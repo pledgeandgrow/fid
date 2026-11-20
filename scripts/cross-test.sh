@@ -208,7 +208,8 @@ build_one() {
     # Apple silicon too: a host build would be arm64)
     local tflag=(--target "$TARGET")
     if [ "$HOST" = macos ] && [ "$TOS" = macos ] && [ "$TARCH" = "$HARCH" ]; then tflag=(); fi
-    timeout 600 "$FID" ccompile "$f" "${tflag[@]}" --cc-opt 0 --no-cache -o "$OUT/$b.$EXT" > "$OUT/$b.build.log" 2>&1
+    # bash 3.2 (macOS): an empty array expanded under set -u is an unbound variable
+    timeout 600 "$FID" ccompile "$f" ${tflag[@]+"${tflag[@]}"} --cc-opt 0 --no-cache -o "$OUT/$b.$EXT" > "$OUT/$b.build.log" 2>&1
   fi
   echo $? > "$OUT/$b.build_rc"
 }

@@ -3676,12 +3676,19 @@ impl CCodeGen {
         // raw result as a str (pe_ir_enc.fd pe_dll_found).
         wln!(self, "static char* __p_str_wrap(const char* s) {{");
         wln!(self, "    if (!s) return NULL;");
-        wln!(self, "    size_t n = strlen(s);");
-        wln!(self, "    uint64_t* b = (uint64_t*)p_malloc((int64_t)(16 + n + 1));");
+        wln!(self, "    /* one counted copy per distinct name: p_getenv is called from");
+        wln!(self, "       pass-gating helpers that run per function, and each copy is a");
+        wln!(self, "       fresh block nobody frees in this runtime */");
+        wln!(self, "    static char* names[64]; static char* vals[64]; static int n = 0;");
+        wln!(self, "    for (int i = 0; i < n; i++) if (strcmp(names[i], s) == 0) return vals[i];");
+        wln!(self, "    size_t len = strlen(s);");
+        wln!(self, "    uint64_t* b = (uint64_t*)p_malloc((int64_t)(16 + len + 1));");
         wln!(self, "    if (!b) return NULL;");
         wln!(self, "    b[0] = 0x4649444500000000ULL + 1; /* P_STR_RC, one owner */");
-        wln!(self, "    b[1] = (uint64_t)n;");
-        wln!(self, "    memcpy((char*)(b + 2), s, n + 1);");
+        wln!(self, "    b[1] = (uint64_t)len;");
+        wln!(self, "    memcpy((char*)(b + 2), s, len + 1);");
+        wln!(self, "    if (n < 64) {{ names[n] = (char*)p_malloc_persistent((int64_t)len + 1);");
+        wln!(self, "                       if (names[n]) {{ strcpy(names[n], s); vals[n] = (char*)(b + 2); n++; }} }}");
         wln!(self, "    return (char*)(b + 2);");
         wln!(self, "}}");
         wln!(self, "int64_t p_getenv(const char* name) {{ return (int64_t)(intptr_t)__p_str_wrap(getenv(name)); }}");
