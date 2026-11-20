@@ -3650,6 +3650,7 @@ impl CCodeGen {
         wln!(self, "int64_t p_dl_find(int64_t handle, const char* name) { (void)handle; (void)name; return 0; }");
         wln!(self, "int64_t p_dl_unload(int64_t handle) { (void)handle; return -1; }");
         wln!(self, "#else");
+        wln!(self, "#include <dlfcn.h>");
         wln!(self, "int64_t p_dl_load(const char* path) {{");
         wln!(self, "    if (!path || !*path) return 0;");
         wln!(self, "    return (int64_t)(intptr_t)dlopen(path, RTLD_NOW | RTLD_LOCAL);");

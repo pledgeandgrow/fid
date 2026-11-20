@@ -75,7 +75,6 @@
   "use"
   "as"
   "with"
-  "pub"
   "async"
   "comptime"
   "interrupt"
@@ -185,3 +184,6 @@
 ["(" ")" "[" "]" "{" "}"] @punctuation.bracket
 
 ["," ";" ":" "::" "." "#"] @punctuation.delimiter
+
+; `pub` is a named node (grammar rule `visibility`), not an anonymous token
+(visibility) @keyword
