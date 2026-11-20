@@ -169,8 +169,13 @@ const kws = new Set([...lexer.matchAll(/s == "([a-z_0-9]+)"/g)].map((m) => m[1])
 const hl = fs.readFileSync(h1, 'utf8');
 const highlighted = new Set();
 hl.replace(/"([a-z_0-9]+)"/g, (_, s) => { highlighted.add(s); return ''; });
+// a named-node capture ((visibility) @keyword) highlights the keyword too
+hl.replace(/\(([a-z_0-9]+)\)/g, (_, s) => { highlighted.add(s); return ''; });
 const prims = new Set(['i8', 'i16', 'i32', 'i64', 'i128', 'u8', 'u16', 'u32', 'u64', 'u128', 'f32', 'f64', 'bool', 'str', 'void', 'q8', 'q4', 'true', 'false']);
-const missing = [...kws].filter((k) => anon.has(k) && !highlighted.has(k) && !prims.has(k));
+// the grammar wraps some keywords in a named rule ('pub' -> visibility):
+// the query matches the node, not the anonymous token
+const kwNode = { pub: 'visibility' };
+const missing = [...kws].filter((k) => anon.has(k) && !highlighted.has(k) && !highlighted.has(kwNode[k] || k) && !prims.has(k));
 check('every lexer keyword the grammar uses is highlighted', missing.length === 0, missing.join(' '));
 check('the grammar knows the main keywords', ['fn', 'val', 'var', 'struct', 'enum', 'impl', 'cap', 'match', 'if', 'while', 'for', 'return', 'use', 'module'].every((k) => anon.has(k)));
 
