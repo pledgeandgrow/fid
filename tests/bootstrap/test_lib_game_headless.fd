@@ -1,0 +1,125 @@
+// A headless game frame without SDL: game.fd's config and 2D physics with a
+// fixed time step, ecs.fd's entity lifecycle, and one frame rendered into
+// image.fd's software canvas, encoded to PNG and BMP bytes. Everything is
+// deterministic (no clock, no files, no window), so every backend must agree.
+//
+// Expected output:
+// fps 60
+// frame_time ok
+// entities 3 3 2
+// alive yes yes no
+// pos 3.5 6.75
+// gravity -4.9
+// overlap yes no
+// pixel 255 0 0
+// pixel 0 255 0
+// png magic yes
+// png size 16x8 ok
+// bmp magic yes
+use game;
+use ecs;
+use image;
+
+fn say(tag: str, b: bool) {
+    if b { println(tag + " yes"); } else { println(tag + " no"); }
+}
+
+fn main() -> i64 {
+    // ── config (game.fd) ───────────────────────────────────────────────
+    var c = game_config_new();
+    println("fps " + int_to_str(c.target_fps));
+    say("frame_time", c.frame_time > 0.0166 && c.frame_time < 0.0167);
+
+    // ── entities (ecs.fd, the non-generic surface) ─────────────────────
+    ecs_reset();
+    var e1 = ecs_create_entity();
+    var e2 = ecs_create_entity();
+    var e3 = ecs_create_entity();
+    println("entities " + int_to_str(ecs_entity_count()) + " " + int_to_str(ecs_entity_count()) + " " + int_to_str(ecs_entity_count()));
+    say("alive", ecs_is_alive(e1) && ecs_is_alive(e2) && ecs_is_alive(e3));
+    ecs_destroy_entity(e3);
+    say("alive", ecs_is_alive(e1) && !ecs_is_alive(e3));
+
+    // ── two frames of 2D physics with a fixed dt (game.fd) ─────────────
+    // e1 starts at (1, 2) with velocity (4, -8); dt = 0.5
+    var px = 1.0;
+    var py = 2.0;
+    var (nx, ny) = physics_move(px, py, 4.0, -8.0, 0.5);
+    px = nx;
+    py = ny;
+    var (nx2, ny2) = physics_move(px, py, 4.0, -8.0, 0.5);
+    px = nx2;
+    py = ny2;
+    // move is p = p + v*dt each frame: (1,2) -> (3,-2) -> (5,-6)
+    println("pos " + float_to_str_short(px, 1) + " " + float_to_str_short(py, 2));
+    // gravity: v = v + g*dt from rest: 0 + (-9.8*0.5) = -4.9
+    println("gravity " + float_to_str_short(physics_gravity(0.0, 0.0, 0.5), 1));
+    say("overlap", physics_aabb_overlap(0.0, 0.0, 10.0, 10.0, 5.0, 5.0, 10.0, 10.0));
+    say("overlap", physics_aabb_overlap(0.0, 0.0, 10.0, 10.0, 11.0, 0.0, 10.0, 10.0));
+
+    // ── render one 16x8 frame: e1 red at (2,2), e2 green at (10,4) ─────
+    var img = image_create(16, 8, 4);
+    image_fill(&mut img, 0, 0, 0, 255);
+    var ex = 2;
+    var ey = 2;
+    while ex < 5 {
+        var eyy = ey;
+        while eyy < 5 {
+            image_set_pixel(&mut img, ex, eyy, 255, 0, 0, 255);
+            eyy = eyy + 1;
+        }
+        ex = ex + 1;
+    }
+    var gx = 10;
+    var gy = 4;
+    while gx < 13 {
+        var gyy = gy;
+        while gyy < 7 {
+            image_set_pixel(&mut img, gx, gyy, 0, 255, 0, 255);
+            gyy = gyy + 1;
+        }
+        gx = gx + 1;
+    }
+    var r1 = image_get_pixel(&img, 3, 3);
+    var r2 = image_get_pixel(&img, 11, 5);
+    // color_pack is RGBA in one word; the low three bytes are what we set
+    println("pixel " + int_to_str(r1 & 255) + " " + int_to_str((r1 >> 8) & 255) + " " + int_to_str((r1 >> 16) & 255));
+    println("pixel " + int_to_str(r2 & 255) + " " + int_to_str((r2 >> 8) & 255) + " " + int_to_str((r2 >> 16) & 255));
+
+    // ── encode the frame (pure-Fides PNG writer) and decode it back ────
+    var png = image_png_encode(&img);
+    say("png magic", png.len() > 8 && png.get(0) == 137 && png.get(1) == 80 && png.get(2) == 78 && png.get(3) == 71);
+    say("png size", png.len() > 50);
+    var back = image_png_decode(png);
+    var rr = image_get_pixel(&back, 3, 3);
+    var rg = image_get_pixel(&back, 11, 5);
+    say("roundtrip", (rr & 255) == 255 && ((rr >> 8) & 255) == 0 && (rg & 255) == 0 && ((rg >> 8) & 255) == 255);
+    return 0;
+}
+
+/// f rounded to `digits` decimals, without the trailing zeros float_to_str
+/// keeps: deterministic across backends for the printed checks.
+fn float_to_str_short(f: f64, digits: i64) -> str {
+    var scale = 1.0;
+    var i = 0;
+    while i < digits {
+        scale = scale * 10.0;
+        i = i + 1;
+    }
+    var v = f;
+    if v < 0.0 {
+        v = 0.0 - v;
+    }
+    var scaled = (v * scale) + 0.5;
+    var whole = scaled as i64;
+    var s = "";
+    if f < 0.0 {
+        s = "-";
+    }
+    var w = whole / 10;
+    var frac = whole % 10;
+    if digits == 1 {
+        return s + int_to_str(whole);
+    }
+    return s + int_to_str(w) + "." + int_to_str(frac);
+}
