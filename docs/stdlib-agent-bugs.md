@@ -208,6 +208,15 @@ From the media/method-dispatch pass (fid-new2 rebuild):
     impl methods (find_opt, position_opt, take, skip, zip, enumerate,
     flat_map, chunk, window, dedup, sort_by, contains_val) were wired
     through all sites; fid-new2 is the first compiler with the full set.
+63b. RESOLVED: a method `self: & mut Vec<i64>` (dedup, sort_by) resolved
+    but silently did nothing: the call site passed the loaded Vec word
+    while the impl forwards `self` to a `& mut` free function expecting
+    a slot address. `Lowerer_lower_method_call` now checks
+    `Lowerer_mut_self_impl` and lowers place receivers (Ident,
+    FieldAccess, Deref — side-effect free) as `Expr::Ref(recv, true)`.
+    Verified interpreter + C backend (dedup/sort_by mutate in place,
+    field receivers too). `get_vec().dedup()` on a temporary still
+    passes the word (harmless: mutating a discarded temp).
 64. `extern "C" ... link "SDL2"` in a stdlib module makes EVERY C build
     that imports the module link `-lSDL2`, even though the compiler
     synthesizes missing externs as returning-0 stubs. image.fd's loader/

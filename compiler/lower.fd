@@ -1274,6 +1274,42 @@ fn lw_impl_key(struct_name: str, method_name: str) -> str {
     return struct_name + "\n" + method_name;
 }
 
+/// Whether `mangled_name` (Vec_x/HashMap_x/String_x) resolves to an impl
+/// method whose self parameter is `& mut` — those need the receiver's
+/// slot address at the call site, not the collection word.
+pub fn Lowerer_mut_self_impl(self: & Lowerer, mangled_name: str) -> bool {
+    var sname: str = "";
+    if str_starts_with(mangled_name, "Vec_") {
+        sname = "Vec";
+    }
+    if str_starts_with(mangled_name, "HashMap_") {
+        sname = "HashMap";
+    }
+    if str_starts_with(mangled_name, "String_") {
+        sname = "String";
+    }
+    if sname == "" {
+        return false;
+    }
+    var mname: str = str_slice(mangled_name, str_len(sname) + 1, str_len(mangled_name));
+    match Lowerer_lookup_impl_method(self, sname, mname) {
+        OptFunc::Some(mf) => {
+            if mf.params.len() > 0 {
+                match mf.params.get(0).ty {
+                    Type::Ref(_, pm) => {
+                        return pm;
+                    }
+                    _ => {
+                    }
+                }
+            }
+        }
+        OptFunc::None => {
+        }
+    }
+    return false;
+}
+
 pub fn Lowerer_lookup_func_ret_type(self: & Lowerer, name: str) -> OptType {
     // CS4: own_ret_index holds the first entry of every name (only
     // Lowerer_insert_func_ret_type adds to func_ret_types)
@@ -11481,6 +11517,29 @@ pub fn Lowerer_lower_method_call(self: & mut Lowerer, receiver: Box<Expr>, metho
     }
     // Auto-deref: for &mut Vec<T> etc, load the actual Vec pointer
     var effective_recv_val: i64 = Lowerer_auto_deref_recv(self, recv_val, recv_ty);
+    // A stdlib impl method taking `self: & mut` on a word-repr collection
+    // (v.dedup(), s.items.dedup(), (*p).dedup()) expects the slot address
+    // like `& mut v` gives, not the Vec word: the impl forwards self to a
+    // `& mut` free function which dereferences it once more. Ident, field
+    // and deref receivers are place expressions with no side effects, so
+    // lowering them as `& mut <place>` is safe.
+    var mut_self: bool = false;
+    match lw_box_expr_unbox(receiver) {
+        Expr::Ident(_) => {
+            mut_self = true;
+        }
+        Expr::FieldAccess(_, _) => {
+            mut_self = true;
+        }
+        Expr::Deref(_) => {
+            mut_self = true;
+        }
+        _ => {
+        }
+    }
+    if mut_self && Lowerer_mut_self_impl(self, mangled_name) {
+        effective_recv_val = Lowerer_lower_expr(self, Expr::Ref(receiver, true));
+    }
     call_args.push(effective_recv_val);
     // core's collection methods take a collection argument as the word
     // itself (Vec_extend(v, other: i64)): a `&Vec` argument is loaded like
