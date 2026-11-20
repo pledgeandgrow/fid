@@ -35,7 +35,7 @@ Nothing imports it; it is the binary. It imports 40 modules (main.fd:11-50).
 | `pir`, `dump-pir` | `cmd_pir` :522 | PIR L1/L2/L3/all, `--opt` runs `optimize_l2`. |
 | `opt` | `cmd_opt` :602 | PIR L2 after `optimize_l2`. The pass-list argument in its usage text is ignored. |
 | `fmt` | `cmd_fmt` :638 | `format_source`, rewrites the file; `--check`. |
-| `version` | `cmd_version` :358 | Prints "fid 0.1.0". |
+| `version` | `cmd_version` :358 | Prints "fid 1.0.0+dev" (dev builds; release stamp via build_info.fd). |
 | `test` | `cmd_test` :897 / `cmd_test_file` :802 | With a `.fd`: builds a harness (`fn test_*()` each in its own process, `fn bench_*()` timed to 200 ms) via `fid ccompile`. Without: scans tests/bootstrap, C-compiles and runs each, "PE" = front end only; `--fail` runs the expected-fail list (hard-coded :943-1021). |
 | `bench` | `cmd_bench` :1233 | ccompile, then run the exe `-n` times (prints exit codes, no timing). |
 | `watch` | `cmd_bench` :180 | Same as `bench`. |

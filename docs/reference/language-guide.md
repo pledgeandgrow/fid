@@ -39,7 +39,7 @@ commit (see [platforms](platforms.md)).
 | Capability security | Compile-time capability grants | None | None |
 | Dependency model | No LLVM; native Windows output needs no C compiler or linker (`fid emit`); other targets go through a C compiler | External (crates, LLVM) | External (libc) |
 | Codegen | Direct machine code (Windows x64) or C99 | Via LLVM | Via gcc/clang |
-| Self-hosting | ✅ Achieved (68 modules, 158,516 lines, bootstrap fixpoint verified Nov 6 and Nov 8) | Yes | Yes |
+| Self-hosting | ✅ Achieved (80 modules, 360,594 lines, bootstrap fixpoint verified Nov 6 and Nov 8 — before the ~2.3x Nov 10–19 growth) | Yes | Yes |
 
 ### Design Philosophy
 
@@ -1368,8 +1368,8 @@ incomplete. `@cfg` uses the host OS, not `--target`.
 
 ## 9. Standard Library
 
-Fides has 146 stdlib modules (51,496 lines, Nov 9), plus 4 in
-`stdlib/pe_runtime/`. Key modules:
+Fides has 403 stdlib modules (259,299 lines, Nov 19), plus 4 in
+`stdlib/pe_runtime/` and 7 in `stdlib/linux_runtime/`. Key modules:
 
 ### Core
 | Module | Description |
@@ -1460,8 +1460,8 @@ Fides has 146 stdlib modules (51,496 lines, Nov 9), plus 4 in
 ## 10. Self-Hosting
 
 **The Fides compiler is self-hosted.** The compiler has been rewritten from
-Rust (`src/*.rs`, 57 files, 112,511 lines) into Fides (`compiler/*.fd`, 61
-modules, 158,516 lines) and achieves a **bootstrap fixpoint**: the self-hosted
+Rust (`src/*.rs`, 57 files, 113,416 lines) into Fides (`compiler/*.fd`, 80
+modules, 360,594 lines) and achieves a **bootstrap fixpoint**: the self-hosted
 compiler reproduces byte-identical output across generations.
 
 ### Current State (Nov 6, 2026)

@@ -141,7 +141,7 @@ Every message is explained on the [Compiler Errors](https://fid-lang.org/docs/er
 | **Checks that stay on** | Bounds, integer overflow and double frees panic in every build, not only in debug. |
 | **No macros** | `comptime` runs ordinary Fid code at compile time, with reflection over types. |
 | **No LLVM** | `fid emit` encodes machine code and writes Windows and Linux executables itself: no assembler, no linker, no C compiler. |
-| **Self-hosted** | About 210K lines of Fid compile themselves to a byte-identical fixpoint, checked on every release build. |
+| **Self-hosted** | About 360K lines of Fid compile themselves to a byte-identical fixpoint, checked on every release build. |
 
 ## Install
 
@@ -167,10 +167,13 @@ One binary, `fid`, is the compiler, interpreter, test runner, formatter, linter 
 | Command | What it does |
 | --- | --- |
 | `fid run file.fd` | Interpret a program. `--leaks` reports memory never freed |
-| `fid emit file.fd -o out` | Native executable with no other tools. `--target x86_64-linux`, `aarch64-linux` or `riscv64-linux` for Linux |
+| `fid emit file.fd -o out` | Native executable with no other tools. `--target x86_64-linux`, `aarch64-linux` or `riscv64-linux` for Linux, `universal` for a macOS fat binary; `--bare`/`--boot` bare metal, `--uefi` a UEFI image |
 | `fid ccompile file.fd -o out` | Through C; `--target` cross-compiles with `zig cc` |
+| `fid wasm file.fd` | WebAssembly/WAT, no C compiler |
 | `fid check file.fd` | Type, borrow and effect checks only |
+| `fid fix file.fd` | Apply the compiler's suggested fixes |
 | `fid test file.fd` | Run every `test_*` function, each in its own process |
+| `fid fuzz file.fd` | Run its `fuzz_*` functions on generated inputs |
 | `fid fmt` / `fid lint` | Format; unused code and `unwrap()` outside tests |
 | `fid audit file.fd` | List every `unsafe` block the program reaches |
 | `fid qualify file.fd` | Safety evidence as JSON: rules, their tests, annotated functions |
@@ -188,7 +191,7 @@ Beside it: `ark` (packages, from path or git), `scribe` (documentation from `///
 | Linux ARM64       |             |    🟡     |         🟡          |
 | Linux RISC-V      |             |    🟡     |         🟡          |
 | macOS             |             |    ⚪     |         ⚪          |
-| WebAssembly       |             |    🟡     |         ⚪          |
+| WebAssembly       |             |    🟡     |         🟡          |
 | Bare metal x86-64 |             |           |         ⚪          |
 
 🟢 supported · 🟡 partly tested · ⚪ experimental. Details and test counts: [platforms](docs/reference/platforms.md).
@@ -213,24 +216,28 @@ The compiler checks itself as hard as it checks your code:
 - **Fixpoint.** Stage 2 and stage 3 of the bootstrap must produce byte-identical output on every release build.
 - **Proved rewrites.** The optimizer's 108 integer rewrite rules are proved with z3.
 - **Checked encoders.** The instruction encoders are compared with clang's assembler across 1,181 forms.
-- **Conformance.** 104 programs each check one rule of the [language reference](docs/reference/reference.md).
+- **Conformance.** 1,596 programs each check one rule of the [language reference](docs/reference/reference.md) (§1–§13).
 
 More in [verification](docs/verification/README.md) and the [contributor walkthrough](docs/reference/compiler-walkthrough.md).
 
 ## Standard library
 
-169 modules, written in Fid. A sample:
+403 modules, written in Fid. A sample:
 
 | Area | Modules |
 | --- | --- |
 | Core and collections | `core`, `vec`, `collections`, `string`, `rc`, `arena`, `iter`, `sort` |
-| Text and data | `json`, `toml`, `yaml`, `csv`, `regex`, `unicode`, `protobuf` |
-| Network | `http`, `http2`, `net`, `dns`, `ws`, `tls_crypto`, `url` |
+| Text and data | `json`, `toml`, `yaml`, `csv`, `regex`, `unicode`, `protobuf`, `cbor` |
+| Network | `http`, `http2`, `http3`, `quic`, `net`, `dns`, `ws`, `grpc`, `ssh`, `webrtc`, `mqtt` |
+| Security | `crypto`, `tls13`, `x509`, `sha512`, `ed25519`, `x25519`, `wireguard`, `pqc`, `hpke`, `typed_strings`, `privacy` |
+| Databases | `sqlite`, `postgres`, `mysql`, `mongodb`, `redis`, `db`, `sql_builder` |
 | Concurrency | `task`, `channel`, `sync`, `parallel`, `async` |
-| Numbers and models | `math`, `bigint`, `decimal`, `tensor`, `simd`, `infer` |
-| Security | `crypto`, `sha512`, `ed25519`, `x25519`, `typed_strings`, `privacy` |
-| Systems | `fs`, `process`, `mmap`, `elf`, `pci`, `uart`, `virtio` |
-| Games and graphics | `ecs`, `physics`, `mesh`, `gltf`, `tilemap`, `shader` |
+| Numbers and models | `math`, `bigint`, `decimal`, `tensor`, `simd`, `infer`, `safetensors`, `bpe` |
+| Industrial and energy | `modbus`, `opcua`, `iec104`, `iec61850`, `dnp3`, `scada`, `plc`, `iso15118`, `matter` |
+| Automotive and robotics | `can`, `ecu`, `mavlink`, `ros2_msg`, `dds`, `kalman`, `planner`, `lidar` |
+| Systems and embedded | `fs`, `process`, `mmap`, `elf`, `pci`, `uart`, `virtio`, `nvme`, `ext4`, `gpio`, `i2c`, `spi` |
+| Games and graphics | `ecs`, `physics`, `mesh`, `gltf`, `tilemap`, `shader`, `sdl`, `vulkan`, `d3d12`, `webgpu` |
+| Finance | `money`, `banking`, `quant`, `decimal` |
 
 Signatures for every module: [API reference](https://fid-lang.org/reference).
 
@@ -238,10 +245,10 @@ Signatures for every module: [API reference](https://fid-lang.org/reference).
 
 Fid is young and moving fast.
 
-- **v0.8.0-unstable is a prerelease.** The stable v1.0.0 release is planned for December 2026.
+- **Releases:** v1.0.0 shipped Sep 9, 2026; the newest tagged build is the **v0.8.0-unstable** prerelease (Nov 10). The tree is in 1.0 release preparation — `fid version` reports `1.0.0+dev`.
 - **Generated code is slower than Rust's.** Through C, Fid is fastest on one of four benchmarks and up to 1.6 times slower on the others; native output is slower still. [Benchmarks, losses included](docs/benchmarks.md).
 - **No package registry yet.** `ark` installs from a path or a git repository.
-- **The full test suite has not been rerun with the current compiler.** Features are checked with their own tests on each backend.
+- **The full test suite has not been rerun with the current compiler.** Features are checked with their own tests on each backend, and the suite has grown ~3x since the last full run.
 - **Not for safety-critical use.** `fid qualify` produces evidence for review, not a certification.
 
 The details: [status](docs/reference/status.md) · [known bugs](docs/reference/known-bugs.md) · [roadmap](docs/roadmap/roadmap.md).
@@ -261,11 +268,13 @@ The details: [status](docs/reference/status.md) · [known bugs](docs/reference/k
 ## Repository layout
 
 ```
-compiler/    the compiler, in Fid: 72 modules, about 210K lines
-stdlib/      the standard library: 169 modules
+compiler/    the compiler, in Fid: 80 modules, about 360K lines
+stdlib/      the standard library: 403 modules
 src/         the earlier compiler in Rust, frozen; it builds stage 1 and runs the test harness
-tests/       bootstrap (572 programs), conformance (104), selfhost (51), leak checks
+tests/       bootstrap (1,752 programs), conformance (1,596), selfhost (57),
+             plus projects, verify, nattools, tooling and leak checks
 examples/    twelve complete programs
+tools/       ark, scribe, veil and friends, written in Fid
 docs/        book, guides, reference, proposals, roadmap, verification
 editors/     VS Code, Neovim, Helix, Emacs, Sublime
 installer/   the Windows installer

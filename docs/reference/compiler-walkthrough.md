@@ -479,7 +479,7 @@ See `docs/reference/syntax.md` for the complete syntax specification.
 
 ```
 fid/
-├── compiler/               # 68 self-hosted Fides modules (~159K lines) — THE COMPILER
+├── compiler/               # 80 self-hosted Fides modules (~361K lines) — THE COMPILER
 │   ├── main.fd / compiler.fd / inc.fd / csplit.fd  # CLI, pipeline, build cache, split C
 │   ├── lexer.fd / parser.fd / ast.fd / token.fd / comptime_eval.fd  # Front end
 │   ├── typechecker.fd / escape.fd / secrecy.fd / borrowck.fd / mono.fd / cowcheck.fd  # Checks
@@ -614,4 +614,4 @@ Run all tests: `./target/release/fidesc test` (or `cargo test --test harness`)
 See `docs/roadmap/roadmap.md` for the full phase status and milestones.
 See `docs/roadmap/roadmap.md` § Self-Host Details for the self-hosting plan.
 
-**Self-hosting status:** Bootstrap fixpoint verified (stage 2 == stage 3 byte-for-byte, checked on every release build; last verified Nov 6, 2026). 68 self-hosted modules (~159K lines) in `compiler/*.fd`. The self-hosted compiler is the release compiler (`fid.exe`) and defines the language; the Rust compiler (`fidesc.exe`) is frozen.
+**Self-hosting status:** Bootstrap fixpoint verified (stage 2 == stage 3 byte-for-byte, checked on every release build; last verified Nov 8, 2026, before the ~2.3x Nov 10–19 growth). 80 self-hosted modules (~361K lines) in `compiler/*.fd`. The self-hosted compiler is the release compiler (`fid.exe`) and defines the language; the Rust compiler (`fidesc.exe`) is frozen.

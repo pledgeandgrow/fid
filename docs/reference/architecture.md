@@ -1,19 +1,20 @@
 # Fides Compiler Architecture
 
 **Version:** 0.6.0
-**Targets (Nov 9):** working: IR interpreter (`fid run`), C codegen (`fid ccompile`, cross targets through `zig cc`), native Windows x64 PE (`fid emit`, compiler/pe_ir*.fd), native Linux AArch64 / RISC-V 64 / x86-64 static ELF (`fid emit --target aarch64-linux|riscv64-linux|x86_64-linux`, the machine layer compiler/nat_ir.fd + nat_enc.fd), and Windows x64 on the machine layer (opt-in `fid emit --nat`). Experimental / incomplete: the old PIR path (`build --native` with the default target, `emit --boot`: they panic), PIR-era ARM64/RISC-V assembly, Mach-O, COFF, WebAssembly, SPIR-V (GPU), bare-metal flat binary (`emit --bare`).
+**Targets (Nov 19):** working: IR interpreter (`fid run`), C codegen (`fid ccompile`, cross targets through `zig cc`), native Windows x64 PE (`fid emit`, compiler/pe_ir*.fd), native Linux AArch64 / RISC-V 64 / x86-64 static ELF (`fid emit --target aarch64-linux|riscv64-linux|x86_64-linux`, the machine layer compiler/nat_ir.fd + nat_enc.fd), Windows x64 on the machine layer (opt-in `fid emit --nat`), native WebAssembly (`fid wasm`, WASI preview 1; 316/344 suite tests), native macOS Mach-O and universal binaries (build, not run on a Mac), Cortex-M Thumb-2 (compiler/nat_thumb.fd), UEFI and multiboot images (`emit --uefi`/`--boot`). Experimental / incomplete: the retired PIR path, PIR-era ARM64/RISC-V assembly, bare-metal flat binary (`emit --bare`).
 
-> **Current state (Nov 9, 2026).** The release compiler is the self-hosted
-> `fid` (`compiler/*.fd`, 68 modules, 158,516 lines). The Rust compiler
-> `fidesc` (`src/*.rs`, 57 files, 112,598 lines) is frozen: it builds stage 1
+> **Current state (Nov 19, 2026).** The release compiler is the self-hosted
+> `fid` (`compiler/*.fd`, 80 modules, 360,594 lines). The Rust compiler
+> `fidesc` (`src/*.rs`, 57 files, 113,416 lines) is frozen: it builds stage 1
 > of the bootstrap and runs the test harness. Most of this document was
 > written for `fidesc`; the `src/*.rs` names below have `compiler/*.fd`
 > counterparts; the self-hosted pipeline as it is now is in § "Self-hosted
 > pipeline (Nov 9)" below. The 3-stage bootstrap reaches a byte-identical
-> fixpoint (stage 2 C == stage 3 C, 67 MB on Nov 8); `fid` compiles itself to
-> C in 74 s when it is built at -O2 (type check 18 s, borrow check 5 s, mono
+> fixpoint (stage 2 C == stage 3 C, 67 MB on Nov 8; not yet re-verified on the
+> current, ~2.3x larger tree); `fid` compiled itself to C in 74 s when built at
+> -O2 and 159K lines (type check 18 s, borrow check 5 s, mono
 > 5 s, lowering 24 s, C generation 20 s), 229 s at -O0. The
-> stdlib has 146 modules, 51,496 lines (+ 4 in `stdlib/pe_runtime/`, 5 in `stdlib/linux_runtime/`). The
+> stdlib has 403 modules, 259,299 lines (+ 4 in `stdlib/pe_runtime/`, 7 in `stdlib/linux_runtime/` incl. `darwin.fd` and `wasi.fd`). The
 > language is described rule by rule in [reference.md](reference.md).
 
 ---
@@ -417,7 +418,7 @@ Native Binary / WASM / SPIR-V / C Source / Running Code
 - Integrated linker (ELF64 objects → executable, in-process)
 - Hot reload (`fidesc watch`) — rebuild and rerun on save, function-level change detection (no in-process swap)
 - Custom runtime: hand-encoded x86-64 machine code via raw syscalls (Linux, no libc) / kernel32.dll (Windows)
-- 146 stdlib modules (Nov 9), among them: core, vec, math, string, fmt, bits, sort, hash, iter, stack, queue, buffer, collections, result, random, path, units, uuid, crypto, storage, clinical, medical, ecu, scada, swift, grid, ota, banking, kv_cache, quant, dp, shard, fs, io, os, sys, ecs, events, parallel, sync, channel, db, http, json, shape, simd, tensor, money, alloc, file, time, typed_strings, memo, privacy, env, args, process, regex, tilemap, sprite, flowfield, streaming, scene, physics, audio, input, arinc, can, task (uefi and kernel moved to fides-os)
+- 403 stdlib modules (Nov 19): core/collections, text/data formats, HTTP/2/3+QUIC and TLS 1.3, databases (postgres/mysql/mongodb/redis/sqlite), post-quantum crypto, industrial/energy protocols (modbus, opcua, iec104/61850, dnp3, iso15118, matter, scada, plc), automotive/robotics (can, ecu, mavlink, ros2_msg, dds, kalman, lidar), kernel drivers and embedded peripherals (e1000, xhci, nvme, ahci, ext4, fat32, uart, i2c, spi, gpio), games/graphics (sdl, vulkan, d3d12, webgpu), media (mp3, vorbis, wav, dsp), ML (tensor, infer, safetensors, bpe), mobile/desktop interop (jni, objc, swift, android_ndk), finance (money, banking, quant) — full list in `stdlib/` (uefi and kernel moved to fides-os)
 - C header FFI parsing (`fidesc parse-header`)
 - Embedded/IoT: FixedBufferAllocator, `!RealTime` effect, RISC-V target, HAL framework
 - Smart pointers: `Box<T>` (recursive types), `Rc<T>` / `Arc<T>` (manual refcount management)
@@ -666,7 +667,7 @@ PIR Level 3 → Register Allocator → Instruction Selector → Peephole → Bin
 - `async` / `await` / `spawn` implementation
 
 #### Phase 6: Fides in Fides (Self-Hosting) — reached
-- Compiler rewritten in Fides (`compiler/*.fd`, 68 modules); `fid` is the release compiler
+- Compiler rewritten in Fides (`compiler/*.fd`, 80 modules); `fid` is the release compiler
 - Fides compiler compiles itself: 3-stage bootstrap, byte-identical fixpoint (49 MB of C, Nov 6)
 - No Rust dependency for end users; stage 1 is still built by `fidesc` until a stage 0 is pinned (`PIN=1`; none yet)
 - Compiler binary is a Fides binary
@@ -851,7 +852,7 @@ Before type-checking, the compiler:
 4. Merges stdlib + imported modules + user code (user wins on conflicts, `extern_decls` merged)
 5. Type-checks the merged program with module-level visibility enforcement
 
-**Standard library modules** (146 modules in `stdlib/`, 51,496 lines, Nov 9; `uefi.fd` below moved to fides-os): `core.fd` (auto-included), `vec.fd`, `math.fd`, `string.fd`, `fmt.fd`, `bits.fd`, `sort.fd`, `hash.fd`, `iter.fd`, `stack.fd`, `queue.fd`, `buffer.fd`, `collections.fd`, `result.fd`, `random.fd`, `path.fd`, `units.fd`, `uuid.fd`, `crypto.fd`, `storage.fd`, `clinical.fd`, `medical.fd`, `ecu.fd`, `scada.fd`, `swift.fd`, `grid.fd`, `ota.fd`, `banking.fd`, `kv_cache.fd`, `quant.fd`, `dp.fd`, `shard.fd`, `channel.fd`, `sync.fd`, `parallel.fd`, `ecs.fd`, `events.fd`, `db.fd`, `http.fd`, `json.fd`, `simd.fd`, `shape.fd`, `tensor.fd`, `money.fd`, `alloc.fd`, `file.fd`, `time.fd`, `typed_strings.fd`, `memo.fd`, `privacy.fd`, `env.fd`, `args.fd`, `process.fd`, `regex.fd`, `tilemap.fd`, `sprite.fd`, `flowfield.fd`, `streaming.fd`, `scene.fd`, `physics.fd`, `audio.fd`, `input.fd`, `arinc.fd`, `can.fd`, `fs.fd`, `io.fd`, `os.fd`, `sys.fd`, `uefi.fd` — imported explicitly via `use`.
+**Standard library modules** (403 modules in `stdlib/`, 259,299 lines, Nov 19; the list below names only the foundational set — see `stdlib/` for the full 403 and `AGENTS.md` → Current Baseline for the domains): `core.fd` (auto-included), `vec.fd`, `math.fd`, `string.fd`, `fmt.fd`, `bits.fd`, `sort.fd`, `hash.fd`, `iter.fd`, `stack.fd`, `queue.fd`, `buffer.fd`, `collections.fd`, `result.fd`, `random.fd`, `path.fd`, `units.fd`, `uuid.fd`, `crypto.fd`, `storage.fd`, `clinical.fd`, `medical.fd`, `ecu.fd`, `scada.fd`, `swift.fd`, `grid.fd`, `ota.fd`, `banking.fd`, `kv_cache.fd`, `quant.fd`, `dp.fd`, `shard.fd`, `channel.fd`, `sync.fd`, `parallel.fd`, `ecs.fd`, `events.fd`, `db.fd`, `http.fd`, `json.fd`, `simd.fd`, `shape.fd`, `tensor.fd`, `money.fd`, `alloc.fd`, `file.fd`, `time.fd`, `typed_strings.fd`, `memo.fd`, `privacy.fd`, `env.fd`, `args.fd`, `process.fd`, `regex.fd`, `tilemap.fd`, `sprite.fd`, `flowfield.fd`, `streaming.fd`, `scene.fd`, `physics.fd`, `audio.fd`, `input.fd`, `arinc.fd`, `can.fd`, `fs.fd`, `io.fd`, `os.fd`, `sys.fd`, plus the HTTP/2/3+QUIC, TLS 1.3, database, industrial, robotics, driver, media, ML and interop modules — imported explicitly via `use`.
 
 **String concatenation**: `str + str` is lowered to a `p_str_concat` runtime call. Works with literals, variables, and inline function call results. `str + i64` is pointer arithmetic (not concatenation).
 

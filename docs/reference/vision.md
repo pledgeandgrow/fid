@@ -9,11 +9,12 @@
 
 > Build the last programming language the world needs.
 >
-> **Today (Nov 6, 2026):** see [AGENTS.md → Current Baseline](../../AGENTS.md#current-baseline-nov-9-2026-full-suite-last-run-nov-2) for what is
-> true now — the self-hosted compiler `fid` has 68 modules, 158,516 lines,
-> a byte-identical fixpoint checked on every release build (49 MB of C), and
-> native output on Windows x64 (`fid emit`); Linux goes through C, and the
-> other targets are experimental. The language `fid` accepts is described in
+> **Today (Nov 19, 2026):** see [AGENTS.md → Current Baseline](../../AGENTS.md) for what is
+> true now — the self-hosted compiler `fid` has 80 modules, 360,594 lines,
+> a byte-identical fixpoint checked on release builds (49 MB of C, last
+> verified Nov 8), and native output on Windows x64 (`fid emit`), Linux
+> x64/AArch64/RISC-V, WASM and Mach-O; the other targets are experimental.
+> The language `fid` accepts is described in
 > [reference.md](reference.md). Much of this document states goals: where it
 > says something is a compile-time error, check reference.md for what the
 > compiler checks today (there is, for example, no region use-after-free
@@ -430,7 +431,7 @@ master of none.
 > and actual test baselines.
 >
 > Written in Aug–Sep 2026; its numbers are from then. Since then (Nov 6): the
-> compiler is self-hosted (68 modules, 158,516 lines), the full suite passes
+> compiler is self-hosted (80 modules, 360,594 lines, Nov 19), the full suite passes
 > 339/339 interp, 343/343 C, 345/345 PE (Nov 2), and generic `Option<T>` (§6
 > below) is done in `fid`.
 

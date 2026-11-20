@@ -72,6 +72,9 @@ module.exports = grammar({
   conflicts: $ => [
     // `if x {`: `x` and a block, or the struct literal `x { f: v }`
     [$._expression, $.struct_expression],
+    // `a::b < c>`: the type arguments of a scoped type, or a comparison
+    // (tree-sitter 0.27 rejects this ambiguity without a declared conflict)
+    [$.scoped_type],
   ],
 
   rules: {

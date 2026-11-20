@@ -1,9 +1,9 @@
 # Self-Hosted Fides Compiler
 
-> **Status (Nov 9, 2026):** the self-hosted compiler `fid` (`compiler/*.fd`,
-> 68 modules, 158,516 lines; 60 reached from `main.fd`) is the release
+> **Status (Nov 19, 2026):** the self-hosted compiler `fid` (`compiler/*.fd`,
+> 80 modules, 360,594 lines; 56 reached from `main.fd`) is the release
 > compiler and defines the language ([reference.md](reference.md)); the Rust
-> compiler `fidesc` (`src/*.rs`, 57 files, 112,598 lines) is frozen and builds
+> compiler `fidesc` (`src/*.rs`, 57 files, 113,416 lines) is frozen and builds
 > stage 1 and runs the test harness. `RELEASE=1 CC="zig cc"
 > ./scripts/bootstrap.sh` builds `fid` in three stages, each stage's C split
 > into 8 units compiled at -O2 when the previous stage has `fid split-c`,
@@ -94,32 +94,42 @@ cargo build --release
 ### Numbers
 
 The one place project counts and measurements are kept (other docs round
-them and link here). Counted with `wc -l` on Nov 9, 2026.
+them and link here). Counted with `wc -l` on Nov 19, 2026.
 
 | Component | Files | Lines |
 |-----------|-------|-------|
-| Self-hosted compiler (`compiler/*.fd`) | 68 (60 reached from `main.fd`) | 158,516 |
-| Rust compiler (`src/*.rs`, frozen) | 57 | 112,598 |
-| Stdlib (`stdlib/*.fd`) | 146 | 51,496 |
-| Native runtimes (`stdlib/pe_runtime/`, `stdlib/linux_runtime/`) | 4 + 5 | 5,688 + 5,627 |
-| Tests (`tests/bootstrap/`) | 543 .fd (502 top level, 105 expected-fail) | — |
-| Tests (`tests/selfhost/`) | 51 .fd | — |
-| Tests (`tests/conformance/`) | 104 .fd (each checks a rule of reference.md) | — |
-| Tests (`tests/leaks/`) | 3 .fd + .expected (`scripts/leak-check.sh`) | — |
-| Examples (`examples/`) | 11 .fd | — |
-| Installer (`installer/`) | 5 | — |
+| Self-hosted compiler (`compiler/*.fd`) | 80 (56 reached from `main.fd`) | 360,594 |
+| Rust compiler (`src/*.rs`, frozen) | 57 | 113,416 |
+| Stdlib (`stdlib/*.fd`) | 403 | 259,299 |
+| Native runtimes (`stdlib/pe_runtime/`, `stdlib/linux_runtime/`) | 4 + 7 | 10,602 + 13,229 |
+| Tools (`tools/*.fd`) | 12 | — |
+| Tests (`tests/bootstrap/`) | 1,752 .fd (1,681 top level, 456 expected-fail; 71 in subdirs) | — |
+| Tests (`tests/selfhost/`) | 57 .fd | — |
+| Tests (`tests/conformance/`) | 1,596 .fd (each checks a rule of reference.md §1–§13) | — |
+| Tests (`tests/leaks/`) | 10 .fd + .expected (`scripts/leak-check.sh`) | — |
+| Tests (`tests/nattools/`) | 68 .fd + check scripts | — |
+| Tests (`tests/projects/`) | 52 .fd | — |
+| Tests (`tests/verify/`) | 50 .fd | — |
+| Tests (`tests/tooling/`) | 14 .fd + 126 `*-check.sh` | — |
+| Examples (`examples/`) | 12 .fd | — |
+| Installer (`installer/`) | 6 | — |
+| Compiler module docs (`docs/file-analysis/`) | 69 of 80 modules | — |
+| CI workflows (`.github/workflows/`) | 13 | — |
 
 | Measurement | Value |
 |-------------|-------|
-| Last full suite (Rust harness, `fidesc` as the compiler) | Nov 2: interp 339/339, C 343/343, PE 345/345, expected-fail 89/89 |
+| Last full suite (Rust harness, `fidesc` as the compiler) | Nov 2: interp 339/339, C 343/343, PE 345/345, expected-fail 89/89 — the suite has grown ~3x since (1,752 bootstrap files); a fresh full run is part of the 1.0 release prep |
 | Full suite with `fid` as the compiler | not run |
 | Native Linux suite (`NATIVE=1 scripts/cross-test.sh`, Nov 9) | AArch64 273, RISC-V 271, x86-64 272 of 317 match the interpreter |
 | Windows x64 on the machine layer (`fid emit --nat`, Nov 9) | 301 of 338 |
-| Bootstrap fixpoint | stage 2 C == stage 3 C: Nov 6 (49 MB), Nov 8 (67 MB, ownership 0004) |
-| Self-compile (`dump-c compiler/main.fd`) | Nov 9: 74 s with the compiler built at -O2 in 8 split units (type check 18 s, borrow check 5, mono 5, lowering 24, C 20), 229 s at -O0; Nov 6: ~133 s; `fidesc`: ~21 s |
+| WebAssembly native (`fid wasm`, Nov 15) | 316 of 344 suite tests match `fid run`; tasks switch stacks since Nov 18 |
+| Bootstrap fixpoint | stage 2 C == stage 3 C: Nov 6 (49 MB), Nov 8 (67 MB, ownership 0004); not re-verified on the Nov 19 tree |
+| Self-compile (`dump-c compiler/main.fd`) | Nov 9: 74 s with the compiler built at -O2 in 8 split units (type check 18 s, borrow check 5, mono 5, lowering 24, C 20), 229 s at -O0; Nov 6: ~133 s; `fidesc`: ~21 s — the compiler is now ~2.3x larger |
+| Version (`compiler/build_info.fd`) | base `1.0.0` (`fid version` prints `1.0.0+dev` on a dev build); tags: v1.0.0 (Sep 9), v0.8.0-unstable (Nov 10) |
 
 Session 30 (Oct 2026) for comparison: compiler 54 files / 104,439 lines, Rust
-55 / 100,935, stdlib 104 / 30,446, 302 bootstrap tests.
+55 / 100,935, stdlib 104 / 30,446, 302 bootstrap tests. Nov 9 for comparison:
+compiler 68 / 158,516, stdlib 146 / 51,496, 543 bootstrap tests.
 
 ### Status at v1.0.0 (Sep 9, 2026; history)
 
@@ -1202,7 +1212,7 @@ Before touching any file:
 > sessions 12–14. Treat them as approximate guides, not exact references.
 > Re-verify with `grep` before editing based on these numbers.
 >
-> **Module count:** 68 `.fd` files in `compiler/` (158,516 lines, Nov 9);
+> **Module count:** 80 `.fd` files in `compiler/` (360,594 lines, Nov 19);
 > the breakdown below was written for the 25 modules of session 16 (57,021
 > lines) and does not cover the later ones (among them `interp.fd`,
 > `escape.fd`, `secrecy.fd`, `checks.fd`, `iropt.fd`, `pe_ir*.fd`,
@@ -2431,7 +2441,7 @@ Probe tests for self-hosting behavior:
 
 ```
 fid/
-├── compiler/             # Self-hosted Fides compiler modules (68 .fd files, 158,516 lines, Nov 9; list below is from session 16)
+├── compiler/             # Self-hosted Fides compiler modules (80 .fd files, 360,594 lines, Nov 19; list below is from session 16)
 │   ├── main.fd           # CLI entry point (ccompile + build + lsp + test + fmt + ...)
 │   ├── compiler.fd       # Pipeline driver
 │   ├── token.fd          # Token kinds (133 variants)
@@ -2459,10 +2469,10 @@ fid/
 │   └── inc.fd            # Incremental compilation cache
 ├── docs/reference/       # This documentation (selfhost.md, known-bugs.md, ...)
 ├── release/              # Self-hosted build artifacts (gitignored)
-├── src/                  # Rust reference compiler, frozen (57 .rs files, 112,511 lines)
-├── stdlib/               # Fides standard library (146 .fd modules, 51,496 lines)
-├── tests/bootstrap/      # Language tests (543 .fd files)
-├── tests/selfhost/       # Self-host module tests (51 .fd files)
+├── src/                  # Rust reference compiler, frozen (57 .rs files, 113,416 lines)
+├── stdlib/               # Fides standard library (403 .fd modules, 259,299 lines)
+├── tests/bootstrap/      # Language tests (1,752 .fd files)
+├── tests/selfhost/       # Self-host module tests (57 .fd files)
 ├── tests/selfhost/       # Bootstrap probe tests
 ├── target/               # Rust build artifacts
 ├── verify.sh             # Full Rust compiler verification

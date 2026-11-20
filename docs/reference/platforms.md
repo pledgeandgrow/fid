@@ -15,12 +15,14 @@ expected-fail 89/89); Linux CI last ran green in session 37. The Nov 4–6
 changes were checked with `fid run`, `fid ccompile` and `fid emit` on their
 tests. The table lists what Tier 1 covered when CI ran.
 
-Nov 17: [.github/workflows/tier1.yml](../../.github/workflows/tier1.yml)
-runs `scripts/tier1.sh` (lanes, expected failures, binaries) on
-windows-latest, ubuntu-latest, ubuntu-24.04-arm and macos-15; what each
-lane checks, and what a target skips, is in
-[tier-checks.md](tier-checks.md). A platform counts as Tier 1 once its job
-is green.
+Nov 17–19: 13 workflows in `.github/workflows/`. tier1.yml runs
+`scripts/tier1.sh` (lanes, expected failures, binaries) on
+windows-latest, ubuntu-latest, ubuntu-24.04-arm and macos-15; tier2.yml
+runs `scripts/tier2.sh` on the partly-tested targets; suite-all.yml,
+macos.yml, macos-native.yml, bare-metal.yml, verify-nightly.yml and
+verify-weekly.yml cover the rest; what each lane checks, and what a
+target skips, is in [tier-checks.md](tier-checks.md). A platform counts
+as Tier 1 once its job is green.
 
 | Platform | Backends | What CI runs |
 |---|---|---|
@@ -34,7 +36,7 @@ every commit.
 
 | Platform | Backends | Status |
 |---|---|---|
-| Windows x64 native on the machine layer (PE) | `fid emit --nat` | opt-in; `fid emit` without it stays on pe_ir. The machine layer's x86-64 code (compiler/nat_ir.fd) in a PE it writes itself, the Linux runtime unchanged over kernel32, ws2_32 and bcrypt (stdlib/linux_runtime/win.fd): Windows threads, WaitOnAddress for futexes, a vectored exception handler for the panics ("Panic: Stack overflow", "Invalid memory access"), sockets with IPv6. 301 of 338 suite tests match the interpreter (Nov 9); processes (`system`, `process_run`) wait for a hook in `pe_sh` (sys.fd); no PDB yet |
+| Windows x64 native on the machine layer (PE) | `fid emit --nat` | opt-in; `fid emit` without it stays on pe_ir. The machine layer's x86-64 code (compiler/nat_ir.fd) in a PE it writes itself, the Linux runtime unchanged over kernel32, ws2_32 and bcrypt (stdlib/linux_runtime/win.fd): Windows threads, WaitOnAddress for futexes, a vectored exception handler for the panics ("Panic: Stack overflow", "Invalid memory access"), sockets with IPv6. 301 of 338 suite tests match the interpreter (Nov 9); processes (`system`, `process_run`) wait for a hook in `pe_sh` (sys.fd); PDB debug info since compiler/pdb.fd (`emit -g` writes `<out>.pdb`, DB3) |
 | Linux x64 native (ELF) | `fid emit --target x86_64-linux` | static ELF, no C compiler or linker, the same machine-layer backend and Linux runtime as ARM64/RISC-V (compiler/nat_ir.fd); 272 suite tests match the interpreter (Nov 9, run natively in WSL); `log`/`pow` need FMA3 (x86-64-v3). `fid emit --elf` is pe_ir's earlier no-stdlib path |
 | Linux ARM64 | C (`fid ccompile --target aarch64-linux`) | static musl executables from `zig cc` on any host; 270 of 286 suite tests matched `fid run` under qemu-aarch64 (Nov 7), the rest explained in release F8 |
 | Linux RISC-V 64 | C (`--target riscv64-linux`) | same path as ARM64; sample programs run under qemu-riscv64; the full suite has not completed (release F8) |

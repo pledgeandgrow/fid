@@ -9,6 +9,10 @@ sessions; their docs say so). The open bugs that audit found are collected
 in `docs/reference/known-bugs.md` §2g. This table replaces the 2026-10-22/23
 one; that pass's record follows the template below.
 
+> **Coverage gap (Nov 19):** `compiler/` now has 80 modules. The 11 added
+> since the audit have no page yet: `ast_ser`, `build_info`, `disasm`,
+> `image_writer`, `ir_ser`, `mir`, `nat_thumb`, `pdb`, `pgo`, `ssa`, `tv`.
+
 | # | File | State (Nov 9) | Headline |
 |---|------|---------------|----------|
 | 1 | [ark.fd](ark.md) | live, buggy | `fid ark`. Directory path deps "do not exist" on Windows; `lock` drops deps; `update <name>` ignores the name |

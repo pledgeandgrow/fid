@@ -84,8 +84,10 @@ runtime; that has not been rechecked since.
 The language is what `fid` accepts, described in [reference.md](reference.md).
 `fidesc` checks less (see
 [language-guide.md § 10](language-guide.md#where-fid-and-fidesc-differ-nov-4)).
-Two known inconsistencies: `fid version` prints `fid 0.1.0` while the release
-is v1.0.0, and the work since v1.0.0 is not yet in a release.
+`fid version` prints `<base>+dev` — `1.0.0+dev` on a dev build, the release
+version on a release build (compiler/build_info.fd, fixed Nov 19; the
+`fid 0.1.0` print is gone). The work since v1.0.0 (Sep 9) is committed on
+`main` as "1.0 release preparation" but is not yet in a tagged release.
 
 ## Releases
 

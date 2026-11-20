@@ -2,22 +2,29 @@
 
 > Consolidated 2026-10-24 from roadmap/, features-roadmap, release-roadmap, selfhost-roadmap, roadmap-issues, roadmap-limitations, opportunities.
 
-## Current status (Nov 6, 2026)
+## Current status (Nov 19, 2026 — "1.0 release preparation" commit)
 
 The sections below are history. What is true now:
 
-- `fid` (self-hosted, `compiler/*.fd`, 68 modules, 158,516 lines) is the
+- `fid` (self-hosted, `compiler/*.fd`, 80 modules, 360,594 lines) is the
   release compiler. The 3-stage bootstrap reaches a byte-identical fixpoint
-  (stage 2 C == stage 3 C, 49 MB). `fidesc` (Rust, `src/*.rs`, 57 files) is
+  (stage 2 C == stage 3 C, 49 MB — last verified Nov 8, before the ~2.3x
+  growth; re-verify for release). `fidesc` (Rust, `src/*.rs`, 57 files) is
   frozen: it builds stage 1 and runs the test harness.
-- Release v1.0.0 (Sep 9, 2026). `fid version` still prints `fid 0.1.0`. Work
-  since v1.0.0 is uncommitted on `main`.
+- Release v1.0.0 (Sep 9, 2026); v0.8.0-unstable prerelease (Nov 10).
+  `fid version` prints `1.0.0+dev` on dev builds (build_info.fd). Work since
+  Nov 10 is committed on `main` as "1.0 release preparation" (49fb2b9).
 - Backends: interpreter (`fid run`), C (`fid ccompile`), native Windows x64
-  (`fid emit`, no C compiler). Linux x64 through C. ARM64, RISC-V, WASM,
-  macOS, native ELF and bare metal are experimental or incomplete.
+  (`fid emit`, no C compiler), native Linux x64/AArch64/RISC-V
+  (`emit --target`), native WASM (`fid wasm`, 316/344 suite tests),
+  native macOS Mach-O + universal (builds, not run), Cortex-M Thumb-2,
+  UEFI/multiboot images. Bare metal and the retired PIR path incomplete.
 - Last full suite: Nov 2 (`fidesc test`): interpreter 339/339, C 343/343, PE
-  345/345, expected-fail 89/89. Not rerun with the Nov 4–6 compiler.
-- Self-compile: about 133 s (`fidesc`: about 21 s).
+  345/345, expected-fail 89/89 — on a suite a third of today's size
+  (1,752 bootstrap + 1,596 conformance programs). The binaries in
+  `release/` predate the current stdlib; rebuild with build-selfhost.sh.
+- Self-compile: ~74 s at -O2 when the compiler was 159K lines (Nov 9);
+  it is 361K lines now.
 - Done in `fid` on Nov 4–6: generics with inference, checked bounds and
   turbofish (proposal 0002); `if`/`match` as expressions; `@cfg`; frees of
   `Vec`/`HashMap` locals, owned elements, region collections and string

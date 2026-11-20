@@ -8,23 +8,31 @@ reference.md is right. Counts: [selfhost.md → Numbers](selfhost.md#numbers).*
 *See `docs/reference/syntax.md` for the language syntax and
 [safety-rules.md](safety-rules.md) for the safety annotations.*
 
-## Current State (Nov 6, 2026)
+## Current State (Nov 19, 2026 — "1.0 release preparation" commit)
 
-- Compiler: `compiler/*.fd`, 68 modules, 158,516 lines; `src/*.rs` (frozen
-  bootstrap reference and test harness), 57 files, 112,511 lines; stdlib 137
-  modules, 51,496 lines (+ 4 in `stdlib/pe_runtime/`, 5 in `stdlib/linux_runtime/`).
-- Tests: 543 `.fd` under `tests/bootstrap/` (502 top level, 105 of them
-  expected-fail `*_fail.fd`), 51 in `tests/selfhost/`, 104 in
-  `tests/conformance/`, 3 in `tests/leaks/`, 11 examples.
-- Fixpoint: stage 2 C == stage 3 C, 49 MB (Nov 6). Self-compile ~133 s.
+- Compiler: `compiler/*.fd`, 80 modules, 360,594 lines; `src/*.rs` (frozen
+  bootstrap reference and test harness), 57 files, 113,416 lines; stdlib 403
+  modules, 259,299 lines (+ 4 in `stdlib/pe_runtime/`, 7 in
+  `stdlib/linux_runtime/` incl. `darwin.fd` and `wasi.fd`).
+- Tests: 1,752 `.fd` under `tests/bootstrap/` (1,681 top level, 456 of them
+  expected-fail `*_fail.fd`), 57 in `tests/selfhost/`, 1,596 in
+  `tests/conformance/`, 10 in `tests/leaks/`, 68 in `tests/nattools/`, 52 in
+  `tests/projects/`, 50 in `tests/verify/`, 14 + 126 check scripts in
+  `tests/tooling/`, 12 examples, 12 tools in `tools/`.
+- Fixpoint: stage 2 C == stage 3 C, 49 MB (Nov 6; last verified before the
+  ~2.3x Nov 10–19 growth — re-verification is part of the release prep).
+  Self-compile ~74 s when the compiler was 159K lines (Nov 9).
 - Last full suite run: Nov 2 (Rust harness, `fidesc` as compiler): interp
-  339/339, C 343/343, PE 345/345, expected-fail 89/89. Not rerun with the
-  Nov 4–6 compiler; the features below were checked with `fid run`,
-  `fid ccompile` and `fid emit` on their tests.
+  339/339, C 343/343, PE 345/345, expected-fail 89/89 — on a suite a third
+  of today's size. The `fid`/`fid-dev` binaries in `release/` predate the
+  current stdlib and fail to parse `stdlib/core.fd`; rebuild with
+  `scripts/build-selfhost.sh`.
 - Backends: interpreter (`fid run`), C (`fid ccompile`, needs zig cc, clang,
-  gcc or cl), native Windows x64 (`fid emit`, no C compiler). Linux x64 goes
-  through C. ARM64, RISC-V, WASM, macOS, native ELF and bare metal are
-  experimental / incomplete.
+  gcc or cl), native Windows x64 (`fid emit`, no C compiler), native Linux
+  x64/AArch64/RISC-V (`fid emit --target`), native WASM (`fid wasm`), macOS
+  Mach-O and universal binaries (build, not run), Cortex-M Thumb-2, UEFI
+  and multiboot images. Linux x64 through C also works. Bare metal and the
+  retired PIR path are incomplete.
 
 ### New in `fid` since Nov 3
 
@@ -261,7 +269,7 @@ reference.md is right. Counts: [selfhost.md → Numbers](selfhost.md#numbers).*
 | `use ... *` glob imports | ⚠️ | Parsed; same as a plain `use` |
 | Re-exports | ✅ | |
 | Multi-file modules | ✅ | |
-| Standard library (stdlib/core.fd) | ✅ | core is auto-imported. 146 modules, 51,496 lines (Nov 9), among them: core, vec, math, string, fmt, bits, sort, hash, iter, stack, queue, buffer, collections, result, random, path, units, uuid, crypto, storage, clinical, medical, ecu, scada, swift, grid, ota, banking, kv_cache, quant, dp, shard, fs, io, os, sys, ecs, events, parallel, sync, channel, db, http, json, shape, simd, tensor, money, alloc, file, time, typed_strings, memo, privacy, env, args, process, regex, tilemap, sprite, flowfield, streaming, scene, physics, audio, input, arinc, can, task. (uefi and kernel moved to fides-os.) |
+| Standard library (stdlib/core.fd) | ✅ | core is auto-imported. 403 modules, 259,299 lines (Nov 19), spanning core/collections, text/data formats, HTTP/2/3+QUIC, TLS 1.3, databases, post-quantum crypto, industrial/energy protocols, automotive/robotics, kernel drivers and embedded peripherals, games/graphics, media, ML, mobile/desktop interop and finance — grouped list in `AGENTS.md` → Current Baseline. (uefi and kernel moved to fides-os.) |
 
 ### Capabilities (Security)
 
@@ -839,7 +847,7 @@ suite run is Nov 2 (interp 339/339, C 343/343, PE 345/345, expected-fail
 |---------|--------|-------|
 | Self-compilation | ✅ | `fides-c.exe` compiles `compiler/main.fd` → up to `fides-c5.exe` (5 generations; session-24 regression fixed in session 26) |
 | Bootstrap fixpoint | ✅ | stage 2 == stage 3 byte-identical (49 MB of C, Nov 6), checked by `RELEASE=1 scripts/bootstrap.sh` on every release build; stage 1 comes from a pinned stage 0 when one exists (`PIN=1` pins one; none yet), otherwise from `fidesc` |
-| Self-host modules | ✅ | 68 `.fd` modules, 158,516 lines (Nov 9; was 25/61K in session 15) |
+| Self-host modules | ✅ | 80 `.fd` modules, 360,594 lines (Nov 19; was 68/159K Nov 9, 25/61K in session 15) |
 | Self-host tests | ✅ | 51 programs in `tests/selfhost/` (`verify-selfhost.sh`; saved baseline 36/47×3) |
 | Self-compile time | ✅ | ~133 s (type check 59 s, borrow check 16 s, lowering 20 s, C generation 12 s; Nov 6); `fidesc` ~21 s |
 | PE emitter (self-hosted) | ✅ | `fid emit` (`compiler/pe_ir*.fd`) makes native Windows executables with no C compiler and reaches a byte-identical fixpoint. The older `build --native` pipeline (default target: compiler.fd `build_executable`, PIR → opt → codegen_x64 → elf64 → linker) crashes in opt.fd `pass_jump_thread`; compiler/pe.fd is reached only by `emit --boot`, which panics |
