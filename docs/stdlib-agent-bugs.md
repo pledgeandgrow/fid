@@ -179,12 +179,17 @@ From the stdlib repair pass (queue/stack/set generics attempt; repros build/t_ge
     one).
 
 From the stdlib capability pass (parallel/arena/collections; repros build/t_par*.fd):
-60. A typed `Vec<i64>` passed through `spawn` arrives *shared*: the worker's
-    first owning write (Vec_set, push) copy-on-writes into a private buffer
-    and the caller never sees the writes — silently. Reads (Vec_get) are
-    unaffected, which is why par_sum looked fine. Workaround used in
-    parallel.fd: pass the Vec as a raw i64 word (`v as i64`) and write
-    through `unsafe` pointers; the caller stays the sole owner.
+60. RESOLVED (Nov 20): spawn args are whole deep copies — `Lowerer_spawn_call`
+    (compiler/lower.fd) inserts `p_send_copy` (stdlib/core.fd: str, Vec with
+    sized or recursive elements, HashMap with keys and values), and a
+    generated wrapper frees the copies when the task body ends. Pinned by
+    tests/bootstrap/test_spawn_vec_copy.fd, test_spawn_mutate_both.fd and
+    test_spawn_deep_copy.fd (parent and task each mutate their own value;
+    `Vec<i64>` verified on interpreter and C; `Vec<str>`/HashMap need a fid
+    built by itself — a stage-1 binary's 1 MB task stacks overflow in the
+    recursive drop, a messaged panic, not corruption). The original report:
+    a typed `Vec<i64>` passed through `spawn` arrived *shared*; workers
+    copy-on-wrote invisibly to the caller.
 61. impl-method module attribution bug: with `use collections` (impl
     HashSet) and `use set` (HashSet_* free functions) together, the
     collections' impl-HashSet method bodies are checked under module

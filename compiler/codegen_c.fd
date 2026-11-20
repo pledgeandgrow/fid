@@ -1667,6 +1667,11 @@ fn cg_is_value_name(name: str) -> bool {
 }
 
 fn cg_libc_clash(name: str) -> bool {
+    // compiler/MSVC intrinsics that real headers macro-define (SDL's
+    // _ReadWriteBarrier), whatever their length: never prototype one
+    if name == "_ReadWriteBarrier" || name == "MemoryBarrier" || name == "_WriteBarrier" || name == "__fastfail" || name == "Assert" || name == "RtlSecurityAttribute" {
+        return true;
+    }
     var n: i64 = str_len(name);
     if n < 2 || n > 12 {
         return false;
@@ -2728,24 +2733,32 @@ fn emit_extern_decls(self: & mut CCodeGen, module: IrModule) -> void {
         }
 
         var inc_missing: bool = false;
-        // A system header (<...>) already declares the function: emit only
-        // the #define rename, not a conflicting forward declaration (printf
-        // is variadic in <stdio.h> but the FFI decl has fixed args).
-        var is_system_include: bool = false;
+        var has_include: bool = false;
+        // The include (system `<...>` or quoted) already declares the
+        // function: emit only the #define rename, not a conflicting forward
+        // declaration (printf is variadic in <stdio.h> but the FFI decl has
+        // fixed args; _ReadWriteBarrier is a macro in SDL's headers).
         match ext.include {
             OptStr::Some(inc) => {
+                has_include = true;
                 inc_missing = vec_contains_str(missing_includes, inc);
-                is_system_include = str_starts_with(inc, "<");
             }
             OptStr::None => {
             }
         }
-        if !inc_missing && is_system_include && ext.pledge_name != ext.c_name {
-            wln(self, "#define " + ext.pledge_name + " " + ext.c_name);
-        } else if !inc_missing && is_system_include {
-            // LG15: the system header declares it as it is (`int abs(int)`):
-            // a prototype of ours with Fides widths would conflict
-        } else if inc_missing {
+        if cg_libc_clash(ext.c_name) {
+            // a libc name (alloca, strdup, ...): the compiler or the headers
+            // declare or macro-define it; a prototype of ours with Fides
+            // widths conflicts with the builtin
+            if ext.pledge_name != ext.c_name {
+                wln(self, "#define " + ext.pledge_name + " " + ext.c_name);
+            }
+        } else if has_include && !inc_missing {
+            // the header declares it as it is
+            if ext.pledge_name != ext.c_name {
+                wln(self, "#define " + ext.pledge_name + " " + ext.c_name);
+            }
+        } else if has_include && inc_missing {
             var ret_default: str = "0";
             match ext.ret_ty {
                 Type::F32 => {
@@ -2767,6 +2780,13 @@ fn emit_extern_decls(self: & mut CCodeGen, module: IrModule) -> void {
                 _ => {
                     wln(self, ret_c + " " + ext.pledge_name + "(" + params_str + ") { return " + ret_default + "; }");
                 }
+            }
+        } else if !inc_missing && cg_libc_clash(ext.c_name) {
+            // a quoted include (SDL.h) also reaches libc builtins: alloca,
+            // strdup and the like are declared by the compiler itself, and a
+            // prototype of ours with Fides widths conflicts with the builtin
+            if ext.pledge_name != ext.c_name {
+                wln(self, "#define " + ext.pledge_name + " " + ext.c_name);
             }
         } else {
             wln(self, ret_c + " " + ext.c_name + "(" + params_str + ");");
