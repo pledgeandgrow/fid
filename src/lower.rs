@@ -195,6 +195,14 @@ pub struct Lowerer {
     /// Loop context — (continue_target, break_target, result_slot) stack
     /// result_slot is Some(alloca) for loop-as-expression, None for plain loops
     loop_stack: Vec<(BlockId, BlockId, Option<ValueId>)>,
+    /// CA8: timeout(ms) { } blocks — the deadline token of each block
+    /// currently open (innermost last) and the loop depth it was opened at
+    /// (return restores all; break/continue restore the ones opened inside
+    /// the loop they leave).
+    timeout_toks: Vec<(ValueId, usize)>,
+    /// The `hit` value of the innermost closed timeout block, read by
+    /// `__timeout_expired()`.
+    last_timeout_hit: Option<ValueId>,
     /// Struct definitions from AST (for layout computation)
     structs: HashMap<String, StructDef>,
     /// Mutable variables that have been allocated on the stack (alloca pattern)
@@ -338,6 +346,10 @@ impl Lowerer {
             current_func: None,
             current_block: BlockId(0),
             loop_stack: Vec::new(),
+            // CA8: timeout(ms) { } — open deadline tokens (innermost last)
+            timeout_toks: Vec::new(),
+            // CA8: the hit flag of the innermost closed timeout block
+            last_timeout_hit: None,
             structs: HashMap::new(),
             allocas: HashMap::new(),
             alloca_types: HashMap::new(),
@@ -1043,16 +1055,18 @@ impl Lowerer {
         // stdin / stdout
         self.module.add_extern("p_flush_stdout", vec![], IrType::Void);
         self.module.add_extern("p_stdin_eof", vec![], IrType::I64);
-        // p_read_line() -> *u8 — one line without the trailing newline; NULL at EOF
-        self.module.add_extern("p_read_line", vec![], IrType::Ptr(Box::new(IrType::U8)));
-        // p_read_stdin(n: i64) -> *u8 — up to n raw bytes from stdin
-        self.module.add_extern("p_read_stdin", vec![IrType::I64], IrType::Ptr(Box::new(IrType::U8)));
+        // p_read_line() -> i64 — raw address of one line without the trailing
+        // newline; 0 at EOF (wrap with read_line/p_str_take, AGENTS §25)
+        self.module.add_extern("p_read_line", vec![], IrType::I64);
+        // p_read_stdin(n: i64) -> i64 — raw address of up to n raw bytes from stdin
+        self.module.add_extern("p_read_stdin", vec![IrType::I64], IrType::I64);
 
-        // p_file_read(path: *u8) -> *u8  — read entire file, return content as string
+        // p_file_read(path: *u8) -> i64 — raw address of the file's content, 0 on
+        // failure (wrap with read_file/p_str_take, AGENTS §25)
         // p_file_write(path: *u8, content: *u8) -> i64  — write content to file, return 0 on success, -1 on error
         // p_file_exists(path: *u8) -> bool  — check if file exists
         // p_file_append(path: *u8, content: *u8) -> i64  — append content to file
-        self.module.add_extern("p_file_read", vec![IrType::Ptr(Box::new(IrType::U8))], IrType::Ptr(Box::new(IrType::U8)));
+        self.module.add_extern("p_file_read", vec![IrType::Ptr(Box::new(IrType::U8))], IrType::I64);
         self.module.add_extern("p_file_write", vec![IrType::Ptr(Box::new(IrType::U8)), IrType::Ptr(Box::new(IrType::U8))], IrType::I64);
         self.module.add_extern("p_file_write_bin", vec![IrType::Ptr(Box::new(IrType::U8)), IrType::Ptr(Box::new(IrType::U8)), IrType::I64], IrType::I64);
         self.module.add_extern("p_file_write_vec", vec![IrType::Ptr(Box::new(IrType::U8)), IrType::Ptr(Box::new(IrType::U8))], IrType::I64);
@@ -1138,14 +1152,16 @@ impl Lowerer {
         self.module.add_extern("p_serial_ready", vec![], IrType::I64);           // check if data available
 
         // ─── Environment variable builtins ───
-        // p_getenv(name: *u8) -> *u8  — get environment variable value (null if not set)
-        self.module.add_extern("p_getenv", vec![IrType::Ptr(Box::new(IrType::U8))], IrType::Ptr(Box::new(IrType::U8)));
+        // p_getenv(name: *u8) -> i64  — raw address of the value (0 when unset);
+        // wrap with env_var/p_str_adopt (stdlib core.fd, AGENTS §25)
+        self.module.add_extern("p_getenv", vec![IrType::Ptr(Box::new(IrType::U8))], IrType::I64);
 
         // ─── Command-line argument builtins ───
         // p_argc() -> i64  — number of command-line arguments
         self.module.add_extern("p_argc", vec![], IrType::I64);
-        // p_argv(index: i64) -> *u8  — get command-line argument by index (null if out of bounds)
-        self.module.add_extern("p_argv", vec![IrType::I64], IrType::Ptr(Box::new(IrType::U8)));
+        // p_argv(index: i64) -> i64  — raw address of the argument (0 when out of
+        // bounds); wrap with arg_at/p_str_take (stdlib core.fd, AGENTS §25)
+        self.module.add_extern("p_argv", vec![IrType::I64], IrType::I64);
 
         // ─── Process control builtins ───
         // p_system(cmd: *u8) -> i64  — run a shell command, return exit status
@@ -1266,6 +1282,13 @@ impl Lowerer {
         self.module.add_extern("p_task_poll_nonblocking", vec![IrType::I64], IrType::I64);
         // p_task_wait_timeout(future, ms) -> i64 — poll until ready or deadline; TIMEOUT_SENTINEL on expiry
         self.module.add_extern("p_task_wait_timeout", vec![IrType::I64, IrType::I64], IrType::I64);
+        // CA8: timeout(ms) { } — the running task's deadline-token slot.
+        // p_clock_mono_ms() -> i64 — monotonic clock in milliseconds
+        self.module.add_extern("p_clock_mono_ms", vec![], IrType::I64);
+        // p_task_token() -> i64 — the slot's current token (0 when empty)
+        self.module.add_extern("p_task_token", vec![], IrType::I64);
+        // p_task_set_token(tok) -> i64 — install tok, return the previous one
+        self.module.add_extern("p_task_set_token", vec![IrType::I64], IrType::I64);
         // ─── Phase A3: Non-blocking IO ───
         // p_net_connect(host: *u8, port: i64) -> i64 (Future handle)
         self.module.add_extern("p_net_connect",
@@ -2678,10 +2701,26 @@ impl Lowerer {
                 // Save persist variables before returning
                 self.emit_persist_saves();
 
+                // CA8: restore every open timeout(ms) { } token on the way out
+                if !self.timeout_toks.is_empty() {
+                    self.timeout_unwind(None);
+                }
+
                 self.emit_terminator(Inst::Return { value: ret_val });
             }
 
             Stmt::If { cond, then_block, else_block, line: _ } => {
+                // CA8: `timeout(ms) { body }` parses to
+                // `if __timeout_block(ms) { body }` — the body runs
+                // unconditionally with the block's deadline token installed.
+                if let Expr::Call { callee, args } = cond {
+                    if callee == "__timeout_block" && args.len() == 1 {
+                        let ms = args[0].clone();
+                        let body = then_block.clone();
+                        self.lower_timeout(ms, &body);
+                        return;
+                    }
+                }
                 self.lower_if(cond, then_block, else_block.as_ref());
             }
 
@@ -2707,6 +2746,11 @@ impl Lowerer {
                             self.emit_inst(Inst::Store { ptr: slot, value: val, store_ty: None });
                         }
                     }
+                    // CA8: restore the timeout tokens opened inside the loop
+                    // being broken out of
+                    if !self.timeout_toks.is_empty() {
+                        self.timeout_unwind(Some(self.loop_stack.len()));
+                    }
                     self.emit_terminator(Inst::Jump { target: break_target });
                 }
             }
@@ -2714,6 +2758,11 @@ impl Lowerer {
             Stmt::Continue(_) => {
                 if let Some((continue_block, _, _)) = self.loop_stack.last() {
                     let continue_target = *continue_block;
+                    // CA8: restore the timeout tokens opened inside the loop
+                    // being continued out of
+                    if !self.timeout_toks.is_empty() {
+                        self.timeout_unwind(Some(self.loop_stack.len()));
+                    }
                     self.emit_terminator(Inst::Jump { target: continue_target });
                 }
             }
@@ -3026,6 +3075,133 @@ impl Lowerer {
     }
 
     /// Lower an if statement
+    /// CA8: `timeout(ms) { body }` (parsed to `if __timeout_block(ms) { body }`).
+    /// Runs the body unconditionally with a deadline token installed in the
+    /// running task's token slot; the slot gets its old token back when the
+    /// body ends, however it ends (return/break/continue restore it on their
+    /// way out). Mirrors compiler/lower.fd Lowerer_lower_timeout; the token is
+    /// `[hit: i64][deadline_mono_ms: i64][parent: i64]` (24 bytes).
+    fn lower_timeout(&mut self, ms: Expr, body: &[Stmt]) {
+        // ms → i64
+        let ms_val = self.lower_expr(&ms);
+        let ms_ty = self.get_value_type(ms_val);
+        let ms_i64 = self.lower_cast(ms_val, ms_ty, IrType::I64);
+
+        // tok = p_malloc(24) as i64; *tok = 0
+        let size = self.emit_inst(Inst::ConstInt { value: 24, ty: IrType::I64 });
+        let raw = self.emit_inst(Inst::Call {
+            func: "p_malloc".to_string(),
+            args: vec![size],
+            ret_ty: IrType::Ptr(Box::new(IrType::U8)),
+            effects: EffectSet::new(),
+        });
+        let tok = self.emit_inst(Inst::BitCast { value: raw, from: IrType::Ptr(Box::new(IrType::U8)), to: IrType::I64 });
+        let zero = self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 });
+        self.emit_inst(Inst::Call {
+            func: "p_atomic_store".to_string(),
+            args: vec![tok, zero],
+            ret_ty: IrType::Void,
+            effects: EffectSet::new(),
+        });
+        // *(tok+8) = p_clock_mono_ms() + ms
+        let now = self.emit_inst(Inst::Call {
+            func: "p_clock_mono_ms".to_string(),
+            args: vec![],
+            ret_ty: IrType::I64,
+            effects: EffectSet::new(),
+        });
+        let deadline = self.emit_inst(Inst::BinOp { op: BinOp::Add, left: now, right: ms_i64, ty: IrType::I64 });
+        let eight = self.emit_inst(Inst::ConstInt { value: 8, ty: IrType::I64 });
+        let dl_at = self.emit_inst(Inst::BinOp { op: BinOp::Add, left: tok, right: eight, ty: IrType::I64 });
+        self.emit_inst(Inst::Call {
+            func: "p_atomic_store".to_string(),
+            args: vec![dl_at, deadline],
+            ret_ty: IrType::Void,
+            effects: EffectSet::new(),
+        });
+        // *(tok+16) = prev = p_task_set_token(tok)
+        let prev = self.emit_inst(Inst::Call {
+            func: "p_task_set_token".to_string(),
+            args: vec![tok],
+            ret_ty: IrType::I64,
+            effects: EffectSet::new(),
+        });
+        let sixteen = self.emit_inst(Inst::ConstInt { value: 16, ty: IrType::I64 });
+        let prev_at = self.emit_inst(Inst::BinOp { op: BinOp::Add, left: tok, right: sixteen, ty: IrType::I64 });
+        self.emit_inst(Inst::Call {
+            func: "p_atomic_store".to_string(),
+            args: vec![prev_at, prev],
+            ret_ty: IrType::Void,
+            effects: EffectSet::new(),
+        });
+
+        let depth = self.timeout_toks.len();
+        let loops_now = self.loop_stack.len();
+        self.timeout_toks.push((tok, loops_now));
+
+        // body (unconditional)
+        let body_block = self.new_block();
+        let end_block = self.new_block();
+        self.emit_terminator(Inst::Jump { target: body_block });
+        self.set_current_block(body_block);
+        self.lower_stmts(body);
+        if !self.current_block_has_terminator() {
+            self.emit_terminator(Inst::Jump { target: end_block });
+        }
+
+        self.timeout_toks.truncate(depth);
+        self.set_current_block(end_block);
+        let hit = self.timeout_leave(tok);
+        self.last_timeout_hit = Some(hit);
+    }
+
+    /// CA8: restore the parent token, free `tok`, and return its hit flag.
+    fn timeout_leave(&mut self, tok: ValueId) -> ValueId {
+        let sixteen = self.emit_inst(Inst::ConstInt { value: 16, ty: IrType::I64 });
+        let prev_at = self.emit_inst(Inst::BinOp { op: BinOp::Add, left: tok, right: sixteen, ty: IrType::I64 });
+        let parent = self.emit_inst(Inst::Call {
+            func: "p_atomic_load".to_string(),
+            args: vec![prev_at],
+            ret_ty: IrType::I64,
+            effects: EffectSet::new(),
+        });
+        self.emit_inst(Inst::Call {
+            func: "p_task_set_token".to_string(),
+            args: vec![parent],
+            ret_ty: IrType::I64,
+            effects: EffectSet::new(),
+        });
+        let hit = self.emit_inst(Inst::Call {
+            func: "p_atomic_load".to_string(),
+            args: vec![tok],
+            ret_ty: IrType::I64,
+            effects: EffectSet::new(),
+        });
+        let fp = self.emit_inst(Inst::BitCast { value: tok, from: IrType::I64, to: IrType::Ptr(Box::new(IrType::U8)) });
+        self.emit_inst(Inst::Call {
+            func: "p_free".to_string(),
+            args: vec![fp],
+            ret_ty: IrType::Void,
+            effects: EffectSet::new(),
+        });
+        hit
+    }
+
+    /// CA8: restore the tokens of the timeout blocks a return/break/continue
+    /// leaves: `return` all of them; `break`/`continue` the ones opened at a
+    /// loop depth >= `min_depth` (inside the loop being left). Does not pop
+    /// the stack — the blocks' own leave code (in their end block) still
+    /// expects its entry there.
+    fn timeout_unwind(&mut self, min_depth: Option<usize>) {
+        let toks: Vec<ValueId> = self.timeout_toks.iter()
+            .filter(|(_, d)| min_depth.map_or(true, |m| *d >= m))
+            .map(|(t, _)| *t)
+            .collect();
+        for t in toks.into_iter().rev() {
+            self.timeout_leave(t);
+        }
+    }
+
     fn lower_if(&mut self, cond: &Expr, then_block: &[Stmt], else_block: Option<&Vec<Stmt>>) {
         let cond_val = self.lower_expr(cond);
 
@@ -4575,6 +4751,14 @@ impl Lowerer {
             }
 
             Expr::Call { callee, args } => {
+                // CA8: `if __timeout_expired() { late }` reads the hit flag of
+                // the innermost closed timeout block
+                if callee == "__timeout_expired" && args.is_empty() {
+                    return match self.last_timeout_hit {
+                        Some(hit) => hit,
+                        None => self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 }),
+                    };
+                }
                 let extern_params = self.module.extern_functions.get(callee).map(|(p, _)| p.clone());
                 let arg_vals: Vec<ValueId> = args.iter().enumerate()
                     .map(|(i, a)| match (a, extern_params.as_ref().and_then(|p| p.get(i))) {

@@ -5648,6 +5648,25 @@ impl Interpreter {
                     ExecOutcome::Panic("block_on: already consumed".to_string())
                 }
             }
+            // CA8: timeout(ms) { } — the deadline-token slot of the running
+            // task (one per OS thread here) and a monotonic clock.
+            "p_clock_mono_ms" => {
+                static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+                let start = START.get_or_init(std::time::Instant::now);
+                ExecOutcome::Value(Value::Int(start.elapsed().as_millis() as i64))
+            }
+            "p_task_token" => {
+                thread_local! { static TOKEN: std::cell::Cell<i64> = const { std::cell::Cell::new(0) }; }
+                ExecOutcome::Value(Value::Int(TOKEN.with(|t| t.get())))
+            }
+            "p_task_set_token" => {
+                thread_local! { static TOKEN: std::cell::Cell<i64> = const { std::cell::Cell::new(0) }; }
+                let new = match args.first() {
+                    Some(Value::Int(n)) => *n,
+                    _ => 0,
+                };
+                ExecOutcome::Value(Value::Int(TOKEN.with(|t| t.replace(new))))
+            }
             "p_task_poll" => {
                 // p_task_poll(future: i64) -> i64
                 // For A1: blocks (joins the thread) to get the value.

@@ -894,6 +894,17 @@ impl TypeChecker {
             self.item_modules.insert(func.name.clone(), module.to_string());
             self.item_visibility.insert(func.name.clone(), func.is_pub);
             self.item_lines.insert(func.name.clone(), func.line);
+            // A self-style method (`fn m(self: &mut Struct, ..)` — fid declares
+            // methods as free functions): also register the mangled
+            // StructName_m form. The unmangled name collides across modules
+            // (borrowck's `check`, typechecker's `check`) and last-wins
+            // attribution then blames private calls on the wrong module.
+            if func.params.first().map_or(false, |p| p.name == "self") {
+                if let Some(sname) = Self::self_param_struct(&func.params[0].ty) {
+                    let mangled = format!("{}_{}", sname, func.name);
+                    self.item_modules.insert(mangled, module.to_string());
+                }
+            }
         }
 
         // Register extern function declarations
@@ -4094,6 +4105,20 @@ impl TypeChecker {
         }
     }
 
+    /// The struct a `self` parameter is bound to: `&mut Foo`/`&Foo`/`Foo` → Foo.
+    /// Used to attribute fid's self-style methods (`fn m(self: &mut Foo, ..)`
+    /// declared as free functions) to their defining module.
+    fn self_param_struct(ty: &Type) -> Option<String> {
+        match ty {
+            Type::Named(s) => Some(s.clone()),
+            Type::Ref { inner, .. } => match &**inner {
+                Type::Named(s) => Some(s.clone()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// Check if an item is accessible from the current module.
     /// Private items are only accessible from within their own module.
     fn check_visibility(&mut self, name: &str) {
@@ -4683,6 +4708,26 @@ impl TypeChecker {
                 self.current_module = mod_name.clone();
             } else if let Some(mod_name) = self.item_modules.get(&func.name) {
                 self.current_module = mod_name.clone();
+            }
+        } else if func.params.first().map_or(false, |p| p.name == "self") {
+            // A self-style method (fid's `fn m(self: &mut Struct, ..)` free
+            // functions): attribute via the unique StructName_m form when the
+            // struct is nameable — the unmangled name can be registered by
+            // several modules (borrowck's `check`, typechecker's `check`) and
+            // last-wins blames private calls on the wrong module. Generic
+            // receivers (`self: &mut Vec<i64>`) fall back to the plain name.
+            let mut attributed = false;
+            if let Some(sname) = Self::self_param_struct(&func.params[0].ty) {
+                let smangled = format!("{}_{}", sname, func.name);
+                if let Some(mod_name) = self.item_modules.get(&smangled) {
+                    self.current_module = mod_name.clone();
+                    attributed = true;
+                }
+            }
+            if !attributed {
+                if let Some(mod_name) = self.item_modules.get(&func.name) {
+                    self.current_module = mod_name.clone();
+                }
             }
         } else if let Some(mod_name) = self.item_modules.get(&func.name) {
             self.current_module = mod_name.clone();
@@ -6327,6 +6372,31 @@ impl TypeChecker {
                     return Type::Void;
                 }
 
+                // CA8: `timeout(ms) { .. } else { .. }` (parser
+                // parse_timeout_stmt): `if __timeout_block(ms) { body }` and
+                // `if __timeout_expired() { late }`; lower.rs runs the body
+                // with the block's deadline token installed
+                if callee == "__timeout_block" {
+                    if args.len() != 1 {
+                        self.errors.push(format!(
+                            "Type error (line {}): timeout takes one value, the time in milliseconds: `timeout(ms) {{ .. }}`",
+                            self.current_line
+                        ));
+                        return Type::Bool;
+                    }
+                    let tbt = arg_types[0].clone();
+                    if !self.is_integer(&tbt) {
+                        self.errors.push(format!(
+                            "Type error (line {}): timeout(ms) takes the time in milliseconds, an integer; got {:?}",
+                            self.current_line, tbt
+                        ));
+                    }
+                    return Type::Bool;
+                }
+                if callee == "__timeout_expired" {
+                    return Type::Bool;
+                }
+
                 // Check for runtime builtin functions (p_*)
                 if callee.starts_with("p_") {
                     // String-returning builtins return str, not i64
@@ -6345,13 +6415,7 @@ impl TypeChecker {
                         | "p_simd_to_str"
                         | "p_socket_recv_str"
                         | "p_http_build_response"
-                        | "p_read_line"
-                        | "p_read_stdin"
-                        | "p_file_read"
                         | "p_db_mem_query"
-                        | "p_getenv"
-                        | "p_env_get"
-                        | "p_argv"
                         | "p_process_stdout"
                         | "p_process_stderr"
                         | "p_dir_list"

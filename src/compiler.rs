@@ -9,6 +9,7 @@ use crate::lexer::Lexer;
 use crate::lower;
 use crate::mono;
 use crate::parser::Parser;
+use crate::token::{Token, TokenKind};
 use crate::typechecker::TypeChecker;
 use crate::x86;
 use crate::pe;
@@ -447,6 +448,12 @@ pub fn build_program_with_runtime(source: &str, source_path: Option<&str>, runti
                 // enum_names when we parse this module (e.g. compiler::lexer).
                 let mut pre_lex = Lexer::new(&module_source);
                 let pre_toks = pre_lex.tokenize();
+                // The import list comes from the tokens themselves: the
+                // parse-based extraction below returns NOTHING when the
+                // pre-parse trips over a struct literal of a type only a
+                // dependency defines (pe_ir.fd's PeFcFix), which would hide
+                // the module's own `use` lines and load it without its deps.
+                let token_imports = imports_from_tokens(&pre_toks);
                 let (pre_imports, pre_struct_names, pre_enum_names): (Vec<String>, Vec<String>, Vec<String>) = {
                     let mut pre_parser = Parser::with_names(
                         pre_toks,
@@ -457,12 +464,17 @@ pub fn build_program_with_runtime(source: &str, source_path: Option<&str>, runti
                     // defined in this module so they're available during the
                     // full parse (e.g. ParseResultIfExpr in parser.fd).
                     if let Ok(pre_prog) = pre_parser.parse() {
-                        let imports = pre_prog.imports.iter().map(|i| i.path.clone()).collect();
+                        let mut imports: Vec<String> = pre_prog.imports.iter().map(|i| i.path.clone()).collect();
+                        for ti in &token_imports {
+                            if !imports.contains(ti) {
+                                imports.push(ti.clone());
+                            }
+                        }
                         let snames = pre_prog.structs.iter().map(|s| s.name.clone()).collect();
                         let enames = pre_prog.enums.iter().map(|e| e.name.clone()).collect();
                         (imports, snames, enames)
                     } else {
-                        (Vec::new(), Vec::new(), Vec::new())
+                        (token_imports, Vec::new(), Vec::new())
                     }
                 };
 
@@ -504,7 +516,9 @@ pub fn build_program_with_runtime(source: &str, source_path: Option<&str>, runti
                 let mut lex = Lexer::new(&module_source);
                 let toks = lex.tokenize();
                 let mut p = Parser::with_names(toks, struct_names.clone(), enum_names.clone());
-                let imported = p.parse().map_err(|e| vec![e])?;
+                // Prefix parse errors with the module path: the parser only
+                // knows line numbers, and the merged program checks many files.
+                let imported = p.parse().map_err(|e| vec![format!("{}: {}", import_path, e)])?;
 
                 let module_name = imported.module.clone()
                     .unwrap_or_else(|| import_path.clone());
@@ -1504,6 +1518,44 @@ fn find_module_conflicts(modules: &[(&String, &Program)]) -> Vec<String> {
         }
     }
     errors
+}
+
+/// Extract `use <path>;` import paths from a token stream. Used by the
+/// module pre-scan: a full pre-parse can fail (e.g. a struct literal of a
+/// type only a dependency defines), and a failed pre-parse used to hide the
+/// module's own `use` lines, so it loaded without its dependencies.
+fn imports_from_tokens(toks: &[Token]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < toks.len() {
+        if toks[i].kind == TokenKind::Use {
+            i += 1;
+            let mut path = String::new();
+            while i < toks.len() {
+                match &toks[i].kind {
+                    TokenKind::Ident(n) => {
+                        if !path.is_empty() {
+                            path.push_str("::");
+                        }
+                        path.push_str(n);
+                    }
+                    TokenKind::DoubleColon => {}
+                    _ => break,
+                }
+                i += 1;
+            }
+            if !path.is_empty() {
+                out.push(path);
+            }
+            // Skip the rest of the use statement (as-alias, with-caps) to ';'
+            while i < toks.len() && toks[i].kind != TokenKind::Semicolon {
+                i += 1;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    out
 }
 
 fn merge_programs(stdlib: Program, user: Program) -> Program {

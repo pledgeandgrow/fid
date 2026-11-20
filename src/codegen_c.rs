@@ -1475,13 +1475,25 @@ impl CCodeGen {
         wln!(self, "int64_t p_file_delete(const char* path);");
         wln!(self, "int64_t p_file_size(const char* path);");
         wln!(self, "int64_t p_file_hash(const char* path);");
+        // File builtins the compiler's own sources use (ported from the
+        // self-hosted generator, compiler/codegen_c.fd)
+        wln!(self, "int64_t p_file_mtime_ms(const char* path);");
+        wln!(self, "void* p_file_read_at(const char* path, int64_t offset, int64_t n);");
+        wln!(self, "int64_t p_file_append_vec(const char* path, void* v);");
+        // Dynamic library loading (L6C)
+        wln!(self, "int64_t p_dl_load(const char* path);");
+        wln!(self, "int64_t p_dl_find(int64_t handle, const char* name);");
+        wln!(self, "int64_t p_dl_unload(int64_t handle);");
+        // Region bookkeeping accessor (proposal 0005): the bootstrap runtime
+        // has no region arenas, so the state stays "no regions open"
+        wln!(self, "int64_t p_region_word(int64_t op, int64_t x);");
         // Environment variable builtins
-        wln!(self, "char* p_getenv(const char* name);");
+        wln!(self, "int64_t p_getenv(const char* name);");
         // Command-line argument builtins — globals saved by main wrapper
         wln!(self, "static int __p_argc = 0;");
         wln!(self, "static char** __p_argv = NULL;");
         wln!(self, "int64_t p_argc(void);");
-        wln!(self, "char* p_argv(int64_t index);");
+        wln!(self, "int64_t p_argv(int64_t index);");
         // Process control builtins
         wln!(self, "int64_t p_system(const char* cmd);");
         wln!(self, "int64_t p_process_run(const char* cmd);");
@@ -1548,6 +1560,10 @@ impl CCodeGen {
         wln!(self, "bool p_atomic_cas(int64_t addr, int64_t expected, int64_t new_val);");
         wln!(self, "int64_t p_atomic_add(int64_t addr, int64_t val);");
         wln!(self, "int64_t p_atomic_sub(int64_t addr, int64_t val);");
+        // CA8: timeout(ms) { } — the running task's deadline-token slot
+        wln!(self, "int64_t p_clock_mono_ms(void);");
+        wln!(self, "int64_t p_task_token(void);");
+        wln!(self, "int64_t p_task_set_token(int64_t tok);");
         wln!(self, "int64_t p_rc_incr(int64_t rc_addr, int64_t val);");
         wln!(self, "void p_rc_decr(int64_t rc_addr, int64_t val);");
         wln!(self, "int64_t p_mutex_init(void);");
@@ -3559,11 +3575,118 @@ impl CCodeGen {
         wln!(self, "int64_t p_file_delete(const char* path) {{ return remove(path) == 0 ? 0 : -1; }}");
         wln!(self, "int64_t p_file_size(const char* path) {{ FILE* f = fopen(path, \"rb\"); if (!f) return -1; fseek(f, 0, SEEK_END); int64_t sz = ftell(f); fclose(f); return sz < 0 ? -1 : sz; }}");
         wln!(self, "int64_t p_file_hash(const char* path) { FILE* f = fopen(path, \"rb\"); if (!f) return 0; uint64_t h = 0xcbf29ce484222325ULL; unsigned char buf[65536]; size_t n; while ((n = fread(buf, 1, sizeof buf, f)) > 0) { for (size_t i = 0; i < n; i++) { h ^= buf[i]; h *= 0x100000001b3ULL; } } fclose(f); return (int64_t)h; }");
+        // File builtins the compiler's own sources use (ported from the
+        // self-hosted generator, compiler/codegen_c.fd)
+        wln!(self, "int64_t p_file_mtime_ms(const char* path) {{");
+        wln!(self, "    struct stat st;");
+        wln!(self, "    if (stat(path, &st) != 0) return -1;");
+        wln!(self, "#if defined(__APPLE__)");
+        wln!(self, "    return (int64_t)st.st_mtimespec.tv_sec * 1000 + (int64_t)st.st_mtimespec.tv_nsec / 1000000;");
+        wln!(self, "#elif (defined(__linux__) && (defined(__USE_XOPEN2K8) || !defined(__GLIBC__))) || defined(__FreeBSD__)");
+        wln!(self, "    return (int64_t)st.st_mtim.tv_sec * 1000 + (int64_t)st.st_mtim.tv_nsec / 1000000;");
+        wln!(self, "#else");
+        wln!(self, "    return (int64_t)st.st_mtime * 1000;");
+        wln!(self, "#endif");
+        wln!(self, "}}");
+        wln!(self, "void* p_file_read_at(const char* path, int64_t offset, int64_t n) {{");
+        wln!(self, "    PVec* v = p_vec_new();");
+        wln!(self, "    if (!path || offset < 0 || n <= 0) return (void*)v;");
+        wln!(self, "    if (n > ((int64_t)1 << 30)) n = (int64_t)1 << 30;");
+        wln!(self, "    FILE* f = fopen(path, \"rb\");");
+        wln!(self, "    if (!f) return (void*)v;");
+        wln!(self, "#ifdef _WIN32");
+        wln!(self, "    int sk = _fseeki64(f, (long long)offset, SEEK_SET);");
+        wln!(self, "#else");
+        wln!(self, "    int sk = fseeko(f, (off_t)offset, SEEK_SET);");
+        wln!(self, "#endif");
+        wln!(self, "    if (sk != 0) {{ fclose(f); return (void*)v; }}");
+        wln!(self, "    size_t chunk = n < 65536 ? (size_t)n : 65536;");
+        wln!(self, "    unsigned char* buf = (unsigned char*)malloc(chunk);");
+        wln!(self, "    if (!buf) {{ fclose(f); return (void*)v; }}");
+        wln!(self, "    int64_t left = n;");
+        wln!(self, "    while (left > 0) {{");
+        wln!(self, "        size_t want = left < (int64_t)chunk ? (size_t)left : chunk;");
+        wln!(self, "        size_t got = fread(buf, 1, want, f);");
+        wln!(self, "        for (size_t i = 0; i < got; i++) p_vec_push(v, (void*)(intptr_t)buf[i]);");
+        wln!(self, "        left -= (int64_t)got;");
+        wln!(self, "        if (got < want) break;");
+        wln!(self, "    }}");
+        wln!(self, "    free(buf); fclose(f); return (void*)v;");
+        wln!(self, "}}");
+        wln!(self, "int64_t p_file_append_vec(const char* path, void* vp) {{");
+        wln!(self, "    PVec* v = (PVec*)vp;");
+        wln!(self, "    if (!path) return -1;");
+        wln!(self, "    FILE* f = fopen(path, \"ab\");");
+        wln!(self, "    if (!f) return -1;");
+        wln!(self, "    int64_t len = v ? v->len : 0;");
+        wln!(self, "    if (len <= 0) {{ fclose(f); return 0; }}");
+        wln!(self, "    unsigned char* buf = (unsigned char*)malloc((size_t)len);");
+        wln!(self, "    if (!buf) {{ fclose(f); return -1; }}");
+        wln!(self, "    for (int64_t i = 0; i < len; i++) buf[i] = (unsigned char)(int64_t)P_VEC_AT(v, i);");
+        wln!(self, "    size_t w = fwrite(buf, 1, (size_t)len, f);");
+        wln!(self, "    free(buf);");
+        wln!(self, "    int c = fclose(f);");
+        wln!(self, "    return (w == (size_t)len && c == 0) ? 0 : -1;");
+        wln!(self, "}}");
+        // Dynamic library loading (L6C), ported from compiler/codegen_c.fd
+        wln!(self, "#ifdef _WIN32");
+        wln!(self, "int64_t p_dl_load(const char* path) {{");
+        wln!(self, "    if (!path || !*path) return 0;");
+        wln!(self, "    UINT old = SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX);");
+        wln!(self, "    HMODULE h = LoadLibraryA(path);");
+        wln!(self, "    SetErrorMode(old);");
+        wln!(self, "    return (int64_t)(intptr_t)h;");
+        wln!(self, "}}");
+        wln!(self, "int64_t p_dl_find(int64_t handle, const char* name) {{");
+        wln!(self, "    if (!handle || !name || !*name) return 0;");
+        wln!(self, "    return (int64_t)(intptr_t)GetProcAddress((HMODULE)(intptr_t)handle, name);");
+        wln!(self, "}}");
+        wln!(self, "int64_t p_dl_unload(int64_t handle) {{");
+        wln!(self, "    if (!handle) return -1;");
+        wln!(self, "    return FreeLibrary((HMODULE)(intptr_t)handle) ? 0 : -1;");
+        wln!(self, "}}");
+        wln!(self, "#elif defined(__wasi__)");
+        wln!(self, "int64_t p_dl_load(const char* path) { (void)path; return 0; }");
+        wln!(self, "int64_t p_dl_find(int64_t handle, const char* name) { (void)handle; (void)name; return 0; }");
+        wln!(self, "int64_t p_dl_unload(int64_t handle) { (void)handle; return -1; }");
+        wln!(self, "#else");
+        wln!(self, "int64_t p_dl_load(const char* path) {{");
+        wln!(self, "    if (!path || !*path) return 0;");
+        wln!(self, "    return (int64_t)(intptr_t)dlopen(path, RTLD_NOW | RTLD_LOCAL);");
+        wln!(self, "}}");
+        wln!(self, "int64_t p_dl_find(int64_t handle, const char* name) {{");
+        wln!(self, "    if (!handle || !name || !*name) return 0;");
+        wln!(self, "    return (int64_t)(intptr_t)dlsym((void*)(intptr_t)handle, name);");
+        wln!(self, "}}");
+        wln!(self, "int64_t p_dl_unload(int64_t handle) {{");
+        wln!(self, "    if (!handle) return -1;");
+        wln!(self, "    return dlclose((void*)(intptr_t)handle) == 0 ? 0 : -1;");
+        wln!(self, "}}");
+        wln!(self, "#endif");
+        // Region bookkeeping accessor (proposal 0005): the bootstrap runtime
+        // opens no region arenas, so op 0 (regions open) and op 1 (current)
+        // stay 0 and core's region-aware paths take the plain malloc/free
+        // route; op 2 (set current) reports "no previous one".
+        wln!(self, "int64_t p_region_word(int64_t op, int64_t x) {{ (void)x; if (op == 2) return 0; return 0; }}");
         // Environment variable builtins
-        wln!(self, "char* p_getenv(const char* name) {{ return getenv(name); }}");
+        // p_getenv/p_argv return COUNTED strings (proposal 0004 layout:
+        // [P_STR_RC + 1][len] bytes NUL), as fid's runtime does (runtime.fd
+        // p_str_wrap) — the stdlib and the compiler's own sources use the
+        // raw result as a str (pe_ir_enc.fd pe_dll_found).
+        wln!(self, "static char* __p_str_wrap(const char* s) {{");
+        wln!(self, "    if (!s) return NULL;");
+        wln!(self, "    size_t n = strlen(s);");
+        wln!(self, "    uint64_t* b = (uint64_t*)p_malloc((int64_t)(16 + n + 1));");
+        wln!(self, "    if (!b) return NULL;");
+        wln!(self, "    b[0] = 0x4649444500000000ULL + 1; /* P_STR_RC, one owner */");
+        wln!(self, "    b[1] = (uint64_t)n;");
+        wln!(self, "    memcpy((char*)(b + 2), s, n + 1);");
+        wln!(self, "    return (char*)(b + 2);");
+        wln!(self, "}}");
+        wln!(self, "int64_t p_getenv(const char* name) {{ return (int64_t)(intptr_t)__p_str_wrap(getenv(name)); }}");
         // Command-line argument builtins — globals declared in emit_runtime_types
         wln!(self, "int64_t p_argc(void) {{ return (int64_t)__p_argc; }}");
-        wln!(self, "char* p_argv(int64_t index) {{ if (index < 0 || index >= __p_argc) return NULL; return __p_argv[index]; }}");
+        wln!(self, "int64_t p_argv(int64_t index) {{ if (index < 0 || index >= __p_argc) return 0; return (int64_t)(intptr_t)__p_str_wrap(__p_argv[index]); }}");
         // Process control builtins
         wln!(self, "int64_t p_system(const char* cmd) {{");
         wln!(self, "    int st = system(cmd);");
@@ -3714,6 +3837,8 @@ impl CCodeGen {
         wln!(self, "int64_t p_clock_now(void) {{ struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); return (int64_t)ts.tv_sec * 1000000000LL + (int64_t)ts.tv_nsec; }}");
         wln!(self, "int64_t p_clock_now_us(void) {{ struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); return (int64_t)ts.tv_sec * 1000000LL + (int64_t)ts.tv_nsec / 1000; }}");
         wln!(self, "int64_t p_clock_now_ms(void) {{ struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); return (int64_t)ts.tv_sec * 1000LL + (int64_t)ts.tv_nsec / 1000000; }}");
+        wln!(self, "/* CA8: monotonic clock for timeout(ms) { } deadlines (never steps back) */");
+        wln!(self, "int64_t p_clock_mono_ms(void) {{ struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (int64_t)ts.tv_sec * 1000LL + (int64_t)ts.tv_nsec / 1000000; }}");
         wln!(self, "#elif defined(_WIN32)");
         wln!(self, "#include <windows.h>");
         wln!(self, "/* 100 ns units since 1970: the precise clock (time() has 1 s resolution) */");
@@ -3729,11 +3854,22 @@ impl CCodeGen {
         wln!(self, "int64_t p_clock_now(void) {{ return __p_now_100ns() * 100; }}");
         wln!(self, "int64_t p_clock_now_us(void) {{ return __p_now_100ns() / 10; }}");
         wln!(self, "int64_t p_clock_now_ms(void) {{ return __p_now_100ns() / 10000; }}");
+        wln!(self, "/* CA8: monotonic clock for timeout(ms) { } deadlines */");
+        wln!(self, "static int64_t __p_mono_ms(void) {{");
+        wln!(self, "    static LARGE_INTEGER freq; static int have_freq = 0;");
+        wln!(self, "    LARGE_INTEGER c;");
+        wln!(self, "    if (!have_freq) {{ QueryPerformanceFrequency(&freq); have_freq = 1; }}");
+        wln!(self, "    QueryPerformanceCounter(&c);");
+        wln!(self, "    return (int64_t)((uint64_t)c.QuadPart * 1000ull / (uint64_t)freq.QuadPart);");
+        wln!(self, "}}");
+        wln!(self, "int64_t p_clock_mono_ms(void) {{ return __p_mono_ms(); }}");
         wln!(self, "#else");
         wln!(self, "#include <time.h>");
         wln!(self, "int64_t p_clock_now(void) {{ return (int64_t)time(NULL) * 1000000000LL; }}");
         wln!(self, "int64_t p_clock_now_us(void) {{ return (int64_t)time(NULL) * 1000000LL; }}");
         wln!(self, "int64_t p_clock_now_ms(void) {{ return (int64_t)time(NULL) * 1000LL; }}");
+        wln!(self, "/* CA8: best monotonic clock this platform gives */");
+        wln!(self, "int64_t p_clock_mono_ms(void) {{ return (int64_t)clock() * 1000 / CLOCKS_PER_SEC; }}");
         wln!(self, "#endif");
         wln!(self, "/* 64 random bits from the operating system's secure generator */");
         wln!(self, "#ifdef _WIN32");
@@ -4617,6 +4753,18 @@ impl CCodeGen {
         wln!(self, "}");
         wln!(self, "int64_t p_atomic_add(int64_t addr, int64_t val) { return atomic_fetch_add((atomic_int_least64_t*)(intptr_t)addr, val); }");
         wln!(self, "int64_t p_atomic_sub(int64_t addr, int64_t val) { return atomic_fetch_sub((atomic_int_least64_t*)(intptr_t)addr, val); }");
+        // CA8: timeout(ms) { } — the running task's deadline-token slot.
+        // One slot per OS thread (a plain slot under toolchains without TLS;
+        // the compiler's own sources only use timeout blocks on one thread).
+        wln!(self, "#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L");
+        wln!(self, "static _Thread_local int64_t __p_task_token;");
+        wln!(self, "#elif defined(_WIN32)");
+        wln!(self, "static __declspec(thread) int64_t __p_task_token;");
+        wln!(self, "#else");
+        wln!(self, "static int64_t __p_task_token;");
+        wln!(self, "#endif");
+        wln!(self, "int64_t p_task_token(void) { return __p_task_token; }");
+        wln!(self, "int64_t p_task_set_token(int64_t tok) { int64_t old = __p_task_token; __p_task_token = tok; return old; }");
         wln!(self, "int64_t p_rc_incr(int64_t rc_addr, int64_t val) { (*(int64_t*)(intptr_t)rc_addr)++; return val; }");
         wln!(self, "void p_rc_decr(int64_t rc_addr, int64_t val) {");
         wln!(self, "    (void)val;");

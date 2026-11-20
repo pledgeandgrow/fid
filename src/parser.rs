@@ -936,6 +936,12 @@ impl Parser {
                     associated_types.push((assoc_name, assoc_ty));
                     continue;
                 }
+                // @annotation(s) on a method (same grammar as a top-level
+                // fn, e.g. `@wrapping pub fn next(...)` in random.fd)
+                let mut annotations = Vec::new();
+                while self.check(&TokenKind::At) {
+                    annotations.push(self.parse_at_annotation()?);
+                }
                 let is_pub = if self.check(&TokenKind::Pub) {
                     self.advance();
                     true
@@ -943,6 +949,7 @@ impl Parser {
                     false
                 };
                 let mut func = self.parse_func()?;
+                func.annotations = annotations;
                 func.is_pub = is_pub;
                 methods.push(func);
             }
@@ -963,6 +970,12 @@ impl Parser {
 
         let mut methods = Vec::new();
         while !self.check(&TokenKind::RBrace) && !self.is_at_end() {
+            // @annotation(s) on an impl method (same grammar as a top-level
+            // fn, e.g. `@unsafe` on ByteBuffer::write_bytes in core.fd)
+            let mut annotations = Vec::new();
+            while self.check(&TokenKind::At) {
+                annotations.push(self.parse_at_annotation()?);
+            }
             let is_pub = if self.check(&TokenKind::Pub) {
                 self.advance();
                 true
@@ -970,6 +983,7 @@ impl Parser {
                 false
             };
             let mut func = self.parse_func()?;
+            func.annotations = annotations;
             func.is_pub = is_pub;
             methods.push(func);
         }
@@ -1676,6 +1690,18 @@ impl Parser {
                 && matches!(self.tokens[self.pos + 1].kind, TokenKind::Ident(ref s2) if s2 == "scope") => {
                 self.parse_cancel_scope_stmt()
             }
+            // CA8: `timeout(ms) { body } else { late }` — contextual keyword:
+            // only a timeout block when the identifier `timeout` is followed by
+            // `( .. ) {` (a `;` inside the parens means an ordinary call).
+            // Desugared here to ordinary statements, exactly as the self-hosted
+            // parser (compiler/parser.fd parse_timeout_stmt) does, so every
+            // later pass sees plain code:
+            //     if __timeout_block(ms) { body }
+            // and with `else`:
+            //     if true { if __timeout_block(ms) { body } if __timeout_expired() { late } }
+            TokenKind::Ident(s) if s == "timeout" && self.timeout_block_ahead() => {
+                self.parse_timeout_stmt()
+            }
             _ => self.parse_assign_or_expr(),
         }
     }
@@ -1942,6 +1968,77 @@ impl Parser {
         self.expect_ident()?; // "scope"
         self.match_tok(TokenKind::Semicolon);
         Ok(Stmt::CancelScope { line })
+    }
+
+    /// CA8: at the identifier `timeout`: is it `timeout( .. ) {`? The `(`
+    /// must follow at once and its `)` be followed by `{`; a `;` before the
+    /// `)` closes means a call. (Mirrors compiler/parser.fd timeout_block_ahead.)
+    fn timeout_block_ahead(&self) -> bool {
+        if self.pos + 3 >= self.tokens.len() {
+            return false;
+        }
+        if self.tokens[self.pos + 1].kind != TokenKind::LParen {
+            return false;
+        }
+        let mut depth: i32 = 0;
+        let mut i = self.pos + 1;
+        while i < self.tokens.len() {
+            match self.tokens[i].kind {
+                TokenKind::LParen => depth += 1,
+                TokenKind::RParen => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return i + 1 < self.tokens.len()
+                            && self.tokens[i + 1].kind == TokenKind::LBrace;
+                    }
+                }
+                TokenKind::Semicolon | TokenKind::Eof => return false,
+                _ => {}
+            }
+            i += 1;
+        }
+        false
+    }
+
+    /// CA8: `timeout(ms) { body }`, optionally followed by `else { late }`.
+    /// Desugared to ordinary statements (see the match arm above); the
+    /// typechecker types both markers as bool, and lower.rs runs the body
+    /// unconditionally with the deadline token installed.
+    fn parse_timeout_stmt(&mut self) -> Result<Stmt, String> {
+        let line = self.peek_token().line;
+        self.expect_ident()?; // "timeout"
+        self.expect(TokenKind::LParen, "(")?;
+        let ms = self.parse_expr()?;
+        self.expect(TokenKind::RParen, ")")?;
+        self.expect(TokenKind::LBrace, "{")?;
+        let body = self.parse_block()?;
+        self.expect(TokenKind::RBrace, "}")?;
+        let guarded = Stmt::If {
+            cond: Expr::Call { callee: "__timeout_block".to_string(), args: vec![ms] },
+            then_block: body,
+            else_block: None,
+            line,
+        };
+        // optional `else { late }`
+        if self.check(&TokenKind::Else) {
+            self.advance();
+            self.expect(TokenKind::LBrace, "{")?;
+            let late = self.parse_block()?;
+            self.expect(TokenKind::RBrace, "}")?;
+            let expired = Stmt::If {
+                cond: Expr::Call { callee: "__timeout_expired".to_string(), args: vec![] },
+                then_block: late,
+                else_block: None,
+                line,
+            };
+            return Ok(Stmt::If {
+                cond: Expr::BoolLit(true),
+                then_block: vec![guarded, expired],
+                else_block: None,
+                line,
+            });
+        }
+        Ok(guarded)
     }
 
     /// Parse a select statement: `select { case ch => x => { body } default => { body } }`
