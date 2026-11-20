@@ -236,10 +236,21 @@ FID=release/fid.exe JOBS=4 bash scripts/cross-test.sh aarch64-linux
 # Manual trigger: gh workflow run build-installer.yml -f version=1.0.0
 ```
 
-## Current Baseline (Nov 19 2026 — "1.0 release preparation" commit; full suite last run Nov 2)
+## Current Baseline (Nov 20 2026 — stage-0 fixes pushed; full suite last run Nov 2)
 
 > Project-wide numbers are kept in docs/reference/selfhost.md → "Numbers"
 > (CURRENT.md was removed on Nov 8); keep the two in step.
+>
+> Nov 20: fidesc compiles the Nov 19 tree again (impl-method @annotations,
+> the timeout(ms){} desugar, token-level pre-scan imports, Struct_m module
+> attribution, raw-i64 builtins, 7 ported builtins, counted p_getenv/
+> p_argv — the Nov 20 commits). Every CI workflow passes stage 0; the
+> Bare-metal qemu lane and Editors are green, macOS reaches its
+> 1,155-test suite. NEW BLOCKER (roadmap CB8 / known-bugs 2g.79): a
+> fidesc-BUILT fid self-compiling the 361K tree needs >16 GB (the frozen
+> lowering emits no 0004 temporary drops) — the 3-stage bootstrap from
+> fidesc cannot pass stage 2 until the rc-ownership lowering is ported to
+> src/lower.rs.
 
 ```
 SELF-HOSTED COMPILER (primary source):
@@ -265,12 +276,13 @@ SELF-HOSTED COMPILER (primary source):
                   3-stage rebuild from a source snapshot). NOT re-verified
                   on the Nov 19 tree — the compiler grew ~2.3x since.
   Bootstrap:      5 generations verified (Rust → c1 → c2 → c3 → c4 → c5)
-  Binary:         release/fid.exe, shipped as fid.exe. The binaries in
-                  release/ (Nov 10–15) PRE-DATE the current stdlib: fid and
-                  fid-dev fail to parse today's stdlib/core.fd. Rebuild
-                  first: ./scripts/build-selfhost.sh (fidesc → C → zig cc).
-                  The full suite has never been rerun with fid as the
-                  compiler.
+  Binary:         release/fid.exe, shipped as fid.exe. release/fid.exe
+                  (Nov 10) still predates the current stdlib; release/
+                  fid-dev.exe was rebuilt Nov 20 from the current tree and
+                  runs it. A fidesc-built binary self-compiling the whole
+                  tree hits the 2g.79 memory wall — see the blocker note
+                  above. The full suite has never been rerun with fid as
+                  the compiler.
   Self-compile:   `dump-c compiler/main.fd`, Nov 9: 74 s with the compiler
                   built at -O2 (8 split units; type check 18 s, borrow
                   check 5, mono 5, lowering 24, C 20), 229 s at -O0

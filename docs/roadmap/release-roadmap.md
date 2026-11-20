@@ -537,7 +537,11 @@ compiler.
       build through C, on Windows too). `fid` on a Mac is no longer taken for
       Windows (`host_os()` in main.fd).
 - [~] F5. macOS x64 and ARM64 through C, in CI (M).
-      Nov 7: `fid ccompile --target x86_64-macos|aarch64-macos` builds Mach-O
+      Nov 20: macos.yml runs the whole suite on macos-15 and macos-15-intel
+      runners — the stage-0 bootstrap fix got it past the build, and a
+      bash-3.2 empty-array bug in cross-test.sh (line 211) was the last
+      thing before the suite; the 1,155-test run's verdicts land with the
+      Nov 20 push. Earlier: Nov 7: `fid ccompile --target x86_64-macos|aarch64-macos` builds Mach-O
       executables (checked on a sample program; the suite was not built for
       macOS), and the compiler's own stage-1 C builds for aarch64-macos with
       the flags scripts/bootstrap.sh now gives Darwin. Not run: there is no
@@ -562,7 +566,11 @@ compiler.
       Nov 15, native WASM (F9, `fid wasm`): the four tests pass
       (scripts/wasm-test.sh).
 - [~] F7. Native macOS: Mach-O executables, not only objects (L).
-      macOS executables come from the C path (F5) for now.
+      macOS executables come from the C path (F5) for now. Nov 20: the
+      macos-native.yml job now runs on real Apple runners but its
+      "3-stage fixpoint" step cannot pass until CB8/2g.79 (a fidesc-built
+      fid needs >16 GB to self-compile the 361K tree); everything before
+      that step passes.
       Nov 15, written, not yet run on a Mac: `fid emit <f> --target
       aarch64-macos|x86_64-macos` writes a PIE Mach-O on the machine layer
       (compiler/nat_enc.fd `nat_macho`: __PAGEZERO, __TEXT/__DATA, dyld

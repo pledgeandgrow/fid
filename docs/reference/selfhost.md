@@ -94,7 +94,8 @@ cargo build --release
 ### Numbers
 
 The one place project counts and measurements are kept (other docs round
-them and link here). Counted with `wc -l` on Nov 19, 2026.
+them and link here). Counted with `wc -l` on Nov 19, 2026 (unchanged by the Nov 20 stage-0
+fixes, which touch `src/*.rs`, scripts and docs only).
 
 | Component | Files | Lines |
 |-----------|-------|-------|
@@ -123,8 +124,8 @@ them and link here). Counted with `wc -l` on Nov 19, 2026.
 | Native Linux suite (`NATIVE=1 scripts/cross-test.sh`, Nov 9) | AArch64 273, RISC-V 271, x86-64 272 of 317 match the interpreter |
 | Windows x64 on the machine layer (`fid emit --nat`, Nov 9) | 301 of 338 |
 | WebAssembly native (`fid wasm`, Nov 15) | 316 of 344 suite tests match `fid run`; tasks switch stacks since Nov 18 |
-| Bootstrap fixpoint | stage 2 C == stage 3 C: Nov 6 (49 MB), Nov 8 (67 MB, ownership 0004); not re-verified on the Nov 19 tree |
-| Self-compile (`dump-c compiler/main.fd`) | Nov 9: 74 s with the compiler built at -O2 in 8 split units (type check 18 s, borrow check 5, mono 5, lowering 24, C 20), 229 s at -O0; Nov 6: ~133 s; `fidesc`: ~21 s — the compiler is now ~2.3x larger |
+| Bootstrap fixpoint | stage 2 C == stage 3 C: Nov 6 (49 MB), Nov 8 (67 MB, ownership 0004); NOT re-verifiable on the Nov 19 tree from fidesc until CB8/2g.79 (a fidesc-built fid needs >16 GB to self-compile it; the 0004 temporary drops must be ported to `src/lower.rs` first) |
+| Self-compile (`dump-c compiler/main.fd`) | Nov 9: 74 s with the compiler built at -O2 in 8 split units (type check 18 s, borrow check 5, mono 5, lowering 24, C 20), 229 s at -O0; Nov 6: ~133 s; `fidesc` (Rust, Nov 20, 361K lines): dump-c ~45 s peaking ~600 MB — the compiler is now ~2.3x larger |
 | Version (`compiler/build_info.fd`) | base `1.0.0` (`fid version` prints `1.0.0+dev` on a dev build); tags: v1.0.0 (Sep 9), v0.8.0-unstable (Nov 10) |
 
 Session 30 (Oct 2026) for comparison: compiler 54 files / 104,439 lines, Rust

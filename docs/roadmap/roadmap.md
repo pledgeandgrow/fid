@@ -2,27 +2,56 @@
 
 > Consolidated 2026-10-24 from roadmap/, features-roadmap, release-roadmap, selfhost-roadmap, roadmap-issues, roadmap-limitations, opportunities.
 
-## Current status (Nov 19, 2026 — "1.0 release preparation" commit)
+## Current status (Nov 20, 2026 — stage 0 unbroken again)
 
 The sections below are history. What is true now:
 
 - `fid` (self-hosted, `compiler/*.fd`, 80 modules, 360,594 lines) is the
-  release compiler. The 3-stage bootstrap reaches a byte-identical fixpoint
-  (stage 2 C == stage 3 C, 49 MB — last verified Nov 8, before the ~2.3x
-  growth; re-verify for release). `fidesc` (Rust, `src/*.rs`, 57 files) is
-  frozen: it builds stage 1 and runs the test harness.
+  release compiler. `fidesc` (Rust, `src/*.rs`, 57 files) is frozen: it
+  builds stage 1 and runs the test harness. **Nov 20: fidesc compiles the
+  Nov 19 tree again** (7 fixes in `src/` — see the Nov 20 commits) after
+  five days in which no binary could parse the current stdlib at all.
+- **The 3-stage bootstrap from fidesc is blocked by a memory wall** (known
+  bugs 2g.79): a fid *built by fidesc* self-compiling the 361K-line tree
+  climbs linearly past 16 GB of arena chunks and dies in C codegen — the
+  Rust fidesc does the same dump-c peaking at ~600 MB, because the frozen
+  lowering predates proposal 0004 and emits no drops for the temporaries
+  the sources churn. Fix: port the rc-ownership lowering
+  (`Lowerer_rc_own_value`, rc drops) from `compiler/lower.fd` to
+  `src/lower.rs`. Until then `macos-native.yml`'s "3-stage fixpoint" step
+  cannot pass; one-stage builds and everything short of the self-compile
+  are unaffected.
 - Release v1.0.0 (Sep 9, 2026); v0.8.0-unstable prerelease (Nov 10).
-  `fid version` prints `1.0.0+dev` on dev builds (build_info.fd). Work since
-  Nov 10 is committed on `main` as "1.0 release preparation" (49fb2b9).
+  `fid version` prints `1.0.0+dev` on dev builds (build_info.fd). The
+  "1.0 release preparation" (49fb2b9) plus the Nov 20 stage-0 fixes are
+  all on `main`.
 - Backends: interpreter (`fid run`), C (`fid ccompile`), native Windows x64
   (`fid emit`, no C compiler), native Linux x64/AArch64/RISC-V
   (`emit --target`), native WASM (`fid wasm`, 316/344 suite tests),
   native macOS Mach-O + universal (builds, not run), Cortex-M Thumb-2,
-  UEFI/multiboot images. Bare metal and the retired PIR path incomplete.
+  UEFI/multiboot images. `ccompile --target wasm32-wasi` builds and runs
+  real programs under Node WASI (2g.61 does not reproduce, Nov 20);
+  the wasm-native 28 failing suite tests are still untriaged.
+- **Bare metal x86 works and is QEMU-tested in CI** (bare-metal.yml boots
+  every `tests/bootstrap/test_bare_*.fd` under `qemu-system-x86_64 -kernel`,
+  green again Nov 20); `--boot` still panics. riscv64/aarch64 board images
+  are the open work, on the `thumbv7m-none` pattern (nat_thumb.fd +
+  tests/nattools/thumb_check.sh). The fides-os CI job is red on that
+  kernel's own API drift (pledgeandgrow/fid-os issue 1).
+- CI (Nov 20): every workflow gets past stage 0 again. Editors and the
+  Bare-metal qemu lane are green; Pages publishes (pledgeandgrow.github.io/
+  fid) once enabled in settings; macOS reached its full 1,155-test suite
+  (the last blocker was a bash-3.2 empty-array bug in cross-test.sh);
+  the full-suite lanes (macOS, Tier 1/2, Suite-all, CI, Benchmarks) were
+  still completing when this was written.
 - Last full suite: Nov 2 (`fidesc test`): interpreter 339/339, C 343/343, PE
   345/345, expected-fail 89/89 — on a suite a third of today's size
-  (1,752 bootstrap + 1,596 conformance programs). The binaries in
-  `release/` predate the current stdlib; rebuild with build-selfhost.sh.
+  (1,752 bootstrap + 1,596 conformance programs). The fidesc interpreter
+  predates the counted-string stdlib: `str_len`/`str_slice`-family calls
+  panic under `fidesc run` (a pre-existing gap, not a regression — nothing
+  ran before the Nov 20 fixes); C and PE lanes are the signal until the
+  interp boundary is ported. The binaries in `release/` predate the
+  current stdlib; rebuild with build-selfhost.sh.
 - Self-compile: ~74 s at -O2 when the compiler was 159K lines (Nov 9);
   it is 361K lines now.
 - Done in `fid` on Nov 4–6: generics with inference, checked bounds and
@@ -33,11 +62,37 @@ The sections below are history. What is true now:
   `parallel` branches on threads; `async fn` with `f64` or struct values as a
   task (interpreter and C); 17 safety rules with negative tests and
   `fid qualify`; owned and borrowed strings; `HashMap` with integer keys.
+- Concurrency (Nov 20): all four 2g.60 interpreter bugs verified fixed;
+  spawn arguments are whole deep copies (`p_send_copy`, stdlib-agent-bugs
+  60 RESOLVED), pinned by test_spawn_vec_copy / test_spawn_mutate_both /
+  test_spawn_deep_copy — `Vec<i64>` on interpreter and C; `Vec<str>` and
+  HashMap arguments need a fid built by itself (a stage-1 binary's 1 MB
+  task stacks overflow in the recursive drop; a messaged panic, not
+  corruption).
+- Games (Nov 20): both SDL examples build with `CC="zig cc"` and
+  `FIDES_CFLAGS="-DSDL_MAIN_HANDLED -I<SDL>/inc -L... -lSDL2
+  -lSDL2_image -lSDL2_mixer"` and run (sdl_window clean-exit; minimal_game
+  full loop) after three FFI generator fixes (never prototype what the
+  headers or the compiler themselves declare). `fid emit`'s no-C-compiler
+  SDL path still crashes in pe_dll_found (Nov 19 code no fid binary ran
+  before Nov 20); test_lib_sdl stays skipped without SDL2
+  (FIDES_TEST_EXTERNAL=1); an SDL CI lane is not written yet.
+- Crypto (Nov 20): test_std_ecdsa 18 s and test_std_rsa 16 s through C,
+  test_bigint 3 s and test_fix_interp_mem_reuse 24 s under `fid run`;
+  bigint-heavy work still exhausts the interpreter's 127 MB simulated
+  memory (stdlib-agent-bugs 20 — the tests say "run through the C
+  backend").
 - Not done: copy-on-write value semantics (`LOWER_COW` off: `var b = a` on a
   `Vec` aliases); native `async` (crashes under `fid emit`); `build --native`
-  (crashes); a full register allocator on the native path; `emit --bare`
+  (crashes); a full register allocator on the native path; `emit --boot`
   (panics). Written Nov 4 but not run: `fid emit --checked-alloc`,
   `scripts/sanitize.sh`, `scripts/fuzz/nightly.sh`.
+- Open follow-ups from Nov 20, in order of leverage: the 0004-drops port to
+  `src/lower.rs` (unblocks the 3-stage bootstrap and F7); the fidesc
+  interpreter's counted-string boundary (or accept C/PE as the oracle);
+  riscv64-none / aarch64-none board images; the wasm-native 28-test triage;
+  pe_dll_found on `fid emit`; an SDL2 CI lane; the fides-os kernel port
+  (their repo).
 
 Current plans: `release-roadmap.md`, `competitive-roadmap.md`,
 `complaint-roadmap.md`, `llvm-roadmap.md`, `inc-roadmap.md`, `pe-roadmap.md`.
@@ -9017,6 +9072,11 @@ escapes verified. Random seed time verified.
 > resolved (Nov 2 suite); CB4, CB5, CB7 resolved; CB6 resolved in the old PIR
 > emitter, which is no longer the native path. Each entry below has its own
 > Nov 6 line.
+>
+> **Added Nov 20, 2026:** CB8 — the 3-stage bootstrap from fidesc cannot
+> pass stage 2 on the 361K-line tree (a memory wall in what the frozen
+> lowering emits; see CB8 below and known-bugs 2g.79). Everything else in
+> this list stays resolved.
 
 #### CB1: Self-hosted compiler doesn't enforce all its annotations
 
@@ -9252,6 +9312,30 @@ runtime is `stdlib/pe_runtime/*.fd`.
 
 Added helpers: `read_u8_at`, `read_u16_at`, `read_u32_at`, `read_u64_at`,
 `read_cstr_at`, `int_to_hex`, `char_from_byte`.
+
+---
+
+#### CB8: The 3-stage bootstrap dies at stage 2 on a fidesc-built fid (added Nov 20, 2026)
+
+**Status:** Open — known-bugs 2g.79; blocks `macos-native.yml`'s fixpoint
+step and any release bootstrap that starts cold from fidesc
+
+A fid binary **built by fidesc** (stage 1) self-compiling the 361K-line
+tree grows linearly past 16 GB of arena chunks and dies with
+`p_malloc: OOM — failed to allocate new arena chunk` in C codegen. The
+Rust fidesc does the same dump-c peaking at ~600 MB: the frozen lowering
+(`src/lower.rs`) predates proposal 0004 and emits no drops for the
+temporaries the current sources churn per function, so nothing ever
+returns to the C runtime's free lists. Measured Nov 20 with RSS polling
+locally (31 GB machine, dies ~16 GB) and reproduced on both macOS
+runners.
+
+**Fix:** port the rc-ownership lowering — `Lowerer_rc_own_value`, the rc
+drops of temporaries at statement end, parameter borrowing and the
+spawn/channel deep copies — from `compiler/lower.fd` ("Ownership") into
+`src/lower.rs`. One-stage builds (fidesc dump-c → C) and everything a
+fidesc-built fid runs short of the self-compile are unaffected, which is
+why every other CI lane works again.
 
 ---
 

@@ -330,6 +330,13 @@ The ten that matter most, in order:
       without an argument, each runtime needs a per-task slot for it (a
       word of the task block natively, a field of the C `__p_co`, the
       interpreter's task), then parser and lowering hunks.
+      Nov 20: the syntax exists in `fid` (stdlib/http_client.fd uses it)
+      and the frozen bootstrap parses and lowers it again — the Nov 20
+      stage-0 fixes backport the parser desugar (`if __timeout_block(ms)`
+      / `__timeout_expired` markers) and the token lowering with the
+      p_task_token/p_task_set_token/p_clock_mono_ms builtins; test_
+      timeout_block.fd documents that a stage-1-built fid still gives
+      tasks 1 MB stacks (a messaged panic in the recursive drop).
 - [ ] CA9. **"Async stack traces are useless"** (Rust, JS, C#). A panic in a task
       shows the chain of tasks that awaited it (M).
 - [~] CA10. **"Blocking call in async code freezes everything"** (Rust, JS,
