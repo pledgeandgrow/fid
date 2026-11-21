@@ -1764,7 +1764,7 @@ fn lw_task_word(ty: Type) -> bool {
             return n == "str";
         }
         Type::Generic(n, _) => {
-            return n == "Vec" || n == "HashMap";
+            return n == "Vec" || n == "VecV" || n == "HashMap";
         }
         _ => {
             return false;
@@ -11276,6 +11276,146 @@ fn Lowerer_lower_stmt_inner(self: & mut Lowerer, stmt: Stmt) {
 // MethodCall lowering extracted into a separate function to avoid the
 // statement-dropping bug in long functions. Lowerer_lower_expr is ~16K lines
 // of generated C, and statements in the MethodCall branch were being dropped.
+/// The element AST type of a Vec<E..> receiver expression.
+fn Lowerer_vecv_elem_ast(self: & Lowerer, receiver: Expr) -> Type {
+    match receiver {
+        Expr::Ident(vn) => {
+            match Lowerer_lookup_var_ast_type(self, vn) {
+                OptType::Some(at) => {
+                    match at {
+                        Type::Generic(gn, ga) => {
+                            if gn == "VecV" && ga.len() == 1 {
+                                return ga.get(0);
+                            }
+                        }
+                        _ => {
+                        }
+                    }
+                }
+                OptType::None => {
+                }
+            }
+        }
+        _ => {
+        }
+    }
+    return Type::Infer;
+}
+
+/// A Vec<E..> method (0008): len/is_empty/get/last/push over core's
+/// VecV_* functions. push's argument is the enum literal; its variant's
+/// payload count and index come from the enum table.
+pub fn Lowerer_vecv_method(self: & mut Lowerer, receiver: Box<Expr>, recv_val: i64, method: str, args: Vec<Expr>) -> i64 {
+    val recv_e: Expr = lw_box_expr_unbox(receiver);
+    val elem_ast: Type = Lowerer_vecv_elem_ast(self, recv_e);
+    // the enum's IR shape (Struct(E)) is what get/last return a pointer to
+    var elem_ir: IrType = Lowerer_lower_type(self, elem_ast);
+    match elem_ir {
+        IrType::Struct(_) => {
+        }
+        _ => {
+            elem_ir = IrType::I64;
+        }
+    }
+    val elem_ptr: IrType = IrType::Ptr(Box::new(elem_ir));
+    if method == "len" {
+        var la: Vec<i64> = Vec::new();
+        la.push(recv_val);
+        return Lowerer_emit_inst(self, Inst::Call("VecV_len", la, IrType::I64, EffectSet_new()));
+    }
+    if method == "is_empty" {
+        var ea: Vec<i64> = Vec::new();
+        ea.push(recv_val);
+        val n: i64 = Lowerer_emit_inst(self, Inst::Call("VecV_len", ea, IrType::I64, EffectSet_new()));
+        val z: i64 = Lowerer_emit_inst(self, Inst::ConstInt(0, IrType::I64));
+        return Lowerer_emit_inst(self, Inst::BinOp(BinOp::Eq, n, z, IrType::Bool));
+    }
+    if method == "get" && args.len() == 1 {
+        val i: i64 = Lowerer_lower_expr(self, args.get(0));
+        var ga: Vec<i64> = Vec::new();
+        ga.push(recv_val);
+        ga.push(i);
+        return Lowerer_emit_inst(self, Inst::Call("VecV_get", ga, elem_ptr, EffectSet_new()));
+    }
+    if method == "last" && args.len() == 0 {
+        var ta: Vec<i64> = Vec::new();
+        ta.push(recv_val);
+        return Lowerer_emit_inst(self, Inst::Call("VecV_last", ta, elem_ptr, EffectSet_new()));
+    }
+    if method == "push" && args.len() == 1 {
+        // the argument is the enum literal: lower it to its temp (a tag
+        // word and the payload), then hand its payload words to VecV_push
+        val et: Type = elem_ast;
+        var en: str = "";
+        match et {
+            Type::Named(n2) => {
+                en = n2;
+            }
+            _ => {
+            }
+        }
+        var vi: i64 = 0 - 1;
+        var nwords: i64 = 0;
+        match Lowerer_lookup_enum(self, en) {
+            OptEnumDef::Some(ed) => {
+                var w: i64 = 0;
+                while w < ed.variants.len() {
+                    if ed.variants.get(w).name == lw_enum_lit_variant(args.get(0)) {
+                        vi = w;
+                        match ed.variants.get(w).data {
+                            OptParams::Some(ps) => {
+                                nwords = ps.len();
+                            }
+                            OptParams::None => {
+                            }
+                        }
+                    }
+                    w = w + 1;
+                }
+            }
+            OptEnumDef::None => {
+            }
+        }
+        if vi < 0 {
+            // not a literal of this enum (the typechecker already spoke):
+            // lower it anyway and push its words as a unit
+            vi = 0;
+        }
+        val elem_val: i64 = Lowerer_lower_keep(self, args.get(0));
+        var tid: i64 = 0;
+        if self.own_on {
+            tid = Lowerer_rc_tid(self, et);
+        }
+        if tid < 16 || tid >= 0x8000 {
+            tid = 0;
+        }
+        var pa: Vec<i64> = Vec::new();
+        pa.push(Lowerer_emit_inst(self, Inst::ConstInt(0, IrType::I64)));
+        pa.push(recv_val);
+        pa.push(Lowerer_emit_inst(self, Inst::ConstInt(vi, IrType::I64)));
+        pa.push(elem_val);
+        pa.push(Lowerer_emit_inst(self, Inst::ConstInt(nwords, IrType::I64)));
+        pa.push(Lowerer_emit_inst(self, Inst::ConstInt(tid, IrType::I64)));
+        Lowerer_emit_inst(self, Inst::Call("VecV_push", pa, elem_ptr, lw_rc_eff()));
+        // the element address is the call's value; statements drop it
+        return Lowerer_emit_inst(self, Inst::ConstInt(0, IrType::I64));
+    }
+    // the typechecker reports unknown Vec<E..> methods; here just 0
+    return Lowerer_emit_inst(self, Inst::ConstInt(0, IrType::I64));
+}
+
+/// The variant name of an Expr::EnumLit argument ("" when it is not one).
+fn lw_enum_lit_variant(e: Expr) -> str {
+    match e {
+        Expr::EnumLit(_, v, _) => {
+            return v;
+        }
+        _ => {
+        }
+    }
+    return "";
+}
+
 pub fn Lowerer_lower_method_call(self: & mut Lowerer, receiver: Box<Expr>, method: str, args: Vec<Expr>) -> i64 {
     // `v.get(i).items.push(x)`: the changing method owns its own receiver
     // (Vec_push calls vec_own); the Vecs it is reached through, here
@@ -11287,6 +11427,10 @@ pub fn Lowerer_lower_method_call(self: & mut Lowerer, receiver: Box<Expr>, metho
         Expr::Ident(name) => {
             if name == "Vec" && method == "filled" && args.len() == 2 && Lowerer_has_function(self, "Vec_filled_typed") {
                 return Lowerer_lower_vec_filled(self, args, Type::Infer);
+            }
+            if name == "VecV" && method == "new" {
+                var venv: i64 = Lowerer_emit_inst(self, Inst::ConstInt(0, IrType::I64));
+                return Lowerer_emit_inst(self, Inst::Call("VecV_new", lw_c_vec1_i64(venv), IrType::Opaque("VecV"), EffectSet_new()));
             }
             if name == "Vec" && method == "new" {
                 var dummy_env: i64 = Lowerer_emit_inst(self, Inst::ConstInt(0, IrType::I64));
@@ -11327,6 +11471,33 @@ pub fn Lowerer_lower_method_call(self: & mut Lowerer, receiver: Box<Expr>, metho
     // Lower receiver
     var recv_val: i64 = Lowerer_lower_expr(self, lw_box_expr_unbox(receiver));
     var recv_ty: IrType = Lowerer_get_value_type(self, recv_val);
+
+    // 0008 (FID_CONTIGUOUS): a Vec<E..>'s methods — the variant stream's
+    // own core functions (the generic Vec_ path must not touch it)
+    var vv_hit: bool = false;
+    match recv_ty {
+        IrType::Ptr(vv_inner) => {
+            match box_ir_type_unbox(vv_inner) {
+                IrType::Opaque(vv_on) => {
+                    if vv_on == "VecV" {
+                        vv_hit = true;
+                    }
+                }
+                _ => {
+                }
+            }
+        }
+        IrType::Opaque(vv_on2) => {
+            if vv_on2 == "VecV" {
+                vv_hit = true;
+            }
+        }
+        _ => {
+        }
+    }
+    if vv_hit {
+        return Lowerer_vecv_method(self, receiver, recv_val, method, args);
+    }
 
     // Lower arguments
     var arg_vals: Vec<i64> = Vec::new();
@@ -11467,7 +11638,7 @@ pub fn Lowerer_lower_method_call(self: & mut Lowerer, receiver: Box<Expr>, metho
             }
             match effective_recv_ty {
                 IrType::Generic(gname, gargs) => {
-                    if gname == "Vec" && gargs.len() > 0 {
+                    if gname == "Vec" || gname == "VecV" && gargs.len() > 0 {
                         vec_elem_ty = gargs.get(0);
                     }
                 }

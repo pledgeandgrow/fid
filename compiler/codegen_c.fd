@@ -7607,9 +7607,13 @@ fn gen_inst(self: &mut CCodeGen, inst: Inst, id: i64, func: IrFunction) -> void 
                             cast = "(double)";
                         }
                         IrType::F32 => {
-                            // Bug 3.19 fix: Same type-pun for f32.
+                            // Bug 3.19 fix: Same type-pun for f32. OP21
+                            // (Nov 21 evening): the word holds the single's
+                            // F64 bits (the Vec<f32> layout canon), so the
+                            // full 64 bits are punned to a double and
+                            // narrowed — the low-32 pun read denormal bits.
                             if callee_returns_int || callee_returns_ptr {
-                                wln(self, "    " + dst + " = ((union { int32_t i; float f; }){ .i = (int32_t)(intptr_t)" + c_fname + "(" + arg_strs + ") }).f;");
+                                wln(self, "    " + dst + " = (float)((union { int64_t i; double d; }){ .i = (int64_t)(intptr_t)" + c_fname + "(" + arg_strs + ") }).d;");
                                 return;
                             }
                             cast = "(float)";
@@ -7920,21 +7924,35 @@ fn gen_inst(self: &mut CCodeGen, inst: Inst, id: i64, func: IrFunction) -> void 
                 // f32 <-> f64 and as its default cast) converts the value,
                 // as the interpreter's Interpreter_cast_value does; it was
                 // `(void*)v`, which C rejects for a float destination.
-                var from_num: bool = is_float_type(from_ty) || str_len(c_int_helper(from_ty)) > 0 || ir_type_eq(from_ty, IrType::Bool);
-                if from_num {
+                // OP21 (Nov 21 evening): from an INTEGER word it is the
+                // Vec<f32>/<f64> element boundary — the word holds the
+                // f64 bits of the single (the layout canon; nat_ir keeps
+                // the bits for int <-> float) — so the bits are
+                // reinterpreted, not converted. A numeric `x as f64`
+                // lowers to p_int_to_float, never to a BitCast.
+                var from_int: bool = str_len(c_int_helper(from_ty)) > 0 && !ir_type_eq(from_ty, IrType::Bool);
+                if from_int {
+                    wln(self, "    " + dst + " = (" + c_type(to_ty) + ")((union { uint64_t u; double f; }){ .u = (uint64_t)(" + v + ") }).f;");
+                } else if is_float_type(from_ty) || ir_type_eq(from_ty, IrType::Bool) {
                     wln(self, "    " + dst + " = (" + c_type(to_ty) + ")" + v + ";");
                 } else {
                     // A pointer, struct or handle: its address as a number
                     wln(self, "    " + dst + " = (" + c_type(to_ty) + ")(intptr_t)" + v + ";");
                 }
             } else if is_float_type(from_ty) {
-                // From a float: a numeric conversion (the interpreter's);
-                // a pointer-sized destination goes through intptr_t.
-                var fcast: str = int_ptr_cast(to_ty);
-                if fcast == "" {
-                    fcast = "(void*)(intptr_t)";
+                // From a float: to an integer it is the element boundary's
+                // other side — the single's f64 bits (OP21); a pointer-sized
+                // destination goes through intptr_t.
+                var to_int: bool = str_len(c_int_helper(to_ty)) > 0 && !ir_type_eq(to_ty, IrType::Bool);
+                if to_int {
+                    wln(self, "    " + dst + " = (" + c_type(to_ty) + ")((union { uint64_t u; double f; }){ .f = (double)(" + v + ") }).u;");
+                } else {
+                    var fcast: str = int_ptr_cast(to_ty);
+                    if fcast == "" {
+                        fcast = "(void*)(intptr_t)";
+                    }
+                    wln(self, "    " + dst + " = " + fcast + v + ";");
                 }
-                wln(self, "    " + dst + " = " + fcast + v + ";");
             } else {
                 var cast: str = int_ptr_cast(to_ty);
                 if cast == "" {
@@ -7975,6 +7993,11 @@ fn gen_inst(self: &mut CCodeGen, inst: Inst, id: i64, func: IrFunction) -> void 
             match ty {
                 IrType::F64 => {
                     wln(self, "    p_print_float(" + v + ");");
+                }
+                // OP21 (Nov 21 evening): an f32 prints as the number it is
+                // (the value is the single, widened by C's promotion)
+                IrType::F32 => {
+                    wln(self, "    p_print_float((double)" + v + ");");
                 }
                 IrType::Bool => {
                     wln(self, "    p_print_bool(" + v + ");");

@@ -15695,6 +15695,52 @@ fn ng_mir_alloc_body(g: &mut NatGen, rec: &NatFnRec) -> NatAlloc {
         mask = mask | masks.get(i);
         i = i + 1;
     }
+    // MI8 (Nov 21 evening): RA2/RA7/RA3 above may have rescued spilled
+    // ranges into registers (argfree's trade moved 242 ranges off the
+    // callee-saved pair in test_machine_frame's `big`, whose frame was
+    // 1952 bytes with 0 spills left). A rescued range's slot is never
+    // touched again (codegen reads spill only of assign == -1 values), so
+    // the frame is re-packed over the still-spilled ones — disjoint
+    // ranges share, as in the first packing. FID_NAT_OFF=frameslots keeps
+    // the old per-value layout (own_slots).
+    if !own_slots {
+        var cur2: i64 = rec.base_frame;
+        i = 0;
+        while i < nv {
+            if assign.get(i) == 0 - 1 && !ng_remat_is(remat.get(i)) && !(n_coal > 0 && ng_find(& mut crep, i) != i) {
+                var share2: i64 = 0 - 1;
+                if i < 4096 {
+                    var j2: i64 = 0;
+                    while j2 < i && share2 < 0 {
+                        if spill.get(j2) >= rec.base_frame && lo.get(j2) >= 0 && lo.get(i) >= 0 && (hi.get(i) < lo.get(j2) || hi.get(j2) < lo.get(i)) {
+                            share2 = spill.get(j2);
+                        }
+                        j2 = j2 + 1;
+                    }
+                }
+                if share2 >= 0 {
+                    spill.set(i, share2);
+                } else {
+                    spill.set(i, cur2);
+                    cur2 = cur2 + 8;
+                }
+            } else {
+                spill.set(i, 0 - 1);
+            }
+            i = i + 1;
+        }
+        if n_coal > 0 {
+            i = 0;
+            while i < nv {
+                var sr: i64 = ng_find(& mut crep, i);
+                if sr != i && assign.get(i) == 0 - 1 {
+                    spill.set(i, spill.get(sr));
+                }
+                i = i + 1;
+            }
+        }
+        cur = cur2;
+    }
     var save_off: i64 = cur;
     cur = cur + 8 * save.len();
     var frame: i64 = (cur + 15) & (0 - 16);
@@ -18871,6 +18917,15 @@ fn ng_vlive_bad(m: MInst, st: i64) -> i64 {
         return 0 - 1;
     }
     if op == MO_VZMASK {
+        if !ng_vlive_has(st, a, w) {
+            return a;
+        }
+        if !ng_vlive_has(st, b, w) {
+            return b;
+        }
+        return 0 - 1;
+    }
+    if op == MO_VBTEST {
         if !ng_vlive_has(st, a, w) {
             return a;
         }
@@ -26499,6 +26554,73 @@ fn ng_vzmask(g: &mut NatGen, d: i64, b: i64, t: i64, w: i64) {
     rv_vmerge_vim(&mut g.e, dx, dx, 0);
 }
 
+/// OP23: MO_VBTEST — r0 = the byte test `mode` of V[a], V[b] (x86-64;
+/// pcmpeqb / pmovmskb and the integer test all land in r0 itself, so no
+/// scratch is taken). mode 0: every byte of a equals b's; 1: any byte
+/// does; 2: any byte of a is zero (b ignored).
+fn ng_vbtest_hw(g: &mut NatGen, r0: i64, a: i64, b: i64, mode: i64, w: i64) {
+    var full: i64 = 65535;
+    if w == 32 {
+        full = 0 - 1;
+    }
+    if mode == 2 {
+        // b = 0, then the ordinary byte-equality of a with it
+        NatEnc_byte(&mut g.e, 0x66);
+        x64_rex(&mut g.e, false, b, 0, b, false);
+        NatEnc_byte(&mut g.e, 0x0F);
+        NatEnc_byte(&mut g.e, 0xEF);
+        x64_modrm_rr(&mut g.e, b, b);
+    }
+    // pcmpeqb a, b (per-byte 0xFF where equal)
+    NatEnc_byte(&mut g.e, 0x66);
+    x64_rex(&mut g.e, false, b, 0, a, false);
+    NatEnc_byte(&mut g.e, 0x0F);
+    NatEnc_byte(&mut g.e, 0x74);
+    x64_modrm_rr(&mut g.e, b, a);
+    // pmovmskb r0, a (two mask bits per byte, zero-extended)
+    NatEnc_byte(&mut g.e, 0x66);
+    x64_rex(&mut g.e, false, r0, 0, a, false);
+    NatEnc_byte(&mut g.e, 0x0F);
+    NatEnc_byte(&mut g.e, 0xD7);
+    x64_modrm_rr(&mut g.e, r0, a);
+    if mode == 0 {
+        // cmp r0, 0xFFFF/0xFFFFFFFF: every byte equal
+        x64_rex(&mut g.e, false, 0, 0, r0, false);
+        NatEnc_byte(&mut g.e, 0x81);
+        x64_modrm_rr(&mut g.e, 7, r0);
+        var k: i64 = 0;
+        while k < 4 {
+            NatEnc_byte(&mut g.e, (full >> (k * 8)) & 255);
+            k = k + 1;
+        }
+        x64_setcc(&mut g.e, 4, r0);
+    } else {
+        x64_test(&mut g.e, r0, r0);
+        x64_setcc(&mut g.e, 5, r0);
+    }
+    // movzx r0, r0's low byte (the boolean)
+    x64_rex(&mut g.e, false, r0, 0, r0, false);
+    NatEnc_byte(&mut g.e, 0x0F);
+    NatEnc_byte(&mut g.e, 0xB6);
+    x64_modrm_rr(&mut g.e, r0, r0);
+}
+
+/// OP23: r0 = the byte test `mode` of vector registers a, b (MO_VBTEST;
+/// x86-64 only, ng_vbtest_ok).
+fn ng_vbtest(g: &mut NatGen, r0: i64, a: i64, b: i64, mode: i64, w: i64) {
+    if g.rec {
+        ng_rec(g, MO_VBTEST, r0, 0, 0, mode, w, a | (b << 4));
+        return;
+    }
+    ng_vbtest_hw(g, r0, ng_vphys(g, a), ng_vphys(g, b), mode, w);
+}
+
+/// OP23: this target encodes MO_VBTEST (x86-64; AArch64 and RVV keep the
+/// word SWAR of the runtime routines).
+fn ng_vbtest_ok(g: &NatGen) -> bool {
+    return ng_x64(g);
+}
+
 /// MO_VEND: after 256-bit code, VZEROUPPER (x86-64), so that the SSE code
 /// after it pays no state transition; nothing elsewhere.
 fn ng_vend(g: &mut NatGen, w: i64) {
@@ -26544,6 +26666,10 @@ fn ng_vec_dispatch(g: &mut NatGen, m: MInst, p0: i64, p1: i64) {
         ng_vzmask(g, m.i2 & 15, (m.i2 >> 4) & 15, (m.i2 >> 8) & 15, m.i1);
         return;
     }
+    if op == MO_VBTEST {
+        ng_vbtest_hw(g, p0, ng_vphys(g, m.i2 & 15), ng_vphys(g, m.i2 >> 4), m.i0, m.i1);
+        return;
+    }
     if op == MO_VEND {
         ng_vend(g, m.i1);
     }
@@ -26583,6 +26709,18 @@ fn ng_vec_verify(g: &NatGen, m: MInst) -> str {
     if op == MO_VZMASK {
         if (m.i2 >> 12) != 0 || t >= nr || t == a || t == b || a == b {
             return "zero mask registers d " + int_to_str(a) + ", b " + int_to_str(b) + ", scratch " + int_to_str(t);
+        }
+        return "";
+    }
+    if op == MO_VBTEST {
+        if m.i0 < 0 || m.i0 > 2 {
+            return "byte test mode " + int_to_str(m.i0);
+        }
+        if !ng_vbtest_ok(g) {
+            return "a byte test on a target without its encoder";
+        }
+        if m.i0 != 2 && a == b {
+            return "byte test of one register " + int_to_str(a);
         }
         return "";
     }
@@ -26801,6 +26939,85 @@ fn ng_vblk_call(g: &mut NatGen, id: i64, name: str, args: Vec<i64>, _func: &IrFu
     ng_vend(g, 16);
     ng_st_val(g, id, m);
     return true;
+}
+
+/// OP23 (Nov 21 evening): pert_vblk_diff / _cmpz / _find lowered as a
+/// 16-byte block loop with MO_VBTEST: the offset of the first block whose
+/// test fires, m = n & ~15 when none does — the routines' own contract.
+/// diff(a, b, n): a block that differs; cmpz(a, b, n): a block where a
+/// and b differ or a holds a zero byte; find(p, n, byte): a block that
+/// holds the byte (replicated to all 16 and matched per byte).
+fn ng_vblk_search(g: &mut NatGen, id: i64, name: str, args: Vec<i64>) {
+    var k: i64 = args.len();
+    var pa: i64 = ng_new_vreg(g);
+    var pb: i64 = ng_new_vreg(g);
+    var n: i64 = ng_new_vreg(g);
+    var m: i64 = ng_new_vreg(g);
+    var off: i64 = ng_new_vreg(g);
+    var t: i64 = ng_new_vreg(g);
+    var c: i64 = ng_new_vreg(g);
+    var tv: i64 = ng_new_vreg(g);
+    var res: i64 = ng_new_vreg(g);
+    var rep: i64 = ng_new_vreg(g);
+    var ax: i64 = ng_new_vreg(g);
+    var bx: i64 = ng_new_vreg(g);
+    var vloop: i64 = NatEnc_label(&mut g.e);
+    var vfound: i64 = NatEnc_label(&mut g.e);
+    var vdone: i64 = NatEnc_label(&mut g.e);
+    if name == "pert_vblk_find" {
+        // find(p, n, b)
+        ng_ld_val(g, pa, args.get(k - 3));
+        ng_ld_val(g, n, args.get(k - 2));
+        ng_ld_val(g, t, args.get(k - 1));
+        ng_li(g, c, 255);
+        ng_and(g, rep, t, c);
+        ng_li(g, c, 72340172838076673);
+        ng_mul(g, rep, rep, c);
+        ng_vsplat(g, 1, rep, 16);
+    } else {
+        // diff(a, b, n) / cmpz(a, b, n)
+        ng_ld_val(g, pa, args.get(k - 3));
+        ng_ld_val(g, pb, args.get(k - 2));
+        ng_ld_val(g, n, args.get(k - 1));
+    }
+    ng_li(g, t, 0 - 16);
+    ng_and(g, m, n, t);
+    ng_li(g, off, 0);
+    ng_mov(g, res, m);
+    ng_place(g, vloop);
+    ng_setcc(g, c, off, m, NCC_LT);
+    ng_beqz(g, c, vdone);
+    ng_add(g, ax, pa, off);
+    ng_vld(g, 0, ax, 0, 16);
+    if name == "pert_vblk_find" {
+        // any byte of the block equals the replicated one
+        ng_vbtest(g, tv, 0, 1, 1, 16);
+        ng_beqz(g, tv, vfound);
+    } else {
+        if name == "pert_vblk_diff" {
+            ng_add(g, bx, pb, off);
+            ng_vld(g, 1, bx, 0, 16);
+            ng_vbtest(g, tv, 0, 1, 0, 16);
+            ng_beqz(g, tv, vfound);
+        } else {
+            // cmpz: the blocks differ, or a holds a zero byte (mode 2
+            // reads the first register only)
+            ng_add(g, bx, pb, off);
+            ng_vld(g, 1, bx, 0, 16);
+            ng_vbtest(g, tv, 0, 1, 0, 16);
+            ng_beqz(g, tv, vfound);
+            ng_vbtest(g, tv, 0, 1, 2, 16);
+            ng_beqz(g, tv, vfound);
+        }
+    }
+    ng_li(g, t, 16);
+    ng_add(g, off, off, t);
+    ng_jmp(g, vloop);
+    ng_place(g, vfound);
+    ng_mov(g, res, off);
+    ng_place(g, vdone);
+    ng_vend(g, 16);
+    ng_st_val(g, id, res);
 }
 
 /// OP21 / TG11: the f64 intrinsics of stdlib/simd.fd as vector loops on
@@ -30361,6 +30578,30 @@ fn ng_gen_function(g: &mut NatGen, name: str, func: &IrFunction, module: &IrModu
         }
         i = i + 1;
     }
+    // MI8: the ids some instruction names as an operand (an Alloca nothing
+    // addresses is dead — ssa or promote removed its loads and stores)
+    var used_ids: Vec<i64> = peir_zeros(func.next_value + 1);
+    {
+        var uops: Vec<i64> = Vec::new();
+        var ub: i64 = 0;
+        while ub < func.blocks.len() {
+            var uids: Vec<i64> = func.blocks.get(ub).instructions;
+            var uk2: i64 = 0;
+            while uk2 < uids.len() {
+                uops.clear();
+                peir_inst_operands(peir_inst_of(func, uids.get(uk2)), &mut uops);
+                var uo: i64 = 0;
+                while uo < uops.len() {
+                    if uops.get(uo) >= 0 && uops.get(uo) < used_ids.len() {
+                        used_ids.set(uops.get(uo), 1);
+                    }
+                    uo = uo + 1;
+                }
+                uk2 = uk2 + 1;
+            }
+            ub = ub + 1;
+        }
+    }
     i = 0;
     while i < func.insts.len() {
         var ve: ValueIdInst = func.insts.get(i);
@@ -30379,8 +30620,18 @@ fn ng_gen_function(g: &mut NatGen, name: str, func: &IrFunction, module: &IrModu
                     dsize = 8;
                 }
                 dsize = (dsize + 7) & (0 - 8);
-                adata.set(ve.id, cur);
-                cur = cur + dsize;
+                // MI8 (Nov 21 evening): ssa/promote leave a promoted
+                // local's Alloca in the IR unused (locals and debug info
+                // still name a value that exists) — nothing addresses it,
+                // so it keeps no frame bytes. big's ~240 dead 8-byte
+                // allocas were its 1.9 KB frame.
+                var aused: bool = ve.id >= 0 && ve.id < used_ids.len() && used_ids.get(ve.id) != 0;
+                if aused {
+                    adata.set(ve.id, cur);
+                    cur = cur + dsize;
+                } else {
+                    adata.set(ve.id, 0 - 1);
+                }
             }
             _ => {
             }

@@ -437,6 +437,27 @@ fn peir_emit8(e: &mut PeirEnc, a: i64, b: i64, c: i64, d: i64, f: i64, g: i64, h
 
 /// OP17 (known-bugs 2g.13): xmm0 converted in place between the float
 /// types: cvtss2sd xmm0, xmm0 (`to_f64`) or cvtsd2ss xmm0, xmm0.
+/// OP21 (Nov 21 evening): BitCast(i64 word -> f32 value): the word holds
+/// the single's f64 bits — movq xmm0, rax; cvtsd2ss; store the 4 bytes.
+fn peir_pun_i64_f32(enc: & mut PeirEnc, voff: i64, dst: i64) {
+    PeirEnc_mov_reg_mem_rbp(enc, PEIR_RAX, voff);
+    peir_emit2(enc, 0x66, 0x48);
+    peir_emit2(enc, 0x0F, 0x6E);
+    PeirEnc_emit_u8(enc, 0xC0);
+    peir_cvt_float(enc, false);
+    peir_store_f32_xmm0(enc, dst);
+}
+
+/// OP21: BitCast(f32 value -> i64 word): cvtss2sd; movq rax, xmm0; store.
+fn peir_pun_f32_i64(enc: & mut PeirEnc, voff: i64, dst: i64) {
+    PeirEnc_movss_xmm_mem_rbp(enc, 0, voff);
+    peir_cvt_float(enc, true);
+    peir_emit2(enc, 0x66, 0x48);
+    peir_emit2(enc, 0x0F, 0xD6);
+    PeirEnc_emit_u8(enc, 0xC0);
+    PeirEnc_mov_mem_rbp_reg(enc, dst, PEIR_RAX);
+}
+
 fn peir_cvt_float(e: &mut PeirEnc, to_f64: bool) -> void {
     if to_f64 {
         PeirEnc_emit_u8(e, 0xF3);
@@ -5014,7 +5035,21 @@ pub fn PeirGen_gen_inst(self: &mut PeirGen, id: i64, inst: Inst, next_cond: i64,
                         if pe_idmap_has(&frame.const_vals, a) {
                             PeirEnc_mov_imm(&mut self.enc, arg_regs.get(ri), pe_idmap_get(&frame.const_vals, a));
                         } else {
-                            PeirEnc_mov_reg_mem_rbp(&mut self.enc, arg_regs.get(ri), PeStackFrame_offset(frame, a));
+                            // OP21 (Nov 21 evening): an f32 argument into an
+                            // integer-word parameter is the Vec<f32> element
+                            // boundary — the single widened, its f64 bits in
+                            // the register (REX.B for r8/r9)
+                            var aty4: IrType = peir_operand_ty(func, a);
+                            var ca_f32b: bool = ir_type_eq(aty4, IrType::F32);
+                            if ca_f32b {
+                                PeirEnc_movss_xmm_mem_rbp(&mut self.enc, 0, PeStackFrame_offset(frame, a));
+                                peir_cvt_float(&mut self.enc, true);
+                                peir_emit2(&mut self.enc, 0x66, 0x48 | ((arg_regs.get(ri) >> 3) & 1));
+                                peir_emit2(&mut self.enc, 0x0F, 0x7E);
+                                PeirEnc_emit_u8(&mut self.enc, 0xC0 | (arg_regs.get(ri) & 7));
+                            } else {
+                                PeirEnc_mov_reg_mem_rbp(&mut self.enc, arg_regs.get(ri), PeStackFrame_offset(frame, a));
+                            }
                         }
                     }
                     OptValueId::None => {
@@ -5069,7 +5104,19 @@ pub fn PeirGen_gen_inst(self: &mut PeirGen, id: i64, inst: Inst, next_cond: i64,
             if !self.calls_reserved {
                 PeirEnc_add_rsp_i32(&mut self.enc, call_space);
             }
-            PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, PEIR_RAX);
+            // OP21 (Nov 21 evening): a call whose result is an f32 (Vec_get
+            // of a Vec<f32>) gets the single's f64 bits in rax — pun them
+            // into the 4-byte slot (an f64 result is its bits already)
+            var rty: IrType = peir_operand_ty(func, id);
+            if ir_type_eq(rty, IrType::F32) {
+                peir_emit2(&mut self.enc, 0x66, 0x48);
+                peir_emit2(&mut self.enc, 0x0F, 0x6E);
+                PeirEnc_emit_u8(&mut self.enc, 0xC0);
+                peir_cvt_float(&mut self.enc, false);
+                peir_store_f32_xmm0(&mut self.enc, dst);
+            } else {
+                PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, PEIR_RAX);
+            }
         }
 
         Inst::CallPtr(fn_ptr, args, cp_ret_ty, _, _) => {
@@ -5390,6 +5437,15 @@ pub fn PeirGen_gen_inst(self: &mut PeirGen, id: i64, inst: Inst, next_cond: i64,
                 PeirEnc_movsd_xmm_mem_rbp(&mut self.enc, 0, voff);
                 peir_cvt_float(&mut self.enc, false);
                 peir_store_f32_xmm0(&mut self.enc, dst);
+            } else if ir_type_is_int(bc_from) && ir_type_eq(bc_to, IrType::F32) {
+                // OP21 (Nov 21 evening): an integer word cast to f32 is the
+                // Vec<f32> element boundary — the word holds the single's
+                // f64 bits, so they are punned to a double and narrowed
+                peir_pun_i64_f32(&mut self.enc, voff, dst);
+            } else if ir_type_eq(bc_from, IrType::F32) && ir_type_is_int(bc_to) {
+                // OP21: the boundary's other side — the single widened and
+                // its f64 bits stored
+                peir_pun_f32_i64(&mut self.enc, voff, dst);
             } else {
                 PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RAX, voff);
                 PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, PEIR_RAX);
@@ -5410,7 +5466,28 @@ pub fn PeirGen_gen_inst(self: &mut PeirGen, id: i64, inst: Inst, next_cond: i64,
                 PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_RAX);
                 PeirGen_call_runtime(self, "p_print_str");
             } else {
-                PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RCX, voff);
+                // OP21 (Nov 21 evening): an f32's slot holds the 4-byte
+                // single; p_print_float takes the f64 bits in rcx — widen
+                // first (peir_pun_f32_i64), the same boundary as the Vec
+                // element path
+                var pr_f32: bool = false;
+                match ty {
+                    IrType::F32 => {
+                        pr_f32 = true;
+                    }
+                    _ => {
+                    }
+                }
+                if pr_f32 {
+                    // movss xmm0, [rbp+off]; cvtss2sd; movq rcx, xmm0
+                    PeirEnc_movss_xmm_mem_rbp(&mut self.enc, 0, voff);
+                    peir_cvt_float(&mut self.enc, true);
+                    peir_emit2(&mut self.enc, 0x66, 0x48);
+                    peir_emit2(&mut self.enc, 0x0F, 0xD6);
+                    PeirEnc_emit_u8(&mut self.enc, 0xC1);
+                } else {
+                    PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RCX, voff);
+                }
                 // Route to the correct print function based on type
                 var print_fn: str = "p_print_int";
                 match ty {

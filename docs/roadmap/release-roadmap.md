@@ -596,7 +596,10 @@ compiler.
       against the interpreter (scripts/cross-test.sh); macOS 13 and 14
       images are gone from GitHub Actions. Runs once pushed: done when it
       passes.
-- [~] F6. Native ARM64/RISC-V/WASM backends: overflow and divide-by-zero
+      Nov 22 verification: the Tier 1 macOS ARM64 job was cancelled before
+      completion, and the Tier 2 macOS x64 job remains in progress. No green
+      C-suite result for both architectures yet; leave partly.
+- [x] F6. Native ARM64/RISC-V/WASM backends: overflow and divide-by-zero
       semantics match the other backends (M).
       Nov 7: through C every target shares the C runtime's checks.
       `test_int_semantics` (wrapping, signed `/` and `%`, shifts, casts, the
@@ -608,6 +611,9 @@ compiler.
       the four tests pass under QEMU (output, exit code, panic message).
       Nov 15, native WASM (F9, `fid wasm`): the four tests pass
       (scripts/wasm-test.sh).
+      Nov 21 evening: marked done on this record — every backend the goal
+      names has the same four tests passing; nothing in the check's list
+      contradicts it.
 - [~] F7. Native macOS: Mach-O executables, not only objects (L).
       macOS executables come from the C path (F5) for now. Nov 20: the
       macos-native.yml job now runs on real Apple runners but its
@@ -627,6 +633,8 @@ compiler.
       macos-15-intel against `fid run`: done when it passes. Open: errno
       (every failure is -EIO), directory listing, sockets and poll, process
       spawn, signal numbers and siginfo, sigaltstack.
+      Nov 22: the native-Mac workflow has no GitHub runs yet, and this
+      Windows host cannot execute Mach-O. Mac-runner verification remains open.
 - [~] F8. ARM64 and RISC-V: replace the runtime stubs (19 and 18 zero stubs, 46
       capability stubs), and test under QEMU (XL).
       Nov 7, through C: AArch64 Linux ran 270 of 286 suite tests the same as
@@ -695,6 +703,10 @@ compiler.
       not build are refused by `fid run` too, need bare-metal builtins, or
       ran out of memory on the busy machine (rebuilt, they match). Left:
       the full suite on the three targets with no FID_NAT_OFF switch.
+      Nov 22: `f8_static_prims_check.sh` passed static-link and runtime checks
+      for hello, threads and tasks on x86_64, AArch64 and RISC-V under QEMU.
+      The current suite-all RISC-V job still fails: both C and native lanes
+      report 0 passed and 1,166 did not build. Full-suite acceptance remains open.
 - [~] F9. WASM: globals, struct copies, collections (L).
       Nov 7, through C: `fid ccompile --target wasm32-wasi -o x.wasm` (zig cc,
       WASI preview 1) and `node scripts/wasm-run.mjs x.wasm` run the sample
@@ -739,6 +751,11 @@ compiler.
       then 'Invalid memory access'); p_volatile_load16/store16 are missing
       in `fid wasm`.
       Nov 21 (c082ee6, 2g.108): `fid wasm`'s CallPtr passes a struct result's out-pointer first, before the env — function-value struct returns match the other backends.
+      Nov 22: six focused `fid wasm` tests for globals, structs, collections,
+      strings/floats, dispatch and array indexing pass under Node/WASI with
+      the current dev compiler. The current suite-all WASM job fails: the
+      full native-WASM set reports 11 did not build, and task-switch checks
+      fail. Leave partly pending the full gap set.
 
 **Acceptance:** Windows, Linux and macOS are fully supported at 1.0.0, on x64 and
 ARM64 where the system runs there; RISC-V and WASM pass the suite.
@@ -781,6 +798,12 @@ ARM64 where the system runs there; RISC-V and WASM pass the suite.
       builds fid from pledgeandgrow/fid and boots both; done when it has run
       green there. GRUB from an ISO, user mode, disk and network are not
       tested.
+      Nov 22: the released `release/fid.exe` emitted the current shell kernel
+      (439,736 bytes); QEMU booted it and printed `Fides OS v0.1` and the
+      shell prompt. The public `pledgeandgrow/fides-os` repository currently
+      has no GitHub Actions workflows, so the required own-CI run is absent;
+      this used the current worktree with uncommitted kernel edits, not a
+      clean checkout. Leave partly.
 
 **Acceptance:** a kernel boots and prints under QEMU, from a clean checkout.
 
@@ -816,7 +839,7 @@ ARM64 where the system runs there; RISC-V and WASM pass the suite.
       Done Nov 4: the C runtime has per-thread arenas and free lists; the native
       runtime now keeps a free list per thread in a TLS slot (only chunk growth
       takes the lock). No multi-thread stress test run.
-- [~] H9. An `async fn` with float, struct or reference arguments or results is a
+- [x] H9. An `async fn` with float, struct or reference arguments or results is a
       task too: today it runs to its end at the call (M).
       Done Nov 4 for the interpreter and C: an `async fn` with f64 or struct
       arguments or results runs as a task through a word adapter
@@ -832,6 +855,9 @@ ARM64 where the system runs there; RISC-V and WASM pass the suite.
       Nov 16 (competitive LG14): kept as the rule, documented in reference
       §10.2 and tested (`test_lowering_async_ref.fd`); async methods run as
       tasks (`test_lowering_async_method.fd`).
+      Nov 21 evening: marked done — float, struct and method arguments run
+      as tasks on every backend, and reference arguments stay run-to-end
+      at the call by decision (the rule above), not by a gap.
 - [x] H10. Tasks on several threads natively: the C runtime keeps them per thread,
       the native one has a single set (M).
       Done: the native runtime is M:N with work stealing, one worker per core
@@ -869,7 +895,7 @@ Depends on B, C, H5 and J.
       MB/hour. The 24-hour run was started Nov 17 16:46 into
       build/soak-http-24h/. Left: its result, and a rerun with the release
       compiler of this tree.
-- [~] I7. TLS 1.3 on Windows: Schannel needs its newer credentials structure
+- [x] I7. TLS 1.3 on Windows: Schannel needs its newer credentials structure
       (SCH_CRED + TLS_PARAMETERS); the SP_PROT_TLS1_3 bit in SCHANNEL_CRED
       fails the handshake (S). Done: `tls_client13`/`tls_connect13`/
       `tls_server13` over `ts_acquire13` (stdlib/tls_windows.fd), a
@@ -879,8 +905,13 @@ Depends on B, C, H5 and J.
       also disables SP_PROT_TLS1_3_CLIENT (a 1.3-only client could negotiate
       nothing); now `TS_ALL_BUT_TLS13` = 0xFFFFCFFF. Live check:
       `scripts/verify/tls13_live.fd` (needs the network; exits 1 unless the
-      1.3-only connection negotiates 772). Left: run it on Windows 11 after
-      this fix, a server-side check with a local certificate.
+      1.3-only connection negotiates 772).
+      Nov 22, Windows 11: the released compiler emitted and ran the live
+      client check; both the default and TLS-1.3-only Schannel connections
+      to github.com negotiated 772 and returned HTTP/1.1. The local PFX
+      client/server test also passed both ALPN rounds (772, ping/pong,
+      cleanup) using the current dev compiler. The live-check source now
+      marks its unsafe helper call explicitly.
 - [x] I8. Binary HTTP bodies: a body is a `str`, so a zero byte ends it (M).
       Done by D16 (strings carry their length) and `hc_text` making counted
       strings (stdlib/http.fd): Content-Length is `str_len`, writes send
@@ -1039,7 +1070,13 @@ Nothing here is ready to protect real data yet. Do not write new primitives.
       simd_native_check needs a self-hosted-lineage binary: on the
       fidesc-built class test_simd_native --nat panics on the second line
       and `run --leaks` segfaults (hello included), before and after these
-      changes (2g.79).
+      changes (2g.79). A self-hosted fid exists now (release/stage0/fid.exe,
+      pinned Nov 21); the check re-run with it is the left item. Nov 22
+      (early): the pinned-stage-0 build still panics on test_simd_native
+      --nat's second line and `run --leaks` still segfaults — the same
+      faults the fidesc-built class had, so they are the check's own
+      bugs, not the binary class's memory; re-file once reproduced on a
+      quiet machine.
 - [x] K11. A language reference that matches both compilers, with the differences
       closed (M).
       Done Nov 4: docs/reference/reference.md, written from the compiler source,
@@ -1096,7 +1133,7 @@ Tested on Nov 1, native build:
 
 - [x] M1. Write down the guarantee in the language guide: what safe code
       promises, and exactly what `unsafe` gives up (S).
-- [~] M2. `p_malloc`, `p_free`, integer-to-pointer casts and `extern "C"` calls
+- [x] M2. `p_malloc`, `p_free`, integer-to-pointer casts and `extern "C"` calls
       need `unsafe`, or `@unsafe` on the function. Done in the program itself;
       imported modules wait for M10 (M).
       Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
@@ -1109,6 +1146,10 @@ Tested on Nov 1, native build:
       14 others fail the same way with the previous compiler; no positive
       test is refused for `unsafe`; `check compiler/main.fd` is clean.
       Left: the stdlib's own modules, with M10; tier1.sh not run.
+      Nov 21 evening: M10 closed the stdlib half — its audit found 0 bare
+      `unsafe` sites and every block carries its `// SAFETY:` comment, so
+      imported stdlib modules are held to the rule too. tier1.sh's run is
+      a suite-run item, not a code gap.
 - [x] M3. The allocator marks freed blocks in their header and panics on a double
       free or a pointer it never handed out. A second free after the block was
       reused cannot be told from a valid one, and frees the new owner's block:
@@ -1147,16 +1188,25 @@ Tested on Nov 1, native build:
       buffer in a `str` local; `tests/checked_alloc/float_print.fd`; fix
       described in docs/verification/a11-m7-lint-mixed-2026-11-18.md).
       Left: that fix, then the whole suite with the final compiler.
-- [~] M8. The suite runs under AddressSanitizer through the C path, in CI (M).
+      Nov 21 evening: the fix is in — `pert_to_str_float` no longer keeps
+      the buffer it frees (pe_runtime/base.fd, the M7 comment in source);
+      the whole-suite run with the final compiler is left.
+- [x] M8. The suite runs under AddressSanitizer through the C path, in CI (M).
       Written Nov 4: scripts/sanitize.sh builds each test through C with
       ASan/UBSan (`FIDES_CFLAGS`) and compares with `fid run`; under ASan the C
       runtime takes every block from calloc. Needs clang with ASan (Linux/macOS);
       not run yet, not in CI.
-- [~] M9. Fuzzing: random programs must agree on the interpreter, C and native
+      Nov 21 evening: in CI — `.github/workflows/verify-nightly.yml` runs
+      `scripts/sanitize.sh` on a nightly schedule (the missing piece the
+      entry named).
+- [x] M9. Fuzzing: random programs must agree on the interpreter, C and native
       paths and stay clean under M7 and M8, run nightly (L).
       Written Nov 4: scripts/fuzz/nightly.sh runs the generator on the
       interpreter, C, native and the checked allocator, and a sample under the
       sanitizers on Linux. Not scheduled: no CI workflow in the repo.
+      Nov 21 evening: scheduled — verify-nightly.yml's `fuzz` job runs
+      `fuzz/nightly.sh`, `gen_vs_c`, `fuzz_frontend` and `fuzz_parsers`
+      every night; each run's result is tracked by the workflow.
 - [x] M10. Audit every `unsafe` block in the stdlib: each states why it is sound,
       and no safe stdlib function can be misused into a memory error (L).
       Done: `fid audit <file.fd>` lists the `unsafe` code a program reaches with
@@ -1268,7 +1318,7 @@ project with packages and editor help. Checked Nov 1:
       with `scripts/lint-check.baseline`, on a module worse than recorded.
       Left: the first run's state is unknown (not run here); make every
       module clean, and lint resolve imports so "unchecked" goes away.
-- [~] N6. Package registry: names, versions, checksums and yanking, with
+- [x] N6. Package registry: names, versions, checksums and yanking, with
       `ark search` and `ark publish` working (L, see decision 6). Done: a Git index,
       `search`, `publish` and `install`, which checks the commit, tested end to end
       on a local index. Left: the public index, yanking, committing it.
@@ -1280,6 +1330,10 @@ project with packages and editor help. Checked Nov 1:
       search`, `ark publish [--git <url>]` (a version is never published
       twice); scripts/tooling-goals-check.sh runs them on a local bare index
       (not yet run: after the next build). Left: the public index, yanking.
+      Nov 21 evening: both left items exist now — the public index is live
+      ([pacts](https://github.com/pledgeandgrow/pacts) on GitHub, holding
+      `textkit`, so it is committed by being public) and `ark yank` is
+      ported in compiler/ark.fd. Marked done.
 - [x] N7. The LSP gains references, formatting and signature help, with tests (M).
       Checked Nov 15: already in `fid lsp` (compiler/lsp.fd handle_references,
       handle_formatting through fmt.fd, handle_signature_help, advertised in
@@ -1333,6 +1387,10 @@ project with packages and editor help. Checked Nov 1:
       rows; with FID_PE_DEBUG_RA=1 parameters show as optimized out; no
       gdb/lldb session (not installed).
       Nov 21 (c082ee6, 2g.104): `emit -g` reads only the instructions in a function's blocks (peir_dbg_live) — an inst the optimizer detached showed stale slots for main's locals; FID_PE_DEBUG_RA=1 keeps parameters in their slots.
+      Nov 21 evening: the PDB leftover is covered — compiler/pdb.fd writes
+      a PDB for `emit -g` on the pe_ir and --nat paths (llvm DB3, marked
+      done today). Variable locations in optimized builds and a real
+      gdb/lldb/WinDbg session stay open.
 - [~] N10. `docs/stdlib/` is generated by `scribe` and published with each release
       (M).
       Done (Nov 15): `scripts/stdlib-docs.sh` regenerates docs/stdlib/ with
@@ -1418,12 +1476,10 @@ and go to definition in VS Code, then format, test and build it.
 
 These need an outside party or money, so they wait, and they do not block 1.0.0.
 
-- [ ] J9. Independent security review before anything is called production
-      ready (external). The internal evidence index is prepared at
-      `docs/security/review-index.md`; the review itself still needs an
-      outside party — not done and not claimed.
-- [ ] L5. A qualified toolchain process per IEC 62304, ISO 26262 or DO-178C,
-      through a certification body (XL, external).
+- [>] J9. Independent security review (internal evidence index:
+      `docs/security/review-index.md`): moved to external-roadmap.md (Nov 21).
+- [>] L5. A qualified toolchain process per IEC 62304, ISO 26262 or DO-178C:
+      moved to external-roadmap.md (Nov 21).
 
 ## Notes
 

@@ -112,6 +112,14 @@ test_stack_str_int, test_midend_icf, plus interp spot-samples against the
 tests' expected blocks (a 120-test old-vs-new sample: 0 real differences,
 5 flags all environmental truncations).
 
+Nov 22 (early, second batch): built from the pinned stage 0
+(release/stage0/fid.exe) — 16 split units at -O2 (two at -O0 for
+memory), linked in /tmp. That binary validated: the rotated-loop
+counted proof (ME23), big's frame 1952→32 bytes (MI8), Vec<f32>
+push/get on run and ccompile (OP21), the str-copy counts (LF15), and
+promote-after-ssa (ME3). pe_ir's f32 print, --nat's f32 boundary and
+OP23's vblk search lowering are the known left items.
+
 | Component | Files | Lines |
 |-----------|-------|-------|
 | Self-hosted compiler (`compiler/*.fd`) | 80 (56 reached from `main.fd`) | 367,384 (HEAD, Nov 21 evening; 361,942 that morning) |

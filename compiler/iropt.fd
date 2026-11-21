@@ -538,26 +538,37 @@ pub fn iropt_native(module: &mut IrModule) {
         if on_fold && iro_time(&mut tp_names, &mut tp_ms, &mut tp_hits, "fold", timing, &mut f) {
             changed = true;
             n_fold = n_fold + 1;
+            // OP3: the pass changed the function: the shared use lists no
+            // longer hold (they were stale here before: fold, simplify,
+            // branchfold, branchfacts, sccp, promote, dse, quietcall, dce
+            // (which repairs its own below), tailcall, gvn and iv never
+            // forgot)
+            iro_uses_forget();
         }
         if on_simplify && iro_time(&mut tp_names, &mut tp_ms, &mut tp_hits, "simplify", timing, &mut f) {
             changed = true;
             n_simp = n_simp + 1;
+            iro_uses_forget();
         }
         if on_branch && iro_time(&mut tp_names, &mut tp_ms, &mut tp_hits, "branchfold", timing, &mut f) {
             changed = true;
             n_branch = n_branch + 1;
+            iro_uses_forget();
         }
         if on_facts && iro_time(&mut tp_names, &mut tp_ms, &mut tp_hits, "branchfacts", timing, &mut f) {
             changed = true;
             n_facts = n_facts + 1;
+            iro_uses_forget();
         }
         if on_sccp && iro_time(&mut tp_names, &mut tp_ms, &mut tp_hits, "sccp", timing, &mut f) {
             changed = true;
             n_sccp = n_sccp + 1;
+            iro_uses_forget();
         }
         if on_promote && iro_promote_here(&f, on_ssa_me, promote_named) && iro_time(&mut tp_names, &mut tp_ms, &mut tp_hits, "promote", timing, &mut f) {
             changed = true;
             n_promote = n_promote + 1;
+            iro_uses_forget();
         }
         if on_devirt {
             tm0 = iro_clock(timing);
@@ -593,6 +604,7 @@ pub fn iropt_native(module: &mut IrModule) {
         if on_dse && iro_time(&mut tp_names, &mut tp_ms, &mut tp_hits, "dse", timing, &mut f) {
             changed = true;
             n_dse = n_dse + 1;
+            iro_uses_forget();
         }
         // OP25: unused calls that end, never panic and write nothing; before
         // dce, which then drops their arguments
@@ -610,14 +622,23 @@ pub fn iropt_native(module: &mut IrModule) {
         if on_dce && iro_time(&mut tp_names, &mut tp_ms, &mut tp_hits, "dce", timing, &mut f) {
             changed = true;
             n_dce = n_dce + 1;
+            // OP3 (Nov 21 evening): dce only removes instructions nothing
+            // reads — iro_uses_dead updates the shared lists in place
+            // (each removed instruction's operands lose their use, the
+            // instruction leaves their user lists; a dead id's own entries
+            // are queried by no one), so the cache survives the most
+            // frequent cleanup pass and the passes around it share it
+            iro_uses_dead(&f);
         }
         if on_tail && iro_time(&mut tp_names, &mut tp_ms, &mut tp_hits, "tailcall", timing, &mut f) {
             changed = true;
             n_tail = n_tail + 1;
+            iro_uses_forget();
         }
         if on_gvn && iro_time(&mut tp_names, &mut tp_ms, &mut tp_hits, "gvn", timing, &mut f) {
             changed = true;
             n_gvn = n_gvn + 1;
+            iro_uses_forget();
         }
         if on_licm {
             // reads the module's effect masks (OP25), so it is timed here
@@ -644,6 +665,7 @@ pub fn iropt_native(module: &mut IrModule) {
         if on_iv && iro_time(&mut tp_names, &mut tp_ms, &mut tp_hits, "iv", timing, &mut f) {
             changed = true;
             n_iv = n_iv + 1;
+            iro_uses_forget();
         }
         // LF11/ME25: loop versioning (on by default since Nov 17;
         // FID_IROPT_OFF=version turns it off)
@@ -3692,6 +3714,85 @@ pub fn iro_uses_disarm() {
     g_iro_uses_armed = false;
 }
 
+/// OP3 (Nov 21 evening): dce removed instructions: repair the shared use
+/// lists in place instead of forgetting them. An id the cache saw (its
+/// block_of >= 0) that no block holds now was removed — it is spliced out
+/// of every user list (each appearance was one use, so the counts drop by
+/// as many) and its own entry is cleared; nothing asks about a dead id.
+/// Survivors keep their relative order, so position-sensitive readers are
+/// safe. Returns how many ids went dead (0 when nothing is held).
+fn iro_uses_dead(f: &IrFunction) -> i64 {
+    if !g_iro_uses_held {
+        return 0;
+    }
+    var n: i64 = g_iro_uses_key.len();
+    if n <= 0 {
+        return 0;
+    }
+    var present: Vec<i64> = peir_zeros(n);
+    var b: i64 = 0;
+    while b < f.blocks.len() {
+        var ids: Vec<i64> = f.blocks.get(b).instructions;
+        var k: i64 = 0;
+        while k < ids.len() {
+            var id: i64 = ids.get(k);
+            if id >= 0 && id < n {
+                present.set(id, 1);
+            }
+            k = k + 1;
+        }
+        b = b + 1;
+    }
+    var dead: i64 = 0;
+    var v: i64 = 0;
+    while v < n {
+        if present.get(v) == 0 && g_iro_uses_block_of.get(v) >= 0 {
+            dead = dead + 1;
+        }
+        v = v + 1;
+    }
+    if dead == 0 {
+        return 0;
+    }
+    var u: i64 = 0;
+    while u < n {
+        var lst: Vec<i64> = g_iro_uses_users.get(u);
+        var lst_len: i64 = lst.len();
+        if lst_len > 0 {
+            var lost: i64 = 0;
+            var keep: Vec<i64> = Vec::new();
+            var q: i64 = 0;
+            while q < lst_len {
+                var w: i64 = lst.get(q);
+                var gone: bool = w >= 0 && w < n && present.get(w) == 0 && g_iro_uses_block_of.get(w) >= 0;
+                if gone {
+                    lost = lost + 1;
+                } else {
+                    keep.push(w);
+                }
+                q = q + 1;
+            }
+            if lost > 0 {
+                g_iro_uses_users.set(u, keep);
+                if g_iro_uses_count.get(u) >= lost {
+                    g_iro_uses_count.set(u, g_iro_uses_count.get(u) - lost);
+                } else {
+                    g_iro_uses_count.set(u, 0);
+                }
+            }
+        }
+        u = u + 1;
+    }
+    v = 0;
+    while v < n {
+        if present.get(v) == 0 && g_iro_uses_block_of.get(v) >= 0 {
+            g_iro_uses_block_of.set(v, 0 - 1);
+        }
+        v = v + 1;
+    }
+    return dead;
+}
+
 /// A pass changed the function: the cached use lists no longer hold.
 pub fn iro_uses_forget() {
     if g_iro_uses_held {
@@ -5517,7 +5618,15 @@ fn iro_promote_here(f: &IrFunction, on_ssa: bool, named: bool) -> bool {
     if named || !on_ssa {
         return true;
     }
-    return !ssa_takes(f);
+    // ME3 (Nov 21 evening): promote runs after ssa too. ssa's round trip
+    // leaves the slots it could not take in the slot form promote works
+    // on, and promote's per-alloca reaching-store dataflow still wins
+    // there (test_matrix_mul was ~2% larger with promote retired: 6,048
+    // against 5,930 instructions after iropt). The order in iropt_native
+    // (midend/ssa first, promote among the cleanup passes) keeps the two
+    // out of each other's way: promote only touches plain allocas whose
+    // loads all have one reaching store — slots ssa left alone.
+    return true;
 }
 
 fn iro_promote(f: &mut IrFunction) -> bool {

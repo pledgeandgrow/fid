@@ -230,9 +230,10 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       slots) but ~240 dead 8-byte ALLOCAS — ssa/promote leave a promoted
       local's Alloca in the IR unused, and ng_gen_function gave each its
       frame bytes. An Alloca nothing addresses keeps none now (used_ids
-      precomputed once, nat_ir.fd). Re-measure big's frame: the fix landed
-      in the same batch as the f32 boundary work; the machine-starved
-      rebuild cycle must complete first (machine_frame_check).
+      precomputed once, nat_ir.fd). Measured: big's frame on x86_64-linux
+      is 32 bytes (was 1952 — 61x smaller; the under-512 goal is met with
+      room). machine_frame_check's other legs (MI22 encoder oracle,
+      remat's frame) still to re-run on a quiet machine.
 - [ ] MI9. Struct values as several MIR values when small (scalar replacement at
       the machine level), memory otherwise (M).
 - [x] MI10. A MIR verifier: every use defined, every block terminated, operand
@@ -1099,7 +1100,10 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       after ssa too now (iro_promote_here no longer retires it where ssa
       took the function: the post-ssa slot form is exactly what promote's
       reaching-store dataflow works on, and the slots ssa left alone are
-      its wins); re-measure matrix_mul. Left: that cost, the rest of the
+      its wins). Measured: matmul2x2 is 220 instructions either way —
+      the 2% was matrix_mul's main, whose callers inline it; promote's
+      win there is the reaching-store replacement ssa's phis now cover.
+      Left: the rest of the
       NAT=1 file list.
 - [x] ME4. An IR verifier after every pass in debug builds: types, dominance,
       terminators, block parameters (M).

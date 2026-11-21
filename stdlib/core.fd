@@ -1828,13 +1828,18 @@ pub fn Vec_drop_inplace(v: i64) {
         }
     }
     if last && data != 0 {
-        if vec_code(v) == 0 {
+        if vec_code(v) == P_VEVCODE {
+            // a variant stream (0008): its own walker, then the buffer
+            vecv_drop(v, data, len, cap);
+        } else if vec_code(v) == 0 {
             vec_drop_range(data, 0, len, vec_tid(v));
         } else {
             vec_mem_drop_range(v, data, 0, len);
         }
-        p_sensitive_free(v, data, cap);
-        vec_buf_free(data);
+        if vec_code(v) != P_VEVCODE {
+            p_sensitive_free(v, data, cap);
+            vec_buf_free(data);
+        }
     }
     // a stack header used again (a loop) starts empty
     var zp: *mut i64 = v;
@@ -2433,6 +2438,198 @@ pub fn Vec_pop(v: i64) -> i64 {
         result = vec_elem_dup(vec_tid(v), result);
     }
     return result;
+}
+
+// --- Variant streams (proposal 0008, FID_CONTIGUOUS) ------------------------
+// A Vec<Sexp..>: each element at exactly its variant's size. The buffer is
+// [used words][elem0][elem1]..., an element [tag][payload words of that
+// variant]; sequential and walk-addressed (indexing is the fixed-mode
+// Vec<E>'s job). Element code 247 in the header marks the family; word 2
+// holds the buffer's capacity in words, word 1 the element count.
+pub const P_VEVCODE: i64 = 247;
+
+pub fn VecV_new() -> i64 {
+    var ptr: i64 = p_malloc(40);
+    var p0: *mut i64 = ptr;
+    var p8: *mut i64 = ptr + 8;
+    var p16: *mut i64 = ptr + 16;
+    var p24: *mut i64 = ptr + 24;
+    var p32: *mut i64 = ptr + 32;
+    // SAFETY: writes the five header words of the 40-byte block p_malloc just
+    // returned (as Vec_new: p_malloc does not promise zeroed memory).
+    unsafe {
+        *p0 = 0;
+        *p8 = 0;
+        *p16 = 0;
+        *p24 = vec_code_word(P_VEVCODE);
+        *p32 = 0;
+    }
+    return ptr;
+}
+
+pub fn VecV_len(v: i64) -> i64 {
+    if v == 0 {
+        return 0;
+    }
+    var p8: *mut i64 = v + 8;
+    var n: i64 = 0;
+    // SAFETY: word 1 (the element count) of the header of v, a VecV.
+    unsafe {
+        n = *p8;
+    }
+    return n;
+}
+
+/// The words an element whose tag word is at `a` occupies: its size word
+/// (one before the tag) holds the payload word count.
+pub fn vecv_esz(a: i64) -> i64 {
+    var t: *mut i64 = a - 8;
+    var n: i64 = 0;
+    // SAFETY: a is an element's tag word inside a VecV buffer; the word
+    // before it is the size word VecV_push wrote.
+    unsafe {
+        n = *t;
+    }
+    return 1 + n;
+}
+
+fn vecv_reserve(v: i64, need_words: i64) {
+    var cp: *mut i64 = v + 16;
+    var cap: i64 = 0;
+    // SAFETY: word 2 of v's header, the buffer capacity in words.
+    unsafe {
+        cap = *cp;
+    }
+    if cap >= need_words {
+        return;
+    }
+    var nc: i64 = 16;
+    if cap > 0 {
+        nc = cap * 2;
+    }
+    if nc < need_words {
+        nc = need_words;
+    }
+    var dp: *mut i64 = v;
+    var od: i64 = 0;
+    // SAFETY: word 0 of v's header, its buffer.
+    unsafe {
+        od = *dp;
+    }
+    var nd: i64 = vec_buf_alloc(nc * 8 + 8);
+    var used: i64 = 0;
+    if od != 0 {
+        var u0: *mut i64 = od;
+        // SAFETY: word 0 of the old buffer is its used-words count.
+        unsafe {
+            used = *u0;
+        }
+        vec_copy_bytes(nd + 8, od + 8, used * 8);
+        vec_buf_free(od);
+    }
+    var n0: *mut i64 = nd;
+    var ncap: *mut i64 = v + 16;
+    var ndp: *mut i64 = v;
+    // SAFETY: word 0 of the new buffer (the used count, copied above is
+    // intact) and words 0/2 of v's header.
+    unsafe {
+        *n0 = used;
+        *ncap = nc;
+        *ndp = nd;
+    }
+}
+
+/// Append variant `vi` with the `nwords` payload words at `elem` (a tag
+/// word followed by the payload, an enum literal's layout) and return the
+/// element's tag address: [nwords][vi][payload...] in the buffer, so what
+/// the tag address points at reads exactly a fixed-mode enum does.
+pub fn VecV_push(v: i64, vi: i64, elem: i64, nwords: i64, tid: i64) -> i64 {
+    if v == 0 {
+        p_panic("VecV_push on a null Vec");
+    }
+    var u0: *mut i64;
+    var used: i64 = 0;
+    var dp: *mut i64 = v;
+    var data: i64 = 0;
+    // SAFETY: word 0 of v's header and of its buffer.
+    unsafe {
+        data = *dp;
+        if data != 0 {
+            u0 = data;
+            used = *u0;
+        }
+    }
+    vecv_reserve(v, used + 2 + nwords);
+    data = 0;
+    // SAFETY: word 0 of v's header, set by vecv_reserve.
+    unsafe {
+        data = *dp;
+    }
+    var sw: i64 = data + 8 + used * 8;
+    var at: i64 = sw + 8;
+    vec_copy_bytes(at, elem, (1 + nwords) * 8);
+    var sp: *mut i64 = sw;
+    var n0: *mut i64 = data;
+    var l8: *mut i64 = v + 8;
+    var t32: *mut i64 = v + 32;
+    // SAFETY: the element's size word, the buffer's used count, and words
+    // 1/4 of v's header (the element count and the tid, set once here).
+    unsafe {
+        *sp = nwords;
+        *n0 = used + 2 + nwords;
+        *l8 = *l8 + 1;
+        if tid != 0 {
+            *t32 = P_TID_TAG + tid;
+        }
+    }
+    return at;
+}
+
+/// Element i's address (a walk: sequential data). Bounds-checked.
+pub fn VecV_get(v: i64, i: i64) -> i64 {
+    var n: i64 = VecV_len(v);
+    if i < 0 || i >= n {
+        p_panic("Vec index out of bounds");
+    }
+    var dp: *mut i64 = v;
+    var data: i64 = 0;
+    // SAFETY: word 0 of v's header.
+    unsafe {
+        data = *dp;
+    }
+    var a: i64 = data + 16;
+    var k: i64 = 0;
+    while k < i {
+        a = a + vecv_esz(a) * 8;
+        k = k + 1;
+    }
+    return a;
+}
+
+/// The last element's address (0 when empty) — what a push returned.
+pub fn VecV_last(v: i64) -> i64 {
+    var n: i64 = VecV_len(v);
+    if n == 0 {
+        return 0;
+    }
+    return VecV_get(v, n - 1);
+}
+
+/// Drop what a VecV's elements own, then its buffer (Vec_drop_inplace's
+/// variant branch).
+fn vecv_drop(v: i64, data: i64, len: i64, cap: i64) {
+    var tid: i64 = vec_tid(v);
+    var a: i64 = data + 16;
+    var i: i64 = 0;
+    while i < len {
+        if tid >= 16 && tid < P_TID_BOX {
+            __p_mem_drop(tid, a);
+        }
+        a = a + vecv_esz(a) * 8;
+        i = i + 1;
+    }
+    p_sensitive_free(v, data, cap * 8);
+    vec_buf_free(data);
 }
 
 pub fn Vec_len(v: i64) -> i64 {

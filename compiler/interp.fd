@@ -102,7 +102,11 @@ pub fn interp_reinterpret_word(v: Value, ty: IrType) -> Value {
         IrType::F32 => {
             match v {
                 Value::Int(bits32) => {
-                    return Value::Float(f32_from_bits_i(bits32));
+                    // OP21 (Nov 21 evening): the word holds the single's
+                    // F64 bits (the Vec<f32> layout canon — C, pe_ir and
+                    // nat_ir all pun the full 64 now), not a 32-bit
+                    // pattern: the f64 value IS the single's value
+                    return Value::Float(f64_from_bits_i(bits32));
                 }
                 _ => {
                     return v;
@@ -4639,11 +4643,17 @@ pub fn Interpreter_cast_value(self: &Interpreter, v: Value, to: IrType) -> Value
     match v {
         Value::Int(i) => {
             match to {
+                // OP21 (Nov 21 evening): an int word cast to a float type is
+                // the Vec<f32>/<f64> element boundary — the word holds the
+                // f64 bits of the single (the layout canon; nat_ir's BitCast
+                // keeps the bits for int<->float too), not a number to
+                // convert. A numeric `x as f64` lowers to p_int_to_float,
+                // never to a BitCast.
                 IrType::F32 => {
-                    return Value::Float((i as f64));
+                    return Value::Float(f64_from_bits_i(i));
                 }
                 IrType::F64 => {
-                    return Value::Float((i as f64));
+                    return Value::Float(f64_from_bits_i(i));
                 }
                 // An address made a pointer (`p + off` cast to *T): a Store
                 // or Load through it needs a pointer value, or it went to 0
@@ -4673,11 +4683,12 @@ pub fn Interpreter_cast_value(self: &Interpreter, v: Value, to: IrType) -> Value
         }
         Value::Float(f) => {
             match to {
+                // OP21: the reverse boundary — the single's f64 bits
                 IrType::I64 => {
-                    return Value::Int((f as i64));
+                    return Value::Int(p_f64_to_bits(f));
                 }
                 IrType::I32 => {
-                    return Value::Int((f as i64));
+                    return Value::Int(p_f64_to_bits(f));
                 }
                 _ => {
                     return Value::Float(f);

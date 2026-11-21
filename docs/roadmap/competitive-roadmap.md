@@ -211,7 +211,15 @@ in memory. This track is where most of the speed is.
       on, the CFG is built 12,584 times and reused 75,881, loops built
       12,077 and reused 29,485 (none reused with it off). Left: use lists
       are reused 2 times in 6,508 builds (test_closure_capture only), so in
-      practice they are not shared between passes.
+      practice they are not shared between passes. Nov 21 (evening):
+      the staleness is closed and DCE keeps the cache: every cleanup pass
+      that changes the function now forgets (fold, simplify, branchfold,
+      branchfacts, sccp, promote, dse, quietcall, tailcall, gvn, iv —
+      their `changed` arms never did), and dce, which only removes
+      instructions nothing reads, updates the shared lists in place
+      instead (iro_uses_dead: the removed ids are spliced out of every
+      user list, the counts drop by as many, survivors keep their order),
+      so the passes around it share them.
 - [x] OP4. One pass manager, with per-pass timing and a switch to turn each off (M).
       Checked Nov 15 (llvm ME5): `iropt_native` runs every pass through
       `iro_pass_on` (FID_IROPT_OFF / `--no-pass=a,b`, `iro_cli_off` in
@@ -603,7 +611,22 @@ in memory. This track is where most of the speed is.
       print the expected output. Left: the pe_ir image of test_simd_i64
       panics (invalid memory access) at its wrapping case;
       test_machine_simd fails the allocation checker on sse, avx2 and --nat
-      (the arghint/argfree issue); f32 SIMD (Vec<f32> element reads wrong).
+      (the arghint/argfree issue); f32 SIMD (Vec<f32> element reads wrong). Nov 21 (evening): the element
+      boundary itself is fixed on the C path — a Vec<f32> word holds the
+      single's f64 bits, and C's call result now puns the full 64 bits to
+      a double and narrows (codegen_c.fd; the low-32 pun read denormal
+      bits), its int<->float BitCasts reinterpreted as bits, and the
+      interpreter reinterprets the whole word (interp.fd; was the low 32).
+      Validated (the final self-hosted-lineage build): `Vec<f32>`
+      push/get prints 4/0.5/1.5 on run AND ccompile (the interp reinterprets
+      the whole word as the single's f64 bits; the C path puns the full 64
+      bits, narrows for the f32 result, prints through p_print_float — an
+      f32 printed as its number, not its bits truncated). pe_ir prints
+      garbage yet: its print pun reads the 4-byte slot wrong (the widening
+      movq is in, the slot model differs); --nat's call boundary is not
+      converted at all (Vec<f32> through --nat still prints 0). Left:
+      pe_ir's print pun, --nat's arg/result f32 conversions, the f32 lane
+      layout for the vectorizer (ng_vz_sty/ng_simd_call).
       Nov 21: the crash under this goal's check (2g.96, test_simd_i64) was pe_ir_stubs' itoa buffer clobbering r14, fixed — not the @simd lowering.
 - [~] OP22. Automatic loop vectorization: SSE2, AVX2 (XL).
       (Checked Nov 15: no vectorizer in iropt.fd or nat_ir.fd; it needs
@@ -644,7 +667,21 @@ in memory. This track is where most of the speed is.
       test_runtime_memops match `fid run` on ccompile, pe_ir, --nat,
       x86_64-linux and aarch64-linux. Left: diff, cmpz and find are still
       word SWAR code (no byte compare or mask machine operations);
-      bench/memops not re-measured.
+      bench/memops not re-measured. Nov 21 (evening): MO_VBTEST is in the MIR
+      (mir.fd; the byte test of two vector registers — every byte equal /
+      any byte equal / any zero byte — writing a general-register bool)
+      with an x86-64 encoder (pcmpeqb, pmovmskb, the integer test all
+      landing in the destination register; nat_ir.fd ng_vbtest), and
+      pert_vblk_diff/_cmpz/_find are lowered to 16-byte block loops with
+      it on --nat/x86_64-linux (ng_vblk_search: the first block whose test
+      fires, m = n & ~15 otherwise — the routines' contract). AArch64 and
+      RVV keep the word SWAR (their encoders are the left part: cmeq +
+      umaxv/uminv, vmseq + vcpop); test_runtime_vblk on --nat still
+      panics (invalid memory access) with the b block loaded — the
+      lowering's loop/label structure or the VBTEST encoding needs a
+      dump-and-inspect cycle (FID_NAT_DUMP of the caller); the SWAR
+      runtime path is the fallback while it is off (gate the search
+      lowering with FID_NAT_OFF=vblktest to compare).
 
 **Where Fides can beat them: what the language proves**
 
@@ -976,6 +1013,72 @@ Some of the largest costs are in how data is laid out, not in the optimizer.
       i64), i64>` key built at run time is not found by equal text built
       separately (`contains` gave false); generic struct keys; maps whose
       type the lowering cannot see.
+      Nov 21 (P2 fix; staged, not yet in the tree): the three things left are done. Tuple keys: a
+      tuple key holding strings (in a nested tuple or in a struct inside
+      it too) is numbered 0x8000 + j by the lowering
+      (Lowerer_key_tuple_tid, Lowerer_key_tuple_mask; core's
+      HM_TKEY_BASE), and __p_key_strs names its string words for that
+      number, so core hashes and compares them as text; core's copy of
+      such a key owns its strings (hm_tkey_strs: Str_dup when the map keeps
+      it, Str_drop with it; clone, share and send copy them too). A nested
+      tuple is laid out inline as the literal lays it out
+      (Lowerer_key_tuple_ir; before, the key type's layout made it one
+      word and replaced the literal's). Generic struct keys:
+      `HashMap<Pair<str, i64>, V>` takes the struct path (the struct's one
+      layout, Lowerer_key_struct_layout_ir) with the instance's element
+      type, whose `str` fields __p_key_strs names (a type parameter's field
+      holding a struct is a pointer and is no longer read as inline words).
+      Maps without a written type: the type checker types an untyped `var
+      m = HashMap::new()` from its first insert of a struct or tuple key
+      (TypeChecker_rt5_note_insert, ast.fd rt6_add_map / rt6_map_at; the
+      variable is retyped, so `m.keys()` is a Vec<K>), and the lowering
+      gives the `let` that HashMap<K, V> (Lowerer_rt6_let_type), the path
+      of a written type. The IR cache (FID_IRCACHE) records and replays the
+      tuple key numbers. Test test_map_tuple_str_keys (keys built apart
+      with equal text found through insert, get, get_or, contains, remove,
+      keys() and values(); a tuple nesting a tuple and a struct with a
+      string; a generic struct key; an unannotated map): right on run,
+      ccompile, emit (pe_ir) and emit --nat, as are test_map_inline,
+      test_map_struct_values, test_map_struct_keys,
+      test_verify_d22_hashmap_str_keys, test_stdlib_hashmap_flood,
+      test_vec_infer_tc and test_generic_struct; the three RT5 tests and
+      the tuple part of the new one free every block (--leaks).
+      Nov 21 (P2 fix; staged, not yet in the tree, G2): two of the RT5 leftovers are done. Tuple
+      layouts are named by their shape, not their length
+      (lower.fd lw_tuple_layout_name: `__tuple_2_pl` for (str, i64),
+      `__tuple_2_s12___tuple_2_pll` for ((str, i64), i64), a code per
+      field), so tuples of one length and different shapes no longer
+      share the last-registered layout. A function's tuple result is laid
+      out as a literal of its element types lays it out (nested tuples and
+      structs, a generic struct's instance too, inline:
+      Lowerer_register_ret_tuple and Lowerer_lower_type_sret use
+      Lowerer_key_tuple_ir; an alias of a tuple type is a tuple), and
+      `val (a, b) = t` reads its fields at the layout's offsets with its
+      types (the value's own layout, else the one its element types give,
+      the address cast to it; before, a tuple held in a variable was read
+      at index * 8 and a nested one as a word), its names getting their
+      element types; a tuple literal's AST type is the tuple of its
+      elements' types. An IR cache hit (FID_IRCACHE, salt 8) makes the
+      layouts of the tuples a cached function uses again from their names.
+      Generic struct values own what they hold: a generic literal is owned
+      as its instance (`Pair { a: "k" + x, b: 1 }` is a Pair<str, i64>,
+      the type of each type-parameter field taken from how its value is
+      owned; `"k" + x` was typed i64, so `p.a` printed a number and its
+      string leaked), a temporary of the statement like a plain struct
+      literal; a variable declared `Pair<str, i64>` holds the struct inline
+      and owns it (its slot held a pointer nobody dropped); a struct or
+      enum given to a type-parameter field is a heap copy the instance's
+      drop frees (Lowerer_rc_gen_param_payload) and its field reads back
+      as a pointer to it. Generic struct map keys free their strings now.
+      Tests test_tuple_shapes and test_generic_struct_drop (written, not
+      yet run with a compiler built from this tree), test_map_tuple_str_keys
+      updated. Left: a type-parameter field holding a struct
+      (`Pair<Cell, i64>` keys) is still hashed and compared by its
+      address; a tuple does not own its elements (a string or a struct
+      literal put in a tuple is a statement temporary, dropped while the
+      tuple still holds it, outside map keys); a non-generic struct's field
+      of a generic instance type (`p: Pair<str, i64>`) is one word that
+      the drop reads as inline.
 - [~] RT6. Generics fully monomorphized, so a `Vec<f64>` holds floats as floats (L).
       Done (Nov 3, verified): `val x: f64 = v.get(0)` round-trips 1.5 — the
       monomorphized layout already stores floats as floats when the element
@@ -1016,6 +1119,42 @@ Some of the largest costs are in how data is laid out, not in the optimizer.
       is right on ccompile and emit. Left: pe_ir (the default Windows
       `emit`) returns only the large block: small blocks stay resident (99
       MB held after they are freed).
+      Nov 21 (P2 fix; staged, not yet in the tree): the pe_ir allocator (the default Windows `emit`)
+      gives freed memory back as well. Each thread now bumps blocks out of
+      its own 4 MB chunk (4 MB-aligned and VirtualAlloc'd, with no lock or
+      atomic on the bump; the old global `lock xadd` bump and its race on a
+      replaced chunk are gone). p_malloc and p_free are still machine code
+      (pe_ir_stubs.fd). They call stdlib/pe_runtime/conc.fd for the slow
+      parts:
+        - pert_alloc_chunk makes a new chunk, and the full chunk's tail
+          becomes free blocks.
+        - pert_alloc_trim runs when p_free passes the thread's threshold of
+          free bytes (8 MB at first, then what is left plus a quarter). It
+          takes chunks off the lists and releases them when every byte
+          they handed out is on this thread's lists and no thread is still
+          bumping from them; 2 such chunks are kept. Free blocks of 256 KB
+          and more give back their inside pages (MEM_DECOMMIT), keeping
+          their header and list link.
+        - pert_alloc_recommit runs when p_malloc reuses such a block.
+      An OS thread that ends retires its chunk and puts its lists in a pool
+      that the next trim adopts (pert_thread_main). FID_MEM_RETURN=0 turns
+      trimming and decommit off. ir.fd roots the three functions.
+      test_mem_return prints its 6 true lines on emit: 4 -> 101 -> 25 MB
+      for the small blocks, 25 -> 40 -> 25 MB for the large block and
+      25 -> 60 -> 29 MB for the big blocks. With FID_MEM_RETURN=0 the
+      small and big cases print false (100 MB and 135 MB held).
+      test_alloc_threads_stress gives its 3 lines on 4 runs. The 11
+      tests/leaks programs match their .expected output on emit, and three
+      of them freed every block with emit --leaks. ownership is right
+      under --checked-alloc. tests/limits/check-native.sh passes all its
+      checks. 16 large tests (collections, btree, hashmap, json, regex,
+      bigint, channel, tasks, tasks_10k, threads, task_steal,
+      parallel_concurrent, spawn_vec_copy, vec_builtins) give the same
+      output and exit code as the old allocator. New test
+      test_mem_return_reuse: freed big blocks, decommitted and then reused,
+      read zero and keep their data. It passes on emit (with and without
+      FID_MEM_RETURN=0), --nat and ccompile; `fid run` passes it in 23 s
+      (its string part builds each string from one 32,000-byte text). Left: a run of the full suite on emit.
 - [~] RT8. Allocator speed on par with mimalloc on its own benchmarks (L).
       Progress Nov 17: bench/alloc/run.sh builds the five programs with the
       C library, mimalloc (`mi_malloc`, `mi_zalloc`) and fid's `p_malloc`
@@ -1037,6 +1176,141 @@ Some of the largest costs are in how data is laid out, not in the optimizer.
       Left: sizes (3.9x) and large (5.0x) against mi_malloc; this run did
       not reproduce fid beating mi_zalloc on all five (slower on small and
       threads); the native runtimes' allocators.
+      Nov 21 (P2 fix; staged, not yet in the tree): the C runtime's allocator (compiler/codegen_c.fd,
+      new emit_block_alloc_runtime; emit_mem_return_runtime). p_malloc and
+      p_free are a leaf fast path (a class block from this thread's free
+      list or current chunk, no lock, no registers saved; the size class
+      from clz, the class bytes from a table) and an out-of-line rest
+      (__p_malloc_full, __p_free_full). Memory known to be zero is not
+      zeroed again: a full chunk's rest is cut into free blocks marked
+      P_BLOCK_ZERO (fresh pages), freshly mapped and decommitted pages as
+      before. Zeroing that goes to memory bypasses the cache: a block of 16
+      KB or more freed more than 256 KB of allocations ago is zeroed with
+      non-temporal stores (__p_zero_big, SSE2; memset elsewhere), a block
+      reused right away stays in the cache (those stores are 5-9x faster
+      there). Large blocks (over 1 MB) keep their pages in a per-thread
+      span cache while the thread asks for them often (8 in a second; at
+      most 16 spans of 8 MB, 64 MB in all, unmapped after 250 ms unused or
+      at the thread's end; FID_SPAN_CACHE=0 off): fresh pages cost a page
+      fault each, several times slower than zeroing in place. A free block
+      of 256 KB or more is decommitted by the trim only once it has stayed
+      free through a whole trim interval (the free stamps it with the trim
+      epoch). stdlib/linux_runtime/base.fd: a reused block is zeroed in the
+      bytes asked for (to 16), not its whole class, and a full chunk's rest
+      goes on the free lists as known-zero blocks (PE_ZERO).
+      bench/alloc (C programs, fid's C runtime linked in), medians of 5
+      runs, old and new interleaved, on a machine loaded by other builds
+      (ms; mi/mi-z: the same machine an hour earlier):
+        program  before  after   mi     mi-z   after/mi-z  after/mi
+        small    1098    1155    847    1263   0.91        1.36
+        churn     890     689    574    1212   0.57        1.20
+        sizes    3319    3162   1128    8812   0.36        2.8
+        threads   903     783    590    1423   0.55        1.33
+        large    5240    2080   1319   10362   0.20        1.58
+      (sizes in a quieter run: 2945 -> 2527; large 5424 -> 2165 and 5601
+      -> 2108 in two others; a buffer freed and asked for again at once,
+      16 KB-1 MB, bench/alloc/c/hot.c of this change: no slower.) mimalloc
+      crashed now and then on threads (exit 139, both mi and mi-z).
+      Tests: test_alloc_reuse_zero, test_mem_return,
+      test_alloc_threads_stress, the new test_alloc_zero_paths (64 KB+
+      blocks at every end offset, span-cache reuse, chunk rests, trim
+      decommit and recommit) and 22 more bootstrap tests and 2 projects
+      through C with the patched runtime (also -DP_LEAKS: tests/leaks, every
+      block freed; -DP_CHECKED_ALLOC); the four allocator tests on --nat
+      Windows and x86_64-linux (WSL), which run base.fd.
+      Left: sizes is still bound by zeroing (Fides memory reads as zero;
+      without the zeroing fid takes 709 ms, mi_malloc 623): 2.8x mi_malloc
+      here; the cold/hot split keeps a cache-resident block's zeroing in
+      the cache, so only part of sizes' blocks get the faster stores.
+      small and threads at about mi_malloc's 1.3x, below mi_zalloc. The
+      remote free still goes to the freeing thread's lists (no owner
+      return: a block can sit next to another thread's live ones). The
+      numbers are from a loaded machine (out-of-memory exits of both old
+      and new sizes runs once in five): to be rerun quiet with
+      bench/alloc/run.sh. The native Windows allocator (pe_ir) is not
+      changed (team C); base.fd's large blocks have no span cache and its
+      heap still has one lock once threads run.
+"Nov 21 (P2 fix)" one (the C runtime's):
+
+      Nov 21 (P2 fix; staged, not yet in the tree, native runtime): the native allocator (stdlib/linux_runtime/base.fd:
+      Linux x86-64/AArch64/RISC-V, --nat Windows, macOS, WASI) gives each
+      thread a heap of its own ("Per-thread heaps"): free lists, the chunk
+      it bumps blocks from, a span cache, in pages of their own, reached
+      through the thread's block (word 88, read from the thread pointer at
+      each call, so a task that resumes on another thread uses that
+      thread's heap; before a second thread starts there is one heap and
+      the thread pointer is not read). p_malloc and p_free of class blocks
+      take no lock and no atomic; the heap lock is left to what threads
+      share: the chunk table (a new chunk, a trim), the pool, --leaks'
+      list, the memory profile; FID_MEM_LIMIT's count has a lock of its
+      own (pe_lim_take_mt). A block freed by a thread that did not make it
+      goes on the freeing thread's lists, as in the C runtime and pe_ir. A
+      chunk's table entry says whether a thread still bumps from it; a trim
+      unmaps a chunk no thread bumps from whose every handed-out byte is on
+      the trimming thread's lists (then no block of it is in use or on
+      another list). A thread that ends (pe_heap_thread_end: conc.fd
+      pe_thread_main on Linux, win.fd / darwin.fd after their thread's last
+      free) unmaps its cached spans, cuts the rest of its chunk into its
+      lists, unmaps its empty chunks and gives its lists to a pool; a
+      thread whose list of a class is empty takes the pool's list of that
+      class (only that class: the main thread joining does not take the
+      workers' blocks), a trim takes them all. Large blocks (over 1 MB)
+      have the C runtime's span cache, same rules: per thread, at most 16
+      spans of 8 MB each and 64 MB in all, kept only while the thread made
+      8 large allocations within a second, unmapped after 250 ms unused
+      (at the next large block or trim) or at the thread's end,
+      FID_SPAN_CACHE=0 off; a cached span's header reads freed, so a
+      second free of its block panics "Double free" (before: an invalid
+      access on the unmapped pages). pe_zero stores four words a turn
+      through pointers, not a pe_st call per word (a reused span is
+      zeroed in the bytes asked for). Fixed on the way: a thread going past
+      FID_MEM_LIMIT on --nat Windows hung (its report allocates and the
+      allocation waited for the heap lock its own thread held); now the
+      report runs outside the lock, one thread reports, exit 125.
+      bench/alloc/fides (team B's programs), before (team B's base.fd) and
+      after interleaved, median of 3, ms, on a machine loaded by other
+      builds (Linux: timed inside WSL 2):
+        program   --nat Windows        x86_64-linux (WSL)
+                  before   after       before   after
+        small      1336     1292        1222     1017
+        churn      1821     2003        1343     1335   (nat: 1625-2981
+                                                       after, 1706-2142
+                                                       before: noise)
+        sizes      7415     4024        8432     5336
+        threads    3269      862        3744      490
+        large      5694     3748       25432    10641
+      Tests (every one also with team B's base.fd, same output and exit
+      code unless said): on --nat Windows and x86_64-linux the allocator
+      tests test_alloc, test_allocator, test_alloc_reuse_zero,
+      test_alloc_threads_stress, test_mem_return, test_alloc_zero_paths
+      (team B), test_mem_return_reuse (team C) and two new ones:
+      test_alloc_thread_heaps (blocks made on four threads freed on four
+      others and reused zeroed; sixteen threads of 32 MB one after another
+      reuse the memory, 8 -> 7 MB resident on Linux, 13 -> 10 on Windows;
+      four threads of 40 large blocks each through the span cache, zeroed
+      and intact) and test_span_double_free (exit 1, "Panic: Double
+      free"); test_threads, test_spawn_{deep_copy,detached,mutate_both,
+      scope,vec_copy}, test_channel, test_channels_select, test_tasks,
+      test_tasks_10k, test_collections, test_collections_btree,
+      test_hashmap, test_hashmap_int_keys, test_json, test_json2; the 11
+      tests/leaks programs match their .expected output, with --leaks the
+      same leak reports as before (4 freed every block, 7 report the same
+      blocks with both runtimes: a lowering matter, not the allocator's);
+      --checked-alloc on ownership, test_alloc_threads_stress,
+      test_threads, test_tasks, test_alloc_thread_heaps (whose 16x32 MB
+      line says "added up" with both runtimes: checked blocks are never
+      reused); tests/limits/check-native.sh passes on nat and
+      x86_64-linux; FID_MEM_LIMIT=2G / 40M (exit 125, one message),
+      FID_MEM_RETURN=0 (test_mem_return's small blocks false, as
+      documented) and FID_SPAN_CACHE=0 runs of four allocator tests. Under
+      qemu-user (WSL) on aarch64-linux and riscv64-linux: the allocator
+      tests, the two new ones, test_threads, test_tasks, test_channel,
+      test_collections, test_hashmap, the same output as x86_64-linux.
+      Left: macOS (darwin.fd's hook) and WASI not run here; the native
+      allocator still decommits a free block of 256 KB or more at its
+      free (team B's delayed decommit is the C runtime's only); a remote
+      free still lands on the freeing thread's lists in all three
+      runtimes (no return to the owner).
 - [x] RT9. Own context switch, not fibers: under 20 ns per task switch (M).
       Done Nov 8 on Windows, both paths. Native: `pe_ctx_swap`
       (compiler/pe_ir_stubs.fd, the same bytes in src/pe.rs, checked against
@@ -1085,6 +1359,81 @@ Some of the largest costs are in how data is laid out, not in the optimizer.
       machine). Left: the C runtime is still one cooperative scheduler per
       OS thread (no M:N, no stealing); the locality gain over the old
       shared-lock queues is not measured.
+      Nov 21 (P2 fix; staged, not yet in the tree): the C runtime is M:N too (compiler/codegen_c.fd
+      "M:N tasks", P_MN: wherever it has its own context switch, P_OWN_CTX,
+      and GNU atomics; not --lib, not -g). Worker threads, one per CPU up to
+      16 (FIDES_WORKERS=<n> 1-16, as the native runtimes; a program's
+      p_co_workers(n) before its first task wins, and fid's interpreter asks
+      for 1 that way, by name, since its tasks share its state), each with
+      a 256-slot ring taken FIFO (the native Chase-Lev algorithm: owner
+      pushes at bottom, owner and thieves claim at top by CAS), steal-half
+      from a rotating victim, a full ring spilling half to the global queue,
+      which also takes what is woken or spawned off a worker (main, the
+      poller, other threads) and which a worker looks at first one time in
+      61. Idle workers sleep on the global queue's condition variable (idle
+      count, then a last look; a push publishes, then reads the count: no
+      spinning, no lost wake-up). A task's switch out is finished by the
+      context it returns to (__p_mn_settle, after the switch, as Go parks on
+      g0): only then is it queued, parked on the task it awaits or on a
+      channel, or handed to the poller, so no worker resumes it before its
+      registers are saved. One poller thread owns the timer heap and the
+      socket waits (AFD/IOCP, epoll, kqueue, the poll set), woken by a pipe
+      or an IOCP post. What assumed one scheduler per thread: the task's
+      token, regions and capabilities move with it (saved in its block at
+      each switch, as before); channel waits in a task park the task on the
+      channel instead of the thread's condition variable; await, task_run
+      and sleeps off a task sleep on a condition variable / the OS while the
+      workers run the tasks; the task chain of a panic ends at "main" or
+      "(thread)" from where the task was started; p_co_stack applies to the
+      tasks the calling task starts (children inherit it); deadlocks are
+      found exactly (every unfinished task parked awaiting another); the
+      allocator's per-thread free lists already took blocks freed on
+      another thread. Thread-locals that code on a task's stack reads
+      (p_malloc/p_free, regions, capabilities, the token, errno after a
+      wait) go through functions the C compiler cannot inline
+      (P_MN_NOINLINE), so an address taken before a switch is never reused
+      on another thread. p_tls_* stays per OS thread, as natively.
+      FIDES_WORKERS=1, random scheduling (RL17) or one CPU keep one
+      cooperative scheduler per thread, the code path of before.
+      FIDES_RUNQ=shared runs every task through the global queue under its
+      lock (the old shared-lock design) for comparison. Tests (dump-c of the
+      stage-0 compiler with the same edits applied to its C, zig cc -O1,
+      Windows x64, 16 CPUs): 55 task/async/channel/select/spawn/timeout/
+      thread programs give the same output and exit code with the default
+      workers (16) and FIDES_WORKERS=1 (2-3 M:N runs each), and match
+      their expected output where they have one (the 3 *_fail ones exit 1
+      with their panic and task chain, "b <- a <- main" included); not
+      task_pingpong_bench, which counts in a plain global and is meant for
+      FIDES_WORKERS=1; test_task_steal 45/45 identical with 2, 3 and 16 workers and
+      10/10 with FIDES_RUNQ=shared; bench_sleepers 4.3 s (1 worker 4.0 s);
+      idle-connection bench (bench/idle, 200 and 1,000 connections) every
+      ping answered, idle p50 0.10 ms in both modes. New
+      tests/ctx_switch/c_task_migrate.fd (4 tasks on 4 workers at once, a
+      task resumed on another worker after a sleep, 2,000 spawned tasks
+      taken by other workers; deterministic output) and
+      tests/bootstrap/c_task_deadlock_fail.fd (both modes panic "Tasks are
+      deadlocked", exit 1). Contention benchmark
+      bench/rt10/run.sh (bench/rt10/runq_bench.fd: ns per yield, the queues
+      alone; tests/ctx_switch/steal_bench.fd: ns per task), -O2, loaded
+      machine, median of 3:
+        workers  queue        yield   fan-out  tree   global
+        4        shared lock  263 ns  9663     8881   9234
+        4        rings         40 ns  7866     6322   9558
+        16       shared lock  483 ns  10789    10258  11126
+        16       rings         25 ns  9180     8602   10390
+        1 (before RT10)      ~155 ns  ~9000    ~9300  ~9200
+      (steal_bench's ~8-10 us a task is making and ending the task: its
+      stack's pages; the queues show in runq_bench). fid's interpreter
+      asks for one worker (interp.fd itask_mode). Left: a compiler built
+      with these edits was not run (the private build's dump-c passed, two
+      split units of the typechecker and gen_inst could not be compiled
+      for lack of memory on the shared machine); the runtime was tested as
+      the C text the edited codegen_c.fd emits (rt10/patch.py applies the
+      same edits to both); Linux/macOS C
+      builds of the M:N path not run here (Windows only); println was two writes, so two tasks' lines could mix
+      under M:N (test_lowering_async_generic_task, about 1 run in 60): in the
+      merged tree println is one locked write on the C path (0 broken lines
+      of 24,001 in a 16-worker stress test; about 7,700 without the lock).
 - [~] RT11. IOCP on Windows, epoll on Linux, kqueue on macOS, replacing the O(n) poll
       loop (L).
       Done Nov 8. Native Windows: a task waiting for a socket submits one AFD
@@ -2420,6 +2769,30 @@ owning what we ship.
       at 0.8 s restarts the 1 s timer); sl15-check.sh mangles WSL paths and
       takes Git Bash's PID for the Windows one.
       Nov 21 (c082ee6, 2g.101): pert_prof_watch_main's periodic report keeps its own clock — an event-triggered report no longer restarts the 1 s timer.
+      Nov 21 (P2 fix; staged, not yet in the tree): the periodic report keeps its own schedule.
+      pe_runtime/conc.fd `pert_prof_watch_main` reports every
+      FID_PROF_EVERY seconds on GetTickCount64 (`next` moves on by one
+      period only when a periodic report is due, and the wait for the event
+      never runs past it); a report on the named event or Ctrl-Break no
+      longer restarts the timer. The same in linux_runtime/sys.fd
+      `pe_prof_watch_main` (SIGUSR2 no longer resets the ticks). With
+      FID_PROF_EVERY=1 the 1.6 s pe_ir service prints 3 reports (the event
+      at 0.8 s, the periodic one at 1 s, exit). tests/prof/sl15_service.fd
+      prints `pid <n>` (its Windows process id) first on stderr and takes
+      SL15_SVC_MS (the length of each half, 800 ms by default);
+      sl15-check.sh names the event with that pid instead of the shell's
+      $!, and runs the service for 2 x 4 s when PowerShell sets the event
+      (PowerShell can take seconds to start; its Set must not land with the
+      service's own). The WSL step goes through `wsl.exe -e wslpath -a` with
+      a forward-slash path and MSYS_NO_PATHCONV=1 (the old call ran wslpath
+      through WSL's shell, which ate the backslashes). Run from WSL with a
+      Windows fid (FID=...fid.exe), the script runs the Windows checks
+      through interop (WSLENV carries FID_PROF, FID_PROF_EVERY and
+      SL15_SVC_MS) and the Linux build directly. With a fid built from the snapshot,
+      sl15-check.sh passes every check from Git Bash and from WSL (FID=
+      ./fid.exe): run, ccompile, emit and x86_64-linux name prof_burn; no
+      event without FID_PROF; 2 reports with FID_PROF=1; 3 with
+      FID_PROF_EVERY=1; 3 with the event set by PowerShell.
 - [x] SL16. Big integers and decimals (M).
       Done: `stdlib/bigint.fd` (`test_bigint.fd`) and `stdlib/decimal.fd`:
       exact decimals on a BigInt mantissa, division and rounding to a scale
@@ -2996,8 +3369,7 @@ Only this produces true production years. It starts now, at small scale.
       tools/doctest.fd lacks scripts/doctest.py's 'native: ...' summary
       line); only 2 of about 25 drivers are ported; the shipped ark, scribe
       and veil are still Rust; WASI and macOS not run.
-- [ ] AD5. A real production service of ours, on Fides, with its incidents written up
-      (L).
+- [>] AD5. A real production service of ours, with its incidents written up: moved to external-roadmap.md (Nov 21).
 
 **Being reachable**
 
@@ -3033,7 +3405,7 @@ Only this produces true production years. It starts now, at small scale.
 
 **Earning users**
 
-- [ ] AD12. A public launch once the beta gate is met, with honest limits (M).
+- [>] AD12. A public launch once the beta gate is met: moved to external-roadmap.md (Nov 21).
 - [~] AD13. Publish the benchmarks (BM10), and invite corrections (S).
       Done (Nov 15): `docs/benchmarks.md` (a page of the site): what is
       measured and how to reproduce it, every result in the repo (Nov 2,
@@ -3041,9 +3413,9 @@ Only this produces true production years. It starts now, at small scale.
       and a corrections section pointing to GitHub issues. Left: putting it
       online (AD2's hosting), a quiet-machine run with native numbers and
       the spread (BM8), results kept over time (BM10).
-- [ ] AD14. Ten external projects built on Fides (XL, not only effort).
-- [ ] AD15. Ten contributors outside the core (XL, not only effort).
-- [ ] AD16. A first company running Fides in production (XL, not only effort).
+- [>] AD14. Ten external projects built on Fides: moved to external-roadmap.md (Nov 21).
+- [>] AD15. Ten contributors outside the core: moved to external-roadmap.md (Nov 21).
+- [>] AD16. A first company running Fides in production: moved to external-roadmap.md (Nov 21).
 
 **Acceptance:** real incidents from real users, handled in public.
 
@@ -3065,8 +3437,6 @@ Only this produces true production years. It starts now, at small scale.
 
 These cost money and do not block anything above.
 
-- [ ] Paid security audits of the compiler and the runtime (release J9).
-- [ ] Toolchain certification (release L5).
-- [ ] A bug bounty.
+- [>] Paid security audits, toolchain certification, a bug bounty, a foundation,
+      full-time staff, conferences: moved to external-roadmap.md (Nov 21).
 - [ ] Dedicated benchmark and fuzzing machines; a laptop and free CI come first.
-- [ ] A foundation, full-time staff, conferences.

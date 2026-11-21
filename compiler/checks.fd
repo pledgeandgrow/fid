@@ -558,9 +558,14 @@ pub fn peir_counted_loop(f: &IrFunction, head: i64, n: i64, succs: Vec<Vec<i64>>
     }
     // ME23: a rotated loop (iropt_me.fd ime_rotate) tests on every edge
     // into its header instead: the way in from outside and each latch end
-    // in Branch(i < right, head, out), with the same i and bound
+    // in Branch(i < right, head, out), with the same i and bound. Nov 21
+    // evening: a rotated loop of one body block is a SELF-loop — the head
+    // ends in Branch(test, head, out), its own latch — which took the
+    // normal path below and was then refused at "the step may be in the
+    // header" (store_block == head && !rotated). A branch to the head
+    // itself is the rotated shape too.
     var rotated: bool = false;
-    if then_b < 0 || else_b < 0 || body.get(then_b) == 0 || body.get(else_b) != 0 {
+    if then_b < 0 || else_b < 0 || body.get(then_b) == 0 || body.get(else_b) != 0 || then_b == head || else_b == head {
         cond = peir_rotated_test(f, head, body, preds, index, facts);
         if cond < 0 {
             return;
@@ -2734,6 +2739,16 @@ fn peir_sf_inherit(f: &IrFunction, r: &mut PeirRanges, dom: &mut PeirDomFacts, i
 /// of b, the two blocks and everything between them the loop's body)? A
 /// budget bounds the walk; running out answers "yes" (a fact is then
 /// dropped, never kept unsoundly).
+/// OP24 (Nov 21 evening): FID_RANGE_WHY=1 prints the range analysis's
+/// square-rule and filled-fact decisions, a diagnostic never a gate.
+fn peir_range_why(what: str) {
+    var v: str = p_getenv("FID_RANGE_WHY");
+    if (v as i64) != 0 && str_len(v) > 0 {
+        p_eprint_str("range: " + what + "
+");
+    }
+}
+
 fn peir_join_stored(f: &IrFunction, preds: &Vec<Vec<i64>>, b: i64, q: i64, slot: i64, vid: i64, def_b: &Vec<i64>, st_ptr: &Vec<i64>, st_blk: &Vec<i64>) -> bool {
     var nb: i64 = f.blocks.len();
     var seen: Vec<i64> = peir_zeros(nb);
@@ -3238,22 +3253,23 @@ fn peir_range_scan(f: &IrFunction, r: &mut PeirRanges, single_pred: &Vec<i64>, p
                             // n * size, "out of memory" when the allocation
                             // fails): from here on n is at most the bytes of
                             // memory, the bound lengths have above
-                            if dom.on && name == "Vec_filled_typed" && cargs.len() >= 2 {
-                                var fnv: i64 = cargs.get(1);
-                                if fnv >= 0 && fnv < nv {
-                                    var fhi: i64 = 281474976710656;
-                                    var flo: i64 = peir_rng_get_lo(r, fnv);
-                                    if flo > fhi {
-                                        flo = fhi;
-                                    }
-                                    if r.cf_v.len() < 40 {
-                                        r.cf_v.push(fnv);
-                                        r.cf_lo.push(flo);
-                                        r.cf_hi.push(fhi);
-                                    }
-                                    peir_dom_vfact(dom, b, fnv, flo, fhi);
+                        if dom.on && name == "Vec_filled_typed" && cargs.len() >= 2 {
+                            var fnv: i64 = cargs.get(1);
+                            if fnv >= 0 && fnv < nv {
+                                var fhi: i64 = 281474976710656;
+                                var flo: i64 = peir_rng_get_lo(r, fnv);
+                                if flo > fhi {
+                                    flo = fhi;
                                 }
+                                if r.cf_v.len() < 40 {
+                                    r.cf_v.push(fnv);
+                                    r.cf_lo.push(flo);
+                                    r.cf_hi.push(fhi);
+                                }
+                                peir_dom_vfact(dom, b, fnv, flo, fhi);
+                                peir_range_why("filled: v" + int_to_str(fnv) + " <= 2^48 recorded at block " + int_to_str(b));
                             }
+                        }
                             // LF10: what every return of an internal callee gives
                             peir_ret_seed(f, r, id, name);
                             // An index below the least length of a filled Vec
@@ -3591,6 +3607,7 @@ fn peir_range_refine(f: &IrFunction, r: &mut PeirRanges, cond: i64, taken: bool)
                 var sq: i64 = peir_square_local(f, r, v, cond);
                 if sq >= 0 {
                     var s: i64 = peir_isqrt(nh);
+                    peir_range_why("square: slot v" + int_to_str(sq) + " |p| <= isqrt(nh=" + int_to_str(nh) + ") = " + int_to_str(s) + " (wh " + int_to_str(wh) + ")");
                     r.ref_lo = 0 - s;
                     r.ref_hi = s;
                     r.ref_loc = sq;
