@@ -180,6 +180,11 @@ in memory. This track is where most of the speed is.
       `compiler/ssa.fd` builds phis and converts them back to one slot per
       phi before any backend reads the IR (opt-in `FID_IROPT_ON=ssa`).
       Left: the suite run with it on and off, then on by default.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — ssa and ssaexit are in IME_DEFAULT_ON; NAT=1
+      ssa-default-check.sh passes on pe_ir and --nat (test_ssa_merge,
+      test_mem2reg_promote), and midend-optin-check with IME=ssa,ssaexit
+      gives 33 tests, 0 differ or fail to build. Left: a full-suite run.
 - [~] OP3. Dominator tree, loop tree and use lists shared by every pass (M).
       Partial (this session): `IroCfg` already carried `idom`; added a
       dominator-tree DFS interval numbering (`tin`/`tout`) built once per
@@ -201,6 +206,12 @@ in memory. This track is where most of the speed is.
       `ime_latches` still find loops themselves (over the shared
       dominators), and every pass rebuilds the CFG it reads (no
       invalidation tracking).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — NAT=1 cfgcache-check.sh: 22 tests, 0 differ; with the cache
+      on, the CFG is built 12,584 times and reused 75,881, loops built
+      12,077 and reused 29,485 (none reused with it off). Left: use lists
+      are reused 2 times in 6,508 builds (test_closure_capture only), so in
+      practice they are not shared between passes.
 - [x] OP4. One pass manager, with per-pass timing and a switch to turn each off (M).
       Checked Nov 15 (llvm ME5): `iropt_native` runs every pass through
       `iro_pass_on` (FID_IROPT_OFF / `--no-pass=a,b`, `iro_cli_off` in
@@ -221,6 +232,14 @@ in memory. This track is where most of the speed is.
       `@constant_time` callee only into `@constant_time` code
       (`test_midend_ct_inline.fd`). Left: a suite run with it on, then the
       default; no profile weighs the decisions yet (`pgo_count` exists).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — inline2 is on by default; inline2-check, inline2-vecfast-check
+      and inline-pgo-check (7 pass) pass; midend-optin-check IME=inline2:
+      33 tests, 0 differ; bench/fides: 4 programs, 0 slower; a 60-program
+      pe_ir sample is the same with it on. Left: mandelbrot (game suite) is
+      10-30% slower with inline2 on (best of 5: 3,699 -> 4,053 ms); on
+      --nat, test_ai_stdlib and test_machine_brflags2 fail the allocation
+      checker under FID_VERIFY=1 only with inline2 on; a whole-suite run.
 - [x] OP6. Constant propagation, folding and branch elimination (M).
       Done (Nov 4, native path): integer arithmetic and comparisons on two
       constants are folded when the result cannot overflow. Left: propagation,
@@ -273,6 +292,13 @@ in memory. This track is where most of the speed is.
       a read-only `Vec<i64>` loop is loaded before the loop (opt-in
       `vecdata`, `ime_vec_data`); both opt-in until
       tests/tooling/licmguard-check.sh passes on the suite.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — test_midend_vec_data, test_midend_licm_guard_deep and its
+      _fail test give their expected output; licmguard-check over the 63
+      test_midend_*.fd: 62 same, 1 out-of-memory build that rebuilt fine
+      (licmguard 3 and 6 operations, vecdata 4 reads). Left: licmguard and
+      vecdata are still opt-in, waiting for the full NAT=1 licmguard-check
+      suite run (only a 60-program sample was run).
 - [~] OP10. Strength reduction and induction variables (M).
       Partial (this session, `iro_iv`, gate `FID_IROPT_OFF=iv`,
       debug `FID_IV_DBG=1`): finds a plain local stored once per
@@ -299,6 +325,13 @@ in memory. This track is where most of the speed is.
       proof now also requires the step's block to be on no inner cycle
       avoiding the header; exit values are ssaexit's (on by default).
       test_midend_ivsr_bounded(_fail).fd, tests/tooling/ivsr-check.sh.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — test_midend_ivsr_bounded prints its expected values and
+      the _fail test panics (division by zero) where it should;
+      ivsr-check.sh: 0 failed (10 products, 9 outside @wrapping); PASS=ivsr
+      over a 60-program sample: 56 same, 2 skipped, 2 out-of-memory builds
+      that match when rebuilt. Left: ivsr is still opt-in; a full-suite run
+      with it on.
 - [~] OP11. Loop unrolling, peeling and rotation (M). Rotation done Nov 7
       (native): a block that jumps back to a header made only of the loop's test
       (loads, constants, integer operations, `len`) runs that test itself, so an
@@ -316,6 +349,16 @@ in memory. This track is where most of the speed is.
       left to the counted-loop proof. tests/tooling/unroll-check.sh
       (SUITE=1, BENCH=1). Left: that check (with SUITE=1 and BENCH=1) with
       this run's compiler.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      failed — the Nov 17 default makes wrong code on pe_ir. A 10-line loop
+      (`s += i` over 100 trips with a dead `waste = i*i`, partially
+      unrolled) built by the default `fid emit` prints 9900 instead of
+      4950; FID_IROPT_OFF=unroll, --nat and `fid run` give 4950
+      (midend-optin-check IME=unroll: test_opt_dce differs the same way).
+      NAT=1 unroll-check.sh: 3 failed (the peeled and run-time counters are
+      0 by default, above 0 only with FID_IROPT_OFF=inline2). Left: fix
+      partial unrolling on pe_ir or take `unroll` out of IME_DEFAULT_ON;
+      SUITE=1 and BENCH=1 not run.
 - [~] OP12. Scalar replacement of structs, and returning small structs in registers
       (L).
       Checked Nov 15 (llvm ME26, ME27): written, opt-in
@@ -332,6 +375,14 @@ in memory. This track is where most of the speed is.
       llvm ME27; test_natabi_retregs.fd). Left: SRA (`ime_sra`) by default
       after a suite run, and the caller's result slot (each call site still
       stores the two registers into it).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — the caller half: retfwd_unit prints a64/rv64/x64 ok;
+      machine_retfwd_check.sh: 0 failures (31 ok) on x86_64, aarch64,
+      riscv64 and --nat; test_natabi_retfwd's main has 60 memory operations
+      against 139 with the slots in memory, test_natabi_retregs 53 against
+      86. SRA (ime_sra) is now on by default (IME_DEFAULT_ON), so the opt-in
+      note above is out of date. Left: a NATIVE=1 suite run with retfwd
+      (only a 61-test sample so far); pair_sum is inlined, so not observed.
 - [~] OP13. Tail calls, tail recursion into loops (M).
       Verified (this session): `iro_tailcalls` (native path, on) already
       converts self-recursive tail calls (`return f(args)` where the
@@ -377,6 +428,14 @@ in memory. This track is where most of the speed is.
       closure that reaches the call through a parameter or a field (no
       interprocedural type facts), and inlining several-block closures by
       default (inline2, OP5).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — `fielddevirt` (on by default) and `dynspec`:
+      test_midend_devirt_field prints its expected values; devirt-check.sh
+      on devirt_field, devirt_param and closure_devirt: 3 same, 0 failed
+      (fielddevirt 3 dyn calls and 1 closure call, dynspec 6 clones), so a
+      receiver reaching the call through a field or a parameter is covered;
+      a 60-program pe_ir sample is the same with both on. Left: a full-suite
+      run with them on and off, and NAT=1 devirt-check.
 - [~] OP15. Block layout for hot paths, using likely branches (M). Native: no jump to
       the block laid out next; a branch inverts its condition to fall through.
       Checked Nov 15 (llvm WP17): nat_ir moves the panic paths of each
@@ -399,6 +458,15 @@ in memory. This track is where most of the speed is.
       nor the block before it falls through), and functions that only
       panic are found first (`PeirGen_find_cold_fns`). `FID_PE_OFF=layout`:
       IR order. Test: test_windows_cold_layout.fd, scripts/pe-win-check.sh.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — test_machine_cold_layout and test_machine_pgo_layout pass on
+      run and ccompile and, with NATIVE=1 cross-test, on x86_64, aarch64 and
+      riscv64 Linux (also under FID_VERIFY=1); FID_NAT_OFF=coldhint changes
+      the image; `run --profile` records block counts. Left: the profile
+      layout does not do what its test describes: scale is inlined by
+      default, and with inlining off the never-entered block is still the
+      fall-through after the branch (only a sub-block moves past the
+      epilogue); the mid-end does not use the block counts for layout.
 
 **Back end**
 
@@ -418,6 +486,17 @@ in memory. This track is where most of the speed is.
       IPRA clobber sets per call and an allocation checker
       (llvm-roadmap RA5, RA6, RA8, RA15, RA20). Left there too: splitting
       at calls (RA4), argument/result registers in the pool (RA7).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — RA4 splitting and RA7 arghint (the default): split_unit
+      24/24, test_machine_split and test_machine_arghint right on run and
+      ccompile; machine_split_check.sh: 29 ok (on/off outputs on all 4
+      targets, 1,132 pieces on x86, the mutation rejected, fewer wide
+      reloads); machine_ra7_check builds every target under FID_VERIFY=1
+      (moves 7,080 -> 4,226 on x86). Left: with FID_NAT_ON=splitall the
+      allocation checker rejects the argument-register assignment on
+      x86-64, RISC-V and --nat Windows; split_alloc_unit has 1 rejected x64
+      random program; 5 of 69 test_machine programs fail FID_VERIFY=1 on
+      x86-64 by default (they pass with FID_NAT_OFF=argfree or arghint).
 - [~] OP17. Floats in xmm registers, not stack slots (L). Done Nov 7: f64
       values and locals get xmm6/xmm7 (callee-saved, all 128 bits saved) and,
       with no call in their live range, xmm2-xmm5; every move to and from a
@@ -430,6 +509,14 @@ in memory. This track is where most of the speed is.
       xmm0/xmm1 (d0/d1, f0/f1) per operation; x86-64 skips the move when
       xmm0/xmm1 already mirror the register (`xmmcache`, llvm-roadmap
       RA18). Left there: a float register class in the allocator.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — the nat_ir float register class: test_machine_fregs and
+      test_machine_float_mod pass on run and ccompile; machine_fregs_check.sh
+      is ok on x86_64, aarch64 and riscv64 Linux and --nat Windows (166, 208
+      and 211 float ranges in float registers; none with fregs off); a
+      FID_VERIFY=1 cross-test of the 69 test_machine programs shows no float
+      failure. Left: pe_ir's f32 and register operands (above) were not part
+      of this check; the disassembly check was skipped (no objdump).
 - [~] OP18. Instruction selection: `lea`, addressing modes, `cmov`, `test`, fused
       compare and branch (L). Done: compare and branch without a stored bool,
       `imul` by an immediate, short immediate loads, shadow space set once.
@@ -445,6 +532,14 @@ in memory. This track is where most of the speed is.
       under Zba), `msub` for remainders, BMI2 shifts under `--cpu
       x86-64-v3`. Left there too: memory operands, `cmov`/`csel` (the MIR
       has no select, MI24), `madd`.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — memop_unit is ok on a64/rv64/x64; machine_memop_check.sh: 62
+      ok, 1 failure; the OP18 encoders: 813 forms, 0 mismatches against
+      clang; outputs on x86_64, aarch64, riscv64 and --nat right with the
+      passes on and off. Left: `c.b = x & c.b` (field on the right) is not
+      fused into a read-modify-write (a load-op and a separate store); the
+      memcmp mutant segfaults instead of running; a NATIVE=1 cross-test of
+      x86_64-linux and --nat beyond a sample.
 - [x] OP19. A peephole pass on the native path (M).
       Verified Nov 15: the machine layer's `ng_peep` (compiler/nat_ir.fd,
       on MIR before allocation, every target; `FID_NAT_OFF=peep`):
@@ -463,19 +558,45 @@ in memory. This track is where most of the speed is.
       `rva22u64|rva23u64|rv64gc_zba_zbb` Zba/Zbb (TG9). Left: BMI1
       (`andn`, `blsr`), AVX2 (no vector code yet: OP21), `--cpu` on pe_ir
       and the C path.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — `--cpu` on pe_ir: test_pe_cpu_bits prints its 17 lines on
+      run, emit and ccompile; pe_cpu_check.sh: an unknown name is refused,
+      `--cpu x86-64-v3` turns on shlx/sarx/shrx (0 -> 7 forms) and blsr
+      (0 -> 3), baseline gives the default image. Left: `ccompile --cpu
+      x86-64-v3` with CC="zig cc" does not build (zig wants x86_64_v3:
+      "unknown CPU"); ANDN is not selected on pe_ir.
 
 **Vectorization**
 
-- [ ] OP21. SIMD types and intrinsics that compile to real vector code (L).
+- [~] OP21. SIMD types and intrinsics that compile to real vector code (L).
       (Checked Nov 15: not started on the native backends. `@simd` reaches
       the IR (`IrFunction.is_simd`) but nat_ir.fd uses it only in its cache
       key; the MIR has no vector operations or vector register class
       (llvm-roadmap TG11), and the encoders no SSE/AVX/NEON/RVV vector
       forms.)
-- [ ] OP22. Automatic loop vectorization: SSE2, AVX2 (XL).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly, so the note above is out of date — integer SIMD over
+      Vec<i64> (stdlib/simd.fd add/sub/and/or/xor_i64, nat_ir.fd
+      ng_simd_i64_kind): test_simd_i64 is right on run and ccompile, and
+      the FID_VERIFY builds for sse, avx2, neon and rvv (VLEN 128 and 256)
+      print the expected output. Left: the pe_ir image of test_simd_i64
+      panics (invalid memory access) at its wrapping case;
+      test_machine_simd fails the allocation checker on sse, avx2 and --nat
+      (the arghint/argfree issue); f32 SIMD (Vec<f32> element reads wrong).
+- [~] OP22. Automatic loop vectorization: SSE2, AVX2 (XL).
       (Checked Nov 15: no vectorizer in iropt.fd or nat_ir.fd; it needs
       OP21's vector MIR first. The old PIR path's `loop-vec` pass (opt.fd)
       is not used by `fid emit`.)
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — nat_ir has a vectorizer now (ng_vz_*): test_vectorize prints
+      its 39 lines; element-wise loops are vectorized (16-byte vectors, 2
+      lanes; 32-byte with avx2), every image (sse, avx2, neon, rvv at VLEN
+      128 and 256, and the off builds) prints the expected output, and
+      vectorize_bench.sh gives 534 ms against 1,058 ms scalar on --nat.
+      Left: reductions (xor/or/and/sum accumulators, float sums) are never
+      vectorized ("the accumulator read in the loop header");
+      vectorize_check.sh fails 22 checks, because its functions are now
+      inlined into one() and it passes MSYS paths to wsl.exe.
 - [~] OP23. Vectorized `memcpy`, `memchr`, string compare and hashing in the runtime
       (M).
       Nov 17: the Linux runtime's copy, compare, search and hash go through
@@ -485,6 +606,13 @@ in memory. This track is where most of the speed is.
       the C library's vector routines. Left: nat_ir lowering of the block
       routines to SSE2/AVX2/NEON/RVV (copy needs only MO_VLD/MO_VST; the
       others need byte compare + mask ops). test_runtime_vblk.fd.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — `pert_vblk_copy` is now lowered to 16-byte vector loads and
+      stores (nat_ir.fd ng_vblk_call); test_runtime_vblk and
+      test_runtime_memops match `fid run` on ccompile, pe_ir, --nat,
+      x86_64-linux and aarch64-linux. Left: diff, cmpz and find are still
+      word SWAR code (no byte compare or mask machine operations);
+      bench/memops not re-measured.
 
 **Where Fides can beat them: what the language proves**
 
@@ -509,6 +637,15 @@ in memory. This track is where most of the speed is.
       over a back edge, so the sieve's `m = m + p` and `p * p` keep their
       overflow checks (p's upper bound needs `p * p < n` turned into a fact
       on p while m's fact holds); ranges through calls (LF10).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — range-dom-check.sh: 13 pass, 5 fail. Add checks are removed
+      (5 with rangedom, 4 without), the _fail variants keep their mul and
+      panic, the programs print their expected lines, and a 60-program
+      pe_ir sample is the same with rangedom. Left: the sieve keeps 4
+      overflow checks (at most 1 expected) and filled_scale keeps its
+      check; inner_sq and sq_big lose their checks with rangedom off too,
+      so the test no longer shows what rangedom does; the suite with
+      rangedom off against the default.
 - [~] OP25. Effects drive optimization: `pure` calls merged, moved out of loops and
       removed; no-write calls keep memory facts alive (L).
       Merged (llvm WP9): `ru_pure_cse` (compiler/rules.fd, native paths)
@@ -531,6 +668,14 @@ in memory. This track is where most of the speed is.
       nothing (`nowritecall`, `ime_writes`; LF5, LF6). Left: the suite runs
       (tests/tooling/op25-check.sh SUITE=1 NAT=1), and `guardcall` waits for
       licmguard's default.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — test_midend_guard_call, test_midend_nowrite_facts and the
+      guard_call _fail test give their expected output; op25-check.sh: 0
+      failed (quietcall 1 dead call; guardcall 1, off 0; nowritecall 84,
+      off 0; readcse 14, off 0; 18 output lines right on pe_ir and --nat); a
+      60-program sample with quietcall and nowritecall: pe_ir 60 same,
+      --nat 53 same. Left: the full suite (SUITE=1 NAT=1); readcse was not
+      in the sample; guardcall still waits for licmguard.
 - [~] OP26. Linear types and second-class references as alias facts: no-alias
       everywhere safe code allows it, stronger than C's default (L).
       Checked Nov 15 (llvm LF1-LF4): the alias query `ime_may_alias`
@@ -543,6 +688,14 @@ in memory. This track is where most of the speed is.
       (`FID_IROPT_ON=dse,loadhoist,forward,matchfacts`). Left: a suite run
       with them on, then the default; a Vec's buffer (reached through core's
       calls) is not in the query (LF3); linear types give no fact yet.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — `linear`, `placefwd` and `vecalias` are in
+      IME_DEFAULT_ON; vecalias-check.sh: 6 pass on pe_ir and 6 on --nat
+      (element reads reused, none with the pass off); linear-alias-check.sh:
+      4 pass; a 60-program sample is the same on pe_ir (60) and --nat (53;
+      the rest skipped, or nat_ir allocation-checker failures that happen
+      with the passes off too). Left: full-suite runs with linear,
+      placefwd, vecdata and vecalias on and off.
 - [~] OP27. `@no-alloc` and known allocation sites: escape analysis moves heap
       objects to the stack (L).
       Checked Nov 15 (llvm LF13, WP12): a local Vec whose value only reaches
@@ -560,6 +713,13 @@ in memory. This track is where most of the speed is.
       `&mut Vec`/`&Vec` parameters keep stack headers
       (`lw_rc_header_safe_params`). Left: strings and small Vec buffers
       (need core support), Boxes in loops or passed to functions.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — test_stack_box, test_stack_vec_param,
+      test_stack_vec_ref_param and test_stack_vec_filled are right on run,
+      ccompile and emit and clean under `run --checked-alloc`; `explain
+      --alloc` reports no heap allocation in box_math and one in
+      box_looped; the leak gate passes (10 programs). Left: as above, and a
+      full-suite run.
 - [ ] OP28. `comptime` evaluation of whole tables and parsers, so work disappears
       from the binary (M).
 - [~] OP29. Regions freed in one step, not object by object (needs release C6) (M).
@@ -586,7 +746,7 @@ in memory. This track is where most of the speed is.
       one step", lw_rg_finish). Gate: scripts/region-check.sh
       (tests/leaks/regions.fd). Left: nat_ir and pe_ir runtimes, budget
       regions sized once, copy-outs in `fid explain --alloc`.
-- [ ] OP30. Profile-guided optimization from a real run (L).
+- [~] OP30. Profile-guided optimization from a real run (L).
       Nov 17: block counts exist. `fid run --profile` writes format
       version 2 (compiler/pgo.fd: "<1 + times entered> <function>@<block
       id>" per block; version 1, calls only, is still read), and
@@ -599,6 +759,14 @@ in memory. This track is where most of the speed is.
       Tests: tests/tooling/pgo-block-check.sh, tests/tooling/pgo-bench.sh
       (what it buys). Left: a suite run with a profile, and the gain on the
       benchmarks.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — test_pgo_block_profile prints its expected values;
+      pgo-block-check.sh: 18 pass (version 2 with block counts, version 1
+      still read, a cold site keeps its call and a hot one inlines,
+      unrolling skips the cold loop); pgo-bench.sh: 1,349 ms without the
+      profile, 1,149 ms with it (1.17x, one micro-benchmark, busy machine).
+      Left: a suite run with a profile, and benchmark gains on a quiet
+      machine.
 - [x] OP31. Whole-program mode by default: every build sees all the code (M).
       Checked Nov 15, done (llvm WP1): every command merges the program, its
       imports, core and the runtime into one module before lowering
@@ -664,6 +832,12 @@ Some of the largest costs are in how data is laid out, not in the optimizer.
       (pointer, length) `str` ABI. The one-word `str` already has O(1)
       length, zero bytes and binary I/O; reasons and what would reopen it
       are in docs/reference/str-abi.md.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — test_file_write_bin and test_binary_io give the same
+      output on run, ccompile, pe_ir, --nat, x86_64-linux (WSL) and
+      aarch64-linux (qemu): zero bytes written and read back, -1 for a bad
+      path and for a negative length. The mark stays [~] only for the
+      (pointer, length) `str` ABI, which the Nov 17 decision sets aside.
 - [x] RT3. Small-string storage with no allocation (M).
       Checked Nov 15, not started: a `str` is a pointer to its bytes on
       every backend, and a one-byte string (`p_char_to_str`, a slice of
@@ -685,7 +859,7 @@ Some of the largest costs are in how data is laid out, not in the optimizer.
       pe_runtime/base.fd (`pert_char_to_str`, which replaces pe_ir's stub)
       and linux_runtime/base.fd (`test_runtime_char_str.fd`). With the
       decision above, nothing is left.
-- [~] RT4. A fast `HashMap`: open addressing with SIMD probing, a strong default hash
+- [x] RT4. A fast `HashMap`: open addressing with SIMD probing, a strong default hash
       (L).
       Already in `stdlib/core.fd`: open addressing with linear probing,
       tombstones (`-1` slots), 75%-load growth, FNV-1a string hash (PE
@@ -720,6 +894,12 @@ Some of the largest costs are in how data is laid out, not in the optimizer.
       every run, which the compiler fixpoint relies on). Left: the
       interpreter and native Linux runs with the next build; mark [x] once
       the final build's validation passes.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — test_stdlib_hashmap_ctrl and test_stdlib_hashmap_flood
+      match on run (the interpreter included), ccompile, pe_ir, --nat,
+      x86_64-linux and aarch64-linux, the runs waited for above; a flooded
+      map takes a seed and a plain one does not. Done.
+      bench/fides/hashmap.fd was not re-measured (the Nov 17 figure stands).
 - [~] RT5. `HashMap<K, V>` with unboxed keys and values (L).
       Checked Nov 15, partly there: every slot is one word of keys and one
       of values (stdlib/core.fd). Integer keys of any width are stored as
@@ -744,6 +924,15 @@ Some of the largest costs are in how data is laid out, not in the optimizer.
       (a tuple has no element type number); a generic struct as a key; a
       map whose type the lowering cannot see (no written `HashMap<K, V>`)
       keeps the old word keys.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — the lowering calls the new functions (struct and tuple keys
+      to `HashMap_insert_k`/`_k_mem`, struct values through
+      `Lowerer_vec_mem_size`); test_map_inline, test_map_struct_values and
+      test_map_struct_keys are right on run, ccompile, pe_ir, --nat,
+      x86_64-linux and aarch64-linux. Left, as above: a `HashMap<(str,
+      i64), i64>` key built at run time is not found by equal text built
+      separately (`contains` gave false); generic struct keys; maps whose
+      type the lowering cannot see.
 - [~] RT6. Generics fully monomorphized, so a `Vec<f64>` holds floats as floats (L).
       Done (Nov 3, verified): `val x: f64 = v.get(0)` round-trips 1.5 — the
       monomorphized layout already stores floats as floats when the element
@@ -756,6 +945,15 @@ Some of the largest costs are in how data is laid out, not in the optimizer.
       1.5, not its bits (`test_vec_infer_elem.fd`). The interpreter prints a
       `Vec<bool>` element as true/false, as C does. Left: a Vec filled only
       from non-literal values still needs its type written.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — the element type now also comes from non-literal values
+      (TypeChecker_rt6_note_push): test_vec_infer_tc prints its 15 lines on
+      run, ccompile and emit and frees every block (--leaks);
+      test_vec_infer_tc_mixed_fail is refused ("cannot store i64 in a
+      Vec<str>"); test_vec_infer_float_var, _from_var and _elem still agree
+      on all three, and no other test is newly rejected. Left: a `let` in a
+      closure body or a generic impl method keeps the old untyped
+      behaviour; a full-suite run.
 - [~] RT7. Allocator: per-thread caches (release H8), freed memory returned to the
       system (L).
       Done (written Nov 4): per-thread arenas and free lists in the C runtime,
@@ -768,6 +966,13 @@ Some of the largest costs are in how data is laid out, not in the optimizer.
       linux_runtime: chunk trim and decommit at free); multi-thread stress
       test `test_alloc_threads_stress.fd`, and `test_mem_return.fd`;
       docs/perf/memory-return.md. Left: the pe_ir allocator.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — test_mem_return prints its 6 true lines on run, ccompile
+      (zig cc), --nat, and ccompile and x86_64-linux in WSL
+      (FID_MEM_RETURN=0 gives false, 100 MB held); test_alloc_threads_stress
+      is right on ccompile and emit. Left: pe_ir (the default Windows
+      `emit`) returns only the large block: small blocks stay resident (99
+      MB held after they are freed).
 - [~] RT8. Allocator speed on par with mimalloc on its own benchmarks (L).
       Progress Nov 17: bench/alloc/run.sh builds the five programs with the
       C library, mimalloc (`mi_malloc`, `mi_zalloc`) and fid's `p_malloc`
@@ -780,7 +985,16 @@ Some of the largest costs are in how data is laid out, not in the optimizer.
       small-block ones; sizes and large are bound by zeroing (Fides memory
       is zeroed). Left: the native runtimes' allocators; sizes/large
       against non-zeroing `mi_malloc`.
-- [~] RT9. Own context switch, not fibers: under 20 ns per task switch (M).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — test_alloc_reuse_zero is right on run, ccompile and emit;
+      `RUNS=1 bench/alloc/run.sh` (mimalloc from the cargo registry) builds
+      and checks every program. fid's time over mi_zalloc's: small 1.72x,
+      churn 0.68x, sizes 0.40x, threads 1.30x, large 0.53x; over
+      mi_malloc's: 0.43, 0.96, 3.92, 2.18, 5.04 (one run, busy machine).
+      Left: sizes (3.9x) and large (5.0x) against mi_malloc; this run did
+      not reproduce fid beating mi_zalloc on all five (slower on small and
+      threads); the native runtimes' allocators.
+- [x] RT9. Own context switch, not fibers: under 20 ns per task switch (M).
       Done Nov 8 on Windows, both paths. Native: `pe_ctx_swap`
       (compiler/pe_ir_stubs.fd, the same bytes in src/pe.rs, checked against
       the assembler) saves the callee-saved registers, xmm6-15 and the TEB's
@@ -801,6 +1015,11 @@ Some of the largest costs are in how data is laid out, not in the optimizer.
       Linux x86-64 (WSL), loop included
       (tests/ctx_switch/c_ctx_swap_bench.fd, the runtime's
       `p_ctx_switch_bench`).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — the switch alone is under 20 ns on every path: C path
+      (zig cc) best 12 ns on Windows x64 and 8 ns on Linux x86-64 (WSL),
+      pe_ir 13.8 ns (ctx_swap_bench.fd); measured on a shared machine.
+      Done.
 - [~] RT10. Tasks across all cores: M:N scheduling with work stealing (XL).
       Done: per-worker local queues — `pe_wq_push` targets the running
       worker's queue via `pert_tls_wid` (spawn locality); `pe_wq_pop` drains
@@ -814,6 +1033,15 @@ Some of the largest costs are in how data is laid out, not in the optimizer.
       `fid emit` that use `async` or `spawn` + `await` crash (`test_async`,
       `test_async_float_struct`); the interpreter and C paths are fine
       (release H10).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — pe_runtime's run queues are per-worker lock-free rings with
+      steal-half (`pe_lq_push`/`pop`/`steal_half`/`spill`); 50 emits of
+      test_task_steal give one image hash and its 4 expected lines, and the
+      test matches on ccompile, --nat, x86_64-linux and aarch64-linux;
+      steal_bench runs (2,610/2,551/5,136 ns per task by default, noisy
+      machine). Left: the C runtime is still one cooperative scheduler per
+      OS thread (no M:N, no stealing); the locality gain over the old
+      shared-lock queues is not measured.
 - [~] RT11. IOCP on Windows, epoll on Linux, kqueue on macOS, replacing the O(n) poll
       loop (L).
       Done Nov 8. Native Windows: a task waiting for a socket submits one AFD
@@ -836,6 +1064,13 @@ Some of the largest costs are in how data is laid out, not in the optimizer.
       `vm.max_map_count` when root. 1M not yet measured: WSL2 6.6 stops at
       589,808 with `max_map_count` 1048576; native Linux backend not yet
       measured (docs/perf/rt11-idle-connections.md).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — test_task_park_wake is right in under 1 s on ccompile, pe_ir
+      and gcc -O2 in WSL; idle-bench-check.sh passes on Windows (200 and
+      1,000 idle connections, every ping answered) and in WSL (median ping
+      0.11 ms at 1,000 and at 100,000 connections). Left: 1M idle
+      connections (needs `vm.max_map_count` raised as root, or Linux 6.13+;
+      WSL2 here is 6.6); 500k was not rerun.
 - [x] RT12. A timer heap, so 100,000 sleeping tasks cost nothing (M).
       Done on the PE path: `pe_runtime/conc.fd` arms deadlines in a min-heap
       (indexed removal, so finishing tasks can't dangle) and keeps fd/join/
@@ -906,6 +1141,14 @@ This is the race we can win outright, since no rival's speed comes for free.
       compiler): rules + e-graph ~400-500 ms with the memo off, ~430-480 ms
       cold, ~27-36 ms warm. Left: hello's cold/warm rows with this run's
       compiler (`TIME=1 tests/tooling/mecache-check.sh`).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — `TIME=1 mecache-check.sh` (--nat) passes every line: hello
+      cold 179 misses recorded, warm 179 hits and the same bytes, the off
+      modes and a damaged memo handled; rules + e-graph 22 + 42 ms with the
+      memo off, 19 + 9 ms warm. Left: hello is not under 0.5 s: about 0.7 s
+      internal through pe_ir after a one-line edit and 2.4 s through --nat
+      (loaded machine); lowering, iropt and native code still run in full
+      on every build.
 - [x] CS2. Cache the checked stdlib in a binary form, not re-parsed each build (L).
       Done: trusted-module fast path — the baked-in core.fd and backend runtime
       skip per-function body checks and error reporting (~26 ms off hello's
@@ -1000,6 +1243,14 @@ This is the race we can win outright, since no rival's speed comes for free.
       opaque; IR is not. Left for <10 s: make `lower()` itself faster —
       profile for hot spots (the pass is per-fn linear work today), or cut
       what it lowers; there is no artifact shortcut here.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — `dump-c compiler/main.fd` with the -O2 compiler (8 units)
+      takes 57 s wall for today's 361K-line tree (121 MB of C): under 60 s.
+      Lowering (33 s by [prof]) and C generation (19 s) dominate; type
+      check 4.8 s, borrow check 0.7, mono 0.6. Left: under 10 s;
+      test_lower_lookups is right on ccompile and emit but `run` panics
+      (extern strlen is not available in the interpreter); no fixpoint or
+      suite check in this run.
 - [~] CS5. Parallel front end and code generation on all cores (L).
       Done (borrowck slice, opt-in): `FID_PAR=N` splits the borrow check's
       function set across N workers (own `BorrowChecker` each, chunks merged
@@ -1026,6 +1277,13 @@ This is the race we can win outright, since no rival's speed comes for free.
       (tests/par/par_check.sh, docs/reference/parallel-checks.md). Left:
       type check of bodies and import resolution (compiler.fd), plus a
       measurement on check compiler/main.fd --time.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — tests/par/par_check.sh: ok; escape (75 messages) and @secret
+      (70) give the same output with FID_PAR=2, 4 and 16;
+      test_escape_par_fail, test_secret_par_fail, test_par_chunks and
+      test_par_escape pass on run, ccompile and emit. Left: type check of
+      bodies, import resolution, lowering and code generation are not
+      parallel; FID_PAR is opt-in; no timing comparison was run.
 - [~] CS6. Incremental native builds per function, under 100 ms for a one-line
       change (L).
       Done: whole-output incremental caching on `emit`, `ccompile`, and `build`
@@ -1067,6 +1325,15 @@ This is the race we can win outright, since no rival's speed comes for free.
       optimized IR, so a pre-opt per-function key is unsound. Phase C
       needs call-graph transitive-closure keys (or a per-fn/module pass
       split) before hits can skip the mid-end.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — the mid-end memo with sound keys (iro_imc_key, iro_imc_salt):
+      irocache-check.sh fails 1 of its 5 steps. Cold and warm builds (22
+      misses, then 22 hits and the same bytes), edits 1-3 and the off modes
+      pass. Left: FID_IROCACHE_VERIFY=1 reports mismatches on most hits
+      (test_irocache_closure 18 of 22, hello 18/21, test_matrix_mul 74/91,
+      test_hashmap 98/116) although the executables are byte-identical, so
+      the memo is not shown sound (it is already on by default for `emit
+      -o` through CB3); a one-line edit still takes 700 ms (target 100).
 - [x] CS7. A fast debug mode with no optimizer, and a release mode (S).
       Done: `--debug` (C at -O0) and `--release` (-O2) on `ccompile` in both compilers.
 - [x] CS8. No linear scans in the self-hosted compiler: tables, not `Vec` searches
@@ -1198,6 +1465,17 @@ language lives.
       (llvm RL5); a rejected result is undone. Test
       `tests/bootstrap/test_ssa_validate.fd`. Left: a suite run with it on;
       licm, inline and the module passes; SMT for straight-line code.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      failed — the validator does not catch the miscompiles it is meant to.
+      tv-check.sh: 3 failed. The self-test (24 cases) and the SMT examples
+      (9) are as expected, but faults injected into main_run after inline,
+      gconst, fold, forward, sccp and dse are not caught (6 of 12), and the
+      program printed 43 instead of 42: an injected miscompile reached the
+      executable. test_ssa_validate and test_tv_inject each get 1 rejected
+      result (Str_drop: pass inline2 rejected), and the tests produce no
+      SMT obligation. So the Nov 16 "Done" does not hold: these passes are
+      not validated yet. Left: catch those faults, triage the inline2
+      rejection, SMT obligations, then the SUITE=1 run.
 - [~] VF7. Mutation testing of the compiler: a broken pass must fail a test (L).
       Verified Nov 15: the tool exists, `scripts/verify/variants.py mutate`
       (Nov 7; backend mutants added under RL11): eleven mutants (fold,
@@ -1303,6 +1581,12 @@ language lives.
       or atomics), with a one-stage build of the Nov 16 tree in WSL:
       docs/verification/sanitizers-2026-11-17.md (findings, what was fixed,
       what is left).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — sanitize-wsl.sh (gcc ASan + UBSan, JOBS=2) on the 18
+      targeted tests: 16 clean; test_deref_minimal fails by design (a
+      deliberate null store); test_fix_fnval_c_ptr prints the expected
+      7/12/5 through C, but `fid run` prints nothing. Left: the whole-suite
+      ASan and TSan runs were not repeated with this compiler.
 - [~] VF15. Fuzz every stdlib parser: JSON, regex, HTTP, TLS records, TOML, XML, CSV
       (L).
       Done (Nov 7): `scripts/fuzz/fuzz_parsers.py` with the driver
@@ -1428,6 +1712,14 @@ Reach what Rust, Go, Zig and C++ programmers expect on day one.
       are not matched by name against a signature's (one lifetime each, by
       the parameter's position); generic structs with lifetimes are not
       instantiated by lifetime.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — the 24 test_frontend_lifetime*, test_frontend_method_*
+      and test_frontend_trait_lifetime* files pass on run, ccompile and
+      emit, and each _fail test's error matches its expect-error (a
+      mutable borrow still active; an impl method tying its result to
+      another parameter than the trait's). Left: as above;
+      test_frontend_lifetime_struct_store_fail gives 2 errors (the first
+      matches); not run on the Linux targets.
 - [~] LG4. Traits: bounds checked, associated types, default methods, trait objects
       (release K9 is the start) (L).
       Done (release K9, in `fid`): every bound of `T: A + B` is checked at the
@@ -1466,6 +1758,14 @@ Reach what Rust, Go, Zig and C++ programmers expect on day one.
       `test_trait_generic_method_generic_impl`,
       `test_trait_generic_default_method`, and the `_arity_fail`,
       `_bound_fail`, `_impl_bound_fail`, `_dyn_fail` tests).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — test_trait_generic_method, _generic_impl, _dyn_fail,
+      _arity_fail, _bound_fail and _impl_bound_fail pass on run, ccompile
+      and emit, with the expected errors (type-parameter count, a missing
+      bound, no call of a generic method through `dyn`). Left: ast_ser.fd
+      does not serialize generic trait methods; _impl_bound_fail gives 2
+      errors (the first matches); GATs and generic impls are still not
+      compared with the trait.
 - [x] LG5. Zero-cost iterators: `map`, `filter`, `fold` compile to a plain loop (L).
       Done (Nov 15): `iro_closure_devirt` (iropt.fd) rewrites `CallPtr` to a
       direct `Call` when the env's fn ref is a `ConstFnRef`, and
@@ -1542,10 +1842,18 @@ Reach what Rust, Go, Zig and C++ programmers expect on day one.
       expansion); `gensym` inside a `comptime fn` (type-checked as an
       ordinary function, so unknown there); `==` for generated structs and
       enums (synthesized before `process_gen` runs, in compiler.fd).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — the three items above are done: `comptime splice { }` in
+      expression position (test_frontend_comptime_splice prints 107 10 6 5
+      21 30 12 true true false; its two _fail tests are refused),
+      test_frontend_gensym_comptime_fn, test_frontend_gensym_runtime_fail
+      and test_frontend_gen_eq pass on run, ccompile and emit. Left: no
+      token-tree macro system; hygiene comes from gensym and the clash
+      errors.
 - [x] LG10. Error handling with context and no allocation on the happy path (M).
       `Result.context(msg)`, `with_context(f)`, `Option.context(msg)` (complaint
       CE1).
-- [~] LG11. Structured concurrency with cancellation and timeouts (L).
+- [x] LG11. Structured concurrency with cancellation and timeouts (L).
       Done (existing + Nov 13): `spawn scope`/`cancel scope`/`select` are
       language-level (pe_ir + nat runtimes). `task.fd` grew
       `task_join_timeout` (poll `task_done` until deadline) and cooperative
@@ -1564,6 +1872,12 @@ Reach what Rust, Go, Zig and C++ programmers expect on day one.
       checkpoint and returns, so its drops and `defer` run (reference 8.2,
       docs/interp-tasks.md). Tests: test_task_interleave.fd on
       run/ccompile/emit, tests/ctx_switch/c_co_stack.fd.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — test_task_interleave prints its 11 expected lines
+      (interleaving, ping-pong, cancellation, a deadline, cleanup, await, a
+      spawned consumer) on run, ccompile and emit; c_co_stack.fd runs
+      (deep: 200000). Nothing of the goal found left. Done. Interleaving on
+      native Linux was not part of this check.
 - [x] LG12. A defined memory model for atomics (L).
       Done (existing, verified Nov 13): `stdlib/atomic.fd` documents the
       C++11 model (SeqCst default; Acquire/Release/AcqRel/Relaxed orders
@@ -1618,7 +1932,7 @@ Reach what Rust, Go, Zig and C++ programmers expect on day one.
       C, and pe_ir and nat_ir run it natively. Limits: the native encoders
       know a subset of each ISA (an unknown instruction gives 0 there), and
       a function with `asm!` is never kept by the FNCACHE.
-- [~] LG14. `async` for every argument type, and async traits (release H9) (L).
+- [x] LG14. `async` for every argument type, and async traits (release H9) (L).
       Done (H9): an `async fn` with `f64` or struct arguments or results runs as
       a task on the interpreter and C paths. Left: reference arguments, native
       async (`fid emit` programs using `async` crash), async traits.
@@ -1636,6 +1950,13 @@ Reach what Rust, Go, Zig and C++ programmers expect on day one.
       async methods of generic impls and async default methods of a `cap`
       (left as they were: not split); `--nat` and the Linux targets not run
       here (a `--nat` hello printed nothing on this machine).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — async methods of generic impls and async default methods
+      of a `cap` now run as tasks: test_lowering_async_generic_method,
+      _generic_task, _cap_default, _method and _ref pass on run, ccompile,
+      emit and --nat, and with test_spawn_detached on x86_64-linux and
+      aarch64-linux (WSL, qemu), so the "not run here" above no longer
+      holds. Done. Not run on riscv64-linux.
 - [~] LG15. C interop without bindings: `@import("header.h")`, as Zig does (L).
       Done (Nov 13): `use foo` falls back to `foo.h` when no `foo.fd` exists;
       `compiler/cparser.fd` generates Fides bindings which merge through the
@@ -1662,6 +1983,14 @@ Reach what Rust, Go, Zig and C++ programmers expect on day one.
       inside a header is not followed; MSVC's and glibc's attribute macros
       (`_ACRTIMP`, `__THROW`) are noise only when the header defines them;
       native backends link a system header's functions from `link` only.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — `#include` following and the system DLL lookup in
+      cparser.fd (cp_include, cp_norm_path, cparse_dll_exports): 8 of the 9
+      steps pass, Windows emit and the WSL x86_64-linux run included. Left:
+      on the C path, test_at_import_system with zig's Windows headers fails
+      ("conflicting types for 'abs'": an extern C name equal to a core
+      function stops core's abs -> p_abs rename), while `fid emit` of it
+      prints 5; --nat Windows and macOS still call no C functions.
 - [~] LG16. C++ interop for the common cases (XL).
       Nov 16 (not yet built), the first step: a C++ header (`.hpp`, `.hh`,
       `.hxx`, or one with `namespace`) imports through compiler/cparser.fd
@@ -1677,6 +2006,16 @@ Reach what Rust, Go, Zig and C++ programmers expect on day one.
       references, exceptions): that needs generated `extern "C"` shims
       compiled with a C++ compiler, or Itanium/MSVC name mangling in the
       backends.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — generated `extern "C"` shims: test_at_import_cpp prints
+      "cpp ok" on run and ccompile; cpp_fail and cpp_shim_fail are refused
+      with the expected undefined-function errors; ccompile of cpp_shim
+      matches its 17 expected lines and cpp_tmpl prints 2.5/pear/
+      7000000000/9; parse-header writes the shim, which `zig c++ -c`
+      compiles; the C at_import tests are unchanged. Left: class templates,
+      operators, nested classes, rvalue references and std containers are
+      not bound; native emit does not compile the shims (use ccompile);
+      std::string results leak.
 - [x] LG17. Every annotation works or is removed (release K8) (M).
       Done: `@bounded-stack`, `@no-indirect` (rejects calls through function
       parameters) and `@tainted` (a tainted function or parameter reaches no IO
@@ -1789,7 +2128,7 @@ owning what we ship.
       as CNG keys and deleted by the new `tls_server_close`; the ALPN choice
       kept after the ticket. Docs: docs/stdlib/tls13.md. Left: the box,
       ticked once the final build's run of `test_tls13_local.fd` passes.
-- [~] SL5. DNS with caching, IPv6 everywhere (M).
+- [x] SL5. DNS with caching, IPv6 everywhere (M).
       Done: `stdlib/dns.fd` parses every answer record with its TTL
       (bounds-checked names), A and AAAA, IPv6 text as RFC 5952, a cache by
       TTL (`dns_cache_resolve`); `test_dns.fd`. Nov 9: IPv6 sockets on the C
@@ -1807,6 +2146,14 @@ owning what we ship.
       (`test_runtime_connect_retry.fd`). Native Windows (pe_runtime) already
       loops over getaddrinfo's answers. Left: `--nat` Windows (win.fd's
       resolver gives one IPv4 address); no run against a real resolver.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — both items left above are done. `--nat` Windows resolves
+      every address through getaddrinfo (IPv6 included) and connect tries
+      each: test_runtime_connect_retry prints true for listening,
+      localhost, 127.0.0.1 and ::1 and -1 for a closed port, on --nat and
+      x86_64-linux; tests/net/real_connect.fd connects through the real
+      resolver on --nat, pe_ir and x86_64-linux (-1 for an invalid name).
+      Done. The cache and the other paths were not rechecked.
 - [~] SL6. JSON at simdjson-class speed (L).
       Measured (5.9 MB nested doc, PE emit): `json_is_valid` ~10 MB/s,
       `json_parse` (validate + canonicalize) ~1.6 MB/s — three orders of
@@ -1967,6 +2314,15 @@ owning what we ship.
       scripts/tooling/sl13_rows_tests.fd, checked by
       scripts/driver-goals-check.sh after the next build. Left: coverage-
       guided mutation and a saved corpus.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      failed — coverage-guided fuzzing does not work yet. The harness gets
+      block coverage (26 blocks), but sl13-fuzz-check.sh fails: the nested
+      `ccompile --fuzz-cov` build panics with a double free
+      (Vec_drop_inplace from build_program_with_path_borrowck), so no
+      target is reported, no input is saved under testdata/fuzz, and
+      fuzz_shapes grows no corpus. `fid test -run <test>/<row>` works
+      (driver-goals-check: the SL13 rows are ok). Left: that double free,
+      then find, save, replay and corpus growth through sl13-fuzz-check.sh.
 - [x] SL14. Structured logging and metrics (M).
       Done: `metrics` (counters, gauges, histograms, Prometheus text format,
       `metrics_serve`); `log` with fields, JSON lines (`log_render_json`) and
@@ -2007,6 +2363,16 @@ owning what we ship.
       suspending an OS worker mid-run (SuspendThread + GetThreadContext on
       worker handles, which the scheduler does not currently export) —
       real L work in the runtime, not a stdlib add-on.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — sl15-check.sh is ok for run, ccompile and emit (the report
+      names prof_burn), for a service without FID_PROF and for FID_PROF=1
+      (a report on the event and one at exit); by hand, x86_64-linux in WSL
+      gives 62 samples with prof_burn at 95%, and setting the named event
+      from another process gave 3 reports. Left: with FID_PROF_EVERY=1 the
+      1.6 s pe_ir service prints 2 reports, not 3 or more
+      (pert_prof_watch_main resets its ticks on every report, so the event
+      at 0.8 s restarts the 1 s timer); sl15-check.sh mangles WSL paths and
+      takes Git Bash's PID for the Windows one.
 - [x] SL16. Big integers and decimals (M).
       Done: `stdlib/bigint.fd` (`test_bigint.fd`) and `stdlib/decimal.fd`:
       exact decimals on a BigInt mantissa, division and rounding to a scale
@@ -2150,6 +2516,17 @@ Go and Rust won developers with tools as much as with languages.
       diagnostics already carry a `Fix:` line (47 in typechecker.fd).
       Left: a test per diagnostic, carets for line-only messages, a code
       index for `fid`.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — 79 of the 80 test_diag_tl2_*_fail tests give their error
+      under `fid check`, with carets where tried; diag-coverage.py: 357
+      error messages, every one with a test; of all 422 expect-error tests
+      408 match, and the 14 others fail the same way with the earlier
+      compiler. Left: test_diag_tl2_nesting_stmt_fail is stale (the
+      parser's 256-level limit now stops it before the type checker's
+      512); banking_double_credit, money_linear and crashfree expect old
+      texts, and diag_reverse_operator_type, frontend_trait_self and
+      world_hermetic_clock are accepted by `check`; errors on structs
+      still have no line.
 - [~] TL3. `fid fix`: applies suggested fixes, and upgrades code between versions (L).
       Done (Nov 15): `fid fix <file.fd> [--check]` (main.fd cmd_fix, the fix
       engine in lsp.fd fix_suggestions/fix_apply, shared with the editor's
@@ -2163,6 +2540,15 @@ Go and Rust won developers with tools as much as with languages.
       the input of scripts/tl-check.sh. Left: upgrades between versions (no
       edition has changed the language yet, ST3), fixes for more diagnostics
       (a by-value parameter changed, borrow conflicts).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — `fid fix --edition` upgrades 2026 to 2027:
+      fix-edition-check.sh passes (42 ok), and fix-tl3-check.sh and
+      fix-more-check.sh still pass; a deprecated function's calls are
+      rewritten to its replacement (test_tooling_fix_deprecated then prints
+      6/20 with no warning), and test_frontend_edition_2027_fail is
+      refused. Left: edition 2027 changes only deprecated calls, and a call
+      with no named replacement stops the upgrade; fixes for more
+      diagnostics (by-value parameters changed, borrow conflicts).
 - [~] TL4. LSP complete: references, rename, formatting, signature help, inlay
       hints, code actions (release N7 is the start) (L).
       Done: `fid lsp` (compiler/lsp.fd) answers references, rename,
@@ -2175,6 +2561,14 @@ Go and Rust won developers with tools as much as with languages.
       Left: rename and references are by whole word in one document (a local
       renames same-named words elsewhere; other files are not searched);
       inlay hints for methods and imported functions, and type hints.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — rename and references are by scope and across files now:
+      lsp-scope-check.sh: 31 ok, PASS (shadowing by declaration position,
+      same-named locals skipped); lsp_probe.py: all ok (capabilities, inlay
+      hints, quick fix, 3 references of add, signature help, formatting).
+      Left: no type hint on turbofish calls; methods of types from other
+      modules are not indexed for hints; a local that shadows a function
+      name takes its calls.
 - [~] TL5. Debugger support with line tables on every platform (release N9) (L).
      Done: `-g`/`--debug` on `fidesc emit`/`build`/`ccompile` — PE gets
      `.debug_abbrev/.debug_info/.debug_line/.debug_str` (DWARF v4, per-instruction
@@ -2200,6 +2594,16 @@ Go and Rust won developers with tools as much as with languages.
      for the input file into the PE (llvm DB3; gdb, lldb, llvm-dwarfdump
      read them; scripts/pe-dwarf-check.py). Left for Windows: a PDB for
      Visual Studio and WinDbg (DB3), variables (DB4).
+     Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+     partly — tl5-lines-check.sh: ok (13 lines): `ccompile -g` writes
+     `#line` to main.fd and to an imported module and runs; Mach-O
+     __DWARF line tables for aarch64 and x86_64 macOS (none with
+     FID_NAT_OFF=debug); pe_ir -g passes pe-dwarf-check and runs;
+     test_cback_debug_info is right on run and ccompile. Left:
+     macho_dwarf_unit misses 2 of its 25 lines (nat_dbg_written_path
+     writes a relative lib/util.fd as util.fd, so __debug_line is 107
+     bytes, not 111): the expectation or the path rule must change; lldb
+     on a Mac not run; variables (DB4).
 - [~] TL6. Cross-compilation out of the box: `fid build --target linux-arm64` from
       any host, with no extra download (L).
       Done (Nov 15): `--target` is read OS first too (main.fd
@@ -2255,6 +2659,14 @@ Go and Rust won developers with tools as much as with languages.
       Left: `tree-sitter generate` and Zed itself have not been run yet;
       the generated parser (editors/tree-sitter-fides/src/) is not
       committed, and extension.toml's rev is not pinned to it.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — `STATIC=1 scripts/tl/editor-check.sh`: 62 ok (the Sublime
+      scope, Emacs' auto-mode-alist and the rest); zed-check.sh: ok (query
+      names, corpus, extension files); the grammar has 120 node types, 35
+      fields, 142 tokens. Left: no tree-sitter CLI here, so `tree-sitter
+      generate`, the corpus test and the parse rate have never run and
+      src/parser.c does not exist; Zed, Neovim, Emacs and Helix were not
+      run (only in CI's editors.yml); editors/zed/src/lib.rs not compiled.
 - [x] TL11. `fid doc` sites as good as docs.rs and pkg.go.dev (M).
       Done (Nov 15): `fid doc <dir>` (scribe.fd scribe_site; before, a
       directory was rejected as "no directory listing"): a page per module
@@ -2267,6 +2679,12 @@ Go and Rust won developers with tools as much as with languages.
       module linked from each item, examples on the page (with the note
       that doctest.py runs them), the package version on each page;
       tests/tooling/doc-links-check.sh and doc-site-check.sh pass.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — doc-links-check.sh: PASS (339,578 relative links resolve,
+      type cross-links, links from items to their source);
+      doc-site-check.sh: PASS (16 ok: version label from ark.toml and
+      FID_DOC_VERSION, source-line links, type links in signatures and
+      parameter tables); test_scribe_links prints its 14 lines.
 - [x] TL12. Call-graph visualization: `fidesc diagram <file.fd>` emits a Mermaid
       sequence diagram of the file's calls, annotated with inferred effects
       (`-o out.mmd`) (S).
@@ -2291,7 +2709,15 @@ Every platform gets a tier, and a tier means CI, not a hope.
       loader are SKIP; bin-target-check.py fails runtime names imported
       from a shared library (docs/reference/tier-checks.md). Left: green
       full runs on all four (validation run and CI).
-- [ ] PL3. Tier 2: Windows ARM64, macOS x64, FreeBSD, RISC-V (L).
+- [~] PL3. Tier 2: Windows ARM64, macOS x64, FreeBSD, RISC-V (L).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — `@cfg` knows freebsd and unix (test_cfg, test_cfg_unix,
+      test_cfg_platforms pass), and tier2-targets-check.sh passes: every
+      program builds for aarch64-windows, x86_64-macos, x86_64-freebsd and
+      riscv64-linux and passes bin-target-check, and the 7 riscv64 binaries
+      run under qemu-riscv64 as under `fid run`. Left: running the Windows
+      ARM64, FreeBSD and macOS x64 binaries (only their file format was
+      checked here; tier2.yml's jobs were not looked at).
 - [~] PL4. WebAssembly with WASI (release F9) (L).
       Done: `fidesc wasm` emits a runnable .wasm (80 KB on hello) via
       `src/wasm.rs`/`compiler/wasm.fd`. Left: it imports a custom Fides
@@ -2324,6 +2750,14 @@ Every platform gets a tier, and a tier means CI, not a hope.
       tests/wasm/task-switch-check.sh and tests/wasm/stackify-check.sh.
       Left: a full run of those; threads still run to their end when they
       start (WASI preview 1 has none).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — task-switch-check.sh: 3 passed (test_wasm_task_switch as
+      expected; test_wasm_process panics "not available in WebAssembly:
+      processes (p_system)"; test_wasm_array_bounds); stackify-check gives
+      the same output with 35 task-switch loops; wasm-test.sh skips C
+      functions with no wasm version with a clear message. Left: the full
+      suite through wasm-test.sh (a 40-test sample: 35 pass, and
+      test_fix_fnval_struct_ret fails); threads; the CI lane not checked.
 - [~] PL5. Freestanding and embedded: Cortex-M, RISC-V boards, with no OS (release G)
       (L).
       Done: `--no-std` skips `core.fd` and still emits static ELFs —
@@ -2331,6 +2765,14 @@ Every platform gets a tier, and a tier means CI, not a hope.
       zero external tools; `compiler/embedded.fd` holds the bare-metal
       helpers. Left: a true no-OS target (flat binary, no ELF runtime),
       Cortex-M (needs a Thumb-2 encoder — arm64 emits A64 only).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — Cortex-M code generation (compiler/nat_thumb.fd, Thumb-2):
+      enc-oracle-pl5.py 226 forms and enc-oracle-op21.py 662 forms, 0
+      mismatches; test_thumb_core 23/23; thumb_check.sh: 10 passed
+      (thumbv7m-linux under qemu-arm: core, overflow panic, exit status;
+      the thumbv7m-none qemu-user board; image shape for mps2-an385 and
+      lm3s6965evb). Left: the no-OS images (vector table, UART, semihosting
+      exit) were not run: no qemu-system-arm here.
 - [~] PL6. Android and iOS (XL).
       Done: the static arm64-linux ELF is Android-adjacent — direct
       syscalls, no libc dependency, so it should run under `adb shell`
@@ -2361,6 +2803,13 @@ Every platform gets a tier, and a tier means CI, not a hope.
       scripts/ci/cross.yml before a release). Left: running the Mach-O
       output on a Mac (`.github/workflows/macos-native.yml` is written; no
       recorded run), and the suite on each commit (PL2).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — the stage-0 rename (`guard` -> `hops` in ssa.fd and
+      egraph.fd): stage0-names-check.sh (FROM=compiler/main.fd) PASS, 72
+      files; fidesc dump-ast parses both with no parse error. The Nov 20
+      macos-native.yml run passes stage 1 (dump-c and C compile on both
+      macOS jobs) and stops at stage 2 (the CB8 memory blocker). Left: no
+      Mach-O binary has run on a Mac yet; the suite on each commit (PL2).
 
 **Acceptance:** Tier 1 passes the whole suite on each commit.
 
@@ -2441,6 +2890,16 @@ Only this produces true production years. It starts now, at small scale.
       `ng_gen_call_std`). Windows `veil.exe` via the PE backend needs more
       RAM than a small machine has (deterministic 2 MB alloc OOM at PE
       emission). Shipped binaries are still the Rust ones.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — tools-selfbuild-check.sh: FAILED. scribe passes every check
+      (the same 43 and 15 sections as the Rust scribe). veil builds and
+      writes its reports, but they differ from the Rust veil's (a plain
+      dash for the em dash; it counts user functions only: 1/1 against
+      1/358). ark builds, and ark-features, -paths, -projects, -registry
+      and cd8-no-install-code pass; ark-binary.sh fails (also with `fid
+      ark`): a program linking a prebuilt library prints '0 0 false'.
+      Left: veil's report, the prebuilt-library call path, and shipping
+      the Fides tools in place of the Rust ones.
 - [~] AD2. The project website served by a Fides program (M).
       Done (Nov 15): `tools/site.fd` renders README, the book, cookbook,
       guides and reference when requested, through `stdlib/markdown.fd`
@@ -2455,6 +2914,11 @@ Only this produces true production years. It starts now, at small scale.
       `docs/website.md`. Left: hosting it (a Pages workflow or a server of
       ours), and `http_serve_scoped` once its double free is fixed
       (known-bugs 2g.35; `http_serve` keeps about 130 KB per request).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — tools/site.fd serves through `http_serve_scoped`:
+      site-memory-check.sh: PASS (59,196 KB after 150 requests, then 26,316
+      KB after 300, 450 and 600); test_site_render prints its 51 lines.
+      Left: hosting it (a Pages workflow or a server of ours).
 - [ ] AD3. `fides-os` as a standing test of bare-metal work (release G4) (M).
       Nov 17: scripts/fides-os-boot.sh boots minimal, shell (banner,
       command list, prompt) and shell-input (echo and mem typed through
@@ -2475,6 +2939,15 @@ Only this produces true production years. It starts now, at small scale.
       most drivers need a process API with timeouts, kill and parallel
       children; the
       shipped ark, scribe and veil are still the Rust ones (AD1).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — the process API with time limits (stdlib/process.fd
+      process_spawn, process_wait with a timeout, process_run_argv) is
+      there: test_process_spawn matches its 13 lines on run, ccompile,
+      pe_ir, --nat and x86_64-linux (WSL). Left: the doctest driver port
+      fails tests/tools/doctest/check.sh (1 same, 2 differ: in --emit mode
+      tools/doctest.fd lacks scripts/doctest.py's 'native: ...' summary
+      line); only 2 of about 25 drivers are ported; the shipped ark, scribe
+      and veil are still Rust; WASI and macOS not run.
 - [ ] AD5. A real production service of ours, on Fides, with its incidents written up
       (L).
 

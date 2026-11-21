@@ -251,6 +251,15 @@ FID=release/fid.exe JOBS=4 bash scripts/cross-test.sh aarch64-linux
 > lowering emits no 0004 temporary drops) — the 3-stage bootstrap from
 > fidesc cannot pass stage 2 until the rc-ownership lowering is ported to
 > src/lower.rs.
+>
+> Nov 21: the wall is in the fidesc-built stage 1 only. A self-hosted fid
+> of Nov 18 used as stage 0 compiled the unmodified Nov 20 tree (86cc919)
+> in one step: 121 MB of C in ~5 min, 8 split units at -O2, a 15 MB fid.
+> That fid passes run, emit (pe_ir) and ccompile of hello and the leak gate
+> (10/10), with none of the fidesc-built fid's crashes. So the 3-stage
+> bootstrap can start from a released fid instead of fidesc. The Nov 21
+> check of 224 roadmap goals with it: 87 validated, 121 partly, 15 failed,
+> 1 not checkable here; the bugs it found are known-bugs 2g.80-2g.113.
 
 ```
 SELF-HOSTED COMPILER (primary source):
@@ -281,14 +290,21 @@ SELF-HOSTED COMPILER (primary source):
                   fid-dev.exe was rebuilt Nov 20 from the current tree and
                   runs it. A fidesc-built binary self-compiling the whole
                   tree hits the 2g.79 memory wall — see the blocker note
-                  above. The full suite has never been rerun with fid as
-                  the compiler.
-  Self-compile:   `dump-c compiler/main.fd`, Nov 9: 74 s with the compiler
-                  built at -O2 (8 split units; type check 18 s, borrow
-                  check 5, mono 5, lowering 24, C 20), 229 s at -O0
-                  (competitive-roadmap CS4) — measured when the compiler
-                  was 158K lines; it is 361K now. `check compiler/main.fd
-                  --time` (fid31, -O0): 137 s. Several fid processes at
+                  above. Nov 21: a fid built from a self-hosted stage 0
+                  (the Nov 18 fid) builds the current tree in one step and
+                  passes run/emit/ccompile and the leak gate.
+                  scripts/build-selfhost.sh's split -O2 step can fail
+                  silently and fall back to one unit at -O0 with exit 0
+                  (2g.86): check for "8 units at -O2" in its output. The
+                  full suite has never been rerun with fid as the compiler.
+  Self-compile:   `dump-c compiler/main.fd`, Nov 21 on the 361K tree: 57 s
+                  with the compiler built at -O2 (8 split units; type check
+                  4.8 s, borrow check 0.7, mono 0.6, front end 16.6 in all,
+                  lowering 32.9, C 19.3; competitive-roadmap CS4).
+                  Nov 9 (158K lines): 74 s at -O2 (type check 18 s, borrow
+                  check 5, mono 5, lowering 24, C 20), 229 s at -O0.
+                  `check compiler/main.fd --time`: 35 s at -O2 (Nov 21);
+                  137 s with fid31 at -O0 (earlier). Several fid processes at
                   once (other sessions' builds) can make a stage 10-200x
                   slower: time on a quiet machine. scripts/bootstrap.sh splits
                   each stage's C into 8 units at -O2 when the previous stage

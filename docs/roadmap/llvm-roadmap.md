@@ -129,7 +129,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
 
 ## Track MI — One machine layer (30)
 
-- [~] MI1. Write down the MIR: instructions, operands (virtual register, physical
+- [x] MI1. Write down the MIR: instructions, operands (virtual register, physical
       register, immediate, stack slot, label), blocks, block parameters; in a new
       `compiler/mir.fd` (M).
       Nov 8–9: `compiler/nat_ir.fd` records each operation of its architecture
@@ -140,6 +140,12 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       vreg of the function, a physical register, immediates, labels placed once.
       Left: its own module `compiler/mir.fd` (a new file and a `main.fd` import),
       block parameters (values still cross blocks in vregs).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — compiler/mir.fd holds the MIR (1,537 lines: MInst, MO_*,
+      blocks, liveness, printer, mir_verify), imported by nat_ir.fd and
+      main.fd; machine_bparams_check passes on 4 targets under FID_VERIFY=1
+      (2229 block parameters on x86_64). Block parameters stay opt-in
+      (`FID_NAT_ON=bparams`).
 - [x] MI2. Target-neutral operations: integer and float arithmetic, compares,
       branch on compare, loads and stores of 1/2/4/8 bytes with extension,
       address arithmetic, calls, returns, traps (M).
@@ -169,6 +175,12 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       division by zero, struct copies, closures, dyn calls, print routing (L).
       Nov 8–9: one lowering for the three Linux targets; `pe_ir.fd` keeps its own
       until MI14.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      failed — nothing of the Windows half is done: pe_ir is still the
+      Windows default (main.fd sets nat_win only with `--nat`) and there is
+      no `--pe` escape hatch. On a 75-program sample `--nat` matches or
+      beats pe_ir (72 same, 3 where it fixes pe_ir, 0 differ). Left: the
+      full x86_64-windows vs x86_64-windows-pe comparison, then the switch.
 - [x] MI6. Panic paths as cold out-of-line blocks shared per function, each a
       call (so traces name the function), from the one lowering (M).
       Panics are calls to shared stubs on every Linux target, so traces name the
@@ -189,6 +201,11 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       the internal convention's register count), `g.va_off` for varargs spawns.
       Arguments come from vregs, so no move cycle can arise there. Left:
       pe_ir's own (MI14/MI17).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — test_call_lowering_parity is right on run, emit and ccompile,
+      and mi7_call_parity gives 19 same, 0 differ (with MSYS_NO_PATHCONV=1;
+      without it the 6 Linux runs come out empty). Left: deleting pe_ir's
+      own call lowering (still there), which waits for MI17/MI5.
 - [~] MI8. One frame layout: slots, spill slots, the save area, alignment, frame
       records for traces, large frames (M).
       Nov 15 (verified in code): one for every machine-layer target —
@@ -198,6 +215,12 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       probed page by page (MI29). Left: pe_ir's own; slots only for values
       that need one (today every IR value has a slot, so big functions have
       frames of many pages).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — rematerialized values get no spill slot: the frame tests pass
+      and big's frame drops from about 20 KB to 1968 bytes on x86-64 (1936
+      on AArch64, 1968 on RISC-V) with 0 spills, but machine_frame_check
+      wants under 512 bytes and fails on 3 targets. Left: what else takes
+      ~1.9 KB of big's frame; pe_ir's frame (MI17).
 - [ ] MI9. Struct values as several MIR values when small (scalar replacement at
       the machine level), memory otherwise (M).
 - [x] MI10. A MIR verifier: every use defined, every block terminated, operand
@@ -265,6 +288,14 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       `nat_pe_symbols`, called from nat_ir.fd for every placed function
       unless `FID_NAT_OFF=debug`; scripts/nat-tools-check.sh compares the
       two images (not run yet).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — floats in float registers on `--nat` by default (180 ranges;
+      `FID_NAT_OFF=winfregs` turns it off), machine_fregs_check 0 failures,
+      machine_mi14_check 34 ok and 1 failure (test_machine_simd fails the
+      allocation check, argument register). `--nat` is still slower than
+      pe_ir: loop 6635 vs 2274 ms, sieve 1381 vs 501, hashmap 2340 vs 1622
+      (fib and bench_float faster). Left: the checker failures, speed, the
+      suites with winfregs/splitfloat.
 - [x] MI15. A Linux x86-64 target on MIR for free once x64 is ported: the ELF
       writer of `nat_enc.fd`, the Linux runtime, x64 selection (M).
       Nov 9: Linux x86-64 on the MIR (`fid emit --target x86_64-linux`): its own
@@ -280,8 +311,22 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       runtime over libSystem in `stdlib/linux_runtime/darwin.fd`. Left: running
       it on a Mac (`.github/workflows/macos-native.yml`), and F7's open runtime
       parts (errno, directory listing, sockets, process spawn, signals).
-- [ ] MI17. Retire `pe_ir.fd`'s and `nat_ir.fd`'s own lowerings once their MIR
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919): not
+      checkable here — darwin.fd now translates recvfrom/accept peer
+      addresses and implements sysinfo, and macos_udp_check passes at link
+      level (both macOS targets bind _recvfrom, _sysctlbyname); udp_peer.fd
+      is right on x86_64- and aarch64-linux, which do not reach darwin.fd.
+      Running it needs a macOS host. Left: that run, recvfrom/sendto with an
+      address on `--nat` Windows, the macos-native.yml step.
+- [~] MI17. Retire `pe_ir.fd`'s and `nat_ir.fd`'s own lowerings once their MIR
       ports match on the whole suite (M).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — pe_ir computes float `%` now (x87 FPREM, exact fmod):
+      test_float_rem_exact is right on run, ccompile and `--nat`, 10 of 11
+      on pe_ir (an f32 result cast `as i64` gives i64::MAX there);
+      mi5_nat_peir_check on a 75-program sample: 72 same, 3 where `--nat`
+      fixes pe_ir. Left: that pe_ir bug, the full-suite comparison, then
+      retiring the lowerings (pe_ir is still the default).
 - [~] MI18. Retire the old PIR path (`pir.fd`, `opt.fd`, `regalloc.fd`,
       `codegen_x64.fd`) and `build --native` with it (S).
       Nov 16: no build reaches PIR any more. `build --native` is the machine
@@ -313,6 +358,13 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       `fid build-x86` uses x86.fd, not PIR. `emit --boot` left it (pe_ir,
       release G1). Retiring needs main.fd/compiler.fd to send `build
       --native` to nat_ir and `gpu` to read IR or MIR.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — no live module imports the PIR path; `fid pir` says it was
+      removed; `fid opt`, codegen listings, `--elf`/`--macho` objects and
+      `emit --boot` work. mi18-pir-retired-check fails on `codegen --coff`
+      (kernel32 imports undefined), and the REPL `:opt` checks fail on
+      inlined functions. Left: COFF, deleting the PIR files (still in the
+      tree), STRICT=1, test_pir/test_opt in verify-selfhost.sh.
 - [ ] MI19. Runtime primitives (`nat_ctx_swap`, atomics, `nat_clone_thread`,
       trampolines) written once in MIR where they can be, per target only where
       they must be (M).
@@ -321,6 +373,12 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       them behind one interface (M).
       Each target's primitives (context switch, thread start, atomics, signals,
       traces) are behind one set of `nat_*` names.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — pe_ir defines the whole `nat_*` primitive interface (one
+      list, pe_ir_stubs.fd `prim_interface_names`, shared with nat_ir) and
+      checks it under FID_VERIFY=1: mi20_prim_check passes on pe, nat and
+      the three Linux targets. Left: the rename: stdlib/pe_runtime/conc.fd
+      still makes 75 calls by `pe_*` names, base.fd 2.
 - [x] MI21. Constants: materialization per target (`movz/movk`, `lui/addi`,
       `mov imm64`) chosen by cost, rematerialized instead of spilled (M).
       Nov 15 (verified in code, already done): `compiler/nat_enc.fd` `a64_li`
@@ -350,13 +408,20 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       tests) not used.
 - [ ] MI24. Conditional select (`csel`, `cmov`, RISC-V Zicond where present) for
       small branches with no side effects (M).
-- [ ] MI25. Floats in float registers on every target, f32 as f32 (not widened),
+- [x] MI25. Floats in float registers on every target, f32 as f32 (not widened),
       moves between classes only where needed (M).
       Nov 17: the f32 FFI stubs and `p_f32_to_bits` keep an f32 as f32 (not
       widened to f64 on the way).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — floats are in float registers by default on every target
+      (`fregs`, `--nat` included) and an f32 stays f32 at the FFI boundary:
+      machine_fregs_check 0 failures (166 float ranges on x86_64, 208 on
+      aarch64, 166 on `--nat`; none with it off), machine_f32_ffi_check 0
+      failures. The aarch64/riscv64 f32 FFI images were built, not run (no
+      loader sysroot here).
 - [ ] MI26. Narrow integers kept in registers with known extension state, so a
       `u8` add does not re-extend each time (M).
-- [x] MI27. Jump tables for dense `match` (M).
+- [~] MI27. Jump tables for dense `match` (M).
       Nov 17: implemented: an indirect jump in the machine IR (`MO_JTAB`, its
       entries `MO_JTE` in compiler/mir.fd), table entries as 4-byte
       self-relative offsets (`NATFIX_SELF32`), `ng_gen_jtab` / `ng_jtab_emit`
@@ -376,6 +441,14 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       machine IR has no indirect jump (an `MO_JTAB` op, its three encoders, a
       table of code addresses in the data and its relocations, and the
       allocator's successor list).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — jump tables work: test_machine_jtab is right,
+      test_irswitch_match has its tables on every target and PIE, the
+      x86-64 image has 9 indirect jumps (1 with jtab off). But
+      machine_jtab_check fails 5
+      (digit_name and live_across are inlined into main), and with inlining
+      off bits3 gets a table the check says it must not. Left: the test or
+      the check, so that it passes as written.
 - [~] MI28. Tail calls as jumps on every target, guaranteed for self-recursion in
       tail position (M).
       Nov 15 (verified in code): self-recursion in tail position (`return f(..)`
@@ -385,6 +458,13 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       other functions as jumps in the machine layer (frame reuse, stack
       arguments), and making the self-recursive case independent of the
       optimizer switch.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — tail jumps in functions that take a frame address:
+      test_machine_tailcall_frame is right on every target, and on
+      x86_64-linux and `--nat` the 3-million-level mutual recursion runs in
+      one frame. On AArch64 and RISC-V tailcall_deep overflows the stack
+      (is_odd called from is_odd): those calls are not jumps there. Left:
+      that; the check's runner passes Windows paths to wsl.exe.
 - [x] MI29. Stack probes for frames over a page, so a large frame cannot jump over
       the guard region (S).
       Nov 15 (written; checked by the final build): `ng_probe_frame`
@@ -407,6 +487,12 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       coalescing and call-free ranges. Replace both with one allocator on MIR (L).
       Nov 8: one linear-scan allocator for the three Linux targets
       (`ng_mir_alloc`); pe_ir keeps its own.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — `FID_PE_OFF=ra` builds pe_ir without its allocator:
+      test_pe_ra_off is right both ways (images 158,963 vs 218,867 bytes),
+      ra1_pe_ra_off_check on 117 programs gives 114 same, 0 differ (1
+      out-of-memory build). Left: deleting pe_ir's allocator, which waits
+      for MI17 and the Windows default.
 - [~] RA2. Liveness on MIR from use lists, live ranges as lists of segments with
       holes, not hulls (M).
       Done (Nov 17): liveness from use lists (`ng_use_liveness`;
@@ -415,12 +501,36 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       scan (`ng_seg_scan`), the greedy allocator and the second chance
       (`FID_NAT_OFF=holes`, `segscan`); the float class and RA7's hints are
       still on hulls.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — liveness from use lists (ng_use_liveness) gives the same
+      allocation (`FID_NAT_OFF=uselive`); machine_segs_check passes on
+      aarch64 and riscv64. On x86_64-linux and `--nat` every build of
+      test_machine_segs and test_machine_holes fails the allocation check
+      (argument register 6; fine with `FID_NAT_OFF=argfree`), and the
+      reload comparison shows 0 vs 0. Left: that failure (RA3/RA7), a
+      measured gain, floats and RA7's hints on segments.
 - [~] RA3. All registers, caller-saved included: a value live across a call goes
       to a callee-saved register or is split around the call (L).
       Caller-saved registers for ranges no clobbering call crosses (AArch64
       x8–x11, RISC-V t4); x86-64 has none spare.
-- [ ] RA4. Live-range splitting at calls and at loop boundaries, with spill code
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — argument registers for spilled ranges (ng_arg_free) work on
+      AArch64 and RISC-V (150 ranges moved; reloads 129 -> 122 and
+      262 -> 159). On x86-64 (Linux and `--nat`) the checker rejects the
+      assignment made with RA7's hints ("defines v.. in argument register 6,
+      whose argument or result is still to be read"): 5 of 69 test_machine
+      programs under FID_VERIFY=1; without it they run right. Left: fix
+      that (the assignment or the checker).
+- [~] RA4. Live-range splitting at calls and at loop boundaries, with spill code
       placed outside loops (L).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — the splitting (ng_mir_alloc_split, ng_split_check) works
+      where the checker allows it: split_unit 24/24, test_machine_split and
+      _split_float right, the split mutation rejected on 4 targets, wide
+      reloads 512 -> 506 (x86-64), 222 -> 209, 258 -> 241; 69 test_machine
+      programs agree with split off and on. Left: split_alloc_unit rejects 1
+      x64 program, the splitall builds fail the argument-register check on
+      x86-64, RISC-V and Windows, the suite spill numbers.
 - [x] RA5. Spill weights from loop depth and use counts (M).
       Nov 9: `ng_spill_weights`: each use or definition 8^(loop depth), the
       loops from back edges in the MIR; with no register free the cheapest
@@ -433,11 +543,19 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       over vreg copies whose two sides never change while the other lives),
       the copy left a move to itself; the checker validates it
       (`FID_NAT_OFF=coalesce`).
-- [ ] RA7. Register hints: arguments, results and call operands prefer the
+- [~] RA7. Register hints: arguments, results and call operands prefer the
       registers they must end in (M).
       (Nov 15: only vreg-to-vreg move hints exist; the argument and result
       registers are outside the allocation pool, `ng_pool_caller`, so they
       cannot be hinted until the pool takes them in.)
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — the hints are on by default (`FID_NAT_OFF=arghint`):
+      arghint_unit 15/15, moves 7080 -> 4226 (x86-64), 7247 -> 4299
+      (AArch64), 7295 -> 4355 (RISC-V), 10304 -> 5854 (`--nat`), the
+      mutation caught, win_callback_regs_check passes. Left: under
+      FID_VERIFY=1 the native suite fails on x86-64 Linux and `--nat`
+      Windows (5 of 69 test_machine programs, with RA3's fill); the full
+      suite.
 - [x] RA8. Rematerialization of constants, addresses of globals and frame slots
       instead of spills (M).
       Nov 9: constants: a vreg defined once by MO_LI is never stored, a spilled
@@ -446,11 +564,18 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       frame slots (MO_SLOTADDR) too (`ng_remat_kind`, `ng_ld_spilled`), and
       the definition of a spilled rematerialized value emits nothing
       (`ng_mir_emit`); test_machine_remat.fd.
-- [ ] RA9. Second-chance or backtracking allocation in the style of regalloc2 /
+- [~] RA9. Second-chance or backtracking allocation in the style of regalloc2 /
       LLVM's greedy, behind a switch, compared with linear scan (XL).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — the greedy allocator (`FID_NAT_ON=greedy`) passes
+      FID_VERIFY=1 on x86-64, AArch64, RISC-V and `--nat`, greedy_unit
+      12/12, and 14 benchmarks print what linear scan's print at 0.85–1.14
+      of its time. It is not consistently better (AArch64 main spills
+      214 -> 236), and machine_batch12's per-function checks fail (the
+      functions are inlined). Left: the full suite, greedy_compare.sh.
 - [ ] RA10. Register classes: integer, float, and pairs where a target needs them
       (S).
-- [ ] RA11. Parallel moves at block edges solved with cycle breaking through one
+- [~] RA11. Parallel moves at block edges solved with cycle breaking through one
       scratch register (M).
       (Nov 15: there are no block-edge moves yet: a range keeps one register
       or slot everywhere, so this comes with splitting, RA4.)
@@ -461,8 +586,22 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       `ng_split_check` in `ng_mir_check` verifies them; no phase can form a
       cycle, so no scratch register is taken; tests/nattools/par_moves_unit.fd,
       split_alloc_unit.fd, machine_split_check.sh.
-- [ ] RA12. Callee-saved registers saved only on paths that use them (shrink
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — nat_par_moves serves the splitter and is checked:
+      par_moves_unit 9/9, the checker rejects the split mutation on all 4
+      targets. But the FID_VERIFY=1 splitall builds fail on x86-64, RISC-V
+      and Windows (the argument-register check, not a move cycle), and
+      split_alloc_unit rejects 1 x64 program. Left: those, so the suite
+      validates RA4.
+- [~] RA12. Callee-saved registers saved only on paths that use them (shrink
       wrapping) (M).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — shrink wrapping (nat_ir.fd ng_sw_plan,
+      `FID_NAT_OFF=shrinkwrap`) with CFI rows for the deferred saves:
+      test_machine_sw_unwind and _shrinkwrap2 right, sw_unwind_check unwinds
+      10 probe stops on x86-64, AArch64 and RISC-V, the swcfi mutation is
+      caught. Left: tailpath is not shrink-wrapped on AArch64 and RISC-V
+      (it saves every callee-saved register in its prologue).
 - [x] RA13. Save and restore with paired instructions (`stp/ldp` on AArch64) (S).
       Nov 15: `ng_prologue`/`ng_epilogue` save and restore the callee-saved
       registers two at a time (`a64_stp`/`a64_ldp` in nat_enc.fd, the same
@@ -480,6 +619,13 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       allocator mode (it replayed code of the other allocator before);
       tests/bootstrap/test_driver_fast_alloc.fd. Left: measuring it against
       the 10% target.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      failed — the check found this not done: in debug mode the allocation
+      is 11–13% of the build, not under 10% (test_compiler_sized 11.2%,
+      test_machine_probe 12.4%, compiler/main.fd 13.1%; `--fast-alloc` with
+      the mid-end is 6.1–9.5%). The main.fd default and fast-alloc rows
+      panic in iro_sccp (integer overflow on subtraction). Left: a faster
+      fast path, that panic, a run on a quiet machine.
 - [x] RA15. An allocation checker: replay the allocated code symbolically and
       prove every use reads the value it should (regalloc2's checker) (L).
       Nov 8: `ng_mir_check`, an independent exact liveness walk; it found a real
@@ -504,16 +650,38 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       but the emitter remembers which register xmm0/xmm1 mirror and does not
       move an operand again (`FID_NAT_OFF=xmmcache`): the float loop 1834 ->
       1364 ms. Left: an xmm register class in the allocator.
-- [ ] RA19. A value used only as a branch condition stays in flags where the
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — float ranges a call crosses take callee-saved float
+      registers on AArch64 (31 ranges) and RISC-V (40): the fcallee tests
+      pass, the mutation is caught. ra18_float_bench: AArch64 0.89 of
+      spilling, RISC-V 1.07 (slower, under qemu). Left: the RISC-V cost, the
+      ratio table in docs/reference/callee-saved-floats.md, programs that
+      start tasks; x86-64 has no callee-saved floats in this scheme.
+- [~] RA19. A value used only as a branch condition stays in flags where the
       target has them (M).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — test_machine_brflags and _brflags2 are right, and with
+      `FID_IROPT_OFF=inline,inline2` not_if, and_if, or_if and the xb_n*
+      cases lose their SETCCs. In a default build both check scripts fail
+      (the functions are inlined); ext_if, xb_ext and xb keep theirs; the
+      x86-64/`--nat` FID_VERIFY builds of brflags2 hit the argument-register
+      check. Left: those, `while a && b` heads, `&&` with a call, RISC-V
+      without Zicond.
 - [x] RA20. The allocator honours IPRA clobber sets (Track WP) at each call (M).
       Calls only clobber what their callee was found to clobber (WP4).
 
 ## Track TG — Thin targets: selection and encoders (20)
 
-- [ ] TG1. Instruction selection as rules: MIR patterns -> target instructions,
+- [x] TG1. Instruction selection as rules: MIR patterns -> target instructions,
       tried by cost, written as data in Fides (an ISLE-like table, no new
       language) (L).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — the operations still hand-selected are table rows now
+      (nat_ir.fd ng_isel_rows_tg1b: DIV/REM/MULH, ASR63, I2F/F2I, ANDN,
+      BLSR, CSEL, TBNZ, OPW, ALUM): isel_tg1b_check gives the same image as
+      the hand-written selection on x64, x64v3, a64, rv and rv23 with fregs
+      on and off, the iseldiv mutant is caught; isel_table_check passes.
+      Moves, calls and prologues stay hand-written, as documented.
 - [ ] TG2. Each rule carries its preconditions (immediate fits, register class)
       and is tested on its own by random operands against the generic lowering
       (M).
@@ -543,6 +711,13 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       each listed instruction back through clang's assembler.
       Left: nat_enc.fd's encoders reading the same table (the EFW_*
       constants) instead of their own constants.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — compiler/disasm.fd decodes from one table (enc_table_unit
+      ok); disasm-check: x86-64 instruction starts agree with objdump,
+      AArch64 and RISC-V round trips all ok, but the x86-64 round trip fails
+      on 3 tests (`shl rbx, 1` emitted as C1 /n 1 reassembles as D1 /n).
+      Left: nat_enc.fd's encoders still use their own words (no EFW_ use),
+      and that round trip (emit D1 or accept the alternative).
 - [x] TG6. Branch relaxation: short forms where the target reaches, long forms
       only when needed (x64 `jcc rel8`, RISC-V `b` vs `jal` vs `auipc+jalr`) (M).
       Nov 15: `ng_mir_emit` (nat_ir.fd) emits a function with every branch
@@ -557,7 +732,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       AArch64 needs none (every form is one word). `FID_NAT_OFF=relax`: all
       long. Test: tests/bootstrap/test_machine_relax.fd (a loop body of a
       few KB, short and long branches). Not yet run: the final build.
-- [~] TG7. x64: memory operands in arithmetic, `test`, `lea` everywhere it pays,
+- [x] TG7. x64: memory operands in arithmetic, `test`, `lea` everywhere it pays,
       `cmov`, BMI1/BMI2 behind `--cpu` (M).
       Done (Nov 15): `test r, r` for every compare with zero (ng_bnez,
       ng_brcc, before); `lea` for element addresses (MO_ADDSHL, MI22) and
@@ -575,7 +750,13 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       tests/bootstrap/test_machine_tg7.fd,
       tests/nattools/machine_tg78_check.sh, enc-oracle-tg78.py;
       docs/reference/slot-operands-and-writeback.md.
-- [~] TG8. AArch64: `madd/msub`, shifted and extended operands, `cbz/tbz`,
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — cmpslot (90 slot compares) and rmwslot (56 slot
+      read-modify-writes), none with them off; blsmsk/blsi under x86-64-v3,
+      none on the baseline; the mutants are caught (they hang rather than
+      print wrong output); tg78_unit ok on 3 targets, enc-oracle-tg78 2310
+      forms 0 mismatches, test_machine_tg7 9/9.
+- [x] TG8. AArch64: `madd/msub`, shifted and extended operands, `cbz/tbz`,
       `csel/csinc`, `ldp/stp`, pre/post-indexed addressing (M).
       Already in nat_ir/nat_enc (verified Nov 15): `msub` for remainders
       (ng_rem), `add ..., lsl #s` for element addresses (ng_addshl, MI22),
@@ -590,7 +771,13 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       allocation (a64_ldr_wb / a64_str_wb; FID_NAT_OFF=wbidx). Tests:
       tests/bootstrap/test_machine_tg8.fd, tests/nattools/tg78_unit.fd,
       machine_tg78_check.sh, enc-oracle-tg78.py.
-- [~] TG9. RISC-V: compressed instructions (RVC) for size, Zba/Zbb when present,
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — machine_tg78_check: 17 loads/stores with writeback on
+      AArch64, 0 with `FID_NAT_OFF=wbidx`, the mutant caught, outputs right
+      on aarch64, x86_64, riscv64 and `--nat`; enc-oracle-tg78 2310 forms 0
+      mismatches; test_machine_tg8 8/8. Float-register accesses are not
+      fused yet, as documented.
+- [x] TG9. RISC-V: compressed instructions (RVC) for size, Zba/Zbb when present,
       `sext.w` elision (M).
       Done (Nov 15): Zba/Zbb under `--cpu rva22u64|rva23u64|rv64gc_zba_zbb`
       (`ng_rv_zb`; `nat_cpu_check` accepts the names): element addresses
@@ -601,6 +788,12 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       encoder writes 4-byte words only; NatEnc and every fixup assume it)
       and `sext.w` elision (the lowering has no 32-bit `*w` operations to
       elide after).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — RVC (nat_enc.fd nat_rvc_of/expand/compress, ng_rvc_pass):
+      rvc_unit ok, enc-oracle-tg9 1238 forms and 36,206 RVC forms (2588 in 2
+      bytes) with 0 mismatches, rvc_check 77 ok (its 3 failures were out of
+      memory and right when rebuilt), test_machine_rvc 13/13; MO_OPW
+      covers the `*w` operations. Not run: the riscv64 cross-test with RVC.
 - [x] TG10. A `--cpu` switch per target with safe defaults (baseline x86-64-v2,
       armv8.0-a, rv64gc) (S).
       Nov 15: `fid emit --cpu <name>` is checked by `nat_cpu_check` —
@@ -610,8 +803,16 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       `g_nat_cpu` for the selections that will differ.
       Nov 15: selections now differ: `x86-64-v3|v4` turns on BMI2 (TG7),
       `rva22u64`/`rva23u64`/`rv64gc_zba_zbb` (new names) Zba/Zbb (TG9).
-- [ ] TG11. SIMD as MIR vector operations: SSE2/AVX2, NEON, RVV, for the `simd`
+- [~] TG11. SIMD as MIR vector operations: SSE2/AVX2, NEON, RVV, for the `simd`
       module and loops the vectorizer picks (XL).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — vector values get frame slots (the vectorizer spills to 4–6
+      vector slots), stdlib/simd.fd has the integer intrinsics,
+      enc-oracle-tg11 113 forms 0 mismatches, the sse/avx2/neon/rvv images
+      are right when run by hand. Left: test_machine_simd case_n fails the
+      allocation check on every x86-64 target under FID_VERIFY=1, the pe_ir
+      build of test_simd_i64 crashes in its wrap section, reductions (red6,
+      redk) are not vectorized.
 - [~] TG12. Object files (COFF, ELF, Mach-O) from the same writer as executables,
       for linking with C (release F4) (M).
       Nov 16, ELF: `fid emit <file> --obj --target <linux> -o x.o` (main.fd
@@ -642,6 +843,12 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       profiler. A wrapper needs the host's thread pointer swapped for the
       runtime's around each call (or a runtime TLS that leaves it alone)
       and a once-per-thread init.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — tg12_objects_check: the COFF object links with lld and
+      prints what the PE prints, a C program links and calls fid_probe, the
+      x86_64/aarch64 Mach-O objects link. `fid emit --obj --nat` on a real
+      program fails (the runtime's LoadLibraryA/GetProcAddress/FreeLibrary
+      undefined). Left: that; running the Mach-O objects (no Mac).
 - [x] TG13. One image writer for PE, ELF and Mach-O: sections, relocations, symbol
       tables, written once (L).
       compiler/image_writer.fd; every writer (nat_enc.fd nat_elf /
@@ -653,6 +860,12 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       gone). Unit tests pin the bytes by digest:
       tests/nattools/image_writer_unit.fd, image_writer_obj_unit.fd; real
       programs: tests/nattools/image_same_check.sh. docs/image-writer.md.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — no old writer body is left (only a comment names
+      FID_IMG_OLD); image_writer_unit and image_writer_obj_unit match their
+      bytes; image_same_check on hello: 11 formats the same (pe-g differs
+      only in the PDB path it names). The coff format is skipped there (the
+      `codegen --coff` failure, RL9/TG12).
 - [~] TG14. Position-independent executables on Linux and macOS (ASLR) (M).
       macOS: already PIE (verified Nov 15: `nat_macho` sets MH_PIE and dyld
       rebases every absolute word, F7). Linux, done (Nov 15) behind
@@ -670,9 +883,24 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       tests/nattools/pie_ldyn_prog.fd), the FID_NAT_ON=pie suite run on the
       three Linux targets, then PIE the default (nat_pie_wanted); the image
       is still one RWX segment.
-- [ ] TG15. Dynamic linking of system libraries where a platform needs it (libc
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — PIE on the three Linux targets: image_writer_unit's PIE
+      lines and machine_batch7's TG14 lines pass (split ET_EXEC by default,
+      pie ET_DYN), the images run (x86_64 in WSL, aarch64/riscv64 under
+      qemu); a dynamically linked PIE (pie_ldyn_prog.fd) runs; `emit --pie`
+      gives ET_DYN; 36 of a 40-test PIE sample pass, the other 4 fail
+      without PIE too. The image is no longer one RWX segment. Left: PIE the
+      default, the full `FID_NAT_ON=pie` suite.
+- [x] TG15. Dynamic linking of system libraries where a platform needs it (libc
       on macOS, `kernel32` on Windows already), through import tables written by
       us (L).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — import tables we write (nat_enc.fd nat_pe_dll_for,
+      nat_pe_win64_stub): tg15_win64_stub_check ok (13 Windows x64 and 12
+      Apple arm64 stubs agree with clang), tg15_win_dll_check ok (92 imports
+      from 7 DLLs, output right), an aarch64-macos binary binds _ldexp,
+      _atoi and _hypot through libSystem, and a Linux libc/libm PIE runs.
+      The Mach-O binaries were checked for structure only (no Mac here).
 - [~] TG16. A WASM target on MIR: structured control flow from MIR's CFG
       (relooper / stackifier), our own module writer, replacing the invalid
       `wasm.fd` output (L).
@@ -697,13 +925,24 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       lowering with nat_ir; it needs MIR target-neutral enough for a stack
       machine, e.g. an emit hook over NatFnRec.mir that wasm.fd walks
       instead of IR: not started).
-- [~] TG17. Peephole rules per target as data, after allocation: redundant moves,
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — the stackifier: stackify-check passes 10 of 10 (e.g.
+      test_wasm_collections, 304 functions structured), the modules
+      validate, both builds print the same, structured modules are about 9%
+      smaller. Left: the target on MIR (wasm.fd still lowers from IR).
+- [x] TG17. Peephole rules per target as data, after allocation: redundant moves,
       load after store, branch to next block (M).
       Already (verified Nov 15): branch to the next block, jump threading
       and redundant moves go in the shared MIR peephole before allocation
       (`ng_peep`, OP19); after allocation the emitter drops a move whose
       registers came out equal (`ng_mir_emit`). Left: rules as per-target
       data after allocation, load after store.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — per-target post-allocation rules (ng_post_rules) with load
+      forwarding, also past a move (ldfwdmov): machine_tg17_check 0
+      failures (x86_64 59 loads forwarded, 40 without ldfwdmov, none with
+      ldfwd off; aarch64 9, riscv64 13, `--nat` ok); pass-matrix on a
+      24-file sample: 0 switches differ on 3 targets.
 - [x] TG18. A shared peephole pass on MIR before allocation: dead flags, double
       extension, constant compare (M).
       The pass is `ng_peep` (OP19: redundant and dead moves, load
@@ -715,7 +954,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       (`FID_NAT_OFF=mirfold`). Dead flags: the MIR carries no flags between
       operations, so there is nothing to remove. Test:
       tests/bootstrap/test_machine_isel.fd. Not yet run: the final build.
-- [~] TG19. Code size mode (`--size`): RVC, short encodings, no unrolling, shared
+- [x] TG19. Code size mode (`--size`): RVC, short encodings, no unrolling, shared
       panic blocks (S).
       Pieces already on by default (Nov 15): shared cold panic blocks per
       function (MI6), short branch encodings (TG6). Nov 16: `fid emit
@@ -726,6 +965,12 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       cache keys on it. tests/bootstrap/test_driver_fast_alloc.fd (the same
       output, an image no larger: scripts/driver-goals-check.sh). Left: RVC
       (compressed RISC-V encodings in nat_enc.fd).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — RVC is on by default for RISC-V Linux (NG_RVC_DEFAULT; off
+      with `FID_NAT_OFF=rvc` or `--cpu rv64g`): tg19_size_check 0 failures;
+      riscv64 images 1,119,752 -> 989,216 bytes by default (11% smaller),
+      982,992 with `--size`; `fid disasm` lists the 2-byte forms. Not run:
+      the riscv64 cross-test with RVC.
 - [x] TG20. A new target costs under 3,000 lines: description, rules, encoder,
       image writer; measured by the RISC-V port (S).
       Measured Nov 15: the RISC-V 64 port is ~500 lines (encoder + target
@@ -751,6 +996,13 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       `ime_headers`/`ime_latches`/`ime_loop_body` still derive loops
       themselves (over the shared dominators), and checks.fd's counted-loop
       analysis, pe_ir and nat_ir keep CFGs of their own.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — ssa.fd's own loop walk is gone (ssa_exit_values takes
+      iro_loop_body from the shared loop tree), ime_loop_body and pe_ir's
+      successors use iro_cfg; the four loop-tree tests are right under
+      FID_VERIFY=1 on pe_ir and `--nat`. Left: nat_ir's own IR-level
+      successor walk (ng_block_succs), kept until ir_verify checks
+      terminators.
 - [~] ME3. mem2reg: locals whose address never escapes become SSA values with
       block parameters, on the IR every backend reads (L).
       Nov 8–9: scalar locals whose address is only loaded and stored live in
@@ -781,6 +1033,12 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       switch); test `tests/bootstrap/test_ssa_merge.fd`. Left: run the
       suite with it on and off, then make it the default (and retire
       `promote`, which it subsumes).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — ssa is on by default and promote is retired where ssa runs
+      (ssa_takes): ssa-default-check passes, promote-retired-check passes 14
+      of 15, but test_matrix_mul has about 2% more instructions without
+      promote (6048 vs 5930 after iropt). Left: that cost, the rest of the
+      NAT=1 file list.
 - [x] ME4. An IR verifier after every pass in debug builds: types, dominance,
       terminators, block parameters (M).
       Nov 8: `compiler/irverify.fd` (`FID_VERIFY=1`), after lowering, iropt, the
@@ -823,11 +1081,24 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       `tests/bootstrap/test_midend_egraph_unary.fd`). Left: integer casts and
       float values are still leaves; the skeleton is the IR's instruction
       order (no separate side-effect skeleton, see ME8).
-- [~] ME8. Extraction by cost, with each value placed at the latest dominating
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — the side-effect skeleton is written (egraph.fd eg_skeleton,
+      opt-in `FID_IROPT_ON=egskel`): test_midend_egskel right, egskel-check
+      9 PASS on `--nat` (1063 values floated, 0 undone), all 8 x86_64-linux
+      images right, a 60-test sample 52 SAME, 0 differ. Left: the full
+      suite on `--nat` and Linux, the pass matrix, then the default.
+- [x] ME8. Extraction by cost, with each value placed at the latest dominating
       point that covers its uses: LICM and sinking fall out (L).
       Extraction by cost; an instruction is rewritten in place into its class's
       best form when that form's operands dominate it. Placement-based LICM is
       still to do.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — placement (egraph.fd eg_place) is on by default on the
+      native paths: egplace-default-check passes (placed 21, hoisted 4; both
+      off switches give identical images; 20 programs the same on, off and
+      without the e-graph); a 60-test sample gives pe_ir 60 SAME, `--nat`
+      53 SAME (2 builds failed for other reasons). Not run: the whole suite
+      and a Linux target.
 - [x] ME9. Rewrite rules as data: a pattern, a replacement, conditions on types
       and constants; a file of rules per area (arithmetic, comparisons, bits,
       floats) (M).
@@ -872,7 +1143,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       arithmetic (a fold that would panic stays varying); constant branch
       conditions become jumps, the dead edge's predecessor link is dropped
       and unreachable blocks removed.
-- [~] ME15. Dead code and dead store elimination on SSA (M).
+- [x] ME15. Dead code and dead store elimination on SSA (M).
       `iro_dse`/`iro_dce_more` run on the current single-def IR; "on SSA"
       proper waits on ME3 phis.
       Done (Nov 16): on the SSA form of `compiler/ssa.fd` (ME3): phis nothing
@@ -881,6 +1152,11 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       drops the values left unread (constants, loads of locals, comparisons
       and bit operations; never what may panic). Opt-in with `ssa`. Left:
       the suite run with `ssa` on and off.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — on by default with `ssa` (`ssa`, `ssaexit` in
+      IME_DEFAULT_ON; `FID_IROPT_OFF=ssa`): ssa-default-check 0 failing on
+      pe_ir and `--nat`, test_ssa_merge right under FID_VERIFY=1, a 100-test
+      sample with ssa on and off 97 SAME, 0 differ.
 - [x] ME16. Each rule tested on its own: random inputs evaluated before and after
       the rewrite, in `fid test-rules` (M).
       `fid test-rules`: each rule on edge and random values.
@@ -906,11 +1182,25 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       several blocks (the block is split at the call; returns store the
       result and jump on), up to 60 instructions, 400 for a callee called
       once, a caller kept under 4,000 (`compiler/iropt_me.fd` `ime_inline`).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — inline2 is on by default, its limits settable per build
+      (FID_INLINE2_LIMITS) with a stats line: inline2-limits-check and
+      inline2-check pass. inline2-tune.sh does not exit 0 (SLOWRUN, likely
+      machine load), and with inline2 on test_regex_linear fails the
+      `--nat` allocation check under FID_VERIFY=1 (only
+      `FID_IROPT_OFF=inline2` fixes it). Left: those, the full suite.
 - [~] ME21. Inlining decisions from the call graph bottom-up, with sizes known
       after the callee is optimized (M).
       Nov 9: written, opt-in (`FID_IROPT_ON=inline2`), not run on the suite yet: post-order over
       the call graph: a callee is inlined into its callers after its own
       callees were.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — the bottom-up inliner now resumes its scan after an inlined
+      site and inlines the same sites: "resumed scan = rescan" on 5
+      programs (e.g. test_lib_bigint 1178 vs 2800 weighings), same output.
+      Left: the full suite on and off, the compile-time measurement
+      (me-measure.sh), the `--nat` allocation-check failure of
+      test_regex_linear with inline2.
 - [~] ME22. Loop canonical form: preheaders, single latches, dedicated exits (M).
       Nov 9: written, opt-in (`FID_IROPT_ON=loops`), not run on the suite yet: all three
       (`ime_canonical_loops`).
@@ -941,6 +1231,12 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       `PEIR_ROTATE` stays meanwhile and does not fire twice. Test
       `tests/bootstrap/test_midend_rotate.fd`, check
       tests/tooling/rotate-check.sh; docs/perf/mid-end/me23-me25-rotate-exit-version.txt.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — exit values from bounds that are not constants work
+      (ssaexit-check 0 failed on pe_ir and `--nat`), but rotate-check fails
+      1: with rotation on, the counted-loop proof no longer removes
+      sum_vec's bounds check. Rotation stays opt-in and PEIR_ROTATE stays in
+      pe_ir. Left: that, SUITE=1.
 - [~] ME24. Loop unrolling by a small factor for short bodies with known trip
       counts (M).
       Nov 9: written, opt-in (`FID_IROPT_ON=unroll`), not run on the suite yet: a one-block loop
@@ -961,6 +1257,14 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       `test_midend_unroll_runtime.fd` (and their `_fail` kin), check
       tests/tooling/unroll-check.sh (SUITE=1, BENCH=1). Left: that check
       with this run's compiler.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      failed — the check found this not done: `unroll` on by default
+      miscompiles. `fid emit test_opt_dce.fd` (pe_ir) prints 9900 for the
+      sum of 0..99 (4950 with `FID_IROPT_OFF=unroll`, with `fid run` and on
+      `--nat`): a partially unrolled loop with a dead store in its body
+      (`waste = i * i`) doubles the sum, and FID_VERIFY=1 is silent.
+      unroll-check also fails 3 (with inline2 on, no peeled or run-time
+      unrolling shows). Left: fix it or take `unroll` out of IME_DEFAULT_ON.
 - [~] ME25. Loop versioning: a fast copy without checks when a cheap test at the
       entry proves them unnecessary (M).
       Not started: the copy needs a way to tell the backends that its checks
@@ -985,6 +1289,13 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       versioned copy's checks (main.fd calls iropt.fd `iro_explain_loops`
       before `explain_checks`). Check tests/tooling/version-default-check.sh
       (NAT=1 SUITE=1, BENCH=1). Left: that check with this run's compiler.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — on by default; version-default-check's outputs are right on
+      pe_ir and `--nat` (the oob/negstart tests panic as they should) and
+      explain shows 1 check removed in sum_first's copy, but it fails 2:
+      test_counted_loop_step and test_version_negstart_fail version no loop
+      once the default `ssa` runs (3 and 2 with ssa off). Left: versioning
+      after ssa, the full suite.
 - [~] ME26. Scalar replacement of aggregates on SSA: struct fields as separate
       values (M).
       Nov 9: written, opt-in (`FID_IROPT_ON=sra`), not run on the suite yet: a struct local
@@ -1047,6 +1358,13 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       bit tests and trees are MI27. `LOWER_SWITCH` stays off by decision:
       switches are formed after the mid-end only. Left: mark done once the
       check script passes on the built compiler.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — matches on narrow integers form switches (7 C switches;
+      outputs right on 4 targets), and with inlining off digit, opcode and
+      small_dense get jump tables and the others none. But
+      machine_switch_narrow_check fails 4 with the default passes (inline2
+      folds opcode and small_dense into main). Left: the test or the check,
+      a suite run with switches.
 - [x] ME29. Tail recursion into loops (S).
       `iro_tailcalls` (`compiler/iropt.fd`): a `return f(...)` self-call in
       tail position becomes argument stores + a jump back to the entry.
@@ -1099,6 +1417,13 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       register 1), without `internal_conv` (whose pass is opt-in): the
       machine layer finds the functions only called directly itself.
       Left: arguments in the registers the caller already has them in.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — arguments where the caller has them, through RA7's hints on
+      by default: wp6_args_check fwd3 16 -> 8 moves, totals 193 -> 179
+      (x86-64), 172 -> 161, 169 -> 159; but fwd5 gains nothing on AArch64
+      (66) and gets one more move on RISC-V (68 vs 67), and the hints trip
+      the allocation checker on x86-64 (test_machine_simd, test_ai_stdlib).
+      Left: those, or the hints opt-in again; the native suite.
 - [~] WP7. `__env` dropped from functions that never read it, at every call (S).
       `iro_env_trim` (`compiler/iropt.fd`): removes `params[0]` and the
       matching `args[0]` at every direct `Inst::Call`. Address-taken
@@ -1131,6 +1456,14 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       docs/perf/mid-end/wp7-wp14-wp15-defaults.txt; check
       tests/tooling/wp-defaults-check.sh. Left: that check and the suite with
       this run's compiler.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      failed — envtrim on by default trims 699 calls and outputs stay right
+      without FID_VERIFY, but the nat_ir allocation checker rejects
+      test_machine_simd (case_n: "defines v1478 in argument register 6,
+      whose argument or result is still to be read", `--nat` and
+      x86_64-linux), test_ai_stdlib and test_machine_brflags2; each builds
+      with `FID_IROPT_OFF=envtrim` (or `FID_NAT_OFF=arghint`/`argfree`).
+      Left: fix that (RA7/RA3) or make envtrim opt-in again; the suite.
 - [x] WP8. Leaf functions without frames, with no frame record where traces do not
       need it (S).
       `g.leaf` in nat_ir: a function with no calls, no callee-saved spills
@@ -1162,7 +1495,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       whose callee called a writer looked pure and two calls of it merged
       (test_midend_effects_deep). Escapes are also followed through address
       arithmetic and casts (`iro_esc_of`).
-- [~] WP10. `!read`-only calls merged when no write lies between them (M).
+- [x] WP10. `!read`-only calls merged when no write lies between them (M).
       `ru_read_call`/`ru_read_reuse` (`compiler/rules.fd`): same-block and
       dominating-block merges with a backward CFG scan for writes. On by
       default since Nov 17 (OP25; `FID_NAT_OFF=readcse` turns it off; it was
@@ -1177,6 +1510,11 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       Nov 17: on by default since OP25 (rules.fd `g_ru_readcse`;
       `FID_NAT_OFF=readcse` or `FID_IROPT_OFF=readcse` turns it off); see
       docs/perf/mid-end/wp7-wp14-wp15-defaults.txt.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — readcse on by default: op25-check 0 failed (readcse 14, 0
+      with it off), midend-optin-check 33 SAME on `--nat`, a 60-test sample
+      54 SAME, 0 differ. The full SUITE=1 NAT=1 run was replaced by the
+      sample.
 - [~] WP11. `@crashfree` functions: their panic paths are absent, so callers need
       no panic edges for them (S).
       Two uses. Optimizer: `iro_mask_annotated` (`compiler/iropt.fd`, was
@@ -1223,6 +1561,13 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       weighed and redirected. docs/perf/mid-end/wp7-wp14-wp15-defaults.txt;
       check tests/tooling/wp-defaults-check.sh. Left: hotness; that check and
       the suite with this run's compiler.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated for what is written — spec on by default folds its clones:
+      wp-defaults-check (spec 2, 0 off; test_midend_spec_hot right on pe_ir
+      and nat), scale_sc1_3 keeps its constant, spec on hello takes 10 ms
+      (was 878); a 60-test sample 0 differ on pe_ir (the `--nat` failures
+      are not spec's). Left: hotness (every candidate within the limits is
+      cloned), the full suite.
 - [~] WP15. Dead function and dead global elimination after optimization, not only
       before (S).
       `iropt_native` calls `IrModule_dead_function_elimination` after the pass
@@ -1256,7 +1601,13 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       docs/perf/mid-end/wp7-wp14-wp15-defaults.txt; check
       tests/tooling/wp-defaults-check.sh. Left: that check and the suite with
       this run's compiler.
-- [~] WP16. Devirtualization: `dyn` calls whose receiver type is known become
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — deadf is on by default and linear (87 ms, was 1860), dead
+      globals go (3) and outputs are right; but wp-defaults-check fails
+      "deadf functions: 0": the PE88 prune runs first and drops them (154
+      with FID_PE_PRUNE=0). Left: the check (or deadf for functions), the
+      full suite.
+- [x] WP16. Devirtualization: `dyn` calls whose receiver type is known become
       direct calls; closures called at one site are inlined (M).
       `iro_devirt` (`compiler/iropt.fd`): a `DynCall` whose receiver's
       definition is `MakeDyn` becomes a direct `Call` to `Type_method` with
@@ -1269,6 +1620,11 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       closure is one block (`iro_inline`); a closure called at one site up
       to 400 instructions (`ime_inline`'s once-called rule) only with
       `FID_IROPT_ON=inline2`. Left: inline2 on by default (ME20).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — inline2 (default since OP5) takes once-called closures and
+      `inlineclo` is in IME_DEFAULT_ON for when it is off: inlineclo-check 7
+      PASS on pe_ir and `--nat` (9 and 51 sites), test_midend_inline_closure
+      right, a 60-test sample 58/54 same, 0 differ.
 - [x] WP17. Global layout: hot functions together, cold panic paths at the end of
       the image (M).
       `ng_cold_last` (nat_ir): within each function, MIR segments ending in
@@ -1307,6 +1663,12 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       (test_midend_icf). Left: a suite run with icf on, then the default;
       sharing at monomorphization (`mono.fd`), so instances whose types lower
       alike are not built twice.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — sharing at monomorphization works: test_mono_share_alias
+      right on 3 backends, mono_share/check.sh ok (11 instance keys, 8
+      built, 3 shared). Left: icf is not on by default and folds nothing in
+      its own test (test_midend_icf prints no folded line even with
+      `FID_IROPT_ON=icf`); only an 82-test sample was run.
 - [x] WP20. Whole-program mode stays the default; a library build records the
       facts (clobbers, effects, sizes) its users need (M).
       Found Nov 15: `FID_LIBFACTS=<path>` already wrote `fn <name> params=N
@@ -1348,7 +1710,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       of the function's locals (LF2). Unmarked typed-pointer parameters
       (by-value structs, unsafe pointers) still count as written. The passes
       that use the query are opt-in (LF4–LF6, LF23).
-- [~] LF2. References are second-class (`escape.fd` proves it): the optimizer may
+- [x] LF2. References are second-class (`escape.fd` proves it): the optimizer may
       assume a reference's target outlives every use and is never stored (M).
       Nov 9: the alias query relies on it (a parameter's place is reached
       only through that parameter and what is derived from it).
@@ -1357,12 +1719,24 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       is no local either (`ime_may_alias`). Left: a local passed to a call
       by reference still counts as escaped for every later call (the
       reference cannot be stored, but a raw pointer from unsafe code can).
-- [~] LF3. Owned values have one owner: a load through an owned `Vec`'s data
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — `lendref` is on by default, so a local only lent to calls
+      that lend it onward keeps its facts: lendref-check 7 of 7 on pe_ir
+      and `--nat` (1012 -> 1009 instructions; the escape test keeps its
+      loads), a 100-test sample with it on and off 97 SAME, 0 differ.
+- [x] LF3. Owned values have one owner: a load through an owned `Vec`'s data
       pointer cannot be changed by a store through any other name (M).
       Nov 9: for locals: a local whose address goes only to loads, stores and
       field addresses overlaps nothing else, and no call can write it
       (`ime_unescaped`). A Vec's buffer is reached through calls to core, so
       its elements are not yet in the query.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — `vecalias` (elements of an owned Vec<i64>'s buffer in the
+      alias query, iropt_me.fd ime_vb_compute) is on by default:
+      vecalias-check 6 of 6 on pe_ir and `--nat` (4822 -> 4821
+      instructions), a 100-test sample 92 SAME, the other 5 out of memory
+      under load and SAME on retry. It acts on vecdata's loads, which stay
+      opt-in (OP9).
 - [x] LF4. Alias analysis as a query interface, answered from LF1–LF3, used by
       DSE, LICM of loads and store forwarding (M).
       Nov 9: `ime_may_alias(p, q)` and `ime_writes(inst, p)` (where an address
@@ -1391,8 +1765,14 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       (egraph.fd, FID_NAT_OFF=forward), a load of a local only loaded and
       stored becomes its dominating single store or the last store before
       it in its block.
-- [~] LF7. Bounds and overflow checks dropped on counted loops (release D12,
+- [x] LF7. Bounds and overflow checks dropped on counted loops (release D12,
       `checks.fd`) (done for `while i < v.len()` and `for i in 0..n`).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — checks.fd takes the other shapes too (bounds on the left,
+      `v.len() - d`, indexes `i + e`, counting down; peir_len_minus,
+      peir_loop_index, peir_counted_down): param-range-check 0 failed;
+      sum_len_gt, window3, step_down2, for_pairs and the counted-down cases
+      lose their bounds checks, keep_odd and the _fail variants keep theirs.
 - [~] LF8. Integer range analysis drops checks whose operands cannot overflow
       (`checks.fd`, `PEIR_RANGES`); extend it to every loop and branch (L).
       Nov 9: facts carried through jumps into single-entry blocks (`n - 1`
@@ -1405,6 +1785,13 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       rangejoin turns it off; test_midend_range_join,
       test_midend_range_join_fail). Left: one fact per block, and none over
       a loop's back edge (a loop header gets only what counted loops give).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — the range set is in (checks.fd peir_join_set, peir_sf_apply):
+      range-loop-check passes, a sample gives 97 SAME with rangeset on and
+      off. range-set-check fails 2 (hull's mul check stays in `fid explain`,
+      though the in-process harness removes it) and range-dom-check fails 5
+      (sieve keeps 4 overflow checks, filled_scale none, rangedom off
+      changes nothing for inner_sq/sq_big). Left: those, SUITE=1.
 - [x] LF9. Ranges from conditions: inside `if i < n`, `i < n` is a fact (M).
       Holds in blocks with that branch as their only way in, and through
       jumps from them (`peir_range_refine`); since Nov 15 also through
@@ -1438,6 +1825,13 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       change makes the counted-loop proof check that the Vec's slot is not
       re-stored between its `len` and the loop (it only looked for calls
       that shorten). Left: a suite run, then the default.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — on by default with versioning: where the Vec is a value the
+      checks are hoisted (explain sum_first: 1 removed in the copy, 1 kept
+      in the original; a 100-test sample 97 SAME), but version-default-check
+      fails 2: loops over a `& Vec` / `&mut Vec` parameter
+      (test_counted_loop_step, test_version_negstart_fail, double_first)
+      are not versioned. Left: those loops, the full suite.
 - [x] LF12. Narrow types as ranges: a `u8` value needs no overflow check on a
       widening add (S). `peir_type_range` on narrow loads and `IntExtend`.
 - [~] LF13. Escape analysis: a `Vec`, `str` or struct that never leaves its function
@@ -1453,6 +1847,12 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       passed to the program's own functions keep stack headers (OP27). Docs:
       docs/reference/stack-locals.md. Left: other string producers,
       Vec::new()+push buffers, temporaries.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — small Vec::filled buffers and Str_concat_into on the stack
+      work: test_stack_str, test_stack_vbuf, test_stack_lower and
+      tests/leaks/stack_vbuf_str are right on run, ccompile and emit; leak
+      gate 10/10. Left: other string producers, Vec::new()+push buffers,
+      temporaries and structs on the stack.
 - [~] LF14. Scalar replacement of a non-escaping `Vec` of known small length (M).
       Nov 16: built and tested (test_midend_vec_sroa.fd, `fid run` and
       `fid emit` with FID_IROPT_ON=vecsroa and without): iropt.fd `iro_vec_sroa` (run by
@@ -1474,6 +1874,13 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       copies of parameters and locals that are only read
       (lw_rc_cancel_param_slots; tests/rc_cancel/check.sh,
       docs/reference/rc-cancel.md).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — Vec and map copies are cancelled across if/else
+      (test_rc_cancel_across, _diamond, _local right on 3 backends, no
+      leaks), but no `str` copy is: tests/rc_cancel/check.sh fails
+      (pick_len, both_arms, loop_copy, kept, local_arms keep their
+      Str_dup/Str_drop; 3 counts removed, 4 wanted). Left: str parameter and
+      local copies (the dup now sits behind a region-stack branch).
 - [~] LF16. Copy-on-write checks removed where a value has one owner provably (M).
       Low gain now: the C and native fast paths test the capacity's sign once.
       Nov 16: built and tested (test_midend_sole_owner.fd, `fid emit` with
@@ -1531,6 +1938,13 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       "never spilled where a register will do" — the IR marks the function,
       not its secret values, so the allocator cannot prefer them; scratch
       registers are not cleared on nat_ir (pe_ir clears them).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — the register wipe works: ct_pick zeroes 24/38/33/24 registers
+      on x86_64, aarch64, riscv64 and `--nat`, none with the switch off,
+      outputs right under FID_VERIFY=1. machine_lf20_check fails 7: under
+      pressure 3 of 8 secret values keep a register (8 wanted), and the
+      wipe does not grow the image on 3 targets. Left: that, @secret
+      parameters and locals (a lowering change), the cross-test suites.
 - [~] LF21. Regions freed in one step instead of object by object (release C6) (M).
       Checked Nov 16: blocked on a design decision (competitive OP29): an
       arena that takes every allocation while a region runs would free
@@ -1558,7 +1972,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       and nothing after it there may write the tag (a store between the load
       and the branch made the fact wrong); test_midend_match_facts. Left:
       opt-in until the suite runs with it on.
-- [~] LF24. `Option` and `Result` in registers: tag and payload as two values, no
+- [x] LF24. `Option` and `Result` in registers: tag and payload as two values, no
       memory for small payloads (M).
       Nov 16, pe_ir half: decided to keep the hidden result pointer there
       (see ME27: in a backend whose values live in slots two registers add
@@ -1577,6 +1991,13 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       tests/nattools/machine_optmatch_check.sh). A Result with a `str`
       payload keeps its slot: the drop call takes its address. Left: mark
       done once the check script passes on the built compiler.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — machine_optmatch_check 0 failures on x86_64, aarch64,
+      riscv64 and `--nat`; its MIR checks skip by default (inline2 inlines
+      the functions), so checked by hand with inlining off: index_or,
+      div_or and count_found have no loads, stores or slot addresses in the
+      final MIR on 3 targets (6, 7, 6 with retfwd off). The script should
+      keep those functions out of line.
 - [x] LF25. A document listing each language fact the optimizer uses, the rule that
       guarantees it, and the test that breaks if the rule is broken (S).
       docs/reference/optimizer-facts.md.
@@ -1609,6 +2030,13 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       the function cache warm (-O2 compiler; front end 138, lower 185,
       mid-end 256, native 43 ms). Left: both targets; lowering and the
       mid-end are now most of it.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — the whole mid-end works only on what main reaches (e-graph
+      functions on hello `--nat`: 152 of 834; a sample 58/54 same), but an
+      uncached `emit hello --time` takes 1.0–1.2 s on a loaded machine
+      (iropt ~180 ms, lowering ~270, native code ~300). The check script's
+      "4 ms" was a cache hit, and its hello expectation is wrong. Left:
+      0.5 s, then 0.1 s.
 - [x] SP4. The checked stdlib cached in binary form, not re-parsed on every build
       (L).
       Competitive CS2: compiler.fd `astcache_*` + ast_ser.fd keep the merged
@@ -1626,7 +2054,13 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       (tests/nattools/par_emit_check.sh, par_emit_globals.py;
       docs/reference/parallel-emission.md). (CS5's `FID_PAR` splits the
       borrow check, SP9.)
-- [x] SP6. A per-function code cache: key = hash of the function's IR, the target,
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — par_emit_globals.py finds no module-state write from the
+      workers (603 functions); test_par_gen_threads and test_par_emit right;
+      par_emit_check 88 ok, its 4 failures out-of-memory builds that give
+      identical images when rebuilt; 1/4/8 threads identical on every
+      target, the par mutant caught. Not run: the PAR_BIG self-build timing.
+- [~] SP6. A per-function code cache: key = hash of the function's IR, the target,
       the options and the clobber/effect facts of what it calls (M).
       Competitive CS6: `FID_FNCACHE=<file>` (opt-in, nat_ir.fd): key = the
       whole IrFunction plus a salt of layouts, globals, externs, the
@@ -1641,19 +2075,44 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       callees' clobber masks and result conventions before it is replayed
       (docs/reference/native-fncache.md). The image layout of a hit is
       SP20's.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — the dependency records (nc_validate) work for
+      test_machine_fncache_deps (245 hits, hit == miss), but
+      machine_fncache_check fails 14: hit images differ from miss images for
+      test_machine_fncache and test_repro_fncache on 3 targets, and after a
+      one-function edit nothing is reused (0 hits, 240 compiled). Left:
+      reuse after an edit, hit == miss.
 - [~] SP7. Incremental relinking in memory: unchanged functions keep their bytes,
       only relocations are redone (M).
       On an FID_FNCACHE hit a function's bytes are replayed at the new
       offset and its fixups registered again (CS6). Left: in memory across
       builds (it is a file read by a fresh process), and only the changed
       functions placed again.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — relinking in memory works when the layout is kept (aarch64
+      build 4: 241 functions in place, 1 compiled again), but relink_check
+      fails 10: an edited program never reuses the kept layout ("a fresh
+      layout (the last build was of another target, cache or program)"),
+      149 of 241 unchanged functions move, and on x86-64 and `--nat` the
+      changed function goes after the others. Left: those (SP6's problem).
 - [ ] SP8. A one-line edit rebuilds in under 100 ms (with SP4–SP7) (L).
       ~0.5 s on hello with every cache warm (CS6, Nov 13).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      failed — `fid serve` builds after an edit re-check only what the edit
+      reaches (2 of 5 bodies) but take 0.9–2.0 s (release 1840/2023 ms,
+      debug 1241/899 ms on a busy machine), and the image after an edit
+      differs from a one-shot emit (sp8-edit-rebuild-check fails steps 2
+      and 3). Left: under 100 ms, the same image as a one-shot build.
 - [~] SP9. Front end in parallel per module where modules do not depend on each
       other (L).
       Competitive CS5: `FID_PAR=N` splits the borrow check's functions over
       N threads (opt-in; diagnostics as sequential), measured a net loss.
       Left: imports, type check and escape per module.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — the import closure is lexed in parallel: test_lex_par the
+      same over 10 runs, lex_par_bench 1013 ms on 1 thread to 255 ms on 8
+      (same tokens), imports_par_check ok. Left: parsing, type check and
+      escape per module in parallel.
 - [~] SP10. No linear scans anywhere in the compiler: every lookup by name or id is
       a table (release CS8) (M).
       Competitive CS8: instructions, functions, strings, structs, methods,
@@ -1662,12 +2121,32 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       scan was quadratic) and `pe_module_has_fn` go through fn_index
       (ir.fd `IrModule_fn_pos`, which rebuilds a stale index). Left:
       `IrModule_get_global`, the borrow checker's prefix queries (CS8).
-- [ ] SP11. Arena allocation for compiler data per function, freed in one step
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — both are tables now (IrModule_get_global through
+      global_index, borrowck.fd bc_borrow_on_prefix): test_borrow_prefix_index
+      right on 3 backends, 33 of 33 borrow/race _fail tests give their
+      errors, par_check ok. Left: linear scans in mono.fd (generic
+      functions and methods), lower.fd Lowerer_lower_vec_sret_call and the
+      typechecker.
+- [~] SP11. Arena allocation for compiler data per function, freed in one step
       (M).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — per-function arenas for the allocator (`FID_FN_ARENA=1`):
+      fn-arena-check 0 failures (321 windows back at their mark), and
+      FID_VERIFY=1 arena builds give the same images on 3 targets.
+      fn-arena-emit-check fails 3: the native emit of compiler/main.fd does
+      not finish (an iro_sccp overflow panic or out of memory). Left: that
+      comparison, the `--leaks` run of an arena compiler.
 - [~] SP12. Self-compile under 60 s, then under 10 s (M, then L).
       Competitive CS4: `dump-c compiler/main.fd` ~25 s wall with the -O2
       compiler (under 60 s). Left: under 10 s (lowering and C generation
       are ~22 s of it).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — the lowering changes keep their answers (test_sp12_lowering,
+      test_cow_names, test_stack_lower pass), but lowering is still
+      super-linear: sp12_scaling.sh 400 fails (N=400 -> 800 takes 3.8–4.6x,
+      limit 3.5). `check compiler/main.fd --time` takes 35 s; the dump-c
+      self-compile was not timed with this build (memory). Left: under 10 s.
 - [~] SP13. A debug mode with no mid-end and the fast allocator (RA14): 5x faster
       than release mode (S).
       `fid emit --debug`: no iropt, rules or e-graph (main.fd cmd_build);
@@ -1681,6 +2160,13 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       stores its byte buffers one byte per byte (iw_bytes/ir_bytes, file
       version 2; it wrote 8 bytes per byte, twice nested: a 357 MB cache).
       Left: the lowered-IR cache by default and lowering's fixed cost.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      failed — `emit --debug` is 1.7x faster than release (1100 vs 1867 ms
+      on a busy machine), not 5x. sp13-debug-cache-check fails 3 (its
+      `--stats` run gets no cache; release builds write caches since CB3),
+      and by hand an image from the warm cache after a one-line edit differs
+      from a `--no-cache` build (32,352 bytes; both run right). Left: 5x,
+      warm images equal to fresh ones, the lowered-IR cache by default.
 - [~] SP14. The e-graph bounded so the release mode stays within 2x of debug (S).
       Bounded: egraph.fd `EG_MAX_NODES` (20,000) and `EG_MAX_ROUNDS` (8).
       Left: the 2x measured (hello: e-graph 140 of 631 ms, CS1).
@@ -1695,8 +2181,15 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       checked against it, every push and pull request (the checked-in
       baseline stays a local machine's). Measured set: `fid emit --target
       x86_64-linux --time` on hello, test_hashmap, test_tasks.
-- [ ] SP16. The compiler itself built by our own backend and fast (bootstrap with
+- [~] SP16. The compiler itself built by our own backend and fast (bootstrap with
       `fid emit` instead of the C path) (L).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — machine_zero_words_check 0 failures and
+      test_midend_sra_inline_payload right, but machine_sp16_check fails 4:
+      the `--nat` front end still crashes (Parser_parse_unary_inner; right
+      with `FID_IROPT_OFF=sra`, so the ime_sra miscompile is still there),
+      the extern probe is not rejected, the x86_64-linux main stack
+      overflows. Left: those, then the compiler built by `fid emit`.
 - [x] SP17. Memory of a build under 1 GB for the compiler itself (M).
       Measured Nov 15: `fid check compiler/main.fd` peaks at ~550 MB —
       under 1 GB. (`dump-c` peaks higher through the 76 MB C text but a
@@ -1715,6 +2208,12 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       request); the back ends' flags are reset after each request
       (serve_reset_backend_state, which also turns `--remarks` off:
       iropt.fd iropt_clear_remarks); tests/tooling/serve-fncache-check.sh.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — serve-fncache-check (the second emit takes 239 functions
+      from memory, same image, no cache file, flags reset),
+      serve-build-check, serve-modcache-check and serve-socket-check pass (a
+      check through the server 360 ms vs 1556 ms one-shot).
+      docs/reference/serve.md does not describe the memory cache yet.
 - [ ] SP19. `fid check` and the LSP share the daemon's state (M).
       Not shared: the LSP keeps its own in-process stdlib (the same
       shortcut as `fid serve`), `fid check` starts a new process.
@@ -1724,6 +2223,14 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       miss and on a hit, and with FID_FNCACHE (not run yet). Left: running
       it; FID_FNCACHE hits relink replayed functions, so their images are
       not byte-identical (CS6).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      failed — builds are not byte-identical with the function cache on:
+      STRICT=1 repro-check fails ("x86_64-linux executable, fn cache hit =
+      off" differs for hello, test_repro_fncache, test_hashmap and
+      test_tooling_explain), and machine_fncache_check's hit images differ
+      from the miss images on 3 targets (25,603 bytes on x86-64); the hit
+      images run the same. The C compares, cache misses and the tail-call
+      summary part are byte-identical.
 
 ## Track RL — Reliability: trusted without decades (25)
 
@@ -1786,7 +2293,14 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       (`tv_structural`, VF6). Test `tests/bootstrap/test_ssa_validate.fd`.
       Left: run the suite with it on and triage each rejection; the module
       passes, licm and devirt are not hooked; `tests/verify/tv/` pairs.
-- [~] RL6. Translation validation for instruction selection: each selected
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — the before/after pairs work (tv-check: 56 pairs of
+      tests/verify/tv as expected, wrong expectations caught), but
+      `FID_VALIDATE=1 emit test_ssa_validate.fd` rejects inline2 on Str_drop
+      ("the blocks changed"; 1 rejected, 25 not checkable of 37), so
+      tv-check ends 3 failed. Left: triage that rejection (a miscompile or a
+      false alarm), the suite with validation.
+- [x] RL6. Translation validation for instruction selection: each selected
       sequence evaluated against its MIR operation on random values (M).
       Nov 16: under FID_VERIFY=1 every machine-layer build first runs
       nat_ir.fd `nat_sel_check`: each integer MIR operation (LI, MOV,
@@ -1803,6 +2317,13 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       build. Test program test_nattools_selcheck.fd, scripts/nat-tools-check.sh
       (not run yet). Left: floats, loads/stores, branches and calls.
       Related: `fid test-rules` checks the MIR rewrite rules (rules.fd).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — floats, memory, branches and calls are checked too
+      (nat_enc.fd NselM, nsel_exec_m): selcheck_more_unit 18 of 18 lines (12
+      of 12 mutants caught), test_nattools_selcheck 17/17 and _more 19/19,
+      nat-tools-check's RL6 section ok on 3 targets plus x86-64-v3 and
+      rva22u64. Vector ops, MO_ALUM/BRCCM/SETCCM/ALUMST and jump tables
+      stay outside, as documented.
 - [x] RL7. The allocation checker (RA15) on every build in CI (S).
       Nov 15: `natgate` job in .github/workflows/ci.yml runs
       `scripts/nat-gate.sh` (IR verifier + register-allocation checker via
@@ -1827,7 +2348,14 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       (docs/verification/rl9-rl25-checks-2026-11-17.md).
       Left: a recorded run with every reader installed; loading (running)
       each image is cross-test.sh's part.
-- [~] RL10. Fuzzing of the IR -> machine code path with random IR (not only random
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — dynamically linked ELF images carry .dynamic at PT_DYNAMIC
+      and pass image-lint and readelf on 3 Linux targets; image-lint-check 0
+      failed; image-check on hello 22 passed, 1 failed: the COFF object
+      (`codegen --coff`) does not build (LoadLibraryA, GetProcAddress,
+      FreeLibrary undefined). Left: the COFF path, a run with
+      llvm-readobj/objdump/dwarfdump installed.
+- [x] RL10. Fuzzing of the IR -> machine code path with random IR (not only random
       source), so backend bugs show without front-end limits (M).
       Nov 16: a whole module to a file and back (ir_ser.fd ir_module_save /
       ir_module_load: every table, the target it was lowered for); `fid emit
@@ -1853,6 +2381,13 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       of the same functions as source), tests/tooling/irfuzz-targets.sh
       (fuzz_ir.sh on every target, with and without `--mid-end`);
       docs/verification/rl10-irfuzz-2026-11-17.md. Left: the per-target runs.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — test_irfuzz_kinds all yes, irfuzz-mirror-check 120 values
+      PASS; 50 seeds per round (not 200) on x86_64-windows and x86_64-,
+      aarch64- and riscv64-linux, with and without `--mid-end`: every
+      failure was out of memory or a build that passed when retried.
+      irfuzz-targets.sh as committed cannot run the Linux rounds (CRLF, a
+      Git-Bash FID path, MIDEND=0 read as on); the doc's table is not filled.
 - [~] RL11. Mutation testing of the backend: a deliberately broken rule or pass
       must fail a test (L).
       `scripts/verify/variants.py mutate` (VF7) had mid-end mutants only, two
@@ -1910,7 +2445,14 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       now (it ran inside the allocator). Test: test_natabi_memcheck.fd;
       `NATIVE=<target> scripts/leak-check.sh` runs tests/leaks natively.
       Left: `--leaks` on pe_ir (the default Windows backend), and a run.
-- [~] RL17. Concurrency testing of the runtime: thousands of task and thread
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      failed — `--leaks` works on `--nat` and x86_64-linux (2 blocks, 128
+      bytes reported by place) and on C, but a pe_ir `--leaks` executable
+      dies at once with "Panic: Illegal instruction" (pe_leaks_leaky.fd):
+      pe_leaks_check fails 5, the pe_ir leak gate fails 10 of 10, and pe_ir
+      `--checked-alloc` with `--leaks` crashes the same way. Left: the pe_ir
+      wiring of the p_malloc/p_free thunks.
+- [x] RL17. Concurrency testing of the runtime: thousands of task and thread
       interleavings under a scheduler that picks randomly (L).
       Nov 16: FIDES_SCHED_RANDOM=<seed> in both native runtimes
       (pe_runtime/conc.fd, linux_runtime/conc.fd "Random-choice
@@ -1927,6 +2469,11 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       The interpreter interleaves since LG11. Not done: loop safepoints
       (fid emits no p_co_tick), enumerating every switch point. Mark [x]
       once tests/sched/sched-random-check.sh passes with this tree's fid.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — sched-random-check.sh passes with this tree's fid (N=300):
+      ccompile and emit give the right output for 300 seeds, 300 distinct
+      schedules in 300 seeds, a seed replays its schedule. Not run: native
+      Linux random runs (the script does not cover them).
 - [x] RL18. A public miscompile log: each bug, the pass, why the tests missed it,
       the test that now catches it (S).
       Done: `docs/verification/miscompile-log.md` — every entry names the
@@ -1963,6 +2510,13 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       prints "[iropt] <pass> <fn>" (iropt_me.fd ime_trace), which the report
       reads; FID_CRASH_TEST=iropt:<pass>[:<fn>] crashes there. Left: a run
       of tests/tooling/rl20-db7-check.sh (then [x]).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — crash reports name the stage, pass and function (the trace
+      names a pass and main; driver-goals-check's RL20 part ok, "reduced 23
+      -> 3 lines"), but rl20-db7-check fails: its sum_to is inlined, and the
+      Windows reduce watchdog runs `_fid_reduce_cmd.bat` by bare name, which
+      fails where cmd does not search the current directory (with that
+      unset, 1 try was stopped as it should). Left: those two.
 - [x] RL21. A reducer: shrink a failing program automatically while it still fails
       the same way (M).
       `scripts/fuzz/reduce.py`: it shrank programs on which two backends
@@ -2005,6 +2559,13 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       adapter (ConstFnRef gives C the address of a function that takes
       `__env` first), as pe_ir's c_adapters and the C path's `__c_fn_<f>`
       have.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — rl25_abi_lanes_check passes on C, pe and nat, the C cross
+      lanes (x86_64/aarch64/riscv64-linux, wasm32-wasi) and the native
+      records lanes on 3 Linux targets, but native x86_64-linux
+      test_verify_abi_c_mixed crashes in libc strtod (invalid memory access
+      at 0x8). Left: that; the aarch64/riscv64 dynamic lanes (no target
+      glibc here); the macOS lanes.
 
 ## Track DB — Debugging and visibility (10)
 
@@ -2036,6 +2597,13 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       the runtime's functions (merged from the binary artifact, no file
       recorded) and monomorphized instances get no rows; code inlined from
       another file keeps its lines but is in the caller's rows.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — library and mono files in line rows: test_nattools_lines_files
+      right; dbg_db1_files_check fails 12 of 18 with the default passes
+      (str_trim_start and lgf_count__* are inlined into main) and passes its
+      core and mono checks with `FID_IROPT_OFF=inline,inline2` on
+      x86_64-linux. Left: the check with the default compiler; runtime
+      functions now have rows, so dbg_run_check.py puts breakpoints in them.
 - [~] DB2. DWARF on Linux and macOS: line numbers, functions, frames (L).
       Nov 9: `.symtab`, DWARF 4 `.debug_info` (a compile unit, a subprogram per
       function) and `.debug_frame` in every native Linux executable; line tables
@@ -2047,7 +2615,14 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       scripts/macho-check.py). Left: DWARF on macOS (a `__DWARF` segment or
       a .dSYM with the same `.debug_info/line/frame`), `DW_AT_frame_base`
       and declaration lines in `.debug_info`.
-- [~] DB3. PDB / CodeView on Windows (L).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — decl lines are right with inlining off (dbg_decl_lines_check
+      0 failed on x86_64-linux, aarch64-macos and `--nat`), but with the
+      default passes it fails 19 on 6 targets: main gets the inlined
+      callee's `fn` line (56, want 76), and inlined functions have no
+      subprogram. Left: nat_dbg_decl_line from the function's own
+      declaration, test functions kept out of line, lldb and llvm-dwarfdump.
+- [x] DB3. PDB / CodeView on Windows (L).
       Done (Nov 15), first step on the default Windows backend: `fid emit`
       images carry a COFF symbol table after the sections (pe_ir_enc.fd
       `pe_append_coff_symbols`, filled by pe_ir.fd `PeirGen_append_symbols`:
@@ -2073,7 +2648,14 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       still the PDB and RSDS entry for Visual Studio and WinDbg (MSF
       container, DBI/TPI/IPI streams, S_GPROC32, C13 lines: what WinDbg
       reads, which cannot be checked without it); variables (DB4).
-- [ ] DB4. Locations of variables at `-O0`-like debug builds, in registers and
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — compiler/pdb.fd writes the PDB and an RSDS debug
+      directory: pe_pdb_check passes `--unit` (11 streams, 177 procedures,
+      C13 lines, GUID and age match), `--emit` on pe_ir (prog.pdb beside
+      prog.exe, lines agree with .debug_line) and `--emit --nat` (305
+      procedures, 5338 line rows); dbghelp reads them. pe_ir PDBs list only
+      functions with rows; no variables (DB4); WinDbg/VS were not run.
+- [~] DB4. Locations of variables at `-O0`-like debug builds, in registers and
       slots (L).
       (Checked Nov 15: not started. `.debug_info` has no DW_TAG_variable or
       DW_TAG_formal_parameter; the pieces exist — the IR's named locals
@@ -2081,6 +2663,13 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       and the allocation per vreg (`NatAlloc`), and RA14's fast mode keeps
       values that cross blocks in their slots — but no table from a source
       name to its slot or register per address range.)
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — the scope units pass (dbg_scopes_unit 22/22), but no real
+      image gets the lexical blocks: dbg_scopes_check fails on every target
+      ("shadow: 0 lexical blocks hold x, want at least 2"), `--debug` reads
+      the outer binding (x = 6, want 50), optimized main has 0 of 12 values
+      after inlining, and a cache hit changes the debug sections. Left: all
+      of that; gdb and llvm-dwarfdump runs.
 - [x] DB5. Panic and crash traces from frame records, no per-call bookkeeping
       (the C path, native Linux).
 - [~] DB6. Unwind information (Windows `.pdata`, DWARF CFI) so system debuggers and
@@ -2110,6 +2699,13 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       tests/nattools/db6_eh_check.sh (with tests/nattools/eh_frame_unit.fd),
       to be run on the first build that has them. Left after that: Windows
       `.pdata`/`.xdata` for `--nat`.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — .eh_frame/.eh_frame_hdr on x86_64, aarch64 and riscv64 Linux
+      (241 FDEs, found by libgcc, images run): db6_eh_check 44 ok, 7
+      failures: the x86-64 CFI says r14/r15 are saved where the prologue
+      stores nothing, and shrink-wrapped functions emit DW_CFA_restore
+      before any rule on all 3 targets. Left: those; pe_unwind_check for
+      the `--nat` .pdata was not run.
 - [~] DB7. `fid explain <function>`: the IR, the MIR after each stage, the machine
       code, side by side (M).
       Nov 15: `fid explain <file> --stages <fn> [--target t]` (also `fid
@@ -2135,6 +2731,13 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       symbol table through nat_pe_symbols, a Mach-O's LC_SYMTAB through
       macho_disasm). Left: a run of tests/tooling/rl20-db7-check.sh,
       scripts/tooling-check.sh and scripts/nat-tools-check.sh (then [x]).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — `fid explain --stages` disassembles: main is listed on
+      x86_64-linux (`<main>:`, `push rbp`), aarch64-macos, x86_64-macos and
+      `--nat` Windows; Mach-O disasm and the missing-function message work.
+      rl20-db7-check fails because its fixture sum_to is now inlined (no
+      `<sum_to>:` on any target). Left: a fixture function that stays out
+      of line, then that run; tooling-check and nat-tools-check.
 - [x] DB8. Optimization remarks: why a check stayed, why a call was not inlined,
       why a value spilled (`--remarks`) (M).
       Nov 16: the three reasons. Each kept check is listed with what the
@@ -2178,6 +2781,11 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       PeirGen_gen_entry_point, rooted in ir.fd pe_ir_needed_functions):
       FID_PROF at start on pe_ir, pending a run of db9-check. Left: a run on
       macOS, pprof protobuf output.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — db9-check passes for ccompile, `--nat`, x86_64-linux and
+      pe_ir `FID_PROF=1`, but fails 2: pe_ir folded stacks start at a wrong
+      root frame (`__c_fn_pe_console_ctrl;main;...`), so no stack begins at
+      main. Left: the entry point's symbol on pe_ir, macOS, pprof output.
 - [~] DB10. Symbol maps for every image we write, readable by `addr2line`-style
       tools (S).
       The symbol table (DB2). Checked Nov 15: Linux ELF (`.symtab`) and the
@@ -2196,6 +2804,13 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       tests/nattools/db10_check.sh (with tests/nattools/
       macho_dwarf_readelf.py), to be run on the first build that has them;
       once it passes, what is left is DB3's PDB.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — wasm names (206 functions) and Mach-O DWARF on both macOS
+      targets (295 subprograms, 5696 line rows, 295 FDEs) check out:
+      db10_check 19 ok, 3 failures: the units compare stderr build lines,
+      macho_dwarf_unit expects `lib/util.fd` where nat_dbg_written_path now
+      writes `util.fd`, and dbg-check.py fails on DB2's decl lines. Left:
+      those; lldb and llvm-dwarfdump --verify.
 
 ---
 

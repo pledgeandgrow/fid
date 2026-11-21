@@ -117,6 +117,15 @@ Everything else relies on these.
       (verify-weekly.yml `suite-fid`, Linux and Windows, normal and
       expected-fail). Left: its first results; on every push it is too slow.
       `tests/` parity is a local script today.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — the midend group's stage-0 part holds:
+      `scripts/stage0-names-check.sh` passes on its 14 files (and on all
+      494), and the frozen fidesc's `dump-ast` parses all 14 (ir_ser.fd
+      builds ExternDecl with ExternDecl_new). Left: A4 itself, the suite
+      run by fidesc's harness with fid as the compiler (normal and
+      expected-fail), still has no first result (not run: a multi-hour
+      job on a shared machine); the other groups' stage-0 blockers were
+      not checked.
 - [x] A5. `_fail` tests name the error they expect. Today any failure passes,
       so a test can reject a program for the wrong reason (M).
 - [x] A6. The effect, capability, region and safety tests in subdirectories run
@@ -296,6 +305,15 @@ the fastest build-to-native among compiled languages, and native code within
       `fid emit`, best of 3, against the compiler before D4/D13/D14:
       bench/fides fib 1358 -> 1274 ms, loop 8261 -> 5190 ms, sieve
       793 -> 723 ms.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — r8 and r9 are value registers of pe_ir's whole-function
+      allocator (PEIR_ALL_REGS 11, PEIR_ARG_VALUE_REGS, peir_ra_reg_ok):
+      test_pe_arg_regs prints its 7 values on run, emit and ccompile; in
+      d4_d13_pe_regs_check.sh all 118 programs give the same result with
+      r89, cswap and cprop on and off; main uses r8/r9 on 61 lines by
+      default, 0 with FID_PE_OFF=r89. Left: rcx and rdx as allocatable
+      registers (not started); the script's disasm check fails because
+      mix12 is inlined into main; no benchmark run.
 - [x] D5. Inlining of small functions at IR level (M).
       Done Nov 4: compiler/iropt.fd inlines single-block functions of up to 16
       instructions.
@@ -335,6 +353,14 @@ the fastest build-to-native among compiled languages, and native code within
       Measured Nov 6: 3.2–3.7 s (front end 2.2 s, then lowering and codegen of
       the whole stdlib). Left: the checked stdlib cached in a binary form
       (competitive CS2) and lowering only what is reached.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — `d9-emit-time-check.sh` (RUNS=3) passes: the cache key is
+      the executable's hash on a development build, and pruned and
+      unpruned emits match `fid run` on 5 programs. On a busy machine: a
+      fresh emit of hello 1.6 s, a rebuild after an edit 1.3 s, up to date
+      0.28 s. Left: the 0.5 s target (the lowered stdlib is not cached); a
+      RELEASE=1 build (the `src-` cache key); cross-test x86_64-windows and
+      x86_64-linux against FID_PE_PRUNE=0.
 - [x] D11. Per-call cost on the C path (M). Functions no longer push and pop a
       call-stack array: panic traces walk the machine stack (unwind tables on
       Windows, `_Unwind_Backtrace` elsewhere; `zig cc` off Windows links
@@ -357,6 +383,16 @@ the fastest build-to-native among compiled languages, and native code within
       r`) instead of through rax and rcx, and loads and stores of a local in
       a register are one move. Left: comparisons and branches on registers,
       and copy propagation between the moves that remain.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — compares on slots, the constant-left swap (peir_op_commutes,
+      peir_mirror_op, PEIR_CONST_LEFT_SWAP) and copy propagation
+      (PeirEnc_mov_rr_cp) work: test_pe_cmp_forms prints its 9 lines on
+      run, emit and ccompile, d4_d13_pe_regs_check.sh gives 118 same of
+      118, and main disassembled by hand has 0 'mov eax, 0x4' by default
+      (6 with FID_PE_OFF=cswap) and 0 repeated or undone moves (11 and 12
+      with FID_PE_OFF=cprop). Left: the script's 3 disasm checks fail (the
+      test functions are inlined into main); bench/check.sh not run; the
+      earlier remainders (D6 on this path, a full allocator, OP16).
 - [x] D14. `Vec` elements at their real size (L). Stage A done: one `Vec`
       implementation, core's. Every backend's `p_vec_*` builtins run core's
       `Vec_*` functions; on native and the interpreter they disagreed with it
@@ -512,7 +548,7 @@ compiler.
 - [x] F2. `fid` builds and bootstraps itself on Linux, in CI (M). Green on Nov 2.
 - [x] F3. Install archives tested on a clean Linux machine: a clean Ubuntu
       container in CI (S). Green on Nov 2.
-- [~] F4. Native ELF path for `fid`: an IR→ELF backend sharing the x86-64
+- [x] F4. Native ELF path for `fid`: an IR→ELF backend sharing the x86-64
       encoder with `pe_ir` (L).
       First step Nov 6: `fid emit --elf` (or `--target linux`) writes a
       static Linux x86-64 executable from pe_ir's code generator, the same
@@ -536,6 +572,13 @@ compiler.
       runtime (it did not: every program using `task_pool_call` failed to
       build through C, on Windows too). `fid` on a Mac is no longer taken for
       Windows (`host_os()` in main.fd).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — the native Linux path reads a directory as `fid run`
+      does (linux_runtime/base.fd pert_file_read gives None for S_IFDIR,
+      sys.fd pert_file_size -1): test_read_dir_none (5 lines),
+      test_files_spec (104 lines) and test_runtime_empty_file (4 lines)
+      built with `emit --target x86_64-linux` and run in WSL match `fid
+      run`. compiler/elf64.fd and linker.fd stay unused.
 - [~] F5. macOS x64 and ARM64 through C, in CI (M).
       Nov 20: macos.yml runs the whole suite on macos-15 and macos-15-intel
       runners — the stage-0 bootstrap fix got it past the build, and a
@@ -643,6 +686,15 @@ compiler.
       10 did not build, 21 without reference; the sampled failures
       (test_drop, test_int_width, test_deref_minimal) predate Nov 15 and the
       rest are not triaged. cross-test.sh needs a relative OUT under WSL.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — `tests/nattools/f8_static_prims_check.sh` passes (hello,
+      test_threads and test_tasks static, no runtime import, right on
+      x86_64, aarch64 and riscv64 under qemu-user). `NATIVE=1
+      cross-test.sh` on a 61-test sample (every 20th suite test): aarch64
+      54 passed, riscv64 55, x86_64 54, 0 failed on each; the 4-5 that did
+      not build are refused by `fid run` too, need bare-metal builtins, or
+      ran out of memory on the busy machine (rebuilt, they match). Left:
+      the full suite on the three targets with no FID_NAT_OFF switch.
 - [~] F9. WASM: globals, struct copies, collections (L).
       Nov 7, through C: `fid ccompile --target wasm32-wasi -o x.wasm` (zig cc,
       WASI preview 1) and `node scripts/wasm-run.mjs x.wasm` run the sample
@@ -676,6 +728,16 @@ compiler.
       no system crypto or TLS library). Native `fid wasm`: tasks switch
       stacks, structured control flow (TG16), fixed-array checks (CI5).
       Left: the full suite run on both paths.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — the WASI C path: test_wasi_c_words, test_vec_f64,
+      test_int_width and test_spawn_vec_copy match `fid run` under Node.
+      Native `fid wasm`: those 4 and test_wasm_control_flow match,
+      task-switch-check 3/3, stackify-check 10/10, and a 40-test sample of
+      wasm-test.sh gives 35 passed, 2 failed, 1 not built, 2 skipped.
+      Left: the full suite on both paths; `fid wasm` returns structs from
+      function values wrong (test_fix_fnval_struct_ret prints wrong values,
+      then 'Invalid memory access'); p_volatile_load16/store16 are missing
+      in `fid wasm`.
 
 **Acceptance:** Windows, Linux and macOS are fully supported at 1.0.0, on x64 and
 ARM64 where the system runs there; RISC-V and WASM pass the suite.
@@ -955,6 +1017,18 @@ Nothing here is ready to protect real data yet. Do not write new primitives.
 - [~] K10. `@cfg` and `@simd` work on `fid` as on `fidesc` (M).
       Done Nov 4 for `@cfg` in `fid` (platform/os, arch, debug/release; test_cfg
       on all backends). `@simd` not compared.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — the native paths act on `@simd` (nat_ir.fd ng_vz_guard,
+      ng_vz_simd_kind): test_simd_native prints its 14 lines on run,
+      ccompile and every native image, and the overflow tests panic. But
+      `tests/nattools/simd_native_check.sh` fails 20 checks (77 ok) on
+      every target: the default inline2 pass inlines the `@simd` functions
+      into main, which is not `@simd`, so nothing is vectorized (with
+      FID_IROPT_OFF=inline,inline2, add_into, sub_k and diff are), and the
+      checked reduction sum_i is vectorized only with ssa off too. Left:
+      keep `@simd` across inlining (or do not inline such functions),
+      handle the SSA form of the reduction, then the check with the
+      default passes.
 - [x] K11. A language reference that matches both compilers, with the differences
       closed (M).
       Done Nov 4: docs/reference/reference.md, written from the compiler source,
@@ -1014,6 +1088,16 @@ Tested on Nov 1, native build:
 - [~] M2. `p_malloc`, `p_free`, integer-to-pointer casts and `extern "C"` calls
       need `unsafe`, or `@unsafe` on the function. Done in the program itself;
       imported modules wait for M10 (M).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — a program file that declares `module x;` and the user
+      modules it imports are held to the rule (g_tc_program_module,
+      tc_note_program_file): test_frontend_unsafe_module_decl_fail and
+      test_frontend_unsafe_import_fail are refused with their texts,
+      test_frontend_unsafe_module_decl prints 42 / 7 on the three
+      backends; of the 422 expect-error tests 408 pass `fid check` and the
+      14 others fail the same way with the previous compiler; no positive
+      test is refused for `unsafe`; `check compiler/main.fd` is clean.
+      Left: the stdlib's own modules, with M10; tier1.sh not run.
 - [x] M3. The allocator marks freed blocks in their header and panics on a double
       free or a pointer it never handed out. A second free after the block was
       reused cannot be told from a valid one, and frees the new owner's block:
@@ -1067,6 +1151,19 @@ Tested on Nov 1, native build:
       Done: `fid audit <file.fd>` lists the `unsafe` code a program reaches with
       its `// SAFETY:` comment. Left: those comments in the stdlib (core alone
       has 174 blocks without one).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — calling an `@unsafe` function needs `unsafe` in the program
+      and its user modules (g_tc_unsafe_fns, tc_note_unsafe_fns): the 5 new
+      _fail tests are refused with their texts, test_unsafe_call_ok and
+      test_unsafe_raw_apis run on the three backends, `audit hello.fd
+      --stdlib --strict` reports 0 sites without a SAFETY comment, and
+      check-stdlib.sh's 5 failures (lidar, packet, pointcloud,
+      static_serve, transform3d) are the previous compiler's too, none
+      about `unsafe`. Left: 26 stdlib `unsafe` blocks with no SAFETY
+      comment (spi.fd 7, gpio.fd 5, vmm.fd 4, i2c.fd 3, framebuffer.fd 2,
+      regmap.fd 2, x86_cpu.fd 2), which `fid audit` misses because it lists
+      reached code only; calls through function values and methods of
+      generic structs are not checked; tier1 not run.
 - [x] M11. An owned and a borrowed string type, so a server frees its request
       strings without a promise: `http_serve_scoped` is `@unsafe` until then (L,
       after M4).
@@ -1131,6 +1228,15 @@ project with packages and editor help. Checked Nov 1:
       of test programs, that formatting is stable, keeps every comment in
       order (`scripts/fmt-comments.py`) and the program prints the same under
       `fid run`. Left: a green CI run.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — fmt-check.sh's fixtures pass; on a scratch copy the
+      formatter repair leaves no file in compiler/ and stdlib/ (runtimes
+      included) failing or changing tokens, the formatted tree builds a
+      compiler that runs hello, and `LIMIT=30 fmt-check.sh` on it passes
+      (483 files formatted, 28 programs run and compared). Left: the repair
+      is not applied in the repository: compiler/cparser.fd still has
+      `module` and `use` on one line and `fid fmt --check` fails on it, so
+      fmt-check.sh and CI's step fail on the committed tree.
 - [~] N5. `lint` runs in CI and is clean on the stdlib (S).
       Done (Nov 15): `scripts/lint-check.sh` lints every stdlib module in CI
       (it linted 5 examples only) and classes each clean / warnings /
@@ -1193,6 +1299,16 @@ project with packages and editor help. Checked Nov 1:
       with -g (competitive TL5), so gdb/lldb on a C build shows .fd lines;
       a panic also prints the failing frame's values (complaint CE8). Left:
       pe_ir's CodeView/PDB, variable locations, a check with a debugger.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — pe_dbg_vars_check.sh: 9 passed, 3 failed. --debug builds
+      are right (DWARF decoded, pe-dwarf-check, a scripted debugger run
+      reads 25 of 25 values, with steps and function breakpoints), and -g
+      output and its pe-dwarf-check pass; objdump in WSL reads the
+      sections with no warning (the script's own objdump step fails on a
+      Git Bash path). Left: -g (optimized) shows wrong values for main's
+      locals (total = 0, want 45), and inlined functions' lines have no
+      rows; with FID_PE_DEBUG_RA=1 parameters show as optimized out; no
+      gdb/lldb session (not installed).
 - [~] N10. `docs/stdlib/` is generated by `scribe` and published with each release
       (M).
       Done (Nov 15): `scripts/stdlib-docs.sh` regenerates docs/stdlib/ with
@@ -1243,6 +1359,14 @@ project with packages and editor help. Checked Nov 1:
       exit): `fid version` prints `commit:` and `built:` from them, with no
       stamp file needed beside the binary. Left: the CI install test's first
       run, the version number (2f.9).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated for the version — n12-version-check.sh passes (15 ok):
+      `fid version`, `--version` and `-V` print 'fid 1.0.0+dev
+      (self-hosted Fides compiler)', compiler/ has no 0.8.0-unstable
+      literal left, build-info.sh writes the version (FIDES_VERSION or
+      VERSION), commit and source hash, and `--reset` restores the file.
+      Left: install and update on a clean machine in release.yml's CI
+      (needs its runners).
 - [x] N13. Contributor basics: contribution guide, issue templates, release notes,
       a security contact (S).
       Done: CONTRIBUTING.md; .github/ISSUE_TEMPLATE/ (bug report, feature

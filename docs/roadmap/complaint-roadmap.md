@@ -35,14 +35,37 @@ The ten that matter most, in order:
 
 ## Track CB — Building and compiling
 
-- [ ] CB1. **"Compiling takes forever"** (Rust, C++, Scala, Swift). Seconds for a
+- [~] CB1. **"Compiling takes forever"** (Rust, C++, Scala, Swift). Seconds for a
       large project, not minutes: fast type checking, a cached stdlib, parallel
       and incremental builds (competitive CS1–CS9) (XL).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — the on-disk import cache works (cb1-impcache-check.sh: 20
+      ok; cold parses and saves, warm hits, the same dump-c with the cache
+      off and warm, an edited or damaged cache is parsed again). Left: its
+      one FAIL is a stale test (the core artifact is version 4, the test
+      wants 3); the self-compile and timing steps were not run (out of
+      memory); fast type checking, parallel and incremental builds.
 - [~] CB2. **"I wait for the whole build to see one type error"** (Rust, C++).
       `fid check` type-checks with no code generation. Left: under 50 ms after an
       edit in a large program (M).
-- [ ] CB3. **"Incremental builds are not incremental"** (C++, Rust). A one-line
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — `fid serve` checks only the bodies an edit touches
+      (cb2-incremental-check.sh PART=A: PASS, 0 to 4 of 7 bodies per edit,
+      the same errors as a full check); serve-modcache-check.sh PASS.
+      Left: PART=B (compiler/main.fd under `fid serve`, the 50 ms target)
+      not run (machine out of memory); serve-socket-check.sh failed only on
+      its timing step, on a busy machine.
+- [~] CB3. **"Incremental builds are not incremental"** (C++, Rust). A one-line
       change rebuilds one function, not the crate (competitive CS6) (L).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — the mid-end memo is on by default and reruns only `tri main`
+      after the one-line edit of test_cb3_one_edit.fd; nat_ir hits all 308
+      functions on a warm build; outputs are right. Left:
+      cb3-incremental-check.sh fails 3 checks: pe_ir's function cache misses
+      1 function on an unchanged rebuild and 2 after the edit (want 0 and
+      1), and nat_ir re-emits pe_win_dl_load/find/unload/call on every warm
+      build. The front end still runs on the whole program (~1.0 s wall per
+      edit through pe_ir).
 - [~] CB4. **"CMake, Makefiles, build.rs: a second language just to build"** (C,
       C++, Rust). One command, `fid build`, no build scripts; native Windows
       executables need no linker. Left: the same on Linux and macOS (L).
@@ -53,6 +76,13 @@ The ten that matter most, in order:
       suite run: tests/tooling/build-host-suite.sh (PASS-NATIVE /
       PASS-FALLBACK per test against `fid run`). Left: run it on Linux and
       macOS and record the counts here.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — on Windows `fid build hello.fd` runs and
+      build-no-toolchain-check.sh passes. Left: what CB4 adds needs a
+      Linux-built fid, which was not made (out of memory): the host
+      fallback to C, the Linux steps of build-no-toolchain-check,
+      build-host-suite.sh, FID_NAT_REJECT=1 in WSL, and the macOS run. A
+      panic in the machine layer is still not caught.
 - [~] CB5. **"Cross-compiling needs a toolchain per target"** (C, C++, Rust).
       `fid build --target linux-arm64` from any host, nothing to install
       (competitive TL6) (L).
@@ -97,6 +127,13 @@ The ten that matter most, in order:
       in imported modules (only the built file is searched); the native
       backends (pe_ir's missing DLL export is already a Fides error,
       test_pe_dll_nofn_fail.fd).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — ccompile and an x86_64-linux build report the missing C
+      function as `error: link: ...` with its `-->` declaration line
+      (cb9_native_link_check.sh marks these FAIL only because of its own
+      grep: it needs `grep -qF -- "$LOC"`). Left: --nat Windows and both
+      macOS targets build such a program with no error (it exits 127 at
+      run time); fix the script's grep and its WSL library copy.
 
 ## Track CM — Memory and safety
 
@@ -119,7 +156,7 @@ The ten that matter most, in order:
       compiler/borrowck.fd). Tests: `test_borrowck.fd` (`&p.x` with `&p.y`,
       `f(&mut t, &t)`) and `test_frontend_disjoint_borrows.fd` (`swap(&mut
       p.a, &mut p.b)`, `v.push(v.len())`).
-- [~] CM3. **"Is this a move or a copy?"** (Rust, C++). One rule for `Vec`, `str`
+- [x] CM3. **"Is this a move or a copy?"** (Rust, C++). One rule for `Vec`, `str`
       and `HashMap`, checked by the compiler (release M4, M5) (L).
       Decided (M4, proposal 0001): copy-on-write. Left (M5): the lowering is
       behind `LOWER_COW`, off (the compiler compiling itself runs out of
@@ -127,6 +164,12 @@ The ten that matter most, in order:
       existing Vec takes its own owner, so `var b = a; b.push(2)` leaves `a`
       as it was (checked on the interpreter, competitive LG1); what is left
       is the M5 decision and its compiler check.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — s5_3_copy_then_change.fd and test_spawn_mutate_both.fd
+      pass on run, ccompile and emit; `LOWER_COW` is left only in comments
+      of compiler/lower.fd; the M5 decision is
+      docs/proposals/0006-m5-ownership-replaces-cow.md (ownership replaces
+      copy-on-write). Leak gate: 10 programs, 0 failed.
 - [x] CM4. **"Integer overflow is undefined, or silently wraps"** (C, C++, Go,
       Rust in release). Every integer operation means the same on every backend,
       and overflow panics in every build unless `@wrapping` says otherwise.
@@ -149,13 +192,20 @@ The ten that matter most, in order:
       Done: `fid run --leaks` (and `fid ccompile --leaks`) reports at exit the
       blocks never freed, grouped by the functions that allocated them
       (`make_node <- build <- main`). Left: line numbers; `fidesc`.
-- [~] CM9. **"Use after free only shows up in production"** (C, C++). A checked
+- [x] CM9. **"Use after free only shows up in production"** (C, C++). A checked
       allocator mode poisons and keeps freed blocks (release M7) (M).
       Done: `fid run --checked-alloc`: each block on its own pages ending at an
       inaccessible page; a freed block's pages become inaccessible and are never
       reused, so a use after free or a write past the end faults at that access,
       with the trace. `fid emit --checked-alloc` (native) written Nov 4, not
       run. Left: running the native mode; naming the block in the report.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — tests/checked_alloc/run.sh on pe_ir: 5 passed; the report
+      names the block, the offset and where it was allocated. The
+      x86_64-linux binaries, run inside WSL, print the full reports
+      (`allocated in make_block <- fill`) and exit 1. run-linux.sh still
+      shows 2 failures on a Windows host: WSL writes stdout over the start
+      of stderr in its 2>&1 file; redirect inside `wsl -e sh -c`.
 - [~] CM10. **"`unsafe` hides everywhere in my dependencies"** (Rust, Go, C#).
       `fid audit` lists every `unsafe` block reachable from a program, with its
       written justification (release M10) (M).
@@ -209,7 +259,7 @@ The ten that matter most, in order:
 - [~] CE4. **"Compiler errors I cannot read"** (C++ templates, Rust generics, Scala
       implicits). Every error has a code, the source line, and a `Fix:` line.
       Left: a test for each error message (competitive TL2) (L).
-- [~] CE5. **"The compiler knows the fix but makes me type it"** (most).
+- [x] CE5. **"The compiler knows the fix but makes me type it"** (most).
       `fid fix` applies suggested fixes (competitive TL3) (M).
       Checked Nov 15: `fid fix <file> [--check]` exists (compiler/main.fd
       cmd_fix over lsp.fd fix_suggestions, also the editor's quick fixes):
@@ -217,13 +267,24 @@ The ten that matter most, in order:
       and now a call of a `@deprecated(use = ...)` function (CU3); a fix is
       kept only when it leaves fewer errors. Left: the other `Fix:` lines
       (most diagnostics print one that no fix applies yet).
-- [~] CE6. **"Cascades: one mistake, two hundred errors"** (C++, Java). After a
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — fix-more-check.sh PASS (75 ok: snake_case renames of
+      variables, parameters and functions, fields left out of a literal;
+      each fixture checks and lints clean after `fid fix` and prints what
+      it should; no rename onto a name in use); fix-tl3-check.sh PASS. By
+      design methods and pub functions are not renamed.
+- [x] CE6. **"Cascades: one mistake, two hundred errors"** (C++, Java). After a
       first error, dependent errors are suppressed (M).
       Done in `fid`: an undefined name is reported once per function, and an
       operand whose error is reported adds no arithmetic error. Nov 15: an
       unknown struct literal is reported once per function, with its line
       (`test_frontend_cascade_struct_fail.fd`). Left: the same in `fidesc`
       (frozen), more dependent errors.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — tests/cascade/check.sh ok for the never, call, struct and
+      type fixtures, each one error on every backend; an annotation naming
+      an unknown type is one error. Known gap: `val a: Foo = mk()` with
+      `fn mk() -> Foo` is still accepted. fidesc is frozen.
 - [x] CE7. **"No stack trace in release builds"** (C, C++, Rust without
       `RUST_BACKTRACE`). Panic traces in every build, at no cost per call.
 - [~] CE8. **"A crash report without the values that caused it"** (most). A panic
@@ -239,6 +300,13 @@ The ten that matter most, in order:
       Left: the native backends (pe_ir, nat_ir: from the frame layout and
       DB4's variable locations); a panic caught by a longjmp leaves the
       callee's record current until the next call.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — `ccompile -g` prints `values in ratio:` with all five
+      values, ce8_embed_dbg passes, and by hand `emit --debug -g --target
+      x86_64-linux` prints them too. Left: pe_ir (the default Windows emit)
+      prints no values (not written); in optimized -g or FID_NAT_FRAMES=1
+      builds ratio is inlined and its frame lost (frame_values_check.sh: 8
+      failures); the script's qemu rows put the env assignment after qemu.
 - [~] CE9. **"Error messages that blame the library, not my call"** (C++, Rust
       generics). An error inside a generic function is reported at the call site
       that chose the types (M).
@@ -262,7 +330,7 @@ The ten that matter most, in order:
 
 ## Track CA — Async and concurrency
 
-- [~] CA1. **"Function colouring: async infects everything"** (Rust, JS, Python,
+- [x] CA1. **"Function colouring: async infects everything"** (Rust, JS, Python,
       C#). Any function runs inside a task and suspends where it waits; callers
       do not change (L). Done (release H9): an `async fn` with `f64` or struct
       arguments or results runs as a task on the interpreter and C paths.
@@ -272,6 +340,11 @@ The ten that matter most, in order:
       wait (LG11, compiler/interp.fd "Interleaved tasks"; tests
       test_async_suspend, test_async_first_wait); async methods in impls
       and traits (LG14, test_lowering_async_method).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — test_async_first_wait, test_async_suspend and
+      test_lowering_async_method print the same on `fid run`, ccompile and
+      emit (pe_ir), matching their Expected blocks. Not rerun here on --nat
+      or the Linux targets.
 - [x] CA2. **"Which async runtime: tokio or async-std?"** (Rust). One runtime,
       in the standard library, used by every library (M).
       Done: `stdlib/pe_runtime/conc.fd` is the only task runtime — workers,
@@ -286,7 +359,7 @@ The ten that matter most, in order:
       (test `diagnostics/err_send_spawn.fd`).
 - [ ] CA4. **"Deadlocks in production"** (Go, C++, Java). Lock order checked across
       the call graph at compile time; a cycle is an error (L).
-- [~] CA5. **"Data races"** (Go, C++, Java). Code reached from `spawn` cannot share
+- [x] CA5. **"Data races"** (Go, C++, Java). Code reached from `spawn` cannot share
       mutable state unchecked (release H3) (L).
       Done: every argument of a spawned call must be `@send`; raw pointers and
       references are not (`test_race_ptr_fail`); a global is not written from
@@ -295,7 +368,12 @@ The ten that matter most, in order:
       frees the copies for any one-word result, str/Vec/map included
       (tests test_spawn_mutate_both, test_await_spawn_collections,
       tests/leaks/spawn_args.fd, await_results.fd).
-- [~] CA6. **"Goroutine and task leaks"** (Go, JS). Structured concurrency: a task
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — leak-check.sh: await_results and spawn_args ok, 0
+      failed; test_await_spawn_collections and test_spawn_mutate_both match
+      their Expected output on run, ccompile, emit and x86_64-linux (WSL).
+      AArch64/RISC-V not run.
+- [x] CA6. **"Goroutine and task leaks"** (Go, JS). Structured concurrency: a task
       cannot outlive the scope that started it unless detached by name
       (competitive LG11) (L).
       Checked Nov 15: `spawn scope { ... }` exists in the language (parser
@@ -303,7 +381,15 @@ The ten that matter most, in order:
       the end, `p_executor_run_all`; `test_spawn_scope.fd`). Left: a bare
       `spawn` outside a scope is accepted and can outlive its caller (no
       check, no named detach).
-- [~] CA7. **"Cancellation is an afterthought"** (Go contexts, JS AbortController).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — test_spawn_detached, test_spawn_unjoined_fail,
+      test_spawn_unjoined_handle_fail and test_spawn_scope pass on run,
+      ccompile and emit: a task never awaited, joined or detached is one
+      E084 error, and `spawn detached f(x)` names a detach (its exes ran 5
+      times each with no hang, also on x86_64/aarch64-linux). Known limits:
+      a spawn stored into an existing variable, shadowed names and direct
+      async calls are not followed.
+- [x] CA7. **"Cancellation is an afterthought"** (Go contexts, JS AbortController).
       Every task can be cancelled, and every wait respects it (L).
       Checked Nov 15: `cancel scope;` cancels the pending tasks of the
       innermost scope (lower.fd `Stmt::CancelScope`, `p_executor_cancel`;
@@ -319,6 +405,12 @@ The ten that matter most, in order:
       mid-way would skip the drops of what it owns. Left: the waits are
       library functions, not every builtin wait (sync_channel_recv,
       p_co_sleep keep ignoring tokens).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — tests/cancel/check.sh: all checks passed
+      (test_task_wait_cancel and send_full on the interpreter, ccompile,
+      emit, --nat and x86_64-linux). Every runtime has the per-task token
+      (p_task_token/p_task_set_token) that the builtin waits test.
+      AArch64/RISC-V and OS thread joins not checked.
 - [~] CA8. **"Timeouts are bolted on"** (most). `timeout(ms) { ... }` around any
       block that waits (M).
       Checked Nov 15: library timeouts only — `task_join_timeout(t, ms)`
@@ -337,8 +429,19 @@ The ten that matter most, in order:
       p_task_token/p_task_set_token/p_clock_mono_ms builtins; test_
       timeout_block.fd documents that a stage-1-built fid still gives
       tasks 1 MB stacks (a messaged panic in the recursive drop).
-- [ ] CA9. **"Async stack traces are useless"** (Rust, JS, C#). A panic in a task
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — test_timeout_block (15 lines), test_timeout_block_type_fail
+      and test_timeout_name pass on run, ccompile and emit; the per-task
+      token builtins are in every runtime. Left: not run on --nat or the
+      Linux targets; that waits which are not cancellable
+      (sync_channel_recv, p_co_sleep) see the block's token is not checked.
+- [x] CA9. **"Async stack traces are useless"** (Rust, JS, C#). A panic in a task
       shows the chain of tasks that awaited it (M).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — tests/cancel/check.sh: the panic's task chain is printed
+      by emit (pe_ir), emit --nat and x86_64-linux builds (the C runtime's
+      was done earlier); pe_ir's p_panic calls pert_task_chain and
+      linux_runtime/conc.fd has pe_co_print_chain. AArch64/RISC-V not run.
 - [~] CA10. **"Blocking call in async code freezes everything"** (Rust, JS,
       Python). The effect system knows which calls block; a blocking call inside a
       task is an error or runs on a worker thread (M).
@@ -394,9 +497,18 @@ The ten that matter most, in order:
       with `<name>.snap` beside the test; `fid test --update` writes it. A
       missing snapshot fails with "run fid test --update to write it";
       verified missing→fail, --update→write, re-run→pass.
-- [ ] CT6. **"I can't debug a release build"** (C++, Rust). Line tables and
+- [~] CT6. **"I can't debug a release build"** (C++, Rust). Line tables and
       variable locations in optimized builds, readable by standard debuggers
       (release N9) (L).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — with FID_PDB=0 the --nat checks vars-debug, run-opt (6289
+      line rows), run-debug and run-g pass; a --debug Linux image has every
+      function with parameters, variables and DW_OP_fbreg locations; all
+      program outputs are right. Left: in optimized builds main's
+      DW_AT_decl_line comes from inlined code and loop locals have no
+      location (scale.acc/step); the checks fail by default (no room for
+      DB3's .buildid, test functions the inliner now removes,
+      dbg_run_check.py matches a line without its file); gdb not run.
 - [ ] CT7. **"The bug only happens in production"** (all). Record the inputs every
       effect brings in; replay the run exactly, in the interpreter, step by step (L).
 - [~] CT8. **"Coverage needs another tool"** (C, C++, Go before 1.20). `fid test
@@ -407,8 +519,22 @@ The ten that matter most, in order:
       three by-value copies that double-freed (`fid veil` crashed on any
       program). Left: `fid test --coverage` still double-frees when the
       covered program panics — one more shared-owner site (known-bugs 2g.30).
-- [ ] CT9. **"Debugger shows mangled names and optimized-out values"** (C++, Rust).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — test-coverage-check.sh: 13 ok, with branch coverage, and a
+      panicking program is covered with no double free. Left: its one FAIL
+      is the script: the report says `test_sign 2 2 100.0% OK` and the regex
+      wants 1/1; fix the regex. Known limit: tests after a panicking one are
+      not covered (all tests run in one process).
+- [~] CT9. **"Debugger shows mangled names and optimized-out values"** (C++, Rust).
       Debug info names Fides functions and types as written (M).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — Mach-O images have __debug_frame and .debug_info,
+      macho_dbg_types_unit matches, and with FID_IROPT_OFF=inline,inline2
+      the names checks pass on aarch64-macos, x86_64-macos and --nat. Left:
+      by default the inliner removes Point::len2 and scale, so
+      dbg_ct9_check.sh fails (keep the test functions out of line, or emit
+      DW_TAG_inlined_subroutine); locals of optimized -g builds have no
+      location; lldb not run.
 - [x] CT10. **"printf debugging needs a recompile"** (all compiled languages).
       `fid run --trace fn_name` prints each call to a function with its arguments
       and result, no code change (M).
@@ -435,12 +561,25 @@ The ten that matter most, in order:
       `test`/`audit`/`update` check them by a scan of each pact's text
       (ark.fd `ark_cap_check`; `ark update` prints the diff). Left: a run
       of its checks, then [x].
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated for direct builds — cd1-direct-caps-check.sh PASS (23 ok:
+      run, check and build fail naming the pact and the path down to the
+      builtin; a granted pact builds; an unlisted pact gets nothing;
+      vendored pacts are checked; FID_ARK_CAPS=off skips it). Left: the
+      capability diff on upgrade (`ark update`) was not checked; fs/env
+      reached through a function value is not seen.
 - [~] CD2. **"I need fifty packages for basic things"** (Rust, JS). A standard
       library that covers HTTP, JSON, TLS, regex, time, CSV, compression and more,
       each tested on every backend. Left: depth (competitive SL track) (L).
-- [ ] CD3. **"`node_modules` is bigger than my program"** (JS). Dependencies are
+- [x] CD3. **"`node_modules` is bigger than my program"** (JS). Dependencies are
       fetched once per machine, shared, and only the functions a program uses end
       up in the binary (M).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — ark-features.sh PASS: one shared checkout per commit in
+      the cache, linked into each project's ark_modules and unshared on
+      update; cd3-reach-c-check.sh PASS: an unused pact function's body is
+      neither in the C nor in the binary. Not checked on Linux or macOS
+      (the symlink path).
 - [ ] CD4. **"Diamond dependencies: two versions of the same library"** (Rust,
       Java). One version per library in a build; a conflict is reported with both
       paths and the newest version that satisfies both (M).
@@ -486,9 +625,15 @@ The ten that matter most, in order:
 
 ## Track CU — Upgrades and stability
 
-- [ ] CU1. **"Upgrading the language breaks my code"** (Python 2→3, Scala 3,
+- [x] CU1. **"Upgrading the language breaks my code"** (Python 2→3, Scala 3,
       Swift). `fid fix --edition` migrates code between editions (competitive
       TL3, ST3) (L).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — fix-edition-check.sh PASS (42 ok): `fid fix --edition
+      2027` states the edition once, the file checks clean in 2027 and
+      prints what it should, a second upgrade changes nothing, and a file
+      it cannot bring there (a @deprecated call with no named replacement,
+      by design) gets status 1 and no edition line.
 - [x] CU2. **"No promise about what will keep working"** (young languages). A
       written stability promise and semantic versioning
       (docs/reference/stability.md).
@@ -604,7 +749,7 @@ The ten that matter most, in order:
       default literal), `_struct_defaults_fail`. Not covered: a literal in a
       global's or constant's initializer, a default calling a generic
       function, `fidesc`.
-- [~] CL6. **"Macros nobody can read"** (C, Rust). `comptime` functions in plain
+- [x] CL6. **"Macros nobody can read"** (C, Rust). `comptime` functions in plain
       Fides cover what macros are used for (competitive LG9) (L).
       Checked Nov 15 (state of competitive LG9): `comptime` functions and
       blocks run at compile time, `comptime gen` generates functions,
@@ -612,6 +757,13 @@ The ten that matter most, in order:
       gives names nothing else declares, and a generated name never replaces
       a declared one. Left: expression-position expansion (what a macro call
       in an expression does), `gensym` inside a `comptime fn`.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — the 10 splice and gensym tests
+      (test_frontend_comptime_splice*, test_frontend_gen_eq,
+      test_frontend_gensym*) pass on run, ccompile and emit: `comptime
+      splice { }` expands in an expression, `gensym` works in a `comptime
+      fn`, and a bad splice is one error. Documented limits remain (no
+      token-tree macros; comptime-splice.md).
 - [x] CL7. **"Orphan rule: I can't implement a trait for a type"** (Rust). A
       trait can be implemented for any type inside one's own program; libraries
       cannot conflict, since the program's choice wins (M).
@@ -656,6 +808,13 @@ The ten that matter most, in order:
       `_fail` tests). Left: dimensions computed by the type checker
       (`Newtons * Meters` is Joules) instead of one function per unit pair;
       a left operand that is not a struct (`2.0 * m`).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — the 17 struct-operator and units tests pass on run, ccompile
+      and emit, the dimension ones included (test_frontend_units_dims,
+      units_compare, units_stdlib_dims). Left:
+      test_frontend_units_dims_int_fail expects `got i64`, but the compiler
+      says `got i8` (the literal 2 is typed i8), so the suite's expected-fail
+      check fails on it: fix the message or the test. Not run on Linux.
 
 ## Track CO — Observability and production
 
@@ -699,6 +858,12 @@ The ten that matter most, in order:
 - [~] CO5. **"Profiling production needs another tool"** (most). `fid profile`
       samples the native call stack and writes flame graph data. Left: attach to a
       running service (competitive SL15) (L).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated on Windows — co5-profile-pid-check.sh: all 11 checks pass
+      (`fid profile --pid` samples a running C-built service, which keeps
+      running; 201 samples, both functions named, stacks from main; clear
+      errors for a non-Fides process and a missing pid). Left: the Linux
+      ptrace path and its ptrace_scope message (needs a Linux-built fid).
 - [x] CO6. **"Config parsing and validation boilerplate"** (all). `config`:
       declared keys load from file (INI), environment and `--flags` —
       precedence flag > env > file > default, errors naming the key (M).
@@ -709,7 +874,7 @@ The ten that matter most, in order:
 - [x] CO8. **"Health checks and graceful shutdown are hand-written"** (servers in
       all languages). `http_serve` serves `/health`, stops on SIGTERM/SIGINT or
       `http_stop()`, and drains live connections before closing (M).
-- [ ] CO9. **"Crash dumps are unreadable"** (C, C++). A crash writes a report with
+- [~] CO9. **"Crash dumps are unreadable"** (C, C++). A crash writes a report with
       the trace, the panic message and the build's version, readable by
       `fid inspect` (M).
       Nov 17: `fid run --crash-file <file>` / FID_CRASH_REPORT (interp.fd
@@ -722,12 +887,29 @@ The ten that matter most, in order:
       build's report names its version (compiler.fd astcache_load);
       tests/tooling/crash-report-check.sh native section. Pending a run of
       that script on Windows and Linux.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — crash-report-check.sh: the interpreter and C checks pass,
+      and pe_ir, --nat and x86_64-linux write a report too (a stack
+      overflow included). Left: native traces lose the innermost function
+      when it is inlined (parse_age into load_record) and print a malformed
+      `-| called from main` line, so the native trace and `fid inspect`
+      checks fail on all three; the native version string is hard-coded
+      (`fid 1.0.0+dev (native)`); macOS and a Linux host not run.
 
 ## Track CI — Interop and platforms
 
 - [~] CI1. **"FFI needs a binding generator"** (Rust bindgen, Go cgo). `extern "C"
       link` declares and links a C function in one block. Left: `@import("x.h")`
       (competitive LG15) (L).
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      partly — `@import` of headers works: the cparser include and DLL
+      export tests, test_at_import_include, a trusted header and an
+      untrusted one (rejected without `unsafe`), Windows and libc calls on
+      ccompile, emit and x86_64-linux. Left: ccompile of
+      test_at_import_system.fd with Windows system headers fails
+      (`conflicting types for 'abs'`: core's `abs` is emitted unrenamed once
+      stdlib.h declares it, codegen_c.fd sanitize_c_name); --nat Windows and
+      macOS nat_ir do not call C functions.
 - [ ] CI2. **"cgo makes builds slow and cross-compiling hard"** (Go). C calls cost
       nothing at build time on the native backend (no C compiler) (M).
 - [~] CI3. **"Callbacks from C are unsafe and awkward"** (Rust, Go). A named Fides
@@ -780,7 +962,13 @@ The ten that matter most, in order:
       in WebAssembly: processes (...)` on both paths; CI's wasm32 lane runs
       `fid wasm` (scripts/wasm-test.sh, tests/wasm/task-switch-check.sh,
       tests/wasm/stackify-check.sh). See competitive PL4.
-- [~] CI6. **"Embedding the language in another app is hard"** (Python, JS). A
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated for the Nov 18 part — task-switch-check.sh: 3 passed (array
+      bounds, processes, task switching); test_wasm_array_index and
+      test_array_typed_let match `fid run` under `fid wasm` and ccompile.
+      Left: the rest of the suite under `fid wasm` (a 40-test sample found
+      test_fix_fnval_struct_ret wrong).
+- [x] CI6. **"Embedding the language in another app is hard"** (Python, JS). A
       C API to run Fides code with a capability-limited sandbox (L).
       Done Nov 16 (codegen_c.fd, on CI7's library build): `fides_call(name,
       caps, nargs, args, &result)` runs an export by name with only the
@@ -801,6 +989,12 @@ The ten that matter most, in order:
       blocks a panicking call allocated are freed (codegen_c.fd
       emit_embed_log_runtime, P_EL_* in fides_call); tests/projects/embed
       covers both. Pending a run of tests/projects/embed/build.sh.
+      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
+      validated — tests/projects/embed/build.sh (zig cc): `embed: ok`,
+      matching expected.txt: threads and tasks started inside a call keep
+      its mask, a panicking call's blocks are freed, 1000 panics do not
+      grow memory. Not run on Linux (no Linux fid). Known limits: not under
+      --leaks/--checked-alloc; a global set by a panicking call dangles.
 - [x] CI7. **"Calling the language from others needs glue"** (Rust, Go). `fid build
       --lib` writes a C header and a shared library from `pub extern` functions (M).
       Done Nov 16: the marker is `@export` on a function (typechecker.fd
@@ -868,7 +1062,8 @@ The ten that matter most, in order:
 
 ## Summary
 
-100 goals: 39 done, 31 partly done, 30 not started (Nov 15; stdlib: CO1 keys
+100 goals: 62 done, 30 partly done, 8 not started (Nov 21, after a fresh
+check of 29 goals; Nov 15: stdlib: CO1 keys
 `@secret` across the crypto modules plus env_secret/config_secret, CM10
 SAFETY comments on every stdlib block, CT3/CL10/CO2 partly; frontend: CL4 named
 arguments checked, CL5 struct field defaults, CL8 f-string values checked, CU3
