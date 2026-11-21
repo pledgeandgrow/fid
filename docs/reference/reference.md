@@ -800,6 +800,12 @@ fn make_adder(n: i64) -> fn(i64) -> i64 {
   path is relative to the project root and never leaves it (`..` and
   absolute paths are errors) (`s4_11_embed.fd`,
   `s4_11_embed_escape_rejected.fd`).
+- The build's target as comptime values: `target_os()`, `target_arch()`
+  (str), `build_debug()` and `feature_enabled("x")` (bool) give what @cfg
+  reads — the target a `--target` named, the host otherwise
+  (`s4_11_target_query.fd`). A statement `comptime if` over them gates
+  code inside a function body; `@cfg` (§12) is the whole-declaration
+  sugar.
 - `compile_error("msg")` in comptime code stops the build with the message
   (`s4_11_compile_error.fd`); `comptime_assert(cond, "msg")` checks while
   compiling — false stops the build, true leaves nothing in the program
@@ -1571,8 +1577,11 @@ holds (`compiler.fd:apply_cfg_filter`, `check_cfg`; `test_cfg.fd`). Arguments:
 | `debug` | the build is under `--debug` |
 | anything else | always |
 
-The platform is the host's, not the target's: `--target` does not change it.
-`@cfg` is not available on enums, `impl` blocks, globals or statements.
+The platform is the target's when `--target` names one, the host's
+otherwise. `@cfg` is not available on enums, `impl` blocks, globals or
+statements — inside a function body, `comptime if` with §4.11's target
+queries (`comptime if comptime target_os() == "windows" { .. }`) is the
+form.
 
 ---
 

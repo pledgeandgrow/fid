@@ -293,6 +293,16 @@ pub fn ct_materialize(v: Expr) -> Expr {
     return Expr::Block(body);
 }
 
+// --- The build's target, for comptime (§4.11, §12) -------------------------
+// The same flags @cfg reads (compiler.fd's g_cfg_*), set by the pipeline
+// before any comptime runs (host values when no --target names others):
+// `comptime target_os() == "windows"` is the general form of which
+// `@cfg(windows)` on a whole function or struct is the sugar.
+pub var g_ct_target_os: str = "";
+pub var g_ct_target_arch: str = "";
+pub var g_ct_debug: bool = false;
+pub var g_ct_features: str = "";
+
 // --- Comptime safety: fatal errors, fuel, traces ---------------------------
 // An explicit `comptime` that cannot be evaluated is a compile error. It
 // used to warn once and run when the program did, so a comptime that
@@ -386,6 +396,69 @@ fn ct_at(line: i64) -> str {
         return " (line " + int_to_str(line) + ")";
     }
     return "";
+}
+
+/// A comptime result landing in a narrower integer type fits, or the build
+/// stops naming the value (§4.11) — the literal-range rule (E079) extended
+/// to what comptime computed.
+fn ct_check_int_fit(ty: Type, expr: & Expr, name: str, errs: & mut Vec<str>) {
+    var v: i64 = 0;
+    match expr {
+        Expr::IntLit(n) => {
+            v = n;
+        }
+        _ => {
+            return;
+        }
+    }
+    var lo: i64 = 0;
+    var hi: i64 = 0;
+    var tname: str = "";
+    match ty {
+        Type::I8 => {
+            lo = 0 - 128;
+            hi = 127;
+            tname = "i8";
+        }
+        Type::U8 => {
+            lo = 0;
+            hi = 255;
+            tname = "u8";
+        }
+        Type::I16 => {
+            lo = 0 - 32768;
+            hi = 32767;
+            tname = "i16";
+        }
+        Type::U16 => {
+            lo = 0;
+            hi = 65535;
+            tname = "u16";
+        }
+        Type::I32 => {
+            lo = 0 - 2147483648;
+            hi = 2147483647;
+            tname = "i32";
+        }
+        Type::U32 => {
+            lo = 0;
+            hi = 4294967295;
+            tname = "u32";
+        }
+        Type::U64 => {
+            lo = 0;
+            hi = 9223372036854775807;
+            tname = "u64";
+        }
+        _ => {
+            return;
+        }
+    }
+    if v < lo || v > hi {
+        var msg: str = "comptime value " + int_to_str(v) + " does not fit in " + tname + " ('" + name + "')";
+        errs.push(msg);
+        ct_fatal_push(msg);
+    }
 }
 
 /// Onto the fatal list, once: the substitution phases iterate, so the same
@@ -1125,6 +1198,31 @@ fn ct_io_message(msg: str) -> bool {
 /// generated from reflection can refuse a @secret field, a zeroizer can
 /// find the @zeroize ones.
 fn ct_annotations_call(callee: str, a: Vec<Expr>, original: & Program) -> ResultExpr {
+    // The build's target (§4.11): the flags @cfg reads, as values
+    if callee == "target_os" {
+        return ResultExpr::Ok(Expr::StringLit(g_ct_target_os));
+    }
+    if callee == "target_arch" {
+        return ResultExpr::Ok(Expr::StringLit(g_ct_target_arch));
+    }
+    if callee == "build_debug" {
+        return ResultExpr::Ok(Expr::BoolLit(g_ct_debug));
+    }
+    if callee == "feature_enabled" {
+        if a.len() != 1 {
+            return ResultExpr::Err("feature_enabled takes one argument, the feature's name (a str)");
+        }
+        match a.get(0) {
+            Expr::StringLit(feat) => {
+                return ResultExpr::Ok(Expr::BoolLit(str_contains(g_ct_features, "
+" + feat + "
+")));
+            }
+            _ => {
+            }
+        }
+        return ResultExpr::Err("feature_enabled takes the feature's name as a string");
+    }
     // String-named siblings of the reflect ops (§4.11): what a comptime fn
     // composes on inside its body (field_names_of / field_count_of), where
     // a type operand cannot be written — a comptime fn's parameters and
@@ -1774,6 +1872,7 @@ pub fn substitute(program: Program) -> Program {
             g_ct_warn_on = true;
             substitute_expr(& mut cd.expr, & prog, & mut errs);
             g_ct_warn_on = false;
+            ct_check_int_fit(cd.ty, & cd.expr, cd.name, & mut errs);
             prog.consts.set(ci, cd);
         }
         ci = ci + 1;
@@ -2191,6 +2290,14 @@ fn substitute_stmt(stmt: & mut Stmt, original: & Program, errs: & mut Vec<str>) 
     match stmt {
         Stmt::Let(lname, lty, expr, lmut, lpersist, lann, lline) => {
             substitute_expr(& mut expr, original, errs);
+            // §4.11: the value comptime computed must fit the declared type
+            match lty {
+                OptType::Some(ct_fit_ty) => {
+                    ct_check_int_fit(ct_fit_ty, & expr, lname, errs);
+                }
+                OptType::None => {
+                }
+            }
             * stmt = Stmt::Let(lname, lty, expr, lmut, lpersist, lann, lline);
         }
         Stmt::LetTuple(tnames, expr, tline) => {
@@ -3562,7 +3669,7 @@ fn evaluate(expr: & Expr, original: & Program) -> ResultExpr {
                 // safety annotations (@secret, @zeroize, ...) a declaration
                 // carries — type arguments come as strings (type_name(T)
                 // composes inside a comptime T: type function).
-                if callee == "field_annotations" || callee == "struct_annotations" || callee == "field_names_of" || callee == "field_count_of" {
+                if callee == "target_os" || callee == "target_arch" || callee == "build_debug" || callee == "feature_enabled" || callee == "field_annotations" || callee == "struct_annotations" || callee == "field_names_of" || callee == "field_count_of" {
                     var fa_args: Vec<Expr> = Vec::new();
                     var fai: i64 = 0;
                     while fai < args.len() {
@@ -4355,7 +4462,7 @@ fn evaluate_with_env(expr: & Expr, env: & ComptimeEnv, original: & Program) -> R
                 // safety annotations (@secret, @zeroize, ...) a declaration
                 // carries — type arguments come as strings (type_name(T)
                 // composes inside a comptime T: type function).
-                if callee == "field_annotations" || callee == "struct_annotations" || callee == "field_names_of" || callee == "field_count_of" {
+                if callee == "target_os" || callee == "target_arch" || callee == "build_debug" || callee == "feature_enabled" || callee == "field_annotations" || callee == "struct_annotations" || callee == "field_names_of" || callee == "field_count_of" {
                     var fa_args: Vec<Expr> = Vec::new();
                     var fai: i64 = 0;
                     while fai < args.len() {

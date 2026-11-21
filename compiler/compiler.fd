@@ -2776,6 +2776,7 @@ pub fn build_program_no_std_borrowck(source: str, source_path: OptStr, borrowck_
             // Apply desugar and default trait methods
             desugar_layers_models(& mut program);
             desugar_phase8b(& mut program);
+            ct_sync_target();
             program = process_gen(program);
             fill_default_trait_methods(& mut program);
 
@@ -5055,6 +5056,7 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                     // A user function named like a function of one imported
                     // module: each side keeps its own (module__name).
                     cc_qualify_shadowed_imports(& mut imported_modules, imported_module_names, & mut user, stdlib);
+                    t_t = time_mark("merge: shadowed imports", t_t);
 
                     // `cap Sub: Super`: Sub carries Super's methods.
                     var trait_defs: Vec<TraitDef> = Vec::new();
@@ -5075,6 +5077,7 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                     if super_errors.len() > 0 {
                         return ResultProgram::Err(super_errors);
                     }
+                    t_t = time_mark("merge: supertraits", t_t);
 
                     // A function defined twice in one module used to collapse
                     // silently into one (src/compiler.rs find_module_conflicts).
@@ -5098,6 +5101,7 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                     if dup_errors.len() > 0 {
                         return ResultProgram::Err(dup_errors);
                     }
+                    t_t = time_mark("merge: duplicate checks", t_t);
 
                     // SL13: `ccompile --fuzz-cov` (fid test --fuzz): the
                     // harness's program and its own modules get a
@@ -5141,11 +5145,13 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                     // Merge user (highest priority)
                     record_func_modules(user, dup_user_module);
                     program = merge_programs(program, user);
+                    t_t = time_mark("merge: merge_programs", t_t);
 
                     // Phase 7.7: Conditional compilation filter
                     // rm-L5A-dep-features: `@cfg(feature = "x")` from
                     // ark_modules/.features
                     g_cfg_features = cfg_ark_features(base_dir);
+                    ct_sync_target();
                     apply_cfg_filter(& mut program);
 
                     // Phase 7.7: Process @derive annotations
@@ -5157,10 +5163,12 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                     synthesize_enum_eq(& mut program);
                     // R1.2b: structural `==` for structs (`__eq_<Struct>`).
                     synthesize_struct_eq(& mut program);
+                    t_t = time_mark("merge: cfg+derive+eq", t_t);
 
                     // Desugar layer/model declarations
                     desugar_layers_models(& mut program);
                     desugar_phase8b(& mut program);
+                    t_t = time_mark("merge: desugars", t_t);
 
                     // Comptime: process gen blocks (before typechecking so generated code is visible)
                     program = process_gen(program);
@@ -5197,9 +5205,11 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                     // created (both skip a type whose __eq_ exists already)
                     synthesize_enum_eq(& mut program);
                     synthesize_struct_eq(& mut program);
+                    t_t = time_mark("merge: comptime+eq", t_t);
 
                     // Phase 3B.1: Fill in default trait methods
                     fill_default_trait_methods(& mut program);
+                    t_t = time_mark("merge: trait defaults", t_t);
 
                     // Turbofish calls `f::<T>(..)`: instantiated before type
                     // checking, so every pass sees an ordinary call (0002)
@@ -8279,6 +8289,16 @@ fn c_reach_keep_set(program: Program) -> i64 {
             return 0;
         }
     }
+    // 2g.85: a library's `--export` functions are roots, as core's are
+    // (reach_keep_set keeps a core name and what it calls): before, an
+    // export was not, so the functions it calls were not lowered and the
+    // export returned 0 (42 with FID_LOWER_ALL=1)
+    val lib_exports: Vec<str> = CGen_lib_export_names();
+    var lei: i64 = 0;
+    while lei < lib_exports.len() {
+        core_names.push(lib_exports.get(lei));
+        lei = lei + 1;
+    }
     return reach_keep_set(program, core_names);
 }
 
@@ -8728,11 +8748,21 @@ fn cc_find_trait_impl_conflicts(imported: Vec<Program>, names: Vec<str>, user: P
 }
 
 fn cc_find_module_conflicts(stdlib: Program, imported: Vec<Program>, names: Vec<str>, user: Program, user_name: str, errors: & mut Vec<str>) {
-    var func_names: Vec<str> = Vec::new();
-    var func_mods: Vec<str> = Vec::new();
-    var struct_names: Vec<str> = Vec::new();
-    var struct_mods: Vec<str> = Vec::new();
-    var struct_shapes: Vec<str> = Vec::new();
+    // name -> index+1 into func_mods_of/struct_mods_of/struct_shapes_of:
+    // the modules (and shapes) a name was already defined in. A linear
+    // Vec scan here was O(total decls) per decl — quadratic when a
+    // program imports modules that define thousands of functions.
+    var func_ix: i64 = HashMap_new();
+    var func_mods_of: Vec<Vec<str>> = Vec::new();
+    var struct_ix: i64 = HashMap_new();
+    var struct_mods_of: Vec<Vec<str>> = Vec::new();
+    var struct_shapes_of: Vec<Vec<str>> = Vec::new();
+    var core_structs: i64 = HashMap_new();
+    var c0: i64 = 0;
+    while c0 < stdlib.structs.len() {
+        HashMap_insert(core_structs, stdlib.structs.get(c0).name, 1);
+        c0 = c0 + 1;
+    }
     var mi: i64 = 0;
     while mi <= imported.len() {
         var prog: Program = user;
@@ -8753,17 +8783,31 @@ fn cc_find_module_conflicts(stdlib: Program, imported: Vec<Program>, names: Vec<
                 ai = ai + 1;
             }
             if !is_cfg {
-                var k: i64 = 0;
-                while k < func_names.len() {
-                    if func_names.get(k) == f.name && func_mods.get(k) != module {
-                        errors.push("Duplicate definition: function '" + f.name + "' is defined in both module '" + func_mods.get(k) + "' and module '" + module + "'\n    Fix: rename one of them (a module's functions share one namespace with every module the program uses)");
+                var fix: i64 = HashMap_get(func_ix, f.name);
+                if fix > 0 {
+                    var mods: Vec<str> = func_mods_of.get(fix - 1);
+                    var k: i64 = 0;
+                    while k < mods.len() {
+                        if mods.get(k) != module {
+                            errors.push("Duplicate definition: function '" + f.name + "' is defined in both module '" + mods.get(k) + "' and module '" + module + "'\n    Fix: rename one of them (a module's functions share one namespace with every module the program uses)");
+                        }
+                        k = k + 1;
                     }
-                    k = k + 1;
                 }
                 // The user's program may shadow an imported function
                 if mi < imported.len() {
-                    func_names.push(f.name);
-                    func_mods.push(module);
+                    if fix == 0 {
+                        var nm: Vec<str> = Vec::new();
+                        nm.push(module);
+                        func_mods_of.push(nm);
+                        HashMap_insert(func_ix, f.name, func_mods_of.len());
+                    } else {
+                        var mods2: Vec<str> = func_mods_of.get(fix - 1);
+                        if !cc_c_str_vec_contains(mods2, module) {
+                            mods2.push(module);
+                            func_mods_of.set(fix - 1, mods2);
+                        }
+                    }
                 }
             }
             fi = fi + 1;
@@ -8777,33 +8821,50 @@ fn cc_find_module_conflicts(stdlib: Program, imported: Vec<Program>, names: Vec<
                 shape = shape + s.fields.get(fj).name + ",";
                 fj = fj + 1;
             }
-            var c: i64 = 0;
             if mi < imported.len() {
-                while c < stdlib.structs.len() {
-                    if stdlib.structs.get(c).name == s.name {
-                        errors.push("Duplicate definition: type '" + s.name + "' is defined in both module 'core' and module '" + module + "'\n    Fix: give this type another name: core's '" + s.name + "' is in every program");
+                if HashMap_get(core_structs, s.name) != 0 {
+                    errors.push("Duplicate definition: type '" + s.name + "' is defined in both module 'core' and module '" + module + "'\n    Fix: give this type another name: core's '" + s.name + "' is in every program");
+                }
+            }
+            var six: i64 = HashMap_get(struct_ix, s.name);
+            if six > 0 {
+                var smods: Vec<str> = struct_mods_of.get(six - 1);
+                var sshapes: Vec<str> = struct_shapes_of.get(six - 1);
+                var k: i64 = 0;
+                while k < smods.len() {
+                    if smods.get(k) != module && sshapes.get(k) != shape {
+                        errors.push("Duplicate definition: type '" + s.name + "' is defined differently in module '" + smods.get(k) + "' and module '" + module + "'\n    Fix: rename one of them, or define the type once in a module both `use`");
                     }
-                    c = c + 1;
+                    k = k + 1;
                 }
             }
-            var k: i64 = 0;
-            while k < struct_names.len() {
-                if struct_names.get(k) == s.name && struct_mods.get(k) != module && struct_shapes.get(k) != shape {
-                    errors.push("Duplicate definition: type '" + s.name + "' is defined differently in module '" + struct_mods.get(k) + "' and module '" + module + "'\n    Fix: rename one of them, or define the type once in a module both `use`");
-                }
-                k = k + 1;
+            if six == 0 {
+                var nm2: Vec<str> = Vec::new();
+                nm2.push(module);
+                struct_mods_of.push(nm2);
+                var sh2: Vec<str> = Vec::new();
+                sh2.push(shape);
+                struct_shapes_of.push(sh2);
+                HashMap_insert(struct_ix, s.name, struct_mods_of.len());
+            } else {
+                var smods2: Vec<str> = struct_mods_of.get(six - 1);
+                var sshapes2: Vec<str> = struct_shapes_of.get(six - 1);
+                smods2.push(module);
+                sshapes2.push(shape);
+                struct_mods_of.set(six - 1, smods2);
+                struct_shapes_of.set(six - 1, sshapes2);
             }
-            struct_names.push(s.name);
-            struct_mods.push(module);
-            struct_shapes.push(shape);
             si = si + 1;
         }
         mi = mi + 1;
     }
+    HashMap_drop(func_ix);
+    HashMap_drop(struct_ix);
+    HashMap_drop(core_structs);
 }
 
 fn cc_find_duplicate_funcs(prog: Program, module: str, errors: & mut Vec<str>) {
-    var seen: Vec<str> = Vec::new();
+    var seen: i64 = HashMap_new();
     var fi: i64 = 0;
     while fi < prog.funcs.len() {
         var f: Func = prog.funcs.get(fi);
@@ -8816,52 +8877,55 @@ fn cc_find_duplicate_funcs(prog: Program, module: str, errors: & mut Vec<str>) {
             ai = ai + 1;
         }
         if !is_cfg {
-            if cc_c_str_vec_contains(seen, f.name) {
+            if HashMap_get(seen, f.name) != 0 {
                 errors.push("Duplicate definition: function '" + f.name + "' is defined twice in module '" + module + "'\n    Fix: remove one definition or rename it");
             } else {
-                seen.push(f.name);
+                HashMap_insert(seen, f.name, 1);
             }
         }
         fi = fi + 1;
     }
+    HashMap_drop(seen);
 }
 
 pub fn merge_programs(stdlib: Program, user: Program) -> Program {
-    // Build sets of user-defined names for conflict detection
-    var user_func_names: Vec<str> = Vec::new();
+    // Build sets of user-defined names for conflict detection (HashMap
+    // sets: a linear Vec scan here is O(stdlib x user), quadratic on
+    // programs with tens of thousands of declarations).
+    var user_funcs: i64 = HashMap_new();
     var i: i64 = 0;
     while i < user.funcs.len() {
-        user_func_names.push(user.funcs.get(i).name);
+        HashMap_insert(user_funcs, user.funcs.get(i).name, 1);
         i = i + 1;
     }
-    var user_struct_names: Vec<str> = Vec::new();
+    var user_structs: i64 = HashMap_new();
     i = 0;
     while i < user.structs.len() {
-        user_struct_names.push(user.structs.get(i).name);
+        HashMap_insert(user_structs, user.structs.get(i).name, 1);
         i = i + 1;
     }
-    var user_enum_names: Vec<str> = Vec::new();
+    var user_enums: i64 = HashMap_new();
     i = 0;
     while i < user.enums.len() {
-        user_enum_names.push(user.enums.get(i).name);
+        HashMap_insert(user_enums, user.enums.get(i).name, 1);
         i = i + 1;
     }
-    var user_const_names: Vec<str> = Vec::new();
+    var user_consts: i64 = HashMap_new();
     i = 0;
     while i < user.consts.len() {
-        user_const_names.push(user.consts.get(i).name);
+        HashMap_insert(user_consts, user.consts.get(i).name, 1);
         i = i + 1;
     }
-    var user_global_names: Vec<str> = Vec::new();
+    var user_globals: i64 = HashMap_new();
     i = 0;
     while i < user.globals.len() {
-        user_global_names.push(user.globals.get(i).name);
+        HashMap_insert(user_globals, user.globals.get(i).name, 1);
         i = i + 1;
     }
-    var user_alias_names: Vec<str> = Vec::new();
+    var user_aliases: i64 = HashMap_new();
     i = 0;
     while i < user.type_aliases.len() {
-        user_alias_names.push(user.type_aliases.get(i).name);
+        HashMap_insert(user_aliases, user.type_aliases.get(i).name, 1);
         i = i + 1;
     }
 
@@ -8871,42 +8935,42 @@ pub fn merge_programs(stdlib: Program, user: Program) -> Program {
     // Add stdlib items that don't conflict with user definitions
     i = 0;
     while i < stdlib.funcs.len() {
-        if !cc_c_str_vec_contains(user_func_names, stdlib.funcs.get(i).name) {
+        if HashMap_get(user_funcs, stdlib.funcs.get(i).name) == 0 {
             merged.funcs.push(stdlib.funcs.get(i));
         }
         i = i + 1;
     }
     i = 0;
     while i < stdlib.structs.len() {
-        if !cc_c_str_vec_contains(user_struct_names, stdlib.structs.get(i).name) {
+        if HashMap_get(user_structs, stdlib.structs.get(i).name) == 0 {
             merged.structs.push(stdlib.structs.get(i));
         }
         i = i + 1;
     }
     i = 0;
     while i < stdlib.enums.len() {
-        if !cc_c_str_vec_contains(user_enum_names, stdlib.enums.get(i).name) {
+        if HashMap_get(user_enums, stdlib.enums.get(i).name) == 0 {
             merged.enums.push(stdlib.enums.get(i));
         }
         i = i + 1;
     }
     i = 0;
     while i < stdlib.consts.len() {
-        if !cc_c_str_vec_contains(user_const_names, stdlib.consts.get(i).name) {
+        if HashMap_get(user_consts, stdlib.consts.get(i).name) == 0 {
             merged.consts.push(stdlib.consts.get(i));
         }
         i = i + 1;
     }
     i = 0;
     while i < stdlib.globals.len() {
-        if !cc_c_str_vec_contains(user_global_names, stdlib.globals.get(i).name) {
+        if HashMap_get(user_globals, stdlib.globals.get(i).name) == 0 {
             merged.globals.push(stdlib.globals.get(i));
         }
         i = i + 1;
     }
     i = 0;
     while i < stdlib.type_aliases.len() {
-        if !cc_c_str_vec_contains(user_alias_names, stdlib.type_aliases.get(i).name) {
+        if HashMap_get(user_aliases, stdlib.type_aliases.get(i).name) == 0 {
             merged.type_aliases.push(stdlib.type_aliases.get(i));
         }
         i = i + 1;
@@ -8914,76 +8978,76 @@ pub fn merge_programs(stdlib: Program, user: Program) -> Program {
     // Merge impls (skip if user has impl for same struct). The user's impl
     // names are taken first: merged.impls is user.impls, so a pushed impl
     // would otherwise hide a second impl block of the same struct.
-    var user_impl_structs: Vec<str> = Vec::new();
+    var user_impl_structs: i64 = HashMap_new();
     i = 0;
     while i < user.impls.len() {
         // L8H: a narrower impl (`impl Wrap<i64>`) is no replacement of the
         // other program's generic `impl<T> Wrap<T>`: both are kept
         if !pd_impl_is_narrowed(user.impls.get(i)) {
-            user_impl_structs.push(user.impls.get(i).struct_name);
+            HashMap_insert(user_impl_structs, user.impls.get(i).struct_name, 1);
         }
         i = i + 1;
     }
     i = 0;
     while i < stdlib.impls.len() {
-        if !cc_c_str_vec_contains(user_impl_structs, stdlib.impls.get(i).struct_name) {
+        if HashMap_get(user_impl_structs, stdlib.impls.get(i).struct_name) == 0 {
             merged.impls.push(stdlib.impls.get(i));
         }
         i = i + 1;
     }
     // Merge traits (user wins on name conflicts)
+    var user_traits: i64 = HashMap_new();
+    i = 0;
+    while i < user.traits.len() {
+        HashMap_insert(user_traits, user.traits.get(i).name, 1);
+        i = i + 1;
+    }
     i = 0;
     while i < stdlib.traits.len() {
-        var stdlib_trait_name: str = stdlib.traits.get(i).name;
-        var has_user_trait: bool = false;
-        var j2: i64 = 0;
-        while j2 < user.traits.len() {
-            if user.traits.get(j2).name == stdlib_trait_name {
-                has_user_trait = true;
-            }
-            j2 = j2 + 1;
-        }
-        if !has_user_trait {
+        if HashMap_get(user_traits, stdlib.traits.get(i).name) == 0 {
             merged.traits.push(stdlib.traits.get(i));
         }
         i = i + 1;
     }
     // Merge trait impls (user wins on (trait, type) conflicts)
+    var user_tis: i64 = HashMap_new();
+    i = 0;
+    while i < user.trait_impls.len() {
+        HashMap_insert(user_tis, user.trait_impls.get(i).trait_name + " for " + user.trait_impls.get(i).type_name, 1);
+        i = i + 1;
+    }
     i = 0;
     while i < stdlib.trait_impls.len() {
-        var stdlib_ti_trait: str = stdlib.trait_impls.get(i).trait_name;
-        var stdlib_ti_type: str = stdlib.trait_impls.get(i).type_name;
-        var has_user_ti: bool = false;
-        var j3: i64 = 0;
-        while j3 < user.trait_impls.len() {
-            if user.trait_impls.get(j3).trait_name == stdlib_ti_trait && user.trait_impls.get(j3).type_name == stdlib_ti_type {
-                has_user_ti = true;
-            }
-            j3 = j3 + 1;
-        }
-        if !has_user_ti {
+        if HashMap_get(user_tis, stdlib.trait_impls.get(i).trait_name + " for " + stdlib.trait_impls.get(i).type_name) == 0 {
             merged.trait_impls.push(stdlib.trait_impls.get(i));
         }
         i = i + 1;
     }
     // Merge extern_decls (user wins on conflicts by pledge_name)
+    var user_exts: i64 = HashMap_new();
+    i = 0;
+    while i < user.extern_decls.len() {
+        HashMap_insert(user_exts, user.extern_decls.get(i).pledge_name, 1);
+        i = i + 1;
+    }
     i = 0;
     while i < stdlib.extern_decls.len() {
-        var stdlib_ext_name: str = stdlib.extern_decls.get(i).pledge_name;
-        var has_user_ext: bool = false;
-        var j4: i64 = 0;
-        while j4 < user.extern_decls.len() {
-            if user.extern_decls.get(j4).pledge_name == stdlib_ext_name {
-                has_user_ext = true;
-            }
-            j4 = j4 + 1;
-        }
-        if !has_user_ext {
+        if HashMap_get(user_exts, stdlib.extern_decls.get(i).pledge_name) == 0 {
             merged.extern_decls.push(stdlib.extern_decls.get(i));
         }
         i = i + 1;
     }
 
+    HashMap_drop(user_funcs);
+    HashMap_drop(user_structs);
+    HashMap_drop(user_enums);
+    HashMap_drop(user_consts);
+    HashMap_drop(user_globals);
+    HashMap_drop(user_aliases);
+    HashMap_drop(user_impl_structs);
+    HashMap_drop(user_traits);
+    HashMap_drop(user_tis);
+    HashMap_drop(user_exts);
     return merged;
 }
 
@@ -9096,6 +9160,37 @@ pub fn cfg_ark_features(base_dir: str) -> str {
         out = cfg_ark_features_at(ws, out);
     }
     return out;
+}
+
+/// Set comptime's view of the build's target (§4.11): the same flags
+/// @cfg reads — the target a --target named, the host otherwise — as
+/// values `comptime target_os()` & co. give. One derivation with
+/// apply_cfg_filter's, kept beside it.
+fn ct_sync_target() {
+    var os: str = g_cfg_os;
+    if str_len(os) == 0 {
+        var is_windows: bool = p_getenv("OS") == "Windows_NT";
+        var is_linux: bool = !is_windows && c_file_exists("/proc/self/exe");
+        var is_freebsd: bool = !is_windows && !is_linux && c_file_exists("/bin/freebsd-version");
+        var is_macos: bool = !is_windows && !is_linux && !is_freebsd;
+        if is_windows {
+            os = "windows";
+        } else if is_macos {
+            os = "macos";
+        } else if is_freebsd {
+            os = "freebsd";
+        } else {
+            os = "linux";
+        }
+    }
+    g_ct_target_os = os;
+    var arch: str = g_cfg_arch;
+    if str_len(arch) == 0 {
+        arch = "x86_64";
+    }
+    g_ct_target_arch = arch;
+    g_ct_debug = g_cfg_debug;
+    g_ct_features = g_cfg_features;
 }
 
 /// Conditional compilation (release K10, as src/compiler.rs apply_cfg_filter):
@@ -9349,6 +9444,13 @@ fn fzc_func(f: Func) -> Func {
 }
 
 /// Instrument every function and method of `program` (fzc_func_wanted).
+/// 2g.83: the lists are refilled in place, not replaced, as parser.fd
+/// pd_cross_module_specializations does: the user program is
+/// build_program_with_path_borrowck's match binding of the parse result,
+/// and a compiler built by a lowering from before the match-binding fix
+/// dropped a replaced list the parse result still held, then dropped it
+/// again with the result ("Double free" in Vec_drop_inplace from
+/// __own_drop_100 there, under `ccompile --fuzz-cov`).
 pub fn fuzz_cov_program(program: & mut Program) {
     var funcs: Vec<Func> = Vec::new();
     var i: i64 = 0;
@@ -9356,7 +9458,7 @@ pub fn fuzz_cov_program(program: & mut Program) {
         funcs.push(fzc_func(program.funcs.get(i)));
         i = i + 1;
     }
-    program.funcs = funcs;
+    fzc_refill_funcs(& mut program.funcs, funcs);
     var impls: Vec<ImplDef> = Vec::new();
     i = 0;
     while i < program.impls.len() {
@@ -9371,7 +9473,25 @@ pub fn fuzz_cov_program(program: & mut Program) {
         impls.push(im);
         i = i + 1;
     }
-    program.impls = impls;
+    fzc_refill_impls(& mut program.impls, impls);
+}
+
+fn fzc_refill_funcs(dst: & mut Vec<Func>, src: Vec<Func>) {
+    dst.clear();
+    var i: i64 = 0;
+    while i < src.len() {
+        dst.push(src.get(i));
+        i = i + 1;
+    }
+}
+
+fn fzc_refill_impls(dst: & mut Vec<ImplDef>, src: Vec<ImplDef>) {
+    dst.clear();
+    var i: i64 = 0;
+    while i < src.len() {
+        dst.push(src.get(i));
+        i = i + 1;
+    }
 }
 
 /// Does `program` define the harness's `__fz_hit`?
@@ -9424,6 +9544,14 @@ fn enum_eq_pattern(enum_name: str, variant: str, prefix: str, n: i64) -> Pattern
 
 pub fn synthesize_enum_eq(program: & mut Program) {
     var generated: Vec<Func> = Vec::new();
+    // name set of the existing functions: a Vec scan per enum was
+    // O(enums x funcs)
+    var fnames: i64 = HashMap_new();
+    var nfi: i64 = 0;
+    while nfi < program.funcs.len() {
+        HashMap_insert(fnames, program.funcs.get(nfi).name, 1);
+        nfi = nfi + 1;
+    }
     var ei: i64 = 0;
     while ei < program.enums.len() {
         var e: EnumDef = program.enums.get(ei);
@@ -9432,15 +9560,7 @@ pub fn synthesize_enum_eq(program: & mut Program) {
             continue;
         }
         var fname: str = "__eq_" + e.name;
-        var exists: bool = false;
-        var fi: i64 = 0;
-        while fi < program.funcs.len() {
-            if program.funcs.get(fi).name == fname {
-                exists = true;
-            }
-            fi = fi + 1;
-        }
-        if exists {
+        if HashMap_get(fnames, fname) != 0 {
             continue;
         }
 
@@ -9487,6 +9607,7 @@ pub fn synthesize_enum_eq(program: & mut Program) {
         body.push(Stmt::Return(OptBoxExpr::Some(Box::new(Expr::BoolLit(false))), 0));
         generated.push(Func_new_full(fname, params, Type::Bool, body, true));
     }
+    HashMap_drop(fnames);
     var gi: i64 = 0;
     while gi < generated.len() {
         program.funcs.push(generated.get(gi));
@@ -9520,11 +9641,11 @@ pub fn synthesize_struct_eq(program: & mut Program) {
         }
         gi = gi + 1;
     }
-    var have: Vec<str> = Vec::new();
+    var have: i64 = HashMap_new();
     var fi: i64 = 0;
     while fi < program.funcs.len() {
         if str_starts_with(program.funcs.get(fi).name, "__eq_") {
-            have.push(program.funcs.get(fi).name);
+            HashMap_insert(have, program.funcs.get(fi).name, 1);
         }
         fi = fi + 1;
     }
@@ -9537,7 +9658,7 @@ pub fn synthesize_struct_eq(program: & mut Program) {
             continue;
         }
         var fname: str = "__eq_" + s.name;
-        if str_vec_contains(have, fname) {
+        if HashMap_get(have, fname) != 0 {
             continue;
         }
         var skip: bool = false;
@@ -9582,6 +9703,7 @@ pub fn synthesize_struct_eq(program: & mut Program) {
         body.push(Stmt::Return(OptBoxExpr::Some(Box::new(same)), 0));
         generated.push(Func_new_full(fname, params, Type::Bool, body, true));
     }
+    HashMap_drop(have);
     var ni: i64 = 0;
     while ni < generated.len() {
         program.funcs.push(generated.get(ni));
@@ -10624,27 +10746,25 @@ fn c_vec1_func(f: Func) -> Vec<Func> {
 /// For each trait impl, if the trait defines a method with a default body that
 /// the impl doesn't override, add the default body to the impl.
 pub fn fill_default_trait_methods(program: & mut Program) {
-    // Build trait map: trait_name -> TraitDef
-    // We can't use HashMap in Fides, so we do linear search
+    // trait_name -> index+1 into program.traits (a Vec scan per impl was
+    // O(impls x traits))
+    var trait_ix: i64 = HashMap_new();
+    var ti0: i64 = 0;
+    while ti0 < program.traits.len() {
+        HashMap_insert(trait_ix, program.traits.get(ti0).name, ti0 + 1);
+        ti0 = ti0 + 1;
+    }
 
     var i: i64 = 0;
     while i < program.trait_impls.len() {
         var ti: TraitImpl = program.trait_impls.get(i);
         // Find the trait definition
-        var trait_def: TraitDef = TraitDef_empty();
-        var found_trait: bool = false;
-        var j: i64 = 0;
-        while j < program.traits.len() {
-            if program.traits.get(j).name == ti.trait_name {
-                trait_def = program.traits.get(j);
-                found_trait = true;
-            }
-            j = j + 1;
-        }
-        if !found_trait {
+        var tix: i64 = HashMap_get(trait_ix, ti.trait_name);
+        if tix == 0 {
             i = i + 1;
             continue;
         }
+        var trait_def: TraitDef = program.traits.get(tix - 1);
 
         // Build set of provided method names
         var provided: Vec<str> = Vec::new();
@@ -10732,6 +10852,7 @@ pub fn fill_default_trait_methods(program: & mut Program) {
         }
         i = i + 1;
     }
+    HashMap_drop(trait_ix);
 }
 
 // ===========================================================================
@@ -11166,6 +11287,21 @@ fn cc_qualify_shadowed_imports(imported: & mut Vec<Program>, names: Vec<str>, us
     // CB1: the import loop takes the parser's list as it goes (a module
     // from the import cache adds its own calls there)
     var calls: Vec<str> = imp_take_qcalls();
+    // one func-name set per module: the per-call scan below was
+    // O(calls x modules x funcs-per-module)
+    var fsets: Vec<i64> = Vec::new();
+    mi = 0;
+    while mi < imported.len() {
+        var mset: i64 = HashMap_new();
+        var mfs: Vec<Func> = imported.get(mi).funcs;
+        var mfi: i64 = 0;
+        while mfi < mfs.len() {
+            HashMap_insert(mset, mfs.get(mfi).name, 1);
+            mfi = mfi + 1;
+        }
+        fsets.push(mset);
+        mi = mi + 1;
+    }
     var ci: i64 = 0;
     while ci < calls.len() {
         var call: str = calls.get(ci);
@@ -11194,15 +11330,7 @@ fn cc_qualify_shadowed_imports(imported: & mut Vec<Program>, names: Vec<str>, us
         while mi < imported.len() {
             if names.get(mi) == path || path_last(names.get(mi)) == path {
                 var target: str = fname;
-                var hit: bool = false;
-                var fs: Vec<Func> = imported.get(mi).funcs;
-                var fi: i64 = 0;
-                while fi < fs.len() {
-                    if fs.get(fi).name == fname {
-                        hit = true;
-                    }
-                    fi = fi + 1;
-                }
+                var hit: bool = HashMap_get(fsets.get(mi), fname) != 0;
                 match rename_get(own.get(mi), fname) {
                     OptStr::Some(q) => {
                         target = q;
@@ -11225,6 +11353,11 @@ fn cc_qualify_shadowed_imports(imported: & mut Vec<Program>, names: Vec<str>, us
             mi = mi + 1;
         }
         ci = ci + 1;
+    }
+    mi = 0;
+    while mi < fsets.len() {
+        HashMap_drop(fsets.get(mi));
+        mi = mi + 1;
     }
     if !any {
         return;
@@ -12328,6 +12461,23 @@ pub fn split_c_units(full: str) -> Vec<CUnit> {
     if !flat && inst_mode != "home" && inst_mode != "move" && env_or_empty("FIDES_INC_EFFECTS") != "off" && g_split_assign == 0 {
         c_copy_instances_to_callers(full, full_len, tail_at, fn_snames, fn_cnames, fn_starts, fn_ends, fn_decl_at, unit_names, & mut fn_units, & mut copy_fn, & mut copy_unit);
     }
+    // B3 on the IR units: the copies ccompile_inc_prepare gave the unit
+    // being cut (incu_copy_instances; its C holds their bodies)
+    if g_split_assign != 0 && g_split_copies != 0 && str_len(g_split_only) > 0 {
+        var cs: i64 = c_unit_slot(unit_names, g_split_only);
+        if cs < 0 {
+            unit_names.push(g_split_only);
+            cs = unit_names.len() - 1;
+        }
+        var ck: i64 = 0;
+        while ck < fn_snames.len() {
+            if HashMap_get(g_split_copies, fn_snames.get(ck)) != 0 && fn_units.get(ck) != cs && str_len(fn_cnames.get(ck)) > 0 && fn_decl_at.get(ck) >= fn_starts.get(ck) {
+                copy_fn.push(ck);
+                copy_unit.push(cs);
+            }
+            ck = ck + 1;
+        }
+    }
 
     // Prelude lines: shared, global definitions, string constants. With
     // effect-scoped protos (C2/C9, on unless FIDES_INC_EFFECTS=off or a
@@ -12668,7 +12818,9 @@ pub fn split_c_units(full: str) -> Vec<CUnit> {
                 ce = ce + 1;
             }
             code.append_str(str_slice(common, cpos, str_len(common)));
-            if str_len(env_or_empty("FIDES_INC_DEBUG")) > 0 {
+            // (B1: an IR unit's line is ccompile_inc_prepare's, over the
+            // whole program's layouts)
+            if str_len(env_or_empty("FIDES_INC_DEBUG")) > 0 && str_len(g_split_only) == 0 {
                 p_eprint_str("[inc] layouts " + unit_names.get(idx) + ": " + int_to_str(n_struct) + " of " + int_to_str(n_struct_all) + " structs, " + int_to_str(n_ext) + " of " + int_to_str(lay_text.len() - n_struct_all) + " externs\n");
             }
         } else {
@@ -12774,6 +12926,10 @@ var g_incu_estimate: i64 = 0;
 var g_split_assign: i64 = 0;
 var g_split_assign_names: Vec<str> = Vec::new();
 var g_split_only: str = "";
+// B3: the instances unit i holds a `static` copy of (one name per line),
+// and for the unit incu_unit_c cuts, the same names (name -> 1; 0: none)
+var g_incu_copies: Vec<str> = Vec::new();
+var g_split_copies: i64 = 0;
 
 /// The unit split_c_units puts function `name` in: its IR unit while
 /// ccompile_inc_prepare's assignment is set, else its module.
@@ -12838,6 +12994,11 @@ pub fn incu_reset() {
     }
     g_split_assign_names = Vec::new();
     g_split_only = "";
+    g_incu_copies = Vec::new();
+    if g_split_copies != 0 {
+        HashMap_drop(g_split_copies);
+        g_split_copies = 0;
+    }
 }
 
 @wrapping
@@ -13158,6 +13319,509 @@ fn incu_ct_errors(module: & IrModule) -> Vec<str> {
     return out;
 }
 
+/// `ix` ordered by `names` (names.get(k) is the name of ix.get(k)), a
+/// stable merge sort.
+fn incu_sort_by_name(ix: Vec<i64>, names: Vec<str>) -> Vec<i64> {
+    var n: i64 = ix.len();
+    var a: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        a.push(i);
+        i = i + 1;
+    }
+    var width: i64 = 1;
+    while width < n {
+        var b: Vec<i64> = Vec::new();
+        var lo: i64 = 0;
+        while lo < n {
+            var mid: i64 = lo + width;
+            if mid > n {
+                mid = n;
+            }
+            var hi: i64 = lo + width * 2;
+            if hi > n {
+                hi = n;
+            }
+            var p: i64 = lo;
+            var q: i64 = mid;
+            while p < mid || q < hi {
+                if q >= hi || (p < mid && str_compare(names.get(a.get(p)), names.get(a.get(q))) <= 0) {
+                    b.push(a.get(p));
+                    p = p + 1;
+                } else {
+                    b.push(a.get(q));
+                    q = q + 1;
+                }
+            }
+            lo = hi;
+        }
+        a = b;
+        width = width * 2;
+    }
+    var out: Vec<i64> = Vec::new();
+    i = 0;
+    while i < n {
+        out.push(ix.get(a.get(i)));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn incu_all_digits(s: str) -> bool {
+    if str_len(s) == 0 {
+        return false;
+    }
+    var i: i64 = 0;
+    while i < str_len(s) {
+        var c: i64 = str_byte_at(s, i);
+        if c < 48 || c > 57 {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// B6 (2g.91): the lowering numbers the own types' functions
+/// (`__own_drop_<i>`, `__own_dup_<i>`) in the order it meets the types, so
+/// core's calls to the ones of core's types changed with the rest of the
+/// program (a struct of the program met first renumbered them) and so did
+/// core's unit key: a fresh project never found core's object in a seeded
+/// store. They are named after their type's key instead
+/// (`__own_dup_t<hash>`, lower.fd lw_own_type_keys): one renaming of
+/// function names over the whole module, the same in every function, so
+/// the program does what it did. Nothing is renamed when a key is missing
+/// or two names would meet. FIDES_INC_OWN_NAMES=index: the lowering's
+/// numbers.
+fn incu_canon_own_names(module: & mut IrModule) {
+    if env_or_empty("FIDES_INC_OWN_NAMES") == "index" {
+        return;
+    }
+    var keys: Vec<str> = lw_own_type_keys();
+    var n: i64 = module.functions.len();
+    var names: i64 = HashMap_new();
+    var i: i64 = 0;
+    while i < n {
+        HashMap_insert(names, module.functions.get(i).name, 1);
+        i = i + 1;
+    }
+    // old name -> index + 1 into new_names
+    var ren: i64 = HashMap_new();
+    var new_names: Vec<str> = Vec::new();
+    var taken: i64 = HashMap_new();
+    var ok: bool = true;
+    i = 0;
+    while i < n && ok {
+        var nm: str = module.functions.get(i).name;
+        var pre: str = "";
+        if str_starts_with(nm, "__own_dup_") {
+            pre = "__own_dup_";
+        } else if str_starts_with(nm, "__own_drop_") {
+            pre = "__own_drop_";
+        }
+        if str_len(pre) > 0 && HashMap_get(ren, nm) == 0 {
+            var rest: str = str_slice(nm, str_len(pre), str_len(nm));
+            if incu_all_digits(rest) {
+                var ix: i64 = str_parse_int(rest);
+                if ix < 0 || ix >= keys.len() {
+                    ok = false;
+                } else {
+                    var h: i64 = hash_source(keys.get(ix)) & 0x7FFFFFFFFFFFFFFF;
+                    var nn: str = pre + "t" + int_to_str(h);
+                    if HashMap_get(names, nn) != 0 || HashMap_get(taken, nn) != 0 {
+                        ok = false;
+                    } else {
+                        HashMap_insert(taken, nn, 1);
+                        new_names.push(nn);
+                        HashMap_insert(ren, nm, new_names.len());
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    if ok && new_names.len() > 0 {
+        i = 0;
+        while i < n {
+            var fe: IrFunctionEntry = module.functions.get(i);
+            var changed: bool = false;
+            var at: i64 = HashMap_get(ren, fe.name);
+            if at != 0 {
+                fe.name = new_names.get(at - 1);
+                fe.func.name = new_names.get(at - 1);
+                changed = true;
+            }
+            var k: i64 = 0;
+            while k < fe.func.insts.len() {
+                var vi: ValueIdInst = fe.func.insts.get(k);
+                match vi.inst {
+                    Inst::Call(cn, ca, ct, ce) => {
+                        var to: i64 = HashMap_get(ren, cn);
+                        if to != 0 {
+                            IrFunction_set_inst(& mut fe.func, vi.id, Inst::Call(new_names.get(to - 1), ca, ct, ce));
+                            changed = true;
+                        }
+                    }
+                    _ => {
+                    }
+                }
+                k = k + 1;
+            }
+            if changed {
+                module.functions.set(i, fe);
+            }
+            i = i + 1;
+        }
+        var ei: i64 = 0;
+        while ei < module.function_effects.len() {
+            var ee: StringEffectSetEntry = module.function_effects.get(ei);
+            var ea: i64 = HashMap_get(ren, ee.name);
+            if ea != 0 {
+                ee.name = new_names.get(ea - 1);
+                module.function_effects.set(ei, ee);
+            }
+            ei = ei + 1;
+        }
+        HashMap_clear(module.fn_index);
+    }
+    HashMap_drop(names);
+    HashMap_drop(ren);
+    HashMap_drop(taken);
+}
+
+/// The functions the C runtime or the generated C calls by name without an
+/// IR call (as codegen_c.fd cg_runtime_root).
+fn incu_runtime_root(name: str) -> bool {
+    return name == "Vec_to_str" || name == "HashMap_to_str" || name == "Str_dup" || name == "Str_drop" || name == "Vec_new" || name == "HashMap_new" || name == "Vec_push" || name == "Vec_get" || name == "Vec_set" || name == "Vec_len" || name == "Vec_pop" || name == "Vec_is_empty" || name == "Vec_filled_typed";
+}
+
+fn incu_live_push(pos: i64, live: i64, work: & mut Vec<i64>, name: str) {
+    if HashMap_get(live, name) != 0 {
+        return;
+    }
+    var at: i64 = HashMap_get(pos, name);
+    if at == 0 {
+        return;
+    }
+    HashMap_insert(live, name, 1);
+    work.push(at - 1);
+}
+
+/// What a run of the whole program can reach, as codegen_c.fd
+/// cg_compute_live finds it in a single TU: main (everything without one),
+/// the functions a string or a function reference names anywhere, C
+/// callbacks and the runtime's roots, then through calls, function
+/// references, strings and dynamic calls (every `<Type>_<method>`). A map
+/// name -> 1.
+fn incu_live(module: & IrModule) -> i64 {
+    var n: i64 = module.functions.len();
+    var pos: i64 = HashMap_new();
+    var named: i64 = HashMap_new();
+    var main_found: bool = false;
+    var i: i64 = 0;
+    while i < n {
+        var fe: IrFunctionEntry = module.functions.get(i);
+        if HashMap_get(pos, fe.name) == 0 {
+            HashMap_insert(pos, fe.name, i + 1);
+        }
+        if fe.name == "main" {
+            main_found = true;
+        }
+        var k: i64 = 0;
+        while k < fe.func.insts.len() {
+            match fe.func.insts.get(k).inst {
+                Inst::ConstStr(sv) => {
+                    if str_len(sv) > 0 && str_len(sv) < 256 {
+                        HashMap_insert(named, sv, 1);
+                    }
+                }
+                Inst::ConstFnRef(rn) => {
+                    HashMap_insert(named, rn, 1);
+                    HashMap_insert(named, c_fn_target(rn), 1);
+                }
+                _ => {
+                }
+            }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    var live: i64 = HashMap_new();
+    var work: Vec<i64> = Vec::new();
+    i = 0;
+    while i < n {
+        var rn2: str = module.functions.get(i).name;
+        if !main_found || rn2 == "main" || incu_runtime_root(rn2) || HashMap_get(named, rn2) != 0 {
+            incu_live_push(pos, live, & mut work, rn2);
+        }
+        i = i + 1;
+    }
+    var cb: i64 = 0;
+    while cb < module.c_callbacks.len() {
+        incu_live_push(pos, live, & mut work, module.c_callbacks.get(cb));
+        cb = cb + 1;
+    }
+    var dyn_done: i64 = HashMap_new();
+    while work.len() > 0 {
+        var at: i64 = work.get(work.len() - 1);
+        work.pop();
+        var we: IrFunctionEntry = module.functions.get(at);
+        var k2: i64 = 0;
+        while k2 < we.func.insts.len() {
+            match we.func.insts.get(k2).inst {
+                Inst::Call(cn, _, _, _) => {
+                    incu_live_push(pos, live, & mut work, cn);
+                }
+                Inst::ConstFnRef(fr) => {
+                    incu_live_push(pos, live, & mut work, c_fn_target(fr));
+                }
+                Inst::ConstStr(sv2) => {
+                    if str_len(sv2) > 0 && str_len(sv2) < 256 {
+                        incu_live_push(pos, live, & mut work, sv2);
+                    }
+                }
+                Inst::DynCall(_, method, _, _, _) => {
+                    if HashMap_get(dyn_done, method) == 0 {
+                        HashMap_insert(dyn_done, method, 1);
+                        var suffix: str = "_" + method;
+                        var di: i64 = 0;
+                        while di < n {
+                            var dn: str = module.functions.get(di).name;
+                            if str_ends_with(dn, suffix) {
+                                incu_live_push(pos, live, & mut work, dn);
+                            }
+                            di = di + 1;
+                        }
+                    }
+                }
+                _ => {
+                }
+            }
+            k2 = k2 + 1;
+        }
+    }
+    HashMap_drop(dyn_done);
+    HashMap_drop(named);
+    HashMap_drop(pos);
+    return live;
+}
+
+/// B3 on the IR units (as c_copy_instances_to_callers on the C text): an
+/// instance that two or more units call, that its generic's unit does not
+/// call and whose address is not taken (a function reference, a string
+/// naming it, a dynamic call's method), has its definition in the calling
+/// unit first by name and a `static` copy in each other calling unit; a
+/// copy's instance callees count as called from the copy's unit, so they
+/// are placed the same way (16 rounds at most). `units`: each function's
+/// unit (definitions move); copy_fn/copy_unit: function i gets a static
+/// copy in unit u.
+fn incu_copy_instances(module: & IrModule, unames: Vec<str>, units: & mut Vec<i64>, copy_fn: & mut Vec<i64>, copy_unit: & mut Vec<i64>) {
+    var n: i64 = module.functions.len();
+    var nu: i64 = unames.len();
+    if nu < 2 {
+        return;
+    }
+    var pos: i64 = HashMap_new();
+    var kidx: Vec<i64> = Vec::new();
+    var inst_fn: Vec<i64> = Vec::new();
+    var home: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        var nm: str = module.functions.get(i).name;
+        if HashMap_get(pos, nm) == 0 {
+            HashMap_insert(pos, nm, i + 1);
+        }
+        var k0: i64 = - 1;
+        if func_is_instance(nm) {
+            var h: i64 = c_unit_slot(unames, func_module_of(nm, ""));
+            if h >= 0 {
+                k0 = inst_fn.len();
+                inst_fn.push(i);
+                home.push(h);
+            }
+        }
+        kidx.push(k0);
+        i = i + 1;
+    }
+    var n_inst: i64 = inst_fn.len();
+    if n_inst == 0 {
+        HashMap_drop(pos);
+        return;
+    }
+    var taken: Vec<i64> = Vec::new();
+    i = 0;
+    while i < n_inst {
+        taken.push(0);
+        i = i + 1;
+    }
+    var e_from: Vec<i64> = Vec::new();
+    var e_to: Vec<i64> = Vec::new();
+    var dyn_done: i64 = HashMap_new();
+    i = 0;
+    while i < n {
+        var fe: IrFunctionEntry = module.functions.get(i);
+        var k: i64 = 0;
+        while k < fe.func.insts.len() {
+            var refd: str = "";
+            match fe.func.insts.get(k).inst {
+                Inst::Call(cn, _, _, _) => {
+                    var t: i64 = HashMap_get(pos, cn) - 1;
+                    if t >= 0 && t != i && kidx.get(t) >= 0 {
+                        e_from.push(i);
+                        e_to.push(t);
+                    }
+                }
+                Inst::ConstFnRef(rn) => {
+                    refd = c_fn_target(rn);
+                    var t2: i64 = HashMap_get(pos, rn) - 1;
+                    if t2 >= 0 && kidx.get(t2) >= 0 {
+                        taken.set(kidx.get(t2), 1);
+                    }
+                }
+                Inst::ConstStr(sv) => {
+                    if str_len(sv) > 0 && str_len(sv) < 256 {
+                        refd = sv;
+                    }
+                }
+                Inst::DynCall(_, method, _, _, _) => {
+                    if HashMap_get(dyn_done, method) == 0 {
+                        HashMap_insert(dyn_done, method, 1);
+                        var suffix: str = "_" + method;
+                        var j: i64 = 0;
+                        while j < n_inst {
+                            if str_ends_with(module.functions.get(inst_fn.get(j)).name, suffix) {
+                                taken.set(j, 1);
+                            }
+                            j = j + 1;
+                        }
+                    }
+                }
+                _ => {
+                }
+            }
+            if str_len(refd) > 0 {
+                var t3: i64 = HashMap_get(pos, refd) - 1;
+                if t3 >= 0 && kidx.get(t3) >= 0 {
+                    taken.set(kidx.get(t3), 1);
+                }
+            }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    HashMap_drop(dyn_done);
+    HashMap_drop(pos);
+    // has: instance x unit, 1 = a static copy there; cu: the units calling
+    // each instance (recomputed each round)
+    var has: Vec<i64> = Vec::new();
+    var cu: Vec<i64> = Vec::new();
+    var hi: i64 = 0;
+    while hi < n_inst * nu {
+        has.push(0);
+        cu.push(0);
+        hi = hi + 1;
+    }
+    var round: i64 = 0;
+    var changed: bool = true;
+    while changed && round < 16 && e_from.len() > 0 {
+        changed = false;
+        hi = 0;
+        while hi < n_inst * nu {
+            cu.set(hi, 0);
+            hi = hi + 1;
+        }
+        var ei: i64 = 0;
+        while ei < e_from.len() {
+            var f: i64 = e_from.get(ei);
+            var kj: i64 = kidx.get(e_to.get(ei));
+            cu.set(kj * nu + units.get(f), 1);
+            var kf: i64 = kidx.get(f);
+            if kf >= 0 {
+                var u0: i64 = 0;
+                while u0 < nu {
+                    if has.get(kf * nu + u0) == 1 {
+                        cu.set(kj * nu + u0, 1);
+                    }
+                    u0 = u0 + 1;
+                }
+            }
+            ei = ei + 1;
+        }
+        var kk: i64 = 0;
+        while kk < n_inst {
+            if taken.get(kk) == 0 {
+                var j2: i64 = inst_fn.get(kk);
+                var p: i64 = units.get(j2);
+                var h2: i64 = home.get(kk);
+                var others: i64 = 0;
+                var best: i64 = - 1;
+                var u: i64 = 0;
+                while u < nu {
+                    if cu.get(kk * nu + u) == 1 {
+                        if u != p {
+                            others = others + 1;
+                        }
+                        if best < 0 || str_compare(unames.get(u), unames.get(best)) < 0 {
+                            best = u;
+                        }
+                    }
+                    u = u + 1;
+                }
+                // its generic's unit calls it and holds it: the others call
+                // that one (a copy would not keep it out of home)
+                var keep: bool = others == 0 || (p == h2 && cu.get(kk * nu + h2) == 1);
+                if !keep {
+                    if p == h2 {
+                        // home does not call it: its definition moves to the
+                        // calling unit first by name
+                        units.set(j2, best);
+                        has.set(kk * nu + best, 0);
+                        p = best;
+                        changed = true;
+                    }
+                    u = 0;
+                    while u < nu {
+                        if cu.get(kk * nu + u) == 1 && u != p && has.get(kk * nu + u) == 0 {
+                            has.set(kk * nu + u, 1);
+                            changed = true;
+                        }
+                        u = u + 1;
+                    }
+                }
+            }
+            kk = kk + 1;
+        }
+        round = round + 1;
+    }
+    var n_copied: i64 = 0;
+    var kk2: i64 = 0;
+    while kk2 < n_inst {
+        var any: bool = false;
+        var u2: i64 = 0;
+        while u2 < nu {
+            if has.get(kk2 * nu + u2) == 1 && u2 != units.get(inst_fn.get(kk2)) {
+                copy_fn.push(inst_fn.get(kk2));
+                copy_unit.push(u2);
+                any = true;
+            }
+            u2 = u2 + 1;
+        }
+        if any {
+            n_copied = n_copied + 1;
+        }
+        kk2 = kk2 + 1;
+    }
+    if str_len(env_or_empty("FIDES_INC_DEBUG")) > 0 {
+        var n_taken: i64 = 0;
+        var tk: i64 = 0;
+        while tk < n_inst {
+            n_taken = n_taken + taken.get(tk);
+            tk = tk + 1;
+        }
+        p_eprint_str("[inc] instance copies: " + int_to_str(copy_fn.len()) + " static copies of " + int_to_str(n_copied) + " of " + int_to_str(n_inst) + " instances (" + int_to_str(n_taken) + " address-taken, never copied)\n");
+    }
+}
+
 /// `ccompile --inc` (B1): lower `source`, cut it into IrUnits and make each
 /// unit's C generator input and object key (`build_key`: the build's
 /// compiler, flags and environment, inc_build_key). Ok: a short C-comment
@@ -13195,6 +13859,9 @@ pub fn ccompile_inc_prepare(source: str, source_path: str, borrowck_mode: str, b
             }
         }
     }
+    // B6: the own types' functions named by their type, not by the order
+    // this program's lowering met the types
+    incu_canon_own_names(& mut module);
     var ct_errs: Vec<str> = incu_ct_errors(& module);
     if ct_errs.len() > 0 {
         return ResultStr::Err(ct_errs);
@@ -13240,7 +13907,9 @@ pub fn ccompile_inc_prepare(source: str, source_path: str, borrowck_mode: str, b
         i = 0;
         while i < n && disp_u >= 0 {
             var dn: str = module.functions.get(i).name;
-            if dn == "__p_elem_drop" || dn == "__p_elem_dup" || dn == "__p_mem_drop" || dn == "__p_mem_dup" {
+            // (__p_key_strs too, lower.fd Lowerer_rc_gen_key_strs_fn: which
+            // words of each struct type hold strings, 2g.91)
+            if dn == "__p_elem_drop" || dn == "__p_elem_dup" || dn == "__p_mem_drop" || dn == "__p_mem_dup" || dn == "__p_key_strs" {
                 units.set(i, disp_u);
             }
             i = i + 1;
@@ -13264,6 +13933,16 @@ pub fn ccompile_inc_prepare(source: str, source_path: str, borrowck_mode: str, b
             }
             i = i + 1;
         }
+    }
+    // B3: an instance two or more units call gets a `static` copy in each
+    // of them but the one holding its definition (incu_copy_instances;
+    // FIDES_INC_INSTANCES=move: the moves above only; not with
+    // FIDES_INC_EFFECTS=off, whose prototypes are shared by every unit)
+    var copy_fn: Vec<i64> = Vec::new();
+    var copy_unit: Vec<i64> = Vec::new();
+    var inst_mode: str = env_or_empty("FIDES_INC_INSTANCES");
+    if inst_mode != "home" && inst_mode != "move" && env_or_empty("FIDES_INC_EFFECTS") != "off" {
+        incu_copy_instances(& module, unames, & mut units, & mut copy_fn, & mut copy_unit);
     }
     var unit_of: Vec<str> = Vec::new();
     i = 0;
@@ -13324,6 +14003,63 @@ pub fn ccompile_inc_prepare(source: str, source_path: str, borrowck_mode: str, b
         }
         i = i + 1;
     }
+    // B1 (2g.92): a unit's dynamic and function-value calls dispatch over
+    // functions of other units too. The C generator takes a dyn call's
+    // candidates among the types its module's trait impls and MakeDyns
+    // name (cg_collect_dyn_types) and a function-value call's among the
+    // functions it has: a unit gets the dyn types its calls can reach (a
+    // trait impl table of its own) and stubs of their methods, and stubs
+    // of every function a function value can name (a function reference)
+    // with the arity of a call through a function value its live functions
+    // make. Before, lib2's `d.area()` on main's Sq had no candidate and
+    // aborted (exit 127), and so did lib2's `f(x)` on main's function.
+    var live: i64 = incu_live(& module);
+    var dyn_types: i64 = HashMap_new();
+    var ti0: i64 = 0;
+    while ti0 < module.trait_impls.len() {
+        var titems: Vec<str> = module.trait_impls.get(ti0).items;
+        var tj: i64 = 0;
+        while tj < titems.len() {
+            HashMap_insert(dyn_types, titems.get(tj), 1);
+            tj = tj + 1;
+        }
+        ti0 = ti0 + 1;
+    }
+    var fn_pos: i64 = HashMap_new();
+    i = 0;
+    while i < n {
+        if HashMap_get(fn_pos, module.functions.get(i).name) == 0 {
+            HashMap_insert(fn_pos, module.functions.get(i).name, i + 1);
+        }
+        i = i + 1;
+    }
+    var fnref_ix: Vec<i64> = Vec::new();
+    var fnref_seen: i64 = HashMap_new();
+    i = 0;
+    while i < n {
+        var fe1: IrFunctionEntry = module.functions.get(i);
+        var k1: i64 = 0;
+        while k1 < fe1.func.insts.len() {
+            match fe1.func.insts.get(k1).inst {
+                Inst::MakeDyn(_, mtn, _) => {
+                    HashMap_insert(dyn_types, mtn, 1);
+                }
+                Inst::ConstFnRef(frn) => {
+                    var fat: i64 = HashMap_get(fn_pos, frn);
+                    if fat != 0 && HashMap_get(fnref_seen, frn) == 0 {
+                        HashMap_insert(fnref_seen, frn, 1);
+                        fnref_ix.push(fat - 1);
+                    }
+                }
+                _ => {
+                }
+            }
+            k1 = k1 + 1;
+        }
+        i = i + 1;
+    }
+    HashMap_drop(fnref_seen);
+    HashMap_drop(fn_pos);
     var opts: str = "fid-ir-unit 1 build " + int_to_str(build_key) + " FID_SWITCH=" + env_or_empty("FID_SWITCH") + " FID_C_CT_OFF=" + env_or_empty("FID_C_CT_OFF") + " FIDES_INC_EFFECTS=" + env_or_empty("FIDES_INC_EFFECTS") + " FIDES_INC_LAYOUTS=" + env_or_empty("FIDES_INC_LAYOUTS") + " FIDES_INC_EQ=" + env_or_empty("FIDES_INC_EQ") + " FIDES_INC_INSTANCES=" + env_or_empty("FIDES_INC_INSTANCES") + " FIDES_INC_SCOPE_DATA=" + env_or_empty("FIDES_INC_SCOPE_DATA") + " FIDES_INC_DISPATCH=" + env_or_empty("FIDES_INC_DISPATCH");
     // units sorted by name (the order of the .fides-tu files)
     var order: Vec<i64> = Vec::new();
@@ -13349,9 +14085,30 @@ pub fn ccompile_inc_prepare(source: str, source_path: str, borrowck_mode: str, b
         var own: i64 = HashMap_new();
         var want: i64 = HashMap_new();
         var dyn_done: i64 = HashMap_new();
+        // its functions, then the static copies of instances it calls (B3)
+        var unit_fns: Vec<IrFunctionEntry> = Vec::new();
         var k2: i64 = 0;
         while k2 < un.module.functions.len() {
-            var fe: IrFunctionEntry = un.module.functions.get(k2);
+            unit_fns.push(un.module.functions.get(k2));
+            k2 = k2 + 1;
+        }
+        var u_slot: i64 = c_unit_slot(unames, un.name);
+        var copy_names: Vec<str> = Vec::new();
+        k2 = 0;
+        while k2 < copy_fn.len() {
+            if copy_unit.get(k2) == u_slot {
+                var cfe: IrFunctionEntry = module.functions.get(copy_fn.get(k2));
+                unit_fns.push(cfe);
+                copy_names.push(cfe.name);
+            }
+            k2 = k2 + 1;
+        }
+        var u_dyn: Vec<str> = Vec::new();
+        var u_dyn_set: i64 = HashMap_new();
+        var ptr_arity: Vec<i64> = Vec::new();
+        k2 = 0;
+        while k2 < unit_fns.len() {
+            var fe: IrFunctionEntry = unit_fns.get(k2);
             cg.functions.push(fe);
             HashMap_insert(own, fe.name, 1);
             var nms: Vec<str> = Vec::new();
@@ -13362,7 +14119,8 @@ pub fn ccompile_inc_prepare(source: str, source_path: str, borrowck_mode: str, b
                 HashMap_insert(want, nms.get(q), 1);
                 q = q + 1;
             }
-            // a dynamic call dispatches to every `<Type>_<method>`
+            // a dynamic call dispatches to every `<Type>_<method>` whose
+            // type is a dyn type (cg_dyn_candidate)
             q = 0;
             while q < dys.len() {
                 if HashMap_get(dyn_done, dys.get(q)) == 0 {
@@ -13371,15 +14129,67 @@ pub fn ccompile_inc_prepare(source: str, source_path: str, borrowck_mode: str, b
                     var w: i64 = 0;
                     while w < n {
                         var wn: str = module.functions.get(w).name;
-                        if str_ends_with(wn, suffix) {
-                            HashMap_insert(want, wn, 1);
+                        if str_ends_with(wn, suffix) && str_len(wn) > str_len(suffix) {
+                            var wt: str = str_slice(wn, 0, str_len(wn) - str_len(suffix));
+                            if HashMap_get(dyn_types, wt) != 0 {
+                                HashMap_insert(want, wn, 1);
+                                if HashMap_get(u_dyn_set, wt) == 0 {
+                                    HashMap_insert(u_dyn_set, wt, 1);
+                                    u_dyn.push(wt);
+                                }
+                            }
                         }
                         w = w + 1;
                     }
                 }
                 q = q + 1;
             }
+            // the arities of its calls through a function value (env
+            // first: the C generator's candidates take args + 1), when a
+            // run can reach it
+            if HashMap_get(live, fe.name) != 0 {
+                var pk: i64 = 0;
+                while pk < fe.func.insts.len() {
+                    match fe.func.insts.get(pk).inst {
+                        Inst::CallPtr(_, pargs, _, _, _) => {
+                            if !vec_contains_i64(ptr_arity, pargs.len() + 1) {
+                                ptr_arity.push(pargs.len() + 1);
+                            }
+                        }
+                        _ => {
+                        }
+                    }
+                    pk = pk + 1;
+                }
+            }
             k2 = k2 + 1;
+        }
+        HashMap_drop(u_dyn_set);
+        // the functions a function value can name, with a matching arity
+        if ptr_arity.len() > 0 {
+            k2 = 0;
+            while k2 < fnref_ix.len() {
+                var rfe: IrFunctionEntry = module.functions.get(fnref_ix.get(k2));
+                if vec_contains_i64(ptr_arity, rfe.func.params.len()) {
+                    HashMap_insert(want, rfe.name, 1);
+                }
+                k2 = k2 + 1;
+            }
+        }
+        // the dyn types its dynamic calls dispatch over, sorted by name
+        if u_dyn.len() > 0 {
+            var di2: i64 = 1;
+            while di2 < u_dyn.len() {
+                var dk: i64 = di2;
+                while dk > 0 && str_compare(u_dyn.get(dk), u_dyn.get(dk - 1)) < 0 {
+                    var dtmp: str = u_dyn.get(dk);
+                    u_dyn.set(dk, u_dyn.get(dk - 1));
+                    u_dyn.set(dk - 1, dtmp);
+                    dk = dk - 1;
+                }
+                di2 = di2 + 1;
+            }
+            cg.trait_impls.push(StringVecStr_new("__inc_dyn", u_dyn));
         }
         k2 = 0;
         while k2 < un.imports.len() {
@@ -13392,18 +14202,40 @@ pub fn ccompile_inc_prepare(source: str, source_path: str, borrowck_mode: str, b
             HashMap_insert(want, module.c_callbacks.get(k2), 1);
             k2 = k2 + 1;
         }
-        // stubs of what it imports (main's unit: of every function), in
-        // the program's order
+        // stubs of what it imports, sorted by name (the program's order
+        // changes with the rest of the program: B6); main's unit, whose
+        // tail lists and registers them, gets every function in the
+        // program's order but a compiler-made one (`__eq_<S>` and the like)
+        // no run can reach, as a single TU's tail lists only those, so a
+        // struct whose `==` nothing uses changes its module's unit only (B2)
+        var stub_ix: Vec<i64> = Vec::new();
+        var stub_nm: Vec<str> = Vec::new();
         var w2: i64 = 0;
         while w2 < n {
             var we: IrFunctionEntry = module.functions.get(w2);
-            if HashMap_get(own, we.name) == 0 && (is_owner || HashMap_get(want, we.name) != 0) {
-                HashMap_insert(own, we.name, 2);
-                if is_owner && dl_at.get(w2) == 1 {
-                    cg.functions.push(we);
-                } else {
-                    cg.functions.push(incu_stub(& we));
+            if HashMap_get(own, we.name) == 0 {
+                var take: bool = HashMap_get(want, we.name) != 0;
+                if !take && is_owner {
+                    take = dl_at.get(w2) == 1 || !str_starts_with(we.name, "__") || HashMap_get(live, we.name) != 0;
                 }
+                if take {
+                    HashMap_insert(own, we.name, 2);
+                    stub_ix.push(w2);
+                    stub_nm.push(we.name);
+                }
+            }
+            w2 = w2 + 1;
+        }
+        if !is_owner {
+            stub_ix = incu_sort_by_name(stub_ix, stub_nm);
+        }
+        w2 = 0;
+        while w2 < stub_ix.len() {
+            var se: IrFunctionEntry = module.functions.get(stub_ix.get(w2));
+            if is_owner && dl_at.get(stub_ix.get(w2)) == 1 {
+                cg.functions.push(se);
+            } else {
+                cg.functions.push(incu_stub(& se));
             }
             w2 = w2 + 1;
         }
@@ -13480,14 +14312,29 @@ pub fn ccompile_inc_prepare(source: str, source_path: str, borrowck_mode: str, b
         var key: i64 = incu_hash(body, incu_hash(lay_bytes, hash_source(opts + role)));
         if str_len(env_or_empty("FIDES_INC_DEBUG")) > 0 {
             p_eprint_str("[inc] ir unit " + un.name + ": " + int_to_str(un.module.functions.len()) + " functions, " + int_to_str(cg.functions.len() - un.module.functions.len()) + " stubs, " + int_to_str(used.len()) + " of " + int_to_str(module.struct_layouts.len()) + " layouts\n");
+            // B2: the layout table of the unit, as split_c_units prints it
+            // on the C text path (the structs of the program it carries,
+            // the FFI declarations), tests/tooling/inc-layouts-check.sh
+            var n_lay_all: i64 = 0;
+            var lc: i64 = 0;
+            while lc < module.struct_layouts.len() {
+                if HashMap_get(lay_at, module.struct_layouts.get(lc).name) == lc + 1 {
+                    n_lay_all = n_lay_all + 1;
+                }
+                lc = lc + 1;
+            }
+            p_eprint_str("[inc] layouts " + un.name + ": " + int_to_str(used.len()) + " of " + int_to_str(n_lay_all) + " structs, " + int_to_str(cg.extern_decls.len()) + " of " + int_to_str(module.extern_decls.len()) + " externs\n");
         }
         g_incu_names.push(un.name);
+        g_incu_copies.push(str_join(copy_names, "\n"));
         g_incu_keys.push(key);
         g_incu_mods.push(cg);
         summary.append_str("// unit " + un.name + " " + int_to_str(key) + "\n");
         oi = oi + 1;
     }
     HashMap_drop(lay_at);
+    HashMap_drop(live);
+    HashMap_drop(dyn_types);
     HashMap_drop(t.owner);
     // the libraries the C names (codegen_c.fd emit_extern_decls), and the
     // loader the runtime header declares
@@ -13532,8 +14379,28 @@ pub fn incu_unit_c(i: i64) -> str {
         return "";
     }
     g_split_only = name;
+    // B3: the static copies this unit holds
+    if g_split_copies != 0 {
+        HashMap_drop(g_split_copies);
+        g_split_copies = 0;
+    }
+    if i < g_incu_copies.len() && str_len(g_incu_copies.get(i)) > 0 {
+        g_split_copies = HashMap_new();
+        var cnames: Vec<str> = str_split(g_incu_copies.get(i), "\n");
+        var ci: i64 = 0;
+        while ci < cnames.len() {
+            if str_len(cnames.get(ci)) > 0 {
+                HashMap_insert(g_split_copies, cnames.get(ci), 1);
+            }
+            ci = ci + 1;
+        }
+    }
     var parts: Vec<CUnit> = split_c_units(text);
     g_split_only = "";
+    if g_split_copies != 0 {
+        HashMap_drop(g_split_copies);
+        g_split_copies = 0;
+    }
     var p: i64 = 0;
     while p < parts.len() {
         if parts.get(p).name == name {
