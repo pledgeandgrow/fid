@@ -12314,7 +12314,7 @@ fn TypeChecker_ce6_type_name_known(self: &TypeChecker, n: str) -> bool {
     if str_len(n) == 1 {
         return true;
     }
-    if n == "Vec" || n == "HashMap" || n == "Option" || n == "Result" || n == "Box" || n == "Rc" || n == "Arc" || n == "Weak" || n == "Tensor" || n == "Channel" || n == "Task" || n == "Future" || n == "Mutex" || n == "RwLock" || n == "Cell" || n == "RefCell" || n == "String" || n == "usize" || n == "isize" || n == "char" || n == "f16" || n == "Any" || n == "Set" || n == "HashSet" || n == "Sender" || n == "Receiver" || n == "Region" || n == "Ptr" || n == "Slice" || n == "Range" || n == "Iterator" || n == "Fn" || n == "FnMut" || n == "FnOnce" {
+    if n == "Vec" || n == "VecV" || n == "HashMap" || n == "Option" || n == "Result" || n == "Box" || n == "Rc" || n == "Arc" || n == "Weak" || n == "Tensor" || n == "Channel" || n == "Task" || n == "Future" || n == "Mutex" || n == "RwLock" || n == "Cell" || n == "RefCell" || n == "String" || n == "usize" || n == "isize" || n == "char" || n == "f16" || n == "Any" || n == "Set" || n == "HashSet" || n == "Sender" || n == "Receiver" || n == "Region" || n == "Ptr" || n == "Slice" || n == "Range" || n == "Iterator" || n == "Fn" || n == "FnMut" || n == "FnOnce" {
         return true;
     }
     match self.current_self_type {
@@ -12603,7 +12603,7 @@ fn TypeChecker_check_func_body(self: &mut TypeChecker, func: Func) {
         var aggregate: bool = false;
         match vpt {
             Type::Generic(gn, _) => {
-                aggregate = gn == "Vec" || gn == "HashMap";
+                aggregate = gn == "Vec" || gn == "VecV" || gn == "HashMap";
             }
             Type::Named(nn) => {
                 aggregate = nn == "Vec" || nn == "HashMap" || tc_is_struct(self, nn);
@@ -13135,7 +13135,7 @@ fn tc_rt6_is_vec_new(e: Expr) -> bool {
             }
             match box_expr_unbox(recv) {
                 Expr::Ident(rn) => {
-                    return rn == "Vec";
+                    return rn == "Vec" || rn == "VecV";
                 }
                 _ => {
                 }
@@ -13250,7 +13250,7 @@ fn TypeChecker_rt6_note_push(self: &mut TypeChecker, receiver: Expr, recv_ty: Ty
     var bare: bool = false;
     match recv_ty {
         Type::Named(bn) => {
-            bare = bn == "Vec";
+            bare = bn == "Vec" || bn == "VecV";
         }
         _ => {
         }
@@ -13316,6 +13316,23 @@ fn TypeChecker_rt6_retype(self: &mut TypeChecker, name: str, ty: Type) {
 // --- Type utilities ------------------------------------------------------
 
 pub fn TypeChecker_resolve_type(self: &TypeChecker, ty: Type) -> Type {
+    // 0008: VecV is Vec to the type system (the sequential flag is the
+    // lowerer's, from the AST type the parser produced)
+    match ty {
+        Type::Generic(vvn, vva) => {
+            if vvn == "VecV" {
+                var vva2: Vec<Type> = Vec::new();
+                var vvi: i64 = 0;
+                while vvi < vva.len() {
+                    vva2.push(TypeChecker_resolve_type(self, vva.get(vvi)));
+                    vvi = vvi + 1;
+                }
+                return Type::Generic("Vec", vva2);
+            }
+        }
+        _ => {
+        }
+    }
     match ty {
         Type::Named(name) => {
             // OPTIMIZATION: use cached alias lookup instead of O(n) linear scan
@@ -14289,6 +14306,20 @@ fn tc_comptime_fold(e: Expr) -> Expr {
         }
     }
     return e;
+}
+
+/// 0008: Vec<E..> sits behind FID_CONTIGUOUS=1 until the suite is green
+/// (docs/proposals/0008-contiguous-data.md). One env read per process.
+var g_tc_vecv_gated: bool = false;
+fn tc_vecv_gate(self: &mut TypeChecker) {
+    if g_tc_vecv_gated {
+        return;
+    }
+    g_tc_vecv_gated = true;
+    var ev: str = p_getenv("FID_CONTIGUOUS");
+    if str_len(ev) == 0 || (ev as i64) == 0 {
+        self.errors.push("Type error: 'Vec<E..>' (a variant stream) is behind FID_CONTIGUOUS=1 (proposal 0008, in progress): set it to try it, or use the fixed-size Vec<E>");
+    }
 }
 
 /// src/typechecker.rs check_value_fits: a value given to an integer type
@@ -20260,6 +20291,9 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
             // nothing they could do, so they are comptime-only.
             // §4.11 annotation reflection and file embed: pure comptime
             // builtins of the evaluator (comptime_eval.fd), comptime-only
+            if callee == "__vecv_gate_marker" {
+                return Type::Void;
+            }
             if callee == "target_os" || callee == "target_arch" {
                 return Type::Str;
             }
@@ -21613,6 +21647,21 @@ pub fn TypeChecker_check_method_call(self: &mut TypeChecker, receiver: Expr, met
                     return Type::Generic("Arc", arc_args);
                 }
             }
+            if name == "VecV" && method == "new" {
+                tc_vecv_gate(self);
+                // the type the checker sees is Vec (resolve_type maps VecV
+                // to Vec); the lowerer reads the AST type (VecV) to route
+                match hint {
+                    Type::Generic(hn, hargs) => {
+                        if hn == "Vec" || hn == "VecV" {
+                            return Type::Generic("Vec", hargs);
+                        }
+                    }
+                    _ => {
+                    }
+                }
+                return Type::Named("Vec");
+            }
             if name == "Vec" && method == "new" {
                 match hint {
                     Type::Generic(hn, hargs) => {
@@ -21777,6 +21826,33 @@ pub fn TypeChecker_check_method_call(self: &mut TypeChecker, receiver: Expr, met
     // Builtin Vec methods
     match recv_ty {
         Type::Generic(name, gargs) => {
+            if name == "VecV" {
+                // 0008: a variant stream — build and walk (push/get/len/
+                // is_empty/last); the mutating-by-index forms are the
+                // fixed-mode Vec<E>'s
+                tc_vecv_gate(self);
+                var velem: Type = Type::Infer;
+                if gargs.len() > 0 {
+                    velem = gargs.get(0);
+                }
+                if method == "push" {
+                    if arg_types.len() == 1 && !TypeChecker_types_compatible(self, velem, arg_types.get(0)) {
+                        self.errors.push("Type error: cannot store " + type_to_str(arg_types.get(0)) + " in a Vec<" + type_to_str(velem) + "..> (push)");
+                    }
+                    return Type::Void;
+                }
+                if method == "get" || method == "last" {
+                    return velem;
+                }
+                if method == "len" {
+                    return Type::I64;
+                }
+                if method == "is_empty" {
+                    return Type::Bool;
+                }
+                self.errors.push("Type error (line " + int_to_str(self.current_line) + "): '" + method + "' is not a Vec<E..> method: a variant stream is built with push and read with get/last/len (indexing and overwriting are the fixed Vec<E>'s)");
+                return Type::Never;
+            }
             if name == "Vec" {
                 var elem_ty: Type = Type::I64;
                 if gargs.len() > 0 {
