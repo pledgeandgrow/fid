@@ -4340,17 +4340,92 @@ fn nat_decl_names(name: str, shown: str) -> Vec<str> {
 /// is none, the name is a generated one (`__...`), the file cannot be read
 /// or `FID_NAT_OFF=declline`.
 pub fn nat_dbg_decl_line(src: & mut NatDeclSrc, path: str, line: i64, name: str, shown: str) -> i64 {
-    if line <= 0 || str_len(path) == 0 || str_len(name) == 0 || !nat_dbg_decl_on() {
+    var d: i64 = nat_dbg_decl_find(src, path, line, name, shown);
+    if d <= 0 {
         return line;
+    }
+    return d;
+}
+
+/// DB2 (2g.102): the declaration of function `name` whose code is
+/// [start, end) of the image, from its line rows (`lrows`, triples of
+/// image position, line, 2 * file index + end flag, in image order; the
+/// scan starts at row `from`): [file (from 1), line]. The first row whose
+/// line has the function's `fn` line at or above it in its file
+/// (nat_dbg_decl_find) gives both: a function that begins with inlined
+/// code has first rows of the callee's lines (in its file, maybe below the
+/// callee's own `fn` and above the caller's: main got scale's line 56,
+/// not its own 76), so a row the scan finds nothing for is passed over, up
+/// to 8 of them. Else the first row's file and line, as before.
+pub fn nat_dbg_decl_of(src: & mut NatDeclSrc, file: str, lrows: & Vec<i64>, from: i64, end: i64, name: str, shown: str) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var ffile: i64 = 0;
+    var fline: i64 = 0;
+    // the rows already scanned without a find: file and line range
+    var nf: Vec<i64> = Vec::new();
+    var nlo: Vec<i64> = Vec::new();
+    var nhi: Vec<i64> = Vec::new();
+    var tries: i64 = 0;
+    var dk: i64 = from;
+    if dk < 0 {
+        dk = 0;
+    }
+    while tries < 8 && dk + 2 < lrows.len() && lrows.get(dk) < end {
+        if (lrows.get(dk + 2) & 1) == 0 && lrows.get(dk + 1) > 0 {
+            var f: i64 = (lrows.get(dk + 2) >> 1) + 1;
+            var l: i64 = lrows.get(dk + 1);
+            if fline == 0 {
+                ffile = f;
+                fline = l;
+            }
+            var known: bool = false;
+            var q: i64 = 0;
+            while q < nf.len() {
+                if nf.get(q) == f && l >= nlo.get(q) && l <= nhi.get(q) {
+                    known = true;
+                }
+                q = q + 1;
+            }
+            if !known {
+                var d: i64 = nat_dbg_decl_find(src, nat_decl_path(file, f), l, name, shown);
+                if d > 0 {
+                    out.push(f);
+                    out.push(d);
+                    return out;
+                }
+                if !nat_dbg_decl_on() || str_starts_with(name, "__") {
+                    // (no scan: switched off, a generated name: the first
+                    // row, as before)
+                    tries = 8;
+                }
+                nf.push(f);
+                nlo.push(l - 400);
+                nhi.push(l);
+                tries = tries + 1;
+            }
+        }
+        dk = dk + 3;
+    }
+    out.push(ffile);
+    out.push(fline);
+    return out;
+}
+
+/// DB2: nat_dbg_decl_line's scan: the `fn` line found, -1 when the scan
+/// finds none, 0 when there is nothing to scan (off, a generated name, no
+/// file or a line past its end).
+fn nat_dbg_decl_find(src: & mut NatDeclSrc, path: str, line: i64, name: str, shown: str) -> i64 {
+    if line <= 0 || str_len(path) == 0 || str_len(name) == 0 || !nat_dbg_decl_on() {
+        return 0;
     }
     // a generated function (`__closure_3`, `__own_dup_2`) has no `fn` line
     if str_starts_with(name, "__") {
-        return line;
+        return 0;
     }
     var fi: i64 = nat_decl_src_index(src, path);
     var cnt: i64 = src.count.get(fi);
     if line > cnt {
-        return line;
+        return 0;
     }
     var text: str = src.texts.get(fi);
     var tlen: i64 = str_len(text);
@@ -4384,7 +4459,7 @@ pub fn nat_dbg_decl_line(src: & mut NatDeclSrc, path: str, line: i64, name: str,
         }
         l = l - 1;
     }
-    return line;
+    return 0 - 1;
 }
 
 /// RL13 R2: whether the debug info writes the build's own paths (`--debug`
@@ -5200,20 +5275,13 @@ pub fn nat_dwarf_build(arch: i64, image: Vec<i64>, base: i64, names: Vec<str>, s
             // frame_base: DW_OP_call_frame_cfa
             info.push(1);
             info.push(0x9C);
-            var dfile: i64 = 0;
-            var dline: i64 = 0;
             while dri + 2 < lrows.len() && lrows.get(dri) < starts.get(i) {
                 dri = dri + 3;
             }
-            var dk: i64 = dri;
-            while dline == 0 && dk + 2 < lrows.len() && lrows.get(dk) < ends.get(i) {
-                if (lrows.get(dk + 2) & 1) == 0 && lrows.get(dk + 1) > 0 {
-                    dfile = (lrows.get(dk + 2) >> 1) + 1;
-                    dline = lrows.get(dk + 1);
-                }
-                dk = dk + 3;
-            }
-            dline = nat_dbg_decl_line(& mut dsrc, nat_decl_path(file, dfile), dline, names.get(i), shown);
+            // (2g.102: the first row of the function's own code)
+            var ddecl: Vec<i64> = nat_dbg_decl_of(& mut dsrc, file, & lrows, dri, ends.get(i), names.get(i), shown);
+            var dfile: i64 = ddecl.get(0);
+            var dline: i64 = ddecl.get(1);
             nat_put_u16(& mut info, dfile);
             nat_put_u32(& mut info, dline);
             nat_dbg_put_vars(& mut info, i, dbg_vat, starts.get(i) - lo, & mut dloc, lists, base + lo, ends.get(i) - starts.get(i));
@@ -8247,17 +8315,10 @@ pub fn nat_macho_dwarf(names: & Vec<str>, starts: & Vec<i64>, ends: Vec<i64>, fi
         while dri + 2 < lrows.len() && lrows.get(dri) < starts.get(i) {
             dri = dri + 3;
         }
-        var dfile: i64 = 0;
-        var dline: i64 = 0;
-        var dk: i64 = dri;
-        while dline == 0 && dk + 2 < lrows.len() && lrows.get(dk) < ends.get(i) {
-            if (lrows.get(dk + 2) & 1) == 0 && lrows.get(dk + 1) > 0 {
-                dfile = (lrows.get(dk + 2) >> 1) + 1;
-                dline = lrows.get(dk + 1);
-            }
-            dk = dk + 3;
-        }
-        dline = nat_dbg_decl_line(& mut dsrc, nat_decl_path(fname, dfile), dline, names.get(i), shown);
+        // (2g.102: the first row of the function's own code)
+        var ddecl: Vec<i64> = nat_dbg_decl_of(& mut dsrc, fname, & lrows, dri, ends.get(i), names.get(i), shown);
+        var dfile: i64 = ddecl.get(0);
+        var dline: i64 = ddecl.get(1);
         nat_put_u16(& mut info, dfile);
         nat_put_u32(& mut info, dline);
         i = i + 1;

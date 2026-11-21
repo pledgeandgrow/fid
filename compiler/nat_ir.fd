@@ -691,6 +691,15 @@ fn ng_fcs_on(g: & NatGen) -> bool {
     if g_ng_fcs_sw != 2 || g_ng_fcs_block || g.win || ng_x64(g) {
         return false;
     }
+    // RA18 (Nov 21): RISC-V's callee-saved float registers cost more than
+    // they win: ra18_float_bench measured a program 1.07x the time of
+    // spilling under qemu (AArch64: 0.89) — twelve d-registers to save and
+    // restore in every prologue for the ranges that cross calls. Off on
+    // RV64 until a cost model weighs it per function; FID_NAT_ON-style
+    // opt-in does not exist for this switch, so the check is here.
+    if g.arch == NAT_RV64 {
+        return false;
+    }
     return ng_fregs_on(g);
 }
 
@@ -8099,6 +8108,8 @@ var g_ng_env_on: str = "";
 var g_ng_env_mut: str = "";
 var g_ng_env_verify: bool = false;
 var g_ng_env_fast: bool = false;
+var g_ng_env_dump: str = "";
+var g_ng_env_frames: bool = false;
 
 fn ng_env_list(name: str) -> str {
     var v: str = p_getenv(name);
@@ -8116,7 +8127,26 @@ fn ng_env_cache_load() {
     g_ng_env_verify = (v as i64) != 0 && str_len(v) > 0;
     var fv: str = p_getenv("FID_NAT_FAST");
     g_ng_env_fast = (fv as i64) != 0 && str_len(fv) > 0 && fv != "0";
+    var rv: str = p_getenv("FID_NAT_FRAMES");
+    g_ng_env_frames = (rv as i64) != 0 && str_len(rv) > 0 && rv != "0";
+    g_ng_env_dump = "";
+    var dv: str = p_getenv("FID_NAT_DUMP");
+    if (dv as i64) != 0 {
+        g_ng_env_dump = dv;
+    }
     g_ng_env_ok = true;
+}
+
+/// RA14: FID_NAT_DUMP ("" when not set; asked a few times per function)
+fn ng_env_dump() -> str {
+    if g_ng_env_ok {
+        return g_ng_env_dump;
+    }
+    var dv: str = p_getenv("FID_NAT_DUMP");
+    if (dv as i64) == 0 {
+        return "";
+    }
+    return dv;
 }
 
 /// A backend switch, on unless FID_NAT_OFF names it.
@@ -11456,6 +11486,20 @@ fn ng_fb_defines_any(mir: & Vec<MInst>, dpos: & Vec<i64>, v: i64) -> bool {
     return false;
 }
 
+/// ng_fb_defines_any with one position of dpos left out: the read-modify-
+/// write's own operation (its position is in the deleted set) may be the
+/// two-address destination `and d, d, x` — deleted, it defines nothing.
+fn ng_fb_defines_any_but(mir: & Vec<MInst>, dpos: & Vec<i64>, v: i64, skip: i64) -> bool {
+    var j: i64 = 0;
+    while j < dpos.len() {
+        if dpos.get(j) != skip && mir.get(dpos.get(j)).r0 == v {
+            return true;
+        }
+        j = j + 1;
+    }
+    return false;
+}
+
 /// An instruction strictly between p and k, other than those at dpos,
 /// writes v.
 fn ng_fb_redef(mir: & Vec<MInst>, dpos: & Vec<i64>, p: i64, k: i64, v: i64) -> bool {
@@ -13404,6 +13448,9 @@ pub struct NgPhys {
     // written at k without being named (ng_implicit_writes)
     pub live: Vec<i64>,
     // holding a value some later operation reads, after k
+    pub cpy: Vec<i64>,
+    // 2g.88: the register a move at k copies into a value (`mov v, r`),
+    // which may define v into r itself
 }
 
 /// RA7: the argument-register model of `mir` (see above).
@@ -13415,6 +13462,7 @@ fn ng_ra7_info(g: & NatGen, mir: & Vec<MInst>, mb: & MBlocks, cands: i64) -> NgP
     var imp: Vec<i64> = Vec::new();
     var kill: Vec<i64> = Vec::new();
     var live: Vec<i64> = Vec::new();
+    var cpy: Vec<i64> = Vec::new();
     // (the result words are argument registers 0 and 1, Inst::Return; on
     // x86-64 result_reg is rax, a scratch register, and word 0 is rdi:
     // without it here a range ending between `mov rdi, result` and the
@@ -13447,6 +13495,11 @@ fn ng_ra7_info(g: & NatGen, mir: & Vec<MInst>, mb: & MBlocks, cands: i64) -> NgP
         imp.push(ng_implicit_regs(g, m, cands));
         kill.push(ng_implicit_writes(g, m, cands));
         live.push(0);
+        if m.op == MO_MOV && m.r0 >= NG_VBASE && m.r1 >= 0 && m.r1 < 64 && (cands & (1 << m.r1)) != 0 {
+            cpy.push(1 << m.r1);
+        } else {
+            cpy.push(0);
+        }
         k = k + 1;
     }
     // The registers some path wrote since the last call (forward, union
@@ -13566,7 +13619,7 @@ fn ng_ra7_info(g: & NatGen, mir: & Vec<MInst>, mb: & MBlocks, cands: i64) -> NgP
         b = b + 1;
     }
     return NgPhys {
-        rd: rd, wr: wr, imp: imp, kill: kill, live: live
+        rd: rd, wr: wr, imp: imp, kill: kill, live: live, cpy: cpy
     };
 }
 
@@ -13595,7 +13648,8 @@ fn ng_arg_fit(ph: & NgPhys, r: i64, lo: i64, hi: i64, blind: bool) -> bool {
 
 /// RA7 / RA3 (2g.88): at the last position `hi` of a range, r's own value
 /// may be live after it only when that operation writes r by name (the
-/// operand copy `mov r, v` a hint is for). Else the range's value is
+/// operand copy `mov r, v` a hint is for) or copies r into the value (`mov
+/// v, r`: the value then is r's own, as the checker allows). Else the range's value is
 /// defined there (a dead definition, the hull one position long: an `li`
 /// whose use add-immediate selection folded away) and would overwrite the
 /// argument or result r holds; before, such a range took r (the allocation
@@ -13608,7 +13662,7 @@ fn ng_arg_fit_end(ph: & NgPhys, r: i64, hi: i64) -> bool {
         return false;
     }
     var bit: i64 = 1 << r;
-    return (ph.live.get(hi) & bit) == 0 || (ph.wr.get(hi) & bit) != 0;
+    return (ph.live.get(hi) & bit) == 0 || ((ph.wr.get(hi) | ph.cpy.get(hi)) & bit) != 0;
 }
 
 /// RA7: after the scan (and RA2), each integer range a move ties to an
@@ -15223,8 +15277,27 @@ fn ng_mir_alloc_body(g: & mut NatGen, rec: & NatFnRec) -> NatAlloc {
                 // (set below), none of its own
                 spill.set(i, 0 - 1);
             } else {
-                spill.set(i, cur);
-                cur = cur + 8;
+                // MI8 (Nov 21): spilled vregs whose position ranges never
+                // overlap share one slot — a linear range covers every
+                // point a vreg's slot is written or read, so disjoint
+                // ranges cannot see each other's bytes. Bounded: the scan
+                // is quadratic in the spilled count.
+                var share: i64 = 0 - 1;
+                if i < 4096 {
+                    var j2: i64 = 0;
+                    while j2 < i && share < 0 {
+                        if spill.get(j2) >= rec.base_frame && lo.get(j2) >= 0 && lo.get(i) >= 0 && (hi.get(i) < lo.get(j2) || hi.get(j2) < lo.get(i)) {
+                            share = spill.get(j2);
+                        }
+                        j2 = j2 + 1;
+                    }
+                }
+                if share >= 0 {
+                    spill.set(i, share);
+                } else {
+                    spill.set(i, cur);
+                    cur = cur + 8;
+                }
             }
         }
         i = i + 1;
@@ -15320,7 +15393,7 @@ fn ng_mir_alloc_body(g: & mut NatGen, rec: & NatFnRec) -> NatAlloc {
     }
     // MI11: FID_NAT_DUMP=<function> (or `*`: every function; main.fd may
     // set g_nat_dump instead) prints the function's MIR with its allocation
-    var dump: str = p_getenv("FID_NAT_DUMP");
+    var dump: str = ng_env_dump();
     var dump_on: bool = g_nat_dump == rec.name || g_nat_dump == "*";
     if (dump as i64) != 0 && str_len(dump) > 0 && (dump == rec.name || dump == "*") {
         dump_on = true;
@@ -15420,7 +15493,7 @@ fn ng_alloc_dump_wanted(name: str) -> bool {
     if g_nat_dump == name || g_nat_dump == "*" {
         return true;
     }
-    var dump: str = p_getenv("FID_NAT_DUMP");
+    var dump: str = ng_env_dump();
     return (dump as i64) != 0 && str_len(dump) > 0 && (dump == name || dump == "*");
 }
 
@@ -24916,7 +24989,12 @@ fn ng_fuse_rmw(g: & NatGen, mir: & mut Vec<MInst>, nvreg: i64, keep: i64) -> i64
                                         set.push(dval.get(q0));
                                         q0 = q0 + 1;
                                     }
-                                    ok = ng_fb_deletable(mir, & uses, & set, s, nv) && !ng_fb_defines_any(mir, & set, st.r0) && !ng_fb_defines_any(mir, & set, lb) && !ng_fb_defines_any(mir, & set, a) && !ng_fb_defines_any(mir, & set, keep);
+                                    // OP18: on the load-on-the-right side the
+                                    // other operand may be the operation's
+                                    // own destination (`and d, d, x`); the
+                                    // operation is in the set and deleted,
+                                    // so only the rest may not define it
+                                    ok = ng_fb_deletable(mir, & uses, & set, s, nv) && !ng_fb_defines_any(mir, & set, st.r0) && !ng_fb_defines_any(mir, & set, lb) && !ng_fb_defines_any_but(mir, & set, a, k) && !ng_fb_defines_any(mir, & set, keep);
                                 }
                                 if ok {
                                     // the operand: a constant of the stretch
@@ -24945,6 +25023,13 @@ fn ng_fuse_rmw(g: & NatGen, mir: & mut Vec<MInst>, nvreg: i64, keep: i64) -> i64
                                             set = all;
                                         }
                                     } else if ng_fb_same(mir, k, a, s, a) {
+                                        mode = 0;
+                                    } else if a == m.r0 && !ng_fb_redef(mir, & set, k, s, a) {
+                                        // OP18: two-address form (`and d, d,
+                                        // x`, d the other operand): deleted,
+                                        // d keeps the operand's value up to
+                                        // the store, which is what the fused
+                                        // `op [base + disp], d` reads
                                         mode = 0;
                                     }
                                     if mode >= 0 {
@@ -27339,9 +27424,11 @@ fn ng_vz_class(g: & NatGen, func: & IrFunction, vz: & mut NgVz, k: i64, id: i64,
                 return "";
             }
             if p == vz.sslot {
-                if inhead {
-                    return "the accumulator read in the loop header";
-                }
+                // OP22 (Nov 21): also in the loop header — after the ssa
+                // round trip the accumulator's load sits at the top of the
+                // header (the phi's slot), and it is the same loop-carried
+                // start value the generated code loads itself before the
+                // vector loop (ng_vz_slot_ld below)
                 if !ir_type_eq(lty, IrType::I64) {
                     return "an accumulator that is not an i64";
                 }
@@ -31788,9 +31875,11 @@ fn nat_generate_image1(module: IrModule, arch: i64, win: bool, mac: bool) -> Res
     // this machine's system folder or FID_NAT_LIBPATH), macOS from the SDK's
     // text-based stubs (nat_enc.fd nat_pe_link_missing,
     // nat_macho_link_missing; nothing when they are not here)
-    if g.win && ng_ldyn_ok(& g) && g.ld.names.len() > 0 {
+    // (not for an object, 2g.110: its C functions may come from the other
+    // objects and libraries it is linked with; the linker reports them)
+    if g.win && !g_nat_object && ng_ldyn_ok(& g) && g.ld.names.len() > 0 {
         c_missing = nat_pe_link_missing(& g.ld.names, & g.ld.libs);
-    } else if g.mac && ng_ldyn_ok(& g) && g.ld.names.len() > 0 {
+    } else if g.mac && !g_nat_object && ng_ldyn_ok(& g) && g.ld.names.len() > 0 {
         c_missing = nat_macho_link_missing(& g.ld.names, & g.ld.libs);
     }
     var other_unres: Vec<str> = Vec::new();
@@ -34454,6 +34543,9 @@ fn ng_dbg_frames_on() -> bool {
     if g_nat_dbg_frames {
         return true;
     }
+    if g_ng_env_ok {
+        return g_ng_env_frames;
+    }
     var v: str = p_getenv("FID_NAT_FRAMES");
     if (v as i64) == 0 {
         return false;
@@ -37056,6 +37148,13 @@ fn nc_skel_fn(g: & mut NatGen, name: str, ix: i64) {
         HashMap_insert(g_nc_line_fns, name, 1);
     }
     var e: NcEntry = g.nc_old.get(ix - 1);
+    // SP6/SP20: what the recording asked for, in its order, first (2g.82:
+    // before the skeleton's call edges below, which asked for their labels
+    // first: a callee the recording asked for later, after a string or
+    // another function, was queued earlier, so a hit image placed the
+    // functions in another order than a build without the cache; 25,528
+    // bytes of hello differed from pe_dbg_free on)
+    nc_log_replay(g, & e.regs);
     var rec2: NatFnRec = NatFnRec {
         name: name, mir: Vec::new(), nvreg: 0, base_frame: 0, slots: Vec::new(), is_ct: false, sret_v: 0 - 1, sret_size: 0, secret: false
     };
@@ -37086,8 +37185,6 @@ fn nc_skel_fn(g: & mut NatGen, name: str, ix: i64) {
         });
     }
     g.recs.push(rec2);
-    // SP6/SP20: what the recording asked for, in its order, first
-    nc_log_replay(g, & e.regs);
     var r: i64 = 0;
     while r < e.refs.len() {
         var rl: i64 = ng_fn_label(g, e.refs.get(r));
@@ -38841,7 +38938,7 @@ fn ng_dump_wanted(name: str) -> bool {
     if g_nat_dump == name || g_nat_dump == "*" {
         return true;
     }
-    var dump: str = p_getenv("FID_NAT_DUMP");
+    var dump: str = ng_env_dump();
     if (dump as i64) == 0 || str_len(dump) == 0 {
         return false;
     }

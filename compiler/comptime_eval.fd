@@ -564,6 +564,8 @@ pub fn process_gen(program: Program) -> Program {
     // (substitute, which runs later, resets both again).
     g_ct_steps = 0;
     g_ct_call_stack = Vec::new();
+    g_ct_memo_keys = Vec::new();
+    g_ct_memo_vals = Vec::new();
     g_ct_line = 0;
     g_ct_subst_line = 0;
     var fbg: str = p_getenv("FID_CT_FALLBACK");
@@ -1816,6 +1818,8 @@ pub fn substitute(program: Program) -> Program {
     // as before the hardening).
     g_ct_steps = 0;
     g_ct_subst_errors = Vec::new();
+    g_ct_memo_keys = Vec::new();
+    g_ct_memo_vals = Vec::new();
     g_ct_call_stack = Vec::new();
     g_ct_line = 0;
     g_ct_subst_line = 0;
@@ -4767,6 +4771,155 @@ fn evaluate_with_env(expr: & Expr, env: & ComptimeEnv, original: & Program) -> R
     return ResultExpr::Ok(Expr::IntLit(0));
 }
 
+// --- Comptime memoization --------------------------------------------------
+// A comptime fn called again with the same literal arguments returns the
+// cached value: the substitution phases iterate, and generated code asks
+// the same questions per instantiation (a serializer over every field of
+// every type). Keyed on the function and its argument values — all a
+// comptime fn can read besides consts, which one pass never changes.
+// A body that calls gensym() is never memoized (its value is fresh per
+// call), and the cache empties with each pass's other state.
+var g_ct_memo_keys: Vec<str> = Vec::new();
+var g_ct_memo_vals: Vec<Expr> = Vec::new();
+
+/// "" when the arguments are not memoizable literals.
+fn ct_memo_key(func: Func, args: & Vec<Expr>) -> str {
+    var k: str = func.name;
+    var i: i64 = 0;
+    while i < args.len() {
+        k = k + "|";
+        match args.get(i) {
+            Expr::IntLit(n) => {
+                k = k + "i" + int_to_str(n);
+            }
+            Expr::BoolLit(b) => {
+                if b {
+                    k = k + "b1";
+                } else {
+                    k = k + "b0";
+                }
+            }
+            Expr::StringLit(sv) => {
+                k = k + "s" + int_to_str(str_len(sv)) + ":" + sv;
+            }
+            _ => {
+                return "";
+            }
+        }
+        i = i + 1;
+    }
+    return k;
+}
+
+fn ct_memo_get(key: str) -> OptExpr {
+    var i: i64 = 0;
+    while i < g_ct_memo_keys.len() {
+        if g_ct_memo_keys.get(i) == key {
+            return OptExpr::Some(g_ct_memo_vals.get(i));
+        }
+        i = i + 1;
+    }
+    return OptExpr::None;
+}
+
+/// Whether any statement calls gensym() (directly or in a nested block):
+/// such a function's value is fresh per call and is never cached.
+fn ct_stmts_use_gensym(stmts: Vec<Stmt>) -> bool {
+    var i: i64 = 0;
+    while i < stmts.len() {
+        if ct_stmt_uses_gensym(stmts.get(i)) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn ct_expr_uses_gensym(e: Expr) -> bool {
+    match e {
+        Expr::Call(cn, cargs) => {
+            if cn == "gensym" {
+                return true;
+            }
+            var i: i64 = 0;
+            while i < cargs.len() {
+                if ct_expr_uses_gensym(cargs.get(i)) {
+                    return true;
+                }
+                i = i + 1;
+            }
+        }
+        Expr::MethodCall(r, _, margs) => {
+            if ct_expr_uses_gensym(ct_box_expr_unbox(r)) {
+                return true;
+            }
+            var j: i64 = 0;
+            while j < margs.len() {
+                if ct_expr_uses_gensym(margs.get(j)) {
+                    return true;
+                }
+                j = j + 1;
+            }
+        }
+        Expr::Binary(_, l, r2) => {
+            return ct_expr_uses_gensym(ct_box_expr_unbox(l)) || ct_expr_uses_gensym(ct_box_expr_unbox(r2));
+        }
+        Expr::Unary(_, inner) => {
+            return ct_expr_uses_gensym(ct_box_expr_unbox(inner));
+        }
+        Expr::Block(bs) => {
+            return ct_stmts_use_gensym(bs);
+        }
+        _ => {
+        }
+    }
+    return false;
+}
+
+fn ct_stmt_uses_gensym(stmt: Stmt) -> bool {
+    match stmt {
+        Stmt::Let(_, _, e, _, _, _, _) => {
+            return ct_expr_uses_gensym(e);
+        }
+        Stmt::Assign(_, _, e, _) => {
+            return ct_expr_uses_gensym(e);
+        }
+        Stmt::Expr(e2, _) => {
+            return ct_expr_uses_gensym(e2);
+        }
+        Stmt::Return(opt, _) => {
+            match opt {
+                OptBoxExpr::Some(e3) => {
+                    return ct_expr_uses_gensym(ct_box_expr_unbox(e3));
+                }
+                OptBoxExpr::None => {
+                }
+            }
+        }
+        Stmt::If(c, t, eb, _) => {
+            if ct_expr_uses_gensym(c) || ct_stmts_use_gensym(t) {
+                return true;
+            }
+            match eb {
+                OptStmts::Some(ebs) => {
+                    return ct_stmts_use_gensym(ebs);
+                }
+                OptStmts::None => {
+                }
+            }
+        }
+        Stmt::While(c2, b, _) => {
+            return ct_expr_uses_gensym(c2) || ct_stmts_use_gensym(b);
+        }
+        Stmt::For(_, it, b2, _) => {
+            return ct_expr_uses_gensym(it) || ct_stmts_use_gensym(b2);
+        }
+        _ => {
+        }
+    }
+    return false;
+}
+
 fn call_comptime_func(func: Func, args: Vec<Expr>, original: & Program) -> ResultExpr {
     if args.len() != func.params.len() {
         return ResultExpr::Err("comptime function '" + func.name + "' expects " + int_to_str(func.params.len()) + " args, got " + int_to_str(args.len()));
@@ -4785,6 +4938,20 @@ fn call_comptime_func(func: Func, args: Vec<Expr>, original: & Program) -> Resul
     if g_ct_call_depth >= 400 {
         return ResultExpr::Err("comptime calls nest deeper than 400 (through '" + func.name + "')");
     }
+    // The memo: same function, same literal arguments, value already known
+    var mkey: str = "";
+    if !ct_stmts_use_gensym(func.body) {
+        mkey = ct_memo_key(func, & args);
+        if str_len(mkey) > 0 {
+            match ct_memo_get(mkey) {
+                OptExpr::Some(mv) => {
+                    return ResultExpr::Ok(mv);
+                }
+                OptExpr::None => {
+                }
+            }
+        }
+    }
     if !ct_fuel_left() {
         return ct_out_of_fuel();
     }
@@ -4796,8 +4963,12 @@ fn call_comptime_func(func: Func, args: Vec<Expr>, original: & Program) -> Resul
     // trace of the boundary error shows the whole failing chain (the
     // boundary clears the stack before the next evaluation).
     match cres {
-        ResultExpr::Ok(_) => {
+        ResultExpr::Ok(mv) => {
             g_ct_call_stack.pop();
+            if str_len(mkey) > 0 && g_ct_memo_keys.len() < 4096 {
+                g_ct_memo_keys.push(mkey);
+                g_ct_memo_vals.push(mv);
+            }
         }
         ResultExpr::Err(_) => {
         }

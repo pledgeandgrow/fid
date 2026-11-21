@@ -21,7 +21,7 @@
 > are still in the file and still called from the stub list. Importers:
 > pe_ir, iropt, nat_ir, main.
 >
-> **Nov 21, uncommitted — 2g.96 and an argv over-allocation (RL16)
+> **Nov 21 (5fb5516) — 2g.96 and an argv over-allocation (RL16)
 > fixed.** `PeirGen_gen_to_str`'s itoa buffer was 16 bytes at rbp-40,
 > under the saved r14 at rbp-24: a number of 16 or more characters
 > (i64::MIN is 20 and its NUL) overwrote the caller's r14, and

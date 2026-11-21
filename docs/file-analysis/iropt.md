@@ -22,7 +22,7 @@
 > reports mismatches on most hits (2g.93), `FID_VERIFY=1` rejects two suite
 > programs after iropt (2g.109).
 >
-> **Nov 21, uncommitted — 2g.89 and 2g.109 fixed.** `iro_sccp`'s BitNot
+> **Nov 21 (5fb5516) — 2g.89 and 2g.109 fixed.** `iro_sccp`'s BitNot
 > fold was `0 - av - 1`, which overflows on `av = i64::MIN` (`~(1 << 63)`);
 > it is `av ^ (0 - 1)` now (:4486-4489). The `fid emit compiler/main.fd`
 > overflow is gone. 2g.109's two causes were fixed where they lived: the

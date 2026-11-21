@@ -20,7 +20,7 @@ Audited 2026-11-09 (new doc).
 > (`codegen --coff`, `emit --obj --nat`) fail with `undefined symbol:
 > FreeLibrary` (2g.110). The text below is of Nov 9.
 >
-> **Nov 21, uncommitted — 2g.106 fixed, and the TLS half of 2g.99.**
+> **Nov 21 (5fb5516) — 2g.106 fixed, and the TLS half of 2g.99.**
 > `nat_pe_link_missing` (:3133) is the Windows `nat_elf_link_missing`: it
 > finds each import's DLL (`nat_pe_find_dll`: `FID_NAT_LIBPATH` directories
 > separated by ';', else `%SystemRoot%\System32`), reads its export

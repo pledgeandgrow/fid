@@ -1,7 +1,7 @@
 # Self-Hosted Fides Compiler
 
 > **Status (Nov 21, 2026):** the self-hosted compiler `fid` (`compiler/*.fd`,
-> 80 modules, 360,657 lines; 56 reached from `main.fd`) is the release
+> 80 modules, 361,942 lines; 56 reached from `main.fd`) is the release
 > compiler and defines the language ([reference.md](reference.md)); the Rust
 > compiler `fidesc` (`src/*.rs`, 57 files, 114,184 lines) is frozen and builds
 > stage 1 and runs the test harness. `RELEASE=1 CC="zig cc"
@@ -104,7 +104,7 @@ them and link here). Counted with `wc -l` on Nov 21, 2026 (HEAD 7897c78).
 
 | Component | Files | Lines |
 |-----------|-------|-------|
-| Self-hosted compiler (`compiler/*.fd`) | 80 (56 reached from `main.fd`) | 360,657 |
+| Self-hosted compiler (`compiler/*.fd`) | 80 (56 reached from `main.fd`) | 361,942 |
 | Rust compiler (`src/*.rs`, frozen) | 57 | 114,184 |
 | Stdlib (`stdlib/*.fd`) | 403 | 259,299 |
 | Native runtimes (`stdlib/pe_runtime/`, `stdlib/linux_runtime/`) | 4 + 7 | 10,602 + 13,229 |
@@ -2452,7 +2452,7 @@ Probe tests for self-hosting behavior:
 
 ```
 fid/
-├── compiler/             # Self-hosted Fides compiler modules (80 .fd files, 360,657 lines, Nov 21; list below is from session 16)
+├── compiler/             # Self-hosted Fides compiler modules (80 .fd files, 361,942 lines, Nov 21; list below is from session 16)
 │   ├── main.fd           # CLI entry point (ccompile + build + lsp + test + fmt + ...)
 │   ├── compiler.fd       # Pipeline driver
 │   ├── token.fd          # Token kinds (133 variants)

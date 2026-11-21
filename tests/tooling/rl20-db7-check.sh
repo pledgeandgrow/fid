@@ -106,7 +106,10 @@ exit 0
 EOF
 cp "$T/test_driver_reduce_hang.fd" "$DIR/hang_in.fd"
 t0=$(date +%s)
-"$FID" reduce "$DIR/hang_in.fd" -o "$DIR/hang_out.fd" --cmd "bash $DIR/pred.sh {}" --timeout 5 > "$DIR/hang.log" 2>&1
+# 2g.105: with NoDefaultCurrentDirectoryInExePath set, cmd.exe does not run
+# a bare `_fid_reduce_cmd.bat` from the current directory (Windows; other
+# hosts ignore the variable)
+NoDefaultCurrentDirectoryInExePath=1 "$FID" reduce "$DIR/hang_in.fd" -o "$DIR/hang_out.fd" --cmd "bash $DIR/pred.sh {}" --timeout 5 > "$DIR/hang.log" 2>&1
 rc=$?
 t1=$(date +%s)
 if [ $rc -eq 0 ]; then ok "fid reduce ended (status 0)"; else bad "fid reduce: status $rc (see $DIR/hang.log)"; fi

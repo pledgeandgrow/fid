@@ -19,7 +19,7 @@
 > ownership section, which is why a fid built by fidesc runs out of
 > memory self-compiling the tree (2g.79).
 >
-> **Nov 21, uncommitted — 2g.109's lowering half is fixed:** a `select`
+> **Nov 21 (5fb5516) — 2g.109's lowering half is fixed:** a `select`
 > case's variable slot (and the `recv` slot) was emitted with
 > `Inst::Alloca` into the current region — inside one case's block — and
 > the next case and a later `select` found it by name in blocks it does

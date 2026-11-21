@@ -1010,6 +1010,17 @@ pub fn subst_expr(expr: Expr, subst: Vec<SubstEntry>, renames: Vec<RenameEntry>,
             return Expr::Call(new_callee, new_args);
         }
         Expr::Ident(s) => {
+            // L8E: the unrolled loop variable reads its copy's element
+            // (2g.84): `x` aliases xs__<k>, a parameter whose type the call
+            // resolution sees
+            // (innermost first: a pack loop nested in another's body)
+            var pai: i64 = g_mono_pack_aliases.len() - 1;
+            while pai >= 0 {
+                if g_mono_pack_aliases.get(pai) == s {
+                    return Expr::Ident(g_mono_pack_alias_tos.get(pai));
+                }
+                pai = pai - 1;
+            }
             // L8E: the pack being written out read any other way (xs[i],
             // xs.get(i), passed as a value): it has no single type
             if g_mono_pack_var != "" && s == g_mono_pack_var {
@@ -2349,6 +2360,15 @@ var g_mono_pack_n: i64 = 0;
 // a counter naming the flags and one-pass loops of unrolled pack loops
 var g_mono_pack_fname: str = "";
 var g_mono_pack_uid: i64 = 0;
+// while one copy of an unrolled `for x in xs` substitutes (subst_expr): the
+// loop variable's name and the element it reads, xs__<k> ("" = none). The
+// copies are made for `x` to alias that parameter, so a call on `x` resolves
+// against the element's type as `xs.get(k)` does (the `let x = xs__<k>` the
+// copies start with sits inside a block the call's type inference does not
+// see, so it resolved every call on `x` to the generic overload — 2g.84).
+// (a stack: a pack loop in the body of another pushes its own pair)
+var g_mono_pack_aliases: Vec<str> = Vec::new();
+var g_mono_pack_alias_tos: Vec<str> = Vec::new();
 
 /// Whether the pack being written out may be passed on, as the last
 /// argument, to `callee`: a pack function or a Vec variadic function.
@@ -2702,12 +2722,17 @@ fn mono_pack_unroll(x: str, body: Vec<Stmt>, line: i64, subst: Vec<SubstEntry>, 
         }
         subst_set(& mut ks, g_mono_pack_tp, Type::Named(g_mono_pack_tp + "__" + int_to_str(k)));
         var one: Vec<Stmt> = Vec::new();
-        one.push(Stmt::Let(x, OptType::None, Expr::Ident(g_mono_pack_var + "__" + int_to_str(k)), false, false, Vec::new(), line));
+        one.push(Stmt::Let(x, OptType::Some(Type::Named(g_mono_pack_tp + "__" + int_to_str(k))), Expr::Ident(g_mono_pack_var + "__" + int_to_str(k)), false, false, Vec::new(), line));
+        val alias_depth: i64 = g_mono_pack_aliases.len();
+        g_mono_pack_aliases.push(x);
+        g_mono_pack_alias_tos.push(g_mono_pack_var + "__" + int_to_str(k));
         var i: i64 = 0;
         while i < body.len() {
             one.push(subst_stmt(body.get(i), ks, renames, method_renames));
             i = i + 1;
         }
+        g_mono_pack_aliases.truncate(alias_depth);
+        g_mono_pack_alias_tos.truncate(alias_depth);
         copies.push(Stmt::If(Expr::BoolLit(true), one, OptStmts::None, line));
         k = k + 1;
     }
@@ -2738,12 +2763,17 @@ fn mono_pack_unroll_jumps(x: str, body: Vec<Stmt>, line: i64, subst: Vec<SubstEn
         }
         subst_set(& mut ks, g_mono_pack_tp, Type::Named(g_mono_pack_tp + "__" + int_to_str(k)));
         var one: Vec<Stmt> = Vec::new();
-        one.push(Stmt::Let(x, OptType::None, Expr::Ident(g_mono_pack_var + "__" + int_to_str(k)), false, false, Vec::new(), line));
+        one.push(Stmt::Let(x, OptType::Some(Type::Named(g_mono_pack_tp + "__" + int_to_str(k))), Expr::Ident(g_mono_pack_var + "__" + int_to_str(k)), false, false, Vec::new(), line));
+        val alias_depth: i64 = g_mono_pack_aliases.len();
+        g_mono_pack_aliases.push(x);
+        g_mono_pack_alias_tos.push(g_mono_pack_var + "__" + int_to_str(k));
         var i: i64 = 0;
         while i < body.len() {
             one.push(subst_stmt(body.get(i), ks, renames, method_renames));
             i = i + 1;
         }
+        g_mono_pack_aliases.truncate(alias_depth);
+        g_mono_pack_alias_tos.truncate(alias_depth);
         if has_break {
             one = mono_pack_mark_breaks(one, flag);
         }

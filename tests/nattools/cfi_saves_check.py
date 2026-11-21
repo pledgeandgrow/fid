@@ -152,6 +152,7 @@ def main():
                 break
         if not first_at:
             continue
+        first_loc = min(a for (a, _) in first_at.values())
         with_saves += 1
         tag = "FDE 0x%x" % start
         for reg, (at_loc, n) in first_at.items():
@@ -165,7 +166,19 @@ def main():
                 f, body_at = fr
                 disp = 16 + f - 8 * n
                 hw = X64_HW.get(reg, reg)
-                if not x64_stores(code[body_at:at_loc - start], hw, disp):
+                # 2g.103: a save RA12 defers (shrink wrapping) gets its
+                # rule where its block starts, and a block reached only
+                # after the store may be laid out before it (hm_mem_slot:
+                # `jmp L2; L1: jmp out; L2: mov [rsp+72], r15 ... jmp L1`,
+                # L1's rows say r15 is saved). The prologue's rules (the
+                # first location with a rule) need the store before them;
+                # a later one, the store somewhere in the function (which
+                # rows say what where is sw_cfi_check.py's part, against
+                # the FID_NAT_OFF=shrinkwrap image).
+                upto = at_loc - start
+                if at_loc != first_loc:
+                    upto = len(code)
+                if not x64_stores(code[body_at:upto], hw, disp):
                     fails.append("%s: r%d said saved at CFA-%d, but no mov [rsp+%d] of it before 0x%x"
                                  % (tag, reg, 8 * n, disp, at_loc))
     if with_saves < want:

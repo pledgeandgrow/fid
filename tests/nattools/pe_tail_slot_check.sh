@@ -20,7 +20,7 @@ fails=0
 ok() { echo "ok   $1"; }
 bad() { echo "FAIL $1"; fails=$((fails + 1)); }
 
-expected() { sed -n '/^\/\/ Expected output:/,/^[^/]/p' "$1" | sed -n 's|^// \(.*\)|\1|p' | sed '1d'; }
+expected() { sed -n '/^\/\/ Expected output/,/^[^/]/p' "$1" | sed -n 's|^// \(.*\)|\1|p' | sed '1d'; }
 
 case "$(uname -s)" in
     MINGW*|MSYS*|CYGWIN*|Windows_NT) ;;

@@ -5231,7 +5231,12 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
                 } else if is_tcc {
                     p_eprint_str("note: --cpu " + cc_march + ": tcc takes no target CPU\n");
                 } else if !(cc_march == "native" && zig_cross) {
-                    gcc_opt = gcc_opt + " -march=" + cc_march;
+                    // 2g.111: zig cc spells the CPU its own way
+                    if str_contains(cc, "zig") {
+                        gcc_opt = gcc_opt + " -march=" + zig_march_name(cc_march);
+                    } else {
+                        gcc_opt = gcc_opt + " -march=" + cc_march;
+                    }
                 }
             }
             // the --max-mem / --cpu-limit defaults (above)
@@ -8514,6 +8519,54 @@ fn reduce_read(path: str) -> str {
     return "";
 }
 
+/// 2g.111 (OP20): the --cpu name `march` (nat_cpu_check's, armv8.0-a
+/// already armv8-a) as zig cc's -march takes it. zig names its CPU models
+/// with `_` (x86_64_v3) and an AArch64 or RISC-V level as a generic model
+/// plus features; it rejects the GCC/clang spellings ("unknown CPU: 'x86'"
+/// for x86-64-v3). Any other name is passed as it is.
+fn zig_march_name(march: str) -> str {
+    if march == "x86-64-v3" {
+        return "x86_64_v3";
+    }
+    if march == "x86-64-v4" {
+        return "x86_64_v4";
+    }
+    if march == "armv8-a" {
+        return "generic+v8a";
+    }
+    if march == "armv8.1-a" {
+        return "generic+v8_1a";
+    }
+    if march == "armv8.2-a" {
+        return "generic+v8_2a";
+    }
+    if march == "armv8.4-a" {
+        return "generic+v8_4a";
+    }
+    if march == "armv9-a" {
+        return "generic+v9a";
+    }
+    if march == "rv64g" {
+        return "generic_rv64+m+a+f+d";
+    }
+    if march == "rv64gc" || march == "rv64imafdc" {
+        return "generic_rv64+m+a+f+d+c";
+    }
+    if march == "rv64gc_zba_zbb" {
+        return "generic_rv64+m+a+f+d+c+zba+zbb";
+    }
+    if march == "rv64gcv" {
+        return "generic_rv64+m+a+f+d+c+v";
+    }
+    if march == "rva22u64" {
+        return "generic_rv64+m+a+f+d+c+zba+zbb+zbs";
+    }
+    if march == "rva23u64" {
+        return "generic_rv64+m+a+f+d+c+zba+zbb+zbs+v";
+    }
+    return march;
+}
+
 // RL20: a try of `fid reduce` that runs too long (a candidate whose loop
 // lost its step runs forever) is killed with its children after
 // `--timeout <s>` seconds (default REDUCE_TIMEOUT_DEFAULT, reduce.py's 300;
@@ -8548,7 +8601,10 @@ fn reduce_system(line: str, log: str, secs: i64) -> i64 {
         // the command in a batch file (cmd.exe reads it as p_system would
         // the line); `%` doubled so it stays itself there
         p_file_write("_fid_reduce_cmd.bat", "@echo off\r\n" + str_replace(line, "%", "%%") + " > " + log + " 2>&1\r\nexit /b %ERRORLEVEL%\r\n");
-        var ps: str = "$p = Start-Process -FilePath 'cmd.exe' -ArgumentList '/d','/c','_fid_reduce_cmd.bat' -NoNewWindow -PassThru\n";
+        // 2g.105: `.\` names it in the current directory: with
+        // NoDefaultCurrentDirectoryInExePath set, cmd does not look there
+        // for a bare name, so every try failed ("not recognized")
+        var ps: str = "$p = Start-Process -FilePath 'cmd.exe' -ArgumentList '/d','/c','.\\_fid_reduce_cmd.bat' -NoNewWindow -PassThru\n";
         // the handle kept, or ExitCode reads empty after the exit
         ps = ps + "$null = $p.Handle\n";
         ps = ps + "if (-not $p.WaitForExit(" + int_to_str(secs * 1000) + ")) {\n";

@@ -1318,11 +1318,15 @@ pub fn PeirGen_generate(self: & mut PeirGen, module: & IrModule) -> Vec {
 
 /// Is the COFF symbol table written (FID_PE_SYMS unset, or not "0")?
 fn peir_syms_on() -> bool {
-    var sw: str = p_getenv("FID_PE_SYMS");
-    if (sw as i64) == 0 {
-        return true;
+    match env_var("FID_PE_SYMS") {
+        Option::Some(sw) => {
+            return sw != "0";
+        }
+        Option::None => {
+            return true;
+        }
     }
-    return sw != "0";
+    return true;
 }
 
 /// Add `name` to the symbol lists when it labels code placed in .text.
@@ -1719,7 +1723,7 @@ pub fn PeirGen_gen_function(self: & mut PeirGen, name: str, func: & IrFunction, 
             self.lrows.push(0);
         }
     }
-    if str_len(p_getenv("PE_DUMP_FN")) > 0 {
+    if str_len(peir_env_or_empty("PE_DUMP_FN")) > 0 {
         p_eprint_str("FN " + name + " @" + int_to_str(self.enc.code.len()) + "\n");
     }
 
@@ -1893,6 +1897,17 @@ pub fn PeirGen_gen_function(self: & mut PeirGen, name: str, func: & IrFunction, 
     self.tail_next = false;
     self.tail_done = false;
     var no_reg: Vec<i64> = peir_zeros(nvals);
+    // N9 (known-bugs 2g.104): a debug build that keeps the allocator
+    // (FID_PE_DEBUG_RA=1) keeps the parameters in their frame slots, which
+    // hold them for the whole function: in a register they showed as
+    // optimized out, and a register is theirs only to their last use
+    if use_regs && g_pe_lines_names != "" && peir_on("dbgvars") {
+        var dpi: i64 = 0;
+        while dpi < func.params.len() {
+            peir_mark(& mut no_reg, func.params.get(dpi).id, nvals);
+            dpi = dpi + 1;
+        }
+    }
     var used_regs: Vec<i64> = Vec::new();
     var ra_facts: PeirRaFacts = PeirRaFacts_new();
     // Value id -> 1 + register, from the whole-function allocator (D4)
@@ -2469,7 +2484,9 @@ fn PeirGen_gen_insts(self: & mut PeirGen, ids: Vec<i64>, n: i64, frame: & mut Pe
 /// OP13 (known-bugs 2g.98): the call ids[at] (value `call`) is in tail
 /// position through a result slot: the next instructions are `store call
 /// -> slot` (a stack alloca, of the call's type) and `jump B`, and B,
-/// after blocks that only jump on, starts `l = load slot; return l`. The
+/// after blocks that only jump on or copy the slot into the next one
+/// (`l = load slot; store l -> slot2; jump C`: nested inlining), starts
+/// `l = load slot; return l`. The
 /// IR optimizer's inliner gives this shape to an inlined `return g(x)`
 /// (is_even inlined into is_odd: is_odd's `return is_odd(n - 2)` stored
 /// into is_even's result slot), so the call was a call and 100 million
@@ -2599,11 +2616,105 @@ fn peir_tail_via_slot(func: & IrFunction, ids: Vec<i64>, at: i64, call: i64) -> 
             }
             target = on_to;
             hops = hops + 1;
+        } else if bids.len() == 3 {
+            // an outer inlined callee's result slot: `l = load slot;
+            // store l -> slot2; jump C` (nested inlining)
+            var fwd: i64 = peir_slot_forward(func, bids, slot, call_ty);
+            if fwd < 0 {
+                return false;
+            }
+            slot = fwd;
+            match IrFunction_get_inst(func, bids.get(2)) {
+                OptInst::Some(fj) => {
+                    match fj {
+                        Inst::Jump(jt3) => {
+                            on_to = jt3;
+                        }
+                        _ => {
+                        }
+                    }
+                }
+                OptInst::None => {
+                }
+            }
+            if on_to < 0 {
+                return false;
+            }
+            target = on_to;
+            hops = hops + 1;
         } else {
             return peir_slot_load_return(func, bids, slot, call_ty);
         }
     }
     return false;
+}
+
+/// peir_tail_via_slot through nested inlining: the block `bids` is `l =
+/// load slot` (of type ty), `store l -> slot2` (a stack alloca) and a
+/// jump: slot2, or -1 when it is not that.
+fn peir_slot_forward(func: & IrFunction, bids: Vec<i64>, slot: i64, call_ty: IrType) -> i64 {
+    var lid: i64 = bids.get(0);
+    match IrFunction_get_inst(func, lid) {
+        OptInst::Some(li) => {
+            match li {
+                Inst::Load(lptr, lty) => {
+                    if lptr != slot || !ir_type_eq(lty, call_ty) {
+                        return 0 - 1;
+                    }
+                }
+                _ => {
+                    return 0 - 1;
+                }
+            }
+        }
+        OptInst::None => {
+            return 0 - 1;
+        }
+    }
+    var slot2: i64 = 0 - 1;
+    match IrFunction_get_inst(func, bids.get(1)) {
+        OptInst::Some(si) => {
+            match si {
+                Inst::Store(sptr, sval, sty) => {
+                    if sval != lid {
+                        return 0 - 1;
+                    }
+                    match sty {
+                        OptIrType::Some(sty2) => {
+                            if !ir_type_eq(sty2, call_ty) {
+                                return 0 - 1;
+                            }
+                        }
+                        OptIrType::None => {
+                        }
+                    }
+                    slot2 = sptr;
+                }
+                _ => {
+                    return 0 - 1;
+                }
+            }
+        }
+        OptInst::None => {
+            return 0 - 1;
+        }
+    }
+    match IrFunction_get_inst(func, slot2) {
+        OptInst::Some(ai) => {
+            match ai {
+                Inst::Alloca(_, _) => {
+                    return slot2;
+                }
+                _ => {
+                    return 0 - 1;
+                }
+            }
+        }
+        OptInst::None => {
+            return 0 - 1;
+        }
+    }
+    return 0 - 1;
 }
 
 /// peir_tail_via_slot's last step: the block (its instructions `bids`)
@@ -7147,8 +7258,8 @@ fn peir_ct_line(func: & IrFunction, id: i64) -> str {
 
 /// Is the check turned off (FID_PE_CT_OFF set and not empty)?
 fn peir_ct_off() -> bool {
-    var sw: str = p_getenv("FID_PE_CT_OFF");
-    return (sw as i64) != 0 && str_len(sw) > 0 && sw != "0";
+    var sw: str = peir_env_or_empty("FID_PE_CT_OFF");
+    return str_len(sw) > 0 && sw != "0";
 }
 
 /// The violations of @constant_time function `func` (named `name`), one
@@ -7994,32 +8105,63 @@ pub fn peir_dbg_type_descs(module: & IrModule) -> Vec<str> {
 /// the pointer and value of a Store, and any value used other than as a
 /// Load's pointer (its address escapes). An alloca nothing writes never
 /// holds its variable (the slot is shown only when something does).
+/// Known-bugs 2g.104: only the instructions of the blocks count. The IR
+/// optimizer takes an instruction out of its block and leaves it in
+/// func.insts: `-g` showed main's `total`, `shown` and `sum` at slots
+/// whose stores the mid-end had forwarded away (0, a stack address).
 fn peir_dbg_written(func: & IrFunction) -> i64 {
     var w: i64 = HashMap_new();
     var ops: Vec<i64> = Vec::new();
-    var i: i64 = 0;
-    while i < func.insts.len() {
-        var inst: Inst = func.insts.get(i).inst;
-        match inst {
-            Inst::Load(_, _) => {
-            }
-            Inst::Store(p, v, _) => {
-                HashMap_insert(w, int_to_str(p), 1);
-                HashMap_insert(w, int_to_str(v), 1);
-            }
-            _ => {
-                ops.clear();
-                peir_inst_operands(inst, & mut ops);
-                var k: i64 = 0;
-                while k < ops.len() {
-                    HashMap_insert(w, int_to_str(ops.get(k)), 1);
-                    k = k + 1;
+    var bi: i64 = 0;
+    while bi < func.blocks.len() {
+        var bids: Vec<i64> = func.blocks.get(bi).instructions;
+        var i: i64 = 0;
+        while i < bids.len() {
+            match IrFunction_get_inst(func, bids.get(i)) {
+                OptInst::Some(inst) => {
+                    match inst {
+                        Inst::Load(_, _) => {
+                        }
+                        Inst::Store(p, v, _) => {
+                            HashMap_insert(w, int_to_str(p), 1);
+                            HashMap_insert(w, int_to_str(v), 1);
+                        }
+                        _ => {
+                            ops.clear();
+                            peir_inst_operands(inst, & mut ops);
+                            var k: i64 = 0;
+                            while k < ops.len() {
+                                HashMap_insert(w, int_to_str(ops.get(k)), 1);
+                                k = k + 1;
+                            }
+                        }
+                    }
+                }
+                OptInst::None => {
                 }
             }
+            i = i + 1;
         }
-        i = i + 1;
+        bi = bi + 1;
     }
     return w;
+}
+
+/// N9 (2g.104): the ids of the instructions in `func`'s blocks (what is
+/// generated); one only in func.insts was taken out by the IR optimizer.
+fn peir_dbg_live(func: & IrFunction) -> i64 {
+    var live: i64 = HashMap_new();
+    var bi: i64 = 0;
+    while bi < func.blocks.len() {
+        var bids: Vec<i64> = func.blocks.get(bi).instructions;
+        var i: i64 = 0;
+        while i < bids.len() {
+            HashMap_insert(live, int_to_str(bids.get(i)), 1);
+            i = i + 1;
+        }
+        bi = bi + 1;
+    }
+    return live;
 }
 
 /// N9: where value `id` (a parameter or a value a variable is bound to)
@@ -8059,6 +8201,7 @@ fn PeirGen_dbg_vars_note(self: & mut PeirGen, func: & IrFunction, module: & IrMo
         return;
     }
     var written: i64 = peir_dbg_written(func);
+    var live: i64 = peir_dbg_live(func);
     var params: i64 = HashMap_new();
     var i: i64 = 0;
     while i < func.params.len() {
@@ -8080,9 +8223,10 @@ fn PeirGen_dbg_vars_note(self: & mut PeirGen, func: & IrFunction, module: & IrMo
             var loc: str = "";
             var is_alloca: bool = false;
             var gone: bool = true;
+            // (an instruction out of every block is gone: 2g.104)
             match IrFunction_get_inst(func, id) {
                 OptInst::Some(inst) => {
-                    gone = false;
+                    gone = !HashMap_contains(live, int_to_str(id));
                     match inst {
                         Inst::Alloca(aty, _) => {
                             is_alloca = true;

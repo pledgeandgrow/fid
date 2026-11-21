@@ -8,7 +8,7 @@
 > skips it (`FID_VERIFY` is not in the build key, 2g.15). New open: it
 > rejects two suite programs after iropt (2g.109).
 >
-> **Nov 21, uncommitted:** the two 2g.109 causes were fixed where they
+> **Nov 21 (5fb5516):** the two 2g.109 causes were fixed where they
 > lived — the select-statement slot a dominated block found by name is an
 > entry-block `Lowerer_txn_raw_slot` now (lower.fd), and `ime_remap`
 > covers `PersistLoad`/`PersistSave`/`Backward` while

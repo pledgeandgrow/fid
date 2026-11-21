@@ -1,0 +1,131 @@
+// 2g.102 (docs/reference/known-bugs.md; DB2 in docs/roadmap/llvm-roadmap.md):
+// a function that begins with inlined code gets its own `fn` line as
+// DW_AT_decl_line, not the callee's. Its first line rows are the callee's
+// lines (main of tests/bootstrap/test_nattools_decl_lines.fd beginning
+// with sum_to's body, line 43): nat_dbg_decl_line scanned up from that row
+// for `fn main`, found none (main is declared below, at 76) and kept 43
+// (a real image: main 56, want 76). compiler/nat_enc.fd nat_dbg_decl_of
+// passes over rows whose scan finds nothing and takes the first row of the
+// function's own code (78 -> 76). Then the writers: nat_dwarf_build (ELF
+// and `--nat` PE) and nat_macho_dwarf with such rows.
+// Run (from the repository root):
+//   fid run tests/nattools/decl_inlined_unit.fd
+// Expected output:
+// inlined first: 1:76
+// own first: 1:76
+// only inlined: 1:43
+// declline off: 1:43
+// elf main decl 1:76
+// macho main decl 1:76
+
+use core;
+use vec;
+use string;
+use compiler::nat_enc;
+
+fn le16(b: &Vec<i64>, at: i64) -> i64 {
+    return b.get(at) | (b.get(at + 1) << 8);
+}
+
+fn le32(b: &Vec<i64>, at: i64) -> i64 {
+    return b.get(at) | (b.get(at + 1) << 8) | (b.get(at + 2) << 16) | (b.get(at + 3) << 24);
+}
+
+fn src_path() -> str {
+    return "tests/bootstrap/test_nattools_decl_lines.fd";
+}
+
+fn row(r: &mut Vec<i64>, pos: i64, line: i64) {
+    r.push(pos);
+    r.push(line);
+    r.push(0);
+}
+
+fn show(label: str, d: &Vec<i64>) {
+    println(label + ": " + int_to_str(d.get(0)) + ":" + int_to_str(d.get(1)));
+}
+
+/// The offset in `b` just past the bytes of `s` and its NUL, where `s`
+/// follows the byte `code`; -1 when it is not there.
+fn after_name(b: &Vec<i64>, code: i64, s: str) -> i64 {
+    var n: i64 = str_len(s);
+    var i: i64 = 1;
+    while i + n < b.len() {
+        if b.get(i - 1) == code {
+            var k: i64 = 0;
+            while k < n && b.get(i + k) == str_byte_at(s, k) {
+                k = k + 1;
+            }
+            if k == n && b.get(i + n) == 0 {
+                return i + n + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn main() {
+    var path: str = src_path();
+    nat_line_files_reset(path);
+    // main at [0, 64): rows 43 and 45 (sum_to's body, inlined), then 78
+    var rows: Vec<i64> = Vec::new();
+    row(& mut rows, 0, 43);
+    row(& mut rows, 8, 45);
+    row(& mut rows, 16, 78);
+    rows.push(64);
+    rows.push(0);
+    rows.push(1);
+    var src: NatDeclSrc = NatDeclSrc_new();
+    var d1: Vec<i64> = nat_dbg_decl_of(& mut src, path, & rows, 0, 64, "main", "");
+    show("inlined first", & d1);
+    var own: Vec<i64> = Vec::new();
+    row(& mut own, 0, 78);
+    row(& mut own, 8, 43);
+    var d2: Vec<i64> = nat_dbg_decl_of(& mut src, path, & own, 0, 64, "main", "");
+    show("own first", & d2);
+    // no row of main's own: the first row, as before
+    var only: Vec<i64> = Vec::new();
+    row(& mut only, 0, 43);
+    var d3: Vec<i64> = nat_dbg_decl_of(& mut src, path, & only, 0, 64, "main", "");
+    show("only inlined", & d3);
+    // FID_NAT_OFF=declline is read from the environment; a generated name
+    // keeps the first row the same way
+    var d4: Vec<i64> = nat_dbg_decl_of(& mut src, path, & rows, 0, 64, "__closure_9", "");
+    show("declline off", & d4);
+
+    // the writers
+    var names: Vec<str> = Vec::new();
+    names.push("main");
+    var starts: Vec<i64> = Vec::new();
+    starts.push(0);
+    var ends: Vec<i64> = Vec::new();
+    ends.push(64);
+    var image: Vec<i64> = Vec::new();
+    var k: i64 = 0;
+    while k < 64 {
+        image.push(0);
+        k = k + 1;
+    }
+    g_nat_dbg_ext = true;
+    var no_cfi: Vec<i64> = Vec::new();
+    var dw: NatDwarf = nat_dwarf_build(NAT_X64, image, 0x400000, names, starts, ends, path, rows, no_cfi, false);
+    g_nat_dbg_ext = false;
+    var einfo: Vec<i64> = dw.info;
+    var p: i64 = after_name(& einfo, 7, "main");
+    if p < 0 {
+        println("elf main missing");
+    } else {
+        p = p + 18;
+        println("elf main decl " + int_to_str(le16(& einfo, p)) + ":" + int_to_str(le32(& einfo, p + 2)));
+    }
+    var parts: Vec<Vec<i64>> = nat_macho_dwarf(& names, & starts, ends, path, rows, 0x100000000);
+    var minfo: Vec<i64> = parts.get(1);
+    var q: i64 = after_name(& minfo, 2, "main");
+    if q < 0 {
+        println("macho main missing");
+    } else {
+        q = q + 16;
+        println("macho main decl " + int_to_str(le16(& minfo, q)) + ":" + int_to_str(le32(& minfo, q + 2)));
+    }
+}

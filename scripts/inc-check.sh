@@ -23,6 +23,8 @@
 # Usage: scripts/inc-check.sh
 #   FID=<fid>   the compiler (default release/fid.exe, else release/fid)
 #   CC=<cc>     C compiler (default "zig cc"); OPT=<0..3> C opt level (0)
+#   KEEP=<dir>  work in <dir> and keep it (B9: FIXPOINT=1 KEEP=/tmp/fx
+#               leaves fx/ref.c, fx/inc.c, fx/*.err, fx/b1.log, fx/b2.log)
 set -u
 cd "$(dirname "$0")/.." || exit 1
 ROOT=$(pwd)
@@ -36,8 +38,15 @@ export CC="${CC:-zig cc}"
 # through FID_HOME (or beside its own exe, which a FID outside the tree is not)
 export FID_HOME="${FID_HOME:-$ROOT}"
 OPT="${OPT:-0}"
-TMP=$(mktemp -d)
-trap 'rm -rf "$TMP"' EXIT
+# KEEP=<dir>: work in <dir> and keep it (the fixture, and for FIXPOINT=1 the
+# --inc compiler, ref.c, inc.c and every log) to diff by hand (B9)
+if [ -n "${KEEP:-}" ]; then
+  TMP="$KEEP"; mkdir -p "$TMP"
+  echo "work files kept in $TMP"
+else
+  TMP=$(mktemp -d)
+  trap 'rm -rf "$TMP"' EXIT
+fi
 fail=0
 bad() { echo "  FAIL  $1"; fail=1; }
 ok() { echo "  ok    $1"; }
@@ -145,13 +154,23 @@ if [ "${FIXPOINT:-0}" = 1 ]; then
   X="$TMP/fx"; mkdir -p "$X"
   if "$FID" ccompile compiler/main.fd --inc --cc-opt "$OPT" -o "$X/fid-inc.exe" >"$X/b1.log" 2>&1; then
     ok "compiler built from $(grep -oE '[0-9]+ units' "$X/b1.log" | tail -1)"
-    "$FID" dump-c compiler/main.fd >"$X/ref.c" 2>/dev/null
-    "$X/fid-inc.exe" dump-c compiler/main.fd >"$X/inc.c" 2>/dev/null
+    # stderr kept: a dump-c that ran out of memory is not a C difference
+    "$FID" dump-c compiler/main.fd >"$X/ref.c" 2>"$X/ref.err"; ref_rc=$?
+    "$X/fid-inc.exe" dump-c compiler/main.fd >"$X/inc.c" 2>"$X/inc.err"; inc_rc=$?
     if [ -s "$X/ref.c" ] && cmp -s "$X/ref.c" "$X/inc.c"; then ok "the --inc compiler generates the same C ($(wc -c <"$X/ref.c") bytes)"
-    else bad "the --inc compiler's C for compiler/main.fd differs from $FID's"; fi
-    if "$X/fid-inc.exe" ccompile compiler/main.fd --inc --cc-opt "$OPT" -o "$X/fid-inc2.exe" >"$X/b2.log" 2>&1 \
-       && grep -q '^All [0-9]* units up to date' "$X/b2.log"; then ok "self-build reused every unit's object (hash-identical artifacts)"
-    else bad "self-build with the --inc compiler: $(grep -E '^Compiling|^All|failed' "$X/b2.log" | head -3)"; fi
+    elif [ "$ref_rc" != 0 ] || [ ! -s "$X/ref.c" ]; then bad "$FID dump-c compiler/main.fd failed (exit $ref_rc): $(tail -2 "$X/ref.err" | tr '\n' ' ')"
+    elif [ "$inc_rc" != 0 ] || [ ! -s "$X/inc.c" ]; then bad "the --inc compiler's dump-c failed (exit $inc_rc, $(wc -c <"$X/inc.c") bytes): $(tail -2 "$X/inc.err" | tr '\n' ' ')"
+    else
+      bad "the --inc compiler's C for compiler/main.fd differs from $FID's: $(cmp "$X/ref.c" "$X/inc.c" 2>&1 | head -1) (ref $(wc -c <"$X/ref.c"), inc $(wc -c <"$X/inc.c") bytes; KEEP=<dir> keeps both)"
+      diff "$X/ref.c" "$X/inc.c" 2>/dev/null | head -20 | sed 's/^/        /'
+    fi
+    if "$X/fid-inc.exe" ccompile compiler/main.fd --inc --cc-opt "$OPT" -o "$X/fid-inc2.exe" >"$X/b2.log" 2>&1; then
+      if grep -q '^All [0-9]* units up to date' "$X/b2.log"; then ok "self-build reused every unit's object (hash-identical artifacts)"
+      else bad "self-build with the --inc compiler rebuilt units: $(grep -E '^Compiling|^All' "$X/b2.log" | head -3)"; fi
+    else
+      bad "self-build with the --inc compiler failed (exit $?): $(grep -E '^Compiling|^All|failed|Panic|error' "$X/b2.log" | head -3)"
+      tail -5 "$X/b2.log" | sed 's/^/        /'
+    fi
   else bad "ccompile --inc compiler/main.fd failed"; tail -15 "$X/b1.log"; fi
 fi
 

@@ -183,17 +183,17 @@ and `AGENTS.md` first when working on the compiler.
 |------|----:|-------------|
 | **Driver** | | |
 | [main.fd](compiler/main.fd) | 9,570 | `fid` entry point: global flags, command dispatch (`run`, `ccompile`, `emit`/`build`, `check`, `fix`, `fmt`, `lint`, `test`, `fuzz`, `bench`, `lsp`, `serve`, `wasm`, `gpu`, `disasm`, `reduce`, `ir-fuzz`, `split-c`, `test-rules`, …), C compiler invocation, build cache, `--target` handling |
-| [compiler.fd](compiler/compiler.fd) | 13,468 | Pipeline: core and runtime merge, imports, AST passes, checks, lowering; backend entry points |
+| [compiler.fd](compiler/compiler.fd) | 13,502 | Pipeline: core and runtime merge, imports, AST passes, checks, lowering; backend entry points |
 | [inc.fd](compiler/inc.fd) | 1,751 | Build stamps, `.fidcache` artifact store, checked-core stamp, in-memory IR cache |
 | [csplit.fd](compiler/csplit.fd) | 590 | `fid split-c`: the compiler's C as a header plus n units (the -O2 release build) |
 | [build_info.fd](compiler/build_info.fd) | 60 | **new.** Version stamp: `fid_version_base` "1.0.0", `fid version` prints `1.0.0+dev` on dev builds, release version written by `scripts/build-info.sh` |
 | **Front end** | | |
 | [token.fd](compiler/token.fd) | 686 | Token kinds, raw-discriminant tags |
 | [lexer.fd](compiler/lexer.fd) | 1,805 | Source → tokens (`5e3` still lexes as `5`, `e3`) |
-| [parser.fd](compiler/parser.fd) | 10,621 | Tokens → AST: f-strings, turbofish, spawn/cancel scopes, `@secret` flag |
+| [parser.fd](compiler/parser.fd) | 10,682 | Tokens → AST: f-strings, turbofish, spawn/cancel scopes, `@secret` flag |
 | [ast.fd](compiler/ast.fd) | 2,640 | AST types and shared helpers |
 | [ast_ser.fd](compiler/ast_ser.fd) | 2,706 | **new.** Binary AST codec ("FIDA" + hash): the checked stdlib/runtime artifact in `.fidcache` so later compiles skip lexing/parsing (CS2) |
-| [comptime_eval.fd](compiler/comptime_eval.fd) | 4,833 | `comptime gen` and compile-time substitution |
+| [comptime_eval.fd](compiler/comptime_eval.fd) | 4,989 | `comptime gen` and compile-time substitution |
 | [mono.fd](compiler/mono.fd) | 5,473 | Turbofish resolution and monomorphization (renaming misses calls inside closures, f-strings, `\|>`: 2g.8) |
 | **Checks** | | |
 | [typechecker.fd](compiler/typechecker.fd) | 24,758 | Types, effects, capabilities, safety annotations, generics (bounds, inference), `&str`/`@scoped`, `@linear`, `@send`, sandbox |
@@ -202,15 +202,15 @@ and `AGENTS.md` first when working on the compiler.
 | [borrowck.fd](compiler/borrowck.fd) | 3,486 | Borrow checker: NLL, field borrows, `for`-loop invalidation (`--borrowck=warn` prints nothing) |
 | [cowcheck.fd](compiler/cowcheck.fd) | 1,313 | `FIDES_COW_CHECK=1` report; use/change walkers the ownership lowering uses |
 | **IR and lowering** | | |
-| [lower.fd](compiler/lower.fd) | 27,878 | AST → SSA IR; inserts every ownership dup/drop/move (proposal 0004, `LOWER_*` switches) |
+| [lower.fd](compiler/lower.fd) | 27,881 | AST → SSA IR; inserts every ownership dup/drop/move (proposal 0004, `LOWER_*` switches) |
 | [reach.fd](compiler/reach.fd) | 515 | Functions `emit` lowers: what main reaches, core and runtime, names in strings (`FID_LOWER_ALL=1` lowers everything) |
 | [ir.fd](compiler/ir.fd) | 5,991 | IR types and instructions, `fn_index`/`str_index`/`inst_at`, verify, reachability, dead-function removal |
 | [checks.fd](compiler/checks.fd) | 6,705 | Drops proven checks: counted loops, integer ranges, `Vec::filled` bounds (C and native) |
 | [irverify.fd](compiler/irverify.fd) | 166 | `FID_VERIFY=1`: operands defined, defined before use, dominance, jump targets |
 | [ir_ser.fd](compiler/ir_ser.fd) | 4,535 | **new.** Binary codec for `IrFunction`: the per-function lowered-IR cache (CS4); names re-intern against the live module tables |
 | **Mid-end** | | |
-| [iropt.fd](compiler/iropt.fd) | 11,143 | IR optimizer and pass manager: inline, gconst, fold, branchfacts, sccp, promote, devirt, dce, tailcall, gvn, licm (`FID_IROPT_OFF`/`ON`) |
-| [iropt_me.fd](compiler/iropt_me.fd) | 6,560 | Restructuring passes and the alias query; on by default since Nov 16–17 (`IME_DEFAULT_ON`: loops, sra, loadhoist, forward, matchfacts, inline2, unroll, version, ssa, ...), switch, ivsr, rotate and ipcp opt-in (`FID_IROPT_ON`) |
+| [iropt.fd](compiler/iropt.fd) | 11,145 | IR optimizer and pass manager: inline, gconst, fold, branchfacts, sccp, promote, devirt, dce, tailcall, gvn, licm (`FID_IROPT_OFF`/`ON`) |
+| [iropt_me.fd](compiler/iropt_me.fd) | 6,608 | Restructuring passes and the alias query; on by default since Nov 16–17 (`IME_DEFAULT_ON`: loops, sra, loadhoist, forward, matchfacts, inline2, unroll, version, ssa, ...), switch, ivsr, rotate and ipcp opt-in (`FID_IROPT_ON`) |
 | [ssa.fd](compiler/ssa.fd) | 1,829 | **new.** SSA form inside the mid-end: mem2reg with merges, dead phis/stores, exit values of counted loops (ME3/ME15/ME23) |
 | [rules.fd](compiler/rules.fd) | 1,079 | Rewrite rules as data (z3-proved), pure-call merging, `fid test-rules [--smt]` |
 | [egraph.fd](compiler/egraph.fd) | 4,079 | E-graph rewriting and store-to-load forwarding of locals (nat_ir path) |
@@ -218,11 +218,11 @@ and `AGENTS.md` first when working on the compiler.
 | **Back ends in use** | | |
 | [interp.fd](compiler/interp.fd) | 14,130 | IR interpreter (`fid run`) over a simulated byte memory, ~270 builtins |
 | [codegen_c.fd](compiler/codegen_c.fd) | 16,565 | IR → C99 plus the embedded C runtime (`ccompile`, `dump-c`, `run --leaks`/`--checked-alloc`/`--mem`) |
-| [pe_ir.fd](compiler/pe_ir.fd) | 8,763 | Default Windows backend: IR → x86-64 → PE32+ (`emit`/`build`); also `--bare`, `--boot`, `--uefi` and `--elf` |
+| [pe_ir.fd](compiler/pe_ir.fd) | 9,010 | Default Windows backend: IR → x86-64 → PE32+ (`emit`/`build`); also `--bare`, `--boot`, `--uefi` and `--elf` |
 | [pe_ir_enc.fd](compiler/pe_ir_enc.fd) | 3,293 | x86-64 encoder, imports, `.rdata`, PE writer for pe_ir |
-| [pe_ir_stubs.fd](compiler/pe_ir_stubs.fd) | 10,177 | pe_ir's runtime hookup: stub generators, `pe_runtime_alias`, allocator, bare runtime, `asm!` encoder |
-| [nat_ir.fd](compiler/nat_ir.fd) | 40,799 | Machine layer: MIR selection, linear-scan + greedy allocators, IPRA, live-range splitting, checker; AArch64/RISC-V/x86-64 Linux ELF, macOS Mach-O and `--nat` PE |
-| [nat_enc.fd](compiler/nat_enc.fd) | 12,637 | Machine-layer encoders (A64, RV64, x64, Thumb-2), ELF with `.debug_line`, PE32+, Mach-O (`nat_macho`) |
+| [pe_ir_stubs.fd](compiler/pe_ir_stubs.fd) | 10,196 | pe_ir's runtime hookup: stub generators, `pe_runtime_alias`, allocator, bare runtime, `asm!` encoder |
+| [nat_ir.fd](compiler/nat_ir.fd) | 41,010 | Machine layer: MIR selection, linear-scan + greedy allocators, IPRA, live-range splitting, checker; AArch64/RISC-V/x86-64 Linux ELF, macOS Mach-O and `--nat` PE |
+| [nat_enc.fd](compiler/nat_enc.fd) | 12,948 | Machine-layer encoders (A64, RV64, x64, Thumb-2), ELF with `.debug_line`, PE32+, Mach-O (`nat_macho`) |
 | [nat_thumb.fd](compiler/nat_thumb.fd) | 3,207 | **new.** Cortex-M (ARMv7-M, Thumb-2) code generator over nat_enc's `t2_*`/`t_*` encoders (PL5) |
 | [mir.fd](compiler/mir.fd) | 1,579 | **new.** The machine IR (MIR) nat_ir selects into (Cranelift VCode shape; MI1) |
 | [image_writer.fd](compiler/image_writer.fd) | 968 | **new.** The one writer of executable/object files (TG13): sections, relocations, symbol tables for ELF, PE/COFF and Mach-O |
@@ -270,7 +270,7 @@ and `AGENTS.md` first when working on the compiler.
 | [hotreload.fd](compiler/hotreload.fd) | 626 | Change snapshots and watcher |
 | [native_debugger.fd](compiler/native_debugger.fd) | 521 | ptrace skeleton |
 | [runtime.fd](compiler/runtime.fd) | 619 | Old plan for `p_*` in Fid; replaced by stdlib/linux_runtime; fails `fid check` |
-| **Total** | **360,657** | **80 modules** (`wc -l`, Nov 21; 56 reached from `main.fd`). 69 modules: `docs/file-analysis/<name>.md` |
+| **Total** | **361,942** | **80 modules** (`wc -l`, Nov 21; 56 reached from `main.fd`). All 80 modules: `docs/file-analysis/<name>.md` |
 
 ---
 

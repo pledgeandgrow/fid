@@ -3265,6 +3265,7 @@ const PE_PF_DEPTH: i64 = 256;     // frames followed per sample
 var pe_pf_on: i64 = 0;          // 1 while samples are counted
 var pe_pf_m: i64 = 0;           // functions in nat_fn_names (0: no tables yet)
 var pe_pf_tab: i64 = 0;         // nat_fn_names(): [address, name]*, [end, 0]
+var pe_pf_entry_b: i64 = 0 - 1; // the bucket of the entry point __fid_entry (-1: none)
 var pe_pf_self: i64 = 0;        // per bucket (m functions, primitives, other)
 var pe_pf_total: i64 = 0;       // per bucket: samples with it on the stack
 var pe_pf_stamp: i64 = 0;       // per bucket: the sample that counted it last
@@ -3379,6 +3380,17 @@ fn pe_pf_setup() -> bool {
     pe_pf_self = pe_zeroed(m + 2);
     pe_pf_total = pe_zeroed(m + 2);
     pe_pf_stamp = pe_zeroed(m + 2);
+    // DB9 (known-bugs 2g.101): the entry point (pe_ir names it __fid_entry
+    // in the table) is not one of the program's functions: stacks start at
+    // main, as on the other backends. Its return addresses were also
+    // counted under the function placed before it (__c_fn_pe_console_ctrl)
+    var e: i64 = 0;
+    while e < m {
+        if pe_pf_name_is(pe_load(tab + e * 16 + 8), "__fid_entry") {
+            pe_pf_entry_b = e;
+        }
+        e = e + 1;
+    }
     pe_pf_tab = tab;
     pe_pf_m = m;
     return true;
@@ -3416,6 +3428,10 @@ fn pe_pf_bucket(pc: i64) -> i64 {
         } else {
             hi = mid - 1;
         }
+    }
+    // the entry point: outside the program's functions (pe_pf_setup)
+    if lo == pe_pf_entry_b {
+        return m + 1;
     }
     return lo;
 }
@@ -3742,7 +3758,14 @@ pub fn pert_prof_watch_main(id: i64) -> i64 {
     var every: i64 = pe_pf_env_num(pe_c_getenv("FID_PROF_EVERY") as i64);
     // auto-reset, not set
     var ev: i64 = pe_pf_create_event(0, 0, 0, "Local\\fid-prof-" + int_to_str(pe_k_getpid()));
-    var ticks: i64 = 0;
+    // SL15 (known-bugs 2g.101): the periodic report keeps its own clock
+    // (GetTickCount64, ms). A report on request (the event, Ctrl-Break)
+    // restarted the count of 100 ms waits, so a report at 0.8 s moved the
+    // 1 s one to 1.8 s; and a wait the event ended early counted 100 ms.
+    var next_at: i64 = 0;
+    if every > 0 {
+        next_at = pe_k_ticks() + every * 1000;
+    }
     var alive: bool = true;
     while alive {
         var hit: bool = false;
@@ -3753,11 +3776,16 @@ pub fn pert_prof_watch_main(id: i64) -> i64 {
         } else {
             pe_k_sleep(100);
         }
-        ticks = ticks + 1;
-        var due: bool = every > 0 && ticks >= every * 10;
+        var due: bool = false;
+        if every > 0 {
+            var now: i64 = pe_k_ticks();
+            if now >= next_at {
+                due = true;
+                next_at = now + every * 1000;
+            }
+        }
         if hit || pe_pf_req != 0 || due {
             pe_pf_req = 0;
-            ticks = 0;
             if pe_pf_on != 0 {
                 pe_pf_print();
             }

@@ -92,6 +92,10 @@ def fde_rules(d, secs, machine):
         first = set()
         rules = {}
         depth = 0
+        # (2g.103: the rules an epilogue's DW_CFA_remember_state keeps and
+        # DW_CFA_restore_state brings back; without them a register an
+        # epilogue restored looked rule-less to the code after it)
+        stack = []
         early = set()
         bad_restore = set()
         q = 0
@@ -127,8 +131,11 @@ def fde_rules(d, secs, machine):
                 _, q = uleb(prog, q)
             elif op == 0x0A:
                 depth += 1
+                stack.append(dict(rules))
             elif op == 0x0B:
                 depth = max(0, depth - 1)
+                if stack:
+                    rules = stack.pop()
         out[start] = (pairs, first, early, bad_restore)
     return out
 

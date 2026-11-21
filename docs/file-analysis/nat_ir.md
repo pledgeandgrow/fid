@@ -26,7 +26,7 @@ the first read and shift.
 > dynamically linked x86_64-linux image crashes in libc `strtod` (2g.99),
 > x86-64 CFI (2g.103, with nat_enc).
 >
-> **Nov 21, uncommitted — 2g.88, 2g.94, 2g.98, 2g.99, 2g.110 fixed; the
+> **Nov 21 (5fb5516) — 2g.88, 2g.94, 2g.98, 2g.99, 2g.110 fixed; the
 > env switches are cached once per image (RA14).** `ng_env_cache_load`
 > (:8111) reads `FID_NAT_OFF`/`FID_NAT_ON`/`FID_NAT_MUTATE`,
 > `FID_VERIFY` and `FID_NAT_FAST` once on the main thread before the

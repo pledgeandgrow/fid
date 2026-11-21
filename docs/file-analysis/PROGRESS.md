@@ -9,10 +9,13 @@ sessions; their docs say so). The open bugs that audit found are collected
 in `docs/reference/known-bugs.md` §2g. This table replaces the 2026-10-22/23
 one; that pass's record follows the template below.
 
-> **Nov 21 update:** `compiler/` has 80 modules (361,858 lines, `wc -l
-> compiler/*.fd`; 360,657 at HEAD, 9 files hold +1,201 uncommitted lines:
-> compiler, comptime_eval, iropt, iropt_me, lower, nat_enc, nat_ir, pe_ir,
-> pe_ir_stubs); 56 are reached from main.fd through `use`, 24 are not.
+> **Nov 21 update:** `compiler/` has 80 modules (361,942 lines, `wc -l
+> compiler/*.fd`; 360,657 before debcee9 and 5fb5516, which grew 9 files
+> by +1,201 lines: compiler, comptime_eval, iropt, iropt_me, lower,
+> nat_enc, nat_ir, pe_ir, pe_ir_stubs; three files hold +84 uncommitted
+> lines for `comptime T: type`: parser.fd +61 parses them, comptime_eval.fd
+> +4 skips generics in pass 1, compiler.fd +19 re-runs `substitute` after
+> mono); 56 are reached from main.fd through `use`, 24 are not.
 > The 11 modules added since the audit have a page now (rows 69-79). Every
 > page's line count is of Nov 21, and each page has a dated note on what
 > changed since Nov 9: fixes (known-bugs 2g.1-2g.78), the new open bugs of
@@ -24,12 +27,13 @@ one; that pass's record follows the template below.
 > State column is of Nov 21; the headlines keep the Nov 9 finding where it
 > still holds.
 >
-> **Nov 21, uncommitted:** the 9 working-tree diffs fix known-bugs 2g.80,
+> **Nov 21 (debcee9 + 5fb5516):** the 9 diffs fix known-bugs 2g.80,
 > 2g.81, 2g.88, 2g.89, 2g.94-2g.96, 2g.98, 2g.99, 2g.106, 2g.109 and 2g.110,
 > harden comptime evaluation (fatal errors, fuel, traces, checked
-> arithmetic, lowerer-computed layouts) and cache the FID_NAT_* switches
-> once per image (RA14). The affected pages carry a "Nov 21, uncommitted"
-> note; whether the suite agrees is not re-checked here.
+> arithmetic, lowerer-computed layouts; conformance tests s4_11_*) and
+> cache the FID_NAT_* switches once per image (RA14). The affected pages
+> carry a "Nov 21 (debcee9)" / "Nov 21 (5fb5516)" note; whether the
+> suite agrees on the native-backend fixes is not re-checked here.
 
 | # | File | State (Nov 21) | Headline |
 |---|------|----------------|----------|
@@ -45,8 +49,8 @@ one; that pass's record follows the template below.
 | 10 | [codegen_riscv.fd](codegen_riscv.md) | dead | Unreached since MI18: `codegen --target riscv` is the machine layer |
 | 11 | [codegen_x64.fd](codegen_x64.md) | dead | Unreached since MI18 (only pe.fd imports it) |
 | 12 | [coff.fd](coff.md) | dead | Unreached since MI18; `codegen --coff` goes through nat_enc and fails on every program (2g.110) |
-| 13 | [compiler.fd](compiler.md) | live | Pipeline, 13,468 lines. warn mode and `@cfg(debug)` fixed (2g.9, 2g.14); unconditional `[build]`/`[prof]` stderr; `ccompile --fuzz-cov` double free (2g.83) |
-| 14 | [comptime_eval.fd](comptime_eval.md) | live | `if` assignments in a `comptime fn` kept and errors returned (2g.19); impl-method substitution not re-checked |
+| 13 | [compiler.fd](compiler.md) | live | Pipeline, 13,502 lines. warn mode and `@cfg(debug)` fixed (2g.9, 2g.14); unconditional `[build]`/`[prof]` stderr; `ccompile --fuzz-cov` double free (2g.83). debcee9: an unevaluated `comptime` is a compile error again. Uncommitted: second `substitute` pass post-mono (comptime over instantiations, §4.11) |
+| 14 | [comptime_eval.fd](comptime_eval.md) | live | `if` assignments in a `comptime fn` kept and errors returned (2g.19). debcee9 hardening (+345): fuel (`FID_CT_FUEL`), call-stack traces, checked arithmetic, consts evaluated, layouts read off a real `Lowerer`; impl-method substitution not re-checked. Uncommitted: generics skipped until the post-mono `substitute` (`comptime T: type`, §4.11) |
 | 15 | [cowcheck.fd](cowcheck.md) | partly live | Report opt-in (`FIDES_COW_CHECK`), premise stale; walkers live in lowering |
 | 16 | [cparser.fd](cparser.md) | live | `parse-header`. `#if`/`#ifdef` evaluated where known (LG15); parameters keep their C type (2g.62); `long` always i32 |
 | 17 | [csplit.fd](csplit.md) | live | `split-c`, used by the release build. `static` stripped from the function head only (2g.1 fixed) |
@@ -64,26 +68,26 @@ one; that pass's record follows the template below.
 | 29 | [inc.fd](inc.md) | live | Stamps, `.fidcache`, core stamp. Key still omits FID_VERIFY/FID_RULES_ON/FID_NAT_ON/FID_LIBFACTS* (2g.15); function cache not byte-identical (2g.82); seeded store, IR units (2g.91, 2g.92) |
 | 30 | [interp.fd](interp.md) | live | `fid run`. Tasks interleave (LG11); printf unformatted (2g.20); `str` params (2g.45), OOM (2g.49), u64 printed signed (2g.52) |
 | 31 | [ir.fd](ir.md) | live | Indexes, reachability, the pe_ir name helpers. `IrModule_get_function` does not check the name |
-| 32 | [iropt.fd](iropt.md) | live | Mid-end, 11,143 lines. SCCP and NaN branchfacts fixed (2g.11, 2g.12); SCCP overflow on the compiler (2g.89); memo mismatches (2g.93) |
-| 33 | [iropt_me.fd](iropt_me.md) | live | 15 passes on by default (`IME_DEFAULT_ON`, ssa among them). Unroll with a dead store on pe_ir (2g.80), sra (2g.94) |
-| 34 | [irverify.fd](irverify.md) | live, opt-in | `FID_VERIFY=1`; skipped on a stamp hit; rejects two suite programs after iropt (2g.109) |
+| 32 | [iropt.fd](iropt.md) | live | Mid-end, 11,145 lines. SCCP and NaN branchfacts fixed (2g.11, 2g.12); 5fb5516: the SCCP BitNot overflow (2g.89) and 2g.109 fixed; memo mismatches (2g.93) |
+| 33 | [iropt_me.fd](iropt_me.md) | live | 15 passes on by default (`IME_DEFAULT_ON`, ssa among them), 6,608 lines. 5fb5516: 2g.109 remap fixes (PersistLoad/Save/Backward, unrenamed uses); the unroll dead-store (2g.80) and sra crash (2g.94) were pe_ir's RA and nat_ir's promote — fixed there; inline2/`Str_drop` (2g.90) |
+| 34 | [irverify.fd](irverify.md) | live, opt-in | `FID_VERIFY=1`; skipped on a stamp hit; the two 2g.109 causes fixed in lower/iropt_me (5fb5516, suite not re-run) |
 | 35 | [json.fd](json.md) | live | Malformed numbers accepted; surrogate pairs not combined |
 | 36 | [lexer.fd](lexer.md) | live | `5e3` fixed; an unknown character is a `BadChar` error token (2g.18) |
 | 37 | [linker.fd](linker.md) | partly live | `build-x86` only; header cause fixed (TG13), exe not run since; missing entry not an error |
-| 38 | [lower.fd](lower.md) | live | Ownership 0004, 27,878 lines. 2g.2, 2g.3 and the clobber crash fixed; function-pointer struct results (2g.47), global u64 (2g.72) |
+| 38 | [lower.fd](lower.md) | live | Ownership 0004, 27,881 lines. 2g.2, 2g.3 and the clobber crash fixed; 5fb5516: select-stmt slots to the entry block (2g.109); function-pointer struct results (2g.47), global u64 (2g.72) |
 | 39 | [lsp.fd](lsp.md) | live | Double free and line-0 diagnostics fixed (2g.5); references, signatureHelp, inlayHint, codeAction, formatting added |
 | 40 | [macho.fd](macho.md) | dead | Unreached since MI18; `codegen --macho` and macOS executables come from nat_enc |
 | 41 | [main.fd](main.md) | live | 55 command names. `build --native` is the machine layer (MI18); POSIX `build` too (CB4); `run --timeout` not enforced |
 | 42 | [mono.fd](mono.md) | live | Nested generic calls renamed (2g.8); no turbofish on the no-std path; `Vec.map` type change (2g.66), packs (2g.84), trait defaults (2g.97) |
-| 43 | [nat_enc.fd](nat_enc.md) | live | Encoders and writers (through image_writer). Linux code R+X, data RW (TG14); DWARF/CFI (2g.102, 2g.103), COFF objects (2g.110) |
-| 44 | [nat_ir.fd](nat_ir.md) | live | Machine layer, 40,799 lines: Linux, macOS, `--nat`, Cortex-M (nat_thumb). Page out of date; 2g.82, 2g.88, 2g.98, 2g.99 |
+| 43 | [nat_enc.fd](nat_enc.md) | live | Encoders and writers (through image_writer), 12,948 lines. Linux code R+X, data RW (TG14). 5fb5516: link-missing checks for PE DLLs and macOS .tbd stubs (2g.106), PT_TLS for dyn x86-64 (2g.99); DWARF/CFI (2g.102, 2g.103) |
+| 44 | [nat_ir.fd](nat_ir.md) | live | Machine layer, 41,010 lines: Linux, macOS, `--nat`, Cortex-M (nat_thumb). Page out of date. 5fb5516: FID_NAT_* cached per image (RA14); 2g.88, 2g.94, 2g.98 (MI28), 2g.99, 2g.110 fixed; 2g.82, 2g.103 |
 | 45 | [native_debugger.fd](native_debugger.md) | dead | No ptrace builtins |
 | 46 | [opt.fd](opt.md) | dead | Unreached since MI18; `fid opt` prints the IR after iropt. Jump-threading fix (2g.17) never run |
-| 47 | [parser.fd](parser.md) | live | Imported struct literals fixed (2g.38). Dead `parse_expr_iterative`; module globals never reset |
+| 47 | [parser.fd](parser.md) | live | 10,682 lines. Imported struct literals fixed (2g.38). Dead `parse_expr_iterative`; module globals never reset. Uncommitted: `comptime T: type` params parse, join `type_params` on `fn`/methods, rejected elsewhere |
 | 48 | [pe.fd](pe.md) | dead | Unreached; `emit --boot` goes through pe_ir (`PEIR_BARE_BOOT`) |
-| 49 | [pe_ir.fd](pe_ir.md) | live | Default Windows backend. Concurrency refusal not re-checked; `--leaks` exes crash (2g.81), f32 cast (2g.95), tail calls (2g.98), `-g` locals (2g.104) |
+| 49 | [pe_ir.fd](pe_ir.md) | live | Default Windows backend, 9,010 lines. 5fb5516: `--leaks` roots (2g.81), f32 cast (2g.95), tail calls via a result slot (2g.98), global-RA bound (2g.80) fixed; `-g` locals (2g.104), FID_PROF root (2g.101); concurrency refusal not re-checked |
 | 50 | [pe_ir_enc.fd](pe_ir_enc.md) | live | Import directory size fixed at 20; no ASLR; writable `.rdata` (still true) |
-| 51 | [pe_ir_stubs.fd](pe_ir_stubs.md) | live | Old machine `p_vec_*` stubs still in the stub list; name helpers moved to ir.fd |
+| 51 | [pe_ir_stubs.fd](pe_ir_stubs.md) | live | 10,196 lines. Old machine `p_vec_*` stubs still in the stub list; name helpers moved to ir.fd. 5fb5516: itoa buffer clobbered r14 (2g.96), argv token copy sized by its address (RL16) fixed |
 | 52 | [peephole.fd](peephole.md) | dead | Unreached since MI18 (only pe.fd imports it) |
 | 53 | [pir.fd](pir.md) | dead | Unreached since MI18; `fid pir`/`dump-pir` print where the views went |
 | 53b | [reach.fd](reach.md) | live (emit only) | Which functions `emit` lowers; `drop` methods are roots (2g.23); `--lib --export` callees not lowered (2g.85) |

@@ -733,7 +733,9 @@ fn tv_shape_x(f: & IrFunction, gc: i64, wide: bool) -> TvShape {
                     }
                 }
                 Inst::GlobalAddr(gname, _) => {
-                    if wide && gc != 0 && id >= 0 && id < nv && HashMap_contains(gc, gname) {
+                    // (2g.90: also the function passes' runs, tv_random,
+                    // with the module's facts, g_tv_gc)
+                    if gc != 0 && id >= 0 && id < nv && HashMap_contains(gc, gname) {
                         plain.set(id, 2);
                     }
                 }
@@ -855,6 +857,44 @@ fn tv_shape_x(f: & IrFunction, gc: i64, wide: bool) -> TvShape {
     };
 }
 
+/// 2g.90 (VF6): the module's constant globals (tv_gconst_facts: an integer
+/// literal that nothing stores to and whose address only loads read), for
+/// the runs of the function passes (tv_random); 0: none known. iropt.fd
+/// iropt_native sets it before its per-function loop and forgets it after.
+var g_tv_gc: i64 = 0;
+
+pub fn tv_note_globals(module: & IrModule) {
+    g_tv_gc = 0;
+    if !tv_on() {
+        return;
+    }
+    var fns: Vec<IrFunction> = Vec::new();
+    var i: i64 = 0;
+    while i < module.functions.len() {
+        fns.push(module.functions.get(i).func);
+        i = i + 1;
+    }
+    g_tv_gc = tv_gconst_facts(& fns, & module.globals);
+}
+
+pub fn tv_forget_globals() {
+    g_tv_gc = 0;
+}
+
+/// The literal of the constant global (g_tv_gc) whose address is `p` in `f`.
+fn tv_fglobal(f: & IrFunction, p: i64) -> i64 {
+    match peir_inst_of(f, p) {
+        Inst::GlobalAddr(gn, _) => {
+            if g_tv_gc != 0 && HashMap_contains(g_tv_gc, gn) {
+                return HashMap_get(g_tv_gc, gn);
+            }
+        }
+        _ => {
+        }
+    }
+    return 0;
+}
+
 fn tv_bidx_of(bindex: & Vec<i64>, bid: i64) -> i64 {
     if bid >= 0 && bid < bindex.len() {
         return bindex.get(bid);
@@ -929,8 +969,16 @@ fn tv_eval(f: & IrFunction, sh: & TvShape, args: & Vec<i64>, limit: i64) -> TvOu
                     Inst::Alloca(_, _) => {
                         vals.set(id, id);
                     }
+                    Inst::GlobalAddr(gn, _) => {
+                        vals.set(id, tv_hash_str(gn));
+                    }
                     Inst::Load(p, t) => {
-                        vals.set(id, tv_narrow(tv_get(& mem, p), t));
+                        if tv_get(& sh.plain, p) == 2 {
+                            // a constant global of the module (g_tv_gc)
+                            vals.set(id, tv_narrow(tv_fglobal(f, p), t));
+                        } else {
+                            vals.set(id, tv_narrow(tv_get(& mem, p), t));
+                        }
                     }
                     Inst::Store(p, v, _) => {
                         if p >= 0 && p < nv {
@@ -1101,11 +1149,13 @@ pub fn tv_random(pre: & IrFunction, post: & IrFunction) -> str {
     if pre.params.len() != post.params.len() {
         return "n/a";
     }
-    var sa: TvShape = tv_shape_of(pre);
+    // 2g.90: a function reading a constant global of the module is run too
+    // (its loads give the literal; tv_note_globals)
+    var sa: TvShape = tv_shape_x(pre, g_tv_gc, false);
     if !sa.ok {
         return "n/a";
     }
-    var sb: TvShape = tv_shape_of(post);
+    var sb: TvShape = tv_shape_x(post, g_tv_gc, false);
     if !sb.ok {
         return "n/a";
     }
@@ -2481,10 +2531,129 @@ fn tv_inject_at(f: & mut IrFunction, x: i64) -> bool {
     return false;
 }
 
+/// An instruction that only computes a value (no effect, no control):
+/// what the program does depends on it only through its uses.
+fn tv_pure_value(inst: Inst) -> bool {
+    match inst {
+        Inst::ConstInt(_, _) => {
+            return true;
+        }
+        Inst::ConstFloat(_, _) => {
+            return true;
+        }
+        Inst::ConstBool(_) => {
+            return true;
+        }
+        Inst::ConstStr(_) => {
+            return true;
+        }
+        Inst::ConstNull(_) => {
+            return true;
+        }
+        Inst::ConstFnRef(_) => {
+            return true;
+        }
+        Inst::GlobalAddr(_, _) => {
+            return true;
+        }
+        Inst::Alloca(_, _) => {
+            return true;
+        }
+        Inst::Load(_, _) => {
+            return true;
+        }
+        Inst::GetFieldPtr(_, _, _) => {
+            return true;
+        }
+        Inst::GetElemPtr(_, _, _) => {
+            return true;
+        }
+        Inst::BitCast(_, _, _) => {
+            return true;
+        }
+        Inst::IntExtend(_, _, _) => {
+            return true;
+        }
+        Inst::IntTrunc(_, _, _) => {
+            return true;
+        }
+        Inst::IntToFloat(_, _, _) => {
+            return true;
+        }
+        Inst::FloatToInt(_, _, _) => {
+            return true;
+        }
+        Inst::BinOp(_, _, _, _) => {
+            return true;
+        }
+        Inst::UnaryOp(_, _, _) => {
+            return true;
+        }
+        _ => {
+            return false;
+        }
+    }
+}
+
+/// 2g.90 (VF6): per value of `f` (1), whether an effect, a branch or a
+/// return depends on it. A fault put into any other value changes nothing
+/// the program does, and the checks rightly accept the result: most of the
+/// faults reported "NOT caught" went into such values (alone, each left the
+/// program's output as it was). A store into a plain local (an alloca only
+/// loads and stores touch) counts when a load that counts reads the local;
+/// every instruction that is not a pure value (tv_pure_value) counts.
+fn tv_live_of(f: & IrFunction) -> Vec<i64> {
+    var nv: i64 = f.next_value + 1;
+    var live: Vec<i64> = peir_zeros(nv);
+    var sh: TvShape = tv_shape_of(f);
+    var changed: bool = true;
+    while changed {
+        changed = false;
+        var b: i64 = 0;
+        while b < f.blocks.len() {
+            var ids: Vec<i64> = f.blocks.get(b).instructions;
+            var k: i64 = 0;
+            while k < ids.len() {
+                var id: i64 = ids.get(k);
+                var inst: Inst = peir_inst_of(f, id);
+                var on: bool = tv_get(& live, id) == 1;
+                match inst {
+                    Inst::Store(p, _, _) => {
+                        on = tv_get(& sh.plain, p) != 1 || tv_get(& live, p) == 1;
+                    }
+                    _ => {
+                        if !tv_pure_value(inst) {
+                            on = true;
+                        }
+                    }
+                }
+                if on {
+                    var ops: Vec<i64> = Vec::new();
+                    peir_inst_operands(inst, & mut ops);
+                    var o: i64 = 0;
+                    while o < ops.len() {
+                        var x: i64 = ops.get(o);
+                        if x >= 0 && x < nv && live.get(x) == 0 {
+                            live.set(x, 1);
+                            changed = true;
+                        }
+                        o = o + 1;
+                    }
+                }
+                k = k + 1;
+            }
+            b = b + 1;
+        }
+    }
+    return live;
+}
+
 /// Put a fault into `f`: the value its first return returns is computed
-/// wrongly (tv_inject_at), else the first value anywhere that can be. False
-/// when `f` has none.
+/// wrongly (tv_inject_at), else the first value anywhere that can be and
+/// that what the function does depends on (tv_live_of; 2g.90). False when
+/// `f` has none.
 fn tv_inject_fn(f: & mut IrFunction) -> bool {
+    var live: Vec<i64> = tv_live_of(f);
     var b: i64 = 0;
     while b < f.blocks.len() {
         var ids: Vec<i64> = f.blocks.get(b).instructions;
@@ -2514,7 +2683,7 @@ fn tv_inject_fn(f: & mut IrFunction) -> bool {
         var ids2: Vec<i64> = f.blocks.get(b2).instructions;
         var k2: i64 = 0;
         while k2 < ids2.len() {
-            if tv_inject_at(f, ids2.get(k2)) {
+            if tv_get(& live, ids2.get(k2)) == 1 && tv_inject_at(f, ids2.get(k2)) {
                 return true;
             }
             k2 = k2 + 1;
@@ -4421,6 +4590,15 @@ fn tv_mod_check(pname: str, wa: & mut TvWorld, wb: & mut TvWorld, fa: & IrFuncti
     // inlineclo (iropt_me ime_inline_closures) is inline2's rule for closures
     if pname == "inline" || pname == "inline2" || pname == "inlineclo" {
         w = tv_inline_witness(wa, wb, fa, fb);
+        // 2g.90: the witness is iro_inline's (a call becomes a copy of its
+        // callee's one block, the blocks stay). inline2 also copies callees
+        // of several blocks, splitting the caller's block and adding the
+        // copy's blocks (iropt_me.fd ime_inline_with): a result whose
+        // blocks changed is outside the witness, not a fault of it, and
+        // the runs across the module decide (Str_drop was rejected so)
+        if pname != "inline" && !tv_blocks_kept(fa, fb) {
+            w = "n/a";
+        }
     } else if pname == "spec" {
         w = tv_spec_witness(wa, wb, fa, fb);
     } else if pname == "gconst" {
@@ -4441,6 +4619,21 @@ fn tv_mod_check(pname: str, wa: & mut TvWorld, wb: & mut TvWorld, fa: & IrFuncti
         return r;
     }
     return w;
+}
+
+/// Has `post` the blocks of `pre`, by id and in order?
+fn tv_blocks_kept(pre: & IrFunction, post: & IrFunction) -> bool {
+    if pre.blocks.len() != post.blocks.len() {
+        return false;
+    }
+    var bi: i64 = 0;
+    while bi < pre.blocks.len() {
+        if pre.blocks.get(bi).id != post.blocks.get(bi).id {
+            return false;
+        }
+        bi = bi + 1;
+    }
+    return true;
 }
 
 /// After module pass `pname` changed `module` (from `pre`, a tv_mod_before):

@@ -1612,6 +1612,104 @@ fn ssa_materialize(f: & mut IrFunction, cfg: & IroCfg, st: & SsaState, exits: & 
         }
         e = e + 1;
     }
+    // ME25 (Nov 21): a phi's load lives at the top of its own block, but a
+    // use of that value in another block (the accumulator read after its
+    // loop: `print %58` with %58 the loop header's load) would read the
+    // header's last execution forever. Each such use loads the slot again
+    // at the top of its own block — the slot model's semantics, which loop
+    // versioning's copy needs (the copy's header load is its own; a reader
+    // of the original's would go stale when the copy runs).
+    var np2: i64 = st.ph_block.len();
+    var vreal_used: Vec<i64> = ssa_fill(np2, 0);
+    {
+        // value id -> phi index + 1 (the phi's load is that value)
+        var vphi: Vec<i64> = peir_zeros(f.next_value + 1);
+        var k2: i64 = 0;
+        while k2 < np2 {
+            if vreal.get(k2) >= 0 && vreal.get(k2) < vphi.len() {
+                vphi.set(vreal.get(k2), k2 + 1);
+            }
+            k2 = k2 + 1;
+        }
+        var b2: i64 = 0;
+        var ops2: Vec<i64> = Vec::new();
+        while b2 < nb {
+            var bids2: Vec<i64> = f.blocks.get(b2).instructions;
+            var w3: i64 = 0;
+            while w3 < bids2.len() {
+                ops2.clear();
+                peir_inst_operands(peir_inst_of(f, bids2.get(w3)), & mut ops2);
+                var o2: i64 = 0;
+                while o2 < ops2.len() {
+                    var u2: i64 = ops2.get(o2);
+                    if u2 >= 0 && u2 < vphi.len() && vphi.get(u2) > 0 && st.ph_block.get(vphi.get(u2) - 1) != b2 {
+                        vreal_used.set(vphi.get(u2) - 1, 1);
+                    }
+                    o2 = o2 + 1;
+                }
+                w3 = w3 + 1;
+            }
+            b2 = b2 + 1;
+        }
+    }
+    {
+        var vphi2: Vec<i64> = peir_zeros(f.next_value + 1);
+        var k5: i64 = 0;
+        while k5 < np2 {
+            if vreal_used.get(k5) == 1 && vreal.get(k5) >= 0 && vreal.get(k5) < vphi2.len() {
+                vphi2.set(vreal.get(k5), k5 + 1);
+            }
+            k5 = k5 + 1;
+        }
+        var b3: i64 = 0;
+        while b3 < nb {
+            var m3: Vec<i64> = peir_zeros(f.next_value + 1);
+            var fresh: Vec<i64> = Vec::new();
+            var any3: bool = false;
+            var ops4: Vec<i64> = Vec::new();
+            var bids3: Vec<i64> = f.blocks.get(b3).instructions;
+            var w4: i64 = 0;
+            while w4 < bids3.len() {
+                ops4.clear();
+                peir_inst_operands(peir_inst_of(f, bids3.get(w4)), & mut ops4);
+                var o3: i64 = 0;
+                while o3 < ops4.len() {
+                    var u3: i64 = ops4.get(o3);
+                    if u3 >= 0 && u3 < vphi2.len() && vphi2.get(u3) > 0 && m3.get(u3) == 0 && st.ph_block.get(vphi2.get(u3) - 1) != b3 {
+                        var k4: i64 = vphi2.get(u3) - 1;
+                        var ty3: IrType = ssa_alloca_ty(f, st.cands.get(st.ph_cand.get(k4)));
+                        var ld3: i64 = ssa_detached(f, Inst::Load(slot.get(k4), ty3));
+                        m3.set(u3, ld3 + 1);
+                        fresh.push(ld3);
+                        any3 = true;
+                    }
+                    o3 = o3 + 1;
+                }
+                w4 = w4 + 1;
+            }
+            if any3 {
+                var bids4: Vec<i64> = Vec::new();
+                var f3: i64 = 0;
+                while f3 < fresh.len() {
+                    bids4.push(fresh.get(f3));
+                    f3 = f3 + 1;
+                }
+                var w5: i64 = 0;
+                while w5 < bids3.len() {
+                    var qid2: i64 = bids3.get(w5);
+                    if qid2 != 0 - 1 {
+                        IrFunction_set_inst(f, qid2, ssa_remap(peir_inst_of(f, qid2), & m3));
+                    }
+                    bids4.push(qid2);
+                    w5 = w5 + 1;
+                }
+                var blk3: BasicBlock = f.blocks.get(b3);
+                blk3.instructions = bids4;
+                f.blocks.set(b3, blk3);
+            }
+            b3 = b3 + 1;
+        }
+    }
 }
 
 // --- Cleanup: values nothing reads ---------------------------------------------

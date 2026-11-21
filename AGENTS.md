@@ -275,7 +275,7 @@ FID=release/fid.exe JOBS=4 bash scripts/cross-test.sh aarch64-linux
 
 ```
 SELF-HOSTED COMPILER (primary source):
-  compiler/*.fd:  80 modules, 360,657 lines — THE COMPILER. 56 are reached
+  compiler/*.fd:  80 modules, 361,942 lines — THE COMPILER. 56 are reached
                   from main.fd; 24 are imported by nothing that main.fd
                   reaches (the whole retired PIR path — pir, opt, regalloc,
                   peephole, codegen_x64/arm64/riscv, pe, arm64_enc,

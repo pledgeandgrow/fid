@@ -12,9 +12,9 @@
 > `pgo` too. New open: partial unrolling miscompiles a loop with a dead
 > store on pe_ir (known-bugs 2g.80), translation validation rejects inline2
 > on `Str_drop` (2g.90), the `ime_sra` miscompile crashes a `--nat` build
-> of the front end (2g.94). 6,560 lines now. The text below is of Nov 9.
+> of the front end (2g.94). The text below is of Nov 9.
 >
-> **Nov 21, uncommitted:** 6,608 lines. 2g.109's mid-end half is fixed
+> **Nov 21 (5fb5516):** 6,608 lines. 2g.109's mid-end half is fixed
 > here: `ime_remap` renames the operands of `PersistLoad`, `PersistSave`
 > and `Backward` (a forward-renamed load's `backward` read a value defined
 > nowhere), and `ime_unrenamed_uses` (:352) marks every value an

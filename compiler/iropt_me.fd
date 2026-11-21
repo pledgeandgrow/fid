@@ -36,11 +36,13 @@
 //               with constant bounds, its variable is a constant
 //
 // Every pass but loops, sra, loadhoist, forward, matchfacts, inline2, ssa
-// and ssaexit (on by default since Nov 16: IME_DEFAULT_ON) and unroll,
+// and ssaexit (on by default since Nov 16: IME_DEFAULT_ON), unroll,
 // linear, placefwd, vecalias, version, inlineclo and lendref (since Nov
-// 17) is off unless named in
+// 17), and licmguard and vecdata (since Nov 21: licmguard-check over the
+// 63 test_midend_*.fd gave 62 the same output, 1 out-of-memory build that
+// rebuilt clean; FID_IROPT_OFF turns each off) is off unless named in
 // FID_IROPT_ON (a comma list, or "all":
-// inline2 sra switch loops ivsr unroll loadhoist licmguard forward
+// inline2 sra switch loops ivsr unroll loadhoist forward
 // matchfacts vecdata ssa ssaexit),
 // and FID_IROPT_OFF still turns it off: they have not been run on the
 // suite yet. What they must respect (the ownership lowering, proposal 0004):
@@ -191,7 +193,7 @@ pub fn ime_on(name: str) -> bool {
 /// tests/tooling/lendref-check.sh (its test, then
 /// midend-pass-suite-check.sh PASS=lendref on the whole suite, pe_ir and
 /// --nat: no DIFF/BUILD/VERIFY); if it fails, lendref leaves this list.
-const IME_DEFAULT_ON: str = ",loops,sra,loadhoist,forward,matchfacts,inline2,inlineclo,lendref,unroll,linear,placefwd,vecalias,version,ssa,ssaexit,";
+const IME_DEFAULT_ON: str = ",loops,sra,loadhoist,forward,matchfacts,inline2,inlineclo,lendref,unroll,linear,placefwd,vecalias,version,ssa,ssaexit,licmguard,vecdata,";
 
 // --- Helpers ----------------------------------------------------------------
 
@@ -751,7 +753,7 @@ fn ime_callee_ok(g: & IrFunction) -> bool {
                     return false;
                 }
                 Inst::Call(cn, _, _, _) => {
-                    if cn == g.name {
+                    if cn == g.name || ime_panic_frame(g.name, cn) {
                         return false;
                     }
                 }
@@ -765,12 +767,31 @@ fn ime_callee_ok(g: & IrFunction) -> bool {
     return true;
 }
 
+/// CO9 (known-bugs 2g.100): a native crash trace is a walk of the frame
+/// records, so a function inlined into its caller is not in it: core's
+/// `panic` stays a call, and so does a function that calls it (parse_age
+/// into load_record lost parse_age). A cold path: FID_IROPT_OFF=panicframe
+/// inlines them again.
+fn ime_panic_frame(callee: str, called: str) -> bool {
+    if callee != "panic" && called != "panic" {
+        return false;
+    }
+    return !iro_named_off(p_getenv("FID_IROPT_OFF"), "panicframe");
+}
+
 /// Copy `g` into `f` at the call `call_id`, position `k` of block index
 /// `bi`: the block is split after the call, the callee's blocks come in
 /// (its parameters are the arguments, its allocas go to f's entry block),
 /// each return stores the result and jumps to the rest, and the call
 /// becomes a load of the result there.
 fn ime_inline_site(f: & mut IrFunction, g: & IrFunction, bi: i64, k: i64, call_id: i64, args: Vec<i64>) {
+    // K10: @simd rides along — the annotation's guards and checked-op
+    // vectorization then cover the copied loops (without this, inlining a
+    // @simd callee into a plain caller left the caller is_simd = false, so
+    // nothing in it was vectorized)
+    if g.is_simd {
+        f.is_simd = true;
+    }
     // split the block: what comes before the call stays, the rest moves
     var all: Vec<i64> = f.blocks.get(bi).instructions;
     var before: Vec<i64> = Vec::new();

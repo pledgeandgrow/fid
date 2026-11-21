@@ -1,6 +1,6 @@
 # comptime_eval.fd
 
-> **Nov 21:** 4,985 lines (2,120 on Nov 9). Fixed Nov 15 (known-bugs
+> **Nov 21:** 4,989 lines (2,120 on Nov 9). Fixed Nov 15 (known-bugs
 > 2g.19): an assignment inside an `if` in a `comptime fn` is kept (the
 > body runs in `evaluate_block_rt`), with break/continue, compound
 > operators and shadowing; a statement the evaluator cannot run is an
@@ -11,7 +11,11 @@
 > impls (LG9), and splices are expanded in impl methods too. Not re-checked:
 > whether `substitute` reaches impl and trait methods.
 >
-> **Nov 21, uncommitted:** the comptime-hardening pass (+345).
+> **Nov 21 (debcee9):** the comptime-hardening pass (+345), shipped with
+> the conformance tests `s4_11_arith_overflow_rejected`,
+> `s4_11_const_computes`, `s4_11_error_trace_names_fn`,
+> `s4_11_fallback_env_runs`, `s4_11_fatal_not_runtime`,
+> `s4_11_fuel_budget_error` and `s4_11_shift_amount_rejected`.
 > Evaluation has a fuel budget — `ct_fuel_left` charges every
 > `evaluate`/`evaluate_with_env`/`eval_binop`/`call_comptime_func` and
 > every statement of `evaluate_block_rt`; over 10^8 steps (default;
@@ -31,14 +35,20 @@
 > `ce_has_annotation` — is deleted; `use compiler::ir`, `compiler::lower`
 > are new). Splice errors reach the fatal list (`ct_fatal_splice`), and a
 > `reflect` error is fatal even under `FID_CT_FALLBACK` (it used to lower
-> to 0). Line numbers below are from Nov 9.
+> to 0). In the working tree (uncommitted, Nov 21): generics are
+> templates — `substitute`'s need-scan and the `ct_comptime_fns`
+> registration both skip any function with `type_params` (:1577, :1628),
+> so a generic's comptime nodes and a generic `comptime fn` are left for
+> the second `substitute` pass that compiler.fd runs after
+> `monomorphize`, where the `comptime T: type` parameters are concrete
+> (§4.11). Line numbers below are from Nov 9.
 
 > **Re-audited 2026-11-09** against the current source and the latest `fid` build (s18).
 > `return comptime` and loop accumulation are fixed; impl methods, `if` assignments inside
 > comptime functions, and dropped errors are still open.
 
 - **Path:** `compiler/comptime_eval.fd`
-- **LOC:** 4,985 (2026-11-21; 2,120 on Nov 9, 1,632 on Oct 22; Rust `src/comptime.rs`: 1,358)
+- **LOC:** 4,989 (2026-11-21; 2,120 on Nov 9, 1,632 on Oct 22; Rust `src/comptime.rs`: 1,358)
 - **Role:** compile-time evaluation. `process_gen` runs `comptime gen { }` blocks, parses the
   string they produce and appends its functions and structs. `substitute` replaces each
   `comptime expr` / `comptime { }` / `comptime reflect(T)` with a literal, then evaluates calls to

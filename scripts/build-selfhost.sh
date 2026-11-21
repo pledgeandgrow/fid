@@ -81,7 +81,8 @@ echo "[3/3] ${CC_CMD[*]} -> $OUT/$OUT_EXE"
 # As scripts/bootstrap.sh: when the stage-0 compiler has `fid split-c`, the C
 # is split into SPLIT units (default 8) compiled at -O2, JOBS at a time
 # (default 4), and linked; the compiler is about 3x faster than one unit at
-# -O0 (the Rust bootstrap, tcc, SPLIT=1 or a failed split: one unit at -O0).
+# -O0 (the Rust bootstrap, tcc or SPLIT=1: one unit at -O0). A unit that
+# fails is retried alone, then the build stops with exit 1 (2g.86).
 # The generated C is the same either way: only the C compiler's work differs.
 SPLIT="${SPLIT:-8}"
 JOBS="${JOBS:-4}"
@@ -92,22 +93,58 @@ built=0
 base="$OUT/fid-dev_wrapped_u"
 case "${CC_CMD[*]}" in *tcc*) ;; *)
   if [ "$SPLIT" -gt 1 ] && "$STAGE0" split-c "$OUT/fid-dev_wrapped.c" "$base" "$SPLIT" >> "$OUT/fid-dev.cc.log" 2>&1 && [ -f "$base.h" ]; then
-    objs=(); pids=(); ok=1
+    # 2g.86: a unit that fails is named with its exit code and built again
+    # alone (a C compiler killed for memory at JOBS at a time, exit 5 with
+    # no message, usually builds by itself); one that still fails, or a
+    # failed link, stops the build with exit 1. Before, any failure fell
+    # back to one unit at -O0 (a ~17x slower fid) and the script exited 0.
+    objs=(); pids=(); pid_units=(); failed=()
     for k in $(seq 0 $((SPLIT - 1))); do
       "${CC_CMD[@]}" "${SPLIT_CFLAGS[@]}" -c "${base}_$k.c" -o "${base}_$k.o" >> "$OUT/fid-dev.cc.log" 2>&1 &
       pids+=($!)
+      pid_units+=("$k")
       objs+=("${base}_$k.o")
       if [ ${#pids[@]} -ge "$JOBS" ]; then
-        wait "${pids[0]}" || ok=0
+        wait "${pids[0]}"; rc=$?
+        [ "$rc" -ne 0 ] && failed+=("${pid_units[0]}:$rc")
         pids=("${pids[@]:1}")
+        pid_units=("${pid_units[@]:1}")
       fi
     done
-    for pid in "${pids[@]}"; do wait "$pid" || ok=0; done
-    if [ "$ok" = 1 ] && "${CC_CMD[@]}" "${objs[@]}" -o "$OUT/$OUT_EXE" "${LIBS[@]}" >> "$OUT/fid-dev.cc.log" 2>&1; then
+    for i in "${!pids[@]}"; do
+      wait "${pids[$i]}"; rc=$?
+      [ "$rc" -ne 0 ] && failed+=("${pid_units[$i]}:$rc")
+    done
+    if [ ${#failed[@]} -gt 0 ]; then
+      for fu in "${failed[@]}"; do
+        echo "      unit ${base}_${fu%%:*}.c failed at -O2 (exit ${fu##*:})"
+      done
+      echo "      building the failed units again, one at a time"
+      still=()
+      for fu in "${failed[@]}"; do
+        k="${fu%%:*}"
+        "${CC_CMD[@]}" "${SPLIT_CFLAGS[@]}" -c "${base}_$k.c" -o "${base}_$k.o" >> "$OUT/fid-dev.cc.log" 2>&1; rc=$?
+        [ "$rc" -ne 0 ] && still+=("$k:$rc")
+      done
+      if [ ${#still[@]} -gt 0 ]; then
+        for fu in "${still[@]}"; do
+          echo "error: unit ${base}_${fu%%:*}.c failed at -O2 again, alone (exit ${fu##*:})"
+        done
+        echo "      see $OUT/fid-dev.cc.log; SPLIT=1 builds one unit at -O0 (about 17x slower)"
+        grep -E "error" "$OUT/fid-dev.cc.log" | head -20
+        rm -f "${base}"_*.c "${base}"_*.o "$base.h"
+        exit 1
+      fi
+    fi
+    if "${CC_CMD[@]}" "${objs[@]}" -o "$OUT/$OUT_EXE" "${LIBS[@]}" >> "$OUT/fid-dev.cc.log" 2>&1; then
       echo "      ($SPLIT units at -O2)"
       built=1
     else
-      echo "      split build failed (see $OUT/fid-dev.cc.log); building one unit at -O0"
+      rc=$?
+      echo "error: linking the $SPLIT units failed (exit $rc); see $OUT/fid-dev.cc.log"
+      grep -E "error" "$OUT/fid-dev.cc.log" | head -20
+      rm -f "${base}"_*.c "${base}"_*.o "$base.h"
+      exit 1
     fi
     rm -f "${base}"_*.c "${base}"_*.o "$base.h"
   fi ;;

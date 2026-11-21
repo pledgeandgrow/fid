@@ -220,6 +220,25 @@ pub fn CGen_lib_export(name: str) {
     g_c_lib_extra = g_c_lib_extra + name + ",";
 }
 
+/// 2g.85: the names CGen_lib_export added (`--export`), in a library
+/// build: roots of the C path's reachability (compiler.fd
+/// c_reach_keep_set), as `@export` functions are (they are annotated).
+pub fn CGen_lib_export_names() -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    if !g_c_lib {
+        return out;
+    }
+    val parts: Vec<str> = str_split(g_c_lib_extra, ",");
+    var i: i64 = 0;
+    while i < parts.len() {
+        if str_len(parts.get(i)) > 0 {
+            out.push(parts.get(i));
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
 /// CI7: the C header of the last library generated (`lib_name` names its
 /// include guard).
 pub fn CGen_lib_header(lib_name: str) -> str {
@@ -9210,9 +9229,19 @@ pub fn CCodeGen_generate(self: & mut CCodeGen, module: IrModule) -> str {
     // extern_func_names, which nothing filled, so `fn ldexp` of an extern
     // block was called as p_ldexp_user (2g.13 / B19 renames), which nothing
     // defines; its declaration and #define use the plain pledge_name
+    // 2g.107: but not a name a Fides function also has (stdlib.h's `abs`
+    // of an @import beside core's `pub fn abs`): the lowering calls the
+    // Fides function (with its __env) by that name, so it keeps its rename
+    // (abs -> p_abs) at the definition and at every call, and the extern's
+    // declaration (its plain pledge_name, or the header's) stays apart.
+    // Before, the extern stopped the rename and core's abs was emitted as
+    // `int64_t abs(void*, int64_t)`: "conflicting types for 'abs'".
     var xf: i64 = 0;
     while xf < module.extern_decls.len() {
-        vec_push_unique(& mut self.extern_func_names, module.extern_decls.get(xf).pledge_name);
+        val xname: str = module.extern_decls.get(xf).pledge_name;
+        if IrModule_fn_pos(& module, xname) < 0 {
+            vec_push_unique(& mut self.extern_func_names, xname);
+        }
         xf = xf + 1;
     }
 

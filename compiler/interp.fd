@@ -13234,6 +13234,19 @@ fn ipx_read_int(path: str) -> i64 {
     return - 1;
 }
 
+/// Whether the file at `path` holds more than white space (a code file
+/// written to the end; a child may exit with -1 itself).
+fn ipx_has_text(path: str) -> bool {
+    match read_file(path) {
+        Option::Some(t) => {
+            return str_len(str_trim(t)) > 0;
+        }
+        Option::None => {
+        }
+    }
+    return false;
+}
+
 /// fid_proc_spawn: the handle (slot + 1), 0 when it could not start.
 /// in_path: a file the child reads as its stdin ("" for none; roadmap
 /// L4H's pipes, ipx_io_start).
@@ -13425,9 +13438,14 @@ fn ipx_wait(h: i64, timeout_ms: i64) -> i64 {
     while true {
         if p_file_exists(codef) != 0 {
             var code: i64 = ipx_read_int(codef);
-            if code < 0 {
-                // being written: look again
-                p_co_sleep(1);
+            // being written: look again until it holds the code (2 s at
+            // most). 2g.113: on Windows cmd's `echo %errorlevel%> file`
+            // creates the file before it writes to it; one more look after
+            // 1 ms was too soon under load, and the child's code read as
+            // -1 (`parallel codes: 0 1 -1`)
+            val tw: i64 = p_clock_now_ms();
+            while code < 0 && !ipx_has_text(codef) && p_clock_now_ms() - tw < 2000 {
+                p_co_sleep(2);
                 code = ipx_read_int(codef);
             }
             ipx_finish(s, code);

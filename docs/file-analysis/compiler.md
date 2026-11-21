@@ -1,6 +1,6 @@
 # compiler.fd — pipeline orchestrator
 
-> **Nov 21:** 13,483 lines (4,502 on Nov 9). It imports 28 compiler
+> **Nov 21:** 13,502 lines (4,502 on Nov 9). It imports 28 compiler
 > modules (39 on Nov 9): `codegen`, `pir`, `opt`, `regalloc`,
 > `codegen_x64/arm64/riscv`, `peephole`, `runtime_*` and `pe` are gone,
 > `ast_ser`, `ir_ser`, `build_info` are new. `build_executable` was removed
@@ -13,18 +13,26 @@
 > module (2g.27). New: `ccompile --fuzz-cov` panics with a double free in
 > `build_program_with_path_borrowck` (2g.83). Also new here: the
 > checked-library AST artifact and the import cache on disk (CS2, CB1; see
-> ast_ser.md). In the working tree (uncommitted, Nov 21): after
+> ast_ser.md). In debcee9 (Nov 21): after
 > `substitute`, `build_program_with_path_borrowck` returns
 > `comptime_subst_errors()` through `enrich_errors` (:5443-5457) — an
 > explicit `comptime` that cannot be evaluated is a compile error again
 > (`FID_CT_FALLBACK=1` keeps the warn-and-run behavior; comptime_eval.md).
+> In the working tree (uncommitted, Nov 21): `substitute` now runs a
+> second time on `mono_result` right after `monomorphize` — "comptime
+> over instantiations" (§4.11): a generic function's comptime nodes, the
+> reflection its `comptime T: type` parameters drive, are evaluated once
+> `T` is concrete. The need-scan in comptime_eval skips generics in the
+> first pass, so only functions that still have comptime nodes are
+> re-visited; errors go through `comptime_subst_errors()` →
+> `enrich_errors` like the first pass (:5469-5486).
 > Line numbers below are from Nov 9.
 
 > **Re-audited 2026-11-09** against the working tree (4,502 lines; 2,841 at
 > the 2026-10-22/23 audit). Probes with the latest self-hosted binary (s18).
 
 - **Path:** `compiler/compiler.fd`
-- **LOC:** 13,483 (2026-11-21; 4,502 on Nov 9)
+- **LOC:** 13,502 (2026-11-21; 4,502 on Nov 9)
 - **Role:** the front-end driver and the backend entry points. Owns stdlib
   and runtime loading, import resolution, program merging, the AST passes
   (@cfg, @derive, `==` synthesis, desugaring, default trait methods,

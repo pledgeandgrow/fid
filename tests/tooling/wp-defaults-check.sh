@@ -96,9 +96,13 @@ want_pos "envtrim" "$(stat et "$ET" FID_IROPT_OFF=inline,inline2 -- "$E")"
 want_zero "envtrim off" "$(stat et_off "$ET" FID_IROPT_OFF=inline,inline2,envtrim -- "$E")"
 want_pos "spec" "$(stat sp "$SP" FID_IROPT_OFF=inline,inline2 -- "$S")"
 want_zero "spec off" "$(stat sp_off "$SP" FID_IROPT_OFF=inline,inline2,spec -- "$S")"
-want_pos "deadf functions" "$(stat df "$DF" FID_IROPT_OFF=inline,inline2 -- "$E")"
+# Nov 21: the emit path lowers only what compiler/reach.fd finds reachable
+# (PE88), so functions the passes made dead are gone before iropt counts
+# them (155 with FID_PE_PRUNE=0, 0 without); the deadf counters are read
+# with the prune off, the outputs below stay checked with it on.
+want_pos "deadf functions" "$(stat df "$DF" FID_PE_PRUNE=0 FID_IROPT_OFF=inline,inline2 -- "$E")"
 want_pos "deadf globals" "$(sed -n "$DG" "$OUT/df.exe.log" | tr -d '\r' | head -1)"
-want_zero "deadf off functions" "$(stat df_off "$DF" FID_IROPT_OFF=inline,inline2,deadf -- "$E")"
+want_zero "deadf off functions" "$(stat df_off "$DF" FID_PE_PRUNE=0 FID_IROPT_OFF=inline,inline2,deadf -- "$E")"
 want_zero "deadf off globals" "$(sed -n "$DG" "$OUT/df_off.exe.log" | tr -d '\r' | head -1)"
 
 # 2. expected output, default and with the three off

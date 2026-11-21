@@ -23,7 +23,7 @@
 > (2g.23, second entry). Fixed: `str_find`/`str_contains` needed `memchr`
 > (2g.58, Nov 16). Line numbers below are from Nov 9.
 >
-> **Nov 21, uncommitted — 2g.80, 2g.81, 2g.95 and 2g.98 fixed.** 2g.81:
+> **Nov 21 (5fb5516) — 2g.80, 2g.81, 2g.95 and 2g.98 fixed.** 2g.81:
 > `pe_ir_needed_fns` (:168) adds `pert_leak_malloc`/`pert_leak_free`/
 > `pert_leak_exit` and everything reachable from them to the wanted roots
 > under `--leaks` — `nat_frame_ret`/`nat_frame_next` had stayed `ud2`, so

@@ -22671,6 +22671,28 @@ pub fn Lowerer_rc_gen_types(self: & mut Lowerer) {
     Lowerer_rc_gen_mem_drop_fn(self, false);
     Lowerer_rc_gen_mem_drop_fn(self, true);
     Lowerer_rc_gen_key_strs_fn(self);
+    Lowerer_rc_record_type_keys(self);
+}
+
+// inc-roadmap B6: the type key of own type i (__own_drop_<i>, __own_dup_<i>)
+// of the last lowering, for `ccompile --inc` (compiler.fd
+// incu_canon_own_names), which names those functions by their type so that
+// a unit calling them keys the same in every program.
+var g_lw_own_type_keys: Vec<str> = Vec::new();
+
+fn Lowerer_rc_record_type_keys(self: & mut Lowerer) {
+    var keys: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < self.own_types.len() {
+        keys.push(self.own_types.get(i).key);
+        i = i + 1;
+    }
+    g_lw_own_type_keys = keys;
+}
+
+/// The own types' keys of the last lowering, by index (B6).
+pub fn lw_own_type_keys() -> Vec<str> {
+    return g_lw_own_type_keys;
 }
 
 /// 1 << i for 0 <= i < 64 (bit 63 included).
@@ -22918,7 +22940,7 @@ fn lw_rc_stack_vecs(module: & mut IrModule) {
     // concatenated strings that stay in their frame, where core has the
     // entry points
     var vbuf_ok: bool = LOWER_STACK_VBUFS && lw_module_has_fn(module, "Vec_init_filled_at") && lw_module_has_fn(module, "Vec_drop_stackbuf");
-    var strs_ok: bool = LOWER_STACK_STRS && lw_module_has_fn(module, "Str_concat_into");
+    var strs_ok: bool = LOWER_STACK_STRS && (lw_module_has_fn(module, "Str_concat_into") || lw_module_has_fn(module, "Int_to_str_into"));
     // OP27: Boxes that stay in their frame, where core can drop what a
     // Box holds in place
     var boxes_ok: bool = LOWER_STACK_BOXES && lw_module_has_fn(module, "__p_mem_drop");
@@ -23916,7 +23938,7 @@ pub fn lw_rc_stack_strs_fn(f: & mut IrFunction) -> bool {
         if ve_id >= 0 && ve_id < nv {
             match f.insts.get(i).inst {
                 Inst::Call(cn, cargs, _, _) => {
-                    if cn == "p_str_concat" && cargs.len() == 2 {
+                    if (cn == "p_str_concat" && cargs.len() == 2) || (cn == "p_to_str" && cargs.len() == 1) {
                         created.set(ve_id, 1);
                         any = true;
                     }
@@ -24101,7 +24123,8 @@ fn lw_rc_stack_str_rewrite(f: & mut IrFunction, h: i64, pro: & mut Vec<i64>) -> 
     var e: ValueIdInst = f.insts.get(pos);
     match e.inst {
         Inst::Call(cn, cargs, cty, ceff) => {
-            if cn != "p_str_concat" || cargs.len() != 2 {
+            var to_str: bool = cn == "p_to_str" && cargs.len() == 1;
+            if (cn != "p_str_concat" || cargs.len() != 2) && !to_str {
                 return false;
             }
             var words: i64 = LOWER_STACK_STR_BYTES / 8;
@@ -24114,20 +24137,26 @@ fn lw_rc_stack_str_rewrite(f: & mut IrFunction, h: i64, pro: & mut Vec<i64>) -> 
             pro.push(env);
             pro.push(capv);
             var na: Vec<i64> = Vec::new();
-            // the operands as the words core takes (as p_str_append's are),
-            // cast right before the call
-            var ca: i64 = lw_detached(f, Inst::BitCast(cargs.get(0), IrType::Ptr(Box::new(IrType::U8)), IrType::I64));
-            var cb: i64 = lw_detached(f, Inst::BitCast(cargs.get(1), IrType::Ptr(Box::new(IrType::U8)), IrType::I64));
-            var casts: Vec<i64> = Vec::new();
-            casts.push(ca);
-            casts.push(cb);
-            lw_rc_insert_before(f, hb, h, casts);
             na.push(env);
             na.push(ai);
             na.push(capv);
-            na.push(ca);
-            na.push(cb);
-            e.inst = Inst::Call("Str_concat_into", na, cty, ceff);
+            if to_str {
+                // LF13 (Nov 21): int_to_str of a local, into the area
+                na.push(cargs.get(0));
+                e.inst = Inst::Call("Int_to_str_into", na, cty, ceff);
+            } else {
+                // the operands as the words core takes (as p_str_append's
+                // are), cast right before the call
+                var ca: i64 = lw_detached(f, Inst::BitCast(cargs.get(0), IrType::Ptr(Box::new(IrType::U8)), IrType::I64));
+                var cb: i64 = lw_detached(f, Inst::BitCast(cargs.get(1), IrType::Ptr(Box::new(IrType::U8)), IrType::I64));
+                var casts: Vec<i64> = Vec::new();
+                casts.push(ca);
+                casts.push(cb);
+                lw_rc_insert_before(f, hb, h, casts);
+                na.push(ca);
+                na.push(cb);
+                e.inst = Inst::Call("Str_concat_into", na, cty, ceff);
+            }
             f.insts.set(pos, e);
             return true;
         }
@@ -25748,6 +25777,7 @@ fn lw_rc_cancel_param_slots(f: & mut IrFunction, module: & IrModule, dead: & mut
     if f.params.len() == 0 || f.blocks.len() == 0 {
         return;
     }
+    g_lw_ps_fn = f.name;
     // the counts of a parameter or a variable at all (most functions have
     // none)
     var cands: Vec<i64> = Vec::new();
@@ -25879,18 +25909,38 @@ fn lw_rc_cancel_param_slots(f: & mut IrFunction, module: & IrModule, dead: & mut
 /// or map slot is then stored the parameter itself); else nothing. A copy
 /// of a local variable the same (lw_ps_local_src_ok); `roles` records the
 /// slots that borrow and those they borrow from.
+
+/// LF15: FID_PS_WHY=1 prints why a count was not cancelled (a diagnostic
+/// of lw_ps_try_slot, never a gate).
+var g_lw_ps_fn: str = "";
+
+fn lw_ps_why(why: str) {
+    match env_var("FID_PS_WHY") {
+        Option::Some(v) => {
+            if str_len(v) > 0 {
+                p_eprint_str("ps [" + g_lw_ps_fn + "]: " + why + "
+");
+            }
+        }
+        Option::None => {
+        }
+    }
+}
 fn lw_ps_try_slot(f: & mut IrFunction, module: & IrModule, c: i64, blk_of: Vec<i64>, pos_of: Vec<i64>, ustart: Vec<i64>, ulist: Vec<i64>, roles: & mut Vec<i64>) -> Vec<i64> {
     var none: Vec<i64> = Vec::new();
     var nv: i64 = blk_of.len();
     if c < 0 || c >= nv || blk_of.get(c) < 0 {
+        lw_ps_why("1:none");
         return none;
     }
     var kind: i64 = lw_ps_count_kind(f, c);
     if kind == 0 {
+        lw_ps_why("2:none");
         return none;
     }
     var a: i64 = lw_ps_count_arg(f, c, kind);
     if a < 0 || a >= nv {
+        lw_ps_why("3:none");
         return none;
     }
     // the parameter itself is never dropped, freed or grown in place here;
@@ -25901,27 +25951,59 @@ fn lw_ps_try_slot(f: & mut IrFunction, module: & IrModule, c: i64, blk_of: Vec<i
     var src_kills: Vec<i64> = Vec::new();
     if is_param {
         if !lw_ps_param_untouched(f, a, ustart, ulist, 0) {
+            lw_ps_why("4:drops, stores, moves, changes) runs");
             return none;
         }
     } else {
         if !LOWER_CANCEL_LOCAL_SLOTS || lw_ps_local_kind(f, a) != kind {
+            lw_ps_why("5:drops, stores, moves, changes) runs");
             return none;
         }
         if !lw_ps_local_src_ok(f, module, kind, a, ustart, ulist, & mut src_kills) {
+            lw_ps_why("6:none");
             return none;
         }
     }
     // the store that gives the slot its value
     var st: i64 = - 1;
     var slot: i64 = - 1;
+    // LF15 (Nov 21): with region lowering on, the dup's result goes through
+    // Lowerer_rg_as_type's BitCast before the store (`t = p` stores
+    // BitCast(Str_dup(p))); a function that opens no region (checked by the
+    // caller) still counts in place, so the pair can go. `wrap` is that
+    // BitCast, deleted with the count.
+    var wrap: i64 = - 1;
     var cb: i64 = blk_of.get(c);
     var cins: Vec<i64> = f.blocks.get(cb).instructions;
     if kind == 1 {
         // Str_dup counts in place: its result is not used, and the first
         // instruction after it that is more than a pure value stores the
-        // parameter (so each store follows its own count)
-        if ustart.get(c + 1) != ustart.get(c) {
+        // parameter (so each store follows its own count) — or, when the
+        // region wrapper took it, exactly one BitCast of it is that
+        // store's value
+        var wrap_shape: bool = ustart.get(c + 1) - ustart.get(c) == 1;
+        if !wrap_shape && ustart.get(c + 1) != ustart.get(c) {
+            lw_ps_why("7:store's value");
             return none;
+        }
+        if wrap_shape {
+            var w: i64 = ulist.get(ustart.get(c));
+            var wat: i64 = lw_inst_pos(f, w);
+            var w_of_c: bool = false;
+            if wat >= 0 {
+                match f.insts.get(wat).inst {
+                    Inst::BitCast(x, _, _) => {
+                        w_of_c = x == c;
+                    }
+                    _ => {
+                    }
+                }
+            }
+            if !w_of_c {
+                lw_ps_why("8:none");
+                return none;
+            }
+            wrap = w;
         }
         var p: i64 = pos_of.get(c) + 1;
         var found: bool = false;
@@ -25929,9 +26011,17 @@ fn lw_ps_try_slot(f: & mut IrFunction, module: & IrModule, c: i64, blk_of: Vec<i
             var pid: i64 = cins.get(p);
             if lw_rc_may_free(f, pid) {
                 found = true;
-                if lw_ps_store_val(f, pid) == a {
-                    st = pid;
-                    slot = lw_ps_store_ptr(f, pid);
+                var sv: i64 = lw_ps_store_val(f, pid);
+                if wrap >= 0 {
+                    if sv == wrap && ustart.get(wrap + 1) - ustart.get(wrap) == 1 {
+                        st = pid;
+                        slot = lw_ps_store_ptr(f, pid);
+                    }
+                } else {
+                    if sv == a {
+                        st = pid;
+                        slot = lw_ps_store_ptr(f, pid);
+                    }
                 }
             }
             p = p + 1;
@@ -25939,6 +26029,7 @@ fn lw_ps_try_slot(f: & mut IrFunction, module: & IrModule, c: i64, blk_of: Vec<i
     } else {
         // the share is used once: stored, later in its block
         if ustart.get(c + 1) - ustart.get(c) != 1 {
+            lw_ps_why("9:the share is used once: stored, later in its block");
             return none;
         }
         var su: i64 = ulist.get(ustart.get(c));
@@ -25948,18 +26039,21 @@ fn lw_ps_try_slot(f: & mut IrFunction, module: & IrModule, c: i64, blk_of: Vec<i
         }
     }
     if st < 0 || slot < 0 || slot >= nv || slot == a || slot == c {
+        lw_ps_why("10:the share is used once: stored, later in its block");
         return none;
     }
     // a local source: read just before the store, in its block, with no
     // kill of the source in between (the slot gets a live value)
     if !is_param {
         if slot == lw_ps_load_ptr(f, a) || blk_of.get(a) != cb || pos_of.get(a) >= pos_of.get(st) {
+            lw_ps_why("11:kill of the source in between ");
             return none;
         }
         var sd: i64 = 0;
         while sd < src_kills.len() {
             var sdi: i64 = src_kills.get(sd);
             if blk_of.get(sdi) == cb && pos_of.get(sdi) > pos_of.get(a) && pos_of.get(sdi) < pos_of.get(st) {
+                lw_ps_why("12:kill of the source in between ");
                 return none;
             }
             sd = sd + 1;
@@ -25968,6 +26062,7 @@ fn lw_ps_try_slot(f: & mut IrFunction, module: & IrModule, c: i64, blk_of: Vec<i
     // the slot is a variable, only loaded and stored; besides our store it
     // is only stored literals (null, zero, a string literal)
     if !lw_ps_is_alloca(f, slot) {
+        lw_ps_why("13:is only stored literals ");
         return none;
     }
     var loads: Vec<i64> = Vec::new();
@@ -25981,6 +26076,7 @@ fn lw_ps_try_slot(f: & mut IrFunction, module: & IrModule, c: i64, blk_of: Vec<i
             var sp: i64 = lw_ps_store_ptr(f, u);
             var sv: i64 = lw_ps_store_val(f, u);
             if sp != slot || sv == slot || !lw_rc_is_literal_value(f, sv) {
+                lw_ps_why("14:none");
                 return none;
             }
             lits.push(u);
@@ -26000,6 +26096,7 @@ fn lw_ps_try_slot(f: & mut IrFunction, module: & IrModule, c: i64, blk_of: Vec<i
             var q2: i64 = ustart.get(l);
             while q2 < ustart.get(l + 1) {
                 if !lw_ps_use_ok(f, module, kind, ulist.get(q2), l, ustart, ulist, 0) {
+                    lw_ps_why("15:none");
                     return none;
                 }
                 q2 = q2 + 1;
@@ -26011,7 +26108,8 @@ fn lw_ps_try_slot(f: & mut IrFunction, module: & IrModule, c: i64, blk_of: Vec<i
     // clears it right after a drop of what it held
     var li2: i64 = 0;
     while li2 < lits.len() {
-        if !lw_ps_lit_store_ok(f, lits.get(li2), st, loads, drops, blk_of, pos_of) {
+        if !lw_ps_lit_store_ok(f, lits.get(li2), st, loads, drops, blk_of, pos_of, ustart, ulist) {
+            lw_ps_why("16:clears it right after a drop of what it held");
             return none;
         }
         li2 = li2 + 1;
@@ -26025,6 +26123,7 @@ fn lw_ps_try_slot(f: & mut IrFunction, module: & IrModule, c: i64, blk_of: Vec<i
         var rd: i64 = 0;
         while rd < src_kills.len() {
             if lw_ps_reaches(f, src_kills.get(rd), st, loads, blk_of, pos_of) {
+                lw_ps_why("17:move, a change) unless our store gave the slot a new value f");
                 return none;
             }
             rd = rd + 1;
@@ -26032,10 +26131,12 @@ fn lw_ps_try_slot(f: & mut IrFunction, module: & IrModule, c: i64, blk_of: Vec<i
     }
     // one role per slot (lw_rc_cancel_param_slots)
     if slot >= roles.len() || roles.get(slot) != 0 {
+        lw_ps_why("18:one role per slot ");
         return none;
     }
     if src >= 0 {
         if src >= roles.len() || roles.get(src) == 1 {
+            lw_ps_why("19:one role per slot ");
             return none;
         }
         roles.set(src, 2);
@@ -26043,12 +26144,15 @@ fn lw_ps_try_slot(f: & mut IrFunction, module: & IrModule, c: i64, blk_of: Vec<i
     roles.set(slot, 1);
     var gone: Vec<i64> = Vec::new();
     gone.push(c);
+    if wrap >= 0 {
+        gone.push(wrap);
+    }
     var di: i64 = 0;
     while di < drops.len() {
         gone.push(drops.get(di));
         di = di + 1;
     }
-    if kind != 1 {
+    if kind != 1 || wrap >= 0 {
         lw_ps_set_store_val(f, st, a);
     }
     return gone;
@@ -26710,7 +26814,7 @@ fn lw_ps_handle_call_ok(module: & IrModule, cn: str, cargs: Vec<i64>, v: i64) ->
 /// out: it is the slot's first value (in the entry block, before our store
 /// `st` and every load there), or it clears the slot right after one of
 /// its drops (nothing between but pure values that are not its loads).
-fn lw_ps_lit_store_ok(f: & IrFunction, ls: i64, st: i64, loads: Vec<i64>, drops: Vec<i64>, blk_of: Vec<i64>, pos_of: Vec<i64>) -> bool {
+fn lw_ps_lit_store_ok(f: & IrFunction, ls: i64, st: i64, loads: Vec<i64>, drops: Vec<i64>, blk_of: Vec<i64>, pos_of: Vec<i64>, ustart: Vec<i64>, ulist: Vec<i64>) -> bool {
     var lb: i64 = blk_of.get(ls);
     var lpos: i64 = pos_of.get(ls);
     if lb < 0 || lpos < 0 {
@@ -26739,7 +26843,36 @@ fn lw_ps_lit_store_ok(f: & IrFunction, ls: i64, st: i64, loads: Vec<i64>, drops:
         if lw_c_vec_i64_has(drops, pid) {
             return true;
         }
-        if lw_c_vec_i64_has(loads, pid) || lw_rc_may_free(f, pid) {
+        if lw_c_vec_i64_has(loads, pid) {
+            // LF15 (Nov 21): a load whose only reader is (a cast and)
+            // one of the drops is that drop's own operand — `load t;
+            // drop(t); t = null` — and keeps nothing from the store
+            var q2: i64 = ustart.get(pid);
+            var ok2: bool = q2 < ustart.get(pid + 1);
+            while q2 < ustart.get(pid + 1) && ok2 {
+                var uu: i64 = ulist.get(q2);
+                if !lw_c_vec_i64_has(drops, uu) {
+                    var uat: i64 = lw_inst_pos(f, uu);
+                    var cast_drop: bool = false;
+                    if uat >= 0 {
+                        match f.insts.get(uat).inst {
+                            Inst::BitCast(bx, _, _) => {
+                                if bx == pid && ustart.get(uu + 1) - ustart.get(uu) == 1 {
+                                    cast_drop = lw_c_vec_i64_has(drops, ulist.get(ustart.get(uu)));
+                                }
+                            }
+                            _ => {
+                            }
+                        }
+                    }
+                    ok2 = cast_drop;
+                }
+                q2 = q2 + 1;
+            }
+            if !ok2 {
+                return false;
+            }
+        } else if lw_rc_may_free(f, pid) {
             return false;
         }
         p = p - 1;

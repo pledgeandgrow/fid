@@ -6000,6 +6000,57 @@ pub fn p_str_append(s: i64, x: i64) -> str {
     return r;
 }
 
+/// `int_to_str` built in a caller's stack area `buf` of `cap` bytes (LF13,
+/// Nov 21: a local `p_to_str` string that never leaves its function) as
+/// [P_STR_STATIC][len] digits NUL, as Str_concat_into does for '+'. An
+/// area that cannot be ours (or is too small for the worst i64: a minus
+/// and 19 digits) gives the heap p_to_str(x). The value is kept <= 0 while
+/// the digits render from the end, so INT64_MIN needs no negation.
+pub fn Int_to_str_into(buf: i64, cap: i64, x: i64) -> str {
+    if buf == 0 || (buf & 7) != 0 || cap < 40 {
+        return p_to_str(x);
+    }
+    var end: i64 = buf + cap - 1;
+    var p: i64 = end - 1;
+    var v: i64 = x;
+    while true {
+        var d: i64 = 0 - (v % 10);
+        var dp: * mut u8 = p;
+        // SAFETY: at most a sign and 19 digits and the NUL are written
+        // into the cap-byte area (cap >= 40).
+        unsafe {
+            * dp = (48 + d) as u8;
+        }
+        p = p - 1;
+        v = v / 10;
+        if v == 0 {
+            break;
+        }
+    }
+    if x < 0 {
+        var sp: * mut u8 = p;
+        // SAFETY: as above.
+        unsafe {
+            * sp = 45;
+        }
+        p = p - 1;
+    }
+    var np: * mut u8 = end;
+    // SAFETY: end = buf + cap - 1 is the area's last byte.
+    unsafe {
+        * np = 0;
+    }
+    var n: i64 = end - p - 1;
+    var hp: * mut i64 = buf;
+    var lp: * mut i64 = buf + 8;
+    // SAFETY: the two header words at the start of the area (cap >= 40).
+    unsafe {
+        * hp = P_STR_STATIC;
+        * lp = n;
+    }
+    return p + 1;
+}
+
 /// `a + b` built in a caller's stack area `buf` of `cap` bytes (LF13: a
 /// local string that never leaves its function) as [P_STR_STATIC][len]
 /// bytes NUL, so a drop leaves it alone. A result that does not fit, or an

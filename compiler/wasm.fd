@@ -2224,11 +2224,28 @@ fn wg_gen_inst(g: & mut WasmGen, id: i64, inst: Inst, last: bool, func: & IrFunc
         Inst::Call(call_name, args, _, _) => {
             wg_gen_call(g, id, call_name, args, func);
         }
-        Inst::CallPtr(fn_ptr, args, _, _, _) => {
-            // A closure: its environment, whose word 0 is the function
+        Inst::CallPtr(fn_ptr, args, cp_ret, _, _) => {
+            // A closure: its environment, whose word 0 is the function. A
+            // struct or enum result (lower.fd: the CallPtr's result type is
+            // a Struct): args[0] is the pointer the callee writes it to,
+            // passed first, before the env, as for a direct call and as
+            // nat_ir's CallPtr does (2g.108: the arguments were shifted by
+            // one, "8597928 0" then "Invalid memory access")
+            var cp_sret: bool = false;
+            match cp_ret {
+                IrType::Struct(_) => {
+                    cp_sret = args.len() > 0;
+                }
+                _ => {
+                }
+            }
             var srcs: Vec<i64> = Vec::new();
-            srcs.push(fn_ptr);
             var ai: i64 = 0;
+            if cp_sret {
+                srcs.push(args.get(0));
+                ai = 1;
+            }
+            srcs.push(fn_ptr);
             while ai < args.len() {
                 srcs.push(args.get(ai));
                 ai = ai + 1;

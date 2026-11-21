@@ -2716,13 +2716,68 @@ fn peir_sf_inherit(f: & IrFunction, r: & mut PeirRanges, dom: & mut PeirDomFacts
     }
 }
 
+/// LF8 (Nov 21): is slot `slot` stored, or value `vid` defined, anywhere on
+/// the paths from block q back to block b (q a not-yet-scanned predecessor
+/// of b, the two blocks and everything between them the loop's body)? A
+/// budget bounds the walk; running out answers "yes" (a fact is then
+/// dropped, never kept unsoundly).
+fn peir_join_stored(f: & IrFunction, preds: & Vec<Vec<i64>>, b: i64, q: i64, slot: i64, vid: i64, def_b: & Vec<i64>, st_ptr: & Vec<i64>, st_blk: & Vec<i64>) -> bool {
+    var nb: i64 = f.blocks.len();
+    var seen: Vec<i64> = peir_zeros(nb);
+    var work: Vec<i64> = Vec::new();
+    work.push(q);
+    var budget: i64 = 1024;
+    while work.len() > 0 && budget > 0 {
+        var w: i64 = work.pop();
+        if w < 0 || w >= nb || w == b || seen.get(w) == 1 {
+            continue;
+        }
+        seen.set(w, 1);
+        budget = budget - 1;
+        if slot >= 0 {
+            var si: i64 = 0;
+            while si < st_ptr.len() {
+                if st_blk.get(si) == w && st_ptr.get(si) == slot {
+                    return true;
+                }
+                si = si + 1;
+            }
+        }
+        if vid >= 0 && vid < def_b.len() && def_b.get(vid) == w {
+            return true;
+        }
+        if w < preds.len() {
+            var pi: i64 = 0;
+            var pp: Vec<i64> = preds.get(w);
+            while pi < pp.len() {
+                work.push(pp.get(pi));
+                pi = pi + 1;
+            }
+        }
+    }
+    if budget <= 0 {
+        return true;
+    }
+    return false;
+}
+
 /// LF8: join block b (ways in `ps`) starts with each fact every way in
 /// carries (what held at the predecessor's end, or its branch's fact on
 /// that edge), as the hull of their intervals. Every predecessor must have
 /// been scanned already; one that has no way in itself (a dead block left
 /// after a `return`) never runs and is left out. r.ref_* (the join's own
 /// fact) is kept.
-fn peir_join_set(f: & IrFunction, r: & mut PeirRanges, dom: & mut PeirDomFacts, index: & Vec<i64>, preds: & Vec<Vec<i64>>, ps: Vec<i64>, b: i64, xs: & Vec<i64>, x_s0: & Vec<i64>, x_sn: & Vec<i64>, x_done: & Vec<i64>) {
+///
+/// Nov 21 (OP24): a predecessor not scanned yet is a back edge (it is laid
+/// out after b). It no longer empties the join: a fact every scanned way
+/// in carries is kept when the back edge cannot break it — a fact on a
+/// value the loop body never re-defines (a value's fact is a property of
+/// the value itself), or on a plain local the body never stores (its back
+/// edge carries the same value). So the sieve's inner loop keeps p's fact
+/// from the outer loop at its header, and `m = m + p` loses its overflow
+/// check. The store/definition walk is peir_join_stored; a fact it cannot
+/// prove is dropped, as before.
+fn peir_join_set(f: & IrFunction, r: & mut PeirRanges, dom: & mut PeirDomFacts, index: & Vec<i64>, preds: & Vec<Vec<i64>>, ps: Vec<i64>, b: i64, xs: & Vec<i64>, x_s0: & Vec<i64>, x_sn: & Vec<i64>, x_done: & Vec<i64>, st_ptr: & Vec<i64>, st_blk: & Vec<i64>) {
     if ps.len() < 2 {
         return;
     }
@@ -2734,15 +2789,20 @@ fn peir_join_set(f: & IrFunction, r: & mut PeirRanges, dom: & mut PeirDomFacts, 
     var all: Vec<i64> = Vec::new();
     var st: Vec<i64> = Vec::new();
     var en: Vec<i64> = Vec::new();
-    var ok: bool = true;
+    var backs: Vec<i64> = Vec::new();
     var q: i64 = 0;
-    while q < ps.len() && ok {
+    while q < ps.len() {
         var qb: i64 = ps.get(q);
         var dead: bool = r.plain_cfg && qb > 0 && qb < preds.len() && preds.get(qb).len() == 0;
         if !dead {
-            st.push(all.len());
-            ok = peir_sf_edge(f, r, index, qb, b, true, xs, x_s0, x_sn, x_done, & mut all);
-            en.push(all.len());
+            if qb >= 0 && qb < x_done.len() && x_done.get(qb) != 0 {
+                st.push(all.len());
+                peir_sf_edge(f, r, index, qb, b, true, xs, x_s0, x_sn, x_done, & mut all);
+                en.push(all.len());
+            } else if qb >= 0 {
+                // not scanned yet: a back edge, judged per fact below
+                backs.push(qb);
+            }
         }
         q = q + 1;
     }
@@ -2751,7 +2811,7 @@ fn peir_join_set(f: & IrFunction, r: & mut PeirRanges, dom: & mut PeirDomFacts, 
     r.ref_lo = keep_lo;
     r.ref_hi = keep_hi;
     r.ref_live = keep_live;
-    if !ok || st.len() < 1 {
+    if st.len() < 1 {
         return;
     }
     var t: Vec<i64> = Vec::new();
@@ -2787,7 +2847,24 @@ fn peir_join_set(f: & IrFunction, r: & mut PeirRanges, dom: & mut PeirDomFacts, 
                 q2 = q2 + 1;
             }
             if every && lo <= hi {
-                peir_sf_apply(f, r, dom, b, kind, id, lo, hi);
+                var safe: bool = true;
+                var bi: i64 = 0;
+                while bi < backs.len() && safe {
+                    var slot: i64 = 0 - 1;
+                    var vid: i64 = 0 - 1;
+                    if kind == 0 {
+                        slot = id;
+                    } else {
+                        vid = id;
+                    }
+                    if peir_join_stored(f, preds, b, backs.get(bi), slot, vid, & r.def_b, st_ptr, st_blk) {
+                        safe = false;
+                    }
+                    bi = bi + 1;
+                }
+                if safe {
+                    peir_sf_apply(f, r, dom, b, kind, id, lo, hi);
+                }
             }
         }
         i = i + 4;
@@ -2948,6 +3025,32 @@ fn peir_range_scan(f: & IrFunction, r: & mut PeirRanges, single_pred: & Vec<i64>
     var xs: Vec<i64> = Vec::new();
     var x_s0: Vec<i64> = peir_zeros(nb);
     var x_sn: Vec<i64> = peir_zeros(nb);
+    // LF8 (Nov 21): every store of the function (slot, block), for the
+    // back-edge rule of peir_join_set (only with the range set on)
+    var st_ptr: Vec<i64> = Vec::new();
+    var st_blk: Vec<i64> = Vec::new();
+    if r.sf_on {
+        var sb: i64 = 0;
+        while sb < f.blocks.len() {
+            var sids: Vec<i64> = f.blocks.get(sb).instructions;
+            var sk: i64 = 0;
+            while sk < sids.len() {
+                var spos: i64 = peir_inst_pos(f, sids.get(sk));
+                if spos >= 0 {
+                    match f.insts.get(spos).inst {
+                        Inst::Store(sp, _, _) => {
+                            st_ptr.push(sp);
+                            st_blk.push(sb);
+                        }
+                        _ => {
+                        }
+                    }
+                }
+                sk = sk + 1;
+            }
+            sb = sb + 1;
+        }
+    }
     r.sf_loc.clear();
     r.sf_lo.clear();
     r.sf_hi.clear();
@@ -2975,7 +3078,7 @@ fn peir_range_scan(f: & IrFunction, r: & mut PeirRanges, single_pred: & Vec<i64>
             peir_join_fact(f, r, index, preds.get(b), b, & x_v, & x_loc, & x_lo, & x_hi, & x_live, & x_done);
             // LF8: every fact all the ways in share
             if r.sf_on {
-                peir_join_set(f, r, dom, index, preds, preds.get(b), b, & xs, & x_s0, & x_sn, & x_done);
+                peir_join_set(f, r, dom, index, preds, preds.get(b), b, & xs, & x_s0, & x_sn, & x_done, & st_ptr, & st_blk);
             }
         }
         // LF8: a loop header with no other fact gets its assumed one

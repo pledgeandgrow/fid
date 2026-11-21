@@ -460,6 +460,9 @@ pub fn iropt_native(module: & mut IrModule) {
         imc = iro_imc_prepare(module, reach, has_main);
         iro_time_note(& mut tp_names, & mut tp_ms, & mut tp_hits, "irocache", timing, tm0);
     }
+    // 2g.90 (VF6): with --validate, the runs that check the passes below
+    // read the module's constant globals as their literals
+    tv_note_globals(module);
     var i: i64 = 0;
     while i < module.functions.len() {
         var entry: IrFunctionEntry = module.functions.get(i);
@@ -662,7 +665,8 @@ pub fn iropt_native(module: & mut IrModule) {
         // hit: compared with what the memo held)
         if imc_on && imc_key != 0 {
             if imc_at > 0 {
-                imc_verify_note(imc_at, entry.name, iro_imc_post(f, changed, imc.pre_h.get(i)));
+                // 2g.93: in the hash the entry was recorded with
+                imc_verify_note(imc_at, entry.name, imc_verify_post(imc_at, f, changed, imc.pre_h.get(i)));
             } else {
                 var _imc_post: i64 = imc_note(imc_key, entry.name, imc.pre_h.get(i), f, changed);
             }
@@ -675,15 +679,20 @@ pub fn iropt_native(module: & mut IrModule) {
     }
     // OP3: outside the loop every request for use lists builds them
     iro_uses_disarm();
+    tv_forget_globals();
     // CS6: the memo's counts, and its file when this build added to it
     if imc_on {
         imc_finish();
     }
     // WP19: functions whose IR is the same (generic instances, specialized
-    // clones) are all called through the first of them (opt-in,
-    // FID_IROPT_ON=icf); bodies are compared after the passes above
+    // clones) are all called through the first of them; bodies are compared
+    // after the passes above. On by default since Nov 21 (before that,
+    // opt-in FID_IROPT_ON=icf; its own test folded nothing with the default
+    // passes, because inline2 had inlined the small identical callees first
+    // — icf now still folds what inlining leaves: instances and clones too
+    // big for its budget); FID_IROPT_OFF=icf turns it off.
     var n_icf: i64 = 0;
-    if has_main && iro_pass_on("icf") && ime_on("icf") {
+    if has_main && iro_pass_on("icf") {
         tm0 = iro_clock(timing);
         ime_trace("icf", "-");
         var tvm_icf: TvMod = tv_mod_before(module);
@@ -1045,15 +1054,6 @@ fn iro_imc_key(imc: & mut IroImc, module: & IrModule, i: i64, salt: i64) -> i64 
         mi = mi + 1;
     }
     return mec_key(MEC_IROPT, own, h);
-}
-
-/// The content hash of `f` after the passes: `pre` when they changed
-/// nothing.
-fn iro_imc_post(f: IrFunction, changed: bool, pre: i64) -> i64 {
-    if changed {
-        return mec_fn_hash(f);
-    }
-    return pre;
 }
 
 /// Run pass `name` on `f`, adding its time to the table when `stats`.
@@ -9849,11 +9849,37 @@ const IRO_VERSION_MAX: i64 = 120;
 /// How many loops the last iro_version call versioned.
 var g_iro_nver: i64 = 0;
 
+/// ME25: FID_VERSION_WHY=1 prints why a loop was not versioned (one line
+/// per refused requirement): a diagnostic of iro_version_one, never a gate.
+/// Any other value prints only functions whose name contains it.
+var g_iro_vw_fn: str = "";
+var g_iro_vw_show: bool = false;
+var g_iro_ver_fn: str = "";
+
+fn iro_version_no(why: str) -> bool {
+    var v: str = p_getenv("FID_VERSION_WHY");
+    if (v as i64) != 0 && str_len(v) > 0 {
+        if !g_iro_vw_show {
+            g_iro_vw_show = true;
+            g_iro_vw_fn = v;
+        }
+        var print: bool = true;
+        if g_iro_vw_fn != "1" {
+            print = str_contains(g_iro_ver_fn, g_iro_vw_fn);
+        }
+        if print {
+            p_eprint_str("version [" + g_iro_ver_fn + "]: " + why + "\n");
+        }
+    }
+    return false;
+}
+
 /// `f0` with its qualifying loops versioned (at most four), see above;
 /// g_iro_nver says how many. Each try works on a copy of the function: a
 /// loop whose copy the proof does not cover leaves `f0` as it was.
 fn iro_version(f0: IrFunction) -> IrFunction {
     g_iro_nver = 0;
+    g_iro_ver_fn = f0.name;
     var f: IrFunction = f0;
     if f.is_constant_time {
         return f;
@@ -9971,7 +9997,10 @@ fn iro_version_one(f: & mut IrFunction, cfg: & IroCfg, facts: & PeirLoopFacts, h
         i = i + 1;
     }
     if latches.len() == 0 || outside.len() != 1 {
-        return false;
+        if latches.len() == 0 {
+            return iro_version_no("no latch");
+        }
+        return iro_version_no("not one entry from outside");
     }
     var pre: i64 = outside.get(0);
     // the body: blocks that reach a latch without passing the header
@@ -9991,23 +10020,23 @@ fn iro_version_one(f: & mut IrFunction, cfg: & IroCfg, facts: & PeirLoopFacts, h
         }
     }
     if body.get(pre) != 0 {
-        return false;
+        return iro_version_no("preheader in the body");
     }
     // the preheader jumps to the header
     var pids: Vec<i64> = f.blocks.get(pre).instructions;
     if pids.len() == 0 {
-        return false;
+        return iro_version_no("empty preheader");
     }
     var pterm: i64 = pids.get(pids.len() - 1);
     var hid: i64 = f.blocks.get(h).id;
     match peir_inst_of(f, pterm) {
         Inst::Jump(t) => {
             if t != hid {
-                return false;
+                return iro_version_no("preheader does not jump to the header");
             }
         }
         _ => {
-            return false;
+            return iro_version_no("preheader does not end in a jump");
         }
     }
     // the header tests `i < right`
@@ -10019,15 +10048,15 @@ fn iro_version_one(f: & mut IrFunction, cfg: & IroCfg, facts: & PeirLoopFacts, h
     match peir_inst_of(f, hids.get(hids.len() - 1)) {
         Inst::Branch(c, t, e) => {
             if t < 0 || t >= cfg.index.len() || e < 0 || e >= cfg.index.len() {
-                return false;
+                return iro_version_no("header branch out of range");
             }
             if cfg.index.get(t) < 0 || cfg.index.get(e) < 0 || body.get(cfg.index.get(t)) == 0 || body.get(cfg.index.get(e)) != 0 {
-                return false;
+                return iro_version_no("header branch shape (exit not out of the loop)");
             }
             cond = c;
         }
         _ => {
-            return false;
+            return iro_version_no("header does not end in a branch");
         }
     }
     var left: i64 = - 1;
@@ -10040,12 +10069,12 @@ fn iro_version_one(f: & mut IrFunction, cfg: & IroCfg, facts: & PeirLoopFacts, h
                     right = r;
                 }
                 _ => {
-                    return false;
+                    return iro_version_no("header test not 'i < right'");
                 }
             }
         }
         _ => {
-            return false;
+            return iro_version_no("header test not a binary operation");
         }
     }
     var islot: i64 = - 1;
@@ -10056,19 +10085,19 @@ fn iro_version_one(f: & mut IrFunction, cfg: & IroCfg, facts: & PeirLoopFacts, h
                     islot = p;
                 }
                 _ => {
-                    return false;
+                    return iro_version_no("counter load not i64");
                 }
             }
         }
         _ => {
-            return false;
+            return iro_version_no("left of the test not a load");
         }
     }
     if islot < 0 || islot >= facts.plain.len() || facts.plain.get(islot) == 0 {
-        return false;
+        return iro_version_no("counter slot not a plain local");
     }
     if peir_is_len(f, right) {
-        return false;
+        return iro_version_no("right is a length (the counted-loop proof takes it)");
     }
     // where each value is defined (block index), and the loop's size
     var def_b: Vec<i64> = Vec::new();
@@ -10085,12 +10114,12 @@ fn iro_version_one(f: & mut IrFunction, cfg: & IroCfg, facts: & PeirLoopFacts, h
                 def_b.set(ids.get(k), b2);
             }
             if body.get(b2) != 0 && k == 0 && f.blocks.get(b2).params.len() > 0 {
-                return false;
+                return iro_version_no("a body block has parameters");
             }
             if body.get(b2) != 0 {
                 size = size + 1;
                 if !iro_version_copyable(peir_inst_of(f, ids.get(k))) {
-                    return false;
+                    return iro_version_no("a body instruction is not copyable");
                 }
             }
             k = k + 1;
@@ -10098,7 +10127,7 @@ fn iro_version_one(f: & mut IrFunction, cfg: & IroCfg, facts: & PeirLoopFacts, h
         b2 = b2 + 1;
     }
     if size > IRO_VERSION_MAX {
-        return false;
+        return iro_version_no("loop larger than IRO_VERSION_MAX");
     }
     // nothing outside the loop reads a value the loop defines
     var ops: Vec<i64> = Vec::new();
@@ -10114,7 +10143,7 @@ fn iro_version_one(f: & mut IrFunction, cfg: & IroCfg, facts: & PeirLoopFacts, h
                 while o < ops.len() {
                     var u: i64 = ops.get(o);
                     if u >= 0 && u < def_b.len() && def_b.get(u) >= 0 && body.get(def_b.get(u)) != 0 {
-                        return false;
+                        return iro_version_no("a value of the loop is read outside it");
                     }
                     o = o + 1;
                 }
@@ -10131,19 +10160,19 @@ fn iro_version_one(f: & mut IrFunction, cfg: & IroCfg, facts: & PeirLoopFacts, h
         match peir_inst_of(f, right) {
             Inst::Load(rp, rt) => {
                 if rp < 0 || rp >= facts.plain.len() || facts.plain.get(rp) == 0 {
-                    return false;
+                    return iro_version_no("bound slot not a plain local");
                 }
                 rslot = rp;
                 rty = rt;
             }
             _ => {
-                return false;
+                return iro_version_no("bound defined in the loop, not a load");
             }
         }
         var si: i64 = 0;
         while si < facts.st_ptr.len() {
             if facts.st_ptr.get(si) == rslot && body.get(facts.st_block.get(si)) != 0 {
-                return false;
+                return iro_version_no("the loop stores the bound's slot");
             }
             si = si + 1;
         }
@@ -10151,10 +10180,10 @@ fn iro_version_one(f: & mut IrFunction, cfg: & IroCfg, facts: & PeirLoopFacts, h
     // the tests compare words, as the loop does
     if rslot >= 0 {
         if !ir_type_eq(rty, IrType::I64) {
-            return false;
+            return iro_version_no("bound slot not i64");
         }
     } else if !iro_version_i64(f, right) {
-        return false;
+        return iro_version_no("bound not an i64 value");
     }
     // a Vec access `v.get(i)` / `v.set(i, x)` in the loop: v from before the
     // loop, or a reload of a slot the loop never stores
@@ -10211,7 +10240,7 @@ fn iro_version_one(f: & mut IrFunction, cfg: & IroCfg, facts: & PeirLoopFacts, h
         b2 = b2 + 1;
     }
     if vval < 0 && vslot < 0 {
-        return false;
+        return iro_version_no("no Vec access in the loop");
     }
     // --- the copy: new blocks, new values, targets inside the loop renamed
     var max_bid: i64 = 0;
@@ -10367,7 +10396,10 @@ fn iro_version_one(f: & mut IrFunction, cfg: & IroCfg, facts: & PeirLoopFacts, h
         }
         ci = ci + 1;
     }
-    return proved;
+    if !proved {
+        return iro_version_no("the proof covers no access of the copy");
+    }
+    return true;
 }
 
 /// ME25/ME23: for `fid explain` (CP3), which reads the IR as lowered: each
