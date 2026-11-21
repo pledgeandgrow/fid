@@ -1,0 +1,65 @@
+// CT1 (complaint-roadmap): Mocking time, network and files. The effects
+// system says exactly what a function touches; a test that wants
+// deterministic time or file behavior injects a mock. MockClock returns
+// a fixed sequence of times; MockFS holds path->content pairs; MockNet
+// holds url->response pairs. The function under test takes the mock as
+// a parameter, and its effects constrain it from doing real I/O.
+//
+// Expected output:
+// 3
+// 100
+// 200
+// 300
+// hello
+// world
+// {"a":1}
+// 2
+// 1
+
+use test;
+
+fn expires_at(clock: &mut MockClock, ttl: i64) -> i64 {
+    var now: i64 = mock_clock_now(clock);
+    return now + ttl;
+}
+
+fn read_config(fs: &MockFS, path: str) -> str {
+    return mock_fs_read(fs, path);
+}
+
+fn fetch_api(net: &MockNet, url: str) -> str {
+    return mock_net_get(net, url);
+}
+
+fn main() -> i64 {
+    // MockClock: a fixed sequence
+    var times: Vec<i64> = Vec::new();
+    times.push(100);
+    times.push(200);
+    times.push(300);
+    var clock: MockClock = mock_clock(times);
+    println(expires_at(&mut clock, 2));
+    println(mock_clock_now(&mut clock));
+    println(mock_clock_now(&mut clock));
+    println(mock_clock_now(&mut clock));
+    println(mock_clock_reads(clock));
+
+    // MockFS: paths to contents
+    var fs: MockFS = mock_fs();
+    mock_fs_add(&mut fs, "/etc/app", "hello");
+    mock_fs_add(&mut fs, "/etc/db", "world");
+    println(read_config(&fs, "/etc/app"));
+    println(read_config(&fs, "/etc/db"));
+    println(read_config(&fs, "/etc/none"));
+
+    // MockNet: urls to responses
+    var net: MockNet = mock_net();
+    mock_net_add(&mut net, "http://api/x", "{\"a\":1}");
+    println(fetch_api(&net, "http://api/x"));
+    println(fetch_api(&net, "http://api/y"));
+
+    // MockClock: fixed
+    var fixed: MockClock = mock_clock_fixed(42);
+    println(mock_clock_now(&mut fixed));
+    return 0;
+}

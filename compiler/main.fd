@@ -3544,7 +3544,18 @@ fn cmd_check(n: i64, start: i64) -> i64 {
     }
     var t0: i64 = p_clock_now_ms();
     match build_program_with_path_borrowck(source, OptStr::Some(input), "on") {
-        ResultProgram::Ok(_) => {
+        ResultProgram::Ok(program) => {
+            // CA4: lock-order analysis on the lowered IR
+            var lc_off: str = env_or_empty("FID_LOCKCHECK");
+            if lc_off != "off" {
+                var lm: IrModule = lower(program);
+                var lcr: LockCheckResult = lockcheck_module(&lm);
+                if lcr.cycle {
+                    p_eprint_str("error: " + lcr.cycle_desc + "
+");
+                    return 1;
+                }
+            }
             time_mark("total", t_start);
             time_report();
             p_eprint_str(input + ": no errors (" + int_to_str(p_clock_now_ms() - t0) + " ms)\n");

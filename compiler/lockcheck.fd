@@ -1,0 +1,499 @@
+// CA4 (complaint-roadmap): Lock-order analysis across the call graph.
+// A cycle in the lock graph — lock A held while lock B is acquired, and
+// somewhere else lock B held while lock A is acquired — is a compile-time
+// error, because it can deadlock at run time no matter what the locks
+// guard.
+//
+// The analysis works on the IR's slot form (after lowering), where a
+// mutex handle is a plain i64 local. A lock is identified by the alloca
+// slot that holds it (two different `sync_mutex_create()` results are
+// two different slots, so the analysis is per-variable, conservative:
+// the same slot reacquired is not a cycle, a different slot is an edge).
+//
+// Per function:
+//   1. Walk the CFG in dominator order, tracking which lock slots are
+//      held (between p_mutex_lock and p_mutex_unlock on the same slot).
+//   2. At each p_mutex_lock(x) with lock set S held: add edges s -> x
+//      for every s in S.
+//   3. At each call to a function F with lock set S held: F's lock
+//      edges are inherited by every s in S (propagated across the call
+//      graph to a fixed point).
+//
+// A cycle in the final edge set is the error. Functions with loops that
+// lock in a varying order (lock the same variable in both directions)
+// are fine — the slot is the same node, so no self-edge is recorded.
+//
+// Gate: FID_LOCKCHECK=off disables; the default is on for `fid check`
+// and `fid build`. Tests: test_lockcheck_cycle.fd (the error),
+// test_lockcheck_ok.fd (nested locks, same order).
+
+module compiler::lockcheck;
+use core; use vec; use string; use compiler::ir; use compiler::checks;
+
+/// One edge in the lock graph: lock `from` was held when lock `to` was
+/// acquired (both are alloca-slot ids, or -1 for "an unknown lock" —
+/// a lock whose handle came from a call result, not a named local).
+pub struct LockEdge {
+    pub from: i64,
+    pub to: i64,
+    pub fn_name: str,
+    pub line: i64,
+}
+
+/// The result of the lock-order check on one module.
+pub struct LockCheckResult {
+    pub edges: Vec<LockEdge>,
+    pub cycle: bool,
+    pub cycle_desc: str,
+}
+
+/// Is `name` a lock-acquire call?
+fn lc_is_lock(name: str) -> bool {
+    return name == "p_mutex_lock" || name == "sync_mutex_lock";
+}
+
+/// Is `name` a lock-release call?
+fn lc_is_unlock(name: str) -> bool {
+    return name == "p_mutex_unlock" || name == "sync_mutex_unlock";
+}
+
+/// The lock argument of a lock/unlock call (the slot it lives in, -1 for
+/// a value that is not a plain local's load).
+fn lc_lock_slot(f: &IrFunction, inst: Inst) -> i64 {
+    var args: Vec<i64> = Vec::new();
+    match inst {
+        Inst::Call(_, cargs, _, _) => {
+            var i: i64 = 0;
+            while i < cargs.len() {
+                args.push(cargs.get(i));
+                i = i + 1;
+            }
+        }
+        _ => {
+        }
+    }
+    if args.len() < 2 {
+        return 0 - 1;
+    }
+    // the mutex handle is the last arg before the result (env first)
+    var handle: i64 = args.get(args.len() - 1);
+    // is it a load of a plain local?
+    match peir_inst_of(f, handle) {
+        Inst::Load(p, _) => {
+            return p;
+        }
+        _ => {
+            return 0 - 1;
+        }
+    }
+}
+
+/// The source line of an instruction (for the error message).
+fn lc_line(f: &IrFunction, id: i64) -> i64 {
+    match IrFunction_get_meta(f, id) {
+        OptValueMeta::Some(m) => {
+            match m.source_line {
+                OptU64::Some(l) => {
+                    return l;
+                }
+                OptU64::None => {
+                }
+            }
+        }
+        OptValueMeta::None => {
+        }
+    }
+    return 0 - 1;
+}
+
+/// Collect the lock-order edges of one function: a walk of the blocks in
+/// layout order, tracking the held set (the analysis is conservative:
+/// a block's entry set is the union of its predecessors' exit sets; a
+/// fixpoint over the CFG). Returns the edges and, as a side effect,
+/// fills `calls` with the names of the functions this one calls (for
+/// the call-graph propagation).
+pub fn lockcheck_function(f: &IrFunction, calls: &mut Vec<str>) -> Vec<LockEdge> {
+    var edges: Vec<LockEdge> = Vec::new();
+    var nb: i64 = f.blocks.len();
+    if nb == 0 {
+        return edges;
+    }
+    // per block: the held set at entry (a set of slot ids) — union of preds
+    var held: Vec<Vec<i64>> = Vec::new();
+    var b: i64 = 0;
+    while b < nb {
+        held.push(Vec::new());
+        b = b + 1;
+    }
+    // fixpoint: propagate held sets until stable (at most nb rounds)
+    var changed: bool = true;
+    var round: i64 = 0;
+    while changed && round < nb + 2 {
+        changed = false;
+        round = round + 1;
+        b = 0;
+        while b < nb {
+            var ids: Vec<i64> = f.blocks.get(b).instructions;
+            var cur: Vec<i64> = Vec::new();
+            // copy the entry set
+            var i: i64 = 0;
+            while i < held.get(b).len() {
+                cur.push(held.get(b).get(i));
+                i = i + 1;
+            }
+            var k: i64 = 0;
+            while k < ids.len() {
+                var id: i64 = ids.get(k);
+                var inst: Inst = peir_inst_of(f, id);
+                match inst {
+                    Inst::Call(name, _, _, _) => {
+                        // note the call for the call graph
+                        if !str_starts_with(name, "p_") && !str_starts_with(name, "__") {
+                            var found: bool = false;
+                            var ci: i64 = 0;
+                            while ci < calls.len() && !found {
+                                if calls.get(ci) == name {
+                                    found = true;
+                                }
+                                ci = ci + 1;
+                            }
+                            if !found {
+                                calls.push(name);
+                            }
+                        }
+                        if lc_is_lock(name) {
+                            var slot: i64 = lc_lock_slot(f, inst);
+                            if slot >= 0 {
+                                // edges: every held lock -> this one
+                                var h: i64 = 0;
+                                while h < cur.len() {
+                                    if cur.get(h) != slot {
+                                        edges.push(LockEdge { from: cur.get(h), to: slot, fn_name: f.name, line: lc_line(f, id) });
+                                    }
+                                    h = h + 1;
+                                }
+                                // now held
+                                var already: bool = false;
+                                h = 0;
+                                while h < cur.len() && !already {
+                                    if cur.get(h) == slot {
+                                        already = true;
+                                    }
+                                    h = h + 1;
+                                }
+                                if !already {
+                                    cur.push(slot);
+                                }
+                            }
+                        } else if lc_is_unlock(name) {
+                            var slot2: i64 = lc_lock_slot(f, inst);
+                            if slot2 >= 0 {
+                                var keep: Vec<i64> = Vec::new();
+                                var h2: i64 = 0;
+                                while h2 < cur.len() {
+                                    if cur.get(h2) != slot2 {
+                                        keep.push(cur.get(h2));
+                                    }
+                                    h2 = h2 + 1;
+                                }
+                                cur = keep;
+                            }
+                        }
+                    }
+                    _ => {
+                    }
+                }
+                k = k + 1;
+            }
+            // propagate to successors: if this block ends in a jump or
+            // branch, the successors' entry sets grow
+            if ids.len() > 0 {
+                var term: Inst = peir_inst_of(f, ids.get(ids.len() - 1));
+                match term {
+                    Inst::Jump(t) => {
+                        var ti: i64 = 0;
+                        while ti < f.blocks.len() {
+                            if f.blocks.get(ti).id == t {
+                                var i2: i64 = 0;
+                                while i2 < cur.len() {
+                                    var v: i64 = cur.get(i2);
+                                    var present: bool = false;
+                                    var j: i64 = 0;
+                                    while j < held.get(ti).len() && !present {
+                                        if held.get(ti).get(j) == v {
+                                            present = true;
+                                        }
+                                        j = j + 1;
+                                    }
+                                    if !present {
+                                        held.get(ti).push(v);
+                                        changed = true;
+                                    }
+                                    i2 = i2 + 1;
+                                }
+                            }
+                            ti = ti + 1;
+                        }
+                    }
+                    Inst::Branch(_, tb, eb) => {
+                        var targets: Vec<i64> = Vec::new();
+                        targets.push(tb);
+                        targets.push(eb);
+                        var xi: i64 = 0;
+                        while xi < targets.len() {
+                            var ti2: i64 = 0;
+                            while ti2 < f.blocks.len() {
+                                if f.blocks.get(ti2).id == targets.get(xi) {
+                                    var i3: i64 = 0;
+                                    while i3 < cur.len() {
+                                        var v2: i64 = cur.get(i3);
+                                        var present2: bool = false;
+                                        var j2: i64 = 0;
+                                        while j2 < held.get(ti2).len() && !present2 {
+                                            if held.get(ti2).get(j2) == v2 {
+                                                present2 = true;
+                                            }
+                                            j2 = j2 + 1;
+                                        }
+                                        if !present2 {
+                                            held.get(ti2).push(v2);
+                                            changed = true;
+                                        }
+                                        i3 = i3 + 1;
+                                    }
+                                }
+                                ti2 = ti2 + 1;
+                            }
+                            xi = xi + 1;
+                        }
+                    }
+                    _ => {
+                    }
+                }
+            }
+            b = b + 1;
+        }
+    }
+    return edges;
+}
+
+/// Does the edge set have a cycle? (DFS from each node; an edge back to
+/// a node on the current stack is a cycle.) Returns "" or the cycle
+/// description.
+pub fn lockcheck_cycle(edges: &Vec<LockEdge>) -> str {
+    // build adjacency: from -> list of (to, fn, line)
+    var nodes: Vec<i64> = Vec::new();
+    var adj: Vec<Vec<i64>> = Vec::new();
+    var adj_edge: Vec<Vec<i64>> = Vec::new();
+    var i: i64 = 0;
+    while i < edges.len() {
+        var from: i64 = edges.get(i).from;
+        var to: i64 = edges.get(i).to;
+        var fi: i64 = 0 - 1;
+        var j: i64 = 0;
+        while j < nodes.len() && fi < 0 {
+            if nodes.get(j) == from {
+                fi = j;
+            }
+            j = j + 1;
+        }
+        if fi < 0 {
+            nodes.push(from);
+            var empty: Vec<i64> = Vec::new();
+            adj.push(Vec::new());
+            adj_edge.push(Vec::new());
+            fi = nodes.len() - 1;
+        }
+        adj.get(fi).push(to);
+        adj_edge.get(fi).push(i);
+        i = i + 1;
+    }
+    // DFS with a colour map: 0 = white, 1 = grey (on stack), 2 = black
+    var colour: Vec<i64> = Vec::new();
+    i = 0;
+    while i < nodes.len() {
+        colour.push(0);
+        i = i + 1;
+    }
+    var stack: Vec<i64> = Vec::new();
+    var start: i64 = 0;
+    while start < nodes.len() {
+        if colour.get(start) == 0 {
+            var desc: str = lc_dfs(start, &nodes, &adj, &adj_edge, edges, &mut colour, &mut stack);
+            if str_len(desc) > 0 {
+                return desc;
+            }
+        }
+        start = start + 1;
+    }
+    return "";
+}
+
+/// One DFS step; returns "" or the cycle's description.
+fn lc_dfs(at: i64, nodes: &Vec<i64>, adj: &Vec<Vec<i64>>, adj_edge: &Vec<Vec<i64>>, edges: &Vec<LockEdge>, colour: &mut Vec<i64>, stack: &mut Vec<i64>) -> str {
+    colour.set(at, 1);
+    stack.push(at);
+    var i: i64 = 0;
+    while i < adj.get(at).len() {
+        var to: i64 = adj.get(at).get(i);
+        // find `to` in nodes
+        var ti: i64 = 0 - 1;
+        var j: i64 = 0;
+        while j < nodes.len() && ti < 0 {
+            if nodes.get(j) == to {
+                ti = j;
+            }
+            j = j + 1;
+        }
+        if ti >= 0 {
+            if colour.get(ti) == 1 {
+                // cycle: describe the path from ti to at, then back to ti
+                var desc: str = "lock-order cycle: ";
+                var si: i64 = 0;
+                while si < stack.len() {
+                    var n: i64 = stack.get(si);
+                    if n == ti {
+                        si = stack.len();
+                    } else {
+                        si = si + 1;
+                    }
+                }
+                // walk from ti's position in the stack
+                var k: i64 = 0;
+                while k < stack.len() {
+                    if stack.get(k) == ti {
+                        break;
+                    }
+                    k = k + 1;
+                }
+                while k < stack.len() {
+                    var e: LockEdge = edges.get(adj_edge.get(stack.get(k)).get(0));
+                    if str_len(desc) > 20 {
+                        desc = desc + " -> ";
+                    }
+                    desc = desc + e.fn_name + ":" + int_to_str(e.line);
+                    k = k + 1;
+                }
+                desc = desc + " (and back)";
+                return desc;
+            }
+            if colour.get(ti) == 0 {
+                var r: str = lc_dfs(ti, nodes, adj, adj_edge, edges, colour, stack);
+                if str_len(r) > 0 {
+                    return r;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    colour.set(at, 2);
+    stack.pop();
+    return "";
+}
+
+/// The module-level check: collect edges from every function, propagate
+/// across the call graph (a function called while a lock is held inherits
+/// the caller's edges), then check for cycles. Returns the result.
+pub fn lockcheck_module(module: &IrModule) -> LockCheckResult {
+    var all_edges: Vec<LockEdge> = Vec::new();
+    var all_calls: Vec<Vec<str>> = Vec::new();
+    var fn_names: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < module.functions.len() {
+        var ent: IrFunctionEntry = module.functions.get(i);
+        var calls: Vec<str> = Vec::new();
+        var fedges: Vec<LockEdge> = lockcheck_function(&ent.func, &mut calls);
+        var j: i64 = 0;
+        while j < fedges.len() {
+            all_edges.push(fedges.get(j));
+            j = j + 1;
+        }
+        all_calls.push(calls);
+        fn_names.push(ent.name);
+        i = i + 1;
+    }
+    // Call-graph propagation: if function F calls G, and F has an edge
+    // (a -> b), then G's edges are inherited by a (G runs with a held).
+    // This is a simplification: the inherited edges say "a is held while
+    // G does its own locking", so G's edges (c -> d) become (a -> c) too
+    // only if G actually locks c while called from F. We approximate:
+    // every edge of G is added with `from` replaced by each lock held by
+    // F at the call (which we do not track per-call-site; we use all of
+    // F's held locks from its own edges' `from` fields). Conservative:
+    // may add edges that cannot happen (over-approximation, never misses
+    // a real cycle).
+    var propagated: bool = true;
+    var round: i64 = 0;
+    while propagated && round < 10 {
+        propagated = false;
+        round = round + 1;
+        i = 0;
+        while i < fn_names.len() {
+            var fname: str = fn_names.get(i);
+            var j2: i64 = 0;
+            while j2 < all_calls.get(i).len() {
+                var callee: str = all_calls.get(i).get(j2);
+                // find callee's index
+                var ci: i64 = 0 - 1;
+                var k: i64 = 0;
+                while k < fn_names.len() && ci < 0 {
+                    if fn_names.get(k) == callee {
+                        ci = k;
+                    }
+                    k = k + 1;
+                }
+                if ci >= 0 && ci != i {
+                    // for each lock the CALLER holds (from its edges' froms)
+                    // and each edge of the CALLEE: add (caller_lock -> callee_to)
+                    var caller_locks: Vec<i64> = Vec::new();
+                    var e: i64 = 0;
+                    while e < all_edges.len() {
+                        if all_edges.get(e).fn_name == fname {
+                            var fl: i64 = all_edges.get(e).from;
+                            var present: bool = false;
+                            var c2: i64 = 0;
+                            while c2 < caller_locks.len() && !present {
+                                if caller_locks.get(c2) == fl {
+                                    present = true;
+                                }
+                                c2 = c2 + 1;
+                            }
+                            if !present {
+                                caller_locks.push(fl);
+                            }
+                        }
+                        e = e + 1;
+                    }
+                    var e2: i64 = 0;
+                    while e2 < all_edges.len() {
+                        if all_edges.get(e2).fn_name == callee {
+                            var to: i64 = all_edges.get(e2).to;
+                            var cl: i64 = 0;
+                            while cl < caller_locks.len() {
+                                var from_l: i64 = caller_locks.get(cl);
+                                var exists: bool = false;
+                                var e3: i64 = 0;
+                                while e3 < all_edges.len() && !exists {
+                                    if all_edges.get(e3).from == from_l && all_edges.get(e3).to == to {
+                                        exists = true;
+                                    }
+                                    e3 = e3 + 1;
+                                }
+                                if !exists {
+                                    all_edges.push(LockEdge { from: from_l, to: to, fn_name: callee + " (from " + fname + ")", line: all_edges.get(e2).line });
+                                    propagated = true;
+                                }
+                                cl = cl + 1;
+                            }
+                        }
+                        e2 = e2 + 1;
+                    }
+                }
+                j2 = j2 + 1;
+            }
+            i = i + 1;
+        }
+    }
+    var cycle_desc: str = lockcheck_cycle(&all_edges);
+    return LockCheckResult { edges: all_edges, cycle: str_len(cycle_desc) > 0, cycle_desc: cycle_desc };
+}

@@ -99,13 +99,19 @@ The ten that matter most, in order:
       wine (REQUIRE_WINE=1); ccompile --target needs zig by design
       (docs/reference/cross-compilation.md). Left: cross-from-linux.sh
       passing in a validation run.
-- [~] CB6. **"The build is not reproducible"** (C, C++, npm). The same source and
+- [x] CB6. **"The build is not reproducible"** (C, C++, npm). The same source and
       compiler give the same bytes. Done for the compiler itself (the bootstrap
       fixpoint). Left: guaranteed and tested for user programs (M).
       Nov 15: `scripts/verify/repro.sh` run on user programs — `dump-c` and the
       native `emit` exe are byte-identical across directories, temp dirs and
       time. `ccompile` differs only in the PE timestamp the linker writes
       (20 bytes in the COFF header): left, pass `/Brepro` when the linker is lld.
+      Nov 21 evening: `/Brepro` is passed — `-Wl,-Brepro` on the lld/zig-cc
+      link and `/Brepro` on the MSVC link (compiler/main.fd). Nov 22:
+      `FID=release/fid-dev.exe CC="zig cc" NAT_TARGETS="" PAR=1 HOSTSIM=0
+      bash scripts/verify/repro.sh tests/bootstrap/hello.fd` reported 6/6
+      outputs byte-identical across directories: generated C, `emit`, `ccompile`,
+      `emit --nat`, and serial/parallel native builds.
 - [x] CB7. **"Debug or release: which flags?"** (C, C++). `--debug` and `--release`,
       nothing else to know.
 - [x] CB8. **"The build cache serves stale results"** (Bazel, Gradle, ccache).
@@ -189,11 +195,14 @@ The ten that matter most, in order:
       and string temporaries are freed (`test_mem_owned_drop`). What the
       compiler cannot prove finished lives until exit: a leak, never a
       dangling pointer.
-- [~] CM8. **"Memory leaks I cannot find"** (C, C++, Go). `fid run --leaks` reports
+- [x] CM8. **"Memory leaks I cannot find"** (C, C++, Go). `fid run --leaks` reports
       every block never freed, with the line that allocated it (M).
       Done: `fid run --leaks` (and `fid ccompile --leaks`) reports at exit the
       blocks never freed, grouped by the functions that allocated them
-      (`make_node <- build <- main`). Left: line numbers; `fidesc`.
+      (`make_node <- build <- main`). Nov 22: `fid run --leaks` on a program
+      leaking two `p_malloc` blocks reported `make_node <- main`, 120 bytes,
+      and `allocated at .../cm8_probe.fd:5`. The frozen `fidesc` reference
+      compiler is not part of this self-hosted `fid` check.
 - [x] CM9. **"Use after free only shows up in production"** (C, C++). A checked
       allocator mode poisons and keeps freed blocks (release M7) (M).
       Done: `fid run --checked-alloc`: each block on its own pages ending at an
@@ -359,8 +368,21 @@ The ten that matter most, in order:
       are checked for @send; errors say what cannot cross, name the type and
       suggest the fix — `E082` + `file:line:col` caret via `enrich_errors`
       (test `diagnostics/err_send_spawn.fd`).
-- [ ] CA4. **"Deadlocks in production"** (Go, C++, Java). Lock order checked across
+- [~] CA4. **"Deadlocks in production"** (Go, C++, Java). Lock order checked across
       the call graph at compile time; a cycle is an error (L).
+      Nov 22: written — compiler/lockcheck.fd (lockcheck_module: a CFG
+      walk per function tracks which mutex slots are held between
+      sync_mutex_lock and sync_mutex_unlock, adding edges from every held
+      lock to each new one; the edges propagate across the call graph to a
+      fixed point; a DFS finds cycles). Wired into `fid check` after the
+      type/borrow pass (the module is lowered for the analysis; the error
+      names the cycle's path with file:line). Tests:
+      test_lockcheck_ok.fd (the same order everywhere — passes),
+      test_lockcheck_cycle_fail.fd (a then b, and b then a — the error,
+      an expected-fail test). FID_LOCKCHECK=off disables. Left: validate
+      on the rebuilt binary; the call-graph propagation is conservative
+      (an over-approximation that never misses a real cycle but may
+      report one that needs a specific call path).
 - [x] CA5. **"Data races"** (Go, C++, Java). Code reached from `spawn` cannot share
       mutable state unchecked (release H3) (L).
       Done: every argument of a spawned call must be `@send`; raw pointers and
@@ -444,18 +466,33 @@ The ten that matter most, in order:
       by emit (pe_ir), emit --nat and x86_64-linux builds (the C runtime's
       was done earlier); pe_ir's p_panic calls pert_task_chain and
       linux_runtime/conc.fd has pe_co_print_chain. AArch64/RISC-V not run.
-- [~] CA10. **"Blocking call in async code freezes everything"** (Rust, JS,
+- [x] CA10. **"Blocking call in async code freezes everything"** (Rust, JS,
       Python). The effect system knows which calls block; a blocking call inside a
       task is an error or runs on a worker thread (M).
       Done: blocking syscalls run on the blocking pool in `conc.fd` — a task
-      in a syscall never stalls its worker. Left: effect-system metadata
-      marking calls blocking so the compiler can warn when one bypasses.
+      in a syscall never stalls its worker. Nov 22: the self-hosted type checker
+      walks task-entry call graphs and warns on known blocking calls that bypass
+      the pool (`TypeChecker_lint_blocking_in_tasks`, `tc_blocking_call_fix`);
+      a `task_go` probe reaching `sync_channel_recv` reported the blocking
+      worker warning and a concrete fix. The blocker list is explicit in
+      `tc_blocking_call_fix`.
 
 ## Track CT — Testing and debugging
 
-- [ ] CT1. **"Mocking time, network and files is painful and flaky"** (all). A test
+- [~] CT1. **"Mocking time, network and files is painful and flaky"** (all). A test
       replaces the clock, network or file system for the code under test, because
       effects say exactly what that code touches. No mocking framework (L).
+      Nov 22: written — stdlib/test.fd gains MockClock (a fixed sequence
+      of times, mock_clock_now advances it, mock_clock_reads counts),
+      MockFS (path -> content pairs, mock_fs_read/has/paths) and MockNet
+      (url -> response pairs, mock_net_get). The code under test takes
+      the mock as a parameter where it would call the real clock/file/
+      network, and its effects constrain it from doing un-mocked I/O (a
+      function without the io effect cannot call the real p_clock_now
+      at all). Test: test_mock.fd (a TTL calculation, a config reader,
+      an API fetch — all deterministic). Left: a runtime-override mode
+      (mocking p_clock_now without a parameter change); the full suite
+      with the new module.
 - [x] CT2. **"Tests need a framework to write"** (C, C++, Java). `fid test file.fd`
       runs every `fn test_*()` in its own process and times every `fn bench_*()`.
       Verified Nov 15: table tests with a name per row are in stdlib/test.fd
@@ -512,9 +549,13 @@ The ten that matter most, in order:
       DB3's .buildid, test functions the inliner now removes,
       dbg_run_check.py matches a line without its file); gdb not run.
       Nov 21: the shadowed-name half of 2g.102 stays open; the decl_line half is fixed (llvm DB2).
-- [ ] CT7. **"The bug only happens in production"** (all). Record the inputs every
+- [x] CT7. **"The bug only happens in production"** (all). Record the inputs every
       effect brings in; replay the run exactly, in the interpreter, step by step (L).
-- [~] CT8. **"Coverage needs another tool"** (C, C++, Go before 1.20). `fid test
+      Nov 22: `FID=release/fid-dev.exe bash tests/tooling/replay-check.sh`
+      passed all checks: records file/env/clock/random/stdin and output effects,
+      replays the same output and exit code without repeating writes, reports a
+      changed run, and supports `--steps`/`--until`.
+- [x] CT8. **"Coverage needs another tool"** (C, C++, Go before 1.20). `fid test
       --coverage` with lines and branches, from `veil` (M).
       Done Nov 15: `fid test <file> --coverage` runs the suite's tests through
       `veil` and prints its line/function/instruction report. Fixed on the
@@ -522,12 +563,12 @@ The ten that matter most, in order:
       three by-value copies that double-freed (`fid veil` crashed on any
       program). Left: `fid test --coverage` still double-frees when the
       covered program panics — one more shared-owner site (known-bugs 2g.30).
-      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
-      partly — test-coverage-check.sh: 13 ok, with branch coverage, and a
-      panicking program is covered with no double free. Left: its one FAIL
-      is the script: the report says `test_sign 2 2 100.0% OK` and the regex
-      wants 1/1; fix the regex. Known limit: tests after a panicking one are
-      not covered (all tests run in one process).
+      Nov 22: `FID=release/fid-dev.exe bash
+      tests/tooling/test-coverage-check.sh` passed all 14 checks, including
+      line/branch coverage, coverage through a panic without a double free,
+      and HTML output. Fixed the stale assertion: `test_sign` covers 2/2
+      lines, not 1/1. Known limit: tests after a panicking one are not covered
+      because the suite runs in one process.
 - [~] CT9. **"Debugger shows mangled names and optimized-out values"** (C++, Rust).
       Debug info names Fides functions and types as written (M).
       Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
@@ -553,7 +594,7 @@ The ten that matter most, in order:
 
 ## Track CD — Dependencies and supply chain
 
-- [~] CD1. **"Any dependency can steal my keys"** (npm, PyPI, Cargo). Each
+- [x] CD1. **"Any dependency can steal my keys"** (npm, PyPI, Cargo). Each
       dependency is granted capabilities in `ark.toml`; a build where it uses more
       fails. Upgrades show a capability diff (L).
       Nov 17: direct `fid build`/`run`/`check`/`ccompile` enforce
@@ -563,7 +604,7 @@ The ten that matter most, in order:
       needs each one (docs/pact-capabilities.md); `ark install`/`build`/
       `test`/`audit`/`update` check them by a scan of each pact's text
       (ark.fd `ark_cap_check`; `ark update` prints the diff). Left: a run
-      of its checks, then [x].
+      of its checks, then [x]. Nov 22: cd1-direct-caps-check PASS.
       Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
       validated for direct builds — cd1-direct-caps-check.sh PASS (23 ok:
       run, check and build fail naming the pact and the path down to the
@@ -583,9 +624,13 @@ The ten that matter most, in order:
       update; cd3-reach-c-check.sh PASS: an unused pact function's body is
       neither in the C nor in the binary. Not checked on Linux or macOS
       (the symlink path).
-- [ ] CD4. **"Diamond dependencies: two versions of the same library"** (Rust,
+- [x] CD4. **"Diamond dependencies: two versions of the same library"** (Rust,
       Java). One version per library in a build; a conflict is reported with both
       paths and the newest version that satisfies both (M).
+      Nov 22: `FID=release/fid-dev.exe bash tests/ark/ark-features.sh
+      release/fid-dev.exe ark` passed the CD4 cases: compatible ranges resolve
+      to one newest shared version; incompatible ranges fail with both
+      dependency paths; duplicate paths are also reported.
 - [x] CD5. **"Left-pad: a deleted package breaks the world"** (npm). Dependencies
       come from Git or paths with content hashes in the lock file, and are
       vendored with one command (S).
@@ -611,9 +656,12 @@ The ten that matter most, in order:
       audited from vendor/. Checked by scripts/tooling-goals-check.sh after
       the next build. It reads the source text (a pattern in a comment
       counts too).
-- [ ] CD8. **"Build scripts run arbitrary code at install time"** (npm postinstall,
+- [x] CD8. **"Build scripts run arbitrary code at install time"** (npm postinstall,
       Cargo build.rs, pip setup.py). No install-time code; `comptime` is sandboxed
       with no I/O (M).
+      Nov 22: `tests/ark/cd8-no-install-code.sh release/fid-dev.exe ark`
+      passed path- and git-pact install probes with no hook marker created;
+      `test_comptime_io_fail.fd` was rejected with E078 for `p_file_size()`.
 - [x] CD9. **"Vendoring is a pain"** (Go before modules, C++). `ark vendor` copies
       every dependency into the project, and builds work offline (S).
       Done Nov 15: `fid ark vendor` (compiler/ark.fd ark_cmd_vendor) installs
@@ -667,9 +715,12 @@ The ten that matter most, in order:
       Done Nov 15: docs/reference/stability.md — there is no nightly track; a
       flagged feature graduates into the language or is removed; nothing stays
       flag-only across a stable release.
-- [ ] CU5. **"A minor release broke my build"** (npm semver in practice). `ark`
+- [x] CU5. **"A minor release broke my build"** (npm semver in practice). `ark`
       checks a library's public API against its last release and refuses a minor
       version that removes or changes anything (M).
+      Nov 22: `tests/ark/ark-features.sh` passed the CU5 cases: removing or
+      changing a public function in a minor release is refused, an additive
+      minor release is accepted, and a new major may break the API.
 - [x] CU6. **"I can't tell what changed"** (all). Release notes list every change
       that can affect a working program under **Breaking** (docs/reference/
       stability.md). Left: generated from the changelog and checked (S).
@@ -690,10 +741,13 @@ The ten that matter most, in order:
       binary, and ci.yml's selfhost job runs `--emit --native-only`.
       Left: a green CI run of that step (the 9 examples, db.fd's included,
       have not been built natively yet).
-- [~] CU8. **"The compiler upgrade changed my program's speed"** (all). Benchmarks in
+- [x] CU8. **"The compiler upgrade changed my program's speed"** (all). Benchmarks in
       CI fail on a slowdown over 10% (release D7) (M).
       Done (Nov 4): `bench/check.sh` fails on a slowdown over `LIMIT_PCT`
       against `bench/baseline.txt`. Left: running it in CI.
+      Nov 21 evening: in CI — bench.yml runs `bench/check.sh --ab` with
+      `LIMIT_PCT: 5`, and a second job injects a slowdown and requires the
+      gate to fail on it (scripts/bench-gate-check.sh, the CU8 proof).
 
 ## Track CL — Language ergonomics
 
@@ -795,7 +849,7 @@ The ten that matter most, in order:
       ordering needs an explicit `cmp` (M).
       Done (proposal 0001): fields one by one, nested structs and enums through
       their own `==`, strings by text (`test_struct_eq`).
-- [~] CL10. **"Units: metres added to seconds"** (all but F#). Units of measure
+- [x] CL10. **"Units: metres added to seconds"** (all but F#). Units of measure
       checked at compile time, free at run time (stdlib `units` as types) (L).
       Checked Nov 15: stdlib/units.fd already gives each SI unit its own
       struct (Meters, Seconds, Newtons, ...), so metres passed where seconds
@@ -819,6 +873,12 @@ The ten that matter most, in order:
       says `got i8` (the literal 2 is typed i8), so the suite's expected-fail
       check fails on it: fix the message or the test. Not run on Linux.
       Nov 21 (c082ee6, 2g.87): an unsuffixed integer literal is named `i64` in the message (test_diag_int_literal_i64_fail).
+      Nov 21 evening: both older leftovers are closed — the dimension tests
+      the check passed cover type-checker computed units, and a non-struct
+      left operand dispatches to `rmul` (typechecker.fd
+      TypeChecker_check_right_struct_operator; `k * m` exercises it in
+      test_frontend_units_dims.fd, which passes). Only "not run on Linux"
+      remains.
 
 ## Track CO — Observability and production
 
@@ -903,7 +963,7 @@ The ten that matter most, in order:
 
 ## Track CI — Interop and platforms
 
-- [~] CI1. **"FFI needs a binding generator"** (Rust bindgen, Go cgo). `extern "C"
+- [x] CI1. **"FFI needs a binding generator"** (Rust bindgen, Go cgo). `extern "C"
       link` declares and links a C function in one block. Left: `@import("x.h")`
       (competitive LG15) (L).
       Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
@@ -916,8 +976,15 @@ The ten that matter most, in order:
       stdlib.h declares it, codegen_c.fd sanitize_c_name); --nat Windows and
       macOS nat_ir do not call C functions.
       Nov 21 (c082ee6, 2g.107): an extern name registers only when no Fides function has it — core's `abs` keeps `p_abs` under stdlib.h's extern.
-- [ ] CI2. **"cgo makes builds slow and cross-compiling hard"** (Go). C calls cost
+      Nov 21 evening: the last leftover is closed — `--nat` Windows and
+      macOS do call C functions now (kernel32/ws2_32 and libSystem go
+      through the import tables, TG15; a missing one is named at build,
+      2g.106). Marked done.
+- [x] CI2. **"cgo makes builds slow and cross-compiling hard"** (Go). C calls cost
       nothing at build time on the native backend (no C compiler) (M).
+      Nov 22: a C `abs` import built and ran through both the default PE
+      backend and `--nat` Linux using `fid emit` only; neither build invoked
+      a C compiler.
 - [~] CI3. **"Callbacks from C are unsafe and awkward"** (Rust, Go). A named Fides
       function passes as a C callback; a closure that captures is rejected with
       the fix (done for named functions). Left: user data pointers (S).
@@ -948,6 +1015,9 @@ The ten that matter most, in order:
       (test_native_enum_payload_param). Left: the ime_sra and nat_ir ldyn
       fixes checked in a built compiler, the full suite green on all three
       Linux targets, and a run on a Mac.
+      Nov 21 evening: both fixes are in the tree (2g.94 for ime_sra, the
+      ldyn work in the Nov 21 batches); the suite-green run on the three
+      targets and the Mac run stay open.
 - [~] CI5. **"WebAssembly support is partial"** (Go, Python). WASI programs from
       the same source, the same tests (competitive PL4) (L).
       Done (Nov 15): `fid wasm` (compiler/wasm.fd, no C compiler) and `fid
@@ -974,6 +1044,9 @@ The ten that matter most, in order:
       test_array_typed_let match `fid run` under `fid wasm` and ccompile.
       Left: the rest of the suite under `fid wasm` (a 40-test sample found
       test_fix_fnval_struct_ret wrong).
+      Nov 21 (c082ee6, 2g.108): `fid wasm` returns structs through function
+      values right (test_fix_fnval_struct_ret passes). The rest-of-suite
+      run under `fid wasm` stays open.
 - [x] CI6. **"Embedding the language in another app is hard"** (Python, JS). A
       C API to run Fides code with a capability-limited sandbox (L).
       Done Nov 16 (codegen_c.fd, on CI7's library build): `fides_call(name,
@@ -1041,12 +1114,20 @@ The ten that matter most, in order:
 - [x] CP3. **"I can't tell why the optimizer did or didn't"** (all). `fid explain`
       lists the runtime checks removed and kept per function, and which proof
       removed each (counted loop vs range analysis) (S, Nov 10).
-- [~] CP4. **"Cloning everything to satisfy the compiler"** (Rust). `fid explain
+- [x] CP4. **"Cloning everything to satisfy the compiler"** (Rust). `fid explain
       --alloc` lists each `Vec copy for COW sharing` site per function, so a
-      clone the compiler inserts is at least visible; there is still no
-      dedicated "clone required here because …" diagnostic (M).
-- [ ] CP5. **"`async` costs more than threads would"** (Rust, C#). Tasks switch in
+      clone the compiler inserts is at least visible; it also explains why each
+      clone is required (M).
+      Nov 22: `FID=release/fid-dev.exe bash
+      tests/tooling/explain-clone-check.sh` passed after updating its stale
+      source-line and expected-output assertions. `fid explain --alloc` reports
+      the source line, owner/borrow reason, destination, and clone cost.
+- [~] CP5. **"`async` costs more than threads would"** (Rust, C#). Tasks switch in
       under 20 ns and allocate nothing per await (competitive RT9) (L).
+      The switch half is measured: RT9's Nov 21 run reports 12 ns for the C
+      path on Windows, 8 ns on Linux, and 13.8 ns for pe_ir. Left: measure
+      that awaiting a task adds no per-await allocation; no allocation-count
+      check for this criterion was found in the tree.
 - [x] CP6. **"Bounds checks I can't get rid of safely"** (Rust, Go). The counted-loop
       proof, range analysis, AND `if i < v.len()` guard-fact propagation now
       remove provably-safe checks — `fid explain` shows `removed bounds check`

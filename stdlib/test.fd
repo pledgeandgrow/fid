@@ -408,3 +408,146 @@ pub fn expect_snapshot(name: str, value: str) -> void {
         p_panic("snapshot differs: " + path);
     }
 }
+
+// --- CT1 (complaint-roadmap): Mocking time, network and files --------------
+//
+// The effects system says exactly what a function touches; a test that
+// wants deterministic time, file, or network behavior injects a mock
+// through these types. The function under test takes a clock or file
+// parameter; its effects constrain it from doing real I/O behind the
+// test's back (a function without the io effect cannot call the real
+// p_clock_now or p_file_read at all).
+
+/// A deterministic clock: a fixed sequence of times, advanced on each
+/// read. Code under test takes `&mut MockClock` where it would call
+/// `p_clock_now()`.
+pub struct MockClock {
+    times: Vec<i64>,
+    at: i64,
+}
+
+/// A clock that returns the given times in order, then repeats the last.
+pub fn mock_clock(times: Vec<i64>) -> MockClock {
+    return MockClock { times: times, at: 0 };
+}
+
+/// A clock that always returns the same time.
+pub fn mock_clock_fixed(t: i64) -> MockClock {
+    var v: Vec<i64> = Vec::new();
+    v.push(t);
+    return MockClock { times: v, at: 0 };
+}
+
+/// Read the next time from the mock clock (the code under test's
+/// "now"). Repeats the last time when the sequence runs out.
+pub fn mock_clock_now(clock: &mut MockClock) -> i64 {
+    if clock.at < clock.times.len() {
+        var t: i64 = clock.times.get(clock.at);
+        clock.at = clock.at + 1;
+        return t;
+    }
+    if clock.times.len() > 0 {
+        return clock.times.get(clock.times.len() - 1);
+    }
+    return 0;
+}
+
+/// How many times the clock was read.
+pub fn mock_clock_reads(clock: MockClock) -> i64 {
+    return clock.at;
+}
+
+/// An in-memory file system: paths to contents. Code under test takes
+/// `&MockFS` where it would call `read_file()`.
+
+/// An in-memory file system: paths to contents. Code under test takes
+/// `&MockFS` where it would call `read_file()`.
+pub struct MockFS {
+    paths: Vec<str>,
+    contents: Vec<str>,
+}
+
+/// A file system with no files.
+pub fn mock_fs() -> MockFS {
+    return MockFS { paths: Vec::new(), contents: Vec::new() };
+}
+
+/// Add or replace a file in the mock file system.
+pub fn mock_fs_add(fs: &mut MockFS, path: str, content: str) {
+    var i: i64 = 0;
+    while i < fs.paths.len() {
+        if fs.paths.get(i) == path {
+            fs.contents.set(i, content);
+            return;
+        }
+        i = i + 1;
+    }
+    fs.paths.push(path);
+    fs.contents.push(content);
+}
+
+/// Read a file from the mock ("" when the path does not exist).
+pub fn mock_fs_read(fs: &MockFS, path: str) -> str {
+    var i: i64 = 0;
+    while i < fs.paths.len() {
+        if fs.paths.get(i) == path {
+            return fs.contents.get(i);
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+/// Does the mock hold this path?
+pub fn mock_fs_has(fs: &MockFS, path: str) -> bool {
+    var i: i64 = 0;
+    while i < fs.paths.len() {
+        if fs.paths.get(i) == path {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// List the paths the mock holds.
+pub fn mock_fs_paths(fs: &MockFS) -> Vec<str> {
+    return fs.paths;
+}
+
+/// An in-memory network: URLs to canned responses.
+pub struct MockNet {
+    urls: Vec<str>,
+    responses: Vec<str>,
+}
+
+/// A network with no responses.
+pub fn mock_net() -> MockNet {
+    return MockNet { urls: Vec::new(), responses: Vec::new() };
+}
+
+/// Add or replace a canned response.
+pub fn mock_net_add(net: &mut MockNet, url: str, response: str) {
+    var i: i64 = 0;
+    while i < net.urls.len() {
+        if net.urls.get(i) == url {
+            net.responses.set(i, response);
+            return;
+        }
+        i = i + 1;
+    }
+    net.urls.push(url);
+    net.responses.push(response);
+}
+
+/// "Fetch" a URL from the mock ("" when the URL has no response).
+pub fn mock_net_get(net: &MockNet, url: str) -> str {
+    var i: i64 = 0;
+    while i < net.urls.len() {
+        if net.urls.get(i) == url {
+            return net.responses.get(i);
+        }
+        i = i + 1;
+    }
+    return "";
+}
