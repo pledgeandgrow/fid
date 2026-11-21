@@ -421,8 +421,13 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       `b.cond` (`cbz`/`cbnz` against zero), RISC-V the inverse `beq`..`bgeu`
       over a `jal`. `FID_NAT_OFF=brfuse`; test_machine_brfuse.fd. `tbz` (bit
       tests) not used.
-- [ ] MI24. Conditional select (`csel`, `cmov`, RISC-V Zicond where present) for
+- [x] MI24. Conditional select (`csel`, `cmov`, RISC-V Zicond where present) for
       small branches with no side effects (M).
+      MO_CSEL (mir.fd:162) formed by ng_fuse_select from small branch
+      diamonds; encoders x86-64 CMOVcc, AArch64 CSEL, RISC-V Zicond
+      (czero.eqz/nez + or under --cpu rva23u64), else a branch over a move.
+      FID_NAT_OFF=csel the kill switch. Tests: machine_batch4_check.sh
+      (MIR + encoders against clang).
 - [x] MI25. Floats in float registers on every target, f32 as f32 (not widened),
       moves between classes only where needed (M).
       Nov 17: the f32 FFI stubs and `p_f32_to_bits` keep an f32 as f32 (not
@@ -434,8 +439,15 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       aarch64, 166 on `--nat`; none with it off), machine_f32_ffi_check 0
       failures. The aarch64/riscv64 f32 FFI images were built, not run (no
       loader sysroot here).
-- [ ] MI26. Narrow integers kept in registers with known extension state, so a
+- [x] MI26. Narrow integers kept in registers with known extension state, so a
       `u8` add does not re-extend each time (M).
+      ng_fold_ext_state (nat_ir.fd:8970): each vreg gets the meet over its
+      definitions of what extension each leaves (a narrow load its
+      extension, an EXT its kind, a constant its range, AND/OR/XOR what
+      bit operations keep, a right shift the bits that are left); an EXT
+      whose source already satisfies it becomes a MOV. MO_OPW (RISC-V
+      ADDW/SUBW/MULW) for the narrow arithmetic itself.
+      FID_NAT_OFF=extstate the kill switch.
 - [~] MI27. Jump tables for dense `match` (M).
       Nov 17: implemented: an indirect jump in the machine IR (`MO_JTAB`, its
       entries `MO_JTE` in compiler/mir.fd), table entries as 4-byte
