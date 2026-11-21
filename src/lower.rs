@@ -5265,6 +5265,55 @@ impl Lowerer {
                                 }
                             }
                         }
+                        // 0004 ownership: pushing/setting/inserting an owned
+                        // value (str, Vec, HashMap) into a container takes an
+                        // OWNER — share/dup it, so the container's drop and
+                        // the source's drop are both balanced (without this,
+                        // both free the same buffer: the heap corrupts a few
+                        // allocations later — the fid emit crash in
+                        // pe_dll_found). A literal needs no share (static).
+                        if matches!(method.as_str(), "push" | "set" | "insert") {
+                            let val_ix = if method == "set" || method == "insert" { 3 } else { 2 };
+                            if val_ix < runtime_args.len() {
+                                let v = runtime_args[val_ix];
+                                // core functions take the dummy env first
+                                let env = self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 });
+                                match &elem_ty {
+                                    IrType::Ptr(inner) if matches!(**inner, IrType::U8) => {
+                                        // str: share only when not a literal
+                                        let is_lit = matches!(self.current_func.as_ref().and_then(|f| f.instructions.get(&v)), Some(Inst::ConstStr { .. }));
+                                        if !is_lit {
+                                            let sh = self.emit_inst(Inst::Call {
+                                                func: "Str_dup".to_string(),
+                                                args: vec![env, v],
+                                                ret_ty: IrType::Ptr(Box::new(IrType::U8)),
+                                                effects: EffectSet::new(),
+                                            });
+                                            runtime_args[val_ix] = sh;
+                                        }
+                                    }
+                                    IrType::Generic(g, _) if g == "Vec" => {
+                                        let sh = self.emit_inst(Inst::Call {
+                                            func: "Vec_share".to_string(),
+                                            args: vec![env, v],
+                                            ret_ty: IrType::I64,
+                                            effects: EffectSet::new(),
+                                        });
+                                        runtime_args[val_ix] = sh;
+                                    }
+                                    IrType::Generic(g, _) if g == "HashMap" => {
+                                        let sh = self.emit_inst(Inst::Call {
+                                            func: "HashMap_share".to_string(),
+                                            args: vec![env, v],
+                                            ret_ty: IrType::I64,
+                                            effects: EffectSet::new(),
+                                        });
+                                        runtime_args[val_ix] = sh;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
                         // Box struct elements before pushing/inserting into Vec.
                         // The Vec runtime stores elements as i64 (8-byte slots).
                         // For struct elements (which are >8 bytes), we must heap-allocate
@@ -5416,6 +5465,45 @@ impl Lowerer {
                         // Phase 10B: HashMap methods call Fides implementation (HashMap_*)
                         let dummy_env = self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 });
                         runtime_args.insert(0, dummy_env);
+                        // An integer-keyed map hashes and compares its keys as
+                        // numbers: HashMap_insert_i etc. (a string key's
+                        // functions read the key as text — the access
+                        // violation at address 3 was key 3 read as a pointer)
+                        let int_keyed = effective_ty.generic_elem()
+                            .map(|k| matches!(k, IrType::I8 | IrType::I16 | IrType::I32 | IrType::I64
+                                              | IrType::U8 | IrType::U16 | IrType::U32 | IrType::U64))
+                            .unwrap_or(false);
+                        // 0004 ownership: set/insert take owners of the key and
+                        // the value when they are str/Vec/HashMap — share them,
+                        // or the map's drop and the source's drop both free.
+                        // An integer key (the _i form) owns nothing.
+                        if matches!(method.as_str(), "set" | "insert") && runtime_args.len() >= 4 {
+                            let kt = if int_keyed { None } else { effective_ty.generic_elem().cloned() };
+                            let vt = effective_ty.generic_args().get(1).cloned();
+                            for (ix, ty) in [(2usize, kt), (3usize, vt)] {
+                                if let Some(ty) = ty {
+                                    let v = runtime_args[ix];
+                                    let sh_name = match &ty {
+                                        IrType::Ptr(inner) if matches!(**inner, IrType::U8) => {
+                                            let is_lit = matches!(self.current_func.as_ref().and_then(|f| f.instructions.get(&v)), Some(Inst::ConstStr { .. }));
+                                            if is_lit { continue; }
+                                            "Str_dup"
+                                        }
+                                        IrType::Generic(g, _) if g == "Vec" => "Vec_share",
+                                        IrType::Generic(g, _) if g == "HashMap" => "HashMap_share",
+                                        _ => continue,
+                                    };
+                                    let env2 = self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 });
+                                    let sh = self.emit_inst(Inst::Call {
+                                        func: sh_name.to_string(),
+                                        args: vec![env2, v],
+                                        ret_ty: IrType::I64,
+                                        effects: EffectSet::new(),
+                                    });
+                                    runtime_args[ix] = sh;
+                                }
+                            }
+                        }
                         let rt = match method.as_str() {
                             "insert" => IrType::Void,
                             "get" => IrType::I64,
@@ -5430,7 +5518,11 @@ impl Lowerer {
                             "clone" => recv_ty.clone(),
                             _ => IrType::I64,
                         };
-                        (format!("HashMap_{}", method), rt)
+                        if int_keyed && matches!(method.as_str(), "insert" | "get" | "contains" | "contains_key" | "remove" | "get_or" | "keys" | "values") {
+                            (format!("HashMap_{}_i", method), rt)
+                        } else {
+                            (format!("HashMap_{}", method), rt)
+                        }
                     } else if effective_ty.is_opaque_named("String") {
                         // Phase 10B: String methods call Fides implementation (String_*)
                         let dummy_env = self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 });
