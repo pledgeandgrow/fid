@@ -294,7 +294,7 @@ pacts go to `ark_modules/`, where `use` looks for them:
 
 ```bash
 fid ark init demo                      # writes ark.toml
-fid ark add lefty --path ../lefty      # or --git <url>
+fid ark add textkit                    # from the pacts index, or --path / --git
 fid ark install                        # into ark_modules/
 fid ark list
 fid ark lock                           # ark.lock: git commits and file hashes
@@ -309,17 +309,31 @@ NAME                  TYPE     SOURCE
 lefty  path  ../lefty
 ```
 
-Treat ark as young. With the 0.8.0-unstable build this chapter was
-checked against, on Windows, a directory path pact was reported missing
-(`Path pact 'lefty' does not exist`), a single-file pact was copied to
-`ark_modules/lefty` without its `.fd` extension so `use lefty;` could not
-find it, and `ark lock` wrote a lock with 0 pacts without complaint.
-These are fixed in the current source (`docs/reference/tool.md` → ark).
-Until your build has the fixes, the dependable way to share code is the
-plain module search: put `lefty.fd` (or `lefty/mod.fd`) next to the
-program, or in a folder you copy in, and `use lefty;`. A pact's own
-dependencies are never installed for you, and the registry index
-(`ark search`, `ark publish`) has few packages.
+**Verified on Windows, Linux and macOS.** The 0.8.0-unstable build had
+real Windows bugs (a directory pact reported missing, a file pact
+installed without its `.fd` extension, `ark lock` writing 0 pacts);
+they are fixed, and the four ark test suites (paths, features,
+projects, registry — 283 checks) run green on Windows and in CI on
+Linux and macOS.
+
+Pacts also come from an index, like crates: [pledgeandgrow/pacts](https://github.com/pledgeandgrow/pacts).
+
+```bash
+$ fid ark search textkit
+textkit 1.0.0  https://github.com/pledgeandgrow/textkit.git
+$ fid ark add textkit            # or --version ^1
+$ fid ark install
+Installing textkit... OK (registry 1.0.0 92c4ae284fba)
+```
+
+Then `use textkit;` and `textkit_title("hello pacts")` prints
+`Hello Pacts` — through the interpreter and a C build alike, on every
+OS. Publishing your own pact is `git tag v1.0.0 && fid ark publish`,
+then a pull request the index's check verifies (`ARK_INDEX` points ark
+at another index if you need your own). The index is young: few pacts
+are published yet. Until yours is there, `--path` and `--git` work the
+same as ever, and so does the plain module search: `lefty.fd` next to
+the program, `use lefty;`.
 
 ## Looking inside
 

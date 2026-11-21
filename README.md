@@ -180,7 +180,7 @@ One binary, `fid`, is the compiler, interpreter, test runner, formatter, linter 
 | `fid explain file.fd` | Which run-time checks were removed or kept, and why |
 | `fid lsp` | Language server over stdio |
 
-Beside it: `ark` (packages, from path or git), `scribe` (documentation from `///` comments) and `veil` (coverage). The full list is in the [CLI reference](https://fid-lang.org/docs/cli).
+Beside it: `ark` (packages: a path, a git repository, or [the pacts index](https://github.com/pledgeandgrow/pacts) — `fid ark add textkit` installs the first published pact), `scribe` (documentation from `///` comments) and `veil` (coverage). The full list is in the [CLI reference](https://fid-lang.org/docs/cli).
 
 ## Where it runs
 
@@ -188,11 +188,13 @@ Beside it: `ark` (packages, from path or git), `scribe` (documentation from `///
 | ----------------- | :---------: | :-------: | :-----------------: |
 | Windows x64       |     🟢      |    🟢     |         🟢          |
 | Linux x64         |     🟢      |    🟢     |         🟡          |
-| Linux ARM64       |             |    🟡     |         🟡          |
-| Linux RISC-V      |             |    🟡     |         🟡          |
-| macOS             |             |    ⚪     |         ⚪          |
-| WebAssembly       |             |    🟡     |         🟡          |
-| Bare metal x86-64 |             |           |         ⚪          |
+| Linux ARM64       |     🟡 ¹    |    🟡     |         🟡          |
+| Linux RISC-V      |     🟡 ¹    |    🟡     |         🟡          |
+| macOS x64 + ARM64 |     🟢      |    🟢     |         ⚪          |
+| WebAssembly       |             |    🟢     |         🟡          |
+| Bare metal x86-64 |             |           |         🟢 ²        |
+
+¹ Under QEMU in CI. ² Multiboot kernels booted and verified under QEMU in CI. macOS runs the suite on real Apple runners (`macos.yml`); its native Mach-O lane (`macos-native.yml`) waits on the bootstrap fix (CB8).
 
 🟢 supported · 🟡 partly tested · ⚪ experimental. Details and test counts: [platforms](docs/reference/platforms.md).
 
@@ -247,7 +249,7 @@ Fid is young and moving fast.
 
 - **Releases:** v1.0.0 shipped Sep 9, 2026; the newest tagged build is the **v0.8.0-unstable** prerelease (Nov 10). The tree is in 1.0 release preparation — `fid version` reports `1.0.0+dev`.
 - **Generated code is slower than Rust's.** Through C, Fid is fastest on one of four benchmarks and up to 1.6 times slower on the others; native output is slower still. [Benchmarks, losses included](docs/benchmarks.md).
-- **No package registry yet.** `ark` installs from a path or a git repository.
+- **The package index is just starting.** `ark` installs from a path, a git repository or [the pacts index](https://github.com/pledgeandgrow/pacts) (`fid ark add textkit`, verified on Windows, Linux CI and macOS CI); few pacts are published yet.
 - **The full test suite has not been rerun with the current compiler.** Features are checked with their own tests on each backend, and the suite has grown ~3x since the last full run.
 - **Not for safety-critical use.** `fid qualify` produces evidence for review, not a certification.
 

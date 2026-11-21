@@ -441,7 +441,7 @@ through `ccompile` on Windows, or read the text from a file with
   arguments come first: in `fid run app.fd a`, `a` is `arg_at(3)`. In a
   built program it is `arg_at(1)`, as `sys.argv[1]` would be.
 - **No pip.** `fid ark` manages dependencies (`ark.toml`), but it is
-  young and has few packages; most of what you'd install is in `stdlib/`
+  young and has few published pacts (the index is github.com/pledgeandgrow/pacts); most of what you'd install is in `stdlib/`
   (JSON, TOML, CSV, HTTP, regex, dates, SQLite through C).
 
 ## What you get that Python doesn't
