@@ -16,6 +16,20 @@ use crate::ast::*;
 use crate::ir::*;
 use std::collections::{HashMap, HashSet};
 
+/// A Box value is the address of its content (Box::new = p_malloc + store;
+/// compiler/lower.fd does the same): unwrap `Generic("Box", [T])` to the
+/// pointer the Box behaves as, so field access and deref see the struct
+/// behind it. Before this, `b.f` on a Box fell to the 0 fallback and `*b`
+/// loaded the pointer word as a plain i64.
+fn box_value_as_ptr(ty: &IrType) -> IrType {
+    if let IrType::Generic(name, args) = ty {
+        if name == "Box" && args.len() == 1 {
+            return IrType::Ptr(Box::new(args[0].clone()));
+        }
+    }
+    ty.clone()
+}
+
 /// Determine effects for runtime builtin functions (p_* functions).
 /// Functions that mutate data have Write effect; functions that allocate
 /// have Alloc effect; IO functions have IO effect. This prevents the
@@ -80,6 +94,11 @@ fn runtime_effects(name: &str) -> Option<EffectSet> {
     // RC operations
     if name.starts_with("p_rc_") {
         effects.add(Effect::Write);
+        return Some(effects);
+    }
+    // Region state probe (0005): a pure read — no arenas exist here, so it
+    // answers 0 and the region paths in core.fd fall through.
+    if name == "p_region_word" {
         return Some(effects);
     }
     // Tensor operations (may allocate)
@@ -874,6 +893,14 @@ impl Lowerer {
         // Arena marks: save returns a mark, restore frees what came after it.
         self.module.add_extern("p_arena_save", vec![], IrType::I64);
         self.module.add_extern("p_arena_restore", vec![IrType::I64], IrType::Void);
+        // Proposal 0005 region probe: core.fd's rg_vec_fit / rg_str_copy and
+        // the other rg_ gates read it. The C runtime stubs it to 0
+        // (codegen_c.rs), and the interpreter returns 0 as compiler/interp.fd
+        // does (no arenas are open in either, so the region path falls
+        // through). Without the extern, `is_runtime_func` was false and every
+        // Vec growth in the interpreter panicked with "Unknown function
+        // 'p_region_word'".
+        self.module.add_extern("p_region_word", vec![IrType::I64, IrType::I64], IrType::I64);
         self.module.add_extern("p_str_concat",
             vec![IrType::Ptr(Box::new(IrType::U8)), IrType::Ptr(Box::new(IrType::U8))],
             IrType::Ptr(Box::new(IrType::U8)));
@@ -5690,7 +5717,8 @@ impl Lowerer {
 
                 // Look up the struct layout to find the field index and type
                 // We need to determine the struct type from the value metadata
-                let struct_ty = self.get_value_type(struct_ptr);
+                // (a Box receiver unwrapped to the content pointer it is)
+                let struct_ty = box_value_as_ptr(&self.get_value_type(struct_ptr));
                 let mut struct_name = match &struct_ty {
                     IrType::Ptr(inner) => match inner.as_ref() {
                         IrType::Struct(name) => Some(name.clone()),
@@ -5716,7 +5744,7 @@ impl Lowerer {
                 // Fallback: try infer_expr_type if get_value_type didn't find a struct
                 // (needed when struct_ptr comes from Vec_get which returns I64)
                 if struct_name.is_none() {
-                    let inferred_ty = self.infer_expr_type(expr);
+                    let inferred_ty = box_value_as_ptr(&self.infer_expr_type(expr));
                     struct_name = match &inferred_ty {
                         IrType::Ptr(inner) => match inner.as_ref() {
                             IrType::Struct(name) => Some(name.clone()),
@@ -5739,6 +5767,31 @@ impl Lowerer {
                         }
                         _ => None,
                     };
+                }
+
+                // `b.f` on a Box whose IR type is a plain pointer chain
+                // (Box::new's result type): the declared AST type says what
+                // the Box holds, and the Box value is its content's address
+                // (compiler/lower.fd's third step, Lowerer_lower_field_
+                // access_expr). Without this the access fell to the 0
+                // fallback and silently read 0.
+                if struct_name.is_none() {
+                    if let Expr::Ident(name) = expr.as_ref() {
+                        let ast_ty = self.var_ast_types.get(name)
+                            .or_else(|| self.current_func_param_types.get(name));
+                        if let Some(t) = ast_ty {
+                            let resolved = self.resolve_type(t);
+                            if let Type::Generic { name: bn, args: bargs } = &resolved {
+                                if bn == "Box" && bargs.len() == 1 {
+                                    if let Type::Named(inner_name) = self.resolve_type(&bargs[0]) {
+                                        if self.module.get_struct(&inner_name).is_some() {
+                                            struct_name = Some(inner_name);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
 
                 // Swizzle access for vec types (Phase 8A)
@@ -6560,7 +6613,8 @@ impl Lowerer {
             Expr::Deref { expr } => {
                 let ptr = self.lower_expr(expr);
                 // Infer the pointee type from the pointer's type metadata
-                let pointee_ty = self.get_value_type(ptr);
+                // (a Box value is the content's address, not a pointer to one)
+                let pointee_ty = box_value_as_ptr(&self.get_value_type(ptr));
                 let load_ty = match &pointee_ty {
                     IrType::Ptr(inner) => *inner.clone(),
                     _ => IrType::I64,
@@ -6568,6 +6622,26 @@ impl Lowerer {
                 // If loading a struct, return the pointer itself (structs are accessed via pointers)
                 if matches!(load_ty, IrType::Struct(_)) {
                     return ptr;
+                }
+                // A Box of a struct whose IR type is a plain pointer chain:
+                // the declared AST type says what the Box holds, and `*b` is
+                // the Box itself (it already is the content's address), as
+                // compiler/lower.fd's Deref does
+                if let Expr::Ident(name) = expr.as_ref() {
+                    let ast_ty = self.var_ast_types.get(name)
+                        .or_else(|| self.current_func_param_types.get(name));
+                    if let Some(t) = ast_ty {
+                        let resolved = self.resolve_type(t);
+                        if let Type::Generic { name: bn, args: bargs } = &resolved {
+                            if bn == "Box" && bargs.len() == 1 {
+                                if let Type::Named(inner_name) = self.resolve_type(&bargs[0]) {
+                                    if self.module.get_struct(&inner_name).is_some() {
+                                        return ptr;
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 self.emit_inst(Inst::Load {
                     ptr,

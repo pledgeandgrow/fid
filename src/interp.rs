@@ -3030,6 +3030,14 @@ impl Interpreter {
                 // I-1C: Region bulk free — interpreter doesn't actually free
                 ExecOutcome::Value(Value::Void)
             }
+            "p_region_word" => {
+                // Proposal 0005 (region arenas), as compiler/interp.fd: no
+                // arenas are open here, so core's region checks fall through
+                // (rg_vec_fit, rg_str_copy and the other rg_ gates read 0).
+                // Without this, every Vec growth in the interpreter panicked
+                // with "Unknown function 'p_region_word'".
+                ExecOutcome::Value(Value::Int(0))
+            }
             "p_str_concat" => {
                 let left = self.value_to_string(args.first().unwrap_or(&Value::Int(0)));
                 let right = self.value_to_string(args.get(1).unwrap_or(&Value::Int(0)));
