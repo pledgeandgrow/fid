@@ -89,3 +89,16 @@ loops. Analyses 2 and 3 may still cover them.
 Read: all of analysis 1 and 3, the range section headers and helpers. Live:
 the asm crash on three paths. Range rules (analysis 2) not audited line by
 line.
+
+## Nov 21 evening (optimizer batch, 5bb97b3)
+
+- Added: a back edge no longer empties a loop header's range set —
+  `peir_join_set` keeps a fact every scanned way in carries when the back
+  edge cannot break it (a value the loop body never re-defines, a plain
+  local it never stores; `peir_join_stored` walks the body's stores and
+  value definitions with a 1024-block budget, answering "stored" when it
+  runs out — a fact is dropped, never kept unsoundly). The scan precomputes
+  the function's (slot, block) store list once, only with the range set on.
+- Not moved by it: the sieve's outer `p * p` and `m + p` (the Vec::filled
+  cf/dom fact on a *parameter* does not reach the square rule's bound at
+  the outer header) — still open, now documented at OP24.

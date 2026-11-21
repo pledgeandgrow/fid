@@ -193,3 +193,18 @@ statement wrapper, parameter copies and the old findings' sites read in
 current source. Live (s18.exe): asm crash (dump-c, emit, emit --nat),
 await/spawn and `??` under `run`, `--leaks` clean, value semantics, spawn
 scope under C. Not run: the test suites.
+
+## Nov 21 evening (optimizer batch, 5bb97b3)
+
+- LF15: str parameter/local copies cancel across blocks now. Two matcher
+  fixes in `lw_ps_try_slot`/`lw_ps_lit_store_ok`: the backward walk over
+  `load t; drop(t); t = null` stops on neither the drop's own operand load
+  (its only reader is the drop) nor the null of the clearing store
+  (ConstNull; the skip is LOCAL to that walk — `lw_rc_may_free` is
+  untouched, a global change there double-dropped and was reverted); and a
+  BitCast-wrapped `Str_dup` result is matched beside the plain in-place
+  count. rc_cancel counts: pick_len/both_arms/loop_copy/local_arms 2->0,
+  kept 4->2.
+- LF13: `lw_rc_stack_strs_fn` also rewrites `h = p_to_str(x)` to
+  `Int_to_str_into(env, area, 128, x)` (core renders into the stack area,
+  INT64_MIN-safe; test_stack_str_int.fd).

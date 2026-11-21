@@ -102,6 +102,16 @@ cargo build --release
 The one place project counts and measurements are kept (other docs round
 them and link here). Counted with `wc -l` on Nov 21, 2026 (HEAD 7897c78).
 
+Nov 21 evening (optimizer batch 5bb97b3): validated on a fidesc-built
+`release/fid-dev.exe` (build-selfhost with STAGE0=fidesc, one -O0 unit,
+~53 MB) — that class is memory-marginal at run time (known-bugs 2g.79's
+new symptoms), so its `--leaks` and heavy-build results are not
+authoritative; the checks that passed on it: version-default-check,
+ssa-default-check, inline2-check, range-loop-check, rc_cancel counts,
+test_stack_str_int, test_midend_icf, plus interp spot-samples against the
+tests' expected blocks (a 120-test old-vs-new sample: 0 real differences,
+5 flags all environmental truncations).
+
 | Component | Files | Lines |
 |-----------|-------|-------|
 | Self-hosted compiler (`compiler/*.fd`) | 80 (56 reached from `main.fd`) | 361,942 |

@@ -107,3 +107,12 @@ LF5, LF6, LF23 "written, opt-in"). Treat any of them as unverified.
 
 - Read: header, `ime_on`, helpers list, pass list, alias-query comments and signatures.
 - No live run: s18 does not contain this module's passes.
+
+## Nov 21 evening (optimizer batch, 5bb97b3)
+
+- `licmguard` and `vecdata` joined IME_DEFAULT_ON (OP9; FID_IROPT_OFF
+  turns each off).
+- `ime_inline_site` propagates `is_simd` from an inlined @simd callee to
+  its caller (K10: the annotation's guards and checked-op vectorization
+  cover the copied loops; before, inlining a @simd fn into a plain caller
+  silently dropped the annotation).

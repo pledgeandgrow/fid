@@ -56,3 +56,19 @@ against 5,930 after iropt). Tests: `test_ssa_merge`, `test_ssa_exit_bound`,
 - **LOW:** the 2% instruction cost above, where `promote` did better.
 - **INFO:** the promoted local's Alloca stays (unused) so `locals` and the
   debug info still name a value that exists.
+
+## Nov 21 evening (optimizer batch, 5bb97b3)
+
+- Fixed: step 5's contract "only that block reads the slot" was broken —
+  a phi's load VALUE could be used in another block (the accumulator read
+  after its loop), reading the header's last execution forever.
+  `ssa_materialize` now gives every such use a fresh `Load` of the slot
+  immediately before the use itself (the slot model's exact position; a
+  block-top placement was tried first and was unsound when a store to the
+  slot precedes the use in that block — test_vectorize caught it).
+- Finding: **FIXED (was HIGH)** — loop versioning (iropt.fd) had rightly
+  refused those functions ("a value of the loop is read outside it");
+  version-default-check is 0 failed with ssa on again.
+- Also: ssa's keyword trap for editors — identifiers `q4`/`q8` are i8
+  aliases in the language; fid accepts them as names, frozen fidesc does
+  not.

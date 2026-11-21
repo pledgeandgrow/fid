@@ -252,3 +252,20 @@ Before it: `set_native_runtime("linux_runtime")` merges
   loop/panic program and `return 3` for all three Linux targets, run in WSL
   and qemu; `s18.exe` and `release/fid-dev.exe` failed as in finding 2.
 - No suite run.
+
+## Nov 21 evening (optimizer batch, 5bb97b3)
+
+- OP18: `ng_fuse_rmw` fuses the load-on-the-right case — the two-address
+  form (`and d, d, x`) may have its other operand be the deleted
+  operation's own destination (`ng_fb_defines_any_but`), and the operand
+  register unchanged from the operation to the store is accepted when
+  nothing between rewrites it (`ng_fb_redef`). `p.b = x & p.b` compiles to
+  one `and [rdi+8], rdx`.
+- OP22/K10: `ng_vz_class` accepts the accumulator's load in the loop
+  header (the post-ssa shape; it is the same loop-carried start value the
+  generated code loads itself).
+- RA18: `ng_fcs_on` returns false on RV64 (measured 1.07x spilling under
+  qemu; AArch64's 0.89 keeps them).
+- MI8: `ng_mir_alloc_body` shares one spill slot between spilled vregs
+  whose [lo, hi] position ranges are disjoint (bounded at 4096; big's
+  frame unchanged — its ranges overlap).

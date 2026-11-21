@@ -65,3 +65,9 @@ The `EK_NOT` arm scans every node for each `not` node (:301-310). Bounded by `EG
 ## Verification state
 
 - Whole file read. No live probe: s18 predates this file (its mid-end line has no e-graph counts).
+
+## Nov 21 evening (optimizer batch, 5bb97b3)
+
+- ME7: the side-effect skeleton is on by default — `g_eg_skel = on_e &&
+  eg_on("egskel")` (FID_NAT_OFF=egskel off), on egskel-check's 9 PASS and
+  the 60-test sample; the full suite with it on is still owed.

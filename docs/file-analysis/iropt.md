@@ -175,3 +175,12 @@ dce runs before gvn/licm leave values dead. Intended for compile time; noted for
   facts, simplify, promote start, gconst, libfacts. Not read in depth: the rest.
 - Live: s18 (latest binary given) is older than this file (no sccp/branchfacts/promote), so the
   three HIGH findings are code inspection only. Probes ov32/ov64/shr8 gave correct results on s18.
+
+## Nov 21 evening (optimizer batch, 5bb97b3)
+
+- icf (`iro_fold_identical`) is on by default now: gated on
+  `iro_pass_on("icf")` alone (FID_IROPT_OFF=icf off). Its test's bodies
+  were rebuilt over inline2's callee budget so the fold survives the
+  default inliner (test_midend_icf: 1 folded, interp == folded native).
+- Added `FID_VERSION_WHY[=<substr>]`: prints why `iro_version_one` refused
+  a loop (named per function), a diagnostic of ME25.
