@@ -299,6 +299,11 @@ pub struct Parser {
     // LG3: every lifetime name parse_type consumed (`&'a T`), in order; a
     // signature reads the ones each parameter's and the result's type added
     pub lt_seen: Vec<str>,
+    // `comptime T: type` parameters (reference.md §4.11): parse_params
+    // collects their names here; the fn parser moves them into the
+    // function's type parameters (inference or `f::<T>(..)` fills them, as
+    // any type parameter), and every other params context rejects them.
+    pub p_ct_type_params: Vec<str>,
 }
 
 pub fn Parser_new(tokens: Vec<Token>) -> Parser {
@@ -382,7 +387,7 @@ pub fn Parser_new(tokens: Vec<Token>) -> Parser {
     }
 
     return Parser {
-        tokens: tokens, pos: 0, struct_names: sn, enum_names: en, struct_name_set: sn_set, enum_name_set: en_set, alias_set: HashMap_new(), errors: Vec::new(), expr_depth: 0, max_expr_depth: 256, nest_depth: 0, nest_hit: false, lt_seen: Vec::new(),
+        tokens: tokens, pos: 0, struct_names: sn, enum_names: en, struct_name_set: sn_set, enum_name_set: en_set, alias_set: HashMap_new(), errors: Vec::new(), expr_depth: 0, max_expr_depth: 256, nest_depth: 0, nest_hit: false, lt_seen: Vec::new(), p_ct_type_params: Vec::new(),
     };
 }
 
@@ -459,7 +464,7 @@ impl Parser {
             ei = ei + 1;
         }
         return Parser {
-            tokens: tokens, pos: 0, struct_names: sn, enum_names: en, struct_name_set: sn_set, enum_name_set: en_set, alias_set: HashMap_new(), errors: Vec::new(), expr_depth: 0, max_expr_depth: 256, nest_depth: 0, nest_hit: false, lt_seen: Vec::new(),
+            tokens: tokens, pos: 0, struct_names: sn, enum_names: en, struct_name_set: sn_set, enum_name_set: en_set, alias_set: HashMap_new(), errors: Vec::new(), expr_depth: 0, max_expr_depth: 256, nest_depth: 0, nest_hit: false, lt_seen: Vec::new(), p_ct_type_params: Vec::new(),
         };
     }
     fn peek(self: & Parser) -> TokenKind {
@@ -2525,6 +2530,9 @@ impl Parser {
                 return ParseResultExternDecl::Err(e);
             }
         }
+        if self.p_ct_type_params.len() > 0 {
+            return ParseResultExternDecl::Err("a comptime parameter (`comptime T: type`) is allowed on functions and methods only");
+        }
         match self.expect(TokenKind::RParen, ")") {
             ParseResultUnit::Err(e) => {
                 return ParseResultExternDecl::Err(e);
@@ -2694,6 +2702,12 @@ impl Parser {
                 return ParseResultFunc::Err(e);
             }
         }
+        // `comptime T: type` parameters join the type parameters (§4.11)
+        var ctp_i: i64 = 0;
+        while ctp_i < self.p_ct_type_params.len() {
+            type_params.push(self.p_ct_type_params.get(ctp_i));
+            ctp_i = ctp_i + 1;
+        }
         match self.expect(TokenKind::RParen, ")") {
             ParseResultUnit::Err(e) => {
                 return ParseResultFunc::Err(e);
@@ -2860,10 +2874,48 @@ impl Parser {
 
     fn parse_params(self: & mut Parser) -> ParseResultParams {
         var params: Vec<Param> = Vec::new();
+        self.p_ct_type_params = Vec::new();
         if self.check(TokenKind::RParen) {
             return ParseResultParams::Ok(params);
         }
         loop {
+            // `comptime T: type` — a comptime type parameter (§4.11): the
+            // name becomes one of the function's type parameters (inference
+            // or `f::<T>(..)` fills it, as any type parameter), and the
+            // parameter itself is gone. The fn parser picks the names up;
+            // every other params context rejects them.
+            if self.check(TokenKind::Comptime) {
+                self.advance();
+                var ct_name: str = "";
+                match self.expect_ident_or_keyword() {
+                    ParseResultStr::Ok(cn) => {
+                        ct_name = cn;
+                    }
+                    ParseResultStr::Err(e) => {
+                        return ParseResultParams::Err(e);
+                    }
+                }
+                match self.expect(TokenKind::Colon, ":") {
+                    ParseResultUnit::Err(e) => {
+                        return ParseResultParams::Err(e);
+                    }
+                    ParseResultUnit::Ok => {
+                    }
+                }
+                if self.check(TokenKind::Type) {
+                    self.advance();
+                    self.p_ct_type_params.push(ct_name);
+                } else {
+                    return ParseResultParams::Err("'comptime " + ct_name + ": ...': a comptime parameter takes the type `type` here (a value known at compile time is a `const " + ct_name + ": i64` parameter)");
+                }
+                if !self.match_tok(TokenKind::Comma) {
+                    break;
+                }
+                if self.check(TokenKind::RParen) {
+                    break;
+                }
+                continue;
+            }
             // Optional @annotations on the parameter (e.g. @secret, @tainted)
             var param_annotations: Vec<Annotation> = Vec::new();
             while self.check(TokenKind::At) {
@@ -3283,6 +3335,9 @@ impl Parser {
                 return ParseResultSystemDef::Err(e);
             }
         }
+        if self.p_ct_type_params.len() > 0 {
+            return ParseResultSystemDef::Err("a comptime parameter (`comptime T: type`) is allowed on functions and methods only");
+        }
         match self.expect(TokenKind::RParen, ")") {
             ParseResultUnit::Err(e) => {
                 return ParseResultSystemDef::Err(e);
@@ -3456,6 +3511,9 @@ impl Parser {
             ParseResultParams::Err(e) => {
                 return ParseResultEventHandlerDef::Err(e);
             }
+        }
+        if self.p_ct_type_params.len() > 0 {
+            return ParseResultEventHandlerDef::Err("a comptime parameter (`comptime T: type`) is allowed on functions and methods only");
         }
         match self.expect(TokenKind::RParen, ")") {
             ParseResultUnit::Err(e) => {
@@ -4090,6 +4148,38 @@ impl Parser {
         }
         if token_kind_eq(k, TokenKind::While) {
             return self.parse_while();
+        }
+        // `inline for` (§4.11): the loop is unrolled before type checking,
+        // its trip count comptime-known. Encoded as the iterator wrapped in
+        // `comptime`, which the expand pass (comptime_eval.fd) rewrites into
+        // the unrolled statements with the loop variable a literal per copy.
+        var inline_for: bool = false;
+        match k {
+            TokenKind::Ident(w: str) => {
+                if w == "inline" {
+                    inline_for = true;
+                }
+            }
+            _ => {
+            }
+        }
+        if inline_for && self.pos + 1 < self.tokens.len() && token_kind_eq(self.tokens.get(self.pos + 1).kind, TokenKind::For) {
+            self.advance();
+            match self.parse_for() {
+                ParseResultStmt::Ok(s) => {
+                    match s {
+                        Stmt::For(v, it, body, ln) => {
+                            return ParseResultStmt::Ok(Stmt::For(v, Expr::Comptime(Box::new(it)), body, ln));
+                        }
+                        other => {
+                            return ParseResultStmt::Ok(other);
+                        }
+                    }
+                }
+                ParseResultStmt::Err(e) => {
+                    return ParseResultStmt::Err(e);
+                }
+            }
         }
         if token_kind_eq(k, TokenKind::For) {
             return self.parse_for();
@@ -7787,6 +7877,9 @@ impl Parser {
                     return ParseResultExpr::Err(e);
                 }
             }
+            if self.p_ct_type_params.len() > 0 {
+                return ParseResultExpr::Err("a comptime parameter (`comptime T: type`) is allowed on functions and methods only");
+            }
             match self.expect(TokenKind::RParen, ")") {
                 ParseResultUnit::Err(e) => {
                     return ParseResultExpr::Err(e);
@@ -9076,7 +9169,7 @@ pub fn Parser_with_names(tokens: Vec<Token>, struct_names: Vec<str>, enum_names:
         ei = ei + 1;
     }
     return Parser {
-        tokens: tokens, pos: 0, struct_names: struct_names, enum_names: enum_names, struct_name_set: sn_set, enum_name_set: en_set, alias_set: HashMap_new(), errors: Vec::new(), expr_depth: 0, max_expr_depth: 256, nest_depth: 0, nest_hit: false, lt_seen: Vec::new(),
+        tokens: tokens, pos: 0, struct_names: struct_names, enum_names: enum_names, struct_name_set: sn_set, enum_name_set: en_set, alias_set: HashMap_new(), errors: Vec::new(), expr_depth: 0, max_expr_depth: 256, nest_depth: 0, nest_hit: false, lt_seen: Vec::new(), p_ct_type_params: Vec::new(),
     };
 }
 

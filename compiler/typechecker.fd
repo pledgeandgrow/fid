@@ -20920,6 +20920,23 @@ fn TypeChecker_check_expr_inner(self: & mut TypeChecker, expr: Expr, hint: Type)
             return Type::Void;
         }
         Expr::Comptime(inner) => {
+            // Statement `comptime if` (§4.11): only the condition is
+            // comptime. The branches are ordinary code of the program — a
+            // non-generic function's selection already happened before type
+            // checking (expand_comptime), a generic function's waits for its
+            // instantiation, so both branches reach the type checker here
+            // and are checked as the runtime code they are.
+            match box_expr_unbox(inner) {
+                Expr::If(c2, t2, e2) => {
+                    g_tc_comptime_depth = g_tc_comptime_depth + 1;
+                    TypeChecker_check_expr(self, c2);
+                    g_tc_comptime_depth = g_tc_comptime_depth - 1;
+                    var rebuilt: Expr = Expr::If(c2, t2, e2);
+                    return TypeChecker_check_expr(self, rebuilt);
+                }
+                _ => {
+                }
+            }
             g_tc_comptime_depth = g_tc_comptime_depth + 1;
             var ct_ty: Type = TypeChecker_check_expr(self, box_expr_unbox(inner));
             g_tc_comptime_depth = g_tc_comptime_depth - 1;

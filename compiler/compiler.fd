@@ -5176,6 +5176,23 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                         }
                         return ResultProgram::Err(enrich_errors(ctg_errors, source, file_ctg));
                     }
+                    // §4.11: statement `comptime if` selection and `inline
+                    // for` unrolling, before type checking (the branch not
+                    // taken is never checked; generic functions wait for
+                    // substitute's second pass, after mono)
+                    program = expand_comptime(program);
+                    var cte_errors: Vec<str> = comptime_expand_errors();
+                    if cte_errors.len() > 0 {
+                        var file_cte: str = "<stdin>";
+                        match source_path {
+                            OptStr::Some(pce) => {
+                                file_cte = pce;
+                            }
+                            OptStr::None => {
+                            }
+                        }
+                        return ResultProgram::Err(enrich_errors(cte_errors, source, file_cte));
+                    }
                     // LG9: `==` for the structs and enums `comptime gen`
                     // created (both skip a type whose __eq_ exists already)
                     synthesize_enum_eq(& mut program);
@@ -5466,6 +5483,25 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                     var mono_result: Program = monomorphize(program);
                     var t_mono_end: i64 = p_clock_now_ms();
                     t_t = time_mark("mono", t_t);
+                    // Comptime over instantiations (§4.11): a generic
+                    // function's comptime nodes (the reflection its
+                    // `comptime T: type` parameters drive) are evaluated now,
+                    // once T is a concrete type. The need-scan keeps the
+                    // second pass to the functions that have comptime nodes
+                    // (the first pass left theirs: generics were skipped).
+                    mono_result = substitute(mono_result);
+                    var cts2_errors: Vec<str> = comptime_subst_errors();
+                    if cts2_errors.len() > 0 {
+                        var file_cts2: str = "<stdin>";
+                        match source_path {
+                            OptStr::Some(pcs2) => {
+                                file_cts2 = pcs2;
+                            }
+                            OptStr::None => {
+                            }
+                        }
+                        return ResultProgram::Err(enrich_errors(cts2_errors, source, file_cts2));
+                    }
                     p_eprint_str("[prof] mono: ");
                     p_eprint_str(int_to_str(t_mono_end - t_mono));
                     p_eprint_str("ms\n");
@@ -10618,6 +10654,32 @@ pub fn fill_default_trait_methods(program: & mut Program) {
             k = k + 1;
         }
 
+        // The `self` a method filled below carries. 2g.97: it keeps the
+        // impl's own type arguments — `impl<T> Show for Wrap<T>` gives
+        // self: Wrap<T> (the pd_generic_self rule), a narrower impl's
+        // self is its narrower pattern (pd_impl_narrow_self reads it off
+        // the written methods). A bare `Wrap` left T unbound, so a call
+        // on self in a default method could not bind it and method_subst
+        // defaulted it to i64: `self.show()` ran the i64 impl's body on
+        // every receiver.
+        var fill_self: Type = pd_impl_narrow_self(ti.type_name, ti.type_params, ti.methods);
+        match fill_self {
+            Type::Void => {
+                fill_self = Type::Named(ti.type_name);
+                if ti.type_params.len() > 0 {
+                    var ftps: Vec<Type> = Vec::new();
+                    var ftpi: i64 = 0;
+                    while ftpi < ti.type_params.len() {
+                        ftps.push(Type::Named(ti.type_params.get(ftpi)));
+                        ftpi = ftpi + 1;
+                    }
+                    fill_self = Type::Generic(ti.type_name, ftps);
+                }
+            }
+            _ => {
+            }
+        }
+
         // For each trait method with a default body not in provided, add it
         var added: bool = false;
         var m: i64 = 0;
@@ -10633,7 +10695,7 @@ pub fn fill_default_trait_methods(program: & mut Program) {
                 }
                 OptStmts::Some(default_body) => {
                     // Build params: replace self type
-                    var self_type: Type = Type::Named(ti.type_name);
+                    var self_type: Type = fill_self;
                     var params: Vec<Param> = Vec::new();
                     var p: i64 = 0;
                     while p < tm.params.len() {

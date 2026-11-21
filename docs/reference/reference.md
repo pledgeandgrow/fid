@@ -769,6 +769,23 @@ fn make_adder(n: i64) -> fn(i64) -> i64 {
   initializer's value (`s4_11_const_computes.fd`).
 - `comptime fn` marks a function for compile-time calls; a call with literal
   arguments is evaluated at compile time.
+- `comptime T: type` declares a comptime type parameter of a function: a
+  type parameter the caller fills by inference or `f::<T>(..)`, as any type
+  parameter, whose reflection the body computes per instantiation
+  (`s4_11_comptime_type_param.fd`). A generic function's comptime nodes are
+  evaluated once monomorphization has filled its parameters.
+- A statement `comptime if cond { .. } else { .. }` selects its branch while
+  compiling: the branch not taken is not type checked, and its locals are as
+  visible as any other statement's (`s4_11_comptime_if_stmt.fd`). Inside a
+  generic function the selection waits for the instantiation, and both
+  branches are checked as the runtime code they are
+  (`s4_11_comptime_if_generic.fd`).
+- `inline for v in a..b { .. }` unrolls while compiling: one copy of the
+  body per iteration with the loop variable a comptime-known literal, so
+  comptime expressions over it compute (`s4_11_inline_for.fd`). The range
+  must be known at compile time (`s4_11_inline_for_unknown_bound_fail.fd`);
+  at most 4096 iterations unroll, and `break`/`continue` are errors in the
+  body (there is no loop to leave).
 - `comptime gen { … }` (statement) generates code (`test_comptime_gen.fd`):
   the block's value, a string, is parsed and its functions, structs, enums,
   constants, impl blocks and trait impls are added to the program. A

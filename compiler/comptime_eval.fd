@@ -1574,7 +1574,10 @@ pub fn substitute(program: Program) -> Program {
     var need: Vec<bool> = Vec::new();
     var ni: i64 = 0;
     while ni < prog.funcs.len() {
-        need.push(full || ct_scan_stmts_sub(prog.funcs.get(ni).body));
+        // A generic function is a template: its comptime nodes (the
+        // reflection its `comptime T: type` parameters drive) are evaluated
+        // per instantiation, on the second substitute pass after mono (§4.11)
+        need.push(prog.funcs.get(ni).type_params.len() == 0 && (full || ct_scan_stmts_sub(prog.funcs.get(ni).body)));
         ni = ni + 1;
     }
 
@@ -1617,11 +1620,12 @@ pub fn substitute(program: Program) -> Program {
     }
 
     // Phase 3: Aggressive comptime evuation -- auto-evaluate calls to
-    // comptime fn functions when ALL arguments are literals
+    // comptime fn functions when ALL arguments are literals (a generic
+    // comptime fn is left: its type parameters are not known until mono)
     ct_comptime_fns = HashMap_new();
     var cf: i64 = 0;
     while cf < prog.funcs.len() {
-        if prog.funcs.get(cf).is_comptime {
+        if prog.funcs.get(cf).is_comptime && prog.funcs.get(cf).type_params.len() == 0 {
             HashMap_insert(ct_comptime_fns, prog.funcs.get(cf).name, 1);
         }
         cf = cf + 1;
@@ -2053,8 +2057,63 @@ fn substitute_stmt(stmt: & mut Stmt, original: & Program, errs: & mut Vec<str>) 
             * stmt = Stmt::FieldAssign(object, ffield, fop, expr, fline);
         }
         Stmt::Expr(e, eline) => {
-            substitute_expr(& mut e, original, errs);
-            * stmt = Stmt::Expr(e, eline);
+            // Statement `comptime if`: select the branch here (the expand
+            // pass does it before type checking for non-generic functions;
+            // a generic function's turn comes now, its type parameters
+            // instantiated by mono). The taken branch's statements run in
+            // a block: names it declares end with it.
+            var ctif_handled: bool = false;
+            match e {
+                Expr::Comptime(ctif_inner) => {
+                    match ct_box_expr_unbox(ctif_inner) {
+                        Expr::If(ctif_cond, ctif_then, ctif_else) => {
+                            var cond2: Expr = ct_box_expr_unbox(ctif_cond);
+                            substitute_expr(& mut cond2, original, errs);
+                            g_ct_call_stack = Vec::new();
+                            g_ct_line = 0;
+                            match evaluate(& cond2, original) {
+                                ResultExpr::Ok(ctif_v) => {
+                                    match ctif_v {
+                                        Expr::BoolLit(ctif_b) => {
+                                            var taken: Vec<Stmt> = ctif_then;
+                                            if !ctif_b {
+                                                taken = Vec::new();
+                                                match ctif_else {
+                                                    OptStmts::Some(eb3) => {
+                                                        taken = eb3;
+                                                    }
+                                                    OptStmts::None => {
+                                                    }
+                                                }
+                                            }
+                                            substitute_stmts(& mut taken, original, errs);
+                                            * stmt = Stmt::Expr(Expr::Block(taken), eline);
+                                            ctif_handled = true;
+                                        }
+                                        _ => {
+                                            var bad_cond: str = "comptime if" + ct_at(g_ct_subst_line) + ": the condition is not known at compile time (a bool the evaluator can compute)";
+                                            errs.push(bad_cond);
+                                            ct_fatal_push(bad_cond);
+                                        }
+                                    }
+                                }
+                                ResultExpr::Err(ctif_m) => {
+                                    errs.push("comptime if" + ct_at(g_ct_subst_line) + ": " + ctif_m + ct_trace());
+                                    ct_fatal_push("comptime if" + ct_at(g_ct_subst_line) + ": " + ctif_m + ct_trace());
+                                }
+                            }
+                        }
+                        _ => {
+                        }
+                    }
+                }
+                _ => {
+                }
+            }
+            if !ctif_handled {
+                substitute_expr(& mut e, original, errs);
+                * stmt = Stmt::Expr(e, eline);
+            }
         }
         Stmt::Return(opt, rline) => {
             match opt {
@@ -2085,9 +2144,29 @@ fn substitute_stmt(stmt: & mut Stmt, original: & Program, errs: & mut Vec<str>) 
             * stmt = Stmt::While(cond, body, wline);
         }
         Stmt::For(fvar, iterator, body, forline) => {
-            substitute_expr(& mut iterator, original, errs);
-            substitute_stmts(& mut body, original, errs);
-            * stmt = Stmt::For(fvar, iterator, body, forline);
+            // `inline for` of an instantiated generic body: the iterator
+            // arrived wrapped in `comptime` (parser.fd); unroll it here —
+            // evaluating the wrapper would swallow the marker
+            var ec_inline: bool = false;
+            var ec_range: Expr = Expr::IntLit(0);
+            match iterator {
+                Expr::Comptime(ri) => {
+                    ec_inline = true;
+                    ec_range = ct_box_expr_unbox(ri);
+                }
+                _ => {
+                }
+            }
+            if ec_inline {
+                var unrolled: Vec<Stmt> = Vec::new();
+                ec_unroll_inline(& mut unrolled, fvar, ec_range, body, original, errs, forline);
+                substitute_stmts(& mut unrolled, original, errs);
+                * stmt = Stmt::Expr(Expr::Block(unrolled), forline);
+            } else {
+                substitute_expr(& mut iterator, original, errs);
+                substitute_stmts(& mut body, original, errs);
+                * stmt = Stmt::For(fvar, iterator, body, forline);
+            }
         }
         Stmt::Match(expr, arms, mline) => {
             substitute_expr(& mut expr, original, errs);
@@ -2975,75 +3054,86 @@ fn ct_expr_has_break_or_continue(e: Expr) -> bool {
 
 // --- Identifier replacement (for loop unrolling) -------------------------
 
+fn replace_ident_in_stmts(stmts: & mut Vec<Stmt>, name: str, replacement: Expr) {
+    var si: i64 = 0;
+    while si < stmts.len() {
+        var stmt: Stmt = stmts.get(si);
+        replace_ident_in_stmt(& mut stmt, name, replacement);
+        stmts.set(si, stmt);
+        si = si + 1;
+    }
+}
+
 fn replace_ident_in_stmt(stmt: & mut Stmt, name: str, replacement: Expr) {
+    // Every case rebuilds the statement: a pattern binding is a copy, so
+    // replacing into it and dropping it changed nothing (the loop variable
+    // stayed, and the unrolled body read a name nothing declared).
     match stmt {
-        Stmt::Let(_, _, expr, _, _, _, _) => {
+        Stmt::Let(lname, lty, expr, lmut, lpersist, lann, lline) => {
             replace_ident_in_expr(expr, name, replacement);
+            * stmt = Stmt::Let(lname, lty, expr, lmut, lpersist, lann, lline);
         }
-        Stmt::Assign(_, _, expr, _) => {
+        Stmt::LetTuple(tnames, expr, tline) => {
             replace_ident_in_expr(expr, name, replacement);
+            * stmt = Stmt::LetTuple(tnames, expr, tline);
         }
-        Stmt::IndexAssign(_, index, _, expr, _) => {
+        Stmt::Assign(aname, aop, expr, aline) => {
+            replace_ident_in_expr(expr, name, replacement);
+            * stmt = Stmt::Assign(aname, aop, expr, aline);
+        }
+        Stmt::IndexAssign(iname, index, iop, expr, iline) => {
             replace_ident_in_expr(index, name, replacement);
             replace_ident_in_expr(expr, name, replacement);
+            * stmt = Stmt::IndexAssign(iname, index, iop, expr, iline);
         }
-        Stmt::Expr(e, _) => {
+        Stmt::DerefAssign(pexpr, dop, expr, dline) => {
+            replace_ident_in_expr(pexpr, name, replacement);
+            replace_ident_in_expr(expr, name, replacement);
+            * stmt = Stmt::DerefAssign(pexpr, dop, expr, dline);
+        }
+        Stmt::FieldAssign(oexpr, ffield, fop, expr, fline) => {
+            replace_ident_in_expr(oexpr, name, replacement);
+            replace_ident_in_expr(expr, name, replacement);
+            * stmt = Stmt::FieldAssign(oexpr, ffield, fop, expr, fline);
+        }
+        Stmt::Expr(e, eline) => {
             replace_ident_in_expr(e, name, replacement);
+            * stmt = Stmt::Expr(e, eline);
         }
-        Stmt::Return(opt, _) => {
+        Stmt::Return(opt, rline) => {
             match opt {
                 OptBoxExpr::Some(e) => {
                     var inner: Expr = ct_box_expr_unbox(e);
                     replace_ident_in_expr(& mut inner, name, replacement);
+                    * stmt = Stmt::Return(OptBoxExpr::Some(box_expr_new(inner)), rline);
                 }
                 OptBoxExpr::None => {
                 }
             }
         }
-        Stmt::If(cond, then_block, else_block, _) => {
+        Stmt::If(cond, then_block, else_block, iline2) => {
             replace_ident_in_expr(cond, name, replacement);
-            var si: i64 = 0;
-            while si < then_block.len() {
-                var s: Stmt = then_block.get(si);
-                replace_ident_in_stmt(& mut s, name, replacement);
-                then_block.set(si, s);
-                si = si + 1;
-            }
+            replace_ident_in_stmts(& mut then_block, name, replacement);
             match else_block {
                 OptStmts::Some(eb) => {
-                    var ei: i64 = 0;
-                    while ei < eb.len() {
-                        var s: Stmt = eb.get(ei);
-                        replace_ident_in_stmt(& mut s, name, replacement);
-                        eb.set(ei, s);
-                        ei = ei + 1;
-                    }
+                    replace_ident_in_stmts(& mut eb, name, replacement);
                 }
                 OptStmts::None => {
                 }
             }
+            * stmt = Stmt::If(cond, then_block, else_block, iline2);
         }
-        Stmt::For(v, iterator, body, _) => {
+        Stmt::For(v, iterator, body, forline) => {
             if v != name {
                 replace_ident_in_expr(iterator, name, replacement);
-                var si: i64 = 0;
-                while si < body.len() {
-                    var s: Stmt = body.get(si);
-                    replace_ident_in_stmt(& mut s, name, replacement);
-                    body.set(si, s);
-                    si = si + 1;
-                }
+                replace_ident_in_stmts(& mut body, name, replacement);
             }
+            * stmt = Stmt::For(v, iterator, body, forline);
         }
-        Stmt::While(cond, body, _) => {
+        Stmt::While(cond, body, wline) => {
             replace_ident_in_expr(cond, name, replacement);
-            var si: i64 = 0;
-            while si < body.len() {
-                var s: Stmt = body.get(si);
-                replace_ident_in_stmt(& mut s, name, replacement);
-                body.set(si, s);
-                si = si + 1;
-            }
+            replace_ident_in_stmts(& mut body, name, replacement);
+            * stmt = Stmt::While(cond, body, wline);
         }
         _ => {
         }
@@ -3056,6 +3146,18 @@ fn replace_ident_in_expr(expr: & mut Expr, name: str, replacement: Expr) {
             if n == name {
                 * expr = replacement;
             }
+        }
+        // `comptime (i * i)` inside an inline for's body: the loop variable
+        // is its literal in the comptime expression too
+        Expr::Comptime(inner) => {
+            var e2: Expr = ct_box_expr_unbox(inner);
+            replace_ident_in_expr(& mut e2, name, replacement);
+            * expr = Expr::Comptime(box_expr_new(e2));
+        }
+        Expr::ComptimeBlock(stmts) => {
+            var st2: Vec<Stmt> = stmts;
+            replace_ident_in_stmts(& mut st2, name, replacement);
+            * expr = Expr::ComptimeBlock(st2);
         }
         Expr::Binary(op, left, right) => {
             var l: Expr = ct_box_expr_unbox(left);
@@ -4982,4 +5084,326 @@ fn evaluate_reflect(op: ReflectOp, ty: Type, original: & Program) -> ResultExpr 
         }
     }
     return ResultExpr::Err("unreachable");
+}
+
+// --- Pre-type-check expansion: comptime if, inline for (§4.11) ------------
+// Statement-position `comptime if` selects its branch before type checking,
+// so the branch not taken is not checked (config-gated code may name what
+// the other configuration has) and its locals are as visible as any other
+// statement's. `inline for` (parser.fd wraps its iterator in `comptime`)
+// unrolls into one copy of the body per iteration with the loop variable a
+// literal, so comptime expressions over it compute. Generic functions are
+// left to substitute's second pass, after mono filled their parameters.
+
+var g_ct_expand_errors: Vec<str> = Vec::new();
+pub fn comptime_expand_errors() -> Vec<str> {
+    return g_ct_expand_errors;
+}
+
+pub fn expand_comptime(program: Program) -> Program {
+    var prog: Program = program;
+    g_ct_expand_errors = Vec::new();
+    g_ct_steps = 0;
+    g_ct_call_stack = Vec::new();
+    g_ct_line = 0;
+    g_ct_subst_line = 0;
+    var errs: Vec<str> = Vec::new();
+    var fi: i64 = 0;
+    while fi < prog.funcs.len() {
+        if prog.funcs.get(fi).type_params.len() == 0 {
+            var f: Func = prog.funcs.get(fi);
+            f.body = ec_stmts(f.body, & prog, & mut errs);
+            prog.funcs.set(fi, f);
+        }
+        fi = fi + 1;
+    }
+    var ii: i64 = 0;
+    while ii < prog.impls.len() {
+        if prog.impls.get(ii).type_params.len() == 0 {
+            var im: ImplDef = prog.impls.get(ii);
+            var mi: i64 = 0;
+            while mi < im.methods.len() {
+                if im.methods.get(mi).type_params.len() == 0 {
+                    var m: Func = im.methods.get(mi);
+                    m.body = ec_stmts(m.body, & prog, & mut errs);
+                    im.methods.set(mi, m);
+                }
+                mi = mi + 1;
+            }
+            prog.impls.set(ii, im);
+        }
+        ii = ii + 1;
+    }
+    var ti: i64 = 0;
+    while ti < prog.trait_impls.len() {
+        var tim: TraitImpl = prog.trait_impls.get(ti);
+        var tmi: i64 = 0;
+        while tmi < tim.methods.len() {
+            if tim.methods.get(tmi).type_params.len() == 0 {
+                var m2: Func = tim.methods.get(tmi);
+                m2.body = ec_stmts(m2.body, & prog, & mut errs);
+                tim.methods.set(tmi, m2);
+            }
+            tmi = tmi + 1;
+        }
+        prog.trait_impls.set(ti, tim);
+        ti = ti + 1;
+    }
+    g_ct_expand_errors = errs;
+    return prog;
+}
+
+/// The statements of `inline for fvar in range_e { body }`: one copy of the
+/// body per iteration, the loop variable replaced by its literal (so comptime
+/// expressions over it compute), each copy expanded (nested comptime ifs and
+/// inline fors inside see the literal). The loop variable's name is not
+/// declared: every use is the literal.
+fn ec_unroll_inline(out: & mut Vec<Stmt>, fvar: str, range_e: Expr, body: Vec<Stmt>, original: & Program, errs: & mut Vec<str>, line: i64) {
+    match range_e {
+        Expr::Range(a_box, b_box, incl) => {
+            var a_e: Expr = ct_box_expr_unbox(a_box);
+            var b_e: Expr = ct_box_expr_unbox(b_box);
+            substitute_expr(& mut a_e, original, errs);
+            substitute_expr(& mut b_e, original, errs);
+            g_ct_call_stack = Vec::new();
+            g_ct_line = 0;
+            var av: Expr = Expr::IntLit(0);
+            match evaluate(& a_e, original) {
+                ResultExpr::Ok(v) => {
+                    av = v;
+                }
+                ResultExpr::Err(m) => {
+                    errs.push("inline for (line " + int_to_str(line) + "): the range's start: " + m + ct_trace());
+                    return;
+                }
+            }
+            var bv: Expr = Expr::IntLit(0);
+            match evaluate(& b_e, original) {
+                ResultExpr::Ok(v) => {
+                    bv = v;
+                }
+                ResultExpr::Err(m) => {
+                    errs.push("inline for (line " + int_to_str(line) + "): the range's end: " + m + ct_trace());
+                    return;
+                }
+            }
+            var a: i64 = 0;
+            var b: i64 = 0;
+            match av {
+                Expr::IntLit(n) => {
+                    a = n;
+                }
+                _ => {
+                    errs.push("inline for (line " + int_to_str(line) + "): the range's start must be known at compile time (a const or a literal)");
+                    return;
+                }
+            }
+            match bv {
+                Expr::IntLit(n2) => {
+                    b = n2;
+                }
+                _ => {
+                    errs.push("inline for (line " + int_to_str(line) + "): the range's end must be known at compile time (a const or a literal)");
+                    return;
+                }
+            }
+            var trip: i64 = b - a;
+            if incl {
+                trip = b - a + 1;
+            }
+            if trip < 0 {
+                trip = 0;
+            }
+            if trip > 4096 {
+                errs.push("inline for (line " + int_to_str(line) + "): " + int_to_str(trip) + " iterations is more than the 4096 an inline for unrolls");
+                return;
+            }
+            if trip > 0 && ct_stmts_have_break_or_continue(body) {
+                errs.push("inline for (line " + int_to_str(line) + "): break/continue belong to a runtime loop; an unrolled body has no loop to leave");
+                return;
+            }
+            var k: i64 = 0;
+            while k < trip {
+                if !ct_fuel_left() {
+                    errs.push("inline for (line " + int_to_str(line) + "): the fuel budget ran out while unrolling (FID_CT_FUEL raises it)");
+                    return;
+                }
+                var iter: Vec<Stmt> = Vec::new();
+                var bi: i64 = 0;
+                while bi < body.len() {
+                    var bs: Stmt = body.get(bi);
+                    replace_ident_in_stmt(& mut bs, fvar, Expr::IntLit(a + k));
+                    iter.push(bs);
+                    bi = bi + 1;
+                }
+                var expanded: Vec<Stmt> = ec_stmts(iter, original, errs);
+                var ei2: i64 = 0;
+                while ei2 < expanded.len() {
+                    out.push(expanded.get(ei2));
+                    ei2 = ei2 + 1;
+                }
+                k = k + 1;
+            }
+        }
+        _ => {
+            errs.push("inline for (line " + int_to_str(line) + "): the iterator must be a range (a..b) known at compile time");
+        }
+    }
+}
+
+/// One statement list expanded: a statement `comptime if` splices its taken
+/// branch in place (no scope of its own), an `inline for` splices its
+/// unrolled copies; every other statement recurses into the statement lists
+/// it holds. Expressions are untouched: `comptime` there is a value, as
+/// before.
+fn ec_stmts(stmts: Vec<Stmt>, original: & Program, errs: & mut Vec<str>) -> Vec<Stmt> {
+    var out: Vec<Stmt> = Vec::new();
+    var si: i64 = 0;
+    while si < stmts.len() {
+        var stmt: Stmt = stmts.get(si);
+        g_ct_subst_line = ct_stmt_line(stmt);
+        match stmt {
+            Stmt::Expr(e, eline) => {
+                var handled: bool = false;
+                match e {
+                    Expr::Comptime(inner) => {
+                        match ct_box_expr_unbox(inner) {
+                            Expr::If(cond, then_block, else_block) => {
+                                var cond2: Expr = ct_box_expr_unbox(cond);
+                                substitute_expr(& mut cond2, original, errs);
+                                g_ct_call_stack = Vec::new();
+                                g_ct_line = 0;
+                                match evaluate(& cond2, original) {
+                                    ResultExpr::Ok(v) => {
+                                        match v {
+                                            Expr::BoolLit(b) => {
+                                                var taken: Vec<Stmt> = then_block;
+                                                if !b {
+                                                    taken = Vec::new();
+                                                    match else_block {
+                                                        OptStmts::Some(eb4) => {
+                                                            taken = eb4;
+                                                        }
+                                                        OptStmts::None => {
+                                                        }
+                                                    }
+                                                }
+                                                var inner_out: Vec<Stmt> = ec_stmts(taken, original, errs);
+                                                var ti2: i64 = 0;
+                                                while ti2 < inner_out.len() {
+                                                    out.push(inner_out.get(ti2));
+                                                    ti2 = ti2 + 1;
+                                                }
+                                                handled = true;
+                                            }
+                                            _ => {
+                                                errs.push("comptime if (line " + int_to_str(eline) + "): the condition is not known at compile time (a bool the evaluator can compute)");
+                                            }
+                                        }
+                                    }
+                                    ResultExpr::Err(m) => {
+                                        errs.push("comptime if (line " + int_to_str(eline) + "): " + m + ct_trace());
+                                    }
+                                }
+                            }
+                            _ => {
+                            }
+                        }
+                    }
+                    _ => {
+                    }
+                }
+                if !handled {
+                    out.push(stmt);
+                }
+            }
+            Stmt::For(fvar, iterator, body, fline) => {
+                var inline_iter: bool = false;
+                var range_e: Expr = Expr::IntLit(0);
+                match iterator {
+                    Expr::Comptime(ri) => {
+                        inline_iter = true;
+                        range_e = ct_box_expr_unbox(ri);
+                    }
+                    _ => {
+                    }
+                }
+                if inline_iter {
+                    ec_unroll_inline(& mut out, fvar, range_e, body, original, errs, fline);
+                } else {
+                    out.push(Stmt::For(fvar, iterator, ec_stmts(body, original, errs), fline));
+                }
+            }
+            Stmt::If(c, t, eb, iline) => {
+                var new_t: Vec<Stmt> = ec_stmts(t, original, errs);
+                var new_e: OptStmts = OptStmts::None;
+                match eb {
+                    OptStmts::Some(eb2) => {
+                        new_e = OptStmts::Some(ec_stmts(eb2, original, errs));
+                    }
+                    OptStmts::None => {
+                    }
+                }
+                out.push(Stmt::If(c, new_t, new_e, iline));
+            }
+            Stmt::While(c, b, wline) => {
+                out.push(Stmt::While(c, ec_stmts(b, original, errs), wline));
+            }
+            Stmt::Loop(b, lline) => {
+                out.push(Stmt::Loop(ec_stmts(b, original, errs), lline));
+            }
+            Stmt::Match(m, arms, mline) => {
+                var new_arms: Vec<MatchArm> = Vec::new();
+                var ai: i64 = 0;
+                while ai < arms.len() {
+                    var arm: MatchArm = arms.get(ai);
+                    arm.body = ec_stmts(arm.body, original, errs);
+                    new_arms.push(arm);
+                    ai = ai + 1;
+                }
+                out.push(Stmt::Match(m, new_arms, mline));
+            }
+            Stmt::Defer(b, dline) => {
+                out.push(Stmt::Defer(ec_stmts(b, original, errs), dline));
+            }
+            Stmt::Txn(b, tline2) => {
+                out.push(Stmt::Txn(ec_stmts(b, original, errs), tline2));
+            }
+            Stmt::Sandbox(b, sline) => {
+                out.push(Stmt::Sandbox(ec_stmts(b, original, errs), sline));
+            }
+            Stmt::Unsafe(b, uline) => {
+                out.push(Stmt::Unsafe(ec_stmts(b, original, errs), uline));
+            }
+            Stmt::SpawnScope(b, sline2) => {
+                out.push(Stmt::SpawnScope(ec_stmts(b, original, errs), sline2));
+            }
+            Stmt::Parallel(brs, pline) => {
+                var nb: Vec<Vec<Stmt>> = Vec::new();
+                var bi2: i64 = 0;
+                while bi2 < brs.len() {
+                    nb.push(ec_stmts(brs.get(bi2), original, errs));
+                    bi2 = bi2 + 1;
+                }
+                out.push(Stmt::Parallel(nb, pline));
+            }
+            Stmt::Handle(b, hs, hline) => {
+                var nb2: Vec<Stmt> = ec_stmts(b, original, errs);
+                var nh: Vec<EffectHandler> = Vec::new();
+                var hi: i64 = 0;
+                while hi < hs.len() {
+                    var h: EffectHandler = hs.get(hi);
+                    h.body = ec_stmts(h.body, original, errs);
+                    nh.push(h);
+                    hi = hi + 1;
+                }
+                out.push(Stmt::Handle(nb2, nh, hline));
+            }
+            _ => {
+                out.push(stmt);
+            }
+        }
+        si = si + 1;
+    }
+    return out;
 }
