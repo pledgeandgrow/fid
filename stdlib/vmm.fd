@@ -105,6 +105,7 @@ fn physmem_index(m: & PhysMem, pa: i64) -> i64 {
 /// 64-bit read at an 8-byte aligned physical address.
 pub fn phys_read64(m: & PhysMem, pa: i64) -> i64 {
     if !m.fake {
+        // SAFETY: !m.fake means dmap maps all of m.size (the mapper validated the range when the guest RAM was bound), and the doc contract is an 8-byte aligned pa — the load reads guest RAM only.
         unsafe { return physmem_raw_load(pa + m.dmap); }
     }
     return m.words.get(physmem_index(m, pa));
@@ -113,6 +114,7 @@ pub fn phys_read64(m: & PhysMem, pa: i64) -> i64 {
 /// 64-bit write at an 8-byte aligned physical address.
 pub fn phys_write64(m: & mut PhysMem, pa: i64, v: i64) {
     if !m.fake {
+        // SAFETY: !m.fake means dmap maps all of m.size (the mapper validated the range when the guest RAM was bound), and the doc contract is an 8-byte aligned pa — the store writes guest RAM only.
         unsafe { physmem_raw_store(pa + m.dmap, v); }
         return;
     }
@@ -123,6 +125,7 @@ pub fn phys_write64(m: & mut PhysMem, pa: i64, v: i64) {
 /// Byte read at any address (fake RAM: taken out of its word).
 @wrapping pub fn phys_read8(m: & PhysMem, pa: i64) -> i64 {
     if !m.fake {
+        // SAFETY: !m.fake means dmap maps all of m.size; any byte pa in the range is a mapped byte, so the volatile load reads the device behind it without tearing.
         unsafe { return p_volatile_load8(pa + m.dmap); }
     }
     var w: i64 = phys_read64(m, pa - (pa & 7));
@@ -132,6 +135,7 @@ pub fn phys_write64(m: & mut PhysMem, pa: i64, v: i64) {
 /// Byte write.
 @wrapping pub fn phys_write8(m: & mut PhysMem, pa: i64, b: i64) {
     if !m.fake {
+        // SAFETY: !m.fake means dmap maps all of m.size; any byte pa in the range is a mapped byte, so the volatile store hits exactly the device byte (a read-modify-write of its word cannot be avoided on some buses — the doc says so).
         unsafe { p_volatile_store8(pa + m.dmap, b); }
         return;
     }

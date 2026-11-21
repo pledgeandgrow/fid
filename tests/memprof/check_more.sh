@@ -176,15 +176,13 @@ if [ "$WIN" = 1 ]; then
     else
         bad "dynlib: emit build" "$(tail -c 300 "$OUT/dyn_pe.build")"
     fi
-    # the machine layer's static executables have no loader: open gives None
+    # the machine layer loads through the host's loader on --nat Windows
+    # (linux_runtime/sys.fd pert_dl_load over the Windows loader; the old
+    # row expected 'libc: none', which a static no-loader build gave)
     if "$FID" emit tests/bootstrap/test_dynlib.fd --nat -o "$OUT/dyn_nat.exe" > "$OUT/dyn_nat.build" 2>&1; then
         "$OUT/dyn_nat.exe" > "$OUT/dyn_nat.out" 2>&1
         nocr "$OUT/dyn_nat.out"
-        if [ "$(tail -1 "$OUT/dyn_nat.out")" = "libc: none" ]; then
-            ok "dynlib: emit --nat (no loader: none)"
-        else
-            bad "dynlib: emit --nat" "$(head -c 300 "$OUT/dyn_nat.out")"
-        fi
+        dyn_check "emit --nat (the Windows loader)" "$OUT/dyn_nat.out"
     else
         bad "dynlib: emit --nat build" "$(tail -c 300 "$OUT/dyn_nat.build")"
     fi

@@ -730,6 +730,7 @@ pub fn spi_c_int(r: i64) -> i64 {
 @cfg(linux)
 fn spi_linux_ioctl_value(fd: i64, req: i64, value: i64, n: i64) -> i64 {
     var r: i64 = 0 - 1;
+    // SAFETY: the ioctl argument is 8 bytes from p_malloc, written within by the kernel and freed below before the value is returned.
     unsafe {
         val p: i64 = p_malloc(8);
         var i: i64 = 0;
@@ -753,6 +754,7 @@ pub fn spi_linux_xfer(fd: i64, req: Vec<i64>) -> Vec<i64> {
         reply.push(0);
         return reply;
     }
+    // SAFETY: base is n bytes from p_malloc (n covers exactly the transfer buffers of xs) and the kernel DMA touches only those bytes; it is freed on every path below.
     unsafe {
         val base: i64 = p_malloc(n);
         val img: Vec<i64> = spi_ioc_image(& xs, base);
@@ -790,6 +792,7 @@ pub fn spi_linux_xfer(fd: i64, req: Vec<i64>) -> Vec<i64> {
 pub fn spi_linux_open(busno: i64, cs: i64, cfg: SpiConfig) -> Result<SpiBus, str> {
     val path: str = "/dev/spidev" + int_to_str(busno) + "." + int_to_str(cs);
     var fd: i64 = 0 - 1;
+    // SAFETY: spi_sys_open is a raw open of the /dev path built above; fd holds the descriptor or a negative errno, both plain words.
     unsafe {
         fd = spi_c_int(spi_sys_open(path, 2));
     }
@@ -803,18 +806,21 @@ pub fn spi_linux_open(busno: i64, cs: i64, cfg: SpiConfig) -> Result<SpiBus, str
         r = spi_linux_ioctl_value(fd, spi_ioc_wr_mode(), cfg.mode, 1);
     }
     if r < 0 {
+        // SAFETY: fd is a real descriptor (opened and checked above) and this error path returns right after — exactly one close.
         unsafe {
             spi_sys_close(fd);
         }
         return Result::Err("SPI_IOC_WR_MODE failed on " + path);
     }
     if spi_linux_ioctl_value(fd, spi_ioc_wr_bits_per_word(), cfg.bits_per_word, 1) < 0 {
+        // SAFETY: fd is a real descriptor and this error path returns right after — exactly one close.
         unsafe {
             spi_sys_close(fd);
         }
         return Result::Err("SPI_IOC_WR_BITS_PER_WORD failed on " + path);
     }
     if spi_linux_ioctl_value(fd, spi_ioc_wr_max_speed_hz(), cfg.speed_hz, 4) < 0 {
+        // SAFETY: fd is a real descriptor and this error path returns right after — exactly one close.
         unsafe {
             spi_sys_close(fd);
         }
@@ -826,6 +832,7 @@ pub fn spi_linux_open(busno: i64, cs: i64, cfg: SpiConfig) -> Result<SpiBus, str
 @cfg(linux)
 pub fn spi_linux_close(bus: & mut SpiBus) {
     if bus.kind == SPI_BUS_FN && bus.handle >= 0 {
+        // SAFETY: the guard (kind FN and handle >= 0) makes this a real descriptor, and close is the bus's last use.
         unsafe {
             spi_sys_close(bus.handle);
         }

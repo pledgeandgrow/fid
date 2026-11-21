@@ -729,6 +729,7 @@ pub fn i2c_linux_xfer(fd: i64, req: Vec<i64>) -> Vec<i64> {
     val msgs: Vec<I2cMsg> = i2c_decode_request(& req);
     var reply: Vec<i64> = Vec::new();
     val n: i64 = i2c_rdwr_size(& msgs);
+    // SAFETY: base is n bytes from p_malloc (n = i2c_rdwr_size of exactly these messages) and the ioctl writes only within it; it is freed on every path below.
     unsafe {
         val base: i64 = p_malloc(n);
         if base == 0 {
@@ -770,6 +771,7 @@ pub fn i2c_linux_xfer(fd: i64, req: Vec<i64>) -> Vec<i64> {
 pub fn i2c_linux_open(n: i64) -> Result<I2cBus, str> {
     val path: str = "/dev/i2c-" + int_to_str(n);
     var fd: i64 = 0 - 1;
+    // SAFETY: i2c_sys_open is a raw open of the /dev path built above; fd holds the descriptor or a negative errno, both plain words.
     unsafe {
         fd = i2c_c_int(i2c_sys_open(path, I2C_O_RDWR));
     }
@@ -782,6 +784,7 @@ pub fn i2c_linux_open(n: i64) -> Result<I2cBus, str> {
 @cfg(linux)
 pub fn i2c_linux_close(bus: & mut I2cBus) {
     if bus.kind == I2C_BUS_FN && bus.handle >= 0 {
+        // SAFETY: the guard (kind FN and handle >= 0) makes this a real descriptor, and close is the bus's last use.
         unsafe {
             i2c_sys_close(bus.handle);
         }

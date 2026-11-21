@@ -533,6 +533,7 @@ pub struct GpioLinuxLines {
 @cfg(linux)
 fn gpio_linux_ioctl_image(fd: i64, req: i64, img: & Vec<i64>) -> Vec<i64> {
     var back: Vec<i64> = Vec::new();
+    // SAFETY: the ioctl's image buffer is n bytes from p_malloc and the kernel writes only within n; it is freed below on every path (p_free before each return).
     unsafe {
         val n: i64 = img.len();
         val p: i64 = p_malloc(n);
@@ -559,6 +560,7 @@ fn gpio_linux_ioctl_image(fd: i64, req: i64, img: & Vec<i64>) -> Vec<i64> {
 pub fn gpio_linux_request(chip: i64, offsets: Vec<i64>, consumer: str, cfg: GpioConfig) -> Result<GpioLinuxLines, str> {
     val path: str = "/dev/gpiochip" + int_to_str(chip);
     var cfd: i64 = 0 - 1;
+    // SAFETY: gpio_sys_open is a raw open of the /dev path built above; it returns an fd or a negative errno, both plain words (gpio_c_int reinterprets nothing else).
     unsafe {
         cfd = gpio_c_int(gpio_sys_open(path, 2));
     }
@@ -566,6 +568,7 @@ pub fn gpio_linux_request(chip: i64, offsets: Vec<i64>, consumer: str, cfg: Gpio
         return Result::Err("cannot open " + path);
     }
     val back: Vec<i64> = gpio_linux_ioctl_image(cfd, gpio_v2_get_line_ioctl(), & gpio_v2_request_image(& offsets, consumer, & cfg));
+    // SAFETY: cfd was checked >= 0 just above, so this closes a real descriptor exactly once (the error path returns right after).
     unsafe {
         gpio_sys_close(cfd);
     }
@@ -596,6 +599,7 @@ pub fn gpio_linux_set(lines: & GpioLinuxLines, bits: i64, mask: i64) -> bool {
 @cfg(linux)
 pub fn gpio_linux_read_events(lines: & GpioLinuxLines) -> Vec<GpioEvent> {
     var bytes: Vec<i64> = Vec::new();
+    // SAFETY: the event buffer is n bytes from p_malloc and the kernel read writes at most n; it is freed below on every path before the events are decoded into Vecs.
     unsafe {
         val n: i64 = 16 * GPIO_V2_EVENT_SIZE;
         val p: i64 = p_malloc(n);
@@ -613,6 +617,7 @@ pub fn gpio_linux_read_events(lines: & GpioLinuxLines) -> Vec<GpioEvent> {
 @cfg(linux)
 pub fn gpio_linux_release(lines: & mut GpioLinuxLines) {
     if lines.fd >= 0 {
+        // SAFETY: the guard (fd >= 0) makes this a real descriptor, and release is the last use of it — the caller drops the bus after this.
         unsafe {
             gpio_sys_close(lines.fd);
         }
