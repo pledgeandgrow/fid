@@ -594,19 +594,10 @@ pub fn subst_type(ty: Type, subst: Vec<SubstEntry>) -> Type {
             // If the const param is in the substitution, resolve it to a concrete size
             match subst_get(subst, size_param) {
                 OptType::Some(replacement) => {
-                    match replacement {
-                        Type::Named(name) => {
-                            // Check for __const_ prefix
-                            if str_starts_with(name, "__const_") {
-                                var size_str: str = str_slice(name, 8, str_len(name));
-                                var size: i64 = str_parse_int(size_str);
-                                if size >= 0 {
-                                    return Type::Array(box_type_new(subst_type(box_type_deref(elem), subst)), size);
-                                }
-                            }
-                        }
-                        _ => {
-                        }
+                    // A const parameter's argument (ast.fd Type_const_value)
+                    val size: i64 = Type_const_value(replacement);
+                    if size >= 0 {
+                        return Type::Array(box_type_new(subst_type(box_type_deref(elem), subst)), size);
                     }
                 }
                 OptType::None => {
@@ -1034,16 +1025,10 @@ pub fn subst_expr(expr: Expr, subst: Vec<SubstEntry>, renames: Vec<RenameEntry>,
             // Check if this is a const generic param being substituted
             match subst_get(subst, s) {
                 OptType::Some(replacement) => {
-                    match replacement {
-                        Type::Named(name) => {
-                            if str_starts_with(name, "__const_") {
-                                var size_str: str = str_slice(name, 8, str_len(name));
-                                var val: i64 = str_parse_int(size_str);
-                                return Expr::IntLit(val);
-                            }
-                        }
-                        _ => {
-                        }
+                    // A const parameter's argument (ast.fd Type_const_value)
+                    val val: i64 = Type_const_value(replacement);
+                    if val >= 0 {
+                        return Expr::IntLit(val);
                     }
                 }
                 OptType::None => {
@@ -1724,7 +1709,7 @@ pub fn infer_from_pair(param: Type, arg: Type, type_params: Vec<str>, subst: &mu
             if str_vec_contains(type_params, size_param) {
                 match arg {
                     Type::Array(arg_elem, size) => {
-                        subst_set(subst, size_param, Type::Named("__const_" + int_to_str(size)));
+                        subst_set(subst, size_param, Type_const_of(size));
                         infer_from_pair(box_type_deref(elem), box_type_deref(arg_elem), type_params, subst);
                     }
                     _ => {
@@ -3688,7 +3673,7 @@ pub fn monomorphize(program: Program) -> Program {
                     // L8A: a const parameter (`impl<T, const N: usize>`) is
                     // a number here, 0, so the body's N is a constant
                     if mono_is_const_param(imp.methods.get(j), imp.type_params.get(tk)) {
-                        subst_set(&mut isub, imp.type_params.get(tk), Type::Named("__const_0"));
+                        subst_set(&mut isub, imp.type_params.get(tk), Type_const_of(0));
                     } else {
                         subst_set(&mut isub, imp.type_params.get(tk), Type::I64);
                     }
