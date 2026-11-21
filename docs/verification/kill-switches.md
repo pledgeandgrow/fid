@@ -30,6 +30,11 @@ Windows, nat_ir for the Linux and macOS targets and `--nat`). The C path
 (`ccompile`, `dump-c`) and the interpreter (`run`) run no IR optimizer, so
 none of these switches changes them.
 
+The `--no-pass=a,b` flag (or `--no-pass a,b`; `compiler/checks.fd`
+`iro_cli_off`) adds names to the off lists that `iro_named_off` reads:
+the mid-end's, the rules' (`ru_on`) and the e-graph's (`eg_on`). nat_ir's
+own `ng_on` reads `FID_NAT_OFF` only.
+
 ## Mid-end passes, on by default: `FID_IROPT_OFF`
 
 | Switch | Pass (compiler/iropt.fd unless named) |
@@ -45,7 +50,7 @@ none of these switches changes them.
 | `FID_IROPT_OFF=iv` | induction variables (also `IRO_IV`) |
 | `FID_IROPT_OFF=branchfacts` | facts from branch conditions used in the blocks they dominate |
 | `FID_IROPT_OFF=sccp` | sparse conditional constant propagation |
-| `FID_IROPT_OFF=promote` | locals promoted from memory to values (mem2reg) |
+| `FID_IROPT_OFF=promote` | locals promoted from memory to values (mem2reg), in the functions `ssa` does not take (ME3, `iro_promote_here`) |
 | `FID_IROPT_OFF=devirt` | a dynamic call whose receiver is a `MakeDyn` of a known type made direct (WP16) |
 | `FID_IROPT_OFF=gconst` | never-written globals folded to their initializer (WP18) |
 | `FID_IROPT_OFF=quietcall` | unused calls that end, never panic and write nothing removed; quiet calls out of any loop block (OP25, iropt.fd iro_quiet_fns) |
@@ -62,26 +67,31 @@ none of these switches changes them.
 
 `FID_IROPT_STATS=1` prints how many functions each pass changed.
 
-## Mid-end passes, off by default: `FID_IROPT_ON`
+## Mid-end passes of `ime_on`, opt-in or on by default: `FID_IROPT_ON`
 
-Not yet run on the whole suite with the pass on and off, so they are opt-in
-(`FID_IROPT_ON=all` or a comma list). `FID_IROPT_OFF=<name>` still turns
-one off when `all` turned it on.
+Read by `ime_on` (compiler/iropt_me.fd). A pass is opt-in
+(`FID_IROPT_ON=all` or a comma list) until the suite has run with it on
+and off; then it goes into `IME_DEFAULT_ON` and is on unless
+`FID_IROPT_OFF` names it. On Nov 21, 15 of the 27 are on by default:
+loops, sra, loadhoist, forward, matchfacts, inline2, ssa, ssaexit (since
+Nov 16) and unroll, linear, placefwd, vecalias, version, inlineclo,
+lendref (since Nov 17). `FID_IROPT_OFF=<name>` still turns one off when
+`all` turned it on.
 
 | Switch | Pass |
 |--------|------|
 | `FID_IROPT_ON=branchfold` | branches on known conditions folded (ME12) |
 | `FID_IROPT_ON=ipcp` | interprocedural constant propagation (WP13; miscompile M9 before its fix) |
 | `FID_IROPT_ON=simplify` | algebraic identities and reassociation of constant steps (`iro_simplify`) |
-| `FID_IROPT_ON=inline2` | inlining with a cost model, bottom-up over the call graph (ME20, ME21; iropt_me.fd) |
-| `FID_IROPT_ON=loops` | loops in canonical form (ME22) |
+| `FID_IROPT_ON=inline2` | inlining with a cost model, bottom-up over the call graph (ME20, ME21; iropt_me.fd). On by default since Nov 16 (`IME_DEFAULT_ON`): `FID_IROPT_OFF=inline2` |
+| `FID_IROPT_ON=loops` | loops in canonical form (ME22). On by default since Nov 16 (`IME_DEFAULT_ON`): `FID_IROPT_OFF=loops` |
 | `FID_IROPT_ON=ivsr` | induction-variable strength reduction in `@wrapping` code (ME23) |
-| `FID_IROPT_ON=unroll` | full unrolling of short one-block loops (ME24) |
-| `FID_IROPT_ON=sra` | scalar replacement of struct locals (ME26) |
+| `FID_IROPT_ON=unroll` | full unrolling of short one-block loops (ME24; `--size` turns it off). On by default since Nov 17 (`IME_DEFAULT_ON`): `FID_IROPT_OFF=unroll` |
+| `FID_IROPT_ON=sra` | scalar replacement of struct locals (ME26). On by default since Nov 16 (`IME_DEFAULT_ON`): `FID_IROPT_OFF=sra` |
 | `FID_IROPT_ON=switch` | a chain of `x == k` tests lowered to a balanced tree (ME28) |
-| `FID_IROPT_ON=loadhoist` | loads moved out of loops that cannot change them (LF5) |
-| `FID_IROPT_ON=forward` | store-to-load forwarding and repeated loads removed (LF6) |
-| `FID_IROPT_ON=matchfacts` | in a match arm, the scrutinee's tag is a constant (LF23) |
+| `FID_IROPT_ON=loadhoist` | loads moved out of loops that cannot change them (LF5). On by default since Nov 16 (`IME_DEFAULT_ON`): `FID_IROPT_OFF=loadhoist` |
+| `FID_IROPT_ON=forward` | store-to-load forwarding and repeated loads removed (LF6). On by default since Nov 16 (`IME_DEFAULT_ON`): `FID_IROPT_OFF=forward` |
+| `FID_IROPT_ON=matchfacts` | in a match arm, the scrutinee's tag is a constant (LF23). On by default since Nov 16 (`IME_DEFAULT_ON`): `FID_IROPT_OFF=matchfacts` |
 | `FID_IROPT_ON=ssa` | the SSA round trip (`compiler/ssa.fd`, ME3/ME15): locals become values with phis, dead phis and stores go, phis go back to slots before any backend reads the IR. On by default since Nov 16 (iropt_me.fd `IME_DEFAULT_ON`): `FID_IROPT_OFF=ssa` turns it off |
 | `FID_IROPT_ON=ssaexit` | with `ssa`: after a counted loop with constant bounds, its variable is a constant (ME23 exit values). On by default since Nov 16 (`IME_DEFAULT_ON`): `FID_IROPT_OFF=ssaexit` turns it off |
 | `FID_IROPT_ON=icf` | functions whose IR is the same (generic instances, specialized clones) all called through the first of them (WP19; whole program only) |
@@ -211,8 +221,8 @@ macOS targets and `--nat` Windows) and by the rule passes it runs
 | `FID_NAT_OFF=rvc` | RISC-V 2-byte instructions (TG9/TG19; on by default with every `--cpu` but `rv64g`) |
 | `FID_NAT_OFF=relink` | the function cache (SP7): functions put back in the kept layout; off: the layout is not kept |
 
-Note `forward` is two switches: `FID_NAT_OFF=forward` (egraph.fd, on by
-default) and `FID_IROPT_ON=forward` (iropt_me.fd LF6, off by default).
+Note `forward` is two passes: egraph.fd's (`FID_NAT_OFF=forward`) and
+iropt_me.fd's LF6 (`FID_IROPT_OFF=forward`); both are on by default.
 
 ## pe_ir passes: `FID_PE_OFF`
 
@@ -236,7 +246,9 @@ its per-function cache key):
 
 | Switch | What turns on |
 |--------|---------------|
-| `FID_NAT_ON=crashfree` | checks elided in `@crashfree` functions (WP11; the emit path does not prove the annotation) |
+| `FID_NAT_ON=rvc` | RISC-V 2-byte instructions reported on stderr (they are on by default; `FID_NAT_OFF=rvc` wins) |
+| `FID_NAT_ON=bparams` | MI1: each function's machine IR into block-parameter form and out again, checked under `FID_VERIFY=1` (`ng_bparams_round`) |
+| `FID_NAT_ON=vzdump` | a `[vectorize]` line per counted loop on stderr, taken or why not (as `--stats`) |
 | `FID_NAT_ON=pie` | a position-independent Linux executable (TG14; not yet run on the whole suite) |
 | `FID_NAT_ON=splitall` | every integer value split and kept (RA4: a stress test of the split places and their parallel moves) |
 | `FID_NAT_ON=fregs` | the float register class asked for, also on `--nat` Windows with `FID_NAT_OFF=winfregs` |
@@ -252,7 +264,17 @@ the allocator ignore implicit uses of argument registers (the
 register-allocation checker must reject it; machine_ra7_check.sh),
 `FID_NAT_MUTATE=iseldiv` makes the division rules take the other result
 register or signedness (TG1; nat_isel_tg1b_check must reject it under
-`FID_VERIFY=1`).
+`FID_VERIFY=1`). nat_ir.fd's `ng_mutant` also reads addi, andn, argfree,
+blsx, brandor, brgap, brnot, brxblock, cmpslot, fcallee, isel, iselcc,
+iselimm, ldext, ldfwdmov, ldop, memcmp, memop, opw, par, rmw, rmwslot,
+shi, tbz and wbidx; rules.fd reads `rule<N>` / `rulec<N>` (RL11) and
+egraph.fd `egcomm`, `egflip`, `egfold`, `egident`, `egzero`, `egdouble`
+and `egsame`.
+
+`FID_NAT_ON=crashfree` is no longer read (Nov 21): no check is dropped on
+the annotation's word; the checks of a `@crashfree` function left after
+the MIR folds are verified (`ng_crashfree_check`), and an overflow check
+left there rejects the build.
 
 ## Single rules: `FID_EGRAPH_OFF`, `FID_RULES_OFF`
 
@@ -306,6 +328,45 @@ still see every rule. The indexes on Nov 18 (27 rules):
 
     FID_RULES_OFF=3,18 fid emit prog.fd --nat -o prog.exe   # x - x and x ^ x off
 
+## Names read outside the pass lists
+
+These names are read with `iro_named_off` or a list test of their own, not
+through the readers `scripts/switch-check.sh` scans, so the script does
+not check them (Nov 21):
+
+| Variable | Name | What it turns off or on |
+|----------|------|-------------------------|
+| `FID_IROPT_OFF` | `rangejoin` | range facts met at joins (checks.fd; off also turns `rangeset` and `rangeloop` off) |
+| `FID_IROPT_OFF` | `rangeset` | several range facts per block (LF8) |
+| `FID_IROPT_OFF` | `rangedom` | facts of dominating blocks reaching loads (OP24) |
+| `FID_IROPT_OFF` | `rangeloop` | facts over loops' back edges in the final scan (LF8) |
+| `FID_IROPT_OFF` | `retrange` | a call's result narrowed to the range its callee returns (LF10) |
+| `FID_IROPT_OFF` | `cfgcache` | the cached CFG, dominator and loop trees and use lists (OP3) |
+| `FID_IROPT_OFF` | `readcse`, `egplace` | the same as in `FID_NAT_OFF` (rules.fd, egraph.fd) |
+| `FID_IROPT_ON` | `paramrange` | parameters start at the ranges every call gives them (LF10, opt-in) |
+| `FID_IROPT_ON` | `egskel` | the e-graph's side-effect skeleton (ME7, opt-in) |
+| `FID_NAT_OFF` | `declline` | DB2: a function's declaration line is its `fn` line in the debug info (nat_enc.fd); off: the first row's line |
+| `FID_NAT_OFF` | `ehframe` | DB6: `.eh_frame` and `.eh_frame_hdr` in Linux images (nat_enc.fd) |
+
+`FID_RULES_ON` names no rule today: nothing calls `ru_opt_in` (readcse,
+its last name, is on by default since Nov 17). nat_ir still keeps it in
+its cache key.
+
+Other run-time switches:
+
+| Variable | What it does |
+|----------|--------------|
+| `FID_SWITCH=off` (or `0`) | no `Switch` instructions are formed from compare chains (compiler/ir.fd `ir_switch_on`) |
+| `FID_WASM_SWITCH=1` | `fid wasm`: every function keeps the switch loop instead of structured control flow (TG16) |
+| `FID_NAT_FAST=1` | the fast allocator of debug builds (RA14), as `--fast-alloc` |
+| `FID_NAT_PAR=<n>` | SP5: nat_ir's functions compiled on n threads (1..16; not with the function cache) |
+| `FID_PE_CT_OFF=1` | pe_ir's machine-code `@constant_time` check off |
+| `FID_C_CT_OFF=1` | the C path's `@constant_time` check off (LF18) |
+| `FID_RC_SLOTS_OFF=1` | lower.fd: copies into parameter slots stay counted (LF15, to compare) |
+| `FID_MONO_SHARE_OFF=1` | generic instances keyed by their spelled types, not shared (mono.fd) |
+| `FID_PE_PRUNE=0` | `emit` keeps every function before pe_ir or nat_ir (PE88) |
+| `FID_ELF_PEIR=1` | `emit --elf` takes the old pe_ir ELF path (no stdlib) |
+
 ## Checks, not optimizations
 
 | Variable | What it does |
@@ -321,6 +382,8 @@ still see every rule. The indexes on Nov 18 (27 rules):
 |----------|-----------|
 | `FIDES_CHECK_CORE=1` | the checked-library stamp: core and the merged runtime are checked again |
 | `FID_CT_FULL=1` | comptime substitution's skipping of functions it cannot change |
+| `FID_CT_FALLBACK=1` | fatal comptime errors: a `comptime` that cannot be evaluated warns and runs when the program does, as before the hardening (reference.md §4.11, `s4_11_fallback_env_runs.fd`) |
+| `FID_CT_FUEL=N` | the comptime fuel budget (100 million steps by default; `<1` means a billion): the total work one evaluation pass may do, so a runaway comptime is an error, never a hang |
 | `FID_LOWER_ALL=1` | `emit` lowering only what `compiler/reach.fd` finds reachable |
 
 ## Switches that need a rebuilt compiler

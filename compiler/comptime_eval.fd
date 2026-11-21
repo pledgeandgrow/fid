@@ -6,7 +6,7 @@
 // Comptime functions (`comptime fn name(...) { ... }`) are evaluated by
 // directly interpreting their AST bodies when called from a comptime context.
 
-module compiler::comptime_eval; use core; use vec; use string; use compiler::ast; use compiler::token; use compiler::lexer; use compiler::parser;  // --- Box helpers ---------------------------------------------------------
+module compiler::comptime_eval; use core; use vec; use string; use compiler::ast; use compiler::token; use compiler::lexer; use compiler::parser; use compiler::ir; use compiler::lower;  // --- Box helpers ---------------------------------------------------------
 // Each module defines its own box_expr_unbox because Fides has no trait-based
 // generic unbox. This mirrors the pattern in lower.fd, typechecker.fd, etc.
 
@@ -293,8 +293,22 @@ pub fn ct_materialize(v: Expr) -> Expr {
     return Expr::Block(body);
 }
 
-// Explicit `comptime` that could not be evaluated: reported once each (it
-// then runs when the program does; it used to be silent).
+// --- Comptime safety: fatal errors, fuel, traces ---------------------------
+// An explicit `comptime` that cannot be evaluated is a compile error. It
+// used to warn once and run when the program did, so a comptime that
+// silently became runtime work (and a table the program rebuilt on every
+// run) looked fine. FID_CT_FALLBACK=1 keeps the old behavior
+// (docs/verification/kill-switches.md).
+var g_ct_fallback: bool = false;
+
+// The fatal errors of the last substitute() (compiler.fd reports them as it
+// reports comptime gen errors).
+var g_ct_subst_errors: Vec<str> = Vec::new();
+pub fn comptime_subst_errors() -> Vec<str> {
+    return g_ct_subst_errors;
+}
+
+// Warned-once bookkeeping of fallback mode (as before the hardening).
 var g_ct_warn_on: bool = false; var g_ct_warned: i64 = 0; fn ct_warn(msg: str) {
     if !g_ct_warn_on {
         return;
@@ -307,6 +321,145 @@ var g_ct_warn_on: bool = false; var g_ct_warned: i64 = 0; fn ct_warn(msg: str) {
     }
     HashMap_insert(g_ct_warned, msg, 1);
     p_eprint_str("warning: comptime: " + msg + " -- evaluated when the program runs instead\n");
+}
+
+// Fuel: the total work one evaluation pass may do, in steps (one expression
+// node, statement, binop or call each). A comptime that would run away is
+// an error, never a hang of the compiler. FID_CT_FUEL=N overrides the
+// default budget.
+var g_ct_fuel: i64 = 0;
+var g_ct_steps: i64 = 0;
+
+/// Whether another step is within the budget (and charges it).
+fn ct_fuel_left() -> bool {
+    if g_ct_fuel == 0 {
+        g_ct_fuel = 100000000;
+        var fe: str = p_getenv("FID_CT_FUEL");
+        if str_len(fe) > 0 {
+            g_ct_fuel = str_parse_int(fe);
+            if g_ct_fuel < 1 {
+                g_ct_fuel = 1000000000;
+            }
+        }
+    }
+    g_ct_steps = g_ct_steps + 1;
+    return g_ct_steps <= g_ct_fuel;
+}
+
+fn ct_out_of_fuel() -> ResultExpr {
+    return ResultExpr::Err("comptime evaluation ran past its fuel budget of " + int_to_str(g_ct_fuel) + " steps (FID_CT_FUEL raises it; compute less at compile time)");
+}
+
+// The comptime call stack, for error traces: one frame per comptime fn call
+// being evaluated, the innermost source line reached, and the statement of
+// the program whose expression is being substituted.
+var g_ct_call_stack: Vec<str> = Vec::new();
+var g_ct_line: i64 = 0;
+var g_ct_subst_line: i64 = 0;
+
+/// The comptime frames, innermost first, plus the line being run; the empty
+/// string when there is nothing to show. Frames stay on the stack when an
+/// error passes through (call_comptime_func pops only on success), so the
+/// boundary that reports the error sees the whole failing chain; the
+/// boundary clears them before the next evaluation.
+fn ct_trace() -> str {
+    var s: str = "";
+    var i: i64 = g_ct_call_stack.len() - 1;
+    var shown: i64 = 0;
+    while i >= 0 && shown < 8 {
+        s = s + "\n  " + g_ct_call_stack.get(i);
+        i = i - 1;
+        shown = shown + 1;
+    }
+    if i >= 0 {
+        s = s + "\n  .. " + int_to_str(i + 1) + " more comptime frame(s)";
+    }
+    if g_ct_line > 0 {
+        s = s + "\n  while running line " + int_to_str(g_ct_line);
+    }
+    return s;
+}
+
+/// " (line N)" for a message, or "" when the line is unknown.
+fn ct_at(line: i64) -> str {
+    if line > 0 {
+        return " (line " + int_to_str(line) + ")";
+    }
+    return "";
+}
+
+/// Onto the fatal list, once: the substitution phases iterate, so the same
+/// failed comptime is reported per round without this.
+fn ct_fatal_push(msg: str) {
+    var i: i64 = 0;
+    while i < g_ct_subst_errors.len() {
+        if g_ct_subst_errors.get(i) == msg {
+            return;
+        }
+        i = i + 1;
+    }
+    g_ct_subst_errors.push(msg);
+}
+
+/// Where a failed explicit comptime is reported from: the statement whose
+/// expression holds it (substitute_stmt), or 0 (a constant's initializer).
+fn ct_stmt_line(stmt: Stmt) -> i64 {
+    match stmt {
+        Stmt::Let(_, _, _, _, _, _, ln) => {
+            return ln;
+        }
+        Stmt::LetTuple(_, _, ln) => {
+            return ln;
+        }
+        Stmt::Assign(_, _, _, ln) => {
+            return ln;
+        }
+        Stmt::IndexAssign(_, _, _, _, ln) => {
+            return ln;
+        }
+        Stmt::DerefAssign(_, _, _, ln) => {
+            return ln;
+        }
+        Stmt::FieldAssign(_, _, _, _, ln) => {
+            return ln;
+        }
+        Stmt::Expr(_, ln) => {
+            return ln;
+        }
+        Stmt::Return(_, ln) => {
+            return ln;
+        }
+        Stmt::If(_, _, _, ln) => {
+            return ln;
+        }
+        Stmt::While(_, _, ln) => {
+            return ln;
+        }
+        Stmt::For(_, _, _, ln) => {
+            return ln;
+        }
+        Stmt::Match(_, _, ln) => {
+            return ln;
+        }
+        Stmt::Loop(_, ln) => {
+            return ln;
+        }
+        Stmt::Break(_, ln) => {
+            return ln;
+        }
+        Stmt::Continue(ln) => {
+            return ln;
+        }
+        Stmt::Defer(_, ln) => {
+            return ln;
+        }
+        Stmt::ComptimeGen(_, ln) => {
+            return ln;
+        }
+        _ => {
+        }
+    }
+    return 0;
 }
 
 // --- Result type for comptime evuation ---------------------------------
@@ -334,6 +487,14 @@ var g_ct_gen_errors: Vec<str> = Vec::new(); pub fn comptime_gen_errors() -> Vec<
 pub fn process_gen(program: Program) -> Program {
     var prog: Program = program;
     g_ct_gen_errors = Vec::new();
+    // A fresh fuel budget and call stack for this pass's evaluations
+    // (substitute, which runs later, resets both again).
+    g_ct_steps = 0;
+    g_ct_call_stack = Vec::new();
+    g_ct_line = 0;
+    g_ct_subst_line = 0;
+    var fbg: str = p_getenv("FID_CT_FALLBACK");
+    g_ct_fallback = str_len(fbg) > 0 && (fbg as i64) != 0;
 
     // First, substitute comptime expressions inside comptime gen blocks
     var errs: Vec<str> = Vec::new();
@@ -697,7 +858,7 @@ fn process_comptime_gen_in_func(funcs: & mut Vec<Func>, idx: i64, original: & Pr
                         }
                     }
                     ResultExpr::Err(msg) => {
-                        errs.push("comptime gen error: " + msg);
+                        errs.push("comptime gen error: " + msg + ct_trace());
                     }
                 }
             }
@@ -1237,7 +1398,15 @@ fn ct_pure_call(name: str, a: Vec<Expr>) -> ResultExpr {
     }
     if name == "str_repeat" {
         if ct_sig(a, "si") {
-            return ResultExpr::Ok(Expr::StringLit(str_repeat(ct_str(a.get(0)), ct_int(a.get(1)))));
+            // A repeat that builds a huge string at compile time is bounded
+            // (16 MB), as a loop is by fuel: the compiler must not die of a
+            // comptime string.
+            var rep_n: i64 = ct_int(a.get(1));
+            var rep_len: i64 = str_len(ct_str(a.get(0)));
+            if rep_n < 0 || (rep_len > 0 && rep_n > 16777216 / rep_len) {
+                return ResultExpr::Err("comptime str_repeat: " + int_to_str(rep_n) + " x " + int_to_str(rep_len) + " bytes is more than the 16 MB comptime strings allow");
+            }
+            return ResultExpr::Ok(Expr::StringLit(str_repeat(ct_str(a.get(0)), rep_n)));
         }
         return bad;
     }
@@ -1384,6 +1553,16 @@ fn parse_generated_code(source: str) -> OptProgram {
 pub fn substitute(program: Program) -> Program {
     var prog: Program = program;
     var errs: Vec<str> = Vec::new();
+    // Safety pass state: a fresh fuel budget, a fresh fatal-error list, and
+    // the fallback kill switch (FID_CT_FALLBACK=1: warn and run at runtime,
+    // as before the hardening).
+    g_ct_steps = 0;
+    g_ct_subst_errors = Vec::new();
+    g_ct_call_stack = Vec::new();
+    g_ct_line = 0;
+    g_ct_subst_line = 0;
+    var fb_env: str = p_getenv("FID_CT_FALLBACK");
+    g_ct_fallback = str_len(fb_env) > 0 && (fb_env as i64) != 0;
     // Compile time (CS4): a function with no node a phase rewrites is left
     // as it is, not rebuilt 13 times. A function without comptime nodes gets
     // none from substitution, and one without phase 3's patterns (an `if`
@@ -1841,6 +2020,8 @@ fn substitute_stmts(stmts: & mut Vec<Stmt>, original: & Program, errs: & mut Vec
 }
 
 fn substitute_stmt(stmt: & mut Stmt, original: & Program, errs: & mut Vec<str>) {
+    // Where this statement sits, for the error of a comptime it holds
+    g_ct_subst_line = ct_stmt_line(* stmt);
     // A match binding is a copy of the payload: substitute into the copy,
     // then rebuild the statement so the result is kept.
     match stmt {
@@ -2146,6 +2327,17 @@ var g_ct_splice_depth: i64 = 0;
 /// The caller stores the result (`* expr = ct_expand_splice(..)`): the new
 /// expression is handed over whole, never stored through a reference while
 /// the old one's parts are still bound.
+/// A splice error: process_gen's walk reports it through its own (fatal)
+/// error list; the same expansion on substitute's walk reaches this
+/// helper with g_ct_splice_only false, and then the fatal list of
+/// substitute carries it too (its own errs are dropped there).
+fn ct_fatal_splice(errs: & mut Vec<str>, msg: str) {
+    errs.push(msg);
+    if !g_ct_splice_only {
+        ct_fatal_push(msg + ct_trace());
+    }
+}
+
 fn ct_expand_splice(args: Vec<Expr>, original: & Program, errs: & mut Vec<str>) -> Expr {
     var line: i64 = 0;
     match args.get(1) {
@@ -2162,12 +2354,12 @@ fn ct_expand_splice(args: Vec<Expr>, original: & Program, errs: & mut Vec<str>) 
             block = b;
         }
         _ => {
-            errs.push(at + "a splice is `comptime splice { ... }`, a block that returns the expression's text");
+            ct_fatal_splice(errs, at + "a splice is `comptime splice { ... }`, a block that returns the expression's text");
             return Expr::IntLit(0);
         }
     }
     if g_ct_splice_depth >= 16 {
-        errs.push(at + "splices generate splices more than 16 deep");
+        ct_fatal_splice(errs, at + "splices generate splices more than 16 deep");
         return Expr::IntLit(0);
     }
     var src: str = "";
@@ -2178,13 +2370,13 @@ fn ct_expand_splice(args: Vec<Expr>, original: & Program, errs: & mut Vec<str>) 
                     src = s;
                 }
                 _ => {
-                    errs.push(at + "the block must return the source text of an expression, as a string");
+                    ct_fatal_splice(errs, at + "the block must return the source text of an expression, as a string");
                     return Expr::IntLit(0);
                 }
             }
         }
         ResultExpr::Err(msg) => {
-            errs.push(at + msg);
+            ct_fatal_splice(errs, at + msg + ct_trace());
             return Expr::IntLit(0);
         }
     }
@@ -2211,7 +2403,7 @@ fn ct_expand_splice(args: Vec<Expr>, original: & Program, errs: & mut Vec<str>) 
             return out;
         }
         ParseResultExpr::Err(m) => {
-            errs.push(at + "the generated text `" + src + "` is not one expression: " + m);
+            ct_fatal_splice(errs, at + "the generated text `" + src + "` is not one expression: " + m);
         }
     }
     return Expr::IntLit(0);
@@ -2285,18 +2477,30 @@ fn ct_expand_splices(program: Program, errs: & mut Vec<str>) -> Program {
 fn substitute_expr_comptime(expr: & mut Expr, inner: Box<Expr>, original: & Program, errs: & mut Vec<str>) {
     var e: Expr = ct_box_expr_unbox(inner);
     substitute_expr(& mut e, original, errs);
-    // Now evaluate the comptime expression
+    // Now evaluate the comptime expression (the call stack and line are
+    // fresh: any frames left are from an error already reported)
+    g_ct_call_stack = Vec::new();
+    g_ct_line = 0;
     var result: ResultExpr = evaluate(& e, original);
     match result {
         ResultExpr::Ok(v) => {
             * expr = ct_materialize(v);
         }
         ResultExpr::Err(msg) => {
-            errs.push("comptime error: " + msg);
-            // CD8: I/O in comptime is a type error (typechecker.fd
-            // TypeChecker_check_comptime_call), not code moved to run time
-            if !ct_io_message(msg) {
-                ct_warn(msg);
+            var full: str = "comptime error" + ct_at(g_ct_subst_line) + ": " + msg + ct_trace();
+            errs.push(full);
+            // Fatal unless the kill switch is on. CD8: I/O in comptime is a
+            // type error (typechecker.fd TypeChecker_check_comptime_call),
+            // not code moved to run time; in fallback mode its warning is
+            // suppressed (the typechecker already errors), in fatal mode it
+            // is always fatal (an I/O call hidden behind a plain function
+            // is one the typechecker cannot see).
+            if g_ct_fallback {
+                if !ct_io_message(msg) {
+                    ct_warn(msg);
+                }
+            } else {
+                ct_fatal_push(full);
             }
         }
     }
@@ -2304,17 +2508,22 @@ fn substitute_expr_comptime(expr: & mut Expr, inner: Box<Expr>, original: & Prog
 
 fn substitute_expr_comptime_block(expr: & mut Expr, stmts: & mut Vec<Stmt>, original: & Program, errs: & mut Vec<str>) {
     substitute_stmts(stmts, original, errs);
+    g_ct_call_stack = Vec::new();
+    g_ct_line = 0;
     var result: ResultExpr = evaluate_block(stmts, original);
     match result {
         ResultExpr::Ok(v) => {
             * expr = ct_materialize(v);
         }
         ResultExpr::Err(msg) => {
-            errs.push("comptime error: " + msg);
-            // CD8: I/O in comptime is a type error (typechecker.fd
-            // TypeChecker_check_comptime_call), not code moved to run time
-            if !ct_io_message(msg) {
-                ct_warn(msg);
+            var full: str = "comptime error" + ct_at(g_ct_subst_line) + ": " + msg + ct_trace();
+            errs.push(full);
+            if g_ct_fallback {
+                if !ct_io_message(msg) {
+                    ct_warn(msg);
+                }
+            } else {
+                ct_fatal_push(full);
             }
         }
     }
@@ -2327,7 +2536,12 @@ fn substitute_expr_comptime_reflect(expr: & mut Expr, op: ReflectOp, ty: Type, o
             * expr = v;
         }
         ResultExpr::Err(msg) => {
-            errs.push("comptime error: " + msg);
+            // A reflect error was silent before (the node lowered to 0);
+            // there is no runtime fallback for reflection, so it is fatal
+            // in fallback mode too.
+            var full: str = "comptime error" + ct_at(g_ct_subst_line) + ": " + msg;
+            errs.push(full);
+            ct_fatal_push(full);
         }
     }
 }
@@ -2960,8 +3174,45 @@ fn replace_ident_in_expr(expr: & mut Expr, name: str, replacement: Expr) {
 
 // --- Evuation ----------------------------------------------------------
 
+/// Index in `original.consts` of const `name`, or -1.
+fn ct_find_const(original: & Program, name: str) -> i64 {
+    var ci: i64 = 0;
+    while ci < original.consts.len() {
+        if original.consts.get(ci).name == name {
+            return ci;
+        }
+        ci = ci + 1;
+    }
+    return 0 - 1;
+}
+
+/// The value of const `original.consts[idx]` (its initializer evaluated);
+/// a const is comptime-known, so `comptime CONST + 1` computes. Nested
+/// consts (`const A = B + 1`) recurse through here, bounded by the same
+/// call-depth guard as comptime fn calls.
+fn ct_const_value(idx: i64, original: & Program) -> ResultExpr {
+    if g_ct_call_depth >= 400 {
+        return ResultExpr::Err("comptime consts nest deeper than 400 (through '" + original.consts.get(idx).name + "')");
+    }
+    g_ct_call_depth = g_ct_call_depth + 1;
+    var ie: Expr = original.consts.get(idx).expr;
+    val cres: ResultExpr = evaluate(& ie, original);
+    g_ct_call_depth = g_ct_call_depth - 1;
+    return cres;
+}
+
 fn evaluate(expr: & Expr, original: & Program) -> ResultExpr {
+    if !ct_fuel_left() {
+        return ct_out_of_fuel();
+    }
     match expr {
+        Expr::Ident(name) => {
+            var ci: i64 = ct_find_const(original, name);
+            if ci >= 0 {
+                return ct_const_value(ci, original);
+            }
+            return ResultExpr::Err("'" + name + "' is not known at compile time (a variable of the running program)");
+        }
         Expr::IntLit(n) => {
             return ResultExpr::Ok(Expr::IntLit(n));
         }
@@ -3152,6 +3403,10 @@ fn evaluate_block_rt(stmts: Vec<Stmt>, original: & Program, env: & mut ComptimeE
     var si: i64 = 0;
     while si < stmts.len() {
         var stmt: Stmt = stmts.get(si);
+        if !ct_fuel_left() {
+            return ct_out_of_fuel();
+        }
+        g_ct_line = ct_stmt_line(stmt);
         match stmt {
             Stmt::Let(name, _, expr, _, _, _, _) => {
                 var vr: ResultExpr = evaluate_with_env(expr, & local_env, original);
@@ -3544,6 +3799,9 @@ fn ce_write_back(env: & mut ComptimeEnv, local: & ComptimeEnv, n_outer: i64) {
 
 
 fn evaluate_with_env(expr: & Expr, env: & ComptimeEnv, original: & Program) -> ResultExpr {
+    if !ct_fuel_left() {
+        return ct_out_of_fuel();
+    }
     match expr {
         Expr::Ident(name) => {
             var v: OptExpr = ComptimeEnv_get(env, name);
@@ -3552,6 +3810,11 @@ fn evaluate_with_env(expr: & Expr, env: & ComptimeEnv, original: & Program) -> R
                     return ResultExpr::Ok(v);
                 }
                 OptExpr::None => {
+                    // Not a local: a const of the program is comptime-known
+                    var ci: i64 = ct_find_const(original, name);
+                    if ci >= 0 {
+                        return ct_const_value(ci, original);
+                    }
                     return ResultExpr::Err("undefined variable '" + name + "' in comptime");
                 }
             }
@@ -3924,9 +4187,23 @@ fn call_comptime_func(func: Func, args: Vec<Expr>, original: & Program) -> Resul
     if g_ct_call_depth >= 400 {
         return ResultExpr::Err("comptime calls nest deeper than 400 (through '" + func.name + "')");
     }
+    if !ct_fuel_left() {
+        return ct_out_of_fuel();
+    }
     g_ct_call_depth = g_ct_call_depth + 1;
+    g_ct_call_stack.push("in comptime fn '" + func.name + "' (defined at line " + int_to_str(func.line) + ")");
     val cres: ResultExpr = evaluate_block_rt(func.body, original, & mut env, & mut returned);
     g_ct_call_depth = g_ct_call_depth - 1;
+    // The frame is popped only on success: on an error it stays, so the
+    // trace of the boundary error shows the whole failing chain (the
+    // boundary clears the stack before the next evaluation).
+    match cres {
+        ResultExpr::Ok(_) => {
+            g_ct_call_stack.pop();
+        }
+        ResultExpr::Err(_) => {
+        }
+    }
     return cres;
 }
 
@@ -3980,30 +4257,108 @@ fn ce_assign(env: & ComptimeEnv, target: str, op: AssignOp, v: Expr) -> ResultEx
 
 // --- Binary/unary operation evuation -----------------------------------
 
+// Checked comptime arithmetic: overflow is an error with the operands in
+// the message, never a silently wrapped value -- a table computed wrong is
+// worse than a failed build. What does not fit i64 does not compute (the
+// one exception kept is i64::MIN itself, from -2^63 or MIN * 1; a product
+// of exactly 2^63 from other factors is rejected too).
+fn ct_ovf(expr: str) -> ResultExpr {
+    return ResultExpr::Err("comptime arithmetic overflow: " + expr + " does not fit in i64");
+}
+
+fn ct_add_checked(a: i64, b: i64) -> ResultExpr {
+    var lim: i64 = 9223372036854775807;
+    if b > 0 && a > lim - b {
+        return ct_ovf(int_to_str(a) + " + " + int_to_str(b));
+    }
+    if b < 0 && a < (0 - lim - 1) - b {
+        return ct_ovf(int_to_str(a) + " + " + int_to_str(b));
+    }
+    return ResultExpr::Ok(Expr::IntLit(a + b));
+}
+
+fn ct_sub_checked(a: i64, b: i64) -> ResultExpr {
+    var lim: i64 = 9223372036854775807;
+    if b < 0 && a > lim + b {
+        return ct_ovf(int_to_str(a) + " - " + int_to_str(b));
+    }
+    if b > 0 && a < (0 - lim - 1) + b {
+        return ct_ovf(int_to_str(a) + " - " + int_to_str(b));
+    }
+    return ResultExpr::Ok(Expr::IntLit(a - b));
+}
+
+fn ct_mul_checked(a: i64, b: i64) -> ResultExpr {
+    var lim: i64 = 9223372036854775807;
+    var min: i64 = 0 - lim - 1;
+    if a == 0 || b == 0 {
+        return ResultExpr::Ok(Expr::IntLit(0));
+    }
+    if a == min || b == min {
+        if a == min && b == 1 {
+            return ResultExpr::Ok(Expr::IntLit(min));
+        }
+        if b == min && a == 1 {
+            return ResultExpr::Ok(Expr::IntLit(min));
+        }
+        return ct_ovf(int_to_str(a) + " * " + int_to_str(b));
+    }
+    var ua: i64 = a;
+    if ua < 0 {
+        ua = 0 - ua;
+    }
+    var ub: i64 = b;
+    if ub < 0 {
+        ub = 0 - ub;
+    }
+    if ua > lim / ub {
+        return ct_ovf(int_to_str(a) + " * " + int_to_str(b));
+    }
+    return ResultExpr::Ok(Expr::IntLit(a * b));
+}
+
+/// The comptime shift rules: the amount must be 0..63, and a left shift
+/// that drops bits (or the sign) is an overflow.
+fn ct_shift_amount(b: i64) -> ResultExpr {
+    if b < 0 || b > 63 {
+        return ResultExpr::Err("comptime shift by " + int_to_str(b) + ": the amount must be 0..63");
+    }
+    return ResultExpr::Ok(Expr::IntLit(0));
+}
+
 fn eval_binop(op: BinOp, l: Expr, r: Expr) -> ResultExpr {
+    if !ct_fuel_left() {
+        return ct_out_of_fuel();
+    }
     match l {
         Expr::IntLit(a) => {
             match r {
                 Expr::IntLit(b) => {
                     match op {
                         BinOp::Add => {
-                            return ResultExpr::Ok(Expr::IntLit(a + b));
+                            return ct_add_checked(a, b);
                         }
                         BinOp::Sub => {
-                            return ResultExpr::Ok(Expr::IntLit(a - b));
+                            return ct_sub_checked(a, b);
                         }
                         BinOp::Mul => {
-                            return ResultExpr::Ok(Expr::IntLit(a * b));
+                            return ct_mul_checked(a, b);
                         }
                         BinOp::Div => {
                             if b == 0 {
                                 return ResultExpr::Err("division by zero in comptime");
+                            }
+                            if a == (0 - 9223372036854775807 - 1) && b == (0 - 1) {
+                                return ct_ovf(int_to_str(a) + " / " + int_to_str(b));
                             }
                             return ResultExpr::Ok(Expr::IntLit(a / b));
                         }
                         BinOp::Mod => {
                             if b == 0 {
                                 return ResultExpr::Err("modulo by zero in comptime");
+                            }
+                            if a == (0 - 9223372036854775807 - 1) && b == (0 - 1) {
+                                return ResultExpr::Ok(Expr::IntLit(0));
                             }
                             return ResultExpr::Ok(Expr::IntLit(a % b));
                         }
@@ -4041,9 +4396,27 @@ fn eval_binop(op: BinOp, l: Expr, r: Expr) -> ResultExpr {
                             return ResultExpr::Ok(Expr::IntLit(a ^ b));
                         }
                         BinOp::Shl => {
-                            return ResultExpr::Ok(Expr::IntLit(a << b));
+                            match ct_shift_amount(b) {
+                                ResultExpr::Err(sm) => {
+                                    return ResultExpr::Err(sm);
+                                }
+                                ResultExpr::Ok(_) => {
+                                }
+                            }
+                            var sh: i64 = a << b;
+                            if (sh >> b) != a {
+                                return ct_ovf(int_to_str(a) + " << " + int_to_str(b) + " (bits shifted out)");
+                            }
+                            return ResultExpr::Ok(Expr::IntLit(sh));
                         }
                         BinOp::Shr => {
+                            match ct_shift_amount(b) {
+                                ResultExpr::Err(sm) => {
+                                    return ResultExpr::Err(sm);
+                                }
+                                ResultExpr::Ok(_) => {
+                                }
+                            }
                             return ResultExpr::Ok(Expr::IntLit(a >> b));
                         }
                     }
@@ -4158,7 +4531,10 @@ fn eval_unaryop(op: UnaryOp, v: Expr) -> ResultExpr {
         UnaryOp::Neg => {
             match v {
                 Expr::IntLit(n) => {
-                    return ResultExpr::Ok(Expr::IntLit(- n));
+                    if n == (0 - 9223372036854775807 - 1) {
+                        return ct_ovf("- " + int_to_str(n));
+                    }
+                    return ResultExpr::Ok(Expr::IntLit(0 - n));
                 }
                 Expr::FloatLit(f) => {
                     return ResultExpr::Ok(Expr::FloatLit(- f));
@@ -4211,135 +4587,85 @@ fn ce_find_struct(original: & Program, name: str) -> i64 {
     return 0 - 1;
 }
 
-fn ce_has_annotation(anns: Vec<Annotation>, name: str, arg: str) -> bool {
-    var i: i64 = 0;
-    while i < anns.len() {
-        var a: Annotation = anns.get(i);
-        if a.name == name {
-            if arg == "" {
-                return true;
-            }
-            var j: i64 = 0;
-            while j < a.args.len() {
-                if a.args.get(j) == arg {
-                    return true;
-                }
-                j = j + 1;
-            }
-        }
-        i = i + 1;
-    }
-    return false;
-}
+// --- Layout through the lowerer (one code path) ----------------------------
+// struct_size and field_offset must report what the program's own struct
+// gets, so they are computed by the lowerer's layout code itself: a
+// throwaway Lowerer holds every struct and enum of the program (laid out to
+// a fixpoint, as Lowerer_lower_program does), and the query reads it. The
+// evaluator's own copy of the layout rules is gone: two copies agreed only
+// while both were edited in step.
 
-/// Bytes a field of type `ty` takes with the default struct layout (see
-/// the lowerer): one 8-byte slot, except an inline struct (its whole
-/// layout) and an enum with payloads ((1 + largest payload) slots).
-fn ce_slot_size(ty: Type, original: & Program, depth: i64) -> i64 {
-    match ty {
-        Type::Named(n) => {
-            var si: i64 = ce_find_struct(original, n);
-            if si >= 0 && depth < 32 {
-                return ce_struct_layout(original.structs.get(si), original, depth + 1, "");
+/// A Lowerer with every struct and enum of `original` laid out, for
+/// struct_size / field_offset.
+fn ce_layout_lowerer(original: & Program) -> Lowerer {
+    var lw: Lowerer = Lowerer_new();
+    lw.enums = original.enums;
+    var ei: i64 = 0;
+    while ei < original.enums.len() {
+        HashMap_insert(lw.enum_index, original.enums.get(ei).name, ei + 1);
+        ei = ei + 1;
+    }
+    var ai: i64 = 0;
+    while ai < original.type_aliases.len() {
+        var ta: TypeAlias = original.type_aliases.get(ai);
+        lw.type_aliases.push(StringTypeEntry_new(ta.name, ta.alias_for));
+        ai = ai + 1;
+    }
+    // Layouts to a fixpoint: a struct whose field is a struct declared
+    // later needs that one's size (Lowerer_lower_program does the same).
+    var rounds: i64 = 0;
+    var changed: bool = true;
+    while changed && rounds < 8 {
+        changed = false;
+        rounds = rounds + 1;
+        var si: i64 = 0;
+        while si < original.structs.len() {
+            var s: StructDef = original.structs.get(si);
+            var old_size: i64 = 0;
+            match IrModule_get_struct(& lw.module, s.name) {
+                OptStructLayout::Some(ol) => {
+                    old_size = ol.size;
+                }
+                OptStructLayout::None => {
+                }
             }
-            var ei: i64 = 0;
-            while ei < original.enums.len() {
-                var e: EnumDef = original.enums.get(ei);
-                if e.name == n {
-                    var payload: i64 = 0;
-                    var vi: i64 = 0;
-                    while vi < e.variants.len() {
-                        match e.variants.get(vi).data {
-                            OptParams::Some(d) => {
-                                if d.len() > payload {
-                                    payload = d.len();
-                                }
-                            }
-                            OptParams::None => {
-                            }
-                        }
-                        vi = vi + 1;
+            Lowerer_compute_struct_layout(& mut lw, s);
+            match IrModule_get_struct(& lw.module, s.name) {
+                OptStructLayout::Some(nl) => {
+                    if nl.size != old_size {
+                        changed = true;
                     }
-                    if payload > 0 {
-                        return (1 + payload) * 8;
+                }
+                OptStructLayout::None => {
+                }
+            }
+            si = si + 1;
+        }
+        var ej: i64 = 0;
+        while ej < original.enums.len() {
+            var en: EnumDef = original.enums.get(ej);
+            var old_esize: i64 = 0;
+            match IrModule_get_struct(& lw.module, en.name) {
+                OptStructLayout::Some(oel) => {
+                    old_esize = oel.size;
+                }
+                OptStructLayout::None => {
+                }
+            }
+            Lowerer_compute_enum_layout(& mut lw, en);
+            match IrModule_get_struct(& lw.module, en.name) {
+                OptStructLayout::Some(nel) => {
+                    if nel.size != old_esize {
+                        changed = true;
                     }
-                    return 8;
                 }
-                ei = ei + 1;
-            }
-        }
-        _ => {
-        }
-    }
-    return 8;
-}
-
-/// With `field` empty: the struct's size. Otherwise the offset of `field`
-/// (-1 if absent). @repr(C) and @packed use natural sizes, the default
-/// layout 8-byte slots, as the lowerer does.
-fn ce_struct_layout(s: StructDef, original: & Program, depth: i64, field: str) -> i64 {
-    var c_layout: bool = ce_has_annotation(s.annotations, "repr", "C");
-    var packed: bool = ce_has_annotation(s.annotations, "packed", "");
-    var natural: bool = c_layout || packed;
-    var offset: i64 = 0;
-    var max_align: i64 = 8;
-    if natural {
-        max_align = 1;
-    }
-    var i: i64 = 0;
-    while i < s.fields.len() {
-        var f: Param = s.fields.get(i);
-        var size: i64 = 8;
-        if natural {
-            match f.ty {
-                Type::I8 => {
-                    size = 1;
-                }
-                Type::U8 => {
-                    size = 1;
-                }
-                Type::Bool => {
-                    size = 1;
-                }
-                Type::I16 => {
-                    size = 2;
-                }
-                Type::U16 => {
-                    size = 2;
-                }
-                Type::I32 => {
-                    size = 4;
-                }
-                Type::U32 => {
-                    size = 4;
-                }
-                Type::F32 => {
-                    size = 4;
-                }
-                _ => {
+                OptStructLayout::None => {
                 }
             }
-            var align: i64 = size;
-            if packed {
-                align = 1;
-            }
-            offset = (offset + align - 1) / align * align;
-            if align > max_align {
-                max_align = align;
-            }
-        } else {
-            size = ce_slot_size(f.ty, original, depth);
+            ej = ej + 1;
         }
-        if field != "" && f.name == field {
-            return offset;
-        }
-        offset = offset + size;
-        i = i + 1;
     }
-    if field != "" {
-        return 0 - 1;
-    }
-    return (offset + max_align - 1) / max_align * max_align;
+    return lw;
 }
 
 fn ce_str_array(items: Vec<str>) -> Expr {
@@ -4586,7 +4912,15 @@ fn evaluate_reflect(op: ReflectOp, ty: Type, original: & Program) -> ResultExpr 
             if ssi < 0 {
                 return ResultExpr::Err("struct_size: '" + type_name + "' is not a struct");
             }
-            return ResultExpr::Ok(Expr::IntLit(ce_struct_layout(original.structs.get(ssi), original, 0, "")));
+            var lw: Lowerer = ce_layout_lowerer(original);
+            match IrModule_get_struct(& lw.module, type_name) {
+                OptStructLayout::Some(l) => {
+                    return ResultExpr::Ok(Expr::IntLit(l.size));
+                }
+                OptStructLayout::None => {
+                    return ResultExpr::Err("struct_size: '" + type_name + "' could not be laid out");
+                }
+            }
         }
         ReflectOp::FieldOffset => {
             var dot: i64 = str_find(type_name, ".");
@@ -4599,11 +4933,22 @@ fn evaluate_reflect(op: ReflectOp, ty: Type, original: & Program) -> ResultExpr 
             if osi < 0 {
                 return ResultExpr::Err("field_offset: '" + owner + "' is not a struct");
             }
-            var off: i64 = ce_struct_layout(original.structs.get(osi), original, 0, field);
-            if off < 0 {
-                return ResultExpr::Err("field_offset: struct '" + owner + "' has no field '" + field + "'");
+            var lw: Lowerer = ce_layout_lowerer(original);
+            match IrModule_get_struct(& lw.module, owner) {
+                OptStructLayout::Some(l) => {
+                    var fi: i64 = 0;
+                    while fi < l.fields.len() {
+                        if l.fields.get(fi).name == field {
+                            return ResultExpr::Ok(Expr::IntLit(l.fields.get(fi).offset));
+                        }
+                        fi = fi + 1;
+                    }
+                    return ResultExpr::Err("field_offset: struct '" + owner + "' has no field '" + field + "'");
+                }
+                OptStructLayout::None => {
+                    return ResultExpr::Err("field_offset: '" + owner + "' could not be laid out");
+                }
             }
-            return ResultExpr::Ok(Expr::IntLit(off));
         }
         ReflectOp::EnumDiscriminant => {
             var dot2: i64 = str_find(type_name, ".");

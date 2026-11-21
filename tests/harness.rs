@@ -22,6 +22,12 @@ fn is_skip_test(name: &str) -> bool {
         | "test_comptime_reflect.fd"
         | "test_comptime_serialize.fd"
         | "test_comptime_gen.fd"
+        // fid only (OP28): the frozen Rust evaluator runs none of the
+        // statements of a comptime Vec table or a comptime fn with loops
+        // (`var`/`while` silently evaluate to 0, LF22)
+        | "test_comptime_table.fd"
+        | "test_comptime_pure.fd"
+        | "test_comptime_parser.fd"
         | "test_http.fd"
         | "test_json.fd"
         | "test_tensor.fd"

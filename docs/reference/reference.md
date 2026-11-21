@@ -221,7 +221,13 @@ effects    = "!" name | "!" "{" [name {"," name}] "}"
   one, a parameter without a default left out, and a named argument of the
   wrong type are errors (`test_frontend_named_args.fd` and three `_fail`
   tests). Named arguments to methods are not checked.
-- `...name` (variadic) is parsed and ignored: not implemented.
+- `...name: T` (variadic, last parameter). With a concrete type (`...ns: i64`)
+  the extra arguments are packed into a `Vec<i64>`; with a type parameter
+  that types nothing else it is a pack, each argument with its own type,
+  read only as `xs.len()`, `xs.get(K)` with a literal `K`, `for x in xs` or
+  passed on whole (`mono.fd:mono_desugar_variadics`, before type checking;
+  [variadic-packs.md](variadic-packs.md), `test_variadic_args.fd`,
+  `test_variadic_pack.fd`).
 - `given e` is a precondition. A call whose arguments are constants and make
   `e` false is a compile error (`TypeChecker_verify_contracts`,
   `test_contracts_fail.fd`); there is no run-time check. `ensure e` is parsed and
@@ -746,6 +752,21 @@ fn make_adder(n: i64) -> fn(i64) -> i64 {
 
 - `comptime e` and `comptime { stmts }` are evaluated while compiling
   (`compiler/comptime_eval.fd`).
+- A `comptime` that cannot be evaluated is a compile error; it does not
+  silently run when the program does (`s4_11_fatal_not_runtime.fd`).
+  `FID_CT_FALLBACK=1` restores the old warn-and-run-at-runtime behavior
+  (docs/verification/kill-switches.md).
+- Comptime arithmetic is checked: overflow, a shift amount outside 0..63, a
+  left shift that drops bits and division/modulo corner overflow are errors
+  with the operands in the message, never silently wrapped values
+  (`s4_11_arith_overflow_rejected.fd`, `s4_11_shift_amount_rejected.fd`).
+- A comptime error names the statement it failed on and the chain of
+  comptime calls that produced it (`s4_11_error_trace_names_fn.fd`).
+- Evaluation has a fuel budget (100 million steps by default, `FID_CT_FUEL`
+  to change): a comptime that would run away is an error, never a hang of
+  the compiler (`s4_11_fuel_budget_error.fd`).
+- A const is comptime-known: `comptime` resolves a const's name to its
+  initializer's value (`s4_11_const_computes.fd`).
 - `comptime fn` marks a function for compile-time calls; a call with literal
   arguments is evaluated at compile time.
 - `comptime gen { … }` (statement) generates code (`test_comptime_gen.fd`):
@@ -1468,7 +1489,8 @@ Every annotation name is checked: a name not in the table below is an error
 | `@dp(epsilon=E)` | fn | Requires the `Noise` effect, a positive epsilon, and callees whose total epsilon is at most `E` | `typechecker.fd:TypeChecker_verify_dp` |
 | `@shard` | fn | Requires the `Comm` effect | `typechecker.fd:TypeChecker_verify_shard` |
 | `@adapter` | fn | Requires at least one parameter | `typechecker.fd:TypeChecker_verify_adapter` |
-| `@tainted` | param | The function with the parameter may have no `IO` or `Net` effect (on a function the name check reports it as misplaced) | `typechecker.fd:TypeChecker_verify_tainted` |
+| `@tainted` | param | The parameter's value may not reach a sink (output, files, the network, processes, SQL/shell/HTML builders, a `@sink` function), also inside a callee, unless a sanitizer (a `@sanitizer` function, or `sql_escape`, `html_escape`, ...) cleans it first (`test_taint_flow*.fd`); on a function the name check reports it as misplaced | `typechecker.fd:TypeChecker_verify_tainted`, `tf_call` |
+| `@sink`, `@sanitizer` | fn | A sink, and a function whose result is clean, for the `@tainted` check | `typechecker.fd:tf_call` |
 | `@secret`, `@sensitive` | fn, param, local | The value may not reach an output, log, file, network, global, spawn or call through a function value; a `@secret` function's result is secret | `secrecy.fd:sec_analyze_func` |
 | `@declassify` | fn | An audited release: the function may return, or write through reference parameters, secret or sensitive values, and its result is not secret | `secrecy.fd:sec_analyze_func`, `sec_ret` |
 | `@zeroize` | local | The variable (and the bytes of a `str` or `Vec` it holds) is overwritten with zeros at function exit | `lower.fd:Lowerer_lower_let_stmt`, `Lowerer_emit_zeroize` |
@@ -1486,7 +1508,8 @@ Every annotation name is checked: a name not in the table below is an error
 | `@packed` | struct | Fields with no padding | `lower.fd:Lowerer_make_struct_layout` |
 | `@derive(…)` | struct | Generates `S_debug_str` (Debug), `S_clone` (Clone), `S_to_json` (Serialize), `S_default` (Default), `S_from_json` and `S_from_json_error` (Deserialize: each field read from its key; the error names a missing key or a wrong type), `S_equals` (PartialEq, Eq) | `compiler.fd:process_derive` |
 | `@cfg(…)` | fn, struct | §12 | `compiler.fd:apply_cfg_filter`, `check_cfg` |
-| `@test`, `@bounded`, `@sanitizer`, `@sink`, `@panic_handler`, `@cpu_local` | various | Accepted by the name check; no pass reads them: not implemented. `@cpu_local` is valid only on globals, which cannot carry annotations. | `typechecker.fd:annotation_target_mask` |
+| `@panic_handler` | fn | In a bare-metal (`emit --bare`) or UEFI (`emit --uefi`) image, the function a panic or a failed check calls; elsewhere not read | `main.fd:cmd_build` (`pe_ir_generate_flat`, `pe_ir_generate_uefi`) |
+| `@test`, `@bounded`, `@cpu_local` | various | Accepted by the name check; no pass reads them: not implemented. `@cpu_local` is valid only on globals, which cannot carry annotations. | `typechecker.fd:annotation_target_mask` |
 
 A function with any of the safety primitives (`no-alloc`, `no-recursion`,
 `no-unbounded`, `no-indirect`, `no-panic`, `requires-audit`, `bounded-stack`,
