@@ -26,7 +26,9 @@ RELEASE=1 CC="zig cc" ./scripts/bootstrap.sh
 #   Stage 0: release/stage0/fid(.exe) pinned by scripts/stage0.sha256, else
 #   fidesc; STAGE0=<exe> overrides. Neither pin file exists (Nov 21), and
 #   from fidesc stage 2 runs out of memory (known-bugs 2g.79, roadmap CB8):
-#   pass STAGE0=<a self-hosted fid>.
+#   pass STAGE0=<a self-hosted fid>. Nov 21 evening: statement
+#   temporaries are dropped in src/lower.rs too (Vec/HashMap/str
+#   fresh-call temps); the wall is not re-measured yet.
 .\release\fid.exe run      tests/bootstrap/hello.fd
 .\release\fid.exe ccompile tests/bootstrap/hello.fd -o hello.exe  # needs a C compiler
 

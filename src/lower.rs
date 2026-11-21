@@ -9025,12 +9025,83 @@ fn auto_drop_vecs(module: &mut IrModule) {
     }
 }
 
+/// Fresh producers a statement may own, to their drop: a new Vec or map
+/// header (and `HashMap_keys`' result Vec). A `HashMap_get`/`Vec_get`
+/// result is not listed: whether the element is an owner is the
+/// consumer's business, and a missed temporary only leaks.
+fn temp_drop_fn(f: &IrFunction, id: &ValueId) -> Option<&'static str> {
+    match f.instructions.get(id) {
+        Some(Inst::Call { func, .. }) => match func.as_str() {
+            "Vec_new" | "Vec_share" | "Vec_share_deep" | "HashMap_keys" => Some("Vec_drop"),
+            "HashMap_new" | "HashMap_share" => Some("HashMap_drop"),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Whether `inst` may end a statement that owns a temporary: it reads the
+/// value through its handle and keeps no reference to it (VEC_LOCAL_CALLS
+/// and the map reads), or prints it. A user outside this set — a Store,
+/// an arbitrary call — is left alone, never a dangling drop.
+fn temp_user_keeps_nothing(inst: &Inst) -> bool {
+    match inst {
+        Inst::Call { func, .. } => {
+            VEC_LOCAL_CALLS.contains(&func.as_str())
+                || matches!(
+                    func.as_str(),
+                    "Vec_to_str" | "HashMap_get" | "HashMap_insert" | "HashMap_keys" | "HashMap_share"
+                )
+        }
+        Inst::Print { .. } => true,
+        _ => false,
+    }
+}
+
 fn drop_function_vecs(f: &mut IrFunction, borrows: &VecBorrows) {
     let order: Vec<ValueId> = f.blocks.iter().flat_map(|b| b.instructions.iter().copied()).collect();
+    let mut block_of: HashMap<ValueId, usize> = HashMap::new();
+    for (b, block) in f.blocks.iter().enumerate() {
+        for id in &block.instructions {
+            block_of.insert(*id, b);
+        }
+    }
+    let mut uses: HashMap<ValueId, usize> = HashMap::new();
+    let mut user: HashMap<ValueId, ValueId> = HashMap::new();
+    for id in &order {
+        let Some(inst) = f.instructions.get(id) else { continue; };
+        let mut ops = Vec::new();
+        crate::pe::inst_operands(inst, &mut ops);
+        for op in ops {
+            *uses.entry(op).or_insert(0) += 1;
+            user.insert(op, *id);
+        }
+    }
+    // A fresh header used once by a call or print that keeps nothing, in
+    // the same block, and not already dropped by hand: a temporary of the
+    // statement (drop_function_strs does the same for strings).
+    let mut temps: HashMap<ValueId, Vec<(ValueId, &'static str)>> = HashMap::new();
+    for id in &order {
+        let Some(drop_fn) = temp_drop_fn(f, id) else { continue; };
+        if uses.get(id) != Some(&1) {
+            continue;
+        }
+        let u = user[id];
+        if block_of.get(&u) != block_of.get(id) {
+            continue;
+        }
+        let ok = f.instructions.get(&u).map_or(false, |ui| match ui {
+            Inst::Call { func, .. } if func == "Vec_drop" || func == "HashMap_drop" || func == "Str_drop" => false,
+            _ => temp_user_keeps_nothing(ui),
+        });
+        if ok {
+            temps.entry(u).or_default().push((*id, drop_fn));
+        }
+    }
     // A share makes a header the slot owns (its buffer is counted), so a
     // slot receiving one may be dropped like one holding a Vec_new.
     let is_new = |f: &IrFunction, id: &ValueId| matches!(f.instructions.get(id), Some(Inst::Call { func, .. }) if func == "Vec_new" || func == "Vec_share" || func == "Vec_share_deep");
-    if !order.iter().any(|id| is_new(f, id)) {
+    if !order.iter().any(|id| is_new(f, id)) && temps.is_empty() {
         return;
     }
     let mut slots: Vec<ValueId> = Vec::new();
@@ -9083,7 +9154,7 @@ fn drop_function_vecs(f: &mut IrFunction, borrows: &VecBorrows) {
         }
     }
     let kept: Vec<ValueId> = slots.iter().copied().filter(|s| written.contains(s) && !bad.contains(s)).collect();
-    if kept.is_empty() {
+    if kept.is_empty() && temps.is_empty() {
         return;
     }
     // The Vec a slot last held, kept apart from the slot: an Alloca in a
@@ -9120,7 +9191,14 @@ fn drop_function_vecs(f: &mut IrFunction, borrows: &VecBorrows) {
                     }
                     new.push(id);
                 }
-                _ => new.push(id),
+                _ => {
+                    new.push(id);
+                    if let Some(done) = temps.get(&id) {
+                        for (t, drop_fn) in done {
+                            drop_value(f, drop_fn, *t, &mut new);
+                        }
+                    }
+                }
             }
         }
         f.blocks[b].instructions = new;
@@ -9128,7 +9206,7 @@ fn drop_function_vecs(f: &mut IrFunction, borrows: &VecBorrows) {
 }
 
 /// Calls that return a new string, held only by their caller.
-const STR_FRESH_CALLS: &[&str] = &["p_str_concat", "int_to_str"];
+const STR_FRESH_CALLS: &[&str] = &["p_str_concat", "int_to_str", "Str_dup", "Vec_to_str"];
 /// Calls that read a string, keeping no pointer to it and returning none.
 const STR_READ_CALLS: &[&str] = &[
     "p_str_concat", "str_len", "str_byte_at", "str_equal", "str_starts_with", "str_ends_with",
