@@ -1,0 +1,82 @@
+// Benchmark port (layout suite): tree — a pointer-linked binary tree.
+// Source: the suite's tree.goose of github.com/aardappel/goose (Apache-2.0).
+// In the source suite: one grow-only pool, 12-byte nodes, self-relative u32 links, no
+// per-node allocation. The idiomatic Fid port is the index arena: a Vec of
+// nodes (tag-free struct: v + two i64 indices = 24 bytes) with -1 sentinels
+// — the community-recommended Rust shape too, and the structure proposal
+// 0008's region-stable arrays + narrow links are measured against.
+// Checksums must match the source suite at DEPTH=20: node count and the walk total.
+// Usage: fid run tree.fd [depth]   (depth defaults to 20)
+
+@wrapping fn xs_next(x: u64) -> u64 {
+    var v: u64 = x;
+    v = v ^ (v << 13);
+    v = v ^ (v >> 7);
+    v = v ^ (v << 17);
+    return v;
+}
+
+fn xs_mod(x: u64, k: i64) -> i64 {
+    return (x % (k as u64)) as i64;
+}
+
+fn bench_n(default: i64) -> i64 {
+    var n: i64 = default;
+    match arg_at(1) {
+        Option::Some(s) => {
+            val k: i64 = str_parse_int(s);
+            if k > 0 {
+                n = k;
+            }
+        }
+        Option::None => {
+        }
+    }
+    return n;
+}
+
+struct TNode {
+    v: i64,
+    l: i64,
+    r: i64,
+}
+
+var pool: Vec<TNode> = Vec::new();
+
+fn build(depth: i64, seed: u64) -> i64 {
+    if depth == 0 {
+        pool.push(TNode { v: xs_mod(seed, 1000), l: 0 - 1, r: 0 - 1 });
+        return pool.len() - 1;
+    }
+    val l: i64 = build(depth - 1, xs_next(seed));
+    val r: i64 = build(depth - 1, xs_next(seed + 1));
+    pool.push(TNode { v: xs_mod(seed, 1000), l: l, r: r });
+    return pool.len() - 1;
+}
+
+fn sum_tree(n: i64, p: i64) -> i64 {
+    val node: TNode = pool.get(n);
+    var t: i64 = node.v ^ p;
+    if node.l >= 0 {
+        t = t + sum_tree(node.l, p);
+    }
+    if node.r >= 0 {
+        t = t + sum_tree(node.r, p);
+    }
+    return t;
+}
+
+fn main() -> i64 {
+    val depth: i64 = bench_n(20);
+    val passes: i64 = 8;
+    val root: i64 = build(depth, 12345);
+    var total: i64 = 0;
+    var p: i64 = 0;
+    while p < passes {
+        total = total + sum_tree(root, p);
+        p = p + 1;
+    }
+    println(int_to_str(pool.len()));
+    println(int_to_str(total));
+    return 0;
+}

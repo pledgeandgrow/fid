@@ -1,0 +1,63 @@
+// Benchmark port (layout suite): sum — the control.
+// Source: the suite's sum.goose of github.com/aardappel/goose (Apache-2.0).
+// A flat array of scalars scanned repeatedly: nothing here plays to a
+// suite strength, so a dead heat with the C++/Rust rows of the source suite is the expected
+// result, and a gap measures our loop/codegen, not our memory model.
+// The RNG is the suite's xorshift64 (its rng.goose, matching its bench.h),
+// so the data is byte-identical and the checksum must match theirs:
+//     4000000 / <total, pass index xored per the suite>
+// Usage: fid run sum.fd [n]     (n defaults to 4000000)
+
+@wrapping fn xs_next(x: u64) -> u64 {
+    var v: u64 = x;
+    v = v ^ (v << 13);
+    v = v ^ (v >> 7);
+    v = v ^ (v << 17);
+    return v;
+}
+
+fn xs_mod(x: u64, k: i64) -> i64 {
+    return (x % (k as u64)) as i64;
+}
+
+fn bench_n(default: i64) -> i64 {
+    var n: i64 = default;
+    match arg_at(1) {
+        Option::Some(s) => {
+            val k: i64 = str_parse_int(s);
+            if k > 0 {
+                n = k;
+            }
+        }
+        Option::None => {
+        }
+    }
+    return n;
+}
+
+fn main() -> i64 {
+    val n: i64 = bench_n(4000000);
+    val passes: i64 = 8;
+    var data: Vec<i64> = Vec::new();
+    var r: u64 = 12345;
+    var i: i64 = 0;
+    while i < n {
+        r = xs_next(r);
+        data.push(xs_mod(r, 1000));
+        i = i + 1;
+    }
+    var total: i64 = 0;
+    var p: i64 = 0;
+    while p < passes {
+        var j: i64 = 0;
+        while j < data.len() {
+            // the ^ p keeps the passes from collapsing into one multiply
+            total = total + (data.get(j) ^ p);
+            j = j + 1;
+        }
+        p = p + 1;
+    }
+    println(int_to_str(data.len()));
+    println(int_to_str(total));
+    return 0;
+}

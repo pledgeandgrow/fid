@@ -1,0 +1,99 @@
+// Benchmark port (layout suite): words — word frequency over a generated text.
+// Source: the suite's words.goose of github.com/aardappel/goose (Apache-2.0).
+// On trial in the source suite: one contiguous block of variable-size strings and a
+// map whose keys are slices straight into the text (no key is copied). In
+// Fid the idiomatic port copies each word into a heap str and counts in a
+// HashMap<str, i64> — the copies and the headers are exactly the cost
+// proposal 0008 (contiguous data) is about.
+// Checksums: text bytes, word count, distinct words, and a running count
+// checksum (sum of the count after each increment) that is stable across
+// our backends. Usage: fid run words.fd [n]   (n defaults to 2000000)
+
+@wrapping fn xs_next(x: u64) -> u64 {
+    var v: u64 = x;
+    v = v ^ (v << 13);
+    v = v ^ (v >> 7);
+    v = v ^ (v << 17);
+    return v;
+}
+
+fn xs_mod(x: u64, k: i64) -> i64 {
+    return (x % (k as u64)) as i64;
+}
+
+fn bench_n(default: i64) -> i64 {
+    var n: i64 = default;
+    match arg_at(1) {
+        Option::Some(s) => {
+            val k: i64 = str_parse_int(s);
+            if k > 0 {
+                n = k;
+            }
+        }
+        Option::None => {
+        }
+    }
+    return n;
+}
+
+fn main() -> i64 {
+    val n: i64 = bench_n(2000000);
+    val maxw: i64 = 20;
+    // a vocabulary of words (Fid: heap strs; the source: fixed u8[..20] inline)
+    var dict: Vec<str> = Vec::new();
+    var r: u64 = 12345;
+    while dict.len() < n / 10 + 16 {
+        var w: Vec<i64> = Vec::new();
+        r = xs_next(r);
+        val len: i64 = 3 + xs_mod(r, 12);
+        var j: i64 = 0;
+        while j < len {
+            r = xs_next(r);
+            w.push(97 + xs_mod(r, 26));
+            j = j + 1;
+        }
+        dict.push(str_from_bytes(w));
+    }
+    // a text of n words, skewed towards the front of the vocabulary
+    var text: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        r = xs_next(r);
+        val a: i64 = xs_mod(r, dict.len());
+        val k: i64 = (a * a) / dict.len();
+        val word: str = dict.get(k);
+        var b: i64 = 0;
+        while b < str_len(word) {
+            text.push(str_byte_at(word, b));
+            b = b + 1;
+        }
+        text.push(32);
+        i = i + 1;
+    }
+    val text_str: str = str_from_bytes(text);
+    // split into words (each a copied heap str here) and count
+    var words: Vec<str> = str_split(text_str, " ");
+    var counts: HashMap<str, i64> = HashMap::new();
+    var distinct: i64 = 0;
+    var checksum: i64 = 0;
+    var wi: i64 = 0;
+    while wi < words.len() {
+        val w2: str = words.get(wi);
+        if str_len(w2) > 0 {
+            val cur: i64 = counts.get(w2);
+            if cur == 0 {
+                distinct = distinct + 1;
+                counts.insert(w2, 1);
+                checksum = checksum + 1;
+            } else {
+                counts.insert(w2, cur + 1);
+                checksum = checksum + cur + 1;
+            }
+        }
+        wi = wi + 1;
+    }
+    println(int_to_str(str_len(text_str)));
+    println(int_to_str(distinct));
+    println(int_to_str(checksum));
+    return 0;
+}

@@ -1,0 +1,105 @@
+// Benchmark port (layout suite): records — an event log of variant records.
+// Source: the suite's records_var.goose of github.com/aardappel/goose
+// (Apache-2.0). In the source suite every event costs its own variant's size with the
+// string inline behind a varint length. The idiomatic Fid port is the
+// fixed-mode Vec<E> every element of which is the largest variant plus a
+// heap str per Say — the padding and the per-string allocation are what
+// proposal 0008's Vec<E..> (stage 1, landed) and inline text (stage 2)
+// remove. Checksums must match the source suite at N.
+// Usage: fid run records.fd [n]   (n defaults to 2000000)
+
+@wrapping fn xs_next(x: u64) -> u64 {
+    var v: u64 = x;
+    v = v ^ (v << 13);
+    v = v ^ (v >> 7);
+    v = v ^ (v << 17);
+    return v;
+}
+
+fn xs_mod(x: u64, k: i64) -> i64 {
+    return (x % (k as u64)) as i64;
+}
+
+fn bench_n(default: i64) -> i64 {
+    var n: i64 = default;
+    match arg_at(1) {
+        Option::Some(s) => {
+            val k: i64 = str_parse_int(s);
+            if k > 0 {
+                n = k;
+            }
+        }
+        Option::None => {
+        }
+    }
+    return n;
+}
+
+enum Event {
+    Tick,
+    Move(i64, i64, i64),
+    Say(i64, str),
+    Quit(i64, i64),
+}
+
+fn word(seed: u64) -> str {
+    var w: Vec<i64> = Vec::new();
+    var r: u64 = xs_next(seed);
+    val n: i64 = 4 + xs_mod(r, 12);
+    var i: i64 = 0;
+    while i < n {
+        r = xs_next(r);
+        w.push(97 + xs_mod(r, 26));
+        i = i + 1;
+    }
+    return str_from_bytes(w);
+}
+
+fn main() -> i64 {
+    val n: i64 = bench_n(2000000);
+    val passes: i64 = 4;
+    var log: Vec<Event> = Vec::new();
+    var r: u64 = 12345;
+    var i: i64 = 0;
+    while i < n {
+        r = xs_next(r);
+        val k: i64 = xs_mod(r, 8);
+        val id: i64 = xs_mod(r >> 3, 100000);
+        if k < 4 {
+            log.push(Event::Move(id, xs_mod(r >> 20, 201) - 100, xs_mod(r >> 40, 201) - 100));
+        } else if k < 6 {
+            log.push(Event::Say(id, word(r)));
+        } else if k < 7 {
+            log.push(Event::Quit(id, xs_mod(r >> 20, 256)));
+        } else {
+            log.push(Event::Tick);
+        }
+        i = i + 1;
+    }
+    var total: i64 = 0;
+    var p: i64 = 0;
+    while p < passes {
+        var j: i64 = 0;
+        while j < log.len() {
+            match log.get(j) {
+                Event::Tick => {
+                    total = total + 1;
+                }
+                Event::Move(id2, dx, dy) => {
+                    total = total + id2 + dx + dy;
+                }
+                Event::Say(id3, text) => {
+                    total = total + id3 + str_len(text) + str_byte_at(text, 0);
+                }
+                Event::Quit(id4, code) => {
+                    total = total + id4 + code;
+                }
+            }
+            j = j + 1;
+        }
+        p = p + 1;
+    }
+    println(int_to_str(log.len()));
+    println(int_to_str(total));
+    return 0;
+}

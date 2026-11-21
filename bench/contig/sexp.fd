@@ -1,0 +1,234 @@
+// Benchmark port (layout suite): sexp — the flagship.
+// Source: the suite's sexp.goose of github.com/aardappel/goose (Apache-2.0).
+// Generate an s-expression text, parse it into a tree, walk it. In the source suite
+// every node sits in one grow-only pool at exactly its variant's size,
+// with 4-byte self-relative links and the symbol text inline behind a
+// varint length — nothing is freed because there is nothing to free.
+//
+// The idiomatic Fid port is the arena-with-indices pattern (a Vec of
+// worst-case-sized nodes, i64 indices for links, one heap str per
+// symbol): the node is 3 words + tag where the record needs 4..17 bytes,
+// and every symbol costs a counted-string allocation. That contrast is
+// the input to docs/proposals/0008-contiguous-data.md.
+//
+// The RNG and the algorithm mirror the source suite exactly (children chained
+// prev-sibling, so a walk sees them in reverse source order), so
+// text bytes, pool.len, root count and the walk total must match
+// the source suite's checksums. Usage: fid run sexp.fd [n]  (n defaults to 200000)
+
+@wrapping fn xs_next(x: u64) -> u64 {
+    var v: u64 = x;
+    v = v ^ (v << 13);
+    v = v ^ (v >> 7);
+    v = v ^ (v << 17);
+    return v;
+}
+
+fn xs_mod(x: u64, k: i64) -> i64 {
+    return (x % (k as u64)) as i64;
+}
+
+fn bench_n(default: i64) -> i64 {
+    var n: i64 = default;
+    match arg_at(1) {
+        Option::Some(s) => {
+            val k: i64 = str_parse_int(s);
+            if k > 0 {
+                n = k;
+            }
+        }
+        Option::None => {
+        }
+    }
+    return n;
+}
+
+enum Sexp {
+    Sym(str, i64),
+    Num(i64, i64),
+    List(i64, i64),
+}
+
+struct Parser {
+    text: Vec<i64>,
+    pos: i64,
+    pool: Vec<Sexp>,
+    roots: Vec<i64>,
+    err: str,
+}
+
+// --- generation --------------------------------------------------------------
+
+fn emit_sym(p: & mut Parser, seed: u64) -> u64 {
+    var r: u64 = seed;
+    val n: i64 = 3 + xs_mod(r, 12);
+    var i: i64 = 0;
+    while i < n {
+        r = xs_next(r);
+        p.text.push(97 + xs_mod(r, 26));
+        i = i + 1;
+    }
+    return r;
+}
+
+fn emit_num(p: & mut Parser, v: i64) {
+    val s: str = int_to_str(v);
+    var i: i64 = 0;
+    while i < str_len(s) {
+        p.text.push(str_byte_at(s, i));
+        i = i + 1;
+    }
+}
+
+fn gen(p: & mut Parser, depth: i64, seed: u64) -> u64 {
+    var r: u64 = xs_next(seed);
+    if depth == 0 || xs_mod(r, 4) == 0 {
+        if xs_mod(r >> 8, 2) == 0 {
+            r = emit_sym(p, r);
+        } else {
+            emit_num(p, xs_mod(r >> 16, 100000));
+        }
+        p.text.push(32);
+        return r;
+    }
+    p.text.push(40);
+    val kids: i64 = 2 + xs_mod(r >> 24, 4);
+    var k: i64 = 0;
+    while k < kids {
+        r = gen(p, depth - 1, r);
+        k = k + 1;
+    }
+    p.text.push(41);
+    p.text.push(32);
+    return r;
+}
+
+// --- parsing -----------------------------------------------------------------
+
+fn skip_space(p: & mut Parser) {
+    while p.pos < p.text.len() && p.text.get(p.pos) == 32 {
+        p.pos = p.pos + 1;
+    }
+}
+
+fn sym_text(p: & Parser, start: i64, end: i64) -> str {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = start;
+    while i < end {
+        out.push(p.text.get(i));
+        i = i + 1;
+    }
+    return str_from_bytes(out);
+}
+
+fn parse_node(p: & mut Parser, prev: i64) -> i64 {
+    skip_space(p);
+    if p.pos >= p.text.len() {
+        p.err = "eof";
+        return 0 - 1;
+    }
+    val c: i64 = p.text.get(p.pos);
+    if c == 40 {
+        p.pos = p.pos + 1;
+        var chain: i64 = 0 - 1;
+        loop {
+            skip_space(p);
+            if p.pos >= p.text.len() {
+                p.err = "unclosed";
+                return 0 - 1;
+            }
+            if p.text.get(p.pos) == 41 {
+                p.pos = p.pos + 1;
+                break;
+            }
+            chain = parse_node(p, chain);
+            if p.err != "" {
+                return 0 - 1;
+            }
+        }
+        p.pool.push(Sexp::List(chain, prev));
+        return p.pool.len() - 1;
+    }
+    val start: i64 = p.pos;
+    if c >= 48 && c <= 57 {
+        var v: i64 = 0;
+        while p.pos < p.text.len() && p.text.get(p.pos) >= 48 && p.text.get(p.pos) <= 57 {
+            v = v * 10 + (p.text.get(p.pos) - 48);
+            p.pos = p.pos + 1;
+        }
+        p.pool.push(Sexp::Num(v, prev));
+        return p.pool.len() - 1;
+    }
+    while p.pos < p.text.len() && p.text.get(p.pos) != 32 && p.text.get(p.pos) != 40 && p.text.get(p.pos) != 41 {
+        p.pos = p.pos + 1;
+    }
+    p.pool.push(Sexp::Sym(sym_text(p, start, p.pos), prev));
+    return p.pool.len() - 1;
+}
+
+fn parse_all(p: & mut Parser) {
+    loop {
+        skip_space(p);
+        if p.pos >= p.text.len() {
+            break;
+        }
+        val r: i64 = parse_node(p, 0 - 1);
+        if r < 0 {
+            break;
+        }
+        p.roots.push(r);
+    }
+}
+
+// --- walking -----------------------------------------------------------------
+
+fn walk_chain(p: & Parser, c: i64, pass: i64) -> i64 {
+    if c < 0 {
+        return 0;
+    }
+    var here: i64 = 0;
+    match p.pool.get(c) {
+        Sexp::Sym(name, next) => {
+            here = str_len(name) + str_byte_at(name, 0) + pass;
+            return here + walk_chain(p, next, pass);
+        }
+        Sexp::Num(v, next2) => {
+            here = v ^ pass;
+            return here + walk_chain(p, next2, pass);
+        }
+        Sexp::List(first, next3) => {
+            here = 1 + walk_chain(p, first, pass);
+            return here + walk_chain(p, next3, pass);
+        }
+    }
+    return 0;
+}
+
+fn main() -> i64 {
+    val n: i64 = bench_n(200000);
+    val depth: i64 = 4;
+    val passes: i64 = 4;
+    var p: Parser = Parser { text: Vec::new(), pos: 0, pool: Vec::new(), roots: Vec::new(), err: "" };
+    var seed: u64 = 12345;
+    var i: i64 = 0;
+    while i < n {
+        seed = gen(& mut p, depth, seed);
+        i = i + 1;
+    }
+    parse_all(& mut p);
+    println(int_to_str(p.text.len()));
+    println(int_to_str(p.pool.len()));
+    println(int_to_str(p.roots.len()));
+    var total: i64 = 0;
+    var pass: i64 = 0;
+    while pass < passes {
+        var ri: i64 = 0;
+        while ri < p.roots.len() {
+            total = total + walk_chain(& p, p.roots.get(ri), pass);
+            ri = ri + 1;
+        }
+        pass = pass + 1;
+    }
+    println(int_to_str(total));
+    return 0;
+}
