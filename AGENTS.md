@@ -36,6 +36,9 @@ RELEASE=1 CC="zig cc" ./scripts/bootstrap.sh
 # release/fid-dev.c (generated C) + release/fid-dev(.exe)
 ./scripts/build-selfhost.sh          # stage-0 dump-c + C compile → release/fid-dev.exe
 #   (8 units at -O2 when STAGE0 has `fid split-c`, else one unit at -O0;
+#    on a memory-tight machine SPLIT=16 JOBS=2: one 123MB unit at -O0
+#    needs >16GB and LLVM dies, so the split must succeed; JOBS=4 x -O2
+#    units does not fit under ~5GB free. Nov 21 gate log: release/gate-nov21*.log)
 #    STAGE0=release/fid.exe for the fast path: fid at -O2 runs ~17x faster;
 #    STAGE0 defaults to release/stage0/fid.exe — pinned Nov 21 to a
 #    self-hosted 1.0.0+dev, hash in scripts/stage0.sha256 — else fidesc,
@@ -301,11 +304,15 @@ SELF-HOSTED COMPILER (primary source):
                   Mach-O), nat_thumb (Cortex-M Thumb-2 codegen), ir_ser +
                   ast_ser (binary IR/AST caches, .fidcache CS2/CS4),
                   build_info (version stamp; fid version prints 1.0.0+dev)
-  Fixpoint:       VERIFIED byte-for-byte (stage2 == stage3, 49 MB of C,
-                  Nov 6; again Nov 8 with ownership 0004, 67 MB of C, in a
-                  3-stage rebuild from a source snapshot). NOT re-verified
-                  on the Nov 19 tree or later — the compiler grew ~2.3x
-                  since.
+  Fixpoint:       VERIFIED Nov 21 on the c082ee6+changes tree (incl. the
+                  558d0bc temps port): a 3-stage bootstrap from the pinned
+                  release/stage0/fid.exe reached stage 3 — `FIXPOINT OK:
+                  stage 2 and stage 3 emit identical C` (123,338,942 bytes
+                  both), RELEASE OK with smoke test; release/gate-nov21-c.log.
+                  All three stages fell back to one -O2-OOM'd unit at -O0
+                  (~15 min each): the split -O2 build does not fit in ~4GB
+                  free even at SPLIT=16 JOBS=2. Before: Nov 8, and NOT
+                  re-verified on the Nov 19 tree (the compiler grew ~2.3x).
   Bootstrap:      5 generations verified (Rust → c1 → c2 → c3 → c4 → c5)
   Binary:         release/fid.exe, shipped as fid.exe. release/ is local
                   and gitignored, and other sessions rebuild it (fid.exe
