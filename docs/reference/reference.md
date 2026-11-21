@@ -786,6 +786,11 @@ fn make_adder(n: i64) -> fn(i64) -> i64 {
   must be known at compile time (`s4_11_inline_for_unknown_bound_fail.fd`);
   at most 4096 iterations unroll, and `break`/`continue` are errors in the
   body (there is no loop to leave).
+- `compile_error("msg")` in comptime code stops the build with the message
+  (`s4_11_compile_error.fd`); `comptime_assert(cond, "msg")` checks while
+  compiling — false stops the build, true leaves nothing in the program
+  (`s4_11_comptime_assert.fd`). Both are comptime-only: calling one outside
+  comptime code is an error.
 - `comptime gen { … }` (statement) generates code (`test_comptime_gen.fd`):
   the block's value, a string, is parsed and its functions, structs, enums,
   constants, impl blocks and trait impls are added to the program. A

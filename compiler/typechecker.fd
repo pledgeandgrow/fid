@@ -1837,7 +1837,7 @@ fn TypeChecker_dim_result(self: & mut TypeChecker, m: str, lname: str, ld: i64, 
 /// `a op b` with `a` not a struct and `b` of struct type `rname`: the type
 /// of `b.r<op>(a)`, the dimension rule when `b` is a unit and `a` an f64,
 /// or Type::Infer when neither applies (the plain rules then decide).
-fn TypeChecker_check_right_struct_operator(self: & mut TypeChecker, op: BinOp, lt: Type, rname: str, rt: Type) -> Type {
+fn TypeChecker_check_right_struct_operator(self: & mut TypeChecker, op: BinOp, lt: Type, rname: str, rt: Type, lexpr: Expr) -> Type {
     if type_eq(lt, Type::Never) {
         return Type::Infer;
     }
@@ -1854,7 +1854,8 @@ fn TypeChecker_check_right_struct_operator(self: & mut TypeChecker, op: BinOp, l
         if type_eq(lt, Type::F64) {
             return TypeChecker_check_dim_scalar_left(self, m, lt, rname, rt);
         }
-        self.errors.push("Type error (line " + int_to_str(self.current_line) + "): `" + type_to_str(lt) + " " + tc_operator_symbol(m) + " " + rname + "`: a unit combines with an f64 or another unit, got " + type_to_str(lt) + ".");
+        val ltn: str = tc_operand_type_str(lexpr, lt);
+        self.errors.push("Type error (line " + int_to_str(self.current_line) + "): `" + ltn + " " + tc_operator_symbol(m) + " " + rname + "`: a unit combines with an f64 or another unit, got " + ltn + ".");
         return Type::Never;
     }
     if TypeChecker_method_find(self, rname, rm) >= 0 {
@@ -13543,6 +13544,41 @@ pub fn TypeChecker_is_typed_string(self: & TypeChecker, ty: Type) -> bool {
     return false;
 }
 
+/// 2g.87: the type a message names for operand `e` of type `t`. An
+/// unsuffixed integer literal is an i64 in the language; the checker types
+/// one with no integer hint by the narrowest type that holds it
+/// (infer_int_type: `2` is an i8 inside), which a message must not show
+/// ("got i8" for `2 * d`).
+pub fn tc_operand_type_str(e: Expr, t: Type) -> str {
+    match e {
+        Expr::IntLit(v) => {
+            if type_eq(t, infer_int_type(v)) {
+                return "i64";
+            }
+        }
+        Expr::Unary(uop, inner) => {
+            match uop {
+                UnaryOp::Neg => {
+                    match box_expr_unbox(inner) {
+                        Expr::IntLit(nv) => {
+                            if type_eq(t, infer_int_type(nv)) || type_eq(t, infer_int_type(0 - nv)) {
+                                return "i64";
+                            }
+                        }
+                        _ => {
+                        }
+                    }
+                }
+                _ => {
+                }
+            }
+        }
+        _ => {
+        }
+    }
+    return type_to_str(t);
+}
+
 pub fn infer_int_type(value: i64) -> Type {
     if value >= - 128 && value <= 127 {
         return Type::I8;
@@ -19650,7 +19686,7 @@ fn TypeChecker_check_expr_inner(self: & mut TypeChecker, expr: Expr, hint: Type)
                     match rt_r {
                         Type::Named(orn) => {
                             if !tc_is_vec_type(orn) && tc_is_struct(self, orn) && !TypeChecker_is_typed_string(self, rt_r) {
-                                var rres: Type = TypeChecker_check_right_struct_operator(self, op, lt_r, orn, rt_r);
+                                var rres: Type = TypeChecker_check_right_struct_operator(self, op, lt_r, orn, rt_r, box_expr_unbox(left));
                                 if !type_eq(rres, Type::Infer) {
                                     return rres;
                                 }
@@ -20042,6 +20078,31 @@ fn TypeChecker_check_expr_inner(self: & mut TypeChecker, expr: Expr, hint: Type)
                 }
                 return Type::Str;
             }
+            // §4.11: compile_error("msg") and comptime_assert(cond, "msg")
+            // are the evaluator's (comptime_eval.fd); at run time there is
+            // nothing they could do, so they are comptime-only.
+            if callee == "compile_error" {
+                if g_tc_comptime_depth == 0 {
+                    self.errors.push("Comptime error (line " + int_to_str(self.current_line) + "): compile_error() reports while compiling: call it in comptime code (a `comptime fn`, a `comptime { }` block, a `comptime if` condition).");
+                    return Type::Never;
+                }
+                if arg_types.len() != 1 || (!type_eq(arg_types.get(0), Type::Str) && !type_eq(arg_types.get(0), Type::Never)) {
+                    self.errors.push("Type error (line " + int_to_str(self.current_line) + "): compile_error takes one argument, the message (a str)");
+                    return Type::Never;
+                }
+                return Type::Never;
+            }
+            if callee == "comptime_assert" {
+                if g_tc_comptime_depth == 0 {
+                    self.errors.push("Comptime error (line " + int_to_str(self.current_line) + "): comptime_assert() checks while compiling: call it in comptime code (a `comptime fn`, a `comptime { }` block, a `comptime if` condition).");
+                    return Type::Never;
+                }
+                if arg_types.len() < 1 || arg_types.len() > 2 || !type_eq(arg_types.get(0), Type::Bool) || (arg_types.len() == 2 && !type_eq(arg_types.get(1), Type::Str)) {
+                    self.errors.push("Type error (line " + int_to_str(self.current_line) + "): comptime_assert takes a bool and an optional message (a str)");
+                    return Type::Never;
+                }
+                return Type::Void;
+            }
             // Check for runtime builtin functions (p_*)
             if str_starts_with(callee, "p_") {
                 if callee == "p_json_dump" || callee == "p_json_type" || callee == "p_json_pretty" || callee == "p_json_string" || callee == "p_tensor_to_str" || callee == "p_tensor_to_json" || callee == "p_simd_to_str" || callee == "p_socket_recv_str" || callee == "p_http_build_response" || callee == "p_db_mem_query" || callee == "p_process_stdout" || callee == "p_process_stderr" || callee == "p_dir_list" || callee == "p_intern_str" || callee == "p_str_join_n" {
@@ -20083,7 +20144,7 @@ fn TypeChecker_check_expr_inner(self: & mut TypeChecker, expr: Expr, hint: Type)
                     if arg_types.len() != 1 {
                         self.errors.push("Type error (line " + int_to_str(self.current_line) + "): " + callee + " expects 1 argument (a socket path), got " + int_to_str(arg_types.len()));
                     } else if !TypeChecker_types_compatible(self, Type::Str, arg_types.get(0)) {
-                        self.errors.push("Type error (line " + int_to_str(self.current_line) + "): " + callee + " expects a str socket path, got '" + type_to_str(arg_types.get(0)) + "'");
+                        self.errors.push("Type error (line " + int_to_str(self.current_line) + "): " + callee + " expects a str socket path, got '" + tc_operand_type_str(args.get(0), arg_types.get(0)) + "'");
                     }
                     return Type::I64;
                 }
