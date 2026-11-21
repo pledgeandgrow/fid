@@ -25,7 +25,7 @@ use std::path::Path;
 const MANIFEST_FILE: &str = "ark.toml";
 const LOCK_FILE: &str = "ark.lock";
 const MODULES_DIR: &str = "ark_modules";
-const DEFAULT_INDEX: &str = "https://github.com/pledgeandgrow/ark-index.git";
+const DEFAULT_INDEX: &str = "https://github.com/pledgeandgrow/pacts.git";
 
 #[derive(Debug, Clone)]
 pub struct Manifest {

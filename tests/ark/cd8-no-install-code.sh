@@ -20,7 +20,9 @@ if [ $# -gt 0 ]; then
   ARK=("$@")
 else
   ARK=()
-  for f in release/fid.exe release/fid-dev.exe release/fid release/fid-dev; do
+  # prefer the newest working compiler: release/fid.exe can be weeks old
+  # and predate the very features these scripts check (2g.63's lesson)
+  for f in release/fid-dev.exe release/fid.exe release/fid-dev release/fid; do
     if [ -x "$f" ]; then ARK=("$ROOT/$f" ark); break; fi
   done
   if [ ${#ARK[@]} -eq 0 ]; then echo "cd8-no-install-code: no compiler (give the command)"; exit 1; fi

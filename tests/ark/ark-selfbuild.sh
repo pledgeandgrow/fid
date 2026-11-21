@@ -11,7 +11,9 @@ cd "$(dirname "$0")/../.." || exit 1
 ROOT="$(pwd)"
 FID="${1:-}"
 if [ -z "$FID" ]; then
-  for f in release/fid.exe release/fid-dev.exe release/fid release/fid-dev; do
+  # prefer the newest working compiler: release/fid.exe can be weeks old
+  # and predate the very features these scripts check (2g.63's lesson)
+  for f in release/fid-dev.exe release/fid.exe release/fid-dev release/fid; do
     if [ -x "$f" ]; then FID="$ROOT/$f"; break; fi
   done
 fi
