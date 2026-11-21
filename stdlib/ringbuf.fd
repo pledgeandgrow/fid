@@ -25,16 +25,21 @@
 // interleaved sequential order.
 
 module ringbuf;
- use vec; use atomic;
+use vec;
+use atomic;
 
 fn rb_check_cap(cap: i64) {
-    if cap < 2 || (cap & (cap - 1)) != 0 { p_panic("ringbuf: capacity must be a power of two >= 2"); }
+    if cap < 2 || (cap & (cap - 1)) != 0 {
+        p_panic("ringbuf: capacity must be a power of two >= 2");
+    }
 }
 
 /// Smallest power of two >= n (n >= 1).
 pub fn rb_pow2_at_least(n: i64) -> i64 {
     var p: i64 = 2;
-    while p < n { p = p * 2; }
+    while p < n {
+        p = p * 2;
+    }
     return p;
 }
 
@@ -56,14 +61,18 @@ pub fn spsc_new(cap: i64) -> SpscRing {
         s.push(atomic_new(0));
         i = i + 1;
     }
-    return SpscRing { cap: cap, mask: cap - 1, slots: s, head: atomic_new(0), tail: atomic_new(0) };
+    return SpscRing {
+        cap: cap, mask: cap - 1, slots: s, head: atomic_new(0), tail: atomic_new(0)
+    };
 }
 
 /// Producer: false when full.
 pub fn spsc_push(r: SpscRing, v: i64) -> bool {
     val h: i64 = r.head.load(Order::Relaxed);
     val t: i64 = r.tail.load(Order::Acquire);
-    if h - t == r.cap { return false; }
+    if h - t == r.cap {
+        return false;
+    }
     r.slots.get(h & r.mask).store(v, Order::Relaxed);
     r.head.store(h + 1, Order::Release);
     return true;
@@ -89,7 +98,9 @@ pub fn spsc_peek(r: SpscRing) -> i64 {
 pub fn spsc_pop_or(r: SpscRing, none: i64) -> i64 {
     val t: i64 = r.tail.load(Order::Relaxed);
     val h: i64 = r.head.load(Order::Acquire);
-    if h == t { return none; }
+    if h == t {
+        return none;
+    }
     val v: i64 = r.slots.get(t & r.mask).load(Order::Relaxed);
     r.tail.store(t + 1, Order::Release);
     return v;
@@ -100,7 +111,9 @@ pub fn spsc_push_batch(r: SpscRing, vals: Vec<i64>) -> i64 {
     val h: i64 = r.head.load(Order::Relaxed);
     val t: i64 = r.tail.load(Order::Acquire);
     var n: i64 = r.cap - (h - t);
-    if n > vals.len() { n = vals.len(); }
+    if n > vals.len() {
+        n = vals.len();
+    }
     var i: i64 = 0;
     while i < n {
         r.slots.get((h + i) & r.mask).store(vals.get(i), Order::Relaxed);
@@ -115,7 +128,9 @@ pub fn spsc_pop_batch(r: SpscRing, max: i64) -> Vec<i64> {
     val t: i64 = r.tail.load(Order::Relaxed);
     val h: i64 = r.head.load(Order::Acquire);
     var n: i64 = h - t;
-    if n > max { n = max; }
+    if n > max {
+        n = max;
+    }
     var out: Vec<i64> = Vec::new();
     var i: i64 = 0;
     while i < n {
@@ -147,7 +162,9 @@ pub fn mpmc_new(cap: i64) -> MpmcRing {
         dt.push(atomic_new(0));
         i = i + 1;
     }
-    return MpmcRing { cap: cap, mask: cap - 1, seq: sq, data: dt, enq: atomic_new(0), deq: atomic_new(0) };
+    return MpmcRing {
+        cap: cap, mask: cap - 1, seq: sq, data: dt, enq: atomic_new(0), deq: atomic_new(0)
+    };
 }
 
 /// A claimed position, so a producer or consumer can be stepped through
@@ -165,15 +182,23 @@ pub fn mpmc_claim_push(r: MpmcRing) -> MpmcTicket {
         val s: i64 = r.seq.get(pos & r.mask).load(Order::Acquire);
         val dif: i64 = s - pos;
         if dif == 0 {
-            if r.enq.compare_swap(pos, pos + 1, Order::Relaxed) { return MpmcTicket { ok: true, pos: pos }; }
+            if r.enq.compare_swap(pos, pos + 1, Order::Relaxed) {
+                return MpmcTicket {
+                    ok: true, pos: pos
+                };
+            }
             pos = r.enq.load(Order::Relaxed);
         } else if dif < 0 {
-            return MpmcTicket { ok: false, pos: pos };
+            return MpmcTicket {
+                ok: false, pos: pos
+            };
         } else {
             pos = r.enq.load(Order::Relaxed);
         }
     }
-    return MpmcTicket { ok: false, pos: pos };
+    return MpmcTicket {
+        ok: false, pos: pos
+    };
 }
 
 /// Producer, second half: write the value and release the cell.
@@ -184,7 +209,9 @@ pub fn mpmc_publish_push(r: MpmcRing, k: MpmcTicket, v: i64) {
 
 pub fn mpmc_push(r: MpmcRing, v: i64) -> bool {
     val k: MpmcTicket = mpmc_claim_push(r);
-    if !k.ok { return false; }
+    if !k.ok {
+        return false;
+    }
     mpmc_publish_push(r, k, v);
     return true;
 }
@@ -197,15 +224,23 @@ pub fn mpmc_claim_pop(r: MpmcRing) -> MpmcTicket {
         val s: i64 = r.seq.get(pos & r.mask).load(Order::Acquire);
         val dif: i64 = s - (pos + 1);
         if dif == 0 {
-            if r.deq.compare_swap(pos, pos + 1, Order::Relaxed) { return MpmcTicket { ok: true, pos: pos }; }
+            if r.deq.compare_swap(pos, pos + 1, Order::Relaxed) {
+                return MpmcTicket {
+                    ok: true, pos: pos
+                };
+            }
             pos = r.deq.load(Order::Relaxed);
         } else if dif < 0 {
-            return MpmcTicket { ok: false, pos: pos };
+            return MpmcTicket {
+                ok: false, pos: pos
+            };
         } else {
             pos = r.deq.load(Order::Relaxed);
         }
     }
-    return MpmcTicket { ok: false, pos: pos };
+    return MpmcTicket {
+        ok: false, pos: pos
+    };
 }
 
 /// Consumer, second half: read the value and free the cell for the next lap.
@@ -217,7 +252,9 @@ pub fn mpmc_finish_pop(r: MpmcRing, k: MpmcTicket) -> i64 {
 
 pub fn mpmc_pop_or(r: MpmcRing, none: i64) -> i64 {
     val k: MpmcTicket = mpmc_claim_pop(r);
-    if !k.ok { return none; }
+    if !k.ok {
+        return none;
+    }
     return mpmc_finish_pop(r, k);
 }
 
@@ -238,14 +275,20 @@ pub struct OverwriteRing {
 
 pub fn owring_new(cap: i64) -> OverwriteRing {
     rb_check_cap(cap);
-    return OverwriteRing { cap: cap, buf: Vec::filled(cap, 0), head: 0, count: 0, dropped: 0 };
+    return OverwriteRing {
+        cap: cap, buf: Vec::filled(cap, 0), head: 0, count: 0, dropped: 0
+    };
 }
 
 /// Append; when full the oldest entry is overwritten (and counted).
 pub fn owring_push(r: &mut OverwriteRing, v: i64) {
     r.buf.set(r.head, v);
     r.head = (r.head + 1) & (r.cap - 1);
-    if r.count == r.cap { r.dropped = r.dropped + 1; } else { r.count = r.count + 1; }
+    if r.count == r.cap {
+        r.dropped = r.dropped + 1;
+    } else {
+        r.count = r.count + 1;
+    }
 }
 
 /// The entries, oldest first.

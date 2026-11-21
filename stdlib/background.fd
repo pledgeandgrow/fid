@@ -40,10 +40,10 @@ pub const BG_SUCCESS: i64 = 0;
 pub const BG_RETRY: i64 = 1;
 pub const BG_FAILURE: i64 = 2;
 
-pub const BG_MIN_PERIOD_MS: i64 = 900000;      // 15 minutes
-pub const BG_MIN_FLEX_MS: i64 = 300000;        // 5 minutes
-pub const BG_MIN_BACKOFF_MS: i64 = 10000;      // 10 seconds
-pub const BG_MAX_BACKOFF_MS: i64 = 18000000;   // 5 hours
+pub const BG_MIN_PERIOD_MS: i64 = 900000;  // 15 minutes
+pub const BG_MIN_FLEX_MS: i64 = 300000;  // 5 minutes
+pub const BG_MIN_BACKOFF_MS: i64 = 10000;  // 10 seconds
+pub const BG_MAX_BACKOFF_MS: i64 = 18000000;  // 5 hours
 
 pub struct BgSpec {
     pub id: str,
@@ -58,14 +58,12 @@ pub struct BgSpec {
     pub storage_not_low: bool,
     pub backoff: i64,
     pub backoff_ms: i64,
-    pub max_attempts: i64,     // 0: unlimited
+    pub max_attempts: i64,  // 0: unlimited
 }
 
 pub fn bg_one_off(id: str) -> BgSpec {
     return BgSpec {
-        id: id, periodic: false, interval_ms: 0, flex_ms: 0, initial_delay_ms: 0, network: BG_NET_ANY, charging: false,
-        idle: false, battery_not_low: false, storage_not_low: false, backoff: BG_BACKOFF_EXPONENTIAL, backoff_ms: 30000,
-        max_attempts: 0,
+        id: id, periodic: false, interval_ms: 0, flex_ms: 0, initial_delay_ms: 0, network: BG_NET_ANY, charging: false, idle: false, battery_not_low: false, storage_not_low: false, backoff: BG_BACKOFF_EXPONENTIAL, backoff_ms: 30000, max_attempts: 0,
     };
 }
 
@@ -92,7 +90,9 @@ pub fn bg_normalize(s: BgSpec) -> BgNormalized {
             notes.push("interval " + int_to_str(n.interval_ms) + " ms raised to 15 minutes");
             n.interval_ms = BG_MIN_PERIOD_MS;
         }
-        if n.flex_ms <= 0 || n.flex_ms > n.interval_ms { n.flex_ms = n.interval_ms; }
+        if n.flex_ms <= 0 || n.flex_ms > n.interval_ms {
+            n.flex_ms = n.interval_ms;
+        }
         if n.flex_ms < BG_MIN_FLEX_MS {
             notes.push("flex " + int_to_str(n.flex_ms) + " ms raised to 5 minutes");
             n.flex_ms = BG_MIN_FLEX_MS;
@@ -106,7 +106,9 @@ pub fn bg_normalize(s: BgSpec) -> BgNormalized {
         notes.push("backoff lowered to 5 h");
         n.backoff_ms = BG_MAX_BACKOFF_MS;
     }
-    return BgNormalized { spec: n, notes: notes };
+    return BgNormalized {
+        spec: n, notes: notes
+    };
 }
 
 /// The delay before attempt `attempt` + 1 after `attempt` retries
@@ -118,9 +120,14 @@ pub fn bg_backoff_delay(s: &BgSpec, attempt: i64) -> i64 {
         d = s.backoff_ms * attempt;
     } else {
         var k: i64 = 1;
-        while k < attempt && d < BG_MAX_BACKOFF_MS { d = d * 2; k = k + 1; }
+        while k < attempt && d < BG_MAX_BACKOFF_MS {
+            d = d * 2;
+            k = k + 1;
+        }
     }
-    if d > BG_MAX_BACKOFF_MS { d = BG_MAX_BACKOFF_MS; }
+    if d > BG_MAX_BACKOFF_MS {
+        d = BG_MAX_BACKOFF_MS;
+    }
     return d;
 }
 
@@ -131,21 +138,43 @@ pub fn bg_workmanager_calls(s: BgSpec) -> Vec<str> {
     val n: BgSpec = bg_normalize(s).spec;
     var v: Vec<str> = Vec::new();
     v.push("Constraints.Builder()");
-    if n.network == BG_NET_CONNECTED { v.push("setRequiredNetworkType(NetworkType.CONNECTED)"); }
-    if n.network == BG_NET_UNMETERED { v.push("setRequiredNetworkType(NetworkType.UNMETERED)"); }
-    if n.charging { v.push("setRequiresCharging(true)"); }
-    if n.idle { v.push("setRequiresDeviceIdle(true)"); }
-    if n.battery_not_low { v.push("setRequiresBatteryNotLow(true)"); }
-    if n.storage_not_low { v.push("setRequiresStorageNotLow(true)"); }
+    if n.network == BG_NET_CONNECTED {
+        v.push("setRequiredNetworkType(NetworkType.CONNECTED)");
+    }
+    if n.network == BG_NET_UNMETERED {
+        v.push("setRequiredNetworkType(NetworkType.UNMETERED)");
+    }
+    if n.charging {
+        v.push("setRequiresCharging(true)");
+    }
+    if n.idle {
+        v.push("setRequiresDeviceIdle(true)");
+    }
+    if n.battery_not_low {
+        v.push("setRequiresBatteryNotLow(true)");
+    }
+    if n.storage_not_low {
+        v.push("setRequiresStorageNotLow(true)");
+    }
     if n.periodic {
         v.push("PeriodicWorkRequest.Builder(worker, " + int_to_str(n.interval_ms) + ", MILLISECONDS, " + int_to_str(n.flex_ms) + ", MILLISECONDS)");
     } else {
         v.push("OneTimeWorkRequest.Builder(worker)");
     }
-    if n.initial_delay_ms > 0 { v.push("setInitialDelay(" + int_to_str(n.initial_delay_ms) + ", MILLISECONDS)"); }
-    v.push("setBackoffCriteria(BackoffPolicy." + (if n.backoff == BG_BACKOFF_LINEAR { "LINEAR" } else { "EXPONENTIAL" }) + ", " + int_to_str(n.backoff_ms) + ", MILLISECONDS)");
+    if n.initial_delay_ms > 0 {
+        v.push("setInitialDelay(" + int_to_str(n.initial_delay_ms) + ", MILLISECONDS)");
+    }
+    v.push("setBackoffCriteria(BackoffPolicy." + (if n.backoff == BG_BACKOFF_LINEAR {
+        "LINEAR"
+    } else {
+        "EXPONENTIAL"
+    }) + ", " + int_to_str(n.backoff_ms) + ", MILLISECONDS)");
     v.push("addTag(\"" + n.id + "\")");
-    v.push("WorkManager.enqueueUnique" + (if n.periodic { "PeriodicWork" } else { "Work" }) + "(\"" + n.id + "\", KEEP, request)");
+    v.push("WorkManager.enqueueUnique" + (if n.periodic {
+        "PeriodicWork"
+    } else {
+        "Work"
+    }) + "(\"" + n.id + "\", KEEP, request)");
     return v;
 }
 
@@ -153,15 +182,21 @@ pub fn bg_workmanager_calls(s: BgSpec) -> Vec<str> {
 /// letters, digits, '-' and '_')?
 pub fn bg_identifier_ok(id: str) -> bool {
     val parts: Vec<str> = str_split(id, ".");
-    if parts.len() < 2 { return false; }
+    if parts.len() < 2 {
+        return false;
+    }
     var i: i64 = 0;
     while i < parts.len() {
         val p: str = parts.get(i);
-        if str_len(p) == 0 { return false; }
+        if str_len(p) == 0 {
+            return false;
+        }
         var k: i64 = 0;
         while k < str_len(p) {
             val c: i64 = str_byte_at(p, k);
-            if !(char_is_alpha(c) || char_is_digit(c) || c == 45 || c == 95) { return false; }
+            if !(char_is_alpha(c) || char_is_digit(c) || c == 45 || c == 95) {
+                return false;
+            }
             k = k + 1;
         }
         i = i + 1;
@@ -172,25 +207,41 @@ pub fn bg_identifier_ok(id: str) -> bool {
 /// The BGTaskScheduler request of a spec and the warnings for what iOS
 /// cannot express.
 pub struct BgIosPlan {
-    pub request_class: str,          // BGAppRefreshTaskRequest or BGProcessingTaskRequest
+    pub request_class: str,  // BGAppRefreshTaskRequest or BGProcessingTaskRequest
     pub requires_network: bool,
     pub requires_power: bool,
-    pub earliest_begin_ms: i64,      // relative to submission
+    pub earliest_begin_ms: i64,  // relative to submission
     pub warnings: Vec<str>,
 }
 
 pub fn bg_ios_plan(s: &BgSpec) -> BgIosPlan {
     var w: Vec<str> = Vec::new();
-    if !bg_identifier_ok(s.id) { w.push("identifier is not reverse-DNS: " + s.id); }
+    if !bg_identifier_ok(s.id) {
+        w.push("identifier is not reverse-DNS: " + s.id);
+    }
     val processing: bool = s.network != BG_NET_ANY || s.charging || s.idle;
-    if s.network == BG_NET_UNMETERED { w.push("unmetered network not expressible: any network required"); }
-    if s.idle { w.push("idle not expressible: processing tasks already run when the device is idle"); }
-    if s.battery_not_low || s.storage_not_low { w.push("battery/storage constraints not expressible"); }
-    if s.periodic { w.push("not periodic on iOS: submit the next request when the task completes"); }
+    if s.network == BG_NET_UNMETERED {
+        w.push("unmetered network not expressible: any network required");
+    }
+    if s.idle {
+        w.push("idle not expressible: processing tasks already run when the device is idle");
+    }
+    if s.battery_not_low || s.storage_not_low {
+        w.push("battery/storage constraints not expressible");
+    }
+    if s.periodic {
+        w.push("not periodic on iOS: submit the next request when the task completes");
+    }
     return BgIosPlan {
-        request_class: if processing { "BGProcessingTaskRequest" } else { "BGAppRefreshTaskRequest" },
-        requires_network: s.network != BG_NET_ANY, requires_power: s.charging,
-        earliest_begin_ms: if s.periodic { s.interval_ms } else { s.initial_delay_ms }, warnings: w,
+        request_class: if processing {
+            "BGProcessingTaskRequest"
+        } else {
+            "BGAppRefreshTaskRequest"
+        }, requires_network: s.network != BG_NET_ANY, requires_power: s.charging, earliest_begin_ms: if s.periodic {
+            s.interval_ms
+        } else {
+            s.initial_delay_ms
+        }, warnings: w,
     };
 }
 
@@ -208,7 +259,7 @@ pub fn bg_ios_plist(ids: Vec<str>) -> str {
 // ─── Simulation ────────────────────────────────────────────────────────
 
 pub struct BgDevice {
-    pub network: i64,        // 0 none, BG_NET_CONNECTED (metered), BG_NET_UNMETERED
+    pub network: i64,  // 0 none, BG_NET_CONNECTED (metered), BG_NET_UNMETERED
     pub charging: bool,
     pub idle: bool,
     pub battery_low: bool,
@@ -216,17 +267,31 @@ pub struct BgDevice {
 }
 
 pub fn bg_device(network: i64, charging: bool) -> BgDevice {
-    return BgDevice { network: network, charging: charging, idle: false, battery_low: false, storage_low: false };
+    return BgDevice {
+        network: network, charging: charging, idle: false, battery_low: false, storage_low: false
+    };
 }
 
 /// Do the device's conditions satisfy the spec's constraints?
 pub fn bg_constraints_met(s: &BgSpec, d: &BgDevice) -> bool {
-    if s.network == BG_NET_CONNECTED && d.network == 0 { return false; }
-    if s.network == BG_NET_UNMETERED && d.network != BG_NET_UNMETERED { return false; }
-    if s.charging && !d.charging { return false; }
-    if s.idle && !d.idle { return false; }
-    if s.battery_not_low && d.battery_low { return false; }
-    if s.storage_not_low && d.storage_low { return false; }
+    if s.network == BG_NET_CONNECTED && d.network == 0 {
+        return false;
+    }
+    if s.network == BG_NET_UNMETERED && d.network != BG_NET_UNMETERED {
+        return false;
+    }
+    if s.charging && !d.charging {
+        return false;
+    }
+    if s.idle && !d.idle {
+        return false;
+    }
+    if s.battery_not_low && d.battery_low {
+        return false;
+    }
+    if s.storage_not_low && d.storage_low {
+        return false;
+    }
     return true;
 }
 
@@ -239,10 +304,10 @@ pub struct BgTask {
     pub spec: BgSpec,
     pub worker: fn(i64) -> i64,
     pub state: i64,
-    pub next_ms: i64,        // earliest start
-    pub attempts: i64,       // attempts of the current run (retries)
-    pub runs: i64,           // worker calls in total
-    pub period_index: i64,   // periodic: the period being served (1-based)
+    pub next_ms: i64,  // earliest start
+    pub attempts: i64,  // attempts of the current run (retries)
+    pub runs: i64,  // worker calls in total
+    pub period_index: i64,  // periodic: the period being served (1-based)
     pub enqueued_ms: i64,
 }
 
@@ -254,20 +319,28 @@ pub struct BgScheduler {
 }
 
 pub fn bg_scheduler_new(device: BgDevice) -> BgScheduler {
-    return BgScheduler { now: 0, device: device, tasks: Vec::new(), log: Vec::new() };
+    return BgScheduler {
+        now: 0, device: device, tasks: Vec::new(), log: Vec::new()
+    };
 }
 
 /// Enqueue a task (KEEP: an enqueued task with the same id stays).
 pub fn bg_enqueue(s: &mut BgScheduler, spec: BgSpec, worker: fn(i64) -> i64) -> bool {
     var i: i64 = 0;
     while i < s.tasks.len() {
-        if s.tasks.get(i).spec.id == spec.id && s.tasks.get(i).state == BG_ENQUEUED { return false; }
+        if s.tasks.get(i).spec.id == spec.id && s.tasks.get(i).state == BG_ENQUEUED {
+            return false;
+        }
         i = i + 1;
     }
     val n: BgSpec = bg_normalize(spec).spec;
     var first: i64 = s.now + n.initial_delay_ms;
-    if n.periodic { first = s.now + n.initial_delay_ms + n.interval_ms - n.flex_ms; }
-    s.tasks.push(BgTask { spec: n, worker: worker, state: BG_ENQUEUED, next_ms: first, attempts: 0, runs: 0, period_index: 1, enqueued_ms: s.now });
+    if n.periodic {
+        first = s.now + n.initial_delay_ms + n.interval_ms - n.flex_ms;
+    }
+    s.tasks.push(BgTask {
+        spec: n, worker: worker, state: BG_ENQUEUED, next_ms: first, attempts: 0, runs: 0, period_index: 1, enqueued_ms: s.now
+    });
     return true;
 }
 
@@ -286,7 +359,9 @@ pub fn bg_cancel(s: &mut BgScheduler, id: str) -> bool {
     return false;
 }
 
-pub fn bg_set_device(s: &mut BgScheduler, d: BgDevice) { s.device = d; }
+pub fn bg_set_device(s: &mut BgScheduler, d: BgDevice) {
+    s.device = d;
+}
 
 // Run every due task whose constraints hold, once.
 fn bg_run_due(s: &mut BgScheduler) {
@@ -299,12 +374,15 @@ fn bg_run_due(s: &mut BgScheduler) {
             val w: fn(i64) -> i64 = t.worker;
             val r: i64 = w(t.attempts);
             var what: str = "";
-            if r == BG_SUCCESS { what = "success"; }
-            else if r == BG_RETRY { what = "retry"; }
-            else { what = "failure"; }
+            if r == BG_SUCCESS {
+                what = "success";
+            } else if r == BG_RETRY {
+                what = "retry";
+            } else {
+                what = "failure";
+            }
             s.log.push(int_to_str(s.now / 1000) + "s " + t.spec.id + " attempt " + int_to_str(t.attempts) + " " + what);
-            var done: bool = r == BG_SUCCESS || r == BG_FAILURE
-                || (r == BG_RETRY && t.spec.max_attempts > 0 && t.attempts >= t.spec.max_attempts);
+            var done: bool = r == BG_SUCCESS || r == BG_FAILURE || (r == BG_RETRY && t.spec.max_attempts > 0 && t.attempts >= t.spec.max_attempts);
             if r == BG_RETRY && !done {
                 t.next_ms = s.now + bg_backoff_delay(&t.spec, t.attempts);
             } else if t.spec.periodic {
@@ -312,9 +390,15 @@ fn bg_run_due(s: &mut BgScheduler) {
                 t.period_index = t.period_index + 1;
                 t.attempts = 0;
                 t.next_ms = t.enqueued_ms + t.spec.initial_delay_ms + t.period_index * t.spec.interval_ms - t.spec.flex_ms;
-                if t.next_ms <= s.now { t.next_ms = s.now + 1; }
+                if t.next_ms <= s.now {
+                    t.next_ms = s.now + 1;
+                }
             } else if done {
-                t.state = if r == BG_SUCCESS { BG_SUCCEEDED } else { BG_FAILED };
+                t.state = if r == BG_SUCCESS {
+                    BG_SUCCEEDED
+                } else {
+                    BG_FAILED
+                };
             }
             s.tasks.set(i, t);
         }
@@ -327,9 +411,13 @@ fn bg_run_due(s: &mut BgScheduler) {
 pub fn bg_advance(s: &mut BgScheduler, to_ms: i64, step_ms: i64) {
     while s.now <= to_ms {
         bg_run_due(s);
-        if s.now == to_ms { break; }
+        if s.now == to_ms {
+            break;
+        }
         s.now = s.now + step_ms;
-        if s.now > to_ms { s.now = to_ms; }
+        if s.now > to_ms {
+            s.now = to_ms;
+        }
     }
 }
 
@@ -337,16 +425,26 @@ pub fn bg_advance(s: &mut BgScheduler, to_ms: i64, step_ms: i64) {
 pub fn bg_state(s: &BgScheduler, id: str) -> i64 {
     var i: i64 = 0;
     while i < s.tasks.len() {
-        if s.tasks.get(i).spec.id == id { return s.tasks.get(i).state; }
+        if s.tasks.get(i).spec.id == id {
+            return s.tasks.get(i).state;
+        }
         i = i + 1;
     }
     return -1;
 }
 
 pub fn bg_state_name(st: i64) -> str {
-    if st == BG_ENQUEUED { return "enqueued"; }
-    if st == BG_SUCCEEDED { return "succeeded"; }
-    if st == BG_FAILED { return "failed"; }
-    if st == BG_CANCELLED { return "cancelled"; }
+    if st == BG_ENQUEUED {
+        return "enqueued";
+    }
+    if st == BG_SUCCEEDED {
+        return "succeeded";
+    }
+    if st == BG_FAILED {
+        return "failed";
+    }
+    if st == BG_CANCELLED {
+        return "cancelled";
+    }
     return "?";
 }

@@ -28,7 +28,9 @@
 // are passed in as ISO-8601 strings, not read from a clock here.
 
 module ocpp;
- use vec; use string; use json;
+use vec;
+use string;
+use json;
 
 // Message type ids
 pub const OCPP_CALL: i64 = 2;
@@ -55,12 +57,24 @@ pub const EV_FAULT: i64 = 7;
 pub const EV_FAULT_CLEAR: i64 = 8;
 
 pub fn ocpp_state_name(s: i64) -> str {
-    if s == CP_AVAILABLE { return "Available"; }
-    if s == CP_PREPARING { return "Preparing"; }
-    if s == CP_CHARGING { return "Charging"; }
-    if s == CP_SUSPENDED_EV { return "SuspendedEV"; }
-    if s == CP_FINISHING { return "Finishing"; }
-    if s == CP_FAULTED { return "Faulted"; }
+    if s == CP_AVAILABLE {
+        return "Available";
+    }
+    if s == CP_PREPARING {
+        return "Preparing";
+    }
+    if s == CP_CHARGING {
+        return "Charging";
+    }
+    if s == CP_SUSPENDED_EV {
+        return "SuspendedEV";
+    }
+    if s == CP_FINISHING {
+        return "Finishing";
+    }
+    if s == CP_FAULTED {
+        return "Faulted";
+    }
     return "Unknown";
 }
 
@@ -86,10 +100,10 @@ pub struct OcppFrame {
     pub ok: bool,
     pub msg_type: i64,
     pub unique_id: str,
-    pub action: str,       // CALL only
-    pub payload: str,      // CALL / CALLRESULT payload JSON
-    pub error_code: str,   // CALLERROR
-    pub error_desc: str,   // CALLERROR
+    pub action: str,  // CALL only
+    pub payload: str,  // CALL / CALLRESULT payload JSON
+    pub error_code: str,  // CALLERROR
+    pub error_desc: str,  // CALLERROR
 }
 
 /// Parse any OCPP-J frame.
@@ -101,30 +115,24 @@ pub fn ocpp_parse(frame: str) -> OcppFrame {
     val uid: str = json_unescape(json_at(frame, 1));
     if mt == OCPP_CALL {
         return OcppFrame {
-            ok: true, msg_type: mt, unique_id: uid,
-            action: json_unescape(json_at(frame, 2)),
-            payload: json_at(frame, 3),
-            error_code: "", error_desc: "",
+            ok: true, msg_type: mt, unique_id: uid, action: json_unescape(json_at(frame, 2)), payload: json_at(frame, 3), error_code: "", error_desc: "",
         };
     } else if mt == OCPP_CALLRESULT {
         return OcppFrame {
-            ok: true, msg_type: mt, unique_id: uid,
-            action: "", payload: json_at(frame, 2),
-            error_code: "", error_desc: "",
+            ok: true, msg_type: mt, unique_id: uid, action: "", payload: json_at(frame, 2), error_code: "", error_desc: "",
         };
     } else if mt == OCPP_CALLERROR {
         return OcppFrame {
-            ok: true, msg_type: mt, unique_id: uid,
-            action: "", payload: json_at_safe(frame, 4),
-            error_code: json_unescape(json_at(frame, 2)),
-            error_desc: json_unescape(json_at(frame, 3)),
+            ok: true, msg_type: mt, unique_id: uid, action: "", payload: json_at_safe(frame, 4), error_code: json_unescape(json_at(frame, 2)), error_desc: json_unescape(json_at(frame, 3)),
         };
     }
     return ocpp_bad();
 }
 
 fn ocpp_bad() -> OcppFrame {
-    return OcppFrame { ok: false, msg_type: 0, unique_id: "", action: "", payload: "", error_code: "", error_desc: "" };
+    return OcppFrame {
+        ok: false, msg_type: 0, unique_id: "", action: "", payload: "", error_code: "", error_desc: ""
+    };
 }
 
 // ─── Unique ids + pending CALL tracking ──────────────────────────────────
@@ -138,12 +146,14 @@ pub struct OcppClient {
 }
 
 pub fn ocpp_client_new() -> OcppClient {
-    return OcppClient { next_id: 1, pend_ids: Vec::new(), pend_actions: Vec::new() };
+    return OcppClient {
+        next_id: 1, pend_ids: Vec::new(), pend_actions: Vec::new()
+    };
 }
 
 /// Produce the next unique id and remember a CALL of `action`; returns the
 /// full CALL frame.
-pub fn ocpp_client_call(c: & mut OcppClient, action: str, payload_json: str) -> str {
+pub fn ocpp_client_call(c: &mut OcppClient, action: str, payload_json: str) -> str {
     val uid: str = int_to_str(c.next_id);
     c.next_id = c.next_id + 1;
     c.pend_ids.push(uid);
@@ -153,9 +163,11 @@ pub fn ocpp_client_call(c: & mut OcppClient, action: str, payload_json: str) -> 
 
 /// Given a received result/error frame, return the action of the CALL it
 /// answers (and forget that CALL); "" if none is open for its id.
-pub fn ocpp_client_match(c: & mut OcppClient, frame: str) -> str {
+pub fn ocpp_client_match(c: &mut OcppClient, frame: str) -> str {
     val f: OcppFrame = ocpp_parse(frame);
-    if !f.ok { return ""; }
+    if !f.ok {
+        return "";
+    }
     var i: i64 = 0;
     while i < c.pend_ids.len() {
         if str_equal(c.pend_ids.get(i), f.unique_id) {
@@ -169,7 +181,7 @@ pub fn ocpp_client_match(c: & mut OcppClient, frame: str) -> str {
     return "";
 }
 
-pub fn ocpp_client_pending(c: & OcppClient) -> i64 {
+pub fn ocpp_client_pending(c: &OcppClient) -> i64 {
     return c.pend_ids.len();
 }
 
@@ -257,13 +269,15 @@ pub struct ChargePoint {
 }
 
 pub fn cp_new() -> ChargePoint {
-    return ChargePoint { state: CP_AVAILABLE, authorized: false, transaction_id: 0, meter_wh: 0, faulted: false };
+    return ChargePoint {
+        state: CP_AVAILABLE, authorized: false, transaction_id: 0, meter_wh: 0, faulted: false
+    };
 }
 
 /// Advance the state machine by one event; returns the new state. Unknown
 /// transitions leave the state unchanged. A fault forces Faulted until
 /// cleared; from Faulted only EV_FAULT_CLEAR escapes (to Available).
-pub fn cp_step(cp: & mut ChargePoint, event: i64) -> i64 {
+pub fn cp_step(cp: &mut ChargePoint, event: i64) -> i64 {
     if event == EV_FAULT {
         cp.state = CP_FAULTED;
         cp.faulted = true;
@@ -278,20 +292,37 @@ pub fn cp_step(cp: & mut ChargePoint, event: i64) -> i64 {
         return cp.state;
     }
     if cp.state == CP_AVAILABLE {
-        if event == EV_PLUG_IN { cp.state = CP_PREPARING; }
+        if event == EV_PLUG_IN {
+            cp.state = CP_PREPARING;
+        }
     } else if cp.state == CP_PREPARING {
-        if event == EV_AUTHORIZE { cp.authorized = true; }
-        else if event == EV_START {
-            if cp.authorized { cp.state = CP_CHARGING; }
-        } else if event == EV_UNPLUG { cp.state = CP_AVAILABLE; cp.authorized = false; }
+        if event == EV_AUTHORIZE {
+            cp.authorized = true;
+        } else if event == EV_START {
+            if cp.authorized {
+                cp.state = CP_CHARGING;
+            }
+        } else if event == EV_UNPLUG {
+            cp.state = CP_AVAILABLE;
+            cp.authorized = false;
+        }
     } else if cp.state == CP_CHARGING {
-        if event == EV_SUSPEND { cp.state = CP_SUSPENDED_EV; }
-        else if event == EV_STOP { cp.state = CP_FINISHING; }
+        if event == EV_SUSPEND {
+            cp.state = CP_SUSPENDED_EV;
+        } else if event == EV_STOP {
+            cp.state = CP_FINISHING;
+        }
     } else if cp.state == CP_SUSPENDED_EV {
-        if event == EV_RESUME { cp.state = CP_CHARGING; }
-        else if event == EV_STOP { cp.state = CP_FINISHING; }
+        if event == EV_RESUME {
+            cp.state = CP_CHARGING;
+        } else if event == EV_STOP {
+            cp.state = CP_FINISHING;
+        }
     } else if cp.state == CP_FINISHING {
-        if event == EV_UNPLUG { cp.state = CP_AVAILABLE; cp.authorized = false; }
+        if event == EV_UNPLUG {
+            cp.state = CP_AVAILABLE;
+            cp.authorized = false;
+        }
     }
     return cp.state;
 }
@@ -308,17 +339,21 @@ pub struct CentralSystem {
 }
 
 pub fn cs_new(current_time: str, interval: i64) -> CentralSystem {
-    return CentralSystem { accepted_tags: Vec::new(), next_tx: 1, current_time: current_time, heartbeat_interval: interval };
+    return CentralSystem {
+        accepted_tags: Vec::new(), next_tx: 1, current_time: current_time, heartbeat_interval: interval
+    };
 }
 
-pub fn cs_accept_tag(cs: & mut CentralSystem, tag: str) {
+pub fn cs_accept_tag(cs: &mut CentralSystem, tag: str) {
     cs.accepted_tags.push(tag);
 }
 
-fn cs_tag_ok(cs: & CentralSystem, tag: str) -> bool {
+fn cs_tag_ok(cs: &CentralSystem, tag: str) -> bool {
     var i: i64 = 0;
     while i < cs.accepted_tags.len() {
-        if str_equal(cs.accepted_tags.get(i), tag) { return true; }
+        if str_equal(cs.accepted_tags.get(i), tag) {
+            return true;
+        }
         i = i + 1;
     }
     return false;
@@ -327,7 +362,7 @@ fn cs_tag_ok(cs: & CentralSystem, tag: str) -> bool {
 /// Handle a CALL frame; returns the CALLRESULT (or CALLERROR) frame to send
 /// back. Supports BootNotification, Heartbeat, Authorize, StartTransaction
 /// and StopTransaction; other actions get a NotImplemented CALLERROR.
-pub fn cs_handle(cs: & mut CentralSystem, frame: str) -> str {
+pub fn cs_handle(cs: &mut CentralSystem, frame: str) -> str {
     val f: OcppFrame = ocpp_parse(frame);
     if !f.ok || f.msg_type != OCPP_CALL {
         return ocpp_build_error("", "FormationViolation", "not a CALL", "{}");
@@ -340,7 +375,9 @@ pub fn cs_handle(cs: & mut CentralSystem, frame: str) -> str {
     } else if str_equal(action, "Authorize") {
         val tag: str = json_get_str(f.payload, "idTag");
         var status: str = "Invalid";
-        if cs_tag_ok(cs, tag) { status = "Accepted"; }
+        if cs_tag_ok(cs, tag) {
+            status = "Accepted";
+        }
         return ocpp_build_result(f.unique_id, ocpp_id_tag_info(status));
     } else if str_equal(action, "StartTransaction") {
         val tag: str = json_get_str(f.payload, "idTag");

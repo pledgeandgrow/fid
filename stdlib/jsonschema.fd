@@ -31,7 +31,9 @@
 //   if !r.valid { println(r.errors.get(0)); }
 
 module jsonschema;
- use vec; use json; use regex;
+use vec;
+use json;
+use regex;
 
 pub struct JsResult {
     pub valid: bool,
@@ -39,11 +41,11 @@ pub struct JsResult {
 }
 
 struct JsCtx {
-    root: str,          // the root schema (for $ref resolution)
+    root: str,  // the root schema (for $ref resolution)
     errors: Vec<str>,
 }
 
-fn js_err(ctx: & mut JsCtx, path: str, msg: str) {
+fn js_err(ctx: &mut JsCtx, path: str, msg: str) {
     var p: str = path;
     if str_len(p) == 0 {
         p = "#";
@@ -67,7 +69,7 @@ fn js_is_int_number(v: str) -> bool {
 }
 
 // resolve a "#/a/b/0" JSON Pointer against the root schema
-fn js_resolve_ref(ctx: & JsCtx, ref: str) -> str {
+fn js_resolve_ref(ctx: &JsCtx, ref: str) -> str {
     if ref == "#" || str_len(ref) == 0 {
         return ctx.root;
     }
@@ -107,9 +109,16 @@ fn js_unescape_pointer(s: str) -> str {
     while i < str_len(s) {
         if str_byte_at(s, i) == 126 && i + 1 < str_len(s) {
             val n: i64 = str_byte_at(s, i + 1);
-            if n == 49 { o = o + "/"; i = i + 2; }
-            else if n == 48 { o = o + "~"; i = i + 2; }
-            else { o = o + "~"; i = i + 1; }
+            if n == 49 {
+                o = o + "/";
+                i = i + 2;
+            } else if n == 48 {
+                o = o + "~";
+                i = i + 2;
+            } else {
+                o = o + "~";
+                i = i + 1;
+            }
         } else {
             o = o + char_to_str(str_byte_at(s, i));
             i = i + 1;
@@ -140,12 +149,14 @@ fn js_type_matches(wanted: str, v: str) -> bool {
     return wanted == t;
 }
 
-fn js_count_valid(ctx: & mut JsCtx, schemas: Vec<str>, v: str, path: str) -> i64 {
+fn js_count_valid(ctx: &mut JsCtx, schemas: Vec<str>, v: str, path: str) -> i64 {
     var n: i64 = 0;
     var i: i64 = 0;
     while i < schemas.len() {
-        var sub: JsCtx = JsCtx { root: ctx.root, errors: Vec::new() };
-        js_check(& mut sub, schemas.get(i), v, path);
+        var sub: JsCtx = JsCtx {
+            root: ctx.root, errors: Vec::new()
+        };
+        js_check(&mut sub, schemas.get(i), v, path);
         if sub.errors.len() == 0 {
             n = n + 1;
         }
@@ -154,7 +165,7 @@ fn js_count_valid(ctx: & mut JsCtx, schemas: Vec<str>, v: str, path: str) -> i64
     return n;
 }
 
-fn js_check(ctx: & mut JsCtx, schema: str, v: str, path: str) {
+fn js_check(ctx: &mut JsCtx, schema: str, v: str, path: str) {
     val st: str = json_type_safe(schema);
     // boolean schema
     if st == "boolean" {
@@ -243,7 +254,7 @@ fn js_num(v: str) -> f64 {
     return str_parse_float(v);
 }
 
-fn js_check_number(ctx: & mut JsCtx, schema: str, v: str, path: str) {
+fn js_check_number(ctx: &mut JsCtx, schema: str, v: str, path: str) {
     val x: f64 = js_num(v);
     if json_has(schema, "minimum") {
         val m: f64 = js_num(json_get_safe(schema, "minimum"));
@@ -294,7 +305,7 @@ fn js_cp_len(s: str) -> i64 {
     return n;
 }
 
-fn js_check_string(ctx: & mut JsCtx, schema: str, v: str, path: str) {
+fn js_check_string(ctx: &mut JsCtx, schema: str, v: str, path: str) {
     val s: str = json_unescape(v);
     val n: i64 = js_cp_len(s);
     if json_has(schema, "minLength") {
@@ -315,7 +326,7 @@ fn js_check_string(ctx: & mut JsCtx, schema: str, v: str, path: str) {
     }
 }
 
-fn js_check_array(ctx: & mut JsCtx, schema: str, v: str, path: str) {
+fn js_check_array(ctx: &mut JsCtx, schema: str, v: str, path: str) {
     val items: Vec<str> = json_items(v);
     val n: i64 = items.len();
     if json_has(schema, "minItems") {
@@ -377,8 +388,10 @@ fn js_check_array(ctx: & mut JsCtx, schema: str, v: str, path: str) {
         var matched: i64 = 0;
         var i: i64 = 0;
         while i < n {
-            var sub: JsCtx = JsCtx { root: ctx.root, errors: Vec::new() };
-            js_check(& mut sub, cs, items.get(i), path);
+            var sub: JsCtx = JsCtx {
+                root: ctx.root, errors: Vec::new()
+            };
+            js_check(&mut sub, cs, items.get(i), path);
             if sub.errors.len() == 0 {
                 matched = matched + 1;
             }
@@ -400,7 +413,7 @@ fn js_check_array(ctx: & mut JsCtx, schema: str, v: str, path: str) {
     }
 }
 
-fn js_check_object(ctx: & mut JsCtx, schema: str, v: str, path: str) {
+fn js_check_object(ctx: &mut JsCtx, schema: str, v: str, path: str) {
     val keys: Vec<str> = json_keys(v);
     if json_has(schema, "minProperties") {
         if keys.len() < json_get_int(schema, "minProperties", 0) {
@@ -478,15 +491,19 @@ fn json_escape_min(s: str) -> str {
     var i: i64 = 0;
     while i < str_len(s) {
         val c: i64 = str_byte_at(s, i);
-        if c == 34 { o = o + "\\\""; }
-        else if c == 92 { o = o + "\\\\"; }
-        else { o = o + char_to_str(c); }
+        if c == 34 {
+            o = o + "\\\"";
+        } else if c == 92 {
+            o = o + "\\\\";
+        } else {
+            o = o + char_to_str(c);
+        }
         i = i + 1;
     }
     return o;
 }
 
-fn js_check_logic(ctx: & mut JsCtx, schema: str, v: str, path: str) {
+fn js_check_logic(ctx: &mut JsCtx, schema: str, v: str, path: str) {
     if json_has(schema, "allOf") {
         val arr: Vec<str> = json_items(json_get_safe(schema, "allOf"));
         var i: i64 = 0;
@@ -509,16 +526,20 @@ fn js_check_logic(ctx: & mut JsCtx, schema: str, v: str, path: str) {
         }
     }
     if json_has(schema, "not") {
-        var sub: JsCtx = JsCtx { root: ctx.root, errors: Vec::new() };
-        js_check(& mut sub, json_get_safe(schema, "not"), v, path);
+        var sub: JsCtx = JsCtx {
+            root: ctx.root, errors: Vec::new()
+        };
+        js_check(&mut sub, json_get_safe(schema, "not"), v, path);
         if sub.errors.len() == 0 {
             js_err(ctx, path, "value must not match the 'not' schema");
         }
     }
     // if / then / else
     if json_has(schema, "if") {
-        var sub: JsCtx = JsCtx { root: ctx.root, errors: Vec::new() };
-        js_check(& mut sub, json_get_safe(schema, "if"), v, path);
+        var sub: JsCtx = JsCtx {
+            root: ctx.root, errors: Vec::new()
+        };
+        js_check(&mut sub, json_get_safe(schema, "if"), v, path);
         if sub.errors.len() == 0 {
             if json_has(schema, "then") {
                 js_check(ctx, json_get_safe(schema, "then"), v, path);
@@ -537,16 +558,24 @@ pub fn jsonschema_validate(schema: str, instance: str) -> JsResult {
     if !json_is_valid(schema) {
         var e: Vec<str> = Vec::new();
         e.push("#: the schema is not valid JSON");
-        return JsResult { valid: false, errors: e };
+        return JsResult {
+            valid: false, errors: e
+        };
     }
     if !json_is_valid(instance) {
         var e: Vec<str> = Vec::new();
         e.push("#: the instance is not valid JSON");
-        return JsResult { valid: false, errors: e };
+        return JsResult {
+            valid: false, errors: e
+        };
     }
-    var ctx: JsCtx = JsCtx { root: schema, errors: Vec::new() };
-    js_check(& mut ctx, schema, instance, "#");
-    return JsResult { valid: ctx.errors.len() == 0, errors: ctx.errors };
+    var ctx: JsCtx = JsCtx {
+        root: schema, errors: Vec::new()
+    };
+    js_check(&mut ctx, schema, instance, "#");
+    return JsResult {
+        valid: ctx.errors.len() == 0, errors: ctx.errors
+    };
 }
 
 /// Just the boolean: does `instance` satisfy `schema`?

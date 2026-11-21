@@ -49,47 +49,71 @@ pub struct NdefRecord {
 }
 
 pub fn ndef_record(tnf: i64, rtype: str, payload: Vec<i64>) -> NdefRecord {
-    return NdefRecord { tnf: tnf, rtype: str_bytes(rtype), id: Vec::new(), payload: payload };
+    return NdefRecord {
+        tnf: tnf, rtype: str_bytes(rtype), id: Vec::new(), payload: payload
+    };
 }
 
 fn nfc_cat(out: &mut Vec<i64>, b: &Vec<i64>) {
     var i: i64 = 0;
-    while i < b.len() { out.push(b.get(i)); i = i + 1; }
+    while i < b.len() {
+        out.push(b.get(i));
+        i = i + 1;
+    }
 }
 
 fn nfc_sub(b: &Vec<i64>, from: i64, to: i64) -> Vec<i64> {
     var o: Vec<i64> = Vec::new();
     var i: i64 = from;
-    while i < to { o.push(b.get(i)); i = i + 1; }
+    while i < to {
+        o.push(b.get(i));
+        i = i + 1;
+    }
     return o;
 }
 
 fn nfc_same(a: &Vec<i64>, s: str) -> bool {
-    if a.len() != str_len(s) { return false; }
+    if a.len() != str_len(s) {
+        return false;
+    }
     var i: i64 = 0;
     while i < a.len() {
-        if a.get(i) != str_byte_at(s, i) { return false; }
+        if a.get(i) != str_byte_at(s, i) {
+            return false;
+        }
         i = i + 1;
     }
     return true;
 }
 
-pub fn ndef_type_is(r: &NdefRecord, tnf: i64, t: str) -> bool { return r.tnf == tnf && nfc_same(&r.rtype, t); }
+pub fn ndef_type_is(r: &NdefRecord, tnf: i64, t: str) -> bool {
+    return r.tnf == tnf && nfc_same(&r.rtype, t);
+}
 
 // One record (or chunk) with its flags.
 fn nfc_put_record(out: &mut Vec<i64>, flags: i64, tnf: i64, rtype: &Vec<i64>, id: &Vec<i64>, payload: &Vec<i64>) {
     var h: i64 = flags | tnf;
     val short: bool = payload.len() < 256;
-    if short { h = h | NDEF_SR; }
-    if id.len() > 0 { h = h | NDEF_IL; }
+    if short {
+        h = h | NDEF_SR;
+    }
+    if id.len() > 0 {
+        h = h | NDEF_IL;
+    }
     out.push(h);
     out.push(rtype.len());
-    if short { out.push(payload.len()); }
-    else {
+    if short {
+        out.push(payload.len());
+    } else {
         val n: i64 = payload.len();
-        out.push((n >> 24) & 255); out.push((n >> 16) & 255); out.push((n >> 8) & 255); out.push(n & 255);
+        out.push((n >> 24) & 255);
+        out.push((n >> 16) & 255);
+        out.push((n >> 8) & 255);
+        out.push(n & 255);
     }
-    if id.len() > 0 { out.push(id.len()); }
+    if id.len() > 0 {
+        out.push(id.len());
+    }
     nfc_cat(out, rtype);
     nfc_cat(out, id);
     nfc_cat(out, payload);
@@ -104,25 +128,41 @@ pub fn ndef_encode(records: Vec<NdefRecord>, chunk: i64) -> Vec<i64> {
     while i < records.len() {
         val r: NdefRecord = records.get(i);
         var fl: i64 = 0;
-        if i == 0 { fl = fl | NDEF_MB; }
+        if i == 0 {
+            fl = fl | NDEF_MB;
+        }
         val last: bool = i == records.len() - 1;
         if chunk > 0 && r.payload.len() > chunk {
             var pos: i64 = 0;
             var first: bool = true;
             while pos < r.payload.len() {
-                val end: i64 = if pos + chunk < r.payload.len() { pos + chunk } else { r.payload.len() };
+                val end: i64 = if pos + chunk < r.payload.len() {
+                    pos + chunk
+                } else {
+                    r.payload.len()
+                };
                 val part: Vec<i64> = nfc_sub(&r.payload, pos, end);
                 var f: i64 = 0;
-                if first && i == 0 { f = f | NDEF_MB; }
-                if end < r.payload.len() { f = f | NDEF_CF; }
-                else if last { f = f | NDEF_ME; }
-                if first { nfc_put_record(&mut out, f, r.tnf, &r.rtype, &r.id, &part); }
-                else { nfc_put_record(&mut out, f, TNF_UNCHANGED, &empty, &empty, &part); }
+                if first && i == 0 {
+                    f = f | NDEF_MB;
+                }
+                if end < r.payload.len() {
+                    f = f | NDEF_CF;
+                } else if last {
+                    f = f | NDEF_ME;
+                }
+                if first {
+                    nfc_put_record(&mut out, f, r.tnf, &r.rtype, &r.id, &part);
+                } else {
+                    nfc_put_record(&mut out, f, TNF_UNCHANGED, &empty, &empty, &part);
+                }
                 first = false;
                 pos = end;
             }
         } else {
-            if last { fl = fl | NDEF_ME; }
+            if last {
+                fl = fl | NDEF_ME;
+            }
             nfc_put_record(&mut out, fl, r.tnf, &r.rtype, &r.id, &r.payload);
         }
         i = i + 1;
@@ -137,67 +177,109 @@ pub struct NdefMessage {
     pub records: Vec<NdefRecord>,
 }
 
-fn nfc_fail(msg: str) -> NdefMessage { return NdefMessage { ok: false, error: msg, records: Vec::new() }; }
+fn nfc_fail(msg: str) -> NdefMessage {
+    return NdefMessage {
+        ok: false, error: msg, records: Vec::new()
+    };
+}
 
 pub fn ndef_decode(b: Vec<i64>) -> NdefMessage {
     var recs: Vec<NdefRecord> = Vec::new();
     var pos: i64 = 0;
     var first: bool = true;
     var in_chunk: bool = false;
-    var cur: NdefRecord = NdefRecord { tnf: 0, rtype: Vec::new(), id: Vec::new(), payload: Vec::new() };
+    var cur: NdefRecord = NdefRecord {
+        tnf: 0, rtype: Vec::new(), id: Vec::new(), payload: Vec::new()
+    };
     var ended: bool = false;
-    if b.len() == 0 { return nfc_fail("empty"); }
+    if b.len() == 0 {
+        return nfc_fail("empty");
+    }
     while pos < b.len() {
-        if ended { return nfc_fail("bytes after the ME record"); }
+        if ended {
+            return nfc_fail("bytes after the ME record");
+        }
         val h: i64 = b.get(pos);
         val tnf: i64 = h & 7;
-        if first && (h & NDEF_MB) == 0 { return nfc_fail("first record without MB"); }
-        if !first && (h & NDEF_MB) != 0 { return nfc_fail("MB on a later record"); }
-        if pos + 2 > b.len() { return nfc_fail("truncated header"); }
+        if first && (h & NDEF_MB) == 0 {
+            return nfc_fail("first record without MB");
+        }
+        if !first && (h & NDEF_MB) != 0 {
+            return nfc_fail("MB on a later record");
+        }
+        if pos + 2 > b.len() {
+            return nfc_fail("truncated header");
+        }
         val tl: i64 = b.get(pos + 1);
         var p: i64 = pos + 2;
         var pl: i64 = 0;
         if (h & NDEF_SR) != 0 {
-            if p >= b.len() { return nfc_fail("truncated length"); }
+            if p >= b.len() {
+                return nfc_fail("truncated length");
+            }
             pl = b.get(p);
             p = p + 1;
         } else {
-            if p + 4 > b.len() { return nfc_fail("truncated length"); }
+            if p + 4 > b.len() {
+                return nfc_fail("truncated length");
+            }
             pl = (b.get(p) << 24) | (b.get(p + 1) << 16) | (b.get(p + 2) << 8) | b.get(p + 3);
             p = p + 4;
         }
         var il: i64 = 0;
         if (h & NDEF_IL) != 0 {
-            if p >= b.len() { return nfc_fail("truncated id length"); }
+            if p >= b.len() {
+                return nfc_fail("truncated id length");
+            }
             il = b.get(p);
             p = p + 1;
         }
-        if p + tl + il + pl > b.len() { return nfc_fail("record longer than the message"); }
+        if p + tl + il + pl > b.len() {
+            return nfc_fail("record longer than the message");
+        }
         val rtype: Vec<i64> = nfc_sub(&b, p, p + tl);
         val rid: Vec<i64> = nfc_sub(&b, p + tl, p + tl + il);
         val payload: Vec<i64> = nfc_sub(&b, p + tl + il, p + tl + il + pl);
         pos = p + tl + il + pl;
         if in_chunk {
-            if tnf != TNF_UNCHANGED || tl != 0 || il != 0 { return nfc_fail("bad middle chunk"); }
+            if tnf != TNF_UNCHANGED || tl != 0 || il != 0 {
+                return nfc_fail("bad middle chunk");
+            }
             nfc_cat(&mut cur.payload, &payload);
             if (h & NDEF_CF) == 0 {
                 recs.push(cur);
                 in_chunk = false;
             }
         } else {
-            if tnf == TNF_UNCHANGED { return nfc_fail("unchanged TNF outside a chunk"); }
-            if tnf == 7 { return nfc_fail("reserved TNF"); }
-            cur = NdefRecord { tnf: tnf, rtype: rtype, id: rid, payload: payload };
-            if (h & NDEF_CF) != 0 { in_chunk = true; } else { recs.push(cur); }
+            if tnf == TNF_UNCHANGED {
+                return nfc_fail("unchanged TNF outside a chunk");
+            }
+            if tnf == 7 {
+                return nfc_fail("reserved TNF");
+            }
+            cur = NdefRecord {
+                tnf: tnf, rtype: rtype, id: rid, payload: payload
+            };
+            if (h & NDEF_CF) != 0 {
+                in_chunk = true;
+            } else {
+                recs.push(cur);
+            }
         }
         if (h & NDEF_ME) != 0 {
-            if in_chunk { return nfc_fail("ME inside a chunked record"); }
+            if in_chunk {
+                return nfc_fail("ME inside a chunked record");
+            }
             ended = true;
         }
         first = false;
     }
-    if !ended { return nfc_fail("no ME record"); }
-    return NdefMessage { ok: true, error: "", records: recs };
+    if !ended {
+        return nfc_fail("no ME record");
+    }
+    return NdefMessage {
+        ok: true, error: "", records: recs
+    };
 }
 
 // ─── URI records ───────────────────────────────────────────────────────
@@ -205,13 +287,42 @@ pub fn ndef_decode(b: Vec<i64>) -> NdefMessage {
 /// The URI identifier code table (NFC Forum URI RTD).
 pub fn nfc_uri_prefixes() -> Vec<str> {
     var v: Vec<str> = Vec::new();
-    v.push(""); v.push("http://www."); v.push("https://www."); v.push("http://"); v.push("https://");
-    v.push("tel:"); v.push("mailto:"); v.push("ftp://anonymous:anonymous@"); v.push("ftp://ftp.");
-    v.push("ftps://"); v.push("sftp://"); v.push("smb://"); v.push("nfs://"); v.push("ftp://"); v.push("dav://");
-    v.push("news:"); v.push("telnet://"); v.push("imap:"); v.push("rtsp://"); v.push("urn:"); v.push("pop:");
-    v.push("sip:"); v.push("sips:"); v.push("tftp:"); v.push("btspp://"); v.push("btl2cap://"); v.push("btgoep://");
-    v.push("tcpobex://"); v.push("irdaobex://"); v.push("file://"); v.push("urn:epc:id:"); v.push("urn:epc:tag:");
-    v.push("urn:epc:pat:"); v.push("urn:epc:raw:"); v.push("urn:epc:"); v.push("urn:nfc:");
+    v.push("");
+    v.push("http://www.");
+    v.push("https://www.");
+    v.push("http://");
+    v.push("https://");
+    v.push("tel:");
+    v.push("mailto:");
+    v.push("ftp://anonymous:anonymous@");
+    v.push("ftp://ftp.");
+    v.push("ftps://");
+    v.push("sftp://");
+    v.push("smb://");
+    v.push("nfs://");
+    v.push("ftp://");
+    v.push("dav://");
+    v.push("news:");
+    v.push("telnet://");
+    v.push("imap:");
+    v.push("rtsp://");
+    v.push("urn:");
+    v.push("pop:");
+    v.push("sip:");
+    v.push("sips:");
+    v.push("tftp:");
+    v.push("btspp://");
+    v.push("btl2cap://");
+    v.push("btgoep://");
+    v.push("tcpobex://");
+    v.push("irdaobex://");
+    v.push("file://");
+    v.push("urn:epc:id:");
+    v.push("urn:epc:tag:");
+    v.push("urn:epc:pat:");
+    v.push("urn:epc:raw:");
+    v.push("urn:epc:");
+    v.push("urn:nfc:");
     return v;
 }
 
@@ -220,7 +331,9 @@ pub fn ndef_uri_record(uri: str) -> NdefRecord {
     var best: i64 = 0;
     var i: i64 = 1;
     while i < pre.len() {
-        if str_starts_with(uri, pre.get(i)) && str_len(pre.get(i)) > str_len(pre.get(best)) { best = i; }
+        if str_starts_with(uri, pre.get(i)) && str_len(pre.get(i)) > str_len(pre.get(best)) {
+            best = i;
+        }
         i = i + 1;
     }
     var p: Vec<i64> = Vec::new();
@@ -232,11 +345,19 @@ pub fn ndef_uri_record(uri: str) -> NdefRecord {
 
 /// The URI of a URI record (or of an absolute-URI record); "" otherwise.
 pub fn ndef_uri(r: &NdefRecord) -> str {
-    if r.tnf == TNF_ABSOLUTE_URI { return enc_bytes_to_str(r.rtype); }
-    if !ndef_type_is(r, TNF_WELL_KNOWN, "U") || r.payload.len() < 1 { return ""; }
+    if r.tnf == TNF_ABSOLUTE_URI {
+        return enc_bytes_to_str(r.rtype);
+    }
+    if !ndef_type_is(r, TNF_WELL_KNOWN, "U") || r.payload.len() < 1 {
+        return "";
+    }
     val pre: Vec<str> = nfc_uri_prefixes();
     val code: i64 = r.payload.get(0);
-    val prefix: str = if code < pre.len() { pre.get(code) } else { "" };
+    val prefix: str = if code < pre.len() {
+        pre.get(code)
+    } else {
+        ""
+    };
     return prefix + enc_bytes_to_str(nfc_sub(&r.payload, 1, r.payload.len()));
 }
 
@@ -246,7 +367,11 @@ pub fn ndef_uri(r: &NdefRecord) -> str {
 pub fn ndef_text_record(text: str, lang: str, utf16: bool) -> NdefRecord {
     var p: Vec<i64> = Vec::new();
     val lb: Vec<i64> = str_bytes(lang);
-    p.push((if utf16 { 0x80 } else { 0 }) | (lb.len() & 0x3F));
+    p.push((if utf16 {
+        0x80
+    } else {
+        0
+    }) | (lb.len() & 0x3F));
     nfc_cat(&mut p, &lb);
     if utf16 {
         val cps: Vec<i64> = utf8_decode(text);
@@ -257,9 +382,13 @@ pub fn ndef_text_record(text: str, lang: str, utf16: bool) -> NdefRecord {
                 val v: i64 = c - 0x10000;
                 val hi: i64 = 0xD800 + (v >> 10);
                 val lo: i64 = 0xDC00 + (v & 0x3FF);
-                p.push(hi >> 8); p.push(hi & 255); p.push(lo >> 8); p.push(lo & 255);
+                p.push(hi >> 8);
+                p.push(hi & 255);
+                p.push(lo >> 8);
+                p.push(lo & 255);
             } else {
-                p.push(c >> 8); p.push(c & 255);
+                p.push(c >> 8);
+                p.push(c & 255);
             }
             i = i + 1;
         }
@@ -278,38 +407,68 @@ pub struct NdefText {
 }
 
 pub fn ndef_text(r: &NdefRecord) -> NdefText {
-    if !ndef_type_is(r, TNF_WELL_KNOWN, "T") || r.payload.len() < 1 { return NdefText { ok: false, lang: "", text: "", utf16: false }; }
+    if !ndef_type_is(r, TNF_WELL_KNOWN, "T") || r.payload.len() < 1 {
+        return NdefText {
+            ok: false, lang: "", text: "", utf16: false
+        };
+    }
     val st: i64 = r.payload.get(0);
     val ll: i64 = st & 0x3F;
     val utf16: bool = (st & 0x80) != 0;
-    if 1 + ll > r.payload.len() { return NdefText { ok: false, lang: "", text: "", utf16: utf16 }; }
+    if 1 + ll > r.payload.len() {
+        return NdefText {
+            ok: false, lang: "", text: "", utf16: utf16
+        };
+    }
     val lang: str = enc_bytes_to_str(nfc_sub(&r.payload, 1, 1 + ll));
     val body: Vec<i64> = nfc_sub(&r.payload, 1 + ll, r.payload.len());
-    if !utf16 { return NdefText { ok: true, lang: lang, text: enc_bytes_to_str(body), utf16: false }; }
+    if !utf16 {
+        return NdefText {
+            ok: true, lang: lang, text: enc_bytes_to_str(body), utf16: false
+        };
+    }
     var be: bool = true;
     var i: i64 = 0;
-    if body.len() >= 2 && body.get(0) == 0xFF && body.get(1) == 0xFE { be = false; i = 2; }
-    else if body.len() >= 2 && body.get(0) == 0xFE && body.get(1) == 0xFF { i = 2; }
+    if body.len() >= 2 && body.get(0) == 0xFF && body.get(1) == 0xFE {
+        be = false;
+        i = 2;
+    } else if body.len() >= 2 && body.get(0) == 0xFE && body.get(1) == 0xFF {
+        i = 2;
+    }
     var cps: Vec<i64> = Vec::new();
     while i + 1 < body.len() {
-        val u: i64 = if be { (body.get(i) << 8) | body.get(i + 1) } else { (body.get(i + 1) << 8) | body.get(i) };
+        val u: i64 = if be {
+            (body.get(i) << 8) | body.get(i + 1)
+        } else {
+            (body.get(i + 1) << 8) | body.get(i)
+        };
         i = i + 2;
         if u >= 0xD800 && u <= 0xDBFF && i + 1 < body.len() {
-            val l: i64 = if be { (body.get(i) << 8) | body.get(i + 1) } else { (body.get(i + 1) << 8) | body.get(i) };
+            val l: i64 = if be {
+                (body.get(i) << 8) | body.get(i + 1)
+            } else {
+                (body.get(i + 1) << 8) | body.get(i)
+            };
             if l >= 0xDC00 && l <= 0xDFFF {
                 cps.push(0x10000 + ((u - 0xD800) << 10) + (l - 0xDC00));
                 i = i + 2;
-            } else { cps.push(0xFFFD); }
+            } else {
+                cps.push(0xFFFD);
+            }
         } else {
             cps.push(u);
         }
     }
-    return NdefText { ok: true, lang: lang, text: utf8_encode_all(cps), utf16: true };
+    return NdefText {
+        ok: true, lang: lang, text: utf8_encode_all(cps), utf16: true
+    };
 }
 
 // ─── MIME, external and Android application records ────────────────────
 
-pub fn ndef_mime_record(mime_type: str, data: Vec<i64>) -> NdefRecord { return ndef_record(TNF_MEDIA, str_to_lower(mime_type), data); }
+pub fn ndef_mime_record(mime_type: str, data: Vec<i64>) -> NdefRecord {
+    return ndef_record(TNF_MEDIA, str_to_lower(mime_type), data);
+}
 
 /// An external type "domain:type" (NFC Forum external RTD, lower case).
 pub fn ndef_external_record(domain_type: str, data: Vec<i64>) -> NdefRecord {
@@ -317,7 +476,9 @@ pub fn ndef_external_record(domain_type: str, data: Vec<i64>) -> NdefRecord {
 }
 
 /// The Android application record that makes the tag open `package`.
-pub fn ndef_android_app_record(package: str) -> NdefRecord { return ndef_external_record("android.com:pkg", str_bytes(package)); }
+pub fn ndef_android_app_record(package: str) -> NdefRecord {
+    return ndef_external_record("android.com:pkg", str_bytes(package));
+}
 
 // ─── Smart poster ──────────────────────────────────────────────────────
 
@@ -332,12 +493,14 @@ pub struct SmartPoster {
     pub titles: Vec<str>,
     pub langs: Vec<str>,
     pub action: i64,
-    pub size: i64,      // -1 none
+    pub size: i64,  // -1 none
     pub mime: str,
 }
 
 pub fn smart_poster_new(uri: str) -> SmartPoster {
-    return SmartPoster { ok: true, uri: uri, titles: Vec::new(), langs: Vec::new(), action: NFC_ACTION_NONE, size: -1, mime: "" };
+    return SmartPoster {
+        ok: true, uri: uri, titles: Vec::new(), langs: Vec::new(), action: NFC_ACTION_NONE, size: -1, mime: ""
+    };
 }
 
 pub fn smart_poster_title(sp: &mut SmartPoster, lang: str, title: str) {
@@ -349,7 +512,10 @@ pub fn ndef_smart_poster_record(sp: &SmartPoster) -> NdefRecord {
     var inner: Vec<NdefRecord> = Vec::new();
     inner.push(ndef_uri_record(sp.uri));
     var i: i64 = 0;
-    while i < sp.titles.len() { inner.push(ndef_text_record(sp.titles.get(i), sp.langs.get(i), false)); i = i + 1; }
+    while i < sp.titles.len() {
+        inner.push(ndef_text_record(sp.titles.get(i), sp.langs.get(i), false));
+        i = i + 1;
+    }
     if sp.action >= 0 {
         var a: Vec<i64> = Vec::new();
         a.push(sp.action);
@@ -357,33 +523,49 @@ pub fn ndef_smart_poster_record(sp: &SmartPoster) -> NdefRecord {
     }
     if sp.size >= 0 {
         var s: Vec<i64> = Vec::new();
-        s.push((sp.size >> 24) & 255); s.push((sp.size >> 16) & 255); s.push((sp.size >> 8) & 255); s.push(sp.size & 255);
+        s.push((sp.size >> 24) & 255);
+        s.push((sp.size >> 16) & 255);
+        s.push((sp.size >> 8) & 255);
+        s.push(sp.size & 255);
         inner.push(ndef_record(TNF_WELL_KNOWN, "s", s));
     }
-    if str_len(sp.mime) > 0 { inner.push(ndef_record(TNF_WELL_KNOWN, "t", str_bytes(sp.mime))); }
+    if str_len(sp.mime) > 0 {
+        inner.push(ndef_record(TNF_WELL_KNOWN, "t", str_bytes(sp.mime)));
+    }
     return ndef_record(TNF_WELL_KNOWN, "Sp", ndef_encode(inner, 0));
 }
 
 pub fn ndef_smart_poster(r: &NdefRecord) -> SmartPoster {
     var sp: SmartPoster = smart_poster_new("");
     sp.ok = false;
-    if !ndef_type_is(r, TNF_WELL_KNOWN, "Sp") { return sp; }
+    if !ndef_type_is(r, TNF_WELL_KNOWN, "Sp") {
+        return sp;
+    }
     val m: NdefMessage = ndef_decode(r.payload);
-    if !m.ok { return sp; }
+    if !m.ok {
+        return sp;
+    }
     var i: i64 = 0;
     while i < m.records.len() {
         val x: NdefRecord = m.records.get(i);
-        if ndef_type_is(&x, TNF_WELL_KNOWN, "U") { sp.uri = ndef_uri(&x); sp.ok = true; }
+        if ndef_type_is(&x, TNF_WELL_KNOWN, "U") {
+            sp.uri = ndef_uri(&x);
+            sp.ok = true;
+        }
         if ndef_type_is(&x, TNF_WELL_KNOWN, "T") {
             val t: NdefText = ndef_text(&x);
             sp.titles.push(t.text);
             sp.langs.push(t.lang);
         }
-        if ndef_type_is(&x, TNF_WELL_KNOWN, "act") && x.payload.len() == 1 { sp.action = x.payload.get(0); }
+        if ndef_type_is(&x, TNF_WELL_KNOWN, "act") && x.payload.len() == 1 {
+            sp.action = x.payload.get(0);
+        }
         if ndef_type_is(&x, TNF_WELL_KNOWN, "s") && x.payload.len() == 4 {
             sp.size = (x.payload.get(0) << 24) | (x.payload.get(1) << 16) | (x.payload.get(2) << 8) | x.payload.get(3);
         }
-        if ndef_type_is(&x, TNF_WELL_KNOWN, "t") { sp.mime = enc_bytes_to_str(x.payload); }
+        if ndef_type_is(&x, TNF_WELL_KNOWN, "t") {
+            sp.mime = enc_bytes_to_str(x.payload);
+        }
         i = i + 1;
     }
     return sp;
@@ -397,8 +579,13 @@ pub fn nfc_tlv_wrap(message: Vec<i64>) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     out.push(0x03);
     val n: i64 = message.len();
-    if n < 0xFF { out.push(n); }
-    else { out.push(0xFF); out.push((n >> 8) & 255); out.push(n & 255); }
+    if n < 0xFF {
+        out.push(n);
+    } else {
+        out.push(0xFF);
+        out.push((n >> 8) & 255);
+        out.push(n & 255);
+    }
     nfc_cat(&mut out, &message);
     out.push(0xFE);
     return out;
@@ -410,19 +597,29 @@ pub fn nfc_tlv_find(area: Vec<i64>) -> Vec<i64> {
     var pos: i64 = 0;
     while pos < area.len() {
         val t: i64 = area.get(pos);
-        if t == 0x00 { pos = pos + 1; }
-        else if t == 0xFE { return Vec::new(); }
-        else {
-            if pos + 1 >= area.len() { return Vec::new(); }
+        if t == 0x00 {
+            pos = pos + 1;
+        } else if t == 0xFE {
+            return Vec::new();
+        } else {
+            if pos + 1 >= area.len() {
+                return Vec::new();
+            }
             var len: i64 = area.get(pos + 1);
             var v: i64 = pos + 2;
             if len == 0xFF {
-                if pos + 3 >= area.len() { return Vec::new(); }
+                if pos + 3 >= area.len() {
+                    return Vec::new();
+                }
                 len = (area.get(pos + 2) << 8) | area.get(pos + 3);
                 v = pos + 4;
             }
-            if v + len > area.len() { return Vec::new(); }
-            if t == 0x03 { return nfc_sub(&area, v, v + len); }
+            if v + len > area.len() {
+                return Vec::new();
+            }
+            if t == 0x03 {
+                return nfc_sub(&area, v, v + len);
+            }
             pos = v + len;
         }
     }
@@ -433,7 +630,10 @@ pub fn nfc_tlv_find(area: Vec<i64>) -> Vec<i64> {
 /// memory: magic E1, version 1.0, size / 8, read/write access 00.
 pub fn nfc_type2_cc(data_bytes: i64) -> Vec<i64> {
     var cc: Vec<i64> = Vec::new();
-    cc.push(0xE1); cc.push(0x10); cc.push(data_bytes / 8); cc.push(0x00);
+    cc.push(0xE1);
+    cc.push(0x10);
+    cc.push(data_bytes / 8);
+    cc.push(0x00);
     return cc;
 }
 
@@ -447,20 +647,40 @@ pub struct NfcCall {
 
 pub fn nfc_android_calls() -> Vec<NfcCall> {
     var v: Vec<NfcCall> = Vec::new();
-    v.push(NfcCall { cls: "android/nfc/NfcAdapter", method: "getDefaultAdapter", sig: "(Landroid/content/Context;)Landroid/nfc/NfcAdapter;" });
-    v.push(NfcCall { cls: "android/nfc/NfcAdapter", method: "enableReaderMode", sig: "(Landroid/app/Activity;Landroid/nfc/NfcAdapter$ReaderCallback;ILandroid/os/Bundle;)V" });
-    v.push(NfcCall { cls: "android/nfc/tech/Ndef", method: "get", sig: "(Landroid/nfc/Tag;)Landroid/nfc/tech/Ndef;" });
-    v.push(NfcCall { cls: "android/nfc/tech/Ndef", method: "getNdefMessage", sig: "()Landroid/nfc/NdefMessage;" });
-    v.push(NfcCall { cls: "android/nfc/NdefMessage", method: "toByteArray", sig: "()[B" });
-    v.push(NfcCall { cls: "android/nfc/tech/Ndef", method: "writeNdefMessage", sig: "(Landroid/nfc/NdefMessage;)V" });
+    v.push(NfcCall {
+        cls: "android/nfc/NfcAdapter", method: "getDefaultAdapter", sig: "(Landroid/content/Context;)Landroid/nfc/NfcAdapter;"
+    });
+    v.push(NfcCall {
+        cls: "android/nfc/NfcAdapter", method: "enableReaderMode", sig: "(Landroid/app/Activity;Landroid/nfc/NfcAdapter$ReaderCallback;ILandroid/os/Bundle;)V"
+    });
+    v.push(NfcCall {
+        cls: "android/nfc/tech/Ndef", method: "get", sig: "(Landroid/nfc/Tag;)Landroid/nfc/tech/Ndef;"
+    });
+    v.push(NfcCall {
+        cls: "android/nfc/tech/Ndef", method: "getNdefMessage", sig: "()Landroid/nfc/NdefMessage;"
+    });
+    v.push(NfcCall {
+        cls: "android/nfc/NdefMessage", method: "toByteArray", sig: "()[B"
+    });
+    v.push(NfcCall {
+        cls: "android/nfc/tech/Ndef", method: "writeNdefMessage", sig: "(Landroid/nfc/NdefMessage;)V"
+    });
     return v;
 }
 
 pub fn nfc_ios_calls() -> Vec<NfcCall> {
     var v: Vec<NfcCall> = Vec::new();
-    v.push(NfcCall { cls: "NFCNDEFReaderSession", method: "initWithDelegate:queue:invalidateAfterFirstRead:", sig: "@@:@@B" });
-    v.push(NfcCall { cls: "NFCNDEFReaderSession", method: "beginSession", sig: "v@:" });
-    v.push(NfcCall { cls: "NFCNDEFPayload", method: "typeNameFormat", sig: "C@:" });
-    v.push(NfcCall { cls: "NFCNDEFPayload", method: "payload", sig: "@@:" });
+    v.push(NfcCall {
+        cls: "NFCNDEFReaderSession", method: "initWithDelegate:queue:invalidateAfterFirstRead:", sig: "@@:@@B"
+    });
+    v.push(NfcCall {
+        cls: "NFCNDEFReaderSession", method: "beginSession", sig: "v@:"
+    });
+    v.push(NfcCall {
+        cls: "NFCNDEFPayload", method: "typeNameFormat", sig: "C@:"
+    });
+    v.push(NfcCall {
+        cls: "NFCNDEFPayload", method: "payload", sig: "@@:"
+    });
     return v;
 }

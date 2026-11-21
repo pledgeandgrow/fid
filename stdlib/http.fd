@@ -26,15 +26,20 @@
 // making requests.
 
 module http;
- use json; use signal; use task; use trace;
- // SAFETY: the prototype comes from <string.h>; hc_copy moves bytes inside
- // the connection's read buffer, within the bytes it holds.
- extern "C" include "<string.h>" {
-    fn memmove as hc_memmove(dst: * u8, src: * u8, n: i64) -> * u8;
+use json;
+use signal;
+use task;
+use trace;
+// SAFETY: the prototype comes from <string.h>; hc_copy moves bytes inside
+// the connection's read buffer, within the bytes it holds.
+extern "C" include "<string.h>" {
+    fn memmove as hc_memmove(dst: *u8, src: *u8, n: i64) -> *u8;
 }
 
 /// Largest request head and body a server accepts.
-const HTTP_MAX_HEAD: i64 = 65536; const HTTP_MAX_BODY: i64 = 16777216;  /// A connection that sends nothing for this long is closed (ms).
+const HTTP_MAX_HEAD: i64 = 65536;
+const HTTP_MAX_BODY: i64 = 16777216;
+/// A connection that sends nothing for this long is closed (ms).
 const HTTP_IDLE_MS: i64 = 30000;
 /// A message as it arrived. For a response, `method` is the protocol word and
 /// `target` the status code.
@@ -55,7 +60,8 @@ pub struct HttpRequest {
 /// passed where an owned str is taken; `str_clone` makes an owned copy. A
 /// ScopedRequest itself cannot be kept (no field, global, collection or
 /// result may hold one). Headers: http_scoped_header.
-@scoped pub struct ScopedRequest {
+@scoped
+pub struct ScopedRequest {
     pub method: str,
     pub target: str,
     pub path: str,
@@ -346,41 +352,41 @@ pub fn status_text(code: i64) -> str {
 // its size, the bytes in it, the first byte not yet consumed.
 
 fn hc_get(c: i64, i: i64) -> i64 {
-    var p: * mut i64 = c + i * 8;
+    var p: *mut i64 = c + i * 8;
     var v: i64 = 0;
     // SAFETY: private helper; c is a 6-word connection block from
     // p_malloc(48) and i is one of its word indexes (0..5).
     unsafe {
-        v = * p;
+        v = *p;
     }
     return v;
 }
 
 fn hc_set(c: i64, i: i64, v: i64) {
-    var p: * mut i64 = c + i * 8;
+    var p: *mut i64 = c + i * 8;
     // SAFETY: private helper; as hc_get, word i (0..5) of a connection block.
     unsafe {
-        * p = v;
+        *p = v;
     }
 }
 
 fn hc_byte(addr: i64) -> i64 {
-    var p: * mut u8 = addr;
+    var p: *mut u8 = addr;
     var v: i64 = 0;
     // SAFETY: private helper; callers read buf + i with i below the bytes in
     // the connection's read buffer (the scan loops stop at hc_get(c, 4)).
     unsafe {
-        v = (* p) as i64;
+        v = (*p) as i64;
     }
     return v;
 }
 
 fn hc_set_byte(addr: i64, v: i64) {
-    var p: * mut u8 = addr;
+    var p: *mut u8 = addr;
     // SAFETY: private helper; callers write inside a block they allocated,
     // below its length.
     unsafe {
-        * p = v as u8;
+        *p = v as u8;
     }
 }
 
@@ -389,11 +395,11 @@ fn hc_copy(dst: i64, src: i64, n: i64) {
 }
 
 fn hc_no_tls_recv(tls: i64, buf: i64, n: i64, timeout_ms: i64) -> i64 {
-    return - 1;
+    return -1;
 }
 
 fn hc_no_tls_send(tls: i64, buf: i64, n: i64) -> i64 {
-    return - 1;
+    return -1;
 }
 
 fn hc_no_tls_close(tls: i64) -> i64 {
@@ -405,7 +411,10 @@ fn hc_no_tls_accept(fd: i64) -> i64 {
 }
 
 // Module `https` sets these
-var http_tls_recv: fn(i64, i64, i64, i64) -> i64 = hc_no_tls_recv; var http_tls_send: fn(i64, i64, i64) -> i64 = hc_no_tls_send; var http_tls_close: fn(i64) -> i64 = hc_no_tls_close; var http_tls_accept: fn(i64) -> i64 = hc_no_tls_accept;
+var http_tls_recv: fn(i64, i64, i64, i64) -> i64 = hc_no_tls_recv;
+var http_tls_send: fn(i64, i64, i64) -> i64 = hc_no_tls_send;
+var http_tls_close: fn(i64) -> i64 = hc_no_tls_close;
+var http_tls_accept: fn(i64) -> i64 = hc_no_tls_accept;
 /// For module `https`: how to read, write, close and accept a TLS session.
 pub fn http_set_tls(recv: fn(i64, i64, i64, i64) -> i64, send: fn(i64, i64, i64) -> i64, close: fn(i64) -> i64, accept: fn(i64) -> i64) {
     http_tls_recv = recv;
@@ -495,7 +504,7 @@ fn hc_find_line(c: i64, from: i64) -> i64 {
         }
         i = i + 1;
     }
-    return - 1;
+    return -1;
 }
 
 /// The offset of the "\r\n\r\n" that ends a head, or -1.
@@ -504,7 +513,7 @@ fn hc_find_head(c: i64) -> i64 {
     while true {
         val at: i64 = hc_find_line(c, from);
         if at < 0 {
-            return - 1;
+            return -1;
         }
         val buf: i64 = hc_get(c, 2) + hc_get(c, 5);
         if at + 3 < hc_get(c, 4) - hc_get(c, 5) && hc_byte(buf + at + 2) == 13 && hc_byte(buf + at + 3) == 10 {
@@ -512,7 +521,7 @@ fn hc_find_head(c: i64) -> i64 {
         }
         from = at + 2;
     }
-    return - 1;
+    return -1;
 }
 
 /// Take `n` bytes off the buffer, reading more as needed; "" if the input ends.
@@ -552,7 +561,7 @@ fn hs_allocated(s: str) -> bool {
         return true;
     }
     // A plain allocator block (unheadered), detected by the block magic.
-    return ((hc_get(s as i64, - 1) >> 48) & 65535) == 61918 && ((hc_get(s as i64, - 1) >> 40) & 255) == 90;
+    return ((hc_get(s as i64, -1) >> 48) & 65535) == 61918 && ((hc_get(s as i64, -1) >> 40) & 255) == 90;
 }
 
 fn hc_hex(s: str) -> i64 {
@@ -657,8 +666,11 @@ pub fn http_not_found(req: HttpRequest) -> str {
     return build_response(404, "text/plain", "Not Found\n");
 }
 
-var http_handler: fn(HttpRequest) -> str = http_not_found; var http_secure: bool = false; var http_scoped: bool = false; var http_user_handler: fn(HttpRequest) -> str = http_not_found;
- fn http_scoped_not_found(req: ScopedRequest) -> str {
+var http_handler: fn(HttpRequest) -> str = http_not_found;
+var http_secure: bool = false;
+var http_scoped: bool = false;
+var http_user_handler: fn(HttpRequest) -> str = http_not_found;
+fn http_scoped_not_found(req: ScopedRequest) -> str {
     return build_response(404, "text/plain", "Not Found\n");
 }
 
@@ -744,12 +756,13 @@ pub fn http_conn_task(c: i64) -> i64 {
         if session == 0 {
             http_conn_close(c);
             if http_st != 0 {
-                p_atomic_add(http_st + 8, - 1);
+                p_atomic_add(http_st + 8, -1);
             }
             return 0;
         }
         hc_set(c, 1, session);
-    } while true {
+    }
+    while true {
         // While shutting down, idle keep-alive reads time out fast so the
         // connection drains instead of lingering for the full idle window.
         var idle: i64 = HTTP_IDLE_MS;
@@ -787,7 +800,7 @@ pub fn http_conn_task(c: i64) -> i64 {
     }
     http_conn_close(c);
     if http_st != 0 {
-        p_atomic_add(http_st + 8, - 1);
+        p_atomic_add(http_st + 8, -1);
     }
     return 0;
 }
@@ -809,7 +822,8 @@ pub fn http_accept_task(fd: i64) -> i64 {
                 task_detach(task_go("http_conn_task", http_conn_new(client, 0)));
             }
         }
-    } while http_st != 0 && p_atomic_load(http_st + 8) > 0 {
+    }
+    while http_st != 0 && p_atomic_load(http_st + 8) > 0 {
         task_sleep(50);
     }
     p_socket_close(fd);
@@ -983,7 +997,7 @@ pub fn router_new() -> Router {
 /// method: "GET", "POST", "PUT", "DELETE", etc.
 /// path: path pattern (e.g. "/", "/users", "/users/:id")
 /// handler: function to call when the route matches
-pub fn router_add(router: & mut Router, method: str, path: str, handler: route_handler) -> void {
+pub fn router_add(router: &mut Router, method: str, path: str, handler: route_handler) -> void {
     var route = Route {
         method: method, path: path, handler: handler
     };

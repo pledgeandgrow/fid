@@ -29,12 +29,14 @@
 // scripts/verify/crypto_bind_unix_check.fd.
 
 module crypto_bind;
- use vec; use string; use crypto_bind_rsa;
- // SAFETY: each declaration matches the OpenSSL prototype it names (pointers
- // and handles as i64 words, ints as i32 results); every pointer passed is 0,
- // an OpenSSL object this module made, or a block it allocated with at least
- // the length passed beside it.
- extern "C" link "crypto" {
+use vec;
+use string;
+use crypto_bind_rsa;
+// SAFETY: each declaration matches the OpenSSL prototype it names (pointers
+// and handles as i64 words, ints as i32 results); every pointer passed is 0,
+// an OpenSSL object this module made, or a block it allocated with at least
+// the length passed beside it.
+extern "C" link "crypto" {
     fn EVP_CIPHER_CTX_new as cu_ctx_new() -> i64;
     fn EVP_CIPHER_CTX_free as cu_ctx_free(ctx: i64);
     fn EVP_CIPHER_CTX_ctrl as cu_ctx_ctrl(ctx: i64, kind: i64, arg: i64, ptr: i64) -> i32;
@@ -104,11 +106,14 @@ module crypto_bind;
 
 // EVP_CTRL_GCM_SET_IVLEN, EVP_CTRL_GCM_GET_TAG, EVP_CTRL_GCM_SET_TAG
 // (openssl/evp.h: 0x9, 0x10, 0x11)
-const CU_GCM_SET_IVLEN: i64 = 9; const CU_GCM_GET_TAG: i64 = 16; const CU_GCM_SET_TAG: i64 = 17;
+const CU_GCM_SET_IVLEN: i64 = 9;
+const CU_GCM_GET_TAG: i64 = 16;
+const CU_GCM_SET_TAG: i64 = 17;
 // NID_X9_62_prime256v1 (openssl/obj_mac.h)
 const CU_NID_P256: i64 = 415;
 // BCRYPT_ECDSA_PUBLIC_P256_MAGIC, BCRYPT_ECDSA_PRIVATE_P256_MAGIC
-const CU_P256_PUBLIC: i64 = 827540293; const CU_P256_PRIVATE: i64 = 844317509;
+const CU_P256_PUBLIC: i64 = 827540293;
+const CU_P256_PRIVATE: i64 = 844317509;
 const CU_COORD: i64 = 32;
 
 // ─── raw memory helpers ───────────────────────────────────────────────────
@@ -118,8 +123,8 @@ fn cu_get(p: i64) -> i64 {
     // SAFETY: private helper; every caller reads an 8-byte slot from
     // cu_slot() (cu_zeroed(8)) or a 4-byte length in one.
     unsafe {
-        var q: * mut i64 = p;
-        v = * q;
+        var q: *mut i64 = p;
+        v = *q;
     }
     return v;
 }
@@ -129,8 +134,8 @@ fn cu_byte(p: i64) -> i64 {
     // SAFETY: private helper; every caller reads p + i with i below the
     // length of a block it allocated (cu_zeroed, cu_buf).
     unsafe {
-        var q: * mut u8 = p;
-        v = (* q) as i64;
+        var q: *mut u8 = p;
+        v = (*q) as i64;
     }
     return v & 255;
 }
@@ -139,8 +144,8 @@ fn cu_set_byte(p: i64, v: i64) {
     // SAFETY: private helper; every caller writes p + i with i below the
     // length of a block it allocated (cu_zeroed, cu_buf).
     unsafe {
-        var q: * mut u8 = p;
-        * q = (v & 255) as u8;
+        var q: *mut u8 = p;
+        *q = (v & 255) as u8;
     }
 }
 
@@ -169,7 +174,7 @@ fn cu_slot_int(p: i64) -> i64 {
 }
 
 /// A byte Vec copied into memory (a Vec<i64> is a header, not bytes).
-fn cu_buf(v: & Vec) -> i64 {
+fn cu_buf(v: &Vec) -> i64 {
     val n: i64 = v.len();
     val p: i64 = cu_zeroed(n);
     var i: i64 = 0;
@@ -181,7 +186,7 @@ fn cu_buf(v: & Vec) -> i64 {
 }
 
 /// Bytes [from, from + n) of `v` copied into memory.
-fn cu_buf_range(v: & Vec, from: i64, n: i64) -> i64 {
+fn cu_buf_range(v: &Vec, from: i64, n: i64) -> i64 {
     val p: i64 = cu_zeroed(n);
     var i: i64 = 0;
     while i < n {
@@ -211,14 +216,14 @@ fn cu_wipe_free(p: i64, n: i64) {
     p_free(p);
 }
 
-fn cu_push_u32le(out: & mut Vec<i64>, v: i64) {
+fn cu_push_u32le(out: &mut Vec<i64>, v: i64) {
     out.push(v & 255);
     out.push((v >> 8) & 255);
     out.push((v >> 16) & 255);
     out.push((v >> 24) & 255);
 }
 
-fn cu_u32le(v: & Vec, at: i64) -> i64 {
+fn cu_u32le(v: &Vec, at: i64) -> i64 {
     return (v.get(at) & 255) | ((v.get(at + 1) & 255) << 8) | ((v.get(at + 2) & 255) << 16) | ((v.get(at + 3) & 255) << 24);
 }
 
@@ -242,7 +247,8 @@ fn cu_gcm_cipher(n: i64) -> i64 {
 /// key is 16, 24 or 32 bytes; nonce 12 bytes recommended; aad may be empty.
 /// The key is `@secret` (complaint CO1): this body may not print, log,
 /// send or store it; the result is an audited release (`@declassify`).
-@declassify pub fn cb_gcm_encrypt(@secret key: & Vec, nonce: & Vec, aad: & Vec, pt: & Vec) -> Vec<i64> {
+@declassify
+pub fn cb_gcm_encrypt(@secret key: &Vec, nonce: &Vec, aad: &Vec, pt: &Vec) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     val cipher: i64 = cu_gcm_cipher(key.len());
     if cipher == 0 || nonce.len() == 0 {
@@ -296,7 +302,8 @@ fn cu_gcm_cipher(n: i64) -> i64 {
 /// (tag mismatch included).
 /// The key is `@secret` (complaint CO1): this body may not print, log,
 /// send or store it; the result is an audited release (`@declassify`).
-@declassify pub fn cb_gcm_decrypt(@secret key: & Vec, nonce: & Vec, aad: & Vec, ct_tag: & Vec) -> Vec<i64> {
+@declassify
+pub fn cb_gcm_decrypt(@secret key: &Vec, nonce: &Vec, aad: &Vec, ct_tag: &Vec) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     if ct_tag.len() < 16 {
         return out;
@@ -348,7 +355,8 @@ fn cu_gcm_cipher(n: i64) -> i64 {
 /// PBKDF2-HMAC-SHA256: derives `out_len` bytes; empty Vec on failure.
 /// The key is `@secret` (complaint CO1): this body may not print, log,
 /// send or store it; the result is an audited release (`@declassify`).
-@declassify pub fn cb_pbkdf2_derive(@secret password: & Vec, salt: & Vec, iters: i64, out_len: i64) -> Vec<i64> {
+@declassify
+pub fn cb_pbkdf2_derive(@secret password: &Vec, salt: &Vec, iters: i64, out_len: i64) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     if iters < 1 || out_len < 1 {
         return out;
@@ -370,7 +378,7 @@ fn cu_gcm_cipher(n: i64) -> i64 {
 
 /// A BIGNUM as `CU_COORD` big-endian bytes appended to `out`. False if it
 /// does not fit.
-fn cu_push_bn(out: & mut Vec<i64>, bn: i64) -> bool {
+fn cu_push_bn(out: &mut Vec<i64>, bn: i64) -> bool {
     val b: i64 = cu_zeroed(CU_COORD);
     val ok: bool = cu_bn_to(bn, b, CU_COORD) == CU_COORD;
     if ok {
@@ -393,14 +401,14 @@ fn cu_blob(key: i64, is_private: bool) -> Vec<i64> {
     ok = ok && cu_point_xy(cu_ec_group(key), cu_ec_public(key), x, y, 0) == 1;
     if ok {
         if is_private {
-            cu_push_u32le(& mut out, CU_P256_PRIVATE);
+            cu_push_u32le(&mut out, CU_P256_PRIVATE);
         } else {
-            cu_push_u32le(& mut out, CU_P256_PUBLIC);
+            cu_push_u32le(&mut out, CU_P256_PUBLIC);
         }
-        cu_push_u32le(& mut out, CU_COORD);
-        ok = cu_push_bn(& mut out, x) && cu_push_bn(& mut out, y);
+        cu_push_u32le(&mut out, CU_COORD);
+        ok = cu_push_bn(&mut out, x) && cu_push_bn(&mut out, y);
         if ok && is_private {
-            ok = cu_push_bn(& mut out, cu_ec_private(key));
+            ok = cu_push_bn(&mut out, cu_ec_private(key));
         }
     }
     if x != 0 {
@@ -416,20 +424,20 @@ fn cu_blob(key: i64, is_private: bool) -> Vec<i64> {
 }
 
 /// Generate a P-256 key pair into priv_blob/pub_blob. 0 on success.
-pub fn cb_ecdsa_generate(priv_blob: & mut Vec, pub_blob: & mut Vec) -> i64 {
+pub fn cb_ecdsa_generate(priv_blob: &mut Vec, pub_blob: &mut Vec) -> i64 {
     val key: i64 = cu_ec_new(CU_NID_P256);
     if key == 0 {
-        return - 1;
+        return -1;
     }
     if cu_ec_generate(key) != 1 {
         cu_ec_free(key);
-        return - 1;
+        return -1;
     }
     val priv: Vec<i64> = cu_blob(key, true);
     val pubb: Vec<i64> = cu_blob(key, false);
     cu_ec_free(key);
     if priv.len() == 0 || pubb.len() == 0 {
-        return - 1;
+        return -1;
     }
     var i: i64 = 0;
     while i < priv.len() {
@@ -446,7 +454,7 @@ pub fn cb_ecdsa_generate(priv_blob: & mut Vec, pub_blob: & mut Vec) -> i64 {
 
 /// An EC_KEY from a blob (checked: size, magic, coordinate size, the point
 /// on the curve), or 0.
-fn cu_import(blob: & Vec, is_private: bool) -> i64 {
+fn cu_import(blob: &Vec, is_private: bool) -> i64 {
     var want: i64 = 8 + 2 * CU_COORD;
     var magic: i64 = CU_P256_PUBLIC;
     if is_private {
@@ -492,7 +500,8 @@ fn cu_import(blob: & Vec, is_private: bool) -> i64 {
 /// Sign a 32-byte hash with the private blob: 64-byte r||s, empty on error.
 /// The key is `@secret` (complaint CO1): this body may not print, log,
 /// send or store it; the result is an audited release (`@declassify`).
-@declassify pub fn cb_ecdsa_sign(@secret priv_blob: & Vec, hash: & Vec) -> Vec<i64> {
+@declassify
+pub fn cb_ecdsa_sign(@secret priv_blob: &Vec, hash: &Vec) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     if hash.len() != 32 {
         return out;
@@ -509,7 +518,7 @@ fn cu_import(blob: & Vec, is_private: bool) -> i64 {
         val ss: i64 = cu_slot();
         cu_sig_get0(sig, rs, ss);
         var rsv: Vec<i64> = Vec::new();
-        if cu_push_bn(& mut rsv, cu_get(rs)) && cu_push_bn(& mut rsv, cu_get(ss)) {
+        if cu_push_bn(&mut rsv, cu_get(rs)) && cu_push_bn(&mut rsv, cu_get(ss)) {
             out = rsv;
         }
         p_free(rs);
@@ -521,7 +530,7 @@ fn cu_import(blob: & Vec, is_private: bool) -> i64 {
 }
 
 /// Verify a 64-byte r||s signature over a 32-byte hash with the public blob.
-pub fn cb_ecdsa_verify(pub_blob: & Vec, hash: & Vec, sig: & Vec) -> bool {
+pub fn cb_ecdsa_verify(pub_blob: &Vec, hash: &Vec, sig: &Vec) -> bool {
     if hash.len() != 32 || sig.len() != 64 {
         return false;
     }
@@ -570,16 +579,23 @@ pub fn cb_ecdsa_verify(pub_blob: & Vec, hash: & Vec, sig: & Vec) -> bool {
 // EVP_PKEY_RSA; EVP_PKEY_CTRL_MD; EVP_PKEY_CTRL_RSA_PADDING, _PSS_SALTLEN,
 // _MGF1_MD, _OAEP_MD, _OAEP_LABEL (EVP_PKEY_ALG_CTRL 0x1000 + 1, 2, 5, 9,
 // 10); RSA_PKCS1_PADDING, RSA_PKCS1_OAEP_PADDING, RSA_PKCS1_PSS_PADDING
-const CU_PKEY_RSA: i64 = 6; const CU_CTRL_MD: i64 = 1;
-const CU_CTRL_PADDING: i64 = 4097; const CU_CTRL_SALTLEN: i64 = 4098; const CU_CTRL_MGF1_MD: i64 = 4101; const CU_CTRL_OAEP_MD: i64 = 4105; const CU_CTRL_OAEP_LABEL: i64 = 4106;
-const CU_PAD_PKCS1: i64 = 1; const CU_PAD_OAEP: i64 = 4; const CU_PAD_PSS: i64 = 6;
+const CU_PKEY_RSA: i64 = 6;
+const CU_CTRL_MD: i64 = 1;
+const CU_CTRL_PADDING: i64 = 4097;
+const CU_CTRL_SALTLEN: i64 = 4098;
+const CU_CTRL_MGF1_MD: i64 = 4101;
+const CU_CTRL_OAEP_MD: i64 = 4105;
+const CU_CTRL_OAEP_LABEL: i64 = 4106;
+const CU_PAD_PKCS1: i64 = 1;
+const CU_PAD_OAEP: i64 = 4;
+const CU_PAD_PSS: i64 = 6;
 
 fn cu_put(p: i64, v: i64) {
     // SAFETY: private helper; every caller writes an 8-byte slot from
     // cu_slot() (cu_zeroed(8)).
     unsafe {
-        var q: * mut i64 = p;
-        * q = v;
+        var q: *mut i64 = p;
+        *q = v;
     }
 }
 
@@ -601,7 +617,7 @@ fn cu_md(alg: str) -> i64 {
 }
 
 // A BIGNUM of big-endian bytes (0 on failure).
-fn cu_bn_of(v: & Vec) -> i64 {
+fn cu_bn_of(v: &Vec) -> i64 {
     val b: i64 = cu_buf(v);
     val bn: i64 = cu_bn_from(b, v.len(), 0);
     cu_wipe_free(b, v.len());
@@ -632,7 +648,7 @@ fn cu_bn_drop(bn: i64) {
 // An EVP_PKEY holding the RSA key of a blob (checked first:
 // crypto_bind_rsa's cbr_blob_ok), or 0. `want_private`: the blob must hold
 // the private key.
-fn cu_rsa_pkey(blob: & Vec, want_private: bool) -> i64 {
+fn cu_rsa_pkey(blob: &Vec, want_private: bool) -> i64 {
     if !cbr_blob_ok(blob, want_private) {
         return 0;
     }
@@ -641,11 +657,11 @@ fn cu_rsa_pkey(blob: & Vec, want_private: bool) -> i64 {
     if rsa == 0 {
         return 0;
     }
-    val n: i64 = cu_bn_of(& cbr_blob_part(blob, 1));
-    val e: i64 = cu_bn_of(& cbr_blob_part(blob, 0));
+    val n: i64 = cu_bn_of(&cbr_blob_part(blob, 1));
+    val e: i64 = cu_bn_of(&cbr_blob_part(blob, 0));
     var d: i64 = 0;
     if full {
-        d = cu_bn_of(& cbr_blob_part(blob, 7));
+        d = cu_bn_of(&cbr_blob_part(blob, 7));
     }
     if n == 0 || e == 0 || (full && d == 0) || cu_rsa_set0_key(rsa, n, e, d) != 1 {
         cu_bn_drop(n);
@@ -656,17 +672,17 @@ fn cu_rsa_pkey(blob: & Vec, want_private: bool) -> i64 {
     }
     // the RSA object owns n, e and d now
     if full {
-        val p: i64 = cu_bn_of(& cbr_blob_part(blob, 2));
-        val q: i64 = cu_bn_of(& cbr_blob_part(blob, 3));
+        val p: i64 = cu_bn_of(&cbr_blob_part(blob, 2));
+        val q: i64 = cu_bn_of(&cbr_blob_part(blob, 3));
         if p == 0 || q == 0 || cu_rsa_set0_factors(rsa, p, q) != 1 {
             cu_bn_drop(p);
             cu_bn_drop(q);
             cu_rsa_free(rsa);
             return 0;
         }
-        val dp: i64 = cu_bn_of(& cbr_blob_part(blob, 4));
-        val dq: i64 = cu_bn_of(& cbr_blob_part(blob, 5));
-        val qi: i64 = cu_bn_of(& cbr_blob_part(blob, 6));
+        val dp: i64 = cu_bn_of(&cbr_blob_part(blob, 4));
+        val dq: i64 = cu_bn_of(&cbr_blob_part(blob, 5));
+        val qi: i64 = cu_bn_of(&cbr_blob_part(blob, 6));
         if dp == 0 || dq == 0 || qi == 0 || cu_rsa_set0_crt(rsa, dp, dq, qi) != 1 {
             cu_bn_drop(dp);
             cu_bn_drop(dq);
@@ -689,26 +705,26 @@ fn cu_rsa_pkey(blob: & Vec, want_private: bool) -> i64 {
 // Set the padding (and its hashes) of an initialized EVP_PKEY_CTX. True
 // when OpenSSL took every setting.
 fn cu_rsa_padding(ctx: i64, pad: i64, md: i64, salt_len: i64) -> bool {
-    if cu_pctx_ctrl(ctx, CU_PKEY_RSA, - 1, CU_CTRL_PADDING, pad, 0) <= 0 {
+    if cu_pctx_ctrl(ctx, CU_PKEY_RSA, -1, CU_CTRL_PADDING, pad, 0) <= 0 {
         return false;
     }
     if pad == CU_PAD_OAEP {
-        return cu_pctx_ctrl(ctx, CU_PKEY_RSA, - 1, CU_CTRL_OAEP_MD, 0, md) > 0 && cu_pctx_ctrl(ctx, CU_PKEY_RSA, - 1, CU_CTRL_MGF1_MD, 0, md) > 0;
+        return cu_pctx_ctrl(ctx, CU_PKEY_RSA, -1, CU_CTRL_OAEP_MD, 0, md) > 0 && cu_pctx_ctrl(ctx, CU_PKEY_RSA, -1, CU_CTRL_MGF1_MD, 0, md) > 0;
     }
-    if cu_pctx_ctrl(ctx, - 1, - 1, CU_CTRL_MD, 0, md) <= 0 {
+    if cu_pctx_ctrl(ctx, -1, -1, CU_CTRL_MD, 0, md) <= 0 {
         return false;
     }
     if pad == CU_PAD_PSS {
-        return cu_pctx_ctrl(ctx, CU_PKEY_RSA, - 1, CU_CTRL_SALTLEN, salt_len, 0) > 0 && cu_pctx_ctrl(ctx, CU_PKEY_RSA, - 1, CU_CTRL_MGF1_MD, 0, md) > 0;
+        return cu_pctx_ctrl(ctx, CU_PKEY_RSA, -1, CU_CTRL_SALTLEN, salt_len, 0) > 0 && cu_pctx_ctrl(ctx, CU_PKEY_RSA, -1, CU_CTRL_MGF1_MD, 0, md) > 0;
     }
     return true;
 }
 
 /// Generate an RSA key of `bits` bits (2048, 3072, 4096; e = 65537) into
 /// priv_blob (full private) and pub_blob. 0 on success.
-pub fn cb_rsa_generate(bits: i64, priv_blob: & mut Vec, pub_blob: & mut Vec) -> i64 {
+pub fn cb_rsa_generate(bits: i64, priv_blob: &mut Vec, pub_blob: &mut Vec) -> i64 {
     if bits < 1024 || bits > 16384 {
-        return - 1;
+        return -1;
     }
     val rsa: i64 = cu_rsa_new();
     val e: i64 = cu_bn_new();
@@ -731,8 +747,8 @@ pub fn cb_rsa_generate(bits: i64, priv_blob: & mut Vec, pub_blob: & mut Vec) -> 
         val dq: Vec<i64> = cu_bn_bytes(cu_get(s + 48));
         val qi: Vec<i64> = cu_bn_bytes(cu_get(s + 56));
         p_free(s);
-        priv = cb_rsa_private_blob(& n, & ev, & d, & p, & q, & dp, & dq, & qi);
-        pubb = cb_rsa_public_blob(& n, & ev);
+        priv = cb_rsa_private_blob(&n, &ev, &d, &p, &q, &dp, &dq, &qi);
+        pubb = cb_rsa_public_blob(&n, &ev);
     }
     if e != 0 {
         cu_bn_free(e);
@@ -741,7 +757,7 @@ pub fn cb_rsa_generate(bits: i64, priv_blob: & mut Vec, pub_blob: & mut Vec) -> 
         cu_rsa_free(rsa);
     }
     if priv.len() == 0 || pubb.len() == 0 {
-        return - 1;
+        return -1;
     }
     var i: i64 = 0;
     while i < priv.len() {
@@ -758,7 +774,7 @@ pub fn cb_rsa_generate(bits: i64, priv_blob: & mut Vec, pub_blob: & mut Vec) -> 
 
 // Sign `hash` (of the hash `hash_alg`) with padding `pad`: the signature,
 // as long as the modulus; empty on failure.
-fn cu_rsa_sign(priv_blob: & Vec, hash_alg: str, hash: & Vec, pad: i64, salt_len: i64) -> Vec<i64> {
+fn cu_rsa_sign(priv_blob: &Vec, hash_alg: str, hash: &Vec, pad: i64, salt_len: i64) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     val hlen: i64 = cbr_hash_len(hash_alg);
     val md: i64 = cu_md(hash_alg);
@@ -791,7 +807,7 @@ fn cu_rsa_sign(priv_blob: & Vec, hash_alg: str, hash: & Vec, pad: i64, salt_len:
 }
 
 // Verify `sig` over `hash` with padding `pad`.
-fn cu_rsa_verify(pub_blob: & Vec, hash_alg: str, hash: & Vec, sig: & Vec, pad: i64, salt_len: i64) -> bool {
+fn cu_rsa_verify(pub_blob: &Vec, hash_alg: str, hash: &Vec, sig: &Vec, pad: i64, salt_len: i64) -> bool {
     val hlen: i64 = cbr_hash_len(hash_alg);
     val md: i64 = cu_md(hash_alg);
     if hlen == 0 || md == 0 || hash.len() != hlen || salt_len < 0 {
@@ -824,13 +840,14 @@ fn cu_rsa_verify(pub_blob: & Vec, hash_alg: str, hash: & Vec, sig: & Vec, pad: i
 /// the modulus), empty on error.
 /// The key is `@secret` (complaint CO1): this body may not print, log,
 /// send or store it; the result is an audited release (`@declassify`).
-@declassify pub fn cb_rsa_sign_pkcs1(@secret priv_blob: & Vec, hash_alg: str, hash: & Vec) -> Vec<i64> {
+@declassify
+pub fn cb_rsa_sign_pkcs1(@secret priv_blob: &Vec, hash_alg: str, hash: &Vec) -> Vec<i64> {
     return cu_rsa_sign(priv_blob, hash_alg, hash, CU_PAD_PKCS1, 0);
 }
 
 /// Verify an RSASSA-PKCS1-v1_5 signature over the digest `hash` with a
 /// public (or private) blob.
-pub fn cb_rsa_verify_pkcs1(pub_blob: & Vec, hash_alg: str, hash: & Vec, sig: & Vec) -> bool {
+pub fn cb_rsa_verify_pkcs1(pub_blob: &Vec, hash_alg: str, hash: &Vec, sig: &Vec) -> bool {
     return cu_rsa_verify(pub_blob, hash_alg, hash, sig, CU_PAD_PKCS1, 0);
 }
 
@@ -839,18 +856,19 @@ pub fn cb_rsa_verify_pkcs1(pub_blob: & Vec, hash_alg: str, hash: & Vec, sig: & V
 /// Empty on error.
 /// The key is `@secret` (complaint CO1): this body may not print, log,
 /// send or store it; the result is an audited release (`@declassify`).
-@declassify pub fn cb_rsa_sign_pss(@secret priv_blob: & Vec, hash_alg: str, hash: & Vec, salt_len: i64) -> Vec<i64> {
+@declassify
+pub fn cb_rsa_sign_pss(@secret priv_blob: &Vec, hash_alg: str, hash: &Vec, salt_len: i64) -> Vec<i64> {
     return cu_rsa_sign(priv_blob, hash_alg, hash, CU_PAD_PSS, salt_len);
 }
 
 /// Verify an RSASSA-PSS signature (MGF1 of the same hash, a salt of exactly
 /// `salt_len` bytes) over the digest `hash`.
-pub fn cb_rsa_verify_pss(pub_blob: & Vec, hash_alg: str, hash: & Vec, sig: & Vec, salt_len: i64) -> bool {
+pub fn cb_rsa_verify_pss(pub_blob: &Vec, hash_alg: str, hash: &Vec, sig: &Vec, salt_len: i64) -> bool {
     return cu_rsa_verify(pub_blob, hash_alg, hash, sig, CU_PAD_PSS, salt_len);
 }
 
 // An OAEP context of `pkey` for encryption or decryption with `label`.
-fn cu_oaep_ctx(pkey: i64, encrypt: bool, md: i64, label: & Vec) -> i64 {
+fn cu_oaep_ctx(pkey: i64, encrypt: bool, md: i64, label: &Vec) -> i64 {
     val ctx: i64 = cu_pctx_new(pkey, 0);
     if ctx == 0 {
         return 0;
@@ -873,7 +891,7 @@ fn cu_oaep_ctx(pkey: i64, encrypt: bool, md: i64, label: & Vec) -> i64 {
                 cu_set_byte(lab + i, label.get(i));
                 i = i + 1;
             }
-            ok = cu_pctx_ctrl(ctx, CU_PKEY_RSA, - 1, CU_CTRL_OAEP_LABEL, label.len(), lab) > 0;
+            ok = cu_pctx_ctrl(ctx, CU_PKEY_RSA, -1, CU_CTRL_OAEP_LABEL, label.len(), lab) > 0;
         }
     }
     if !ok {
@@ -887,7 +905,7 @@ fn cu_oaep_ctx(pkey: i64, encrypt: bool, md: i64, label: & Vec) -> i64 {
 /// MGF1: encrypt `msg` (at most modulus length - 2 * digest - 2 bytes) to
 /// a public blob. `label` may be empty. The ciphertext (as long as the
 /// modulus), empty on error.
-pub fn cb_rsa_encrypt_oaep(pub_blob: & Vec, hash_alg: str, msg: & Vec, label: & Vec) -> Vec<i64> {
+pub fn cb_rsa_encrypt_oaep(pub_blob: &Vec, hash_alg: str, msg: &Vec, label: &Vec) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     val hlen: i64 = cbr_hash_len(hash_alg);
     val md: i64 = cu_md(hash_alg);
@@ -922,7 +940,8 @@ pub fn cb_rsa_encrypt_oaep(pub_blob: & Vec, hash_alg: str, msg: & Vec, label: & 
 /// ciphertext, its padding or the label is wrong.
 /// The key is `@secret` (complaint CO1): this body may not print, log,
 /// send or store it; the result is an audited release (`@declassify`).
-@declassify pub fn cb_rsa_decrypt_oaep(@secret priv_blob: & Vec, hash_alg: str, ct: & Vec, label: & Vec, out: & mut Vec) -> bool {
+@declassify
+pub fn cb_rsa_decrypt_oaep(@secret priv_blob: &Vec, hash_alg: str, ct: &Vec, label: &Vec, out: &mut Vec) -> bool {
     val hlen: i64 = cbr_hash_len(hash_alg);
     val md: i64 = cu_md(hash_alg);
     val k: i64 = cb_rsa_modulus_len(priv_blob);

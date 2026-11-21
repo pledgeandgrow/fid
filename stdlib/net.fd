@@ -20,7 +20,10 @@
 //   net_send_to(sock, "hello", 5, server);
 
 module net;
- use vec; use string; use trace; use world;
+use vec;
+use string;
+use trace;
+use world;
 // Under a test's fake sockets (stdlib/world, complaint CT1) the socket,
 // address, bind, connect, send, recv and close functions below use the
 // fake instead: no socket is opened.
@@ -53,8 +56,14 @@ extern "C" include "pledge_net.h" link "" {
 
 // ─── Constants ────────────────────────────────────────────────────────────
 
-pub const AF_INET: i64 = 2; pub const SOCK_DGRAM: i64 = 2; pub const SOCK_STREAM: i64 = 1; pub const SOL_SOCKET: i64 = 1; pub const SO_REUSEADDR: i64 = 2; pub const SO_BROADCAST: i64 = 6; pub const SO_RCVTIMEO: i64 = 20;
- pub const MSG_DONTWAIT: i64 = 0x40;
+pub const AF_INET: i64 = 2;
+pub const SOCK_DGRAM: i64 = 2;
+pub const SOCK_STREAM: i64 = 1;
+pub const SOL_SOCKET: i64 = 1;
+pub const SO_REUSEADDR: i64 = 2;
+pub const SO_BROADCAST: i64 = 6;
+pub const SO_RCVTIMEO: i64 = 20;
+pub const MSG_DONTWAIT: i64 = 0x40;
 // ─── Address ──────────────────────────────────────────────────────────────
 
 pub struct NetAddr {
@@ -86,13 +95,17 @@ pub fn net_addr_any(port: i64) -> NetAddr {
 
 /// Create a UDP socket. Returns socket file descriptor or -1 on error.
 pub fn net_socket_create() -> i64 {
-    if world_sockets_faked() { return world_sock_open(false); }
+    if world_sockets_faked() {
+        return world_sock_open(false);
+    }
     return pledge_net_socket(AF_INET, SOCK_DGRAM, 0);
 }
 
 /// Create a TCP socket. Returns socket file descriptor or -1 on error.
 pub fn net_socket_create_tcp() -> i64 {
-    if world_sockets_faked() { return world_sock_open(true); }
+    if world_sockets_faked() {
+        return world_sock_open(true);
+    }
     return pledge_net_socket(AF_INET, SOCK_STREAM, 0);
 }
 
@@ -103,7 +116,9 @@ pub fn net_bind(sock: i64, port: i64) -> i64 {
     // In native builds, the runtime constructs this struct.
     // For now, we use a native helper.
     // CO2: a "net.bind" span under FIDES_TRACE (socket and port)
-    if world_sockets_faked() { return world_sock_bind(sock, port); }
+    if world_sockets_faked() {
+        return world_sock_bind(sock, port);
+    }
     val t0: i64 = trace_span_begin();
     val r: i64 = pledge_net_bind(sock, port);
     trace_span_end(t0, "net.bind", net_trace_detail(sock, port), r == 0);
@@ -146,7 +161,7 @@ pub fn net_close(sock: i64) -> void {
 /// Returns number of bytes sent, or -1 on error.
 // SAFETY: the caller's promise (@unsafe): data holds len readable bytes the caller owns; net_send_bytes/net_send_bytes_to are the safe forms.
 @unsafe
-pub fn net_send_to(sock: i64, data: i64, len: i64, addr: & NetAddr) -> i64 {
+pub fn net_send_to(sock: i64, data: i64, len: i64, addr: &NetAddr) -> i64 {
     val t0: i64 = trace_span_begin();
     if world_sockets_faked() {
         trace_span_end(t0, "net.send_to", net_trace_detail(sock, len), true);
@@ -162,15 +177,15 @@ pub fn net_send_to(sock: i64, data: i64, len: i64, addr: & NetAddr) -> i64 {
 /// The sender's address is stored in from_addr.
 // SAFETY: the caller's promise (@unsafe): buf holds len writable bytes the caller owns; net_recv_bytes/net_recv_bytes_from are the safe forms.
 @unsafe
-pub fn net_recv_from(sock: i64, buf: i64, len: i64, from_addr: & mut NetAddr) -> i64 {
+pub fn net_recv_from(sock: i64, buf: i64, len: i64, from_addr: &mut NetAddr) -> i64 {
     val t0: i64 = trace_span_begin();
     if world_sockets_faked() {
         val got: Vec<i64> = world_sock_recv(sock, len);
         trace_span_end(t0, "net.recv_from", net_trace_detail(sock, got.len()), got.len() > 0);
         if got.len() == 0 {
-            return - 1;
+            return -1;
         }
-        net_poke_bytes(buf, & got);
+        net_poke_bytes(buf, &got);
         from_addr.ip = world_sock_last_ip();
         from_addr.port = world_sock_last_port();
         return got.len();
@@ -181,7 +196,7 @@ pub fn net_recv_from(sock: i64, buf: i64, len: i64, from_addr: & mut NetAddr) ->
 }
 
 /// Connect to a server (TCP).
-pub fn net_connect(sock: i64, addr: & NetAddr) -> i64 {
+pub fn net_connect(sock: i64, addr: &NetAddr) -> i64 {
     val t0: i64 = trace_span_begin();
     if world_sockets_faked() {
         val fr: i64 = world_sock_connect(sock, addr.ip, addr.port);
@@ -217,9 +232,9 @@ pub fn net_recv(sock: i64, buf: i64, len: i64) -> i64 {
         val got: Vec<i64> = world_sock_recv(sock, len);
         trace_span_end(t0, "net.recv", net_trace_detail(sock, got.len()), got.len() > 0);
         if got.len() == 0 {
-            return - 1;
+            return -1;
         }
-        net_poke_bytes(buf, & got);
+        net_poke_bytes(buf, &got);
         return got.len();
     }
     val r: i64 = pledge_net_recv(sock, buf, len);
@@ -284,7 +299,7 @@ pub fn p_net_send_file(sock: i64, path: str) -> i64 {
 
 /// A block of n bytes holding the low bytes of data[0..n): the caller
 /// frees it with p_free. 0 when n is 0 or the allocation fails.
-fn net_bytes_block(data: & Vec<i64>, n: i64) -> i64 {
+fn net_bytes_block(data: &Vec<i64>, n: i64) -> i64 {
     if n <= 0 {
         return 0;
     }
@@ -294,10 +309,10 @@ fn net_bytes_block(data: & Vec<i64>, n: i64) -> i64 {
     }
     var i: i64 = 0;
     while i < n {
-        var p: * mut u8 = buf + i;
+        var p: *mut u8 = buf + i;
         // SAFETY: i < n: inside the n bytes p_malloc just gave.
         unsafe {
-            * p = (data.get(i) & 255) as u8;
+            *p = (data.get(i) & 255) as u8;
         }
         i = i + 1;
     }
@@ -313,11 +328,11 @@ fn net_block_bytes(buf: i64, n: i64, cap: i64) -> Vec<i64> {
     }
     var i: i64 = 0;
     while i < m {
-        var p: * mut u8 = buf + i;
+        var p: *mut u8 = buf + i;
         var b: i64 = 0;
         // SAFETY: i < m <= cap: inside the cap bytes the caller allocated.
         unsafe {
-            b = (* p) as i64;
+            b = (*p) as i64;
         }
         out.push(b & 255);
         i = i + 1;
@@ -334,12 +349,12 @@ fn net_peek_bytes(buf: i64, n: i64) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     var i: i64 = 0;
     while i < n {
-        var p: * mut u8 = buf + i;
+        var p: *mut u8 = buf + i;
         var b: i64 = 0;
         // SAFETY: i < n: inside the n bytes the caller of net_send or
         // net_send_to passed (the raw-buffer contract of those functions).
         unsafe {
-            b = (* p) as i64;
+            b = (*p) as i64;
         }
         out.push(b & 255);
         i = i + 1;
@@ -348,14 +363,14 @@ fn net_peek_bytes(buf: i64, n: i64) -> Vec<i64> {
 }
 
 /// Write the bytes of `data` to buf (which holds at least data.len()).
-fn net_poke_bytes(buf: i64, data: & Vec<i64>) -> void {
+fn net_poke_bytes(buf: i64, data: &Vec<i64>) -> void {
     var i: i64 = 0;
     while i < data.len() {
-        var p: * mut u8 = buf + i;
+        var p: *mut u8 = buf + i;
         // SAFETY: data came from world_sock_recv(sock, len), so
         // data.len() <= len, the size of the buffer the caller passed.
         unsafe {
-            * p = (data.get(i) & 255) as u8;
+            *p = (data.get(i) & 255) as u8;
         }
         i = i + 1;
     }
@@ -367,9 +382,9 @@ pub fn net_send_bytes(sock: i64, data: Vec<i64>) -> i64 {
     if n == 0 {
         return 0;
     }
-    val buf: i64 = net_bytes_block(& data, n);
+    val buf: i64 = net_bytes_block(&data, n);
     if buf == 0 {
-        return - 1;
+        return -1;
     }
     val r: i64 = net_send(sock, buf, n);
     p_free(buf);
@@ -392,14 +407,14 @@ pub fn net_recv_bytes(sock: i64, max: i64) -> Vec<i64> {
 }
 
 /// Send bytes to an address (UDP): the number sent, or -1 on error.
-pub fn net_send_bytes_to(sock: i64, data: Vec<i64>, addr: & NetAddr) -> i64 {
+pub fn net_send_bytes_to(sock: i64, data: Vec<i64>, addr: &NetAddr) -> i64 {
     val n: i64 = data.len();
     if n == 0 {
         return 0;
     }
-    val buf: i64 = net_bytes_block(& data, n);
+    val buf: i64 = net_bytes_block(&data, n);
     if buf == 0 {
-        return - 1;
+        return -1;
     }
     val r: i64 = net_send_to(sock, buf, n, addr);
     p_free(buf);
@@ -408,7 +423,7 @@ pub fn net_send_bytes_to(sock: i64, data: Vec<i64>, addr: & NetAddr) -> i64 {
 
 /// Receive up to `max` bytes from any sender (UDP): the bytes ([] on an
 /// error or a timeout); the sender's address goes to from_addr.
-pub fn net_recv_bytes_from(sock: i64, max: i64, from_addr: & mut NetAddr) -> Vec<i64> {
+pub fn net_recv_bytes_from(sock: i64, max: i64, from_addr: &mut NetAddr) -> Vec<i64> {
     var none: Vec<i64> = Vec::new();
     if max <= 0 {
         return none;
@@ -441,26 +456,26 @@ pub fn net_buffer_create(size: i64) -> NetBuffer {
     };
 }
 
-pub fn net_buffer_write_u8(buf: & mut NetBuffer, val: i64) -> void {
+pub fn net_buffer_write_u8(buf: &mut NetBuffer, val: i64) -> void {
     if buf.pos < buf.size {
         buf.data.set(buf.pos, val & 0xFF);
         buf.pos = buf.pos + 1;
     }
 }
 
-pub fn net_buffer_write_u16(buf: & mut NetBuffer, val: i64) -> void {
+pub fn net_buffer_write_u16(buf: &mut NetBuffer, val: i64) -> void {
     net_buffer_write_u8(buf, (val >> 8) & 0xFF);
     net_buffer_write_u8(buf, val & 0xFF);
 }
 
-pub fn net_buffer_write_u32(buf: & mut NetBuffer, val: i64) -> void {
+pub fn net_buffer_write_u32(buf: &mut NetBuffer, val: i64) -> void {
     net_buffer_write_u8(buf, (val >> 24) & 0xFF);
     net_buffer_write_u8(buf, (val >> 16) & 0xFF);
     net_buffer_write_u8(buf, (val >> 8) & 0xFF);
     net_buffer_write_u8(buf, val & 0xFF);
 }
 
-pub fn net_buffer_read_u8(buf: & mut NetBuffer) -> i64 {
+pub fn net_buffer_read_u8(buf: &mut NetBuffer) -> i64 {
     if buf.pos >= buf.size {
         return 0;
     }
@@ -469,13 +484,13 @@ pub fn net_buffer_read_u8(buf: & mut NetBuffer) -> i64 {
     return val;
 }
 
-pub fn net_buffer_read_u16(buf: & mut NetBuffer) -> i64 {
+pub fn net_buffer_read_u16(buf: &mut NetBuffer) -> i64 {
     var hi = net_buffer_read_u8(buf);
     var lo = net_buffer_read_u8(buf);
     return (hi << 8) | lo;
 }
 
-pub fn net_buffer_read_u32(buf: & mut NetBuffer) -> i64 {
+pub fn net_buffer_read_u32(buf: &mut NetBuffer) -> i64 {
     var b0 = net_buffer_read_u8(buf);
     var b1 = net_buffer_read_u8(buf);
     var b2 = net_buffer_read_u8(buf);
@@ -483,11 +498,11 @@ pub fn net_buffer_read_u32(buf: & mut NetBuffer) -> i64 {
     return (b0 << 24) | (b1 << 16) | (b2 << 8) | b3;
 }
 
-pub fn net_buffer_reset(buf: & mut NetBuffer) -> void {
+pub fn net_buffer_reset(buf: &mut NetBuffer) -> void {
     buf.pos = 0;
 }
 
-pub fn net_buffer_remaining(buf: & NetBuffer) -> i64 {
+pub fn net_buffer_remaining(buf: &NetBuffer) -> i64 {
     return buf.size - buf.pos;
 }
 
@@ -516,14 +531,22 @@ pub fn net_buffer_remaining(buf: & NetBuffer) -> i64 {
 // send are queued and net_reliable_take_outgoing hands them over, for an
 // application that moves packets itself, or a test.
 
-pub const MSG_TYPE_DATA: i64 = 0; pub const MSG_TYPE_ACK: i64 = 1; pub const MSG_TYPE_PING: i64 = 2; pub const MSG_TYPE_PONG: i64 = 3;
+pub const MSG_TYPE_DATA: i64 = 0;
+pub const MSG_TYPE_ACK: i64 = 1;
+pub const MSG_TYPE_PING: i64 = 2;
+pub const MSG_TYPE_PONG: i64 = 3;
 /// What net_reliable_recv found in a packet (NetReceived.kind).
-pub const NET_RECV_IGNORED: i64 = 0; pub const NET_RECV_ACK: i64 = 1; pub const NET_RECV_DATA: i64 = 2; pub const NET_RECV_DUPLICATE: i64 = 3; pub const NET_RECV_PING: i64 = 4; pub const NET_RECV_PONG: i64 = 5;
+pub const NET_RECV_IGNORED: i64 = 0;
+pub const NET_RECV_ACK: i64 = 1;
+pub const NET_RECV_DATA: i64 = 2;
+pub const NET_RECV_DUPLICATE: i64 = 3;
+pub const NET_RECV_PING: i64 = 4;
+pub const NET_RECV_PONG: i64 = 5;
 /// Bytes before the payload: the type byte and the u32 id.
 pub const NET_RELIABLE_HEADER: i64 = 5;
 /// How many delivered ids a connection remembers to spot duplicates.
 const NET_RELIABLE_WINDOW: i64 = 1024;
- pub struct ReliableMessage {
+pub struct ReliableMessage {
     pub msg_id: i64,
     pub msg_type: i64,
     pub data: Vec<i64>,
@@ -593,7 +616,7 @@ pub fn net_reliable_packet_id(packet: Vec<i64>) -> i64 {
 
 /// Send a packet to the connection's peer, or queue it when the connection
 /// does no I/O. Returns the bytes sent (or queued), -1 on an error.
-fn net_reliable_transmit(conn: & mut ReliableConnection, packet: Vec<i64>) -> i64 {
+fn net_reliable_transmit(conn: &mut ReliableConnection, packet: Vec<i64>) -> i64 {
     val n: i64 = packet.len();
     if conn.sock < 0 {
         conn.outgoing.push(packet);
@@ -606,14 +629,14 @@ fn net_reliable_transmit(conn: & mut ReliableConnection, packet: Vec<i64>) -> i6
         p_volatile_store8(buf + i, packet.get(i));
         i = i + 1;
     }
-    val sent: i64 = net_send_to(conn.sock, buf, n, & conn.remote);
+    val sent: i64 = net_send_to(conn.sock, buf, n, &conn.remote);
     p_free(buf);
     return sent;
 }
 
 /// The packets a connection with no socket would have sent, oldest first;
 /// the queue is empty afterwards.
-pub fn net_reliable_take_outgoing(conn: & mut ReliableConnection) -> Vec<Vec<i64>> {
+pub fn net_reliable_take_outgoing(conn: &mut ReliableConnection) -> Vec<Vec<i64>> {
     val out: Vec<Vec<i64>> = conn.outgoing;
     conn.outgoing = Vec::new();
     return out;
@@ -623,7 +646,7 @@ pub fn net_reliable_take_outgoing(conn: & mut ReliableConnection) -> Vec<Vec<i64
 /// the current time, from the same clock net_reliable_update is given.
 /// Returns what the send returned (bytes, or -1). The message stays pending
 /// either way: a failed send is retried as a lost one would be.
-pub fn net_reliable_send_at(conn: & mut ReliableConnection, data: Vec<i64>, now_ms: i64) -> i64 {
+pub fn net_reliable_send_at(conn: &mut ReliableConnection, data: Vec<i64>, now_ms: i64) -> i64 {
     val id: i64 = conn.next_msg_id;
     conn.next_msg_id = conn.next_msg_id + 1;
     // Ids are u32 on the wire; 0 is never used (it marks a short packet)
@@ -640,18 +663,18 @@ pub fn net_reliable_send_at(conn: & mut ReliableConnection, data: Vec<i64>, now_
 
 /// As net_reliable_send_at, at time 0 (the first net_reliable_update with a
 /// time past the timeout sends it again).
-pub fn net_reliable_send(conn: & mut ReliableConnection, data: Vec<i64>) -> i64 {
+pub fn net_reliable_send(conn: &mut ReliableConnection, data: Vec<i64>) -> i64 {
     return net_reliable_send_at(conn, data, 0);
 }
 
 /// Ask the peer for a PONG carrying `id` (a keep-alive, or a probe of the
 /// round trip). Not retransmitted.
-pub fn net_reliable_ping(conn: & mut ReliableConnection, id: i64) -> i64 {
+pub fn net_reliable_ping(conn: &mut ReliableConnection, id: i64) -> i64 {
     return net_reliable_transmit(conn, net_reliable_packet(MSG_TYPE_PING, id, Vec::new()));
 }
 
 /// Has a DATA message with this id been delivered already?
-fn net_reliable_seen(conn: & mut ReliableConnection, msg_id: i64) -> bool {
+fn net_reliable_seen(conn: &mut ReliableConnection, msg_id: i64) -> bool {
     var k: i64 = 0;
     while k < conn.received_ids.len() {
         if conn.received_ids.get(k) == msg_id {
@@ -663,7 +686,7 @@ fn net_reliable_seen(conn: & mut ReliableConnection, msg_id: i64) -> bool {
 }
 
 /// Remember a delivered id; past the window, the older half is forgotten.
-fn net_reliable_remember(conn: & mut ReliableConnection, msg_id: i64) {
+fn net_reliable_remember(conn: &mut ReliableConnection, msg_id: i64) {
     conn.received_ids.push(msg_id);
     if conn.received_ids.len() > NET_RELIABLE_WINDOW {
         var keep: Vec<i64> = Vec::new();
@@ -684,7 +707,7 @@ fn net_reliable_remember(conn: & mut ReliableConnection, msg_id: i64) {
 /// packet is ACKed; a new one comes back as NET_RECV_DATA with its payload,
 /// one already delivered as NET_RECV_DUPLICATE. A PING is answered with a
 /// PONG. Anything else, or a packet too short for its header, is ignored.
-pub fn net_reliable_recv_at(conn: & mut ReliableConnection, packet: Vec<i64>, now_ms: i64) -> NetReceived {
+pub fn net_reliable_recv_at(conn: &mut ReliableConnection, packet: Vec<i64>, now_ms: i64) -> NetReceived {
     var got: NetReceived = NetReceived {
         kind: NET_RECV_IGNORED, msg_id: 0, data: Vec::new(),
     };
@@ -743,13 +766,13 @@ pub fn net_reliable_recv_at(conn: & mut ReliableConnection, packet: Vec<i64>, no
 }
 
 /// As net_reliable_recv_at with the time unknown (no round-trip sample).
-pub fn net_reliable_recv(conn: & mut ReliableConnection, packet: Vec<i64>) -> NetReceived {
-    return net_reliable_recv_at(conn, packet, - 1);
+pub fn net_reliable_recv(conn: &mut ReliableConnection, packet: Vec<i64>) -> NetReceived {
+    return net_reliable_recv_at(conn, packet, -1);
 }
 
 /// Update the connection: retransmit unacked messages that have timed out,
 /// and forget the acked ones.
-pub fn net_reliable_update(conn: & mut ReliableConnection, current_time: i64) -> void {
+pub fn net_reliable_update(conn: &mut ReliableConnection, current_time: i64) -> void {
     var keep: Vec<ReliableMessage> = Vec::new();
     var i: i64 = 0;
     while i < conn.pending.len() {
@@ -768,7 +791,7 @@ pub fn net_reliable_update(conn: & mut ReliableConnection, current_time: i64) ->
 }
 
 /// Get the number of pending (unacked) messages.
-pub fn net_reliable_pending_count(conn: & ReliableConnection) -> i64 {
+pub fn net_reliable_pending_count(conn: &ReliableConnection) -> i64 {
     var n: i64 = 0;
     var i: i64 = 0;
     while i < conn.pending.len() {
@@ -782,6 +805,6 @@ pub fn net_reliable_pending_count(conn: & ReliableConnection) -> i64 {
 }
 
 /// Get the estimated round-trip time in milliseconds.
-pub fn net_reliable_rtt(conn: & ReliableConnection) -> f64 {
+pub fn net_reliable_rtt(conn: &ReliableConnection) -> f64 {
     return conn.rtt;
 }

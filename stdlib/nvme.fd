@@ -134,11 +134,11 @@ fn nv_put64(b: &mut Vec<i64>, o: i64, v: i64) {
     nv_put32(b, o + 4, (v >> 32) & 4294967295);
 }
 
-fn nv_get32(b: & Vec<i64>, o: i64) -> i64 {
+fn nv_get32(b: &Vec<i64>, o: i64) -> i64 {
     return b.get(o) | (b.get(o + 1) << 8) | (b.get(o + 2) << 16) | (b.get(o + 3) << 24);
 }
 
-fn nv_get64(b: & Vec<i64>, o: i64) -> i64 {
+fn nv_get64(b: &Vec<i64>, o: i64) -> i64 {
     return nv_get32(b, o) | (nv_get32(b, o + 4) << 32);
 }
 
@@ -169,11 +169,13 @@ pub struct NvmeCmd {
 }
 
 pub fn nvme_cmd(opc: i64, nsid: i64) -> NvmeCmd {
-    return NvmeCmd { opc: opc, cid: 0, nsid: nsid, prp1: 0, prp2: 0, cdw10: 0, cdw11: 0, cdw12: 0, cdw13: 0, cdw14: 0, cdw15: 0 };
+    return NvmeCmd {
+        opc: opc, cid: 0, nsid: nsid, prp1: 0, prp2: 0, cdw10: 0, cdw11: 0, cdw12: 0, cdw13: 0, cdw14: 0, cdw15: 0
+    };
 }
 
 /// The 64-byte submission queue entry (PRPs, no fused operation).
-pub fn nvme_sqe(c: & NvmeCmd) -> Vec<i64> {
+pub fn nvme_sqe(c: &NvmeCmd) -> Vec<i64> {
     var e: Vec<i64> = nv_zeros(64);
     nv_put32(&mut e, 0, (c.opc & 255) | ((c.cid & 65535) << 16));
     nv_put32(&mut e, 4, c.nsid);
@@ -188,7 +190,7 @@ pub fn nvme_sqe(c: & NvmeCmd) -> Vec<i64> {
     return e;
 }
 
-pub fn nvme_sqe_parse(e: & Vec<i64>, o: i64) -> NvmeCmd {
+pub fn nvme_sqe_parse(e: &Vec<i64>, o: i64) -> NvmeCmd {
     val dw0: i64 = nv_get32(e, o);
     return NvmeCmd {
         opc: dw0 & 255, cid: (dw0 >> 16) & 65535, nsid: nv_get32(e, o + 4), prp1: nv_get64(e, o + 24), prp2: nv_get64(e, o + 32), cdw10: nv_get32(e, o + 40), cdw11: nv_get32(e, o + 44), cdw12: nv_get32(e, o + 48), cdw13: nv_get32(e, o + 52), cdw14: nv_get32(e, o + 56), cdw15: nv_get32(e, o + 60)
@@ -317,7 +319,7 @@ pub fn nvme_prps(buf: i64, nbytes: i64, list: i64) -> Vec<i64> {
 }
 
 /// The PRP list bytes for `nvme_prps` (entries after the first two).
-pub fn nvme_prp_list_bytes(prps: & Vec<i64>) -> Vec<i64> {
+pub fn nvme_prp_list_bytes(prps: &Vec<i64>) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     var i: i64 = 2;
     while i < prps.len() {
@@ -345,7 +347,7 @@ pub struct NvmeCqe {
     pub dnr: bool,
 }
 
-pub fn nvme_cqe_parse(e: & Vec<i64>, o: i64) -> NvmeCqe {
+pub fn nvme_cqe_parse(e: &Vec<i64>, o: i64) -> NvmeCqe {
     val dw2: i64 = nv_get32(e, o + 8);
     val dw3: i64 = nv_get32(e, o + 12);
     return NvmeCqe {
@@ -362,17 +364,31 @@ pub fn nvme_cqe(dw0: i64, sqhd: i64, sqid: i64, cid: i64, phase: i64, sc: i64, s
     return e;
 }
 
-pub fn nvme_status_str(c: & NvmeCqe) -> str {
+pub fn nvme_status_str(c: &NvmeCqe) -> str {
     if c.sct == 0 {
-        if c.sc == 0 { return "success"; }
-        if c.sc == 1 { return "invalid opcode"; }
-        if c.sc == 2 { return "invalid field"; }
-        if c.sc == 11 { return "invalid namespace"; }
-        if c.sc == 128 { return "LBA out of range"; }
+        if c.sc == 0 {
+            return "success";
+        }
+        if c.sc == 1 {
+            return "invalid opcode";
+        }
+        if c.sc == 2 {
+            return "invalid field";
+        }
+        if c.sc == 11 {
+            return "invalid namespace";
+        }
+        if c.sc == 128 {
+            return "LBA out of range";
+        }
     }
     if c.sct == 1 {
-        if c.sc == 1 { return "invalid queue identifier"; }
-        if c.sc == 2 { return "invalid queue size"; }
+        if c.sc == 1 {
+            return "invalid queue identifier";
+        }
+        if c.sc == 2 {
+            return "invalid queue size";
+        }
     }
     return "sct " + int_to_str(c.sct) + " sc " + int_to_str(c.sc);
 }
@@ -392,7 +408,7 @@ pub struct NvmeIdCtrl {
     pub nn: i64,
 }
 
-fn nv_ascii(d: & Vec<i64>, o: i64, n: i64) -> str {
+fn nv_ascii(d: &Vec<i64>, o: i64, n: i64) -> str {
     var out: Vec<i64> = Vec::new();
     var i: i64 = 0;
     while i < n {
@@ -402,14 +418,14 @@ fn nv_ascii(d: & Vec<i64>, o: i64, n: i64) -> str {
     return str_trim(str_from_bytes(out));
 }
 
-pub fn nvme_id_ctrl_parse(d: & Vec<i64>) -> NvmeIdCtrl {
+pub fn nvme_id_ctrl_parse(d: &Vec<i64>) -> NvmeIdCtrl {
     return NvmeIdCtrl {
         vid: d.get(0) | (d.get(1) << 8), serial: nv_ascii(d, 4, 20), model: nv_ascii(d, 24, 40), firmware: nv_ascii(d, 64, 8), mdts: d.get(77), cntlid: d.get(78) | (d.get(79) << 8), version: nv_get32(d, 80), sqes: d.get(512), cqes: d.get(513), nn: nv_get32(d, 516)
     };
 }
 
 /// Largest transfer in bytes (MDTS; 0 means no limit, given as -1).
-pub fn nvme_max_transfer(id: & NvmeIdCtrl, mpsmin: i64) -> i64 {
+pub fn nvme_max_transfer(id: &NvmeIdCtrl, mpsmin: i64) -> i64 {
     if id.mdts == 0 {
         return -1;
     }
@@ -426,7 +442,7 @@ pub struct NvmeIdNs {
     pub ms: i64,
 }
 
-pub fn nvme_id_ns_parse(d: & Vec<i64>) -> NvmeIdNs {
+pub fn nvme_id_ns_parse(d: &Vec<i64>) -> NvmeIdNs {
     val fl: i64 = d.get(26) & 15;
     val lbaf: i64 = nv_get32(d, 128 + 4 * fl);
     return NvmeIdNs {
@@ -457,42 +473,44 @@ pub struct NvmeQueue {
 }
 
 pub fn nvme_queue(qid: i64, sq: i64, cq: i64, size: i64, dstrd: i64) -> NvmeQueue {
-    return NvmeQueue { qid: qid, sq: sq, cq: cq, size: size, sq_tail: 0, sq_head: 0, cq_head: 0, phase: 1, next_cid: 0, dstrd: dstrd };
+    return NvmeQueue {
+        qid: qid, sq: sq, cq: cq, size: size, sq_tail: 0, sq_head: 0, cq_head: 0, phase: 1, next_cid: 0, dstrd: dstrd
+    };
 }
 
-pub fn nvme_rd(bus: & NvmeBus, off: i64) -> i64 {
+pub fn nvme_rd(bus: &NvmeBus, off: i64) -> i64 {
     val f = bus.mmio_rd;
     return f(off) & 4294967295;
 }
 
-pub fn nvme_wr(bus: & NvmeBus, off: i64, v: i64) {
+pub fn nvme_wr(bus: &NvmeBus, off: i64, v: i64) {
     val f = bus.mmio_wr;
     f(off, v & 4294967295);
 }
 
-pub fn nvme_wr64(bus: & NvmeBus, off: i64, v: i64) {
+pub fn nvme_wr64(bus: &NvmeBus, off: i64, v: i64) {
     nvme_wr(bus, off, v & 4294967295);
     nvme_wr(bus, off + 4, (v >> 32) & 4294967295);
 }
 
-fn nv_mem_wr(bus: & NvmeBus, addr: i64, data: Vec<i64>) {
+fn nv_mem_wr(bus: &NvmeBus, addr: i64, data: Vec<i64>) {
     val f = bus.mem_wr;
     f(addr, data);
 }
 
-fn nv_mem_rd(bus: & NvmeBus, addr: i64, n: i64) -> Vec<i64> {
+fn nv_mem_rd(bus: &NvmeBus, addr: i64, n: i64) -> Vec<i64> {
     val f = bus.mem_rd;
     return f(addr, n);
 }
 
 /// Is the submission queue full (one slot always stays empty)?
-pub fn nvme_sq_full(q: & NvmeQueue) -> bool {
+pub fn nvme_sq_full(q: &NvmeQueue) -> bool {
     return (q.sq_tail + 1) % q.size == q.sq_head;
 }
 
 /// Put `c` on the queue with the next command id and ring the doorbell.
 /// Returns the command id, or -EBUSY when the queue is full.
-pub fn nvme_submit(bus: & NvmeBus, q: &mut NvmeQueue, cmd: NvmeCmd) -> i64 {
+pub fn nvme_submit(bus: &NvmeBus, q: &mut NvmeQueue, cmd: NvmeCmd) -> i64 {
     if nvme_sq_full(q) {
         return 0 - VFS_EBUSY;
     }
@@ -507,7 +525,7 @@ pub fn nvme_submit(bus: & NvmeBus, q: &mut NvmeQueue, cmd: NvmeCmd) -> i64 {
 
 /// Take one completion if the controller posted one (its phase tag equals
 /// the queue's current phase): cid -1 when there is none.
-pub fn nvme_poll(bus: & NvmeBus, q: &mut NvmeQueue) -> NvmeCqe {
+pub fn nvme_poll(bus: &NvmeBus, q: &mut NvmeQueue) -> NvmeCqe {
     val e: Vec<i64> = nv_mem_rd(bus, q.cq + q.cq_head * NVME_CQE_SIZE, NVME_CQE_SIZE);
     var c: NvmeCqe = nvme_cqe_parse(&e, 0);
     if c.phase != q.phase {
@@ -525,9 +543,11 @@ pub fn nvme_poll(bus: & NvmeBus, q: &mut NvmeQueue) -> NvmeCqe {
 }
 
 /// Submit and wait for that command's completion.
-pub fn nvme_exec(bus: & NvmeBus, q: &mut NvmeQueue, cmd: NvmeCmd) -> NvmeCqe {
+pub fn nvme_exec(bus: &NvmeBus, q: &mut NvmeQueue, cmd: NvmeCmd) -> NvmeCqe {
     val cid: i64 = nvme_submit(bus, q, cmd);
-    var none: NvmeCqe = NvmeCqe { dw0: 0, sqhd: 0, sqid: 0, cid: -1, phase: 0, sc: 255, sct: 7, dnr: true };
+    var none: NvmeCqe = NvmeCqe {
+        dw0: 0, sqhd: 0, sqid: 0, cid: -1, phase: 0, sc: 255, sct: 7, dnr: true
+    };
     if cid < 0 {
         return none;
     }
@@ -542,7 +562,7 @@ pub fn nvme_exec(bus: & NvmeBus, q: &mut NvmeQueue, cmd: NvmeCmd) -> NvmeCqe {
     return none;
 }
 
-pub fn nvme_ok(c: & NvmeCqe) -> bool {
+pub fn nvme_ok(c: &NvmeCqe) -> bool {
     return c.cid >= 0 && c.sc == 0 && c.sct == 0;
 }
 
@@ -553,7 +573,7 @@ pub struct NvmeCtrl {
     pub admin: NvmeQueue,
 }
 
-fn nv_wait_rdy(bus: & NvmeBus, want: i64) -> i64 {
+fn nv_wait_rdy(bus: &NvmeBus, want: i64) -> i64 {
     var i: i64 = 0;
     while i < NVME_POLL_LIMIT {
         val s: i64 = nvme_rd(bus, NVME_REG_CSTS);
@@ -570,9 +590,11 @@ fn nv_wait_rdy(bus: & NvmeBus, want: i64) -> i64 {
 
 /// Reset and enable the controller with an admin queue pair of `entries`
 /// entries at `asq` and `acq` (page aligned).
-pub fn nvme_init(bus: & NvmeBus, asq: i64, acq: i64, entries: i64) -> NvmeCtrl {
+pub fn nvme_init(bus: &NvmeBus, asq: i64, acq: i64, entries: i64) -> NvmeCtrl {
     val cap: NvmeCap = nvme_cap_decode(nvme_rd(bus, NVME_REG_CAP), nvme_rd(bus, NVME_REG_CAP + 4));
-    var ctl: NvmeCtrl = NvmeCtrl { err: "", cap: cap, version: nvme_rd(bus, NVME_REG_VS), admin: nvme_queue(0, asq, acq, entries, cap.dstrd) };
+    var ctl: NvmeCtrl = NvmeCtrl {
+        err: "", cap: cap, version: nvme_rd(bus, NVME_REG_VS), admin: nvme_queue(0, asq, acq, entries, cap.dstrd)
+    };
     if asq % NVME_PAGE != 0 || acq % NVME_PAGE != 0 {
         ctl.err = "admin queues not page aligned";
         return ctl;
@@ -605,7 +627,7 @@ pub fn nvme_init(bus: & NvmeBus, asq: i64, acq: i64, entries: i64) -> NvmeCtrl {
 }
 
 /// Create the I/O queue pair `qid` (completion queue first, as required).
-pub fn nvme_create_io_queues(bus: & NvmeBus, ctl: &mut NvmeCtrl, qid: i64, sq: i64, cq: i64, entries: i64) -> NvmeQueue {
+pub fn nvme_create_io_queues(bus: &NvmeBus, ctl: &mut NvmeCtrl, qid: i64, sq: i64, cq: i64, entries: i64) -> NvmeQueue {
     var q: NvmeQueue = nvme_queue(qid, sq, cq, entries, ctl.cap.dstrd);
     nv_mem_wr(bus, cq, nv_zeros(entries * NVME_CQE_SIZE));
     val c1: NvmeCqe = nvme_exec(bus, &mut ctl.admin, nvme_cmd_create_cq(qid, entries, cq, 0, false));
@@ -624,7 +646,7 @@ pub fn nvme_create_io_queues(bus: & NvmeBus, ctl: &mut NvmeCtrl, qid: i64, sq: i
 
 /// Read or write `nlb` blocks between `slba` and the buffer `buf`; `list`
 /// is a page for the PRP list when the buffer spans more than two pages.
-pub fn nvme_rw(bus: & NvmeBus, q: &mut NvmeQueue, write: bool, nsid: i64, slba: i64, nlb: i64, lba_size: i64, buf: i64, list: i64) -> NvmeCqe {
+pub fn nvme_rw(bus: &NvmeBus, q: &mut NvmeQueue, write: bool, nsid: i64, slba: i64, nlb: i64, lba_size: i64, buf: i64, list: i64) -> NvmeCqe {
     val prps: Vec<i64> = nvme_prps(buf, nlb * lba_size, list);
     if prps.len() > 2 {
         nv_mem_wr(bus, list, nvme_prp_list_bytes(&prps));
@@ -680,7 +702,7 @@ fn nv_bd_zero(h: i64, lba: i64, count: i64) -> i64 {
 
 /// A BlockDev over namespace `nsid` through I/O queue `q`; `buf` is two
 /// pages of DMA memory (a bounce page and a PRP list page).
-pub fn nvme_blockdev(bus: NvmeBus, q: NvmeQueue, nsid: i64, ns: & NvmeIdNs, buf: i64) -> BlockDev {
+pub fn nvme_blockdev(bus: NvmeBus, q: NvmeQueue, nsid: i64, ns: &NvmeIdNs, buf: i64) -> BlockDev {
     val h: i64 = nv_dev_bus.len();
     nv_dev_bus.push(bus);
     nv_dev_q.push(q);

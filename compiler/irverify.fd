@@ -9,27 +9,36 @@
 // Unreachable blocks are not checked for dominance. Run on the native Linux
 // path with FID_VERIFY=1, after lowering and after each optimizer stage.
 
-module compiler::irverify; use core; use vec; use string; use compiler::ast; use compiler::ir; use compiler::checks; use compiler::iropt; const IV_MAX_ERRORS: i64 = 20;  /// The problems of `module`, at most IV_MAX_ERRORS; empty when it is sound.
+module compiler::irverify;
+use core;
+use vec;
+use string;
+use compiler::ast;
+use compiler::ir;
+use compiler::checks;
+use compiler::iropt;
+const IV_MAX_ERRORS: i64 = 20;
+/// The problems of `module`, at most IV_MAX_ERRORS; empty when it is sound.
 /// `stage` names the point of the pipeline in each message.
-pub fn ir_verify(module: & IrModule, stage: str) -> Vec<str> {
+pub fn ir_verify(module: &IrModule, stage: str) -> Vec<str> {
     var errs: Vec<str> = Vec::new();
     var fi: i64 = 0;
     while fi < module.functions.len() && errs.len() < IV_MAX_ERRORS {
         var entry: IrFunctionEntry = module.functions.get(fi);
         var f: IrFunction = entry.func;
-        iv_function(& f, stage, & mut errs);
+        iv_function(&f, stage, &mut errs);
         fi = fi + 1;
     }
     return errs;
 }
 
-fn iv_err(errs: & mut Vec<str>, f: & IrFunction, stage: str, msg: str) {
+fn iv_err(errs: &mut Vec<str>, f: &IrFunction, stage: str, msg: str) {
     if errs.len() < IV_MAX_ERRORS {
         errs.push("IR verifier (" + stage + "): " + f.name + ": " + msg);
     }
 }
 
-fn iv_function(f: & IrFunction, stage: str, errs: & mut Vec<str>) {
+fn iv_function(f: &IrFunction, stage: str, errs: &mut Vec<str>) {
     var n: i64 = f.next_value;
     var i: i64 = 0;
     while i < f.insts.len() {
@@ -102,11 +111,11 @@ fn iv_function(f: & IrFunction, stage: str, errs: & mut Vec<str>) {
                 OptInst::Some(inst) => {
                     match inst {
                         Inst::Jump(t) => {
-                            iv_target(f, & cfg, t, stage, errs);
+                            iv_target(f, &cfg, t, stage, errs);
                         }
                         Inst::Branch(_, t1, t2) => {
-                            iv_target(f, & cfg, t1, stage, errs);
-                            iv_target(f, & cfg, t2, stage, errs);
+                            iv_target(f, &cfg, t1, stage, errs);
+                            iv_target(f, &cfg, t2, stage, errs);
                         }
                         Inst::Switch(_, sk, st, sd) => {
                             // ME28: every target a block, one per key, keys distinct
@@ -115,7 +124,7 @@ fn iv_function(f: & IrFunction, stage: str, errs: & mut Vec<str>) {
                             }
                             var si: i64 = 0;
                             while si < st.len() {
-                                iv_target(f, & cfg, st.get(si), stage, errs);
+                                iv_target(f, &cfg, st.get(si), stage, errs);
                                 var sj: i64 = si + 1;
                                 while sj < sk.len() {
                                     if si < sk.len() && sk.get(si) == sk.get(sj) {
@@ -125,13 +134,13 @@ fn iv_function(f: & IrFunction, stage: str, errs: & mut Vec<str>) {
                                 }
                                 si = si + 1;
                             }
-                            iv_target(f, & cfg, sd, stage, errs);
+                            iv_target(f, &cfg, sd, stage, errs);
                         }
                         _ => {
                         }
                     }
                     ops.clear();
-                    peir_inst_operands(inst, & mut ops);
+                    peir_inst_operands(inst, &mut ops);
                     var oi: i64 = 0;
                     while oi < ops.len() {
                         var v: i64 = ops.get(oi);
@@ -143,7 +152,7 @@ fn iv_function(f: & IrFunction, stage: str, errs: & mut Vec<str>) {
                                 if def_pos.get(v) >= k2 {
                                     iv_err(errs, f, stage, "%" + int_to_str(uid) + " uses %" + int_to_str(v) + " before its definition");
                                 }
-                            } else if !iro_dominates(& cfg, db, b) {
+                            } else if !iro_dominates(&cfg, db, b) {
                                 iv_err(errs, f, stage, "%" + int_to_str(uid) + " uses %" + int_to_str(v) + ", whose block does not dominate the use");
                             }
                         }
@@ -159,7 +168,7 @@ fn iv_function(f: & IrFunction, stage: str, errs: & mut Vec<str>) {
     }
 }
 
-fn iv_target(f: & IrFunction, cfg: & IroCfg, t: i64, stage: str, errs: & mut Vec<str>) {
+fn iv_target(f: &IrFunction, cfg: &IroCfg, t: i64, stage: str, errs: &mut Vec<str>) {
     if t < 0 || t >= cfg.index.len() || cfg.index.get(t) < 0 {
         iv_err(errs, f, stage, "a jump to block " + int_to_str(t) + ", which does not exist");
     }

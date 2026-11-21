@@ -18,7 +18,39 @@
 // 6. No closures -- all helpers are top-level functions
 // 7. No ? operator -- explicit match on Result types
 
-module compiler::compiler; use core; use vec; use string; use compiler::ast; use compiler::token; use compiler::lexer; use compiler::parser; use compiler::ir; use compiler::typechecker; use compiler::lower; use compiler::mono; use compiler::borrowck; use compiler::escape; use compiler::secrecy; use compiler::codegen_c; use compiler::comptime_eval; use compiler::cparser; use compiler::pe_ir; use compiler::inc; use compiler::interp; use compiler::ast_ser; use compiler::reach; use compiler::green_thread; use compiler::elf64; use compiler::linker; use compiler::x86; use compiler::wasm; use compiler::iropt; use compiler::cowcheck; use compiler::ir_ser; use compiler::build_info;  // ===========================================================================
+module compiler::compiler;
+use core;
+use vec;
+use string;
+use compiler::ast;
+use compiler::token;
+use compiler::lexer;
+use compiler::parser;
+use compiler::ir;
+use compiler::typechecker;
+use compiler::lower;
+use compiler::mono;
+use compiler::borrowck;
+use compiler::escape;
+use compiler::secrecy;
+use compiler::codegen_c;
+use compiler::comptime_eval;
+use compiler::cparser;
+use compiler::pe_ir;
+use compiler::inc;
+use compiler::interp;
+use compiler::ast_ser;
+use compiler::reach;
+use compiler::green_thread;
+use compiler::elf64;
+use compiler::linker;
+use compiler::x86;
+use compiler::wasm;
+use compiler::iropt;
+use compiler::cowcheck;
+use compiler::ir_ser;
+use compiler::build_info;
+// ===========================================================================
 // Result types (Fides has no generic Result<T,E>)
 // ===========================================================================
 
@@ -364,7 +396,7 @@ pub fn PathProgram_new(path: str, prog: Program) -> PathProgram {
 }
 
 /// Cached file read -- returns cached content if available, otherwise reads from disk.
-fn cached_file_read(cache: & mut Vec<PathContent>, path: str) -> str {
+fn cached_file_read(cache: &mut Vec<PathContent>, path: str) -> str {
     var i: i64 = 0;
     while i < cache.len() {
         if cache.get(i).path == path {
@@ -378,7 +410,7 @@ fn cached_file_read(cache: & mut Vec<PathContent>, path: str) -> str {
 }
 
 /// Cached lex -- returns cached tokens if available, otherwise lexes.
-fn cached_lex(token_cache: & mut Vec<PathTokens>, content_cache: & mut Vec<PathContent>, path: str) -> Vec<Token> {
+fn cached_lex(token_cache: &mut Vec<PathTokens>, content_cache: &mut Vec<PathContent>, path: str) -> Vec<Token> {
     var i: i64 = 0;
     while i < token_cache.len() {
         if token_cache.get(i).path == path {
@@ -410,7 +442,7 @@ fn imp_module_file(import_path: str, base_dir: str, ark_root: str, project_root:
     var candidates: Vec<str> = Vec::new();
     candidates.push(c_path_join(base_dir, str_concat(path_str, ".fd")));
     candidates.push(c_path_join(base_dir, c_path_join(path_str, "mod.fd")));
-    ark_push_candidates(& mut candidates, ark_root, path_str);
+    ark_push_candidates(&mut candidates, ark_root, path_str);
     candidates.push(c_path_join(stdlib_dir(), str_concat(path_str, ".fd")));
     candidates.push(c_path_join(stdlib_dir(), c_path_join(path_str, "mod.fd")));
     candidates.push(c_path_join(project_root, str_concat(path_str, ".fd")));
@@ -432,7 +464,7 @@ fn imp_module_file(import_path: str, base_dir: str, ark_root: str, project_root:
 /// it; a file with a lex error is left to the loop, which lexes it again and
 /// reports as before. Parse order and messages are unchanged. Returns the
 /// module graph of what it found (lexer.fd ModGraph).
-fn imp_prefetch_lex(user: Program, base_dir: str, ark_root: str, project_root: str, nw: i64, content_cache: & mut Vec<PathContent>, token_cache: & mut Vec<PathTokens>) -> ModGraph {
+fn imp_prefetch_lex(user: Program, base_dir: str, ark_root: str, project_root: str, nw: i64, content_cache: &mut Vec<PathContent>, token_cache: &mut Vec<PathTokens>) -> ModGraph {
     var g: ModGraph = ModGraph_new();
     // import path -> 1 + its index in g.names; a file -> 1 once lexed
     var seen: i64 = HashMap_new();
@@ -463,7 +495,7 @@ fn imp_prefetch_lex(user: Program, base_dir: str, ark_root: str, project_root: s
                 at.push(texts.len());
                 texts.push(cached_file_read(content_cache, f));
             } else {
-                at.push(- 1);
+                at.push(-1);
             }
             ix = ix + 1;
         }
@@ -531,7 +563,7 @@ pub fn modcache_hits() -> i64 {
 
 /// The Program parsed earlier from `path` when the file still holds the
 /// same text.
-fn modcache_get(content_cache: & mut Vec<PathContent>, path: str) -> OptProgram {
+fn modcache_get(content_cache: &mut Vec<PathContent>, path: str) -> OptProgram {
     if !g_modcache_on {
         return OptProgram::None;
     }
@@ -551,7 +583,7 @@ fn modcache_get(content_cache: & mut Vec<PathContent>, path: str) -> OptProgram 
 }
 
 /// Keep `prog`, parsed from `path`, for the next build of this process.
-fn modcache_put(content_cache: & mut Vec<PathContent>, path: str, prog: Program) {
+fn modcache_put(content_cache: &mut Vec<PathContent>, path: str, prog: Program) {
     if !g_modcache_on {
         return;
     }
@@ -574,7 +606,7 @@ fn modcache_put(content_cache: & mut Vec<PathContent>, path: str, prog: Program)
 /// This avoids re-parsing modules that were pre-scanned then deferred due to
 /// unloaded transitive dependencies. The pre-scan parse is the most expensive
 /// step (~4s per module), and deferred modules get re-parsed on re-encounter.
-fn cached_parse(parse_cache: & mut Vec<PathProgram>, token_cache: & mut Vec<PathTokens>, content_cache: & mut Vec<PathContent>, path: str, struct_names: Vec<str>, enum_names: Vec<str>) -> OptProgram {
+fn cached_parse(parse_cache: &mut Vec<PathProgram>, token_cache: &mut Vec<PathTokens>, content_cache: &mut Vec<PathContent>, path: str, struct_names: Vec<str>, enum_names: Vec<str>) -> OptProgram {
     var i: i64 = 0;
     while i < parse_cache.len() {
         if parse_cache.get(i).path == path {
@@ -595,7 +627,7 @@ fn cached_parse(parse_cache: & mut Vec<PathProgram>, token_cache: & mut Vec<Path
         if str_len(isrc) == 0 {
             imp_on = false;
         } else {
-            imp_k = imp_key(& sc, struct_names, enum_names);
+            imp_k = imp_key(&sc, struct_names, enum_names);
             match imp_load(path, imp_k) {
                 OptProgram::Some(cp) => {
                     parse_cache.push(PathProgram_new(path, cp));
@@ -631,7 +663,7 @@ fn cached_parse(parse_cache: & mut Vec<PathProgram>, token_cache: & mut Vec<Path
                 // only a text without those words is known to have none.
                 var keep: bool = turbofish_all().len() == tf0;
                 if keep && (sec0 || parser_saw_secret()) {
-                    keep = !imp_has_word(& sc, "secret") && !imp_has_word(& sc, "sensitive");
+                    keep = !imp_has_word(&sc, "secret") && !imp_has_word(&sc, "sensitive");
                 }
                 if keep && !g_imp_broken {
                     imp_save(path, imp_k, imp_import_names(prog), mine, prog);
@@ -687,9 +719,12 @@ var g_imp_on: bool = false;
 var g_imp_broken: bool = false;
 // builds started in this process
 var g_imp_builds: i64 = 0;
-var g_imp_hits: i64 = 0; var g_imp_parsed: i64 = 0; var g_imp_saved: i64 = 0;
+var g_imp_hits: i64 = 0;
+var g_imp_parsed: i64 = 0;
+var g_imp_saved: i64 = 0;
 // the names in the parser's import set (process-wide, as that set is)
-var g_imp_names: i64 = HashMap_new(); var g_imp_names_vec: Vec<str> = Vec::new();
+var g_imp_names: i64 = HashMap_new();
+var g_imp_names_vec: Vec<str> = Vec::new();
 // `module::name` calls taken from the parser (cc_qualify_shadowed_imports
 // reads these first, then the parser's own list)
 var g_imp_qcalls: Vec<str> = Vec::new();
@@ -783,7 +818,7 @@ fn imp_note_imports(p: Program) {
     }
 }
 
-fn imp_add_word(words: i64, order: & mut Vec<i64>, h: i64) {
+fn imp_add_word(words: i64, order: &mut Vec<i64>, h: i64) {
     if HashMap_get_i(words, h) == 0 {
         order.push(h);
         HashMap_insert_i(words, h, order.len());
@@ -795,7 +830,8 @@ fn imp_word_byte(c: i64) -> bool {
 }
 
 /// One pass over the text: its hash (= hash_source) and its words.
-@wrapping fn imp_scan(src: str) -> ImpScan {
+@wrapping
+fn imp_scan(src: str) -> ImpScan {
     var th: i64 = 8834263827529598795;
     var words: i64 = HashMap_new();
     var order: Vec<i64> = Vec::new();
@@ -816,21 +852,21 @@ fn imp_word_byte(c: i64) -> bool {
             wh = wh * 1099511628211;
         } else {
             if in_word {
-                imp_add_word(words, & mut order, wh);
+                imp_add_word(words, &mut order, wh);
                 in_word = false;
             }
         }
         i = i + 1;
     }
     if in_word {
-        imp_add_word(words, & mut order, wh);
+        imp_add_word(words, &mut order, wh);
     }
     return ImpScan {
         text_hash: th, words: words, order: order
     };
 }
 
-fn imp_has_word(sc: & ImpScan, w: str) -> bool {
+fn imp_has_word(sc: &ImpScan, w: str) -> bool {
     return HashMap_get_i(sc.words, hash_source(w)) != 0;
 }
 
@@ -850,7 +886,8 @@ fn imp_is_word(name: str) -> bool {
 
 /// Set `bit` in flags for each word of the text that is one of `names`.
 /// A name that is not a single word is folded into the returned value.
-@wrapping fn imp_mark(sc: & ImpScan, flags: & mut Vec<i64>, names: Vec<str>, bit: i64) -> i64 {
+@wrapping
+fn imp_mark(sc: &ImpScan, flags: &mut Vec<i64>, names: Vec<str>, bit: i64) -> i64 {
     var odd: i64 = 0;
     var i: i64 = 0;
     while i < names.len() {
@@ -870,16 +907,17 @@ fn imp_is_word(name: str) -> bool {
 }
 
 /// The key of a parse of the scanned text with these names known.
-@wrapping fn imp_key(sc: & ImpScan, struct_names: Vec<str>, enum_names: Vec<str>) -> i64 {
+@wrapping
+fn imp_key(sc: &ImpScan, struct_names: Vec<str>, enum_names: Vec<str>) -> i64 {
     var flags: Vec<i64> = Vec::new();
     var i: i64 = 0;
     while i < sc.order.len() {
         flags.push(0);
         i = i + 1;
     }
-    var odd: i64 = imp_mark(sc, & mut flags, struct_names, 1);
-    odd = odd ^ imp_mark(sc, & mut flags, enum_names, 2);
-    odd = odd ^ imp_mark(sc, & mut flags, g_imp_names_vec, 4);
+    var odd: i64 = imp_mark(sc, &mut flags, struct_names, 1);
+    odd = odd ^ imp_mark(sc, &mut flags, enum_names, 2);
+    odd = odd ^ imp_mark(sc, &mut flags, g_imp_names_vec, 4);
     var k: i64 = sc.text_hash;
     i = 0;
     while i < flags.len() {
@@ -948,19 +986,19 @@ fn imp_load(path: str, key: i64) -> OptProgram {
         return OptProgram::None;
     }
     var r: ArBuf = arbuf_new(vb);
-    var magic: i64 = ar_i64(& mut r);
-    var ver: i64 = ar_i64(& mut r);
-    var stored: i64 = ar_i64(& mut r);
+    var magic: i64 = ar_i64(&mut r);
+    var ver: i64 = ar_i64(&mut r);
+    var stored: i64 = ar_i64(&mut r);
     if magic != 4473417 || ver != 1 || stored != key {
         return OptProgram::None;
     }
-    var spath: str = ar_str(& mut r);
+    var spath: str = ar_str(&mut r);
     if spath != path {
         return OptProgram::None;
     }
-    var names: Vec<str> = ar_strs(& mut r);
-    var qcalls: Vec<str> = ar_strs(& mut r);
-    var prog: Program = ar_program(& mut r);
+    var names: Vec<str> = ar_strs(&mut r);
+    var qcalls: Vec<str> = ar_strs(&mut r);
+    var prog: Program = ar_program(&mut r);
     if !r.ok {
         return OptProgram::None;
     }
@@ -974,13 +1012,13 @@ fn imp_load(path: str, key: i64) -> OptProgram {
 
 fn imp_save(path: str, key: i64, names: Vec<str>, qcalls: Vec<str>, prog: Program) {
     var b: AwBuf = awbuf_new();
-    aw_i64(& mut b, 4473417);
-    aw_i64(& mut b, 1);
-    aw_i64(& mut b, key);
-    aw_str(& mut b, path);
-    aw_strs(& mut b, names);
-    aw_strs(& mut b, qcalls);
-    aw_program(& mut b, prog);
+    aw_i64(&mut b, 4473417);
+    aw_i64(&mut b, 1);
+    aw_i64(&mut b, key);
+    aw_str(&mut b, path);
+    aw_strs(&mut b, names);
+    aw_strs(&mut b, qcalls);
+    aw_program(&mut b, prog);
     var file: str = imp_file(path);
     // written whole under another name first: a reader never sees half a file
     var tmp: str = file + "." + int_to_str(p_getpid()) + ".tmp";
@@ -1873,7 +1911,7 @@ pub fn ark_project_root(base_dir: str) -> str {
 ///   ark_modules/<path>.fd, ark_modules/<path>/mod.fd    (a file pact, any path)
 ///   ark_modules/<p>/lib.fd, ark_modules/<p>/src/lib.fd  (`use p`)
 ///   ark_modules/<p>/src/<rest>.fd                       (`use p::rest`)
-pub fn ark_push_candidates(candidates: & mut Vec<str>, ark_root: str, path_str: str) {
+pub fn ark_push_candidates(candidates: &mut Vec<str>, ark_root: str, path_str: str) {
     if str_len(ark_root) == 0 {
         return;
     }
@@ -1941,7 +1979,7 @@ pub fn ark_workspace_root_of(dir: str) -> str {
 }
 
 /// The places of ark_push_candidates under one directory of pacts.
-fn ark_push_candidates_in(candidates: & mut Vec<str>, mods: str, path_str: str) {
+fn ark_push_candidates_in(candidates: &mut Vec<str>, mods: str, path_str: str) {
     candidates.push(c_path_join(mods, str_concat(path_str, ".fd")));
     candidates.push(c_path_join(mods, c_path_join(path_str, "mod.fd")));
     var slash: i64 = str_find(path_str, "/");
@@ -2217,7 +2255,7 @@ pub struct Cd1Use {
     pub why: Vec<str>,
 }
 
-fn cd1_add(u: & mut Cd1Use, cap: str, why: str) {
+fn cd1_add(u: &mut Cd1Use, cap: str, why: str) {
     if str_len(cap) == 0 || cc_c_str_vec_contains(u.names, cap) {
         return;
     }
@@ -2281,7 +2319,7 @@ fn cd1_index(program: Program) -> Cd1Index {
     };
 }
 
-fn cd1_queue(w: & mut Cd1Walk, code: i64, file: str, path: str) {
+fn cd1_queue(w: &mut Cd1Walk, code: i64, file: str, path: str) {
     var key: str = int_to_str(code);
     if HashMap_get(w.seen, key) != 0 {
         return;
@@ -2296,9 +2334,9 @@ fn cd1_queue(w: & mut Cd1Walk, code: i64, file: str, path: str) {
 /// the functions it calls (not another pact's: `stop`) are queued, and
 /// the impl methods of a name it calls when the type checker inferred IO
 /// or Net for them.
-fn cd1_scan(program: Program, ix: Cd1Index, tc: & TypeChecker, body: Vec<Stmt>, file: str, path: str, stop: i64, w: & mut Cd1Walk, u: & mut Cd1Use) {
+fn cd1_scan(program: Program, ix: Cd1Index, tc: &TypeChecker, body: Vec<Stmt>, file: str, path: str, stop: i64, w: &mut Cd1Walk, u: &mut Cd1Use) {
     var calls: Vec<str> = Vec::new();
-    scan_stmts_for_calls(body, & mut calls);
+    scan_stmts_for_calls(body, &mut calls);
     var ci: i64 = 0;
     while ci < calls.len() {
         var c: str = calls.get(ci);
@@ -2335,7 +2373,7 @@ fn cd1_scan(program: Program, ix: Cd1Index, tc: & TypeChecker, body: Vec<Stmt>, 
 /// What pact `pact` uses in the checked `program`: the modules of `mods`
 /// (named `mod_names`) that belong to it. `stop`: the function and method
 /// names of the other pacts' modules.
-fn cd1_pact_uses(program: Program, ix: Cd1Index, tc: & TypeChecker, pact: str, mods: Vec<Program>, mod_names: Vec<str>, stop: i64) -> Cd1Use {
+fn cd1_pact_uses(program: Program, ix: Cd1Index, tc: &TypeChecker, pact: str, mods: Vec<Program>, mod_names: Vec<str>, stop: i64) -> Cd1Use {
     var u: Cd1Use = Cd1Use {
         names: Vec::new(), why: Vec::new()
     };
@@ -2367,7 +2405,7 @@ fn cd1_pact_uses(program: Program, ix: Cd1Index, tc: & TypeChecker, pact: str, m
                 }
                 eff_names.push(f.name);
                 eff_files.push(file);
-                cd1_scan(program, ix, tc, f.body, file, f.name, stop, & mut w, & mut u);
+                cd1_scan(program, ix, tc, f.body, file, f.name, stop, &mut w, &mut u);
                 fi = fi + 1;
             }
             var ii: i64 = 0;
@@ -2379,7 +2417,7 @@ fn cd1_pact_uses(program: Program, ix: Cd1Index, tc: & TypeChecker, pact: str, m
                     var mname: str = imp.struct_name + "." + meth.name;
                     eff_names.push(mname);
                     eff_files.push(file);
-                    cd1_scan(program, ix, tc, meth.body, file, mname, stop, & mut w, & mut u);
+                    cd1_scan(program, ix, tc, meth.body, file, mname, stop, &mut w, &mut u);
                     ki = ki + 1;
                 }
                 ii = ii + 1;
@@ -2388,7 +2426,7 @@ fn cd1_pact_uses(program: Program, ix: Cd1Index, tc: & TypeChecker, pact: str, m
             while ei < m.extern_decls.len() {
                 var ed: ExternDecl = m.extern_decls.get(ei);
                 if !str_starts_with(ed.pledge_name, "p_") {
-                    cd1_add(& mut u, "ffi", file + " (extern \"" + ed.abi + "\" " + ed.c_name + ")");
+                    cd1_add(&mut u, "ffi", file + " (extern \"" + ed.abi + "\" " + ed.c_name + ")");
                 }
                 ei = ei + 1;
             }
@@ -2398,14 +2436,14 @@ fn cd1_pact_uses(program: Program, ix: Cd1Index, tc: & TypeChecker, pact: str, m
                 var qi: i64 = 0;
                 while qi < imd.capabilities.len() {
                     var qc: str = str_trim(imd.capabilities.get(qi));
-                    cd1_add(& mut u, str_to_lower(qc), file + " (use " + imd.path + " with { " + qc + " })");
+                    cd1_add(&mut u, str_to_lower(qc), file + " (use " + imd.path + " with { " + qc + " })");
                     qi = qi + 1;
                 }
                 ui = ui + 1;
             }
             var src: str = c_file_read(file);
             if str_contains(src, "unsafe {") || str_contains(src, "unsafe{") {
-                cd1_add(& mut u, "unsafe", file + " (unsafe {)");
+                cd1_add(&mut u, "unsafe", file + " (unsafe {)");
             }
         }
         mi = mi + 1;
@@ -2418,11 +2456,11 @@ fn cd1_pact_uses(program: Program, ix: Cd1Index, tc: & TypeChecker, pact: str, m
         var wpath: str = w.paths.get(at);
         at = at + 1;
         if code > 0 {
-            cd1_scan(program, ix, tc, program.funcs.get(code - 1).body, wfile, wpath, stop, & mut w, & mut u);
+            cd1_scan(program, ix, tc, program.funcs.get(code - 1).body, wfile, wpath, stop, &mut w, &mut u);
         } else {
             var enc: i64 = 0 - code - 1;
             var imp2: ImplDef = program.impls.get(enc / 65536);
-            cd1_scan(program, ix, tc, imp2.methods.get(enc % 65536).body, wfile, wpath, stop, & mut w, & mut u);
+            cd1_scan(program, ix, tc, imp2.methods.get(enc % 65536).body, wfile, wpath, stop, &mut w, &mut u);
         }
     }
     HashMap_drop(w.seen);
@@ -2432,7 +2470,7 @@ fn cd1_pact_uses(program: Program, ix: Cd1Index, tc: & TypeChecker, pact: str, m
     var ni: i64 = 0;
     while ni < eff_names.len() {
         if cc_c_str_vec_contains(TypeChecker_effects_of(tc, eff_names.get(ni)), "Net") {
-            cd1_add(& mut u, "net", eff_files.get(ni) + " (" + eff_names.get(ni) + ": the type checker inferred the Net effect)");
+            cd1_add(&mut u, "net", eff_files.get(ni) + " (" + eff_names.get(ni) + ": the type checker inferred the Net effect)");
         }
         ni = ni + 1;
     }
@@ -2462,7 +2500,7 @@ fn cd1_sorted(names: Vec<str>) -> Vec<str> {
 /// imported modules) against the [capabilities] of the project's ark.toml
 /// (the workspace root's in a member). The errors: one per pact that uses
 /// a capability it is not granted, in the words of ark_cap_check.
-pub fn cd1_check(program: Program, tc: & TypeChecker, mods: Vec<Program>, mod_names: Vec<str>) -> Vec<str> {
+pub fn cd1_check(program: Program, tc: &TypeChecker, mods: Vec<Program>, mod_names: Vec<str>) -> Vec<str> {
     var errs: Vec<str> = Vec::new();
     if g_cd1_pacts.len() == 0 || env_or_empty("FID_ARK_CAPS") == "off" {
         return errs;
@@ -2667,7 +2705,8 @@ pub fn build_program_no_std_borrowck(source: str, source_path: OptStr, borrowck_
                 while ui >= 0 {
                     imports_to_process.push(user.imports.get(ui).path);
                     ui = ui - 1;
-                } while imports_to_process.len() > 0 {
+                }
+                while imports_to_process.len() > 0 {
                     var import_path: str = imports_to_process.get(imports_to_process.len() - 1);
                     imports_to_process.pop();
                     // Skip "core" -- not available in no-std mode
@@ -2694,7 +2733,7 @@ pub fn build_program_no_std_borrowck(source: str, source_path: OptStr, borrowck_
                     candidates.push(c_path_join(base_dir, str_concat(path_str, ".fd")));
                     candidates.push(c_path_join(base_dir, c_path_join(path_str, "mod.fd")));
                     // TL9: an installed pact
-                    ark_push_candidates(& mut candidates, ark_project_root(base_dir), path_str);
+                    ark_push_candidates(&mut candidates, ark_project_root(base_dir), path_str);
                     candidates.push(c_path_join(project_root, str_concat(path_str, ".fd")));
                     candidates.push(c_path_join(project_root, c_path_join(path_str, "mod.fd")));
 
@@ -2766,7 +2805,7 @@ pub fn build_program_no_std_borrowck(source: str, source_path: OptStr, borrowck_
                                 imported_modules.push(imported);
                                 imported_module_names.push(module_name);
                                 record_module_file(module_name, found_path);
-                                ir_note_program_files(& imported, found_path);
+                                ir_note_program_files(&imported, found_path);
                             }
                         }
                     }
@@ -2774,11 +2813,11 @@ pub fn build_program_no_std_borrowck(source: str, source_path: OptStr, borrowck_
             }
 
             // Apply desugar and default trait methods
-            desugar_layers_models(& mut program);
-            desugar_phase8b(& mut program);
+            desugar_layers_models(&mut program);
+            desugar_phase8b(&mut program);
             ct_sync_target();
             program = process_gen(program);
-            fill_default_trait_methods(& mut program);
+            fill_default_trait_methods(&mut program);
 
             // Merge imported modules into the program (imports first, user wins)
             var mi: i64 = 0;
@@ -2795,7 +2834,7 @@ pub fn build_program_no_std_borrowck(source: str, source_path: OptStr, borrowck_
             // Register imported modules first so their functions are visible
             var mi2: i64 = 0;
             while mi2 < imported_modules.len() {
-                TypeChecker_register_program(& mut tc, imported_modules.get(mi2), imported_module_names.get(mi2));
+                TypeChecker_register_program(&mut tc, imported_modules.get(mi2), imported_module_names.get(mi2));
                 mi2 = mi2 + 1;
             }
             var user_module: str = "main";
@@ -2807,17 +2846,17 @@ pub fn build_program_no_std_borrowck(source: str, source_path: OptStr, borrowck_
                 }
             }
             note_program_path(source_path);
-            TypeChecker_register_program(& mut tc, user, user_module);
-            TypeChecker_register_trait_impls(& mut tc, program);
-            TypeChecker_register_generated_decls(& mut tc, program);
-            TypeChecker_verify_trait_impls(& mut tc, program);
-            TypeChecker_collect_capabilities(& mut tc, user);
-            TypeChecker_check_bodies(& mut tc, program);
+            TypeChecker_register_program(&mut tc, user, user_module);
+            TypeChecker_register_trait_impls(&mut tc, program);
+            TypeChecker_register_generated_decls(&mut tc, program);
+            TypeChecker_verify_trait_impls(&mut tc, program);
+            TypeChecker_collect_capabilities(&mut tc, user);
+            TypeChecker_check_bodies(&mut tc, program);
             // Also check imported module bodies
             var mi3: i64 = 0;
             while mi3 < imported_modules.len() {
-                TypeChecker_collect_capabilities(& mut tc, imported_modules.get(mi3));
-                TypeChecker_check_bodies(& mut tc, imported_modules.get(mi3));
+                TypeChecker_collect_capabilities(&mut tc, imported_modules.get(mi3));
+                TypeChecker_check_bodies(&mut tc, imported_modules.get(mi3));
                 mi3 = mi3 + 1;
             }
             if tc.errors.len() > 0 {
@@ -2868,7 +2907,7 @@ pub fn build_program_no_std_borrowck(source: str, source_path: OptStr, borrowck_
                     bc_mode = BorrowckMode::Warn;
                 }
                 var bc: BorrowChecker = BorrowChecker_new(bc_mode);
-                check(& mut bc, program);
+                check(&mut bc, program);
                 // Warn mode collects into bc.warnings (known-bugs 2g.9: nothing was
                 // printed, the code below reads bc.errors only)
                 var wi: i64 = 0;
@@ -2914,12 +2953,18 @@ pub fn build_program_no_std_borrowck(source: str, source_path: OptStr, borrowck_
 /// Build a program with optional file path for resolving `use` imports.
 /// Cached parsed stdlib for LSP (avoids re-parsing on every keystroke).
 /// Uses module-level vars for persistence across calls in a single process.
-pub var g_stdlib_cache: OptProgram = OptProgram::None; var g_stdlib_struct_names: Vec<str> = Vec::new(); var g_stdlib_enum_names: Vec<str> = Vec::new(); var g_stdlib_cache_init: bool = false;  // Hash of core.fd's text (release D9: a core checked clean once is not
+pub var g_stdlib_cache: OptProgram = OptProgram::None;
+var g_stdlib_struct_names: Vec<str> = Vec::new();
+var g_stdlib_enum_names: Vec<str> = Vec::new();
+var g_stdlib_cache_init: bool = false;  // Hash of core.fd's text (release D9: a core checked clean once is not
 // checked again by the same compiler)
-var g_stdlib_hash: i64 = 0; var g_stdlib_dir_found: bool = false; var g_stdlib_dir: str = "stdlib";  // Native Windows emit: merge the Fides PE runtime (pe_runtime/*.fd) into
+var g_stdlib_hash: i64 = 0;
+var g_stdlib_dir_found: bool = false;
+var g_stdlib_dir: str = "stdlib";  // Native Windows emit: merge the Fides PE runtime (pe_runtime/*.fd) into
 // core before the user program parses, as Rust's build_program_with_runtime
 // does, so a call to builtin `p_X` can run `pert_X` (see pe_ir resolve_call).
-pub var g_pe_runtime_merge: bool = false; pub fn set_pe_runtime_merge(v: bool) {
+pub var g_pe_runtime_merge: bool = false;
+pub fn set_pe_runtime_merge(v: bool) {
     g_pe_runtime_merge = v;
 }
 /// The runtime merged: "pe_runtime" (native Windows), or "linux_runtime"
@@ -2930,7 +2975,8 @@ pub var g_native_rt_win: bool = false;  // macOS on the machine layer (`fid emit
 // runtime plus its macOS layer (linux_runtime/darwin.fd)
 pub var g_native_rt_mac: bool = false;  // WebAssembly (`fid wasm`, compiler/wasm.fd): the Linux runtime plus its
 // WASI layer (linux_runtime/wasi.fd)
-pub var g_native_rt_wasi: bool = false; pub fn set_native_runtime(dir: str) {
+pub var g_native_rt_wasi: bool = false;
+pub fn set_native_runtime(dir: str) {
     g_native_rt_dir = dir;
     g_pe_runtime_merge = true;
 }
@@ -3043,9 +3089,11 @@ fn exe_dir() -> str {
 
 /// G8.7: Global lint warnings populated by build_program_with_path.
 /// Read by lint_source after a successful build.
-pub var g_lint_warnings: Vec<str> = Vec::new();  /// G8.2: Global borrow-checker mode. Set by the CLI before calling the pipeline.
+pub var g_lint_warnings: Vec<str> = Vec::new();
+/// G8.2: Global borrow-checker mode. Set by the CLI before calling the pipeline.
 /// "off" = skip borrow checking, "warn" = report but don't fail, "on" = fail on errors.
-pub var g_borrowck_mode: str = "on";  /// G8.2: Setter for the borrow-checker mode (called from main.fd).
+pub var g_borrowck_mode: str = "on";
+/// G8.2: Setter for the borrow-checker mode (called from main.fd).
 /// Fides doesn't support module-qualified assignment, so we use a function.
 pub fn set_borrowck_mode(mode: str) {
     g_borrowck_mode = mode;
@@ -3054,7 +3102,10 @@ pub fn set_borrowck_mode(mode: str) {
 // SP2 (own-backend roadmap): one per-stage timing table for `--time`.
 // Stages are recorded only while the flag is on; the helpers cost a clock
 // read plus two Vec pushes per mark.
-pub var g_time_on: bool = false; var g_time_names: Vec<str> = Vec::new(); var g_time_ms: Vec<i64> = Vec::new();  /// Turn the --time table on (main.fd: globals are set through functions).
+pub var g_time_on: bool = false;
+var g_time_names: Vec<str> = Vec::new();
+var g_time_ms: Vec<i64> = Vec::new();
+/// Turn the --time table on (main.fd: globals are set through functions).
 pub fn set_time_on() {
     g_time_on = true;
     iropt_set_time_on();
@@ -3139,7 +3190,11 @@ pub fn get_cached_stdlib() -> OptProgram {
 // a changed runtime file or a rebuilt compiler misses and the parse path
 // runs. The artifact stores two Programs: core alone (what get_cached_stdlib
 // returns for reach_keep_set) and the merged program the pipeline merges.
-var g_astcache_hit: bool = false; var g_astcache_lib_hash: i64 = 0; var g_astcache_rt_files: Vec<str> = Vec::new(); var g_astcache_rt_raws: Vec<str> = Vec::new(); fn astcache_path(lib_hash: i64) -> str {
+var g_astcache_hit: bool = false;
+var g_astcache_lib_hash: i64 = 0;
+var g_astcache_rt_files: Vec<str> = Vec::new();
+var g_astcache_rt_raws: Vec<str> = Vec::new();
+fn astcache_path(lib_hash: i64) -> str {
     var over: str = env_or_empty("FID_ASTCACHE");
     if str_len(over) > 0 {
         return over;
@@ -3174,7 +3229,9 @@ var g_astcache_core_key: i64 = 0;
 // SP18: in `fid serve` (g_serve_mode), the core+runtime Program of an
 // emit request stays in memory too, under its lib_hash (every library
 // file's hash): a later emit with the same runtime reads no artifact.
-pub var g_serve_mode: bool = false; var g_astcache_merged_key: i64 = 0; var g_astcache_merged: OptProgram = OptProgram::None;
+pub var g_serve_mode: bool = false;
+var g_astcache_merged_key: i64 = 0;
+var g_astcache_merged: OptProgram = OptProgram::None;
 
 /// SP18: keep the merged Program of `lib_hash` for the next request.
 fn astcache_memo_merged(lib_hash: i64, merged_p: Program) {
@@ -3274,22 +3331,53 @@ pub struct Cb2Mod {
     pub same: bool,
 }
 
-var g_cb2_req: bool = false;           // this build is a serve check request
-var g_cb2_build: bool = false;         // SP8: ... or a serve build request
+var g_cb2_req: bool = false;  // this build is a serve check request
+var g_cb2_build: bool = false;  // SP8: ... or a serve build request
 var g_cb2_base: Vec<Cb2Mod> = Vec::new();  // the last clean check's modules
 var g_cb2_base_on: bool = false;
 var g_cb2_base_cfg: i64 = 0;
-var g_cb2_cur: Vec<Cb2Mod> = Vec::new();   // this request's modules
+var g_cb2_cur: Vec<Cb2Mod> = Vec::new();  // this request's modules
 var g_cb2_cur_cfg: i64 = 0;
-var g_cb2_cur_ok: bool = false;        // every module has a file
-var g_cb2_pending: bool = false;       // g_cb2_cur holds a request's modules
+var g_cb2_cur_ok: bool = false;  // every module has a file
+var g_cb2_pending: bool = false;  // g_cb2_cur holds a request's modules
 var g_cb2_note: str = "";
 var g_cb2_debug: bool = false;
 var g_cb2_tags_done: bool = false;
-var g_cb2_t_fn: i64 = 0; var g_cb2_t_impl: i64 = 0; var g_cb2_t_for: i64 = 0; var g_cb2_t_struct: i64 = 0; var g_cb2_t_enum: i64 = 0; var g_cb2_t_cap: i64 = 0; var g_cb2_t_type: i64 = 0; var g_cb2_t_var: i64 = 0; var g_cb2_t_val: i64 = 0; var g_cb2_t_static: i64 = 0; var g_cb2_t_const: i64 = 0;
-var g_cb2_t_use: i64 = 0; var g_cb2_t_module: i64 = 0; var g_cb2_t_extern: i64 = 0; var g_cb2_t_layer: i64 = 0; var g_cb2_t_model: i64 = 0; var g_cb2_t_component: i64 = 0; var g_cb2_t_system: i64 = 0; var g_cb2_t_state: i64 = 0; var g_cb2_t_on: i64 = 0;
-var g_cb2_t_lbrace: i64 = 0; var g_cb2_t_rbrace: i64 = 0; var g_cb2_t_lparen: i64 = 0; var g_cb2_t_rparen: i64 = 0; var g_cb2_t_lbracket: i64 = 0; var g_cb2_t_rbracket: i64 = 0; var g_cb2_t_semi: i64 = 0; var g_cb2_t_comma: i64 = 0; var g_cb2_t_eq: i64 = 0;
-var g_cb2_t_lt: i64 = 0; var g_cb2_t_gt: i64 = 0; var g_cb2_t_shr: i64 = 0; var g_cb2_t_hash: i64 = 0; var g_cb2_t_at: i64 = 0; var g_cb2_t_eof: i64 = 0;
+var g_cb2_t_fn: i64 = 0;
+var g_cb2_t_impl: i64 = 0;
+var g_cb2_t_for: i64 = 0;
+var g_cb2_t_struct: i64 = 0;
+var g_cb2_t_enum: i64 = 0;
+var g_cb2_t_cap: i64 = 0;
+var g_cb2_t_type: i64 = 0;
+var g_cb2_t_var: i64 = 0;
+var g_cb2_t_val: i64 = 0;
+var g_cb2_t_static: i64 = 0;
+var g_cb2_t_const: i64 = 0;
+var g_cb2_t_use: i64 = 0;
+var g_cb2_t_module: i64 = 0;
+var g_cb2_t_extern: i64 = 0;
+var g_cb2_t_layer: i64 = 0;
+var g_cb2_t_model: i64 = 0;
+var g_cb2_t_component: i64 = 0;
+var g_cb2_t_system: i64 = 0;
+var g_cb2_t_state: i64 = 0;
+var g_cb2_t_on: i64 = 0;
+var g_cb2_t_lbrace: i64 = 0;
+var g_cb2_t_rbrace: i64 = 0;
+var g_cb2_t_lparen: i64 = 0;
+var g_cb2_t_rparen: i64 = 0;
+var g_cb2_t_lbracket: i64 = 0;
+var g_cb2_t_rbracket: i64 = 0;
+var g_cb2_t_semi: i64 = 0;
+var g_cb2_t_comma: i64 = 0;
+var g_cb2_t_eq: i64 = 0;
+var g_cb2_t_lt: i64 = 0;
+var g_cb2_t_gt: i64 = 0;
+var g_cb2_t_shr: i64 = 0;
+var g_cb2_t_hash: i64 = 0;
+var g_cb2_t_at: i64 = 0;
+var g_cb2_t_eof: i64 = 0;
 
 /// A serve check request starts (true) or ends (false). FID_CB2=off keeps
 /// every request a full build, as before CB2.
@@ -3366,7 +3454,7 @@ fn cb2_tags_init() {
     g_cb2_t_eof = token_kind_tag(TokenKind::Eof);
 }
 
-fn cb2_tag(toks: & Vec<Token>, i: i64) -> i64 {
+fn cb2_tag(toks: &Vec<Token>, i: i64) -> i64 {
     if i < 0 || i >= toks.len() {
         return g_cb2_t_eof;
     }
@@ -3396,7 +3484,7 @@ fn cb2_is_name_head(t: i64) -> bool {
     return t == g_cb2_t_struct || t == g_cb2_t_enum || t == g_cb2_t_cap || t == g_cb2_t_type || t == g_cb2_t_var || t == g_cb2_t_val || t == g_cb2_t_static || t == g_cb2_t_const || t == g_cb2_t_layer || t == g_cb2_t_model || t == g_cb2_t_component || t == g_cb2_t_system || t == g_cb2_t_state || t == g_cb2_t_on;
 }
 
-fn cb2_ident(toks: & Vec<Token>, i: i64) -> str {
+fn cb2_ident(toks: &Vec<Token>, i: i64) -> str {
     if i < 0 || i >= toks.len() {
         return "";
     }
@@ -3412,7 +3500,7 @@ fn cb2_ident(toks: & Vec<Token>, i: i64) -> str {
 
 /// The last token of the item that starts at `start` (tokens before
 /// `limit` only): a `;` at its level, or the `}` that closes a block item.
-fn cb2_item_end(toks: & Vec<Token>, start: i64, limit: i64) -> i64 {
+fn cb2_item_end(toks: &Vec<Token>, start: i64, limit: i64) -> i64 {
     var t0: i64 = cb2_tag(toks, start);
     // `#[..]` / `#![..]`: an attribute of the module, an item of its own;
     // `@import("x.h")` likewise
@@ -3461,7 +3549,8 @@ fn cb2_item_end(toks: & Vec<Token>, start: i64, limit: i64) -> i64 {
     return limit - 1;
 }
 
-@wrapping fn cb2_mix(h: i64, v: i64) -> i64 {
+@wrapping
+fn cb2_mix(h: i64, v: i64) -> i64 {
     var x: i64 = h;
     var y: i64 = v;
     var i: i64 = 0;
@@ -3474,7 +3563,8 @@ fn cb2_item_end(toks: & Vec<Token>, start: i64, limit: i64) -> i64 {
     return x;
 }
 
-@wrapping fn cb2_mix_str(h: i64, s: str) -> i64 {
+@wrapping
+fn cb2_mix_str(h: i64, s: str) -> i64 {
     var n: i64 = str_len(s);
     var x: i64 = cb2_mix(h, n);
     var i: i64 = 0;
@@ -3487,7 +3577,7 @@ fn cb2_item_end(toks: & Vec<Token>, start: i64, limit: i64) -> i64 {
 }
 
 /// The hash of tokens a..=b folded into h: kinds and payloads, no positions.
-fn cb2_hash_range(toks: & Vec<Token>, a: i64, b: i64, h: i64) -> i64 {
+fn cb2_hash_range(toks: &Vec<Token>, a: i64, b: i64, h: i64) -> i64 {
     var x: i64 = h;
     var j: i64 = a;
     while j <= b {
@@ -3525,7 +3615,7 @@ fn cb2_hash_range(toks: & Vec<Token>, a: i64, b: i64, h: i64) -> i64 {
 
 /// Note word hash h for the item numbered id (wset remembers the last item
 /// that noted each word, so an item lists a word once).
-fn cb2_word(wset: i64, id: i64, out: & mut Vec<i64>, h: i64) {
+fn cb2_word(wset: i64, id: i64, out: &mut Vec<i64>, h: i64) {
     if HashMap_get_i(wset, h) != id {
         HashMap_insert_i(wset, h, id);
         out.push(h);
@@ -3533,7 +3623,8 @@ fn cb2_word(wset: i64, id: i64, out: & mut Vec<i64>, h: i64) {
 }
 
 /// The words of an f-string's text (its `{..}` parts are code).
-@wrapping fn cb2_text_words(wset: i64, id: i64, out: & mut Vec<i64>, s: str) {
+@wrapping
+fn cb2_text_words(wset: i64, id: i64, out: &mut Vec<i64>, s: str) {
     var n: i64 = str_len(s);
     var in_w: bool = false;
     var wh: i64 = 0;
@@ -3560,7 +3651,7 @@ fn cb2_word(wset: i64, id: i64, out: & mut Vec<i64>, h: i64) {
 
 /// The words tokens a..=b mention: identifiers (`main` only where it is
 /// called or passed) and the words of f-strings.
-fn cb2_words_range(toks: & Vec<Token>, a: i64, b: i64, wset: i64, id: i64, out: & mut Vec<i64>) {
+fn cb2_words_range(toks: &Vec<Token>, a: i64, b: i64, wset: i64, id: i64, out: &mut Vec<i64>) {
     var j: i64 = a;
     while j <= b {
         match toks.get(j).kind {
@@ -3585,7 +3676,7 @@ fn cb2_words_range(toks: & Vec<Token>, a: i64, b: i64, wset: i64, id: i64, out: 
     }
 }
 
-fn cb2_push_name(names: & mut Vec<str>, s: str) {
+fn cb2_push_name(names: &mut Vec<str>, s: str) {
     if str_len(s) == 0 {
         return;
     }
@@ -3601,7 +3692,7 @@ fn cb2_push_name(names: & mut Vec<str>, s: str) {
 
 /// The names tokens a..=b define: the name after an item keyword at their
 /// own level, the name after every `fn`, and an enum's variants.
-fn cb2_names_range(toks: & Vec<Token>, a: i64, b: i64, names: & mut Vec<str>) {
+fn cb2_names_range(toks: &Vec<Token>, a: i64, b: i64, names: &mut Vec<str>) {
     var depth: i64 = 0;
     var in_enum: bool = false;
     var j: i64 = a;
@@ -3633,7 +3724,7 @@ fn cb2_names_range(toks: & Vec<Token>, a: i64, b: i64, names: & mut Vec<str>) {
 }
 
 /// The first item keyword of tokens a..=b at their own level, or -1.
-fn cb2_head_at(toks: & Vec<Token>, a: i64, b: i64) -> i64 {
+fn cb2_head_at(toks: &Vec<Token>, a: i64, b: i64) -> i64 {
     var depth: i64 = 0;
     var j: i64 = a;
     while j <= b {
@@ -3651,11 +3742,11 @@ fn cb2_head_at(toks: & Vec<Token>, a: i64, b: i64) -> i64 {
         }
         j = j + 1;
     }
-    return - 1;
+    return -1;
 }
 
 /// How many `fn` tokens a..=b hold at their own level.
-fn cb2_fn_count(toks: & Vec<Token>, a: i64, b: i64) -> i64 {
+fn cb2_fn_count(toks: &Vec<Token>, a: i64, b: i64) -> i64 {
     var depth: i64 = 0;
     var count: i64 = 0;
     var j: i64 = a;
@@ -3686,7 +3777,7 @@ fn cb2_item_new(key: str, hash: i64, names: Vec<str>, words: Vec<i64>, kind: i64
 /// An `impl` item s..=e (its keyword at head): one body item per method,
 /// keyed "impl:T:m" ("trait:T:m" for `impl Trait for T`), and one
 /// declaration item for the rest (the header, associated types).
-fn cb2_add_impl(items: & mut Vec<Cb2Item>, toks: & Vec<Token>, s: i64, e: i64, head: i64, wset: i64, next_id: & mut i64) {
+fn cb2_add_impl(items: &mut Vec<Cb2Item>, toks: &Vec<Token>, s: i64, e: i64, head: i64, wset: i64, next_id: &mut i64) {
     var j: i64 = head + 1;
     // `impl<T> ...`: the parameters come first
     if cb2_tag(toks, j) == g_cb2_t_lt {
@@ -3709,7 +3800,7 @@ fn cb2_add_impl(items: & mut Vec<Cb2Item>, toks: & Vec<Token>, s: i64, e: i64, h
     var first: str = "";
     var after_for: str = "";
     var is_trait: bool = false;
-    var open: i64 = - 1;
+    var open: i64 = -1;
     while j <= e && open < 0 {
         var th: i64 = cb2_tag(toks, j);
         if th == g_cb2_t_lbrace {
@@ -3734,23 +3825,23 @@ fn cb2_add_impl(items: & mut Vec<Cb2Item>, toks: & Vec<Token>, s: i64, e: i64, h
         ty = after_for;
         prefix = "trait:";
     }
-    var hid: i64 = * next_id;
-    * next_id = * next_id + 1;
+    var hid: i64 = *next_id;
+    *next_id = *next_id + 1;
     var hnames: Vec<str> = Vec::new();
-    cb2_push_name(& mut hnames, ty);
+    cb2_push_name(&mut hnames, ty);
     if is_trait {
-        cb2_push_name(& mut hnames, first);
+        cb2_push_name(&mut hnames, first);
     }
     var hwords: Vec<i64> = Vec::new();
     if open < 0 || str_len(ty) == 0 {
         // not the shape expected: one declaration item for all of it
-        cb2_names_range(toks, s, e, & mut hnames);
-        cb2_words_range(toks, s, e, wset, hid, & mut hwords);
+        cb2_names_range(toks, s, e, &mut hnames);
+        cb2_words_range(toks, s, e, wset, hid, &mut hwords);
         items.push(cb2_item_new("implx:" + ty, cb2_hash_range(toks, s, e, 8834263827529598795), hnames, hwords, 1));
         return;
     }
     var hhash: i64 = cb2_hash_range(toks, s, open, 8834263827529598795);
-    cb2_words_range(toks, s, open, wset, hid, & mut hwords);
+    cb2_words_range(toks, s, open, wset, hid, &mut hwords);
     var k: i64 = open + 1;
     while k < e {
         var me: i64 = cb2_item_end(toks, k, e);
@@ -3763,23 +3854,23 @@ fn cb2_add_impl(items: & mut Vec<Cb2Item>, toks: & Vec<Token>, s: i64, e: i64, h
             mname = cb2_ident(toks, mh + 1);
         }
         if str_len(mname) > 0 {
-            var mid: i64 = * next_id;
-            * next_id = * next_id + 1;
+            var mid: i64 = *next_id;
+            *next_id = *next_id + 1;
             var mnames: Vec<str> = Vec::new();
-            cb2_names_range(toks, k, me, & mut mnames);
+            cb2_names_range(toks, k, me, &mut mnames);
             if is_trait {
                 // a trait method is also called without its name (an
                 // operator, a `for` loop, printing): its type and trait too
-                cb2_push_name(& mut mnames, ty);
-                cb2_push_name(& mut mnames, first);
+                cb2_push_name(&mut mnames, ty);
+                cb2_push_name(&mut mnames, first);
             }
             var mwords: Vec<i64> = Vec::new();
-            cb2_words_range(toks, k, me, wset, mid, & mut mwords);
+            cb2_words_range(toks, k, me, wset, mid, &mut mwords);
             items.push(cb2_item_new(prefix + ty + ":" + mname, cb2_hash_range(toks, k, me, 8834263827529598795), mnames, mwords, 0));
         } else {
             hhash = cb2_hash_range(toks, k, me, hhash);
-            cb2_names_range(toks, k, me, & mut hnames);
-            cb2_words_range(toks, k, me, wset, hid, & mut hwords);
+            cb2_names_range(toks, k, me, &mut hnames);
+            cb2_words_range(toks, k, me, wset, hid, &mut hwords);
         }
         k = me + 1;
     }
@@ -3787,9 +3878,9 @@ fn cb2_add_impl(items: & mut Vec<Cb2Item>, toks: & Vec<Token>, s: i64, e: i64, h
 }
 
 /// The item s..=e of a module.
-fn cb2_add_item(items: & mut Vec<Cb2Item>, toks: & Vec<Token>, s: i64, e: i64, wset: i64, next_id: & mut i64) {
+fn cb2_add_item(items: &mut Vec<Cb2Item>, toks: &Vec<Token>, s: i64, e: i64, wset: i64, next_id: &mut i64) {
     var head: i64 = cb2_head_at(toks, s, e);
-    var ht: i64 = - 1;
+    var ht: i64 = -1;
     if head >= 0 {
         ht = cb2_tag(toks, head);
     }
@@ -3797,12 +3888,12 @@ fn cb2_add_item(items: & mut Vec<Cb2Item>, toks: & Vec<Token>, s: i64, e: i64, w
         cb2_add_impl(items, toks, s, e, head, wset, next_id);
         return;
     }
-    var id: i64 = * next_id;
-    * next_id = * next_id + 1;
+    var id: i64 = *next_id;
+    *next_id = *next_id + 1;
     var names: Vec<str> = Vec::new();
-    cb2_names_range(toks, s, e, & mut names);
+    cb2_names_range(toks, s, e, &mut names);
     var words: Vec<i64> = Vec::new();
-    cb2_words_range(toks, s, e, wset, id, & mut words);
+    cb2_words_range(toks, s, e, wset, id, &mut words);
     var hash: i64 = cb2_hash_range(toks, s, e, 8834263827529598795);
     var t0: i64 = cb2_tag(toks, s);
     if ht == g_cb2_t_use || ht == g_cb2_t_module || t0 == g_cb2_t_hash || (t0 == g_cb2_t_at && cb2_ident(toks, s + 1) == "import") {
@@ -3829,7 +3920,7 @@ fn cb2_add_item(items: & mut Vec<Cb2Item>, toks: & Vec<Token>, s: i64, e: i64, w
 
 /// The items of one module's tokens. A key defined twice in the module
 /// becomes "dup<k>:key" (never skipped; the checker's key covers both).
-fn cb2_items(toks: & Vec<Token>, wset: i64) -> Vec<Cb2Item> {
+fn cb2_items(toks: &Vec<Token>, wset: i64) -> Vec<Cb2Item> {
     cb2_tags_init();
     var items: Vec<Cb2Item> = Vec::new();
     var next_id: i64 = 1;
@@ -3843,7 +3934,7 @@ fn cb2_items(toks: & Vec<Token>, wset: i64) -> Vec<Cb2Item> {
         if e < i {
             e = i;
         }
-        cb2_add_item(& mut items, toks, i, e, wset, & mut next_id);
+        cb2_add_item(&mut items, toks, i, e, wset, &mut next_id);
         i = e + 1;
     }
     var counts: i64 = HashMap_new();
@@ -3871,7 +3962,7 @@ fn cb2_items(toks: & Vec<Token>, wset: i64) -> Vec<Cb2Item> {
 }
 
 /// A module's state from its text and tokens.
-fn cb2_module(path: str, text: str, toks: & Vec<Token>, is_user: bool, main_mod: bool) -> Cb2Mod {
+fn cb2_module(path: str, text: str, toks: &Vec<Token>, is_user: bool, main_mod: bool) -> Cb2Mod {
     var wset: i64 = HashMap_new();
     var items: Vec<Cb2Item> = cb2_items(toks, wset);
     return Cb2Mod {
@@ -3887,7 +3978,7 @@ fn cb2_base_find(path: str) -> i64 {
         }
         i = i + 1;
     }
-    return - 1;
+    return -1;
 }
 
 fn cb2_cur_find(path: str) -> i64 {
@@ -3898,10 +3989,10 @@ fn cb2_cur_find(path: str) -> i64 {
         }
         i = i + 1;
     }
-    return - 1;
+    return -1;
 }
 
-fn cb2_has_wset(v: & Vec<Cb2Mod>, w: i64) -> bool {
+fn cb2_has_wset(v: &Vec<Cb2Mod>, w: i64) -> bool {
     var i: i64 = 0;
     while i < v.len() {
         if v.get(i).wset == w {
@@ -3920,7 +4011,7 @@ fn cb2_drop_pending() {
     var i: i64 = 0;
     while i < g_cb2_cur.len() {
         var w: i64 = g_cb2_cur.get(i).wset;
-        if w != 0 && !cb2_has_wset(& g_cb2_base, w) {
+        if w != 0 && !cb2_has_wset(&g_cb2_base, w) {
             HashMap_drop(w);
         }
         i = i + 1;
@@ -3941,7 +4032,7 @@ pub fn cb2_commit() {
     var i: i64 = 0;
     while i < g_cb2_base.len() {
         var w: i64 = g_cb2_base.get(i).wset;
-        if w != 0 && !cb2_has_wset(& g_cb2_cur, w) {
+        if w != 0 && !cb2_has_wset(&g_cb2_cur, w) {
             HashMap_drop(w);
         }
         i = i + 1;
@@ -3954,7 +4045,7 @@ pub fn cb2_commit() {
 }
 
 /// The tokens of `path` lexed in this build, or its text lexed now.
-fn cb2_tokens_of(token_cache: & Vec<PathTokens>, path: str, text: str) -> Vec<Token> {
+fn cb2_tokens_of(token_cache: &Vec<PathTokens>, path: str, text: str) -> Vec<Token> {
     var i: i64 = 0;
     while i < token_cache.len() {
         if token_cache.get(i).path == path {
@@ -3968,7 +4059,7 @@ fn cb2_tokens_of(token_cache: & Vec<PathTokens>, path: str, text: str) -> Vec<To
 
 /// Add a module of this request: the clean state's when its text is the
 /// same, else built from its tokens.
-fn cb2_cur_add(path: str, text: str, token_cache: & Vec<PathTokens>, have_toks: bool, toks: Vec<Token>, is_user: bool, main_mod: bool) {
+fn cb2_cur_add(path: str, text: str, token_cache: &Vec<PathTokens>, have_toks: bool, toks: Vec<Token>, is_user: bool, main_mod: bool) {
     var b: i64 = cb2_base_find(path);
     if b >= 0 && g_cb2_base.get(b).text == text {
         var bm: Cb2Mod = g_cb2_base.get(b);
@@ -3982,7 +4073,7 @@ fn cb2_cur_add(path: str, text: str, token_cache: & Vec<PathTokens>, have_toks: 
     if !have_toks {
         tk = cb2_tokens_of(token_cache, path, text);
     }
-    g_cb2_cur.push(cb2_module(path, text, & tk, is_user, main_mod));
+    g_cb2_cur.push(cb2_module(path, text, &tk, is_user, main_mod));
 }
 
 /// Everything a module's check depends on besides the modules' texts.
@@ -4004,7 +4095,7 @@ pub fn cb2_config(lib_hash: i64, borrowck_mode: str, base_dir: str) -> i64 {
 }
 
 /// Put the names of `it` into the pool.
-fn cb2_pool_add(pool: i64, pool_list: & mut Vec<i64>, it: & Cb2Item) {
+fn cb2_pool_add(pool: i64, pool_list: &mut Vec<i64>, it: &Cb2Item) {
     var i: i64 = 0;
     while i < it.names.len() {
         var h: i64 = hash_source(it.names.get(i));
@@ -4024,7 +4115,7 @@ fn cb2_skippable_key(key: str) -> bool {
 /// every body no edit since the last clean check can reach (see above).
 /// `mod_names`: the imported modules; the program's own file is
 /// `user_text`, lexed as `user_toks`, registered as module `user_module`.
-pub fn cb2_skip_set(skip0: i64, user_text: str, source_path: OptStr, user_toks: Vec<Token>, user_module: str, mod_names: Vec<str>, content_cache: & mut Vec<PathContent>, token_cache: & Vec<PathTokens>, cfg: i64) -> i64 {
+pub fn cb2_skip_set(skip0: i64, user_text: str, source_path: OptStr, user_toks: Vec<Token>, user_module: str, mod_names: Vec<str>, content_cache: &mut Vec<PathContent>, token_cache: &Vec<PathTokens>, cfg: i64) -> i64 {
     if !g_cb2_req {
         return skip0;
     }
@@ -4106,7 +4197,7 @@ pub fn cb2_skip_set(skip0: i64, user_text: str, source_path: OptStr, user_toks: 
                     var at: i64 = HashMap_get(bkeys, it.key);
                     if at == 0 || bm.items.get(at - 1).hash != it.hash {
                         st.set(offs.get(mi) + k, 1);
-                        cb2_pool_add(pool, & mut pool_list, & it);
+                        cb2_pool_add(pool, &mut pool_list, &it);
                         if it.kind == 2 {
                             all = true;
                         }
@@ -4120,7 +4211,7 @@ pub fn cb2_skip_set(skip0: i64, user_text: str, source_path: OptStr, user_toks: 
                 while bi < bm.items.len() {
                     var bit: Cb2Item = bm.items.get(bi);
                     if !HashMap_contains(ckeys, bit.key) {
-                        cb2_pool_add(pool, & mut pool_list, & bit);
+                        cb2_pool_add(pool, &mut pool_list, &bit);
                         if bit.kind == 2 {
                             all = true;
                         }
@@ -4143,7 +4234,7 @@ pub fn cb2_skip_set(skip0: i64, user_text: str, source_path: OptStr, user_toks: 
                 while ka < m.items.len() {
                     var ita: Cb2Item = m.items.get(ka);
                     st.set(offs.get(mi) + ka, 1);
-                    cb2_pool_add(pool, & mut pool_list, & ita);
+                    cb2_pool_add(pool, &mut pool_list, &ita);
                     ka = ka + 1;
                 }
             }
@@ -4158,7 +4249,7 @@ pub fn cb2_skip_set(skip0: i64, user_text: str, source_path: OptStr, user_toks: 
             var gk: i64 = 0;
             while gk < gm.items.len() {
                 var git: Cb2Item = gm.items.get(gk);
-                cb2_pool_add(pool, & mut pool_list, & git);
+                cb2_pool_add(pool, &mut pool_list, &git);
                 gk = gk + 1;
             }
         }
@@ -4209,7 +4300,7 @@ pub fn cb2_skip_set(skip0: i64, user_text: str, source_path: OptStr, user_toks: 
                         }
                         if found {
                             st.set(offs.get(mi) + ck, 2);
-                            cb2_pool_add(pool, & mut pool_list, & cit);
+                            cb2_pool_add(pool, &mut pool_list, &cit);
                         }
                     }
                     ck = ck + 1;
@@ -4305,21 +4396,21 @@ fn astcache_save(lib_hash: i64, core_p: Program, merged_p: Program, same: bool) 
         return;
     }
     var b: AwBuf = awbuf_new();
-    aw_i64(& mut b, 4473414);
-    aw_i64(& mut b, 4);
-    aw_i64(& mut b, lib_hash);
-    aw_bool(& mut b, same);
-    aw_program(& mut b, core_p);
+    aw_i64(&mut b, 4473414);
+    aw_i64(&mut b, 4);
+    aw_i64(&mut b, lib_hash);
+    aw_bool(&mut b, same);
+    aw_program(&mut b, core_p);
     if !same {
-        aw_program(& mut b, merged_p);
+        aw_program(&mut b, merged_p);
     }
     // DB1 (version 4): which library file (core, a runtime file) each
     // library function came from, as name/path pairs (ir.fd ir_lib_file_pairs)
     var lib_pairs: Vec<str> = ir_lib_file_pairs();
-    aw_i64(& mut b, lib_pairs.len());
+    aw_i64(&mut b, lib_pairs.len());
     var lpi: i64 = 0;
     while lpi < lib_pairs.len() {
-        aw_str(& mut b, lib_pairs.get(lpi));
+        aw_str(&mut b, lib_pairs.get(lpi));
         lpi = lpi + 1;
     }
     p_file_write_vec(astcache_path(lib_hash), b.bytes);
@@ -4408,22 +4499,22 @@ fn astcache_load() -> OptProgram {
         var vb: Vec<i64> = p_file_read_bytes(path);
         if vb.len() > 24 {
             var r: ArBuf = arbuf_new(vb);
-            var magic: i64 = ar_i64(& mut r);
-            var ver: i64 = ar_i64(& mut r);
-            var stored: i64 = ar_i64(& mut r);
+            var magic: i64 = ar_i64(&mut r);
+            var ver: i64 = ar_i64(&mut r);
+            var stored: i64 = ar_i64(&mut r);
             if magic == 4473414 && ver == 4 && stored == lib_hash {
-                var same: bool = ar_bool(& mut r);
-                var core_p: Program = ar_program(& mut r);
+                var same: bool = ar_bool(&mut r);
+                var core_p: Program = ar_program(&mut r);
                 var merged_p: Program = core_p;
                 if !same {
-                    merged_p = ar_program(& mut r);
+                    merged_p = ar_program(&mut r);
                 }
                 // DB1: the library functions' files (astcache_save)
                 var lib_pairs: Vec<str> = Vec::new();
-                var npairs: i64 = ar_i64(& mut r);
+                var npairs: i64 = ar_i64(&mut r);
                 var lpi: i64 = 0;
                 while lpi < npairs && r.ok {
-                    lib_pairs.push(ar_str(& mut r));
+                    lib_pairs.push(ar_str(&mut r));
                     lpi = lpi + 1;
                 }
                 if r.ok {
@@ -4475,7 +4566,7 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
             // DB1: core's functions get core.fd's line rows (an artifact hit
             // restored the records in astcache_load)
             if !g_astcache_hit {
-                ir_note_lib_program(& stdlib_parsed, c_path_join(stdlib_dir(), "core.fd"));
+                ir_note_lib_program(&stdlib_parsed, c_path_join(stdlib_dir(), "core.fd"));
             }
             // The checked-library stamp (release D9) covers core and the
             // runtime merged into it: a library checked clean once is not
@@ -4529,7 +4620,7 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                                 rsi = rsi + 1;
                             }
                             // DB1: the runtime file's functions get its rows
-                            ir_note_lib_program(& rt_program, pe_runtime_path(rt_files.get(rti)));
+                            ir_note_lib_program(&rt_program, pe_runtime_path(rt_files.get(rti)));
                             stdlib = merge_programs(rt_program, stdlib);
                         }
                     }
@@ -4694,7 +4785,7 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                         var pf_nw: i64 = esc_par_workers();
                         if pf_nw >= 2 && !imp_active() && !g_modcache_on {
                             var t_pf: i64 = p_clock_now_ms();
-                            var pf_graph: ModGraph = imp_prefetch_lex(user, base_dir, ark_root, project_root, pf_nw, & mut content_cache, & mut token_cache);
+                            var pf_graph: ModGraph = imp_prefetch_lex(user, base_dir, ark_root, project_root, pf_nw, &mut content_cache, &mut token_cache);
                             time_row("  imports: lexed ahead, " + modgraph_summary(modgraph_levels(pf_graph.deps)), p_clock_now_ms() - t_pf);
                         }
 
@@ -4722,7 +4813,7 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                             candidates.push(c_path_join(base_dir, c_path_join(path_str, "mod.fd")));
                             // TL9: an installed pact, before the stdlib (a
                             // dependency is a deliberate choice)
-                            ark_push_candidates(& mut candidates, ark_root, path_str);
+                            ark_push_candidates(&mut candidates, ark_root, path_str);
                             candidates.push(c_path_join(stdlib_dir(), str_concat(path_str, ".fd")));
                             candidates.push(c_path_join(stdlib_dir(), c_path_join(path_str, "mod.fd")));
                             candidates.push(c_path_join(project_root, str_concat(path_str, ".fd")));
@@ -4818,7 +4909,7 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                                 } else {
                                     // CB2: parsed by an earlier build of this
                                     // process (serve, fix, lsp) from the same text
-                                    pre_result_opt = modcache_get(& mut content_cache, found_path);
+                                    pre_result_opt = modcache_get(&mut content_cache, found_path);
                                     var mc_hit: bool = false;
                                     match pre_result_opt {
                                         OptProgram::Some(_) => {
@@ -4834,7 +4925,7 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                                         // CB1: cached_parse lexes only when the
                                         // import cache misses; a lex error stops
                                         // it before the parse
-                                        pre_result_opt = cached_parse(& mut parse_cache, & mut token_cache, & mut content_cache, found_path, struct_names, enum_names);
+                                        pre_result_opt = cached_parse(&mut parse_cache, &mut token_cache, &mut content_cache, found_path, struct_names, enum_names);
                                         if g_import_lex_errors.len() > 0 {
                                             var lex_errs: Vec<str> = g_import_lex_errors;
                                             g_import_lex_errors = Vec::new();
@@ -4842,11 +4933,11 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                                         }
                                         match pre_result_opt {
                                             OptProgram::Some(mc_prog) => {
-                                                modcache_put(& mut content_cache, found_path, mc_prog);
+                                                modcache_put(&mut content_cache, found_path, mc_prog);
                                             }
                                             OptProgram::None => {
                                                 // the full parse below reads the tokens
-                                                pre_toks = cached_lex(& mut token_cache, & mut content_cache, found_path);
+                                                pre_toks = cached_lex(&mut token_cache, &mut content_cache, found_path);
                                             }
                                         }
                                     }
@@ -4976,7 +5067,7 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                                         imported_module_names.push(mod_name);
                                         if !is_header {
                                             record_module_file(mod_name, found_path);
-                                            ir_note_program_files(& imported, found_path);
+                                            ir_note_program_files(&imported, found_path);
                                             cd1_note_module(mod_name, found_path, ark_root);
                                         }
                                         var imp_ed_err: str = cc_record_edition(imported, mod_name, found_path);
@@ -5007,7 +5098,7 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                                                 imported_modules.push(imported);
                                                 imported_module_names.push(mod_name);
                                                 record_module_file(mod_name, found_path);
-                                                ir_note_program_files(& imported, found_path);
+                                                ir_note_program_files(&imported, found_path);
                                                 cd1_note_module(mod_name, found_path, ark_root);
                                                 var imp_ed_err2: str = cc_record_edition(imported, mod_name, found_path);
                                                 if str_len(imp_ed_err2) > 0 {
@@ -5049,31 +5140,31 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                     t_t = time_mark("imports", t_t);
                     // L8H: a module's narrower definitions of a generic one of a module it
                     // imports are its specializations (parser.fd)
-                    var cms_errs: Vec<str> = pd_cross_module_specializations(& mut imported_modules, imported_module_names, & mut user);
+                    var cms_errs: Vec<str> = pd_cross_module_specializations(&mut imported_modules, imported_module_names, &mut user);
                     if cms_errs.len() > 0 {
                         return ResultProgram::Err(cms_errs);
                     }
                     // A user function named like a function of one imported
                     // module: each side keeps its own (module__name).
-                    cc_qualify_shadowed_imports(& mut imported_modules, imported_module_names, & mut user, stdlib);
+                    cc_qualify_shadowed_imports(&mut imported_modules, imported_module_names, &mut user, stdlib);
                     t_t = time_mark("merge: shadowed imports", t_t);
 
                     // `cap Sub: Super`: Sub carries Super's methods.
                     var trait_defs: Vec<TraitDef> = Vec::new();
-                    cc_push_traits(& mut trait_defs, stdlib);
+                    cc_push_traits(&mut trait_defs, stdlib);
                     var tmi: i64 = 0;
                     while tmi < imported_modules.len() {
-                        cc_push_traits(& mut trait_defs, imported_modules.get(tmi));
+                        cc_push_traits(&mut trait_defs, imported_modules.get(tmi));
                         tmi = tmi + 1;
                     }
-                    cc_push_traits(& mut trait_defs, user);
+                    cc_push_traits(&mut trait_defs, user);
                     var super_errors: Vec<str> = Vec::new();
                     tmi = 0;
                     while tmi < imported_modules.len() {
-                        cc_inherit_supertraits(imported_modules.get(tmi), trait_defs, & mut super_errors);
+                        cc_inherit_supertraits(imported_modules.get(tmi), trait_defs, &mut super_errors);
                         tmi = tmi + 1;
                     }
-                    cc_inherit_supertraits(& mut user, trait_defs, & mut super_errors);
+                    cc_inherit_supertraits(&mut user, trait_defs, &mut super_errors);
                     if super_errors.len() > 0 {
                         return ResultProgram::Err(super_errors);
                     }
@@ -5084,7 +5175,7 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                     var dup_errors: Vec<str> = Vec::new();
                     var dmi: i64 = 0;
                     while dmi < imported_modules.len() {
-                        cc_find_duplicate_funcs(imported_modules.get(dmi), imported_module_names.get(dmi), & mut dup_errors);
+                        cc_find_duplicate_funcs(imported_modules.get(dmi), imported_module_names.get(dmi), &mut dup_errors);
                         dmi = dmi + 1;
                     }
                     var dup_user_module: str = "main";
@@ -5095,9 +5186,9 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                         OptStr::None => {
                         }
                     }
-                    cc_find_duplicate_funcs(user, dup_user_module, & mut dup_errors);
-                    cc_find_module_conflicts(stdlib, imported_modules, imported_module_names, user, dup_user_module, & mut dup_errors);
-                    cc_find_trait_impl_conflicts(imported_modules, imported_module_names, user, & mut dup_errors);
+                    cc_find_duplicate_funcs(user, dup_user_module, &mut dup_errors);
+                    cc_find_module_conflicts(stdlib, imported_modules, imported_module_names, user, dup_user_module, &mut dup_errors);
+                    cc_find_trait_impl_conflicts(imported_modules, imported_module_names, user, &mut dup_errors);
                     if dup_errors.len() > 0 {
                         return ResultProgram::Err(dup_errors);
                     }
@@ -5107,13 +5198,13 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                     // harness's program and its own modules get a
                     // `__fz_hit(k)` per block (fuzz_cov_program)
                     if g_fuzz_cov && fzc_has_hook(user) {
-                        fuzz_cov_program(& mut user);
+                        fuzz_cov_program(&mut user);
                         var fz_mods: Vec<Program> = Vec::new();
                         var fzi: i64 = 0;
                         while fzi < imported_modules.len() {
                             var fz_m: Program = imported_modules.get(fzi);
                             if fzc_module_wanted(imported_module_names.get(fzi)) {
-                                fuzz_cov_program(& mut fz_m);
+                                fuzz_cov_program(&mut fz_m);
                             }
                             fz_mods.push(fz_m);
                             fzi = fzi + 1;
@@ -5152,22 +5243,22 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                     // ark_modules/.features
                     g_cfg_features = cfg_ark_features(base_dir);
                     ct_sync_target();
-                    apply_cfg_filter(& mut program);
+                    apply_cfg_filter(&mut program);
 
                     // Phase 7.7: Process @derive annotations
-                    process_derive(& mut program);
+                    process_derive(&mut program);
                     // OP15: the @cold functions, for the native backends' block layout
                     cc_collect_cold_hints(program);
 
                     // R1.2: structural `==` for enums (the lowerer calls `__eq_<Enum>`).
-                    synthesize_enum_eq(& mut program);
+                    synthesize_enum_eq(&mut program);
                     // R1.2b: structural `==` for structs (`__eq_<Struct>`).
-                    synthesize_struct_eq(& mut program);
+                    synthesize_struct_eq(&mut program);
                     t_t = time_mark("merge: cfg+derive+eq", t_t);
 
                     // Desugar layer/model declarations
-                    desugar_layers_models(& mut program);
-                    desugar_phase8b(& mut program);
+                    desugar_layers_models(&mut program);
+                    desugar_phase8b(&mut program);
                     t_t = time_mark("merge: desugars", t_t);
 
                     // Comptime: process gen blocks (before typechecking so generated code is visible)
@@ -5203,12 +5294,12 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                     }
                     // LG9: `==` for the structs and enums `comptime gen`
                     // created (both skip a type whose __eq_ exists already)
-                    synthesize_enum_eq(& mut program);
-                    synthesize_struct_eq(& mut program);
+                    synthesize_enum_eq(&mut program);
+                    synthesize_struct_eq(&mut program);
                     t_t = time_mark("merge: comptime+eq", t_t);
 
                     // Phase 3B.1: Fill in default trait methods
-                    fill_default_trait_methods(& mut program);
+                    fill_default_trait_methods(&mut program);
                     t_t = time_mark("merge: trait defaults", t_t);
 
                     // Turbofish calls `f::<T>(..)`: instantiated before type
@@ -5240,12 +5331,12 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                         OptStr::None => {
                         }
                     }
-                    TypeChecker_register_program(& mut tc, stdlib, stdlib_module);
+                    TypeChecker_register_program(&mut tc, stdlib, stdlib_module);
 
                     // Register imported modules
                     var mi2: i64 = 0;
                     while mi2 < imported_modules.len() {
-                        TypeChecker_register_program(& mut tc, imported_modules.get(mi2), imported_module_names.get(mi2));
+                        TypeChecker_register_program(&mut tc, imported_modules.get(mi2), imported_module_names.get(mi2));
                         mi2 = mi2 + 1;
                     }
 
@@ -5258,12 +5349,12 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                         }
                     }
                     note_program_path(source_path);
-                    TypeChecker_register_program(& mut tc, user, user_module);
+                    TypeChecker_register_program(&mut tc, user, user_module);
 
-                    TypeChecker_register_trait_impls(& mut tc, program);
-                    TypeChecker_register_generated_decls(& mut tc, program);
-                    TypeChecker_verify_trait_impls(& mut tc, program);
-                    TypeChecker_collect_capabilities(& mut tc, user);
+                    TypeChecker_register_trait_impls(&mut tc, program);
+                    TypeChecker_register_generated_decls(&mut tc, program);
+                    TypeChecker_verify_trait_impls(&mut tc, program);
+                    TypeChecker_collect_capabilities(&mut tc, user);
                     // Core's bodies are checked once per core and compiler
                     // (release D9): user code still sees every declaration
                     // of core; only re-checking its bodies is skipped
@@ -5294,11 +5385,11 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                     // CB2: a `fid serve` check request leaves out the bodies
                     // no edit since its last clean check can reach
                     if g_cb2_req {
-                        core_skip = cb2_skip_set(core_skip, source, source_path, tokens, user_module, imported_module_names, & mut content_cache, & token_cache, cb2_config(lib_hash, borrowck_mode, base_dir));
+                        core_skip = cb2_skip_set(core_skip, source, source_path, tokens, user_module, imported_module_names, &mut content_cache, &token_cache, cb2_config(lib_hash, borrowck_mode, base_dir));
                         tc.skip_bodies = core_skip;
                         t_t = time_mark("cb2 plan", t_t);
                     }
-                    TypeChecker_check_bodies(& mut tc, program);
+                    TypeChecker_check_bodies(&mut tc, program);
                     t_t = time_mark("typecheck", t_t);
 
                     if tc.errors.len() > 0 {
@@ -5344,7 +5435,7 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                     // CD1: each pact the program imports against ark.toml's
                     // [capabilities] (nothing to do outside a project with
                     // that section), from what the checker inferred
-                    var cap_errors: Vec<str> = cd1_check(program, & tc, imported_modules, imported_module_names);
+                    var cap_errors: Vec<str> = cd1_check(program, &tc, imported_modules, imported_module_names);
                     if cap_errors.len() > 0 {
                         p_eprint_str("[build] FAILED: pact capabilities not granted\n");
                         return ResultProgram::Err(cap_errors);
@@ -5380,7 +5471,7 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                     }
                     // The typechecker is done: its tables go now, not at the
                     // end of the build
-                    TypeChecker_free_maps(& mut tc);
+                    TypeChecker_free_maps(&mut tc);
 
                     // G8.2: Borrow check — mode controlled by borrowck_mode parameter.
                     //   "off"  : skip borrow checking entirely
@@ -5396,7 +5487,7 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                         }
                         var bc: BorrowChecker = BorrowChecker_new(bc_mode);
                         bc.skip_bodies = core_skip;
-                        check(& mut bc, program);
+                        check(&mut bc, program);
                         // Warn mode collects into bc.warnings (known-bugs 2g.9: nothing was
                         // printed, the code below reads bc.errors only)
                         var wi: i64 = 0;
@@ -5407,7 +5498,7 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
 ");
                             wi = wi + 1;
                         }
-                        BorrowChecker_free_maps(& mut bc);
+                        BorrowChecker_free_maps(&mut bc);
                         if bc.errors.len() > 0 {
                             var file4: str = "<stdin>";
                             match source_path {
@@ -5536,7 +5627,7 @@ pub fn ccompile_source_with_path(source: str, source_path: str, borrowck_mode: s
             p_eprint_str("[ccompile] Cache HIT -- skipping parse/typecheck/lower/optimize\n");
             var t_codegen: i64 = p_clock_now_ms();
             var cg: CCodeGen = CCodeGen_new();
-            var c_code: str = CCodeGen_generate(& mut cg, cached_module);
+            var c_code: str = CCodeGen_generate(&mut cg, cached_module);
             // LF18: a @constant_time violation is a compile error, not C
             // with an #error line handed to the C compiler
             val ct_errs_hit: Vec<str> = c_ct_error_lines();
@@ -5577,7 +5668,7 @@ pub fn ccompile_source_with_path(source: str, source_path: str, borrowck_mode: s
             global_cache_store(source_path, src_hash, lmod);
             p_eprint_str("[ccompile] Generating C code...\n");
             var cg: CCodeGen = CCodeGen_new();
-            var c_code: str = CCodeGen_generate(& mut cg, lmod);
+            var c_code: str = CCodeGen_generate(&mut cg, lmod);
             // LF18: as above
             val ct_errs: Vec<str> = c_ct_error_lines();
             if ct_errs.len() > 0 {
@@ -5677,14 +5768,14 @@ pub fn lint_source(source: str, source_path: str, perf: bool) -> ResultVecStr {
                     program = mono_desugar_variadics(program);
 
                     var tc: TypeChecker = TypeChecker::new();
-                    TypeChecker_register_program(& mut tc, stdlib, stdlib_module);
+                    TypeChecker_register_program(&mut tc, stdlib, stdlib_module);
                     tc_note_program_file(source_path, stdlib_dir());
-                    TypeChecker_register_program(& mut tc, user, user_module);
-                    TypeChecker_register_trait_impls(& mut tc, program);
-                    TypeChecker_register_generated_decls(& mut tc, program);
-                    TypeChecker_verify_trait_impls(& mut tc, program);
-                    TypeChecker_collect_capabilities(& mut tc, user);
-                    TypeChecker_check_bodies(& mut tc, program);
+                    TypeChecker_register_program(&mut tc, user, user_module);
+                    TypeChecker_register_trait_impls(&mut tc, program);
+                    TypeChecker_register_generated_decls(&mut tc, program);
+                    TypeChecker_verify_trait_impls(&mut tc, program);
+                    TypeChecker_collect_capabilities(&mut tc, user);
+                    TypeChecker_check_bodies(&mut tc, program);
 
                     if tc.errors.len() > 0 {
                         var file: str = source_path;
@@ -5701,7 +5792,7 @@ pub fn lint_source(source: str, source_path: str, perf: bool) -> ResultVecStr {
 
                     // Run lints
                     tc.run_lints(program);
-                    lint_unwraps(& mut tc, user, source, source_path);
+                    lint_unwraps(&mut tc, user, source, source_path);
                     // L7E: unused variables, naming, import order
                     var sw: Vec<str> = lint_source_scan(source);
                     var swi: i64 = 0;
@@ -5822,7 +5913,7 @@ fn lint_with_imports(source: str, source_path: str, perf: bool, user: Program) -
         wi = wi + 1;
     }
     var tc: TypeChecker = TypeChecker::new();
-    lint_unwraps(& mut tc, user, source, source_path);
+    lint_unwraps(&mut tc, user, source, source_path);
     var ti: i64 = 0;
     while ti < tc.warnings.len() {
         warnings.push(tc.warnings.get(ti));
@@ -5881,13 +5972,13 @@ pub fn repl_expr_type_in(defs: str, expr_src: str) -> ResultStr {
                     var program: Program = stdlib;
                     program = merge_programs(program, user);
                     var tc: TypeChecker = TypeChecker::new();
-                    TypeChecker_register_program(& mut tc, stdlib, stdlib_module);
-                    TypeChecker_register_program(& mut tc, user, "main");
-                    TypeChecker_register_trait_impls(& mut tc, program);
-                    TypeChecker_register_generated_decls(& mut tc, program);
-                    TypeChecker_verify_trait_impls(& mut tc, program);
-                    TypeChecker_collect_capabilities(& mut tc, user);
-                    TypeChecker_check_bodies(& mut tc, program);
+                    TypeChecker_register_program(&mut tc, stdlib, stdlib_module);
+                    TypeChecker_register_program(&mut tc, user, "main");
+                    TypeChecker_register_trait_impls(&mut tc, program);
+                    TypeChecker_register_generated_decls(&mut tc, program);
+                    TypeChecker_verify_trait_impls(&mut tc, program);
+                    TypeChecker_collect_capabilities(&mut tc, user);
+                    TypeChecker_check_bodies(&mut tc, program);
                     if tc.errors.len() > 0 {
                         return ResultStr::Err(enrich_errors(tc.errors, source, "<repl>"));
                     }
@@ -5902,9 +5993,9 @@ pub fn repl_expr_type_in(defs: str, expr_src: str) -> ResultStr {
                         Stmt::Expr(e, _) => {
                             // the body checked clean: check the expression
                             // once more in a fresh scope, for its type
-                            TypeChecker_push_scope(& mut tc);
-                            var ty: Type = TypeChecker_check_expr(& mut tc, e);
-                            TypeChecker_pop_scope(& mut tc);
+                            TypeChecker_push_scope(&mut tc);
+                            var ty: Type = TypeChecker_check_expr(&mut tc, e);
+                            TypeChecker_pop_scope(&mut tc);
                             // an integer made of literals is an i64, as
                             // in a `val` without a type (typechecker.fd
                             // Stmt::Let), not the smallest type holding
@@ -6159,7 +6250,7 @@ fn rast_pattern(p: Pattern) -> str {
     return "?";
 }
 
-fn rast_exprs(es: Vec<Expr>, depth: i64, out: & mut Vec<str>) {
+fn rast_exprs(es: Vec<Expr>, depth: i64, out: &mut Vec<str>) {
     var i: i64 = 0;
     while i < es.len() {
         rast_expr(es.get(i), depth, out);
@@ -6167,7 +6258,7 @@ fn rast_exprs(es: Vec<Expr>, depth: i64, out: & mut Vec<str>) {
     }
 }
 
-fn rast_stmts(ss: Vec<Stmt>, depth: i64, out: & mut Vec<str>) {
+fn rast_stmts(ss: Vec<Stmt>, depth: i64, out: &mut Vec<str>) {
     var i: i64 = 0;
     while i < ss.len() {
         rast_stmt(ss.get(i), depth, out);
@@ -6176,12 +6267,12 @@ fn rast_stmts(ss: Vec<Stmt>, depth: i64, out: & mut Vec<str>) {
 }
 
 /// A child list under a label line ("Then", "Body"), one level deeper.
-fn rast_block(label: str, ss: Vec<Stmt>, depth: i64, out: & mut Vec<str>) {
+fn rast_block(label: str, ss: Vec<Stmt>, depth: i64, out: &mut Vec<str>) {
     out.push(rast_ind(depth) + label);
     rast_stmts(ss, depth + 1, out);
 }
 
-fn rast_arms(arms: Vec<MatchArm>, depth: i64, out: & mut Vec<str>) {
+fn rast_arms(arms: Vec<MatchArm>, depth: i64, out: &mut Vec<str>) {
     var i: i64 = 0;
     while i < arms.len() {
         var arm: MatchArm = arms.get(i);
@@ -6199,7 +6290,7 @@ fn rast_arms(arms: Vec<MatchArm>, depth: i64, out: & mut Vec<str>) {
     }
 }
 
-fn rast_opt_expr(e: OptBoxExpr, depth: i64, out: & mut Vec<str>) {
+fn rast_opt_expr(e: OptBoxExpr, depth: i64, out: &mut Vec<str>) {
     match e {
         OptBoxExpr::Some(x) => {
             rast_expr(box_expr_unbox(x), depth, out);
@@ -6209,7 +6300,7 @@ fn rast_opt_expr(e: OptBoxExpr, depth: i64, out: & mut Vec<str>) {
     }
 }
 
-fn rast_if(cond: Expr, then_b: Vec<Stmt>, else_b: OptStmts, depth: i64, out: & mut Vec<str>) {
+fn rast_if(cond: Expr, then_b: Vec<Stmt>, else_b: OptStmts, depth: i64, out: &mut Vec<str>) {
     out.push(rast_ind(depth) + "If");
     rast_expr(cond, depth + 1, out);
     rast_block("Then", then_b, depth + 1, out);
@@ -6222,7 +6313,7 @@ fn rast_if(cond: Expr, then_b: Vec<Stmt>, else_b: OptStmts, depth: i64, out: & m
     }
 }
 
-fn rast_expr(e: Expr, depth: i64, out: & mut Vec<str>) {
+fn rast_expr(e: Expr, depth: i64, out: &mut Vec<str>) {
     var ind: str = rast_ind(depth);
     match e {
         Expr::IntLit(n) => {
@@ -6443,7 +6534,7 @@ fn rast_expr(e: Expr, depth: i64, out: & mut Vec<str>) {
     }
 }
 
-fn rast_stmt(s: Stmt, depth: i64, out: & mut Vec<str>) {
+fn rast_stmt(s: Stmt, depth: i64, out: &mut Vec<str>) {
     var ind: str = rast_ind(depth);
     match s {
         Stmt::Let(name, oty, init, is_mut, _, _, _) => {
@@ -6684,7 +6775,7 @@ fn repl_no_fn(name: str) -> ResultStr {
 
 /// L7G: `:ir` — function `name` of the lowered session as IR text.
 pub fn repl_fn_ir(module: IrModule, name: str) -> ResultStr {
-    var text: str = IrModule_function_detail_str(& module, name);
+    var text: str = IrModule_function_detail_str(&module, name);
     if str_len(text) == 0 {
         return repl_no_fn(name);
     }
@@ -6731,7 +6822,7 @@ fn repl_effect_name(e: Effect) -> str {
 /// L7G: `:effects` — the effects of function `name` in the lowered session
 /// (its own and those of the functions it calls), "pure" when it has none.
 pub fn repl_fn_effects(module: IrModule, name: str) -> ResultStr {
-    match IrModule_get_function(& module, name) {
+    match IrModule_get_function(&module, name) {
         OptIrFunction::Some(f) => {
             if f.effects.effects.len() == 0 {
                 return ResultStr::Ok("pure");
@@ -6803,13 +6894,13 @@ pub fn repl_lang_effects(defs: str, name: str) -> ResultStr {
                     var program: Program = stdlib;
                     program = merge_programs(program, user);
                     var tc: TypeChecker = TypeChecker::new();
-                    TypeChecker_register_program(& mut tc, stdlib, stdlib_module);
-                    TypeChecker_register_program(& mut tc, user, "main");
-                    TypeChecker_register_trait_impls(& mut tc, program);
-                    TypeChecker_register_generated_decls(& mut tc, program);
-                    TypeChecker_verify_trait_impls(& mut tc, program);
-                    TypeChecker_collect_capabilities(& mut tc, user);
-                    TypeChecker_check_bodies(& mut tc, program);
+                    TypeChecker_register_program(&mut tc, stdlib, stdlib_module);
+                    TypeChecker_register_program(&mut tc, user, "main");
+                    TypeChecker_register_trait_impls(&mut tc, program);
+                    TypeChecker_register_generated_decls(&mut tc, program);
+                    TypeChecker_verify_trait_impls(&mut tc, program);
+                    TypeChecker_collect_capabilities(&mut tc, user);
+                    TypeChecker_check_bodies(&mut tc, program);
                     if tc.errors.len() > 0 {
                         return ResultStr::Err(enrich_errors(tc.errors, source, "<repl>"));
                     }
@@ -6821,12 +6912,12 @@ pub fn repl_lang_effects(defs: str, name: str) -> ResultStr {
                     if dot > 0 {
                         known = repl_has_method(program, str_slice(key, 0, dot), str_slice(key, dot + 1, str_len(key)));
                     } else {
-                        known = TypeChecker_knows_fn(& tc, key);
+                        known = TypeChecker_knows_fn(&tc, key);
                     }
                     if !known || key == "main" {
                         return repl_no_fn(name);
                     }
-                    var effs: Vec<str> = TypeChecker_effects_of(& tc, key);
+                    var effs: Vec<str> = TypeChecker_effects_of(&tc, key);
                     if effs.len() == 0 {
                         return ResultStr::Ok("pure");
                     }
@@ -6869,7 +6960,7 @@ fn repl_call_cap(callee: str) -> str {
     return "";
 }
 
-fn repl_cap_add(caps: & mut Vec<str>, c: str) {
+fn repl_cap_add(caps: &mut Vec<str>, c: str) {
     if str_len(c) > 0 && !cc_c_str_vec_contains(caps, c) {
         caps.push(c);
     }
@@ -6882,7 +6973,7 @@ fn repl_cap_add(caps: & mut Vec<str>, c: str) {
 /// IO when no call named the IO or FS one). "none" when it needs nothing.
 pub fn repl_fn_caps(module: IrModule, name: str, user: Vec<str>) -> ResultStr {
     var start_effects: Vec<Effect> = Vec::new();
-    match IrModule_get_function(& module, name) {
+    match IrModule_get_function(&module, name) {
         OptIrFunction::Some(f) => {
             start_effects = f.effects.effects;
         }
@@ -6898,16 +6989,16 @@ pub fn repl_fn_caps(module: IrModule, name: str, user: Vec<str>) -> ResultStr {
     while todo.len() > 0 {
         var fname: str = todo.get(todo.len() - 1);
         todo.remove(todo.len() - 1);
-        match IrModule_get_function(& module, fname) {
+        match IrModule_get_function(&module, fname) {
             OptIrFunction::Some(f) => {
                 var k: i64 = 0;
                 while k < f.insts.len() {
                     match f.insts.get(k).inst {
                         Inst::Print(_, _) => {
-                            repl_cap_add(& mut caps, "IO");
+                            repl_cap_add(&mut caps, "IO");
                         }
                         Inst::Call(callee, _, _, _) => {
-                            repl_cap_add(& mut caps, repl_call_cap(callee));
+                            repl_cap_add(&mut caps, repl_call_cap(callee));
                             if cc_c_str_vec_contains(user, callee) && !cc_c_str_vec_contains(seen, callee) {
                                 seen.push(callee);
                                 todo.push(callee);
@@ -6927,10 +7018,10 @@ pub fn repl_fn_caps(module: IrModule, name: str, user: Vec<str>) -> ResultStr {
     while e < start_effects.len() {
         match start_effects.get(e) {
             Effect::Net => {
-                repl_cap_add(& mut caps, "Net");
+                repl_cap_add(&mut caps, "Net");
             }
             Effect::Spawn => {
-                repl_cap_add(& mut caps, "Spawn");
+                repl_cap_add(&mut caps, "Spawn");
             }
             Effect::IO => {
                 if !cc_c_str_vec_contains(caps, "IO") && !cc_c_str_vec_contains(caps, "FS") {
@@ -6955,7 +7046,7 @@ pub fn repl_fn_caps(module: IrModule, name: str, user: Vec<str>) -> ResultStr {
 /// `:effects` names them (repl_lang_effects over the session `defs`; the
 /// IR's set when the checker does not know the name).
 pub fn repl_fn_opt(module: IrModule, name: str, defs: str) -> ResultStr {
-    if str_len(IrModule_function_detail_str(& module, name)) == 0 {
+    if str_len(IrModule_function_detail_str(&module, name)) == 0 {
         return repl_no_fn(name);
     }
     var effects: str = "";
@@ -6974,8 +7065,8 @@ pub fn repl_fn_opt(module: IrModule, name: str, defs: str) -> ResultStr {
         }
     }
     var opt_mod: IrModule = module;
-    iropt_native(& mut opt_mod);
-    var text: str = IrModule_function_detail_str(& opt_mod, name);
+    iropt_native(&mut opt_mod);
+    var text: str = IrModule_function_detail_str(&opt_mod, name);
     if str_len(text) == 0 {
         return ResultStr::Err(c_vec1("'" + name + "' was inlined into its callers and removed by the optimizer (:ir " + name + " shows it as lowered)"));
     }
@@ -7002,10 +7093,10 @@ pub fn repl_expr_ast(defs: str, expr_src: str) -> ResultStr {
             var lines: Vec<str> = Vec::new();
             match f.body.get(0) {
                 Stmt::Expr(e, _) => {
-                    rast_expr(e, 0, & mut lines);
+                    rast_expr(e, 0, &mut lines);
                 }
                 _ => {
-                    rast_stmt(f.body.get(0), 0, & mut lines);
+                    rast_stmt(f.body.get(0), 0, &mut lines);
                 }
             }
             return ResultStr::Ok(str_join(lines, "\n"));
@@ -7017,7 +7108,7 @@ pub fn repl_expr_ast(defs: str, expr_src: str) -> ResultStr {
 /// CE2: unwrap() and expect() panic on None or Err. Outside tests (a file
 /// named *_test.fd, or a fn test_* or bench_* as `fid test` runs), warn at
 /// each function that calls one.
-fn lint_unwraps(tc: & mut TypeChecker, user: Program, source: str, source_path: str) {
+fn lint_unwraps(tc: &mut TypeChecker, user: Program, source: str, source_path: str) {
     if str_ends_with(source_path, "_test.fd") {
         return;
     }
@@ -7045,7 +7136,7 @@ fn lint_unwraps(tc: & mut TypeChecker, user: Program, source: str, source_path: 
         val name: str = names.get(i);
         if !str_starts_with(name, "test_") && !str_starts_with(name, "bench_") {
             var called: Vec<str> = Vec::new();
-            TypeChecker_collect_called_funcs(tc, bodies.get(i), & mut called);
+            TypeChecker_collect_called_funcs(tc, bodies.get(i), &mut called);
             if str_vec_contains(called, "#unwrap") {
                 tc.warnings.push(lint_unwrap_where(source, name) + "'" + name + "' calls unwrap() or expect(), which panic on None or Err.\n" + "    Fix: match on it, use unwrap_or(default), or return the error with ?.");
             }
@@ -7149,14 +7240,18 @@ fn lx_tokens(source: str) -> Vec<LxTok> {
             if end > n {
                 end = n;
             }
-            out.push(LxTok { text: str_slice(source, i + 1, end), kind: 2, line: start_line });
+            out.push(LxTok {
+                text: str_slice(source, i + 1, end), kind: 2, line: start_line
+            });
             i = j + 1;
         } else if lx_is_alpha(c) {
             var j2: i64 = i;
             while j2 < n && lx_is_alnum(str_byte_at(source, j2)) {
                 j2 = j2 + 1;
             }
-            out.push(LxTok { text: str_slice(source, i, j2), kind: 0, line: line });
+            out.push(LxTok {
+                text: str_slice(source, i, j2), kind: 0, line: line
+            });
             i = j2;
         } else if c >= 48 && c <= 57 {
             var j3: i64 = i;
@@ -7165,10 +7260,14 @@ fn lx_tokens(source: str) -> Vec<LxTok> {
             while j3 < n && (lx_is_alnum(str_byte_at(source, j3)) || (str_byte_at(source, j3) == 46 && j3 + 1 < n && str_byte_at(source, j3 + 1) >= 48 && str_byte_at(source, j3 + 1) <= 57)) {
                 j3 = j3 + 1;
             }
-            out.push(LxTok { text: str_slice(source, i, j3), kind: 3, line: line });
+            out.push(LxTok {
+                text: str_slice(source, i, j3), kind: 3, line: line
+            });
             i = j3;
         } else {
-            out.push(LxTok { text: str_slice(source, i, i + 1), kind: 1, line: line });
+            out.push(LxTok {
+                text: str_slice(source, i, i + 1), kind: 1, line: line
+            });
             i = i + 1;
         }
     }
@@ -7454,7 +7553,7 @@ fn lx_in_ranges(starts: Vec<i64>, ends: Vec<i64>, i: i64) -> bool {
 /// parameter list is the tokens [p0, p1), its body [b0, b1). A method of a
 /// trait impl (`check_params` false) takes the parameters the trait gives
 /// it: those are not reported unused.
-fn lx_lint_fn(toks: Vec<LxTok>, name: str, p0: i64, p1: i64, b0: i64, b1: i64, check_params: bool, out: & mut Vec<str>) {
+fn lx_lint_fn(toks: Vec<LxTok>, name: str, p0: i64, p1: i64, b0: i64, b1: i64, check_params: bool, out: &mut Vec<str>) {
     // the body's declarations: var/val/let [mut] NAME, for NAME in
     var dnames: Vec<str> = Vec::new();
     var dlines: Vec<i64> = Vec::new();
@@ -7537,11 +7636,11 @@ fn lx_use_key(path: str) -> str {
 /// The import-order warnings: within a group of `use` lines (one after the
 /// other, no blank line or other item between), the paths are sorted
 /// (lx_use_key).
-fn lx_lint_uses(toks: Vec<LxTok>, out: & mut Vec<str>) {
+fn lx_lint_uses(toks: Vec<LxTok>, out: &mut Vec<str>) {
     var depth: i64 = 0;
     var prev_path: str = "";
-    var prev_end_line: i64 = - 10;
-    var prev_end_tok: i64 = - 10;
+    var prev_end_line: i64 = -10;
+    var prev_end_tok: i64 = -10;
     var i: i64 = 0;
     while i < toks.len() {
         if lx_is(toks, i, "{") {
@@ -7571,7 +7670,7 @@ fn lx_lint_uses(toks: Vec<LxTok>, out: & mut Vec<str>) {
                 prev_end_line = et.line;
                 prev_end_tok = k;
             } else {
-                prev_end_tok = - 10;
+                prev_end_tok = -10;
             }
             i = k;
         }
@@ -7584,7 +7683,7 @@ fn lx_lint_uses(toks: Vec<LxTok>, out: & mut Vec<str>) {
 pub fn lint_source_scan(source: str) -> Vec<str> {
     var out: Vec<str> = Vec::new();
     var toks: Vec<LxTok> = lx_tokens(source);
-    lx_lint_uses(toks, & mut out);
+    lx_lint_uses(toks, &mut out);
     // the token ranges of `impl Trait for Type { ... }` blocks
     var trait_starts: Vec<i64> = Vec::new();
     var trait_ends: Vec<i64> = Vec::new();
@@ -7645,7 +7744,7 @@ pub fn lint_source_scan(source: str) -> Vec<str> {
                     if !lx_fn_name_ok(name) && !str_starts_with(name, "_") && !const_fn {
                         out.push("line " + int_to_str(nt.line) + ": function '" + name + "' should be snake_case: " + lx_to_snake(name));
                     }
-                    lx_lint_fn(toks, name, p0, p1, b + 1, b1 - 1, !lx_in_ranges(trait_starts, trait_ends, i), & mut out);
+                    lx_lint_fn(toks, name, p0, p1, b + 1, b1 - 1, !lx_in_ranges(trait_starts, trait_ends, i), &mut out);
                 }
             }
         } else if (lx_is(toks, i, "struct") || lx_is(toks, i, "enum") || lx_is(toks, i, "trait") || (lx_is(toks, i, "cap") && !lx_is(toks, i - 1, ".") && (lx_is(toks, i + 2, "{") || lx_is(toks, i + 2, ":") || lx_is(toks, i + 2, "<")))) && lx_ident_at(toks, i + 1) {
@@ -7678,7 +7777,7 @@ pub fn lint_perf(user: Program) -> Vec<str> {
     var warnings: Vec<str> = Vec::new();
     var fi: i64 = 0;
     while fi < user.funcs.len() {
-        lint_perf_func(user.funcs.get(fi), & mut warnings);
+        lint_perf_func(user.funcs.get(fi), &mut warnings);
         fi = fi + 1;
     }
     var ii: i64 = 0;
@@ -7686,7 +7785,7 @@ pub fn lint_perf(user: Program) -> Vec<str> {
         var imp: ImplDef = user.impls.get(ii);
         var mi: i64 = 0;
         while mi < imp.methods.len() {
-            lint_perf_func(imp.methods.get(mi), & mut warnings);
+            lint_perf_func(imp.methods.get(mi), &mut warnings);
             mi = mi + 1;
         }
         ii = ii + 1;
@@ -7694,7 +7793,7 @@ pub fn lint_perf(user: Program) -> Vec<str> {
     return warnings;
 }
 
-fn lint_perf_func(f: Func, warnings: & mut Vec<str>) {
+fn lint_perf_func(f: Func, warnings: &mut Vec<str>) {
     var str_names: Vec<str> = Vec::new();
     var pi: i64 = 0;
     while pi < f.params.len() {
@@ -7806,11 +7905,11 @@ fn lint_perf_is_str_var(e: Expr, str_names: Vec<str>) -> bool {
     return false;
 }
 
-fn lint_perf_warn(warnings: & mut Vec<str>, fname: str, line: i64, what: str) {
+fn lint_perf_warn(warnings: &mut Vec<str>, fname: str, line: i64, what: str) {
     warnings.push(fname + ": line " + int_to_str(line) + ": " + what);
 }
 
-fn lint_perf_stmts(body: Vec<Stmt>, fname: str, depth: i64, base_names: Vec<str>, warnings: & mut Vec<str>) {
+fn lint_perf_stmts(body: Vec<Stmt>, fname: str, depth: i64, base_names: Vec<str>, warnings: &mut Vec<str>) {
     // Pre-pass: names this block declares `str`-typed are visible everywhere
     // in the block (slight over-approximation is fine for a lint).
     var str_names: Vec<str> = base_names;
@@ -7835,7 +7934,7 @@ fn lint_perf_stmts(body: Vec<Stmt>, fname: str, depth: i64, base_names: Vec<str>
     }
 }
 
-fn lint_perf_stmt(s: Stmt, fname: str, depth: i64, site: i64, str_names: Vec<str>, warnings: & mut Vec<str>) {
+fn lint_perf_stmt(s: Stmt, fname: str, depth: i64, site: i64, str_names: Vec<str>, warnings: &mut Vec<str>) {
     match s {
         Stmt::Let(n, oty, e, _, _, _, _) => {
             lint_perf_expr(e, fname, depth, site, str_names.clone(), warnings);
@@ -8002,7 +8101,7 @@ fn lint_perf_stmt(s: Stmt, fname: str, depth: i64, site: i64, str_names: Vec<str
     }
 }
 
-fn lint_perf_exprs(args: Vec<Expr>, fname: str, depth: i64, site: i64, str_names: Vec<str>, warnings: & mut Vec<str>) {
+fn lint_perf_exprs(args: Vec<Expr>, fname: str, depth: i64, site: i64, str_names: Vec<str>, warnings: &mut Vec<str>) {
     var i: i64 = 0;
     while i < args.len() {
         lint_perf_expr(args.get(i), fname, depth, site, str_names.clone(), warnings);
@@ -8010,7 +8109,7 @@ fn lint_perf_exprs(args: Vec<Expr>, fname: str, depth: i64, site: i64, str_names
     }
 }
 
-fn lint_perf_expr(e: Expr, fname: str, depth: i64, site: i64, str_names: Vec<str>, warnings: & mut Vec<str>) {
+fn lint_perf_expr(e: Expr, fname: str, depth: i64, site: i64, str_names: Vec<str>, warnings: &mut Vec<str>) {
     match e {
         Expr::StrConcat(a, b) => {
             if depth > 0 {
@@ -8716,7 +8815,7 @@ pub fn serve_client_ask(port: i64, request: str, body: str) -> ServeAnswer {
 /// type. The program's own impl of that (trait, type) wins over both
 /// (merge_programs), so the pair is reported only when the program has none:
 /// otherwise the one merged later won silently.
-fn cc_find_trait_impl_conflicts(imported: Vec<Program>, names: Vec<str>, user: Program, errors: & mut Vec<str>) {
+fn cc_find_trait_impl_conflicts(imported: Vec<Program>, names: Vec<str>, user: Program, errors: &mut Vec<str>) {
     var user_pairs: i64 = HashMap_new();
     var ui: i64 = 0;
     while ui < user.trait_impls.len() {
@@ -8747,7 +8846,7 @@ fn cc_find_trait_impl_conflicts(imported: Vec<Program>, names: Vec<str>, user: P
     HashMap_drop(user_pairs);
 }
 
-fn cc_find_module_conflicts(stdlib: Program, imported: Vec<Program>, names: Vec<str>, user: Program, user_name: str, errors: & mut Vec<str>) {
+fn cc_find_module_conflicts(stdlib: Program, imported: Vec<Program>, names: Vec<str>, user: Program, user_name: str, errors: &mut Vec<str>) {
     // name -> index+1 into func_mods_of/struct_mods_of/struct_shapes_of:
     // the modules (and shapes) a name was already defined in. A linear
     // Vec scan here was O(total decls) per decl — quadratic when a
@@ -8863,7 +8962,7 @@ fn cc_find_module_conflicts(stdlib: Program, imported: Vec<Program>, names: Vec<
     HashMap_drop(core_structs);
 }
 
-fn cc_find_duplicate_funcs(prog: Program, module: str, errors: & mut Vec<str>) {
+fn cc_find_duplicate_funcs(prog: Program, module: str, errors: &mut Vec<str>) {
     var seen: i64 = HashMap_new();
     var fi: i64 = 0;
     while fi < prog.funcs.len() {
@@ -9057,9 +9156,12 @@ pub fn merge_programs(stdlib: Program, user: Program) -> Program {
 
 /// The target of a cross build: "" = the host. `fid ccompile --target`
 /// sets them (os: linux, macos, windows; arch: x86_64, aarch64, riscv64).
-pub var g_cfg_os: str = "";  /// `--debug` on the command line: `@cfg(debug)` holds (known-bugs 2g.14:
+pub var g_cfg_os: str = "";
+/// `--debug` on the command line: `@cfg(debug)` holds (known-bugs 2g.14:
 /// check_cfg was always given false)
-pub var g_cfg_debug: bool = false; pub var g_cfg_arch: str = "";  /// Does `@cfg(arch)` name the target's architecture? (x86_64 on the host.)
+pub var g_cfg_debug: bool = false;
+pub var g_cfg_arch: str = "";
+/// Does `@cfg(arch)` name the target's architecture? (x86_64 on the host.)
 fn cfg_arch_is(name: str) -> bool {
     var want: str = name;
     if want == "arm64" {
@@ -9197,7 +9299,7 @@ fn ct_sync_target() {
 /// a function or struct whose @cfg names another platform, architecture or
 /// build mode is left out. Lists are rebuilt with plain pushes (the old
 /// Vec-of-struct copy problem that made this a no-op is long fixed).
-pub fn apply_cfg_filter(program: & mut Program) {
+pub fn apply_cfg_filter(program: &mut Program) {
     var is_windows: bool = p_getenv("OS") == "Windows_NT";
     var is_linux: bool = !is_windows && c_file_exists("/proc/self/exe");
     // PL3: a FreeBSD host has no /proc by default but has freebsd-version
@@ -9451,14 +9553,14 @@ fn fzc_func(f: Func) -> Func {
 /// dropped a replaced list the parse result still held, then dropped it
 /// again with the result ("Double free" in Vec_drop_inplace from
 /// __own_drop_100 there, under `ccompile --fuzz-cov`).
-pub fn fuzz_cov_program(program: & mut Program) {
+pub fn fuzz_cov_program(program: &mut Program) {
     var funcs: Vec<Func> = Vec::new();
     var i: i64 = 0;
     while i < program.funcs.len() {
         funcs.push(fzc_func(program.funcs.get(i)));
         i = i + 1;
     }
-    fzc_refill_funcs(& mut program.funcs, funcs);
+    fzc_refill_funcs(&mut program.funcs, funcs);
     var impls: Vec<ImplDef> = Vec::new();
     i = 0;
     while i < program.impls.len() {
@@ -9473,10 +9575,10 @@ pub fn fuzz_cov_program(program: & mut Program) {
         impls.push(im);
         i = i + 1;
     }
-    fzc_refill_impls(& mut program.impls, impls);
+    fzc_refill_impls(&mut program.impls, impls);
 }
 
-fn fzc_refill_funcs(dst: & mut Vec<Func>, src: Vec<Func>) {
+fn fzc_refill_funcs(dst: &mut Vec<Func>, src: Vec<Func>) {
     dst.clear();
     var i: i64 = 0;
     while i < src.len() {
@@ -9485,7 +9587,7 @@ fn fzc_refill_funcs(dst: & mut Vec<Func>, src: Vec<Func>) {
     }
 }
 
-fn fzc_refill_impls(dst: & mut Vec<ImplDef>, src: Vec<ImplDef>) {
+fn fzc_refill_impls(dst: &mut Vec<ImplDef>, src: Vec<ImplDef>) {
     dst.clear();
     var i: i64 = 0;
     while i < src.len() {
@@ -9542,7 +9644,7 @@ fn enum_eq_pattern(enum_name: str, variant: str, prefix: str, n: i64) -> Pattern
     return Pattern::EnumVariant(enum_name, variant, binds);
 }
 
-pub fn synthesize_enum_eq(program: & mut Program) {
+pub fn synthesize_enum_eq(program: &mut Program) {
     var generated: Vec<Func> = Vec::new();
     // name set of the existing functions: a Vec scan per enum was
     // O(enums x funcs)
@@ -9625,7 +9727,7 @@ pub fn synthesize_enum_eq(program: & mut Program) {
 /// Each field goes back through `==`: nested structs and enums use their own
 /// __eq, strings compare by content. A struct with a field of a generic
 /// struct or enum type is skipped (its `==` would not type-check yet).
-pub fn synthesize_struct_eq(program: & mut Program) {
+pub fn synthesize_struct_eq(program: &mut Program) {
     var generic_defs: Vec<str> = Vec::new();
     var gi: i64 = 0;
     while gi < program.structs.len() {
@@ -9711,7 +9813,7 @@ pub fn synthesize_struct_eq(program: & mut Program) {
     }
 }
 
-pub fn process_derive(program: & mut Program) {
+pub fn process_derive(program: &mut Program) {
     var generated: Vec<Func> = Vec::new();
     // CL1: the structs that derive Deserialize (a field of one of them is
     // read with its own <T>_from_json), and the readers they need
@@ -10105,7 +10207,7 @@ fn cc_parse_funcs(src: str) -> Vec<Func> {
 /// CL1: add stdlib/derive_json.fd's readers to the program (once; a program
 /// that imports derive_json has them already). false when the file is not
 /// found: `S_from_json` then gives every field its default, as before.
-fn cc_add_derive_json(program: & mut Program) -> bool {
+fn cc_add_derive_json(program: &mut Program) -> bool {
     var fi: i64 = 0;
     while fi < program.funcs.len() {
         if program.funcs.get(fi).name == "djson_find" {
@@ -10305,7 +10407,7 @@ pub fn default_expr_for_type(ty: Type) -> Expr {
 // ===========================================================================
 
 /// Desugar layer/model declarations into structs + impls + constructor functions.
-pub fn desugar_layers_models(program: & mut Program) {
+pub fn desugar_layers_models(program: &mut Program) {
     // Desugar layers: struct + impl + constructor
     var i: i64 = 0;
     while i < program.layers.len() {
@@ -10390,7 +10492,7 @@ pub fn desugar_layers_models(program: & mut Program) {
 
 /// Desugar F18 components → structs, F20 event handlers → functions,
 /// F19 state machines → enum + initial/handle functions.
-pub fn desugar_phase8b(program: & mut Program) {
+pub fn desugar_phase8b(program: &mut Program) {
     // F18: Desugar components → structs
     var ci: i64 = 0;
     while ci < program.components.len() {
@@ -10745,7 +10847,7 @@ fn c_vec1_func(f: Func) -> Vec<Func> {
 /// Phase 3B.1: Fill in default trait methods.
 /// For each trait impl, if the trait defines a method with a default body that
 /// the impl doesn't override, add the default body to the impl.
-pub fn fill_default_trait_methods(program: & mut Program) {
+pub fn fill_default_trait_methods(program: &mut Program) {
     // trait_name -> index+1 into program.traits (a Vec scan per impl was
     // O(impls x traits))
     var trait_ix: i64 = HashMap_new();
@@ -10862,7 +10964,7 @@ pub fn fill_default_trait_methods(program: & mut Program) {
 /// I-3A: Transitive Capability DCE -- strip functions requiring capabilities not
 /// in the granted set, then transitively eliminate all functions only reachable
 /// through the stripped functions.
-pub fn strip_ungranted_caps(module: & mut IrModule, granted_caps: Vec<str>) {
+pub fn strip_ungranted_caps(module: &mut IrModule, granted_caps: Vec<str>) {
     // Map capability names to the effects they grant
     var granted_io: bool = cc_c_str_vec_contains(granted_caps, "IO") || cc_c_str_vec_contains(granted_caps, "FS");
     var granted_net: bool = cc_c_str_vec_contains(granted_caps, "Net");
@@ -10961,7 +11063,8 @@ pub fn strip_ungranted_caps(module: & mut IrModule, granted_caps: Vec<str>) {
     }
     if cc_c_str_vec_contains(all_func_names, "_start") && !cc_c_str_vec_contains(to_remove, "_start") {
         queue.push("_start");
-    } while queue.len() > 0 {
+    }
+    while queue.len() > 0 {
         var name: str = queue.get(0);
         queue = c_vec_remove_first(queue);
         if cc_c_str_vec_contains(reachable, name) || cc_c_str_vec_contains(to_remove, name) {
@@ -11132,7 +11235,7 @@ fn cc_is_cfg(f: Func) -> bool {
 }
 
 /// `funcs` with names and calls rewritten through `renames`.
-fn cc_rename_funcs(funcs: & mut Vec<Func>, renames: Vec<RenameEntry>, rename_defs: bool) {
+fn cc_rename_funcs(funcs: &mut Vec<Func>, renames: Vec<RenameEntry>, rename_defs: bool) {
     var empty_subst: Vec<SubstEntry> = subst_new();
     var no_methods: Vec<RenameEntry> = rename_new();
     var fi: i64 = 0;
@@ -11220,7 +11323,7 @@ fn cc_serialize_field(name: str, ty: Type) -> Expr {
     return Expr::Call("int_to_str", args);
 }
 
-fn cc_qualify_shadowed_imports(imported: & mut Vec<Program>, names: Vec<str>, user: & mut Program, core: Program) {
+fn cc_qualify_shadowed_imports(imported: &mut Vec<Program>, names: Vec<str>, user: &mut Program, core: Program) {
     // name -> 1 + index of the one module defining it, or -1 for several
     var definer: i64 = HashMap_new();
     var core_fns: i64 = HashMap_new();
@@ -11259,7 +11362,7 @@ fn cc_qualify_shadowed_imports(imported: & mut Vec<Program>, names: Vec<str>, us
         var d: i64 = HashMap_get(definer, uf.name);
         if d > 0 && !cc_is_cfg(uf) {
             var module: str = str_replace(names.get(d - 1), "::", "__");
-            rename_set(& mut renames, uf.name, module + "__" + uf.name);
+            rename_set(&mut renames, uf.name, module + "__" + uf.name);
             any = true;
         }
         ui = ui + 1;
@@ -11274,7 +11377,7 @@ fn cc_qualify_shadowed_imports(imported: & mut Vec<Program>, names: Vec<str>, us
         while fi < fs.len() {
             var f: Func = fs.get(fi);
             if !cc_is_cfg(f) && HashMap_get(definer, f.name) == 0 - 1 {
-                rename_set(& mut mine, f.name, str_replace(names.get(mi), "::", "__") + "__" + f.name);
+                rename_set(&mut mine, f.name, str_replace(names.get(mi), "::", "__") + "__" + f.name);
                 any = true;
             }
             fi = fi + 1;
@@ -11324,7 +11427,7 @@ fn cc_qualify_shadowed_imports(imported: & mut Vec<Program>, names: Vec<str>, us
             ai = ai + 1;
         }
         if seg == "core" {
-            rename_set(& mut qualified, call, fname);
+            rename_set(&mut qualified, call, fname);
         }
         mi = 0;
         while mi < imported.len() {
@@ -11346,7 +11449,7 @@ fn cc_qualify_shadowed_imports(imported: & mut Vec<Program>, names: Vec<str>, us
                     }
                 }
                 if hit {
-                    rename_set(& mut qualified, call, target);
+                    rename_set(&mut qualified, call, target);
                     any = true;
                 }
             }
@@ -11366,33 +11469,33 @@ fn cc_qualify_shadowed_imports(imported: & mut Vec<Program>, names: Vec<str>, us
     while mi < imported.len() {
         var prog: Program = imported.get(mi);
         var map: Vec<RenameEntry> = rename_new();
-        cc_rename_extend(& mut map, renames);
-        cc_rename_extend(& mut map, qualified);
+        cc_rename_extend(&mut map, renames);
+        cc_rename_extend(&mut map, qualified);
         // A name it does not define: the copy of a module it imports
         var ip: i64 = 0;
         while ip < prog.imports.len() {
             var ik: i64 = 0;
             while ik < imported.len() {
                 if names.get(ik) == prog.imports.get(ip).path {
-                    cc_rename_extend(& mut map, own.get(ik));
+                    cc_rename_extend(&mut map, own.get(ik));
                 }
                 ik = ik + 1;
             }
             ip = ip + 1;
         }
-        cc_rename_extend(& mut map, own.get(mi));
-        cc_rename_funcs(& mut prog.funcs, map, true);
+        cc_rename_extend(&mut map, own.get(mi));
+        cc_rename_funcs(&mut prog.funcs, map, true);
         var ii: i64 = 0;
         while ii < prog.impls.len() {
             var rimp: ImplDef = prog.impls.get(ii);
-            cc_rename_funcs(& mut rimp.methods, map, false);
+            cc_rename_funcs(&mut rimp.methods, map, false);
             prog.impls.set(ii, rimp);
             ii = ii + 1;
         }
         ii = 0;
         while ii < prog.trait_impls.len() {
             var rti: TraitImpl = prog.trait_impls.get(ii);
-            cc_rename_funcs(& mut rti.methods, map, false);
+            cc_rename_funcs(&mut rti.methods, map, false);
             prog.trait_impls.set(ii, rti);
             ii = ii + 1;
         }
@@ -11400,25 +11503,25 @@ fn cc_qualify_shadowed_imports(imported: & mut Vec<Program>, names: Vec<str>, us
         mi = mi + 1;
     }
     if qualified.len() > 0 {
-        cc_rename_funcs(& mut user.funcs, qualified, false);
+        cc_rename_funcs(&mut user.funcs, qualified, false);
         var ui2: i64 = 0;
         while ui2 < user.impls.len() {
             var uimp: ImplDef = user.impls.get(ui2);
-            cc_rename_funcs(& mut uimp.methods, qualified, false);
+            cc_rename_funcs(&mut uimp.methods, qualified, false);
             user.impls.set(ui2, uimp);
             ui2 = ui2 + 1;
         }
         ui2 = 0;
         while ui2 < user.trait_impls.len() {
             var uti: TraitImpl = user.trait_impls.get(ui2);
-            cc_rename_funcs(& mut uti.methods, qualified, false);
+            cc_rename_funcs(&mut uti.methods, qualified, false);
             user.trait_impls.set(ui2, uti);
             ui2 = ui2 + 1;
         }
     }
 }
 
-fn cc_rename_extend(map: & mut Vec<RenameEntry>, more: Vec<RenameEntry>) {
+fn cc_rename_extend(map: &mut Vec<RenameEntry>, more: Vec<RenameEntry>) {
     var i: i64 = 0;
     while i < more.len() {
         map.push(more.get(i));
@@ -11426,7 +11529,7 @@ fn cc_rename_extend(map: & mut Vec<RenameEntry>, more: Vec<RenameEntry>) {
     }
 }
 
-fn cc_push_traits(defs: & mut Vec<TraitDef>, p: Program) {
+fn cc_push_traits(defs: &mut Vec<TraitDef>, p: Program) {
     var i: i64 = 0;
     while i < p.traits.len() {
         defs.push(p.traits.get(i));
@@ -11436,7 +11539,7 @@ fn cc_push_traits(defs: & mut Vec<TraitDef>, p: Program) {
 
 /// Supertrait methods first (transitively), then the trait's own; a method
 /// the trait redeclares keeps its signature.
-fn cc_collect_trait_methods(name: str, defs: Vec<TraitDef>, seen: & mut Vec<str>, out: & mut Vec<TraitMethod>) {
+fn cc_collect_trait_methods(name: str, defs: Vec<TraitDef>, seen: &mut Vec<str>, out: &mut Vec<TraitMethod>) {
     if cc_c_str_vec_contains(seen, name) {
         return;
     }
@@ -11476,7 +11579,7 @@ fn cc_collect_trait_methods(name: str, defs: Vec<TraitDef>, seen: & mut Vec<str>
 
 /// `cap Sub: Super { .. }`: a subtrait inherits its supertraits' methods, so
 /// an impl of Sub must provide them and a `dyn Sub` vtable carries them.
-fn cc_inherit_supertraits(p: & mut Program, defs: Vec<TraitDef>, errors: & mut Vec<str>) {
+fn cc_inherit_supertraits(p: &mut Program, defs: Vec<TraitDef>, errors: &mut Vec<str>) {
     var i: i64 = 0;
     while i < p.traits.len() {
         var t: TraitDef = p.traits.get(i);
@@ -11500,7 +11603,7 @@ fn cc_inherit_supertraits(p: & mut Program, defs: Vec<TraitDef>, errors: & mut V
             }
             var out: Vec<TraitMethod> = Vec::new();
             var seen: Vec<str> = Vec::new();
-            cc_collect_trait_methods(t.name, defs, & mut seen, & mut out);
+            cc_collect_trait_methods(t.name, defs, &mut seen, &mut out);
             t.methods = out.clone();
             p.traits.set(i, t);
         }
@@ -11568,7 +11671,7 @@ pub fn c_str_find_last(s: str, ch: str) -> i64 {
         }
         i = i - 1;
     }
-    return - 1;
+    return -1;
 }
 
 // c_vec1 and c_file_exists moved to compiler::ir (shared with backends
@@ -11637,7 +11740,9 @@ pub fn c_os_cwd() -> str {
 
 // --- Per-module C units (`ccompile --inc`, as src/codegen_c.rs) ----------
 
-var g_func_module_index: i64 = 0; var g_func_module_names: Vec<str> = Vec::new(); fn set_func_module(name: str, module: str) {
+var g_func_module_index: i64 = 0;
+var g_func_module_names: Vec<str> = Vec::new();
+fn set_func_module(name: str, module: str) {
     if g_func_module_index == 0 {
         g_func_module_index = HashMap_new();
         var names: Vec<str> = Vec::new();
@@ -11751,7 +11856,7 @@ fn func_is_instance(name: str) -> bool {
 /// function names in the tail (`__p_fns`) does not count as a caller.
 /// An instance calling another moves that one along: placement repeats
 /// until nothing moves (at most 8 rounds).
-fn c_place_instances_at_callers(full: str, full_len: i64, snames: Vec<str>, cnames: Vec<str>, starts: Vec<i64>, ends: Vec<i64>, units: & mut Vec<i64>) {
+fn c_place_instances_at_callers(full: str, full_len: i64, snames: Vec<str>, cnames: Vec<str>, starts: Vec<i64>, ends: Vec<i64>, units: &mut Vec<i64>) {
     var n: i64 = snames.len();
     // instance C name -> its index + 1
     var inst_at: i64 = HashMap_new();
@@ -11825,7 +11930,7 @@ fn c_place_instances_at_callers(full: str, full_len: i64, snames: Vec<str>, cnam
         var home_calls: Vec<i64> = Vec::new();
         i = 0;
         while i < n {
-            first_u.push(- 1);
+            first_u.push(-1);
             multi.push(0);
             home_calls.push(0);
             i = i + 1;
@@ -11889,7 +11994,7 @@ fn c_place_instances_at_callers(full: str, full_len: i64, snames: Vec<str>, cnam
 /// names its frames; a frame in a `static` copy has no name in a trace.
 /// Each unit's text still holds every function it runs, so a unit's object
 /// key changes exactly when a copy it holds does.
-fn c_copy_instances_to_callers(full: str, full_len: i64, tail_at: i64, snames: Vec<str>, cnames: Vec<str>, starts: Vec<i64>, ends: Vec<i64>, decl_at: Vec<i64>, unit_names: Vec<str>, units: & mut Vec<i64>, copy_fn: & mut Vec<i64>, copy_unit: & mut Vec<i64>) {
+fn c_copy_instances_to_callers(full: str, full_len: i64, tail_at: i64, snames: Vec<str>, cnames: Vec<str>, starts: Vec<i64>, ends: Vec<i64>, decl_at: Vec<i64>, unit_names: Vec<str>, units: &mut Vec<i64>, copy_fn: &mut Vec<i64>, copy_unit: &mut Vec<i64>) {
     var n: i64 = snames.len();
     var nu: i64 = unit_names.len();
     if nu < 2 {
@@ -11903,7 +12008,7 @@ fn c_copy_instances_to_callers(full: str, full_len: i64, tail_at: i64, snames: V
     var home: Vec<i64> = Vec::new();
     var i: i64 = 0;
     while i < n {
-        var k0: i64 = - 1;
+        var k0: i64 = -1;
         if str_len(cnames.get(i)) > 0 && decl_at.get(i) >= starts.get(i) && func_is_instance(snames.get(i)) {
             var h: i64 = c_unit_slot(unit_names, func_module_of(snames.get(i), ""));
             if h >= 0 {
@@ -11932,19 +12037,19 @@ fn c_copy_instances_to_callers(full: str, full_len: i64, tail_at: i64, snames: V
     }
     var e_from: Vec<i64> = Vec::new();
     var e_to: Vec<i64> = Vec::new();
-    var cur: i64 = - 1;
+    var cur: i64 = -1;
     var nf: i64 = 0;
     var k: i64 = 0;
     while k < full_len {
         if cur >= 0 && k >= ends.get(cur) {
-            cur = - 1;
+            cur = -1;
         }
         while nf < n && starts.get(nf) <= k {
             cur = nf;
             nf = nf + 1;
         }
         if cur >= 0 && k >= ends.get(cur) {
-            cur = - 1;
+            cur = -1;
         }
         var c: i64 = str_byte_at(full, k);
         if c == 34 || c == 39 {
@@ -12053,7 +12158,7 @@ fn c_copy_instances_to_callers(full: str, full_len: i64, tail_at: i64, snames: V
                 var p: i64 = units.get(j2);
                 var h2: i64 = home.get(kk);
                 var others: i64 = 0;
-                var best: i64 = - 1;
+                var best: i64 = -1;
                 var u: i64 = 0;
                 while u < nu {
                     if cu.get(kk * nu + u) == 1 {
@@ -12134,7 +12239,7 @@ fn c_unit_slot(names: Vec<str>, name: str) -> i64 {
         }
         i = i + 1;
     }
-    return - 1;
+    return -1;
 }
 
 /// The `_strN` names `body` uses, appended to `used` (a HashMap as a set).
@@ -12221,7 +12326,7 @@ fn c_next_fn_mark(full: str, from: i64, limit: i64) -> i64 {
 /// the first form was scoped and every unit carried every literal, so a
 /// literal added anywhere rebuilt every unit (inc-roadmap B7).
 fn c_str_decl_key(t: str) -> str {
-    var at: i64 = - 1;
+    var at: i64 = -1;
     if str_starts_with(t, "static const char _str") {
         at = 18;
     } else if str_starts_with(t, "#define _str") {
@@ -12406,7 +12511,7 @@ pub fn split_c_units(full: str) -> Vec<CUnit> {
         var fname: str = str_slice_len(full, full_len, at + 6, line_end);
         var body_end: i64 = c_next_fn_mark(full, line_end, tail_at);
         var cname: str = "";
-        var decl_at: i64 = - 1;
+        var decl_at: i64 = -1;
         var dl: i64 = line_end + 1;
         while dl < body_end && cname == "" {
             var de: i64 = dl;
@@ -12448,7 +12553,7 @@ pub fn split_c_units(full: str) -> Vec<CUnit> {
     // (B1: the IR units place instances themselves, ccompile_inc_prepare;
     // the text of one unit does not show every caller)
     if !flat && env_or_empty("FIDES_INC_INSTANCES") != "home" && g_split_assign == 0 {
-        c_place_instances_at_callers(full, full_len, fn_snames, fn_cnames, fn_starts, fn_ends, & mut fn_units);
+        c_place_instances_at_callers(full, full_len, fn_snames, fn_cnames, fn_starts, fn_ends, &mut fn_units);
     }
     // B3: an instance two or more units call gets a `static` copy in each
     // (c_copy_instances_to_callers; FIDES_INC_INSTANCES=move: the moves
@@ -12459,7 +12564,7 @@ pub fn split_c_units(full: str) -> Vec<CUnit> {
     var copy_unit: Vec<i64> = Vec::new();
     var inst_mode: str = env_or_empty("FIDES_INC_INSTANCES");
     if !flat && inst_mode != "home" && inst_mode != "move" && env_or_empty("FIDES_INC_EFFECTS") != "off" && g_split_assign == 0 {
-        c_copy_instances_to_callers(full, full_len, tail_at, fn_snames, fn_cnames, fn_starts, fn_ends, fn_decl_at, unit_names, & mut fn_units, & mut copy_fn, & mut copy_unit);
+        c_copy_instances_to_callers(full, full_len, tail_at, fn_snames, fn_cnames, fn_starts, fn_ends, fn_decl_at, unit_names, &mut fn_units, &mut copy_fn, &mut copy_unit);
     }
     // B3 on the IR units: the copies ccompile_inc_prepare gave the unit
     // being cut (incu_copy_instances; its C holds their bodies)
@@ -12518,7 +12623,7 @@ pub fn split_c_units(full: str) -> Vec<CUnit> {
     var lay_is_struct: Vec<i64> = Vec::new();
     var lay_keys: Vec<str> = Vec::new();
     var lay_key_entry: Vec<i64> = Vec::new();
-    var lay_prev_decl_line: i64 = - 2;
+    var lay_prev_decl_line: i64 = -2;
     var common_len: i64 = 0;
     var lines: Vec<str> = str_split(stripped.to_str(), "\n");
     var li: i64 = 0;
@@ -13015,7 +13120,7 @@ fn incu_hash(v: Vec<i64>, seed: i64) -> i64 {
 /// What `f` names: the functions it calls or takes the address of (to
 /// `names`), the methods of its dynamic calls (to `dyns`); true when it
 /// calls the library loader (p_dl_*).
-fn incu_named(f: & IrFunction, names: & mut Vec<str>, dyns: & mut Vec<str>) -> bool {
+fn incu_named(f: &IrFunction, names: &mut Vec<str>, dyns: &mut Vec<str>) -> bool {
     var dl: bool = false;
     var i: i64 = 0;
     while i < f.insts.len() {
@@ -13041,7 +13146,7 @@ fn incu_named(f: & IrFunction, names: & mut Vec<str>, dyns: & mut Vec<str>) -> b
 }
 
 /// B6: the globals `f` addresses, into `set` (name -> 1).
-fn incu_globals_named(f: & IrFunction, set: i64) {
+fn incu_globals_named(f: &IrFunction, set: i64) {
     var i: i64 = 0;
     while i < f.insts.len() {
         match f.insts.get(i).inst {
@@ -13057,7 +13162,7 @@ fn incu_globals_named(f: & IrFunction, set: i64) {
 
 /// The function of `fe` with its signature only (one empty block), so a
 /// unit that imports it gets its prototype and nothing of its body.
-fn incu_stub(fe: & IrFunctionEntry) -> IrFunctionEntry {
+fn incu_stub(fe: &IrFunctionEntry) -> IrFunctionEntry {
     var f: IrFunction = IrFunction_new(fe.func.name, fe.func.ret_ty);
     f.params = fe.func.params;
     var nv: i64 = 0;
@@ -13073,7 +13178,7 @@ fn incu_stub(fe: & IrFunctionEntry) -> IrFunctionEntry {
 }
 
 /// The struct names in type `t`.
-fn incu_type_names(t: IrType, out: & mut Vec<str>) {
+fn incu_type_names(t: IrType, out: &mut Vec<str>) {
     match t {
         IrType::Struct(n) => {
             out.push(n);
@@ -13106,7 +13211,7 @@ fn incu_type_names(t: IrType, out: & mut Vec<str>) {
 /// as its length (8 bytes, low first) and its bytes, so every type, field
 /// and name the unit holds is found; an integer that happens to look like
 /// a name only keeps one layout too many.
-fn incu_layouts_named(bytes: Vec<i64>, module: & IrModule, lay_at: i64, max_len: i64) -> Vec<i64> {
+fn incu_layouts_named(bytes: Vec<i64>, module: &IrModule, lay_at: i64, max_len: i64) -> Vec<i64> {
     var nl: i64 = module.struct_layouts.len();
     var need: Vec<i64> = Vec::new();
     var i: i64 = 0;
@@ -13149,7 +13254,7 @@ fn incu_layouts_named(bytes: Vec<i64>, module: & IrModule, lay_at: i64, max_len:
         var fi: i64 = 0;
         while fi < sl.fields.len() {
             var tn: Vec<str> = Vec::new();
-            incu_type_names(sl.fields.get(fi).ty, & mut tn);
+            incu_type_names(sl.fields.get(fi).ty, &mut tn);
             var ti: i64 = 0;
             while ti < tn.len() {
                 var at2: i64 = HashMap_get(lay_at, tn.get(ti));
@@ -13179,7 +13284,7 @@ fn incu_layouts_named(bytes: Vec<i64>, module: & IrModule, lay_at: i64, max_len:
 /// are all in one unit other than its generic's own; an instance calling
 /// another moves that one along, until nothing moves (8 rounds at most).
 /// `units`: each function's unit number.
-fn incu_place_instances(module: & IrModule, units: & mut Vec<i64>) {
+fn incu_place_instances(module: &IrModule, units: &mut Vec<i64>) {
     var n: i64 = module.functions.len();
     var pos: i64 = HashMap_new();
     var is_inst: Vec<i64> = Vec::new();
@@ -13211,7 +13316,7 @@ fn incu_place_instances(module: & IrModule, units: & mut Vec<i64>) {
         var fe: IrFunctionEntry = module.functions.get(i);
         var names: Vec<str> = Vec::new();
         var dyns: Vec<str> = Vec::new();
-        incu_named(& fe.func, & mut names, & mut dyns);
+        incu_named(&fe.func, &mut names, &mut dyns);
         var k: i64 = 0;
         while k < names.len() {
             var t: i64 = HashMap_get(pos, names.get(k)) - 1;
@@ -13247,7 +13352,7 @@ fn incu_place_instances(module: & IrModule, units: & mut Vec<i64>) {
         var home_calls: Vec<i64> = Vec::new();
         i = 0;
         while i < n {
-            first_u.push(- 1);
+            first_u.push(-1);
             multi.push(0);
             home_calls.push(0);
             i = i + 1;
@@ -13296,7 +13401,7 @@ fn incu_place_instances(module: & IrModule, units: & mut Vec<i64>) {
 
 /// LF18 before any C is written: the @constant_time violations of `module`
 /// (as the C generator reports them; FID_C_CT_OFF=1: none).
-fn incu_ct_errors(module: & IrModule) -> Vec<str> {
+fn incu_ct_errors(module: &IrModule) -> Vec<str> {
     var out: Vec<str> = Vec::new();
     var sw: str = p_getenv("FID_C_CT_OFF");
     if (sw as i64) != 0 && str_len(sw) > 0 && sw != "0" {
@@ -13307,7 +13412,7 @@ fn incu_ct_errors(module: & IrModule) -> Vec<str> {
         var entry: IrFunctionEntry = module.functions.get(f);
         if entry.func.is_constant_time {
             var cfunc: IrFunction = entry.func;
-            var errs: Vec<str> = cg_ct_check(& cfunc, entry.name);
+            var errs: Vec<str> = cg_ct_check(&cfunc, entry.name);
             var i: i64 = 0;
             while i < errs.len() {
                 out.push("C backend: @constant_time violated: " + errs.get(i));
@@ -13393,7 +13498,7 @@ fn incu_all_digits(s: str) -> bool {
 /// the program does what it did. Nothing is renamed when a key is missing
 /// or two names would meet. FIDES_INC_OWN_NAMES=index: the lowering's
 /// numbers.
-fn incu_canon_own_names(module: & mut IrModule) {
+fn incu_canon_own_names(module: &mut IrModule) {
     if env_or_empty("FIDES_INC_OWN_NAMES") == "index" {
         return;
     }
@@ -13458,7 +13563,7 @@ fn incu_canon_own_names(module: & mut IrModule) {
                     Inst::Call(cn, ca, ct, ce) => {
                         var to: i64 = HashMap_get(ren, cn);
                         if to != 0 {
-                            IrFunction_set_inst(& mut fe.func, vi.id, Inst::Call(new_names.get(to - 1), ca, ct, ce));
+                            IrFunction_set_inst(&mut fe.func, vi.id, Inst::Call(new_names.get(to - 1), ca, ct, ce));
                             changed = true;
                         }
                     }
@@ -13495,7 +13600,7 @@ fn incu_runtime_root(name: str) -> bool {
     return name == "Vec_to_str" || name == "HashMap_to_str" || name == "Str_dup" || name == "Str_drop" || name == "Vec_new" || name == "HashMap_new" || name == "Vec_push" || name == "Vec_get" || name == "Vec_set" || name == "Vec_len" || name == "Vec_pop" || name == "Vec_is_empty" || name == "Vec_filled_typed";
 }
 
-fn incu_live_push(pos: i64, live: i64, work: & mut Vec<i64>, name: str) {
+fn incu_live_push(pos: i64, live: i64, work: &mut Vec<i64>, name: str) {
     if HashMap_get(live, name) != 0 {
         return;
     }
@@ -13513,7 +13618,7 @@ fn incu_live_push(pos: i64, live: i64, work: & mut Vec<i64>, name: str) {
 /// callbacks and the runtime's roots, then through calls, function
 /// references, strings and dynamic calls (every `<Type>_<method>`). A map
 /// name -> 1.
-fn incu_live(module: & IrModule) -> i64 {
+fn incu_live(module: &IrModule) -> i64 {
     var n: i64 = module.functions.len();
     var pos: i64 = HashMap_new();
     var named: i64 = HashMap_new();
@@ -13552,13 +13657,13 @@ fn incu_live(module: & IrModule) -> i64 {
     while i < n {
         var rn2: str = module.functions.get(i).name;
         if !main_found || rn2 == "main" || incu_runtime_root(rn2) || HashMap_get(named, rn2) != 0 {
-            incu_live_push(pos, live, & mut work, rn2);
+            incu_live_push(pos, live, &mut work, rn2);
         }
         i = i + 1;
     }
     var cb: i64 = 0;
     while cb < module.c_callbacks.len() {
-        incu_live_push(pos, live, & mut work, module.c_callbacks.get(cb));
+        incu_live_push(pos, live, &mut work, module.c_callbacks.get(cb));
         cb = cb + 1;
     }
     var dyn_done: i64 = HashMap_new();
@@ -13570,14 +13675,14 @@ fn incu_live(module: & IrModule) -> i64 {
         while k2 < we.func.insts.len() {
             match we.func.insts.get(k2).inst {
                 Inst::Call(cn, _, _, _) => {
-                    incu_live_push(pos, live, & mut work, cn);
+                    incu_live_push(pos, live, &mut work, cn);
                 }
                 Inst::ConstFnRef(fr) => {
-                    incu_live_push(pos, live, & mut work, c_fn_target(fr));
+                    incu_live_push(pos, live, &mut work, c_fn_target(fr));
                 }
                 Inst::ConstStr(sv2) => {
                     if str_len(sv2) > 0 && str_len(sv2) < 256 {
-                        incu_live_push(pos, live, & mut work, sv2);
+                        incu_live_push(pos, live, &mut work, sv2);
                     }
                 }
                 Inst::DynCall(_, method, _, _, _) => {
@@ -13588,7 +13693,7 @@ fn incu_live(module: & IrModule) -> i64 {
                         while di < n {
                             var dn: str = module.functions.get(di).name;
                             if str_ends_with(dn, suffix) {
-                                incu_live_push(pos, live, & mut work, dn);
+                                incu_live_push(pos, live, &mut work, dn);
                             }
                             di = di + 1;
                         }
@@ -13615,7 +13720,7 @@ fn incu_live(module: & IrModule) -> i64 {
 /// are placed the same way (16 rounds at most). `units`: each function's
 /// unit (definitions move); copy_fn/copy_unit: function i gets a static
 /// copy in unit u.
-fn incu_copy_instances(module: & IrModule, unames: Vec<str>, units: & mut Vec<i64>, copy_fn: & mut Vec<i64>, copy_unit: & mut Vec<i64>) {
+fn incu_copy_instances(module: &IrModule, unames: Vec<str>, units: &mut Vec<i64>, copy_fn: &mut Vec<i64>, copy_unit: &mut Vec<i64>) {
     var n: i64 = module.functions.len();
     var nu: i64 = unames.len();
     if nu < 2 {
@@ -13631,7 +13736,7 @@ fn incu_copy_instances(module: & IrModule, unames: Vec<str>, units: & mut Vec<i6
         if HashMap_get(pos, nm) == 0 {
             HashMap_insert(pos, nm, i + 1);
         }
-        var k0: i64 = - 1;
+        var k0: i64 = -1;
         if func_is_instance(nm) {
             var h: i64 = c_unit_slot(unames, func_module_of(nm, ""));
             if h >= 0 {
@@ -13754,7 +13859,7 @@ fn incu_copy_instances(module: & IrModule, unames: Vec<str>, units: & mut Vec<i6
                 var p: i64 = units.get(j2);
                 var h2: i64 = home.get(kk);
                 var others: i64 = 0;
-                var best: i64 = - 1;
+                var best: i64 = -1;
                 var u: i64 = 0;
                 while u < nu {
                     if cu.get(kk * nu + u) == 1 {
@@ -13861,8 +13966,8 @@ pub fn ccompile_inc_prepare(source: str, source_path: str, borrowck_mode: str, b
     }
     // B6: the own types' functions named by their type, not by the order
     // this program's lowering met the types
-    incu_canon_own_names(& mut module);
-    var ct_errs: Vec<str> = incu_ct_errors(& module);
+    incu_canon_own_names(&mut module);
+    var ct_errs: Vec<str> = incu_ct_errors(&module);
     if ct_errs.len() > 0 {
         return ResultStr::Err(ct_errs);
     }
@@ -13888,7 +13993,7 @@ pub fn ccompile_inc_prepare(source: str, source_path: str, borrowck_mode: str, b
     }
     HashMap_drop(uidx);
     if env_or_empty("FIDES_INC_INSTANCES") != "home" {
-        incu_place_instances(& module, & mut units);
+        incu_place_instances(&module, &mut units);
     }
     // B6: core's dispatches over the program's struct and enum types
     // (lower.fd Lowerer_rc_gen_elem_fn, Lowerer_rc_gen_mem_drop_fn) change
@@ -13896,7 +14001,7 @@ pub fn ccompile_inc_prepare(source: str, source_path: str, borrowck_mode: str, b
     // core's unit is the same in every program that does not change core.
     // FIDES_INC_DISPATCH=core: they stay in core's unit.
     if env_or_empty("FIDES_INC_DISPATCH") != "core" {
-        var disp_u: i64 = - 1;
+        var disp_u: i64 = -1;
         i = 0;
         while i < unames.len() {
             if unames.get(i) == owner {
@@ -13918,7 +14023,7 @@ pub fn ccompile_inc_prepare(source: str, source_path: str, borrowck_mode: str, b
     // FIDES_INC_EQ=main: the `==` helpers in main's unit, as split_c_units
     // puts them (else the unit that holds one would lose its body there)
     if env_or_empty("FIDES_INC_EQ") == "main" {
-        var main_u: i64 = - 1;
+        var main_u: i64 = -1;
         i = 0;
         while i < unames.len() {
             if unames.get(i) == owner {
@@ -13942,7 +14047,7 @@ pub fn ccompile_inc_prepare(source: str, source_path: str, borrowck_mode: str, b
     var copy_unit: Vec<i64> = Vec::new();
     var inst_mode: str = env_or_empty("FIDES_INC_INSTANCES");
     if inst_mode != "home" && inst_mode != "move" && env_or_empty("FIDES_INC_EFFECTS") != "off" {
-        incu_copy_instances(& module, unames, & mut units, & mut copy_fn, & mut copy_unit);
+        incu_copy_instances(&module, unames, &mut units, &mut copy_fn, &mut copy_unit);
     }
     var unit_of: Vec<str> = Vec::new();
     i = 0;
@@ -13950,8 +14055,8 @@ pub fn ccompile_inc_prepare(source: str, source_path: str, borrowck_mode: str, b
         unit_of.push(unames.get(units.get(i)));
         i = i + 1;
     }
-    var t: IrLinkTable = ir_units_split(& module, unit_of);
-    var problems: Vec<str> = ir_units_check(& t);
+    var t: IrLinkTable = ir_units_split(&module, unit_of);
+    var problems: Vec<str> = ir_units_check(&t);
     if problems.len() > 0 || t.units.len() == 0 {
         if problems.len() > 0 {
             p_eprint_str("[inc] IR units: " + problems.get(0) + "; cutting the program's C instead\n");
@@ -13959,7 +14064,7 @@ pub fn ccompile_inc_prepare(source: str, source_path: str, borrowck_mode: str, b
         HashMap_drop(t.owner);
         incu_reset();
         var wcg: CCodeGen = CCodeGen_new();
-        var whole: str = CCodeGen_generate(& mut wcg, module);
+        var whole: str = CCodeGen_generate(&mut wcg, module);
         val wct: Vec<str> = c_ct_error_lines();
         if wct.len() > 0 {
             return ResultStr::Err(wct);
@@ -13982,7 +14087,7 @@ pub fn ccompile_inc_prepare(source: str, source_path: str, borrowck_mode: str, b
         var fe0: IrFunctionEntry = module.functions.get(i);
         var nm0: Vec<str> = Vec::new();
         var dy0: Vec<str> = Vec::new();
-        if incu_named(& fe0.func, & mut nm0, & mut dy0) {
+        if incu_named(&fe0.func, &mut nm0, &mut dy0) {
             dl_at.push(1);
         } else {
             dl_at.push(0);
@@ -14013,7 +14118,7 @@ pub fn ccompile_inc_prepare(source: str, source_path: str, borrowck_mode: str, b
     // with the arity of a call through a function value its live functions
     // make. Before, lib2's `d.area()` on main's Sq had no candidate and
     // aborted (exit 127), and so did lib2's `f(x)` on main's function.
-    var live: i64 = incu_live(& module);
+    var live: i64 = incu_live(&module);
     var dyn_types: i64 = HashMap_new();
     var ti0: i64 = 0;
     while ti0 < module.trait_impls.len() {
@@ -14113,7 +14218,7 @@ pub fn ccompile_inc_prepare(source: str, source_path: str, borrowck_mode: str, b
             HashMap_insert(own, fe.name, 1);
             var nms: Vec<str> = Vec::new();
             var dys: Vec<str> = Vec::new();
-            incu_named(& fe.func, & mut nms, & mut dys);
+            incu_named(&fe.func, &mut nms, &mut dys);
             var q: i64 = 0;
             while q < nms.len() {
                 HashMap_insert(want, nms.get(q), 1);
@@ -14235,7 +14340,7 @@ pub fn ccompile_inc_prepare(source: str, source_path: str, borrowck_mode: str, b
             if is_owner && dl_at.get(stub_ix.get(w2)) == 1 {
                 cg.functions.push(se);
             } else {
-                cg.functions.push(incu_stub(& se));
+                cg.functions.push(incu_stub(&se));
             }
             w2 = w2 + 1;
         }
@@ -14255,7 +14360,7 @@ pub fn ccompile_inc_prepare(source: str, source_path: str, borrowck_mode: str, b
             var gf: i64 = 0;
             while gf < un.module.functions.len() {
                 var gfe: IrFunctionEntry = un.module.functions.get(gf);
-                incu_globals_named(& gfe.func, gnamed);
+                incu_globals_named(&gfe.func, gnamed);
                 gf = gf + 1;
             }
             var gx: i64 = 0;
@@ -14278,7 +14383,7 @@ pub fn ccompile_inc_prepare(source: str, source_path: str, borrowck_mode: str, b
         HashMap_drop(want);
         cg.c_callbacks = module.c_callbacks;
         // B2: the layouts the unit names
-        var body: Vec<i64> = ir_module_bytes(& cg, "fid-unit");
+        var body: Vec<i64> = ir_module_bytes(&cg, "fid-unit");
         var used: Vec<i64> = Vec::new();
         if env_or_empty("FIDES_INC_LAYOUTS") == "off" {
             // every unit carries every layout (as split_c_units then does)
@@ -14290,17 +14395,17 @@ pub fn ccompile_inc_prepare(source: str, source_path: str, borrowck_mode: str, b
                 la = la + 1;
             }
         } else {
-            used = incu_layouts_named(body, & module, lay_at, max_len);
+            used = incu_layouts_named(body, &module, lay_at, max_len);
         }
         var lm: IrModule = IrModule_new();
         var ui: i64 = 0;
         while ui < used.len() {
             var lay: StructLayout = module.struct_layouts.get(used.get(ui)).layout;
-            IrModule_add_struct(& mut cg, lay);
-            IrModule_add_struct(& mut lm, lay);
+            IrModule_add_struct(&mut cg, lay);
+            IrModule_add_struct(&mut lm, lay);
             ui = ui + 1;
         }
-        var lay_bytes: Vec<i64> = ir_module_bytes(& lm, "layouts");
+        var lay_bytes: Vec<i64> = ir_module_bytes(&lm, "layouts");
         HashMap_drop(lm.fn_index);
         HashMap_drop(lm.struct_index);
         HashMap_drop(lm.str_index);
@@ -14372,7 +14477,7 @@ pub fn incu_unit_c(i: i64) -> str {
         set_c_register_all(true);
     }
     var cg: CCodeGen = CCodeGen_new();
-    var text: str = CCodeGen_generate(& mut cg, m);
+    var text: str = CCodeGen_generate(&mut cg, m);
     set_c_register_all(false);
     val ct: Vec<str> = c_ct_error_lines();
     if ct.len() > 0 {

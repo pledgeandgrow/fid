@@ -66,101 +66,140 @@ pub struct AuditCheck {
 /// An empty log; key is empty for a plain BLAKE3 chain or 32 bytes for
 /// a keyed (MAC) chain.
 pub fn audit_new(key: Vec<i64>) -> AuditLog {
-    return AuditLog { records: Vec::new(), key: key };
+    return AuditLog {
+        records: Vec::new(), key: key
+    };
 }
 
 fn al_zero32() -> Vec<i64> {
     var z: Vec<i64> = Vec::new();
     var i: i64 = 0;
-    while i < 32 { z.push(0); i = i + 1; }
+    while i < 32 {
+        z.push(0);
+        i = i + 1;
+    }
     return z;
 }
 
-fn al_u64(out: & mut Vec<i64>, x: i64) {
+fn al_u64(out: &mut Vec<i64>, x: i64) {
     var i: i64 = 0;
-    while i < 8 { out.push((x >> (i * 8)) & 255); i = i + 1; }
+    while i < 8 {
+        out.push((x >> (i * 8)) & 255);
+        i = i + 1;
+    }
 }
 
-fn al_field(out: & mut Vec<i64>, s: str) {
+fn al_field(out: &mut Vec<i64>, s: str) {
     val b: Vec<i64> = str_bytes(s);
     al_u64(out, b.len());
     var i: i64 = 0;
-    while i < b.len() { out.push(b.get(i) & 255); i = i + 1; }
+    while i < b.len() {
+        out.push(b.get(i) & 255);
+        i = i + 1;
+    }
 }
 
 /// The hash of a record's contents chained to `prev`.
-pub fn audit_record_hash(key: & Vec<i64>, seq: i64, time: i64, actor: str, action: str, data: str, prev: & Vec<i64>) -> Vec<i64> {
+pub fn audit_record_hash(key: &Vec<i64>, seq: i64, time: i64, actor: str, action: str, data: str, prev: &Vec<i64>) -> Vec<i64> {
     var m: Vec<i64> = str_bytes("fides-audit-v1");
-    al_u64(& mut m, seq);
-    al_u64(& mut m, time);
-    al_field(& mut m, actor);
-    al_field(& mut m, action);
-    al_field(& mut m, data);
+    al_u64(&mut m, seq);
+    al_u64(&mut m, time);
+    al_field(&mut m, actor);
+    al_field(&mut m, action);
+    al_field(&mut m, data);
     var i: i64 = 0;
-    while i < prev.len() { m.push(prev.get(i) & 255); i = i + 1; }
-    if key.len() == 32 { return blake3_keyed(*key, m); }
+    while i < prev.len() {
+        m.push(prev.get(i) & 255);
+        i = i + 1;
+    }
+    if key.len() == 32 {
+        return blake3_keyed(*key, m);
+    }
     return blake3_bytes(m);
 }
 
 /// The hash of the newest record (32 zero bytes for an empty log): store
 /// it apart from the log to detect a removed tail later.
-pub fn audit_head(log: & AuditLog) -> Vec<i64> {
-    if log.records.len() == 0 { return al_zero32(); }
+pub fn audit_head(log: &AuditLog) -> Vec<i64> {
+    if log.records.len() == 0 {
+        return al_zero32();
+    }
     return log.records.get(log.records.len() - 1).hash;
 }
 
 /// Append a record (sequence numbers start at 0) and return it.
-pub fn audit_append(log: & mut AuditLog, time: i64, actor: str, action: str, data: str) -> AuditRecord {
+pub fn audit_append(log: &mut AuditLog, time: i64, actor: str, action: str, data: str) -> AuditRecord {
     val seq: i64 = log.records.len();
     val prev: Vec<i64> = audit_head(log);
-    val h: Vec<i64> = audit_record_hash(& log.key, seq, time, actor, action, data, & prev);
-    val r: AuditRecord = AuditRecord { seq: seq, time: time, actor: actor, action: action, data: data, prev: prev, hash: h };
+    val h: Vec<i64> = audit_record_hash(&log.key, seq, time, actor, action, data, &prev);
+    val r: AuditRecord = AuditRecord {
+        seq: seq, time: time, actor: actor, action: action, data: data, prev: prev, hash: h
+    };
     log.records.push(r);
     return r;
 }
 
-fn al_eq(a: & Vec<i64>, b: & Vec<i64>) -> bool {
-    if a.len() != b.len() { return false; }
+fn al_eq(a: &Vec<i64>, b: &Vec<i64>) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
     var d: i64 = 0;
     var i: i64 = 0;
-    while i < a.len() { d = d | (a.get(i) ^ b.get(i)); i = i + 1; }
+    while i < a.len() {
+        d = d | (a.get(i) ^ b.get(i));
+        i = i + 1;
+    }
     return d == 0;
 }
 
 /// Check every record: sequence numbers 0, 1, 2..., each prev equal to
 /// the previous hash (zeros for the first), each hash recomputed.
-pub fn audit_verify(log: & AuditLog) -> AuditCheck {
+pub fn audit_verify(log: &AuditLog) -> AuditCheck {
     var prev: Vec<i64> = al_zero32();
     var i: i64 = 0;
     while i < log.records.len() {
         val r: AuditRecord = log.records.get(i);
         if r.seq != i {
-            return AuditCheck { ok: false, index: i, reason: "sequence gap: record removed or reordered" };
+            return AuditCheck {
+                ok: false, index: i, reason: "sequence gap: record removed or reordered"
+            };
         }
-        if !al_eq(& r.prev, & prev) {
-            return AuditCheck { ok: false, index: i, reason: "broken link to the previous record" };
+        if !al_eq(&r.prev, &prev) {
+            return AuditCheck {
+                ok: false, index: i, reason: "broken link to the previous record"
+            };
         }
-        val h: Vec<i64> = audit_record_hash(& log.key, r.seq, r.time, r.actor, r.action, r.data, & r.prev);
-        if !al_eq(& h, & r.hash) {
-            return AuditCheck { ok: false, index: i, reason: "record contents changed" };
+        val h: Vec<i64> = audit_record_hash(&log.key, r.seq, r.time, r.actor, r.action, r.data, &r.prev);
+        if !al_eq(&h, &r.hash) {
+            return AuditCheck {
+                ok: false, index: i, reason: "record contents changed"
+            };
         }
         prev = r.hash;
         i = i + 1;
     }
-    return AuditCheck { ok: true, index: -1, reason: "" };
+    return AuditCheck {
+        ok: true, index: -1, reason: ""
+    };
 }
 
 /// audit_verify, plus the newest hash must equal an anchored head and the
 /// log must hold `count` records: catches a removed tail.
-pub fn audit_verify_anchored(log: & AuditLog, head: Vec<i64>, count: i64) -> AuditCheck {
+pub fn audit_verify_anchored(log: &AuditLog, head: Vec<i64>, count: i64) -> AuditCheck {
     val c: AuditCheck = audit_verify(log);
-    if !c.ok { return c; }
+    if !c.ok {
+        return c;
+    }
     if log.records.len() != count {
-        return AuditCheck { ok: false, index: log.records.len(), reason: "record count differs from the anchor" };
+        return AuditCheck {
+            ok: false, index: log.records.len(), reason: "record count differs from the anchor"
+        };
     }
     val h: Vec<i64> = audit_head(log);
-    if !al_eq(& h, & head) {
-        return AuditCheck { ok: false, index: log.records.len(), reason: "head differs from the anchor" };
+    if !al_eq(&h, &head) {
+        return AuditCheck {
+            ok: false, index: log.records.len(), reason: "head differs from the anchor"
+        };
     }
     return c;
 }
@@ -172,11 +211,17 @@ fn al_escape(s: str) -> str {
     var i: i64 = 0;
     while i < str_len(s) {
         val c: i64 = str_byte_at(s, i);
-        if c == 37 { out = out + "%25"; }
-        else if c == 124 { out = out + "%7C"; }
-        else if c == 10 { out = out + "%0A"; }
-        else if c == 13 { out = out + "%0D"; }
-        else { out = out + str_slice(s, i, i + 1); }
+        if c == 37 {
+            out = out + "%25";
+        } else if c == 124 {
+            out = out + "%7C";
+        } else if c == 10 {
+            out = out + "%0A";
+        } else if c == 13 {
+            out = out + "%0D";
+        } else {
+            out = out + str_slice(s, i, i + 1);
+        }
         i = i + 1;
     }
     return out;
@@ -204,7 +249,7 @@ pub fn audit_record_line(r: AuditRecord) -> str {
 }
 
 /// The whole log, one line per record, each ending in "\n".
-pub fn audit_to_text(log: & AuditLog) -> str {
+pub fn audit_to_text(log: &AuditLog) -> str {
     var out: str = "";
     var i: i64 = 0;
     while i < log.records.len() {
@@ -227,12 +272,12 @@ pub fn audit_from_text(text: str, key: Vec<i64>) -> AuditLog {
             val f: Vec<str> = str_split(line, "|");
             if f.len() == 7 && str_len(f.get(2)) == 64 && str_len(f.get(3)) == 64 && hex_valid(f.get(2)) && hex_valid(f.get(3)) {
                 log.records.push(AuditRecord {
-                    seq: str_parse_int(f.get(0)), time: str_parse_int(f.get(1)),
-                    actor: al_unescape(f.get(4)), action: al_unescape(f.get(5)), data: al_unescape(f.get(6)),
-                    prev: hex_decode_bytes(f.get(2)), hash: hex_decode_bytes(f.get(3))
+                    seq: str_parse_int(f.get(0)), time: str_parse_int(f.get(1)), actor: al_unescape(f.get(4)), action: al_unescape(f.get(5)), data: al_unescape(f.get(6)), prev: hex_decode_bytes(f.get(2)), hash: hex_decode_bytes(f.get(3))
                 });
             } else {
-                log.records.push(AuditRecord { seq: -1, time: 0, actor: "", action: "", data: line, prev: Vec::new(), hash: Vec::new() });
+                log.records.push(AuditRecord {
+                    seq: -1, time: 0, actor: "", action: "", data: line, prev: Vec::new(), hash: Vec::new()
+                });
             }
         }
         i = i + 1;

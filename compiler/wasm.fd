@@ -55,24 +55,58 @@
 // within the context that starts them.
 
 module compiler::wasm;
- use core; use vec; use string; use compiler::ir; use compiler::ast; use compiler::checks;
+use core;
+use vec;
+use string;
+use compiler::ir;
+use compiler::ast;
+use compiler::checks;
 // WASM value types
-const WT_I32: i64 = 0x7F; const WT_I64: i64 = 0x7E; const WT_VOID: i64 = 0x40;
+const WT_I32: i64 = 0x7F;
+const WT_I64: i64 = 0x7E;
+const WT_VOID: i64 = 0x40;
 // Section ids
-const SEC_TYPE: i64 = 1; const SEC_IMPORT: i64 = 2; const SEC_FUNCTION: i64 = 3; const SEC_TABLE: i64 = 4; const SEC_MEMORY: i64 = 5; const SEC_GLOBAL: i64 = 6; const SEC_EXPORT: i64 = 7; const SEC_ELEM: i64 = 9; const SEC_CODE: i64 = 10; const SEC_DATA: i64 = 11;
+const SEC_TYPE: i64 = 1;
+const SEC_IMPORT: i64 = 2;
+const SEC_FUNCTION: i64 = 3;
+const SEC_TABLE: i64 = 4;
+const SEC_MEMORY: i64 = 5;
+const SEC_GLOBAL: i64 = 6;
+const SEC_EXPORT: i64 = 7;
+const SEC_ELEM: i64 = 9;
+const SEC_CODE: i64 = 10;
+const SEC_DATA: i64 = 11;
 // Memory layout
-const WG_STACK_LO: i64 = 1024; const WG_STACK_TOP: i64 = 8389632;  // 1024 + 8 MB
+const WG_STACK_LO: i64 = 1024;
+const WG_STACK_TOP: i64 = 8389632;  // 1024 + 8 MB
 const WG_DATA_BASE: i64 = 8389632;  // What nat_ctx_tramp returns: marks a task's first context record
 const WG_TRAMP: i64 = 0x7A5E7A5E;
 // The globals of stack switching (see "Tasks"): the state (0 running, 1
 // unwinding, 2 rewinding), the end of the saved frames, the running
 // context's record, the context to switch to
-const WG_G_ST: i64 = 4; const WG_G_PTR: i64 = 5; const WG_G_CUR: i64 = 6; const WG_G_NEXT: i64 = 7;
+const WG_G_ST: i64 = 4;
+const WG_G_PTR: i64 = 5;
+const WG_G_CUR: i64 = 6;
+const WG_G_NEXT: i64 = 7;
 // The arithmetic panics (nat_ir's NP_*)
-const WP_ADD: i64 = 0; const WP_SUB: i64 = 1; const WP_MUL: i64 = 2; const WP_DIV_OVF: i64 = 3; const WP_DIV_ZERO: i64 = 4; const WP_MOD_ZERO: i64 = 5;
+const WP_ADD: i64 = 0;
+const WP_SUB: i64 = 1;
+const WP_MUL: i64 = 2;
+const WP_DIV_OVF: i64 = 3;
+const WP_DIV_ZERO: i64 = 4;
+const WP_MOD_ZERO: i64 = 5;
 // Integer compare kinds
-const WCC_EQ: i64 = 0; const WCC_NE: i64 = 1; const WCC_LT: i64 = 2; const WCC_LE: i64 = 3; const WCC_GT: i64 = 4; const WCC_GE: i64 = 5; const WCC_LTU: i64 = 6; const WCC_LEU: i64 = 7; const WCC_GTU: i64 = 8; const WCC_GEU: i64 = 9;
- fn wg_panic_messages() -> Vec<str> {
+const WCC_EQ: i64 = 0;
+const WCC_NE: i64 = 1;
+const WCC_LT: i64 = 2;
+const WCC_LE: i64 = 3;
+const WCC_GT: i64 = 4;
+const WCC_GE: i64 = 5;
+const WCC_LTU: i64 = 6;
+const WCC_LEU: i64 = 7;
+const WCC_GTU: i64 = 8;
+const WCC_GEU: i64 = 9;
+fn wg_panic_messages() -> Vec<str> {
     var v: Vec<str> = Vec::new();
     v.push("Integer overflow on addition");
     v.push("Integer overflow on subtraction");
@@ -172,7 +206,7 @@ fn WasmGen_new() -> WasmGen {
 
 // ─── Bytes ─────────────────────────────────────────────────────────────
 
-fn wb_uleb(out: & mut Vec<i64>, v: i64) {
+fn wb_uleb(out: &mut Vec<i64>, v: i64) {
     var x: i64 = v;
     while true {
         var byte: i64 = x & 0x7F;
@@ -186,7 +220,7 @@ fn wb_uleb(out: & mut Vec<i64>, v: i64) {
     }
 }
 
-fn wb_sleb(out: & mut Vec<i64>, v: i64) {
+fn wb_sleb(out: &mut Vec<i64>, v: i64) {
     var x: i64 = v;
     while true {
         var byte: i64 = x & 0x7F;
@@ -200,7 +234,7 @@ fn wb_sleb(out: & mut Vec<i64>, v: i64) {
     }
 }
 
-fn wb_name(out: & mut Vec<i64>, s: str) {
+fn wb_name(out: &mut Vec<i64>, s: str) {
     var n: i64 = str_len(s);
     wb_uleb(out, n);
     var i: i64 = 0;
@@ -210,7 +244,7 @@ fn wb_name(out: & mut Vec<i64>, s: str) {
     }
 }
 
-fn wb_append(out: & mut Vec<i64>, bs: & Vec<i64>) {
+fn wb_append(out: &mut Vec<i64>, bs: &Vec<i64>) {
     var i: i64 = 0;
     var n: i64 = bs.len();
     while i < n {
@@ -220,7 +254,7 @@ fn wb_append(out: & mut Vec<i64>, bs: & Vec<i64>) {
 }
 
 /// A section: id, size, contents.
-fn wb_section(out: & mut Vec<i64>, id: i64, contents: & Vec<i64>) {
+fn wb_section(out: &mut Vec<i64>, id: i64, contents: &Vec<i64>) {
     out.push(id);
     wb_uleb(out, contents.len());
     wb_append(out, contents);
@@ -228,98 +262,98 @@ fn wb_section(out: & mut Vec<i64>, id: i64, contents: & Vec<i64>) {
 
 // ─── Instructions into the current body ────────────────────────────────
 
-fn w(g: & mut WasmGen, byte: i64) {
+fn w(g: &mut WasmGen, byte: i64) {
     g.b.push(byte & 0xFF);
 }
 
-fn wu(g: & mut WasmGen, v: i64) {
-    wb_uleb(& mut g.b, v);
+fn wu(g: &mut WasmGen, v: i64) {
+    wb_uleb(&mut g.b, v);
 }
 
-fn wi64(g: & mut WasmGen, v: i64) {
+fn wi64(g: &mut WasmGen, v: i64) {
     w(g, 0x42);
-    wb_sleb(& mut g.b, v);
+    wb_sleb(&mut g.b, v);
 }
 
-fn wi32(g: & mut WasmGen, v: i64) {
+fn wi32(g: &mut WasmGen, v: i64) {
     w(g, 0x41);
-    wb_sleb(& mut g.b, v);
+    wb_sleb(&mut g.b, v);
 }
 
-fn wlget(g: & mut WasmGen, l: i64) {
+fn wlget(g: &mut WasmGen, l: i64) {
     w(g, 0x20);
     wu(g, l);
 }
 
-fn wlset(g: & mut WasmGen, l: i64) {
+fn wlset(g: &mut WasmGen, l: i64) {
     w(g, 0x21);
     wu(g, l);
 }
 
-fn wltee(g: & mut WasmGen, l: i64) {
+fn wltee(g: &mut WasmGen, l: i64) {
     w(g, 0x22);
     wu(g, l);
 }
 
-fn wgget(g: & mut WasmGen, x: i64) {
+fn wgget(g: &mut WasmGen, x: i64) {
     w(g, 0x23);
     wu(g, x);
 }
 
-fn wgset(g: & mut WasmGen, x: i64) {
+fn wgset(g: &mut WasmGen, x: i64) {
     w(g, 0x24);
     wu(g, x);
 }
 
-fn wend(g: & mut WasmGen) {
+fn wend(g: &mut WasmGen) {
     w(g, 0x0B);
 }
 
-fn wbr(g: & mut WasmGen, depth: i64) {
+fn wbr(g: &mut WasmGen, depth: i64) {
     w(g, 0x0C);
     wu(g, depth);
 }
 
-fn wif(g: & mut WasmGen) {
+fn wif(g: &mut WasmGen) {
     w(g, 0x04);
     w(g, WT_VOID);
     g.extra = g.extra + 1;
 }
 
-fn wif_t(g: & mut WasmGen, t: i64) {
+fn wif_t(g: &mut WasmGen, t: i64) {
     w(g, 0x04);
     w(g, t);
     g.extra = g.extra + 1;
 }
 
-fn welse(g: & mut WasmGen) {
+fn welse(g: &mut WasmGen) {
     w(g, 0x05);
 }
 
-fn wendif(g: & mut WasmGen) {
+fn wendif(g: &mut WasmGen) {
     w(g, 0x0B);
     g.extra = g.extra - 1;
 }
 
-fn wcall(g: & mut WasmGen, fidx: i64) {
+fn wcall(g: &mut WasmGen, fidx: i64) {
     w(g, 0x10);
     wu(g, fidx);
 }
 
-fn wwrap(g: & mut WasmGen) {
+fn wwrap(g: &mut WasmGen) {
     w(g, 0xA7);
 }
 
-fn wextu(g: & mut WasmGen) {
+fn wextu(g: &mut WasmGen) {
     w(g, 0xAD);
 }
 
-fn wexts(g: & mut WasmGen) {
+fn wexts(g: &mut WasmGen) {
     w(g, 0xAC);
 }
 
 /// i64 load of `size` bytes at [top-of-stack address + off] (an i64 address)
-fn wload(g: & mut WasmGen, size: i64, signed: bool, off: i64) {
+fn wload(g: &mut WasmGen, size: i64, signed: bool, off: i64) {
     wwrap(g);
     if size == 1 {
         if signed {
@@ -350,7 +384,7 @@ fn wload(g: & mut WasmGen, size: i64, signed: bool, off: i64) {
 }
 
 /// i64 store of `size` bytes; the stack is [i32 address, i64 value]
-fn wstore(g: & mut WasmGen, size: i64, off: i64) {
+fn wstore(g: &mut WasmGen, size: i64, off: i64) {
     if size == 1 {
         w(g, 0x3C);
         wu(g, 0);
@@ -368,7 +402,7 @@ fn wstore(g: & mut WasmGen, size: i64, off: i64) {
 }
 
 /// The local of value `id` (-1: none)
-fn wg_local(g: & WasmGen, id: i64) -> i64 {
+fn wg_local(g: &WasmGen, id: i64) -> i64 {
     if id < 0 || id >= g.local_of.len() {
         return 0 - 1;
     }
@@ -376,7 +410,7 @@ fn wg_local(g: & WasmGen, id: i64) -> i64 {
 }
 
 /// Push value `id` (0 for a value without a local)
-fn wget(g: & mut WasmGen, id: i64) {
+fn wget(g: &mut WasmGen, id: i64) {
     var l: i64 = wg_local(g, id);
     if l < 0 {
         wi64(g, 0);
@@ -386,7 +420,7 @@ fn wget(g: & mut WasmGen, id: i64) {
 }
 
 /// Pop into value `id`
-fn wset(g: & mut WasmGen, id: i64) {
+fn wset(g: &mut WasmGen, id: i64) {
     var l: i64 = wg_local(g, id);
     if l < 0 {
         w(g, 0x1A);
@@ -396,13 +430,13 @@ fn wset(g: & mut WasmGen, id: i64) {
 }
 
 /// Push value `id` as an i32 address
-fn wget_addr(g: & mut WasmGen, id: i64) {
+fn wget_addr(g: &mut WasmGen, id: i64) {
     wget(g, id);
     wwrap(g);
 }
 
 /// i64 comparison of the two values on the stack -> i64 0/1
-fn wcmp(g: & mut WasmGen, cc: i64) {
+fn wcmp(g: &mut WasmGen, cc: i64) {
     if cc == WCC_EQ {
         w(g, 0x51);
     } else if cc == WCC_NE {
@@ -428,7 +462,7 @@ fn wcmp(g: & mut WasmGen, cc: i64) {
 }
 
 /// Normalize the i64 on the stack to narrow type `ty` (nat_ir's ng_ext)
-fn wnarrow(g: & mut WasmGen, ty: IrType) {
+fn wnarrow(g: &mut WasmGen, ty: IrType) {
     match ty {
         IrType::I8 => {
             w(g, 0xC2);
@@ -483,7 +517,7 @@ fn wg_is_narrow(ty: IrType) -> bool {
 }
 
 /// Push value `id` as an f64 (its bits reinterpreted), or an f32
-fn wget_f(g: & mut WasmGen, id: i64, is32: bool) {
+fn wget_f(g: &mut WasmGen, id: i64, is32: bool) {
     wget(g, id);
     if is32 {
         wwrap(g);
@@ -494,7 +528,7 @@ fn wget_f(g: & mut WasmGen, id: i64, is32: bool) {
 }
 
 /// Local `local` (a float's bits) pushed as an f32 or f64
-fn wlget_f(g: & mut WasmGen, local: i64, is32: bool) {
+fn wlget_f(g: &mut WasmGen, local: i64, is32: bool) {
     wlget(g, local);
     if is32 {
         wwrap(g);
@@ -505,7 +539,7 @@ fn wlget_f(g: & mut WasmGen, local: i64, is32: bool) {
 }
 
 /// The float on the stack back to bits (i64)
-fn wf_bits(g: & mut WasmGen, is32: bool) {
+fn wf_bits(g: &mut WasmGen, is32: bool) {
     if is32 {
         w(g, 0xBC);
         wextu(g);
@@ -647,12 +681,12 @@ fn wg_wasi_sig(name: str) -> str {
     return "";
 }
 
-fn wg_has_fn(g: & WasmGen, name: str) -> bool {
+fn wg_has_fn(g: &WasmGen, name: str) -> bool {
     return HashMap_contains(g.all_fns, name);
 }
 
 /// Parameter count of a function or primitive (-1: neither)
-fn wg_nparams(g: & WasmGen, name: str) -> i64 {
+fn wg_nparams(g: &WasmGen, name: str) -> i64 {
     if HashMap_contains(g.all_fns, name) {
         return HashMap_get(g.all_fns, name) - 1;
     }
@@ -660,7 +694,7 @@ fn wg_nparams(g: & WasmGen, name: str) -> i64 {
 }
 
 /// The type index of signature `key`
-fn wg_type(g: & mut WasmGen, key: str) -> i64 {
+fn wg_type(g: &mut WasmGen, key: str) -> i64 {
     if HashMap_contains(g.type_index, key) {
         return HashMap_get(g.type_index, key) - 1;
     }
@@ -670,7 +704,7 @@ fn wg_type(g: & mut WasmGen, key: str) -> i64 {
 }
 
 /// The type of a function of n i64 parameters returning an i64
-fn wg_type_n(g: & mut WasmGen, n: i64) -> i64 {
+fn wg_type_n(g: &mut WasmGen, n: i64) -> i64 {
     var key: str = "";
     var i: i64 = 0;
     while i < n {
@@ -682,7 +716,7 @@ fn wg_type_n(g: & mut WasmGen, n: i64) -> i64 {
 
 /// The function a call to `name` runs: an alias (p_vec_* -> core's
 /// Vec_*), the runtime's pert_X for builtin p_X, else `name`.
-fn wg_resolve(g: & WasmGen, name: str) -> str {
+fn wg_resolve(g: &WasmGen, name: str) -> str {
     var alias: str = pe_runtime_alias(name);
     if alias != name {
         return alias;
@@ -696,7 +730,7 @@ fn wg_resolve(g: & WasmGen, name: str) -> str {
 
 /// The index of function `name`, queueing it for compilation; -1 when the
 /// program defines no such function and it is not a primitive.
-fn wg_fn_ref(g: & mut WasmGen, name: str) -> i64 {
+fn wg_fn_ref(g: &mut WasmGen, name: str) -> i64 {
     if HashMap_contains(g.fn_index, name) {
         return HashMap_get(g.fn_index, name);
     }
@@ -712,7 +746,7 @@ fn wg_fn_ref(g: & mut WasmGen, name: str) -> i64 {
 }
 
 /// The table index of function `name` (0: none)
-fn wg_table_ref(g: & mut WasmGen, name: str) -> i64 {
+fn wg_table_ref(g: &mut WasmGen, name: str) -> i64 {
     if HashMap_contains(g.table_index, name) {
         return HashMap_get(g.table_index, name);
     }
@@ -725,21 +759,21 @@ fn wg_table_ref(g: & mut WasmGen, name: str) -> i64 {
     return g.table.len();
 }
 
-fn wg_unresolved(g: & mut WasmGen, name: str) {
+fn wg_unresolved(g: &mut WasmGen, name: str) {
     if !HashMap_contains(g.unresolved_seen, name) {
         HashMap_insert(g.unresolved_seen, name, 1);
         g.unresolved.push(name + " (from " + g.cur_name + ")");
     }
 }
 
-fn wg_data_align(g: & mut WasmGen) {
+fn wg_data_align(g: &mut WasmGen) {
     while g.data.len() % 8 != 0 {
         g.data.push(0);
     }
 }
 
 /// The address of string constant `s` (its bytes and a NUL, 8-aligned)
-fn wg_str(g: & mut WasmGen, s: str) -> i64 {
+fn wg_str(g: &mut WasmGen, s: str) -> i64 {
     if HashMap_contains(g.str_addr, s) {
         return HashMap_get(g.str_addr, s);
     }
@@ -757,7 +791,7 @@ fn wg_str(g: & mut WasmGen, s: str) -> i64 {
 }
 
 /// The address of global `name` (its value is written at the end)
-fn wg_glob(g: & mut WasmGen, name: str, module: & IrModule) -> i64 {
+fn wg_glob(g: &mut WasmGen, name: str, module: &IrModule) -> i64 {
     if HashMap_contains(g.glob_addr, name) {
         return HashMap_get(g.glob_addr, name);
     }
@@ -785,7 +819,7 @@ fn wg_glob(g: & mut WasmGen, name: str, module: & IrModule) -> i64 {
     return a;
 }
 
-fn wg_data_word(g: & mut WasmGen, addr: i64, v: i64) {
+fn wg_data_word(g: &mut WasmGen, addr: i64, v: i64) {
     var at: i64 = addr - WG_DATA_BASE;
     var i: i64 = 0;
     while i < 8 {
@@ -794,7 +828,7 @@ fn wg_data_word(g: & mut WasmGen, addr: i64, v: i64) {
     }
 }
 
-fn wg_dyn_id(g: & WasmGen, name: str) -> i64 {
+fn wg_dyn_id(g: &WasmGen, name: str) -> i64 {
     var i: i64 = 0;
     while i < g.dyn_types.len() {
         if g.dyn_types.get(i) == name {
@@ -827,7 +861,7 @@ fn wg_insert_sorted(v: Vec<str>, s: str) -> Vec<str> {
     return out;
 }
 
-fn wg_meta_ty(func: & IrFunction, id: i64) -> IrType {
+fn wg_meta_ty(func: &IrFunction, id: i64) -> IrType {
     match IrFunction_get_meta(func, id) {
         OptValueMeta::Some(m) => {
             return m.ty;
@@ -844,7 +878,7 @@ fn wg_meta_ty(func: & IrFunction, id: i64) -> IrType {
 /// `[T; N]` itself is the array's address here (the Load from a slot of a
 /// `var a: [T; N] = ...`, which holds the pointer: an i64 load), so it is
 /// checked against N the same way.
-fn wg_array_bound(func: & IrFunction, module: & IrModule, ptr: i64, esize: i64) -> i64 {
+fn wg_array_bound(func: &IrFunction, module: &IrModule, ptr: i64, esize: i64) -> i64 {
     match wg_meta_ty(func, ptr) {
         IrType::Array(velem, vn) => {
             var vsize: i64 = IrModule_type_size(module, box_ir_type_unbox(velem));
@@ -878,7 +912,7 @@ fn wg_array_bound(func: & IrFunction, module: & IrModule, ptr: i64, esize: i64) 
 
 /// CI5: whether instruction `id` lies inside an `unsafe` block (between an
 /// UnsafeBegin and its UnsafeEnd: ids grow in the order lowering emits)
-fn wg_in_unsafe(func: & IrFunction, id: i64) -> bool {
+fn wg_in_unsafe(func: &IrFunction, id: i64) -> bool {
     var depth: i64 = 0;
     var i: i64 = 0;
     while i < func.insts.len() {
@@ -901,7 +935,7 @@ fn wg_in_unsafe(func: & IrFunction, id: i64) -> bool {
     return depth > 0;
 }
 
-fn wg_meta_line(func: & IrFunction, id: i64) -> i64 {
+fn wg_meta_line(func: &IrFunction, id: i64) -> i64 {
     match IrFunction_get_meta(func, id) {
         OptValueMeta::Some(m) => {
             match m.source_line {
@@ -933,7 +967,7 @@ fn wg_is_ptr_ty(t: IrType) -> bool {
     return false;
 }
 
-fn wg_unchecked(g: & WasmGen, id: i64) -> bool {
+fn wg_unchecked(g: &WasmGen, id: i64) -> bool {
     return id >= 0 && id < g.unchecked.len() && (g.unchecked.get(id) & 1) != 0;
 }
 
@@ -942,7 +976,7 @@ fn wg_unchecked(g: & WasmGen, id: i64) -> bool {
 /// Call function `name` (resolved) with `pushed` arguments on the stack:
 /// extra ones dropped, missing ones 0 (WASM checks arity, machine code
 /// does not). Without a definition: a trap. Leaves its i64 result.
-fn wg_call_named(g: & mut WasmGen, name: str, pushed: i64) {
+fn wg_call_named(g: &mut WasmGen, name: str, pushed: i64) {
     var f: i64 = wg_fn_ref(g, name);
     if f < 0 {
         wg_unresolved(g, name);
@@ -960,7 +994,8 @@ fn wg_call_named(g: & mut WasmGen, name: str, pushed: i64) {
     while k > np {
         w(g, 0x1A);
         k = k - 1;
-    } while k < np {
+    }
+    while k < np {
         wi64(g, 0);
         k = k + 1;
     }
@@ -973,7 +1008,7 @@ fn wg_call_named(g: & mut WasmGen, name: str, pushed: i64) {
 /// After a call that may give control away: when it returned unwinding,
 /// leave the switch loop for the function's save code with this segment
 /// (the call's) as the resume point
-fn wg_as_check(g: & mut WasmGen) {
+fn wg_as_check(g: &mut WasmGen) {
     wgget(g, WG_G_ST);
     wwrap(g);
     wif(g);
@@ -986,7 +1021,7 @@ fn wg_as_check(g: & mut WasmGen) {
 
 /// The functions a call instruction may run, as wg_gen_call resolves it
 /// ("<ind>": a closure, any function a function reference names)
-fn wg_as_callees(g: & WasmGen, inst: Inst) -> Vec<str> {
+fn wg_as_callees(g: &WasmGen, inst: Inst) -> Vec<str> {
     var out: Vec<str> = Vec::new();
     match inst {
         Inst::Call(call_name, _, _, _) => {
@@ -1027,7 +1062,7 @@ fn wg_as_callees(g: & WasmGen, inst: Inst) -> Vec<str> {
 }
 
 /// Whether instruction `inst` is a call that may give control away
-fn wg_as_inst(g: & WasmGen, inst: Inst) -> bool {
+fn wg_as_inst(g: &WasmGen, inst: Inst) -> bool {
     var cs: Vec<str> = wg_as_callees(g, inst);
     var i: i64 = 0;
     while i < cs.len() {
@@ -1048,7 +1083,7 @@ fn wg_as_inst(g: & WasmGen, inst: Inst) -> bool {
 /// nat_ctx_swap, nat_call_fn (a task's body, any function) or
 /// nat_clone_thread (a thread's) through calls, closures (when a function
 /// a function reference names may) and dyn calls
-fn wg_as_analyze(g: & mut WasmGen, module: & IrModule) {
+fn wg_as_analyze(g: &mut WasmGen, module: &IrModule) {
     var nf: i64 = module.functions.len();
     var idx: i64 = HashMap_new();
     var fi: i64 = 0;
@@ -1148,7 +1183,7 @@ fn wg_as_analyze(g: & mut WasmGen, module: & IrModule) {
 }
 
 /// Push values `srcs` (-1: a null `__env`)
-fn wg_push_srcs(g: & mut WasmGen, srcs: & Vec<i64>) {
+fn wg_push_srcs(g: &mut WasmGen, srcs: &Vec<i64>) {
     var i: i64 = 0;
     while i < srcs.len() {
         var s: i64 = srcs.get(i);
@@ -1163,7 +1198,7 @@ fn wg_push_srcs(g: & mut WasmGen, srcs: & Vec<i64>) {
 
 /// Start a call of builtin `name`: its null `__env` pushed when it runs
 /// the runtime's Fides function. Returns the function to call.
-fn wg_builtin_begin(g: & mut WasmGen, name: str) -> str {
+fn wg_builtin_begin(g: &mut WasmGen, name: str) -> str {
     var target: str = wg_resolve(g, name);
     if wg_has_fn(g, target) && !wg_has_fn(g, name) {
         wi64(g, 0);
@@ -1172,7 +1207,7 @@ fn wg_builtin_begin(g: & mut WasmGen, name: str) -> str {
 }
 
 /// Call builtin `name` with the values `args`; leaves the result.
-fn wg_call_builtin(g: & mut WasmGen, name: str, args: & Vec<i64>) {
+fn wg_call_builtin(g: &mut WasmGen, name: str, args: &Vec<i64>) {
     var target: str = wg_resolve(g, name);
     var env: bool = wg_has_fn(g, target) && !wg_has_fn(g, name);
     var n: i64 = args.len();
@@ -1185,7 +1220,7 @@ fn wg_call_builtin(g: & mut WasmGen, name: str, args: & Vec<i64>) {
 }
 
 /// A panic with `msg` (the runtime prints it, its trace, and exits 1)
-fn wg_panic_msg(g: & mut WasmGen, msg: str) {
+fn wg_panic_msg(g: &mut WasmGen, msg: str) {
     var target: str = wg_builtin_begin(g, "p_panic");
     var env: i64 = 0;
     if wg_has_fn(g, target) && !wg_has_fn(g, "p_panic") {
@@ -1199,7 +1234,7 @@ fn wg_panic_msg(g: & mut WasmGen, msg: str) {
 
 /// Arithmetic panic `which`: with " at line N" for the division panics
 /// when the instruction has a line (as the interpreter prints them)
-fn wg_panic(g: & mut WasmGen, which: i64) {
+fn wg_panic(g: &mut WasmGen, which: i64) {
     var msg: str = wg_panic_messages().get(which);
     if which >= WP_DIV_OVF && g.cur_inst_line > 0 {
         msg = msg + " at line " + int_to_str(g.cur_inst_line);
@@ -1208,14 +1243,14 @@ fn wg_panic(g: & mut WasmGen, which: i64) {
 }
 
 /// if (i32 on the stack) { panic which }
-fn wg_panic_if(g: & mut WasmGen, which: i64) {
+fn wg_panic_if(g: &mut WasmGen, which: i64) {
     wif(g);
     wg_panic(g, which);
     wendif(g);
 }
 
 /// A call to a WASI import (C name `wasi_<name>`) with values `args`
-fn wg_call_import(g: & mut WasmGen, ix: i64, args: & Vec<i64>) {
+fn wg_call_import(g: &mut WasmGen, ix: i64, args: &Vec<i64>) {
     var sig: str = g.imp_sigs.get(ix);
     var gt: i64 = str_find(sig, ">");
     var i: i64 = 0;
@@ -1243,7 +1278,7 @@ fn wg_call_import(g: & mut WasmGen, ix: i64, args: & Vec<i64>) {
 /// The value of bare-metal builtin `name` in a WASI program (the
 /// interpreter's), -1 when it is not one (or the program or its runtime
 /// defines it)
-fn wg_bare_value(g: & WasmGen, name: str) -> i64 {
+fn wg_bare_value(g: &WasmGen, name: str) -> i64 {
     if wg_has_fn(g, name) || wg_has_fn(g, wg_resolve(g, name)) {
         return 0 - 1;
     }
@@ -1266,7 +1301,7 @@ fn wg_bare_value(g: & WasmGen, name: str) -> i64 {
 }
 
 /// A builtin or C function that starts a process (WASI has no processes)
-fn wg_is_process_call(g: & WasmGen, name: str) -> bool {
+fn wg_is_process_call(g: &WasmGen, name: str) -> bool {
     if wg_has_fn(g, name) {
         return false;
     }
@@ -1280,7 +1315,7 @@ fn wg_is_process_call(g: & WasmGen, name: str) -> bool {
     return false;
 }
 
-fn wg_gen_call(g: & mut WasmGen, id: i64, call_name: str, args: Vec<i64>, func: & IrFunction) {
+fn wg_gen_call(g: &mut WasmGen, id: i64, call_name: str, args: Vec<i64>, func: &IrFunction) {
     // An f64 lives in its local as its bits: these copy the word
     if (call_name == "p_f64_to_bits" || call_name == "p_f64_from_bits") && args.len() == 1 {
         wget(g, args.get(0));
@@ -1368,24 +1403,24 @@ fn wg_gen_call(g: & mut WasmGen, id: i64, call_name: str, args: Vec<i64>, func: 
         var prim: str = "nat_c_" + cname;
         if wg_has_fn(g, over) {
             wi64(g, 0);
-            wg_push_srcs(g, & args);
+            wg_push_srcs(g, &args);
             wg_call_named(g, over, args.len() + 1);
             wset(g, id);
             return;
         }
         if wg_prim_params(prim) >= 0 {
-            wg_push_srcs(g, & args);
+            wg_push_srcs(g, &args);
             wg_call_named(g, prim, args.len());
             wset(g, id);
             return;
         }
         if HashMap_contains(g.imp_index, cname) {
-            wg_call_import(g, HashMap_get(g.imp_index, cname) - 1, & args);
+            wg_call_import(g, HashMap_get(g.imp_index, cname) - 1, &args);
             wset(g, id);
             return;
         }
         if wg_prim_params(cname) >= 0 {
-            wg_push_srcs(g, & args);
+            wg_push_srcs(g, &args);
             wg_call_named(g, cname, args.len());
             wset(g, id);
             return;
@@ -1444,7 +1479,7 @@ fn wg_gen_call(g: & mut WasmGen, id: i64, call_name: str, args: Vec<i64>, func: 
         wi64(g, 0);
         n = n + 1;
     }
-    wg_push_srcs(g, & args);
+    wg_push_srcs(g, &args);
     wg_call_named(g, resolved, n);
     wset(g, id);
 }
@@ -1452,7 +1487,7 @@ fn wg_gen_call(g: & mut WasmGen, id: i64, call_name: str, args: Vec<i64>, func: 
 // ─── Integer arithmetic (nat_ir's meaning) ─────────────────────────────
 
 /// t0 / t1 or t0 % t1 in type `ty`, onto the stack
-fn wg_divmod(g: & mut WasmGen, is_mod: bool, ty: IrType, checked: bool) {
+fn wg_divmod(g: &mut WasmGen, is_mod: bool, ty: IrType, checked: bool) {
     // Division by zero panics, even in @wrapping code
     wlget(g, g.t1);
     w(g, 0x50);
@@ -1501,7 +1536,7 @@ fn wg_divmod(g: & mut WasmGen, is_mod: bool, ty: IrType, checked: bool) {
 
 /// The i64 in t2 normalized to narrow type `ty`; with a panic: one that
 /// does not fit. Leaves it in t2.
-fn wg_narrow_t2(g: & mut WasmGen, ty: IrType, panic: i64) {
+fn wg_narrow_t2(g: &mut WasmGen, ty: IrType, panic: i64) {
     if !wg_is_narrow(ty) {
         return;
     }
@@ -1519,7 +1554,7 @@ fn wg_narrow_t2(g: & mut WasmGen, ty: IrType, panic: i64) {
 }
 
 /// t2 = t0 op t1 for add (0), sub (1), mul (2), with overflow checks
-fn wg_checked(g: & mut WasmGen, kind: i64, ty: IrType, checked: bool) {
+fn wg_checked(g: &mut WasmGen, kind: i64, ty: IrType, checked: bool) {
     var is_i64: bool = ir_type_eq(ty, IrType::I64);
     var is_u64: bool = ir_type_eq(ty, IrType::U64);
     var which: i64 = WP_ADD;
@@ -1625,7 +1660,7 @@ fn wg_checked(g: & mut WasmGen, kind: i64, ty: IrType, checked: bool) {
     }
 }
 
-fn wg_fcmp(g: & mut WasmGen, cc: i64, is32: bool) {
+fn wg_fcmp(g: &mut WasmGen, cc: i64, is32: bool) {
     var op: i64 = 0x61;
     if cc == WCC_NE {
         op = 0x62;
@@ -1649,7 +1684,7 @@ fn wg_fcmp(g: & mut WasmGen, cc: i64, is32: bool) {
     wextu(g);
 }
 
-fn wg_gen_binop(g: & mut WasmGen, id: i64, op: BinOp, left: i64, right: i64, ty: IrType, func: & IrFunction) {
+fn wg_gen_binop(g: &mut WasmGen, id: i64, op: BinOp, left: i64, right: i64, ty: IrType, func: &IrFunction) {
     var lty: IrType = wg_meta_ty(func, left);
     var rty: IrType = wg_meta_ty(func, right);
     var float_ty: IrType = ty;
@@ -1889,7 +1924,7 @@ fn wg_gen_binop(g: & mut WasmGen, id: i64, op: BinOp, left: i64, right: i64, ty:
 
 // ─── Instructions ──────────────────────────────────────────────────────
 
-fn wg_block(g: & WasmGen, block_id: i64) -> i64 {
+fn wg_block(g: &WasmGen, block_id: i64) -> i64 {
     if HashMap_contains(g.block_index, int_to_str(block_id)) {
         return HashMap_get(g.block_index, int_to_str(block_id));
     }
@@ -1897,14 +1932,14 @@ fn wg_block(g: & WasmGen, block_id: i64) -> i64 {
 }
 
 /// Branch to the loop: the dispatch enters block `target`
-fn wg_jump(g: & mut WasmGen, target: i64) {
+fn wg_jump(g: &mut WasmGen, target: i64) {
     wi32(g, target);
     wlset(g, g.cur);
     wbr(g, g.nblocks - 1 - g.k + g.extra);
 }
 
 /// The epilogue of a return: the frame given back
-fn wg_epilogue(g: & mut WasmGen) {
+fn wg_epilogue(g: &mut WasmGen) {
     if g.frame > 0 {
         wlget(g, g.fp);
         wi64(g, g.frame);
@@ -1913,7 +1948,7 @@ fn wg_epilogue(g: & mut WasmGen) {
     }
 }
 
-fn wg_gen_inst(g: & mut WasmGen, id: i64, inst: Inst, last: bool, func: & IrFunction, module: & IrModule) {
+fn wg_gen_inst(g: &mut WasmGen, id: i64, inst: Inst, last: bool, func: &IrFunction, module: &IrModule) {
     match inst {
         Inst::ConstInt(value, _) => {
             wi64(g, value);
@@ -2250,7 +2285,7 @@ fn wg_gen_inst(g: & mut WasmGen, id: i64, inst: Inst, last: bool, func: & IrFunc
                 srcs.push(args.get(ai));
                 ai = ai + 1;
             }
-            wg_push_srcs(g, & srcs);
+            wg_push_srcs(g, &srcs);
             wget(g, fn_ptr);
             wload(g, 8, false, 0);
             wwrap(g);
@@ -2484,18 +2519,18 @@ fn wg_gen_inst(g: & mut WasmGen, id: i64, inst: Inst, last: bool, func: & IrFunc
         }
         Inst::GradBegin(_) => {
             var gargs: Vec<i64> = Vec::new();
-            wg_call_builtin(g, pe_ir_autograd_builtin(inst), & gargs);
+            wg_call_builtin(g, pe_ir_autograd_builtin(inst), &gargs);
             w(g, 0x1A);
         }
         Inst::GradEnd => {
             var eargs: Vec<i64> = Vec::new();
-            wg_call_builtin(g, pe_ir_autograd_builtin(inst), & eargs);
+            wg_call_builtin(g, pe_ir_autograd_builtin(inst), &eargs);
             w(g, 0x1A);
         }
         Inst::Backward(v) => {
             var bargs: Vec<i64> = Vec::new();
             bargs.push(v);
-            wg_call_builtin(g, pe_ir_autograd_builtin(inst), & bargs);
+            wg_call_builtin(g, pe_ir_autograd_builtin(inst), &bargs);
             w(g, 0x1A);
         }
         Inst::TryUnwrap(_, _, _, _) => {
@@ -2551,10 +2586,16 @@ fn wg_note_id(maxid: i64, id: i64) -> i64 {
 
 // A block's terminator: none (falls into the next block), Jump, Branch,
 // Return / Unreachable / Switch, none in the last block (returns 0)
-const WK_FALL: i64 = 0; const WK_JUMP: i64 = 1; const WK_BRANCH: i64 = 2; const WK_END: i64 = 3; const WK_RET0: i64 = 4;
+const WK_FALL: i64 = 0;
+const WK_JUMP: i64 = 1;
+const WK_BRANCH: i64 = 2;
+const WK_END: i64 = 3;
+const WK_RET0: i64 = 4;
 // The enclosing constructs while writing: an if, block x's loop, the
 // block that merge node x follows
-const WS_IF: i64 = 0; const WS_LOOP: i64 = 1; const WS_BLOCK: i64 = 2;
+const WS_IF: i64 = 0;
+const WS_LOOP: i64 = 1;
+const WS_BLOCK: i64 = 2;
 
 /// The CFG of one function, by block index (func.blocks order; 0 is the
 /// entry), and the state of writing it
@@ -2599,7 +2640,7 @@ fn wg_cfg_index(bidx: i64, block_id: i64) -> i64 {
 /// The CFG of `func`: terminators and successors, reverse postorder from
 /// the entry, immediate dominators (Cooper, Harvey and Kennedy's iteration),
 /// loop headers and merge nodes, and the dominator tree's merge children.
-fn wg_cfg_build(func: & IrFunction) -> WgCfg {
+fn wg_cfg_build(func: &IrFunction) -> WgCfg {
     var nb: i64 = func.blocks.len();
     var bidx: i64 = HashMap_new();
     var i: i64 = 0;
@@ -2798,7 +2839,7 @@ fn wg_cfg_build(func: & IrFunction) -> WgCfg {
                     if nd < 0 {
                         nd = p;
                     } else {
-                        nd = wg_cfg_isect(& c, p, nd);
+                        nd = wg_cfg_isect(&c, p, nd);
                     }
                 }
                 pi = pi + 1;
@@ -2866,7 +2907,7 @@ fn wg_cfg_build(func: & IrFunction) -> WgCfg {
 }
 
 /// The nearest common dominator of reachable blocks a and b.
-fn wg_cfg_isect(c: & WgCfg, a: i64, b: i64) -> i64 {
+fn wg_cfg_isect(c: &WgCfg, a: i64, b: i64) -> i64 {
     var x: i64 = a;
     var y: i64 = b;
     while x != y {
@@ -2880,19 +2921,19 @@ fn wg_cfg_isect(c: & WgCfg, a: i64, b: i64) -> i64 {
     return x;
 }
 
-fn wg_st_push(c: & mut WgCfg, kind: i64, blk: i64) {
+fn wg_st_push(c: &mut WgCfg, kind: i64, blk: i64) {
     c.ctx_kind.push(kind);
     c.ctx_blk.push(blk);
 }
 
-fn wg_st_pop(c: & mut WgCfg) {
+fn wg_st_pop(c: &mut WgCfg) {
     c.ctx_kind.truncate(c.ctx_kind.len() - 1);
     c.ctx_blk.truncate(c.ctx_blk.len() - 1);
 }
 
 /// The depth of the innermost enclosing construct `kind` of block t, -2
 /// when none encloses
-fn wg_st_find(c: & WgCfg, kind: i64, t: i64) -> i64 {
+fn wg_st_find(c: &WgCfg, kind: i64, t: i64) -> i64 {
     var n: i64 = c.ctx_kind.len();
     var i: i64 = n - 1;
     while i >= 0 {
@@ -2908,7 +2949,7 @@ fn wg_st_find(c: & WgCfg, kind: i64, t: i64) -> i64 {
 /// for a back edge, to the block merge node t follows), -1 when t's tree is
 /// written in place, -2 when neither applies (the function then keeps the
 /// switch loop)
-fn wg_st_depth(c: & WgCfg, s: i64, t: i64) -> i64 {
+fn wg_st_depth(c: &WgCfg, s: i64, t: i64) -> i64 {
     if c.rnum.get(t) <= c.rnum.get(s) {
         return wg_st_find(c, WS_LOOP, t);
     }
@@ -2922,7 +2963,7 @@ fn wg_st_depth(c: & WgCfg, s: i64, t: i64) -> i64 {
 }
 
 /// Take the edge s -> t
-fn wg_st_goto(g: & mut WasmGen, c: & mut WgCfg, s: i64, t: i64, func: & IrFunction, module: & IrModule) {
+fn wg_st_goto(g: &mut WasmGen, c: &mut WgCfg, s: i64, t: i64, func: &IrFunction, module: &IrModule) {
     var d: i64 = wg_st_depth(c, s, t);
     if d >= 0 {
         wbr(g, d);
@@ -2936,7 +2977,7 @@ fn wg_st_goto(g: & mut WasmGen, c: & mut WgCfg, s: i64, t: i64, func: & IrFuncti
 
 /// Block x and what it dominates: [loop] x's merge children's blocks
 /// around x's code, each child's tree after its block [end]
-fn wg_st_tree(g: & mut WasmGen, c: & mut WgCfg, x: i64, func: & IrFunction, module: & IrModule) {
+fn wg_st_tree(g: &mut WasmGen, c: &mut WgCfg, x: i64, func: &IrFunction, module: &IrModule) {
     if !c.ok || c.done.get(x) == 1 {
         c.ok = false;
         w(g, 0x00);
@@ -2956,7 +2997,7 @@ fn wg_st_tree(g: & mut WasmGen, c: & mut WgCfg, x: i64, func: & IrFunction, modu
 }
 
 /// Merge child y of x (and the later ones in the list) around x's code
-fn wg_st_within(g: & mut WasmGen, c: & mut WgCfg, x: i64, y: i64, func: & IrFunction, module: & IrModule) {
+fn wg_st_within(g: &mut WasmGen, c: &mut WgCfg, x: i64, y: i64, func: &IrFunction, module: &IrModule) {
     if !c.ok {
         return;
     }
@@ -2974,7 +3015,7 @@ fn wg_st_within(g: & mut WasmGen, c: & mut WgCfg, x: i64, y: i64, func: & IrFunc
 }
 
 /// Block x's instructions up to its terminator, then the terminator
-fn wg_st_code(g: & mut WasmGen, c: & mut WgCfg, x: i64, func: & IrFunction, module: & IrModule) {
+fn wg_st_code(g: &mut WasmGen, c: &mut WgCfg, x: i64, func: &IrFunction, module: &IrModule) {
     var block: BasicBlock = func.blocks.get(x);
     var pos: i64 = c.tpos.get(x);
     var ii: i64 = 0;
@@ -3048,7 +3089,7 @@ fn wg_st_code(g: & mut WasmGen, c: & mut WgCfg, x: i64, func: & IrFunction, modu
 }
 
 /// The body of IR function `func`: its locals, the frame, the blocks.
-fn wg_gen_function(g: & mut WasmGen, name: str, func: & IrFunction, module: & IrModule) {
+fn wg_gen_function(g: &mut WasmGen, name: str, func: &IrFunction, module: &IrModule) {
     g.cur_name = name;
     // The runtime's arithmetic wraps, as pe_ir's and nat_ir's does
     g.cur_wrapping = func.is_wrapping || is_pe_runtime_fn(name);
@@ -3204,7 +3245,7 @@ fn wg_gen_function(g: & mut WasmGen, name: str, func: & IrFunction, module: & Ir
         var st_mark: i64 = g.b.len();
         var cfg: WgCfg = wg_cfg_build(func);
         if cfg.ok {
-            wg_st_tree(g, & mut cfg, 0, func, module);
+            wg_st_tree(g, &mut cfg, 0, func, module);
         }
         if cfg.ok {
             // every path ended in a return, a br or a trap
@@ -3360,7 +3401,7 @@ fn wg_gen_function(g: & mut WasmGen, name: str, func: & IrFunction, module: & Ir
 }
 
 /// The body of primitive `name` (its parameters are locals 0..n)
-fn wg_gen_primitive(g: & mut WasmGen, name: str) {
+fn wg_gen_primitive(g: &mut WasmGen, name: str) {
     g.cur_name = name;
     g.b = Vec::new();
     g.extra = 0;
@@ -3610,12 +3651,12 @@ fn wg_gen_primitive(g: & mut WasmGen, name: str) {
         w(g, 0xA1);
         w(g, 0x99);
         w(g, 0x44);
-        wb_f64_half(& mut g.b);
+        wb_f64_half(&mut g.b);
         w(g, 0x66);
         wif_t(g, 0x7C);
         wlget(g, t);
         w(g, 0x44);
-        wb_f64_one(& mut g.b);
+        wb_f64_one(&mut g.b);
         wlget(g, x);
         w(g, 0xA6);
         w(g, 0xA0);
@@ -3650,7 +3691,7 @@ fn wg_gen_primitive(g: & mut WasmGen, name: str) {
     wend(g);
 }
 
-fn wb_f64_bits(out: & mut Vec<i64>, bits: i64) {
+fn wb_f64_bits(out: &mut Vec<i64>, bits: i64) {
     var i: i64 = 0;
     while i < 8 {
         out.push((bits >> (i * 8)) & 0xFF);
@@ -3658,16 +3699,16 @@ fn wb_f64_bits(out: & mut Vec<i64>, bits: i64) {
     }
 }
 
-fn wb_f64_half(out: & mut Vec<i64>) {
+fn wb_f64_half(out: &mut Vec<i64>) {
     wb_f64_bits(out, 4602678819172646912);
 }
 
-fn wb_f64_one(out: & mut Vec<i64>) {
+fn wb_f64_one(out: &mut Vec<i64>) {
     wb_f64_bits(out, 4607182418800017408);
 }
 
 /// _start: pe_rt_init, main(env 0), proc_exit(its result)
-fn wg_gen_start(g: & mut WasmGen, exit_ix: i64) {
+fn wg_gen_start(g: &mut WasmGen, exit_ix: i64) {
     g.cur_name = "_start";
     g.b = Vec::new();
     g.extra = 0;
@@ -3771,7 +3812,7 @@ fn wg_gen_start(g: & mut WasmGen, exit_ix: i64) {
 
 /// The dyn types: every type made into a dyn value or named by a trait
 /// impl, sorted (as pe_ir and nat_ir find DynCall candidates).
-fn wg_collect_dyn_types(g: & mut WasmGen, module: & IrModule) {
+fn wg_collect_dyn_types(g: &mut WasmGen, module: &IrModule) {
     var types: Vec<str> = Vec::new();
     var ti: i64 = 0;
     while ti < module.trait_impls.len() {
@@ -3804,7 +3845,7 @@ fn wg_collect_dyn_types(g: & mut WasmGen, module: & IrModule) {
 
 /// The values of the globals, the panic-trace table (empty: no frames to
 /// walk here) and the table of functions named by strings.
-fn wg_finish_data(g: & mut WasmGen, module: & IrModule) -> Vec<i64> {
+fn wg_finish_data(g: &mut WasmGen, module: &IrModule) -> Vec<i64> {
     var gi: i64 = 0;
     while gi < g.globs.len() {
         var gname: str = g.globs.get(gi);
@@ -3879,7 +3920,7 @@ fn wg_finish_data(g: & mut WasmGen, module: & IrModule) -> Vec<i64> {
 }
 
 /// The type section's entry for signature key `key`
-fn wb_functype(out: & mut Vec<i64>, key: str) {
+fn wb_functype(out: &mut Vec<i64>, key: str) {
     var gt: i64 = str_find(key, ">");
     out.push(0x60);
     wb_uleb(out, gt);
@@ -3905,7 +3946,7 @@ fn wb_functype(out: & mut Vec<i64>, key: str) {
     }
 }
 
-fn wb_global_i64(out: & mut Vec<i64>, mutable: bool, v: i64) {
+fn wb_global_i64(out: &mut Vec<i64>, mutable: bool, v: i64) {
     out.push(WT_I64);
     if mutable {
         out.push(1);
@@ -3939,21 +3980,21 @@ fn wg_switch_only() -> bool {
 
 /// The "name" custom section (id 0) with its function-names subsection
 /// (id 1): function index i is named names[i] (imports first, as indexed)
-fn wb_name_section(out: & mut Vec<i64>, names: & Vec<str>) {
+fn wb_name_section(out: &mut Vec<i64>, names: &Vec<str>) {
     var sub: Vec<i64> = Vec::new();
-    wb_uleb(& mut sub, names.len());
+    wb_uleb(&mut sub, names.len());
     var i: i64 = 0;
     while i < names.len() {
-        wb_uleb(& mut sub, i);
-        wb_name(& mut sub, names.get(i));
+        wb_uleb(&mut sub, i);
+        wb_name(&mut sub, names.get(i));
         i = i + 1;
     }
     var contents: Vec<i64> = Vec::new();
-    wb_name(& mut contents, "name");
+    wb_name(&mut contents, "name");
     contents.push(1);
-    wb_uleb(& mut contents, sub.len());
-    wb_append(& mut contents, & sub);
-    wb_section(out, 0, & contents);
+    wb_uleb(&mut contents, sub.len());
+    wb_append(&mut contents, &sub);
+    wb_section(out, 0, &contents);
 }
 
 // ─── Public entry points ───────────────────────────────────────────────
@@ -3961,7 +4002,7 @@ fn wb_name_section(out: & mut Vec<i64>, names: & Vec<str>) {
 /// A WASI module from an IR module that has the Linux runtime and its
 /// WASI layer (stdlib/linux_runtime/wasi.fd) merged in.
 pub fn wasm_generate(module: IrModule) -> ResultBytes {
-    if !pe_module_has_fn(& module, "main") {
+    if !pe_module_has_fn(&module, "main") {
         return ResultBytes::Err(c_vec1("wasm backend: the program has no `main` function"));
     }
     var g: WasmGen = WasmGen_new();
@@ -3972,10 +4013,10 @@ pub fn wasm_generate(module: IrModule) -> ResultBytes {
         HashMap_insert(g.all_fns, fe.name, fe.func.params.len() + 1);
         fi = fi + 1;
     }
-    if !wg_has_fn(& g, "pe_wasi_syscall") {
+    if !wg_has_fn(&g, "pe_wasi_syscall") {
         return ResultBytes::Err(c_vec1("wasm backend: the WASI layer of the runtime (stdlib/linux_runtime/wasi.fd) is not merged"));
     }
-    wg_collect_dyn_types(& mut g, & module);
+    wg_collect_dyn_types(&mut g, &module);
     // extern "C" functions; the WASI ones are imports, proc_exit always
     var ei: i64 = 0;
     while ei < module.extern_decls.len() {
@@ -4004,56 +4045,56 @@ pub fn wasm_generate(module: IrModule) -> ResultBytes {
     // Stack switching (see "Tasks"): the functions that may give control
     // away, and the running program's context record (its frames are
     // saved from the bottom of the stack up)
-    wg_as_analyze(& mut g, & module);
-    wg_data_align(& mut g);
+    wg_as_analyze(&mut g, &module);
+    wg_data_align(&mut g);
     g.main_rec = WG_DATA_BASE + g.data.len();
     var mr: i64 = 0;
     while mr < 128 {
         g.data.push(0);
         mr = mr + 1;
     }
-    wg_data_word(& mut g, g.main_rec, WG_STACK_LO);
+    wg_data_word(&mut g, g.main_rec, WG_STACK_LO);
     var imp_types: Vec<i64> = Vec::new();
     var ii: i64 = 0;
     while ii < g.imp_names.len() {
-        imp_types.push(wg_type(& mut g, g.imp_sigs.get(ii)));
+        imp_types.push(wg_type(&mut g, g.imp_sigs.get(ii)));
         ii = ii + 1;
     }
     // _start is the first function defined
-    var start_type: i64 = wg_type(& mut g, ">");
+    var start_type: i64 = wg_type(&mut g, ">");
     HashMap_insert(g.fn_index, "_start", g.n_imports);
     g.def_types.push(start_type);
     var code: Vec<i64> = Vec::new();
     var nbodies: i64 = 0;
-    wg_gen_start(& mut g, HashMap_get(g.imp_index, "wasi_proc_exit") - 1);
-    wb_uleb(& mut code, g.b.len());
-    wb_append(& mut code, & g.b);
+    wg_gen_start(&mut g, HashMap_get(g.imp_index, "wasi_proc_exit") - 1);
+    wb_uleb(&mut code, g.b.len());
+    wb_append(&mut code, &g.b);
     nbodies = nbodies + 1;
     // Compile what _start reaches, as calls are met
     var qi: i64 = 0;
     while qi < g.queue.len() {
         var name: str = g.queue.get(qi);
-        if wg_has_fn(& g, name) {
-            match IrModule_get_function(& module, name) {
+        if wg_has_fn(&g, name) {
+            match IrModule_get_function(&module, name) {
                 OptIrFunction::Some(func) => {
-                    wg_gen_function(& mut g, name, & func, & module);
+                    wg_gen_function(&mut g, name, &func, &module);
                 }
                 OptIrFunction::None => {
                     g.b = Vec::new();
-                    wu(& mut g, 0);
-                    w(& mut g, 0x00);
-                    wend(& mut g);
+                    wu(&mut g, 0);
+                    w(&mut g, 0x00);
+                    wend(&mut g);
                 }
             }
         } else {
-            wg_gen_primitive(& mut g, name);
+            wg_gen_primitive(&mut g, name);
         }
-        wb_uleb(& mut code, g.b.len());
-        wb_append(& mut code, & g.b);
+        wb_uleb(&mut code, g.b.len());
+        wb_append(&mut code, &g.b);
         nbodies = nbodies + 1;
         qi = qi + 1;
     }
-    var tabs: Vec<i64> = wg_finish_data(& mut g, & module);
+    var tabs: Vec<i64> = wg_finish_data(&mut g, &module);
     // The panic trace table and the named-function table may queue no
     // functions (their entries were queued when named)
     if g.unresolved.len() > 0 {
@@ -4074,105 +4115,105 @@ pub fn wasm_generate(module: IrModule) -> ResultBytes {
     m.push(0);
     // Types
     var sec: Vec<i64> = Vec::new();
-    wb_uleb(& mut sec, g.type_keys.len());
+    wb_uleb(&mut sec, g.type_keys.len());
     var ti: i64 = 0;
     while ti < g.type_keys.len() {
-        wb_functype(& mut sec, g.type_keys.get(ti));
+        wb_functype(&mut sec, g.type_keys.get(ti));
         ti = ti + 1;
     }
-    wb_section(& mut m, SEC_TYPE, & sec);
+    wb_section(&mut m, SEC_TYPE, &sec);
     // Imports
     sec = Vec::new();
-    wb_uleb(& mut sec, g.n_imports);
+    wb_uleb(&mut sec, g.n_imports);
     ii = 0;
     while ii < g.n_imports {
-        wb_name(& mut sec, "wasi_snapshot_preview1");
-        wb_name(& mut sec, g.imp_names.get(ii));
+        wb_name(&mut sec, "wasi_snapshot_preview1");
+        wb_name(&mut sec, g.imp_names.get(ii));
         sec.push(0x00);
-        wb_uleb(& mut sec, imp_types.get(ii));
+        wb_uleb(&mut sec, imp_types.get(ii));
         ii = ii + 1;
     }
-    wb_section(& mut m, SEC_IMPORT, & sec);
+    wb_section(&mut m, SEC_IMPORT, &sec);
     // Functions
     sec = Vec::new();
-    wb_uleb(& mut sec, g.def_types.len());
+    wb_uleb(&mut sec, g.def_types.len());
     var di: i64 = 0;
     while di < g.def_types.len() {
-        wb_uleb(& mut sec, g.def_types.get(di));
+        wb_uleb(&mut sec, g.def_types.get(di));
         di = di + 1;
     }
-    wb_section(& mut m, SEC_FUNCTION, & sec);
+    wb_section(&mut m, SEC_FUNCTION, &sec);
     // Table (funcref; index 0 is null)
     sec = Vec::new();
-    wb_uleb(& mut sec, 1);
+    wb_uleb(&mut sec, 1);
     sec.push(0x70);
     sec.push(0x00);
-    wb_uleb(& mut sec, g.table.len() + 1);
-    wb_section(& mut m, SEC_TABLE, & sec);
+    wb_uleb(&mut sec, g.table.len() + 1);
+    wb_section(&mut m, SEC_TABLE, &sec);
     // Memory: the stack, the data, a page to spare
     var data_end: i64 = WG_DATA_BASE + g.data.len();
     var pages: i64 = (data_end + 65535) / 65536 + 1;
     sec = Vec::new();
-    wb_uleb(& mut sec, 1);
+    wb_uleb(&mut sec, 1);
     sec.push(0x00);
-    wb_uleb(& mut sec, pages);
-    wb_section(& mut m, SEC_MEMORY, & sec);
+    wb_uleb(&mut sec, pages);
+    wb_section(&mut m, SEC_MEMORY, &sec);
     // Globals: 0 the stack pointer, 1 the thread block, 2 the named
     // functions' table, 3 the panic-trace table; stack switching's 4 the
     // state, 5 the end of the saved frames, 6 the running context, 7 the
     // context to enter
     sec = Vec::new();
-    wb_uleb(& mut sec, 8);
-    wb_global_i64(& mut sec, true, WG_STACK_TOP);
-    wb_global_i64(& mut sec, true, 0);
-    wb_global_i64(& mut sec, false, tabs.get(1));
-    wb_global_i64(& mut sec, false, tabs.get(0));
-    wb_global_i64(& mut sec, true, 0);
-    wb_global_i64(& mut sec, true, 0);
-    wb_global_i64(& mut sec, true, g.main_rec);
-    wb_global_i64(& mut sec, true, 0);
-    wb_section(& mut m, SEC_GLOBAL, & sec);
+    wb_uleb(&mut sec, 8);
+    wb_global_i64(&mut sec, true, WG_STACK_TOP);
+    wb_global_i64(&mut sec, true, 0);
+    wb_global_i64(&mut sec, false, tabs.get(1));
+    wb_global_i64(&mut sec, false, tabs.get(0));
+    wb_global_i64(&mut sec, true, 0);
+    wb_global_i64(&mut sec, true, 0);
+    wb_global_i64(&mut sec, true, g.main_rec);
+    wb_global_i64(&mut sec, true, 0);
+    wb_section(&mut m, SEC_GLOBAL, &sec);
     // Exports
     sec = Vec::new();
-    wb_uleb(& mut sec, 2);
-    wb_name(& mut sec, "memory");
+    wb_uleb(&mut sec, 2);
+    wb_name(&mut sec, "memory");
     sec.push(0x02);
-    wb_uleb(& mut sec, 0);
-    wb_name(& mut sec, "_start");
+    wb_uleb(&mut sec, 0);
+    wb_name(&mut sec, "_start");
     sec.push(0x00);
-    wb_uleb(& mut sec, g.n_imports);
-    wb_section(& mut m, SEC_EXPORT, & sec);
+    wb_uleb(&mut sec, g.n_imports);
+    wb_section(&mut m, SEC_EXPORT, &sec);
     // Elements: the table from index 1
     if g.table.len() > 0 {
         sec = Vec::new();
-        wb_uleb(& mut sec, 1);
+        wb_uleb(&mut sec, 1);
         sec.push(0x00);
         sec.push(0x41);
         sec.push(0x01);
         sec.push(0x0B);
-        wb_uleb(& mut sec, g.table.len());
+        wb_uleb(&mut sec, g.table.len());
         var tj: i64 = 0;
         while tj < g.table.len() {
-            wb_uleb(& mut sec, g.table.get(tj));
+            wb_uleb(&mut sec, g.table.get(tj));
             tj = tj + 1;
         }
-        wb_section(& mut m, SEC_ELEM, & sec);
+        wb_section(&mut m, SEC_ELEM, &sec);
     }
     // Code
     sec = Vec::new();
-    wb_uleb(& mut sec, nbodies);
-    wb_append(& mut sec, & code);
-    wb_section(& mut m, SEC_CODE, & sec);
+    wb_uleb(&mut sec, nbodies);
+    wb_append(&mut sec, &code);
+    wb_section(&mut m, SEC_CODE, &sec);
     // Data: one segment at WG_DATA_BASE
     sec = Vec::new();
-    wb_uleb(& mut sec, 1);
+    wb_uleb(&mut sec, 1);
     sec.push(0x00);
     sec.push(0x41);
-    wb_sleb(& mut sec, WG_DATA_BASE);
+    wb_sleb(&mut sec, WG_DATA_BASE);
     sec.push(0x0B);
-    wb_uleb(& mut sec, g.data.len());
-    wb_append(& mut sec, & g.data);
-    wb_section(& mut m, SEC_DATA, & sec);
+    wb_uleb(&mut sec, g.data.len());
+    wb_append(&mut sec, &g.data);
+    wb_section(&mut m, SEC_DATA, &sec);
     // The "name" custom section (DB10): every function's name, for
     // wasm-objdump, wasm-tools, Node's traces; FID_NAT_OFF=debug leaves it out
     if wg_debug_on() {
@@ -4188,7 +4229,7 @@ pub fn wasm_generate(module: IrModule) -> ResultBytes {
             fnames.push(g.queue.get(qi));
             qi = qi + 1;
         }
-        wb_name_section(& mut m, & fnames);
+        wb_name_section(&mut m, &fnames);
     }
     p_eprint_str("[wasm] " + int_to_str(nbodies) + " functions, " + int_to_str(g.data.len()) + " bytes of data, " + int_to_str(m.len()) + " bytes\n");
     p_eprint_str("[wasm] control flow: " + int_to_str(g.cf_struct) + " structured, " + int_to_str(g.cf_task + g.cf_irred + g.cf_forced) + " switch loops (" + int_to_str(g.cf_task) + " tasks, " + int_to_str(g.cf_irred) + " irreducible, " + int_to_str(g.cf_forced) + " FID_WASM_SWITCH)\n");

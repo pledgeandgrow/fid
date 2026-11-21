@@ -21,7 +21,8 @@
 // map in a kernel). Tests play the NIC's side with the same descriptor
 // functions.
 module e1000;
- use vec; use vmm;
+use vec;
+use vmm;
 
 pub const E1K_CTRL: i64 = 0x0000;
 pub const E1K_STATUS: i64 = 0x0008;
@@ -132,13 +133,27 @@ pub const TXD_STAT_DD: i64 = 0x01;
 /// RCTL.BSIZE bits for a receive buffer size (256..16384), with BSEX for
 /// the extended sizes; -1 when the size is not one the NIC supports.
 pub fn e1k_rctl_bsize(size: i64) -> i64 {
-    if size == 2048 { return 0; }
-    if size == 1024 { return 1 << 16; }
-    if size == 512 { return 2 << 16; }
-    if size == 256 { return 3 << 16; }
-    if size == 16384 { return (1 << 16) | RCTL_BSEX; }
-    if size == 8192 { return (2 << 16) | RCTL_BSEX; }
-    if size == 4096 { return (3 << 16) | RCTL_BSEX; }
+    if size == 2048 {
+        return 0;
+    }
+    if size == 1024 {
+        return 1 << 16;
+    }
+    if size == 512 {
+        return 2 << 16;
+    }
+    if size == 256 {
+        return 3 << 16;
+    }
+    if size == 16384 {
+        return (1 << 16) | RCTL_BSEX;
+    }
+    if size == 8192 {
+        return (2 << 16) | RCTL_BSEX;
+    }
+    if size == 4096 {
+        return (3 << 16) | RCTL_BSEX;
+    }
     return -1;
 }
 
@@ -146,7 +161,9 @@ pub fn e1k_rctl_bsize(size: i64) -> i64 {
 /// 15, collision distance 64 (512 for half duplex).
 pub fn e1k_tctl(full_duplex: bool) -> i64 {
     var cold: i64 = 0x40;
-    if !full_duplex { cold = 0x200; }
+    if !full_duplex {
+        cold = 0x200;
+    }
     return TCTL_EN | TCTL_PSP | (0x0F << 4) | (cold << 12);
 }
 
@@ -158,8 +175,12 @@ pub fn e1k_tipg() -> i64 {
 /// Link speed in Mb/s from STATUS bits 7:6.
 pub fn e1k_link_speed(status: i64) -> i64 {
     var s: i64 = (status >> 6) & 3;
-    if s == 0 { return 10; }
-    if s == 1 { return 100; }
+    if s == 0 {
+        return 10;
+    }
+    if s == 1 {
+        return 100;
+    }
     return 1000;
 }
 
@@ -170,12 +191,12 @@ pub struct E1000Bus {
     pub wr: fn(i64, i64) -> void,
 }
 
-pub fn e1k_rd(b: & E1000Bus, off: i64) -> i64 {
+pub fn e1k_rd(b: &E1000Bus, off: i64) -> i64 {
     val f = b.rd;
     return f(off) & 0xFFFFFFFF;
 }
 
-pub fn e1k_wr(b: & E1000Bus, off: i64, v: i64) {
+pub fn e1k_wr(b: &E1000Bus, off: i64, v: i64) {
     val f = b.wr;
     f(off, v & 0xFFFFFFFF);
 }
@@ -185,7 +206,7 @@ pub fn e1k_wr(b: & E1000Bus, off: i64, v: i64) {
 /// One EEPROM word through EERD. small = the 82541/82547 layout (DONE
 /// bit 1, address from bit 2); otherwise the 82540 one (DONE bit 4,
 /// address from bit 8). -1 when DONE never comes.
-pub fn e1k_eeprom_read(b: & E1000Bus, addr: i64, small: bool, spins: i64) -> i64 {
+pub fn e1k_eeprom_read(b: &E1000Bus, addr: i64, small: bool, spins: i64) -> i64 {
     var done: i64 = 0x10;
     var shift: i64 = 8;
     if small {
@@ -204,7 +225,7 @@ pub fn e1k_eeprom_read(b: & E1000Bus, addr: i64, small: bool, spins: i64) -> i64
     return -1;
 }
 
-fn e1k_ee_clock(b: & E1000Bus, v: i64) -> i64 {
+fn e1k_ee_clock(b: &E1000Bus, v: i64) -> i64 {
     e1k_wr(b, E1K_EECD, v | EECD_SK);
     var r: i64 = e1k_rd(b, E1K_EECD);
     e1k_wr(b, E1K_EECD, v & ~EECD_SK);
@@ -215,7 +236,7 @@ fn e1k_ee_clock(b: & E1000Bus, v: i64) -> i64 {
 /// and wait for the grant, select, shift out READ (110b) and the address
 /// (abits bits, 6 for a 93C46), shift in 16 data bits (MSB first),
 /// deselect and release. -1 when the grant does not come.
-pub fn e1k_eeprom_read_bitbang(b: & E1000Bus, addr: i64, abits: i64, spins: i64) -> i64 {
+pub fn e1k_eeprom_read_bitbang(b: &E1000Bus, addr: i64, abits: i64, spins: i64) -> i64 {
     var base: i64 = e1k_rd(b, E1K_EECD) & ~(EECD_SK | EECD_DI | EECD_CS);
     e1k_wr(b, E1K_EECD, base | EECD_REQ);
     var g: i64 = 0;
@@ -234,7 +255,9 @@ pub fn e1k_eeprom_read_bitbang(b: & E1000Bus, addr: i64, abits: i64, spins: i64)
     while i >= 0 {
         var bit: i64 = (cmd >> i) & 1;
         var d: i64 = v & ~EECD_DI;
-        if bit != 0 { d = d | EECD_DI; }
+        if bit != 0 {
+            d = d | EECD_DI;
+        }
         e1k_wr(b, E1K_EECD, d);
         e1k_ee_clock(b, d);
         i = i - 1;
@@ -301,7 +324,9 @@ pub fn e1k_mac_str(mac: Vec<i64>) -> str {
     var b: Vec<i64> = Vec::new();
     var i: i64 = 0;
     while i < 6 {
-        if i > 0 { b.push(58); }
+        if i > 0 {
+            b.push(58);
+        }
         b.push(str_byte_at(hexd, (mac.get(i) >> 4) & 15));
         b.push(str_byte_at(hexd, mac.get(i) & 15));
         i = i + 1;
@@ -336,13 +361,13 @@ pub struct TxDesc {
     pub special: i64,
 }
 
-pub fn e1k_rx_desc_read(m: & PhysMem, pa: i64) -> RxDesc {
+pub fn e1k_rx_desc_read(m: &PhysMem, pa: i64) -> RxDesc {
     return RxDesc {
         addr: phys_read64(m, pa), len: phys_read_le(m, pa + 8, 2), csum: phys_read_le(m, pa + 10, 2), status: phys_read8(m, pa + 12), errors: phys_read8(m, pa + 13), special: phys_read_le(m, pa + 14, 2)
     };
 }
 
-pub fn e1k_rx_desc_write(m: & mut PhysMem, pa: i64, d: RxDesc) {
+pub fn e1k_rx_desc_write(m: &mut PhysMem, pa: i64, d: RxDesc) {
     phys_write64(m, pa, d.addr);
     phys_write_le(m, pa + 8, 2, d.len);
     phys_write_le(m, pa + 10, 2, d.csum);
@@ -351,13 +376,13 @@ pub fn e1k_rx_desc_write(m: & mut PhysMem, pa: i64, d: RxDesc) {
     phys_write_le(m, pa + 14, 2, d.special);
 }
 
-pub fn e1k_tx_desc_read(m: & PhysMem, pa: i64) -> TxDesc {
+pub fn e1k_tx_desc_read(m: &PhysMem, pa: i64) -> TxDesc {
     return TxDesc {
         addr: phys_read64(m, pa), len: phys_read_le(m, pa + 8, 2), cso: phys_read8(m, pa + 10), cmd: phys_read8(m, pa + 11), status: phys_read8(m, pa + 12) & 15, css: phys_read8(m, pa + 13), special: phys_read_le(m, pa + 14, 2)
     };
 }
 
-pub fn e1k_tx_desc_write(m: & mut PhysMem, pa: i64, d: TxDesc) {
+pub fn e1k_tx_desc_write(m: &mut PhysMem, pa: i64, d: TxDesc) {
     phys_write64(m, pa, d.addr);
     phys_write_le(m, pa + 8, 2, d.len);
     phys_write8(m, pa + 10, d.cso);
@@ -394,7 +419,9 @@ pub fn e1k_new(mem_base: i64, n: i64, buf_size: i64) -> E1000 {
     var tx_ring: i64 = rx_ring + n * 16;
     var rx_buf: i64 = tx_ring + n * 16;
     var tx_buf: i64 = rx_buf + n * buf_size;
-    return E1000 { mac: Vec::new(), rx_ring: rx_ring, rx_count: n, rx_buf: rx_buf, buf_size: buf_size, rx_next: 0, tx_ring: tx_ring, tx_count: n, tx_buf: tx_buf, tx_tail: 0, tx_clean: 0, rx_packets: 0, rx_errors: 0, tx_packets: 0 };
+    return E1000 {
+        mac: Vec::new(), rx_ring: rx_ring, rx_count: n, rx_buf: rx_buf, buf_size: buf_size, rx_next: 0, tx_ring: tx_ring, tx_count: n, tx_buf: tx_buf, tx_tail: 0, tx_clean: 0, rx_packets: 0, rx_errors: 0, tx_packets: 0
+    };
 }
 
 /// Bytes of DMA memory e1k_new lays out.
@@ -405,7 +432,7 @@ pub fn e1k_mem_size(n: i64, buf_size: i64) -> i64 {
 /// Bring the NIC up. Reads the MAC from RAL0/RAH0 when the firmware set
 /// it (AV), else from the EEPROM. Returns false when the reset does not
 /// finish.
-pub fn e1k_init(e: & mut E1000, b: & E1000Bus, m: & mut PhysMem, promisc: bool, spins: i64) -> bool {
+pub fn e1k_init(e: &mut E1000, b: &E1000Bus, m: &mut PhysMem, promisc: bool, spins: i64) -> bool {
     e1k_wr(b, E1K_IMC, 0xFFFFFFFF);
     e1k_wr(b, E1K_CTRL, e1k_rd(b, E1K_CTRL) | CTRL_RST);
     var i: i64 = 0;
@@ -442,7 +469,9 @@ pub fn e1k_init(e: & mut E1000, b: & E1000Bus, m: & mut PhysMem, promisc: bool, 
     // receive ring: every descriptor owns a buffer, all handed to the NIC
     var d: i64 = 0;
     while d < e.rx_count {
-        e1k_rx_desc_write(m, e.rx_ring + d * 16, RxDesc { addr: e.rx_buf + d * e.buf_size, len: 0, csum: 0, status: 0, errors: 0, special: 0 });
+        e1k_rx_desc_write(m, e.rx_ring + d * 16, RxDesc {
+            addr: e.rx_buf + d * e.buf_size, len: 0, csum: 0, status: 0, errors: 0, special: 0
+        });
         d = d + 1;
     }
     e1k_wr(b, E1K_RDBAL, e.rx_ring & 0xFFFFFFFF);
@@ -457,7 +486,9 @@ pub fn e1k_init(e: & mut E1000, b: & E1000Bus, m: & mut PhysMem, promisc: bool, 
     e1k_wr(b, E1K_RCTL, rctl);
     d = 0;
     while d < e.tx_count {
-        e1k_tx_desc_write(m, e.tx_ring + d * 16, TxDesc { addr: e.tx_buf + d * e.buf_size, len: 0, cso: 0, cmd: 0, status: TXD_STAT_DD, css: 0, special: 0 });
+        e1k_tx_desc_write(m, e.tx_ring + d * 16, TxDesc {
+            addr: e.tx_buf + d * e.buf_size, len: 0, cso: 0, cmd: 0, status: TXD_STAT_DD, css: 0, special: 0
+        });
         d = d + 1;
     }
     e1k_wr(b, E1K_TDBAL, e.tx_ring & 0xFFFFFFFF);
@@ -476,7 +507,7 @@ pub fn e1k_init(e: & mut E1000, b: & E1000Bus, m: & mut PhysMem, promisc: bool, 
 }
 
 /// Reclaim transmitted descriptors (DD set); returns how many.
-pub fn e1k_tx_reclaim(e: & mut E1000, m: & PhysMem) -> i64 {
+pub fn e1k_tx_reclaim(e: &mut E1000, m: &PhysMem) -> i64 {
     var n: i64 = 0;
     while e.tx_clean != e.tx_tail {
         var d: TxDesc = e1k_tx_desc_read(m, e.tx_ring + e.tx_clean * 16);
@@ -491,7 +522,7 @@ pub fn e1k_tx_reclaim(e: & mut E1000, m: & PhysMem) -> i64 {
 
 /// Queue one frame (bytes, without the FCS: the NIC appends it). Returns
 /// false when the ring is full or the frame does not fit a buffer.
-pub fn e1k_transmit(e: & mut E1000, b: & E1000Bus, m: & mut PhysMem, frame: Vec<i64>) -> bool {
+pub fn e1k_transmit(e: &mut E1000, b: &E1000Bus, m: &mut PhysMem, frame: Vec<i64>) -> bool {
     if frame.len() > e.buf_size || frame.len() == 0 {
         return false;
     }
@@ -502,7 +533,9 @@ pub fn e1k_transmit(e: & mut E1000, b: & E1000Bus, m: & mut PhysMem, frame: Vec<
     }
     var buf: i64 = e.tx_buf + e.tx_tail * e.buf_size;
     phys_write_bytes(m, buf, frame);
-    e1k_tx_desc_write(m, e.tx_ring + e.tx_tail * 16, TxDesc { addr: buf, len: frame.len(), cso: 0, cmd: TXD_CMD_EOP | TXD_CMD_IFCS | TXD_CMD_RS, status: 0, css: 0, special: 0 });
+    e1k_tx_desc_write(m, e.tx_ring + e.tx_tail * 16, TxDesc {
+        addr: buf, len: frame.len(), cso: 0, cmd: TXD_CMD_EOP | TXD_CMD_IFCS | TXD_CMD_RS, status: 0, css: 0, special: 0
+    });
     e.tx_tail = next;
     e1k_wr(b, E1K_TDT, e.tx_tail);
     e.tx_packets = e.tx_packets + 1;
@@ -520,8 +553,10 @@ pub struct RxResult {
 /// descriptor and gives it back to the NIC through RDT. Frames with
 /// receive errors are dropped (got = true, frame empty, errors set);
 /// a frame larger than one buffer (no EOP) is dropped too.
-pub fn e1k_receive(e: & mut E1000, b: & E1000Bus, m: & mut PhysMem) -> RxResult {
-    var r: RxResult = RxResult { got: false, frame: Vec::new(), status: 0, errors: 0 };
+pub fn e1k_receive(e: &mut E1000, b: &E1000Bus, m: &mut PhysMem) -> RxResult {
+    var r: RxResult = RxResult {
+        got: false, frame: Vec::new(), status: 0, errors: 0
+    };
     var pa: i64 = e.rx_ring + e.rx_next * 16;
     var d: RxDesc = e1k_rx_desc_read(m, pa);
     if (d.status & RXD_STAT_DD) == 0 {
@@ -537,23 +572,25 @@ pub fn e1k_receive(e: & mut E1000, b: & E1000Bus, m: & mut PhysMem) -> RxResult 
     } else {
         e.rx_errors = e.rx_errors + 1;
     }
-    e1k_rx_desc_write(m, pa, RxDesc { addr: d.addr, len: 0, csum: 0, status: 0, errors: 0, special: 0 });
+    e1k_rx_desc_write(m, pa, RxDesc {
+        addr: d.addr, len: 0, csum: 0, status: 0, errors: 0, special: 0
+    });
     e1k_wr(b, E1K_RDT, e.rx_next);
     e.rx_next = (e.rx_next + 1) % e.rx_count;
     return r;
 }
 
 /// Read and clear the interrupt causes.
-pub fn e1k_irq_causes(b: & E1000Bus) -> i64 {
+pub fn e1k_irq_causes(b: &E1000Bus) -> i64 {
     return e1k_rd(b, E1K_ICR);
 }
 
-pub fn e1k_link_up(b: & E1000Bus) -> bool {
+pub fn e1k_link_up(b: &E1000Bus) -> bool {
     return (e1k_rd(b, E1K_STATUS) & STATUS_LU) != 0;
 }
 
 /// Set the multicast table bit for a group address.
-pub fn e1k_mta_add(b: & E1000Bus, mac: Vec<i64>) {
+pub fn e1k_mta_add(b: &E1000Bus, mac: Vec<i64>) {
     var bit: i64 = e1k_mta_bit(mac);
     var reg: i64 = E1K_MTA + 4 * (bit >> 5);
     e1k_wr(b, reg, e1k_rd(b, reg) | (1 << (bit & 31)));

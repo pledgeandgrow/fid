@@ -16,7 +16,11 @@
 //   - Objects: keys sorted (Rust uses BTreeMap; we sort on dump)
 //   - Strings: same escape sequences (\n \r \t \" \\ \uXXXX)
 
-module compiler::json; use core; use vec; use string;  // --- JSON Value ------------------------------------------------------
+module compiler::json;
+use core;
+use vec;
+use string;
+// --- JSON Value ------------------------------------------------------
 
 // NOTE: Enum and struct declarations must come before any impl blocks.
 // The Fides parser adds enum/struct names as it encounters them, so impl
@@ -53,7 +57,7 @@ impl JsonObject {
         };
     }
 
-    pub fn insert(self: & mut JsonObject, key: str, value: Json) -> void {
+    pub fn insert(self: &mut JsonObject, key: str, value: Json) -> void {
         // Check if key already exists -- update in place
         var i: i64 = 0;
         while i < self.keys.len() {
@@ -114,14 +118,14 @@ impl JsonParser {
         };
     }
 
-    fn peek(self: & JsonParser) -> i64 {
+    fn peek(self: &JsonParser) -> i64 {
         if self.pos >= self.len {
             return 0;
         }
         return str_byte_at(self.source, self.pos);
     }
 
-    fn peek_at(self: & JsonParser, offset: i64) -> i64 {
+    fn peek_at(self: &JsonParser, offset: i64) -> i64 {
         var idx = self.pos + offset;
         if idx >= self.len {
             return 0;
@@ -129,7 +133,7 @@ impl JsonParser {
         return str_byte_at(self.source, idx);
     }
 
-    fn advance(self: & mut JsonParser) -> i64 {
+    fn advance(self: &mut JsonParser) -> i64 {
         if self.pos >= self.len {
             return 0;
         }
@@ -138,7 +142,7 @@ impl JsonParser {
         return ch;
     }
 
-    fn skip_ws(self: & mut JsonParser) {
+    fn skip_ws(self: &mut JsonParser) {
         while self.pos < self.len {
             var ch = str_byte_at(self.source, self.pos);
             if ch == 32 || ch == 9 || ch == 10 || ch == 13 {
@@ -149,7 +153,7 @@ impl JsonParser {
         }
     }
 
-    fn parse_value(self: & mut JsonParser) -> JsonResult {
+    fn parse_value(self: &mut JsonParser) -> JsonResult {
         self.skip_ws();
         if self.pos >= self.len {
             return JsonResult::Err("Unexpected end of input");
@@ -182,7 +186,7 @@ impl JsonParser {
         return JsonResult::Err(p_str_concat(p_str_concat(p_str_concat("Unexpected character '", p_char_to_str(ch)), "' at position "), int_to_str(self.pos)));
     }
 
-    fn parse_null(self: & mut JsonParser) -> JsonResult {
+    fn parse_null(self: &mut JsonParser) -> JsonResult {
         // Check "null"
         if self.pos + 4 <= self.len && self.peek() == 110  // n
         && self.peek_at(1) == 117  // u
@@ -195,7 +199,7 @@ impl JsonParser {
         return JsonResult::Err("Invalid null literal");
     }
 
-    fn parse_bool(self: & mut JsonParser) -> JsonResult {
+    fn parse_bool(self: &mut JsonParser) -> JsonResult {
         // Check "true"
         if self.pos + 4 <= self.len && self.peek() == 116  // t
         && self.peek_at(1) == 114  // r
@@ -218,7 +222,7 @@ impl JsonParser {
         return JsonResult::Err("Invalid boolean literal");
     }
 
-    fn parse_string(self: & mut JsonParser) -> JsonResult {
+    fn parse_string(self: &mut JsonParser) -> JsonResult {
         self.pos = self.pos + 1;
         // skip opening "
         var sb = StringBuilder::new();
@@ -285,7 +289,7 @@ impl JsonParser {
                         i = i + 1;
                     }
                     // Encode as UTF-8
-                    append_utf8(& mut sb, code);
+                    append_utf8(&mut sb, code);
                     self.pos = self.pos + 4;
                 } else {
                     return JsonResult::Err(p_str_concat("Invalid escape character '", p_str_concat(p_char_to_str(esc), "'")));
@@ -300,7 +304,7 @@ impl JsonParser {
         return JsonResult::Err("Unterminated string");
     }
 
-    fn parse_number(self: & mut JsonParser) -> JsonResult {
+    fn parse_number(self: &mut JsonParser) -> JsonResult {
         var start = self.pos;
         if self.pos < self.len && str_byte_at(self.source, self.pos) == 45 {
             self.pos = self.pos + 1;
@@ -339,7 +343,8 @@ impl JsonParser {
                         // + or -
                         self.pos = self.pos + 1;
                     }
-                } while self.pos < self.len {
+                }
+                while self.pos < self.len {
                     var dch = str_byte_at(self.source, self.pos);
                     if dch >= 48 && dch <= 57 {
                         self.pos = self.pos + 1;
@@ -383,7 +388,7 @@ impl JsonParser {
         return JsonResult::Ok(Json::Num(val));
     }
 
-    fn parse_array(self: & mut JsonParser) -> JsonResult {
+    fn parse_array(self: &mut JsonParser) -> JsonResult {
         self.pos = self.pos + 1;
         // skip [
         self.skip_ws();
@@ -392,7 +397,8 @@ impl JsonParser {
             self.pos = self.pos + 1;
             // ]
             return JsonResult::Ok(Json::Arr(arr));
-        } while true {
+        }
+        while true {
             var result = self.parse_value();
             match result {
                 JsonResult::Ok(v) => {
@@ -422,7 +428,7 @@ impl JsonParser {
         return JsonResult::Err("Unterminated array");
     }
 
-    fn parse_object(self: & mut JsonParser) -> JsonResult {
+    fn parse_object(self: &mut JsonParser) -> JsonResult {
         self.pos = self.pos + 1;
         // skip {
         self.skip_ws();
@@ -431,7 +437,8 @@ impl JsonParser {
             self.pos = self.pos + 1;
             // }
             return JsonResult::Ok(Json::Obj(obj));
-        } while true {
+        }
+        while true {
             self.skip_ws();
             // Key must be a string
             if self.pos >= self.len || str_byte_at(self.source, self.pos) != 34 {
@@ -514,7 +521,7 @@ pub fn json_parse(s: str) -> JsonResult {
 /// If pretty is true, uses 2-space indentation.
 pub fn json_dump(v: Json, pretty: bool) -> str {
     var sb = StringBuilder::new();
-    dump_inner(v, & mut sb, pretty, 0);
+    dump_inner(v, &mut sb, pretty, 0);
     return sb.to_str();
 }
 
@@ -565,7 +572,7 @@ pub fn json_escape_string(s: str) -> str {
 // --- Internal helpers ------------------------------------------------
 
 /// Append a Unicode code point as UTF-8 to a StringBuilder.
-fn append_utf8(sb: & mut StringBuilder, code: i64) -> void {
+fn append_utf8(sb: &mut StringBuilder, code: i64) -> void {
     if code < 128 {
         // 1-byte: 0xxxxxxx
         sb.append_char(code);
@@ -599,7 +606,7 @@ fn format_number(n: f64) -> str {
     var back = int_val as f64;
     if back == n {
         // No fractional part -- check if within safe integer range
-        if n < 1000000000000000.0 && n > - 1000000000000000.0 {
+        if n < 1000000000000000.0 && n > -1000000000000000.0 {
             return int_to_str(int_val);
         }
     }
@@ -607,7 +614,7 @@ fn format_number(n: f64) -> str {
 }
 
 /// Recursive dump implementation.
-fn dump_inner(v: Json, sb: & mut StringBuilder, pretty: bool, indent: i64) -> void {
+fn dump_inner(v: Json, sb: &mut StringBuilder, pretty: bool, indent: i64) -> void {
     match v {
         Json::Null => {
             sb.append_str("null");
@@ -696,7 +703,7 @@ fn dump_inner(v: Json, sb: & mut StringBuilder, pretty: bool, indent: i64) -> vo
 }
 
 /// Append `n` levels of 2-space indentation to a StringBuilder.
-fn append_indent(sb: & mut StringBuilder, n: i64) -> void {
+fn append_indent(sb: &mut StringBuilder, n: i64) -> void {
     var i: i64 = 0;
     while i < n {
         sb.append_str("  ");

@@ -17,12 +17,13 @@
 //   audio_shutdown();
 
 module audio;
- use file;
+use file;
 // ─── Audio Handle Types ───────────────────────────────────────────────────
 //
 // Sound handles and channel handles are i64 (opaque pointers or indices).
 
-pub const AUDIO_NO_CHANNEL: i64 = - 1; pub const AUDIO_MAX_CHANNELS: i64 = 32;
+pub const AUDIO_NO_CHANNEL: i64 = -1;
+pub const AUDIO_MAX_CHANNELS: i64 = 32;
 // ─── FFI Declarations ─────────────────────────────────────────────────────
 //
 // These are stubs — the actual implementations are in the platform runtime.
@@ -36,7 +37,7 @@ pub const AUDIO_NO_CHANNEL: i64 = - 1; pub const AUDIO_MAX_CHANNELS: i64 = 32;
 extern "C" include "pledge_audio.h" link "" {
     fn pledge_audio_init() -> i64;
     fn pledge_audio_shutdown() -> void;
-    fn pledge_audio_load(path: * u8) -> i64;
+    fn pledge_audio_load(path: *u8) -> i64;
     fn pledge_audio_play(sound: i64, volume: f64) -> i64;
     fn pledge_audio_stop(channel: i64) -> void;
     fn pledge_audio_set_volume(channel: i64, volume: f64) -> void;
@@ -148,16 +149,16 @@ pub struct AudioBuffer {
     pub data: Vec<i64>,  // interleaved samples (i16 range for 16-bit, 0-255 for 8-bit)
 }
 
-fn aud_u16le(d: & Vec<i64>, at: i64) -> i64 {
+fn aud_u16le(d: &Vec<i64>, at: i64) -> i64 {
     return (d.get(at) & 255) | ((d.get(at + 1) & 255) << 8);
 }
 
-fn aud_u32le(d: & Vec<i64>, at: i64) -> i64 {
+fn aud_u32le(d: &Vec<i64>, at: i64) -> i64 {
     return (d.get(at) & 255) | ((d.get(at + 1) & 255) << 8) | ((d.get(at + 2) & 255) << 16) | ((d.get(at + 3) & 255) << 24);
 }
 
 fn aud_u32le_into(d: Vec<i64>, at: i64) -> i64 {
-    return aud_u32le(& d, at);
+    return aud_u32le(&d, at);
 }
 
 /// Decode a WAV byte stream. `sample_rate` is 0 on failure.
@@ -180,12 +181,12 @@ pub fn audio_wav_decode(d: Vec<i64>) -> AudioBuffer {
     var fmt_ch: i64 = 0;
     var fmt_bits: i64 = 0;
     var fmt_tag: i64 = 0;
-    var data_off: i64 = - 1;
+    var data_off: i64 = -1;
     var data_len: i64 = 0;
     var pos: i64 = 12;
     while pos + 8 <= d.len() {
-        val cid: i64 = aud_u32le(& d, pos);
-        val clen: i64 = aud_u32le(& d, pos + 4);
+        val cid: i64 = aud_u32le(&d, pos);
+        val clen: i64 = aud_u32le(&d, pos + 4);
         if clen < 0 || pos + 8 + clen > d.len() {
             return bad;
         }
@@ -194,10 +195,10 @@ pub fn audio_wav_decode(d: Vec<i64>) -> AudioBuffer {
             if clen < 16 {
                 return bad;
             }
-            fmt_tag = aud_u16le(& d, pos + 8);
-            fmt_ch = aud_u16le(& d, pos + 10);
-            fmt_rate = aud_u32le(& d, pos + 12);
-            fmt_bits = aud_u16le(& d, pos + 22);
+            fmt_tag = aud_u16le(&d, pos + 8);
+            fmt_ch = aud_u16le(&d, pos + 10);
+            fmt_rate = aud_u32le(&d, pos + 12);
+            fmt_bits = aud_u16le(&d, pos + 22);
         } else if cid == 0x61746164 {
             // 'data'
             data_off = pos + 8;
@@ -220,7 +221,7 @@ pub fn audio_wav_decode(d: Vec<i64>) -> AudioBuffer {
         }
     } else {
         while i + 1 < data_off + data_len {
-            var s: i64 = aud_u16le(& d, i);
+            var s: i64 = aud_u16le(&d, i);
             if s >= 32768 {
                 s = s - 65536;
             }
@@ -238,31 +239,47 @@ pub fn audio_load_wav(path: str) -> AudioBuffer {
 
 /// Encode an AudioBuffer as a 16-bit PCM WAV byte stream.
 /// 8-bit buffers are widened to 16 bits.
-pub fn audio_wav_encode(buf: & AudioBuffer) -> Vec<i64> {
+pub fn audio_wav_encode(buf: &AudioBuffer) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     val ns: i64 = buf.data.len();
     val data_len: i64 = ns * 2;
-    out.push(82); out.push(73); out.push(70); out.push(70);
-    aud_push_u32le(& mut out, 36 + data_len);
-    out.push(87); out.push(65); out.push(86); out.push(69);
-    out.push(102); out.push(109); out.push(116); out.push(32);
-    aud_push_u32le(& mut out, 16);
-    aud_push_u16le(& mut out, 1);
-    aud_push_u16le(& mut out, buf.channels);
-    aud_push_u32le(& mut out, buf.sample_rate);
-    aud_push_u32le(& mut out, buf.sample_rate * buf.channels * 2);
-    aud_push_u16le(& mut out, buf.channels * 2);
-    aud_push_u16le(& mut out, 16);
-    out.push(100); out.push(97); out.push(116); out.push(97);
-    aud_push_u32le(& mut out, data_len);
+    out.push(82);
+    out.push(73);
+    out.push(70);
+    out.push(70);
+    aud_push_u32le(&mut out, 36 + data_len);
+    out.push(87);
+    out.push(65);
+    out.push(86);
+    out.push(69);
+    out.push(102);
+    out.push(109);
+    out.push(116);
+    out.push(32);
+    aud_push_u32le(&mut out, 16);
+    aud_push_u16le(&mut out, 1);
+    aud_push_u16le(&mut out, buf.channels);
+    aud_push_u32le(&mut out, buf.sample_rate);
+    aud_push_u32le(&mut out, buf.sample_rate * buf.channels * 2);
+    aud_push_u16le(&mut out, buf.channels * 2);
+    aud_push_u16le(&mut out, 16);
+    out.push(100);
+    out.push(97);
+    out.push(116);
+    out.push(97);
+    aud_push_u32le(&mut out, data_len);
     var i: i64 = 0;
     while i < ns {
         var s: i64 = buf.data.get(i);
         if buf.bits == 8 {
             s = (s - 128) * 256;
         }
-        if s > 32767 { s = 32767; }
-        if s < 0 - 32768 { s = 0 - 32768; }
+        if s > 32767 {
+            s = 32767;
+        }
+        if s < 0 - 32768 {
+            s = 0 - 32768;
+        }
         out.push(s & 255);
         out.push((s >> 8) & 255);
         i = i + 1;
@@ -270,12 +287,12 @@ pub fn audio_wav_encode(buf: & AudioBuffer) -> Vec<i64> {
     return out;
 }
 
-fn aud_push_u16le(v: & mut Vec<i64>, x: i64) -> void {
+fn aud_push_u16le(v: &mut Vec<i64>, x: i64) -> void {
     v.push(x & 255);
     v.push((x >> 8) & 255);
 }
 
-fn aud_push_u32le(v: & mut Vec<i64>, x: i64) -> void {
+fn aud_push_u32le(v: &mut Vec<i64>, x: i64) -> void {
     v.push(x & 255);
     v.push((x >> 8) & 255);
     v.push((x >> 16) & 255);
@@ -283,7 +300,7 @@ fn aud_push_u32le(v: & mut Vec<i64>, x: i64) -> void {
 }
 
 /// Save an AudioBuffer as a 16-bit PCM WAV file.
-pub fn audio_save_wav(buf: & AudioBuffer, path: str) -> i64 {
+pub fn audio_save_wav(buf: &AudioBuffer, path: str) -> i64 {
     return file_write_bytes(path, audio_wav_encode(buf));
 }
 
@@ -316,7 +333,7 @@ pub fn audio_state_create() -> AudioState {
 }
 
 /// Set master volume through the state tracker (respects mute).
-pub fn audio_state_set_volume(state: & mut AudioState, vol: f64) -> void {
+pub fn audio_state_set_volume(state: &mut AudioState, vol: f64) -> void {
     state.master_vol = vol;
     if !state.muted {
         audio_master_volume(vol);
@@ -324,7 +341,7 @@ pub fn audio_state_set_volume(state: & mut AudioState, vol: f64) -> void {
 }
 
 /// Toggle mute. Returns the new mute state.
-pub fn audio_state_toggle_mute(state: & mut AudioState) -> bool {
+pub fn audio_state_toggle_mute(state: &mut AudioState) -> bool {
     state.muted = !state.muted;
     if state.muted {
         audio_master_volume(0.0);
@@ -335,7 +352,7 @@ pub fn audio_state_toggle_mute(state: & mut AudioState) -> bool {
 }
 
 /// Play music (loops). Stops any previous music.
-pub fn audio_state_play_music(state: & mut AudioState, sound: i64) -> void {
+pub fn audio_state_play_music(state: &mut AudioState, sound: i64) -> void {
     if state.music_channel != AUDIO_NO_CHANNEL {
         audio_stop(state.music_channel);
     }
@@ -344,7 +361,7 @@ pub fn audio_state_play_music(state: & mut AudioState, sound: i64) -> void {
 }
 
 /// Stop music.
-pub fn audio_state_stop_music(state: & mut AudioState) -> void {
+pub fn audio_state_stop_music(state: &mut AudioState) -> void {
     if state.music_channel != AUDIO_NO_CHANNEL {
         audio_stop(state.music_channel);
         state.music_channel = AUDIO_NO_CHANNEL;
@@ -352,7 +369,7 @@ pub fn audio_state_stop_music(state: & mut AudioState) -> void {
 }
 
 /// Play a sound effect and track the channel.
-pub fn audio_state_play_sfx(state: & mut AudioState, sound: i64, volume: f64) -> i64 {
+pub fn audio_state_play_sfx(state: &mut AudioState, sound: i64, volume: f64) -> i64 {
     var ch = audio_play(sound, volume);
     if ch != AUDIO_NO_CHANNEL {
         state.sfx_channels.push(ch);
@@ -361,7 +378,7 @@ pub fn audio_state_play_sfx(state: & mut AudioState, sound: i64, volume: f64) ->
 }
 
 /// Clean up finished SFX channels from the tracking list.
-pub fn audio_state_cleanup_sfx(state: & mut AudioState) -> void {
+pub fn audio_state_cleanup_sfx(state: &mut AudioState) -> void {
     var active = Vec::new();
     var i = 0;
     while i < state.sfx_channels.len() {

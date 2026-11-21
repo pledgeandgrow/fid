@@ -23,7 +23,13 @@
 // tests/net/http3_udp_loopback.fd.
 
 module http3_udp;
- use vec; use http3; use quic; use quic_conn; use quic_frame; use quic_udp; use udp;
+use vec;
+use http3;
+use quic;
+use quic_conn;
+use quic_frame;
+use quic_udp;
+use udp;
 
 /// A client connection and its HTTP/3 state.
 pub struct H3UdpClient {
@@ -65,64 +71,65 @@ fn hu_same(a: Vec<i64>, b: Vec<i64>) -> bool {
 
 /// Connect to `ip`:`port` (IPv4 or IPv6 text); `cfg.alpn` should hold "h3".
 pub fn h3_udp_connect(ip: str, port: i64, cfg: QuicConfig) -> H3UdpClient {
-    return H3UdpClient { udp: quic_udp_connect(ip, port, cfg), h3: h3_new(false) };
+    return H3UdpClient {
+        udp: quic_udp_connect(ip, port, cfg), h3: h3_new(false)
+    };
 }
 
 /// Send what is ready, wait up to `wait_ms` for datagrams, move QUIC and
 /// HTTP/3 on (what HTTP/3 queued goes out at the next poll).
-pub fn h3_udp_client_poll(c: & mut H3UdpClient, wait_ms: i64) {
-    quic_udp_client_poll(& mut c.udp, wait_ms);
-    h3_poll(& mut c.h3, & mut c.udp.conn);
+pub fn h3_udp_client_poll(c: &mut H3UdpClient, wait_ms: i64) {
+    quic_udp_client_poll(&mut c.udp, wait_ms);
+    h3_poll(&mut c.h3, &mut c.udp.conn);
 }
 
 /// Close the connection (H3_NO_ERROR), give the close a moment to leave,
 /// and close the socket.
-pub fn h3_udp_client_close(c: & mut H3UdpClient) {
-    if !quic_conn_done(& c.udp.conn) {
-        h3_close(& mut c.h3, & mut c.udp.conn, p_clock_now_ms());
+pub fn h3_udp_client_close(c: &mut H3UdpClient) {
+    if !quic_conn_done(&c.udp.conn) {
+        h3_close(&mut c.h3, &mut c.udp.conn, p_clock_now_ms());
     }
     var n: i64 = 0;
-    while n < 3 && !quic_conn_closed(& c.udp.conn) {
-        quic_udp_client_poll(& mut c.udp, 5);
+    while n < 3 && !quic_conn_closed(&c.udp.conn) {
+        quic_udp_client_poll(&mut c.udp, 5);
         n = n + 1;
     }
-    quic_udp_client_free(& mut c.udp);
+    quic_udp_client_free(&mut c.udp);
 }
 
 /// One request on a new connection: connect, send it once the handshake
 /// is done, wait for the response, close. The message has `ok` false and
 /// `why` set when anything failed or `timeout_ms` passed.
-pub fn h3_udp_fetch(ip: str, port: i64, cfg: QuicConfig, method: str, authority: str, path: str,
-        names: Vec<str>, values: Vec<str>, body: Vec<i64>, timeout_ms: i64) -> H3Message {
+pub fn h3_udp_fetch(ip: str, port: i64, cfg: QuicConfig, method: str, authority: str, path: str, names: Vec<str>, values: Vec<str>, body: Vec<i64>, timeout_ms: i64) -> H3Message {
     var c: H3UdpClient = h3_udp_connect(ip, port, cfg);
     val t0: i64 = p_clock_now_ms();
-    var id: i64 = - 1;
-    var m: H3Message = h3_message(& c.h3, - 1);
+    var id: i64 = -1;
+    var m: H3Message = h3_message(&c.h3, -1);
     m.why = "timed out";
     var going: bool = true;
     while going && p_clock_now_ms() - t0 < timeout_ms {
-        h3_udp_client_poll(& mut c, 20);
-        if quic_conn_done(& c.udp.conn) {
+        h3_udp_client_poll(&mut c, 20);
+        if quic_conn_done(&c.udp.conn) {
             m.why = "connection closed: " + c.udp.conn.why;
             if c.h3.error >= 0 {
                 m.why = "connection closed: " + h3_error_name(c.h3.error) + " " + c.h3.why;
             }
             going = false;
         } else {
-            if id < 0 && quic_conn_established(& c.udp.conn) {
-                id = h3_request(& mut c.h3, & mut c.udp.conn, method, "https", authority, path, names, values, body);
+            if id < 0 && quic_conn_established(&c.udp.conn) {
+                id = h3_request(&mut c.h3, &mut c.udp.conn, method, "https", authority, path, names, values, body);
                 if id < 0 && c.h3.started {
                     m.why = "the request could not be sent";
                     going = false;
                 }
             }
-            if id >= 0 && h3_done(& c.h3, id) {
-                m = h3_response(& mut c.h3, id);
+            if id >= 0 && h3_done(&c.h3, id) {
+                m = h3_response(&mut c.h3, id);
                 going = false;
             }
         }
     }
-    h3_udp_client_close(& mut c);
+    h3_udp_client_close(&mut c);
     return m;
 }
 
@@ -130,13 +137,15 @@ pub fn h3_udp_fetch(ip: str, port: i64, cfg: QuicConfig, method: str, authority:
 
 /// A server socket on `port` of every address (dual-stack IPv6, else IPv4).
 pub fn h3_udp_listen(port: i64, cfg: QuicConfig) -> H3UdpServer {
-    return H3UdpServer { udp: quic_udp_listen(port, cfg), h3s: Vec::new(), cids: Vec::new() };
+    return H3UdpServer {
+        udp: quic_udp_listen(port, cfg), h3s: Vec::new(), cids: Vec::new()
+    };
 }
 
 /// Move every connection on (waiting up to `wait_ms` for datagrams) and
 /// return the requests that arrived whole since the last poll.
-pub fn h3_udp_server_poll(s: & mut H3UdpServer, wait_ms: i64) -> Vec<H3UdpRequest> {
-    quic_udp_server_poll(& mut s.udp, wait_ms);
+pub fn h3_udp_server_poll(s: &mut H3UdpServer, wait_ms: i64) -> Vec<H3UdpRequest> {
+    quic_udp_server_poll(&mut s.udp, wait_ms);
     // Keep each connection's HTTP/3 state at its connection's index
     // (quic_udp_server_poll adds new connections and drops closed ones)
     var h3s: Vec<H3Conn> = Vec::new();
@@ -144,7 +153,7 @@ pub fn h3_udp_server_poll(s: & mut H3UdpServer, wait_ms: i64) -> Vec<H3UdpReques
     var i: i64 = 0;
     while i < s.udp.conns.len() {
         val scid: Vec<i64> = s.udp.conns.get(i).scid;
-        var found: i64 = - 1;
+        var found: i64 = -1;
         var j: i64 = 0;
         while j < s.cids.len() && found < 0 {
             if hu_same(s.cids.get(j), scid) {
@@ -167,12 +176,14 @@ pub fn h3_udp_server_poll(s: & mut H3UdpServer, wait_ms: i64) -> Vec<H3UdpReques
     while i < s.udp.conns.len() {
         var q: QuicConn = s.udp.conns.get(i);
         var h: H3Conn = s.h3s.get(i);
-        h3_poll(& mut h, & mut q);
-        val ids: Vec<i64> = h3_requests(& mut h);
+        h3_poll(&mut h, &mut q);
+        val ids: Vec<i64> = h3_requests(&mut h);
         var k: i64 = 0;
         while k < ids.len() {
             val id: i64 = ids.get(k);
-            out.push(H3UdpRequest { conn: i, id: id, msg: h3_message(& h, id) });
+            out.push(H3UdpRequest {
+                conn: i, id: id, msg: h3_message(&h, id)
+            });
             k = k + 1;
         }
         s.udp.conns.set(i, q);
@@ -184,20 +195,19 @@ pub fn h3_udp_server_poll(s: & mut H3UdpServer, wait_ms: i64) -> Vec<H3UdpReques
 
 /// Answer request `id` of connection `conn` (from h3_udp_server_poll); it
 /// leaves at the next poll.
-pub fn h3_udp_respond(s: & mut H3UdpServer, conn: i64, id: i64, status: i64,
-        names: Vec<str>, values: Vec<str>, body: Vec<i64>) -> bool {
+pub fn h3_udp_respond(s: &mut H3UdpServer, conn: i64, id: i64, status: i64, names: Vec<str>, values: Vec<str>, body: Vec<i64>) -> bool {
     if conn < 0 || conn >= s.udp.conns.len() {
         return false;
     }
     var q: QuicConn = s.udp.conns.get(conn);
     var h: H3Conn = s.h3s.get(conn);
-    val ok: bool = h3_respond(& mut h, & mut q, id, status, names, values, body);
+    val ok: bool = h3_respond(&mut h, &mut q, id, status, names, values, body);
     s.udp.conns.set(conn, q);
     s.h3s.set(conn, h);
     return ok;
 }
 
 /// Close the server socket.
-pub fn h3_udp_server_free(s: & mut H3UdpServer) {
-    quic_udp_server_free(& mut s.udp);
+pub fn h3_udp_server_free(s: &mut H3UdpServer) {
+    quic_udp_server_free(&mut s.udp);
 }

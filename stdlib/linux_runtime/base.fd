@@ -62,14 +62,18 @@ fn pe_ld(addr: i64) -> i64 {
     // they allocated (thread/task blocks, queues, channels, tables), of the
     // initial stack (argv, envp, auxv) or of a struct the kernel filled; the
     // layouts are in each section's comment.
-    unsafe { v = *p; }
+    unsafe {
+        v = *p;
+    }
     return v;
 }
 
 fn pe_st(addr: i64, value: i64) {
     var p: *mut i64 = addr;
     // SAFETY: NOT checked here: as pe_ld, a word of a block of this runtime's.
-    unsafe { *p = value; }
+    unsafe {
+        *p = value;
+    }
 }
 
 fn pe_ldb(addr: i64) -> i64 {
@@ -77,14 +81,18 @@ fn pe_ldb(addr: i64) -> i64 {
     var v: i64 = 0;
     // SAFETY: NOT checked here: a byte of a string up to its NUL or of a
     // buffer the caller holds.
-    unsafe { v = *p; }
+    unsafe {
+        v = *p;
+    }
     return v;
 }
 
 fn pe_stb(addr: i64, value: i64) {
     var p: *mut u8 = addr;
     // SAFETY: NOT checked here: a byte of a buffer the caller allocated.
-    unsafe { *p = value; }
+    unsafe {
+        *p = value;
+    }
 }
 
 fn pe_copy(dst: i64, src: i64, n: i64) {
@@ -163,9 +171,13 @@ fn pe_mmap(n: i64) -> i64 {
 fn pe_bump(n: i64) -> i64 {
     if pe_heap_cur == 0 || pe_heap_cur + n > pe_heap_end {
         var size: i64 = pe_heap_chunk;
-        if n > size { size = n; }
+        if n > size {
+            size = n;
+        }
         // RT7: the chunk left behind keeps how far it was handed out
-        if pe_heap_base != 0 { pe_chunk_note_used(pe_heap_base, pe_heap_cur); }
+        if pe_heap_base != 0 {
+            pe_chunk_note_used(pe_heap_base, pe_heap_cur);
+        }
         pe_heap_cur = pe_mmap(size);
         pe_heap_end = pe_heap_cur + size;
         pe_heap_base = pe_heap_cur;
@@ -194,13 +206,13 @@ fn pe_lists() -> i64 {
 // chunk and the two highest empty ones, for the next blocks.
 // FID_MEM_RETURN=0 turns it off, as in the C runtime.
 
-var pe_heap_base: i64 = 0;        // the current chunk's base
+var pe_heap_base: i64 = 0;  // the current chunk's base
 var pe_chunk_tab: i64 = 0;
 var pe_chunk_n: i64 = 0;
 var pe_chunk_cap: i64 = 0;
 var pe_fl_bytes: i64 = 0;
 var pe_trim_next: i64 = 8388608;
-var pe_mem_return: i64 = 0 - 1;   // 1 on, 0 off, -1 not read yet
+var pe_mem_return: i64 = 0 - 1;  // 1 on, 0 off, -1 not read yet
 
 const PE_TRIM_MIN: i64 = 8388608;
 const PE_KEEP_FREE_CHUNKS: i64 = 2;
@@ -208,7 +220,9 @@ const PE_KEEP_FREE_CHUNKS: i64 = 2;
 fn pe_chunk_add(base: i64, size: i64) {
     if pe_chunk_n == pe_chunk_cap {
         var cap: i64 = pe_chunk_cap * 2;
-        if cap < 170 { cap = 170; }               // 4080 bytes: a page
+        if cap < 170 {
+            cap = 170;
+        }  // 4080 bytes: a page
         val t: i64 = pe_mmap(((cap * 24) + 4095) & (0 - 4096));
         var c: i64 = 0;
         while c < pe_chunk_n * 3 {
@@ -238,7 +252,9 @@ fn pe_chunk_add(base: i64, size: i64) {
 /// The handed-out end of the chunk at index i
 fn pe_chunk_used(i: i64) -> i64 {
     val base: i64 = pe_ld(pe_chunk_tab + i * 24);
-    if base == pe_heap_base { return pe_heap_cur; }
+    if base == pe_heap_base {
+        return pe_heap_cur;
+    }
     return pe_ld(pe_chunk_tab + i * 24 + 16);
 }
 
@@ -256,7 +272,9 @@ fn pe_chunk_at(a: i64) -> i64 {
             hi = mid - 1;
         }
     }
-    if at >= 0 && a < pe_chunk_used(at) { return at; }
+    if at >= 0 && a < pe_chunk_used(at) {
+        return at;
+    }
     return 0 - 1;
 }
 
@@ -275,7 +293,9 @@ fn pe_chunk_note_used(base: i64, used: i64) {
 /// empty (and not the current one)?
 fn pe_chunk_empty(i: i64, free: i64) -> bool {
     val base: i64 = pe_ld(pe_chunk_tab + i * 24);
-    if base == pe_heap_base { return false; }
+    if base == pe_heap_base {
+        return false;
+    }
     return free == pe_ld(pe_chunk_tab + i * 24 + 16) - base;
 }
 
@@ -284,7 +304,9 @@ fn pe_trim() {
     if pe_mem_return < 0 {
         pe_mem_return = 1;
         val e: i64 = pe_env_raw("FID_MEM_RETURN" as i64);
-        if e != 0 && pe_ldb(e) == 48 && pe_ldb(e + 1) == 0 { pe_mem_return = 0; }
+        if e != 0 && pe_ldb(e) == 48 && pe_ldb(e + 1) == 0 {
+            pe_mem_return = 0;
+        }
     }
     if pe_mem_return == 0 {
         pe_trim_next = 0x7FFFFFFFFFFFFFFF;
@@ -296,7 +318,7 @@ fn pe_trim() {
         return;
     }
     val fb_size: i64 = ((n * 8) + 4095) & (0 - 4096);
-    val fb: i64 = pe_mmap(fb_size);                  // zeroed
+    val fb: i64 = pe_mmap(fb_size);  // zeroed
     val lists: i64 = pe_lists();
     // the free bytes of each chunk
     var k: i64 = 4;
@@ -304,7 +326,9 @@ fn pe_trim() {
         var b: i64 = pe_ld(lists + k * 8);
         while b != 0 {
             val at: i64 = pe_chunk_at(b - 8);
-            if at >= 0 { pe_st(fb + at * 8, pe_ld(fb + at * 8) + (1 << k)); }
+            if at >= 0 {
+                pe_st(fb + at * 8, pe_ld(fb + at * 8) + (1 << k));
+            }
             b = pe_ld(b);
         }
         k = k + 1;
@@ -313,7 +337,9 @@ fn pe_trim() {
     var empty: i64 = 0;
     var i: i64 = 0;
     while i < n {
-        if pe_chunk_empty(i, pe_ld(fb + i * 8)) { empty = empty + 1; }
+        if pe_chunk_empty(i, pe_ld(fb + i * 8)) {
+            empty = empty + 1;
+        }
         i = i + 1;
     }
     var drop: i64 = empty - PE_KEEP_FREE_CHUNKS;
@@ -334,8 +360,14 @@ fn pe_trim() {
             val nx: i64 = pe_ld(b2);
             val at2: i64 = pe_chunk_at(b2 - 8);
             if at2 >= 0 && pe_ld(fb + at2 * 8) < 0 {
-                if prev != 0 { pe_st(prev, nx); } else { pe_st(lists + k * 8, nx); }
-                if (pe_ld(b2 - 8) & PE_DECOMMITTED) == 0 { pe_fl_bytes = pe_fl_bytes - (1 << k); }
+                if prev != 0 {
+                    pe_st(prev, nx);
+                } else {
+                    pe_st(lists + k * 8, nx);
+                }
+                if (pe_ld(b2 - 8) & PE_DECOMMITTED) == 0 {
+                    pe_fl_bytes = pe_fl_bytes - (1 << k);
+                }
             } else {
                 prev = b2;
             }
@@ -363,17 +395,19 @@ fn pe_trim() {
     pe_chunk_n = w;
     pe_sys(PE_SYS_MUNMAP, fb, fb_size, 0);
     var step: i64 = pe_fl_bytes / 4;
-    if step < PE_TRIM_MIN { step = PE_TRIM_MIN; }
+    if step < PE_TRIM_MIN {
+        step = PE_TRIM_MIN;
+    }
     pe_trim_next = pe_fl_bytes + step;
 }
 
-var pe_mt: i64 = 0;           // 1 once threads may run
-var pe_heap_lock: i64 = 0;    // *i64
+var pe_mt: i64 = 0;  // 1 once threads may run
+var pe_heap_lock: i64 = 0;  // *i64
 
 /// A spinlock word: 0 free, 1 held.
 fn pe_lock(l: i64) {
     while nat_atomic_cas(l, 0, 1) == 0 {
-        pe_sys(124, 0, 0, 0);     // sched_yield
+        pe_sys(124, 0, 0, 0);  // sched_yield
     }
 }
 
@@ -459,17 +493,23 @@ var lrt_ck_cap: i64 = 0;
 /// Note a checked block (takes the heap lock once threads run); returns
 /// its entry's index + 1.
 fn pe_ck_note(base: i64, span: i64, p: i64, n: i64, site: i64, fn1: i64, fn2: i64) -> i64 {
-    if pe_mt != 0 { pe_lock(pe_heap_lock); }
+    if pe_mt != 0 {
+        pe_lock(pe_heap_lock);
+    }
     if lrt_ck_n == lrt_ck_cap {
         var cap: i64 = lrt_ck_cap * 2;
-        if cap == 0 { cap = 1024; }
+        if cap == 0 {
+            cap = 1024;
+        }
         var t: i64 = pe_mmap(cap * LRT_CK_ENT);
         var i: i64 = 0;
         while i < lrt_ck_n * (LRT_CK_ENT / 8) {
             pe_st(t + i * 8, pe_ld(lrt_ck_tab + i * 8));
             i = i + 1;
         }
-        if lrt_ck_tab != 0 { pe_sys(PE_SYS_MUNMAP, lrt_ck_tab, lrt_ck_cap * LRT_CK_ENT, 0); }
+        if lrt_ck_tab != 0 {
+            pe_sys(PE_SYS_MUNMAP, lrt_ck_tab, lrt_ck_cap * LRT_CK_ENT, 0);
+        }
         lrt_ck_tab = t;
         lrt_ck_cap = cap;
     }
@@ -484,7 +524,9 @@ fn pe_ck_note(base: i64, span: i64, p: i64, n: i64, site: i64, fn1: i64, fn2: i6
     pe_st(e + 56, fn2);
     lrt_ck_n = lrt_ck_n + 1;
     var r: i64 = lrt_ck_n;
-    if pe_mt != 0 { pe_unlock(pe_heap_lock); }
+    if pe_mt != 0 {
+        pe_unlock(pe_heap_lock);
+    }
     return r;
 }
 
@@ -495,7 +537,9 @@ fn pe_ck_note(base: i64, span: i64, p: i64, n: i64, site: i64, fn1: i64, fn2: i6
 /// True when it printed the report; anything else is left to the generic
 /// message. Allocates nothing.
 fn pe_ck_fault(addr: i64) -> bool {
-    if (lrt_mem_mode & 1) == 0 || lrt_ck_tab == 0 || pe_sigbuf == 0 { return false; }
+    if (lrt_mem_mode & 1) == 0 || lrt_ck_tab == 0 || pe_sigbuf == 0 {
+        return false;
+    }
     var i: i64 = lrt_ck_n - 1;
     while i >= 0 {
         var e: i64 = lrt_ck_tab + i * LRT_CK_ENT;
@@ -505,7 +549,9 @@ fn pe_ck_fault(addr: i64) -> bool {
             var p: i64 = pe_ld(e + 16);
             var freed: bool = pe_ld(e + 40) != 0;
             // a live block's own pages are readable: not a fault of this kind
-            if !freed && addr < base + span - 4096 { return false; }
+            if !freed && addr < base + span - 4096 {
+                return false;
+            }
             if freed {
                 pert_eprint_str("Panic: Use after free (--checked-alloc): the block of " as i64);
             } else {
@@ -514,7 +560,9 @@ fn pe_ck_fault(addr: i64) -> bool {
             pe_eprint_int(pe_ld(e + 24));
             pert_eprint_str(" bytes at " as i64);
             pe_eprint_hex(p);
-            if freed { pert_eprint_str(" was freed" as i64); }
+            if freed {
+                pert_eprint_str(" was freed" as i64);
+            }
             pert_eprint_str("; accessed at offset " as i64);
             pe_eprint_int(addr - p);
             var site: i64 = pe_ld(e + 32);
@@ -552,17 +600,27 @@ fn pe_fn_name_at(pc: i64) -> i64 {
     var tab: i64 = nat_fn_names();
     if lrt_fn_count == 0 {
         var c: i64 = 0;
-        while pe_ld(tab + c * 16 + 8) != 0 { c = c + 1; }
+        while pe_ld(tab + c * 16 + 8) != 0 {
+            c = c + 1;
+        }
         lrt_fn_count = c;
     }
     var m: i64 = lrt_fn_count;
-    if m == 0 { return 0; }
-    if pc < pe_ld(tab) || pc >= pe_ld(tab + m * 16) { return 0; }
+    if m == 0 {
+        return 0;
+    }
+    if pc < pe_ld(tab) || pc >= pe_ld(tab + m * 16) {
+        return 0;
+    }
     var lo: i64 = 0;
     var hi: i64 = m - 1;
     while lo < hi {
         var mid: i64 = (lo + hi + 1) / 2;
-        if pe_ld(tab + mid * 16) <= pc { lo = mid; } else { hi = mid - 1; }
+        if pe_ld(tab + mid * 16) <= pc {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
     }
     return pe_ld(tab + lo * 16 + 8);
 }
@@ -571,7 +629,9 @@ fn pe_fn_name_at(pc: i64) -> i64 {
 /// (runtime functions skipped), 0 when there is none. Only once the
 /// runtime is set up (pe_sigbuf), as for a trace.
 fn pe_dbg_site(fp0: i64, which: i64) -> i64 {
-    if pe_sigbuf == 0 { return 0; }
+    if pe_sigbuf == 0 {
+        return 0;
+    }
     var fp: i64 = fp0;
     var seen: i64 = 0;
     var steps: i64 = 0;
@@ -580,7 +640,9 @@ fn pe_dbg_site(fp0: i64, which: i64) -> i64 {
         fp = nat_frame_next(fp);
         steps = steps + 1;
         if name != 0 && !pe_is_rt_name(name) {
-            if seen == which { return name; }
+            if seen == which {
+                return name;
+            }
             seen = seen + 1;
         }
     }
@@ -590,19 +652,29 @@ fn pe_dbg_site(fp0: i64, which: i64) -> i64 {
 /// Did the program ask for this block (pert_malloc's caller, from the
 /// frame fp, is not runtime code)?
 fn pe_dbg_from_program(fp: i64) -> bool {
-    if pe_sigbuf == 0 || fp == 0 || (fp & 7) != 0 { return false; }
+    if pe_sigbuf == 0 || fp == 0 || (fp & 7) != 0 {
+        return false;
+    }
     var name: i64 = pe_fn_name_at(nat_frame_ret(fp) - 4);
-    if name == 0 { return false; }
+    if name == 0 {
+        return false;
+    }
     return pe_is_rt_name(name) == false;
 }
 
 fn pe_dbg_malloc(size: i64, fp: i64) -> i64 {
     // (a store, so the mid-end does not fold the backend's value away)
-    if lrt_mem_mode < 0 { lrt_mem_mode = 0; }
+    if lrt_mem_mode < 0 {
+        lrt_mem_mode = 0;
+    }
     var n: i64 = size;
-    if n < 0 { n = 0; }
+    if n < 0 {
+        n = 0;
+    }
     var track: bool = false;
-    if (lrt_mem_mode & 2) != 0 { track = pe_dbg_from_program(fp); }
+    if (lrt_mem_mode & 2) != 0 {
+        track = pe_dbg_from_program(fp);
+    }
     var checked: bool = (lrt_mem_mode & 1) != 0;
     // L7C: the memory profile counts every block, the runtime's too (the
     // C runtime's --mem does), each by the first program function on the
@@ -623,11 +695,13 @@ fn pe_dbg_malloc(size: i64, fp: i64) -> i64 {
         var used: i64 = (n + 15) & (0 - 16);
         span = ((used + 80 + 4095) & (0 - 4096)) + 4096;
         base = pe_mmap(span);
-        pe_sys(PE_SYS_MPROTECT, base + span - 4096, 4096, 0);    // the guard page
+        pe_sys(PE_SYS_MPROTECT, base + span - 4096, 4096, 0);  // the guard page
         p = base + span - 4096 - used;
         // CM9: the return address of the call to the allocator
         var site: i64 = 0;
-        if fp != 0 && (fp & 7) == 0 { site = nat_frame_ret(fp); }
+        if fp != 0 && (fp & 7) == 0 {
+            site = nat_frame_ret(fp);
+        }
         ck_ix = pe_ck_note(base, span, p, n, site, s1, s2);
     } else {
         base = pe_plain_malloc(n + 80);
@@ -644,19 +718,29 @@ fn pe_dbg_malloc(size: i64, fp: i64) -> i64 {
     pe_st(p - 16, n);
     pe_st(p - 8, pe_magic() + PE_DBG);
     if track {
-        if pe_mt != 0 { pe_lock(pe_heap_lock); }
+        if pe_mt != 0 {
+            pe_lock(pe_heap_lock);
+        }
         pe_st(p - 80, 1);
         pe_st(p - 24, lrt_dbg_head);
-        if lrt_dbg_head != 0 { pe_st(lrt_dbg_head - 32, p); }
+        if lrt_dbg_head != 0 {
+            pe_st(lrt_dbg_head - 32, p);
+        }
         lrt_dbg_head = p;
         lrt_dbg_count = lrt_dbg_count + 1;
-        if pe_mt != 0 { pe_unlock(pe_heap_lock); }
+        if pe_mt != 0 {
+            pe_unlock(pe_heap_lock);
+        }
     }
     if prof {
-        if pe_mt != 0 { pe_lock(pe_heap_lock); }
+        if pe_mt != 0 {
+            pe_lock(pe_heap_lock);
+        }
         pe_st(p - 80, pe_ld(p - 80) | 2);
         pe_mp_note(s1, n);
-        if pe_mt != 0 { pe_unlock(pe_heap_lock); }
+        if pe_mt != 0 {
+            pe_unlock(pe_heap_lock);
+        }
     }
     return p;
 }
@@ -673,8 +757,14 @@ fn pe_dbg_free(p: i64) {
     if (pe_ld(p - 80) & 1) != 0 {
         var prev: i64 = pe_ld(p - 32);
         var next: i64 = pe_ld(p - 24);
-        if prev != 0 { pe_st(prev - 24, next); } else { lrt_dbg_head = next; }
-        if next != 0 { pe_st(next - 32, prev); }
+        if prev != 0 {
+            pe_st(prev - 24, next);
+        } else {
+            lrt_dbg_head = next;
+        }
+        if next != 0 {
+            pe_st(next - 32, prev);
+        }
         lrt_dbg_count = lrt_dbg_count - 1;
         pe_st(p - 80, 0);
     }
@@ -683,7 +773,9 @@ fn pe_dbg_free(p: i64) {
     var span: i64 = pe_ld(p - 40);
     // CM9: its entry says freed (the caller holds the heap lock)
     var ck_ix: i64 = pe_ld(p - 56);
-    if ck_ix > 0 && ck_ix <= lrt_ck_n { pe_st(lrt_ck_tab + (ck_ix - 1) * LRT_CK_ENT + 40, 1); }
+    if ck_ix > 0 && ck_ix <= lrt_ck_n {
+        pe_st(lrt_ck_tab + (ck_ix - 1) * LRT_CK_ENT + 40, 1);
+    }
     if span > 0 {
         // inaccessible for good, a page at a time (the Windows layer takes
         // a longer PROT_NONE region for a stack guard)
@@ -701,7 +793,10 @@ fn pe_dbg_free(p: i64) {
 fn pe_eprint_pad(v: i64, width: i64) {
     var digits: i64 = 1;
     var t: i64 = v;
-    while t >= 10 { t = t / 10; digits = digits + 1; }
+    while t >= 10 {
+        t = t / 10;
+        digits = digits + 1;
+    }
     var k: i64 = digits;
     while k < width {
         pe_write_all(2, " " as i64, 1);
@@ -713,7 +808,9 @@ fn pe_eprint_pad(v: i64, width: i64) {
 /// --leaks at exit: the blocks never freed, by where they were allocated,
 /// the most bytes first (the C runtime's report, __p_mc_report).
 fn pe_leak_report() {
-    if (lrt_mem_mode & 2) == 0 || pe_sigbuf == 0 { return; }
+    if (lrt_mem_mode & 2) == 0 || pe_sigbuf == 0 {
+        return;
+    }
     if lrt_dbg_head == 0 {
         pert_eprint_str("fid --leaks: every block was freed\n" as i64);
         return;
@@ -732,7 +829,9 @@ fn pe_leak_report() {
         blocks = blocks + 1;
         bytes = bytes + sz;
         var j: i64 = 0;
-        while j < places && (pe_ld(tab + j * 32) != s1 || pe_ld(tab + j * 32 + 8) != s2) { j = j + 1; }
+        while j < places && (pe_ld(tab + j * 32) != s1 || pe_ld(tab + j * 32 + 8) != s2) {
+            j = j + 1;
+        }
         if j == places && places < cap {
             pe_st(tab + j * 32, s1);
             pe_st(tab + j * 32 + 8, s2);
@@ -754,10 +853,14 @@ fn pe_leak_report() {
         var best: i64 = 0 - 1;
         var j2: i64 = 0;
         while j2 < places {
-            if pe_ld(tab + j2 * 32 + 24) > 0 && (best < 0 || pe_ld(tab + j2 * 32 + 16) > pe_ld(tab + best * 32 + 16)) { best = j2; }
+            if pe_ld(tab + j2 * 32 + 24) > 0 && (best < 0 || pe_ld(tab + j2 * 32 + 16) > pe_ld(tab + best * 32 + 16)) {
+                best = j2;
+            }
             j2 = j2 + 1;
         }
-        if best < 0 { shown = places; } else {
+        if best < 0 {
+            shown = places;
+        } else {
             pert_eprint_str("  " as i64);
             pe_eprint_pad(pe_ld(tab + best * 32 + 16), 8);
             pert_eprint_str(" bytes in " as i64);
@@ -813,8 +916,12 @@ var lrt_mp_lost: i64 = 0;
 /// FID_MEM_PROFILE at start (pe_rt_init): the profile without `--mem`.
 fn pe_mp_env() {
     var v: i64 = pe_env_ptr("FID_MEM_PROFILE" as i64);
-    if v == 0 { return; }
-    if pe_ldb(v) == 48 && pe_ldb(v + 1) == 0 { return; }
+    if v == 0 {
+        return;
+    }
+    if pe_ldb(v) == 48 && pe_ldb(v + 1) == 0 {
+        return;
+    }
     lrt_mem_mode = lrt_mem_mode | 4;
 }
 
@@ -823,13 +930,17 @@ fn pe_mp_note(name: i64, n: i64) {
     lrt_mp_allocs = lrt_mp_allocs + 1;
     lrt_mp_bytes = lrt_mp_bytes + n;
     lrt_mp_live = lrt_mp_live + n;
-    if lrt_mp_live > lrt_mp_peak { lrt_mp_peak = lrt_mp_live; }
+    if lrt_mp_live > lrt_mp_peak {
+        lrt_mp_peak = lrt_mp_live;
+    }
     if lrt_mp_tab == 0 {
         lrt_mp_tab = pe_mmap(LRT_MP_CAP * LRT_MP_ENT);
     }
     // name 0 has the slot whose name word is -1
     var key: i64 = name;
-    if key == 0 { key = 0 - 1; }
+    if key == 0 {
+        key = 0 - 1;
+    }
     var i: i64 = ((key >> 3) * 40503) & (LRT_MP_CAP - 1);
     var k: i64 = 0;
     while k < LRT_MP_CAP {
@@ -852,7 +963,9 @@ fn pe_mp_note(name: i64, n: i64) {
             return;
         }
         i = i + 1;
-        if i == LRT_MP_CAP { i = 0; }
+        if i == LRT_MP_CAP {
+            i = 0;
+        }
         k = k + 1;
     }
     lrt_mp_lost = lrt_mp_lost + n;
@@ -861,17 +974,23 @@ fn pe_mp_note(name: i64, n: i64) {
 /// The profile at exit (pe_rt_exit, pert_exit): the totals and peak, then
 /// up to 20 functions, the most bytes first (then the most allocations).
 fn pe_mem_report() {
-    if (lrt_mem_mode & 4) == 0 || pe_sigbuf == 0 { return; }
+    if (lrt_mem_mode & 4) == 0 || pe_sigbuf == 0 {
+        return;
+    }
     // what the program did, before printing: printing allocates on some
     // targets (the Windows layer), and those blocks are not counted
-    if pe_mt != 0 { pe_lock(pe_heap_lock); }
+    if pe_mt != 0 {
+        pe_lock(pe_heap_lock);
+    }
     lrt_mem_mode = lrt_mem_mode & (0 - 5);
     val allocs: i64 = lrt_mp_allocs;
     val bytes: i64 = lrt_mp_bytes;
     val frees: i64 = lrt_mp_frees;
     val freed: i64 = lrt_mp_freed;
     val peak: i64 = lrt_mp_peak;
-    if pe_mt != 0 { pe_unlock(pe_heap_lock); }
+    if pe_mt != 0 {
+        pe_unlock(pe_heap_lock);
+    }
     pert_eprint_str("fid --mem: " as i64);
     pe_eprint_int(allocs);
     pert_eprint_str(" allocation(s), " as i64);
@@ -883,7 +1002,9 @@ fn pe_mem_report() {
     pert_eprint_str(" bytes); peak " as i64);
     pe_eprint_int(peak);
     pert_eprint_str(" bytes live\n" as i64);
-    if lrt_mp_tab == 0 { return; }
+    if lrt_mp_tab == 0 {
+        return;
+    }
     pert_eprint_str("  by function:\n" as i64);
     var shown: i64 = 0;
     var more: bool = true;
@@ -939,20 +1060,28 @@ fn pe_mem_report() {
 
 fn pe_malloc_raw(size: i64) -> i64 {
     var n: i64 = size;
-    if n < 0 { n = 0; }
+    if n < 0 {
+        n = 0;
+    }
     var need: i64 = n + 8;
     if need > 1048576 {
         var total: i64 = (n + 16 + 4095) & (0 - 4096);
         // roadmap P12: FID_MEM_LIMIT (sys.fd)
-        if lrt_lim_mem != 0 { pe_lim_take(total); }
+        if lrt_lim_mem != 0 {
+            pe_lim_take(total);
+        }
         var big: i64 = pe_mmap(total);
         pe_st(big, total);
         pe_st(big + 8, pe_magic() + PE_LARGE);
         return big + 16;
     }
     var k: i64 = 4;
-    while (1 << k) < need { k = k + 1; }
-    if lrt_lim_mem != 0 { pe_lim_take(1 << k); }
+    while (1 << k) < need {
+        k = k + 1;
+    }
+    if lrt_lim_mem != 0 {
+        pe_lim_take(1 << k);
+    }
     var lists: i64 = pe_lists();
     var head: i64 = pe_ld(lists + k * 8);
     if head != 0 {
@@ -984,7 +1113,9 @@ pub fn pert_alloc(size: i64) -> i64 {
 }
 
 pub fn pert_free(p: i64) {
-    if p == 0 { return; }
+    if p == 0 {
+        return;
+    }
     if pe_mt == 0 {
         pe_free_raw(p);
         return;
@@ -1009,12 +1140,16 @@ fn pe_free_raw(p: i64) {
         return;
     }
     if k == PE_LARGE {
-        if lrt_lim_mem != 0 { pe_lim_give(pe_ld(p - 16)); }
+        if lrt_lim_mem != 0 {
+            pe_lim_give(pe_ld(p - 16));
+        }
         pe_sys(PE_SYS_MUNMAP, p - 16, pe_ld(p - 16), 0);
         return;
     }
     // roadmap P12: FID_MEM_LIMIT (sys.fd)
-    if lrt_lim_mem != 0 { pe_lim_give(1 << k); }
+    if lrt_lim_mem != 0 {
+        pe_lim_give(1 << k);
+    }
     var mark: i64 = 0;
     if k >= PE_DECOMMIT_K && pe_decommit(p, 1 << k) {
         mark = PE_DECOMMITTED;
@@ -1026,7 +1161,9 @@ fn pe_free_raw(p: i64) {
     // RT7: past the threshold, empty chunks go back to the system
     if mark == 0 {
         pe_fl_bytes = pe_fl_bytes + (1 << k);
-        if pe_fl_bytes > pe_trim_next { pe_trim(); }
+        if pe_fl_bytes > pe_trim_next {
+            pe_trim();
+        }
     }
 }
 
@@ -1059,7 +1196,9 @@ fn pe_page_hi(p: i64, size: i64) -> i64 {
 fn pe_decommit(p: i64, size: i64) -> bool {
     val lo: i64 = pe_page_lo(p);
     val hi: i64 = pe_page_hi(p, size);
-    if hi - lo < PE_DECOMMIT_ALIGN { return false; }
+    if hi - lo < PE_DECOMMIT_ALIGN {
+        return false;
+    }
     // PROT_READ|WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED
     val r: i64 = nat_syscall(PE_SYS_MMAP, lo, hi - lo, 3, 50, 0 - 1, 0);
     return r == lo;
@@ -1074,12 +1213,16 @@ pub fn pert_mem_resident() -> i64 {
         return nat_syscall(1014, 0, 0, 0, 0, 0, 0);
     }
     val fd: i64 = pe_open("/proc/self/statm" as i64, 0);
-    if fd < 0 { return 0 - 1; }
+    if fd < 0 {
+        return 0 - 1;
+    }
     val buf: i64 = pert_malloc(128);
     val n: i64 = pe_sys(PE_SYS_READ, fd, buf, 127);
     pe_sys(PE_SYS_CLOSE, fd, 0, 0);
     var i: i64 = 0;
-    while i < n && pe_ldb(buf + i) != 32 { i = i + 1; }
+    while i < n && pe_ldb(buf + i) != 32 {
+        i = i + 1;
+    }
     i = i + 1;
     var pages: i64 = 0;
     var digits: i64 = 0;
@@ -1089,7 +1232,9 @@ pub fn pert_mem_resident() -> i64 {
         i = i + 1;
     }
     pert_free(buf);
-    if digits == 0 { return 0 - 1; }
+    if digits == 0 {
+        return 0 - 1;
+    }
     return pages * 4096;
 }
 
@@ -1100,7 +1245,9 @@ fn pe_write_all(fd: i64, buf: i64, n: i64) {
     var left: i64 = n;
     while left > 0 {
         var w: i64 = pe_sys(PE_SYS_WRITE, fd, at, left);
-        if w <= 0 { return; }
+        if w <= 0 {
+            return;
+        }
         at = at + w;
         left = left - w;
     }
@@ -1109,21 +1256,31 @@ fn pe_write_all(fd: i64, buf: i64, n: i64) {
 /// The length of a string: its header's (core's length-headered strings),
 /// else up to its NUL.
 fn pe_len(s: i64) -> i64 {
-    if s == 0 { return 0; }
+    if s == 0 {
+        return 0;
+    }
     var h: i64 = p_str_hdr_len(s);
-    if h >= 0 { return h; }
+    if h >= 0 {
+        return h;
+    }
     var n: i64 = 0;
-    while pe_ldb(s + n) != 0 { n = n + 1; }
+    while pe_ldb(s + n) != 0 {
+        n = n + 1;
+    }
     return n;
 }
 
 pub fn pert_print_str(s: i64) {
-    if s == 0 { return; }
+    if s == 0 {
+        return;
+    }
     pe_write_all(1, s, pe_len(s));
 }
 
 pub fn pert_eprint_str(s: i64) {
-    if s == 0 { return; }
+    if s == 0 {
+        return;
+    }
     pe_write_all(2, s, pe_len(s));
 }
 
@@ -1139,7 +1296,11 @@ pub fn pert_print_int(v: i64) {
 }
 
 pub fn pert_print_bool(b: bool) {
-    if b { pe_write_all(1, "true" as i64, 4); } else { pe_write_all(1, "false" as i64, 5); }
+    if b {
+        pe_write_all(1, "true" as i64, 4);
+    } else {
+        pe_write_all(1, "false" as i64, 5);
+    }
 }
 
 pub fn pert_print_float(val: f64) {
@@ -1236,10 +1397,12 @@ fn pe_altstack_on(t: i64) {
 
 fn pe_altstack_off(t: i64) {
     var ss: i64 = pe_ld(t + 8);
-    if ss == 0 { return; }
+    if ss == 0 {
+        return;
+    }
     var st: i64 = pert_malloc(24);
     pe_st(st, 0);
-    pe_st(st + 8, 2);                 // SS_DISABLE
+    pe_st(st + 8, 2);  // SS_DISABLE
     pe_st(st + 16, 0);
     pe_sys(PE_SYS_SIGALTSTACK, st, 0, 0);
     pert_free(st);
@@ -1251,7 +1414,9 @@ fn pe_altstack_off(t: i64) {
 /// limit). `private`: a word only this process waits on.
 fn pe_futex_wait(addr: i64, val: i64, ms: i64, private: bool) {
     var op: i64 = 0;
-    if private { op = 128; }
+    if private {
+        op = 128;
+    }
     if ms < 0 {
         nat_syscall(PE_SYS_FUTEX, addr, op, val, 0, 0, 0);
         return;
@@ -1268,18 +1433,18 @@ fn pe_futex_wake(addr: i64, n: i64) {
     nat_syscall(PE_SYS_FUTEX, addr, 129, n, 0, 0, 0);
 }
 
-var pe_sig_flags: i64 = 0;    // [0, 64): arrived; [64, 128): registered
+var pe_sig_flags: i64 = 0;  // [0, 64): arrived; [64, 128): registered
 var pe_sigbuf: i64 = 0;
 
 fn pe_sig_install(sig: i64) -> i64 {
     var act: i64 = pert_malloc(32);
     pe_zero(act, 32);
     pe_st(act, nat_sig_handler());
-    pe_st(act + 8, 134217732);        // SA_SIGINFO | SA_ONSTACK
+    pe_st(act + 8, 134217732);  // SA_SIGINFO | SA_ONSTACK
     // x86-64 returns from a handler through the restorer it is given
     var restorer: i64 = nat_sig_restorer();
     if restorer != 0 {
-        pe_st(act + 8, 134217732 | 67108864);     // | SA_RESTORER
+        pe_st(act + 8, 134217732 | 67108864);  // | SA_RESTORER
         pe_st(act + 16, restorer);
     }
     var r: i64 = nat_syscall(PE_SYS_RT_SIGACTION, sig, act, 0, 8, 0, 0);
@@ -1343,7 +1508,11 @@ fn pe_fd_hex(fd: i64, v: i64) {
         var d: i64 = (v >> (i * 4)) & 15;
         if d != 0 || started || i == 0 {
             started = true;
-            if d < 10 { pe_stb(pe_sigbuf + n, 48 + d); } else { pe_stb(pe_sigbuf + n, 87 + d); }
+            if d < 10 {
+                pe_stb(pe_sigbuf + n, 48 + d);
+            } else {
+                pe_stb(pe_sigbuf + n, 87 + d);
+            }
             n = n + 1;
         }
         i = i - 1;
@@ -1375,24 +1544,32 @@ pub fn pe_on_signal(sig: i64, info: i64) {
             var cur: i64 = pe_ld(t);
             if cur != 0 {
                 var base: i64 = pe_ld(cur + 120);
-                if base != 0 && addr >= base && addr < base + PE_GUARD { over = true; }
+                if base != 0 && addr >= base && addr < base + PE_GUARD {
+                    over = true;
+                }
             }
             var glo: i64 = pe_ld(t + 16);
             var ghi: i64 = pe_ld(t + 24);
-            if glo != 0 && addr >= glo && addr < ghi { over = true; }
+            if glo != 0 && addr >= glo && addr < ghi {
+                over = true;
+            }
             if glo == 0 && cur == 0 {
                 var top: i64 = nat_start_sp();
-                if addr < top && addr >= top - pe_main_stack_win { over = true; }
+                if addr < top && addr >= top - pe_main_stack_win {
+                    over = true;
+                }
             }
         }
     }
     // CM9: a fault on a --checked-alloc block's pages says what the block was
     var ck: bool = false;
-    if !over && (sig == 11 || sig == 7) { ck = pe_ck_fault(addr); }
+    if !over && (sig == 11 || sig == 7) {
+        ck = pe_ck_fault(addr);
+    }
     if over {
         pert_eprint_str("Panic: Stack overflow\n" as i64);
     } else if ck {
-        // (pe_ck_fault printed it)
+    // (pe_ck_fault printed it)
     } else if sig == 11 || sig == 7 {
         pert_eprint_str("Panic: Invalid memory access (null or dangling pointer) at " as i64);
         pe_eprint_hex(addr);
@@ -1400,9 +1577,13 @@ pub fn pe_on_signal(sig: i64, info: i64) {
     } else {
         pert_eprint_str("Panic: signal " as i64);
         pe_eprint_int(sig);
-        if sig == 6 { pert_eprint_str(" (SIGABRT)\n" as i64); }
-        else if sig == 8 { pert_eprint_str(" (SIGFPE)\n" as i64); }
-        else { pert_eprint_str(" (UNKNOWN)\n" as i64); }
+        if sig == 6 {
+            pert_eprint_str(" (SIGABRT)\n" as i64);
+        } else if sig == 8 {
+            pert_eprint_str(" (SIGFPE)\n" as i64);
+        } else {
+            pert_eprint_str(" (UNKNOWN)\n" as i64);
+        }
     }
     // CE8: -g: the values of the frame the trace starts at (as the C
     // backend: an invalid access, not a stack overflow)
@@ -1428,9 +1609,13 @@ pub fn pe_on_signal(sig: i64, info: i64) {
         } else {
             pe_fd_str(rfd, "signal " as i64);
             pe_fd_int(rfd, sig);
-            if sig == 6 { pe_fd_str(rfd, " (SIGABRT)" as i64); }
-            else if sig == 8 { pe_fd_str(rfd, " (SIGFPE)" as i64); }
-            else { pe_fd_str(rfd, " (UNKNOWN)" as i64); }
+            if sig == 6 {
+                pe_fd_str(rfd, " (SIGABRT)" as i64);
+            } else if sig == 8 {
+                pe_fd_str(rfd, " (SIGFPE)" as i64);
+            } else {
+                pe_fd_str(rfd, " (UNKNOWN)" as i64);
+            }
         }
         pe_fd_str(rfd, "\n" as i64);
         pe_crash_close(rfd, nat_frame_fp());
@@ -1460,15 +1645,23 @@ pub fn pe_on_signal_uc(sig: i64, info: i64, uc: i64) {
 /// runtime's own tables, e.g. lrt_sens_table's, are not leaks).
 fn pe_is_rt_name(n: i64) -> bool {
     if pe_ldb(n) == 112 && pe_ldb(n + 1) == 101 {
-        if pe_ldb(n + 2) == 95 { return true; }
-        if pe_ldb(n + 2) == 114 && pe_ldb(n + 3) == 116 && pe_ldb(n + 4) == 95 { return true; }
+        if pe_ldb(n + 2) == 95 {
+            return true;
+        }
+        if pe_ldb(n + 2) == 114 && pe_ldb(n + 3) == 116 && pe_ldb(n + 4) == 95 {
+            return true;
+        }
     }
-    if pe_ldb(n) == 108 && pe_ldb(n + 1) == 114 && pe_ldb(n + 2) == 116 && pe_ldb(n + 3) == 95 { return true; }
+    if pe_ldb(n) == 108 && pe_ldb(n + 1) == 114 && pe_ldb(n + 2) == 116 && pe_ldb(n + 3) == 95 {
+        return true;
+    }
     return pe_ldb(n) == 110 && pe_ldb(n + 1) == 97 && pe_ldb(n + 2) == 116 && pe_ldb(n + 3) == 95;
 }
 
 fn pe_trace_flush(fd: i64, name: i64, reps: i64) {
-    if name == 0 { return; }
+    if name == 0 {
+        return;
+    }
     pe_fd_str(fd, "    -| called from " as i64);
     pe_fd_str(fd, name);
     if reps > 1 {
@@ -1482,7 +1675,9 @@ fn pe_trace_flush(fd: i64, name: i64, reps: i64) {
 /// String s on file descriptor fd (pert_eprint_str's fd 2, or a crash
 /// report: CO9). Allocates nothing.
 fn pe_fd_str(fd: i64, s: i64) {
-    if s == 0 { return; }
+    if s == 0 {
+        return;
+    }
     pe_write_all(fd, s, pe_len(s));
 }
 
@@ -1497,11 +1692,17 @@ fn pe_trace_from(fp0: i64) {
 /// pe_trace_from on file descriptor fd; `head`: the "stack trace:" line
 /// first (a crash report has its own "trace:" line, CO9).
 fn pe_trace_to(fd: i64, fp0: i64, head: bool) {
-    if pe_sigbuf == 0 { return; }
+    if pe_sigbuf == 0 {
+        return;
+    }
     var tab: i64 = nat_fn_names();
     var m: i64 = 0;
-    while pe_ld(tab + m * 16 + 8) != 0 { m = m + 1; }
-    if m == 0 { return; }
+    while pe_ld(tab + m * 16 + 8) != 0 {
+        m = m + 1;
+    }
+    if m == 0 {
+        return;
+    }
     var lo_code: i64 = pe_ld(tab);
     var end_code: i64 = pe_ld(tab + m * 16);
     var fp: i64 = fp0;
@@ -1518,12 +1719,18 @@ fn pe_trace_to(fd: i64, fp0: i64, head: bool) {
             var hi: i64 = m - 1;
             while lo < hi {
                 var mid: i64 = (lo + hi + 1) / 2;
-                if pe_ld(tab + mid * 16) <= pc { lo = mid; } else { hi = mid - 1; }
+                if pe_ld(tab + mid * 16) <= pc {
+                    lo = mid;
+                } else {
+                    hi = mid - 1;
+                }
             }
             var name: i64 = pe_ld(tab + lo * 16 + 8);
             if !pe_is_rt_name(name) {
                 if !shown {
-                    if head { pe_fd_str(fd, "stack trace:\n" as i64); }
+                    if head {
+                        pe_fd_str(fd, "stack trace:\n" as i64);
+                    }
                     pe_fd_str(fd, "    - " as i64);
                     pe_fd_str(fd, name);
                     pe_fd_str(fd, "\n" as i64);
@@ -1570,7 +1777,9 @@ var lrt_crash_busy: i64 = 0;
 /// string: no header before it to read).
 fn pe_cstr_len(s: i64) -> i64 {
     var n: i64 = 0;
-    while pe_ldb(s + n) != 0 { n = n + 1; }
+    while pe_ldb(s + n) != 0 {
+        n = n + 1;
+    }
     return n;
 }
 
@@ -1579,15 +1788,21 @@ fn pe_cstr_len(s: i64) -> i64 {
 /// is not set or empty. Allocates nothing (pert_getenv copies it).
 fn pe_env_ptr(name: i64) -> i64 {
     var sp: i64 = nat_start_sp();
-    if sp == 0 { return 0; }
+    if sp == 0 {
+        return 0;
+    }
     var at: i64 = sp + 8 + (pe_ld(sp) + 1) * 8;
     var n: i64 = pe_len(name);
     while pe_ld(at) != 0 {
         var e: i64 = pe_ld(at);
         var j: i64 = 0;
-        while j < n && pe_ldb(e + j) == pe_ldb(name + j) { j = j + 1; }
+        while j < n && pe_ldb(e + j) == pe_ldb(name + j) {
+            j = j + 1;
+        }
         if j == n && pe_ldb(e + n) == 61 {
-            if pe_ldb(e + n + 1) == 0 { return 0; }
+            if pe_ldb(e + n + 1) == 0 {
+                return 0;
+            }
             return e + n + 1;
         }
         at = at + 8;
@@ -1599,11 +1814,15 @@ fn pe_env_ptr(name: i64) -> i64 {
 /// program), or -1: FID_CRASH_REPORT not set, the file cannot be written
 /// (stderr says so), or a report was started already.
 fn pe_crash_open() -> i64 {
-    if lrt_crash_busy != 0 || pe_sigbuf == 0 { return 0 - 1; }
+    if lrt_crash_busy != 0 || pe_sigbuf == 0 {
+        return 0 - 1;
+    }
     lrt_crash_busy = 1;
     var path: i64 = pe_env_ptr("FID_CRASH_REPORT" as i64);
-    if path == 0 { return 0 - 1; }
-    var fd: i64 = pe_open(path, 577);                 // WRONLY|CREAT|TRUNC
+    if path == 0 {
+        return 0 - 1;
+    }
+    var fd: i64 = pe_open(path, 577);  // WRONLY|CREAT|TRUNC
     if fd < 0 {
         pe_fd_str(2, "crash report: cannot write " as i64);
         pe_write_all(2, path, pe_cstr_len(path));
@@ -1615,7 +1834,9 @@ fn pe_crash_open() -> i64 {
     pe_fd_str(fd, "\nprogram: " as i64);
     var sp: i64 = nat_start_sp();
     var arg0: i64 = 0;
-    if sp != 0 && pe_ld(sp) > 0 { arg0 = pe_ld(sp + 8); }
+    if sp != 0 && pe_ld(sp) > 0 {
+        arg0 = pe_ld(sp + 8);
+    }
     if arg0 != 0 {
         pe_write_all(fd, arg0, pe_cstr_len(arg0));
     } else {
@@ -1633,7 +1854,9 @@ fn pe_crash_close(fd: i64, fp0: i64) {
     pe_fd_str(fd, "end\n" as i64);
     pe_sys(PE_SYS_CLOSE, fd, 0, 0);
     var path: i64 = pe_env_ptr("FID_CRASH_REPORT" as i64);
-    if path == 0 { return; }
+    if path == 0 {
+        return;
+    }
     var pn: i64 = pe_cstr_len(path);
     pe_fd_str(2, "crash report: " as i64);
     pe_write_all(2, path, pn);
@@ -1647,19 +1870,31 @@ fn pe_crash_close(fd: i64, fp0: i64) {
 /// FID_CRASH_REPORT asks for one.
 fn pe_crash_report(msg: i64, fp0: i64) {
     var fd: i64 = pe_crash_open();
-    if fd < 0 { return; }
+    if fd < 0 {
+        return;
+    }
     var n: i64 = 0;
-    if msg != 0 { n = pe_len(msg); }
+    if msg != 0 {
+        n = pe_len(msg);
+    }
     var at: i64 = 0;
     while true {
         var e: i64 = at;
-        while e < n && pe_ldb(msg + e) != 10 { e = e + 1; }
+        while e < n && pe_ldb(msg + e) != 10 {
+            e = e + 1;
+        }
         var len: i64 = e - at;
-        if len > 0 && pe_ldb(msg + at + len - 1) == 13 { len = len - 1; }
+        if len > 0 && pe_ldb(msg + at + len - 1) == 13 {
+            len = len - 1;
+        }
         pe_fd_str(fd, "message: " as i64);
-        if len > 0 { pe_write_all(fd, msg + at, len); }
+        if len > 0 {
+            pe_write_all(fd, msg + at, len);
+        }
         pe_fd_str(fd, "\n" as i64);
-        if e >= n { break; }
+        if e >= n {
+            break;
+        }
         at = e + 1;
     }
     pe_crash_close(fd, fp0);
@@ -1683,7 +1918,9 @@ var lrt_dbg_frames_busy: i64 = 0;
 /// The frames array of the image's frame table, 0 when it has none (a
 /// build without -g). `tab` is nat_fn_names(), `m` its function count.
 fn pe_dbg_frames_tab(tab: i64, m: i64) -> i64 {
-    if pe_ld(tab + m * 16 + 16) != PE_DBG_FRAMES_MAGIC { return 0; }
+    if pe_ld(tab + m * 16 + 16) != PE_DBG_FRAMES_MAGIC {
+        return 0;
+    }
     return pe_ld(tab + m * 16 + 24);
 }
 
@@ -1691,7 +1928,9 @@ fn pe_dbg_frames_tab(tab: i64, m: i64) -> i64 {
 /// keep the frame record [fp, return address] 16 bytes under it, RISC-V's
 /// s0 is the CFA itself (nat_ir.fd ng_cfi_saves, nat_frame_ret).
 fn pe_dbg_cfa(fp: i64) -> i64 {
-    if nat_arch() == 2 { return fp; }
+    if nat_arch() == 2 {
+        return fp;
+    }
     return fp + 16;
 }
 
@@ -1716,7 +1955,9 @@ fn pe_dbg_eprint_u64(v: i64) {
 /// The low `bits` bits of v as a signed number.
 fn pe_dbg_sext(v: i64, bits: i64) -> i64 {
     var top: i64 = 1 << (bits - 1);
-    if (v & top) != 0 { return v - (top << 1); }
+    if (v & top) != 0 {
+        return v - (top << 1);
+    }
     return v;
 }
 
@@ -1725,7 +1966,9 @@ fn pe_dbg_sext(v: i64, bits: i64) -> i64 {
 fn pe_dbg_frac(f0: i64, w0: i64) {
     var f: i64 = f0;
     var w: i64 = w0;
-    if f == 0 || w <= 0 { return; }
+    if f == 0 || w <= 0 {
+        return;
+    }
     while f % 10 == 0 {
         f = f / 10;
         w = w - 1;
@@ -1745,7 +1988,9 @@ fn pe_dbg_frac(f0: i64, w0: i64) {
 
 /// The f64 with bits b as C's %g prints it (six significant digits).
 fn pe_dbg_eprint_f64(b: i64) {
-    if b < 0 { pe_dbg_ech(45); }
+    if b < 0 {
+        pe_dbg_ech(45);
+    }
     var ab: i64 = b & 0x7FFFFFFFFFFFFFFF;
     if (ab >> 52) == 0x7FF {
         if (ab & 0xFFFFFFFFFFFFF) != 0 {
@@ -1785,7 +2030,9 @@ fn pe_dbg_eprint_f64(b: i64) {
         } else {
             pe_dbg_ech(43);
         }
-        if ee < 10 { pe_dbg_ech(48); }
+        if ee < 10 {
+            pe_dbg_ech(48);
+        }
         pe_eprint_int(ee);
         return;
     }
@@ -1804,14 +2051,18 @@ fn pe_dbg_f32_bits(b0: i64) -> i64 {
     var b: i64 = b0 & 0xFFFFFFFF;
     var one: i64 = 1;
     var sign: i64 = 0;
-    if ((b >> 31) & 1) != 0 { sign = one << 63; }
+    if ((b >> 31) & 1) != 0 {
+        sign = one << 63;
+    }
     var ex: i64 = (b >> 23) & 0xFF;
     var mt: i64 = b & 0x7FFFFF;
     if ex == 0xFF {
         return sign | (0x7FF << 52) | (mt << 29);
     }
     if ex == 0 {
-        if mt == 0 { return sign; }
+        if mt == 0 {
+            return sign;
+        }
         // a subnormal f32 is a normal f64
         var e: i64 = 0 - 126;
         while mt < 0x800000 {
@@ -1838,11 +2089,15 @@ fn pe_dbg_eprint_str(s: i64) {
         return;
     }
     var n: i64 = l;
-    if n > 60 { n = 60; }
+    if n > 60 {
+        n = 60;
+    }
     pe_dbg_ech(34);
     pe_write_all(2, s, n);
     pe_dbg_ech(34);
-    if l > 60 { pert_eprint_str("..." as i64); }
+    if l > 60 {
+        pert_eprint_str("..." as i64);
+    }
 }
 
 /// The word v of a variable of kind `kind` (cg_dbg_kind's letters).
@@ -1896,7 +2151,9 @@ fn pe_dbg_frame_values(name: i64, rec: i64, cfa: i64) {
         var place: i64 = pe_ld(e + 16);
         var v: i64 = pe_ld(e + 24);
         if nm != 0 && (place == 1 || place == 2) {
-            if place == 1 { v = pe_ld(cfa + v); }
+            if place == 1 {
+                v = pe_ld(cfa + v);
+            }
             pert_eprint_str("    " as i64);
             pert_eprint_str(nm);
             pert_eprint_str(" = " as i64);
@@ -1912,13 +2169,21 @@ fn pe_dbg_frame_values(name: i64, rec: i64, cfa: i64) {
 /// trace) whose code holds the return address and which has a record.
 /// Nothing without a frame table (no -g) or before the runtime is set up.
 pub fn pe_dbg_frame_print(fp0: i64) {
-    if pe_sigbuf == 0 || lrt_dbg_frames_busy != 0 { return; }
+    if pe_sigbuf == 0 || lrt_dbg_frames_busy != 0 {
+        return;
+    }
     var tab: i64 = nat_fn_names();
     var m: i64 = 0;
-    while pe_ld(tab + m * 16 + 8) != 0 { m = m + 1; }
-    if m == 0 { return; }
+    while pe_ld(tab + m * 16 + 8) != 0 {
+        m = m + 1;
+    }
+    if m == 0 {
+        return;
+    }
     var frames: i64 = pe_dbg_frames_tab(tab, m);
-    if frames == 0 { return; }
+    if frames == 0 {
+        return;
+    }
     lrt_dbg_frames_busy = 1;
     var lo_code: i64 = pe_ld(tab);
     var end_code: i64 = pe_ld(tab + m * 16);
@@ -1934,7 +2199,11 @@ pub fn pe_dbg_frame_print(fp0: i64) {
             var hi: i64 = m - 1;
             while lo < hi {
                 var mid: i64 = (lo + hi + 1) / 2;
-                if pe_ld(tab + mid * 16) <= pc { lo = mid; } else { hi = mid - 1; }
+                if pe_ld(tab + mid * 16) <= pc {
+                    lo = mid;
+                } else {
+                    hi = mid - 1;
+                }
             }
             var name: i64 = pe_ld(tab + lo * 16 + 8);
             var rec: i64 = pe_ld(frames + lo * 8);
@@ -2118,7 +2387,9 @@ pub fn pert_mem_copy(dst: i64, src: i64, n: i64) {
             var d8: *mut i64 = dst + off;
             // SAFETY: off + 8 <= n and both addresses 8-aligned: a word of
             // the n bytes core's caller vouches for at src and at dst.
-            unsafe { *d8 = *s8; }
+            unsafe {
+                *d8 = *s8;
+            }
             off = off + 8;
         }
     }
@@ -2126,7 +2397,9 @@ pub fn pert_mem_copy(dst: i64, src: i64, n: i64) {
         var s1: *mut u8 = src + off;
         var d1: *mut u8 = dst + off;
         // SAFETY: off < n: a byte of the n bytes at src and at dst.
-        unsafe { *d1 = *s1; }
+        unsafe {
+            *d1 = *s1;
+        }
         off = off + 1;
     }
 }
@@ -2140,14 +2413,18 @@ pub fn pert_bytes_eq(a: i64, b: i64, n: i64) -> bool {
     if ((a ^ b) & 7) == 0 {
         // OP23: equally misaligned: bytes up to a's word boundary first
         while off < n && ((a + off) & 7) != 0 {
-            if pe_ldb(a + off) != pe_ldb(b + off) { return false; }
+            if pe_ldb(a + off) != pe_ldb(b + off) {
+                return false;
+            }
             off = off + 1;
         }
         // then 16-byte blocks (pert_vblk_diff), then words
         if n - off >= 16 {
             var left: i64 = n - off;
             var d: i64 = pert_vblk_diff(a + off, b + off, left);
-            if d < (left & (0 - 16)) { return false; }
+            if d < (left & (0 - 16)) {
+                return false;
+            }
             off = off + d;
         }
         while off + 8 <= n {
@@ -2157,8 +2434,13 @@ pub fn pert_bytes_eq(a: i64, b: i64, n: i64) -> bool {
             var y: i64 = 0;
             // SAFETY: off + 8 <= n, both 8-aligned: a word of the n bytes at a
             // and at b.
-            unsafe { x = *a8; y = *b8; }
-            if x != y { return false; }
+            unsafe {
+                x = *a8;
+                y = *b8;
+            }
+            if x != y {
+                return false;
+            }
             off = off + 8;
         }
     }
@@ -2168,8 +2450,13 @@ pub fn pert_bytes_eq(a: i64, b: i64, n: i64) -> bool {
         var xb: i64 = 0;
         var yb: i64 = 0;
         // SAFETY: off < n: a byte of the n bytes at a and at b.
-        unsafe { xb = *a1; yb = *b1; }
-        if xb != yb { return false; }
+        unsafe {
+            xb = *a1;
+            yb = *b1;
+        }
+        if xb != yb {
+            return false;
+        }
         off = off + 1;
     }
     return true;
@@ -2184,8 +2471,12 @@ pub fn pert_mem_find_byte(p: i64, n: i64, b: i64) -> i64 {
         var hp: *mut u8 = p + i;
         var hx: i64 = 0;
         // SAFETY: i < n: a byte of the n bytes at p.
-        unsafe { hx = *hp; }
-        if hx == b { return i; }
+        unsafe {
+            hx = *hp;
+        }
+        if hx == b {
+            return i;
+        }
         i = i + 1;
     }
     var lo: i64 = 0x0101010101010101;
@@ -2206,10 +2497,16 @@ pub fn pert_mem_find_byte(p: i64, n: i64, b: i64) -> i64 {
         var wp: *mut i64 = p + i;
         var w: i64 = 0;
         // SAFETY: i + 8 <= n and p + i 8-aligned: a word of the n bytes at p.
-        unsafe { w = *wp; }
+        unsafe {
+            w = *wp;
+        }
         var x: i64 = w ^ rep;
         // a zero byte in x is a match in w: stop, the tail finds which
-        if ((x - lo) & (0 - x - 1) & hi) != 0 { scanning = false; } else { i = i + 8; }
+        if ((x - lo) & (0 - x - 1) & hi) != 0 {
+            scanning = false;
+        } else {
+            i = i + 8;
+        }
     }
     // the bytes left, and the word that held a match, one by one
     return pert_mem_find_byte_tail(p, n, b, i);
@@ -2221,8 +2518,12 @@ fn pert_mem_find_byte_tail(p: i64, n: i64, b: i64, from: i64) -> i64 {
         var tp: *mut u8 = p + j;
         var tx: i64 = 0;
         // SAFETY: j < n: a byte of the n bytes at p.
-        unsafe { tx = *tp; }
-        if tx == b { return j; }
+        unsafe {
+            tx = *tp;
+        }
+        if tx == b {
+            return j;
+        }
         j = j + 1;
     }
     return -1;
@@ -2232,8 +2533,12 @@ pub fn pert_str_concat(a: i64, b: i64) -> i64 {
     var la: i64 = pe_len(a);
     var lb: i64 = pe_len(b);
     var r: i64 = pe_new_str(la + lb);
-    if la > 0 { pe_copy(r, a, la); }
-    if lb > 0 { pe_copy(r + la, b, lb); }
+    if la > 0 {
+        pe_copy(r, a, la);
+    }
+    if lb > 0 {
+        pe_copy(r + la, b, lb);
+    }
     return r;
 }
 
@@ -2243,7 +2548,9 @@ fn pe_int_digits(v: i64, buf: i64) -> i64 {
     var n: i64 = 0;
     // Work on the negative value: -MIN does not fit
     var x: i64 = v;
-    if x > 0 { x = 0 - x; }
+    if x > 0 {
+        x = 0 - x;
+    }
     if x == 0 {
         pe_stb(buf, 48);
         return 1;
@@ -2277,7 +2584,9 @@ pub fn pert_to_str(v: i64) -> str {
 }
 
 pub fn pert_to_str_bool(b: bool) -> str {
-    if b { return pe_dup("true" as i64); }
+    if b {
+        return pe_dup("true" as i64);
+    }
     return pe_dup("false" as i64);
 }
 
@@ -2297,7 +2606,7 @@ pub fn pert_to_str_str(s: i64) -> str {
 /// (dropping a static string does nothing), so this and core's one-byte
 /// slices never allocate, as on the C path (codegen_c.fd __p_chr1).
 var lrt_chr1: i64 = 0;
-const LRT_STR_STATIC: i64 = 0x4649444553545202;   // core's P_STR_STATIC
+const LRT_STR_STATIC: i64 = 0x4649444553545202;  // core's P_STR_STATIC
 
 pub fn pert_char_to_str(c: i64) -> str {
     var t: i64 = lrt_chr1;
@@ -2307,7 +2616,7 @@ pub fn pert_char_to_str(c: i64) -> str {
         while i < 256 {
             pe_st(t + i * 24, LRT_STR_STATIC);
             pe_st(t + i * 24 + 8, 1);
-            pe_st(t + i * 24 + 16, i);      // the byte, its NUL, zero padding
+            pe_st(t + i * 24 + 16, i);  // the byte, its NUL, zero padding
             i = i + 1;
         }
         // two threads may both build one; either table stays valid
@@ -2332,8 +2641,8 @@ pub fn pert_print_map(m: i64) {
     p_str_free(s);
 }
 
-const LRT_STR_MAGIC: i64 = 0x4649444553545201;    // core's P_STR_MAGIC
-const LRT_STR_RC: i64 = 0x4649444500000000;       // core's P_STR_RC
+const LRT_STR_MAGIC: i64 = 0x4649444553545201;  // core's P_STR_MAGIC
+const LRT_STR_RC: i64 = 0x4649444500000000;  // core's P_STR_RC
 
 /// The header length of a non-null string, or -1 when it has no header:
 /// core's p_str_hdr_len (with p_str_len_word and p_str_count_of) in one
@@ -2344,28 +2653,50 @@ const LRT_STR_RC: i64 = 0x4649444500000000;       // core's P_STR_RC
 /// (P_STR_RC + a count in 1..2^30 with the append bit clear).
 @wrapping
 fn lrt_hdr_len(s: i64) -> i64 {
-    if (s & 7) != 0 { return 0 - 1; }
+    if (s & 7) != 0 {
+        return 0 - 1;
+    }
     var l: i64 = pe_ld(s - 8);
-    if l < 0 || l >= 0x10000000000 { return 0 - 1; }
+    if l < 0 || l >= 0x10000000000 {
+        return 0 - 1;
+    }
     var w: i64 = pe_ld(s - 16);
-    if w == LRT_STR_MAGIC || w == LRT_STR_STATIC { return l; }
+    if w == LRT_STR_MAGIC || w == LRT_STR_STATIC {
+        return l;
+    }
     var d: i64 = w - LRT_STR_RC;
-    if d < 0 || d >= 0x100000000 { return 0 - 1; }
-    if (d & 0x40000000) != 0 { return 0 - 1; }
-    if (d & 0x3FFFFFFF) >= 1 { return l; }
+    if d < 0 || d >= 0x100000000 {
+        return 0 - 1;
+    }
+    if (d & 0x40000000) != 0 {
+        return 0 - 1;
+    }
+    if (d & 0x3FFFFFFF) >= 1 {
+        return l;
+    }
     return 0 - 1;
 }
 
 pub fn pert_str_equal(a: i64, b: i64) -> bool {
-    if a == b { return true; }
-    if a == 0 || b == 0 { return false; }
+    if a == b {
+        return true;
+    }
+    if a == 0 || b == 0 {
+        return false;
+    }
     // both lengths from their headers in one call each; a string without
     // one (a C string, a pointer into a buffer) is measured by pe_len
     var la: i64 = lrt_hdr_len(a);
     var lb: i64 = lrt_hdr_len(b);
-    if la < 0 { la = pe_len(a); }
-    if lb < 0 { lb = pe_len(b); }
-    if la != lb { return false; }
+    if la < 0 {
+        la = pe_len(a);
+    }
+    if lb < 0 {
+        lb = pe_len(b);
+    }
+    if la != lb {
+        return false;
+    }
     // OP23: a word at a time where the two are equally aligned
     return pert_bytes_eq(a, b, la);
 }
@@ -2379,19 +2710,31 @@ pub fn pert_str_equal(a: i64, b: i64) -> bool {
 /// inside both strings.
 @wrapping
 pub fn pert_str_compare(a: i64, b: i64) -> i64 {
-    if a == b { return 0; }
-    if a == 0 { return 0 - 1; }
-    if b == 0 { return 1; }
+    if a == b {
+        return 0;
+    }
+    if a == 0 {
+        return 0 - 1;
+    }
+    if b == 0 {
+        return 1;
+    }
     var m: i64 = pe_len(a);
     var lb: i64 = pe_len(b);
-    if lb < m { m = lb; }
+    if lb < m {
+        m = lb;
+    }
     m = m + 1;
     var i: i64 = 0;
     if ((a ^ b) & 7) == 0 {
         var head: bool = true;
         while head && i < m && ((a + i) & 7) != 0 {
             var x0: i64 = pe_ldb(a + i);
-            if x0 != pe_ldb(b + i) || x0 == 0 { head = false; } else { i = i + 1; }
+            if x0 != pe_ldb(b + i) || x0 == 0 {
+                head = false;
+            } else {
+                i = i + 1;
+            }
         }
         if head && m - i >= 16 {
             // the 16-byte blocks that are equal and hold no NUL of a
@@ -2407,7 +2750,10 @@ pub fn pert_str_compare(a: i64, b: i64) -> i64 {
             var y: i64 = 0;
             // SAFETY: i + 8 <= m (the shorter length and its NUL), both
             // 8-aligned: a word of each string's own bytes.
-            unsafe { x = *a8; y = *b8; }
+            unsafe {
+                x = *a8;
+                y = *b8;
+            }
             // (x - 0x0101010101010101) & ~x & 0x8080808080808080: a NUL in x
             if x != y || ((x - 72340172838076673) & (~x) & -9187201950435737472) != 0 {
                 words = false;
@@ -2419,8 +2765,12 @@ pub fn pert_str_compare(a: i64, b: i64) -> i64 {
     while i < m {
         var xa: i64 = pe_ldb(a + i);
         var yb: i64 = pe_ldb(b + i);
-        if xa != yb { return xa - yb; }
-        if xa == 0 { return 0; }
+        if xa != yb {
+            return xa - yb;
+        }
+        if xa == 0 {
+            return 0;
+        }
         i = i + 1;
     }
     return 0;
@@ -2428,9 +2778,12 @@ pub fn pert_str_compare(a: i64, b: i64) -> i64 {
 
 /// FNV-1a over 8 bytes at a time: the Windows runtime's p_str_hash, so a
 /// HashMap of strings is laid out, and printed, the same.
-@wrapping pub fn pert_str_hash(s: i64) -> i64 {
+@wrapping
+pub fn pert_str_hash(s: i64) -> i64 {
     var hash: i64 = -3750763034362895579;
-    if s == 0 { return 0; }
+    if s == 0 {
+        return 0;
+    }
     var addr: i64 = s;
     // OP23: the words of each page in a tight loop (one page test per page,
     // one 64-bit zero-byte test per word: the function wraps), then the
@@ -2448,7 +2801,9 @@ pub fn pert_str_compare(a: i64, b: i64) -> i64 {
             // NUL's word and lim keeps the word inside the page of bytes
             // already read, so the read cannot fault (pe_ld's read, without
             // a call per word).
-            unsafe { w = *wp; }
+            unsafe {
+                w = *wp;
+            }
             // (w - 0x0101010101010101) & ~w & 0x8080808080808080: a zero byte
             if ((w - 72340172838076673) & (~w) & -9187201950435737472) != 0 {
                 going = false;
@@ -2465,7 +2820,9 @@ pub fn pert_str_compare(a: i64, b: i64) -> i64 {
             var k: i64 = 0;
             while k < 8 && whole {
                 var b: i64 = pe_ldb(addr + k);
-                if b == 0 { whole = false; }
+                if b == 0 {
+                    whole = false;
+                }
                 wc = wc | (b << (k * 8));
                 k = k + 1;
             }
@@ -2489,19 +2846,30 @@ pub fn pert_str_compare(a: i64, b: i64) -> i64 {
 }
 
 /// atoll: spaces, a sign, base-10 digits; 0 when there are none.
-@wrapping pub fn pert_str_to_int(s: i64) -> i64 {
-    if s == 0 { return 0; }
+@wrapping
+pub fn pert_str_to_int(s: i64) -> i64 {
+    if s == 0 {
+        return 0;
+    }
     var i: i64 = 0;
-    while pe_ldb(s + i) == 32 || pe_ldb(s + i) == 9 || pe_ldb(s + i) == 10 || pe_ldb(s + i) == 13 { i = i + 1; }
+    while pe_ldb(s + i) == 32 || pe_ldb(s + i) == 9 || pe_ldb(s + i) == 10 || pe_ldb(s + i) == 13 {
+        i = i + 1;
+    }
     var neg: bool = false;
-    if pe_ldb(s + i) == 45 { neg = true; i = i + 1; }
-    else if pe_ldb(s + i) == 43 { i = i + 1; }
+    if pe_ldb(s + i) == 45 {
+        neg = true;
+        i = i + 1;
+    } else if pe_ldb(s + i) == 43 {
+        i = i + 1;
+    }
     var v: i64 = 0;
     while pe_ldb(s + i) >= 48 && pe_ldb(s + i) <= 57 {
         v = v * 10 + (pe_ldb(s + i) - 48);
         i = i + 1;
     }
-    if neg { return 0 - v; }
+    if neg {
+        return 0 - v;
+    }
     return v;
 }
 
@@ -2518,49 +2886,91 @@ fn pe_pow10(k: i64) -> f64 {
 /// atof: sign, digits, fraction, exponent. Exact (as strtod) whenever the
 /// digits fit in 53 bits and the power of ten is at most 10^22.
 pub fn pert_str_to_float(s: i64) -> f64 {
-    if s == 0 { return 0.0; }
+    if s == 0 {
+        return 0.0;
+    }
     var i: i64 = 0;
-    while pe_ldb(s + i) == 32 || pe_ldb(s + i) == 9 || pe_ldb(s + i) == 10 { i = i + 1; }
+    while pe_ldb(s + i) == 32 || pe_ldb(s + i) == 9 || pe_ldb(s + i) == 10 {
+        i = i + 1;
+    }
     var neg: bool = false;
-    if pe_ldb(s + i) == 45 { neg = true; i = i + 1; }
-    else if pe_ldb(s + i) == 43 { i = i + 1; }
+    if pe_ldb(s + i) == 45 {
+        neg = true;
+        i = i + 1;
+    } else if pe_ldb(s + i) == 43 {
+        i = i + 1;
+    }
     var mant: i64 = 0;
     var digits: i64 = 0;
     var exp10: i64 = 0;
     while pe_ldb(s + i) >= 48 && pe_ldb(s + i) <= 57 {
-        if digits < 18 { mant = mant * 10 + (pe_ldb(s + i) - 48); digits = digits + 1; }
-        else { exp10 = exp10 + 1; }
+        if digits < 18 {
+            mant = mant * 10 + (pe_ldb(s + i) - 48);
+            digits = digits + 1;
+        } else {
+            exp10 = exp10 + 1;
+        }
         i = i + 1;
     }
     if pe_ldb(s + i) == 46 {
         i = i + 1;
         while pe_ldb(s + i) >= 48 && pe_ldb(s + i) <= 57 {
-            if digits < 18 { mant = mant * 10 + (pe_ldb(s + i) - 48); digits = digits + 1; exp10 = exp10 - 1; }
+            if digits < 18 {
+                mant = mant * 10 + (pe_ldb(s + i) - 48);
+                digits = digits + 1;
+                exp10 = exp10 - 1;
+            }
             i = i + 1;
         }
     }
     if pe_ldb(s + i) == 101 || pe_ldb(s + i) == 69 {
         i = i + 1;
         var eneg: bool = false;
-        if pe_ldb(s + i) == 45 { eneg = true; i = i + 1; }
-        else if pe_ldb(s + i) == 43 { i = i + 1; }
-        var e: i64 = 0;
-        while pe_ldb(s + i) >= 48 && pe_ldb(s + i) <= 57 {
-            if e < 10000 { e = e * 10 + (pe_ldb(s + i) - 48); }
+        if pe_ldb(s + i) == 45 {
+            eneg = true;
+            i = i + 1;
+        } else if pe_ldb(s + i) == 43 {
             i = i + 1;
         }
-        if eneg { exp10 = exp10 - e; } else { exp10 = exp10 + e; }
+        var e: i64 = 0;
+        while pe_ldb(s + i) >= 48 && pe_ldb(s + i) <= 57 {
+            if e < 10000 {
+                e = e * 10 + (pe_ldb(s + i) - 48);
+            }
+            i = i + 1;
+        }
+        if eneg {
+            exp10 = exp10 - e;
+        } else {
+            exp10 = exp10 + e;
+        }
     }
     var v: f64 = mant as f64;
     if exp10 > 0 {
-        if exp10 <= 22 { v = v * pe_pow10(exp10); }
-        else { var k: i64 = 0; while k < exp10 && k < 400 { v = v * 10.0; k = k + 1; } }
+        if exp10 <= 22 {
+            v = v * pe_pow10(exp10);
+        } else {
+            var k: i64 = 0;
+            while k < exp10 && k < 400 {
+                v = v * 10.0;
+                k = k + 1;
+            }
+        }
     } else if exp10 < 0 {
         var ne: i64 = 0 - exp10;
-        if ne <= 22 { v = v / pe_pow10(ne); }
-        else { var k2: i64 = 0; while k2 < ne && k2 < 400 { v = v / 10.0; k2 = k2 + 1; } }
+        if ne <= 22 {
+            v = v / pe_pow10(ne);
+        } else {
+            var k2: i64 = 0;
+            while k2 < ne && k2 < 400 {
+                v = v / 10.0;
+                k2 = k2 + 1;
+            }
+        }
     }
-    if neg { return 0.0 - v; }
+    if neg {
+        return 0.0 - v;
+    }
     return v;
 }
 
@@ -2572,8 +2982,12 @@ pub fn pert_str_to_float(s: i64) -> f64 {
 fn pe_round(x: f64) -> i64 {
     var r: i64 = x as i64;
     var frac: f64 = x - (r as f64);
-    if frac > 0.5 { return r + 1; }
-    if frac == 0.5 && (r & 1) == 1 { return r + 1; }
+    if frac > 0.5 {
+        return r + 1;
+    }
+    if frac == 0.5 && (r & 1) == 1 {
+        return r + 1;
+    }
     return r;
 }
 
@@ -2583,7 +2997,10 @@ fn pe_fixed(neg: bool, r: i64, p: i64) -> i64 {
     var dig: i64 = pert_malloc(48);
     var nd: i64 = pe_int_digits(r, dig);
     var at: i64 = 0;
-    if neg { pe_stb(buf, 45); at = 1; }
+    if neg {
+        pe_stb(buf, 45);
+        at = 1;
+    }
     if p == 0 {
         pe_copy(buf + at, dig, nd);
         at = at + nd;
@@ -2594,7 +3011,11 @@ fn pe_fixed(neg: bool, r: i64, p: i64) -> i64 {
             pe_stb(buf + at + 1, 46);
             at = at + 2;
             var z: i64 = 0;
-            while z < p - nd { pe_stb(buf + at, 48); at = at + 1; z = z + 1; }
+            while z < p - nd {
+                pe_stb(buf + at, 48);
+                at = at + 1;
+                z = z + 1;
+            }
             pe_copy(buf + at, dig, nd);
             at = at + nd;
         } else {
@@ -2606,8 +3027,12 @@ fn pe_fixed(neg: bool, r: i64, p: i64) -> i64 {
             at = at + p;
         }
         // No trailing zeros after the point
-        while pe_ldb(buf + at - 1) == 48 { at = at - 1; }
-        if pe_ldb(buf + at - 1) == 46 { at = at - 1; }
+        while pe_ldb(buf + at - 1) == 48 {
+            at = at - 1;
+        }
+        if pe_ldb(buf + at - 1) == 46 {
+            at = at - 1;
+        }
     }
     var r2: i64 = pe_dup_range(buf, 0, at);
     pert_free(buf);
@@ -2635,14 +3060,21 @@ fn pe_big_integer_text(neg: bool, a: f64) -> i64 {
             carry = x / 1000000000;
             li = li + 1;
         }
-        if carry > 0 { limbs.push(carry); }
+        if carry > 0 {
+            limbs.push(carry);
+        }
         k = k + 1;
     }
     var top: i64 = limbs.len() - 1;
-    while top > 0 && limbs.get(top) == 0 { top = top - 1; }
+    while top > 0 && limbs.get(top) == 0 {
+        top = top - 1;
+    }
     var buf: i64 = pert_malloc(400);
     var at: i64 = 0;
-    if neg { pe_stb(buf, 45); at = 1; }
+    if neg {
+        pe_stb(buf, 45);
+        at = 1;
+    }
     var dig: i64 = pert_malloc(48);
     var nd: i64 = pe_int_digits(limbs.get(top), dig);
     pe_copy(buf + at, dig, nd);
@@ -2665,19 +3097,27 @@ fn pe_big_integer_text(neg: bool, a: f64) -> i64 {
 }
 
 pub fn pert_to_str_float(val: f64) -> str {
-    if val != val { return pe_dup("NaN" as i64); }
+    if val != val {
+        return pe_dup("NaN" as i64);
+    }
     var d: f64 = val - val;
     if d != d {
-        if val > 0.0 { return pe_dup("inf" as i64); }
+        if val > 0.0 {
+            return pe_dup("inf" as i64);
+        }
         return pe_dup("-inf" as i64);
     }
     if val == 0.0 {
-        if p_f64_to_bits(val) < 0 { return pe_dup("-0" as i64); }
+        if p_f64_to_bits(val) < 0 {
+            return pe_dup("-0" as i64);
+        }
         return pe_dup("0" as i64);
     }
     var neg: bool = val < 0.0;
     var a: f64 = val;
-    if neg { a = 0.0 - a; }
+    if neg {
+        a = 0.0 - a;
+    }
     if a >= 9007199254740992.0 {
         return pe_big_integer_text(neg, a);
     }
@@ -2688,7 +3128,9 @@ pub fn pert_to_str_float(val: f64) -> str {
     var pow: f64 = 1.0;
     while p <= 22 {
         var scaled: f64 = a * pow;
-        if scaled >= 9007199254740992.0 { break; }
+        if scaled >= 9007199254740992.0 {
+            break;
+        }
         var r: i64 = pe_round(scaled);
         if (r as f64) / pow == a {
             return pe_fixed(neg, r, p);
@@ -2738,7 +3180,9 @@ fn pe_bn_mul_small(a: Vec<i64>, k: i64) -> Vec<i64> {
         out.push(carry % 1000000000);
         carry = carry / 1000000000;
     }
-    while out.len() > 1 && out.get(out.len() - 1) == 0 { out.pop(); }
+    while out.len() > 1 && out.get(out.len() - 1) == 0 {
+        out.pop();
+    }
     return out;
 }
 
@@ -2759,18 +3203,26 @@ fn pe_bn_shl(a: Vec<i64>, n: i64) -> Vec<i64> {
 fn pe_bn_add(a: Vec<i64>, b: Vec<i64>) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     var n: i64 = a.len();
-    if b.len() > n { n = b.len(); }
+    if b.len() > n {
+        n = b.len();
+    }
     var carry: i64 = 0;
     var i: i64 = 0;
     while i < n {
         var x: i64 = carry;
-        if i < a.len() { x = x + a.get(i); }
-        if i < b.len() { x = x + b.get(i); }
+        if i < a.len() {
+            x = x + a.get(i);
+        }
+        if i < b.len() {
+            x = x + b.get(i);
+        }
         out.push(x % 1000000000);
         carry = x / 1000000000;
         i = i + 1;
     }
-    if carry > 0 { out.push(carry); }
+    if carry > 0 {
+        out.push(carry);
+    }
     return out;
 }
 
@@ -2781,7 +3233,9 @@ fn pe_bn_sub(a: Vec<i64>, b: Vec<i64>) -> Vec<i64> {
     var i: i64 = 0;
     while i < a.len() {
         var x: i64 = a.get(i) - borrow;
-        if i < b.len() { x = x - b.get(i); }
+        if i < b.len() {
+            x = x - b.get(i);
+        }
         if x < 0 {
             x = x + 1000000000;
             borrow = 1;
@@ -2791,20 +3245,26 @@ fn pe_bn_sub(a: Vec<i64>, b: Vec<i64>) -> Vec<i64> {
         out.push(x);
         i = i + 1;
     }
-    while out.len() > 1 && out.get(out.len() - 1) == 0 { out.pop(); }
+    while out.len() > 1 && out.get(out.len() - 1) == 0 {
+        out.pop();
+    }
     return out;
 }
 
 /// -1, 0 or 1 as a <, == or > b
 fn pe_bn_cmp(a: Vec<i64>, b: Vec<i64>) -> i64 {
     if a.len() != b.len() {
-        if a.len() < b.len() { return 0 - 1; }
+        if a.len() < b.len() {
+            return 0 - 1;
+        }
         return 1;
     }
     var i: i64 = a.len() - 1;
     while i >= 0 {
         if a.get(i) != b.get(i) {
-            if a.get(i) < b.get(i) { return 0 - 1; }
+            if a.get(i) < b.get(i) {
+                return 0 - 1;
+            }
             return 1;
         }
         i = i - 1;
@@ -2815,7 +3275,9 @@ fn pe_bn_cmp(a: Vec<i64>, b: Vec<i64>) -> i64 {
 /// r + m reaches the next power s: r + m >= s (inclusive bounds) or > s
 fn pe_bn_reach(r: Vec<i64>, m: Vec<i64>, s: Vec<i64>, inclusive: bool) -> bool {
     val c: i64 = pe_bn_cmp(pe_bn_add(r, m), s);
-    if inclusive { return c >= 0; }
+    if inclusive {
+        return c >= 0;
+    }
     return c > 0;
 }
 
@@ -2887,7 +3349,9 @@ fn pe_float_text_exact(neg: bool, a: f64) -> i64 {
         }
         val cl: i64 = pe_bn_cmp(r, mm);
         var low: bool = cl < 0;
-        if inclusive { low = cl <= 0; }
+        if inclusive {
+            low = cl <= 0;
+        }
         val high: bool = pe_bn_reach(r, mp, s, inclusive);
         if low || high {
             going = false;
@@ -2916,7 +3380,9 @@ fn pe_float_text_exact(neg: bool, a: f64) -> i64 {
         nd = nd + 1;
         k = k + 1;
     }
-    while nd > 1 && pe_ldb(dig + nd - 1) == 0 { nd = nd - 1; }
+    while nd > 1 && pe_ldb(dig + nd - 1) == 0 {
+        nd = nd - 1;
+    }
     var buf: i64 = pert_malloc(nd + 820);
     var at: i64 = 0;
     if neg {
@@ -2947,7 +3413,9 @@ fn pe_float_text_exact(neg: bool, a: f64) -> i64 {
                 at = at + 1;
             }
             var dd: i64 = 0;
-            if j2 < nd { dd = pe_ldb(dig + j2); }
+            if j2 < nd {
+                dd = pe_ldb(dig + j2);
+            }
             pe_stb(buf + at, 48 + dd);
             at = at + 1;
             j2 = j2 + 1;
@@ -2978,7 +3446,9 @@ pub fn pert_sb_append(sb: i64, s: i64) {
     var len: i64 = pe_ld(sb + 8);
     var cap: i64 = pe_ld(sb + 16);
     if len + n + 1 > cap {
-        while len + n + 1 > cap { cap = cap * 2; }
+        while len + n + 1 > cap {
+            cap = cap * 2;
+        }
         var grown: i64 = pert_malloc(cap);
         pe_copy(grown, pe_ld(sb), len);
         pert_free(pe_ld(sb));
@@ -3000,7 +3470,9 @@ pub fn pert_allocator_create(arg: i64) -> i64 {
 }
 
 pub fn pert_allocator_alloc(alloc: i64, size: i64) -> i64 {
-    if size < 0 { return 0; }
+    if size < 0 {
+        return 0;
+    }
     return pert_malloc(size);
 }
 
@@ -3025,53 +3497,77 @@ fn pe_find(s: i64, sub: i64, from: i64) -> i64 {
     var i: i64 = from;
     while i + m <= n {
         var j: i64 = 0;
-        while j < m && pe_ldb(s + i + j) == pe_ldb(sub + j) { j = j + 1; }
-        if j == m { return i; }
+        while j < m && pe_ldb(s + i + j) == pe_ldb(sub + j) {
+            j = j + 1;
+        }
+        if j == m {
+            return i;
+        }
         i = i + 1;
     }
     return 0 - 1;
 }
 
 pub fn pert_string_find(s: i64, sub: i64) -> i64 {
-    if s == 0 || sub == 0 { return 0 - 1; }
+    if s == 0 || sub == 0 {
+        return 0 - 1;
+    }
     return pe_find(s, sub, 0);
 }
 
 pub fn pert_string_contains(s: i64, sub: i64) -> bool {
-    if s == 0 || sub == 0 { return false; }
+    if s == 0 || sub == 0 {
+        return false;
+    }
     return pe_find(s, sub, 0) >= 0;
 }
 
 pub fn pert_string_starts_with(s: i64, prefix: i64) -> bool {
-    if s == 0 || prefix == 0 { return false; }
+    if s == 0 || prefix == 0 {
+        return false;
+    }
     var n: i64 = pe_len(s);
     var m: i64 = pe_len(prefix);
-    if m > n { return false; }
+    if m > n {
+        return false;
+    }
     var i: i64 = 0;
     while i < m {
-        if pe_ldb(s + i) != pe_ldb(prefix + i) { return false; }
+        if pe_ldb(s + i) != pe_ldb(prefix + i) {
+            return false;
+        }
         i = i + 1;
     }
     return true;
 }
 
 pub fn pert_string_ends_with(s: i64, suffix: i64) -> bool {
-    if s == 0 || suffix == 0 { return false; }
+    if s == 0 || suffix == 0 {
+        return false;
+    }
     var n: i64 = pe_len(s);
     var m: i64 = pe_len(suffix);
-    if m > n { return false; }
+    if m > n {
+        return false;
+    }
     var i: i64 = 0;
     while i < m {
-        if pe_ldb(s + n - m + i) != pe_ldb(suffix + i) { return false; }
+        if pe_ldb(s + n - m + i) != pe_ldb(suffix + i) {
+            return false;
+        }
         i = i + 1;
     }
     return true;
 }
 
 pub fn pert_string_replace(s: i64, from: i64, to: i64) -> str {
-    if s == 0 { return pe_new_str(0); }
+    if s == 0 {
+        return pe_new_str(0);
+    }
     var m: i64 = pe_len(from);
-    if from == 0 || m == 0 { return pe_dup(s); }
+    if from == 0 || m == 0 {
+        return pe_dup(s);
+    }
     var sb: i64 = pert_sb_new();
     var n: i64 = pe_len(s);
     var i: i64 = 0;
@@ -3096,12 +3592,18 @@ fn pe_is_space(b: i64) -> bool {
 }
 
 pub fn pert_string_trim(s: i64) -> str {
-    if s == 0 { return pe_new_str(0); }
+    if s == 0 {
+        return pe_new_str(0);
+    }
     var n: i64 = pe_len(s);
     var a: i64 = 0;
-    while a < n && pe_is_space(pe_ldb(s + a)) { a = a + 1; }
+    while a < n && pe_is_space(pe_ldb(s + a)) {
+        a = a + 1;
+    }
     var b: i64 = n;
-    while b > a && pe_is_space(pe_ldb(s + b - 1)) { b = b - 1; }
+    while b > a && pe_is_space(pe_ldb(s + b - 1)) {
+        b = b - 1;
+    }
     return pe_dup_range(s, a, b - a);
 }
 
@@ -3111,7 +3613,9 @@ pub fn pert_string_to_uppercase(s: i64) -> str {
     var i: i64 = 0;
     while i < n {
         var c: i64 = pe_ldb(r + i);
-        if c >= 97 && c <= 122 { pe_stb(r + i, c - 32); }
+        if c >= 97 && c <= 122 {
+            pe_stb(r + i, c - 32);
+        }
         i = i + 1;
     }
     return r;
@@ -3123,7 +3627,9 @@ pub fn pert_string_to_lowercase(s: i64) -> str {
     var i: i64 = 0;
     while i < n {
         var c: i64 = pe_ldb(r + i);
-        if c >= 65 && c <= 90 { pe_stb(r + i, c + 32); }
+        if c >= 65 && c <= 90 {
+            pe_stb(r + i, c + 32);
+        }
         i = i + 1;
     }
     return r;
@@ -3131,20 +3637,30 @@ pub fn pert_string_to_lowercase(s: i64) -> str {
 
 /// p_string_from(s): a new string with the bytes of s ("" for null).
 pub fn pert_string_from(s: i64) -> str {
-    if s == 0 { return pe_new_str(0); }
+    if s == 0 {
+        return pe_new_str(0);
+    }
     return pe_dup(s);
 }
 
 /// p_string_substring(s, start, end): the C runtime's p_string_slice
 /// (start clamped to 0, end to the length, empty when start > end).
 pub fn pert_string_substring(s: i64, start: i64, end: i64) -> str {
-    if s == 0 { return pe_new_str(0); }
+    if s == 0 {
+        return pe_new_str(0);
+    }
     var n: i64 = pe_len(s);
     var a: i64 = start;
     var b: i64 = end;
-    if a < 0 { a = 0; }
-    if b > n { b = n; }
-    if a > b { a = b; }
+    if a < 0 {
+        a = 0;
+    }
+    if b > n {
+        b = n;
+    }
+    if a > b {
+        a = b;
+    }
     return pe_dup_range(s, a, b - a);
 }
 
@@ -3175,7 +3691,9 @@ pub fn pert_read_line() -> str {
         }
         any = true;
         var c: i64 = pe_ldb(b);
-        if c == 10 { break; }
+        if c == 10 {
+            break;
+        }
         if n == cap {
             var nb: i64 = pert_malloc(cap * 2);
             pe_copy(nb, buf, n);
@@ -3191,7 +3709,9 @@ pub fn pert_read_line() -> str {
         pert_free(buf);
         return pe_null_str();
     }
-    while n > 0 && (pe_ldb(buf + n - 1) == 13 || pe_ldb(buf + n - 1) == 10) { n = n - 1; }
+    while n > 0 && (pe_ldb(buf + n - 1) == 13 || pe_ldb(buf + n - 1) == 10) {
+        n = n - 1;
+    }
     var r: i64 = pe_dup_range(buf, 0, n);
     pert_free(buf);
     return r;
@@ -3199,7 +3719,9 @@ pub fn pert_read_line() -> str {
 
 pub fn pert_read_stdin(n: i64) -> str {
     var m: i64 = n;
-    if m < 0 { m = 0; }
+    if m < 0 {
+        m = 0;
+    }
     var buf: i64 = pert_malloc(m + 8);
     var got: i64 = 0;
     while got < m {
@@ -3223,13 +3745,17 @@ pub fn pert_read_stdin(n: i64) -> str {
 /// kept, as in the C runtime).
 pub fn pert_string_split(s: i64, delim: i64) -> i64 {
     var v: i64 = Vec_new();
-    if s == 0 || delim == 0 { return v; }
+    if s == 0 || delim == 0 {
+        return v;
+    }
     var n: i64 = pe_len(s);
     var m: i64 = pe_len(delim);
     var start: i64 = 0;
     while start < n {
         var at: i64 = 0 - 1;
-        if m > 0 { at = pe_find(s, delim, start); }
+        if m > 0 {
+            at = pe_find(s, delim, start);
+        }
         if at < 0 {
             Vec_push(v, pe_dup_range(s, start, n - start));
             start = n;
@@ -3249,20 +3775,28 @@ pub fn pert_argc() -> i64 {
 
 pub fn pert_argv(i: i64) -> str {
     var sp: i64 = nat_start_sp();
-    if i < 0 || i >= pe_ld(sp) { return pe_null_str(); }
+    if i < 0 || i >= pe_ld(sp) {
+        return pe_null_str();
+    }
     return pe_ld(sp + 8 + i * 8);
 }
 
 pub fn pert_getenv(name: i64) -> str {
-    if name == 0 { return pe_null_str(); }
+    if name == 0 {
+        return pe_null_str();
+    }
     var sp: i64 = nat_start_sp();
     var at: i64 = sp + 8 + (pe_ld(sp) + 1) * 8;
     var n: i64 = pe_len(name);
     while pe_ld(at) != 0 {
         var e: i64 = pe_ld(at);
         var j: i64 = 0;
-        while j < n && pe_ldb(e + j) == pe_ldb(name + j) { j = j + 1; }
-        if j == n && pe_ldb(e + n) == 61 { return p_str_from_ptr(e + n + 1); }
+        while j < n && pe_ldb(e + j) == pe_ldb(name + j) {
+            j = j + 1;
+        }
+        if j == n && pe_ldb(e + n) == 61 {
+            return p_str_from_ptr(e + n + 1);
+        }
         at = at + 8;
     }
     return pe_null_str();
@@ -3326,20 +3860,29 @@ fn pe_open(path: i64, flags: i64) -> i64 {
 }
 
 pub fn pert_file_read(path: i64) -> str {
-    if path == 0 { return pe_null_str(); }
+    if path == 0 {
+        return pe_null_str();
+    }
     // F4: a directory is not a file, whatever its file system says its
     // size is (ext4 gives a huge end offset, tmpfs/9p an error or 0, which
     // read as ""): stat first (sys.fd pe_mode, S_IFDIR) and give the null
     // that `fid run` and the C runtime give
     val dmode: i64 = pe_mode(path);
-    if dmode >= 0 && (dmode & 61440) == 16384 { return pe_null_str(); }
+    if dmode >= 0 && (dmode & 61440) == 16384 {
+        return pe_null_str();
+    }
     var fd: i64 = pe_open(path, 0);
-    if fd < 0 { return pe_null_str(); }
+    if fd < 0 {
+        return pe_null_str();
+    }
     var size: i64 = pe_sys(PE_SYS_LSEEK, fd, 0, 2);
     // VF14 (as the C runtime's p_file_read): a directory opens, its end is
     // a huge offset on ext4 and reading it fails (EISDIR); it reads as a
     // missing file, not as an empty string or a huge allocation
-    if size < 0 || size >= 281474976710656 { pe_sys(PE_SYS_CLOSE, fd, 0, 0); return pe_null_str(); }
+    if size < 0 || size >= 281474976710656 {
+        pe_sys(PE_SYS_CLOSE, fd, 0, 0);
+        return pe_null_str();
+    }
     pe_sys(PE_SYS_LSEEK, fd, 0, 0);
     var r: i64 = pe_new_str(size);
     var got: i64 = 0;
@@ -3350,7 +3893,9 @@ pub fn pert_file_read(path: i64) -> str {
             p_str_free(r);
             return pe_null_str();
         }
-        if k <= 0 { break; }
+        if k <= 0 {
+            break;
+        }
         got = got + k;
     }
     pe_stb(r + got, 0);
@@ -3359,9 +3904,13 @@ pub fn pert_file_read(path: i64) -> str {
 }
 
 fn pe_write_file(path: i64, data: i64, n: i64, flags: i64) -> i64 {
-    if path == 0 { return 0 - 1; }
+    if path == 0 {
+        return 0 - 1;
+    }
     var fd: i64 = pe_open(path, flags);
-    if fd < 0 { return 0 - 1; }
+    if fd < 0 {
+        return 0 - 1;
+    }
     pe_write_all(fd, data, n);
     pe_sys(PE_SYS_CLOSE, fd, 0, 0);
     return 0;
@@ -3371,37 +3920,51 @@ fn pe_write_file(path: i64, data: i64, n: i64, flags: i64) -> i64 {
 // first zero byte, as C's fputs and pe_ir's stub (test_binary_io); a string
 // literal can hold one since RT2. p_file_write_bin writes every byte.
 fn pe_text_len(s: i64) -> i64 {
-    if s == 0 { return 0; }
+    if s == 0 {
+        return 0;
+    }
     val m: i64 = pe_len(s);
     var n: i64 = 0;
-    while n < m && pe_ldb(s + n) != 0 { n = n + 1; }
+    while n < m && pe_ldb(s + n) != 0 {
+        n = n + 1;
+    }
     return n;
 }
 
 pub fn pert_file_write(path: i64, content: i64) -> i64 {
-    return pe_write_file(path, content, pe_text_len(content), 577);    // WRONLY|CREAT|TRUNC
+    return pe_write_file(path, content, pe_text_len(content), 577);  // WRONLY|CREAT|TRUNC
 }
 
 pub fn pert_file_write_bin(path: i64, data: i64, n: i64) -> i64 {
-    if n < 0 { return 0 - 1; }    // as the C runtime: nothing is created
+    if n < 0 {
+        return 0 - 1;
+    }  // as the C runtime: nothing is created
     return pe_write_file(path, data, n, 577);
 }
 
 pub fn pert_file_append(path: i64, content: i64) -> i64 {
-    return pe_write_file(path, content, pe_text_len(content), 1089);   // WRONLY|CREAT|APPEND
+    return pe_write_file(path, content, pe_text_len(content), 1089);  // WRONLY|CREAT|APPEND
 }
 
 pub fn pert_file_exists(path: i64) -> bool {
-    if path == 0 { return false; }
+    if path == 0 {
+        return false;
+    }
     var fd: i64 = pe_open(path, 0);
-    if fd < 0 { return false; }
+    if fd < 0 {
+        return false;
+    }
     pe_sys(PE_SYS_CLOSE, fd, 0, 0);
     return true;
 }
 
 pub fn pert_file_delete(path: i64) -> i64 {
-    if path == 0 { return 0 - 1; }
-    if pe_sys(PE_SYS_UNLINKAT, PE_AT_FDCWD, path, 0) < 0 { return 0 - 1; }
+    if path == 0 {
+        return 0 - 1;
+    }
+    if pe_sys(PE_SYS_UNLINKAT, PE_AT_FDCWD, path, 0) < 0 {
+        return 0 - 1;
+    }
     return 0;
 }
 
@@ -3411,12 +3974,22 @@ pub fn pert_file_delete(path: i64) -> i64 {
 
 /// OP23: bytes up to a word boundary, then eight bytes per store (the
 /// byte repeated), then the bytes left.
-@wrapping pub fn pert_memset(dst: i64, v: i64, n: i64) {
+@wrapping
+pub fn pert_memset(dst: i64, v: i64, n: i64) {
     var i: i64 = 0;
-    while i < n && ((dst + i) & 7) != 0 { pe_stb(dst + i, v & 255); i = i + 1; }
+    while i < n && ((dst + i) & 7) != 0 {
+        pe_stb(dst + i, v & 255);
+        i = i + 1;
+    }
     var rep: i64 = (v & 255) * 0x0101010101010101;
-    while i + 8 <= n { pe_st(dst + i, rep); i = i + 8; }
-    while i < n { pe_stb(dst + i, v & 255); i = i + 1; }
+    while i + 8 <= n {
+        pe_st(dst + i, rep);
+        i = i + 8;
+    }
+    while i < n {
+        pe_stb(dst + i, v & 255);
+        i = i + 1;
+    }
 }
 
 // @zeroize: wipe a heap string's bytes and a Vec's element buffer.
@@ -3424,19 +3997,29 @@ pub fn pert_file_delete(path: i64) -> i64 {
 // at [24] (vec_code reads it). Byte stores keep the wipe off the
 // optimizer's dead-store list on this backend.
 pub fn pert_str_zeroize(s: i64) {
-    if s == 0 { return; }
+    if s == 0 {
+        return;
+    }
     var i: i64 = 0;
-    while pe_ldb(s + i) != 0 { pe_stb(s + i, 0); i = i + 1; }
+    while pe_ldb(s + i) != 0 {
+        pe_stb(s + i, 0);
+        i = i + 1;
+    }
 }
 
 pub fn pert_vec_zeroize(v: i64) {
-    if v == 0 { return; }
+    if v == 0 {
+        return;
+    }
     var data: i64 = pe_ld(v);
     var cap: i64 = pe_ld(v + 16);
     if data != 0 && cap > 0 {
         var n: i64 = cap * vec_esz(vec_code(v));
         var i: i64 = 0;
-        while i < n { pe_stb(data + i, 0); i = i + 1; }
+        while i < n {
+            pe_stb(data + i, 0);
+            i = i + 1;
+        }
     }
     pert_sensitive_unmark(v);
 }
@@ -3452,7 +4035,10 @@ fn lrt_sens_table() -> i64 {
     if lrt_sens_tab == 0 {
         lrt_sens_tab = pert_malloc(256 * 24);
         var zi: i64 = 0;
-        while zi < 256 * 24 { pe_stb(lrt_sens_tab + zi, 0); zi = zi + 1; }
+        while zi < 256 * 24 {
+            pe_stb(lrt_sens_tab + zi, 0);
+            zi = zi + 1;
+        }
     }
     return lrt_sens_tab;
 }
@@ -3461,14 +4047,18 @@ fn lrt_sens_find(hdr: i64) -> i64 {
     var t: i64 = lrt_sens_table();
     var i: i64 = 0;
     while i < lrt_sens_n {
-        if pe_ld(t + i * 24) == hdr { return i; }
+        if pe_ld(t + i * 24) == hdr {
+            return i;
+        }
         i = i + 1;
     }
     return -1;
 }
 
 pub fn pert_sensitive_mark(v: i64) {
-    if v == 0 || lrt_sens_n >= 256 || lrt_sens_find(v) >= 0 { return; }
+    if v == 0 || lrt_sens_n >= 256 || lrt_sens_find(v) >= 0 {
+        return;
+    }
     var e: i64 = lrt_sens_table() + lrt_sens_n * 24;
     pe_st(e, v);
     pe_st(e + 8, pe_ld(v));
@@ -3478,20 +4068,26 @@ pub fn pert_sensitive_mark(v: i64) {
 
 pub fn pert_sensitive_remark(v: i64) {
     var i: i64 = lrt_sens_find(v);
-    if i < 0 { return; }
+    if i < 0 {
+        return;
+    }
     var e: i64 = lrt_sens_table() + i * 24;
     pe_st(e + 8, pe_ld(v));
     pe_st(e + 16, vec_esz(vec_code(v)));
 }
 
 pub fn pert_sensitive_check(v: i64) -> i64 {
-    if lrt_sens_find(v) >= 0 { return 1; }
+    if lrt_sens_find(v) >= 0 {
+        return 1;
+    }
     return 0;
 }
 
 pub fn pert_sensitive_unmark(v: i64) {
     var i: i64 = lrt_sens_find(v);
-    if i < 0 { return; }
+    if i < 0 {
+        return;
+    }
     var t: i64 = lrt_sens_table();
     var last: i64 = t + (lrt_sens_n - 1) * 24;
     var e: i64 = t + i * 24;
@@ -3503,12 +4099,21 @@ pub fn pert_sensitive_unmark(v: i64) {
 
 pub fn pert_sensitive_free(v: i64, buf: i64, cap: i64) {
     var i: i64 = lrt_sens_find(v);
-    if i < 0 || buf == 0 { return; }
+    if i < 0 || buf == 0 {
+        return;
+    }
     var esz: i64 = pe_ld(lrt_sens_table() + i * 24 + 16);
-    if cap < 0 { cap = 0 - cap; }
+    if cap < 0 {
+        cap = 0 - cap;
+    }
     var j: i64 = 0;
-    while j < cap * esz { pe_stb(buf + j, 0); j = j + 1; }
+    while j < cap * esz {
+        pe_stb(buf + j, 0);
+        j = j + 1;
+    }
     lrt_sens_wipes = lrt_sens_wipes + 1;
 }
 
-pub fn pert_sensitive_wipes() -> i64 { return lrt_sens_wipes; }
+pub fn pert_sensitive_wipes() -> i64 {
+    return lrt_sens_wipes;
+}

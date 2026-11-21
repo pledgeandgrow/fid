@@ -43,7 +43,8 @@
 //   val hits: Vec<SigHit> = sig_scan(& rs, bytes);   // the rules that matched
 
 module sigmatch;
- use vec; use regex;
+use vec;
+use regex;
 
 /// One element of a compiled hex pattern: a byte under a mask (kind 0), a
 /// jump of min..max bytes (kind 1), or alternatives (kind 2): each
@@ -124,21 +125,21 @@ struct SgP {
     err: str,
 }
 
-fn sg_c(p: & SgP) -> i64 {
+fn sg_c(p: &SgP) -> i64 {
     if p.i < str_len(p.s) {
         return str_byte_at(p.s, p.i);
     }
     return 0;
 }
 
-fn sg_at(p: & SgP, k: i64) -> i64 {
+fn sg_at(p: &SgP, k: i64) -> i64 {
     if p.i + k < str_len(p.s) {
         return str_byte_at(p.s, p.i + k);
     }
     return 0;
 }
 
-fn sg_fail(p: & mut SgP, msg: str) {
+fn sg_fail(p: &mut SgP, msg: str) {
     if str_len(p.err) == 0 {
         // the line of the error
         var line: i64 = 1;
@@ -154,7 +155,7 @@ fn sg_fail(p: & mut SgP, msg: str) {
     p.i = str_len(p.s);
 }
 
-fn sg_ws(p: & mut SgP) {
+fn sg_ws(p: &mut SgP) {
     while p.i < str_len(p.s) {
         val c: i64 = sg_c(p);
         if c == 32 || c == 9 || c == 10 || c == 13 {
@@ -179,7 +180,7 @@ fn sg_is_id(c: i64) -> bool {
     return (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 95;
 }
 
-fn sg_word(p: & mut SgP) -> str {
+fn sg_word(p: &mut SgP) -> str {
     sg_ws(p);
     val st: i64 = p.i;
     while p.i < str_len(p.s) && sg_is_id(sg_c(p)) {
@@ -188,7 +189,7 @@ fn sg_word(p: & mut SgP) -> str {
     return str_slice(p.s, st, p.i);
 }
 
-fn sg_peek_word(p: & mut SgP) -> str {
+fn sg_peek_word(p: &mut SgP) -> str {
     sg_ws(p);
     val save: i64 = p.i;
     val w: str = sg_word(p);
@@ -196,7 +197,7 @@ fn sg_peek_word(p: & mut SgP) -> str {
     return w;
 }
 
-fn sg_expect(p: & mut SgP, c: i64) {
+fn sg_expect(p: &mut SgP, c: i64) {
     sg_ws(p);
     if sg_c(p) != c {
         sg_fail(p, "expected '" + char_to_str(c) + "'");
@@ -206,14 +207,20 @@ fn sg_expect(p: & mut SgP, c: i64) {
 }
 
 fn sg_hexdig(c: i64) -> i64 {
-    if c >= 48 && c <= 57 { return c - 48; }
-    if c >= 97 && c <= 102 { return c - 87; }
-    if c >= 65 && c <= 70 { return c - 55; }
-    return - 1;
+    if c >= 48 && c <= 57 {
+        return c - 48;
+    }
+    if c >= 97 && c <= 102 {
+        return c - 87;
+    }
+    if c >= 65 && c <= 70 {
+        return c - 55;
+    }
+    return -1;
 }
 
 /// A number: decimal or 0x hex, optional KB / MB suffix; -1 when absent.
-fn sg_number(p: & mut SgP) -> i64 {
+fn sg_number(p: &mut SgP) -> i64 {
     sg_ws(p);
     var v: i64 = 0;
     var any: bool = false;
@@ -233,7 +240,7 @@ fn sg_number(p: & mut SgP) -> i64 {
     }
     if !any {
         sg_fail(p, "expected a number");
-        return - 1;
+        return -1;
     }
     if sg_c(p) == 75 && sg_at(p, 1) == 66 {
         v = v * 1024;
@@ -245,7 +252,7 @@ fn sg_number(p: & mut SgP) -> i64 {
     return v;
 }
 
-fn sg_quoted(p: & mut SgP) -> Vec<i64> {
+fn sg_quoted(p: &mut SgP) -> Vec<i64> {
     // at '"'
     var out: Vec<i64> = Vec::new();
     p.i = p.i + 1;
@@ -258,10 +265,13 @@ fn sg_quoted(p: & mut SgP) -> Vec<i64> {
         if c == 92 {
             val e: i64 = sg_at(p, 1);
             p.i = p.i + 2;
-            if e == 110 { out.push(10); }
-            else if e == 114 { out.push(13); }
-            else if e == 116 { out.push(9); }
-            else if e == 120 {
+            if e == 110 {
+                out.push(10);
+            } else if e == 114 {
+                out.push(13);
+            } else if e == 116 {
+                out.push(9);
+            } else if e == 120 {
                 val h1: i64 = sg_hexdig(sg_c(p));
                 val h2: i64 = sg_hexdig(sg_at(p, 1));
                 if h1 < 0 || h2 < 0 {
@@ -287,11 +297,13 @@ fn sg_quoted(p: & mut SgP) -> Vec<i64> {
 }
 
 fn sg_hex_el(kind: i64, value: i64, mask: i64, min: i64, max: i64) -> SigHexEl {
-    return SigHexEl { kind: kind, value: value, mask: mask, min: min, max: max, alts: Vec::new() };
+    return SigHexEl {
+        kind: kind, value: value, mask: mask, min: min, max: max, alts: Vec::new()
+    };
 }
 
 /// One byte token (two hex digits or ?) at p; value | mask << 8, -1 on error.
-fn sg_hex_byte(p: & mut SgP) -> i64 {
+fn sg_hex_byte(p: &mut SgP) -> i64 {
     val c1: i64 = sg_c(p);
     val c2: i64 = sg_at(p, 1);
     var v: i64 = 0;
@@ -302,7 +314,7 @@ fn sg_hex_byte(p: & mut SgP) -> i64 {
         v = sg_hexdig(c1) << 4;
         m = 0xF0;
     } else {
-        return - 1;
+        return -1;
     }
     if c2 == 63 {
         m = m | 0;
@@ -310,13 +322,13 @@ fn sg_hex_byte(p: & mut SgP) -> i64 {
         v = v | sg_hexdig(c2);
         m = m | 0x0F;
     } else {
-        return - 1;
+        return -1;
     }
     p.i = p.i + 2;
     return v | (m << 8);
 }
 
-fn sg_parse_hex(p: & mut SgP) -> Vec<SigHexEl> {
+fn sg_parse_hex(p: &mut SgP) -> Vec<SigHexEl> {
     // at '{'
     var els: Vec<SigHexEl> = Vec::new();
     p.i = p.i + 1;
@@ -338,7 +350,7 @@ fn sg_parse_hex(p: & mut SgP) -> Vec<SigHexEl> {
             p.i = p.i + 1;
             sg_ws(p);
             var lo: i64 = 0;
-            var hi: i64 = - 1;
+            var hi: i64 = -1;
             if sg_c(p) != 45 {
                 lo = sg_number(p);
             }
@@ -397,7 +409,7 @@ fn sg_parse_hex(p: & mut SgP) -> Vec<SigHexEl> {
     return els;
 }
 
-fn sg_parse_regex(p: & mut SgP) -> str {
+fn sg_parse_regex(p: &mut SgP) -> str {
     // at '/': up to the next unescaped '/'
     p.i = p.i + 1;
     val st: i64 = p.i;
@@ -420,11 +432,13 @@ fn sg_parse_regex(p: & mut SgP) -> str {
     return re;
 }
 
-fn sg_string_def(p: & mut SgP) -> SigString {
+fn sg_string_def(p: &mut SgP) -> SigString {
     // at '$'
     p.i = p.i + 1;
     val id: str = "$" + sg_word(p);
-    var s: SigString = SigString { id: id, kind: 0, text: Vec::new(), hex: Vec::new(), regex: "", nocase: false, wide: false, ascii: false, fullword: false };
+    var s: SigString = SigString {
+        id: id, kind: 0, text: Vec::new(), hex: Vec::new(), regex: "", nocase: false, wide: false, ascii: false, fullword: false
+    };
     sg_expect(p, 61);
     sg_ws(p);
     val c: i64 = sg_c(p);
@@ -446,11 +460,17 @@ fn sg_string_def(p: & mut SgP) -> SigString {
     // modifiers
     while true {
         val w: str = sg_peek_word(p);
-        if w == "nocase" { s.nocase = true; }
-        else if w == "wide" { s.wide = true; }
-        else if w == "ascii" { s.ascii = true; }
-        else if w == "fullword" { s.fullword = true; }
-        else { break; }
+        if w == "nocase" {
+            s.nocase = true;
+        } else if w == "wide" {
+            s.wide = true;
+        } else if w == "ascii" {
+            s.ascii = true;
+        } else if w == "fullword" {
+            s.fullword = true;
+        } else {
+            break;
+        }
         sg_word(p);
     }
     if s.kind != 0 && (s.nocase || s.wide || s.ascii || s.fullword) {
@@ -460,15 +480,17 @@ fn sg_string_def(p: & mut SgP) -> SigString {
 }
 
 fn sg_node(kind: i64) -> SigCond {
-    return SigCond { kind: kind, a: - 1, b: - 1, id: "", ids: Vec::new(), op: "", n: 0, lo: 0, hi: 0 };
+    return SigCond {
+        kind: kind, a: -1, b: -1, id: "", ids: Vec::new(), op: "", n: 0, lo: 0, hi: 0
+    };
 }
 
-fn sg_push(r: & mut SigRule, c: SigCond) -> i64 {
+fn sg_push(r: &mut SigRule, c: SigCond) -> i64 {
     r.cond.push(c);
     return r.cond.len() - 1;
 }
 
-fn sg_op(p: & mut SgP) -> str {
+fn sg_op(p: &mut SgP) -> str {
     sg_ws(p);
     val c: i64 = sg_c(p);
     val d: i64 = sg_at(p, 1);
@@ -484,7 +506,7 @@ fn sg_op(p: & mut SgP) -> str {
     return "";
 }
 
-fn sg_id_exists(r: & SigRule, id: str) -> bool {
+fn sg_id_exists(r: &SigRule, id: str) -> bool {
     var i: i64 = 0;
     while i < r.strings.len() {
         if r.strings.get(i).id == id {
@@ -495,7 +517,7 @@ fn sg_id_exists(r: & SigRule, id: str) -> bool {
     return false;
 }
 
-fn sg_ref(p: & mut SgP, r: & SigRule) -> str {
+fn sg_ref(p: &mut SgP, r: &SigRule) -> str {
     // after the sigil; the id with a '$' (names are checked here)
     val id: str = "$" + sg_word(p);
     if !sg_id_exists(r, id) {
@@ -504,7 +526,7 @@ fn sg_ref(p: & mut SgP, r: & SigRule) -> str {
     return id;
 }
 
-fn sg_set(p: & mut SgP, r: & SigRule) -> Vec<str> {
+fn sg_set(p: &mut SgP, r: &SigRule) -> Vec<str> {
     // "them" or ( $a, $b* )
     var ids: Vec<str> = Vec::new();
     if sg_peek_word(p) == "them" {
@@ -551,7 +573,7 @@ fn sg_set(p: & mut SgP, r: & SigRule) -> Vec<str> {
     return ids;
 }
 
-fn sg_primary(p: & mut SgP, r: & mut SigRule) -> i64 {
+fn sg_primary(p: &mut SgP, r: &mut SigRule) -> i64 {
     sg_ws(p);
     val c: i64 = sg_c(p);
     if c == 40 {
@@ -620,8 +642,12 @@ fn sg_primary(p: & mut SgP, r: & mut SigRule) -> i64 {
         return sg_push(r, n);
     }
     val w: str = sg_word(p);
-    if w == "true" { return sg_push(r, sg_node(0)); }
-    if w == "false" { return sg_push(r, sg_node(1)); }
+    if w == "true" {
+        return sg_push(r, sg_node(0));
+    }
+    if w == "false" {
+        return sg_push(r, sg_node(1));
+    }
     if w == "filesize" {
         var n: SigCond = sg_node(10);
         n.op = sg_op(p);
@@ -630,9 +656,15 @@ fn sg_primary(p: & mut SgP, r: & mut SigRule) -> i64 {
     }
     if w == "all" || w == "any" || w == "none" {
         var n: SigCond = sg_node(11);
-        if w == "all" { n.n = - 1; }
-        if w == "any" { n.n = - 2; }
-        if w == "none" { n.n = - 3; }
+        if w == "all" {
+            n.n = -1;
+        }
+        if w == "any" {
+            n.n = -2;
+        }
+        if w == "none" {
+            n.n = -3;
+        }
         if sg_word(p) != "of" {
             sg_fail(p, "expected 'of'");
         }
@@ -646,10 +678,10 @@ fn sg_primary(p: & mut SgP, r: & mut SigRule) -> i64 {
     } else {
         sg_fail(p, "unexpected '" + char_to_str(c) + "' in condition");
     }
-    return - 1;
+    return -1;
 }
 
-fn sg_not(p: & mut SgP, r: & mut SigRule) -> i64 {
+fn sg_not(p: &mut SgP, r: &mut SigRule) -> i64 {
     if sg_peek_word(p) == "not" {
         sg_word(p);
         var n: SigCond = sg_node(4);
@@ -659,7 +691,7 @@ fn sg_not(p: & mut SgP, r: & mut SigRule) -> i64 {
     return sg_primary(p, r);
 }
 
-fn sg_and(p: & mut SgP, r: & mut SigRule) -> i64 {
+fn sg_and(p: &mut SgP, r: &mut SigRule) -> i64 {
     var left: i64 = sg_not(p, r);
     while str_len(p.err) == 0 && sg_peek_word(p) == "and" {
         sg_word(p);
@@ -671,7 +703,7 @@ fn sg_and(p: & mut SgP, r: & mut SigRule) -> i64 {
     return left;
 }
 
-fn sg_or(p: & mut SgP, r: & mut SigRule) -> i64 {
+fn sg_or(p: &mut SgP, r: &mut SigRule) -> i64 {
     var left: i64 = sg_and(p, r);
     while str_len(p.err) == 0 && sg_peek_word(p) == "or" {
         sg_word(p);
@@ -683,8 +715,10 @@ fn sg_or(p: & mut SgP, r: & mut SigRule) -> i64 {
     return left;
 }
 
-fn sg_rule(p: & mut SgP) -> SigRule {
-    var r: SigRule = SigRule { name: "", tags: Vec::new(), meta_keys: Vec::new(), meta_vals: Vec::new(), strings: Vec::new(), cond: Vec::new(), root: - 1 };
+fn sg_rule(p: &mut SgP) -> SigRule {
+    var r: SigRule = SigRule {
+        name: "", tags: Vec::new(), meta_keys: Vec::new(), meta_vals: Vec::new(), strings: Vec::new(), cond: Vec::new(), root: -1
+    };
     r.name = sg_word(p);
     if str_len(r.name) == 0 {
         sg_fail(p, "rule without a name");
@@ -728,14 +762,14 @@ fn sg_rule(p: & mut SgP) -> SigRule {
             sg_ws(p);
             while str_len(p.err) == 0 && sg_c(p) == 36 {
                 val s: SigString = sg_string_def(p);
-                if sg_id_exists(& r, s.id) {
+                if sg_id_exists(&r, s.id) {
                     sg_fail(p, "duplicate string " + s.id);
                 }
                 r.strings.push(s);
                 sg_ws(p);
             }
         } else if sec == "condition" {
-            val root: i64 = sg_or(p, & mut r);
+            val root: i64 = sg_or(p, &mut r);
             r.root = root;
             sg_ws(p);
             if sg_c(p) != 125 {
@@ -753,18 +787,22 @@ fn sg_rule(p: & mut SgP) -> SigRule {
 
 /// Compile a rule file.
 pub fn sig_compile(text: str) -> SigRules {
-    var p: SgP = SgP { s: text, i: 0, err: "" };
-    var out: SigRules = SigRules { ok: true, error: "", rules: Vec::new() };
+    var p: SgP = SgP {
+        s: text, i: 0, err: ""
+    };
+    var out: SigRules = SigRules {
+        ok: true, error: "", rules: Vec::new()
+    };
     while true {
-        sg_ws(& mut p);
+        sg_ws(&mut p);
         if p.i >= str_len(p.s) {
             break;
         }
-        if sg_word(& mut p) != "rule" {
-            sg_fail(& mut p, "expected 'rule'");
+        if sg_word(&mut p) != "rule" {
+            sg_fail(&mut p, "expected 'rule'");
             break;
         }
-        val r: SigRule = sg_rule(& mut p);
+        val r: SigRule = sg_rule(&mut p);
         if str_len(p.err) > 0 {
             break;
         }
@@ -786,14 +824,14 @@ fn sg_lower(c: i64) -> i64 {
     return c;
 }
 
-fn sg_wordch(b: & Vec<i64>, i: i64) -> bool {
+fn sg_wordch(b: &Vec<i64>, i: i64) -> bool {
     if i < 0 || i >= b.len() {
         return false;
     }
     return sg_is_id(b.get(i) & 255);
 }
 
-fn sg_find_text(b: & Vec<i64>, pat: & Vec<i64>, nocase: bool, fullword: bool, m: & mut SigStrMatch) {
+fn sg_find_text(b: &Vec<i64>, pat: &Vec<i64>, nocase: bool, fullword: bool, m: &mut SigStrMatch) {
     val n: i64 = pat.len();
     var i: i64 = 0;
     while i + n <= b.len() {
@@ -818,7 +856,7 @@ fn sg_find_text(b: & Vec<i64>, pat: & Vec<i64>, nocase: bool, fullword: bool, m:
     }
 }
 
-fn sg_hex_at(b: & Vec<i64>, els: & Vec<SigHexEl>, k: i64, pos: i64) -> i64 {
+fn sg_hex_at(b: &Vec<i64>, els: &Vec<SigHexEl>, k: i64, pos: i64) -> i64 {
     // the end of a match of els[k..] starting at pos, or -1 (shortest jumps first)
     if k >= els.len() {
         return pos;
@@ -826,7 +864,7 @@ fn sg_hex_at(b: & Vec<i64>, els: & Vec<SigHexEl>, k: i64, pos: i64) -> i64 {
     val e: SigHexEl = els.get(k);
     if e.kind == 0 {
         if pos >= b.len() || ((b.get(pos) & 255) & e.mask) != e.value {
-            return - 1;
+            return -1;
         }
         return sg_hex_at(b, els, k + 1, pos + 1);
     }
@@ -843,7 +881,7 @@ fn sg_hex_at(b: & Vec<i64>, els: & Vec<SigHexEl>, k: i64, pos: i64) -> i64 {
             }
             j = j + 1;
         }
-        return - 1;
+        return -1;
     }
     var a: i64 = 0;
     while a < e.alts.len() {
@@ -865,10 +903,10 @@ fn sg_hex_at(b: & Vec<i64>, els: & Vec<SigHexEl>, k: i64, pos: i64) -> i64 {
         }
         a = a + 1;
     }
-    return - 1;
+    return -1;
 }
 
-fn sg_find_regex(b: & Vec<i64>, re: str, m: & mut SigStrMatch) {
+fn sg_find_regex(b: &Vec<i64>, re: str, m: &mut SigStrMatch) {
     val s: str = str_from_bytes(b);
     var from: i64 = 0;
     while from <= str_len(s) {
@@ -886,7 +924,7 @@ fn sg_find_regex(b: & Vec<i64>, re: str, m: & mut SigStrMatch) {
     }
 }
 
-fn sg_widen(t: & Vec<i64>) -> Vec<i64> {
+fn sg_widen(t: &Vec<i64>) -> Vec<i64> {
     var w: Vec<i64> = Vec::new();
     var i: i64 = 0;
     while i < t.len() {
@@ -898,20 +936,22 @@ fn sg_widen(t: & Vec<i64>) -> Vec<i64> {
 }
 
 /// Every match of one string in `b`.
-pub fn sig_find(s: & SigString, b: & Vec<i64>) -> SigStrMatch {
-    var m: SigStrMatch = SigStrMatch { id: s.id, offsets: Vec::new(), lengths: Vec::new() };
+pub fn sig_find(s: &SigString, b: &Vec<i64>) -> SigStrMatch {
+    var m: SigStrMatch = SigStrMatch {
+        id: s.id, offsets: Vec::new(), lengths: Vec::new()
+    };
     if s.kind == 0 {
         if !s.wide || s.ascii {
-            sg_find_text(b, & s.text, s.nocase, s.fullword, & mut m);
+            sg_find_text(b, &s.text, s.nocase, s.fullword, &mut m);
         }
         if s.wide {
-            val w: Vec<i64> = sg_widen(& s.text);
-            sg_find_text(b, & w, s.nocase, s.fullword, & mut m);
+            val w: Vec<i64> = sg_widen(&s.text);
+            sg_find_text(b, &w, s.nocase, s.fullword, &mut m);
         }
     } else if s.kind == 1 {
         var i: i64 = 0;
         while i < b.len() {
-            val e: i64 = sg_hex_at(b, & s.hex, 0, i);
+            val e: i64 = sg_hex_at(b, &s.hex, 0, i);
             if e >= 0 {
                 m.offsets.push(i);
                 m.lengths.push(e - i);
@@ -919,21 +959,31 @@ pub fn sig_find(s: & SigString, b: & Vec<i64>) -> SigStrMatch {
             i = i + 1;
         }
     } else {
-        sg_find_regex(b, s.regex, & mut m);
+        sg_find_regex(b, s.regex, &mut m);
     }
     return m;
 }
 
 fn sg_cmp(x: i64, op: str, y: i64) -> bool {
-    if op == "==" { return x == y; }
-    if op == "!=" { return x != y; }
-    if op == "<" { return x < y; }
-    if op == "<=" { return x <= y; }
-    if op == ">" { return x > y; }
+    if op == "==" {
+        return x == y;
+    }
+    if op == "!=" {
+        return x != y;
+    }
+    if op == "<" {
+        return x < y;
+    }
+    if op == "<=" {
+        return x <= y;
+    }
+    if op == ">" {
+        return x > y;
+    }
     return x >= y;
 }
 
-fn sg_matches_of(ms: & Vec<SigStrMatch>, id: str) -> SigStrMatch {
+fn sg_matches_of(ms: &Vec<SigStrMatch>, id: str) -> SigStrMatch {
     var i: i64 = 0;
     while i < ms.len() {
         if ms.get(i).id == id {
@@ -941,17 +991,31 @@ fn sg_matches_of(ms: & Vec<SigStrMatch>, id: str) -> SigStrMatch {
         }
         i = i + 1;
     }
-    return SigStrMatch { id: id, offsets: Vec::new(), lengths: Vec::new() };
+    return SigStrMatch {
+        id: id, offsets: Vec::new(), lengths: Vec::new()
+    };
 }
 
-fn sg_eval(r: & SigRule, k: i64, ms: & Vec<SigStrMatch>, size: i64) -> bool {
+fn sg_eval(r: &SigRule, k: i64, ms: &Vec<SigStrMatch>, size: i64) -> bool {
     val c: SigCond = r.cond.get(k);
-    if c.kind == 0 { return true; }
-    if c.kind == 1 { return false; }
-    if c.kind == 2 { return sg_eval(r, c.a, ms, size) && sg_eval(r, c.b, ms, size); }
-    if c.kind == 3 { return sg_eval(r, c.a, ms, size) || sg_eval(r, c.b, ms, size); }
-    if c.kind == 4 { return !sg_eval(r, c.a, ms, size); }
-    if c.kind == 10 { return sg_cmp(size, c.op, c.n); }
+    if c.kind == 0 {
+        return true;
+    }
+    if c.kind == 1 {
+        return false;
+    }
+    if c.kind == 2 {
+        return sg_eval(r, c.a, ms, size) && sg_eval(r, c.b, ms, size);
+    }
+    if c.kind == 3 {
+        return sg_eval(r, c.a, ms, size) || sg_eval(r, c.b, ms, size);
+    }
+    if c.kind == 4 {
+        return !sg_eval(r, c.a, ms, size);
+    }
+    if c.kind == 10 {
+        return sg_cmp(size, c.op, c.n);
+    }
     if c.kind == 11 {
         var found: i64 = 0;
         var i: i64 = 0;
@@ -961,14 +1025,24 @@ fn sg_eval(r: & SigRule, k: i64, ms: & Vec<SigStrMatch>, size: i64) -> bool {
             }
             i = i + 1;
         }
-        if c.n == - 1 { return found == c.ids.len(); }
-        if c.n == - 2 { return found > 0; }
-        if c.n == - 3 { return found == 0; }
+        if c.n == -1 {
+            return found == c.ids.len();
+        }
+        if c.n == -2 {
+            return found > 0;
+        }
+        if c.n == -3 {
+            return found == 0;
+        }
         return found >= c.n;
     }
     val m: SigStrMatch = sg_matches_of(ms, c.id);
-    if c.kind == 5 { return m.offsets.len() > 0; }
-    if c.kind == 8 { return sg_cmp(m.offsets.len(), c.op, c.n); }
+    if c.kind == 5 {
+        return m.offsets.len() > 0;
+    }
+    if c.kind == 8 {
+        return sg_cmp(m.offsets.len(), c.op, c.n);
+    }
     if c.kind == 9 {
         if c.lo < 1 || c.lo > m.offsets.len() {
             return false;
@@ -990,18 +1064,18 @@ fn sg_eval(r: & SigRule, k: i64, ms: & Vec<SigStrMatch>, size: i64) -> bool {
 }
 
 /// Whether one rule's condition holds over `b`.
-pub fn sig_rule_matches(r: & SigRule, b: & Vec<i64>) -> bool {
+pub fn sig_rule_matches(r: &SigRule, b: &Vec<i64>) -> bool {
     var ms: Vec<SigStrMatch> = Vec::new();
     var i: i64 = 0;
     while i < r.strings.len() {
-        ms.push(sig_find(& r.strings.get(i), b));
+        ms.push(sig_find(&r.strings.get(i), b));
         i = i + 1;
     }
-    return sg_eval(r, r.root, & ms, b.len());
+    return sg_eval(r, r.root, &ms, b.len());
 }
 
 /// Every rule whose condition holds over `b`, with its found strings.
-pub fn sig_scan(rs: & SigRules, b: Vec<i64>) -> Vec<SigHit> {
+pub fn sig_scan(rs: &SigRules, b: Vec<i64>) -> Vec<SigHit> {
     var hits: Vec<SigHit> = Vec::new();
     var k: i64 = 0;
     while k < rs.rules.len() {
@@ -1009,10 +1083,10 @@ pub fn sig_scan(rs: & SigRules, b: Vec<i64>) -> Vec<SigHit> {
         var ms: Vec<SigStrMatch> = Vec::new();
         var i: i64 = 0;
         while i < r.strings.len() {
-            ms.push(sig_find(& r.strings.get(i), & b));
+            ms.push(sig_find(&r.strings.get(i), &b));
             i = i + 1;
         }
-        if sg_eval(& r, r.root, & ms, b.len()) {
+        if sg_eval(&r, r.root, &ms, b.len()) {
             var found: Vec<SigStrMatch> = Vec::new();
             i = 0;
             while i < ms.len() {
@@ -1021,7 +1095,9 @@ pub fn sig_scan(rs: & SigRules, b: Vec<i64>) -> Vec<SigHit> {
                 }
                 i = i + 1;
             }
-            hits.push(SigHit { rule: r.name, tags: r.tags, strings: found });
+            hits.push(SigHit {
+                rule: r.name, tags: r.tags, strings: found
+            });
         }
         k = k + 1;
     }
@@ -1029,12 +1105,12 @@ pub fn sig_scan(rs: & SigRules, b: Vec<i64>) -> Vec<SigHit> {
 }
 
 /// Scan text (its bytes).
-pub fn sig_scan_str(rs: & SigRules, s: str) -> Vec<SigHit> {
+pub fn sig_scan_str(rs: &SigRules, s: str) -> Vec<SigHit> {
     return sig_scan(rs, str_bytes(s));
 }
 
 /// The names of the rules that matched.
-pub fn sig_hit_names(hits: & Vec<SigHit>) -> Vec<str> {
+pub fn sig_hit_names(hits: &Vec<SigHit>) -> Vec<str> {
     var out: Vec<str> = Vec::new();
     var i: i64 = 0;
     while i < hits.len() {

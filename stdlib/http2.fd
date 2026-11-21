@@ -57,23 +57,71 @@
 // order their requests complete.
 
 module http2;
- use vec; use string; use hpack; use http; use task;
+use vec;
+use string;
+use hpack;
+use http;
+use task;
 // ─── Constants (RFC 9113 6, 7, 11) ────────────────────────────────────────
 
-pub const H2_DATA: i64 = 0; pub const H2_HEADERS: i64 = 1; pub const H2_PRIORITY: i64 = 2; pub const H2_RST_STREAM: i64 = 3; pub const H2_SETTINGS: i64 = 4; pub const H2_PUSH_PROMISE: i64 = 5; pub const H2_PING: i64 = 6; pub const H2_GOAWAY: i64 = 7; pub const H2_WINDOW_UPDATE: i64 = 8; pub const H2_CONTINUATION: i64 = 9;
- pub const H2_FLAG_END_STREAM: i64 = 1; pub const H2_FLAG_ACK: i64 = 1; pub const H2_FLAG_END_HEADERS: i64 = 4; pub const H2_FLAG_PADDED: i64 = 8; pub const H2_FLAG_PRIORITY: i64 = 32;
- pub const H2_NO_ERROR: i64 = 0; pub const H2_PROTOCOL_ERROR: i64 = 1; pub const H2_INTERNAL_ERROR: i64 = 2; pub const H2_FLOW_CONTROL_ERROR: i64 = 3; pub const H2_SETTINGS_TIMEOUT: i64 = 4; pub const H2_STREAM_CLOSED: i64 = 5; pub const H2_FRAME_SIZE_ERROR: i64 = 6; pub const H2_REFUSED_STREAM: i64 = 7; pub const H2_CANCEL: i64 = 8; pub const H2_COMPRESSION_ERROR: i64 = 9; pub const H2_CONNECT_ERROR: i64 = 10; pub const H2_ENHANCE_YOUR_CALM: i64 = 11; pub const H2_INADEQUATE_SECURITY: i64 = 12; pub const H2_HTTP_1_1_REQUIRED: i64 = 13;
- pub const H2_SETTINGS_HEADER_TABLE_SIZE: i64 = 1; pub const H2_SETTINGS_ENABLE_PUSH: i64 = 2; pub const H2_SETTINGS_MAX_CONCURRENT_STREAMS: i64 = 3; pub const H2_SETTINGS_INITIAL_WINDOW_SIZE: i64 = 4; pub const H2_SETTINGS_MAX_FRAME_SIZE: i64 = 5; pub const H2_SETTINGS_MAX_HEADER_LIST_SIZE: i64 = 6;
+pub const H2_DATA: i64 = 0;
+pub const H2_HEADERS: i64 = 1;
+pub const H2_PRIORITY: i64 = 2;
+pub const H2_RST_STREAM: i64 = 3;
+pub const H2_SETTINGS: i64 = 4;
+pub const H2_PUSH_PROMISE: i64 = 5;
+pub const H2_PING: i64 = 6;
+pub const H2_GOAWAY: i64 = 7;
+pub const H2_WINDOW_UPDATE: i64 = 8;
+pub const H2_CONTINUATION: i64 = 9;
+pub const H2_FLAG_END_STREAM: i64 = 1;
+pub const H2_FLAG_ACK: i64 = 1;
+pub const H2_FLAG_END_HEADERS: i64 = 4;
+pub const H2_FLAG_PADDED: i64 = 8;
+pub const H2_FLAG_PRIORITY: i64 = 32;
+pub const H2_NO_ERROR: i64 = 0;
+pub const H2_PROTOCOL_ERROR: i64 = 1;
+pub const H2_INTERNAL_ERROR: i64 = 2;
+pub const H2_FLOW_CONTROL_ERROR: i64 = 3;
+pub const H2_SETTINGS_TIMEOUT: i64 = 4;
+pub const H2_STREAM_CLOSED: i64 = 5;
+pub const H2_FRAME_SIZE_ERROR: i64 = 6;
+pub const H2_REFUSED_STREAM: i64 = 7;
+pub const H2_CANCEL: i64 = 8;
+pub const H2_COMPRESSION_ERROR: i64 = 9;
+pub const H2_CONNECT_ERROR: i64 = 10;
+pub const H2_ENHANCE_YOUR_CALM: i64 = 11;
+pub const H2_INADEQUATE_SECURITY: i64 = 12;
+pub const H2_HTTP_1_1_REQUIRED: i64 = 13;
+pub const H2_SETTINGS_HEADER_TABLE_SIZE: i64 = 1;
+pub const H2_SETTINGS_ENABLE_PUSH: i64 = 2;
+pub const H2_SETTINGS_MAX_CONCURRENT_STREAMS: i64 = 3;
+pub const H2_SETTINGS_INITIAL_WINDOW_SIZE: i64 = 4;
+pub const H2_SETTINGS_MAX_FRAME_SIZE: i64 = 5;
+pub const H2_SETTINGS_MAX_HEADER_LIST_SIZE: i64 = 6;
 /// Stream states (5.1); reserved states never occur (no push).
-pub const H2_IDLE: i64 = 0; pub const H2_OPEN: i64 = 1; pub const H2_HALF_CLOSED_LOCAL: i64 = 2; pub const H2_HALF_CLOSED_REMOTE: i64 = 3; pub const H2_CLOSED: i64 = 4;
+pub const H2_IDLE: i64 = 0;
+pub const H2_OPEN: i64 = 1;
+pub const H2_HALF_CLOSED_LOCAL: i64 = 2;
+pub const H2_HALF_CLOSED_REMOTE: i64 = 3;
+pub const H2_CLOSED: i64 = 4;
 /// The default and largest window, the default frame size (6.5.2).
-pub const H2_DEFAULT_WINDOW: i64 = 65535; pub const H2_MAX_WINDOW: i64 = 2147483647; pub const H2_DEFAULT_FRAME: i64 = 16384; pub const H2_MAX_FRAME: i64 = 16777215;
+pub const H2_DEFAULT_WINDOW: i64 = 65535;
+pub const H2_MAX_WINDOW: i64 = 2147483647;
+pub const H2_DEFAULT_FRAME: i64 = 16384;
+pub const H2_MAX_FRAME: i64 = 16777215;
 /// What we announce: streams at once, and the windows we keep open for the
 /// peer (the connection's is raised with a WINDOW_UPDATE).
-const H2_OUR_MAX_STREAMS: i64 = 100; const H2_OUR_STREAM_WINDOW: i64 = 1048576; const H2_OUR_CONN_WINDOW: i64 = 16777216;  /// Largest header block and body we take.
-const H2_MAX_HEADER_BLOCK: i64 = 262144; const H2_MAX_BODY: i64 = 16777216;  /// An idle server connection is closed after this long (ms); a client waits
+const H2_OUR_MAX_STREAMS: i64 = 100;
+const H2_OUR_STREAM_WINDOW: i64 = 1048576;
+const H2_OUR_CONN_WINDOW: i64 = 16777216;
+/// Largest header block and body we take.
+const H2_MAX_HEADER_BLOCK: i64 = 262144;
+const H2_MAX_BODY: i64 = 16777216;
+/// An idle server connection is closed after this long (ms); a client waits
 /// this long for a response.
-const H2_IDLE_MS: i64 = 30000; const H2_CLIENT_MS: i64 = 15000;
+const H2_IDLE_MS: i64 = 30000;
+const H2_CLIENT_MS: i64 = 15000;
 /// SETTINGS_MAX_HEADER_LIST_SIZE we announce and enforce (6.5.2): the
 /// decoded size of a field section, each field's name and value and 32.
 pub const H2_OUR_MAX_HEADER_LIST: i64 = 65536;
@@ -189,11 +237,11 @@ pub fn h2_frame(ftype: i64, flags: i64, stream: i64, payload: Vec<i64>) -> H2Fra
 
 fn h2_none() -> H2Frame {
     return H2Frame {
-        length: 0, ftype: - 1, flags: 0, stream: 0, payload: Vec::new()
+        length: 0, ftype: -1, flags: 0, stream: 0, payload: Vec::new()
     };
 }
 
-fn h2_put32(out: & mut Vec<i64>, v: i64) {
+fn h2_put32(out: &mut Vec<i64>, v: i64) {
     out.push((v >> 24) & 255);
     out.push((v >> 16) & 255);
     out.push((v >> 8) & 255);
@@ -204,7 +252,7 @@ fn h2_get32(b: Vec<i64>, at: i64) -> i64 {
     return (b.get(at) << 24) | (b.get(at + 1) << 16) | (b.get(at + 2) << 8) | b.get(at + 3);
 }
 
-fn h2_append(out: & mut Vec<i64>, b: Vec<i64>) {
+fn h2_append(out: &mut Vec<i64>, b: Vec<i64>) {
     var i: i64 = 0;
     while i < b.len() {
         out.push(b.get(i));
@@ -223,7 +271,7 @@ fn h2_sub(b: Vec<i64>, from: i64, to: i64) -> Vec<i64> {
 }
 
 /// Append a frame's 9-byte header and payload to `out`.
-pub fn h2_put_frame(out: & mut Vec<i64>, f: H2Frame) {
+pub fn h2_put_frame(out: &mut Vec<i64>, f: H2Frame) {
     val n: i64 = f.payload.len();
     out.push((n >> 16) & 255);
     out.push((n >> 8) & 255);
@@ -237,7 +285,7 @@ pub fn h2_put_frame(out: & mut Vec<i64>, f: H2Frame) {
 /// A frame as bytes: header then payload.
 pub fn h2_frame_encode(f: H2Frame) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
-    h2_put_frame(& mut out, f);
+    h2_put_frame(&mut out, f);
     return out;
 }
 
@@ -277,7 +325,7 @@ pub fn h2_frames_decode(b: Vec<i64>, at: i64) -> Vec<H2Frame> {
     return out;
 }
 
-fn h2_pad_bytes(out: & mut Vec<i64>, pad: i64) {
+fn h2_pad_bytes(out: &mut Vec<i64>, pad: i64) {
     var i: i64 = 0;
     while i < pad {
         out.push(0);
@@ -296,8 +344,8 @@ pub fn h2_data_frame(stream: i64, data: Vec<i64>, end_stream: bool, pad: i64) ->
         flags = flags | H2_FLAG_PADDED;
         p.push(pad);
     }
-    h2_append(& mut p, data);
-    h2_pad_bytes(& mut p, pad);
+    h2_append(&mut p, data);
+    h2_pad_bytes(&mut p, pad);
     return h2_frame(H2_DATA, flags, stream, p);
 }
 
@@ -321,7 +369,7 @@ pub fn h2_no_priority() -> H2Priority {
     };
 }
 
-fn h2_put_priority(out: & mut Vec<i64>, pr: H2Priority) {
+fn h2_put_priority(out: &mut Vec<i64>, pr: H2Priority) {
     var d: i64 = pr.dep & H2_MAX_WINDOW;
     if pr.exclusive {
         d = d | 2147483648;
@@ -351,24 +399,24 @@ pub fn h2_headers_frame_ex(stream: i64, block: Vec<i64>, end_stream: bool, end_h
     }
     if has_priority {
         flags = flags | H2_FLAG_PRIORITY;
-        h2_put_priority(& mut p, pr);
+        h2_put_priority(&mut p, pr);
     }
-    h2_append(& mut p, block);
-    h2_pad_bytes(& mut p, pad);
+    h2_append(&mut p, block);
+    h2_pad_bytes(&mut p, pad);
     return h2_frame(H2_HEADERS, flags, stream, p);
 }
 
 /// PRIORITY (6.3).
 pub fn h2_priority_frame(stream: i64, pr: H2Priority) -> H2Frame {
     var p: Vec<i64> = Vec::new();
-    h2_put_priority(& mut p, pr);
+    h2_put_priority(&mut p, pr);
     return h2_frame(H2_PRIORITY, 0, stream, p);
 }
 
 /// RST_STREAM (6.4).
 pub fn h2_rst_stream_frame(stream: i64, code: i64) -> H2Frame {
     var p: Vec<i64> = Vec::new();
-    h2_put32(& mut p, code);
+    h2_put32(&mut p, code);
     return h2_frame(H2_RST_STREAM, 0, stream, p);
 }
 
@@ -379,7 +427,7 @@ pub fn h2_settings_frame(ids: Vec<i64>, vals: Vec<i64>) -> H2Frame {
     while i < ids.len() {
         p.push((ids.get(i) >> 8) & 255);
         p.push(ids.get(i) & 255);
-        h2_put32(& mut p, vals.get(i));
+        h2_put32(&mut p, vals.get(i));
         i = i + 1;
     }
     return h2_frame(H2_SETTINGS, 0, 0, p);
@@ -412,16 +460,16 @@ pub fn h2_ping_frame(opaque: Vec<i64>, ack: bool) -> H2Frame {
 /// GOAWAY (6.8).
 pub fn h2_goaway_frame(last_stream: i64, code: i64, debug: str) -> H2Frame {
     var p: Vec<i64> = Vec::new();
-    h2_put32(& mut p, last_stream & H2_MAX_WINDOW);
-    h2_put32(& mut p, code);
-    h2_append(& mut p, str_bytes(debug));
+    h2_put32(&mut p, last_stream & H2_MAX_WINDOW);
+    h2_put32(&mut p, code);
+    h2_append(&mut p, str_bytes(debug));
     return h2_frame(H2_GOAWAY, 0, 0, p);
 }
 
 /// WINDOW_UPDATE (6.9) for a stream, or the connection (stream 0).
 pub fn h2_window_update_frame(stream: i64, increment: i64) -> H2Frame {
     var p: Vec<i64> = Vec::new();
-    h2_put32(& mut p, increment & H2_MAX_WINDOW);
+    h2_put32(&mut p, increment & H2_MAX_WINDOW);
     return h2_frame(H2_WINDOW_UPDATE, 0, stream, p);
 }
 
@@ -737,7 +785,7 @@ pub struct H2Conn {
 fn h2_conn(fd: i64, client: bool, authority: str) -> H2Conn {
     var dec: Hpack = hpack_new(4096);
     return H2Conn {
-        fd: fd, client: client, authority: authority, ok: true, inbuf: Vec::new(), inpos: 0, out: Vec::new(), enc: hpack_new(4096), dec: dec, peer_window: H2_DEFAULT_WINDOW, peer_max_frame: H2_DEFAULT_FRAME, peer_max_streams: 100, send_window: H2_DEFAULT_WINDOW, recv_window: H2_DEFAULT_WINDOW, streams: Vec::new(), next_id: 1, last_peer: 0, got_settings: false, goaway: false, error: - 1, why: "", cont_stream: 0, cont_flags: 0, cont_block: Vec::new(), tls: 0, settings_deadline: 0, peer_max_header_list: - 1, tasks: false, jobs: Vec::new(), job_ids: Vec::new(),
+        fd: fd, client: client, authority: authority, ok: true, inbuf: Vec::new(), inpos: 0, out: Vec::new(), enc: hpack_new(4096), dec: dec, peer_window: H2_DEFAULT_WINDOW, peer_max_frame: H2_DEFAULT_FRAME, peer_max_streams: 100, send_window: H2_DEFAULT_WINDOW, recv_window: H2_DEFAULT_WINDOW, streams: Vec::new(), next_id: 1, last_peer: 0, got_settings: false, goaway: false, error: -1, why: "", cont_stream: 0, cont_flags: 0, cont_block: Vec::new(), tls: 0, settings_deadline: 0, peer_max_header_list: -1, tasks: false, jobs: Vec::new(), job_ids: Vec::new(),
     };
 }
 
@@ -747,15 +795,15 @@ pub fn h2_conn_new(fd: i64, client: bool, authority: str) -> H2Conn {
     return h2_conn(fd, client, authority);
 }
 
-fn h2_new_stream(c: & H2Conn, id: i64) -> H2Stream {
+fn h2_new_stream(c: &H2Conn, id: i64) -> H2Stream {
     return H2Stream {
-        id: id, state: H2_OPEN, send_window: c.peer_window, recv_window: H2_OUR_STREAM_WINDOW, names: Vec::new(), vals: Vec::new(), got_headers: false, body: Vec::new(), pending: Vec::new(), pending_end: false, handled: false, reset: - 1,
+        id: id, state: H2_OPEN, send_window: c.peer_window, recv_window: H2_OUR_STREAM_WINDOW, names: Vec::new(), vals: Vec::new(), got_headers: false, body: Vec::new(), pending: Vec::new(), pending_end: false, handled: false, reset: -1,
     };
 }
 
 /// Index of stream `id` in the table, -1 when it is not there (idle, or
 /// closed and forgotten).
-pub fn h2_stream_index(c: & H2Conn, id: i64) -> i64 {
+pub fn h2_stream_index(c: &H2Conn, id: i64) -> i64 {
     var i: i64 = 0;
     while i < c.streams.len() {
         if c.streams.get(i).id == id {
@@ -763,30 +811,32 @@ pub fn h2_stream_index(c: & H2Conn, id: i64) -> i64 {
         }
         i = i + 1;
     }
-    return - 1;
+    return -1;
 }
 
 /// Queue a frame (written by h2_flush).
-pub fn h2_send(c: & mut H2Conn, f: H2Frame) {
-    h2_put_frame(& mut c.out, f);
+pub fn h2_send(c: &mut H2Conn, f: H2Frame) {
+    h2_put_frame(&mut c.out, f);
 }
 
 // Module `http2_tls` sets these: reading, writing and closing a TLS
 // session (as module http's http_set_tls). A connection whose `tls` is not
 // 0 goes through them.
 fn h2_no_tls_recv(tls: i64, buf: i64, n: i64, timeout_ms: i64) -> i64 {
-    return - 1;
+    return -1;
 }
 
 fn h2_no_tls_send(tls: i64, buf: i64, n: i64) -> i64 {
-    return - 1;
+    return -1;
 }
 
 fn h2_no_tls_close(tls: i64) -> i64 {
     return 0;
 }
 
-var h2_tls_recv: fn(i64, i64, i64, i64) -> i64 = h2_no_tls_recv; var h2_tls_send: fn(i64, i64, i64) -> i64 = h2_no_tls_send; var h2_tls_close: fn(i64) -> i64 = h2_no_tls_close;
+var h2_tls_recv: fn(i64, i64, i64, i64) -> i64 = h2_no_tls_recv;
+var h2_tls_send: fn(i64, i64, i64) -> i64 = h2_no_tls_send;
+var h2_tls_close: fn(i64) -> i64 = h2_no_tls_close;
 /// For module `http2_tls`: how to read, write and close a TLS session.
 pub fn http2_set_tls(recv: fn(i64, i64, i64, i64) -> i64, send: fn(i64, i64, i64) -> i64, close: fn(i64) -> i64) {
     h2_tls_recv = recv;
@@ -795,7 +845,7 @@ pub fn http2_set_tls(recv: fn(i64, i64, i64, i64) -> i64, send: fn(i64, i64, i64
 }
 
 // Write `n` bytes at `buf` to the socket or through the TLS session.
-fn h2_io_send(c: & H2Conn, buf: i64, n: i64) -> i64 {
+fn h2_io_send(c: &H2Conn, buf: i64, n: i64) -> i64 {
     if c.tls != 0 {
         val send: fn(i64, i64, i64) -> i64 = h2_tls_send;
         return send(c.tls, buf, n);
@@ -805,7 +855,7 @@ fn h2_io_send(c: & H2Conn, buf: i64, n: i64) -> i64 {
 
 // Read up to `n` bytes into `buf`: how many, 0 at the end, below 0 on an
 // error or a timeout.
-fn h2_io_recv(c: & H2Conn, buf: i64, n: i64, timeout_ms: i64) -> i64 {
+fn h2_io_recv(c: &H2Conn, buf: i64, n: i64, timeout_ms: i64) -> i64 {
     if c.tls != 0 {
         val recv: fn(i64, i64, i64, i64) -> i64 = h2_tls_recv;
         return recv(c.tls, buf, n, timeout_ms);
@@ -814,7 +864,7 @@ fn h2_io_recv(c: & H2Conn, buf: i64, n: i64, timeout_ms: i64) -> i64 {
 }
 
 // Close the TLS session (if any) and the socket.
-fn h2_close_transport(c: & mut H2Conn) {
+fn h2_close_transport(c: &mut H2Conn) {
     if c.tls != 0 {
         val close: fn(i64) -> i64 = h2_tls_close;
         close(c.tls);
@@ -822,12 +872,12 @@ fn h2_close_transport(c: & mut H2Conn) {
     }
     if c.fd >= 0 {
         p_socket_close(c.fd);
-        c.fd = - 1;
+        c.fd = -1;
     }
 }
 
 /// Write the queued frames. False when the connection failed.
-pub fn h2_flush(c: & mut H2Conn) -> bool {
+pub fn h2_flush(c: &mut H2Conn) -> bool {
     val n: i64 = c.out.len();
     if n == 0 || c.fd < 0 {
         return c.ok;
@@ -849,7 +899,7 @@ pub fn h2_flush(c: & mut H2Conn) -> bool {
 
 // More bytes from the socket into inbuf: how many, 0 at the end, below 0 on
 // an error or a timeout.
-fn h2_fill(c: & mut H2Conn, timeout_ms: i64) -> i64 {
+fn h2_fill(c: &mut H2Conn, timeout_ms: i64) -> i64 {
     if c.inpos > 0 && c.inpos * 2 >= c.inbuf.len() {
         c.inbuf = h2_sub(c.inbuf, c.inpos, c.inbuf.len());
         c.inpos = 0;
@@ -867,7 +917,7 @@ fn h2_fill(c: & mut H2Conn, timeout_ms: i64) -> i64 {
 
 // Wait until `n` unread bytes are buffered. False at the end of the input,
 // on an error or a timeout.
-fn h2_need(c: & mut H2Conn, n: i64, timeout_ms: i64) -> bool {
+fn h2_need(c: &mut H2Conn, n: i64, timeout_ms: i64) -> bool {
     while c.inbuf.len() - c.inpos < n {
         if h2_fill(c, timeout_ms) <= 0 {
             return false;
@@ -878,7 +928,7 @@ fn h2_need(c: & mut H2Conn, n: i64, timeout_ms: i64) -> bool {
 
 /// Read the next frame (ftype -1 at the end of the input, on a timeout, or
 /// when the frame is larger than we allow: then `c.error` is set).
-pub fn h2_read_frame(c: & mut H2Conn, timeout_ms: i64) -> H2Frame {
+pub fn h2_read_frame(c: &mut H2Conn, timeout_ms: i64) -> H2Frame {
     if !h2_need(c, 9, timeout_ms) {
         return h2_none();
     }
@@ -898,7 +948,7 @@ pub fn h2_read_frame(c: & mut H2Conn, timeout_ms: i64) -> H2Frame {
 
 /// A connection error (5.4.1): GOAWAY with the last stream the peer opened,
 /// then the connection is done.
-pub fn h2_conn_error(c: & mut H2Conn, code: i64, why: str) {
+pub fn h2_conn_error(c: &mut H2Conn, code: i64, why: str) {
     if c.error < 0 {
         c.error = code;
         c.why = why;
@@ -911,7 +961,7 @@ pub fn h2_conn_error(c: & mut H2Conn, code: i64, why: str) {
 // Before closing: read (and drop) what the peer still sends until it closes
 // or `ms` pass. Closing a socket with unread input resets the connection on
 // some systems (Windows), and the peer may then lose our last frames.
-fn h2_linger(c: & mut H2Conn, ms: i64) {
+fn h2_linger(c: &mut H2Conn, ms: i64) {
     if c.fd < 0 {
         return;
     }
@@ -927,7 +977,7 @@ fn h2_linger(c: & mut H2Conn, ms: i64) {
 }
 
 // A stream error (5.4.2): RST_STREAM, and the stream is forgotten.
-fn h2_stream_error(c: & mut H2Conn, id: i64, code: i64) {
+fn h2_stream_error(c: &mut H2Conn, id: i64, code: i64) {
     h2_send(c, h2_rst_stream_frame(id, code));
     val k: i64 = h2_stream_index(c, id);
     if k >= 0 {
@@ -937,9 +987,9 @@ fn h2_stream_error(c: & mut H2Conn, id: i64, code: i64) {
 
 // Send our SETTINGS (and, for a client, the preface first) and open the
 // connection window wide.
-fn h2_start(c: & mut H2Conn) {
+fn h2_start(c: &mut H2Conn) {
     if c.client {
-        h2_append(& mut c.out, h2_preface());
+        h2_append(&mut c.out, h2_preface());
     }
     h2_send(c, h2_our_settings(c.client));
     h2_send(c, h2_window_update_frame(0, H2_OUR_CONN_WINDOW - H2_DEFAULT_WINDOW));
@@ -969,7 +1019,7 @@ pub fn h2_our_settings(client: bool) -> H2Frame {
 /// True when our SETTINGS have waited for their acknowledgement past the
 /// deadline at `now_ms` (the ms clock, p_clock_now_ms): then the connection
 /// has ended with GOAWAY SETTINGS_TIMEOUT (6.5.3).
-pub fn h2_settings_overdue(c: & mut H2Conn, now_ms: i64) -> bool {
+pub fn h2_settings_overdue(c: &mut H2Conn, now_ms: i64) -> bool {
     if c.settings_deadline > 0 && now_ms >= c.settings_deadline {
         c.settings_deadline = 0;
         h2_conn_error(c, H2_SETTINGS_TIMEOUT, "SETTINGS not acknowledged");
@@ -980,7 +1030,7 @@ pub fn h2_settings_overdue(c: & mut H2Conn, now_ms: i64) -> bool {
 
 // How long to wait for input: `ms`, or less when our SETTINGS time out
 // sooner (at least 1).
-fn h2_wait_ms(c: & H2Conn, ms: i64) -> i64 {
+fn h2_wait_ms(c: &H2Conn, ms: i64) -> i64 {
     var wait: i64 = ms;
     if c.settings_deadline > 0 {
         // a few ms past the deadline, so a wait that ends finds it passed
@@ -997,12 +1047,12 @@ fn h2_wait_ms(c: & H2Conn, ms: i64) -> i64 {
 
 /// Queue what an end sends first: the preface (client), our SETTINGS, and
 /// a WINDOW_UPDATE that opens the connection window.
-pub fn h2_conn_start(c: & mut H2Conn) {
+pub fn h2_conn_start(c: &mut H2Conn) {
     h2_start(c);
 }
 
 // Apply the peer's SETTINGS (6.5.2), then acknowledge them.
-fn h2_apply_settings(c: & mut H2Conn, info: H2Info) {
+fn h2_apply_settings(c: &mut H2Conn, info: H2Info) {
     if h2_settings_values(c, info) {
         h2_send(c, h2_settings_ack());
     }
@@ -1011,7 +1061,7 @@ fn h2_apply_settings(c: & mut H2Conn, info: H2Info) {
 // Apply the peer's SETTINGS values; false after a connection error. (An
 // h2c Upgrade's HTTP2-Settings are applied so too, with no ACK: the 101
 // acknowledges them, RFC 7540 3.2.1.)
-fn h2_settings_values(c: & mut H2Conn, info: H2Info) -> bool {
+fn h2_settings_values(c: &mut H2Conn, info: H2Info) -> bool {
     var i: i64 = 0;
     while i < info.ids.len() {
         val id: i64 = info.ids.get(i);
@@ -1023,7 +1073,7 @@ fn h2_settings_values(c: & mut H2Conn, info: H2Info) -> bool {
                 size = 4096;
             }
             if size != c.enc.max_size {
-                hpack_set_max_size(& mut c.enc, size);
+                hpack_set_max_size(&mut c.enc, size);
             }
         } else if id == H2_SETTINGS_INITIAL_WINDOW_SIZE {
             // Every stream's window moves by the difference (6.9.2)
@@ -1183,26 +1233,26 @@ fn h2_check_fields(names: Vec<str>, vals: Vec<str>, request: bool, trailers: boo
 // The content-length of a header list (8.1.1): -1 when there is none, -2
 // when a value is not a decimal number or two values differ.
 fn h2_content_length(names: Vec<str>, vals: Vec<str>) -> i64 {
-    var found: i64 = - 1;
+    var found: i64 = -1;
     var i: i64 = 0;
     while i < names.len() {
         if names.get(i) == "content-length" {
             val v: str = vals.get(i);
             if str_len(v) == 0 || str_len(v) > 18 {
-                return - 2;
+                return -2;
             }
             var n: i64 = 0;
             var j: i64 = 0;
             while j < str_len(v) {
                 val b: i64 = str_byte_at(v, j);
                 if b < 48 || b > 57 {
-                    return - 2;
+                    return -2;
                 }
                 n = n * 10 + (b - 48);
                 j = j + 1;
             }
             if found >= 0 && found != n {
-                return - 2;
+                return -2;
             }
             found = n;
         }
@@ -1212,7 +1262,7 @@ fn h2_content_length(names: Vec<str>, vals: Vec<str>) -> i64 {
 }
 
 // Count the streams that are not closed.
-fn h2_active(c: & H2Conn) -> i64 {
+fn h2_active(c: &H2Conn) -> i64 {
     var n: i64 = 0;
     var i: i64 = 0;
     while i < c.streams.len() {
@@ -1229,7 +1279,7 @@ fn h2_active(c: & H2Conn) -> i64 {
 // Large, RFC 6585) and, if the request goes on, asks the client to stop
 // with RST_STREAM NO_ERROR (8.1); a client refuses the response with
 // RST_STREAM CANCEL, and the stream ends reset.
-fn h2_header_list_too_large(c: & mut H2Conn, k: i64, end_stream: bool) {
+fn h2_header_list_too_large(c: &mut H2Conn, k: i64, end_stream: bool) {
     var s: H2Stream = c.streams.get(k);
     val id: i64 = s.id;
     if c.client {
@@ -1256,10 +1306,10 @@ fn h2_header_list_too_large(c: & mut H2Conn, k: i64, end_stream: bool) {
 }
 
 // A complete header block for stream `id`.
-fn h2_on_header_block(c: & mut H2Conn, id: i64, flags: i64, block: Vec<i64>) {
+fn h2_on_header_block(c: &mut H2Conn, id: i64, flags: i64, block: Vec<i64>) {
     val end_stream: bool = (flags & H2_FLAG_END_STREAM) != 0;
     // Decode first, whatever happens to the stream: the table is shared
-    val hl: HpackHeaders = hpack_decode(& mut c.dec, block);
+    val hl: HpackHeaders = hpack_decode(&mut c.dec, block);
     if !hl.ok {
         h2_conn_error(c, H2_COMPRESSION_ERROR, hl.error);
         return;
@@ -1311,7 +1361,7 @@ fn h2_on_header_block(c: & mut H2Conn, id: i64, flags: i64, block: Vec<i64>) {
             // A request's content-length must be a number, and one that
             // ends the stream here declares no body (8.1.1)
             val cl: i64 = h2_content_length(hl.names, hl.vals);
-            if cl == - 2 || (end_stream && cl > 0) {
+            if cl == -2 || (end_stream && cl > 0) {
                 h2_stream_error(c, id, H2_PROTOCOL_ERROR);
                 return;
             }
@@ -1345,7 +1395,7 @@ fn h2_on_header_block(c: & mut H2Conn, id: i64, flags: i64, block: Vec<i64>) {
     c.streams.set(k, s);
 }
 
-fn h2_on_data(c: & mut H2Conn, f: H2Frame, info: H2Info) {
+fn h2_on_data(c: &mut H2Conn, f: H2Frame, info: H2Info) {
     // Flow control counts the whole payload, padding included (6.9.1)
     c.recv_window = c.recv_window - f.length;
     if c.recv_window < 0 {
@@ -1379,7 +1429,7 @@ fn h2_on_data(c: & mut H2Conn, f: H2Frame, info: H2Info) {
         h2_stream_error(c, f.stream, H2_REFUSED_STREAM);
         return;
     }
-    h2_append(& mut s.body, info.data);
+    h2_append(&mut s.body, info.data);
     val end_stream: bool = (f.flags & H2_FLAG_END_STREAM) != 0;
     if !c.client {
         // 8.1.1: a request's DATA must add up to its content-length (a
@@ -1406,7 +1456,7 @@ fn h2_on_data(c: & mut H2Conn, f: H2Frame, info: H2Info) {
 
 /// Handle one frame the peer sent. False when the connection is over (an
 /// error, or GOAWAY with nothing left to finish).
-pub fn h2_process(c: & mut H2Conn, f: H2Frame) -> bool {
+pub fn h2_process(c: &mut H2Conn, f: H2Frame) -> bool {
     val info: H2Info = h2_parse(f);
     // Inside a header block only its CONTINUATION frames may come (6.10)
     if c.cont_stream != 0 && (f.ftype != H2_CONTINUATION || f.stream != c.cont_stream) {
@@ -1447,7 +1497,7 @@ pub fn h2_process(c: & mut H2Conn, f: H2Frame) -> bool {
             h2_conn_error(c, H2_PROTOCOL_ERROR, "CONTINUATION without HEADERS");
             return false;
         }
-        h2_append(& mut c.cont_block, info.data);
+        h2_append(&mut c.cont_block, info.data);
         if c.cont_block.len() > H2_MAX_HEADER_BLOCK {
             h2_conn_error(c, H2_ENHANCE_YOUR_CALM, "header block too large");
             return false;
@@ -1523,8 +1573,8 @@ pub fn h2_process(c: & mut H2Conn, f: H2Frame) -> bool {
 
 /// Queue the header block of stream `id` as HEADERS and as many
 /// CONTINUATION frames as the peer's frame size needs.
-pub fn h2_send_headers(c: & mut H2Conn, id: i64, names: Vec<str>, vals: Vec<str>, end_stream: bool) {
-    val block: Vec<i64> = hpack_encode(& mut c.enc, names, vals);
+pub fn h2_send_headers(c: &mut H2Conn, id: i64, names: Vec<str>, vals: Vec<str>, end_stream: bool) {
+    val block: Vec<i64> = hpack_encode(&mut c.enc, names, vals);
     val max: i64 = c.peer_max_frame;
     if block.len() <= max {
         h2_send(c, h2_headers_frame(id, block, end_stream, true));
@@ -1543,7 +1593,7 @@ pub fn h2_send_headers(c: & mut H2Conn, id: i64, names: Vec<str>, vals: Vec<str>
 }
 
 // Set a stream's body to send after its HEADERS.
-fn h2_queue_body(c: & mut H2Conn, id: i64, body: Vec<i64>) {
+fn h2_queue_body(c: &mut H2Conn, id: i64, body: Vec<i64>) {
     val k: i64 = h2_stream_index(c, id);
     if k < 0 {
         return;
@@ -1555,7 +1605,7 @@ fn h2_queue_body(c: & mut H2Conn, id: i64, body: Vec<i64>) {
 }
 
 // Our side of a stream is done.
-fn h2_close_local(s: & mut H2Stream) {
+fn h2_close_local(s: &mut H2Stream) {
     if s.state == H2_HALF_CLOSED_REMOTE || s.state == H2_CLOSED {
         s.state = H2_CLOSED;
     } else {
@@ -1565,7 +1615,7 @@ fn h2_close_local(s: & mut H2Stream) {
 
 /// Send what the windows allow of every stream's pending body, a frame per
 /// stream in turn, so streams share the connection.
-pub fn h2_pump(c: & mut H2Conn) {
+pub fn h2_pump(c: &mut H2Conn) {
     var progress: bool = true;
     while progress {
         progress = false;
@@ -1591,7 +1641,7 @@ pub fn h2_pump(c: & mut H2Conn) {
                     if last {
                         s.pending = Vec::new();
                         s.pending_end = false;
-                        h2_close_local(& mut s);
+                        h2_close_local(&mut s);
                     } else {
                         s.pending = h2_sub(s.pending, n, s.pending.len());
                         progress = true;
@@ -1605,7 +1655,7 @@ pub fn h2_pump(c: & mut H2Conn) {
 }
 
 // Forget closed streams that nobody waits on (server side).
-fn h2_drop_closed(c: & mut H2Conn) {
+fn h2_drop_closed(c: &mut H2Conn) {
     var k: i64 = c.streams.len() - 1;
     while k >= 0 {
         val s: H2Stream = c.streams.get(k);
@@ -1618,7 +1668,8 @@ fn h2_drop_closed(c: & mut H2Conn) {
 
 // ─── Server ───────────────────────────────────────────────────────────────
 
-var h2_handler: fn(HttpRequest) -> str = http_not_found; var h2_stopping: bool = false;
+var h2_handler: fn(HttpRequest) -> str = http_not_found;
+var h2_stopping: bool = false;
 /// The request a handler gets: method and path from the pseudo-header
 /// fields, the other fields as headers (with "host" from :authority), the
 /// body. `version` is "2".
@@ -1664,7 +1715,7 @@ pub fn h2_request(s: H2Stream) -> HttpRequest {
 /// Turn a response of module `http` (build_response: "HTTP/1.1 200 OK",
 /// headers, body) into HTTP/2 fields and a body. Text that is not such a
 /// response is sent as a 200 text/plain body.
-pub fn h2_response_fields(resp: str, names: & mut Vec<str>, vals: & mut Vec<str>) -> str {
+pub fn h2_response_fields(resp: str, names: &mut Vec<str>, vals: &mut Vec<str>) -> str {
     val end: i64 = str_find(resp, "\r\n\r\n");
     if !str_starts_with(resp, "HTTP/") || end < 0 {
         names.push(":status");
@@ -1693,7 +1744,7 @@ pub fn h2_response_fields(resp: str, names: & mut Vec<str>, vals: & mut Vec<str>
 // Send a handler's response `resp` (module http's text) on stream `id`,
 // unless the stream is gone or was reset meanwhile. `head`: a HEAD
 // request, whose response has no body.
-fn h2_respond(c: & mut H2Conn, id: i64, head: bool, resp: str) {
+fn h2_respond(c: &mut H2Conn, id: i64, head: bool, resp: str) {
     val k: i64 = h2_stream_index(c, id);
     if k < 0 {
         return;
@@ -1704,7 +1755,7 @@ fn h2_respond(c: & mut H2Conn, id: i64, head: bool, resp: str) {
     }
     var names: Vec<str> = Vec::new();
     var vals: Vec<str> = Vec::new();
-    var body: str = h2_response_fields(resp, & mut names, & mut vals);
+    var body: str = h2_response_fields(resp, &mut names, &mut vals);
     if head {
         body = "";
     }
@@ -1712,7 +1763,7 @@ fn h2_respond(c: & mut H2Conn, id: i64, head: bool, resp: str) {
     h2_send_headers(c, id, names, vals, bytes.len() == 0);
     if bytes.len() == 0 {
         var t: H2Stream = c.streams.get(k);
-        h2_close_local(& mut t);
+        h2_close_local(&mut t);
         c.streams.set(k, t);
     } else {
         h2_queue_body(c, id, bytes);
@@ -1759,7 +1810,7 @@ pub fn h2_job_text(s: H2Stream) -> str {
 }
 
 // The line of `t` starting at `at[0]`; moves at[0] past its LF.
-fn h2_job_line(t: str, at: & mut Vec<i64>) -> str {
+fn h2_job_line(t: str, at: &mut Vec<i64>) -> str {
     val from: i64 = at.get(0);
     var i: i64 = from;
     while i < str_len(t) && str_byte_at(t, i) != 10 {
@@ -1775,13 +1826,13 @@ pub fn h2_job_request(t: str) -> HttpRequest {
     req.version = "2";
     var at: Vec<i64> = Vec::new();
     at.push(0);
-    req.method = h2_job_line(t, & mut at);
-    req.target = h2_job_line(t, & mut at);
-    val n: i64 = str_parse_int(h2_job_line(t, & mut at));
+    req.method = h2_job_line(t, &mut at);
+    req.target = h2_job_line(t, &mut at);
+    val n: i64 = str_parse_int(h2_job_line(t, &mut at));
     var i: i64 = 0;
     while i < n {
-        req.names.push(h2_job_line(t, & mut at));
-        req.vals.push(h2_job_line(t, & mut at));
+        req.names.push(h2_job_line(t, &mut at));
+        req.vals.push(h2_job_line(t, &mut at));
         i = i + 1;
     }
     val q: i64 = str_find(req.target, "?");
@@ -1816,7 +1867,7 @@ pub fn h2_handler_task(slot: i64) -> i64 {
 }
 
 // Start the handler of stream `s` on a task of its own.
-fn h2_start_job(c: & mut H2Conn, s: H2Stream) {
+fn h2_start_job(c: &mut H2Conn, s: H2Stream) {
     val slot: i64 = p_malloc(24);
     p_atomic_store(slot, h2_job_text(s) as i64);
     p_atomic_store(slot + 8, 0);
@@ -1828,7 +1879,7 @@ fn h2_start_job(c: & mut H2Conn, s: H2Stream) {
 
 /// Send the responses of the handler tasks that have finished. Returns how
 /// many are still running.
-pub fn h2_collect_jobs(c: & mut H2Conn) -> i64 {
+pub fn h2_collect_jobs(c: &mut H2Conn) -> i64 {
     var k: i64 = 0;
     while k < c.jobs.len() {
         val slot: i64 = c.jobs.get(k);
@@ -1852,7 +1903,7 @@ pub fn h2_collect_jobs(c: & mut H2Conn) -> i64 {
 
 // Before a connection ends: wait for its handler tasks and drop their
 // responses (their slots and strings are the connection's to free).
-fn h2_finish_jobs(c: & mut H2Conn) {
+fn h2_finish_jobs(c: &mut H2Conn) {
     while c.jobs.len() > 0 {
         val slot: i64 = c.jobs.get(0);
         if p_atomic_load(slot + 16) != 0 {
@@ -1870,7 +1921,7 @@ fn h2_finish_jobs(c: & mut H2Conn) {
 // its own when the connection says so (servers on sockets), else here,
 // one at a time (connections driven by hand, http2_set_handler_tasks
 // false).
-fn h2_run_handlers(c: & mut H2Conn) {
+fn h2_run_handlers(c: &mut H2Conn) {
     var k: i64 = 0;
     while k < c.streams.len() {
         var s: H2Stream = c.streams.get(k);
@@ -1922,7 +1973,7 @@ pub fn http2_reset_stop() {
 
 /// After a frame: run the handlers of complete requests, send what the
 /// windows allow, forget finished streams.
-pub fn h2_server_step(c: & mut H2Conn) {
+pub fn h2_server_step(c: &mut H2Conn) {
     h2_run_handlers(c);
     h2_pump(c);
     h2_drop_closed(c);
@@ -1938,13 +1989,13 @@ fn h2_head_end(b: Vec<i64>, from: i64) -> i64 {
         }
         i = i + 1;
     }
-    return - 1;
+    return -1;
 }
 
 // What a cleartext connection starts with: 1 the HTTP/2 preface, 2 an
 // HTTP/1.1 head (whole in inbuf), 0 the end of the input or a timeout, 3
 // neither (an over-long head).
-fn h2_read_opening(c: & mut H2Conn) -> i64 {
+fn h2_read_opening(c: &mut H2Conn) -> i64 {
     val magic: Vec<i64> = h2_preface();
     while true {
         val n: i64 = c.inbuf.len();
@@ -1976,7 +2027,7 @@ fn h2_read_opening(c: & mut H2Conn) -> i64 {
 
 // The client's connection preface (3.4): its 24 bytes at inpos. False (and
 // a connection error) when they are something else, or never come.
-fn h2_expect_preface(c: & mut H2Conn) -> bool {
+fn h2_expect_preface(c: &mut H2Conn) -> bool {
     if !h2_need(c, 24, H2_IDLE_MS) {
         return false;
     }
@@ -2038,7 +2089,7 @@ fn h2_b64url_value(b: i64) -> i64 {
     if b == 95 {
         return 63;
     }
-    return - 1;
+    return -1;
 }
 
 /// Bytes in base64url without padding (RFC 4648 section 5), as
@@ -2072,7 +2123,7 @@ pub fn h2_b64url_encode(b: Vec<i64>) -> str {
 
 /// Decode base64url (padding '=' allowed at the end) into `out`. False on a
 /// character outside the alphabet or a length no encoding gives.
-pub fn h2_b64url_decode(s: str, out: & mut Vec<i64>) -> bool {
+pub fn h2_b64url_decode(s: str, out: &mut Vec<i64>) -> bool {
     var n: i64 = str_len(s);
     while n > 0 && str_byte_at(s, n - 1) == 61 {
         n = n - 1;
@@ -2115,7 +2166,7 @@ pub fn h2_settings_header(client: bool) -> str {
 /// 1, half-closed (remote), answered once the client's preface is in.
 /// False, with nothing queued, when it does not ask or asks wrongly: the
 /// caller answers it over HTTP/1.1.
-pub fn h2_upgrade_request(c: & mut H2Conn, req: HttpRequest, body: Vec<i64>) -> bool {
+pub fn h2_upgrade_request(c: &mut H2Conn, req: HttpRequest, body: Vec<i64>) -> bool {
     if c.client || c.tls != 0 || c.streams.len() > 0 || req.method == "" {
         return false;
     }
@@ -2140,7 +2191,7 @@ pub fn h2_upgrade_request(c: & mut H2Conn, req: HttpRequest, body: Vec<i64>) -> 
         return false;
     }
     var payload: Vec<i64> = Vec::new();
-    if !h2_b64url_decode(settings_text, & mut payload) {
+    if !h2_b64url_decode(settings_text, &mut payload) {
         return false;
     }
     val info: H2Info = h2_parse(h2_frame(H2_SETTINGS, 0, 0, payload));
@@ -2181,7 +2232,7 @@ pub fn h2_upgrade_request(c: & mut H2Conn, req: HttpRequest, body: Vec<i64>) -> 
     if !h2_settings_values(c, info) {
         return false;
     }
-    h2_append(& mut c.out, str_bytes("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: h2c\r\n\r\n"));
+    h2_append(&mut c.out, str_bytes("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: h2c\r\n\r\n"));
     h2_start(c);
     var s: H2Stream = h2_new_stream(c, 1);
     s.names = names;
@@ -2215,7 +2266,7 @@ pub fn h2_h1_response(resp: str, head: bool) -> str {
 // the 101 and our SETTINGS go out, true. Anything else is answered over
 // HTTP/1.1 (the handler's response, or 400/411 for a body we do not take)
 // and the connection is done: false.
-fn h2_h1_or_upgrade(c: & mut H2Conn) -> bool {
+fn h2_h1_or_upgrade(c: &mut H2Conn) -> bool {
     val end: i64 = h2_head_end(c.inbuf, 0);
     val req: HttpRequest = http_parse_head(str_from_bytes(h2_sub(c.inbuf, 0, end)));
     c.inpos = end;
@@ -2237,7 +2288,7 @@ fn h2_h1_or_upgrade(c: & mut H2Conn) -> bool {
         i = i + 1;
     }
     val cl: i64 = h2_content_length(lnames, lvals);
-    if cl == - 2 || cl > H2_MAX_BODY {
+    if cl == -2 || cl > H2_MAX_BODY {
         h2_h1_write(c, build_response(400, "text/plain", "Bad Request\n"));
         return false;
     }
@@ -2266,8 +2317,8 @@ fn h2_h1_or_upgrade(c: & mut H2Conn) -> bool {
 }
 
 // Queue and write HTTP/1.1 text.
-fn h2_h1_write(c: & mut H2Conn, text: str) {
-    h2_append(& mut c.out, str_bytes(text));
+fn h2_h1_write(c: &mut H2Conn, text: str) {
+    h2_append(&mut c.out, str_bytes(text));
     h2_flush(c);
 }
 
@@ -2275,7 +2326,7 @@ fn h2_h1_write(c: & mut H2Conn, text: str) {
 // the handler tasks waited for, the transport closed. While handlers run
 // on tasks, input is awaited a few ms at a time so their responses go out
 // as they finish (a frame already buffered is taken at once).
-fn h2_serve_frames(c: & mut H2Conn) {
+fn h2_serve_frames(c: &mut H2Conn) {
     while c.ok {
         if h2_settings_overdue(c, p_clock_now_ms()) {
             break;
@@ -2332,30 +2383,30 @@ fn h2_serve_frames(c: & mut H2Conn) {
 pub fn http2_serve_conn(fd: i64) -> i64 {
     var c: H2Conn = h2_conn(fd, false, "");
     c.tasks = h2_handler_tasks;
-    val opening: i64 = h2_read_opening(& mut c);
+    val opening: i64 = h2_read_opening(&mut c);
     if opening == 1 {
         c.inpos = 24;
-        h2_start(& mut c);
-        h2_flush(& mut c);
+        h2_start(&mut c);
+        h2_flush(&mut c);
     } else if opening == 2 {
-        if !h2_h1_or_upgrade(& mut c) {
-            h2_linger(& mut c, 1000);
-            h2_close_transport(& mut c);
+        if !h2_h1_or_upgrade(&mut c) {
+            h2_linger(&mut c, 1000);
+            h2_close_transport(&mut c);
             return 0;
         }
         // Upgraded: the client's preface follows the 101
-        if !h2_expect_preface(& mut c) {
-            h2_close_transport(& mut c);
+        if !h2_expect_preface(&mut c) {
+            h2_close_transport(&mut c);
             return 0;
         }
     } else {
         if opening == 3 {
-            h2_conn_error(& mut c, H2_PROTOCOL_ERROR, "no HTTP/2 connection preface");
+            h2_conn_error(&mut c, H2_PROTOCOL_ERROR, "no HTTP/2 connection preface");
         }
-        h2_close_transport(& mut c);
+        h2_close_transport(&mut c);
         return 0;
     }
-    h2_serve_frames(& mut c);
+    h2_serve_frames(&mut c);
     return 0;
 }
 
@@ -2366,13 +2417,13 @@ pub fn http2_serve_session(fd: i64, tls: i64) -> i64 {
     var c: H2Conn = h2_conn(fd, false, "");
     c.tls = tls;
     c.tasks = h2_handler_tasks;
-    if !h2_expect_preface(& mut c) {
-        h2_close_transport(& mut c);
+    if !h2_expect_preface(&mut c) {
+        h2_close_transport(&mut c);
         return 0;
     }
-    h2_start(& mut c);
-    h2_flush(& mut c);
-    h2_serve_frames(& mut c);
+    h2_start(&mut c);
+    h2_flush(&mut c);
+    h2_serve_frames(&mut c);
     return 0;
 }
 
@@ -2461,14 +2512,14 @@ pub fn http2_connect(host: str, port: i64) -> H2Conn {
         c.why = "cannot connect";
         return c;
     }
-    h2_start(& mut c);
-    h2_flush(& mut c);
+    h2_start(&mut c);
+    h2_flush(&mut c);
     return c;
 }
 
 /// A connection that failed before it started: `ok` false, `why` says why.
 pub fn http2_failed(why: str) -> H2Conn {
-    var c: H2Conn = h2_conn(- 1, true, "");
+    var c: H2Conn = h2_conn(-1, true, "");
     c.ok = false;
     c.why = why;
     return c;
@@ -2481,8 +2532,8 @@ pub fn http2_failed(why: str) -> H2Conn {
 pub fn http2_connect_session(fd: i64, tls: i64, host: str, port: i64) -> H2Conn {
     var c: H2Conn = h2_conn(fd, true, host + ":" + int_to_str(port));
     c.tls = tls;
-    h2_start(& mut c);
-    h2_flush(& mut c);
+    h2_start(&mut c);
+    h2_flush(&mut c);
     return c;
 }
 
@@ -2490,9 +2541,9 @@ pub fn http2_connect_session(fd: i64, tls: i64, host: str, port: i64) -> H2Conn 
 /// cannot take one, or the request's fields are larger than the peer's
 /// SETTINGS_MAX_HEADER_LIST_SIZE). `names`/`vals` are extra fields
 /// (lowercase names).
-pub fn http2_request(c: & mut H2Conn, method: str, path: str, names: Vec<str>, vals: Vec<str>, body: str) -> i64 {
+pub fn http2_request(c: &mut H2Conn, method: str, path: str, names: Vec<str>, vals: Vec<str>, body: str) -> i64 {
     if !c.ok || c.goaway {
-        return - 1;
+        return -1;
     }
     var hn: Vec<str> = Vec::new();
     var hv: Vec<str> = Vec::new();
@@ -2522,7 +2573,7 @@ pub fn http2_request(c: & mut H2Conn, method: str, path: str, names: Vec<str>, v
     // The peer's MAX_HEADER_LIST_SIZE (6.5.2): a larger request would only
     // be refused
     if c.peer_max_header_list >= 0 && h2_header_list_size(hn, hv) > c.peer_max_header_list {
-        return - 1;
+        return -1;
     }
     val id: i64 = c.next_id;
     c.next_id = c.next_id + 2;
@@ -2530,7 +2581,7 @@ pub fn http2_request(c: & mut H2Conn, method: str, path: str, names: Vec<str>, v
     h2_send_headers(c, id, hn, hv, bytes.len() == 0);
     if bytes.len() == 0 {
         var s: H2Stream = c.streams.get(c.streams.len() - 1);
-        h2_close_local(& mut s);
+        h2_close_local(&mut s);
         c.streams.set(c.streams.len() - 1, s);
     } else {
         h2_queue_body(c, id, bytes);
@@ -2540,7 +2591,7 @@ pub fn http2_request(c: & mut H2Conn, method: str, path: str, names: Vec<str>, v
     return id;
 }
 
-fn h2_stream_done(c: & H2Conn, id: i64) -> bool {
+fn h2_stream_done(c: &H2Conn, id: i64) -> bool {
     val k: i64 = h2_stream_index(c, id);
     if k < 0 {
         return true;
@@ -2551,7 +2602,7 @@ fn h2_stream_done(c: & H2Conn, id: i64) -> bool {
 
 /// Read frames until stream `id` has its whole response, and return it
 /// (the stream is then forgotten).
-pub fn http2_wait(c: & mut H2Conn, id: i64) -> Http2Response {
+pub fn http2_wait(c: &mut H2Conn, id: i64) -> Http2Response {
     while c.ok && !h2_stream_done(c, id) {
         if h2_settings_overdue(c, p_clock_now_ms()) {
             break;
@@ -2601,7 +2652,7 @@ pub fn http2_wait(c: & mut H2Conn, id: i64) -> Http2Response {
 }
 
 /// Say goodbye (GOAWAY) and close the socket (and the TLS session).
-pub fn http2_close(c: & mut H2Conn) {
+pub fn http2_close(c: &mut H2Conn) {
     if c.fd >= 0 {
         if c.ok {
             h2_send(c, h2_goaway_frame(0, H2_NO_ERROR, ""));
@@ -2644,16 +2695,16 @@ pub fn http2_get_upgrade(host: str, port: i64, path: str) -> Http2Response {
     }
     var c: H2Conn = h2_conn(fd, true, host + ":" + int_to_str(port));
     val request: str = "GET " + path + " HTTP/1.1\r\nHost: " + c.authority + "\r\nConnection: Upgrade, HTTP2-Settings\r\nUpgrade: h2c\r\nHTTP2-Settings: " + h2_settings_header(true) + "\r\n\r\n";
-    h2_append(& mut c.out, str_bytes(request));
-    if !h2_flush(& mut c) {
-        h2_close_transport(& mut c);
+    h2_append(&mut c.out, str_bytes(request));
+    if !h2_flush(&mut c) {
+        h2_close_transport(&mut c);
         return h2_no_response(0, "cannot send the request");
     }
     // The HTTP/1.1 response head
     var end: i64 = h2_head_end(c.inbuf, 0);
     while end < 0 {
-        if c.inbuf.len() > H2_MAX_H1_HEAD || h2_fill(& mut c, H2_CLIENT_MS) <= 0 {
-            h2_close_transport(& mut c);
+        if c.inbuf.len() > H2_MAX_H1_HEAD || h2_fill(&mut c, H2_CLIENT_MS) <= 0 {
+            h2_close_transport(&mut c);
             return h2_no_response(0, "no answer to the Upgrade");
         }
         end = h2_head_end(c.inbuf, 0);
@@ -2673,14 +2724,14 @@ pub fn http2_get_upgrade(host: str, port: i64, path: str) -> Http2Response {
         }
         val cl: i64 = h2_content_length(lnames, lvals);
         if cl >= 0 {
-            if cl > H2_MAX_BODY || !h2_need(& mut c, cl, H2_CLIENT_MS) {
-                h2_close_transport(& mut c);
+            if cl > H2_MAX_BODY || !h2_need(&mut c, cl, H2_CLIENT_MS) {
+                h2_close_transport(&mut c);
                 return h2_no_response(0, "HTTP/1.1 body cut short");
             }
         } else {
             var more: bool = true;
             while more && c.inbuf.len() - c.inpos <= H2_MAX_BODY {
-                more = h2_fill(& mut c, H2_CLIENT_MS) > 0;
+                more = h2_fill(&mut c, H2_CLIENT_MS) > 0;
             }
         }
         var stop: i64 = c.inbuf.len();
@@ -2688,22 +2739,22 @@ pub fn http2_get_upgrade(host: str, port: i64, path: str) -> Http2Response {
             stop = c.inpos + cl;
         }
         val r: Http2Response = h2_h1_as_response(head, h2_sub(c.inbuf, c.inpos, stop));
-        h2_close_transport(& mut c);
+        h2_close_transport(&mut c);
         return r;
     }
     if !h2_has_token(http_header(first, "upgrade"), "h2c") {
-        h2_close_transport(& mut c);
+        h2_close_transport(&mut c);
         return h2_no_response(0, "101 without Upgrade: h2c");
     }
     // Switched: our request is stream 1, its side done (half-closed local)
-    var s: H2Stream = h2_new_stream(& c, 1);
+    var s: H2Stream = h2_new_stream(&c, 1);
     s.state = H2_HALF_CLOSED_LOCAL;
     c.streams.push(s);
     c.next_id = 3;
-    h2_start(& mut c);
-    h2_flush(& mut c);
-    val r: Http2Response = http2_wait(& mut c, 1);
-    http2_close(& mut c);
+    h2_start(&mut c);
+    h2_flush(&mut c);
+    val r: Http2Response = http2_wait(&mut c, 1);
+    http2_close(&mut c);
     return r;
 }
 
@@ -2713,9 +2764,9 @@ pub fn http2_get(host: str, port: i64, path: str) -> Http2Response {
     if !c.ok {
         return h2_no_response(0, c.why);
     }
-    val id: i64 = http2_request(& mut c, "GET", path, Vec::new(), Vec::new(), "");
-    val r: Http2Response = http2_wait(& mut c, id);
-    http2_close(& mut c);
+    val id: i64 = http2_request(&mut c, "GET", path, Vec::new(), Vec::new(), "");
+    val r: Http2Response = http2_wait(&mut c, id);
+    http2_close(&mut c);
     return r;
 }
 
@@ -2729,9 +2780,9 @@ pub fn http2_post(host: str, port: i64, path: str, content_type: str, body: str)
     var vals: Vec<str> = Vec::new();
     names.push("content-type");
     vals.push(content_type);
-    val id: i64 = http2_request(& mut c, "POST", path, names, vals, body);
-    val r: Http2Response = http2_wait(& mut c, id);
-    http2_close(& mut c);
+    val id: i64 = http2_request(&mut c, "POST", path, names, vals, body);
+    val r: Http2Response = http2_wait(&mut c, id);
+    http2_close(&mut c);
     return r;
 }
 
@@ -2743,7 +2794,7 @@ pub fn http2_get_many(host: str, port: i64, paths: Vec<str>) -> Vec<Http2Respons
     var ids: Vec<i64> = Vec::new();
     var i: i64 = 0;
     while i < paths.len() {
-        ids.push(http2_request(& mut c, "GET", paths.get(i), Vec::new(), Vec::new(), ""));
+        ids.push(http2_request(&mut c, "GET", paths.get(i), Vec::new(), Vec::new(), ""));
         i = i + 1;
     }
     i = 0;
@@ -2751,10 +2802,10 @@ pub fn http2_get_many(host: str, port: i64, paths: Vec<str>) -> Vec<Http2Respons
         if ids.get(i) < 0 {
             out.push(h2_no_response(0, "cannot connect"));
         } else {
-            out.push(http2_wait(& mut c, ids.get(i)));
+            out.push(http2_wait(&mut c, ids.get(i)));
         }
         i = i + 1;
     }
-    http2_close(& mut c);
+    http2_close(&mut c);
     return out;
 }

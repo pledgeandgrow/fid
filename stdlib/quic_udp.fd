@@ -33,7 +33,12 @@
 // to a new socket.
 
 module quic_udp;
- use vec; use crypto; use quic; use quic_conn; use quic_frame; use udp;
+use vec;
+use crypto;
+use quic;
+use quic_conn;
+use quic_frame;
+use udp;
 
 /// The largest datagram we read (QUIC's own limit is what we advertise,
 /// 1472; a peer may send up to that).
@@ -78,7 +83,7 @@ fn qud_same_cid(a: Vec<i64>, b: Vec<i64>) -> bool {
 }
 
 /// Send every datagram a connection has ready.
-fn qud_flush(sock: i64, family: i64, conn: & mut QuicConn, to: & UdpAddr, now: i64) {
+fn qud_flush(sock: i64, family: i64, conn: &mut QuicConn, to: &UdpAddr, now: i64) {
     var n: i64 = 0;
     while n < 256 {
         val d: Vec<i64> = quic_conn_send(conn, now);
@@ -93,7 +98,7 @@ fn qud_flush(sock: i64, family: i64, conn: & mut QuicConn, to: & UdpAddr, now: i
 /// How long to wait for a datagram: at most `wait_ms`, less when a timer
 /// of the connection falls earlier; at least 1 ms (a socket timeout of 0
 /// would wait forever).
-fn qud_wait(conn: & QuicConn, wait_ms: i64, now: i64) -> i64 {
+fn qud_wait(conn: &QuicConn, wait_ms: i64, now: i64) -> i64 {
     var w: i64 = wait_ms;
     val t: i64 = quic_conn_timeout(conn);
     if t >= 0 && t - now < w {
@@ -112,79 +117,81 @@ pub fn quic_udp_connect(ip: str, port: i64, cfg: QuicConfig) -> QuicUdpClient {
     val server: UdpAddr = udp_addr(ip, port);
     val sock: i64 = udp_open(server.family);
     val now: i64 = qud_now();
-    var cl: QuicUdpClient = QuicUdpClient { sock: sock, family: server.family, server: server, conn: quic_connect(cfg, now) };
-    qud_flush(cl.sock, cl.family, & mut cl.conn, & cl.server, now);
+    var cl: QuicUdpClient = QuicUdpClient {
+        sock: sock, family: server.family, server: server, conn: quic_connect(cfg, now)
+    };
+    qud_flush(cl.sock, cl.family, &mut cl.conn, &cl.server, now);
     return cl;
 }
 
 /// Send what is ready, wait up to `wait_ms` for datagrams from the server
 /// and process them, run the timers, send again.
-pub fn quic_udp_client_poll(cl: & mut QuicUdpClient, wait_ms: i64) {
+pub fn quic_udp_client_poll(cl: &mut QuicUdpClient, wait_ms: i64) {
     var now: i64 = qud_now();
-    qud_flush(cl.sock, cl.family, & mut cl.conn, & cl.server, now);
-    if quic_conn_closed(& cl.conn) {
+    qud_flush(cl.sock, cl.family, &mut cl.conn, &cl.server, now);
+    if quic_conn_closed(&cl.conn) {
         return;
     }
-    var wait: i64 = qud_wait(& cl.conn, wait_ms, now);
+    var wait: i64 = qud_wait(&cl.conn, wait_ms, now);
     var got: i64 = 0;
     while got < 64 {
         var from: UdpAddr = udp_addr_none();
-        val d: Vec<i64> = udp_recv(cl.sock, QUD_RECV_MAX, wait, & mut from);
+        val d: Vec<i64> = udp_recv(cl.sock, QUD_RECV_MAX, wait, &mut from);
         if d.len() == 0 {
             got = 64;
         } else {
             now = qud_now();
-            if udp_addr_same(& from, & cl.server) {
-                quic_conn_recv(& mut cl.conn, d, now);
+            if udp_addr_same(&from, &cl.server) {
+                quic_conn_recv(&mut cl.conn, d, now);
             }
             wait = 0;
             got = got + 1;
         }
     }
     now = qud_now();
-    val t: i64 = quic_conn_timeout(& cl.conn);
+    val t: i64 = quic_conn_timeout(&cl.conn);
     if t >= 0 && t <= now {
-        quic_conn_on_timeout(& mut cl.conn, now);
+        quic_conn_on_timeout(&mut cl.conn, now);
     }
-    qud_flush(cl.sock, cl.family, & mut cl.conn, & cl.server, now);
+    qud_flush(cl.sock, cl.family, &mut cl.conn, &cl.server, now);
 }
 
 /// Move the client to a new socket (a new local port: what a phone moving
 /// between networks looks like to the server) and migrate the connection
 /// (quic_conn_migrate: a fresh connection ID, path validation). False, and
 /// nothing changed, when the connection may not migrate.
-pub fn quic_udp_client_migrate(cl: & mut QuicUdpClient) -> bool {
+pub fn quic_udp_client_migrate(cl: &mut QuicUdpClient) -> bool {
     val sock: i64 = udp_open(cl.family);
     if sock < 0 {
         return false;
     }
-    if !quic_conn_migrate(& mut cl.conn, qud_now()) {
+    if !quic_conn_migrate(&mut cl.conn, qud_now()) {
         udp_close(sock);
         return false;
     }
     udp_close(cl.sock);
     cl.sock = sock;
-    qud_flush(cl.sock, cl.family, & mut cl.conn, & cl.server, qud_now());
+    qud_flush(cl.sock, cl.family, &mut cl.conn, &cl.server, qud_now());
     return true;
 }
 
 /// Close the client's socket (close the connection first with
 /// quic_conn_close and poll until it is closed, or the peer will wait for
 /// its idle timeout).
-pub fn quic_udp_client_free(cl: & mut QuicUdpClient) {
+pub fn quic_udp_client_free(cl: &mut QuicUdpClient) {
     if cl.sock >= 0 {
         udp_close(cl.sock);
-        cl.sock = - 1;
+        cl.sock = -1;
     }
 }
 
 /// A server socket bound to `port` on every address: dual-stack IPv6 (::),
 /// or IPv4 (0.0.0.0) where the system has no IPv6.
 pub fn quic_udp_listen(port: i64, cfg: QuicConfig) -> QuicUdpServer {
-    var sock: i64 = udp_listen(& udp_addr_any(UDP_V6, port));
+    var sock: i64 = udp_listen(&udp_addr_any(UDP_V6, port));
     var family: i64 = UDP_V6;
     if sock < 0 {
-        sock = udp_listen(& udp_addr_any(UDP_V4, port));
+        sock = udp_listen(&udp_addr_any(UDP_V4, port));
         family = UDP_V4;
     }
     return qud_server(sock, family, cfg);
@@ -193,7 +200,7 @@ pub fn quic_udp_listen(port: i64, cfg: QuicConfig) -> QuicUdpServer {
 /// A server socket bound to one local address ("127.0.0.1", "::1", ...).
 pub fn quic_udp_listen_on(ip: str, port: i64, cfg: QuicConfig) -> QuicUdpServer {
     val a: UdpAddr = udp_addr(ip, port);
-    return qud_server(udp_listen(& a), a.family, cfg);
+    return qud_server(udp_listen(&a), a.family, cfg);
 }
 
 fn qud_server(sock: i64, family: i64, cfg: QuicConfig) -> QuicUdpServer {
@@ -206,18 +213,20 @@ fn qud_server(sock: i64, family: i64, cfg: QuicConfig) -> QuicUdpServer {
     if c.retry && c.token_key.len() != 16 {
         c.token_key = crypto_random_bytes(16);
     }
-    return QuicUdpServer { sock: sock, family: family, cfg: c, conns: Vec::new(), addrs: Vec::new(), seen: Vec::new() };
+    return QuicUdpServer {
+        sock: sock, family: family, cfg: c, conns: Vec::new(), addrs: Vec::new(), seen: Vec::new()
+    };
 }
 
 /// The port the server's socket is bound to (-1 when unknown).
-pub fn quic_udp_server_port(sv: & QuicUdpServer) -> i64 {
+pub fn quic_udp_server_port(sv: &QuicUdpServer) -> i64 {
     return udp_local_port(sv.sock);
 }
 
 /// The connection a datagram is for: its index, -1 for none. Long headers
 /// by the IDs a client starts with, short ones by every ID a connection
 /// issued.
-fn qud_route(sv: & QuicUdpServer, d: Vec<i64>) -> i64 {
+fn qud_route(sv: &QuicUdpServer, d: Vec<i64>) -> i64 {
     var dcid: Vec<i64> = quic_datagram_dcid(d);
     val long: bool = dcid.len() > 0;
     if !long {
@@ -226,21 +235,20 @@ fn qud_route(sv: & QuicUdpServer, d: Vec<i64>) -> i64 {
     var i: i64 = 0;
     while i < sv.conns.len() {
         val c: QuicConn = sv.conns.get(i);
-        if qud_same_cid(dcid, c.scid) || (long && qud_same_cid(dcid, c.odcid))
-            || (!long && quic_conn_owns_cid(& c, dcid)) {
+        if qud_same_cid(dcid, c.scid) || (long && qud_same_cid(dcid, c.odcid)) || (!long && quic_conn_owns_cid(&c, dcid)) {
             return i;
         }
         i = i + 1;
     }
-    return - 1;
+    return -1;
 }
 
 /// Remember an address a datagram came from (at most 256).
-fn qud_seen(sv: & mut QuicUdpServer, a: & UdpAddr) {
+fn qud_seen(sv: &mut QuicUdpServer, a: &UdpAddr) {
     var i: i64 = 0;
     while i < sv.seen.len() {
         val s: UdpAddr = sv.seen.get(i);
-        if udp_addr_same(& s, a) {
+        if udp_addr_same(&s, a) {
             return;
         }
         i = i + 1;
@@ -248,21 +256,23 @@ fn qud_seen(sv: & mut QuicUdpServer, a: & UdpAddr) {
     if sv.seen.len() >= 256 {
         sv.seen.remove(0);
     }
-    sv.seen.push(UdpAddr { family: a.family, ip: a.ip, port: a.port, scope: a.scope });
+    sv.seen.push(UdpAddr {
+        family: a.family, ip: a.ip, port: a.port, scope: a.scope
+    });
 }
 
 /// The address a connection now sends to (its peer_addr), among those seen.
-fn qud_addr_of(sv: & QuicUdpServer, k: i64) -> UdpAddr {
+fn qud_addr_of(sv: &QuicUdpServer, k: i64) -> UdpAddr {
     val conn: QuicConn = sv.conns.get(k);
-    val want: Vec<i64> = quic_conn_peer_addr(& conn);
+    val want: Vec<i64> = quic_conn_peer_addr(&conn);
     val cur: UdpAddr = sv.addrs.get(k);
-    if want.len() == 0 || qud_same_cid(udp_addr_key(& cur), want) {
+    if want.len() == 0 || qud_same_cid(udp_addr_key(&cur), want) {
         return cur;
     }
     var i: i64 = sv.seen.len() - 1;
     while i >= 0 {
         val a: UdpAddr = sv.seen.get(i);
-        if qud_same_cid(udp_addr_key(& a), want) {
+        if qud_same_cid(udp_addr_key(&a), want) {
             return a;
         }
         i = i - 1;
@@ -273,7 +283,7 @@ fn qud_addr_of(sv: & QuicUdpServer, k: i64) -> UdpAddr {
 /// What the server answers a datagram no connection takes: Version
 /// Negotiation for another version, Retry, a new connection, or a
 /// Stateless Reset.
-fn qud_unrouted(sv: & mut QuicUdpServer, d: Vec<i64>, from: & UdpAddr, now: i64) {
+fn qud_unrouted(sv: &mut QuicUdpServer, d: Vec<i64>, from: &UdpAddr, now: i64) {
     val v: i64 = quic_packet_version(d);
     if v > 0 && !quic_version_supported(v) {
         if d.len() >= QUIC_DATAGRAM {
@@ -296,16 +306,18 @@ fn qud_unrouted(sv: & mut QuicUdpServer, d: Vec<i64>, from: & UdpAddr, now: i64)
     }
     val key: Vec<i64> = udp_addr_key(from);
     if sv.cfg.retry && quic_initial_token(d).len() == 0 {
-        val retry: Vec<i64> = quic_retry_for(& sv.cfg, d, key, now);
+        val retry: Vec<i64> = quic_retry_for(&sv.cfg, d, key, now);
         if retry.len() > 0 {
             udp_send_on(sv.sock, sv.family, retry, from);
         }
         return;
     }
     val c: QuicConn = quic_accept_from(sv.cfg, d, key, now);
-    if !quic_conn_closed(& c) {
+    if !quic_conn_closed(&c) {
         sv.conns.push(c);
-        sv.addrs.push(UdpAddr { family: from.family, ip: from.ip, port: from.port, scope: from.scope });
+        sv.addrs.push(UdpAddr {
+            family: from.family, ip: from.ip, port: from.port, scope: from.scope
+        });
     }
 }
 
@@ -313,15 +325,15 @@ fn qud_unrouted(sv: & mut QuicUdpServer, d: Vec<i64>, from: & UdpAddr, now: i64)
 /// datagrams and give each to its connection (a new client's Initial makes
 /// a connection), run the timers, send again, and forget connections that
 /// are closed.
-pub fn quic_udp_server_poll(sv: & mut QuicUdpServer, wait_ms: i64) {
+pub fn quic_udp_server_poll(sv: &mut QuicUdpServer, wait_ms: i64) {
     var now: i64 = qud_now();
     var wait: i64 = wait_ms;
     var i: i64 = 0;
     while i < sv.conns.len() {
         var c: QuicConn = sv.conns.get(i);
         val a: UdpAddr = sv.addrs.get(i);
-        qud_flush(sv.sock, sv.family, & mut c, & a, now);
-        wait = qud_wait(& c, wait, now);
+        qud_flush(sv.sock, sv.family, &mut c, &a, now);
+        wait = qud_wait(&c, wait, now);
         sv.conns.set(i, c);
         i = i + 1;
     }
@@ -331,22 +343,22 @@ pub fn quic_udp_server_poll(sv: & mut QuicUdpServer, wait_ms: i64) {
     var got: i64 = 0;
     while got < 64 {
         var from: UdpAddr = udp_addr_none();
-        val d: Vec<i64> = udp_recv(sv.sock, QUD_RECV_MAX, wait, & mut from);
+        val d: Vec<i64> = udp_recv(sv.sock, QUD_RECV_MAX, wait, &mut from);
         if d.len() == 0 {
             got = 64;
         } else {
             now = qud_now();
-            qud_seen(sv, & from);
+            qud_seen(sv, &from);
             val k: i64 = qud_route(sv, d);
             if k >= 0 {
                 var c: QuicConn = sv.conns.get(k);
-                quic_conn_recv_from(& mut c, d, udp_addr_key(& from), now);
+                quic_conn_recv_from(&mut c, d, udp_addr_key(&from), now);
                 sv.conns.set(k, c);
                 // the connection decides where its datagrams go (it
                 // follows a client that moved once the move is real)
                 sv.addrs.set(k, qud_addr_of(sv, k));
             } else {
-                qud_unrouted(sv, d, & from, now);
+                qud_unrouted(sv, d, &from, now);
             }
             wait = 0;
             got = got + 1;
@@ -356,16 +368,16 @@ pub fn quic_udp_server_poll(sv: & mut QuicUdpServer, wait_ms: i64) {
     i = 0;
     while i < sv.conns.len() {
         var c: QuicConn = sv.conns.get(i);
-        val t: i64 = quic_conn_timeout(& c);
+        val t: i64 = quic_conn_timeout(&c);
         if t >= 0 && t <= now {
-            quic_conn_on_timeout(& mut c, now);
+            quic_conn_on_timeout(&mut c, now);
         }
         sv.conns.set(i, c);
         val a: UdpAddr = qud_addr_of(sv, i);
         sv.addrs.set(i, a);
         c = sv.conns.get(i);
-        qud_flush(sv.sock, sv.family, & mut c, & a, now);
-        if quic_conn_closed(& c) {
+        qud_flush(sv.sock, sv.family, &mut c, &a, now);
+        if quic_conn_closed(&c) {
             sv.conns.remove(i);
             sv.addrs.remove(i);
         } else {
@@ -376,9 +388,9 @@ pub fn quic_udp_server_poll(sv: & mut QuicUdpServer, wait_ms: i64) {
 }
 
 /// Close the server socket.
-pub fn quic_udp_server_free(sv: & mut QuicUdpServer) {
+pub fn quic_udp_server_free(sv: &mut QuicUdpServer) {
     if sv.sock >= 0 {
         udp_close(sv.sock);
-        sv.sock = - 1;
+        sv.sock = -1;
     }
 }

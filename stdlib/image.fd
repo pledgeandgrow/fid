@@ -19,7 +19,8 @@
 //   var tex2 = sdl_load_texture(ren, "background.png");
 
 module image;
- use compress; use file;
+use compress;
+use file;
 // ─── Image Data Structure ────────────────────────────────────────────────
 
 pub struct Image {
@@ -71,7 +72,7 @@ pub fn image_create(width: i64, height: i64, channels: i64) -> Image {
 }
 
 /// Get a pixel at (x, y). Returns RGBA as a packed i64: 0xRRGGBBAA.
-pub fn image_get_pixel(img: & Image, x: i64, y: i64) -> i64 {
+pub fn image_get_pixel(img: &Image, x: i64, y: i64) -> i64 {
     if x < 0 || x >= img.width || y < 0 || y >= img.height {
         return 0;
     }
@@ -87,7 +88,7 @@ pub fn image_get_pixel(img: & Image, x: i64, y: i64) -> i64 {
 }
 
 /// Set a pixel at (x, y) from RGBA components.
-pub fn image_set_pixel(img: & mut Image, x: i64, y: i64, r: i64, g: i64, b: i64, a: i64) -> void {
+pub fn image_set_pixel(img: &mut Image, x: i64, y: i64, r: i64, g: i64, b: i64, a: i64) -> void {
     if x < 0 || x >= img.width || y < 0 || y >= img.height {
         return;
     }
@@ -101,7 +102,7 @@ pub fn image_set_pixel(img: & mut Image, x: i64, y: i64, r: i64, g: i64, b: i64,
 }
 
 /// Fill the entire image with a solid color.
-pub fn image_fill(img: & mut Image, r: i64, g: i64, b: i64, a: i64) -> void {
+pub fn image_fill(img: &mut Image, r: i64, g: i64, b: i64, a: i64) -> void {
     var y = 0;
     while y < img.height {
         var x = 0;
@@ -114,7 +115,7 @@ pub fn image_fill(img: & mut Image, r: i64, g: i64, b: i64, a: i64) -> void {
 }
 
 /// Free image data (the Vec will be dropped automatically, but this clears it).
-pub fn image_free(img: & mut Image) -> void {
+pub fn image_free(img: &mut Image) -> void {
     img.width = 0;
     img.height = 0;
     img.channels = 0;
@@ -123,19 +124,19 @@ pub fn image_free(img: & mut Image) -> void {
 
 // ─── PNG / BMP decoding (pure Fides) ─────────────────────────────────────
 
-fn img_u32be(d: & Vec<i64>, at: i64) -> i64 {
+fn img_u32be(d: &Vec<i64>, at: i64) -> i64 {
     return ((d.get(at) & 255) << 24) | ((d.get(at + 1) & 255) << 16) | ((d.get(at + 2) & 255) << 8) | (d.get(at + 3) & 255);
 }
 
-fn img_u16be(d: & Vec<i64>, at: i64) -> i64 {
+fn img_u16be(d: &Vec<i64>, at: i64) -> i64 {
     return ((d.get(at) & 255) << 8) | (d.get(at + 1) & 255);
 }
 
-fn img_u16le(d: & Vec<i64>, at: i64) -> i64 {
+fn img_u16le(d: &Vec<i64>, at: i64) -> i64 {
     return ((d.get(at + 1) & 255) << 8) | (d.get(at) & 255);
 }
 
-fn img_u32le(d: & Vec<i64>, at: i64) -> i64 {
+fn img_u32le(d: &Vec<i64>, at: i64) -> i64 {
     return ((d.get(at + 3) & 255) << 24) | ((d.get(at + 2) & 255) << 16) | ((d.get(at + 1) & 255) << 8) | (d.get(at) & 255);
 }
 
@@ -145,11 +146,27 @@ fn img_paeth(a: i64, b: i64, c: i64) -> i64 {
     val pa: i64 = p - a;
     val pb: i64 = p - b;
     val pc: i64 = p - c;
-    val aa: i64 = if pa < 0 { 0 - pa } else { pa };
-    val ab: i64 = if pb < 0 { 0 - pb } else { pb };
-    val ac: i64 = if pc < 0 { 0 - pc } else { pc };
-    if aa <= ab && aa <= ac { return a; }
-    if ab <= ac { return b; }
+    val aa: i64 = if pa < 0 {
+        0 - pa
+    } else {
+        pa
+    };
+    val ab: i64 = if pb < 0 {
+        0 - pb
+    } else {
+        pb
+    };
+    val ac: i64 = if pc < 0 {
+        0 - pc
+    } else {
+        pc
+    };
+    if aa <= ab && aa <= ac {
+        return a;
+    }
+    if ab <= ac {
+        return b;
+    }
     return c;
 }
 
@@ -171,39 +188,70 @@ pub fn image_png_decode(d: Vec<i64>) -> Image {
     var pos: i64 = 8;
     var done: bool = false;
     while !done && pos + 8 <= d.len() {
-        val len: i64 = img_u32be(& d, pos);
-        if len < 0 || pos + 12 + len > d.len() { return bad; }
-        val ty: i64 = img_u32be(& d, pos + 4);
+        val len: i64 = img_u32be(&d, pos);
+        if len < 0 || pos + 12 + len > d.len() {
+            return bad;
+        }
+        val ty: i64 = img_u32be(&d, pos + 4);
         if ty == 0x49484452 {
             // IHDR
-            if len != 13 { return bad; }
-            w = img_u32be(& d, pos + 8);
-            h = img_u32be(& d, pos + 12);
+            if len != 13 {
+                return bad;
+            }
+            w = img_u32be(&d, pos + 8);
+            h = img_u32be(&d, pos + 12);
             bd = d.get(pos + 16) & 255;
             ct = d.get(pos + 17) & 255;
             interlace = d.get(pos + 20) & 255;
         } else if ty == 0x504C5445 {
             var i: i64 = 0;
-            while i < len { plte.push(d.get(pos + 8 + i) & 255); i = i + 1; }
+            while i < len {
+                plte.push(d.get(pos + 8 + i) & 255);
+                i = i + 1;
+            }
         } else if ty == 0x74524E53 {
             var i2: i64 = 0;
-            while i2 < len { trns.push(d.get(pos + 8 + i2) & 255); i2 = i2 + 1; }
+            while i2 < len {
+                trns.push(d.get(pos + 8 + i2) & 255);
+                i2 = i2 + 1;
+            }
         } else if ty == 0x49444154 {
             var i3: i64 = 0;
-            while i3 < len { idat.push(d.get(pos + 8 + i3) & 255); i3 = i3 + 1; }
+            while i3 < len {
+                idat.push(d.get(pos + 8 + i3) & 255);
+                i3 = i3 + 1;
+            }
         } else if ty == 0x49454E44 {
             done = true;
         }
         pos = pos + 12 + len;
     }
-    if w <= 0 || h <= 0 || bd != 8 || interlace != 0 || idat.len() == 0 { return bad; }
+    if w <= 0 || h <= 0 || bd != 8 || interlace != 0 || idat.len() == 0 {
+        return bad;
+    }
     var bpp: i64 = 0;
-    if ct == 0 { bpp = 1; } else if ct == 2 { bpp = 3; } else if ct == 3 { bpp = 1; } else if ct == 4 { bpp = 2; } else if ct == 6 { bpp = 4; }
-    if bpp == 0 { return bad; }
-    if ct == 3 && plte.len() == 0 { return bad; }
+    if ct == 0 {
+        bpp = 1;
+    } else if ct == 2 {
+        bpp = 3;
+    } else if ct == 3 {
+        bpp = 1;
+    } else if ct == 4 {
+        bpp = 2;
+    } else if ct == 6 {
+        bpp = 4;
+    }
+    if bpp == 0 {
+        return bad;
+    }
+    if ct == 3 && plte.len() == 0 {
+        return bad;
+    }
     val stride: i64 = w * bpp;
     val raw: Vec<i64> = zlib_decompress(idat);
-    if raw.len() < h * (stride + 1) { return bad; }
+    if raw.len() < h * (stride + 1) {
+        return bad;
+    }
     // Unfilter every scanline into `px` (stride bytes per row).
     var px: Vec<i64> = Vec::new();
     var y: i64 = 0;
@@ -213,13 +261,29 @@ pub fn image_png_decode(d: Vec<i64>) -> Image {
         while x < stride {
             val cur: i64 = raw.get(y * (stride + 1) + 1 + x) & 255;
             var left: i64 = 0;
-            if x >= bpp { left = px.get(y * stride + x - bpp) & 255; }
+            if x >= bpp {
+                left = px.get(y * stride + x - bpp) & 255;
+            }
             var up: i64 = 0;
-            if y > 0 { up = px.get((y - 1) * stride + x) & 255; }
+            if y > 0 {
+                up = px.get((y - 1) * stride + x) & 255;
+            }
             var ul: i64 = 0;
-            if y > 0 && x >= bpp { ul = px.get((y - 1) * stride + x - bpp) & 255; }
+            if y > 0 && x >= bpp {
+                ul = px.get((y - 1) * stride + x - bpp) & 255;
+            }
             var v: i64 = cur;
-            if ft == 1 { v = cur + left; } else if ft == 2 { v = cur + up; } else if ft == 3 { v = cur + (left + up) / 2; } else if ft == 4 { v = cur + img_paeth(left, up, ul); } else if ft != 0 { return bad; }
+            if ft == 1 {
+                v = cur + left;
+            } else if ft == 2 {
+                v = cur + up;
+            } else if ft == 3 {
+                v = cur + (left + up) / 2;
+            } else if ft == 4 {
+                v = cur + img_paeth(left, up, ul);
+            } else if ft != 0 {
+                return bad;
+            }
             px.push(v & 255);
             x = x + 1;
         }
@@ -229,11 +293,13 @@ pub fn image_png_decode(d: Vec<i64>) -> Image {
     var img: Image = image_create(w, h, 4);
     var trns_gray: i64 = -1;
     var trns_rgb: Vec<i64> = Vec::new();
-    if ct == 0 && trns.len() >= 2 { trns_gray = img_u16be(& trns, 0); }
+    if ct == 0 && trns.len() >= 2 {
+        trns_gray = img_u16be(&trns, 0);
+    }
     if ct == 2 && trns.len() >= 6 {
-        trns_rgb.push(img_u16be(& trns, 0));
-        trns_rgb.push(img_u16be(& trns, 2));
-        trns_rgb.push(img_u16be(& trns, 4));
+        trns_rgb.push(img_u16be(&trns, 0));
+        trns_rgb.push(img_u16be(&trns, 2));
+        trns_rgb.push(img_u16be(&trns, 4));
     }
     y = 0;
     while y < h {
@@ -246,23 +312,43 @@ pub fn image_png_decode(d: Vec<i64>) -> Image {
             val at: i64 = y * stride + x2 * bpp;
             if ct == 0 {
                 val gv: i64 = px.get(at) & 255;
-                r = gv; g = gv; b = gv;
-                if trns_gray >= 0 && gv == trns_gray { a = 0; }
+                r = gv;
+                g = gv;
+                b = gv;
+                if trns_gray >= 0 && gv == trns_gray {
+                    a = 0;
+                }
             } else if ct == 2 {
-                r = px.get(at) & 255; g = px.get(at + 1) & 255; b = px.get(at + 2) & 255;
-                if trns_rgb.len() == 3 && r == trns_rgb.get(0) && g == trns_rgb.get(1) && b == trns_rgb.get(2) { a = 0; }
+                r = px.get(at) & 255;
+                g = px.get(at + 1) & 255;
+                b = px.get(at + 2) & 255;
+                if trns_rgb.len() == 3 && r == trns_rgb.get(0) && g == trns_rgb.get(1) && b == trns_rgb.get(2) {
+                    a = 0;
+                }
             } else if ct == 3 {
                 val ix: i64 = px.get(at) & 255;
-                if ix * 3 + 2 >= plte.len() { return bad; }
-                r = plte.get(ix * 3); g = plte.get(ix * 3 + 1); b = plte.get(ix * 3 + 2);
-                if ix < trns.len() { a = trns.get(ix) & 255; }
+                if ix * 3 + 2 >= plte.len() {
+                    return bad;
+                }
+                r = plte.get(ix * 3);
+                g = plte.get(ix * 3 + 1);
+                b = plte.get(ix * 3 + 2);
+                if ix < trns.len() {
+                    a = trns.get(ix) & 255;
+                }
             } else if ct == 4 {
                 val gv2: i64 = px.get(at) & 255;
-                r = gv2; g = gv2; b = gv2; a = px.get(at + 1) & 255;
+                r = gv2;
+                g = gv2;
+                b = gv2;
+                a = px.get(at + 1) & 255;
             } else {
-                r = px.get(at) & 255; g = px.get(at + 1) & 255; b = px.get(at + 2) & 255; a = px.get(at + 3) & 255;
+                r = px.get(at) & 255;
+                g = px.get(at + 1) & 255;
+                b = px.get(at + 2) & 255;
+                a = px.get(at + 3) & 255;
             }
-            image_set_pixel(& mut img, x2, y, r, g, b, a);
+            image_set_pixel(&mut img, x2, y, r, g, b, a);
             x2 = x2 + 1;
         }
         y = y + 1;
@@ -274,32 +360,48 @@ pub fn image_png_decode(d: Vec<i64>) -> Image {
 /// 4-channel Image. `width` 0 on failure.
 pub fn image_bmp_decode(d: Vec<i64>) -> Image {
     var bad: Image = image_create(0, 0, 4);
-    if d.len() < 54 || d.get(0) != 66 || d.get(1) != 77 { return bad; }
-    val off: i64 = img_u32le(& d, 10);
-    var w: i64 = img_u32le(& d, 18);
-    var h: i64 = img_u32le(& d, 22);
+    if d.len() < 54 || d.get(0) != 66 || d.get(1) != 77 {
+        return bad;
+    }
+    val off: i64 = img_u32le(&d, 10);
+    var w: i64 = img_u32le(&d, 18);
+    var h: i64 = img_u32le(&d, 22);
     // 32-bit negatives: top-down rows
     var top_down: bool = false;
-    if h < 0 { top_down = true; h = 0 - h; }
-    if h > 2147483647 { h = h - 4294967296; top_down = true; }
-    val planes: i64 = img_u16le(& d, 26);
-    val bpp: i64 = img_u16le(& d, 28);
-    val comp: i64 = img_u32le(& d, 30);
-    if w <= 0 || h <= 0 || planes != 1 || comp != 0 || (bpp != 24 && bpp != 32) { return bad; }
+    if h < 0 {
+        top_down = true;
+        h = 0 - h;
+    }
+    if h > 2147483647 {
+        h = h - 4294967296;
+        top_down = true;
+    }
+    val planes: i64 = img_u16le(&d, 26);
+    val bpp: i64 = img_u16le(&d, 28);
+    val comp: i64 = img_u32le(&d, 30);
+    if w <= 0 || h <= 0 || planes != 1 || comp != 0 || (bpp != 24 && bpp != 32) {
+        return bad;
+    }
     val bytes_px: i64 = bpp / 8;
     val row: i64 = (w * bytes_px + 3) / 4 * 4;
-    if off + row * h > d.len() { return bad; }
+    if off + row * h > d.len() {
+        return bad;
+    }
     var img: Image = image_create(w, h, 4);
     var y: i64 = 0;
     while y < h {
         var ry: i64 = h - 1 - y;
-        if top_down { ry = y; }
+        if top_down {
+            ry = y;
+        }
         var x: i64 = 0;
         while x < w {
             val at: i64 = off + ry * row + x * bytes_px;
             var a: i64 = 255;
-            if bpp == 32 { a = d.get(at + 3) & 255; }
-            image_set_pixel(& mut img, x, y, d.get(at + 2) & 255, d.get(at + 1) & 255, d.get(at) & 255, a);
+            if bpp == 32 {
+                a = d.get(at + 3) & 255;
+            }
+            image_set_pixel(&mut img, x, y, d.get(at + 2) & 255, d.get(at + 1) & 255, d.get(at) & 255, a);
             x = x + 1;
         }
         y = y + 1;
@@ -355,14 +457,14 @@ fn image_load_file(path: str, jpg: bool, channels: i64) -> Image {
     var w: i64 = 0;
     var h: i64 = 0;
     var c: i64 = 0;
-    var pw: * mut i64 = out;
-    var ph: * mut i64 = out + 8;
-    var pc: * mut i64 = out + 16;
+    var pw: *mut i64 = out;
+    var ph: *mut i64 = out + 8;
+    var pc: *mut i64 = out + 16;
     // SAFETY: words 0, 1 and 2 of the 24-byte block above, then its free.
     unsafe {
-        w = * pw;
-        h = * ph;
-        c = * pc;
+        w = *pw;
+        h = *ph;
+        c = *pc;
         p_free(out);
     }
     if result != 0 || w <= 0 || h <= 0 {
@@ -411,24 +513,24 @@ pub fn image_load(path: str) -> Image {
 
 // ─── PNG / BMP encoding (pure Fides) ─────────────────────────────────────
 
-fn img_push_u32be(v: & mut Vec<i64>, x: i64) -> void {
+fn img_push_u32be(v: &mut Vec<i64>, x: i64) -> void {
     v.push((x >> 24) & 255);
     v.push((x >> 16) & 255);
     v.push((x >> 8) & 255);
     v.push(x & 255);
 }
 
-fn img_push_u32le(v: & mut Vec<i64>, x: i64) -> void {
+fn img_push_u32le(v: &mut Vec<i64>, x: i64) -> void {
     v.push(x & 255);
     v.push((x >> 8) & 255);
     v.push((x >> 16) & 255);
     v.push((x >> 24) & 255);
 }
 
-fn img_push_chunk(out: & mut Vec<i64>, ty: i64, data: & Vec<i64>) -> void {
+fn img_push_chunk(out: &mut Vec<i64>, ty: i64, data: &Vec<i64>) -> void {
     img_push_u32be(out, data.len());
     var crc_in: Vec<i64> = Vec::new();
-    img_push_u32be(& mut crc_in, ty);
+    img_push_u32be(&mut crc_in, ty);
     var i: i64 = 0;
     while i < data.len() {
         crc_in.push(data.get(i) & 255);
@@ -443,15 +545,25 @@ fn img_push_chunk(out: & mut Vec<i64>, ty: i64, data: & Vec<i64>) -> void {
 }
 
 /// Encode an Image as PNG bytes (8-bit RGBA, no interlace, filter 0).
-pub fn image_png_encode(img: & Image) -> Vec<i64> {
+pub fn image_png_encode(img: &Image) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
-    out.push(137); out.push(80); out.push(78); out.push(71);
-    out.push(13); out.push(10); out.push(26); out.push(10);
+    out.push(137);
+    out.push(80);
+    out.push(78);
+    out.push(71);
+    out.push(13);
+    out.push(10);
+    out.push(26);
+    out.push(10);
     var ihdr: Vec<i64> = Vec::new();
-    img_push_u32be(& mut ihdr, img.width);
-    img_push_u32be(& mut ihdr, img.height);
-    ihdr.push(8); ihdr.push(6); ihdr.push(0); ihdr.push(0); ihdr.push(0);
-    img_push_chunk(& mut out, 0x49484452, & ihdr);
+    img_push_u32be(&mut ihdr, img.width);
+    img_push_u32be(&mut ihdr, img.height);
+    ihdr.push(8);
+    ihdr.push(6);
+    ihdr.push(0);
+    ihdr.push(0);
+    ihdr.push(0);
+    img_push_chunk(&mut out, 0x49484452, &ihdr);
     var raw: Vec<i64> = Vec::new();
     var y: i64 = 0;
     while y < img.height {
@@ -468,38 +580,39 @@ pub fn image_png_encode(img: & Image) -> Vec<i64> {
         y = y + 1;
     }
     val idat: Vec<i64> = zlib_compress_bytes(raw);
-    img_push_chunk(& mut out, 0x49444154, & idat);
+    img_push_chunk(&mut out, 0x49444154, &idat);
     var empty: Vec<i64> = Vec::new();
-    img_push_chunk(& mut out, 0x49454E44, & empty);
+    img_push_chunk(&mut out, 0x49454E44, &empty);
     return out;
 }
 
 /// Save an Image as a PNG file. Returns file_write_bytes' status.
-pub fn image_save_png(img: & Image, path: str) -> i64 {
+pub fn image_save_png(img: &Image, path: str) -> i64 {
     return file_write_bytes(path, image_png_encode(img));
 }
 
 /// Save an Image as a 24-bit BMP file (BI_RGB, bottom-up rows).
 /// Returns file_write_bytes' status.
-pub fn image_save_bmp(img: & Image, path: str) -> i64 {
+pub fn image_save_bmp(img: &Image, path: str) -> i64 {
     var out: Vec<i64> = Vec::new();
     val row: i64 = (img.width * 3 + 3) / 4 * 4;
     val px_size: i64 = row * img.height;
-    out.push(66); out.push(77);
-    img_push_u32le(& mut out, 54 + px_size);
-    img_push_u32le(& mut out, 0);
-    img_push_u32le(& mut out, 54);
-    img_push_u32le(& mut out, 40);
-    img_push_u32le(& mut out, img.width);
-    img_push_u32le(& mut out, img.height);
-    img_push_u32le(& mut out, 1 | (24 << 16));
+    out.push(66);
+    out.push(77);
+    img_push_u32le(&mut out, 54 + px_size);
+    img_push_u32le(&mut out, 0);
+    img_push_u32le(&mut out, 54);
+    img_push_u32le(&mut out, 40);
+    img_push_u32le(&mut out, img.width);
+    img_push_u32le(&mut out, img.height);
+    img_push_u32le(&mut out, 1 | (24 << 16));
     // planes=1 (u16), bpp=24 (u16)
-    img_push_u32le(& mut out, 0);
-    img_push_u32le(& mut out, px_size);
-    img_push_u32le(& mut out, 2835);
-    img_push_u32le(& mut out, 2835);
-    img_push_u32le(& mut out, 0);
-    img_push_u32le(& mut out, 0);
+    img_push_u32le(&mut out, 0);
+    img_push_u32le(&mut out, px_size);
+    img_push_u32le(&mut out, 2835);
+    img_push_u32le(&mut out, 2835);
+    img_push_u32le(&mut out, 0);
+    img_push_u32le(&mut out, 0);
     var y: i64 = img.height - 1;
     while y >= 0 {
         var x: i64 = 0;
@@ -511,7 +624,10 @@ pub fn image_save_bmp(img: & Image, path: str) -> i64 {
             x = x + 1;
         }
         var pad: i64 = row - img.width * 3;
-        while pad > 0 { out.push(0); pad = pad - 1; }
+        while pad > 0 {
+            out.push(0);
+            pad = pad - 1;
+        }
         y = y - 1;
     }
     return file_write_bytes(path, out);
@@ -529,7 +645,7 @@ extern "C" include "pledge_image.h" link "" {
 
 /// Convert an Image to an SDL texture for rendering.
 /// Returns texture handle or 0 on failure.
-pub fn image_to_texture(ren: i64, img: & Image) -> i64 {
+pub fn image_to_texture(ren: i64, img: &Image) -> i64 {
     if img.width == 0 || img.height == 0 {
         return 0;
     }
@@ -539,7 +655,7 @@ pub fn image_to_texture(ren: i64, img: & Image) -> i64 {
 // ─── Image Manipulation ──────────────────────────────────────────────────
 
 /// Flip an image horizontally (mirror left-right).
-pub fn image_flip_h(img: & mut Image) -> void {
+pub fn image_flip_h(img: &mut Image) -> void {
     var y = 0;
     while y < img.height {
         var x = 0;
@@ -561,7 +677,7 @@ pub fn image_flip_h(img: & mut Image) -> void {
 }
 
 /// Flip an image vertically (mirror top-bottom).
-pub fn image_flip_v(img: & mut Image) -> void {
+pub fn image_flip_v(img: &mut Image) -> void {
     var y = 0;
     while y < img.height / 2 {
         var x = 0;
@@ -582,7 +698,7 @@ pub fn image_flip_v(img: & mut Image) -> void {
 }
 
 /// Extract a sub-region of an image as a new Image.
-pub fn image_subregion(img: & Image, x: i64, y: i64, w: i64, h: i64) -> Image {
+pub fn image_subregion(img: &Image, x: i64, y: i64, w: i64, h: i64) -> Image {
     if x < 0 || y < 0 || x + w > img.width || y + h > img.height {
         return image_create(0, 0, img.channels);
     }
@@ -606,7 +722,7 @@ pub fn image_subregion(img: & Image, x: i64, y: i64, w: i64, h: i64) -> Image {
 }
 
 /// Resize an image using nearest-neighbor sampling.
-pub fn image_resize_nn(img: & Image, new_w: i64, new_h: i64) -> Image {
+pub fn image_resize_nn(img: &Image, new_w: i64, new_h: i64) -> Image {
     var result = image_create(new_w, new_h, img.channels);
     var y = 0;
     while y < new_h {
@@ -654,4 +770,15 @@ pub fn color_unpack(c: i64) -> Color {
 }
 
 // Common colors (RGBA)
-pub const COLOR_WHITE: i64 = 0xFFFFFFFF; pub const COLOR_BLACK: i64 = 0x000000FF; pub const COLOR_RED: i64 = 0xFF0000FF; pub const COLOR_GREEN: i64 = 0x00FF00FF; pub const COLOR_BLUE: i64 = 0x0000FFFF; pub const COLOR_YELLOW: i64 = 0xFFFF00FF; pub const COLOR_CYAN: i64 = 0x00FFFFFF; pub const COLOR_MAGENTA: i64 = 0xFF00FFFF; pub const COLOR_TRANSPARENT: i64 = 0x00000000; pub const COLOR_GRAY: i64 = 0x808080FF; pub const COLOR_DARK_GRAY: i64 = 0x404040FF; pub const COLOR_LIGHT_GRAY: i64 = 0xC0C0C0FF;
+pub const COLOR_WHITE: i64 = 0xFFFFFFFF;
+pub const COLOR_BLACK: i64 = 0x000000FF;
+pub const COLOR_RED: i64 = 0xFF0000FF;
+pub const COLOR_GREEN: i64 = 0x00FF00FF;
+pub const COLOR_BLUE: i64 = 0x0000FFFF;
+pub const COLOR_YELLOW: i64 = 0xFFFF00FF;
+pub const COLOR_CYAN: i64 = 0x00FFFFFF;
+pub const COLOR_MAGENTA: i64 = 0xFF00FFFF;
+pub const COLOR_TRANSPARENT: i64 = 0x00000000;
+pub const COLOR_GRAY: i64 = 0x808080FF;
+pub const COLOR_DARK_GRAY: i64 = 0x404040FF;
+pub const COLOR_LIGHT_GRAY: i64 = 0xC0C0C0FF;

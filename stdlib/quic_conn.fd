@@ -74,7 +74,13 @@
 // hold them; they are never output.
 
 module quic_conn;
- use vec; use aes_gcm; use crypto; use quic; use quic_frame; use quic_tls; use x509;
+use vec;
+use aes_gcm;
+use crypto;
+use quic;
+use quic_frame;
+use quic_tls;
+use x509;
 
 // ─── Constants ──────────────────────────────────────────────────────────
 
@@ -371,7 +377,7 @@ fn qcn_none() -> Vec<i64> {
     return none;
 }
 
-fn qcn_put(out: & mut Vec<i64>, v: Vec<i64>) {
+fn qcn_put(out: &mut Vec<i64>, v: Vec<i64>) {
     var i: i64 = 0;
     while i < v.len() {
         out.push(v.get(i) & 255);
@@ -394,38 +400,42 @@ fn qcn_same(a: Vec<i64>, b: Vec<i64>) -> bool {
 }
 
 fn qcn_no_keys() -> QuicKeys {
-    return QuicKeys { aead: 0, key: qcn_none(), iv: qcn_none(), hp: qcn_none() };
+    return QuicKeys {
+        aead: 0, key: qcn_none(), iv: qcn_none(), hp: qcn_none()
+    };
 }
 
 fn qcn_recv_new() -> QRecv {
-    return QRecv { base: 0, ready: Vec::new(), chunk_off: Vec::new(), chunks: Vec::new(), highest: 0, fin_size: - 1 };
+    return QRecv {
+        base: 0, ready: Vec::new(), chunk_off: Vec::new(), chunks: Vec::new(), highest: 0, fin_size: -1
+    };
 }
 
 fn qcn_space_new() -> QSpace {
     return QSpace {
-        tx: qcn_no_keys(), rx: qcn_no_keys(), has_tx: false, has_rx: false, discarded: false,
-        next_pn: 0, largest_rx: - 1, largest_rx_time: 0, recv: Vec::new(), ack_needed: false,
-        largest_acked: - 1, sent: Vec::new(), loss_time: - 1, last_eliciting: - 1,
-        crypto_pending: Vec::new(), crypto_off: 0, crypto_in: qcn_recv_new(), retx: Vec::new(),
-        probes: 0,
+        tx: qcn_no_keys(), rx: qcn_no_keys(), has_tx: false, has_rx: false, discarded: false, next_pn: 0, largest_rx: -1, largest_rx_time: 0, recv: Vec::new(), ack_needed: false, largest_acked: -1, sent: Vec::new(), loss_time: -1, last_eliciting: -1, crypto_pending: Vec::new(), crypto_off: 0, crypto_in: qcn_recv_new(), retx: Vec::new(), probes: 0,
     };
 }
 
 // ─── Keys kept by the connection (audited releases) ─────────────────────
 
-@declassify fn qcn_keep_initial(dcid: Vec<i64>, server: bool) -> QuicKeys {
+@declassify
+fn qcn_keep_initial(dcid: Vec<i64>, server: bool) -> QuicKeys {
     return quic_initial_keys(dcid, server);
 }
 
-@declassify fn qcn_keep_keys(secret: Vec<i64>, aead: i64) -> QuicKeys {
+@declassify
+fn qcn_keep_keys(secret: Vec<i64>, aead: i64) -> QuicKeys {
     return quic_keys_from_secret(secret, aead);
 }
 
-@declassify fn qcn_keep_next_secret(secret: Vec<i64>) -> Vec<i64> {
+@declassify
+fn qcn_keep_next_secret(secret: Vec<i64>) -> Vec<i64> {
     return quic_next_secret(secret);
 }
 
-@declassify fn qcn_keep_updated(old: QuicKeys, next_secret: Vec<i64>) -> QuicKeys {
+@declassify
+fn qcn_keep_updated(old: QuicKeys, next_secret: Vec<i64>) -> QuicKeys {
     return quic_updated_keys(old, next_secret);
 }
 
@@ -436,13 +446,7 @@ fn qcn_config(alpn: Vec<str>) -> QuicConfig {
     suites.push(QT_TLS_AES_128_GCM_SHA256);
     suites.push(QT_TLS_CHACHA20_POLY1305_SHA256);
     return QuicConfig {
-        alpn: alpn, server_name: "", cert: qcn_none(), key_seed: qcn_none(), peer_key: qcn_none(),
-        suites: suites, max_data: 4194304, max_stream_data_bidi_local: 1048576,
-        max_stream_data_bidi_remote: 1048576, max_stream_data_uni: 1048576,
-        max_streams_bidi: 100, max_streams_uni: 100, idle_timeout_ms: 30000, seed: qcn_none(),
-        version: QUIC_V1, key_share: true, retry: false, token_key: qcn_none(), reset_key: qcn_none(),
-        ticket_key: qcn_none(), early_data: false, ticket: quic_ticket_none(), allow_migration: true,
-        roots: Vec::new(),
+        alpn: alpn, server_name: "", cert: qcn_none(), key_seed: qcn_none(), peer_key: qcn_none(), suites: suites, max_data: 4194304, max_stream_data_bidi_local: 1048576, max_stream_data_bidi_remote: 1048576, max_stream_data_uni: 1048576, max_streams_bidi: 100, max_streams_uni: 100, idle_timeout_ms: 30000, seed: qcn_none(), version: QUIC_V1, key_share: true, retry: false, token_key: qcn_none(), reset_key: qcn_none(), ticket_key: qcn_none(), early_data: false, ticket: quic_ticket_none(), allow_migration: true, roots: Vec::new(),
     };
 }
 
@@ -470,7 +474,7 @@ pub fn quic_config_server(alpn: Vec<str>, cert: Vec<i64>, key_seed: Vec<i64>) ->
 
 /// `n` random bytes: from the OS, or from SHA-256(seed || counter) when the
 /// configuration has a seed.
-fn qcn_rand(c: & mut QuicConn, n: i64) -> Vec<i64> {
+fn qcn_rand(c: &mut QuicConn, n: i64) -> Vec<i64> {
     if c.cfg.seed.len() == 0 {
         return crypto_random_bytes(n);
     }
@@ -499,43 +503,15 @@ fn qcn_blank(server: bool, cfg: QuicConfig, now: i64) -> QuicConn {
     spaces.push(qcn_space_new());
     spaces.push(qcn_space_new());
     var none_str: Vec<str> = Vec::new();
-    val tls: QuicTls = quic_tls_new(server, cfg.suites, none_str, "", qcn_none(), qcn_none(),
-        qcn_none(), qcn_none(), qcn_none(), qcn_none());
+    val tls: QuicTls = quic_tls_new(server, cfg.suites, none_str, "", qcn_none(), qcn_none(), qcn_none(), qcn_none(), qcn_none(), qcn_none());
     return QuicConn {
-        server: server, state: QS_HANDSHAKE, cfg: cfg, tls: tls, alpn: "", scid: qcn_none(),
-        dcid: qcn_none(), dcid_seq: 0, odcid: qcn_none(), peer_first_scid: qcn_none(),
-        got_peer_packet: false, retried: false, retry_scid: qcn_none(), token: qcn_none(),
-        initial_crypto: qcn_none(), spare_cids: Vec::new(), spare_seqs: Vec::new(),
-        spaces: spaces, streams: Vec::new(), rr: 0, new_streams: Vec::new(),
-        peer: quic_params_default(), has_peer_params: false,
-        max_data_local: cfg.max_data, recv_total: 0, consumed_total: 0, max_data_pending: false,
-        max_data_peer: 0, sent_total: 0, data_blocked_at: - 1,
-        max_streams_bidi_local: cfg.max_streams_bidi, max_streams_uni_local: cfg.max_streams_uni,
-        streams_bidi_pending: false, streams_uni_pending: false, peer_bidi_opened: 0,
-        peer_uni_opened: 0, max_streams_bidi_peer: 0, max_streams_uni_peer: 0,
-        local_bidi_opened: 0, local_uni_opened: 0, ctrl: Vec::new(),
-        srtt: QCN_INITIAL_RTT, rttvar: QCN_INITIAL_RTT / 2, min_rtt: 0, latest_rtt: 0,
-        has_rtt: false, pto_count: 0, cwnd: QCN_INITIAL_CWND, ssthresh: 4611686018427387903,
-        bytes_in_flight: 0, recovery_start: - 1, addr_validated: !server, bytes_received: 0,
-        bytes_sent: 0, hs_confirmed: false, handshake_done_pending: false, key_phase: false,
-        ap_tx_secret: qcn_none(), ap_rx_secret: qcn_none(), prev_rx: qcn_no_keys(),
-        has_prev_rx: false, key_update_pn: - 1, close_pending: false, close_deadline: - 1,
-        error: - 1, app_error: false, why: "", peer_closed: false, idle_ms: cfg.idle_timeout_ms,
-        last_activity: now, last_send: now, rand_ctr: 0, packets_sent: 0, packets_received: 0,
-        packets_lost: 0, now: now, idle_restarted: false,
-        version: cfg.version, vn_done: false, retry_odcid: qcn_none(),
-        local_cids: Vec::new(), local_seqs: Vec::new(), next_local_seq: 0, cids_issued: false,
-        reset_key: qcn_none(), rx_dcid_seq: 0, dcid_token: qcn_none(), spare_tokens: Vec::new(),
-        reset_received: false, early_tx: qcn_no_keys(), early_rx: qcn_no_keys(), has_early_tx: false,
-        has_early_rx: false, early_packets: 0, first_ap_pn: - 1, peer_addr: qcn_none(), prev_addr: qcn_none(),
-        rx_addr: qcn_none(), path_challenge: qcn_none(), path_deadline: - 1, path_validated: true,
-        path_rx: 0, path_tx: 0, migrations: 0,
+        server: server, state: QS_HANDSHAKE, cfg: cfg, tls: tls, alpn: "", scid: qcn_none(), dcid: qcn_none(), dcid_seq: 0, odcid: qcn_none(), peer_first_scid: qcn_none(), got_peer_packet: false, retried: false, retry_scid: qcn_none(), token: qcn_none(), initial_crypto: qcn_none(), spare_cids: Vec::new(), spare_seqs: Vec::new(), spaces: spaces, streams: Vec::new(), rr: 0, new_streams: Vec::new(), peer: quic_params_default(), has_peer_params: false, max_data_local: cfg.max_data, recv_total: 0, consumed_total: 0, max_data_pending: false, max_data_peer: 0, sent_total: 0, data_blocked_at: -1, max_streams_bidi_local: cfg.max_streams_bidi, max_streams_uni_local: cfg.max_streams_uni, streams_bidi_pending: false, streams_uni_pending: false, peer_bidi_opened: 0, peer_uni_opened: 0, max_streams_bidi_peer: 0, max_streams_uni_peer: 0, local_bidi_opened: 0, local_uni_opened: 0, ctrl: Vec::new(), srtt: QCN_INITIAL_RTT, rttvar: QCN_INITIAL_RTT / 2, min_rtt: 0, latest_rtt: 0, has_rtt: false, pto_count: 0, cwnd: QCN_INITIAL_CWND, ssthresh: 4611686018427387903, bytes_in_flight: 0, recovery_start: -1, addr_validated: !server, bytes_received: 0, bytes_sent: 0, hs_confirmed: false, handshake_done_pending: false, key_phase: false, ap_tx_secret: qcn_none(), ap_rx_secret: qcn_none(), prev_rx: qcn_no_keys(), has_prev_rx: false, key_update_pn: -1, close_pending: false, close_deadline: -1, error: -1, app_error: false, why: "", peer_closed: false, idle_ms: cfg.idle_timeout_ms, last_activity: now, last_send: now, rand_ctr: 0, packets_sent: 0, packets_received: 0, packets_lost: 0, now: now, idle_restarted: false, version: cfg.version, vn_done: false, retry_odcid: qcn_none(), local_cids: Vec::new(), local_seqs: Vec::new(), next_local_seq: 0, cids_issued: false, reset_key: qcn_none(), rx_dcid_seq: 0, dcid_token: qcn_none(), spare_tokens: Vec::new(), reset_received: false, early_tx: qcn_no_keys(), early_rx: qcn_no_keys(), has_early_tx: false, has_early_rx: false, early_packets: 0, first_ap_pn: -1, peer_addr: qcn_none(), prev_addr: qcn_none(), rx_addr: qcn_none(), path_challenge: qcn_none(), path_deadline: -1, path_validated: true, path_rx: 0, path_tx: 0, migrations: 0,
     };
 }
 
 /// Our first connection ID (`scid`, sequence 0) and the key of our
 /// stateless reset tokens.
-fn qcn_init_cids(c: & mut QuicConn) {
+fn qcn_init_cids(c: &mut QuicConn) {
     if c.cfg.reset_key.len() == 32 {
         c.reset_key = c.cfg.reset_key;
     } else {
@@ -554,7 +530,7 @@ fn qcn_init_cids(c: & mut QuicConn) {
 /// The handshake's settings from the configuration: the key share, the
 /// ticket (client) or ticket key (server), early data, the time and some
 /// randomness for tickets.
-fn qcn_tls_setup(c: & mut QuicConn, now: i64) {
+fn qcn_tls_setup(c: &mut QuicConn, now: i64) {
     c.tls.now = now;
     c.tls.key_share_first = c.cfg.key_share;
     c.tls.early_data = c.cfg.early_data;
@@ -568,7 +544,7 @@ fn qcn_tls_setup(c: & mut QuicConn, now: i64) {
 }
 
 /// Our transport parameters.
-fn qcn_local_params(c: & QuicConn) -> QuicParams {
+fn qcn_local_params(c: &QuicConn) -> QuicParams {
     var p: QuicParams = quic_params_default();
     p.max_idle_timeout = c.cfg.idle_timeout_ms;
     p.max_udp_payload_size = 1472;
@@ -598,11 +574,11 @@ fn qcn_local_params(c: & QuicConn) -> QuicParams {
     return p;
 }
 
-fn qcn_set_space(c: & mut QuicConn, level: i64, sp: QSpace) {
+fn qcn_set_space(c: &mut QuicConn, level: i64, sp: QSpace) {
     c.spaces.set(level, sp);
 }
 
-fn qcn_install_initial(c: & mut QuicConn) {
+fn qcn_install_initial(c: &mut QuicConn) {
     var sp: QSpace = c.spaces.get(QL_INITIAL);
     sp.tx = qcn_keep_initial(c.odcid, c.server);
     sp.rx = qcn_keep_initial(c.odcid, !c.server);
@@ -615,22 +591,21 @@ fn qcn_install_initial(c: & mut QuicConn) {
 /// ClientHello. quic_conn_send then gives the first datagram.
 pub fn quic_connect(cfg: QuicConfig, now: i64) -> QuicConn {
     var c: QuicConn = qcn_blank(false, cfg, now);
-    c.scid = qcn_rand(& mut c, QCN_CID_LEN);
-    c.odcid = qcn_rand(& mut c, QCN_CID_LEN);
+    c.scid = qcn_rand(&mut c, QCN_CID_LEN);
+    c.odcid = qcn_rand(&mut c, QCN_CID_LEN);
     c.dcid = c.odcid;
-    qcn_init_cids(& mut c);
-    val random: Vec<i64> = qcn_rand(& mut c, 32);
-    val eph: Vec<i64> = qcn_rand(& mut c, 32);
-    val params: Vec<i64> = quic_params_encode(qcn_local_params(& c));
-    c.tls = quic_tls_new(false, c.cfg.suites, c.cfg.alpn, c.cfg.server_name, qcn_none(), qcn_none(),
-        c.cfg.peer_key, random, eph, params);
+    qcn_init_cids(&mut c);
+    val random: Vec<i64> = qcn_rand(&mut c, 32);
+    val eph: Vec<i64> = qcn_rand(&mut c, 32);
+    val params: Vec<i64> = quic_params_encode(qcn_local_params(&c));
+    c.tls = quic_tls_new(false, c.cfg.suites, c.cfg.alpn, c.cfg.server_name, qcn_none(), qcn_none(), c.cfg.peer_key, random, eph, params);
     c.tls.trust_anchors = c.cfg.roots;
-    qcn_tls_setup(& mut c, now);
-    qcn_install_initial(& mut c);
-    quic_tls_client_start(& mut c.tls);
-    qcn_after_tls(& mut c, now);
+    qcn_tls_setup(&mut c, now);
+    qcn_install_initial(&mut c);
+    quic_tls_client_start(&mut c.tls);
+    qcn_after_tls(&mut c, now);
     if c.tls.early_ready && c.state == QS_HANDSHAKE {
-        qcn_start_early(& mut c);
+        qcn_start_early(&mut c);
     }
     return c;
 }
@@ -638,7 +613,7 @@ pub fn quic_connect(cfg: QuicConfig, now: i64) -> QuicConn {
 /// 0-RTT (client, RFC 9001 §4.6): keys from the early traffic secret, and
 /// the server's limits as the ticket remembers them (RFC 9000 §7.4.1), so
 /// that streams can be opened and written before the handshake is done.
-fn qcn_start_early(c: & mut QuicConn) {
+fn qcn_start_early(c: &mut QuicConn) {
     val parsed: QuicParamsParsed = quic_params_parse(c.tls.offer.params, true);
     if parsed.error >= 0 {
         return;
@@ -659,7 +634,7 @@ fn qcn_start_early(c: & mut QuicConn) {
 
 /// Whether streams can carry data now: once established; a server from
 /// its Finished on (0.5-RTT, RFC 9001 §4.1.1); a client in 0-RTT.
-fn qcn_streams_open(c: & QuicConn) -> bool {
+fn qcn_streams_open(c: &QuicConn) -> bool {
     if c.state == QS_ESTABLISHED {
         return true;
     }
@@ -739,13 +714,13 @@ pub struct QuicTokenCheck {
 
 /// `n` bytes for a stateless reply: from the OS, or (a configuration with
 /// a seed, for tests) from SHA-256 of the seed, a label and `salt`.
-fn qcn_cfg_rand(cfg: & QuicConfig, label: str, salt: Vec<i64>, n: i64) -> Vec<i64> {
+fn qcn_cfg_rand(cfg: &QuicConfig, label: str, salt: Vec<i64>, n: i64) -> Vec<i64> {
     if cfg.seed.len() == 0 {
         return crypto_random_bytes(n);
     }
     var input: Vec<i64> = cfg.seed;
-    qcn_put(& mut input, str_bytes(label));
-    qcn_put(& mut input, salt);
+    qcn_put(&mut input, str_bytes(label));
+    qcn_put(&mut input, salt);
     var out: Vec<i64> = Vec::new();
     var round: i64 = 0;
     while out.len() < n {
@@ -768,7 +743,7 @@ fn qcn_cfg_rand(cfg: & QuicConfig, label: str, salt: Vec<i64>, n: i64) -> Vec<i6
 /// client's address (`addr`, as the I/O layer names it), the time and
 /// both connection IDs. [] when `d` is no new Initial or there is no
 /// 16-byte token key.
-pub fn quic_retry_for(cfg: & QuicConfig, d: Vec<i64>, addr: Vec<i64>, now: i64) -> Vec<i64> {
+pub fn quic_retry_for(cfg: &QuicConfig, d: Vec<i64>, addr: Vec<i64>, now: i64) -> Vec<i64> {
     if !quic_is_new_initial(d) || cfg.token_key.len() != 16 {
         return qcn_none();
     }
@@ -782,28 +757,32 @@ pub fn quic_retry_for(cfg: & QuicConfig, d: Vec<i64>, addr: Vec<i64>, now: i64) 
         k = k - 1;
     }
     plain.push(h.dcid.len());
-    qcn_put(& mut plain, h.dcid);
+    qcn_put(&mut plain, h.dcid);
     plain.push(rscid.len());
-    qcn_put(& mut plain, rscid);
+    qcn_put(&mut plain, rscid);
     val nonce: Vec<i64> = qcn_cfg_rand(cfg, "retry nonce", h.dcid, 12);
     var token: Vec<i64> = nonce;
-    qcn_put(& mut token, qcn_seal_token(cfg.token_key, nonce, addr, plain));
+    qcn_put(&mut token, qcn_seal_token(cfg.token_key, nonce, addr, plain));
     val unused: Vec<i64> = qcn_cfg_rand(cfg, "retry bits", h.dcid, 1);
     return quic_retry_packet(h.scid, rscid, h.dcid, token, unused.get(0));
 }
 
-@declassify fn qcn_seal_token(key: Vec<i64>, nonce: Vec<i64>, aad: Vec<i64>, plain: Vec<i64>) -> Vec<i64> {
+@declassify
+fn qcn_seal_token(key: Vec<i64>, nonce: Vec<i64>, aad: Vec<i64>, plain: Vec<i64>) -> Vec<i64> {
     return aes_gcm_seal(key, nonce, aad, plain);
 }
 
-@declassify fn qcn_open_token(key: Vec<i64>, nonce: Vec<i64>, aad: Vec<i64>, sealed: Vec<i64>) -> GcmOpened {
+@declassify
+fn qcn_open_token(key: Vec<i64>, nonce: Vec<i64>, aad: Vec<i64>, sealed: Vec<i64>) -> GcmOpened {
     return aes_gcm_open(key, nonce, aad, sealed);
 }
 
 /// Open a Retry token a client returned from `addr`: ok when our key
 /// opens it for that address and it is at most QCN_RETRY_TOKEN_MS old.
-pub fn quic_token_check(cfg: & QuicConfig, token: Vec<i64>, addr: Vec<i64>, now: i64) -> QuicTokenCheck {
-    val bad: QuicTokenCheck = QuicTokenCheck { ok: false, odcid: qcn_none(), retry_scid: qcn_none() };
+pub fn quic_token_check(cfg: &QuicConfig, token: Vec<i64>, addr: Vec<i64>, now: i64) -> QuicTokenCheck {
+    val bad: QuicTokenCheck = QuicTokenCheck {
+        ok: false, odcid: qcn_none(), retry_scid: qcn_none()
+    };
     if cfg.token_key.len() != 16 || token.len() < 12 + 16 + 11 {
         return bad;
     }
@@ -829,7 +808,9 @@ pub fn quic_token_check(cfg: & QuicConfig, token: Vec<i64>, addr: Vec<i64>, now:
     if 11 + ol + rl != p.len() {
         return bad;
     }
-    return QuicTokenCheck { ok: true, odcid: quic_slice(p, 10, 10 + ol), retry_scid: quic_slice(p, 11 + ol, 11 + ol + rl) };
+    return QuicTokenCheck {
+        ok: true, odcid: quic_slice(p, 10, 10 + ol), retry_scid: quic_slice(p, 11 + ol, 11 + ol + rl)
+    };
 }
 
 /// The Stateless Reset (RFC 9000 §10.3) an endpoint whose connection
@@ -864,7 +845,7 @@ pub fn quic_accept_from(cfg: QuicConfig, d: Vec<i64>, addr: Vec<i64>, now: i64) 
             c.why = "retry required";
             return c;
         }
-        val tc: QuicTokenCheck = quic_token_check(& c.cfg, h.token, addr, now);
+        val tc: QuicTokenCheck = quic_token_check(&c.cfg, h.token, addr, now);
         if !tc.ok || !qcn_same(tc.retry_scid, h.dcid) {
             c.state = QS_CLOSED;
             c.error = QE_INVALID_TOKEN;
@@ -881,16 +862,15 @@ pub fn quic_accept_from(cfg: QuicConfig, d: Vec<i64>, addr: Vec<i64>, now: i64) 
     c.dcid = h.scid;
     c.peer_first_scid = h.scid;
     c.got_peer_packet = true;
-    c.scid = qcn_rand(& mut c, QCN_CID_LEN);
-    qcn_init_cids(& mut c);
-    val random: Vec<i64> = qcn_rand(& mut c, 32);
-    val eph: Vec<i64> = qcn_rand(& mut c, 32);
-    val params: Vec<i64> = quic_params_encode(qcn_local_params(& c));
-    c.tls = quic_tls_new(true, c.cfg.suites, c.cfg.alpn, "", c.cfg.cert, c.cfg.key_seed, qcn_none(),
-        random, eph, params);
-    qcn_tls_setup(& mut c, now);
-    qcn_install_initial(& mut c);
-    quic_conn_recv(& mut c, d, now);
+    c.scid = qcn_rand(&mut c, QCN_CID_LEN);
+    qcn_init_cids(&mut c);
+    val random: Vec<i64> = qcn_rand(&mut c, 32);
+    val eph: Vec<i64> = qcn_rand(&mut c, 32);
+    val params: Vec<i64> = quic_params_encode(qcn_local_params(&c));
+    c.tls = quic_tls_new(true, c.cfg.suites, c.cfg.alpn, "", c.cfg.cert, c.cfg.key_seed, qcn_none(), random, eph, params);
+    qcn_tls_setup(&mut c, now);
+    qcn_install_initial(&mut c);
+    quic_conn_recv(&mut c, d, now);
     if c.packets_received == 0 && c.state == QS_HANDSHAKE {
         // Nothing in it decrypted
         c.state = QS_CLOSED;
@@ -901,7 +881,7 @@ pub fn quic_accept_from(cfg: QuicConfig, d: Vec<i64>, addr: Vec<i64>, now: i64) 
 
 // ─── Errors and closing ─────────────────────────────────────────────────
 
-fn qcn_pto_base(c: & QuicConn) -> i64 {
+fn qcn_pto_base(c: &QuicConn) -> i64 {
     var v: i64 = 4 * c.rttvar;
     if v < 1 {
         v = 1;
@@ -911,7 +891,7 @@ fn qcn_pto_base(c: & QuicConn) -> i64 {
 
 /// Close with a transport error: CONNECTION_CLOSE goes out, then the
 /// closing period (RFC 9000 §10.2.1).
-fn qcn_fail(c: & mut QuicConn, code: i64, why: str) {
+fn qcn_fail(c: &mut QuicConn, code: i64, why: str) {
     if c.state >= QS_CLOSING {
         return;
     }
@@ -925,7 +905,7 @@ fn qcn_fail(c: & mut QuicConn, code: i64, why: str) {
 
 /// Close the connection with an application error code and reason
 /// (CONNECTION_CLOSE type 0x1d once the handshake is done).
-pub fn quic_conn_close(c: & mut QuicConn, code: i64, reason: str, now: i64) {
+pub fn quic_conn_close(c: &mut QuicConn, code: i64, reason: str, now: i64) {
     if c.state >= QS_CLOSING {
         return;
     }
@@ -939,25 +919,25 @@ pub fn quic_conn_close(c: & mut QuicConn, code: i64, reason: str, now: i64) {
 
 /// Whether the connection can carry streams: the handshake is complete
 /// and it is not closing.
-pub fn quic_conn_established(c: & QuicConn) -> bool {
+pub fn quic_conn_established(c: &QuicConn) -> bool {
     return c.state == QS_ESTABLISHED;
 }
 
 /// Whether the connection is over (closing, draining or closed): nothing
 /// more will be delivered.
-pub fn quic_conn_done(c: & QuicConn) -> bool {
+pub fn quic_conn_done(c: &QuicConn) -> bool {
     return c.state >= QS_CLOSING;
 }
 
 /// Whether the connection is closed for good (its timers are over).
-pub fn quic_conn_closed(c: & QuicConn) -> bool {
+pub fn quic_conn_closed(c: &QuicConn) -> bool {
     return c.state == QS_CLOSED;
 }
 
 // ─── Spaces and keys ────────────────────────────────────────────────────
 
 /// Forget a packet number space's keys and packets (RFC 9001 §4.9).
-fn qcn_discard(c: & mut QuicConn, level: i64) {
+fn qcn_discard(c: &mut QuicConn, level: i64) {
     var sp: QSpace = c.spaces.get(level);
     if sp.discarded {
         return;
@@ -976,8 +956,8 @@ fn qcn_discard(c: & mut QuicConn, level: i64) {
     sp.sent = Vec::new();
     sp.retx = Vec::new();
     sp.crypto_pending = Vec::new();
-    sp.loss_time = - 1;
-    sp.last_eliciting = - 1;
+    sp.loss_time = -1;
+    sp.last_eliciting = -1;
     sp.ack_needed = false;
     sp.probes = 0;
     sp.has_tx = false;
@@ -989,7 +969,7 @@ fn qcn_discard(c: & mut QuicConn, level: i64) {
     c.pto_count = 0;
 }
 
-fn qcn_stream_kind_limits(c: & mut QuicConn) {
+fn qcn_stream_kind_limits(c: &mut QuicConn) {
     // The peer's limits apply to streams opened before its parameters came
     var i: i64 = 0;
     while i < c.streams.len() {
@@ -1004,7 +984,7 @@ fn qcn_stream_kind_limits(c: & mut QuicConn) {
 
 /// Apply the peer's transport parameters, checking the connection IDs
 /// they authenticate (RFC 9000 §7.3).
-fn qcn_apply_params(c: & mut QuicConn) {
+fn qcn_apply_params(c: &mut QuicConn) {
     val parsed: QuicParamsParsed = quic_params_parse(c.tls.peer_params, !c.server);
     if parsed.error >= 0 {
         qcn_fail(c, parsed.error, parsed.why);
@@ -1047,16 +1027,16 @@ fn qcn_apply_params(c: & mut QuicConn) {
 /// After the handshake took input (or started): send what it produced,
 /// install the keys it derived, apply the peer's parameters, and move the
 /// connection on when the handshake is complete.
-fn qcn_after_tls(c: & mut QuicConn, now: i64) {
+fn qcn_after_tls(c: &mut QuicConn, now: i64) {
     if c.tls.alert >= 0 {
         qcn_fail(c, QE_CRYPTO_ERROR + c.tls.alert, c.tls.why);
         return;
     }
     if c.tls.out_initial.len() > 0 {
         var sp: QSpace = c.spaces.get(QL_INITIAL);
-        qcn_put(& mut sp.crypto_pending, c.tls.out_initial);
+        qcn_put(&mut sp.crypto_pending, c.tls.out_initial);
         if !c.server {
-            qcn_put(& mut c.initial_crypto, c.tls.out_initial);
+            qcn_put(&mut c.initial_crypto, c.tls.out_initial);
         }
         c.spaces.set(QL_INITIAL, sp);
         c.tls.out_initial = qcn_none();
@@ -1077,7 +1057,7 @@ fn qcn_after_tls(c: & mut QuicConn, now: i64) {
     }
     if c.tls.out_handshake.len() > 0 {
         var sp2: QSpace = c.spaces.get(QL_HANDSHAKE);
-        qcn_put(& mut sp2.crypto_pending, c.tls.out_handshake);
+        qcn_put(&mut sp2.crypto_pending, c.tls.out_handshake);
         c.spaces.set(QL_HANDSHAKE, sp2);
         c.tls.out_handshake = qcn_none();
     }
@@ -1130,7 +1110,7 @@ fn qcn_after_tls(c: & mut QuicConn, now: i64) {
     if c.tls.out_app.len() > 0 && c.state < QS_CLOSING {
         // NewSessionTicket, in 1-RTT CRYPTO frames
         var ap2: QSpace = c.spaces.get(QL_APP);
-        qcn_put(& mut ap2.crypto_pending, c.tls.out_app);
+        qcn_put(&mut ap2.crypto_pending, c.tls.out_app);
         c.spaces.set(QL_APP, ap2);
         c.tls.out_app = qcn_none();
     }
@@ -1139,7 +1119,7 @@ fn qcn_after_tls(c: & mut QuicConn, now: i64) {
 /// The server did not take our 0-RTT (RFC 9001 §4.6.2): every packet sent
 /// with the 0-RTT keys counts as lost and its stream data goes again in
 /// 1-RTT packets (at the same offsets: the server saw none of it).
-fn qcn_early_rejected(c: & mut QuicConn) {
+fn qcn_early_rejected(c: &mut QuicConn) {
     var ap: QSpace = c.spaces.get(QL_APP);
     var i: i64 = 0;
     while i < ap.sent.len() {
@@ -1147,21 +1127,21 @@ fn qcn_early_rejected(c: & mut QuicConn) {
         if p.ack_eliciting {
             c.bytes_in_flight = c.bytes_in_flight - p.size;
         }
-        qcn_requeue(c, & mut ap, p.frames);
+        qcn_requeue(c, &mut ap, p.frames);
         i = i + 1;
     }
     if c.bytes_in_flight < 0 {
         c.bytes_in_flight = 0;
     }
     ap.sent = Vec::new();
-    ap.loss_time = - 1;
+    ap.loss_time = -1;
     c.spaces.set(QL_APP, ap);
 }
 
 // ─── Streams ────────────────────────────────────────────────────────────
 
 /// Whether stream `id` was opened by this end.
-fn qcn_is_local(c: & QuicConn, id: i64) -> bool {
+fn qcn_is_local(c: &QuicConn, id: i64) -> bool {
     val by_server: bool = (id & 1) == 1;
     return by_server == c.server;
 }
@@ -1171,7 +1151,7 @@ fn qcn_is_uni(id: i64) -> bool {
 }
 
 /// What the peer lets us send on a stream we open, from its parameters.
-fn qcn_peer_initial_send_max(c: & QuicConn, id: i64) -> i64 {
+fn qcn_peer_initial_send_max(c: &QuicConn, id: i64) -> i64 {
     if !c.has_peer_params && !c.has_early_tx {
         // (in 0-RTT, `peer` holds the limits the ticket remembers)
         return 0;
@@ -1185,7 +1165,7 @@ fn qcn_peer_initial_send_max(c: & QuicConn, id: i64) -> i64 {
     return c.peer.initial_max_stream_data_bidi_local;
 }
 
-fn qcn_stream_new(c: & QuicConn, id: i64) -> QStream {
+fn qcn_stream_new(c: &QuicConn, id: i64) -> QStream {
     var recv: i64 = 0;
     if qcn_is_uni(id) {
         if !qcn_is_local(c, id) {
@@ -1201,15 +1181,12 @@ fn qcn_stream_new(c: & QuicConn, id: i64) -> QStream {
         send = qcn_peer_initial_send_max(c, id);
     }
     return QStream {
-        id: id, pending: Vec::new(), pending_pos: 0, send_off: 0, send_max: send,
-        fin_queued: false, fin_sent: false, fin_acked: false, blocked_at: - 1, reset_sent: false,
-        stop_code: - 1, rx: qcn_recv_new(), recv_max: recv, recv_window: recv, max_pending: false,
-        fin_read: false, peer_reset: - 1, stop_sent: false,
+        id: id, pending: Vec::new(), pending_pos: 0, send_off: 0, send_max: send, fin_queued: false, fin_sent: false, fin_acked: false, blocked_at: -1, reset_sent: false, stop_code: -1, rx: qcn_recv_new(), recv_max: recv, recv_window: recv, max_pending: false, fin_read: false, peer_reset: -1, stop_sent: false,
     };
 }
 
 /// Index of stream `id` in the table, -1 when it is not there.
-pub fn quic_stream_index(c: & QuicConn, id: i64) -> i64 {
+pub fn quic_stream_index(c: &QuicConn, id: i64) -> i64 {
     var i: i64 = 0;
     while i < c.streams.len() {
         if c.streams.get(i).id == id {
@@ -1217,13 +1194,13 @@ pub fn quic_stream_index(c: & QuicConn, id: i64) -> i64 {
         }
         i = i + 1;
     }
-    return - 1;
+    return -1;
 }
 
 /// The stream a frame from the peer names: its index, opening the peer's
 /// streams up to it (RFC 9000 §3.2); -1 for a stream that is finished and
 /// forgotten (the frame is ignored); -2 after a connection error.
-fn qcn_stream_for_frame(c: & mut QuicConn, id: i64) -> i64 {
+fn qcn_stream_for_frame(c: &mut QuicConn, id: i64) -> i64 {
     val k: i64 = quic_stream_index(c, id);
     if k >= 0 {
         return k;
@@ -1236,10 +1213,10 @@ fn qcn_stream_for_frame(c: & mut QuicConn, id: i64) -> i64 {
             lopened = c.local_uni_opened;
         }
         if seq < lopened {
-            return - 1;
+            return -1;
         }
         qcn_fail(c, QE_STREAM_STATE_ERROR, "a frame for a stream we did not open");
-        return - 2;
+        return -2;
     }
     var opened: i64 = c.peer_bidi_opened;
     var limit: i64 = c.max_streams_bidi_local;
@@ -1248,11 +1225,11 @@ fn qcn_stream_for_frame(c: & mut QuicConn, id: i64) -> i64 {
         limit = c.max_streams_uni_local;
     }
     if seq < opened {
-        return - 1;
+        return -1;
     }
     if seq >= limit {
         qcn_fail(c, QE_STREAM_LIMIT_ERROR, "the peer opened more streams than allowed");
-        return - 2;
+        return -2;
     }
     var n: i64 = opened;
     while n <= seq {
@@ -1272,7 +1249,7 @@ fn qcn_stream_for_frame(c: & mut QuicConn, id: i64) -> i64 {
 
 /// A stream whose both halves are over leaves the table; a peer's stream
 /// gives the peer one more stream of its kind (MAX_STREAMS).
-fn qcn_maybe_retire(c: & mut QuicConn, k: i64) {
+fn qcn_maybe_retire(c: &mut QuicConn, k: i64) {
     if k < 0 || k >= c.streams.len() {
         return;
     }
@@ -1305,9 +1282,9 @@ fn qcn_maybe_retire(c: & mut QuicConn, k: i64) {
 
 /// Open a bidirectional stream: its id, or -1 when the peer's stream
 /// limit is reached (or the connection is over).
-pub fn quic_open_bidi(c: & mut QuicConn) -> i64 {
+pub fn quic_open_bidi(c: &mut QuicConn) -> i64 {
     if c.state >= QS_CLOSING || c.local_bidi_opened >= c.max_streams_bidi_peer {
-        return - 1;
+        return -1;
     }
     var initiator: i64 = 0;
     if c.server {
@@ -1322,9 +1299,9 @@ pub fn quic_open_bidi(c: & mut QuicConn) -> i64 {
 
 /// Open a unidirectional stream (we send, the peer receives): its id, or
 /// -1 when the peer's limit is reached.
-pub fn quic_open_uni(c: & mut QuicConn) -> i64 {
+pub fn quic_open_uni(c: &mut QuicConn) -> i64 {
     if c.state >= QS_CLOSING || c.local_uni_opened >= c.max_streams_uni_peer {
-        return - 1;
+        return -1;
     }
     var initiator: i64 = 2;
     if c.server {
@@ -1339,7 +1316,7 @@ pub fn quic_open_uni(c: & mut QuicConn) -> i64 {
 
 /// Queue bytes on a stream, and the FIN after them when `fin`. False when
 /// the stream cannot be written: unknown, receive-only, finished or reset.
-pub fn quic_stream_write(c: & mut QuicConn, id: i64, data: Vec<i64>, fin: bool) -> bool {
+pub fn quic_stream_write(c: &mut QuicConn, id: i64, data: Vec<i64>, fin: bool) -> bool {
     if c.state >= QS_CLOSING {
         return false;
     }
@@ -1351,7 +1328,7 @@ pub fn quic_stream_write(c: & mut QuicConn, id: i64, data: Vec<i64>, fin: bool) 
     if s.fin_queued || s.reset_sent || s.stop_code >= 0 {
         return false;
     }
-    qcn_put(& mut s.pending, data);
+    qcn_put(&mut s.pending, data);
     if fin {
         s.fin_queued = true;
     }
@@ -1360,7 +1337,7 @@ pub fn quic_stream_write(c: & mut QuicConn, id: i64, data: Vec<i64>, fin: bool) 
 }
 
 /// The bytes queued on a stream and not sent yet.
-pub fn quic_stream_unsent(c: & QuicConn, id: i64) -> i64 {
+pub fn quic_stream_unsent(c: &QuicConn, id: i64) -> i64 {
     val k: i64 = quic_stream_index(c, id);
     if k < 0 {
         return 0;
@@ -1371,7 +1348,7 @@ pub fn quic_stream_unsent(c: & QuicConn, id: i64) -> i64 {
 
 /// Read what arrived in order on a stream since the last read ([] when
 /// nothing new). Reading opens the flow-control windows again.
-pub fn quic_stream_read(c: & mut QuicConn, id: i64) -> Vec<i64> {
+pub fn quic_stream_read(c: &mut QuicConn, id: i64) -> Vec<i64> {
     val k: i64 = quic_stream_index(c, id);
     if k < 0 {
         return qcn_none();
@@ -1399,7 +1376,7 @@ pub fn quic_stream_read(c: & mut QuicConn, id: i64) -> Vec<i64> {
 
 /// Whether the peer finished a stream and everything up to the FIN was
 /// read (also true for a stream already forgotten).
-pub fn quic_stream_finished(c: & QuicConn, id: i64) -> bool {
+pub fn quic_stream_finished(c: &QuicConn, id: i64) -> bool {
     val k: i64 = quic_stream_index(c, id);
     if k < 0 {
         return true;
@@ -1410,26 +1387,26 @@ pub fn quic_stream_finished(c: & QuicConn, id: i64) -> bool {
 
 /// The error code the peer reset a stream with (RESET_STREAM), -1 if it
 /// did not.
-pub fn quic_stream_reset_code(c: & QuicConn, id: i64) -> i64 {
+pub fn quic_stream_reset_code(c: &QuicConn, id: i64) -> i64 {
     val k: i64 = quic_stream_index(c, id);
     if k < 0 {
-        return - 1;
+        return -1;
     }
     return c.streams.get(k).peer_reset;
 }
 
 /// The error code the peer asked us to stop sending with (STOP_SENDING),
 /// -1 if it did not.
-pub fn quic_stream_stop_code(c: & QuicConn, id: i64) -> i64 {
+pub fn quic_stream_stop_code(c: &QuicConn, id: i64) -> i64 {
     val k: i64 = quic_stream_index(c, id);
     if k < 0 {
-        return - 1;
+        return -1;
     }
     return c.streams.get(k).stop_code;
 }
 
 /// Abandon sending on a stream: RESET_STREAM with `code`.
-pub fn quic_stream_reset(c: & mut QuicConn, id: i64, code: i64) {
+pub fn quic_stream_reset(c: &mut QuicConn, id: i64, code: i64) {
     val k: i64 = quic_stream_index(c, id);
     if k < 0 || (qcn_is_uni(id) && !qcn_is_local(c, id)) {
         return;
@@ -1452,7 +1429,7 @@ pub fn quic_stream_reset(c: & mut QuicConn, id: i64, code: i64) {
 
 /// Ask the peer to stop sending on a stream: STOP_SENDING with `code`;
 /// what still arrives is dropped.
-pub fn quic_stream_stop(c: & mut QuicConn, id: i64, code: i64) {
+pub fn quic_stream_stop(c: &mut QuicConn, id: i64, code: i64) {
     val k: i64 = quic_stream_index(c, id);
     if k < 0 || (qcn_is_uni(id) && qcn_is_local(c, id)) {
         return;
@@ -1470,14 +1447,14 @@ pub fn quic_stream_stop(c: & mut QuicConn, id: i64, code: i64) {
 }
 
 /// The streams the peer opened since the last call.
-pub fn quic_accept_streams(c: & mut QuicConn) -> Vec<i64> {
+pub fn quic_accept_streams(c: &mut QuicConn) -> Vec<i64> {
     val out: Vec<i64> = c.new_streams;
     c.new_streams = Vec::new();
     return out;
 }
 
 /// The streams with bytes to read or a FIN not read yet.
-pub fn quic_readable_streams(c: & QuicConn) -> Vec<i64> {
+pub fn quic_readable_streams(c: &QuicConn) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     var i: i64 = 0;
     while i < c.streams.len() {
@@ -1495,7 +1472,7 @@ pub fn quic_readable_streams(c: & QuicConn) -> Vec<i64> {
 /// Add `data` at `off` to a receive buffer: what continues the in-order
 /// bytes goes to `ready` (with any waiting pieces it now reaches), what is
 /// ahead waits; what was already received is dropped.
-fn qcn_recv_insert(r: & mut QRecv, off: i64, data: Vec<i64>) {
+fn qcn_recv_insert(r: &mut QRecv, off: i64, data: Vec<i64>) {
     val end: i64 = off + data.len();
     if end > r.highest {
         r.highest = end;
@@ -1546,7 +1523,7 @@ fn qcn_recv_insert(r: & mut QRecv, off: i64, data: Vec<i64>) {
 }
 
 /// The bytes waiting ahead of the in-order part.
-fn qcn_recv_buffered(r: & QRecv) -> i64 {
+fn qcn_recv_buffered(r: &QRecv) -> i64 {
     var n: i64 = 0;
     var k: i64 = 0;
     while k < r.chunks.len() {
@@ -1560,7 +1537,7 @@ fn qcn_recv_buffered(r: & QRecv) -> i64 {
 
 /// Process one UDP datagram from the peer (all the packets coalesced in
 /// it). Anything that does not decrypt is dropped, as RFC 9000 asks.
-pub fn quic_conn_recv(c: & mut QuicConn, d: Vec<i64>, now: i64) {
+pub fn quic_conn_recv(c: &mut QuicConn, d: Vec<i64>, now: i64) {
     if c.state == QS_CLOSED || c.state == QS_DRAINING {
         return;
     }
@@ -1605,8 +1582,7 @@ pub fn quic_conn_recv(c: & mut QuicConn, d: Vec<i64>, now: i64) {
         off = off + h.end;
         // Every packet is for one of our connection IDs (a client's first
         // Initials still carry the ID it chose: RFC 9000 §7.2)
-        val ours: bool = qcn_same(h.dcid, c.scid)
-            || (c.server && (h.ptype == QUIC_INITIAL || h.ptype == QUIC_0RTT) && qcn_same(h.dcid, c.odcid));
+        val ours: bool = qcn_same(h.dcid, c.scid) || (c.server && (h.ptype == QUIC_INITIAL || h.ptype == QUIC_0RTT) && qcn_same(h.dcid, c.odcid));
         if !ours {
             continue;
         }
@@ -1648,7 +1624,7 @@ pub fn quic_conn_recv(c: & mut QuicConn, d: Vec<i64>, now: i64) {
 /// follows the peer to a new address when a packet that is not only a
 /// probe arrives from it (RFC 9000 §9.3), validating it with
 /// PATH_CHALLENGE meanwhile; quic_conn_peer_addr tells where to send.
-pub fn quic_conn_recv_from(c: & mut QuicConn, d: Vec<i64>, addr: Vec<i64>, now: i64) {
+pub fn quic_conn_recv_from(c: &mut QuicConn, d: Vec<i64>, addr: Vec<i64>, now: i64) {
     if c.peer_addr.len() == 0 {
         c.peer_addr = addr;
     }
@@ -1662,12 +1638,12 @@ pub fn quic_conn_recv_from(c: & mut QuicConn, d: Vec<i64>, addr: Vec<i64>, now: 
 
 /// Where the connection's datagrams go: the peer address quic_conn_recv_from
 /// last settled on ([] when it was never given one).
-pub fn quic_conn_peer_addr(c: & QuicConn) -> Vec<i64> {
+pub fn quic_conn_peer_addr(c: &QuicConn) -> Vec<i64> {
     return c.peer_addr;
 }
 
 /// The index in local_cids of one of our connection IDs, -1 for none.
-fn qcn_local_cid_index(c: & QuicConn, cid: Vec<i64>) -> i64 {
+fn qcn_local_cid_index(c: &QuicConn, cid: Vec<i64>) -> i64 {
     var i: i64 = 0;
     while i < c.local_cids.len() {
         if qcn_same(c.local_cids.get(i), cid) {
@@ -1675,18 +1651,18 @@ fn qcn_local_cid_index(c: & QuicConn, cid: Vec<i64>) -> i64 {
         }
         i = i + 1;
     }
-    return - 1;
+    return -1;
 }
 
 /// Whether `cid` is one of this connection's IDs (a server routes short
 /// headers by it: the peer may use any ID we issued).
-pub fn quic_conn_owns_cid(c: & QuicConn, cid: Vec<i64>) -> bool {
+pub fn quic_conn_owns_cid(c: &QuicConn, cid: Vec<i64>) -> bool {
     return qcn_local_cid_index(c, cid) >= 0;
 }
 
 /// A Stateless Reset from the peer ends the connection at once: draining,
 /// nothing more sent (RFC 9000 §10.3.1).
-fn qcn_check_reset(c: & mut QuicConn, d: Vec<i64>, now: i64) {
+fn qcn_check_reset(c: &mut QuicConn, d: Vec<i64>, now: i64) {
     var hit: bool = c.dcid_token.len() == 16 && quic_is_stateless_reset(d, c.dcid_token);
     var i: i64 = 0;
     while i < c.spare_tokens.len() && !hit {
@@ -1709,7 +1685,7 @@ fn qcn_check_reset(c: & mut QuicConn, d: Vec<i64>, now: i64) {
 }
 
 /// Whether a stateless reset ended the connection.
-pub fn quic_conn_was_reset(c: & QuicConn) -> bool {
+pub fn quic_conn_was_reset(c: &QuicConn) -> bool {
     return c.reset_received;
 }
 
@@ -1717,7 +1693,7 @@ pub fn quic_conn_was_reset(c: & QuicConn) -> bool {
 /// for our IDs: RFC 9000 §6.2). One that lists the version we use is
 /// ignored; one that lists QUIC v1 when we started with another makes us
 /// go on in v1 (our Initial again, once); otherwise the attempt is over.
-fn qcn_version_neg(c: & mut QuicConn, p: Vec<i64>) {
+fn qcn_version_neg(c: &mut QuicConn, p: Vec<i64>) {
     if c.server || c.got_peer_packet || c.vn_done {
         return;
     }
@@ -1762,8 +1738,8 @@ fn qcn_version_neg(c: & mut QuicConn, p: Vec<i64>) {
     }
     sp.sent = Vec::new();
     sp.retx = Vec::new();
-    sp.loss_time = - 1;
-    sp.last_eliciting = - 1;
+    sp.loss_time = -1;
+    sp.last_eliciting = -1;
     sp.crypto_pending = c.initial_crypto;
     sp.crypto_off = 0;
     c.spaces.set(QL_INITIAL, sp);
@@ -1774,14 +1750,14 @@ fn qcn_version_neg(c: & mut QuicConn, p: Vec<i64>) {
 }
 
 /// Whether the client went on in QUIC v1 after a Version Negotiation.
-pub fn quic_conn_version_negotiated(c: & QuicConn) -> bool {
+pub fn quic_conn_version_negotiated(c: &QuicConn) -> bool {
     return c.vn_done && c.version == QUIC_V1 && c.state != QS_CLOSED;
 }
 
 /// A 0-RTT packet (server): opened with the early keys, numbered in the
 /// application space (its ACK goes in 1-RTT packets), its frames those a
 /// 0-RTT packet may carry (RFC 9000 §12.4).
-fn qcn_packet_early(c: & mut QuicConn, p: Vec<i64>, now: i64) {
+fn qcn_packet_early(c: &mut QuicConn, p: Vec<i64>, now: i64) {
     var sp: QSpace = c.spaces.get(QL_APP);
     val o: QuicOpened = quic_unprotect_long(c.early_rx, p, sp.largest_rx);
     if !o.ok {
@@ -1819,34 +1795,34 @@ fn qcn_packet_early(c: & mut QuicConn, p: Vec<i64>, now: i64) {
 
 /// Whether this connection resumed a session (a ticket), and whether its
 /// 0-RTT data was taken (client: the server said so; server: we did).
-pub fn quic_conn_resumed(c: & QuicConn) -> bool {
+pub fn quic_conn_resumed(c: &QuicConn) -> bool {
     return c.tls.resumed;
 }
 
-pub fn quic_conn_early_accepted(c: & QuicConn) -> bool {
+pub fn quic_conn_early_accepted(c: &QuicConn) -> bool {
     return c.tls.early_accepted;
 }
 
 /// Whether a client can write stream data now that goes out as 0-RTT.
-pub fn quic_conn_early_open(c: & QuicConn) -> bool {
+pub fn quic_conn_early_open(c: &QuicConn) -> bool {
     return !c.server && c.has_early_tx && c.state == QS_HANDSHAKE;
 }
 
 /// The latest session ticket the server gave this (client) connection,
 /// for QuicConfig.ticket of a later one; quic_conn_has_ticket tells
 /// whether there is one.
-pub fn quic_conn_ticket(c: & QuicConn) -> QuicTicket {
+pub fn quic_conn_ticket(c: &QuicConn) -> QuicTicket {
     return c.tls.ticket;
 }
 
-pub fn quic_conn_has_ticket(c: & QuicConn) -> bool {
+pub fn quic_conn_has_ticket(c: &QuicConn) -> bool {
     return c.tls.has_ticket;
 }
 
 /// A Retry from the server (client only, before any other server packet):
 /// check its tag, take its token and connection ID, and start again with
 /// Initial keys from that ID (RFC 9000 §17.2.5.2).
-fn qcn_retry(c: & mut QuicConn, p: Vec<i64>, h: QuicLongHeader) {
+fn qcn_retry(c: &mut QuicConn, p: Vec<i64>, h: QuicLongHeader) {
     if c.server || c.retried || c.got_peer_packet || h.token.len() == 0 || !qcn_same(h.dcid, c.scid) {
         return;
     }
@@ -1872,8 +1848,8 @@ fn qcn_retry(c: & mut QuicConn, p: Vec<i64>, h: QuicLongHeader) {
     }
     sp.sent = Vec::new();
     sp.retx = Vec::new();
-    sp.loss_time = - 1;
-    sp.last_eliciting = - 1;
+    sp.loss_time = -1;
+    sp.last_eliciting = -1;
     sp.crypto_pending = c.initial_crypto;
     sp.crypto_off = 0;
     sp.tx = qcn_keep_initial(c.dcid, false);
@@ -1890,7 +1866,7 @@ fn qcn_retry(c: & mut QuicConn, p: Vec<i64>, h: QuicLongHeader) {
 /// Try the keys of the next key phase on a 1-RTT packet that did not open
 /// with the current ones (RFC 9001 §6.2/§6.3), and the previous keys for a
 /// late packet of the old phase.
-fn qcn_open_short(c: & mut QuicConn, sp: & QSpace, p: Vec<i64>) -> QuicOpened {
+fn qcn_open_short(c: &mut QuicConn, sp: &QSpace, p: Vec<i64>) -> QuicOpened {
     val o: QuicOpened = quic_unprotect_short(sp.rx, p, c.scid.len(), sp.largest_rx);
     if o.ok || !c.hs_confirmed {
         return o;
@@ -1926,7 +1902,7 @@ fn qcn_open_short(c: & mut QuicConn, sp: & QSpace, p: Vec<i64>) -> QuicOpened {
 /// Start a key update (RFC 9001 §6.1): new 1-RTT keys for sending, the
 /// key-phase bit flips. False when one cannot start yet: the handshake is
 /// not confirmed, or the last update was not acknowledged.
-pub fn quic_conn_update_keys(c: & mut QuicConn) -> bool {
+pub fn quic_conn_update_keys(c: &mut QuicConn) -> bool {
     if !c.hs_confirmed || c.key_update_pn >= 0 || c.state != QS_ESTABLISHED {
         return false;
     }
@@ -1942,7 +1918,7 @@ pub fn quic_conn_update_keys(c: & mut QuicConn) -> bool {
 
 /// One packet at `level` (`p` is the packet; for a short header the rest
 /// of the datagram). True when it decrypted and was processed.
-fn qcn_packet(c: & mut QuicConn, level: i64, p: Vec<i64>, now: i64) -> bool {
+fn qcn_packet(c: &mut QuicConn, level: i64, p: Vec<i64>, now: i64) -> bool {
     val sp: QSpace = c.spaces.get(level);
     if !sp.has_rx || sp.discarded {
         return false;
@@ -1951,9 +1927,11 @@ fn qcn_packet(c: & mut QuicConn, level: i64, p: Vec<i64>, now: i64) -> bool {
         // 1-RTT before the client's Finished: not readable yet (RFC 9001 §5.7)
         return false;
     }
-    var o: QuicOpened = QuicOpened { ok: false, header: qcn_none(), pn: 0, payload: qcn_none(), end: 0 };
+    var o: QuicOpened = QuicOpened {
+        ok: false, header: qcn_none(), pn: 0, payload: qcn_none(), end: 0
+    };
     if level == QL_APP {
-        o = qcn_open_short(c, & sp, p);
+        o = qcn_open_short(c, &sp, p);
     } else {
         o = quic_unprotect_long(sp.rx, p, sp.largest_rx);
     }
@@ -2017,7 +1995,7 @@ fn qcn_non_probing(frames: Vec<QuicFrame>) -> bool {
 /// congestion control and the RTT estimate (RFC 9002 §9.4), and move to
 /// a fresh connection ID of the peer's when there is one (§9.5). Only on
 /// an established connection whose transport parameters allow migration.
-fn qcn_maybe_migrated(c: & mut QuicConn, now: i64) {
+fn qcn_maybe_migrated(c: &mut QuicConn, now: i64) {
     if c.rx_addr.len() == 0 || c.peer_addr.len() == 0 || qcn_same(c.rx_addr, c.peer_addr) {
         return;
     }
@@ -2030,7 +2008,7 @@ fn qcn_maybe_migrated(c: & mut QuicConn, now: i64) {
         c.peer_addr = c.rx_addr;
         c.path_validated = true;
         c.path_challenge = qcn_none();
-        c.path_deadline = - 1;
+        c.path_deadline = -1;
         return;
     }
     if c.path_validated {
@@ -2049,7 +2027,7 @@ fn qcn_maybe_migrated(c: & mut QuicConn, now: i64) {
 
 /// On a new path: a PATH_CHALLENGE to answer, its deadline, and congestion
 /// control and RTT from scratch.
-fn qcn_new_path(c: & mut QuicConn, now: i64) {
+fn qcn_new_path(c: &mut QuicConn, now: i64) {
     c.path_challenge = qcn_rand(c, 8);
     var f: QuicFrame = quic_frame_blank(QF_PATH_CHALLENGE);
     f.data = c.path_challenge;
@@ -2061,7 +2039,7 @@ fn qcn_new_path(c: & mut QuicConn, now: i64) {
     c.path_deadline = now + wait;
     c.cwnd = QCN_INITIAL_CWND;
     c.ssthresh = 4611686018427387903;
-    c.recovery_start = - 1;
+    c.recovery_start = -1;
     c.srtt = QCN_INITIAL_RTT;
     c.rttvar = QCN_INITIAL_RTT / 2;
     c.has_rtt = false;
@@ -2069,7 +2047,7 @@ fn qcn_new_path(c: & mut QuicConn, now: i64) {
 }
 
 /// Switch to the peer's next spare connection ID, retiring the one in use.
-fn qcn_use_spare_cid(c: & mut QuicConn) {
+fn qcn_use_spare_cid(c: &mut QuicConn) {
     var r: QuicFrame = quic_frame_blank(QF_RETIRE_CONNECTION_ID);
     r.seq = c.dcid_seq;
     c.ctrl.push(r);
@@ -2087,9 +2065,8 @@ fn qcn_use_spare_cid(c: & mut QuicConn) {
 /// path validation and restarts congestion control. False when it may
 /// not: before the handshake is confirmed, the server asked for no
 /// migration (disable_active_migration), or it gave us no spare ID.
-pub fn quic_conn_migrate(c: & mut QuicConn, now: i64) -> bool {
-    if c.server || c.state != QS_ESTABLISHED || !c.hs_confirmed || !c.has_peer_params
-        || c.peer.disable_active_migration || c.spare_cids.len() == 0 {
+pub fn quic_conn_migrate(c: &mut QuicConn, now: i64) -> bool {
+    if c.server || c.state != QS_ESTABLISHED || !c.hs_confirmed || !c.has_peer_params || c.peer.disable_active_migration || c.spare_cids.len() == 0 {
         return false;
     }
     qcn_use_spare_cid(c);
@@ -2100,18 +2077,18 @@ pub fn quic_conn_migrate(c: & mut QuicConn, now: i64) -> bool {
 
 /// Whether the current path is validated (our PATH_CHALLENGE answered),
 /// and how many times the connection moved to another path.
-pub fn quic_conn_path_validated(c: & QuicConn) -> bool {
+pub fn quic_conn_path_validated(c: &QuicConn) -> bool {
     return c.path_validated;
 }
 
-pub fn quic_conn_migrations(c: & QuicConn) -> i64 {
+pub fn quic_conn_migrations(c: &QuicConn) -> i64 {
     return c.migrations;
 }
 
 /// Issue connection IDs to the peer once the handshake is confirmed
 /// (RFC 9000 §5.1.1): up to the smaller of its active_connection_id_limit
 /// and ours, each with its stateless reset token.
-fn qcn_issue_cids(c: & mut QuicConn) {
+fn qcn_issue_cids(c: &mut QuicConn) {
     if !c.hs_confirmed || c.state != QS_ESTABLISHED || !c.has_peer_params {
         return;
     }
@@ -2136,7 +2113,7 @@ fn qcn_issue_cids(c: & mut QuicConn) {
 
 /// The peer retires one of our connection IDs (RFC 9000 §19.16): forget
 /// it and issue another.
-fn qcn_on_retire(c: & mut QuicConn, f: QuicFrame) {
+fn qcn_on_retire(c: &mut QuicConn, f: QuicFrame) {
     if f.seq >= c.next_local_seq {
         qcn_fail(c, QE_PROTOCOL_VIOLATION, "RETIRE_CONNECTION_ID for an ID we never issued");
         return;
@@ -2158,11 +2135,11 @@ fn qcn_on_retire(c: & mut QuicConn, f: QuicFrame) {
 }
 
 /// The connection IDs this connection answers to (a server routes by them).
-pub fn quic_conn_cids(c: & QuicConn) -> Vec<Vec<i64>> {
+pub fn quic_conn_cids(c: &QuicConn) -> Vec<Vec<i64>> {
     return c.local_cids;
 }
 
-fn qcn_frame(c: & mut QuicConn, level: i64, f: QuicFrame, now: i64) {
+fn qcn_frame(c: &mut QuicConn, level: i64, f: QuicFrame, now: i64) {
     val t: i64 = f.ftype;
     if t == QF_PADDING || t == QF_PING {
         return;
@@ -2217,12 +2194,11 @@ fn qcn_frame(c: & mut QuicConn, level: i64, f: QuicFrame, now: i64) {
         if c.path_challenge.len() == 8 && qcn_same(f.data, c.path_challenge) {
             c.path_validated = true;
             c.path_challenge = qcn_none();
-            c.path_deadline = - 1;
+            c.path_deadline = -1;
         }
         return;
     }
-    if t == QF_DATA_BLOCKED || t == QF_STREAM_DATA_BLOCKED
-        || t == QF_STREAMS_BLOCKED_BIDI || t == QF_STREAMS_BLOCKED_UNI {
+    if t == QF_DATA_BLOCKED || t == QF_STREAM_DATA_BLOCKED || t == QF_STREAMS_BLOCKED_BIDI || t == QF_STREAMS_BLOCKED_UNI {
         // our windows open as we read
         return;
     }
@@ -2292,10 +2268,10 @@ fn qcn_frame(c: & mut QuicConn, level: i64, f: QuicFrame, now: i64) {
     }
 }
 
-fn qcn_on_crypto(c: & mut QuicConn, level: i64, f: QuicFrame, now: i64) {
+fn qcn_on_crypto(c: &mut QuicConn, level: i64, f: QuicFrame, now: i64) {
     var sp: QSpace = c.spaces.get(level);
-    qcn_recv_insert(& mut sp.crypto_in, f.offset, f.data);
-    if qcn_recv_buffered(& sp.crypto_in) + sp.crypto_in.ready.len() > QCN_CRYPTO_BUFFER {
+    qcn_recv_insert(&mut sp.crypto_in, f.offset, f.data);
+    if qcn_recv_buffered(&sp.crypto_in) + sp.crypto_in.ready.len() > QCN_CRYPTO_BUFFER {
         c.spaces.set(level, sp);
         qcn_fail(c, QE_CRYPTO_BUFFER_EXCEEDED, "too much CRYPTO data out of order");
         return;
@@ -2306,12 +2282,12 @@ fn qcn_on_crypto(c: & mut QuicConn, level: i64, f: QuicFrame, now: i64) {
     c.spaces.set(level, sp);
     if got.len() > 0 {
         c.tls.now = now;
-        quic_tls_input(& mut c.tls, level, got);
+        quic_tls_input(&mut c.tls, level, got);
         qcn_after_tls(c, now);
     }
 }
 
-fn qcn_on_stream(c: & mut QuicConn, f: QuicFrame) {
+fn qcn_on_stream(c: &mut QuicConn, f: QuicFrame) {
     val id: i64 = f.stream_id;
     if qcn_is_uni(id) && qcn_is_local(c, id) {
         qcn_fail(c, QE_STREAM_STATE_ERROR, "STREAM on a send-only stream");
@@ -2346,14 +2322,14 @@ fn qcn_on_stream(c: & mut QuicConn, f: QuicFrame) {
         s.rx.fin_size = end;
     }
     if s.peer_reset < 0 && !s.stop_sent {
-        qcn_recv_insert(& mut s.rx, f.offset, f.data);
+        qcn_recv_insert(&mut s.rx, f.offset, f.data);
     } else if end > s.rx.highest {
         s.rx.highest = end;
     }
     c.streams.set(k, s);
 }
 
-fn qcn_on_reset(c: & mut QuicConn, f: QuicFrame) {
+fn qcn_on_reset(c: &mut QuicConn, f: QuicFrame) {
     val id: i64 = f.stream_id;
     if qcn_is_uni(id) && qcn_is_local(c, id) {
         qcn_fail(c, QE_STREAM_STATE_ERROR, "RESET_STREAM on a send-only stream");
@@ -2396,7 +2372,7 @@ fn qcn_on_reset(c: & mut QuicConn, f: QuicFrame) {
 
 /// A peer's NEW_CONNECTION_ID: kept as a spare; when it asks us to retire
 /// the ID in use, switch to a spare and retire the old ones.
-fn qcn_on_new_cid(c: & mut QuicConn, f: QuicFrame) {
+fn qcn_on_new_cid(c: &mut QuicConn, f: QuicFrame) {
     if c.dcid.len() == 0 {
         qcn_fail(c, QE_PROTOCOL_VIOLATION, "NEW_CONNECTION_ID with a zero-length connection ID in use");
         return;
@@ -2446,7 +2422,7 @@ fn qcn_on_new_cid(c: & mut QuicConn, f: QuicFrame) {
 
 // ─── ACKs, RTT, loss (RFC 9002) ─────────────────────────────────────────
 
-fn qcn_update_rtt(c: & mut QuicConn, latest: i64, ack_delay: i64) {
+fn qcn_update_rtt(c: &mut QuicConn, latest: i64, ack_delay: i64) {
     c.latest_rtt = latest;
     if !c.has_rtt {
         c.has_rtt = true;
@@ -2472,7 +2448,7 @@ fn qcn_update_rtt(c: & mut QuicConn, latest: i64, ack_delay: i64) {
 
 /// Frames of a lost (or probed) packet back to the queue: data again,
 /// window updates as fresh values, nothing for frames that need no resend.
-fn qcn_requeue(c: & mut QuicConn, sp: & mut QSpace, frames: Vec<QuicFrame>) {
+fn qcn_requeue(c: &mut QuicConn, sp: &mut QSpace, frames: Vec<QuicFrame>) {
     var i: i64 = 0;
     while i < frames.len() {
         val f: QuicFrame = frames.get(i);
@@ -2482,8 +2458,7 @@ fn qcn_requeue(c: & mut QuicConn, sp: & mut QSpace, frames: Vec<QuicFrame>) {
             if k >= 0 && !c.streams.get(k).reset_sent {
                 sp.retx.push(f);
             }
-        } else if t == QF_CRYPTO || t == QF_HANDSHAKE_DONE || t == QF_RESET_STREAM
-            || t == QF_STOP_SENDING || t == QF_RETIRE_CONNECTION_ID {
+        } else if t == QF_CRYPTO || t == QF_HANDSHAKE_DONE || t == QF_RESET_STREAM || t == QF_STOP_SENDING || t == QF_RETIRE_CONNECTION_ID {
             sp.retx.push(f);
         } else if t == QF_NEW_CONNECTION_ID {
             // again, unless the peer retired it meanwhile
@@ -2518,7 +2493,7 @@ fn qcn_requeue(c: & mut QuicConn, sp: & mut QSpace, frames: Vec<QuicFrame>) {
     }
 }
 
-fn qcn_on_ack(c: & mut QuicConn, level: i64, f: QuicFrame, now: i64) {
+fn qcn_on_ack(c: &mut QuicConn, level: i64, f: QuicFrame, now: i64) {
     var sp: QSpace = c.spaces.get(level);
     val largest: i64 = f.ranges.get(1);
     if largest >= sp.next_pn {
@@ -2588,7 +2563,7 @@ fn qcn_on_ack(c: & mut QuicConn, level: i64, f: QuicFrame, now: i64) {
         }
         if level == QL_APP && c.key_update_pn >= 0 && p.pn >= c.key_update_pn {
             // The peer has our new keys: the old receive keys can go
-            c.key_update_pn = - 1;
+            c.key_update_pn = -1;
         }
         var k: i64 = 0;
         while k < p.frames.len() {
@@ -2619,9 +2594,9 @@ fn qcn_on_ack(c: & mut QuicConn, level: i64, f: QuicFrame, now: i64) {
     qcn_detect_lost(c, level, now);
 }
 
-fn qcn_detect_lost(c: & mut QuicConn, level: i64, now: i64) {
+fn qcn_detect_lost(c: &mut QuicConn, level: i64, now: i64) {
     var sp: QSpace = c.spaces.get(level);
-    sp.loss_time = - 1;
+    sp.loss_time = -1;
     if sp.largest_acked < 0 {
         c.spaces.set(level, sp);
         return;
@@ -2653,7 +2628,7 @@ fn qcn_detect_lost(c: & mut QuicConn, level: i64, now: i64) {
         i = i + 1;
     }
     sp.sent = keep;
-    var newest_lost: i64 = - 1;
+    var newest_lost: i64 = -1;
     var j: i64 = 0;
     while j < lost.len() {
         val p: QSent = lost.get(j);
@@ -2663,7 +2638,7 @@ fn qcn_detect_lost(c: & mut QuicConn, level: i64, now: i64) {
                 newest_lost = p.time;
             }
         }
-        qcn_requeue(c, & mut sp, p.frames);
+        qcn_requeue(c, &mut sp, p.frames);
         c.packets_lost = c.packets_lost + 1;
         j = j + 1;
     }
@@ -2683,10 +2658,10 @@ fn qcn_detect_lost(c: & mut QuicConn, level: i64, now: i64) {
 }
 
 /// When the probe timeout of a space fires (-1: not armed).
-fn qcn_pto_time(c: & QuicConn, level: i64) -> i64 {
+fn qcn_pto_time(c: &QuicConn, level: i64) -> i64 {
     val sp: QSpace = c.spaces.get(level);
     if !sp.has_tx || sp.discarded {
-        return - 1;
+        return -1;
     }
     var eliciting: bool = false;
     var i: i64 = 0;
@@ -2704,7 +2679,7 @@ fn qcn_pto_time(c: & QuicConn, level: i64) -> i64 {
     }
     if level == QL_APP {
         if !c.hs_confirmed {
-            return - 1;
+            return -1;
         }
         if c.has_peer_params {
             dur = dur + c.peer.max_ack_delay;
@@ -2719,24 +2694,24 @@ fn qcn_pto_time(c: & QuicConn, level: i64) -> i64 {
     if !c.server && !c.hs_confirmed && level != QL_APP && c.state == QS_HANDSHAKE {
         val hs: QSpace = c.spaces.get(QL_HANDSHAKE);
         if level == QL_INITIAL && hs.has_tx {
-            return - 1;
+            return -1;
         }
         return c.last_send + dur;
     }
-    return - 1;
+    return -1;
 }
 
 /// When quic_conn_on_timeout should next be called (-1: no timer). The
 /// earliest of the loss timer, the probe timeout, the idle timeout and the
 /// end of the closing or draining period.
-pub fn quic_conn_timeout(c: & QuicConn) -> i64 {
+pub fn quic_conn_timeout(c: &QuicConn) -> i64 {
     if c.state == QS_CLOSED {
-        return - 1;
+        return -1;
     }
     if c.state == QS_CLOSING || c.state == QS_DRAINING {
         return c.close_deadline;
     }
-    var best: i64 = - 1;
+    var best: i64 = -1;
     if c.idle_ms > 0 {
         var idle: i64 = c.idle_ms;
         if idle < 3 * qcn_pto_base(c) {
@@ -2748,7 +2723,7 @@ pub fn quic_conn_timeout(c: & QuicConn) -> i64 {
         best = c.path_deadline;
     }
     var level: i64 = 0;
-    var loss: i64 = - 1;
+    var loss: i64 = -1;
     while level < 3 {
         val lt: i64 = c.spaces.get(level).loss_time;
         if lt >= 0 && (loss < 0 || lt < loss) {
@@ -2776,7 +2751,7 @@ pub fn quic_conn_timeout(c: & QuicConn) -> i64 {
 /// Run the timers that are due at `now`: loss detection, a probe (one or
 /// two ack-eliciting packets go out with the next quic_conn_send calls),
 /// the idle timeout and the end of closing or draining.
-pub fn quic_conn_on_timeout(c: & mut QuicConn, now: i64) {
+pub fn quic_conn_on_timeout(c: &mut QuicConn, now: i64) {
     c.now = now;
     if c.state == QS_CLOSED {
         return;
@@ -2805,7 +2780,7 @@ pub fn quic_conn_on_timeout(c: & mut QuicConn, now: i64) {
     if c.path_deadline >= 0 && now >= c.path_deadline {
         // The new path did not answer our PATH_CHALLENGE: a server goes
         // back to the address that was validated (RFC 9000 §9.3.2)
-        c.path_deadline = - 1;
+        c.path_deadline = -1;
         c.path_challenge = qcn_none();
         if c.server && !c.path_validated && c.prev_addr.len() > 0 {
             c.peer_addr = c.prev_addr;
@@ -2822,8 +2797,8 @@ pub fn quic_conn_on_timeout(c: & mut QuicConn, now: i64) {
         }
         level = level + 1;
     }
-    var pick: i64 = - 1;
-    var when: i64 = - 1;
+    var pick: i64 = -1;
+    var when: i64 = -1;
     level = 0;
     while level < 3 {
         val pt: i64 = qcn_pto_time(c, level);
@@ -2842,7 +2817,7 @@ pub fn quic_conn_on_timeout(c: & mut QuicConn, now: i64) {
     // Probe with the oldest data in flight (RFC 9002 §6.2.4)
     if sp.sent.len() > 0 {
         val oldest: QSent = sp.sent.get(0);
-        qcn_requeue(c, & mut sp, oldest.frames);
+        qcn_requeue(c, &mut sp, oldest.frames);
     }
     c.spaces.set(pick, sp);
 }
@@ -2860,12 +2835,12 @@ struct QBuild {
 }
 
 /// Add a frame if it fits. `keep`: remember it for retransmission.
-fn qcn_add(b: & mut QBuild, f: QuicFrame, keep: bool) -> bool {
+fn qcn_add(b: &mut QBuild, f: QuicFrame, keep: bool) -> bool {
     val enc: Vec<i64> = quic_frame_encode(f);
     if enc.len() > b.room - b.payload.len() {
         return false;
     }
-    qcn_put(& mut b.payload, enc);
+    qcn_put(&mut b.payload, enc);
     if keep {
         b.frames.push(f);
     }
@@ -2880,7 +2855,7 @@ fn qcn_add(b: & mut QBuild, f: QuicFrame, keep: bool) -> bool {
 }
 
 /// The ACK frame of a space.
-fn qcn_ack_frame(c: & QuicConn, level: i64, sp: & QSpace, now: i64) -> QuicFrame {
+fn qcn_ack_frame(c: &QuicConn, level: i64, sp: &QSpace, now: i64) -> QuicFrame {
     var f: QuicFrame = quic_frame_blank(QF_ACK);
     f.ranges = sp.recv;
     if level == QL_APP {
@@ -2894,7 +2869,7 @@ fn qcn_ack_frame(c: & QuicConn, level: i64, sp: & QSpace, now: i64) -> QuicFrame
 }
 
 /// Whether a space has anything to send.
-fn qcn_wants(c: & QuicConn, level: i64) -> bool {
+fn qcn_wants(c: &QuicConn, level: i64) -> bool {
     val sp: QSpace = c.spaces.get(level);
     if !sp.has_tx || sp.discarded {
         return false;
@@ -2911,8 +2886,7 @@ fn qcn_wants(c: & QuicConn, level: i64) -> bool {
     if c.state != QS_ESTABLISHED && !(c.server && c.tls.ap_ready) {
         return false;
     }
-    if c.handshake_done_pending || c.ctrl.len() > 0 || c.max_data_pending
-        || c.streams_bidi_pending || c.streams_uni_pending {
+    if c.handshake_done_pending || c.ctrl.len() > 0 || c.max_data_pending || c.streams_bidi_pending || c.streams_uni_pending {
         return true;
     }
     if !qcn_streams_open(c) {
@@ -2922,7 +2896,7 @@ fn qcn_wants(c: & QuicConn, level: i64) -> bool {
 }
 
 /// Whether a stream has data, a FIN or a window update to send.
-fn qcn_stream_data_waiting(c: & QuicConn) -> bool {
+fn qcn_stream_data_waiting(c: &QuicConn) -> bool {
     var i: i64 = 0;
     while i < c.streams.len() {
         val s: QStream = c.streams.get(i);
@@ -2941,7 +2915,7 @@ fn qcn_stream_data_waiting(c: & QuicConn) -> bool {
 }
 
 /// Whether a client has 0-RTT data to send (no 1-RTT keys yet).
-fn qcn_wants_early(c: & QuicConn) -> bool {
+fn qcn_wants_early(c: &QuicConn) -> bool {
     if c.server || !c.has_early_tx || c.spaces.get(QL_APP).has_tx || c.state != QS_HANDSHAKE {
         return false;
     }
@@ -2950,18 +2924,22 @@ fn qcn_wants_early(c: & QuicConn) -> bool {
 
 /// A 0-RTT packet's frames: what qcn_fill_app gives (stream data, window
 /// updates); no ACK or CRYPTO frame may go in 0-RTT.
-fn qcn_fill_early(c: & mut QuicConn, room: i64) -> QBuild {
-    var b: QBuild = QBuild { payload: Vec::new(), frames: Vec::new(), room: room, eliciting: false, path: false };
+fn qcn_fill_early(c: &mut QuicConn, room: i64) -> QBuild {
+    var b: QBuild = QBuild {
+        payload: Vec::new(), frames: Vec::new(), room: room, eliciting: false, path: false
+    };
     if c.bytes_in_flight + QUIC_DATAGRAM <= c.cwnd {
-        qcn_fill_app(c, & mut b);
+        qcn_fill_app(c, &mut b);
     }
     return b;
 }
 
 /// Fill a packet of `level` with what is waiting, within `room` bytes of
 /// frames. Returns the packet (empty payload when nothing went in).
-fn qcn_fill(c: & mut QuicConn, level: i64, room: i64, now: i64) -> QBuild {
-    var b: QBuild = QBuild { payload: Vec::new(), frames: Vec::new(), room: room, eliciting: false, path: false };
+fn qcn_fill(c: &mut QuicConn, level: i64, room: i64, now: i64) -> QBuild {
+    var b: QBuild = QBuild {
+        payload: Vec::new(), frames: Vec::new(), room: room, eliciting: false, path: false
+    };
     var sp: QSpace = c.spaces.get(level);
     if c.close_pending {
         var f: QuicFrame = quic_frame_blank(QF_CONNECTION_CLOSE);
@@ -2981,12 +2959,12 @@ fn qcn_fill(c: & mut QuicConn, level: i64, room: i64, now: i64) -> QBuild {
         if f.data.len() > 200 {
             f.data = quic_slice(f.data, 0, 200);
         }
-        qcn_add(& mut b, f, false);
+        qcn_add(&mut b, f, false);
         return b;
     }
     var acked: bool = false;
     if sp.recv.len() > 0 && sp.ack_needed {
-        if qcn_add(& mut b, qcn_ack_frame(c, level, & sp, now), false) {
+        if qcn_add(&mut b, qcn_ack_frame(c, level, &sp, now), false) {
             sp.ack_needed = false;
             acked = true;
         }
@@ -2998,7 +2976,7 @@ fn qcn_fill(c: & mut QuicConn, level: i64, room: i64, now: i64) -> QBuild {
         var i: i64 = 0;
         while i < sp.retx.len() {
             val f: QuicFrame = sp.retx.get(i);
-            if !qcn_add(& mut b, f, true) {
+            if !qcn_add(&mut b, f, true) {
                 keep.push(f);
             }
             i = i + 1;
@@ -3015,7 +2993,7 @@ fn qcn_fill(c: & mut QuicConn, level: i64, room: i64, now: i64) -> QBuild {
                 var f: QuicFrame = quic_frame_blank(QF_CRYPTO);
                 f.offset = sp.crypto_off;
                 f.data = quic_slice(sp.crypto_pending, 0, n);
-                if qcn_add(& mut b, f, true) {
+                if qcn_add(&mut b, f, true) {
                     sp.crypto_off = sp.crypto_off + n;
                     sp.crypto_pending = quic_slice(sp.crypto_pending, n, sp.crypto_pending.len());
                 }
@@ -3024,19 +3002,19 @@ fn qcn_fill(c: & mut QuicConn, level: i64, room: i64, now: i64) -> QBuild {
     }
     c.spaces.set(level, sp);
     if level == QL_APP && cc_ok {
-        qcn_fill_app(c, & mut b);
+        qcn_fill_app(c, &mut b);
     }
     var sp2: QSpace = c.spaces.get(level);
     if !acked && b.eliciting && sp2.recv.len() > 0 {
         // Piggyback an ACK on a packet that goes anyway
-        if qcn_add(& mut b, qcn_ack_frame(c, level, & sp2, now), false) {
+        if qcn_add(&mut b, qcn_ack_frame(c, level, &sp2, now), false) {
             sp2.ack_needed = false;
             c.spaces.set(level, sp2);
         }
     }
     if sp2.probes > 0 {
         if !b.eliciting {
-            qcn_add(& mut b, quic_frame_blank(QF_PING), false);
+            qcn_add(&mut b, quic_frame_blank(QF_PING), false);
         }
         sp2.probes = sp2.probes - 1;
         c.spaces.set(level, sp2);
@@ -3046,7 +3024,7 @@ fn qcn_fill(c: & mut QuicConn, level: i64, room: i64, now: i64) -> QBuild {
 
 /// The 1-RTT frames: HANDSHAKE_DONE, control frames, window updates, then
 /// stream data round-robin within the stream and connection windows.
-fn qcn_fill_app(c: & mut QuicConn, b: & mut QBuild) {
+fn qcn_fill_app(c: &mut QuicConn, b: &mut QBuild) {
     if c.handshake_done_pending {
         if qcn_add(b, quic_frame_blank(QF_HANDSHAKE_DONE), true) {
             c.handshake_done_pending = false;
@@ -3183,7 +3161,7 @@ fn qcn_space_of(level: i64) -> i64 {
 }
 
 /// The header length of a packet at `level` with a `pn_len`-byte number.
-fn qcn_header_len(c: & QuicConn, level: i64, pn_len: i64) -> i64 {
+fn qcn_header_len(c: &QuicConn, level: i64, pn_len: i64) -> i64 {
     if level == QL_APP {
         return 1 + c.dcid.len() + pn_len;
     }
@@ -3197,7 +3175,7 @@ fn qcn_header_len(c: & QuicConn, level: i64, pn_len: i64) -> i64 {
 /// The next datagram to send, [] when there is nothing (call again until
 /// it gives []). Initial, Handshake and 1-RTT packets are coalesced; a
 /// datagram with an Initial packet is padded to 1200 bytes.
-pub fn quic_conn_send(c: & mut QuicConn, now: i64) -> Vec<i64> {
+pub fn quic_conn_send(c: &mut QuicConn, now: i64) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     c.now = now;
     if c.state == QS_CLOSED || c.state == QS_DRAINING {
@@ -3257,7 +3235,9 @@ pub fn quic_conn_send(c: & mut QuicConn, now: i64) -> Vec<i64> {
             val pn_len: i64 = quic_pn_length(pn, sp.largest_acked);
             val room: i64 = limit - used - qcn_header_len(c, level, pn_len) - 16;
             if room >= 24 {
-                var b: QBuild = QBuild { payload: Vec::new(), frames: Vec::new(), room: room, eliciting: false, path: false };
+                var b: QBuild = QBuild {
+                    payload: Vec::new(), frames: Vec::new(), room: room, eliciting: false, path: false
+                };
                 if level == QL_0RTT {
                     b = qcn_fill_early(c, room);
                 } else {
@@ -3334,13 +3314,15 @@ pub fn quic_conn_send(c: & mut QuicConn, now: i64) -> Vec<i64> {
             sent_handshake = true;
         }
         val wire: Vec<i64> = quic_protect(keys, hdr, pn, b.payload);
-        qcn_put(& mut out, wire);
+        qcn_put(&mut out, wire);
         sp.next_pn = pn + 1;
         if b.eliciting {
             sp.last_eliciting = now;
             c.bytes_in_flight = c.bytes_in_flight + wire.len();
         }
-        sp.sent.push(QSent { pn: pn, time: now, size: wire.len(), ack_eliciting: b.eliciting, frames: b.frames });
+        sp.sent.push(QSent {
+            pn: pn, time: now, size: wire.len(), ack_eliciting: b.eliciting, frames: b.frames
+        });
         c.spaces.set(qcn_space_of(lv), sp);
         c.packets_sent = c.packets_sent + 1;
         if b.eliciting && !c.idle_restarted {

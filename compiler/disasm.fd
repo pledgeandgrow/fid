@@ -23,7 +23,11 @@
 // RISC-V assembler syntax for the others, with the usual aliases (mov,
 // cmp, cset, li, mv, j, ret). Branch targets are absolute addresses.
 
-module compiler::disasm; use core; use vec; use string; use compiler::nat_enc;
+module compiler::disasm;
+use core;
+use vec;
+use string;
+use compiler::nat_enc;
 
 pub const DSM_A64: i64 = 1;
 pub const DSM_RV64: i64 = 2;
@@ -58,7 +62,8 @@ pub fn disasm_arch_of(name: str) -> i64 {
 // --- Numbers -----------------------------------------------------------------
 
 /// `v` as `digits` lowercase hex digits (more when it needs them).
-@wrapping fn dsm_hex(v: i64, digits: i64) -> str {
+@wrapping
+fn dsm_hex(v: i64, digits: i64) -> str {
     var hexd: str = "0123456789abcdef";
     var out: str = "";
     var x: i64 = v;
@@ -73,7 +78,8 @@ pub fn disasm_arch_of(name: str) -> i64 {
 }
 
 /// A signed number in hex: 0x10, -0x10.
-@wrapping fn dsm_shex(v: i64) -> str {
+@wrapping
+fn dsm_shex(v: i64) -> str {
     if v < 0 {
         return "-0x" + dsm_hex(0 - v, 1);
     }
@@ -81,20 +87,22 @@ pub fn disasm_arch_of(name: str) -> i64 {
 }
 
 /// The low `bits` bits of `v` as a signed number.
-@wrapping fn dsm_sext(v: i64, bits: i64) -> i64 {
+@wrapping
+fn dsm_sext(v: i64, bits: i64) -> i64 {
     var m: i64 = 1 << (bits - 1);
     var x: i64 = v & ((1 << bits) - 1);
     return (x ^ m) - m;
 }
 
-fn dsm_u8(b: & Vec<i64>, at: i64) -> i64 {
+fn dsm_u8(b: &Vec<i64>, at: i64) -> i64 {
     if at < 0 || at >= b.len() {
         return 0;
     }
     return b.get(at) & 255;
 }
 
-@wrapping fn dsm_u(b: & Vec<i64>, at: i64, size: i64) -> i64 {
+@wrapping
+fn dsm_u(b: &Vec<i64>, at: i64, size: i64) -> i64 {
     var v: i64 = 0;
     var i: i64 = size - 1;
     while i >= 0 {
@@ -105,7 +113,7 @@ fn dsm_u8(b: & Vec<i64>, at: i64) -> i64 {
 }
 
 /// The little-endian 32-bit word at `at`.
-fn dsm_word(b: & Vec<i64>, at: i64) -> i64 {
+fn dsm_word(b: &Vec<i64>, at: i64) -> i64 {
     return dsm_u(b, at, 4) & 0xFFFFFFFF;
 }
 
@@ -219,7 +227,8 @@ pub struct DsmModrm {
     pub disp: i64,
 }
 
-@wrapping fn x64_modrm(b: & Vec<i64>, at: i64, rex: i64) -> DsmModrm {
+@wrapping
+fn x64_modrm(b: &Vec<i64>, at: i64, rex: i64) -> DsmModrm {
     var modrm: i64 = dsm_u8(b, at);
     var md: i64 = (modrm >> 6) & 3;
     var reg: i64 = ((modrm >> 3) & 7) | ((rex & 4) << 1);
@@ -286,7 +295,7 @@ pub struct DsmModrm {
         }
     }
     return DsmModrm {
-        len: len, reg: reg, rm_reg: - 1, mem: "[" + text + "]", rip: rip, disp: disp
+        len: len, reg: reg, rm_reg: -1, mem: "[" + text + "]", rip: rip, disp: disp
     };
 }
 
@@ -307,7 +316,8 @@ fn x64xmm(n: i64) -> str {
 }
 
 /// A rip-relative operand's target, once the instruction's end is known.
-@wrapping fn x64_rip_note(m: DsmModrm, end_addr: i64) -> str {
+@wrapping
+fn x64_rip_note(m: DsmModrm, end_addr: i64) -> str {
     if !m.rip {
         return "";
     }
@@ -518,33 +528,105 @@ pub const EFW_RV_AMOADD_D: i64 = 0x0000302F;
 pub const EFW_RV_AMOSWAP_D: i64 = 0x0800302F;
 
 // Field codes of the templates. AArch64:
-const EFF_XD: i64 = 1; const EFF_XDS: i64 = 2; const EFF_WD: i64 = 3; const EFF_XN: i64 = 4;
-const EFF_XNS: i64 = 5; const EFF_WN: i64 = 6; const EFF_XM: i64 = 7; const EFF_WM: i64 = 8;
-const EFF_XA: i64 = 9; const EFF_DD: i64 = 10; const EFF_DN: i64 = 11; const EFF_DM: i64 = 12;
-const EFF_DA: i64 = 13; const EFF_SD: i64 = 14; const EFF_SN: i64 = 15; const EFF_IMM12: i64 = 16;
-const EFF_SH12: i64 = 17; const EFF_SHIFT: i64 = 18; const EFF_COND: i64 = 19; const EFF_NCOND: i64 = 20;
-const EFF_IMMR: i64 = 21; const EFF_IMMS: i64 = 22; const EFF_LSL6: i64 = 23; const EFF_IMM16: i64 = 24;
-const EFF_HW: i64 = 25; const EFF_B26: i64 = 26; const EFF_B19: i64 = 27; const EFF_B14: i64 = 28;
-const EFF_TBIT: i64 = 29; const EFF_ADRP: i64 = 30; const EFF_ADR: i64 = 31; const EFF_UOFF: i64 = 32;
-const EFF_SIMM7: i64 = 33; const EFF_XT2: i64 = 34; const EFF_QD: i64 = 35; const EFF_VD: i64 = 36;
-const EFF_VN: i64 = 37; const EFF_VM: i64 = 38; const EFF_IDX1: i64 = 39; const EFF_COND0: i64 = 40;
-const EFF_TBR: i64 = 41; const EFF_IMM16D: i64 = 42; const EFF_RSC: i64 = 43;
+const EFF_XD: i64 = 1;
+const EFF_XDS: i64 = 2;
+const EFF_WD: i64 = 3;
+const EFF_XN: i64 = 4;
+const EFF_XNS: i64 = 5;
+const EFF_WN: i64 = 6;
+const EFF_XM: i64 = 7;
+const EFF_WM: i64 = 8;
+const EFF_XA: i64 = 9;
+const EFF_DD: i64 = 10;
+const EFF_DN: i64 = 11;
+const EFF_DM: i64 = 12;
+const EFF_DA: i64 = 13;
+const EFF_SD: i64 = 14;
+const EFF_SN: i64 = 15;
+const EFF_IMM12: i64 = 16;
+const EFF_SH12: i64 = 17;
+const EFF_SHIFT: i64 = 18;
+const EFF_COND: i64 = 19;
+const EFF_NCOND: i64 = 20;
+const EFF_IMMR: i64 = 21;
+const EFF_IMMS: i64 = 22;
+const EFF_LSL6: i64 = 23;
+const EFF_IMM16: i64 = 24;
+const EFF_HW: i64 = 25;
+const EFF_B26: i64 = 26;
+const EFF_B19: i64 = 27;
+const EFF_B14: i64 = 28;
+const EFF_TBIT: i64 = 29;
+const EFF_ADRP: i64 = 30;
+const EFF_ADR: i64 = 31;
+const EFF_UOFF: i64 = 32;
+const EFF_SIMM7: i64 = 33;
+const EFF_XT2: i64 = 34;
+const EFF_QD: i64 = 35;
+const EFF_VD: i64 = 36;
+const EFF_VN: i64 = 37;
+const EFF_VM: i64 = 38;
+const EFF_IDX1: i64 = 39;
+const EFF_COND0: i64 = 40;
+const EFF_TBR: i64 = 41;
+const EFF_IMM16D: i64 = 42;
+const EFF_RSC: i64 = 43;
 // RISC-V:
-const EFF_RD: i64 = 50; const EFF_RS1: i64 = 51; const EFF_RS2: i64 = 52; const EFF_FD: i64 = 53;
-const EFF_FS1: i64 = 54; const EFF_FS2: i64 = 55; const EFF_FS3: i64 = 56; const EFF_IMMI: i64 = 57;
-const EFF_IMMST: i64 = 58; const EFF_SHAMT6: i64 = 59; const EFF_SHAMT5: i64 = 60; const EFF_BOFF: i64 = 61;
-const EFF_JOFF: i64 = 62; const EFF_UIMM20: i64 = 63; const EFF_RM: i64 = 64; const EFF_RVD: i64 = 65;
-const EFF_RVS1: i64 = 66; const EFF_RVS2: i64 = 67; const EFF_VTYPE: i64 = 68; const EFF_AQRL: i64 = 69;
-const EFF_FSAME: i64 = 70; const EFF_RMD: i64 = 71;
+const EFF_RD: i64 = 50;
+const EFF_RS1: i64 = 51;
+const EFF_RS2: i64 = 52;
+const EFF_FD: i64 = 53;
+const EFF_FS1: i64 = 54;
+const EFF_FS2: i64 = 55;
+const EFF_FS3: i64 = 56;
+const EFF_IMMI: i64 = 57;
+const EFF_IMMST: i64 = 58;
+const EFF_SHAMT6: i64 = 59;
+const EFF_SHAMT5: i64 = 60;
+const EFF_BOFF: i64 = 61;
+const EFF_JOFF: i64 = 62;
+const EFF_UIMM20: i64 = 63;
+const EFF_RM: i64 = 64;
+const EFF_RVD: i64 = 65;
+const EFF_RVS1: i64 = 66;
+const EFF_RVS2: i64 = 67;
+const EFF_VTYPE: i64 = 68;
+const EFF_AQRL: i64 = 69;
+const EFF_FSAME: i64 = 70;
+const EFF_RMD: i64 = 71;
 // x86-64 (ModRM operands, immediates):
-const EFF_R: i64 = 80; const EFF_R8: i64 = 81; const EFF_R32: i64 = 82; const EFF_R64: i64 = 83;
-const EFF_RW: i64 = 84; const EFF_RM: i64 = 85; const EFF_RMS: i64 = 86; const EFF_RM8: i64 = 87;
-const EFF_RM8S: i64 = 88; const EFF_RM16S: i64 = 89; const EFF_RM32: i64 = 90; const EFF_RM32S: i64 = 91;
-const EFF_RM64: i64 = 92; const EFF_RM64S: i64 = 93; const EFF_RMW: i64 = 94; const EFF_RMWS: i64 = 95;
-const EFF_X: i64 = 96; const EFF_XRM: i64 = 97; const EFF_V: i64 = 98; const EFF_VV: i64 = 99;
-const EFF_VRM: i64 = 100; const EFF_GV: i64 = 101; const EFF_ACC: i64 = 102; const EFF_OREG: i64 = 103;
-const EFF_IB: i64 = 104; const EFF_IBX: i64 = 105; const EFF_SB: i64 = 106; const EFF_SZ: i64 = 107;
-const EFF_UZ: i64 = 108; const EFF_IQ: i64 = 109; const EFF_DQ: i64 = 110; const EFF_XV: i64 = 111;
+const EFF_R: i64 = 80;
+const EFF_R8: i64 = 81;
+const EFF_R32: i64 = 82;
+const EFF_R64: i64 = 83;
+const EFF_RW: i64 = 84;
+const EFF_RM: i64 = 85;
+const EFF_RMS: i64 = 86;
+const EFF_RM8: i64 = 87;
+const EFF_RM8S: i64 = 88;
+const EFF_RM16S: i64 = 89;
+const EFF_RM32: i64 = 90;
+const EFF_RM32S: i64 = 91;
+const EFF_RM64: i64 = 92;
+const EFF_RM64S: i64 = 93;
+const EFF_RMW: i64 = 94;
+const EFF_RMWS: i64 = 95;
+const EFF_X: i64 = 96;
+const EFF_XRM: i64 = 97;
+const EFF_V: i64 = 98;
+const EFF_VV: i64 = 99;
+const EFF_VRM: i64 = 100;
+const EFF_GV: i64 = 101;
+const EFF_ACC: i64 = 102;
+const EFF_OREG: i64 = 103;
+const EFF_IB: i64 = 104;
+const EFF_IBX: i64 = 105;
+const EFF_SB: i64 = 106;
+const EFF_SZ: i64 = 107;
+const EFF_UZ: i64 = 108;
+const EFF_IQ: i64 = 109;
+const EFF_DQ: i64 = 110;
+const EFF_XV: i64 = 111;
 
 /// A template field's code, 0 when `name` is not a field.
 fn ef_field_code(name: str) -> i64 {
@@ -578,16 +660,16 @@ fn ef_field_code(name: str) -> i64 {
 // The table, built once (ef_init). One entry per row in each Vec.
 var g_ef_ready: bool = false;
 var g_ef_arch: Vec<i64> = Vec::new();
-var g_ef_base: Vec<i64> = Vec::new();   // A64/RV: fixed bits; x64: opcode byte
-var g_ef_mask: Vec<i64> = Vec::new();   // A64/RV: the bits base fixes
-var g_ef_prio: Vec<i64> = Vec::new();   // 0: an alias, matched first
+var g_ef_base: Vec<i64> = Vec::new();  // A64/RV: fixed bits; x64: opcode byte
+var g_ef_mask: Vec<i64> = Vec::new();  // A64/RV: the bits base fixes
+var g_ef_prio: Vec<i64> = Vec::new();  // 0: an alias, matched first
 var g_ef_tmpl: Vec<str> = Vec::new();
-var g_ef_fields: Vec<i64> = Vec::new(); // EF_MAXF field codes per row, 0 = none
-var g_ef_pre: Vec<i64> = Vec::new();    // x64: -1 any, 0 none, 0x66 / 0xF2 / 0xF3
-var g_ef_map: Vec<i64> = Vec::new();    // x64: 0 one byte, 1 0F, 2 0F 38, 3 0F 3A
-var g_ef_dig: Vec<i64> = Vec::new();    // x64: ModRM.reg digit, -1 /r, -2 no ModRM, -3 +r
-var g_ef_w: Vec<i64> = Vec::new();      // x64: REX/VEX.W -1 any, 0, 1
-var g_ef_vex: Vec<i64> = Vec::new();    // x64: 1 a VEX form
+var g_ef_fields: Vec<i64> = Vec::new();  // EF_MAXF field codes per row, 0 = none
+var g_ef_pre: Vec<i64> = Vec::new();  // x64: -1 any, 0 none, 0x66 / 0xF2 / 0xF3
+var g_ef_map: Vec<i64> = Vec::new();  // x64: 0 one byte, 1 0F, 2 0F 38, 3 0F 3A
+var g_ef_dig: Vec<i64> = Vec::new();  // x64: ModRM.reg digit, -1 /r, -2 no ModRM, -3 +r
+var g_ef_w: Vec<i64> = Vec::new();  // x64: REX/VEX.W -1 any, 0, 1
+var g_ef_vex: Vec<i64> = Vec::new();  // x64: 1 a VEX form
 var g_ef_order: Vec<i64> = Vec::new();  // rows in match order (by arch, priority)
 var g_ef_errors: Vec<str> = Vec::new();
 
@@ -1200,7 +1282,8 @@ pub fn ef_mask(id: i64) -> i64 {
 }
 
 /// The bits of an AArch64 / RISC-V field holding `v` (the encoder side).
-@wrapping fn ef_put(code: i64, v: i64) -> i64 {
+@wrapping
+fn ef_put(code: i64, v: i64) -> i64 {
     if code == EFF_XD || code == EFF_XDS || code == EFF_WD || code == EFF_DD || code == EFF_SD || code == EFF_QD || code == EFF_VD {
         return v & 31;
     }
@@ -1331,7 +1414,8 @@ pub fn ef_mask(id: i64) -> i64 {
 }
 
 /// The bits a field occupies (for ef_check).
-@wrapping fn ef_field_bits(code: i64) -> i64 {
+@wrapping
+fn ef_field_bits(code: i64) -> i64 {
     if code == EFF_SHIFT {
         return (63 << 10) | (3 << 22);
     }
@@ -1381,7 +1465,8 @@ pub fn ef_mask(id: i64) -> i64 {
 /// AArch64 / RISC-V: the word of row `id` with operands a, b, c, d in the
 /// order its template names them (unused ones 0). `ef_word(ef_id(DSM_A64,
 /// "add {xd}, {xn}, {xm}{shift}"), 0, 1, 2, 0)` is `add x0, x1, x2`.
-@wrapping pub fn ef_word(id: i64, a: i64, b: i64, c: i64, d: i64) -> i64 {
+@wrapping
+pub fn ef_word(id: i64, a: i64, b: i64, c: i64, d: i64) -> i64 {
     ef_init();
     var w: i64 = g_ef_base.get(id);
     var ops: Vec<i64> = Vec::new();
@@ -1439,7 +1524,8 @@ fn ef_word_ok(id: i64, w: i64) -> bool {
 }
 
 /// One AArch64 / RISC-V field of word `w` (at address `pc`) as text.
-@wrapping fn ef_field_text(code: i64, w: i64, pc: i64) -> str {
+@wrapping
+fn ef_field_text(code: i64, w: i64, pc: i64) -> str {
     var d: i64 = w & 31;
     var n: i64 = (w >> 5) & 31;
     var m: i64 = (w >> 16) & 31;
@@ -1850,7 +1936,8 @@ fn ef_match_x64(vex: i64, map: i64, op: i64, mand: i64, reg: i64, w: bool) -> i6
 /// fields on the same bits, base bits outside the mask, a row no word can
 /// reach (an earlier row in match order takes every word it has). Empty
 /// when the table is sound.
-@wrapping pub fn ef_check() -> Vec<str> {
+@wrapping
+pub fn ef_check() -> Vec<str> {
     ef_init();
     var out: Vec<str> = Vec::new();
     var e: i64 = 0;
@@ -1922,7 +2009,8 @@ fn ef_match_x64(vex: i64, map: i64, op: i64, mand: i64, reg: i64, w: bool) -> i6
 
 /// One AArch64 instruction at address `pc`: its row in the table of
 /// encoding forms (ef_init_a64), else `.word`.
-@wrapping pub fn dsm_a64(w: i64, pc: i64) -> str {
+@wrapping
+pub fn dsm_a64(w: i64, pc: i64) -> str {
     var t: str = ef_decode_word(DSM_A64, w, pc);
     if t != "" {
         return t;
@@ -1932,7 +2020,8 @@ fn ef_match_x64(vex: i64, map: i64, op: i64, mand: i64, reg: i64, w: bool) -> i6
 
 /// One RISC-V instruction at address `pc`: its row in the table
 /// (ef_init_rv), else `.word`.
-@wrapping pub fn dsm_rv(w: i64, pc: i64) -> str {
+@wrapping
+pub fn dsm_rv(w: i64, pc: i64) -> str {
     var t: str = ef_decode_word(DSM_RV64, w, pc);
     if t != "" {
         return t;
@@ -1943,7 +2032,8 @@ fn ef_match_x64(vex: i64, map: i64, op: i64, mand: i64, reg: i64, w: bool) -> i6
 /// The text of x86-64 field `code`: an operand of ModRM `m`, or an
 /// immediate at b[imm] (its length in .len). `size` is the operand size,
 /// `vl` VEX.L, `vvvv` the VEX register, `op` the opcode byte.
-@wrapping fn x64_field_text(code: i64, b: & Vec<i64>, imm: i64, m: DsmModrm, size: i64, rex: i64, has_rex: bool, wide: bool, vl: bool, vvvv: i64, op: i64, seg: str) -> DsmInsn {
+@wrapping
+fn x64_field_text(code: i64, b: &Vec<i64>, imm: i64, m: DsmModrm, size: i64, rex: i64, has_rex: bool, wide: bool, vl: bool, vvvv: i64, op: i64, seg: str) -> DsmInsn {
     var mseg: str = "";
     if m.rm_reg < 0 {
         mseg = seg;
@@ -2073,7 +2163,8 @@ fn ef_match_x64(vex: i64, map: i64, op: i64, mand: i64, reg: i64, w: bool) -> i6
 
 /// An x86-64 row rendered: `head` bytes before the ModRM (prefixes, REX or
 /// VEX, opcode), the ModRM at b[at + head] unless the row has none.
-@wrapping fn x64_render(id: i64, b: & Vec<i64>, at: i64, head: i64, addr: i64, rex: i64, has_rex: bool, size: i64, vl: bool, vvvv: i64, op: i64, seg: str, lock: str) -> DsmInsn {
+@wrapping
+fn x64_render(id: i64, b: &Vec<i64>, at: i64, head: i64, addr: i64, rex: i64, has_rex: bool, size: i64, vl: bool, vvvv: i64, op: i64, seg: str, lock: str) -> DsmInsn {
     var dig: i64 = g_ef_dig.get(id);
     var m: DsmModrm = DsmModrm {
         len: 0, reg: 0, rm_reg: 0, mem: "", rip: false, disp: 0
@@ -2118,7 +2209,8 @@ fn ef_match_x64(vex: i64, map: i64, op: i64, mand: i64, reg: i64, w: bool) -> i6
 /// VEX and the opcode, then its row in the table of encoding forms
 /// (ef_init_x64); branches, the one-byte forms without operands and the
 /// system instructions are named here.
-@wrapping pub fn dsm_x64(b: & Vec<i64>, at: i64, addr: i64) -> DsmInsn {
+@wrapping
+pub fn dsm_x64(b: &Vec<i64>, at: i64, addr: i64) -> DsmInsn {
     var p: i64 = at;
     var opsize16: bool = false;
     var rep: i64 = 0;
@@ -2318,7 +2410,8 @@ fn dsm_x64_ends_flow(text: str) -> bool {
 /// end (the padding between functions) and, on x86-64, the zeros after a
 /// jump up to an aligned loop head are each shown as one line
 /// `(N zero bytes of padding)`, not decoded as instructions.
-@wrapping pub fn disasm_bytes(b: & Vec<i64>, from: i64, to: i64, arch: i64, addr: i64) -> str {
+@wrapping
+pub fn disasm_bytes(b: &Vec<i64>, from: i64, to: i64, arch: i64, addr: i64) -> str {
     ef_init();
     var out: str = "";
     var end: i64 = to;
@@ -2405,7 +2498,7 @@ fn dsm_x64_ends_flow(text: str) -> bool {
 }
 
 /// The NUL-ended name at `off` of an image.
-fn dsm_cstr(b: & Vec<i64>, off: i64) -> str {
+fn dsm_cstr(b: &Vec<i64>, off: i64) -> str {
     var out: str = "";
     var i: i64 = off;
     while i >= 0 && i < b.len() && dsm_u8(b, i) != 0 && i - off < 512 {
@@ -2416,7 +2509,7 @@ fn dsm_cstr(b: & Vec<i64>, off: i64) -> str {
 }
 
 /// An ELF executable's functions (its .symtab), or the one named `name`.
-fn disasm_elf(b: & Vec<i64>, name: str) -> str {
+fn disasm_elf(b: &Vec<i64>, name: str) -> str {
     var machine: i64 = dsm_u(b, 0x12, 2);
     var arch: i64 = 0;
     if machine == 62 {
@@ -2479,7 +2572,7 @@ fn disasm_elf(b: & Vec<i64>, name: str) -> str {
 
 /// A PE executable's functions (the COFF symbols nat_pe_symbols writes),
 /// or the one named `name`. x86-64 only.
-fn disasm_pe(b: & Vec<i64>, name: str) -> str {
+fn disasm_pe(b: &Vec<i64>, name: str) -> str {
     var pe: i64 = dsm_u(b, 0x3C, 4);
     var coff: i64 = pe + 4;
     var nsec: i64 = dsm_u(b, coff + 2, 2);
@@ -2547,16 +2640,16 @@ fn disasm_pe(b: & Vec<i64>, name: str) -> str {
 /// or a PE from the machine layer; `name` "" for every function.
 pub fn disasm_image(bytes: Vec<i64>, name: str) -> str {
     var b: Vec<i64> = bytes;
-    if b.len() >= 64 && dsm_u8(& b, 0) == 0x7F && dsm_u8(& b, 1) == 0x45 && dsm_u8(& b, 2) == 0x4C && dsm_u8(& b, 3) == 0x46 {
-        return disasm_elf(& b, name);
+    if b.len() >= 64 && dsm_u8(&b, 0) == 0x7F && dsm_u8(&b, 1) == 0x45 && dsm_u8(&b, 2) == 0x4C && dsm_u8(&b, 3) == 0x46 {
+        return disasm_elf(&b, name);
     }
-    if b.len() >= 256 && dsm_u8(& b, 0) == 0x4D && dsm_u8(& b, 1) == 0x5A {
-        return disasm_pe(& b, name);
+    if b.len() >= 256 && dsm_u8(&b, 0) == 0x4D && dsm_u8(&b, 1) == 0x5A {
+        return disasm_pe(&b, name);
     }
-    if b.len() >= 4 && (dsm_u(& b, 0, 4) & 0xFFFFFFFE) == 0xFEEDFACE {
+    if b.len() >= 4 && (dsm_u(&b, 0, 4) & 0xFFFFFFFE) == 0xFEEDFACE {
         return "fid disasm: a Mach-O: use a Linux --target (the code is the same) or llvm-objdump -d\n";
     }
-    if b.len() >= 4 && dsm_u(& b, 0, 4) == 0xFEEDFACF {
+    if b.len() >= 4 && dsm_u(&b, 0, 4) == 0xFEEDFACF {
         return "fid disasm: a Mach-O: use a Linux --target (the code is the same) or llvm-objdump -d\n";
     }
     return "fid disasm: not an ELF or PE executable (for bare code: --raw --arch <a>)\n";

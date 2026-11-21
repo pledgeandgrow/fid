@@ -27,7 +27,7 @@
 //   if evs.len() > 0 { println(evs.get(0).data); }
 
 module sse;
- use vec;
+use vec;
 
 /// An event. `retry` (encoding only) is -1 when not sent.
 pub struct SseEvent {
@@ -39,7 +39,9 @@ pub struct SseEvent {
 
 /// An event to encode (no retry). Use "" for no type / no id.
 pub fn sse_event(event: str, data: str, id: str) -> SseEvent {
-    return SseEvent { event: event, data: data, id: id, retry: - 1 };
+    return SseEvent {
+        event: event, data: data, id: id, retry: -1
+    };
 }
 
 fn sse_has_break(s: str) -> bool {
@@ -106,18 +108,20 @@ pub fn sse_response_headers() -> Vec<str> {
 // ─── parsing ────────────────────────────────────────────────────────────
 
 pub struct SseParser {
-    pub line: Vec<i64>,      // bytes of the unfinished line
-    pub after_cr: bool,      // the last byte was a CR ending a line
-    pub started: bool,       // the BOM check is done
+    pub line: Vec<i64>,  // bytes of the unfinished line
+    pub after_cr: bool,  // the last byte was a CR ending a line
+    pub started: bool,  // the BOM check is done
     pub data: str,
-    pub has_data: bool,      // the data buffer is not empty
+    pub has_data: bool,  // the data buffer is not empty
     pub event_type: str,
-    pub last_id: str,        // the last event ID buffer
-    pub retry: i64,          // the reconnection time, -1 until set
+    pub last_id: str,  // the last event ID buffer
+    pub retry: i64,  // the reconnection time, -1 until set
 }
 
 pub fn sse_parser_new() -> SseParser {
-    return SseParser { line: Vec::new(), after_cr: false, started: false, data: "", has_data: false, event_type: "", last_id: "", retry: - 1 };
+    return SseParser {
+        line: Vec::new(), after_cr: false, started: false, data: "", has_data: false, event_type: "", last_id: "", retry: -1
+    };
 }
 
 fn sse_all_digits(s: str) -> bool {
@@ -135,7 +139,7 @@ fn sse_all_digits(s: str) -> bool {
     return true;
 }
 
-fn sse_dispatch(p: & mut SseParser, out: & mut Vec<SseEvent>) {
+fn sse_dispatch(p: &mut SseParser, out: &mut Vec<SseEvent>) {
     if !p.has_data {
         p.data = "";
         p.event_type = "";
@@ -149,13 +153,15 @@ fn sse_dispatch(p: & mut SseParser, out: & mut Vec<SseEvent>) {
     if str_len(t) == 0 {
         t = "message";
     }
-    out.push(SseEvent { event: t, data: d, id: p.last_id, retry: - 1 });
+    out.push(SseEvent {
+        event: t, data: d, id: p.last_id, retry: -1
+    });
     p.data = "";
     p.has_data = false;
     p.event_type = "";
 }
 
-fn sse_process_line(p: & mut SseParser, line: str, out: & mut Vec<SseEvent>) {
+fn sse_process_line(p: &mut SseParser, line: str, out: &mut Vec<SseEvent>) {
     if str_len(line) == 0 {
         sse_dispatch(p, out);
         return;
@@ -189,14 +195,14 @@ fn sse_process_line(p: & mut SseParser, line: str, out: & mut Vec<SseEvent>) {
     }
 }
 
-fn sse_end_line(p: & mut SseParser, out: & mut Vec<SseEvent>) {
+fn sse_end_line(p: &mut SseParser, out: &mut Vec<SseEvent>) {
     val line: str = str_from_bytes(p.line);
     p.line = Vec::new();
     sse_process_line(p, line, out);
 }
 
 /// Feed bytes (0..255 each); the events dispatched by them.
-pub fn sse_feed_bytes(p: & mut SseParser, chunk: Vec<i64>) -> Vec<SseEvent> {
+pub fn sse_feed_bytes(p: &mut SseParser, chunk: Vec<i64>) -> Vec<SseEvent> {
     var out: Vec<SseEvent> = Vec::new();
     var i: i64 = 0;
     // a UTF-8 BOM at the very start of the stream is dropped once
@@ -240,10 +246,10 @@ pub fn sse_feed_bytes(p: & mut SseParser, chunk: Vec<i64>) -> Vec<SseEvent> {
             if p.after_cr {
                 p.after_cr = false;  // the LF of a CRLF
             } else {
-                sse_end_line(p, & mut out);
+                sse_end_line(p, &mut out);
             }
         } else if c == 13 {
-            sse_end_line(p, & mut out);
+            sse_end_line(p, &mut out);
             p.after_cr = true;
         } else {
             p.after_cr = false;
@@ -255,14 +261,14 @@ pub fn sse_feed_bytes(p: & mut SseParser, chunk: Vec<i64>) -> Vec<SseEvent> {
 }
 
 /// Feed text.
-pub fn sse_feed(p: & mut SseParser, chunk: str) -> Vec<SseEvent> {
+pub fn sse_feed(p: &mut SseParser, chunk: str) -> Vec<SseEvent> {
     return sse_feed_bytes(p, str_bytes(chunk));
 }
 
 /// The end of the stream: an unfinished event is discarded (per spec),
 /// so this only resets the line state. Returns whether anything was
 /// dropped.
-pub fn sse_end(p: & mut SseParser) -> bool {
+pub fn sse_end(p: &mut SseParser) -> bool {
     val dropped: bool = p.has_data || p.line.len() > 0;
     p.line = Vec::new();
     p.after_cr = false;
@@ -275,13 +281,13 @@ pub fn sse_end(p: & mut SseParser) -> bool {
 /// Parse a whole stream (what was dispatched before it ended).
 pub fn sse_parse(text: str) -> Vec<SseEvent> {
     var p: SseParser = sse_parser_new();
-    val evs: Vec<SseEvent> = sse_feed(& mut p, text);
-    sse_end(& mut p);
+    val evs: Vec<SseEvent> = sse_feed(&mut p, text);
+    sse_end(&mut p);
     return evs;
 }
 
 /// The request header a reconnecting client sends ("" before any id).
-pub fn sse_last_event_id_header(p: & SseParser) -> str {
+pub fn sse_last_event_id_header(p: &SseParser) -> str {
     if str_len(p.last_id) == 0 {
         return "";
     }

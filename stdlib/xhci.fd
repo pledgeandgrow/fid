@@ -23,7 +23,8 @@
 // uncached); DMA memory (rings, contexts, the DCBAA) is a stdlib vmm
 // PhysMem, fake RAM in tests or real memory through a direct map.
 module xhci;
- use vec; use vmm;
+use vec;
+use vmm;
 
 // ─── Capability registers ───────────────────────────────────────────────
 
@@ -132,26 +133,66 @@ pub const CC_CONTEXT_STATE: i64 = 19;
 pub const CC_STOPPED: i64 = 26;
 
 pub fn xhci_cc_name(cc: i64) -> str {
-    if cc == 1 { return "Success"; }
-    if cc == 2 { return "Data Buffer Error"; }
-    if cc == 3 { return "Babble Detected"; }
-    if cc == 4 { return "USB Transaction Error"; }
-    if cc == 5 { return "TRB Error"; }
-    if cc == 6 { return "Stall Error"; }
-    if cc == 7 { return "Resource Error"; }
-    if cc == 8 { return "Bandwidth Error"; }
-    if cc == 9 { return "No Slots Available"; }
-    if cc == 11 { return "Slot Not Enabled"; }
-    if cc == 12 { return "Endpoint Not Enabled"; }
-    if cc == 13 { return "Short Packet"; }
-    if cc == 14 { return "Ring Underrun"; }
-    if cc == 15 { return "Ring Overrun"; }
-    if cc == 17 { return "Parameter Error"; }
-    if cc == 19 { return "Context State Error"; }
-    if cc == 21 { return "Event Ring Full"; }
-    if cc == 24 { return "Command Ring Stopped"; }
-    if cc == 25 { return "Command Aborted"; }
-    if cc == 26 { return "Stopped"; }
+    if cc == 1 {
+        return "Success";
+    }
+    if cc == 2 {
+        return "Data Buffer Error";
+    }
+    if cc == 3 {
+        return "Babble Detected";
+    }
+    if cc == 4 {
+        return "USB Transaction Error";
+    }
+    if cc == 5 {
+        return "TRB Error";
+    }
+    if cc == 6 {
+        return "Stall Error";
+    }
+    if cc == 7 {
+        return "Resource Error";
+    }
+    if cc == 8 {
+        return "Bandwidth Error";
+    }
+    if cc == 9 {
+        return "No Slots Available";
+    }
+    if cc == 11 {
+        return "Slot Not Enabled";
+    }
+    if cc == 12 {
+        return "Endpoint Not Enabled";
+    }
+    if cc == 13 {
+        return "Short Packet";
+    }
+    if cc == 14 {
+        return "Ring Underrun";
+    }
+    if cc == 15 {
+        return "Ring Overrun";
+    }
+    if cc == 17 {
+        return "Parameter Error";
+    }
+    if cc == 19 {
+        return "Context State Error";
+    }
+    if cc == 21 {
+        return "Event Ring Full";
+    }
+    if cc == 24 {
+        return "Command Ring Stopped";
+    }
+    if cc == 25 {
+        return "Command Aborted";
+    }
+    if cc == 26 {
+        return "Stopped";
+    }
     return "Code " + int_to_str(cc);
 }
 
@@ -164,36 +205,36 @@ pub struct Trb {
     pub control: i64,
 }
 
-pub fn trb_type(t: & Trb) -> i64 {
+pub fn trb_type(t: &Trb) -> i64 {
     return (t.control >> 10) & 63;
 }
 
-pub fn trb_cycle(t: & Trb) -> i64 {
+pub fn trb_cycle(t: &Trb) -> i64 {
     return t.control & 1;
 }
 
 /// Completion code of an event TRB.
-pub fn trb_cc(t: & Trb) -> i64 {
+pub fn trb_cc(t: &Trb) -> i64 {
     return (t.status >> 24) & 255;
 }
 
 /// Slot id of an event or command TRB.
-pub fn trb_slot(t: & Trb) -> i64 {
+pub fn trb_slot(t: &Trb) -> i64 {
     return (t.control >> 24) & 255;
 }
 
 /// Endpoint id (DCI) of a transfer event.
-pub fn trb_ep(t: & Trb) -> i64 {
+pub fn trb_ep(t: &Trb) -> i64 {
     return (t.control >> 16) & 31;
 }
 
 /// Bytes not transferred, from a transfer event.
-pub fn trb_residual(t: & Trb) -> i64 {
+pub fn trb_residual(t: &Trb) -> i64 {
     return t.status & 0xFFFFFF;
 }
 
 /// Port id of a port status change event.
-pub fn trb_port(t: & Trb) -> i64 {
+pub fn trb_port(t: &Trb) -> i64 {
     return (t.param >> 24) & 255;
 }
 
@@ -203,100 +244,148 @@ fn trb_ctl(ty: i64, flags: i64) -> i64 {
 
 /// Normal TRB (bulk / interrupt data).
 pub fn trb_normal(buf: i64, len: i64, td_size: i64, flags: i64) -> Trb {
-    return Trb { param: buf, status: (len & 0x1FFFF) | ((td_size & 31) << 17), control: trb_ctl(TRB_NORMAL, flags) };
+    return Trb {
+        param: buf, status: (len & 0x1FFFF) | ((td_size & 31) << 17), control: trb_ctl(TRB_NORMAL, flags)
+    };
 }
 
 /// Setup stage TRB for an 8-byte SETUP packet (immediate data).
 /// trt: 0 = no data stage, 2 = OUT data, 3 = IN data.
-@wrapping pub fn trb_setup(bm_request_type: i64, b_request: i64, w_value: i64, w_index: i64, w_length: i64, trt: i64) -> Trb {
+@wrapping
+pub fn trb_setup(bm_request_type: i64, b_request: i64, w_value: i64, w_index: i64, w_length: i64, trt: i64) -> Trb {
     var p: i64 = (bm_request_type & 255) | ((b_request & 255) << 8) | ((w_value & 0xFFFF) << 16) | ((w_index & 0xFFFF) << 32) | ((w_length & 0xFFFF) << 48);
-    return Trb { param: p, status: 8, control: trb_ctl(TRB_SETUP, TRB_IDT | ((trt & 3) << 16)) };
+    return Trb {
+        param: p, status: 8, control: trb_ctl(TRB_SETUP, TRB_IDT | ((trt & 3) << 16))
+    };
 }
 
 pub fn trb_data(buf: i64, len: i64, dir_in: bool) -> Trb {
     var f: i64 = 0;
-    if dir_in { f = TRB_DIR_IN; }
-    return Trb { param: buf, status: len & 0x1FFFF, control: trb_ctl(TRB_DATA, f) };
+    if dir_in {
+        f = TRB_DIR_IN;
+    }
+    return Trb {
+        param: buf, status: len & 0x1FFFF, control: trb_ctl(TRB_DATA, f)
+    };
 }
 
 /// Status stage: direction opposite to the data stage (IN when there is
 /// no data stage), interrupt on completion.
 pub fn trb_status(dir_in: bool) -> Trb {
     var f: i64 = TRB_IOC;
-    if dir_in { f = f | TRB_DIR_IN; }
-    return Trb { param: 0, status: 0, control: trb_ctl(TRB_STATUS, f) };
+    if dir_in {
+        f = f | TRB_DIR_IN;
+    }
+    return Trb {
+        param: 0, status: 0, control: trb_ctl(TRB_STATUS, f)
+    };
 }
 
 pub fn trb_link(target: i64, toggle: bool) -> Trb {
     var f: i64 = 0;
-    if toggle { f = TRB_TC; }
-    return Trb { param: target & ~15, status: 0, control: trb_ctl(TRB_LINK, f) };
+    if toggle {
+        f = TRB_TC;
+    }
+    return Trb {
+        param: target & ~15, status: 0, control: trb_ctl(TRB_LINK, f)
+    };
 }
 
 pub fn trb_noop_cmd() -> Trb {
-    return Trb { param: 0, status: 0, control: trb_ctl(TRB_NOOP_CMD, 0) };
+    return Trb {
+        param: 0, status: 0, control: trb_ctl(TRB_NOOP_CMD, 0)
+    };
 }
 
 pub fn trb_enable_slot(slot_type: i64) -> Trb {
-    return Trb { param: 0, status: 0, control: trb_ctl(TRB_ENABLE_SLOT, (slot_type & 31) << 16) };
+    return Trb {
+        param: 0, status: 0, control: trb_ctl(TRB_ENABLE_SLOT, (slot_type & 31) << 16)
+    };
 }
 
 pub fn trb_disable_slot(slot: i64) -> Trb {
-    return Trb { param: 0, status: 0, control: trb_ctl(TRB_DISABLE_SLOT, (slot & 255) << 24) };
+    return Trb {
+        param: 0, status: 0, control: trb_ctl(TRB_DISABLE_SLOT, (slot & 255) << 24)
+    };
 }
 
 /// Address Device; bsr = block SET_ADDRESS (only enable the slot).
 pub fn trb_address_device(input_ctx: i64, slot: i64, bsr: bool) -> Trb {
     var f: i64 = (slot & 255) << 24;
-    if bsr { f = f | 0x200; }
-    return Trb { param: input_ctx & ~15, status: 0, control: trb_ctl(TRB_ADDRESS_DEVICE, f) };
+    if bsr {
+        f = f | 0x200;
+    }
+    return Trb {
+        param: input_ctx & ~15, status: 0, control: trb_ctl(TRB_ADDRESS_DEVICE, f)
+    };
 }
 
 /// Configure Endpoint; dc = deconfigure.
 pub fn trb_configure_ep(input_ctx: i64, slot: i64, dc: bool) -> Trb {
     var f: i64 = (slot & 255) << 24;
-    if dc { f = f | 0x200; }
-    return Trb { param: input_ctx & ~15, status: 0, control: trb_ctl(TRB_CONFIGURE_EP, f) };
+    if dc {
+        f = f | 0x200;
+    }
+    return Trb {
+        param: input_ctx & ~15, status: 0, control: trb_ctl(TRB_CONFIGURE_EP, f)
+    };
 }
 
 pub fn trb_evaluate_ctx(input_ctx: i64, slot: i64) -> Trb {
-    return Trb { param: input_ctx & ~15, status: 0, control: trb_ctl(TRB_EVALUATE_CTX, (slot & 255) << 24) };
+    return Trb {
+        param: input_ctx & ~15, status: 0, control: trb_ctl(TRB_EVALUATE_CTX, (slot & 255) << 24)
+    };
 }
 
 pub fn trb_reset_ep(slot: i64, dci: i64, preserve: bool) -> Trb {
     var f: i64 = ((slot & 255) << 24) | ((dci & 31) << 16);
-    if preserve { f = f | 0x200; }
-    return Trb { param: 0, status: 0, control: trb_ctl(TRB_RESET_EP, f) };
+    if preserve {
+        f = f | 0x200;
+    }
+    return Trb {
+        param: 0, status: 0, control: trb_ctl(TRB_RESET_EP, f)
+    };
 }
 
 pub fn trb_stop_ep(slot: i64, dci: i64, suspend: bool) -> Trb {
     var f: i64 = ((slot & 255) << 24) | ((dci & 31) << 16);
-    if suspend { f = f | 0x800000; }
-    return Trb { param: 0, status: 0, control: trb_ctl(TRB_STOP_EP, f) };
+    if suspend {
+        f = f | 0x800000;
+    }
+    return Trb {
+        param: 0, status: 0, control: trb_ctl(TRB_STOP_EP, f)
+    };
 }
 
 /// Set TR Dequeue Pointer: new dequeue address with its cycle state.
 pub fn trb_set_tr_deq(slot: i64, dci: i64, ptr: i64, dcs: i64) -> Trb {
-    return Trb { param: (ptr & ~15) | (dcs & 1), status: 0, control: trb_ctl(TRB_SET_TR_DEQ, ((slot & 255) << 24) | ((dci & 31) << 16)) };
+    return Trb {
+        param: (ptr & ~15) | (dcs & 1), status: 0, control: trb_ctl(TRB_SET_TR_DEQ, ((slot & 255) << 24) | ((dci & 31) << 16))
+    };
 }
 
 pub fn trb_reset_device(slot: i64) -> Trb {
-    return Trb { param: 0, status: 0, control: trb_ctl(TRB_RESET_DEVICE, (slot & 255) << 24) };
+    return Trb {
+        param: 0, status: 0, control: trb_ctl(TRB_RESET_DEVICE, (slot & 255) << 24)
+    };
 }
 
 /// Write a TRB at pa: parameter and status first, the control dword (with
 /// the cycle bit) last, so the controller never sees a half-written TRB.
-pub fn xhci_trb_write(m: & mut PhysMem, pa: i64, t: Trb) {
+pub fn xhci_trb_write(m: &mut PhysMem, pa: i64, t: Trb) {
     phys_write_le(m, pa, 4, t.param & 0xFFFFFFFF);
     phys_write_le(m, pa + 4, 4, (t.param >> 32) & 0xFFFFFFFF);
     phys_write_le(m, pa + 8, 4, t.status & 0xFFFFFFFF);
     phys_write_le(m, pa + 12, 4, t.control & 0xFFFFFFFF);
 }
 
-@wrapping pub fn xhci_trb_read(m: & PhysMem, pa: i64) -> Trb {
+@wrapping
+pub fn xhci_trb_read(m: &PhysMem, pa: i64) -> Trb {
     var lo: i64 = phys_read_le(m, pa, 4);
     var hi: i64 = phys_read_le(m, pa + 4, 4);
-    return Trb { param: lo | (hi << 32), status: phys_read_le(m, pa + 8, 4), control: phys_read_le(m, pa + 12, 4) };
+    return Trb {
+        param: lo | (hi << 32), status: phys_read_le(m, pa + 8, 4), control: phys_read_le(m, pa + 12, 4)
+    };
 }
 
 // ─── Producer rings (command and transfer) ──────────────────────────────
@@ -315,25 +404,27 @@ pub struct XhciRing {
 
 /// A one-segment ring of `size` TRBs at pa (64-byte aligned): zeroed,
 /// with a link TRB back to the start that toggles the cycle state.
-pub fn xhci_ring_new(m: & mut PhysMem, pa: i64, size: i64) -> XhciRing {
+pub fn xhci_ring_new(m: &mut PhysMem, pa: i64, size: i64) -> XhciRing {
     var i: i64 = 0;
     while i < size * 2 {
         phys_write64(m, pa + i * 8, 0);
         i = i + 1;
     }
     xhci_trb_write(m, pa + (size - 1) * 16, trb_link(pa, true));
-    return XhciRing { base: pa, size: size, enq: 0, pcs: 1, deq: 0, queued: 0 };
+    return XhciRing {
+        base: pa, size: size, enq: 0, pcs: 1, deq: 0, queued: 0
+    };
 }
 
 /// TRBs that can still be queued (one slot stays empty to tell full from
 /// empty).
-pub fn xhci_ring_space(r: & XhciRing) -> i64 {
+pub fn xhci_ring_space(r: &XhciRing) -> i64 {
     var usable: i64 = r.size - 1;
     return usable - 1 - r.queued;
 }
 
 /// Physical address of the next enqueue slot.
-pub fn xhci_ring_enq_ptr(r: & XhciRing) -> i64 {
+pub fn xhci_ring_enq_ptr(r: &XhciRing) -> i64 {
     return r.base + r.enq * 16;
 }
 
@@ -341,12 +432,14 @@ pub fn xhci_ring_enq_ptr(r: & XhciRing) -> i64 {
 /// the ring is full. Crossing the link TRB hands it to the controller
 /// (its cycle bit and chain bit set from the TRB before it) and toggles
 /// the producer cycle state.
-pub fn xhci_ring_push(m: & mut PhysMem, r: & mut XhciRing, t: Trb) -> i64 {
+pub fn xhci_ring_push(m: &mut PhysMem, r: &mut XhciRing, t: Trb) -> i64 {
     if xhci_ring_space(r) <= 0 {
         return -1;
     }
     var at: i64 = xhci_ring_enq_ptr(r);
-    var c: Trb = Trb { param: t.param, status: t.status, control: (t.control & ~1) | r.pcs };
+    var c: Trb = Trb {
+        param: t.param, status: t.status, control: (t.control & ~1) | r.pcs
+    };
     xhci_trb_write(m, at, c);
     r.enq = r.enq + 1;
     r.queued = r.queued + 1;
@@ -362,7 +455,7 @@ pub fn xhci_ring_push(m: & mut PhysMem, r: & mut XhciRing, t: Trb) -> i64 {
 
 /// The controller reported it finished the TRB at pa: everything up to
 /// and including it is free again.
-pub fn xhci_ring_consumed(r: & mut XhciRing, pa: i64) {
+pub fn xhci_ring_consumed(r: &mut XhciRing, pa: i64) {
     var idx: i64 = (pa - r.base) / 16;
     if idx < 0 || idx >= r.size - 1 {
         return;
@@ -372,7 +465,9 @@ pub fn xhci_ring_consumed(r: & mut XhciRing, pa: i64) {
         n = n + r.size - 1;
     }
     r.queued = r.queued - n;
-    if r.queued < 0 { r.queued = 0; }
+    if r.queued < 0 {
+        r.queued = 0;
+    }
     r.deq = idx + 1;
     if r.deq == r.size - 1 {
         r.deq = 0;
@@ -380,7 +475,7 @@ pub fn xhci_ring_consumed(r: & mut XhciRing, pa: i64) {
 }
 
 /// CRCR value: ring address with the ring cycle state.
-pub fn xhci_crcr(r: & XhciRing) -> i64 {
+pub fn xhci_crcr(r: &XhciRing) -> i64 {
     return (r.base & ~63) | (r.pcs & 1);
 }
 
@@ -396,7 +491,7 @@ pub struct XhciEventRing {
 }
 
 /// One-segment event ring: segment of `size` TRBs at seg, ERST at erst.
-pub fn xhci_event_ring_new(m: & mut PhysMem, erst: i64, seg: i64, size: i64) -> XhciEventRing {
+pub fn xhci_event_ring_new(m: &mut PhysMem, erst: i64, seg: i64, size: i64) -> XhciEventRing {
     var i: i64 = 0;
     while i < size * 2 {
         phys_write64(m, seg + i * 8, 0);
@@ -405,22 +500,26 @@ pub fn xhci_event_ring_new(m: & mut PhysMem, erst: i64, seg: i64, size: i64) -> 
     phys_write64(m, erst, seg);
     phys_write_le(m, erst + 8, 4, size);
     phys_write_le(m, erst + 12, 4, 0);
-    return XhciEventRing { erst: erst, seg: seg, size: size, deq: 0, ccs: 1 };
+    return XhciEventRing {
+        erst: erst, seg: seg, size: size, deq: 0, ccs: 1
+    };
 }
 
-pub fn xhci_event_ptr(er: & XhciEventRing) -> i64 {
+pub fn xhci_event_ptr(er: &XhciEventRing) -> i64 {
     return er.seg + er.deq * 16;
 }
 
 /// Whether an event is waiting (its cycle bit matches CCS).
-pub fn xhci_event_pending(er: & XhciEventRing, m: & PhysMem) -> bool {
+pub fn xhci_event_pending(er: &XhciEventRing, m: &PhysMem) -> bool {
     return (phys_read_le(m, xhci_event_ptr(er) + 12, 4) & 1) == er.ccs;
 }
 
 /// Take the next event; control = -1 when none is pending.
-pub fn xhci_event_pop(er: & mut XhciEventRing, m: & PhysMem) -> Trb {
+pub fn xhci_event_pop(er: &mut XhciEventRing, m: &PhysMem) -> Trb {
     if !xhci_event_pending(er, m) {
-        return Trb { param: 0, status: 0, control: -1 };
+        return Trb {
+            param: 0, status: 0, control: -1
+        };
     }
     var t: Trb = xhci_trb_read(m, xhci_event_ptr(er));
     er.deq = er.deq + 1;
@@ -433,7 +532,7 @@ pub fn xhci_event_pop(er: & mut XhciEventRing, m: & PhysMem) -> Trb {
 
 /// ERDP value after handling events: dequeue pointer with EHB (bit 3,
 /// write 1 to clear the busy flag).
-pub fn xhci_erdp(er: & XhciEventRing) -> i64 {
+pub fn xhci_erdp(er: &XhciEventRing) -> i64 {
     return xhci_event_ptr(er) | 8;
 }
 
@@ -462,16 +561,26 @@ pub fn xhci_dci(ep_num: i64, dir_in: bool) -> i64 {
 /// direction.
 pub fn xhci_ep_type(bm_attributes: i64, dir_in: bool) -> i64 {
     var t: i64 = bm_attributes & 3;
-    if t == 0 { return EP_CONTROL; }
-    if dir_in { return t + 4; }
+    if t == 0 {
+        return EP_CONTROL;
+    }
+    if dir_in {
+        return t + 4;
+    }
     return t;
 }
 
 /// Initial EP0 max packet size for a port speed.
 pub fn xhci_ep0_max_packet(speed: i64) -> i64 {
-    if speed == XHCI_SPEED_LOW { return 8; }
-    if speed == XHCI_SPEED_FULL { return 8; }
-    if speed == XHCI_SPEED_HIGH { return 64; }
+    if speed == XHCI_SPEED_LOW {
+        return 8;
+    }
+    if speed == XHCI_SPEED_FULL {
+        return 8;
+    }
+    if speed == XHCI_SPEED_HIGH {
+        return 64;
+    }
     return 512;
 }
 
@@ -488,7 +597,8 @@ pub fn xhci_slot_ctx(speed: i64, entries: i64, root_port: i64, route: i64) -> Ve
 /// Endpoint context dwords 0..4: type, max packet, burst, interval,
 /// error count 3 (0 for isochronous), TR dequeue pointer with DCS, and
 /// the average TRB length.
-@wrapping pub fn xhci_ep_ctx(ep_type: i64, max_packet: i64, burst: i64, interval: i64, ring: i64, dcs: i64, avg_trb: i64) -> Vec<i64> {
+@wrapping
+pub fn xhci_ep_ctx(ep_type: i64, max_packet: i64, burst: i64, interval: i64, ring: i64, dcs: i64, avg_trb: i64) -> Vec<i64> {
     var cerr: i64 = 3;
     if ep_type == EP_ISOCH_OUT || ep_type == EP_ISOCH_IN {
         cerr = 0;
@@ -502,7 +612,7 @@ pub fn xhci_slot_ctx(speed: i64, entries: i64, root_port: i64, route: i64) -> Ve
     return d;
 }
 
-fn xhci_write_dwords(m: & mut PhysMem, pa: i64, d: Vec<i64>) {
+fn xhci_write_dwords(m: &mut PhysMem, pa: i64, d: Vec<i64>) {
     var i: i64 = 0;
     while i < d.len() {
         phys_write_le(m, pa + i * 4, 4, d.get(i));
@@ -520,7 +630,7 @@ pub fn xhci_ctx_size(csz64: bool) -> i64 {
 
 /// Input context for Address Device at pa: add flags A0 (slot) and A1
 /// (EP0), the slot context and the EP0 context on ring ep0_ring.
-pub fn xhci_input_ctx_address(m: & mut PhysMem, pa: i64, csz64: bool, root_port: i64, speed: i64, ep0_ring: i64) {
+pub fn xhci_input_ctx_address(m: &mut PhysMem, pa: i64, csz64: bool, root_port: i64, speed: i64, ep0_ring: i64) {
     var cs: i64 = xhci_ctx_size(csz64);
     var i: i64 = 0;
     while i < cs * 33 / 8 {
@@ -534,7 +644,7 @@ pub fn xhci_input_ctx_address(m: & mut PhysMem, pa: i64, csz64: bool, root_port:
 
 /// Dword d of context index `ctx` (0 = input control / slot, ...) in a
 /// context block at pa.
-pub fn xhci_ctx_dword(m: & PhysMem, pa: i64, csz64: bool, ctx: i64, d: i64) -> i64 {
+pub fn xhci_ctx_dword(m: &PhysMem, pa: i64, csz64: bool, ctx: i64, d: i64) -> i64 {
     return phys_read_le(m, pa + ctx * xhci_ctx_size(csz64) + d * 4, 4);
 }
 
@@ -545,23 +655,24 @@ pub struct XhciBus {
     pub wr: fn(i64, i64) -> void,
 }
 
-pub fn xhci_rd(b: & XhciBus, off: i64) -> i64 {
+pub fn xhci_rd(b: &XhciBus, off: i64) -> i64 {
     val f = b.rd;
     return f(off) & 0xFFFFFFFF;
 }
 
-pub fn xhci_wr(b: & XhciBus, off: i64, v: i64) {
+pub fn xhci_wr(b: &XhciBus, off: i64, v: i64) {
     val f = b.wr;
     f(off, v & 0xFFFFFFFF);
 }
 
 /// 64-bit register as two dword writes, low first.
-pub fn xhci_wr64(b: & XhciBus, off: i64, v: i64) {
+pub fn xhci_wr64(b: &XhciBus, off: i64, v: i64) {
     xhci_wr(b, off, v & 0xFFFFFFFF);
     xhci_wr(b, off + 4, (v >> 32) & 0xFFFFFFFF);
 }
 
-@wrapping pub fn xhci_rd64(b: & XhciBus, off: i64) -> i64 {
+@wrapping
+pub fn xhci_rd64(b: &XhciBus, off: i64) -> i64 {
     return xhci_rd(b, off) | (xhci_rd(b, off + 4) << 32);
 }
 
@@ -584,7 +695,7 @@ pub struct XhciCaps {
     pub rt: i64,
 }
 
-pub fn xhci_caps(b: & XhciBus) -> XhciCaps {
+pub fn xhci_caps(b: &XhciBus) -> XhciCaps {
     var w0: i64 = xhci_rd(b, 0);
     var p1: i64 = xhci_rd(b, XHCI_HCSPARAMS1);
     var p2: i64 = xhci_rd(b, XHCI_HCSPARAMS2);
@@ -596,26 +707,26 @@ pub fn xhci_caps(b: & XhciBus) -> XhciCaps {
 }
 
 /// Byte offset of PORTSC of port n (1-based).
-pub fn xhci_portsc_off(c: & XhciCaps, n: i64) -> i64 {
+pub fn xhci_portsc_off(c: &XhciCaps, n: i64) -> i64 {
     return c.op + XHCI_PORTS + 0x10 * (n - 1);
 }
 
 /// Byte offset of a register of interrupter i: IMAN 0, IMOD 4, ERSTSZ 8,
 /// ERSTBA 0x10, ERDP 0x18.
-pub fn xhci_ir_off(c: & XhciCaps, i: i64, reg: i64) -> i64 {
+pub fn xhci_ir_off(c: &XhciCaps, i: i64, reg: i64) -> i64 {
     return c.rt + 0x20 + 32 * i + reg;
 }
 
 /// Doorbell register of a slot (0 = the host controller / command ring).
-pub fn xhci_db_off(c: & XhciCaps, slot: i64) -> i64 {
+pub fn xhci_db_off(c: &XhciCaps, slot: i64) -> i64 {
     return c.db + 4 * slot;
 }
 
-pub fn xhci_ring_doorbell(b: & XhciBus, c: & XhciCaps, slot: i64, target: i64, stream: i64) {
+pub fn xhci_ring_doorbell(b: &XhciBus, c: &XhciCaps, slot: i64, target: i64, stream: i64) {
     xhci_wr(b, xhci_db_off(c, slot), (target & 255) | ((stream & 0xFFFF) << 16));
 }
 
-fn xhci_wait(b: & XhciBus, off: i64, mask: i64, want: i64, spins: i64) -> bool {
+fn xhci_wait(b: &XhciBus, off: i64, mask: i64, want: i64, spins: i64) -> bool {
     var i: i64 = 0;
     while i < spins {
         if (xhci_rd(b, off) & mask) == want {
@@ -628,7 +739,7 @@ fn xhci_wait(b: & XhciBus, off: i64, mask: i64, want: i64, spins: i64) -> bool {
 
 /// Stop, then reset the controller: clear R/S, wait for HCHalted, set
 /// HCRST, wait for HCRST and CNR to clear.
-pub fn xhci_reset(b: & XhciBus, c: & XhciCaps, spins: i64) -> bool {
+pub fn xhci_reset(b: &XhciBus, c: &XhciCaps, spins: i64) -> bool {
     var cmd: i64 = xhci_rd(b, c.op + XHCI_USBCMD);
     xhci_wr(b, c.op + XHCI_USBCMD, cmd & ~USBCMD_RS);
     if !xhci_wait(b, c.op + XHCI_USBSTS, USBSTS_HCH, USBSTS_HCH, spins) {
@@ -644,9 +755,11 @@ pub fn xhci_reset(b: & XhciBus, c: & XhciCaps, spins: i64) -> bool {
 /// Program and start a reset controller: slots enabled, DCBAA, command
 /// ring, interrupter 0 (ERSTSZ, ERDP, then ERSTBA last), interrupts on,
 /// run. Returns false if the controller does not leave the halted state.
-pub fn xhci_start(b: & XhciBus, c: & XhciCaps, dcbaa: i64, cmd: & XhciRing, er: & XhciEventRing, slots: i64, spins: i64) -> bool {
+pub fn xhci_start(b: &XhciBus, c: &XhciCaps, dcbaa: i64, cmd: &XhciRing, er: &XhciEventRing, slots: i64, spins: i64) -> bool {
     var n: i64 = slots;
-    if n > c.max_slots { n = c.max_slots; }
+    if n > c.max_slots {
+        n = c.max_slots;
+    }
     xhci_wr(b, c.op + XHCI_CONFIG, n);
     xhci_wr64(b, c.op + XHCI_DCBAAP, dcbaa & ~63);
     xhci_wr64(b, c.op + XHCI_CRCR, xhci_crcr(cmd));
@@ -686,7 +799,7 @@ pub fn xhci_portsc_preserve(v: i64) -> i64 {
 }
 
 /// Start a port reset (warm reset for USB 3 ports when warm).
-pub fn xhci_port_reset(b: & XhciBus, c: & XhciCaps, port: i64, warm: bool) {
+pub fn xhci_port_reset(b: &XhciBus, c: &XhciCaps, port: i64, warm: bool) {
     var off: i64 = xhci_portsc_off(c, port);
     var v: i64 = xhci_portsc_preserve(xhci_rd(b, off));
     if warm {
@@ -697,7 +810,7 @@ pub fn xhci_port_reset(b: & XhciBus, c: & XhciCaps, port: i64, warm: bool) {
 }
 
 /// Acknowledge change bits (write 1 to the ones in `bits`).
-pub fn xhci_port_ack(b: & XhciBus, c: & XhciCaps, port: i64, bits: i64) {
+pub fn xhci_port_ack(b: &XhciBus, c: &XhciCaps, port: i64, bits: i64) {
     var off: i64 = xhci_portsc_off(c, port);
     xhci_wr(b, off, xhci_portsc_preserve(xhci_rd(b, off)) | (bits & 0x00FE0000));
 }
@@ -708,7 +821,7 @@ pub const XECP_LEGACY: i64 = 1;
 pub const XECP_PROTOCOL: i64 = 2;
 
 /// Offsets of all extended capabilities, packed id * 2^32 + offset.
-pub fn xhci_ext_caps(b: & XhciBus, c: & XhciCaps) -> Vec<i64> {
+pub fn xhci_ext_caps(b: &XhciBus, c: &XhciCaps) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     var off: i64 = c.xecp;
     var guard_v: i64 = 0;
@@ -727,7 +840,7 @@ pub fn xhci_ext_caps(b: & XhciBus, c: & XhciCaps) -> Vec<i64> {
 
 /// BIOS -> OS handoff on the USB legacy support capability at off: set
 /// the OS-owned semaphore, wait for the BIOS-owned one to clear.
-pub fn xhci_legacy_handoff(b: & XhciBus, off: i64, spins: i64) -> bool {
+pub fn xhci_legacy_handoff(b: &XhciBus, off: i64, spins: i64) -> bool {
     var w: i64 = xhci_rd(b, off);
     xhci_wr(b, off, w | (1 << 24));
     var i: i64 = 0;
@@ -749,7 +862,7 @@ pub struct XhciProtocol {
 }
 
 /// Supported protocol capability at off ("USB " 2.0 or 3.x and its ports).
-pub fn xhci_protocol(b: & XhciBus, off: i64) -> XhciProtocol {
+pub fn xhci_protocol(b: &XhciBus, off: i64) -> XhciProtocol {
     var w0: i64 = xhci_rd(b, off);
     var name: i64 = xhci_rd(b, off + 4);
     var w2: i64 = xhci_rd(b, off + 8);

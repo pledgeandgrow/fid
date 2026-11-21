@@ -64,12 +64,12 @@ pub fn kf_new(f: DMat, h: DMat, q: DMat, r: DMat, x0: DMat, p0: DMat) -> Kf {
 }
 
 /// Set the control input matrix B (n x k).
-pub fn kf_set_control(kf: & mut Kf, b: DMat) {
+pub fn kf_set_control(kf: &mut Kf, b: DMat) {
     kf.b = b;
 }
 
 /// x = F x, P = F P F' + Q.
-pub fn kf_predict(kf: & mut Kf) {
+pub fn kf_predict(kf: &mut Kf) {
     val fx: DMat = dm_mul(&kf.f, &kf.x);
     kf.x = fx;
     val ft: DMat = dm_transpose(&kf.f);
@@ -79,7 +79,7 @@ pub fn kf_predict(kf: & mut Kf) {
 }
 
 /// x = F x + B u, P = F P F' + Q.
-pub fn kf_predict_u(kf: & mut Kf, u: & DMat) {
+pub fn kf_predict_u(kf: &mut Kf, u: &DMat) {
     kf_predict(kf);
     val bu: DMat = dm_mul(&kf.b, u);
     kf.x = dm_add(&kf.x, &bu);
@@ -88,7 +88,7 @@ pub fn kf_predict_u(kf: & mut Kf, u: & DMat) {
 /// The gain-and-covariance step shared by the linear and extended filters:
 /// innovation y = z - zhat, S = H P H' + R, K = P H' S^-1, x += K y,
 /// Joseph-form P. Returns (new x, new P, S) or Err for a singular S.
-fn kf_correct(x: & DMat, p: & DMat, h: & DMat, r: & DMat, y: & DMat) -> Result<Vec<DMat>, str> {
+fn kf_correct(x: &DMat, p: &DMat, h: &DMat, r: &DMat, y: &DMat) -> Result<Vec<DMat>, str> {
     val ht: DMat = dm_transpose(h);
     val pht: DMat = dm_mul(p, &ht);
     val hpht: DMat = dm_mul(h, &pht);
@@ -120,7 +120,7 @@ fn kf_correct(x: & DMat, p: & DMat, h: & DMat, r: & DMat, y: & DMat) -> Result<V
 }
 
 /// y' S^-1 y.
-fn kf_nis(y: & DMat, s: & DMat) -> f64 {
+fn kf_nis(y: &DMat, s: &DMat) -> f64 {
     match dm_solve(s, y) {
         Result::Ok(w) => {
             var acc: f64 = 0.0;
@@ -138,7 +138,7 @@ fn kf_nis(y: & DMat, s: & DMat) -> f64 {
 }
 
 /// Fold in measurement z (m x 1). Returns the NIS of the innovation.
-pub fn kf_update(kf: & mut Kf, z: & DMat) -> Result<f64, str> {
+pub fn kf_update(kf: &mut Kf, z: &DMat) -> Result<f64, str> {
     val hx: DMat = dm_mul(&kf.h, &kf.x);
     val y: DMat = dm_sub(z, &hx);
     match kf_correct(&kf.x, &kf.p, &kf.h, &kf.r, &y) {
@@ -176,7 +176,7 @@ pub fn kf_cv_model(dt: f64, qc: f64) -> Vec<DMat> {
 // ─── Extended Kalman filter ───
 
 /// A copy of v.
-fn kf_vcopy(v: & Vec<f64>) -> Vec<f64> {
+fn kf_vcopy(v: &Vec<f64>) -> Vec<f64> {
     var o: Vec<f64> = Vec::new();
     var i: i64 = 0;
     while i < v.len() {
@@ -204,7 +204,7 @@ pub fn ekf_new(x0: DMat, p0: DMat, q: DMat, r: DMat) -> Ekf {
 }
 
 /// x = f(x, u), P = F P F' + Q with F = fjac(x, u) at the old x.
-pub fn ekf_predict(e: & mut Ekf, f: fn(Vec<f64>, Vec<f64>) -> Vec<f64>, fjac: fn(Vec<f64>, Vec<f64>) -> Vec<f64>, u: & Vec<f64>) {
+pub fn ekf_predict(e: &mut Ekf, f: fn(Vec<f64>, Vec<f64>) -> Vec<f64>, fjac: fn(Vec<f64>, Vec<f64>) -> Vec<f64>, u: &Vec<f64>) {
     val n: i64 = e.x.rows;
     val xv: Vec<f64> = dm_to_vec(&e.x);
     val fm: DMat = dm_from(n, n, fjac(xv, kf_vcopy(u)));
@@ -218,7 +218,7 @@ pub fn ekf_predict(e: & mut Ekf, f: fn(Vec<f64>, Vec<f64>) -> Vec<f64>, fjac: fn
 
 /// Fold in z with the measurement model h(x) and its Jacobian hjac(x).
 /// Returns the NIS.
-pub fn ekf_update(e: & mut Ekf, z: & DMat, h: fn(Vec<f64>) -> Vec<f64>, hjac: fn(Vec<f64>) -> Vec<f64>) -> Result<f64, str> {
+pub fn ekf_update(e: &mut Ekf, z: &DMat, h: fn(Vec<f64>) -> Vec<f64>, hjac: fn(Vec<f64>) -> Vec<f64>) -> Result<f64, str> {
     val xv: Vec<f64> = dm_to_vec(&e.x);
     val hm: DMat = dm_from(z.rows, e.x.rows, hjac(xv));
     val zh: DMat = dm_col_vec(h(xv));
@@ -281,7 +281,7 @@ pub fn ukf_new(x0: DMat, p0: DMat, q: DMat, r: DMat, alpha: f64, beta: f64, kapp
 
 /// The 2n + 1 sigma points of (x, p): x, then x + c_i and x - c_i for the
 /// columns c_i of the Cholesky factor of (n + lambda) p.
-pub fn ukf_sigma_points(x: & DMat, p: & DMat, lambda: f64) -> Result<Vec<DMat>, str> {
+pub fn ukf_sigma_points(x: &DMat, p: &DMat, lambda: f64) -> Result<Vec<DMat>, str> {
     val n: i64 = x.rows;
     val sp: DMat = dm_scale(p, (n as f64) + lambda);
     match dm_cholesky(&sp) {
@@ -309,7 +309,7 @@ pub fn ukf_sigma_points(x: & DMat, p: & DMat, lambda: f64) -> Result<Vec<DMat>, 
 }
 
 /// Weighted mean of column points.
-fn ukf_mean(pts: & Vec<DMat>, w: & Vec<f64>) -> DMat {
+fn ukf_mean(pts: &Vec<DMat>, w: &Vec<f64>) -> DMat {
     val first: DMat = pts.get(0);
     var m: DMat = dm_zeros(first.rows, 1);
     var i: i64 = 0;
@@ -322,7 +322,7 @@ fn ukf_mean(pts: & Vec<DMat>, w: & Vec<f64>) -> DMat {
 }
 
 /// sum_i w_i (a_i - ma)(b_i - mb)'.
-fn ukf_cross(a: & Vec<DMat>, ma: & DMat, b: & Vec<DMat>, mb: & DMat, w: & Vec<f64>) -> DMat {
+fn ukf_cross(a: &Vec<DMat>, ma: &DMat, b: &Vec<DMat>, mb: &DMat, w: &Vec<f64>) -> DMat {
     var c: DMat = dm_zeros(ma.rows, mb.rows);
     var i: i64 = 0;
     while i < a.len() {
@@ -337,7 +337,7 @@ fn ukf_cross(a: & Vec<DMat>, ma: & DMat, b: & Vec<DMat>, mb: & DMat, w: & Vec<f6
 }
 
 /// Propagate the sigma points through f(x, u): x = mean, P = cov + Q.
-pub fn ukf_predict(k: & mut Ukf, f: fn(Vec<f64>, Vec<f64>) -> Vec<f64>, u: & Vec<f64>) -> Result<i64, str> {
+pub fn ukf_predict(k: &mut Ukf, f: fn(Vec<f64>, Vec<f64>) -> Vec<f64>, u: &Vec<f64>) -> Result<i64, str> {
     match ukf_sigma_points(&k.x, &k.p, k.lambda) {
         Result::Ok(pts) => {
             var fp: Vec<DMat> = Vec::new();
@@ -359,7 +359,7 @@ pub fn ukf_predict(k: & mut Ukf, f: fn(Vec<f64>, Vec<f64>) -> Vec<f64>, u: & Vec
 }
 
 /// Fold in z with the measurement model h(x). Returns the NIS.
-pub fn ukf_update(k: & mut Ukf, z: & DMat, h: fn(Vec<f64>) -> Vec<f64>) -> Result<f64, str> {
+pub fn ukf_update(k: &mut Ukf, z: &DMat, h: fn(Vec<f64>) -> Vec<f64>) -> Result<f64, str> {
     match ukf_sigma_points(&k.x, &k.p, k.lambda) {
         Result::Ok(pts) => {
             var zp: Vec<DMat> = Vec::new();

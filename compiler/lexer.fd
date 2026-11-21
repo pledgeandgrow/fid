@@ -13,7 +13,11 @@
 //
 // Dependencies: compiler::token (TokenKind, Token, token_new)
 
-module compiler::lexer; use vec; use core; use compiler::token;  // --- Lexer ----------------------------------------------------------------
+module compiler::lexer;
+use vec;
+use core;
+use compiler::token;
+// --- Lexer ----------------------------------------------------------------
 
 pub struct Lexer {
     pub source: str,
@@ -38,7 +42,7 @@ impl Lexer {
     }
 
     /// Tokenize the entire source. Returns Vec<Token> ending with an Eof token.
-    pub fn tokenize(self: & mut Lexer) -> Vec<Token> {
+    pub fn tokenize(self: &mut Lexer) -> Vec<Token> {
         var tokens: Vec<Token> = Vec::new();
 
         while self.pos < self.src_len {
@@ -82,7 +86,7 @@ impl Lexer {
     }
 
     /// Peek the current byte, or 0 (NUL) at EOF.
-    fn peek(self: & Lexer) -> i64 {
+    fn peek(self: &Lexer) -> i64 {
         if self.pos >= self.src_len {
             return 0;
         }
@@ -93,17 +97,17 @@ impl Lexer {
     /// bounds. (Rust returns Option<char>; we use -1 as the "None" sentinel.
     /// Callers compare against specific byte values, never against 0, since 0
     /// is a valid NUL byte -- using -1 avoids a false match at EOF.)
-    fn peek_at(self: & Lexer, offset: i64) -> i64 {
+    fn peek_at(self: &Lexer, offset: i64) -> i64 {
         var idx: i64 = self.pos + offset;
         if idx >= self.src_len {
-            return - 1;
+            return -1;
         }
         return str_byte_at(self.source, idx);
     }
 
     /// Consume and return the current byte, advancing position and updating
     /// line/col. Multi-byte UTF-8 sequences count as a single column.
-    fn advance(self: & mut Lexer) -> i64 {
+    fn advance(self: &mut Lexer) -> i64 {
         var c: i64 = self.peek();
         self.pos = self.pos + 1;
         if c == 10 {
@@ -133,7 +137,7 @@ impl Lexer {
     /// Read the UTF-8 character at the current position as a string,
     /// advancing past all its bytes. Unlike `byte_to_str(advance())`,
     /// this captures multi-byte sequences (e.g. em-dash -- is 3 bytes).
-    fn read_utf8(self: & mut Lexer) -> str {
+    fn read_utf8(self: &mut Lexer) -> str {
         var c: i64 = self.peek();
         if c < 128 {
             // ASCII -- single byte
@@ -168,7 +172,7 @@ impl Lexer {
     }
 
     /// Decode one UTF-8 scalar at the cursor and advance past it.
-    fn read_codepoint(self: & mut Lexer) -> i64 {
+    fn read_codepoint(self: &mut Lexer) -> i64 {
         var c: i64 = self.peek();
         if c < 128 {
             return self.advance();
@@ -193,7 +197,7 @@ impl Lexer {
     }
 
     /// Read N hex digits (N = 2 for \xHH) or up to '}' (for \u{...}).
-    fn read_hex_value(self: & mut Lexer, line: i64, col: i64, max_digits: i64, until_brace: bool) -> i64 {
+    fn read_hex_value(self: &mut Lexer, line: i64, col: i64, max_digits: i64, until_brace: bool) -> i64 {
         var v: i64 = 0;
         var n: i64 = 0;
         while self.pos < self.src_len && n < max_digits {
@@ -230,7 +234,7 @@ impl Lexer {
     /// At a `'`: whether a lifetime name follows -- a letter or `_`, then
     /// letters, digits and `_` with no closing `'` after them (`'a'` is a
     /// char literal, `'a` and `'static` are lifetimes).
-    fn lifetime_ahead(self: & Lexer) -> bool {
+    fn lifetime_ahead(self: &Lexer) -> bool {
         var c1: i64 = self.peek_at(1);
         if !(lex_is_alpha(c1) || c1 == 95) {
             return false;
@@ -243,7 +247,7 @@ impl Lexer {
     }
 
     /// A lifetime name `'a`; the token's text keeps the quote.
-    fn read_lifetime(self: & mut Lexer) -> Token {
+    fn read_lifetime(self: &mut Lexer) -> Token {
         var line: i64 = self.line;
         var col: i64 = self.col;
         self.advance();
@@ -257,7 +261,7 @@ impl Lexer {
     /// R1.7: char literal 'c' -> IntLit holding the Unicode scalar value, so it
     /// compares directly against str_byte_at results. Same escapes as strings
     /// plus \' (and \x / \u{...}).
-    fn read_char_lit(self: & mut Lexer) -> Token {
+    fn read_char_lit(self: &mut Lexer) -> Token {
         var line: i64 = self.line;
         var col: i64 = self.col;
         self.advance();
@@ -316,13 +320,13 @@ impl Lexer {
         return token_new(TokenKind::IntLit(v), line, col);
     }
 
-    fn skip_line_comment(self: & mut Lexer) {
+    fn skip_line_comment(self: &mut Lexer) {
         while self.pos < self.src_len && self.peek() != 10 {
             self.advance();
         }
     }
 
-    fn skip_block_comment(self: & mut Lexer) {
+    fn skip_block_comment(self: &mut Lexer) {
         self.advance();
         // consume '/'
         self.advance();
@@ -338,7 +342,7 @@ impl Lexer {
         }
     }
 
-    fn read_identifier_or_keyword(self: & mut Lexer) -> Token {
+    fn read_identifier_or_keyword(self: &mut Lexer) -> Token {
         var line: i64 = self.line;
         var col: i64 = self.col;
         var start_pos: i64 = self.pos;
@@ -359,7 +363,7 @@ impl Lexer {
         return token_new(kind, line, col);
     }
 
-    fn read_number(self: & mut Lexer) -> Token {
+    fn read_number(self: &mut Lexer) -> Token {
         var line: i64 = self.line;
         var col: i64 = self.col;
         var start_pos: i64 = self.pos;
@@ -427,7 +431,8 @@ impl Lexer {
                 if self.peek() == 43 || self.peek() == 45 {
                     // '+' / '-'
                     self.advance();
-                } while self.pos < self.src_len && lex_is_digit(self.peek()) {
+                }
+                while self.pos < self.src_len && lex_is_digit(self.peek()) {
                     self.advance();
                 }
             }
@@ -451,7 +456,8 @@ impl Lexer {
                 while k < ex {
                     self.advance();
                     k = k + 1;
-                } while self.pos < self.src_len && lex_is_digit(self.peek()) {
+                }
+                while self.pos < self.src_len && lex_is_digit(self.peek()) {
                     self.advance();
                 }
                 var eraw: str = str_slice_len(self.source, self.src_len, start_pos, self.pos);
@@ -469,7 +475,7 @@ impl Lexer {
 
     /// Remove underscore separators from a numeric string (e.g. "1_000" -> "1000")
 
-    fn read_fstring(self: & mut Lexer) -> Token {
+    fn read_fstring(self: &mut Lexer) -> Token {
         var line: i64 = self.line;
         var col: i64 = self.col;
         self.advance();
@@ -561,7 +567,7 @@ impl Lexer {
         return token_new(TokenKind::FString(s), line, col);
     }
 
-    fn read_string(self: & mut Lexer) -> Token {
+    fn read_string(self: &mut Lexer) -> Token {
         var line: i64 = self.line;
         var col: i64 = self.col;
         self.advance();
@@ -629,7 +635,7 @@ impl Lexer {
     /// Read a raw string: r"..." or r#"..."# (with N hash signs).
     /// No escape sequences are processed -- content is taken literally.
     /// The closing delimiter is '"' followed by the same number of '#'.
-    fn read_raw_string(self: & mut Lexer) -> Token {
+    fn read_raw_string(self: &mut Lexer) -> Token {
         var line: i64 = self.line;
         var col: i64 = self.col;
         self.advance();
@@ -683,7 +689,7 @@ impl Lexer {
         return token_new(TokenKind::StringLit(s), line, col);
     }
 
-    fn read_operator(self: & mut Lexer) -> Token {
+    fn read_operator(self: &mut Lexer) -> Token {
         var line: i64 = self.line;
         var col: i64 = self.col;
         var op_start: i64 = self.pos;
@@ -1387,13 +1393,14 @@ pub fn lex_is_hexdigit(c: i64) -> bool {
 
 /// Parse `s` as an integer in the given radix (2, 8, 10, 16). Returns 0 on
 /// any non-digit. Used for binary/octal literals (str_parse_hex handles 16).
-@wrapping pub fn parse_radix(s: str, radix: i64) -> i64 {
+@wrapping
+pub fn parse_radix(s: str, radix: i64) -> i64 {
     var result: i64 = 0;
     var i: i64 = 0;
     var n: i64 = str_len(s);
     while i < n {
         var b: i64 = str_byte_at(s, i);
-        var digit: i64 = - 1;
+        var digit: i64 = -1;
         if b >= 48 && b <= 57 {
             digit = b - 48;
         } else if b >= 65 && b <= 90 {
@@ -1435,7 +1442,8 @@ pub fn lex_error(line: i64, col: i64, msg: str) -> str {
 
 /// The value of a decimal literal. One above i64::MAX is a u64: it keeps its
 /// bits.
-@wrapping fn lex_parse_int(s: str) -> i64 {
+@wrapping
+fn lex_parse_int(s: str) -> i64 {
     var v: i64 = 0;
     var i: i64 = 0;
     var n: i64 = str_len(s);
@@ -1533,7 +1541,7 @@ pub fn lex_par_plan(sizes: Vec<i64>, nw: i64) -> Vec<Vec<i64>> {
     }
     var r: i64 = 0;
     while r < n {
-        var best: i64 = - 1;
+        var best: i64 = -1;
         var j: i64 = 0;
         while j < n {
             if !taken.get(j) && (best < 0 || sizes.get(j) > sizes.get(best)) {
@@ -1730,7 +1738,7 @@ pub fn modgraph_levels(deps: Vec<Vec<i64>>) -> Vec<i64> {
     var level: Vec<i64> = Vec::new();
     var i: i64 = 0;
     while i < n {
-        level.push(- 1);
+        level.push(-1);
         i = i + 1;
     }
     var changed: bool = true;
@@ -1770,7 +1778,7 @@ pub fn modgraph_levels(deps: Vec<Vec<i64>>) -> Vec<i64> {
 /// cycle`: how many of the modules the levels of modgraph_levels let be
 /// worked on together.
 pub fn modgraph_summary(levels: Vec<i64>) -> str {
-    var top: i64 = - 1;
+    var top: i64 = -1;
     var cyc: i64 = 0;
     var i: i64 = 0;
     while i < levels.len() {

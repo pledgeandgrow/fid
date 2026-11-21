@@ -23,12 +23,13 @@
 //     extern "C" block below; @cfg(linux), C backend only (the
 //     interpreter has no FFI)
 module spi;
- use vec;
- use string;
+use vec;
+use string;
 
 extern "C" include "<fcntl.h>" {
     fn open as spi_sys_open(path: str, flags: i64) -> i64;
 }
+
 extern "C" include "<unistd.h>" {
     fn close as spi_sys_close(fd: i64) -> i64;
 }
@@ -106,7 +107,9 @@ pub struct SpiConfig {
 }
 
 pub fn spi_config(mode: i64, bits_per_word: i64, speed_hz: i64) -> SpiConfig {
-    return SpiConfig { mode: mode, bits_per_word: bits_per_word, speed_hz: speed_hz };
+    return SpiConfig {
+        mode: mode, bits_per_word: bits_per_word, speed_hz: speed_hz
+    };
 }
 
 pub fn spi_cpol(mode: i64) -> i64 {
@@ -133,7 +136,7 @@ pub fn spi_word_bytes(bits: i64) -> i64 {
 }
 
 /// Words to buffer bytes (each word masked to `bits`, little-endian).
-pub fn spi_pack_words(words: & Vec<i64>, bits: i64) -> Vec<i64> {
+pub fn spi_pack_words(words: &Vec<i64>, bits: i64) -> Vec<i64> {
     val wb: i64 = spi_word_bytes(bits);
     var mask: i64 = (1 << bits) - 1;
     var out: Vec<i64> = Vec::new();
@@ -150,7 +153,7 @@ pub fn spi_pack_words(words: & Vec<i64>, bits: i64) -> Vec<i64> {
     return out;
 }
 
-pub fn spi_unpack_words(bytes: & Vec<i64>, bits: i64) -> Vec<i64> {
+pub fn spi_unpack_words(bytes: &Vec<i64>, bits: i64) -> Vec<i64> {
     val wb: i64 = spi_word_bytes(bits);
     var mask: i64 = (1 << bits) - 1;
     var out: Vec<i64> = Vec::new();
@@ -216,11 +219,19 @@ pub fn spi_bitbang_steps(mode: i64, bits: i64, lsb_first: bool, word: i64) -> Ve
         }
         val bit: i64 = (word >> bit_index) & 1;
         if cpha == 0 {
-            steps.push(SpiStep { sck: idle, mosi: bit, sample: false });
-            steps.push(SpiStep { sck: active, mosi: bit, sample: true });
+            steps.push(SpiStep {
+                sck: idle, mosi: bit, sample: false
+            });
+            steps.push(SpiStep {
+                sck: active, mosi: bit, sample: true
+            });
         } else {
-            steps.push(SpiStep { sck: active, mosi: bit, sample: false });
-            steps.push(SpiStep { sck: idle, mosi: bit, sample: true });
+            steps.push(SpiStep {
+                sck: active, mosi: bit, sample: false
+            });
+            steps.push(SpiStep {
+                sck: idle, mosi: bit, sample: true
+            });
         }
         i = i + 1;
     }
@@ -231,14 +242,16 @@ pub fn spi_bitbang_steps(mode: i64, bits: i64, lsb_first: bool, word: i64) -> Ve
         if lsb_first {
             last = (word >> (bits - 1)) & 1;
         }
-        steps.push(SpiStep { sck: idle, mosi: last, sample: false });
+        steps.push(SpiStep {
+            sck: idle, mosi: last, sample: false
+        });
     }
     return steps;
 }
 
 /// A slave watching SCK/MOSI: it samples MOSI on the edge its mode
 /// samples on and assembles words. Feeds on the steps of any master.
-pub fn spi_slave_decode(mode: i64, bits: i64, lsb_first: bool, steps: & Vec<SpiStep>) -> Vec<i64> {
+pub fn spi_slave_decode(mode: i64, bits: i64, lsb_first: bool, steps: &Vec<SpiStep>) -> Vec<i64> {
     val idle: i64 = spi_cpol(mode);
     val cpha: i64 = spi_cpha(mode);
     var words: Vec<i64> = Vec::new();
@@ -283,7 +296,7 @@ pub struct SpiPins {
 }
 
 /// Clock the words out over the pins; the words read from MISO.
-pub fn spi_bitbang_xfer(pins: & SpiPins, cfg: & SpiConfig, words: & Vec<i64>) -> Vec<i64> {
+pub fn spi_bitbang_xfer(pins: &SpiPins, cfg: &SpiConfig, words: &Vec<i64>) -> Vec<i64> {
     val lsb: bool = (cfg.mode & SPI_LSB_FIRST) != 0;
     var cs_active: i64 = 0;
     if (cfg.mode & SPI_CS_HIGH) != 0 {
@@ -343,12 +356,14 @@ pub struct SpiXfer {
 }
 
 pub fn spi_xfer(tx: Vec<i64>) -> SpiXfer {
-    return SpiXfer { tx: tx, speed_hz: 0, bits_per_word: 0, delay_us: 0, cs_change: false };
+    return SpiXfer {
+        tx: tx, speed_hz: 0, bits_per_word: 0, delay_us: 0, cs_change: false
+    };
 }
 
 /// The request a transport receives: [mode, cs, n, then per segment len,
 /// speed_hz, bits_per_word, delay_us, cs_change, tx bytes...].
-pub fn spi_encode_request(cfg: & SpiConfig, cs: i64, xs: & Vec<SpiXfer>) -> Vec<i64> {
+pub fn spi_encode_request(cfg: &SpiConfig, cs: i64, xs: &Vec<SpiXfer>) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     out.push(cfg.mode);
     out.push(cs);
@@ -375,7 +390,7 @@ pub fn spi_encode_request(cfg: & SpiConfig, cs: i64, xs: & Vec<SpiXfer>) -> Vec<
     return out;
 }
 
-pub fn spi_decode_request(req: & Vec<i64>) -> Vec<SpiXfer> {
+pub fn spi_decode_request(req: &Vec<i64>) -> Vec<SpiXfer> {
     var xs: Vec<SpiXfer> = Vec::new();
     if req.len() < 3 {
         return xs;
@@ -391,7 +406,9 @@ pub fn spi_decode_request(req: & Vec<i64>) -> Vec<SpiXfer> {
             tx.push(req.get(p + 5 + j));
             j = j + 1;
         }
-        xs.push(SpiXfer { tx: tx, speed_hz: req.get(p + 1), bits_per_word: req.get(p + 2), delay_us: req.get(p + 3), cs_change: req.get(p + 4) != 0 });
+        xs.push(SpiXfer {
+            tx: tx, speed_hz: req.get(p + 1), bits_per_word: req.get(p + 2), delay_us: req.get(p + 3), cs_change: req.get(p + 4) != 0
+        });
         p = p + 5 + len;
         i = i + 1;
     }
@@ -412,14 +429,18 @@ pub struct SpiFakeDev {
 }
 
 pub fn spi_fake_regdev(cs: i64, nregs: i64) -> SpiFakeDev {
-    return SpiFakeDev { cs: cs, kind: 0, regs: Vec::filled(nregs, 0), read_bit: 0x80, addr_mask: 0x7F, written: Vec::new() };
+    return SpiFakeDev {
+        cs: cs, kind: 0, regs: Vec::filled(nregs, 0), read_bit: 0x80, addr_mask: 0x7F, written: Vec::new()
+    };
 }
 
 pub fn spi_fake_loopback(cs: i64) -> SpiFakeDev {
-    return SpiFakeDev { cs: cs, kind: 1, regs: Vec::new(), read_bit: 0, addr_mask: 0, written: Vec::new() };
+    return SpiFakeDev {
+        cs: cs, kind: 1, regs: Vec::new(), read_bit: 0, addr_mask: 0, written: Vec::new()
+    };
 }
 
-pub fn spi_fake_set(d: & mut SpiFakeDev, reg: i64, bytes: Vec<i64>) {
+pub fn spi_fake_set(d: &mut SpiFakeDev, reg: i64, bytes: Vec<i64>) {
     var i: i64 = 0;
     while i < bytes.len() {
         d.regs.set((reg + i) % d.regs.len(), bytes.get(i) & 0xFF);
@@ -444,22 +465,26 @@ fn spi_no_xfer(h: i64, req: Vec<i64>) -> Vec<i64> {
 }
 
 pub fn spi_bus_fake(cfg: SpiConfig) -> SpiBus {
-    return SpiBus { kind: SPI_BUS_FAKE, handle: 0, cs: 0, cfg: cfg, xfer: spi_no_xfer, devs: Vec::new(), selects: 0 };
+    return SpiBus {
+        kind: SPI_BUS_FAKE, handle: 0, cs: 0, cfg: cfg, xfer: spi_no_xfer, devs: Vec::new(), selects: 0
+    };
 }
 
 pub fn spi_bus_custom(handle: i64, cfg: SpiConfig, xfer: fn(i64, Vec<i64>) -> Vec<i64>) -> SpiBus {
-    return SpiBus { kind: SPI_BUS_FN, handle: handle, cs: 0, cfg: cfg, xfer: xfer, devs: Vec::new(), selects: 0 };
+    return SpiBus {
+        kind: SPI_BUS_FN, handle: handle, cs: 0, cfg: cfg, xfer: xfer, devs: Vec::new(), selects: 0
+    };
 }
 
-pub fn spi_fake_add(bus: & mut SpiBus, d: SpiFakeDev) {
+pub fn spi_fake_add(bus: &mut SpiBus, d: SpiFakeDev) {
     bus.devs.push(d);
 }
 
-pub fn spi_select(bus: & mut SpiBus, cs: i64) {
+pub fn spi_select(bus: &mut SpiBus, cs: i64) {
     bus.cs = cs;
 }
 
-pub fn spi_fake_get(bus: & SpiBus, cs: i64) -> SpiFakeDev {
+pub fn spi_fake_get(bus: &SpiBus, cs: i64) -> SpiFakeDev {
     var i: i64 = 0;
     while i < bus.devs.len() {
         if bus.devs.get(i).cs == cs {
@@ -471,7 +496,7 @@ pub fn spi_fake_get(bus: & SpiBus, cs: i64) -> SpiFakeDev {
 }
 
 /// One chip-select assertion of a fake register device: returns MISO.
-fn spi_fake_frame(d: & mut SpiFakeDev, tx: & Vec<i64>, loopmode: bool) -> Vec<i64> {
+fn spi_fake_frame(d: &mut SpiFakeDev, tx: &Vec<i64>, loopmode: bool) -> Vec<i64> {
     var rx: Vec<i64> = Vec::new();
     if d.kind == 1 || loopmode {
         var i: i64 = 0;
@@ -506,7 +531,7 @@ fn spi_fake_frame(d: & mut SpiFakeDev, tx: & Vec<i64>, loopmode: bool) -> Vec<i6
     return rx;
 }
 
-fn spi_fake_message(bus: & mut SpiBus, xs: & Vec<SpiXfer>) -> Result<Vec<i64>, str> {
+fn spi_fake_message(bus: &mut SpiBus, xs: &Vec<SpiXfer>) -> Result<Vec<i64>, str> {
     var di: i64 = 0 - 1;
     var i: i64 = 0;
     while i < bus.devs.len() {
@@ -533,7 +558,7 @@ fn spi_fake_message(bus: & mut SpiBus, xs: & Vec<SpiXfer>) -> Result<Vec<i64>, s
         }
         if x.cs_change || k == xs.len() - 1 {
             bus.selects = bus.selects + 1;
-            val got: Vec<i64> = spi_fake_frame(& mut d, & frame, loopmode);
+            val got: Vec<i64> = spi_fake_frame(&mut d, &frame, loopmode);
             var g: i64 = 0;
             while g < got.len() {
                 rx.push(got.get(g));
@@ -549,12 +574,12 @@ fn spi_fake_message(bus: & mut SpiBus, xs: & Vec<SpiXfer>) -> Result<Vec<i64>, s
 
 /// Run a message (segments under one chip select unless cs_change); the
 /// bytes clocked in, all segments concatenated.
-pub fn spi_message(bus: & mut SpiBus, xs: Vec<SpiXfer>) -> Result<Vec<i64>, str> {
+pub fn spi_message(bus: &mut SpiBus, xs: Vec<SpiXfer>) -> Result<Vec<i64>, str> {
     if bus.kind == SPI_BUS_FAKE {
-        return spi_fake_message(bus, & xs);
+        return spi_fake_message(bus, &xs);
     }
     val f = bus.xfer;
-    val reply: Vec<i64> = f(bus.handle, spi_encode_request(& bus.cfg, bus.cs, & xs));
+    val reply: Vec<i64> = f(bus.handle, spi_encode_request(&bus.cfg, bus.cs, &xs));
     if reply.len() == 0 {
         return Result::Err("transport gave no status");
     }
@@ -571,18 +596,18 @@ pub fn spi_message(bus: & mut SpiBus, xs: Vec<SpiXfer>) -> Result<Vec<i64>, str>
 }
 
 /// Full duplex: send tx, get as many bytes back.
-pub fn spi_transfer(bus: & mut SpiBus, tx: Vec<i64>) -> Result<Vec<i64>, str> {
+pub fn spi_transfer(bus: &mut SpiBus, tx: Vec<i64>) -> Result<Vec<i64>, str> {
     var xs: Vec<SpiXfer> = Vec::new();
     xs.push(spi_xfer(tx));
     return spi_message(bus, xs);
 }
 
 /// Full duplex in words of the bus's bits_per_word.
-pub fn spi_transfer_words(bus: & mut SpiBus, words: Vec<i64>) -> Result<Vec<i64>, str> {
+pub fn spi_transfer_words(bus: &mut SpiBus, words: Vec<i64>) -> Result<Vec<i64>, str> {
     val bits: i64 = bus.cfg.bits_per_word;
-    match spi_transfer(bus, spi_pack_words(& words, bits)) {
+    match spi_transfer(bus, spi_pack_words(&words, bits)) {
         Result::Ok(rx) => {
-            return Result::Ok(spi_unpack_words(& rx, bits));
+            return Result::Ok(spi_unpack_words(&rx, bits));
         }
         Result::Err(e) => {
             return Result::Err(e);
@@ -591,7 +616,7 @@ pub fn spi_transfer_words(bus: & mut SpiBus, words: Vec<i64>) -> Result<Vec<i64>
 }
 
 /// Send then receive under one chip select (half duplex in two segments).
-pub fn spi_write_then_read(bus: & mut SpiBus, tx: Vec<i64>, n: i64) -> Result<Vec<i64>, str> {
+pub fn spi_write_then_read(bus: &mut SpiBus, tx: Vec<i64>, n: i64) -> Result<Vec<i64>, str> {
     var xs: Vec<SpiXfer> = Vec::new();
     val ntx: i64 = tx.len();
     xs.push(spi_xfer(tx));
@@ -613,13 +638,13 @@ pub fn spi_write_then_read(bus: & mut SpiBus, tx: Vec<i64>, n: i64) -> Result<Ve
 }
 
 /// Read n registers from a register device (address | 0x80, then dummies).
-pub fn spi_read_regs(bus: & mut SpiBus, reg: i64, n: i64) -> Result<Vec<i64>, str> {
+pub fn spi_read_regs(bus: &mut SpiBus, reg: i64, n: i64) -> Result<Vec<i64>, str> {
     var tx: Vec<i64> = Vec::new();
     tx.push((reg & 0x7F) | 0x80);
     return spi_write_then_read(bus, tx, n);
 }
 
-pub fn spi_read_reg8(bus: & mut SpiBus, reg: i64) -> i64 {
+pub fn spi_read_reg8(bus: &mut SpiBus, reg: i64) -> i64 {
     match spi_read_regs(bus, reg, 1) {
         Result::Ok(b) => {
             return b.get(0);
@@ -631,7 +656,7 @@ pub fn spi_read_reg8(bus: & mut SpiBus, reg: i64) -> i64 {
 }
 
 /// Write registers (address with the read bit clear, then the values).
-pub fn spi_write_regs(bus: & mut SpiBus, reg: i64, values: Vec<i64>) -> bool {
+pub fn spi_write_regs(bus: &mut SpiBus, reg: i64, values: Vec<i64>) -> bool {
     var tx: Vec<i64> = Vec::new();
     tx.push(reg & 0x7F);
     var i: i64 = 0;
@@ -651,7 +676,7 @@ pub fn spi_write_regs(bus: & mut SpiBus, reg: i64, values: Vec<i64>) -> bool {
 
 // ─── Linux spidev image ─────────────────────────────────────────────────
 
-fn spi_put_le(out: & mut Vec<i64>, off: i64, v: i64, n: i64) {
+fn spi_put_le(out: &mut Vec<i64>, off: i64, v: i64, n: i64) {
     var i: i64 = 0;
     while i < n {
         out.set(off + i, (v >> (8 * i)) & 0xFF);
@@ -659,7 +684,7 @@ fn spi_put_le(out: & mut Vec<i64>, off: i64, v: i64, n: i64) {
     }
 }
 
-pub fn spi_image_size(xs: & Vec<SpiXfer>) -> i64 {
+pub fn spi_image_size(xs: &Vec<SpiXfer>) -> i64 {
     var n: i64 = SPI_IOC_TRANSFER_SIZE * xs.len();
     var i: i64 = 0;
     while i < xs.len() {
@@ -673,7 +698,7 @@ pub fn spi_image_size(xs: & Vec<SpiXfer>) -> i64 {
 /// rx buffer. Fields: tx_buf@0 (u64), rx_buf@8 (u64), len@16 (u32),
 /// speed_hz@20 (u32), delay_usecs@24 (u16), bits_per_word@26,
 /// cs_change@27, tx_nbits@28, rx_nbits@29, word_delay_usecs@30, pad@31.
-pub fn spi_ioc_image(xs: & Vec<SpiXfer>, base: i64) -> Vec<i64> {
+pub fn spi_ioc_image(xs: &Vec<SpiXfer>, base: i64) -> Vec<i64> {
     var img: Vec<i64> = Vec::filled(spi_image_size(xs), 0);
     var buf: i64 = SPI_IOC_TRANSFER_SIZE * xs.len();
     var i: i64 = 0;
@@ -681,12 +706,12 @@ pub fn spi_ioc_image(xs: & Vec<SpiXfer>, base: i64) -> Vec<i64> {
         val x: SpiXfer = xs.get(i);
         val o: i64 = SPI_IOC_TRANSFER_SIZE * i;
         val n: i64 = x.tx.len();
-        spi_put_le(& mut img, o, base + buf, 8);
-        spi_put_le(& mut img, o + 8, base + buf + n, 8);
-        spi_put_le(& mut img, o + 16, n, 4);
-        spi_put_le(& mut img, o + 20, x.speed_hz, 4);
-        spi_put_le(& mut img, o + 24, x.delay_us, 2);
-        spi_put_le(& mut img, o + 26, x.bits_per_word, 1);
+        spi_put_le(&mut img, o, base + buf, 8);
+        spi_put_le(&mut img, o + 8, base + buf + n, 8);
+        spi_put_le(&mut img, o + 16, n, 4);
+        spi_put_le(&mut img, o + 20, x.speed_hz, 4);
+        spi_put_le(&mut img, o + 24, x.delay_us, 2);
+        spi_put_le(&mut img, o + 26, x.bits_per_word, 1);
         if x.cs_change {
             img.set(o + 27, 1);
         }
@@ -702,7 +727,7 @@ pub fn spi_ioc_image(xs: & Vec<SpiXfer>, base: i64) -> Vec<i64> {
 }
 
 /// The rx bytes of every segment, from an image after the ioctl.
-pub fn spi_ioc_rx(xs: & Vec<SpiXfer>, img: & Vec<i64>) -> Vec<i64> {
+pub fn spi_ioc_rx(xs: &Vec<SpiXfer>, img: &Vec<i64>) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     var buf: i64 = SPI_IOC_TRANSFER_SIZE * xs.len();
     var i: i64 = 0;
@@ -747,9 +772,9 @@ fn spi_linux_ioctl_value(fd: i64, req: i64, value: i64, n: i64) -> i64 {
 /// The Linux transport (handle = the spidev fd).
 @cfg(linux)
 pub fn spi_linux_xfer(fd: i64, req: Vec<i64>) -> Vec<i64> {
-    val xs: Vec<SpiXfer> = spi_decode_request(& req);
+    val xs: Vec<SpiXfer> = spi_decode_request(&req);
     var reply: Vec<i64> = Vec::new();
-    val n: i64 = spi_image_size(& xs);
+    val n: i64 = spi_image_size(&xs);
     if n == 0 {
         reply.push(0);
         return reply;
@@ -757,7 +782,7 @@ pub fn spi_linux_xfer(fd: i64, req: Vec<i64>) -> Vec<i64> {
     // SAFETY: base is n bytes from p_malloc (n covers exactly the transfer buffers of xs) and the kernel DMA touches only those bytes; it is freed on every path below.
     unsafe {
         val base: i64 = p_malloc(n);
-        val img: Vec<i64> = spi_ioc_image(& xs, base);
+        val img: Vec<i64> = spi_ioc_image(&xs, base);
         var i: i64 = 0;
         while i < n {
             p_volatile_store8(base + i, img.get(i));
@@ -777,7 +802,7 @@ pub fn spi_linux_xfer(fd: i64, req: Vec<i64>) -> Vec<i64> {
         }
         p_free(base);
         reply.push(0);
-        val rx: Vec<i64> = spi_ioc_rx(& xs, & back);
+        val rx: Vec<i64> = spi_ioc_rx(&xs, &back);
         var k: i64 = 0;
         while k < rx.len() {
             reply.push(rx.get(k));
@@ -826,11 +851,13 @@ pub fn spi_linux_open(busno: i64, cs: i64, cfg: SpiConfig) -> Result<SpiBus, str
         }
         return Result::Err("SPI_IOC_WR_MAX_SPEED_HZ failed on " + path);
     }
-    return Result::Ok(SpiBus { kind: SPI_BUS_FN, handle: fd, cs: cs, cfg: cfg, xfer: spi_linux_xfer, devs: Vec::new(), selects: 0 });
+    return Result::Ok(SpiBus {
+        kind: SPI_BUS_FN, handle: fd, cs: cs, cfg: cfg, xfer: spi_linux_xfer, devs: Vec::new(), selects: 0
+    });
 }
 
 @cfg(linux)
-pub fn spi_linux_close(bus: & mut SpiBus) {
+pub fn spi_linux_close(bus: &mut SpiBus) {
     if bus.kind == SPI_BUS_FN && bus.handle >= 0 {
         // SAFETY: the guard (kind FN and handle >= 0) makes this a real descriptor, and close is the bus's last use.
         unsafe {

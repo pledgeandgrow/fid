@@ -24,7 +24,8 @@
 //   vmm_map(&mut asp, &mut mem, &mut fa, 0x400000, 0x5000, 4096, VM_READ | VM_WRITE);
 //   val t = vmm_translate(&asp, &mem, 0x400123);   // t.pa == 0x5123
 module vmm;
- use vec; use pmm;
+use vec;
+use pmm;
 
 // ─── Architectures ──────────────────────────────────────────────────────
 
@@ -94,7 +95,7 @@ fn physmem_raw_store(addr: i64, v: i64) {
     p_volatile_store(addr, v);
 }
 
-fn physmem_index(m: & PhysMem, pa: i64) -> i64 {
+fn physmem_index(m: &PhysMem, pa: i64) -> i64 {
     var off: i64 = pa - m.base;
     if off < 0 || off + 8 > m.size {
         panic("physmem: address outside fake RAM");
@@ -103,19 +104,23 @@ fn physmem_index(m: & PhysMem, pa: i64) -> i64 {
 }
 
 /// 64-bit read at an 8-byte aligned physical address.
-pub fn phys_read64(m: & PhysMem, pa: i64) -> i64 {
+pub fn phys_read64(m: &PhysMem, pa: i64) -> i64 {
     if !m.fake {
         // SAFETY: !m.fake means dmap maps all of m.size (the mapper validated the range when the guest RAM was bound), and the doc contract is an 8-byte aligned pa — the load reads guest RAM only.
-        unsafe { return physmem_raw_load(pa + m.dmap); }
+        unsafe {
+            return physmem_raw_load(pa + m.dmap);
+        }
     }
     return m.words.get(physmem_index(m, pa));
 }
 
 /// 64-bit write at an 8-byte aligned physical address.
-pub fn phys_write64(m: & mut PhysMem, pa: i64, v: i64) {
+pub fn phys_write64(m: &mut PhysMem, pa: i64, v: i64) {
     if !m.fake {
         // SAFETY: !m.fake means dmap maps all of m.size (the mapper validated the range when the guest RAM was bound), and the doc contract is an 8-byte aligned pa — the store writes guest RAM only.
-        unsafe { physmem_raw_store(pa + m.dmap, v); }
+        unsafe {
+            physmem_raw_store(pa + m.dmap, v);
+        }
         return;
     }
     var i: i64 = physmem_index(m, pa);
@@ -123,20 +128,26 @@ pub fn phys_write64(m: & mut PhysMem, pa: i64, v: i64) {
 }
 
 /// Byte read at any address (fake RAM: taken out of its word).
-@wrapping pub fn phys_read8(m: & PhysMem, pa: i64) -> i64 {
+@wrapping
+pub fn phys_read8(m: &PhysMem, pa: i64) -> i64 {
     if !m.fake {
         // SAFETY: !m.fake means dmap maps all of m.size; any byte pa in the range is a mapped byte, so the volatile load reads the device behind it without tearing.
-        unsafe { return p_volatile_load8(pa + m.dmap); }
+        unsafe {
+            return p_volatile_load8(pa + m.dmap);
+        }
     }
     var w: i64 = phys_read64(m, pa - (pa & 7));
     return (w >> ((pa & 7) * 8)) & 255;
 }
 
 /// Byte write.
-@wrapping pub fn phys_write8(m: & mut PhysMem, pa: i64, b: i64) {
+@wrapping
+pub fn phys_write8(m: &mut PhysMem, pa: i64, b: i64) {
     if !m.fake {
         // SAFETY: !m.fake means dmap maps all of m.size; any byte pa in the range is a mapped byte, so the volatile store hits exactly the device byte (a read-modify-write of its word cannot be avoided on some buses — the doc says so).
-        unsafe { p_volatile_store8(pa + m.dmap, b); }
+        unsafe {
+            p_volatile_store8(pa + m.dmap, b);
+        }
         return;
     }
     var a: i64 = pa - (pa & 7);
@@ -147,7 +158,8 @@ pub fn phys_write64(m: & mut PhysMem, pa: i64, v: i64) {
 }
 
 /// Little-endian read of n (1..8) bytes.
-@wrapping pub fn phys_read_le(m: & PhysMem, pa: i64, n: i64) -> i64 {
+@wrapping
+pub fn phys_read_le(m: &PhysMem, pa: i64, n: i64) -> i64 {
     if m.fake && (pa & 7) == 0 && n == 8 {
         return phys_read64(m, pa);
     }
@@ -169,7 +181,8 @@ pub fn phys_write64(m: & mut PhysMem, pa: i64, v: i64) {
 }
 
 /// Little-endian write of the low n (1..8) bytes of v.
-@wrapping pub fn phys_write_le(m: & mut PhysMem, pa: i64, n: i64, v: i64) {
+@wrapping
+pub fn phys_write_le(m: &mut PhysMem, pa: i64, n: i64, v: i64) {
     if m.fake && (pa & 7) == 0 && n == 8 {
         phys_write64(m, pa, v);
         return;
@@ -191,7 +204,7 @@ pub fn phys_write64(m: & mut PhysMem, pa: i64, v: i64) {
 }
 
 /// Copy bytes (one per element) into physical memory.
-pub fn phys_write_bytes(m: & mut PhysMem, pa: i64, bytes: Vec<i64>) {
+pub fn phys_write_bytes(m: &mut PhysMem, pa: i64, bytes: Vec<i64>) {
     var i: i64 = 0;
     while i < bytes.len() {
         phys_write8(m, pa + i, bytes.get(i));
@@ -200,7 +213,7 @@ pub fn phys_write_bytes(m: & mut PhysMem, pa: i64, bytes: Vec<i64>) {
 }
 
 /// Read n bytes from physical memory.
-pub fn phys_read_bytes(m: & PhysMem, pa: i64, n: i64) -> Vec<i64> {
+pub fn phys_read_bytes(m: &PhysMem, pa: i64, n: i64) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     var i: i64 = 0;
     while i < n {
@@ -211,7 +224,7 @@ pub fn phys_read_bytes(m: & PhysMem, pa: i64, n: i64) -> Vec<i64> {
 }
 
 /// Zero one 4-KiB frame.
-pub fn phys_zero_frame(m: & mut PhysMem, pa: i64) {
+pub fn phys_zero_frame(m: &mut PhysMem, pa: i64) {
     var i: i64 = 0;
     while i < 512 {
         phys_write64(m, pa + i * 8, 0);
@@ -228,11 +241,13 @@ pub struct FrameAlloc {
 
 /// Allocator for `frames` frames starting at physical `base`.
 pub fn framealloc_new(base: i64, frames: i64) -> FrameAlloc {
-    return FrameAlloc { pmm: pmm_new(frames), base: base };
+    return FrameAlloc {
+        pmm: pmm_new(frames), base: base
+    };
 }
 
 /// Physical address of a free frame, -1 when none is left.
-pub fn framealloc_alloc(fa: & mut FrameAlloc) -> i64 {
+pub fn framealloc_alloc(fa: &mut FrameAlloc) -> i64 {
     var f: i64 = pmm_alloc(&mut fa.pmm);
     if f < 0 {
         return -1;
@@ -240,12 +255,12 @@ pub fn framealloc_alloc(fa: & mut FrameAlloc) -> i64 {
     return fa.base + f * 4096;
 }
 
-pub fn framealloc_free(fa: & mut FrameAlloc, pa: i64) {
+pub fn framealloc_free(fa: &mut FrameAlloc, pa: i64) {
     pmm_free(&mut fa.pmm, (pa - fa.base) / 4096);
 }
 
 /// Frames in use.
-pub fn framealloc_used(fa: & FrameAlloc) -> i64 {
+pub fn framealloc_used(fa: &FrameAlloc) -> i64 {
     return fa.pmm.used;
 }
 
@@ -291,7 +306,8 @@ pub fn vmm_leaf_allowed(arch: i64, level: i64) -> bool {
 
 /// Canonical: the bits above the translated range copy the top bit.
 /// AArch64 only looks at bits 63:48 (all zero: TTBR0, all one: TTBR1).
-@wrapping pub fn vmm_canonical(arch: i64, va: i64) -> bool {
+@wrapping
+pub fn vmm_canonical(arch: i64, va: i64) -> bool {
     var bits: i64 = vmm_va_bits(arch);
     if arch == VMM_AARCH64 {
         bits = 49;
@@ -317,7 +333,8 @@ fn vmm_bit(x: bool, v: i64) -> i64 {
 }
 
 /// x86-64: P, RW, US, PWT, PCD, A, D, PS (large page), G, NX (bit 63).
-@wrapping fn vmm_x86_encode(level: i64, pa: i64, flags: i64, leaf: bool) -> i64 {
+@wrapping
+fn vmm_x86_encode(level: i64, pa: i64, flags: i64, leaf: bool) -> i64 {
     var e: i64 = (pa & VMM_ADDR_MASK) | 1;
     if !leaf {
         return e | 2 | 4;
@@ -334,8 +351,11 @@ fn vmm_bit(x: bool, v: i64) -> i64 {
     return e;
 }
 
-@wrapping fn vmm_x86_decode(level: i64, e: i64) -> VmEntry {
-    var r: VmEntry = VmEntry { valid: (e & 1) != 0, leaf: false, pa: 0, flags: 0 };
+@wrapping
+fn vmm_x86_decode(level: i64, e: i64) -> VmEntry {
+    var r: VmEntry = VmEntry {
+        valid: (e & 1) != 0, leaf: false, pa: 0, flags: 0
+    };
     if !r.valid {
         return r;
     }
@@ -360,7 +380,8 @@ fn vmm_bit(x: bool, v: i64) -> i64 {
 // AArch64 lower attributes: AttrIndx[4:2], AP[7:6], SH[9:8], AF[10],
 // nG[11]; upper: DBM[51], PXN[53], UXN[54]. AP[2] (bit 7) = read-only,
 // AP[1] (bit 6) = EL0 access. MAIR index 0 = normal WB, 1 = device.
-@wrapping fn vmm_a64_encode(level: i64, pa: i64, flags: i64, leaf: bool) -> i64 {
+@wrapping
+fn vmm_a64_encode(level: i64, pa: i64, flags: i64, leaf: bool) -> i64 {
     var e: i64 = pa & 0x0000FFFFFFFFF000;
     if !leaf {
         return e | 3;
@@ -392,8 +413,11 @@ fn vmm_bit(x: bool, v: i64) -> i64 {
     return e;
 }
 
-@wrapping fn vmm_a64_decode(level: i64, e: i64) -> VmEntry {
-    var r: VmEntry = VmEntry { valid: (e & 1) != 0, leaf: false, pa: 0, flags: 0 };
+@wrapping
+fn vmm_a64_decode(level: i64, e: i64) -> VmEntry {
+    var r: VmEntry = VmEntry {
+        valid: (e & 1) != 0, leaf: false, pa: 0, flags: 0
+    };
     if !r.valid {
         return r;
     }
@@ -433,7 +457,8 @@ fn vmm_bit(x: bool, v: i64) -> i64 {
 }
 
 // RISC-V: V R W X U G A D, RSW, PPN from bit 10, Svpbmt in bits 62:61.
-@wrapping fn vmm_rv_encode(level: i64, pa: i64, flags: i64, leaf: bool) -> i64 {
+@wrapping
+fn vmm_rv_encode(level: i64, pa: i64, flags: i64, leaf: bool) -> i64 {
     var e: i64 = ((pa >> 12) & 0xFFFFFFFFFFF) << 10;
     e = e | 1;
     if !leaf {
@@ -451,8 +476,11 @@ fn vmm_bit(x: bool, v: i64) -> i64 {
     return e;
 }
 
-@wrapping fn vmm_rv_decode(level: i64, e: i64) -> VmEntry {
-    var r: VmEntry = VmEntry { valid: (e & 1) != 0, leaf: false, pa: 0, flags: 0 };
+@wrapping
+fn vmm_rv_decode(level: i64, e: i64) -> VmEntry {
+    var r: VmEntry = VmEntry {
+        valid: (e & 1) != 0, leaf: false, pa: 0, flags: 0
+    };
     if !r.valid {
         return r;
     }
@@ -545,7 +573,7 @@ pub struct Translation {
     pub entry_pa: i64,  // where the leaf entry lives
 }
 
-fn vmm_new_table(mem: & mut PhysMem, fa: & mut FrameAlloc) -> i64 {
+fn vmm_new_table(mem: &mut PhysMem, fa: &mut FrameAlloc) -> i64 {
     var pa: i64 = framealloc_alloc(fa);
     if pa < 0 {
         return -1;
@@ -555,8 +583,10 @@ fn vmm_new_table(mem: & mut PhysMem, fa: & mut FrameAlloc) -> i64 {
 }
 
 /// A fresh, empty address space. root is -1 when no frame is free.
-pub fn vmm_new(arch: i64, mem: & mut PhysMem, fa: & mut FrameAlloc) -> AddrSpace {
-    var a: AddrSpace = AddrSpace { arch: arch, root: -1, root_hi: 0, asid: 0, tables: 0, mapped: 0 };
+pub fn vmm_new(arch: i64, mem: &mut PhysMem, fa: &mut FrameAlloc) -> AddrSpace {
+    var a: AddrSpace = AddrSpace {
+        arch: arch, root: -1, root_hi: 0, asid: 0, tables: 0, mapped: 0
+    };
     a.root = vmm_new_table(mem, fa);
     if a.root < 0 {
         return a;
@@ -574,7 +604,7 @@ pub fn vmm_new(arch: i64, mem: & mut PhysMem, fa: & mut FrameAlloc) -> AddrSpace
     return a;
 }
 
-fn vmm_root_for(a: & AddrSpace, va: i64) -> i64 {
+fn vmm_root_for(a: &AddrSpace, va: i64) -> i64 {
     if a.arch == VMM_AARCH64 && va < 0 {
         return a.root_hi;
     }
@@ -583,7 +613,7 @@ fn vmm_root_for(a: & AddrSpace, va: i64) -> i64 {
 
 /// Map [va, va+size) to [pa, pa+size) with one leaf entry; size is 4 KiB
 /// or a large page size the architecture allows.
-pub fn vmm_map_page(a: & mut AddrSpace, mem: & mut PhysMem, fa: & mut FrameAlloc, va: i64, pa: i64, size: i64, flags: i64) -> i64 {
+pub fn vmm_map_page(a: &mut AddrSpace, mem: &mut PhysMem, fa: &mut FrameAlloc, va: i64, pa: i64, size: i64, flags: i64) -> i64 {
     if !vmm_canonical(a.arch, va) {
         return VMM_ERR_CANON;
     }
@@ -646,7 +676,7 @@ pub fn vmm_best_size(arch: i64, va: i64, pa: i64, left: i64) -> i64 {
 
 /// Map a range (4-KiB aligned) using large pages where alignment allows.
 /// Returns the number of leaf entries written, or an error.
-pub fn vmm_map(a: & mut AddrSpace, mem: & mut PhysMem, fa: & mut FrameAlloc, va: i64, pa: i64, len: i64, flags: i64) -> i64 {
+pub fn vmm_map(a: &mut AddrSpace, mem: &mut PhysMem, fa: &mut FrameAlloc, va: i64, pa: i64, len: i64, flags: i64) -> i64 {
     if (va & 4095) != 0 || (pa & 4095) != 0 || (len & 4095) != 0 {
         return VMM_ERR_ALIGN;
     }
@@ -665,8 +695,10 @@ pub fn vmm_map(a: & mut AddrSpace, mem: & mut PhysMem, fa: & mut FrameAlloc, va:
 }
 
 /// Walk the tables for va.
-pub fn vmm_translate(a: & AddrSpace, mem: & PhysMem, va: i64) -> Translation {
-    var t: Translation = Translation { ok: false, pa: 0, flags: 0, level: -1, page_size: 0, entry_pa: 0 };
+pub fn vmm_translate(a: &AddrSpace, mem: &PhysMem, va: i64) -> Translation {
+    var t: Translation = Translation {
+        ok: false, pa: 0, flags: 0, level: -1, page_size: 0, entry_pa: 0
+    };
     if !vmm_canonical(a.arch, va) {
         return t;
     }
@@ -697,7 +729,7 @@ pub fn vmm_translate(a: & AddrSpace, mem: & PhysMem, va: i64) -> Translation {
     return t;
 }
 
-fn vmm_table_empty(mem: & PhysMem, table: i64) -> bool {
+fn vmm_table_empty(mem: &PhysMem, table: i64) -> bool {
     var i: i64 = 0;
     while i < 512 {
         if phys_read64(mem, table + i * 8) != 0 {
@@ -711,7 +743,7 @@ fn vmm_table_empty(mem: & PhysMem, table: i64) -> bool {
 /// Remove the mapping holding va (a whole large page when va is in one)
 /// and free page tables left empty. Returns the size unmapped or an error.
 /// The caller then invalidates the TLB entry for va.
-pub fn vmm_unmap(a: & mut AddrSpace, mem: & mut PhysMem, fa: & mut FrameAlloc, va: i64) -> i64 {
+pub fn vmm_unmap(a: &mut AddrSpace, mem: &mut PhysMem, fa: &mut FrameAlloc, va: i64) -> i64 {
     if !vmm_canonical(a.arch, va) {
         return VMM_ERR_CANON;
     }
@@ -754,7 +786,7 @@ pub fn vmm_unmap(a: & mut AddrSpace, mem: & mut PhysMem, fa: & mut FrameAlloc, v
 }
 
 /// Replace the flags of the mapping holding va.
-pub fn vmm_protect(a: & mut AddrSpace, mem: & mut PhysMem, va: i64, flags: i64) -> i64 {
+pub fn vmm_protect(a: &mut AddrSpace, mem: &mut PhysMem, va: i64, flags: i64) -> i64 {
     var t: Translation = vmm_translate(a, mem, va);
     if !t.ok {
         return VMM_ERR_NOTMAPPED;
@@ -767,12 +799,13 @@ pub fn vmm_protect(a: & mut AddrSpace, mem: & mut PhysMem, va: i64, flags: i64) 
 // ─── Root registers and attribute setup ─────────────────────────────────
 
 /// CR3: root table address with a PCID (CR4.PCIDE) in bits 11:0.
-pub fn vmm_cr3(a: & AddrSpace, pcid: i64) -> i64 {
+pub fn vmm_cr3(a: &AddrSpace, pcid: i64) -> i64 {
     return (a.root & VMM_ADDR_MASK) | (pcid & 4095);
 }
 
 /// satp: MODE (8 = Sv39, 9 = Sv48) << 60 | ASID << 44 | root PPN.
-@wrapping pub fn vmm_satp(a: & AddrSpace) -> i64 {
+@wrapping
+pub fn vmm_satp(a: &AddrSpace) -> i64 {
     var mode: i64 = 8;
     if a.arch == VMM_SV48 {
         mode = 9;
@@ -781,7 +814,8 @@ pub fn vmm_cr3(a: & AddrSpace, pcid: i64) -> i64 {
 }
 
 /// TTBR0_EL1 / TTBR1_EL1: ASID << 48 | table address.
-@wrapping pub fn vmm_ttbr(table: i64, asid: i64) -> i64 {
+@wrapping
+pub fn vmm_ttbr(table: i64, asid: i64) -> i64 {
     return ((asid & 0xFFFF) << 48) | (table & 0x0000FFFFFFFFF000);
 }
 
@@ -795,12 +829,24 @@ pub fn vmm_mair_el1() -> i64 {
 /// inner-shareable walks, and IPS from the physical address width.
 pub fn vmm_tcr_el1(pa_bits: i64) -> i64 {
     var ips: i64 = 0;
-    if pa_bits > 32 { ips = 1; }
-    if pa_bits > 36 { ips = 2; }
-    if pa_bits > 40 { ips = 3; }
-    if pa_bits > 42 { ips = 4; }
-    if pa_bits > 44 { ips = 5; }
-    if pa_bits > 48 { ips = 6; }
+    if pa_bits > 32 {
+        ips = 1;
+    }
+    if pa_bits > 36 {
+        ips = 2;
+    }
+    if pa_bits > 40 {
+        ips = 3;
+    }
+    if pa_bits > 42 {
+        ips = 4;
+    }
+    if pa_bits > 44 {
+        ips = 5;
+    }
+    if pa_bits > 48 {
+        ips = 6;
+    }
     var t0: i64 = 16 | (1 << 8) | (1 << 10) | (3 << 12);
     // T0SZ, IRGN0, ORGN0, SH0, TG0 = 4K (0)
     var t1: i64 = (16 << 16) | (1 << 24) | (1 << 26) | (3 << 28) | (2 << 30);

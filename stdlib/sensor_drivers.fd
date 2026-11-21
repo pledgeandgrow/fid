@@ -24,10 +24,10 @@
 // commands take the wait as the caller's job (a poll limit or a separate
 // read call), so nothing here sleeps.
 module sensor_drivers;
- use vec;
- use string;
- use i2c;
- use spi;
+use vec;
+use string;
+use i2c;
+use spi;
 
 // ─── Bus choice ─────────────────────────────────────────────────────────
 
@@ -44,30 +44,34 @@ pub struct SensorBus {
 }
 
 pub fn sensor_on_i2c(bus: I2cBus, addr: i64) -> SensorBus {
-    return SensorBus { kind: SENSOR_I2C, addr: addr, i2c: bus, spi: spi_bus_fake(spi_config(0, 8, 1000000)) };
+    return SensorBus {
+        kind: SENSOR_I2C, addr: addr, i2c: bus, spi: spi_bus_fake(spi_config(0, 8, 1000000))
+    };
 }
 
 pub fn sensor_on_spi(bus: SpiBus) -> SensorBus {
-    return SensorBus { kind: SENSOR_SPI, addr: 0, i2c: i2c_bus_fake(), spi: bus };
+    return SensorBus {
+        kind: SENSOR_SPI, addr: 0, i2c: i2c_bus_fake(), spi: bus
+    };
 }
 
-pub fn sensor_read_regs(s: & mut SensorBus, reg: i64, n: i64) -> Result<Vec<i64>, str> {
+pub fn sensor_read_regs(s: &mut SensorBus, reg: i64, n: i64) -> Result<Vec<i64>, str> {
     if s.kind == SENSOR_SPI {
-        return spi_read_regs(& mut s.spi, reg, n);
+        return spi_read_regs(&mut s.spi, reg, n);
     }
-    return i2c_read_regs(& mut s.i2c, s.addr, reg, n);
+    return i2c_read_regs(&mut s.i2c, s.addr, reg, n);
 }
 
-pub fn sensor_write_reg(s: & mut SensorBus, reg: i64, value: i64) -> bool {
+pub fn sensor_write_reg(s: &mut SensorBus, reg: i64, value: i64) -> bool {
     if s.kind == SENSOR_SPI {
         var v: Vec<i64> = Vec::new();
         v.push(value & 0xFF);
-        return spi_write_regs(& mut s.spi, reg, v);
+        return spi_write_regs(&mut s.spi, reg, v);
     }
-    return i2c_write_reg8(& mut s.i2c, s.addr, reg, value);
+    return i2c_write_reg8(&mut s.i2c, s.addr, reg, value);
 }
 
-pub fn sensor_read_reg(s: & mut SensorBus, reg: i64) -> i64 {
+pub fn sensor_read_reg(s: &mut SensorBus, reg: i64) -> i64 {
     match sensor_read_regs(s, reg, 1) {
         Result::Ok(b) => {
             return b.get(0);
@@ -79,8 +83,8 @@ pub fn sensor_read_reg(s: & mut SensorBus, reg: i64) -> i64 {
 }
 
 /// Send raw command bytes (I2C devices without registers).
-pub fn sensor_command(s: & mut SensorBus, bytes: Vec<i64>) -> bool {
-    match i2c_write(& mut s.i2c, s.addr, bytes) {
+pub fn sensor_command(s: &mut SensorBus, bytes: Vec<i64>) -> bool {
+    match i2c_write(&mut s.i2c, s.addr, bytes) {
         Result::Ok(_) => {
             return true;
         }
@@ -90,15 +94,15 @@ pub fn sensor_command(s: & mut SensorBus, bytes: Vec<i64>) -> bool {
     }
 }
 
-pub fn sensor_read_raw(s: & mut SensorBus, n: i64) -> Result<Vec<i64>, str> {
-    return i2c_read(& mut s.i2c, s.addr, n);
+pub fn sensor_read_raw(s: &mut SensorBus, n: i64) -> Result<Vec<i64>, str> {
+    return i2c_read(&mut s.i2c, s.addr, n);
 }
 
-fn sd_u16le(b: & Vec<i64>, i: i64) -> i64 {
+fn sd_u16le(b: &Vec<i64>, i: i64) -> i64 {
     return (b.get(i) & 0xFF) | ((b.get(i + 1) & 0xFF) << 8);
 }
 
-fn sd_s16le(b: & Vec<i64>, i: i64) -> i64 {
+fn sd_s16le(b: &Vec<i64>, i: i64) -> i64 {
     val v: i64 = sd_u16le(b, i);
     if v >= 0x8000 {
         return v - 0x10000;
@@ -106,7 +110,7 @@ fn sd_s16le(b: & Vec<i64>, i: i64) -> i64 {
     return v;
 }
 
-fn sd_s16be(b: & Vec<i64>, i: i64) -> i64 {
+fn sd_s16be(b: &Vec<i64>, i: i64) -> i64 {
     val v: i64 = ((b.get(i) & 0xFF) << 8) | (b.get(i + 1) & 0xFF);
     if v >= 0x8000 {
         return v - 0x10000;
@@ -168,8 +172,10 @@ pub struct Bme280Cal {
 
 /// Calibration from the 26 bytes at 0x88..0xA1 and the 7 at 0xE1..0xE7
 /// (pass an empty second block for a BMP280).
-pub fn bme280_parse_cal(a: & Vec<i64>, b: & Vec<i64>) -> Bme280Cal {
-    var c: Bme280Cal = Bme280Cal { t1: sd_u16le(a, 0), t2: sd_s16le(a, 2), t3: sd_s16le(a, 4), p1: sd_u16le(a, 6), p2: sd_s16le(a, 8), p3: sd_s16le(a, 10), p4: sd_s16le(a, 12), p5: sd_s16le(a, 14), p6: sd_s16le(a, 16), p7: sd_s16le(a, 18), p8: sd_s16le(a, 20), p9: sd_s16le(a, 22), h1: 0, h2: 0, h3: 0, h4: 0, h5: 0, h6: 0 };
+pub fn bme280_parse_cal(a: &Vec<i64>, b: &Vec<i64>) -> Bme280Cal {
+    var c: Bme280Cal = Bme280Cal {
+        t1: sd_u16le(a, 0), t2: sd_s16le(a, 2), t3: sd_s16le(a, 4), p1: sd_u16le(a, 6), p2: sd_s16le(a, 8), p3: sd_s16le(a, 10), p4: sd_s16le(a, 12), p5: sd_s16le(a, 14), p6: sd_s16le(a, 16), p7: sd_s16le(a, 18), p8: sd_s16le(a, 20), p9: sd_s16le(a, 22), h1: 0, h2: 0, h3: 0, h4: 0, h5: 0, h6: 0
+    };
     if a.len() >= 26 {
         c.h1 = a.get(25) & 0xFF;
     }
@@ -184,7 +190,7 @@ pub fn bme280_parse_cal(a: & Vec<i64>, b: & Vec<i64>) -> Bme280Cal {
 }
 
 /// The datasheet's t_fine (shared by pressure and humidity).
-pub fn bme280_t_fine(c: & Bme280Cal, adc_t: i64) -> i64 {
+pub fn bme280_t_fine(c: &Bme280Cal, adc_t: i64) -> i64 {
     val var1: i64 = (((adc_t >> 3) - (c.t1 << 1)) * c.t2) >> 11;
     val d: i64 = (adc_t >> 4) - c.t1;
     val var2: i64 = (((d * d) >> 12) * c.t3) >> 14;
@@ -197,7 +203,7 @@ pub fn bme280_temp_c100(t_fine: i64) -> i64 {
 }
 
 /// Pressure in Pa as Q24.8 (divide by 256), the 64-bit formula.
-pub fn bme280_pressure_q24_8(c: & Bme280Cal, t_fine: i64, adc_p: i64) -> i64 {
+pub fn bme280_pressure_q24_8(c: &Bme280Cal, t_fine: i64, adc_p: i64) -> i64 {
     var var1: i64 = t_fine - 128000;
     var var2: i64 = var1 * var1 * c.p6;
     var2 = var2 + ((var1 * c.p5) << 17);
@@ -215,7 +221,7 @@ pub fn bme280_pressure_q24_8(c: & Bme280Cal, t_fine: i64, adc_p: i64) -> i64 {
 }
 
 /// Relative humidity in %RH as Q22.10 (divide by 1024).
-pub fn bme280_humidity_q22_10(c: & Bme280Cal, t_fine: i64, adc_h: i64) -> i64 {
+pub fn bme280_humidity_q22_10(c: &Bme280Cal, t_fine: i64, adc_h: i64) -> i64 {
     var v: i64 = t_fine - 76800;
     val a: i64 = (((adc_h << 14) - (c.h4 << 20) - (c.h5 * v)) + 16384) >> 15;
     val b: i64 = ((((((v * c.h6) >> 10) * (((v * c.h3) >> 11) + 32768)) >> 10) + 2097152) * c.h2 + 8192) >> 14;
@@ -231,7 +237,7 @@ pub fn bme280_humidity_q22_10(c: & Bme280Cal, t_fine: i64, adc_h: i64) -> i64 {
 }
 
 /// The datasheet's double-precision formulas: [temp C, pressure Pa, %RH].
-pub fn bme280_compensate_f64(c: & Bme280Cal, adc_t: i64, adc_p: i64, adc_h: i64) -> Vec<f64> {
+pub fn bme280_compensate_f64(c: &Bme280Cal, adc_t: i64, adc_p: i64, adc_h: i64) -> Vec<f64> {
     var v1: f64 = ((adc_t as f64) / 16384.0 - (c.t1 as f64) / 1024.0) * (c.t2 as f64);
     val dt: f64 = (adc_t as f64) / 131072.0 - (c.t1 as f64) / 8192.0;
     var v2: f64 = dt * dt * (c.t3 as f64);
@@ -267,7 +273,7 @@ pub fn bme280_compensate_f64(c: & Bme280Cal, adc_t: i64, adc_p: i64, adc_h: i64)
 }
 
 /// Raw ADC values from the 8 data bytes at 0xF7: [adc_p, adc_t, adc_h].
-pub fn bme280_parse_data(d: & Vec<i64>) -> Vec<i64> {
+pub fn bme280_parse_data(d: &Vec<i64>) -> Vec<i64> {
     var r: Vec<i64> = Vec::new();
     r.push(((d.get(0) & 0xFF) << 12) | ((d.get(1) & 0xFF) << 4) | ((d.get(2) & 0xFF) >> 4));
     r.push(((d.get(3) & 0xFF) << 12) | ((d.get(4) & 0xFF) << 4) | ((d.get(5) & 0xFF) >> 4));
@@ -309,12 +315,12 @@ pub struct Bme280 {
 /// filter off and normal mode.
 pub fn bme280_init(link: SensorBus) -> Result<Bme280, str> {
     var l: SensorBus = link;
-    val id: i64 = sensor_read_reg(& mut l, BME280_REG_ID);
+    val id: i64 = sensor_read_reg(&mut l, BME280_REG_ID);
     if id != BME280_CHIP_ID && id != BMP280_CHIP_ID {
         return Result::Err("unexpected chip id " + int_to_str(id));
     }
     var a: Vec<i64> = Vec::new();
-    match sensor_read_regs(& mut l, 0x88, 26) {
+    match sensor_read_regs(&mut l, 0x88, 26) {
         Result::Ok(v) => {
             a = v;
         }
@@ -325,7 +331,7 @@ pub fn bme280_init(link: SensorBus) -> Result<Bme280, str> {
     var b: Vec<i64> = Vec::new();
     val hum: bool = id == BME280_CHIP_ID;
     if hum {
-        match sensor_read_regs(& mut l, 0xE1, 7) {
+        match sensor_read_regs(&mut l, 0xE1, 7) {
             Result::Ok(v) => {
                 b = v;
             }
@@ -333,28 +339,30 @@ pub fn bme280_init(link: SensorBus) -> Result<Bme280, str> {
                 return Result::Err(e);
             }
         }
-        sensor_write_reg(& mut l, BME280_REG_CTRL_HUM, bme280_osrs(1));
+        sensor_write_reg(&mut l, BME280_REG_CTRL_HUM, bme280_osrs(1));
     }
-    sensor_write_reg(& mut l, BME280_REG_CONFIG, 0x00);
-    sensor_write_reg(& mut l, BME280_REG_CTRL_MEAS, (bme280_osrs(1) << 5) | (bme280_osrs(1) << 2) | BME280_MODE_NORMAL);
-    return Result::Ok(Bme280 { link: l, cal: bme280_parse_cal(& a, & b), has_humidity: hum });
+    sensor_write_reg(&mut l, BME280_REG_CONFIG, 0x00);
+    sensor_write_reg(&mut l, BME280_REG_CTRL_MEAS, (bme280_osrs(1) << 5) | (bme280_osrs(1) << 2) | BME280_MODE_NORMAL);
+    return Result::Ok(Bme280 {
+        link: l, cal: bme280_parse_cal(&a, &b), has_humidity: hum
+    });
 }
 
 /// One reading: [temp 0.01 C, pressure Pa Q24.8, humidity Q22.10].
-pub fn bme280_read(dev: & mut Bme280) -> Result<Vec<i64>, str> {
+pub fn bme280_read(dev: &mut Bme280) -> Result<Vec<i64>, str> {
     var n: i64 = 6;
     if dev.has_humidity {
         n = 8;
     }
-    match sensor_read_regs(& mut dev.link, BME280_REG_DATA, n) {
+    match sensor_read_regs(&mut dev.link, BME280_REG_DATA, n) {
         Result::Ok(d) => {
-            val raw: Vec<i64> = bme280_parse_data(& d);
-            val tf: i64 = bme280_t_fine(& dev.cal, raw.get(1));
+            val raw: Vec<i64> = bme280_parse_data(&d);
+            val tf: i64 = bme280_t_fine(&dev.cal, raw.get(1));
             var out: Vec<i64> = Vec::new();
             out.push(bme280_temp_c100(tf));
-            out.push(bme280_pressure_q24_8(& dev.cal, tf, raw.get(0)));
+            out.push(bme280_pressure_q24_8(&dev.cal, tf, raw.get(0)));
             if dev.has_humidity {
-                out.push(bme280_humidity_q22_10(& dev.cal, tf, raw.get(2)));
+                out.push(bme280_humidity_q22_10(&dev.cal, tf, raw.get(2)));
             } else {
                 out.push(0);
             }
@@ -408,19 +416,21 @@ pub struct Mpu6050 {
 /// Wake the device (clock from the X gyro PLL) and set the ranges.
 pub fn mpu6050_init(link: SensorBus, afs: i64, fs: i64) -> Result<Mpu6050, str> {
     var l: SensorBus = link;
-    val who: i64 = sensor_read_reg(& mut l, MPU6050_REG_WHO_AM_I);
+    val who: i64 = sensor_read_reg(&mut l, MPU6050_REG_WHO_AM_I);
     if who != MPU6050_WHO_AM_I_VALUE {
         return Result::Err("unexpected WHO_AM_I " + int_to_str(who));
     }
-    sensor_write_reg(& mut l, MPU6050_REG_PWR_MGMT_1, 0x01);
-    sensor_write_reg(& mut l, MPU6050_REG_GYRO_CONFIG, (fs & 3) << 3);
-    sensor_write_reg(& mut l, MPU6050_REG_ACCEL_CONFIG, (afs & 3) << 3);
-    return Result::Ok(Mpu6050 { link: l, afs: afs & 3, fs: fs & 3 });
+    sensor_write_reg(&mut l, MPU6050_REG_PWR_MGMT_1, 0x01);
+    sensor_write_reg(&mut l, MPU6050_REG_GYRO_CONFIG, (fs & 3) << 3);
+    sensor_write_reg(&mut l, MPU6050_REG_ACCEL_CONFIG, (afs & 3) << 3);
+    return Result::Ok(Mpu6050 {
+        link: l, afs: afs & 3, fs: fs & 3
+    });
 }
 
 /// Scale a 14-byte burst from 0x3B: [ax, ay, az] in mg, temperature in
 /// 0.001 C, [gx, gy, gz] in 0.001 deg/s.
-pub fn mpu6050_scale(raw: & Vec<i64>, afs: i64, fs: i64) -> Vec<i64> {
+pub fn mpu6050_scale(raw: &Vec<i64>, afs: i64, fs: i64) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     val alsb: i64 = mpu6050_accel_lsb_per_g(afs);
     var i: i64 = 0;
@@ -439,10 +449,10 @@ pub fn mpu6050_scale(raw: & Vec<i64>, afs: i64, fs: i64) -> Vec<i64> {
     return out;
 }
 
-pub fn mpu6050_read(dev: & mut Mpu6050) -> Result<Vec<i64>, str> {
-    match sensor_read_regs(& mut dev.link, MPU6050_REG_ACCEL_XOUT_H, 14) {
+pub fn mpu6050_read(dev: &mut Mpu6050) -> Result<Vec<i64>, str> {
+    match sensor_read_regs(&mut dev.link, MPU6050_REG_ACCEL_XOUT_H, 14) {
         Result::Ok(b) => {
-            return Result::Ok(mpu6050_scale(& b, dev.afs, dev.fs));
+            return Result::Ok(mpu6050_scale(&b, dev.afs, dev.fs));
         }
         Result::Err(e) => {
             return Result::Err(e);
@@ -467,13 +477,13 @@ pub fn vl53l0x_range_status(status_reg: i64) -> i64 {
     return (status_reg & 0x78) >> 3;
 }
 
-pub fn vl53l0x_present(s: & mut SensorBus) -> bool {
+pub fn vl53l0x_present(s: &mut SensorBus) -> bool {
     return sensor_read_reg(s, VL53L0X_REG_MODEL_ID) == VL53L0X_MODEL_ID_VALUE;
 }
 
 /// Start a single measurement (the stop variable read at init time goes
 /// through the 0x80/0xFF/0x00 private page as in the ST API).
-pub fn vl53l0x_start_single(s: & mut SensorBus, stop_variable: i64) -> bool {
+pub fn vl53l0x_start_single(s: &mut SensorBus, stop_variable: i64) -> bool {
     var ok: bool = sensor_write_reg(s, 0x80, 0x01);
     ok = ok && sensor_write_reg(s, 0xFF, 0x01);
     ok = ok && sensor_write_reg(s, 0x00, 0x00);
@@ -487,7 +497,7 @@ pub fn vl53l0x_start_single(s: & mut SensorBus, stop_variable: i64) -> bool {
 /// Poll for the result (up to max_polls reads of the interrupt status),
 /// then read range and status and clear the interrupt. [range mm, device
 /// range status]; Err on timeout.
-pub fn vl53l0x_read_result(s: & mut SensorBus, max_polls: i64) -> Result<Vec<i64>, str> {
+pub fn vl53l0x_read_result(s: &mut SensorBus, max_polls: i64) -> Result<Vec<i64>, str> {
     var n: i64 = 0;
     while n < max_polls {
         val st: i64 = sensor_read_reg(s, VL53L0X_REG_RESULT_INTERRUPT_STATUS);
@@ -533,7 +543,7 @@ pub const SHT3X_READ_STATUS: i64 = 0xF32D;
 pub const SHT3X_CLEAR_STATUS: i64 = 0x3041;
 
 /// Sensirion CRC-8: polynomial 0x31, initial 0xFF, no reflection.
-pub fn sht3x_crc8(bytes: & Vec<i64>) -> i64 {
+pub fn sht3x_crc8(bytes: &Vec<i64>) -> i64 {
     var crc: i64 = 0xFF;
     var i: i64 = 0;
     while i < bytes.len() {
@@ -570,7 +580,7 @@ pub fn sht3x_rh100(raw: i64) -> i64 {
 }
 
 /// Decode the 6-byte answer: [temp 0.01 C, RH 0.01 %], Err on a CRC error.
-pub fn sht3x_decode(b: & Vec<i64>) -> Result<Vec<i64>, str> {
+pub fn sht3x_decode(b: &Vec<i64>) -> Result<Vec<i64>, str> {
     if b.len() < 6 {
         return Result::Err("short read");
     }
@@ -580,10 +590,10 @@ pub fn sht3x_decode(b: & Vec<i64>) -> Result<Vec<i64>, str> {
     var h: Vec<i64> = Vec::new();
     h.push(b.get(3));
     h.push(b.get(4));
-    if sht3x_crc8(& t) != (b.get(2) & 0xFF) {
+    if sht3x_crc8(&t) != (b.get(2) & 0xFF) {
         return Result::Err("temperature CRC mismatch");
     }
-    if sht3x_crc8(& h) != (b.get(5) & 0xFF) {
+    if sht3x_crc8(&h) != (b.get(5) & 0xFF) {
         return Result::Err("humidity CRC mismatch");
     }
     var out: Vec<i64> = Vec::new();
@@ -593,13 +603,13 @@ pub fn sht3x_decode(b: & Vec<i64>) -> Result<Vec<i64>, str> {
 }
 
 /// Single-shot high repeatability with clock stretching, then the answer.
-pub fn sht3x_measure(s: & mut SensorBus) -> Result<Vec<i64>, str> {
+pub fn sht3x_measure(s: &mut SensorBus) -> Result<Vec<i64>, str> {
     if !sensor_command(s, sht3x_command_bytes(SHT3X_MEAS_HIGH_STRETCH)) {
         return Result::Err("no ACK");
     }
     match sensor_read_raw(s, 6) {
         Result::Ok(b) => {
-            return sht3x_decode(& b);
+            return sht3x_decode(&b);
         }
         Result::Err(e) => {
             return Result::Err(e);
@@ -640,7 +650,7 @@ pub fn bh1750_lux100(raw: i64, mtreg: i64, mode: i64) -> i64 {
     return (raw * 1000 * 69 + div / 2) / div;
 }
 
-pub fn bh1750_read_lux100(s: & mut SensorBus, mtreg: i64, mode: i64) -> Result<i64, str> {
+pub fn bh1750_read_lux100(s: &mut SensorBus, mtreg: i64, mode: i64) -> Result<i64, str> {
     match sensor_read_raw(s, 2) {
         Result::Ok(b) => {
             return Result::Ok(bh1750_lux100(((b.get(0) & 0xFF) << 8) | (b.get(1) & 0xFF), mtreg, mode));
@@ -742,12 +752,12 @@ pub struct Ina219 {
     pub cal: i64,
 }
 
-fn ina_write16(s: & mut SensorBus, reg: i64, value: i64) -> bool {
-    return i2c_write_reg16_be(& mut s.i2c, s.addr, reg, value);
+fn ina_write16(s: &mut SensorBus, reg: i64, value: i64) -> bool {
+    return i2c_write_reg16_be(&mut s.i2c, s.addr, reg, value);
 }
 
-fn ina_read16(s: & mut SensorBus, reg: i64) -> i64 {
-    return i2c_read_reg16_be(& mut s.i2c, s.addr, reg);
+fn ina_read16(s: &mut SensorBus, reg: i64) -> i64 {
+    return i2c_read_reg16_be(&mut s.i2c, s.addr, reg);
 }
 
 pub fn ina219_init(link: SensorBus, current_lsb_ua: i64, shunt_mohm: i64, config: i64) -> Result<Ina219, str> {
@@ -756,19 +766,21 @@ pub fn ina219_init(link: SensorBus, current_lsb_ua: i64, shunt_mohm: i64, config
     if cal <= 0 || cal > 0xFFFE {
         return Result::Err("calibration out of range");
     }
-    if !ina_write16(& mut l, INA219_REG_CONFIG, config) {
+    if !ina_write16(&mut l, INA219_REG_CONFIG, config) {
         return Result::Err("no ACK");
     }
-    ina_write16(& mut l, INA219_REG_CAL, cal & 0xFFFE);
-    return Result::Ok(Ina219 { link: l, current_lsb_ua: current_lsb_ua, cal: cal & 0xFFFE });
+    ina_write16(&mut l, INA219_REG_CAL, cal & 0xFFFE);
+    return Result::Ok(Ina219 {
+        link: l, current_lsb_ua: current_lsb_ua, cal: cal & 0xFFFE
+    });
 }
 
 /// [bus mV, shunt uV, current uA, power uW].
-pub fn ina219_read(dev: & mut Ina219) -> Vec<i64> {
+pub fn ina219_read(dev: &mut Ina219) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
-    out.push(ina219_bus_mv(ina_read16(& mut dev.link, INA219_REG_BUS)));
-    out.push(ina219_shunt_uv(ina_read16(& mut dev.link, INA219_REG_SHUNT)));
-    out.push(ina219_current_ua(ina_read16(& mut dev.link, INA219_REG_CURRENT), dev.current_lsb_ua));
-    out.push(ina219_power_uw(ina_read16(& mut dev.link, INA219_REG_POWER), dev.current_lsb_ua));
+    out.push(ina219_bus_mv(ina_read16(&mut dev.link, INA219_REG_BUS)));
+    out.push(ina219_shunt_uv(ina_read16(&mut dev.link, INA219_REG_SHUNT)));
+    out.push(ina219_current_ua(ina_read16(&mut dev.link, INA219_REG_CURRENT), dev.current_lsb_ua));
+    out.push(ina219_power_uw(ina_read16(&mut dev.link, INA219_REG_POWER), dev.current_lsb_ua));
     return out;
 }

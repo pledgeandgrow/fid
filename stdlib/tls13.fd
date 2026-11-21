@@ -32,7 +32,9 @@
 // for QUIC, with Ed25519 certificates, are stdlib/quic_tls.fd.
 
 module tls13;
- use vec; use crypto; use tls_crypto;
+use vec;
+use crypto;
+use tls_crypto;
 
 /// The hash length of the SHA-256 suites: every secret is this long.
 pub const TLS13_HASH_LEN: i64 = 32;
@@ -116,13 +118,15 @@ pub fn tls13_empty_hash() -> Vec<i64> {
 
 /// Derive-Secret(secret, label, messages) with the transcript hash given:
 /// HKDF-Expand-Label(secret, label, hash, 32).
-@secret pub fn tls13_derive_secret(@secret secret: Vec<i64>, label: str, transcript_hash: Vec<i64>) -> Vec<i64> {
+@secret
+pub fn tls13_derive_secret(@secret secret: Vec<i64>, label: str, transcript_hash: Vec<i64>) -> Vec<i64> {
     return hkdf_expand_label(secret, label, transcript_hash, TLS13_HASH_LEN);
 }
 
 /// The Early Secret: HKDF-Extract(0, PSK), the PSK all zeros when there is
 /// none (an empty `psk`).
-@secret pub fn tls13_early_secret(@secret psk: Vec<i64>) -> Vec<i64> {
+@secret
+pub fn tls13_early_secret(@secret psk: Vec<i64>) -> Vec<i64> {
     var ikm: Vec<i64> = psk;
     if psk.len() == 0 {
         ikm = t13_zeros(TLS13_HASH_LEN);
@@ -132,7 +136,8 @@ pub fn tls13_empty_hash() -> Vec<i64> {
 
 /// The binder key of a PSK (§7.1, §4.2.11.2): "ext binder" for an external
 /// PSK, "res binder" for a resumption one.
-@secret pub fn tls13_binder_key(@secret early: Vec<i64>, external: bool) -> Vec<i64> {
+@secret
+pub fn tls13_binder_key(@secret early: Vec<i64>, external: bool) -> Vec<i64> {
     if external {
         return tls13_derive_secret(early, "ext binder", tls13_empty_hash());
     }
@@ -141,46 +146,51 @@ pub fn tls13_empty_hash() -> Vec<i64> {
 
 /// The Handshake Secret: HKDF-Extract(Derive-Secret(early, "derived", ""),
 /// the (EC)DHE shared secret).
-@secret pub fn tls13_handshake_secret(@secret early: Vec<i64>, @secret shared: Vec<i64>) -> Vec<i64> {
+@secret
+pub fn tls13_handshake_secret(@secret early: Vec<i64>, @secret shared: Vec<i64>) -> Vec<i64> {
     return hkdf_extract(tls13_derive_secret(early, "derived", tls13_empty_hash()), shared);
 }
 
 /// The Master Secret: HKDF-Extract(Derive-Secret(handshake, "derived", ""), 0).
-@secret pub fn tls13_master_secret(@secret handshake: Vec<i64>) -> Vec<i64> {
-    return hkdf_extract(tls13_derive_secret(handshake, "derived", tls13_empty_hash()),
-        t13_zeros(TLS13_HASH_LEN));
+@secret
+pub fn tls13_master_secret(@secret handshake: Vec<i64>) -> Vec<i64> {
+    return hkdf_extract(tls13_derive_secret(handshake, "derived", tls13_empty_hash()), t13_zeros(TLS13_HASH_LEN));
 }
 
 /// The write key (`key_len` bytes: 16 for AES-128-GCM, 32 for
 /// ChaCha20-Poly1305) and the 12-byte IV of a traffic secret (§7.3).
-@secret pub fn tls13_traffic_keys(@secret secret: Vec<i64>, key_len: i64) -> Tls13TrafficKeys {
+@secret
+pub fn tls13_traffic_keys(@secret secret: Vec<i64>, key_len: i64) -> Tls13TrafficKeys {
     var none: Vec<i64> = Vec::new();
     return Tls13TrafficKeys {
-        key: hkdf_expand_label(secret, "key", none, key_len),
-        iv: hkdf_expand_label(secret, "iv", none, 12),
+        key: hkdf_expand_label(secret, "key", none, key_len), iv: hkdf_expand_label(secret, "iv", none, 12),
     };
 }
 
 /// The next generation of a traffic secret, for KeyUpdate (§7.2).
-@secret pub fn tls13_next_traffic_secret(@secret secret: Vec<i64>) -> Vec<i64> {
+@secret
+pub fn tls13_next_traffic_secret(@secret secret: Vec<i64>) -> Vec<i64> {
     var none: Vec<i64> = Vec::new();
     return hkdf_expand_label(secret, "traffic upd", none, TLS13_HASH_LEN);
 }
 
 /// The finished_key of a base key (a handshake traffic secret, §4.4.4).
-@secret pub fn tls13_finished_key(@secret base_key: Vec<i64>) -> Vec<i64> {
+@secret
+pub fn tls13_finished_key(@secret base_key: Vec<i64>) -> Vec<i64> {
     var none: Vec<i64> = Vec::new();
     return hkdf_expand_label(base_key, "finished", none, TLS13_HASH_LEN);
 }
 
 /// verify_data of a Finished message (§4.4.4): HMAC(finished_key,
 /// Transcript-Hash(messages up to the Finished)). Released: it is sent.
-@declassify pub fn tls13_finished_verify_data(@secret base_key: Vec<i64>, transcript_hash: Vec<i64>) -> Vec<i64> {
+@declassify
+pub fn tls13_finished_verify_data(@secret base_key: Vec<i64>, transcript_hash: Vec<i64>) -> Vec<i64> {
     return t13_hmac(tls13_finished_key(base_key), transcript_hash);
 }
 
 /// Check a peer's Finished: verify_data compared over every byte.
-@declassify pub fn tls13_finished_check(@secret base_key: Vec<i64>, transcript_hash: Vec<i64>, received: Vec<i64>) -> bool {
+@declassify
+pub fn tls13_finished_check(@secret base_key: Vec<i64>, transcript_hash: Vec<i64>, received: Vec<i64>) -> bool {
     val want: Vec<i64> = t13_hmac(tls13_finished_key(base_key), transcript_hash);
     if received.len() != want.len() {
         return false;
@@ -198,51 +208,30 @@ pub fn tls13_empty_hash() -> Vec<i64> {
 /// (empty: none), the handshake secret from the (EC)DHE `shared` secret,
 /// and the handshake traffic secrets over `hello_hash` =
 /// Transcript-Hash(ClientHello..ServerHello).
-@secret pub fn tls13_schedule_handshake(@secret psk: Vec<i64>, @secret shared: Vec<i64>, hello_hash: Vec<i64>) -> Tls13Schedule {
+@secret
+pub fn tls13_schedule_handshake(@secret psk: Vec<i64>, @secret shared: Vec<i64>, hello_hash: Vec<i64>) -> Tls13Schedule {
     val none: Vec<i64> = Vec::new();
     val early: Vec<i64> = tls13_early_secret(psk);
     val hs: Vec<i64> = tls13_handshake_secret(early, shared);
     return Tls13Schedule {
-        early: early,
-        handshake: hs,
-        client_hs: tls13_derive_secret(hs, "c hs traffic", hello_hash),
-        server_hs: tls13_derive_secret(hs, "s hs traffic", hello_hash),
-        master: tls13_master_secret(hs),
-        client_ap: none,
-        server_ap: none,
-        exporter: none,
-        resumption: none,
+        early: early, handshake: hs, client_hs: tls13_derive_secret(hs, "c hs traffic", hello_hash), server_hs: tls13_derive_secret(hs, "s hs traffic", hello_hash), master: tls13_master_secret(hs), client_ap: none, server_ap: none, exporter: none, resumption: none,
     };
 }
 
 /// The application traffic secrets and the exporter master secret over
 /// `finished_hash` = Transcript-Hash(ClientHello..server Finished).
-@secret pub fn tls13_schedule_application(@secret s: Tls13Schedule, finished_hash: Vec<i64>) -> Tls13Schedule {
+@secret
+pub fn tls13_schedule_application(@secret s: Tls13Schedule, finished_hash: Vec<i64>) -> Tls13Schedule {
     return Tls13Schedule {
-        early: s.early,
-        handshake: s.handshake,
-        client_hs: s.client_hs,
-        server_hs: s.server_hs,
-        master: s.master,
-        client_ap: tls13_derive_secret(s.master, "c ap traffic", finished_hash),
-        server_ap: tls13_derive_secret(s.master, "s ap traffic", finished_hash),
-        exporter: tls13_derive_secret(s.master, "exp master", finished_hash),
-        resumption: s.resumption,
+        early: s.early, handshake: s.handshake, client_hs: s.client_hs, server_hs: s.server_hs, master: s.master, client_ap: tls13_derive_secret(s.master, "c ap traffic", finished_hash), server_ap: tls13_derive_secret(s.master, "s ap traffic", finished_hash), exporter: tls13_derive_secret(s.master, "exp master", finished_hash), resumption: s.resumption,
     };
 }
 
 /// The resumption master secret over `client_finished_hash` =
 /// Transcript-Hash(ClientHello..client Finished).
-@secret pub fn tls13_schedule_resumption(@secret s: Tls13Schedule, client_finished_hash: Vec<i64>) -> Tls13Schedule {
+@secret
+pub fn tls13_schedule_resumption(@secret s: Tls13Schedule, client_finished_hash: Vec<i64>) -> Tls13Schedule {
     return Tls13Schedule {
-        early: s.early,
-        handshake: s.handshake,
-        client_hs: s.client_hs,
-        server_hs: s.server_hs,
-        master: s.master,
-        client_ap: s.client_ap,
-        server_ap: s.server_ap,
-        exporter: s.exporter,
-        resumption: tls13_derive_secret(s.master, "res master", client_finished_hash),
+        early: s.early, handshake: s.handshake, client_hs: s.client_hs, server_hs: s.server_hs, master: s.master, client_ap: s.client_ap, server_ap: s.server_ap, exporter: s.exporter, resumption: tls13_derive_secret(s.master, "res master", client_finished_hash),
     };
 }

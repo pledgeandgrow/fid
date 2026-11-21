@@ -38,20 +38,20 @@ pub const COBOL_BINARY: i64 = 4;
 /// One elementary field of a copybook.
 pub struct CobolField {
     pub name: str,
-    pub kind: i64,      // COBOL_ALPHA / ZONED / PACKED / BINARY
-    pub digits: i64,    // total digits (numeric) or characters (alpha)
-    pub scale: i64,     // digits after the implied point (V)
-    pub signed: bool,   // PIC S...
-    pub offset: i64,    // byte offset in the record
-    pub size: i64,      // bytes in the record
+    pub kind: i64,  // COBOL_ALPHA / ZONED / PACKED / BINARY
+    pub digits: i64,  // total digits (numeric) or characters (alpha)
+    pub scale: i64,  // digits after the implied point (V)
+    pub signed: bool,  // PIC S...
+    pub offset: i64,  // byte offset in the record
+    pub size: i64,  // bytes in the record
 }
 
 /// A parsed copybook: its elementary fields in record order.
 pub struct Copybook {
-    pub name: str,              // the 01-level record name ("" if none)
+    pub name: str,  // the 01-level record name ("" if none)
     pub fields: Vec<CobolField>,
-    pub size: i64,              // record length in bytes
-    pub error: str,             // "" when the copybook parsed cleanly
+    pub size: i64,  // record length in bytes
+    pub error: str,  // "" when the copybook parsed cleanly
 }
 
 // ─── Packed decimal (COMP-3) ────────────────────────────────────────────
@@ -83,13 +83,19 @@ pub fn cobol_pack(value: i64, digits: i64, signed: bool) -> Vec<i64> {
     var out: Vec<i64> = Vec::filled(size, 0);
     var neg: bool = value < 0;
     var v: i64 = value;
-    if neg { v = 0 - v; }
+    if neg {
+        v = 0 - v;
+    }
     var sign: i64 = 15;
     if signed {
-        if neg { sign = 13; } else { sign = 12; }
+        if neg {
+            sign = 13;
+        } else {
+            sign = 12;
+        }
     }
     // nibbles from the right: sign, then digits low to high
-    var nib: i64 = 2 * size - 1;   // index of the sign nibble
+    var nib: i64 = 2 * size - 1;  // index of the sign nibble
     var nibbles: Vec<i64> = Vec::filled(2 * size, 0);
     nibbles.set(nib, sign);
     var i: i64 = nib - 1;
@@ -113,18 +119,28 @@ pub fn cobol_pack(value: i64, digits: i64, signed: bool) -> Vec<i64> {
 /// True when bytes[start..start+size] are valid packed decimal: every
 /// digit nibble 0-9 and the sign nibble A-F.
 pub fn cobol_packed_valid(bytes: Vec<i64>, start: i64, size: i64) -> bool {
-    if size <= 0 || start < 0 || start + size > bytes.len() { return false; }
+    if size <= 0 || start < 0 || start + size > bytes.len() {
+        return false;
+    }
     var i: i64 = 0;
     while i < size {
         val b: i64 = bytes.get(start + i);
-        if b < 0 || b > 255 { return false; }
+        if b < 0 || b > 255 {
+            return false;
+        }
         val hi: i64 = b / 16;
         val lo: i64 = b % 16;
-        if hi > 9 { return false; }
+        if hi > 9 {
+            return false;
+        }
         if i == size - 1 {
-            if lo < 10 { return false; }
+            if lo < 10 {
+                return false;
+            }
         } else {
-            if lo > 9 { return false; }
+            if lo > 9 {
+                return false;
+            }
         }
         i = i + 1;
     }
@@ -135,7 +151,9 @@ pub fn cobol_packed_valid(bytes: Vec<i64>, start: i64, size: i64) -> bool {
 /// is negative, any other valid sign positive. Invalid data gives 0
 /// (check with cobol_packed_valid).
 pub fn cobol_unpack(bytes: Vec<i64>, start: i64, size: i64) -> i64 {
-    if !cobol_packed_valid(bytes, start, size) { return 0; }
+    if !cobol_packed_valid(bytes, start, size) {
+        return 0;
+    }
     var v: i64 = 0;
     var i: i64 = 0;
     var sign: i64 = 12;
@@ -149,7 +167,9 @@ pub fn cobol_unpack(bytes: Vec<i64>, start: i64, size: i64) -> i64 {
         }
         i = i + 1;
     }
-    if sign == 13 || sign == 11 { return 0 - v; }
+    if sign == 13 || sign == 11 {
+        return 0 - v;
+    }
     return v;
 }
 
@@ -169,9 +189,13 @@ pub fn cobol_packed_hex(bytes: Vec<i64>) -> str {
 /// True when |value| has at most `digits` digits (and, for an unsigned
 /// field, value >= 0): it can be stored without truncation.
 pub fn cobol_fits(value: i64, digits: i64, signed: bool) -> bool {
-    if !signed && value < 0 { return false; }
+    if !signed && value < 0 {
+        return false;
+    }
     var v: i64 = value;
-    if v < 0 { v = 0 - v; }
+    if v < 0 {
+        v = 0 - v;
+    }
     var n: i64 = 0;
     while n < digits {
         v = v / 10;
@@ -189,7 +213,9 @@ pub fn cobol_zone(value: i64, digits: i64, signed: bool) -> Vec<i64> {
     var out: Vec<i64> = Vec::filled(digits, 48);
     var neg: bool = value < 0;
     var v: i64 = value;
-    if neg { v = 0 - v; }
+    if neg {
+        v = 0 - v;
+    }
     var i: i64 = digits - 1;
     while i >= 0 {
         out.set(i, 48 + v % 10);
@@ -199,9 +225,17 @@ pub fn cobol_zone(value: i64, digits: i64, signed: bool) -> Vec<i64> {
     if signed && digits > 0 {
         val d: i64 = out.get(digits - 1) - 48;
         if neg {
-            if d == 0 { out.set(digits - 1, 125); } else { out.set(digits - 1, 73 + d); }   // '}' / 'J'..'R'
+            if d == 0 {
+                out.set(digits - 1, 125);
+            } else {
+                out.set(digits - 1, 73 + d);
+            }  // '}' / 'J'..'R'
         } else {
-            if d == 0 { out.set(digits - 1, 123); } else { out.set(digits - 1, 64 + d); }   // '{' / 'A'..'I'
+            if d == 0 {
+                out.set(digits - 1, 123);
+            } else {
+                out.set(digits - 1, 64 + d);
+            }  // '{' / 'A'..'I'
         }
     }
     return out;
@@ -210,24 +244,42 @@ pub fn cobol_zone(value: i64, digits: i64, signed: bool) -> Vec<i64> {
 // digit and sign of one zoned byte: returns digit (0-9) or -1 when bad;
 // sets *neg through the return encoding: digit + 10 for negative.
 fn cobol_zone_byte(b: i64, last: bool) -> i64 {
-    if b >= 48 && b <= 57 { return b - 48; }
-    if !last { return -1; }
-    if b == 123 { return 0; }
-    if b == 125 { return 10; }
-    if b >= 65 && b <= 73 { return b - 64; }
-    if b >= 74 && b <= 82 { return b - 73 + 10; }
+    if b >= 48 && b <= 57 {
+        return b - 48;
+    }
+    if !last {
+        return -1;
+    }
+    if b == 123 {
+        return 0;
+    }
+    if b == 125 {
+        return 10;
+    }
+    if b >= 65 && b <= 73 {
+        return b - 64;
+    }
+    if b >= 74 && b <= 82 {
+        return b - 73 + 10;
+    }
     // EBCDIC-style zones carried over in ASCII: 'p'..'y' negative (some converters)
-    if b >= 112 && b <= 121 { return b - 112 + 10; }
+    if b >= 112 && b <= 121 {
+        return b - 112 + 10;
+    }
     return -1;
 }
 
 /// True when bytes[start..start+size] are valid zoned decimal (spaces are
 /// not digits: an unset numeric field is invalid, as in COBOL).
 pub fn cobol_zoned_valid(bytes: Vec<i64>, start: i64, size: i64) -> bool {
-    if size <= 0 || start < 0 || start + size > bytes.len() { return false; }
+    if size <= 0 || start < 0 || start + size > bytes.len() {
+        return false;
+    }
     var i: i64 = 0;
     while i < size {
-        if cobol_zone_byte(bytes.get(start + i), i == size - 1) < 0 { return false; }
+        if cobol_zone_byte(bytes.get(start + i), i == size - 1) < 0 {
+            return false;
+        }
         i = i + 1;
     }
     return true;
@@ -235,7 +287,9 @@ pub fn cobol_zoned_valid(bytes: Vec<i64>, start: i64, size: i64) -> bool {
 
 /// Decode zoned decimal at bytes[start..start+size] (0 when invalid).
 pub fn cobol_unzone(bytes: Vec<i64>, start: i64, size: i64) -> i64 {
-    if !cobol_zoned_valid(bytes, start, size) { return 0; }
+    if !cobol_zoned_valid(bytes, start, size) {
+        return 0;
+    }
     var v: i64 = 0;
     var neg: bool = false;
     var i: i64 = 0;
@@ -248,7 +302,9 @@ pub fn cobol_unzone(bytes: Vec<i64>, start: i64, size: i64) -> i64 {
         v = v * 10 + d;
         i = i + 1;
     }
-    if neg { return 0 - v; }
+    if neg {
+        return 0 - v;
+    }
     return v;
 }
 
@@ -256,12 +312,16 @@ pub fn cobol_unzone(bytes: Vec<i64>, start: i64, size: i64) -> i64 {
 
 /// Bytes a COMP field of `digits` digits takes (2, 4 or 8).
 pub fn cobol_binary_size(digits: i64) -> i64 {
-    if digits <= 4 { return 2; }
-    if digits <= 9 { return 4; }
+    if digits <= 4 {
+        return 2;
+    }
+    if digits <= 9 {
+        return 4;
+    }
     return 8;
 }
 
-fn cobol_put_be(rec: & mut Vec<i64>, start: i64, size: i64, value: i64) -> void {
+fn cobol_put_be(rec: &mut Vec<i64>, start: i64, size: i64, value: i64) -> void {
     var v: i64 = value;
     var i: i64 = size - 1;
     while i >= 0 {
@@ -280,7 +340,9 @@ fn cobol_get_be(rec: Vec<i64>, start: i64, size: i64, signed: bool) -> i64 {
     }
     if signed && size < 8 {
         val top: i64 = 1 << (8 * size - 1);
-        if (v & top) != 0 { v = v - (top << 1); }
+        if (v & top) != 0 {
+            v = v - (top << 1);
+        }
     }
     return v;
 }
@@ -288,11 +350,15 @@ fn cobol_get_be(rec: Vec<i64>, start: i64, size: i64, signed: bool) -> i64 {
 // ─── Copybook parsing ───────────────────────────────────────────────────
 
 fn cobol_is_digit_word(w: str) -> bool {
-    if str_len(w) == 0 { return false; }
+    if str_len(w) == 0 {
+        return false;
+    }
     var i: i64 = 0;
     while i < str_len(w) {
         val c: i64 = str_byte_at(w, i);
-        if c < 48 || c > 57 { return false; }
+        if c < 48 || c > 57 {
+            return false;
+        }
         i = i + 1;
     }
     return true;
@@ -307,20 +373,28 @@ fn cobol_words(text: str) -> Vec<str> {
     while li < lines.len() {
         val line: str = str_trim(str_replace(str_replace(lines.get(li), "\t", " "), "\r", ""));
         li = li + 1;
-        if str_len(line) == 0 || str_starts_with(line, "*") { continue; }
+        if str_len(line) == 0 || str_starts_with(line, "*") {
+            continue;
+        }
         val parts: Vec<str> = str_split(line, " ");
         var pi: i64 = 0;
         while pi < parts.len() {
             var w: str = parts.get(pi);
             pi = pi + 1;
-            if str_len(w) == 0 { continue; }
+            if str_len(w) == 0 {
+                continue;
+            }
             var ends: bool = false;
             if str_ends_with(w, ".") {
                 ends = true;
                 w = str_slice(w, 0, str_len(w) - 1);
             }
-            if str_len(w) > 0 { words.push(str_to_upper(w)); }
-            if ends { words.push("."); }
+            if str_len(w) > 0 {
+                words.push(str_to_upper(w));
+            }
+            if ends {
+                words.push(".");
+            }
         }
     }
     return words;
@@ -342,33 +416,43 @@ fn cobol_parse_pic(pic: str) -> Vec<i64> {
         val c: i64 = str_byte_at(pic, i);
         i = i + 1;
         var rep: i64 = 1;
-        if i < n && str_byte_at(pic, i) == 40 {   // '('
+        if i < n && str_byte_at(pic, i) == 40 {  // '('
             var j: i64 = i + 1;
             var num: i64 = 0;
             while j < n && str_byte_at(pic, j) != 41 {
                 val d: i64 = str_byte_at(pic, j);
-                if d < 48 || d > 57 { ok = 0; }
+                if d < 48 || d > 57 {
+                    ok = 0;
+                }
                 num = num * 10 + (d - 48);
                 j = j + 1;
             }
-            if j >= n { ok = 0; }
+            if j >= n {
+                ok = 0;
+            }
             rep = num;
             i = j + 1;
         }
-        if c == 83 {            // S
+        if c == 83 {  // S
             signed = 1;
-        } else if c == 86 {     // V
+        } else if c == 86 {  // V
             after_v = true;
-        } else if c == 57 {     // 9
-            if after_v { frac_d = frac_d + rep; } else { int_d = int_d + rep; }
-        } else if c == 88 || c == 65 {   // X, A
+        } else if c == 57 {  // 9
+            if after_v {
+                frac_d = frac_d + rep;
+            } else {
+                int_d = int_d + rep;
+            }
+        } else if c == 88 || c == 65 {  // X, A
             alpha = alpha + rep;
-        } else if c == 80 {     // P: scaling position, takes no room
+        } else if c == 80 {  // P: scaling position, takes no room
         } else {
-            ok = 0;             // edited pictures (Z, ., $, -, ...) not supported
+            ok = 0;  // edited pictures (Z, ., $, -, ...) not supported
         }
     }
-    if alpha > 0 && (int_d + frac_d) > 0 { ok = 0; }
+    if alpha > 0 && (int_d + frac_d) > 0 {
+        ok = 0;
+    }
     res.set(0, int_d);
     res.set(1, frac_d);
     res.set(2, alpha);
@@ -394,10 +478,14 @@ pub fn cobol_copybook(text: str) -> Copybook {
             stmt.push(words.get(i));
             i = i + 1;
         }
-        i = i + 1;   // the "."
-        if stmt.len() == 0 { continue; }
+        i = i + 1;  // the "."
+        if stmt.len() == 0 {
+            continue;
+        }
         if !cobol_is_digit_word(stmt.get(0)) {
-            if str_len(err) == 0 { err = "expected a level number, got " + stmt.get(0); }
+            if str_len(err) == 0 {
+                err = "expected a level number, got " + stmt.get(0);
+            }
             continue;
         }
         val level: i64 = str_parse_int(stmt.get(0));
@@ -414,15 +502,16 @@ pub fn cobol_copybook(text: str) -> Copybook {
             val w: str = stmt.get(k);
             k = k + 1;
             if str_equal(w, "PIC") || str_equal(w, "PICTURE") {
-                if k < stmt.len() && str_equal(stmt.get(k), "IS") { k = k + 1; }
+                if k < stmt.len() && str_equal(stmt.get(k), "IS") {
+                    k = k + 1;
+                }
                 if k < stmt.len() {
                     pic = stmt.get(k);
                     k = k + 1;
                 }
             } else if str_equal(w, "COMP-3") || str_equal(w, "COMPUTATIONAL-3") || str_equal(w, "PACKED-DECIMAL") {
                 usage = COBOL_PACKED;
-            } else if str_equal(w, "COMP") || str_equal(w, "COMP-4") || str_equal(w, "COMPUTATIONAL")
-                || str_equal(w, "COMPUTATIONAL-4") || str_equal(w, "BINARY") || str_equal(w, "COMP-5") {
+            } else if str_equal(w, "COMP") || str_equal(w, "COMP-4") || str_equal(w, "COMPUTATIONAL") || str_equal(w, "COMPUTATIONAL-4") || str_equal(w, "BINARY") || str_equal(w, "COMP-5") {
                 usage = COBOL_BINARY;
             } else if str_equal(w, "OCCURS") {
                 if k < stmt.len() && cobol_is_digit_word(stmt.get(k)) {
@@ -430,18 +519,24 @@ pub fn cobol_copybook(text: str) -> Copybook {
                     k = k + 1;
                 }
             } else if str_equal(w, "VALUE") || str_equal(w, "VALUES") {
-                k = stmt.len();   // initial values are not applied
+                k = stmt.len();  // initial values are not applied
             }
             // USAGE, IS, DISPLAY, TIMES: no effect
         }
         if str_len(pic) == 0 {
-            if level == 1 && str_len(rec_name) == 0 { rec_name = name; }
-            continue;   // a group item
+            if level == 1 && str_len(rec_name) == 0 {
+                rec_name = name;
+            }
+            continue;  // a group item
         }
-        if level == 66 || level == 88 { continue; }   // RENAMES / condition names
+        if level == 66 || level == 88 {
+            continue;
+        }  // RENAMES / condition names
         val p: Vec<i64> = cobol_parse_pic(pic);
         if p.get(4) == 0 {
-            if str_len(err) == 0 { err = "unsupported PIC " + pic + " for " + name; }
+            if str_len(err) == 0 {
+                err = "unsupported PIC " + pic + " for " + name;
+            }
             continue;
         }
         var kind: i64 = usage;
@@ -451,33 +546,44 @@ pub fn cobol_copybook(text: str) -> Copybook {
             digits = p.get(2);
         }
         var size: i64 = digits;
-        if kind == COBOL_PACKED { size = cobol_packed_size(digits); }
-        if kind == COBOL_BINARY { size = cobol_binary_size(digits); }
+        if kind == COBOL_PACKED {
+            size = cobol_packed_size(digits);
+        }
+        if kind == COBOL_BINARY {
+            size = cobol_binary_size(digits);
+        }
         if kind != COBOL_ALPHA && digits > 18 {
-            if str_len(err) == 0 { err = "more than 18 digits in " + name; }
+            if str_len(err) == 0 {
+                err = "more than 18 digits in " + name;
+            }
             continue;
         }
         var o: i64 = 1;
         while o <= occurs {
             var fname: str = name;
-            if occurs > 1 { fname = name + "(" + int_to_str(o) + ")"; }
+            if occurs > 1 {
+                fname = name + "(" + int_to_str(o) + ")";
+            }
             fields.push(CobolField {
-                name: fname, kind: kind, digits: digits, scale: p.get(1),
-                signed: p.get(3) == 1, offset: offset, size: size
+                name: fname, kind: kind, digits: digits, scale: p.get(1), signed: p.get(3) == 1, offset: offset, size: size
             });
             offset = offset + size;
             o = o + 1;
         }
     }
-    return Copybook { name: rec_name, fields: fields, size: offset, error: err };
+    return Copybook {
+        name: rec_name, fields: fields, size: offset, error: err
+    };
 }
 
 /// Index of the field named `name` (upper-cased), or -1.
-pub fn cobol_field_index(cb: & Copybook, name: str) -> i64 {
+pub fn cobol_field_index(cb: &Copybook, name: str) -> i64 {
     val want: str = str_to_upper(name);
     var i: i64 = 0;
     while i < cb.fields.len() {
-        if str_equal(cb.fields.get(i).name, want) { return i; }
+        if str_equal(cb.fields.get(i).name, want) {
+            return i;
+        }
         i = i + 1;
     }
     return -1;
@@ -485,20 +591,26 @@ pub fn cobol_field_index(cb: & Copybook, name: str) -> i64 {
 
 /// The copybook as a layout listing, one field a line:
 /// "NAME kind=packed digits=9 scale=2 signed offset=8 size=5".
-pub fn cobol_layout(cb: & Copybook) -> str {
+pub fn cobol_layout(cb: &Copybook) -> str {
     var out: str = "";
     var i: i64 = 0;
     while i < cb.fields.len() {
         val f: CobolField = cb.fields.get(i);
         var kn: str = "alpha";
-        if f.kind == COBOL_ZONED { kn = "zoned"; }
-        if f.kind == COBOL_PACKED { kn = "packed"; }
-        if f.kind == COBOL_BINARY { kn = "binary"; }
+        if f.kind == COBOL_ZONED {
+            kn = "zoned";
+        }
+        if f.kind == COBOL_PACKED {
+            kn = "packed";
+        }
+        if f.kind == COBOL_BINARY {
+            kn = "binary";
+        }
         var sg: str = "";
-        if f.signed { sg = " signed"; }
-        out = out + f.name + " kind=" + kn + " digits=" + int_to_str(f.digits)
-            + " scale=" + int_to_str(f.scale) + sg + " offset=" + int_to_str(f.offset)
-            + " size=" + int_to_str(f.size) + "\n";
+        if f.signed {
+            sg = " signed";
+        }
+        out = out + f.name + " kind=" + kn + " digits=" + int_to_str(f.digits) + " scale=" + int_to_str(f.scale) + sg + " offset=" + int_to_str(f.offset) + " size=" + int_to_str(f.size) + "\n";
         i = i + 1;
     }
     return out;
@@ -507,18 +619,20 @@ pub fn cobol_layout(cb: & Copybook) -> str {
 // ─── Records ────────────────────────────────────────────────────────────
 
 /// A fresh record: alphanumeric fields spaces, numeric fields zero.
-pub fn cobol_record_new(cb: & Copybook) -> Vec<i64> {
+pub fn cobol_record_new(cb: &Copybook) -> Vec<i64> {
     var rec: Vec<i64> = Vec::filled(cb.size, 32);
     var i: i64 = 0;
     while i < cb.fields.len() {
         val f: CobolField = cb.fields.get(i);
-        if f.kind != COBOL_ALPHA { cobol_put_num(& mut rec, f, 0); }
+        if f.kind != COBOL_ALPHA {
+            cobol_put_num(&mut rec, f, 0);
+        }
         i = i + 1;
     }
     return rec;
 }
 
-fn cobol_put_num(rec: & mut Vec<i64>, f: CobolField, value: i64) -> void {
+fn cobol_put_num(rec: &mut Vec<i64>, f: CobolField, value: i64) -> void {
     var bytes: Vec<i64> = Vec::new();
     if f.kind == COBOL_PACKED {
         bytes = cobol_pack(value, f.digits, f.signed);
@@ -538,37 +652,61 @@ fn cobol_put_num(rec: & mut Vec<i64>, f: CobolField, value: i64) -> void {
 /// Set numeric field `name` to the scaled integer `value` (cents for
 /// V99). False, and the record unchanged, when there is no such numeric
 /// field, the record is too short, or the value does not fit.
-pub fn cobol_set_num(cb: & Copybook, rec: & mut Vec<i64>, name: str, value: i64) -> bool {
+pub fn cobol_set_num(cb: &Copybook, rec: &mut Vec<i64>, name: str, value: i64) -> bool {
     val idx: i64 = cobol_field_index(cb, name);
-    if idx < 0 { return false; }
+    if idx < 0 {
+        return false;
+    }
     val f: CobolField = cb.fields.get(idx);
-    if f.kind == COBOL_ALPHA { return false; }
-    if f.offset + f.size > rec.len() { return false; }
-    if !cobol_fits(value, f.digits, f.signed) { return false; }
+    if f.kind == COBOL_ALPHA {
+        return false;
+    }
+    if f.offset + f.size > rec.len() {
+        return false;
+    }
+    if !cobol_fits(value, f.digits, f.signed) {
+        return false;
+    }
     cobol_put_num(rec, f, value);
     return true;
 }
 
 /// The scaled integer in numeric field `name` (0 when absent or invalid:
 /// check with cobol_field_valid).
-pub fn cobol_get_num(cb: & Copybook, rec: Vec<i64>, name: str) -> i64 {
+pub fn cobol_get_num(cb: &Copybook, rec: Vec<i64>, name: str) -> i64 {
     val idx: i64 = cobol_field_index(cb, name);
-    if idx < 0 { return 0; }
+    if idx < 0 {
+        return 0;
+    }
     val f: CobolField = cb.fields.get(idx);
-    if f.offset + f.size > rec.len() { return 0; }
-    if f.kind == COBOL_PACKED { return cobol_unpack(rec, f.offset, f.size); }
-    if f.kind == COBOL_ZONED { return cobol_unzone(rec, f.offset, f.size); }
-    if f.kind == COBOL_BINARY { return cobol_get_be(rec, f.offset, f.size, f.signed); }
+    if f.offset + f.size > rec.len() {
+        return 0;
+    }
+    if f.kind == COBOL_PACKED {
+        return cobol_unpack(rec, f.offset, f.size);
+    }
+    if f.kind == COBOL_ZONED {
+        return cobol_unzone(rec, f.offset, f.size);
+    }
+    if f.kind == COBOL_BINARY {
+        return cobol_get_be(rec, f.offset, f.size, f.signed);
+    }
     return 0;
 }
 
 /// Set alphanumeric field `name`: truncated or padded with spaces.
-pub fn cobol_set_str(cb: & Copybook, rec: & mut Vec<i64>, name: str, value: str) -> bool {
+pub fn cobol_set_str(cb: &Copybook, rec: &mut Vec<i64>, name: str, value: str) -> bool {
     val idx: i64 = cobol_field_index(cb, name);
-    if idx < 0 { return false; }
+    if idx < 0 {
+        return false;
+    }
     val f: CobolField = cb.fields.get(idx);
-    if f.kind != COBOL_ALPHA { return false; }
-    if f.offset + f.size > rec.len() { return false; }
+    if f.kind != COBOL_ALPHA {
+        return false;
+    }
+    if f.offset + f.size > rec.len() {
+        return false;
+    }
     var j: i64 = 0;
     while j < f.size {
         if j < str_len(value) {
@@ -582,13 +720,19 @@ pub fn cobol_set_str(cb: & Copybook, rec: & mut Vec<i64>, name: str, value: str)
 }
 
 /// Alphanumeric field `name`, trailing spaces removed ("" when absent).
-pub fn cobol_get_str(cb: & Copybook, rec: Vec<i64>, name: str) -> str {
+pub fn cobol_get_str(cb: &Copybook, rec: Vec<i64>, name: str) -> str {
     val idx: i64 = cobol_field_index(cb, name);
-    if idx < 0 { return ""; }
+    if idx < 0 {
+        return "";
+    }
     val f: CobolField = cb.fields.get(idx);
-    if f.offset + f.size > rec.len() { return ""; }
+    if f.offset + f.size > rec.len() {
+        return "";
+    }
     var end: i64 = f.size;
-    while end > 0 && rec.get(f.offset + end - 1) == 32 { end = end - 1; }
+    while end > 0 && rec.get(f.offset + end - 1) == 32 {
+        end = end - 1;
+    }
     var bytes: Vec<i64> = Vec::new();
     var j: i64 = 0;
     while j < end {
@@ -600,13 +744,21 @@ pub fn cobol_get_str(cb: & Copybook, rec: Vec<i64>, name: str) -> str {
 
 /// True when field `name` holds valid data for its kind (an alphanumeric
 /// field is always valid).
-pub fn cobol_field_valid(cb: & Copybook, rec: Vec<i64>, name: str) -> bool {
+pub fn cobol_field_valid(cb: &Copybook, rec: Vec<i64>, name: str) -> bool {
     val idx: i64 = cobol_field_index(cb, name);
-    if idx < 0 { return false; }
+    if idx < 0 {
+        return false;
+    }
     val f: CobolField = cb.fields.get(idx);
-    if f.offset + f.size > rec.len() { return false; }
-    if f.kind == COBOL_PACKED { return cobol_packed_valid(rec, f.offset, f.size); }
-    if f.kind == COBOL_ZONED { return cobol_zoned_valid(rec, f.offset, f.size); }
+    if f.offset + f.size > rec.len() {
+        return false;
+    }
+    if f.kind == COBOL_PACKED {
+        return cobol_packed_valid(rec, f.offset, f.size);
+    }
+    if f.kind == COBOL_ZONED {
+        return cobol_zoned_valid(rec, f.offset, f.size);
+    }
     return true;
 }
 
@@ -615,13 +767,19 @@ pub fn cobol_field_valid(cb: & Copybook, rec: Vec<i64>, name: str) -> bool {
 pub fn cobol_format(value: i64, scale: i64) -> str {
     var neg: bool = value < 0;
     var v: i64 = value;
-    if neg { v = 0 - v; }
+    if neg {
+        v = 0 - v;
+    }
     var s: str = int_to_str(v);
     if scale > 0 {
-        while str_len(s) <= scale { s = "0" + s; }
+        while str_len(s) <= scale {
+            s = "0" + s;
+        }
         s = str_slice(s, 0, str_len(s) - scale) + "." + str_slice(s, str_len(s) - scale, str_len(s));
     }
-    if neg { return "-" + s; }
+    if neg {
+        return "-" + s;
+    }
     return s;
 }
 
@@ -632,7 +790,9 @@ pub fn cobol_format(value: i64, scale: i64) -> str {
 /// transfers add, is skipped when `line_sequential`).
 pub fn cobol_split_records(data: Vec<i64>, size: i64, line_sequential: bool) -> Vec<Vec<i64>> {
     var out: Vec<Vec<i64>> = Vec::new();
-    if size <= 0 { return out; }
+    if size <= 0 {
+        return out;
+    }
     var p: i64 = 0;
     while p + size <= data.len() {
         var rec: Vec<i64> = Vec::new();
@@ -644,8 +804,12 @@ pub fn cobol_split_records(data: Vec<i64>, size: i64, line_sequential: bool) -> 
         out.push(rec);
         p = p + size;
         if line_sequential {
-            if p < data.len() && data.get(p) == 13 { p = p + 1; }
-            if p < data.len() && data.get(p) == 10 { p = p + 1; }
+            if p < data.len() && data.get(p) == 13 {
+                p = p + 1;
+            }
+            if p < data.len() && data.get(p) == 10 {
+                p = p + 1;
+            }
         }
     }
     return out;
@@ -663,7 +827,9 @@ pub fn cobol_join_records(recs: Vec<Vec<i64>>, line_sequential: bool) -> Vec<i64
             out.push(r.get(j));
             j = j + 1;
         }
-        if line_sequential { out.push(10); }
+        if line_sequential {
+            out.push(10);
+        }
         i = i + 1;
     }
     return out;

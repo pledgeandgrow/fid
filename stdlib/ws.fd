@@ -20,7 +20,10 @@
 //   }
 
 module ws;
- use vec; use string; use encoding; use crypto;
+use vec;
+use string;
+use encoding;
+use crypto;
 // ─── SHA-1 (RFC 3174) — needed only for the handshake ───────────────────
 
 fn sha1_rol(x: i64, n: i64) -> i64 {
@@ -160,7 +163,7 @@ pub fn ws_ok(c: WsConn) -> bool {
 /// (module `wss`).
 pub fn ws_failed(is_client: bool) -> WsConn {
     return WsConn {
-        fd: - 1, is_client: is_client, open: false, tls: 0
+        fd: -1, is_client: is_client, open: false, tls: 0
     };
 }
 
@@ -188,18 +191,20 @@ fn ws_gen_key() -> str {
 // ─── I/O: the socket, or the TLS session module `wss` handed over ────────
 
 fn ws_no_tls_recv(tls: i64, buf: i64, n: i64, timeout_ms: i64) -> i64 {
-    return - 1;
+    return -1;
 }
 
 fn ws_no_tls_send(tls: i64, buf: i64, n: i64) -> i64 {
-    return - 1;
+    return -1;
 }
 
 fn ws_no_tls_close(tls: i64) -> i64 {
     return 0;
 }
 
-var ws_tls_recv: fn(i64, i64, i64, i64) -> i64 = ws_no_tls_recv; var ws_tls_send: fn(i64, i64, i64) -> i64 = ws_no_tls_send; var ws_tls_close: fn(i64) -> i64 = ws_no_tls_close;
+var ws_tls_recv: fn(i64, i64, i64, i64) -> i64 = ws_no_tls_recv;
+var ws_tls_send: fn(i64, i64, i64) -> i64 = ws_no_tls_send;
+var ws_tls_close: fn(i64) -> i64 = ws_no_tls_close;
 /// For module `wss`: how to read, write and close a TLS session.
 pub fn ws_set_tls(recv: fn(i64, i64, i64, i64) -> i64, send: fn(i64, i64, i64) -> i64, close: fn(i64) -> i64) {
     ws_tls_recv = recv;
@@ -210,10 +215,10 @@ pub fn ws_set_tls(recv: fn(i64, i64, i64, i64) -> i64, send: fn(i64, i64, i64) -
 fn ws_io_read(fd: i64, tls: i64, buf: i64, n: i64) -> i64 {
     if tls != 0 {
         val recv: fn(i64, i64, i64, i64) -> i64 = ws_tls_recv;
-        return recv(tls, buf, n, - 1);
+        return recv(tls, buf, n, -1);
     }
     // Wait as a task does (other tasks run meanwhile), then read
-    p_co_wait_fd(fd, 0, - 1);
+    p_co_wait_fd(fd, 0, -1);
     return p_socket_read(fd, buf, n);
 }
 
@@ -255,7 +260,7 @@ fn ws_read_headers(fd: i64, tls: i64) -> str {
 /// `host` may be a hostname or IP. Returns WsConn with fd<0 on failure.
 pub fn ws_connect(host: str, port: i64, path: str) -> WsConn {
     var fail: WsConn = WsConn {
-        fd: - 1, is_client: true, open: false, tls: 0
+        fd: -1, is_client: true, open: false, tls: 0
     };
     // A name or an IPv4/IPv6 address; a task waits instead of blocking
     var fd: i64 = p_co_connect(host, port);
@@ -270,7 +275,7 @@ pub fn ws_connect(host: str, port: i64, path: str) -> WsConn {
 /// the socket then closed.
 pub fn ws_handshake(fd: i64, tls: i64, host: str, path: str) -> WsConn {
     var fail: WsConn = WsConn {
-        fd: - 1, is_client: true, open: false, tls: 0
+        fd: -1, is_client: true, open: false, tls: 0
     };
     var key: str = ws_gen_key();
     var req: str = "GET " + path + " HTTP/1.1\r\n" + "Host: " + host + "\r\n" + "Upgrade: websocket\r\n" + "Connection: Upgrade\r\n" + "Sec-WebSocket-Key: " + key + "\r\n" + "Sec-WebSocket-Version: 13\r\n\r\n";
@@ -305,7 +310,7 @@ pub fn ws_read_request(fd: i64, tls: i64) -> str {
 /// ws_accept over the TLS session `tls` on `fd` (0: none).
 pub fn ws_accept_on(fd: i64, tls: i64, request: str) -> WsConn {
     var fail: WsConn = WsConn {
-        fd: - 1, is_client: false, open: false, tls: 0
+        fd: -1, is_client: false, open: false, tls: 0
     };
     var low: str = str_to_lower(request);
     if !str_contains(low, "upgrade: websocket") {
@@ -334,12 +339,12 @@ pub fn ws_accept_on(fd: i64, tls: i64, request: str) -> WsConn {
 
 // ─── Framing ────────────────────────────────────────────────────────────
 
-fn ws_push_u16(v: & mut Vec, x: i64) -> void {
+fn ws_push_u16(v: &mut Vec, x: i64) -> void {
     v.push((x >> 8) & 255);
     v.push(x & 255);
 }
 
-fn ws_push_u64(v: & mut Vec, x: i64) -> void {
+fn ws_push_u64(v: &mut Vec, x: i64) -> void {
     var s: i64 = 7;
     while s >= 0 {
         v.push((x >> (s * 8)) & 255);
@@ -361,10 +366,10 @@ pub fn ws_frame_encode(opcode: i64, payload: Vec, mask: bool) -> Vec {
         f.push(mbit | len);
     } else if len <= 65535 {
         f.push(mbit | 126);
-        ws_push_u16(& mut f, len);
+        ws_push_u16(&mut f, len);
     } else {
         f.push(mbit | 127);
-        ws_push_u64(& mut f, len);
+        ws_push_u64(&mut f, len);
     }
     var maskkey: Vec = Vec::new();
     if mask {
@@ -438,13 +443,13 @@ fn ws_read_n(fd: i64, tls: i64, n: i64) -> Vec {
 /// any data frame is returned as it is.
 pub fn ws_recv(c: WsConn) -> WsFrame {
     var dead: WsFrame = WsFrame {
-        opcode: - 1, text: "", bytes: Vec::new(), fin: true
+        opcode: -1, text: "", bytes: Vec::new(), fin: true
     };
     if c.fd < 0 {
         return dead;
     }
     var acc: Vec = Vec::new();
-    var first_op: i64 = - 1;
+    var first_op: i64 = -1;
     var fin: bool = false;
     var grd: i64 = 0;
     while !fin && grd < 100000 {
@@ -500,7 +505,7 @@ pub fn ws_recv(c: WsConn) -> WsFrame {
             // A control frame is never fragmented. Before any data it is
             // the answer; in the middle of a message a ping is answered, a
             // pong skipped, and a close ends the message.
-            if first_op == - 1 {
+            if first_op == -1 {
                 return WsFrame {
                     opcode: op, text: str_from_bytes(payload), bytes: payload, fin: true
                 };

@@ -57,7 +57,13 @@
 //   while mongo_cursor_more(&mut c, &mut cur) { val d: BsonDoc = mongo_cursor_next(&mut cur); }
 
 module mongodb;
- use vec; use string; use net; use kdf; use md5; use encoding; use crypto;
+use vec;
+use string;
+use net;
+use kdf;
+use md5;
+use encoding;
+use crypto;
 
 pub const BSON_DOUBLE: i64 = 1;
 pub const BSON_STRING: i64 = 2;
@@ -94,7 +100,9 @@ pub struct BsonWriter {
 }
 
 pub fn bson_writer() -> BsonWriter {
-    var w: BsonWriter = BsonWriter { out: Vec::new(), starts: Vec::new(), is_array: Vec::new(), counts: Vec::new() };
+    var w: BsonWriter = BsonWriter {
+        out: Vec::new(), starts: Vec::new(), is_array: Vec::new(), counts: Vec::new()
+    };
     w.starts.push(0);
     w.is_array.push(false);
     w.counts.push(0);
@@ -105,14 +113,15 @@ pub fn bson_writer() -> BsonWriter {
     return w;
 }
 
-fn bs_put_i32(out: & mut Vec<i64>, v: i64) {
+fn bs_put_i32(out: &mut Vec<i64>, v: i64) {
     out.push(v & 255);
     out.push((v >> 8) & 255);
     out.push((v >> 16) & 255);
     out.push((v >> 24) & 255);
 }
 
-@wrapping fn bs_put_i64(out: & mut Vec<i64>, v: i64) {
+@wrapping
+fn bs_put_i64(out: &mut Vec<i64>, v: i64) {
     var i: i64 = 0;
     while i < 8 {
         out.push((v >> (i * 8)) & 255);
@@ -120,7 +129,7 @@ fn bs_put_i32(out: & mut Vec<i64>, v: i64) {
     }
 }
 
-fn bs_put_bytes(out: & mut Vec<i64>, b: Vec<i64>) {
+fn bs_put_bytes(out: &mut Vec<i64>, b: Vec<i64>) {
     var i: i64 = 0;
     while i < b.len() {
         out.push(b.get(i) & 255);
@@ -128,12 +137,12 @@ fn bs_put_bytes(out: & mut Vec<i64>, b: Vec<i64>) {
     }
 }
 
-fn bs_put_cstr(out: & mut Vec<i64>, s: str) {
+fn bs_put_cstr(out: &mut Vec<i64>, s: str) {
     bs_put_bytes(out, str_bytes(s));
     out.push(0);
 }
 
-fn bs_set_i32(out: & mut Vec<i64>, at: i64, v: i64) {
+fn bs_set_i32(out: &mut Vec<i64>, at: i64, v: i64) {
     out.set(at, v & 255);
     out.set(at + 1, (v >> 8) & 255);
     out.set(at + 2, (v >> 16) & 255);
@@ -141,42 +150,42 @@ fn bs_set_i32(out: & mut Vec<i64>, at: i64, v: i64) {
 }
 
 // The element head: type byte and key (the array index inside arrays).
-fn bs_head(w: & mut BsonWriter, t: i64, key: str) {
+fn bs_head(w: &mut BsonWriter, t: i64, key: str) {
     val top: i64 = w.counts.len() - 1;
     w.out.push(t);
     if w.is_array.get(top) {
-        bs_put_cstr(& mut w.out, int_to_str(w.counts.get(top)));
+        bs_put_cstr(&mut w.out, int_to_str(w.counts.get(top)));
     } else {
-        bs_put_cstr(& mut w.out, key);
+        bs_put_cstr(&mut w.out, key);
     }
     w.counts.set(top, w.counts.get(top) + 1);
 }
 
-pub fn bson_put_double(w: & mut BsonWriter, key: str, v: f64) {
+pub fn bson_put_double(w: &mut BsonWriter, key: str, v: f64) {
     bs_head(w, BSON_DOUBLE, key);
-    bs_put_i64(& mut w.out, p_f64_to_bits(v));
+    bs_put_i64(&mut w.out, p_f64_to_bits(v));
 }
 
 /// A UTF-8 string (int32 length including the NUL, bytes, NUL).
-pub fn bson_put_string(w: & mut BsonWriter, key: str, v: str) {
+pub fn bson_put_string(w: &mut BsonWriter, key: str, v: str) {
     bs_head(w, BSON_STRING, key);
     val b: Vec<i64> = str_bytes(v);
-    bs_put_i32(& mut w.out, b.len() + 1);
-    bs_put_bytes(& mut w.out, b);
+    bs_put_i32(&mut w.out, b.len() + 1);
+    bs_put_bytes(&mut w.out, b);
     w.out.push(0);
 }
 
-pub fn bson_put_int32(w: & mut BsonWriter, key: str, v: i64) {
+pub fn bson_put_int32(w: &mut BsonWriter, key: str, v: i64) {
     bs_head(w, BSON_INT32, key);
-    bs_put_i32(& mut w.out, v);
+    bs_put_i32(&mut w.out, v);
 }
 
-pub fn bson_put_int64(w: & mut BsonWriter, key: str, v: i64) {
+pub fn bson_put_int64(w: &mut BsonWriter, key: str, v: i64) {
     bs_head(w, BSON_INT64, key);
-    bs_put_i64(& mut w.out, v);
+    bs_put_i64(&mut w.out, v);
 }
 
-pub fn bson_put_bool(w: & mut BsonWriter, key: str, v: bool) {
+pub fn bson_put_bool(w: &mut BsonWriter, key: str, v: bool) {
     bs_head(w, BSON_BOOL, key);
     if v {
         w.out.push(1);
@@ -185,25 +194,25 @@ pub fn bson_put_bool(w: & mut BsonWriter, key: str, v: bool) {
     }
 }
 
-pub fn bson_put_null(w: & mut BsonWriter, key: str) {
+pub fn bson_put_null(w: &mut BsonWriter, key: str) {
     bs_head(w, BSON_NULL, key);
 }
 
 /// UTC datetime: milliseconds since the Unix epoch.
-pub fn bson_put_datetime(w: & mut BsonWriter, key: str, ms: i64) {
+pub fn bson_put_datetime(w: &mut BsonWriter, key: str, ms: i64) {
     bs_head(w, BSON_DATETIME, key);
-    bs_put_i64(& mut w.out, ms);
+    bs_put_i64(&mut w.out, ms);
 }
 
 /// Timestamp: increment (low 32 bits) and seconds (high 32 bits).
-pub fn bson_put_timestamp(w: & mut BsonWriter, key: str, seconds: i64, increment: i64) {
+pub fn bson_put_timestamp(w: &mut BsonWriter, key: str, seconds: i64, increment: i64) {
     bs_head(w, BSON_TIMESTAMP, key);
-    bs_put_i32(& mut w.out, increment);
-    bs_put_i32(& mut w.out, seconds);
+    bs_put_i32(&mut w.out, increment);
+    bs_put_i32(&mut w.out, seconds);
 }
 
 /// An ObjectId from its 12 bytes.
-pub fn bson_put_objectid(w: & mut BsonWriter, key: str, id: Vec<i64>) {
+pub fn bson_put_objectid(w: &mut BsonWriter, key: str, id: Vec<i64>) {
     bs_head(w, BSON_OBJECTID, key);
     var i: i64 = 0;
     while i < 12 {
@@ -217,17 +226,17 @@ pub fn bson_put_objectid(w: & mut BsonWriter, key: str, id: Vec<i64>) {
 }
 
 /// Binary data with a subtype (0 generic, 4 UUID, ...).
-pub fn bson_put_binary(w: & mut BsonWriter, key: str, subtype: i64, data: Vec<i64>) {
+pub fn bson_put_binary(w: &mut BsonWriter, key: str, subtype: i64, data: Vec<i64>) {
     bs_head(w, BSON_BINARY, key);
-    bs_put_i32(& mut w.out, data.len());
+    bs_put_i32(&mut w.out, data.len());
     w.out.push(subtype);
-    bs_put_bytes(& mut w.out, data);
+    bs_put_bytes(&mut w.out, data);
 }
 
 /// A regular expression; options sorted as the spec asks ("imsx").
-pub fn bson_put_regex(w: & mut BsonWriter, key: str, pattern: str, options: str) {
+pub fn bson_put_regex(w: &mut BsonWriter, key: str, pattern: str, options: str) {
     bs_head(w, BSON_REGEX, key);
-    bs_put_cstr(& mut w.out, pattern);
+    bs_put_cstr(&mut w.out, pattern);
     val order: str = "ilmsux";
     var sorted: str = "";
     var i: i64 = 0;
@@ -238,53 +247,53 @@ pub fn bson_put_regex(w: & mut BsonWriter, key: str, pattern: str, options: str)
         }
         i = i + 1;
     }
-    bs_put_cstr(& mut w.out, sorted);
+    bs_put_cstr(&mut w.out, sorted);
 }
 
 /// Decimal128 from its 16 bytes (little-endian, as on the wire).
-pub fn bson_put_decimal128(w: & mut BsonWriter, key: str, bytes16: Vec<i64>) {
+pub fn bson_put_decimal128(w: &mut BsonWriter, key: str, bytes16: Vec<i64>) {
     bs_head(w, BSON_DECIMAL128, key);
-    bs_put_bytes(& mut w.out, bytes16);
+    bs_put_bytes(&mut w.out, bytes16);
 }
 
-pub fn bson_put_minkey(w: & mut BsonWriter, key: str) {
+pub fn bson_put_minkey(w: &mut BsonWriter, key: str) {
     bs_head(w, BSON_MINKEY, key);
 }
 
-pub fn bson_put_maxkey(w: & mut BsonWriter, key: str) {
+pub fn bson_put_maxkey(w: &mut BsonWriter, key: str) {
     bs_head(w, BSON_MAXKEY, key);
 }
 
 /// A whole encoded document as an element.
-pub fn bson_put_document(w: & mut BsonWriter, key: str, doc: Vec<i64>) {
+pub fn bson_put_document(w: &mut BsonWriter, key: str, doc: Vec<i64>) {
     bs_head(w, BSON_DOCUMENT, key);
-    bs_put_bytes(& mut w.out, doc);
+    bs_put_bytes(&mut w.out, doc);
 }
 
 /// A whole encoded document as an array element (its keys must be 0, 1..).
-pub fn bson_put_array_doc(w: & mut BsonWriter, key: str, doc: Vec<i64>) {
+pub fn bson_put_array_doc(w: &mut BsonWriter, key: str, doc: Vec<i64>) {
     bs_head(w, BSON_ARRAY, key);
-    bs_put_bytes(& mut w.out, doc);
+    bs_put_bytes(&mut w.out, doc);
 }
 
-fn bs_begin(w: & mut BsonWriter, t: i64, key: str) {
+fn bs_begin(w: &mut BsonWriter, t: i64, key: str) {
     bs_head(w, t, key);
     w.starts.push(w.out.len());
     w.is_array.push(t == BSON_ARRAY);
     w.counts.push(0);
-    bs_put_i32(& mut w.out, 0);
+    bs_put_i32(&mut w.out, 0);
 }
 
-pub fn bson_begin_doc(w: & mut BsonWriter, key: str) {
+pub fn bson_begin_doc(w: &mut BsonWriter, key: str) {
     bs_begin(w, BSON_DOCUMENT, key);
 }
 
-pub fn bson_begin_array(w: & mut BsonWriter, key: str) {
+pub fn bson_begin_array(w: &mut BsonWriter, key: str) {
     bs_begin(w, BSON_ARRAY, key);
 }
 
 /// Close the innermost open document or array.
-pub fn bson_end(w: & mut BsonWriter) {
+pub fn bson_end(w: &mut BsonWriter) {
     if w.starts.len() <= 1 {
         return;
     }
@@ -292,16 +301,16 @@ pub fn bson_end(w: & mut BsonWriter) {
     val s: i64 = w.starts.pop();
     w.is_array.pop();
     w.counts.pop();
-    bs_set_i32(& mut w.out, s, w.out.len() - s);
+    bs_set_i32(&mut w.out, s, w.out.len() - s);
 }
 
 /// Close everything and give the document's bytes.
-pub fn bson_finish(w: & mut BsonWriter) -> Vec<i64> {
+pub fn bson_finish(w: &mut BsonWriter) -> Vec<i64> {
     while w.starts.len() > 1 {
         bson_end(w);
     }
     w.out.push(0);
-    bs_set_i32(& mut w.out, 0, w.out.len());
+    bs_set_i32(&mut w.out, 0, w.out.len());
     val out: Vec<i64> = w.out;
     return out;
 }
@@ -309,7 +318,7 @@ pub fn bson_finish(w: & mut BsonWriter) -> Vec<i64> {
 /// The empty document {}.
 pub fn bson_empty() -> Vec<i64> {
     var w: BsonWriter = bson_writer();
-    return bson_finish(& mut w);
+    return bson_finish(&mut w);
 }
 
 // ─── ObjectId ─────────────────────────────────────────────────────────────
@@ -353,9 +362,15 @@ pub fn bson_objectid_hex(id: Vec<i64>) -> str {
 }
 
 fn bs_hexv(c: i64) -> i64 {
-    if c >= 48 && c <= 57 { return c - 48; }
-    if c >= 97 && c <= 102 { return c - 87; }
-    if c >= 65 && c <= 70 { return c - 55; }
+    if c >= 48 && c <= 57 {
+        return c - 48;
+    }
+    if c >= 97 && c <= 102 {
+        return c - 87;
+    }
+    if c >= 65 && c <= 70 {
+        return c - 55;
+    }
     return 0 - 1;
 }
 
@@ -420,10 +435,12 @@ fn mg_failed_doc() -> BsonDoc {
 }
 
 fn bs_doc_new() -> BsonDoc {
-    return BsonDoc { kind: Vec::new(), key: Vec::new(), ival: Vec::new(), ival2: Vec::new(), fval: Vec::new(), sval: Vec::new(), sval2: Vec::new(), bytes: Vec::new(), first: Vec::new(), nkids: Vec::new(), kids: Vec::new(), root: 0 - 1, ok: true, error: "" };
+    return BsonDoc {
+        kind: Vec::new(), key: Vec::new(), ival: Vec::new(), ival2: Vec::new(), fval: Vec::new(), sval: Vec::new(), sval2: Vec::new(), bytes: Vec::new(), first: Vec::new(), nkids: Vec::new(), kids: Vec::new(), root: 0 - 1, ok: true, error: ""
+    };
 }
 
-fn bs_node(d: & mut BsonDoc, kind: i64, key: str) -> i64 {
+fn bs_node(d: &mut BsonDoc, kind: i64, key: str) -> i64 {
     d.kind.push(kind);
     d.key.push(key);
     d.ival.push(0);
@@ -438,14 +455,15 @@ fn bs_node(d: & mut BsonDoc, kind: i64, key: str) -> i64 {
     return d.kind.len() - 1;
 }
 
-fn bs_fail(r: & mut BsReader, msg: str) {
+fn bs_fail(r: &mut BsReader, msg: str) {
     if r.ok {
         r.ok = false;
         r.error = msg + " at byte " + int_to_str(r.pos);
     }
 }
 
-@wrapping fn bs_le(r: & mut BsReader, n: i64) -> i64 {
+@wrapping
+fn bs_le(r: &mut BsReader, n: i64) -> i64 {
     if r.pos + n > r.b.len() {
         bs_fail(r, "truncated");
         r.pos = r.b.len();
@@ -461,7 +479,7 @@ fn bs_fail(r: & mut BsReader, msg: str) {
     return v;
 }
 
-fn bs_i32(r: & mut BsReader) -> i64 {
+fn bs_i32(r: &mut BsReader) -> i64 {
     val v: i64 = bs_le(r, 4);
     if v >= 2147483648 {
         return v - 4294967296;
@@ -469,7 +487,7 @@ fn bs_i32(r: & mut BsReader) -> i64 {
     return v;
 }
 
-fn bs_take(r: & mut BsReader, n: i64) -> Vec<i64> {
+fn bs_take(r: &mut BsReader, n: i64) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     if n < 0 || r.pos + n > r.b.len() {
         bs_fail(r, "truncated");
@@ -485,7 +503,7 @@ fn bs_take(r: & mut BsReader, n: i64) -> Vec<i64> {
     return out;
 }
 
-fn bs_cstr(r: & mut BsReader) -> str {
+fn bs_cstr(r: &mut BsReader) -> str {
     var e: i64 = r.pos;
     while e < r.b.len() && r.b.get(e) != 0 {
         e = e + 1;
@@ -500,7 +518,7 @@ fn bs_cstr(r: & mut BsReader) -> str {
     return s;
 }
 
-fn bs_string(r: & mut BsReader) -> str {
+fn bs_string(r: &mut BsReader) -> str {
     val n: i64 = bs_i32(r);
     if n < 1 || r.pos + n > r.b.len() {
         bs_fail(r, "bad string length");
@@ -514,7 +532,7 @@ fn bs_string(r: & mut BsReader) -> str {
 }
 
 // A document or array body at r.pos (its int32 length first).
-fn bs_document(d: & mut BsonDoc, r: & mut BsReader, node: i64, depth: i64) {
+fn bs_document(d: &mut BsonDoc, r: &mut BsReader, node: i64, depth: i64) {
     if depth > BSON_MAX_DEPTH {
         bs_fail(r, "nested too deep");
         return;
@@ -546,7 +564,7 @@ fn bs_document(d: & mut BsonDoc, r: & mut BsReader, node: i64, depth: i64) {
             d.ival.set(n, bs_le(r, 1));
             d.bytes.set(n, bs_take(r, bl));
         } else if t == BSON_UNDEFINED || t == BSON_NULL || t == BSON_MINKEY || t == BSON_MAXKEY {
-            // no value
+        // no value
         } else if t == BSON_OBJECTID {
             d.bytes.set(n, bs_take(r, 12));
         } else if t == BSON_BOOL {
@@ -592,9 +610,11 @@ fn bs_document(d: & mut BsonDoc, r: & mut BsReader, node: i64, depth: i64) {
 /// length.
 pub fn bson_decode_at(b: Vec<i64>, at: i64) -> BsonDoc {
     var d: BsonDoc = bs_doc_new();
-    var r: BsReader = BsReader { b: b, pos: at, ok: true, error: "" };
-    val root: i64 = bs_node(& mut d, BSON_DOCUMENT, "");
-    bs_document(& mut d, & mut r, root, 0);
+    var r: BsReader = BsReader {
+        b: b, pos: at, ok: true, error: ""
+    };
+    val root: i64 = bs_node(&mut d, BSON_DOCUMENT, "");
+    bs_document(&mut d, &mut r, root, 0);
     d.ok = r.ok;
     d.error = r.error;
     d.root = root;
@@ -620,24 +640,24 @@ pub fn bson_doc_len(b: Vec<i64>, at: i64) -> i64 {
     return (b.get(at) & 255) | ((b.get(at + 1) & 255) << 8) | ((b.get(at + 2) & 255) << 16) | ((b.get(at + 3) & 255) << 24);
 }
 
-pub fn bson_kind(d: & BsonDoc, i: i64) -> i64 {
+pub fn bson_kind(d: &BsonDoc, i: i64) -> i64 {
     return d.kind.get(i);
 }
 
-pub fn bson_key(d: & BsonDoc, i: i64) -> str {
+pub fn bson_key(d: &BsonDoc, i: i64) -> str {
     return d.key.get(i);
 }
 
-pub fn bson_count(d: & BsonDoc, i: i64) -> i64 {
+pub fn bson_count(d: &BsonDoc, i: i64) -> i64 {
     return d.nkids.get(i);
 }
 
-pub fn bson_child(d: & BsonDoc, i: i64, k: i64) -> i64 {
+pub fn bson_child(d: &BsonDoc, i: i64, k: i64) -> i64 {
     return d.kids.get(d.first.get(i) + k);
 }
 
 /// The element `key` of document node `i`, or -1.
-pub fn bson_get(d: & BsonDoc, i: i64, key: str) -> i64 {
+pub fn bson_get(d: &BsonDoc, i: i64, key: str) -> i64 {
     var k: i64 = 0;
     while k < d.nkids.get(i) {
         val c: i64 = bson_child(d, i, k);
@@ -650,7 +670,7 @@ pub fn bson_get(d: & BsonDoc, i: i64, key: str) -> i64 {
 }
 
 /// Follow a dotted path ("cursor.firstBatch") from node i; -1 if absent.
-pub fn bson_path(d: & BsonDoc, i: i64, path: str) -> i64 {
+pub fn bson_path(d: &BsonDoc, i: i64, path: str) -> i64 {
     val parts: Vec<str> = str_split(path, ".");
     var n: i64 = i;
     var k: i64 = 0;
@@ -661,7 +681,7 @@ pub fn bson_path(d: & BsonDoc, i: i64, path: str) -> i64 {
     return n;
 }
 
-pub fn bson_string(d: & BsonDoc, i: i64) -> str {
+pub fn bson_string(d: &BsonDoc, i: i64) -> str {
     if i < 0 {
         return "";
     }
@@ -669,7 +689,7 @@ pub fn bson_string(d: & BsonDoc, i: i64) -> str {
 }
 
 /// A number node as an integer (int32, int64, double truncated, bool).
-pub fn bson_int(d: & BsonDoc, i: i64) -> i64 {
+pub fn bson_int(d: &BsonDoc, i: i64) -> i64 {
     if i < 0 {
         return 0;
     }
@@ -681,7 +701,7 @@ pub fn bson_int(d: & BsonDoc, i: i64) -> i64 {
 }
 
 /// A number node as a float.
-pub fn bson_double(d: & BsonDoc, i: i64) -> f64 {
+pub fn bson_double(d: &BsonDoc, i: i64) -> f64 {
     if i < 0 {
         return 0.0;
     }
@@ -691,7 +711,7 @@ pub fn bson_double(d: & BsonDoc, i: i64) -> f64 {
     return d.ival.get(i) as f64;
 }
 
-pub fn bson_bytes(d: & BsonDoc, i: i64) -> Vec<i64> {
+pub fn bson_bytes(d: &BsonDoc, i: i64) -> Vec<i64> {
     return d.bytes.get(i);
 }
 
@@ -723,8 +743,12 @@ fn bs_b64(b: Vec<i64>) -> str {
         val b0: i64 = b.get(i);
         var b1: i64 = 0;
         var b2: i64 = 0;
-        if i + 1 < b.len() { b1 = b.get(i + 1); }
-        if i + 2 < b.len() { b2 = b.get(i + 2); }
+        if i + 1 < b.len() {
+            b1 = b.get(i + 1);
+        }
+        if i + 2 < b.len() {
+            b2 = b.get(i + 2);
+        }
         val v: i64 = (b0 << 16) | (b1 << 8) | b2;
         out = out + str_slice(alpha, (v >> 18) & 63, ((v >> 18) & 63) + 1) + str_slice(alpha, (v >> 12) & 63, ((v >> 12) & 63) + 1);
         if i + 1 < b.len() {
@@ -743,7 +767,7 @@ fn bs_b64(b: Vec<i64>) -> str {
 }
 
 /// Relaxed Extended JSON (v2) of node i.
-pub fn bson_to_json(d: & BsonDoc, i: i64) -> str {
+pub fn bson_to_json(d: &BsonDoc, i: i64) -> str {
     val k: i64 = d.kind.get(i);
     if k == BSON_DOCUMENT || k == BSON_ARRAY {
         var open: str = "{";
@@ -829,7 +853,7 @@ pub fn bson_to_json(d: & BsonDoc, i: i64) -> str {
 }
 
 // Write node i's value into w under `key`.
-fn bs_put_node(w: & mut BsonWriter, d: & BsonDoc, i: i64, key: str) {
+fn bs_put_node(w: &mut BsonWriter, d: &BsonDoc, i: i64, key: str) {
     val k: i64 = d.kind.get(i);
     if k == BSON_DOCUMENT || k == BSON_ARRAY {
         bs_begin(w, k, key);
@@ -847,8 +871,8 @@ fn bs_put_node(w: & mut BsonWriter, d: & BsonDoc, i: i64, key: str) {
     } else if k == BSON_JS {
         bs_head(w, BSON_JS, key);
         val b: Vec<i64> = str_bytes(d.sval.get(i));
-        bs_put_i32(& mut w.out, b.len() + 1);
-        bs_put_bytes(& mut w.out, b);
+        bs_put_i32(&mut w.out, b.len() + 1);
+        bs_put_bytes(&mut w.out, b);
         w.out.push(0);
     } else if k == BSON_BINARY {
         bson_put_binary(w, key, d.ival.get(i), d.bytes.get(i));
@@ -860,8 +884,8 @@ fn bs_put_node(w: & mut BsonWriter, d: & BsonDoc, i: i64, key: str) {
         bson_put_datetime(w, key, d.ival.get(i));
     } else if k == BSON_REGEX {
         bs_head(w, BSON_REGEX, key);
-        bs_put_cstr(& mut w.out, d.sval.get(i));
-        bs_put_cstr(& mut w.out, d.sval2.get(i));
+        bs_put_cstr(&mut w.out, d.sval.get(i));
+        bs_put_cstr(&mut w.out, d.sval2.get(i));
     } else if k == BSON_INT32 {
         bson_put_int32(w, key, d.ival.get(i));
     } else if k == BSON_TIMESTAMP {
@@ -876,19 +900,19 @@ fn bs_put_node(w: & mut BsonWriter, d: & BsonDoc, i: i64, key: str) {
 }
 
 /// The bytes of document (or array) node i, as a document.
-pub fn bson_encode_node(d: & BsonDoc, i: i64) -> Vec<i64> {
+pub fn bson_encode_node(d: &BsonDoc, i: i64) -> Vec<i64> {
     var w: BsonWriter = bson_writer();
     var j: i64 = 0;
     while j < d.nkids.get(i) {
         val c: i64 = bson_child(d, i, j);
-        bs_put_node(& mut w, d, c, d.key.get(c));
+        bs_put_node(&mut w, d, c, d.key.get(c));
         j = j + 1;
     }
-    return bson_finish(& mut w);
+    return bson_finish(&mut w);
 }
 
 /// Put node i of another document into w under `key`.
-pub fn bson_put_node(w: & mut BsonWriter, key: str, d: & BsonDoc, i: i64) {
+pub fn bson_put_node(w: &mut BsonWriter, key: str, d: &BsonDoc, i: i64) {
     bs_put_node(w, d, i, key);
 }
 
@@ -916,35 +940,35 @@ pub fn mongo_crc32c(b: Vec<i64>) -> i64 {
 
 /// An OP_MSG: body document, then document sequences (identifier and
 /// documents), flag bits; with checksum when flags has bit 0.
-pub fn mongo_op_msg(request_id: i64, response_to: i64, flags: i64, body: Vec<i64>, seq_ids: Vec<str>, seq_docs: Vec<Vec<Vec<i64>>>) -> Vec<i64> {
+pub fn mongo_op_msg(request_id: i64, response_to: i64, flags: i64, body: Vec<i64>, seq_ids: Vec<str>, seq_docs: Vec<Vec<Vec<i64>> >) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
-    bs_put_i32(& mut out, 0);
-    bs_put_i32(& mut out, request_id);
-    bs_put_i32(& mut out, response_to);
-    bs_put_i32(& mut out, MONGO_OP_MSG);
-    bs_put_i32(& mut out, flags);
+    bs_put_i32(&mut out, 0);
+    bs_put_i32(&mut out, request_id);
+    bs_put_i32(&mut out, response_to);
+    bs_put_i32(&mut out, MONGO_OP_MSG);
+    bs_put_i32(&mut out, flags);
     out.push(0);
-    bs_put_bytes(& mut out, body);
+    bs_put_bytes(&mut out, body);
     var s: i64 = 0;
     while s < seq_ids.len() {
         out.push(1);
         val at: i64 = out.len();
-        bs_put_i32(& mut out, 0);
-        bs_put_cstr(& mut out, seq_ids.get(s));
+        bs_put_i32(&mut out, 0);
+        bs_put_cstr(&mut out, seq_ids.get(s));
         val docs: Vec<Vec<i64>> = seq_docs.get(s);
         var k: i64 = 0;
         while k < docs.len() {
-            bs_put_bytes(& mut out, docs.get(k));
+            bs_put_bytes(&mut out, docs.get(k));
             k = k + 1;
         }
-        bs_set_i32(& mut out, at, out.len() - at);
+        bs_set_i32(&mut out, at, out.len() - at);
         s = s + 1;
     }
     if (flags & 1) != 0 {
-        bs_set_i32(& mut out, 0, out.len() + 4);
-        bs_put_i32(& mut out, mongo_crc32c(out));
+        bs_set_i32(&mut out, 0, out.len() + 4);
+        bs_put_i32(&mut out, mongo_crc32c(out));
     } else {
-        bs_set_i32(& mut out, 0, out.len());
+        bs_set_i32(&mut out, 0, out.len());
     }
     return out;
 }
@@ -962,11 +986,13 @@ pub struct MongoMessage {
     pub body: BsonDoc,
     pub body_bytes: Vec<i64>,
     pub seq_ids: Vec<str>,
-    pub seq_docs: Vec<Vec<Vec<i64>>>,
+    pub seq_docs: Vec<Vec<Vec<i64>> >,
 }
 
 fn mg_empty_message() -> MongoMessage {
-    return MongoMessage { complete: false, ok: true, error: "", length: 0, request_id: 0, response_to: 0, flags: 0, body: bs_doc_new(), body_bytes: Vec::new(), seq_ids: Vec::new(), seq_docs: Vec::new() };
+    return MongoMessage {
+        complete: false, ok: true, error: "", length: 0, request_id: 0, response_to: 0, flags: 0, body: bs_doc_new(), body_bytes: Vec::new(), seq_ids: Vec::new(), seq_docs: Vec::new()
+    };
 }
 
 /// Parse the OP_MSG at the start of `b`.
@@ -975,8 +1001,10 @@ pub fn mongo_read_message(b: Vec<i64>) -> MongoMessage {
     if b.len() < 4 {
         return m;
     }
-    var r: BsReader = BsReader { b: b, pos: 0, ok: true, error: "" };
-    val len: i64 = bs_i32(& mut r);
+    var r: BsReader = BsReader {
+        b: b, pos: 0, ok: true, error: ""
+    };
+    val len: i64 = bs_i32(&mut r);
     if len < 21 || len > 48000000 {
         m.complete = true;
         m.ok = false;
@@ -988,15 +1016,15 @@ pub fn mongo_read_message(b: Vec<i64>) -> MongoMessage {
     }
     m.complete = true;
     m.length = len;
-    m.request_id = bs_i32(& mut r);
-    m.response_to = bs_i32(& mut r);
-    val op: i64 = bs_i32(& mut r);
+    m.request_id = bs_i32(&mut r);
+    m.response_to = bs_i32(&mut r);
+    val op: i64 = bs_i32(&mut r);
     if op != MONGO_OP_MSG {
         m.ok = false;
         m.error = "opcode " + int_to_str(op) + " is not OP_MSG";
         return m;
     }
-    m.flags = bs_le(& mut r, 4);
+    m.flags = bs_le(&mut r, 4);
     var end: i64 = len;
     if (m.flags & 1) != 0 {
         end = len - 4;
@@ -1006,8 +1034,10 @@ pub fn mongo_read_message(b: Vec<i64>) -> MongoMessage {
             head.push(b.get(i));
             i = i + 1;
         }
-        var cr: BsReader = BsReader { b: b, pos: end, ok: true, error: "" };
-        if bs_le(& mut cr, 4) != mongo_crc32c(head) {
+        var cr: BsReader = BsReader {
+            b: b, pos: end, ok: true, error: ""
+        };
+        if bs_le(&mut cr, 4) != mongo_crc32c(head) {
             m.ok = false;
             m.error = "checksum mismatch";
             return m;
@@ -1015,7 +1045,7 @@ pub fn mongo_read_message(b: Vec<i64>) -> MongoMessage {
     }
     var bodies: i64 = 0;
     while r.pos < end && r.ok {
-        val kind: i64 = bs_le(& mut r, 1);
+        val kind: i64 = bs_le(&mut r, 1);
         if kind == 0 {
             val dl: i64 = bson_doc_len(b, r.pos);
             if dl < 5 || r.pos + dl > end {
@@ -1023,7 +1053,7 @@ pub fn mongo_read_message(b: Vec<i64>) -> MongoMessage {
                 m.error = "bad body section";
                 return m;
             }
-            m.body_bytes = bs_take(& mut r, dl);
+            m.body_bytes = bs_take(&mut r, dl);
             m.body = bson_decode(m.body_bytes);
             if !m.body.ok {
                 m.ok = false;
@@ -1033,13 +1063,13 @@ pub fn mongo_read_message(b: Vec<i64>) -> MongoMessage {
             bodies = bodies + 1;
         } else if kind == 1 {
             val start: i64 = r.pos;
-            val sl: i64 = bs_i32(& mut r);
+            val sl: i64 = bs_i32(&mut r);
             if sl < 5 || start + sl > end {
                 m.ok = false;
                 m.error = "bad document sequence";
                 return m;
             }
-            m.seq_ids.push(bs_cstr(& mut r));
+            m.seq_ids.push(bs_cstr(&mut r));
             var docs: Vec<Vec<i64>> = Vec::new();
             while r.ok && r.pos < start + sl {
                 val dl: i64 = bson_doc_len(b, r.pos);
@@ -1048,7 +1078,7 @@ pub fn mongo_read_message(b: Vec<i64>) -> MongoMessage {
                     m.error = "bad document in a sequence";
                     return m;
                 }
-                docs.push(bs_take(& mut r, dl));
+                docs.push(bs_take(&mut r, dl));
             }
             m.seq_docs.push(docs);
         } else {
@@ -1071,112 +1101,112 @@ pub fn mongo_read_message(b: Vec<i64>) -> MongoMessage {
 /// (filter is always sent).
 pub fn mongo_cmd_find(db: str, coll: str, filter: Vec<i64>, sort: Vec<i64>, projection: Vec<i64>, skip: i64, limit: i64, batch: i64) -> Vec<i64> {
     var w: BsonWriter = bson_writer();
-    bson_put_string(& mut w, "find", coll);
-    bson_put_document(& mut w, "filter", filter);
+    bson_put_string(&mut w, "find", coll);
+    bson_put_document(&mut w, "filter", filter);
     if sort.len() > 5 {
-        bson_put_document(& mut w, "sort", sort);
+        bson_put_document(&mut w, "sort", sort);
     }
     if projection.len() > 5 {
-        bson_put_document(& mut w, "projection", projection);
+        bson_put_document(&mut w, "projection", projection);
     }
     if skip > 0 {
-        bson_put_int64(& mut w, "skip", skip);
+        bson_put_int64(&mut w, "skip", skip);
     }
     if limit > 0 {
-        bson_put_int64(& mut w, "limit", limit);
+        bson_put_int64(&mut w, "limit", limit);
     }
     if batch > 0 {
-        bson_put_int32(& mut w, "batchSize", batch);
+        bson_put_int32(&mut w, "batchSize", batch);
     }
-    bson_put_string(& mut w, "$db", db);
-    return bson_finish(& mut w);
+    bson_put_string(&mut w, "$db", db);
+    return bson_finish(&mut w);
 }
 
 /// {insert: coll, ordered: true, $db}; the documents go in a "documents"
 /// sequence section.
 pub fn mongo_cmd_insert(db: str, coll: str) -> Vec<i64> {
     var w: BsonWriter = bson_writer();
-    bson_put_string(& mut w, "insert", coll);
-    bson_put_bool(& mut w, "ordered", true);
-    bson_put_string(& mut w, "$db", db);
-    return bson_finish(& mut w);
+    bson_put_string(&mut w, "insert", coll);
+    bson_put_bool(&mut w, "ordered", true);
+    bson_put_string(&mut w, "$db", db);
+    return bson_finish(&mut w);
 }
 
 /// One update statement {q, u, upsert, multi}.
 pub fn mongo_update_stmt(q: Vec<i64>, u: Vec<i64>, upsert: bool, multi: bool) -> Vec<i64> {
     var w: BsonWriter = bson_writer();
-    bson_put_document(& mut w, "q", q);
-    bson_put_document(& mut w, "u", u);
-    bson_put_bool(& mut w, "upsert", upsert);
-    bson_put_bool(& mut w, "multi", multi);
-    return bson_finish(& mut w);
+    bson_put_document(&mut w, "q", q);
+    bson_put_document(&mut w, "u", u);
+    bson_put_bool(&mut w, "upsert", upsert);
+    bson_put_bool(&mut w, "multi", multi);
+    return bson_finish(&mut w);
 }
 
 /// One delete statement {q, limit} (limit 1: one document, 0: all).
 pub fn mongo_delete_stmt(q: Vec<i64>, limit: i64) -> Vec<i64> {
     var w: BsonWriter = bson_writer();
-    bson_put_document(& mut w, "q", q);
-    bson_put_int32(& mut w, "limit", limit);
-    return bson_finish(& mut w);
+    bson_put_document(&mut w, "q", q);
+    bson_put_int32(&mut w, "limit", limit);
+    return bson_finish(&mut w);
 }
 
 fn mg_simple_cmd(name: str, coll: str, db: str) -> Vec<i64> {
     var w: BsonWriter = bson_writer();
-    bson_put_string(& mut w, name, coll);
-    bson_put_bool(& mut w, "ordered", true);
-    bson_put_string(& mut w, "$db", db);
-    return bson_finish(& mut w);
+    bson_put_string(&mut w, name, coll);
+    bson_put_bool(&mut w, "ordered", true);
+    bson_put_string(&mut w, "$db", db);
+    return bson_finish(&mut w);
 }
 
 /// {aggregate: coll, pipeline: [stages], cursor: {batchSize}, $db}.
 pub fn mongo_cmd_aggregate(db: str, coll: str, stages: Vec<Vec<i64>>, batch: i64) -> Vec<i64> {
     var w: BsonWriter = bson_writer();
-    bson_put_string(& mut w, "aggregate", coll);
-    bson_begin_array(& mut w, "pipeline");
+    bson_put_string(&mut w, "aggregate", coll);
+    bson_begin_array(&mut w, "pipeline");
     var i: i64 = 0;
     while i < stages.len() {
-        bson_put_document(& mut w, "", stages.get(i));
+        bson_put_document(&mut w, "", stages.get(i));
         i = i + 1;
     }
-    bson_end(& mut w);
-    bson_begin_doc(& mut w, "cursor");
+    bson_end(&mut w);
+    bson_begin_doc(&mut w, "cursor");
     if batch > 0 {
-        bson_put_int32(& mut w, "batchSize", batch);
+        bson_put_int32(&mut w, "batchSize", batch);
     }
-    bson_end(& mut w);
-    bson_put_string(& mut w, "$db", db);
-    return bson_finish(& mut w);
+    bson_end(&mut w);
+    bson_put_string(&mut w, "$db", db);
+    return bson_finish(&mut w);
 }
 
 /// {getMore: id, collection, batchSize, $db}.
 pub fn mongo_cmd_get_more(db: str, coll: str, cursor_id: i64, batch: i64) -> Vec<i64> {
     var w: BsonWriter = bson_writer();
-    bson_put_int64(& mut w, "getMore", cursor_id);
-    bson_put_string(& mut w, "collection", coll);
+    bson_put_int64(&mut w, "getMore", cursor_id);
+    bson_put_string(&mut w, "collection", coll);
     if batch > 0 {
-        bson_put_int32(& mut w, "batchSize", batch);
+        bson_put_int32(&mut w, "batchSize", batch);
     }
-    bson_put_string(& mut w, "$db", db);
-    return bson_finish(& mut w);
+    bson_put_string(&mut w, "$db", db);
+    return bson_finish(&mut w);
 }
 
 /// {killCursors: coll, cursors: [id], $db}.
 pub fn mongo_cmd_kill_cursors(db: str, coll: str, cursor_id: i64) -> Vec<i64> {
     var w: BsonWriter = bson_writer();
-    bson_put_string(& mut w, "killCursors", coll);
-    bson_begin_array(& mut w, "cursors");
-    bson_put_int64(& mut w, "", cursor_id);
-    bson_end(& mut w);
-    bson_put_string(& mut w, "$db", db);
-    return bson_finish(& mut w);
+    bson_put_string(&mut w, "killCursors", coll);
+    bson_begin_array(&mut w, "cursors");
+    bson_put_int64(&mut w, "", cursor_id);
+    bson_end(&mut w);
+    bson_put_string(&mut w, "$db", db);
+    return bson_finish(&mut w);
 }
 
 /// {name: 1, $db} (hello, ping, buildInfo ...).
 pub fn mongo_cmd_simple(db: str, name: str) -> Vec<i64> {
     var w: BsonWriter = bson_writer();
-    bson_put_int32(& mut w, name, 1);
-    bson_put_string(& mut w, "$db", db);
-    return bson_finish(& mut w);
+    bson_put_int32(&mut w, name, 1);
+    bson_put_string(&mut w, "$db", db);
+    return bson_finish(&mut w);
 }
 
 // ─── Client ───────────────────────────────────────────────────────────────
@@ -1188,7 +1218,9 @@ pub struct MongoTransport {
 }
 
 pub fn mongo_tcp_transport(sock: i64) -> MongoTransport {
-    return MongoTransport { conn: sock, send: net_send_bytes, recv: net_recv_bytes };
+    return MongoTransport {
+        conn: sock, send: net_send_bytes, recv: net_recv_bytes
+    };
 }
 
 pub struct MongoClient {
@@ -1202,7 +1234,9 @@ pub struct MongoClient {
 }
 
 pub fn mongo_client_new(tr: MongoTransport, db: str) -> MongoClient {
-    return MongoClient { tr: tr, db: db, next_id: 1, inbuf: Vec::new(), ok: true, error: "", checksums: false };
+    return MongoClient {
+        tr: tr, db: db, next_id: 1, inbuf: Vec::new(), ok: true, error: "", checksums: false
+    };
 }
 
 /// A command's reply. ok: the server said ok: 1. n, n_modified: write
@@ -1219,23 +1253,25 @@ pub struct MongoReply {
 }
 
 fn mg_reply_of(d: BsonDoc) -> MongoReply {
-    var r: MongoReply = MongoReply { ok: false, code: 0, code_name: "", errmsg: "", n: 0, n_modified: 0, write_errors: Vec::new(), doc: d };
+    var r: MongoReply = MongoReply {
+        ok: false, code: 0, code_name: "", errmsg: "", n: 0, n_modified: 0, write_errors: Vec::new(), doc: d
+    };
     if !d.ok {
         r.errmsg = "bad reply: " + d.error;
         return r;
     }
-    r.ok = bson_double(& d, bson_get(& d, d.root, "ok")) == 1.0;
-    r.code = bson_int(& d, bson_get(& d, d.root, "code"));
-    r.code_name = bson_string(& d, bson_get(& d, d.root, "codeName"));
-    r.errmsg = bson_string(& d, bson_get(& d, d.root, "errmsg"));
-    r.n = bson_int(& d, bson_get(& d, d.root, "n"));
-    r.n_modified = bson_int(& d, bson_get(& d, d.root, "nModified"));
-    val we: i64 = bson_get(& d, d.root, "writeErrors");
+    r.ok = bson_double(&d, bson_get(&d, d.root, "ok")) == 1.0;
+    r.code = bson_int(&d, bson_get(&d, d.root, "code"));
+    r.code_name = bson_string(&d, bson_get(&d, d.root, "codeName"));
+    r.errmsg = bson_string(&d, bson_get(&d, d.root, "errmsg"));
+    r.n = bson_int(&d, bson_get(&d, d.root, "n"));
+    r.n_modified = bson_int(&d, bson_get(&d, d.root, "nModified"));
+    val we: i64 = bson_get(&d, d.root, "writeErrors");
     if we >= 0 {
         var k: i64 = 0;
-        while k < bson_count(& d, we) {
-            val e: i64 = bson_child(& d, we, k);
-            r.write_errors.push("#" + int_to_str(bson_int(& d, bson_get(& d, e, "index"))) + " " + int_to_str(bson_int(& d, bson_get(& d, e, "code"))) + " " + bson_string(& d, bson_get(& d, e, "errmsg")));
+        while k < bson_count(&d, we) {
+            val e: i64 = bson_child(&d, we, k);
+            r.write_errors.push("#" + int_to_str(bson_int(&d, bson_get(&d, e, "index"))) + " " + int_to_str(bson_int(&d, bson_get(&d, e, "code"))) + " " + bson_string(&d, bson_get(&d, e, "errmsg")));
             k = k + 1;
         }
     }
@@ -1243,7 +1279,7 @@ fn mg_reply_of(d: BsonDoc) -> MongoReply {
 }
 
 /// Send a command (body + optional sequences) and read its reply.
-pub fn mongo_run(c: & mut MongoClient, body: Vec<i64>, seq_ids: Vec<str>, seq_docs: Vec<Vec<Vec<i64>>>) -> MongoReply {
+pub fn mongo_run(c: &mut MongoClient, body: Vec<i64>, seq_ids: Vec<str>, seq_docs: Vec<Vec<Vec<i64>> >) -> MongoReply {
     var flags: i64 = 0;
     if c.checksums {
         flags = 1;
@@ -1297,40 +1333,40 @@ pub fn mongo_run(c: & mut MongoClient, body: Vec<i64>, seq_ids: Vec<str>, seq_do
     return e;
 }
 
-pub fn mongo_command(c: & mut MongoClient, body: Vec<i64>) -> MongoReply {
+pub fn mongo_command(c: &mut MongoClient, body: Vec<i64>) -> MongoReply {
     var ids: Vec<str> = Vec::new();
-    var docs: Vec<Vec<Vec<i64>>> = Vec::new();
+    var docs: Vec<Vec<Vec<i64>> > = Vec::new();
     return mongo_run(c, body, ids, docs);
 }
 
-pub fn mongo_ping(c: & mut MongoClient) -> bool {
+pub fn mongo_ping(c: &mut MongoClient) -> bool {
     val r: MongoReply = mongo_command(c, mongo_cmd_simple("admin", "ping"));
     return r.ok;
 }
 
 /// insert: the documents (encoded) into `coll`.
-pub fn mongo_insert(c: & mut MongoClient, coll: str, docs: Vec<Vec<i64>>) -> MongoReply {
+pub fn mongo_insert(c: &mut MongoClient, coll: str, docs: Vec<Vec<i64>>) -> MongoReply {
     var ids: Vec<str> = Vec::new();
     ids.push("documents");
-    var seqs: Vec<Vec<Vec<i64>>> = Vec::new();
+    var seqs: Vec<Vec<Vec<i64>> > = Vec::new();
     seqs.push(docs);
     return mongo_run(c, mongo_cmd_insert(c.db, coll), ids, seqs);
 }
 
 /// update: statements made with mongo_update_stmt.
-pub fn mongo_update(c: & mut MongoClient, coll: str, stmts: Vec<Vec<i64>>) -> MongoReply {
+pub fn mongo_update(c: &mut MongoClient, coll: str, stmts: Vec<Vec<i64>>) -> MongoReply {
     var ids: Vec<str> = Vec::new();
     ids.push("updates");
-    var seqs: Vec<Vec<Vec<i64>>> = Vec::new();
+    var seqs: Vec<Vec<Vec<i64>> > = Vec::new();
     seqs.push(stmts);
     return mongo_run(c, mg_simple_cmd("update", coll, c.db), ids, seqs);
 }
 
 /// delete: statements made with mongo_delete_stmt.
-pub fn mongo_delete(c: & mut MongoClient, coll: str, stmts: Vec<Vec<i64>>) -> MongoReply {
+pub fn mongo_delete(c: &mut MongoClient, coll: str, stmts: Vec<Vec<i64>>) -> MongoReply {
     var ids: Vec<str> = Vec::new();
     ids.push("deletes");
-    var seqs: Vec<Vec<Vec<i64>>> = Vec::new();
+    var seqs: Vec<Vec<Vec<i64>> > = Vec::new();
     seqs.push(stmts);
     return mongo_run(c, mg_simple_cmd("delete", coll, c.db), ids, seqs);
 }
@@ -1349,25 +1385,27 @@ pub struct MongoCursor {
     pub batches: i64,
 }
 
-fn mg_cursor_from(r: & MongoReply, coll: str, batch_size: i64, key: str) -> MongoCursor {
-    var cur: MongoCursor = MongoCursor { ok: r.ok, error: r.errmsg, id: 0, ns: "", coll: coll, batch: Vec::new(), pos: 0, batch_size: batch_size, batches: 0 };
+fn mg_cursor_from(r: &MongoReply, coll: str, batch_size: i64, key: str) -> MongoCursor {
+    var cur: MongoCursor = MongoCursor {
+        ok: r.ok, error: r.errmsg, id: 0, ns: "", coll: coll, batch: Vec::new(), pos: 0, batch_size: batch_size, batches: 0
+    };
     if !r.ok {
         return cur;
     }
     val d: BsonDoc = r.doc;
-    val cn: i64 = bson_get(& d, d.root, "cursor");
+    val cn: i64 = bson_get(&d, d.root, "cursor");
     if cn < 0 {
         cur.ok = false;
         cur.error = "reply without a cursor";
         return cur;
     }
-    cur.id = bson_int(& d, bson_get(& d, cn, "id"));
-    cur.ns = bson_string(& d, bson_get(& d, cn, "ns"));
-    val b: i64 = bson_get(& d, cn, key);
+    cur.id = bson_int(&d, bson_get(&d, cn, "id"));
+    cur.ns = bson_string(&d, bson_get(&d, cn, "ns"));
+    val b: i64 = bson_get(&d, cn, key);
     if b >= 0 {
         var k: i64 = 0;
-        while k < bson_count(& d, b) {
-            cur.batch.push(bson_encode_node(& d, bson_child(& d, b, k)));
+        while k < bson_count(&d, b) {
+            cur.batch.push(bson_encode_node(&d, bson_child(&d, b, k)));
             k = k + 1;
         }
     }
@@ -1376,21 +1414,21 @@ fn mg_cursor_from(r: & MongoReply, coll: str, batch_size: i64, key: str) -> Mong
 }
 
 /// find: a cursor over the matching documents.
-pub fn mongo_find(c: & mut MongoClient, coll: str, filter: Vec<i64>, sort: Vec<i64>, limit: i64, batch_size: i64) -> MongoCursor {
+pub fn mongo_find(c: &mut MongoClient, coll: str, filter: Vec<i64>, sort: Vec<i64>, limit: i64, batch_size: i64) -> MongoCursor {
     var e: Vec<i64> = Vec::new();
     val r: MongoReply = mongo_command(c, mongo_cmd_find(c.db, coll, filter, sort, e, 0, limit, batch_size));
-    return mg_cursor_from(& r, coll, batch_size, "firstBatch");
+    return mg_cursor_from(&r, coll, batch_size, "firstBatch");
 }
 
 /// aggregate: a cursor over the pipeline's output.
-pub fn mongo_aggregate(c: & mut MongoClient, coll: str, stages: Vec<Vec<i64>>, batch_size: i64) -> MongoCursor {
+pub fn mongo_aggregate(c: &mut MongoClient, coll: str, stages: Vec<Vec<i64>>, batch_size: i64) -> MongoCursor {
     val r: MongoReply = mongo_command(c, mongo_cmd_aggregate(c.db, coll, stages, batch_size));
-    return mg_cursor_from(& r, coll, batch_size, "firstBatch");
+    return mg_cursor_from(&r, coll, batch_size, "firstBatch");
 }
 
 /// Is there another document? Runs getMore when the batch is used up and
 /// the server still holds the cursor.
-pub fn mongo_cursor_more(c: & mut MongoClient, cur: & mut MongoCursor) -> bool {
+pub fn mongo_cursor_more(c: &mut MongoClient, cur: &mut MongoCursor) -> bool {
     if !cur.ok {
         return false;
     }
@@ -1399,7 +1437,7 @@ pub fn mongo_cursor_more(c: & mut MongoClient, cur: & mut MongoCursor) -> bool {
     }
     while cur.id != 0 {
         val r: MongoReply = mongo_command(c, mongo_cmd_get_more(c.db, cur.coll, cur.id, cur.batch_size));
-        val next: MongoCursor = mg_cursor_from(& r, cur.coll, cur.batch_size, "nextBatch");
+        val next: MongoCursor = mg_cursor_from(&r, cur.coll, cur.batch_size, "nextBatch");
         if !next.ok {
             cur.ok = false;
             cur.error = next.error;
@@ -1417,14 +1455,14 @@ pub fn mongo_cursor_more(c: & mut MongoClient, cur: & mut MongoCursor) -> bool {
 }
 
 /// The next document (call after mongo_cursor_more said true).
-pub fn mongo_cursor_next(cur: & mut MongoCursor) -> BsonDoc {
+pub fn mongo_cursor_next(cur: &mut MongoCursor) -> BsonDoc {
     val b: Vec<i64> = cur.batch.get(cur.pos);
     cur.pos = cur.pos + 1;
     return bson_decode(b);
 }
 
 /// Drop a cursor before its end: killCursors on the server.
-pub fn mongo_cursor_close(c: & mut MongoClient, cur: & mut MongoCursor) -> bool {
+pub fn mongo_cursor_close(c: &mut MongoClient, cur: &mut MongoCursor) -> bool {
     if cur.id == 0 {
         return true;
     }
@@ -1458,36 +1496,36 @@ pub struct MongoHello {
 /// application out; `sasl_user` "" leaves saslSupportedMechs out.
 pub fn mongo_cmd_hello(app: str, os_type: str, compressors: Vec<str>, sasl_db: str, sasl_user: str) -> Vec<i64> {
     var w: BsonWriter = bson_writer();
-    bson_put_int32(& mut w, "hello", 1);
-    bson_begin_doc(& mut w, "client");
+    bson_put_int32(&mut w, "hello", 1);
+    bson_begin_doc(&mut w, "client");
     if str_len(app) > 0 {
-        bson_begin_doc(& mut w, "application");
-        bson_put_string(& mut w, "name", app);
-        bson_end(& mut w);
+        bson_begin_doc(&mut w, "application");
+        bson_put_string(&mut w, "name", app);
+        bson_end(&mut w);
     }
-    bson_begin_doc(& mut w, "driver");
-    bson_put_string(& mut w, "name", "fides-mongodb");
-    bson_put_string(& mut w, "version", "1.0");
-    bson_end(& mut w);
-    bson_begin_doc(& mut w, "os");
-    bson_put_string(& mut w, "type", os_type);
-    bson_end(& mut w);
-    bson_end(& mut w);
-    bson_begin_array(& mut w, "compression");
+    bson_begin_doc(&mut w, "driver");
+    bson_put_string(&mut w, "name", "fides-mongodb");
+    bson_put_string(&mut w, "version", "1.0");
+    bson_end(&mut w);
+    bson_begin_doc(&mut w, "os");
+    bson_put_string(&mut w, "type", os_type);
+    bson_end(&mut w);
+    bson_end(&mut w);
+    bson_begin_array(&mut w, "compression");
     var i: i64 = 0;
     while i < compressors.len() {
-        bson_put_string(& mut w, "", compressors.get(i));
+        bson_put_string(&mut w, "", compressors.get(i));
         i = i + 1;
     }
-    bson_end(& mut w);
+    bson_end(&mut w);
     if str_len(sasl_user) > 0 {
-        bson_put_string(& mut w, "saslSupportedMechs", sasl_db + "." + sasl_user);
+        bson_put_string(&mut w, "saslSupportedMechs", sasl_db + "." + sasl_user);
     }
-    bson_put_string(& mut w, "$db", "admin");
-    return bson_finish(& mut w);
+    bson_put_string(&mut w, "$db", "admin");
+    return bson_finish(&mut w);
 }
 
-fn mg_str_list(d: & BsonDoc, node: i64) -> Vec<str> {
+fn mg_str_list(d: &BsonDoc, node: i64) -> Vec<str> {
     var out: Vec<str> = Vec::new();
     if node < 0 {
         return out;
@@ -1503,26 +1541,28 @@ fn mg_str_list(d: & BsonDoc, node: i64) -> Vec<str> {
 /// Read a hello reply; `compressor` is the first of the client's
 /// `compressors` (its order of preference) that the server also lists, ""
 /// when none.
-pub fn mongo_parse_hello(r: & MongoReply, compressors: Vec<str>) -> MongoHello {
-    var h: MongoHello = MongoHello { ok: r.ok, error: r.errmsg, writable_primary: false, min_wire: 0, max_wire: 0, max_bson_size: 16777216, max_message_size: 48000000, max_write_batch: 100000, compression: Vec::new(), sasl_mechs: Vec::new(), compressor: "" };
+pub fn mongo_parse_hello(r: &MongoReply, compressors: Vec<str>) -> MongoHello {
+    var h: MongoHello = MongoHello {
+        ok: r.ok, error: r.errmsg, writable_primary: false, min_wire: 0, max_wire: 0, max_bson_size: 16777216, max_message_size: 48000000, max_write_batch: 100000, compression: Vec::new(), sasl_mechs: Vec::new(), compressor: ""
+    };
     if !r.ok {
         return h;
     }
     val d: BsonDoc = r.doc;
-    h.writable_primary = bson_int(& d, bson_get(& d, d.root, "isWritablePrimary")) != 0;
-    h.min_wire = bson_int(& d, bson_get(& d, d.root, "minWireVersion"));
-    h.max_wire = bson_int(& d, bson_get(& d, d.root, "maxWireVersion"));
-    if bson_get(& d, d.root, "maxBsonObjectSize") >= 0 {
-        h.max_bson_size = bson_int(& d, bson_get(& d, d.root, "maxBsonObjectSize"));
+    h.writable_primary = bson_int(&d, bson_get(&d, d.root, "isWritablePrimary")) != 0;
+    h.min_wire = bson_int(&d, bson_get(&d, d.root, "minWireVersion"));
+    h.max_wire = bson_int(&d, bson_get(&d, d.root, "maxWireVersion"));
+    if bson_get(&d, d.root, "maxBsonObjectSize") >= 0 {
+        h.max_bson_size = bson_int(&d, bson_get(&d, d.root, "maxBsonObjectSize"));
     }
-    if bson_get(& d, d.root, "maxMessageSizeBytes") >= 0 {
-        h.max_message_size = bson_int(& d, bson_get(& d, d.root, "maxMessageSizeBytes"));
+    if bson_get(&d, d.root, "maxMessageSizeBytes") >= 0 {
+        h.max_message_size = bson_int(&d, bson_get(&d, d.root, "maxMessageSizeBytes"));
     }
-    if bson_get(& d, d.root, "maxWriteBatchSize") >= 0 {
-        h.max_write_batch = bson_int(& d, bson_get(& d, d.root, "maxWriteBatchSize"));
+    if bson_get(&d, d.root, "maxWriteBatchSize") >= 0 {
+        h.max_write_batch = bson_int(&d, bson_get(&d, d.root, "maxWriteBatchSize"));
     }
-    h.compression = mg_str_list(& d, bson_get(& d, d.root, "compression"));
-    h.sasl_mechs = mg_str_list(& d, bson_get(& d, d.root, "saslSupportedMechs"));
+    h.compression = mg_str_list(&d, bson_get(&d, d.root, "compression"));
+    h.sasl_mechs = mg_str_list(&d, bson_get(&d, d.root, "saslSupportedMechs"));
     var i: i64 = 0;
     while i < compressors.len() && str_len(h.compressor) == 0 {
         var k: i64 = 0;
@@ -1542,15 +1582,15 @@ pub fn mongo_parse_hello(r: & MongoReply, compressors: Vec<str>) -> MongoHello {
 /// result only: this client still sends every message uncompressed, which
 /// the protocol allows (a server compresses only replies to compressed
 /// requests), since OP_COMPRESSED is not implemented.
-pub fn mongo_hello(c: & mut MongoClient, app: str, compressors: Vec<str>, sasl_db: str, sasl_user: str) -> MongoHello {
+pub fn mongo_hello(c: &mut MongoClient, app: str, compressors: Vec<str>, sasl_db: str, sasl_user: str) -> MongoHello {
     val r: MongoReply = mongo_command(c, mongo_cmd_hello(app, "linux", compressors, sasl_db, sasl_user));
-    return mongo_parse_hello(& r, compressors);
+    return mongo_parse_hello(&r, compressors);
 }
 
 /// The SCRAM mechanism for an account from hello's saslSupportedMechs:
 /// SCRAM-SHA-256 when listed or when the list is absent (MongoDB 4.0 and
 /// later default to it), else SCRAM-SHA-1.
-pub fn mongo_pick_mechanism(h: & MongoHello) -> str {
+pub fn mongo_pick_mechanism(h: &MongoHello) -> str {
     if h.sasl_mechs.len() == 0 {
         return "SCRAM-SHA-256";
     }
@@ -1598,7 +1638,7 @@ pub fn mongo_password_digest(user: str, password: str) -> str {
     return md5_hex(md5_str(user + ":mongo:" + password));
 }
 
-fn mg_utf8_cps(b: & Vec<i64>) -> Vec<i64> {
+fn mg_utf8_cps(b: &Vec<i64>) -> Vec<i64> {
     // code points of UTF-8 bytes; -1 for a malformed sequence
     var out: Vec<i64> = Vec::new();
     var i: i64 = 0;
@@ -1636,7 +1676,7 @@ fn mg_utf8_cps(b: & Vec<i64>) -> Vec<i64> {
     return out;
 }
 
-fn mg_put_utf8(out: & mut Vec<i64>, cp: i64) {
+fn mg_put_utf8(out: &mut Vec<i64>, cp: i64) {
     if cp < 128 {
         out.push(cp);
     } else if cp < 2048 {
@@ -1690,8 +1730,8 @@ fn mg_sasl_prohibited(cp: i64) -> bool {
 /// (or malformed UTF-8) gives "" with *ok false. Not done: NFKC
 /// normalization (text already in NFKC, which includes all ASCII, is
 /// unaffected) and the bidirectional check.
-pub fn mongo_saslprep(s: str, ok: & mut bool) -> str {
-    val cps: Vec<i64> = mg_utf8_cps(& str_bytes(s));
+pub fn mongo_saslprep(s: str, ok: &mut bool) -> str {
+    val cps: Vec<i64> = mg_utf8_cps(&str_bytes(s));
     var out: Vec<i64> = Vec::new();
     var i: i64 = 0;
     while i < cps.len() {
@@ -1708,11 +1748,11 @@ pub fn mongo_saslprep(s: str, ok: & mut bool) -> str {
                 *ok = false;
                 return "";
             }
-            mg_put_utf8(& mut out, cp);
+            mg_put_utf8(&mut out, cp);
         }
         i = i + 1;
     }
-    *ok = true;
+    * ok = true;
     return str_from_bytes(out);
 }
 
@@ -1727,7 +1767,9 @@ pub fn mongo_scram_nonce() -> str {
 /// is prepared as MongoDB does (SHA-1: the MD5 digest; SHA-256: SASLprep);
 /// false uses the password bytes as they are (RFC 5802's examples).
 pub fn mongo_scram_new(mechanism: str, user: str, password: str, cnonce: str, mongo_secret: bool) -> MongoScram {
-    var s: MongoScram = MongoScram { hash: KDF_SHA256, mechanism: mechanism, user: user, secret: Vec::new(), cnonce: cnonce, client_first_bare: "", auth_message: "", server_signature: Vec::new(), salted: Vec::new(), iterations: 0, ok: true, error: "" };
+    var s: MongoScram = MongoScram {
+        hash: KDF_SHA256, mechanism: mechanism, user: user, secret: Vec::new(), cnonce: cnonce, client_first_bare: "", auth_message: "", server_signature: Vec::new(), salted: Vec::new(), iterations: 0, ok: true, error: ""
+    };
     if mechanism == "SCRAM-SHA-1" {
         s.hash = KDF_SHA1;
     } else if mechanism != "SCRAM-SHA-256" {
@@ -1746,7 +1788,7 @@ pub fn mongo_scram_new(mechanism: str, user: str, password: str, cnonce: str, mo
         s.secret = str_bytes(mongo_password_digest(user, password));
     } else {
         var pok: bool = true;
-        val p: str = mongo_saslprep(password, & mut pok);
+        val p: str = mongo_saslprep(password, &mut pok);
         if !pok {
             s.ok = false;
             s.error = "the password has a character SASLprep prohibits";
@@ -1759,7 +1801,7 @@ pub fn mongo_scram_new(mechanism: str, user: str, password: str, cnonce: str, mo
 }
 
 /// client-first-message: "n,," (no channel binding) + the bare part.
-pub fn mongo_scram_client_first(s: & MongoScram) -> str {
+pub fn mongo_scram_client_first(s: &MongoScram) -> str {
     return "n,," + s.client_first_bare;
 }
 
@@ -1789,7 +1831,7 @@ pub fn mongo_scram_cache_size() -> i64 {
     return mg_salt_keys.len();
 }
 
-fn mg_scram_fail(s: & mut MongoScram, msg: str) -> str {
+fn mg_scram_fail(s: &mut MongoScram, msg: str) -> str {
     s.ok = false;
     s.error = msg;
     return "";
@@ -1799,7 +1841,7 @@ fn mg_scram_fail(s: & mut MongoScram, msg: str) -> str {
 /// client-final-message with its proof, or "" with s.ok false (a nonce that
 /// does not extend ours, a bad salt, too few iterations, a mandatory
 /// extension, a server error).
-pub fn mongo_scram_client_final(s: & mut MongoScram, server_first: str) -> str {
+pub fn mongo_scram_client_final(s: &mut MongoScram, server_first: str) -> str {
     if !s.ok {
         return "";
     }
@@ -1860,7 +1902,7 @@ pub fn mongo_scram_client_final(s: & mut MongoScram, server_first: str) -> str {
 
 /// Check server-final-message ("v=<ServerSignature>"): true when the
 /// server proved it knows the password; s.error says why not.
-pub fn mongo_scram_check_final(s: & mut MongoScram, server_final: str) -> bool {
+pub fn mongo_scram_check_final(s: &mut MongoScram, server_final: str) -> bool {
     if !s.ok || s.server_signature.len() == 0 {
         return false;
     }
@@ -1899,25 +1941,25 @@ pub fn mongo_scram_check_final(s: & mut MongoScram, server_final: str) -> bool {
 /// options: {skipEmptyExchange: true}, $db}.
 pub fn mongo_cmd_sasl_start(db: str, mechanism: str, payload: Vec<i64>) -> Vec<i64> {
     var w: BsonWriter = bson_writer();
-    bson_put_int32(& mut w, "saslStart", 1);
-    bson_put_string(& mut w, "mechanism", mechanism);
-    bson_put_binary(& mut w, "payload", 0, payload);
-    bson_put_int32(& mut w, "autoAuthorize", 1);
-    bson_begin_doc(& mut w, "options");
-    bson_put_bool(& mut w, "skipEmptyExchange", true);
-    bson_end(& mut w);
-    bson_put_string(& mut w, "$db", db);
-    return bson_finish(& mut w);
+    bson_put_int32(&mut w, "saslStart", 1);
+    bson_put_string(&mut w, "mechanism", mechanism);
+    bson_put_binary(&mut w, "payload", 0, payload);
+    bson_put_int32(&mut w, "autoAuthorize", 1);
+    bson_begin_doc(&mut w, "options");
+    bson_put_bool(&mut w, "skipEmptyExchange", true);
+    bson_end(&mut w);
+    bson_put_string(&mut w, "$db", db);
+    return bson_finish(&mut w);
 }
 
 /// {saslContinue: 1, conversationId, payload: BinData(0, ...), $db}.
 pub fn mongo_cmd_sasl_continue(db: str, conversation: i64, payload: Vec<i64>) -> Vec<i64> {
     var w: BsonWriter = bson_writer();
-    bson_put_int32(& mut w, "saslContinue", 1);
-    bson_put_int32(& mut w, "conversationId", conversation);
-    bson_put_binary(& mut w, "payload", 0, payload);
-    bson_put_string(& mut w, "$db", db);
-    return bson_finish(& mut w);
+    bson_put_int32(&mut w, "saslContinue", 1);
+    bson_put_int32(&mut w, "conversationId", conversation);
+    bson_put_binary(&mut w, "payload", 0, payload);
+    bson_put_string(&mut w, "$db", db);
+    return bson_finish(&mut w);
 }
 
 fn mg_auth_fail(msg: str) -> MongoReply {
@@ -1927,23 +1969,23 @@ fn mg_auth_fail(msg: str) -> MongoReply {
     return e;
 }
 
-fn mg_payload(r: & MongoReply) -> str {
+fn mg_payload(r: &MongoReply) -> str {
     val d: BsonDoc = r.doc;
-    val p: i64 = bson_get(& d, d.root, "payload");
-    if p < 0 || bson_kind(& d, p) != BSON_BINARY {
+    val p: i64 = bson_get(&d, d.root, "payload");
+    if p < 0 || bson_kind(&d, p) != BSON_BINARY {
         return "";
     }
-    return str_from_bytes(bson_bytes(& d, p));
+    return str_from_bytes(bson_bytes(&d, p));
 }
 
-fn mg_done(r: & MongoReply) -> bool {
+fn mg_done(r: &MongoReply) -> bool {
     val d: BsonDoc = r.doc;
-    return bson_int(& d, bson_get(& d, d.root, "done")) != 0;
+    return bson_int(&d, bson_get(&d, d.root, "done")) != 0;
 }
 
-fn mg_conversation(r: & MongoReply) -> i64 {
+fn mg_conversation(r: &MongoReply) -> i64 {
     val d: BsonDoc = r.doc;
-    return bson_int(& d, bson_get(& d, d.root, "conversationId"));
+    return bson_int(&d, bson_get(&d, d.root, "conversationId"));
 }
 
 /// Authenticate with SCRAM-SHA-1 or SCRAM-SHA-256 against `source`
@@ -1952,17 +1994,17 @@ fn mg_conversation(r: & MongoReply) -> i64 {
 /// until the server says done (none when the server honours
 /// skipEmptyExchange, 4.4 and later). The reply is ok only when every step
 /// was.
-pub fn mongo_auth_scram(c: & mut MongoClient, mechanism: str, source: str, user: str, password: str, cnonce: str) -> MongoReply {
+pub fn mongo_auth_scram(c: &mut MongoClient, mechanism: str, source: str, user: str, password: str, cnonce: str) -> MongoReply {
     var s: MongoScram = mongo_scram_new(mechanism, user, password, cnonce, true);
     if !s.ok {
         return mg_auth_fail(s.error);
     }
-    val r1: MongoReply = mongo_command(c, mongo_cmd_sasl_start(source, mechanism, str_bytes(mongo_scram_client_first(& s))));
+    val r1: MongoReply = mongo_command(c, mongo_cmd_sasl_start(source, mechanism, str_bytes(mongo_scram_client_first(&s))));
     if !r1.ok {
         return r1;
     }
-    val conv: i64 = mg_conversation(& r1);
-    val cf: str = mongo_scram_client_final(& mut s, mg_payload(& r1));
+    val conv: i64 = mg_conversation(&r1);
+    val cf: str = mongo_scram_client_final(&mut s, mg_payload(&r1));
     if !s.ok {
         return mg_auth_fail(s.error);
     }
@@ -1970,11 +2012,11 @@ pub fn mongo_auth_scram(c: & mut MongoClient, mechanism: str, source: str, user:
     if !r.ok {
         return r;
     }
-    if !mongo_scram_check_final(& mut s, mg_payload(& r)) {
+    if !mongo_scram_check_final(&mut s, mg_payload(&r)) {
         return mg_auth_fail(s.error);
     }
     var rounds: i64 = 0;
-    while !mg_done(& r) {
+    while !mg_done(&r) {
         rounds = rounds + 1;
         if rounds > 2 {
             return mg_auth_fail("the SASL conversation did not finish");
@@ -1991,10 +2033,10 @@ pub fn mongo_auth_scram(c: & mut MongoClient, mechanism: str, source: str, user:
 /// Connect-time sequence: hello (asking for the account's mechanisms),
 /// then SCRAM with the mechanism it names (mongo_hello and
 /// mongo_auth_scram separately when the hello result is wanted).
-pub fn mongo_login(c: & mut MongoClient, app: str, compressors: Vec<str>, source: str, user: str, password: str, cnonce: str) -> MongoReply {
+pub fn mongo_login(c: &mut MongoClient, app: str, compressors: Vec<str>, source: str, user: str, password: str, cnonce: str) -> MongoReply {
     val h: MongoHello = mongo_hello(c, app, compressors, source, user);
     if !h.ok {
         return mg_auth_fail("hello failed: " + h.error);
     }
-    return mongo_auth_scram(c, mongo_pick_mechanism(& h), source, user, password, cnonce);
+    return mongo_auth_scram(c, mongo_pick_mechanism(&h), source, user, password, cnonce);
 }

@@ -196,7 +196,7 @@ fn ahci_put32(b: &mut Vec<i64>, o: i64, v: i64) {
     b.set(o + 3, (v >> 24) & 255);
 }
 
-fn ahci_get32(b: & Vec<i64>, o: i64) -> i64 {
+fn ahci_get32(b: &Vec<i64>, o: i64) -> i64 {
     return b.get(o) | (b.get(o + 1) << 8) | (b.get(o + 2) << 16) | (b.get(o + 3) << 24);
 }
 
@@ -267,8 +267,10 @@ pub struct AhciD2h {
 }
 
 /// Decode a Register FIS Device to Host (as found at RFIS+0x40).
-pub fn ahci_fis_parse_d2h(f: & Vec<i64>, o: i64) -> AhciD2h {
-    var d: AhciD2h = AhciD2h { valid: false, irq: false, status: 0, error: 0, lba: 0, device: 0, count: 0 };
+pub fn ahci_fis_parse_d2h(f: &Vec<i64>, o: i64) -> AhciD2h {
+    var d: AhciD2h = AhciD2h {
+        valid: false, irq: false, status: 0, error: 0, lba: 0, device: 0, count: 0
+    };
     if f.get(o) != FIS_TYPE_REG_D2H {
         return d;
     }
@@ -318,7 +320,7 @@ pub struct AhciCmdHeader {
     pub ctba: i64,
 }
 
-pub fn ahci_cmd_header_parse(h: & Vec<i64>, o: i64) -> AhciCmdHeader {
+pub fn ahci_cmd_header_parse(h: &Vec<i64>, o: i64) -> AhciCmdHeader {
     val dw0: i64 = ahci_get32(h, o);
     return AhciCmdHeader {
         cfl: dw0 & 31, atapi: (dw0 & 32) != 0, write: (dw0 & 64) != 0, prdtl: (dw0 >> 16) & 65535, prdbc: ahci_get32(h, o + 4), ctba: ahci_get32(h, o + 8) | (ahci_get32(h, o + 12) << 32)
@@ -341,7 +343,7 @@ pub fn ahci_prd(dba: i64, nbytes: i64, irq: bool) -> Vec<i64> {
 
 /// The command table: the FIS at 0, ATAPI command at 0x40, then the PRDT
 /// at 0x80 covering `nbytes` from `buf` in pieces of at most 4 MiB.
-pub fn ahci_cmd_table(fis: & Vec<i64>, acmd: & Vec<i64>, buf: i64, nbytes: i64) -> Vec<i64> {
+pub fn ahci_cmd_table(fis: &Vec<i64>, acmd: &Vec<i64>, buf: i64, nbytes: i64) -> Vec<i64> {
     var nprd: i64 = (nbytes + AHCI_PRD_MAX - 1) / AHCI_PRD_MAX;
     var t: Vec<i64> = ahci_zeros(AHCI_CMD_TABLE_PRDT + 16 * nprd);
     var i: i64 = 0;
@@ -388,12 +390,12 @@ pub struct AhciIdentify {
     pub queue_depth: i64,
 }
 
-fn ahci_id_word(d: & Vec<i64>, w: i64) -> i64 {
+fn ahci_id_word(d: &Vec<i64>, w: i64) -> i64 {
     return d.get(2 * w) | (d.get(2 * w + 1) << 8);
 }
 
 /// ATA strings: each word holds two characters, high byte first.
-fn ahci_id_string(d: & Vec<i64>, w0: i64, words: i64) -> str {
+fn ahci_id_string(d: &Vec<i64>, w0: i64, words: i64) -> str {
     var out: Vec<i64> = Vec::new();
     var i: i64 = 0;
     while i < words {
@@ -405,8 +407,10 @@ fn ahci_id_string(d: & Vec<i64>, w0: i64, words: i64) -> str {
     return str_trim(str_from_bytes(out));
 }
 
-pub fn ahci_identify_parse(d: & Vec<i64>) -> AhciIdentify {
-    var id: AhciIdentify = AhciIdentify { model: "", serial: "", firmware: "", lba48: false, sectors: 0, sector_size: 512, ncq: false, queue_depth: 1 };
+pub fn ahci_identify_parse(d: &Vec<i64>) -> AhciIdentify {
+    var id: AhciIdentify = AhciIdentify {
+        model: "", serial: "", firmware: "", lba48: false, sectors: 0, sector_size: 512, ncq: false, queue_depth: 1
+    };
     id.serial = ahci_id_string(d, 10, 10);
     id.firmware = ahci_id_string(d, 23, 4);
     id.model = ahci_id_string(d, 27, 20);
@@ -452,28 +456,28 @@ pub struct AhciPort {
 pub const AHCI_CT_STRIDE: i64 = 256;
 pub const AHCI_POLL_LIMIT: i64 = 100000;
 
-pub fn ahci_rd(bus: & AhciBus, off: i64) -> i64 {
+pub fn ahci_rd(bus: &AhciBus, off: i64) -> i64 {
     val f = bus.mmio_rd;
     return f(off) & 4294967295;
 }
 
-pub fn ahci_wr(bus: & AhciBus, off: i64, v: i64) {
+pub fn ahci_wr(bus: &AhciBus, off: i64, v: i64) {
     val f = bus.mmio_wr;
     f(off, v & 4294967295);
 }
 
-fn ahci_mem_wr(bus: & AhciBus, addr: i64, data: Vec<i64>) {
+fn ahci_mem_wr(bus: &AhciBus, addr: i64, data: Vec<i64>) {
     val f = bus.mem_wr;
     f(addr, data);
 }
 
-fn ahci_mem_rd(bus: & AhciBus, addr: i64, n: i64) -> Vec<i64> {
+fn ahci_mem_rd(bus: &AhciBus, addr: i64, n: i64) -> Vec<i64> {
     val f = bus.mem_rd;
     return f(addr, n);
 }
 
 /// Wait until (reg & mask) == want; false after AHCI_POLL_LIMIT reads.
-pub fn ahci_wait(bus: & AhciBus, off: i64, mask: i64, want: i64) -> bool {
+pub fn ahci_wait(bus: &AhciBus, off: i64, mask: i64, want: i64) -> bool {
     var i: i64 = 0;
     while i < AHCI_POLL_LIMIT {
         if (ahci_rd(bus, off) & mask) == want {
@@ -485,13 +489,13 @@ pub fn ahci_wait(bus: & AhciBus, off: i64, mask: i64, want: i64) -> bool {
 }
 
 /// Turn AHCI mode on (GHC.AE) and return the implemented ports (PI).
-pub fn ahci_enable(bus: & AhciBus) -> i64 {
+pub fn ahci_enable(bus: &AhciBus) -> i64 {
     ahci_wr(bus, AHCI_GHC, ahci_rd(bus, AHCI_GHC) | AHCI_GHC_AE);
     return ahci_rd(bus, AHCI_PI);
 }
 
 /// HBA reset (GHC.HR, cleared by the HBA when done), then AE again.
-pub fn ahci_reset(bus: & AhciBus) -> bool {
+pub fn ahci_reset(bus: &AhciBus) -> bool {
     ahci_wr(bus, AHCI_GHC, ahci_rd(bus, AHCI_GHC) | AHCI_GHC_HR);
     if !ahci_wait(bus, AHCI_GHC, AHCI_GHC_HR, 0) {
         return false;
@@ -501,7 +505,7 @@ pub fn ahci_reset(bus: & AhciBus) -> bool {
 }
 
 /// Ports with an active SATA link and their signatures: [port, sig]...
-pub fn ahci_probe(bus: & AhciBus) -> Vec<i64> {
+pub fn ahci_probe(bus: &AhciBus) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     val pi: i64 = ahci_rd(bus, AHCI_PI);
     var p: i64 = 0;
@@ -517,7 +521,7 @@ pub fn ahci_probe(bus: & AhciBus) -> Vec<i64> {
 
 /// Stop the command engine and FIS receive (clear ST, wait CR; clear FRE,
 /// wait FR).
-pub fn ahci_port_stop(bus: & AhciBus, p: i64) -> bool {
+pub fn ahci_port_stop(bus: &AhciBus, p: i64) -> bool {
     val r: i64 = ahci_port_reg(p, AHCI_PX_CMD);
     ahci_wr(bus, r, ahci_rd(bus, r) & (4294967295 - AHCI_PXCMD_ST));
     if !ahci_wait(bus, r, AHCI_PXCMD_CR, 0) {
@@ -528,7 +532,7 @@ pub fn ahci_port_stop(bus: & AhciBus, p: i64) -> bool {
 }
 
 /// Start it again: wait CR clear, set FRE, then ST.
-pub fn ahci_port_start(bus: & AhciBus, p: i64) -> bool {
+pub fn ahci_port_start(bus: &AhciBus, p: i64) -> bool {
     val r: i64 = ahci_port_reg(p, AHCI_PX_CMD);
     if !ahci_wait(bus, r, AHCI_PXCMD_CR, 0) {
         return false;
@@ -540,8 +544,10 @@ pub fn ahci_port_start(bus: & AhciBus, p: i64) -> bool {
 
 /// Point port `p` at its memory (aligned as required), clear errors and
 /// interrupts, start it.
-pub fn ahci_port_setup(bus: & AhciBus, p: i64, clb: i64, fb: i64, ctba: i64) -> AhciPort {
-    var st: AhciPort = AhciPort { port: p, clb: clb, fb: fb, ctba: ctba, nslots: ahci_cap_nslots(ahci_rd(bus, AHCI_CAP)), err: "", last_status: 0, last_error: 0 };
+pub fn ahci_port_setup(bus: &AhciBus, p: i64, clb: i64, fb: i64, ctba: i64) -> AhciPort {
+    var st: AhciPort = AhciPort {
+        port: p, clb: clb, fb: fb, ctba: ctba, nslots: ahci_cap_nslots(ahci_rd(bus, AHCI_CAP)), err: "", last_status: 0, last_error: 0
+    };
     if clb % 1024 != 0 || fb % 256 != 0 || ctba % 128 != 0 {
         st.err = "misaligned CLB, FB or command table";
         return st;
@@ -565,7 +571,7 @@ pub fn ahci_port_setup(bus: & AhciBus, p: i64, clb: i64, fb: i64, ctba: i64) -> 
 }
 
 /// A command slot neither in PxSACT nor PxCI, or -1.
-pub fn ahci_free_slot(bus: & AhciBus, port: & AhciPort) -> i64 {
+pub fn ahci_free_slot(bus: &AhciBus, port: &AhciPort) -> i64 {
     val busy: i64 = ahci_rd(bus, ahci_port_reg(port.port, AHCI_PX_SACT)) | ahci_rd(bus, ahci_port_reg(port.port, AHCI_PX_CI));
     var s: i64 = 0;
     while s < port.nslots {
@@ -579,7 +585,7 @@ pub fn ahci_free_slot(bus: & AhciBus, port: & AhciPort) -> i64 {
 
 /// Build the command in a free slot, issue it and wait for completion.
 /// Returns 0 or -errno (EIO with the task file in last_status/last_error).
-pub fn ahci_exec(bus: & AhciBus, port: &mut AhciPort, fis: Vec<i64>, write: bool, buf: i64, nbytes: i64) -> i64 {
+pub fn ahci_exec(bus: &AhciBus, port: &mut AhciPort, fis: Vec<i64>, write: bool, buf: i64, nbytes: i64) -> i64 {
     val p: i64 = port.port;
     if (ahci_rd(bus, ahci_port_reg(p, AHCI_PX_TFD)) & (ATA_SR_BSY | ATA_SR_DRQ)) != 0 {
         return 0 - VFS_EBUSY;
@@ -617,7 +623,7 @@ pub fn ahci_exec(bus: & AhciBus, port: &mut AhciPort, fis: Vec<i64>, write: bool
 }
 
 /// IDENTIFY DEVICE into the 512-byte buffer at `buf`.
-pub fn ahci_identify(bus: & AhciBus, port: &mut AhciPort, buf: i64) -> AhciIdentify {
+pub fn ahci_identify(bus: &AhciBus, port: &mut AhciPort, buf: i64) -> AhciIdentify {
     val r: i64 = ahci_exec(bus, port, ahci_fis_identify(), false, buf, 512);
     if r < 0 {
         port.err = "IDENTIFY failed: " + vfs_errno_name(r);
@@ -626,14 +632,14 @@ pub fn ahci_identify(bus: & AhciBus, port: &mut AhciPort, buf: i64) -> AhciIdent
     return ahci_identify_parse(&d);
 }
 
-pub fn ahci_read(bus: & AhciBus, port: &mut AhciPort, lba: i64, count: i64, buf: i64, sector: i64) -> i64 {
+pub fn ahci_read(bus: &AhciBus, port: &mut AhciPort, lba: i64, count: i64, buf: i64, sector: i64) -> i64 {
     if count < 1 || count > 65536 {
         return 0 - VFS_EINVAL;
     }
     return ahci_exec(bus, port, ahci_fis_read_dma_ext(lba, count), false, buf, count * sector);
 }
 
-pub fn ahci_write(bus: & AhciBus, port: &mut AhciPort, lba: i64, count: i64, buf: i64, sector: i64) -> i64 {
+pub fn ahci_write(bus: &AhciBus, port: &mut AhciPort, lba: i64, count: i64, buf: i64, sector: i64) -> i64 {
     if count < 1 || count > 65536 {
         return 0 - VFS_EINVAL;
     }
@@ -682,7 +688,7 @@ fn ahci_bd_zero(h: i64, lba: i64, count: i64) -> i64 {
 
 /// A BlockDev over a set-up port: one sector per request through the DMA
 /// bounce buffer at `buf` (sector-sized, physical, word aligned).
-pub fn ahci_blockdev(bus: AhciBus, port: AhciPort, id: & AhciIdentify, buf: i64) -> BlockDev {
+pub fn ahci_blockdev(bus: AhciBus, port: AhciPort, id: &AhciIdentify, buf: i64) -> BlockDev {
     val h: i64 = ahci_dev_bus.len();
     ahci_dev_bus.push(bus);
     ahci_dev_port.push(port);

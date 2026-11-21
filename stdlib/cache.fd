@@ -25,7 +25,7 @@
 //   val got: str = ttl_get(& mut t, "k", now_ms);
 
 module cache;
- use vec;
+use vec;
 
 /// Counters common to the caches.
 pub struct CacheStats {
@@ -36,11 +36,13 @@ pub struct CacheStats {
 }
 
 fn cs_new() -> CacheStats {
-    return CacheStats { hits: 0, misses: 0, evictions: 0, expirations: 0 };
+    return CacheStats {
+        hits: 0, misses: 0, evictions: 0, expirations: 0
+    };
 }
 
 /// "hits=3 misses=1 evictions=0 expired=0 ratio=75%"
-pub fn cache_stats_str(s: & CacheStats) -> str {
+pub fn cache_stats_str(s: &CacheStats) -> str {
     var ratio: i64 = 0;
     if s.hits + s.misses > 0 {
         ratio = s.hits * 100 / (s.hits + s.misses);
@@ -54,7 +56,8 @@ pub fn cache_stats_str(s: & CacheStats) -> str {
 /// (head) to least recent (tail); free slots are chained through `next`.
 pub struct LruCache {
     pub capacity: i64,
-    pub index: HashMap<str, i64>,
+    pub index: HashMap<str,
+     i64>,
     pub keys: Vec<str>,
     pub vals: Vec<str>,
     pub prev: Vec<i64>,
@@ -68,45 +71,61 @@ pub struct LruCache {
 
 pub fn lru_new(capacity: i64) -> LruCache {
     var cap: i64 = capacity;
-    if cap < 1 { cap = 1; }
-    return LruCache { capacity: cap, index: HashMap::new(), keys: Vec::new(), vals: Vec::new(), prev: Vec::new(), next: Vec::new(), head: - 1, tail: - 1, free: - 1, size: 0, stats: cs_new() };
+    if cap < 1 {
+        cap = 1;
+    }
+    return LruCache {
+        capacity: cap, index: HashMap::new(), keys: Vec::new(), vals: Vec::new(), prev: Vec::new(), next: Vec::new(), head: -1, tail: -1, free: -1, size: 0, stats: cs_new()
+    };
 }
 
-fn lru_unlink(c: & mut LruCache, s: i64) {
+fn lru_unlink(c: &mut LruCache, s: i64) {
     val p: i64 = c.prev.get(s);
     val n: i64 = c.next.get(s);
-    if p >= 0 { c.next.set(p, n); } else { c.head = n; }
-    if n >= 0 { c.prev.set(n, p); } else { c.tail = p; }
-    c.prev.set(s, - 1);
-    c.next.set(s, - 1);
+    if p >= 0 {
+        c.next.set(p, n);
+    } else {
+        c.head = n;
+    }
+    if n >= 0 {
+        c.prev.set(n, p);
+    } else {
+        c.tail = p;
+    }
+    c.prev.set(s, -1);
+    c.next.set(s, -1);
 }
 
-fn lru_push_front(c: & mut LruCache, s: i64) {
-    c.prev.set(s, - 1);
+fn lru_push_front(c: &mut LruCache, s: i64) {
+    c.prev.set(s, -1);
     c.next.set(s, c.head);
-    if c.head >= 0 { c.prev.set(c.head, s); }
+    if c.head >= 0 {
+        c.prev.set(c.head, s);
+    }
     c.head = s;
-    if c.tail < 0 { c.tail = s; }
+    if c.tail < 0 {
+        c.tail = s;
+    }
 }
 
-fn lru_alloc(c: & mut LruCache, key: str, val_: str) -> i64 {
+fn lru_alloc(c: &mut LruCache, key: str, val_: str) -> i64 {
     if c.free >= 0 {
         val s: i64 = c.free;
         c.free = c.next.get(s);
         c.keys.set(s, key);
         c.vals.set(s, val_);
-        c.prev.set(s, - 1);
-        c.next.set(s, - 1);
+        c.prev.set(s, -1);
+        c.next.set(s, -1);
         return s;
     }
     c.keys.push(key);
     c.vals.push(val_);
-    c.prev.push(- 1);
-    c.next.push(- 1);
+    c.prev.push(-1);
+    c.next.push(-1);
     return c.keys.len() - 1;
 }
 
-fn lru_release(c: & mut LruCache, s: i64) {
+fn lru_release(c: &mut LruCache, s: i64) {
     c.index.remove(c.keys.get(s));
     c.keys.set(s, "");
     c.vals.set(s, "");
@@ -116,7 +135,7 @@ fn lru_release(c: & mut LruCache, s: i64) {
 }
 
 /// Remove and return the least recently used key ("" when empty).
-pub fn lru_evict(c: & mut LruCache) -> str {
+pub fn lru_evict(c: &mut LruCache) -> str {
     val s: i64 = c.tail;
     if s < 0 {
         return "";
@@ -129,7 +148,7 @@ pub fn lru_evict(c: & mut LruCache) -> str {
 }
 
 /// The value of `key` ("" on a miss); a hit makes it most recent.
-pub fn lru_get(c: & mut LruCache, key: str) -> str {
+pub fn lru_get(c: &mut LruCache, key: str) -> str {
     if !c.index.contains(key) {
         c.stats.misses = c.stats.misses + 1;
         return "";
@@ -142,20 +161,20 @@ pub fn lru_get(c: & mut LruCache, key: str) -> str {
 }
 
 /// Look without counting or reordering.
-pub fn lru_peek(c: & LruCache, key: str) -> str {
+pub fn lru_peek(c: &LruCache, key: str) -> str {
     if !c.index.contains(key) {
         return "";
     }
     return c.vals.get(c.index.get(key));
 }
 
-pub fn lru_has(c: & LruCache, key: str) -> bool {
+pub fn lru_has(c: &LruCache, key: str) -> bool {
     return c.index.contains(key);
 }
 
 /// Insert or replace; the entry becomes most recent. Returns the evicted
 /// key ("" when nothing was evicted).
-pub fn lru_put(c: & mut LruCache, key: str, value: str) -> str {
+pub fn lru_put(c: &mut LruCache, key: str, value: str) -> str {
     if c.index.contains(key) {
         val s: i64 = c.index.get(key);
         c.vals.set(s, value);
@@ -175,7 +194,7 @@ pub fn lru_put(c: & mut LruCache, key: str, value: str) -> str {
 }
 
 /// Remove `key`; whether it was present.
-pub fn lru_remove(c: & mut LruCache, key: str) -> bool {
+pub fn lru_remove(c: &mut LruCache, key: str) -> bool {
     if !c.index.contains(key) {
         return false;
     }
@@ -185,12 +204,12 @@ pub fn lru_remove(c: & mut LruCache, key: str) -> bool {
     return true;
 }
 
-pub fn lru_len(c: & LruCache) -> i64 {
+pub fn lru_len(c: &LruCache) -> i64 {
     return c.size;
 }
 
 /// Keys from most to least recently used.
-pub fn lru_keys(c: & LruCache) -> Vec<str> {
+pub fn lru_keys(c: &LruCache) -> Vec<str> {
     var out: Vec<str> = Vec::new();
     var s: i64 = c.head;
     while s >= 0 {
@@ -206,14 +225,17 @@ pub fn lru_keys(c: & LruCache) -> Vec<str> {
 /// recent first). `bhead`/`btail` map a count to its list's ends.
 pub struct LfuCache {
     pub capacity: i64,
-    pub index: HashMap<str, i64>,
+    pub index: HashMap<str,
+     i64>,
     pub keys: Vec<str>,
     pub vals: Vec<str>,
     pub freq: Vec<i64>,
     pub prev: Vec<i64>,
     pub next: Vec<i64>,
-    pub bhead: HashMap<i64, i64>,
-    pub btail: HashMap<i64, i64>,
+    pub bhead: HashMap<i64,
+     i64>,
+    pub btail: HashMap<i64,
+     i64>,
     pub min_freq: i64,
     pub free: i64,
     pub size: i64,
@@ -222,40 +244,56 @@ pub struct LfuCache {
 
 pub fn lfu_new(capacity: i64) -> LfuCache {
     var cap: i64 = capacity;
-    if cap < 1 { cap = 1; }
-    return LfuCache { capacity: cap, index: HashMap::new(), keys: Vec::new(), vals: Vec::new(), freq: Vec::new(), prev: Vec::new(), next: Vec::new(), bhead: HashMap::new(), btail: HashMap::new(), min_freq: 0, free: - 1, size: 0, stats: cs_new() };
+    if cap < 1 {
+        cap = 1;
+    }
+    return LfuCache {
+        capacity: cap, index: HashMap::new(), keys: Vec::new(), vals: Vec::new(), freq: Vec::new(), prev: Vec::new(), next: Vec::new(), bhead: HashMap::new(), btail: HashMap::new(), min_freq: 0, free: -1, size: 0, stats: cs_new()
+    };
 }
 
-fn lfu_bget(m: & HashMap<i64, i64>, f: i64) -> i64 {
+fn lfu_bget(m: &HashMap<i64, i64>, f: i64) -> i64 {
     if m.contains(f) {
         return m.get(f);
     }
-    return - 1;
+    return -1;
 }
 
-fn lfu_unlink(c: & mut LfuCache, s: i64) {
+fn lfu_unlink(c: &mut LfuCache, s: i64) {
     val f: i64 = c.freq.get(s);
     val p: i64 = c.prev.get(s);
     val n: i64 = c.next.get(s);
-    if p >= 0 { c.next.set(p, n); } else { c.bhead.insert(f, n); }
-    if n >= 0 { c.prev.set(n, p); } else { c.btail.insert(f, p); }
-    c.prev.set(s, - 1);
-    c.next.set(s, - 1);
+    if p >= 0 {
+        c.next.set(p, n);
+    } else {
+        c.bhead.insert(f, n);
+    }
+    if n >= 0 {
+        c.prev.set(n, p);
+    } else {
+        c.btail.insert(f, p);
+    }
+    c.prev.set(s, -1);
+    c.next.set(s, -1);
 }
 
-fn lfu_push(c: & mut LfuCache, s: i64) {
+fn lfu_push(c: &mut LfuCache, s: i64) {
     val f: i64 = c.freq.get(s);
-    val h: i64 = lfu_bget(& c.bhead, f);
-    c.prev.set(s, - 1);
+    val h: i64 = lfu_bget(&c.bhead, f);
+    c.prev.set(s, -1);
     c.next.set(s, h);
-    if h >= 0 { c.prev.set(h, s); } else { c.btail.insert(f, s); }
+    if h >= 0 {
+        c.prev.set(h, s);
+    } else {
+        c.btail.insert(f, s);
+    }
     c.bhead.insert(f, s);
 }
 
-fn lfu_touch(c: & mut LfuCache, s: i64) {
+fn lfu_touch(c: &mut LfuCache, s: i64) {
     val f: i64 = c.freq.get(s);
     lfu_unlink(c, s);
-    if c.min_freq == f && lfu_bget(& c.bhead, f) < 0 {
+    if c.min_freq == f && lfu_bget(&c.bhead, f) < 0 {
         c.min_freq = f + 1;
     }
     c.freq.set(s, f + 1);
@@ -264,11 +302,11 @@ fn lfu_touch(c: & mut LfuCache, s: i64) {
 
 /// Remove and return the least frequently used key (least recent among
 /// equals); "" when empty.
-pub fn lfu_evict(c: & mut LfuCache) -> str {
+pub fn lfu_evict(c: &mut LfuCache) -> str {
     if c.size == 0 {
         return "";
     }
-    val s: i64 = lfu_bget(& c.btail, c.min_freq);
+    val s: i64 = lfu_bget(&c.btail, c.min_freq);
     if s < 0 {
         return "";
     }
@@ -284,7 +322,7 @@ pub fn lfu_evict(c: & mut LfuCache) -> str {
     return k;
 }
 
-pub fn lfu_get(c: & mut LfuCache, key: str) -> str {
+pub fn lfu_get(c: &mut LfuCache, key: str) -> str {
     if !c.index.contains(key) {
         c.stats.misses = c.stats.misses + 1;
         return "";
@@ -295,12 +333,12 @@ pub fn lfu_get(c: & mut LfuCache, key: str) -> str {
     return c.vals.get(s);
 }
 
-pub fn lfu_has(c: & LfuCache, key: str) -> bool {
+pub fn lfu_has(c: &LfuCache, key: str) -> bool {
     return c.index.contains(key);
 }
 
 /// The use count of `key` (0 when absent). A put counts as the first use.
-pub fn lfu_count(c: & LfuCache, key: str) -> i64 {
+pub fn lfu_count(c: &LfuCache, key: str) -> i64 {
     if !c.index.contains(key) {
         return 0;
     }
@@ -308,7 +346,7 @@ pub fn lfu_count(c: & LfuCache, key: str) -> i64 {
 }
 
 /// Insert or replace (a replace counts as a use). Returns the evicted key.
-pub fn lfu_put(c: & mut LfuCache, key: str, value: str) -> str {
+pub fn lfu_put(c: &mut LfuCache, key: str, value: str) -> str {
     if c.index.contains(key) {
         val s: i64 = c.index.get(key);
         c.vals.set(s, value);
@@ -319,7 +357,7 @@ pub fn lfu_put(c: & mut LfuCache, key: str, value: str) -> str {
     if c.size >= c.capacity {
         evicted = lfu_evict(c);
     }
-    var s: i64 = - 1;
+    var s: i64 = -1;
     if c.free >= 0 {
         s = c.free;
         c.free = c.next.get(s);
@@ -330,8 +368,8 @@ pub fn lfu_put(c: & mut LfuCache, key: str, value: str) -> str {
         c.keys.push(key);
         c.vals.push(value);
         c.freq.push(1);
-        c.prev.push(- 1);
-        c.next.push(- 1);
+        c.prev.push(-1);
+        c.next.push(-1);
         s = c.keys.len() - 1;
     }
     c.index.insert(key, s);
@@ -341,7 +379,7 @@ pub fn lfu_put(c: & mut LfuCache, key: str, value: str) -> str {
     return evicted;
 }
 
-pub fn lfu_len(c: & LfuCache) -> i64 {
+pub fn lfu_len(c: &LfuCache) -> i64 {
     return c.size;
 }
 
@@ -351,23 +389,26 @@ pub fn lfu_len(c: & LfuCache) -> i64 {
 pub struct TtlCache {
     pub lru: LruCache,
     pub ttl: i64,
-    pub expires: HashMap<str, i64>,
+    pub expires: HashMap<str,
+     i64>,
     pub stats: CacheStats,
 }
 
 pub fn ttl_new(capacity: i64, ttl: i64) -> TtlCache {
-    return TtlCache { lru: lru_new(capacity), ttl: ttl, expires: HashMap::new(), stats: cs_new() };
+    return TtlCache {
+        lru: lru_new(capacity), ttl: ttl, expires: HashMap::new(), stats: cs_new()
+    };
 }
 
-fn ttl_drop(c: & mut TtlCache, key: str) {
-    lru_remove(& mut c.lru, key);
+fn ttl_drop(c: &mut TtlCache, key: str) {
+    lru_remove(&mut c.lru, key);
     c.expires.remove(key);
     c.stats.expirations = c.stats.expirations + 1;
 }
 
 /// The value of `key` at time `now` ("" when missing or expired).
-pub fn ttl_get(c: & mut TtlCache, key: str, now: i64) -> str {
-    if !lru_has(& c.lru, key) {
+pub fn ttl_get(c: &mut TtlCache, key: str, now: i64) -> str {
+    if !lru_has(&c.lru, key) {
         c.stats.misses = c.stats.misses + 1;
         return "";
     }
@@ -377,12 +418,12 @@ pub fn ttl_get(c: & mut TtlCache, key: str, now: i64) -> str {
         return "";
     }
     c.stats.hits = c.stats.hits + 1;
-    return lru_get(& mut c.lru, key);
+    return lru_get(&mut c.lru, key);
 }
 
 /// Remove every entry expired at `now`; how many went.
-pub fn ttl_sweep(c: & mut TtlCache, now: i64) -> i64 {
-    val keys: Vec<str> = lru_keys(& c.lru);
+pub fn ttl_sweep(c: &mut TtlCache, now: i64) -> i64 {
+    val keys: Vec<str> = lru_keys(&c.lru);
     var n: i64 = 0;
     var i: i64 = 0;
     while i < keys.len() {
@@ -397,29 +438,29 @@ pub fn ttl_sweep(c: & mut TtlCache, now: i64) -> i64 {
 
 /// Insert or replace with the default ttl; expired entries are swept
 /// before an LRU eviction. Returns the key evicted for room ("").
-pub fn ttl_put(c: & mut TtlCache, key: str, value: str, now: i64) -> str {
+pub fn ttl_put(c: &mut TtlCache, key: str, value: str, now: i64) -> str {
     return ttl_put_for(c, key, value, now, c.ttl);
 }
 
 /// Insert or replace with its own lifetime.
-pub fn ttl_put_for(c: & mut TtlCache, key: str, value: str, now: i64, ttl: i64) -> str {
-    if !lru_has(& c.lru, key) && lru_len(& c.lru) >= c.lru.capacity {
+pub fn ttl_put_for(c: &mut TtlCache, key: str, value: str, now: i64, ttl: i64) -> str {
+    if !lru_has(&c.lru, key) && lru_len(&c.lru) >= c.lru.capacity {
         ttl_sweep(c, now);
     }
     var evicted: str = "";
-    if !lru_has(& c.lru, key) && lru_len(& c.lru) >= c.lru.capacity {
-        evicted = lru_evict(& mut c.lru);
+    if !lru_has(&c.lru, key) && lru_len(&c.lru) >= c.lru.capacity {
+        evicted = lru_evict(&mut c.lru);
         c.expires.remove(evicted);
         c.stats.evictions = c.stats.evictions + 1;
     }
-    lru_put(& mut c.lru, key, value);
+    lru_put(&mut c.lru, key, value);
     c.expires.insert(key, now + ttl);
     return evicted;
 }
 
 /// Time left for `key` at `now` (0 when missing or expired).
-pub fn ttl_remaining(c: & TtlCache, key: str, now: i64) -> i64 {
-    if !lru_has(& c.lru, key) {
+pub fn ttl_remaining(c: &TtlCache, key: str, now: i64) -> i64 {
+    if !lru_has(&c.lru, key) {
         return 0;
     }
     val left: i64 = c.expires.get(key) - now;
@@ -429,6 +470,6 @@ pub fn ttl_remaining(c: & TtlCache, key: str, now: i64) -> i64 {
     return left;
 }
 
-pub fn ttl_len(c: & TtlCache) -> i64 {
-    return lru_len(& c.lru);
+pub fn ttl_len(c: &TtlCache) -> i64 {
+    return lru_len(&c.lru);
 }

@@ -238,7 +238,7 @@ pub struct DtlsSrtpKeys {
 
 // ─── Bytes ────────────────────────────────────────────────────────────────
 
-fn dtl_slice(b: & Vec<i64>, from: i64, to: i64) -> Vec<i64> {
+fn dtl_slice(b: &Vec<i64>, from: i64, to: i64) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     var i: i64 = from;
     while i < to {
@@ -258,7 +258,7 @@ fn dtl_cat(a: Vec<i64>, b: Vec<i64>) -> Vec<i64> {
     return out;
 }
 
-fn dtl_add(out: & mut Vec<i64>, b: & Vec<i64>) {
+fn dtl_add(out: &mut Vec<i64>, b: &Vec<i64>) {
     var i: i64 = 0;
     while i < b.len() {
         out.push(b.get(i) & 255);
@@ -266,7 +266,7 @@ fn dtl_add(out: & mut Vec<i64>, b: & Vec<i64>) {
     }
 }
 
-fn dtl_put(out: & mut Vec<i64>, v: i64, n: i64) {
+fn dtl_put(out: &mut Vec<i64>, v: i64, n: i64) {
     var i: i64 = n - 1;
     while i >= 0 {
         out.push((v >> (8 * i)) & 255);
@@ -276,11 +276,11 @@ fn dtl_put(out: & mut Vec<i64>, v: i64, n: i64) {
 
 fn dtl_be(v: i64, n: i64) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
-    dtl_put(& mut out, v, n);
+    dtl_put(&mut out, v, n);
     return out;
 }
 
-fn dtl_get(b: & Vec<i64>, at: i64, n: i64) -> i64 {
+fn dtl_get(b: &Vec<i64>, at: i64, n: i64) -> i64 {
     var v: i64 = 0;
     var i: i64 = 0;
     while i < n {
@@ -290,7 +290,7 @@ fn dtl_get(b: & Vec<i64>, at: i64, n: i64) -> i64 {
     return v;
 }
 
-fn dtl_eq(a: & Vec<i64>, b: & Vec<i64>) -> bool {
+fn dtl_eq(a: &Vec<i64>, b: &Vec<i64>) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -304,17 +304,17 @@ fn dtl_eq(a: & Vec<i64>, b: & Vec<i64>) -> bool {
 }
 
 // a vector of 16-bit values with a length prefix of `lb` bytes
-fn dtl_list16(vals: & Vec<i64>, lb: i64) -> Vec<i64> {
+fn dtl_list16(vals: &Vec<i64>, lb: i64) -> Vec<i64> {
     var out: Vec<i64> = dtl_be(vals.len() * 2, lb);
     var i: i64 = 0;
     while i < vals.len() {
-        dtl_put(& mut out, vals.get(i), 2);
+        dtl_put(&mut out, vals.get(i), 2);
         i = i + 1;
     }
     return out;
 }
 
-fn dtl_has(v: & Vec<i64>, x: i64) -> bool {
+fn dtl_has(v: &Vec<i64>, x: i64) -> bool {
     var i: i64 = 0;
     while i < v.len() {
         if v.get(i) == x {
@@ -366,7 +366,7 @@ fn dtl_norm_fp(s: str) -> str {
 }
 
 /// The peer certificate's fingerprint ("" before it arrived).
-pub fn dtls_peer_fingerprint(c: & DtlsConn) -> str {
+pub fn dtls_peer_fingerprint(c: &DtlsConn) -> str {
     if c.peer_cert.len() == 0 {
         return "";
     }
@@ -375,7 +375,7 @@ pub fn dtls_peer_fingerprint(c: & DtlsConn) -> str {
 
 /// RFC 5705 keying material exporter without a context value; empty
 /// before the handshake is done.
-pub fn dtls_export(c: & DtlsConn, label: str, n: i64) -> Vec<i64> {
+pub fn dtls_export(c: &DtlsConn, label: str, n: i64) -> Vec<i64> {
     if c.state != DTLS_CONNECTED {
         var none: Vec<i64> = Vec::new();
         return none;
@@ -384,27 +384,37 @@ pub fn dtls_export(c: & DtlsConn, label: str, n: i64) -> Vec<i64> {
 }
 
 /// The SRTP master keys and salts of both directions (RFC 5764 §4.2).
-pub fn dtls_srtp_keys(c: & DtlsConn) -> DtlsSrtpKeys {
-    var k: DtlsSrtpKeys = DtlsSrtpKeys { ok: false, profile: c.srtp_profile, client_key: Vec::new(), client_salt: Vec::new(), server_key: Vec::new(), server_salt: Vec::new() };
+pub fn dtls_srtp_keys(c: &DtlsConn) -> DtlsSrtpKeys {
+    var k: DtlsSrtpKeys = DtlsSrtpKeys {
+        ok: false, profile: c.srtp_profile, client_key: Vec::new(), client_salt: Vec::new(), server_key: Vec::new(), server_salt: Vec::new()
+    };
     if c.state != DTLS_CONNECTED || c.srtp_profile == 0 {
         return k;
     }
     val kl: i64 = srtp_profile_key_len(c.srtp_profile);
     val sl: i64 = srtp_profile_salt_len(c.srtp_profile);
     val m: Vec<i64> = dtls_export(c, "EXTRACTOR-dtls_srtp", 2 * (kl + sl));
-    k.client_key = dtl_slice(& m, 0, kl);
-    k.server_key = dtl_slice(& m, kl, 2 * kl);
-    k.client_salt = dtl_slice(& m, 2 * kl, 2 * kl + sl);
-    k.server_salt = dtl_slice(& m, 2 * kl + sl, 2 * kl + 2 * sl);
+    k.client_key = dtl_slice(&m, 0, kl);
+    k.server_key = dtl_slice(&m, kl, 2 * kl);
+    k.client_salt = dtl_slice(&m, 2 * kl, 2 * kl + sl);
+    k.server_salt = dtl_slice(&m, 2 * kl + sl, 2 * kl + 2 * sl);
     k.ok = true;
     return k;
 }
 
 pub fn dtls_state_name(s: i64) -> str {
-    if s == DTLS_NEW { return "new"; }
-    if s == DTLS_CONNECTING { return "connecting"; }
-    if s == DTLS_CONNECTED { return "connected"; }
-    if s == DTLS_FAILED { return "failed"; }
+    if s == DTLS_NEW {
+        return "new";
+    }
+    if s == DTLS_CONNECTING {
+        return "connecting";
+    }
+    if s == DTLS_CONNECTED {
+        return "connected";
+    }
+    if s == DTLS_FAILED {
+        return "failed";
+    }
     return "closed";
 }
 
@@ -434,9 +444,7 @@ pub fn dtls_config(is_server: bool, cert_pem: str, key_pem: str, remote_fingerpr
         der = cb.der;
     }
     return DtlsConfig {
-        is_server: is_server, cert_der: der, key: key, remote_fingerprint: remote_fingerprint,
-        srtp_profiles: profiles, cookie: is_server, cookie_secret: crypto_random_bytes(32), peer: "",
-        mtu: 1200, seed: crypto_random_bytes(32), require_ems: true, require_client_cert: true, rto_ms: 1000
+        is_server: is_server, cert_der: der, key: key, remote_fingerprint: remote_fingerprint, srtp_profiles: profiles, cookie: is_server, cookie_secret: crypto_random_bytes(32), peer: "", mtu: 1200, seed: crypto_random_bytes(32), require_ems: true, require_client_cert: true, rto_ms: 1000
     };
 }
 
@@ -448,19 +456,7 @@ pub fn dtls_new(cfg: DtlsConfig) -> DtlsConn {
     val rk: Vec<i64> = kdf_hmac(KDF_SHA256, cfg.seed, str_bytes("fides dtls drbg"));
     val rto: i64 = cfg.rto_ms;
     var c: DtlsConn = DtlsConn {
-        cfg: cfg, state: DTLS_NEW, err: "", hs: hs, now: 0,
-        rng_key: rk, rng_ctr: 0,
-        r_epoch: 0, w_epoch: 0, w_seqs: Vec::filled(2, 0), r_tops: Vec::filled(2, 0 - 1), r_wins: Vec::new(),
-        pending: Vec::new(), cur_rec_seq: 0,
-        cw_key: Vec::new(), sw_key: Vec::new(), cw_iv: Vec::new(), sw_iv: Vec::new(),
-        hs_send_seq: 0, hs_recv_seq: 0,
-        rb_seq: Vec::new(), rb_type: Vec::new(), rb_len: Vec::new(), rb_got: Vec::new(), rb_data: Vec::new(), rb_have: Vec::new(),
-        transcript: Vec::new(), client_random: Vec::new(), server_random: Vec::new(), cookie: Vec::new(),
-        eph_key: Vec::new(), peer_eph: Vec::new(), peer_cert: Vec::new(), peer_key: Vec::new(),
-        cert_requested: false, master: Vec::new(), ems: false, srtp_profile: 0,
-        fl_types: Vec::new(), fl_epochs: Vec::new(), fl_msgs: Vec::new(),
-        fresh_peer_flight: true, peer_flight_seq: 0, timer_at: 0 - 1, rto: rto, rtx_round: 0, last_trigger: 0 - 1000000,
-        out: Vec::new(), app_in: Vec::new(), retransmissions: 0, records_sent: 0, records_dropped: 0, hello_verify: 0
+        cfg: cfg, state: DTLS_NEW, err: "", hs: hs, now: 0, rng_key: rk, rng_ctr: 0, r_epoch: 0, w_epoch: 0, w_seqs: Vec::filled(2, 0), r_tops: Vec::filled(2, 0 - 1), r_wins: Vec::new(), pending: Vec::new(), cur_rec_seq: 0, cw_key: Vec::new(), sw_key: Vec::new(), cw_iv: Vec::new(), sw_iv: Vec::new(), hs_send_seq: 0, hs_recv_seq: 0, rb_seq: Vec::new(), rb_type: Vec::new(), rb_len: Vec::new(), rb_got: Vec::new(), rb_data: Vec::new(), rb_have: Vec::new(), transcript: Vec::new(), client_random: Vec::new(), server_random: Vec::new(), cookie: Vec::new(), eph_key: Vec::new(), peer_eph: Vec::new(), peer_cert: Vec::new(), peer_key: Vec::new(), cert_requested: false, master: Vec::new(), ems: false, srtp_profile: 0, fl_types: Vec::new(), fl_epochs: Vec::new(), fl_msgs: Vec::new(), fresh_peer_flight: true, peer_flight_seq: 0, timer_at: 0 - 1, rto: rto, rtx_round: 0, last_trigger: 0 - 1000000, out: Vec::new(), app_in: Vec::new(), retransmissions: 0, records_sent: 0, records_dropped: 0, hello_verify: 0
     };
     c.r_wins.push(Vec::filled(DTL_WINDOW, 0 - 1));
     c.r_wins.push(Vec::filled(DTL_WINDOW, 0 - 1));
@@ -472,12 +468,12 @@ pub fn dtls_new(cfg: DtlsConfig) -> DtlsConn {
         c.err = "no certificate or P-256 key";
     }
     if c.cfg.cookie_secret.len() == 0 {
-        c.cfg.cookie_secret = dtl_random(& mut c, 32);
+        c.cfg.cookie_secret = dtl_random(&mut c, 32);
     }
     return c;
 }
 
-fn dtl_random(c: & mut DtlsConn, n: i64) -> Vec<i64> {
+fn dtl_random(c: &mut DtlsConn, n: i64) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     while out.len() < n {
         val blk: Vec<i64> = kdf_hmac(KDF_SHA256, c.rng_key, dtl_be(c.rng_ctr, 8));
@@ -492,52 +488,52 @@ fn dtl_random(c: & mut DtlsConn, n: i64) -> Vec<i64> {
 }
 
 /// Datagrams to send, in order; the queue is emptied.
-pub fn dtls_drain(c: & mut DtlsConn) -> Vec<Vec<i64>> {
+pub fn dtls_drain(c: &mut DtlsConn) -> Vec<Vec<i64>> {
     val o: Vec<Vec<i64>> = c.out;
     c.out = Vec::new();
     return o;
 }
 
 /// Application data received, in order; the queue is emptied.
-pub fn dtls_read_app(c: & mut DtlsConn) -> Vec<Vec<i64>> {
+pub fn dtls_read_app(c: &mut DtlsConn) -> Vec<Vec<i64>> {
     val o: Vec<Vec<i64>> = c.app_in;
     c.app_in = Vec::new();
     return o;
 }
 
 /// When dtls_poll next has work (-1: no timer running).
-pub fn dtls_next_timeout(c: & DtlsConn) -> i64 {
+pub fn dtls_next_timeout(c: &DtlsConn) -> i64 {
     return c.timer_at;
 }
 
 // ─── Record layer ─────────────────────────────────────────────────────────
 
-fn dtl_nonce(iv: & Vec<i64>, epoch: i64, seq: i64) -> Vec<i64> {
+fn dtl_nonce(iv: &Vec<i64>, epoch: i64, seq: i64) -> Vec<i64> {
     var n: Vec<i64> = dtl_slice(iv, 0, 4);
-    dtl_put(& mut n, epoch, 2);
-    dtl_put(& mut n, seq, 6);
+    dtl_put(&mut n, epoch, 2);
+    dtl_put(&mut n, seq, 6);
     return n;
 }
 
 fn dtl_aad(epoch: i64, seq: i64, ct: i64, len: i64) -> Vec<i64> {
     var a: Vec<i64> = dtl_be(epoch, 2);
-    dtl_put(& mut a, seq, 6);
+    dtl_put(&mut a, seq, 6);
     a.push(ct);
     a.push(254);
     a.push(253);
-    dtl_put(& mut a, len, 2);
+    dtl_put(&mut a, len, 2);
     return a;
 }
 
 // one record under the current keys of `epoch`, with the next sequence
 // number of that epoch
-fn dtl_make_record(c: & mut DtlsConn, ct: i64, epoch: i64, plain: Vec<i64>) -> Vec<i64> {
+fn dtl_make_record(c: &mut DtlsConn, ct: i64, epoch: i64, plain: Vec<i64>) -> Vec<i64> {
     val seq: i64 = c.w_seqs.get(epoch);
     c.w_seqs.set(epoch, seq + 1);
     return dtl_record_with_seq(c, ct, epoch, seq, plain);
 }
 
-fn dtl_record_with_seq(c: & mut DtlsConn, ct: i64, epoch: i64, seq: i64, plain: Vec<i64>) -> Vec<i64> {
+fn dtl_record_with_seq(c: &mut DtlsConn, ct: i64, epoch: i64, seq: i64, plain: Vec<i64>) -> Vec<i64> {
     var frag: Vec<i64> = plain;
     if epoch > 0 {
         var key: Vec<i64> = c.cw_key;
@@ -546,47 +542,47 @@ fn dtl_record_with_seq(c: & mut DtlsConn, ct: i64, epoch: i64, seq: i64, plain: 
             key = c.sw_key;
             iv = c.sw_iv;
         }
-        val sealed: Vec<i64> = aes_gcm_seal(key, dtl_nonce(& iv, epoch, seq), dtl_aad(epoch, seq, ct, plain.len()), plain);
+        val sealed: Vec<i64> = aes_gcm_seal(key, dtl_nonce(&iv, epoch, seq), dtl_aad(epoch, seq, ct, plain.len()), plain);
         frag = dtl_be(epoch, 2);
-        dtl_put(& mut frag, seq, 6);
-        dtl_add(& mut frag, & sealed);
+        dtl_put(&mut frag, seq, 6);
+        dtl_add(&mut frag, &sealed);
     }
     var r: Vec<i64> = Vec::new();
     r.push(ct);
     r.push(254);
     r.push(253);
-    dtl_put(& mut r, epoch, 2);
-    dtl_put(& mut r, seq, 6);
-    dtl_put(& mut r, frag.len(), 2);
-    dtl_add(& mut r, & frag);
+    dtl_put(&mut r, epoch, 2);
+    dtl_put(&mut r, seq, 6);
+    dtl_put(&mut r, frag.len(), 2);
+    dtl_add(&mut r, &frag);
     c.records_sent = c.records_sent + 1;
     return r;
 }
 
 /// Feed one received datagram (one or more records).
-pub fn dtls_receive(c: & mut DtlsConn, dg: Vec<i64>, now: i64) {
+pub fn dtls_receive(c: &mut DtlsConn, dg: Vec<i64>, now: i64) {
     c.now = now;
     var at: i64 = 0;
     while at + 13 <= dg.len() {
         if c.state == DTLS_FAILED || c.state == DTLS_CLOSED {
             return;
         }
-        val len: i64 = dtl_get(& dg, at + 11, 2);
+        val len: i64 = dtl_get(&dg, at + 11, 2);
         if at + 13 + len > dg.len() {
             c.records_dropped = c.records_dropped + 1;
             return;
         }
-        dtl_record(c, dtl_slice(& dg, at, at + 13 + len));
+        dtl_record(c, dtl_slice(&dg, at, at + 13 + len));
         at = at + 13 + len;
     }
 }
 
-fn dtl_record(c: & mut DtlsConn, rec: Vec<i64>) {
+fn dtl_record(c: &mut DtlsConn, rec: Vec<i64>) {
     val ct: i64 = rec.get(0);
-    val ver: i64 = dtl_get(& rec, 1, 2);
-    val epoch: i64 = dtl_get(& rec, 3, 2);
-    val seq: i64 = dtl_get(& rec, 5, 6);
-    val frag: Vec<i64> = dtl_slice(& rec, 13, rec.len());
+    val ver: i64 = dtl_get(&rec, 1, 2);
+    val epoch: i64 = dtl_get(&rec, 3, 2);
+    val seq: i64 = dtl_get(&rec, 5, 6);
+    val frag: Vec<i64> = dtl_slice(&rec, 13, rec.len());
     if (ct < 20 || ct > 23) || (ver != 65277 && ver != 65279) {
         c.records_dropped = c.records_dropped + 1;
         return;
@@ -625,7 +621,7 @@ fn dtl_record(c: & mut DtlsConn, rec: Vec<i64>) {
             key = c.cw_key;
             iv = c.cw_iv;
         }
-        val o: GcmOpened = aes_gcm_open(key, dtl_cat(dtl_slice(& iv, 0, 4), dtl_slice(& frag, 0, 8)), dtl_aad(epoch, seq, ct, frag.len() - 24), dtl_slice(& frag, 8, frag.len()));
+        val o: GcmOpened = aes_gcm_open(key, dtl_cat(dtl_slice(&iv, 0, 4), dtl_slice(&frag, 0, 8)), dtl_aad(epoch, seq, ct, frag.len() - 24), dtl_slice(&frag, 8, frag.len()));
         if !o.ok {
             c.records_dropped = c.records_dropped + 1;
             return;
@@ -651,7 +647,7 @@ fn dtl_record(c: & mut DtlsConn, rec: Vec<i64>) {
     }
 }
 
-fn dtl_on_alert(c: & mut DtlsConn, p: Vec<i64>) {
+fn dtl_on_alert(c: &mut DtlsConn, p: Vec<i64>) {
     if p.len() < 2 {
         return;
     }
@@ -665,7 +661,7 @@ fn dtl_on_alert(c: & mut DtlsConn, p: Vec<i64>) {
     c.timer_at = 0 - 1;
 }
 
-fn dtl_send_alert(c: & mut DtlsConn, level: i64, desc: i64) {
+fn dtl_send_alert(c: &mut DtlsConn, level: i64, desc: i64) {
     var p: Vec<i64> = Vec::new();
     p.push(level);
     p.push(desc);
@@ -674,7 +670,7 @@ fn dtl_send_alert(c: & mut DtlsConn, level: i64, desc: i64) {
     c.out.push(r);
 }
 
-fn dtl_fail(c: & mut DtlsConn, desc: i64, why: str) {
+fn dtl_fail(c: &mut DtlsConn, desc: i64, why: str) {
     if c.state == DTLS_FAILED {
         return;
     }
@@ -685,7 +681,7 @@ fn dtl_fail(c: & mut DtlsConn, desc: i64, why: str) {
 }
 
 /// Send close_notify and close.
-pub fn dtls_close(c: & mut DtlsConn) {
+pub fn dtls_close(c: &mut DtlsConn) {
     if c.state == DTLS_CONNECTED || c.state == DTLS_CONNECTING {
         dtl_send_alert(c, 1, DTLS_ALERT_CLOSE_NOTIFY);
     }
@@ -694,7 +690,7 @@ pub fn dtls_close(c: & mut DtlsConn) {
 }
 
 /// Send application data (one record); false before the handshake is done.
-pub fn dtls_send_app(c: & mut DtlsConn, data: Vec<i64>) -> bool {
+pub fn dtls_send_app(c: &mut DtlsConn, data: Vec<i64>) -> bool {
     if c.state != DTLS_CONNECTED {
         return false;
     }
@@ -702,7 +698,7 @@ pub fn dtls_send_app(c: & mut DtlsConn, data: Vec<i64>) -> bool {
     return true;
 }
 
-fn dtl_on_ccs(c: & mut DtlsConn, p: Vec<i64>) {
+fn dtl_on_ccs(c: &mut DtlsConn, p: Vec<i64>) {
     if p.len() != 1 || p.get(0) != 1 {
         return;
     }
@@ -728,26 +724,26 @@ fn dtl_on_ccs(c: & mut DtlsConn, p: Vec<i64>) {
 // ─── Flights and retransmission ───────────────────────────────────────────
 
 // a handshake message with its 12-byte header, unfragmented
-fn dtl_hs_msg(t: i64, seq: i64, body: & Vec<i64>) -> Vec<i64> {
+fn dtl_hs_msg(t: i64, seq: i64, body: &Vec<i64>) -> Vec<i64> {
     var m: Vec<i64> = Vec::new();
     m.push(t);
-    dtl_put(& mut m, body.len(), 3);
-    dtl_put(& mut m, seq, 2);
-    dtl_put(& mut m, 0, 3);
-    dtl_put(& mut m, body.len(), 3);
-    dtl_add(& mut m, body);
+    dtl_put(&mut m, body.len(), 3);
+    dtl_put(&mut m, seq, 2);
+    dtl_put(&mut m, 0, 3);
+    dtl_put(&mut m, body.len(), 3);
+    dtl_add(&mut m, body);
     return m;
 }
 
-fn dtl_flight_clear(c: & mut DtlsConn) {
+fn dtl_flight_clear(c: &mut DtlsConn) {
     c.fl_types = Vec::new();
     c.fl_epochs = Vec::new();
     c.fl_msgs = Vec::new();
 }
 
 // add our next handshake message to the flight and the transcript
-fn dtl_flight_add(c: & mut DtlsConn, t: i64, body: Vec<i64>, epoch: i64) -> Vec<i64> {
-    val m: Vec<i64> = dtl_hs_msg(t, c.hs_send_seq, & body);
+fn dtl_flight_add(c: &mut DtlsConn, t: i64, body: Vec<i64>, epoch: i64) -> Vec<i64> {
+    val m: Vec<i64> = dtl_hs_msg(t, c.hs_send_seq, &body);
     c.hs_send_seq = c.hs_send_seq + 1;
     c.fl_types.push(DTLS_CT_HANDSHAKE);
     c.fl_epochs.push(epoch);
@@ -755,7 +751,7 @@ fn dtl_flight_add(c: & mut DtlsConn, t: i64, body: Vec<i64>, epoch: i64) -> Vec<
     return m;
 }
 
-fn dtl_flight_add_ccs(c: & mut DtlsConn) {
+fn dtl_flight_add_ccs(c: &mut DtlsConn) {
     var one: Vec<i64> = Vec::new();
     one.push(1);
     c.fl_types.push(DTLS_CT_CCS);
@@ -764,7 +760,7 @@ fn dtl_flight_add_ccs(c: & mut DtlsConn) {
 }
 
 // the flight as records, fragmented to the MTU, packed into datagrams
-fn dtl_send_flight(c: & mut DtlsConn) {
+fn dtl_send_flight(c: &mut DtlsConn) {
     var recs: Vec<Vec<i64>> = Vec::new();
     var i: i64 = 0;
     while i < c.fl_msgs.len() {
@@ -786,10 +782,10 @@ fn dtl_send_flight(c: & mut DtlsConn) {
                 if n > room {
                     n = room;
                 }
-                var f: Vec<i64> = dtl_slice(& m, 0, 6);
-                dtl_put(& mut f, off, 3);
-                dtl_put(& mut f, n, 3);
-                dtl_add(& mut f, & dtl_slice(& m, 12 + off, 12 + off + n));
+                var f: Vec<i64> = dtl_slice(&m, 0, 6);
+                dtl_put(&mut f, off, 3);
+                dtl_put(&mut f, n, 3);
+                dtl_add(&mut f, &dtl_slice(&m, 12 + off, 12 + off + n));
                 recs.push(dtl_make_record(c, DTLS_CT_HANDSHAKE, epoch, f));
                 off = off + n;
             }
@@ -804,7 +800,7 @@ fn dtl_send_flight(c: & mut DtlsConn) {
             c.out.push(dg);
             dg = Vec::new();
         }
-        dtl_add(& mut dg, & r);
+        dtl_add(&mut dg, &r);
         i = i + 1;
     }
     if dg.len() > 0 {
@@ -813,7 +809,7 @@ fn dtl_send_flight(c: & mut DtlsConn) {
 }
 
 // send a new flight; `timed` arms the retransmission timer
-fn dtl_send_new_flight(c: & mut DtlsConn, timed: bool) {
+fn dtl_send_new_flight(c: &mut DtlsConn, timed: bool) {
     dtl_send_flight(c);
     c.fresh_peer_flight = true;
     c.rto = c.cfg.rto_ms;
@@ -826,7 +822,7 @@ fn dtl_send_new_flight(c: & mut DtlsConn, timed: bool) {
 }
 
 /// Run the retransmission timer at time `now` (milliseconds).
-pub fn dtls_poll(c: & mut DtlsConn, now: i64) {
+pub fn dtls_poll(c: &mut DtlsConn, now: i64) {
     c.now = now;
     if c.state != DTLS_CONNECTING || c.timer_at < 0 || now < c.timer_at {
         return;
@@ -848,7 +844,7 @@ pub fn dtls_poll(c: & mut DtlsConn, now: i64) {
 }
 
 // a message of the peer's previous flight came again: resend ours
-fn dtl_old_message(c: & mut DtlsConn, mseq: i64, foff: i64) {
+fn dtl_old_message(c: &mut DtlsConn, mseq: i64, foff: i64) {
     if foff != 0 || mseq < c.peer_flight_seq || c.fl_msgs.len() == 0 {
         return;
     }
@@ -863,12 +859,12 @@ fn dtl_old_message(c: & mut DtlsConn, mseq: i64, foff: i64) {
     c.retransmissions = c.retransmissions + 1;
 }
 
-fn dtl_old_handshake_record(c: & mut DtlsConn, p: Vec<i64>) {
+fn dtl_old_handshake_record(c: &mut DtlsConn, p: Vec<i64>) {
     var at: i64 = 0;
     while at + 12 <= p.len() {
-        val mseq: i64 = dtl_get(& p, at + 4, 2);
-        val foff: i64 = dtl_get(& p, at + 6, 3);
-        val flen: i64 = dtl_get(& p, at + 9, 3);
+        val mseq: i64 = dtl_get(&p, at + 4, 2);
+        val foff: i64 = dtl_get(&p, at + 6, 3);
+        val flen: i64 = dtl_get(&p, at + 9, 3);
         if mseq < c.hs_recv_seq {
             dtl_old_message(c, mseq, foff);
         }
@@ -878,19 +874,19 @@ fn dtl_old_handshake_record(c: & mut DtlsConn, p: Vec<i64>) {
 
 // ─── Handshake reassembly ─────────────────────────────────────────────────
 
-fn dtl_handshake_record(c: & mut DtlsConn, p: Vec<i64>) {
+fn dtl_handshake_record(c: &mut DtlsConn, p: Vec<i64>) {
     var at: i64 = 0;
     while at + 12 <= p.len() {
         val mt: i64 = p.get(at);
-        val len: i64 = dtl_get(& p, at + 1, 3);
-        val mseq: i64 = dtl_get(& p, at + 4, 2);
-        val foff: i64 = dtl_get(& p, at + 6, 3);
-        val flen: i64 = dtl_get(& p, at + 9, 3);
+        val len: i64 = dtl_get(&p, at + 1, 3);
+        val mseq: i64 = dtl_get(&p, at + 4, 2);
+        val foff: i64 = dtl_get(&p, at + 6, 3);
+        val flen: i64 = dtl_get(&p, at + 9, 3);
         if at + 12 + flen > p.len() || foff + flen > len || len > 65536 {
             c.records_dropped = c.records_dropped + 1;
             return;
         }
-        dtl_fragment(c, mt, len, mseq, foff, dtl_slice(& p, at + 12, at + 12 + flen));
+        dtl_fragment(c, mt, len, mseq, foff, dtl_slice(&p, at + 12, at + 12 + flen));
         if c.state == DTLS_FAILED {
             return;
         }
@@ -898,7 +894,7 @@ fn dtl_handshake_record(c: & mut DtlsConn, p: Vec<i64>) {
     }
 }
 
-fn dtl_fragment(c: & mut DtlsConn, mt: i64, len: i64, mseq: i64, foff: i64, frag: Vec<i64>) {
+fn dtl_fragment(c: &mut DtlsConn, mt: i64, len: i64, mseq: i64, foff: i64, frag: Vec<i64>) {
     // a server waiting for a ClientHello takes one at any message_seq (a
     // client retransmits its first one until it gets a cookie), whole or
     // in fragments
@@ -932,7 +928,7 @@ fn dtl_fragment(c: & mut DtlsConn, mt: i64, len: i64, mseq: i64, foff: i64, frag
 
 // store a fragment in the reassembly buffer of its message; the slot, or
 // -1 when the fragment does not agree with what came before
-fn dtl_rb_put(c: & mut DtlsConn, mt: i64, len: i64, mseq: i64, foff: i64, frag: Vec<i64>) -> i64 {
+fn dtl_rb_put(c: &mut DtlsConn, mt: i64, len: i64, mseq: i64, foff: i64, frag: Vec<i64>) -> i64 {
     var k: i64 = 0;
     while k < c.rb_seq.len() && c.rb_seq.get(k) != mseq {
         k = k + 1;
@@ -969,7 +965,7 @@ fn dtl_rb_put(c: & mut DtlsConn, mt: i64, len: i64, mseq: i64, foff: i64, frag: 
     return k;
 }
 
-fn dtl_rb_remove(c: & mut DtlsConn, k: i64) {
+fn dtl_rb_remove(c: &mut DtlsConn, k: i64) {
     c.rb_seq.remove(k);
     c.rb_type.remove(k);
     c.rb_len.remove(k);
@@ -978,7 +974,7 @@ fn dtl_rb_remove(c: & mut DtlsConn, k: i64) {
     c.rb_have.remove(k);
 }
 
-fn dtl_process_ready(c: & mut DtlsConn) {
+fn dtl_process_ready(c: &mut DtlsConn) {
     var more: bool = true;
     while more && c.state != DTLS_FAILED {
         more = false;
@@ -1024,11 +1020,13 @@ struct DtlsHello {
 }
 
 fn dtl_hello_bad() -> DtlsHello {
-    return DtlsHello { ok: false, version: 0, random: Vec::new(), session_id: Vec::new(), cookie: Vec::new(), suites: Vec::new(), suite: 0, comps: Vec::new(), ext_types: Vec::new(), ext_data: Vec::new() };
+    return DtlsHello {
+        ok: false, version: 0, random: Vec::new(), session_id: Vec::new(), cookie: Vec::new(), suites: Vec::new(), suite: 0, comps: Vec::new(), ext_types: Vec::new(), ext_data: Vec::new()
+    };
 }
 
 // ClientHello (client true) or ServerHello
-fn dtl_parse_hello(b: & Vec<i64>, client: bool) -> DtlsHello {
+fn dtl_parse_hello(b: &Vec<i64>, client: bool) -> DtlsHello {
     var h: DtlsHello = dtl_hello_bad();
     if b.len() < 35 {
         return h;
@@ -1109,7 +1107,7 @@ fn dtl_parse_hello(b: & Vec<i64>, client: bool) -> DtlsHello {
     return h;
 }
 
-fn dtl_ext_at(h: & DtlsHello, t: i64) -> i64 {
+fn dtl_ext_at(h: &DtlsHello, t: i64) -> i64 {
     var i: i64 = 0;
     while i < h.ext_types.len() {
         if h.ext_types.get(i) == t {
@@ -1120,15 +1118,15 @@ fn dtl_ext_at(h: & DtlsHello, t: i64) -> i64 {
     return 0 - 1;
 }
 
-fn dtl_ext(out: & mut Vec<i64>, t: i64, data: Vec<i64>) {
+fn dtl_ext(out: &mut Vec<i64>, t: i64, data: Vec<i64>) {
     dtl_put(out, t, 2);
     dtl_put(out, data.len(), 2);
-    dtl_add(out, & data);
+    dtl_add(out, &data);
 }
 
 // a 16-bit list in an extension: [len2] values (groups, sig algs) or the
 // use_srtp profiles; empty when malformed
-fn dtl_u16_list(d: & Vec<i64>) -> Vec<i64> {
+fn dtl_u16_list(d: &Vec<i64>) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     if d.len() < 2 {
         return out;
@@ -1145,57 +1143,57 @@ fn dtl_u16_list(d: & Vec<i64>) -> Vec<i64> {
     return out;
 }
 
-fn dtl_use_srtp_ext(profiles: & Vec<i64>) -> Vec<i64> {
+fn dtl_use_srtp_ext(profiles: &Vec<i64>) -> Vec<i64> {
     var d: Vec<i64> = dtl_list16(profiles, 2);
     d.push(0);
     return d;
 }
 
-fn dtl_client_hello_body(c: & DtlsConn) -> Vec<i64> {
+fn dtl_client_hello_body(c: &DtlsConn) -> Vec<i64> {
     var b: Vec<i64> = Vec::new();
     b.push(254);
     b.push(253);
-    dtl_add(& mut b, & c.client_random);
+    dtl_add(&mut b, &c.client_random);
     b.push(0);
     b.push(c.cookie.len());
-    dtl_add(& mut b, & c.cookie);
-    dtl_put(& mut b, 2, 2);
-    dtl_put(& mut b, DTLS_SUITE, 2);
+    dtl_add(&mut b, &c.cookie);
+    dtl_put(&mut b, 2, 2);
+    dtl_put(&mut b, DTLS_SUITE, 2);
     b.push(1);
     b.push(0);
     var ex: Vec<i64> = Vec::new();
     var g: Vec<i64> = Vec::new();
     g.push(DTL_SECP256R1);
-    dtl_ext(& mut ex, DTL_EXT_GROUPS, dtl_list16(& g, 2));
+    dtl_ext(&mut ex, DTL_EXT_GROUPS, dtl_list16(&g, 2));
     var pf: Vec<i64> = Vec::new();
     pf.push(1);
     pf.push(0);
-    dtl_ext(& mut ex, DTL_EXT_POINT_FORMATS, pf);
+    dtl_ext(&mut ex, DTL_EXT_POINT_FORMATS, pf);
     var sa: Vec<i64> = Vec::new();
     sa.push(DTL_ECDSA_SHA256);
-    dtl_ext(& mut ex, DTL_EXT_SIG_ALGS, dtl_list16(& sa, 2));
+    dtl_ext(&mut ex, DTL_EXT_SIG_ALGS, dtl_list16(&sa, 2));
     var none: Vec<i64> = Vec::new();
-    dtl_ext(& mut ex, DTL_EXT_EMS, none);
+    dtl_ext(&mut ex, DTL_EXT_EMS, none);
     if c.cfg.srtp_profiles.len() > 0 {
-        dtl_ext(& mut ex, DTL_EXT_USE_SRTP, dtl_use_srtp_ext(& c.cfg.srtp_profiles));
+        dtl_ext(&mut ex, DTL_EXT_USE_SRTP, dtl_use_srtp_ext(&c.cfg.srtp_profiles));
     }
     var rn: Vec<i64> = Vec::new();
     rn.push(0);
-    dtl_ext(& mut ex, DTL_EXT_RENEG, rn);
-    dtl_put(& mut b, ex.len(), 2);
-    dtl_add(& mut b, & ex);
+    dtl_ext(&mut ex, DTL_EXT_RENEG, rn);
+    dtl_put(&mut b, ex.len(), 2);
+    dtl_add(&mut b, &ex);
     return b;
 }
 
-fn dtl_certificate_body(der: & Vec<i64>) -> Vec<i64> {
+fn dtl_certificate_body(der: &Vec<i64>) -> Vec<i64> {
     var b: Vec<i64> = dtl_be(der.len() + 3, 3);
-    dtl_put(& mut b, der.len(), 3);
-    dtl_add(& mut b, der);
+    dtl_put(&mut b, der.len(), 3);
+    dtl_add(&mut b, der);
     return b;
 }
 
 // the first certificate of a Certificate message (empty list: empty)
-fn dtl_first_cert(b: & Vec<i64>) -> Vec<i64> {
+fn dtl_first_cert(b: &Vec<i64>) -> Vec<i64> {
     var none: Vec<i64> = Vec::new();
     if b.len() < 3 {
         return none;
@@ -1212,7 +1210,7 @@ fn dtl_first_cert(b: & Vec<i64>) -> Vec<i64> {
 }
 
 // the peer certificate: P-256 key and the expected fingerprint. "" or why not.
-fn dtl_check_cert(c: & mut DtlsConn, der: Vec<i64>) -> str {
+fn dtl_check_cert(c: &mut DtlsConn, der: Vec<i64>) -> str {
     if der.len() == 0 {
         return "no certificate";
     }
@@ -1232,21 +1230,21 @@ fn dtl_check_cert(c: & mut DtlsConn, der: Vec<i64>) -> str {
     return "";
 }
 
-fn dtl_sign(c: & DtlsConn, msg: Vec<i64>) -> Vec<i64> {
+fn dtl_sign(c: &DtlsConn, msg: Vec<i64>) -> Vec<i64> {
     val curve: EcCurve = ec_p256();
-    return ecdsa_sig_to_der(ecdsa_sign(& curve, c.cfg.key, KDF_SHA256, msg));
+    return ecdsa_sig_to_der(ecdsa_sign(&curve, c.cfg.key, KDF_SHA256, msg));
 }
 
 // SignatureAndHashAlgorithm || signature<2>
-fn dtl_signed(c: & DtlsConn, msg: Vec<i64>) -> Vec<i64> {
+fn dtl_signed(c: &DtlsConn, msg: Vec<i64>) -> Vec<i64> {
     val der: Vec<i64> = dtl_sign(c, msg);
     var b: Vec<i64> = dtl_be(DTL_ECDSA_SHA256, 2);
-    dtl_put(& mut b, der.len(), 2);
-    dtl_add(& mut b, & der);
+    dtl_put(&mut b, der.len(), 2);
+    dtl_add(&mut b, &der);
     return b;
 }
 
-fn dtl_verify_signed(c: & DtlsConn, msg: Vec<i64>, b: & Vec<i64>, at: i64) -> bool {
+fn dtl_verify_signed(c: &DtlsConn, msg: Vec<i64>, b: &Vec<i64>, at: i64) -> bool {
     if at + 4 > b.len() || dtl_get(b, at, 2) != DTL_ECDSA_SHA256 {
         return false;
     }
@@ -1255,38 +1253,38 @@ fn dtl_verify_signed(c: & DtlsConn, msg: Vec<i64>, b: & Vec<i64>, at: i64) -> bo
         return false;
     }
     val curve: EcCurve = ec_p256();
-    return ecdsa_verify_der(& curve, c.peer_key, KDF_SHA256, msg, dtl_slice(b, at + 4, at + 4 + n));
+    return ecdsa_verify_der(&curve, c.peer_key, KDF_SHA256, msg, dtl_slice(b, at + 4, at + 4 + n));
 }
 
-fn dtl_finished(c: & DtlsConn, label: str) -> Vec<i64> {
+fn dtl_finished(c: &DtlsConn, label: str) -> Vec<i64> {
     return dtls_prf(c.master, label, kdf_hash(KDF_SHA256, c.transcript), 12);
 }
 
 // master secret and key block once the premaster secret is known (the
 // transcript then ends with ClientKeyExchange)
-fn dtl_keys(c: & mut DtlsConn, pms: Vec<i64>) {
+fn dtl_keys(c: &mut DtlsConn, pms: Vec<i64>) {
     if c.ems {
         c.master = dtls_prf(pms, "extended master secret", kdf_hash(KDF_SHA256, c.transcript), 48);
     } else {
         c.master = dtls_prf(pms, "master secret", dtl_cat(c.client_random, c.server_random), 48);
     }
     val kb: Vec<i64> = dtls_prf(c.master, "key expansion", dtl_cat(c.server_random, c.client_random), 40);
-    c.cw_key = dtl_slice(& kb, 0, 16);
-    c.sw_key = dtl_slice(& kb, 16, 32);
-    c.cw_iv = dtl_slice(& kb, 32, 36);
-    c.sw_iv = dtl_slice(& kb, 36, 40);
+    c.cw_key = dtl_slice(&kb, 0, 16);
+    c.sw_key = dtl_slice(&kb, 16, 32);
+    c.cw_iv = dtl_slice(&kb, 32, 36);
+    c.sw_iv = dtl_slice(&kb, 36, 40);
 }
 
-fn dtl_new_eph(c: & mut DtlsConn) -> Vec<i64> {
+fn dtl_new_eph(c: &mut DtlsConn) -> Vec<i64> {
     c.eph_key = dtl_random(c, 32);
     val curve: EcCurve = ec_p256();
-    return ec_public_key(& curve, c.eph_key);
+    return ec_public_key(&curve, c.eph_key);
 }
 
 // ─── Client ───────────────────────────────────────────────────────────────
 
 /// Start the handshake (a client sends its ClientHello; a server waits).
-pub fn dtls_start(c: & mut DtlsConn, now: i64) {
+pub fn dtls_start(c: &mut DtlsConn, now: i64) {
     c.now = now;
     if c.state != DTLS_NEW {
         return;
@@ -1302,14 +1300,14 @@ pub fn dtls_start(c: & mut DtlsConn, now: i64) {
     dtl_send_new_flight(c, true);
 }
 
-fn dtl_client_message(c: & mut DtlsConn, t: i64, mseq: i64, body: Vec<i64>) {
-    val full: Vec<i64> = dtl_hs_msg(t, mseq, & body);
+fn dtl_client_message(c: &mut DtlsConn, t: i64, mseq: i64, body: Vec<i64>) {
+    val full: Vec<i64> = dtl_hs_msg(t, mseq, &body);
     if c.hs == DTL_C_WAIT_SH && t == DTLS_HS_HELLO_VERIFY {
         if body.len() < 3 || 3 + body.get(2) != body.len() || body.get(2) > 255 {
             dtl_fail(c, DTLS_ALERT_DECODE_ERROR, "bad HelloVerifyRequest");
             return;
         }
-        c.cookie = dtl_slice(& body, 3, body.len());
+        c.cookie = dtl_slice(&body, 3, body.len());
         c.hello_verify = c.hello_verify + 1;
         dtl_flight_clear(c);
         val m: Vec<i64> = dtl_flight_add(c, DTLS_HS_CLIENT_HELLO, dtl_client_hello_body(c), 0);
@@ -1319,7 +1317,7 @@ fn dtl_client_message(c: & mut DtlsConn, t: i64, mseq: i64, body: Vec<i64>) {
         return;
     }
     if c.hs == DTL_C_WAIT_SH && t == DTLS_HS_SERVER_HELLO {
-        val h: DtlsHello = dtl_parse_hello(& body, false);
+        val h: DtlsHello = dtl_parse_hello(&body, false);
         if !h.ok {
             dtl_fail(c, DTLS_ALERT_DECODE_ERROR, "bad ServerHello");
             return;
@@ -1332,77 +1330,77 @@ fn dtl_client_message(c: & mut DtlsConn, t: i64, mseq: i64, body: Vec<i64>) {
             dtl_fail(c, DTLS_ALERT_ILLEGAL_PARAMETER, "server chose a suite we did not offer");
             return;
         }
-        c.ems = dtl_ext_at(& h, DTL_EXT_EMS) >= 0;
+        c.ems = dtl_ext_at(&h, DTL_EXT_EMS) >= 0;
         if c.cfg.require_ems && !c.ems {
             dtl_fail(c, DTLS_ALERT_HANDSHAKE_FAILURE, "no extended master secret");
             return;
         }
-        val us: i64 = dtl_ext_at(& h, DTL_EXT_USE_SRTP);
+        val us: i64 = dtl_ext_at(&h, DTL_EXT_USE_SRTP);
         if c.cfg.srtp_profiles.len() > 0 {
             if us < 0 {
                 dtl_fail(c, DTLS_ALERT_HANDSHAKE_FAILURE, "server did not take use_srtp");
                 return;
             }
-            val ps: Vec<i64> = dtl_u16_list(& h.ext_data.get(us));
-            if ps.len() != 1 || !dtl_has(& c.cfg.srtp_profiles, ps.get(0)) {
+            val ps: Vec<i64> = dtl_u16_list(&h.ext_data.get(us));
+            if ps.len() != 1 || !dtl_has(&c.cfg.srtp_profiles, ps.get(0)) {
                 dtl_fail(c, DTLS_ALERT_ILLEGAL_PARAMETER, "server chose an SRTP profile we did not offer");
                 return;
             }
             c.srtp_profile = ps.get(0);
         }
         c.server_random = h.random;
-        dtl_add(& mut c.transcript, & full);
+        dtl_add(&mut c.transcript, &full);
         c.hs = DTL_C_WAIT_CERT;
         return;
     }
     if c.hs == DTL_C_WAIT_CERT && t == DTLS_HS_CERTIFICATE {
-        val why: str = dtl_check_cert(c, dtl_first_cert(& body));
+        val why: str = dtl_check_cert(c, dtl_first_cert(&body));
         if str_len(why) > 0 {
             dtl_fail(c, DTLS_ALERT_BAD_CERTIFICATE, why);
             return;
         }
-        dtl_add(& mut c.transcript, & full);
+        dtl_add(&mut c.transcript, &full);
         c.hs = DTL_C_WAIT_SKE;
         return;
     }
     if c.hs == DTL_C_WAIT_SKE && t == DTLS_HS_SERVER_KEY_EXCHANGE {
-        if body.len() < 4 + 65 + 4 || body.get(0) != 3 || dtl_get(& body, 1, 2) != DTL_SECP256R1 || body.get(3) != 65 {
+        if body.len() < 4 + 65 + 4 || body.get(0) != 3 || dtl_get(&body, 1, 2) != DTL_SECP256R1 || body.get(3) != 65 {
             dtl_fail(c, DTLS_ALERT_ILLEGAL_PARAMETER, "ServerKeyExchange is not ECDHE on secp256r1");
             return;
         }
-        val params: Vec<i64> = dtl_slice(& body, 0, 69);
+        val params: Vec<i64> = dtl_slice(&body, 0, 69);
         val signed: Vec<i64> = dtl_cat(dtl_cat(c.client_random, c.server_random), params);
-        if !dtl_verify_signed(c, signed, & body, 69) {
+        if !dtl_verify_signed(c, signed, &body, 69) {
             dtl_fail(c, DTLS_ALERT_DECRYPT_ERROR, "ServerKeyExchange signature does not verify");
             return;
         }
-        c.peer_eph = dtl_slice(& body, 4, 69);
-        dtl_add(& mut c.transcript, & full);
+        c.peer_eph = dtl_slice(&body, 4, 69);
+        dtl_add(&mut c.transcript, &full);
         c.hs = DTL_C_WAIT_SHD;
         return;
     }
     if c.hs == DTL_C_WAIT_SHD && t == DTLS_HS_CERTIFICATE_REQUEST {
         // certificate_types<1> must allow ecdsa_sign (64)
-        if body.len() < 1 || body.len() < 1 + body.get(0) || !dtl_has(& dtl_slice(& body, 1, 1 + body.get(0)), 64) {
+        if body.len() < 1 || body.len() < 1 + body.get(0) || !dtl_has(&dtl_slice(&body, 1, 1 + body.get(0)), 64) {
             dtl_fail(c, DTLS_ALERT_HANDSHAKE_FAILURE, "server does not accept ECDSA certificates");
             return;
         }
         c.cert_requested = true;
-        dtl_add(& mut c.transcript, & full);
+        dtl_add(&mut c.transcript, &full);
         return;
     }
     if c.hs == DTL_C_WAIT_SHD && t == DTLS_HS_SERVER_HELLO_DONE {
-        dtl_add(& mut c.transcript, & full);
+        dtl_add(&mut c.transcript, &full);
         dtl_client_flight5(c);
         return;
     }
     if c.hs == DTL_C_WAIT_FIN && t == DTLS_HS_FINISHED && c.r_epoch == 1 {
         val want: Vec<i64> = dtl_finished(c, "server finished");
-        if !dtl_eq(& want, & body) {
+        if !dtl_eq(&want, &body) {
             dtl_fail(c, DTLS_ALERT_DECRYPT_ERROR, "server Finished does not verify");
             return;
         }
-        dtl_add(& mut c.transcript, & full);
+        dtl_add(&mut c.transcript, &full);
         c.hs = DTL_DONE;
         c.state = DTLS_CONNECTED;
         c.timer_at = 0 - 1;
@@ -1411,46 +1409,46 @@ fn dtl_client_message(c: & mut DtlsConn, t: i64, mseq: i64, body: Vec<i64>) {
     dtl_fail(c, DTLS_ALERT_UNEXPECTED_MESSAGE, "unexpected handshake message " + int_to_str(t));
 }
 
-fn dtl_client_flight5(c: & mut DtlsConn) {
+fn dtl_client_flight5(c: &mut DtlsConn) {
     dtl_flight_clear(c);
     if c.cert_requested {
-        val m: Vec<i64> = dtl_flight_add(c, DTLS_HS_CERTIFICATE, dtl_certificate_body(& c.cfg.cert_der), 0);
-        dtl_add(& mut c.transcript, & m);
+        val m: Vec<i64> = dtl_flight_add(c, DTLS_HS_CERTIFICATE, dtl_certificate_body(&c.cfg.cert_der), 0);
+        dtl_add(&mut c.transcript, &m);
     }
     val pub_key: Vec<i64> = dtl_new_eph(c);
     val curve: EcCurve = ec_p256();
-    val pms: Vec<i64> = ecdh_shared(& curve, c.eph_key, c.peer_eph);
+    val pms: Vec<i64> = ecdh_shared(&curve, c.eph_key, c.peer_eph);
     if pms.len() == 0 {
         dtl_fail(c, DTLS_ALERT_ILLEGAL_PARAMETER, "server ECDHE key is not on the curve");
         return;
     }
     var cke: Vec<i64> = Vec::new();
     cke.push(65);
-    dtl_add(& mut cke, & pub_key);
+    dtl_add(&mut cke, &pub_key);
     val km: Vec<i64> = dtl_flight_add(c, DTLS_HS_CLIENT_KEY_EXCHANGE, cke, 0);
-    dtl_add(& mut c.transcript, & km);
+    dtl_add(&mut c.transcript, &km);
     dtl_keys(c, pms);
     if c.cert_requested {
         val cv: Vec<i64> = dtl_flight_add(c, DTLS_HS_CERTIFICATE_VERIFY, dtl_signed(c, c.transcript), 0);
-        dtl_add(& mut c.transcript, & cv);
+        dtl_add(&mut c.transcript, &cv);
     }
     dtl_flight_add_ccs(c);
     c.w_epoch = 1;
     val fin: Vec<i64> = dtl_flight_add(c, DTLS_HS_FINISHED, dtl_finished(c, "client finished"), 1);
-    dtl_add(& mut c.transcript, & fin);
+    dtl_add(&mut c.transcript, &fin);
     c.hs = DTL_C_WAIT_CCS;
     dtl_send_new_flight(c, true);
 }
 
 // ─── Server ───────────────────────────────────────────────────────────────
 
-fn dtl_cookie_for(c: & DtlsConn, random: & Vec<i64>) -> Vec<i64> {
+fn dtl_cookie_for(c: &DtlsConn, random: &Vec<i64>) -> Vec<i64> {
     val mac: Vec<i64> = kdf_hmac(KDF_SHA256, c.cfg.cookie_secret, dtl_cat(str_bytes(c.cfg.peer), dtl_slice(random, 0, random.len())));
-    return dtl_slice(& mac, 0, 16);
+    return dtl_slice(&mac, 0, 16);
 }
 
-fn dtl_server_on_hello(c: & mut DtlsConn, mseq: i64, body: Vec<i64>) {
-    val h: DtlsHello = dtl_parse_hello(& body, true);
+fn dtl_server_on_hello(c: &mut DtlsConn, mseq: i64, body: Vec<i64>) {
+    val h: DtlsHello = dtl_parse_hello(&body, true);
     if !h.ok {
         dtl_fail(c, DTLS_ALERT_DECODE_ERROR, "bad ClientHello");
         return;
@@ -1460,16 +1458,16 @@ fn dtl_server_on_hello(c: & mut DtlsConn, mseq: i64, body: Vec<i64>) {
         return;
     }
     if c.cfg.cookie {
-        val want: Vec<i64> = dtl_cookie_for(c, & h.random);
-        if !dtl_eq(& want, & h.cookie) {
+        val want: Vec<i64> = dtl_cookie_for(c, &h.random);
+        if !dtl_eq(&want, &h.cookie) {
             // HelloVerifyRequest: stateless, record sequence number of the ClientHello
             var hv: Vec<i64> = Vec::new();
             hv.push(254);
             hv.push(255);
             hv.push(want.len());
-            dtl_add(& mut hv, & want);
+            dtl_add(&mut hv, &want);
             val rs: i64 = c.cur_rec_seq;
-            c.out.push(dtl_record_with_seq(c, DTLS_CT_HANDSHAKE, 0, rs, dtl_hs_msg(DTLS_HS_HELLO_VERIFY, mseq, & hv)));
+            c.out.push(dtl_record_with_seq(c, DTLS_CT_HANDSHAKE, 0, rs, dtl_hs_msg(DTLS_HS_HELLO_VERIFY, mseq, &hv)));
             if c.w_seqs.get(0) <= rs {
                 c.w_seqs.set(0, rs + 1);
             }
@@ -1477,34 +1475,34 @@ fn dtl_server_on_hello(c: & mut DtlsConn, mseq: i64, body: Vec<i64>) {
             return;
         }
     }
-    if !dtl_has(& h.suites, DTLS_SUITE) || !dtl_has(& h.comps, 0) {
+    if !dtl_has(&h.suites, DTLS_SUITE) || !dtl_has(&h.comps, 0) {
         dtl_fail(c, DTLS_ALERT_HANDSHAKE_FAILURE, "client does not offer ECDHE-ECDSA-AES128-GCM-SHA256");
         return;
     }
-    val gi: i64 = dtl_ext_at(& h, DTL_EXT_GROUPS);
-    if gi >= 0 && !dtl_has(& dtl_u16_list(& h.ext_data.get(gi)), DTL_SECP256R1) {
+    val gi: i64 = dtl_ext_at(&h, DTL_EXT_GROUPS);
+    if gi >= 0 && !dtl_has(&dtl_u16_list(&h.ext_data.get(gi)), DTL_SECP256R1) {
         dtl_fail(c, DTLS_ALERT_HANDSHAKE_FAILURE, "client does not offer secp256r1");
         return;
     }
-    val si: i64 = dtl_ext_at(& h, DTL_EXT_SIG_ALGS);
-    if si >= 0 && !dtl_has(& dtl_u16_list(& h.ext_data.get(si)), DTL_ECDSA_SHA256) {
+    val si: i64 = dtl_ext_at(&h, DTL_EXT_SIG_ALGS);
+    if si >= 0 && !dtl_has(&dtl_u16_list(&h.ext_data.get(si)), DTL_ECDSA_SHA256) {
         dtl_fail(c, DTLS_ALERT_HANDSHAKE_FAILURE, "client does not offer ecdsa_secp256r1_sha256");
         return;
     }
-    c.ems = dtl_ext_at(& h, DTL_EXT_EMS) >= 0;
+    c.ems = dtl_ext_at(&h, DTL_EXT_EMS) >= 0;
     if c.cfg.require_ems && !c.ems {
         dtl_fail(c, DTLS_ALERT_HANDSHAKE_FAILURE, "no extended master secret");
         return;
     }
     if c.cfg.srtp_profiles.len() > 0 {
-        val ui: i64 = dtl_ext_at(& h, DTL_EXT_USE_SRTP);
+        val ui: i64 = dtl_ext_at(&h, DTL_EXT_USE_SRTP);
         var offered: Vec<i64> = Vec::new();
         if ui >= 0 {
-            offered = dtl_u16_list(& h.ext_data.get(ui));
+            offered = dtl_u16_list(&h.ext_data.get(ui));
         }
         var i: i64 = 0;
         while i < c.cfg.srtp_profiles.len() && c.srtp_profile == 0 {
-            if dtl_has(& offered, c.cfg.srtp_profiles.get(i)) {
+            if dtl_has(&offered, c.cfg.srtp_profiles.get(i)) {
                 c.srtp_profile = c.cfg.srtp_profiles.get(i);
             }
             i = i + 1;
@@ -1521,7 +1519,7 @@ fn dtl_server_on_hello(c: & mut DtlsConn, mseq: i64, body: Vec<i64>) {
     }
     c.hs_recv_seq = mseq + 1;
     c.hs_send_seq = mseq;
-    c.transcript = dtl_hs_msg(DTLS_HS_CLIENT_HELLO, mseq, & body);
+    c.transcript = dtl_hs_msg(DTLS_HS_CLIENT_HELLO, mseq, &body);
     c.peer_flight_seq = mseq;
     c.fresh_peer_flight = false;
     dtl_flight_clear(c);
@@ -1529,53 +1527,53 @@ fn dtl_server_on_hello(c: & mut DtlsConn, mseq: i64, body: Vec<i64>) {
     var sh: Vec<i64> = Vec::new();
     sh.push(254);
     sh.push(253);
-    dtl_add(& mut sh, & c.server_random);
+    dtl_add(&mut sh, &c.server_random);
     sh.push(0);
-    dtl_put(& mut sh, DTLS_SUITE, 2);
+    dtl_put(&mut sh, DTLS_SUITE, 2);
     sh.push(0);
     var ex: Vec<i64> = Vec::new();
     var rn: Vec<i64> = Vec::new();
     rn.push(0);
-    dtl_ext(& mut ex, DTL_EXT_RENEG, rn);
+    dtl_ext(&mut ex, DTL_EXT_RENEG, rn);
     if c.ems {
         var none: Vec<i64> = Vec::new();
-        dtl_ext(& mut ex, DTL_EXT_EMS, none);
+        dtl_ext(&mut ex, DTL_EXT_EMS, none);
     }
     var pf: Vec<i64> = Vec::new();
     pf.push(1);
     pf.push(0);
-    dtl_ext(& mut ex, DTL_EXT_POINT_FORMATS, pf);
+    dtl_ext(&mut ex, DTL_EXT_POINT_FORMATS, pf);
     if c.srtp_profile != 0 {
         var one: Vec<i64> = Vec::new();
         one.push(c.srtp_profile);
-        dtl_ext(& mut ex, DTL_EXT_USE_SRTP, dtl_use_srtp_ext(& one));
+        dtl_ext(&mut ex, DTL_EXT_USE_SRTP, dtl_use_srtp_ext(&one));
     }
-    dtl_put(& mut sh, ex.len(), 2);
-    dtl_add(& mut sh, & ex);
+    dtl_put(&mut sh, ex.len(), 2);
+    dtl_add(&mut sh, &ex);
     val m1: Vec<i64> = dtl_flight_add(c, DTLS_HS_SERVER_HELLO, sh, 0);
-    dtl_add(& mut c.transcript, & m1);
-    val m2: Vec<i64> = dtl_flight_add(c, DTLS_HS_CERTIFICATE, dtl_certificate_body(& c.cfg.cert_der), 0);
-    dtl_add(& mut c.transcript, & m2);
+    dtl_add(&mut c.transcript, &m1);
+    val m2: Vec<i64> = dtl_flight_add(c, DTLS_HS_CERTIFICATE, dtl_certificate_body(&c.cfg.cert_der), 0);
+    dtl_add(&mut c.transcript, &m2);
     // ServerKeyExchange: named curve secp256r1, our ephemeral point, signed
     val pub_key: Vec<i64> = dtl_new_eph(c);
     var params: Vec<i64> = Vec::new();
     params.push(3);
-    dtl_put(& mut params, DTL_SECP256R1, 2);
+    dtl_put(&mut params, DTL_SECP256R1, 2);
     params.push(65);
-    dtl_add(& mut params, & pub_key);
+    dtl_add(&mut params, &pub_key);
     val ske: Vec<i64> = dtl_cat(params, dtl_signed(c, dtl_cat(dtl_cat(c.client_random, c.server_random), params)));
     val m3: Vec<i64> = dtl_flight_add(c, DTLS_HS_SERVER_KEY_EXCHANGE, ske, 0);
-    dtl_add(& mut c.transcript, & m3);
+    dtl_add(&mut c.transcript, &m3);
     if c.cfg.require_client_cert {
         var cr: Vec<i64> = Vec::new();
         cr.push(1);
         cr.push(64);
         var sa: Vec<i64> = Vec::new();
         sa.push(DTL_ECDSA_SHA256);
-        dtl_add(& mut cr, & dtl_list16(& sa, 2));
-        dtl_put(& mut cr, 0, 2);
+        dtl_add(&mut cr, &dtl_list16(&sa, 2));
+        dtl_put(&mut cr, 0, 2);
         val m4: Vec<i64> = dtl_flight_add(c, DTLS_HS_CERTIFICATE_REQUEST, cr, 0);
-        dtl_add(& mut c.transcript, & m4);
+        dtl_add(&mut c.transcript, &m4);
         c.cert_requested = true;
         c.hs = DTL_S_WAIT_CERT;
     } else {
@@ -1583,19 +1581,19 @@ fn dtl_server_on_hello(c: & mut DtlsConn, mseq: i64, body: Vec<i64>) {
     }
     var empty: Vec<i64> = Vec::new();
     val m5: Vec<i64> = dtl_flight_add(c, DTLS_HS_SERVER_HELLO_DONE, empty, 0);
-    dtl_add(& mut c.transcript, & m5);
+    dtl_add(&mut c.transcript, &m5);
     dtl_send_new_flight(c, true);
 }
 
-fn dtl_server_message(c: & mut DtlsConn, t: i64, mseq: i64, body: Vec<i64>) {
-    val full: Vec<i64> = dtl_hs_msg(t, mseq, & body);
+fn dtl_server_message(c: &mut DtlsConn, t: i64, mseq: i64, body: Vec<i64>) {
+    val full: Vec<i64> = dtl_hs_msg(t, mseq, &body);
     if c.hs == DTL_S_WAIT_CERT && t == DTLS_HS_CERTIFICATE {
-        val why: str = dtl_check_cert(c, dtl_first_cert(& body));
+        val why: str = dtl_check_cert(c, dtl_first_cert(&body));
         if str_len(why) > 0 {
             dtl_fail(c, DTLS_ALERT_BAD_CERTIFICATE, why);
             return;
         }
-        dtl_add(& mut c.transcript, & full);
+        dtl_add(&mut c.transcript, &full);
         c.hs = DTL_S_WAIT_CKE;
         return;
     }
@@ -1605,12 +1603,12 @@ fn dtl_server_message(c: & mut DtlsConn, t: i64, mseq: i64, body: Vec<i64>) {
             return;
         }
         val curve: EcCurve = ec_p256();
-        val pms: Vec<i64> = ecdh_shared(& curve, c.eph_key, dtl_slice(& body, 1, 66));
+        val pms: Vec<i64> = ecdh_shared(&curve, c.eph_key, dtl_slice(&body, 1, 66));
         if pms.len() == 0 {
             dtl_fail(c, DTLS_ALERT_ILLEGAL_PARAMETER, "client ECDHE key is not on the curve");
             return;
         }
-        dtl_add(& mut c.transcript, & full);
+        dtl_add(&mut c.transcript, &full);
         dtl_keys(c, pms);
         if c.peer_cert.len() > 0 {
             c.hs = DTL_S_WAIT_CV;
@@ -1620,26 +1618,26 @@ fn dtl_server_message(c: & mut DtlsConn, t: i64, mseq: i64, body: Vec<i64>) {
         return;
     }
     if c.hs == DTL_S_WAIT_CV && t == DTLS_HS_CERTIFICATE_VERIFY {
-        if !dtl_verify_signed(c, c.transcript, & body, 0) {
+        if !dtl_verify_signed(c, c.transcript, &body, 0) {
             dtl_fail(c, DTLS_ALERT_DECRYPT_ERROR, "CertificateVerify does not verify");
             return;
         }
-        dtl_add(& mut c.transcript, & full);
+        dtl_add(&mut c.transcript, &full);
         c.hs = DTL_S_WAIT_CCS;
         return;
     }
     if c.hs == DTL_S_WAIT_FIN && t == DTLS_HS_FINISHED && c.r_epoch == 1 {
         val want: Vec<i64> = dtl_finished(c, "client finished");
-        if !dtl_eq(& want, & body) {
+        if !dtl_eq(&want, &body) {
             dtl_fail(c, DTLS_ALERT_DECRYPT_ERROR, "client Finished does not verify");
             return;
         }
-        dtl_add(& mut c.transcript, & full);
+        dtl_add(&mut c.transcript, &full);
         dtl_flight_clear(c);
         dtl_flight_add_ccs(c);
         c.w_epoch = 1;
         val fin: Vec<i64> = dtl_flight_add(c, DTLS_HS_FINISHED, dtl_finished(c, "server finished"), 1);
-        dtl_add(& mut c.transcript, & fin);
+        dtl_add(&mut c.transcript, &fin);
         c.hs = DTL_DONE;
         c.state = DTLS_CONNECTED;
         // the last flight is resent only when the client's comes again

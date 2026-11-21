@@ -20,7 +20,11 @@
 // Dependencies: compiler::token, compiler::ast, compiler::lexer (for f-strings)
 
 module compiler::parser;
- use vec; use core; use compiler::token; use compiler::ast; use compiler::lexer;
+use vec;
+use core;
+use compiler::token;
+use compiler::ast;
+use compiler::lexer;
 // --- ParseResult ---------------------------------------------------------
 // Custom Result enum for parse functions. Fides has no `?` operator, so
 // callers must pattern-match to extract the value or propagate the error.
@@ -209,7 +213,8 @@ pub enum OpEntry {
 
 // The names modules are imported under, for `module::name()`, and each
 // `module::name` called so far
-var g_import_set: i64 = HashMap_new(); var g_qualified_calls: Vec<str> = Vec::new();
+var g_import_set: i64 = HashMap_new();
+var g_qualified_calls: Vec<str> = Vec::new();
 // LG15: the headers imported with @import: import path -> 1, or 3 when
 // marked `trusted` (compiler.fd's import loop reads it)
 var g_at_imports: i64 = HashMap_new();
@@ -467,15 +472,15 @@ impl Parser {
             tokens: tokens, pos: 0, struct_names: sn, enum_names: en, struct_name_set: sn_set, enum_name_set: en_set, alias_set: HashMap_new(), errors: Vec::new(), expr_depth: 0, max_expr_depth: 256, nest_depth: 0, nest_hit: false, lt_seen: Vec::new(), p_ct_type_params: Vec::new(),
         };
     }
-    fn peek(self: & Parser) -> TokenKind {
+    fn peek(self: &Parser) -> TokenKind {
         return self.tokens.get(self.pos).kind;
     }
 
-    fn peek_token(self: & Parser) -> Token {
+    fn peek_token(self: &Parser) -> Token {
         return self.tokens.get(self.pos);
     }
 
-    fn advance(self: & mut Parser) -> Token {
+    fn advance(self: &mut Parser) -> Token {
         var tok: Token = self.tokens.get(self.pos);
         if !token_kind_eq(tok.kind, TokenKind::Eof) {
             self.pos = self.pos + 1;
@@ -483,15 +488,15 @@ impl Parser {
         return tok;
     }
 
-    fn is_at_end(self: & Parser) -> bool {
+    fn is_at_end(self: &Parser) -> bool {
         return token_kind_eq(self.peek(), TokenKind::Eof);
     }
 
-    fn check(self: & Parser, kind: TokenKind) -> bool {
+    fn check(self: &Parser, kind: TokenKind) -> bool {
         return token_kind_eq(self.peek(), kind);
     }
 
-    fn match_tok(self: & mut Parser, kind: TokenKind) -> bool {
+    fn match_tok(self: &mut Parser, kind: TokenKind) -> bool {
         if self.check(kind) {
             self.advance();
             return true;
@@ -499,7 +504,7 @@ impl Parser {
         return false;
     }
 
-    fn recover_to_sync_token(self: & mut Parser) {
+    fn recover_to_sync_token(self: &mut Parser) {
         while !self.is_at_end() {
             var k: TokenKind = self.peek();
             if token_kind_eq(k, TokenKind::Semicolon) {
@@ -534,7 +539,7 @@ impl Parser {
     // R1.5: split a compound token starting with `>` so a generic list can close
     // on its first char: `>>` -> `>`, `>>=` -> `>=`, `>=` -> `=`. Returns false if
     // the current token does not start with `>`.
-    fn split_gt(self: & mut Parser) -> bool {
+    fn split_gt(self: &mut Parser) -> bool {
         var tok: Token = self.peek_token();
         var rest: TokenKind = TokenKind::Eof;
         if token_kind_eq(tok.kind, TokenKind::Shr) {
@@ -550,7 +555,7 @@ impl Parser {
         return true;
     }
 
-    fn expect(self: & mut Parser, kind: TokenKind, msg: str) -> ParseResultUnit {
+    fn expect(self: &mut Parser, kind: TokenKind, msg: str) -> ParseResultUnit {
         if self.check(kind) {
             self.advance();
             return ParseResultUnit::Ok;
@@ -564,7 +569,7 @@ impl Parser {
         return ParseResultUnit::Err("Parse error at " + int_to_str(tok.line) + ":" + int_to_str(tok.col) + ": expected " + msg + " but got '" + token_kind_to_str(tok.kind) + "'\n    Fix: write " + msg + " here; often a `;`, `)` or `}` is missing just before this point");
     }
 
-    fn expect_ident(self: & mut Parser) -> ParseResultStr {
+    fn expect_ident(self: &mut Parser) -> ParseResultStr {
         var tok: Token = self.peek_token();
         match tok.kind {
             TokenKind::Ident(s: str) => {
@@ -577,7 +582,7 @@ impl Parser {
         return ParseResultStr::Err(pd_expected_name_err(tok));
     }
 
-    fn expect_ident_or_keyword(self: & mut Parser) -> ParseResultStr {
+    fn expect_ident_or_keyword(self: &mut Parser) -> ParseResultStr {
         var tok: Token = self.peek_token();
         match tok.kind {
             TokenKind::Ident(s: str) => {
@@ -595,7 +600,7 @@ impl Parser {
         return ParseResultStr::Err(pd_expected_name_err(tok));
     }
 
-    fn is_struct_name(self: & Parser, name: str) -> bool {
+    fn is_struct_name(self: &Parser, name: str) -> bool {
         // O(1) HashMap lookup (string interning optimization)
         if HashMap_get(self.struct_name_set, name) != 0 {
             return true;
@@ -607,7 +612,7 @@ impl Parser {
         return false;
     }
 
-    fn is_enum_name(self: & Parser, name: str) -> bool {
+    fn is_enum_name(self: &Parser, name: str) -> bool {
         // O(1) HashMap lookup (string interning optimization)
         if HashMap_get(self.enum_name_set, name) != 0 {
             return true;
@@ -615,7 +620,7 @@ impl Parser {
         return false;
     }
 
-    fn read_type_name(self: & mut Parser) -> ParseResultStr {
+    fn read_type_name(self: &mut Parser) -> ParseResultStr {
         var tok: Token = self.peek_token();
         match tok.kind {
             TokenKind::Ident(s: str) => {
@@ -688,7 +693,7 @@ impl Parser {
         return ParseResultStr::Err("Parse error at " + int_to_str(tok.line) + ":" + int_to_str(tok.col) + ": expected type name but got '" + token_kind_to_str(tok.kind) + "'\n    Fix: name a type here, as in `i64`, `str` or `Point`");
     }
 
-    pub fn parse(self: & mut Parser) -> ParseResultProgram {
+    pub fn parse(self: &mut Parser) -> ParseResultProgram {
         var program: Program = program_new();
         g_pd_impl_selfs = Vec::new();
         g_pd_timpl_selfs = Vec::new();
@@ -723,22 +728,22 @@ impl Parser {
             return ParseResultProgram::Err(vec_str_join(self.errors, "\n"));
         }
         // L8H: several definitions of a name, one generic: specializations
-        pd_name_specializations(& mut program);
+        pd_name_specializations(&mut program);
         // ... and methods of a narrower impl that a generic impl also has
-        pd_impl_specializations(& mut program, g_pd_impl_selfs);
+        pd_impl_specializations(&mut program, g_pd_impl_selfs);
         // ... and a trait impl for a narrower type beside a generic one
         // (`impl Show for Wrap<i64>` with `impl<T> Show for Wrap<T>`): it
         // becomes a narrower impl of the struct whose methods specialize
         // the generic trait impl's (after pd_impl_specializations, so its
         // numbers `__spec<k>` follow those)
-        val tspec_errs: Vec<str> = pd_trait_impl_specializations(& mut program, g_pd_timpl_selfs);
+        val tspec_errs: Vec<str> = pd_trait_impl_specializations(&mut program, g_pd_timpl_selfs);
         if tspec_errs.len() > 0 {
             return ParseResultProgram::Err(vec_str_join(tspec_errs, "\n"));
         }
         return ParseResultProgram::Ok(program);
     }
 
-    fn parse_top_level_item(self: & mut Parser, program: & mut Program, is_pub: bool) -> ParseResultUnit {
+    fn parse_top_level_item(self: &mut Parser, program: &mut Program, is_pub: bool) -> ParseResultUnit {
         var k: TokenKind = self.peek();
 
         if token_kind_eq(k, TokenKind::Module) {
@@ -1161,7 +1166,7 @@ impl Parser {
         }
 
     }
-    fn parse_extern_block(self: & mut Parser, program: & mut Program, _is_pub: bool) -> ParseResultUnit {
+    fn parse_extern_block(self: &mut Parser, program: &mut Program, _is_pub: bool) -> ParseResultUnit {
         self.advance();
         // consume extern
         var abi: str = "C";
@@ -1263,7 +1268,7 @@ impl Parser {
         return ParseResultUnit::Ok;
     }
 
-    fn parse_struct(self: & mut Parser) -> ParseResultStructDef {
+    fn parse_struct(self: &mut Parser) -> ParseResultStructDef {
         match self.expect(TokenKind::Struct, "struct") {
             ParseResultUnit::Err(e) => {
                 return ParseResultStructDef::Err(e);
@@ -1450,7 +1455,7 @@ impl Parser {
         return ParseResultStructDef::Ok(__ret_StructDef);
     }
 
-    fn parse_enum(self: & mut Parser) -> ParseResultEnumDef {
+    fn parse_enum(self: &mut Parser) -> ParseResultEnumDef {
         match self.expect(TokenKind::Enum, "enum") {
             ParseResultUnit::Err(e) => {
                 return ParseResultEnumDef::Err(e);
@@ -1607,7 +1612,7 @@ impl Parser {
         return ParseResultEnumDef::Ok(__ret_EnumDef);
     }
 
-    fn parse_const(self: & mut Parser) -> ParseResultConstDef {
+    fn parse_const(self: &mut Parser) -> ParseResultConstDef {
         match self.expect(TokenKind::Const, "const") {
             ParseResultUnit::Err(e) => {
                 return ParseResultConstDef::Err(e);
@@ -1663,7 +1668,7 @@ impl Parser {
 
     // Parse a module-level mutable global variable:
     // `var name: Type = expr;` or `var name: Type;` (zero-initialized)
-    fn parse_global_var(self: & mut Parser) -> ParseResultGlobalVar {
+    fn parse_global_var(self: &mut Parser) -> ParseResultGlobalVar {
         // Accept either `var` or `static` (static is an alias for var).
         if !self.match_tok(TokenKind::Var) {
             match self.expect(TokenKind::Static, "var or static") {
@@ -1760,7 +1765,7 @@ impl Parser {
         return ParseResultGlobalVar::Ok(__ret_GlobalVar);
     }
 
-    fn parse_type_alias(self: & mut Parser) -> ParseResultTypeAlias {
+    fn parse_type_alias(self: &mut Parser) -> ParseResultTypeAlias {
         match self.expect(TokenKind::Type, "type") {
             ParseResultUnit::Err(e) => {
                 return ParseResultTypeAlias::Err(e);
@@ -1808,7 +1813,7 @@ impl Parser {
         return ParseResultTypeAlias::Ok(__ret_TypeAlias);
     }
 
-    fn parse_impl_or_trait_impl(self: & mut Parser) -> ParseResultImplOrTrait {
+    fn parse_impl_or_trait_impl(self: &mut Parser) -> ParseResultImplOrTrait {
         match self.expect(TokenKind::Impl, "impl") {
             ParseResultUnit::Err(e) => {
                 return ParseResultImplOrTrait::Err(e);
@@ -2168,7 +2173,7 @@ impl Parser {
         return ParseResultImplOrTrait::Ok(__iot0);
     }
 
-    fn parse_trait(self: & mut Parser) -> ParseResultTraitDef {
+    fn parse_trait(self: &mut Parser) -> ParseResultTraitDef {
         match self.expect(TokenKind::Cap, "cap") {
             ParseResultUnit::Err(e) => {
                 return ParseResultTraitDef::Err(e);
@@ -2506,7 +2511,7 @@ impl Parser {
         return ParseResultTraitDef::Ok(__td0);
     }
 
-    fn parse_extern_func_decl(self: & mut Parser, abi: str, include: OptStr, link_lib: OptStr) -> ParseResultExternDecl {
+    fn parse_extern_func_decl(self: &mut Parser, abi: str, include: OptStr, link_lib: OptStr) -> ParseResultExternDecl {
         var c_name: str = "";
         // The C symbol may itself be a Fides keyword ("system", "time", ...)
         match self.expect_ident_or_keyword() {
@@ -2574,7 +2579,7 @@ impl Parser {
         return ParseResultExternDecl::Ok(__ret_ExternDecl);
     }
 
-    fn parse_func(self: & mut Parser) -> ParseResultFunc {
+    fn parse_func(self: &mut Parser) -> ParseResultFunc {
         // TL2: the line of `fn`, for diagnostics about the whole function
         val fn_line: i64 = self.peek_token().line;
         match self.expect(TokenKind::Fn, "fn") {
@@ -2887,7 +2892,7 @@ impl Parser {
         return ParseResultFunc::Ok(mfunc);
     }
 
-    fn parse_params(self: & mut Parser) -> ParseResultParams {
+    fn parse_params(self: &mut Parser) -> ParseResultParams {
         var params: Vec<Param> = Vec::new();
         self.p_ct_type_params = Vec::new();
         if self.check(TokenKind::RParen) {
@@ -3013,7 +3018,7 @@ impl Parser {
         return ParseResultParams::Ok(params);
     }
 
-    fn parse_layer(self: & mut Parser) -> ParseResultLayerDef {
+    fn parse_layer(self: &mut Parser) -> ParseResultLayerDef {
         match self.expect(TokenKind::Layer, "layer") {
             ParseResultUnit::Err(e) => {
                 return ParseResultLayerDef::Err(e);
@@ -3133,7 +3138,7 @@ impl Parser {
         return ParseResultLayerDef::Ok(__ret_LayerDef);
     }
 
-    fn parse_model(self: & mut Parser) -> ParseResultModelDef {
+    fn parse_model(self: &mut Parser) -> ParseResultModelDef {
         match self.expect(TokenKind::Model, "model") {
             ParseResultUnit::Err(e) => {
                 return ParseResultModelDef::Err(e);
@@ -3249,7 +3254,7 @@ impl Parser {
         return ParseResultModelDef::Ok(__ret_ModelDef);
     }
 
-    fn parse_component(self: & mut Parser) -> ParseResultComponentDef {
+    fn parse_component(self: &mut Parser) -> ParseResultComponentDef {
         match self.expect(TokenKind::Component, "component") {
             ParseResultUnit::Err(e) => {
                 return ParseResultComponentDef::Err(e);
@@ -3317,7 +3322,7 @@ impl Parser {
         return ParseResultComponentDef::Ok(__ret_ComponentDef);
     }
 
-    fn parse_system(self: & mut Parser) -> ParseResultSystemDef {
+    fn parse_system(self: &mut Parser) -> ParseResultSystemDef {
         match self.expect(TokenKind::System, "system") {
             ParseResultUnit::Err(e) => {
                 return ParseResultSystemDef::Err(e);
@@ -3389,7 +3394,7 @@ impl Parser {
         return ParseResultSystemDef::Ok(__ret_SystemDef);
     }
 
-    fn parse_state_machine(self: & mut Parser) -> ParseResultStateMachineDef {
+    fn parse_state_machine(self: &mut Parser) -> ParseResultStateMachineDef {
         match self.expect(TokenKind::State, "state") {
             ParseResultUnit::Err(e) => {
                 return ParseResultStateMachineDef::Err(e);
@@ -3494,7 +3499,7 @@ impl Parser {
         return ParseResultStateMachineDef::Ok(__ret_StateMachineDef);
     }
 
-    fn parse_event_handler(self: & mut Parser) -> ParseResultEventHandlerDef {
+    fn parse_event_handler(self: &mut Parser) -> ParseResultEventHandlerDef {
         match self.expect(TokenKind::On, "on") {
             ParseResultUnit::Err(e) => {
                 return ParseResultEventHandlerDef::Err(e);
@@ -3566,7 +3571,7 @@ impl Parser {
         return ParseResultEventHandlerDef::Ok(__ret_EventHandlerDef);
     }
 
-    fn parse_type(self: & mut Parser) -> ParseResultType {
+    fn parse_type(self: &mut Parser) -> ParseResultType {
         var tok: Token = self.peek_token();
         var k: TokenKind = tok.kind;
 
@@ -4029,7 +4034,7 @@ impl Parser {
     // prefix operators; past 256 levels it stops with this error instead of
     // overflowing the compiler's stack. It skips to the end of the file, so
     // the enclosing levels' recovery does not report it once per level.
-    fn nest_too_deep(self: & mut Parser) -> str {
+    fn nest_too_deep(self: &mut Parser) -> str {
         var t: Token = self.peek_token();
         var msg: str = "Parse error at " + int_to_str(t.line) + ":" + int_to_str(t.col) + ": nested too deeply (more than 256 levels of brackets, blocks or prefix operators)\n    Fix: split the expression into named parts (`val` bindings) or into functions";
         self.nest_hit = true;
@@ -4042,14 +4047,14 @@ impl Parser {
     // An error to report; after "nested too deeply" (which skipped to the
     // end of the file), one found at the end is a consequence of it (a
     // missing `}` per level) and is left out.
-    fn push_parse_error(self: & mut Parser, e: str) {
+    fn push_parse_error(self: &mut Parser, e: str) {
         if self.nest_hit && self.is_at_end() && !str_contains(e, "nested too deeply") {
             return;
         }
         self.errors.push(e);
     }
 
-    fn parse_block(self: & mut Parser) -> ParseResultStmts {
+    fn parse_block(self: &mut Parser) -> ParseResultStmts {
         if self.nest_depth >= 256 {
             return ParseResultStmts::Err(self.nest_too_deep());
         }
@@ -4059,7 +4064,7 @@ impl Parser {
         return r;
     }
 
-    fn parse_block_inner(self: & mut Parser) -> ParseResultStmts {
+    fn parse_block_inner(self: &mut Parser) -> ParseResultStmts {
         var stmts: Vec<Stmt> = Vec::new();
         while !self.check(TokenKind::RBrace) && !self.is_at_end() {
             match self.parse_stmt() {
@@ -4075,7 +4080,7 @@ impl Parser {
         return ParseResultStmts::Ok(pd_infer_vec_lets(stmts));
     }
 
-    fn parse_stmt(self: & mut Parser) -> ParseResultStmt {
+    fn parse_stmt(self: &mut Parser) -> ParseResultStmt {
         var k: TokenKind = self.peek();
 
         // A word keyword heading an lvalue is an expression statement, not the
@@ -4446,7 +4451,7 @@ impl Parser {
         return self.parse_assign_or_expr();
     }
 
-    fn parse_assign_or_expr(self: & mut Parser) -> ParseResultStmt {
+    fn parse_assign_or_expr(self: &mut Parser) -> ParseResultStmt {
         var line: i64 = self.peek_token().line;
         var expr: Expr = Expr::IntLit(0);
         match self.parse_expr() {
@@ -4563,7 +4568,7 @@ impl Parser {
         return ParseResultStmt::Ok(Stmt::Expr(expr, line));
     }
 
-    fn parse_while(self: & mut Parser) -> ParseResultStmt {
+    fn parse_while(self: &mut Parser) -> ParseResultStmt {
         var line: i64 = self.peek_token().line;
         match self.expect(TokenKind::While, "while") {
             ParseResultUnit::Err(e) => {
@@ -4607,7 +4612,7 @@ impl Parser {
         return ParseResultStmt::Ok(Stmt::While(cond, body, line));
     }
 
-    fn parse_guard_stmt(self: & mut Parser) -> ParseResultStmt {
+    fn parse_guard_stmt(self: &mut Parser) -> ParseResultStmt {
         var line: i64 = self.peek_token().line;
         match self.expect(TokenKind::Guard, "guard") {
             ParseResultUnit::Err(e) => {
@@ -4664,7 +4669,7 @@ impl Parser {
         return ParseResultStmt::Ok(Stmt::If(Expr::Unary(UnaryOp::Not, Box::new(cond)), then_block, OptStmts::None, line));
     }
 
-    fn parse_for(self: & mut Parser) -> ParseResultStmt {
+    fn parse_for(self: &mut Parser) -> ParseResultStmt {
         var line: i64 = self.peek_token().line;
         match self.expect(TokenKind::For, "for") {
             ParseResultUnit::Err(e) => {
@@ -4724,7 +4729,7 @@ impl Parser {
         return ParseResultStmt::Ok(Stmt::For(loop_var, iterator, body, line));
     }
 
-    fn parse_loop(self: & mut Parser) -> ParseResultStmt {
+    fn parse_loop(self: &mut Parser) -> ParseResultStmt {
         var line: i64 = self.peek_token().line;
         match self.expect(TokenKind::Loop, "loop") {
             ParseResultUnit::Err(e) => {
@@ -4759,7 +4764,7 @@ impl Parser {
         return ParseResultStmt::Ok(Stmt::Loop(body, line));
     }
 
-    fn parse_query_stmt(self: & mut Parser) -> ParseResultStmt {
+    fn parse_query_stmt(self: &mut Parser) -> ParseResultStmt {
         var line: i64 = self.peek_token().line;
         match self.expect(TokenKind::Query, "query") {
             ParseResultUnit::Err(e) => {
@@ -4826,7 +4831,7 @@ impl Parser {
         return ParseResultStmt::Ok(Stmt::Query(components, body, line));
     }
 
-    fn parse_match_stmt(self: & mut Parser) -> ParseResultStmt {
+    fn parse_match_stmt(self: &mut Parser) -> ParseResultStmt {
         var line: i64 = self.peek_token().line;
         match self.expect(TokenKind::Match, "match") {
             ParseResultUnit::Err(e) => {
@@ -4858,7 +4863,7 @@ impl Parser {
         marks.push(0);
         while !self.check(TokenKind::RBrace) && !self.is_at_end() {
             var pattern: Pattern = Pattern::Wildcard;
-            match self.parse_pattern(& mut nests, & mut npctr) {
+            match self.parse_pattern(&mut nests, &mut npctr) {
                 ParseResultPattern::Ok(p) => {
                     pattern = p;
                 }
@@ -4931,7 +4936,7 @@ impl Parser {
         return ParseResultStmt::Ok(Stmt::Match(expr, arms, line));
     }
 
-    fn parse_select_stmt(self: & mut Parser) -> ParseResultStmt {
+    fn parse_select_stmt(self: &mut Parser) -> ParseResultStmt {
         var line: i64 = self.peek_token().line;
         match self.expect(TokenKind::Select, "select") {
             ParseResultUnit::Err(e) => {
@@ -5064,7 +5069,7 @@ impl Parser {
         return ParseResultStmt::Ok(Stmt::Select(cases, default, line));
     }
 
-    fn parse_parallel_stmt(self: & mut Parser) -> ParseResultStmt {
+    fn parse_parallel_stmt(self: &mut Parser) -> ParseResultStmt {
         var line: i64 = self.peek_token().line;
         // Consume 'parallel' keyword (contextual keyword — an Ident)
         self.advance();
@@ -5108,7 +5113,7 @@ impl Parser {
         return ParseResultStmt::Ok(Stmt::Parallel(branches, line));
     }
 
-    fn parse_let(self: & mut Parser) -> ParseResultStmt {
+    fn parse_let(self: &mut Parser) -> ParseResultStmt {
         var line: i64 = self.peek_token().line;
         var k: TokenKind = self.peek();
         var is_mut: bool = false;
@@ -5236,7 +5241,7 @@ impl Parser {
         return ParseResultStmt::Ok(Stmt::Let(name, ty, expr, is_mut, false, Vec::new(), line));
     }
 
-    fn parse_persist_let(self: & mut Parser) -> ParseResultStmt {
+    fn parse_persist_let(self: &mut Parser) -> ParseResultStmt {
         var line: i64 = self.peek_token().line;
         match self.expect(TokenKind::Persist, "persist") {
             ParseResultUnit::Err(e) => {
@@ -5298,7 +5303,7 @@ impl Parser {
         return ParseResultStmt::Ok(Stmt::Let(name, ty, expr, is_mut, true, Vec::new(), line));
     }
 
-    fn parse_return(self: & mut Parser) -> ParseResultStmt {
+    fn parse_return(self: &mut Parser) -> ParseResultStmt {
         var line: i64 = self.peek_token().line;
         match self.expect(TokenKind::Return, "return") {
             ParseResultUnit::Err(e) => {
@@ -5324,7 +5329,7 @@ impl Parser {
         return ParseResultStmt::Ok(Stmt::Return(OptBoxExpr::Some(Box::new(expr)), line));
     }
 
-    fn parse_if_expr(self: & mut Parser) -> ParseResultIfExpr {
+    fn parse_if_expr(self: &mut Parser) -> ParseResultIfExpr {
         match self.expect(TokenKind::If, "if") {
             ParseResultUnit::Err(e) => {
                 return ParseResultIfExpr::Err(e);
@@ -5416,7 +5421,7 @@ impl Parser {
         });
     }
 
-    fn parse_use_stmt(self: & mut Parser) -> ParseResultStmt {
+    fn parse_use_stmt(self: &mut Parser) -> ParseResultStmt {
         var line: i64 = self.peek_token().line;
         match self.expect(TokenKind::Use, "use") {
             ParseResultUnit::Err(e) => {
@@ -5476,7 +5481,7 @@ impl Parser {
         return ParseResultStmt::Ok(Stmt::Use(path, items, line));
     }
 
-    fn parse_handle_stmt(self: & mut Parser) -> ParseResultStmt {
+    fn parse_handle_stmt(self: &mut Parser) -> ParseResultStmt {
         var line: i64 = self.peek_token().line;
         match self.expect(TokenKind::Handle, "handle") {
             ParseResultUnit::Err(e) => {
@@ -5626,7 +5631,7 @@ impl Parser {
         return ParseResultStmt::Ok(Stmt::Handle(body, handlers, line));
     }
 
-    fn parse_do_stmt(self: & mut Parser) -> ParseResultStmt {
+    fn parse_do_stmt(self: &mut Parser) -> ParseResultStmt {
         var line: i64 = self.peek_token().line;
         match self.expect(TokenKind::Do, "do") {
             ParseResultUnit::Err(e) => {
@@ -5696,7 +5701,7 @@ impl Parser {
 
     // L3A: `resume(cont, value)` — call the continuation captured by the
     // enclosing effect handler with the given value.
-    fn parse_resume_stmt(self: & mut Parser) -> ParseResultStmt {
+    fn parse_resume_stmt(self: &mut Parser) -> ParseResultStmt {
         var line: i64 = self.peek_token().line;
         match self.expect(TokenKind::Resume, "resume") {
             ParseResultUnit::Err(e) => {
@@ -5749,7 +5754,7 @@ impl Parser {
     }
 
     // L3B: `spawn scope { body }` — structured concurrency scope
-    fn parse_spawn_scope_stmt(self: & mut Parser) -> ParseResultStmt {
+    fn parse_spawn_scope_stmt(self: &mut Parser) -> ParseResultStmt {
         var line: i64 = self.peek_token().line;
         match self.expect(TokenKind::Spawn, "spawn") {
             ParseResultUnit::Err(e) => {
@@ -5793,7 +5798,7 @@ impl Parser {
     }
 
     // L3E: `cancel scope;` — cancel all pending tasks in the current spawn scope
-    fn parse_cancel_scope_stmt(self: & mut Parser) -> ParseResultStmt {
+    fn parse_cancel_scope_stmt(self: &mut Parser) -> ParseResultStmt {
         var line: i64 = self.peek_token().line;
         match self.expect_ident() {
             ParseResultStr::Err(e) => {
@@ -5816,7 +5821,7 @@ impl Parser {
     // CA8: at the identifier `timeout`: is it `timeout( .. ) {`? The `(`
     // must follow at once and its `)` be followed by `{`; a `;` before the
     // `)` closes means a call.
-    fn timeout_block_ahead(self: & Parser) -> bool {
+    fn timeout_block_ahead(self: &Parser) -> bool {
         if self.pos + 3 >= self.tokens.len() {
             return false;
         }
@@ -5857,7 +5862,7 @@ impl Parser {
     // The type checker types both markers as bool; lower.fd
     // Lowerer_lower_timeout runs the body unconditionally with the token
     // installed (docs/reference/timeout-blocks.md).
-    fn parse_timeout_stmt(self: & mut Parser) -> ParseResultStmt {
+    fn parse_timeout_stmt(self: &mut Parser) -> ParseResultStmt {
         var line: i64 = self.peek_token().line;
         self.advance();
         match self.expect(TokenKind::LParen, "(") {
@@ -5943,7 +5948,7 @@ impl Parser {
         return ParseResultStmt::Ok(Stmt::If(Expr::BoolLit(true), outer, OptStmts::None, line));
     }
 
-    fn parse_region_block(self: & mut Parser) -> ParseResultStmt {
+    fn parse_region_block(self: &mut Parser) -> ParseResultStmt {
         var line: i64 = self.peek_token().line;
         match self.expect(TokenKind::Region, "region") {
             ParseResultUnit::Err(e) => {
@@ -6085,7 +6090,7 @@ impl Parser {
         return ParseResultStmt::Ok(Stmt::RegionBlock(name, budget, is_gpu, is_kv_cache, window_size, body, line));
     }
 
-    fn parse_sandbox_block(self: & mut Parser) -> ParseResultStmt {
+    fn parse_sandbox_block(self: &mut Parser) -> ParseResultStmt {
         var line: i64 = self.peek_token().line;
         match self.expect(TokenKind::Sandbox, "sandbox") {
             ParseResultUnit::Err(e) => {
@@ -6120,7 +6125,7 @@ impl Parser {
         return ParseResultStmt::Ok(Stmt::Sandbox(body, line));
     }
 
-    fn parse_unsafe_block(self: & mut Parser) -> ParseResultStmt {
+    fn parse_unsafe_block(self: &mut Parser) -> ParseResultStmt {
         var line: i64 = self.peek_token().line;
         match self.expect(TokenKind::Unsafe, "unsafe") {
             ParseResultUnit::Err(e) => {
@@ -6155,7 +6160,7 @@ impl Parser {
         return ParseResultStmt::Ok(Stmt::Unsafe(body, line));
     }
 
-    fn parse_txn_block(self: & mut Parser) -> ParseResultStmt {
+    fn parse_txn_block(self: &mut Parser) -> ParseResultStmt {
         var line: i64 = self.peek_token().line;
         match self.expect(TokenKind::Txn, "txn") {
             ParseResultUnit::Err(e) => {
@@ -6190,7 +6195,7 @@ impl Parser {
         return ParseResultStmt::Ok(Stmt::Txn(body, line));
     }
 
-    fn parse_grad_block(self: & mut Parser) -> ParseResultStmt {
+    fn parse_grad_block(self: &mut Parser) -> ParseResultStmt {
         var line: i64 = self.peek_token().line;
         match self.expect(TokenKind::Grad, "grad") {
             ParseResultUnit::Err(e) => {
@@ -6248,7 +6253,7 @@ impl Parser {
         return ParseResultStmt::Ok(Stmt::GradBlock(grad_var, body, line));
     }
 
-    fn parse_pattern(self: & mut Parser, nests: & mut Vec<PatNest>, ctr: & mut i64) -> ParseResultPattern {
+    fn parse_pattern(self: &mut Parser, nests: &mut Vec<PatNest>, ctr: &mut i64) -> ParseResultPattern {
         var tok: Token = self.peek_token();
         var k: TokenKind = tok.kind;
 
@@ -6341,7 +6346,7 @@ impl Parser {
                 var bindings: Vec<Binding> = Vec::new();
                 if self.match_tok(TokenKind::LParen) {
                     loop {
-                        match self.parse_pat_arg(& mut bindings, nests, ctr) {
+                        match self.parse_pat_arg(&mut bindings, nests, ctr) {
                             ParseResultUnit::Err(e) => {
                                 return ParseResultPattern::Err(e);
                             }
@@ -6366,7 +6371,7 @@ impl Parser {
                 self.advance();
                 var bindings: Vec<Binding> = Vec::new();
                 loop {
-                    match self.parse_pat_arg(& mut bindings, nests, ctr) {
+                    match self.parse_pat_arg(&mut bindings, nests, ctr) {
                         ParseResultUnit::Err(e) => {
                             return ParseResultPattern::Err(e);
                         }
@@ -6396,7 +6401,7 @@ impl Parser {
     /// or a nested pattern (`Ok(x)`, `E::V(y)`, `1`, `_`). A nested pattern
     /// is bound to a fresh `__np` name and recorded in `nests`; the match
     /// arm's desugar gives it an inner match of its own.
-    fn parse_pat_arg(self: & mut Parser, bindings: & mut Vec<Binding>, nests: & mut Vec<PatNest>, ctr: & mut i64) -> ParseResultUnit {
+    fn parse_pat_arg(self: &mut Parser, bindings: &mut Vec<Binding>, nests: &mut Vec<PatNest>, ctr: &mut i64) -> ParseResultUnit {
         var nested: bool = false;
         var tk: TokenKind = self.peek_token().kind;
         if !token_kind_eq(tk, TokenKind::Ident("")) {
@@ -6404,8 +6409,8 @@ impl Parser {
             // not `name [: ty]` shape is a nested pattern position
             match self.parse_pattern(nests, ctr) {
                 ParseResultPattern::Ok(p) => {
-                    var sn2: str = "__np" + int_to_str(* ctr);
-                    * ctr = * ctr + 1;
+                    var sn2: str = "__np" + int_to_str(*ctr);
+                    *ctr = *ctr + 1;
                     nests.push(PatNest {
                         name: sn2, pat: p
                     });
@@ -6426,8 +6431,8 @@ impl Parser {
         if nested {
             match self.parse_pattern(nests, ctr) {
                 ParseResultPattern::Ok(p) => {
-                    var sn: str = "__np" + int_to_str(* ctr);
-                    * ctr = * ctr + 1;
+                    var sn: str = "__np" + int_to_str(*ctr);
+                    *ctr = *ctr + 1;
                     nests.push(PatNest {
                         name: sn, pat: p
                     });
@@ -6468,7 +6473,7 @@ impl Parser {
     /// _ => <the remaining arms> }`, applied once per nested position.
     /// `marks` — nests[marks[i] .. marks[i+1]] are arm i's positions;
     /// marks.len() == arms.len() + 1. Recursive over the arm list.
-    fn pd_desugar_arms(self: & mut Parser, scrut: str, arms: Vec<MatchArm>, nests: Vec<PatNest>, marks: Vec<i64>, i: i64, line: i64, as_expr: bool) -> Vec<MatchArm> {
+    fn pd_desugar_arms(self: &mut Parser, scrut: str, arms: Vec<MatchArm>, nests: Vec<PatNest>, marks: Vec<i64>, i: i64, line: i64, as_expr: bool) -> Vec<MatchArm> {
         var out: Vec<MatchArm> = Vec::new();
         if i >= arms.len() {
             return out;
@@ -6543,11 +6548,11 @@ impl Parser {
         return out;
     }
 
-    fn parse_expr(self: & mut Parser) -> ParseResultExpr {
+    fn parse_expr(self: &mut Parser) -> ParseResultExpr {
         return self.parse_pipe_forward();
     }
 
-    fn parse_pipe_forward(self: & mut Parser) -> ParseResultExpr {
+    fn parse_pipe_forward(self: &mut Parser) -> ParseResultExpr {
         var left: Expr = Expr::IntLit(0);
         match self.parse_coalesce() {
             ParseResultExpr::Ok(e) => {
@@ -6556,7 +6561,8 @@ impl Parser {
             ParseResultExpr::Err(e) => {
                 return ParseResultExpr::Err(e);
             }
-        } while self.match_tok(TokenKind::PipeArrow) {
+        }
+        while self.match_tok(TokenKind::PipeArrow) {
             var right: Expr = Expr::IntLit(0);
             match self.parse_coalesce() {
                 ParseResultExpr::Ok(e) => {
@@ -6571,7 +6577,7 @@ impl Parser {
         return ParseResultExpr::Ok(left);
     }
 
-    fn parse_coalesce(self: & mut Parser) -> ParseResultExpr {
+    fn parse_coalesce(self: &mut Parser) -> ParseResultExpr {
         var left: Expr = Expr::IntLit(0);
         match self.parse_range() {
             ParseResultExpr::Ok(e) => {
@@ -6580,7 +6586,8 @@ impl Parser {
             ParseResultExpr::Err(e) => {
                 return ParseResultExpr::Err(e);
             }
-        } while self.match_tok(TokenKind::QuestionQuestion) {
+        }
+        while self.match_tok(TokenKind::QuestionQuestion) {
             var right: Expr = Expr::IntLit(0);
             match self.parse_range() {
                 ParseResultExpr::Ok(e) => {
@@ -6595,7 +6602,7 @@ impl Parser {
         return ParseResultExpr::Ok(left);
     }
 
-    fn parse_range(self: & mut Parser) -> ParseResultExpr {
+    fn parse_range(self: &mut Parser) -> ParseResultExpr {
         var left: Expr = Expr::IntLit(0);
         match self.parse_or() {
             ParseResultExpr::Ok(e) => {
@@ -6622,7 +6629,7 @@ impl Parser {
         return ParseResultExpr::Ok(left);
     }
 
-    fn parse_or(self: & mut Parser) -> ParseResultExpr {
+    fn parse_or(self: &mut Parser) -> ParseResultExpr {
         var left: Expr = Expr::IntLit(0);
         match self.parse_bit_or() {
             ParseResultExpr::Ok(e) => {
@@ -6631,7 +6638,8 @@ impl Parser {
             ParseResultExpr::Err(e) => {
                 return ParseResultExpr::Err(e);
             }
-        } while self.match_tok(TokenKind::Or) {
+        }
+        while self.match_tok(TokenKind::Or) {
             var right: Expr = Expr::IntLit(0);
             match self.parse_bit_or() {
                 ParseResultExpr::Ok(e) => {
@@ -6646,7 +6654,7 @@ impl Parser {
         return ParseResultExpr::Ok(left);
     }
 
-    fn parse_bit_or(self: & mut Parser) -> ParseResultExpr {
+    fn parse_bit_or(self: &mut Parser) -> ParseResultExpr {
         var left: Expr = Expr::IntLit(0);
         match self.parse_bit_xor() {
             ParseResultExpr::Ok(e) => {
@@ -6655,7 +6663,8 @@ impl Parser {
             ParseResultExpr::Err(e) => {
                 return ParseResultExpr::Err(e);
             }
-        } while self.match_tok(TokenKind::Pipe) {
+        }
+        while self.match_tok(TokenKind::Pipe) {
             var right: Expr = Expr::IntLit(0);
             match self.parse_bit_xor() {
                 ParseResultExpr::Ok(e) => {
@@ -6670,7 +6679,7 @@ impl Parser {
         return ParseResultExpr::Ok(left);
     }
 
-    fn parse_bit_xor(self: & mut Parser) -> ParseResultExpr {
+    fn parse_bit_xor(self: &mut Parser) -> ParseResultExpr {
         var left: Expr = Expr::IntLit(0);
         match self.parse_bit_and() {
             ParseResultExpr::Ok(e) => {
@@ -6679,7 +6688,8 @@ impl Parser {
             ParseResultExpr::Err(e) => {
                 return ParseResultExpr::Err(e);
             }
-        } while self.match_tok(TokenKind::Caret) {
+        }
+        while self.match_tok(TokenKind::Caret) {
             var right: Expr = Expr::IntLit(0);
             match self.parse_bit_and() {
                 ParseResultExpr::Ok(e) => {
@@ -6694,7 +6704,7 @@ impl Parser {
         return ParseResultExpr::Ok(left);
     }
 
-    fn parse_bit_and(self: & mut Parser) -> ParseResultExpr {
+    fn parse_bit_and(self: &mut Parser) -> ParseResultExpr {
         var left: Expr = Expr::IntLit(0);
         match self.parse_shift() {
             ParseResultExpr::Ok(e) => {
@@ -6703,7 +6713,8 @@ impl Parser {
             ParseResultExpr::Err(e) => {
                 return ParseResultExpr::Err(e);
             }
-        } while self.match_tok(TokenKind::Ampersand) {
+        }
+        while self.match_tok(TokenKind::Ampersand) {
             var right: Expr = Expr::IntLit(0);
             match self.parse_shift() {
                 ParseResultExpr::Ok(e) => {
@@ -6718,7 +6729,7 @@ impl Parser {
         return ParseResultExpr::Ok(left);
     }
 
-    fn parse_shift(self: & mut Parser) -> ParseResultExpr {
+    fn parse_shift(self: &mut Parser) -> ParseResultExpr {
         var left: Expr = Expr::IntLit(0);
         match self.parse_and() {
             ParseResultExpr::Ok(e) => {
@@ -6753,7 +6764,7 @@ impl Parser {
         return ParseResultExpr::Ok(left);
     }
 
-    fn parse_and(self: & mut Parser) -> ParseResultExpr {
+    fn parse_and(self: &mut Parser) -> ParseResultExpr {
         var left: Expr = Expr::IntLit(0);
         match self.parse_equality() {
             ParseResultExpr::Ok(e) => {
@@ -6762,7 +6773,8 @@ impl Parser {
             ParseResultExpr::Err(e) => {
                 return ParseResultExpr::Err(e);
             }
-        } while self.match_tok(TokenKind::And) {
+        }
+        while self.match_tok(TokenKind::And) {
             var right: Expr = Expr::IntLit(0);
             match self.parse_equality() {
                 ParseResultExpr::Ok(e) => {
@@ -6777,7 +6789,7 @@ impl Parser {
         return ParseResultExpr::Ok(left);
     }
 
-    fn parse_equality(self: & mut Parser) -> ParseResultExpr {
+    fn parse_equality(self: &mut Parser) -> ParseResultExpr {
         var left: Expr = Expr::IntLit(0);
         match self.parse_comparison() {
             ParseResultExpr::Ok(e) => {
@@ -6812,7 +6824,7 @@ impl Parser {
         return ParseResultExpr::Ok(left);
     }
 
-    fn parse_comparison(self: & mut Parser) -> ParseResultExpr {
+    fn parse_comparison(self: &mut Parser) -> ParseResultExpr {
         var left: Expr = Expr::IntLit(0);
         match self.parse_addition() {
             ParseResultExpr::Ok(e) => {
@@ -6929,7 +6941,7 @@ impl Parser {
         return ParseResultExpr::Ok(left);
     }
 
-    fn parse_addition(self: & mut Parser) -> ParseResultExpr {
+    fn parse_addition(self: &mut Parser) -> ParseResultExpr {
         var left: Expr = Expr::IntLit(0);
         match self.parse_multiplication() {
             ParseResultExpr::Ok(e) => {
@@ -6964,7 +6976,7 @@ impl Parser {
         return ParseResultExpr::Ok(left);
     }
 
-    fn parse_multiplication(self: & mut Parser) -> ParseResultExpr {
+    fn parse_multiplication(self: &mut Parser) -> ParseResultExpr {
         var left: Expr = Expr::IntLit(0);
         match self.parse_unary() {
             ParseResultExpr::Ok(e) => {
@@ -7001,7 +7013,7 @@ impl Parser {
         return ParseResultExpr::Ok(left);
     }
 
-    fn parse_unary(self: & mut Parser) -> ParseResultExpr {
+    fn parse_unary(self: &mut Parser) -> ParseResultExpr {
         // F1: one level of nesting (see nest_too_deep)
         if self.nest_depth >= 256 {
             return ParseResultExpr::Err(self.nest_too_deep());
@@ -7017,14 +7029,14 @@ impl Parser {
     // (parse_unary counts it), so `-(-(-(x)))` nests one level per `-(`
     // (test_verify_parser_nesting_ok.fd's 200 of them were counted as 400
     // and rejected). Any other operand is a level, as before: `- - - x`.
-    fn parse_prefix_operand(self: & mut Parser) -> ParseResultExpr {
+    fn parse_prefix_operand(self: &mut Parser) -> ParseResultExpr {
         if self.check(TokenKind::LParen) {
             return self.parse_unary_inner();
         }
         return self.parse_unary();
     }
 
-    fn parse_unary_inner(self: & mut Parser) -> ParseResultExpr {
+    fn parse_unary_inner(self: &mut Parser) -> ParseResultExpr {
         var k: TokenKind = self.peek();
         if token_kind_eq(k, TokenKind::Minus) {
             self.advance();
@@ -7099,7 +7111,7 @@ impl Parser {
         return self.parse_postfix();
     }
 
-    fn parse_comptime_expr(self: & mut Parser, _line: i64) -> ParseResultExpr {
+    fn parse_comptime_expr(self: &mut Parser, _line: i64) -> ParseResultExpr {
         // comptime { block }
         if self.check(TokenKind::LBrace) {
             self.advance();
@@ -7320,7 +7332,7 @@ impl Parser {
         return ParseResultExpr::Ok(Expr::Comptime(Box::new(inner)));
     }
 
-    fn parse_postfix(self: & mut Parser) -> ParseResultExpr {
+    fn parse_postfix(self: &mut Parser) -> ParseResultExpr {
         var expr: Expr = Expr::IntLit(0);
         match self.parse_primary() {
             ParseResultExpr::Ok(e) => {
@@ -7459,7 +7471,7 @@ impl Parser {
         return ParseResultExpr::Ok(expr);
     }
 
-    fn parse_match_expr(self: & mut Parser) -> ParseResultExpr {
+    fn parse_match_expr(self: &mut Parser) -> ParseResultExpr {
         match self.expect(TokenKind::Match, "match") {
             ParseResultUnit::Err(e) => {
                 return ParseResultExpr::Err(e);
@@ -7491,7 +7503,7 @@ impl Parser {
         var pat_line: i64 = self.peek_token().line;
         while !self.check(TokenKind::RBrace) && !self.is_at_end() {
             var pattern: Pattern = Pattern::Wildcard;
-            match self.parse_pattern(& mut nests, & mut npctr) {
+            match self.parse_pattern(&mut nests, &mut npctr) {
                 ParseResultPattern::Ok(p) => {
                     pattern = p;
                 }
@@ -7583,7 +7595,7 @@ impl Parser {
 
     // Helper: parse call arguments and build a Call expr.
     // Assumes LParen was already consumed. Consumes RParen.
-    fn parse_call_expr(self: & mut Parser, callee: str) -> ParseResultExpr {
+    fn parse_call_expr(self: &mut Parser, callee: str) -> ParseResultExpr {
         var args: Vec<Expr> = Vec::new();
         if !self.check(TokenKind::RParen) {
             loop {
@@ -7658,7 +7670,7 @@ impl Parser {
 
     // Helper: parse struct literal body. Assumes LBrace was already consumed.
     // Consumes RBrace.
-    fn parse_struct_lit_expr(self: & mut Parser, name: str) -> ParseResultExpr {
+    fn parse_struct_lit_expr(self: &mut Parser, name: str) -> ParseResultExpr {
         var fields: Vec<FieldInit> = Vec::new();
         var spread: OptBoxExpr = OptBoxExpr::None;
         if !self.check(TokenKind::RBrace) {
@@ -7739,7 +7751,7 @@ impl Parser {
 
     // Helper: parse comma-separated expr list inside ( ... ).
     // Assumes LParen was already consumed. Consumes RParen.
-    fn parse_expr_list(self: & mut Parser) -> ParseResultExprs {
+    fn parse_expr_list(self: &mut Parser) -> ParseResultExprs {
         var args: Vec<Expr> = Vec::new();
         if !self.check(TokenKind::RParen) {
             loop {
@@ -7769,7 +7781,7 @@ impl Parser {
     // Helper: parse tuple rest after first element and comma.
     // Assumes LParen and first expr were already consumed, and comma was matched.
     // Consumes RParen.
-    fn parse_tuple_rest(self: & mut Parser, first: Expr) -> ParseResultExpr {
+    fn parse_tuple_rest(self: &mut Parser, first: Expr) -> ParseResultExpr {
         var elems: Vec<Expr> = Vec::new();
         elems.push(first);
         loop {
@@ -7797,7 +7809,7 @@ impl Parser {
         return ParseResultExpr::Ok(Expr::TupleLit(elems));
     }
 
-    fn parse_primary(self: & mut Parser) -> ParseResultExpr {
+    fn parse_primary(self: &mut Parser) -> ParseResultExpr {
         var tok: Token = self.peek_token();
         var k: TokenKind = tok.kind;
 
@@ -8248,7 +8260,7 @@ impl Parser {
         return ParseResultExpr::Err("Parse error at " + int_to_str(tok.line) + ":" + int_to_str(tok.col) + ": unexpected token '" + token_kind_to_str(k) + "'\n    Fix: an expression goes here; look for a missing operand, a stray symbol, or a `;` or `}` missing before it");
     }
 
-    fn parse_asm(self: & mut Parser) -> ParseResultExpr {
+    fn parse_asm(self: &mut Parser) -> ParseResultExpr {
         match self.expect(TokenKind::LParen, "(") {
             ParseResultUnit::Err(e) => {
                 return ParseResultExpr::Err(e);
@@ -8352,7 +8364,7 @@ impl Parser {
         return ParseResultExpr::Ok(Expr::Asm(template, operands));
     }
 
-    fn peek_bin_op(self: & Parser) -> BinOpInfo {
+    fn peek_bin_op(self: &Parser) -> BinOpInfo {
         var k: TokenKind = self.peek();
         if token_kind_eq(k, TokenKind::PipeArrow) {
             return BinOpInfo_new(BinOp::Or, 1, true);
@@ -8417,7 +8429,7 @@ impl Parser {
         return BinOpInfo_new(BinOp::Add, 0, false);
     }
 
-    fn parse_expr_iterative(self: & mut Parser) -> ParseResultExpr {
+    fn parse_expr_iterative(self: &mut Parser) -> ParseResultExpr {
         var vals: Vec<Expr> = Vec::new();
         var ops: Vec<OpEntry> = Vec::new();
         var need_primary: bool = true;
@@ -8472,7 +8484,7 @@ impl Parser {
                             }
                         }
                         if is_op && top_prec >= prec {
-                            if !reduce_one_op(& mut vals, & mut ops) {
+                            if !reduce_one_op(&mut vals, &mut ops) {
                                 break;
                             }
                         } else {
@@ -8499,7 +8511,7 @@ impl Parser {
                             found_paren = true;
                             break;
                         }
-                        if !reduce_one_op(& mut vals, & mut ops) {
+                        if !reduce_one_op(&mut vals, &mut ops) {
                             break;
                         }
                     }
@@ -8510,7 +8522,8 @@ impl Parser {
                             var elems: Vec<Expr> = Vec::new();
                             if vals.len() > 0 {
                                 elems.push(vals.pop());
-                            } while self.match_tok(TokenKind::Comma) {
+                            }
+                            while self.match_tok(TokenKind::Comma) {
                                 self.expr_depth = self.expr_depth + 1;
                                 var elem: Expr = Expr::IntLit(0);
                                 if self.expr_depth > self.max_expr_depth {
@@ -8566,7 +8579,7 @@ impl Parser {
             if is_paren {
                 return ParseResultExpr::Err("unmatched '(' in expression");
             }
-            if !reduce_one_op(& mut vals, & mut ops) {
+            if !reduce_one_op(&mut vals, &mut ops) {
                 break;
             }
         }
@@ -8578,7 +8591,7 @@ impl Parser {
     }
 
     /// `{ ident :` at the parser's position, after a capitalised name.
-    fn pd_field_init_follows(self: & Parser, name: str) -> bool {
+    fn pd_field_init_follows(self: &Parser, name: str) -> bool {
         if str_len(name) == 0 {
             return false;
         }
@@ -8610,7 +8623,7 @@ impl Parser {
     }
 
     /// `@import(` at the parser's position.
-    fn pd_at_import(self: & Parser) -> bool {
+    fn pd_at_import(self: &Parser) -> bool {
         if self.pos + 2 >= self.tokens.len() {
             return false;
         }
@@ -8627,7 +8640,7 @@ impl Parser {
 
     /// `@import("path/foo.h")`: the import of `path/foo`, found as a header
     /// (compiler.fd's import resolution: `.fd` first, then `.h`).
-    fn parse_at_import(self: & mut Parser) -> ParseResultImportDef {
+    fn parse_at_import(self: &mut Parser) -> ParseResultImportDef {
         self.advance();
         self.advance();
         self.advance();
@@ -8692,7 +8705,7 @@ impl Parser {
         return ParseResultImportDef::Ok(ImportDef_new_full(ipath, Vec::new(), Vec::new(), OptStr::None, OptStr::None, false, false));
     }
 
-    fn parse_use(self: & mut Parser) -> ParseResultImportDef {
+    fn parse_use(self: &mut Parser) -> ParseResultImportDef {
         match self.expect(TokenKind::Use, "use") {
             ParseResultUnit::Err(e) => {
                 return ParseResultImportDef::Err(e);
@@ -8839,7 +8852,7 @@ impl Parser {
         return ParseResultImportDef::Ok(import_result);
     }
 
-    fn parse_at_annotation(self: & mut Parser) -> ParseResultAnnotation {
+    fn parse_at_annotation(self: &mut Parser) -> ParseResultAnnotation {
         match self.expect(TokenKind::At, "@") {
             ParseResultUnit::Err(e) => {
                 return ParseResultAnnotation::Err(e);
@@ -8927,7 +8940,7 @@ impl Parser {
         return ParseResultAnnotation::Ok(__ret_Annotation);
     }
 
-    fn parse_annotation_arg(self: & mut Parser) -> ParseResultStr {
+    fn parse_annotation_arg(self: &mut Parser) -> ParseResultStr {
         var arg: str = "";
         var tok: Token = self.peek_token();
         match tok.kind {
@@ -9027,7 +9040,7 @@ impl Parser {
         return ParseResultStr::Err("Expected annotation argument, got '" + token_kind_to_str(tok.kind) + "'");
     }
 
-    fn parse_attribute(self: & mut Parser) -> ParseResultAttribute {
+    fn parse_attribute(self: &mut Parser) -> ParseResultAttribute {
         match self.expect(TokenKind::Hash, "#") {
             ParseResultUnit::Err(e) => {
                 return ParseResultAttribute::Err(e);
@@ -9107,7 +9120,7 @@ impl Parser {
         return ParseResultAttribute::Ok(__ret_Attribute);
     }
 
-    fn parse_fstring_parts(self: & mut Parser, raw: str) -> ParseResultExpr {
+    fn parse_fstring_parts(self: &mut Parser, raw: str) -> ParseResultExpr {
         var parts: Vec<FStringPart> = Vec::new();
         var current: str = "";
         var i: i64 = 0;
@@ -9220,7 +9233,7 @@ fn pd_has_cfg(f: Func) -> bool {
 /// `name__spec<k>` (ast.fd spec_base_name), so it is no duplicate, and
 /// monomorphization takes an instantiation's body from the most specific
 /// one that takes its types. @cfg variants are not grouped.
-fn pd_name_specializations(program: & mut Program) {
+fn pd_name_specializations(program: &mut Program) {
     val n: i64 = program.funcs.len();
     if n < 2 {
         return;
@@ -9511,7 +9524,7 @@ pub fn BinOpInfo_new(op: BinOp, prec: i64, found: bool) -> BinOpInfo {
     };
 }
 
-pub fn reduce_one_op(vals: & mut Vec<Expr>, ops: & mut Vec<OpEntry>) -> bool {
+pub fn reduce_one_op(vals: &mut Vec<Expr>, ops: &mut Vec<OpEntry>) -> bool {
     if ops.len() == 0 {
         return false;
     }
@@ -9536,13 +9549,15 @@ pub fn reduce_one_op(vals: & mut Vec<Expr>, ops: & mut Vec<OpEntry>) -> bool {
 }
 
 // An @secret annotation was parsed: the secrecy analysis has work to do.
-var g_saw_secret: bool = false; pub fn parser_saw_secret() -> bool {
+var g_saw_secret: bool = false;
+pub fn parser_saw_secret() -> bool {
     return g_saw_secret;
 }
 
 // LG9: a `comptime splice { }` was parsed: process_gen (comptime_eval.fd)
 // has splices to expand (it walks the program only then).
-var g_saw_splice: bool = false; pub fn parser_saw_splice() -> bool {
+var g_saw_splice: bool = false;
+pub fn parser_saw_splice() -> bool {
     return g_saw_splice;
 }
 
@@ -9990,7 +10005,7 @@ fn pd_self_as(p: Param, st: Type, imp: ImplDef) -> Param {
 /// is the one whose parameters name the struct's (TypeChecker
 /// impl_tp_lists). Every method of a narrower impl has its `self` typed as
 /// the narrower type.
-fn pd_impl_specializations(program: & mut Program, selfs: Vec<Type>) {
+fn pd_impl_specializations(program: &mut Program, selfs: Vec<Type>) {
     val n: i64 = program.impls.len();
     if n == 0 {
         return;
@@ -10020,7 +10035,7 @@ fn pd_impl_specializations(program: & mut Program, selfs: Vec<Type>) {
             is_narrow = true;
             val st: Type = selfs.get(i);
             // the generic impl of the struct
-            var g: i64 = - 1;
+            var g: i64 = -1;
             var j: i64 = 0;
             while j < n && g < 0 {
                 if j != i && program.impls.get(j).struct_name == imp.struct_name {
@@ -10161,7 +10176,7 @@ fn pd_selfs_as(methods: Vec<Func>, st: Type, shell: ImplDef) -> Vec<Func> {
 /// The method names of trait `trait_name` among `traits`, pushed to `out`;
 /// false when the trait is not there or inherits methods (`cap Sub:
 /// Super`: its impls may also define Super's).
-fn pd_trait_methods_of(traits: Vec<TraitDef>, trait_name: str, out: & mut Vec<str>) -> bool {
+fn pd_trait_methods_of(traits: Vec<TraitDef>, trait_name: str, out: &mut Vec<str>) -> bool {
     var i: i64 = 0;
     while i < traits.len() {
         if traits.get(i).name == trait_name {
@@ -10235,7 +10250,7 @@ pub fn pd_impl_is_narrowed(imp: ImplDef) -> bool {
 /// generic impl binds them for every type), a method without `self` (no
 /// receiver to choose by), a method the trait does not have (`trait_ms`,
 /// when `check_ms`).
-fn pd_timpl_as_spec_impl(ti: TraitImpl, st: Type, spec_n: i64, check_ms: bool, trait_ms: Vec<str>, errs: & mut Vec<str>) -> ImplDef {
+fn pd_timpl_as_spec_impl(ti: TraitImpl, st: Type, spec_n: i64, check_ms: bool, trait_ms: Vec<str>, errs: &mut Vec<str>) -> ImplDef {
     val shell: ImplDef = ImplDef_new_full(ti.type_name, ti.type_params, Vec::new());
     var what: str = "impl ";
     if ti.type_params.len() > 0 {
@@ -10282,7 +10297,7 @@ fn pd_timpl_as_spec_impl(ti: TraitImpl, st: Type, spec_n: i64, check_ms: bool, t
 /// type (as in a narrower impl): a module importing a generic impl of the
 /// trait for the type turns it into a specialization
 /// (pd_cross_module_specializations). The errors found.
-fn pd_trait_impl_specializations(program: & mut Program, selfs: Vec<Type>) -> Vec<str> {
+fn pd_trait_impl_specializations(program: &mut Program, selfs: Vec<Type>) -> Vec<str> {
     var errs: Vec<str> = Vec::new();
     val n: i64 = program.trait_impls.len();
     var any_narrow: bool = false;
@@ -10328,8 +10343,8 @@ fn pd_trait_impl_specializations(program: & mut Program, selfs: Vec<Type>) -> Ve
             }
             if has_general {
                 var trait_ms: Vec<str> = Vec::new();
-                val check_ms: bool = pd_trait_methods_of(program.traits, ti.trait_name, & mut trait_ms);
-                added.push(pd_timpl_as_spec_impl(ti, st, spec_n, check_ms, trait_ms, & mut errs));
+                val check_ms: bool = pd_trait_methods_of(program.traits, ti.trait_name, &mut trait_ms);
+                added.push(pd_timpl_as_spec_impl(ti, st, spec_n, check_ms, trait_ms, &mut errs));
             } else {
                 ti.methods = pd_selfs_as(ti.methods, st, shell);
                 keep.push(ti);
@@ -10450,7 +10465,7 @@ fn pd_cm_spec_of_timpl(progs: Vec<Program>, from: Vec<i64>, trait_name: str, typ
 /// function's generic definition must be `pub`. `mods` are the imported
 /// modules (their names in `names`), `user` the program; called by
 /// compiler.fd before its duplicate checks. The errors found.
-pub fn pd_cross_module_specializations(mods: & mut Vec<Program>, names: Vec<str>, user: & mut Program) -> Vec<str> {
+pub fn pd_cross_module_specializations(mods: &mut Vec<Program>, names: Vec<str>, user: &mut Program) -> Vec<str> {
     var errs: Vec<str> = Vec::new();
     val nm: i64 = mods.len();
     if nm == 0 || names.len() < nm {
@@ -10553,13 +10568,13 @@ pub fn pd_cross_module_specializations(mods: & mut Vec<Program>, names: Vec<str>
                 val st: Type = pd_impl_narrow_self(ti.type_name, ti.type_params, ti.methods);
                 if !pd_type_is_void(st) && pd_cm_spec_of_timpl(progs, from, ti.trait_name, ti.type_name) {
                     var trait_ms: Vec<str> = Vec::new();
-                    var check_ms: bool = pd_trait_methods_of(sp.traits, ti.trait_name, & mut trait_ms);
+                    var check_ms: bool = pd_trait_methods_of(sp.traits, ti.trait_name, &mut trait_ms);
                     var tf: i64 = 0;
                     while tf < from.len() && !check_ms {
-                        check_ms = pd_trait_methods_of(progs.get(from.get(tf)).traits, ti.trait_name, & mut trait_ms);
+                        check_ms = pd_trait_methods_of(progs.get(from.get(tf)).traits, ti.trait_name, &mut trait_ms);
                         tf = tf + 1;
                     }
-                    imps.push(pd_timpl_as_spec_impl(ti, st, m_n, check_ms, trait_ms, & mut errs));
+                    imps.push(pd_timpl_as_spec_impl(ti, st, m_n, check_ms, trait_ms, &mut errs));
                     ch = true;
                 } else {
                     keep.push(ti);
@@ -10592,14 +10607,14 @@ pub fn pd_cross_module_specializations(mods: & mut Vec<Program>, names: Vec<str>
     // still held, then dropped it again with the result (Invalid memory
     // access in vec_drop_range: test_cross_module_specialization).
     if changed.get(nm) {
-        pd_refill_funcs(& mut user.funcs, progs.get(nm).funcs);
-        pd_refill_impls(& mut user.impls, progs.get(nm).impls);
-        pd_refill_timpls(& mut user.trait_impls, progs.get(nm).trait_impls);
+        pd_refill_funcs(&mut user.funcs, progs.get(nm).funcs);
+        pd_refill_impls(&mut user.impls, progs.get(nm).impls);
+        pd_refill_timpls(&mut user.trait_impls, progs.get(nm).trait_impls);
     }
     return errs;
 }
 
-fn pd_refill_funcs(dst: & mut Vec<Func>, src: Vec<Func>) {
+fn pd_refill_funcs(dst: &mut Vec<Func>, src: Vec<Func>) {
     dst.clear();
     var i: i64 = 0;
     while i < src.len() {
@@ -10608,7 +10623,7 @@ fn pd_refill_funcs(dst: & mut Vec<Func>, src: Vec<Func>) {
     }
 }
 
-fn pd_refill_impls(dst: & mut Vec<ImplDef>, src: Vec<ImplDef>) {
+fn pd_refill_impls(dst: &mut Vec<ImplDef>, src: Vec<ImplDef>) {
     dst.clear();
     var i: i64 = 0;
     while i < src.len() {
@@ -10617,7 +10632,7 @@ fn pd_refill_impls(dst: & mut Vec<ImplDef>, src: Vec<ImplDef>) {
     }
 }
 
-fn pd_refill_timpls(dst: & mut Vec<TraitImpl>, src: Vec<TraitImpl>) {
+fn pd_refill_timpls(dst: &mut Vec<TraitImpl>, src: Vec<TraitImpl>) {
     dst.clear();
     var i: i64 = 0;
     while i < src.len() {

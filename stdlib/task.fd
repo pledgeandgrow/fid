@@ -15,7 +15,8 @@
 //   println(task_result(t));
 
 module task;
- use vec; use sync;
+use vec;
+use sync;
 /// Start the function `name`, which takes one i64, as a task. It starts on a
 /// worker as soon as one is free. Returns the task.
 ///
@@ -112,7 +113,7 @@ pub fn task_scope_new() -> TaskScope {
 }
 
 /// Start `name(arg)` as a child of the scope.
-pub fn task_scope_go(s: & mut TaskScope, name: str, arg: i64) -> i64 {
+pub fn task_scope_go(s: &mut TaskScope, name: str, arg: i64) -> i64 {
     var t: i64 = task_go(name, arg);
     s.tasks.push(t);
     return t;
@@ -121,17 +122,17 @@ pub fn task_scope_go(s: & mut TaskScope, name: str, arg: i64) -> i64 {
 /// The scope's cancel flag as an i64 address: hand it to a child's arg (or
 /// pack it into a struct) so the child can poll
 /// `sync_atomic_load(flag_ptr) != 0` and stop early.
-pub fn task_scope_flag_ptr(s: & TaskScope) -> i64 {
+pub fn task_scope_flag_ptr(s: &TaskScope) -> i64 {
     return s.flag;
 }
 
 /// True once someone cancelled the scope. Children poll this.
-pub fn task_scope_cancelled(s: & TaskScope) -> bool {
+pub fn task_scope_cancelled(s: &TaskScope) -> bool {
     return sync_atomic_load(s.flag) != 0;
 }
 
 /// Ask every child (cooperatively) to stop. Does not wait.
-pub fn task_scope_cancel(s: & mut TaskScope) -> void {
+pub fn task_scope_cancel(s: &mut TaskScope) -> void {
     sync_atomic_store(s.flag, 1);
 }
 
@@ -147,7 +148,7 @@ pub fn task_join_timeout(t: i64, ms: i64) -> i64 {
         // CA8: a timeout block around the join that ran out stops it (its
         // sleeps return at once then)
         if task_slot_cancelled() {
-            return - 1;
+            return -1;
         }
         task_sleep(1);
         if ms >= 0 {
@@ -157,13 +158,13 @@ pub fn task_join_timeout(t: i64, ms: i64) -> i64 {
     if task_done(t) {
         return task_result(t);
     }
-    return - 1;
+    return -1;
 }
 
 /// Wait for every child of the scope. Returns the results in spawn order.
 /// Children that spawned more children are covered too: task_run drains the
 /// scheduler before the per-handle results are read.
-pub fn task_scope_join(s: & mut TaskScope) -> Vec<i64> {
+pub fn task_scope_join(s: &mut TaskScope) -> Vec<i64> {
     task_run();
     var out: Vec<i64> = Vec::new();
     var i: i64 = 0;
@@ -177,7 +178,7 @@ pub fn task_scope_join(s: & mut TaskScope) -> Vec<i64> {
 /// Cancel the scope, then wait for every child to observe the flag and end.
 /// Returns the results of children that finished (spawn order; a child that
 /// ignores cancellation still has its result once it ends).
-pub fn task_scope_cancel_join(s: & mut TaskScope) -> Vec<i64> {
+pub fn task_scope_cancel_join(s: &mut TaskScope) -> Vec<i64> {
     task_scope_cancel(s);
     return task_scope_join(s);
 }
@@ -286,7 +287,7 @@ pub fn task_token_remaining(tok: i64) -> i64 {
     if task_token_cancelled(tok) {
         return 0;
     }
-    var best: i64 = - 1;
+    var best: i64 = -1;
     val now: i64 = p_clock_mono_ms();
     var t: i64 = tok;
     var depth: i64 = 0;
@@ -343,9 +344,9 @@ fn task_wait_fd_cancellable(fd: i64, write: i64, timeout_ms: i64, tok: i64) -> i
     val start: i64 = p_clock_mono_ms();
     while true {
         if task_token_cancelled(tok) || task_slot_cancelled() {
-            return - 1;
+            return -1;
         }
-        var left: i64 = - 1;
+        var left: i64 = -1;
         if timeout_ms >= 0 {
             left = timeout_ms - (p_clock_mono_ms() - start);
             if left <= 0 {
@@ -407,7 +408,7 @@ pub fn task_join_cancellable(t: i64, tok: i64) -> bool {
 
 /// Sleep `ms` unless the scope is cancelled first: true when the whole time
 /// passed.
-pub fn task_scope_sleep(s: & TaskScope, ms: i64) -> bool {
+pub fn task_scope_sleep(s: &TaskScope, ms: i64) -> bool {
     val end: i64 = p_clock_mono_ms() + ms;
     while true {
         if sync_atomic_load(s.flag) != 0 || task_slot_cancelled() {

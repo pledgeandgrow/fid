@@ -30,15 +30,16 @@
 // feed received bytes back through iec104_parse.
 
 module iec104;
- use vec; use string;
+use vec;
+use string;
 
 // ─── Type identifications ────────────────────────────────────────────────
-pub const M_SP_NA_1: i64 = 1;    // single-point information
-pub const M_DP_NA_1: i64 = 3;    // double-point information
-pub const M_ME_NC_1: i64 = 13;   // measured value, short float
-pub const M_ME_TF_1: i64 = 36;   // measured value, short float with time
-pub const C_SC_NA_1: i64 = 45;   // single command
-pub const C_DC_NA_1: i64 = 46;   // double command
+pub const M_SP_NA_1: i64 = 1;  // single-point information
+pub const M_DP_NA_1: i64 = 3;  // double-point information
+pub const M_ME_NC_1: i64 = 13;  // measured value, short float
+pub const M_ME_TF_1: i64 = 36;  // measured value, short float with time
+pub const C_SC_NA_1: i64 = 45;  // single command
+pub const C_DC_NA_1: i64 = 46;  // double command
 pub const C_IC_NA_1: i64 = 100;  // interrogation command
 pub const C_CI_NA_1: i64 = 101;  // counter interrogation
 pub const C_CS_NA_1: i64 = 103;  // clock synchronisation
@@ -48,10 +49,10 @@ pub const COT_PERIODIC: i64 = 1;
 pub const COT_SPONT: i64 = 3;
 pub const COT_INIT: i64 = 4;
 pub const COT_REQUEST: i64 = 5;
-pub const COT_ACT: i64 = 6;       // activation
-pub const COT_ACTCON: i64 = 7;    // activation confirmation
+pub const COT_ACT: i64 = 6;  // activation
+pub const COT_ACTCON: i64 = 7;  // activation confirmation
 pub const COT_ACTTERM: i64 = 10;  // activation termination
-pub const COT_INTROGEN: i64 = 20; // interrogated by station interrogation
+pub const COT_INTROGEN: i64 = 20;  // interrogated by station interrogation
 
 // ─── APCI frame formats ──────────────────────────────────────────────────
 pub const APCI_I: i64 = 0;
@@ -66,7 +67,7 @@ pub const U_STOPDT_CON: i64 = 0x23;
 pub const U_TESTFR_ACT: i64 = 0x43;
 pub const U_TESTFR_CON: i64 = 0x83;
 
-fn put16le(out: & mut Vec<i64>, v: i64) {
+fn put16le(out: &mut Vec<i64>, v: i64) {
     out.push(v & 255);
     out.push((v >> 8) & 255);
 }
@@ -75,7 +76,7 @@ fn put16le(out: & mut Vec<i64>, v: i64) {
 
 /// I-format frame: start, length, control (N(S) in octets 1-2, N(R) in 3-4),
 /// then the ASDU. ns/nr are the 15-bit sequence numbers.
-pub fn iec104_i_frame(ns: i64, nr: i64, asdu: & Vec<i64>) -> Vec<i64> {
+pub fn iec104_i_frame(ns: i64, nr: i64, asdu: &Vec<i64>) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     out.push(0x68);
     out.push((4 + asdu.len()) & 255);
@@ -87,7 +88,10 @@ pub fn iec104_i_frame(ns: i64, nr: i64, asdu: & Vec<i64>) -> Vec<i64> {
     out.push(nrf & 255);
     out.push((nrf >> 8) & 255);
     var i: i64 = 0;
-    while i < asdu.len() { out.push(asdu.get(i)); i = i + 1; }
+    while i < asdu.len() {
+        out.push(asdu.get(i));
+        i = i + 1;
+    }
     return out;
 }
 
@@ -96,7 +100,7 @@ pub fn iec104_s_frame(nr: i64) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     out.push(0x68);
     out.push(4);
-    out.push(0x01);   // bit0=1, bit1=0 -> S-format
+    out.push(0x01);  // bit0=1, bit1=0 -> S-format
     out.push(0x00);
     val nrf: i64 = (nr << 1) & 0xFFFF;
     out.push(nrf & 255);
@@ -121,20 +125,22 @@ pub fn iec104_u_frame(func: i64) -> Vec<i64> {
 pub struct Iec104Frame {
     pub ok: bool,
     pub error: str,
-    pub format: i64,   // APCI_I / APCI_S / APCI_U
+    pub format: i64,  // APCI_I / APCI_S / APCI_U
     pub ns: i64,
     pub nr: i64,
     pub ufunc: i64,
     pub asdu: Vec<i64>,
-    pub total_len: i64,   // bytes consumed (2 + length)
+    pub total_len: i64,  // bytes consumed (2 + length)
 }
 
 fn f_err(msg: str) -> Iec104Frame {
-    return Iec104Frame { ok: false, error: msg, format: 0, ns: 0, nr: 0, ufunc: 0, asdu: Vec::new(), total_len: 0 };
+    return Iec104Frame {
+        ok: false, error: msg, format: 0, ns: 0, nr: 0, ufunc: 0, asdu: Vec::new(), total_len: 0
+    };
 }
 
 /// Parse one APCI frame starting at the front of `b`.
-pub fn iec104_parse(b: & Vec<i64>) -> Iec104Frame {
+pub fn iec104_parse(b: &Vec<i64>) -> Iec104Frame {
     if b.len() < 6 {
         return f_err("frame too short");
     }
@@ -156,15 +162,24 @@ pub fn iec104_parse(b: & Vec<i64>) -> Iec104Frame {
         val nr: i64 = ((c2 | (c3 << 8)) >> 1) & 0x7FFF;
         var asdu: Vec<i64> = Vec::new();
         var i: i64 = 6;
-        while i < total { asdu.push(b.get(i)); i = i + 1; }
-        return Iec104Frame { ok: true, error: "", format: APCI_I, ns: ns, nr: nr, ufunc: 0, asdu: asdu, total_len: total };
+        while i < total {
+            asdu.push(b.get(i));
+            i = i + 1;
+        }
+        return Iec104Frame {
+            ok: true, error: "", format: APCI_I, ns: ns, nr: nr, ufunc: 0, asdu: asdu, total_len: total
+        };
     } else if (c0 & 3) == 1 {
         // S-format
         val nr: i64 = ((c2 | (c3 << 8)) >> 1) & 0x7FFF;
-        return Iec104Frame { ok: true, error: "", format: APCI_S, ns: 0, nr: nr, ufunc: 0, asdu: Vec::new(), total_len: total };
+        return Iec104Frame {
+            ok: true, error: "", format: APCI_S, ns: 0, nr: nr, ufunc: 0, asdu: Vec::new(), total_len: total
+        };
     } else {
         // U-format
-        return Iec104Frame { ok: true, error: "", format: APCI_U, ns: 0, nr: 0, ufunc: c0, asdu: Vec::new(), total_len: total };
+        return Iec104Frame {
+            ok: true, error: "", format: APCI_U, ns: 0, nr: 0, ufunc: c0, asdu: Vec::new(), total_len: total
+        };
     }
 }
 
@@ -176,19 +191,25 @@ pub fn iec104_asdu_header(type_id: i64, num_objects: i64, sq: bool, cot: i64, te
     var out: Vec<i64> = Vec::new();
     out.push(type_id & 255);
     var vsq: i64 = num_objects & 127;
-    if sq { vsq = vsq | 0x80; }
+    if sq {
+        vsq = vsq | 0x80;
+    }
     out.push(vsq);
     var cotb: i64 = cot & 63;
-    if negative { cotb = cotb | 0x40; }
-    if test { cotb = cotb | 0x80; }
+    if negative {
+        cotb = cotb | 0x40;
+    }
+    if test {
+        cotb = cotb | 0x80;
+    }
     out.push(cotb);
     out.push(orig & 255);
-    put16le(& mut out, common_addr);
+    put16le(&mut out, common_addr);
     return out;
 }
 
 /// Push a 3-byte information object address.
-pub fn iec104_put_ioa(out: & mut Vec<i64>, ioa: i64) {
+pub fn iec104_put_ioa(out: &mut Vec<i64>, ioa: i64) {
     out.push(ioa & 255);
     out.push((ioa >> 8) & 255);
     out.push((ioa >> 16) & 255);
@@ -207,27 +228,22 @@ pub struct Iec104Asdu {
     pub body_start: i64,
 }
 
-pub fn iec104_asdu_decode(b: & Vec<i64>) -> Iec104Asdu {
+pub fn iec104_asdu_decode(b: &Vec<i64>) -> Iec104Asdu {
     val vsq: i64 = b.get(1);
     val cotb: i64 = b.get(2);
     return Iec104Asdu {
-        type_id: b.get(0),
-        num_objects: vsq & 127, sq: (vsq & 0x80) != 0,
-        cot: cotb & 63, negative: (cotb & 0x40) != 0, test: (cotb & 0x80) != 0,
-        orig: b.get(3),
-        common_addr: b.get(4) | (b.get(5) << 8),
-        body_start: 6,
+        type_id: b.get(0), num_objects: vsq & 127, sq: (vsq & 0x80) != 0, cot: cotb & 63, negative: (cotb & 0x40) != 0, test: (cotb & 0x80) != 0, orig: b.get(3), common_addr: b.get(4) | (b.get(5) << 8), body_start: 6,
     };
 }
 
-pub fn iec104_get_ioa(b: & Vec<i64>, pos: i64) -> i64 {
+pub fn iec104_get_ioa(b: &Vec<i64>, pos: i64) -> i64 {
     return b.get(pos) | (b.get(pos + 1) << 8) | (b.get(pos + 2) << 16);
 }
 
 // ─── IEEE 754 single precision (for M_ME_NC_1 / M_ME_TF_1) ───────────────
 
 /// Encode an f64 as 4 little-endian IEEE-754 binary32 bytes.
-pub fn iec104_put_f32(out: & mut Vec<i64>, x: f64) {
+pub fn iec104_put_f32(out: &mut Vec<i64>, x: f64) {
     val bits: i64 = iec104_f32_bits(x);
     out.push(bits & 255);
     out.push((bits >> 8) & 255);
@@ -236,16 +252,21 @@ pub fn iec104_put_f32(out: & mut Vec<i64>, x: f64) {
 }
 
 /// The 32 bits of x rounded to single precision (nearest, ties to even).
-@wrapping pub fn iec104_f32_bits(x: f64) -> i64 {
+@wrapping
+pub fn iec104_f32_bits(x: f64) -> i64 {
     val bits: i64 = p_f64_to_bits(x);
     val sign: i64 = (((bits as u64) >> (63 as u64)) as i64) << 31;
     val e: i64 = (bits >> 52) & 2047;
     val m: i64 = bits & 4503599627370495;
     if e == 2047 {
-        if m == 0 { return sign | 0x7f800000; }
+        if m == 0 {
+            return sign | 0x7f800000;
+        }
         return sign | 0x7fc00000 | ((m >> 29) & 4194303);
     }
-    if e == 0 { return sign; }
+    if e == 0 {
+        return sign;
+    }
     val ex: i64 = e - 1023;
     var full: i64 = m | 4503599627370496;
     var shift: i64 = 29;
@@ -253,20 +274,31 @@ pub fn iec104_put_f32(out: & mut Vec<i64>, x: f64) {
     if biased <= 0 {
         shift = 29 + 1 - biased;
         biased = 0;
-        if shift > 54 { return sign; }
+        if shift > 54 {
+            return sign;
+        }
     }
     var mant: i64 = full >> shift;
     val rem: i64 = full & ((1 << shift) - 1);
     val half: i64 = 1 << (shift - 1);
-    if rem > half || (rem == half && (mant & 1) == 1) { mant = mant + 1; }
-    if biased == 0 { return sign | mant; }
-    if mant >= 16777216 { mant = mant >> 1; biased = biased + 1; }
-    if biased >= 255 { return sign | 0x7f800000; }
+    if rem > half || (rem == half && (mant & 1) == 1) {
+        mant = mant + 1;
+    }
+    if biased == 0 {
+        return sign | mant;
+    }
+    if mant >= 16777216 {
+        mant = mant >> 1;
+        biased = biased + 1;
+    }
+    if biased >= 255 {
+        return sign | 0x7f800000;
+    }
     return sign | (biased << 23) | (mant & 8388607);
 }
 
 /// Decode 4 little-endian IEEE-754 binary32 bytes at `pos` to f64.
-pub fn iec104_get_f32(b: & Vec<i64>, pos: i64) -> f64 {
+pub fn iec104_get_f32(b: &Vec<i64>, pos: i64) -> f64 {
     val s: i64 = b.get(pos) | (b.get(pos + 1) << 8) | (b.get(pos + 2) << 16) | (b.get(pos + 3) << 24);
     return iec104_f32_to_f64(s);
 }
@@ -276,9 +308,13 @@ pub fn iec104_f32_to_f64(s: i64) -> f64 {
     val m: i64 = s & 8388607;
     var v: f64 = 0.0;
     if e == 0 {
-        v = (m as f64) * iec104_pow2(- 149);
+        v = (m as f64) * iec104_pow2(-149);
     } else if e == 255 {
-        if m == 0 { v = 1.0 / 0.0; } else { v = 0.0 / 0.0; }
+        if m == 0 {
+            v = 1.0 / 0.0;
+        } else {
+            v = 0.0 / 0.0;
+        }
     } else {
         v = ((m + 8388608) as f64) * iec104_pow2(e - 150);
     }
@@ -292,10 +328,16 @@ fn iec104_pow2(e: i64) -> f64 {
     var r: f64 = 1.0;
     var i: i64 = 0;
     if e >= 0 {
-        while i < e { r = r * 2.0; i = i + 1; }
+        while i < e {
+            r = r * 2.0;
+            i = i + 1;
+        }
     } else {
-        var n: i64 = - e;
-        while i < n { r = r / 2.0; i = i + 1; }
+        var n: i64 = -e;
+        while i < n {
+            r = r / 2.0;
+            i = i + 1;
+        }
     }
     return r;
 }
@@ -323,18 +365,13 @@ pub struct Cp56Time {
     pub hour: i64,
     pub day: i64,
     pub month: i64,
-    pub year: i64,   // full year (2000 + yy)
+    pub year: i64,  // full year (2000 + yy)
 }
 
-pub fn iec104_cp56_decode(b: & Vec<i64>, pos: i64) -> Cp56Time {
+pub fn iec104_cp56_decode(b: &Vec<i64>, pos: i64) -> Cp56Time {
     val ms: i64 = b.get(pos) | (b.get(pos + 1) << 8);
     return Cp56Time {
-        ms: ms % 1000, second: ms / 1000,
-        minute: b.get(pos + 2) & 63,
-        hour: b.get(pos + 3) & 31,
-        day: b.get(pos + 4) & 31,
-        month: b.get(pos + 5) & 15,
-        year: 2000 + (b.get(pos + 6) & 127),
+        ms: ms % 1000, second: ms / 1000, minute: b.get(pos + 2) & 63, hour: b.get(pos + 3) & 31, day: b.get(pos + 4) & 31, month: b.get(pos + 5) & 15, year: 2000 + (b.get(pos + 6) & 127),
     };
 }
 
@@ -343,9 +380,11 @@ pub fn iec104_cp56_decode(b: & Vec<i64>, pos: i64) -> Cp56Time {
 /// M_SP_NA_1 (1): one single-point object. `value` 0/1, in the SIQ low bit.
 pub fn iec104_sp_na(cot: i64, common_addr: i64, ioa: i64, value: bool) -> Vec<i64> {
     var out: Vec<i64> = iec104_asdu_header(M_SP_NA_1, 1, false, cot, false, false, 0, common_addr);
-    iec104_put_ioa(& mut out, ioa);
+    iec104_put_ioa(&mut out, ioa);
     var siq: i64 = 0;
-    if value { siq = 1; }
+    if value {
+        siq = 1;
+    }
     out.push(siq);
     return out;
 }
@@ -353,20 +392,23 @@ pub fn iec104_sp_na(cot: i64, common_addr: i64, ioa: i64, value: bool) -> Vec<i6
 /// M_ME_NC_1 (13): one short-float measured value with a QDS quality byte.
 pub fn iec104_me_nc(cot: i64, common_addr: i64, ioa: i64, value: f64, quality: i64) -> Vec<i64> {
     var out: Vec<i64> = iec104_asdu_header(M_ME_NC_1, 1, false, cot, false, false, 0, common_addr);
-    iec104_put_ioa(& mut out, ioa);
-    iec104_put_f32(& mut out, value);
+    iec104_put_ioa(&mut out, ioa);
+    iec104_put_f32(&mut out, value);
     out.push(quality & 255);
     return out;
 }
 
 /// M_ME_TF_1 (36): short-float measured value with a CP56Time2a tag.
-pub fn iec104_me_tf(cot: i64, common_addr: i64, ioa: i64, value: f64, quality: i64, time: & Vec<i64>) -> Vec<i64> {
+pub fn iec104_me_tf(cot: i64, common_addr: i64, ioa: i64, value: f64, quality: i64, time: &Vec<i64>) -> Vec<i64> {
     var out: Vec<i64> = iec104_asdu_header(M_ME_TF_1, 1, false, cot, false, false, 0, common_addr);
-    iec104_put_ioa(& mut out, ioa);
-    iec104_put_f32(& mut out, value);
+    iec104_put_ioa(&mut out, ioa);
+    iec104_put_f32(&mut out, value);
     out.push(quality & 255);
     var i: i64 = 0;
-    while i < time.len() { out.push(time.get(i)); i = i + 1; }
+    while i < time.len() {
+        out.push(time.get(i));
+        i = i + 1;
+    }
     return out;
 }
 
@@ -374,11 +416,15 @@ pub fn iec104_me_tf(cot: i64, common_addr: i64, ioa: i64, value: f64, quality: i
 /// `qu` the qualifier of command (0..31).
 pub fn iec104_sc_na(cot: i64, common_addr: i64, ioa: i64, on: bool, select: bool, qu: i64) -> Vec<i64> {
     var out: Vec<i64> = iec104_asdu_header(C_SC_NA_1, 1, false, cot, false, false, 0, common_addr);
-    iec104_put_ioa(& mut out, ioa);
+    iec104_put_ioa(&mut out, ioa);
     var sco: i64 = 0;
-    if on { sco = sco | 1; }
+    if on {
+        sco = sco | 1;
+    }
     sco = sco | ((qu & 31) << 2);
-    if select { sco = sco | 0x80; }
+    if select {
+        sco = sco | 0x80;
+    }
     out.push(sco);
     return out;
 }
@@ -387,7 +433,7 @@ pub fn iec104_sc_na(cot: i64, common_addr: i64, ioa: i64, on: bool, select: bool
 /// interrogation (20 = station interrogation / general).
 pub fn iec104_interrogation(cot: i64, common_addr: i64, qoi: i64) -> Vec<i64> {
     var out: Vec<i64> = iec104_asdu_header(C_IC_NA_1, 1, false, cot, false, false, 0, common_addr);
-    iec104_put_ioa(& mut out, 0);
+    iec104_put_ioa(&mut out, 0);
     out.push(qoi & 255);
     return out;
 }
@@ -399,15 +445,15 @@ pub fn iec104_interrogation(cot: i64, common_addr: i64, qoi: i64) -> Vec<i64> {
 /// sequence (next expected). `unacked_at` holds the send time of each
 /// outstanding I-frame for t1. All times are caller-supplied ticks.
 pub struct Iec104State {
-    pub vs: i64,          // next N(S) to send
-    pub va: i64,          // peer has acked up to this N(S)
-    pub vr: i64,          // next expected N(S) from peer (our N(R))
-    pub k: i64,           // max outstanding I-frames
-    pub w: i64,           // ack after this many received I-frames
+    pub vs: i64,  // next N(S) to send
+    pub va: i64,  // peer has acked up to this N(S)
+    pub vr: i64,  // next expected N(S) from peer (our N(R))
+    pub k: i64,  // max outstanding I-frames
+    pub w: i64,  // ack after this many received I-frames
     pub recv_since_ack: i64,
-    pub t1: i64,          // timeout for a sent I/U frame ack
-    pub t2: i64,          // timeout to send an S-frame ack when idle
-    pub t3: i64,          // timeout to send a TESTFR
+    pub t1: i64,  // timeout for a sent I/U frame ack
+    pub t2: i64,  // timeout to send an S-frame ack when idle
+    pub t3: i64,  // timeout to send a TESTFR
     pub last_send_tick: i64,
     pub last_recv_tick: i64,
     pub oldest_unacked_tick: i64,
@@ -416,19 +462,17 @@ pub struct Iec104State {
 
 pub fn iec104_state_new(k: i64, w: i64, t1: i64, t2: i64, t3: i64) -> Iec104State {
     return Iec104State {
-        vs: 0, va: 0, vr: 0, k: k, w: w, recv_since_ack: 0,
-        t1: t1, t2: t2, t3: t3, last_send_tick: 0, last_recv_tick: 0,
-        oldest_unacked_tick: 0, has_unacked: false,
+        vs: 0, va: 0, vr: 0, k: k, w: w, recv_since_ack: 0, t1: t1, t2: t2, t3: t3, last_send_tick: 0, last_recv_tick: 0, oldest_unacked_tick: 0, has_unacked: false,
     };
 }
 
 /// May we send another I-frame (window not full)?
-pub fn iec104_can_send(s: & Iec104State) -> bool {
+pub fn iec104_can_send(s: &Iec104State) -> bool {
     return ((s.vs - s.va) & 0x7FFF) < s.k;
 }
 
 /// Record that we sent an I-frame at `tick`; returns its N(S).
-pub fn iec104_on_send(s: & mut Iec104State, tick: i64) -> i64 {
+pub fn iec104_on_send(s: &mut Iec104State, tick: i64) -> i64 {
     val ns: i64 = s.vs;
     if !s.has_unacked {
         s.oldest_unacked_tick = tick;
@@ -441,7 +485,7 @@ pub fn iec104_on_send(s: & mut Iec104State, tick: i64) -> i64 {
 
 /// Record that we received an I-frame with sequence `ns` carrying N(R)
 /// `nr`, at `tick`. Returns true if we now owe an S-frame ack (w reached).
-pub fn iec104_on_recv_i(s: & mut Iec104State, ns: i64, nr: i64, tick: i64) -> bool {
+pub fn iec104_on_recv_i(s: &mut Iec104State, ns: i64, nr: i64, tick: i64) -> bool {
     s.vr = (ns + 1) & 0x7FFF;
     s.va = nr;
     if ((s.vs - s.va) & 0x7FFF) == 0 {
@@ -458,12 +502,12 @@ pub fn iec104_on_recv_i(s: & mut Iec104State, ns: i64, nr: i64, tick: i64) -> bo
 }
 
 /// Record that we sent the S-frame ack (clears the received counter).
-pub fn iec104_on_send_ack(s: & mut Iec104State) {
+pub fn iec104_on_send_ack(s: &mut Iec104State) {
     s.recv_since_ack = 0;
 }
 
 /// Record a peer S-frame acking up to N(R).
-pub fn iec104_on_recv_s(s: & mut Iec104State, nr: i64, tick: i64) {
+pub fn iec104_on_recv_s(s: &mut Iec104State, nr: i64, tick: i64) {
     s.va = nr;
     if ((s.vs - s.va) & 0x7FFF) == 0 {
         s.has_unacked = false;
@@ -474,7 +518,7 @@ pub fn iec104_on_recv_s(s: & mut Iec104State, nr: i64, tick: i64) {
 /// Which timer (if any) has expired by `now`: 1 = t1 (a sent frame was not
 /// acked, close the connection), 2 = t2 (send an S-frame ack), 3 = t3 (send
 /// a TESTFR), 0 = none. t1 takes priority, then t2, then t3.
-pub fn iec104_timer_expired(s: & Iec104State, now: i64) -> i64 {
+pub fn iec104_timer_expired(s: &Iec104State, now: i64) -> i64 {
     if s.has_unacked && (now - s.oldest_unacked_tick) >= s.t1 {
         return 1;
     }

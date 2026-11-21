@@ -64,7 +64,9 @@
 // per-OS syscall numbers.
 
 module compiler::runtime;
- use core; use vec; use string;
+use core;
+use vec;
+use string;
 // ==========================================================================
 // Per-arch ABI boundary (provided by the runtime stub object, not this file)
 // ==========================================================================
@@ -90,10 +92,12 @@ extern "C" {
 //   - free==1 means on the free list (next_free links free blocks)
 //   - heap grows by RT_PAGE_CHUNK (64KB) chunks via rt_sys_mmap
 
-const RT_HDR_SIZE: i64 = 24; const RT_ALIGN: i64 = 16; const RT_PAGE_CHUNK: i64 = 65536;
+const RT_HDR_SIZE: i64 = 24;
+const RT_ALIGN: i64 = 16;
+const RT_PAGE_CHUNK: i64 = 65536;
 // Global free-list head (Fides is single-threaded per the opt.fd note).
 var rt_free_head: i64 = 0;
- fn rt_align_up(n: i64, a: i64) -> i64 {
+fn rt_align_up(n: i64, a: i64) -> i64 {
     var r: i64 = n % a;
     if r == 0 {
         return n;
@@ -113,13 +117,13 @@ fn rt_grow_heap(need: i64) -> i64 {
         return 0;
     }
     var hdr: i64 = base;
-    var p_size: * mut i64 = hdr;
-    var p_free: * mut i64 = hdr + 8;
-    var p_next: * mut i64 = hdr + 16;
+    var p_size: *mut i64 = hdr;
+    var p_free: *mut i64 = hdr + 8;
+    var p_next: *mut i64 = hdr + 16;
     unsafe {
-        * p_size = chunk - RT_HDR_SIZE;
-        * p_free = 1;
-        * p_next = rt_free_head;
+        *p_size = chunk - RT_HDR_SIZE;
+        *p_free = 1;
+        *p_next = rt_free_head;
     }
     rt_free_head = hdr;
     return base;
@@ -138,39 +142,39 @@ pub fn p_malloc(size: i64) -> i64 {
         var b_size: i64 = 0;
         var b_free: i64 = 0;
         var b_next: i64 = 0;
-        var sp: * mut i64 = cur;
-        var fp: * mut i64 = cur + 8;
-        var np: * mut i64 = cur + 16;
+        var sp: *mut i64 = cur;
+        var fp: *mut i64 = cur + 8;
+        var np: *mut i64 = cur + 16;
         unsafe {
-            b_size = * sp;
-            b_free = * fp;
-            b_next = * np;
+            b_size = *sp;
+            b_free = *fp;
+            b_next = *np;
         }
         if b_free == 1 && b_size >= need {
             // Split: leave remainder as a new free block if it can hold
             // header + a minimum payload.
             if b_size >= need + RT_HDR_SIZE + RT_ALIGN {
                 var rem: i64 = cur + RT_HDR_SIZE + need;
-                var rs: * mut i64 = rem;
-                var rf: * mut i64 = rem + 8;
-                var rn: * mut i64 = rem + 16;
+                var rs: *mut i64 = rem;
+                var rf: *mut i64 = rem + 8;
+                var rn: *mut i64 = rem + 16;
                 unsafe {
-                    * rs = b_size - need - RT_HDR_SIZE;
-                    * rf = 1;
-                    * rn = b_next;
+                    *rs = b_size - need - RT_HDR_SIZE;
+                    *rf = 1;
+                    *rn = b_next;
                 }
                 unsafe {
-                    * sp = need;
-                    * fp = 0;
-                    * np = rem;
+                    *sp = need;
+                    *fp = 0;
+                    *np = rem;
                 }
                 // unlink `cur`, point its slot-chain at `rem` instead
                 if prev == 0 {
                     rt_free_head = rem;
                 } else {
-                    var pnext: * mut i64 = prev + 16;
+                    var pnext: *mut i64 = prev + 16;
                     unsafe {
-                        * pnext = rem;
+                        *pnext = rem;
                     }
                 }
             } else {
@@ -178,13 +182,13 @@ pub fn p_malloc(size: i64) -> i64 {
                 if prev == 0 {
                     rt_free_head = b_next;
                 } else {
-                    var pnext2: * mut i64 = prev + 16;
+                    var pnext2: *mut i64 = prev + 16;
                     unsafe {
-                        * pnext2 = b_next;
+                        *pnext2 = b_next;
                     }
                 }
                 unsafe {
-                    * fp = 0;
+                    *fp = 0;
                 }
             }
             return cur + RT_HDR_SIZE;
@@ -205,11 +209,11 @@ pub fn p_free(ptr: i64) {
         return;
     }
     var hdr: i64 = ptr - RT_HDR_SIZE;
-    var fp: * mut i64 = hdr + 8;
-    var np: * mut i64 = hdr + 16;
+    var fp: *mut i64 = hdr + 8;
+    var np: *mut i64 = hdr + 16;
     unsafe {
-        * fp = 1;
-        * np = rt_free_head;
+        *fp = 1;
+        *np = rt_free_head;
     }
     rt_free_head = hdr;
     // NOTE: no coalescing yet — adjacent free blocks stay fragmented.
@@ -229,9 +233,9 @@ pub fn p_alloc(size: i64) -> i64 {
 pub fn p_memset(dst: i64, byte: i64, n: i64) -> i64 {
     var i: i64 = 0;
     while i < n {
-        var p: * mut i64 = dst + i;
+        var p: *mut i64 = dst + i;
         unsafe {
-            * p = byte & 0xFF;
+            *p = byte & 0xFF;
         }
         i = i + 1;
     }
@@ -241,10 +245,10 @@ pub fn p_memset(dst: i64, byte: i64, n: i64) -> i64 {
 pub fn p_memcpy(dst: i64, src: i64, n: i64) -> i64 {
     var i: i64 = 0;
     while i < n {
-        var d: * mut i64 = dst + i;
-        var s: * mut i64 = src + i;
+        var d: *mut i64 = dst + i;
+        var s: *mut i64 = src + i;
         unsafe {
-            * d = * s;
+            *d = *s;
         }
         i = i + 1;
     }
@@ -259,13 +263,13 @@ pub fn p_memcpy(dst: i64, src: i64, n: i64) -> i64 {
 // from here was a visibility error under `fid check` (2g.22)
 pub fn rt_str_length(s: i64) -> i64 {
     var n: i64 = 0;
-    var p: * mut i64 = s;
+    var p: *mut i64 = s;
     unsafe {
-        var b: i64 = * p;
+        var b: i64 = *p;
         while b != 0 {
             n = n + 1;
             p = s + n;
-            b = * p;
+            b = *p;
         }
     }
     return n;
@@ -280,20 +284,20 @@ pub fn p_str_concat(a: i64, b: i64) -> i64 {
     }
     p_memcpy(out, a, la);
     p_memcpy(out + la, b, lb);
-    var z: * mut i64 = out + la + lb;
+    var z: *mut i64 = out + la + lb;
     unsafe {
-        * z = 0;
+        *z = 0;
     }
     return out;
 }
 
 pub fn p_str_equal(a: i64, b: i64) -> bool {
     var i: i64 = 0;
-    var pa: * mut i64 = a;
-    var pb: * mut i64 = b;
+    var pa: *mut i64 = a;
+    var pb: *mut i64 = b;
     unsafe {
-        var ba: i64 = * pa;
-        var bb: i64 = * pb;
+        var ba: i64 = *pa;
+        var bb: i64 = *pb;
         while ba != 0 && bb != 0 {
             if ba != bb {
                 return false;
@@ -301,8 +305,8 @@ pub fn p_str_equal(a: i64, b: i64) -> bool {
             i = i + 1;
             pa = a + i;
             pb = b + i;
-            ba = * pa;
-            bb = * pb;
+            ba = *pa;
+            bb = *pb;
         }
         return ba == bb;
     }
@@ -311,11 +315,11 @@ pub fn p_str_equal(a: i64, b: i64) -> bool {
 
 pub fn p_str_compare(a: i64, b: i64) -> i64 {
     var i: i64 = 0;
-    var pa: * mut i64 = a;
-    var pb: * mut i64 = b;
+    var pa: *mut i64 = a;
+    var pb: *mut i64 = b;
     unsafe {
-        var ba: i64 = * pa;
-        var bb: i64 = * pb;
+        var ba: i64 = *pa;
+        var bb: i64 = *pb;
         while ba != 0 && bb != 0 {
             if ba != bb {
                 return ba - bb;
@@ -323,8 +327,8 @@ pub fn p_str_compare(a: i64, b: i64) -> i64 {
             i = i + 1;
             pa = a + i;
             pb = b + i;
-            ba = * pa;
-            bb = * pb;
+            ba = *pa;
+            bb = *pb;
         }
         return ba - bb;
     }
@@ -338,20 +342,20 @@ pub fn p_str_compare(a: i64, b: i64) -> i64 {
 pub fn p_to_str(n: i64) -> i64 {
     if n == 0 {
         var z: i64 = p_str_alloc(1);
-        var zp: * mut i64 = z;
+        var zp: *mut i64 = z;
         unsafe {
-            * zp = 48;
+            *zp = 48;
         }
-        var zn: * mut i64 = z + 1;
+        var zn: *mut i64 = z + 1;
         unsafe {
-            * zn = 0;
+            *zn = 0;
         }
         return z;
     }
     var neg: bool = n < 0;
     var m: i64 = n;
     if neg {
-        m = - n;
+        m = -n;
     }
     // digits (reverse into a 24-byte scratch on the stack? Fides has no
     // VLAs — use a small heap scratch then reverse into place)
@@ -359,9 +363,9 @@ pub fn p_to_str(n: i64) -> i64 {
     var cnt: i64 = 0;
     while m > 0 {
         var d: i64 = m % 10;
-        var dp: * mut i64 = scratch + cnt;
+        var dp: *mut i64 = scratch + cnt;
         unsafe {
-            * dp = 48 + d;
+            *dp = 48 + d;
         }
         cnt = cnt + 1;
         m = m / 10;
@@ -373,18 +377,18 @@ pub fn p_to_str(n: i64) -> i64 {
     var out: i64 = p_str_alloc(out_len);
     var oi: i64 = 0;
     if neg {
-        var mp: * mut i64 = out;
+        var mp: *mut i64 = out;
         unsafe {
-            * mp = 45;
+            *mp = 45;
         }
         oi = 1;
     }
     var ri: i64 = cnt - 1;
     while ri >= 0 {
-        var sp: * mut i64 = scratch + ri;
-        var op: * mut i64 = out + oi;
+        var sp: *mut i64 = scratch + ri;
+        var op: *mut i64 = out + oi;
         unsafe {
-            * op = * sp;
+            *op = *sp;
         }
         oi = oi + 1;
         if ri == 0 {
@@ -392,9 +396,9 @@ pub fn p_to_str(n: i64) -> i64 {
         }
         ri = ri - 1;
     }
-    var zp2: * mut i64 = out + oi;
+    var zp2: *mut i64 = out + oi;
     unsafe {
-        * zp2 = 0;
+        *zp2 = 0;
     }
     p_free(scratch);
     return out;
@@ -402,13 +406,13 @@ pub fn p_to_str(n: i64) -> i64 {
 
 pub fn p_char_to_str(b: i64) -> i64 {
     var out: i64 = p_str_alloc(1);
-    var p: * mut i64 = out;
+    var p: *mut i64 = out;
     unsafe {
-        * p = b & 0xFF;
+        *p = b & 0xFF;
     }
-    var z: * mut i64 = out + 1;
+    var z: *mut i64 = out + 1;
     unsafe {
-        * z = 0;
+        *z = 0;
     }
     return out;
 }
@@ -494,8 +498,14 @@ pub fn p_exit(code: i64) {
 // open flags (Linux): O_RDONLY=0 O_WRONLY=1 O_RDWR=2 O_CREAT=64 O_TRUNC=512
 // mode for O_CREAT: 0644 = 420
 
-const RT_O_RDONLY: i64 = 0; const RT_O_WRONLY: i64 = 1; const RT_O_RDWR: i64 = 2; const RT_O_CREAT: i64 = 64; const RT_O_TRUNC: i64 = 512; const RT_O_APPEND: i64 = 1024; const RT_MODE_644: i64 = 420;
- pub fn p_file_write(path: i64, content: i64) -> i64 {
+const RT_O_RDONLY: i64 = 0;
+const RT_O_WRONLY: i64 = 1;
+const RT_O_RDWR: i64 = 2;
+const RT_O_CREAT: i64 = 64;
+const RT_O_TRUNC: i64 = 512;
+const RT_O_APPEND: i64 = 1024;
+const RT_MODE_644: i64 = 420;
+pub fn p_file_write(path: i64, content: i64) -> i64 {
     var fd: i64 = rt_sys_open(path, RT_O_WRONLY | RT_O_CREAT | RT_O_TRUNC, RT_MODE_644);
     if fd < 0 {
         return fd;
@@ -554,9 +564,9 @@ pub fn p_file_read(path: i64) -> i64 {
     // Wrap the raw buffer in a length header so str_len is O(1).
     var out: i64 = p_str_alloc(total);
     p_memcpy(out, buf, total);
-    var z: * mut i64 = out + total;
+    var z: *mut i64 = out + total;
     unsafe {
-        * z = 0;
+        *z = 0;
     }
     p_free(buf);
     return out;

@@ -176,7 +176,7 @@ fn ThGen_new(bare: bool) -> ThGen {
 // ===========================================================================
 
 /// Where code starts (flash / code RAM)
-fn th_flash_base(g: & ThGen) -> i64 {
+fn th_flash_base(g: &ThGen) -> i64 {
     if g.board == 2 {
         // (the file offset of the code, page-congruent for a loader)
         return 0x100000 + TH_CODE_OFF;
@@ -188,29 +188,29 @@ fn th_flash_base(g: & ThGen) -> i64 {
 /// an overflow leaves the RAM and faults), then .data, then (lm3s6965evb)
 /// the heap up to the RAM's end. mps2-an385 has its heap in the 16 MB of
 /// PSRAM at 0x21000000.
-fn th_ram_base(g: & ThGen) -> i64 {
+fn th_ram_base(g: &ThGen) -> i64 {
     return 0x20000000;
 }
 
-fn th_ram_end(g: & ThGen) -> i64 {
+fn th_ram_end(g: &ThGen) -> i64 {
     if g.board == 1 {
         return 0x20010000;
     }
     return 0x20400000;
 }
 
-fn th_stack_size(g: & ThGen) -> i64 {
+fn th_stack_size(g: &ThGen) -> i64 {
     if g.board == 1 {
         return 0x4000;
     }
     return 0x100000;
 }
 
-fn th_heap_in_psram(g: & ThGen) -> bool {
+fn th_heap_in_psram(g: &ThGen) -> bool {
     return g.board != 1;
 }
 
-fn th_heap_end(g: & ThGen) -> i64 {
+fn th_heap_end(g: &ThGen) -> i64 {
     if g.board == 1 {
         return th_ram_end(g);
     }
@@ -238,171 +238,171 @@ pub fn nat_thumb_board_index(name: str) -> i64 {
 // Emission helpers
 // ===========================================================================
 
-fn th_fix(g: & mut ThGen, label: i64, kind: i64, extra: i64) {
-    g.fixes.push(NatEnc_pos(& g.e));
+fn th_fix(g: &mut ThGen, label: i64, kind: i64, extra: i64) {
+    g.fixes.push(NatEnc_pos(&g.e));
     g.fixes.push(label);
     g.fixes.push(kind);
     g.fixes.push(extra);
 }
 
 /// A 32-bit word in d that holds the address of `label` (+ extra)
-fn th_dword_fix(g: & mut ThGen, label: i64, extra: i64) {
-    g.dfixes.push(NatEnc_pos(& g.d));
+fn th_dword_fix(g: &mut ThGen, label: i64, extra: i64) {
+    g.dfixes.push(NatEnc_pos(&g.d));
     g.dfixes.push(label);
     g.dfixes.push(TH_FIX_ABS32);
     g.dfixes.push(extra);
-    NatEnc_word(& mut g.d, 0);
+    NatEnc_word(&mut g.d, 0);
 }
 
 /// A 32-bit word in the code / read-only data with the address of `label`
-fn th_word_fix(g: & mut ThGen, label: i64, extra: i64) {
+fn th_word_fix(g: &mut ThGen, label: i64, extra: i64) {
     th_fix(g, label, TH_FIX_ABS32, extra);
-    NatEnc_word(& mut g.e, 0);
+    NatEnc_word(&mut g.e, 0);
 }
 
-fn th_new_label(g: & mut ThGen) -> i64 {
-    return NatEnc_label(& mut g.e);
+fn th_new_label(g: &mut ThGen) -> i64 {
+    return NatEnc_label(&mut g.e);
 }
 
-fn th_place(g: & mut ThGen, label: i64) {
-    NatEnc_place(& mut g.e, label);
+fn th_place(g: &mut ThGen, label: i64) {
+    NatEnc_place(&mut g.e, label);
 }
 
 /// A label for a word in RAM (d), placed at d's current position
-fn th_ram_place(g: & mut ThGen, label: i64) {
-    NatEnc_align(& mut g.d, 8);
-    g.e.labels.set(label, NatEnc_pos(& g.d));
+fn th_ram_place(g: &mut ThGen, label: i64) {
+    NatEnc_align(&mut g.d, 8);
+    g.e.labels.set(label, NatEnc_pos(&g.d));
     HashMap_insert_i(g.ram_labels, label, 1);
 }
 
-fn th_bl(g: & mut ThGen, label: i64) {
+fn th_bl(g: &mut ThGen, label: i64) {
     th_fix(g, label, TH_FIX_BL, 0);
-    t2_bl(& mut g.e, 0);
+    t2_bl(&mut g.e, 0);
 }
 
-fn th_b(g: & mut ThGen, label: i64) {
+fn th_b(g: &mut ThGen, label: i64) {
     th_fix(g, label, TH_FIX_B, 0);
-    t2_b(& mut g.e, 0);
+    t2_b(&mut g.e, 0);
 }
 
-fn th_bcc(g: & mut ThGen, cond: i64, label: i64) {
+fn th_bcc(g: &mut ThGen, cond: i64, label: i64) {
     th_fix(g, label, TH_FIX_BCC, cond);
-    t2_bcc(& mut g.e, cond, 4);
+    t2_bcc(&mut g.e, cond, 4);
 }
 
 /// bl label when `cond` holds (b<not cond> over the bl)
-fn th_bl_if(g: & mut ThGen, cond: i64, label: i64) {
-    t2_bcc(& mut g.e, cond ^ 1, 4);
+fn th_bl_if(g: &mut ThGen, cond: i64, label: i64) {
+    t2_bcc(&mut g.e, cond ^ 1, 4);
     th_bl(g, label);
 }
 
 /// r = the address of `label` + extra (movw + movt, patched)
-fn th_addr(g: & mut ThGen, r: i64, label: i64, extra: i64) {
+fn th_addr(g: &mut ThGen, r: i64, label: i64, extra: i64) {
     th_fix(g, label, TH_FIX_MOVW, extra);
-    t2_movw(& mut g.e, r, 0);
-    t2_movt(& mut g.e, r, 0);
+    t2_movw(&mut g.e, r, 0);
+    t2_movt(&mut g.e, r, 0);
 }
 
 /// r = the low 32 bits of v
-fn th_li32(g: & mut ThGen, r: i64, v: i64) {
+fn th_li32(g: &mut ThGen, r: i64, v: i64) {
     var w: i64 = v & 0xFFFFFFFF;
-    t2_movw(& mut g.e, r, w & 0xFFFF);
+    t2_movw(&mut g.e, r, w & 0xFFFF);
     if ((w >> 16) & 0xFFFF) != 0 {
-        t2_movt(& mut g.e, r, (w >> 16) & 0xFFFF);
+        t2_movt(&mut g.e, r, (w >> 16) & 0xFFFF);
     }
 }
 
 /// lo:hi = v
-fn th_li64(g: & mut ThGen, lo: i64, hi: i64, v: i64) {
+fn th_li64(g: &mut ThGen, lo: i64, hi: i64, v: i64) {
     th_li32(g, lo, v);
     th_li32(g, hi, (v >> 32) & 0xFFFFFFFF);
 }
 
-fn th_mov(g: & mut ThGen, d: i64, m: i64) {
+fn th_mov(g: &mut ThGen, d: i64, m: i64) {
     if d != m {
-        t2_mov(& mut g.e, d, m);
+        t2_mov(&mut g.e, d, m);
     }
 }
 
 /// ldr / str of a word at [base + off], any off >= 0 (r12 the address
 /// past 4095)
-fn th_mem(g: & mut ThGen, load: bool, r: i64, base: i64, off: i64) {
+fn th_mem(g: &mut ThGen, load: bool, r: i64, base: i64, off: i64) {
     if off >= 0 && off <= 4095 {
-        t2_ldst(& mut g.e, load, false, r, base, off);
+        t2_ldst(&mut g.e, load, false, r, base, off);
         return;
     }
     th_li32(g, TH_R12, off);
-    t2_dp(& mut g.e, TDP_ADD, false, TH_R12, base, TH_R12, 0, 0);
-    t2_ldst(& mut g.e, load, false, r, TH_R12, 0);
+    t2_dp(&mut g.e, TDP_ADD, false, TH_R12, base, TH_R12, 0, 0);
+    t2_ldst(&mut g.e, load, false, r, TH_R12, 0);
 }
 
 /// r = sp + off
-fn th_sp_addr(g: & mut ThGen, r: i64, off: i64) {
+fn th_sp_addr(g: &mut ThGen, r: i64, off: i64) {
     if off >= 0 && off <= 4095 {
-        t2_addw(& mut g.e, r, TH_SP, off);
+        t2_addw(&mut g.e, r, TH_SP, off);
         return;
     }
     th_li32(g, TH_R12, off);
-    t2_dp(& mut g.e, TDP_ADD, false, r, TH_SP, TH_R12, 0, 0);
+    t2_dp(&mut g.e, TDP_ADD, false, r, TH_SP, TH_R12, 0, 0);
 }
 
-fn th_sp_sub(g: & mut ThGen, n: i64) {
+fn th_sp_sub(g: &mut ThGen, n: i64) {
     if n == 0 {
         return;
     }
     if n <= 4095 {
-        t2_subw(& mut g.e, TH_SP, TH_SP, n);
+        t2_subw(&mut g.e, TH_SP, TH_SP, n);
         return;
     }
     th_li32(g, TH_R12, n);
-    t2_dp(& mut g.e, TDP_SUB, false, TH_SP, TH_SP, TH_R12, 0, 0);
+    t2_dp(&mut g.e, TDP_SUB, false, TH_SP, TH_SP, TH_R12, 0, 0);
 }
 
-fn th_sp_add(g: & mut ThGen, n: i64) {
+fn th_sp_add(g: &mut ThGen, n: i64) {
     if n == 0 {
         return;
     }
     if n <= 4095 {
-        t2_addw(& mut g.e, TH_SP, TH_SP, n);
+        t2_addw(&mut g.e, TH_SP, TH_SP, n);
         return;
     }
     th_li32(g, TH_R12, n);
-    t2_dp(& mut g.e, TDP_ADD, false, TH_SP, TH_SP, TH_R12, 0, 0);
+    t2_dp(&mut g.e, TDP_ADD, false, TH_SP, TH_SP, TH_R12, 0, 0);
 }
 
 /// cmp r, #imm8
-fn th_cmpi(g: & mut ThGen, r: i64, imm: i64) {
-    t2_dpi(& mut g.e, TDP_SUB, true, 15, r, imm);
+fn th_cmpi(g: &mut ThGen, r: i64, imm: i64) {
+    t2_dpi(&mut g.e, TDP_SUB, true, 15, r, imm);
 }
 
 /// lo:hi = -(lo:hi)
-fn th_neg64(g: & mut ThGen, lo: i64, hi: i64) {
-    t2_movw(& mut g.e, TH_R12, 0);
-    t2_dp(& mut g.e, TDP_SUB, true, lo, TH_R12, lo, 0, 0);
-    t2_dp(& mut g.e, TDP_SBC, false, hi, TH_R12, hi, 0, 0);
+fn th_neg64(g: &mut ThGen, lo: i64, hi: i64) {
+    t2_movw(&mut g.e, TH_R12, 0);
+    t2_dp(&mut g.e, TDP_SUB, true, lo, TH_R12, lo, 0, 0);
+    t2_dp(&mut g.e, TDP_SBC, false, hi, TH_R12, hi, 0, 0);
 }
 
 /// dlo:dhi = the low word s extended (TX_*)
-fn th_ext_pair(g: & mut ThGen, kind: i64, dlo: i64, dhi: i64, s: i64) {
+fn th_ext_pair(g: &mut ThGen, kind: i64, dlo: i64, dhi: i64, s: i64) {
     if kind == TX_SB || kind == TX_SH || kind == TX_SW {
         if kind == TX_SB {
-            t2_ext(& mut g.e, 0, dlo, s);
+            t2_ext(&mut g.e, 0, dlo, s);
         } else if kind == TX_SH {
-            t2_ext(& mut g.e, 1, dlo, s);
+            t2_ext(&mut g.e, 1, dlo, s);
         } else {
             th_mov(g, dlo, s);
         }
-        t2_shift_imm(& mut g.e, 2, dhi, dlo, 31);
+        t2_shift_imm(&mut g.e, 2, dhi, dlo, 31);
         return;
     }
     if kind == TX_ZB {
-        t2_ext(& mut g.e, 2, dlo, s);
+        t2_ext(&mut g.e, 2, dlo, s);
     } else if kind == TX_ZH {
-        t2_ext(& mut g.e, 3, dlo, s);
+        t2_ext(&mut g.e, 3, dlo, s);
     } else {
         th_mov(g, dlo, s);
     }
-    t2_movw(& mut g.e, dhi, 0);
+    t2_movw(&mut g.e, dhi, 0);
 }
 
 fn th_narrow_kind(t: IrType) -> i64 {
@@ -435,7 +435,7 @@ fn th_narrow_kind(t: IrType) -> i64 {
 // Values, names, strings, globals
 // ===========================================================================
 
-fn th_slot(g: & ThGen, id: i64) -> i64 {
+fn th_slot(g: &ThGen, id: i64) -> i64 {
     if id < 0 || id >= g.slots.len() {
         return 0 - 1;
     }
@@ -443,11 +443,11 @@ fn th_slot(g: & ThGen, id: i64) -> i64 {
 }
 
 /// lo:hi = value id (0 for a value without a slot, and for id -1)
-fn th_ld(g: & mut ThGen, lo: i64, hi: i64, id: i64) {
+fn th_ld(g: &mut ThGen, lo: i64, hi: i64, id: i64) {
     var off: i64 = th_slot(g, id);
     if off < 0 {
-        t2_movw(& mut g.e, lo, 0);
-        t2_movw(& mut g.e, hi, 0);
+        t2_movw(&mut g.e, lo, 0);
+        t2_movw(&mut g.e, hi, 0);
         return;
     }
     th_mem(g, true, lo, TH_SP, off);
@@ -455,16 +455,16 @@ fn th_ld(g: & mut ThGen, lo: i64, hi: i64, id: i64) {
 }
 
 /// r = the low word of value id
-fn th_ldlo(g: & mut ThGen, r: i64, id: i64) {
+fn th_ldlo(g: &mut ThGen, r: i64, id: i64) {
     var off: i64 = th_slot(g, id);
     if off < 0 {
-        t2_movw(& mut g.e, r, 0);
+        t2_movw(&mut g.e, r, 0);
         return;
     }
     th_mem(g, true, r, TH_SP, off);
 }
 
-fn th_st(g: & mut ThGen, id: i64, lo: i64, hi: i64) {
+fn th_st(g: &mut ThGen, id: i64, lo: i64, hi: i64) {
     var off: i64 = th_slot(g, id);
     if off < 0 {
         return;
@@ -473,40 +473,40 @@ fn th_st(g: & mut ThGen, id: i64, lo: i64, hi: i64) {
     th_mem(g, false, hi, TH_SP, off + 4);
 }
 
-fn th_st_imm(g: & mut ThGen, id: i64, v: i64) {
+fn th_st_imm(g: &mut ThGen, id: i64, v: i64) {
     th_li64(g, 0, 1, v);
     th_st(g, id, 0, 1);
 }
 
-fn th_copy_val(g: & mut ThGen, id: i64, src: i64) {
+fn th_copy_val(g: &mut ThGen, id: i64, src: i64) {
     th_ld(g, 0, 1, src);
     th_st(g, id, 0, 1);
 }
 
 /// Outgoing argument k = value id / an immediate / r0:r1
-fn th_arg_val(g: & mut ThGen, k: i64, id: i64) {
+fn th_arg_val(g: &mut ThGen, k: i64, id: i64) {
     th_ld(g, 0, 1, id);
     th_mem(g, false, 0, TH_SP, 8 * k);
     th_mem(g, false, 1, TH_SP, 8 * k + 4);
 }
 
-fn th_arg_imm(g: & mut ThGen, k: i64, v: i64) {
+fn th_arg_imm(g: &mut ThGen, k: i64, v: i64) {
     th_li64(g, 0, 1, v);
     th_mem(g, false, 0, TH_SP, 8 * k);
     th_mem(g, false, 1, TH_SP, 8 * k + 4);
 }
 
-fn th_arg_r01(g: & mut ThGen, k: i64) {
+fn th_arg_r01(g: &mut ThGen, k: i64) {
     th_mem(g, false, 0, TH_SP, 8 * k);
     th_mem(g, false, 1, TH_SP, 8 * k + 4);
 }
 
-fn th_has_fn(g: & ThGen, name: str) -> bool {
+fn th_has_fn(g: &ThGen, name: str) -> bool {
     return HashMap_contains(g.all_fns, name);
 }
 
 /// The function a call to `name` runs (as nat_ir.fd ng_resolve)
-fn th_resolve(g: & ThGen, name: str) -> str {
+fn th_resolve(g: &ThGen, name: str) -> str {
     var alias: str = pe_runtime_alias(name);
     if alias != name {
         return alias;
@@ -520,7 +520,7 @@ fn th_resolve(g: & ThGen, name: str) -> str {
 
 /// The label of function `name` (queued for compilation), 0 when the
 /// program has no such function and it is not a primitive
-fn th_fn_label(g: & mut ThGen, name: str) -> i64 {
+fn th_fn_label(g: &mut ThGen, name: str) -> i64 {
     if HashMap_contains(g.fn_labels, name) {
         return HashMap_get(g.fn_labels, name);
     }
@@ -533,7 +533,7 @@ fn th_fn_label(g: & mut ThGen, name: str) -> i64 {
     return l;
 }
 
-fn th_prim_label(g: & mut ThGen, name: str) -> i64 {
+fn th_prim_label(g: &mut ThGen, name: str) -> i64 {
     if HashMap_contains(g.fn_labels, name) {
         return HashMap_get(g.fn_labels, name);
     }
@@ -542,7 +542,7 @@ fn th_prim_label(g: & mut ThGen, name: str) -> i64 {
     return l;
 }
 
-fn th_str_label(g: & mut ThGen, s: str) -> i64 {
+fn th_str_label(g: &mut ThGen, s: str) -> i64 {
     if HashMap_contains(g.str_labels, s) {
         return HashMap_get(g.str_labels, s);
     }
@@ -552,7 +552,7 @@ fn th_str_label(g: & mut ThGen, s: str) -> i64 {
     return l;
 }
 
-fn th_glob_label(g: & mut ThGen, name: str) -> i64 {
+fn th_glob_label(g: &mut ThGen, name: str) -> i64 {
     if HashMap_contains(g.glob_labels, name) {
         return HashMap_get(g.glob_labels, name);
     }
@@ -563,7 +563,7 @@ fn th_glob_label(g: & mut ThGen, name: str) -> i64 {
 }
 
 /// The stub that panics with `msg` (emitted after the functions)
-fn th_msg_label(g: & mut ThGen, msg: str) -> i64 {
+fn th_msg_label(g: &mut ThGen, msg: str) -> i64 {
     if HashMap_contains(g.msg_labels, msg) {
         return HashMap_get(g.msg_labels, msg);
     }
@@ -573,7 +573,7 @@ fn th_msg_label(g: & mut ThGen, msg: str) -> i64 {
     return l;
 }
 
-fn th_np_label(g: & mut ThGen, which: i64, line: i64) -> i64 {
+fn th_np_label(g: &mut ThGen, which: i64, line: i64) -> i64 {
     var msg: str = th_np_messages().get(which);
     if line > 0 {
         msg = msg + " at line " + int_to_str(line);
@@ -583,7 +583,7 @@ fn th_np_label(g: & mut ThGen, which: i64, line: i64) -> i64 {
 
 /// What this target does not support, reached in the current function: a
 /// panic when it runs, and a note for the build
-fn th_unsupported(g: & mut ThGen, what: str) {
+fn th_unsupported(g: &mut ThGen, what: str) {
     var key: str = g.cur_name + ": " + what;
     if !HashMap_contains(g.notes_seen, key) {
         HashMap_insert(g.notes_seen, key, 1);
@@ -593,7 +593,7 @@ fn th_unsupported(g: & mut ThGen, what: str) {
 }
 
 /// Call `fname` (a function or a primitive), or the unsupported panic
-fn th_call_or_missing(g: & mut ThGen, fname: str) {
+fn th_call_or_missing(g: &mut ThGen, fname: str) {
     var l: i64 = th_fn_label(g, fname);
     if l == 0 {
         th_unsupported(g, "`" + fname + "`");
@@ -602,7 +602,7 @@ fn th_call_or_missing(g: & mut ThGen, fname: str) {
     th_bl(g, l);
 }
 
-fn th_meta_ty(func: & IrFunction, id: i64) -> IrType {
+fn th_meta_ty(func: &IrFunction, id: i64) -> IrType {
     match IrFunction_get_meta(func, id) {
         OptValueMeta::Some(m) => {
             return m.ty;
@@ -620,7 +620,7 @@ fn th_meta_ty(func: & IrFunction, id: i64) -> IrType {
     return IrType::I64;
 }
 
-fn th_meta_line(func: & IrFunction, id: i64) -> i64 {
+fn th_meta_line(func: &IrFunction, id: i64) -> i64 {
     match IrFunction_get_meta(func, id) {
         OptValueMeta::Some(m) => {
             match m.source_line {
@@ -670,35 +670,35 @@ fn th_log2_exact(n: i64) -> i64 {
 // 64-bit arithmetic on r0:r1 (a) and r2:r3 (b), the result in r0:r1
 // ===========================================================================
 
-fn th_mul64(g: & mut ThGen) {
-    t2_umull(& mut g.e, 4, 5, 0, 2);
-    t2_mla(& mut g.e, 5, 0, 3, 5);
-    t2_mla(& mut g.e, 5, 1, 2, 5);
-    t2_mov(& mut g.e, 0, 4);
-    t2_mov(& mut g.e, 1, 5);
+fn th_mul64(g: &mut ThGen) {
+    t2_umull(&mut g.e, 4, 5, 0, 2);
+    t2_mla(&mut g.e, 5, 0, 3, 5);
+    t2_mla(&mut g.e, 5, 1, 2, 5);
+    t2_mov(&mut g.e, 0, 4);
+    t2_mov(&mut g.e, 1, 5);
 }
 
 /// r0:r1 narrowed to `ty` (nothing for a 64-bit type); a narrow result
 /// that changed panics with `which` when which >= 0
-fn th_narrow(g: & mut ThGen, ty: IrType, which: i64, line: i64) {
+fn th_narrow(g: &mut ThGen, ty: IrType, which: i64, line: i64) {
     var kind: i64 = th_narrow_kind(ty);
     if kind == 0 {
         return;
     }
     th_ext_pair(g, kind, 4, 5, 0);
     if which >= 0 {
-        t2_dp(& mut g.e, TDP_EOR, false, TH_R12, 4, 0, 0, 0);
-        t2_dp(& mut g.e, TDP_EOR, false, 6, 5, 1, 0, 0);
-        t2_dp(& mut g.e, TDP_ORR, true, TH_R12, TH_R12, 6, 0, 0);
+        t2_dp(&mut g.e, TDP_EOR, false, TH_R12, 4, 0, 0, 0);
+        t2_dp(&mut g.e, TDP_EOR, false, 6, 5, 1, 0, 0);
+        t2_dp(&mut g.e, TDP_ORR, true, TH_R12, TH_R12, 6, 0, 0);
         th_bl_if(g, TC_NE, th_np_label(g, which, line));
     }
-    t2_mov(& mut g.e, 0, 4);
-    t2_mov(& mut g.e, 1, 5);
+    t2_mov(&mut g.e, 0, 4);
+    t2_mov(&mut g.e, 1, 5);
 }
 
 /// add (0), sub (1), mul (2) with the overflow checks of nat_ir.fd
 /// ng_gen_checked
-fn th_arith(g: & mut ThGen, kind: i64, ty: IrType, checked: bool) {
+fn th_arith(g: &mut ThGen, kind: i64, ty: IrType, checked: bool) {
     var which: i64 = TP_ADD;
     if kind == 1 {
         which = TP_SUB;
@@ -708,27 +708,27 @@ fn th_arith(g: & mut ThGen, kind: i64, ty: IrType, checked: bool) {
     }
     if checked && ir_type_eq(ty, IrType::I64) {
         if kind == 0 {
-            t2_dp(& mut g.e, TDP_ADD, true, 4, 0, 2, 0, 0);
-            t2_dp(& mut g.e, TDP_ADC, false, 5, 1, 3, 0, 0);
+            t2_dp(&mut g.e, TDP_ADD, true, 4, 0, 2, 0, 0);
+            t2_dp(&mut g.e, TDP_ADC, false, 5, 1, 3, 0, 0);
             // overflow when a and b have one sign and the sum the other
-            t2_dp(& mut g.e, TDP_EOR, false, 6, 1, 5, 0, 0);
-            t2_dp(& mut g.e, TDP_EOR, false, TH_R12, 3, 5, 0, 0);
-            t2_dp(& mut g.e, TDP_AND, false, 6, 6, TH_R12, 0, 0);
+            t2_dp(&mut g.e, TDP_EOR, false, 6, 1, 5, 0, 0);
+            t2_dp(&mut g.e, TDP_EOR, false, TH_R12, 3, 5, 0, 0);
+            t2_dp(&mut g.e, TDP_AND, false, 6, 6, TH_R12, 0, 0);
             th_cmpi(g, 6, 0);
             th_bl_if(g, TC_LT, th_np_label(g, which, 0));
-            t2_mov(& mut g.e, 0, 4);
-            t2_mov(& mut g.e, 1, 5);
+            t2_mov(&mut g.e, 0, 4);
+            t2_mov(&mut g.e, 1, 5);
         } else if kind == 1 {
-            t2_dp(& mut g.e, TDP_SUB, true, 4, 0, 2, 0, 0);
-            t2_dp(& mut g.e, TDP_SBC, false, 5, 1, 3, 0, 0);
+            t2_dp(&mut g.e, TDP_SUB, true, 4, 0, 2, 0, 0);
+            t2_dp(&mut g.e, TDP_SBC, false, 5, 1, 3, 0, 0);
             // overflow when a and b differ in sign and the result's is b's
-            t2_dp(& mut g.e, TDP_EOR, false, 6, 1, 3, 0, 0);
-            t2_dp(& mut g.e, TDP_EOR, false, TH_R12, 1, 5, 0, 0);
-            t2_dp(& mut g.e, TDP_AND, false, 6, 6, TH_R12, 0, 0);
+            t2_dp(&mut g.e, TDP_EOR, false, 6, 1, 3, 0, 0);
+            t2_dp(&mut g.e, TDP_EOR, false, TH_R12, 1, 5, 0, 0);
+            t2_dp(&mut g.e, TDP_AND, false, 6, 6, TH_R12, 0, 0);
             th_cmpi(g, 6, 0);
             th_bl_if(g, TC_LT, th_np_label(g, which, 0));
-            t2_mov(& mut g.e, 0, 4);
-            t2_mov(& mut g.e, 1, 5);
+            t2_mov(&mut g.e, 0, 4);
+            t2_mov(&mut g.e, 1, 5);
         } else {
             th_bl(g, th_prim_label(g, "__th_smul_ovf"));
             th_cmpi(g, 2, 0);
@@ -738,12 +738,12 @@ fn th_arith(g: & mut ThGen, kind: i64, ty: IrType, checked: bool) {
     }
     if checked && ir_type_eq(ty, IrType::U64) {
         if kind == 0 {
-            t2_dp(& mut g.e, TDP_ADD, true, 0, 0, 2, 0, 0);
-            t2_dp(& mut g.e, TDP_ADC, true, 1, 1, 3, 0, 0);
+            t2_dp(&mut g.e, TDP_ADD, true, 0, 0, 2, 0, 0);
+            t2_dp(&mut g.e, TDP_ADC, true, 1, 1, 3, 0, 0);
             th_bl_if(g, TC_CS, th_np_label(g, which, 0));
         } else if kind == 1 {
-            t2_dp(& mut g.e, TDP_SUB, true, 0, 0, 2, 0, 0);
-            t2_dp(& mut g.e, TDP_SBC, true, 1, 1, 3, 0, 0);
+            t2_dp(&mut g.e, TDP_SUB, true, 0, 0, 2, 0, 0);
+            t2_dp(&mut g.e, TDP_SBC, true, 1, 1, 3, 0, 0);
             th_bl_if(g, TC_CC, th_np_label(g, which, 0));
         } else {
             th_bl(g, th_prim_label(g, "__th_umul_ovf"));
@@ -753,11 +753,11 @@ fn th_arith(g: & mut ThGen, kind: i64, ty: IrType, checked: bool) {
         return;
     }
     if kind == 0 {
-        t2_dp(& mut g.e, TDP_ADD, true, 0, 0, 2, 0, 0);
-        t2_dp(& mut g.e, TDP_ADC, false, 1, 1, 3, 0, 0);
+        t2_dp(&mut g.e, TDP_ADD, true, 0, 0, 2, 0, 0);
+        t2_dp(&mut g.e, TDP_ADC, false, 1, 1, 3, 0, 0);
     } else if kind == 1 {
-        t2_dp(& mut g.e, TDP_SUB, true, 0, 0, 2, 0, 0);
-        t2_dp(& mut g.e, TDP_SBC, false, 1, 1, 3, 0, 0);
+        t2_dp(&mut g.e, TDP_SUB, true, 0, 0, 2, 0, 0);
+        t2_dp(&mut g.e, TDP_SBC, false, 1, 1, 3, 0, 0);
     } else {
         th_mul64(g);
     }
@@ -769,9 +769,9 @@ fn th_arith(g: & mut ThGen, kind: i64, ty: IrType, checked: bool) {
 }
 
 /// r0:r1 = a / b or a % b in `ty` (nat_ir.fd ng_gen_divmod's meaning)
-fn th_divmod(g: & mut ThGen, is_mod: bool, ty: IrType, checked: bool, line: i64) {
+fn th_divmod(g: &mut ThGen, is_mod: bool, ty: IrType, checked: bool, line: i64) {
     // division by zero panics, even in @wrapping code
-    t2_dp(& mut g.e, TDP_ORR, true, TH_R12, 2, 3, 0, 0);
+    t2_dp(&mut g.e, TDP_ORR, true, TH_R12, 2, 3, 0, 0);
     if is_mod {
         th_bl_if(g, TC_EQ, th_np_label(g, TP_MOD_ZERO, line));
     } else {
@@ -780,25 +780,25 @@ fn th_divmod(g: & mut ThGen, is_mod: bool, ty: IrType, checked: bool, line: i64)
     if th_is_unsigned(ty) {
         th_bl(g, th_prim_label(g, "__th_udivmod"));
         if is_mod {
-            t2_mov(& mut g.e, 0, 2);
-            t2_mov(& mut g.e, 1, 3);
+            t2_mov(&mut g.e, 0, 2);
+            t2_mov(&mut g.e, 1, 3);
         }
         return;
     }
     var normal: i64 = th_new_label(g);
     var done: i64 = th_new_label(g);
     // b == -1: -a (and a % -1 == 0), without the division
-    t2_dp(& mut g.e, TDP_AND, false, TH_R12, 2, 3, 0, 0);
-    t2_dpi(& mut g.e, TDP_ADD, true, 15, TH_R12, 1);
+    t2_dp(&mut g.e, TDP_AND, false, TH_R12, 2, 3, 0, 0);
+    t2_dpi(&mut g.e, TDP_ADD, true, 15, TH_R12, 1);
     th_bcc(g, TC_NE, normal);
     if is_mod {
-        t2_movw(& mut g.e, 0, 0);
-        t2_movw(& mut g.e, 1, 0);
+        t2_movw(&mut g.e, 0, 0);
+        t2_movw(&mut g.e, 1, 0);
     } else {
         if checked && ir_type_eq(ty, IrType::I64) {
             th_li32(g, TH_R12, 0x80000000);
-            t2_dp(& mut g.e, TDP_EOR, false, TH_R12, 1, TH_R12, 0, 0);
-            t2_dp(& mut g.e, TDP_ORR, true, TH_R12, TH_R12, 0, 0, 0);
+            t2_dp(&mut g.e, TDP_EOR, false, TH_R12, 1, TH_R12, 0, 0);
+            t2_dp(&mut g.e, TDP_ORR, true, TH_R12, TH_R12, 0, 0, 0);
             th_bl_if(g, TC_EQ, th_np_label(g, TP_DIV_OVF, line));
         }
         th_neg64(g, 0, 1);
@@ -807,19 +807,19 @@ fn th_divmod(g: & mut ThGen, is_mod: bool, ty: IrType, checked: bool, line: i64)
     th_place(g, normal);
     th_bl(g, th_prim_label(g, "__th_sdivmod"));
     if is_mod {
-        t2_mov(& mut g.e, 0, 2);
-        t2_mov(& mut g.e, 1, 3);
+        t2_mov(&mut g.e, 0, 2);
+        t2_mov(&mut g.e, 1, 3);
     }
     th_place(g, done);
 }
 
 /// The condition that holds after th_cmp_flags for compare kind (0 eq,
 /// 1 ne, 2 lt, 3 le, 4 gt, 5 ge) of a and b
-fn th_cmp_flags(g: & mut ThGen, kind: i64, unsigned: bool) -> i64 {
+fn th_cmp_flags(g: &mut ThGen, kind: i64, unsigned: bool) -> i64 {
     if kind == 0 || kind == 1 {
-        t2_dp(& mut g.e, TDP_EOR, false, TH_R12, 0, 2, 0, 0);
-        t2_dp(& mut g.e, TDP_EOR, false, 6, 1, 3, 0, 0);
-        t2_dp(& mut g.e, TDP_ORR, true, TH_R12, TH_R12, 6, 0, 0);
+        t2_dp(&mut g.e, TDP_EOR, false, TH_R12, 0, 2, 0, 0);
+        t2_dp(&mut g.e, TDP_EOR, false, 6, 1, 3, 0, 0);
+        t2_dp(&mut g.e, TDP_ORR, true, TH_R12, TH_R12, 6, 0, 0);
         if kind == 0 {
             return TC_EQ;
         }
@@ -829,11 +829,11 @@ fn th_cmp_flags(g: & mut ThGen, kind: i64, unsigned: bool) -> i64 {
     // (signed); a > b and a <= b compare b with a
     var swap: bool = kind == 3 || kind == 4;
     if swap {
-        t2_cmp(& mut g.e, 2, 0);
-        t2_dp(& mut g.e, TDP_SBC, true, TH_R12, 3, 1, 0, 0);
+        t2_cmp(&mut g.e, 2, 0);
+        t2_dp(&mut g.e, TDP_SBC, true, TH_R12, 3, 1, 0, 0);
     } else {
-        t2_cmp(& mut g.e, 0, 2);
-        t2_dp(& mut g.e, TDP_SBC, true, TH_R12, 1, 3, 0, 0);
+        t2_cmp(&mut g.e, 0, 2);
+        t2_dp(&mut g.e, TDP_SBC, true, TH_R12, 1, 3, 0, 0);
     }
     var lt: bool = kind == 2 || kind == 4;
     if unsigned {
@@ -849,15 +849,15 @@ fn th_cmp_flags(g: & mut ThGen, kind: i64, unsigned: bool) -> i64 {
 }
 
 /// r0:r1 = (a <kind> b) as 0 / 1
-fn th_setcc(g: & mut ThGen, kind: i64, unsigned: bool) {
+fn th_setcc(g: &mut ThGen, kind: i64, unsigned: bool) {
     var cond: i64 = th_cmp_flags(g, kind, unsigned);
-    t2_movw(& mut g.e, 0, 1);
-    t2_bcc(& mut g.e, cond, 4);
-    t2_movw(& mut g.e, 0, 0);
-    t2_movw(& mut g.e, 1, 0);
+    t2_movw(&mut g.e, 0, 1);
+    t2_bcc(&mut g.e, cond, 4);
+    t2_movw(&mut g.e, 0, 0);
+    t2_movw(&mut g.e, 1, 0);
 }
 
-fn th_gen_binop(g: & mut ThGen, id: i64, op: BinOp, left: i64, right: i64, ty: IrType, func: & IrFunction) {
+fn th_gen_binop(g: &mut ThGen, id: i64, op: BinOp, left: i64, right: i64, ty: IrType, func: &IrFunction) {
     var lty: IrType = th_meta_ty(func, left);
     var rty: IrType = th_meta_ty(func, right);
     if ir_type_is_float(ty) || ir_type_is_float(lty) {
@@ -892,16 +892,16 @@ fn th_gen_binop(g: & mut ThGen, id: i64, op: BinOp, left: i64, right: i64, ty: I
             th_divmod(g, true, ty, checked, th_meta_line(func, id));
         }
         BinOp::BitAnd => {
-            t2_dp(& mut g.e, TDP_AND, false, 0, 0, 2, 0, 0);
-            t2_dp(& mut g.e, TDP_AND, false, 1, 1, 3, 0, 0);
+            t2_dp(&mut g.e, TDP_AND, false, 0, 0, 2, 0, 0);
+            t2_dp(&mut g.e, TDP_AND, false, 1, 1, 3, 0, 0);
         }
         BinOp::BitOr => {
-            t2_dp(& mut g.e, TDP_ORR, false, 0, 0, 2, 0, 0);
-            t2_dp(& mut g.e, TDP_ORR, false, 1, 1, 3, 0, 0);
+            t2_dp(&mut g.e, TDP_ORR, false, 0, 0, 2, 0, 0);
+            t2_dp(&mut g.e, TDP_ORR, false, 1, 1, 3, 0, 0);
         }
         BinOp::BitXor => {
-            t2_dp(& mut g.e, TDP_EOR, false, 0, 0, 2, 0, 0);
-            t2_dp(& mut g.e, TDP_EOR, false, 1, 1, 3, 0, 0);
+            t2_dp(&mut g.e, TDP_EOR, false, 0, 0, 2, 0, 0);
+            t2_dp(&mut g.e, TDP_EOR, false, 1, 1, 3, 0, 0);
         }
         BinOp::Shl => {
             th_bl(g, th_prim_label(g, "__th_lsl"));
@@ -917,23 +917,23 @@ fn th_gen_binop(g: & mut ThGen, id: i64, op: BinOp, left: i64, right: i64, ty: I
         BinOp::And => {
             // (a != 0) & (b != 0)
             var zero: i64 = th_new_label(g);
-            t2_dp(& mut g.e, TDP_ORR, true, TH_R12, 0, 1, 0, 0);
-            t2_movw(& mut g.e, 0, 0);
+            t2_dp(&mut g.e, TDP_ORR, true, TH_R12, 0, 1, 0, 0);
+            t2_movw(&mut g.e, 0, 0);
             th_bcc(g, TC_EQ, zero);
-            t2_dp(& mut g.e, TDP_ORR, true, TH_R12, 2, 3, 0, 0);
+            t2_dp(&mut g.e, TDP_ORR, true, TH_R12, 2, 3, 0, 0);
             th_bcc(g, TC_EQ, zero);
-            t2_movw(& mut g.e, 0, 1);
+            t2_movw(&mut g.e, 0, 1);
             th_place(g, zero);
-            t2_movw(& mut g.e, 1, 0);
+            t2_movw(&mut g.e, 1, 0);
         }
         BinOp::Or => {
-            t2_dp(& mut g.e, TDP_ORR, false, 0, 0, 1, 0, 0);
-            t2_dp(& mut g.e, TDP_ORR, false, 0, 0, 2, 0, 0);
-            t2_dp(& mut g.e, TDP_ORR, true, 0, 0, 3, 0, 0);
-            t2_movw(& mut g.e, 0, 0);
-            t2_bcc(& mut g.e, TC_EQ, 4);
-            t2_movw(& mut g.e, 0, 1);
-            t2_movw(& mut g.e, 1, 0);
+            t2_dp(&mut g.e, TDP_ORR, false, 0, 0, 1, 0, 0);
+            t2_dp(&mut g.e, TDP_ORR, false, 0, 0, 2, 0, 0);
+            t2_dp(&mut g.e, TDP_ORR, true, 0, 0, 3, 0, 0);
+            t2_movw(&mut g.e, 0, 0);
+            t2_bcc(&mut g.e, TC_EQ, 4);
+            t2_movw(&mut g.e, 0, 1);
+            t2_movw(&mut g.e, 1, 0);
         }
         BinOp::Eq => {
             th_setcc(g, 0, unsigned_cmp);
@@ -961,13 +961,13 @@ fn th_gen_binop(g: & mut ThGen, id: i64, op: BinOp, left: i64, right: i64, ty: I
 // Instructions
 // ===========================================================================
 
-fn th_block_label(g: & ThGen, block: i64) -> i64 {
+fn th_block_label(g: &ThGen, block: i64) -> i64 {
     return HashMap_get(g.block_labels, int_to_str(block));
 }
 
 /// A call of runtime builtin `name` with these values (the runtime's
 /// Fides function takes the environment first)
-fn th_call_builtin(g: & mut ThGen, name: str, vals: Vec<i64>) {
+fn th_call_builtin(g: &mut ThGen, name: str, vals: Vec<i64>) {
     var resolved: str = th_resolve(g, name);
     var k0: i64 = 0;
     if th_has_fn(g, resolved) && !th_has_fn(g, name) {
@@ -984,7 +984,7 @@ fn th_call_builtin(g: & mut ThGen, name: str, vals: Vec<i64>) {
     th_call_or_missing(g, resolved);
 }
 
-fn th_gen_call(g: & mut ThGen, id: i64, call_name: str, args: Vec<i64>, func: & IrFunction) {
+fn th_gen_call(g: &mut ThGen, id: i64, call_name: str, args: Vec<i64>, func: &IrFunction) {
     // an f64 is its bits in a slot
     if (call_name == "p_f64_to_bits" || call_name == "p_f64_from_bits") && args.len() == 1 {
         th_copy_val(g, id, args.get(0));
@@ -1066,7 +1066,7 @@ fn th_gen_call(g: & mut ThGen, id: i64, call_name: str, args: Vec<i64>, func: & 
     th_st(g, id, 0, 1);
 }
 
-fn th_gen_inst(g: & mut ThGen, id: i64, inst: Inst, func: & IrFunction, module: & IrModule) {
+fn th_gen_inst(g: &mut ThGen, id: i64, inst: Inst, func: &IrFunction, module: &IrModule) {
     match inst {
         Inst::ConstInt(value, _) => {
             th_st_imm(g, id, value);
@@ -1087,7 +1087,7 @@ fn th_gen_inst(g: & mut ThGen, id: i64, inst: Inst, func: & IrFunction, module: 
         }
         Inst::ConstStr(value) => {
             th_addr(g, 0, th_str_label(g, value), 0);
-            t2_movw(& mut g.e, 1, 0);
+            t2_movw(&mut g.e, 1, 0);
             th_st(g, id, 0, 1);
         }
         Inst::ConstFnRef(name) => {
@@ -1097,7 +1097,7 @@ fn th_gen_inst(g: & mut ThGen, id: i64, inst: Inst, func: & IrFunction, module: 
             } else {
                 // a Thumb address: bit 0 set
                 th_addr(g, 0, fl, 1);
-                t2_movw(& mut g.e, 1, 0);
+                t2_movw(&mut g.e, 1, 0);
                 th_st(g, id, 0, 1);
             }
         }
@@ -1106,7 +1106,7 @@ fn th_gen_inst(g: & mut ThGen, id: i64, inst: Inst, func: & IrFunction, module: 
         }
         Inst::GlobalAddr(name, _) => {
             th_addr(g, 0, th_glob_label(g, name), 0);
-            t2_movw(& mut g.e, 1, 0);
+            t2_movw(&mut g.e, 1, 0);
             th_st(g, id, 0, 1);
         }
         Inst::BinOp(op, left, right, ty) => {
@@ -1118,20 +1118,20 @@ fn th_gen_inst(g: & mut ThGen, id: i64, inst: Inst, func: & IrFunction, module: 
                 UnaryOp::Neg => {
                     if ir_type_eq(ty, IrType::F32) {
                         th_li32(g, TH_R12, 0x80000000);
-                        t2_dp(& mut g.e, TDP_EOR, false, 0, 0, TH_R12, 0, 0);
+                        t2_dp(&mut g.e, TDP_EOR, false, 0, 0, TH_R12, 0, 0);
                     } else if ir_type_is_float(ty) {
                         th_li32(g, TH_R12, 0x80000000);
-                        t2_dp(& mut g.e, TDP_EOR, false, 1, 1, TH_R12, 0, 0);
+                        t2_dp(&mut g.e, TDP_EOR, false, 1, 1, TH_R12, 0, 0);
                     } else {
                         th_neg64(g, 0, 1);
                     }
                 }
                 UnaryOp::Not => {
-                    t2_dpi(& mut g.e, TDP_EOR, false, 0, 0, 1);
+                    t2_dpi(&mut g.e, TDP_EOR, false, 0, 0, 1);
                 }
                 UnaryOp::BitNot => {
-                    t2_dp(& mut g.e, TDP_ORN, false, 0, 15, 0, 0, 0);
-                    t2_dp(& mut g.e, TDP_ORN, false, 1, 15, 1, 0, 0);
+                    t2_dp(&mut g.e, TDP_ORN, false, 0, 15, 0, 0, 0);
+                    t2_dp(&mut g.e, TDP_ORN, false, 1, 15, 1, 0, 0);
                 }
             }
             th_st(g, id, 0, 1);
@@ -1143,7 +1143,7 @@ fn th_gen_inst(g: & mut ThGen, id: i64, inst: Inst, func: & IrFunction, module: 
             }
             if data >= 0 {
                 th_sp_addr(g, 0, data);
-                t2_movw(& mut g.e, 1, 0);
+                t2_movw(&mut g.e, 1, 0);
                 th_st(g, id, 0, 1);
             }
         }
@@ -1169,30 +1169,30 @@ fn th_gen_inst(g: & mut ThGen, id: i64, inst: Inst, func: & IrFunction, module: 
             th_ldlo(g, 2, ptr);
             if size <= 1 {
                 if unsigned {
-                    t2_ldst(& mut g.e, true, true, 0, 2, 0);
-                    t2_movw(& mut g.e, 1, 0);
+                    t2_ldst(&mut g.e, true, true, 0, 2, 0);
+                    t2_movw(&mut g.e, 1, 0);
                 } else {
-                    t2_ldst_x(& mut g.e, 2, 0, 2, 0);
-                    t2_shift_imm(& mut g.e, 2, 1, 0, 31);
+                    t2_ldst_x(&mut g.e, 2, 0, 2, 0);
+                    t2_shift_imm(&mut g.e, 2, 1, 0, 31);
                 }
             } else if size == 2 {
                 if unsigned {
-                    t2_ldst_x(& mut g.e, 1, 0, 2, 0);
-                    t2_movw(& mut g.e, 1, 0);
+                    t2_ldst_x(&mut g.e, 1, 0, 2, 0);
+                    t2_movw(&mut g.e, 1, 0);
                 } else {
-                    t2_ldst_x(& mut g.e, 3, 0, 2, 0);
-                    t2_shift_imm(& mut g.e, 2, 1, 0, 31);
+                    t2_ldst_x(&mut g.e, 3, 0, 2, 0);
+                    t2_shift_imm(&mut g.e, 2, 1, 0, 31);
                 }
             } else if size == 4 {
-                t2_ldst(& mut g.e, true, false, 0, 2, 0);
+                t2_ldst(&mut g.e, true, false, 0, 2, 0);
                 if unsigned {
-                    t2_movw(& mut g.e, 1, 0);
+                    t2_movw(&mut g.e, 1, 0);
                 } else {
-                    t2_shift_imm(& mut g.e, 2, 1, 0, 31);
+                    t2_shift_imm(&mut g.e, 2, 1, 0, 31);
                 }
             } else {
-                t2_ldst(& mut g.e, true, false, 0, 2, 0);
-                t2_ldst(& mut g.e, true, false, 1, 2, 4);
+                t2_ldst(&mut g.e, true, false, 0, 2, 0);
+                t2_ldst(&mut g.e, true, false, 1, 2, 4);
             }
             th_st(g, id, 0, 1);
         }
@@ -1246,8 +1246,8 @@ fn th_gen_inst(g: & mut ThGen, id: i64, inst: Inst, func: & IrFunction, module: 
             }
             if is_struct {
                 // copy the struct: r0 dst, r1 src, r2 bytes
-                t2_mov(& mut g.e, 1, 0);
-                t2_mov(& mut g.e, 0, 2);
+                t2_mov(&mut g.e, 1, 0);
+                t2_mov(&mut g.e, 0, 2);
                 th_li32(g, 2, IrModule_type_size(module, store_ty));
                 th_bl(g, th_prim_label(g, "__th_copy"));
             } else {
@@ -1256,14 +1256,14 @@ fn th_gen_inst(g: & mut ThGen, id: i64, inst: Inst, func: & IrFunction, module: 
                     sz = IrModule_type_size(module, store_ty);
                 }
                 if sz == 1 {
-                    t2_ldst(& mut g.e, false, true, 0, 2, 0);
+                    t2_ldst(&mut g.e, false, true, 0, 2, 0);
                 } else if sz == 2 {
-                    t2_ldst_x(& mut g.e, 0, 0, 2, 0);
+                    t2_ldst_x(&mut g.e, 0, 0, 2, 0);
                 } else if sz == 4 {
-                    t2_ldst(& mut g.e, false, false, 0, 2, 0);
+                    t2_ldst(&mut g.e, false, false, 0, 2, 0);
                 } else {
-                    t2_ldst(& mut g.e, false, false, 0, 2, 0);
-                    t2_ldst(& mut g.e, false, false, 1, 2, 4);
+                    t2_ldst(&mut g.e, false, false, 0, 2, 0);
+                    t2_ldst(&mut g.e, false, false, 1, 2, 4);
                 }
             }
         }
@@ -1306,9 +1306,9 @@ fn th_gen_inst(g: & mut ThGen, id: i64, inst: Inst, func: & IrFunction, module: 
             th_ld(g, 0, 1, struct_ptr);
             if offset != 0 {
                 th_li32(g, TH_R12, offset);
-                t2_dp(& mut g.e, TDP_ADD, true, 0, 0, TH_R12, 0, 0);
+                t2_dp(&mut g.e, TDP_ADD, true, 0, 0, TH_R12, 0, 0);
                 th_li32(g, TH_R12, (offset >> 32) & 0xFFFFFFFF);
-                t2_dp(& mut g.e, TDP_ADC, false, 1, 1, TH_R12, 0, 0);
+                t2_dp(&mut g.e, TDP_ADC, false, 1, 1, TH_R12, 0, 0);
             }
             th_st(g, id, 0, 1);
         }
@@ -1321,20 +1321,20 @@ fn th_gen_inst(g: & mut ThGen, id: i64, inst: Inst, func: & IrFunction, module: 
             var esh: i64 = th_log2_exact(esize);
             if esh >= 1 && esh <= 31 {
                 // r2:r3 <<= esh
-                t2_shift_imm(& mut g.e, 0, 3, 3, esh);
-                t2_dp(& mut g.e, TDP_ORR, false, 3, 3, 2, 1, 32 - esh);
-                t2_shift_imm(& mut g.e, 0, 2, 2, esh);
+                t2_shift_imm(&mut g.e, 0, 3, 3, esh);
+                t2_dp(&mut g.e, TDP_ORR, false, 3, 3, 2, 1, 32 - esh);
+                t2_shift_imm(&mut g.e, 0, 2, 2, esh);
             } else if esh != 0 {
-                t2_mov(& mut g.e, 0, 2);
-                t2_mov(& mut g.e, 1, 3);
+                t2_mov(&mut g.e, 0, 2);
+                t2_mov(&mut g.e, 1, 3);
                 th_li64(g, 2, 3, esize);
                 th_mul64(g);
-                t2_mov(& mut g.e, 2, 0);
-                t2_mov(& mut g.e, 3, 1);
+                t2_mov(&mut g.e, 2, 0);
+                t2_mov(&mut g.e, 3, 1);
             }
             th_ld(g, 0, 1, array_ptr);
-            t2_dp(& mut g.e, TDP_ADD, true, 0, 0, 2, 0, 0);
-            t2_dp(& mut g.e, TDP_ADC, false, 1, 1, 3, 0, 0);
+            t2_dp(&mut g.e, TDP_ADD, true, 0, 0, 2, 0, 0);
+            t2_dp(&mut g.e, TDP_ADC, false, 1, 1, 3, 0, 0);
             th_st(g, id, 0, 1);
         }
         Inst::Jump(target) => {
@@ -1348,9 +1348,9 @@ fn th_gen_inst(g: & mut ThGen, id: i64, inst: Inst, func: & IrFunction, module: 
             var ki: i64 = 0;
             while ki < sw_keys.len() && ki < sw_targets.len() {
                 th_li64(g, 2, 3, sw_keys.get(ki));
-                t2_dp(& mut g.e, TDP_EOR, false, TH_R12, 0, 2, 0, 0);
-                t2_dp(& mut g.e, TDP_EOR, false, 6, 1, 3, 0, 0);
-                t2_dp(& mut g.e, TDP_ORR, true, TH_R12, TH_R12, 6, 0, 0);
+                t2_dp(&mut g.e, TDP_EOR, false, TH_R12, 0, 2, 0, 0);
+                t2_dp(&mut g.e, TDP_EOR, false, 6, 1, 3, 0, 0);
+                t2_dp(&mut g.e, TDP_ORR, true, TH_R12, TH_R12, 6, 0, 0);
                 th_bcc(g, TC_EQ, th_block_label(g, sw_targets.get(ki)));
                 ki = ki + 1;
             }
@@ -1363,7 +1363,7 @@ fn th_gen_inst(g: & mut ThGen, id: i64, inst: Inst, func: & IrFunction, module: 
             var tl: i64 = th_block_label(g, then);
             var el: i64 = th_block_label(g, else_);
             th_ld(g, 0, 1, cond);
-            t2_dp(& mut g.e, TDP_ORR, true, TH_R12, 0, 1, 0, 0);
+            t2_dp(&mut g.e, TDP_ORR, true, TH_R12, 0, 1, 0, 0);
             if tl == g.next_block_label {
                 th_bcc(g, TC_EQ, el);
             } else {
@@ -1379,14 +1379,14 @@ fn th_gen_inst(g: & mut ThGen, id: i64, inst: Inst, func: & IrFunction, module: 
                     th_ld(g, 0, 1, v);
                 }
                 OptValueId::None => {
-                    t2_movw(& mut g.e, 0, 0);
-                    t2_movw(& mut g.e, 1, 0);
+                    t2_movw(&mut g.e, 0, 0);
+                    t2_movw(&mut g.e, 1, 0);
                 }
             }
             th_b(g, g.epi);
         }
         Inst::Unreachable => {
-            t_udf(& mut g.e);
+            t_udf(&mut g.e);
         }
         Inst::Call(call_name, args, _, _) => {
             th_gen_call(g, id, call_name, args, func);
@@ -1400,8 +1400,8 @@ fn th_gen_inst(g: & mut ThGen, id: i64, inst: Inst, func: & IrFunction, module: 
                 ai = ai + 1;
             }
             th_ldlo(g, TH_R12, fn_ptr);
-            t2_ldst(& mut g.e, true, false, TH_R12, TH_R12, 0);
-            t_blx(& mut g.e, TH_R12);
+            t2_ldst(&mut g.e, true, false, TH_R12, TH_R12, 0);
+            t_blx(&mut g.e, TH_R12);
             th_st(g, id, 0, 1);
         }
         Inst::DynCall(_, method, args, _, _) => {
@@ -1413,12 +1413,12 @@ fn th_gen_inst(g: & mut ThGen, id: i64, inst: Inst, func: & IrFunction, module: 
                 th_arg_val(g, ai + 1, args.get(ai));
                 ai = ai + 1;
             }
-            t2_movw(& mut g.e, 4, 0);
+            t2_movw(&mut g.e, 4, 0);
             if args.len() > 0 {
                 th_ldlo(g, 2, args.get(0));
-                t2_ldst(& mut g.e, true, false, 4, 2, 0);
-                t2_ldst(& mut g.e, true, false, 0, 2, 8);
-                t2_ldst(& mut g.e, true, false, 1, 2, 12);
+                t2_ldst(&mut g.e, true, false, 4, 2, 0);
+                t2_ldst(&mut g.e, true, false, 0, 2, 8);
+                t2_ldst(&mut g.e, true, false, 1, 2, 12);
                 th_arg_r01(g, 1);
             }
             var done: i64 = th_new_label(g);
@@ -1428,7 +1428,7 @@ fn th_gen_inst(g: & mut ThGen, id: i64, inst: Inst, func: & IrFunction, module: 
                 if th_has_fn(g, mname) {
                     var next: i64 = th_new_label(g);
                     th_li32(g, TH_R12, ti + 1);
-                    t2_cmp(& mut g.e, 4, TH_R12);
+                    t2_cmp(&mut g.e, 4, TH_R12);
                     th_bcc(g, TC_NE, next);
                     th_bl(g, th_fn_label(g, mname));
                     th_b(g, done);
@@ -1437,7 +1437,7 @@ fn th_gen_inst(g: & mut ThGen, id: i64, inst: Inst, func: & IrFunction, module: 
                 ti = ti + 1;
             }
             // no implementation for this type
-            t_udf(& mut g.e);
+            t_udf(&mut g.e);
             th_place(g, done);
             th_st(g, id, 0, 1);
         }
@@ -1452,7 +1452,7 @@ fn th_gen_inst(g: & mut ThGen, id: i64, inst: Inst, func: & IrFunction, module: 
                 th_arg_imm(g, 0, 0);
             }
             th_call_or_missing(g, resolved);
-            t2_mov(& mut g.e, 4, 0);
+            t2_mov(&mut g.e, 4, 0);
             var tid: i64 = 0;
             var ti2: i64 = 0;
             while ti2 < g.dyn_types.len() {
@@ -1462,14 +1462,14 @@ fn th_gen_inst(g: & mut ThGen, id: i64, inst: Inst, func: & IrFunction, module: 
                 ti2 = ti2 + 1;
             }
             th_li32(g, 2, tid);
-            t2_movw(& mut g.e, 3, 0);
-            t2_ldst(& mut g.e, false, false, 2, 4, 0);
-            t2_ldst(& mut g.e, false, false, 3, 4, 4);
+            t2_movw(&mut g.e, 3, 0);
+            t2_ldst(&mut g.e, false, false, 2, 4, 0);
+            t2_ldst(&mut g.e, false, false, 3, 4, 4);
             th_ld(g, 0, 1, value);
-            t2_ldst(& mut g.e, false, false, 0, 4, 8);
-            t2_ldst(& mut g.e, false, false, 1, 4, 12);
-            t2_mov(& mut g.e, 0, 4);
-            t2_movw(& mut g.e, 1, 0);
+            t2_ldst(&mut g.e, false, false, 0, 4, 8);
+            t2_ldst(&mut g.e, false, false, 1, 4, 12);
+            t2_mov(&mut g.e, 0, 4);
+            t2_movw(&mut g.e, 1, 0);
             th_st(g, id, 0, 1);
         }
         Inst::BitCast(value, bc_from, bc_to) => {
@@ -1591,13 +1591,13 @@ fn th_gen_inst(g: & mut ThGen, id: i64, inst: Inst, func: & IrFunction, module: 
                 k0 = 1;
             }
             th_addr(g, 0, th_str_label(g, message), 0);
-            t2_movw(& mut g.e, 1, 0);
+            t2_movw(&mut g.e, 1, 0);
             th_arg_r01(g, k0);
             if k0 == 1 {
                 th_arg_imm(g, 0, 0);
             }
             th_call_or_missing(g, resolved);
-            t_udf(& mut g.e);
+            t_udf(&mut g.e);
         }
         Inst::PersistLoad(_, default, _) => {
             th_copy_val(g, id, default);
@@ -1646,11 +1646,11 @@ fn th_note_id(maxid: i64, id: i64) -> i64 {
     return maxid;
 }
 
-fn th_gen_function(g: & mut ThGen, name: str, func: & IrFunction, module: & IrModule) {
+fn th_gen_function(g: &mut ThGen, name: str, func: &IrFunction, module: &IrModule) {
     g.cur_name = name;
     g.wrapping = func.is_wrapping || is_pe_runtime_fn(name);
     g.n_fns = g.n_fns + 1;
-    NatEnc_align(& mut g.e, 4);
+    NatEnc_align(&mut g.e, 4);
     th_place(g, HashMap_get(g.fn_labels, name));
 
     var maxid: i64 = 0;
@@ -1759,7 +1759,7 @@ fn th_gen_function(g: & mut ThGen, name: str, func: & IrFunction, module: & IrMo
     g.frame = frame;
     g.epi = th_new_label(g);
 
-    t2_push(& mut g.e, TH_SAVE_MASK);
+    t2_push(&mut g.e, TH_SAVE_MASK);
     th_sp_sub(g, frame);
 
     g.block_labels = HashMap_new();
@@ -1791,26 +1791,26 @@ fn th_gen_function(g: & mut ThGen, name: str, func: & IrFunction, module: & IrMo
         bi = bi + 1;
     }
     // falling off the end returns 0
-    t2_movw(& mut g.e, 0, 0);
-    t2_movw(& mut g.e, 1, 0);
+    t2_movw(&mut g.e, 0, 0);
+    t2_movw(&mut g.e, 1, 0);
     th_place(g, g.epi);
     th_sp_add(g, frame);
-    t2_pop(& mut g.e, TH_RESTORE_MASK);
+    t2_pop(&mut g.e, TH_RESTORE_MASK);
 }
 
 // ===========================================================================
 // Primitives and helper routines
 // ===========================================================================
 
-fn th_prim(g: & mut ThGen, name: str) {
-    NatEnc_align(& mut g.e, 4);
+fn th_prim(g: &mut ThGen, name: str) {
+    NatEnc_align(&mut g.e, 4);
     th_place(g, th_prim_label(g, name));
 }
 
 /// r0:r1 = v; bx lr
-fn th_ret_imm(g: & mut ThGen, v: i64) {
+fn th_ret_imm(g: &mut ThGen, v: i64) {
     th_li64(g, 0, 1, v);
-    t_bx(& mut g.e, TH_LR);
+    t_bx(&mut g.e, TH_LR);
 }
 
 /// The generic (asm-generic/unistd.h) system call numbers the runtime
@@ -1945,9 +1945,9 @@ fn th_linux_sysmap() -> Vec<i64> {
 
 /// nat_syscall(n, a, b, c, d, e, f) over Linux (svc 0, the number in r7);
 /// a result in [-4095, -1] is an error, any other a 32-bit unsigned value
-fn th_prim_syscall_linux(g: & mut ThGen) {
+fn th_prim_syscall_linux(g: &mut ThGen) {
     th_prim(g, "nat_syscall");
-    t2_push(& mut g.e, TH_SAVE_MASK);
+    t2_push(&mut g.e, TH_SAVE_MASK);
     th_mem(g, true, TH_R12, TH_SP, TH_SAVED);
     var call: i64 = th_new_label(g);
     var map: Vec<i64> = th_linux_sysmap();
@@ -1955,13 +1955,13 @@ fn th_prim_syscall_linux(g: & mut ThGen) {
     while i + 1 < map.len() {
         th_li32(g, 7, map.get(i + 1));
         th_li32(g, 0, map.get(i));
-        t2_cmp(& mut g.e, TH_R12, 0);
+        t2_cmp(&mut g.e, TH_R12, 0);
         th_bcc(g, TC_EQ, call);
         i = i + 2;
     }
     // not one this target maps: -ENOSYS
     th_li64(g, 0, 1, 0 - 38);
-    t2_pop(& mut g.e, TH_RESTORE_MASK);
+    t2_pop(&mut g.e, TH_RESTORE_MASK);
     th_place(g, call);
     var k: i64 = 0;
     while k < 6 {
@@ -1969,32 +1969,32 @@ fn th_prim_syscall_linux(g: & mut ThGen) {
         th_mem(g, true, k, TH_SP, TH_SAVED + 8 + 8 * k);
         k = k + 1;
     }
-    t_svc(& mut g.e, 0);
+    t_svc(&mut g.e, 0);
     var done: i64 = th_new_label(g);
-    t2_movw(& mut g.e, 1, 0);
+    t2_movw(&mut g.e, 1, 0);
     th_li32(g, TH_R12, 0xFFFFF001);
-    t2_cmp(& mut g.e, 0, TH_R12);
+    t2_cmp(&mut g.e, 0, TH_R12);
     th_bcc(g, TC_CC, done);
     th_li32(g, 1, 0xFFFFFFFF);
     th_place(g, done);
-    t2_pop(& mut g.e, TH_RESTORE_MASK);
+    t2_pop(&mut g.e, TH_RESTORE_MASK);
 }
 
 /// r0 = the byte to send on the UART (clobbers r2, r3)
-fn th_prim_putc(g: & mut ThGen) {
+fn th_prim_putc(g: &mut ThGen) {
     th_prim(g, "__th_putc");
     if g.board == 2 {
         // write(1, &byte, 1) (clobbers r0-r2)
-        t2_push(& mut g.e, (1 << 7) | (1 << 14));
-        t2_subw(& mut g.e, TH_SP, TH_SP, 8);
-        t2_ldst(& mut g.e, false, true, 0, TH_SP, 0);
-        t2_movw(& mut g.e, 0, 1);
-        t_mov(& mut g.e, 1, TH_SP);
-        t2_movw(& mut g.e, 2, 1);
-        t2_movw(& mut g.e, 7, 4);
-        t_svc(& mut g.e, 0);
-        t2_addw(& mut g.e, TH_SP, TH_SP, 8);
-        t2_pop(& mut g.e, (1 << 7) | (1 << 15));
+        t2_push(&mut g.e, (1 << 7) | (1 << 14));
+        t2_subw(&mut g.e, TH_SP, TH_SP, 8);
+        t2_ldst(&mut g.e, false, true, 0, TH_SP, 0);
+        t2_movw(&mut g.e, 0, 1);
+        t_mov(&mut g.e, 1, TH_SP);
+        t2_movw(&mut g.e, 2, 1);
+        t2_movw(&mut g.e, 7, 4);
+        t_svc(&mut g.e, 0);
+        t2_addw(&mut g.e, TH_SP, TH_SP, 8);
+        t2_pop(&mut g.e, (1 << 7) | (1 << 15));
         return;
     }
     var wait: i64 = th_new_label(g);
@@ -2002,52 +2002,52 @@ fn th_prim_putc(g: & mut ThGen) {
         // PL011 (Stellaris UART0): wait while the FIFO is full (FR.TXFF)
         th_li32(g, 2, 0x4000C000);
         th_place(g, wait);
-        t2_ldst(& mut g.e, true, false, 3, 2, 0x18);
-        t2_dpi(& mut g.e, TDP_AND, true, 15, 3, 0x20);
+        t2_ldst(&mut g.e, true, false, 3, 2, 0x18);
+        t2_dpi(&mut g.e, TDP_AND, true, 15, 3, 0x20);
         th_bcc(g, TC_NE, wait);
     } else {
         // CMSDK APB UART0: wait while STATE.TXFULL
         th_li32(g, 2, 0x40004000);
         th_place(g, wait);
-        t2_ldst(& mut g.e, true, false, 3, 2, 4);
-        t2_dpi(& mut g.e, TDP_AND, true, 15, 3, 1);
+        t2_ldst(&mut g.e, true, false, 3, 2, 4);
+        t2_dpi(&mut g.e, TDP_AND, true, 15, 3, 1);
         th_bcc(g, TC_NE, wait);
     }
-    t2_ldst(& mut g.e, false, false, 0, 2, 0);
-    t_bx(& mut g.e, TH_LR);
+    t2_ldst(&mut g.e, false, false, 0, 2, 0);
+    t_bx(&mut g.e, TH_LR);
 }
 
 /// Exit with code r4 through semihosting: SYS_EXIT_EXTENDED (0x20) with
 /// [ADP_Stopped_ApplicationExit, code], then SYS_EXIT (0x18) for an older
 /// host (the code is lost there), then wait forever
-fn th_prim_exit(g: & mut ThGen) {
+fn th_prim_exit(g: &mut ThGen) {
     th_prim(g, "__th_exit");
     if g.board == 2 {
-        t2_mov(& mut g.e, 0, 4);
-        t2_movw(& mut g.e, 7, 248);
-        t_svc(& mut g.e, 0);
-        t_udf(& mut g.e);
+        t2_mov(&mut g.e, 0, 4);
+        t2_movw(&mut g.e, 7, 248);
+        t_svc(&mut g.e, 0);
+        t_udf(&mut g.e);
         return;
     }
-    t2_subw(& mut g.e, TH_SP, TH_SP, 8);
+    t2_subw(&mut g.e, TH_SP, TH_SP, 8);
     th_li32(g, 0, 0x20026);
-    t2_ldst(& mut g.e, false, false, 0, TH_SP, 0);
-    t2_ldst(& mut g.e, false, false, 4, TH_SP, 4);
-    t_mov(& mut g.e, 1, TH_SP);
-    t2_movw(& mut g.e, 0, 0x20);
-    t_bkpt(& mut g.e, 0xAB);
-    t2_movw(& mut g.e, 0, 0x18);
+    t2_ldst(&mut g.e, false, false, 0, TH_SP, 0);
+    t2_ldst(&mut g.e, false, false, 4, TH_SP, 4);
+    t_mov(&mut g.e, 1, TH_SP);
+    t2_movw(&mut g.e, 0, 0x20);
+    t_bkpt(&mut g.e, 0xAB);
+    t2_movw(&mut g.e, 0, 0x18);
     th_li32(g, 1, 0x20026);
-    t_bkpt(& mut g.e, 0xAB);
+    t_bkpt(&mut g.e, 0xAB);
     var hang: i64 = th_new_label(g);
     th_place(g, hang);
     th_b(g, hang);
 }
 
 /// nat_syscall with no OS: the calls the runtime needs, on the board
-fn th_prim_syscall_bare(g: & mut ThGen) {
+fn th_prim_syscall_bare(g: &mut ThGen) {
     th_prim(g, "nat_syscall");
-    t2_push(& mut g.e, TH_SAVE_MASK);
+    t2_push(&mut g.e, TH_SAVE_MASK);
     th_mem(g, true, TH_R12, TH_SP, TH_SAVED);
     var w_write: i64 = th_new_label(g);
     var w_exit: i64 = th_new_label(g);
@@ -2092,48 +2092,48 @@ fn th_prim_syscall_bare(g: & mut ThGen) {
     var i: i64 = 0;
     while i + 1 < cases.len() {
         th_li32(g, 0, cases.get(i));
-        t2_cmp(& mut g.e, TH_R12, 0);
+        t2_cmp(&mut g.e, TH_R12, 0);
         th_bcc(g, TC_EQ, cases.get(i + 1));
         i = i + 2;
     }
     th_li64(g, 0, 1, 0 - 38);
-    t2_pop(& mut g.e, TH_RESTORE_MASK);
+    t2_pop(&mut g.e, TH_RESTORE_MASK);
     // nothing to do: 0
     th_place(g, w_zero);
     th_li64(g, 0, 1, 0);
-    t2_pop(& mut g.e, TH_RESTORE_MASK);
+    t2_pop(&mut g.e, TH_RESTORE_MASK);
     th_place(g, w_one);
     th_li64(g, 0, 1, 1);
-    t2_pop(& mut g.e, TH_RESTORE_MASK);
+    t2_pop(&mut g.e, TH_RESTORE_MASK);
     // clock_gettime(clock, ts): no clock, the time is 0
     th_place(g, w_clock);
     th_mem(g, true, 2, TH_SP, TH_SAVED + 16);
-    t2_movw(& mut g.e, 0, 0);
-    t2_ldst(& mut g.e, false, false, 0, 2, 0);
-    t2_ldst(& mut g.e, false, false, 0, 2, 4);
-    t2_ldst(& mut g.e, false, false, 0, 2, 8);
-    t2_ldst(& mut g.e, false, false, 0, 2, 12);
-    t2_movw(& mut g.e, 1, 0);
-    t2_pop(& mut g.e, TH_RESTORE_MASK);
+    t2_movw(&mut g.e, 0, 0);
+    t2_ldst(&mut g.e, false, false, 0, 2, 0);
+    t2_ldst(&mut g.e, false, false, 0, 2, 4);
+    t2_ldst(&mut g.e, false, false, 0, 2, 8);
+    t2_ldst(&mut g.e, false, false, 0, 2, 12);
+    t2_movw(&mut g.e, 1, 0);
+    t2_pop(&mut g.e, TH_RESTORE_MASK);
     // write(fd, buf, len): every byte to the UART
     th_place(g, w_write);
     th_mem(g, true, 4, TH_SP, TH_SAVED + 16);
     th_mem(g, true, 5, TH_SP, TH_SAVED + 24);
-    t2_movw(& mut g.e, 6, 0);
+    t2_movw(&mut g.e, 6, 0);
     var wloop: i64 = th_new_label(g);
     var wdone: i64 = th_new_label(g);
     th_place(g, wloop);
-    t2_cmp(& mut g.e, 6, 5);
+    t2_cmp(&mut g.e, 6, 5);
     th_bcc(g, TC_GE, wdone);
-    t2_ldst(& mut g.e, true, true, 0, 4, 0);
-    t2_dpi(& mut g.e, TDP_ADD, false, 4, 4, 1);
+    t2_ldst(&mut g.e, true, true, 0, 4, 0);
+    t2_dpi(&mut g.e, TDP_ADD, false, 4, 4, 1);
     th_bl(g, th_prim_label(g, "__th_putc"));
-    t2_dpi(& mut g.e, TDP_ADD, false, 6, 6, 1);
+    t2_dpi(&mut g.e, TDP_ADD, false, 6, 6, 1);
     th_b(g, wloop);
     th_place(g, wdone);
-    t2_mov(& mut g.e, 0, 5);
-    t2_movw(& mut g.e, 1, 0);
-    t2_pop(& mut g.e, TH_RESTORE_MASK);
+    t2_mov(&mut g.e, 0, 5);
+    t2_movw(&mut g.e, 1, 0);
+    t2_pop(&mut g.e, TH_RESTORE_MASK);
     // exit_group(code)
     th_place(g, w_exit);
     th_mem(g, true, 4, TH_SP, TH_SAVED + 8);
@@ -2142,87 +2142,87 @@ fn th_prim_syscall_bare(g: & mut ThGen) {
     // zeroed up to the heap's end; past it the memory faults
     th_place(g, w_mmap);
     th_mem(g, true, 0, TH_SP, TH_SAVED + 16);
-    t2_dpi(& mut g.e, TDP_ADD, false, 0, 0, 7);
-    t2_dpi(& mut g.e, TDP_BIC, false, 0, 0, 7);
+    t2_dpi(&mut g.e, TDP_ADD, false, 0, 0, 7);
+    t2_dpi(&mut g.e, TDP_BIC, false, 0, 0, 7);
     th_addr(g, 2, g.heap_label, 0);
-    t2_ldst(& mut g.e, true, false, 3, 2, 0);
-    t2_dp(& mut g.e, TDP_ADD, false, 1, 3, 0, 0, 0);
-    t2_ldst(& mut g.e, false, false, 1, 2, 0);
+    t2_ldst(&mut g.e, true, false, 3, 2, 0);
+    t2_dp(&mut g.e, TDP_ADD, false, 1, 3, 0, 0, 0);
+    t2_ldst(&mut g.e, false, false, 1, 2, 0);
     var inside: i64 = th_new_label(g);
     th_li32(g, TH_R12, th_heap_end(g));
-    t2_cmp(& mut g.e, 1, TH_R12);
+    t2_cmp(&mut g.e, 1, TH_R12);
     th_bcc(g, TC_LS, inside);
-    t2_mov(& mut g.e, 1, TH_R12);
+    t2_mov(&mut g.e, 1, TH_R12);
     th_place(g, inside);
-    t2_mov(& mut g.e, 4, 3);
-    t2_movw(& mut g.e, 0, 0);
+    t2_mov(&mut g.e, 4, 3);
+    t2_movw(&mut g.e, 0, 0);
     var zloop: i64 = th_new_label(g);
     var zdone: i64 = th_new_label(g);
     th_place(g, zloop);
-    t2_cmp(& mut g.e, 4, 1);
+    t2_cmp(&mut g.e, 4, 1);
     th_bcc(g, TC_CS, zdone);
-    t2_ldst(& mut g.e, false, false, 0, 4, 0);
-    t2_dpi(& mut g.e, TDP_ADD, false, 4, 4, 4);
+    t2_ldst(&mut g.e, false, false, 0, 4, 0);
+    t2_dpi(&mut g.e, TDP_ADD, false, 4, 4, 4);
     th_b(g, zloop);
     th_place(g, zdone);
-    t2_mov(& mut g.e, 0, 3);
-    t2_movw(& mut g.e, 1, 0);
-    t2_pop(& mut g.e, TH_RESTORE_MASK);
+    t2_mov(&mut g.e, 0, 3);
+    t2_movw(&mut g.e, 1, 0);
+    t2_pop(&mut g.e, TH_RESTORE_MASK);
 }
 
 /// The helper routines of 64-bit arithmetic (operands r0:r1, r2:r3)
-fn th_prim_arith(g: & mut ThGen) {
+fn th_prim_arith(g: &mut ThGen) {
     // __th_udivmod: r0:r1 = n / d, r2:r3 = n % d (d != 0), unsigned
     th_prim(g, "__th_udivmod");
     var slow: i64 = th_new_label(g);
-    t2_dp(& mut g.e, TDP_ORR, true, TH_R12, 1, 3, 0, 0);
+    t2_dp(&mut g.e, TDP_ORR, true, TH_R12, 1, 3, 0, 0);
     th_bcc(g, TC_NE, slow);
     // both fit in 32 bits: one udiv
-    t2_div(& mut g.e, TH_R12, 0, 2, true);
-    t2_mls(& mut g.e, 2, TH_R12, 2, 0);
-    t2_mov(& mut g.e, 0, TH_R12);
-    t2_movw(& mut g.e, 1, 0);
-    t2_movw(& mut g.e, 3, 0);
-    t_bx(& mut g.e, TH_LR);
+    t2_div(&mut g.e, TH_R12, 0, 2, true);
+    t2_mls(&mut g.e, 2, TH_R12, 2, 0);
+    t2_mov(&mut g.e, 0, TH_R12);
+    t2_movw(&mut g.e, 1, 0);
+    t2_movw(&mut g.e, 3, 0);
+    t_bx(&mut g.e, TH_LR);
     th_place(g, slow);
-    t2_push(& mut g.e, TH_SAVE_MASK);
-    t2_mov(& mut g.e, 4, 0);
-    t2_mov(& mut g.e, 5, 1);
-    t2_movw(& mut g.e, 6, 0);
-    t2_movw(& mut g.e, 7, 0);
-    t2_movw(& mut g.e, 8, 64);
+    t2_push(&mut g.e, TH_SAVE_MASK);
+    t2_mov(&mut g.e, 4, 0);
+    t2_mov(&mut g.e, 5, 1);
+    t2_movw(&mut g.e, 6, 0);
+    t2_movw(&mut g.e, 7, 0);
+    t2_movw(&mut g.e, 8, 64);
     var loop: i64 = th_new_label(g);
     var do_sub: i64 = th_new_label(g);
     var next: i64 = th_new_label(g);
     th_place(g, loop);
     // rem:q <<= 1 (the bit shifted out of rem in C)
-    t2_dp(& mut g.e, TDP_ADD, true, 4, 4, 4, 0, 0);
-    t2_dp(& mut g.e, TDP_ADC, true, 5, 5, 5, 0, 0);
-    t2_dp(& mut g.e, TDP_ADC, true, 6, 6, 6, 0, 0);
-    t2_dp(& mut g.e, TDP_ADC, true, 7, 7, 7, 0, 0);
+    t2_dp(&mut g.e, TDP_ADD, true, 4, 4, 4, 0, 0);
+    t2_dp(&mut g.e, TDP_ADC, true, 5, 5, 5, 0, 0);
+    t2_dp(&mut g.e, TDP_ADC, true, 6, 6, 6, 0, 0);
+    t2_dp(&mut g.e, TDP_ADC, true, 7, 7, 7, 0, 0);
     th_bcc(g, TC_CS, do_sub);
-    t2_cmp(& mut g.e, 6, 2);
-    t2_dp(& mut g.e, TDP_SBC, true, TH_R12, 7, 3, 0, 0);
+    t2_cmp(&mut g.e, 6, 2);
+    t2_dp(&mut g.e, TDP_SBC, true, TH_R12, 7, 3, 0, 0);
     th_bcc(g, TC_CC, next);
     th_place(g, do_sub);
-    t2_dp(& mut g.e, TDP_SUB, true, 6, 6, 2, 0, 0);
-    t2_dp(& mut g.e, TDP_SBC, false, 7, 7, 3, 0, 0);
-    t2_dpi(& mut g.e, TDP_ORR, false, 4, 4, 1);
+    t2_dp(&mut g.e, TDP_SUB, true, 6, 6, 2, 0, 0);
+    t2_dp(&mut g.e, TDP_SBC, false, 7, 7, 3, 0, 0);
+    t2_dpi(&mut g.e, TDP_ORR, false, 4, 4, 1);
     th_place(g, next);
-    t2_dpi(& mut g.e, TDP_SUB, true, 8, 8, 1);
+    t2_dpi(&mut g.e, TDP_SUB, true, 8, 8, 1);
     th_bcc(g, TC_NE, loop);
-    t2_mov(& mut g.e, 0, 4);
-    t2_mov(& mut g.e, 1, 5);
-    t2_mov(& mut g.e, 2, 6);
-    t2_mov(& mut g.e, 3, 7);
-    t2_pop(& mut g.e, TH_RESTORE_MASK);
+    t2_mov(&mut g.e, 0, 4);
+    t2_mov(&mut g.e, 1, 5);
+    t2_mov(&mut g.e, 2, 6);
+    t2_mov(&mut g.e, 3, 7);
+    t2_pop(&mut g.e, TH_RESTORE_MASK);
 
     // __th_sdivmod: truncating signed division (the quotient's sign is
     // the operands' xor, the remainder's the dividend's)
     th_prim(g, "__th_sdivmod");
-    t2_push(& mut g.e, TH_SAVE_MASK);
-    t2_dp(& mut g.e, TDP_EOR, false, 4, 1, 3, 0, 0);
-    t2_mov(& mut g.e, 5, 1);
+    t2_push(&mut g.e, TH_SAVE_MASK);
+    t2_dp(&mut g.e, TDP_EOR, false, 4, 1, 3, 0, 0);
+    t2_mov(&mut g.e, 5, 1);
     var apos: i64 = th_new_label(g);
     th_cmpi(g, 1, 0);
     th_bcc(g, TC_GE, apos);
@@ -2244,46 +2244,46 @@ fn th_prim_arith(g: & mut ThGen) {
     th_bcc(g, TC_GE, rpos);
     th_neg64(g, 2, 3);
     th_place(g, rpos);
-    t2_pop(& mut g.e, TH_RESTORE_MASK);
+    t2_pop(&mut g.e, TH_RESTORE_MASK);
 
     // __th_umul_ovf: r0:r1 = a * b mod 2^64, r2 = 1 when the product
     // needs more than 64 bits
     th_prim(g, "__th_umul_ovf");
-    t2_push(& mut g.e, TH_SAVE_MASK);
-    t2_movw(& mut g.e, 8, 0);
+    t2_push(&mut g.e, TH_SAVE_MASK);
+    t2_movw(&mut g.e, 8, 0);
     var ok1: i64 = th_new_label(g);
     th_cmpi(g, 1, 0);
     th_bcc(g, TC_EQ, ok1);
     th_cmpi(g, 3, 0);
     th_bcc(g, TC_EQ, ok1);
-    t2_movw(& mut g.e, 8, 1);
+    t2_movw(&mut g.e, 8, 1);
     th_place(g, ok1);
-    t2_umull(& mut g.e, 4, 5, 0, 2);
-    t2_umull(& mut g.e, 6, 7, 1, 2);
+    t2_umull(&mut g.e, 4, 5, 0, 2);
+    t2_umull(&mut g.e, 6, 7, 1, 2);
     th_cmpi(g, 7, 0);
-    t2_bcc(& mut g.e, TC_EQ, 4);
-    t2_movw(& mut g.e, 8, 1);
-    t2_dp(& mut g.e, TDP_ADD, true, 5, 5, 6, 0, 0);
-    t2_bcc(& mut g.e, TC_CC, 4);
-    t2_movw(& mut g.e, 8, 1);
-    t2_umull(& mut g.e, 6, 7, 0, 3);
+    t2_bcc(&mut g.e, TC_EQ, 4);
+    t2_movw(&mut g.e, 8, 1);
+    t2_dp(&mut g.e, TDP_ADD, true, 5, 5, 6, 0, 0);
+    t2_bcc(&mut g.e, TC_CC, 4);
+    t2_movw(&mut g.e, 8, 1);
+    t2_umull(&mut g.e, 6, 7, 0, 3);
     th_cmpi(g, 7, 0);
-    t2_bcc(& mut g.e, TC_EQ, 4);
-    t2_movw(& mut g.e, 8, 1);
-    t2_dp(& mut g.e, TDP_ADD, true, 5, 5, 6, 0, 0);
-    t2_bcc(& mut g.e, TC_CC, 4);
-    t2_movw(& mut g.e, 8, 1);
-    t2_mov(& mut g.e, 0, 4);
-    t2_mov(& mut g.e, 1, 5);
-    t2_mov(& mut g.e, 2, 8);
-    t2_movw(& mut g.e, 3, 0);
-    t2_pop(& mut g.e, TH_RESTORE_MASK);
+    t2_bcc(&mut g.e, TC_EQ, 4);
+    t2_movw(&mut g.e, 8, 1);
+    t2_dp(&mut g.e, TDP_ADD, true, 5, 5, 6, 0, 0);
+    t2_bcc(&mut g.e, TC_CC, 4);
+    t2_movw(&mut g.e, 8, 1);
+    t2_mov(&mut g.e, 0, 4);
+    t2_mov(&mut g.e, 1, 5);
+    t2_mov(&mut g.e, 2, 8);
+    t2_movw(&mut g.e, 3, 0);
+    t2_pop(&mut g.e, TH_RESTORE_MASK);
 
     // __th_smul_ovf: r0:r1 = a * b mod 2^64, r2 = 1 when the product is
     // not an i64
     th_prim(g, "__th_smul_ovf");
-    t2_push(& mut g.e, TH_SAVE_MASK);
-    t2_dp(& mut g.e, TDP_EOR, false, 8, 1, 3, 0, 0);
+    t2_push(&mut g.e, TH_SAVE_MASK);
+    t2_dp(&mut g.e, TDP_EOR, false, 8, 1, 3, 0, 0);
     var sa: i64 = th_new_label(g);
     th_cmpi(g, 1, 0);
     th_bcc(g, TC_GE, sa);
@@ -2308,9 +2308,9 @@ fn th_prim_arith(g: & mut ThGen) {
     th_cmpi(g, 0, 0);
     th_bcc(g, TC_NE, ovf);
     th_li32(g, TH_R12, 0x80000000);
-    t2_cmp(& mut g.e, 1, TH_R12);
+    t2_cmp(&mut g.e, 1, TH_R12);
     th_bcc(g, TC_NE, ovf);
-    t2_movw(& mut g.e, 2, 0);
+    t2_movw(&mut g.e, 2, 0);
     th_b(g, fin);
     th_place(g, fits);
     var pos: i64 = th_new_label(g);
@@ -2318,12 +2318,12 @@ fn th_prim_arith(g: & mut ThGen) {
     th_bcc(g, TC_GE, pos);
     th_neg64(g, 0, 1);
     th_place(g, pos);
-    t2_movw(& mut g.e, 2, 0);
+    t2_movw(&mut g.e, 2, 0);
     th_b(g, fin);
     th_place(g, ovf);
-    t2_movw(& mut g.e, 2, 1);
+    t2_movw(&mut g.e, 2, 1);
     th_place(g, fin);
-    t2_pop(& mut g.e, TH_RESTORE_MASK);
+    t2_pop(&mut g.e, TH_RESTORE_MASK);
 
     // __th_lsl / __th_lsr / __th_asr: r0:r1 shifted by r2 & 63 (clobbers
     // r3, r12)
@@ -2337,40 +2337,40 @@ fn th_prim_arith(g: & mut ThGen) {
             th_prim(g, "__th_asr");
         }
         var big: i64 = th_new_label(g);
-        t2_dpi(& mut g.e, TDP_AND, false, 2, 2, 63);
-        t2_dpi(& mut g.e, TDP_SUB, true, TH_R12, 2, 32);
+        t2_dpi(&mut g.e, TDP_AND, false, 2, 2, 63);
+        t2_dpi(&mut g.e, TDP_SUB, true, TH_R12, 2, 32);
         th_bcc(g, TC_GE, big);
-        t2_dpi(& mut g.e, TDP_RSB, false, 3, 2, 32);
+        t2_dpi(&mut g.e, TDP_RSB, false, 3, 2, 32);
         if kind == 0 {
             // hi = hi << n | lo >> (32 - n); lo <<= n
-            t2_shift(& mut g.e, 1, 3, 0, 3);
-            t2_shift(& mut g.e, 0, 1, 1, 2);
-            t2_dp(& mut g.e, TDP_ORR, false, 1, 1, 3, 0, 0);
-            t2_shift(& mut g.e, 0, 0, 0, 2);
+            t2_shift(&mut g.e, 1, 3, 0, 3);
+            t2_shift(&mut g.e, 0, 1, 1, 2);
+            t2_dp(&mut g.e, TDP_ORR, false, 1, 1, 3, 0, 0);
+            t2_shift(&mut g.e, 0, 0, 0, 2);
         } else {
             // lo = lo >> n | hi << (32 - n); hi >>= n
-            t2_shift(& mut g.e, 0, 3, 1, 3);
-            t2_shift(& mut g.e, 1, 0, 0, 2);
-            t2_dp(& mut g.e, TDP_ORR, false, 0, 0, 3, 0, 0);
+            t2_shift(&mut g.e, 0, 3, 1, 3);
+            t2_shift(&mut g.e, 1, 0, 0, 2);
+            t2_dp(&mut g.e, TDP_ORR, false, 0, 0, 3, 0, 0);
             if kind == 1 {
-                t2_shift(& mut g.e, 1, 1, 1, 2);
+                t2_shift(&mut g.e, 1, 1, 1, 2);
             } else {
-                t2_shift(& mut g.e, 2, 1, 1, 2);
+                t2_shift(&mut g.e, 2, 1, 1, 2);
             }
         }
-        t_bx(& mut g.e, TH_LR);
+        t_bx(&mut g.e, TH_LR);
         th_place(g, big);
         if kind == 0 {
-            t2_shift(& mut g.e, 0, 1, 0, TH_R12);
-            t2_movw(& mut g.e, 0, 0);
+            t2_shift(&mut g.e, 0, 1, 0, TH_R12);
+            t2_movw(&mut g.e, 0, 0);
         } else if kind == 1 {
-            t2_shift(& mut g.e, 1, 0, 1, TH_R12);
-            t2_movw(& mut g.e, 1, 0);
+            t2_shift(&mut g.e, 1, 0, 1, TH_R12);
+            t2_movw(&mut g.e, 1, 0);
         } else {
-            t2_shift(& mut g.e, 2, 0, 1, TH_R12);
-            t2_shift_imm(& mut g.e, 2, 1, 1, 31);
+            t2_shift(&mut g.e, 2, 0, 1, TH_R12);
+            t2_shift_imm(&mut g.e, 2, 1, 1, 31);
         }
-        t_bx(& mut g.e, TH_LR);
+        t_bx(&mut g.e, TH_LR);
         kind = kind + 1;
     }
 
@@ -2381,81 +2381,81 @@ fn th_prim_arith(g: & mut ThGen) {
     th_place(g, cloop);
     th_cmpi(g, 2, 0);
     th_bcc(g, TC_EQ, cdone);
-    t2_ldst(& mut g.e, true, true, 3, 1, 0);
-    t2_ldst(& mut g.e, false, true, 3, 0, 0);
-    t2_dpi(& mut g.e, TDP_ADD, false, 0, 0, 1);
-    t2_dpi(& mut g.e, TDP_ADD, false, 1, 1, 1);
-    t2_dpi(& mut g.e, TDP_SUB, false, 2, 2, 1);
+    t2_ldst(&mut g.e, true, true, 3, 1, 0);
+    t2_ldst(&mut g.e, false, true, 3, 0, 0);
+    t2_dpi(&mut g.e, TDP_ADD, false, 0, 0, 1);
+    t2_dpi(&mut g.e, TDP_ADD, false, 1, 1, 1);
+    t2_dpi(&mut g.e, TDP_SUB, false, 2, 2, 1);
     th_b(g, cloop);
     th_place(g, cdone);
-    t_bx(& mut g.e, TH_LR);
+    t_bx(&mut g.e, TH_LR);
 }
 
 /// The runtime's other primitives (stdlib/linux_runtime/base.fd's extern
 /// block): one thread, no signals, no frame records
-fn th_prim_runtime(g: & mut ThGen) {
+fn th_prim_runtime(g: &mut ThGen) {
     // nat_start_sp: the start block (argc, argv, envp as 8-byte words)
     th_prim(g, "nat_start_sp");
     if g.bare {
         th_addr(g, 0, g.zero_block_label, 0);
     } else {
         th_addr(g, 2, g.start_sp_label, 0);
-        t2_ldst(& mut g.e, true, false, 0, 2, 0);
+        t2_ldst(&mut g.e, true, false, 0, 2, 0);
     }
-    t2_movw(& mut g.e, 1, 0);
-    t_bx(& mut g.e, TH_LR);
+    t2_movw(&mut g.e, 1, 0);
+    t_bx(&mut g.e, TH_LR);
 
     // one core, no interrupt touches these: plain loads and stores
     th_prim(g, "nat_atomic_load");
-    t2_ldst(& mut g.e, true, false, 2, TH_SP, 0);
-    t2_ldst(& mut g.e, true, false, 0, 2, 0);
-    t2_ldst(& mut g.e, true, false, 1, 2, 4);
-    t_bx(& mut g.e, TH_LR);
+    t2_ldst(&mut g.e, true, false, 2, TH_SP, 0);
+    t2_ldst(&mut g.e, true, false, 0, 2, 0);
+    t2_ldst(&mut g.e, true, false, 1, 2, 4);
+    t_bx(&mut g.e, TH_LR);
 
     th_prim(g, "nat_atomic_store");
-    t2_ldst(& mut g.e, true, false, 2, TH_SP, 0);
-    t2_ldst(& mut g.e, true, false, 0, TH_SP, 8);
-    t2_ldst(& mut g.e, true, false, 1, TH_SP, 12);
-    t2_ldst(& mut g.e, false, false, 0, 2, 0);
-    t2_ldst(& mut g.e, false, false, 1, 2, 4);
+    t2_ldst(&mut g.e, true, false, 2, TH_SP, 0);
+    t2_ldst(&mut g.e, true, false, 0, TH_SP, 8);
+    t2_ldst(&mut g.e, true, false, 1, TH_SP, 12);
+    t2_ldst(&mut g.e, false, false, 0, 2, 0);
+    t2_ldst(&mut g.e, false, false, 1, 2, 4);
     th_ret_imm(g, 0);
 
     // nat_atomic_add(addr, v) -> the old value
     th_prim(g, "nat_atomic_add");
-    t2_ldst(& mut g.e, true, false, 2, TH_SP, 0);
-    t2_ldst(& mut g.e, true, false, 0, 2, 0);
-    t2_ldst(& mut g.e, true, false, 1, 2, 4);
-    t2_ldst(& mut g.e, true, false, 3, TH_SP, 8);
-    t2_ldst(& mut g.e, true, false, TH_R12, TH_SP, 12);
-    t2_dp(& mut g.e, TDP_ADD, true, 3, 0, 3, 0, 0);
-    t2_dp(& mut g.e, TDP_ADC, false, TH_R12, 1, TH_R12, 0, 0);
-    t2_ldst(& mut g.e, false, false, 3, 2, 0);
-    t2_ldst(& mut g.e, false, false, TH_R12, 2, 4);
-    t_bx(& mut g.e, TH_LR);
+    t2_ldst(&mut g.e, true, false, 2, TH_SP, 0);
+    t2_ldst(&mut g.e, true, false, 0, 2, 0);
+    t2_ldst(&mut g.e, true, false, 1, 2, 4);
+    t2_ldst(&mut g.e, true, false, 3, TH_SP, 8);
+    t2_ldst(&mut g.e, true, false, TH_R12, TH_SP, 12);
+    t2_dp(&mut g.e, TDP_ADD, true, 3, 0, 3, 0, 0);
+    t2_dp(&mut g.e, TDP_ADC, false, TH_R12, 1, TH_R12, 0, 0);
+    t2_ldst(&mut g.e, false, false, 3, 2, 0);
+    t2_ldst(&mut g.e, false, false, TH_R12, 2, 4);
+    t_bx(&mut g.e, TH_LR);
 
     // nat_atomic_cas(addr, expected, new) -> 1 when *addr was expected
     th_prim(g, "nat_atomic_cas");
     var fail: i64 = th_new_label(g);
-    t2_ldst(& mut g.e, true, false, 2, TH_SP, 0);
-    t2_ldst(& mut g.e, true, false, 0, 2, 0);
-    t2_ldst(& mut g.e, true, false, 3, TH_SP, 8);
-    t2_cmp(& mut g.e, 0, 3);
+    t2_ldst(&mut g.e, true, false, 2, TH_SP, 0);
+    t2_ldst(&mut g.e, true, false, 0, 2, 0);
+    t2_ldst(&mut g.e, true, false, 3, TH_SP, 8);
+    t2_cmp(&mut g.e, 0, 3);
     th_bcc(g, TC_NE, fail);
-    t2_ldst(& mut g.e, true, false, 0, 2, 4);
-    t2_ldst(& mut g.e, true, false, 3, TH_SP, 12);
-    t2_cmp(& mut g.e, 0, 3);
+    t2_ldst(&mut g.e, true, false, 0, 2, 4);
+    t2_ldst(&mut g.e, true, false, 3, TH_SP, 12);
+    t2_cmp(&mut g.e, 0, 3);
     th_bcc(g, TC_NE, fail);
-    t2_ldst(& mut g.e, true, false, 3, TH_SP, 16);
-    t2_ldst(& mut g.e, false, false, 3, 2, 0);
-    t2_ldst(& mut g.e, true, false, 3, TH_SP, 20);
-    t2_ldst(& mut g.e, false, false, 3, 2, 4);
+    t2_ldst(&mut g.e, true, false, 3, TH_SP, 16);
+    t2_ldst(&mut g.e, false, false, 3, 2, 0);
+    t2_ldst(&mut g.e, true, false, 3, TH_SP, 20);
+    t2_ldst(&mut g.e, false, false, 3, 2, 4);
     th_ret_imm(g, 1);
     th_place(g, fail);
     th_ret_imm(g, 0);
 
     // tasks and threads do not run on this target
     th_prim(g, "nat_ctx_swap");
-    t_udf(& mut g.e);
+    t_udf(&mut g.e);
     th_prim(g, "nat_ctx_tramp");
     th_ret_imm(g, 0);
     th_prim(g, "nat_clone_thread");
@@ -2463,45 +2463,45 @@ fn th_prim_runtime(g: & mut ThGen) {
 
     // nat_call_fn(addr, nargs, argv): addr(env 0, argv[0..8])
     th_prim(g, "nat_call_fn");
-    t2_push(& mut g.e, TH_SAVE_MASK);
-    t2_ldst(& mut g.e, true, false, 4, TH_SP, TH_SAVED);
-    t2_ldst(& mut g.e, true, false, 6, TH_SP, TH_SAVED + 16);
-    t2_subw(& mut g.e, TH_SP, TH_SP, 72);
-    t2_movw(& mut g.e, 0, 0);
-    t2_ldst(& mut g.e, false, false, 0, TH_SP, 0);
-    t2_ldst(& mut g.e, false, false, 0, TH_SP, 4);
+    t2_push(&mut g.e, TH_SAVE_MASK);
+    t2_ldst(&mut g.e, true, false, 4, TH_SP, TH_SAVED);
+    t2_ldst(&mut g.e, true, false, 6, TH_SP, TH_SAVED + 16);
+    t2_subw(&mut g.e, TH_SP, TH_SP, 72);
+    t2_movw(&mut g.e, 0, 0);
+    t2_ldst(&mut g.e, false, false, 0, TH_SP, 0);
+    t2_ldst(&mut g.e, false, false, 0, TH_SP, 4);
     var k: i64 = 0;
     while k < 8 {
-        t2_ldst(& mut g.e, true, false, 0, 6, 8 * k);
-        t2_ldst(& mut g.e, false, false, 0, TH_SP, 8 + 8 * k);
-        t2_ldst(& mut g.e, true, false, 0, 6, 8 * k + 4);
-        t2_ldst(& mut g.e, false, false, 0, TH_SP, 12 + 8 * k);
+        t2_ldst(&mut g.e, true, false, 0, 6, 8 * k);
+        t2_ldst(&mut g.e, false, false, 0, TH_SP, 8 + 8 * k);
+        t2_ldst(&mut g.e, true, false, 0, 6, 8 * k + 4);
+        t2_ldst(&mut g.e, false, false, 0, TH_SP, 12 + 8 * k);
         k = k + 1;
     }
-    t_blx(& mut g.e, 4);
-    t2_addw(& mut g.e, TH_SP, TH_SP, 72);
-    t2_pop(& mut g.e, TH_RESTORE_MASK);
+    t_blx(&mut g.e, 4);
+    t2_addw(&mut g.e, TH_SP, TH_SP, 72);
+    t2_pop(&mut g.e, TH_RESTORE_MASK);
 
     th_prim(g, "nat_fn_table");
     th_addr(g, 0, g.fn_table_label, 0);
-    t2_movw(& mut g.e, 1, 0);
-    t_bx(& mut g.e, TH_LR);
+    t2_movw(&mut g.e, 1, 0);
+    t_bx(&mut g.e, TH_LR);
     th_prim(g, "nat_fn_names");
     th_addr(g, 0, g.names_label, 0);
-    t2_movw(& mut g.e, 1, 0);
-    t_bx(& mut g.e, TH_LR);
+    t2_movw(&mut g.e, 1, 0);
+    t_bx(&mut g.e, TH_LR);
 
     th_prim(g, "nat_tls_get");
     th_addr(g, 2, g.tls_label, 0);
-    t2_ldst(& mut g.e, true, false, 0, 2, 0);
-    t2_ldst(& mut g.e, true, false, 1, 2, 4);
-    t_bx(& mut g.e, TH_LR);
+    t2_ldst(&mut g.e, true, false, 0, 2, 0);
+    t2_ldst(&mut g.e, true, false, 1, 2, 4);
+    t_bx(&mut g.e, TH_LR);
     th_prim(g, "nat_tls_set");
     th_addr(g, 2, g.tls_label, 0);
-    t2_ldst(& mut g.e, true, false, 0, TH_SP, 0);
-    t2_ldst(& mut g.e, true, false, 1, TH_SP, 4);
-    t2_ldst(& mut g.e, false, false, 0, 2, 0);
-    t2_ldst(& mut g.e, false, false, 1, 2, 4);
+    t2_ldst(&mut g.e, true, false, 0, TH_SP, 0);
+    t2_ldst(&mut g.e, true, false, 1, TH_SP, 4);
+    t2_ldst(&mut g.e, false, false, 0, 2, 0);
+    t2_ldst(&mut g.e, false, false, 1, 2, 4);
     th_ret_imm(g, 0);
 
     // no frame records: a panic prints no trace
@@ -2526,18 +2526,18 @@ fn th_prim_runtime(g: & mut ThGen) {
 
 /// Every pending panic stub: [sp] env 0, [sp + 8] the message; the
 /// runtime's p_panic prints "Panic: <message>" and exits with 1
-fn th_gen_msg_stubs(g: & mut ThGen) {
+fn th_gen_msg_stubs(g: &mut ThGen) {
     while g.msgs_done < g.msgs.len() {
         var msg: str = g.msgs.get(g.msgs_done);
         g.msgs_done = g.msgs_done + 1;
-        NatEnc_align(& mut g.e, 4);
+        NatEnc_align(&mut g.e, 4);
         th_place(g, HashMap_get(g.msg_labels, msg));
-        t2_subw(& mut g.e, TH_SP, TH_SP, 24);
+        t2_subw(&mut g.e, TH_SP, TH_SP, 24);
         var resolved: str = th_resolve(g, "p_panic");
         if th_has_fn(g, resolved) {
             th_arg_imm(g, 0, 0);
             th_addr(g, 0, th_str_label(g, msg), 0);
-            t2_movw(& mut g.e, 1, 0);
+            t2_movw(&mut g.e, 1, 0);
             th_arg_r01(g, 1);
             th_bl(g, th_fn_label(g, resolved));
         } else {
@@ -2546,7 +2546,7 @@ fn th_gen_msg_stubs(g: & mut ThGen) {
             th_arg_imm(g, 1, 1);
             th_bl(g, th_prim_label(g, "nat_syscall"));
         }
-        t_udf(& mut g.e);
+        t_udf(&mut g.e);
     }
 }
 
@@ -2557,90 +2557,90 @@ fn th_gen_msg_stubs(g: & mut ThGen) {
 /// _start (Linux): the kernel's argc, argv, envp (32-bit words) copied as
 /// 8-byte words below the stack for nat_start_sp, then main(env 0) and
 /// exit_group(its result)
-fn th_gen_start_linux(g: & mut ThGen) {
+fn th_gen_start_linux(g: &mut ThGen) {
     g.entry_label = th_new_label(g);
-    NatEnc_align(& mut g.e, 4);
+    NatEnc_align(&mut g.e, 4);
     th_place(g, g.entry_label);
-    t_mov(& mut g.e, 4, TH_SP);
-    t2_dpi(& mut g.e, TDP_ADD, false, 6, 4, 4);
-    t2_movw(& mut g.e, 7, 0);
+    t_mov(&mut g.e, 4, TH_SP);
+    t2_dpi(&mut g.e, TDP_ADD, false, 6, 4, 4);
+    t2_movw(&mut g.e, 7, 0);
     var scan: i64 = th_new_label(g);
     th_place(g, scan);
-    t2_ldst(& mut g.e, true, false, TH_R12, 6, 0);
-    t2_dpi(& mut g.e, TDP_ADD, false, 6, 6, 4);
+    t2_ldst(&mut g.e, true, false, TH_R12, 6, 0);
+    t2_dpi(&mut g.e, TDP_ADD, false, 6, 6, 4);
     th_cmpi(g, TH_R12, 0);
     th_bcc(g, TC_NE, scan);
-    t2_dpi(& mut g.e, TDP_ADD, false, 7, 7, 1);
+    t2_dpi(&mut g.e, TDP_ADD, false, 7, 7, 1);
     th_cmpi(g, 7, 2);
     th_bcc(g, TC_LT, scan);
     // r6: after envp's NULL; room for twice the bytes and 4 words more
-    t2_dp(& mut g.e, TDP_SUB, false, 5, 6, 4, 0, 0);
-    t2_shift_imm(& mut g.e, 0, 5, 5, 1);
-    t2_dpi(& mut g.e, TDP_ADD, false, 5, 5, 32);
-    t2_dp(& mut g.e, TDP_SUB, false, TH_R12, 4, 5, 0, 0);
-    t2_dpi(& mut g.e, TDP_BIC, false, TH_R12, TH_R12, 15);
-    t_mov(& mut g.e, TH_SP, TH_R12);
-    t2_mov(& mut g.e, 8, TH_R12);
+    t2_dp(&mut g.e, TDP_SUB, false, 5, 6, 4, 0, 0);
+    t2_shift_imm(&mut g.e, 0, 5, 5, 1);
+    t2_dpi(&mut g.e, TDP_ADD, false, 5, 5, 32);
+    t2_dp(&mut g.e, TDP_SUB, false, TH_R12, 4, 5, 0, 0);
+    t2_dpi(&mut g.e, TDP_BIC, false, TH_R12, TH_R12, 15);
+    t_mov(&mut g.e, TH_SP, TH_R12);
+    t2_mov(&mut g.e, 8, TH_R12);
     var copy: i64 = th_new_label(g);
     var cdone: i64 = th_new_label(g);
     th_place(g, copy);
-    t2_cmp(& mut g.e, 4, 6);
+    t2_cmp(&mut g.e, 4, 6);
     th_bcc(g, TC_CS, cdone);
-    t2_ldst(& mut g.e, true, false, 0, 4, 0);
-    t2_ldst(& mut g.e, false, false, 0, 8, 0);
-    t2_movw(& mut g.e, 1, 0);
-    t2_ldst(& mut g.e, false, false, 1, 8, 4);
-    t2_dpi(& mut g.e, TDP_ADD, false, 4, 4, 4);
-    t2_dpi(& mut g.e, TDP_ADD, false, 8, 8, 8);
+    t2_ldst(&mut g.e, true, false, 0, 4, 0);
+    t2_ldst(&mut g.e, false, false, 0, 8, 0);
+    t2_movw(&mut g.e, 1, 0);
+    t2_ldst(&mut g.e, false, false, 1, 8, 4);
+    t2_dpi(&mut g.e, TDP_ADD, false, 4, 4, 4);
+    t2_dpi(&mut g.e, TDP_ADD, false, 8, 8, 8);
     th_b(g, copy);
     th_place(g, cdone);
-    t2_movw(& mut g.e, 1, 0);
-    t2_ldst(& mut g.e, false, false, 1, 8, 0);
-    t2_ldst(& mut g.e, false, false, 1, 8, 4);
-    t2_ldst(& mut g.e, false, false, 1, 8, 8);
-    t2_ldst(& mut g.e, false, false, 1, 8, 12);
-    t_mov(& mut g.e, 0, TH_SP);
+    t2_movw(&mut g.e, 1, 0);
+    t2_ldst(&mut g.e, false, false, 1, 8, 0);
+    t2_ldst(&mut g.e, false, false, 1, 8, 4);
+    t2_ldst(&mut g.e, false, false, 1, 8, 8);
+    t2_ldst(&mut g.e, false, false, 1, 8, 12);
+    t_mov(&mut g.e, 0, TH_SP);
     th_addr(g, 2, g.start_sp_label, 0);
-    t2_ldst(& mut g.e, false, false, 0, 2, 0);
-    t2_ldst(& mut g.e, false, false, 1, 2, 4);
+    t2_ldst(&mut g.e, false, false, 0, 2, 0);
+    t2_ldst(&mut g.e, false, false, 1, 2, 4);
     // main(env 0)
-    t2_subw(& mut g.e, TH_SP, TH_SP, 8);
-    t2_ldst(& mut g.e, false, false, 1, TH_SP, 0);
-    t2_ldst(& mut g.e, false, false, 1, TH_SP, 4);
+    t2_subw(&mut g.e, TH_SP, TH_SP, 8);
+    t2_ldst(&mut g.e, false, false, 1, TH_SP, 0);
+    t2_ldst(&mut g.e, false, false, 1, TH_SP, 4);
     th_bl(g, th_fn_label(g, "main"));
-    t2_movw(& mut g.e, 7, 248);
-    t_svc(& mut g.e, 0);
-    t_udf(& mut g.e);
+    t2_movw(&mut g.e, 7, 248);
+    t_svc(&mut g.e, 0);
+    t_udf(&mut g.e);
 }
 
 /// The vector table (initial sp, reset, the 14 system exceptions), the
 /// reset handler (UART on, .data copied from flash to RAM, the heap's
 /// start, main(env 0), exit with its result) and the fault handler
-fn th_gen_start_bare(g: & mut ThGen) {
+fn th_gen_start_bare(g: &mut ThGen) {
     g.entry_label = th_new_label(g);
     g.fault_label = th_new_label(g);
-    NatEnc_word(& mut g.e, th_ram_base(g) + th_stack_size(g));
+    NatEnc_word(&mut g.e, th_ram_base(g) + th_stack_size(g));
     th_word_fix(g, g.entry_label, 1);
     var v: i64 = 2;
     while v < 16 {
         th_word_fix(g, g.fault_label, 1);
         v = v + 1;
     }
-    NatEnc_align(& mut g.e, 4);
+    NatEnc_align(&mut g.e, 4);
     th_place(g, g.entry_label);
     // the UART
     if g.board == 2 {
-        // (qemu-arm: the UART is write(2))
+    // (qemu-arm: the UART is write(2))
     } else if g.board == 1 {
         th_li32(g, 2, 0x4000C000);
         th_li32(g, 3, 0x301);
-        t2_ldst(& mut g.e, false, false, 3, 2, 0x30);
+        t2_ldst(&mut g.e, false, false, 3, 2, 0x30);
     } else {
         th_li32(g, 2, 0x40004000);
-        t2_movw(& mut g.e, 3, 16);
-        t2_ldst(& mut g.e, false, false, 3, 2, 0x10);
-        t2_movw(& mut g.e, 3, 1);
-        t2_ldst(& mut g.e, false, false, 3, 2, 8);
+        t2_movw(&mut g.e, 3, 16);
+        t2_ldst(&mut g.e, false, false, 3, 2, 0x10);
+        t2_movw(&mut g.e, 3, 1);
+        t2_ldst(&mut g.e, false, false, 3, 2, 8);
     }
     // .data: its image in flash to its place in RAM
     th_addr(g, 0, g.data_lma_label, 0);
@@ -2649,12 +2649,12 @@ fn th_gen_start_bare(g: & mut ThGen) {
     var copy: i64 = th_new_label(g);
     var cdone: i64 = th_new_label(g);
     th_place(g, copy);
-    t2_cmp(& mut g.e, 1, 2);
+    t2_cmp(&mut g.e, 1, 2);
     th_bcc(g, TC_CS, cdone);
-    t2_ldst(& mut g.e, true, false, 3, 0, 0);
-    t2_ldst(& mut g.e, false, false, 3, 1, 0);
-    t2_dpi(& mut g.e, TDP_ADD, false, 0, 0, 4);
-    t2_dpi(& mut g.e, TDP_ADD, false, 1, 1, 4);
+    t2_ldst(&mut g.e, true, false, 3, 0, 0);
+    t2_ldst(&mut g.e, false, false, 3, 1, 0);
+    t2_dpi(&mut g.e, TDP_ADD, false, 0, 0, 4);
+    t2_dpi(&mut g.e, TDP_ADD, false, 1, 1, 4);
     th_b(g, copy);
     th_place(g, cdone);
     // the heap: PSRAM, or the RAM after .data
@@ -2662,36 +2662,36 @@ fn th_gen_start_bare(g: & mut ThGen) {
         th_li32(g, 0, 0x21000000);
     } else {
         th_addr(g, 0, g.data_end_label, 0);
-        t2_dpi(& mut g.e, TDP_ADD, false, 0, 0, 7);
-        t2_dpi(& mut g.e, TDP_BIC, false, 0, 0, 7);
+        t2_dpi(&mut g.e, TDP_ADD, false, 0, 0, 7);
+        t2_dpi(&mut g.e, TDP_BIC, false, 0, 0, 7);
     }
     th_addr(g, 2, g.heap_label, 0);
-    t2_ldst(& mut g.e, false, false, 0, 2, 0);
+    t2_ldst(&mut g.e, false, false, 0, 2, 0);
     // main(env 0), then exit with its result
-    t2_subw(& mut g.e, TH_SP, TH_SP, 8);
-    t2_movw(& mut g.e, 1, 0);
-    t2_ldst(& mut g.e, false, false, 1, TH_SP, 0);
-    t2_ldst(& mut g.e, false, false, 1, TH_SP, 4);
+    t2_subw(&mut g.e, TH_SP, TH_SP, 8);
+    t2_movw(&mut g.e, 1, 0);
+    t2_ldst(&mut g.e, false, false, 1, TH_SP, 0);
+    t2_ldst(&mut g.e, false, false, 1, TH_SP, 4);
     th_bl(g, th_fn_label(g, "main"));
-    t2_mov(& mut g.e, 4, 0);
+    t2_mov(&mut g.e, 4, 0);
     th_bl(g, th_prim_label(g, "__th_exit"));
 
     // a fault (a bad address, the stack or the heap overrun): say so on
     // the UART and exit with 1
-    NatEnc_align(& mut g.e, 4);
+    NatEnc_align(&mut g.e, 4);
     th_place(g, g.fault_label);
     th_addr(g, 4, th_str_label(g, "Panic: hard fault (an invalid memory access, or out of memory)\n"), 0);
     var floop: i64 = th_new_label(g);
     var fdone: i64 = th_new_label(g);
     th_place(g, floop);
-    t2_ldst(& mut g.e, true, true, 0, 4, 0);
+    t2_ldst(&mut g.e, true, true, 0, 4, 0);
     th_cmpi(g, 0, 0);
     th_bcc(g, TC_EQ, fdone);
     th_bl(g, th_prim_label(g, "__th_putc"));
-    t2_dpi(& mut g.e, TDP_ADD, false, 4, 4, 1);
+    t2_dpi(&mut g.e, TDP_ADD, false, 4, 4, 1);
     th_b(g, floop);
     th_place(g, fdone);
-    t2_movw(& mut g.e, 4, 1);
+    t2_movw(&mut g.e, 4, 1);
     th_bl(g, th_prim_label(g, "__th_exit"));
 }
 
@@ -2704,14 +2704,14 @@ fn th_gen_start_bare(g: & mut ThGen) {
 /// read-only: the function tables (empty: no traces), the start block of
 /// a no-OS program, the strings ([static magic][length] before the bytes,
 /// as on the other targets).
-fn th_gen_data(g: & mut ThGen, module: & IrModule) {
+fn th_gen_data(g: &mut ThGen, module: &IrModule) {
     th_ram_place(g, g.data_start_label);
     th_ram_place(g, g.heap_label);
-    NatEnc_quad(& mut g.d, 0);
+    NatEnc_quad(&mut g.d, 0);
     th_ram_place(g, g.tls_label);
-    NatEnc_quad(& mut g.d, 0);
+    NatEnc_quad(&mut g.d, 0);
     th_ram_place(g, g.start_sp_label);
-    NatEnc_quad(& mut g.d, 0);
+    NatEnc_quad(&mut g.d, 0);
     var gi: i64 = 0;
     while gi < g.globs.len() {
         var gname: str = g.globs.get(gi);
@@ -2758,58 +2758,58 @@ fn th_gen_data(g: & mut ThGen, module: & IrModule) {
         }
         if str_label != 0 {
             th_dword_fix(g, str_label, 0);
-            NatEnc_word(& mut g.d, 0);
+            NatEnc_word(&mut g.d, 0);
         } else {
-            NatEnc_quad(& mut g.d, bits);
+            NatEnc_quad(&mut g.d, bits);
         }
         var k: i64 = 8;
         while k < size {
-            NatEnc_byte(& mut g.d, 0);
+            NatEnc_byte(&mut g.d, 0);
             k = k + 1;
         }
         gi = gi + 1;
     }
     th_ram_place(g, g.data_end_label);
 
-    NatEnc_align(& mut g.e, 8);
+    NatEnc_align(&mut g.e, 8);
     th_place(g, g.names_label);
     var z: i64 = 0;
     while z < 6 {
-        NatEnc_quad(& mut g.e, 0);
+        NatEnc_quad(&mut g.e, 0);
         z = z + 1;
     }
     th_place(g, g.fn_table_label);
-    NatEnc_quad(& mut g.e, 0);
-    NatEnc_quad(& mut g.e, 0);
+    NatEnc_quad(&mut g.e, 0);
+    NatEnc_quad(&mut g.e, 0);
     th_place(g, g.zero_block_label);
     z = 0;
     while z < 4 {
-        NatEnc_quad(& mut g.e, 0);
+        NatEnc_quad(&mut g.e, 0);
         z = z + 1;
     }
     var si: i64 = 0;
     while si < g.strs.len() {
         var s: str = g.strs.get(si);
-        NatEnc_align(& mut g.e, 8);
+        NatEnc_align(&mut g.e, 8);
         var n: i64 = str_len(s);
-        NatEnc_quad(& mut g.e, 0x4649444553545202);
-        NatEnc_quad(& mut g.e, n);
+        NatEnc_quad(&mut g.e, 0x4649444553545202);
+        NatEnc_quad(&mut g.e, n);
         th_place(g, HashMap_get(g.str_labels, s));
         var bi: i64 = 0;
         while bi < n {
-            NatEnc_byte(& mut g.e, str_byte_at(s, bi));
+            NatEnc_byte(&mut g.e, str_byte_at(s, bi));
             bi = bi + 1;
         }
-        NatEnc_byte(& mut g.e, 0);
+        NatEnc_byte(&mut g.e, 0);
         si = si + 1;
     }
     // the flash image of .data follows the code
-    NatEnc_align(& mut g.e, 8);
+    NatEnc_align(&mut g.e, 8);
     th_place(g, g.data_lma_label);
 }
 
 /// The address of a placed label (-1: never placed)
-fn th_label_addr(g: & ThGen, label: i64) -> i64 {
+fn th_label_addr(g: &ThGen, label: i64) -> i64 {
     if label <= 0 || label >= g.e.labels.len() {
         return 0 - 1;
     }
@@ -2823,7 +2823,7 @@ fn th_label_addr(g: & ThGen, label: i64) -> i64 {
     return g.code_vma + pos;
 }
 
-fn th_put32(code: & mut Vec<i64>, pos: i64, w: i64) {
+fn th_put32(code: &mut Vec<i64>, pos: i64, w: i64) {
     code.set(pos, w & 0xFF);
     code.set(pos + 1, (w >> 8) & 0xFF);
     code.set(pos + 2, (w >> 16) & 0xFF);
@@ -2831,7 +2831,7 @@ fn th_put32(code: & mut Vec<i64>, pos: i64, w: i64) {
 }
 
 /// Patch every fixup: "" or the first error
-fn th_resolve_fixes(g: & mut ThGen) -> str {
+fn th_resolve_fixes(g: &mut ThGen) -> str {
     var i: i64 = 0;
     while i + 3 < g.fixes.len() {
         var pos: i64 = g.fixes.get(i);
@@ -2849,15 +2849,15 @@ fn th_resolve_fixes(g: & mut ThGen) -> str {
                 if off < 0 - 1048576 || off >= 1048576 {
                     return "thumbv7m: a conditional branch is out of range (more than 1 MB) in the code";
                 }
-                t2_bcc(& mut tmp, extra, off);
+                t2_bcc(&mut tmp, extra, off);
             } else {
                 if off < 0 - 16777216 || off >= 16777216 {
                     return "thumbv7m: a call or branch is out of range (more than 16 MB)";
                 }
                 if kind == TH_FIX_BL {
-                    t2_bl(& mut tmp, off);
+                    t2_bl(&mut tmp, off);
                 } else {
-                    t2_b(& mut tmp, off);
+                    t2_b(&mut tmp, off);
                 }
             }
             var k: i64 = 0;
@@ -2868,15 +2868,15 @@ fn th_resolve_fixes(g: & mut ThGen) -> str {
         } else if kind == TH_FIX_MOVW {
             var v: i64 = (target + extra) & 0xFFFFFFFF;
             var reg: i64 = g.e.code.get(pos + 3) & 15;
-            t2_movw(& mut tmp, reg, v & 0xFFFF);
-            t2_movt(& mut tmp, reg, (v >> 16) & 0xFFFF);
+            t2_movw(&mut tmp, reg, v & 0xFFFF);
+            t2_movt(&mut tmp, reg, (v >> 16) & 0xFFFF);
             var k2: i64 = 0;
             while k2 < 8 {
                 g.e.code.set(pos + k2, tmp.code.get(k2));
                 k2 = k2 + 1;
             }
         } else {
-            th_put32(& mut g.e.code, pos, target + extra);
+            th_put32(&mut g.e.code, pos, target + extra);
         }
         i = i + 4;
     }
@@ -2886,25 +2886,25 @@ fn th_resolve_fixes(g: & mut ThGen) -> str {
         if dtarget < 0 {
             return "thumbv7m: a data label was never placed";
         }
-        th_put32(& mut g.d.code, g.dfixes.get(j), dtarget + g.dfixes.get(j + 3));
+        th_put32(&mut g.d.code, g.dfixes.get(j), dtarget + g.dfixes.get(j + 3));
         j = j + 4;
     }
     return "";
 }
 
-fn th_u16(out: & mut Vec<i64>, v: i64) {
+fn th_u16(out: &mut Vec<i64>, v: i64) {
     out.push(v & 0xFF);
     out.push((v >> 8) & 0xFF);
 }
 
-fn th_u32(out: & mut Vec<i64>, v: i64) {
+fn th_u32(out: &mut Vec<i64>, v: i64) {
     out.push(v & 0xFF);
     out.push((v >> 8) & 0xFF);
     out.push((v >> 16) & 0xFF);
     out.push((v >> 24) & 0xFF);
 }
 
-fn th_phdr(out: & mut Vec<i64>, offset: i64, vaddr: i64, paddr: i64, size: i64, flags: i64, align: i64) {
+fn th_phdr(out: &mut Vec<i64>, offset: i64, vaddr: i64, paddr: i64, size: i64, flags: i64, align: i64) {
     th_u32(out, 1);
     th_u32(out, offset);
     th_u32(out, vaddr);
@@ -2916,7 +2916,7 @@ fn th_phdr(out: & mut Vec<i64>, offset: i64, vaddr: i64, paddr: i64, size: i64, 
 }
 
 /// A segment of zeroed memory (no bytes in the file)
-fn th_phdr_bss(out: & mut Vec<i64>, vaddr: i64, size: i64) {
+fn th_phdr_bss(out: &mut Vec<i64>, vaddr: i64, size: i64) {
     th_u32(out, 1);
     th_u32(out, 0);
     th_u32(out, vaddr);
@@ -2936,7 +2936,7 @@ const TH_LINUX_BASE: i64 = 0x10000;
 /// The ELF32 image: Linux, one RWX segment of headers, code and data; no
 /// OS, the code in flash and .data in RAM with its image (LMA) in flash
 /// right after the code, as a loader for a board expects
-fn th_elf(g: & ThGen) -> Vec<i64> {
+fn th_elf(g: &ThGen) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     out.push(0x7F);
     out.push(69);
@@ -2948,39 +2948,39 @@ fn th_elf(g: & ThGen) -> Vec<i64> {
     while out.len() < 16 {
         out.push(0);
     }
-    th_u16(& mut out, 2);
-    th_u16(& mut out, 40);
-    th_u32(& mut out, 1);
-    th_u32(& mut out, th_label_addr(g, g.entry_label) | 1);
-    th_u32(& mut out, 52);
-    th_u32(& mut out, 0);
+    th_u16(&mut out, 2);
+    th_u16(&mut out, 40);
+    th_u32(&mut out, 1);
+    th_u32(&mut out, th_label_addr(g, g.entry_label) | 1);
+    th_u32(&mut out, 52);
+    th_u32(&mut out, 0);
     // EABI version 5, soft float
-    th_u32(& mut out, 0x05000200);
-    th_u16(& mut out, 52);
-    th_u16(& mut out, 32);
+    th_u32(&mut out, 0x05000200);
+    th_u16(&mut out, 52);
+    th_u16(&mut out, 32);
     if g.bare && g.board == 2 {
-        th_u16(& mut out, 3);
+        th_u16(&mut out, 3);
     } else if g.bare {
-        th_u16(& mut out, 2);
+        th_u16(&mut out, 2);
     } else {
-        th_u16(& mut out, 1);
+        th_u16(&mut out, 1);
     }
-    th_u16(& mut out, 40);
-    th_u16(& mut out, 0);
-    th_u16(& mut out, 0);
+    th_u16(&mut out, 40);
+    th_u16(&mut out, 0);
+    th_u16(&mut out, 0);
     var elen: i64 = g.e.code.len();
     var dlen: i64 = g.d.code.len();
     if g.bare && g.board == 2 {
         // qemu-arm loads by virtual address: the flash (code, then .data's
         // image), the RAM and the PSRAM as zeroed memory
-        th_phdr(& mut out, TH_CODE_OFF, g.code_vma, g.code_vma, elen + dlen, 5, 0x1000);
-        th_phdr_bss(& mut out, th_ram_base(g), th_ram_end(g) - th_ram_base(g));
-        th_phdr_bss(& mut out, 0x21000000, 0x1000000);
+        th_phdr(&mut out, TH_CODE_OFF, g.code_vma, g.code_vma, elen + dlen, 5, 0x1000);
+        th_phdr_bss(&mut out, th_ram_base(g), th_ram_end(g) - th_ram_base(g));
+        th_phdr_bss(&mut out, 0x21000000, 0x1000000);
     } else if g.bare {
-        th_phdr(& mut out, TH_CODE_OFF, g.code_vma, g.code_vma, elen, 5, 4);
-        th_phdr(& mut out, TH_CODE_OFF + elen, g.data_vma, g.code_vma + elen, dlen, 6, 4);
+        th_phdr(&mut out, TH_CODE_OFF, g.code_vma, g.code_vma, elen, 5, 4);
+        th_phdr(&mut out, TH_CODE_OFF + elen, g.data_vma, g.code_vma + elen, dlen, 6, 4);
     } else {
-        th_phdr(& mut out, 0, TH_LINUX_BASE, TH_LINUX_BASE, TH_CODE_OFF + elen + dlen, 7, 0x1000);
+        th_phdr(&mut out, 0, TH_LINUX_BASE, TH_LINUX_BASE, TH_CODE_OFF + elen + dlen, 7, 0x1000);
     }
     while out.len() < TH_CODE_OFF {
         out.push(0);
@@ -3000,7 +3000,7 @@ fn th_elf(g: & ThGen) -> Vec<i64> {
 
 /// The flash contents of a no-OS image (code, then .data's image), for a
 /// flasher that takes a raw binary at the flash's start
-fn th_flat(g: & ThGen) -> Vec<i64> {
+fn th_flat(g: &ThGen) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     var i: i64 = 0;
     while i < g.e.code.len() {
@@ -3045,7 +3045,7 @@ pub fn nat_thumb_generate(module: IrModule, bare: bool) -> ResultBytes {
         return ResultBytes::Err(c_vec1("thumbv7m: unknown board '" + bname + "' (FID_THUMB_BOARD: mps2-an385, lm3s6965evb or qemu-user)"));
     }
     g.board = bix;
-    if !pe_module_has_fn(& module, "main") {
+    if !pe_module_has_fn(&module, "main") {
         return ResultBytes::Err(c_vec1("thumbv7m: the program has no `main` function"));
     }
     var fi: i64 = 0;
@@ -3062,28 +3062,28 @@ pub fn nat_thumb_generate(module: IrModule, bare: bool) -> ResultBytes {
         }
         ei = ei + 1;
     }
-    th_collect_dyn_types(& mut g, & module);
-    g.heap_label = th_new_label(& mut g);
-    g.tls_label = th_new_label(& mut g);
-    g.start_sp_label = th_new_label(& mut g);
-    g.zero_block_label = th_new_label(& mut g);
-    g.names_label = th_new_label(& mut g);
-    g.fn_table_label = th_new_label(& mut g);
-    g.data_start_label = th_new_label(& mut g);
-    g.data_end_label = th_new_label(& mut g);
-    g.data_lma_label = th_new_label(& mut g);
+    th_collect_dyn_types(&mut g, &module);
+    g.heap_label = th_new_label(&mut g);
+    g.tls_label = th_new_label(&mut g);
+    g.start_sp_label = th_new_label(&mut g);
+    g.zero_block_label = th_new_label(&mut g);
+    g.names_label = th_new_label(&mut g);
+    g.fn_table_label = th_new_label(&mut g);
+    g.data_start_label = th_new_label(&mut g);
+    g.data_end_label = th_new_label(&mut g);
+    g.data_lma_label = th_new_label(&mut g);
     // the entry first: with no OS the vector table is the image's start
     if bare {
-        th_gen_start_bare(& mut g);
-        th_prim_syscall_bare(& mut g);
-        th_prim_putc(& mut g);
-        th_prim_exit(& mut g);
+        th_gen_start_bare(&mut g);
+        th_prim_syscall_bare(&mut g);
+        th_prim_putc(&mut g);
+        th_prim_exit(&mut g);
     } else {
-        th_gen_start_linux(& mut g);
-        th_prim_syscall_linux(& mut g);
+        th_gen_start_linux(&mut g);
+        th_prim_syscall_linux(&mut g);
     }
-    th_prim_runtime(& mut g);
-    th_prim_arith(& mut g);
+    th_prim_runtime(&mut g);
+    th_prim_arith(&mut g);
     // the functions main reaches, then the panic stubs they need (which
     // may reach more functions), until nothing is left
     var qi: i64 = 0;
@@ -3092,23 +3092,23 @@ pub fn nat_thumb_generate(module: IrModule, bare: bool) -> ResultBytes {
         while qi < g.queue.len() {
             var name: str = g.queue.get(qi);
             qi = qi + 1;
-            match IrModule_get_function(& module, name) {
+            match IrModule_get_function(&module, name) {
                 OptIrFunction::Some(f) => {
-                    th_gen_function(& mut g, name, & f, & module);
+                    th_gen_function(&mut g, name, &f, &module);
                 }
                 OptIrFunction::None => {
                     return ResultBytes::Err(c_vec1("thumbv7m: no function " + name));
                 }
             }
         }
-        th_gen_msg_stubs(& mut g);
+        th_gen_msg_stubs(&mut g);
         more = qi < g.queue.len();
     }
-    th_gen_data(& mut g, & module);
+    th_gen_data(&mut g, &module);
     if bare {
-        g.code_vma = th_flash_base(& g);
-        g.data_vma = th_ram_base(& g) + th_stack_size(& g);
-        if g.data_vma + g.d.code.len() > th_ram_end(& g) {
+        g.code_vma = th_flash_base(&g);
+        g.data_vma = th_ram_base(&g) + th_stack_size(&g);
+        if g.data_vma + g.d.code.len() > th_ram_end(&g) {
             return ResultBytes::Err(c_vec1("thumbv7m: the program's data (" + int_to_str(g.d.code.len()) + " bytes) does not fit in the board's RAM"));
         }
         var flash: i64 = 0x400000;
@@ -3122,7 +3122,7 @@ pub fn nat_thumb_generate(module: IrModule, bare: bool) -> ResultBytes {
         g.code_vma = TH_LINUX_BASE + TH_CODE_OFF;
         g.data_vma = g.code_vma + g.e.code.len();
     }
-    var err: str = th_resolve_fixes(& mut g);
+    var err: str = th_resolve_fixes(&mut g);
     if err != "" {
         return ResultBytes::Err(c_vec1(err));
     }
@@ -3145,15 +3145,15 @@ pub fn nat_thumb_generate(module: IrModule, bare: bool) -> ResultBytes {
     if bare {
         var flat: str = th_env("FID_THUMB_FLAT");
         if str_len(flat) > 0 && flat != "0" {
-            return ResultBytes::Ok(th_flat(& g));
+            return ResultBytes::Ok(th_flat(&g));
         }
     }
-    return ResultBytes::Ok(th_elf(& g));
+    return ResultBytes::Ok(th_elf(&g));
 }
 
 /// The dyn types (as nat_ir.fd ng_collect_dyn_types): every type made into
 /// a dyn value or named by a trait impl, sorted
-fn th_collect_dyn_types(g: & mut ThGen, module: & IrModule) {
+fn th_collect_dyn_types(g: &mut ThGen, module: &IrModule) {
     var types: Vec<str> = Vec::new();
     var ti: i64 = 0;
     while ti < module.trait_impls.len() {

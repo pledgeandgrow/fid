@@ -20,7 +20,7 @@
 // ring's buffer is a Vec<i64> here; in a kernel it is a page mapped into
 // both address spaces (stdlib vmm).
 module ipc;
- use vec;
+use vec;
 
 pub const IPC_RUNNING: i64 = 0;
 pub const IPC_BLOCKED_SEND: i64 = 1;
@@ -93,19 +93,25 @@ pub struct IpcKernel {
 }
 
 pub fn ipc_msg(label: i64, words: Vec<i64>) -> IpcMsg {
-    return IpcMsg { label: label, words: words, cap: -1, badge: 0 };
+    return IpcMsg {
+        label: label, words: words, cap: -1, badge: 0
+    };
 }
 
 /// A message that also transfers the cap in slot cptr of the sender.
 pub fn ipc_msg_with_cap(label: i64, words: Vec<i64>, cptr: i64) -> IpcMsg {
-    return IpcMsg { label: label, words: words, cap: cptr, badge: 0 };
+    return IpcMsg {
+        label: label, words: words, cap: cptr, badge: 0
+    };
 }
 
 pub fn ipc_new() -> IpcKernel {
-    return IpcKernel { threads: Vec::new(), endpoints: Vec::new(), next_cap_id: 1, delivered: 0 };
+    return IpcKernel {
+        threads: Vec::new(), endpoints: Vec::new(), next_cap_id: 1, delivered: 0
+    };
 }
 
-pub fn ipc_thread_new(k: & mut IpcKernel, name: str) -> i64 {
+pub fn ipc_thread_new(k: &mut IpcKernel, name: str) -> i64 {
     var id: i64 = k.threads.len();
     k.threads.push(IpcThread {
         id: id, name: name, state: IPC_RUNNING, cspace: Vec::new(), msg: ipc_msg(0, Vec::new()), calling: false, send_cap: -1, reply_to: -1, blocked_on: -1
@@ -113,24 +119,30 @@ pub fn ipc_thread_new(k: & mut IpcKernel, name: str) -> i64 {
     return id;
 }
 
-pub fn ipc_thread(k: & IpcKernel, tid: i64) -> IpcThread {
+pub fn ipc_thread(k: &IpcKernel, tid: i64) -> IpcThread {
     return k.threads.get(tid);
 }
 
-pub fn ipc_state(k: & IpcKernel, tid: i64) -> i64 {
+pub fn ipc_state(k: &IpcKernel, tid: i64) -> i64 {
     return k.threads.get(tid).state;
 }
 
 pub fn ipc_state_name(st: i64) -> str {
-    if st == IPC_RUNNING { return "running"; }
-    if st == IPC_BLOCKED_SEND { return "blocked-send"; }
-    if st == IPC_BLOCKED_RECV { return "blocked-recv"; }
+    if st == IPC_RUNNING {
+        return "running";
+    }
+    if st == IPC_BLOCKED_SEND {
+        return "blocked-send";
+    }
+    if st == IPC_BLOCKED_RECV {
+        return "blocked-recv";
+    }
     return "blocked-reply";
 }
 
 // ─── Capability spaces ──────────────────────────────────────────────────
 
-fn ipc_put_cap(k: & mut IpcKernel, tid: i64, c: Cap) -> i64 {
+fn ipc_put_cap(k: &mut IpcKernel, tid: i64, c: Cap) -> i64 {
     var t: IpcThread = k.threads.get(tid);
     var i: i64 = 0;
     while i < t.cspace.len() {
@@ -147,15 +159,17 @@ fn ipc_put_cap(k: & mut IpcKernel, tid: i64, c: Cap) -> i64 {
 }
 
 /// The cap in slot cptr of thread tid (kind CAP_NULL when empty/invalid).
-pub fn ipc_cap(k: & IpcKernel, tid: i64, cptr: i64) -> Cap {
+pub fn ipc_cap(k: &IpcKernel, tid: i64, cptr: i64) -> Cap {
     var t: IpcThread = k.threads.get(tid);
     if cptr < 0 || cptr >= t.cspace.len() {
-        return Cap { kind: CAP_NULL, obj: -1, rights: 0, badge: 0, id: 0, parent: -1 };
+        return Cap {
+            kind: CAP_NULL, obj: -1, rights: 0, badge: 0, id: 0, parent: -1
+        };
     }
     return t.cspace.get(cptr);
 }
 
-fn ipc_new_cap_id(k: & mut IpcKernel) -> i64 {
+fn ipc_new_cap_id(k: &mut IpcKernel) -> i64 {
     var id: i64 = k.next_cap_id;
     k.next_cap_id = id + 1;
     return id;
@@ -163,26 +177,32 @@ fn ipc_new_cap_id(k: & mut IpcKernel) -> i64 {
 
 /// Create an endpoint; the creator gets a cap with all rights. Returns
 /// the cptr.
-pub fn ipc_endpoint_new(k: & mut IpcKernel, tid: i64) -> i64 {
+pub fn ipc_endpoint_new(k: &mut IpcKernel, tid: i64) -> i64 {
     var ep: i64 = k.endpoints.len();
-    k.endpoints.push(Endpoint { send_q: Vec::new(), recv_q: Vec::new(), alive: true });
+    k.endpoints.push(Endpoint {
+        send_q: Vec::new(), recv_q: Vec::new(), alive: true
+    });
     var cid: i64 = ipc_new_cap_id(k);
-    return ipc_put_cap(k, tid, Cap { kind: CAP_ENDPOINT, obj: ep, rights: CAP_ALL, badge: 0, id: cid, parent: -1 });
+    return ipc_put_cap(k, tid, Cap {
+        kind: CAP_ENDPOINT, obj: ep, rights: CAP_ALL, badge: 0, id: cid, parent: -1
+    });
 }
 
-fn ipc_derive(k: & mut IpcKernel, src: Cap, rights: i64, badge: i64) -> Cap {
+fn ipc_derive(k: &mut IpcKernel, src: Cap, rights: i64, badge: i64) -> Cap {
     var nb: i64 = src.badge;
     if badge != 0 {
         nb = badge;
     }
     var cid: i64 = ipc_new_cap_id(k);
-    return Cap { kind: src.kind, obj: src.obj, rights: src.rights & rights, badge: nb, id: cid, parent: src.id };
+    return Cap {
+        kind: src.kind, obj: src.obj, rights: src.rights & rights, badge: nb, id: cid, parent: src.id
+    };
 }
 
 /// Derive a cap into another thread's CSpace (rights masked, badge set
 /// when non-zero and the source is unbadged). Returns the new cptr or an
 /// error.
-pub fn ipc_cap_copy(k: & mut IpcKernel, from: i64, cptr: i64, to: i64, rights: i64, badge: i64) -> i64 {
+pub fn ipc_cap_copy(k: &mut IpcKernel, from: i64, cptr: i64, to: i64, rights: i64, badge: i64) -> i64 {
     var c: Cap = ipc_cap(k, from, cptr);
     if c.kind == CAP_NULL {
         return IPC_ERR_CAP;
@@ -195,17 +215,19 @@ pub fn ipc_cap_copy(k: & mut IpcKernel, from: i64, cptr: i64, to: i64, rights: i
 }
 
 /// Mint a derived cap in the same CSpace.
-pub fn ipc_mint(k: & mut IpcKernel, tid: i64, cptr: i64, rights: i64, badge: i64) -> i64 {
+pub fn ipc_mint(k: &mut IpcKernel, tid: i64, cptr: i64, rights: i64, badge: i64) -> i64 {
     return ipc_cap_copy(k, tid, cptr, tid, rights, badge);
 }
 
-fn ipc_clear_slot(k: & mut IpcKernel, tid: i64, cptr: i64) {
+fn ipc_clear_slot(k: &mut IpcKernel, tid: i64, cptr: i64) {
     var t: IpcThread = k.threads.get(tid);
-    t.cspace.set(cptr, Cap { kind: CAP_NULL, obj: -1, rights: 0, badge: 0, id: 0, parent: -1 });
+    t.cspace.set(cptr, Cap {
+        kind: CAP_NULL, obj: -1, rights: 0, badge: 0, id: 0, parent: -1
+    });
     k.threads.set(tid, t);
 }
 
-pub fn ipc_cap_delete(k: & mut IpcKernel, tid: i64, cptr: i64) -> i64 {
+pub fn ipc_cap_delete(k: &mut IpcKernel, tid: i64, cptr: i64) -> i64 {
     if ipc_cap(k, tid, cptr).kind == CAP_NULL {
         return IPC_ERR_CAP;
     }
@@ -215,7 +237,7 @@ pub fn ipc_cap_delete(k: & mut IpcKernel, tid: i64, cptr: i64) -> i64 {
 
 /// Delete every cap derived (directly or not) from the cap in slot cptr;
 /// the cap itself stays. Returns how many were deleted.
-pub fn ipc_revoke(k: & mut IpcKernel, tid: i64, cptr: i64) -> i64 {
+pub fn ipc_revoke(k: &mut IpcKernel, tid: i64, cptr: i64) -> i64 {
     var root: Cap = ipc_cap(k, tid, cptr);
     if root.kind == CAP_NULL {
         return IPC_ERR_CAP;
@@ -248,7 +270,7 @@ pub fn ipc_revoke(k: & mut IpcKernel, tid: i64, cptr: i64) -> i64 {
 
 // ─── Message passing ────────────────────────────────────────────────────
 
-fn ipc_check(k: & IpcKernel, tid: i64, cptr: i64, right: i64) -> i64 {
+fn ipc_check(k: &IpcKernel, tid: i64, cptr: i64, right: i64) -> i64 {
     var c: Cap = ipc_cap(k, tid, cptr);
     if c.kind != CAP_ENDPOINT || !k.endpoints.get(c.obj).alive {
         return IPC_ERR_CAP;
@@ -259,7 +281,7 @@ fn ipc_check(k: & IpcKernel, tid: i64, cptr: i64, right: i64) -> i64 {
     return IPC_OK;
 }
 
-fn ipc_set_state(k: & mut IpcKernel, tid: i64, st: i64, ep: i64) {
+fn ipc_set_state(k: &mut IpcKernel, tid: i64, st: i64, ep: i64) {
     var t: IpcThread = k.threads.get(tid);
     t.state = st;
     t.blocked_on = ep;
@@ -267,9 +289,11 @@ fn ipc_set_state(k: & mut IpcKernel, tid: i64, st: i64, ep: i64) {
 }
 
 /// Move the message of `from` (sent through its cap scap) into `to`.
-fn ipc_transfer(k: & mut IpcKernel, from: i64, scap: i64, m: IpcMsg, to: i64) {
+fn ipc_transfer(k: &mut IpcKernel, from: i64, scap: i64, m: IpcMsg, to: i64) {
     var sc: Cap = ipc_cap(k, from, scap);
-    var got: IpcMsg = IpcMsg { label: m.label, words: m.words, cap: -1, badge: sc.badge };
+    var got: IpcMsg = IpcMsg {
+        label: m.label, words: m.words, cap: -1, badge: sc.badge
+    };
     if m.cap >= 0 && (sc.rights & CAP_GRANT) != 0 {
         var tc: Cap = ipc_cap(k, from, m.cap);
         if tc.kind != CAP_NULL {
@@ -286,7 +310,7 @@ fn ipc_transfer(k: & mut IpcKernel, from: i64, scap: i64, m: IpcMsg, to: i64) {
 }
 
 /// After delivery of a call, the caller waits for the receiver's reply.
-fn ipc_after_send(k: & mut IpcKernel, sender: i64, receiver: i64, is_call: bool) {
+fn ipc_after_send(k: &mut IpcKernel, sender: i64, receiver: i64, is_call: bool) {
     if is_call {
         ipc_set_state(k, sender, IPC_BLOCKED_REPLY, -1);
         var r: IpcThread = k.threads.get(receiver);
@@ -297,7 +321,7 @@ fn ipc_after_send(k: & mut IpcKernel, sender: i64, receiver: i64, is_call: bool)
     }
 }
 
-fn ipc_do_send(k: & mut IpcKernel, tid: i64, cptr: i64, m: IpcMsg, is_call: bool, blocking: bool) -> i64 {
+fn ipc_do_send(k: &mut IpcKernel, tid: i64, cptr: i64, m: IpcMsg, is_call: bool, blocking: bool) -> i64 {
     var chk: i64 = ipc_check(k, tid, cptr, CAP_SEND);
     if chk != IPC_OK {
         return chk;
@@ -334,21 +358,21 @@ fn ipc_do_send(k: & mut IpcKernel, tid: i64, cptr: i64, m: IpcMsg, is_call: bool
 }
 
 /// Send m through endpoint cap cptr; blocks until a receiver takes it.
-pub fn ipc_send(k: & mut IpcKernel, tid: i64, cptr: i64, m: IpcMsg) -> i64 {
+pub fn ipc_send(k: &mut IpcKernel, tid: i64, cptr: i64, m: IpcMsg) -> i64 {
     return ipc_do_send(k, tid, cptr, m, false, true);
 }
 
 /// Send only when a receiver is already waiting (IPC_WOULDBLOCK otherwise).
-pub fn ipc_nbsend(k: & mut IpcKernel, tid: i64, cptr: i64, m: IpcMsg) -> i64 {
+pub fn ipc_nbsend(k: &mut IpcKernel, tid: i64, cptr: i64, m: IpcMsg) -> i64 {
     return ipc_do_send(k, tid, cptr, m, false, false);
 }
 
 /// Send and wait for the reply (delivered into the caller's msg).
-pub fn ipc_call(k: & mut IpcKernel, tid: i64, cptr: i64, m: IpcMsg) -> i64 {
+pub fn ipc_call(k: &mut IpcKernel, tid: i64, cptr: i64, m: IpcMsg) -> i64 {
     return ipc_do_send(k, tid, cptr, m, true, true);
 }
 
-fn ipc_do_recv(k: & mut IpcKernel, tid: i64, cptr: i64, blocking: bool) -> i64 {
+fn ipc_do_recv(k: &mut IpcKernel, tid: i64, cptr: i64, blocking: bool) -> i64 {
     var chk: i64 = ipc_check(k, tid, cptr, CAP_RECV);
     if chk != IPC_OK {
         return chk;
@@ -374,17 +398,17 @@ fn ipc_do_recv(k: & mut IpcKernel, tid: i64, cptr: i64, blocking: bool) -> i64 {
 }
 
 /// Receive on endpoint cap cptr: takes a queued sender or blocks.
-pub fn ipc_recv(k: & mut IpcKernel, tid: i64, cptr: i64) -> i64 {
+pub fn ipc_recv(k: &mut IpcKernel, tid: i64, cptr: i64) -> i64 {
     return ipc_do_recv(k, tid, cptr, true);
 }
 
 /// Receive only when a sender is queued.
-pub fn ipc_poll(k: & mut IpcKernel, tid: i64, cptr: i64) -> i64 {
+pub fn ipc_poll(k: &mut IpcKernel, tid: i64, cptr: i64) -> i64 {
     return ipc_do_recv(k, tid, cptr, false);
 }
 
 /// Answer the last call received (one-shot reply right).
-pub fn ipc_reply(k: & mut IpcKernel, tid: i64, m: IpcMsg) -> i64 {
+pub fn ipc_reply(k: &mut IpcKernel, tid: i64, m: IpcMsg) -> i64 {
     var t: IpcThread = k.threads.get(tid);
     var c: i64 = t.reply_to;
     if c < 0 || k.threads.get(c).state != IPC_BLOCKED_REPLY {
@@ -393,7 +417,9 @@ pub fn ipc_reply(k: & mut IpcKernel, tid: i64, m: IpcMsg) -> i64 {
     t.reply_to = -1;
     k.threads.set(tid, t);
     var ct: IpcThread = k.threads.get(c);
-    ct.msg = IpcMsg { label: m.label, words: m.words, cap: -1, badge: 0 };
+    ct.msg = IpcMsg {
+        label: m.label, words: m.words, cap: -1, badge: 0
+    };
     ct.state = IPC_RUNNING;
     k.threads.set(c, ct);
     k.delivered = k.delivered + 1;
@@ -402,13 +428,13 @@ pub fn ipc_reply(k: & mut IpcKernel, tid: i64, m: IpcMsg) -> i64 {
 
 /// Reply to the current caller, then wait for the next message: the
 /// usual server loop step.
-pub fn ipc_reply_recv(k: & mut IpcKernel, tid: i64, cptr: i64, m: IpcMsg) -> i64 {
+pub fn ipc_reply_recv(k: &mut IpcKernel, tid: i64, cptr: i64, m: IpcMsg) -> i64 {
     ipc_reply(k, tid, m);
     return ipc_recv(k, tid, cptr);
 }
 
 /// Message last delivered to tid.
-pub fn ipc_msg_of(k: & IpcKernel, tid: i64) -> IpcMsg {
+pub fn ipc_msg_of(k: &IpcKernel, tid: i64) -> IpcMsg {
     return k.threads.get(tid).msg;
 }
 
@@ -432,16 +458,16 @@ pub fn shmring_new(capacity: i64) -> Vec<i64> {
     return m;
 }
 
-pub fn shmring_count(r: & Vec<i64>) -> i64 {
+pub fn shmring_count(r: &Vec<i64>) -> i64 {
     return (r.get(0) - r.get(1)) & 0xFFFF;
 }
 
-pub fn shmring_space(r: & Vec<i64>) -> i64 {
+pub fn shmring_space(r: &Vec<i64>) -> i64 {
     return r.get(2) - shmring_count(r);
 }
 
 /// Producer side: false when the ring is full.
-pub fn shmring_push(r: & mut Vec<i64>, d: RingDesc) -> bool {
+pub fn shmring_push(r: &mut Vec<i64>, d: RingDesc) -> bool {
     if shmring_space(r) == 0 {
         return false;
     }
@@ -458,19 +484,23 @@ pub fn shmring_push(r: & mut Vec<i64>, d: RingDesc) -> bool {
 }
 
 /// Consumer side: the next descriptor, len = -1 when the ring is empty.
-pub fn shmring_pop(r: & mut Vec<i64>) -> RingDesc {
+pub fn shmring_pop(r: &mut Vec<i64>) -> RingDesc {
     if shmring_count(r) == 0 {
-        return RingDesc { offset: 0, len: -1, flags: 0, cookie: 0 };
+        return RingDesc {
+            offset: 0, len: -1, flags: 0, cookie: 0
+        };
     }
     var tail: i64 = r.get(1);
     var o: i64 = 4 + (tail & (r.get(2) - 1)) * 4;
-    var d: RingDesc = RingDesc { offset: r.get(o), len: r.get(o + 1), flags: r.get(o + 2), cookie: r.get(o + 3) };
+    var d: RingDesc = RingDesc {
+        offset: r.get(o), len: r.get(o + 1), flags: r.get(o + 2), cookie: r.get(o + 3)
+    };
     r.set(1, (tail + 1) & 0xFFFF);
     return d;
 }
 
 /// Consumer asks to be notified once the producer index passes idx.
-pub fn shmring_set_event(r: & mut Vec<i64>, idx: i64) {
+pub fn shmring_set_event(r: &mut Vec<i64>, idx: i64) {
     r.set(3, idx & 0xFFFF);
 }
 

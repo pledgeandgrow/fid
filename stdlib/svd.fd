@@ -29,7 +29,10 @@
 //   val gpio: RegBlock = svd_peripheral(dev, "GPIOA");
 
 module svd;
- use vec; use string; use xml; use regmap;
+use vec;
+use string;
+use xml;
+use regmap;
 
 pub struct SvdDevice {
     pub ok: bool,
@@ -56,7 +59,9 @@ fn svd_trim(s: str) -> str {
 pub fn svd_parse_int(s0: str) -> i64 {
     val s: str = svd_trim(s0);
     val n: i64 = str_len(s);
-    if n == 0 { return -1; }
+    if n == 0 {
+        return -1;
+    }
     var base: i64 = 10;
     var i: i64 = 0;
     if n > 2 && str_byte_at(s, 0) == 48 && (str_byte_at(s, 1) == 120 || str_byte_at(s, 1) == 88) {
@@ -69,15 +74,25 @@ pub fn svd_parse_int(s0: str) -> i64 {
         base = 2;
         i = 1;
     }
-    if i >= n { return -1; }
+    if i >= n {
+        return -1;
+    }
     var v: i64 = 0;
     while i < n {
         val c: i64 = str_byte_at(s, i);
         var d: i64 = -1;
-        if c >= 48 && c <= 57 { d = c - 48; }
-        if c >= 97 && c <= 102 { d = c - 87; }
-        if c >= 65 && c <= 70 { d = c - 55; }
-        if d < 0 || d >= base { return -1; }
+        if c >= 48 && c <= 57 {
+            d = c - 48;
+        }
+        if c >= 97 && c <= 102 {
+            d = c - 87;
+        }
+        if c >= 65 && c <= 70 {
+            d = c - 55;
+        }
+        if d < 0 || d >= base {
+            return -1;
+        }
         v = v * base + d;
         i = i + 1;
     }
@@ -85,32 +100,48 @@ pub fn svd_parse_int(s0: str) -> i64 {
 }
 
 fn svd_child_text(node: XmlNode, tag: str) -> str {
-    if !xml_has(node, tag) { return ""; }
+    if !xml_has(node, tag) {
+        return "";
+    }
     return svd_trim(xml_text(xml_child(node, tag)));
 }
 
 fn svd_child_int(node: XmlNode, tag: str, dflt: i64) -> i64 {
     val t: str = svd_child_text(node, tag);
-    if str_len(t) == 0 { return dflt; }
+    if str_len(t) == 0 {
+        return dflt;
+    }
     val v: i64 = svd_parse_int(t);
-    if v < 0 { return dflt; }
+    if v < 0 {
+        return dflt;
+    }
     return v;
 }
 
 /// SVD <access> text to a regmap access kind (-1 when unknown).
 pub fn svd_access(s: str) -> i64 {
-    if str_equal(s, "read-only") { return REG_RO; }
-    if str_equal(s, "write-only") || str_equal(s, "writeOnce") { return REG_WO; }
-    if str_equal(s, "read-write") || str_equal(s, "read-writeOnce") { return REG_RW; }
+    if str_equal(s, "read-only") {
+        return REG_RO;
+    }
+    if str_equal(s, "write-only") || str_equal(s, "writeOnce") {
+        return REG_WO;
+    }
+    if str_equal(s, "read-write") || str_equal(s, "read-writeOnce") {
+        return REG_RW;
+    }
     return -1;
 }
 
 fn svd_props(node: XmlNode, up: SvdProps) -> SvdProps {
-    var p: SvdProps = SvdProps { size: up.size, access: up.access, reset: up.reset };
+    var p: SvdProps = SvdProps {
+        size: up.size, access: up.access, reset: up.reset
+    };
     p.size = svd_child_int(node, "size", up.size);
     p.reset = svd_child_int(node, "resetValue", up.reset);
     val a: i64 = svd_access(svd_child_text(node, "access"));
-    if a >= 0 { p.access = a; }
+    if a >= 0 {
+        p.access = a;
+    }
     return p;
 }
 
@@ -168,8 +199,12 @@ fn svd_field(fnode: XmlNode, reg_access: i64) -> RegField {
         }
     }
     var acc: i64 = svd_access(svd_child_text(fnode, "access"));
-    if acc < 0 { acc = reg_access; }
-    if str_equal(svd_child_text(fnode, "modifiedWriteValues"), "oneToClear") { acc = REG_W1C; }
+    if acc < 0 {
+        acc = reg_access;
+    }
+    if str_equal(svd_child_text(fnode, "modifiedWriteValues"), "oneToClear") {
+        acc = REG_W1C;
+    }
     var f: RegField = regfield_new(svd_child_text(fnode, "name"), lsb, width, acc);
     f.desc = svd_child_text(fnode, "description");
     val evs: Vec<XmlNode> = xml_children(fnode, "enumeratedValues");
@@ -196,7 +231,9 @@ fn svd_register(rnode: XmlNode, props: SvdProps, prefix: str, extra_off: i64, ou
     val name: str = svd_child_text(rnode, "name");
     val off: i64 = svd_child_int(rnode, "addressOffset", 0) + extra_off;
     var base: RegDesc = regdesc_new(prefix + name, off, p.size, p.access, p.reset);
-    if str_equal(svd_child_text(rnode, "modifiedWriteValues"), "oneToClear") { base.access = REG_W1C; }
+    if str_equal(svd_child_text(rnode, "modifiedWriteValues"), "oneToClear") {
+        base.access = REG_W1C;
+    }
     base.desc = svd_child_text(rnode, "description");
     if xml_has(rnode, "fields") {
         val fs: Vec<XmlNode> = xml_children(xml_child(rnode, "fields"), "field");
@@ -266,40 +303,55 @@ fn svd_register_list(container: XmlNode, props: SvdProps, prefix: str, extra_off
 fn svd_find_block(blocks: &Vec<RegBlock>, name: str) -> i64 {
     var i: i64 = 0;
     while i < blocks.len() {
-        if str_equal(blocks.get(i).name, name) { return i; }
+        if str_equal(blocks.get(i).name, name) {
+            return i;
+        }
         i = i + 1;
     }
     return -1;
 }
 
 fn svd_fail(msg: str) -> SvdDevice {
-    return SvdDevice { ok: false, error: msg, name: "", width: 0, peripherals: Vec::new(), descs: Vec::new() };
+    return SvdDevice {
+        ok: false, error: msg, name: "", width: 0, peripherals: Vec::new(), descs: Vec::new()
+    };
 }
 
 /// Parse an SVD document.
 pub fn svd_parse(text: str) -> SvdDevice {
     val doc: XmlDoc = xml_load(text);
-    if !doc.ok { return svd_fail("svd: XML: " + doc.error); }
+    if !doc.ok {
+        return svd_fail("svd: XML: " + doc.error);
+    }
     val root: XmlNode = doc.root;
-    if !str_equal(root.tag, "device") { return svd_fail("svd: root element is <" + root.tag + ">, not <device>"); }
-    val top: SvdProps = svd_props(root, SvdProps { size: 32, access: REG_RW, reset: 0 });
+    if !str_equal(root.tag, "device") {
+        return svd_fail("svd: root element is <" + root.tag + ">, not <device>");
+    }
+    val top: SvdProps = svd_props(root, SvdProps {
+        size: 32, access: REG_RW, reset: 0
+    });
     var dev: SvdDevice = SvdDevice {
-        ok: true, error: "", name: svd_child_text(root, "name"),
-        width: svd_child_int(root, "width", 32), peripherals: Vec::new(), descs: Vec::new()
+        ok: true, error: "", name: svd_child_text(root, "name"), width: svd_child_int(root, "width", 32), peripherals: Vec::new(), descs: Vec::new()
     };
-    if !xml_has(root, "peripherals") { return dev; }
+    if !xml_has(root, "peripherals") {
+        return dev;
+    }
     val ps: Vec<XmlNode> = xml_children(xml_child(root, "peripherals"), "peripheral");
     var i: i64 = 0;
     while i < ps.len() {
         val pn: XmlNode = ps.get(i);
         val name: str = svd_child_text(pn, "name");
         val base: i64 = svd_child_int(pn, "baseAddress", -1);
-        if base < 0 { return svd_fail("svd: peripheral " + name + " has no baseAddress"); }
+        if base < 0 {
+            return svd_fail("svd: peripheral " + name + " has no baseAddress");
+        }
         var blk: RegBlock = regblock_new(name, base);
         val from: str = xml_attr(pn, "derivedFrom");
         if str_len(from) > 0 {
             val j: i64 = svd_find_block(&dev.peripherals, from);
-            if j < 0 { return svd_fail("svd: " + name + " derives from unknown " + from); }
+            if j < 0 {
+                return svd_fail("svd: " + name + " derives from unknown " + from);
+            }
             blk.regs = dev.peripherals.get(j).regs;
         }
         val pp: SvdProps = svd_props(pn, top);
@@ -313,7 +365,9 @@ pub fn svd_parse(text: str) -> SvdDevice {
             }
         }
         val errs: Vec<str> = regblock_check(&blk);
-        if errs.len() > 0 { return svd_fail("svd: " + name + ": " + errs.get(0)); }
+        if errs.len() > 0 {
+            return svd_fail("svd: " + name + ": " + errs.get(0));
+        }
         dev.peripherals.push(blk);
         dev.descs.push(svd_child_text(pn, "description"));
         i = i + 1;
@@ -324,7 +378,9 @@ pub fn svd_parse(text: str) -> SvdDevice {
 /// The peripheral named `name` (panics when absent).
 pub fn svd_peripheral(dev: SvdDevice, name: str) -> RegBlock {
     val i: i64 = svd_find_block(&dev.peripherals, name);
-    if i < 0 { p_panic("svd: no peripheral " + name); }
+    if i < 0 {
+        p_panic("svd: no peripheral " + name);
+    }
     return dev.peripherals.get(i);
 }
 

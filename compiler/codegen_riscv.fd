@@ -22,7 +22,13 @@
 // 6. Option<VReg> -> OptVReg enum
 // 7. `as u64`/`as i32` bit extraction -> i64 arithmetic
 
-module compiler::codegen_riscv; use core; use vec; use string; use compiler::ast; use compiler::pir;  // ===========================================================================
+module compiler::codegen_riscv;
+use core;
+use vec;
+use string;
+use compiler::ast;
+use compiler::pir;
+// ===========================================================================
 // Public API
 // ===========================================================================
 
@@ -190,13 +196,13 @@ pub fn RiscVCodeGen_new() -> RiscVCodeGen {
 // --- Output helpers ------------------------------------------------------
 
 /// Append a string with a trailing newline.
-pub fn RiscVCodeGen_wl(self: & mut RiscVCodeGen, s: str) {
+pub fn RiscVCodeGen_wl(self: &mut RiscVCodeGen, s: str) {
     self.output = self.output + s + "\n";
 }
 
 // --- Module / function / block generation -------------------------------
 
-pub fn RiscVCodeGen_gen_module(self: & mut RiscVCodeGen, module: L3Module) {
+pub fn RiscVCodeGen_gen_module(self: &mut RiscVCodeGen, module: L3Module) {
     // Text section
     RiscVCodeGen_wl(self, "    .section .text");
     RiscVCodeGen_wl(self, "    .globl main");
@@ -227,7 +233,7 @@ pub fn RiscVCodeGen_gen_module(self: & mut RiscVCodeGen, module: L3Module) {
     }
 }
 
-pub fn RiscVCodeGen_gen_function(self: & mut RiscVCodeGen, func: L3Function) {
+pub fn RiscVCodeGen_gen_function(self: &mut RiscVCodeGen, func: L3Function) {
     RiscVCodeGen_wl(self, ".globl " + func.name);
     RiscVCodeGen_wl(self, func.name + ":");
 
@@ -254,7 +260,7 @@ pub fn RiscVCodeGen_gen_function(self: & mut RiscVCodeGen, func: L3Function) {
     self.label_counter = self.label_counter + 1;
 }
 
-pub fn RiscVCodeGen_gen_block(self: & mut RiscVCodeGen, func: L3Function, block: L3Block) {
+pub fn RiscVCodeGen_gen_block(self: &mut RiscVCodeGen, func: L3Function, block: L3Block) {
     var i: i64 = 0;
     while i < block.instructions.len() {
         RiscVCodeGen_gen_inst(self, func, block.instructions.get(i));
@@ -264,7 +270,7 @@ pub fn RiscVCodeGen_gen_block(self: & mut RiscVCodeGen, func: L3Function, block:
 
 // --- Instruction generation ---------------------------------------------
 
-pub fn RiscVCodeGen_gen_inst(self: & mut RiscVCodeGen, func: L3Function, inst: L3Inst) {
+pub fn RiscVCodeGen_gen_inst(self: &mut RiscVCodeGen, func: L3Function, inst: L3Inst) {
     match inst {
         L3Inst::AddrOfSlot(dst, slot) => {
             var d: str = rv_vreg_to_reg(dst);
@@ -364,11 +370,11 @@ pub fn RiscVCodeGen_gen_inst(self: & mut RiscVCodeGen, func: L3Function, inst: L
 
 // --- Simple instruction generators ---------------------------------------
 
-pub fn RiscVCodeGen_gen_mov(self: & mut RiscVCodeGen, dst: VReg, src: Operand) {
+pub fn RiscVCodeGen_gen_mov(self: &mut RiscVCodeGen, dst: VReg, src: Operand) {
     var d: str = rv_vreg_to_reg(dst);
     match src {
         Operand::ImmI(i) => {
-            if i >= - 2048 && i <= 2047 {
+            if i >= -2048 && i <= 2047 {
                 RiscVCodeGen_wl(self, "    li " + d + ", " + int_to_str(i));
             } else {
                 // Load large immediate via lui + addi.
@@ -394,7 +400,7 @@ pub fn RiscVCodeGen_gen_mov(self: & mut RiscVCodeGen, dst: VReg, src: Operand) {
     }
 }
 
-pub fn RiscVCodeGen_gen_bin(self: & mut RiscVCodeGen, op: BinOp, dst: VReg, a: Operand, b: Operand) {
+pub fn RiscVCodeGen_gen_bin(self: &mut RiscVCodeGen, op: BinOp, dst: VReg, a: Operand, b: Operand) {
     var d: str = rv_vreg_to_reg(dst);
     var l: str = riscv_operand_to_reg(a);
     var r: str = riscv_operand_to_reg(b);
@@ -443,7 +449,7 @@ pub fn RiscVCodeGen_gen_bin(self: & mut RiscVCodeGen, op: BinOp, dst: VReg, a: O
     }
 }
 
-pub fn RiscVCodeGen_gen_unary(self: & mut RiscVCodeGen, op: UnaryOp, dst: VReg, src: Operand) {
+pub fn RiscVCodeGen_gen_unary(self: &mut RiscVCodeGen, op: UnaryOp, dst: VReg, src: Operand) {
     var d: str = rv_vreg_to_reg(dst);
     var s: str = riscv_operand_to_reg(src);
     if unaryop_eq(op, UnaryOp::Neg) {
@@ -455,7 +461,7 @@ pub fn RiscVCodeGen_gen_unary(self: & mut RiscVCodeGen, op: UnaryOp, dst: VReg, 
     }
 }
 
-pub fn RiscVCodeGen_gen_ret(self: & mut RiscVCodeGen, value: OptOperand) {
+pub fn RiscVCodeGen_gen_ret(self: &mut RiscVCodeGen, value: OptOperand) {
     match value {
         OptOperand::Some(value) => {
             var v: str = riscv_operand_to_reg(value);
@@ -471,7 +477,7 @@ pub fn RiscVCodeGen_gen_ret(self: & mut RiscVCodeGen, value: OptOperand) {
     RiscVCodeGen_wl(self, "    return");
 }
 
-pub fn RiscVCodeGen_gen_call(self: & mut RiscVCodeGen, dst: OptVReg, target: str, args: Vec<Operand>) {
+pub fn RiscVCodeGen_gen_call(self: &mut RiscVCodeGen, dst: OptVReg, target: str, args: Vec<Operand>) {
     var i: i64 = 0;
     while i < args.len() && i < 8 {
         var a: str = riscv_operand_to_reg(args.get(i));
@@ -494,7 +500,7 @@ pub fn RiscVCodeGen_gen_call(self: & mut RiscVCodeGen, dst: OptVReg, target: str
     }
 }
 
-pub fn RiscVCodeGen_gen_call_ptr(self: & mut RiscVCodeGen, dst: OptVReg, fn_ptr: Operand, args: Vec<Operand>) {
+pub fn RiscVCodeGen_gen_call_ptr(self: &mut RiscVCodeGen, dst: OptVReg, fn_ptr: Operand, args: Vec<Operand>) {
     var ptr: str = riscv_operand_to_reg(fn_ptr);
     var i: i64 = 0;
     while i < args.len() && i < 7 {
@@ -518,7 +524,7 @@ pub fn RiscVCodeGen_gen_call_ptr(self: & mut RiscVCodeGen, dst: OptVReg, fn_ptr:
     }
 }
 
-pub fn RiscVCodeGen_gen_dyn_call(self: & mut RiscVCodeGen, dst: OptVReg, trait_name: str, method: str, args: Vec<Operand>) {
+pub fn RiscVCodeGen_gen_dyn_call(self: &mut RiscVCodeGen, dst: OptVReg, trait_name: str, method: str, args: Vec<Operand>) {
     var callee: str = trait_name + "_" + method;
     var i: i64 = 0;
     while i < args.len() && i < 8 {
@@ -542,7 +548,7 @@ pub fn RiscVCodeGen_gen_dyn_call(self: & mut RiscVCodeGen, dst: OptVReg, trait_n
     }
 }
 
-pub fn RiscVCodeGen_gen_cast(self: & mut RiscVCodeGen, dst: VReg, src: Operand, kind: CastKind) {
+pub fn RiscVCodeGen_gen_cast(self: &mut RiscVCodeGen, dst: VReg, src: Operand, kind: CastKind) {
     var d: str = rv_vreg_to_reg(dst);
     var s: str = riscv_operand_to_reg(src);
     if riscv_cast_kind_eq(kind, CastKind::BitCast) {

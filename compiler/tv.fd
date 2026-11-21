@@ -59,10 +59,22 @@
 //     checks must reject, and FID_TV_SELFTEST=1 runs tv_selftest: pairs
 //     (before, after) each check must accept or reject.
 
-module compiler::tv; use core; use vec; use string; use compiler::ast; use compiler::ir; use compiler::checks; use compiler::ssa; use compiler::ir_ser;  /// Runs of each function pair on random inputs.
-const TV_RUNS: i64 = 12;  /// Instructions one run of the function before the pass may execute.
-const TV_STEPS: i64 = 20000;  /// How deep two values are compared, and how many comparisons one check may make.
-const TV_DEPTH: i64 = 8; const TV_BUDGET: i64 = 200000;
+module compiler::tv;
+use core;
+use vec;
+use string;
+use compiler::ast;
+use compiler::ir;
+use compiler::checks;
+use compiler::ssa;
+use compiler::ir_ser;
+/// Runs of each function pair on random inputs.
+const TV_RUNS: i64 = 12;
+/// Instructions one run of the function before the pass may execute.
+const TV_STEPS: i64 = 20000;
+/// How deep two values are compared, and how many comparisons one check may make.
+const TV_DEPTH: i64 = 8;
+const TV_BUDGET: i64 = 200000;
 
 var g_tv_state: i64 = 0;  // 0 unread, 1 on, -1 off
 var g_tv_checked: i64 = 0;
@@ -104,7 +116,7 @@ pub fn tv_on() -> bool {
 
 /// A copy of `f` that the pass cannot change: every Vec a pass edits in
 /// place is copied (instruction payloads are only ever replaced whole).
-pub fn tv_snapshot(f: & IrFunction) -> IrFunction {
+pub fn tv_snapshot(f: &IrFunction) -> IrFunction {
     var nf: IrFunction = IrFunction_new(f.name, f.ret_ty);
     nf.params = f.params.clone();
     var nbl: Vec<BasicBlock> = Vec::new();
@@ -139,7 +151,7 @@ pub fn tv_snapshot(f: & IrFunction) -> IrFunction {
 }
 
 /// Give `f` back the IR of `s` (a tv_snapshot of it).
-fn tv_restore(f: & mut IrFunction, s: & IrFunction) {
+fn tv_restore(f: &mut IrFunction, s: &IrFunction) {
     f.params = s.params;
     f.blocks = s.blocks;
     f.value_metas = s.value_metas;
@@ -158,7 +170,7 @@ fn tv_restore(f: & mut IrFunction, s: & IrFunction) {
 
 /// Before a pass: the function as it is when validation is on (an empty
 /// function otherwise, which tv_after never reads).
-pub fn tv_before(f: & IrFunction) -> IrFunction {
+pub fn tv_before(f: &IrFunction) -> IrFunction {
     if !tv_on() {
         return IrFunction_new("", IrType::Void);
     }
@@ -167,7 +179,7 @@ pub fn tv_before(f: & IrFunction) -> IrFunction {
 
 /// After pass `pass` changed `f` (from `pre`, a tv_before): true when the
 /// result is accepted; false when it was rejected, and `f` is `pre` again.
-pub fn tv_after(pname: str, pre: & IrFunction, f: & mut IrFunction) -> bool {
+pub fn tv_after(pname: str, pre: &IrFunction, f: &mut IrFunction) -> bool {
     if !tv_on() {
         return true;
     }
@@ -185,7 +197,7 @@ pub fn tv_after(pname: str, pre: & IrFunction, f: & mut IrFunction) -> bool {
 /// checkable, else rejected: `f` gets back the IR of `pre`), counted and
 /// reported; with FID_VALIDATE_SMT the pair is also written as an SMT-LIB
 /// obligation (straight-line code only).
-fn tv_settle(pname: str, why: str, inj: bool, pre: & IrFunction, f: & mut IrFunction) -> bool {
+fn tv_settle(pname: str, why: str, inj: bool, pre: &IrFunction, f: &mut IrFunction) -> bool {
     tv_smt_pair(pname, pre, f, inj, why);
     if inj {
         g_tv_injected = g_tv_injected + 1;
@@ -271,7 +283,7 @@ pub fn tv_report() {
 
 /// Does `post` mean what `pre` meant, after pass `pass`? "" yes, "n/a" no
 /// check applies, else why not.
-pub fn tv_check(pname: str, pre: & IrFunction, post: & IrFunction) -> str {
+pub fn tv_check(pname: str, pre: &IrFunction, post: &IrFunction) -> str {
     // VF6: LICM keeps value ids and only moves instructions (tv_licm)
     if pname == "licm" {
         var lw: str = tv_licm(pre, post);
@@ -399,7 +411,8 @@ fn tv_is_float(t: IrType) -> bool {
 
 /// `v` as a value of type `t`: the low bits, sign-extended for a signed
 /// type; 0 or 1 for bool; all 64 bits for anything else.
-@wrapping fn tv_narrow(v: i64, t: IrType) -> i64 {
+@wrapping
+fn tv_narrow(v: i64, t: IrType) -> i64 {
     var bits: i64 = tv_bits(t);
     if bits >= 64 {
         return v;
@@ -416,17 +429,20 @@ fn tv_is_float(t: IrType) -> bool {
 }
 
 /// a < b as unsigned 64-bit values.
-@wrapping fn tv_ult(a: i64, b: i64) -> bool {
+@wrapping
+fn tv_ult(a: i64, b: i64) -> bool {
     var top: i64 = 1 << 63;
     return (a ^ top) < (b ^ top);
 }
 
-@wrapping fn tv_mix(h: i64, v: i64) -> i64 {
+@wrapping
+fn tv_mix(h: i64, v: i64) -> i64 {
     var x: i64 = (h ^ v) * 1099511628211;
     return x ^ (x >> 31);
 }
 
-@wrapping fn tv_hash_str(s: str) -> i64 {
+@wrapping
+fn tv_hash_str(s: str) -> i64 {
     var h: i64 = 1469598103934665603;
     var i: i64 = 0;
     var n: i64 = str_len(s);
@@ -451,7 +467,8 @@ fn tv_quiet_op(op: BinOp) -> bool {
 /// zero panics) unless the function is @wrapping. Unsigned 64-bit
 /// multiplication, division and remainder, shifts by the width or more,
 /// and floats are not computed.
-@wrapping fn tv_binop(op: BinOp, a: i64, b: i64, ot: IrType, rt: IrType, wrapping: bool) -> TvK {
+@wrapping
+fn tv_binop(op: BinOp, a: i64, b: i64, ot: IrType, rt: IrType, wrapping: bool) -> TvK {
     if tv_is_float(ot) || tv_is_float(rt) {
         return tv_k(2, 0);
     }
@@ -635,7 +652,8 @@ fn tv_quiet_op(op: BinOp) -> bool {
     return tv_k(2, 0);
 }
 
-@wrapping fn tv_unop(op: UnaryOp, a: i64, t: IrType, wrapping: bool) -> TvK {
+@wrapping
+fn tv_unop(op: UnaryOp, a: i64, t: IrType, wrapping: bool) -> TvK {
     if tv_is_float(t) {
         return tv_k(2, 0);
     }
@@ -683,28 +701,28 @@ pub struct TvShape {
     pub bindex: Vec<i64>,
 }
 
-fn tv_bidx(sh: & TvShape, bid: i64) -> i64 {
+fn tv_bidx(sh: &TvShape, bid: i64) -> i64 {
     if bid >= 0 && bid < sh.bindex.len() {
         return sh.bindex.get(bid);
     }
-    return - 1;
+    return -1;
 }
 
-fn tv_get(v: & Vec<i64>, id: i64) -> i64 {
+fn tv_get(v: &Vec<i64>, id: i64) -> i64 {
     if id >= 0 && id < v.len() {
         return v.get(id);
     }
     return 0;
 }
 
-fn tv_shape_of(f: & IrFunction) -> TvShape {
+fn tv_shape_of(f: &IrFunction) -> TvShape {
     return tv_shape_x(f, 0, false);
 }
 
 /// tv_shape_of, and with `wide` (the module checks, tv_wrandom) also the
 /// addresses of the globals in `gc` (name -> value, tv_gconst_facts) that
 /// only loads read (plain 2), and calls through a pointer.
-fn tv_shape_x(f: & IrFunction, gc: i64, wide: bool) -> TvShape {
+fn tv_shape_x(f: &IrFunction, gc: i64, wide: bool) -> TvShape {
     var nv: i64 = f.next_value + 1;
     var plain: Vec<i64> = peir_zeros(nv);
     var maxid: i64 = 0;
@@ -717,7 +735,7 @@ fn tv_shape_x(f: & IrFunction, gc: i64, wide: bool) -> TvShape {
     }
     var bindex: Vec<i64> = Vec::new();
     while bindex.len() <= maxid {
-        bindex.push(- 1);
+        bindex.push(-1);
     }
     b = 0;
     while b < f.blocks.len() {
@@ -753,7 +771,7 @@ fn tv_shape_x(f: & IrFunction, gc: i64, wide: bool) -> TvShape {
         while k2 < ids2.len() {
             var inst: Inst = peir_inst_of(f, ids2.get(k2));
             var ops: Vec<i64> = Vec::new();
-            peir_inst_operands(inst, & mut ops);
+            peir_inst_operands(inst, &mut ops);
             var o: i64 = 0;
             while o < ops.len() {
                 var v: i64 = ops.get(o);
@@ -820,10 +838,10 @@ fn tv_shape_x(f: & IrFunction, gc: i64, wide: bool) -> TvShape {
                     ok = !tv_is_float(t);
                 }
                 Inst::Jump(t) => {
-                    ok = tv_bidx_of(& bindex, t) >= 0;
+                    ok = tv_bidx_of(&bindex, t) >= 0;
                 }
                 Inst::Branch(_, t, e) => {
-                    ok = tv_bidx_of(& bindex, t) >= 0 && tv_bidx_of(& bindex, e) >= 0;
+                    ok = tv_bidx_of(&bindex, t) >= 0 && tv_bidx_of(&bindex, e) >= 0;
                 }
                 Inst::Return(_) => {
                 }
@@ -863,7 +881,7 @@ fn tv_shape_x(f: & IrFunction, gc: i64, wide: bool) -> TvShape {
 /// iropt_native sets it before its per-function loop and forgets it after.
 var g_tv_gc: i64 = 0;
 
-pub fn tv_note_globals(module: & IrModule) {
+pub fn tv_note_globals(module: &IrModule) {
     g_tv_gc = 0;
     if !tv_on() {
         return;
@@ -874,7 +892,7 @@ pub fn tv_note_globals(module: & IrModule) {
         fns.push(module.functions.get(i).func);
         i = i + 1;
     }
-    g_tv_gc = tv_gconst_facts(& fns, & module.globals);
+    g_tv_gc = tv_gconst_facts(&fns, &module.globals);
 }
 
 pub fn tv_forget_globals() {
@@ -882,7 +900,7 @@ pub fn tv_forget_globals() {
 }
 
 /// The literal of the constant global (g_tv_gc) whose address is `p` in `f`.
-fn tv_fglobal(f: & IrFunction, p: i64) -> i64 {
+fn tv_fglobal(f: &IrFunction, p: i64) -> i64 {
     match peir_inst_of(f, p) {
         Inst::GlobalAddr(gn, _) => {
             if g_tv_gc != 0 && HashMap_contains(g_tv_gc, gn) {
@@ -895,11 +913,11 @@ fn tv_fglobal(f: & IrFunction, p: i64) -> i64 {
     return 0;
 }
 
-fn tv_bidx_of(bindex: & Vec<i64>, bid: i64) -> i64 {
+fn tv_bidx_of(bindex: &Vec<i64>, bid: i64) -> i64 {
     if bid >= 0 && bid < bindex.len() {
         return bindex.get(bid);
     }
-    return - 1;
+    return -1;
 }
 
 /// What one run did: kind 0 returned `val`, 1 panicked, 2 reached
@@ -912,7 +930,7 @@ pub struct TvOut {
     pub steps: i64,
 }
 
-fn tv_eval(f: & IrFunction, sh: & TvShape, args: & Vec<i64>, limit: i64) -> TvOut {
+fn tv_eval(f: &IrFunction, sh: &TvShape, args: &Vec<i64>, limit: i64) -> TvOut {
     var nv: i64 = f.next_value + 1;
     var vals: Vec<i64> = peir_zeros(nv);
     var mem: Vec<i64> = peir_zeros(nv);
@@ -935,7 +953,7 @@ fn tv_eval(f: & IrFunction, sh: & TvShape, args: & Vec<i64>, limit: i64) -> TvOu
     while !done {
         var ids: Vec<i64> = f.blocks.get(b).instructions;
         var k: i64 = 0;
-        var nxt: i64 = - 1;
+        var nxt: i64 = -1;
         while k < ids.len() && nxt < 0 && !done {
             var id: i64 = ids.get(k);
             steps = steps + 1;
@@ -973,20 +991,20 @@ fn tv_eval(f: & IrFunction, sh: & TvShape, args: & Vec<i64>, limit: i64) -> TvOu
                         vals.set(id, tv_hash_str(gn));
                     }
                     Inst::Load(p, t) => {
-                        if tv_get(& sh.plain, p) == 2 {
+                        if tv_get(&sh.plain, p) == 2 {
                             // a constant global of the module (g_tv_gc)
                             vals.set(id, tv_narrow(tv_fglobal(f, p), t));
                         } else {
-                            vals.set(id, tv_narrow(tv_get(& mem, p), t));
+                            vals.set(id, tv_narrow(tv_get(&mem, p), t));
                         }
                     }
                     Inst::Store(p, v, _) => {
                         if p >= 0 && p < nv {
-                            mem.set(p, tv_get(& vals, v));
+                            mem.set(p, tv_get(&vals, v));
                         }
                     }
                     Inst::BinOp(op, l, r, t) => {
-                        var res: TvK = tv_binop(op, tv_get(& vals, l), tv_get(& vals, r), ssa_vty(f, l), t, f.is_wrapping);
+                        var res: TvK = tv_binop(op, tv_get(&vals, l), tv_get(&vals, r), ssa_vty(f, l), t, f.is_wrapping);
                         if res.kind == 0 {
                             vals.set(id, res.v);
                         } else if res.kind == 1 {
@@ -998,7 +1016,7 @@ fn tv_eval(f: & IrFunction, sh: & TvShape, args: & Vec<i64>, limit: i64) -> TvOu
                         }
                     }
                     Inst::UnaryOp(op, x, t) => {
-                        var ru: TvK = tv_unop(op, tv_get(& vals, x), t, f.is_wrapping);
+                        var ru: TvK = tv_unop(op, tv_get(&vals, x), t, f.is_wrapping);
                         if ru.kind == 0 {
                             vals.set(id, ru.v);
                         } else if ru.kind == 1 {
@@ -1010,23 +1028,23 @@ fn tv_eval(f: & IrFunction, sh: & TvShape, args: & Vec<i64>, limit: i64) -> TvOu
                         }
                     }
                     Inst::IntExtend(x, _, to) => {
-                        vals.set(id, tv_narrow(tv_get(& vals, x), to));
+                        vals.set(id, tv_narrow(tv_get(&vals, x), to));
                     }
                     Inst::IntTrunc(x, _, to) => {
-                        vals.set(id, tv_narrow(tv_get(& vals, x), to));
+                        vals.set(id, tv_narrow(tv_get(&vals, x), to));
                     }
                     Inst::BitCast(x, _, _) => {
-                        vals.set(id, tv_get(& vals, x));
+                        vals.set(id, tv_get(&vals, x));
                     }
                     Inst::Call(nm, cargs, rt, eff) => {
                         var h: i64 = tv_hash_str(nm);
                         var ai: i64 = 0;
                         while ai < cargs.len() {
-                            h = tv_mix(h, tv_get(& vals, cargs.get(ai)));
+                            h = tv_mix(h, tv_get(&vals, cargs.get(ai)));
                             ai = ai + 1;
                         }
                         var es: EffectSet = eff;
-                        if !EffectSet_is_pure(& es) {
+                        if !EffectSet_is_pure(&es) {
                             ncalls = ncalls + 1;
                             h = tv_mix(h, ncalls);
                             trace = tv_mix(tv_mix(trace, 11), h);
@@ -1034,7 +1052,7 @@ fn tv_eval(f: & IrFunction, sh: & TvShape, args: & Vec<i64>, limit: i64) -> TvOu
                         vals.set(id, tv_narrow(h, rt));
                     }
                     Inst::Print(x, _) => {
-                        trace = tv_mix(tv_mix(trace, 13), tv_get(& vals, x));
+                        trace = tv_mix(tv_mix(trace, 13), tv_get(&vals, x));
                     }
                     Inst::Jump(t) => {
                         nxt = tv_bidx(sh, t);
@@ -1044,7 +1062,7 @@ fn tv_eval(f: & IrFunction, sh: & TvShape, args: & Vec<i64>, limit: i64) -> TvOu
                         }
                     }
                     Inst::Branch(c, t, e) => {
-                        if tv_get(& vals, c) != 0 {
+                        if tv_get(&vals, c) != 0 {
                             nxt = tv_bidx(sh, t);
                         } else {
                             nxt = tv_bidx(sh, e);
@@ -1057,7 +1075,7 @@ fn tv_eval(f: & IrFunction, sh: & TvShape, args: & Vec<i64>, limit: i64) -> TvOu
                     Inst::Return(rv) => {
                         match rv {
                             OptValueId::Some(x) => {
-                                out.val = tv_get(& vals, x);
+                                out.val = tv_get(&vals, x);
                             }
                             OptValueId::None => {
                             }
@@ -1097,7 +1115,8 @@ fn tv_eval(f: & IrFunction, sh: & TvShape, args: & Vec<i64>, limit: i64) -> TvOu
 
 /// The input of one run for a parameter of type `t`: 0, 1, -1, then small
 /// values (loop bounds), then larger and full-width random ones.
-@wrapping fn tv_arg(t: IrType, run: i64, r: i64) -> i64 {
+@wrapping
+fn tv_arg(t: IrType, run: i64, r: i64) -> i64 {
     var v: i64 = r;
     if run == 0 {
         v = 0;
@@ -1116,7 +1135,7 @@ fn tv_eval(f: & IrFunction, sh: & TvShape, args: & Vec<i64>, limit: i64) -> TvOu
     return tv_narrow(v, t);
 }
 
-fn tv_out_str(o: & TvOut) -> str {
+fn tv_out_str(o: &TvOut) -> str {
     if o.kind == 0 {
         return "returned " + int_to_str(o.val);
     }
@@ -1129,7 +1148,7 @@ fn tv_out_str(o: & TvOut) -> str {
     return "fell off the end of a block";
 }
 
-fn tv_args_str(args: & Vec<i64>) -> str {
+fn tv_args_str(args: &Vec<i64>) -> str {
     var s: str = "(";
     var i: i64 = 0;
     while i < args.len() {
@@ -1145,7 +1164,7 @@ fn tv_args_str(args: & Vec<i64>) -> str {
 /// RL5: run `pre` and `post` on the same inputs; "" when every run that
 /// finished agrees, "n/a" when none could be run, else the first
 /// disagreement.
-pub fn tv_random(pre: & IrFunction, post: & IrFunction) -> str {
+pub fn tv_random(pre: &IrFunction, post: &IrFunction) -> str {
     if pre.params.len() != post.params.len() {
         return "n/a";
     }
@@ -1170,9 +1189,9 @@ pub fn tv_random(pre: & IrFunction, post: & IrFunction) -> str {
             args.push(tv_arg(pre.params.get(pi).ty, run, seed));
             pi = pi + 1;
         }
-        var oa: TvOut = tv_eval(pre, & sa, & args, TV_STEPS);
+        var oa: TvOut = tv_eval(pre, &sa, &args, TV_STEPS);
         if oa.kind < 4 {
-            var ob: TvOut = tv_eval(post, & sb, & args, oa.steps * 8 + 1000);
+            var ob: TvOut = tv_eval(post, &sb, &args, oa.steps * 8 + 1000);
             if ob.kind < 4 {
                 conclusive = conclusive + 1;
                 var same: bool = oa.kind == ob.kind && oa.trace == ob.trace;
@@ -1181,9 +1200,9 @@ pub fn tv_random(pre: & IrFunction, post: & IrFunction) -> str {
                 }
                 if !same {
                     if oa.trace != ob.trace && oa.kind == ob.kind {
-                        return "on inputs " + tv_args_str(& args) + " the calls or prints differ";
+                        return "on inputs " + tv_args_str(&args) + " the calls or prints differ";
                     }
-                    return "on inputs " + tv_args_str(& args) + " the function " + tv_out_str(& oa) + " before the pass and " + tv_out_str(& ob) + " after it";
+                    return "on inputs " + tv_args_str(&args) + " the function " + tv_out_str(&oa) + " before the pass and " + tv_out_str(&ob) + " after it";
                 }
             }
         }
@@ -1201,7 +1220,7 @@ pub fn tv_random(pre: & IrFunction, post: & IrFunction) -> str {
 /// another way (pure, cannot panic), 1 keep it or reuse an equal one that
 /// comes first (it may panic), 2 keep it in its order (an effect, the end
 /// of a block).
-fn tv_class(f: & IrFunction, plain: & Vec<i64>, inst: Inst) -> i64 {
+fn tv_class(f: &IrFunction, plain: &Vec<i64>, inst: Inst) -> i64 {
     match inst {
         Inst::ConstInt(_, _) => {
             return 0;
@@ -1405,7 +1424,7 @@ fn tv_shape(inst: Inst) -> str {
 /// operation on constants evaluated at its type. Kind 0 a value, 1 the
 /// operation panics, 3 constants this evaluator does not compute, 2 not a
 /// constant.
-pub fn tv_constk(f: & IrFunction, v: i64, d: i64) -> TvK {
+pub fn tv_constk(f: &IrFunction, v: i64, d: i64) -> TvK {
     if d > 6 || v < 0 {
         return tv_k(2, 0);
     }
@@ -1456,7 +1475,7 @@ pub fn tv_constk(f: & IrFunction, v: i64, d: i64) -> TvK {
     return tv_k(2, 0);
 }
 
-fn tv_has_inst(f: & IrFunction, v: i64) -> bool {
+fn tv_has_inst(f: &IrFunction, v: i64) -> bool {
     match IrFunction_get_inst(f, v) {
         OptInst::Some(_) => {
             return true;
@@ -1482,7 +1501,7 @@ pub struct TvCtx {
     pub rep: Vec<i64>,
 }
 
-fn tv_is_slot_load(plain: & Vec<i64>, inst: Inst) -> bool {
+fn tv_is_slot_load(plain: &Vec<i64>, inst: Inst) -> bool {
     match inst {
         Inst::Load(p, _) => {
             return tv_get(plain, p) == 1;
@@ -1496,8 +1515,8 @@ fn tv_is_slot_load(plain: & Vec<i64>, inst: Inst) -> bool {
 /// Is load `b` before load `a` (of pointer `p`) in one block of the
 /// function before the pass, with nothing between that may write what they
 /// read: for a plain local a store to it, else anything with an effect?
-fn tv_quiet_between(pre: & IrFunction, cx: & TvCtx, b: i64, a: i64, p: i64) -> bool {
-    var ba: i64 = tv_get(& cx.blk_a, a);
+fn tv_quiet_between(pre: &IrFunction, cx: &TvCtx, b: i64, a: i64, p: i64) -> bool {
+    var ba: i64 = tv_get(&cx.blk_a, a);
     if b < 0 || b >= cx.blk_a.len() || a < 0 || a >= cx.blk_a.len() {
         return false;
     }
@@ -1505,7 +1524,7 @@ fn tv_quiet_between(pre: & IrFunction, cx: & TvCtx, b: i64, a: i64, p: i64) -> b
         return false;
     }
     var ids: Vec<i64> = pre.blocks.get(ba).instructions;
-    var is_local: bool = tv_get(& cx.plain_a, p) == 1;
+    var is_local: bool = tv_get(&cx.plain_a, p) == 1;
     var k: i64 = cx.pos_a.get(b) + 1;
     while k < cx.pos_a.get(a) {
         var inst: Inst = peir_inst_of(pre, ids.get(k));
@@ -1519,7 +1538,7 @@ fn tv_quiet_between(pre: & IrFunction, cx: & TvCtx, b: i64, a: i64, p: i64) -> b
                 _ => {
                 }
             }
-        } else if tv_class(pre, & cx.plain_a, inst) == 2 {
+        } else if tv_class(pre, &cx.plain_a, inst) == 2 {
             return false;
         }
         k = k + 1;
@@ -1528,7 +1547,7 @@ fn tv_quiet_between(pre: & IrFunction, cx: & TvCtx, b: i64, a: i64, p: i64) -> b
 }
 
 /// Does value `b` after the pass equal value `a` before it?
-fn tv_val_eq(pre: & IrFunction, post: & IrFunction, cx: & mut TvCtx, a: i64, b: i64, d: i64) -> bool {
+fn tv_val_eq(pre: &IrFunction, post: &IrFunction, cx: &mut TvCtx, a: i64, b: i64, d: i64) -> bool {
     cx.budget = cx.budget - 1;
     if cx.budget < 0 {
         // out of comparisons: only an unchanged name passes
@@ -1554,8 +1573,8 @@ fn tv_val_eq(pre: & IrFunction, post: & IrFunction, cx: & mut TvCtx, a: i64, b: 
         // replaces a promoted load may be a parameter, which has no
         // instruction, so this comes before the parameters' rule). The
         // check then says "not checkable" when no run can be made.
-        var sa: bool = ha && tv_is_slot_load(& cx.plain_a, peir_inst_of(pre, a));
-        var sb: bool = hb && tv_is_slot_load(& cx.plain_b, peir_inst_of(post, b));
+        var sa: bool = ha && tv_is_slot_load(&cx.plain_a, peir_inst_of(pre, a));
+        var sb: bool = hb && tv_is_slot_load(&cx.plain_b, peir_inst_of(post, b));
         if sa || sb {
             g_tv_deferred = true;
             return true;
@@ -1573,7 +1592,7 @@ fn tv_val_eq(pre: & IrFunction, post: & IrFunction, cx: & mut TvCtx, a: i64, b: 
     if d >= TV_DEPTH {
         return a == b;
     }
-    var cl: i64 = tv_class(pre, & cx.plain_a, ia);
+    var cl: i64 = tv_class(pre, &cx.plain_a, ia);
     if cl == 2 {
         // the result of a call or an effect is only itself
         return a == b;
@@ -1588,9 +1607,9 @@ fn tv_val_eq(pre: & IrFunction, post: & IrFunction, cx: & mut TvCtx, a: i64, b: 
         }
     }
     var oa: Vec<i64> = Vec::new();
-    peir_inst_operands(ia, & mut oa);
+    peir_inst_operands(ia, &mut oa);
     var ob: Vec<i64> = Vec::new();
-    peir_inst_operands(ib, & mut ob);
+    peir_inst_operands(ib, &mut ob);
     if oa.len() != ob.len() {
         return false;
     }
@@ -1609,7 +1628,7 @@ fn tv_val_eq(pre: & IrFunction, post: & IrFunction, cx: & mut TvCtx, a: i64, b: 
 
 /// The instructions of block `ids` that must stay in order (class 2). The
 /// SSA round trip may remove and add allocas and the stores of plain locals.
-fn tv_kept(f: & IrFunction, plain: & Vec<i64>, ids: Vec<i64>, pname: str) -> Vec<i64> {
+fn tv_kept(f: &IrFunction, plain: &Vec<i64>, ids: Vec<i64>, pname: str) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     var k: i64 = 0;
     while k < ids.len() {
@@ -1641,8 +1660,8 @@ fn tv_kept(f: & IrFunction, plain: & Vec<i64>, ids: Vec<i64>, pname: str) -> Vec
 /// A removed instruction `id` that may panic is covered by an equal one
 /// that is kept and runs first (in its block before it, or in a block that
 /// dominates it).
-fn tv_covered(pre: & IrFunction, post: & IrFunction, cx: & mut TvCtx, in_b: & Vec<i64>, id: i64) -> bool {
-    var r: i64 = tv_get(& cx.rep, id);
+fn tv_covered(pre: &IrFunction, post: &IrFunction, cx: &mut TvCtx, in_b: &Vec<i64>, id: i64) -> bool {
+    var r: i64 = tv_get(&cx.rep, id);
     var cands: Vec<i64> = Vec::new();
     if r > 0 {
         cands.push(r - 1);
@@ -1666,21 +1685,21 @@ fn tv_covered(pre: & IrFunction, post: & IrFunction, cx: & mut TvCtx, in_b: & Ve
     var ci: i64 = 0;
     while ci < cands.len() {
         var y2: i64 = cands.get(ci);
-        var by: i64 = tv_get(& cx.blk_a, y2);
-        var bx: i64 = tv_get(& cx.blk_a, id);
+        var by: i64 = tv_get(&cx.blk_a, y2);
+        var bx: i64 = tv_get(&cx.blk_a, id);
         var first: bool = false;
         if by >= 0 && bx >= 0 && y2 < cx.blk_a.len() {
             if by == bx {
                 first = cx.pos_a.get(y2) < cx.pos_a.get(id);
             } else {
-                first = iro_dominates(& cx.cfg_a, by, bx);
+                first = iro_dominates(&cx.cfg_a, by, bx);
             }
         }
         if first && tv_get(in_b, y2) == 1 {
             var oa: Vec<i64> = Vec::new();
-            peir_inst_operands(peir_inst_of(pre, id), & mut oa);
+            peir_inst_operands(peir_inst_of(pre, id), &mut oa);
             var ob: Vec<i64> = Vec::new();
-            peir_inst_operands(peir_inst_of(post, y2), & mut ob);
+            peir_inst_operands(peir_inst_of(post, y2), &mut ob);
             var same: bool = oa.len() == ob.len() && tv_shape(peir_inst_of(pre, id)) == tv_shape(peir_inst_of(post, y2));
             var i: i64 = 0;
             while same && i < oa.len() {
@@ -1698,7 +1717,7 @@ fn tv_covered(pre: & IrFunction, post: & IrFunction, cx: & mut TvCtx, in_b: & Ve
 
 /// VF6: check the rewrites of a pass that keeps value ids (fold, dce, gvn,
 /// ssa). "" accepted, "n/a" another pass, else what is wrong.
-pub fn tv_structural(pname: str, pre: & IrFunction, post: & IrFunction) -> str {
+pub fn tv_structural(pname: str, pre: &IrFunction, post: &IrFunction) -> str {
     g_tv_deferred = false;
     if pname != "fold" && pname != "dce" && pname != "gvn" && pname != "ssa" {
         return "n/a";
@@ -1720,8 +1739,8 @@ pub fn tv_structural(pname: str, pre: & IrFunction, post: & IrFunction) -> str {
     var pos_a: Vec<i64> = Vec::new();
     var z: i64 = 0;
     while z < nva {
-        blk_a.push(- 1);
-        pos_a.push(- 1);
+        blk_a.push(-1);
+        pos_a.push(-1);
         z = z + 1;
     }
     bi = 0;
@@ -1758,8 +1777,8 @@ pub fn tv_structural(pname: str, pre: & IrFunction, post: & IrFunction) -> str {
     // 1. what has an effect stays, in its order, on equal operands
     bi = 0;
     while bi < pre.blocks.len() {
-        var la: Vec<i64> = tv_kept(pre, & cx.plain_a, pre.blocks.get(bi).instructions, pname);
-        var lb: Vec<i64> = tv_kept(post, & cx.plain_b, post.blocks.get(bi).instructions, pname);
+        var la: Vec<i64> = tv_kept(pre, &cx.plain_a, pre.blocks.get(bi).instructions, pname);
+        var lb: Vec<i64> = tv_kept(post, &cx.plain_b, post.blocks.get(bi).instructions, pname);
         var bid: str = int_to_str(pre.blocks.get(bi).id);
         if la.len() != lb.len() {
             return "an instruction with an effect was added or removed in block " + bid;
@@ -1776,15 +1795,15 @@ pub fn tv_structural(pname: str, pre: & IrFunction, post: & IrFunction) -> str {
                 return "%" + int_to_str(e) + " changed";
             }
             var oa: Vec<i64> = Vec::new();
-            peir_inst_operands(ia, & mut oa);
+            peir_inst_operands(ia, &mut oa);
             var ob: Vec<i64> = Vec::new();
-            peir_inst_operands(ib, & mut ob);
+            peir_inst_operands(ib, &mut ob);
             if oa.len() != ob.len() {
                 return "%" + int_to_str(e) + " changed its operands";
             }
             var o: i64 = 0;
             while o < oa.len() {
-                if !tv_val_eq(pre, post, & mut cx, oa.get(o), ob.get(o), 0) {
+                if !tv_val_eq(pre, post, &mut cx, oa.get(o), ob.get(o), 0) {
                     return "an operand of %" + int_to_str(e) + " changed its value";
                 }
                 o = o + 1;
@@ -1800,8 +1819,8 @@ pub fn tv_structural(pname: str, pre: & IrFunction, post: & IrFunction) -> str {
         var k2: i64 = 0;
         while k2 < ids2.len() {
             var p: i64 = ids2.get(k2);
-            if tv_class(pre, & cx.plain_a, peir_inst_of(pre, p)) == 1 && tv_get(& in_b, p) == 1 {
-                if !tv_val_eq(pre, post, & mut cx, p, p, 0) {
+            if tv_class(pre, &cx.plain_a, peir_inst_of(pre, p)) == 1 && tv_get(&in_b, p) == 1 {
+                if !tv_val_eq(pre, post, &mut cx, p, p, 0) {
                     return "%" + int_to_str(p) + " (it may panic) changed its value";
                 }
             }
@@ -1816,8 +1835,8 @@ pub fn tv_structural(pname: str, pre: & IrFunction, post: & IrFunction) -> str {
         var k3: i64 = 0;
         while k3 < ids3.len() {
             var q: i64 = ids3.get(k3);
-            if tv_class(pre, & cx.plain_a, peir_inst_of(pre, q)) == 1 && tv_get(& in_b, q) == 0 {
-                if !tv_covered(pre, post, & mut cx, & in_b, q) {
+            if tv_class(pre, &cx.plain_a, peir_inst_of(pre, q)) == 1 && tv_get(&in_b, q) == 0 {
+                if !tv_covered(pre, post, &mut cx, &in_b, q) {
                     return "%" + int_to_str(q) + " (it may panic) was removed with nothing equal before it";
                 }
             }
@@ -1832,7 +1851,8 @@ pub fn tv_structural(pname: str, pre: & IrFunction, post: & IrFunction) -> str {
 
 /// How deep the module checks follow calls into the module, and the largest
 /// function written as an SMT obligation (instructions).
-const TV_CALL_DEPTH: i64 = 6; const TV_SMT_MAX: i64 = 400;
+const TV_CALL_DEPTH: i64 = 6;
+const TV_SMT_MAX: i64 = 400;
 
 /// Per value of a function (ids below `n`): the index of the block holding
 /// it and its position there; -1 in no block, -2 in more than one place.
@@ -1841,13 +1861,13 @@ pub struct TvPos {
     pub pos: Vec<i64>,
 }
 
-fn tv_pos_of(f: & IrFunction, n: i64) -> TvPos {
+fn tv_pos_of(f: &IrFunction, n: i64) -> TvPos {
     var blk: Vec<i64> = Vec::new();
     var pos: Vec<i64> = Vec::new();
     var z: i64 = 0;
     while z < n {
-        blk.push(- 1);
-        pos.push(- 1);
+        blk.push(-1);
+        pos.push(-1);
         z = z + 1;
     }
     var b: i64 = 0;
@@ -1857,8 +1877,8 @@ fn tv_pos_of(f: & IrFunction, n: i64) -> TvPos {
         while k < ids.len() {
             var id: i64 = ids.get(k);
             if id >= 0 && id < n {
-                if blk.get(id) != - 1 {
-                    blk.set(id, - 2);
+                if blk.get(id) != -1 {
+                    blk.set(id, -2);
                 } else {
                     blk.set(id, b);
                     pos.set(id, k);
@@ -1874,14 +1894,14 @@ fn tv_pos_of(f: & IrFunction, n: i64) -> TvPos {
 }
 
 /// The larger of the two functions' value counts.
-fn tv_nvals(a: & IrFunction, b: & IrFunction) -> i64 {
+fn tv_nvals(a: &IrFunction, b: &IrFunction) -> i64 {
     if a.next_value > b.next_value {
         return a.next_value + 1;
     }
     return b.next_value + 1;
 }
 
-fn tv_same_ids(a: & Vec<i64>, b: & Vec<i64>) -> bool {
+fn tv_same_ids(a: &Vec<i64>, b: &Vec<i64>) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -1901,15 +1921,15 @@ fn tv_same_inst(ia: Inst, ib: Inst) -> bool {
         return false;
     }
     var oa: Vec<i64> = Vec::new();
-    peir_inst_operands(ia, & mut oa);
+    peir_inst_operands(ia, &mut oa);
     var ob: Vec<i64> = Vec::new();
-    peir_inst_operands(ib, & mut ob);
-    return tv_same_ids(& oa, & ob);
+    peir_inst_operands(ib, &mut ob);
+    return tv_same_ids(&oa, &ob);
 }
 
 /// "" when both functions have the same blocks holding the same ids, in
 /// the same order; else what differs.
-fn tv_same_blocks(pre: & IrFunction, post: & IrFunction) -> str {
+fn tv_same_blocks(pre: &IrFunction, post: &IrFunction) -> str {
     if pre.blocks.len() != post.blocks.len() {
         return "the blocks changed";
     }
@@ -1920,7 +1940,7 @@ fn tv_same_blocks(pre: & IrFunction, post: & IrFunction) -> str {
         if ba.id != bb.id {
             return "the blocks changed";
         }
-        if !tv_same_ids(& ba.instructions, & bb.instructions) {
+        if !tv_same_ids(&ba.instructions, &bb.instructions) {
             return "the instructions of block " + int_to_str(ba.id) + " changed";
         }
         bi = bi + 1;
@@ -1929,7 +1949,7 @@ fn tv_same_blocks(pre: & IrFunction, post: & IrFunction) -> str {
 }
 
 /// Is `y` of `f` neither able to panic nor seen (tv_class 0), or a stack slot?
-fn tv_quiet_id(f: & IrFunction, plain: & Vec<i64>, y: i64) -> bool {
+fn tv_quiet_id(f: &IrFunction, plain: &Vec<i64>, y: i64) -> bool {
     var inst: Inst = peir_inst_of(f, y);
     match inst {
         Inst::Alloca(_, _) => {
@@ -1965,7 +1985,7 @@ fn tv_call_kind(name: str) -> i64 {
 }
 
 /// Does a block of loop `body` (flags per block index) of `f` store local `p`?
-fn tv_loop_stores(f: & IrFunction, body: & Vec<i64>, p: i64) -> bool {
+fn tv_loop_stores(f: &IrFunction, body: &Vec<i64>, p: i64) -> bool {
     var b: i64 = 0;
     while b < f.blocks.len() && b < body.len() {
         if body.get(b) == 1 {
@@ -1992,7 +2012,7 @@ fn tv_loop_stores(f: & IrFunction, body: & Vec<i64>, p: i64) -> bool {
 /// May something in loop `body` of `f` write memory other than its plain
 /// locals? With `lens`, calls that keep every Vec's length (`get`, `set`,
 /// `len`) do not count.
-fn tv_loop_writes(f: & IrFunction, plain: & Vec<i64>, body: & Vec<i64>, lens: bool) -> bool {
+fn tv_loop_writes(f: &IrFunction, plain: &Vec<i64>, body: &Vec<i64>, lens: bool) -> bool {
     var b: i64 = 0;
     while b < f.blocks.len() && b < body.len() {
         if body.get(b) == 1 {
@@ -2008,7 +2028,7 @@ fn tv_loop_writes(f: & IrFunction, plain: & Vec<i64>, body: & Vec<i64>, lens: bo
                     }
                     Inst::Call(cn, _, _, ce) => {
                         var es: EffectSet = ce;
-                        var fine: bool = EffectSet_is_pure(& es) || tv_call_kind(cn) > 0;
+                        var fine: bool = EffectSet_is_pure(&es) || tv_call_kind(cn) > 0;
                         if lens && (cn == "Vec_get" || cn == "Vec_set" || cn == "Vec_len" || cn == "p_vec_get" || cn == "p_vec_set" || cn == "p_vec_len") {
                             fine = true;
                         }
@@ -2048,7 +2068,7 @@ fn tv_loop_writes(f: & IrFunction, plain: & Vec<i64>, body: & Vec<i64>, lens: bo
 
 /// Is block index `p` the one way into the loop headed by block index `h`
 /// (whose blocks `body` flags), ending in a jump to it?
-fn tv_enters(f: & IrFunction, cfg: & IroCfg, body: & Vec<i64>, h: i64, p: i64) -> bool {
+fn tv_enters(f: &IrFunction, cfg: &IroCfg, body: &Vec<i64>, h: i64, p: i64) -> bool {
     if h < 0 || h >= cfg.preds.len() || p < 0 || p >= f.blocks.len() {
         return false;
     }
@@ -2087,7 +2107,7 @@ fn tv_enters(f: & IrFunction, cfg: & IroCfg, body: & Vec<i64>, h: i64, p: i64) -
 /// panic or be seen? Only quiet instructions stay ahead of it in its block,
 /// and from the header to its block the way is a chain of inner loops, each
 /// entered by a jump from a block of quiet instructions.
-fn tv_licm_first(pre: & IrFunction, cfg: & IroCfg, loops: & IroLoops, pa: & TvPos, pb: & TvPos, plain: & Vec<i64>, v: i64, src: i64, head: i64) -> bool {
+fn tv_licm_first(pre: &IrFunction, cfg: &IroCfg, loops: &IroLoops, pa: &TvPos, pb: &TvPos, plain: &Vec<i64>, v: i64, src: i64, head: i64) -> bool {
     var ids: Vec<i64> = pre.blocks.get(src).instructions;
     var k: i64 = 0;
     while k < pa.pos.get(v) && k < ids.len() {
@@ -2109,7 +2129,7 @@ fn tv_licm_first(pre: & IrFunction, cfg: & IroCfg, loops: & IroLoops, pa: & TvPo
             return false;
         }
         var hp: Vec<i64> = cfg.preds.get(cur);
-        var q: i64 = - 1;
+        var q: i64 = -1;
         var i: i64 = 0;
         while i < hp.len() {
             var r: i64 = hp.get(i);
@@ -2121,7 +2141,7 @@ fn tv_licm_first(pre: & IrFunction, cfg: & IroCfg, loops: & IroLoops, pa: & TvPo
             }
             i = i + 1;
         }
-        if q < 0 || !tv_enters(pre, cfg, & cb, cur, q) {
+        if q < 0 || !tv_enters(pre, cfg, &cb, cur, q) {
             return false;
         }
         var qi: Vec<i64> = pre.blocks.get(q).instructions;
@@ -2140,15 +2160,15 @@ fn tv_licm_first(pre: & IrFunction, cfg: & IroCfg, loops: & IroLoops, pa: & TvPo
 
 /// May `v`, which LICM moved from block index `from` to `to`, run there?
 /// "" yes, else why not.
-fn tv_licm_move(pre: & IrFunction, post: & IrFunction, cfg: & IroCfg, loops: & IroLoops, pa: & TvPos, pb: & TvPos, plain: & Vec<i64>, v: i64, src: i64, to: i64) -> str {
+fn tv_licm_move(pre: &IrFunction, post: &IrFunction, cfg: &IroCfg, loops: &IroLoops, pa: &TvPos, pb: &TvPos, plain: &Vec<i64>, v: i64, src: i64, to: i64) -> str {
     // the loop it left: one holding block `src` that block `to` enters
-    var head: i64 = - 1;
+    var head: i64 = -1;
     var body: Vec<i64> = Vec::new();
     var hi: i64 = 0;
     while hi < loops.headers.len() && head < 0 {
         var hh: i64 = loops.headers.get(hi);
         var bd: Vec<i64> = iro_loop_body(loops, hh);
-        if src < bd.len() && bd.get(src) == 1 && to >= 0 && to < bd.len() && bd.get(to) == 0 && tv_enters(post, cfg, & bd, hh, to) {
+        if src < bd.len() && bd.get(src) == 1 && to >= 0 && to < bd.len() && bd.get(to) == 0 && tv_enters(post, cfg, &bd, hh, to) {
             head = hh;
             body = bd;
         }
@@ -2160,7 +2180,7 @@ fn tv_licm_move(pre: & IrFunction, post: & IrFunction, cfg: & IroCfg, loops: & I
     var inst: Inst = peir_inst_of(pre, v);
     // its operands come from outside the loop, or moved ahead of it
     var ops: Vec<i64> = Vec::new();
-    peir_inst_operands(inst, & mut ops);
+    peir_inst_operands(inst, &mut ops);
     var o: i64 = 0;
     while o < ops.len() {
         var x: i64 = ops.get(o);
@@ -2178,19 +2198,19 @@ fn tv_licm_move(pre: & IrFunction, post: & IrFunction, cfg: & IroCfg, loops: & I
     match inst {
         Inst::Load(lp, _) => {
             if tv_get(plain, lp) == 1 {
-                if tv_loop_stores(pre, & body, lp) {
+                if tv_loop_stores(pre, &body, lp) {
                     return "loads a local the loop stores";
                 }
                 return "";
             }
-            if tv_loop_writes(pre, plain, & body, false) {
+            if tv_loop_writes(pre, plain, &body, false) {
                 return "loads memory the loop may write";
             }
             cl = 1;
         }
         Inst::Call(cn, _, _, ce) => {
             if cn == "Vec_len" || cn == "p_vec_len" {
-                if tv_loop_writes(pre, plain, & body, true) {
+                if tv_loop_writes(pre, plain, &body, true) {
                     return "is `len` of a Vec the loop may resize";
                 }
                 return "";
@@ -2200,7 +2220,7 @@ fn tv_licm_move(pre: & IrFunction, post: & IrFunction, cfg: & IroCfg, loops: & I
             if kind == 2 {
                 return "";
             }
-            if kind != 1 && !EffectSet_is_pure(& es) {
+            if kind != 1 && !EffectSet_is_pure(&es) {
                 return "is a call that may have an effect";
             }
             cl = 1;
@@ -2234,7 +2254,7 @@ fn tv_licm_move(pre: & IrFunction, post: & IrFunction, cfg: & IroCfg, loops: & I
 ///     ran, before the pass, first thing each time the loop was entered
 ///     (tv_licm_first);
 ///   - `len` of a Vec when nothing in the loop can resize one.
-pub fn tv_licm(pre: & IrFunction, post: & IrFunction) -> str {
+pub fn tv_licm(pre: &IrFunction, post: &IrFunction) -> str {
     if pre.blocks.len() != post.blocks.len() {
         return "the blocks changed";
     }
@@ -2254,7 +2274,7 @@ pub fn tv_licm(pre: & IrFunction, post: & IrFunction) -> str {
     while v < n {
         var ba: i64 = pa.blk.get(v);
         var bb: i64 = pb.blk.get(v);
-        if ba == - 2 || bb == - 2 {
+        if ba == -2 || bb == -2 {
             return "%" + int_to_str(v) + " is in two places";
         }
         if (ba < 0 && bb >= 0) || (ba >= 0 && bb < 0) {
@@ -2288,20 +2308,20 @@ pub fn tv_licm(pre: & IrFunction, post: & IrFunction) -> str {
             }
             k2 = k2 + 1;
         }
-        if !tv_same_ids(& sa_ids, & sb_ids) {
+        if !tv_same_ids(&sa_ids, &sb_ids) {
             return "the instructions of block " + int_to_str(pre.blocks.get(bi).id) + " were reordered";
         }
         bi = bi + 1;
     }
     // what moved may run where it went
     var cfg: IroCfg = iro_cfg(pre);
-    var loops: IroLoops = iro_loops(& cfg);
+    var loops: IroLoops = iro_loops(&cfg);
     v = 0;
     while v < n {
         var src: i64 = pa.blk.get(v);
         var to: i64 = pb.blk.get(v);
         if src >= 0 && src != to {
-            var why: str = tv_licm_move(pre, post, & cfg, & loops, & pa, & pb, & plain, v, src, to);
+            var why: str = tv_licm_move(pre, post, &cfg, &loops, &pa, &pb, &plain, v, src, to);
             if str_len(why) > 0 {
                 return "%" + int_to_str(v) + " " + why;
             }
@@ -2315,7 +2335,7 @@ pub fn tv_licm(pre: & IrFunction, post: & IrFunction) -> str {
 
 /// Is `ib` (after the pass) the direct call iro_devirt makes of `ia`, a
 /// trait call on a value just made from a known type? "" yes, else why not.
-fn tv_devirt_call(module: & IrModule, pre: & IrFunction, post: & IrFunction, pa: & TvPos, ia: Inst, ib: Inst) -> str {
+fn tv_devirt_call(module: &IrModule, pre: &IrFunction, post: &IrFunction, pa: &TvPos, ia: Inst, ib: Inst) -> str {
     match ia {
         Inst::DynCall(_tr, method, args, ret, _de) => {
             match ib {
@@ -2392,7 +2412,7 @@ fn tv_devirt_call(module: & IrModule, pre: & IrFunction, post: & IrFunction, pa:
 /// with the same result type, T_m a function of the module with that many
 /// parameters, and the 0 (the env slot) a new constant just before it.
 /// Nothing else may change.
-pub fn tv_devirt(module: & IrModule, pre: & IrFunction, post: & IrFunction) -> str {
+pub fn tv_devirt(module: &IrModule, pre: &IrFunction, post: &IrFunction) -> str {
     if pre.blocks.len() != post.blocks.len() {
         return "the blocks changed";
     }
@@ -2428,7 +2448,7 @@ pub fn tv_devirt(module: & IrModule, pre: & IrFunction, post: & IrFunction) -> s
                 var xa: Inst = peir_inst_of(pre, y);
                 var xb: Inst = peir_inst_of(post, y);
                 if !tv_same_inst(xa, xb) {
-                    var why: str = tv_devirt_call(module, pre, post, & pa, xa, xb);
+                    var why: str = tv_devirt_call(module, pre, post, &pa, xa, xb);
                     if str_len(why) > 0 {
                         return "%" + int_to_str(y) + " " + why;
                     }
@@ -2446,7 +2466,7 @@ pub fn tv_devirt(module: & IrModule, pre: & IrFunction, post: & IrFunction) -> s
 }
 
 /// tv_after for iro_devirt, which reads the module.
-pub fn tv_after_devirt(module: & IrModule, pre: & IrFunction, f: & mut IrFunction) -> bool {
+pub fn tv_after_devirt(module: &IrModule, pre: &IrFunction, f: &mut IrFunction) -> bool {
     if !tv_on() {
         return true;
     }
@@ -2497,7 +2517,7 @@ fn tv_inject_on(pname: str, fname: str) -> bool {
 /// Compute value `x` of `f` wrongly: an addition becomes a subtraction, a
 /// subtraction, product, xor or or an addition, an integer constant gets its
 /// low bit flipped. False when `x` is none of these.
-fn tv_inject_at(f: & mut IrFunction, x: i64) -> bool {
+fn tv_inject_at(f: &mut IrFunction, x: i64) -> bool {
     match IrFunction_get_inst(f, x) {
         OptInst::Some(inst) => {
             match inst {
@@ -2602,7 +2622,7 @@ fn tv_pure_value(inst: Inst) -> bool {
 /// program's output as it was). A store into a plain local (an alloca only
 /// loads and stores touch) counts when a load that counts reads the local;
 /// every instruction that is not a pure value (tv_pure_value) counts.
-fn tv_live_of(f: & IrFunction) -> Vec<i64> {
+fn tv_live_of(f: &IrFunction) -> Vec<i64> {
     var nv: i64 = f.next_value + 1;
     var live: Vec<i64> = peir_zeros(nv);
     var sh: TvShape = tv_shape_of(f);
@@ -2616,10 +2636,10 @@ fn tv_live_of(f: & IrFunction) -> Vec<i64> {
             while k < ids.len() {
                 var id: i64 = ids.get(k);
                 var inst: Inst = peir_inst_of(f, id);
-                var on: bool = tv_get(& live, id) == 1;
+                var on: bool = tv_get(&live, id) == 1;
                 match inst {
                     Inst::Store(p, _, _) => {
-                        on = tv_get(& sh.plain, p) != 1 || tv_get(& live, p) == 1;
+                        on = tv_get(&sh.plain, p) != 1 || tv_get(&live, p) == 1;
                     }
                     _ => {
                         if !tv_pure_value(inst) {
@@ -2629,7 +2649,7 @@ fn tv_live_of(f: & IrFunction) -> Vec<i64> {
                 }
                 if on {
                     var ops: Vec<i64> = Vec::new();
-                    peir_inst_operands(inst, & mut ops);
+                    peir_inst_operands(inst, &mut ops);
                     var o: i64 = 0;
                     while o < ops.len() {
                         var x: i64 = ops.get(o);
@@ -2652,7 +2672,7 @@ fn tv_live_of(f: & IrFunction) -> Vec<i64> {
 /// wrongly (tv_inject_at), else the first value anywhere that can be and
 /// that what the function does depends on (tv_live_of; 2g.90). False when
 /// `f` has none.
-fn tv_inject_fn(f: & mut IrFunction) -> bool {
+fn tv_inject_fn(f: &mut IrFunction) -> bool {
     var live: Vec<i64> = tv_live_of(f);
     var b: i64 = 0;
     while b < f.blocks.len() {
@@ -2683,7 +2703,7 @@ fn tv_inject_fn(f: & mut IrFunction) -> bool {
         var ids2: Vec<i64> = f.blocks.get(b2).instructions;
         var k2: i64 = 0;
         while k2 < ids2.len() {
-            if tv_get(& live, ids2.get(k2)) == 1 && tv_inject_at(f, ids2.get(k2)) {
+            if tv_get(&live, ids2.get(k2)) == 1 && tv_inject_at(f, ids2.get(k2)) {
                 return true;
             }
             k2 = k2 + 1;
@@ -2767,7 +2787,8 @@ fn tv_hex(d: i64) -> str {
 }
 
 /// `v` as a 64-bit SMT-LIB literal.
-@wrapping fn tv_smt_lit(v: i64) -> str {
+@wrapping
+fn tv_smt_lit(v: i64) -> str {
     var s: str = "#x";
     var i: i64 = 0;
     while i < 16 {
@@ -2808,7 +2829,8 @@ fn tv_smt_checked(op: str, a: str, b: str, ot: IrType) -> TvSmtE {
 
 /// `a op b` (terms) with operands of type `ot` and a result of type `rt`;
 /// `rid` is the right operand's value (a shift needs a constant amount).
-@wrapping fn tv_smt_binop(f: & IrFunction, op: BinOp, a: str, b: str, rid: i64, ot: IrType, rt: IrType, wrap: bool) -> TvSmtE {
+@wrapping
+fn tv_smt_binop(f: &IrFunction, op: BinOp, a: str, b: str, rid: i64, ot: IrType, rt: IrType, wrap: bool) -> TvSmtE {
     var no: TvSmtE = tv_smt_e(false, "", "");
     if tv_is_float(ot) || tv_is_float(rt) {
         return no;
@@ -2949,7 +2971,7 @@ fn tv_smt_unop(op: UnaryOp, a: str, t: IrType, wrap: bool) -> TvSmtE {
 
 /// The term of value `v` of `f`: p<i> for parameter i, else prefix + id
 /// when defined already; "" otherwise.
-fn tv_smt_val(f: & IrFunction, pfx: str, defd: & Vec<i64>, v: i64) -> str {
+fn tv_smt_val(f: &IrFunction, pfx: str, defd: &Vec<i64>, v: i64) -> str {
     var i: i64 = 0;
     while i < f.params.len() {
         if f.params.get(i).id == v {
@@ -2963,7 +2985,7 @@ fn tv_smt_val(f: & IrFunction, pfx: str, defd: & Vec<i64>, v: i64) -> str {
     return "";
 }
 
-fn tv_smt_fn(f: & IrFunction, pfx: str) -> TvSmt {
+fn tv_smt_fn(f: &IrFunction, pfx: str) -> TvSmt {
     var r: TvSmt = TvSmt {
         ok: false, defs: "", ret: tv_smt_lit(0), pan: "false"
     };
@@ -3010,26 +3032,26 @@ fn tv_smt_fn(f: & IrFunction, pfx: str) -> TvSmt {
                 }
             }
             Inst::Alloca(_, _) => {
-                good = tv_get(& sh.plain, id) == 1;
+                good = tv_get(&sh.plain, id) == 1;
             }
             Inst::Load(lp, lt) => {
-                if tv_get(& sh.plain, lp) == 1 && lp < mem.len() {
+                if tv_get(&sh.plain, lp) == 1 && lp < mem.len() {
                     term = tv_smt_narrow(mem.get(lp), lt);
                 } else {
                     good = false;
                 }
             }
             Inst::Store(sp, sv, _) => {
-                var svt: str = tv_smt_val(f, pfx, & defd, sv);
-                if tv_get(& sh.plain, sp) == 1 && sp < mem.len() && str_len(svt) > 0 {
+                var svt: str = tv_smt_val(f, pfx, &defd, sv);
+                if tv_get(&sh.plain, sp) == 1 && sp < mem.len() && str_len(svt) > 0 {
                     mem.set(sp, svt);
                 } else {
                     good = false;
                 }
             }
             Inst::BinOp(op, l, rr, bt) => {
-                var la: str = tv_smt_val(f, pfx, & defd, l);
-                var lb: str = tv_smt_val(f, pfx, & defd, rr);
+                var la: str = tv_smt_val(f, pfx, &defd, l);
+                var lb: str = tv_smt_val(f, pfx, &defd, rr);
                 if str_len(la) == 0 || str_len(lb) == 0 {
                     good = false;
                 } else {
@@ -3040,7 +3062,7 @@ fn tv_smt_fn(f: & IrFunction, pfx: str) -> TvSmt {
                 }
             }
             Inst::UnaryOp(uop, ux, ut) => {
-                var ua: str = tv_smt_val(f, pfx, & defd, ux);
+                var ua: str = tv_smt_val(f, pfx, &defd, ux);
                 if str_len(ua) == 0 {
                     good = false;
                 } else {
@@ -3051,7 +3073,7 @@ fn tv_smt_fn(f: & IrFunction, pfx: str) -> TvSmt {
                 }
             }
             Inst::IntExtend(ex, ea, et) => {
-                var xe: str = tv_smt_val(f, pfx, & defd, ex);
+                var xe: str = tv_smt_val(f, pfx, &defd, ex);
                 if str_len(xe) == 0 || tv_is_float(ea) || tv_is_float(et) {
                     good = false;
                 } else {
@@ -3059,7 +3081,7 @@ fn tv_smt_fn(f: & IrFunction, pfx: str) -> TvSmt {
                 }
             }
             Inst::IntTrunc(tx, ta, tt) => {
-                var xt: str = tv_smt_val(f, pfx, & defd, tx);
+                var xt: str = tv_smt_val(f, pfx, &defd, tx);
                 if str_len(xt) == 0 || tv_is_float(ta) || tv_is_float(tt) {
                     good = false;
                 } else {
@@ -3067,7 +3089,7 @@ fn tv_smt_fn(f: & IrFunction, pfx: str) -> TvSmt {
                 }
             }
             Inst::BitCast(cx, ca, cb) => {
-                var xc: str = tv_smt_val(f, pfx, & defd, cx);
+                var xc: str = tv_smt_val(f, pfx, &defd, cx);
                 if str_len(xc) == 0 || tv_is_float(ca) || tv_is_float(cb) {
                     good = false;
                 } else {
@@ -3077,7 +3099,7 @@ fn tv_smt_fn(f: & IrFunction, pfx: str) -> TvSmt {
             Inst::Return(rv) => {
                 match rv {
                     OptValueId::Some(x) => {
-                        var xr: str = tv_smt_val(f, pfx, & defd, x);
+                        var xr: str = tv_smt_val(f, pfx, &defd, x);
                         if str_len(xr) == 0 {
                             good = false;
                         } else {
@@ -3123,7 +3145,7 @@ fn tv_smt_fn(f: & IrFunction, pfx: str) -> TvSmt {
 /// `pname`) means what `pre` meant, when both are straight-line code.
 /// `why` is the validator's verdict and `inj` whether a fault was put in
 /// (both go into the first line, which the tooling reads).
-fn tv_smt_pair(pname: str, pre: & IrFunction, post: & IrFunction, inj: bool, why: str) {
+fn tv_smt_pair(pname: str, pre: &IrFunction, post: &IrFunction, inj: bool, why: str) {
     if str_len(tv_smt_dir()) == 0 {
         return;
     }
@@ -3153,7 +3175,7 @@ fn tv_smt_pair(pname: str, pre: & IrFunction, post: & IrFunction, inj: bool, why
 /// differ (in whether they panic, or in what they return when neither
 /// does), so `unsat` proves them the same. `note` is the first line's
 /// comment. "" when either is not one block of integer code without calls.
-pub fn tv_smt_text(note: str, pre: & IrFunction, post: & IrFunction) -> str {
+pub fn tv_smt_text(note: str, pre: &IrFunction, post: &IrFunction) -> str {
     if pre.params.len() != post.params.len() {
         return "";
     }
@@ -3201,7 +3223,7 @@ pub struct TvMod {
 /// keeps what a function pass edits).
 fn tv_copy(f: IrFunction) -> IrFunction {
     var nf: IrFunction = f;
-    var s: IrFunction = tv_snapshot(& f);
+    var s: IrFunction = tv_snapshot(&f);
     nf.params = s.params;
     nf.blocks = s.blocks;
     nf.value_metas = s.value_metas;
@@ -3218,7 +3240,7 @@ fn tv_copy(f: IrFunction) -> IrFunction {
 
 /// Before a module pass: the module as it is when validation is on (an
 /// empty TvMod otherwise, which tv_mod_after does not read).
-pub fn tv_mod_before(module: & IrModule) -> TvMod {
+pub fn tv_mod_before(module: &IrModule) -> TvMod {
     var m: TvMod = TvMod {
         on: false, entries: Vec::new(), hashes: Vec::new(), index: 0, has_main: false
     };
@@ -3284,7 +3306,7 @@ fn tv_world(names: Vec<str>, fns: Vec<IrFunction>, gc: i64) -> TvWorld {
     return w;
 }
 
-fn tv_world_of(module: & IrModule, gc: i64) -> TvWorld {
+fn tv_world_of(module: &IrModule, gc: i64) -> TvWorld {
     var names: Vec<str> = Vec::new();
     var fns: Vec<IrFunction> = Vec::new();
     var i: i64 = 0;
@@ -3297,7 +3319,7 @@ fn tv_world_of(module: & IrModule, gc: i64) -> TvWorld {
     return tv_world(names, fns, gc);
 }
 
-fn tv_world_pre(m: & TvMod, gc: i64) -> TvWorld {
+fn tv_world_pre(m: &TvMod, gc: i64) -> TvWorld {
     var names: Vec<str> = Vec::new();
     var fns: Vec<IrFunction> = Vec::new();
     var i: i64 = 0;
@@ -3312,13 +3334,13 @@ fn tv_world_pre(m: & TvMod, gc: i64) -> TvWorld {
 
 /// 1 when the evaluator can run the function at `at` of `w`, else 0 (its
 /// shape is found once).
-fn tv_w_ok(w: & mut TvWorld, at: i64) -> i64 {
+fn tv_w_ok(w: &mut TvWorld, at: i64) -> i64 {
     if at < 0 || at >= w.st.len() {
         return 0;
     }
     if w.st.get(at) == 0 {
         var g: IrFunction = w.fns.get(at);
-        var s: TvShape = tv_shape_x(& g, w.gc, true);
+        var s: TvShape = tv_shape_x(&g, w.gc, true);
         if s.ok {
             w.st.set(at, 1);
         } else {
@@ -3333,10 +3355,10 @@ fn tv_w_ok(w: & mut TvWorld, at: i64) -> i64 {
 }
 
 /// -1 when `w` has no function `nm`, 1 when the evaluator can run it, else 0.
-fn tv_w_ev(w: & mut TvWorld, nm: str) -> i64 {
+fn tv_w_ev(w: &mut TvWorld, nm: str) -> i64 {
     var at: i64 = HashMap_get(w.index, nm) - 1;
     if at < 0 {
-        return - 1;
+        return -1;
     }
     return tv_w_ok(w, at);
 }
@@ -3347,7 +3369,7 @@ fn tv_w_ev(w: & mut TvWorld, nm: str) -> i64 {
 /// have is run on one side only when it is on the other too, so the two
 /// runs treat the same call alike; one only the module after the pass has
 /// (a clone) must be run.
-fn tv_call_how(wa: & mut TvWorld, wb: & mut TvWorld, side: i64, nm: str) -> i64 {
+fn tv_call_how(wa: &mut TvWorld, wb: &mut TvWorld, side: i64, nm: str) -> i64 {
     var ea: i64 = tv_w_ev(wa, nm);
     var eb: i64 = tv_w_ev(wb, nm);
     var mine: i64 = ea;
@@ -3379,7 +3401,7 @@ fn tv_call_how(wa: & mut TvWorld, wb: & mut TvWorld, side: i64, nm: str) -> i64 
 }
 
 /// The name of the function `v` points to on side `side` ("" none).
-fn tv_wfn_at(wa: & TvWorld, wb: & TvWorld, side: i64, v: i64) -> str {
+fn tv_wfn_at(wa: &TvWorld, wb: &TvWorld, side: i64, v: i64) -> str {
     if side == 0 {
         var at: i64 = HashMap_get(wa.fref, int_to_str(v)) - 1;
         if at >= 0 {
@@ -3395,7 +3417,7 @@ fn tv_wfn_at(wa: & TvWorld, wb: & TvWorld, side: i64, v: i64) -> str {
 }
 
 /// The value of the constant global whose address is `p` in `f`.
-fn tv_wglobal(w: & TvWorld, f: & IrFunction, p: i64) -> i64 {
+fn tv_wglobal(w: &TvWorld, f: &IrFunction, p: i64) -> i64 {
     match peir_inst_of(f, p) {
         Inst::GlobalAddr(gn, _) => {
             if w.gc != 0 && HashMap_contains(w.gc, gn) {
@@ -3418,7 +3440,7 @@ pub struct TvRun {
 }
 
 /// A call of `nm` with arguments `argv` (values) and result type `rt`.
-fn tv_wcall(wa: & mut TvWorld, wb: & mut TvWorld, side: i64, nm: str, argv: & Vec<i64>, rt: IrType, eff: EffectSet, run: & mut TvRun, depth: i64) -> TvOut {
+fn tv_wcall(wa: &mut TvWorld, wb: &mut TvWorld, side: i64, nm: str, argv: &Vec<i64>, rt: IrType, eff: EffectSet, run: &mut TvRun, depth: i64) -> TvOut {
     var out: TvOut = TvOut {
         kind: 5, val: 0, trace: 0, steps: 0
     };
@@ -3433,14 +3455,14 @@ fn tv_wcall(wa: & mut TvWorld, wb: & mut TvWorld, side: i64, nm: str, argv: & Ve
             var cf: IrFunction = wa.fns.get(at);
             var csh: TvShape = wa.shapes.get(at);
             if cf.params.len() == argv.len() {
-                co = tv_weval(wa, wb, 0, & cf, & csh, argv, run, depth + 1);
+                co = tv_weval(wa, wb, 0, &cf, &csh, argv, run, depth + 1);
             }
         } else {
             var bt: i64 = HashMap_get(wb.index, nm) - 1;
             var bf: IrFunction = wb.fns.get(bt);
             var bsh: TvShape = wb.shapes.get(bt);
             if bf.params.len() == argv.len() {
-                co = tv_weval(wa, wb, 1, & bf, & bsh, argv, run, depth + 1);
+                co = tv_weval(wa, wb, 1, &bf, &bsh, argv, run, depth + 1);
             }
         }
         if co.kind == 0 {
@@ -3456,7 +3478,7 @@ fn tv_wcall(wa: & mut TvWorld, wb: & mut TvWorld, side: i64, nm: str, argv: & Ve
             ai = ai + 1;
         }
         var es: EffectSet = eff;
-        if !EffectSet_is_pure(& es) {
+        if !EffectSet_is_pure(&es) {
             run.ncalls = run.ncalls + 1;
             h = tv_mix(h, run.ncalls);
             run.trace = tv_mix(tv_mix(run.trace, 11), h);
@@ -3470,7 +3492,7 @@ fn tv_wcall(wa: & mut TvWorld, wb: & mut TvWorld, side: i64, nm: str, argv: & Ve
 /// tv_eval across the module: calls are followed into the functions of the
 /// side's module (tv_call_how), loads of constant globals read their value,
 /// calls through a pointer to a function of the module are calls of it.
-fn tv_weval(wa: & mut TvWorld, wb: & mut TvWorld, side: i64, f: & IrFunction, sh: & TvShape, args: & Vec<i64>, run: & mut TvRun, depth: i64) -> TvOut {
+fn tv_weval(wa: &mut TvWorld, wb: &mut TvWorld, side: i64, f: &IrFunction, sh: &TvShape, args: &Vec<i64>, run: &mut TvRun, depth: i64) -> TvOut {
     var nv: i64 = f.next_value + 1;
     var vals: Vec<i64> = peir_zeros(nv);
     var mem: Vec<i64> = peir_zeros(nv);
@@ -3490,7 +3512,7 @@ fn tv_weval(wa: & mut TvWorld, wb: & mut TvWorld, side: i64, f: & IrFunction, sh
     while !done {
         var ids: Vec<i64> = f.blocks.get(b).instructions;
         var k: i64 = 0;
-        var nxt: i64 = - 1;
+        var nxt: i64 = -1;
         while k < ids.len() && nxt < 0 && !done {
             var id: i64 = ids.get(k);
             run.steps = run.steps + 1;
@@ -3528,19 +3550,19 @@ fn tv_weval(wa: & mut TvWorld, wb: & mut TvWorld, side: i64, f: & IrFunction, sh
                         vals.set(id, id);
                     }
                     Inst::Load(p, lt) => {
-                        if tv_get(& sh.plain, p) == 2 {
+                        if tv_get(&sh.plain, p) == 2 {
                             vals.set(id, tv_narrow(tv_wglobal(wa, f, p), lt));
                         } else {
-                            vals.set(id, tv_narrow(tv_get(& mem, p), lt));
+                            vals.set(id, tv_narrow(tv_get(&mem, p), lt));
                         }
                     }
                     Inst::Store(p, v, _) => {
                         if p >= 0 && p < nv {
-                            mem.set(p, tv_get(& vals, v));
+                            mem.set(p, tv_get(&vals, v));
                         }
                     }
                     Inst::BinOp(op, l, r, bt) => {
-                        var res: TvK = tv_binop(op, tv_get(& vals, l), tv_get(& vals, r), ssa_vty(f, l), bt, f.is_wrapping);
+                        var res: TvK = tv_binop(op, tv_get(&vals, l), tv_get(&vals, r), ssa_vty(f, l), bt, f.is_wrapping);
                         if res.kind == 0 {
                             vals.set(id, res.v);
                         } else if res.kind == 1 {
@@ -3552,7 +3574,7 @@ fn tv_weval(wa: & mut TvWorld, wb: & mut TvWorld, side: i64, f: & IrFunction, sh
                         }
                     }
                     Inst::UnaryOp(uop, x, ut) => {
-                        var ru: TvK = tv_unop(uop, tv_get(& vals, x), ut, f.is_wrapping);
+                        var ru: TvK = tv_unop(uop, tv_get(&vals, x), ut, f.is_wrapping);
                         if ru.kind == 0 {
                             vals.set(id, ru.v);
                         } else if ru.kind == 1 {
@@ -3564,22 +3586,22 @@ fn tv_weval(wa: & mut TvWorld, wb: & mut TvWorld, side: i64, f: & IrFunction, sh
                         }
                     }
                     Inst::IntExtend(ex, _, eto) => {
-                        vals.set(id, tv_narrow(tv_get(& vals, ex), eto));
+                        vals.set(id, tv_narrow(tv_get(&vals, ex), eto));
                     }
                     Inst::IntTrunc(tx, _, tto) => {
-                        vals.set(id, tv_narrow(tv_get(& vals, tx), tto));
+                        vals.set(id, tv_narrow(tv_get(&vals, tx), tto));
                     }
                     Inst::BitCast(cx, _, _) => {
-                        vals.set(id, tv_get(& vals, cx));
+                        vals.set(id, tv_get(&vals, cx));
                     }
                     Inst::Call(nm, cargs, rt, eff) => {
                         var argv: Vec<i64> = Vec::new();
                         var ai: i64 = 0;
                         while ai < cargs.len() {
-                            argv.push(tv_get(& vals, cargs.get(ai)));
+                            argv.push(tv_get(&vals, cargs.get(ai)));
                             ai = ai + 1;
                         }
-                        var co: TvOut = tv_wcall(wa, wb, side, nm, & argv, rt, eff, run, depth);
+                        var co: TvOut = tv_wcall(wa, wb, side, nm, &argv, rt, eff, run, depth);
                         if co.kind == 0 {
                             vals.set(id, co.val);
                         } else {
@@ -3591,12 +3613,12 @@ fn tv_weval(wa: & mut TvWorld, wb: & mut TvWorld, side: i64, f: & IrFunction, sh
                         var pargv: Vec<i64> = Vec::new();
                         var pj: i64 = 0;
                         while pj < pargs.len() {
-                            pargv.push(tv_get(& vals, pargs.get(pj)));
+                            pargv.push(tv_get(&vals, pargs.get(pj)));
                             pj = pj + 1;
                         }
-                        var cname: str = tv_wfn_at(wa, wb, side, tv_get(& vals, fp));
+                        var cname: str = tv_wfn_at(wa, wb, side, tv_get(&vals, fp));
                         if str_len(cname) > 0 {
-                            var po: TvOut = tv_wcall(wa, wb, side, cname, & pargv, prt, peff, run, depth);
+                            var po: TvOut = tv_wcall(wa, wb, side, cname, &pargv, prt, peff, run, depth);
                             if po.kind == 0 {
                                 vals.set(id, po.val);
                             } else {
@@ -3605,14 +3627,14 @@ fn tv_weval(wa: & mut TvWorld, wb: & mut TvWorld, side: i64, f: & IrFunction, sh
                             }
                         } else {
                             // a pointer to no function of the module: uninterpreted
-                            var ph: i64 = tv_mix(tv_get(& vals, fp), 5);
+                            var ph: i64 = tv_mix(tv_get(&vals, fp), 5);
                             var pk: i64 = 0;
                             while pk < pargv.len() {
                                 ph = tv_mix(ph, pargv.get(pk));
                                 pk = pk + 1;
                             }
                             var pes: EffectSet = peff;
-                            if !EffectSet_is_pure(& pes) {
+                            if !EffectSet_is_pure(&pes) {
                                 run.ncalls = run.ncalls + 1;
                                 ph = tv_mix(ph, run.ncalls);
                                 run.trace = tv_mix(tv_mix(run.trace, 11), ph);
@@ -3621,7 +3643,7 @@ fn tv_weval(wa: & mut TvWorld, wb: & mut TvWorld, side: i64, f: & IrFunction, sh
                         }
                     }
                     Inst::Print(x, _) => {
-                        run.trace = tv_mix(tv_mix(run.trace, 13), tv_get(& vals, x));
+                        run.trace = tv_mix(tv_mix(run.trace, 13), tv_get(&vals, x));
                     }
                     Inst::Jump(t) => {
                         nxt = tv_bidx(sh, t);
@@ -3631,7 +3653,7 @@ fn tv_weval(wa: & mut TvWorld, wb: & mut TvWorld, side: i64, f: & IrFunction, sh
                         }
                     }
                     Inst::Branch(c, t, e) => {
-                        if tv_get(& vals, c) != 0 {
+                        if tv_get(&vals, c) != 0 {
                             nxt = tv_bidx(sh, t);
                         } else {
                             nxt = tv_bidx(sh, e);
@@ -3644,7 +3666,7 @@ fn tv_weval(wa: & mut TvWorld, wb: & mut TvWorld, side: i64, f: & IrFunction, sh
                     Inst::Return(rv) => {
                         match rv {
                             OptValueId::Some(x) => {
-                                out.val = tv_get(& vals, x);
+                                out.val = tv_get(&vals, x);
                             }
                             OptValueId::None => {
                             }
@@ -3687,7 +3709,7 @@ fn tv_weval(wa: & mut TvWorld, wb: & mut TvWorld, side: i64, f: & IrFunction, sh
 /// (pairs: 1 and the value) takes that value. "" when every run that
 /// finished agrees, "n/a" when none could be run, else the first
 /// disagreement.
-fn tv_wrandom(wa: & mut TvWorld, wb: & mut TvWorld, fa: & IrFunction, fb: & IrFunction, fixed: & Vec<i64>) -> str {
+fn tv_wrandom(wa: &mut TvWorld, wb: &mut TvWorld, fa: &IrFunction, fb: &IrFunction, fixed: &Vec<i64>) -> str {
     if fa.params.len() != fb.params.len() {
         return "n/a";
     }
@@ -3717,12 +3739,12 @@ fn tv_wrandom(wa: & mut TvWorld, wb: & mut TvWorld, fa: & IrFunction, fb: & IrFu
         var ra: TvRun = TvRun {
             trace: 7, ncalls: 0, steps: 0, limit: TV_STEPS
         };
-        var oa: TvOut = tv_weval(wa, wb, 0, fa, & sa, & args, & mut ra, 0);
+        var oa: TvOut = tv_weval(wa, wb, 0, fa, &sa, &args, &mut ra, 0);
         if oa.kind < 4 {
             var rb: TvRun = TvRun {
                 trace: 7, ncalls: 0, steps: 0, limit: ra.steps * 8 + 1000
             };
-            var ob: TvOut = tv_weval(wa, wb, 1, fb, & sb, & args, & mut rb, 0);
+            var ob: TvOut = tv_weval(wa, wb, 1, fb, &sb, &args, &mut rb, 0);
             if ob.kind < 4 {
                 conclusive = conclusive + 1;
                 var same: bool = oa.kind == ob.kind && oa.trace == ob.trace;
@@ -3731,9 +3753,9 @@ fn tv_wrandom(wa: & mut TvWorld, wb: & mut TvWorld, fa: & IrFunction, fb: & IrFu
                 }
                 if !same {
                     if oa.trace != ob.trace && oa.kind == ob.kind {
-                        return "on inputs " + tv_args_str(& args) + " the calls or prints differ";
+                        return "on inputs " + tv_args_str(&args) + " the calls or prints differ";
                     }
-                    return "on inputs " + tv_args_str(& args) + " the function " + tv_out_str(& oa) + " before the pass and " + tv_out_str(& ob) + " after it";
+                    return "on inputs " + tv_args_str(&args) + " the function " + tv_out_str(&oa) + " before the pass and " + tv_out_str(&ob) + " after it";
                 }
             }
         }
@@ -3761,7 +3783,7 @@ pub struct TvFacts {
     pub slots: Vec<Vec<i64>>,
 }
 
-fn tv_ipcp_facts(wa: & TvWorld, module: & IrModule) -> TvFacts {
+fn tv_ipcp_facts(wa: &TvWorld, module: &IrModule) -> TvFacts {
     var fx: TvFacts = TvFacts {
         at: HashMap_new(), slots: Vec::new()
     };
@@ -3778,7 +3800,7 @@ fn tv_ipcp_facts(wa: & TvWorld, module: & IrModule) -> TvFacts {
             var ids: Vec<i64> = g.blocks.get(b).instructions;
             var k: i64 = 0;
             while k < ids.len() {
-                match peir_inst_of(& g, ids.get(k)) {
+                match peir_inst_of(&g, ids.get(k)) {
                     Inst::ConstFnRef(fr) => {
                         HashMap_insert(taken, fr, 1);
                         HashMap_insert(taken, c_fn_target(fr), 1);
@@ -3832,7 +3854,7 @@ fn tv_ipcp_facts(wa: & TvWorld, module: & IrModule) -> TvFacts {
             var ids2: Vec<i64> = g2.blocks.get(b2).instructions;
             var k2: i64 = 0;
             while k2 < ids2.len() {
-                match peir_inst_of(& g2, ids2.get(k2)) {
+                match peir_inst_of(&g2, ids2.get(k2)) {
                     Inst::Call(cn, cargs, _, _) => {
                         if !HashMap_contains(taken, cn) && HashMap_contains(wa.index, cn) && !tv_backend_name(cn) {
                             var slot: i64 = HashMap_get(fx.at, cn) - 1;
@@ -3852,7 +3874,7 @@ fn tv_ipcp_facts(wa: & TvWorld, module: & IrModule) -> TvFacts {
                             } else {
                                 var a: i64 = 0;
                                 while a < cargs.len() {
-                                    var ka: TvK = tv_constk(& g2, cargs.get(a), 0);
+                                    var ka: TvK = tv_constk(&g2, cargs.get(a), 0);
                                     var s0: i64 = st.get(2 * a);
                                     if ka.kind == 0 {
                                         if s0 == 0 {
@@ -3884,7 +3906,7 @@ fn tv_ipcp_facts(wa: & TvWorld, module: & IrModule) -> TvFacts {
 
 /// The facts of function `name` with `np` parameters (pairs: state, value),
 /// or none.
-fn tv_fixed(fx: & TvFacts, name: str, np: i64) -> Vec<i64> {
+fn tv_fixed(fx: &TvFacts, name: str, np: i64) -> Vec<i64> {
     var none: Vec<i64> = Vec::new();
     if fx.at == 0 {
         return none;
@@ -3903,7 +3925,7 @@ fn tv_fixed(fx: & TvFacts, name: str, np: i64) -> Vec<i64> {
 /// WP18's fact, found here again: the globals with an integer literal for
 /// initializer whose address, in every function of `fns`, is only loaded
 /// (never stored through, passed or kept): name -> that value.
-fn tv_gconst_facts(fns: & Vec<IrFunction>, globals: & Vec<GlobalEntry>) -> i64 {
+fn tv_gconst_facts(fns: &Vec<IrFunction>, globals: &Vec<GlobalEntry>) -> i64 {
     var cand: i64 = HashMap_new();
     var bad: i64 = HashMap_new();
     var gi: i64 = 0;
@@ -3939,7 +3961,7 @@ fn tv_gconst_facts(fns: & Vec<IrFunction>, globals: & Vec<GlobalEntry>) -> i64 {
             var k: i64 = 0;
             while k < ids.len() {
                 var id: i64 = ids.get(k);
-                match peir_inst_of(& f, id) {
+                match peir_inst_of(&f, id) {
                     Inst::GlobalAddr(gn, _) => {
                         if id >= 0 && id < nv && HashMap_contains(cand, gn) {
                             gaddr.set(id, 1);
@@ -3959,9 +3981,9 @@ fn tv_gconst_facts(fns: & Vec<IrFunction>, globals: & Vec<GlobalEntry>) -> i64 {
                 var ids2: Vec<i64> = f.blocks.get(b2).instructions;
                 var k2: i64 = 0;
                 while k2 < ids2.len() {
-                    var inst: Inst = peir_inst_of(& f, ids2.get(k2));
+                    var inst: Inst = peir_inst_of(&f, ids2.get(k2));
                     var ops: Vec<i64> = Vec::new();
-                    peir_inst_operands(inst, & mut ops);
+                    peir_inst_operands(inst, &mut ops);
                     var o: i64 = 0;
                     while o < ops.len() {
                         var x: i64 = ops.get(o);
@@ -3975,7 +3997,7 @@ fn tv_gconst_facts(fns: & Vec<IrFunction>, globals: & Vec<GlobalEntry>) -> i64 {
                                 }
                             }
                             if !isload {
-                                match peir_inst_of(& f, x) {
+                                match peir_inst_of(&f, x) {
                                     Inst::GlobalAddr(bn, _) => {
                                         HashMap_insert(bad, bn, 1);
                                     }
@@ -4008,7 +4030,7 @@ fn tv_gconst_facts(fns: & Vec<IrFunction>, globals: & Vec<GlobalEntry>) -> i64 {
 /// VF6: gconst's witness (iropt.fd iro_const_globals, WP18): only loads
 /// changed, each into the value, at the load's type, of a global with a
 /// literal initializer that nothing writes (`gc`, tv_gconst_facts).
-fn tv_gconst_witness(pre: & IrFunction, post: & IrFunction, gc: i64) -> str {
+fn tv_gconst_witness(pre: &IrFunction, post: &IrFunction, gc: i64) -> str {
     var sb: str = tv_same_blocks(pre, post);
     if str_len(sb) > 0 {
         return sb;
@@ -4055,7 +4077,7 @@ fn tv_gconst_witness(pre: & IrFunction, post: & IrFunction, gc: i64) -> str {
 
 /// Do functions `n1` and `n2` of `w` have the same body (parameters, result
 /// type, wrapping arithmetic, blocks and instructions, value for value)?
-fn tv_same_body(w: & TvWorld, n1: str, n2: str) -> bool {
+fn tv_same_body(w: &TvWorld, n1: str, n2: str) -> bool {
     var x: i64 = HashMap_get(w.index, n1) - 1;
     var y: i64 = HashMap_get(w.index, n2) - 1;
     if x < 0 || y < 0 {
@@ -4076,7 +4098,7 @@ fn tv_same_body(w: & TvWorld, n1: str, n2: str) -> bool {
         }
         i = i + 1;
     }
-    if str_len(tv_same_blocks(& f1, & f2)) > 0 {
+    if str_len(tv_same_blocks(&f1, &f2)) > 0 {
         return false;
     }
     var bi: i64 = 0;
@@ -4084,7 +4106,7 @@ fn tv_same_body(w: & TvWorld, n1: str, n2: str) -> bool {
         var ids: Vec<i64> = f1.blocks.get(bi).instructions;
         var k: i64 = 0;
         while k < ids.len() {
-            if !tv_same_inst(peir_inst_of(& f1, ids.get(k)), peir_inst_of(& f2, ids.get(k))) {
+            if !tv_same_inst(peir_inst_of(&f1, ids.get(k)), peir_inst_of(&f2, ids.get(k))) {
                 return false;
             }
             k = k + 1;
@@ -4097,7 +4119,7 @@ fn tv_same_body(w: & TvWorld, n1: str, n2: str) -> bool {
 /// VF6: icf's witness (iropt.fd iro_fold_identical, WP19): only direct calls
 /// changed, each to a function whose body (in the module before the pass,
 /// `wa`) is the same as the one it called.
-fn tv_icf_witness(wa: & TvWorld, pre: & IrFunction, post: & IrFunction) -> str {
+fn tv_icf_witness(wa: &TvWorld, pre: &IrFunction, post: &IrFunction) -> str {
     var sb: str = tv_same_blocks(pre, post);
     if str_len(sb) > 0 {
         return sb;
@@ -4116,7 +4138,7 @@ fn tv_icf_witness(wa: & TvWorld, pre: & IrFunction, post: & IrFunction) -> str {
                     Inst::Call(n1, a1, r1, _) => {
                         match ib {
                             Inst::Call(n2, a2, r2, _) => {
-                                if tv_same_ids(& a1, & a2) && ir_type_eq(r1, r2) {
+                                if tv_same_ids(&a1, &a2) && ir_type_eq(r1, r2) {
                                     if tv_same_body(wa, n1, n2) {
                                         why = "";
                                     } else {
@@ -4144,8 +4166,8 @@ fn tv_icf_witness(wa: & TvWorld, pre: & IrFunction, post: & IrFunction) -> str {
 
 /// Is `b` (after the pass) a new constant, in the entry block, of the value
 /// `fixed` gives parameter `a` (before the pass)?
-fn tv_ipcp_arg(pre: & IrFunction, post: & IrFunction, pa: & TvPos, pb: & TvPos, fixed: & Vec<i64>, a: i64, b: i64) -> bool {
-    var at: i64 = - 1;
+fn tv_ipcp_arg(pre: &IrFunction, post: &IrFunction, pa: &TvPos, pb: &TvPos, fixed: &Vec<i64>, a: i64, b: i64) -> bool {
+    var at: i64 = -1;
     var pi: i64 = 0;
     while pi < pre.params.len() {
         if pre.params.get(pi).id == a {
@@ -4174,7 +4196,7 @@ fn tv_ipcp_arg(pre: & IrFunction, post: & IrFunction, pa: & TvPos, pb: & TvPos, 
 /// constants appear in the entry block; and an operand changed only from a
 /// parameter to a new constant of the value every call passes for it
 /// (`fixed`, tv_ipcp_facts).
-fn tv_ipcp_witness(pre: & IrFunction, post: & IrFunction, fixed: & Vec<i64>) -> str {
+fn tv_ipcp_witness(pre: &IrFunction, post: &IrFunction, fixed: &Vec<i64>) -> str {
     if pre.params.len() != post.params.len() {
         return "the parameters changed";
     }
@@ -4216,7 +4238,7 @@ fn tv_ipcp_witness(pre: & IrFunction, post: & IrFunction, fixed: & Vec<i64>) -> 
             }
             k = k + 1;
         }
-        if !tv_same_ids(& kept, & ia) {
+        if !tv_same_ids(&kept, &ia) {
             return "the instructions of block " + bid + " changed";
         }
         var j: i64 = 0;
@@ -4228,15 +4250,15 @@ fn tv_ipcp_witness(pre: & IrFunction, post: & IrFunction, fixed: & Vec<i64>) -> 
                 return "%" + int_to_str(x) + " changed";
             }
             var oa: Vec<i64> = Vec::new();
-            peir_inst_operands(xa, & mut oa);
+            peir_inst_operands(xa, &mut oa);
             var ob: Vec<i64> = Vec::new();
-            peir_inst_operands(xb, & mut ob);
+            peir_inst_operands(xb, &mut ob);
             if oa.len() != ob.len() {
                 return "%" + int_to_str(x) + " changed its operands";
             }
             var o: i64 = 0;
             while o < oa.len() {
-                if oa.get(o) != ob.get(o) && !tv_ipcp_arg(pre, post, & pa, & pb, fixed, oa.get(o), ob.get(o)) {
+                if oa.get(o) != ob.get(o) && !tv_ipcp_arg(pre, post, &pa, &pb, fixed, oa.get(o), ob.get(o)) {
                     return "%" + int_to_str(x) + " reads %" + int_to_str(ob.get(o)) + " in place of %" + int_to_str(oa.get(o)) + ", and not every call passes that constant";
                 }
                 o = o + 1;
@@ -4251,7 +4273,7 @@ fn tv_ipcp_witness(pre: & IrFunction, post: & IrFunction, fixed: & Vec<i64>) -> 
 /// Is `run` (new values of the function after the pass), followed by the
 /// call's value turned into a move of `r`, a copy of callee `g` as `w` has
 /// it, with its parameters read as `args`? "" yes, else why not.
-fn tv_inline_copy(w: & TvWorld, g: str, caller: & IrFunction, post: & IrFunction, args: & Vec<i64>, run: & Vec<i64>, r: i64) -> str {
+fn tv_inline_copy(w: &TvWorld, g: str, caller: &IrFunction, post: &IrFunction, args: &Vec<i64>, run: &Vec<i64>, r: i64) -> str {
     var at: i64 = HashMap_get(w.index, g) - 1;
     if at < 0 {
         return "inlines " + g + ", which is not a function of the module";
@@ -4270,8 +4292,8 @@ fn tv_inline_copy(w: & TvWorld, g: str, caller: & IrFunction, post: & IrFunction
     if body.len() != run.len() + 1 {
         return "is not a copy of " + g + " (" + int_to_str(run.len()) + " instructions for its " + int_to_str(body.len() - 1) + ")";
     }
-    var rv: i64 = - 1;
-    match peir_inst_of(& c, body.get(body.len() - 1)) {
+    var rv: i64 = -1;
+    match peir_inst_of(&c, body.get(body.len() - 1)) {
         Inst::Return(ov) => {
             match ov {
                 OptValueId::Some(x) => {
@@ -4300,21 +4322,21 @@ fn tv_inline_copy(w: & TvWorld, g: str, caller: & IrFunction, post: & IrFunction
     var q: i64 = 0;
     while q < run.len() {
         var cid: i64 = body.get(q);
-        var ci: Inst = peir_inst_of(& c, cid);
+        var ci: Inst = peir_inst_of(&c, cid);
         var ni: Inst = peir_inst_of(post, run.get(q));
         if tv_shape(ci) != tv_shape(ni) {
             return "is not a copy of " + g + " (its instruction " + int_to_str(q) + " differs)";
         }
         var oc: Vec<i64> = Vec::new();
-        peir_inst_operands(ci, & mut oc);
+        peir_inst_operands(ci, &mut oc);
         var on: Vec<i64> = Vec::new();
-        peir_inst_operands(ni, & mut on);
+        peir_inst_operands(ni, &mut on);
         if oc.len() != on.len() {
             return "is not a copy of " + g + " (its instruction " + int_to_str(q) + " differs)";
         }
         var o: i64 = 0;
         while o < oc.len() {
-            if tv_get(& map, oc.get(o)) - 1 != on.get(o) {
+            if tv_get(&map, oc.get(o)) - 1 != on.get(o) {
                 return "is not a copy of " + g + " (an operand of its instruction " + int_to_str(q) + " differs)";
             }
             o = o + 1;
@@ -4324,7 +4346,7 @@ fn tv_inline_copy(w: & TvWorld, g: str, caller: & IrFunction, post: & IrFunction
         }
         q = q + 1;
     }
-    if tv_get(& map, rv) - 1 != r {
+    if tv_get(&map, rv) - 1 != r {
         return "does not give the value " + g + " returns";
     }
     return "";
@@ -4334,16 +4356,16 @@ fn tv_inline_copy(w: & TvWorld, g: str, caller: & IrFunction, post: & IrFunction
 /// its callee's copy, `run`, computes? The callee is taken as the module
 /// after the pass has it, or before (the inliner reads callees as it
 /// changes them).
-fn tv_inline_site(wa: & TvWorld, wb: & TvWorld, pre: & IrFunction, post: & IrFunction, ia: Inst, ib: Inst, run: & Vec<i64>) -> str {
+fn tv_inline_site(wa: &TvWorld, wb: &TvWorld, pre: &IrFunction, post: &IrFunction, ia: Inst, ib: Inst, run: &Vec<i64>) -> str {
     match ia {
         Inst::Call(g, args, _, _) => {
             match ib {
                 Inst::BitCast(r, _, _) => {
-                    var w1: str = tv_inline_copy(wb, g, pre, post, & args, run, r);
+                    var w1: str = tv_inline_copy(wb, g, pre, post, &args, run, r);
                     if str_len(w1) == 0 {
                         return "";
                     }
-                    return tv_inline_copy(wa, g, pre, post, & args, run, r);
+                    return tv_inline_copy(wa, g, pre, post, &args, run, r);
                 }
                 _ => {
                 }
@@ -4360,7 +4382,7 @@ fn tv_inline_site(wa: & TvWorld, wb: & TvWorld, pre: & IrFunction, post: & IrFun
 /// and where new instructions come in, they are, with the call after them
 /// turned into a move of their result, a copy of the callee's one block
 /// with its parameters read as the call's arguments (tv_inline_copy).
-fn tv_inline_witness(wa: & TvWorld, wb: & TvWorld, pre: & IrFunction, post: & IrFunction) -> str {
+fn tv_inline_witness(wa: &TvWorld, wb: &TvWorld, pre: &IrFunction, post: &IrFunction) -> str {
     if pre.blocks.len() != post.blocks.len() {
         return "the blocks changed";
     }
@@ -4388,7 +4410,7 @@ fn tv_inline_witness(wa: & TvWorld, wb: & TvWorld, pre: & IrFunction, post: & Ir
                 var xa: Inst = peir_inst_of(pre, y);
                 var xb: Inst = peir_inst_of(post, y);
                 if run.len() > 0 || !tv_same_inst(xa, xb) {
-                    var why: str = tv_inline_site(wa, wb, pre, post, xa, xb, & run);
+                    var why: str = tv_inline_site(wa, wb, pre, post, xa, xb, &run);
                     if str_len(why) > 0 {
                         return "%" + int_to_str(y) + " " + why;
                     }
@@ -4416,7 +4438,7 @@ fn tv_inline_witness(wa: & TvWorld, wb: & TvWorld, pre: & IrFunction, post: & Ir
 /// block (iropt.fd iro_specialize: iro_clone_function, then
 /// iro_emit_param_const)? Every other instruction is the same, on the same
 /// operands, with the parameter's uses moved to the constant.
-fn tv_spec_clone_at(f: & IrFunction, g: & IrFunction, j: i64, v: i64) -> bool {
+fn tv_spec_clone_at(f: &IrFunction, g: &IrFunction, j: i64, v: i64) -> bool {
     var pty: IrType = f.params.get(j).ty;
     var pj: i64 = f.params.get(j).id;
     var g0: Vec<i64> = g.blocks.get(0).instructions;
@@ -4430,7 +4452,7 @@ fn tv_spec_clone_at(f: & IrFunction, g: & IrFunction, j: i64, v: i64) -> bool {
         return false;
     }
     var pf: TvPos = tv_pos_of(f, n);
-    if pf.blk.get(nid) != - 1 {
+    if pf.blk.get(nid) != -1 {
         return false;
     }
     var pi: i64 = 0;
@@ -4476,9 +4498,9 @@ fn tv_spec_clone_at(f: & IrFunction, g: & IrFunction, j: i64, v: i64) -> bool {
                 return false;
             }
             var oa: Vec<i64> = Vec::new();
-            peir_inst_operands(xa, & mut oa);
+            peir_inst_operands(xa, &mut oa);
             var ob: Vec<i64> = Vec::new();
-            peir_inst_operands(xb, & mut ob);
+            peir_inst_operands(xb, &mut ob);
             if oa.len() != ob.len() {
                 return false;
             }
@@ -4503,7 +4525,7 @@ fn tv_spec_clone_at(f: & IrFunction, g: & IrFunction, j: i64, v: i64) -> bool {
 /// Is `g` a clone of `f` for a constant the call (in `caller`, arguments
 /// `args`) passes: the same signature, and tv_spec_clone_at for one of the
 /// parameters whose argument is a constant?
-fn tv_spec_clone(f: & IrFunction, g: & IrFunction, caller: & IrFunction, args: & Vec<i64>) -> bool {
+fn tv_spec_clone(f: &IrFunction, g: &IrFunction, caller: &IrFunction, args: &Vec<i64>) -> bool {
     if f.params.len() != g.params.len() || args.len() != f.params.len() || f.params.len() == 0 {
         return false;
     }
@@ -4535,7 +4557,7 @@ fn tv_spec_clone(f: & IrFunction, g: & IrFunction, caller: & IrFunction, args: &
 /// changed, each to a function the module before the pass did not have
 /// that is a clone of the callee for a constant the call passes
 /// (tv_spec_clone).
-fn tv_spec_witness(wa: & TvWorld, wb: & TvWorld, pre: & IrFunction, post: & IrFunction) -> str {
+fn tv_spec_witness(wa: &TvWorld, wb: &TvWorld, pre: &IrFunction, post: &IrFunction) -> str {
     var sb: str = tv_same_blocks(pre, post);
     if str_len(sb) > 0 {
         return sb;
@@ -4557,10 +4579,10 @@ fn tv_spec_witness(wa: & TvWorld, wb: & TvWorld, pre: & IrFunction, post: & IrFu
                                 var x: i64 = HashMap_get(wa.index, n1) - 1;
                                 var y: i64 = HashMap_get(wb.index, n2) - 1;
                                 var fresh: bool = HashMap_get(wa.index, n2) == 0;
-                                if tv_same_ids(& a1, & a2) && ir_type_eq(r1, r2) && x >= 0 && y >= 0 && fresh {
+                                if tv_same_ids(&a1, &a2) && ir_type_eq(r1, r2) && x >= 0 && y >= 0 && fresh {
                                     var cf: IrFunction = wa.fns.get(x);
                                     var cg: IrFunction = wb.fns.get(y);
-                                    good = tv_spec_clone(& cf, & cg, pre, & a1);
+                                    good = tv_spec_clone(&cf, &cg, pre, &a1);
                                 }
                             }
                             _ => {
@@ -4585,7 +4607,7 @@ fn tv_spec_witness(wa: & TvWorld, wb: & TvWorld, pre: & IrFunction, post: & IrFu
 /// witness first; where it has none, or it does not hold, the runs across
 /// the module decide (a witness that does not hold is the verdict when no
 /// run can be made). "" yes, "n/a" nothing applies, else why not.
-fn tv_mod_check(pname: str, wa: & mut TvWorld, wb: & mut TvWorld, fa: & IrFunction, fb: & IrFunction, fixed: & Vec<i64>) -> str {
+fn tv_mod_check(pname: str, wa: &mut TvWorld, wb: &mut TvWorld, fa: &IrFunction, fb: &IrFunction, fixed: &Vec<i64>) -> str {
     var w: str = "n/a";
     // inlineclo (iropt_me ime_inline_closures) is inline2's rule for closures
     if pname == "inline" || pname == "inline2" || pname == "inlineclo" {
@@ -4622,7 +4644,7 @@ fn tv_mod_check(pname: str, wa: & mut TvWorld, wb: & mut TvWorld, fa: & IrFuncti
 }
 
 /// Has `post` the blocks of `pre`, by id and in order?
-fn tv_blocks_kept(pre: & IrFunction, post: & IrFunction) -> bool {
+fn tv_blocks_kept(pre: &IrFunction, post: &IrFunction) -> bool {
     if pre.blocks.len() != post.blocks.len() {
         return false;
     }
@@ -4639,7 +4661,7 @@ fn tv_blocks_kept(pre: & IrFunction, post: & IrFunction) -> bool {
 /// After module pass `pname` changed `module` (from `pre`, a tv_mod_before):
 /// true when every function it changed is accepted; false when one was
 /// rejected, and the module has its functions from before the pass again.
-pub fn tv_mod_after(pname: str, pre: & TvMod, module: & mut IrModule) -> bool {
+pub fn tv_mod_after(pname: str, pre: &TvMod, module: &mut IrModule) -> bool {
     if !pre.on {
         return true;
     }
@@ -4667,7 +4689,7 @@ pub fn tv_mod_after(pname: str, pre: & TvMod, module: & mut IrModule) -> bool {
         var ie: IrFunctionEntry = module.functions.get(todo.get(t));
         if tv_inject_on(pname, ie.name) {
             var ifn: IrFunction = ie.func;
-            if tv_inject_fn(& mut ifn) {
+            if tv_inject_fn(&mut ifn) {
                 ie.func = ifn;
                 module.functions.set(todo.get(t), ie);
                 inj = true;
@@ -4683,22 +4705,22 @@ pub fn tv_mod_after(pname: str, pre: & TvMod, module: & mut IrModule) -> bool {
         afns.push(pre.entries.get(i).func);
         i = i + 1;
     }
-    var gc: i64 = tv_gconst_facts(& afns, & module.globals);
+    var gc: i64 = tv_gconst_facts(&afns, &module.globals);
     var wa: TvWorld = tv_world_pre(pre, gc);
     var wb: TvWorld = tv_world_of(module, gc);
     var fx: TvFacts = TvFacts {
         at: 0, slots: Vec::new()
     };
     if pre.has_main {
-        fx = tv_ipcp_facts(& wa, module);
+        fx = tv_ipcp_facts(&wa, module);
     }
     t = 0;
     while t < todo.len() {
         var fb: IrFunction = module.functions.get(todo.get(t)).func;
         var fa: IrFunction = pre.entries.get(froms.get(t)).func;
         var fname: str = pre.entries.get(froms.get(t)).name;
-        var fixed: Vec<i64> = tv_fixed(& fx, fname, fa.params.len());
-        var why: str = tv_mod_check(pname, & mut wa, & mut wb, & fa, & fb, & fixed);
+        var fixed: Vec<i64> = tv_fixed(&fx, fname, fa.params.len());
+        var why: str = tv_mod_check(pname, &mut wa, &mut wb, &fa, &fb, &fixed);
         if why == "n/a" {
             g_tv_unchecked = g_tv_unchecked + 1;
             tv_note_na(pname);
@@ -4749,27 +4771,27 @@ fn tvs_fn(name: str, np: i64) -> IrFunction {
     var f: IrFunction = IrFunction_new(name, IrType::I64);
     var i: i64 = 0;
     while i < np {
-        var id: i64 = IrFunction_new_value(& mut f, ValueMeta_new(IrType::I64));
+        var id: i64 = IrFunction_new_value(&mut f, ValueMeta_new(IrType::I64));
         f.params.push(ValueIdType_new(id, IrType::I64));
         i = i + 1;
     }
     return f;
 }
 
-fn tvs_ci(f: & mut IrFunction, v: i64) -> i64 {
+fn tvs_ci(f: &mut IrFunction, v: i64) -> i64 {
     return IrFunction_emit(f, Inst::ConstInt(v, IrType::I64));
 }
 
-fn tvs_op(f: & mut IrFunction, op: BinOp, a: i64, b: i64) -> i64 {
+fn tvs_op(f: &mut IrFunction, op: BinOp, a: i64, b: i64) -> i64 {
     return IrFunction_emit(f, Inst::BinOp(op, a, b, IrType::I64));
 }
 
-fn tvs_ret(f: & mut IrFunction, v: i64) {
+fn tvs_ret(f: &mut IrFunction, v: i64) {
     var _r: i64 = IrFunction_emit(f, Inst::Return(OptValueId::Some(v)));
 }
 
 /// Take `id` out of the block holding it.
-fn tvs_drop(f: & mut IrFunction, id: i64) {
+fn tvs_drop(f: &mut IrFunction, id: i64) {
     var b: i64 = 0;
     while b < f.blocks.len() {
         var blk: BasicBlock = f.blocks.get(b);
@@ -4788,7 +4810,7 @@ fn tvs_drop(f: & mut IrFunction, id: i64) {
 }
 
 /// Put `id` into block index `b`, before instruction `before`.
-fn tvs_put(f: & mut IrFunction, id: i64, b: i64, before: i64) {
+fn tvs_put(f: &mut IrFunction, id: i64, b: i64, before: i64) {
     tvs_drop(f, id);
     var blk: BasicBlock = f.blocks.get(b);
     var out: Vec<i64> = Vec::new();
@@ -4806,7 +4828,7 @@ fn tvs_put(f: & mut IrFunction, id: i64, b: i64, before: i64) {
 }
 
 /// A new instruction in block index `b`, before `before`.
-fn tvs_new(f: & mut IrFunction, inst: Inst, b: i64, before: i64) -> i64 {
+fn tvs_new(f: &mut IrFunction, inst: Inst, b: i64, before: i64) -> i64 {
     f.current_block_idx = b;
     var id: i64 = IrFunction_emit(f, inst);
     tvs_put(f, id, b, before);
@@ -4815,7 +4837,7 @@ fn tvs_new(f: & mut IrFunction, inst: Inst, b: i64, before: i64) -> i64 {
 
 /// 1, after noting in `bad` when verdict `why` is not what case `name`
 /// expects (accepted: ""; rejected: a reason).
-fn tvs_expect(name: str, why: str, accept: bool, bad: & mut Vec<str>) -> i64 {
+fn tvs_expect(name: str, why: str, accept: bool, bad: &mut Vec<str>) -> i64 {
     var tr: str = p_getenv("FID_TV_SELFTEST_TRACE");
     if (tr as i64) != 0 && str_len(tr) > 0 {
         p_eprint_str("tv selftest: ran " + name + ": " + why + "\n");
@@ -4844,27 +4866,27 @@ fn tvs_expect(name: str, why: str, accept: bool, bad: & mut Vec<str>) -> i64 {
 fn tvs_fold(c: i64) -> str {
     var f: IrFunction = tvs_fn("tvs_fold", 1);
     var x: i64 = f.params.get(0).id;
-    var two: i64 = tvs_ci(& mut f, 2);
-    var three: i64 = tvs_ci(& mut f, 3);
-    var m: i64 = tvs_op(& mut f, BinOp::Mul, two, three);
-    var s: i64 = tvs_op(& mut f, BinOp::Add, x, m);
-    tvs_ret(& mut f, s);
-    var g: IrFunction = tv_snapshot(& f);
-    IrFunction_set_inst(& mut g, m, Inst::ConstInt(c, IrType::I64));
-    return tv_check("fold", & f, & g);
+    var two: i64 = tvs_ci(&mut f, 2);
+    var three: i64 = tvs_ci(&mut f, 3);
+    var m: i64 = tvs_op(&mut f, BinOp::Mul, two, three);
+    var s: i64 = tvs_op(&mut f, BinOp::Add, x, m);
+    tvs_ret(&mut f, s);
+    var g: IrFunction = tv_snapshot(&f);
+    IrFunction_set_inst(&mut g, m, Inst::ConstInt(c, IrType::I64));
+    return tv_check("fold", &f, &g);
 }
 
 /// fold of i64::MAX + 1 (which panics) into a constant.
 fn tvs_fold_panic() -> str {
     var f: IrFunction = tvs_fn("tvs_foldp", 1);
     var x: i64 = f.params.get(0).id;
-    var big: i64 = tvs_ci(& mut f, 9223372036854775807);
-    var one: i64 = tvs_ci(& mut f, 1);
-    var o: i64 = tvs_op(& mut f, BinOp::Add, big, one);
-    tvs_ret(& mut f, x);
-    var g: IrFunction = tv_snapshot(& f);
-    IrFunction_set_inst(& mut g, o, Inst::ConstInt(0 - 9223372036854775807 - 1, IrType::I64));
-    return tv_check("fold", & f, & g);
+    var big: i64 = tvs_ci(&mut f, 9223372036854775807);
+    var one: i64 = tvs_ci(&mut f, 1);
+    var o: i64 = tvs_op(&mut f, BinOp::Add, big, one);
+    tvs_ret(&mut f, x);
+    var g: IrFunction = tv_snapshot(&f);
+    IrFunction_set_inst(&mut g, o, Inst::ConstInt(0 - 9223372036854775807 - 1, IrType::I64));
+    return tv_check("fold", &f, &g);
 }
 
 /// dce of an unused `x op y`.
@@ -4872,11 +4894,11 @@ fn tvs_dce(op: BinOp) -> str {
     var f: IrFunction = tvs_fn("tvs_dce", 2);
     var x: i64 = f.params.get(0).id;
     var y: i64 = f.params.get(1).id;
-    var d: i64 = tvs_op(& mut f, op, x, y);
-    tvs_ret(& mut f, x);
-    var g: IrFunction = tv_snapshot(& f);
-    tvs_drop(& mut g, d);
-    return tv_check("dce", & f, & g);
+    var d: i64 = tvs_op(&mut f, op, x, y);
+    tvs_ret(&mut f, x);
+    var g: IrFunction = tv_snapshot(&f);
+    tvs_drop(&mut g, d);
+    return tv_check("dce", &f, &g);
 }
 
 /// gvn: (x + y) ^ (x + y) with the second addition replaced by the first.
@@ -4884,14 +4906,14 @@ fn tvs_gvn_ok() -> str {
     var f: IrFunction = tvs_fn("tvs_gvn", 2);
     var x: i64 = f.params.get(0).id;
     var y: i64 = f.params.get(1).id;
-    var a: i64 = tvs_op(& mut f, BinOp::Add, x, y);
-    var a2: i64 = tvs_op(& mut f, BinOp::Add, x, y);
-    var r: i64 = tvs_op(& mut f, BinOp::BitXor, a, a2);
-    tvs_ret(& mut f, r);
-    var g: IrFunction = tv_snapshot(& f);
-    IrFunction_set_inst(& mut g, r, Inst::BinOp(BinOp::BitXor, a, a, IrType::I64));
-    tvs_drop(& mut g, a2);
-    return tv_check("gvn", & f, & g);
+    var a: i64 = tvs_op(&mut f, BinOp::Add, x, y);
+    var a2: i64 = tvs_op(&mut f, BinOp::Add, x, y);
+    var r: i64 = tvs_op(&mut f, BinOp::BitXor, a, a2);
+    tvs_ret(&mut f, r);
+    var g: IrFunction = tv_snapshot(&f);
+    IrFunction_set_inst(&mut g, r, Inst::BinOp(BinOp::BitXor, a, a, IrType::I64));
+    tvs_drop(&mut g, a2);
+    return tv_check("gvn", &f, &g);
 }
 
 /// gvn of a load across a store to the same local: s = x; l1 = s; s = y;
@@ -4900,17 +4922,17 @@ fn tvs_gvn_store() -> str {
     var f: IrFunction = tvs_fn("tvs_gvns", 2);
     var x: i64 = f.params.get(0).id;
     var y: i64 = f.params.get(1).id;
-    var s: i64 = IrFunction_emit(& mut f, Inst::Alloca(IrType::I64, Region::Stack));
-    var _s1: i64 = IrFunction_emit(& mut f, Inst::Store(s, x, OptIrType::None));
-    var l1: i64 = IrFunction_emit(& mut f, Inst::Load(s, IrType::I64));
-    var _s2: i64 = IrFunction_emit(& mut f, Inst::Store(s, y, OptIrType::None));
-    var l2: i64 = IrFunction_emit(& mut f, Inst::Load(s, IrType::I64));
-    var r: i64 = tvs_op(& mut f, BinOp::BitXor, l1, l2);
-    tvs_ret(& mut f, r);
-    var g: IrFunction = tv_snapshot(& f);
-    IrFunction_set_inst(& mut g, r, Inst::BinOp(BinOp::BitXor, l1, l1, IrType::I64));
-    tvs_drop(& mut g, l2);
-    return tv_check("gvn", & f, & g);
+    var s: i64 = IrFunction_emit(&mut f, Inst::Alloca(IrType::I64, Region::Stack));
+    var _s1: i64 = IrFunction_emit(&mut f, Inst::Store(s, x, OptIrType::None));
+    var l1: i64 = IrFunction_emit(&mut f, Inst::Load(s, IrType::I64));
+    var _s2: i64 = IrFunction_emit(&mut f, Inst::Store(s, y, OptIrType::None));
+    var l2: i64 = IrFunction_emit(&mut f, Inst::Load(s, IrType::I64));
+    var r: i64 = tvs_op(&mut f, BinOp::BitXor, l1, l2);
+    tvs_ret(&mut f, r);
+    var g: IrFunction = tv_snapshot(&f);
+    IrFunction_set_inst(&mut g, r, Inst::BinOp(BinOp::BitXor, l1, l1, IrType::I64));
+    tvs_drop(&mut g, l2);
+    return tv_check("gvn", &f, &g);
 }
 
 /// LICM on `i = 0; acc = 0; while i < n { acc = q; i = i + 1 }; return acc`:
@@ -4921,45 +4943,45 @@ fn tvs_gvn_store() -> str {
 fn tvs_licm(what: i64) -> str {
     var f: IrFunction = tvs_fn("tvs_licm", 1);
     var n: i64 = f.params.get(0).id;
-    var iv: i64 = IrFunction_emit(& mut f, Inst::Alloca(IrType::I64, Region::Stack));
-    var acc: i64 = IrFunction_emit(& mut f, Inst::Alloca(IrType::I64, Region::Stack));
-    var zero: i64 = tvs_ci(& mut f, 0);
-    var one: i64 = tvs_ci(& mut f, 1);
-    var c7: i64 = tvs_ci(& mut f, 7);
-    var c100: i64 = tvs_ci(& mut f, 100);
-    var _s0: i64 = IrFunction_emit(& mut f, Inst::Store(iv, zero, OptIrType::None));
-    var _s1: i64 = IrFunction_emit(& mut f, Inst::Store(acc, zero, OptIrType::None));
-    var h: i64 = IrFunction_new_block(& mut f);
-    var body: i64 = IrFunction_new_block(& mut f);
-    var exb: i64 = IrFunction_new_block(& mut f);
+    var iv: i64 = IrFunction_emit(&mut f, Inst::Alloca(IrType::I64, Region::Stack));
+    var acc: i64 = IrFunction_emit(&mut f, Inst::Alloca(IrType::I64, Region::Stack));
+    var zero: i64 = tvs_ci(&mut f, 0);
+    var one: i64 = tvs_ci(&mut f, 1);
+    var c7: i64 = tvs_ci(&mut f, 7);
+    var c100: i64 = tvs_ci(&mut f, 100);
+    var _s0: i64 = IrFunction_emit(&mut f, Inst::Store(iv, zero, OptIrType::None));
+    var _s1: i64 = IrFunction_emit(&mut f, Inst::Store(acc, zero, OptIrType::None));
+    var h: i64 = IrFunction_new_block(&mut f);
+    var body: i64 = IrFunction_new_block(&mut f);
+    var exb: i64 = IrFunction_new_block(&mut f);
     f.current_block_idx = 0;
-    var j0: i64 = IrFunction_emit(& mut f, Inst::Jump(h));
+    var j0: i64 = IrFunction_emit(&mut f, Inst::Jump(h));
     f.current_block_idx = h;
-    var li: i64 = IrFunction_emit(& mut f, Inst::Load(iv, IrType::I64));
-    var c: i64 = IrFunction_emit(& mut f, Inst::BinOp(BinOp::Lt, li, n, IrType::Bool));
-    var _br: i64 = IrFunction_emit(& mut f, Inst::Branch(c, body, exb));
+    var li: i64 = IrFunction_emit(&mut f, Inst::Load(iv, IrType::I64));
+    var c: i64 = IrFunction_emit(&mut f, Inst::BinOp(BinOp::Lt, li, n, IrType::Bool));
+    var _br: i64 = IrFunction_emit(&mut f, Inst::Branch(c, body, exb));
     f.current_block_idx = body;
     var q: i64 = 0;
     if what == 1 {
-        q = tvs_op(& mut f, BinOp::Div, c100, n);
+        q = tvs_op(&mut f, BinOp::Div, c100, n);
     } else {
-        q = tvs_op(& mut f, BinOp::BitAnd, n, c7);
+        q = tvs_op(&mut f, BinOp::BitAnd, n, c7);
     }
-    var _s2: i64 = IrFunction_emit(& mut f, Inst::Store(acc, q, OptIrType::None));
-    var li2: i64 = IrFunction_emit(& mut f, Inst::Load(iv, IrType::I64));
-    var nx: i64 = tvs_op(& mut f, BinOp::Add, li2, one);
-    var _s3: i64 = IrFunction_emit(& mut f, Inst::Store(iv, nx, OptIrType::None));
-    var _jb: i64 = IrFunction_emit(& mut f, Inst::Jump(h));
+    var _s2: i64 = IrFunction_emit(&mut f, Inst::Store(acc, q, OptIrType::None));
+    var li2: i64 = IrFunction_emit(&mut f, Inst::Load(iv, IrType::I64));
+    var nx: i64 = tvs_op(&mut f, BinOp::Add, li2, one);
+    var _s3: i64 = IrFunction_emit(&mut f, Inst::Store(iv, nx, OptIrType::None));
+    var _jb: i64 = IrFunction_emit(&mut f, Inst::Jump(h));
     f.current_block_idx = exb;
-    var la: i64 = IrFunction_emit(& mut f, Inst::Load(acc, IrType::I64));
-    tvs_ret(& mut f, la);
-    var g: IrFunction = tv_snapshot(& f);
+    var la: i64 = IrFunction_emit(&mut f, Inst::Load(acc, IrType::I64));
+    tvs_ret(&mut f, la);
+    var g: IrFunction = tv_snapshot(&f);
     if what == 2 {
-        tvs_put(& mut g, li, 0, j0);
+        tvs_put(&mut g, li, 0, j0);
     } else {
-        tvs_put(& mut g, q, 0, j0);
+        tvs_put(&mut g, q, 0, j0);
     }
-    return tv_check("licm", & f, & g);
+    return tv_check("licm", &f, &g);
 }
 
 /// inline: tvs_g(a) = a + 1 inlined into tvs_h(x) = tvs_g(x) * 3; `wrong`:
@@ -4967,25 +4989,25 @@ fn tvs_licm(what: i64) -> str {
 fn tvs_inline(wrong: bool) -> str {
     var g: IrFunction = tvs_fn("tvs_g", 1);
     var ga: i64 = g.params.get(0).id;
-    var gone: i64 = tvs_ci(& mut g, 1);
-    var gs: i64 = tvs_op(& mut g, BinOp::Add, ga, gone);
-    tvs_ret(& mut g, gs);
+    var gone: i64 = tvs_ci(&mut g, 1);
+    var gs: i64 = tvs_op(&mut g, BinOp::Add, ga, gone);
+    tvs_ret(&mut g, gs);
     var h: IrFunction = tvs_fn("tvs_h", 1);
     var x: i64 = h.params.get(0).id;
     var args: Vec<i64> = Vec::new();
     args.push(x);
-    var cl: i64 = IrFunction_emit(& mut h, Inst::Call("tvs_g", args, IrType::I64, EffectSet_new()));
-    var three: i64 = tvs_ci(& mut h, 3);
-    var m: i64 = tvs_op(& mut h, BinOp::Mul, cl, three);
-    tvs_ret(& mut h, m);
-    var h2: IrFunction = tv_snapshot(& h);
-    var one2: i64 = tvs_new(& mut h2, Inst::ConstInt(1, IrType::I64), 0, cl);
+    var cl: i64 = IrFunction_emit(&mut h, Inst::Call("tvs_g", args, IrType::I64, EffectSet_new()));
+    var three: i64 = tvs_ci(&mut h, 3);
+    var m: i64 = tvs_op(&mut h, BinOp::Mul, cl, three);
+    tvs_ret(&mut h, m);
+    var h2: IrFunction = tv_snapshot(&h);
+    var one2: i64 = tvs_new(&mut h2, Inst::ConstInt(1, IrType::I64), 0, cl);
     var op: BinOp = BinOp::Add;
     if wrong {
         op = BinOp::Sub;
     }
-    var s2: i64 = tvs_new(& mut h2, Inst::BinOp(op, x, one2, IrType::I64), 0, cl);
-    IrFunction_set_inst(& mut h2, cl, Inst::BitCast(s2, IrType::I64, IrType::I64));
+    var s2: i64 = tvs_new(&mut h2, Inst::BinOp(op, x, one2, IrType::I64), 0, cl);
+    IrFunction_set_inst(&mut h2, cl, Inst::BitCast(s2, IrType::I64, IrType::I64));
     var an: Vec<str> = Vec::new();
     an.push("tvs_g");
     an.push("tvs_h");
@@ -5001,40 +5023,40 @@ fn tvs_inline(wrong: bool) -> str {
     var wa: TvWorld = tv_world(an, af, 0);
     var wb: TvWorld = tv_world(bn, bf, 0);
     var none: Vec<i64> = Vec::new();
-    return tv_mod_check("inline", & mut wa, & mut wb, & h, & h2, & none);
+    return tv_mod_check("inline", &mut wa, &mut wb, &h, &h2, &none);
 }
 
 /// gconst: a load of tvs_G (initializer 5) folded to 5; `stored`: another
 /// function stores 9 into it.
 fn tvs_gconst(stored: bool) -> str {
     var u: IrFunction = tvs_fn("tvs_u", 0);
-    var ga: i64 = IrFunction_emit(& mut u, Inst::GlobalAddr("tvs_G", IrType::I64));
-    var l: i64 = IrFunction_emit(& mut u, Inst::Load(ga, IrType::I64));
-    tvs_ret(& mut u, l);
-    var u2: IrFunction = tv_snapshot(& u);
-    IrFunction_set_inst(& mut u2, l, Inst::ConstInt(5, IrType::I64));
+    var ga: i64 = IrFunction_emit(&mut u, Inst::GlobalAddr("tvs_G", IrType::I64));
+    var l: i64 = IrFunction_emit(&mut u, Inst::Load(ga, IrType::I64));
+    tvs_ret(&mut u, l);
+    var u2: IrFunction = tv_snapshot(&u);
+    IrFunction_set_inst(&mut u2, l, Inst::ConstInt(5, IrType::I64));
     var fns: Vec<IrFunction> = Vec::new();
     fns.push(u);
     if stored {
         var s: IrFunction = tvs_fn("tvs_s", 0);
-        var sa: i64 = IrFunction_emit(& mut s, Inst::GlobalAddr("tvs_G", IrType::I64));
-        var nine: i64 = tvs_ci(& mut s, 9);
-        var _st: i64 = IrFunction_emit(& mut s, Inst::Store(sa, nine, OptIrType::None));
-        tvs_ret(& mut s, nine);
+        var sa: i64 = IrFunction_emit(&mut s, Inst::GlobalAddr("tvs_G", IrType::I64));
+        var nine: i64 = tvs_ci(&mut s, 9);
+        var _st: i64 = IrFunction_emit(&mut s, Inst::Store(sa, nine, OptIrType::None));
+        tvs_ret(&mut s, nine);
         fns.push(s);
     }
     var globals: Vec<GlobalEntry> = Vec::new();
     globals.push(GlobalEntry_new("tvs_G", IrType::I64, Expr::IntLit(5)));
-    var gc: i64 = tv_gconst_facts(& fns, & globals);
-    return tv_gconst_witness(& u, & u2, gc);
+    var gc: i64 = tv_gconst_facts(&fns, &globals);
+    return tv_gconst_witness(&u, &u2, gc);
 }
 
 fn tvs_addc(name: str, c: i64) -> IrFunction {
     var f: IrFunction = tvs_fn(name, 1);
     var a: i64 = f.params.get(0).id;
-    var k: i64 = tvs_ci(& mut f, c);
-    var r: i64 = tvs_op(& mut f, BinOp::Add, a, k);
-    tvs_ret(& mut f, r);
+    var k: i64 = tvs_ci(&mut f, c);
+    var r: i64 = tvs_op(&mut f, BinOp::Add, a, k);
+    tvs_ret(&mut f, r);
     return f;
 }
 
@@ -5050,12 +5072,12 @@ fn tvs_icf(same: bool) -> str {
     var x: i64 = c.params.get(0).id;
     var args: Vec<i64> = Vec::new();
     args.push(x);
-    var cl: i64 = IrFunction_emit(& mut c, Inst::Call("tvs_k1", args, IrType::I64, EffectSet_new()));
-    tvs_ret(& mut c, cl);
-    var c2: IrFunction = tv_snapshot(& c);
+    var cl: i64 = IrFunction_emit(&mut c, Inst::Call("tvs_k1", args, IrType::I64, EffectSet_new()));
+    tvs_ret(&mut c, cl);
+    var c2: IrFunction = tv_snapshot(&c);
     var args2: Vec<i64> = Vec::new();
     args2.push(x);
-    IrFunction_set_inst(& mut c2, cl, Inst::Call("tvs_k2", args2, IrType::I64, EffectSet_new()));
+    IrFunction_set_inst(&mut c2, cl, Inst::Call("tvs_k2", args2, IrType::I64, EffectSet_new()));
     var an: Vec<str> = Vec::new();
     an.push("tvs_k1");
     an.push("tvs_k2");
@@ -5065,19 +5087,19 @@ fn tvs_icf(same: bool) -> str {
     af.push(k2);
     af.push(c);
     var wa: TvWorld = tv_world(an, af, 0);
-    return tv_icf_witness(& wa, & c, & c2);
+    return tv_icf_witness(&wa, &c, &c2);
 }
 
 /// A function calling tvs_q(a, b) with two constants.
 fn tvs_caller(name: str, a: i64, b: i64) -> IrFunction {
     var f: IrFunction = tvs_fn(name, 0);
-    var ca: i64 = tvs_ci(& mut f, a);
-    var cb: i64 = tvs_ci(& mut f, b);
+    var ca: i64 = tvs_ci(&mut f, a);
+    var cb: i64 = tvs_ci(&mut f, b);
     var args: Vec<i64> = Vec::new();
     args.push(ca);
     args.push(cb);
-    var cl: i64 = IrFunction_emit(& mut f, Inst::Call("tvs_q", args, IrType::I64, EffectSet_new()));
-    tvs_ret(& mut f, cl);
+    var cl: i64 = IrFunction_emit(&mut f, Inst::Call("tvs_q", args, IrType::I64, EffectSet_new()));
+    tvs_ret(&mut f, cl);
     return f;
 }
 
@@ -5087,11 +5109,11 @@ fn tvs_ipcp(agree: bool) -> str {
     var q: IrFunction = tvs_fn("tvs_q", 2);
     var a: i64 = q.params.get(0).id;
     var b: i64 = q.params.get(1).id;
-    var s: i64 = tvs_op(& mut q, BinOp::Add, a, b);
-    tvs_ret(& mut q, s);
-    var q2: IrFunction = tv_snapshot(& q);
-    var k: i64 = tvs_new(& mut q2, Inst::ConstInt(5, IrType::I64), 0, s);
-    IrFunction_set_inst(& mut q2, s, Inst::BinOp(BinOp::Add, a, k, IrType::I64));
+    var s: i64 = tvs_op(&mut q, BinOp::Add, a, b);
+    tvs_ret(&mut q, s);
+    var q2: IrFunction = tv_snapshot(&q);
+    var k: i64 = tvs_new(&mut q2, Inst::ConstInt(5, IrType::I64), 0, s);
+    IrFunction_set_inst(&mut q2, s, Inst::BinOp(BinOp::Add, a, k, IrType::I64));
     var m1: IrFunction = tvs_caller("tvs_m1", 1, 5);
     var m2: IrFunction = tvs_caller("tvs_m2", 2, 5);
     if !agree {
@@ -5116,9 +5138,9 @@ fn tvs_ipcp(agree: bool) -> str {
     var wa: TvWorld = tv_world(an, af, 0);
     var wb: TvWorld = tv_world(bn, bf, 0);
     var module: IrModule = IrModule_new();
-    var fx: TvFacts = tv_ipcp_facts(& wa, & module);
-    var fixed: Vec<i64> = tv_fixed(& fx, "tvs_q", 2);
-    return tv_mod_check("ipcp", & mut wa, & mut wb, & q, & q2, & fixed);
+    var fx: TvFacts = tv_ipcp_facts(&wa, &module);
+    var fixed: Vec<i64> = tv_fixed(&fx, "tvs_q", 2);
+    return tv_mod_check("ipcp", &mut wa, &mut wb, &q, &q2, &fixed);
 }
 
 /// spec: tvs_q(a, b) = a * b; its caller passes (3, 5) and is sent to the
@@ -5127,29 +5149,29 @@ fn tvs_spec(right: bool) -> str {
     var q: IrFunction = tvs_fn("tvs_q", 2);
     var a: i64 = q.params.get(0).id;
     var b: i64 = q.params.get(1).id;
-    var s: i64 = tvs_op(& mut q, BinOp::Mul, a, b);
-    tvs_ret(& mut q, s);
-    var q2: IrFunction = tv_snapshot(& q);
+    var s: i64 = tvs_op(&mut q, BinOp::Mul, a, b);
+    tvs_ret(&mut q, s);
+    var q2: IrFunction = tv_snapshot(&q);
     q2.name = "tvs_q_sc1_5";
     var cv: i64 = 5;
     if !right {
         cv = 6;
     }
-    var k: i64 = tvs_new(& mut q2, Inst::ConstInt(cv, IrType::I64), 0, s);
-    IrFunction_set_inst(& mut q2, s, Inst::BinOp(BinOp::Mul, a, k, IrType::I64));
+    var k: i64 = tvs_new(&mut q2, Inst::ConstInt(cv, IrType::I64), 0, s);
+    IrFunction_set_inst(&mut q2, s, Inst::BinOp(BinOp::Mul, a, k, IrType::I64));
     var m: IrFunction = tvs_fn("tvs_m", 0);
-    var c3: i64 = tvs_ci(& mut m, 3);
-    var c5: i64 = tvs_ci(& mut m, 5);
+    var c3: i64 = tvs_ci(&mut m, 3);
+    var c5: i64 = tvs_ci(&mut m, 5);
     var args: Vec<i64> = Vec::new();
     args.push(c3);
     args.push(c5);
-    var cl: i64 = IrFunction_emit(& mut m, Inst::Call("tvs_q", args, IrType::I64, EffectSet_new()));
-    tvs_ret(& mut m, cl);
-    var m2: IrFunction = tv_snapshot(& m);
+    var cl: i64 = IrFunction_emit(&mut m, Inst::Call("tvs_q", args, IrType::I64, EffectSet_new()));
+    tvs_ret(&mut m, cl);
+    var m2: IrFunction = tv_snapshot(&m);
     var args2: Vec<i64> = Vec::new();
     args2.push(c3);
     args2.push(c5);
-    IrFunction_set_inst(& mut m2, cl, Inst::Call("tvs_q_sc1_5", args2, IrType::I64, EffectSet_new()));
+    IrFunction_set_inst(&mut m2, cl, Inst::Call("tvs_q_sc1_5", args2, IrType::I64, EffectSet_new()));
     var an: Vec<str> = Vec::new();
     an.push("tvs_q");
     an.push("tvs_m");
@@ -5168,7 +5190,7 @@ fn tvs_spec(right: bool) -> str {
     var wb: TvWorld = tv_world(bn, bf, 0);
     var pre: IrFunction = wa.fns.get(1);
     var post: IrFunction = wb.fns.get(1);
-    return tv_spec_witness(& wa, & wb, & pre, & post);
+    return tv_spec_witness(&wa, &wb, &pre, &post);
 }
 
 /// devirt: a trait call `m` on a value made from type TvsT made a direct
@@ -5177,21 +5199,21 @@ fn tvs_devirt(right: bool) -> str {
     var module: IrModule = IrModule_new();
     var tm: IrFunction = tvs_fn("TvsT_m", 2);
     var tm1: i64 = tm.params.get(1).id;
-    tvs_ret(& mut tm, tm1);
+    tvs_ret(&mut tm, tm1);
     var um: IrFunction = tvs_fn("TvsU_m", 2);
     var um0: i64 = um.params.get(0).id;
-    tvs_ret(& mut um, um0);
-    IrModule_add_function(& mut module, tm);
-    IrModule_add_function(& mut module, um);
+    tvs_ret(&mut um, um0);
+    IrModule_add_function(&mut module, tm);
+    IrModule_add_function(&mut module, um);
     var f: IrFunction = tvs_fn("tvs_dv", 1);
     var x: i64 = f.params.get(0).id;
-    var d: i64 = IrFunction_emit(& mut f, Inst::MakeDyn(x, "TvsT", "TvsTr"));
+    var d: i64 = IrFunction_emit(&mut f, Inst::MakeDyn(x, "TvsT", "TvsTr"));
     var dargs: Vec<i64> = Vec::new();
     dargs.push(d);
-    var r: i64 = IrFunction_emit(& mut f, Inst::DynCall("TvsTr", "m", dargs, IrType::I64, EffectSet_new()));
-    tvs_ret(& mut f, r);
-    var g: IrFunction = tv_snapshot(& f);
-    var e0: i64 = tvs_new(& mut g, Inst::ConstInt(0, IrType::I64), 0, r);
+    var r: i64 = IrFunction_emit(&mut f, Inst::DynCall("TvsTr", "m", dargs, IrType::I64, EffectSet_new()));
+    tvs_ret(&mut f, r);
+    var g: IrFunction = tv_snapshot(&f);
+    var e0: i64 = tvs_new(&mut g, Inst::ConstInt(0, IrType::I64), 0, r);
     var nargs: Vec<i64> = Vec::new();
     nargs.push(e0);
     nargs.push(x);
@@ -5199,8 +5221,8 @@ fn tvs_devirt(right: bool) -> str {
     if !right {
         target = "TvsU_m";
     }
-    IrFunction_set_inst(& mut g, r, Inst::Call(target, nargs, IrType::I64, EffectSet_new()));
-    return tv_devirt(& module, & f, & g);
+    IrFunction_set_inst(&mut g, r, Inst::Call(target, nargs, IrType::I64, EffectSet_new()));
+    return tv_devirt(&module, &f, &g);
 }
 
 /// A fault tv_inject_fn puts into gvn's right result must be caught.
@@ -5208,14 +5230,14 @@ fn tvs_inject() -> str {
     var f: IrFunction = tvs_fn("tvs_inj", 2);
     var x: i64 = f.params.get(0).id;
     var y: i64 = f.params.get(1).id;
-    var a: i64 = tvs_op(& mut f, BinOp::Add, x, y);
-    var r: i64 = tvs_op(& mut f, BinOp::BitXor, a, x);
-    tvs_ret(& mut f, r);
-    var g: IrFunction = tv_snapshot(& f);
-    if !tv_inject_fn(& mut g) {
+    var a: i64 = tvs_op(&mut f, BinOp::Add, x, y);
+    var r: i64 = tvs_op(&mut f, BinOp::BitXor, a, x);
+    tvs_ret(&mut f, r);
+    var g: IrFunction = tv_snapshot(&f);
+    if !tv_inject_fn(&mut g) {
         return "";
     }
-    return tv_check("gvn", & f, & g);
+    return tv_check("gvn", &f, &g);
 }
 
 /// Straight-line code is written as SMT-LIB ("" yes).
@@ -5223,11 +5245,11 @@ fn tvs_smt() -> str {
     var f: IrFunction = tvs_fn("tvs_smt", 2);
     var x: i64 = f.params.get(0).id;
     var y: i64 = f.params.get(1).id;
-    var a: i64 = tvs_op(& mut f, BinOp::Mul, x, y);
-    var k: i64 = tvs_ci(& mut f, 3);
-    var d: i64 = tvs_op(& mut f, BinOp::Div, a, k);
-    tvs_ret(& mut f, d);
-    var s: TvSmt = tv_smt_fn(& f, "a");
+    var a: i64 = tvs_op(&mut f, BinOp::Mul, x, y);
+    var k: i64 = tvs_ci(&mut f, 3);
+    var d: i64 = tvs_op(&mut f, BinOp::Div, a, k);
+    tvs_ret(&mut f, d);
+    var s: TvSmt = tv_smt_fn(&f, "a");
     if !s.ok || str_len(s.defs) == 0 || s.pan == "false" {
         return "not written as SMT-LIB";
     }
@@ -5237,7 +5259,7 @@ fn tvs_smt() -> str {
 /// Write the obligation of one example pair to <dir>/tvx<n>.smt2, its first
 /// line naming the answer z3 must give ("expect unsat": the two are the
 /// same; "expect sat": they differ). 1 when written.
-fn tvs_smt_put(dir: str, n: i64, name: str, same: bool, pre: & IrFunction, post: & IrFunction) -> i64 {
+fn tvs_smt_put(dir: str, n: i64, name: str, same: bool, pre: &IrFunction, post: &IrFunction) -> i64 {
     var want: str = "expect sat";
     if same {
         want = "expect unsat";
@@ -5255,9 +5277,9 @@ fn tvs_smt_put(dir: str, n: i64, name: str, same: bool, pre: & IrFunction, post:
 fn tvs_smt_opk(name: str, op: BinOp, k: i64) -> IrFunction {
     var f: IrFunction = tvs_fn(name, 1);
     var x: i64 = f.params.get(0).id;
-    var c: i64 = tvs_ci(& mut f, k);
-    var r: i64 = tvs_op(& mut f, op, x, c);
-    tvs_ret(& mut f, r);
+    var c: i64 = tvs_ci(&mut f, k);
+    var r: i64 = tvs_op(&mut f, op, x, c);
+    tvs_ret(&mut f, r);
     return f;
 }
 
@@ -5265,11 +5287,11 @@ fn tvs_smt_opk(name: str, op: BinOp, k: i64) -> IrFunction {
 fn tvs_smt_fold(name: str, a: i64, b: i64) -> IrFunction {
     var f: IrFunction = tvs_fn(name, 1);
     var x: i64 = f.params.get(0).id;
-    var ca: i64 = tvs_ci(& mut f, a);
-    var cb: i64 = tvs_ci(& mut f, b);
-    var m: i64 = tvs_op(& mut f, BinOp::Mul, ca, cb);
-    var r: i64 = tvs_op(& mut f, BinOp::Add, x, m);
-    tvs_ret(& mut f, r);
+    var ca: i64 = tvs_ci(&mut f, a);
+    var cb: i64 = tvs_ci(&mut f, b);
+    var m: i64 = tvs_op(&mut f, BinOp::Mul, ca, cb);
+    var r: i64 = tvs_op(&mut f, BinOp::Add, x, m);
+    tvs_ret(&mut f, r);
     return f;
 }
 
@@ -5289,64 +5311,64 @@ pub fn tv_smt_examples(dir: str) -> i64 {
     var f1: IrFunction = tvs_smt_opk("tvx_mul2", BinOp::Mul, 2);
     var g1: IrFunction = tvs_fn("tvx_mul2", 1);
     var x1: i64 = g1.params.get(0).id;
-    var s1: i64 = tvs_op(& mut g1, BinOp::Add, x1, x1);
-    tvs_ret(& mut g1, s1);
-    n = n + tvs_smt_put(dir, n + 1, "x * 2 as x + x", true, & f1, & g1);
+    var s1: i64 = tvs_op(&mut g1, BinOp::Add, x1, x1);
+    tvs_ret(&mut g1, s1);
+    n = n + tvs_smt_put(dir, n + 1, "x * 2 as x + x", true, &f1, &g1);
     // x + y - y as x: the panic of the overflowing addition is lost
     var f2: IrFunction = tvs_fn("tvx_addsub", 2);
     var x2: i64 = f2.params.get(0).id;
     var y2: i64 = f2.params.get(1).id;
-    var a2: i64 = tvs_op(& mut f2, BinOp::Add, x2, y2);
-    var b2: i64 = tvs_op(& mut f2, BinOp::Sub, a2, y2);
-    tvs_ret(& mut f2, b2);
+    var a2: i64 = tvs_op(&mut f2, BinOp::Add, x2, y2);
+    var b2: i64 = tvs_op(&mut f2, BinOp::Sub, a2, y2);
+    tvs_ret(&mut f2, b2);
     var g2: IrFunction = tvs_fn("tvx_addsub", 2);
     var p2: i64 = g2.params.get(0).id;
-    tvs_ret(& mut g2, p2);
-    n = n + tvs_smt_put(dir, n + 1, "x + y - y as x (checked arithmetic)", false, & f2, & g2);
+    tvs_ret(&mut g2, p2);
+    n = n + tvs_smt_put(dir, n + 1, "x + y - y as x (checked arithmetic)", false, &f2, &g2);
     // a fold of 6 * 7 into 42, and into 43
     var f3: IrFunction = tvs_smt_fold("tvx_fold", 6, 7);
     var g3: IrFunction = tvs_smt_addk("tvx_fold", 42);
-    n = n + tvs_smt_put(dir, n + 1, "x + 6 * 7 folded to x + 42", true, & f3, & g3);
+    n = n + tvs_smt_put(dir, n + 1, "x + 6 * 7 folded to x + 42", true, &f3, &g3);
     var g4: IrFunction = tvs_smt_addk("tvx_fold", 43);
-    n = n + tvs_smt_put(dir, n + 1, "x + 6 * 7 folded to x + 43", false, & f3, & g4);
+    n = n + tvs_smt_put(dir, n + 1, "x + 6 * 7 folded to x + 43", false, &f3, &g4);
     // an unused x / y removed: y == 0 panicked
     var f5: IrFunction = tvs_fn("tvx_div", 2);
     var x5: i64 = f5.params.get(0).id;
     var y5: i64 = f5.params.get(1).id;
-    var _d5: i64 = tvs_op(& mut f5, BinOp::Div, x5, y5);
-    tvs_ret(& mut f5, x5);
+    var _d5: i64 = tvs_op(&mut f5, BinOp::Div, x5, y5);
+    tvs_ret(&mut f5, x5);
     var g5: IrFunction = tvs_fn("tvx_div", 2);
     var p5: i64 = g5.params.get(0).id;
-    tvs_ret(& mut g5, p5);
-    n = n + tvs_smt_put(dir, n + 1, "an unused x / y removed", false, & f5, & g5);
+    tvs_ret(&mut g5, p5);
+    n = n + tvs_smt_put(dir, n + 1, "an unused x / y removed", false, &f5, &g5);
     // (x ^ y) ^ y as x
     var f6: IrFunction = tvs_fn("tvx_xor", 2);
     var x6: i64 = f6.params.get(0).id;
     var y6: i64 = f6.params.get(1).id;
-    var a6: i64 = tvs_op(& mut f6, BinOp::BitXor, x6, y6);
-    var b6: i64 = tvs_op(& mut f6, BinOp::BitXor, a6, y6);
-    tvs_ret(& mut f6, b6);
+    var a6: i64 = tvs_op(&mut f6, BinOp::BitXor, x6, y6);
+    var b6: i64 = tvs_op(&mut f6, BinOp::BitXor, a6, y6);
+    tvs_ret(&mut f6, b6);
     var g6: IrFunction = tvs_fn("tvx_xor", 2);
     var p6: i64 = g6.params.get(0).id;
-    tvs_ret(& mut g6, p6);
-    n = n + tvs_smt_put(dir, n + 1, "(x ^ y) ^ y as x", true, & f6, & g6);
+    tvs_ret(&mut g6, p6);
+    n = n + tvs_smt_put(dir, n + 1, "(x ^ y) ^ y as x", true, &f6, &g6);
     // x / 4 as x >> 2: not for negative x (signed division rounds to 0)
     var f7: IrFunction = tvs_smt_opk("tvx_div4", BinOp::Div, 4);
     var g7: IrFunction = tvs_smt_opk("tvx_div4", BinOp::Shr, 2);
-    n = n + tvs_smt_put(dir, n + 1, "x / 4 as x >> 2 (signed)", false, & f7, & g7);
+    n = n + tvs_smt_put(dir, n + 1, "x / 4 as x >> 2 (signed)", false, &f7, &g7);
     // x * 8 as x << 3: not with checked arithmetic (the shift does not panic)
     var f8: IrFunction = tvs_smt_opk("tvx_mul8", BinOp::Mul, 8);
     var g8: IrFunction = tvs_smt_opk("tvx_mul8", BinOp::Shl, 3);
-    n = n + tvs_smt_put(dir, n + 1, "x * 8 as x << 3 (checked arithmetic)", false, & f8, & g8);
+    n = n + tvs_smt_put(dir, n + 1, "x * 8 as x << 3 (checked arithmetic)", false, &f8, &g8);
     // x - x as 0
     var f9: IrFunction = tvs_fn("tvx_subself", 1);
     var x9: i64 = f9.params.get(0).id;
-    var s9: i64 = tvs_op(& mut f9, BinOp::Sub, x9, x9);
-    tvs_ret(& mut f9, s9);
+    var s9: i64 = tvs_op(&mut f9, BinOp::Sub, x9, x9);
+    tvs_ret(&mut f9, s9);
     var g9: IrFunction = tvs_fn("tvx_subself", 1);
-    var z9: i64 = tvs_ci(& mut g9, 0);
-    tvs_ret(& mut g9, z9);
-    n = n + tvs_smt_put(dir, n + 1, "x - x as 0", true, & f9, & g9);
+    var z9: i64 = tvs_ci(&mut g9, 0);
+    tvs_ret(&mut g9, z9);
+    n = n + tvs_smt_put(dir, n + 1, "x - x as 0", true, &f9, &g9);
     return n;
 }
 
@@ -5354,30 +5376,30 @@ pub fn tv_smt_examples(dir: str) -> i64 {
 pub fn tv_selftest() -> i64 {
     var bad: Vec<str> = Vec::new();
     var n: i64 = 0;
-    n = n + tvs_expect("fold of 2 * 3 into 6", tvs_fold(6), true, & mut bad);
-    n = n + tvs_expect("fold of 2 * 3 into 7", tvs_fold(7), false, & mut bad);
-    n = n + tvs_expect("fold of an addition that overflows", tvs_fold_panic(), false, & mut bad);
-    n = n + tvs_expect("dce of an unused bit operation", tvs_dce(BinOp::BitAnd), true, & mut bad);
-    n = n + tvs_expect("dce of a division that may panic", tvs_dce(BinOp::Div), false, & mut bad);
-    n = n + tvs_expect("gvn of an equal addition", tvs_gvn_ok(), true, & mut bad);
-    n = n + tvs_expect("gvn of a load across a store", tvs_gvn_store(), false, & mut bad);
-    n = n + tvs_expect("licm of a bit operation", tvs_licm(0), true, & mut bad);
-    n = n + tvs_expect("licm of a division out of the loop body", tvs_licm(1), false, & mut bad);
-    n = n + tvs_expect("licm of a load of a local the loop stores", tvs_licm(2), false, & mut bad);
-    n = n + tvs_expect("inline of a copy of the callee", tvs_inline(false), true, & mut bad);
-    n = n + tvs_expect("inline of a wrong copy", tvs_inline(true), false, & mut bad);
-    n = n + tvs_expect("gconst of a global nothing stores", tvs_gconst(false), true, & mut bad);
-    n = n + tvs_expect("gconst of a global a function stores", tvs_gconst(true), false, & mut bad);
-    n = n + tvs_expect("icf to the same body", tvs_icf(true), true, & mut bad);
-    n = n + tvs_expect("icf to another body", tvs_icf(false), false, & mut bad);
-    n = n + tvs_expect("ipcp of a constant every call passes", tvs_ipcp(true), true, & mut bad);
-    n = n + tvs_expect("ipcp of a parameter the calls differ on", tvs_ipcp(false), false, & mut bad);
-    n = n + tvs_expect("spec to a clone for the constant passed", tvs_spec(true), true, & mut bad);
-    n = n + tvs_expect("spec to a clone for another constant", tvs_spec(false), false, & mut bad);
-    n = n + tvs_expect("devirt to the type's method", tvs_devirt(true), true, & mut bad);
-    n = n + tvs_expect("devirt to another type's method", tvs_devirt(false), false, & mut bad);
-    n = n + tvs_expect("an injected fault", tvs_inject(), false, & mut bad);
-    n = n + tvs_expect("SMT-LIB of straight-line code", tvs_smt(), true, & mut bad);
+    n = n + tvs_expect("fold of 2 * 3 into 6", tvs_fold(6), true, &mut bad);
+    n = n + tvs_expect("fold of 2 * 3 into 7", tvs_fold(7), false, &mut bad);
+    n = n + tvs_expect("fold of an addition that overflows", tvs_fold_panic(), false, &mut bad);
+    n = n + tvs_expect("dce of an unused bit operation", tvs_dce(BinOp::BitAnd), true, &mut bad);
+    n = n + tvs_expect("dce of a division that may panic", tvs_dce(BinOp::Div), false, &mut bad);
+    n = n + tvs_expect("gvn of an equal addition", tvs_gvn_ok(), true, &mut bad);
+    n = n + tvs_expect("gvn of a load across a store", tvs_gvn_store(), false, &mut bad);
+    n = n + tvs_expect("licm of a bit operation", tvs_licm(0), true, &mut bad);
+    n = n + tvs_expect("licm of a division out of the loop body", tvs_licm(1), false, &mut bad);
+    n = n + tvs_expect("licm of a load of a local the loop stores", tvs_licm(2), false, &mut bad);
+    n = n + tvs_expect("inline of a copy of the callee", tvs_inline(false), true, &mut bad);
+    n = n + tvs_expect("inline of a wrong copy", tvs_inline(true), false, &mut bad);
+    n = n + tvs_expect("gconst of a global nothing stores", tvs_gconst(false), true, &mut bad);
+    n = n + tvs_expect("gconst of a global a function stores", tvs_gconst(true), false, &mut bad);
+    n = n + tvs_expect("icf to the same body", tvs_icf(true), true, &mut bad);
+    n = n + tvs_expect("icf to another body", tvs_icf(false), false, &mut bad);
+    n = n + tvs_expect("ipcp of a constant every call passes", tvs_ipcp(true), true, &mut bad);
+    n = n + tvs_expect("ipcp of a parameter the calls differ on", tvs_ipcp(false), false, &mut bad);
+    n = n + tvs_expect("spec to a clone for the constant passed", tvs_spec(true), true, &mut bad);
+    n = n + tvs_expect("spec to a clone for another constant", tvs_spec(false), false, &mut bad);
+    n = n + tvs_expect("devirt to the type's method", tvs_devirt(true), true, &mut bad);
+    n = n + tvs_expect("devirt to another type's method", tvs_devirt(false), false, &mut bad);
+    n = n + tvs_expect("an injected fault", tvs_inject(), false, &mut bad);
+    n = n + tvs_expect("SMT-LIB of straight-line code", tvs_smt(), true, &mut bad);
     p_eprint_str("tv selftest: " + int_to_str(n) + " cases, " + int_to_str(n - bad.len()) + " as expected\n");
     var i: i64 = 0;
     while i < bad.len() {
@@ -5460,7 +5482,7 @@ fn tvp_pair_new(name: str) -> TvpPair {
 }
 
 /// Note the first error of the pair being read (with its line).
-fn tvp_err(p: & mut TvpP, msg: str) {
+fn tvp_err(p: &mut TvpP, msg: str) {
     if str_len(p.err) == 0 {
         p.err = "line " + int_to_str(p.at + 1) + ": " + msg;
     }
@@ -5500,7 +5522,7 @@ fn tvp_words(line: str) -> Vec<str> {
     return out;
 }
 
-fn tvp_w(ws: & Vec<str>, i: i64) -> str {
+fn tvp_w(ws: &Vec<str>, i: i64) -> str {
     if i >= 0 && i < ws.len() {
         return ws.get(i);
     }
@@ -5528,7 +5550,7 @@ fn tvp_isnum(w: str) -> bool {
 }
 
 /// The integer `w`, or i64's `min` or `max`.
-fn tvp_num(p: & mut TvpP, w: str) -> i64 {
+fn tvp_num(p: &mut TvpP, w: str) -> i64 {
     if w == "max" {
         return 9223372036854775807;
     }
@@ -5567,7 +5589,7 @@ fn tvp_num(p: & mut TvpP, w: str) -> i64 {
     return 0 - v;
 }
 
-fn tvp_ty(p: & mut TvpP, w: str) -> IrType {
+fn tvp_ty(p: &mut TvpP, w: str) -> IrType {
     if w == "i64" {
         return IrType::I64;
     }
@@ -5606,7 +5628,7 @@ fn tvp_ty(p: & mut TvpP, w: str) -> IrType {
 }
 
 /// `%N` (a value) or `bN` (a block, `mark` 98): N.
-fn tvp_ref(p: & mut TvpP, w: str, mark: i64) -> i64 {
+fn tvp_ref(p: &mut TvpP, w: str, mark: i64) -> i64 {
     if str_len(w) < 2 || str_byte_at(w, 0) != mark {
         if mark == 98 {
             tvp_err(p, "not a block: '" + w + "'");
@@ -5623,11 +5645,11 @@ fn tvp_ref(p: & mut TvpP, w: str, mark: i64) -> i64 {
     return tvp_num(p, rest);
 }
 
-fn tvp_val(p: & mut TvpP, w: str) -> i64 {
+fn tvp_val(p: &mut TvpP, w: str) -> i64 {
     return tvp_ref(p, w, 37);
 }
 
-fn tvp_blk(p: & mut TvpP, w: str) -> i64 {
+fn tvp_blk(p: &mut TvpP, w: str) -> i64 {
     return tvp_ref(p, w, 98);
 }
 
@@ -5697,7 +5719,7 @@ pub struct TvpArgs {
     pub eff: EffectSet,
 }
 
-fn tvp_args(p: & mut TvpP, ws: & Vec<str>, from: i64) -> TvpArgs {
+fn tvp_args(p: &mut TvpP, ws: &Vec<str>, from: i64) -> TvpArgs {
     var a: TvpArgs = TvpArgs {
         args: Vec::new(), eff: EffectSet_new()
     };
@@ -5706,15 +5728,15 @@ fn tvp_args(p: & mut TvpP, ws: & Vec<str>, from: i64) -> TvpArgs {
         var w: str = ws.get(i);
         if str_byte_at(w, 0) == 33 {
             if w == "!io" {
-                EffectSet_add(& mut a.eff, Effect::IO);
+                EffectSet_add(&mut a.eff, Effect::IO);
             } else if w == "!write" {
-                EffectSet_add(& mut a.eff, Effect::Write);
+                EffectSet_add(&mut a.eff, Effect::Write);
             } else if w == "!read" {
-                EffectSet_add(& mut a.eff, Effect::Read);
+                EffectSet_add(&mut a.eff, Effect::Read);
             } else if w == "!alloc" {
-                EffectSet_add(& mut a.eff, Effect::Alloc);
+                EffectSet_add(&mut a.eff, Effect::Alloc);
             } else if w == "!diverge" {
-                EffectSet_add(& mut a.eff, Effect::Diverge);
+                EffectSet_add(&mut a.eff, Effect::Diverge);
             } else {
                 tvp_err(p, "not an effect: '" + w + "'");
             }
@@ -5727,7 +5749,7 @@ fn tvp_args(p: & mut TvpP, ws: & Vec<str>, from: i64) -> TvpArgs {
 }
 
 /// The instruction of words `ws` (`%N OP ...`).
-fn tvp_inst(p: & mut TvpP, ws: & Vec<str>) -> Inst {
+fn tvp_inst(p: &mut TvpP, ws: &Vec<str>) -> Inst {
     var op: str = tvp_w(ws, 1);
     if op == "const" {
         var ct: IrType = tvp_ty(p, tvp_w(ws, 2));
@@ -5836,7 +5858,7 @@ fn tvp_inst(p: & mut TvpP, ws: & Vec<str>) -> Inst {
 }
 
 /// Is `w` a block label (`bN`, the line's only word)?
-fn tvp_is_label(ws: & Vec<str>) -> bool {
+fn tvp_is_label(ws: &Vec<str>) -> bool {
     if ws.len() != 1 {
         return false;
     }
@@ -5847,7 +5869,7 @@ fn tvp_is_label(ws: & Vec<str>) -> bool {
 /// The function whose header (`fn name(%0: T, ...) -> T [wrapping]`) is
 /// line `p.at`, with the blocks and instructions that follow it; `p.at` is
 /// then the first line that is neither.
-fn tvp_fn(p: & mut TvpP, head: & Vec<str>) -> IrFunction {
+fn tvp_fn(p: &mut TvpP, head: &Vec<str>) -> IrFunction {
     var name: str = tvp_w(head, 1);
     if str_len(name) == 0 {
         tvp_err(p, "a function without a name");
@@ -5884,14 +5906,14 @@ fn tvp_fn(p: & mut TvpP, head: & Vec<str>) -> IrFunction {
                 blocks.push(BasicBlock_new(0));
             }
             var id: i64 = tvp_val(p, ws.get(0));
-            var inst: Inst = tvp_inst(p, & ws);
+            var inst: Inst = tvp_inst(p, &ws);
             items.push(ValueIdInst_new(id, inst));
             var last: i64 = blocks.len() - 1;
             var blk: BasicBlock = blocks.get(last);
             blk.instructions.push(id);
             blocks.set(last, blk);
             p.at = p.at + 1;
-        } else if tvp_is_label(& ws) {
+        } else if tvp_is_label(&ws) {
             blocks.push(BasicBlock_new(tvp_blk(p, ws.get(0))));
             p.at = p.at + 1;
         } else {
@@ -5904,7 +5926,7 @@ fn tvp_fn(p: & mut TvpP, head: & Vec<str>) -> IrFunction {
 /// The IrFunction of what tvp_fn read: values by the ids written (one
 /// meta per id up to the largest, in order), the first block the entry,
 /// predecessors from the terminators.
-fn tvp_build(p: & mut TvpP, name: str, ret: IrType, params: Vec<ValueIdType>, blocks: Vec<BasicBlock>, items: Vec<ValueIdInst>, wrapping: bool) -> IrFunction {
+fn tvp_build(p: &mut TvpP, name: str, ret: IrType, params: Vec<ValueIdType>, blocks: Vec<BasicBlock>, items: Vec<ValueIdInst>, wrapping: bool) -> IrFunction {
     var f: IrFunction = IrFunction_new(name, ret);
     if blocks.len() == 0 {
         tvp_err(p, "function " + name + " has no instructions");
@@ -5958,7 +5980,7 @@ fn tvp_build(p: & mut TvpP, name: str, ret: IrType, params: Vec<ValueIdType>, bl
         if a > 0 {
             var inst: Inst = items.get(a - 1).inst;
             var meta: ValueMeta = ValueMeta_new(inst_result_type(inst));
-            meta.effects = inst_effects(& inst);
+            meta.effects = inst_effects(&inst);
             metas.push(ValueIdMeta_new(id, meta));
             insts.push(ValueIdInst_new(id, inst));
             inst_at.push(insts.len());
@@ -6050,7 +6072,7 @@ fn tvp_build(p: & mut TvpP, name: str, ret: IrType, params: Vec<ValueIdType>, bl
     return f;
 }
 
-fn tvp_index(names: & Vec<str>, nm: str) -> i64 {
+fn tvp_index(names: &Vec<str>, nm: str) -> i64 {
     var i: i64 = 0;
     while i < names.len() {
         if names.get(i) == nm {
@@ -6073,8 +6095,8 @@ pub fn tv_is_module_pass(pname: str) -> bool {
 /// tv_after (function passes), tv_after_devirt and tv_mod_after (module
 /// passes) make.
 pub fn tv_pair_check(pname: str, an: Vec<str>, af: Vec<IrFunction>, bn: Vec<str>, bf: Vec<IrFunction>, globals: Vec<GlobalEntry>, fname: str) -> str {
-    var ia: i64 = tvp_index(& an, fname);
-    var ib: i64 = tvp_index(& bn, fname);
+    var ia: i64 = tvp_index(&an, fname);
+    var ib: i64 = tvp_index(&bn, fname);
     if ia < 0 || ib < 0 {
         return "n/a";
     }
@@ -6084,12 +6106,12 @@ pub fn tv_pair_check(pname: str, an: Vec<str>, af: Vec<IrFunction>, bn: Vec<str>
         var module: IrModule = IrModule_new();
         var i: i64 = 0;
         while i < af.len() {
-            IrModule_add_function(& mut module, af.get(i));
+            IrModule_add_function(&mut module, af.get(i));
             i = i + 1;
         }
-        var why: str = tv_devirt(& module, & fa, & fb);
+        var why: str = tv_devirt(&module, &fa, &fb);
         if str_len(why) == 0 {
-            var r: str = tv_random(& fa, & fb);
+            var r: str = tv_random(&fa, &fb);
             if str_len(r) > 0 && r != "n/a" {
                 why = r;
             }
@@ -6097,24 +6119,24 @@ pub fn tv_pair_check(pname: str, an: Vec<str>, af: Vec<IrFunction>, bn: Vec<str>
         return why;
     }
     if tv_is_module_pass(pname) {
-        var gc: i64 = tv_gconst_facts(& af, & globals);
+        var gc: i64 = tv_gconst_facts(&af, &globals);
         var wa: TvWorld = tv_world(an, af, gc);
         var wb: TvWorld = tv_world(bn, bf, gc);
         var fixed: Vec<i64> = Vec::new();
         if pname == "ipcp" {
             var m2: IrModule = IrModule_new();
-            var fx: TvFacts = tv_ipcp_facts(& wa, & m2);
-            fixed = tv_fixed(& fx, fname, fa.params.len());
+            var fx: TvFacts = tv_ipcp_facts(&wa, &m2);
+            fixed = tv_fixed(&fx, fname, fa.params.len());
         }
-        return tv_mod_check(pname, & mut wa, & mut wb, & fa, & fb, & fixed);
+        return tv_mod_check(pname, &mut wa, &mut wb, &fa, &fb, &fixed);
     }
-    return tv_check(pname, & fa, & fb);
+    return tv_check(pname, &fa, &fb);
 }
 
 /// Check pair `pr` of file `src` (read with error `err`): counts[0] + 1,
 /// counts[1] + 1 when the verdict is the one expected. A pair not as
 /// expected is printed on stderr; with `each` every pair is.
-fn tvp_finish(src: str, pr: & TvpPair, err0: str, each: bool, counts: & mut Vec<i64>) {
+fn tvp_finish(src: str, pr: &TvpPair, err0: str, each: bool, counts: &mut Vec<i64>) {
     var err: str = err0;
     if str_len(err) == 0 && str_len(pr.pname) == 0 {
         err = "no `pass` line";
@@ -6126,7 +6148,7 @@ fn tvp_finish(src: str, pr: & TvpPair, err0: str, each: bool, counts: & mut Vec<
     if str_len(fname) == 0 && pr.an.len() > 0 {
         fname = pr.an.get(0);
     }
-    if str_len(err) == 0 && (tvp_index(& pr.an, fname) < 0 || tvp_index(& pr.bn, fname) < 0) {
+    if str_len(err) == 0 && (tvp_index(&pr.an, fname) < 0 || tvp_index(&pr.bn, fname) < 0) {
         err = "no function " + fname + " both before and after the pass";
     }
     var why: str = "";
@@ -6164,7 +6186,7 @@ fn tvp_finish(src: str, pr: & TvpPair, err0: str, each: bool, counts: & mut Vec<
 }
 
 /// Run the pairs of file text `text` (named `src` in the report).
-pub fn tv_pairs_text(src: str, text: str, each: bool, counts: & mut Vec<i64>) {
+pub fn tv_pairs_text(src: str, text: str, each: bool, counts: &mut Vec<i64>) {
     var p: TvpP = TvpP {
         lines: str_lines(text), at: 0, err: ""
     };
@@ -6176,10 +6198,10 @@ pub fn tv_pairs_text(src: str, text: str, each: bool, counts: & mut Vec<i64>) {
             p.at = p.at + 1;
         } else {
             var w0: str = ws.get(0);
-            var w1: str = tvp_w(& ws, 1);
+            var w1: str = tvp_w(&ws, 1);
             if w0 == "pair" {
                 if open {
-                    tvp_finish(src, & pr, p.err, each, counts);
+                    tvp_finish(src, &pr, p.err, each, counts);
                 }
                 pr = tvp_pair_new(w1);
                 p.err = "";
@@ -6187,7 +6209,7 @@ pub fn tv_pairs_text(src: str, text: str, each: bool, counts: & mut Vec<i64>) {
                 p.at = p.at + 1;
             } else if w0 == "fn" {
                 open = true;
-                var f: IrFunction = tvp_fn(& mut p, & ws);
+                var f: IrFunction = tvp_fn(&mut p, &ws);
                 if pr.side == 0 {
                     pr.an.push(f.name);
                     pr.af.push(f);
@@ -6195,7 +6217,7 @@ pub fn tv_pairs_text(src: str, text: str, each: bool, counts: & mut Vec<i64>) {
                     pr.bn.push(f.name);
                     pr.bf.push(f);
                 } else {
-                    tvp_err(& mut p, "a function before `before` or `after`");
+                    tvp_err(&mut p, "a function before `before` or `after`");
                 }
             } else {
                 open = true;
@@ -6213,22 +6235,22 @@ pub fn tv_pairs_text(src: str, text: str, each: bool, counts: & mut Vec<i64>) {
                 } else if w0 == "check" {
                     pr.check = w1;
                 } else if w0 == "global" {
-                    var gty: IrType = tvp_ty(& mut p, tvp_w(& ws, 2));
-                    var gv: i64 = tvp_num(& mut p, tvp_w(& ws, 3));
+                    var gty: IrType = tvp_ty(&mut p, tvp_w(&ws, 2));
+                    var gv: i64 = tvp_num(&mut p, tvp_w(&ws, 3));
                     pr.globals.push(GlobalEntry_new(w1, gty, Expr::IntLit(gv)));
                 } else if w0 == "before" {
                     pr.side = 0;
                 } else if w0 == "after" {
                     pr.side = 1;
                 } else if w0 != "end" {
-                    tvp_err(& mut p, "not a line of a pair: '" + w0 + "'");
+                    tvp_err(&mut p, "not a line of a pair: '" + w0 + "'");
                 }
                 p.at = p.at + 1;
             }
         }
     }
     if open {
-        tvp_finish(src, & pr, p.err, each, counts);
+        tvp_finish(src, &pr, p.err, each, counts);
     }
 }
 
@@ -6266,7 +6288,7 @@ pub fn tv_pairs_run(path: str, each: bool) -> i64 {
     while k < files.len() {
         match read_file(files.get(k)) {
             Option::Some(text) => {
-                tv_pairs_text(files.get(k), text, each, & mut counts);
+                tv_pairs_text(files.get(k), text, each, &mut counts);
             }
             Option::None => {
                 p_eprint_str("tv pairs: cannot read " + files.get(k) + "\n");

@@ -51,7 +51,11 @@
 // ReadyForQuery is dropped with that read's buffer.
 
 module postgres;
- use vec; use crypto; use encoding; use json; use trace;
+use vec;
+use crypto;
+use encoding;
+use json;
+use trace;
 
 // ─── Constants ────────────────────────────────────────────────────────────
 
@@ -63,16 +67,16 @@ const PG_TIMEOUT_MS: i64 = 30000;
 const PG_MAX_MESSAGE: i64 = 268435456;
 
 // Message tags (one byte; frontend and backend share some letters)
-pub const PG_AUTH: i64 = 82;             // 'R' Authentication*
-pub const PG_PARAMETER_STATUS: i64 = 83; // 'S' (frontend: Sync)
-pub const PG_BACKEND_KEY: i64 = 75;      // 'K'
-pub const PG_READY: i64 = 90;            // 'Z' ReadyForQuery
+pub const PG_AUTH: i64 = 82;  // 'R' Authentication*
+pub const PG_PARAMETER_STATUS: i64 = 83;  // 'S' (frontend: Sync)
+pub const PG_BACKEND_KEY: i64 = 75;  // 'K'
+pub const PG_READY: i64 = 90;  // 'Z' ReadyForQuery
 pub const PG_ROW_DESCRIPTION: i64 = 84;  // 'T'
-pub const PG_DATA_ROW: i64 = 68;         // 'D' (frontend: Describe)
-pub const PG_COMMAND_COMPLETE: i64 = 67; // 'C'
-pub const PG_ERROR: i64 = 69;            // 'E' (frontend: Execute)
-pub const PG_NOTICE: i64 = 78;           // 'N'
-pub const PG_EMPTY_QUERY: i64 = 73;      // 'I'
+pub const PG_DATA_ROW: i64 = 68;  // 'D' (frontend: Describe)
+pub const PG_COMMAND_COMPLETE: i64 = 67;  // 'C'
+pub const PG_ERROR: i64 = 69;  // 'E' (frontend: Execute)
+pub const PG_NOTICE: i64 = 78;  // 'N'
+pub const PG_EMPTY_QUERY: i64 = 73;  // 'I'
 
 /// The SSLRequest code: 1234 in the high 16 bits, 5679 in the low ones.
 pub const PG_SSL_REQUEST_CODE: i64 = 80877103;
@@ -84,24 +88,33 @@ pub const PG_SSL_PREFER: i64 = 1;
 pub const PG_SSL_REQUIRE: i64 = 2;
 
 // Type OIDs whose text is written into JSON as it is
-const PG_BOOL: i64 = 16; const PG_INT8: i64 = 20; const PG_INT2: i64 = 21; const PG_INT4: i64 = 23; const PG_OID: i64 = 26; const PG_JSON: i64 = 114; const PG_FLOAT4: i64 = 700; const PG_FLOAT8: i64 = 701; const PG_NUMERIC: i64 = 1700; const PG_JSONB: i64 = 3802;
+const PG_BOOL: i64 = 16;
+const PG_INT8: i64 = 20;
+const PG_INT2: i64 = 21;
+const PG_INT4: i64 = 23;
+const PG_OID: i64 = 26;
+const PG_JSON: i64 = 114;
+const PG_FLOAT4: i64 = 700;
+const PG_FLOAT8: i64 = 701;
+const PG_NUMERIC: i64 = 1700;
+const PG_JSONB: i64 = 3802;
 
 // ─── Bytes ────────────────────────────────────────────────────────────────
 
-fn pg_put_i32(b: & mut Vec<i64>, v: i64) {
+fn pg_put_i32(b: &mut Vec<i64>, v: i64) {
     b.push((v >> 24) & 255);
     b.push((v >> 16) & 255);
     b.push((v >> 8) & 255);
     b.push(v & 255);
 }
 
-fn pg_put_i16(b: & mut Vec<i64>, v: i64) {
+fn pg_put_i16(b: &mut Vec<i64>, v: i64) {
     b.push((v >> 8) & 255);
     b.push(v & 255);
 }
 
 // The bytes of `s`, no terminator.
-fn pg_put_text(b: & mut Vec<i64>, s: str) {
+fn pg_put_text(b: &mut Vec<i64>, s: str) {
     val n: i64 = str_len(s);
     var i: i64 = 0;
     while i < n {
@@ -111,12 +124,12 @@ fn pg_put_text(b: & mut Vec<i64>, s: str) {
 }
 
 // The bytes of `s` and the NUL that ends a protocol String.
-fn pg_put_cstr(b: & mut Vec<i64>, s: str) {
+fn pg_put_cstr(b: &mut Vec<i64>, s: str) {
     pg_put_text(b, s);
     b.push(0);
 }
 
-fn pg_put_bytes(b: & mut Vec<i64>, v: Vec<i64>) {
+fn pg_put_bytes(b: &mut Vec<i64>, v: Vec<i64>) {
     var i: i64 = 0;
     while i < v.len() {
         b.push(v.get(i));
@@ -179,8 +192,8 @@ fn pg_text(b: Vec<i64>, start: i64, end: i64) -> str {
 pub fn pg_msg(tag: i64, body: Vec<i64>) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     out.push(tag);
-    pg_put_i32(& mut out, body.len() + 4);
-    pg_put_bytes(& mut out, body);
+    pg_put_i32(&mut out, body.len() + 4);
+    pg_put_bytes(&mut out, body);
     return out;
 }
 
@@ -188,26 +201,26 @@ pub fn pg_msg(tag: i64, body: Vec<i64>) -> Vec<i64> {
 /// NUL. `database` "" leaves it to the server (the user's name).
 pub fn pg_startup_message(user: str, database: str) -> Vec<i64> {
     var body: Vec<i64> = Vec::new();
-    pg_put_i32(& mut body, PG_PROTOCOL_3);
-    pg_put_cstr(& mut body, "user");
-    pg_put_cstr(& mut body, user);
+    pg_put_i32(&mut body, PG_PROTOCOL_3);
+    pg_put_cstr(&mut body, "user");
+    pg_put_cstr(&mut body, user);
     if str_len(database) > 0 {
-        pg_put_cstr(& mut body, "database");
-        pg_put_cstr(& mut body, database);
+        pg_put_cstr(&mut body, "database");
+        pg_put_cstr(&mut body, database);
     }
-    pg_put_cstr(& mut body, "client_encoding");
-    pg_put_cstr(& mut body, "UTF8");
+    pg_put_cstr(&mut body, "client_encoding");
+    pg_put_cstr(&mut body, "UTF8");
     body.push(0);
     var out: Vec<i64> = Vec::new();
-    pg_put_i32(& mut out, body.len() + 4);
-    pg_put_bytes(& mut out, body);
+    pg_put_i32(&mut out, body.len() + 4);
+    pg_put_bytes(&mut out, body);
     return out;
 }
 
 /// Query ('Q'): the simple query protocol.
 pub fn pg_query_message(sql: str) -> Vec<i64> {
     var body: Vec<i64> = Vec::new();
-    pg_put_cstr(& mut body, sql);
+    pg_put_cstr(&mut body, sql);
     return pg_msg(81, body);
 }
 
@@ -215,9 +228,9 @@ pub fn pg_query_message(sql: str) -> Vec<i64> {
 /// no parameter types given (the server infers them).
 pub fn pg_parse_message(name: str, sql: str) -> Vec<i64> {
     var body: Vec<i64> = Vec::new();
-    pg_put_cstr(& mut body, name);
-    pg_put_cstr(& mut body, sql);
-    pg_put_i16(& mut body, 0);
+    pg_put_cstr(&mut body, name);
+    pg_put_cstr(&mut body, sql);
+    pg_put_i16(&mut body, 0);
     return pg_msg(80, body);
 }
 
@@ -232,24 +245,24 @@ pub fn pg_bind_message(portal: str, stmt: str, params: Vec<str>) -> Vec<i64> {
 /// the rest.
 pub fn pg_bind_message_nulls(portal: str, stmt: str, params: Vec<str>, nulls: Vec<bool>) -> Vec<i64> {
     var body: Vec<i64> = Vec::new();
-    pg_put_cstr(& mut body, portal);
-    pg_put_cstr(& mut body, stmt);
+    pg_put_cstr(&mut body, portal);
+    pg_put_cstr(&mut body, stmt);
     // no parameter format codes: all text
-    pg_put_i16(& mut body, 0);
-    pg_put_i16(& mut body, params.len());
+    pg_put_i16(&mut body, 0);
+    pg_put_i16(&mut body, params.len());
     var i: i64 = 0;
     while i < params.len() {
         if i < nulls.len() && nulls.get(i) {
-            pg_put_i32(& mut body, - 1);
+            pg_put_i32(&mut body, -1);
         } else {
             val p: str = params.get(i);
-            pg_put_i32(& mut body, str_len(p));
-            pg_put_text(& mut body, p);
+            pg_put_i32(&mut body, str_len(p));
+            pg_put_text(&mut body, p);
         }
         i = i + 1;
     }
     // no result format codes: all text
-    pg_put_i16(& mut body, 0);
+    pg_put_i16(&mut body, 0);
     return pg_msg(66, body);
 }
 
@@ -258,15 +271,15 @@ pub fn pg_bind_message_nulls(portal: str, stmt: str, params: Vec<str>, nulls: Ve
 pub fn pg_describe_portal_message(portal: str) -> Vec<i64> {
     var body: Vec<i64> = Vec::new();
     body.push(80);
-    pg_put_cstr(& mut body, portal);
+    pg_put_cstr(&mut body, portal);
     return pg_msg(68, body);
 }
 
 /// Execute ('E') portal `portal`, at most `max_rows` rows (0: all).
 pub fn pg_execute_message(portal: str, max_rows: i64) -> Vec<i64> {
     var body: Vec<i64> = Vec::new();
-    pg_put_cstr(& mut body, portal);
-    pg_put_i32(& mut body, max_rows);
+    pg_put_cstr(&mut body, portal);
+    pg_put_i32(&mut body, max_rows);
     return pg_msg(69, body);
 }
 
@@ -283,7 +296,7 @@ pub fn pg_terminate_message() -> Vec<i64> {
 /// PasswordMessage ('p') with a cleartext or an "md5..." password.
 pub fn pg_password_message(password: str) -> Vec<i64> {
     var body: Vec<i64> = Vec::new();
-    pg_put_cstr(& mut body, password);
+    pg_put_cstr(&mut body, password);
     return pg_msg(112, body);
 }
 
@@ -291,16 +304,16 @@ pub fn pg_password_message(password: str) -> Vec<i64> {
 /// message with its Int32 length.
 pub fn pg_sasl_initial_message(mechanism: str, data: str) -> Vec<i64> {
     var body: Vec<i64> = Vec::new();
-    pg_put_cstr(& mut body, mechanism);
-    pg_put_i32(& mut body, str_len(data));
-    pg_put_text(& mut body, data);
+    pg_put_cstr(&mut body, mechanism);
+    pg_put_i32(&mut body, str_len(data));
+    pg_put_text(&mut body, data);
     return pg_msg(112, body);
 }
 
 /// SASLResponse ('p'): the data alone.
 pub fn pg_sasl_response_message(data: str) -> Vec<i64> {
     var body: Vec<i64> = Vec::new();
-    pg_put_text(& mut body, data);
+    pg_put_text(&mut body, data);
     return pg_msg(112, body);
 }
 
@@ -308,8 +321,8 @@ pub fn pg_sasl_response_message(data: str) -> Vec<i64> {
 /// byte, 'S' (go on with the TLS handshake) or 'N' (no TLS here).
 pub fn pg_ssl_request_message() -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
-    pg_put_i32(& mut out, 8);
-    pg_put_i32(& mut out, PG_SSL_REQUEST_CODE);
+    pg_put_i32(&mut out, 8);
+    pg_put_i32(&mut out, PG_SSL_REQUEST_CODE);
     return out;
 }
 
@@ -324,7 +337,7 @@ pub fn pg_ssl_answer(answer: i64, sslmode: i64) -> i64 {
     if answer == 78 && sslmode != PG_SSL_REQUIRE {
         return 0;
     }
-    return - 1;
+    return -1;
 }
 
 // ─── Transport ────────────────────────────────────────────────────────────
@@ -395,7 +408,7 @@ fn pg_io_read_byte(io: PgIo, conn: i64) -> i64 {
     var mem: i64 = p_malloc(8);
     val recv: fn(i64, i64, i64, i64) -> i64 = io.recv;
     val n: i64 = recv(conn, mem, 1, PG_TIMEOUT_MS);
-    var b: i64 = - 1;
+    var b: i64 = -1;
     if n == 1 {
         b = p_volatile_load8(mem) & 255;
     }
@@ -426,22 +439,22 @@ pub struct PgIn {
 /// A reader over bytes already received (no socket).
 pub fn pg_in_bytes(bytes: Vec<i64>) -> PgIn {
     var b: Vec<i64> = Vec::new();
-    pg_put_bytes(& mut b, bytes);
+    pg_put_bytes(&mut b, bytes);
     return PgIn {
-        fd: - 1, buf: b, pos: 0, conn: - 1, recv: pg_plain_recv,
+        fd: -1, buf: b, pos: 0, conn: -1, recv: pg_plain_recv,
     };
 }
 
 // A reader of what the server sends on connection `c` (in clear or through
 // its TLS session).
-fn pg_in_conn(c: & PgConn) -> PgIn {
+fn pg_in_conn(c: &PgConn) -> PgIn {
     return PgIn {
         fd: c.fd, buf: Vec::new(), pos: 0, conn: c.conn, recv: c.io.recv,
     };
 }
 
 // More bytes from the socket. False at the end, on an error or a timeout.
-fn pg_fill(r: & mut PgIn) -> bool {
+fn pg_fill(r: &mut PgIn) -> bool {
     if r.fd < 0 {
         return false;
     }
@@ -468,7 +481,7 @@ fn pg_fill(r: & mut PgIn) -> bool {
 }
 
 // Wait until `n` unread bytes are there.
-fn pg_need(r: & mut PgIn, n: i64) -> bool {
+fn pg_need(r: &mut PgIn, n: i64) -> bool {
     while r.buf.len() - r.pos < n {
         if !pg_fill(r) {
             return false;
@@ -479,12 +492,12 @@ fn pg_need(r: & mut PgIn, n: i64) -> bool {
 
 fn pg_no_msg() -> PgMsg {
     return PgMsg {
-        tag: - 1, body: Vec::new(),
+        tag: -1, body: Vec::new(),
     };
 }
 
 /// The next message.
-pub fn pg_next(r: & mut PgIn) -> PgMsg {
+pub fn pg_next(r: &mut PgIn) -> PgMsg {
     if !pg_need(r, 5) {
         return pg_no_msg();
     }
@@ -633,7 +646,7 @@ fn pg_tag_count(tag: str) -> i64 {
 /// Read the answer to a query up to ReadyForQuery: row sets, command tags
 /// and errors (the first error is kept; the server still finishes with
 /// ReadyForQuery).
-pub fn pg_collect(r: & mut PgIn) -> PgResult {
+pub fn pg_collect(r: &mut PgIn) -> PgResult {
     var res: PgResult = pg_result_new();
     var parts: Vec<str> = Vec::new();
     loop {
@@ -736,22 +749,70 @@ pub fn pg_collect(r: & mut PgIn) -> PgResult {
 
 fn md5_k() -> Vec<i64> {
     var k: Vec<i64> = Vec::new();
-    k.push(0xd76aa478); k.push(0xe8c7b756); k.push(0x242070db); k.push(0xc1bdceee);
-    k.push(0xf57c0faf); k.push(0x4787c62a); k.push(0xa8304613); k.push(0xfd469501);
-    k.push(0x698098d8); k.push(0x8b44f7af); k.push(0xffff5bb1); k.push(0x895cd7be);
-    k.push(0x6b901122); k.push(0xfd987193); k.push(0xa679438e); k.push(0x49b40821);
-    k.push(0xf61e2562); k.push(0xc040b340); k.push(0x265e5a51); k.push(0xe9b6c7aa);
-    k.push(0xd62f105d); k.push(0x02441453); k.push(0xd8a1e681); k.push(0xe7d3fbc8);
-    k.push(0x21e1cde6); k.push(0xc33707d6); k.push(0xf4d50d87); k.push(0x455a14ed);
-    k.push(0xa9e3e905); k.push(0xfcefa3f8); k.push(0x676f02d9); k.push(0x8d2a4c8a);
-    k.push(0xfffa3942); k.push(0x8771f681); k.push(0x6d9d6122); k.push(0xfde5380c);
-    k.push(0xa4beea44); k.push(0x4bdecfa9); k.push(0xf6bb4b60); k.push(0xbebfbc70);
-    k.push(0x289b7ec6); k.push(0xeaa127fa); k.push(0xd4ef3085); k.push(0x04881d05);
-    k.push(0xd9d4d039); k.push(0xe6db99e5); k.push(0x1fa27cf8); k.push(0xc4ac5665);
-    k.push(0xf4292244); k.push(0x432aff97); k.push(0xab9423a7); k.push(0xfc93a039);
-    k.push(0x655b59c3); k.push(0x8f0ccc92); k.push(0xffeff47d); k.push(0x85845dd1);
-    k.push(0x6fa87e4f); k.push(0xfe2ce6e0); k.push(0xa3014314); k.push(0x4e0811a1);
-    k.push(0xf7537e82); k.push(0xbd3af235); k.push(0x2ad7d2bb); k.push(0xeb86d391);
+    k.push(0xd76aa478);
+    k.push(0xe8c7b756);
+    k.push(0x242070db);
+    k.push(0xc1bdceee);
+    k.push(0xf57c0faf);
+    k.push(0x4787c62a);
+    k.push(0xa8304613);
+    k.push(0xfd469501);
+    k.push(0x698098d8);
+    k.push(0x8b44f7af);
+    k.push(0xffff5bb1);
+    k.push(0x895cd7be);
+    k.push(0x6b901122);
+    k.push(0xfd987193);
+    k.push(0xa679438e);
+    k.push(0x49b40821);
+    k.push(0xf61e2562);
+    k.push(0xc040b340);
+    k.push(0x265e5a51);
+    k.push(0xe9b6c7aa);
+    k.push(0xd62f105d);
+    k.push(0x02441453);
+    k.push(0xd8a1e681);
+    k.push(0xe7d3fbc8);
+    k.push(0x21e1cde6);
+    k.push(0xc33707d6);
+    k.push(0xf4d50d87);
+    k.push(0x455a14ed);
+    k.push(0xa9e3e905);
+    k.push(0xfcefa3f8);
+    k.push(0x676f02d9);
+    k.push(0x8d2a4c8a);
+    k.push(0xfffa3942);
+    k.push(0x8771f681);
+    k.push(0x6d9d6122);
+    k.push(0xfde5380c);
+    k.push(0xa4beea44);
+    k.push(0x4bdecfa9);
+    k.push(0xf6bb4b60);
+    k.push(0xbebfbc70);
+    k.push(0x289b7ec6);
+    k.push(0xeaa127fa);
+    k.push(0xd4ef3085);
+    k.push(0x04881d05);
+    k.push(0xd9d4d039);
+    k.push(0xe6db99e5);
+    k.push(0x1fa27cf8);
+    k.push(0xc4ac5665);
+    k.push(0xf4292244);
+    k.push(0x432aff97);
+    k.push(0xab9423a7);
+    k.push(0xfc93a039);
+    k.push(0x655b59c3);
+    k.push(0x8f0ccc92);
+    k.push(0xffeff47d);
+    k.push(0x85845dd1);
+    k.push(0x6fa87e4f);
+    k.push(0xfe2ce6e0);
+    k.push(0xa3014314);
+    k.push(0x4e0811a1);
+    k.push(0xf7537e82);
+    k.push(0xbd3af235);
+    k.push(0x2ad7d2bb);
+    k.push(0xeb86d391);
     return k;
 }
 
@@ -760,30 +821,55 @@ fn md5_k() -> Vec<i64> {
 fn md5_shift(i: i64) -> i64 {
     val r: i64 = i % 4;
     if i < 16 {
-        if r == 0 { return 7; }
-        if r == 1 { return 12; }
-        if r == 2 { return 17; }
+        if r == 0 {
+            return 7;
+        }
+        if r == 1 {
+            return 12;
+        }
+        if r == 2 {
+            return 17;
+        }
         return 22;
     }
     if i < 32 {
-        if r == 0 { return 5; }
-        if r == 1 { return 9; }
-        if r == 2 { return 14; }
+        if r == 0 {
+            return 5;
+        }
+        if r == 1 {
+            return 9;
+        }
+        if r == 2 {
+            return 14;
+        }
         return 20;
     }
     if i < 48 {
-        if r == 0 { return 4; }
-        if r == 1 { return 11; }
-        if r == 2 { return 16; }
+        if r == 0 {
+            return 4;
+        }
+        if r == 1 {
+            return 11;
+        }
+        if r == 2 {
+            return 16;
+        }
         return 23;
     }
-    if r == 0 { return 6; }
-    if r == 1 { return 10; }
-    if r == 2 { return 15; }
+    if r == 0 {
+        return 6;
+    }
+    if r == 1 {
+        return 10;
+    }
+    if r == 2 {
+        return 15;
+    }
     return 21;
 }
 
-@wrapping fn md5_rotl(x: i64, n: i64) -> i64 {
+@wrapping
+fn md5_rotl(x: i64, n: i64) -> i64 {
     val m: i64 = x & 0xFFFFFFFF;
     return ((m << n) | (m >> (32 - n))) & 0xFFFFFFFF;
 }
@@ -791,7 +877,7 @@ fn md5_shift(i: i64) -> i64 {
 /// MD5 of bytes: 16 bytes.
 pub fn pg_md5(msg: Vec<i64>) -> Vec<i64> {
     var p: Vec<i64> = Vec::new();
-    pg_put_bytes(& mut p, msg);
+    pg_put_bytes(&mut p, msg);
     p.push(0x80);
     while p.len() % 64 != 56 {
         p.push(0);
@@ -880,7 +966,7 @@ pub fn pg_hex(b: Vec<i64>) -> str {
 pub fn pg_md5_password(user: str, password: str, salt: Vec<i64>) -> str {
     val inner: str = pg_hex(pg_md5(str_bytes(password + user)));
     var m: Vec<i64> = str_bytes(inner);
-    pg_put_bytes(& mut m, salt);
+    pg_put_bytes(&mut m, salt);
     return "md5" + pg_hex(pg_md5(m));
 }
 
@@ -932,7 +1018,7 @@ fn pg_sasl_name(s: str) -> str {
 
 /// client-first-message: "n,," (no channel binding) then
 /// "n=<user>,r=<nonce>".
-pub fn pg_scram_client_first(s: & mut PgScram) -> str {
+pub fn pg_scram_client_first(s: &mut PgScram) -> str {
     s.client_first_bare = "n=" + pg_sasl_name(s.user) + ",r=" + s.cnonce;
     return "n,," + s.client_first_bare;
 }
@@ -965,7 +1051,7 @@ fn pg_xor(a: Vec<i64>, b: Vec<i64>) -> Vec<i64> {
 /// client-final-message for the server's first message, with the proof;
 /// "" and `s.ok` false when the server's message is unusable (a nonce
 /// that does not extend ours, no salt, a bad iteration count, an error).
-pub fn pg_scram_client_final(s: & mut PgScram, server_first: str) -> str {
+pub fn pg_scram_client_final(s: &mut PgScram, server_first: str) -> str {
     val err: str = pg_scram_attr(server_first, "e");
     if str_len(err) > 0 {
         s.ok = false;
@@ -1007,7 +1093,7 @@ pub fn pg_scram_client_final(s: & mut PgScram, server_first: str) -> str {
 
 /// True when the server's final message carries the signature we expect
 /// (it proves the server knows the password too).
-pub fn pg_scram_verify_server(s: & PgScram, server_final: str) -> bool {
+pub fn pg_scram_verify_server(s: &PgScram, server_final: str) -> bool {
     if s.server_sig.len() != 32 {
         return false;
     }
@@ -1054,7 +1140,7 @@ pub fn pg_conn_new(fd: i64, user: str, password: str) -> PgConn {
 
 /// Send what is queued in `c.out` (nothing happens with fd -1: the bytes
 /// stay for the caller to look at).
-pub fn pg_flush(c: & mut PgConn) -> bool {
+pub fn pg_flush(c: &mut PgConn) -> bool {
     if c.fd < 0 {
         return true;
     }
@@ -1064,7 +1150,7 @@ pub fn pg_flush(c: & mut PgConn) -> bool {
 }
 
 // End the TLS session (if any) and close the socket.
-fn pg_shut(c: & mut PgConn) {
+fn pg_shut(c: &mut PgConn) {
     if c.tls {
         val close: fn(i64) -> i64 = c.io.close;
         close(c.conn);
@@ -1072,22 +1158,22 @@ fn pg_shut(c: & mut PgConn) {
     if c.fd >= 0 {
         p_socket_close(c.fd);
     }
-    c.fd = - 1;
-    c.conn = - 1;
+    c.fd = -1;
+    c.conn = -1;
     c.tls = false;
     c.io = pg_plain_io();
 }
 
-fn pg_fail(c: & mut PgConn, why: str) -> i64 {
+fn pg_fail(c: &mut PgConn, why: str) -> i64 {
     c.ok = false;
     c.error = why;
-    return - 1;
+    return -1;
 }
 
 /// One message of the startup phase: answers authentication requests into
 /// `c.out`, records parameters and the key. Returns 0 to go on, 1 when the
 /// server is ready (c.ok true), -1 on failure (c.error says why).
-pub fn pg_startup_step(c: & mut PgConn, s: & mut PgScram, m: PgMsg) -> i64 {
+pub fn pg_startup_step(c: &mut PgConn, s: &mut PgScram, m: PgMsg) -> i64 {
     if m.tag < 0 {
         return pg_fail(c, "connection closed during startup");
     }
@@ -1099,7 +1185,7 @@ pub fn pg_startup_step(c: & mut PgConn, s: & mut PgScram, m: PgMsg) -> i64 {
         }
         if code == 3 {
             c.auth = "password";
-            pg_put_bytes(& mut c.out, pg_password_message(c.password));
+            pg_put_bytes(&mut c.out, pg_password_message(c.password));
             return 0;
         }
         if code == 5 {
@@ -1110,7 +1196,7 @@ pub fn pg_startup_step(c: & mut PgConn, s: & mut PgScram, m: PgMsg) -> i64 {
                 salt.push(m.body.get(i));
                 i = i + 1;
             }
-            pg_put_bytes(& mut c.out, pg_password_message(pg_md5_password(c.user, c.password, salt)));
+            pg_put_bytes(&mut c.out, pg_password_message(pg_md5_password(c.user, c.password, salt)));
             return 0;
         }
         if code == 10 {
@@ -1129,7 +1215,7 @@ pub fn pg_startup_step(c: & mut PgConn, s: & mut PgScram, m: PgMsg) -> i64 {
             }
             c.auth = "SCRAM-SHA-256";
             val first: str = pg_scram_client_first(s);
-            pg_put_bytes(& mut c.out, pg_sasl_initial_message("SCRAM-SHA-256", first));
+            pg_put_bytes(&mut c.out, pg_sasl_initial_message("SCRAM-SHA-256", first));
             return 0;
         }
         if code == 11 {
@@ -1138,7 +1224,7 @@ pub fn pg_startup_step(c: & mut PgConn, s: & mut PgScram, m: PgMsg) -> i64 {
             if !s.ok {
                 return pg_fail(c, s.error);
             }
-            pg_put_bytes(& mut c.out, pg_sasl_response_message(fin));
+            pg_put_bytes(&mut c.out, pg_sasl_response_message(fin));
             return 0;
         }
         if code == 12 {
@@ -1199,8 +1285,8 @@ pub fn pg_connect_io(fd: i64, host: str, user: str, password: str, database: str
     }
     if sslmode != PG_SSL_DISABLE {
         if !pg_io_write(c.io, c.conn, pg_ssl_request_message()) {
-            pg_fail(& mut c, "cannot write to the server");
-            pg_shut(& mut c);
+            pg_fail(&mut c, "cannot write to the server");
+            pg_shut(&mut c);
             return c;
         }
         // Exactly one byte: whatever follows it before the handshake would
@@ -1210,21 +1296,21 @@ pub fn pg_connect_io(fd: i64, host: str, user: str, password: str, database: str
         val what: i64 = pg_ssl_answer(answer, sslmode);
         if what < 0 {
             if answer == 78 {
-                pg_fail(& mut c, "the server does not support TLS (sslmode require)");
+                pg_fail(&mut c, "the server does not support TLS (sslmode require)");
             } else if answer < 0 {
-                pg_fail(& mut c, "no answer to SSLRequest");
+                pg_fail(&mut c, "no answer to SSLRequest");
             } else {
-                pg_fail(& mut c, "unexpected answer to SSLRequest: " + int_to_str(answer));
+                pg_fail(&mut c, "unexpected answer to SSLRequest: " + int_to_str(answer));
             }
-            pg_shut(& mut c);
+            pg_shut(&mut c);
             return c;
         }
         if what == 1 {
             val start: fn(i64, str) -> i64 = tls.start;
             val session: i64 = start(fd, host);
             if session == 0 {
-                pg_fail(& mut c, "TLS handshake with " + host + " failed (certificate or name not accepted)");
-                pg_shut(& mut c);
+                pg_fail(&mut c, "TLS handshake with " + host + " failed (certificate or name not accepted)");
+                pg_shut(&mut c);
                 return c;
             }
             c.conn = session;
@@ -1232,27 +1318,27 @@ pub fn pg_connect_io(fd: i64, host: str, user: str, password: str, database: str
             c.tls = true;
         }
     }
-    pg_put_bytes(& mut c.out, pg_startup_message(user, database));
+    pg_put_bytes(&mut c.out, pg_startup_message(user, database));
     var s: PgScram = pg_scram_new("", password, pg_scram_nonce());
-    var r: PgIn = pg_in_conn(& c);
+    var r: PgIn = pg_in_conn(&c);
     var phase: i64 = 0;
     while phase == 0 {
-        if !pg_flush(& mut c) {
-            phase = pg_fail(& mut c, "cannot write to the server");
+        if !pg_flush(&mut c) {
+            phase = pg_fail(&mut c, "cannot write to the server");
         } else {
-            val m: PgMsg = pg_next(& mut r);
-            phase = pg_startup_step(& mut c, & mut s, m);
+            val m: PgMsg = pg_next(&mut r);
+            phase = pg_startup_step(&mut c, &mut s, m);
         }
     }
     if phase < 0 {
-        pg_shut(& mut c);
+        pg_shut(&mut c);
     }
     return c;
 }
 
 /// A server parameter the server reported at startup ("server_version",
 /// "TimeZone", ...); "" when it did not.
-pub fn pg_parameter(c: & PgConn, name: str) -> str {
+pub fn pg_parameter(c: &PgConn, name: str) -> str {
     var i: i64 = 0;
     while i < c.param_names.len() {
         if str_equal(c.param_names.get(i), name) {
@@ -1264,7 +1350,7 @@ pub fn pg_parameter(c: & PgConn, name: str) -> str {
 }
 
 // Send `bytes` and read the answer up to ReadyForQuery.
-fn pg_round_trip(c: & PgConn, bytes: Vec<i64>) -> PgResult {
+fn pg_round_trip(c: &PgConn, bytes: Vec<i64>) -> PgResult {
     if !c.ok || c.fd < 0 {
         return pg_result_fail("not connected: " + c.error);
     }
@@ -1272,12 +1358,12 @@ fn pg_round_trip(c: & PgConn, bytes: Vec<i64>) -> PgResult {
         return pg_result_fail("cannot write to the server");
     }
     var r: PgIn = pg_in_conn(c);
-    return pg_collect(& mut r);
+    return pg_collect(&mut r);
 }
 
 /// Run SQL with the simple query protocol: one or more statements, no
 /// parameters. Never put outside input in `sql`: use pg_query_params.
-pub fn pg_query(c: & PgConn, sql: str) -> PgResult {
+pub fn pg_query(c: &PgConn, sql: str) -> PgResult {
     // CO2: a "pg.query" span under FIDES_TRACE (the SQL text)
     val t0: i64 = trace_span_begin();
     val r: PgResult = pg_round_trip(c, pg_query_message(sql));
@@ -1294,17 +1380,17 @@ pub fn pg_extended_query(sql: str, params: Vec<str>) -> Vec<i64> {
 /// pg_extended_query where `nulls[i]` true binds parameter i as NULL.
 pub fn pg_extended_query_nulls(sql: str, params: Vec<str>, nulls: Vec<bool>) -> Vec<i64> {
     var b: Vec<i64> = pg_parse_message("", sql);
-    pg_put_bytes(& mut b, pg_bind_message_nulls("", "", params, nulls));
-    pg_put_bytes(& mut b, pg_describe_portal_message(""));
-    pg_put_bytes(& mut b, pg_execute_message("", 0));
-    pg_put_bytes(& mut b, pg_sync_message());
+    pg_put_bytes(&mut b, pg_bind_message_nulls("", "", params, nulls));
+    pg_put_bytes(&mut b, pg_describe_portal_message(""));
+    pg_put_bytes(&mut b, pg_execute_message("", 0));
+    pg_put_bytes(&mut b, pg_sync_message());
     return b;
 }
 
 /// Run one statement with parameters `$1`, `$2`, ... bound to `params`
 /// (text; the server converts them to the column types). The values never
 /// go through the SQL text.
-pub fn pg_query_params(c: & PgConn, sql: str, params: Vec<str>) -> PgResult {
+pub fn pg_query_params(c: &PgConn, sql: str, params: Vec<str>) -> PgResult {
     // CO2: a "pg.query" span under FIDES_TRACE (the SQL text, not the
     // parameter values)
     val t0: i64 = trace_span_begin();
@@ -1315,7 +1401,7 @@ pub fn pg_query_params(c: & PgConn, sql: str, params: Vec<str>) -> PgResult {
 
 /// pg_query_params where `nulls[i]` true binds `$<i+1>` as SQL NULL (the
 /// text in params[i] is then ignored).
-pub fn pg_query_params_nulls(c: & PgConn, sql: str, params: Vec<str>, nulls: Vec<bool>) -> PgResult {
+pub fn pg_query_params_nulls(c: &PgConn, sql: str, params: Vec<str>, nulls: Vec<bool>) -> PgResult {
     val t0: i64 = trace_span_begin();
     val r: PgResult = pg_round_trip(c, pg_extended_query_nulls(sql, params, nulls));
     trace_span_end(t0, "pg.query", sql, r.ok);
@@ -1323,21 +1409,20 @@ pub fn pg_query_params_nulls(c: & PgConn, sql: str, params: Vec<str>, nulls: Vec
 }
 
 /// Run a statement for its effect: the rows it changed, -1 on an error.
-pub fn pg_exec(c: & PgConn, sql: str) -> i64 {
+pub fn pg_exec(c: &PgConn, sql: str) -> i64 {
     val r: PgResult = pg_query(c, sql);
     if !r.ok {
-        return - 1;
+        return -1;
     }
     return r.affected;
 }
 
 /// Say goodbye (Terminate), end the TLS session if any and close the
 /// socket.
-pub fn pg_close(c: & mut PgConn) {
+pub fn pg_close(c: &mut PgConn) {
     if c.fd >= 0 {
         pg_io_write(c.io, c.conn, pg_terminate_message());
     }
     pg_shut(c);
     c.ok = false;
 }
-

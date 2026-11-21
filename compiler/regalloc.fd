@@ -25,12 +25,40 @@
 // 6. sort_by_key -> bubble sort (small N)
 
 module compiler::regalloc;
- use core; use vec; use string; use compiler::ast; use compiler::ir; use compiler::pir;
+use core;
+use vec;
+use string;
+use compiler::ast;
+use compiler::ir;
+use compiler::pir;
 // ===========================================================================
 // Physical registers (encoded as i64)
 // ===========================================================================
 
-pub const REG_RAX: i64 = 0; pub const REG_RCX: i64 = 1; pub const REG_RDX: i64 = 2; pub const REG_RBX: i64 = 3; pub const REG_RSP: i64 = 4; pub const REG_RBP: i64 = 5; pub const REG_RSI: i64 = 6; pub const REG_RDI: i64 = 7; pub const REG_R8: i64 = 8; pub const REG_R9: i64 = 9; pub const REG_R10: i64 = 10; pub const REG_R11: i64 = 11; pub const REG_R12: i64 = 12; pub const REG_R13: i64 = 13; pub const REG_R14: i64 = 14; pub const REG_R15: i64 = 15; pub const REG_XMM0: i64 = 16; pub const REG_XMM1: i64 = 17; pub const REG_XMM2: i64 = 18; pub const REG_XMM3: i64 = 19; pub const REG_XMM4: i64 = 20; pub const REG_XMM5: i64 = 21; pub const REG_XMM6: i64 = 22; pub const REG_XMM7: i64 = 23;
+pub const REG_RAX: i64 = 0;
+pub const REG_RCX: i64 = 1;
+pub const REG_RDX: i64 = 2;
+pub const REG_RBX: i64 = 3;
+pub const REG_RSP: i64 = 4;
+pub const REG_RBP: i64 = 5;
+pub const REG_RSI: i64 = 6;
+pub const REG_RDI: i64 = 7;
+pub const REG_R8: i64 = 8;
+pub const REG_R9: i64 = 9;
+pub const REG_R10: i64 = 10;
+pub const REG_R11: i64 = 11;
+pub const REG_R12: i64 = 12;
+pub const REG_R13: i64 = 13;
+pub const REG_R14: i64 = 14;
+pub const REG_R15: i64 = 15;
+pub const REG_XMM0: i64 = 16;
+pub const REG_XMM1: i64 = 17;
+pub const REG_XMM2: i64 = 18;
+pub const REG_XMM3: i64 = 19;
+pub const REG_XMM4: i64 = 20;
+pub const REG_XMM5: i64 = 21;
+pub const REG_XMM6: i64 = 22;
+pub const REG_XMM7: i64 = 23;
 /// The 4-bit encoding used in ModRM reg/rm fields.
 pub fn physreg_encoding(r: i64) -> i64 {
     return r & 0xF;
@@ -246,7 +274,7 @@ pub fn Allocation_new() -> Allocation {
 }
 
 /// Look up where a VReg lives.
-pub fn Allocation_loc(self: & Allocation, vreg_id: i64) -> Location {
+pub fn Allocation_loc(self: &Allocation, vreg_id: i64) -> Location {
     var i: i64 = 0;
     while i < self.vreg_to_loc.len() {
         if self.vreg_to_loc.get(i).vreg_id == vreg_id {
@@ -258,7 +286,7 @@ pub fn Allocation_loc(self: & Allocation, vreg_id: i64) -> Location {
 }
 
 /// Look up the physical register for a VReg, if any.
-pub fn Allocation_reg(self: & Allocation, vreg_id: i64) -> OptI64 {
+pub fn Allocation_reg(self: &Allocation, vreg_id: i64) -> OptI64 {
     var loc: Location = Allocation_loc(self, vreg_id);
     match loc {
         Location::Reg(r) => {
@@ -272,7 +300,7 @@ pub fn Allocation_reg(self: & Allocation, vreg_id: i64) -> OptI64 {
 }
 
 /// Insert or update a vreg -> location mapping.
-pub fn Allocation_set_loc(self: & mut Allocation, vreg_id: i64, loc: Location) {
+pub fn Allocation_set_loc(self: &mut Allocation, vreg_id: i64, loc: Location) {
     var i: i64 = 0;
     while i < self.vreg_to_loc.len() {
         if self.vreg_to_loc.get(i).vreg_id == vreg_id {
@@ -296,7 +324,7 @@ pub fn ModuleAllocation_new() -> ModuleAllocation {
     };
 }
 
-pub fn ModuleAllocation_get(self: & ModuleAllocation, name: str) -> OptAllocation {
+pub fn ModuleAllocation_get(self: &ModuleAllocation, name: str) -> OptAllocation {
     var i: i64 = 0;
     while i < self.func_names.len() {
         if self.func_names.get(i) == name {
@@ -317,7 +345,7 @@ pub enum OptAllocation {
 // ===========================================================================
 
 /// Run the linear scan allocator on a single function.
-pub fn allocate(func: & L3Function, pure_funcs: Vec<str>, no_alloc_funcs: Vec<str>) -> Allocation {
+pub fn allocate(func: &L3Function, pure_funcs: Vec<str>, no_alloc_funcs: Vec<str>) -> Allocation {
     // 1. Compute live intervals.
     var intervals: Vec<LiveInterval> = compute_live_intervals(func);
 
@@ -325,7 +353,7 @@ pub fn allocate(func: & L3Function, pure_funcs: Vec<str>, no_alloc_funcs: Vec<st
     // Mov { src: ImmI(c) }. These are rematerializable. (F-1A)
     var constant_vreg_ids: Vec<i64> = Vec::new();
     var constant_vreg_vals: Vec<i64> = Vec::new();
-    compute_constant_vregs(func, & mut constant_vreg_ids, & mut constant_vreg_vals);
+    compute_constant_vregs(func, &mut constant_vreg_ids, &mut constant_vreg_vals);
 
     // 2. Map argument VRegs to their incoming physical registers.
     var arg_regs: Vec<i64> = physreg_arg_regs();
@@ -368,7 +396,7 @@ pub fn allocate(func: & L3Function, pure_funcs: Vec<str>, no_alloc_funcs: Vec<st
 
     // 4. Sort intervals by start point (bubble sort -- small N).
     var sorted: Vec<LiveInterval> = intervals;
-    sort_intervals_by_start(& mut sorted);
+    sort_intervals_by_start(&mut sorted);
 
     // 5. Linear scan.
     var active: Vec<LiveInterval> = Vec::new();
@@ -376,7 +404,7 @@ pub fn allocate(func: & L3Function, pure_funcs: Vec<str>, no_alloc_funcs: Vec<st
     // Remove pre-assigned arg registers from the free pool.
     var pi: i64 = 0;
     while pi < preassigned_reg_vals.len() {
-        remove_from_pool(& mut free_pool, preassigned_reg_vals.get(pi));
+        remove_from_pool(&mut free_pool, preassigned_reg_vals.get(pi));
         pi = pi + 1;
     }
 
@@ -401,7 +429,7 @@ pub fn allocate(func: & L3Function, pure_funcs: Vec<str>, no_alloc_funcs: Vec<st
                 if is_reg_clobbered_in_range(func, interval.start, interval.end, reg, pure_funcs, no_alloc_funcs) {
                     var aligned: i64 = (spill_offset + 7) & (~7);
                     spill_offset = aligned + 8;
-                    set_loc_in_vec(& mut vreg_to_loc, interval.vreg_id, Location::Spill(aligned));
+                    set_loc_in_vec(&mut vreg_to_loc, interval.vreg_id, Location::Spill(aligned));
                     // Update arg_locations
                     var ai: i64 = 0;
                     while ai < func.params.len() {
@@ -416,10 +444,10 @@ pub fn allocate(func: & L3Function, pure_funcs: Vec<str>, no_alloc_funcs: Vec<st
                     if !pool_contains(free_pool, reg) {
                         free_pool.push(reg);
                     }
-                    sort_pool(& mut free_pool);
+                    sort_pool(&mut free_pool);
                 } else {
                     active.push(interval);
-                    sort_active_by_end(& mut active);
+                    sort_active_by_end(&mut active);
                 }
             }
             si = si + 1;
@@ -461,7 +489,7 @@ pub fn allocate(func: & L3Function, pure_funcs: Vec<str>, no_alloc_funcs: Vec<st
             }
             fi = fi + 1;
         }
-        sort_pool(& mut free_pool);
+        sort_pool(&mut free_pool);
 
         // Try to assign a free register that is not clobbered during this interval.
         var assigned_reg: OptI64 = OptI64::None;
@@ -477,10 +505,10 @@ pub fn allocate(func: & L3Function, pure_funcs: Vec<str>, no_alloc_funcs: Vec<st
 
         match assigned_reg {
             OptI64::Some(reg) => {
-                remove_from_pool(& mut free_pool, reg);
+                remove_from_pool(&mut free_pool, reg);
                 vreg_to_loc.push(VRegLocEntry_new(interval.vreg_id, Location::Reg(reg)));
                 active.push(interval);
-                sort_active_by_end(& mut active);
+                sort_active_by_end(&mut active);
                 if physreg_is_callee_saved(reg) && !ra_vec_contains_i64(used_callee_saved, reg) {
                     used_callee_saved.push(reg);
                 }
@@ -495,7 +523,7 @@ pub fn allocate(func: & L3Function, pure_funcs: Vec<str>, no_alloc_funcs: Vec<st
                     ci = ci + 1;
                 }
                 candidates.push(interval);
-                sort_active_by_end(& mut candidates);
+                sort_active_by_end(&mut candidates);
 
                 var spill_vreg_id: i64 = candidates.get(candidates.len() - 1).vreg_id;
                 var is_current: bool = spill_vreg_id == interval.vreg_id;
@@ -557,11 +585,11 @@ pub fn allocate(func: & L3Function, pure_funcs: Vec<str>, no_alloc_funcs: Vec<st
                     // F-1A: If the evicted VReg is a constant, rematerialize it.
                     var const_idx3: i64 = ra_vec_find_i64(constant_vreg_ids, spill_vreg_id);
                     if const_idx3 >= 0 {
-                        set_loc_in_vec(& mut vreg_to_loc, spill_vreg_id, Location::Remat(constant_vreg_vals.get(const_idx3)));
+                        set_loc_in_vec(&mut vreg_to_loc, spill_vreg_id, Location::Remat(constant_vreg_vals.get(const_idx3)));
                     } else {
                         var aligned3: i64 = (spill_offset + 7) & (~7);
                         spill_offset = aligned3 + 8;
-                        set_loc_in_vec(& mut vreg_to_loc, spill_vreg_id, Location::Spill(aligned3));
+                        set_loc_in_vec(&mut vreg_to_loc, spill_vreg_id, Location::Spill(aligned3));
                     }
 
                     // Remove spilled vreg from active
@@ -577,7 +605,7 @@ pub fn allocate(func: & L3Function, pure_funcs: Vec<str>, no_alloc_funcs: Vec<st
 
                     vreg_to_loc.push(VRegLocEntry_new(interval.vreg_id, Location::Reg(reg)));
                     active.push(interval);
-                    sort_active_by_end(& mut active);
+                    sort_active_by_end(&mut active);
                     if physreg_is_callee_saved(reg) && !ra_vec_contains_i64(used_callee_saved, reg) {
                         used_callee_saved.push(reg);
                     }
@@ -588,7 +616,7 @@ pub fn allocate(func: & L3Function, pure_funcs: Vec<str>, no_alloc_funcs: Vec<st
     }
 
     // Sort callee-saved registers by encoding for deterministic prologue.
-    sort_vec_i64(& mut used_callee_saved);
+    sort_vec_i64(&mut used_callee_saved);
 
     var result: Allocation = Allocation_new();
     result.vreg_to_loc = vreg_to_loc;
@@ -599,13 +627,13 @@ pub fn allocate(func: & L3Function, pure_funcs: Vec<str>, no_alloc_funcs: Vec<st
 }
 
 /// Run the allocator on all functions in a module.
-pub fn allocate_module(module: & L3Module) -> ModuleAllocation {
+pub fn allocate_module(module: &L3Module) -> ModuleAllocation {
     var result: ModuleAllocation = ModuleAllocation_new();
     var i: i64 = 0;
     while i < module.functions.len() {
         var f: L3Function = module.functions.get(i);
         result.func_names.push(f.name);
-        result.func_allocs.push(allocate(& f, module.pure_functions, module.no_alloc_functions));
+        result.func_allocs.push(allocate(&f, module.pure_functions, module.no_alloc_functions));
         i = i + 1;
     }
     return result;
@@ -617,7 +645,7 @@ pub fn allocate_module(module: & L3Module) -> ModuleAllocation {
 
 /// Compute the set of VRegs that hold a constant value and are safe to
 /// rematerialize. (F-1A)
-pub fn compute_constant_vregs(func: & L3Function, ids: & mut Vec<i64>, vals: & mut Vec<i64>) {
+pub fn compute_constant_vregs(func: &L3Function, ids: &mut Vec<i64>, vals: &mut Vec<i64>) {
     var bi: i64 = 0;
     while bi < func.blocks.len() {
         var block: L3Block = func.blocks.get(bi);
@@ -645,7 +673,7 @@ pub fn compute_constant_vregs(func: & L3Function, ids: & mut Vec<i64>, vals: & m
 }
 
 /// Compute live intervals for all VRegs in a function.
-pub fn compute_live_intervals(func: & L3Function) -> Vec<LiveInterval> {
+pub fn compute_live_intervals(func: &L3Function) -> Vec<LiveInterval> {
     var interval_ids: Vec<i64> = Vec::new();
     var interval_starts: Vec<i64> = Vec::new();
     var interval_ends: Vec<i64> = Vec::new();
@@ -654,7 +682,7 @@ pub fn compute_live_intervals(func: & L3Function) -> Vec<LiveInterval> {
     // Function params are live from instruction 0.
     var pi: i64 = 0;
     while pi < func.params.len() {
-        record_def(& mut interval_ids, & mut interval_starts, & mut interval_ends, func.params.get(pi).vreg.id, 0);
+        record_def(&mut interval_ids, &mut interval_starts, &mut interval_ends, func.params.get(pi).vreg.id, 0);
         pi = pi + 1;
     }
 
@@ -671,7 +699,7 @@ pub fn compute_live_intervals(func: & L3Function) -> Vec<LiveInterval> {
         // Block params are defined at block entry.
         var pai: i64 = 0;
         while pai < block.params.len() {
-            record_def(& mut interval_ids, & mut interval_starts, & mut interval_ends, block.params.get(pai).vreg.id, idx);
+            record_def(&mut interval_ids, &mut interval_starts, &mut interval_ends, block.params.get(pai).vreg.id, idx);
             pai = pai + 1;
         }
 
@@ -683,7 +711,7 @@ pub fn compute_live_intervals(func: & L3Function) -> Vec<LiveInterval> {
             var dst_opt: OptVReg = inst_def(inst);
             match dst_opt {
                 OptVReg::Some(dst) => {
-                    record_def(& mut interval_ids, & mut interval_starts, & mut interval_ends, dst.id, idx);
+                    record_def(&mut interval_ids, &mut interval_starts, &mut interval_ends, dst.id, idx);
                 }
                 OptVReg::None => {
                 }
@@ -693,7 +721,7 @@ pub fn compute_live_intervals(func: & L3Function) -> Vec<LiveInterval> {
             var uses: Vec<i64> = inst_uses(inst);
             var ui: i64 = 0;
             while ui < uses.len() {
-                record_use(& mut interval_ids, & mut interval_starts, & mut interval_ends, uses.get(ui), idx);
+                record_use(&mut interval_ids, &mut interval_starts, &mut interval_ends, uses.get(ui), idx);
                 ui = ui + 1;
             }
 
@@ -933,7 +961,7 @@ pub fn compute_live_intervals(func: & L3Function) -> Vec<LiveInterval> {
 }
 
 /// Record a def (start of interval).
-pub fn record_def(ids: & mut Vec<i64>, starts: & mut Vec<i64>, ends: & mut Vec<i64>, vreg_id: i64, pos: i64) {
+pub fn record_def(ids: &mut Vec<i64>, starts: &mut Vec<i64>, ends: &mut Vec<i64>, vreg_id: i64, pos: i64) {
     var idx: i64 = ra_vec_find_i64(ids, vreg_id);
     if idx < 0 {
         ids.push(vreg_id);
@@ -947,7 +975,7 @@ pub fn record_def(ids: & mut Vec<i64>, starts: & mut Vec<i64>, ends: & mut Vec<i
 }
 
 /// Record a use (extends end of interval).
-pub fn record_use(ids: & mut Vec<i64>, starts: & mut Vec<i64>, ends: & mut Vec<i64>, vreg_id: i64, pos: i64) {
+pub fn record_use(ids: &mut Vec<i64>, starts: &mut Vec<i64>, ends: &mut Vec<i64>, vreg_id: i64, pos: i64) {
     var idx: i64 = ra_vec_find_i64(ids, vreg_id);
     if idx < 0 {
         ids.push(vreg_id);
@@ -1072,7 +1100,7 @@ pub fn inst_clobbers(inst: L3Inst, pure_funcs: Vec<str>, no_alloc_funcs: Vec<str
 }
 
 /// Check if a register is clobbered by any instruction in the given range.
-pub fn is_reg_clobbered_in_range(func: & L3Function, start: i64, end: i64, reg: i64, pure_funcs: Vec<str>, no_alloc_funcs: Vec<str>) -> bool {
+pub fn is_reg_clobbered_in_range(func: &L3Function, start: i64, end: i64, reg: i64, pure_funcs: Vec<str>, no_alloc_funcs: Vec<str>) -> bool {
     var idx: i64 = 0;
     var bi: i64 = 0;
     while bi < func.blocks.len() {
@@ -1192,44 +1220,44 @@ pub fn inst_uses(inst: L3Inst) -> Vec<i64> {
     var uses: Vec<i64> = Vec::new();
     match inst {
         L3Inst::Mov(_, src) => {
-            collect_operand_uses(src, & mut uses);
+            collect_operand_uses(src, &mut uses);
         }
         L3Inst::AddrOfSlot(_, _) => {
         }
         L3Inst::GlobalAddr(_, _, _) => {
         }
         L3Inst::Bin(_, _, a, b, _) => {
-            collect_operand_uses(a, & mut uses);
-            collect_operand_uses(b, & mut uses);
+            collect_operand_uses(a, &mut uses);
+            collect_operand_uses(b, &mut uses);
         }
         L3Inst::Unary(_, _, src, _) => {
-            collect_operand_uses(src, & mut uses);
+            collect_operand_uses(src, &mut uses);
         }
         L3Inst::StackAlloc(_, _, _) => {
         }
         L3Inst::Load(_, ptr, _) => {
-            collect_operand_uses(ptr, & mut uses);
+            collect_operand_uses(ptr, &mut uses);
         }
         L3Inst::Store(ptr, value, _) => {
-            collect_operand_uses(ptr, & mut uses);
-            collect_operand_uses(value, & mut uses);
+            collect_operand_uses(ptr, &mut uses);
+            collect_operand_uses(value, &mut uses);
         }
         L3Inst::FieldAddr(_, base, _, _) => {
-            collect_operand_uses(base, & mut uses);
+            collect_operand_uses(base, &mut uses);
         }
         L3Inst::ElemAddr(_, base, index, _) => {
-            collect_operand_uses(base, & mut uses);
-            collect_operand_uses(index, & mut uses);
+            collect_operand_uses(base, &mut uses);
+            collect_operand_uses(index, &mut uses);
         }
         L3Inst::Jmp(_) => {
         }
         L3Inst::Br(cond, _, _) => {
-            collect_operand_uses(cond, & mut uses);
+            collect_operand_uses(cond, &mut uses);
         }
         L3Inst::Ret(value) => {
             match value {
                 OptOperand::Some(v) => {
-                    collect_operand_uses(v, & mut uses);
+                    collect_operand_uses(v, &mut uses);
                 }
                 OptOperand::None => {
                 }
@@ -1240,36 +1268,36 @@ pub fn inst_uses(inst: L3Inst) -> Vec<i64> {
         L3Inst::Call(_, _, args, _) => {
             var ai: i64 = 0;
             while ai < args.len() {
-                collect_operand_uses(args.get(ai), & mut uses);
+                collect_operand_uses(args.get(ai), &mut uses);
                 ai = ai + 1;
             }
         }
         L3Inst::CallPtr(_, fn_ptr, args, _, _) => {
-            collect_operand_uses(fn_ptr, & mut uses);
+            collect_operand_uses(fn_ptr, &mut uses);
             var ai: i64 = 0;
             while ai < args.len() {
-                collect_operand_uses(args.get(ai), & mut uses);
+                collect_operand_uses(args.get(ai), &mut uses);
                 ai = ai + 1;
             }
         }
         L3Inst::DynCall(_, _, _, args, _) => {
             var ai: i64 = 0;
             while ai < args.len() {
-                collect_operand_uses(args.get(ai), & mut uses);
+                collect_operand_uses(args.get(ai), &mut uses);
                 ai = ai + 1;
             }
         }
         L3Inst::MakeDyn(_, value, _, _) => {
-            collect_operand_uses(value, & mut uses);
+            collect_operand_uses(value, &mut uses);
         }
         L3Inst::Cast(_, src, _, _, _) => {
-            collect_operand_uses(src, & mut uses);
+            collect_operand_uses(src, &mut uses);
         }
         L3Inst::TryUnwrap(value, _, _, _) => {
-            collect_operand_uses(value, & mut uses);
+            collect_operand_uses(value, &mut uses);
         }
         L3Inst::Print(value, _) => {
-            collect_operand_uses(value, & mut uses);
+            collect_operand_uses(value, &mut uses);
         }
         L3Inst::Panic(_) => {
         }
@@ -1278,7 +1306,7 @@ pub fn inst_uses(inst: L3Inst) -> Vec<i64> {
 }
 
 /// Collect VReg uses from an operand.
-pub fn collect_operand_uses(op: Operand, uses: & mut Vec<i64>) {
+pub fn collect_operand_uses(op: Operand, uses: &mut Vec<i64>) {
     match op {
         Operand::VReg(r) => {
             uses.push(r.id);
@@ -1358,10 +1386,10 @@ pub fn ra_vec_find_i64(vec: Vec<i64>, value: i64) -> i64 {
         }
         i = i + 1;
     }
-    return - 1;
+    return -1;
 }
 
-pub fn remove_from_pool(pool: & mut Vec<i64>, value: i64) {
+pub fn remove_from_pool(pool: &mut Vec<i64>, value: i64) {
     var new_pool: Vec<i64> = Vec::new();
     var i: i64 = 0;
     while i < pool.len() {
@@ -1383,7 +1411,7 @@ pub fn pool_contains(pool: Vec<i64>, value: i64) -> bool {
     return ra_vec_contains_i64(pool, value);
 }
 
-pub fn sort_pool(pool: & mut Vec<i64>) {
+pub fn sort_pool(pool: &mut Vec<i64>) {
     // Bubble sort by physreg_encoding
     var n: i64 = pool.len();
     var i: i64 = 0;
@@ -1401,7 +1429,7 @@ pub fn sort_pool(pool: & mut Vec<i64>) {
     }
 }
 
-pub fn sort_vec_i64(vec: & mut Vec<i64>) {
+pub fn sort_vec_i64(vec: &mut Vec<i64>) {
     var n: i64 = vec.len();
     var i: i64 = 0;
     while i < n {
@@ -1418,7 +1446,7 @@ pub fn sort_vec_i64(vec: & mut Vec<i64>) {
     }
 }
 
-pub fn sort_intervals_by_start(intervals: & mut Vec<LiveInterval>) {
+pub fn sort_intervals_by_start(intervals: &mut Vec<LiveInterval>) {
     var n: i64 = intervals.len();
     var i: i64 = 0;
     while i < n {
@@ -1435,7 +1463,7 @@ pub fn sort_intervals_by_start(intervals: & mut Vec<LiveInterval>) {
     }
 }
 
-pub fn sort_active_by_end(active: & mut Vec<LiveInterval>) {
+pub fn sort_active_by_end(active: &mut Vec<LiveInterval>) {
     var n: i64 = active.len();
     var i: i64 = 0;
     while i < n {
@@ -1485,7 +1513,7 @@ pub fn get_loc_from_vec(vec: Vec<VRegLocEntry>, vreg_id: i64) -> Location {
     return Location::Spill(0);
 }
 
-pub fn set_loc_in_vec(vec: & mut Vec<VRegLocEntry>, vreg_id: i64, loc: Location) {
+pub fn set_loc_in_vec(vec: &mut Vec<VRegLocEntry>, vreg_id: i64, loc: Location) {
     var i: i64 = 0;
     while i < vec.len() {
         if vec.get(i).vreg_id == vreg_id {

@@ -30,7 +30,8 @@
 // these functions decide values and check sequences.
 
 module power;
- use vec; use string;
+use vec;
+use string;
 
 // ─── PLL ────────────────────────────────────────────────────────────────
 
@@ -46,21 +47,39 @@ pub struct PllConfig {
 }
 
 fn pll_none() -> PllConfig {
-    return PllConfig { ok: false, m: 0, n: 0, p: 0, q: 0, vco: 0, sys: 0, usb: 0 };
+    return PllConfig {
+        ok: false, m: 0, n: 0, p: 0, q: 0, vco: 0, sys: 0, usb: 0
+    };
 }
 
 /// Check one configuration against the limits; "" when valid.
 pub fn pll_check(fin: i64, m: i64, n: i64, p: i64, q: i64, sys_max: i64) -> str {
-    if m < 2 || m > 63 { return "M out of 2..63"; }
-    if n < 50 || n > 432 { return "N out of 50..432"; }
-    if p != 2 && p != 4 && p != 6 && p != 8 { return "P must be 2, 4, 6 or 8"; }
-    if q < 2 || q > 15 { return "Q out of 2..15"; }
+    if m < 2 || m > 63 {
+        return "M out of 2..63";
+    }
+    if n < 50 || n > 432 {
+        return "N out of 50..432";
+    }
+    if p != 2 && p != 4 && p != 6 && p != 8 {
+        return "P must be 2, 4, 6 or 8";
+    }
+    if q < 2 || q > 15 {
+        return "Q out of 2..15";
+    }
     val vin: i64 = fin / m;
-    if vin < 1000000 || vin > 2000000 { return "VCO input " + int_to_str(vin) + " Hz out of 1..2 MHz"; }
+    if vin < 1000000 || vin > 2000000 {
+        return "VCO input " + int_to_str(vin) + " Hz out of 1..2 MHz";
+    }
     val vco: i64 = fin * n / m;
-    if vco < 100000000 || vco > 432000000 { return "VCO " + int_to_str(vco) + " Hz out of 100..432 MHz"; }
-    if vco / p > sys_max { return "system clock above " + int_to_str(sys_max); }
-    if vco / q > 48000000 { return "USB clock above 48 MHz"; }
+    if vco < 100000000 || vco > 432000000 {
+        return "VCO " + int_to_str(vco) + " Hz out of 100..432 MHz";
+    }
+    if vco / p > sys_max {
+        return "system clock above " + int_to_str(sys_max);
+    }
+    if vco / q > 48000000 {
+        return "USB clock above 48 MHz";
+    }
     return "";
 }
 
@@ -80,14 +99,20 @@ pub fn pll_solve(fin: i64, target: i64, sys_max: i64) -> PllConfig {
                     if n >= 50 && n <= 432 {
                         // Q: exact 48 MHz if possible, else the closest below.
                         var q: i64 = (vco + 47999999) / 48000000;
-                        if q < 2 { q = 2; }
+                        if q < 2 {
+                            q = 2;
+                        }
                         if q <= 15 {
                             val usb: i64 = vco / q;
                             var score: i64 = vin / 1000;
-                            if vco % 48000000 == 0 && usb == 48000000 { score = score + 10000000; }
+                            if vco % 48000000 == 0 && usb == 48000000 {
+                                score = score + 10000000;
+                            }
                             if score > best_score && str_len(pll_check(fin, m, n, p, q, sys_max)) == 0 {
                                 best_score = score;
-                                best = PllConfig { ok: true, m: m, n: n, p: p, q: q, vco: vco, sys: target, usb: usb };
+                                best = PllConfig {
+                                    ok: true, m: m, n: n, p: p, q: q, vco: vco, sys: target, usb: usb
+                                };
                             }
                         }
                     }
@@ -104,7 +129,9 @@ pub fn pll_solve(fin: i64, target: i64, sys_max: i64) -> PllConfig {
 /// PLLSRC[22] (1 = HSE), Q[27:24].
 pub fn pll_cfgr(c: PllConfig, hse: bool) -> i64 {
     var v: i64 = c.m | (c.n << 6) | (((c.p / 2) - 1) << 16) | (c.q << 24);
-    if hse { v = v | (1 << 22); }
+    if hse {
+        v = v | (1 << 22);
+    }
     return v;
 }
 
@@ -134,15 +161,25 @@ pub struct BusClocks {
 /// 20 at 1.8-2.1 (mv = supply in millivolts).
 pub fn flash_wait_states(hclk: i64, mv: i64) -> i64 {
     var step: i64 = 20000000;
-    if mv >= 2700 { step = 30000000; } else if mv >= 2400 { step = 24000000; } else if mv >= 2100 { step = 22000000; }
-    if hclk <= 0 { return 0; }
+    if mv >= 2700 {
+        step = 30000000;
+    } else if mv >= 2400 {
+        step = 24000000;
+    } else if mv >= 2100 {
+        step = 22000000;
+    }
+    if hclk <= 0 {
+        return 0;
+    }
     return (hclk - 1) / step;
 }
 
 /// The bus clocks from SYSCLK and prescalers, checked against the limits
 /// (HCLK <= sys_max, PCLK1 <= apb1_max, PCLK2 <= apb2_max).
 pub fn bus_clocks(sysclk: i64, ahb: i64, apb1: i64, apb2: i64, sys_max: i64, apb1_max: i64, apb2_max: i64, mv: i64) -> BusClocks {
-    var b: BusClocks = BusClocks { ok: true, why: "", hclk: 0, pclk1: 0, pclk2: 0, tim1: 0, tim2: 0, wait_states: 0 };
+    var b: BusClocks = BusClocks {
+        ok: true, why: "", hclk: 0, pclk1: 0, pclk2: 0, tim1: 0, tim2: 0, wait_states: 0
+    };
     if !ahb_prescaler_ok(ahb) || !apb_prescaler_ok(apb1) || !apb_prescaler_ok(apb2) {
         b.ok = false;
         b.why = "invalid prescaler";
@@ -152,13 +189,24 @@ pub fn bus_clocks(sysclk: i64, ahb: i64, apb1: i64, apb2: i64, sys_max: i64, apb
     b.pclk1 = b.hclk / apb1;
     b.pclk2 = b.hclk / apb2;
     b.tim1 = b.pclk1;
-    if apb1 != 1 { b.tim1 = 2 * b.pclk1; }
+    if apb1 != 1 {
+        b.tim1 = 2 * b.pclk1;
+    }
     b.tim2 = b.pclk2;
-    if apb2 != 1 { b.tim2 = 2 * b.pclk2; }
+    if apb2 != 1 {
+        b.tim2 = 2 * b.pclk2;
+    }
     b.wait_states = flash_wait_states(b.hclk, mv);
-    if b.hclk > sys_max { b.ok = false; b.why = "HCLK above " + int_to_str(sys_max); }
-    else if b.pclk1 > apb1_max { b.ok = false; b.why = "PCLK1 " + int_to_str(b.pclk1) + " above " + int_to_str(apb1_max); }
-    else if b.pclk2 > apb2_max { b.ok = false; b.why = "PCLK2 " + int_to_str(b.pclk2) + " above " + int_to_str(apb2_max); }
+    if b.hclk > sys_max {
+        b.ok = false;
+        b.why = "HCLK above " + int_to_str(sys_max);
+    } else if b.pclk1 > apb1_max {
+        b.ok = false;
+        b.why = "PCLK1 " + int_to_str(b.pclk1) + " above " + int_to_str(apb1_max);
+    } else if b.pclk2 > apb2_max {
+        b.ok = false;
+        b.why = "PCLK2 " + int_to_str(b.pclk2) + " above " + int_to_str(apb2_max);
+    }
     return b;
 }
 
@@ -166,7 +214,9 @@ pub fn bus_clocks(sysclk: i64, ahb: i64, apb1: i64, apb2: i64, sys_max: i64, apb
 pub fn apb_prescaler_for(hclk: i64, max: i64) -> i64 {
     var d: i64 = 1;
     while d <= 16 {
-        if hclk / d <= max { return d; }
+        if hclk / d <= max {
+            return d;
+        }
         d = d * 2;
     }
     return -1;
@@ -197,7 +247,9 @@ pub struct ClockTree {
 }
 
 pub fn clktree_new() -> ClockTree {
-    return ClockTree { nodes: Vec::new() };
+    return ClockTree {
+        nodes: Vec::new()
+    };
 }
 
 fn clk_add(t: &mut ClockTree, n: ClkNode) -> i64 {
@@ -206,7 +258,9 @@ fn clk_add(t: &mut ClockTree, n: ClkNode) -> i64 {
 }
 
 fn clk_node(name: str, kind: i64) -> ClkNode {
-    return ClkNode { name: name, kind: kind, parents: Vec::new(), sel: 0, num: 1, den: 1, hz: 0, on: true, max_hz: 0 };
+    return ClkNode {
+        name: name, kind: kind, parents: Vec::new(), sel: 0, num: 1, den: 1, hz: 0, on: true, max_hz: 0
+    };
 }
 
 pub fn clk_source(t: &mut ClockTree, name: str, hz: i64) -> i64 {
@@ -271,19 +325,31 @@ pub fn clk_select(t: &mut ClockTree, id: i64, sel: i64) {
 /// Frequency of a node (0 when gated off or a source is off).
 pub fn clk_freq(t: &ClockTree, id: i64) -> i64 {
     val n: ClkNode = t.nodes.get(id);
-    if !n.on { return 0; }
-    if n.kind == CLK_SOURCE { return n.hz; }
-    if n.kind == CLK_MUX { return clk_freq(t, n.parents.get(n.sel)); }
+    if !n.on {
+        return 0;
+    }
+    if n.kind == CLK_SOURCE {
+        return n.hz;
+    }
+    if n.kind == CLK_MUX {
+        return clk_freq(t, n.parents.get(n.sel));
+    }
     val p: i64 = clk_freq(t, n.parents.get(0));
-    if n.kind == CLK_MUL { return p * n.num / n.den; }
-    if n.kind == CLK_DIV { return p / n.den; }
+    if n.kind == CLK_MUL {
+        return p * n.num / n.den;
+    }
+    if n.kind == CLK_DIV {
+        return p / n.den;
+    }
     return p;
 }
 
 pub fn clk_find(t: &ClockTree, name: str) -> i64 {
     var i: i64 = 0;
     while i < t.nodes.len() {
-        if str_equal(t.nodes.get(i).name, name) { return i; }
+        if str_equal(t.nodes.get(i).name, name) {
+            return i;
+        }
         i = i + 1;
     }
     return -1;
@@ -296,7 +362,9 @@ pub fn clk_check(t: &ClockTree) -> Vec<str> {
     while i < t.nodes.len() {
         val n: ClkNode = t.nodes.get(i);
         val f: i64 = clk_freq(t, i);
-        if n.max_hz > 0 && f > n.max_hz { out.push(n.name + ": " + int_to_str(f) + " > " + int_to_str(n.max_hz)); }
+        if n.max_hz > 0 && f > n.max_hz {
+            out.push(n.name + ": " + int_to_str(f) + " > " + int_to_str(n.max_hz));
+        }
         i = i + 1;
     }
     return out;
@@ -334,7 +402,9 @@ pub struct PowerSim {
 }
 
 pub fn powersim_new() -> PowerSim {
-    return PowerSim { mode: PM_RUN, sysclk_src: "PLL", ram_ok: true, irq_pending: false, exti_enabled: false, wake_sources: WAKE_RESET, wuf: false, resets: 0, log: Vec::new() };
+    return PowerSim {
+        mode: PM_RUN, sysclk_src: "PLL", ram_ok: true, irq_pending: false, exti_enabled: false, wake_sources: WAKE_RESET, wuf: false, resets: 0, log: Vec::new()
+    };
 }
 
 /// Try to enter a mode; false (with the reason logged) when the rules
@@ -344,7 +414,9 @@ pub fn power_enter(s: &mut PowerSim, m: i64) -> bool {
         s.log.push(pm_name(m) + " refused: only entered from RUN (now " + pm_name(s.mode) + ")");
         return false;
     }
-    if m == PM_RUN { return true; }
+    if m == PM_RUN {
+        return true;
+    }
     if s.irq_pending && m != PM_STANDBY {
         s.log.push(pm_name(m) + ": WFI returned at once (interrupt pending)");
         return false;
@@ -369,7 +441,9 @@ pub fn power_enter(s: &mut PowerSim, m: i64) -> bool {
 
 /// A wakeup event; false when it does not wake the current mode.
 pub fn power_wake(s: &mut PowerSim, src: i64) -> bool {
-    if s.mode == PM_RUN { return false; }
+    if s.mode == PM_RUN {
+        return false;
+    }
     if s.mode == PM_SLEEP {
         if src == WAKE_IRQ || src == WAKE_EXTI || src == WAKE_RTC || src == WAKE_RESET {
             s.mode = PM_RUN;
@@ -422,12 +496,16 @@ pub fn power_average_na(modes: Vec<i64>, durations: Vec<i64>, current_na: Vec<i6
         total = total + durations.get(i);
         i = i + 1;
     }
-    if total == 0 { return 0; }
+    if total == 0 {
+        return 0;
+    }
     return charge / total;
 }
 
 /// Hours a battery of `mah` lasts at an average current of `avg_na`.
 pub fn power_battery_hours(mah: i64, avg_na: i64) -> i64 {
-    if avg_na <= 0 { return -1; }
+    if avg_na <= 0 {
+        return -1;
+    }
     return mah * 1000000 / avg_na;
 }

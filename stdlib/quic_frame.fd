@@ -17,7 +17,8 @@
 // handshake and the streams are stdlib/quic_conn.fd (competitive SL2).
 
 module quic_frame;
- use vec; use quic;
+use vec;
+use quic;
 
 // ─── Frame types (RFC 9000 §19, Table 3) ────────────────────────────────
 
@@ -159,7 +160,7 @@ pub struct QuicParamsParsed {
 
 // ─── Helpers ────────────────────────────────────────────────────────────
 
-fn qfr_put(out: & mut Vec<i64>, v: Vec<i64>) {
+fn qfr_put(out: &mut Vec<i64>, v: Vec<i64>) {
     var i: i64 = 0;
     while i < v.len() {
         out.push(v.get(i) & 255);
@@ -167,7 +168,7 @@ fn qfr_put(out: & mut Vec<i64>, v: Vec<i64>) {
     }
 }
 
-fn qfr_put_varint(out: & mut Vec<i64>, v: i64) {
+fn qfr_put_varint(out: &mut Vec<i64>, v: i64) {
     qfr_put(out, quic_varint_encode(v));
 }
 
@@ -179,10 +180,7 @@ fn qfr_none() -> Vec<i64> {
 /// A frame of type `ftype` with every field zero or empty.
 pub fn quic_frame_blank(ftype: i64) -> QuicFrame {
     return QuicFrame {
-        ftype: ftype, stream_id: 0, offset: 0, data: qfr_none(), fin: false,
-        ranges: qfr_none(), ack_delay: 0, ecn: qfr_none(), error_code: 0,
-        final_size: 0, frame_type: 0, limit: 0, seq: 0, retire_prior_to: 0,
-        reset_token: qfr_none(),
+        ftype: ftype, stream_id: 0, offset: 0, data: qfr_none(), fin: false, ranges: qfr_none(), ack_delay: 0, ecn: qfr_none(), error_code: 0, final_size: 0, frame_type: 0, limit: 0, seq: 0, retire_prior_to: 0, reset_token: qfr_none(),
     };
 }
 
@@ -194,8 +192,7 @@ pub fn quic_frame_is_stream(ftype: i64) -> bool {
 /// Whether receiving the frame calls for an acknowledgment (RFC 9002 §2):
 /// every frame but ACK, PADDING and CONNECTION_CLOSE.
 pub fn quic_frame_ack_eliciting(ftype: i64) -> bool {
-    return !(ftype == QF_PADDING || ftype == QF_ACK || ftype == QF_ACK_ECN
-        || ftype == QF_CONNECTION_CLOSE || ftype == QF_CONNECTION_CLOSE_APP);
+    return !(ftype == QF_PADDING || ftype == QF_ACK || ftype == QF_ACK_ECN || ftype == QF_CONNECTION_CLOSE || ftype == QF_CONNECTION_CLOSE_APP);
 }
 
 /// Whether a frame type may appear in a packet of encryption level `level`
@@ -205,13 +202,10 @@ pub fn quic_frame_ack_eliciting(ftype: i64) -> bool {
 /// RETIRE_CONNECTION_ID; 1-RTT every frame.
 pub fn quic_frame_allowed(ftype: i64, level: i64) -> bool {
     if level == QL_INITIAL || level == QL_HANDSHAKE {
-        return ftype == QF_PADDING || ftype == QF_PING || ftype == QF_ACK
-            || ftype == QF_ACK_ECN || ftype == QF_CRYPTO || ftype == QF_CONNECTION_CLOSE;
+        return ftype == QF_PADDING || ftype == QF_PING || ftype == QF_ACK || ftype == QF_ACK_ECN || ftype == QF_CRYPTO || ftype == QF_CONNECTION_CLOSE;
     }
     if level == QL_0RTT {
-        return !(ftype == QF_ACK || ftype == QF_ACK_ECN || ftype == QF_CRYPTO
-            || ftype == QF_HANDSHAKE_DONE || ftype == QF_NEW_TOKEN
-            || ftype == QF_PATH_RESPONSE || ftype == QF_RETIRE_CONNECTION_ID);
+        return !(ftype == QF_ACK || ftype == QF_ACK_ECN || ftype == QF_CRYPTO || ftype == QF_HANDSHAKE_DONE || ftype == QF_NEW_TOKEN || ftype == QF_PATH_RESPONSE || ftype == QF_RETIRE_CONNECTION_ID);
     }
     return ftype >= 0 && ftype <= QF_HANDSHAKE_DONE;
 }
@@ -222,7 +216,7 @@ pub fn quic_frame_allowed(ftype: i64, level: i64) -> bool {
 /// always sent with its Length field (type 0x0a/0x0b, 0x0e/0x0f when the
 /// offset is not zero); a frame type this module does not know adds
 /// nothing.
-pub fn quic_frame_put(out: & mut Vec<i64>, f: QuicFrame) {
+pub fn quic_frame_put(out: &mut Vec<i64>, f: QuicFrame) {
     val t: i64 = f.ftype;
     if quic_frame_is_stream(t) {
         var st: i64 = QF_STREAM | 0x02;
@@ -306,8 +300,7 @@ pub fn quic_frame_put(out: & mut Vec<i64>, f: QuicFrame) {
         qfr_put(out, f.data);
         return;
     }
-    if t == QF_MAX_DATA || t == QF_MAX_STREAMS_BIDI || t == QF_MAX_STREAMS_UNI
-        || t == QF_DATA_BLOCKED || t == QF_STREAMS_BLOCKED_BIDI || t == QF_STREAMS_BLOCKED_UNI {
+    if t == QF_MAX_DATA || t == QF_MAX_STREAMS_BIDI || t == QF_MAX_STREAMS_UNI || t == QF_DATA_BLOCKED || t == QF_STREAMS_BLOCKED_BIDI || t == QF_STREAMS_BLOCKED_UNI {
         qfr_put_varint(out, t);
         qfr_put_varint(out, f.limit);
         return;
@@ -352,7 +345,7 @@ pub fn quic_frame_put(out: & mut Vec<i64>, f: QuicFrame) {
 /// The encoding of one frame.
 pub fn quic_frame_encode(f: QuicFrame) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
-    quic_frame_put(& mut out, f);
+    quic_frame_put(&mut out, f);
     return out;
 }
 
@@ -382,7 +375,7 @@ struct QfrReader {
     bad: bool,
 }
 
-fn qfr_varint(r: & mut QfrReader) -> i64 {
+fn qfr_varint(r: &mut QfrReader) -> i64 {
     if r.bad {
         return 0;
     }
@@ -395,7 +388,7 @@ fn qfr_varint(r: & mut QfrReader) -> i64 {
     return v.value;
 }
 
-fn qfr_bytes(r: & mut QfrReader, n: i64) -> Vec<i64> {
+fn qfr_bytes(r: &mut QfrReader, n: i64) -> Vec<i64> {
     if r.bad || n < 0 || r.pos + n > r.b.len() {
         r.bad = true;
         return qfr_none();
@@ -405,7 +398,7 @@ fn qfr_bytes(r: & mut QfrReader, n: i64) -> Vec<i64> {
     return out;
 }
 
-fn qfr_fail(fs: & mut QuicFrames, code: i64, why: str) {
+fn qfr_fail(fs: &mut QuicFrames, code: i64, why: str) {
     if fs.error < 0 {
         fs.error = code;
         fs.why = why;
@@ -414,7 +407,7 @@ fn qfr_fail(fs: & mut QuicFrames, code: i64, why: str) {
 
 /// Parse one frame at the reader's position (the type already read).
 /// False when it is malformed (the reason is set in `fs`).
-fn qfr_parse_one(r: & mut QfrReader, t: i64, fs: & mut QuicFrames) -> bool {
+fn qfr_parse_one(r: &mut QfrReader, t: i64, fs: &mut QuicFrames) -> bool {
     var f: QuicFrame = quic_frame_blank(t);
     if quic_frame_is_stream(t) {
         f.ftype = QF_STREAM;
@@ -511,8 +504,7 @@ fn qfr_parse_one(r: & mut QfrReader, t: i64, fs: & mut QuicFrames) -> bool {
         }
     } else if t == QF_MAX_DATA || t == QF_DATA_BLOCKED {
         f.limit = qfr_varint(r);
-    } else if t == QF_MAX_STREAMS_BIDI || t == QF_MAX_STREAMS_UNI
-        || t == QF_STREAMS_BLOCKED_BIDI || t == QF_STREAMS_BLOCKED_UNI {
+    } else if t == QF_MAX_STREAMS_BIDI || t == QF_MAX_STREAMS_UNI || t == QF_STREAMS_BLOCKED_BIDI || t == QF_STREAMS_BLOCKED_UNI {
         f.limit = qfr_varint(r);
         if !r.bad && f.limit > 1152921504606846976 {
             // 2^60 (RFC 9000 §19.11, §19.14)
@@ -565,16 +557,20 @@ fn qfr_parse_one(r: & mut QfrReader, t: i64, fs: & mut QuicFrames) -> bool {
 /// Parse the frames of a decrypted payload received at `level` (QL_*).
 /// An empty payload is a PROTOCOL_VIOLATION (RFC 9000 §12.4).
 pub fn quic_frames_parse(payload: Vec<i64>, level: i64) -> QuicFrames {
-    var fs: QuicFrames = QuicFrames { frames: Vec::new(), error: - 1, why: "", ack_eliciting: false };
+    var fs: QuicFrames = QuicFrames {
+        frames: Vec::new(), error: -1, why: "", ack_eliciting: false
+    };
     if payload.len() == 0 {
-        qfr_fail(& mut fs, QE_PROTOCOL_VIOLATION, "a packet without frames");
+        qfr_fail(&mut fs, QE_PROTOCOL_VIOLATION, "a packet without frames");
         return fs;
     }
-    var r: QfrReader = QfrReader { b: payload, pos: 0, bad: false };
+    var r: QfrReader = QfrReader {
+        b: payload, pos: 0, bad: false
+    };
     while r.pos < r.b.len() {
-        val t: i64 = qfr_varint(& mut r);
+        val t: i64 = qfr_varint(&mut r);
         if r.bad {
-            qfr_fail(& mut fs, QE_FRAME_ENCODING_ERROR, "frame type cut short");
+            qfr_fail(&mut fs, QE_FRAME_ENCODING_ERROR, "frame type cut short");
             return fs;
         }
         if t == QF_PADDING {
@@ -585,10 +581,10 @@ pub fn quic_frames_parse(payload: Vec<i64>, level: i64) -> QuicFrames {
             continue;
         }
         if !quic_frame_allowed(t, level) && t <= QF_HANDSHAKE_DONE {
-            qfr_fail(& mut fs, QE_PROTOCOL_VIOLATION, "frame " + int_to_str(t) + " not allowed at this level");
+            qfr_fail(&mut fs, QE_PROTOCOL_VIOLATION, "frame " + int_to_str(t) + " not allowed at this level");
             return fs;
         }
-        if !qfr_parse_one(& mut r, t, & mut fs) {
+        if !qfr_parse_one(&mut r, t, &mut fs) {
             return fs;
         }
         if quic_frame_ack_eliciting(t) {
@@ -698,25 +694,18 @@ pub const QTP_RETRY_SCID: i64 = 0x10;
 /// data or streams allowed until the peer says so).
 pub fn quic_params_default() -> QuicParams {
     return QuicParams {
-        has_original_dcid: false, original_dcid: qfr_none(), max_idle_timeout: 0,
-        stateless_reset_token: qfr_none(), max_udp_payload_size: 65527,
-        initial_max_data: 0, initial_max_stream_data_bidi_local: 0,
-        initial_max_stream_data_bidi_remote: 0, initial_max_stream_data_uni: 0,
-        initial_max_streams_bidi: 0, initial_max_streams_uni: 0,
-        ack_delay_exponent: 3, max_ack_delay: 25, disable_active_migration: false,
-        active_connection_id_limit: 2, has_initial_scid: false, initial_scid: qfr_none(),
-        has_retry_scid: false, retry_scid: qfr_none(),
+        has_original_dcid: false, original_dcid: qfr_none(), max_idle_timeout: 0, stateless_reset_token: qfr_none(), max_udp_payload_size: 65527, initial_max_data: 0, initial_max_stream_data_bidi_local: 0, initial_max_stream_data_bidi_remote: 0, initial_max_stream_data_uni: 0, initial_max_streams_bidi: 0, initial_max_streams_uni: 0, ack_delay_exponent: 3, max_ack_delay: 25, disable_active_migration: false, active_connection_id_limit: 2, has_initial_scid: false, initial_scid: qfr_none(), has_retry_scid: false, retry_scid: qfr_none(),
     };
 }
 
-fn qfr_param_int(out: & mut Vec<i64>, id: i64, v: i64) {
+fn qfr_param_int(out: &mut Vec<i64>, id: i64, v: i64) {
     val enc: Vec<i64> = quic_varint_encode(v);
     qfr_put_varint(out, id);
     qfr_put_varint(out, enc.len());
     qfr_put(out, enc);
 }
 
-fn qfr_param_bytes(out: & mut Vec<i64>, id: i64, v: Vec<i64>) {
+fn qfr_param_bytes(out: &mut Vec<i64>, id: i64, v: Vec<i64>) {
     qfr_put_varint(out, id);
     qfr_put_varint(out, v.len());
     qfr_put(out, v);
@@ -728,39 +717,41 @@ fn qfr_param_bytes(out: & mut Vec<i64>, id: i64, v: Vec<i64>) {
 pub fn quic_params_encode(p: QuicParams) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     if p.has_original_dcid {
-        qfr_param_bytes(& mut out, QTP_ORIGINAL_DCID, p.original_dcid);
+        qfr_param_bytes(&mut out, QTP_ORIGINAL_DCID, p.original_dcid);
     }
     if p.max_idle_timeout > 0 {
-        qfr_param_int(& mut out, QTP_MAX_IDLE_TIMEOUT, p.max_idle_timeout);
+        qfr_param_int(&mut out, QTP_MAX_IDLE_TIMEOUT, p.max_idle_timeout);
     }
     if p.stateless_reset_token.len() == 16 {
-        qfr_param_bytes(& mut out, QTP_STATELESS_RESET_TOKEN, p.stateless_reset_token);
+        qfr_param_bytes(&mut out, QTP_STATELESS_RESET_TOKEN, p.stateless_reset_token);
     }
-    qfr_param_int(& mut out, QTP_MAX_UDP_PAYLOAD_SIZE, p.max_udp_payload_size);
-    qfr_param_int(& mut out, QTP_INITIAL_MAX_DATA, p.initial_max_data);
-    qfr_param_int(& mut out, QTP_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL, p.initial_max_stream_data_bidi_local);
-    qfr_param_int(& mut out, QTP_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE, p.initial_max_stream_data_bidi_remote);
-    qfr_param_int(& mut out, QTP_INITIAL_MAX_STREAM_DATA_UNI, p.initial_max_stream_data_uni);
-    qfr_param_int(& mut out, QTP_INITIAL_MAX_STREAMS_BIDI, p.initial_max_streams_bidi);
-    qfr_param_int(& mut out, QTP_INITIAL_MAX_STREAMS_UNI, p.initial_max_streams_uni);
-    qfr_param_int(& mut out, QTP_ACK_DELAY_EXPONENT, p.ack_delay_exponent);
-    qfr_param_int(& mut out, QTP_MAX_ACK_DELAY, p.max_ack_delay);
+    qfr_param_int(&mut out, QTP_MAX_UDP_PAYLOAD_SIZE, p.max_udp_payload_size);
+    qfr_param_int(&mut out, QTP_INITIAL_MAX_DATA, p.initial_max_data);
+    qfr_param_int(&mut out, QTP_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL, p.initial_max_stream_data_bidi_local);
+    qfr_param_int(&mut out, QTP_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE, p.initial_max_stream_data_bidi_remote);
+    qfr_param_int(&mut out, QTP_INITIAL_MAX_STREAM_DATA_UNI, p.initial_max_stream_data_uni);
+    qfr_param_int(&mut out, QTP_INITIAL_MAX_STREAMS_BIDI, p.initial_max_streams_bidi);
+    qfr_param_int(&mut out, QTP_INITIAL_MAX_STREAMS_UNI, p.initial_max_streams_uni);
+    qfr_param_int(&mut out, QTP_ACK_DELAY_EXPONENT, p.ack_delay_exponent);
+    qfr_param_int(&mut out, QTP_MAX_ACK_DELAY, p.max_ack_delay);
     if p.disable_active_migration {
-        qfr_put_varint(& mut out, QTP_DISABLE_ACTIVE_MIGRATION);
-        qfr_put_varint(& mut out, 0);
+        qfr_put_varint(&mut out, QTP_DISABLE_ACTIVE_MIGRATION);
+        qfr_put_varint(&mut out, 0);
     }
-    qfr_param_int(& mut out, QTP_ACTIVE_CONNECTION_ID_LIMIT, p.active_connection_id_limit);
+    qfr_param_int(&mut out, QTP_ACTIVE_CONNECTION_ID_LIMIT, p.active_connection_id_limit);
     if p.has_initial_scid {
-        qfr_param_bytes(& mut out, QTP_INITIAL_SCID, p.initial_scid);
+        qfr_param_bytes(&mut out, QTP_INITIAL_SCID, p.initial_scid);
     }
     if p.has_retry_scid {
-        qfr_param_bytes(& mut out, QTP_RETRY_SCID, p.retry_scid);
+        qfr_param_bytes(&mut out, QTP_RETRY_SCID, p.retry_scid);
     }
     return out;
 }
 
 fn qfr_params_bad(p: QuicParams, why: str) -> QuicParamsParsed {
-    return QuicParamsParsed { params: p, error: QE_TRANSPORT_PARAMETER_ERROR, why: why };
+    return QuicParamsParsed {
+        params: p, error: QE_TRANSPORT_PARAMETER_ERROR, why: why
+    };
 }
 
 /// Parse the peer's transport parameters. `from_server` tells who sent
@@ -796,13 +787,11 @@ pub fn quic_params_parse(b: Vec<i64>, from_server: bool) -> QuicParamsParsed {
             }
             seen.push(pid);
         }
-        if !from_server && (pid == QTP_ORIGINAL_DCID || pid == QTP_STATELESS_RESET_TOKEN
-            || pid == QTP_PREFERRED_ADDRESS || pid == QTP_RETRY_SCID) {
+        if !from_server && (pid == QTP_ORIGINAL_DCID || pid == QTP_STATELESS_RESET_TOKEN || pid == QTP_PREFERRED_ADDRESS || pid == QTP_RETRY_SCID) {
             return qfr_params_bad(p, "a server-only parameter from the client");
         }
         var num: i64 = 0;
-        val is_int: bool = pid == QTP_MAX_IDLE_TIMEOUT || (pid >= QTP_MAX_UDP_PAYLOAD_SIZE && pid <= QTP_MAX_ACK_DELAY)
-            || pid == QTP_ACTIVE_CONNECTION_ID_LIMIT;
+        val is_int: bool = pid == QTP_MAX_IDLE_TIMEOUT || (pid >= QTP_MAX_UDP_PAYLOAD_SIZE && pid <= QTP_MAX_ACK_DELAY) || pid == QTP_ACTIVE_CONNECTION_ID_LIMIT;
         if is_int {
             val x: QuicVarint = quic_varint_decode(v, 0);
             if !x.ok || x.len != v.len() {
@@ -886,5 +875,7 @@ pub fn quic_params_parse(b: Vec<i64>, from_server: bool) -> QuicParamsParsed {
     if from_server && !p.has_original_dcid {
         return qfr_params_bad(p, "original_destination_connection_id missing");
     }
-    return QuicParamsParsed { params: p, error: - 1, why: "" };
+    return QuicParamsParsed {
+        params: p, error: -1, why: ""
+    };
 }

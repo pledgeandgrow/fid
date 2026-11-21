@@ -24,7 +24,9 @@
 //   println(query_one(c, "SELECT COUNT(*) AS n FROM users"));     // {"n":3}
 
 module mysql_db;
- use db; use json; use mysql;
+use db;
+use json;
+use mysql;
 
 // Column types (protocol numbers; module mysql names most of them)
 const MJ_DECIMAL: i64 = 0;
@@ -100,7 +102,7 @@ pub fn mysql_json_value(kind: i64, text: str) -> str {
 }
 
 /// The rows of `r` as a JSON array of objects ("[]" without rows).
-pub fn mysql_rows_json(r: & MysqlResult) -> str {
+pub fn mysql_rows_json(r: &MysqlResult) -> str {
     var sb: StringBuilder = StringBuilder::new();
     sb.append_str("[");
     val ncols: i64 = r.columns.len();
@@ -133,21 +135,21 @@ pub fn mysql_rows_json(r: & MysqlResult) -> str {
 }
 
 /// COM_QUERY, the rows as JSON ("[]" on an error or without rows).
-pub fn mysql_query_json(c: & mut MysqlConn, sql: str) -> str {
+pub fn mysql_query_json(c: &mut MysqlConn, sql: str) -> str {
     val r: MysqlResult = mysql_query(c, sql);
     if !r.ok {
         return "[]";
     }
-    return mysql_rows_json(& r);
+    return mysql_rows_json(&r);
 }
 
 /// COM_STMT_EXECUTE, the rows as JSON ("[]" on an error or without rows).
-pub fn mysql_execute_json(c: & mut MysqlConn, stmt: & MysqlStmt, params: Vec<MysqlParam>) -> str {
+pub fn mysql_execute_json(c: &mut MysqlConn, stmt: &MysqlStmt, params: Vec<MysqlParam>) -> str {
     val r: MysqlResult = mysql_execute(c, stmt, params);
     if !r.ok {
         return "[]";
     }
-    return mysql_rows_json(& r);
+    return mysql_rows_json(&r);
 }
 
 // ─── A TCP transport through the task runtime ─────────────────────────────
@@ -193,7 +195,9 @@ pub fn mysql_co_recv(sock: i64, max: i64) -> Vec<i64> {
 
 /// The transport over socket `sock` from p_co_connect.
 pub fn mysql_co_transport(sock: i64) -> MysqlTransport {
-    return MysqlTransport { conn: sock, send: mysql_co_send, recv: mysql_co_recv };
+    return MysqlTransport {
+        conn: sock, send: mysql_co_send, recv: mysql_co_recv
+    };
 }
 
 /// Connect to host:port and log in. `ok` false (`error` why) on failure;
@@ -202,7 +206,7 @@ pub fn mysql_connect_tcp(host: str, port: i64, user: str, password: str, databas
     val sock: i64 = p_co_connect(host, port);
     if sock < 0 {
         // No socket: the handshake read fails at once, then say why
-        var none: MysqlConn = mysql_connect(mysql_co_transport(- 1), user, password, database);
+        var none: MysqlConn = mysql_connect(mysql_co_transport(-1), user, password, database);
         none.ok = false;
         none.error = "cannot connect to " + host + ":" + int_to_str(port);
         return none;
@@ -215,7 +219,7 @@ pub fn mysql_connect_tcp(host: str, port: i64, user: str, password: str, databas
 }
 
 /// COM_QUIT and close the socket of a mysql_connect_tcp connection.
-pub fn mysql_close_tcp(c: & mut MysqlConn) {
+pub fn mysql_close_tcp(c: &mut MysqlConn) {
     mysql_close(c);
     if c.tr.conn >= 0 {
         p_socket_close(c.tr.conn);
@@ -225,20 +229,20 @@ pub fn mysql_close_tcp(c: & mut MysqlConn) {
 impl Database for MysqlConn {
     pub fn query (self: MysqlConn, sql: str) -> str {
         var c: MysqlConn = self;
-        return mysql_query_json(& mut c, sql);
+        return mysql_query_json(&mut c, sql);
     }
 
     pub fn exec(self: MysqlConn, sql: str) -> i64 {
         var c: MysqlConn = self;
-        val r: MysqlResult = mysql_query(& mut c, sql);
+        val r: MysqlResult = mysql_query(&mut c, sql);
         if !r.ok {
-            return - 1;
+            return -1;
         }
         return r.affected_rows;
     }
 
     pub fn close(self: MysqlConn) {
         var c: MysqlConn = self;
-        mysql_close(& mut c);
+        mysql_close(&mut c);
     }
 }

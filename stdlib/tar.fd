@@ -81,17 +81,17 @@ pub fn tar_symlink(name: str, target: str) -> TarEntry {
     return e;
 }
 
-pub fn tar_is_dir(e: & TarEntry) -> bool {
+pub fn tar_is_dir(e: &TarEntry) -> bool {
     return e.typeflag == TAR_DIR;
 }
 
-pub fn tar_is_file(e: & TarEntry) -> bool {
+pub fn tar_is_file(e: &TarEntry) -> bool {
     return e.typeflag == TAR_REG || e.typeflag == TAR_AREG || e.typeflag == TAR_CONT;
 }
 
 // --- field codecs ------------------------------------------------------------------
 
-fn tar_is_zero_block(b: & Vec<i64>, off: i64) -> bool {
+fn tar_is_zero_block(b: &Vec<i64>, off: i64) -> bool {
     var i: i64 = 0;
     while i < TAR_BLOCK {
         if b.get(off + i) != 0 {
@@ -103,7 +103,7 @@ fn tar_is_zero_block(b: & Vec<i64>, off: i64) -> bool {
 }
 
 /// A NUL-terminated string field of at most `len` bytes.
-fn tar_field_str(b: & Vec<i64>, off: i64, len: i64) -> str {
+fn tar_field_str(b: &Vec<i64>, off: i64, len: i64) -> str {
     var out: Vec<i64> = Vec::new();
     var i: i64 = 0;
     while i < len {
@@ -120,7 +120,7 @@ fn tar_field_str(b: & Vec<i64>, off: i64, len: i64) -> str {
 /// A numeric field: octal digits (leading spaces or NULs skipped, ended by
 /// a space or NUL) or, with the top bit of the first byte set, the GNU
 /// base-256 big-endian form.
-pub fn tar_field_num(b: & Vec<i64>, off: i64, len: i64) -> i64 {
+pub fn tar_field_num(b: &Vec<i64>, off: i64, len: i64) -> i64 {
     val first: i64 = b.get(off);
     if (first & 128) != 0 {
         var v: i64 = first & 63;
@@ -149,7 +149,7 @@ pub fn tar_field_num(b: & Vec<i64>, off: i64, len: i64) -> i64 {
 
 /// The checksum of the header at `off`: every byte summed with the
 /// checksum field (148..155) counted as spaces. [unsigned, signed].
-pub fn tar_checksums(b: & Vec<i64>, off: i64) -> Vec<i64> {
+pub fn tar_checksums(b: &Vec<i64>, off: i64) -> Vec<i64> {
     var u: i64 = 0;
     var s: i64 = 0;
     var i: i64 = 0;
@@ -239,7 +239,7 @@ pub fn tar_pax_record(key: str, value: str) -> str {
 }
 
 /// Parse pax records into parallel key/value lists.
-fn tar_pax_parse(d: & Vec<i64>, keys: &mut Vec<str>, vals: &mut Vec<str>) -> bool {
+fn tar_pax_parse(d: &Vec<i64>, keys: &mut Vec<str>, vals: &mut Vec<str>) -> bool {
     var p: i64 = 0;
     while p < d.len() {
         if d.get(p) == 0 {
@@ -287,7 +287,7 @@ fn tar_dec(s: str) -> i64 {
     return v;
 }
 
-fn tar_apply_pax(e: &mut TarEntry, keys: & Vec<str>, vals: & Vec<str>) {
+fn tar_apply_pax(e: &mut TarEntry, keys: &Vec<str>, vals: &Vec<str>) {
     var i: i64 = 0;
     while i < keys.len() {
         val k: str = keys.get(i);
@@ -316,7 +316,9 @@ fn tar_apply_pax(e: &mut TarEntry, keys: & Vec<str>, vals: & Vec<str>) {
 // --- reading ---------------------------------------------------------------------
 
 fn tar_fail(msg: str, es: Vec<TarEntry>) -> TarArchive {
-    return TarArchive { err: msg, entries: es };
+    return TarArchive {
+        err: msg, entries: es
+    };
 }
 
 /// Parse a whole archive. `err` is "" on success; entries read before an
@@ -332,7 +334,9 @@ pub fn tar_parse(b: Vec<i64>) -> TarArchive {
     var off: i64 = 0;
     while off + TAR_BLOCK <= b.len() {
         if tar_is_zero_block(&b, off) {
-            return TarArchive { err: "", entries: es };
+            return TarArchive {
+                err: "", entries: es
+            };
         }
         val stored: i64 = tar_field_num(&b, off + 148, 8);
         val sums: Vec<i64> = tar_checksums(&b, off);
@@ -427,12 +431,14 @@ pub fn tar_parse(b: Vec<i64>) -> TarArchive {
         return tar_fail("trailing partial block", es);
     }
     // no end-of-archive marker: accepted, as GNU tar does with a warning
-    return TarArchive { err: "", entries: es };
+    return TarArchive {
+        err: "", entries: es
+    };
 }
 
 /// The index of the entry named `name`, or -1 (the last one wins, as an
 /// extracting tar would leave it).
-pub fn tar_find(a: & TarArchive, name: str) -> i64 {
+pub fn tar_find(a: &TarArchive, name: str) -> i64 {
     var found: i64 = -1;
     var i: i64 = 0;
     while i < a.entries.len() {
@@ -484,7 +490,7 @@ pub fn tar_fix_checksum(h: &mut Vec<i64>) {
 }
 
 /// One ustar header block for `e`, with `name`/`prefix` as given.
-fn tar_raw_header(e: & TarEntry, name: str, prefix: str, size: i64) -> Vec<i64> {
+fn tar_raw_header(e: &TarEntry, name: str, prefix: str, size: i64) -> Vec<i64> {
     var h: Vec<i64> = Vec::filled(TAR_BLOCK, 0);
     tar_put_str(&mut h, 0, 100, name);
     tar_put_octal(&mut h, 100, 8, e.mode & 4095);
@@ -508,7 +514,7 @@ fn tar_raw_header(e: & TarEntry, name: str, prefix: str, size: i64) -> Vec<i64> 
     return h;
 }
 
-fn tar_push_data(out: &mut Vec<i64>, data: & Vec<i64>) {
+fn tar_push_data(out: &mut Vec<i64>, data: &Vec<i64>) {
     var i: i64 = 0;
     while i < data.len() {
         out.push(data.get(i));
@@ -521,7 +527,7 @@ fn tar_push_data(out: &mut Vec<i64>, data: & Vec<i64>) {
 
 /// The header block(s) of one entry: a pax header first when a value does
 /// not fit the ustar fields.
-pub fn tar_header(e: & TarEntry) -> Vec<i64> {
+pub fn tar_header(e: &TarEntry) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     var name: str = e.name;
     var prefix: str = "";
@@ -600,7 +606,7 @@ pub fn tar_write(entries: Vec<TarEntry>) -> Vec<i64> {
 }
 
 /// "-rw-r--r--"-style mode string of an entry (as `tar tv` prints it).
-pub fn tar_mode_str(e: & TarEntry) -> str {
+pub fn tar_mode_str(e: &TarEntry) -> str {
     var s: str = "-";
     if e.typeflag == TAR_DIR {
         s = "d";

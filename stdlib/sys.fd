@@ -13,7 +13,8 @@
 //   println(sys_page_size());  // 4096
 
 module sys;
- use vec; use os;
+use vec;
+use os;
 // ─── FFI declarations ───────────────────────────────────────────────────
 
 // SAFETY: the prototypes come from <unistd.h>, checked by the C compiler;
@@ -40,7 +41,12 @@ extern "C" include "<stdint.h>" {
 }
 
 // sysconf constants (Linux values; sx_sysconf maps them on other systems)
-pub const _SC_PAGESIZE: i64 = 30; pub const _SC_CLK_TCK: i64 = 2; pub const _SC_NPROCESSORS_ONLN: i64 = 84; pub const _SC_NPROCESSORS_CONF: i64 = 83; pub const _SC_PHYS_PAGES: i64 = 85; pub const _SC_AVPHYS_PAGES: i64 = 86;
+pub const _SC_PAGESIZE: i64 = 30;
+pub const _SC_CLK_TCK: i64 = 2;
+pub const _SC_NPROCESSORS_ONLN: i64 = 84;
+pub const _SC_NPROCESSORS_CONF: i64 = 83;
+pub const _SC_PHYS_PAGES: i64 = 85;
+pub const _SC_AVPHYS_PAGES: i64 = 86;
 // ─── Per-system primitives (@cfg) ───────────────────────────────────────
 // sx_sysconf(name) takes the Linux _SC_ numbers above; -1 when the system
 // has no such figure. The POSIX functions are only called on Linux and
@@ -56,10 +62,10 @@ fn sx_block(n: i64) -> i64 {
     }
     var i: i64 = 0;
     while i < n {
-        var p: * mut u8 = b + i;
+        var p: *mut u8 = b + i;
         // SAFETY: i < n, inside the block just allocated.
         unsafe {
-            * p = 0 as u8;
+            *p = 0 as u8;
         }
         i = i + 1;
     }
@@ -71,11 +77,11 @@ fn sx_get(buf: i64, off: i64, n: i64) -> i64 {
     var v: i64 = 0;
     var i: i64 = 0;
     while i < n {
-        var p: * mut u8 = buf + off + i;
+        var p: *mut u8 = buf + off + i;
         var b: i64 = 0;
         // SAFETY: every caller reads inside a block from sx_block.
         unsafe {
-            b = (* p) as i64;
+            b = (*p) as i64;
         }
         v = v | ((b & 255) << (8 * i));
         i = i + 1;
@@ -88,7 +94,7 @@ fn sx_get(buf: i64, off: i64, n: i64) -> i64 {
 fn sx_sysinfo_field(off: i64) -> i64 {
     val b: i64 = sx_block(64);
     if b == 0 {
-        return - 1;
+        return -1;
     }
     sw_sysinfo(b);
     val v: i64 = sx_get(b, off, 4);
@@ -102,14 +108,14 @@ fn sx_sysinfo_field(off: i64) -> i64 {
 fn sx_memory_field(off: i64) -> i64 {
     val b: i64 = sx_block(72);
     if b == 0 {
-        return - 1;
+        return -1;
     }
-    var p: * mut u8 = b;
+    var p: *mut u8 = b;
     // SAFETY: the first byte of the 72-byte block (dwLength = 64).
     unsafe {
-        * p = 64 as u8;
+        *p = 64 as u8;
     }
-    var v: i64 = - 1;
+    var v: i64 = -1;
     if sw_memstatus(b) != 0 {
         v = sx_get(b, off, 8);
     }
@@ -133,11 +139,11 @@ fn sx_sysconf(name: i64) -> i64 {
         val bytes: i64 = sx_memory_field(off);
         val ps: i64 = sx_sysinfo_field(4);
         if bytes < 0 || ps <= 0 {
-            return - 1;
+            return -1;
         }
         return bytes / ps;
     }
-    return - 1;
+    return -1;
 }
 
 @cfg(windows)
@@ -199,7 +205,7 @@ fn sx_getgid() -> i64 {
 // no _SC_AVPHYS_PAGES.
 @cfg(macos)
 fn sx_sysconf(name: i64) -> i64 {
-    var m: i64 = - 1;
+    var m: i64 = -1;
     if name == _SC_PAGESIZE {
         m = 29;
     } else if name == _SC_CLK_TCK {
@@ -212,7 +218,7 @@ fn sx_sysconf(name: i64) -> i64 {
         m = 200;
     }
     if m < 0 {
-        return - 1;
+        return -1;
     }
     return pledge_sysconf(m);
 }

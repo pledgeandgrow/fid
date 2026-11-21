@@ -58,7 +58,7 @@ const PE_M_PTHREAD_ATTR_INIT: i64 = 32;
 const PE_M_PTHREAD_ATTR_SETSTACK: i64 = 33;
 const PE_M_PTHREAD_ATTR_SETDETACH: i64 = 34;
 const PE_M_ABORT: i64 = 35;
-const PE_M_ERROR: i64 = 36;        // __error(): the thread's errno
+const PE_M_ERROR: i64 = 36;  // __error(): the thread's errno
 const PE_M_FDOPENDIR: i64 = 37;
 const PE_M_READDIR: i64 = 38;
 const PE_M_TELLDIR: i64 = 39;
@@ -80,7 +80,7 @@ const PE_M_FORK: i64 = 54;
 const PE_M_EXECVE: i64 = 55;
 const PE_M_WAIT4: i64 = 56;
 const PE_M_SETITIMER: i64 = 57;
-const PE_M__EXIT: i64 = 58;        // _exit(): a forked child that could not exec
+const PE_M__EXIT: i64 = 58;  // _exit(): a forked child that could not exec
 const PE_M_GETPPID: i64 = 59;
 const PE_M_GETUID: i64 = 60;
 const PE_M_GETGID: i64 = 61;
@@ -92,9 +92,9 @@ fn pe_m(k: i64, a: i64, b: i64, c: i64) -> i64 {
     return nat_mac_call(k, a, b, c, 0, 0, 0);
 }
 
-var pe_mac_top: i64 = 0;        // the start block (nat_start_sp reads it)
-var pe_mac_info: i64 = 0;       // the siginfo handed to pe_on_signal
-var pe_mac_tls_key: i64 = 0;    // *i64: the pthread key for the thread block
+var pe_mac_top: i64 = 0;  // the start block (nat_start_sp reads it)
+var pe_mac_info: i64 = 0;  // the siginfo handed to pe_on_signal
+var pe_mac_tls_key: i64 = 0;  // *i64: the pthread key for the thread block
 var pe_mac_key_ready: bool = false;
 var pe_mac_forked: bool = false;  // in a child of fork(): exit with _exit
 
@@ -106,7 +106,9 @@ var pe_mac_forked: bool = false;  // in a child of fork(): exit with _exit
 pub fn pe_mac_start(argc: i64, argv: i64, envp: i64) -> i64 {
     var nenv: i64 = 0;
     if envp != 0 {
-        while pe_ld(envp + nenv * 8) != 0 { nenv = nenv + 1; }
+        while pe_ld(envp + nenv * 8) != 0 {
+            nenv = nenv + 1;
+        }
     }
     var words: i64 = 1 + argc + 1 + nenv + 3;
     var block: i64 = pert_malloc(words * 8);
@@ -191,7 +193,7 @@ pub fn pe_mac_thread_main(p: i64) -> i64 {
     nat_call_fn(entry, 1, argv);
     pert_free(argv);
     nat_atomic_store(ctid, 0);
-    pe_m(PE_M_ULOCK_WAKE, 1, ctid, 0);        // UL_COMPARE_AND_WAIT | wake
+    pe_m(PE_M_ULOCK_WAKE, 1, ctid, 0);  // UL_COMPARE_AND_WAIT | wake
     return 0;
 }
 
@@ -203,12 +205,16 @@ fn pe_mac_mmap(n: i64) -> i64 {
     var a: i64 = nat_mac_call(PE_M_MMAP, 0, n, 3, 0x1002, 0 - 1, 0);
     // MAP_FAILED: -ENOMEM, as the Linux call gives (base.fd pe_mmap reports
     // it as out of memory)
-    if a == 0 - 1 { return 0 - 12; }
+    if a == 0 - 1 {
+        return 0 - 12;
+    }
     return a;
 }
 
 fn pe_mac_mprotect(addr: i64, len: i64, prot: i64) -> i64 {
-    if pe_m(PE_M_MPROTECT, addr, len, prot) < 0 { return 0 - 22; }
+    if pe_m(PE_M_MPROTECT, addr, len, prot) < 0 {
+        return 0 - 22;
+    }
     return 0;
 }
 
@@ -234,7 +240,9 @@ fn pe_mac_stat(path: i64, st: i64) -> i64 {
     var mtime_ns: i64 = pe_ld(buf + 56);
     pe_zero(st, 144);
     var mode_at: i64 = 16;
-    if nat_arch() == 3 { mode_at = 24; }
+    if nat_arch() == 3 {
+        mode_at = 24;
+    }
     pe_st(st + mode_at, mode);
     pe_st(st + 48, size);
     pe_st(st + 88, mtime);
@@ -250,37 +258,85 @@ fn pe_mac_stat(path: i64, st: i64) -> i64 {
 /// DIRECTORY 0x100000, CLOEXEC 0x1000000.
 fn pe_mac_oflags(f: i64) -> i64 {
     var m: i64 = f & 3;
-    if (f & 0x40) != 0 { m = m | 0x200; }
-    if (f & 0x80) != 0 { m = m | 0x800; }
-    if (f & 0x200) != 0 { m = m | 0x400; }
-    if (f & 0x400) != 0 { m = m | 0x8; }
-    if (f & 0x800) != 0 { m = m | 0x4; }
+    if (f & 0x40) != 0 {
+        m = m | 0x200;
+    }
+    if (f & 0x80) != 0 {
+        m = m | 0x800;
+    }
+    if (f & 0x200) != 0 {
+        m = m | 0x400;
+    }
+    if (f & 0x400) != 0 {
+        m = m | 0x8;
+    }
+    if (f & 0x800) != 0 {
+        m = m | 0x4;
+    }
     var dir_bit: i64 = 0x4000;
-    if nat_arch() == 3 { dir_bit = 0x10000; }       // x86-64: 0x4000 is O_DIRECT
-    if (f & dir_bit) != 0 { m = m | 0x100000; }
-    if (f & 0x80000) != 0 { m = m | 0x1000000; }
+    if nat_arch() == 3 {
+        dir_bit = 0x10000;
+    }  // x86-64: 0x4000 is O_DIRECT
+    if (f & dir_bit) != 0 {
+        m = m | 0x100000;
+    }
+    if (f & 0x80000) != 0 {
+        m = m | 0x1000000;
+    }
     return m;
 }
 
 /// The Linux number of macOS errno `e` (1-34 are the same but EDEADLK).
 fn pe_mac_errno_linux(e: i64) -> i64 {
-    if e == 11 { return 35; }                  // EDEADLK
-    if e >= 1 && e <= 34 { return e; }
-    if e == 35 { return 11; }                  // EAGAIN
-    if e == 36 { return 115; }                 // EINPROGRESS
-    if e == 37 { return 114; }                 // EALREADY
-    if e == 38 { return 88; }                  // ENOTSOCK
-    if e == 48 { return 98; }                  // EADDRINUSE
-    if e == 49 { return 99; }                  // EADDRNOTAVAIL
-    if e == 54 { return 104; }                 // ECONNRESET
-    if e == 57 { return 107; }                 // ENOTCONN
-    if e == 60 { return 110; }                 // ETIMEDOUT
-    if e == 61 { return 111; }                 // ECONNREFUSED
-    if e == 62 { return 40; }                  // ELOOP
-    if e == 63 { return 36; }                  // ENAMETOOLONG
-    if e == 66 { return 39; }                  // ENOTEMPTY
-    if e == 78 { return 38; }                  // ENOSYS
-    return 5;                                  // EIO
+    if e == 11 {
+        return 35;
+    }  // EDEADLK
+    if e >= 1 && e <= 34 {
+        return e;
+    }
+    if e == 35 {
+        return 11;
+    }  // EAGAIN
+    if e == 36 {
+        return 115;
+    }  // EINPROGRESS
+    if e == 37 {
+        return 114;
+    }  // EALREADY
+    if e == 38 {
+        return 88;
+    }  // ENOTSOCK
+    if e == 48 {
+        return 98;
+    }  // EADDRINUSE
+    if e == 49 {
+        return 99;
+    }  // EADDRNOTAVAIL
+    if e == 54 {
+        return 104;
+    }  // ECONNRESET
+    if e == 57 {
+        return 107;
+    }  // ENOTCONN
+    if e == 60 {
+        return 110;
+    }  // ETIMEDOUT
+    if e == 61 {
+        return 111;
+    }  // ECONNREFUSED
+    if e == 62 {
+        return 40;
+    }  // ELOOP
+    if e == 63 {
+        return 36;
+    }  // ENAMETOOLONG
+    if e == 66 {
+        return 39;
+    }  // ENOTEMPTY
+    if e == 78 {
+        return 38;
+    }  // ENOSYS
+    return 5;  // EIO
 }
 
 fn pe_mac_errno_ret(r: i64) -> i64 {
@@ -289,7 +345,9 @@ fn pe_mac_errno_ret(r: i64) -> i64 {
     if r == 0 - 1 {
         var ep: i64 = pe_m(PE_M_ERROR, 0, 0, 0);
         var e: i64 = 5;
-        if ep != 0 { e = pe_ld(ep) & 0xFFFFFFFF; }
+        if ep != 0 {
+            e = pe_ld(ep) & 0xFFFFFFFF;
+        }
         return 0 - pe_mac_errno_linux(e);
     }
     return r;
@@ -302,7 +360,7 @@ fn pe_mac_errno_ret(r: i64) -> i64 {
 // listed keeps a DIR* (opened on a dup, so closedir does not close the
 // runtime's fd); 64 at a time.
 
-var pe_mac_dirs: i64 = 0;       // 64 x { fd + 1, DIR* }
+var pe_mac_dirs: i64 = 0;  // 64 x { fd + 1, DIR* }
 
 fn pe_mac_dir_for(fd: i64) -> i64 {
     if pe_mac_dirs == 0 {
@@ -311,13 +369,20 @@ fn pe_mac_dir_for(fd: i64) -> i64 {
     }
     var i: i64 = 0;
     while i < 64 {
-        if pe_ld(pe_mac_dirs + i * 16) == fd + 1 { return pe_ld(pe_mac_dirs + i * 16 + 8); }
+        if pe_ld(pe_mac_dirs + i * 16) == fd + 1 {
+            return pe_ld(pe_mac_dirs + i * 16 + 8);
+        }
         i = i + 1;
     }
     var d2: i64 = pe_m(PE_M_DUP, fd, 0, 0);
-    if d2 < 0 { return 0; }
+    if d2 < 0 {
+        return 0;
+    }
     var dirp: i64 = pe_m(PE_M_FDOPENDIR, d2, 0, 0);
-    if dirp == 0 { pe_m(PE_M_CLOSE, d2, 0, 0); return 0; }
+    if dirp == 0 {
+        pe_m(PE_M_CLOSE, d2, 0, 0);
+        return 0;
+    }
     i = 0;
     while i < 64 {
         if pe_ld(pe_mac_dirs + i * 16) == 0 {
@@ -332,7 +397,9 @@ fn pe_mac_dir_for(fd: i64) -> i64 {
 }
 
 fn pe_mac_dir_close(fd: i64) {
-    if pe_mac_dirs == 0 { return; }
+    if pe_mac_dirs == 0 {
+        return;
+    }
     var i: i64 = 0;
     while i < 64 {
         if pe_ld(pe_mac_dirs + i * 16) == fd + 1 {
@@ -347,17 +414,23 @@ fn pe_mac_dir_close(fd: i64) {
 
 fn pe_mac_getdents(fd: i64, buf: i64, count: i64) -> i64 {
     var dirp: i64 = pe_mac_dir_for(fd);
-    if dirp == 0 { return 0 - 9; }                                 // EBADF
+    if dirp == 0 {
+        return 0 - 9;
+    }  // EBADF
     var used: i64 = 0;
     while true {
         var pos: i64 = pe_m(PE_M_TELLDIR, dirp, 0, 0);
         var ent: i64 = pe_m(PE_M_READDIR, dirp, 0, 0);
-        if ent == 0 { return used; }
+        if ent == 0 {
+            return used;
+        }
         var namlen: i64 = pe_ldb(ent + 18) | (pe_ldb(ent + 19) << 8);
         var rl: i64 = (19 + namlen + 1 + 7) & (0 - 8);
         if used + rl > count {
             pe_m(PE_M_SEEKDIR, dirp, pos, 0);
-            if used == 0 { return 0 - 22; }                       // EINVAL: buffer too small
+            if used == 0 {
+                return 0 - 22;
+            }  // EINVAL: buffer too small
             return used;
         }
         var o: i64 = buf + used;
@@ -381,30 +454,70 @@ fn pe_mac_getdents(fd: i64, buf: i64, count: i64) -> i64 {
 // Linux and macOS agree on 1-6, 8, 9, 11, 13-15 and 21-28.
 
 fn pe_mac_sig_from_linux(s: i64) -> i64 {
-    if s == 7 { return 10; }       // SIGBUS
-    if s == 10 { return 30; }      // SIGUSR1
-    if s == 12 { return 31; }      // SIGUSR2
-    if s == 17 { return 20; }      // SIGCHLD
-    if s == 18 { return 19; }      // SIGCONT
-    if s == 19 { return 17; }      // SIGSTOP
-    if s == 20 { return 18; }      // SIGTSTP
-    if s == 23 { return 16; }      // SIGURG
-    if s == 29 { return 23; }      // SIGIO
-    if s == 31 { return 12; }      // SIGSYS
+    if s == 7 {
+        return 10;
+    }  // SIGBUS
+    if s == 10 {
+        return 30;
+    }  // SIGUSR1
+    if s == 12 {
+        return 31;
+    }  // SIGUSR2
+    if s == 17 {
+        return 20;
+    }  // SIGCHLD
+    if s == 18 {
+        return 19;
+    }  // SIGCONT
+    if s == 19 {
+        return 17;
+    }  // SIGSTOP
+    if s == 20 {
+        return 18;
+    }  // SIGTSTP
+    if s == 23 {
+        return 16;
+    }  // SIGURG
+    if s == 29 {
+        return 23;
+    }  // SIGIO
+    if s == 31 {
+        return 12;
+    }  // SIGSYS
     return s;
 }
 
 fn pe_mac_sig_to_linux(s: i64) -> i64 {
-    if s == 10 { return 7; }
-    if s == 30 { return 10; }
-    if s == 31 { return 12; }
-    if s == 20 { return 17; }
-    if s == 19 { return 18; }
-    if s == 17 { return 19; }
-    if s == 18 { return 20; }
-    if s == 16 { return 23; }
-    if s == 23 { return 29; }
-    if s == 12 { return 31; }
+    if s == 10 {
+        return 7;
+    }
+    if s == 30 {
+        return 10;
+    }
+    if s == 31 {
+        return 12;
+    }
+    if s == 20 {
+        return 17;
+    }
+    if s == 19 {
+        return 18;
+    }
+    if s == 17 {
+        return 19;
+    }
+    if s == 18 {
+        return 20;
+    }
+    if s == 16 {
+        return 23;
+    }
+    if s == 23 {
+        return 29;
+    }
+    if s == 12 {
+        return 31;
+    }
     return s;
 }
 
@@ -424,7 +537,9 @@ pub fn pe_mac_on_signal(sig: i64, info: i64, uc: i64) {
         return;
     }
     var addr: i64 = 0;
-    if info != 0 { addr = pe_ld(info + 24); }
+    if info != 0 {
+        addr = pe_ld(info + 24);
+    }
     if pe_mac_info != 0 {
         pe_zero(pe_mac_info, 128);
         pe_st(pe_mac_info + 16, addr);
@@ -440,9 +555,13 @@ pub fn pe_mac_on_signal(sig: i64, info: i64, uc: i64) {
 /// r8-r15, rip; arm64's the exception state (16) then x0-x28, fp, lr, sp,
 /// pc. One sample of the profiler (sys.fd pe_prof_tick_regs).
 fn pe_mac_prof_sample(uc: i64) {
-    if uc == 0 { return; }
+    if uc == 0 {
+        return;
+    }
     var mc: i64 = pe_ld(uc + 48);
-    if mc == 0 { return; }
+    if mc == 0 {
+        return;
+    }
     if nat_arch() == 3 {
         pe_prof_tick_regs(pe_ld(mc + 144), pe_ld(mc + 64), pe_ld(mc + 72), 0);
         return;
@@ -459,13 +578,20 @@ fn pe_mac_sigaction(sig: i64, act: i64) -> i64 {
     // 0x08000000 and 0x10000000). Translate into a temporary.
     var ma: i64 = pert_malloc(16);
     pe_zero(ma, 16);
-    pe_st(ma, pe_ld(act));                 // handler
+    pe_st(ma, pe_ld(act));  // handler
     var lf: i64 = pe_ld(act + 8);
-    var mf: i64 = 0x40;                    // SA_SIGINFO
-    if (lf & 0x08000000) != 0 { mf = mf | 1; }      // SA_ONSTACK
-    if (lf & 0x10000000) != 0 { mf = mf | 2; }      // SA_RESTART
+    var mf: i64 = 0x40;  // SA_SIGINFO
+    if (lf & 0x08000000) != 0 {
+        mf = mf | 1;
+    }  // SA_ONSTACK
+    if (lf & 0x10000000) != 0 {
+        mf = mf | 2;
+    }  // SA_RESTART
     var i: i64 = 0;
-    while i < 4 { pe_stb(ma + 12 + i, (mf >> (i * 8)) & 255); i = i + 1; }
+    while i < 4 {
+        pe_stb(ma + 12 + i, (mf >> (i * 8)) & 255);
+        i = i + 1;
+    }
     var r: i64 = pe_mac_errno_ret(pe_m(PE_M_SIGACTION, pe_mac_sig_from_linux(sig), ma, 0));
     pert_free(ma);
     return r;
@@ -475,13 +601,17 @@ fn pe_mac_sigaction(sig: i64, act: i64) -> i64 {
 /// flags int }; SS_DISABLE is 2 on Linux, 4 on macOS. The old stack is not
 /// reported (the runtime passes none).
 fn pe_mac_sigaltstack(ss: i64) -> i64 {
-    if ss == 0 { return 0; }
+    if ss == 0 {
+        return 0;
+    }
     var ms: i64 = pert_malloc(24);
     pe_zero(ms, 24);
     pe_st(ms, pe_ld(ss));
     pe_st(ms + 8, pe_ld(ss + 16));
     var fl: i64 = 0;
-    if (pe_ld(ss + 8) & 2) != 0 { fl = 4; }
+    if (pe_ld(ss + 8) & 2) != 0 {
+        fl = 4;
+    }
     pe_st(ms + 16, fl);
     var r: i64 = pe_mac_errno_ret(pe_m(PE_M_SIGALTSTACK, ms, 0, 0));
     pert_free(ms);
@@ -498,7 +628,9 @@ fn pe_mac_sigaltstack(ss: i64) -> i64 {
 /// frees it.
 fn pe_mac_sa(sa: i64, len: i64) -> i64 {
     var n: i64 = len;
-    if n < 16 { n = 16; }
+    if n < 16 {
+        n = 16;
+    }
     var t: i64 = pert_malloc(n);
     pe_zero(t, n);
     var i: i64 = 0;
@@ -507,7 +639,9 @@ fn pe_mac_sa(sa: i64, len: i64) -> i64 {
         i = i + 1;
     }
     var fam: i64 = pe_ldb(sa) | (pe_ldb(sa + 1) << 8);
-    if fam == 10 { fam = 30; }
+    if fam == 10 {
+        fam = 30;
+    }
     pe_stb(t, len & 255);
     pe_stb(t + 1, fam & 255);
     return t;
@@ -516,7 +650,10 @@ fn pe_mac_sa(sa: i64, len: i64) -> i64 {
 /// Store the low 32 bits of v at addr (a socklen_t, u32 on both systems).
 fn pe_mac_st32(addr: i64, v: i64) {
     var k: i64 = 0;
-    while k < 4 { pe_stb(addr + k, (v >> (k * 8)) & 255); k = k + 1; }
+    while k < 4 {
+        pe_stb(addr + k, (v >> (k * 8)) & 255);
+        k = k + 1;
+    }
 }
 
 /// MI16: the reverse of pe_mac_sa. t is a BSD sockaddr of tlen bytes the
@@ -527,22 +664,34 @@ fn pe_mac_st32(addr: i64, v: i64) {
 /// path) sit at the same offsets in both layouts; the family becomes a
 /// 16-bit Linux number (AF_INET6 30 -> 10).
 fn pe_mac_sa_back(t: i64, tlen: i64, sa: i64, lenp: i64) {
-    if sa == 0 || lenp == 0 { return; }
+    if sa == 0 || lenp == 0 {
+        return;
+    }
     var cap: i64 = pe_ld(lenp) & 0xFFFFFFFF;
     var n: i64 = tlen;
-    if n < 2 { n = 2; }
+    if n < 2 {
+        n = 2;
+    }
     var fam: i64 = pe_ldb(t + 1);
-    if fam == 30 { fam = 10; }
+    if fam == 30 {
+        fam = 10;
+    }
     var i: i64 = 2;
     while i < n && i < cap {
         pe_stb(sa + i, pe_ldb(t + i));
         i = i + 1;
     }
-    if cap >= 1 { pe_stb(sa, fam & 255); }
-    if cap >= 2 { pe_stb(sa + 1, (fam >> 8) & 255); }
+    if cap >= 1 {
+        pe_stb(sa, fam & 255);
+    }
+    if cap >= 2 {
+        pe_stb(sa + 1, (fam >> 8) & 255);
+    }
     var ln: i64 = n;
     // BSD AF_UNIX addresses are 106 bytes long, Linux's 110: same path
-    if fam == 1 && ln < 110 { ln = ln + 4; }
+    if fam == 1 && ln < 110 {
+        ln = ln + 4;
+    }
     pe_mac_st32(lenp, ln);
 }
 
@@ -552,13 +701,15 @@ fn pe_mac_recvfrom(fd: i64, buf: i64, n: i64, flags: i64, src: i64, lenp: i64) -
     if src == 0 || lenp == 0 {
         return pe_mac_errno_ret(nat_mac_call(PE_M_RECVFROM, fd, buf, n, pe_mac_msg(flags), 0, 0));
     }
-    var t: i64 = pert_malloc(136);          // sockaddr_storage (128) + its length
+    var t: i64 = pert_malloc(136);  // sockaddr_storage (128) + its length
     pe_zero(t, 136);
     pe_st(t + 128, 128);
     var r: i64 = pe_mac_errno_ret(nat_mac_call(PE_M_RECVFROM, fd, buf, n, pe_mac_msg(flags), t, t + 128));
     if r >= 0 {
         var tl: i64 = pe_ld(t + 128) & 0xFFFFFFFF;
-        if tl > 128 { tl = 128; }
+        if tl > 128 {
+            tl = 128;
+        }
         if tl == 0 {
             // a connected socket's peer is not reported: Linux says length 0
             pe_mac_st32(lenp, 0);
@@ -573,22 +724,42 @@ fn pe_mac_recvfrom(fd: i64, buf: i64, n: i64, flags: i64, src: i64, lenp: i64) -
 fn pe_mac_nosigpipe(s: i64) {
     var on: i64 = pert_malloc(8);
     pe_st(on, 1);
-    nat_mac_call(PE_M_SETSOCKOPT, s, 0xFFFF, 0x1022, on, 4, 0);   // SO_NOSIGPIPE
+    nat_mac_call(PE_M_SETSOCKOPT, s, 0xFFFF, 0x1022, on, 4, 0);  // SO_NOSIGPIPE
     pert_free(on);
 }
 
 /// A Linux SOL_SOCKET option name -> macOS (-1: none).
 fn pe_mac_sockopt(name: i64) -> i64 {
-    if name == 2 { return 4; }             // SO_REUSEADDR
-    if name == 4 { return 0x1007; }        // SO_ERROR
-    if name == 6 { return 0x20; }          // SO_BROADCAST
-    if name == 7 { return 0x1001; }        // SO_SNDBUF
-    if name == 8 { return 0x1002; }        // SO_RCVBUF
-    if name == 9 { return 8; }             // SO_KEEPALIVE
-    if name == 13 { return 0x80; }         // SO_LINGER
-    if name == 15 { return 0x200; }        // SO_REUSEPORT
-    if name == 20 { return 0x1006; }       // SO_RCVTIMEO
-    if name == 21 { return 0x1005; }       // SO_SNDTIMEO
+    if name == 2 {
+        return 4;
+    }  // SO_REUSEADDR
+    if name == 4 {
+        return 0x1007;
+    }  // SO_ERROR
+    if name == 6 {
+        return 0x20;
+    }  // SO_BROADCAST
+    if name == 7 {
+        return 0x1001;
+    }  // SO_SNDBUF
+    if name == 8 {
+        return 0x1002;
+    }  // SO_RCVBUF
+    if name == 9 {
+        return 8;
+    }  // SO_KEEPALIVE
+    if name == 13 {
+        return 0x80;
+    }  // SO_LINGER
+    if name == 15 {
+        return 0x200;
+    }  // SO_REUSEPORT
+    if name == 20 {
+        return 0x1006;
+    }  // SO_RCVTIMEO
+    if name == 21 {
+        return 0x1005;
+    }  // SO_SNDTIMEO
     return 0 - 1;
 }
 
@@ -600,9 +771,11 @@ fn pe_mac_sockopt_call(get: bool, fd: i64, level: i64, name: i64, val: i64, len:
     if level == 1 {
         lv = 0xFFFF;
         nm = pe_mac_sockopt(name);
-        if nm < 0 { return 0 - 92; }                             // ENOPROTOOPT
+        if nm < 0 {
+            return 0 - 92;
+        }  // ENOPROTOOPT
     } else if level == 41 && name == 26 {
-        nm = 27;                                                 // IPV6_V6ONLY
+        nm = 27;  // IPV6_V6ONLY
     }
     if !get {
         return pe_mac_errno_ret(nat_mac_call(PE_M_SETSOCKOPT, fd, lv, nm, val, len, 0));
@@ -613,7 +786,10 @@ fn pe_mac_sockopt_call(get: bool, fd: i64, level: i64, name: i64, val: i64, len:
         if e != 0 {
             var le: i64 = pe_mac_errno_linux(e);
             var k: i64 = 0;
-            while k < 4 { pe_stb(val + k, (le >> (k * 8)) & 255); k = k + 1; }
+            while k < 4 {
+                pe_stb(val + k, (le >> (k * 8)) & 255);
+                k = k + 1;
+            }
         }
     }
     return r;
@@ -623,23 +799,35 @@ fn pe_mac_sockopt_call(get: bool, fd: i64, level: i64, name: i64, val: i64, len:
 /// MSG_DONTWAIT 0x40 -> 0x80; MSG_OOB, MSG_PEEK the same.
 fn pe_mac_msg(f: i64) -> i64 {
     var m: i64 = f & 3;
-    if (f & 0x40) != 0 { m = m | 0x80; }
-    if (f & 0x100) != 0 { m = m | 0x40; }      // MSG_WAITALL
+    if (f & 0x40) != 0 {
+        m = m | 0x80;
+    }
+    if (f & 0x100) != 0 {
+        m = m | 0x40;
+    }  // MSG_WAITALL
     return m;
 }
 
 /// O_NONBLOCK and O_APPEND between the Linux and macOS fcntl values.
 fn pe_mac_fl_to(f: i64) -> i64 {
     var m: i64 = f & 3;
-    if (f & 2048) != 0 { m = m | 4; }
-    if (f & 1024) != 0 { m = m | 8; }
+    if (f & 2048) != 0 {
+        m = m | 4;
+    }
+    if (f & 1024) != 0 {
+        m = m | 8;
+    }
     return m;
 }
 
 fn pe_mac_fl_from(m: i64) -> i64 {
     var f: i64 = m & 3;
-    if (m & 4) != 0 { f = f | 2048; }
-    if (m & 8) != 0 { f = f | 1024; }
+    if (m & 4) != 0 {
+        f = f | 2048;
+    }
+    if (m & 8) != 0 {
+        f = f | 1024;
+    }
     return f;
 }
 
@@ -647,12 +835,14 @@ fn pe_mac_fl_from(m: i64) -> i64 {
 /// read from the stack, where nat_mac_call puts argument d, so arg goes in
 /// both c and d.
 fn pe_mac_fcntl(fd: i64, cmd: i64, arg: i64) -> i64 {
-    if cmd == 4 {                                                // F_SETFL
+    if cmd == 4 {  // F_SETFL
         var a: i64 = pe_mac_fl_to(arg);
         return pe_mac_errno_ret(nat_mac_call(PE_M_FCNTL, fd, 4, a, a, 0, 0));
     }
     var r: i64 = pe_mac_errno_ret(nat_mac_call(PE_M_FCNTL, fd, cmd, arg, arg, 0, 0));
-    if cmd == 3 && r >= 0 { return pe_mac_fl_from(r); }         // F_GETFL
+    if cmd == 3 && r >= 0 {
+        return pe_mac_fl_from(r);
+    }  // F_GETFL
     return r;
 }
 
@@ -660,12 +850,20 @@ fn pe_mac_fcntl(fd: i64, cmd: i64, arg: i64) -> i64 {
 /// bits) by fcntl; SO_NOSIGPIPE on every socket.
 fn pe_mac_socket(domain: i64, ty: i64, proto: i64) -> i64 {
     var d: i64 = domain;
-    if d == 10 { d = 30; }
+    if d == 10 {
+        d = 30;
+    }
     var s: i64 = pe_mac_errno_ret(pe_m(PE_M_SOCKET, d, ty & 15, proto));
-    if s < 0 { return s; }
+    if s < 0 {
+        return s;
+    }
     pe_mac_nosigpipe(s);
-    if (ty & 2048) != 0 { pe_mac_fcntl(s, 4, 2048); }
-    if (ty & 0x80000) != 0 { nat_mac_call(PE_M_FCNTL, s, 2, 1, 1, 0, 0); }  // FD_CLOEXEC
+    if (ty & 2048) != 0 {
+        pe_mac_fcntl(s, 4, 2048);
+    }
+    if (ty & 0x80000) != 0 {
+        nat_mac_call(PE_M_FCNTL, s, 2, 1, 1, 0, 0);
+    }  // FD_CLOEXEC
     return s;
 }
 
@@ -682,20 +880,28 @@ fn pe_mac_accept(fd: i64, addr: i64, len: i64, flags: i64) -> i64 {
         c = pe_mac_errno_ret(pe_m(PE_M_ACCEPT, fd, t, t + 128));
         if c >= 0 {
             var tl: i64 = pe_ld(t + 128) & 0xFFFFFFFF;
-            if tl > 128 { tl = 128; }
+            if tl > 128 {
+                tl = 128;
+            }
             pe_mac_sa_back(t, tl, addr, len);
         }
         pert_free(t);
     }
-    if c < 0 { return c; }
+    if c < 0 {
+        return c;
+    }
     pe_mac_nosigpipe(c);
-    if (flags & 2048) != 0 { pe_mac_fcntl(c, 4, 2048); }
+    if (flags & 2048) != 0 {
+        pe_mac_fcntl(c, 4, 2048);
+    }
     return c;
 }
 
 /// bind / connect / sendto with an address: the BSD layout of it.
 fn pe_mac_addr_call(k: i64, fd: i64, sa: i64, len: i64) -> i64 {
-    if sa == 0 { return pe_mac_errno_ret(pe_m(k, fd, 0, len)); }
+    if sa == 0 {
+        return pe_mac_errno_ret(pe_m(k, fd, 0, len));
+    }
     var t: i64 = pe_mac_sa(sa, len);
     var r: i64 = pe_mac_errno_ret(pe_m(k, fd, t, len));
     pert_free(t);
@@ -718,7 +924,9 @@ fn pe_mac_ppoll(fds: i64, n: i64, ts: i64) -> i64 {
     var ms: i64 = 0 - 1;
     if ts != 0 {
         ms = pe_ld(ts) * 1000 + (pe_ld(ts + 8) + 999999) / 1000000;
-        if ms > 2147483647 { ms = 2147483647; }
+        if ms > 2147483647 {
+            ms = 2147483647;
+        }
     }
     return pe_mac_errno_ret(pe_m(PE_M_POLL, fds, n, ms));
 }
@@ -734,24 +942,28 @@ fn pe_mac_ppoll(fds: i64, n: i64, ts: i64) -> i64 {
 // (pe_mac_efd_w). struct kevent (64-bit): { ident u64, filter i16,
 // flags u16, fflags u32, data i64, udata u64 }, 32 bytes.
 
-var pe_mac_efd_r: i64 = 0 - 1;     // the eventfd's read end (the fd it is)
-var pe_mac_efd_w: i64 = 0 - 1;     // its write end
+var pe_mac_efd_r: i64 = 0 - 1;  // the eventfd's read end (the fd it is)
+var pe_mac_efd_w: i64 = 0 - 1;  // its write end
 
 /// eventfd2: a non-blocking, close-on-exec pipe; its read end is the fd.
 /// One is all the reactor makes.
 fn pe_mac_eventfd() -> i64 {
-    if pe_mac_efd_r >= 0 { return 0 - 24; }                  // EMFILE
+    if pe_mac_efd_r >= 0 {
+        return 0 - 24;
+    }  // EMFILE
     var fds: i64 = pert_malloc(8);
     pe_st(fds, 0);
     var r: i64 = pe_mac_errno_ret(pe_m(PE_M_PIPE, fds, 0, 0));
     var w0: i64 = pe_ld(fds);
     pert_free(fds);
-    if r < 0 { return r; }
+    if r < 0 {
+        return r;
+    }
     var rd: i64 = w0 & 0xFFFFFFFF;
     var wr: i64 = (w0 >> 32) & 0xFFFFFFFF;
-    pe_mac_fcntl(rd, 4, 2048);                               // O_NONBLOCK
+    pe_mac_fcntl(rd, 4, 2048);  // O_NONBLOCK
     pe_mac_fcntl(wr, 4, 2048);
-    nat_mac_call(PE_M_FCNTL, rd, 2, 1, 1, 0, 0);             // FD_CLOEXEC
+    nat_mac_call(PE_M_FCNTL, rd, 2, 1, 1, 0, 0);  // FD_CLOEXEC
     nat_mac_call(PE_M_FCNTL, wr, 2, 1, 1, 0, 0);
     pe_mac_efd_r = rd;
     pe_mac_efd_w = wr;
@@ -761,7 +973,9 @@ fn pe_mac_eventfd() -> i64 {
 /// epoll_create1: a close-on-exec kqueue.
 fn pe_mac_epoll_create() -> i64 {
     var kq: i64 = pe_mac_errno_ret(pe_m(PE_M_KQUEUE, 0, 0, 0));
-    if kq >= 0 { nat_mac_call(PE_M_FCNTL, kq, 2, 1, 1, 0, 0); }
+    if kq >= 0 {
+        nat_mac_call(PE_M_FCNTL, kq, 2, 1, 1, 0, 0);
+    }
     return kq;
 }
 
@@ -769,7 +983,7 @@ fn pe_mac_epoll_create() -> i64 {
 fn pe_mac_kchange(kq: i64, fd: i64, filter: i64, flags: i64, udata: i64) -> i64 {
     var kev: i64 = pert_malloc(32);
     pe_st(kev, fd);
-    pe_st(kev + 8, (filter & 0xFFFF) | ((flags & 0xFFFF) << 16));   // fflags 0
+    pe_st(kev + 8, (filter & 0xFFFF) | ((flags & 0xFFFF) << 16));  // fflags 0
     pe_st(kev + 16, 0);
     pe_st(kev + 24, udata);
     var r: i64 = pe_mac_errno_ret(nat_mac_call(PE_M_KEVENT, kq, kev, 1, 0, 0, 0));
@@ -801,15 +1015,19 @@ fn pe_mac_epoll_ctl(kq: i64, op: i64, fd: i64, ev: i64) -> i64 {
         events = pe_mac_ep_events(ev);
         data = pe_mac_ep_data(ev);
     }
-    if (events & (1 | 8192)) != 0 {                          // EPOLLIN | EPOLLRDHUP
+    if (events & (1 | 8192)) != 0 {  // EPOLLIN | EPOLLRDHUP
         var r: i64 = pe_mac_kchange(kq, fd, 0 - 1, 1, data);  // EVFILT_READ, EV_ADD
-        if r < 0 { return r; }
+        if r < 0 {
+            return r;
+        }
     } else {
-        pe_mac_kchange(kq, fd, 0 - 1, 2, 0);                  // EV_DELETE
+        pe_mac_kchange(kq, fd, 0 - 1, 2, 0);  // EV_DELETE
     }
-    if (events & 4) != 0 {                                   // EPOLLOUT
-        var r2: i64 = pe_mac_kchange(kq, fd, 0 - 2, 1, data); // EVFILT_WRITE, EV_ADD
-        if r2 < 0 { return r2; }
+    if (events & 4) != 0 {  // EPOLLOUT
+        var r2: i64 = pe_mac_kchange(kq, fd, 0 - 2, 1, data);  // EVFILT_WRITE, EV_ADD
+        if r2 < 0 {
+            return r2;
+        }
     } else {
         pe_mac_kchange(kq, fd, 0 - 2, 2, 0);
     }
@@ -830,9 +1048,13 @@ fn pe_mac_stn(p: i64, v: i64, n: i64) {
 /// EVFILT_WRITE EPOLLOUT, EV_EOF adds EPOLLHUP (and EPOLLRDHUP on the
 /// read side), EV_ERROR EPOLLERR.
 fn pe_mac_epoll_wait(kq: i64, buf: i64, max: i64, ms: i64) -> i64 {
-    if max <= 0 { return 0 - 22; }                           // EINVAL
+    if max <= 0 {
+        return 0 - 22;
+    }  // EINVAL
     var n: i64 = max;
-    if n > 256 { n = 256; }
+    if n > 256 {
+        n = 256;
+    }
     var kevs: i64 = pert_malloc(n * 32);
     var ts: i64 = 0;
     if ms >= 0 {
@@ -845,16 +1067,24 @@ fn pe_mac_epoll_wait(kq: i64, buf: i64, max: i64, ms: i64) -> i64 {
     while i < k {
         var kv: i64 = kevs + i * 32;
         var w: i64 = pe_ld(kv + 8);
-        var filter: i64 = w & 0xFFFF;                        // 0xFFFF read, 0xFFFE write
+        var filter: i64 = w & 0xFFFF;  // 0xFFFF read, 0xFFFE write
         var flags: i64 = (w >> 16) & 0xFFFF;
         var events: i64 = 0;
-        if filter == 0xFFFF { events = 1; }                  // EPOLLIN
-        if filter == 0xFFFE { events = 4; }                  // EPOLLOUT
-        if (flags & 0x8000) != 0 {                           // EV_EOF
-            events = events | 16;                            // EPOLLHUP
-            if filter == 0xFFFF { events = events | 8192; }  // EPOLLRDHUP
+        if filter == 0xFFFF {
+            events = 1;
+        }  // EPOLLIN
+        if filter == 0xFFFE {
+            events = 4;
+        }  // EPOLLOUT
+        if (flags & 0x8000) != 0 {  // EV_EOF
+            events = events | 16;  // EPOLLHUP
+            if filter == 0xFFFF {
+                events = events | 8192;
+            }  // EPOLLRDHUP
         }
-        if (flags & 0x4000) != 0 { events = events | 8; }   // EV_ERROR: EPOLLERR
+        if (flags & 0x4000) != 0 {
+            events = events | 8;
+        }  // EV_ERROR: EPOLLERR
         var data: i64 = pe_ld(kv + 24);
         if nat_arch() == 3 {
             var e: i64 = buf + i * 12;
@@ -867,7 +1097,9 @@ fn pe_mac_epoll_wait(kq: i64, buf: i64, max: i64, ms: i64) -> i64 {
         i = i + 1;
     }
     pert_free(kevs);
-    if ts != 0 { pert_free(ts); }
+    if ts != 0 {
+        pert_free(ts);
+    }
     return k;
 }
 
@@ -876,16 +1108,20 @@ fn pe_mac_epoll_wait(kq: i64, buf: i64, max: i64, ms: i64) -> i64 {
 /// clone(SIGCHLD) with no shared memory is fork; threads come through
 /// nat_clone_thread (pe_mac_clone), not here.
 fn pe_mac_fork(flags: i64) -> i64 {
-    if (flags & 0x100) != 0 { return 0 - 38; }                  // CLONE_VM: no
+    if (flags & 0x100) != 0 {
+        return 0 - 38;
+    }  // CLONE_VM: no
     var pid: i64 = pe_mac_errno_ret(pe_m(PE_M_FORK, 0, 0, 0));
-    if pid == 0 { pe_mac_forked = true; }
+    if pid == 0 {
+        pe_mac_forked = true;
+    }
     return pid;
 }
 
 /// wait4(pid, status, options, rusage): the status word is the same
 /// (exit code << 8, or the signal: a macOS number, made a Linux one).
 fn pe_mac_wait4(pid: i64, status: i64, options: i64, ru: i64) -> i64 {
-    var o: i64 = options & 1;                                    // WNOHANG
+    var o: i64 = options & 1;  // WNOHANG
     var r: i64 = pe_mac_errno_ret(nat_mac_call(PE_M_WAIT4, pid, status, o, ru, 0, 0));
     if r > 0 && status != 0 {
         var st: i64 = pe_ld(status) & 0xFFFFFFFF;
@@ -893,7 +1129,10 @@ fn pe_mac_wait4(pid: i64, status: i64, options: i64, ru: i64) -> i64 {
         if sg != 0 && sg != 127 {
             st = (st & (0 - 128)) | pe_mac_sig_to_linux(sg);
             var k: i64 = 0;
-            while k < 4 { pe_stb(status + k, (st >> (k * 8)) & 255); k = k + 1; }
+            while k < 4 {
+                pe_stb(status + k, (st >> (k * 8)) & 255);
+                k = k + 1;
+            }
         }
     }
     return r;
@@ -905,7 +1144,9 @@ fn pe_mac_clock(clk: i64, ts: i64) -> i64 {
     // clock_gettime is in libSystem on macOS 10.12+. clk: 0 REALTIME, else
     // MONOTONIC (6 on macOS).
     var c: i64 = 0;
-    if clk != 0 && clk != 5 && clk != 8 { c = 6; }
+    if clk != 0 && clk != 5 && clk != 8 {
+        c = 6;
+    }
     return pe_m(PE_M_CLOCK_GETTIME, c, ts, 0);
 }
 
@@ -915,15 +1156,19 @@ fn pe_mac_clock(clk: i64, ts: i64) -> i64 {
 
 fn pe_mac_futex(addr: i64, op: i64, val: i64, ts: i64) -> i64 {
     var cmd: i64 = op & 127;
-    if cmd == 0 || cmd == 9 {                                 // WAIT
-        var us: i64 = 0;                                      // 0 = no timeout
-        if ts != 0 { us = pe_ld(ts) * 1000000 + pe_ld(ts + 8) / 1000; }
+    if cmd == 0 || cmd == 9 {  // WAIT
+        var us: i64 = 0;  // 0 = no timeout
+        if ts != 0 {
+            us = pe_ld(ts) * 1000000 + pe_ld(ts + 8) / 1000;
+        }
         nat_mac_call(PE_M_ULOCK_WAIT, 1, addr, val & 0xFFFFFFFF, us, 0, 0);
         return 0;
     }
-    if cmd == 1 || cmd == 10 {                                // WAKE
+    if cmd == 1 || cmd == 10 {  // WAKE
         var o: i64 = 1;
-        if val != 1 { o = 1 | 0x100; }                        // ULF_WAKE_ALL
+        if val != 1 {
+            o = 1 | 0x100;
+        }  // ULF_WAKE_ALL
         nat_mac_call(PE_M_ULOCK_WAKE, o, addr, 0, 0, 0, 0);
         return 0;
     }
@@ -940,7 +1185,9 @@ fn pe_mac_cpus() -> i64 {
     var n: i64 = pe_ld(out) & 0xFFFFFFFF;
     pert_free(out);
     pert_free(sz);
-    if n < 1 { n = 1; }
+    if n < 1 {
+        n = 1;
+    }
     return n;
 }
 
@@ -953,7 +1200,9 @@ fn pe_mac_sysctl(name: str, out: i64, max: i64) -> i64 {
     var r: i64 = nat_mac_call(PE_M_SYSCTLBYNAME, name as i64, out, sz, 0, 0, 0);
     var got: i64 = pe_ld(sz);
     pert_free(sz);
-    if r != 0 { return 0 - 1; }
+    if r != 0 {
+        return 0 - 1;
+    }
     return got;
 }
 
@@ -962,8 +1211,12 @@ fn pe_mac_sysctl_int(name: str, dflt: i64) -> i64 {
     var out: i64 = pert_malloc(8);
     var got: i64 = pe_mac_sysctl(name, out, 8);
     var v: i64 = dflt;
-    if got == 4 { v = pe_ld(out) & 0xFFFFFFFF; }
-    if got == 8 { v = pe_ld(out); }
+    if got == 4 {
+        v = pe_ld(out) & 0xFFFFFFFF;
+    }
+    if got == 8 {
+        v = pe_ld(out);
+    }
     pert_free(out);
     return v;
 }
@@ -978,17 +1231,23 @@ fn pe_mac_sysctl_int(name: str, dflt: i64) -> i64 {
 /// bufferram and procs have no macOS counterpart and stay 0; mem_unit is 1
 /// (the sizes are bytes).
 fn pe_mac_sysinfo(si: i64) -> i64 {
-    if si == 0 { return 0 - 14; }                             // EFAULT
+    if si == 0 {
+        return 0 - 14;
+    }  // EFAULT
     pe_zero(si, 112);
     var b: i64 = pert_malloc(64);
     var total: i64 = pe_mac_sysctl_int("hw.memsize", 0);
     var pg: i64 = pe_mac_sysctl_int("hw.pagesize", 4096);
-    if pg <= 0 { pg = 4096; }
+    if pg <= 0 {
+        pg = 4096;
+    }
     var freep: i64 = pe_mac_sysctl_int("vm.page_free_count", 0);
     freep = freep + pe_mac_sysctl_int("vm.page_speculative_count", 0);
     pe_st(si + 32, total);
     var fr: i64 = freep * pg;
-    if total > 0 && fr > total { fr = total; }
+    if total > 0 && fr > total {
+        fr = total;
+    }
     pe_st(si + 40, fr);
     // uptime: now - boot (struct timeval: seconds first)
     if pe_mac_sysctl("kern.boottime", b, 16) >= 8 {
@@ -996,7 +1255,9 @@ fn pe_mac_sysinfo(si: i64) -> i64 {
         pe_zero(b + 16, 16);
         pe_m(PE_M_CLOCK_GETTIME, 0, b + 16, 0);
         var up: i64 = pe_ld(b + 16) - boot;
-        if up > 0 { pe_st(si, up); }
+        if up > 0 {
+            pe_st(si, up);
+        }
     }
     // struct loadavg { fixpt_t ldavg[3]; long fscale; }
     if pe_mac_sysctl("vm.loadavg", b, 24) >= 24 {
@@ -1034,18 +1295,22 @@ fn pe_mac_affinity(size: i64, mask: i64) -> i64 {
 /// Every system call of the shared runtime (generic Linux numbers), on
 /// macOS through libSystem.
 pub fn pe_mac_syscall(n: i64, a: i64, b: i64, c: i64, d: i64, e: i64, f: i64) -> i64 {
-    if n == 63 { return pe_mac_errno_ret(pe_m(PE_M_READ, a, b, c)); }         // read
-    if n == 64 {                                                             // write
+    if n == 63 {
+        return pe_mac_errno_ret(pe_m(PE_M_READ, a, b, c));
+    }  // read
+    if n == 64 {  // write
         // the eventfd (a pipe): written at its other end
-        if a >= 0 && a == pe_mac_efd_r { return pe_mac_errno_ret(pe_m(PE_M_WRITE, pe_mac_efd_w, b, c)); }
+        if a >= 0 && a == pe_mac_efd_r {
+            return pe_mac_errno_ret(pe_m(PE_M_WRITE, pe_mac_efd_w, b, c));
+        }
         return pe_mac_errno_ret(pe_m(PE_M_WRITE, a, b, c));
     }
-    if n == 56 {                                                             // openat
+    if n == 56 {  // openat
         // openat(AT_FDCWD=-2, path, macOS flags, mode)
         var fd: i64 = nat_mac_call(PE_M_OPEN, 0 - 2, b, pe_mac_oflags(c), d, 0, 0);
         return pe_mac_errno_ret(fd);
     }
-    if n == 57 {                                                             // close
+    if n == 57 {  // close
         pe_mac_dir_close(a);
         if a >= 0 && a == pe_mac_efd_r {
             pe_m(PE_M_CLOSE, pe_mac_efd_w, 0, 0);
@@ -1054,70 +1319,141 @@ pub fn pe_mac_syscall(n: i64, a: i64, b: i64, c: i64, d: i64, e: i64, f: i64) ->
         }
         return pe_mac_errno_ret(pe_m(PE_M_CLOSE, a, 0, 0));
     }
-    if n == 62 { return pe_mac_errno_ret(pe_m(PE_M_LSEEK, a, b, c)); }        // lseek
-    if n == 79 { return pe_mac_stat(b, c); }                                 // newfstatat
-    if n == 61 { return pe_mac_getdents(a, b, c); }                          // getdents64
-    if n == 35 {                                                             // unlinkat
+    if n == 62 {
+        return pe_mac_errno_ret(pe_m(PE_M_LSEEK, a, b, c));
+    }  // lseek
+    if n == 79 {
+        return pe_mac_stat(b, c);
+    }  // newfstatat
+    if n == 61 {
+        return pe_mac_getdents(a, b, c);
+    }  // getdents64
+    if n == 35 {  // unlinkat
         return pe_mac_errno_ret(nat_mac_call(PE_M_UNLINKAT, 0 - 2, b, c, 0, 0, 0));
     }
-    if n == 34 {                                                             // mkdirat
+    if n == 34 {  // mkdirat
         return pe_mac_errno_ret(nat_mac_call(PE_M_MKDIRAT, 0 - 2, b, c, 0, 0, 0));
     }
-    if n == 276 || n == 38 {                                                 // renameat2 / renameat
+    if n == 276 || n == 38 {  // renameat2 / renameat
         return pe_mac_errno_ret(nat_mac_call(PE_M_RENAMEAT, 0 - 2, b, 0 - 2, d, 0, 0));
     }
-    if n == 222 && (d & 16) != 0 {                                           // mmap MAP_FIXED
+    if n == 222 && (d & 16) != 0 {  // mmap MAP_FIXED
         // RT7 (base.fd pe_decommit): fresh zero pages over [a, a + b);
         // macOS MAP_FIXED 0x10 | MAP_ANON 0x1000 | MAP_PRIVATE 0x2
         var fa: i64 = nat_mac_call(PE_M_MMAP, a, b, 3, 0x1012, 0 - 1, 0);
-        if fa == 0 - 1 { return 0 - 12; }
+        if fa == 0 - 1 {
+            return 0 - 12;
+        }
         return fa;
     }
-    if n == 222 { return pe_mac_mmap(b); }                                   // mmap
-    if n == 215 { return pe_m(PE_M_MUNMAP, a, b, 0); }                       // munmap
-    if n == 226 { return pe_mac_mprotect(a, b, c); }                        // mprotect
-    if n == 113 { return pe_mac_clock(a, b); }                              // clock_gettime
-    if n == 101 { return pe_mac_errno_ret(pe_m(PE_M_NANOSLEEP, a, b, 0)); } // nanosleep (-EINTR: the rest in b)
-    if n == 124 { pe_m(PE_M_SCHED_YIELD, 0, 0, 0); return 0; }              // sched_yield
-    if n == 123 { return pe_mac_affinity(b, c); }                          // sched_getaffinity
-    if n == 172 { return pe_m(PE_M_GETPID, 0, 0, 0); }                     // getpid
-    if n == 178 { return pe_m(PE_M_GETPID, 0, 0, 0); }                     // gettid ~ pid
-    if n == 173 { return pe_m(PE_M_GETPPID, 0, 0, 0); }                    // getppid
-    if n == 174 || n == 175 { return pe_m(PE_M_GETUID, 0, 0, 0); }         // getuid / geteuid
-    if n == 176 || n == 177 { return pe_m(PE_M_GETGID, 0, 0, 0); }         // getgid / getegid
-    if n == 278 {                                                           // getrandom
-        pe_m(PE_M_ARC4RANDOM, a, b, 0);                                     // arc4random_buf(buf, n)
+    if n == 222 {
+        return pe_mac_mmap(b);
+    }  // mmap
+    if n == 215 {
+        return pe_m(PE_M_MUNMAP, a, b, 0);
+    }  // munmap
+    if n == 226 {
+        return pe_mac_mprotect(a, b, c);
+    }  // mprotect
+    if n == 113 {
+        return pe_mac_clock(a, b);
+    }  // clock_gettime
+    if n == 101 {
+        return pe_mac_errno_ret(pe_m(PE_M_NANOSLEEP, a, b, 0));
+    }  // nanosleep (-EINTR: the rest in b)
+    if n == 124 {
+        pe_m(PE_M_SCHED_YIELD, 0, 0, 0);
+        return 0;
+    }  // sched_yield
+    if n == 123 {
+        return pe_mac_affinity(b, c);
+    }  // sched_getaffinity
+    if n == 172 {
+        return pe_m(PE_M_GETPID, 0, 0, 0);
+    }  // getpid
+    if n == 178 {
+        return pe_m(PE_M_GETPID, 0, 0, 0);
+    }  // gettid ~ pid
+    if n == 173 {
+        return pe_m(PE_M_GETPPID, 0, 0, 0);
+    }  // getppid
+    if n == 174 || n == 175 {
+        return pe_m(PE_M_GETUID, 0, 0, 0);
+    }  // getuid / geteuid
+    if n == 176 || n == 177 {
+        return pe_m(PE_M_GETGID, 0, 0, 0);
+    }  // getgid / getegid
+    if n == 278 {  // getrandom
+        pe_m(PE_M_ARC4RANDOM, a, b, 0);  // arc4random_buf(buf, n)
         return b;
     }
-    if n == 93 || n == 94 {                                                 // exit / exit_group
+    if n == 93 || n == 94 {  // exit / exit_group
         // a forked child (exec failed) must not run the parent's atexit
         // work: _exit
-        if pe_mac_forked { pe_m(PE_M__EXIT, a, 0, 0); }
+        if pe_mac_forked {
+            pe_m(PE_M__EXIT, a, 0, 0);
+        }
         pe_m(PE_M_EXIT, a, 0, 0);
         return 0;
     }
-    if n == 98 { return pe_mac_futex(a, b, c, d); }                        // futex
-    if n == 134 {                                                           // rt_sigaction
-        if b != 0 { pe_mac_sigaction(a, b); }
+    if n == 98 {
+        return pe_mac_futex(a, b, c, d);
+    }  // futex
+    if n == 134 {  // rt_sigaction
+        if b != 0 {
+            pe_mac_sigaction(a, b);
+        }
         return 0;
     }
-    if n == 132 { return pe_mac_sigaltstack(a); }                          // sigaltstack
-    if n == 103 { return pe_mac_errno_ret(pe_m(PE_M_SETITIMER, a, b, c)); } // setitimer (timeval: usec an int, padded)
-    if n == 198 { return pe_mac_socket(a, b, c); }                         // socket
-    if n == 200 { return pe_mac_addr_call(PE_M_BIND, a, b, c); }           // bind
-    if n == 203 { return pe_mac_addr_call(PE_M_CONNECT, a, b, c); }        // connect
-    if n == 201 { return pe_mac_errno_ret(pe_m(PE_M_LISTEN, a, b, 0)); }   // listen
-    if n == 202 { return pe_mac_accept(a, b, c, 0); }                      // accept
-    if n == 242 { return pe_mac_accept(a, b, c, d); }                      // accept4
-    if n == 206 { return pe_mac_sendto(a, b, c, d, e, f); }                // sendto
-    if n == 207 { return pe_mac_recvfrom(a, b, c, d, e, f); }              // recvfrom
-    if n == 208 { return pe_mac_sockopt_call(false, a, b, c, d, e); }      // setsockopt
-    if n == 209 { return pe_mac_sockopt_call(true, a, b, c, d, e); }       // getsockopt
-    if n == 73 { return pe_mac_ppoll(a, b, c); }                           // ppoll
-    if n == 220 { return pe_mac_fork(a); }                                 // clone: fork
-    if n == 221 { return pe_mac_errno_ret(pe_m(PE_M_EXECVE, a, b, c)); }   // execve
-    if n == 260 { return pe_mac_wait4(a, b, c, d); }                       // wait4
-    if n == 129 || n == 131 {                                              // kill / tgkill
+    if n == 132 {
+        return pe_mac_sigaltstack(a);
+    }  // sigaltstack
+    if n == 103 {
+        return pe_mac_errno_ret(pe_m(PE_M_SETITIMER, a, b, c));
+    }  // setitimer (timeval: usec an int, padded)
+    if n == 198 {
+        return pe_mac_socket(a, b, c);
+    }  // socket
+    if n == 200 {
+        return pe_mac_addr_call(PE_M_BIND, a, b, c);
+    }  // bind
+    if n == 203 {
+        return pe_mac_addr_call(PE_M_CONNECT, a, b, c);
+    }  // connect
+    if n == 201 {
+        return pe_mac_errno_ret(pe_m(PE_M_LISTEN, a, b, 0));
+    }  // listen
+    if n == 202 {
+        return pe_mac_accept(a, b, c, 0);
+    }  // accept
+    if n == 242 {
+        return pe_mac_accept(a, b, c, d);
+    }  // accept4
+    if n == 206 {
+        return pe_mac_sendto(a, b, c, d, e, f);
+    }  // sendto
+    if n == 207 {
+        return pe_mac_recvfrom(a, b, c, d, e, f);
+    }  // recvfrom
+    if n == 208 {
+        return pe_mac_sockopt_call(false, a, b, c, d, e);
+    }  // setsockopt
+    if n == 209 {
+        return pe_mac_sockopt_call(true, a, b, c, d, e);
+    }  // getsockopt
+    if n == 73 {
+        return pe_mac_ppoll(a, b, c);
+    }  // ppoll
+    if n == 220 {
+        return pe_mac_fork(a);
+    }  // clone: fork
+    if n == 221 {
+        return pe_mac_errno_ret(pe_m(PE_M_EXECVE, a, b, c));
+    }  // execve
+    if n == 260 {
+        return pe_mac_wait4(a, b, c, d);
+    }  // wait4
+    if n == 129 || n == 131 {  // kill / tgkill
         // kill(pid, sig) goes to that process (AD4: process_kill of a
         // child); tgkill (raise) to this one
         var ksig: i64 = c;
@@ -1128,11 +1464,23 @@ pub fn pe_mac_syscall(n: i64, a: i64, b: i64, c: i64, d: i64, e: i64, f: i64) ->
         }
         return pe_mac_errno_ret(pe_m(PE_M_KILL, kpid, pe_mac_sig_from_linux(ksig), 0));
     }
-    if n == 179 { return pe_mac_sysinfo(a); }                              // sysinfo
-    if n == 25 { return pe_mac_fcntl(a, b, c); }                           // fcntl
-    if n == 19 { return pe_mac_eventfd(); }                                // eventfd2
-    if n == 20 { return pe_mac_epoll_create(); }                           // epoll_create1
-    if n == 21 { return pe_mac_epoll_ctl(a, b, c, d); }                    // epoll_ctl
-    if n == 22 { return pe_mac_epoll_wait(a, b, c, d); }                   // epoll_pwait
-    return 0 - 38;                                                          // ENOSYS
+    if n == 179 {
+        return pe_mac_sysinfo(a);
+    }  // sysinfo
+    if n == 25 {
+        return pe_mac_fcntl(a, b, c);
+    }  // fcntl
+    if n == 19 {
+        return pe_mac_eventfd();
+    }  // eventfd2
+    if n == 20 {
+        return pe_mac_epoll_create();
+    }  // epoll_create1
+    if n == 21 {
+        return pe_mac_epoll_ctl(a, b, c, d);
+    }  // epoll_ctl
+    if n == 22 {
+        return pe_mac_epoll_wait(a, b, c, d);
+    }  // epoll_pwait
+    return 0 - 38;  // ENOSYS
 }

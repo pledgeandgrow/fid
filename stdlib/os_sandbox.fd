@@ -35,7 +35,7 @@
 //   val verdict: i64 = bpf_run(& prog, SB_ARCH_X86_64, sb_call_x64("read"), args0());
 
 module os_sandbox;
- use vec;
+use vec;
 
 // ─── classic BPF opcodes (linux/bpf_common.h) ───────────────────────────
 
@@ -87,16 +87,28 @@ pub struct BpfInsn {
 }
 
 pub fn bpf(code: i64, jt: i64, jf: i64, k: i64) -> BpfInsn {
-    return BpfInsn { code: code, jt: jt, jf: jf, k: k };
+    return BpfInsn {
+        code: code, jt: jt, jf: jf, k: k
+    };
 }
 
 /// A verdict value (the 32-bit seccomp return) from a policy verdict code.
 pub fn sb_ret(verdict: i64) -> i64 {
-    if verdict == SB_VERDICT_ALLOW { return SB_RET_ALLOW; }
-    if verdict == SB_VERDICT_KILL { return SB_RET_KILL_PROCESS; }
-    if verdict == SB_VERDICT_TRAP { return SB_RET_TRAP; }
-    if verdict == SB_VERDICT_LOG { return SB_RET_LOG; }
-    if verdict == SB_VERDICT_NOTIFY { return SB_RET_USER_NOTIF; }
+    if verdict == SB_VERDICT_ALLOW {
+        return SB_RET_ALLOW;
+    }
+    if verdict == SB_VERDICT_KILL {
+        return SB_RET_KILL_PROCESS;
+    }
+    if verdict == SB_VERDICT_TRAP {
+        return SB_RET_TRAP;
+    }
+    if verdict == SB_VERDICT_LOG {
+        return SB_RET_LOG;
+    }
+    if verdict == SB_VERDICT_NOTIFY {
+        return SB_RET_USER_NOTIF;
+    }
     if verdict >= SB_VERDICT_ERRNO {
         return SB_RET_ERRNO | ((verdict - SB_VERDICT_ERRNO) & SB_RET_DATA);
     }
@@ -124,22 +136,30 @@ pub struct BpfPolicy {
 }
 
 pub fn bpf_policy_new(default_verdict: i64) -> BpfPolicy {
-    return BpfPolicy { rules: Vec::new(), default_verdict: default_verdict, kill_x32: true };
+    return BpfPolicy {
+        rules: Vec::new(), default_verdict: default_verdict, kill_x32: true
+    };
 }
 
 /// Allow one call number.
-pub fn bpf_allow(p: & mut BpfPolicy, nr: i64) {
-    p.rules.push(BpfRule { nr: nr, verdict: SB_VERDICT_ALLOW, has_arg: false, arg_index: 0, arg_value: 0 });
+pub fn bpf_allow(p: &mut BpfPolicy, nr: i64) {
+    p.rules.push(BpfRule {
+        nr: nr, verdict: SB_VERDICT_ALLOW, has_arg: false, arg_index: 0, arg_value: 0
+    });
 }
 
 /// Allow one call only when argument `idx` (0..5) equals `value`.
-pub fn bpf_allow_arg(p: & mut BpfPolicy, nr: i64, idx: i64, value: i64) {
-    p.rules.push(BpfRule { nr: nr, verdict: SB_VERDICT_ALLOW, has_arg: true, arg_index: idx, arg_value: value });
+pub fn bpf_allow_arg(p: &mut BpfPolicy, nr: i64, idx: i64, value: i64) {
+    p.rules.push(BpfRule {
+        nr: nr, verdict: SB_VERDICT_ALLOW, has_arg: true, arg_index: idx, arg_value: value
+    });
 }
 
 /// Give one call number a specific verdict (e.g. SB_VERDICT_ERRNO + 1).
-pub fn bpf_rule(p: & mut BpfPolicy, nr: i64, verdict: i64) {
-    p.rules.push(BpfRule { nr: nr, verdict: verdict, has_arg: false, arg_index: 0, arg_value: 0 });
+pub fn bpf_rule(p: &mut BpfPolicy, nr: i64, verdict: i64) {
+    p.rules.push(BpfRule {
+        nr: nr, verdict: verdict, has_arg: false, arg_index: 0, arg_value: 0
+    });
 }
 
 // ─── compilation to instructions ────────────────────────────────────────
@@ -147,7 +167,7 @@ pub fn bpf_rule(p: & mut BpfPolicy, nr: i64, verdict: i64) {
 /// The program as a list of instructions. Shape: load arch; if arch != the
 /// target, default; (x86-64) load nr; if nr >= 0x40000000 and kill_x32,
 /// default; load nr; per rule a compare that returns its verdict; default.
-pub fn bpf_assemble(p: & BpfPolicy, arch: i64) -> Vec<BpfInsn> {
+pub fn bpf_assemble(p: &BpfPolicy, arch: i64) -> Vec<BpfInsn> {
     var out: Vec<BpfInsn> = Vec::new();
     val def: i64 = sb_ret(p.default_verdict);
     // load arch, reject a foreign one
@@ -183,7 +203,7 @@ pub fn bpf_assemble(p: & BpfPolicy, arch: i64) -> Vec<BpfInsn> {
     return out;
 }
 
-fn sb_put32le(o: & mut Vec<i64>, v: i64) {
+fn sb_put32le(o: &mut Vec<i64>, v: i64) {
     o.push(v & 255);
     o.push((v >> 8) & 255);
     o.push((v >> 16) & 255);
@@ -191,7 +211,7 @@ fn sb_put32le(o: & mut Vec<i64>, v: i64) {
 }
 
 /// Encode instructions as struct sock_filter bytes (8 bytes each).
-pub fn bpf_encode(prog: & Vec<BpfInsn>) -> Vec<i64> {
+pub fn bpf_encode(prog: &Vec<BpfInsn>) -> Vec<i64> {
     var o: Vec<i64> = Vec::new();
     var i: i64 = 0;
     while i < prog.len() {
@@ -200,19 +220,19 @@ pub fn bpf_encode(prog: & Vec<BpfInsn>) -> Vec<i64> {
         o.push((in.code >> 8) & 255);
         o.push(in.jt & 255);
         o.push(in.jf & 255);
-        sb_put32le(& mut o, in.k & 0xFFFFFFFF);
+        sb_put32le(&mut o, in.k & 0xFFFFFFFF);
         i = i + 1;
     }
     return o;
 }
 
 /// Compile a policy straight to sock_filter bytes.
-pub fn bpf_compile(p: & BpfPolicy, arch: i64) -> Vec<i64> {
-    return bpf_encode(& bpf_assemble(p, arch));
+pub fn bpf_compile(p: &BpfPolicy, arch: i64) -> Vec<i64> {
+    return bpf_encode(&bpf_assemble(p, arch));
 }
 
 /// Decode sock_filter bytes back to instructions.
-pub fn bpf_decode(b: & Vec<i64>) -> Vec<BpfInsn> {
+pub fn bpf_decode(b: &Vec<i64>) -> Vec<BpfInsn> {
     var out: Vec<BpfInsn> = Vec::new();
     var i: i64 = 0;
     while i + 8 <= b.len() {
@@ -225,7 +245,7 @@ pub fn bpf_decode(b: & Vec<i64>) -> Vec<BpfInsn> {
 }
 
 /// The number of instructions a policy compiles to.
-pub fn bpf_len(p: & BpfPolicy, arch: i64) -> i64 {
+pub fn bpf_len(p: &BpfPolicy, arch: i64) -> i64 {
     return bpf_assemble(p, arch).len();
 }
 
@@ -234,7 +254,12 @@ pub fn bpf_len(p: & BpfPolicy, arch: i64) -> i64 {
 /// The six arguments of a call as a Vec (index 0..5).
 pub fn sb_args(a0: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64) -> Vec<i64> {
     var v: Vec<i64> = Vec::new();
-    v.push(a0); v.push(a1); v.push(a2); v.push(a3); v.push(a4); v.push(a5);
+    v.push(a0);
+    v.push(a1);
+    v.push(a2);
+    v.push(a3);
+    v.push(a4);
+    v.push(a5);
     return v;
 }
 
@@ -243,7 +268,7 @@ pub fn sb_args0() -> Vec<i64> {
     return sb_args(0, 0, 0, 0, 0, 0);
 }
 
-fn sb_field(nr: i64, arch: i64, args: & Vec<i64>, off: i64) -> i64 {
+fn sb_field(nr: i64, arch: i64, args: &Vec<i64>, off: i64) -> i64 {
     if off == SB_OFF_NR {
         return nr & 0xFFFFFFFF;
     }
@@ -271,7 +296,7 @@ fn sb_u32(x: i64) -> i64 {
 
 /// Run an encoded program (sock_filter bytes) over one record; returns the
 /// 32-bit seccomp verdict the program would produce for it.
-pub fn bpf_run(prog_bytes: & Vec<i64>, arch: i64, nr: i64, args: Vec<i64>) -> i64 {
+pub fn bpf_run(prog_bytes: &Vec<i64>, arch: i64, nr: i64, args: Vec<i64>) -> i64 {
     val prog: Vec<BpfInsn> = bpf_decode(prog_bytes);
     var acc: i64 = 0;
     var pc: i64 = 0;
@@ -281,7 +306,7 @@ pub fn bpf_run(prog_bytes: & Vec<i64>, arch: i64, nr: i64, args: Vec<i64>) -> i6
         steps = steps + 1;
         val cls: i64 = ins.code & 7;
         if cls == BPF_LD {
-            acc = sb_field(nr, arch, & args, ins.k);
+            acc = sb_field(nr, arch, &args, ins.k);
             pc = pc + 1;
         } else if cls == BPF_RET {
             return ins.k & 0xFFFFFFFF;
@@ -313,80 +338,138 @@ pub fn sb_verdict_name(ret: i64) -> str {
     if (ret & 0x80000000) != 0 && action == 0 {
         return "KILL_PROCESS";
     }
-    if ret == SB_RET_KILL_THREAD { return "KILL_THREAD"; }
-    if action == SB_RET_TRAP { return "TRAP"; }
-    if action == SB_RET_ERRNO { return "ERRNO " + int_to_str(ret & SB_RET_DATA); }
-    if ret == SB_RET_USER_NOTIF { return "USER_NOTIF"; }
-    if action == (SB_RET_TRACE & 0x7FFF0000) { return "TRACE"; }
-    if ret == SB_RET_LOG { return "LOG"; }
-    if ret == SB_RET_ALLOW { return "ALLOW"; }
+    if ret == SB_RET_KILL_THREAD {
+        return "KILL_THREAD";
+    }
+    if action == SB_RET_TRAP {
+        return "TRAP";
+    }
+    if action == SB_RET_ERRNO {
+        return "ERRNO " + int_to_str(ret & SB_RET_DATA);
+    }
+    if ret == SB_RET_USER_NOTIF {
+        return "USER_NOTIF";
+    }
+    if action == (SB_RET_TRACE & 0x7FFF0000) {
+        return "TRACE";
+    }
+    if ret == SB_RET_LOG {
+        return "LOG";
+    }
+    if ret == SB_RET_ALLOW {
+        return "ALLOW";
+    }
     return "KILL_PROCESS";
 }
 
 // ─── call-number tables (a common subset; x86-64 and aarch64) ───────────
 
-fn sb_pair(names: & mut Vec<str>, nums: & mut Vec<i64>, n: str, v: i64) {
+fn sb_pair(names: &mut Vec<str>, nums: &mut Vec<i64>, n: str, v: i64) {
     names.push(n);
     nums.push(v);
 }
 
-fn sb_x64_tab(names: & mut Vec<str>, nums: & mut Vec<i64>) {
-    sb_pair(names, nums, "read", 0); sb_pair(names, nums, "write", 1);
-    sb_pair(names, nums, "open", 2); sb_pair(names, nums, "close", 3);
-    sb_pair(names, nums, "stat", 4); sb_pair(names, nums, "fstat", 5);
-    sb_pair(names, nums, "lstat", 6); sb_pair(names, nums, "poll", 7);
-    sb_pair(names, nums, "lseek", 8); sb_pair(names, nums, "mmap", 9);
-    sb_pair(names, nums, "mprotect", 10); sb_pair(names, nums, "munmap", 11);
-    sb_pair(names, nums, "brk", 12); sb_pair(names, nums, "rt_sigaction", 13);
-    sb_pair(names, nums, "rt_sigprocmask", 14); sb_pair(names, nums, "ioctl", 16);
-    sb_pair(names, nums, "pread64", 17); sb_pair(names, nums, "pwrite64", 18);
-    sb_pair(names, nums, "readv", 19); sb_pair(names, nums, "writev", 20);
-    sb_pair(names, nums, "access", 21); sb_pair(names, nums, "pipe", 22);
-    sb_pair(names, nums, "select", 23); sb_pair(names, nums, "dup", 32);
-    sb_pair(names, nums, "dup2", 33); sb_pair(names, nums, "nanosleep", 35);
-    sb_pair(names, nums, "socket", 41); sb_pair(names, nums, "connect", 42);
-    sb_pair(names, nums, "accept", 43); sb_pair(names, nums, "sendto", 44);
-    sb_pair(names, nums, "recvfrom", 45); sb_pair(names, nums, "bind", 49);
-    sb_pair(names, nums, "listen", 50); sb_pair(names, nums, "clone", 56);
-    sb_pair(names, nums, "fork", 57); sb_pair(names, nums, "execve", 59);
-    sb_pair(names, nums, "exit", 60); sb_pair(names, nums, "wait4", 61);
-    sb_pair(names, nums, "kill", 62); sb_pair(names, nums, "fcntl", 72);
-    sb_pair(names, nums, "getcwd", 79); sb_pair(names, nums, "futex", 202);
-    sb_pair(names, nums, "exit_group", 231); sb_pair(names, nums, "openat", 257);
-    sb_pair(names, nums, "newfstatat", 262); sb_pair(names, nums, "ptrace", 101);
-    sb_pair(names, nums, "getpid", 39); sb_pair(names, nums, "clock_gettime", 228);
+fn sb_x64_tab(names: &mut Vec<str>, nums: &mut Vec<i64>) {
+    sb_pair(names, nums, "read", 0);
+    sb_pair(names, nums, "write", 1);
+    sb_pair(names, nums, "open", 2);
+    sb_pair(names, nums, "close", 3);
+    sb_pair(names, nums, "stat", 4);
+    sb_pair(names, nums, "fstat", 5);
+    sb_pair(names, nums, "lstat", 6);
+    sb_pair(names, nums, "poll", 7);
+    sb_pair(names, nums, "lseek", 8);
+    sb_pair(names, nums, "mmap", 9);
+    sb_pair(names, nums, "mprotect", 10);
+    sb_pair(names, nums, "munmap", 11);
+    sb_pair(names, nums, "brk", 12);
+    sb_pair(names, nums, "rt_sigaction", 13);
+    sb_pair(names, nums, "rt_sigprocmask", 14);
+    sb_pair(names, nums, "ioctl", 16);
+    sb_pair(names, nums, "pread64", 17);
+    sb_pair(names, nums, "pwrite64", 18);
+    sb_pair(names, nums, "readv", 19);
+    sb_pair(names, nums, "writev", 20);
+    sb_pair(names, nums, "access", 21);
+    sb_pair(names, nums, "pipe", 22);
+    sb_pair(names, nums, "select", 23);
+    sb_pair(names, nums, "dup", 32);
+    sb_pair(names, nums, "dup2", 33);
+    sb_pair(names, nums, "nanosleep", 35);
+    sb_pair(names, nums, "socket", 41);
+    sb_pair(names, nums, "connect", 42);
+    sb_pair(names, nums, "accept", 43);
+    sb_pair(names, nums, "sendto", 44);
+    sb_pair(names, nums, "recvfrom", 45);
+    sb_pair(names, nums, "bind", 49);
+    sb_pair(names, nums, "listen", 50);
+    sb_pair(names, nums, "clone", 56);
+    sb_pair(names, nums, "fork", 57);
+    sb_pair(names, nums, "execve", 59);
+    sb_pair(names, nums, "exit", 60);
+    sb_pair(names, nums, "wait4", 61);
+    sb_pair(names, nums, "kill", 62);
+    sb_pair(names, nums, "fcntl", 72);
+    sb_pair(names, nums, "getcwd", 79);
+    sb_pair(names, nums, "futex", 202);
+    sb_pair(names, nums, "exit_group", 231);
+    sb_pair(names, nums, "openat", 257);
+    sb_pair(names, nums, "newfstatat", 262);
+    sb_pair(names, nums, "ptrace", 101);
+    sb_pair(names, nums, "getpid", 39);
+    sb_pair(names, nums, "clock_gettime", 228);
 }
 
-fn sb_a64_tab(names: & mut Vec<str>, nums: & mut Vec<i64>) {
-    sb_pair(names, nums, "io_setup", 0); sb_pair(names, nums, "getcwd", 17);
-    sb_pair(names, nums, "dup", 23); sb_pair(names, nums, "fcntl", 25);
-    sb_pair(names, nums, "ioctl", 29); sb_pair(names, nums, "faccessat", 48);
-    sb_pair(names, nums, "openat", 56); sb_pair(names, nums, "close", 57);
-    sb_pair(names, nums, "pipe2", 59); sb_pair(names, nums, "read", 63);
-    sb_pair(names, nums, "write", 64); sb_pair(names, nums, "readv", 65);
-    sb_pair(names, nums, "writev", 66); sb_pair(names, nums, "pread64", 67);
-    sb_pair(names, nums, "pwrite64", 68); sb_pair(names, nums, "ppoll", 73);
-    sb_pair(names, nums, "exit", 93); sb_pair(names, nums, "exit_group", 94);
-    sb_pair(names, nums, "futex", 98); sb_pair(names, nums, "nanosleep", 101);
-    sb_pair(names, nums, "clock_gettime", 113); sb_pair(names, nums, "kill", 129);
-    sb_pair(names, nums, "rt_sigaction", 134); sb_pair(names, nums, "rt_sigprocmask", 135);
-    sb_pair(names, nums, "getpid", 172); sb_pair(names, nums, "socket", 198);
-    sb_pair(names, nums, "bind", 200); sb_pair(names, nums, "listen", 201);
-    sb_pair(names, nums, "accept", 202); sb_pair(names, nums, "connect", 203);
-    sb_pair(names, nums, "sendto", 206); sb_pair(names, nums, "recvfrom", 207);
-    sb_pair(names, nums, "brk", 214); sb_pair(names, nums, "munmap", 215);
-    sb_pair(names, nums, "clone", 220); sb_pair(names, nums, "execve", 221);
-    sb_pair(names, nums, "mmap", 222); sb_pair(names, nums, "mprotect", 226);
-    sb_pair(names, nums, "wait4", 260); sb_pair(names, nums, "ptrace", 117);
+fn sb_a64_tab(names: &mut Vec<str>, nums: &mut Vec<i64>) {
+    sb_pair(names, nums, "io_setup", 0);
+    sb_pair(names, nums, "getcwd", 17);
+    sb_pair(names, nums, "dup", 23);
+    sb_pair(names, nums, "fcntl", 25);
+    sb_pair(names, nums, "ioctl", 29);
+    sb_pair(names, nums, "faccessat", 48);
+    sb_pair(names, nums, "openat", 56);
+    sb_pair(names, nums, "close", 57);
+    sb_pair(names, nums, "pipe2", 59);
+    sb_pair(names, nums, "read", 63);
+    sb_pair(names, nums, "write", 64);
+    sb_pair(names, nums, "readv", 65);
+    sb_pair(names, nums, "writev", 66);
+    sb_pair(names, nums, "pread64", 67);
+    sb_pair(names, nums, "pwrite64", 68);
+    sb_pair(names, nums, "ppoll", 73);
+    sb_pair(names, nums, "exit", 93);
+    sb_pair(names, nums, "exit_group", 94);
+    sb_pair(names, nums, "futex", 98);
+    sb_pair(names, nums, "nanosleep", 101);
+    sb_pair(names, nums, "clock_gettime", 113);
+    sb_pair(names, nums, "kill", 129);
+    sb_pair(names, nums, "rt_sigaction", 134);
+    sb_pair(names, nums, "rt_sigprocmask", 135);
+    sb_pair(names, nums, "getpid", 172);
+    sb_pair(names, nums, "socket", 198);
+    sb_pair(names, nums, "bind", 200);
+    sb_pair(names, nums, "listen", 201);
+    sb_pair(names, nums, "accept", 202);
+    sb_pair(names, nums, "connect", 203);
+    sb_pair(names, nums, "sendto", 206);
+    sb_pair(names, nums, "recvfrom", 207);
+    sb_pair(names, nums, "brk", 214);
+    sb_pair(names, nums, "munmap", 215);
+    sb_pair(names, nums, "clone", 220);
+    sb_pair(names, nums, "execve", 221);
+    sb_pair(names, nums, "mmap", 222);
+    sb_pair(names, nums, "mprotect", 226);
+    sb_pair(names, nums, "wait4", 260);
+    sb_pair(names, nums, "ptrace", 117);
 }
 
 fn sb_lookup(name: str, x64: bool) -> i64 {
     var names: Vec<str> = Vec::new();
     var nums: Vec<i64> = Vec::new();
     if x64 {
-        sb_x64_tab(& mut names, & mut nums);
+        sb_x64_tab(&mut names, &mut nums);
     } else {
-        sb_a64_tab(& mut names, & mut nums);
+        sb_a64_tab(&mut names, &mut nums);
     }
     var i: i64 = 0;
     while i < names.len() {
@@ -395,7 +478,7 @@ fn sb_lookup(name: str, x64: bool) -> i64 {
         }
         i = i + 1;
     }
-    return - 1;
+    return -1;
 }
 
 /// The x86-64 call number of a name, or -1 when not in the table.
@@ -409,7 +492,7 @@ pub fn sb_call_a64(name: str) -> i64 {
 }
 
 /// Allow a call by name for the given architecture (ignored when unknown).
-pub fn bpf_allow_name(p: & mut BpfPolicy, name: str, arch: i64) {
+pub fn bpf_allow_name(p: &mut BpfPolicy, name: str, arch: i64) {
     val nr: i64 = sb_lookup(name, arch != SB_ARCH_AARCH64);
     if nr >= 0 {
         bpf_allow(p, nr);
@@ -442,8 +525,12 @@ pub const LL_NET_CONNECT_TCP: i64 = 2;
 /// handles bits 1..0x2000, ABI 2 adds REFER, ABI 3 adds TRUNCATE.
 pub fn ll_fs_mask_for_abi(abi: i64) -> i64 {
     var m: i64 = 0x1FFF;  // bits 0..12 (EXECUTE..MAKE_SYM)
-    if abi >= 2 { m = m | LL_FS_REFER; }
-    if abi >= 3 { m = m | LL_FS_TRUNCATE; }
+    if abi >= 2 {
+        m = m | LL_FS_REFER;
+    }
+    if abi >= 3 {
+        m = m | LL_FS_TRUNCATE;
+    }
     return m;
 }
 
@@ -468,20 +555,26 @@ pub struct LlRuleset {
 
 /// A ruleset that handles (and so by default denies) the given rights.
 pub fn ll_new(handled_fs: i64, handled_net: i64) -> LlRuleset {
-    return LlRuleset { handled_fs: handled_fs, handled_net: handled_net, paths: Vec::new(), ports: Vec::new() };
+    return LlRuleset {
+        handled_fs: handled_fs, handled_net: handled_net, paths: Vec::new(), ports: Vec::new()
+    };
 }
 
 /// Allow `rights` on everything beneath `path`.
-pub fn ll_allow_path(r: & mut LlRuleset, path: str, rights: i64) {
-    r.paths.push(LlPathRule { allowed: rights, path: path });
+pub fn ll_allow_path(r: &mut LlRuleset, path: str, rights: i64) {
+    r.paths.push(LlPathRule {
+        allowed: rights, path: path
+    });
 }
 
 /// Allow `action` (LL_NET_*) on `port`.
-pub fn ll_allow_port(r: & mut LlRuleset, port: i64, action: i64) {
-    r.ports.push(LlPortRule { allowed: action, port: port });
+pub fn ll_allow_port(r: &mut LlRuleset, port: i64, action: i64) {
+    r.ports.push(LlPortRule {
+        allowed: action, port: port
+    });
 }
 
-fn sb_put64le(o: & mut Vec<i64>, v: i64) {
+fn sb_put64le(o: &mut Vec<i64>, v: i64) {
     var i: i64 = 0;
     while i < 8 {
         o.push((v >> (i * 8)) & 255);
@@ -491,41 +584,44 @@ fn sb_put64le(o: & mut Vec<i64>, v: i64) {
 
 /// struct landlock_ruleset_attr: two u64 (handled_access_fs,
 /// handled_access_net) masked to the rights an ABI version supports.
-pub fn ll_ruleset_attr(r: & LlRuleset, abi: i64) -> Vec<i64> {
+pub fn ll_ruleset_attr(r: &LlRuleset, abi: i64) -> Vec<i64> {
     var o: Vec<i64> = Vec::new();
     var fs: i64 = r.handled_fs & ll_fs_mask_for_abi(abi);
     var net: i64 = 0;
     if abi >= 4 {
         net = r.handled_net & (LL_NET_BIND_TCP | LL_NET_CONNECT_TCP);
     }
-    sb_put64le(& mut o, fs);
-    sb_put64le(& mut o, net);
+    sb_put64le(&mut o, fs);
+    sb_put64le(&mut o, net);
     return o;
 }
 
 /// struct landlock_path_beneath_attr: u64 allowed_access, then an s32 fd
 /// placeholder (the kernel wants an open fd; -1 here since this module does
 /// not open files).
-pub fn ll_path_beneath_attr(rule: & LlPathRule, abi: i64) -> Vec<i64> {
+pub fn ll_path_beneath_attr(rule: &LlPathRule, abi: i64) -> Vec<i64> {
     var o: Vec<i64> = Vec::new();
-    sb_put64le(& mut o, rule.allowed & ll_fs_mask_for_abi(abi));
+    sb_put64le(&mut o, rule.allowed & ll_fs_mask_for_abi(abi));
     // fd as s32 = -1, then 4 bytes of padding to 16 (the struct is packed
     // in the kernel, but the syscall reads only the first 12 bytes)
-    o.push(255); o.push(255); o.push(255); o.push(255);
+    o.push(255);
+    o.push(255);
+    o.push(255);
+    o.push(255);
     return o;
 }
 
 /// struct landlock_net_port_attr (ABI 4+): u64 allowed_access, u64 port.
-pub fn ll_net_port_attr(rule: & LlPortRule) -> Vec<i64> {
+pub fn ll_net_port_attr(rule: &LlPortRule) -> Vec<i64> {
     var o: Vec<i64> = Vec::new();
-    sb_put64le(& mut o, rule.allowed);
-    sb_put64le(& mut o, rule.port);
+    sb_put64le(&mut o, rule.allowed);
+    sb_put64le(&mut o, rule.port);
     return o;
 }
 
 /// The rights a ruleset asks for that the given ABI cannot enforce (the
 /// best-effort downgrade drops these). 0 when the ABI covers everything.
-pub fn ll_unsupported_fs(r: & LlRuleset, abi: i64) -> i64 {
+pub fn ll_unsupported_fs(r: &LlRuleset, abi: i64) -> i64 {
     return r.handled_fs & (0x7FFFFFFF ^ ll_fs_mask_for_abi(abi)) & r.handled_fs;
 }
 
@@ -548,16 +644,26 @@ pub struct JobLimits {
 }
 
 pub fn job_new() -> JobLimits {
-    return JobLimits { active_process_limit: 0, process_memory_limit: 0, job_memory_limit: 0, kill_on_close: true, ui_restrictions: 0 };
+    return JobLimits {
+        active_process_limit: 0, process_memory_limit: 0, job_memory_limit: 0, kill_on_close: true, ui_restrictions: 0
+    };
 }
 
 /// The LimitFlags word a JobLimits produces.
-pub fn job_limit_flags(j: & JobLimits) -> i64 {
+pub fn job_limit_flags(j: &JobLimits) -> i64 {
     var f: i64 = 0;
-    if j.active_process_limit > 0 { f = f | JOB_LIMIT_ACTIVE_PROCESS; }
-    if j.process_memory_limit > 0 { f = f | JOB_LIMIT_PROCESS_MEMORY; }
-    if j.job_memory_limit > 0 { f = f | JOB_LIMIT_JOB_MEMORY; }
-    if j.kill_on_close { f = f | JOB_LIMIT_KILL_ON_JOB_CLOSE; }
+    if j.active_process_limit > 0 {
+        f = f | JOB_LIMIT_ACTIVE_PROCESS;
+    }
+    if j.process_memory_limit > 0 {
+        f = f | JOB_LIMIT_PROCESS_MEMORY;
+    }
+    if j.job_memory_limit > 0 {
+        f = f | JOB_LIMIT_JOB_MEMORY;
+    }
+    if j.kill_on_close {
+        f = f | JOB_LIMIT_KILL_ON_JOB_CLOSE;
+    }
     return f;
 }
 
@@ -566,19 +672,19 @@ pub fn job_limit_flags(j: & JobLimits) -> i64 {
 /// minimum/maximum working set (8+8, 0), active process limit (4),
 /// affinity (8, 0), priority class (4, 0), scheduling class (4, 0). This is
 /// the exact head of JOBOBJECT_BASIC_LIMIT_INFORMATION (48 bytes, 64-bit).
-pub fn job_basic_limit_bytes(j: & JobLimits) -> Vec<i64> {
+pub fn job_basic_limit_bytes(j: &JobLimits) -> Vec<i64> {
     var o: Vec<i64> = Vec::new();
-    sb_put64le(& mut o, 0);  // PerProcessUserTimeLimit
-    sb_put64le(& mut o, 0);  // PerJobUserTimeLimit
-    sb_put32le(& mut o, job_limit_flags(j));  // LimitFlags
-    sb_put32le(& mut o, 0);  // (padding to 8-byte alignment)
-    sb_put64le(& mut o, 0);  // MinimumWorkingSetSize
-    sb_put64le(& mut o, 0);  // MaximumWorkingSetSize
-    sb_put32le(& mut o, j.active_process_limit);  // ActiveProcessLimit
-    sb_put32le(& mut o, 0);  // (padding)
-    sb_put64le(& mut o, 0);  // Affinity
-    sb_put32le(& mut o, 0);  // PriorityClass
-    sb_put32le(& mut o, 0);  // SchedulingClass
+    sb_put64le(&mut o, 0);  // PerProcessUserTimeLimit
+    sb_put64le(&mut o, 0);  // PerJobUserTimeLimit
+    sb_put32le(&mut o, job_limit_flags(j));  // LimitFlags
+    sb_put32le(&mut o, 0);  // (padding to 8-byte alignment)
+    sb_put64le(&mut o, 0);  // MinimumWorkingSetSize
+    sb_put64le(&mut o, 0);  // MaximumWorkingSetSize
+    sb_put32le(&mut o, j.active_process_limit);  // ActiveProcessLimit
+    sb_put32le(&mut o, 0);  // (padding)
+    sb_put64le(&mut o, 0);  // Affinity
+    sb_put32le(&mut o, 0);  // PriorityClass
+    sb_put32le(&mut o, 0);  // SchedulingClass
     return o;
 }
 
@@ -596,10 +702,12 @@ pub struct AppContainer {
 }
 
 pub fn appcontainer_new(name: str) -> AppContainer {
-    return AppContainer { name: name, capabilities: Vec::new() };
+    return AppContainer {
+        name: name, capabilities: Vec::new()
+    };
 }
 
-pub fn appcontainer_add(a: & mut AppContainer, cap: i64) {
+pub fn appcontainer_add(a: &mut AppContainer, cap: i64) {
     a.capabilities.push(cap);
 }
 

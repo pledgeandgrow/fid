@@ -40,7 +40,12 @@
 // (over UDP, against curl and a public HTTP/3 server).
 
 module http3;
- use vec; use string; use qpack; use quic; use quic_conn; use quic_frame;
+use vec;
+use string;
+use qpack;
+use quic;
+use quic_conn;
+use quic_frame;
 
 // ─── Constants ──────────────────────────────────────────────────────────
 
@@ -193,7 +198,7 @@ fn h3_none() -> Vec<i64> {
     return none;
 }
 
-fn h3_put(out: & mut Vec<i64>, v: Vec<i64>) {
+fn h3_put(out: &mut Vec<i64>, v: Vec<i64>) {
     var i: i64 = 0;
     while i < v.len() {
         out.push(v.get(i) & 255);
@@ -214,24 +219,22 @@ fn h3_tail(b: Vec<i64>, from: i64) -> Vec<i64> {
 
 fn h3_msg_new() -> H3Message {
     return H3Message {
-        ok: false, error: - 1, why: "", status: 0, interim: 0, method: "", scheme: "", authority: "", path: "",
-        names: Vec::new(), values: Vec::new(), body: Vec::new(), trailer_names: Vec::new(), trailer_values: Vec::new(),
+        ok: false, error: -1, why: "", status: 0, interim: 0, method: "", scheme: "", authority: "", path: "", names: Vec::new(), values: Vec::new(), body: Vec::new(), trailer_names: Vec::new(), trailer_values: Vec::new(),
     };
 }
 
 fn h3_stream_new(id: i64, method: str) -> H3Stream {
     return H3Stream {
-        id: id, buf: Vec::new(), pos: 0, data_left: 0, skip_left: 0, state: H3ST_HEADERS, msg: h3_msg_new(),
-        content_length: - 1, req_method: method, given: false,
+        id: id, buf: Vec::new(), pos: 0, data_left: 0, skip_left: 0, state: H3ST_HEADERS, msg: h3_msg_new(), content_length: -1, req_method: method, given: false,
     };
 }
 
 /// One frame: its type, length and payload (§7.1).
 pub fn h3_frame(ftype: i64, payload: Vec<i64>) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
-    h3_put(& mut out, quic_varint_encode(ftype));
-    h3_put(& mut out, quic_varint_encode(payload.len()));
-    h3_put(& mut out, payload);
+    h3_put(&mut out, quic_varint_encode(ftype));
+    h3_put(&mut out, quic_varint_encode(payload.len()));
+    h3_put(&mut out, payload);
     return out;
 }
 
@@ -240,8 +243,8 @@ pub fn h3_settings_frame(ids: Vec<i64>, vals: Vec<i64>) -> Vec<i64> {
     var p: Vec<i64> = Vec::new();
     var i: i64 = 0;
     while i < ids.len() {
-        h3_put(& mut p, quic_varint_encode(ids.get(i)));
-        h3_put(& mut p, quic_varint_encode(vals.get(i)));
+        h3_put(&mut p, quic_varint_encode(ids.get(i)));
+        h3_put(&mut p, quic_varint_encode(vals.get(i)));
         i = i + 1;
     }
     return h3_frame(H3F_SETTINGS, p);
@@ -256,13 +259,19 @@ pub fn h3_varint_frame(ftype: i64, v: i64) -> Vec<i64> {
 fn h3_hdr(b: Vec<i64>, pos: i64) -> H3Hdr {
     val t: QuicVarint = quic_varint_decode(b, pos);
     if !t.ok {
-        return H3Hdr { ok: false, ftype: 0, len: 0, hlen: 0 };
+        return H3Hdr {
+            ok: false, ftype: 0, len: 0, hlen: 0
+        };
     }
     val l: QuicVarint = quic_varint_decode(b, pos + t.len);
     if !l.ok {
-        return H3Hdr { ok: false, ftype: 0, len: 0, hlen: 0 };
+        return H3Hdr {
+            ok: false, ftype: 0, len: 0, hlen: 0
+        };
     }
-    return H3Hdr { ok: true, ftype: t.value, len: l.value, hlen: t.len + l.len };
+    return H3Hdr {
+        ok: true, ftype: t.value, len: l.value, hlen: t.len + l.len
+    };
 }
 
 /// HTTP/2 frame types reserved in HTTP/3 (§7.2.8): receiving one is
@@ -273,26 +282,66 @@ fn h3_h2_frame(t: i64) -> bool {
 
 /// The name of an HTTP/3 or QPACK error code.
 pub fn h3_error_name(code: i64) -> str {
-    if code == H3_NO_ERROR { return "H3_NO_ERROR"; }
-    if code == H3_GENERAL_PROTOCOL_ERROR { return "H3_GENERAL_PROTOCOL_ERROR"; }
-    if code == H3_INTERNAL_ERROR { return "H3_INTERNAL_ERROR"; }
-    if code == H3_STREAM_CREATION_ERROR { return "H3_STREAM_CREATION_ERROR"; }
-    if code == H3_CLOSED_CRITICAL_STREAM { return "H3_CLOSED_CRITICAL_STREAM"; }
-    if code == H3_FRAME_UNEXPECTED { return "H3_FRAME_UNEXPECTED"; }
-    if code == H3_FRAME_ERROR { return "H3_FRAME_ERROR"; }
-    if code == H3_EXCESSIVE_LOAD { return "H3_EXCESSIVE_LOAD"; }
-    if code == H3_ID_ERROR { return "H3_ID_ERROR"; }
-    if code == H3_SETTINGS_ERROR { return "H3_SETTINGS_ERROR"; }
-    if code == H3_MISSING_SETTINGS { return "H3_MISSING_SETTINGS"; }
-    if code == H3_REQUEST_REJECTED { return "H3_REQUEST_REJECTED"; }
-    if code == H3_REQUEST_CANCELLED { return "H3_REQUEST_CANCELLED"; }
-    if code == H3_REQUEST_INCOMPLETE { return "H3_REQUEST_INCOMPLETE"; }
-    if code == H3_MESSAGE_ERROR { return "H3_MESSAGE_ERROR"; }
-    if code == H3_CONNECT_ERROR { return "H3_CONNECT_ERROR"; }
-    if code == H3_VERSION_FALLBACK { return "H3_VERSION_FALLBACK"; }
-    if code == QPACK_DECOMPRESSION_FAILED { return "QPACK_DECOMPRESSION_FAILED"; }
-    if code == QPACK_ENCODER_STREAM_ERROR { return "QPACK_ENCODER_STREAM_ERROR"; }
-    if code == QPACK_DECODER_STREAM_ERROR { return "QPACK_DECODER_STREAM_ERROR"; }
+    if code == H3_NO_ERROR {
+        return "H3_NO_ERROR";
+    }
+    if code == H3_GENERAL_PROTOCOL_ERROR {
+        return "H3_GENERAL_PROTOCOL_ERROR";
+    }
+    if code == H3_INTERNAL_ERROR {
+        return "H3_INTERNAL_ERROR";
+    }
+    if code == H3_STREAM_CREATION_ERROR {
+        return "H3_STREAM_CREATION_ERROR";
+    }
+    if code == H3_CLOSED_CRITICAL_STREAM {
+        return "H3_CLOSED_CRITICAL_STREAM";
+    }
+    if code == H3_FRAME_UNEXPECTED {
+        return "H3_FRAME_UNEXPECTED";
+    }
+    if code == H3_FRAME_ERROR {
+        return "H3_FRAME_ERROR";
+    }
+    if code == H3_EXCESSIVE_LOAD {
+        return "H3_EXCESSIVE_LOAD";
+    }
+    if code == H3_ID_ERROR {
+        return "H3_ID_ERROR";
+    }
+    if code == H3_SETTINGS_ERROR {
+        return "H3_SETTINGS_ERROR";
+    }
+    if code == H3_MISSING_SETTINGS {
+        return "H3_MISSING_SETTINGS";
+    }
+    if code == H3_REQUEST_REJECTED {
+        return "H3_REQUEST_REJECTED";
+    }
+    if code == H3_REQUEST_CANCELLED {
+        return "H3_REQUEST_CANCELLED";
+    }
+    if code == H3_REQUEST_INCOMPLETE {
+        return "H3_REQUEST_INCOMPLETE";
+    }
+    if code == H3_MESSAGE_ERROR {
+        return "H3_MESSAGE_ERROR";
+    }
+    if code == H3_CONNECT_ERROR {
+        return "H3_CONNECT_ERROR";
+    }
+    if code == H3_VERSION_FALLBACK {
+        return "H3_VERSION_FALLBACK";
+    }
+    if code == QPACK_DECOMPRESSION_FAILED {
+        return "QPACK_DECOMPRESSION_FAILED";
+    }
+    if code == QPACK_ENCODER_STREAM_ERROR {
+        return "QPACK_ENCODER_STREAM_ERROR";
+    }
+    if code == QPACK_DECODER_STREAM_ERROR {
+        return "QPACK_DECODER_STREAM_ERROR";
+    }
     return "0x" + h3_hex(code);
 }
 
@@ -337,8 +386,7 @@ fn h3_name_ok(n: str) -> bool {
         val lower: bool = c >= 97 && c <= 122;
         val digit: bool = c >= 48 && c <= 57;
         // ! # $ % & ' * + - . ^ _ ` | ~
-        val sym: bool = c == 33 || (c >= 35 && c <= 39) || c == 42 || c == 43 || c == 45 || c == 46
-            || c == 94 || c == 95 || c == 96 || c == 124 || c == 126;
+        val sym: bool = c == 33 || (c >= 35 && c <= 39) || c == 42 || c == 43 || c == 45 || c == 46 || c == 94 || c == 95 || c == 96 || c == 124 || c == 126;
         if !lower && !digit && !sym {
             return false;
         }
@@ -424,9 +472,7 @@ pub fn h3_check_fields(names: Vec<str>, vals: Vec<str>, request: bool, trailers:
                     return "unknown pseudo-header " + n;
                 }
                 n_status = n_status + 1;
-                if str_len(v) != 3 || str_byte_at(v, 0) < 49 || str_byte_at(v, 0) > 53
-                    || str_byte_at(v, 1) < 48 || str_byte_at(v, 1) > 57
-                    || str_byte_at(v, 2) < 48 || str_byte_at(v, 2) > 57 {
+                if str_len(v) != 3 || str_byte_at(v, 0) < 49 || str_byte_at(v, 0) > 53 || str_byte_at(v, 1) < 48 || str_byte_at(v, 1) > 57 || str_byte_at(v, 2) < 48 || str_byte_at(v, 2) > 57 {
                     return "bad :status " + v;
                 }
             }
@@ -483,27 +529,27 @@ pub fn h3_check_fields(names: Vec<str>, vals: Vec<str>, request: bool, trailers:
 /// The content-length of a message (RFC 9110 §8.6): -1 when there is
 /// none, -2 when a value is not a number or two values differ.
 fn h3_content_length(names: Vec<str>, vals: Vec<str>) -> i64 {
-    var cl: i64 = - 1;
+    var cl: i64 = -1;
     var i: i64 = 0;
     while i < names.len() {
         if names.get(i) == "content-length" {
             val v: str = vals.get(i);
             val len: i64 = str_len(v);
             if len == 0 || len > 18 {
-                return - 2;
+                return -2;
             }
             var n: i64 = 0;
             var k: i64 = 0;
             while k < len {
                 val c: i64 = str_byte_at(v, k);
                 if c < 48 || c > 57 {
-                    return - 2;
+                    return -2;
                 }
                 n = n * 10 + (c - 48);
                 k = k + 1;
             }
             if cl >= 0 && cl != n {
-                return - 2;
+                return -2;
             }
             cl = n;
         }
@@ -524,7 +570,7 @@ fn h3_status_of(names: Vec<str>, vals: Vec<str>) -> i64 {
 }
 
 /// The first value of field `name` in a message, "" if none.
-pub fn h3_field(m: & H3Message, name: str) -> str {
+pub fn h3_field(m: &H3Message, name: str) -> str {
     var i: i64 = 0;
     while i < m.names.len() {
         if m.names.get(i) == name {
@@ -540,17 +586,12 @@ pub fn h3_field(m: & H3Message, name: str) -> str {
 /// HTTP/3 state for a connection; `server` as the QuicConn's.
 pub fn h3_new(server: bool) -> H3Conn {
     return H3Conn {
-        server: server, started: false, ctrl_id: - 1, enc_id: - 1, dec_id: - 1,
-        peer_ctrl: - 1, peer_enc: - 1, peer_dec: - 1, peer_settings: false,
-        peer_max_field_section: - 1, peer_qpack_capacity: 0, peer_blocked_streams: 0,
-        max_field_section: H3_DEFAULT_MAX_FIELD_SECTION, huffman: true,
-        unis: Vec::new(), streams: Vec::new(), goaway_recv: - 1, goaway_sent: - 1,
-        max_push_id_peer: - 1, highest_request: - 1, error: - 1, why: "",
+        server: server, started: false, ctrl_id: -1, enc_id: -1, dec_id: -1, peer_ctrl: -1, peer_enc: -1, peer_dec: -1, peer_settings: false, peer_max_field_section: -1, peer_qpack_capacity: 0, peer_blocked_streams: 0, max_field_section: H3_DEFAULT_MAX_FIELD_SECTION, huffman: true, unis: Vec::new(), streams: Vec::new(), goaway_recv: -1, goaway_sent: -1, max_push_id_peer: -1, highest_request: -1, error: -1, why: "",
     };
 }
 
 /// Close the connection with an HTTP/3 error (§8).
-pub fn h3_conn_error(h: & mut H3Conn, q: & mut QuicConn, code: i64, why: str) {
+pub fn h3_conn_error(h: &mut H3Conn, q: &mut QuicConn, code: i64, why: str) {
     if h.error >= 0 {
         return;
     }
@@ -561,12 +602,12 @@ pub fn h3_conn_error(h: & mut H3Conn, q: & mut QuicConn, code: i64, why: str) {
 
 /// Whether the HTTP/3 connection is over (our error or the QUIC
 /// connection closing).
-pub fn h3_failed(h: & H3Conn, q: & QuicConn) -> bool {
+pub fn h3_failed(h: &H3Conn, q: &QuicConn) -> bool {
     return h.error >= 0 || quic_conn_done(q);
 }
 
 /// Index of request stream `id`, -1 if we do not track it.
-pub fn h3_stream_index(h: & H3Conn, id: i64) -> i64 {
+pub fn h3_stream_index(h: &H3Conn, id: i64) -> i64 {
     var i: i64 = 0;
     while i < h.streams.len() {
         if h.streams.get(i).id == id {
@@ -574,18 +615,18 @@ pub fn h3_stream_index(h: & H3Conn, id: i64) -> i64 {
         }
         i = i + 1;
     }
-    return - 1;
+    return -1;
 }
 
 /// Fail a request stream with an HTTP/3 error: STOP_SENDING and
 /// RESET_STREAM with `code` (§4.1.2, §8).
-fn h3_stream_fail(h: & mut H3Conn, q: & mut QuicConn, k: i64, code: i64, why: str) {
+fn h3_stream_fail(h: &mut H3Conn, q: &mut QuicConn, k: i64, code: i64, why: str) {
     h3_stream_fail_as(h, q, k, code, code, why);
 }
 
 /// As h3_stream_fail, the message failing with `code` and the stream
 /// reset with `sent`.
-fn h3_stream_fail_as(h: & mut H3Conn, q: & mut QuicConn, k: i64, code: i64, sent: i64, why: str) {
+fn h3_stream_fail_as(h: &mut H3Conn, q: &mut QuicConn, k: i64, code: i64, sent: i64, why: str) {
     var s: H3Stream = h.streams.get(k);
     if s.state == H3ST_FAILED {
         return;
@@ -601,7 +642,7 @@ fn h3_stream_fail_as(h: & mut H3Conn, q: & mut QuicConn, k: i64, code: i64, sent
 
 /// Open our control stream (with SETTINGS) and QPACK streams once the
 /// connection can carry them.
-fn h3_start(h: & mut H3Conn, q: & mut QuicConn) {
+fn h3_start(h: &mut H3Conn, q: &mut QuicConn) {
     if h.started || !quic_conn_established(q) {
         return;
     }
@@ -625,7 +666,7 @@ fn h3_start(h: & mut H3Conn, q: & mut QuicConn) {
     vals.push(h.max_field_section);
     ids.push(H3_SETTING_QPACK_BLOCKED_STREAMS);
     vals.push(0);
-    h3_put(& mut ctrl, h3_settings_frame(ids, vals));
+    h3_put(&mut ctrl, h3_settings_frame(ids, vals));
     quic_stream_write(q, h.ctrl_id, ctrl, false);
     var enc: Vec<i64> = Vec::new();
     enc.push(H3_STREAM_QPACK_ENCODER);
@@ -639,7 +680,7 @@ fn h3_start(h: & mut H3Conn, q: & mut QuicConn) {
 /// Move the HTTP/3 state on: open our control streams, take the streams
 /// the peer opened, read the control and QPACK streams, read requests or
 /// responses. Call after every quic_conn_recv / quic_conn_on_timeout.
-pub fn h3_poll(h: & mut H3Conn, q: & mut QuicConn) {
+pub fn h3_poll(h: &mut H3Conn, q: &mut QuicConn) {
     if h.error >= 0 || quic_conn_done(q) {
         return;
     }
@@ -649,7 +690,9 @@ pub fn h3_poll(h: & mut H3Conn, q: & mut QuicConn) {
     while f < fresh.len() && h.error < 0 {
         val id: i64 = fresh.get(f);
         if (id & 2) != 0 {
-            h.unis.push(H3Uni { id: id, stype: - 1, buf: Vec::new(), pos: 0, skip_left: 0, got_settings: false });
+            h.unis.push(H3Uni {
+                id: id, stype: -1, buf: Vec::new(), pos: 0, skip_left: 0, got_settings: false
+            });
         } else if !h.server {
             h3_conn_error(h, q, H3_STREAM_CREATION_ERROR, "a server-initiated bidirectional stream");
         } else if h.goaway_sent >= 0 && id >= h.goaway_sent {
@@ -698,15 +741,15 @@ fn h3_critical(t: i64) -> bool {
 
 /// Read one of the peer's unidirectional streams. False when it is over
 /// and can be forgotten.
-fn h3_uni_run(h: & mut H3Conn, q: & mut QuicConn, k: i64) -> bool {
+fn h3_uni_run(h: &mut H3Conn, q: &mut QuicConn, k: i64) -> bool {
     var u: H3Uni = h.unis.get(k);
     val id: i64 = u.id;
     val gone: bool = quic_stream_index(q, id) < 0;
     val rc: i64 = quic_stream_reset_code(q, id);
-    h3_put(& mut u.buf, quic_stream_read(q, id));
+    h3_put(&mut u.buf, quic_stream_read(q, id));
     val fin: bool = quic_stream_finished(q, id);
     val closed: bool = gone || fin || rc >= 0;
-    if u.stype == - 1 {
+    if u.stype == -1 {
         val t: QuicVarint = quic_varint_decode(u.buf, u.pos);
         if !t.ok {
             h.unis.set(k, u);
@@ -751,7 +794,7 @@ fn h3_uni_run(h: & mut H3Conn, q: & mut QuicConn, k: i64) -> bool {
         return false;
     }
     if t == H3_STREAM_CONTROL {
-        h3_control_frames(h, q, & mut u);
+        h3_control_frames(h, q, &mut u);
     } else if t == H3_STREAM_QPACK_ENCODER {
         val sc: QpackScan = qpack_encoder_stream_scan(u.buf, u.pos, 0);
         if sc.status == QPACK_SCAN_ERROR {
@@ -801,13 +844,13 @@ fn h3_payload(b: Vec<i64>, from: i64, len: i64) -> Vec<i64> {
 fn h3_one_varint(p: Vec<i64>) -> i64 {
     val v: QuicVarint = quic_varint_decode(p, 0);
     if !v.ok || v.len != p.len() {
-        return - 1;
+        return -1;
     }
     return v.value;
 }
 
 /// The frames of the peer's control stream (§6.2.1, §7.2).
-fn h3_control_frames(h: & mut H3Conn, q: & mut QuicConn, u: & mut H3Uni) {
+fn h3_control_frames(h: &mut H3Conn, q: &mut QuicConn, u: &mut H3Uni) {
     while h.error < 0 {
         if u.skip_left > 0 {
             var n: i64 = u.buf.len() - u.pos;
@@ -886,7 +929,7 @@ fn h3_control_frames(h: & mut H3Conn, q: & mut QuicConn, u: & mut H3Uni) {
 }
 
 /// The peer's SETTINGS (§7.2.4).
-fn h3_apply_settings(h: & mut H3Conn, q: & mut QuicConn, p: Vec<i64>) {
+fn h3_apply_settings(h: &mut H3Conn, q: &mut QuicConn, p: Vec<i64>) {
     var seen: Vec<i64> = Vec::new();
     var pos: i64 = 0;
     while pos < p.len() {
@@ -928,7 +971,7 @@ fn h3_apply_settings(h: & mut H3Conn, q: & mut QuicConn, p: Vec<i64>) {
 
 /// A GOAWAY from the peer (§5.2): a server's names the first client
 /// request it did not and will not process.
-fn h3_on_goaway(h: & mut H3Conn, q: & mut QuicConn, v: i64) {
+fn h3_on_goaway(h: &mut H3Conn, q: &mut QuicConn, v: i64) {
     if !h.server {
         if (v & 3) != 0 {
             h3_conn_error(h, q, H3_ID_ERROR, "GOAWAY with a stream id that is not a client request");
@@ -959,13 +1002,13 @@ fn h3_on_goaway(h: & mut H3Conn, q: & mut QuicConn, v: i64) {
 // ─── Request streams (§4.1) ─────────────────────────────────────────────
 
 /// Read a request stream (server) or a response stream (client).
-fn h3_stream_run(h: & mut H3Conn, q: & mut QuicConn, k: i64) {
+fn h3_stream_run(h: &mut H3Conn, q: &mut QuicConn, k: i64) {
     var s: H3Stream = h.streams.get(k);
     if s.state >= H3ST_DONE {
         return;
     }
     val rc: i64 = quic_stream_reset_code(q, s.id);
-    h3_put(& mut s.buf, quic_stream_read(q, s.id));
+    h3_put(&mut s.buf, quic_stream_read(q, s.id));
     val fin: bool = quic_stream_finished(q, s.id);
     if rc >= 0 {
         // Reset by the peer (quic_conn keeps a reset stream until it is
@@ -979,7 +1022,7 @@ fn h3_stream_run(h: & mut H3Conn, q: & mut QuicConn, k: i64) {
         }
         return;
     }
-    var serr: i64 = - 1;
+    var serr: i64 = -1;
     var swhy: str = "";
     var looping: bool = true;
     while looping && h.error < 0 && serr < 0 {
@@ -996,7 +1039,7 @@ fn h3_stream_run(h: & mut H3Conn, q: & mut QuicConn, k: i64) {
                     i = i + 1;
                 }
                 s.data_left = s.data_left - n;
-                if s.content_length >= 0 && s.msg.body.len() > s.content_length && !h3_no_content(& s) {
+                if s.content_length >= 0 && s.msg.body.len() > s.content_length && !h3_no_content(&s) {
                     serr = H3_MESSAGE_ERROR;
                     swhy = "more DATA than content-length";
                 }
@@ -1029,7 +1072,7 @@ fn h3_stream_run(h: & mut H3Conn, q: & mut QuicConn, k: i64) {
                     } else {
                         val p: Vec<i64> = h3_payload(s.buf, s.pos + hd.hlen, hd.len);
                         s.pos = s.pos + hd.hlen + hd.len;
-                        val why: str = h3_on_headers(h, q, & mut s, p);
+                        val why: str = h3_on_headers(h, q, &mut s, p);
                         if why != "" && h.error < 0 {
                             serr = s.msg.error;
                             swhy = why;
@@ -1037,8 +1080,7 @@ fn h3_stream_run(h: & mut H3Conn, q: & mut QuicConn, k: i64) {
                     }
                 } else if t == H3F_PUSH_PROMISE && !h.server {
                     h3_conn_error(h, q, H3_ID_ERROR, "PUSH_PROMISE without MAX_PUSH_ID");
-                } else if t == H3F_PUSH_PROMISE || t == H3F_SETTINGS || t == H3F_GOAWAY || t == H3F_MAX_PUSH_ID
-                    || t == H3F_CANCEL_PUSH || h3_h2_frame(t) {
+                } else if t == H3F_PUSH_PROMISE || t == H3F_SETTINGS || t == H3F_GOAWAY || t == H3F_MAX_PUSH_ID || t == H3F_CANCEL_PUSH || h3_h2_frame(t) {
                     h3_conn_error(h, q, H3_FRAME_UNEXPECTED, "frame type " + int_to_str(t) + " on a request stream");
                 } else {
                     // Unknown or reserved frame: skipped (§9)
@@ -1066,13 +1108,13 @@ fn h3_stream_run(h: & mut H3Conn, q: & mut QuicConn, k: i64) {
                 serr = H3_MESSAGE_ERROR;
                 swhy = "the response stream ended without a final response";
             }
-        } else if s.content_length >= 0 && s.msg.body.len() != s.content_length && !h3_no_content(& s) {
+        } else if s.content_length >= 0 && s.msg.body.len() != s.content_length && !h3_no_content(&s) {
             serr = H3_MESSAGE_ERROR;
             swhy = "content-length " + int_to_str(s.content_length) + " but " + int_to_str(s.msg.body.len()) + " bytes";
         } else {
             s.state = H3ST_DONE;
             s.msg.ok = true;
-            s.msg.error = - 1;
+            s.msg.error = -1;
         }
     }
     if s.pos >= s.buf.len() {
@@ -1090,14 +1132,14 @@ fn h3_stream_run(h: & mut H3Conn, q: & mut QuicConn, k: i64) {
 
 /// A response that carries no content whatever content-length says: to
 /// HEAD, or 204 / 304 (RFC 9110 §6.4.1).
-fn h3_no_content(s: & H3Stream) -> bool {
+fn h3_no_content(s: &H3Stream) -> bool {
     return s.req_method == "HEAD" || s.msg.status == 204 || s.msg.status == 304;
 }
 
 /// A HEADERS frame on a request stream: the message's header section,
 /// an interim response, or trailers. "" when fine; else why the stream
 /// fails (its code in `s.msg.error`); a connection error closes `h`.
-fn h3_on_headers(h: & mut H3Conn, q: & mut QuicConn, s: & mut H3Stream, p: Vec<i64>) -> str {
+fn h3_on_headers(h: &mut H3Conn, q: &mut QuicConn, s: &mut H3Stream, p: Vec<i64>) -> str {
     if s.state == H3ST_TRAILERS {
         h3_conn_error(h, q, H3_FRAME_UNEXPECTED, "HEADERS after trailers");
         return "frame unexpected";
@@ -1160,11 +1202,11 @@ fn h3_on_headers(h: & mut H3Conn, q: & mut QuicConn, s: & mut H3Stream, p: Vec<i
     if h.server {
         s.req_method = s.msg.method;
         if s.msg.authority == "" {
-            s.msg.authority = h3_field(& s.msg, "host");
+            s.msg.authority = h3_field(&s.msg, "host");
         }
     }
     val cl: i64 = h3_content_length(s.msg.names, s.msg.values);
-    if cl == - 2 {
+    if cl == -2 {
         s.msg.error = H3_MESSAGE_ERROR;
         return "bad content-length";
     }
@@ -1176,7 +1218,7 @@ fn h3_on_headers(h: & mut H3Conn, q: & mut QuicConn, s: & mut H3Stream, p: Vec<i
 // ─── Messages for the application ───────────────────────────────────────
 
 /// Server: the requests that arrived whole since the last call.
-pub fn h3_requests(h: & mut H3Conn) -> Vec<i64> {
+pub fn h3_requests(h: &mut H3Conn) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     var k: i64 = 0;
     while k < h.streams.len() {
@@ -1193,7 +1235,7 @@ pub fn h3_requests(h: & mut H3Conn) -> Vec<i64> {
 
 /// Whether stream `id`'s message is complete or failed (true for a stream
 /// we do not track).
-pub fn h3_done(h: & H3Conn, id: i64) -> bool {
+pub fn h3_done(h: &H3Conn, id: i64) -> bool {
     val k: i64 = h3_stream_index(h, id);
     if k < 0 {
         return true;
@@ -1203,7 +1245,7 @@ pub fn h3_done(h: & H3Conn, id: i64) -> bool {
 
 /// The message of stream `id` as it stands: a request at a server, a
 /// response at a client (`ok` once complete).
-pub fn h3_message(h: & H3Conn, id: i64) -> H3Message {
+pub fn h3_message(h: &H3Conn, id: i64) -> H3Message {
     val k: i64 = h3_stream_index(h, id);
     if k < 0 {
         var m: H3Message = h3_msg_new();
@@ -1215,7 +1257,7 @@ pub fn h3_message(h: & H3Conn, id: i64) -> H3Message {
 
 /// Client: the response of stream `id`; once it is done the stream is
 /// forgotten.
-pub fn h3_response(h: & mut H3Conn, id: i64) -> H3Message {
+pub fn h3_response(h: &mut H3Conn, id: i64) -> H3Message {
     val m: H3Message = h3_message(h, id);
     val k: i64 = h3_stream_index(h, id);
     if k >= 0 && h.streams.get(k).state >= H3ST_DONE {
@@ -1246,24 +1288,24 @@ fn h3_fields(pn: Vec<str>, pv: Vec<str>, names: Vec<str>, values: Vec<str>) -> H
         v.push(values.get(i));
         i = i + 1;
     }
-    return H3Fields { names: n, values: v };
+    return H3Fields {
+        names: n, values: v
+    };
 }
 
 /// HEADERS (and DATA, and trailers) for a message; [] when a field
 /// section is over the peer's limit.
-fn h3_encode_message(h: & H3Conn, names: Vec<str>, values: Vec<str>, body: Vec<i64>,
-        tnames: Vec<str>, tvalues: Vec<str>) -> Vec<i64> {
+fn h3_encode_message(h: &H3Conn, names: Vec<str>, values: Vec<str>, body: Vec<i64>, tnames: Vec<str>, tvalues: Vec<str>) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
-    if h.peer_max_field_section >= 0 && (qpack_section_size(names, values) > h.peer_max_field_section
-        || qpack_section_size(tnames, tvalues) > h.peer_max_field_section) {
+    if h.peer_max_field_section >= 0 && (qpack_section_size(names, values) > h.peer_max_field_section || qpack_section_size(tnames, tvalues) > h.peer_max_field_section) {
         return out;
     }
-    h3_put(& mut out, h3_frame(H3F_HEADERS, qpack_encode(names, values, h.huffman)));
+    h3_put(&mut out, h3_frame(H3F_HEADERS, qpack_encode(names, values, h.huffman)));
     if body.len() > 0 {
-        h3_put(& mut out, h3_frame(H3F_DATA, body));
+        h3_put(&mut out, h3_frame(H3F_DATA, body));
     }
     if tnames.len() > 0 {
-        h3_put(& mut out, h3_frame(H3F_HEADERS, qpack_encode(tnames, tvalues, h.huffman)));
+        h3_put(&mut out, h3_frame(H3F_HEADERS, qpack_encode(tnames, tvalues, h.huffman)));
     }
     return out;
 }
@@ -1272,15 +1314,14 @@ fn h3_encode_message(h: & H3Conn, names: Vec<str>, values: Vec<str>, body: Vec<i
 /// other fields (lowercased here). The id of the stream, or -1: not
 /// established yet, after a GOAWAY, at the server's stream limit, or the
 /// fields are malformed or over the server's limit.
-pub fn h3_request(h: & mut H3Conn, q: & mut QuicConn, method: str, scheme: str, authority: str, path: str,
-        names: Vec<str>, values: Vec<str>, body: Vec<i64>) -> i64 {
+pub fn h3_request(h: &mut H3Conn, q: &mut QuicConn, method: str, scheme: str, authority: str, path: str, names: Vec<str>, values: Vec<str>, body: Vec<i64>) -> i64 {
     if h.server || h.error >= 0 || !quic_conn_established(q) {
-        return - 1;
+        return -1;
     }
     h3_start(h, q);
     val next: i64 = q.local_bidi_opened << 2;
     if h.goaway_recv >= 0 && next >= h.goaway_recv {
-        return - 1;
+        return -1;
     }
     var pn: Vec<str> = Vec::new();
     var pv: Vec<str> = Vec::new();
@@ -1298,16 +1339,16 @@ pub fn h3_request(h: & mut H3Conn, q: & mut QuicConn, method: str, scheme: str, 
     }
     val f: H3Fields = h3_fields(pn, pv, names, values);
     if h3_check_fields(f.names, f.values, true, false) != "" {
-        return - 1;
+        return -1;
     }
     var none: Vec<str> = Vec::new();
     val bytes: Vec<i64> = h3_encode_message(h, f.names, f.values, body, none, none);
     if bytes.len() == 0 {
-        return - 1;
+        return -1;
     }
     val id: i64 = quic_open_bidi(q);
     if id < 0 {
-        return - 1;
+        return -1;
     }
     quic_stream_write(q, id, bytes, true);
     h.streams.push(h3_stream_new(id, method));
@@ -1316,8 +1357,7 @@ pub fn h3_request(h: & mut H3Conn, q: & mut QuicConn, method: str, scheme: str, 
 
 /// Server: an interim (1xx) response on request `id`, before the final
 /// one (103 Early Hints, say). False if it cannot be sent.
-pub fn h3_respond_interim(h: & mut H3Conn, q: & mut QuicConn, id: i64, status: i64,
-        names: Vec<str>, values: Vec<str>) -> bool {
+pub fn h3_respond_interim(h: &mut H3Conn, q: &mut QuicConn, id: i64, status: i64, names: Vec<str>, values: Vec<str>) -> bool {
     if !h.server || status < 100 || status > 199 || status == 101 || h3_stream_index(h, id) < 0 {
         return false;
     }
@@ -1341,8 +1381,7 @@ pub fn h3_respond_interim(h: & mut H3Conn, q: & mut QuicConn, id: i64, status: i
 /// not empty. The stream is forgotten afterwards; if the request was not
 /// complete yet the client is asked to stop sending it (STOP_SENDING
 /// H3_NO_ERROR, §4.1). False if it cannot be sent.
-pub fn h3_respond_trailers(h: & mut H3Conn, q: & mut QuicConn, id: i64, status: i64,
-        names: Vec<str>, values: Vec<str>, body: Vec<i64>, tnames: Vec<str>, tvalues: Vec<str>) -> bool {
+pub fn h3_respond_trailers(h: &mut H3Conn, q: &mut QuicConn, id: i64, status: i64, names: Vec<str>, values: Vec<str>, body: Vec<i64>, tnames: Vec<str>, tvalues: Vec<str>) -> bool {
     val k: i64 = h3_stream_index(h, id);
     if !h.server || k < 0 || status < 200 || status > 599 {
         return false;
@@ -1355,8 +1394,7 @@ pub fn h3_respond_trailers(h: & mut H3Conn, q: & mut QuicConn, id: i64, status: 
     var en: Vec<str> = Vec::new();
     var ev: Vec<str> = Vec::new();
     val t: H3Fields = h3_fields(en, ev, tnames, tvalues);
-    if h3_check_fields(f.names, f.values, false, false) != ""
-        || h3_check_fields(t.names, t.values, false, true) != "" {
+    if h3_check_fields(f.names, f.values, false, false) != "" || h3_check_fields(t.names, t.values, false, true) != "" {
         return false;
     }
     val bytes: Vec<i64> = h3_encode_message(h, f.names, f.values, body, t.names, t.values);
@@ -1374,8 +1412,7 @@ pub fn h3_respond_trailers(h: & mut H3Conn, q: & mut QuicConn, id: i64, status: 
 }
 
 /// Server: the response to request `id` (see h3_respond_trailers).
-pub fn h3_respond(h: & mut H3Conn, q: & mut QuicConn, id: i64, status: i64,
-        names: Vec<str>, values: Vec<str>, body: Vec<i64>) -> bool {
+pub fn h3_respond(h: &mut H3Conn, q: &mut QuicConn, id: i64, status: i64, names: Vec<str>, values: Vec<str>, body: Vec<i64>) -> bool {
     var none: Vec<str> = Vec::new();
     return h3_respond_trailers(h, q, id, status, names, values, body, none, none);
 }
@@ -1383,7 +1420,7 @@ pub fn h3_respond(h: & mut H3Conn, q: & mut QuicConn, id: i64, status: i64,
 /// Client: read the response of a stream the application opened and wrote
 /// itself (a request h3_request does not build); `method` as sent ("HEAD"
 /// matters: its response has no content).
-pub fn h3_track(h: & mut H3Conn, id: i64, method: str) {
+pub fn h3_track(h: &mut H3Conn, id: i64, method: str) {
     if h.server || h3_stream_index(h, id) >= 0 {
         return;
     }
@@ -1392,7 +1429,7 @@ pub fn h3_track(h: & mut H3Conn, id: i64, method: str) {
 
 /// Server: refuse request `id` unprocessed (H3_REQUEST_REJECTED): the
 /// client may send it again.
-pub fn h3_reject(h: & mut H3Conn, q: & mut QuicConn, id: i64) {
+pub fn h3_reject(h: &mut H3Conn, q: &mut QuicConn, id: i64) {
     val k: i64 = h3_stream_index(h, id);
     if k < 0 {
         return;
@@ -1404,7 +1441,7 @@ pub fn h3_reject(h: & mut H3Conn, q: & mut QuicConn, id: i64) {
 /// Graceful shutdown (§5.2): a server's GOAWAY names the first request it
 /// will not process (the ones it has keep going); a client's says it
 /// accepts no push. New requests are refused afterwards.
-pub fn h3_goaway(h: & mut H3Conn, q: & mut QuicConn) {
+pub fn h3_goaway(h: &mut H3Conn, q: &mut QuicConn) {
     if h.error >= 0 || !h.started || h.goaway_sent >= 0 {
         return;
     }
@@ -1420,12 +1457,12 @@ pub fn h3_goaway(h: & mut H3Conn, q: & mut QuicConn) {
 }
 
 /// Close the connection without an error (H3_NO_ERROR).
-pub fn h3_close(h: & mut H3Conn, q: & mut QuicConn, now: i64) {
+pub fn h3_close(h: &mut H3Conn, q: &mut QuicConn, now: i64) {
     quic_conn_close(q, H3_NO_ERROR, "", now);
 }
 
 /// Whether nothing is in flight: no request waiting for a response
 /// (client) or for the application (server).
-pub fn h3_idle(h: & H3Conn) -> bool {
+pub fn h3_idle(h: &H3Conn) -> bool {
     return h.streams.len() == 0;
 }

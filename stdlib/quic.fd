@@ -34,7 +34,9 @@
 // stdlib/quic_udp.fd (docs/stdlib/quic.md).
 
 module quic;
- use vec; use aes_gcm; use tls_crypto;
+use vec;
+use aes_gcm;
+use tls_crypto;
 
 /// QUIC version 1 (RFC 9000).
 pub const QUIC_V1: i64 = 1;
@@ -121,7 +123,7 @@ pub fn quic_slice(v: Vec<i64>, from: i64, to: i64) -> Vec<i64> {
     return out;
 }
 
-fn qc_append(out: & mut Vec<i64>, v: Vec<i64>) {
+fn qc_append(out: &mut Vec<i64>, v: Vec<i64>) {
     var i: i64 = 0;
     while i < v.len() {
         out.push(v.get(i) & 255);
@@ -188,12 +190,16 @@ pub fn quic_varint_encode_n(v: i64, n: i64) -> Vec<i64> {
 /// The varint at `off` of `b`.
 pub fn quic_varint_decode(b: Vec<i64>, off: i64) -> QuicVarint {
     if off < 0 || off >= b.len() {
-        return QuicVarint { ok: false, value: 0, len: 0 };
+        return QuicVarint {
+            ok: false, value: 0, len: 0
+        };
     }
     val first: i64 = b.get(off) & 255;
     val n: i64 = 1 << ((first >> 6) & 3);
     if off + n > b.len() {
-        return QuicVarint { ok: false, value: 0, len: 0 };
+        return QuicVarint {
+            ok: false, value: 0, len: 0
+        };
     }
     var v: i64 = first & 63;
     var i: i64 = 1;
@@ -201,7 +207,9 @@ pub fn quic_varint_decode(b: Vec<i64>, off: i64) -> QuicVarint {
         v = (v << 8) | (b.get(off + i) & 255);
         i = i + 1;
     }
-    return QuicVarint { ok: true, value: v, len: n };
+    return QuicVarint {
+        ok: true, value: v, len: n
+    };
 }
 
 // ─── Packet numbers (RFC 9000 §17.1, Appendix A) ────────────────────────
@@ -250,31 +258,51 @@ pub fn quic_pn_length(pn: i64, largest_acked: i64) -> i64 {
 /// The QUIC v1 Initial salt (RFC 9001 §5.2).
 fn quic_initial_salt() -> Vec<i64> {
     var s: Vec<i64> = Vec::new();
-    s.push(0x38); s.push(0x76); s.push(0x2c); s.push(0xf7); s.push(0xf5);
-    s.push(0x59); s.push(0x34); s.push(0xb3); s.push(0x4d); s.push(0x17);
-    s.push(0x9a); s.push(0xe6); s.push(0xa4); s.push(0xc8); s.push(0x0c);
-    s.push(0xad); s.push(0xcc); s.push(0xbb); s.push(0x7f); s.push(0x0a);
+    s.push(0x38);
+    s.push(0x76);
+    s.push(0x2c);
+    s.push(0xf7);
+    s.push(0xf5);
+    s.push(0x59);
+    s.push(0x34);
+    s.push(0xb3);
+    s.push(0x4d);
+    s.push(0x17);
+    s.push(0x9a);
+    s.push(0xe6);
+    s.push(0xa4);
+    s.push(0xc8);
+    s.push(0x0c);
+    s.push(0xad);
+    s.push(0xcc);
+    s.push(0xbb);
+    s.push(0x7f);
+    s.push(0x0a);
     return s;
 }
 
 /// initial_secret = HKDF-Extract(initial_salt, the client's first
 /// Destination Connection ID).
-@secret pub fn quic_initial_secret(dcid: Vec<i64>) -> Vec<i64> {
+@secret
+pub fn quic_initial_secret(dcid: Vec<i64>) -> Vec<i64> {
     return hkdf_extract(quic_initial_salt(), dcid);
 }
 
 /// HKDF-Expand-Label(secret, label, "", len).
-@secret fn qc_expand_label(@secret secret: Vec<i64>, label: str, len: i64) -> Vec<i64> {
+@secret
+fn qc_expand_label(@secret secret: Vec<i64>, label: str, len: i64) -> Vec<i64> {
     return hkdf_expand_label(secret, label, qc_empty(), len);
 }
 
 /// client_initial_secret = HKDF-Expand-Label(initial_secret, "client in", "", 32).
-@secret pub fn quic_client_initial_secret(dcid: Vec<i64>) -> Vec<i64> {
+@secret
+pub fn quic_client_initial_secret(dcid: Vec<i64>) -> Vec<i64> {
     return qc_expand_label(quic_initial_secret(dcid), "client in", 32);
 }
 
 /// server_initial_secret = HKDF-Expand-Label(initial_secret, "server in", "", 32).
-@secret pub fn quic_server_initial_secret(dcid: Vec<i64>) -> Vec<i64> {
+@secret
+pub fn quic_server_initial_secret(dcid: Vec<i64>) -> Vec<i64> {
     return qc_expand_label(quic_initial_secret(dcid), "server in", 32);
 }
 
@@ -293,23 +321,24 @@ pub fn quic_aead_key_len(aead: i64) -> i64 {
 /// The packet keys of a traffic secret (§5.1): "quic key", "quic iv",
 /// "quic hp". For 1-RTT, the secret is a TLS 1.3 application traffic
 /// secret (tls13_schedule_application); for Handshake, a handshake one.
-@secret pub fn quic_keys_from_secret(@secret secret: Vec<i64>, aead: i64) -> QuicKeys {
+@secret
+pub fn quic_keys_from_secret(@secret secret: Vec<i64>, aead: i64) -> QuicKeys {
     val klen: i64 = quic_aead_key_len(aead);
     if klen == 0 {
-        return QuicKeys { aead: 0, key: qc_empty(), iv: qc_empty(), hp: qc_empty() };
+        return QuicKeys {
+            aead: 0, key: qc_empty(), iv: qc_empty(), hp: qc_empty()
+        };
     }
     return QuicKeys {
-        aead: aead,
-        key: hkdf_expand_label(secret, "quic key", qc_empty(), klen),
-        iv: hkdf_expand_label(secret, "quic iv", qc_empty(), 12),
-        hp: hkdf_expand_label(secret, "quic hp", qc_empty(), klen),
+        aead: aead, key: hkdf_expand_label(secret, "quic key", qc_empty(), klen), iv: hkdf_expand_label(secret, "quic iv", qc_empty(), 12), hp: hkdf_expand_label(secret, "quic hp", qc_empty(), klen),
     };
 }
 
 /// The Initial keys of a connection, AEAD_AES_128_GCM: the server's
 /// (`server` true) or the client's, from the client's first Destination
 /// Connection ID. Both endpoints derive both.
-@secret pub fn quic_initial_keys(dcid: Vec<i64>, server: bool) -> QuicKeys {
+@secret
+pub fn quic_initial_keys(dcid: Vec<i64>, server: bool) -> QuicKeys {
     if server {
         return quic_keys_from_secret(quic_server_initial_secret(dcid), QUIC_AEAD_AES_128_GCM);
     }
@@ -318,20 +347,25 @@ pub fn quic_aead_key_len(aead: i64) -> i64 {
 
 /// The next 1-RTT secret for a key update (§6.1): HKDF-Expand-Label(secret,
 /// "quic ku", "", hash length 32).
-@secret pub fn quic_next_secret(@secret secret: Vec<i64>) -> Vec<i64> {
+@secret
+pub fn quic_next_secret(@secret secret: Vec<i64>) -> Vec<i64> {
     return hkdf_expand_label(secret, "quic ku", qc_empty(), 32);
 }
 
 /// The keys after a key update: key and IV from the next secret, the
 /// header-protection key kept (§6.1: it is not updated).
-@secret pub fn quic_updated_keys(@secret old: QuicKeys, @secret next_secret: Vec<i64>) -> QuicKeys {
+@secret
+pub fn quic_updated_keys(@secret old: QuicKeys, @secret next_secret: Vec<i64>) -> QuicKeys {
     val k: QuicKeys = quic_keys_from_secret(next_secret, old.aead);
-    return QuicKeys { aead: k.aead, key: k.key, iv: k.iv, hp: old.hp };
+    return QuicKeys {
+        aead: k.aead, key: k.key, iv: k.iv, hp: old.hp
+    };
 }
 
 /// The AEAD nonce of a packet (§5.3): the IV XOR the packet number,
 /// left-padded to 12 bytes.
-@secret pub fn quic_nonce(@secret iv: Vec<i64>, pn: i64) -> Vec<i64> {
+@secret
+pub fn quic_nonce(@secret iv: Vec<i64>, pn: i64) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     var i: i64 = 0;
     while i < 12 {
@@ -354,14 +388,14 @@ pub fn quic_aead_key_len(aead: i64) -> i64 {
 /// The 5-byte header-protection mask of a 16-byte sample (§5.4.3 AES-ECB,
 /// §5.4.4 ChaCha20). Released: it is XORed into bytes on the wire, and the
 /// sample is ciphertext. Empty for a bad key or sample.
-@declassify pub fn quic_hp_mask(@secret keys: QuicKeys, sample: Vec<i64>) -> Vec<i64> {
+@declassify
+pub fn quic_hp_mask(@secret keys: QuicKeys, sample: Vec<i64>) -> Vec<i64> {
     var mask: Vec<i64> = Vec::new();
     if sample.len() != 16 {
         return mask;
     }
     if keys.aead == QUIC_AEAD_CHACHA20_POLY1305 {
-        val counter: i64 = (sample.get(0) & 255) | ((sample.get(1) & 255) << 8)
-            | ((sample.get(2) & 255) << 16) | ((sample.get(3) & 255) << 24);
+        val counter: i64 = (sample.get(0) & 255) | ((sample.get(1) & 255) << 8) | ((sample.get(2) & 255) << 16) | ((sample.get(3) & 255) << 24);
         val nonce: Vec<i64> = quic_slice(sample, 4, 16);
         var zeros: Vec<i64> = Vec::new();
         var z: i64 = 0;
@@ -385,7 +419,8 @@ pub fn quic_aead_key_len(aead: i64) -> i64 {
 
 /// Seal `payload` under `keys` with the packet's nonce, the header as AAD:
 /// ciphertext || 16-byte tag; empty for unknown keys.
-@declassify fn qc_seal(@secret keys: QuicKeys, nonce: Vec<i64>, aad: Vec<i64>, payload: Vec<i64>) -> Vec<i64> {
+@declassify
+fn qc_seal(@secret keys: QuicKeys, nonce: Vec<i64>, aad: Vec<i64>, payload: Vec<i64>) -> Vec<i64> {
     if keys.aead == QUIC_AEAD_CHACHA20_POLY1305 {
         return chacha20poly_encrypt(keys.key, nonce, aad, payload);
     }
@@ -397,16 +432,23 @@ pub fn quic_aead_key_len(aead: i64) -> i64 {
 
 /// Open ciphertext || tag: the plaintext, ok false on a bad tag. A QUIC
 /// payload is never empty (RFC 9000 §12.4), so an empty open is a failure.
-@declassify fn qc_open(@secret keys: QuicKeys, nonce: Vec<i64>, aad: Vec<i64>, sealed: Vec<i64>) -> QcPlain {
+@declassify
+fn qc_open(@secret keys: QuicKeys, nonce: Vec<i64>, aad: Vec<i64>, sealed: Vec<i64>) -> QcPlain {
     if keys.aead == QUIC_AEAD_CHACHA20_POLY1305 {
         val p: Vec<i64> = chacha20poly_decrypt(keys.key, nonce, aad, sealed);
-        return QcPlain { ok: p.len() > 0, plain: p };
+        return QcPlain {
+            ok: p.len() > 0, plain: p
+        };
     }
     if keys.aead == QUIC_AEAD_AES_128_GCM || keys.aead == QUIC_AEAD_AES_256_GCM {
         val o: GcmOpened = aes_gcm_open(keys.key, nonce, aad, sealed);
-        return QcPlain { ok: o.ok && o.plain.len() > 0, plain: o.plain };
+        return QcPlain {
+            ok: o.ok && o.plain.len() > 0, plain: o.plain
+        };
     }
-    return QcPlain { ok: false, plain: qc_empty() };
+    return QcPlain {
+        ok: false, plain: qc_empty()
+    };
 }
 
 // ─── Packets ────────────────────────────────────────────────────────────
@@ -418,8 +460,7 @@ pub fn quic_aead_key_len(aead: i64) -> i64 {
 /// `payload_len` bytes of frames and the 16-byte tag, then the packet
 /// number truncated to `pn_len` (1..4) bytes. Empty for a Retry (it has no
 /// packet number) or a bad length.
-pub fn quic_long_header(ptype: i64, version: i64, dcid: Vec<i64>, scid: Vec<i64>,
-        token: Vec<i64>, pn: i64, pn_len: i64, payload_len: i64) -> Vec<i64> {
+pub fn quic_long_header(ptype: i64, version: i64, dcid: Vec<i64>, scid: Vec<i64>, token: Vec<i64>, pn: i64, pn_len: i64, payload_len: i64) -> Vec<i64> {
     var h: Vec<i64> = Vec::new();
     if ptype < 0 || ptype > 2 || pn_len < 1 || pn_len > 4 || dcid.len() > 20 || scid.len() > 20 {
         return h;
@@ -430,18 +471,18 @@ pub fn quic_long_header(ptype: i64, version: i64, dcid: Vec<i64>, scid: Vec<i64>
     h.push((version >> 8) & 255);
     h.push(version & 255);
     h.push(dcid.len());
-    qc_append(& mut h, dcid);
+    qc_append(&mut h, dcid);
     h.push(scid.len());
-    qc_append(& mut h, scid);
+    qc_append(&mut h, scid);
     if ptype == QUIC_INITIAL {
-        qc_append(& mut h, quic_varint_encode(token.len()));
-        qc_append(& mut h, token);
+        qc_append(&mut h, quic_varint_encode(token.len()));
+        qc_append(&mut h, token);
     }
     val length: i64 = pn_len + payload_len + 16;
     if length < 16384 {
-        qc_append(& mut h, quic_varint_encode_n(length, 2));
+        qc_append(&mut h, quic_varint_encode_n(length, 2));
     } else {
-        qc_append(& mut h, quic_varint_encode_n(length, 4));
+        qc_append(&mut h, quic_varint_encode_n(length, 4));
     }
     var i: i64 = pn_len - 1;
     while i >= 0 {
@@ -467,7 +508,7 @@ pub fn quic_short_header(dcid: Vec<i64>, pn: i64, pn_len: i64, key_phase: bool, 
         first = first | 0x20;
     }
     h.push(first);
-    qc_append(& mut h, dcid);
+    qc_append(&mut h, dcid);
     var i: i64 = pn_len - 1;
     while i >= 0 {
         h.push((pn >> (8 * i)) & 255);
@@ -480,14 +521,14 @@ pub fn quic_short_header(dcid: Vec<i64>, pn: i64, pn_len: i64, key_phase: bool, 
 /// §17.2): `ok` false for a short header, a Version Negotiation packet,
 /// a connection ID over 20 bytes or a packet cut short.
 pub fn quic_parse_long(p: Vec<i64>) -> QuicLongHeader {
-    val bad: QuicLongHeader = QuicLongHeader { ok: false, ptype: 0, version: 0,
-        dcid: qc_empty(), scid: qc_empty(), token: qc_empty(), pn_offset: 0, end: 0 };
+    val bad: QuicLongHeader = QuicLongHeader {
+        ok: false, ptype: 0, version: 0, dcid: qc_empty(), scid: qc_empty(), token: qc_empty(), pn_offset: 0, end: 0
+    };
     if p.len() < 7 || (p.get(0) & 0x80) == 0 {
         return bad;
     }
     val ptype: i64 = (p.get(0) >> 4) & 3;
-    val version: i64 = ((p.get(1) & 255) << 24) | ((p.get(2) & 255) << 16)
-        | ((p.get(3) & 255) << 8) | (p.get(4) & 255);
+    val version: i64 = ((p.get(1) & 255) << 24) | ((p.get(2) & 255) << 16) | ((p.get(3) & 255) << 8) | (p.get(4) & 255);
     if version == 0 {
         return bad;
     }
@@ -511,9 +552,9 @@ pub fn quic_parse_long(p: Vec<i64>) -> QuicLongHeader {
         if p.len() < off + 16 {
             return bad;
         }
-        return QuicLongHeader { ok: true, ptype: ptype, version: version, dcid: dcid,
-            scid: scid, token: quic_slice(p, off, p.len() - 16),
-            pn_offset: p.len(), end: p.len() };
+        return QuicLongHeader {
+            ok: true, ptype: ptype, version: version, dcid: dcid, scid: scid, token: quic_slice(p, off, p.len() - 16), pn_offset: p.len(), end: p.len()
+        };
     }
     var token: Vec<i64> = Vec::new();
     if ptype == QUIC_INITIAL {
@@ -533,8 +574,9 @@ pub fn quic_parse_long(p: Vec<i64>) -> QuicLongHeader {
     if off + length.value > p.len() {
         return bad;
     }
-    return QuicLongHeader { ok: true, ptype: ptype, version: version, dcid: dcid,
-        scid: scid, token: token, pn_offset: off, end: off + length.value };
+    return QuicLongHeader {
+        ok: true, ptype: ptype, version: version, dcid: dcid, scid: scid, token: token, pn_offset: off, end: off + length.value
+    };
 }
 
 /// Protect a packet (§5.3, §5.4.1): `header` is the unprotected header
@@ -543,7 +585,8 @@ pub fn quic_parse_long(p: Vec<i64>) -> QuicLongHeader {
 /// then the header is masked with a sample of the ciphertext taken 4
 /// bytes after the packet number's start. Empty when the keys are unknown
 /// or the payload is too short to sample (pad it: RFC 9001 §5.4.2).
-@declassify pub fn quic_protect(@secret keys: QuicKeys, header: Vec<i64>, pn: i64, payload: Vec<i64>) -> Vec<i64> {
+@declassify
+pub fn quic_protect(@secret keys: QuicKeys, header: Vec<i64>, pn: i64, payload: Vec<i64>) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     if header.len() < 2 {
         return out;
@@ -577,12 +620,14 @@ pub fn quic_parse_long(p: Vec<i64>) -> QuicLongHeader {
         out.push(b);
         i = i + 1;
     }
-    qc_append(& mut out, sealed);
+    qc_append(&mut out, sealed);
     return out;
 }
 
 fn qc_failed(end: i64) -> QuicOpened {
-    return QuicOpened { ok: false, header: qc_empty(), pn: 0, payload: qc_empty(), end: end };
+    return QuicOpened {
+        ok: false, header: qc_empty(), pn: 0, payload: qc_empty(), end: end
+    };
 }
 
 /// Remove the protection of the packet in `p` whose packet number starts
@@ -590,7 +635,8 @@ fn qc_failed(end: i64) -> QuicOpened {
 /// byte and the packet number, recover the full packet number against
 /// `largest_pn` (the largest received in its space, -1 for none) and open
 /// the payload with the unprotected header as AAD.
-@declassify pub fn quic_unprotect(@secret keys: QuicKeys, p: Vec<i64>, pn_offset: i64, end: i64, largest_pn: i64) -> QuicOpened {
+@declassify
+pub fn quic_unprotect(@secret keys: QuicKeys, p: Vec<i64>, pn_offset: i64, end: i64, largest_pn: i64) -> QuicOpened {
     if pn_offset < 1 || end > p.len() || pn_offset + 4 + 16 > end {
         return qc_failed(end);
     }
@@ -621,18 +667,20 @@ fn qc_failed(end: i64) -> QuicOpened {
         i = i + 1;
     }
     val pn: i64 = quic_decode_pn(largest_pn, truncated, 8 * pn_len);
-    val o: QcPlain = qc_open(keys, quic_nonce(keys.iv, pn), header,
-        quic_slice(p, pn_offset + pn_len, end));
+    val o: QcPlain = qc_open(keys, quic_nonce(keys.iv, pn), header, quic_slice(p, pn_offset + pn_len, end));
     if !o.ok {
         return qc_failed(end);
     }
-    return QuicOpened { ok: true, header: header, pn: pn, payload: o.plain, end: end };
+    return QuicOpened {
+        ok: true, header: header, pn: pn, payload: o.plain, end: end
+    };
 }
 
 /// quic_unprotect of the long-header packet at the start of `p` (an
 /// Initial, 0-RTT or Handshake packet); `end` tells where a coalesced
 /// next packet starts.
-@declassify pub fn quic_unprotect_long(@secret keys: QuicKeys, p: Vec<i64>, largest_pn: i64) -> QuicOpened {
+@declassify
+pub fn quic_unprotect_long(@secret keys: QuicKeys, p: Vec<i64>, largest_pn: i64) -> QuicOpened {
     val h: QuicLongHeader = quic_parse_long(p);
     if !h.ok || h.ptype == QUIC_RETRY {
         return qc_failed(p.len());
@@ -643,7 +691,8 @@ fn qc_failed(end: i64) -> QuicOpened {
 /// quic_unprotect of a short-header (1-RTT) packet: the receiver knows
 /// the length of its own connection ID, `dcid_len`; the packet runs to the
 /// end of `p`.
-@declassify pub fn quic_unprotect_short(@secret keys: QuicKeys, p: Vec<i64>, dcid_len: i64, largest_pn: i64) -> QuicOpened {
+@declassify
+pub fn quic_unprotect_short(@secret keys: QuicKeys, p: Vec<i64>, dcid_len: i64, largest_pn: i64) -> QuicOpened {
     if p.len() < 1 || (p.get(0) & 0x80) != 0 {
         return qc_failed(p.len());
     }
@@ -658,18 +707,39 @@ fn qc_failed(end: i64) -> QuicOpened {
 /// encrypted.
 pub fn quic_retry_tag(odcid: Vec<i64>, retry_without_tag: Vec<i64>) -> Vec<i64> {
     var key: Vec<i64> = Vec::new();
-    key.push(0xbe); key.push(0x0c); key.push(0x69); key.push(0x0b);
-    key.push(0x9f); key.push(0x66); key.push(0x57); key.push(0x5a);
-    key.push(0x1d); key.push(0x76); key.push(0x6b); key.push(0x54);
-    key.push(0xe3); key.push(0x68); key.push(0xc8); key.push(0x4e);
+    key.push(0xbe);
+    key.push(0x0c);
+    key.push(0x69);
+    key.push(0x0b);
+    key.push(0x9f);
+    key.push(0x66);
+    key.push(0x57);
+    key.push(0x5a);
+    key.push(0x1d);
+    key.push(0x76);
+    key.push(0x6b);
+    key.push(0x54);
+    key.push(0xe3);
+    key.push(0x68);
+    key.push(0xc8);
+    key.push(0x4e);
     var nonce: Vec<i64> = Vec::new();
-    nonce.push(0x46); nonce.push(0x15); nonce.push(0x99); nonce.push(0xd3);
-    nonce.push(0x5d); nonce.push(0x63); nonce.push(0x2b); nonce.push(0xf2);
-    nonce.push(0x23); nonce.push(0x98); nonce.push(0x25); nonce.push(0xbb);
+    nonce.push(0x46);
+    nonce.push(0x15);
+    nonce.push(0x99);
+    nonce.push(0xd3);
+    nonce.push(0x5d);
+    nonce.push(0x63);
+    nonce.push(0x2b);
+    nonce.push(0xf2);
+    nonce.push(0x23);
+    nonce.push(0x98);
+    nonce.push(0x25);
+    nonce.push(0xbb);
     var pseudo: Vec<i64> = Vec::new();
     pseudo.push(odcid.len());
-    qc_append(& mut pseudo, odcid);
-    qc_append(& mut pseudo, retry_without_tag);
+    qc_append(&mut pseudo, odcid);
+    qc_append(&mut pseudo, retry_without_tag);
     return aes_gcm_seal(key, nonce, pseudo, qc_empty());
 }
 
@@ -709,12 +779,12 @@ pub fn quic_retry_packet(dcid: Vec<i64>, scid: Vec<i64>, odcid: Vec<i64>, token:
     p.push(0);
     p.push(QUIC_V1);
     p.push(dcid.len());
-    qc_append(& mut p, dcid);
+    qc_append(&mut p, dcid);
     p.push(scid.len());
-    qc_append(& mut p, scid);
-    qc_append(& mut p, token);
+    qc_append(&mut p, scid);
+    qc_append(&mut p, token);
     val tag: Vec<i64> = quic_retry_tag(odcid, p);
-    qc_append(& mut p, tag);
+    qc_append(&mut p, tag);
     return p;
 }
 
@@ -734,7 +804,7 @@ pub struct QuicVersionNeg {
 /// datagram too short to tell.
 pub fn quic_packet_version(d: Vec<i64>) -> i64 {
     if d.len() < 5 || (d.get(0) & 0x80) == 0 {
-        return - 1;
+        return -1;
     }
     return ((d.get(1) & 255) << 24) | ((d.get(2) & 255) << 16) | ((d.get(3) & 255) << 8) | (d.get(4) & 255);
 }
@@ -771,9 +841,9 @@ pub fn quic_version_negotiation(d: Vec<i64>, versions: Vec<i64>, unused: i64) ->
     out.push(0);
     out.push(0);
     out.push(scid.len());
-    qc_append(& mut out, scid);
+    qc_append(&mut out, scid);
     out.push(dcid.len());
-    qc_append(& mut out, dcid);
+    qc_append(&mut out, dcid);
     var i: i64 = 0;
     while i < versions.len() {
         val v: i64 = versions.get(i);
@@ -789,7 +859,9 @@ pub fn quic_version_negotiation(d: Vec<i64>, versions: Vec<i64>, unused: i64) ->
 /// Parse a Version Negotiation packet; `ok` false when `p` is not one (a
 /// version list must hold whole 4-byte versions).
 pub fn quic_parse_version_negotiation(p: Vec<i64>) -> QuicVersionNeg {
-    val bad: QuicVersionNeg = QuicVersionNeg { ok: false, dcid: qc_empty(), scid: qc_empty(), versions: qc_empty() };
+    val bad: QuicVersionNeg = QuicVersionNeg {
+        ok: false, dcid: qc_empty(), scid: qc_empty(), versions: qc_empty()
+    };
     if quic_packet_version(p) != 0 || p.len() < 7 {
         return bad;
     }
@@ -805,12 +877,12 @@ pub fn quic_parse_version_negotiation(p: Vec<i64>) -> QuicVersionNeg {
     var versions: Vec<i64> = Vec::new();
     var off: i64 = start;
     while off + 4 <= p.len() {
-        versions.push(((p.get(off) & 255) << 24) | ((p.get(off + 1) & 255) << 16)
-            | ((p.get(off + 2) & 255) << 8) | (p.get(off + 3) & 255));
+        versions.push(((p.get(off) & 255) << 24) | ((p.get(off + 1) & 255) << 16) | ((p.get(off + 2) & 255) << 8) | (p.get(off + 3) & 255));
         off = off + 4;
     }
-    return QuicVersionNeg { ok: true, dcid: quic_slice(p, 6, 6 + dlen),
-        scid: quic_slice(p, 7 + dlen, start), versions: versions };
+    return QuicVersionNeg {
+        ok: true, dcid: quic_slice(p, 6, 6 + dlen), scid: quic_slice(p, 7 + dlen, start), versions: versions
+    };
 }
 
 // ─── Stateless reset (RFC 9000 §10.3) ───────────────────────────────────
@@ -819,7 +891,8 @@ pub fn quic_parse_version_negotiation(p: Vec<i64>) -> QuicVersionNeg {
 /// endpoint's static key (32 bytes, kept secret) over the ID, 16 bytes
 /// (§10.3.2: the same key and ID always give the same token, and the
 /// token says nothing about the key). Released: it goes on the wire.
-@declassify pub fn quic_reset_token(@secret key: Vec<i64>, cid: Vec<i64>) -> Vec<i64> {
+@declassify
+pub fn quic_reset_token(@secret key: Vec<i64>, cid: Vec<i64>) -> Vec<i64> {
     return hkdf_expand_label(key, "fides reset", cid, 16);
 }
 
@@ -843,7 +916,7 @@ pub fn quic_stateless_reset(token: Vec<i64>, trigger_len: i64, random: Vec<i64>)
         out.push(random.get(i) & 255);
         i = i + 1;
     }
-    qc_append(& mut out, token);
+    qc_append(&mut out, token);
     return out;
 }
 

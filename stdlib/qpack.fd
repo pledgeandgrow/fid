@@ -33,7 +33,8 @@
 // every static entry, Huffman literals, the errors).
 
 module qpack;
- use vec; use string;
+use vec;
+use string;
 
 /// QPACK error codes (RFC 9204 §6), sent as HTTP/3 application errors.
 pub const QPACK_DECOMPRESSION_FAILED: i64 = 0x200;
@@ -76,7 +77,8 @@ pub struct QpackScan {
 
 // ─── Static table (Appendix A) ─────────────────────────────────────────
 
-var qp_st_names: Vec<str> = Vec::new(); var qp_st_vals: Vec<str> = Vec::new();
+var qp_st_names: Vec<str> = Vec::new();
+var qp_st_vals: Vec<str> = Vec::new();
 fn qp_init() {
     if qp_st_names.len() > 0 {
         return;
@@ -318,7 +320,7 @@ pub fn qpack_static_find(name: str, value: str) -> i64 {
         }
         i = i + 1;
     }
-    return - 1;
+    return -1;
 }
 
 /// The first static entry named `name`, -1 if none.
@@ -331,7 +333,7 @@ pub fn qpack_static_find_name(name: str) -> i64 {
         }
         i = i + 1;
     }
-    return - 1;
+    return -1;
 }
 
 /// The size of a field section by RFC 9114 §4.2.2 (and RFC 9204 §3.2.1):
@@ -365,16 +367,19 @@ const QP_INT_MAX: i64 = 2147483647;
 /// one length are consecutive in symbol order, after the shorter ones.
 const QP_HUFF_LENS: str = "ISXXXXXXXTZXXZXXXXXXXXZXXXXXXXXXBFFHIBDGFFDGDBBBAAABBBBBBBCDKBHFIBCCCCCCCCCCCCCCCCCCCCCCDCDIOIJBKABABABBBACCBBBABCBAABCCCCCKGJIXPRPPRRRSRSSSSSTSTTRSTSSSSQRSRSSTRQPRRSSQSRRTQRSSQQRQSRSSPRRRSRRSVVPORSRUVVVWWVTUOQVWWVWTQQVVXWWWPTPQRQQSRRUUTTVSVWVVWWWWWXWWWWWVZ";
 
-var qp_hlen: Vec<i64> = Vec::new(); var qp_hcode: Vec<i64> = Vec::new();
-var qp_hfirst: Vec<i64> = Vec::new(); var qp_hcount: Vec<i64> = Vec::new();
-var qp_hstart: Vec<i64> = Vec::new(); var qp_hsorted: Vec<i64> = Vec::new();
+var qp_hlen: Vec<i64> = Vec::new();
+var qp_hcode: Vec<i64> = Vec::new();
+var qp_hfirst: Vec<i64> = Vec::new();
+var qp_hcount: Vec<i64> = Vec::new();
+var qp_hstart: Vec<i64> = Vec::new();
+var qp_hsorted: Vec<i64> = Vec::new();
 fn qp_huff_init() {
     if qp_hlen.len() > 0 {
         return;
     }
     var l: i64 = 0;
     while l <= 30 {
-        qp_hfirst.push(- 1);
+        qp_hfirst.push(-1);
         qp_hcount.push(0);
         qp_hstart.push(0);
         l = l + 1;
@@ -460,7 +465,7 @@ fn qp_huff_encode(bytes: Vec<i64>) -> Vec<i64> {
 /// Decode `n` Huffman-coded bytes of `b` from `from` into `out`. False when
 /// the input holds EOS or is padded with more than 7 bits or with bits
 /// other than ones (RFC 7541 §5.2).
-fn qp_huff_decode_into(b: Vec<i64>, from: i64, n: i64, out: & mut Vec<i64>) -> bool {
+fn qp_huff_decode_into(b: Vec<i64>, from: i64, n: i64, out: &mut Vec<i64>) -> bool {
     qp_huff_init();
     var code: i64 = 0;
     var len: i64 = 0;
@@ -496,7 +501,7 @@ fn qp_huff_decode_into(b: Vec<i64>, from: i64, n: i64, out: & mut Vec<i64>) -> b
 
 /// Append `value` as an integer with an N-bit prefix (`prefix` 1..8);
 /// `first` holds the bits above the prefix.
-fn qp_put_int(out: & mut Vec<i64>, first: i64, prefix: i64, value: i64) {
+fn qp_put_int(out: &mut Vec<i64>, first: i64, prefix: i64, value: i64) {
     val max: i64 = (1 << prefix) - 1;
     if value < max {
         out.push(first | value);
@@ -513,11 +518,11 @@ fn qp_put_int(out: & mut Vec<i64>, first: i64, prefix: i64, value: i64) {
 
 /// Read an integer with an N-bit prefix at `*pos`, moving `*pos` past it.
 /// -1 (and `*pos` -1) when the input ends first or the value is too large.
-fn qp_get_int(b: Vec<i64>, pos: & mut i64, prefix: i64) -> i64 {
-    val at: i64 = * pos;
+fn qp_get_int(b: Vec<i64>, pos: &mut i64, prefix: i64) -> i64 {
+    val at: i64 = *pos;
     if at < 0 || at >= b.len() {
-        * pos = - 1;
-        return - 1;
+        *pos = -1;
+        return -1;
     }
     val max: i64 = (1 << prefix) - 1;
     var v: i64 = b.get(at) & max;
@@ -527,8 +532,8 @@ fn qp_get_int(b: Vec<i64>, pos: & mut i64, prefix: i64) -> i64 {
         var more: bool = true;
         while more {
             if p >= b.len() || shift > 28 {
-                * pos = - 1;
-                return - 1;
+                *pos = -1;
+                return -1;
             }
             val c: i64 = b.get(p);
             p = p + 1;
@@ -537,8 +542,8 @@ fn qp_get_int(b: Vec<i64>, pos: & mut i64, prefix: i64) -> i64 {
             more = (c & 128) != 0;
         }
         if v > QP_INT_MAX {
-            * pos = - 1;
-            return - 1;
+            *pos = -1;
+            return -1;
         }
     }
     * pos = p;
@@ -547,7 +552,7 @@ fn qp_get_int(b: Vec<i64>, pos: & mut i64, prefix: i64) -> i64 {
 
 // ─── Encoding (§4.5) ───────────────────────────────────────────────────
 
-fn qp_put_bytes(out: & mut Vec<i64>, b: Vec<i64>) {
+fn qp_put_bytes(out: &mut Vec<i64>, b: Vec<i64>) {
     var i: i64 = 0;
     while i < b.len() {
         out.push(b.get(i) & 255);
@@ -557,7 +562,7 @@ fn qp_put_bytes(out: & mut Vec<i64>, b: Vec<i64>) {
 
 /// A string literal whose length has a `prefix`-bit prefix; the H bit is
 /// the bit just above the prefix, `first` holds the bits above that.
-fn qp_put_str(out: & mut Vec<i64>, first: i64, prefix: i64, s: str, huffman: bool) {
+fn qp_put_str(out: &mut Vec<i64>, first: i64, prefix: i64, s: str, huffman: bool) {
     val bytes: Vec<i64> = str_bytes(s);
     if huffman && bytes.len() > 0 && qp_huff_size(bytes) < bytes.len() {
         val coded: Vec<i64> = qp_huff_encode(bytes);
@@ -578,7 +583,7 @@ fn qp_sensitive(name: str) -> bool {
 /// whole field, a literal with a static name reference when it holds the
 /// name, a literal with a literal name otherwise. Strings are
 /// Huffman-coded when `huffman` and that is shorter.
-pub fn qpack_encode_line(out: & mut Vec<i64>, name: str, value: str, huffman: bool) {
+pub fn qpack_encode_line(out: &mut Vec<i64>, name: str, value: str, huffman: bool) {
     var n_bit: i64 = 0;
     if qp_sensitive(name) {
         n_bit = 0x20;
@@ -614,7 +619,7 @@ pub fn qpack_encode(names: Vec<str>, values: Vec<str>, huffman: bool) -> Vec<i64
     out.push(0);
     var i: i64 = 0;
     while i < names.len() {
-        qpack_encode_line(& mut out, names.get(i), values.get(i), huffman);
+        qpack_encode_line(&mut out, names.get(i), values.get(i), huffman);
         i = i + 1;
     }
     return out;
@@ -633,25 +638,25 @@ fn qp_fail(r: QpackFields, why: str) -> QpackFields {
 /// A string literal at `*pos` whose length has a `prefix`-bit prefix (the
 /// H bit just above it). `*pos` becomes -1 when it is cut short, too long
 /// or badly Huffman-coded.
-fn qp_get_str(b: Vec<i64>, pos: & mut i64, prefix: i64) -> str {
-    if * pos < 0 || * pos >= b.len() {
-        * pos = - 1;
+fn qp_get_str(b: Vec<i64>, pos: &mut i64, prefix: i64) -> str {
+    if *pos < 0 || *pos >= b.len() {
+        *pos = -1;
         return "";
     }
-    val huff: bool = ((b.get(* pos) >> prefix) & 1) != 0;
+    val huff: bool = ((b.get(*pos) >> prefix) & 1) != 0;
     val n: i64 = qp_get_int(b, pos, prefix);
     if n < 0 {
         return "";
     }
-    val at: i64 = * pos;
+    val at: i64 = *pos;
     if at + n > b.len() {
-        * pos = - 1;
+        *pos = -1;
         return "";
     }
     var bytes: Vec<i64> = Vec::new();
     if huff {
-        if !qp_huff_decode_into(b, at, n, & mut bytes) {
-            * pos = - 1;
+        if !qp_huff_decode_into(b, at, n, &mut bytes) {
+            *pos = -1;
             return "";
         }
     } else {
@@ -670,10 +675,10 @@ fn qp_get_str(b: Vec<i64>, pos: & mut i64, prefix: i64) -> str {
 /// section accepted (RFC 9114 §4.2.2), -1 for no limit.
 pub fn qpack_decode(block: Vec<i64>, max_size: i64) -> QpackFields {
     var r: QpackFields = QpackFields {
-        ok: true, error: - 1, too_large: false, why: "", names: Vec::new(), values: Vec::new(), size: 0,
+        ok: true, error: -1, too_large: false, why: "", names: Vec::new(), values: Vec::new(), size: 0,
     };
     var pos: i64 = 0;
-    val ric: i64 = qp_get_int(block, & mut pos, 8);
+    val ric: i64 = qp_get_int(block, &mut pos, 8);
     if pos < 0 {
         return qp_fail(r, "field section prefix cut short");
     }
@@ -682,7 +687,7 @@ pub fn qpack_decode(block: Vec<i64>, max_size: i64) -> QpackFields {
         // is 0 (§4.5.1.1).
         return qp_fail(r, "Required Insert Count " + int_to_str(ric) + " without a dynamic table");
     }
-    qp_get_int(block, & mut pos, 7);
+    qp_get_int(block, &mut pos, 7);
     if pos < 0 {
         return qp_fail(r, "field section prefix cut short");
     }
@@ -695,7 +700,7 @@ pub fn qpack_decode(block: Vec<i64>, max_size: i64) -> QpackFields {
             if (first & 0x40) == 0 {
                 return qp_fail(r, "dynamic table reference");
             }
-            val idx: i64 = qp_get_int(block, & mut pos, 6);
+            val idx: i64 = qp_get_int(block, &mut pos, 6);
             if pos < 0 || idx >= QPACK_STATIC_LEN {
                 return qp_fail(r, "bad static index");
             }
@@ -706,22 +711,22 @@ pub fn qpack_decode(block: Vec<i64>, max_size: i64) -> QpackFields {
             if (first & 0x10) == 0 {
                 return qp_fail(r, "dynamic table name reference");
             }
-            val idx: i64 = qp_get_int(block, & mut pos, 4);
+            val idx: i64 = qp_get_int(block, &mut pos, 4);
             if pos < 0 || idx >= QPACK_STATIC_LEN {
                 return qp_fail(r, "bad static name index");
             }
             name = qpack_static_name(idx);
-            value = qp_get_str(block, & mut pos, 7);
+            value = qp_get_str(block, &mut pos, 7);
             if pos < 0 {
                 return qp_fail(r, "bad field value");
             }
         } else if (first & 0x20) != 0 {
             // Literal field line with literal name
-            name = qp_get_str(block, & mut pos, 3);
+            name = qp_get_str(block, &mut pos, 3);
             if pos < 0 {
                 return qp_fail(r, "bad field name");
             }
-            value = qp_get_str(block, & mut pos, 7);
+            value = qp_get_str(block, &mut pos, 7);
             if pos < 0 {
                 return qp_fail(r, "bad field value");
             }
@@ -746,18 +751,20 @@ pub fn qpack_decode(block: Vec<i64>, max_size: i64) -> QpackFields {
 // ─── Encoder and decoder streams (§4.3, §4.4) ──────────────────────────
 
 fn qp_scan(status: i64, used: i64, error: i64, why: str) -> QpackScan {
-    return QpackScan { status: status, used: used, error: error, why: why };
+    return QpackScan {
+        status: status, used: used, error: error, why: why
+    };
 }
 
 /// An integer with a `prefix`-bit prefix at `*pos` that may be cut short
 /// by the end of what arrived: -2 when it is (more may come), -1 when it
 /// is too large, else the value (and `*pos` moves past it).
-fn qp_stream_int(b: Vec<i64>, pos: & mut i64, prefix: i64) -> i64 {
-    val at: i64 = * pos;
+fn qp_stream_int(b: Vec<i64>, pos: &mut i64, prefix: i64) -> i64 {
+    val at: i64 = *pos;
     var p: i64 = at;
-    val v: i64 = qp_get_int(b, & mut p, prefix);
+    val v: i64 = qp_get_int(b, &mut p, prefix);
     if p >= 0 {
-        * pos = p;
+        *pos = p;
         return v;
     }
     // Cut short when every continuation byte to the end has its high bit
@@ -765,14 +772,14 @@ fn qp_stream_int(b: Vec<i64>, pos: & mut i64, prefix: i64) -> i64 {
     var k: i64 = at + 1;
     while k < b.len() {
         if (b.get(k) & 128) == 0 {
-            return - 1;
+            return -1;
         }
         k = k + 1;
     }
     if b.len() - at > 6 {
-        return - 1;
+        return -1;
     }
-    return - 2;
+    return -2;
 }
 
 /// Scan what the peer sent on its QPACK encoder stream from `from`,
@@ -785,26 +792,23 @@ pub fn qpack_encoder_stream_scan(b: Vec<i64>, from: i64, max_capacity: i64) -> Q
         val first: i64 = b.get(pos) & 255;
         if (first & 0xe0) == 0x20 {
             var p: i64 = pos;
-            val cap: i64 = qp_stream_int(b, & mut p, 5);
-            if cap == - 2 {
-                return qp_scan(QPACK_SCAN_MORE, pos - from, - 1, "");
+            val cap: i64 = qp_stream_int(b, &mut p, 5);
+            if cap == -2 {
+                return qp_scan(QPACK_SCAN_MORE, pos - from, -1, "");
             }
             if cap < 0 || cap > max_capacity {
-                return qp_scan(QPACK_SCAN_ERROR, pos - from, QPACK_ENCODER_STREAM_ERROR,
-                    "dynamic table capacity over our maximum");
+                return qp_scan(QPACK_SCAN_ERROR, pos - from, QPACK_ENCODER_STREAM_ERROR, "dynamic table capacity over our maximum");
             }
             pos = p;
         } else if max_capacity == 0 {
             // Insert with name reference (1...), with literal name (01..)
             // or Duplicate (000): an entry never fits a table of size 0
-            return qp_scan(QPACK_SCAN_ERROR, pos - from, QPACK_ENCODER_STREAM_ERROR,
-                "an insertion into a table of capacity 0");
+            return qp_scan(QPACK_SCAN_ERROR, pos - from, QPACK_ENCODER_STREAM_ERROR, "an insertion into a table of capacity 0");
         } else {
-            return qp_scan(QPACK_SCAN_ERROR, pos - from, QPACK_ENCODER_STREAM_ERROR,
-                "dynamic table insertions are not supported");
+            return qp_scan(QPACK_SCAN_ERROR, pos - from, QPACK_ENCODER_STREAM_ERROR, "dynamic table insertions are not supported");
         }
     }
-    return qp_scan(QPACK_SCAN_OK, pos - from, - 1, "");
+    return qp_scan(QPACK_SCAN_OK, pos - from, -1, "");
 }
 
 /// Scan what the peer sent on its QPACK decoder stream from `from`. We
@@ -817,21 +821,19 @@ pub fn qpack_decoder_stream_scan(b: Vec<i64>, from: i64) -> QpackScan {
         val first: i64 = b.get(pos) & 255;
         if (first & 0xc0) == 0x40 {
             var p: i64 = pos;
-            val sid: i64 = qp_stream_int(b, & mut p, 6);
-            if sid == - 2 {
-                return qp_scan(QPACK_SCAN_MORE, pos - from, - 1, "");
+            val sid: i64 = qp_stream_int(b, &mut p, 6);
+            if sid == -2 {
+                return qp_scan(QPACK_SCAN_MORE, pos - from, -1, "");
             }
             if sid < 0 {
                 return qp_scan(QPACK_SCAN_ERROR, pos - from, QPACK_DECODER_STREAM_ERROR, "stream id too large");
             }
             pos = p;
         } else if (first & 0x80) != 0 {
-            return qp_scan(QPACK_SCAN_ERROR, pos - from, QPACK_DECODER_STREAM_ERROR,
-                "Section Acknowledgment of a section without dynamic references");
+            return qp_scan(QPACK_SCAN_ERROR, pos - from, QPACK_DECODER_STREAM_ERROR, "Section Acknowledgment of a section without dynamic references");
         } else {
-            return qp_scan(QPACK_SCAN_ERROR, pos - from, QPACK_DECODER_STREAM_ERROR,
-                "Insert Count Increment without insertions");
+            return qp_scan(QPACK_SCAN_ERROR, pos - from, QPACK_DECODER_STREAM_ERROR, "Insert Count Increment without insertions");
         }
     }
-    return qp_scan(QPACK_SCAN_OK, pos - from, - 1, "");
+    return qp_scan(QPACK_SCAN_OK, pos - from, -1, "");
 }

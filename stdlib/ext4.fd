@@ -158,15 +158,15 @@ pub struct Ext4Dirent {
 
 // --- bytes ------------------------------------------------------------------------
 
-fn e4_u16(b: & Vec<i64>, o: i64) -> i64 {
+fn e4_u16(b: &Vec<i64>, o: i64) -> i64 {
     return b.get(o) + b.get(o + 1) * 256;
 }
 
-fn e4_u32(b: & Vec<i64>, o: i64) -> i64 {
+fn e4_u32(b: &Vec<i64>, o: i64) -> i64 {
     return e4_u16(b, o) + e4_u16(b, o + 2) * 65536;
 }
 
-fn e4_slice(b: & Vec<i64>, o: i64, n: i64) -> Vec<i64> {
+fn e4_slice(b: &Vec<i64>, o: i64, n: i64) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     var i: i64 = 0;
     while i < n {
@@ -203,7 +203,7 @@ fn e4_crc_init() {
 
 /// crc32c without the final inversion (the kernel's crc32c_le): ext4
 /// starts it at 0xFFFFFFFF and stores the result as it is.
-pub fn ext4_crc32c(crc: i64, data: & Vec<i64>, start: i64, len: i64) -> i64 {
+pub fn ext4_crc32c(crc: i64, data: &Vec<i64>, start: i64, len: i64) -> i64 {
     e4_crc_init();
     var c: i64 = crc;
     var i: i64 = 0;
@@ -226,7 +226,7 @@ fn e4_crc_u32(crc: i64, v: i64) -> i64 {
 // --- blocks -----------------------------------------------------------------------
 
 /// File system block `n` (empty when it cannot be read).
-pub fn ext4_block(fs: & Ext4Fs, n: i64) -> Vec<i64> {
+pub fn ext4_block(fs: &Ext4Fs, n: i64) -> Vec<i64> {
     if n < 0 || n >= fs.blocks_count {
         return Vec::new();
     }
@@ -375,7 +375,7 @@ pub fn ext4_open_opts(dev: BlockDev, recover: bool) -> Ext4Fs {
 }
 
 /// The inode table's first block of group `g`.
-fn e4_inode_table(fs: & Ext4Fs, g: i64) -> i64 {
+fn e4_inode_table(fs: &Ext4Fs, g: i64) -> i64 {
     val per: i64 = fs.bs / fs.desc_size;
     val gdt: i64 = fs.first_data_block + 1;
     val blk: Vec<i64> = ext4_block(fs, gdt + g / per);
@@ -391,12 +391,14 @@ fn e4_inode_table(fs: & Ext4Fs, g: i64) -> i64 {
 }
 
 fn e4_bad_inode(ino: i64, e: i64) -> Ext4Inode {
-    return Ext4Inode { err: e, ino: ino, mode: 0, uid: 0, gid: 0, size: 0, links: 0, blocks: 0, flags: 0, atime: 0, ctime: 0, mtime: 0, generation: 0, iblock: Vec::new(), csum_ok: false, dtime: 0, file_acl: 0 };
+    return Ext4Inode {
+        err: e, ino: ino, mode: 0, uid: 0, gid: 0, size: 0, links: 0, blocks: 0, flags: 0, atime: 0, ctime: 0, mtime: 0, generation: 0, iblock: Vec::new(), csum_ok: false, dtime: 0, file_acl: 0
+    };
 }
 
 /// Read inode `ino` (1-based). `err` is 0 or -errno; `csum_ok` is false
 /// when metadata_csum is on and the checksum does not match.
-pub fn ext4_inode(fs: & Ext4Fs, ino: i64) -> Ext4Inode {
+pub fn ext4_inode(fs: &Ext4Fs, ino: i64) -> Ext4Inode {
     if ino < 1 || ino > fs.inodes_count {
         return e4_bad_inode(ino, 0 - VFS_EINVAL);
     }
@@ -448,15 +450,15 @@ pub fn ext4_inode(fs: & Ext4Fs, ino: i64) -> Ext4Inode {
     return n;
 }
 
-pub fn ext4_is_dir(n: & Ext4Inode) -> bool {
+pub fn ext4_is_dir(n: &Ext4Inode) -> bool {
     return (n.mode & 61440) == 16384;
 }
 
-pub fn ext4_is_reg(n: & Ext4Inode) -> bool {
+pub fn ext4_is_reg(n: &Ext4Inode) -> bool {
     return (n.mode & 61440) == 32768;
 }
 
-pub fn ext4_is_symlink(n: & Ext4Inode) -> bool {
+pub fn ext4_is_symlink(n: &Ext4Inode) -> bool {
     return (n.mode & 61440) == 40960;
 }
 
@@ -464,7 +466,7 @@ pub fn ext4_is_symlink(n: & Ext4Inode) -> bool {
 
 /// Extents of an inode as flat words [logical, length, physical,
 /// uninitialized] each, collected through an extent tree of any depth.
-pub fn ext4_extents(fs: & Ext4Fs, n: & Ext4Inode) -> Vec<i64> {
+pub fn ext4_extents(fs: &Ext4Fs, n: &Ext4Inode) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     var nodes: Vec<Vec<i64>> = Vec::new();
     nodes.push(n.iblock);
@@ -512,7 +514,7 @@ pub fn ext4_extents(fs: & Ext4Fs, n: & Ext4Inode) -> Vec<i64> {
     return out;
 }
 
-fn e4_ind(fs: & Ext4Fs, blk: i64, level: i64, first: i64, count: i64, map: &mut Vec<i64>) {
+fn e4_ind(fs: &Ext4Fs, blk: i64, level: i64, first: i64, count: i64, map: &mut Vec<i64>) {
     // `first` is the logical block of this tree's first leaf
     if blk == 0 {
         return;
@@ -546,7 +548,7 @@ fn e4_ind(fs: & Ext4Fs, blk: i64, level: i64, first: i64, count: i64, map: &mut 
 
 /// The physical block of every logical block of the file (0 = a hole or
 /// an uninitialized extent).
-pub fn ext4_block_map(fs: & Ext4Fs, n: & Ext4Inode) -> Vec<i64> {
+pub fn ext4_block_map(fs: &Ext4Fs, n: &Ext4Inode) -> Vec<i64> {
     val count: i64 = (n.size + fs.bs - 1) / fs.bs;
     var map: Vec<i64> = Vec::filled(count, 0);
     if (n.flags & EXT4_EXTENTS_FL) != 0 {
@@ -580,7 +582,7 @@ pub fn ext4_block_map(fs: & Ext4Fs, n: & Ext4Inode) -> Vec<i64> {
 }
 
 /// `len` bytes of the file from `off` (holes read as zeros).
-pub fn ext4_read(fs: & Ext4Fs, n: & Ext4Inode, off: i64, len: i64) -> Vec<i64> {
+pub fn ext4_read(fs: &Ext4Fs, n: &Ext4Inode, off: i64, len: i64) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     var end: i64 = off + len;
     if end > n.size {
@@ -614,7 +616,7 @@ pub fn ext4_read(fs: & Ext4Fs, n: & Ext4Inode, off: i64, len: i64) -> Vec<i64> {
 }
 
 /// The target of a symlink inode.
-pub fn ext4_readlink(fs: & Ext4Fs, n: & Ext4Inode) -> str {
+pub fn ext4_readlink(fs: &Ext4Fs, n: &Ext4Inode) -> str {
     if !ext4_is_symlink(n) {
         return "";
     }
@@ -628,7 +630,7 @@ pub fn ext4_readlink(fs: & Ext4Fs, n: & Ext4Inode) -> str {
 
 /// Every entry of a directory inode (including "." and ".."), read
 /// linearly block by block.
-pub fn ext4_readdir(fs: & Ext4Fs, n: & Ext4Inode) -> Vec<Ext4Dirent> {
+pub fn ext4_readdir(fs: &Ext4Fs, n: &Ext4Inode) -> Vec<Ext4Dirent> {
     var out: Vec<Ext4Dirent> = Vec::new();
     if !ext4_is_dir(n) {
         return out;
@@ -654,7 +656,9 @@ pub fn ext4_readdir(fs: & Ext4Fs, n: & Ext4Inode) -> Vec<Ext4Dirent> {
                     break;
                 }
                 if ino != 0 && nl > 0 && o + 8 + nl <= b.len() {
-                    out.push(Ext4Dirent { name: str_from_bytes(e4_slice(&b, o + 8, nl)), ino: ino, ftype: t });
+                    out.push(Ext4Dirent {
+                        name: str_from_bytes(e4_slice(&b, o + 8, nl)), ino: ino, ftype: t
+                    });
                 }
                 o = o + rec;
             }
@@ -665,7 +669,7 @@ pub fn ext4_readdir(fs: & Ext4Fs, n: & Ext4Inode) -> Vec<Ext4Dirent> {
 }
 
 /// The inode of `name` in directory inode `dir`, or -ENOENT.
-pub fn ext4_dir_lookup(fs: & Ext4Fs, dir: i64, name: str) -> i64 {
+pub fn ext4_dir_lookup(fs: &Ext4Fs, dir: i64, name: str) -> i64 {
     val d: Ext4Inode = ext4_inode(fs, dir);
     if d.err < 0 {
         return d.err;
@@ -686,7 +690,7 @@ pub fn ext4_dir_lookup(fs: & Ext4Fs, dir: i64, name: str) -> i64 {
 
 /// Resolve an absolute path to an inode number (or -errno), following
 /// symlinks (in the last component too when `follow`).
-pub fn ext4_lookup(fs: & Ext4Fs, path: str, follow: bool) -> i64 {
+pub fn ext4_lookup(fs: &Ext4Fs, path: str, follow: bool) -> i64 {
     var comps: Vec<str> = Vec::new();
     val parts: Vec<str> = str_split(path, "/");
     var i: i64 = 0;
@@ -782,7 +786,7 @@ fn e4_set32(b: &mut Vec<i64>, o: i64, v: i64) {
     e4_set16(b, o + 2, (v >> 16) & 65535);
 }
 
-fn e4_be32(b: & Vec<i64>, o: i64) -> i64 {
+fn e4_be32(b: &Vec<i64>, o: i64) -> i64 {
     return ((b.get(o) * 256 + b.get(o + 1)) * 256 + b.get(o + 2)) * 256 + b.get(o + 3);
 }
 
@@ -800,7 +804,7 @@ fn e4_min(a: i64, b: i64) -> i64 {
     return b;
 }
 
-fn e4_copy_into(dst: &mut Vec<i64>, at: i64, src: & Vec<i64>, from: i64, n: i64) {
+fn e4_copy_into(dst: &mut Vec<i64>, at: i64, src: &Vec<i64>, from: i64, n: i64) {
     var i: i64 = 0;
     while i < n {
         dst.set(at + i, src.get(from + i));
@@ -809,7 +813,7 @@ fn e4_copy_into(dst: &mut Vec<i64>, at: i64, src: & Vec<i64>, from: i64, n: i64)
 }
 
 /// Write file system block `n` (bs bytes). 0 or -errno.
-pub fn ext4_put_block(fs: & Ext4Fs, n: i64, data: Vec<i64>) -> i64 {
+pub fn ext4_put_block(fs: &Ext4Fs, n: i64, data: Vec<i64>) -> i64 {
     if n < 0 || n >= fs.blocks_count || data.len() != fs.bs {
         return 0 - VFS_EINVAL;
     }
@@ -821,7 +825,7 @@ pub fn ext4_put_block(fs: & Ext4Fs, n: i64, data: Vec<i64>) -> i64 {
 
 /// crc16 (poly 0x8005 reflected, as lib/crc16.c) for uninit_bg descriptor
 /// checksums.
-fn e4_crc16(crc: i64, data: & Vec<i64>, start: i64, len: i64) -> i64 {
+fn e4_crc16(crc: i64, data: &Vec<i64>, start: i64, len: i64) -> i64 {
     var c: i64 = crc & 65535;
     var i: i64 = 0;
     while i < len {
@@ -851,7 +855,7 @@ fn e4_le32_bytes(v: i64) -> Vec<i64> {
 
 /// The checksum seed of an inode's metadata (directory blocks, extent
 /// blocks): crc32c(fs seed, inode number, generation).
-fn e4_inode_seed(fs: & Ext4Fs, ino: i64, generation: i64) -> i64 {
+fn e4_inode_seed(fs: &Ext4Fs, ino: i64, generation: i64) -> i64 {
     return e4_crc_u32(e4_crc_u32(fs.csum_seed, ino), generation);
 }
 
@@ -865,7 +869,7 @@ pub fn ext4_writable_ro_compat() -> i64 {
 }
 
 // Why writing is refused ("" when it is allowed).
-fn e4_ro_reason(fs: & Ext4Fs) -> str {
+fn e4_ro_reason(fs: &Ext4Fs) -> str {
     val unknown: i64 = fs.ro_compat & (0 - 1 - ext4_writable_ro_compat()) & 4294967295;
     if unknown != 0 {
         return "ro_compat features " + int_to_hex(unknown) + " are not written by this driver";
@@ -891,7 +895,7 @@ fn e4_ro_reason(fs: & Ext4Fs) -> str {
     return "";
 }
 
-fn e4_check_rw(fs: & Ext4Fs) -> i64 {
+fn e4_check_rw(fs: &Ext4Fs) -> i64 {
     if !fs.writable {
         return 0 - VFS_EROFS;
     }
@@ -941,7 +945,7 @@ pub struct Ext4Group {
     pub itable_unused: i64,
 }
 
-fn e4_gd_place(fs: & Ext4Fs, g: i64) -> Vec<i64> {
+fn e4_gd_place(fs: &Ext4Fs, g: i64) -> Vec<i64> {
     // [block, byte offset in it]
     val per: i64 = fs.bs / fs.desc_size;
     var out: Vec<i64> = Vec::new();
@@ -951,10 +955,12 @@ fn e4_gd_place(fs: & Ext4Fs, g: i64) -> Vec<i64> {
 }
 
 /// Block group descriptor `g`.
-pub fn ext4_group(fs: & Ext4Fs, g: i64) -> Ext4Group {
+pub fn ext4_group(fs: &Ext4Fs, g: i64) -> Ext4Group {
     val pl: Vec<i64> = e4_gd_place(fs, g);
     val b: Vec<i64> = ext4_block(fs, pl.get(0));
-    var r: Ext4Group = Ext4Group { block_bitmap: 0, inode_bitmap: 0, inode_table: 0, free_blocks: 0, free_inodes: 0, used_dirs: 0, flags: 0, itable_unused: 0 };
+    var r: Ext4Group = Ext4Group {
+        block_bitmap: 0, inode_bitmap: 0, inode_table: 0, free_blocks: 0, free_inodes: 0, used_dirs: 0, flags: 0, itable_unused: 0
+    };
     if b.len() == 0 {
         return r;
     }
@@ -980,7 +986,7 @@ pub fn ext4_group(fs: & Ext4Fs, g: i64) -> Ext4Group {
 }
 
 // The descriptor checksum: crc32c (metadata_csum) or crc16 (uninit_bg).
-fn e4_gd_checksum(fs: & Ext4Fs, g: i64, b: & Vec<i64>, o: i64) -> i64 {
+fn e4_gd_checksum(fs: &Ext4Fs, g: i64, b: &Vec<i64>, o: i64) -> i64 {
     var d: Vec<i64> = e4_slice(b, o, fs.desc_size);
     d.set(30, 0);
     d.set(31, 0);
@@ -1004,7 +1010,7 @@ fn e4_gd_checksum(fs: & Ext4Fs, g: i64, b: & Vec<i64>, o: i64) -> i64 {
 
 // Write descriptor `g` (fields and its checksum); bitmap checksums are
 // passed in (-1 keeps what is there).
-fn e4_gd_write(fs: & Ext4Fs, g: i64, r: & Ext4Group, bb_csum: i64, ib_csum: i64) -> i64 {
+fn e4_gd_write(fs: &Ext4Fs, g: i64, r: &Ext4Group, bb_csum: i64, ib_csum: i64) -> i64 {
     val pl: Vec<i64> = e4_gd_place(fs, g);
     var b: Vec<i64> = ext4_block(fs, pl.get(0));
     if b.len() == 0 {
@@ -1043,7 +1049,7 @@ fn e4_gd_write(fs: & Ext4Fs, g: i64, r: & Ext4Group, bb_csum: i64, ib_csum: i64)
 
 // --- bitmaps ------------------------------------------------------------------------------
 
-fn e4_bit(b: & Vec<i64>, i: i64) -> bool {
+fn e4_bit(b: &Vec<i64>, i: i64) -> bool {
     return (b.get(i / 8) & (1 << (i % 8))) != 0;
 }
 
@@ -1055,11 +1061,11 @@ fn e4_clear_bit(b: &mut Vec<i64>, i: i64) {
     b.set(i / 8, b.get(i / 8) & (255 - (1 << (i % 8))));
 }
 
-fn e4_group_first(fs: & Ext4Fs, g: i64) -> i64 {
+fn e4_group_first(fs: &Ext4Fs, g: i64) -> i64 {
     return fs.first_data_block + g * fs.bpg;
 }
 
-fn e4_group_nblocks(fs: & Ext4Fs, g: i64) -> i64 {
+fn e4_group_nblocks(fs: &Ext4Fs, g: i64) -> i64 {
     return e4_min(fs.bpg, fs.blocks_count - e4_group_first(fs, g));
 }
 
@@ -1073,21 +1079,21 @@ fn e4_is_power(g: i64, base: i64) -> bool {
 
 /// Does group `g` hold a superblock backup (sparse_super: 0, 1 and powers
 /// of 3, 5, 7)?
-pub fn ext4_group_has_super(fs: & Ext4Fs, g: i64) -> bool {
+pub fn ext4_group_has_super(fs: &Ext4Fs, g: i64) -> bool {
     if g <= 1 || (fs.ro_compat & 1) == 0 {
         return true;
     }
     return e4_is_power(g, 3) || e4_is_power(g, 5) || e4_is_power(g, 7);
 }
 
-fn e4_itable_blocks(fs: & Ext4Fs) -> i64 {
+fn e4_itable_blocks(fs: &Ext4Fs) -> i64 {
     return (fs.ipg * fs.inode_size + fs.bs - 1) / fs.bs;
 }
 
 // The block bitmap of a BLOCK_UNINIT group, as mke2fs would have written
 // it: the superblock backup and descriptor blocks, every group's bitmaps
 // and inode table that lie in this group, the padding.
-fn e4_init_block_bitmap(fs: & Ext4Fs, g: i64) -> Vec<i64> {
+fn e4_init_block_bitmap(fs: &Ext4Fs, g: i64) -> Vec<i64> {
     var bm: Vec<i64> = Vec::filled(fs.bs, 0);
     val first: i64 = e4_group_first(fs, g);
     val n: i64 = e4_group_nblocks(fs, g);
@@ -1130,18 +1136,18 @@ fn e4_init_block_bitmap(fs: & Ext4Fs, g: i64) -> Vec<i64> {
     return bm;
 }
 
-fn e4_uninit_ok(fs: & Ext4Fs) -> bool {
+fn e4_uninit_ok(fs: &Ext4Fs) -> bool {
     return fs.csum || (fs.ro_compat & 16) != 0;
 }
 
-fn e4_read_block_bitmap(fs: & Ext4Fs, g: i64, r: & Ext4Group) -> Vec<i64> {
+fn e4_read_block_bitmap(fs: &Ext4Fs, g: i64, r: &Ext4Group) -> Vec<i64> {
     if (r.flags & EXT4_BG_BLOCK_UNINIT) != 0 && e4_uninit_ok(fs) {
         return e4_init_block_bitmap(fs, g);
     }
     return ext4_block(fs, r.block_bitmap);
 }
 
-fn e4_read_inode_bitmap(fs: & Ext4Fs, g: i64, r: & Ext4Group) -> Vec<i64> {
+fn e4_read_inode_bitmap(fs: &Ext4Fs, g: i64, r: &Ext4Group) -> Vec<i64> {
     if (r.flags & EXT4_BG_INODE_UNINIT) != 0 && e4_uninit_ok(fs) {
         var bm: Vec<i64> = Vec::filled(fs.bs, 0);
         var i: i64 = fs.ipg;
@@ -1155,7 +1161,7 @@ fn e4_read_inode_bitmap(fs: & Ext4Fs, g: i64, r: & Ext4Group) -> Vec<i64> {
 }
 
 // Store a block bitmap and the descriptor that counts it.
-fn e4_store_block_bitmap(fs: & Ext4Fs, g: i64, r: &mut Ext4Group, bm: Vec<i64>) -> i64 {
+fn e4_store_block_bitmap(fs: &Ext4Fs, g: i64, r: &mut Ext4Group, bm: Vec<i64>) -> i64 {
     r.flags = r.flags & (65535 - EXT4_BG_BLOCK_UNINIT);
     val w: i64 = ext4_put_block(fs, r.block_bitmap, bm);
     if w < 0 {
@@ -1168,7 +1174,7 @@ fn e4_store_block_bitmap(fs: & Ext4Fs, g: i64, r: &mut Ext4Group, bm: Vec<i64>) 
     return e4_gd_write(fs, g, r, c, 0 - 1);
 }
 
-fn e4_store_inode_bitmap(fs: & Ext4Fs, g: i64, r: &mut Ext4Group, bm: Vec<i64>) -> i64 {
+fn e4_store_inode_bitmap(fs: &Ext4Fs, g: i64, r: &mut Ext4Group, bm: Vec<i64>) -> i64 {
     r.flags = r.flags & (65535 - EXT4_BG_INODE_UNINIT);
     val w: i64 = ext4_put_block(fs, r.inode_bitmap, bm);
     if w < 0 {
@@ -1183,7 +1189,7 @@ fn e4_store_inode_bitmap(fs: & Ext4Fs, g: i64, r: &mut Ext4Group, bm: Vec<i64>) 
 
 // --- block allocation ------------------------------------------------------------------------
 
-fn e4_find_zero(bm: & Vec<i64>, from: i64, to: i64) -> i64 {
+fn e4_find_zero(bm: &Vec<i64>, from: i64, to: i64) -> i64 {
     var i: i64 = from;
     while i < to {
         if (i % 8) == 0 && i + 8 <= to && bm.get(i / 8) == 255 {
@@ -1353,7 +1359,7 @@ pub fn ext4_free_inode(fs: &mut Ext4Fs, ino: i64, is_dir: bool) -> i64 {
 
 // --- inodes ---------------------------------------------------------------------------------------
 
-fn e4_inode_pos(fs: & Ext4Fs, ino: i64) -> i64 {
+fn e4_inode_pos(fs: &Ext4Fs, ino: i64) -> i64 {
     val g: i64 = (ino - 1) / fs.ipg;
     val idx: i64 = (ino - 1) % fs.ipg;
     val t: i64 = e4_inode_table(fs, g);
@@ -1363,7 +1369,7 @@ fn e4_inode_pos(fs: & Ext4Fs, ino: i64) -> i64 {
     return t * fs.bs + idx * fs.inode_size;
 }
 
-fn e4_put_inode_raw(fs: & Ext4Fs, ino: i64, raw: Vec<i64>) -> i64 {
+fn e4_put_inode_raw(fs: &Ext4Fs, ino: i64, raw: Vec<i64>) -> i64 {
     var z: Vec<i64> = raw;
     if fs.csum {
         z.set(124, 0);
@@ -1390,7 +1396,7 @@ fn e4_put_inode_raw(fs: & Ext4Fs, ino: i64, raw: Vec<i64>) -> i64 {
 
 /// Write inode `n` back: its fields over the on-disk bytes (extra fields
 /// and in-inode attributes are kept), with the checksum.
-pub fn ext4_write_inode(fs: & Ext4Fs, n: & Ext4Inode) -> i64 {
+pub fn ext4_write_inode(fs: &Ext4Fs, n: &Ext4Inode) -> i64 {
     val pos: i64 = e4_inode_pos(fs, n.ino);
     if pos < 0 {
         return 0 - VFS_EIO;
@@ -1421,11 +1427,11 @@ pub fn ext4_write_inode(fs: & Ext4Fs, n: & Ext4Inode) -> i64 {
     return e4_put_inode_raw(fs, n.ino, raw);
 }
 
-fn e4_spb(fs: & Ext4Fs) -> i64 {
+fn e4_spb(fs: &Ext4Fs) -> i64 {
     return fs.bs / 512;
 }
 
-fn e4_uses_extents(fs: & Ext4Fs) -> bool {
+fn e4_uses_extents(fs: &Ext4Fs) -> bool {
     return (fs.incompat & EXT4_FEATURE_INCOMPAT_EXTENTS) != 0;
 }
 
@@ -1481,32 +1487,32 @@ fn e4_new_inode(fs: &mut Ext4Fs, parent: i64, mode: i64, extents: bool) -> Ext4I
 
 // --- extent trees ------------------------------------------------------------------------------
 
-fn ex_entries(nd: & Vec<i64>) -> i64 {
+fn ex_entries(nd: &Vec<i64>) -> i64 {
     return e4_u16(nd, 2);
 }
 
-fn ex_max(nd: & Vec<i64>) -> i64 {
+fn ex_max(nd: &Vec<i64>) -> i64 {
     return e4_u16(nd, 4);
 }
 
-fn ex_depth(nd: & Vec<i64>) -> i64 {
+fn ex_depth(nd: &Vec<i64>) -> i64 {
     return e4_u16(nd, 6);
 }
 
-fn ex_key(nd: & Vec<i64>, i: i64) -> i64 {
+fn ex_key(nd: &Vec<i64>, i: i64) -> i64 {
     return e4_u32(nd, 12 + 12 * i);
 }
 
-fn ex_child(nd: & Vec<i64>, i: i64) -> i64 {
+fn ex_child(nd: &Vec<i64>, i: i64) -> i64 {
     val o: i64 = 12 + 12 * i;
     return e4_u32(nd, o + 4) + e4_u16(nd, o + 8) * 4294967296;
 }
 
-fn ex_rawlen(nd: & Vec<i64>, i: i64) -> i64 {
+fn ex_rawlen(nd: &Vec<i64>, i: i64) -> i64 {
     return e4_u16(nd, 12 + 12 * i + 4);
 }
 
-fn ex_start(nd: & Vec<i64>, i: i64) -> i64 {
+fn ex_start(nd: &Vec<i64>, i: i64) -> i64 {
     val o: i64 = 12 + 12 * i;
     return e4_u32(nd, o + 8) + e4_u16(nd, o + 6) * 4294967296;
 }
@@ -1561,7 +1567,7 @@ fn ex_remove(nd: &mut Vec<i64>, pos: i64) {
     e4_set16(nd, 2, cnt - 1);
 }
 
-fn ex_block_max(fs: & Ext4Fs) -> i64 {
+fn ex_block_max(fs: &Ext4Fs) -> i64 {
     return (fs.bs - 12) / 12;
 }
 
@@ -1572,8 +1578,10 @@ struct E4Path {
     idx: Vec<i64>,
 }
 
-fn e4x_path(fs: & Ext4Fs, n: & Ext4Inode, lblk: i64) -> E4Path {
-    var p: E4Path = E4Path { nodes: Vec::new(), blocks: Vec::new(), idx: Vec::new() };
+fn e4x_path(fs: &Ext4Fs, n: &Ext4Inode, lblk: i64) -> E4Path {
+    var p: E4Path = E4Path {
+        nodes: Vec::new(), blocks: Vec::new(), idx: Vec::new()
+    };
     var nd: Vec<i64> = n.iblock;
     p.nodes.push(nd);
     p.blocks.push(0);
@@ -1601,7 +1609,7 @@ fn e4x_path(fs: & Ext4Fs, n: & Ext4Inode, lblk: i64) -> E4Path {
 
 // Write node `level` of the path: the root into the inode (written later
 // by the caller), a block with its tail checksum.
-fn e4x_put_node(fs: & Ext4Fs, n: &mut Ext4Inode, blk: i64, nd: Vec<i64>) -> i64 {
+fn e4x_put_node(fs: &Ext4Fs, n: &mut Ext4Inode, blk: i64, nd: Vec<i64>) -> i64 {
     if blk == 0 {
         n.iblock = nd;
         return 0;
@@ -1619,7 +1627,7 @@ fn e4x_put_node(fs: & Ext4Fs, n: &mut Ext4Inode, blk: i64, nd: Vec<i64>) -> i64 
 
 /// The physical block of logical block `lblk` and whether its extent is
 /// uninitialized: [physical (0 = hole), uninit (0/1)].
-fn e4x_lookup(fs: & Ext4Fs, n: & Ext4Inode, lblk: i64) -> Vec<i64> {
+fn e4x_lookup(fs: &Ext4Fs, n: &Ext4Inode, lblk: i64) -> Vec<i64> {
     val p: E4Path = e4x_path(fs, n, lblk);
     val leaf: Vec<i64> = p.nodes.get(p.nodes.len() - 1);
     var out: Vec<i64> = Vec::new();
@@ -1649,7 +1657,7 @@ fn e4x_lookup(fs: & Ext4Fs, n: & Ext4Inode, lblk: i64) -> Vec<i64> {
 
 // After the first key of node `level` changed to `key`, the keys of its
 // parents that point at it change too.
-fn e4x_fix_keys(fs: & Ext4Fs, n: &mut Ext4Inode, p: &mut E4Path, level: i64, key: i64) -> i64 {
+fn e4x_fix_keys(fs: &Ext4Fs, n: &mut Ext4Inode, p: &mut E4Path, level: i64, key: i64) -> i64 {
     var l: i64 = level - 1;
     while l >= 0 {
         val i: i64 = p.idx.get(l);
@@ -1831,7 +1839,7 @@ pub fn ext4_extent_insert(fs: &mut Ext4Fs, n: &mut Ext4Inode, lblk: i64, len: i6
 }
 
 /// The blocks of an extent tree's nodes below the root.
-pub fn ext4_extent_tree_blocks(fs: & Ext4Fs, n: & Ext4Inode) -> Vec<i64> {
+pub fn ext4_extent_tree_blocks(fs: &Ext4Fs, n: &Ext4Inode) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     var nodes: Vec<Vec<i64>> = Vec::new();
     nodes.push(n.iblock);
@@ -1855,7 +1863,7 @@ pub fn ext4_extent_tree_blocks(fs: & Ext4Fs, n: & Ext4Inode) -> Vec<i64> {
 
 // Replace the tree by one holding `ex` ([logical, length, physical,
 // uninit] each): the old node blocks are freed, the extents inserted again.
-fn e4x_rebuild(fs: &mut Ext4Fs, n: &mut Ext4Inode, ex: & Vec<i64>) -> i64 {
+fn e4x_rebuild(fs: &mut Ext4Fs, n: &mut Ext4Inode, ex: &Vec<i64>) -> i64 {
     val old: Vec<i64> = ext4_extent_tree_blocks(fs, n);
     var i: i64 = 0;
     while i < old.len() {
@@ -1900,7 +1908,7 @@ fn e4x_init_extent(fs: &mut Ext4Fs, n: &mut Ext4Inode, lblk: i64) -> i64 {
 
 // --- indirect block maps (ext2/ext3) ---------------------------------------------------------------
 
-fn e4i_path(fs: & Ext4Fs, lb: i64) -> Vec<i64> {
+fn e4i_path(fs: &Ext4Fs, lb: i64) -> Vec<i64> {
     // [slot in i_block, offsets in each indirect level...]
     val per: i64 = fs.bs / 4;
     var out: Vec<i64> = Vec::new();
@@ -1929,7 +1937,7 @@ fn e4i_path(fs: & Ext4Fs, lb: i64) -> Vec<i64> {
     return out;
 }
 
-fn e4i_lookup(fs: & Ext4Fs, n: & Ext4Inode, lb: i64) -> i64 {
+fn e4i_lookup(fs: &Ext4Fs, n: &Ext4Inode, lb: i64) -> i64 {
     val path: Vec<i64> = e4i_path(fs, lb);
     var ptr: i64 = e4_u32(&n.iblock, 4 * path.get(0));
     var k: i64 = 1;
@@ -2082,11 +2090,11 @@ fn e4i_truncate(fs: &mut Ext4Fs, n: &mut Ext4Inode, keep: i64) -> i64 {
 
 // --- block mapping for writes ------------------------------------------------------------------
 
-fn e4_is_extent_inode(n: & Ext4Inode) -> bool {
+fn e4_is_extent_inode(n: &Ext4Inode) -> bool {
     return (n.flags & EXT4_EXTENTS_FL) != 0;
 }
 
-fn e4_map(fs: & Ext4Fs, n: & Ext4Inode, lb: i64) -> Vec<i64> {
+fn e4_map(fs: &Ext4Fs, n: &Ext4Inode, lb: i64) -> Vec<i64> {
     if e4_is_extent_inode(n) {
         return e4x_lookup(fs, n, lb);
     }
@@ -2105,7 +2113,7 @@ fn e4_set_map(fs: &mut Ext4Fs, n: &mut Ext4Inode, lb: i64, pblk: i64) -> i64 {
 
 // Where a new block for logical `lb` should go: after the block before
 // it, else in the inode's group after its inode table.
-fn e4_goal(fs: & Ext4Fs, n: & Ext4Inode, lb: i64) -> i64 {
+fn e4_goal(fs: &Ext4Fs, n: &Ext4Inode, lb: i64) -> i64 {
     if lb > 0 {
         val prev: Vec<i64> = e4_map(fs, n, lb - 1);
         if prev.get(0) > 0 {
@@ -2151,7 +2159,7 @@ fn e4_block_for_write(fs: &mut Ext4Fs, n: &mut Ext4Inode, lb: i64) -> i64 {
 
 // Write `data` into inode `n` at `off` (blocks allocated as needed; size
 // grows). Bytes written or -errno; the caller writes the inode.
-fn e4_write_data(fs: &mut Ext4Fs, n: &mut Ext4Inode, off: i64, data: & Vec<i64>) -> i64 {
+fn e4_write_data(fs: &mut Ext4Fs, n: &mut Ext4Inode, off: i64, data: &Vec<i64>) -> i64 {
     var k: i64 = 0;
     var pos: i64 = off;
     while k < data.len() {
@@ -2307,21 +2315,21 @@ fn e4d_need(name_len: i64) -> i64 {
 }
 
 // The end of the entries in a directory block (the checksum tail after).
-fn e4d_end(fs: & Ext4Fs) -> i64 {
+fn e4d_end(fs: &Ext4Fs) -> i64 {
     if fs.csum {
         return fs.bs - 12;
     }
     return fs.bs;
 }
 
-fn e4d_name_len(fs: & Ext4Fs, b: & Vec<i64>, o: i64) -> i64 {
+fn e4d_name_len(fs: &Ext4Fs, b: &Vec<i64>, o: i64) -> i64 {
     if (fs.incompat & EXT4_FEATURE_INCOMPAT_FILETYPE) != 0 {
         return b.get(o + 6);
     }
     return e4_u16(b, o + 6);
 }
 
-fn e4d_put_entry(fs: & Ext4Fs, b: &mut Vec<i64>, o: i64, rec: i64, ino: i64, name: & Vec<i64>, ftype: i64) {
+fn e4d_put_entry(fs: &Ext4Fs, b: &mut Vec<i64>, o: i64, rec: i64, ino: i64, name: &Vec<i64>, ftype: i64) {
     e4_set32(b, o, ino);
     e4_set16(b, o + 4, rec);
     if (fs.incompat & EXT4_FEATURE_INCOMPAT_FILETYPE) != 0 {
@@ -2343,7 +2351,7 @@ fn e4d_put_entry(fs: & Ext4Fs, b: &mut Vec<i64>, o: i64, rec: i64, ino: i64, nam
 }
 
 // Write a directory block, its checksum tail first (metadata_csum).
-fn e4d_put_block(fs: & Ext4Fs, d: & Ext4Inode, pb: i64, blk: Vec<i64>) -> i64 {
+fn e4d_put_block(fs: &Ext4Fs, d: &Ext4Inode, pb: i64, blk: Vec<i64>) -> i64 {
     var b: Vec<i64> = blk;
     if fs.csum {
         val t: i64 = fs.bs - 12;
@@ -2565,7 +2573,7 @@ fn e4d_set_dotdot(fs: &mut Ext4Fs, d: &mut Ext4Inode, parent: i64) -> i64 {
     return e4d_put_block(fs, d, m.get(0), b);
 }
 
-fn e4d_is_empty(fs: & Ext4Fs, d: & Ext4Inode) -> bool {
+fn e4d_is_empty(fs: &Ext4Fs, d: &Ext4Inode) -> bool {
     val es: Vec<Ext4Dirent> = ext4_readdir(fs, d);
     var i: i64 = 0;
     while i < es.len() {
@@ -2590,7 +2598,7 @@ fn e4_name_ok(name: str) -> i64 {
 }
 
 // The directory `dir` for a change: an inode that is a directory.
-fn e4_dir_for_change(fs: & Ext4Fs, dir: i64) -> Ext4Inode {
+fn e4_dir_for_change(fs: &Ext4Fs, dir: i64) -> Ext4Inode {
     var d: Ext4Inode = ext4_inode(fs, dir);
     if d.err == 0 && !ext4_is_dir(&d) {
         d.err = 0 - VFS_ENOTDIR;
@@ -2889,7 +2897,7 @@ pub fn ext4_link(fs: &mut Ext4Fs, ino: i64, dir: i64, name: str) -> i64 {
 }
 
 // Is directory `anc` the directory `ino` or above it?
-fn e4_is_ancestor(fs: & Ext4Fs, anc: i64, ino: i64) -> bool {
+fn e4_is_ancestor(fs: &Ext4Fs, anc: i64, ino: i64) -> bool {
     var cur: i64 = ino;
     var guard_v: i64 = 0;
     while guard_v < 4096 {
@@ -3005,7 +3013,7 @@ pub fn ext4_rename(fs: &mut Ext4Fs, odir: i64, oname: str, ndir: i64, nname: str
 // --- paths -------------------------------------------------------------------------------------------------
 
 // [parent directory inode, or -errno] and the last name of `path`.
-fn e4_split_path(fs: & Ext4Fs, path: str, name: &mut str) -> i64 {
+fn e4_split_path(fs: &Ext4Fs, path: str, name: &mut str) -> i64 {
     var p: str = path;
     while str_len(p) > 1 && str_ends_with(p, "/") {
         p = str_slice(p, 0, str_len(p) - 1);
@@ -3015,7 +3023,7 @@ fn e4_split_path(fs: & Ext4Fs, path: str, name: &mut str) -> i64 {
         *name = p;
         return EXT4_ROOT_INO;
     }
-    *name = str_slice(p, cut + 1, str_len(p));
+    * name = str_slice(p, cut + 1, str_len(p));
     if cut == 0 {
         return EXT4_ROOT_INO;
     }
@@ -3148,10 +3156,12 @@ struct E4Journal {
 }
 
 fn e4j_fail(msg: str) -> E4Journal {
-    return E4Journal { err: msg, map: Vec::new(), bs: 0, maxlen: 0, first: 0, start: 0, sequence: 0, incompat: 0, csum: false, v3: false, is64: false, seed: 0, sb: Vec::new() };
+    return E4Journal {
+        err: msg, map: Vec::new(), bs: 0, maxlen: 0, first: 0, start: 0, sequence: 0, incompat: 0, csum: false, v3: false, is64: false, seed: 0, sb: Vec::new()
+    };
 }
 
-fn e4j_open(fs: & Ext4Fs) -> E4Journal {
+fn e4j_open(fs: &Ext4Fs) -> E4Journal {
     if (fs.compat & EXT4_FEATURE_COMPAT_HAS_JOURNAL) == 0 {
         return e4j_fail("no journal");
     }
@@ -3209,21 +3219,21 @@ fn e4j_open(fs: & Ext4Fs) -> E4Journal {
     return j;
 }
 
-fn e4j_block(fs: & Ext4Fs, j: & E4Journal, lb: i64) -> Vec<i64> {
+fn e4j_block(fs: &Ext4Fs, j: &E4Journal, lb: i64) -> Vec<i64> {
     if lb < 0 || lb >= j.map.len() || j.map.get(lb) == 0 {
         return Vec::new();
     }
     return ext4_block(fs, j.map.get(lb));
 }
 
-fn e4j_next(j: & E4Journal, lb: i64) -> i64 {
+fn e4j_next(j: &E4Journal, lb: i64) -> i64 {
     if lb + 1 >= j.maxlen {
         return j.first;
     }
     return lb + 1;
 }
 
-fn e4j_tag_bytes(j: & E4Journal) -> i64 {
+fn e4j_tag_bytes(j: &E4Journal) -> i64 {
     if j.v3 {
         return 16;
     }
@@ -3238,7 +3248,7 @@ fn e4j_tag_bytes(j: & E4Journal) -> i64 {
 }
 
 // A block whose tail (last 4 bytes) holds crc32c(seed, block) checks out.
-fn e4j_tail_ok(j: & E4Journal, b: & Vec<i64>) -> bool {
+fn e4j_tail_ok(j: &E4Journal, b: &Vec<i64>) -> bool {
     if !j.csum {
         return true;
     }
@@ -3247,7 +3257,7 @@ fn e4j_tail_ok(j: & E4Journal, b: & Vec<i64>) -> bool {
     return ext4_crc32c(j.seed, &z, 0, j.bs) == e4_be32(b, j.bs - 4);
 }
 
-fn e4j_commit_ok(j: & E4Journal, b: & Vec<i64>) -> bool {
+fn e4j_commit_ok(j: &E4Journal, b: &Vec<i64>) -> bool {
     if !j.csum {
         return true;
     }
@@ -3257,7 +3267,7 @@ fn e4j_commit_ok(j: & E4Journal, b: & Vec<i64>) -> bool {
 }
 
 // The tags of a descriptor block: [fs block, flags, checksum] each.
-fn e4j_tags(j: & E4Journal, b: & Vec<i64>) -> Vec<i64> {
+fn e4j_tags(j: &E4Journal, b: &Vec<i64>) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     val tb: i64 = e4j_tag_bytes(j);
     var size: i64 = j.bs;
@@ -3300,7 +3310,9 @@ fn e4j_tags(j: & E4Journal, b: & Vec<i64>) -> Vec<i64> {
 /// flag cleared. Data blocks whose tag checksum fails are not written
 /// (counted in bad_checksums).
 pub fn ext4_journal_recover(fs: &mut Ext4Fs) -> Ext4Recovery {
-    var rec: Ext4Recovery = Ext4Recovery { err: "", needed: false, transactions: 0, replayed: 0, revoked: 0, bad_checksums: 0, next_sequence: 0 };
+    var rec: Ext4Recovery = Ext4Recovery {
+        err: "", needed: false, transactions: 0, replayed: 0, revoked: 0, bad_checksums: 0, next_sequence: 0
+    };
     if (fs.incompat & EXT4_FEATURE_INCOMPAT_RECOVER) == 0 {
         return rec;
     }
@@ -3486,7 +3498,6 @@ fn e4_finish_recovery(dev: BlockDev) -> str {
 
 // ═══ vfs ═══════════════════════════════════════════════════════════════════════════
 
-
 var e4_mounted: Vec<Ext4Fs> = Vec::new();
 
 fn e4_vfs_root(fs: i64) -> i64 {
@@ -3632,7 +3643,6 @@ pub fn ext4_ops() -> FsOps {
 pub fn ext4_mounted(h: i64) -> Ext4Fs {
     return e4_mounted.get(h);
 }
-
 
 /// Mount an opened file system on `path` (read-write when `writable`,
 /// else every change is EROFS); returns its handle or -errno. The mounted

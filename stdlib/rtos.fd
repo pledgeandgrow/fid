@@ -33,7 +33,8 @@
 // RT_TIMEOUT, and a received message) is in its TCB when it runs again.
 
 module rtos;
- use vec; use string;
+use vec;
+use string;
 
 pub const RT_READY: i64 = 0;
 pub const RT_RUNNING: i64 = 1;
@@ -122,9 +123,7 @@ pub struct Rtos {
 /// task 0 and counts towards max_tasks). `slice` ticks per round-robin turn.
 pub fn rtos_new(max_tasks: i64, max_sems: i64, max_mutexes: i64, max_queues: i64, max_timers: i64, slice: i64) -> Rtos {
     var r: Rtos = Rtos {
-        tasks: Vec::new(), sems: Vec::new(), mutexes: Vec::new(), queues: Vec::new(), timers: Vec::new(),
-        max_tasks: max_tasks, max_sems: max_sems, max_mutexes: max_mutexes, max_queues: max_queues, max_timers: max_timers,
-        tick: 0, current: 0, next_seq: 0, slice_len: slice, switches: 0, log: Vec::new(), timer_events: Vec::new()
+        tasks: Vec::new(), sems: Vec::new(), mutexes: Vec::new(), queues: Vec::new(), timers: Vec::new(), max_tasks: max_tasks, max_sems: max_sems, max_mutexes: max_mutexes, max_queues: max_queues, max_timers: max_timers, tick: 0, current: 0, next_seq: 0, slice_len: slice, switches: 0, log: Vec::new(), timer_events: Vec::new()
     };
     rtos_task_create(&mut r, "idle", 0);
     var t: RtTask = r.tasks.get(0);
@@ -149,11 +148,12 @@ pub fn rtos_name(r: &Rtos, id: i64) -> str {
 /// Create a ready task; -1 when the task table is full. Does not switch:
 /// call rtos_schedule (or let the next API call or tick do it).
 pub fn rtos_task_create(r: &mut Rtos, name: str, prio: i64) -> i64 {
-    if r.tasks.len() >= r.max_tasks { return -1; }
+    if r.tasks.len() >= r.max_tasks {
+        return -1;
+    }
     val s: i64 = rt_seq(r);
     r.tasks.push(RtTask {
-        name: name, base_prio: prio, prio: prio, state: RT_READY, wake: -1, wait_kind: RTW_NONE, wait_obj: -1,
-        result: RT_OK, msg: 0, seq: s, slice: r.slice_len, runs: 0
+        name: name, base_prio: prio, prio: prio, state: RT_READY, wake: -1, wait_kind: RTW_NONE, wait_obj: -1, result: RT_OK, msg: 0, seq: s, slice: r.slice_len, runs: 0
     });
     return r.tasks.len() - 1;
 }
@@ -179,13 +179,17 @@ pub fn rtos_schedule(r: &mut Rtos) {
                     best = i;
                 } else if t.prio == b.prio {
                     // The running task keeps the CPU against equals; else FIFO.
-                    if b.state != RT_RUNNING && (t.state == RT_RUNNING || t.seq < b.seq) { best = i; }
+                    if b.state != RT_RUNNING && (t.state == RT_RUNNING || t.seq < b.seq) {
+                        best = i;
+                    }
                 }
             }
         }
         i = i + 1;
     }
-    if best < 0 || best == r.current { return; }
+    if best < 0 || best == r.current {
+        return;
+    }
     var old: RtTask = r.tasks.get(r.current);
     if old.state == RT_RUNNING {
         old.state = RT_READY;
@@ -229,7 +233,9 @@ fn rt_best_waiter(r: &Rtos, waiters: Vec<i64>) -> i64 {
     var best: i64 = -1;
     var i: i64 = 0;
     while i < waiters.len() {
-        if best < 0 || r.tasks.get(waiters.get(i)).prio > r.tasks.get(waiters.get(best)).prio { best = i; }
+        if best < 0 || r.tasks.get(waiters.get(i)).prio > r.tasks.get(waiters.get(best)).prio {
+            best = i;
+        }
         i = i + 1;
     }
     return best;
@@ -242,13 +248,19 @@ fn rt_block(r: &mut Rtos, kind: i64, obj: i64, timeout: i64) {
     t.wait_kind = kind;
     t.wait_obj = obj;
     t.result = RT_PENDING;
-    if timeout >= 0 { t.wake = r.tick + timeout; } else { t.wake = -1; }
+    if timeout >= 0 {
+        t.wake = r.tick + timeout;
+    } else {
+        t.wake = -1;
+    }
     r.tasks.set(r.current, t);
 }
 
 /// Put the current task to sleep for `ticks` ticks.
 pub fn rtos_delay(r: &mut Rtos, ticks: i64) {
-    if r.current == 0 { return; }
+    if r.current == 0 {
+        return;
+    }
     var t: RtTask = r.tasks.get(r.current);
     t.state = RT_DELAYED;
     t.wake = r.tick + ticks;
@@ -258,14 +270,18 @@ pub fn rtos_delay(r: &mut Rtos, ticks: i64) {
 
 pub fn rtos_suspend(r: &mut Rtos, id: i64) {
     var t: RtTask = r.tasks.get(id);
-    if t.state == RT_BLOCKED { return; }
+    if t.state == RT_BLOCKED {
+        return;
+    }
     t.state = RT_SUSPENDED;
     r.tasks.set(id, t);
     rtos_schedule(r);
 }
 
 pub fn rtos_resume(r: &mut Rtos, id: i64) {
-    if r.tasks.get(id).state != RT_SUSPENDED { return; }
+    if r.tasks.get(id).state != RT_SUSPENDED {
+        return;
+    }
     rt_make_ready(r, id, RT_OK);
     rtos_schedule(r);
 }
@@ -288,8 +304,12 @@ pub fn rtos_yield(r: &mut Rtos) {
 // ─── Semaphores ─────────────────────────────────────────────────────────
 
 pub fn rtos_sem_create(r: &mut Rtos, initial: i64, max: i64) -> i64 {
-    if r.sems.len() >= r.max_sems { return -1; }
-    r.sems.push(RtSem { count: initial, max: max, waiters: Vec::new() });
+    if r.sems.len() >= r.max_sems {
+        return -1;
+    }
+    r.sems.push(RtSem {
+        count: initial, max: max, waiters: Vec::new()
+    });
     return r.sems.len() - 1;
 }
 
@@ -301,7 +321,9 @@ pub fn rtos_sem_take(r: &mut Rtos, s: i64, timeout: i64) -> i64 {
         r.sems.set(s, sem);
         return RT_OK;
     }
-    if timeout == 0 { return RT_WOULD_BLOCK; }
+    if timeout == 0 {
+        return RT_WOULD_BLOCK;
+    }
     sem.waiters.push(r.current);
     r.sems.set(s, sem);
     rt_block(r, RTW_SEM, s, timeout);
@@ -322,7 +344,9 @@ pub fn rtos_sem_give(r: &mut Rtos, s: i64) -> i64 {
         rtos_schedule(r);
         return RT_OK;
     }
-    if sem.count >= sem.max { return RT_ERROR; }
+    if sem.count >= sem.max {
+        return RT_ERROR;
+    }
     sem.count = sem.count + 1;
     r.sems.set(s, sem);
     return RT_OK;
@@ -331,8 +355,12 @@ pub fn rtos_sem_give(r: &mut Rtos, s: i64) -> i64 {
 // ─── Mutexes with priority inheritance ──────────────────────────────────
 
 pub fn rtos_mutex_create(r: &mut Rtos) -> i64 {
-    if r.mutexes.len() >= r.max_mutexes { return -1; }
-    r.mutexes.push(RtMutex { owner: -1, depth: 0, waiters: Vec::new() });
+    if r.mutexes.len() >= r.max_mutexes {
+        return -1;
+    }
+    r.mutexes.push(RtMutex {
+        owner: -1, depth: 0, waiters: Vec::new()
+    });
     return r.mutexes.len() - 1;
 }
 
@@ -348,14 +376,18 @@ fn rt_update_prio(r: &mut Rtos, id: i64) {
             var i: i64 = 0;
             while i < mx.waiters.len() {
                 val wp: i64 = r.tasks.get(mx.waiters.get(i)).prio;
-                if wp > p { p = wp; }
+                if wp > p {
+                    p = wp;
+                }
                 i = i + 1;
             }
         }
         m = m + 1;
     }
     var t: RtTask = r.tasks.get(id);
-    if t.prio == p { return; }
+    if t.prio == p {
+        return;
+    }
     if p > t.prio {
         rt_note(r, t.name + " inherits priority " + int_to_str(p));
     } else {
@@ -365,7 +397,9 @@ fn rt_update_prio(r: &mut Rtos, id: i64) {
     r.tasks.set(id, t);
     if t.state == RT_BLOCKED && t.wait_kind == RTW_MUTEX {
         val owner: i64 = r.mutexes.get(t.wait_obj).owner;
-        if owner >= 0 { rt_update_prio(r, owner); }
+        if owner >= 0 {
+            rt_update_prio(r, owner);
+        }
     }
 }
 
@@ -382,7 +416,9 @@ pub fn rtos_mutex_lock(r: &mut Rtos, m: i64, timeout: i64) -> i64 {
         r.mutexes.set(m, mx);
         return RT_OK;
     }
-    if timeout == 0 { return RT_WOULD_BLOCK; }
+    if timeout == 0 {
+        return RT_WOULD_BLOCK;
+    }
     mx.waiters.push(r.current);
     r.mutexes.set(m, mx);
     rt_note(r, rtos_name(r, r.current) + " blocks on mutex " + int_to_str(m) + " held by " + rtos_name(r, mx.owner));
@@ -396,7 +432,9 @@ pub fn rtos_mutex_lock(r: &mut Rtos, m: i64, timeout: i64) -> i64 {
 /// old owner's priority is recomputed.
 pub fn rtos_mutex_unlock(r: &mut Rtos, m: i64) -> i64 {
     var mx: RtMutex = r.mutexes.get(m);
-    if mx.owner != r.current { return RT_ERROR; }
+    if mx.owner != r.current {
+        return RT_ERROR;
+    }
     if mx.depth > 1 {
         mx.depth = mx.depth - 1;
         r.mutexes.set(m, mx);
@@ -425,8 +463,12 @@ pub fn rtos_mutex_unlock(r: &mut Rtos, m: i64) -> i64 {
 // ─── Queues ─────────────────────────────────────────────────────────────
 
 pub fn rtos_queue_create(r: &mut Rtos, cap: i64) -> i64 {
-    if r.queues.len() >= r.max_queues { return -1; }
-    r.queues.push(RtQueue { cap: cap, items: Vec::new(), recv_waiters: Vec::new(), send_waiters: Vec::new() });
+    if r.queues.len() >= r.max_queues {
+        return -1;
+    }
+    r.queues.push(RtQueue {
+        cap: cap, items: Vec::new(), recv_waiters: Vec::new(), send_waiters: Vec::new()
+    });
     return r.queues.len() - 1;
 }
 
@@ -451,7 +493,9 @@ pub fn rtos_queue_send(r: &mut Rtos, q: i64, v: i64, timeout: i64) -> i64 {
         r.queues.set(q, qu);
         return RT_OK;
     }
-    if timeout == 0 { return RT_WOULD_BLOCK; }
+    if timeout == 0 {
+        return RT_WOULD_BLOCK;
+    }
     qu.send_waiters.push(r.current);
     r.queues.set(q, qu);
     var me: RtTask = r.tasks.get(r.current);
@@ -486,7 +530,9 @@ pub fn rtos_queue_recv(r: &mut Rtos, q: i64, timeout: i64) -> i64 {
         }
         return RT_OK;
     }
-    if timeout == 0 { return RT_WOULD_BLOCK; }
+    if timeout == 0 {
+        return RT_WOULD_BLOCK;
+    }
     qu.recv_waiters.push(r.current);
     r.queues.set(q, qu);
     rt_block(r, RTW_QRECV, q, timeout);
@@ -506,8 +552,12 @@ pub fn rtos_task_result(r: &Rtos, id: i64) -> i64 {
 // ─── Timers ─────────────────────────────────────────────────────────────
 
 pub fn rtos_timer_create(r: &mut Rtos, period: i64, reload: bool) -> i64 {
-    if r.timers.len() >= r.max_timers { return -1; }
-    r.timers.push(RtTimer { period: period, expiry: 0, reload: reload, active: false, fired: 0 });
+    if r.timers.len() >= r.max_timers {
+        return -1;
+    }
+    r.timers.push(RtTimer {
+        period: period, expiry: 0, reload: reload, active: false, fired: 0
+    });
     return r.timers.len() - 1;
 }
 
@@ -548,7 +598,9 @@ fn rt_timeout(r: &mut Rtos, id: i64) {
     }
     rt_make_ready(r, id, RT_TIMEOUT);
     rt_note(r, t.name + " timed out");
-    if k == RTW_MUTEX && r.mutexes.get(o).owner >= 0 { rt_update_prio(r, r.mutexes.get(o).owner); }
+    if k == RTW_MUTEX && r.mutexes.get(o).owner >= 0 {
+        rt_update_prio(r, r.mutexes.get(o).owner);
+    }
 }
 
 /// The timer interrupt: advance time, wake sleepers and timeouts, run
@@ -559,8 +611,12 @@ pub fn rtos_tick(r: &mut Rtos) {
     while i < r.tasks.len() {
         val t: RtTask = r.tasks.get(i);
         if t.wake >= 0 && t.wake <= r.tick {
-            if t.state == RT_DELAYED { rt_make_ready(r, i, RT_OK); }
-            if t.state == RT_BLOCKED { rt_timeout(r, i); }
+            if t.state == RT_DELAYED {
+                rt_make_ready(r, i, RT_OK);
+            }
+            if t.state == RT_BLOCKED {
+                rt_timeout(r, i);
+            }
         }
         i = i + 1;
     }
@@ -570,7 +626,11 @@ pub fn rtos_tick(r: &mut Rtos) {
         if tm.active && tm.expiry <= r.tick {
             tm.fired = tm.fired + 1;
             r.timer_events.push("t" + int_to_str(r.tick) + " timer " + int_to_str(i));
-            if tm.reload { tm.expiry = tm.expiry + tm.period; } else { tm.active = false; }
+            if tm.reload {
+                tm.expiry = tm.expiry + tm.period;
+            } else {
+                tm.active = false;
+            }
         }
         r.timers.set(i, tm);
         i = i + 1;
@@ -584,7 +644,9 @@ pub fn rtos_tick(r: &mut Rtos) {
             var k: i64 = 0;
             while k < r.tasks.len() {
                 val o: RtTask = r.tasks.get(k);
-                if k != r.current && o.state == RT_READY && o.prio == cur.prio { other = true; }
+                if k != r.current && o.state == RT_READY && o.prio == cur.prio {
+                    other = true;
+                }
                 k = k + 1;
             }
             if other {

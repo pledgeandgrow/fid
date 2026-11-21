@@ -35,10 +35,12 @@
 // ModbusMap server) and pass it here.
 
 module sunspec;
- use vec; use string; use modbus;
+use vec;
+use string;
+use modbus;
 
-pub const SUNSPEC_MARKER_HI: i64 = 0x5375;   // "Su"
-pub const SUNSPEC_MARKER_LO: i64 = 0x6e53;   // "nS"
+pub const SUNSPEC_MARKER_HI: i64 = 0x5375;  // "Su"
+pub const SUNSPEC_MARKER_LO: i64 = 0x6e53;  // "nS"
 pub const SUNSPEC_END: i64 = 0xFFFF;
 
 pub const SUNSPEC_MODEL_COMMON: i64 = 1;
@@ -60,12 +62,12 @@ pub fn sunspec_i16(reg: i64) -> i64 {
 }
 
 /// Read an unsigned 32-bit value from two big-endian registers at `off`.
-pub fn sunspec_u32(regs: & Vec<i64>, off: i64) -> i64 {
+pub fn sunspec_u32(regs: &Vec<i64>, off: i64) -> i64 {
     return ((regs.get(off) & 65535) << 16) | (regs.get(off + 1) & 65535);
 }
 
 /// Read a signed 32-bit value from two big-endian registers at `off`.
-pub fn sunspec_i32(regs: & Vec<i64>, off: i64) -> i64 {
+pub fn sunspec_i32(regs: &Vec<i64>, off: i64) -> i64 {
     val v: i64 = sunspec_u32(regs, off);
     if (v & 0x80000000) != 0 {
         return v - 4294967296;
@@ -78,25 +80,35 @@ pub fn sunspec_apply_sf(value: i64, sf: i64) -> f64 {
     var r: f64 = value as f64;
     var s: i64 = sf;
     if s >= 0 {
-        while s > 0 { r = r * 10.0; s = s - 1; }
+        while s > 0 {
+            r = r * 10.0;
+            s = s - 1;
+        }
     } else {
-        while s < 0 { r = r / 10.0; s = s + 1; }
+        while s < 0 {
+            r = r / 10.0;
+            s = s + 1;
+        }
     }
     return r;
 }
 
 /// Read a fixed-length string of `nregs` registers (two chars each,
 /// big-endian) at `off`, stopping at a NUL.
-pub fn sunspec_string(regs: & Vec<i64>, off: i64, nregs: i64) -> str {
+pub fn sunspec_string(regs: &Vec<i64>, off: i64, nregs: i64) -> str {
     var s: str = "";
     var i: i64 = 0;
     while i < nregs {
         val reg: i64 = regs.get(off + i) & 65535;
         val hi: i64 = (reg >> 8) & 255;
         val lo: i64 = reg & 255;
-        if hi == 0 { return str_trim(s); }
+        if hi == 0 {
+            return str_trim(s);
+        }
         s = s + char_to_str(hi);
-        if lo == 0 { return str_trim(s); }
+        if lo == 0 {
+            return str_trim(s);
+        }
         s = s + char_to_str(lo);
         i = i + 1;
     }
@@ -128,7 +140,7 @@ fn s_byte(s: str, idx: i64) -> i64 {
 
 /// Find the "SunS" marker from `start` onward; returns its register offset
 /// or -1. The two registers after the marker begin the first model.
-pub fn sunspec_find_marker(regs: & Vec<i64>, start: i64) -> i64 {
+pub fn sunspec_find_marker(regs: &Vec<i64>, start: i64) -> i64 {
     var i: i64 = start;
     while i + 1 < regs.len() {
         if (regs.get(i) & 65535) == SUNSPEC_MARKER_HI && (regs.get(i + 1) & 65535) == SUNSPEC_MARKER_LO {
@@ -148,23 +160,25 @@ pub struct SunSpecModel {
 }
 
 /// Walk the model list beginning just after the marker at `marker_off`.
-pub fn sunspec_walk_models(regs: & Vec<i64>, marker_off: i64) -> Vec<SunSpecModel> {
+pub fn sunspec_walk_models(regs: &Vec<i64>, marker_off: i64) -> Vec<SunSpecModel> {
     var out: Vec<SunSpecModel> = Vec::new();
-    var pos: i64 = marker_off + 2;   // first model id register
+    var pos: i64 = marker_off + 2;  // first model id register
     while pos + 1 < regs.len() {
         val id: i64 = regs.get(pos) & 65535;
         if id == SUNSPEC_END {
             break;
         }
         val length: i64 = regs.get(pos + 1) & 65535;
-        out.push(SunSpecModel { id: id, data_off: pos + 2, length: length });
+        out.push(SunSpecModel {
+            id: id, data_off: pos + 2, length: length
+        });
         pos = pos + 2 + length;
     }
     return out;
 }
 
 /// Find a model's data offset by id in a walked list; -1 if absent.
-pub fn sunspec_model_offset(models: & Vec<SunSpecModel>, id: i64) -> i64 {
+pub fn sunspec_model_offset(models: &Vec<SunSpecModel>, id: i64) -> i64 {
     var i: i64 = 0;
     while i < models.len() {
         if models.get(i).id == id {
@@ -190,15 +204,9 @@ pub struct SunSpecCommon {
 /// Parse the common model's data at `off` (its length is 66 registers).
 /// Manufacturer/model/options/version/serial are 16/16/8/8/16 registers;
 /// device address is the last register.
-pub fn sunspec_common(regs: & Vec<i64>, off: i64) -> SunSpecCommon {
+pub fn sunspec_common(regs: &Vec<i64>, off: i64) -> SunSpecCommon {
     return SunSpecCommon {
-        ok: true,
-        manufacturer: sunspec_string(regs, off, 16),
-        model: sunspec_string(regs, off + 16, 16),
-        options: sunspec_string(regs, off + 32, 8),
-        version: sunspec_string(regs, off + 40, 8),
-        serial: sunspec_string(regs, off + 48, 16),
-        device_address: regs.get(off + 64) & 65535,
+        ok: true, manufacturer: sunspec_string(regs, off, 16), model: sunspec_string(regs, off + 16, 16), options: sunspec_string(regs, off + 32, 8), version: sunspec_string(regs, off + 40, 8), serial: sunspec_string(regs, off + 48, 16), device_address: regs.get(off + 64) & 65535,
     };
 }
 
@@ -207,21 +215,21 @@ pub fn sunspec_common(regs: & Vec<i64>, off: i64) -> SunSpecCommon {
 /// Scaled inverter readings.
 pub struct SunSpecInverter {
     pub ok: bool,
-    pub ac_current: f64,    // A
-    pub ac_voltage: f64,    // V (phase A to N)
-    pub ac_power: f64,      // W
-    pub frequency: f64,     // Hz
-    pub apparent_power: f64,// VA
-    pub reactive_power: f64,// VAr
+    pub ac_current: f64,  // A
+    pub ac_voltage: f64,  // V (phase A to N)
+    pub ac_power: f64,  // W
+    pub frequency: f64,  // Hz
+    pub apparent_power: f64,  // VA
+    pub reactive_power: f64,  // VAr
     pub power_factor: f64,  // %
-    pub energy_wh: f64,     // Wh (accumulated)
+    pub energy_wh: f64,  // Wh (accumulated)
 }
 
 /// Parse an inverter model (101/102/103) at data offset `off`. The point
 /// layout is the standard integer+SF model: A(0) AphA..C(1..3) A_SF(4),
 /// PPV/PhV(5..10) V_SF(11), W(12) W_SF(13), Hz(14) Hz_SF(15), VA(16)
 /// VA_SF(17), VAr(18) VAr_SF(19), PF(20) PF_SF(21), WH(22:23) WH_SF(24).
-pub fn sunspec_inverter(regs: & Vec<i64>, off: i64) -> SunSpecInverter {
+pub fn sunspec_inverter(regs: &Vec<i64>, off: i64) -> SunSpecInverter {
     val a_sf: i64 = sunspec_i16(regs.get(off + 4));
     val v_sf: i64 = sunspec_i16(regs.get(off + 11));
     val w_sf: i64 = sunspec_i16(regs.get(off + 13));
@@ -231,15 +239,7 @@ pub fn sunspec_inverter(regs: & Vec<i64>, off: i64) -> SunSpecInverter {
     val pf_sf: i64 = sunspec_i16(regs.get(off + 21));
     val wh_sf: i64 = sunspec_i16(regs.get(off + 24));
     return SunSpecInverter {
-        ok: true,
-        ac_current: sunspec_apply_sf(regs.get(off) & 65535, a_sf),
-        ac_voltage: sunspec_apply_sf(regs.get(off + 8) & 65535, v_sf),
-        ac_power: sunspec_apply_sf(sunspec_i16(regs.get(off + 12)), w_sf),
-        frequency: sunspec_apply_sf(regs.get(off + 14) & 65535, hz_sf),
-        apparent_power: sunspec_apply_sf(sunspec_i16(regs.get(off + 16)), va_sf),
-        reactive_power: sunspec_apply_sf(sunspec_i16(regs.get(off + 18)), var_sf),
-        power_factor: sunspec_apply_sf(sunspec_i16(regs.get(off + 20)), pf_sf),
-        energy_wh: sunspec_apply_sf(sunspec_u32(regs, off + 22), wh_sf),
+        ok: true, ac_current: sunspec_apply_sf(regs.get(off) & 65535, a_sf), ac_voltage: sunspec_apply_sf(regs.get(off + 8) & 65535, v_sf), ac_power: sunspec_apply_sf(sunspec_i16(regs.get(off + 12)), w_sf), frequency: sunspec_apply_sf(regs.get(off + 14) & 65535, hz_sf), apparent_power: sunspec_apply_sf(sunspec_i16(regs.get(off + 16)), va_sf), reactive_power: sunspec_apply_sf(sunspec_i16(regs.get(off + 18)), var_sf), power_factor: sunspec_apply_sf(sunspec_i16(regs.get(off + 20)), pf_sf), energy_wh: sunspec_apply_sf(sunspec_u32(regs, off + 22), wh_sf),
     };
 }
 
@@ -247,32 +247,26 @@ pub fn sunspec_inverter(regs: & Vec<i64>, off: i64) -> SunSpecInverter {
 
 pub struct SunSpecMeter {
     pub ok: bool,
-    pub ac_current: f64,       // A total
-    pub voltage_ln: f64,       // V line-to-neutral average
-    pub real_power: f64,       // W total
-    pub frequency: f64,        // Hz
-    pub exported_wh: f64,      // Wh exported (total)
-    pub imported_wh: f64,      // Wh imported (total)
+    pub ac_current: f64,  // A total
+    pub voltage_ln: f64,  // V line-to-neutral average
+    pub real_power: f64,  // W total
+    pub frequency: f64,  // Hz
+    pub exported_wh: f64,  // Wh exported (total)
+    pub imported_wh: f64,  // Wh imported (total)
 }
 
 /// Parse a wye meter (203) at data offset `off`. Standard layout: A(0)
 /// AphA..C(1..3) A_SF(4); PhV avg(8) ... V_SF(15); Hz(16) Hz_SF(17);
 /// W(18) ... W_SF(22); then energy: TotWhExp(a 32-bit at 38), TotWhImp
 /// (32-bit at 42), TotWh_SF(54). Offsets follow the SunSpec 203 map.
-pub fn sunspec_meter(regs: & Vec<i64>, off: i64) -> SunSpecMeter {
+pub fn sunspec_meter(regs: &Vec<i64>, off: i64) -> SunSpecMeter {
     val a_sf: i64 = sunspec_i16(regs.get(off + 4));
     val v_sf: i64 = sunspec_i16(regs.get(off + 15));
     val hz_sf: i64 = sunspec_i16(regs.get(off + 17));
     val w_sf: i64 = sunspec_i16(regs.get(off + 22));
     val wh_sf: i64 = sunspec_i16(regs.get(off + 54));
     return SunSpecMeter {
-        ok: true,
-        ac_current: sunspec_apply_sf(regs.get(off) & 65535, a_sf),
-        voltage_ln: sunspec_apply_sf(regs.get(off + 8) & 65535, v_sf),
-        real_power: sunspec_apply_sf(sunspec_i16(regs.get(off + 18)), w_sf),
-        frequency: sunspec_apply_sf(regs.get(off + 16) & 65535, hz_sf),
-        exported_wh: sunspec_apply_sf(sunspec_u32(regs, off + 38), wh_sf),
-        imported_wh: sunspec_apply_sf(sunspec_u32(regs, off + 42), wh_sf),
+        ok: true, ac_current: sunspec_apply_sf(regs.get(off) & 65535, a_sf), voltage_ln: sunspec_apply_sf(regs.get(off + 8) & 65535, v_sf), real_power: sunspec_apply_sf(sunspec_i16(regs.get(off + 18)), w_sf), frequency: sunspec_apply_sf(regs.get(off + 16) & 65535, hz_sf), exported_wh: sunspec_apply_sf(sunspec_u32(regs, off + 38), wh_sf), imported_wh: sunspec_apply_sf(sunspec_u32(regs, off + 42), wh_sf),
     };
 }
 
@@ -280,39 +274,49 @@ pub fn sunspec_meter(regs: & Vec<i64>, off: i64) -> SunSpecMeter {
 
 /// Scan a device from a ModbusMap's holding registers starting at `start`:
 /// returns the walked model list. The marker is found first.
-pub fn sunspec_scan(m: & ModbusMap, start: i64) -> Vec<SunSpecModel> {
-    val marker: i64 = sunspec_find_marker(& m.holding, start);
+pub fn sunspec_scan(m: &ModbusMap, start: i64) -> Vec<SunSpecModel> {
+    val marker: i64 = sunspec_find_marker(&m.holding, start);
     if marker < 0 {
         return Vec::new();
     }
-    return sunspec_walk_models(& m.holding, marker);
+    return sunspec_walk_models(&m.holding, marker);
 }
 
 /// Read the first inverter model present (101/102/103) from a ModbusMap.
-pub fn sunspec_read_inverter(m: & ModbusMap, models: & Vec<SunSpecModel>) -> SunSpecInverter {
+pub fn sunspec_read_inverter(m: &ModbusMap, models: &Vec<SunSpecModel>) -> SunSpecInverter {
     var off: i64 = sunspec_model_offset(models, SUNSPEC_MODEL_INVERTER_3PH);
-    if off < 0 { off = sunspec_model_offset(models, SUNSPEC_MODEL_INVERTER_SPLIT); }
-    if off < 0 { off = sunspec_model_offset(models, SUNSPEC_MODEL_INVERTER_1PH); }
     if off < 0 {
-        return SunSpecInverter { ok: false, ac_current: 0.0, ac_voltage: 0.0, ac_power: 0.0, frequency: 0.0, apparent_power: 0.0, reactive_power: 0.0, power_factor: 0.0, energy_wh: 0.0 };
+        off = sunspec_model_offset(models, SUNSPEC_MODEL_INVERTER_SPLIT);
     }
-    return sunspec_inverter(& m.holding, off);
+    if off < 0 {
+        off = sunspec_model_offset(models, SUNSPEC_MODEL_INVERTER_1PH);
+    }
+    if off < 0 {
+        return SunSpecInverter {
+            ok: false, ac_current: 0.0, ac_voltage: 0.0, ac_power: 0.0, frequency: 0.0, apparent_power: 0.0, reactive_power: 0.0, power_factor: 0.0, energy_wh: 0.0
+        };
+    }
+    return sunspec_inverter(&m.holding, off);
 }
 
 /// Read the wye meter model (203) from a ModbusMap.
-pub fn sunspec_read_meter(m: & ModbusMap, models: & Vec<SunSpecModel>) -> SunSpecMeter {
+pub fn sunspec_read_meter(m: &ModbusMap, models: &Vec<SunSpecModel>) -> SunSpecMeter {
     val off: i64 = sunspec_model_offset(models, SUNSPEC_MODEL_METER_WYE);
     if off < 0 {
-        return SunSpecMeter { ok: false, ac_current: 0.0, voltage_ln: 0.0, real_power: 0.0, frequency: 0.0, exported_wh: 0.0, imported_wh: 0.0 };
+        return SunSpecMeter {
+            ok: false, ac_current: 0.0, voltage_ln: 0.0, real_power: 0.0, frequency: 0.0, exported_wh: 0.0, imported_wh: 0.0
+        };
     }
-    return sunspec_meter(& m.holding, off);
+    return sunspec_meter(&m.holding, off);
 }
 
 /// Read the common model (1) from a ModbusMap.
-pub fn sunspec_read_common(m: & ModbusMap, models: & Vec<SunSpecModel>) -> SunSpecCommon {
+pub fn sunspec_read_common(m: &ModbusMap, models: &Vec<SunSpecModel>) -> SunSpecCommon {
     val off: i64 = sunspec_model_offset(models, SUNSPEC_MODEL_COMMON);
     if off < 0 {
-        return SunSpecCommon { ok: false, manufacturer: "", model: "", options: "", version: "", serial: "", device_address: 0 };
+        return SunSpecCommon {
+            ok: false, manufacturer: "", model: "", options: "", version: "", serial: "", device_address: 0
+        };
     }
-    return sunspec_common(& m.holding, off);
+    return sunspec_common(&m.holding, off);
 }

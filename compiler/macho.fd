@@ -13,15 +13,29 @@
 //   - Symbol table (nlist_64, 16 bytes each)
 //   - String table
 
-module compiler::macho; use core; use vec; use string; use compiler::elf64; use compiler::image_writer;  // --- Constants ----------------------------------------------------------
+module compiler::macho;
+use core;
+use vec;
+use string;
+use compiler::elf64;
+use compiler::image_writer;
+// --- Constants ----------------------------------------------------------
 
-pub const MH_MAGIC_64: i64 = 0xFEEDFACF; pub const CPU_TYPE_X86_64: i64 = 0x01000007; pub const CPU_SUBTYPE_ALL: i64 = 3; pub const MH_OBJECT: i64 = 1; pub const LC_SEGMENT_64: i64 = 0x19; pub const LC_SYMTAB: i64 = 0x2;  // n_type values
+pub const MH_MAGIC_64: i64 = 0xFEEDFACF;
+pub const CPU_TYPE_X86_64: i64 = 0x01000007;
+pub const CPU_SUBTYPE_ALL: i64 = 3;
+pub const MH_OBJECT: i64 = 1;
+pub const LC_SEGMENT_64: i64 = 0x19;
+pub const LC_SYMTAB: i64 = 0x2;  // n_type values
 pub const N_UNDF_EXT: i64 = 0x01;  // undefined external
 pub const N_SECT: i64 = 0x0e;  // defined in section (local)
 pub const N_SECT_EXT: i64 = 0x0f;  // defined external
 
 // x86-64 relocation types
-pub const XR_UNSIGNED: i64 = 0; pub const XR_SIGNED: i64 = 1; pub const XR_BRANCH: i64 = 2;  // --- Structs ------------------------------------------------------------
+pub const XR_UNSIGNED: i64 = 0;
+pub const XR_SIGNED: i64 = 1;
+pub const XR_BRANCH: i64 = 2;
+// --- Structs ------------------------------------------------------------
 
 pub struct MachOSymbol {
     pub name: str,
@@ -75,7 +89,7 @@ pub enum ResultVec {
     Err(str)
 }
 
-fn mo_sym_index(e: & MachOEmitter, name: str) -> i64 {
+fn mo_sym_index(e: &MachOEmitter, name: str) -> i64 {
     var i: i64 = 0;
     while i < e.sym_names.len() {
         if e.sym_names.get(i) == name {
@@ -86,7 +100,7 @@ fn mo_sym_index(e: & MachOEmitter, name: str) -> i64 {
     return 0;
 }
 
-fn mo_add_symbol(e: & mut MachOEmitter, name: str, value: i64, sect: i64, sym_type: i64) -> i64 {
+fn mo_add_symbol(e: &mut MachOEmitter, name: str, value: i64, sect: i64, sym_type: i64) -> i64 {
     var i: i64 = 0;
     while i < e.sym_names.len() {
         if e.sym_names.get(i) == name {
@@ -100,7 +114,7 @@ fn mo_add_symbol(e: & mut MachOEmitter, name: str, value: i64, sect: i64, sym_ty
     return idx;
 }
 
-fn mo_rodata_find(em: & ElfEmitter, name: str) -> i64 {
+fn mo_rodata_find(em: &ElfEmitter, name: str) -> i64 {
     var i: i64 = 0;
     while i < em.rodata_symbols.len() {
         if em.rodata_symbols.get(i).name == name {
@@ -108,12 +122,12 @@ fn mo_rodata_find(em: & ElfEmitter, name: str) -> i64 {
         }
         i = i + 1;
     }
-    return - 1;
+    return -1;
 }
 
 // Assemble via the shared encoder, then translate results into Mach-O
 // symbols/relocations/section bytes.
-pub fn MachOEmitter_import(self: & mut MachOEmitter, em: & ElfEmitter) {
+pub fn MachOEmitter_import(self: &mut MachOEmitter, em: &ElfEmitter) {
     var i: i64 = 0;
     while i < em.text.len() {
         self.text_bytes.push(em.text.get(i));
@@ -184,7 +198,7 @@ pub fn MachOEmitter_import(self: & mut MachOEmitter, em: & ElfEmitter) {
     }
 }
 
-fn mo_count_relocs_in(e: & MachOEmitter, sect: i64) -> i64 {
+fn mo_count_relocs_in(e: &MachOEmitter, sect: i64) -> i64 {
     var n: i64 = 0;
     var i: i64 = 0;
     while i < e.relocations.len() {
@@ -198,7 +212,7 @@ fn mo_count_relocs_in(e: & MachOEmitter, sect: i64) -> i64 {
 
 // --- Build Mach-O object file ---
 
-pub fn MachOEmitter_build_macho(self: & mut MachOEmitter) -> ResultVec {
+pub fn MachOEmitter_build_macho(self: &mut MachOEmitter) -> ResultVec {
     // TG13: the object from compiler/image_writer.fd (the old body wrote a
     // malformed MH_OBJECT and is gone: docs/image-writer.md)
     return MachOEmitter_build_macho_img(self);
@@ -206,7 +220,7 @@ pub fn MachOEmitter_build_macho(self: & mut MachOEmitter) -> ResultVec {
 
 /// Where symbol `s` goes in an object's symbol table: 0 local (N_SECT),
 /// 1 defined external (N_SECT | N_EXT), 2 undefined (N_UNDF | N_EXT).
-fn mo_sym_group(s: & MachOSymbol) -> i64 {
+fn mo_sym_group(s: &MachOSymbol) -> i64 {
     if s.section_number == 0 {
         return 2;
     }
@@ -218,7 +232,7 @@ fn mo_sym_group(s: & MachOSymbol) -> i64 {
 
 /// The relocations of section `sect` (1 __text, 2 __const) as
 /// relocation_info records, symbols renumbered by `newidx`.
-fn mo_img_relocs(self: & MachOEmitter, sect: i64, newidx: & Vec<i64>) -> Vec<i64> {
+fn mo_img_relocs(self: &MachOEmitter, sect: i64, newidx: &Vec<i64>) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     var i: i64 = 0;
     while i < self.relocations.len() {
@@ -228,7 +242,7 @@ fn mo_img_relocs(self: & MachOEmitter, sect: i64, newidx: & Vec<i64>) -> Vec<i64
             if r.symbol_index >= 0 && r.symbol_index < newidx.len() {
                 sym = newidx.get(r.symbol_index);
             }
-            img_macho_reloc(& mut out, r.offset, sym, r.is_pcrel, r.length, r.is_extern, r.rtype);
+            img_macho_reloc(&mut out, r.offset, sym, r.is_pcrel, r.length, r.is_extern, r.rtype);
         }
         i = i + 1;
     }
@@ -250,7 +264,7 @@ fn mo_img_relocs(self: & MachOEmitter, sect: i64, newidx: & Vec<i64>) -> Vec<i64
 ///   - a __const symbol's n_value its address (__const's address + its
 ///     offset; the old body wrote the offset)
 ///   - __text flagged S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS
-pub fn MachOEmitter_build_macho_img(self: & mut MachOEmitter) -> ResultVec {
+pub fn MachOEmitter_build_macho_img(self: &mut MachOEmitter) -> ResultVec {
     var text_size: i64 = self.text_bytes.len();
     var const_size: i64 = self.const_bytes.len();
     // __const when there are bytes, symbols or relocations in it
@@ -287,7 +301,7 @@ pub fn MachOEmitter_build_macho_img(self: & mut MachOEmitter) -> ResultVec {
         var i: i64 = 0;
         while i < n {
             var s: MachOSymbol = self.symbols.get(i);
-            if mo_sym_group(& s) == k {
+            if mo_sym_group(&s) == k {
                 newidx.set(i, nl.len() / 16);
                 var value: i64 = s.value;
                 if s.section_number == 2 {
@@ -295,8 +309,8 @@ pub fn MachOEmitter_build_macho_img(self: & mut MachOEmitter) -> ResultVec {
                 } else if s.section_number == 0 {
                     value = 0;
                 }
-                var strx: i64 = img_str_add(& mut strtab, s.name);
-                img_macho_nlist(& mut nl, strx, s.sym_type, s.section_number, s.description, value);
+                var strx: i64 = img_str_add(&mut strtab, s.name);
+                img_macho_nlist(&mut nl, strx, s.sym_type, s.section_number, s.description, value);
                 c = c + 1;
             }
             i = i + 1;
@@ -304,9 +318,9 @@ pub fn MachOEmitter_build_macho_img(self: & mut MachOEmitter) -> ResultVec {
         counts.push(c);
         k = k + 1;
     }
-    img_align(& mut strtab, 8);
-    var text_rel: Vec<i64> = mo_img_relocs(self, 1, & newidx);
-    var const_rel: Vec<i64> = mo_img_relocs(self, 2, & newidx);
+    img_align(&mut strtab, 8);
+    var text_rel: Vec<i64> = mo_img_relocs(self, 1, &newidx);
+    var const_rel: Vec<i64> = mo_img_relocs(self, 2, &newidx);
     // Layout: header, load commands, section data, relocations, symbols,
     // strings
     var cmds_size: i64 = 72 + 80 * nsects + 24 + 80;
@@ -317,32 +331,32 @@ pub fn MachOEmitter_build_macho_img(self: & mut MachOEmitter) -> ResultVec {
     var sym_off: i64 = const_rel_off + const_rel.len();
     var str_off: i64 = sym_off + nl.len();
     var out: Vec<i64> = Vec::new();
-    img_macho_header(& mut out, CPU_TYPE_X86_64, CPU_SUBTYPE_ALL, MH_OBJECT, 3, cmds_size, 0);
-    img_macho_segment(& mut out, "", 0, span, text_off, span, 7, 7, nsects);
+    img_macho_header(&mut out, CPU_TYPE_X86_64, CPU_SUBTYPE_ALL, MH_OBJECT, 3, cmds_size, 0);
+    img_macho_segment(&mut out, "", 0, span, text_off, span, 7, 7, nsects);
     var text_rel_at: i64 = 0;
     if text_rel.len() > 0 {
         text_rel_at = text_rel_off;
     }
-    img_macho_section_rel(& mut out, "__text", "__TEXT", 0, text_size, text_off, 4, text_rel_at, text_rel.len() / 8, 0x80000400);
+    img_macho_section_rel(&mut out, "__text", "__TEXT", 0, text_size, text_off, 4, text_rel_at, text_rel.len() / 8, 0x80000400);
     if has_const {
         var const_rel_at: i64 = 0;
         if const_rel.len() > 0 {
             const_rel_at = const_rel_off;
         }
-        img_macho_section_rel(& mut out, "__const", "__TEXT", const_addr, const_size, const_off, 3, const_rel_at, const_rel.len() / 8, 0);
+        img_macho_section_rel(&mut out, "__const", "__TEXT", const_addr, const_size, const_off, 3, const_rel_at, const_rel.len() / 8, 0);
     }
-    img_macho_symtab_cmd(& mut out, sym_off, nl.len() / 16, str_off, strtab.len());
-    img_macho_dysymtab_cmd(& mut out, 0, counts.get(0), counts.get(0), counts.get(1), counts.get(0) + counts.get(1), counts.get(2));
-    img_append(& mut out, & self.text_bytes);
+    img_macho_symtab_cmd(&mut out, sym_off, nl.len() / 16, str_off, strtab.len());
+    img_macho_dysymtab_cmd(&mut out, 0, counts.get(0), counts.get(0), counts.get(1), counts.get(0) + counts.get(1), counts.get(2));
+    img_append(&mut out, &self.text_bytes);
     if has_const {
-        img_pad_to(& mut out, const_off);
-        img_append(& mut out, & self.const_bytes);
+        img_pad_to(&mut out, const_off);
+        img_append(&mut out, &self.const_bytes);
     }
-    img_pad_to(& mut out, text_rel_off);
-    img_append(& mut out, & text_rel);
-    img_append(& mut out, & const_rel);
-    img_append(& mut out, & nl);
-    img_append(& mut out, & strtab);
+    img_pad_to(&mut out, text_rel_off);
+    img_append(&mut out, &text_rel);
+    img_append(&mut out, &const_rel);
+    img_append(&mut out, &nl);
+    img_append(&mut out, &strtab);
     return ResultVec::Ok(out);
 }
 
@@ -350,7 +364,7 @@ pub fn MachOEmitter_build_macho_img(self: & mut MachOEmitter) -> ResultVec {
 
 pub fn emit_macho_file(module: i64, asm: str) -> ResultVec {
     var em: ElfEmitter = ElfEmitter_new();
-    match ElfEmitter_assemble(& mut em, asm) {
+    match ElfEmitter_assemble(&mut em, asm) {
         ResultUnit::Ok => {
         }
         ResultUnit::Err(e) => {
@@ -358,6 +372,6 @@ pub fn emit_macho_file(module: i64, asm: str) -> ResultVec {
         }
     }
     var emitter: MachOEmitter = MachOEmitter_new();
-    MachOEmitter_import(& mut emitter, & em);
+    MachOEmitter_import(&mut emitter, &em);
     return MachOEmitter_build_macho(emitter);
 }

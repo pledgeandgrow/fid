@@ -98,12 +98,12 @@ pub fn region_new() -> i64 {
     if h == 0 {
         p_panic("out of memory");
     }
-    var p0: * mut i64 = h;
-    var p1: * mut i64 = h + 8;
+    var p0: *mut i64 = h;
+    var p1: *mut i64 = h + 8;
     // SAFETY: h is a live 16-byte block just allocated above.
     unsafe {
-        * p0 = 0;
-        * p1 = 0;
+        *p0 = 0;
+        *p1 = 0;
     }
     return h;
 }
@@ -118,17 +118,17 @@ pub fn region_alloc(region: i64, size: i64) -> i64 {
     if node == 0 {
         p_panic("out of memory");
     }
-    var headp: * mut i64 = region;
-    var countp: * mut i64 = region + 8;
-    var nextp: * mut i64 = node;
-    var sizep: * mut i64 = node + 8;
+    var headp: *mut i64 = region;
+    var countp: *mut i64 = region + 8;
+    var nextp: *mut i64 = node;
+    var sizep: *mut i64 = node + 8;
     // SAFETY: `region` is a live region header ({head, count}); `node` is
     // a live size+16 block whose first two words are the list link.
     unsafe {
-        * nextp = * headp;
-        * sizep = size;
-        * headp = node;
-        * countp = * countp + 1;
+        *nextp = *headp;
+        *sizep = size;
+        *headp = node;
+        *countp = *countp + 1;
     }
     return node + 16;
 }
@@ -147,19 +147,19 @@ pub fn region_free(region: i64) -> void {
     if region == 0 {
         return;
     }
-    var headp: * mut i64 = region;
+    var headp: *mut i64 = region;
     var node: i64 = 0;
     // SAFETY: `region` is a live header; every node it points to was
     // allocated by region_alloc (16-byte link + payload).
     unsafe {
-        node = * headp;
+        node = *headp;
     }
     while node != 0 {
-        var np: * mut i64 = node;
+        var np: *mut i64 = node;
         var next: i64 = 0;
         // SAFETY: node is a live list node; read its link before freeing.
         unsafe {
-            next = * np;
+            next = *np;
         }
         p_free(node);
         node = next;
@@ -174,32 +174,32 @@ pub fn region_free_one(region: i64, ptr: i64) -> void {
     if region == 0 || ptr == 0 {
         return;
     }
-    var headp: * mut i64 = region;
-    var countp: * mut i64 = region + 8;
+    var headp: *mut i64 = region;
+    var countp: *mut i64 = region + 8;
     var prev: i64 = 0;
     var node: i64 = 0;
     // SAFETY: `region` is a live header; walk its node list.
     unsafe {
-        node = * headp;
+        node = *headp;
     }
     while node != 0 {
-        var np: * mut i64 = node;
+        var np: *mut i64 = node;
         var next: i64 = 0;
         // SAFETY: node is a live list node.
         unsafe {
-            next = * np;
+            next = *np;
         }
         if node + 16 == ptr {
-            var prevp: * mut i64 = prev;
+            var prevp: *mut i64 = prev;
             // SAFETY: unlink `node`: head case writes the header, else the
             // previous node's next word — both live.
             unsafe {
                 if prev == 0 {
-                    * headp = next;
+                    *headp = next;
                 } else {
-                    * prevp = next;
+                    *prevp = next;
                 }
-                * countp = * countp - 1;
+                * countp = *countp - 1;
             }
             p_free(node);
             return;
@@ -244,12 +244,12 @@ pub fn with_arena(f: fn() -> i64) -> i64 {
 pub fn mem_copy(dst: i64, src: i64, n: i64) -> void {
     var i: i64 = 0;
     while i < n {
-        var d: * mut u8 = dst + i;
-        var s: * mut u8 = src + i;
+        var d: *mut u8 = dst + i;
+        var s: *mut u8 = src + i;
         // SAFETY: the function's @unsafe contract: dst and src each hold n
         // bytes; i < n keeps the copy inside them.
         unsafe {
-            * d = * s;
+            *d = *s;
         }
         i = i + 1;
     }
@@ -294,11 +294,11 @@ pub fn region_count(region: i64) -> i64 {
     if region == 0 {
         return 0;
     }
-    var countp: * mut i64 = region + 8;
+    var countp: *mut i64 = region + 8;
     var n: i64 = 0;
     // SAFETY: `region` is a live header; word 1 is the live count.
     unsafe {
-        n = * countp;
+        n = *countp;
     }
     return n;
 }
@@ -341,7 +341,7 @@ pub fn frame_new() -> FrameArena {
 /// Begin a new frame. Saves the current arena position.
 /// All allocations between frame_begin and frame_end will be freed
 /// when frame_end is called.
-pub fn frame_begin(fa: & mut FrameArena) -> void {
+pub fn frame_begin(fa: &mut FrameArena) -> void {
     fa.mark = p_arena_save();
     fa.alloc_count = 0;
 }
@@ -349,7 +349,7 @@ pub fn frame_begin(fa: & mut FrameArena) -> void {
 /// Allocate `size` bytes within the current frame.
 /// The memory is freed when frame_end is called.
 /// Must be called between frame_begin and frame_end.
-pub fn frame_alloc(fa: & mut FrameArena, size: i64) -> i64 {
+pub fn frame_alloc(fa: &mut FrameArena, size: i64) -> i64 {
     fa.alloc_count = fa.alloc_count + 1;
     return p_malloc(size);
 }

@@ -22,7 +22,12 @@
 // 7. Option<T> -> Opt* enums or explicit checks
 // 8. f64::to_bits/from_bits -> p_f64_to_bits extern / store f64 directly
 
-module compiler::codegen; use core; use vec; use string; use compiler::ast;  // ===========================================================================
+module compiler::codegen;
+use core;
+use vec;
+use string;
+use compiler::ast;
+// ===========================================================================
 // Vec-based map helper types (replacing HashMap)
 // ===========================================================================
 
@@ -159,24 +164,25 @@ pub fn CodeGen_new() -> CodeGen {
 
 // --- Scope management ------------------------------------------------------
 
-pub fn CodeGen_push_scope(self: & mut CodeGen) {
+pub fn CodeGen_push_scope(self: &mut CodeGen) {
     self.scope_marks.push(self.local_vars.len());
 }
 
-pub fn CodeGen_pop_scope(self: & mut CodeGen) {
+pub fn CodeGen_pop_scope(self: &mut CodeGen) {
     if self.scope_marks.len() > 0 {
         var mark: i64 = self.scope_marks.pop();
         // Truncate local_vars and local_types back to the mark
         while self.local_vars.len() > mark {
             self.local_vars.pop();
-        } while self.local_types.len() > mark {
+        }
+        while self.local_types.len() > mark {
             self.local_types.pop();
         }
     }
 }
 
 /// Declare a variable in the current scope, returning its stack offset.
-pub fn CodeGen_declare_var(self: & mut CodeGen, name: str) -> i64 {
+pub fn CodeGen_declare_var(self: &mut CodeGen, name: str) -> i64 {
     var offset: i64 = self.next_offset;
     self.next_offset = self.next_offset + 8;
     self.local_vars.push(VarOffsetEntry_new(name, offset));
@@ -184,14 +190,14 @@ pub fn CodeGen_declare_var(self: & mut CodeGen, name: str) -> i64 {
 }
 
 /// Declare a variable with a known struct type (for method call resolution).
-pub fn CodeGen_declare_var_typed(self: & mut CodeGen, name: str, struct_name: str) -> i64 {
+pub fn CodeGen_declare_var_typed(self: &mut CodeGen, name: str, struct_name: str) -> i64 {
     var offset: i64 = CodeGen_declare_var(self, name);
     self.local_types.push(VarTypeEntry_new(name, struct_name));
     return offset;
 }
 
 /// Look up a variable's struct type name, searching from innermost scope outward.
-pub fn CodeGen_lookup_var_type(self: & CodeGen, name: str) -> ArmOptStr {
+pub fn CodeGen_lookup_var_type(self: &CodeGen, name: str) -> ArmOptStr {
     var i: i64 = self.local_types.len() - 1;
     while i >= 0 {
         if self.local_types.get(i).name == name {
@@ -203,7 +209,7 @@ pub fn CodeGen_lookup_var_type(self: & CodeGen, name: str) -> ArmOptStr {
 }
 
 /// Look up a variable's stack offset, searching from innermost scope outward.
-pub fn CodeGen_lookup_var(self: & CodeGen, name: str) -> OptI64 {
+pub fn CodeGen_lookup_var(self: &CodeGen, name: str) -> OptI64 {
     var i: i64 = self.local_vars.len() - 1;
     while i >= 0 {
         if self.local_vars.get(i).name == name {
@@ -216,7 +222,7 @@ pub fn CodeGen_lookup_var(self: & CodeGen, name: str) -> OptI64 {
 
 /// Get the byte offset of a field by searching all struct layouts.
 /// Returns the first match (simplified — real impl tracks struct type).
-pub fn CodeGen_get_field_offset(self: & CodeGen, field: str) -> i64 {
+pub fn CodeGen_get_field_offset(self: &CodeGen, field: str) -> i64 {
     var i: i64 = 0;
     while i < self.struct_layouts.len() {
         var layout: StructFieldLayout = self.struct_layouts.get(i);
@@ -235,12 +241,12 @@ pub fn CodeGen_get_field_offset(self: & CodeGen, field: str) -> i64 {
 // --- Output helpers --------------------------------------------------------
 
 /// Append a string (no newline).
-pub fn CodeGen_w(self: & mut CodeGen, s: str) {
+pub fn CodeGen_w(self: &mut CodeGen, s: str) {
     self.output = self.output + s;
 }
 
 /// Append a string with a trailing newline.
-pub fn CodeGen_wl(self: & mut CodeGen, s: str) {
+pub fn CodeGen_wl(self: &mut CodeGen, s: str) {
     self.output = self.output + s + "\n";
 }
 
@@ -274,14 +280,14 @@ pub fn CodeGen_escape_string(s: str) -> str {
 }
 
 /// Generate a fresh label with the given prefix.
-pub fn CodeGen_fresh_label(self: & mut CodeGen, prefix: str) -> str {
+pub fn CodeGen_fresh_label(self: &mut CodeGen, prefix: str) -> str {
     var label: str = "." + prefix + "_" + int_to_str(self.label_counter);
     self.label_counter = self.label_counter + 1;
     return label;
 }
 
 /// Intern a string constant, returning its label.
-pub fn CodeGen_intern_string(self: & mut CodeGen, s: str) -> str {
+pub fn CodeGen_intern_string(self: &mut CodeGen, s: str) -> str {
     var i: i64 = 0;
     while i < self.string_consts.len() {
         if self.string_consts.get(i).content == s {
@@ -295,7 +301,7 @@ pub fn CodeGen_intern_string(self: & mut CodeGen, s: str) -> str {
 }
 
 /// Intern a float constant, returning its label.
-pub fn CodeGen_intern_float(self: & mut CodeGen, f: f64) -> str {
+pub fn CodeGen_intern_float(self: &mut CodeGen, f: f64) -> str {
     var i: i64 = 0;
     while i < self.float_consts.len() {
         if self.float_consts.get(i).value == f {
@@ -316,11 +322,11 @@ pub fn CodeGen_intern_float(self: & mut CodeGen, f: f64) -> str {
 /// Returns a string of AArch64 assembly text.
 pub fn generate(program: Program) -> str {
     var gen: CodeGen = CodeGen_new();
-    CodeGen_generate(& mut gen, program);
+    CodeGen_generate(&mut gen, program);
     return gen.output;
 }
 
-pub fn CodeGen_generate(self: & mut CodeGen, program: Program) {
+pub fn CodeGen_generate(self: &mut CodeGen, program: Program) {
     // Register struct layouts for field access codegen
     var si: i64 = 0;
     while si < program.structs.len() {
@@ -408,7 +414,7 @@ pub fn CodeGen_generate(self: & mut CodeGen, program: Program) {
 // ===========================================================================
 
 /// Reset local variable state for a new function.
-fn CodeGen_reset_locals(self: & mut CodeGen) {
+fn CodeGen_reset_locals(self: &mut CodeGen) {
     var empty_vars: Vec<VarOffsetEntry> = Vec::new();
     self.local_vars = empty_vars;
     var empty_types: Vec<VarTypeEntry> = Vec::new();
@@ -419,7 +425,7 @@ fn CodeGen_reset_locals(self: & mut CodeGen) {
     self.next_offset = 0;
 }
 
-pub fn CodeGen_gen_func(self: & mut CodeGen, func: Func) {
+pub fn CodeGen_gen_func(self: &mut CodeGen, func: Func) {
     var mangled: str = "p_" + func.name;
     CodeGen_wl(self, mangled + ":");
 
@@ -464,7 +470,7 @@ pub fn CodeGen_gen_func(self: & mut CodeGen, func: Func) {
     CodeGen_wl(self, "");
 }
 
-pub fn CodeGen_gen_method(self: & mut CodeGen, struct_name: str, func: Func) {
+pub fn CodeGen_gen_method(self: &mut CodeGen, struct_name: str, func: Func) {
     var mangled: str = "p_" + struct_name + "_" + func.name;
     CodeGen_wl(self, mangled + ":");
 
@@ -509,7 +515,7 @@ pub fn CodeGen_gen_method(self: & mut CodeGen, struct_name: str, func: Func) {
     CodeGen_wl(self, "");
 }
 
-pub fn CodeGen_gen_epilogue(self: & mut CodeGen) {
+pub fn CodeGen_gen_epilogue(self: &mut CodeGen) {
     CodeGen_wl(self, "    add sp, sp, #" + int_to_str(self.frame_size));
     CodeGen_wl(self, "    ldp x29, x30, [sp], #16");
     CodeGen_wl(self, "    ret");
@@ -519,7 +525,7 @@ pub fn CodeGen_gen_epilogue(self: & mut CodeGen) {
 // Statement generation
 // ===========================================================================
 
-pub fn CodeGen_gen_stmt(self: & mut CodeGen, stmt: Stmt) {
+pub fn CodeGen_gen_stmt(self: &mut CodeGen, stmt: Stmt) {
     match stmt {
         Stmt::Let(name, _ty, expr, _is_mut, _is_persist, _annotations, _line) => {
             // Track struct type for method call resolution
@@ -969,7 +975,7 @@ pub fn CodeGen_gen_stmt(self: & mut CodeGen, stmt: Stmt) {
 }
 
 /// Generate match statement code (shared between Stmt::Match and Expr::Match).
-pub fn CodeGen_gen_match(self: & mut CodeGen, expr: Expr, arms: Vec<MatchArm>) {
+pub fn CodeGen_gen_match(self: &mut CodeGen, expr: Expr, arms: Vec<MatchArm>) {
     // Evaluate match expression
     CodeGen_gen_expr(self, expr);
     var match_temp: i64 = self.next_offset;
@@ -1056,7 +1062,7 @@ pub fn CodeGen_gen_match(self: & mut CodeGen, expr: Expr, arms: Vec<MatchArm>) {
 // Expression generation
 // ===========================================================================
 
-pub fn CodeGen_gen_expr(self: & mut CodeGen, expr: Expr) {
+pub fn CodeGen_gen_expr(self: &mut CodeGen, expr: Expr) {
     match expr {
         Expr::IntLit(n) => {
             CodeGen_wl(self, "    mov x0, #" + int_to_str(n));

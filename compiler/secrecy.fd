@@ -21,8 +21,13 @@
 // Dependencies: compiler::ast, compiler::escape (identifier walker)
 
 module compiler::secrecy;
- use core; use vec; use string; use compiler::ast; use compiler::parser; use compiler::escape;
- pub struct SecSummary {
+use core;
+use vec;
+use string;
+use compiler::ast;
+use compiler::parser;
+use compiler::escape;
+pub struct SecSummary {
     pub leaks: Vec<i64>,
     pub returns: Vec<i64>,
     pub outputs: bool,
@@ -179,7 +184,7 @@ fn sec_type_names(program: Program) -> i64 {
 }
 
 // method name -> one more key it may call
-fn sec_index_method(method_index: i64, method_keys: & mut Vec<Vec<str>>, method: str, key: str) {
+fn sec_index_method(method_index: i64, method_keys: &mut Vec<Vec<str>>, method: str, key: str) {
     var slot: i64 = HashMap_get(method_index, method);
     if slot == 0 {
         method_keys.push(Vec::new());
@@ -243,12 +248,12 @@ pub fn SecrecyChecker_new(program: Program) -> SecrecyChecker {
             HashMap_insert(func_index, key, k + 1);
         }
         if !str_starts_with(all.get(k).skey, "fn:") {
-            sec_index_method(method_index, & mut method_keys, all.get(k).func.name, key);
+            sec_index_method(method_index, &mut method_keys, all.get(k).func.name, key);
         } else {
             var p: i64 = 0;
             while p < str_len(key) {
                 if str_byte_at(key, p) == 95 && p > 0 && HashMap_get(type_names, str_slice(key, 0, p)) != 0 {
-                    sec_index_method(method_index, & mut method_keys, str_slice(key, p + 1, str_len(key)), key);
+                    sec_index_method(method_index, &mut method_keys, str_slice(key, p + 1, str_len(key)), key);
                 }
                 p = p + 1;
             }
@@ -296,7 +301,7 @@ pub fn SecrecyChecker_new(program: Program) -> SecrecyChecker {
     };
 }
 
-fn sec_error(self: & mut SecrecyChecker, kind: str, msg: str) {
+fn sec_error(self: &mut SecrecyChecker, kind: str, msg: str) {
     if self.report {
         var full: str = "Security error (" + kind + ") (line " + int_to_str(self.line) + "): in '" + self.func_name + "', " + msg;
         if !str_vec_contains(self.errors, full) {
@@ -305,7 +310,7 @@ fn sec_error(self: & mut SecrecyChecker, kind: str, msg: str) {
     }
 }
 
-fn sec_summary(self: & SecrecyChecker, key: str) -> SecSummary {
+fn sec_summary(self: &SecrecyChecker, key: str) -> SecSummary {
     var slot: i64 = HashMap_get(self.summary_index, key);
     if slot == 0 {
         var empty: Vec<i64> = Vec::new();
@@ -317,7 +322,7 @@ fn sec_summary(self: & SecrecyChecker, key: str) -> SecSummary {
     return self.summaries.get(slot - 1);
 }
 
-fn sec_set_summary(self: & mut SecrecyChecker, key: str, s: SecSummary) {
+fn sec_set_summary(self: &mut SecrecyChecker, key: str, s: SecSummary) {
     var slot: i64 = HashMap_get(self.summary_index, key);
     if slot == 0 {
         self.summaries.push(s);
@@ -328,7 +333,7 @@ fn sec_set_summary(self: & mut SecrecyChecker, key: str, s: SecSummary) {
 }
 
 // A number that grows whenever any summary grows (summaries only grow).
-fn sec_summary_total(self: & SecrecyChecker) -> i64 {
+fn sec_summary_total(self: &SecrecyChecker) -> i64 {
     var n: i64 = 0;
     var i: i64 = 0;
     while i < self.summaries.len() {
@@ -344,7 +349,7 @@ fn sec_summary_total(self: & SecrecyChecker) -> i64 {
 
 // --- Variables and context ------------------------------------------------
 
-fn sec_var(self: & SecrecyChecker, name: str) -> Vec<i64> {
+fn sec_var(self: &SecrecyChecker, name: str) -> Vec<i64> {
     var slot: i64 = HashMap_get(self.var_index, name);
     if slot == 0 {
         return sec_none();
@@ -352,12 +357,12 @@ fn sec_var(self: & SecrecyChecker, name: str) -> Vec<i64> {
     return self.var_labels.get(slot - 1);
 }
 
-fn sec_has_var(self: & SecrecyChecker, name: str) -> bool {
+fn sec_has_var(self: &SecrecyChecker, name: str) -> bool {
     return HashMap_get(self.var_index, name) != 0;
 }
 
 /// Give `name` (at least) the label `l`.
-fn sec_assign(self: & mut SecrecyChecker, name: str, l: Vec<i64>) {
+fn sec_assign(self: &mut SecrecyChecker, name: str, l: Vec<i64>) {
     var slot: i64 = HashMap_get(self.var_index, name);
     if slot == 0 {
         self.var_labels.push(l);
@@ -375,30 +380,30 @@ fn sec_assign(self: & mut SecrecyChecker, name: str, l: Vec<i64>) {
     }
 }
 
-fn sec_pc(self: & SecrecyChecker) -> Vec<i64> {
+fn sec_pc(self: &SecrecyChecker) -> Vec<i64> {
     if self.pc.len() == 0 {
         return sec_none();
     }
     return self.pc.get(self.pc.len() - 1);
 }
 
-fn sec_push_pc(self: & mut SecrecyChecker, extra: Vec<i64>) {
+fn sec_push_pc(self: &mut SecrecyChecker, extra: Vec<i64>) {
     var next: Vec<i64> = sec_union(sec_pc(self), extra);
     self.pc.push(next);
 }
 
-fn sec_pop_pc(self: & mut SecrecyChecker) {
+fn sec_pop_pc(self: &mut SecrecyChecker) {
     self.pc.pop();
 }
 
-fn sec_note_leak(self: & mut SecrecyChecker, i: i64) {
+fn sec_note_leak(self: &mut SecrecyChecker, i: i64) {
     if !sec_has(self.cur_leaks, i) {
         self.cur_leaks = sec_union(self.cur_leaks, sec_one(i));
         self.changed = true;
     }
 }
 
-fn sec_note_output(self: & mut SecrecyChecker) {
+fn sec_note_output(self: &mut SecrecyChecker) {
     if !self.cur_outputs {
         self.cur_outputs = true;
         self.changed = true;
@@ -406,15 +411,15 @@ fn sec_note_output(self: & mut SecrecyChecker) {
 }
 
 /// `data` reaches the output `what` while the code runs under `pc`.
-fn sec_sink(self: & mut SecrecyChecker, what: str, data: Vec<i64>, pc: Vec<i64>) {
+fn sec_sink(self: &mut SecrecyChecker, what: str, data: Vec<i64>, pc: Vec<i64>) {
     sec_note_output(self);
-    if sec_has(data, - 1) {
+    if sec_has(data, -1) {
         sec_error(self, "@secret", "a secret value reaches " + what);
-    } else if sec_has(data, - 2) {
+    } else if sec_has(data, -2) {
         sec_error(self, "@sensitive", "a sensitive value reaches " + what + "; release it through privacy::release (a consent check) or mark the function @declassify");
-    } else if sec_has(pc, - 1) {
+    } else if sec_has(pc, -1) {
         sec_error(self, "@secret", what + " runs inside a branch or loop that depends on a secret");
-    } else if sec_has(pc, - 2) {
+    } else if sec_has(pc, -2) {
         sec_error(self, "@sensitive", what + " runs inside a branch or loop that depends on sensitive data");
     }
     var both: Vec<i64> = sec_union(data, pc);
@@ -427,7 +432,7 @@ fn sec_sink(self: & mut SecrecyChecker, what: str, data: Vec<i64>, pc: Vec<i64>)
     }
 }
 
-fn sec_ret(self: & mut SecrecyChecker, l: Vec<i64>) {
+fn sec_ret(self: &mut SecrecyChecker, l: Vec<i64>) {
     if self.declassify {
         return;
     }
@@ -439,7 +444,7 @@ fn sec_ret(self: & mut SecrecyChecker, l: Vec<i64>) {
                 self.cur_returns = sec_union(self.cur_returns, sec_one(o));
                 self.changed = true;
             }
-        } else if o == - 1 {
+        } else if o == -1 {
             if !self.may_return_secret {
                 sec_error(self, "@secret", "returns a secret value; mark the function @secret (callers keep its result secret) or @declassify (an audited release)");
             }
@@ -452,7 +457,7 @@ fn sec_ret(self: & mut SecrecyChecker, l: Vec<i64>) {
 
 // --- Functions ------------------------------------------------------------
 
-fn sec_analyze_func(self: & mut SecrecyChecker, key: str, f: Func) {
+fn sec_analyze_func(self: &mut SecrecyChecker, key: str, f: Func) {
     self.func_name = f.name;
     // TL2: what is reported before its first statement is placed at its
     // `fn`, not at "line 0"
@@ -473,9 +478,9 @@ fn sec_analyze_func(self: & mut SecrecyChecker, key: str, f: Func) {
     while i < f.params.len() {
         var p: Param = f.params.get(i);
         if sec_has_annotation(p.annotations, "secret") {
-            sec_assign(self, p.name, sec_one(- 1));
+            sec_assign(self, p.name, sec_one(-1));
         } else if sec_has_annotation(p.annotations, "sensitive") {
-            sec_assign(self, p.name, sec_one(- 2));
+            sec_assign(self, p.name, sec_one(-2));
         } else {
             sec_assign(self, p.name, sec_one(i));
         }
@@ -522,7 +527,7 @@ fn sec_analyze_func(self: & mut SecrecyChecker, key: str, f: Func) {
 
 // --- Statements -----------------------------------------------------------
 
-fn sec_stmts(self: & mut SecrecyChecker, stmts: Vec<Stmt>) {
+fn sec_stmts(self: &mut SecrecyChecker, stmts: Vec<Stmt>) {
     var i: i64 = 0;
     while i < stmts.len() {
         sec_stmt(self, stmts.get(i));
@@ -531,7 +536,7 @@ fn sec_stmts(self: & mut SecrecyChecker, stmts: Vec<Stmt>) {
 }
 
 /// Process `stmts` and return the label of their value (the last statement's).
-fn sec_stmts_value(self: & mut SecrecyChecker, stmts: Vec<Stmt>) -> Vec<i64> {
+fn sec_stmts_value(self: &mut SecrecyChecker, stmts: Vec<Stmt>) -> Vec<i64> {
     var n: i64 = stmts.len();
     if n == 0 {
         return sec_none();
@@ -574,7 +579,7 @@ fn sec_stmts_value(self: & mut SecrecyChecker, stmts: Vec<Stmt>) -> Vec<i64> {
     return sec_none();
 }
 
-fn sec_arms(self: & mut SecrecyChecker, arms: Vec<MatchArm>, scrutinee: Vec<i64>) -> Vec<i64> {
+fn sec_arms(self: &mut SecrecyChecker, arms: Vec<MatchArm>, scrutinee: Vec<i64>) -> Vec<i64> {
     sec_push_pc(self, scrutinee);
     var pc: Vec<i64> = sec_pc(self);
     var out: Vec<i64> = Vec::new();
@@ -641,14 +646,14 @@ fn sec_base_var(e: Expr) -> OptStr {
 }
 
 /// `name` (directly or through a field, element or dereference) receives `l`.
-fn sec_store(self: & mut SecrecyChecker, name: str, l: Vec<i64>) {
+fn sec_store(self: &mut SecrecyChecker, name: str, l: Vec<i64>) {
     if sec_has_var(self, name) || HashMap_get(self.globals, name) == 0 {
         sec_assign(self, name, l);
         // The caller sees what is written through a reference parameter.
         if str_vec_contains(self.ref_params, name) && !self.declassify {
-            if sec_has(l, - 1) && !self.may_return_secret {
+            if sec_has(l, -1) && !self.may_return_secret {
                 sec_error(self, "@secret", "writes a secret value through reference parameter '" + name + "'; mark the function @secret or @declassify");
-            } else if sec_has(l, - 2) && !self.may_return_sensitive {
+            } else if sec_has(l, -2) && !self.may_return_sensitive {
                 sec_error(self, "@sensitive", "writes a sensitive value through reference parameter '" + name + "'; mark the function @sensitive or @declassify");
             }
         }
@@ -657,7 +662,7 @@ fn sec_store(self: & mut SecrecyChecker, name: str, l: Vec<i64>) {
     }
 }
 
-fn sec_store_place(self: & mut SecrecyChecker, place: Expr, l: Vec<i64>) {
+fn sec_store_place(self: &mut SecrecyChecker, place: Expr, l: Vec<i64>) {
     match sec_base_var(place) {
         OptStr::Some(base) => {
             sec_store(self, base, l);
@@ -671,17 +676,17 @@ fn sec_has_secret_annotation(anns: Vec<Annotation>) -> bool {
     return sec_has_annotation(anns, "secret");
 }
 
-fn sec_stmt(self: & mut SecrecyChecker, s: Stmt) {
+fn sec_stmt(self: &mut SecrecyChecker, s: Stmt) {
     self.line = stmt_line(s);
     var pc: Vec<i64> = sec_pc(self);
     match s {
         Stmt::Let(name, _, expr, _, _, annotations, _) => {
             var l: Vec<i64> = sec_union(sec_expr(self, expr), pc);
             if sec_has_secret_annotation(annotations) {
-                l = sec_union(l, sec_one(- 1));
+                l = sec_union(l, sec_one(-1));
             }
             if sec_has_annotation(annotations, "sensitive") {
-                l = sec_union(l, sec_one(- 2));
+                l = sec_union(l, sec_one(-2));
             }
             sec_assign(self, name, l);
         }
@@ -696,10 +701,10 @@ fn sec_stmt(self: & mut SecrecyChecker, s: Stmt) {
         Stmt::LetUninit(name, _, annotations, _) => {
             var ul: Vec<i64> = pc;
             if sec_has_secret_annotation(annotations) {
-                ul = sec_union(ul, sec_one(- 1));
+                ul = sec_union(ul, sec_one(-1));
             }
             if sec_has_annotation(annotations, "sensitive") {
-                ul = sec_union(ul, sec_one(- 2));
+                ul = sec_union(ul, sec_one(-2));
             }
             sec_assign(self, name, ul);
         }
@@ -846,7 +851,7 @@ fn sec_stmt(self: & mut SecrecyChecker, s: Stmt) {
 
 // --- Expressions ----------------------------------------------------------
 
-fn sec_exprs(self: & mut SecrecyChecker, es: Vec<Expr>) -> Vec<Vec<i64>> {
+fn sec_exprs(self: &mut SecrecyChecker, es: Vec<Expr>) -> Vec<Vec<i64>> {
     var out: Vec<Vec<i64>> = Vec::new();
     var i: i64 = 0;
     while i < es.len() {
@@ -866,12 +871,12 @@ fn sec_union_all(ls: Vec<Vec<i64>>) -> Vec<i64> {
     return out;
 }
 
-fn sec_expr2(self: & mut SecrecyChecker, a: Box<Expr>, b: Box<Expr>) -> Vec<i64> {
+fn sec_expr2(self: &mut SecrecyChecker, a: Box<Expr>, b: Box<Expr>) -> Vec<i64> {
     var l: Vec<i64> = sec_expr(self, box_expr_deref(a));
     return sec_union(l, sec_expr(self, box_expr_deref(b)));
 }
 
-fn sec_expr(self: & mut SecrecyChecker, e: Expr) -> Vec<i64> {
+fn sec_expr(self: &mut SecrecyChecker, e: Expr) -> Vec<i64> {
     match e {
         Expr::Ident(n) => {
             return sec_var(self, n);
@@ -1022,11 +1027,11 @@ fn sec_expr(self: & mut SecrecyChecker, e: Expr) -> Vec<i64> {
     return sec_none();
 }
 
-fn sec_closure(self: & mut SecrecyChecker, params: Vec<Param>, body: Vec<Stmt>) -> Vec<i64> {
+fn sec_closure(self: &mut SecrecyChecker, params: Vec<Param>, body: Vec<Stmt>) -> Vec<i64> {
     // The body runs where the closure is called; check it here with the
     // captured labels, and give the closure those labels.
     var used: Vec<str> = Vec::new();
-    esc_idents_stmts(body, & mut used);
+    esc_idents_stmts(body, &mut used);
     var captured: Vec<i64> = Vec::new();
     var ui: i64 = 0;
     while ui < used.len() {
@@ -1060,7 +1065,7 @@ fn sec_closure(self: & mut SecrecyChecker, params: Vec<Param>, body: Vec<Stmt>) 
     return captured;
 }
 
-fn sec_call(self: & mut SecrecyChecker, callee: str, args: Vec<Expr>) -> Vec<i64> {
+fn sec_call(self: &mut SecrecyChecker, callee: str, args: Vec<Expr>) -> Vec<i64> {
     var ls: Vec<Vec<i64>> = sec_exprs(self, args);
     var all: Vec<i64> = sec_union_all(ls);
     var pc: Vec<i64> = sec_pc(self);
@@ -1086,7 +1091,7 @@ fn sec_call(self: & mut SecrecyChecker, callee: str, args: Vec<Expr>) -> Vec<i64
 /// argument labels `ls` (`ls[i]` is parameter `i`). CS5: the callee's
 /// parameter names and annotations come from the tables
 /// SecrecyChecker_new made, not from a copy of its Func.
-fn sec_apply_summary(self: & mut SecrecyChecker, name: str, slot: i64, summ: SecSummary, ls: Vec<Vec<i64>>, pc: Vec<i64>) -> Vec<i64> {
+fn sec_apply_summary(self: &mut SecrecyChecker, name: str, slot: i64, summ: SecSummary, ls: Vec<Vec<i64>>, pc: Vec<i64>) -> Vec<i64> {
     var pnames: Vec<str> = self.param_names.get(slot - 1);
     var anns: i64 = self.fn_anns.get(slot - 1);
     var li: i64 = 0;
@@ -1098,9 +1103,9 @@ fn sec_apply_summary(self: & mut SecrecyChecker, name: str, slot: i64, summ: Sec
             if i < pnames.len() {
                 pname = pnames.get(i);
             }
-            if sec_has(l, - 1) {
+            if sec_has(l, -1) {
                 sec_error(self, "@secret", "a secret value is passed to '" + name + "', which outputs its parameter '" + pname + "'");
-            } else if sec_has(l, - 2) {
+            } else if sec_has(l, -2) {
                 sec_error(self, "@sensitive", "a sensitive value is passed to '" + name + "', which outputs its parameter '" + pname + "'");
             }
             var oi: i64 = 0;
@@ -1115,9 +1120,9 @@ fn sec_apply_summary(self: & mut SecrecyChecker, name: str, slot: i64, summ: Sec
     }
     if summ.outputs {
         sec_note_output(self);
-        if sec_has(pc, - 1) {
+        if sec_has(pc, -1) {
             sec_error(self, "@secret", "'" + name + "' produces output and is called inside a branch or loop that depends on a secret");
-        } else if sec_has(pc, - 2) {
+        } else if sec_has(pc, -2) {
             sec_error(self, "@sensitive", "'" + name + "' produces output and is called inside a branch or loop that depends on sensitive data");
         }
         var pi: i64 = 0;
@@ -1138,10 +1143,10 @@ fn sec_apply_summary(self: & mut SecrecyChecker, name: str, slot: i64, summ: Sec
         ri = ri + 1;
     }
     if (anns & 1) != 0 {
-        out = sec_union(out, sec_one(- 1));
+        out = sec_union(out, sec_one(-1));
     }
     if (anns & 2) != 0 {
-        out = sec_union(out, sec_one(- 2));
+        out = sec_union(out, sec_one(-2));
     }
     if (anns & 4) != 0 {
         out = sec_none();
@@ -1149,7 +1154,7 @@ fn sec_apply_summary(self: & mut SecrecyChecker, name: str, slot: i64, summ: Sec
     return out;
 }
 
-fn sec_method_call(self: & mut SecrecyChecker, receiver: Expr, method: str, args: Vec<Expr>) -> Vec<i64> {
+fn sec_method_call(self: &mut SecrecyChecker, receiver: Expr, method: str, args: Vec<Expr>) -> Vec<i64> {
     var recv: Vec<i64> = sec_expr(self, receiver);
     var ls: Vec<Vec<i64>> = Vec::new();
     ls.push(recv);
@@ -1237,7 +1242,7 @@ pub fn sec_par_worker(s: i64, e: i64) -> Vec<str> {
     var c: SecrecyChecker = sec_par_copy(g_sec_par_master.get(0));
     var i: i64 = s;
     while i < e {
-        sec_analyze_func(& mut c, g_sec_par_units.get(i).key, g_sec_par_units.get(i).func);
+        sec_analyze_func(&mut c, g_sec_par_units.get(i).key, g_sec_par_units.get(i).func);
         i = i + 1;
     }
     var out: Vec<str> = c.errors;
@@ -1300,13 +1305,13 @@ pub fn secrecy_check_skipped(program: Program, skip: i64) -> Vec<str> {
         return Vec::new();
     }
     var c: SecrecyChecker = SecrecyChecker_new(program);
-    var before: i64 = - 1;
-    while before != sec_summary_total(& c) {
-        before = sec_summary_total(& c);
+    var before: i64 = -1;
+    while before != sec_summary_total(&c) {
+        before = sec_summary_total(&c);
         var i: i64 = 0;
         while i < c.all.len() {
             var sf: SecFunc = c.all.get(i);
-            sec_analyze_func(& mut c, sf.key, sf.func);
+            sec_analyze_func(&mut c, sf.key, sf.func);
             i = i + 1;
         }
     }
@@ -1341,7 +1346,7 @@ pub fn secrecy_check_skipped(program: Program, skip: i64) -> Vec<str> {
     while j < c.all.len() {
         var sf2: SecFunc = c.all.get(j);
         if skip == 0 || !HashMap_contains(skip, sf2.skey) {
-            sec_analyze_func(& mut c, sf2.key, sf2.func);
+            sec_analyze_func(&mut c, sf2.key, sf2.func);
         }
         j = j + 1;
     }

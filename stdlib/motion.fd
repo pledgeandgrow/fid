@@ -70,17 +70,25 @@ fn motion_f32_from_bits(b: i64) -> f64 {
     val e: i64 = (b >> 23) & 0xFF;
     val m: i64 = b & 0x7FFFFF;
     var bits: i64 = 0;
-    if e == 0 && m == 0 { bits = 0; }
-    else if e == 0xFF { bits = 0x7FF0000000000000 | (m << 29); }
-    else if e == 0 {
+    if e == 0 && m == 0 {
+        bits = 0;
+    } else if e == 0xFF {
+        bits = 0x7FF0000000000000 | (m << 29);
+    } else if e == 0 {
         // subnormal: normalize
         var mm: i64 = m;
         var ee: i64 = -126;
-        while (mm & 0x800000) == 0 { mm = mm << 1; ee = ee - 1; }
+        while (mm & 0x800000) == 0 {
+            mm = mm << 1;
+            ee = ee - 1;
+        }
         bits = ((ee + 1023) << 52) | ((mm & 0x7FFFFF) << 29);
+    } else {
+        bits = ((e - 127 + 1023) << 52) | (m << 29);
     }
-    else { bits = ((e - 127 + 1023) << 52) | (m << 29); }
-    if sign == 1 { bits = bits | (0 - 9223372036854775807 - 1); }
+    if sign == 1 {
+        bits = bits | (0 - 9223372036854775807 - 1);
+    }
     return p_f64_from_bits(bits);
 }
 
@@ -105,12 +113,16 @@ pub fn motion_read_sensor_event(addr: i64) -> SensorEvent {
         val pz: *mut u32 = addr + 32;
         z = *pz;
     }
-    return SensorEvent { sensor_type: t, timestamp_ns: ts, x: motion_f32_from_bits(x), y: motion_f32_from_bits(y), z: motion_f32_from_bits(z) };
+    return SensorEvent {
+        sensor_type: t, timestamp_ns: ts, x: motion_f32_from_bits(x), y: motion_f32_from_bits(y), z: motion_f32_from_bits(z)
+    };
 }
 
 /// The sensor event of three float bit patterns (for tests and replays).
 pub fn motion_event_from_bits(kind: i64, ts: i64, xb: i64, yb: i64, zb: i64) -> SensorEvent {
-    return SensorEvent { sensor_type: kind, timestamp_ns: ts, x: motion_f32_from_bits(xb), y: motion_f32_from_bits(yb), z: motion_f32_from_bits(zb) };
+    return SensorEvent {
+        sensor_type: kind, timestamp_ns: ts, x: motion_f32_from_bits(xb), y: motion_f32_from_bits(yb), z: motion_f32_from_bits(zb)
+    };
 }
 
 // ─── Vectors and trigonometry ──────────────────────────────────────────
@@ -121,26 +133,48 @@ pub struct MVec {
     pub z: f64,
 }
 
-pub fn mvec(x: f64, y: f64, z: f64) -> MVec { return MVec { x: x, y: y, z: z }; }
-pub fn mvec_norm(v: MVec) -> f64 { return math_sqrt(v.x * v.x + v.y * v.y + v.z * v.z); }
-pub fn mvec_cross(a: MVec, b: MVec) -> MVec {
-    return MVec { x: a.y * b.z - a.z * b.y, y: a.z * b.x - a.x * b.z, z: a.x * b.y - a.y * b.x };
+pub fn mvec(x: f64, y: f64, z: f64) -> MVec {
+    return MVec {
+        x: x, y: y, z: z
+    };
 }
-pub fn mvec_scale(a: MVec, k: f64) -> MVec { return MVec { x: a.x * k, y: a.y * k, z: a.z * k }; }
+pub fn mvec_norm(v: MVec) -> f64 {
+    return math_sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
+}
+pub fn mvec_cross(a: MVec, b: MVec) -> MVec {
+    return MVec {
+        x: a.y * b.z - a.z * b.y, y: a.z * b.x - a.x * b.z, z: a.x * b.y - a.y * b.x
+    };
+}
+pub fn mvec_scale(a: MVec, k: f64) -> MVec {
+    return MVec {
+        x: a.x * k, y: a.y * k, z: a.z * k
+    };
+}
 
 /// iOS CMAcceleration (g, gravity negative z when flat) -> m/s^2 here.
 pub fn motion_from_ios_accel(x: f64, y: f64, z: f64) -> MVec {
     return mvec(0.0 - x * MOTION_G, 0.0 - y * MOTION_G, 0.0 - z * MOTION_G);
 }
 
-pub fn motion_pi() -> f64 { return 3.141592653589793; }
-pub fn motion_deg(r: f64) -> f64 { return r * 57.29577951308232; }
-pub fn motion_rad(d: f64) -> f64 { return d * 0.017453292519943295; }
+pub fn motion_pi() -> f64 {
+    return 3.141592653589793;
+}
+pub fn motion_deg(r: f64) -> f64 {
+    return r * 57.29577951308232;
+}
+pub fn motion_rad(d: f64) -> f64 {
+    return d * 0.017453292519943295;
+}
 
 /// atan(x) by two argument halvings and a Taylor series.
 pub fn motion_atan(x: f64) -> f64 {
-    if x < 0.0 { return 0.0 - motion_atan(0.0 - x); }
-    if x > 1.0 { return motion_pi() / 2.0 - motion_atan(1.0 / x); }
+    if x < 0.0 {
+        return 0.0 - motion_atan(0.0 - x);
+    }
+    if x > 1.0 {
+        return motion_pi() / 2.0 - motion_atan(1.0 / x);
+    }
     var y: f64 = x / (1.0 + math_sqrt(1.0 + x * x));
     y = y / (1.0 + math_sqrt(1.0 + y * y));
     val y2: f64 = y * y;
@@ -149,7 +183,11 @@ pub fn motion_atan(x: f64) -> f64 {
     var k: i64 = 0;
     while k < 14 {
         val d: f64 = (2 * k + 1) as f64;
-        if k % 2 == 0 { sum = sum + term / d; } else { sum = sum - term / d; }
+        if k % 2 == 0 {
+            sum = sum + term / d;
+        } else {
+            sum = sum - term / d;
+        }
         term = term * y2;
         k = k + 1;
     }
@@ -157,26 +195,36 @@ pub fn motion_atan(x: f64) -> f64 {
 }
 
 pub fn motion_atan2(y: f64, x: f64) -> f64 {
-    if x > 0.0 { return motion_atan(y / x); }
+    if x > 0.0 {
+        return motion_atan(y / x);
+    }
     if x < 0.0 {
-        if y >= 0.0 { return motion_atan(y / x) + motion_pi(); }
+        if y >= 0.0 {
+            return motion_atan(y / x) + motion_pi();
+        }
         return motion_atan(y / x) - motion_pi();
     }
-    if y > 0.0 { return motion_pi() / 2.0; }
-    if y < 0.0 { return 0.0 - motion_pi() / 2.0; }
+    if y > 0.0 {
+        return motion_pi() / 2.0;
+    }
+    if y < 0.0 {
+        return 0.0 - motion_pi() / 2.0;
+    }
     return 0.0;
 }
 
 // ─── Gravity and linear acceleration ───────────────────────────────────
 
 pub struct GravityFilter {
-    pub alpha: f64,       // 0.8 in the Android documentation
+    pub alpha: f64,  // 0.8 in the Android documentation
     pub gravity: MVec,
     pub started: bool,
 }
 
 pub fn gravity_filter_new(alpha: f64) -> GravityFilter {
-    return GravityFilter { alpha: alpha, gravity: mvec(0.0, 0.0, 0.0), started: false };
+    return GravityFilter {
+        alpha: alpha, gravity: mvec(0.0, 0.0, 0.0), started: false
+    };
 }
 
 /// Update with an accelerometer sample; returns the linear acceleration
@@ -196,20 +244,26 @@ pub fn gravity_filter_update(f: &mut GravityFilter, a: MVec) -> MVec {
 
 /// Rotation about the device x axis implied by gravity (radians):
 /// positive when the top edge rises.
-pub fn motion_tilt_x(a: MVec) -> f64 { return motion_atan2(a.y, a.z); }
+pub fn motion_tilt_x(a: MVec) -> f64 {
+    return motion_atan2(a.y, a.z);
+}
 
 /// Rotation about the device y axis implied by gravity (radians).
-pub fn motion_tilt_y(a: MVec) -> f64 { return motion_atan2(0.0 - a.x, math_sqrt(a.y * a.y + a.z * a.z)); }
+pub fn motion_tilt_y(a: MVec) -> f64 {
+    return motion_atan2(0.0 - a.x, math_sqrt(a.y * a.y + a.z * a.z));
+}
 
 pub struct Complementary {
-    pub alpha: f64,     // weight of the gyro path, e.g. 0.98
-    pub angle_x: f64,   // radians
+    pub alpha: f64,  // weight of the gyro path, e.g. 0.98
+    pub angle_x: f64,  // radians
     pub angle_y: f64,
     pub started: bool,
 }
 
 pub fn complementary_new(alpha: f64) -> Complementary {
-    return Complementary { alpha: alpha, angle_x: 0.0, angle_y: 0.0, started: false };
+    return Complementary {
+        alpha: alpha, angle_x: 0.0, angle_y: 0.0, started: false
+    };
 }
 
 /// Fuse one accelerometer + gyroscope sample taken `dt` seconds after the
@@ -230,38 +284,54 @@ pub fn complementary_update(c: &mut Complementary, a: MVec, gyro: MVec, dt: f64)
 // ─── Compass ───────────────────────────────────────────────────────────
 
 pub struct Orientation {
-    pub ok: bool,        // false in free fall or near a magnetic pole
-    pub azimuth: f64,    // degrees clockwise from magnetic north, [0, 360)
-    pub pitch: f64,      // degrees (SensorManager.getOrientation)
+    pub ok: bool,  // false in free fall or near a magnetic pole
+    pub azimuth: f64,  // degrees clockwise from magnetic north, [0, 360)
+    pub pitch: f64,  // degrees (SensorManager.getOrientation)
     pub roll: f64,
 }
 
 /// SensorManager.getRotationMatrix + getOrientation: gravity `a` and the
 /// geomagnetic field `e` in the device frame.
 pub fn motion_orientation(a: MVec, e: MVec) -> Orientation {
-    val bad: Orientation = Orientation { ok: false, azimuth: 0.0, pitch: 0.0, roll: 0.0 };
+    val bad: Orientation = Orientation {
+        ok: false, azimuth: 0.0, pitch: 0.0, roll: 0.0
+    };
     val na: f64 = mvec_norm(a);
-    if na < 0.1 * MOTION_G { return bad; }
+    if na < 0.1 * MOTION_G {
+        return bad;
+    }
     val h0: MVec = mvec_cross(e, a);
     val nh: f64 = mvec_norm(h0);
-    if nh < 0.1 { return bad; }
+    if nh < 0.1 {
+        return bad;
+    }
     val h: MVec = mvec_scale(h0, 1.0 / nh);
     val an: MVec = mvec_scale(a, 1.0 / na);
     val m: MVec = mvec_cross(an, h);
     var az: f64 = motion_deg(motion_atan2(h.y, m.y));
-    if az < 0.0 { az = az + 360.0; }
-    if az >= 360.0 { az = az - 360.0; }
+    if az < 0.0 {
+        az = az + 360.0;
+    }
+    if az >= 360.0 {
+        az = az - 360.0;
+    }
     val sp: f64 = 0.0 - an.y;
     val pitch: f64 = motion_atan2(sp, math_sqrt(1.0 - sp * sp));
     val roll: f64 = motion_atan2(0.0 - an.x, an.z);
-    return Orientation { ok: true, azimuth: az, pitch: motion_deg(pitch), roll: motion_deg(roll) };
+    return Orientation {
+        ok: true, azimuth: az, pitch: motion_deg(pitch), roll: motion_deg(roll)
+    };
 }
 
 /// True heading from a magnetic one and the local declination (east +).
 pub fn motion_true_heading(magnetic: f64, declination: f64) -> f64 {
     var h: f64 = magnetic + declination;
-    while h < 0.0 { h = h + 360.0; }
-    while h >= 360.0 { h = h - 360.0; }
+    while h < 0.0 {
+        h = h + 360.0;
+    }
+    while h >= 360.0 {
+        h = h - 360.0;
+    }
     return h;
 }
 
@@ -275,9 +345,9 @@ pub fn motion_compass_point(deg: f64) -> str {
 // ─── Steps ─────────────────────────────────────────────────────────────
 
 pub struct StepDetector {
-    pub threshold: f64,        // m/s^2 above g
+    pub threshold: f64,  // m/s^2 above g
     pub min_interval_ms: i64,  // refractory period
-    pub smooth: f64,           // EMA weight of the new sample
+    pub smooth: f64,  // EMA weight of the new sample
     pub level: f64,
     pub prev: f64,
     pub prev2: f64,
@@ -289,8 +359,7 @@ pub struct StepDetector {
 
 pub fn step_detector_new(threshold: f64, min_interval_ms: i64) -> StepDetector {
     return StepDetector {
-        threshold: threshold, min_interval_ms: min_interval_ms, smooth: 0.5, level: 0.0, prev: 0.0, prev2: 0.0,
-        last_step_ms: -1, steps: 0, intervals_sum: 0, samples: 0,
+        threshold: threshold, min_interval_ms: min_interval_ms, smooth: 0.5, level: 0.0, prev: 0.0, prev2: 0.0, last_step_ms: -1, steps: 0, intervals_sum: 0, samples: 0,
     };
 }
 
@@ -298,12 +367,18 @@ pub fn step_detector_new(threshold: f64, min_interval_ms: i64) -> StepDetector {
 /// previous smoothed value was a local peak above g + threshold).
 pub fn step_detector_update(s: &mut StepDetector, a: MVec, t_ms: i64) -> bool {
     val mag: f64 = mvec_norm(a);
-    if s.samples == 0 { s.level = mag; } else { s.level = s.smooth * mag + (1.0 - s.smooth) * s.level; }
+    if s.samples == 0 {
+        s.level = mag;
+    } else {
+        s.level = s.smooth * mag + (1.0 - s.smooth) * s.level;
+    }
     s.samples = s.samples + 1;
     var step: bool = false;
     if s.samples >= 3 && s.prev > s.prev2 && s.prev >= s.level && s.prev > MOTION_G + s.threshold {
         if s.last_step_ms < 0 || t_ms - s.last_step_ms >= s.min_interval_ms {
-            if s.last_step_ms >= 0 { s.intervals_sum = s.intervals_sum + (t_ms - s.last_step_ms); }
+            if s.last_step_ms >= 0 {
+                s.intervals_sum = s.intervals_sum + (t_ms - s.last_step_ms);
+            }
             s.last_step_ms = t_ms;
             s.steps = s.steps + 1;
             step = true;
@@ -316,37 +391,42 @@ pub fn step_detector_update(s: &mut StepDetector, a: MVec, t_ms: i64) -> bool {
 
 /// Steps per minute from the mean interval (0 before two steps).
 pub fn step_cadence(s: &StepDetector) -> f64 {
-    if s.steps < 2 || s.intervals_sum == 0 { return 0.0; }
+    if s.steps < 2 || s.intervals_sum == 0 {
+        return 0.0;
+    }
     return 60000.0 * ((s.steps - 1) as f64) / (s.intervals_sum as f64);
 }
 
 // ─── Shake ─────────────────────────────────────────────────────────────
 
 pub struct ShakeDetector {
-    pub threshold_g: f64,      // spike when |a| > threshold * g (2.7 is common)
+    pub threshold_g: f64,  // spike when |a| > threshold * g (2.7 is common)
     pub window_ms: i64,
     pub min_spikes: i64,
     pub cooldown_ms: i64,
-    pub spikes: Vec<i64>,      // times of recent spikes
+    pub spikes: Vec<i64>,  // times of recent spikes
     pub last_shake_ms: i64,
     pub shakes: i64,
 }
 
 pub fn shake_detector_new(threshold_g: f64, window_ms: i64, min_spikes: i64, cooldown_ms: i64) -> ShakeDetector {
     return ShakeDetector {
-        threshold_g: threshold_g, window_ms: window_ms, min_spikes: min_spikes, cooldown_ms: cooldown_ms,
-        spikes: Vec::new(), last_shake_ms: -1, shakes: 0,
+        threshold_g: threshold_g, window_ms: window_ms, min_spikes: min_spikes, cooldown_ms: cooldown_ms, spikes: Vec::new(), last_shake_ms: -1, shakes: 0,
     };
 }
 
 /// Feed a sample; true when it completes a shake gesture.
 pub fn shake_detector_update(s: &mut ShakeDetector, a: MVec, t_ms: i64) -> bool {
-    if mvec_norm(a) / MOTION_G > s.threshold_g { s.spikes.push(t_ms); }
+    if mvec_norm(a) / MOTION_G > s.threshold_g {
+        s.spikes.push(t_ms);
+    }
     // drop spikes outside the window
     var keep: Vec<i64> = Vec::new();
     var i: i64 = 0;
     while i < s.spikes.len() {
-        if t_ms - s.spikes.get(i) <= s.window_ms { keep.push(s.spikes.get(i)); }
+        if t_ms - s.spikes.get(i) <= s.window_ms {
+            keep.push(s.spikes.get(i));
+        }
         i = i + 1;
     }
     s.spikes = keep;

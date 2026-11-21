@@ -19,9 +19,9 @@
 // is read with stdlib file (no FFI). On bare metal, read the conversion
 // register yourself (stdlib volatile) and pass the code to these functions.
 module adc;
- use vec;
- use string;
- use file;
+use vec;
+use string;
+use file;
 
 // ─── Transfer functions ─────────────────────────────────────────────────
 
@@ -34,21 +34,27 @@ pub struct AdcSpec {
 
 /// A unipolar converter: codes 0..2^bits-1 over 0..vref (LSB = vref/2^bits).
 pub fn adc_spec(bits: i64, vref: f64) -> AdcSpec {
-    return AdcSpec { bits: bits, vref: vref, bipolar: false, minus_one: false };
+    return AdcSpec {
+        bits: bits, vref: vref, bipolar: false, minus_one: false
+    };
 }
 
 /// A converter whose full-scale code means exactly vref (LSB = vref/(2^bits-1)).
 pub fn adc_spec_full(bits: i64, vref: f64) -> AdcSpec {
-    return AdcSpec { bits: bits, vref: vref, bipolar: false, minus_one: true };
+    return AdcSpec {
+        bits: bits, vref: vref, bipolar: false, minus_one: true
+    };
 }
 
 /// A bipolar converter: two's complement codes over -fs..+fs (LSB = fs / 2^(bits-1)).
 pub fn adc_spec_bipolar(bits: i64, full_scale: f64) -> AdcSpec {
-    return AdcSpec { bits: bits, vref: full_scale, bipolar: true, minus_one: false };
+    return AdcSpec {
+        bits: bits, vref: full_scale, bipolar: true, minus_one: false
+    };
 }
 
 /// Volts per code.
-pub fn adc_lsb(s: & AdcSpec) -> f64 {
+pub fn adc_lsb(s: &AdcSpec) -> f64 {
     if s.bipolar {
         return s.vref / ((1 << (s.bits - 1)) as f64);
     }
@@ -67,7 +73,7 @@ pub fn adc_sign_extend(raw: i64, bits: i64) -> i64 {
     return m;
 }
 
-pub fn adc_to_volts(s: & AdcSpec, raw: i64) -> f64 {
+pub fn adc_to_volts(s: &AdcSpec, raw: i64) -> f64 {
     if s.bipolar {
         return (adc_sign_extend(raw, s.bits) as f64) * adc_lsb(s);
     }
@@ -75,7 +81,7 @@ pub fn adc_to_volts(s: & AdcSpec, raw: i64) -> f64 {
 }
 
 /// The code for a voltage (nearest, clamped to the range).
-pub fn adc_from_volts(s: & AdcSpec, v: f64) -> i64 {
+pub fn adc_from_volts(s: &AdcSpec, v: f64) -> i64 {
     var x: f64 = v / adc_lsb(s);
     var lo: i64 = 0;
     var hi: i64 = (1 << s.bits) - 1;
@@ -108,7 +114,7 @@ pub fn adc_to_mv_int(raw: i64, bits: i64, vref_mv: i64) -> i64 {
 
 /// Decimate 4^extra_bits samples into one code with extra_bits more
 /// resolution. Uses the first 4^extra_bits samples; -1 if too few.
-pub fn adc_oversample(samples: & Vec<i64>, extra_bits: i64) -> i64 {
+pub fn adc_oversample(samples: &Vec<i64>, extra_bits: i64) -> i64 {
     val need: i64 = 1 << (2 * extra_bits);
     if samples.len() < need {
         return 0 - 1;
@@ -123,7 +129,7 @@ pub fn adc_oversample(samples: & Vec<i64>, extra_bits: i64) -> i64 {
 }
 
 /// Plain average of n samples, rounded.
-pub fn adc_average(samples: & Vec<i64>) -> i64 {
+pub fn adc_average(samples: &Vec<i64>) -> i64 {
     if samples.len() == 0 {
         return 0;
     }
@@ -147,11 +153,13 @@ pub struct AdcMovingAvg {
 }
 
 pub fn adc_mavg_new(size: i64) -> AdcMovingAvg {
-    return AdcMovingAvg { buf: Vec::filled(size, 0), pos: 0, count: 0, sum: 0 };
+    return AdcMovingAvg {
+        buf: Vec::filled(size, 0), pos: 0, count: 0, sum: 0
+    };
 }
 
 /// Add a sample; the average of what the window holds (rounded down).
-pub fn adc_mavg_push(m: & mut AdcMovingAvg, x: i64) -> i64 {
+pub fn adc_mavg_push(m: &mut AdcMovingAvg, x: i64) -> i64 {
     if m.count == m.buf.len() {
         m.sum = m.sum - m.buf.get(m.pos);
     } else {
@@ -172,10 +180,12 @@ pub struct AdcEma {
 }
 
 pub fn adc_ema_new(shift: i64) -> AdcEma {
-    return AdcEma { acc: 0, shift: shift, primed: false };
+    return AdcEma {
+        acc: 0, shift: shift, primed: false
+    };
 }
 
-pub fn adc_ema_push(e: & mut AdcEma, x: i64) -> i64 {
+pub fn adc_ema_push(e: &mut AdcEma, x: i64) -> i64 {
     if !e.primed {
         e.acc = x << e.shift;
         e.primed = true;
@@ -185,7 +195,7 @@ pub fn adc_ema_push(e: & mut AdcEma, x: i64) -> i64 {
     return e.acc >> e.shift;
 }
 
-fn adc_sorted(v: & Vec<i64>) -> Vec<i64> {
+fn adc_sorted(v: &Vec<i64>) -> Vec<i64> {
     var s: Vec<i64> = Vec::new();
     var i: i64 = 0;
     while i < v.len() {
@@ -203,7 +213,7 @@ fn adc_sorted(v: & Vec<i64>) -> Vec<i64> {
 }
 
 /// Median of a set of samples (the lower middle one for an even count).
-pub fn adc_median(v: & Vec<i64>) -> i64 {
+pub fn adc_median(v: &Vec<i64>) -> i64 {
     if v.len() == 0 {
         return 0;
     }
@@ -218,15 +228,17 @@ pub struct AdcMedian {
 }
 
 pub fn adc_median_new(size: i64) -> AdcMedian {
-    return AdcMedian { win: Vec::new(), size: size };
+    return AdcMedian {
+        win: Vec::new(), size: size
+    };
 }
 
-pub fn adc_median_push(m: & mut AdcMedian, x: i64) -> i64 {
+pub fn adc_median_push(m: &mut AdcMedian, x: i64) -> i64 {
     m.win.push(x);
     if m.win.len() > m.size {
         m.win.remove(0);
     }
-    return adc_median(& m.win);
+    return adc_median(&m.win);
 }
 
 // ─── Calibration ────────────────────────────────────────────────────────
@@ -240,18 +252,22 @@ pub struct AdcCal {
 /// From two points: raw1 reads ref1, raw2 reads ref2 (raw1 != raw2).
 pub fn adc_cal_two_point(raw1: i64, ref1: f64, raw2: i64, ref2: f64) -> AdcCal {
     if raw1 == raw2 {
-        return AdcCal { gain: 1.0, offset: 0.0 };
+        return AdcCal {
+            gain: 1.0, offset: 0.0
+        };
     }
     val g: f64 = (ref2 - ref1) / ((raw2 - raw1) as f64);
-    return AdcCal { gain: g, offset: ref1 - g * (raw1 as f64) };
+    return AdcCal {
+        gain: g, offset: ref1 - g * (raw1 as f64)
+    };
 }
 
-pub fn adc_cal_apply(c: & AdcCal, raw: i64) -> f64 {
+pub fn adc_cal_apply(c: &AdcCal, raw: i64) -> f64 {
     return c.gain * (raw as f64) + c.offset;
 }
 
 /// The raw code that reads `value` after calibration.
-pub fn adc_cal_inverse(c: & AdcCal, value: f64) -> f64 {
+pub fn adc_cal_inverse(c: &AdcCal, value: f64) -> f64 {
     if c.gain == 0.0 {
         return 0.0;
     }
@@ -371,7 +387,7 @@ pub struct AdcScanType {
     pub ok: bool,
 }
 
-fn adc_take_num(s: str, pos: & mut i64) -> i64 {
+fn adc_take_num(s: str, pos: &mut i64) -> i64 {
     var v: i64 = 0;
     var any: bool = false;
     while *pos < str_len(s) {
@@ -390,7 +406,9 @@ fn adc_take_num(s: str, pos: & mut i64) -> i64 {
 }
 
 pub fn adc_parse_scan_type(t: str) -> AdcScanType {
-    var r: AdcScanType = AdcScanType { big_endian: false, signed: false, realbits: 0, storagebits: 0, repeat: 1, shift: 0, ok: false };
+    var r: AdcScanType = AdcScanType {
+        big_endian: false, signed: false, realbits: 0, storagebits: 0, repeat: 1, shift: 0, ok: false
+    };
     val s: str = str_trim(t);
     if str_len(s) < 8 || str_byte_at(s, 2) != 58 {
         return r;
@@ -407,26 +425,26 @@ pub fn adc_parse_scan_type(t: str) -> AdcScanType {
         return r;
     }
     var p: i64 = 4;
-    r.realbits = adc_take_num(s, & mut p);
+    r.realbits = adc_take_num(s, &mut p);
     if p >= str_len(s) || str_byte_at(s, p) != 47 {
         return r;
     }
     p = p + 1;
-    r.storagebits = adc_take_num(s, & mut p);
+    r.storagebits = adc_take_num(s, &mut p);
     if p < str_len(s) && str_byte_at(s, p) == 88 {
         p = p + 1;
-        r.repeat = adc_take_num(s, & mut p);
+        r.repeat = adc_take_num(s, &mut p);
     }
     if p + 1 < str_len(s) && str_byte_at(s, p) == 62 && str_byte_at(s, p + 1) == 62 {
         p = p + 2;
-        r.shift = adc_take_num(s, & mut p);
+        r.shift = adc_take_num(s, &mut p);
     }
     r.ok = r.realbits > 0 && r.storagebits >= r.realbits && r.storagebits % 8 == 0 && r.storagebits <= 64 && r.shift >= 0 && r.repeat > 0;
     return r;
 }
 
 /// Decode one sample of a scan type at byte offset off in a buffer read.
-pub fn adc_scan_decode(st: & AdcScanType, bytes: & Vec<i64>, off: i64) -> i64 {
+pub fn adc_scan_decode(st: &AdcScanType, bytes: &Vec<i64>, off: i64) -> i64 {
     val n: i64 = st.storagebits / 8;
     var v: i64 = 0;
     var i: i64 = 0;

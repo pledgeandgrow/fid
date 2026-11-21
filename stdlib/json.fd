@@ -18,7 +18,8 @@
 // value still has its quotes); use json_get_str / json_unescape to decode.
 
 module json;
- use vec; use encoding;
+use vec;
+use encoding;
 // ─── Pure-Fides JSON scanner ────────────────────────────────────────────
 // Position-based scanning over a str. Whitespace and literals per RFC 8259.
 
@@ -50,11 +51,11 @@ const JSTRC: str = "cccccccccccccccccccccccccccccccc..q.........................
 // (for the tables: 0 <= j < 256).
 fn j_b(s: str, j: i64) -> i64 {
     var addr: i64 = (s as i64) + j;
-    var p: * mut u8 = addr;
+    var p: *mut u8 = addr;
     var c: i64 = 0;
     // SAFETY: every caller passes 0 <= j < str_len(s): a byte of s.
     unsafe {
-        c = * p;
+        c = *p;
     }
     return c;
 }
@@ -72,11 +73,11 @@ fn j_ws_n(s: str, i: i64, n: i64) -> i64 {
     val base: i64 = s as i64;
     while j < n {
         var addr: i64 = base + j;
-        var p: * mut u8 = addr;
+        var p: *mut u8 = addr;
         var c: i64 = 0;
         // SAFETY: 0 <= j < n = str_len(s): a byte of s.
         unsafe {
-            c = * p;
+            c = *p;
         }
         if c > 32 {
             return j;
@@ -93,12 +94,12 @@ fn j_ws_n(s: str, i: i64, n: i64) -> i64 {
 fn j_lit_n(s: str, i: i64, n: i64, lit: str) -> i64 {
     val m: i64 = str_len(lit);
     if i < 0 || i + m > n {
-        return - 1;
+        return -1;
     }
     var k: i64 = 0;
     while k < m {
         if j_b(s, i + k) != j_b(lit, k) {
-            return - 1;
+            return -1;
         }
         k = k + 1;
     }
@@ -114,8 +115,8 @@ fn j_words_ok() -> bool {
     var w: i64 = 0;
     // SAFETY: the literal has 8 bytes (and its NUL): the load reads them.
     unsafe {
-        var p: * mut i64 = (probe as i64) as * mut i64;
-        w = * p;
+        var p: *mut i64 = (probe as i64) as * mut i64;
+        w = *p;
     }
     // "01234567" as a little-endian word
     return w == 3978425819141910832;
@@ -132,7 +133,8 @@ fn j_words_ok() -> bool {
 // v = w ^ 0x5c..5c a backslash; (w - 0x20..20) & ~w & 0x80..80 finds a
 // byte below 0x20. Without such a byte nothing borrows, and no other byte
 // (0x80 and up included) sets a bit.
-@wrapping fn j_plain_words(s: str, i: i64, n: i64) -> i64 {
+@wrapping
+fn j_plain_words(s: str, i: i64, n: i64) -> i64 {
     if !j_words_ok() {
         return i;
     }
@@ -151,18 +153,18 @@ fn j_words_ok() -> bool {
     val quotes: i64 = 2459565876494606882;
     val slashes: i64 = 6655295901103053916;
     val spaces: i64 = 2314885530818453536;
-    val highs: i64 = - 9187201950435737472;
+    val highs: i64 = -9187201950435737472;
     while j + 8 <= n {
         var w: i64 = 0;
         // SAFETY: base + j is 8-aligned and j + 8 <= n = str_len(s): the
         // word is 8 bytes of s.
         unsafe {
-            var p: * mut i64 = (base + j) as * mut i64;
-            w = * p;
+            var p: *mut i64 = (base + j) as * mut i64;
+            w = *p;
         }
         val q: i64 = w ^ quotes;
         val b: i64 = w ^ slashes;
-        val hit: i64 = (((q - ones) & (q ^ (- 1))) | ((b - ones) & (b ^ (- 1))) | ((w - spaces) & (w ^ (- 1)))) & highs;
+        val hit: i64 = (((q - ones) & (q ^ (-1))) | ((b - ones) & (b ^ (-1))) | ((w - spaces) & (w ^ (-1)))) & highs;
         if hit != 0 {
             return j;
         }
@@ -179,7 +181,7 @@ fn j_scan_str(s: str, i: i64) -> i64 {
 // input; n = str_len(s).
 fn j_scan_str_n(s: str, i: i64, n: i64) -> i64 {
     if i < 0 || i >= n || j_b(s, i) != 34 {
-        return - 1;
+        return -1;
     }
     val base: i64 = s as i64;
     val tab: i64 = JSTRC as i64;
@@ -191,14 +193,14 @@ fn j_scan_str_n(s: str, i: i64, n: i64) -> i64 {
         var run: i64 = 0;
         while j < n {
             var addr: i64 = base + j;
-            var p: * mut u8 = addr;
+            var p: *mut u8 = addr;
             // SAFETY: 0 <= j < n = str_len(s): a byte of s; then 0 <= c
             // < 256 (a u8), a byte of the 256-byte JSTRC.
             unsafe {
-                var c: i64 = * p;
+                var c: i64 = *p;
                 var taddr: i64 = tab + c;
-                var tp: * mut u8 = taddr;
-                cls = * tp;
+                var tp: *mut u8 = taddr;
+                cls = *tp;
             }
             if cls != 46 {
                 break;
@@ -211,29 +213,29 @@ fn j_scan_str_n(s: str, i: i64, n: i64) -> i64 {
             }
         }
         if j >= n {
-            return - 1;
+            return -1;
         }
         if cls == 113 {
             return j + 1;
         }
         if cls != 98 {
             // a control byte: it must be escaped
-            return - 1;
+            return -1;
         }
         // only \" \\ \/ \b \f \n \r \t \uXXXX are valid escapes
         if j + 1 >= n {
-            return - 1;
+            return -1;
         }
         val e: i64 = j_b(s, j + 1);
         if e == 117 {
             if j + 6 > n {
-                return - 1;
+                return -1;
             }
             var k: i64 = 2;
             while k < 6 {
                 val h: i64 = j_b(s, j + k);
                 if !((h >= 48 && h <= 57) || (h >= 97 && h <= 102) || (h >= 65 && h <= 70)) {
-                    return - 1;
+                    return -1;
                 }
                 k = k + 1;
             }
@@ -241,10 +243,10 @@ fn j_scan_str_n(s: str, i: i64, n: i64) -> i64 {
         } else if e == 34 || e == 92 || e == 47 || e == 98 || e == 102 || e == 110 || e == 114 || e == 116 {
             j = j + 2;
         } else {
-            return - 1;
+            return -1;
         }
     }
-    return - 1;
+    return -1;
 }
 
 // Past the digits from i (i itself when there are none); n = str_len(s).
@@ -253,11 +255,11 @@ fn j_digits(s: str, i: i64, n: i64) -> i64 {
     val base: i64 = s as i64;
     while j < n {
         var addr: i64 = base + j;
-        var p: * mut u8 = addr;
+        var p: *mut u8 = addr;
         var c: i64 = 0;
         // SAFETY: 0 <= i <= j < n = str_len(s): a byte of s.
         unsafe {
-            c = * p;
+            c = *p;
         }
         if c < 48 || c > 57 {
             return j;
@@ -272,7 +274,7 @@ fn j_digits(s: str, i: i64, n: i64) -> i64 {
 fn j_scan_num_n(s: str, i: i64, n: i64) -> i64 {
     var j: i64 = i;
     if j < 0 {
-        return - 1;
+        return -1;
     }
     if j < n && j_b(s, j) == 45 {
         j = j + 1;
@@ -281,16 +283,16 @@ fn j_scan_num_n(s: str, i: i64, n: i64) -> i64 {
     j = j_digits(s, j, n);
     val digits: i64 = j - first;
     if digits == 0 {
-        return - 1;
+        return -1;
     }
     if digits > 1 && j_b(s, first) == 48 {
-        return - 1;
+        return -1;
     }
     if j < n && j_b(s, j) == 46 {
         val f0: i64 = j + 1;
         j = j_digits(s, f0, n);
         if j == f0 {
-            return - 1;
+            return -1;
         }
     }
     if j < n && (j_b(s, j) == 101 || j_b(s, j) == 69) {
@@ -301,7 +303,7 @@ fn j_scan_num_n(s: str, i: i64, n: i64) -> i64 {
         val e0: i64 = j;
         j = j_digits(s, e0, n);
         if j == e0 {
-            return - 1;
+            return -1;
         }
     }
     return j;
@@ -316,7 +318,7 @@ fn j_scan_val(s: str, i: i64) -> i64 {
 fn j_scan_val_n(s: str, i: i64, n: i64) -> i64 {
     val j: i64 = j_ws_n(s, i, n);
     if j < 0 || j >= n {
-        return - 1;
+        return -1;
     }
     val k: i64 = j_b(JCLASS, j_b(s, j));
     if k == 115 {
@@ -340,7 +342,7 @@ fn j_scan_val_n(s: str, i: i64, n: i64) -> i64 {
     if k == 110 {
         return j_lit_n(s, j, n, "null");
     }
-    return - 1;
+    return -1;
 }
 
 // i at '['; n = str_len(s).
@@ -352,11 +354,11 @@ fn j_scan_arr_n(s: str, i: i64, n: i64) -> i64 {
     while true {
         j = j_scan_val_n(s, j, n);
         if j < 0 {
-            return - 1;
+            return -1;
         }
         j = j_ws_n(s, j, n);
         if j >= n {
-            return - 1;
+            return -1;
         }
         val c: i64 = j_b(s, j);
         if c == 44 {
@@ -366,9 +368,9 @@ fn j_scan_arr_n(s: str, i: i64, n: i64) -> i64 {
         if c == 93 {
             return j + 1;
         }
-        return - 1;
+        return -1;
     }
-    return - 1;
+    return -1;
 }
 
 // i at '{'; n = str_len(s).
@@ -381,19 +383,19 @@ fn j_scan_obj_n(s: str, i: i64, n: i64) -> i64 {
         j = j_ws_n(s, j, n);
         j = j_scan_str_n(s, j, n);
         if j < 0 {
-            return - 1;
+            return -1;
         }
         j = j_ws_n(s, j, n);
         if j >= n || j_b(s, j) != 58 {
-            return - 1;
+            return -1;
         }
         j = j_scan_val_n(s, j + 1, n);
         if j < 0 {
-            return - 1;
+            return -1;
         }
         j = j_ws_n(s, j, n);
         if j >= n {
-            return - 1;
+            return -1;
         }
         val c: i64 = j_b(s, j);
         if c == 44 {
@@ -403,9 +405,9 @@ fn j_scan_obj_n(s: str, i: i64, n: i64) -> i64 {
         if c == 125 {
             return j + 1;
         }
-        return - 1;
+        return -1;
     }
-    return - 1;
+    return -1;
 }
 
 /// True when `s` is well-formed JSON (RFC 8259 grammar, no trailing junk).
@@ -437,7 +439,8 @@ fn j_members(s: str, i: i64) -> Vec<i64> {
         var j: i64 = j_ws(s, i + 1);
         if j < str_len(s) && str_byte_at(s, j) == 93 {
             return out;
-        } while j < str_len(s) {
+        }
+        while j < str_len(s) {
             j = j_ws(s, j);
             var vs: i64 = j;
             var ve: i64 = j_scan_val(s, j);
@@ -465,7 +468,8 @@ fn j_members(s: str, i: i64) -> Vec<i64> {
     var j: i64 = j_ws(s, i + 1);
     if j < str_len(s) && str_byte_at(s, j) == 125 {
         return out;
-    } while j < str_len(s) {
+    }
+    while j < str_len(s) {
         j = j_ws(s, j);
         if j >= str_len(s) || str_byte_at(s, j) != 34 {
             return Vec::new();
@@ -538,11 +542,11 @@ fn j_type_at(s: str, i: i64) -> str {
 
 fn j_canon(s: str, i: i64) -> str {
     var sb: StringBuilder = StringBuilder::new();
-    j_canon_into(s, i, & mut sb);
+    j_canon_into(s, i, &mut sb);
     return sb.to_str();
 }
 
-fn j_canon_into(s: str, i: i64, out: & mut StringBuilder) {
+fn j_canon_into(s: str, i: i64, out: &mut StringBuilder) {
     var j: i64 = j_ws(s, i);
     if j >= str_len(s) {
         return;
@@ -563,7 +567,7 @@ fn j_canon_into(s: str, i: i64, out: & mut StringBuilder) {
     out.append_str(str_slice(s, j, e));
 }
 
-fn j_canon_obj_into(s: str, i: i64, out: & mut StringBuilder) {
+fn j_canon_obj_into(s: str, i: i64, out: &mut StringBuilder) {
     var mem: Vec<i64> = j_members(s, i);
     var n: i64 = mem.len() / 4;
     var keys: Vec<str> = Vec::new();
@@ -606,7 +610,7 @@ fn j_canon_obj_into(s: str, i: i64, out: & mut StringBuilder) {
     out.append_str("}");
 }
 
-fn j_canon_arr_into(s: str, i: i64, out: & mut StringBuilder) {
+fn j_canon_arr_into(s: str, i: i64, out: &mut StringBuilder) {
     var mem: Vec<i64> = j_members(s, i);
     var n: i64 = mem.len() / 2;
     out.append_str("[");
@@ -707,7 +711,7 @@ pub fn json_unescape(lit: str) -> str {
                     break;
                 }
                 var h: i64 = str_byte_at(lit, i + k);
-                var d: i64 = - 1;
+                var d: i64 = -1;
                 if h >= 48 && h <= 57 {
                     d = h - 48;
                 }
@@ -734,7 +738,7 @@ pub fn json_unescape(lit: str) -> str {
                 var k2: i64 = 3;
                 while k2 <= 6 {
                     var h2: i64 = str_byte_at(lit, i + k2);
-                    var d2: i64 = - 1;
+                    var d2: i64 = -1;
                     if h2 >= 48 && h2 <= 57 {
                         d2 = h2 - 48;
                     }
@@ -745,7 +749,7 @@ pub fn json_unescape(lit: str) -> str {
                         d2 = h2 - 55;
                     }
                     if d2 < 0 {
-                        lo = - 1;
+                        lo = -1;
                         break;
                     }
                     lo = lo * 16 + d2;
@@ -1024,7 +1028,7 @@ pub fn json_len_safe(s: str) -> i64 {
     if str_equal(t, "array") {
         return j_members(s, j_ws(s, 0)).len() / 2;
     }
-    return - 1;
+    return -1;
 }
 
 /// Pretty-print, or "" on invalid JSON.
@@ -1317,7 +1321,13 @@ pub fn json_null() -> str {
 //   val port: i64 = jd_int(& d, jd_path(& d, jd_root(& d), "server.port"), 80);
 
 /// Node kinds (jd_kind).
-pub const JSON_NULL: i64 = 0; pub const JSON_FALSE: i64 = 1; pub const JSON_TRUE: i64 = 2; pub const JSON_NUMBER: i64 = 3; pub const JSON_STRING: i64 = 4; pub const JSON_ARRAY: i64 = 5; pub const JSON_OBJECT: i64 = 6;
+pub const JSON_NULL: i64 = 0;
+pub const JSON_FALSE: i64 = 1;
+pub const JSON_TRUE: i64 = 2;
+pub const JSON_NUMBER: i64 = 3;
+pub const JSON_STRING: i64 = 4;
+pub const JSON_ARRAY: i64 = 5;
+pub const JSON_OBJECT: i64 = 6;
 /// Arrays and objects nested deeper than this are refused (the scan is
 /// recursive).
 const JSON_MAX_DEPTH: i64 = 512;
@@ -1336,7 +1346,7 @@ pub struct JsonDoc {
     pub count: Vec<i64>,
 }
 
-fn jd_new_node(d: & mut JsonDoc, kind: i64, start: i64) -> i64 {
+fn jd_new_node(d: &mut JsonDoc, kind: i64, start: i64) -> i64 {
     val n: i64 = d.kind.len();
     d.kind.push(kind);
     d.start.push(start);
@@ -1348,7 +1358,7 @@ fn jd_new_node(d: & mut JsonDoc, kind: i64, start: i64) -> i64 {
 
 // A leaf (a string, number or literal) whose end is already known: its
 // five words pushed once, without a later d.end.set.
-fn jd_new_leaf(d: & mut JsonDoc, kind: i64, start: i64, end: i64) {
+fn jd_new_leaf(d: &mut JsonDoc, kind: i64, start: i64, end: i64) {
     val n: i64 = d.kind.len();
     d.kind.push(kind);
     d.start.push(start);
@@ -1359,16 +1369,16 @@ fn jd_new_leaf(d: & mut JsonDoc, kind: i64, start: i64, end: i64) {
 
 // Index the value at `i` (after white space); returns where it ends, -1
 // when it is malformed. n = str_len(d.text).
-fn jd_value(d: & mut JsonDoc, i: i64, depth: i64, n: i64) -> i64 {
+fn jd_value(d: &mut JsonDoc, i: i64, depth: i64, n: i64) -> i64 {
     // d.text is read in place (a binding would take an owner of it)
     var j: i64 = j_ws_n(d.text, i, n);
     if j < 0 || j >= n {
-        return - 1;
+        return -1;
     }
     val c: i64 = j_b(d.text, j);
     if c == 91 || c == 123 {
         if depth >= JSON_MAX_DEPTH {
-            return - 1;
+            return -1;
         }
         var kind: i64 = JSON_ARRAY;
         var close: i64 = 93;
@@ -1384,33 +1394,33 @@ fn jd_value(d: & mut JsonDoc, i: i64, depth: i64, n: i64) -> i64 {
         } else {
             var more: bool = true;
             while more {
-                var e: i64 = - 1;
+                var e: i64 = -1;
                 if kind == JSON_ARRAY {
                     e = jd_value(d, j, depth + 1, n);
                 } else {
                     // a key, ':' and a value
                     j = j_ws_n(d.text, j, n);
                     if j >= n || j_b(d.text, j) != 34 {
-                        return - 1;
+                        return -1;
                     }
                     val ke: i64 = j_scan_str_n(d.text, j, n);
                     if ke < 0 {
-                        return - 1;
+                        return -1;
                     }
                     jd_new_leaf(d, JSON_STRING, j, ke);
                     j = j_ws_n(d.text, ke, n);
                     if j >= n || j_b(d.text, j) != 58 {
-                        return - 1;
+                        return -1;
                     }
                     e = jd_value(d, j + 1, depth + 1, n);
                 }
                 if e < 0 {
-                    return - 1;
+                    return -1;
                 }
                 count = count + 1;
                 j = j_ws_n(d.text, e, n);
                 if j >= n {
-                    return - 1;
+                    return -1;
                 }
                 val sep: i64 = j_b(d.text, j);
                 if sep == 44 {
@@ -1419,7 +1429,7 @@ fn jd_value(d: & mut JsonDoc, i: i64, depth: i64, n: i64) -> i64 {
                     j = j + 1;
                     more = false;
                 } else {
-                    return - 1;
+                    return -1;
                 }
             }
         }
@@ -1431,7 +1441,7 @@ fn jd_value(d: & mut JsonDoc, i: i64, depth: i64, n: i64) -> i64 {
     // one JCLASS load picks the scanner of a leaf
     val cls: i64 = j_b(JCLASS, c);
     var skind: i64 = JSON_NUMBER;
-    var se: i64 = - 1;
+    var se: i64 = -1;
     if cls == 115 {
         skind = JSON_STRING;
         se = j_scan_str_n(d.text, j, n);
@@ -1448,7 +1458,7 @@ fn jd_value(d: & mut JsonDoc, i: i64, depth: i64, n: i64) -> i64 {
         se = j_lit_n(d.text, j, n, "null");
     }
     if se < 0 {
-        return - 1;
+        return -1;
     }
     jd_new_leaf(d, skind, j, se);
     return se;
@@ -1467,7 +1477,7 @@ pub fn json_index(s: str) -> JsonDoc {
         text: s, ok: true, kind: Vec::new(), start: Vec::new(), end: Vec::new(), next: Vec::new(), count: Vec::new(),
     };
     val n: i64 = str_len(s);
-    val e: i64 = jd_value(& mut d, 0, 0, n);
+    val e: i64 = jd_value(&mut d, 0, 0, n);
     if e < 0 || j_ws_n(s, e, n) != n {
         d.ok = false;
     }
@@ -1475,33 +1485,33 @@ pub fn json_index(s: str) -> JsonDoc {
 }
 
 /// The root node: 0, or -1 when the document is not valid.
-pub fn jd_root(d: & JsonDoc) -> i64 {
+pub fn jd_root(d: &JsonDoc) -> i64 {
     if !d.ok || d.kind.len() == 0 {
-        return - 1;
+        return -1;
     }
     return 0;
 }
 
 /// How many nodes the document has.
-pub fn jd_nodes(d: & JsonDoc) -> i64 {
+pub fn jd_nodes(d: &JsonDoc) -> i64 {
     return d.kind.len();
 }
 
-fn jd_valid(d: & JsonDoc, node: i64) -> bool {
+fn jd_valid(d: &JsonDoc, node: i64) -> bool {
     return d.ok && node >= 0 && node < d.kind.len();
 }
 
 /// The kind of a node (JSON_NULL .. JSON_OBJECT), -1 for no node.
-pub fn jd_kind(d: & JsonDoc, node: i64) -> i64 {
+pub fn jd_kind(d: &JsonDoc, node: i64) -> i64 {
     if !jd_valid(d, node) {
-        return - 1;
+        return -1;
     }
     return d.kind.get(node);
 }
 
 /// The kind as json_type names it: "null", "boolean", "number", "string",
 /// "array", "object"; "error" for no node.
-pub fn jd_type(d: & JsonDoc, node: i64) -> str {
+pub fn jd_type(d: &JsonDoc, node: i64) -> str {
     val k: i64 = jd_kind(d, node);
     if k == JSON_NULL {
         return "null";
@@ -1525,7 +1535,7 @@ pub fn jd_type(d: & JsonDoc, node: i64) -> str {
 }
 
 /// Elements of an array or members of an object; 0 for anything else.
-pub fn jd_len(d: & JsonDoc, node: i64) -> i64 {
+pub fn jd_len(d: &JsonDoc, node: i64) -> i64 {
     if !jd_valid(d, node) {
         return 0;
     }
@@ -1533,7 +1543,7 @@ pub fn jd_len(d: & JsonDoc, node: i64) -> i64 {
 }
 
 /// The raw text of a node (a string keeps its quotes); "" for no node.
-pub fn jd_raw(d: & JsonDoc, node: i64) -> str {
+pub fn jd_raw(d: &JsonDoc, node: i64) -> str {
     if !jd_valid(d, node) {
         return "";
     }
@@ -1541,9 +1551,9 @@ pub fn jd_raw(d: & JsonDoc, node: i64) -> str {
 }
 
 /// Element `idx` of an array, -1 when out of range or not an array.
-pub fn jd_at(d: & JsonDoc, node: i64, idx: i64) -> i64 {
+pub fn jd_at(d: &JsonDoc, node: i64, idx: i64) -> i64 {
     if jd_kind(d, node) != JSON_ARRAY || idx < 0 || idx >= d.count.get(node) {
-        return - 1;
+        return -1;
     }
     var c: i64 = node + 1;
     var k: i64 = 0;
@@ -1556,7 +1566,7 @@ pub fn jd_at(d: & JsonDoc, node: i64, idx: i64) -> i64 {
 
 // Whether key node `knode` spells `key` (compared in place when the key
 // has no escapes).
-fn jd_key_is(d: & JsonDoc, knode: i64, key: str) -> bool {
+fn jd_key_is(d: &JsonDoc, knode: i64, key: str) -> bool {
     val ks: i64 = d.start.get(knode) + 1;
     val ke: i64 = d.end.get(knode) - 1;
     val m: i64 = str_len(key);
@@ -1579,9 +1589,9 @@ fn jd_key_is(d: & JsonDoc, knode: i64, key: str) -> bool {
 
 /// The value of field `key` of an object (the first, when a key repeats),
 /// -1 when it is missing or `node` is not an object.
-pub fn jd_get(d: & JsonDoc, node: i64, key: str) -> i64 {
+pub fn jd_get(d: &JsonDoc, node: i64, key: str) -> i64 {
     if jd_kind(d, node) != JSON_OBJECT {
-        return - 1;
+        return -1;
     }
     var c: i64 = node + 1;
     var m: i64 = 0;
@@ -1594,18 +1604,18 @@ pub fn jd_get(d: & JsonDoc, node: i64, key: str) -> i64 {
         c = d.next.get(c + 1);
         m = m + 1;
     }
-    return - 1;
+    return -1;
 }
 
 /// Whether an object has field `key` (even when it is null).
-pub fn jd_has(d: & JsonDoc, node: i64, key: str) -> bool {
+pub fn jd_has(d: &JsonDoc, node: i64, key: str) -> bool {
     return jd_get(d, node, key) >= 0;
 }
 
 // The key node of member `idx` of an object, -1 when out of range.
-fn jd_member_key(d: & JsonDoc, node: i64, idx: i64) -> i64 {
+fn jd_member_key(d: &JsonDoc, node: i64, idx: i64) -> i64 {
     if jd_kind(d, node) != JSON_OBJECT || idx < 0 || idx >= d.count.get(node) {
-        return - 1;
+        return -1;
     }
     var c: i64 = node + 1;
     var m: i64 = 0;
@@ -1617,7 +1627,7 @@ fn jd_member_key(d: & JsonDoc, node: i64, idx: i64) -> i64 {
 }
 
 /// The key of member `idx` of an object, decoded; "" when out of range.
-pub fn jd_key(d: & JsonDoc, node: i64, idx: i64) -> str {
+pub fn jd_key(d: &JsonDoc, node: i64, idx: i64) -> str {
     val k: i64 = jd_member_key(d, node, idx);
     if k < 0 {
         return "";
@@ -1626,10 +1636,10 @@ pub fn jd_key(d: & JsonDoc, node: i64, idx: i64) -> str {
 }
 
 /// The value of member `idx` of an object, -1 when out of range.
-pub fn jd_member(d: & JsonDoc, node: i64, idx: i64) -> i64 {
+pub fn jd_member(d: &JsonDoc, node: i64, idx: i64) -> i64 {
     val k: i64 = jd_member_key(d, node, idx);
     if k < 0 {
-        return - 1;
+        return -1;
     }
     return k + 1;
 }
@@ -1643,7 +1653,7 @@ pub fn jd_member(d: & JsonDoc, node: i64, idx: i64) -> i64 {
 ///   val d: JsonDoc = json_index("[10, 20, 30]");
 ///   val kids: Vec<i64> = jd_children(& d, jd_root(& d));
 ///   assert_eq(jd_int(& d, kids.get(2), 0), 30);
-pub fn jd_children(d: & JsonDoc, node: i64) -> Vec<i64> {
+pub fn jd_children(d: &JsonDoc, node: i64) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     val k: i64 = jd_kind(d, node);
     if k != JSON_ARRAY && k != JSON_OBJECT {
@@ -1667,7 +1677,7 @@ pub fn jd_children(d: & JsonDoc, node: i64) -> Vec<i64> {
 }
 
 /// A string node decoded; "" for anything else.
-pub fn jd_str(d: & JsonDoc, node: i64) -> str {
+pub fn jd_str(d: &JsonDoc, node: i64) -> str {
     if jd_kind(d, node) != JSON_STRING {
         return "";
     }
@@ -1676,7 +1686,7 @@ pub fn jd_str(d: & JsonDoc, node: i64) -> str {
 
 /// A number node as an integer (read as json_get_int reads it); `def` for
 /// anything else.
-pub fn jd_int(d: & JsonDoc, node: i64, def: i64) -> i64 {
+pub fn jd_int(d: &JsonDoc, node: i64, def: i64) -> i64 {
     if jd_kind(d, node) != JSON_NUMBER {
         return def;
     }
@@ -1684,7 +1694,7 @@ pub fn jd_int(d: & JsonDoc, node: i64, def: i64) -> i64 {
 }
 
 /// A number node as a float; `def` for anything else.
-pub fn jd_num(d: & JsonDoc, node: i64, def: f64) -> f64 {
+pub fn jd_num(d: &JsonDoc, node: i64, def: f64) -> f64 {
     if jd_kind(d, node) != JSON_NUMBER {
         return def;
     }
@@ -1692,7 +1702,7 @@ pub fn jd_num(d: & JsonDoc, node: i64, def: f64) -> f64 {
 }
 
 /// A true or false node; `def` for anything else.
-pub fn jd_bool(d: & JsonDoc, node: i64, def: bool) -> bool {
+pub fn jd_bool(d: &JsonDoc, node: i64, def: bool) -> bool {
     val k: i64 = jd_kind(d, node);
     if k == JSON_TRUE {
         return true;
@@ -1704,13 +1714,13 @@ pub fn jd_bool(d: & JsonDoc, node: i64, def: bool) -> bool {
 }
 
 /// Whether a node is null (false for no node).
-pub fn jd_is_null(d: & JsonDoc, node: i64) -> bool {
+pub fn jd_is_null(d: &JsonDoc, node: i64) -> bool {
     return jd_kind(d, node) == JSON_NULL;
 }
 
 /// Follow a dot-separated path from `node`, as json_path does: "a.b.0.c"
 /// is field a, field b, element 0, field c. -1 on any miss.
-pub fn jd_path(d: & JsonDoc, node: i64, path: str) -> i64 {
+pub fn jd_path(d: &JsonDoc, node: i64, path: str) -> i64 {
     var cur: i64 = node;
     val segs: Vec<str> = str_split(path, ".");
     var i: i64 = 0;
@@ -1722,7 +1732,7 @@ pub fn jd_path(d: & JsonDoc, node: i64, path: str) -> i64 {
         } else if k == JSON_ARRAY {
             cur = jd_at(d, cur, str_parse_int(seg));
         } else {
-            cur = - 1;
+            cur = -1;
         }
         i = i + 1;
     }

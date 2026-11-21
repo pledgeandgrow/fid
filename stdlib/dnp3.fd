@@ -31,15 +31,16 @@
 // line) and feed the received bytes back in.
 
 module dnp3;
- use vec; use string;
+use vec;
+use string;
 
 // ─── Function codes ──────────────────────────────────────────────────────
 
 // Data link function codes (primary, PRM=1)
-pub const DNP3_LINK_RESET: i64 = 0;        // reset link states
+pub const DNP3_LINK_RESET: i64 = 0;  // reset link states
 pub const DNP3_LINK_RESET_USER: i64 = 1;
 pub const DNP3_LINK_TEST: i64 = 2;
-pub const DNP3_LINK_CONFIRMED: i64 = 3;    // user data, confirmed
+pub const DNP3_LINK_CONFIRMED: i64 = 3;  // user data, confirmed
 pub const DNP3_LINK_UNCONFIRMED: i64 = 4;  // user data, unconfirmed
 pub const DNP3_LINK_REQUEST_STATUS: i64 = 9;
 
@@ -64,8 +65,8 @@ pub const DNP3_CROB_PULSE_ON: i64 = 1;
 pub const DNP3_CROB_PULSE_OFF: i64 = 2;
 pub const DNP3_CROB_LATCH_ON: i64 = 3;
 pub const DNP3_CROB_LATCH_OFF: i64 = 4;
-pub const DNP3_CROB_TRIP: i64 = 0x81;      // trip | pulse-on
-pub const DNP3_CROB_CLOSE: i64 = 0x41;     // close | pulse-on
+pub const DNP3_CROB_TRIP: i64 = 0x81;  // trip | pulse-on
+pub const DNP3_CROB_CLOSE: i64 = 0x41;  // close | pulse-on
 
 // CROB status codes
 pub const DNP3_STATUS_SUCCESS: i64 = 0;
@@ -79,7 +80,7 @@ pub const DNP3_IIN_ALL_STATIONS: i64 = 0x0100;
 pub const DNP3_IIN_CLASS1: i64 = 0x0200;
 pub const DNP3_IIN_NEED_TIME: i64 = 0x0010;
 pub const DNP3_IIN_DEVICE_RESTART: i64 = 0x0080;
-pub const DNP3_IIN_NO_FUNC_CODE: i64 = 0x0001;    // byte2 bit0
+pub const DNP3_IIN_NO_FUNC_CODE: i64 = 0x0001;  // byte2 bit0
 pub const DNP3_IIN_OBJECT_UNKNOWN: i64 = 0x0002;
 pub const DNP3_IIN_PARAM_ERROR: i64 = 0x0004;
 
@@ -87,7 +88,7 @@ pub const DNP3_IIN_PARAM_ERROR: i64 = 0x0004;
 
 /// CRC-16/DNP over `b` from `start` for `n` bytes. Reflected polynomial
 /// 0xA6BC (0x3D65), initial 0, final complement. "123456789" gives 0xEA82.
-pub fn dnp3_crc(b: & Vec<i64>, start: i64, n: i64) -> i64 {
+pub fn dnp3_crc(b: &Vec<i64>, start: i64, n: i64) -> i64 {
     var crc: i64 = 0;
     var i: i64 = 0;
     while i < n {
@@ -95,7 +96,7 @@ pub fn dnp3_crc(b: & Vec<i64>, start: i64, n: i64) -> i64 {
         var k: i64 = 0;
         while k < 8 {
             if (crc & 1) != 0 {
-                crc = (crc >> 1) ^ 42684;   // 0xA6BC
+                crc = (crc >> 1) ^ 42684;  // 0xA6BC
             } else {
                 crc = crc >> 1;
             }
@@ -107,11 +108,11 @@ pub fn dnp3_crc(b: & Vec<i64>, start: i64, n: i64) -> i64 {
 }
 
 /// CRC of a whole byte vector.
-pub fn dnp3_crc_all(b: & Vec<i64>) -> i64 {
+pub fn dnp3_crc_all(b: &Vec<i64>) -> i64 {
     return dnp3_crc(b, 0, b.len());
 }
 
-fn d_put16le(out: & mut Vec<i64>, v: i64) {
+fn d_put16le(out: &mut Vec<i64>, v: i64) {
     out.push(v & 255);
     out.push((v >> 8) & 255);
 }
@@ -122,20 +123,20 @@ fn d_put16le(out: & mut Vec<i64>, v: i64) {
 pub struct Dnp3LinkFrame {
     pub ok: bool,
     pub error: str,
-    pub dir: i64,       // 0/1 master->outstation direction bit
-    pub prm: i64,       // 1 primary, 0 secondary
-    pub fcb: i64,       // frame count bit
-    pub fcv: i64,       // frame count valid
-    pub func: i64,      // link function code (low 4 bits of control)
+    pub dir: i64,  // 0/1 master->outstation direction bit
+    pub prm: i64,  // 1 primary, 0 secondary
+    pub fcb: i64,  // frame count bit
+    pub fcv: i64,  // frame count valid
+    pub func: i64,  // link function code (low 4 bits of control)
     pub dest: i64,
     pub src: i64,
-    pub payload: Vec<i64>,   // transport+application bytes (CRCs stripped)
+    pub payload: Vec<i64>,  // transport+application bytes (CRCs stripped)
 }
 
 /// Build a link frame carrying `payload` (<=250 bytes of transport data).
 /// `ctrl_dir`/`prm`/`fcb`/`fcv` set the control octet bits; `func` is the
 /// link function code.
-pub fn dnp3_link_frame(dir: i64, prm: i64, fcb: i64, fcv: i64, func: i64, dest: i64, src: i64, payload: & Vec<i64>) -> Vec<i64> {
+pub fn dnp3_link_frame(dir: i64, prm: i64, fcb: i64, fcv: i64, func: i64, dest: i64, src: i64, payload: &Vec<i64>) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     out.push(0x05);
     out.push(0x64);
@@ -143,16 +144,24 @@ pub fn dnp3_link_frame(dir: i64, prm: i64, fcb: i64, fcv: i64, func: i64, dest: 
     // of the data, i.e. 5 (control+dest+src) + payload length.
     out.push((5 + payload.len()) & 255);
     var ctrl: i64 = func & 15;
-    if dir != 0 { ctrl = ctrl | 0x80; }
-    if prm != 0 { ctrl = ctrl | 0x40; }
-    if fcb != 0 { ctrl = ctrl | 0x20; }
-    if fcv != 0 { ctrl = ctrl | 0x10; }
+    if dir != 0 {
+        ctrl = ctrl | 0x80;
+    }
+    if prm != 0 {
+        ctrl = ctrl | 0x40;
+    }
+    if fcb != 0 {
+        ctrl = ctrl | 0x20;
+    }
+    if fcv != 0 {
+        ctrl = ctrl | 0x10;
+    }
     out.push(ctrl);
-    d_put16le(& mut out, dest);
-    d_put16le(& mut out, src);
+    d_put16le(&mut out, dest);
+    d_put16le(&mut out, src);
     // header CRC over the 8 header bytes (start..len+ctrl+dest+src)
-    val hcrc: i64 = dnp3_crc(& out, 0, 8);
-    d_put16le(& mut out, hcrc);
+    val hcrc: i64 = dnp3_crc(&out, 0, 8);
+    d_put16le(&mut out, hcrc);
     // data in 16-byte blocks, each with its own CRC
     var i: i64 = 0;
     while i < payload.len() {
@@ -167,8 +176,8 @@ pub fn dnp3_link_frame(dir: i64, prm: i64, fcb: i64, fcv: i64, func: i64, dest: 
             out.push(blk.get(k));
             k = k + 1;
         }
-        val bcrc: i64 = dnp3_crc(& blk, 0, blk.len());
-        d_put16le(& mut out, bcrc);
+        val bcrc: i64 = dnp3_crc(&blk, 0, blk.len());
+        d_put16le(&mut out, bcrc);
         i = i + 16;
     }
     return out;
@@ -181,7 +190,7 @@ fn d_err_link(msg: str) -> Dnp3LinkFrame {
 }
 
 /// Parse a link frame, checking every CRC.
-pub fn dnp3_link_parse(f: & Vec<i64>) -> Dnp3LinkFrame {
+pub fn dnp3_link_parse(f: &Vec<i64>) -> Dnp3LinkFrame {
     if f.len() < 10 {
         return d_err_link("frame too short");
     }
@@ -199,11 +208,13 @@ pub fn dnp3_link_parse(f: & Vec<i64>) -> Dnp3LinkFrame {
     // payload length = length - 5 (control+dest+src)
     val plen: i64 = length - 5;
     var payload: Vec<i64> = Vec::new();
-    var pos: i64 = 10;   // first data block
+    var pos: i64 = 10;  // first data block
     var remaining: i64 = plen;
     while remaining > 0 {
         var blen: i64 = 16;
-        if remaining < 16 { blen = remaining; }
+        if remaining < 16 {
+            blen = remaining;
+        }
         if pos + blen + 2 > f.len() {
             return d_err_link("truncated data block");
         }
@@ -214,7 +225,7 @@ pub fn dnp3_link_parse(f: & Vec<i64>) -> Dnp3LinkFrame {
             payload.push(f.get(pos + j));
             j = j + 1;
         }
-        val bcrc: i64 = dnp3_crc(& blk, 0, blen);
+        val bcrc: i64 = dnp3_crc(&blk, 0, blen);
         if (f.get(pos + blen) | (f.get(pos + blen + 1) << 8)) != bcrc {
             return d_err_link("data block CRC mismatch");
         }
@@ -222,9 +233,7 @@ pub fn dnp3_link_parse(f: & Vec<i64>) -> Dnp3LinkFrame {
         remaining = remaining - blen;
     }
     return Dnp3LinkFrame {
-        ok: true, error: "",
-        dir: (ctrl >> 7) & 1, prm: (ctrl >> 6) & 1, fcb: (ctrl >> 5) & 1, fcv: (ctrl >> 4) & 1,
-        func: ctrl & 15, dest: dest, src: src, payload: payload,
+        ok: true, error: "", dir: (ctrl >> 7) & 1, prm: (ctrl >> 6) & 1, fcb: (ctrl >> 5) & 1, fcv: (ctrl >> 4) & 1, func: ctrl & 15, dest: dest, src: src, payload: payload,
     };
 }
 
@@ -233,7 +242,7 @@ pub fn dnp3_link_parse(f: & Vec<i64>) -> Dnp3LinkFrame {
 /// Segment an application fragment into transport segments: each segment is
 /// one header byte (FIR | FIN | 6-bit sequence) followed by up to 249 bytes.
 /// `seq0` is the sequence of the first segment.
-pub fn dnp3_transport_segment(fragment: & Vec<i64>, seq0: i64) -> Vec<Vec<i64>> {
+pub fn dnp3_transport_segment(fragment: &Vec<i64>, seq0: i64) -> Vec<Vec<i64>> {
     var out: Vec<Vec<i64>> = Vec::new();
     val total: i64 = fragment.len();
     var pos: i64 = 0;
@@ -241,11 +250,17 @@ pub fn dnp3_transport_segment(fragment: & Vec<i64>, seq0: i64) -> Vec<Vec<i64>> 
     var first: bool = true;
     while pos < total || first {
         var chunk: i64 = total - pos;
-        if chunk > 249 { chunk = 249; }
+        if chunk > 249 {
+            chunk = 249;
+        }
         val fin: bool = (pos + chunk) >= total;
         var hdr: i64 = seq & 63;
-        if first { hdr = hdr | 0x40; }   // FIR
-        if fin { hdr = hdr | 0x80; }     // FIN
+        if first {
+            hdr = hdr | 0x40;
+        }  // FIR
+        if fin {
+            hdr = hdr | 0x80;
+        }  // FIN
         var seg: Vec<i64> = Vec::new();
         seg.push(hdr);
         var j: i64 = 0;
@@ -268,14 +283,16 @@ pub struct Dnp3Assembly {
     pub fragment: Vec<i64>,
 }
 
-pub fn dnp3_transport_assemble(segs: & Vec<Vec<i64>>) -> Dnp3Assembly {
+pub fn dnp3_transport_assemble(segs: &Vec<Vec<i64>>) -> Dnp3Assembly {
     var out: Vec<i64> = Vec::new();
     var expect_seq: i64 = -1;
     var i: i64 = 0;
     while i < segs.len() {
         val seg: Vec<i64> = segs.get(i);
         if seg.len() < 1 {
-            return Dnp3Assembly { ok: false, fragment: Vec::new() };
+            return Dnp3Assembly {
+                ok: false, fragment: Vec::new()
+            };
         }
         val hdr: i64 = seg.get(0);
         val fir: bool = (hdr & 0x40) != 0;
@@ -283,12 +300,16 @@ pub fn dnp3_transport_assemble(segs: & Vec<Vec<i64>>) -> Dnp3Assembly {
         val seq: i64 = hdr & 63;
         if i == 0 {
             if !fir {
-                return Dnp3Assembly { ok: false, fragment: Vec::new() };
+                return Dnp3Assembly {
+                    ok: false, fragment: Vec::new()
+                };
             }
             expect_seq = seq;
         } else {
             if seq != expect_seq {
-                return Dnp3Assembly { ok: false, fragment: Vec::new() };
+                return Dnp3Assembly {
+                    ok: false, fragment: Vec::new()
+                };
             }
         }
         var j: i64 = 1;
@@ -298,12 +319,16 @@ pub fn dnp3_transport_assemble(segs: & Vec<Vec<i64>>) -> Dnp3Assembly {
         }
         expect_seq = (expect_seq + 1) & 63;
         if fin {
-            return Dnp3Assembly { ok: true, fragment: out };
+            return Dnp3Assembly {
+                ok: true, fragment: out
+            };
         }
         i = i + 1;
     }
     // ran out of segments without a FIN
-    return Dnp3Assembly { ok: false, fragment: out };
+    return Dnp3Assembly {
+        ok: false, fragment: out
+    };
 }
 
 // ─── Application layer: object header ────────────────────────────────────
@@ -331,8 +356,8 @@ pub fn dnp3_objhdr_range(group: i64, variation: i64, start: i64, stop: i64) -> V
         out.push(stop);
     } else {
         out.push(0x01);
-        d_put16le(& mut out, start);
-        d_put16le(& mut out, stop);
+        d_put16le(&mut out, start);
+        d_put16le(&mut out, stop);
     }
     return out;
 }
@@ -357,7 +382,7 @@ pub fn dnp3_objhdr_count(group: i64, variation: i64, count: i64) -> Vec<i64> {
         out.push(count);
     } else {
         out.push(0x08);
-        d_put16le(& mut out, count);
+        d_put16le(&mut out, count);
     }
     return out;
 }
@@ -381,11 +406,12 @@ pub struct Dnp3ObjHeaderAt {
     pub ok: bool,
 }
 
-pub fn dnp3_objhdr_decode(b: & Vec<i64>, pos: i64) -> Dnp3ObjHeaderAt {
+pub fn dnp3_objhdr_decode(b: &Vec<i64>, pos: i64) -> Dnp3ObjHeaderAt {
     if pos + 3 > b.len() {
         return Dnp3ObjHeaderAt {
-            hdr: Dnp3ObjHeader { group: 0, variation: 0, qualifier: 0, start: 0, stop: 0, count: 0 },
-            next: pos, ok: false,
+            hdr: Dnp3ObjHeader {
+                group: 0, variation: 0, qualifier: 0, start: 0, stop: 0, count: 0
+            }, next: pos, ok: false,
         };
     }
     val group: i64 = b.get(pos);
@@ -396,7 +422,9 @@ pub fn dnp3_objhdr_decode(b: & Vec<i64>, pos: i64) -> Dnp3ObjHeaderAt {
     var stop: i64 = 0;
     var count: i64 = 0;
     if qual == 0x00 {
-        start = b.get(p); stop = b.get(p + 1); p = p + 2;
+        start = b.get(p);
+        stop = b.get(p + 1);
+        p = p + 2;
         count = stop - start + 1;
     } else if qual == 0x01 {
         start = b.get(p) | (b.get(p + 1) << 8);
@@ -406,13 +434,16 @@ pub fn dnp3_objhdr_decode(b: & Vec<i64>, pos: i64) -> Dnp3ObjHeaderAt {
     } else if qual == 0x06 {
         count = 0;
     } else if qual == 0x07 || qual == 0x17 {
-        count = b.get(p); p = p + 1;
+        count = b.get(p);
+        p = p + 1;
     } else if qual == 0x08 || qual == 0x28 {
-        count = b.get(p) | (b.get(p + 1) << 8); p = p + 2;
+        count = b.get(p) | (b.get(p + 1) << 8);
+        p = p + 2;
     }
     return Dnp3ObjHeaderAt {
-        hdr: Dnp3ObjHeader { group: group, variation: variation, qualifier: qual, start: start, stop: stop, count: count },
-        next: p, ok: true,
+        hdr: Dnp3ObjHeader {
+            group: group, variation: variation, qualifier: qual, start: start, stop: stop, count: count
+        }, next: p, ok: true,
     };
 }
 
@@ -421,10 +452,18 @@ pub fn dnp3_objhdr_decode(b: & Vec<i64>, pos: i64) -> Dnp3ObjHeaderAt {
 /// Build an application control octet.
 pub fn dnp3_app_ctrl(fir: bool, fin: bool, con: bool, uns: bool, seq: i64) -> i64 {
     var c: i64 = seq & 15;
-    if fir { c = c | 0x80; }
-    if fin { c = c | 0x40; }
-    if con { c = c | 0x20; }
-    if uns { c = c | 0x10; }
+    if fir {
+        c = c | 0x80;
+    }
+    if fin {
+        c = c | 0x40;
+    }
+    if con {
+        c = c | 0x20;
+    }
+    if uns {
+        c = c | 0x10;
+    }
     return c;
 }
 
@@ -436,7 +475,10 @@ pub fn dnp3_build_read(seq: i64, group: i64, variation: i64, start: i64, stop: i
     out.push(DNP3_FC_READ);
     val oh: Vec<i64> = dnp3_objhdr_range(group, variation, start, stop);
     var i: i64 = 0;
-    while i < oh.len() { out.push(oh.get(i)); i = i + 1; }
+    while i < oh.len() {
+        out.push(oh.get(i));
+        i = i + 1;
+    }
     return out;
 }
 
@@ -447,7 +489,10 @@ pub fn dnp3_build_read_class0(seq: i64) -> Vec<i64> {
     out.push(DNP3_FC_READ);
     val oh: Vec<i64> = dnp3_objhdr_all(60, 1);
     var i: i64 = 0;
-    while i < oh.len() { out.push(oh.get(i)); i = i + 1; }
+    while i < oh.len() {
+        out.push(oh.get(i));
+        i = i + 1;
+    }
     return out;
 }
 
@@ -463,15 +508,15 @@ pub struct Dnp3AppRequest {
     pub body_start: i64,
 }
 
-pub fn dnp3_app_request(b: & Vec<i64>) -> Dnp3AppRequest {
+pub fn dnp3_app_request(b: &Vec<i64>) -> Dnp3AppRequest {
     if b.len() < 2 {
-        return Dnp3AppRequest { ok: false, fir: false, fin: false, con: false, uns: false, seq: 0, func: 0, body_start: 0 };
+        return Dnp3AppRequest {
+            ok: false, fir: false, fin: false, con: false, uns: false, seq: 0, func: 0, body_start: 0
+        };
     }
     val c: i64 = b.get(0);
     return Dnp3AppRequest {
-        ok: true,
-        fir: (c & 0x80) != 0, fin: (c & 0x40) != 0, con: (c & 0x20) != 0, uns: (c & 0x10) != 0,
-        seq: c & 15, func: b.get(1), body_start: 2,
+        ok: true, fir: (c & 0x80) != 0, fin: (c & 0x40) != 0, con: (c & 0x20) != 0, uns: (c & 0x10) != 0, seq: c & 15, func: b.get(1), body_start: 2,
     };
 }
 
@@ -484,9 +529,11 @@ pub struct Dnp3AppResponse {
     pub body_start: i64,
 }
 
-pub fn dnp3_app_response_header(b: & Vec<i64>) -> Dnp3AppResponse {
+pub fn dnp3_app_response_header(b: &Vec<i64>) -> Dnp3AppResponse {
     if b.len() < 4 {
-        return Dnp3AppResponse { ok: false, seq: 0, func: 0, iin: 0, body_start: 0 };
+        return Dnp3AppResponse {
+            ok: false, seq: 0, func: 0, iin: 0, body_start: 0
+        };
     }
     val c: i64 = b.get(0);
     val iin: i64 = (b.get(2) << 8) | b.get(3);
@@ -500,7 +547,7 @@ pub fn dnp3_app_response_header(b: & Vec<i64>) -> Dnp3AppResponse {
 /// CROB (g12v1): 11 bytes. control code, count, on-time, off-time, status.
 pub fn dnp3_crob_encode(index: i64, control_code: i64, count: i64, on_time: i64, off_time: i64, status: i64) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
-    out.push(index & 255);   // 8-bit index prefix (qualifier 0x17)
+    out.push(index & 255);  // 8-bit index prefix (qualifier 0x17)
     out.push(control_code & 255);
     out.push(count & 255);
     out.push(on_time & 255);
@@ -526,12 +573,11 @@ pub struct Dnp3Crob {
 }
 
 /// Decode a CROB at `pos` (the index prefix then 11 CROB octets).
-pub fn dnp3_crob_decode(b: & Vec<i64>, pos: i64) -> Dnp3Crob {
+pub fn dnp3_crob_decode(b: &Vec<i64>, pos: i64) -> Dnp3Crob {
     val on: i64 = b.get(pos + 3) | (b.get(pos + 4) << 8) | (b.get(pos + 5) << 16) | (b.get(pos + 6) << 24);
     val off: i64 = b.get(pos + 7) | (b.get(pos + 8) << 8) | (b.get(pos + 9) << 16) | (b.get(pos + 10) << 24);
     return Dnp3Crob {
-        index: b.get(pos), control_code: b.get(pos + 1), count: b.get(pos + 2),
-        on_time: on, off_time: off, status: b.get(pos + 11),
+        index: b.get(pos), control_code: b.get(pos + 1), count: b.get(pos + 2), on_time: on, off_time: off, status: b.get(pos + 11),
     };
 }
 
@@ -540,8 +586,12 @@ pub fn dnp3_crob_decode(b: & Vec<i64>, pos: i64) -> Dnp3Crob {
 /// plus the state.
 pub fn dnp3_binary_flags(online: bool, state: bool) -> i64 {
     var f: i64 = 0;
-    if online { f = f | 0x01; }
-    if state { f = f | 0x80; }
+    if online {
+        f = f | 0x01;
+    }
+    if state {
+        f = f | 0x80;
+    }
     return f;
 }
 
@@ -557,7 +607,7 @@ pub fn dnp3_analog32_encode(flags: i64, value: i64) -> Vec<i64> {
 }
 
 /// Decode a 32-bit signed analog value at `pos+1` (after its flag byte).
-pub fn dnp3_analog32_value(b: & Vec<i64>, pos: i64) -> i64 {
+pub fn dnp3_analog32_value(b: &Vec<i64>, pos: i64) -> i64 {
     var v: i64 = b.get(pos + 1) | (b.get(pos + 2) << 8) | (b.get(pos + 3) << 16) | (b.get(pos + 4) << 24);
     // sign-extend from 32 bits
     if (v & 0x80000000) != 0 {
@@ -571,7 +621,7 @@ pub fn dnp3_counter32_encode(flags: i64, value: i64) -> Vec<i64> {
     return dnp3_analog32_encode(flags, value);
 }
 
-pub fn dnp3_counter32_value(b: & Vec<i64>, pos: i64) -> i64 {
+pub fn dnp3_counter32_value(b: &Vec<i64>, pos: i64) -> i64 {
     return b.get(pos + 1) | (b.get(pos + 2) << 8) | (b.get(pos + 3) << 16) | (b.get(pos + 4) << 24);
 }
 
@@ -580,25 +630,23 @@ pub fn dnp3_counter32_value(b: & Vec<i64>, pos: i64) -> i64 {
 /// A simple outstation: binary inputs, binary (relay) outputs selected by
 /// CROB, analog inputs and counters. `selected_*` tracks a pending SELECT.
 pub struct Dnp3Outstation {
-    pub binary_in: Vec<i64>,     // 0/1
-    pub relays: Vec<i64>,        // 0/1 output state
+    pub binary_in: Vec<i64>,  // 0/1
+    pub relays: Vec<i64>,  // 0/1 output state
     pub analog_in: Vec<i64>,
     pub counters: Vec<i64>,
-    pub selected_index: i64,     // -1 if nothing selected
+    pub selected_index: i64,  // -1 if nothing selected
     pub selected_code: i64,
     pub iin: i64,
 }
 
 pub fn dnp3_outstation_new(nbin: i64, nrelay: i64, nanalog: i64, ncounter: i64) -> Dnp3Outstation {
     return Dnp3Outstation {
-        binary_in: Vec::filled(nbin, 0), relays: Vec::filled(nrelay, 0),
-        analog_in: Vec::filled(nanalog, 0), counters: Vec::filled(ncounter, 0),
-        selected_index: -1, selected_code: 0, iin: 0,
+        binary_in: Vec::filled(nbin, 0), relays: Vec::filled(nrelay, 0), analog_in: Vec::filled(nanalog, 0), counters: Vec::filled(ncounter, 0), selected_index: -1, selected_code: 0, iin: 0,
     };
 }
 
 /// Apply a SELECT (g12v1): remember the point/code; returns the status.
-pub fn dnp3_outstation_select(os: & mut Dnp3Outstation, crob: & Dnp3Crob) -> i64 {
+pub fn dnp3_outstation_select(os: &mut Dnp3Outstation, crob: &Dnp3Crob) -> i64 {
     if crob.index < 0 || crob.index >= os.relays.len() {
         return DNP3_STATUS_FORMAT_ERROR;
     }
@@ -609,7 +657,7 @@ pub fn dnp3_outstation_select(os: & mut Dnp3Outstation, crob: & Dnp3Crob) -> i64
 
 /// Apply an OPERATE (g12v1): must match the prior SELECT; carries out the
 /// latch and returns the status.
-pub fn dnp3_outstation_operate(os: & mut Dnp3Outstation, crob: & Dnp3Crob) -> i64 {
+pub fn dnp3_outstation_operate(os: &mut Dnp3Outstation, crob: &Dnp3Crob) -> i64 {
     if os.selected_index != crob.index || os.selected_code != crob.control_code {
         os.selected_index = -1;
         return DNP3_STATUS_NO_SELECT;
@@ -627,7 +675,7 @@ pub fn dnp3_outstation_operate(os: & mut Dnp3Outstation, crob: & Dnp3Crob) -> i6
 /// Build a Class-0 response: application header (response, FIR+FIN) with the
 /// given sequence and IIN, then g1v2 binary inputs and g30v1 analog inputs
 /// over their full ranges.
-pub fn dnp3_outstation_class0(os: & Dnp3Outstation, seq: i64, iin: i64) -> Vec<i64> {
+pub fn dnp3_outstation_class0(os: &Dnp3Outstation, seq: i64, iin: i64) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     out.push(dnp3_app_ctrl(true, true, false, false, seq));
     out.push(DNP3_FC_RESPONSE);
@@ -637,7 +685,10 @@ pub fn dnp3_outstation_class0(os: & Dnp3Outstation, seq: i64, iin: i64) -> Vec<i
     if os.binary_in.len() > 0 {
         val oh: Vec<i64> = dnp3_objhdr_range(1, 2, 0, os.binary_in.len() - 1);
         var i: i64 = 0;
-        while i < oh.len() { out.push(oh.get(i)); i = i + 1; }
+        while i < oh.len() {
+            out.push(oh.get(i));
+            i = i + 1;
+        }
         var k: i64 = 0;
         while k < os.binary_in.len() {
             out.push(dnp3_binary_flags(true, os.binary_in.get(k) != 0));
@@ -648,12 +699,18 @@ pub fn dnp3_outstation_class0(os: & Dnp3Outstation, seq: i64, iin: i64) -> Vec<i
     if os.analog_in.len() > 0 {
         val oh2: Vec<i64> = dnp3_objhdr_range(30, 1, 0, os.analog_in.len() - 1);
         var i2: i64 = 0;
-        while i2 < oh2.len() { out.push(oh2.get(i2)); i2 = i2 + 1; }
+        while i2 < oh2.len() {
+            out.push(oh2.get(i2));
+            i2 = i2 + 1;
+        }
         var k2: i64 = 0;
         while k2 < os.analog_in.len() {
             val enc: Vec<i64> = dnp3_analog32_encode(0x01, os.analog_in.get(k2));
             var j: i64 = 0;
-            while j < enc.len() { out.push(enc.get(j)); j = j + 1; }
+            while j < enc.len() {
+                out.push(enc.get(j));
+                j = j + 1;
+            }
             k2 = k2 + 1;
         }
     }

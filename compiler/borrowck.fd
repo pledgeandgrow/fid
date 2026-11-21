@@ -29,7 +29,13 @@
 //
 // Dependencies: compiler::ast
 
-module compiler::borrowck; use core; use vec; use string; use compiler::ast; use compiler::escape;  // --- Vec-based map entry structs ------------------------------------------
+module compiler::borrowck;
+use core;
+use vec;
+use string;
+use compiler::ast;
+use compiler::escape;
+// --- Vec-based map entry structs ------------------------------------------
 // These replace HashMap<String, T> with Vec<Entry> + linear search.
 
 // shared_borrows: var -> set of borrowers (Vec<str>)
@@ -398,7 +404,7 @@ pub struct BorrowChecker {
 }
 
 /// Free the borrow checker's index maps (raw handles) once checked.
-pub fn BorrowChecker_free_maps(self: & mut BorrowChecker) {
+pub fn BorrowChecker_free_maps(self: &mut BorrowChecker) {
     HashMap_drop(self.last_use_index);
     self.last_use_index = HashMap_new();
     HashMap_drop(self.sb_ix);
@@ -433,7 +439,8 @@ pub fn BorrowChecker_new(mode: BorrowckMode) -> BorrowChecker {
 // The units a parallel check walks, shared read-only with the workers for
 // the duration of the spawn/await block: spawn arguments must be @send and
 // Vec<Func> is not, so the worker receives only chunk bounds.
-pub var g_bc_units: Vec<Func> = Vec::new(); pub fn bc_par_workers() -> i64 {
+pub var g_bc_units: Vec<Func> = Vec::new();
+pub fn bc_par_workers() -> i64 {
     var r: i64 = p_getenv("FID_PAR");
     if r == 0 {
         return 1;
@@ -474,11 +481,11 @@ pub fn bc_par_worker(s: i64, e: i64) -> Vec<str> {
     bc.par_lt = true;
     var i: i64 = s;
     while i < e {
-        check_func(& mut bc, g_bc_units.get(i));
+        check_func(&mut bc, g_bc_units.get(i));
         i = i + 1;
     }
     var out: Vec<str> = bc.errors;
-    BorrowChecker_free_maps(& mut bc);
+    BorrowChecker_free_maps(&mut bc);
     return out;
 }
 
@@ -486,30 +493,33 @@ pub fn bc_par_worker(s: i64, e: i64) -> Vec<str> {
 // for each such function the parameters its result borrows from by its
 // signature (`fn f<'a>(x: &'a T, y: &T) -> &'a T`: [0]). Module globals,
 // so the parallel workers of check() read them as they read g_bc_units.
-var g_bc_lt_index: i64 = 0; var g_bc_lt_ties: Vec<Vec<i64>> = Vec::new();
+var g_bc_lt_index: i64 = 0;
+var g_bc_lt_ties: Vec<Vec<i64>> = Vec::new();
 // LG3: for each entry of g_bc_lt_ties, whether parameter 0 is `&mut` (a
 // method's receiver is borrowed the way its `self` is), and whether any
 // entry ties more than one parameter (then a borrower can hold several
 // borrows: `r`, `r#1`, `r#2`, ..., released together by release_borrow_by).
-var g_bc_lt_self_mut: Vec<bool> = Vec::new(); var g_bc_lt_multi: bool = false;
+var g_bc_lt_self_mut: Vec<bool> = Vec::new();
+var g_bc_lt_multi: bool = false;
 // LG3: method name -> 1 when every user method of that name (impls, trait
 // impls, trait declarations) takes its receiver as `&` or by value, so a
 // call only reads it; 2 when one takes `&mut self` (bc_user_read_method).
 // Struct name -> 1 for a struct with lifetime parameters
 // (`struct View<'a> { r: &'a i64 }`): its values hold references.
 // Built once before the walk; the parallel workers only read them.
-var g_bc_meth_kind: i64 = 0; var g_bc_lt_structs: i64 = 0;
+var g_bc_meth_kind: i64 = 0;
+var g_bc_lt_structs: i64 = 0;
 
 /// LG3: the parameters entry `k` of g_bc_lt_ties ties; a parallel worker
 /// reads its own copy (CS5).
-fn bc_lt_ties_at(self: & BorrowChecker, k: i64) -> Vec<i64> {
+fn bc_lt_ties_at(self: &BorrowChecker, k: i64) -> Vec<i64> {
     if self.par_lt {
         return self.lt_ties.get(k);
     }
     return g_bc_lt_ties.get(k);
 }
 
-fn bc_lt_self_mut_at(self: & BorrowChecker, k: i64) -> bool {
+fn bc_lt_self_mut_at(self: &BorrowChecker, k: i64) -> bool {
     if self.par_lt {
         return self.lt_self_mut.get(k);
     }
@@ -784,7 +794,7 @@ fn bc_alias(name: str, count: i64) -> str {
 }
 
 /// LG3: the borrows `n` holds: its own and those of `n#1`, `n#2`, ...
-fn bc_held_borrows(self: & BorrowChecker, n: str) -> Vec<BorrowOfEntry> {
+fn bc_held_borrows(self: &BorrowChecker, n: str) -> Vec<BorrowOfEntry> {
     var out: Vec<BorrowOfEntry> = Vec::new();
     var bi: i64 = HashMap_get(self.bo_ix, n);
     if bi > 0 {
@@ -803,7 +813,7 @@ fn bc_held_borrows(self: & BorrowChecker, n: str) -> Vec<BorrowOfEntry> {
 }
 
 /// LG3: `name` borrows `path` too, as its borrow number `count`.
-fn bc_tie_borrow(self: & mut BorrowChecker, name: str, path: str, is_mut: bool, count: i64, line: i64) -> void {
+fn bc_tie_borrow(self: &mut BorrowChecker, name: str, path: str, is_mut: bool, count: i64, line: i64) -> void {
     if count > 0 {
         self.alias_seen = true;
     }
@@ -815,7 +825,7 @@ fn bc_tie_borrow(self: & mut BorrowChecker, name: str, path: str, is_mut: bool, 
 /// `path` stays mutably borrowed, also after `holder`'s last use; when `who`
 /// ends first and `holder` still lives, the borrow goes back to `holder`
 /// (release_borrow_one).
-fn bc_hand_over_mut(self: & mut BorrowChecker, who: str, holder: str, path: str, line: i64) -> void {
+fn bc_hand_over_mut(self: &mut BorrowChecker, who: str, holder: str, path: str, line: i64) -> void {
     mut_borrow_set(self, path, OptStr::Some(who));
     borrow_of_add(self, who, path, true, line);
     self.mh_to.push(who);
@@ -825,7 +835,7 @@ fn bc_hand_over_mut(self: & mut BorrowChecker, who: str, holder: str, path: str,
 /// LG3: `name` borrows, from its borrow number `count` on, what variable
 /// `holder` borrows: shared borrows are shared again, a mutable one is
 /// handed over. Returns the next borrow number.
-fn bc_pass_on(self: & mut BorrowChecker, name: str, holder: str, count: i64, line: i64) -> i64 {
+fn bc_pass_on(self: &mut BorrowChecker, name: str, holder: str, count: i64, line: i64) -> i64 {
     var c: i64 = count;
     if holder == name {
         return c;
@@ -854,7 +864,7 @@ fn bc_pass_on(self: & mut BorrowChecker, name: str, holder: str, count: i64, lin
 /// `view` a struct holding a reference); a variable holding borrows passes
 /// them on (`val q = &a; val r = f(q)`: r borrows a; a `&mut` one is handed
 /// over). Returns the next borrow number.
-fn bc_tie_one(self: & mut BorrowChecker, name: str, e: Expr, count: i64, line: i64) -> i64 {
+fn bc_tie_one(self: &mut BorrowChecker, name: str, e: Expr, count: i64, line: i64) -> i64 {
     var c: i64 = count;
     match e {
         Expr::Ref(inner, m) => {
@@ -890,7 +900,7 @@ fn bc_tie_one(self: & mut BorrowChecker, name: str, e: Expr, count: i64, line: i
 /// borrows passes them on too. A receiver that is itself a reference
 /// (`val q = &a; q.m()`) passes on what it points to and is not borrowed
 /// itself: the result points where `q` does.
-fn bc_record_method_borrow(self: & mut BorrowChecker, name: str, recv: Expr, method: str, args: Vec<Expr>, line: i64) -> void {
+fn bc_record_method_borrow(self: &mut BorrowChecker, name: str, recv: Expr, method: str, args: Vec<Expr>, line: i64) -> void {
     if self.unsafe_depth > 0 || g_bc_lt_index == 0 {
         return;
     }
@@ -938,7 +948,7 @@ fn bc_record_method_borrow(self: & mut BorrowChecker, name: str, recv: Expr, met
 // none): name borrows what each such argument borrows (bc_tie_one), so
 // changing any of them while name is live is the error it is for
 // `val r = &a`.
-fn bc_record_call_borrow(self: & mut BorrowChecker, name: str, callee: str, args: Vec<Expr>, line: i64) -> void {
+fn bc_record_call_borrow(self: &mut BorrowChecker, name: str, callee: str, args: Vec<Expr>, line: i64) -> void {
     if self.unsafe_depth > 0 || g_bc_lt_index == 0 {
         return;
     }
@@ -960,7 +970,7 @@ fn bc_record_call_borrow(self: & mut BorrowChecker, name: str, callee: str, args
 
 /// LG3: `val name = S { f: &a, g: q, .. }` for a struct with lifetime
 /// parameters: name borrows what each field value borrows (bc_tie_one).
-fn bc_record_struct_borrow(self: & mut BorrowChecker, name: str, sname: str, fields: Vec<FieldInit>, line: i64) -> void {
+fn bc_record_struct_borrow(self: &mut BorrowChecker, name: str, sname: str, fields: Vec<FieldInit>, line: i64) -> void {
     if self.unsafe_depth > 0 || g_bc_lt_structs == 0 {
         return;
     }
@@ -979,7 +989,7 @@ fn bc_record_struct_borrow(self: & mut BorrowChecker, name: str, sname: str, fie
 /// base (a struct with lifetime parameters, or the escape check rejects the
 /// store) borrows that too, under its next borrow number. The `&path`'s
 /// temporary borrow made by check_expr is released first.
-fn bc_record_field_borrow(self: & mut BorrowChecker, base: str, e: Expr, line: i64) -> void {
+fn bc_record_field_borrow(self: &mut BorrowChecker, base: str, e: Expr, line: i64) -> void {
     var holds: bool = false;
     match e {
         Expr::Ref(inner, _) => {
@@ -1017,7 +1027,7 @@ fn bc_record_field_borrow(self: & mut BorrowChecker, base: str, e: Expr, line: i
 }
 
 // Check an entire program. Walks every function and impl method body.
-pub fn check(self: & mut BorrowChecker, program: Program) -> void {
+pub fn check(self: &mut BorrowChecker, program: Program) -> void {
     // Skip entirely when borrow checking is off -- the full analysis walks
     // every statement with O(n) linear searches and is extremely slow on
     // large programs (e.g. the stdlib). In Off mode, violations are already
@@ -1126,7 +1136,7 @@ pub fn check(self: & mut BorrowChecker, program: Program) -> void {
 }
 
 // Check a single function. Resets all borrow state between functions.
-pub fn check_func(self: & mut BorrowChecker, func: Func) -> void {
+pub fn check_func(self: &mut BorrowChecker, func: Func) -> void {
     // Reset state -- borrows don't cross function boundaries.
     self.shared_borrows.clear();
     self.mut_borrow.clear();
@@ -1203,7 +1213,7 @@ pub fn check_func(self: & mut BorrowChecker, func: Func) -> void {
 // --- Phase 6: NLL pre-pass ------------------------------------------------
 
 // Compute the last statement index that references each variable.
-fn compute_last_use(self: & mut BorrowChecker, body: Vec<Stmt>) -> void {
+fn compute_last_use(self: &mut BorrowChecker, body: Vec<Stmt>) -> void {
     var i: i64 = 0;
     while i < body.len() {
         var stmt: Stmt = body.get(i);
@@ -1214,7 +1224,7 @@ fn compute_last_use(self: & mut BorrowChecker, body: Vec<Stmt>) -> void {
 
 // Recursively collect all variable references in a statement and update
 // their last-use index.
-fn collect_var_uses_stmt(self: & mut BorrowChecker, stmt: Stmt, idx: i64) -> void {
+fn collect_var_uses_stmt(self: &mut BorrowChecker, stmt: Stmt, idx: i64) -> void {
     match stmt {
         Stmt::Let(name, _, expr, _, _, _, _) => {
             collect_var_uses_expr(self, expr, idx);
@@ -1483,7 +1493,7 @@ fn collect_var_uses_stmt(self: & mut BorrowChecker, stmt: Stmt, idx: i64) -> voi
 }
 
 // Recursively collect all variable references in an expression.
-fn collect_var_uses_expr(self: & mut BorrowChecker, expr: Expr, idx: i64) -> void {
+fn collect_var_uses_expr(self: &mut BorrowChecker, expr: Expr, idx: i64) -> void {
     match expr {
         Expr::Ident(name) => {
             last_use_set(self, name, idx);
@@ -1663,7 +1673,7 @@ fn collect_var_uses_expr(self: & mut BorrowChecker, expr: Expr, idx: i64) -> voi
 // --- last_use helper ------------------------------------------------------
 
 // Set the last-use index for a variable. If it already exists, update it.
-fn last_use_set(self: & mut BorrowChecker, name: str, idx: i64) -> void {
+fn last_use_set(self: &mut BorrowChecker, name: str, idx: i64) -> void {
     if HashMap_contains(self.last_use_index, name) {
         self.last_use.get(HashMap_get(self.last_use_index, name) - 1).val = idx;
         return;
@@ -1673,15 +1683,15 @@ fn last_use_set(self: & mut BorrowChecker, name: str, idx: i64) -> void {
 }
 
 // Get the last-use index for a variable, or -1 if not found.
-fn last_use_get(self: & BorrowChecker, name: str) -> i64 {
+fn last_use_get(self: &BorrowChecker, name: str) -> i64 {
     if !HashMap_contains(self.last_use_index, name) {
-        return - 1;
+        return -1;
     }
     return self.last_use.get(HashMap_get(self.last_use_index, name) - 1).val;
 }
 
 /// Whether `key` ("fn:name", "impl:Type:method") is a body not to check.
-pub fn bc_skips(self: & BorrowChecker, key: str) -> bool {
+pub fn bc_skips(self: &BorrowChecker, key: str) -> bool {
     if self.skip_bodies == 0 {
         return false;
     }
@@ -1693,7 +1703,7 @@ pub fn bc_skips(self: & BorrowChecker, key: str) -> bool {
 // Release borrows for borrowers whose last use was before the current
 // statement index. This is the core of NLL -- borrows end at the borrower's
 // last use, not at scope end.
-fn release_dead_borrows(self: & mut BorrowChecker) -> void {
+fn release_dead_borrows(self: &mut BorrowChecker) -> void {
     var current_idx: i64 = self.stmt_index;
     if current_idx < self.dead_at.len() {
         // Bucketed fast path (CS3): release_borrow_by is O(1) via bo_ix,
@@ -1730,12 +1740,12 @@ fn release_dead_borrows(self: & mut BorrowChecker) -> void {
 
 // --- Scope management -----------------------------------------------------
 
-fn push_scope(self: & mut BorrowChecker) -> void {
+fn push_scope(self: &mut BorrowChecker) -> void {
     var scope: StringVec = StringVec_new();
     self.scope_stack.push(scope);
 }
 
-fn pop_scope(self: & mut BorrowChecker) -> void {
+fn pop_scope(self: &mut BorrowChecker) -> void {
     if self.scope_stack.len() > 0 {
         var dead: StringVec = self.scope_stack.pop();
         var i: i64 = 0;
@@ -1751,13 +1761,13 @@ fn pop_scope(self: & mut BorrowChecker) -> void {
 }
 
 // Add a name to the current (top) scope.
-fn scope_stack_push_name(self: & mut BorrowChecker, name: str) -> void {
+fn scope_stack_push_name(self: &mut BorrowChecker, name: str) -> void {
     var top: i64 = self.scope_stack.len() - 1;
     self.scope_stack.get(top).items.push(name);
 }
 
 // Remove a name from the current (top) scope.
-fn scope_stack_remove_name(self: & mut BorrowChecker, name: str) -> void {
+fn scope_stack_remove_name(self: &mut BorrowChecker, name: str) -> void {
     var top: i64 = self.scope_stack.len() - 1;
     var scope: Vec<str> = self.scope_stack.get(top).items;
     var i: i64 = 0;
@@ -1772,7 +1782,7 @@ fn scope_stack_remove_name(self: & mut BorrowChecker, name: str) -> void {
 
 // Release any borrow held by `borrower`. Called when the borrower goes out
 // of scope or is reassigned.
-fn release_borrow_by(self: & mut BorrowChecker, borrower: str) -> void {
+fn release_borrow_by(self: &mut BorrowChecker, borrower: str) -> void {
     // LG3: a call tying its result to several arguments made `borrower#k`
     // hold the further borrows: they end with `borrower`
     if g_bc_lt_multi || self.alias_seen {
@@ -1787,7 +1797,7 @@ fn release_borrow_by(self: & mut BorrowChecker, borrower: str) -> void {
     release_borrow_one(self, borrower);
 }
 
-fn release_borrow_one(self: & mut BorrowChecker, borrower: str) -> void {
+fn release_borrow_one(self: &mut BorrowChecker, borrower: str) -> void {
     var i: i64 = HashMap_get(self.bo_ix, borrower);
     if i <= 0 {
         return;
@@ -1807,7 +1817,7 @@ fn release_borrow_one(self: & mut BorrowChecker, borrower: str) -> void {
 }
 
 /// Whether `b` holds the mutable borrow of `path`.
-fn bc_mut_holder_is(self: & BorrowChecker, path: str, b: str) -> bool {
+fn bc_mut_holder_is(self: &BorrowChecker, path: str, b: str) -> bool {
     var i: i64 = HashMap_get(self.mb_ix, path);
     if i <= 0 {
         return false;
@@ -1828,7 +1838,7 @@ fn bc_mut_holder_is(self: & BorrowChecker, path: str, b: str) -> bool {
 /// to the variable it came from when that one still holds it (`m` is used
 /// again after `r = f(m)` ends); one taken over from `borrower` now comes
 /// from where `borrower`'s came from (a chain `m -> r -> s`).
-fn bc_mut_release_handed(self: & mut BorrowChecker, path: str, borrower: str) -> void {
+fn bc_mut_release_handed(self: &mut BorrowChecker, path: str, borrower: str) -> void {
     var from: str = "";
     var j: i64 = 0;
     while j < self.mh_to.len() {
@@ -1866,7 +1876,7 @@ fn bc_mut_release_handed(self: & mut BorrowChecker, path: str, borrower: str) ->
 
 // Declare a variable in the current scope. If it was previously a borrower
 // (reassignment), release its old borrow first.
-fn declare_var(self: & mut BorrowChecker, name: str) -> void {
+fn declare_var(self: &mut BorrowChecker, name: str) -> void {
     // Reassignment: if this name was a borrower, release the old borrow.
     release_borrow_by(self, name);
     HashMap_remove(self.ref_vars, name);
@@ -1877,7 +1887,7 @@ fn declare_var(self: & mut BorrowChecker, name: str) -> void {
 // that appear directly inside a call argument list (not assigned to a
 // variable). The caller releases it via release_borrow_by when the
 // enclosing expression completes.
-fn create_temp_borrow(self: & mut BorrowChecker, borrowed_var: str, is_mut: bool, line: i64) -> void {
+fn create_temp_borrow(self: &mut BorrowChecker, borrowed_var: str, is_mut: bool, line: i64) -> void {
     var name: str = "__tmp_ref_" + int_to_str(self.temp_counter);
     self.temp_counter = self.temp_counter + 1;
     create_borrow(self, borrowed_var, name, is_mut, line);
@@ -1886,7 +1896,7 @@ fn create_temp_borrow(self: & mut BorrowChecker, borrowed_var: str, is_mut: bool
 }
 
 // Release all temporary borrows created since the checkpoint value.
-fn release_temps_since(self: & mut BorrowChecker, checkpoint: i64) -> void {
+fn release_temps_since(self: &mut BorrowChecker, checkpoint: i64) -> void {
     var i: i64 = checkpoint;
     while i < self.temp_counter {
         var name: str = "__tmp_ref_" + int_to_str(i);
@@ -1898,7 +1908,7 @@ fn release_temps_since(self: & mut BorrowChecker, checkpoint: i64) -> void {
 
 // Phase 4: Release only temp SHARED borrows created since the checkpoint.
 // Reserved &mut temp borrows are NOT released here.
-fn release_shared_temps_since(self: & mut BorrowChecker, checkpoint: i64) -> void {
+fn release_shared_temps_since(self: &mut BorrowChecker, checkpoint: i64) -> void {
     var i: i64 = checkpoint;
     while i < self.temp_counter {
         var name: str = "__tmp_ref_" + int_to_str(i);
@@ -1992,7 +2002,7 @@ fn bc_pfx_add(map: i64, key: str, delta: i64) -> void {
     }
 }
 
-fn has_shared_borrow(self: & BorrowChecker, var: str) -> bool {
+fn has_shared_borrow(self: &BorrowChecker, var: str) -> bool {
     var i: i64 = HashMap_get(self.sb_ix, var);
     if i <= 0 {
         return false;
@@ -2000,7 +2010,7 @@ fn has_shared_borrow(self: & BorrowChecker, var: str) -> bool {
     return self.shared_borrows.get(i - 1).borrowers.len() > 0;
 }
 
-fn has_mut_borrow(self: & BorrowChecker, var: str) -> bool {
+fn has_mut_borrow(self: &BorrowChecker, var: str) -> bool {
     var i: i64 = HashMap_get(self.mb_ix, var);
     if i <= 0 {
         return false;
@@ -2016,12 +2026,12 @@ fn has_mut_borrow(self: & BorrowChecker, var: str) -> bool {
 }
 
 // Check if any shared borrow exists on var OR any field path under it.
-fn has_shared_borrow_inclusive(self: & BorrowChecker, var: str) -> bool {
+fn has_shared_borrow_inclusive(self: &BorrowChecker, var: str) -> bool {
     return HashMap_get(self.sb_pfx, var) > 0;
 }
 
 // Check if any mutable borrow exists on var OR any field path under it.
-fn has_mut_borrow_inclusive(self: & BorrowChecker, var: str) -> bool {
+fn has_mut_borrow_inclusive(self: &BorrowChecker, var: str) -> bool {
     return HashMap_get(self.mb_pfx, var) > 0;
 }
 
@@ -2033,7 +2043,7 @@ fn has_mut_borrow_inclusive(self: & BorrowChecker, var: str) -> bool {
 // can hold one and the walk stops. A path whose root is not borrowed costs
 // one table lookup; a path without a dot costs none. Same answer as the
 // earlier walk from the longest prefix up (each prefix checked exactly).
-fn bc_borrow_on_prefix(self: & BorrowChecker, path: str, is_mut: bool) -> bool {
+fn bc_borrow_on_prefix(self: &BorrowChecker, path: str, is_mut: bool) -> bool {
     var pfx: i64 = self.sb_pfx;
     if is_mut {
         pfx = self.mb_pfx;
@@ -2062,12 +2072,12 @@ fn bc_borrow_on_prefix(self: & BorrowChecker, path: str, is_mut: bool) -> bool {
 }
 
 // Check if any shared borrow exists on a PREFIX of path.
-fn has_shared_borrow_on_prefix(self: & BorrowChecker, path: str) -> bool {
+fn has_shared_borrow_on_prefix(self: &BorrowChecker, path: str) -> bool {
     return bc_borrow_on_prefix(self, path, false);
 }
 
 // Check if any mutable borrow exists on a PREFIX of path.
-fn has_mut_borrow_on_prefix(self: & BorrowChecker, path: str) -> bool {
+fn has_mut_borrow_on_prefix(self: &BorrowChecker, path: str) -> bool {
     return bc_borrow_on_prefix(self, path, true);
 }
 
@@ -2075,7 +2085,7 @@ fn has_mut_borrow_on_prefix(self: & BorrowChecker, path: str) -> bool {
 
 // Tombstone instead of remove: clearing the payload keeps vec positions
 // (and the *_ix maps) stable. has_* treats an empty payload as absent.
-fn shared_borrows_remove(self: & mut BorrowChecker, key: str) -> void {
+fn shared_borrows_remove(self: &mut BorrowChecker, key: str) -> void {
     var i: i64 = HashMap_get(self.sb_ix, key);
     if i <= 0 {
         return;
@@ -2087,7 +2097,7 @@ fn shared_borrows_remove(self: & mut BorrowChecker, key: str) -> void {
     }
 }
 
-fn mut_borrow_remove(self: & mut BorrowChecker, key: str) -> void {
+fn mut_borrow_remove(self: &mut BorrowChecker, key: str) -> void {
     var i: i64 = HashMap_get(self.mb_ix, key);
     if i <= 0 {
         return;
@@ -2102,7 +2112,7 @@ fn mut_borrow_remove(self: & mut BorrowChecker, key: str) -> void {
     }
 }
 
-fn shared_borrows_remove_borrower(self: & mut BorrowChecker, borrowed: str, borrower: str) -> void {
+fn shared_borrows_remove_borrower(self: &mut BorrowChecker, borrowed: str, borrower: str) -> void {
     var i: i64 = HashMap_get(self.sb_ix, borrowed);
     if i <= 0 {
         return;
@@ -2119,7 +2129,7 @@ fn shared_borrows_remove_borrower(self: & mut BorrowChecker, borrowed: str, borr
     }
 }
 
-fn mut_borrow_clear_if_borrower(self: & mut BorrowChecker, borrowed: str, borrower: str) -> void {
+fn mut_borrow_clear_if_borrower(self: &mut BorrowChecker, borrowed: str, borrower: str) -> void {
     var i: i64 = HashMap_get(self.mb_ix, borrowed);
     if i <= 0 {
         return;
@@ -2136,7 +2146,7 @@ fn mut_borrow_clear_if_borrower(self: & mut BorrowChecker, borrowed: str, borrow
     }
 }
 
-fn shared_borrows_get_or_create(self: & mut BorrowChecker, key: str) -> void {
+fn shared_borrows_get_or_create(self: &mut BorrowChecker, key: str) -> void {
     if HashMap_get(self.sb_ix, key) > 0 {
         return;
     }
@@ -2144,7 +2154,7 @@ fn shared_borrows_get_or_create(self: & mut BorrowChecker, key: str) -> void {
     HashMap_insert(self.sb_ix, key, self.shared_borrows.len());
 }
 
-fn shared_borrows_add_borrower(self: & mut BorrowChecker, key: str, borrower: str) -> void {
+fn shared_borrows_add_borrower(self: &mut BorrowChecker, key: str, borrower: str) -> void {
     var i: i64 = HashMap_get(self.sb_ix, key);
     if i <= 0 {
         self.shared_borrows.push(SharedBorrowEntry_new(key));
@@ -2155,7 +2165,7 @@ fn shared_borrows_add_borrower(self: & mut BorrowChecker, key: str, borrower: st
     bc_pfx_add(self.sb_pfx, key, 1);
 }
 
-fn mut_borrow_set(self: & mut BorrowChecker, key: str, borrower: OptStr) -> void {
+fn mut_borrow_set(self: &mut BorrowChecker, key: str, borrower: OptStr) -> void {
     var i: i64 = HashMap_get(self.mb_ix, key);
     if i <= 0 {
         self.mut_borrow.push(MutBorrowEntry_new(key, borrower));
@@ -2187,7 +2197,7 @@ fn mut_borrow_set(self: & mut BorrowChecker, key: str, borrower: OptStr) -> void
     }
 }
 
-fn borrow_of_add(self: & mut BorrowChecker, borrower: str, borrowed: str, is_mut: bool, line: i64) -> void {
+fn borrow_of_add(self: &mut BorrowChecker, borrower: str, borrowed: str, is_mut: bool, line: i64) -> void {
     // Tombstone an existing entry for this borrower (reassignment).
     var old: i64 = HashMap_get(self.bo_ix, borrower);
     if old > 0 {
@@ -2211,8 +2221,8 @@ fn borrow_of_add(self: & mut BorrowChecker, borrower: str, borrowed: str, is_mut
 // CM2: which borrow holds `path` (or a field of it, or what it is a field
 // of), and the change that frees it. want: 1 a mutable borrow, 0 a shared
 // one. The latest such borrow is named (as src/borrowck.rs holder_note).
-fn holder_note(self: & BorrowChecker, path: str, want: i64) -> str {
-    var best: i64 = - 1;
+fn holder_note(self: &BorrowChecker, path: str, want: i64) -> str {
+    var best: i64 = -1;
     var i: i64 = 0;
     while i < self.borrow_of.len() {
         var e: BorrowOfEntry = self.borrow_of.get(i);
@@ -2266,7 +2276,7 @@ fn holder_note(self: & BorrowChecker, path: str, want: i64) -> str {
 
 // Rule 1 & 2: creating a borrow. is_mut true = &mut x, false = &x.
 // borrowed_path is a field path like "s" or "s.x" or "s.inner.z".
-fn create_borrow(self: & mut BorrowChecker, borrowed_path: str, borrower: str, is_mut: bool, line: i64) -> void {
+fn create_borrow(self: &mut BorrowChecker, borrowed_path: str, borrower: str, is_mut: bool, line: i64) -> void {
     if is_mut && bc_is_iterating(self, borrowed_path) {
         violation(self, line, "cannot create &mut " + borrowed_path + " while a `for` loop iterates over it.\n    Fix: collect the changes and apply them after the loop.");
         return;
@@ -2336,7 +2346,7 @@ fn create_borrow(self: & mut BorrowChecker, borrowed_path: str, borrower: str, i
 
 /// OW5: a named borrower (not a temporary, a closure capture or `r#k`)
 /// that no statement of the function reads.
-fn bc_never_read(self: & BorrowChecker, borrower: str) -> bool {
+fn bc_never_read(self: &BorrowChecker, borrower: str) -> bool {
     if str_len(borrower) == 0 || str_starts_with(borrower, "__") || str_find(borrower, "#") >= 0 {
         return false;
     }
@@ -2345,7 +2355,7 @@ fn bc_never_read(self: & BorrowChecker, borrower: str) -> bool {
 
 // Phase 4: Activate all reserved &mut borrows. Called after all call
 // arguments have been evaluated.
-fn activate_reserved_borrows(self: & mut BorrowChecker) -> void {
+fn activate_reserved_borrows(self: &mut BorrowChecker) -> void {
     var reserved: Vec<ReservedMutBorrow> = self.reserved_mut_borrows;
     self.reserved_mut_borrows.clear();
     var i: i64 = 0;
@@ -2383,7 +2393,7 @@ fn bc_field_path(e: Expr) -> str {
     return "";
 }
 
-fn check_mutation(self: & mut BorrowChecker, var: str, line: i64) -> void {
+fn check_mutation(self: &mut BorrowChecker, var: str, line: i64) -> void {
     if bc_is_iterating(self, var) {
         violation(self, line, "cannot change " + var + " while a `for` loop iterates over it: the loop would read past a resize or skip elements.
     Fix: collect the changes in another Vec and apply them after the loop.");
@@ -2401,7 +2411,7 @@ fn check_mutation(self: & mut BorrowChecker, var: str, line: i64) -> void {
 
 /// Whether a `for` loop around this point iterates over `var` (or the
 /// variable `var` is a field of).
-fn bc_is_iterating(self: & BorrowChecker, var: str) -> bool {
+fn bc_is_iterating(self: &BorrowChecker, var: str) -> bool {
     var i: i64 = 0;
     while i < self.iterating.len() {
         var it: str = self.iterating.get(i);
@@ -2413,7 +2423,7 @@ fn bc_is_iterating(self: & BorrowChecker, var: str) -> bool {
     return false;
 }
 
-fn violation(self: & mut BorrowChecker, line: i64, msg: str) -> void {
+fn violation(self: &mut BorrowChecker, line: i64, msg: str) -> void {
     var full: str = "";
     match self.current_func {
         OptStr::Some(f) => {
@@ -2442,7 +2452,7 @@ fn bc_read_method(m: str) -> bool {
     return m == "len" || m == "get" || m == "is_empty" || m == "contains" || m == "contains_key" || m == "first" || m == "last" || m == "clone" || m == "to_str" || m == "keys" || m == "values" || m == "starts_with" || m == "ends_with" || m == "find" || m == "capacity" || m == "is_some" || m == "is_none" || m == "is_ok" || m == "is_err" || m == "unwrap" || m == "unwrap_or" || m == "get_or" || m == "eq" || m == "cmp" || m == "show" || m == "slice" || m == "byte_at" || m == "char_at";
 }
 
-fn check_stmt(self: & mut BorrowChecker, stmt: Stmt) -> void {
+fn check_stmt(self: &mut BorrowChecker, stmt: Stmt) -> void {
     self.stmt_line = stmt_line(stmt);
     match stmt {
         Stmt::Let(name, _, expr, _, _, _, line) => {
@@ -2827,7 +2837,7 @@ fn check_stmt(self: & mut BorrowChecker, stmt: Stmt) -> void {
 
 // --- Expression walker ----------------------------------------------------
 
-fn check_expr(self: & mut BorrowChecker, expr: Expr) -> void {
+fn check_expr(self: &mut BorrowChecker, expr: Expr) -> void {
     match expr {
         Expr::IntLit(_) => {
         }
@@ -3136,14 +3146,14 @@ fn check_expr(self: & mut BorrowChecker, expr: Expr) -> void {
             var captured: Vec<str> = Vec::new();
             var b: i64 = 0;
             while b < body.len() {
-                collect_captures_stmt_fd(body.get(b), & mut captured);
+                collect_captures_stmt_fd(body.get(b), &mut captured);
                 b = b + 1;
             }
             // Collect identifiers that are assigned to (for mutable capture).
             var assigned: Vec<str> = Vec::new();
             b = 0;
             while b < body.len() {
-                collect_assigned_stmt_fd(body.get(b), & mut assigned);
+                collect_assigned_stmt_fd(body.get(b), &mut assigned);
                 b = b + 1;
             }
             // The body first: what the closure itself does with a captured
@@ -3203,7 +3213,7 @@ fn check_expr(self: & mut BorrowChecker, expr: Expr) -> void {
 // Called from Stmt::Let after the variable is declared. This "promotes" the
 // temporary borrow created by check_expr into a named borrow tied to the
 // variable. The temp is released first to avoid a double-borrow.
-fn maybe_record_borrow_from_expr(self: & mut BorrowChecker, name: str, expr: Expr, line: i64) -> void {
+fn maybe_record_borrow_from_expr(self: &mut BorrowChecker, name: str, expr: Expr, line: i64) -> void {
     match expr {
         Expr::Ref(inner, is_mut) => {
             if self.unsafe_depth == 0 {
@@ -3305,7 +3315,7 @@ pub fn str_to_lower(s: str) -> str {
 
 // Collect identifiers used in a statement that are NOT locals (params or
 // locally-declared variables). These are closure captures.
-fn collect_captures_stmt_fd(stmt: Stmt, captured: & mut Vec<str>) -> void {
+fn collect_captures_stmt_fd(stmt: Stmt, captured: &mut Vec<str>) -> void {
     match stmt {
         Stmt::Let(_, _, expr, _, _, _, _) => {
             collect_captures_expr_fd(expr, captured);
@@ -3373,7 +3383,7 @@ fn collect_captures_stmt_fd(stmt: Stmt, captured: & mut Vec<str>) -> void {
     }
 }
 
-fn collect_captures_expr_fd(expr: Expr, captured: & mut Vec<str>) -> void {
+fn collect_captures_expr_fd(expr: Expr, captured: &mut Vec<str>) -> void {
     match expr {
         Expr::Ident(name) => {
             if !bc_vec_contains_str(captured, name) {
@@ -3430,7 +3440,7 @@ fn bc_vec_contains_str(v: Vec<str>, s: str) -> bool {
 }
 
 // Collect identifiers that are assigned to in a statement (for mutable capture).
-fn collect_assigned_stmt_fd(stmt: Stmt, assigned: & mut Vec<str>) -> void {
+fn collect_assigned_stmt_fd(stmt: Stmt, assigned: &mut Vec<str>) -> void {
     match stmt {
         Stmt::Assign(target, _, _, _) => {
             if !bc_vec_contains_str(assigned, target) {

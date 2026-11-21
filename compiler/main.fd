@@ -11,7 +11,47 @@
 // stage-0 compiler (fidesc) loads imports in this order and parses a struct
 // literal only of a type it has already loaded (release A4).
 
-module compiler::main; use core; use vec; use string; use compiler::ast; use compiler::token; use compiler::lexer; use compiler::parser; use compiler::ir; use compiler::pgo; use compiler::image_writer; use compiler::mir; use compiler::compiler; use compiler::inc; use compiler::pe_ir; use compiler::pe_ir_stubs; use compiler::fmt; use compiler::lower; use compiler::scribe; use compiler::veil; use compiler::tensor; use compiler::gpu; use compiler::wasm; use compiler::lsp; use compiler::ark; use compiler::cparser; use compiler::iropt; use compiler::nat_ir; use compiler::rules; use compiler::checks; use compiler::irverify; use compiler::egraph; use compiler::typechecker; use compiler::json; use compiler::csplit; use compiler::reach; use compiler::build_info; use compiler::ir_ser; use compiler::disasm; use compiler::pdb;  // --- Global flag state ---------------------------------------------------
+module compiler::main;
+use core;
+use vec;
+use string;
+use compiler::ast;
+use compiler::token;
+use compiler::lexer;
+use compiler::parser;
+use compiler::ir;
+use compiler::pgo;
+use compiler::image_writer;
+use compiler::mir;
+use compiler::compiler;
+use compiler::inc;
+use compiler::pe_ir;
+use compiler::pe_ir_stubs;
+use compiler::fmt;
+use compiler::lower;
+use compiler::scribe;
+use compiler::veil;
+use compiler::tensor;
+use compiler::gpu;
+use compiler::wasm;
+use compiler::lsp;
+use compiler::ark;
+use compiler::cparser;
+use compiler::iropt;
+use compiler::nat_ir;
+use compiler::rules;
+use compiler::checks;
+use compiler::irverify;
+use compiler::egraph;
+use compiler::typechecker;
+use compiler::json;
+use compiler::csplit;
+use compiler::reach;
+use compiler::build_info;
+use compiler::ir_ser;
+use compiler::disasm;
+use compiler::pdb;
+// --- Global flag state ---------------------------------------------------
 // Parsed from --borrowck= and --timeout flags before command dispatch.
 // Fides does not support module-level mutable vars, so these are passed
 // as extra parameters to command handlers that need them.
@@ -417,13 +457,13 @@ fn lim_parse_bytes(s: str) -> i64 {
     var v: i64 = 0;
     while i < len && str_byte_at(s, i) >= 48 && str_byte_at(s, i) <= 57 {
         if v > 1099511627776 {
-            return - 1;
+            return -1;
         }
         v = v * 10 + (str_byte_at(s, i) - 48);
         i = i + 1;
     }
     if i == 0 {
-        return - 1;
+        return -1;
     }
     var mult: i64 = 1;
     if i < len {
@@ -435,7 +475,7 @@ fn lim_parse_bytes(s: str) -> i64 {
         } else if c == 71 || c == 103 {
             mult = 1073741824;
         } else {
-            return - 1;
+            return -1;
         }
         i = i + 1;
         // an optional "B" (64MB, 64mb)
@@ -444,7 +484,7 @@ fn lim_parse_bytes(s: str) -> i64 {
         }
     }
     if i != len {
-        return - 1;
+        return -1;
     }
     return v * mult;
 }
@@ -458,7 +498,7 @@ fn lim_parse_ms(s: str) -> i64 {
     var digits: i64 = 0;
     while i < len && str_byte_at(s, i) >= 48 && str_byte_at(s, i) <= 57 {
         if whole > 1000000000000 {
-            return - 1;
+            return -1;
         }
         whole = whole * 10 + (str_byte_at(s, i) - 48);
         i = i + 1;
@@ -476,7 +516,7 @@ fn lim_parse_ms(s: str) -> i64 {
         }
     }
     if digits == 0 || i != len {
-        return - 1;
+        return -1;
     }
     return whole * 1000 + frac_ms;
 }
@@ -883,7 +923,7 @@ fn cmd_ir(n: i64, start: i64) -> i64 {
     var result: ResultIrModule = lower_to_ir_module(source);
     match result {
         ResultIrModule::Ok(ir_mod) => {
-            print(IrModule_to_str(& ir_mod));
+            print(IrModule_to_str(&ir_mod));
             print("\n");
             return 0;
         }
@@ -986,9 +1026,9 @@ fn cmd_opt(n: i64, start: i64) -> i64 {
     match result {
         ResultIrModule::Ok(ir_mod) => {
             var opt_mod: IrModule = ir_mod;
-            iropt_native(& mut opt_mod);
+            iropt_native(&mut opt_mod);
             if str_len(only_fn) > 0 {
-                var text: str = IrModule_function_detail_str(& opt_mod, only_fn);
+                var text: str = IrModule_function_detail_str(&opt_mod, only_fn);
                 if str_len(text) == 0 {
                     p_eprint_str("Error: no function '" + only_fn + "' after optimization (inlined and removed, or not in " + input + ")\n");
                     return 1;
@@ -996,7 +1036,7 @@ fn cmd_opt(n: i64, start: i64) -> i64 {
                 print(text);
                 return 0;
             }
-            print(IrModule_to_str(& opt_mod));
+            print(IrModule_to_str(&opt_mod));
             print("\n");
             return 0;
         }
@@ -1529,7 +1569,8 @@ fn fz_corpus_files(cdir: str, part: str) -> Vec<str> {
 
 /// A saved input's file name: its FNV-1a hash, 16 hex digits (the same
 /// input is saved once).
-@wrapping fn fz_input_name(bytes: Vec<i64>) -> str {
+@wrapping
+fn fz_input_name(bytes: Vec<i64>) -> str {
     var h: i64 = 0 - 3750763034362895579;
     var i: i64 = 0;
     while i < bytes.len() {
@@ -2343,7 +2384,8 @@ fn cmd_test_file(n: i64, start: i64, fuzz_only: bool) -> i64 {
             }
             i = i + 1;
         }
-    } while i < tests.len() {
+    }
+    while i < tests.len() {
         var run_cmd: str = test_env_prefix(update_snaps, test_fixed_clock(tests.get(i), real_clock), row_filter) + run;
         if p_system(run_cmd + " " + tests.get(i) + " 1") == 0 {
             print("ok    " + tests.get(i) + "\n");
@@ -3030,7 +3072,7 @@ fn cmd_profile(n: i64, start: i64) -> i64 {
     print("  self %   samples  function\n");
     var shown: i64 = 0;
     while shown < 20 && shown < names.len() {
-        var best: i64 = - 1;
+        var best: i64 = -1;
         var bi: i64 = 0;
         while bi < names.len() {
             if HashMap_get(counts, names.get(bi)) > 0 {
@@ -3786,7 +3828,8 @@ fn cmd_serve(n: i64, start: i64) -> i64 {
 // SP19: where a request's answer goes: stdout (stdin mode), or, for a
 // socket client, g_serve_buf in protocol lines (compiler.fd: `e <error>`,
 // `o <note>`, escaped)
-var g_serve_sock: bool = false; var g_serve_buf: str = "";
+var g_serve_sock: bool = false;
+var g_serve_buf: str = "";
 
 /// An error of a request's answer.
 fn serve_err(e: str) {
@@ -4182,7 +4225,7 @@ fn cmd_explain(n: i64, start: i64) -> i64 {
                 // ME25/ME23: loops versioned (and, with FID_IROPT_ON=rotate,
                 // rotated) as emit leaves them
                 var mx: IrModule = m;
-                var _nver: i64 = iro_explain_loops(& mut mx);
+                var _nver: i64 = iro_explain_loops(&mut mx);
                 lines = explain_checks(mx, filt);
             }
             var i: i64 = 0;
@@ -4535,15 +4578,15 @@ fn patch_pe_stack(exe_path: str) {
         p_eprint_str("[main] WARNING: PE stack patching failed: not a PE file.\n");
         return;
     }
-    pe_put_u64(& mut bytes, stack_off, 268435456);
+    pe_put_u64(&mut bytes, stack_off, 268435456);
     // 256MB reserve
-    pe_put_u64(& mut bytes, stack_off + 8, 16777216);
+    pe_put_u64(&mut bytes, stack_off + 8, 16777216);
     // 16MB commit
     p_file_write_vec(exe_path, bytes);
     p_eprint_str("[main] PE stack patched to 256MB.\n");
 }
 
-fn pe_put_u64(bytes: & mut Vec<i64>, off: i64, value: i64) {
+fn pe_put_u64(bytes: &mut Vec<i64>, off: i64, value: i64) {
     var i: i64 = 0;
     while i < 8 {
         bytes.set(off + i, (value >> (i * 8)) & 0xFF);
@@ -4708,11 +4751,15 @@ fn link_decl_in(source: str, sym: str) -> LinkDecl {
             in_extern = false;
         }
         if in_extern && (str_contains(t, "fn " + sym + "(") || str_contains(t, "fn " + sym + " (") || str_contains(t, "fn " + sym + " as ")) {
-            return LinkDecl { line: li + 1, lib: cur_lib };
+            return LinkDecl {
+                line: li + 1, lib: cur_lib
+            };
         }
         li = li + 1;
     }
-    return LinkDecl { line: 0, lib: "" };
+    return LinkDecl {
+        line: 0, lib: ""
+    };
 }
 
 /// CB9: a Fides error for each symbol the linker found missing (none when
@@ -5575,7 +5622,7 @@ fn cmd_gpu(n: i64, start: i64) -> i64 {
             // MI18: gpu.fd reads the IR (PIR's L3 before Nov 16)
             if target == "spirv" {
                 if text_mode {
-                    var text: str = generate_spirv_text(& ir_mod);
+                    var text: str = generate_spirv_text(&ir_mod);
                     if str_len(output) > 0 {
                         p_file_write(output, text);
                         p_eprint_str("Generated SPIR-V text: " + output + "\n");
@@ -5583,7 +5630,7 @@ fn cmd_gpu(n: i64, start: i64) -> i64 {
                         print(text);
                     }
                 } else {
-                    var words: Vec<i64> = generate_spirv(& ir_mod);
+                    var words: Vec<i64> = generate_spirv(&ir_mod);
                     var bytes: Vec<i64> = Vec::new();
                     var wi: i64 = 0;
                     while wi < words.len() {
@@ -5604,7 +5651,7 @@ fn cmd_gpu(n: i64, start: i64) -> i64 {
                 return 0;
             }
             if target == "ptx" {
-                var ptx: str = generate_ptx(& ir_mod);
+                var ptx: str = generate_ptx(&ir_mod);
                 if str_len(output) > 0 {
                     p_file_write(output, ptx);
                     p_eprint_str("Generated PTX assembly: " + output + "\n");
@@ -6026,7 +6073,7 @@ fn cmd_verify(n: i64, start: i64) -> i64 {
             return 1;
         }
         ResultIrModule::Ok(ir_mod) => {
-            var result: VerificationResult = IrModule_verify(& ir_mod);
+            var result: VerificationResult = IrModule_verify(&ir_mod);
             var wi: i64 = 0;
             while wi < result.warnings.len() {
                 p_eprint_str("warning: " + result.warnings.get(wi) + "\n");
@@ -6037,7 +6084,7 @@ fn cmd_verify(n: i64, start: i64) -> i64 {
                 p_eprint_str("error: " + result.errors.get(ei) + "\n");
                 ei = ei + 1;
             }
-            if VerificationResult_is_valid(& result) {
+            if VerificationResult_is_valid(&result) {
                 print("IR verification passed (" + int_to_str(result.warnings.len()) + " warnings)\n");
                 return 0;
             }
@@ -6070,11 +6117,11 @@ fn cmd_sourcemap(n: i64, start: i64) -> i64 {
             return 1;
         }
         ResultIrModule::Ok(ir_mod) => {
-            var sm: SourceMap = IrModule_source_map(& ir_mod);
+            var sm: SourceMap = IrModule_source_map(&ir_mod);
             if sm.entries.len() == 0 {
                 print("Source map is empty (no source line info available).\n");
             } else {
-                print(SourceMap_to_str(& sm));
+                print(SourceMap_to_str(&sm));
             }
             return 0;
         }
@@ -6258,7 +6305,7 @@ fn pe88_names_dropped(r: ResultBytes) -> bool {
 }
 
 /// PE88: queue `name` once.
-fn pe88_mark(seen: i64, work: & mut Vec<str>, name: str) {
+fn pe88_mark(seen: i64, work: &mut Vec<str>, name: str) {
     if str_len(name) > 0 && !HashMap_contains(seen, name) {
         HashMap_insert(seen, name, 1);
         work.push(name);
@@ -6267,7 +6314,7 @@ fn pe88_mark(seen: i64, work: & mut Vec<str>, name: str) {
 
 /// PE88: queue `name` when the module has a function of that name (a
 /// string that may be looked up by name at run time).
-fn pe88_mark_named(module: & IrModule, seen: i64, work: & mut Vec<str>, name: str) {
+fn pe88_mark_named(module: &IrModule, seen: i64, work: &mut Vec<str>, name: str) {
     if str_len(name) > 0 && IrModule_fn_pos(module, name) >= 0 {
         pe88_mark(seen, work, name);
     }
@@ -6276,7 +6323,7 @@ fn pe88_mark_named(module: & IrModule, seen: i64, work: & mut Vec<str>, name: st
 /// PE88: a call of `callee` as pe_ir makes it: the name, what pe_ir
 /// resolves it to (pert_c_ override, core stand-in, pert_ function) and,
 /// for print and p_to_str, every formatter they may dispatch to.
-fn pe88_mark_call(module: & IrModule, seen: i64, work: & mut Vec<str>, callee: str, prints: Vec<str>) {
+fn pe88_mark_call(module: &IrModule, seen: i64, work: &mut Vec<str>, callee: str, prints: Vec<str>) {
     pe88_mark(seen, work, callee);
     pe88_mark(seen, work, pe_ir_resolve_callee(module, callee));
     if callee == "print" || callee == "p_to_str" {
@@ -6292,7 +6339,7 @@ fn pe88_mark_call(module: & IrModule, seen: i64, work: & mut Vec<str>, callee: s
 /// PE88: a `dyn` call of `method` may land in any function named
 /// `<type>_<method>` (pe_ir_reachable_from's rule); each method is looked
 /// up once.
-fn pe88_mark_dyn(module: & IrModule, seen: i64, dyn_done: i64, work: & mut Vec<str>, method: str) {
+fn pe88_mark_dyn(module: &IrModule, seen: i64, dyn_done: i64, work: &mut Vec<str>, method: str) {
     if HashMap_contains(dyn_done, method) {
         return;
     }
@@ -6310,7 +6357,7 @@ fn pe88_mark_dyn(module: & IrModule, seen: i64, dyn_done: i64, work: & mut Vec<s
 
 /// PE88: the names of the functions some code of a pe_ir build of `module`
 /// may call (a set: keys are names), see the section comment.
-fn pe88_reached(module: & IrModule) -> i64 {
+fn pe88_reached(module: &IrModule) -> i64 {
     var seen: i64 = HashMap_new();
     var dyn_done: i64 = HashMap_new();
     var work: Vec<str> = Vec::new();
@@ -6322,30 +6369,30 @@ fn pe88_reached(module: & IrModule) -> i64 {
         var rname: str = module.functions.get(i).name;
         var rf: IrFunction = module.functions.get(i).func;
         if rname == "main" || rname == "main_entry" || ir_dfe_root(rname) || rf.is_interrupt || rf.is_kernel {
-            pe88_mark(seen, & mut work, rname);
+            pe88_mark(seen, &mut work, rname);
         }
         i = i + 1;
     }
     i = 0;
     while i < module.c_callbacks.len() {
-        pe88_mark(seen, & mut work, module.c_callbacks.get(i));
+        pe88_mark(seen, &mut work, module.c_callbacks.get(i));
         i = i + 1;
     }
     i = 0;
     while i < module.extern_functions.len() {
-        pe88_mark(seen, & mut work, module.extern_functions.get(i).name);
+        pe88_mark(seen, &mut work, module.extern_functions.get(i).name);
         i = i + 1;
     }
     i = 0;
     while i < module.string_constants.len() {
-        pe88_mark_named(module, seen, & mut work, module.string_constants.get(i).key);
+        pe88_mark_named(module, seen, &mut work, module.string_constants.get(i).key);
         i = i + 1;
     }
     i = 0;
     while i < module.globals.len() {
         match module.globals.get(i).init {
             Expr::StringLit(gs) => {
-                pe88_mark_named(module, seen, & mut work, gs);
+                pe88_mark_named(module, seen, &mut work, gs);
             }
             _ => {
             }
@@ -6358,7 +6405,7 @@ fn pe88_reached(module: & IrModule) -> i64 {
         var di: i64 = 0;
         while di < deps.len() {
             if deps.get(di).a == f {
-                pe88_mark(seen, & mut work, deps.get(di).b);
+                pe88_mark(seen, &mut work, deps.get(di).b);
             }
             di = di + 1;
         }
@@ -6369,34 +6416,34 @@ fn pe88_reached(module: & IrModule) -> i64 {
                     var inst: Inst = func.insts.get(ii).inst;
                     match inst {
                         Inst::Call(callee, _, _, _) => {
-                            pe88_mark_call(module, seen, & mut work, callee, prints);
+                            pe88_mark_call(module, seen, &mut work, callee, prints);
                         }
                         Inst::ConstStr(value) => {
-                            pe88_mark_named(module, seen, & mut work, value);
+                            pe88_mark_named(module, seen, &mut work, value);
                         }
                         Inst::ConstFnRef(fref) => {
-                            pe88_mark(seen, & mut work, c_fn_target(fref));
-                            pe88_mark(seen, & mut work, fref);
+                            pe88_mark(seen, &mut work, c_fn_target(fref));
+                            pe88_mark(seen, &mut work, fref);
                         }
                         Inst::Print(_, pty) => {
-                            pe88_mark(seen, & mut work, pe_ir_print_formatter(pty));
+                            pe88_mark(seen, &mut work, pe_ir_print_formatter(pty));
                             var pi: i64 = 0;
                             while pi < prints.len() {
-                                pe88_mark(seen, & mut work, pe_ir_resolve_callee(module, prints.get(pi)));
+                                pe88_mark(seen, &mut work, pe_ir_resolve_callee(module, prints.get(pi)));
                                 pi = pi + 1;
                             }
                         }
                         Inst::DynCall(_, method, _, _, _) => {
-                            pe88_mark_dyn(module, seen, dyn_done, & mut work, method);
+                            pe88_mark_dyn(module, seen, dyn_done, &mut work, method);
                         }
                         Inst::GradBegin(_) => {
-                            pe88_mark(seen, & mut work, pe_ir_resolve_callee(module, pe_ir_autograd_builtin(inst)));
+                            pe88_mark(seen, &mut work, pe_ir_resolve_callee(module, pe_ir_autograd_builtin(inst)));
                         }
                         Inst::GradEnd => {
-                            pe88_mark(seen, & mut work, pe_ir_resolve_callee(module, pe_ir_autograd_builtin(inst)));
+                            pe88_mark(seen, &mut work, pe_ir_resolve_callee(module, pe_ir_autograd_builtin(inst)));
                         }
                         Inst::Backward(_) => {
-                            pe88_mark(seen, & mut work, pe_ir_resolve_callee(module, pe_ir_autograd_builtin(inst)));
+                            pe88_mark(seen, &mut work, pe_ir_resolve_callee(module, pe_ir_autograd_builtin(inst)));
                         }
                         _ => {
                         }
@@ -6415,7 +6462,7 @@ fn pe88_reached(module: & IrModule) -> i64 {
 /// PE88: drop the functions of `module` no code of a pe_ir build can call
 /// (pe88_reached); returns how many went. A program without `main` keeps
 /// everything (pe_ir rejects it anyway).
-fn pe88_prune(module: & mut IrModule) -> i64 {
+fn pe88_prune(module: &mut IrModule) -> i64 {
     if IrModule_fn_pos(module, "main") < 0 {
         return 0;
     }
@@ -6445,7 +6492,7 @@ fn pe88_prune(module: & mut IrModule) -> i64 {
     return removed;
 }
 
-fn nat_verified(m: & IrModule, stage: str) -> bool {
+fn nat_verified(m: &IrModule, stage: str) -> bool {
     var errs: Vec<str> = ir_verify(m, stage);
     var i: i64 = 0;
     while i < errs.len() {
@@ -6462,7 +6509,7 @@ fn nat_verified(m: & IrModule, stage: str) -> bool {
 // it, found through the executable's own symbol table (DB2, DB10).
 
 /// Print function `name` of `m` under a heading naming the stage.
-fn explain_stage(m: & IrModule, name: str, stage: str) {
+fn explain_stage(m: &IrModule, name: str, stage: str) {
     print("=== " + name + ": IR " + stage + " ===\n");
     var text: str = IrModule_function_detail_str(m, name);
     if str_len(text) > 0 {
@@ -6528,7 +6575,8 @@ fn hex2(v: i64) -> str {
 
 /// The little-endian integer of `size` bytes at `off` of an image, 0 when
 /// it is out of range.
-@wrapping fn elf_u(b: & Vec<i64>, off: i64, size: i64) -> i64 {
+@wrapping
+fn elf_u(b: &Vec<i64>, off: i64, size: i64) -> i64 {
     if off < 0 || off + size > b.len() {
         return 0;
     }
@@ -6542,7 +6590,7 @@ fn hex2(v: i64) -> str {
 }
 
 /// The NUL-ended name at `off` of an image is `name`.
-fn elf_name_is(b: & Vec<i64>, off: i64, name: str) -> bool {
+fn elf_name_is(b: &Vec<i64>, off: i64, name: str) -> bool {
     var len: i64 = str_len(name);
     if off < 0 || off + len >= b.len() {
         return false;
@@ -6560,7 +6608,7 @@ fn elf_name_is(b: & Vec<i64>, off: i64, name: str) -> bool {
 /// The bytes of function `name` in an ELF64 executable, from its `.symtab`
 /// (address and size of the symbol, through the header of the section it
 /// is in). Empty when there is no such symbol.
-fn elf_symbol_bytes(b: & Vec<i64>, name: str) -> Vec<i64> {
+fn elf_symbol_bytes(b: &Vec<i64>, name: str) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     if b.len() < 64 || b.get(0) != 0x7F || b.get(1) != 0x45 || b.get(2) != 0x4C || b.get(3) != 0x46 {
         return out;
@@ -6610,7 +6658,7 @@ fn elf_symbol_bytes(b: & Vec<i64>, name: str) -> Vec<i64> {
 
 /// The big-endian 32-bit word at `off` of an image (a universal Mach-O's
 /// header), 0 when it is out of range.
-fn macho_be32(b: & Vec<i64>, off: i64) -> i64 {
+fn macho_be32(b: &Vec<i64>, off: i64) -> i64 {
     if off < 0 || off + 4 > b.len() {
         return 0;
     }
@@ -6618,7 +6666,7 @@ fn macho_be32(b: & Vec<i64>, off: i64) -> i64 {
 }
 
 /// The NUL-ended name at `off` of an image (at most 512 bytes).
-fn macho_cstr(b: & Vec<i64>, off: i64) -> str {
+fn macho_cstr(b: &Vec<i64>, off: i64) -> str {
     var out: str = "";
     var i: i64 = off;
     while i >= 0 && i < b.len() && (b.get(i) & 255) != 0 && i - off < 512 {
@@ -6656,13 +6704,13 @@ fn macho_disasm(bytes: Vec<i64>, name: str) -> str {
     var b: Vec<i64> = bytes;
     var at: i64 = 0;
     // a universal binary (FAT_MAGIC, big-endian): fat_arch[0].offset
-    if macho_be32(& b, 0) == 0xCAFEBABE && macho_be32(& b, 4) > 0 {
-        at = macho_be32(& b, 16);
+    if macho_be32(&b, 0) == 0xCAFEBABE && macho_be32(&b, 4) > 0 {
+        at = macho_be32(&b, 16);
     }
-    if b.len() < at + 32 || elf_u(& b, at, 4) != 0xFEEDFACF {
+    if b.len() < at + 32 || elf_u(&b, at, 4) != 0xFEEDFACF {
         return "";
     }
-    var cputype: i64 = elf_u(& b, at + 4, 4);
+    var cputype: i64 = elf_u(&b, at + 4, 4);
     var arch: i64 = 0;
     if cputype == 0x01000007 {
         arch = disasm_arch_of("x86_64");
@@ -6674,7 +6722,7 @@ fn macho_disasm(bytes: Vec<i64>, name: str) -> str {
     }
     // the sections of every LC_SEGMENT_64 (n_sect counts them from 1, in
     // order) and LC_SYMTAB
-    var ncmds: i64 = elf_u(& b, at + 16, 4);
+    var ncmds: i64 = elf_u(&b, at + 16, 4);
     var sect_addr: Vec<i64> = Vec::new();
     var sect_size: Vec<i64> = Vec::new();
     var sect_off: Vec<i64> = Vec::new();
@@ -6684,25 +6732,25 @@ fn macho_disasm(bytes: Vec<i64>, name: str) -> str {
     var lc: i64 = at + 32;
     var ci: i64 = 0;
     while ci < ncmds && lc + 8 <= b.len() {
-        var cmd: i64 = elf_u(& b, lc, 4);
-        var cmdsize: i64 = elf_u(& b, lc + 4, 4);
+        var cmd: i64 = elf_u(&b, lc, 4);
+        var cmdsize: i64 = elf_u(&b, lc + 4, 4);
         if cmdsize < 8 {
             break;
         }
         if cmd == 0x19 {
-            var nsects: i64 = elf_u(& b, lc + 64, 4);
+            var nsects: i64 = elf_u(&b, lc + 64, 4);
             var si: i64 = 0;
             while si < nsects {
                 var sh: i64 = lc + 72 + si * 80;
-                sect_addr.push(elf_u(& b, sh + 32, 8));
-                sect_size.push(elf_u(& b, sh + 40, 8));
-                sect_off.push(elf_u(& b, sh + 48, 4));
+                sect_addr.push(elf_u(&b, sh + 32, 8));
+                sect_size.push(elf_u(&b, sh + 40, 8));
+                sect_off.push(elf_u(&b, sh + 48, 4));
                 si = si + 1;
             }
         } else if cmd == 0x2 {
-            symoff = elf_u(& b, lc + 8, 4);
-            nsyms = elf_u(& b, lc + 12, 4);
-            stroff = elf_u(& b, lc + 16, 4);
+            symoff = elf_u(&b, lc + 8, 4);
+            nsyms = elf_u(&b, lc + 12, 4);
+            stroff = elf_u(&b, lc + 16, 4);
         }
         lc = lc + cmdsize;
         ci = ci + 1;
@@ -6716,16 +6764,16 @@ fn macho_disasm(bytes: Vec<i64>, name: str) -> str {
     var k: i64 = 0;
     while k < nsyms {
         var ent: i64 = at + symoff + k * 16;
-        var ntype: i64 = elf_u(& b, ent + 4, 1);
-        var nsect: i64 = elf_u(& b, ent + 5, 1);
+        var ntype: i64 = elf_u(&b, ent + 4, 1);
+        var nsect: i64 = elf_u(&b, ent + 5, 1);
         // N_SECT (type bits 0x0E), not a debugging (stab) record
         if (ntype & 0xE0) == 0 && (ntype & 0x0E) == 0x0E && nsect >= 1 && nsect <= sect_addr.len() {
-            var nm: str = macho_cstr(& b, at + stroff + elf_u(& b, ent, 4));
+            var nm: str = macho_cstr(&b, at + stroff + elf_u(&b, ent, 4));
             if str_starts_with(nm, "_") {
                 nm = str_slice(nm, 1, str_len(nm));
             }
             names.push(nm);
-            values.push(elf_u(& b, ent + 8, 8));
+            values.push(elf_u(&b, ent + 8, 8));
             sects.push(nsect);
         }
         k = k + 1;
@@ -6747,7 +6795,7 @@ fn macho_disasm(bytes: Vec<i64>, name: str) -> str {
             }
             var file_off: i64 = at + sect_off.get(s) + (value - sect_addr.get(s));
             if fend > value && file_off >= 0 {
-                out = out + "\n" + macho_hex(value) + " <" + names.get(i) + ">:\n" + disasm_bytes(& b, file_off, file_off + (fend - value), arch, value);
+                out = out + "\n" + macho_hex(value) + " <" + names.get(i) + ">:\n" + disasm_bytes(&b, file_off, file_off + (fend - value), arch, value);
                 found = found + 1;
             }
         }
@@ -6794,7 +6842,7 @@ fn explain_machine_code(bytes: Vec<i64>, name: str, not_elf: bool) {
         return;
     }
     var img: Vec<i64> = bytes;
-    var code: Vec<i64> = elf_symbol_bytes(& img, name);
+    var code: Vec<i64> = elf_symbol_bytes(&img, name);
     if code.len() == 0 {
         print("  (no symbol " + name + ": not reached from main, folded into an identical function, or FID_NAT_OFF=debug)\n");
         return;
@@ -7218,7 +7266,7 @@ fn entry_rename_main(source: str) -> str {
 /// The source of `fn main()` that runs one request through `handler`
 /// (`f`, as parsed), or "" with the reason in `why` when `f` cannot be an
 /// entry point.
-fn entry_main_text(f: Func, why: & mut Vec<str>) -> str {
+fn entry_main_text(f: Func, why: &mut Vec<str>) -> str {
     var takes_req: bool = false;
     if f.params.len() == 1 {
         var pt: str = type_to_str(f.params.get(0).ty);
@@ -7285,7 +7333,7 @@ fn entry_wrap_source(source: str, input: str, handler: str) -> ResultStr {
                 }
                 if f.name == handler && !found {
                     found = true;
-                    main_text = entry_main_text(f, & mut why);
+                    main_text = entry_main_text(f, &mut why);
                     var ai: i64 = 0;
                     while ai < f.annotations.len() {
                         var an: str = f.annotations.get(ai).name;
@@ -7922,7 +7970,7 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
                         pdb_setup(nat_out);
                         // DB1: the input file's methods too (imports were
                         // recorded by the import loops)
-                        ir_note_program_files(& nl_prog, input);
+                        ir_note_program_files(&nl_prog, input);
                     }
                     ParseResultProgram::Err(_) => {
                     }
@@ -7935,12 +7983,12 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
                 g_lower_keep = 0;
                 t_run = time_mark("lower", t_run);
                 if str_len(explain_fn) > 0 {
-                    explain_stage(& nat_mod, explain_fn, "after lowering");
+                    explain_stage(&nat_mod, explain_fn, "after lowering");
                 }
                 // RL10: ir-fuzz puts its random function in place of the
                 // template's fz_target (and prints the value main prints)
                 if g_main_irfuzz {
-                    if !irfuzz_install(& mut nat_mod, g_main_irfuzz_seed) {
+                    if !irfuzz_install(&mut nat_mod, g_main_irfuzz_seed) {
                         return 1;
                     }
                 }
@@ -7954,7 +8002,7 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
                 var nat_pruned: i64 = 0;
                 if pe88_prune_on() && !obj_mode && !g_main_irfuzz && !has_flag(n, start, "--lib") {
                     crash_stage("prune (functions no code can call)");
-                    nat_pruned = pe88_prune(& mut nat_mod);
+                    nat_pruned = pe88_prune(&mut nat_mod);
                     t_run = time_mark("prune", t_run);
                 }
                 // ir-fuzz builds the random IR straight to machine code;
@@ -7965,7 +8013,7 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
                 // after each stage with FID_VERIFY=1
                 var nat_verify: bool = str_len(env_or_empty("FID_VERIFY")) > 0;
                 var nat_t0: i64 = p_clock_now_ms();
-                if nat_verify && !nat_verified(& nat_mod, "after lowering") {
+                if nat_verify && !nat_verified(&nat_mod, "after lowering") {
                     return 1;
                 }
                 var nat_rr: Vec<i64> = Vec::new();
@@ -7977,31 +8025,31 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
                 nat_eg.push(0);
                 if nat_mid {
                     crash_stage("iropt (the mid-end's passes)");
-                    iropt_native(& mut nat_mod);
+                    iropt_native(&mut nat_mod);
                     t_run = time_mark("iropt", t_run);
-                    if nat_verify && !nat_verified(& nat_mod, "after iropt") {
+                    if nat_verify && !nat_verified(&nat_mod, "after iropt") {
                         return 1;
                     }
                     if str_len(explain_fn) > 0 {
-                        explain_stage(& nat_mod, explain_fn, "after iropt");
+                        explain_stage(&nat_mod, explain_fn, "after iropt");
                     }
                     crash_stage("rules");
-                    nat_rr = rules_run(& mut nat_mod);
+                    nat_rr = rules_run(&mut nat_mod);
                     t_run = time_mark("rules", t_run);
-                    if nat_verify && !nat_verified(& nat_mod, "after rules") {
+                    if nat_verify && !nat_verified(&nat_mod, "after rules") {
                         return 1;
                     }
                     if str_len(explain_fn) > 0 {
-                        explain_stage(& nat_mod, explain_fn, "after the rules");
+                        explain_stage(&nat_mod, explain_fn, "after the rules");
                     }
                     crash_stage("e-graph");
-                    nat_eg = egraph_run(& mut nat_mod);
+                    nat_eg = egraph_run(&mut nat_mod);
                     t_run = time_mark("egraph", t_run);
-                    if nat_verify && !nat_verified(& nat_mod, "after the e-graph") {
+                    if nat_verify && !nat_verified(&nat_mod, "after the e-graph") {
                         return 1;
                     }
                     if str_len(explain_fn) > 0 {
-                        explain_stage(& nat_mod, explain_fn, "after the e-graph");
+                        explain_stage(&nat_mod, explain_fn, "after the e-graph");
                     }
                 }
                 if remarks {
@@ -8021,7 +8069,7 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
                     if nat_win {
                         ir_target = "x86_64-windows";
                     }
-                    if !ir_module_save(save_ir, & nat_mod, ir_target) {
+                    if !ir_module_save(save_ir, &nat_mod, ir_target) {
                         print("Error: could not write " + save_ir + "\n");
                         return 1;
                     }
@@ -8065,9 +8113,9 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
                     nat_mod = lower(nprogram);
                     g_lower_keep = 0;
                     if nat_mid {
-                        iropt_native(& mut nat_mod);
-                        nat_rr = rules_run(& mut nat_mod);
-                        nat_eg = egraph_run(& mut nat_mod);
+                        iropt_native(&mut nat_mod);
+                        nat_rr = rules_run(&mut nat_mod);
+                        nat_eg = egraph_run(&mut nat_mod);
                     }
                     if nat_win {
                         nat_res = nat_generate_pe(nat_mod);
@@ -8244,26 +8292,26 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
                 // Inlining and folding before machine code (release D5, D6)
                 var t_io: i64 = p_clock_now_ms();
                 var pe_verify: bool = str_len(env_or_empty("FID_VERIFY")) > 0;
-                if pe_verify && !nat_verified(& ir_mod, "after lowering") {
+                if pe_verify && !nat_verified(&ir_mod, "after lowering") {
                     return 1;
                 }
                 // PE88: what no code can call goes before the mid-end
                 var pe88_dropped: i64 = 0;
                 if pe88_prune_on() {
-                    pe88_dropped = pe88_prune(& mut ir_mod);
+                    pe88_dropped = pe88_prune(&mut ir_mod);
                     t_run = time_mark("prune", t_run);
                     t_io = p_clock_now_ms();
                 }
                 if do_opt {
                     crash_stage("iropt (the mid-end's passes)");
-                    iropt_native(& mut ir_mod);
+                    iropt_native(&mut ir_mod);
                 }
                 t_run = time_mark("iropt", t_run);
                 p_eprint_str("[prof] iropt: " + int_to_str(p_clock_now_ms() - t_io) + "ms\n");
                 if remarks {
                     print_remarks(ir_mod, "");
                 }
-                if pe_verify && !nat_verified(& ir_mod, "after iropt") {
+                if pe_verify && !nat_verified(&ir_mod, "after iropt") {
                     return 1;
                 }
                 // DB3: a debug build's image carries DWARF line tables
@@ -8274,7 +8322,7 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
                     pdb_setup(output);
                     // CT9: functions show under their names as written
                     // (Point::len, max<i64>; pe_ir_enc.fd pe_dbg_shown_for)
-                    g_pe_dbg_shown_pairs = ng_dbg_shown_pairs(& ir_mod);
+                    g_pe_dbg_shown_pairs = ng_dbg_shown_pairs(&ir_mod);
                 }
                 p_eprint_str("[build] Emitting PE via pe_ir backend...\n");
                 crash_stage("native code (pe_ir: machine code and the PE writer)");
@@ -8291,7 +8339,7 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
                     var ir_all: IrModule = lower(program);
                     g_lower_keep = 0;
                     if do_opt {
-                        iropt_native(& mut ir_all);
+                        iropt_native(&mut ir_all);
                     }
                     pe_res = pe_ir_generate_pe(ir_all);
                     t_run = time_mark("again, unpruned", t_run);
@@ -8334,7 +8382,7 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
             if is_posix_host() {
                 p_eprint_str("[build] Using C codegen (Linux)...\n");
                 var cgen: CCodeGen = CCodeGen_new();
-                var c_source: str = CCodeGen_generate(& mut cgen, ir_mod);
+                var c_source: str = CCodeGen_generate(&mut cgen, ir_mod);
                 var c_file: str = output + ".c";
                 p_file_write(c_file, c_source);
                 // Try gcc first, then clang
@@ -8736,7 +8784,7 @@ fn reduce_count(s: str, ch: i64) -> i64 {
 /// The ranges [i, j) of `lines` that can go as one statement (a line, or
 /// a whole `if`/`while`/`for`/`match`/`fn` with its block), as i, j pairs,
 /// the longest first (reduce.py units).
-fn reduce_units(lines: & Vec<str>) -> Vec<i64> {
+fn reduce_units(lines: &Vec<str>) -> Vec<i64> {
     var starts: Vec<i64> = Vec::new();
     var ends: Vec<i64> = Vec::new();
     var i: i64 = 0;
@@ -8797,7 +8845,7 @@ fn reduce_units(lines: & Vec<str>) -> Vec<i64> {
 }
 
 /// `lines` without [i, j).
-fn reduce_without(lines: & Vec<str>, i: i64, j: i64) -> Vec<str> {
+fn reduce_without(lines: &Vec<str>, i: i64, j: i64) -> Vec<str> {
     var out: Vec<str> = Vec::new();
     var k: i64 = 0;
     while k < lines.len() {
@@ -8844,13 +8892,13 @@ fn reduce_run(input: str, out_path: str, cmd: str, fails: str, match_text: str, 
     var changed: bool = true;
     while changed {
         changed = false;
-        var us: Vec<i64> = reduce_units(& lines);
+        var us: Vec<i64> = reduce_units(&lines);
         var u: i64 = 0;
         while u + 1 < us.len() && !changed {
             var i: i64 = us.get(u);
             var j: i64 = us.get(u + 1);
             if j <= lines.len() {
-                var next: Vec<str> = reduce_without(& lines, i, j);
+                var next: Vec<str> = reduce_without(&lines, i, j);
                 tries = tries + 1;
                 p_file_write(cand, str_join(next, "\n"));
                 var res: Vec<str> = reduce_outcome(cand, cmd, fails, secs);
@@ -9103,7 +9151,7 @@ fn cmd_disasm(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
         } else {
             base = str_parse_int(base_s);
         }
-        print(disasm_bytes(& bytes, 0, bytes.len(), arch, base));
+        print(disasm_bytes(&bytes, 0, bytes.len(), arch, base));
         return 0;
     }
     // DB7: a Mach-O through its LC_SYMTAB (macho_disasm), else an ELF or PE
@@ -9137,7 +9185,7 @@ fn cmd_ir_fuzz(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
 
 /// RL10: put seed `seed`'s random function in place of the template's
 /// fz_target, and print the value the program must print.
-fn irfuzz_install(m: & mut IrModule, seed: i64) -> bool {
+fn irfuzz_install(m: &mut IrModule, seed: i64) -> bool {
     match IrModule_get_function(m, "fz_target") {
         OptIrFunction::Some(old) => {
             if old.params.len() < 2 {
@@ -9189,7 +9237,7 @@ fn cmd_emit_ir(n: i64, start: i64) -> i64 {
         return 1;
     }
     var m: IrModule = ld.module;
-    var errs: Vec<str> = ir_verify(& m, "as read from " + path);
+    var errs: Vec<str> = ir_verify(&m, "as read from " + path);
     if errs.len() > 0 {
         var ei: i64 = 0;
         while ei < errs.len() && ei < 20 {
@@ -9201,11 +9249,11 @@ fn cmd_emit_ir(n: i64, start: i64) -> i64 {
     }
     if has_flag(n, start, "--mid-end") {
         crash_stage("iropt (the mid-end's passes)");
-        iropt_native(& mut m);
+        iropt_native(&mut m);
         crash_stage("rules");
-        var _rr: Vec<i64> = rules_run(& mut m);
+        var _rr: Vec<i64> = rules_run(&mut m);
         crash_stage("e-graph");
-        var _eg: Vec<i64> = egraph_run(& mut m);
+        var _eg: Vec<i64> = egraph_run(&mut m);
     }
     if has_flag(n, start, "--fast-alloc") || has_flag(n, start, "--fast") {
         g_nat_fast = true;
