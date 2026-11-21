@@ -4,7 +4,35 @@
 > session was editing it during the read: deadf became opt-in, gconst got two phases, envtrim /
 > ipcp / spec now skip functions named by a string constant). Line numbers are of that state.
 
-- **Path:** `compiler/iropt.fd` — **3,656 LOC**
+> **Nov 21:** 11,145 lines. Fixed Nov 15: SCCP folds only when the result
+> fits the operands' type, and leaves u64 above the i64 range and
+> over-wide shifts alone (known-bugs 2g.11; the first two HIGH findings
+> below); branchfacts settles a float comparison on its true edge only
+> (2g.12, NaN; the third). The pass table below is of Nov 9; since then
+> `envtrim`, `spec` and `deadf` are on by default (`iro_pass_on`), `ipcp`
+> is still opt-in, the iropt_me passes in `IME_DEFAULT_ON` are on (see
+> iropt_me.md), and new passes exist (hofspec, icf, devirt, closuredevirt,
+> fielddevirt, dynspec, licm, licmcall, rotate, tailcall, dse, guardcall,
+> quietcall, nowritecall, soleown, vecsroa, version, midreach, ...). The
+> per-function passes are memoized (CS6, `FID_IROCACHE`, ir_ser.md) and
+> checked by translation validation with `--validate` (tv.md). Callers:
+> `build_executable` is gone (MI18); `fid opt`, `emit-ir --mid-end` and
+> `:opt` in `fid repl` run `iropt_native` too. New open: `fid emit
+> compiler/main.fd` panics with an overflow in `iro_sccp` (2g.89), the memo
+> reports mismatches on most hits (2g.93), `FID_VERIFY=1` rejects two suite
+> programs after iropt (2g.109).
+>
+> **Nov 21, uncommitted — 2g.89 and 2g.109 fixed.** `iro_sccp`'s BitNot
+> fold was `0 - av - 1`, which overflows on `av = i64::MIN` (`~(1 << 63)`);
+> it is `av ^ (0 - 1)` now (:4486-4489). The `fid emit compiler/main.fd`
+> overflow is gone. 2g.109's two causes were fixed where they lived: the
+> select-statement slots a dominated block found by name move to the entry
+> block (lower.fd `Lowerer_txn_raw_slot`), and `ime_remap` covers
+> `PersistLoad`/`PersistSave`/`Backward` with `ime_unrenamed_uses` keeping
+> the values remap cannot rename (iropt_me.fd). Still open: the memo
+> mismatches (2g.93). Line numbers below are from Nov 9.
+
+- **Path:** `compiler/iropt.fd` — **3,656 LOC** on Nov 9 (11,145 on Nov 21)
 - **Role:** the IR optimizer that runs on `IrModule` before the own native backends (pe_ir and
   nat_ir). Pass manager `iropt_native` (:42), shared CFG facts (`IroCfg`, `iro_cfg` :985,
   `iro_dominates` :1105), use lists (`IroUses`, `iro_uses` :1580), per-function and whole-program

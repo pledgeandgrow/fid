@@ -20,7 +20,7 @@ pub fn env_get(name: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 19*
+*Defined at line 23*
 
 ---
 
@@ -38,7 +38,7 @@ pub fn env_exists(name: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 28*
+*Defined at line 52*
 
 ---
 

@@ -44,7 +44,7 @@ pub struct EntityTemplate {
 | `height` | `i64,       // collision box height (pixels)` |
 | `flags` | `i64,        // bitmask: bit 0 = solid, bit 1 = hostile, bit 2 = static` |
 
-*Defined at line 21*
+*Defined at line 20*
 
 ---
 
@@ -68,7 +68,7 @@ pub struct Entity {
 | `active` | `bool,      // is this entity alive/active?` |
 | `tag` | `i64,          // user-defined tag (for grouping/filtering)` |
 
-*Defined at line 31*
+*Defined at line 34*
 
 ---
 
@@ -87,7 +87,7 @@ pub struct SceneManager {
 | `next_id` | `i64,      // next entity ID to assign` |
 | `next_tag` | `i64,     // next tag to assign` |
 
-*Defined at line 45*
+*Defined at line 56*
 
 ---
 
@@ -101,7 +101,7 @@ pub fn scene_manager_create() -> SceneManager {
 
 **Returns:** `SceneManager`
 
-*Defined at line 55*
+*Defined at line 78*
 
 ---
 
@@ -123,7 +123,7 @@ pub fn scene_register_template(sm: &mut SceneManager, name: str, max_health: i64
 
 **Returns:** `i64`
 
-*Defined at line 67*
+*Defined at line 87*
 
 ---
 
@@ -146,7 +146,7 @@ pub fn scene_register_template_flags(sm: &mut SceneManager, name: str, max_healt
 
 **Returns:** `i64`
 
-*Defined at line 80*
+*Defined at line 96*
 
 ---
 
@@ -165,7 +165,7 @@ pub fn scene_get_template(sm: SceneManager, template_id: i64) -> EntityTemplate 
 
 **Returns:** `EntityTemplate`
 
-*Defined at line 93*
+*Defined at line 105*
 
 ---
 
@@ -184,7 +184,7 @@ pub fn scene_find_template(sm: SceneManager, name: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 107*
+*Defined at line 115*
 
 ---
 
@@ -205,7 +205,7 @@ pub fn scene_spawn(sm: &mut SceneManager, template_id: i64, x: f64, y: f64) -> i
 
 **Returns:** `i64`
 
-*Defined at line 122*
+*Defined at line 130*
 
 ---
 
@@ -245,7 +245,7 @@ pub fn scene_despawn(sm: &mut SceneManager, entity_id: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 154*
+*Defined at line 156*
 
 ---
 
@@ -264,7 +264,7 @@ pub fn scene_get_entity(sm: SceneManager, entity_id: i64) -> Entity {
 
 **Returns:** `Entity`
 
-*Defined at line 172*
+*Defined at line 174*
 
 ---
 
@@ -283,7 +283,7 @@ pub fn scene_find_entity(sm: SceneManager, entity_id: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 195*
+*Defined at line 189*
 
 ---
 
@@ -301,7 +301,7 @@ pub fn scene_entity_count(sm: SceneManager) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 208*
+*Defined at line 202*
 
 ---
 
@@ -320,7 +320,7 @@ pub fn scene_count_by_template(sm: SceneManager, template_id: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 222*
+*Defined at line 216*
 
 ---
 
@@ -339,7 +339,7 @@ pub fn scene_count_by_tag(sm: SceneManager, tag: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 236*
+*Defined at line 230*
 
 ---
 
@@ -359,7 +359,7 @@ pub fn scene_update_entity(sm: &mut SceneManager, entity_id: i64, dt: f64) -> vo
 
 **Returns:** `void`
 
-*Defined at line 252*
+*Defined at line 246*
 
 ---
 
@@ -380,7 +380,7 @@ pub fn scene_set_velocity(sm: &mut SceneManager, entity_id: i64, vx: f64, vy: f6
 
 **Returns:** `void`
 
-*Defined at line 260*
+*Defined at line 258*
 
 ---
 
@@ -400,7 +400,7 @@ pub fn scene_damage(sm: &mut SceneManager, entity_id: i64, amount: i64) -> bool 
 
 **Returns:** `bool`
 
-*Defined at line 267*
+*Defined at line 270*
 
 ---
 
@@ -420,7 +420,7 @@ pub fn scene_set_tag(sm: &mut SceneManager, entity_id: i64, tag: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 275*
+*Defined at line 291*
 
 ---
 
@@ -441,7 +441,7 @@ pub fn scene_query_radius(sm: SceneManager, x: f64, y: f64, radius: f64) -> Vec<
 
 **Returns:** `Vec<i64>`
 
-*Defined at line 284*
+*Defined at line 304*
 
 ---
 
@@ -463,7 +463,7 @@ pub fn scene_query_box(sm: SceneManager, x0: f64, y0: f64, x1: f64, y1: f64) -> 
 
 **Returns:** `Vec<i64>`
 
-*Defined at line 303*
+*Defined at line 323*
 
 ---
 
@@ -483,7 +483,7 @@ pub fn scene_nearest(sm: SceneManager, x: f64, y: f64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 317*
+*Defined at line 337*
 
 ---
 
@@ -501,7 +501,7 @@ pub fn scene_clear(sm: &mut SceneManager) -> void {
 
 **Returns:** `void`
 
-*Defined at line 340*
+*Defined at line 360*
 
 ---
 
@@ -519,7 +519,7 @@ pub fn scene_clear_all(sm: &mut SceneManager) -> void {
 
 **Returns:** `void`
 
-*Defined at line 345*
+*Defined at line 365*
 
 ---
 

@@ -7,9 +7,9 @@ moves up a tier only when the tests that tier names pass on it.
 
 CI runs the whole suite, and a failure blocks the change.
 
-Status (Nov 6, 2026): the repository has no CI workflow at the moment (the
-`.github/workflows/` files were removed in commit 9f2ba40), so no platform
-meets this definition today. The last full suite run is Nov 2 on Windows
+Status (Nov 6, 2026; history, see Nov 17–19 below): the repository had no
+CI workflow then (the `.github/workflows/` files were removed in commit
+9f2ba40), so no platform met this definition. The last full suite run is Nov 2 on Windows
 (Rust harness, `fidesc` as compiler: interp 339/339, C 343/343, PE 345/345,
 expected-fail 89/89); Linux CI last ran green in session 37. The Nov 4–6
 changes were checked with `fid run`, `fid ccompile` and `fid emit` on their
@@ -62,7 +62,7 @@ docs/reference/cross-compilation.md.
 | WebAssembly native | `fid wasm` | Nov 15: valid modules over WASI preview 1, no C compiler (compiler/wasm.fd, stdlib/linux_runtime/wasi.fd); 316 of 344 suite tests match `fid run` (scripts/wasm-test.sh `ALL=1`, Nov 15). Nov 18: tasks switch stacks (asyncify-style, compiler/wasm.fd "Tasks"; threads still run to their end), structured control flow (TG16), an index into a fixed-size array checked as the interpreter does; processes are a clear panic `not available in WebAssembly: processes (...)`, C functions without a WebAssembly version panic when called, bare-metal builtins do nothing (release F9) |
 | macOS native | `fid emit --target x86_64-macos\|aarch64-macos` (machine layer) | Mach-O executables (PIE, dyld binds into a GOT, ad-hoc code signature, a symbol table; compiler/nat_enc.fd `nat_macho`, runtime stdlib/linux_runtime/darwin.fd) build from any host and pass scripts/macho-check.py; not run on a Mac yet (release F7) |
 | Bare metal | `emit --bare`, `--boot` | `fid emit --bare` writes Multiboot flat binaries; bare-metal.yml boots every tests/bootstrap/test_bare_*.fd under `qemu-system-x86_64 -kernel` and compares COM1 output and the exit code (green again Nov 20, after the stage-0 bootstrap fix); the fides-os job tracks that kernel's own build (pledgeandgrow/fid-os issue 1) |
-| Old PIR backends | `build --native` (default target), `build-x86`, `codegen --target x86-64\|arm64\|riscv`, `codegen --elf\|--coff\|--macho`, `emit --boot` | Nov 9: `build --native` panics in the PIR optimizer, `build-x86` writes an exe that segfaults, `emit --boot` panics; `codegen` prints assembly (ARM64/RISC-V assembly is wrong: `return` for `ret`); COFF objects are valid, Mach-O headers correct but never linked, x86-64 ELF objects have malformed section headers (known-bugs 2g.16) |
+| Old PIR backends | `build-x86` | Removed from every other command on Nov 17 (llvm MI18): `build --native` and `codegen` (also `--elf\|--coff\|--macho` objects) run the machine layer, `emit --boot` builds pe_ir's bootable image, `fid pir` names the replacements. Nov 9: `build-x86` wrote an exe that segfaulted; the ELF object writer was fixed by TG13, the exe is untested since (known-bugs 2g.16) |
 | Android, iOS | none | not started (PL6) |
 
 ## What decides a platform's tier

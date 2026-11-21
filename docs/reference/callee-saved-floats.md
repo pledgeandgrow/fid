@@ -105,3 +105,9 @@ also goes into the salt. Once `nat_ctx_swap` saves d8..d15 / fs0..fs11 too,
 To be filled in from `bash tests/nattools/ra18_float_bench.sh release/fid.exe 5`
 on a quiet machine (the numbers of the Nov 9 first step, xmm cache only:
 the float loop 1834 -> 1364 ms).
+
+Nov 21 (roadmap RA18 check, fid built from a self-hosted stage 0, not a
+quiet machine): float ranges a call crosses take callee-saved float
+registers on AArch64 (31 ranges) and RISC-V (40); the fcallee tests pass
+and the mutation is caught. ra18_float_bench: AArch64 0.89 of the time with
+spilling, RISC-V 1.07 (slower, under qemu).

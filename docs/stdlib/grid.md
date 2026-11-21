@@ -61,7 +61,7 @@
 pub const LN_XCBR: i64 = 0;  // Circuit Breaker
 ```
 
-*Defined at line 27*
+*Defined at line 24*
 
 ---
 
@@ -71,7 +71,7 @@ pub const LN_XCBR: i64 = 0;  // Circuit Breaker
 pub const LN_XSWI: i64 = 1;  // Switch / Disconnector
 ```
 
-*Defined at line 28*
+*Defined at line 25*
 
 ---
 
@@ -81,7 +81,7 @@ pub const LN_XSWI: i64 = 1;  // Switch / Disconnector
 pub const LN_MMXU: i64 = 2;  // Measurement (voltage, current, power)
 ```
 
-*Defined at line 29*
+*Defined at line 26*
 
 ---
 
@@ -91,7 +91,7 @@ pub const LN_MMXU: i64 = 2;  // Measurement (voltage, current, power)
 pub const LN_PTUV: i64 = 3;  // Voltage Time Protection
 ```
 
-*Defined at line 30*
+*Defined at line 27*
 
 ---
 
@@ -101,7 +101,7 @@ pub const LN_PTUV: i64 = 3;  // Voltage Time Protection
 pub const LN_PTOC: i64 = 4;  // Overcurrent Protection
 ```
 
-*Defined at line 31*
+*Defined at line 28*
 
 ---
 
@@ -111,7 +111,7 @@ pub const LN_PTOC: i64 = 4;  // Overcurrent Protection
 pub const LN_PDIS: i64 = 5;  // Distance Protection
 ```
 
-*Defined at line 32*
+*Defined at line 29*
 
 ---
 
@@ -121,7 +121,7 @@ pub const LN_PDIS: i64 = 5;  // Distance Protection
 pub const LN_RREC: i64 = 6;  // Disturbance Recorder
 ```
 
-*Defined at line 33*
+*Defined at line 30*
 
 ---
 
@@ -131,7 +131,7 @@ pub const LN_RREC: i64 = 6;  // Disturbance Recorder
 pub const LN_RBRF: i64 = 7;  // Breaker Failure
 ```
 
-*Defined at line 34*
+*Defined at line 31*
 
 ---
 
@@ -141,7 +141,7 @@ pub const LN_RBRF: i64 = 7;  // Breaker Failure
 pub const LN_CSWI: i64 = 8;  // Control Switch
 ```
 
-*Defined at line 35*
+*Defined at line 32*
 
 ---
 
@@ -151,7 +151,7 @@ pub const LN_CSWI: i64 = 8;  // Control Switch
 pub const LN_CILO: i64 = 9;  // Interlocking
 ```
 
-*Defined at line 36*
+*Defined at line 33*
 
 ---
 
@@ -161,7 +161,7 @@ pub const LN_CILO: i64 = 9;  // Interlocking
 pub const LN_CSWI2: i64 = 10; // Control Switch (alternate)
 ```
 
-*Defined at line 37*
+*Defined at line 34*
 
 ---
 
@@ -179,7 +179,7 @@ pub fn iec61850_ln_name(ln_type: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 40*
+*Defined at line 37*
 
 ---
 
@@ -189,7 +189,7 @@ pub fn iec61850_ln_name(ln_type: i64) -> str {
 pub const CDC_SPS: i64  = 0;  // Single Point Status
 ```
 
-*Defined at line 56*
+*Defined at line 76*
 
 ---
 
@@ -199,7 +199,7 @@ pub const CDC_SPS: i64  = 0;  // Single Point Status
 pub const CDC_DPS: i64  = 1;  // Double Point Status
 ```
 
-*Defined at line 57*
+*Defined at line 77*
 
 ---
 
@@ -209,7 +209,7 @@ pub const CDC_DPS: i64  = 1;  // Double Point Status
 pub const CDC_MV: i64   = 2;  // Measured Value
 ```
 
-*Defined at line 58*
+*Defined at line 78*
 
 ---
 
@@ -219,7 +219,7 @@ pub const CDC_MV: i64   = 2;  // Measured Value
 pub const CDC_ASG: i64  = 3;  // Analog Setting
 ```
 
-*Defined at line 59*
+*Defined at line 79*
 
 ---
 
@@ -229,7 +229,7 @@ pub const CDC_ASG: i64  = 3;  // Analog Setting
 pub const CDC_ING: i64  = 4;  // Integer Setting
 ```
 
-*Defined at line 60*
+*Defined at line 80*
 
 ---
 
@@ -239,7 +239,7 @@ pub const CDC_ING: i64  = 4;  // Integer Setting
 pub const CDC_ENG: i64  = 5;  // Enumerated Setting
 ```
 
-*Defined at line 61*
+*Defined at line 81*
 
 ---
 
@@ -249,7 +249,7 @@ pub const CDC_ENG: i64  = 5;  // Enumerated Setting
 pub const CDC_SPC: i64  = 6;  // Single Point Controllable
 ```
 
-*Defined at line 62*
+*Defined at line 82*
 
 ---
 
@@ -259,7 +259,7 @@ pub const CDC_SPC: i64  = 6;  // Single Point Controllable
 pub const CDC_DPC: i64  = 7;  // Double Point Controllable
 ```
 
-*Defined at line 63*
+*Defined at line 83*
 
 ---
 
@@ -269,7 +269,7 @@ pub const CDC_DPC: i64  = 7;  // Double Point Controllable
 pub const CDC_INC: i64  = 8;  // Integer Controllable
 ```
 
-*Defined at line 64*
+*Defined at line 84*
 
 ---
 
@@ -287,7 +287,7 @@ pub fn iec61850_cdc_name(cdc: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 67*
+*Defined at line 87*
 
 ---
 
@@ -311,7 +311,7 @@ pub struct XCBR {
 | `op_cnt` | `i64,         // operation counter` |
 | `rated_current` | `i64,  // amperes` |
 
-*Defined at line 85*
+*Defined at line 123*
 
 ---
 
@@ -330,7 +330,7 @@ pub fn iec61850_xcbr_new(name: str, rated_current: i64) -> XCBR {
 
 **Returns:** `XCBR`
 
-*Defined at line 96*
+*Defined at line 149*
 
 ---
 
@@ -339,17 +339,17 @@ pub fn iec61850_xcbr_new(name: str, rated_current: i64) -> XCBR {
 Set breaker position (0=open, 1=closed).
 
 ```fides
-pub fn iec61850_xcbr_set_pos(breaker: XCBR, pos: i64) -> void {
+pub fn iec61850_xcbr_set_pos(breaker: &mut XCBR, pos: i64) -> void {
 ```
 
 **Parameters:**
 
-- `breaker`: `XCBR`
+- `breaker`: `&mut XCBR`
 - `pos`: `i64`
 
 **Returns:** `void`
 
-*Defined at line 109*
+*Defined at line 158*
 
 ---
 
@@ -367,7 +367,7 @@ pub fn iec61850_xcbr_pos_name(breaker: XCBR) -> str {
 
 **Returns:** `str`
 
-*Defined at line 119*
+*Defined at line 169*
 
 ---
 
@@ -385,7 +385,7 @@ pub fn iec61850_xcbr_is_closed(breaker: XCBR) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 126*
+*Defined at line 180*
 
 ---
 
@@ -403,7 +403,7 @@ pub fn iec61850_xcbr_is_open(breaker: XCBR) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 131*
+*Defined at line 185*
 
 ---
 
@@ -412,17 +412,17 @@ pub fn iec61850_xcbr_is_open(breaker: XCBR) -> bool {
 Set breaker health.
 
 ```fides
-pub fn iec61850_xcbr_set_health(breaker: XCBR, health: i64) -> void {
+pub fn iec61850_xcbr_set_health(breaker: &mut XCBR, health: i64) -> void {
 ```
 
 **Parameters:**
 
-- `breaker`: `XCBR`
+- `breaker`: `&mut XCBR`
 - `health`: `i64`
 
 **Returns:** `void`
 
-*Defined at line 136*
+*Defined at line 190*
 
 ---
 
@@ -440,7 +440,7 @@ pub fn iec61850_xcbr_health_name(breaker: XCBR) -> str {
 
 **Returns:** `str`
 
-*Defined at line 144*
+*Defined at line 198*
 
 ---
 
@@ -469,7 +469,7 @@ pub struct MMXU {
 | `power_factor` | `f64,   // 0.0-1.0` |
 | `frequency` | `f64,      // Hz` |
 
-*Defined at line 155*
+*Defined at line 213*
 
 ---
 
@@ -487,7 +487,7 @@ pub fn iec61850_mmxu_new(name: str) -> MMXU {
 
 **Returns:** `MMXU`
 
-*Defined at line 171*
+*Defined at line 238*
 
 ---
 
@@ -496,19 +496,19 @@ pub fn iec61850_mmxu_new(name: str) -> MMXU {
 Set three-phase voltage measurements.
 
 ```fides
-pub fn iec61850_mmxu_set_voltage(mmxu: MMXU, va: f64, vb: f64, vc: f64) -> void {
+pub fn iec61850_mmxu_set_voltage(mmxu: &mut MMXU, va: f64, vb: f64, vc: f64) -> void {
 ```
 
 **Parameters:**
 
-- `mmxu`: `MMXU`
+- `mmxu`: `&mut MMXU`
 - `va`: `f64`
 - `vb`: `f64`
 - `vc`: `f64`
 
 **Returns:** `void`
 
-*Defined at line 189*
+*Defined at line 245*
 
 ---
 
@@ -517,19 +517,19 @@ pub fn iec61850_mmxu_set_voltage(mmxu: MMXU, va: f64, vb: f64, vc: f64) -> void 
 Set three-phase current measurements.
 
 ```fides
-pub fn iec61850_mmxu_set_current(mmxu: MMXU, ia: f64, ib: f64, ic: f64) -> void {
+pub fn iec61850_mmxu_set_current(mmxu: &mut MMXU, ia: f64, ib: f64, ic: f64) -> void {
 ```
 
 **Parameters:**
 
-- `mmxu`: `MMXU`
+- `mmxu`: `&mut MMXU`
 - `ia`: `f64`
 - `ib`: `f64`
 - `ic`: `f64`
 
 **Returns:** `void`
 
-*Defined at line 196*
+*Defined at line 252*
 
 ---
 
@@ -538,19 +538,19 @@ pub fn iec61850_mmxu_set_current(mmxu: MMXU, ia: f64, ib: f64, ic: f64) -> void 
 Set power measurements.
 
 ```fides
-pub fn iec61850_mmxu_set_power(mmxu: MMXU, active: f64, reactive: f64, pf: f64) -> void {
+pub fn iec61850_mmxu_set_power(mmxu: &mut MMXU, active: f64, reactive: f64, pf: f64) -> void {
 ```
 
 **Parameters:**
 
-- `mmxu`: `MMXU`
+- `mmxu`: `&mut MMXU`
 - `active`: `f64`
 - `reactive`: `f64`
 - `pf`: `f64`
 
 **Returns:** `void`
 
-*Defined at line 203*
+*Defined at line 259*
 
 ---
 
@@ -568,7 +568,7 @@ pub fn iec61850_mmxu_apparent_power(mmxu: MMXU) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 210*
+*Defined at line 266*
 
 ---
 
@@ -586,7 +586,7 @@ pub fn iec61850_mmxu_total_power(mmxu: MMXU) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 216*
+*Defined at line 271*
 
 ---
 
@@ -603,13 +603,13 @@ pub struct GOOSEMessage {
 | Name | Type |
 |------|------|
 | `app_id` | `i64` |
-| `goose_ref` | `str,       // dataset reference` |
-| `seq_num` | `i64,         // sequence number` |
-| `time` | `i64,            // time of last change` |
-| `st_num` | `i64,          // state number` |
-| `data` | `Vec,            // dataset values` |
+| `goose_ref` | `str` |
+| `seq_num` | `i64` |
+| `time` | `i64` |
+| `st_num` | `i64` |
+| `data` | `Vec<i64>` |
 
-*Defined at line 229*
+*Defined at line 282*
 
 ---
 
@@ -628,7 +628,7 @@ pub fn iec61850_goose_new(app_id: i64, ref: str) -> GOOSEMessage {
 
 **Returns:** `GOOSEMessage`
 
-*Defined at line 239*
+*Defined at line 296*
 
 ---
 
@@ -637,17 +637,17 @@ pub fn iec61850_goose_new(app_id: i64, ref: str) -> GOOSEMessage {
 Add a data value to the GOOSE message.
 
 ```fides
-pub fn iec61850_goose_add_data(msg: GOOSEMessage, value: i64) -> void {
+pub fn iec61850_goose_add_data(msg: &mut GOOSEMessage, value: i64) -> void {
 ```
 
 **Parameters:**
 
-- `msg`: `GOOSEMessage`
+- `msg`: `&mut GOOSEMessage`
 - `value`: `i64`
 
 **Returns:** `void`
 
-*Defined at line 251*
+*Defined at line 303*
 
 ---
 
@@ -656,18 +656,18 @@ pub fn iec61850_goose_add_data(msg: GOOSEMessage, value: i64) -> void {
 Update a data value in the GOOSE message (increments seq_num).
 
 ```fides
-pub fn iec61850_goose_update_data(msg: GOOSEMessage, index: i64, value: i64) -> void {
+pub fn iec61850_goose_update_data(msg: &mut GOOSEMessage, index: i64, value: i64) -> void {
 ```
 
 **Parameters:**
 
-- `msg`: `GOOSEMessage`
+- `msg`: `&mut GOOSEMessage`
 - `index`: `i64`
 - `value`: `i64`
 
 **Returns:** `void`
 
-*Defined at line 258*
+*Defined at line 310*
 
 ---
 
@@ -686,7 +686,7 @@ pub fn iec61850_goose_get_data(msg: GOOSEMessage, index: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 267*
+*Defined at line 319*
 
 ---
 
@@ -704,7 +704,7 @@ pub fn iec61850_goose_data_count(msg: GOOSEMessage) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 275*
+*Defined at line 327*
 
 ---
 
@@ -713,16 +713,16 @@ pub fn iec61850_goose_data_count(msg: GOOSEMessage) -> i64 {
 Serialize GOOSE message to a Vec of bytes (simplified format).
 
 ```fides
-pub fn iec61850_goose_serialize(msg: GOOSEMessage) -> Vec {
+pub fn iec61850_goose_serialize(msg: GOOSEMessage) -> Vec<i64> {
 ```
 
 **Parameters:**
 
 - `msg`: `GOOSEMessage`
 
-**Returns:** `Vec`
+**Returns:** `Vec<i64>`
 
-*Defined at line 280*
+*Defined at line 332*
 
 ---
 
@@ -742,7 +742,7 @@ pub fn iec61850_ref(ld: str, ln: str, field: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 318*
+*Defined at line 370*
 
 ---
 
@@ -761,7 +761,7 @@ pub fn iec61850_dataset_ref(ld: str, ds_name: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 323*
+*Defined at line 375*
 
 ---
 
@@ -781,7 +781,7 @@ pub fn iec61850_control_ref(ld: str, ln: str, co_name: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 328*
+*Defined at line 380*
 
 ---
 
@@ -805,7 +805,7 @@ pub struct PTOC {
 | `tds` | `f64,             // time dial setting (for inverse curves)` |
 | `tripped` | `bool` |
 
-*Defined at line 335*
+*Defined at line 387*
 
 ---
 
@@ -825,7 +825,7 @@ pub fn iec61850_ptoc_new(name: str, pickup: f64, delay: f64) -> PTOC {
 
 **Returns:** `PTOC`
 
-*Defined at line 346*
+*Defined at line 402*
 
 ---
 
@@ -834,17 +834,17 @@ pub fn iec61850_ptoc_new(name: str, pickup: f64, delay: f64) -> PTOC {
 Check if overcurrent condition is met.
 
 ```fides
-pub fn iec61850_ptoc_check(ptoc: PTOC, measured_current: f64) -> bool {
+pub fn iec61850_ptoc_check(ptoc: &mut PTOC, measured_current: f64) -> bool {
 ```
 
 **Parameters:**
 
-- `ptoc`: `PTOC`
+- `ptoc`: `&mut PTOC`
 - `measured_current`: `f64`
 
 **Returns:** `bool`
 
-*Defined at line 359*
+*Defined at line 409*
 
 ---
 
@@ -853,17 +853,17 @@ pub fn iec61850_ptoc_check(ptoc: PTOC, measured_current: f64) -> bool {
 Set inverse time curve mode.
 
 ```fides
-pub fn iec61850_ptoc_set_inverse(ptoc: PTOC, tds: f64) -> void {
+pub fn iec61850_ptoc_set_inverse(ptoc: &mut PTOC, tds: f64) -> void {
 ```
 
 **Parameters:**
 
-- `ptoc`: `PTOC`
+- `ptoc`: `&mut PTOC`
 - `tds`: `f64`
 
 **Returns:** `void`
 
-*Defined at line 368*
+*Defined at line 418*
 
 ---
 
@@ -884,7 +884,7 @@ pub fn iec61850_ptoc_trip_time(ptoc: PTOC, measured_current: f64) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 376*
+*Defined at line 426*
 
 ---
 

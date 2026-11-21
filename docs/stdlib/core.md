@@ -132,7 +132,7 @@ pub fn println(s: str) -> void {
 
 **Returns:** `void`
 
-*Defined at line 10*
+*Defined at line 21*
 
 ---
 
@@ -148,7 +148,7 @@ pub fn assert(cond: bool) -> void {
 
 **Returns:** `void`
 
-*Defined at line 16*
+*Defined at line 27*
 
 ---
 
@@ -165,7 +165,7 @@ pub fn assert_msg(cond: bool, msg: str) -> void {
 
 **Returns:** `void`
 
-*Defined at line 24*
+*Defined at line 35*
 
 ---
 
@@ -182,7 +182,7 @@ pub fn assert_eq<T>(a: T, b: T) -> void {
 
 **Returns:** `void`
 
-*Defined at line 31*
+*Defined at line 42*
 
 ---
 
@@ -200,7 +200,7 @@ pub fn assert_eq_msg<T>(a: T, b: T, msg: str) -> void {
 
 **Returns:** `void`
 
-*Defined at line 38*
+*Defined at line 49*
 
 ---
 
@@ -212,11 +212,10 @@ pub enum Option<T> {
 
 **Variants:**
 
-- `pub`
 - `Some`
 - `None`
 
-*Defined at line 48*
+*Defined at line 80*
 
 ---
 
@@ -226,7 +225,7 @@ pub enum Option<T> {
 impl Option {
 ```
 
-*Defined at line 53*
+*Defined at line 87*
 
 ---
 
@@ -238,11 +237,10 @@ pub enum Result<T, E> {
 
 **Variants:**
 
-- `pub`
 - `Ok`
 - `Err`
 
-*Defined at line 126*
+*Defined at line 193*
 
 ---
 
@@ -262,7 +260,7 @@ Besides `is_ok`, `unwrap`, `map` and the rest:
 `Option` has `context(msg: str) -> Result`: `Some(v)` is `Ok(v)`, `None` is
 `Err(msg)`, so `?` can pass a missing value up as an error.
 
-*Defined at line 131*
+*Defined at line 197*
 
 ---
 
@@ -279,7 +277,7 @@ pub fn max(a: i64, b: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 216*
+*Defined at line 364*
 
 ---
 
@@ -296,7 +294,7 @@ pub fn min(a: i64, b: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 221*
+*Defined at line 371*
 
 ---
 
@@ -312,7 +310,7 @@ pub fn abs(n: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 226*
+*Defined at line 378*
 
 ---
 
@@ -330,7 +328,7 @@ pub fn clamp(n: i64, lo: i64, hi: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 231*
+*Defined at line 385*
 
 ---
 
@@ -346,7 +344,7 @@ pub fn create_allocator(name: str) -> Allocator {
 
 **Returns:** `Allocator`
 
-*Defined at line 246*
+*Defined at line 404*
 
 ---
 
@@ -363,7 +361,7 @@ pub fn allocator_alloc(alloc: &Allocator, size: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 250*
+*Defined at line 408*
 
 ---
 
@@ -380,7 +378,7 @@ pub fn allocator_free(alloc: &Allocator, ptr: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 254*
+*Defined at line 412*
 
 ---
 
@@ -396,7 +394,7 @@ pub fn allocator_bytes_used(alloc: &Allocator) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 258*
+*Defined at line 416*
 
 ---
 
@@ -428,7 +426,7 @@ pub fn Vec_new() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 292*
+*Defined at line 736*
 
 ---
 
@@ -443,7 +441,7 @@ pub fn Vec_push(v: i64, value: i64) {
 - `v`: `i64`
 - `value`: `i64`
 
-*Defined at line 305*
+*Defined at line 2279*
 
 ---
 
@@ -459,7 +457,7 @@ pub fn Vec_pop(v: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 366*
+*Defined at line 2368*
 
 ---
 
@@ -475,7 +473,7 @@ pub fn Vec_len(v: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 399*
+*Defined at line 2404*
 
 ---
 
@@ -491,7 +489,7 @@ pub fn Vec_is_empty(v: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 408*
+*Defined at line 2414*
 
 ---
 
@@ -508,7 +506,7 @@ pub fn Vec_get(v: i64, idx: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 417*
+*Defined at line 2462*
 
 ---
 
@@ -524,7 +522,7 @@ pub fn Vec_set(v: i64, idx: i64, value: i64) {
 - `idx`: `i64`
 - `value`: `i64`
 
-*Defined at line 447*
+*Defined at line 2590*
 
 ---
 
@@ -538,7 +536,7 @@ pub fn Vec_clear(v: i64) {
 
 - `v`: `i64`
 
-*Defined at line 475*
+*Defined at line 2623*
 
 ---
 
@@ -554,7 +552,7 @@ pub fn Vec_capacity(v: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 482*
+*Defined at line 2627*
 
 ---
 
@@ -571,7 +569,7 @@ pub fn Vec_contains(v: i64, value: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 491*
+*Defined at line 2646*
 
 ---
 
@@ -587,7 +585,7 @@ pub fn Vec_first(v: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 521*
+*Defined at line 2690*
 
 ---
 
@@ -603,7 +601,7 @@ pub fn Vec_last(v: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 547*
+*Defined at line 2725*
 
 ---
 
@@ -618,7 +616,7 @@ pub fn Vec_truncate(v: i64, n: i64) {
 - `v`: `i64`
 - `n`: `i64`
 
-*Defined at line 574*
+*Defined at line 2763*
 
 ---
 
@@ -632,7 +630,7 @@ pub fn Vec_reverse(v: i64) {
 
 - `v`: `i64`
 
-*Defined at line 587*
+*Defined at line 2791*
 
 ---
 
@@ -647,7 +645,7 @@ pub fn Vec_extend(v: i64, other: i64) {
 - `v`: `i64`
 - `other`: `i64`
 
-*Defined at line 617*
+*Defined at line 2844*
 
 ---
 
@@ -663,7 +661,7 @@ pub fn Vec_insert(v: i64, idx: i64, value: i64) {
 - `idx`: `i64`
 - `value`: `i64`
 
-*Defined at line 644*
+*Defined at line 2927*
 
 ---
 
@@ -680,7 +678,7 @@ pub fn Vec_remove(v: i64, idx: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 694*
+*Defined at line 2996*
 
 ---
 
@@ -696,7 +694,7 @@ pub fn Vec_clone(v: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 746*
+*Defined at line 3065*
 
 ---
 
@@ -712,7 +710,7 @@ pub fn Vec_to_str(v: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 775*
+*Defined at line 3103*
 
 ---
 
@@ -726,7 +724,7 @@ pub fn Vec_sort(v: i64) {
 
 - `v`: `i64`
 
-*Defined at line 809*
+*Defined at line 3155*
 
 ---
 
@@ -738,7 +736,7 @@ pub fn HashMap_new() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 933*
+*Defined at line 3427*
 
 ---
 
@@ -754,7 +752,7 @@ pub fn HashMap_insert(m: i64, key: i64, value: i64) {
 - `key`: `i64`
 - `value`: `i64`
 
-*Defined at line 1084*
+*Defined at line 4997*
 
 ---
 
@@ -771,7 +769,7 @@ pub fn HashMap_get(m: i64, key: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 1143*
+*Defined at line 5131*
 
 ---
 
@@ -788,7 +786,7 @@ pub fn HashMap_contains(m: i64, key: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 1179*
+*Defined at line 5185*
 
 ---
 
@@ -803,7 +801,7 @@ pub fn HashMap_remove(m: i64, key: i64) {
 - `m`: `i64`
 - `key`: `i64`
 
-*Defined at line 1202*
+*Defined at line 5219*
 
 ---
 
@@ -819,7 +817,7 @@ pub fn HashMap_len(m: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 1238*
+*Defined at line 5273*
 
 ---
 
@@ -835,7 +833,7 @@ pub fn HashMap_is_empty(m: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 1247*
+*Defined at line 5283*
 
 ---
 
@@ -849,7 +847,7 @@ pub fn HashMap_clear(m: i64) {
 
 - `m`: `i64`
 
-*Defined at line 1256*
+*Defined at line 5294*
 
 ---
 
@@ -865,7 +863,7 @@ pub fn HashMap_keys(m: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 1282*
+*Defined at line 5332*
 
 ---
 
@@ -881,7 +879,7 @@ pub fn HashMap_values(m: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 1311*
+*Defined at line 5386*
 
 ---
 
@@ -897,7 +895,7 @@ pub fn HashMap_clone(m: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 1327*
+*Defined at line 5415*
 
 ---
 
@@ -915,7 +913,7 @@ pub fn HashMap_get_or(m: i64, key: i64, default: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 1363*
+*Defined at line 5660*
 
 ---
 
@@ -931,23 +929,23 @@ pub fn HashMap_to_str(m: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 1402*
+*Defined at line 5717*
 
 ---
 
 ## String_from
 
 ```fides
-pub fn String_from(s: i64) -> i64 {
+pub fn String_from(s: i64) -> str {
 ```
 
 **Parameters:**
 
 - `s`: `i64`
 
-**Returns:** `i64`
+**Returns:** `str`
 
-*Defined at line 1527*
+*Defined at line 6157*
 
 ---
 
@@ -963,7 +961,7 @@ pub fn String_len(s: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 1543*
+*Defined at line 6167*
 
 ---
 
@@ -979,14 +977,14 @@ pub fn String_is_empty(s: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 1547*
+*Defined at line 6171*
 
 ---
 
 ## String_push_str
 
 ```fides
-pub fn String_push_str(s: i64, other: i64) -> i64 {
+pub fn String_push_str(s: i64, other: i64) -> str {
 ```
 
 **Parameters:**
@@ -994,9 +992,9 @@ pub fn String_push_str(s: i64, other: i64) -> i64 {
 - `s`: `i64`
 - `other`: `i64`
 
-**Returns:** `i64`
+**Returns:** `str`
 
-*Defined at line 1555*
+*Defined at line 6185*
 
 ---
 
@@ -1013,7 +1011,7 @@ pub fn String_contains(s: i64, sub: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 1567*
+*Defined at line 6194*
 
 ---
 
@@ -1030,7 +1028,7 @@ pub fn String_starts_with(s: i64, prefix: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 1600*
+*Defined at line 6198*
 
 ---
 
@@ -1047,62 +1045,62 @@ pub fn String_ends_with(s: i64, suffix: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 1623*
+*Defined at line 6210*
 
 ---
 
 ## String_trim
 
 ```fides
-pub fn String_trim(s: i64) -> i64 {
+pub fn String_trim(s: i64) -> str {
 ```
 
 **Parameters:**
 
 - `s`: `i64`
 
-**Returns:** `i64`
+**Returns:** `str`
 
-*Defined at line 1648*
+*Defined at line 6222*
 
 ---
 
 ## String_to_uppercase
 
 ```fides
-pub fn String_to_uppercase(s: i64) -> i64 {
+pub fn String_to_uppercase(s: i64) -> str {
 ```
 
 **Parameters:**
 
 - `s`: `i64`
 
-**Returns:** `i64`
+**Returns:** `str`
 
-*Defined at line 1704*
+*Defined at line 6252*
 
 ---
 
 ## String_to_lowercase
 
 ```fides
-pub fn String_to_lowercase(s: i64) -> i64 {
+pub fn String_to_lowercase(s: i64) -> str {
 ```
 
 **Parameters:**
 
 - `s`: `i64`
 
-**Returns:** `i64`
+**Returns:** `str`
 
-*Defined at line 1731*
+*Defined at line 6284*
 
 ---
 
 ## String_slice
 
 ```fides
-pub fn String_slice(s: i64, start: i64, end: i64) -> i64 {
+pub fn String_slice(s: i64, start: i64, end: i64) -> str {
 ```
 
 **Parameters:**
@@ -1111,9 +1109,9 @@ pub fn String_slice(s: i64, start: i64, end: i64) -> i64 {
 - `start`: `i64`
 - `end`: `i64`
 
-**Returns:** `i64`
+**Returns:** `str`
 
-*Defined at line 1758*
+*Defined at line 6288*
 
 ---
 
@@ -1130,7 +1128,7 @@ pub fn String_find(s: i64, sub: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 1785*
+*Defined at line 6323*
 
 ---
 
@@ -1147,14 +1145,14 @@ pub fn String_rfind(s: i64, sub: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 1818*
+*Defined at line 6387*
 
 ---
 
 ## String_replace
 
 ```fides
-pub fn String_replace(s: i64, from: i64, to: i64) -> i64 {
+pub fn String_replace(s: i64, from: i64, to: i64) -> str {
 ```
 
 **Parameters:**
@@ -1163,9 +1161,9 @@ pub fn String_replace(s: i64, from: i64, to: i64) -> i64 {
 - `from`: `i64`
 - `to`: `i64`
 
-**Returns:** `i64`
+**Returns:** `str`
 
-*Defined at line 1851*
+*Defined at line 6410*
 
 ---
 
@@ -1182,7 +1180,7 @@ pub fn String_split(s: i64, delim: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 1913*
+*Defined at line 6478*
 
 ---
 
@@ -1198,14 +1196,14 @@ pub fn String_parse_int(s: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 1965*
+*Defined at line 6505*
 
 ---
 
 ## String_char_at
 
 ```fides
-pub fn String_char_at(s: i64, idx: i64) -> i64 {
+pub fn String_char_at(s: i64, idx: i64) -> str {
 ```
 
 **Parameters:**
@@ -1213,16 +1211,16 @@ pub fn String_char_at(s: i64, idx: i64) -> i64 {
 - `s`: `i64`
 - `idx`: `i64`
 
-**Returns:** `i64`
+**Returns:** `str`
 
-*Defined at line 2001*
+*Defined at line 6545*
 
 ---
 
 ## String_repeat
 
 ```fides
-pub fn String_repeat(s: i64, n: i64) -> i64 {
+pub fn String_repeat(s: i64, n: i64) -> str {
 ```
 
 **Parameters:**
@@ -1230,41 +1228,41 @@ pub fn String_repeat(s: i64, n: i64) -> i64 {
 - `s`: `i64`
 - `n`: `i64`
 
-**Returns:** `i64`
+**Returns:** `str`
 
-*Defined at line 2018*
+*Defined at line 6607*
 
 ---
 
 ## String_to_string
 
 ```fides
-pub fn String_to_string(s: i64) -> i64 {
+pub fn String_to_string(s: i64) -> str {
 ```
 
 **Parameters:**
 
 - `s`: `i64`
 
-**Returns:** `i64`
+**Returns:** `str`
 
-*Defined at line 2038*
+*Defined at line 6621*
 
 ---
 
 ## String_clone
 
 ```fides
-pub fn String_clone(s: i64) -> i64 {
+pub fn String_clone(s: i64) -> str {
 ```
 
 **Parameters:**
 
 - `s`: `i64`
 
-**Returns:** `i64`
+**Returns:** `str`
 
-*Defined at line 2042*
+*Defined at line 6625*
 
 ---
 
@@ -1280,7 +1278,7 @@ pub fn String_bytes(s: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 2046*
+*Defined at line 6629*
 
 ---
 
@@ -1294,10 +1292,10 @@ pub struct StringBuilder {
 
 | Name | Type |
 |------|------|
-| `buf` | `str` |
+| `handle` | `i64` |
 | `len` | `i64` |
 
-*Defined at line 2061*
+*Defined at line 6644*
 
 ---
 
@@ -1307,7 +1305,7 @@ pub struct StringBuilder {
 impl StringBuilder {
 ```
 
-*Defined at line 2066*
+*Defined at line 6644*
 
 ---
 
@@ -1324,7 +1322,7 @@ pub fn String_byte_at(s: i64, idx: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 2108*
+*Defined at line 6694*
 
 ---
 
@@ -1340,7 +1338,7 @@ pub fn String_char_count(s: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 2122*
+*Defined at line 6735*
 
 ---
 
@@ -1356,7 +1354,7 @@ pub fn char_to_str(b: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 2126*
+*Defined at line 6739*
 
 ---
 
@@ -1372,7 +1370,7 @@ pub fn char_is_digit(b: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 2130*
+*Defined at line 6743*
 
 ---
 
@@ -1388,7 +1386,7 @@ pub fn char_is_alpha(b: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 2134*
+*Defined at line 6747*
 
 ---
 
@@ -1404,7 +1402,7 @@ pub fn char_is_whitespace(b: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 2138*
+*Defined at line 6751*
 
 ---
 
@@ -1420,7 +1418,7 @@ pub fn char_is_upper(b: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 2142*
+*Defined at line 6755*
 
 ---
 
@@ -1436,7 +1434,7 @@ pub fn char_is_lower(b: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 2146*
+*Defined at line 6759*
 
 ---
 
@@ -1452,7 +1450,7 @@ pub fn char_to_upper(b: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 2150*
+*Defined at line 6763*
 
 ---
 
@@ -1468,7 +1466,7 @@ pub fn char_to_lower(b: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 2155*
+*Defined at line 6770*
 
 ---
 
@@ -1482,10 +1480,10 @@ pub struct ByteBuffer {
 
 | Name | Type |
 |------|------|
-| `data` | `Vec` |
+| `data` | `Vec<i64>` |
 | `len` | `i64` |
 
-*Defined at line 2166*
+*Defined at line 6783*
 
 ---
 
@@ -1495,7 +1493,7 @@ pub struct ByteBuffer {
 impl ByteBuffer {
 ```
 
-*Defined at line 2171*
+*Defined at line 6783*
 
 ---
 
@@ -1505,34 +1503,36 @@ Iterate over the bytes of a string, returning a Vec of byte values.
 Usage: `value bytes = str_bytes("hello");  // [104, 101, 108, 108, 111]`
 
 ```fides
-pub fn str_bytes(s: str) -> Vec {
+pub fn str_bytes(s: str) -> Vec<i64> {
 ```
 
 **Parameters:**
 
 - `s`: `str`
 
-**Returns:** `Vec`
+**Returns:** `Vec<i64>`
 
-*Defined at line 2250*
+*Defined at line 6893*
 
 ---
 
 ## str_from_bytes
 
 Build a string from a Vec of byte values.
+Linear: one counted allocation + a byte copy (was a concat per byte,
+quadratic — a multi-MB body took minutes).
 
 ```fides
-pub fn str_from_bytes(bytes: Vec) -> str {
+pub fn str_from_bytes(bytes: Vec<i64>) -> str {
 ```
 
 **Parameters:**
 
-- `bytes`: `Vec`
+- `bytes`: `Vec<i64>`
 
 **Returns:** `str`
 
-*Defined at line 2266*
+*Defined at line 6914*
 
 ---
 
@@ -1552,7 +1552,7 @@ pub fn str_slice(s: str, start: i64, end: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 2278*
+*Defined at line 6933*
 
 ---
 
@@ -1571,7 +1571,7 @@ pub fn str_starts_with(s: str, prefix: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 2289*
+*Defined at line 6955*
 
 ---
 
@@ -1590,7 +1590,7 @@ pub fn str_ends_with(s: str, suffix: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 2294*
+*Defined at line 6960*
 
 ---
 
@@ -1609,7 +1609,7 @@ pub fn str_contains(s: str, sub: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 2299*
+*Defined at line 6965*
 
 ---
 
@@ -1628,7 +1628,7 @@ pub fn str_find(s: str, sub: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 2304*
+*Defined at line 6970*
 
 ---
 
@@ -1647,7 +1647,7 @@ pub fn str_rfind(s: str, sub: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 2309*
+*Defined at line 6975*
 
 ---
 
@@ -1665,7 +1665,7 @@ pub fn str_trim_start(s: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 2314*
+*Defined at line 6980*
 
 ---
 
@@ -1683,7 +1683,7 @@ pub fn str_trim_end(s: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 2330*
+*Defined at line 7003*
 
 ---
 
@@ -1701,7 +1701,7 @@ pub fn str_trim(s: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 2346*
+*Defined at line 7026*
 
 ---
 
@@ -1710,7 +1710,7 @@ pub fn str_trim(s: str) -> str {
 Split a string by delimiter, returning a Vec of string parts.
 
 ```fides
-pub fn str_split(s: str, delim: str) -> Vec {
+pub fn str_split(s: str, delim: str) -> Vec<str> {
 ```
 
 **Parameters:**
@@ -1718,9 +1718,9 @@ pub fn str_split(s: str, delim: str) -> Vec {
 - `s`: `str`
 - `delim`: `str`
 
-**Returns:** `Vec`
+**Returns:** `Vec<str>`
 
-*Defined at line 2351*
+*Defined at line 7067*
 
 ---
 
@@ -1730,7 +1730,7 @@ Split a string by a single character delimiter, returning a Vec of parts.
 Faster than str_split for single-char delimiters.
 
 ```fides
-pub fn str_split_char(s: str, delim: i64) -> Vec {
+pub fn str_split_char(s: str, delim: i64) -> Vec<str> {
 ```
 
 **Parameters:**
@@ -1738,9 +1738,9 @@ pub fn str_split_char(s: str, delim: i64) -> Vec {
 - `s`: `str`
 - `delim`: `i64`
 
-**Returns:** `Vec`
+**Returns:** `Vec<str>`
 
-*Defined at line 2389*
+*Defined at line 7113*
 
 ---
 
@@ -1760,7 +1760,7 @@ pub fn str_replace(s: str, from: str, to: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 2410*
+*Defined at line 7137*
 
 ---
 
@@ -1779,7 +1779,7 @@ pub fn str_repeat(s: str, n: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 2415*
+*Defined at line 7149*
 
 ---
 
@@ -1797,7 +1797,7 @@ pub fn str_to_upper(s: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 2420*
+*Defined at line 7154*
 
 ---
 
@@ -1815,7 +1815,7 @@ pub fn str_to_lower(s: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 2425*
+*Defined at line 7159*
 
 ---
 
@@ -1833,7 +1833,7 @@ pub fn str_parse_int(s: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 2430*
+*Defined at line 7164*
 
 ---
 
@@ -1852,7 +1852,7 @@ pub fn str_parse_hex(s: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 2436*
+*Defined at line 7170*
 
 ---
 
@@ -1873,7 +1873,7 @@ pub fn str_parse_int_range(s: str, start: i64, end: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 2491*
+*Defined at line 7258*
 
 ---
 
@@ -1892,7 +1892,7 @@ pub fn str_byte_at(s: str, idx: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 2513*
+*Defined at line 7291*
 
 ---
 
@@ -1910,7 +1910,7 @@ pub fn str_len(s: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 2518*
+*Defined at line 7296*
 
 ---
 
@@ -1928,7 +1928,7 @@ pub fn str_is_empty(s: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 2523*
+*Defined at line 7301*
 
 ---
 
@@ -1947,7 +1947,7 @@ pub fn str_concat(a: str, b: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 2528*
+*Defined at line 7306*
 
 ---
 
@@ -1966,7 +1966,7 @@ pub fn str_compare(a: str, b: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 2533*
+*Defined at line 7311*
 
 ---
 
@@ -1985,7 +1985,7 @@ pub fn str_equal(a: str, b: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 2538*
+*Defined at line 7316*
 
 ---
 
@@ -2003,7 +2003,7 @@ pub fn int_to_str(n: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 2543*
+*Defined at line 7321*
 
 ---
 
@@ -2021,7 +2021,7 @@ pub fn float_to_str(f: f64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 2548*
+*Defined at line 7336*
 
 ---
 
@@ -2039,7 +2039,7 @@ pub fn str_parse_float(s: str) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 2553*
+*Defined at line 7341*
 
 ---
 
@@ -2057,7 +2057,7 @@ pub fn byte_to_str(b: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 2558*
+*Defined at line 7346*
 
 ---
 

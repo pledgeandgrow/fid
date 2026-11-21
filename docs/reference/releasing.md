@@ -19,6 +19,13 @@ shipped `fid.exe` is built from the tagged source and nothing else. Run them
 one at a time on a quiet machine: parallel builds slow each other down by
 10x or more.
 
+Nov 21: started from `fidesc` (no `release/stage0/fid` pinned), the
+bootstrap cannot pass stage 2 on the current tree: a `fid` built by
+`fidesc` runs out of memory self-compiling it (known-bugs 2g.79). Start it
+from a self-hosted `fid` instead (`STAGE0=<fid.exe>`; `PIN=1` after a
+fixpoint keeps the last stage as the next stage 0); the Nov 18 `fid` built
+the tree that way.
+
 ## 2. Run the tests
 
 The full suite through the Rust harness with `fid` as the compiler under
@@ -99,8 +106,11 @@ FIDES_VERSION=1.0.1 ./installer/build-installer.sh   # default: the version in i
 
 ## 4. Publish
 
-1. Update `docs/reference/changelog.md` and the version in `Cargo.toml`
-   (`fid version` prints it).
+1. Update `docs/reference/changelog.md`, the version in `Cargo.toml`
+   (what `fidesc` reports) and `fid_version_base` in
+   `compiler/build_info.fd` (a dev build of `fid` prints it with `+dev`; a
+   release build prints the version `scripts/build-info.sh` writes from
+   `FIDES_VERSION`, a `VERSION` file or the tag).
 2. Tag the commit: `git tag -a v1.0.1 -m "Fides 1.0.1"` and push the tag.
 3. Create the GitHub release from the tag. GitHub drafts the notes from the
    merged pull requests, grouped by label (`.github/release.yml`); add the

@@ -1,0 +1,60 @@
+// known-bugs 2g.109 (WP19, OP9): `select` lowered each case's variable to
+// a slot made in that case's block (compiler/lower.fd
+// Lowerer_lower_select_stmt); a later case or a later select with a
+// variable of the same name found that slot by name, from a block the
+// first one does not dominate, and FID_VERIFY=1 rejected the program
+// ("after lowering ... does not dominate"; test_verify_semantics_ext). The
+// slots are in the entry block now. Same output on every backend, and
+// FID_VERIFY=1 builds it (tests/tooling/verify-clean-check.sh).
+//
+// Expected output:
+// 208
+// -1
+// 107
+// 9
+// 15
+
+use channel;
+
+fn main() -> i64 {
+    val ca = channel_create(1);
+    val cb = channel_create(1);
+    channel_send(cb, 8);
+    var got: i64 = 0;
+    select {
+        case ca => kv => { got = 100 + kv; }
+        case cb => kv => { got = 200 + kv; }
+        default => { got = 0 - 1; }
+    }
+    println(got);
+    var got2: i64 = 0;
+    select {
+        case ca => kv => { got2 = 100 + kv; }
+        default => { got2 = 0 - 1; }
+    }
+    println(got2);
+    channel_send(ca, 7);
+    var got3: i64 = 0;
+    select {
+        case cb => kv => { got3 = 200 + kv; }
+        case ca => kv => { got3 = 100 + kv; }
+        default => { got3 = 0 - 1; }
+    }
+    println(got3);
+    // a select in a loop: the case variable is bound again each trip
+    var total: i64 = 0;
+    var last: i64 = 0;
+    var i: i64 = 1;
+    while i <= 5 {
+        channel_send(cb, i);
+        select {
+            case ca => kv => { total = total + 1000 * kv; }
+            case cb => kv => { total = total + kv; last = kv + 4; }
+            default => { total = total + 100000; }
+        }
+        i = i + 1;
+    }
+    println(last);
+    println(total);
+    return 0;
+}

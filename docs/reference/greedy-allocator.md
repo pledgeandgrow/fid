@@ -117,10 +117,18 @@ only, built with the previous compiler against this tree's
 `compiler/nat_ir.fd` (`fid ccompile`): `tests/nattools/greedy_unit.fd`
 (hulls) and `tests/nattools/seg_unit.fd` (segments: random functions,
 the greedy assignment judged by the allocation checker's rules) printed
-all their expected lines on every target. No program has been built with
-`FID_NAT_ON=greedy` by a compiler that has it. The tables below are to be
+all their expected lines on every target. No program had been built with
+`FID_NAT_ON=greedy` by a compiler that has it then. The tables below are to be
 filled from the commands that follow, run with the compiler built from
 this tree.
+
+Nov 21 (roadmap RA9 check, fid built from a self-hosted stage 0): with
+`FID_NAT_ON=greedy` programs pass `FID_VERIFY=1` on x86-64, AArch64, RISC-V
+and `--nat`, greedy_unit gives 12/12, and 14 benchmarks print what the
+linear scan's builds print, at 0.85–1.14 of their time. It is not
+consistently better (AArch64 main spills 214 -> 236), and machine_batch12's
+per-function checks fail because the functions are inlined. The full-suite
+table (greedy_compare.sh) was not run.
 
 | target | ranges | linear spills | linear weight | greedy spills | greedy weight | evictions |
 |---|---:|---:|---:|---:|---:|---:|

@@ -4,8 +4,10 @@
 > The Oct 22/23 findings are resolved; the file was rewritten to half its size.
 
 - **Path:** `compiler/token.fd`
-- **LOC:** 279 (was 560 on Oct 23; Rust `src/token.rs`: 263)
-- **Role:** the `TokenKind` enum (138 variants), the `Token` struct (kind, line, col) and four helpers:
+- **LOC:** 686 (2026-11-21; 279 on Nov 9, 560 on Oct 23; Rust `src/token.rs`: 263). Nov 21:
+  140 variants; `BadChar` is new (Nov 15: an unknown character is an error token, not `Eof`,
+  known-bugs 2g.18). Imported by compiler, comptime_eval, lexer, main, parser and pe_ir.
+- **Role:** the `TokenKind` enum (138 variants on Nov 9), the `Token` struct (kind, line, col) and four helpers:
   `token_new`, `token_kind_to_str`, `is_word_keyword`, `token_kind_tag` / `token_kind_eq`.
 
 ## Callers

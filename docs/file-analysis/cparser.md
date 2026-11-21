@@ -5,7 +5,13 @@
 > findings are fixed; one changed.
 
 - **Path:** `compiler/cparser.fd`
-- **LOC:** 1,163 (Rust `src/cparser.rs`: 315)
+- **LOC:** 4,265 (2026-11-21; 1,163 on Nov 9; Rust `src/cparser.rs`: 315).
+  Nov 21: `#if`/`#ifdef`/`#ifndef`/`#elif`/`#else` are now evaluated where
+  the condition is known (LG15: only a branch known false is dropped; the
+  file header still says conditionals are not evaluated). A parameter keeps
+  its C type (`int` → `i32`, known-bugs 2g.62, fixed Nov 19). `long` is
+  still `i32`. pe_ir.fd imports it too now. Line numbers below are from
+  Nov 9.
 - **Role:** C header to Fides FFI bindings. Reads the header and the `#include "..."` headers in
   the same folder, collects `#define`s, tokenizes, splits declarations at `;`, and writes:
   `pub const` for integer macros and enum values, one `extern "C" link "lib" { ... }` block, and a

@@ -59,7 +59,7 @@ pub struct HttpRequest {
 | `vals` | `Vec<str>` |
 | `body` | `str` |
 
-*Defined at line 42*
+*Defined at line 41*
 
 ---
 
@@ -78,7 +78,7 @@ pub fn http_header(req: HttpRequest, name: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 70*
+*Defined at line 90*
 
 ---
 
@@ -96,7 +96,7 @@ pub fn http_keep_alive(req: HttpRequest) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 82*
+*Defined at line 102*
 
 ---
 
@@ -114,7 +114,7 @@ pub fn http_parse_head(head: str) -> HttpRequest {
 
 **Returns:** `HttpRequest`
 
-*Defined at line 118*
+*Defined at line 138*
 
 ---
 
@@ -133,7 +133,7 @@ pub fn parse_request(raw: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 194*
+*Defined at line 217*
 
 ---
 
@@ -153,7 +153,7 @@ pub fn build_response(status: i64, content_type: str, body: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 215*
+*Defined at line 237*
 
 ---
 
@@ -174,7 +174,7 @@ pub fn build_response_headers(status: i64, content_type: str, headers: str, body
 
 **Returns:** `str`
 
-*Defined at line 220*
+*Defined at line 242*
 
 ---
 
@@ -192,7 +192,7 @@ pub fn status_text(code: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 227*
+*Defined at line 247*
 
 ---
 
@@ -210,7 +210,7 @@ pub fn http_set_tls(recv: fn(i64, i64, i64, i64) -> i64, send: fn(i64, i64, i64)
 - `send`: `fn(i64`
 - `close`: `fn(i64) -> i64`
 
-*Defined at line 297*
+*Defined at line 410*
 
 ---
 
@@ -229,7 +229,7 @@ pub fn http_conn_new(fd: i64, tls: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 306*
+*Defined at line 418*
 
 ---
 
@@ -243,7 +243,7 @@ pub fn http_conn_close(c: i64) {
 
 - `c`: `i64`
 
-*Defined at line 317*
+*Defined at line 429*
 
 ---
 
@@ -265,7 +265,7 @@ pub fn http_read_message(c: i64, timeout_ms: i64, to_end: bool) -> HttpRequest {
 
 **Returns:** `HttpRequest`
 
-*Defined at line 482*
+*Defined at line 613*
 
 ---
 
@@ -284,7 +284,7 @@ pub fn http_conn_write(c: i64, data: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 513*
+*Defined at line 645*
 
 ---
 
@@ -303,7 +303,7 @@ pub fn http_conn_task(c: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 534*
+*Defined at line 737*
 
 ---
 
@@ -321,7 +321,7 @@ pub fn http_accept_task(fd: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 568*
+*Defined at line 798*
 
 ---
 
@@ -345,36 +345,45 @@ pub fn http_serve(port: i64, handler: fn(HttpRequest) -> str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 584*
+*Defined at line 825*
 
 ---
 
 ## http_serve_scoped
 
+As http_serve, with memory that stays flat: after each response, the
+request's strings and the response are freed. The handler borrows the
+request (ScopedRequest): the compiler rejects a handler that keeps one of
+its strings, so this needs no promise (release M11; it was @unsafe).
+
 ```fides
-pub fn http_serve_scoped(port: i64, handler: fn(HttpRequest) -> str) -> bool {
+pub fn http_serve_scoped(port: i64, handler: fn(ScopedRequest) -> str) -> bool {
 ```
 
 **Parameters:**
 
 - `port`: `i64`
-- `handler`: `fn(HttpRequest) -> str`
+- `handler`: `fn(ScopedRequest) -> str`
 
 **Returns:** `bool`
 
-*Defined at line 598*
+*Defined at line 838*
 
 ---
 
 ## http_set_scoped
 
-For module `https`.
+For module `https`: serve scoped requests with `handler`.
 
 ```fides
-pub fn http_set_scoped() {
+pub fn http_set_scoped(handler: fn(ScopedRequest) -> str) {
 ```
 
-*Defined at line 604*
+**Parameters:**
+
+- `handler`: `fn(ScopedRequest) -> str`
+
+*Defined at line 845*
 
 ---
 
@@ -392,7 +401,7 @@ pub fn http_listen_tasks(fd: i64, handler: fn(HttpRequest) -> str) {
 - `fd`: `i64`
 - `handler`: `fn(HttpRequest) -> str`
 
-*Defined at line 610*
+*Defined at line 861*
 
 ---
 
@@ -411,7 +420,7 @@ pub fn http_serve_on(fd: i64, secure: bool, handler: fn(HttpRequest) -> str) {
 - `secure`: `bool`
 - `handler`: `fn(HttpRequest) -> str`
 
-*Defined at line 617*
+*Defined at line 872*
 
 ---
 
@@ -429,7 +438,7 @@ pub fn handle_request(req: HttpRequest) -> str {
 
 **Returns:** `str`
 
-*Defined at line 625*
+*Defined at line 883*
 
 ---
 
@@ -447,7 +456,7 @@ pub fn serve(port: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 630*
+*Defined at line 888*
 
 ---
 
@@ -463,7 +472,7 @@ pub fn http_request_arena_new() -> http_request_arena {
 
 **Returns:** `http_request_arena`
 
-*Defined at line 664*
+*Defined at line 921*
 
 ---
 
@@ -483,7 +492,7 @@ pub fn http_request_alloc(arena: http_request_arena, size: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 670*
+*Defined at line 927*
 
 ---
 
@@ -502,7 +511,7 @@ pub fn http_request_arena_free(arena: http_request_arena) -> void {
 
 **Returns:** `void`
 
-*Defined at line 676*
+*Defined at line 933*
 
 ---
 
@@ -523,7 +532,7 @@ pub fn http_parse_request_arena(arena: http_request_arena, raw: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 683*
+*Defined at line 940*
 
 ---
 
@@ -545,7 +554,7 @@ pub fn http_build_response_arena(arena: http_request_arena, status: i64, content
 
 **Returns:** `str`
 
-*Defined at line 693*
+*Defined at line 950*
 
 ---
 
@@ -559,7 +568,7 @@ pub fn router_new() -> Router {
 
 **Returns:** `Router`
 
-*Defined at line 720*
+*Defined at line 976*
 
 ---
 
@@ -571,19 +580,19 @@ path: path pattern (e.g. "/", "/users", "/users/:id")
 handler: function to call when the route matches
 
 ```fides
-pub fn router_add(router: Router, method: str, path: str, handler: route_handler) -> void {
+pub fn router_add(router: &mut Router, method: str, path: str, handler: route_handler) -> void {
 ```
 
 **Parameters:**
 
-- `router`: `Router`
+- `router`: `&mut Router`
 - `method`: `str`
 - `path`: `str`
 - `handler`: `route_handler`
 
 **Returns:** `void`
 
-*Defined at line 728*
+*Defined at line 986*
 
 ---
 
@@ -604,7 +613,7 @@ pub fn router_dispatch(router: Router, method: str, path: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 735*
+*Defined at line 995*
 
 ---
 
@@ -624,7 +633,7 @@ pub fn router_dispatch_request(router: Router, request: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 750*
+*Defined at line 1011*
 
 ---
 
@@ -646,7 +655,7 @@ pub fn apply_middleware(handler: route_handler, mw: middleware) -> route_handler
 
 **Returns:** `route_handler`
 
-*Defined at line 778*
+*Defined at line 1039*
 
 ---
 
@@ -664,7 +673,7 @@ pub fn logging_middleware(handler: route_handler) -> route_handler {
 
 **Returns:** `route_handler`
 
-*Defined at line 783*
+*Defined at line 1044*
 
 ---
 
@@ -682,7 +691,7 @@ pub fn cors_middleware(handler: route_handler) -> route_handler {
 
 **Returns:** `route_handler`
 
-*Defined at line 792*
+*Defined at line 1053*
 
 ---
 

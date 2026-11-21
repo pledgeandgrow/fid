@@ -1,4 +1,4 @@
-# Fides Cookbook
+# Fid Cookbook
 
 > Common tasks, short recipes. Everything here is plain `.fd` source —
 > run it with `fid run file.fd` or build it with `fid emit file.fd`.
@@ -80,8 +80,9 @@ fn main() -> i64 {
 }
 ```
 
-For env vars: `use env;` (`env_get`, `env_has`), or the low-level
-`p_getenv("NAME")` which returns an empty str when unset — always check.
+For env vars: `use env;` (`env_get`, `env_exists`), or core's
+`env_var("NAME")`, an `Option<str>` that is `None` when unset. The raw
+`p_getenv` returns 0 when unset (test it with `(s as i64) == 0`).
 
 ## Collections
 
@@ -149,7 +150,7 @@ fn main() -> i64 {
 ## Error handling
 
 Fallible calls return `Option<T>`/`Result<T,E>` (see `stdlib/result.fd`);
-checked arithmetic uses `checked_add`/`checked_mul` etc.:
+integer arithmetic is checked in every build (overflow panics):
 
 ```fides
 use core;

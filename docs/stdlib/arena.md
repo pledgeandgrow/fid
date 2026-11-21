@@ -39,7 +39,7 @@ pub fn arena_new() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 46*
+*Defined at line 45*
 
 ---
 
@@ -50,17 +50,17 @@ The memory is uninitialized. O(1) — just bumps a pointer.
 The memory is freed when the arena is restored or freed.
 
 ```fides
-pub fn arena_alloc(arena_mark: i64, size: i64) -> i64 {
+pub fn arena_alloc(_arena_mark: i64, size: i64) -> i64 {
 ```
 
 **Parameters:**
 
-- `arena_mark`: `i64`
+- `_arena_mark`: `i64`
 - `size`: `i64`
 
 **Returns:** `i64`
 
-*Defined at line 53*
+*Defined at line 52*
 
 ---
 
@@ -75,7 +75,7 @@ pub fn arena_save() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 61*
+*Defined at line 60*
 
 ---
 
@@ -95,7 +95,7 @@ pub fn arena_restore(mark: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 68*
+*Defined at line 67*
 
 ---
 
@@ -114,7 +114,7 @@ pub fn arena_free(arena_mark: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 74*
+*Defined at line 73*
 
 ---
 
@@ -133,7 +133,7 @@ pub fn region_new() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 94*
+*Defined at line 96*
 
 ---
 
@@ -153,7 +153,7 @@ pub fn region_alloc(region: i64, size: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 105*
+*Defined at line 113*
 
 ---
 
@@ -172,7 +172,7 @@ pub fn region_free(region: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 113*
+*Defined at line 146*
 
 ---
 
@@ -193,7 +193,7 @@ pub fn region_free_one(region: i64, ptr: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 120*
+*Defined at line 173*
 
 ---
 
@@ -220,7 +220,7 @@ pub fn with_arena(f: fn() -> i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 140*
+*Defined at line 228*
 
 ---
 
@@ -241,7 +241,7 @@ pub fn mem_copy(dst: i64, src: i64, n: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 151*
+*Defined at line 244*
 
 ---
 
@@ -260,7 +260,7 @@ pub fn mem_zero(dst: i64, n: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 162*
+*Defined at line 262*
 
 ---
 
@@ -280,7 +280,7 @@ pub fn mem_set(dst: i64, val: i64, n: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 167*
+*Defined at line 270*
 
 ---
 
@@ -295,7 +295,7 @@ pub fn arena_used() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 175*
+*Defined at line 278*
 
 ---
 
@@ -314,7 +314,7 @@ pub fn region_count(region: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 184*
+*Defined at line 293*
 
 ---
 
@@ -329,7 +329,7 @@ pub fn frame_new() -> FrameArena {
 
 **Returns:** `FrameArena`
 
-*Defined at line 216*
+*Defined at line 335*
 
 ---
 
@@ -340,16 +340,16 @@ All allocations between frame_begin and frame_end will be freed
 when frame_end is called.
 
 ```fides
-pub fn frame_begin(fa: FrameArena) -> void {
+pub fn frame_begin(fa: &mut FrameArena) -> void {
 ```
 
 **Parameters:**
 
-- `fa`: `FrameArena`
+- `fa`: `&mut FrameArena`
 
 **Returns:** `void`
 
-*Defined at line 223*
+*Defined at line 344*
 
 ---
 
@@ -360,17 +360,17 @@ The memory is freed when frame_end is called.
 Must be called between frame_begin and frame_end.
 
 ```fides
-pub fn frame_alloc(fa: FrameArena, size: i64) -> i64 {
+pub fn frame_alloc(fa: &mut FrameArena, size: i64) -> i64 {
 ```
 
 **Parameters:**
 
-- `fa`: `FrameArena`
+- `fa`: `&mut FrameArena`
 - `size`: `i64`
 
 **Returns:** `i64`
 
-*Defined at line 231*
+*Defined at line 352*
 
 ---
 
@@ -390,7 +390,7 @@ pub fn frame_end(fa: FrameArena) -> void {
 
 **Returns:** `void`
 
-*Defined at line 239*
+*Defined at line 360*
 
 ---
 
@@ -410,7 +410,7 @@ pub fn frame_free(fa: FrameArena) -> void {
 
 **Returns:** `void`
 
-*Defined at line 246*
+*Defined at line 367*
 
 ---
 
@@ -428,7 +428,7 @@ pub fn frame_alloc_count(fa: FrameArena) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 251*
+*Defined at line 372*
 
 ---
 
@@ -444,7 +444,7 @@ pub fn http_request_arena_new() -> http_request_arena {
 
 **Returns:** `http_request_arena`
 
-*Defined at line 280*
+*Defined at line 400*
 
 ---
 
@@ -454,17 +454,17 @@ Allocate `size` bytes within an HTTP request arena.
 The memory is freed when http_request_arena_free is called.
 
 ```fides
-pub fn http_request_alloc(arena: http_request_arena, size: i64) -> i64 {
+pub fn http_request_alloc(_arena: http_request_arena, size: i64) -> i64 {
 ```
 
 **Parameters:**
 
-- `arena`: `http_request_arena`
+- `_arena`: `http_request_arena`
 - `size`: `i64`
 
 **Returns:** `i64`
 
-*Defined at line 286*
+*Defined at line 406*
 
 ---
 
@@ -483,7 +483,7 @@ pub fn http_request_arena_free(arena: http_request_arena) -> void {
 
 **Returns:** `void`
 
-*Defined at line 292*
+*Defined at line 412*
 
 ---
 

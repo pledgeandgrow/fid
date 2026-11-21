@@ -37,7 +37,7 @@
 pub const ASSET_TEXTURE: i64 = 0;
 ```
 
-*Defined at line 32*
+*Defined at line 29*
 
 ---
 
@@ -47,7 +47,7 @@ pub const ASSET_TEXTURE: i64 = 0;
 pub const ASSET_SOUND: i64 = 1;
 ```
 
-*Defined at line 33*
+*Defined at line 29*
 
 ---
 
@@ -57,7 +57,7 @@ pub const ASSET_SOUND: i64 = 1;
 pub const ASSET_FONT: i64 = 2;
 ```
 
-*Defined at line 34*
+*Defined at line 29*
 
 ---
 
@@ -67,7 +67,7 @@ pub const ASSET_FONT: i64 = 2;
 pub const ASSET_MESH: i64 = 3;
 ```
 
-*Defined at line 35*
+*Defined at line 29*
 
 ---
 
@@ -77,7 +77,7 @@ pub const ASSET_MESH: i64 = 3;
 pub const ASSET_TEXT: i64 = 4;
 ```
 
-*Defined at line 36*
+*Defined at line 29*
 
 ---
 
@@ -87,7 +87,7 @@ pub const ASSET_TEXT: i64 = 4;
 pub const ASSET_DATA: i64 = 5;
 ```
 
-*Defined at line 37*
+*Defined at line 29*
 
 ---
 
@@ -109,7 +109,7 @@ pub struct AssetEntry {
 | `last_modified` | `i64,   // file mtime (for hot reload)` |
 | `size` | `i64,             // size in bytes` |
 
-*Defined at line 41*
+*Defined at line 32*
 
 ---
 
@@ -129,7 +129,7 @@ pub struct AssetManager {
 | `total_loaded` | `i64` |
 | `total_memory` | `i64,     // estimated memory usage in bytes` |
 
-*Defined at line 51*
+*Defined at line 44*
 
 ---
 
@@ -143,7 +143,7 @@ pub fn asset_init() -> void {
 
 **Returns:** `void`
 
-*Defined at line 68*
+*Defined at line 73*
 
 ---
 
@@ -161,7 +161,7 @@ pub fn asset_set_root(path: str) -> void {
 
 **Returns:** `void`
 
-*Defined at line 75*
+*Defined at line 80*
 
 ---
 
@@ -179,7 +179,7 @@ pub fn asset_set_auto_reload(enabled: bool) -> void {
 
 **Returns:** `void`
 
-*Defined at line 80*
+*Defined at line 85*
 
 ---
 
@@ -197,7 +197,7 @@ pub fn asset_find(path: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 85*
+*Defined at line 90*
 
 ---
 
@@ -215,7 +215,7 @@ pub fn asset_load_texture(path: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 97*
+*Defined at line 102*
 
 ---
 
@@ -233,7 +233,7 @@ pub fn asset_load_sound(path: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 125*
+*Defined at line 126*
 
 ---
 
@@ -252,7 +252,7 @@ pub fn asset_load_font(path: str, size: f64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 152*
+*Defined at line 149*
 
 ---
 
@@ -270,7 +270,7 @@ pub fn asset_load_mesh(path: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 179*
+*Defined at line 172*
 
 ---
 
@@ -288,7 +288,7 @@ pub fn asset_load_text(path: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 206*
+*Defined at line 203*
 
 ---
 
@@ -306,7 +306,7 @@ pub fn asset_handle(idx: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 234*
+*Defined at line 227*
 
 ---
 
@@ -324,7 +324,7 @@ pub fn asset_type(idx: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 240*
+*Defined at line 235*
 
 ---
 
@@ -342,7 +342,7 @@ pub fn asset_path(idx: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 246*
+*Defined at line 243*
 
 ---
 
@@ -360,7 +360,7 @@ pub fn asset_release(idx: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 252*
+*Defined at line 251*
 
 ---
 
@@ -378,7 +378,7 @@ pub fn asset_unload(idx: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 267*
+*Defined at line 268*
 
 ---
 
@@ -396,7 +396,7 @@ pub fn asset_reload(idx: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 280*
+*Defined at line 283*
 
 ---
 
@@ -410,7 +410,7 @@ pub fn asset_hot_reload() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 311*
+*Defined at line 316*
 
 ---
 
@@ -424,7 +424,7 @@ pub fn asset_count() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 330*
+*Defined at line 335*
 
 ---
 
@@ -438,7 +438,7 @@ pub fn asset_memory_usage() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 335*
+*Defined at line 340*
 
 ---
 
@@ -452,7 +452,7 @@ pub fn asset_unload_all() -> void {
 
 **Returns:** `void`
 
-*Defined at line 340*
+*Defined at line 345*
 
 ---
 
@@ -466,7 +466,7 @@ pub fn asset_shutdown() -> void {
 
 **Returns:** `void`
 
-*Defined at line 350*
+*Defined at line 355*
 
 ---
 

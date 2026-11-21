@@ -35,7 +35,7 @@ pub struct Font {
 | `line_gap` | `f64,      // line gap` |
 | `line_height` | `f64,   // total line height (ascent - descent + line_gap)` |
 
-*Defined at line 28*
+*Defined at line 25*
 
 ---
 
@@ -57,7 +57,7 @@ pub struct Glyph {
 | `advance` | `f64,       // cursor advance after this glyph` |
 | `bitmap` | `Vec<i64>,   // grayscale pixels (0-255), width * height` |
 
-*Defined at line 38*
+*Defined at line 41*
 
 ---
 
@@ -77,7 +77,7 @@ pub fn font_load(path: str, pixel_size: f64) -> Font {
 
 **Returns:** `Font`
 
-*Defined at line 79*
+*Defined at line 92*
 
 ---
 
@@ -95,7 +95,7 @@ pub fn font_free(font: &mut Font) -> void {
 
 **Returns:** `void`
 
-*Defined at line 107*
+*Defined at line 115*
 
 ---
 
@@ -115,7 +115,7 @@ pub fn font_get_glyph(font: &Font, codepoint: i64) -> Glyph {
 
 **Returns:** `Glyph`
 
-*Defined at line 119*
+*Defined at line 127*
 
 ---
 
@@ -135,7 +135,7 @@ pub fn font_kern(font: &Font, ch1: i64, ch2: i64) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 153*
+*Defined at line 157*
 
 ---
 
@@ -154,7 +154,7 @@ pub fn font_text_width(font: &Font, text: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 161*
+*Defined at line 167*
 
 ---
 
@@ -173,7 +173,7 @@ pub fn font_text_height(font: &Font, text: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 170*
+*Defined at line 176*
 
 ---
 
@@ -193,7 +193,7 @@ pub fn font_render_text(font: &Font, text: str) -> Image {
 
 **Returns:** `Image`
 
-*Defined at line 184*
+*Defined at line 193*
 
 ---
 
@@ -216,7 +216,7 @@ pub fn font_render_text_colored(font: &Font, text: str, r: i64, g: i64, b: i64, 
 
 **Returns:** `Image`
 
-*Defined at line 245*
+*Defined at line 264*
 
 ---
 
@@ -226,7 +226,7 @@ pub fn font_render_text_colored(font: &Font, text: str, r: i64, g: i64, b: i64, 
 pub const BITMAP_FONT_WIDTH: i64 = 8;
 ```
 
-*Defined at line 276*
+*Defined at line 295*
 
 ---
 
@@ -236,7 +236,7 @@ pub const BITMAP_FONT_WIDTH: i64 = 8;
 pub const BITMAP_FONT_HEIGHT: i64 = 8;
 ```
 
-*Defined at line 277*
+*Defined at line 295*
 
 ---
 
@@ -255,7 +255,7 @@ pub fn font_bitmap_char(ch: i64) -> Image {
 
 **Returns:** `Image`
 
-*Defined at line 281*
+*Defined at line 413*
 
 ---
 
@@ -273,7 +273,7 @@ pub fn font_bitmap_text(text: str) -> Image {
 
 **Returns:** `Image`
 
-*Defined at line 308*
+*Defined at line 432*
 
 ---
 

@@ -4,7 +4,9 @@
 > The number-validation bug is still open; it now keeps a prefix instead of returning 0.
 
 - **Path:** `compiler/json.fd`
-- **LOC:** 666 (Rust `src/json.rs`: 289)
+- **LOC:** 729 (2026-11-21; 666 on Nov 9; Rust `src/json.rs`: 289). Nov 21: imported by
+  interp, lsp and main; still no surrogate-pair code. The other findings were not re-checked;
+  line numbers below are from Nov 9.
 - **Role:** leaf JSON module: `Json` enum (Null, Bool, Num(f64), Str, Arr, Obj), `JsonObject`
   (insertion-ordered keys, sorted on dump), `json_parse`, `json_dump` (compact / pretty),
   `json_escape_string`.

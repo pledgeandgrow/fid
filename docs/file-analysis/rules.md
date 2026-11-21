@@ -3,7 +3,15 @@
 > **New doc 2026-11-09.** Read at 822 lines while another session was editing it (read-only call
 > merging became opt-in, a library-facts reader was added). Line numbers are of that state.
 
-- **Path:** `compiler/rules.fd` — **822 LOC**
+> **Nov 21:** 1,079 lines. It imports `ast`, `checks`, `egraph`, `inc`,
+> `ir`, `ir_ser` (the mid-end memo, `FID_MECACHE`) and `iropt`. main.fd
+> runs it on the machine-layer path (Linux, macOS, `--nat`) and in
+> `emit-ir --mid-end`. The HIGH finding below was fixed Nov 15 (a write
+> after the second call on a loop back to it stops the merge, as the end
+> of that finding says), before readcse went on by default (Nov 17). Line
+> numbers below are from Nov 9.
+
+- **Path:** `compiler/rules.fd` — **822 LOC** on Nov 9 (1,079 on Nov 21)
 - **Role:** 27 identity rules on integer BinOps (`ru_rules` :71), applied in place (`ru_rewrite`
   :170); merging of repeated pure calls under dominance (`ru_pure_cse`, WP9) and, opt-in, of
   read-only calls with no write between (WP10); `fid test-rules` self-test and SMT-LIB proof files

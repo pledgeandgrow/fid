@@ -117,11 +117,12 @@ $ node scripts/wasm-run.mjs wc.wasm poem.txt
 ```
 
 The module targets WASI preview 1 and runs under any WASI host (Node,
-wasmtime, wasmer). Tasks run to their end when started, and there are no
-processes, signals or new sockets. Building WASI through C
-(`ccompile --target wasm32-wasi`) fails to compile the C runtime in the
-current build (`use of undeclared identifier 'SO_ERROR'`); use
-`fid wasm`.
+wasmtime, wasmer). Tasks switch stacks (since Nov 18), threads run to
+their end when started, and there are no processes, signals or new
+sockets. WASI through C
+(`CC="zig cc" fid ccompile --target wasm32-wasi`) also works: the
+`SO_ERROR` failure this chapter reported on Nov 15 no longer reproduces
+(known-bugs 2g.61, Nov 20).
 
 ## What the platforms are worth
 
@@ -133,7 +134,10 @@ are tested. Roughly:
 - **Linux x64, AArch64 and RISC-V 64 native** (`emit --target …-linux`)
   pass most of the test suite (around 270 of 317 tests matched the
   interpreter in the last run) and are built without a C toolchain.
-- **macOS, WASM and bare metal** build, and are not yet supported.
+- **macOS and WASI through C** (`ccompile --target`) build and are
+  partly tested (macos.yml has run the suite on macOS runners since
+  Nov 20); **native macOS, `fid wasm` and bare metal** build, and are not
+  yet supported.
 
 Ship on a tier-1 or tier-2 target, and keep your own tests running on
 exactly that target.
@@ -185,16 +189,11 @@ installer, signing, checksums — are in `docs/reference/releasing.md`.
 ## Common mistakes
 
 - **`emit` on Windows refusing a program.** If `fid emit` says
-  `not available in native Windows executables: pe_c_memchr`, the
-  program uses a string search (`str_find`, `str_contains`, …) and your
-  build's Windows back end lacks the C function the runtime calls for it.
-  Build that program with `ccompile`, or with `emit --target
-  x86_64-linux` for Linux.
-- **Program arguments under `fid run`.** The interpreter passes its own
-  command line through: under `fid run app.fd a b`, `arg_at(1)` is
-  `run`, `arg_at(2)` the file, and your first argument is `arg_at(3)`.
-  Built executables number arguments from 1. Test argument handling on a
-  build.
+  `not available in native Windows executables: <name>`, the program
+  uses a C function the Windows back end does not have (in builds of
+  Nov 15, `pe_c_memchr` for `str_find`; a Nov 21 build has it). Build
+  that program with `ccompile`, or with `emit --target x86_64-linux` for
+  Linux.
 - **Shipping a `ccompile --debug` build.** It is `-O0`. The default is
   `-O2`.
 - **Expecting `extern "C"` libraries in an `emit` build.** Only

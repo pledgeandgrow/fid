@@ -1,9 +1,14 @@
 # codegen_x64.fd — PIR L3 → x86-64 AT&T assembly
 
+> **Nov 21: dead.** Its only importer is pe.fd, itself unreached. MI18
+> (Nov 17) removed the PIR path: `fid codegen` and `build --native` build
+> through the machine layer (nat_ir), `emit --boot` through pe_ir. The
+> callers below are as of Nov 9.
+
 Re-audited 2026-11-09 (previous audit 2026-10-22/23).
 
 - **Path:** `compiler/codegen_x64.fd`
-- **LOC:** 2,000
+- **LOC:** 2,286 (2026-11-21; 2,000 on Nov 9)
 - **Role:** instruction selector of the old PIR path: `L3Module` +
   `regalloc.fd` allocation → AT&T asm (stack canary, overflow `jo`,
   division checks, recursion guard). Output goes through `peephole.fd` and

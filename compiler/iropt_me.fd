@@ -329,10 +329,46 @@ fn ime_remap(inst: Inst, vm: & Vec<i64>, bm: & Vec<i64>) -> Inst {
         Inst::Print(v, t) => {
             return Inst::Print(ime_v(vm, v), t);
         }
+        // 2g.109: these read a value too (forward renamed a loss's load
+        // everywhere but in its `backward`, which then read a value
+        // defined nowhere)
+        Inst::PersistLoad(nm, d, t) => {
+            return Inst::PersistLoad(nm, ime_v(vm, d), t);
+        }
+        Inst::PersistSave(nm, v) => {
+            return Inst::PersistSave(nm, ime_v(vm, v));
+        }
+        Inst::Backward(l) => {
+            return Inst::Backward(ime_v(vm, l));
+        }
         _ => {
         }
     }
     return inst;
+}
+
+/// 2g.109: per value (1), whether an instruction ime_remap does not rename
+/// reads it (a TryUnwrap, an asm! input): such a value must stay itself.
+fn ime_unrenamed_uses(f: & IrFunction) -> Vec<i64> {
+    var bad: Vec<i64> = peir_zeros(f.next_value + 1);
+    var i: i64 = 0;
+    while i < f.insts.len() {
+        var inst: Inst = f.insts.get(i).inst;
+        if !ime_remap_covers(inst) {
+            var ops: Vec<i64> = Vec::new();
+            peir_inst_operands(inst, & mut ops);
+            var o: i64 = 0;
+            while o < ops.len() {
+                var v: i64 = ops.get(o);
+                if v >= 0 && v < bad.len() {
+                    bad.set(v, 1);
+                }
+                o = o + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return bad;
 }
 
 /// Give copy `nid` (in `f`) the source line of `oid` (in `from`): a panic
@@ -1682,7 +1718,8 @@ fn ime_reduce_one(f: & mut IrFunction, cfg: & IroCfg, body: Vec<i64>, head: i64,
                                     step = sc;
                                     ok = true;
                                 }
-                                if binop_eq(sop, BinOp::Sub) {
+                                // (2g.89: -i64::MIN does not exist)
+                                if binop_eq(sop, BinOp::Sub) && sc != 0 - 9223372036854775807 - 1 {
                                     step = 0 - sc;
                                     ok = true;
                                 }
@@ -2536,6 +2573,15 @@ fn ime_remap_covers(inst: Inst) -> bool {
             return true;
         }
         Inst::Print(_, _) => {
+            return true;
+        }
+        Inst::PersistLoad(_, _, _) => {
+            return true;
+        }
+        Inst::PersistSave(_, _) => {
+            return true;
+        }
+        Inst::Backward(_) => {
             return true;
         }
         _ => {
@@ -6296,6 +6342,8 @@ pub fn ime_forward(f: & mut IrFunction) -> bool {
     var n: i64 = f.next_value + 1;
     var map: Vec<i64> = peir_zeros(n + 1);
     var dead: Vec<i64> = peir_zeros(n + 1);
+    // 2g.109: a load read where ime_remap cannot rename it stays
+    var fixed: Vec<i64> = ime_unrenamed_uses(f);
     var any: bool = false;
     var b: i64 = 0;
     while b < f.blocks.len() {
@@ -6328,7 +6376,7 @@ pub fn ime_forward(f: & mut IrFunction) -> bool {
                         }
                         i = i + 1;
                     }
-                    if known >= 0 && ir_type_eq(ime_type(f, known), t) && id < map.len() {
+                    if known >= 0 && ir_type_eq(ime_type(f, known), t) && id < map.len() && (id >= fixed.len() || fixed.get(id) == 0) {
                         map.set(id, ime_v(& map, known) + 1);
                         dead.set(id, 1);
                         any = true;

@@ -1,6 +1,6 @@
 # TEST.md — Fides Test Results
 
-*Last updated: Nov 9, 2026. The bootstrap fixpoint is VERIFIED byte-for-byte (stage 2 C == stage 3 C: 49 MB on Nov 6, checked by `RELEASE=1 scripts/bootstrap.sh`; 67 MB on Nov 8 with ownership 0004). 543 .fd test files under `tests/bootstrap/` (502 top level, 105 of them expected-fail), 51 in `tests/selfhost/`, 104 in `tests/conformance/`, 3 in `tests/leaks/`, 11 examples. Current results are in "Current Results" below; the Session-16-era tables after it are kept for history — see `tests/bootstrap/baseline/test_results.txt` (via `./verify.sh`) for the saved baseline, and [selfhost.md → Numbers](selfhost.md#numbers) for the project's counts.*
+*Last updated: Nov 21, 2026. The bootstrap fixpoint is VERIFIED byte-for-byte (stage 2 C == stage 3 C: 49 MB on Nov 6, checked by `RELEASE=1 scripts/bootstrap.sh`; 67 MB on Nov 8 with ownership 0004); not re-verified on the current tree (a `fid` built by `fidesc` runs out of memory self-compiling it, known-bugs 2g.79). 1,753 .fd test files under `tests/bootstrap/` (1,682 top level, 458 of them expected-fail), 57 in `tests/selfhost/`, 1,596 in `tests/conformance/`, 10 in `tests/leaks/`, 12 examples. Current results are in "Current Results" below; the Session-16-era tables after it are kept for history — see `tests/bootstrap/baseline/test_results.txt` (via `./verify.sh`) for the saved baseline, and [selfhost.md → Numbers](selfhost.md#numbers) for the project's counts.*
 
 ## Current Results
 
@@ -47,6 +47,13 @@ envtrim, gconst and deadf; fixed again that evening in fid31, which matches the 
 | Encoder oracle (`scripts/enc-oracle.py`) | 1,181 forms, 0 mismatches against clang's assembler |
 | Rewrite rules (`scripts/rules-smt.sh`) | all 108 obligations proved by z3 |
 
+**Nov 21 (fid only, quick runs; the full suite was not run):** the tree
+(86cc919) built in one step from a self-hosted stage 0 (the `fid` of
+Nov 18; 8 split units at -O2, a 15 MB `fid`). That `fid` passes `run`,
+`emit` (pe_ir) and `ccompile` of hello and the leak gate (10 of 10). The
+Nov 21 check of 224 roadmap goals with it: 87 validated, 121 partly, 15
+failed, 1 not checkable; the bugs found are known-bugs 2g.80-2g.113.
+
 **Self-hosted compiler vs `fidesc`** (same program, outputs compared),
 Oct 27, 2026, on the 302 test programs of that date — not rerun since the
 suite grew:
@@ -64,9 +71,9 @@ To rerun it: `fidesc test --compiler release/fid.exe` sends `run`,
 
 | Tool | State |
 |---|---|
-| `bench/run.sh`, `bench/check.sh` | Built and in use. `check.sh` fails on a slowdown over `LIMIT_PCT` against `bench/baseline.txt`; not in CI |
-| `scripts/sanitize.sh` | Written, not run: the tests through C under ASan/UBSan; needs clang with ASan (Linux/macOS); `FIDES_CFLAGS` passes extra C flags |
-| `scripts/fuzz/nightly.sh` + `checked` backend in `scripts/fuzz/gen_programs.py` | Written, not run. No CI workflow in the repo schedules it |
+| `bench/run.sh`, `bench/check.sh` | Built and in use. `check.sh` fails on a slowdown over `LIMIT_PCT` against its baseline file (`BENCH_BASE`, default `bench/baseline.txt`, not in the tree); `.github/workflows/bench.yml` runs `bench/check.sh --ab` (Nov 21) |
+| `scripts/sanitize.sh` | The tests through C under ASan/UBSan; needs clang with ASan (Linux/macOS); `FIDES_CFLAGS` passes extra C flags. Scheduled nightly in `.github/workflows/verify-nightly.yml` (Nov 21) |
+| `scripts/fuzz/nightly.sh` + `checked` backend in `scripts/fuzz/gen_programs.py` | Scheduled nightly in `.github/workflows/verify-nightly.yml`, with `gen_vs_c.py`, `fuzz_frontend.py` and `fuzz_parsers.py` (Nov 21) |
 | `fid emit --checked-alloc` | Written, not run: every block on pages of its own, ending at a guard page; freed pages inaccessible, never reused |
 | `fid run --leaks`, `fid run --checked-alloc` | The C runtime's debug allocator (leak report, use after free) |
 

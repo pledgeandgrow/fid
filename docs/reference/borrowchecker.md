@@ -7,14 +7,18 @@
 > This document was written as the design for the Rust compiler. The rules
 > as `fid` applies them are in [reference.md §8.4](reference.md#84-references).
 
-## Current State (Nov 6, 2026)
+## Current State (Nov 6, 2026; K5 additions to Nov 19)
 
 `fid` checks, besides the three rules:
 
 - **K4, iterator invalidation:** changing a `Vec` while a `for` loop walks it
   is an error (`test_iter_invalidation_fail.fd`).
 - **K5:** `s.x = 1` while `s` is borrowed is an error; `&v[i]` is a borrow of
-  `v`; trait impl bodies are borrow-checked.
+  `v`; trait impl bodies are borrow-checked. Since Nov 15 a nested write
+  `s.a.z =` checks every prefix and casts are descended (known-bugs 2g.9);
+  since Nov 19 `&mut v[0]` and `&mut v[1]` with distinct constant indices
+  are two element borrows that do not conflict (2g.73), and borrows across
+  calls follow [lifetimes-across-calls.md](lifetimes-across-calls.md) (LG3).
 - **Escape check** (`compiler/escape.fd`): a reference cannot be stored,
   returned from a local, outlive its block, or be sent to another task.
 - **Borrowed strings:** a `str` field of a `@scoped` struct reads as `&str`,

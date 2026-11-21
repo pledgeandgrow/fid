@@ -35,7 +35,7 @@ pub struct NavGrid {
 | `height` | `i64` |
 | `cells` | `Vec<bool>,     // true = blocked` |
 
-*Defined at line 24*
+*Defined at line 20*
 
 ---
 
@@ -52,7 +52,7 @@ pub fn nav_grid_create(width: i64, height: i64) -> NavGrid {
 
 **Returns:** `NavGrid`
 
-*Defined at line 30*
+*Defined at line 40*
 
 ---
 
@@ -71,7 +71,7 @@ pub fn nav_grid_set_blocked(grid: &mut NavGrid, x: i64, y: i64, blocked: bool) -
 
 **Returns:** `void`
 
-*Defined at line 44*
+*Defined at line 52*
 
 ---
 
@@ -89,7 +89,7 @@ pub fn nav_grid_is_blocked(grid: &NavGrid, x: i64, y: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 49*
+*Defined at line 59*
 
 ---
 
@@ -106,7 +106,7 @@ pub fn nav_grid_index(x: i64, y: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 54*
+*Defined at line 66*
 
 ---
 
@@ -122,7 +122,7 @@ pub fn nav_grid_unpack(idx: i64) -> vec2 {
 
 **Returns:** `vec2`
 
-*Defined at line 58*
+*Defined at line 71*
 
 ---
 
@@ -146,7 +146,7 @@ pub struct AStarNode {
 | `open` | `bool` |
 | `closed` | `bool` |
 
-*Defined at line 63*
+*Defined at line 76*
 
 ---
 
@@ -168,7 +168,7 @@ pub fn nav_grid_find_path(grid: &NavGrid, start_x: i64, start_y: i64, goal_x: i6
 
 **Returns:** `Vec<i64>`
 
-*Defined at line 76*
+*Defined at line 92*
 
 ---
 
@@ -186,7 +186,7 @@ pub fn nav_grid_path_length(path: Vec<i64>) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 223*
+*Defined at line 249*
 
 ---
 
@@ -205,7 +205,7 @@ pub fn nav_grid_path_waypoint(path: Vec<i64>, idx: i64) -> vec2 {
 
 **Returns:** `vec2`
 
-*Defined at line 228*
+*Defined at line 254*
 
 ---
 
@@ -224,7 +224,7 @@ pub struct NavPoly {
 | `center_y` | `f64` |
 | `neighbors` | `Vec<i64>,    // adjacent polygon IDs` |
 
-*Defined at line 235*
+*Defined at line 263*
 
 ---
 
@@ -240,7 +240,7 @@ pub struct NavMesh {
 |------|------|
 | `polygons` | `Vec<NavPoly>` |
 
-*Defined at line 242*
+*Defined at line 270*
 
 ---
 
@@ -252,7 +252,7 @@ pub fn navmesh_create() -> NavMesh {
 
 **Returns:** `NavMesh`
 
-*Defined at line 246*
+*Defined at line 274*
 
 ---
 
@@ -272,7 +272,7 @@ pub fn navmesh_add_polygon(mesh: &mut NavMesh, center_x: f64, center_y: f64) -> 
 
 **Returns:** `i64`
 
-*Defined at line 251*
+*Defined at line 281*
 
 ---
 
@@ -292,7 +292,7 @@ pub fn navmesh_connect(mesh: &mut NavMesh, a: i64, b: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 263*
+*Defined at line 290*
 
 ---
 
@@ -312,7 +312,7 @@ pub fn navmesh_find_path(mesh: &NavMesh, start: i64, goal: i64) -> Vec<i64> {
 
 **Returns:** `Vec<i64>`
 
-*Defined at line 275*
+*Defined at line 306*
 
 ---
 
@@ -331,7 +331,7 @@ pub fn navmesh_poly_center(mesh: &NavMesh, id: i64) -> vec2 {
 
 **Returns:** `vec2`
 
-*Defined at line 382*
+*Defined at line 419*
 
 ---
 
@@ -349,7 +349,7 @@ pub fn navmesh_poly_count(mesh: &NavMesh) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 389*
+*Defined at line 428*
 
 ---
 

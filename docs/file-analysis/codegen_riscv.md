@@ -1,9 +1,13 @@
 # codegen_riscv.fd — PIR L3 → RISC-V 64 assembly
 
+> **Nov 21: dead.** Nothing imports it. MI18 (Nov 17) removed the PIR
+> path: `fid codegen --target riscv` builds through the machine layer
+> (nat_ir, `riscv64-linux`). The callers below are as of Nov 9.
+
 Re-audited 2026-11-09 (previous audit 2026-10-22/23).
 
 - **Path:** `compiler/codegen_riscv.fd`
-- **LOC:** 554
+- **LOC:** 679 (2026-11-21; 554 on Nov 9)
 - **Role:** instruction selector of the old PIR path for RV64: a clone of
   codegen_arm64 with RISC-V mnemonics (vregs `5 + id % 23`, fixed
   256-byte frame). Port of `src/codegen_riscv.rs`. The working RISC-V

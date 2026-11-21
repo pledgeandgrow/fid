@@ -81,6 +81,13 @@ blocker for pinning was that a natively built `fid` stopped with "Invalid
 free" while string length headers (roadmap RT2) were unfinished in the native
 runtime; that has not been rechecked since.
 
+Nov 21: still no stage 0 is pinned. A cold start from `fidesc` no longer
+reaches the fixpoint on the current tree: the `fid` that `fidesc` builds
+runs out of memory self-compiling it (known-bugs 2g.79). A self-hosted
+`fid` of Nov 18 used as stage 0 (`STAGE0=<exe>`) built the tree in one step
+(8 split units at -O2), and the result passes run, emit, ccompile and the
+leak gate, so the bootstrap can start from a self-hosted stage 0.
+
 The language is what `fid` accepts, described in [reference.md](reference.md).
 `fidesc` checks less (see
 [language-guide.md § 10](language-guide.md#where-fid-and-fidesc-differ-nov-4)).

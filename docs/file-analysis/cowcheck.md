@@ -4,7 +4,9 @@
 > probes (`s18.exe run` / `emit`).
 
 - **Path:** `compiler/cowcheck.fd`
-- **LOC:** 603 (no Rust counterpart)
+- **LOC:** 1,313 (2026-11-21; 603 on Nov 9; no Rust counterpart). The
+  report is still opt-in (`FIDES_COW_CHECK`) and the file still has no
+  `module` line. Line numbers below are from Nov 9.
 - **Role:** Two jobs. (1) The migration report of proposal 0001 / release M5 (`FIDES_COW_CHECK=1`): a local copied from a place, changed through a Vec, and never written back. (2) AST walkers that `lower.fd` uses for ownership decisions (proposal 0004): `cow_first_change`, `cow_written_back`, `cow_root`, `cow_uses_stmt(s)`/`cow_uses_expr`.
 - **Imports:** `core`, `vec`, `string`, `compiler::ast`. The file has no `module compiler::cowcheck;` line (every other compiler module has one); it is imported as `compiler::cowcheck` all the same.
 

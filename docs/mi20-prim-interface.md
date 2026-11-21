@@ -1,7 +1,7 @@
 # One interface for the runtime's machine-code primitives (MI20)
 
 Every native backend defines the same set of `nat_*` primitives, the
-machine-code pieces a runtime cannot write in Fides: system calls and
+machine-code pieces a runtime cannot write in Fid: system calls and
 threads, the thread word, signals, atomics, the task context switch,
 calls by address, traces (frame records and the function tables), the
 start block, and a few target facts. The list is

@@ -25,7 +25,8 @@ toolchain, and the best panic traces (with line numbers). It is also slow
 speed in a build, not under `run`.
 
 `fid ccompile` uses the C compiler in `CC`. **When `CC` is not set it
-tries `tcc`**, and fails if you don't have it. With zig installed:
+looks for `gcc`, `clang`, `tcc` and `cl.exe`** (`cc` too on Linux), and
+fails if you have none of them. With zig installed:
 
 ```bash
 CC="zig cc" fid ccompile app.fd -o app.exe
@@ -260,9 +261,8 @@ sampling profiler built into Linux programs made by `fid emit`: run them
 with `FID_PROF=1` for a table of functions by self and total samples on
 stderr at exit.
 
-`fid bench app.fd -n 10` builds the program and runs it `n` times. In
-current builds it always uses `tcc`, whatever `CC` says; without `tcc`,
-build the executable yourself and time it.
+`fid bench app.fd -n 10` builds the program through `fid ccompile` (with
+`CC` when it is set, else the default C compiler) and times `n` runs.
 
 ## Talking to C
 
@@ -369,7 +369,7 @@ build predates them.
   loads yours, and every `channel_*` call is an `undefined function`.
   Don't reuse standard module names for your files.
 - **A `main` in the test file.** `fid test` refuses it:
-  `a test file holds only fn test_*() and fn bench_*()`.
+  `a test file holds only fn test_*(), fn bench_*() and fn fuzz_*(data: Vec<u8>)`.
 - **Benchmarking `fid run`.** It is an interpreter. Use `emit` or
   `ccompile` for anything timed.
 - **Running `fmt` on uncommitted work.** It rewrites in place; check the

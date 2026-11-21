@@ -14,8 +14,26 @@
 > into `compiler/ir.fd` (:2019-2340), next to the new
 > `IrModule_dead_function_elimination`. Line numbers below are **HEAD's**.
 
+> **Nov 21:** 10,196 lines. The move described above is done: the name
+> resolution and reachability helpers (`pert_name`, `pe_runtime_alias`,
+> `pe_ir_reachable_from`, ...) are in ir.fd. 90 `PeirGen_gen_*`
+> generators; the old machine `p_vec_*` stubs (`PeirGen_gen_vec_new`, ...)
+> are still in the file and still called from the stub list. Importers:
+> pe_ir, iropt, nat_ir, main.
+>
+> **Nov 21, uncommitted — 2g.96 and an argv over-allocation (RL16)
+> fixed.** `PeirGen_gen_to_str`'s itoa buffer was 16 bytes at rbp-40,
+> under the saved r14 at rbp-24: a number of 16 or more characters
+> (i64::MIN is 20 and its NUL) overwrote the caller's r14, and
+> test_simd_i64's `wrap:` line crashed (OP21). It is a 32-byte buffer at
+> rbp-56 now (frame 56 → 72). `PeirGen_gen_argv` passed the token's
+> address as the copy size (a block of megabytes per argument that
+> `--leaks` reported); it scans the token for its space or NUL end and
+> allocates length + 1 (:8105-8124). Line numbers below are HEAD's of
+> Nov 9.
+
 - **Path:** `compiler/pe_ir_stubs.fd`
-- **LOC:** 7,071 at HEAD (INDEX.md says 5,539); 6,755 in the working copy.
+- **LOC:** 10,196 (2026-11-21). On Nov 9: 7,071 at HEAD (INDEX.md said 5,539); 6,755 in the working copy.
 - **Role:** The `PeirGen` state (:144) and everything pe_ir emits that is not
   a user instruction: 79 `PeirGen_gen_*` machine-code generators (print,
   panic, allocator, strings, StringBuilder, files, argv, `p_system`, Vec and

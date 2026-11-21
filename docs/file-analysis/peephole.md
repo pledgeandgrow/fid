@@ -1,10 +1,15 @@
 # peephole.fd — asm-level peephole optimizer
 
+> **Nov 21: dead.** Its only importer is pe.fd, itself unreached; compiler.fd
+> and main.fd no longer import it since MI18 (Nov 17) removed the PIR path
+> (`fid codegen` has no `--peephole`; `emit --boot` goes through pe_ir).
+> 1,331 lines now. The callers below are as of Nov 9.
+
 > **Re-audited 2026-11-09.** Unchanged since Oct 23 except one line (Nov 1). It is no longer
 > "always on in `build`": default `build`/`emit` go through pe_ir (Windows), C (posix) or nat_ir,
 > none of which emits text asm.
 
-- **Path:** `compiler/peephole.fd` — **1,151 LOC** (Rust `src/peephole.rs` = 994)
+- **Path:** `compiler/peephole.fd` — **1,331 LOC** (2026-11-21; 1,151 on Nov 9; Rust `src/peephole.rs` = 994)
 - **Role:** 9 string-level passes over x86-64 AT&T asm from `codegen_x64.fd`, 5-iteration
   fixpoint (`peephole_optimize` :46).
 

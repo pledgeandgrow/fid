@@ -13,7 +13,7 @@ translation it found. Review the output before using it.
 CC="zig cc" fid ccompile tools/c2fd.fd -o c2fd.exe
 ./c2fd.exe input.c > output.fd
 
-# the interpreter accepts it too, but it is very slow on an 8,500-line
+# the interpreter accepts it too, but it is very slow on a 9,700-line
 # program: use the built one
 fid run tools/c2fd.fd input.c > output.fd
 ```

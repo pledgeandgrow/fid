@@ -36,7 +36,7 @@ pub struct Chunk {
 | `last_used` | `i64,   // tick counter for LRU eviction` |
 | `data` | `Vec<i64>,   // chunk data (tile IDs, entity IDs, etc.)` |
 
-*Defined at line 19*
+*Defined at line 18*
 
 ---
 
@@ -59,7 +59,7 @@ pub struct StreamManager {
 | `load_count` | `i64,       // total chunks loaded` |
 | `unload_count` | `i64,     // total chunks unloaded` |
 
-*Defined at line 29*
+*Defined at line 32*
 
 ---
 
@@ -80,7 +80,7 @@ pub fn streaming_create(chunk_size: i64, view_radius: i64) -> StreamManager {
 
 **Returns:** `StreamManager`
 
-*Defined at line 45*
+*Defined at line 66*
 
 ---
 
@@ -100,7 +100,7 @@ pub fn streaming_set_focus(mgr: &mut StreamManager, x: i64, y: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 61*
+*Defined at line 75*
 
 ---
 
@@ -120,7 +120,7 @@ pub fn streaming_world_to_chunk(mgr: StreamManager, x: i64, y: i64) -> (i64, i64
 
 **Returns:** `(i64, i64)`
 
-*Defined at line 67*
+*Defined at line 81*
 
 ---
 
@@ -140,7 +140,7 @@ pub fn streaming_chunk_to_world(mgr: StreamManager, cx: i64, cy: i64) -> (i64, i
 
 **Returns:** `(i64, i64)`
 
-*Defined at line 72*
+*Defined at line 86*
 
 ---
 
@@ -160,7 +160,7 @@ pub fn streaming_find_chunk(mgr: StreamManager, cx: i64, cy: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 79*
+*Defined at line 93*
 
 ---
 
@@ -180,7 +180,7 @@ pub fn streaming_is_chunk_loaded(mgr: StreamManager, cx: i64, cy: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 92*
+*Defined at line 106*
 
 ---
 
@@ -199,7 +199,7 @@ pub fn streaming_update(mgr: &mut StreamManager) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 103*
+*Defined at line 119*
 
 ---
 
@@ -217,7 +217,7 @@ pub fn streaming_loaded_count(mgr: StreamManager) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 185*
+*Defined at line 201*
 
 ---
 
@@ -235,7 +235,7 @@ pub fn streaming_total_loaded(mgr: StreamManager) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 199*
+*Defined at line 215*
 
 ---
 
@@ -253,7 +253,7 @@ pub fn streaming_total_unloaded(mgr: StreamManager) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 204*
+*Defined at line 220*
 
 ---
 
@@ -271,7 +271,7 @@ pub fn streaming_view_diameter(mgr: StreamManager) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 209*
+*Defined at line 225*
 
 ---
 
@@ -291,7 +291,7 @@ pub fn streaming_is_position_loaded(mgr: StreamManager, x: i64, y: i64) -> bool 
 
 **Returns:** `bool`
 
-*Defined at line 214*
+*Defined at line 230*
 
 ---
 
@@ -314,7 +314,7 @@ pub fn streaming_get_chunk_data(mgr: StreamManager, cx: i64, cy: i64, local_x: i
 
 **Returns:** `i64`
 
-*Defined at line 224*
+*Defined at line 240*
 
 ---
 
@@ -337,7 +337,7 @@ pub fn streaming_set_chunk_data(mgr: &mut StreamManager, cx: i64, cy: i64, local
 
 **Returns:** `void`
 
-*Defined at line 236*
+*Defined at line 256*
 
 ---
 
@@ -355,7 +355,7 @@ pub fn streaming_stats(mgr: StreamManager) -> str {
 
 **Returns:** `str`
 
-*Defined at line 249*
+*Defined at line 275*
 
 ---
 

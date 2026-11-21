@@ -12,21 +12,23 @@
 
 ## par_map
 
-Parallel map: apply a function to each element of a Vec.
-Currently sequential — parallel write to a shared result Vec requires
-finer-grained synchronization. Each element is independent.
+Parallel map: `out[i] = f(v[i])` for every element.
+For large inputs (>= PAR_THRESHOLD) two OS threads each write a
+disjoint half of a preallocated result Vec — truly parallel, since no
+element is written twice. Small inputs run sequentially.
 
 ```fides
-pub fn par_map(n: i64) -> Vec<i64> {
+pub fn par_map(v: Vec<i64>, f: fn(i64) -> i64) -> Vec<i64> {
 ```
 
 **Parameters:**
 
-- `n`: `i64`
+- `v`: `Vec<i64>`
+- `f`: `fn(i64) -> i64`
 
 **Returns:** `Vec<i64>`
 
-*Defined at line 58*
+*Defined at line 124*
 
 ---
 
@@ -46,7 +48,7 @@ pub fn par_sum(data: Vec<i64>) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 71*
+*Defined at line 218*
 
 ---
 
@@ -67,7 +69,7 @@ pub fn par_dot(a: Vec<i64>, b: Vec<i64>) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 94*
+*Defined at line 241*
 
 ---
 
@@ -89,7 +91,7 @@ pub fn par_fill(n: i64, value: i64) -> Vec<i64> {
 
 **Returns:** `Vec<i64>`
 
-*Defined at line 118*
+*Defined at line 275*
 
 ---
 
@@ -109,7 +111,7 @@ pub fn par_range(start: i64, end: i64) -> Vec<i64> {
 
 **Returns:** `Vec<i64>`
 
-*Defined at line 130*
+*Defined at line 287*
 
 ---
 
@@ -129,7 +131,7 @@ pub fn is_parallelizable(effect_mask: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 143*
+*Defined at line 300*
 
 ---
 
@@ -145,7 +147,7 @@ pub fn parallel_hint() -> void {
 
 **Returns:** `void`
 
-*Defined at line 158*
+*Defined at line 315*
 
 ---
 

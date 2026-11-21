@@ -23,7 +23,7 @@ pub fn all_reduce(t: Tensor) -> Tensor {
 
 **Returns:** `Tensor`
 
-*Defined at line 12*
+*Defined at line 17*
 
 ---
 
@@ -41,7 +41,7 @@ pub fn broadcast(t: Tensor) -> Tensor {
 
 **Returns:** `Tensor`
 
-*Defined at line 17*
+*Defined at line 22*
 
 ---
 
@@ -59,7 +59,7 @@ pub fn all_gather(t: Tensor) -> Tensor {
 
 **Returns:** `Tensor`
 
-*Defined at line 22*
+*Defined at line 27*
 
 ---
 
@@ -77,7 +77,7 @@ pub fn scatter(t: Tensor) -> Tensor {
 
 **Returns:** `Tensor`
 
-*Defined at line 27*
+*Defined at line 32*
 
 ---
 
@@ -95,7 +95,7 @@ pub fn send_tensor(t: Tensor) -> void {
 
 **Returns:** `void`
 
-*Defined at line 32*
+*Defined at line 37*
 
 ---
 
@@ -113,7 +113,7 @@ pub fn recv_tensor(shape: Vec<i64>) -> Tensor {
 
 **Returns:** `Tensor`
 
-*Defined at line 37*
+*Defined at line 42*
 
 ---
 

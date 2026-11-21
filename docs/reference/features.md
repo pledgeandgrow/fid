@@ -8,31 +8,37 @@ reference.md is right. Counts: [selfhost.md → Numbers](selfhost.md#numbers).*
 *See `docs/reference/syntax.md` for the language syntax and
 [safety-rules.md](safety-rules.md) for the safety annotations.*
 
-## Current State (Nov 19, 2026 — "1.0 release preparation" commit)
+## Current State (Nov 19, 2026 — "1.0 release preparation" commit; counts and build rechecked Nov 21)
 
-- Compiler: `compiler/*.fd`, 80 modules, 360,594 lines; `src/*.rs` (frozen
-  bootstrap reference and test harness), 57 files, 113,416 lines; stdlib 403
+- Compiler (counted Nov 21): `compiler/*.fd`, 80 modules, 360,657 lines; `src/*.rs` (frozen
+  bootstrap reference and test harness), 57 files, 114,184 lines; stdlib 403
   modules, 259,299 lines (+ 4 in `stdlib/pe_runtime/`, 7 in
   `stdlib/linux_runtime/` incl. `darwin.fd` and `wasi.fd`).
-- Tests: 1,752 `.fd` under `tests/bootstrap/` (1,681 top level, 456 of them
+- Tests: 1,753 `.fd` under `tests/bootstrap/` (1,682 top level, 456 of them
   expected-fail `*_fail.fd`), 57 in `tests/selfhost/`, 1,596 in
   `tests/conformance/`, 10 in `tests/leaks/`, 68 in `tests/nattools/`, 52 in
   `tests/projects/`, 50 in `tests/verify/`, 14 + 126 check scripts in
   `tests/tooling/`, 12 examples, 12 tools in `tools/`.
 - Fixpoint: stage 2 C == stage 3 C, 49 MB (Nov 6; last verified before the
   ~2.3x Nov 10–19 growth — re-verification is part of the release prep).
-  Self-compile ~74 s when the compiler was 159K lines (Nov 9).
+  Self-compile ~74 s when the compiler was 159K lines (Nov 9); 57 s at -O2
+  for the 361K-line tree (Nov 21).
+- Build (Nov 21): a fid built by `fidesc` runs out of memory self-compiling
+  the tree (known-bugs 2g.79). The tree builds in one step from the
+  self-hosted fid of Nov 18 as stage 0 (15 MB at -O2, 8 split units), and
+  that build passes run, emit, ccompile and the 10-program leak gate.
+  `scripts/build-selfhost.sh` can fall back to -O0 without an error (2g.86).
 - Last full suite run: Nov 2 (Rust harness, `fidesc` as compiler): interp
   339/339, C 343/343, PE 345/345, expected-fail 89/89 — on a suite a third
-  of today's size. The `fid`/`fid-dev` binaries in `release/` predate the
-  current stdlib and fail to parse `stdlib/core.fd`; rebuild with
-  `scripts/build-selfhost.sh`.
+  of today's size. Nov 21 check of 224 compiler goals (docs/roadmap/*.md):
+  87 validated, 121 partly, 15 failed, 1 not checkable; the bugs it found
+  are known-bugs 2g.80–2g.113.
 - Backends: interpreter (`fid run`), C (`fid ccompile`, needs zig cc, clang,
   gcc or cl), native Windows x64 (`fid emit`, no C compiler), native Linux
   x64/AArch64/RISC-V (`fid emit --target`), native WASM (`fid wasm`), macOS
   Mach-O and universal binaries (build, not run), Cortex-M Thumb-2, UEFI
-  and multiboot images. Linux x64 through C also works. Bare metal and the
-  retired PIR path are incomplete.
+  and multiboot images. Linux x64 through C also works. Bare metal is
+  experimental; the retired PIR path is no longer reached (Nov 17, MI18).
 
 ### New in `fid` since Nov 3
 
@@ -47,7 +53,7 @@ reference.md is right. Counts: [selfhost.md → Numbers](selfhost.md#numbers).*
 | Higher-order effects | ✅ | A function taking a function value gets the effects of the function passed at each call site (`effects/test_effect_ho_instantiation`) |
 | `@send` | ✅ | Every argument of a spawned call must be `@send`; a struct of `@send` fields is `@send`; raw pointers and references are not (`test_race_ptr_fail`) |
 | `parallel { \| a \| b }` | ✅ | `x = f(..)` branches and multi-statement branches that only read word-sized locals run on threads (`test_parallel_branches`, all 3 backends) |
-| `async fn` with f64/struct | ⚠️ | Runs as a task in the interpreter and C; native async crashes |
+| `async fn` with f64/struct | ✅ | Runs as a task in the interpreter, C and native (`test_async_float_struct`; native fixed Nov 9, known-bugs 2f.2) |
 | Per-thread allocation | ⚠️ | C runtime: per-thread arenas and free lists; native runtime: per-thread free lists. Written Nov 4, exercised by every native test; no multi-thread stress test run |
 | Safety annotations | ✅ | `@no-alloc` sees `.push()`, `Vec::new()`, string `+`; `@no-indirect` rejects calls through function parameters; `@firmware` rejects OS runtime calls; `@gas` counts literal loop trip counts; `@tainted` on parameters; `@no-recursion`, `@bounded-stack`. 17 rules, each with a negative test |
 | `fid qualify <file.fd> [-o out.json]` | ✅ | JSON evidence (compiler and source hashes, check result, annotated functions, each rule with its requirement and tests). Always `NOT_QUALIFIED`: evidence, not a certificate |
@@ -56,7 +62,7 @@ reference.md is right. Counts: [selfhost.md → Numbers](selfhost.md#numbers).*
 | Native IR optimizer | ✅ | `fid emit`: inlining of small single-block functions, constant folding, dead code removal (`compiler/iropt.fd`) |
 | core.fd check stamp | ✅ | core.fd is type-checked once per (compiler, core.fd) pair; `FIDES_CHECK_CORE=1` forces it. `.fidcache/` evicts least recently used artifacts past 64 files or 1 GB |
 | `fid emit --checked-alloc` | written, not run | Every block on pages of its own, ending at a guard page; freed pages inaccessible, never reused |
-| `scripts/sanitize.sh`, `scripts/fuzz/nightly.sh` | written, not run | ASan/UBSan through C (needs clang with ASan); fuzzing with a `checked` backend; no CI workflow schedules it |
+| `scripts/sanitize.sh`, `scripts/fuzz/nightly.sh` | ✅ run | ASan/UBSan through C; fuzzing with a `checked` backend. First runs Nov 16–17 (docs/verification/sanitizers-2026-11-17.md, fuzz-runs.md); ci.yml runs sanitize.sh on six tests, verify-nightly.yml runs both |
 | Value semantics (proposals 0001, 0004) | ✅ | Since the ownership rule of 0004 (`LOWER_RC` on, Nov 7–8): `var b = a` on a `Vec`, `str` or `HashMap` gives an independent value, shared until the first write copies it (checked Nov 9, interpreter and C). A copied struct's `Vec` fields are separate too (`var t = s; t.v.push(2)` leaves `s.v` unchanged, run/C/native, Nov 15). `LOWER_COW`, 0001's lowering, is off |
 
 ## Legend
@@ -77,7 +83,7 @@ reference.md is right. Counts: [selfhost.md → Numbers](selfhost.md#numbers).*
 | IR Lowering (lower.rs) | ✅ | AST → typed SSA IR with effects/regions |
 | IR Interpreter (interp.rs) | ✅ | Runs IR directly via `fidesc run` |
 | PE Emitter (pe.rs) | ✅ | Generates native x64 PE executables. In `fid`, `fid emit` (`compiler/pe_ir*.fd`) is the native Windows path; bare metal (`emit --bare`, pe_ir_stubs) builds since Nov 6, not yet run under QEMU |
-| ELF64 Emitter (elf64.rs) | ⚠️ | Experimental / incomplete; Linux x64 goes through C |
+| ELF64 Emitter (elf64.rs) | ⚠️ | Experimental / incomplete in `fidesc`; in `fid`, Linux x64 ELF comes from the machine layer (nat_ir) |
 | C Codegen (codegen_c.rs) | ✅ | Generates C code, 198/211 tests match interpreter output. Phase 10B: Print calls Fides Vec_to_str/HashMap_to_str for formatting. Binary hardening: stack canaries, PIE/ASLR, RELRO, NX stack. Stack traces on panic via p_call_stack. Rc/Arc runtime via p_rc_incr/p_rc_decr. Drop trait: compiler-inserted drop calls. Negative size checks on p_malloc/p_shared_alloc/p_allocator_alloc. ftell failure check on p_file_read/p_file_size. |
 | PIR (pir.rs) | ✅ | PIR L1/L2/L3, `fidesc pir` command |
 | Optimizer (opt.rs) | ✅ | 23 passes: const-fold, CSE, GVN, SROA, DSE, DCE, inline, unroll, TCO, alias-analysis, effect-reorder, partial-eval, vectorize, strength-reduce, devirt, jump-thread, loop-rotate, loop-vec, effect-opt, region-pool, reassociate, memoize. 22 in default pass list. Enabled by default in `build` (use `--no-opt` to disable). `--lto` for aggressive inlining. |
@@ -99,7 +105,7 @@ reference.md is right. Counts: [selfhost.md → Numbers](selfhost.md#numbers).*
 | Target Triple Parsing | ✅ | `parse_target_triple()` normalizes arch-os format strings |
 | @cpu_local variables | ❌ | In `fid` no pass reads it: it is valid only on globals, which cannot carry annotations (the Rust PE emitter had GS-relative addressing) |
 | Inline asm clobbers | ✅ | `clobber("reg")` syntax, clobber save/restore in PE backend, 50+ x86 instructions encoded |
-| No-stdlib mode | ✅ | `--bare` / `--no-std` / `--no-stdlib` skips stdlib/core.fd, zero hidden runtime deps |
+| No-stdlib mode | ✅ | `--bare` (also `--boot`, the same image, and `--uefi`) skips stdlib/core.fd, zero hidden runtime deps; there is no `--no-std`/`--no-stdlib` flag |
 | Cross-compilation dispatch | ✅ | `--target arm64`/`riscv64` validates and emits diagnostic, falls back to C codegen |
 | UEFI boot services | — | `uefi.fd` moved to the fides-os project (Oct 24) |
 
@@ -295,8 +301,8 @@ reference.md is right. Counts: [selfhost.md → Numbers](selfhost.md#numbers).*
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| `async` / `await` | ⚠️ | An `async fn` runs as a green task on its own stack (f64/struct arguments and results through an adapter); prefix `await` gives the result. Interpreter and C work; native (`fid emit`) async crashes |
-| `spawn` | ⚠️ | `spawn f(args)` runs `f` on an OS thread and gives a `Future<T>`; every argument must be `@send`. Native spawn+await crashes |
+| `async` / `await` | ⚠️ | An `async fn` runs as a green task on its own stack (f64/struct arguments and results through an adapter); prefix `await` gives the result. Interpreter, C and native (`fid emit`, pe_ir and `--nat`) work since Nov 9 (known-bugs 2f.2) |
+| `spawn` | ⚠️ | `spawn f(args)` runs `f` on an OS thread and gives a `Future<T>`; every argument must be `@send`. Native spawn+await works since Nov 9 (known-bugs 2f.2) |
 | `parallel { \| … }` | ✅ | Branches on threads (see "New in `fid`") |
 | Mutex | ✅ | `sync_mutex_create/lock/unlock` via pthread mutex |
 | RwLock | ✅ | `sync_rwlock_create/read_lock/read_unlock/write_lock/write_unlock` — atomic reader count, no TOCTOU race |
@@ -749,7 +755,7 @@ val out = quant::dequantize_q8(q_out); // dequantize result
 | Parameterized queries (F68) | no concat on typed strings | ✅ DONE (compile error on SQLString + str) |
 | `@medical` (F48) | Checks named after IEC 62304 (not compliance) | ✅ DONE (no alloc, no recursion, no while, no panic, must be @audit) |
 | `given`/`ensure` contracts (F10) | Design by Contract | ✅ DONE (preconditions verified at call sites with constant args) |
-| `async`/`await`/`spawn` (Phase 7.6) | Cooperative concurrency | ⚠️ (green tasks on their own stacks; interpreter and C work; native async crashes) |
+| `async`/`await`/`spawn` (Phase 7.6) | Cooperative concurrency | ⚠️ (green tasks on their own stacks; interpreter, C and native work, native since Nov 9: known-bugs 2f.2) |
 | Borrow checker (`--borrowck`) | Compile-time aliasing analysis | ✅ Phases 1-6 (Rules 1-3, field-wise, two-phase, NLL; `on` by default; tested) |
 | Generic enums (`enum Option<T>`) | Type-parameterized enums | ✅ DONE (methods instantiated per `T` in `fid`; a bare `Option` has `T = i64`) |
 | Generic structs (`struct Foo<T>`) | Type-parameterized structs | ⚠️ PARSED (AST, parser; type_params field); a literal or field use is rejected by `fid` (Nov 9) |
@@ -846,12 +852,12 @@ suite run is Nov 2 (interp 339/339, C 343/343, PE 345/345, expected-fail
 | Feature | Status | Notes |
 |---------|--------|-------|
 | Self-compilation | ✅ | `fides-c.exe` compiles `compiler/main.fd` → up to `fides-c5.exe` (5 generations; session-24 regression fixed in session 26) |
-| Bootstrap fixpoint | ✅ | stage 2 == stage 3 byte-identical (49 MB of C, Nov 6), checked by `RELEASE=1 scripts/bootstrap.sh` on every release build; stage 1 comes from a pinned stage 0 when one exists (`PIN=1` pins one; none yet), otherwise from `fidesc` |
-| Self-host modules | ✅ | 80 `.fd` modules, 360,594 lines (Nov 19; was 68/159K Nov 9, 25/61K in session 15) |
-| Self-host tests | ✅ | 51 programs in `tests/selfhost/` (`verify-selfhost.sh`; saved baseline 36/47×3) |
-| Self-compile time | ✅ | ~133 s (type check 59 s, borrow check 16 s, lowering 20 s, C generation 12 s; Nov 6); `fidesc` ~21 s |
-| PE emitter (self-hosted) | ✅ | `fid emit` (`compiler/pe_ir*.fd`) makes native Windows executables with no C compiler and reaches a byte-identical fixpoint. The older `build --native` pipeline (default target: compiler.fd `build_executable`, PIR → opt → codegen_x64 → elf64 → linker) crashes in opt.fd `pass_jump_thread`; compiler/pe.fd is reached only by `emit --boot`, which panics |
-| LSP server (self-hosted) | ✅ | `compiler/lsp.fd` (1,082 lines) — JSON-RPC over stdio |
-| Linux native codegen (self-hosted) | ⚠️ | `peephole.fd` + `regalloc.fd` + `codegen_x64.fd` — wired into the L3 → x86-64 → asm pipeline (session 28-29); experimental, Linux x64 goes through C |
+| Bootstrap fixpoint | ✅ | stage 2 == stage 3 byte-identical (49 MB of C, Nov 6), checked by `RELEASE=1 scripts/bootstrap.sh` on every release build; stage 1 comes from `STAGE0=<exe>` or a pinned stage 0 when one exists (`PIN=1` pins one; none yet), otherwise from `fidesc`. Not re-verified since Nov 8; from `fidesc` the bootstrap cannot pass stage 2 on the current tree (known-bugs 2g.79) |
+| Self-host modules | ✅ | 80 `.fd` modules, 360,657 lines (Nov 21; was 68/159K Nov 9, 25/61K in session 15) |
+| Self-host tests | ✅ | 57 programs in `tests/selfhost/` (`verify-selfhost.sh`; saved baseline 36/47×3) |
+| Self-compile time | ✅ | ~133 s (type check 59 s, borrow check 16 s, lowering 20 s, C generation 12 s; Nov 6); `fidesc` ~21 s. Nov 21: 57 s at -O2 for the 361K-line tree |
+| PE emitter (self-hosted) | ✅ | `fid emit` (`compiler/pe_ir*.fd`) makes native Windows executables with no C compiler and reaches a byte-identical fixpoint. The older `build --native` pipeline (compiler.fd `build_executable`, PIR → opt → codegen_x64 → elf64 → linker) was removed Nov 17 (MI18): `--native` is the machine layer (nat_ir); `emit --boot` goes through pe_ir (`PEIR_BARE_BOOT`), and compiler/pe.fd is reached by nothing |
+| LSP server (self-hosted) | ✅ | `compiler/lsp.fd` (4,576 lines, Nov 21) — JSON-RPC over stdio |
+| Linux native codegen (self-hosted) | ✅ | the machine layer (`compiler/nat_ir.fd` + `nat_enc.fd`, runtime `stdlib/linux_runtime/`): static ELF for x86-64, AArch64 and RISC-V 64 (`fid emit --target <triple>`). The session 28-29 PIR pipeline (`peephole.fd`, `regalloc.fd`, `codegen_x64.fd`) is no longer reached (Nov 17, MI18) |
 | Module-level `var` in self-hosted | ✅ | Supported on all backends since session 11 |
 | Standalone binary | ✅ | `release/fid.exe` (`RELEASE=1 scripts/bootstrap.sh`, fixpoint checked), shipped as `fid.exe`; `run` and `ccompile` match `fidesc` on the test programs |

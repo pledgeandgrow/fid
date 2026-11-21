@@ -2,7 +2,10 @@
 
 > **New doc 2026-11-09.** Read at 790 lines.
 
-- **Path:** `compiler/egraph.fd` — **790 LOC**
+- **Path:** `compiler/egraph.fd` — **4,079 LOC** (2026-11-21; 790 on Nov 9). Nov 21: it also
+  imports `checks`, `inc`, `ir_ser` (the mid-end memo, `FID_MECACHE`), `iropt` and `ssa`; main.fd
+  runs it after iropt and the rules on the machine-layer path (Linux, macOS, `--nat`) and in
+  `emit-ir --mid-end`. The findings below were not re-checked; their line numbers are from Nov 9.
 - **Role:** per function, pure integer/bool values become e-nodes; equality saturation with
   built-in rules; each instruction is rewritten in place into its class's cheapest form, a
   constant, or a move from an earlier dominating equal value (ME6-ME11). Also forwards loads of

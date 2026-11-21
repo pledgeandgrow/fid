@@ -42,10 +42,10 @@ pub struct BitSet {
 
 | Name | Type |
 |------|------|
-| `words` | `Vec,    // Vec<i64>, each element holds 63 bits` |
-| `nbits` | `i64,    // logical size in bits` |
+| `words` | `Vec<i64>` |
+| `nbits` | `i64` |
 
-*Defined at line 23*
+*Defined at line 20*
 
 ---
 
@@ -63,7 +63,7 @@ pub fn bitset_new(nbits: i64) -> BitSet {
 
 **Returns:** `BitSet`
 
-*Defined at line 37*
+*Defined at line 45*
 
 ---
 
@@ -81,7 +81,7 @@ pub fn bitset_new_full(nbits: i64) -> BitSet {
 
 **Returns:** `BitSet`
 
-*Defined at line 51*
+*Defined at line 68*
 
 ---
 
@@ -99,7 +99,7 @@ pub fn bitset_from_string(s: str) -> BitSet {
 
 **Returns:** `BitSet`
 
-*Defined at line 58*
+*Defined at line 80*
 
 ---
 
@@ -108,17 +108,17 @@ pub fn bitset_from_string(s: str) -> BitSet {
 Set bit `i`. Out-of-range indices are ignored.
 
 ```fides
-pub fn bitset_set(bs: BitSet, i: i64) -> void {
+pub fn bitset_set(bs: &mut BitSet, i: i64) -> void {
 ```
 
 **Parameters:**
 
-- `bs`: `BitSet`
+- `bs`: `&mut BitSet`
 - `i`: `i64`
 
 **Returns:** `void`
 
-*Defined at line 77*
+*Defined at line 105*
 
 ---
 
@@ -127,17 +127,17 @@ pub fn bitset_set(bs: BitSet, i: i64) -> void {
 Clear bit `i`. Out-of-range indices are ignored.
 
 ```fides
-pub fn bitset_clear(bs: BitSet, i: i64) -> void {
+pub fn bitset_clear(bs: &mut BitSet, i: i64) -> void {
 ```
 
 **Parameters:**
 
-- `bs`: `BitSet`
+- `bs`: `&mut BitSet`
 - `i`: `i64`
 
 **Returns:** `void`
 
-*Defined at line 85*
+*Defined at line 120*
 
 ---
 
@@ -146,17 +146,17 @@ pub fn bitset_clear(bs: BitSet, i: i64) -> void {
 Flip bit `i`. Out-of-range indices are ignored.
 
 ```fides
-pub fn bitset_flip(bs: BitSet, i: i64) -> void {
+pub fn bitset_flip(bs: &mut BitSet, i: i64) -> void {
 ```
 
 **Parameters:**
 
-- `bs`: `BitSet`
+- `bs`: `&mut BitSet`
 - `i`: `i64`
 
 **Returns:** `void`
 
-*Defined at line 97*
+*Defined at line 142*
 
 ---
 
@@ -175,7 +175,7 @@ pub fn bitset_get(bs: BitSet, i: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 105*
+*Defined at line 157*
 
 ---
 
@@ -184,16 +184,16 @@ pub fn bitset_get(bs: BitSet, i: i64) -> bool {
 Set every bit in range.
 
 ```fides
-pub fn bitset_fill_all(bs: BitSet) -> void {
+pub fn bitset_fill_all(bs: &mut BitSet) -> void {
 ```
 
 **Parameters:**
 
-- `bs`: `BitSet`
+- `bs`: `&mut BitSet`
 
 **Returns:** `void`
 
-*Defined at line 115*
+*Defined at line 174*
 
 ---
 
@@ -202,16 +202,16 @@ pub fn bitset_fill_all(bs: BitSet) -> void {
 Clear every bit.
 
 ```fides
-pub fn bitset_clear_all(bs: BitSet) -> void {
+pub fn bitset_clear_all(bs: &mut BitSet) -> void {
 ```
 
 **Parameters:**
 
-- `bs`: `BitSet`
+- `bs`: `&mut BitSet`
 
 **Returns:** `void`
 
-*Defined at line 124*
+*Defined at line 188*
 
 ---
 
@@ -229,7 +229,7 @@ pub fn bitset_count(bs: BitSet) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 133*
+*Defined at line 200*
 
 ---
 
@@ -247,7 +247,7 @@ pub fn bitset_any(bs: BitSet) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 144*
+*Defined at line 217*
 
 ---
 
@@ -265,7 +265,7 @@ pub fn bitset_all(bs: BitSet) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 149*
+*Defined at line 225*
 
 ---
 
@@ -283,7 +283,7 @@ pub fn bitset_none(bs: BitSet) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 154*
+*Defined at line 233*
 
 ---
 
@@ -302,7 +302,7 @@ pub fn bitset_next_set(bs: BitSet, from: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 159*
+*Defined at line 243*
 
 ---
 
@@ -321,7 +321,7 @@ pub fn bitset_next_clear(bs: BitSet, from: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 170*
+*Defined at line 260*
 
 ---
 
@@ -340,7 +340,7 @@ pub fn bitset_and(a: BitSet, b: BitSet) -> BitSet {
 
 **Returns:** `BitSet`
 
-*Defined at line 189*
+*Defined at line 286*
 
 ---
 
@@ -359,7 +359,7 @@ pub fn bitset_or(a: BitSet, b: BitSet) -> BitSet {
 
 **Returns:** `BitSet`
 
-*Defined at line 201*
+*Defined at line 302*
 
 ---
 
@@ -378,7 +378,7 @@ pub fn bitset_xor(a: BitSet, b: BitSet) -> BitSet {
 
 **Returns:** `BitSet`
 
-*Defined at line 213*
+*Defined at line 318*
 
 ---
 
@@ -397,7 +397,7 @@ pub fn bitset_andnot(a: BitSet, b: BitSet) -> BitSet {
 
 **Returns:** `BitSet`
 
-*Defined at line 225*
+*Defined at line 334*
 
 ---
 
@@ -416,7 +416,7 @@ pub fn bitset_intersects(a: BitSet, b: BitSet) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 239*
+*Defined at line 353*
 
 ---
 
@@ -435,7 +435,7 @@ pub fn bitset_contains_all(a: BitSet, b: BitSet) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 250*
+*Defined at line 369*
 
 ---
 
@@ -454,7 +454,7 @@ pub fn bitset_equals(a: BitSet, b: BitSet) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 263*
+*Defined at line 387*
 
 ---
 
@@ -472,7 +472,7 @@ pub fn bitset_clone(bs: BitSet) -> BitSet {
 
 **Returns:** `BitSet`
 
-*Defined at line 274*
+*Defined at line 409*
 
 ---
 
@@ -490,7 +490,7 @@ pub fn bitset_not(bs: BitSet) -> BitSet {
 
 **Returns:** `BitSet`
 
-*Defined at line 285*
+*Defined at line 423*
 
 ---
 
@@ -508,7 +508,7 @@ pub fn bitset_to_string(bs: BitSet) -> str {
 
 **Returns:** `str`
 
-*Defined at line 298*
+*Defined at line 441*
 
 ---
 
@@ -517,16 +517,16 @@ pub fn bitset_to_string(bs: BitSet) -> str {
 All set indices as a Vec<i64>, ascending.
 
 ```fides
-pub fn bitset_to_vec(bs: BitSet) -> Vec {
+pub fn bitset_to_vec(bs: BitSet) -> Vec<i64> {
 ```
 
 **Parameters:**
 
 - `bs`: `BitSet`
 
-**Returns:** `Vec`
+**Returns:** `Vec<i64>`
 
-*Defined at line 313*
+*Defined at line 461*
 
 ---
 

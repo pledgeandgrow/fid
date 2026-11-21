@@ -20,7 +20,7 @@
 
 ---
 
-## `fid` commands (Nov 9, 2026)
+## `fid` commands (Nov 9, 2026; states corrected Nov 21)
 
 The self-hosted `fid` has every tool built in; there are no separate
 binaries. Dispatch is in compiler/main.fd (docs/file-analysis/main.md).
@@ -29,11 +29,11 @@ binaries. Dispatch is in compiler/main.fd (docs/file-analysis/main.md).
 |---|---|---|
 | `run <file>` | IR interpreter. `--leaks` / `--checked-alloc` rebuild through C (`ccompile --debug`, needs `CC`) and run with the debug allocator | works |
 | `ccompile` (`compile`) `<file> -o <out>` | C, then a C compiler. `--target`, `--cc-opt`, `--debug`, `--release`, `--inc`, `--no-cache`, `--profile`, `--leaks`, `--checked-alloc` | works |
-| `emit` / `build <file> -o <out>` | native: Windows PE (pe_ir) by default on Windows; `--target aarch64-linux\|riscv64-linux\|x86_64-linux` and `--nat` use the machine layer (also written OS first: `linux-arm64`, `linux-x64`, `macos-arm64`; TL6); `--target windows-x64` on any host is a pe_ir PE; `--bare`, `--elf`, `--boot`; through C on a POSIX host without `--target`; `--no-opt`, `--debug`, `--checked-alloc` | works except `--boot` and `--native` with the default target (panic) |
+| `emit` / `build <file> -o <out>` | native: Windows PE (pe_ir) by default on Windows; `--target aarch64-linux\|riscv64-linux\|x86_64-linux` and `--nat` use the machine layer (also written OS first: `linux-arm64`, `linux-x64`, `macos-arm64`; TL6); `--target windows-x64` on any host is a pe_ir PE; `--bare`, `--elf`, `--boot`; through C on a POSIX host without `--target`; `--no-opt`, `--debug`, `--checked-alloc` | works; since Nov 17 (MI18) `--native` is the machine layer on every target and `--boot` the bootable image of pe_ir |
 | `dump-c`, `split-c <c> <prefix> <n>` | generated C to stdout; cut a C file into a header and n units | works |
 | `check <file> [--time]` | front end only: types, borrows, escapes | works |
 | `lint <file>` | unused functions and imports, `unwrap()` outside tests | works (does not resolve `compiler::` imports) |
-| `fmt <file> [--check]` | formatter, rewrites the file | **corrupts files** (known-bugs 2g.6) |
+| `fmt <file> [--check]` | formatter, rewrites the file | corrupted files until Nov 15 (known-bugs 2g.6, fixed) |
 | `test [<file>] [--fail]` | a file's `test_*`/`bench_*` functions, or the suite / expected-fail list | works on Windows; without a file broken on POSIX |
 | `fuzz <file> [--seeds N]` | a test file's `fuzz_*(data: Vec<u8>)` targets on N deterministic inputs (1000; `test --fuzz`: 100), coverage-guided (the harness is built with `ccompile --fuzz-cov`); failing inputs are saved under `testdata/fuzz/<target>/` and replayed by every `fid test`: [docs/fuzzing.md](../fuzzing.md) | new Nov 15 (TL1), checked by scripts/tl-check.sh |
 | `fix <file> [--check]` | applies the suggested fixes (`val` -> `var`, a narrowing `as T`, a misspelled name, an unused import), each kept only when the program then has fewer errors (or as many, none on the fixed line); `--check` writes nothing | new Nov 15 (TL3) |
@@ -41,7 +41,7 @@ binaries. Dispatch is in compiler/main.fd (docs/file-analysis/main.md).
 | `qualify <file>` | safety evidence as JSON | works |
 | `audit <file> [--stdlib] [--strict]` | unsafe code a program reaches and its `// SAFETY:` comments | works |
 | `doc` / `scribe` | documentation generator; `doc <dir>`: a site, a page per module and an index with search (TL11, Nov 15) | works, buggy (CRLF) |
-| `veil` | coverage | **crashes** (Double free, 2g.2) |
+| `veil` | coverage | crashed (Double free) until Nov 15 (2g.2, fixed); `fid test --coverage` still double-frees when the covered program panics (2g.30) |
 | `lsp` | language server: diagnostics, completion, hover, definition, rename, references, formatting, signature help, inlay hints (parameter names), code actions (the fixes of `fix`) | symbol requests fixed Nov 15 (2g.5); rename and references are by whole word in one file |
 | `ark ...` | package manager: path and git pacts, `use` finds them in ark_modules/, ark.lock records git commits and file hashes, `install` checks out the locked commit, `audit` reports what a build pulls in | TL9, Nov 15; a pact's own dependencies resolved to one version each, a per-machine cache, dev-dependencies, an API check on publish (docs/reference/ark.md) |
 | `parse-header <h>` | C header to Fides bindings | works |
@@ -51,9 +51,11 @@ binaries. Dispatch is in compiler/main.fd (docs/file-analysis/main.md).
 | `tokens`, `ast` (`dump-ast`, `dump-ast-raw`, `dump-ast-flat`), `ir`, `verify`, `sourcemap` | dumps (the four `ast` forms print the same summary) | work |
 | `opt <f> [--fn <n>]` | the IR after the IR optimizer the machine layer runs (iropt_native) | Nov 17 (llvm MI18; `pir`/`dump-pir` were retired with the PIR path and name this instead: docs/pir-retired.md) |
 | `codegen <f> [--target t] [--fn <n>] [--elf/--coff/--macho <o>]` | the machine layer: a disassembly, or an object file as `emit --obj` | Nov 17 (llvm MI18) |
-| `build-x86`, `gpu`, `wasm` | experimental back ends | produce broken output (platforms.md, Tier 3) |
+| `wasm <file> -o <out.wasm>` | native WebAssembly (WASI) | modules validate and run; 316 of 344 suite tests match `fid run` (Nov 15, 2g.21) |
+| `build-x86`, `gpu` | experimental back ends | `gpu` rewritten Nov 15, not yet built; `build-x86`'s exe untested (2g.16, 2g.21; platforms.md, Tier 3) |
+| `disasm`, `dump-mir`, `emit-ir`, `explain`, `serve`, `reduce`, `ir-fuzz`, `inspect`, `replay` | machine code and machine IR, `.fir` to the machine layer, what the optimizer did (CP3), a long-lived checker ([serve.md](serve.md)), shrinking a failing program, IR fuzzing, a crash report, a `run --record` trace run again (CT7) | new Nov 10–19 |
 | `notebook` | HTML page of a file's code blocks (evaluates nothing) | works |
-| `version` | version string (`0.1.0`) | works |
+| `version` | version string (`1.0.0+dev` on a dev build, compiler/build_info.fd) | works |
 
 Global flags: `--borrowck=off|on` (`warn` prints nothing), `--timeout N`
 (parsed, not enforced); arguments after `--` go to the program. Environment:
@@ -75,8 +77,8 @@ built by `fid emit` for Linux (x86-64, AArch64, RISC-V) profiles itself
 when run with `FID_PROF=1`: a sample per millisecond of CPU time, and at
 exit a table on stderr of the functions by self and total samples
 (llvm-roadmap DB9; scripts/prof-check.sh). Not in `fid`
-(`fidesc` only): `debug`, `replay`, `autopsy`, `diff-test`, `link`, `sbom`,
-`spdx`.
+(`fidesc` only): `debug`, `autopsy`, `diff-test`, `link`, `sbom`, `spdx`
+(`fid replay` runs a trace of `fid run --record`, CT7).
 
 ---
 
@@ -103,8 +105,9 @@ the packages (like crates). Package manifests are `ark.toml`, lock files are
 
 Supports path dependencies (files and directories), git dependencies (clone
 with `--depth 1`, branch/tag support), lock file generation, and a custom
-TOML parser (zero external dependencies). Registry support (ark.dev) is
-planned for the future.
+TOML parser (zero external dependencies). The package index is a Git
+repository (`ark search`, `ark publish`, `ark add <name>`; live since
+Nov 21 as pledgeandgrow/pacts, docs/reference/ark.md).
 
 ```
 ark init [name]              # create ark.toml
@@ -207,11 +210,12 @@ completes this identifier?". The name is already used informally in the
 Fides codebase (the interpreter is called "the reference oracle"). Now
 it's the official name for the language server.
 
-**Status: ✅ Implemented (as `fidesc lsp`); ⚠️ `fid lsp` diagnostics only** —
-`fid lsp` (compiler/lsp.fd, Nov 9) publishes diagnostics (always at line 0)
-and has completion, hover, definition and rename, but each of those four
-ends with "Double free" (known-bugs 2g.5); it has no references. The LSP
-server below is `fidesc lsp` (see `src/lsp.rs`). It implements JSON-RPC 2.0 over stdio
+**Status: ✅ Implemented (as `fidesc lsp` and `fid lsp`)** —
+`fid lsp` (compiler/lsp.fd) publishes diagnostics and has completion,
+hover, definition, rename, references, formatting, signature help, inlay
+hints and code actions; until Nov 15 completion, hover, definition and
+rename ended with "Double free" and diagnostics sat at line 0 (known-bugs
+2g.5, fixed). The LSP server below is `fidesc lsp` (see `src/lsp.rs`). It implements JSON-RPC 2.0 over stdio
 with no external dependencies (built-in JSON parser/serializer). Supports:
 `initialize`, `initialized`, `shutdown`, `exit`, `textDocument/didOpen`,
 `didChange`, `didClose`, `publishDiagnostics`, hover, goto-def, completion,
@@ -386,9 +390,9 @@ fid qualify <file.fd> -o evidence.json
 | `fid test <file.fd> --filter <text> --jobs <n>` | Only the names holding `<text>`; tests `n` at a time, output in order. Each test runs with FIDES_TEST_NOW and FIDES_TEST_SEED fixed (`--real-clock`, or a test named `*_real_clock`, opts out) |
 | `fid run <file.fd> --trace f,g` | Each call of `f` and `g` (a method as `T::m`) with its arguments and result, on stderr |
 | `fid --version` | The version and `build: exe:<hash>` of this executable (with the release stamp's commit when there is one) |
-| `bench/run.sh`, `bench/check.sh` | `check.sh` fails on a slowdown over `LIMIT_PCT` against `bench/baseline.txt`; not in CI |
-| `scripts/sanitize.sh` | Written, not run: the tests through C under ASan/UBSan (clang with ASan, Linux/macOS); `FIDES_CFLAGS` passes extra C flags |
-| `scripts/fuzz/nightly.sh` | Written, not run; no CI workflow schedules it |
+| `bench/run.sh`, `bench/check.sh` | `check.sh` fails on a slowdown over `LIMIT_PCT` against its baseline file (`BENCH_BASE`, default `bench/baseline.txt`); `.github/workflows/bench.yml` runs `bench/check.sh --ab` |
+| `scripts/sanitize.sh` | The tests through C under ASan/UBSan (clang with ASan, Linux/macOS); `FIDES_CFLAGS` passes extra C flags; nightly in `.github/workflows/verify-nightly.yml` |
+| `scripts/fuzz/nightly.sh` | Nightly in `.github/workflows/verify-nightly.yml` (Nov 21) |
 
 ---
 
@@ -449,7 +453,7 @@ optimization level: `-O2` by default, `-O0` for a program over 16 MB of C
 
 | Tool     | Status       | Notes |
 |----------|--------------|-------|
-| ark    | ✅ Implemented | Package manager — path/git deps, ark.toml, ark.lock, ark_modules/ (registry pending) |
+| ark    | ✅ Implemented | Package manager — path/git deps, ark.toml, ark.lock, ark_modules/, the package index (pledgeandgrow/pacts, Nov 21) |
 | forge    | ✅ Implemented (as `fidesc fmt`) | Code formatter — canonical formatting for Fides syntax |
 | sentinel | ✅ Implemented (as `fidesc lint`) | Linter — unused functions, unused imports |
 | oracle   | ✅ Implemented (as `fidesc lsp`) | LSP server — JSON-RPC, diagnostics, hover, goto-def, completion, references |

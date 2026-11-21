@@ -46,7 +46,7 @@ pub fn template_render(tmpl: Template, data: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 115*
+*Defined at line 125*
 
 ---
 
@@ -66,7 +66,7 @@ pub fn apply_filter(value: str, filter: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 140*
+*Defined at line 152*
 
 ---
 
@@ -85,7 +85,7 @@ pub fn render(source: str, data: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 161*
+*Defined at line 179*
 
 ---
 
@@ -105,7 +105,7 @@ pub fn render_file(path: str, data: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 168*
+*Defined at line 186*
 
 ---
 
@@ -125,7 +125,7 @@ pub fn comptime_template(source: str) -> Template {
 
 **Returns:** `Template`
 
-*Defined at line 191*
+*Defined at line 209*
 
 ---
 

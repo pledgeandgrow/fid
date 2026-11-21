@@ -39,7 +39,7 @@
 pub const ECU_STATE_INIT: i64     = 0;
 ```
 
-*Defined at line 25*
+*Defined at line 23*
 
 ---
 
@@ -49,7 +49,7 @@ pub const ECU_STATE_INIT: i64     = 0;
 pub const ECU_STATE_RUN: i64      = 1;
 ```
 
-*Defined at line 26*
+*Defined at line 23*
 
 ---
 
@@ -59,7 +59,7 @@ pub const ECU_STATE_RUN: i64      = 1;
 pub const ECU_STATE_SHUTDOWN: i64 = 2;
 ```
 
-*Defined at line 27*
+*Defined at line 23*
 
 ---
 
@@ -69,7 +69,7 @@ pub const ECU_STATE_SHUTDOWN: i64 = 2;
 pub const ECU_STATE_FAULT: i64    = 3;
 ```
 
-*Defined at line 28*
+*Defined at line 23*
 
 ---
 
@@ -79,7 +79,7 @@ pub const ECU_STATE_FAULT: i64    = 3;
 pub const ECU_STATE_LIMP_HOME: i64 = 4;
 ```
 
-*Defined at line 29*
+*Defined at line 23*
 
 ---
 
@@ -97,7 +97,7 @@ pub fn ecu_state_name(state: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 32*
+*Defined at line 25*
 
 ---
 
@@ -119,7 +119,7 @@ pub struct SensorReading {
 | `timestamp` | `i64` |
 | `error_code` | `i64` |
 
-*Defined at line 44*
+*Defined at line 47*
 
 ---
 
@@ -139,7 +139,7 @@ pub fn sensor_ok(value: f64, raw: i64, timestamp: i64) -> SensorReading {
 
 **Returns:** `SensorReading`
 
-*Defined at line 53*
+*Defined at line 56*
 
 ---
 
@@ -158,7 +158,7 @@ pub fn sensor_fault(error_code: i64, timestamp: i64) -> SensorReading {
 
 **Returns:** `SensorReading`
 
-*Defined at line 64*
+*Defined at line 63*
 
 ---
 
@@ -178,7 +178,7 @@ pub fn sensor_validate(reading: SensorReading, min_val: f64, max_val: f64) -> Se
 
 **Returns:** `SensorReading`
 
-*Defined at line 75*
+*Defined at line 70*
 
 ---
 
@@ -196,7 +196,7 @@ pub fn sensor_raw_to_value(raw: i64, raw_min: i64, raw_max: i64,
 - `raw_min`: `i64`
 - `raw_max`: `i64`
 
-*Defined at line 92*
+*Defined at line 83*
 
 ---
 
@@ -216,7 +216,7 @@ pub struct ActuatorCommand {
 | `clamped` | `bool` |
 | `limited` | `bool` |
 
-*Defined at line 105*
+*Defined at line 95*
 
 ---
 
@@ -236,7 +236,7 @@ pub fn actuator_command(value: f64, min_val: f64, max_val: f64) -> ActuatorComma
 
 **Returns:** `ActuatorCommand`
 
-*Defined at line 112*
+*Defined at line 102*
 
 ---
 
@@ -257,7 +257,7 @@ pub fn actuator_rate_limit(target: f64, current: f64, max_rate: f64) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 132*
+*Defined at line 120*
 
 ---
 
@@ -283,7 +283,7 @@ pub struct PIDController {
 | `integral_min` | `f64` |
 | `integral_max` | `f64` |
 
-*Defined at line 149*
+*Defined at line 137*
 
 ---
 
@@ -303,7 +303,7 @@ pub fn pid_new(kp: f64, ki: f64, kd: f64) -> PIDController {
 
 **Returns:** `PIDController`
 
-*Defined at line 162*
+*Defined at line 159*
 
 ---
 
@@ -312,18 +312,18 @@ pub fn pid_new(kp: f64, ki: f64, kd: f64) -> PIDController {
 Set output limits.
 
 ```fides
-pub fn pid_set_limits(pid: PIDController, out_min: f64, out_max: f64) -> void {
+pub fn pid_set_limits(pid: &mut PIDController, out_min: f64, out_max: f64) -> void {
 ```
 
 **Parameters:**
 
-- `pid`: `PIDController`
+- `pid`: `&mut PIDController`
 - `out_min`: `f64`
 - `out_max`: `f64`
 
 **Returns:** `void`
 
-*Defined at line 177*
+*Defined at line 166*
 
 ---
 
@@ -332,18 +332,18 @@ pub fn pid_set_limits(pid: PIDController, out_min: f64, out_max: f64) -> void {
 Set integral anti-windup limits.
 
 ```fides
-pub fn pid_set_integral_limits(pid: PIDController, int_min: f64, int_max: f64) -> void {
+pub fn pid_set_integral_limits(pid: &mut PIDController, int_min: f64, int_max: f64) -> void {
 ```
 
 **Parameters:**
 
-- `pid`: `PIDController`
+- `pid`: `&mut PIDController`
 - `int_min`: `f64`
 - `int_max`: `f64`
 
 **Returns:** `void`
 
-*Defined at line 183*
+*Defined at line 172*
 
 ---
 
@@ -353,19 +353,19 @@ Compute PID output for one time step.
 setpoint: desired value, measured: current value, dt: time step in seconds
 
 ```fides
-pub fn pid_compute(pid: PIDController, setpoint: f64, measured: f64, dt: f64) -> f64 {
+pub fn pid_compute(pid: &mut PIDController, setpoint: f64, measured: f64, dt: f64) -> f64 {
 ```
 
 **Parameters:**
 
-- `pid`: `PIDController`
+- `pid`: `&mut PIDController`
 - `setpoint`: `f64`
 - `measured`: `f64`
 - `dt`: `f64`
 
 **Returns:** `f64`
 
-*Defined at line 191*
+*Defined at line 180*
 
 ---
 
@@ -374,16 +374,16 @@ pub fn pid_compute(pid: PIDController, setpoint: f64, measured: f64, dt: f64) ->
 Reset PID controller state.
 
 ```fides
-pub fn pid_reset(pid: PIDController) -> void {
+pub fn pid_reset(pid: &mut PIDController) -> void {
 ```
 
 **Parameters:**
 
-- `pid`: `PIDController`
+- `pid`: `&mut PIDController`
 
 **Returns:** `void`
 
-*Defined at line 220*
+*Defined at line 209*
 
 ---
 
@@ -405,7 +405,7 @@ pub struct CalParam {
 | `max_val` | `f64` |
 | `unit` | `str` |
 
-*Defined at line 231*
+*Defined at line 220*
 
 ---
 
@@ -427,7 +427,7 @@ pub fn cal_param_new(name: str, value: f64, min_val: f64, max_val: f64, unit: st
 
 **Returns:** `CalParam`
 
-*Defined at line 240*
+*Defined at line 229*
 
 ---
 
@@ -436,17 +436,17 @@ pub fn cal_param_new(name: str, value: f64, min_val: f64, max_val: f64, unit: st
 Set a calibration parameter value (clamped to range).
 
 ```fides
-pub fn cal_param_set(param: CalParam, value: f64) -> void {
+pub fn cal_param_set(param: &mut CalParam, value: f64) -> void {
 ```
 
 **Parameters:**
 
-- `param`: `CalParam`
+- `param`: `&mut CalParam`
 - `value`: `f64`
 
 **Returns:** `void`
 
-*Defined at line 251*
+*Defined at line 236*
 
 ---
 
@@ -464,7 +464,7 @@ pub fn cal_param_get(param: CalParam) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 259*
+*Defined at line 248*
 
 ---
 
@@ -482,7 +482,7 @@ pub fn cal_param_is_valid(param: CalParam) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 264*
+*Defined at line 253*
 
 ---
 
@@ -502,7 +502,7 @@ pub struct Watchdog {
 | `last_kick` | `i64` |
 | `expired` | `bool` |
 
-*Defined at line 274*
+*Defined at line 263*
 
 ---
 
@@ -520,7 +520,7 @@ pub fn watchdog_new(timeout_ms: i64) -> Watchdog {
 
 **Returns:** `Watchdog`
 
-*Defined at line 281*
+*Defined at line 270*
 
 ---
 
@@ -529,17 +529,17 @@ pub fn watchdog_new(timeout_ms: i64) -> Watchdog {
 Kick the watchdog (reset the timer).
 
 ```fides
-pub fn watchdog_kick(wd: Watchdog, current_time: i64) -> void {
+pub fn watchdog_kick(wd: &mut Watchdog, current_time: i64) -> void {
 ```
 
 **Parameters:**
 
-- `wd`: `Watchdog`
+- `wd`: `&mut Watchdog`
 - `current_time`: `i64`
 
 **Returns:** `void`
 
-*Defined at line 290*
+*Defined at line 277*
 
 ---
 
@@ -548,17 +548,17 @@ pub fn watchdog_kick(wd: Watchdog, current_time: i64) -> void {
 Check if the watchdog has expired.
 
 ```fides
-pub fn watchdog_check(wd: Watchdog, current_time: i64) -> bool {
+pub fn watchdog_check(wd: &mut Watchdog, current_time: i64) -> bool {
 ```
 
 **Parameters:**
 
-- `wd`: `Watchdog`
+- `wd`: `&mut Watchdog`
 - `current_time`: `i64`
 
 **Returns:** `bool`
 
-*Defined at line 296*
+*Defined at line 283*
 
 ---
 
@@ -576,7 +576,7 @@ pub fn watchdog_is_expired(wd: Watchdog) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 305*
+*Defined at line 292*
 
 ---
 

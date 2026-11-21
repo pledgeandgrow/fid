@@ -67,7 +67,7 @@ pub fn image_create(width: i64, height: i64, channels: i64) -> Image {
 
 **Returns:** `Image`
 
-*Defined at line 33*
+*Defined at line 46*
 
 ---
 
@@ -87,7 +87,7 @@ pub fn image_get_pixel(img: &Image, x: i64, y: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 60*
+*Defined at line 74*
 
 ---
 
@@ -111,7 +111,7 @@ pub fn image_set_pixel(img: &mut Image, x: i64, y: i64, r: i64, g: i64, b: i64, 
 
 **Returns:** `void`
 
-*Defined at line 76*
+*Defined at line 90*
 
 ---
 
@@ -133,7 +133,7 @@ pub fn image_fill(img: &mut Image, r: i64, g: i64, b: i64, a: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 90*
+*Defined at line 104*
 
 ---
 
@@ -151,7 +151,7 @@ pub fn image_free(img: &mut Image) -> void {
 
 **Returns:** `void`
 
-*Defined at line 103*
+*Defined at line 117*
 
 ---
 
@@ -170,7 +170,7 @@ pub fn image_load_png(path: str) -> Image {
 
 **Returns:** `Image`
 
-*Defined at line 127*
+*Defined at line 380*
 
 ---
 
@@ -189,7 +189,7 @@ pub fn image_load_jpg(path: str) -> Image {
 
 **Returns:** `Image`
 
-*Defined at line 138*
+*Defined at line 392*
 
 ---
 
@@ -207,7 +207,7 @@ pub fn image_load(path: str) -> Image {
 
 **Returns:** `Image`
 
-*Defined at line 148*
+*Defined at line 397*
 
 ---
 
@@ -227,7 +227,7 @@ pub fn image_to_texture(ren: i64, img: &Image) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 172*
+*Defined at line 532*
 
 ---
 
@@ -245,7 +245,7 @@ pub fn image_flip_h(img: &mut Image) -> void {
 
 **Returns:** `void`
 
-*Defined at line 182*
+*Defined at line 542*
 
 ---
 
@@ -263,7 +263,7 @@ pub fn image_flip_v(img: &mut Image) -> void {
 
 **Returns:** `void`
 
-*Defined at line 204*
+*Defined at line 564*
 
 ---
 
@@ -285,7 +285,7 @@ pub fn image_subregion(img: &Image, x: i64, y: i64, w: i64, h: i64) -> Image {
 
 **Returns:** `Image`
 
-*Defined at line 225*
+*Defined at line 585*
 
 ---
 
@@ -305,7 +305,7 @@ pub fn image_resize_nn(img: &Image, new_w: i64, new_h: i64) -> Image {
 
 **Returns:** `Image`
 
-*Defined at line 249*
+*Defined at line 609*
 
 ---
 
@@ -324,7 +324,7 @@ pub struct Color {
 | `b` | `i64` |
 | `a` | `i64` |
 
-*Defined at line 273*
+*Defined at line 633*
 
 ---
 
@@ -345,7 +345,7 @@ pub fn color_pack(r: i64, g: i64, b: i64, a: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 281*
+*Defined at line 641*
 
 ---
 
@@ -363,7 +363,7 @@ pub fn color_unpack(c: i64) -> Color {
 
 **Returns:** `Color`
 
-*Defined at line 286*
+*Defined at line 646*
 
 ---
 
@@ -373,7 +373,7 @@ pub fn color_unpack(c: i64) -> Color {
 pub const COLOR_WHITE: i64 = 0xFFFFFFFF;
 ```
 
-*Defined at line 295*
+*Defined at line 657*
 
 ---
 
@@ -383,7 +383,7 @@ pub const COLOR_WHITE: i64 = 0xFFFFFFFF;
 pub const COLOR_BLACK: i64 = 0x000000FF;
 ```
 
-*Defined at line 296*
+*Defined at line 657*
 
 ---
 
@@ -393,7 +393,7 @@ pub const COLOR_BLACK: i64 = 0x000000FF;
 pub const COLOR_RED: i64 = 0xFF0000FF;
 ```
 
-*Defined at line 297*
+*Defined at line 657*
 
 ---
 
@@ -403,7 +403,7 @@ pub const COLOR_RED: i64 = 0xFF0000FF;
 pub const COLOR_GREEN: i64 = 0x00FF00FF;
 ```
 
-*Defined at line 298*
+*Defined at line 657*
 
 ---
 
@@ -413,7 +413,7 @@ pub const COLOR_GREEN: i64 = 0x00FF00FF;
 pub const COLOR_BLUE: i64 = 0x0000FFFF;
 ```
 
-*Defined at line 299*
+*Defined at line 657*
 
 ---
 
@@ -423,7 +423,7 @@ pub const COLOR_BLUE: i64 = 0x0000FFFF;
 pub const COLOR_YELLOW: i64 = 0xFFFF00FF;
 ```
 
-*Defined at line 300*
+*Defined at line 657*
 
 ---
 
@@ -433,7 +433,7 @@ pub const COLOR_YELLOW: i64 = 0xFFFF00FF;
 pub const COLOR_CYAN: i64 = 0x00FFFFFF;
 ```
 
-*Defined at line 301*
+*Defined at line 657*
 
 ---
 
@@ -443,7 +443,7 @@ pub const COLOR_CYAN: i64 = 0x00FFFFFF;
 pub const COLOR_MAGENTA: i64 = 0xFF00FFFF;
 ```
 
-*Defined at line 302*
+*Defined at line 657*
 
 ---
 
@@ -453,7 +453,7 @@ pub const COLOR_MAGENTA: i64 = 0xFF00FFFF;
 pub const COLOR_TRANSPARENT: i64 = 0x00000000;
 ```
 
-*Defined at line 303*
+*Defined at line 657*
 
 ---
 
@@ -463,7 +463,7 @@ pub const COLOR_TRANSPARENT: i64 = 0x00000000;
 pub const COLOR_GRAY: i64 = 0x808080FF;
 ```
 
-*Defined at line 304*
+*Defined at line 657*
 
 ---
 
@@ -473,7 +473,7 @@ pub const COLOR_GRAY: i64 = 0x808080FF;
 pub const COLOR_DARK_GRAY: i64 = 0x404040FF;
 ```
 
-*Defined at line 305*
+*Defined at line 657*
 
 ---
 
@@ -483,7 +483,7 @@ pub const COLOR_DARK_GRAY: i64 = 0x404040FF;
 pub const COLOR_LIGHT_GRAY: i64 = 0xC0C0C0FF;
 ```
 
-*Defined at line 306*
+*Defined at line 657*
 
 ---
 

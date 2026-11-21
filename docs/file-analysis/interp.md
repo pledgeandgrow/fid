@@ -1,7 +1,19 @@
 # File Analysis: compiler/interp.fd
 
 - **Path:** `compiler/interp.fd` — module `compiler::interp`
-- **LOC:** 7,456 (2026-11-09; was 3,967 on 2026-10-22). `src/interp.rs`: 6,358.
+- **LOC:** 14,130 (2026-11-21; 7,456 on 2026-11-09, 3,967 on 2026-10-22). `src/interp.rs`: 6,358.
+- **Nov 21:** it also imports `compiler::pgo` (`run --profile`, `--trace`).
+  Changed since the audit below: tasks interleave (LG11, the "Interleaved
+  tasks" section of interp.fd and docs/interp-tasks.md), so finding 9 and
+  the "Interleaving tasks" item no longer hold; the debug hook records
+  coverage (`Interpreter_set_debug_hook`, used by veil.fd), so finding 12
+  no longer holds; an empty file reads as `Some("")` (2g.42, Nov 16).
+  Still open: `printf` does no formatting (finding 8, 2g.20), a green thread that yields twice (finding 10,
+  2g.20). New open: `p_string_len`/`p_string_from` on a `str` parameter
+  (2g.45), out-of-memory under pressure (2g.49), fixed arrays as results
+  or reference parameters (2g.51), `u64` printed signed (2g.52), a panic's
+  line is core's `panic` wrapper (2g.77), a flaky parallel spawn (2g.113).
+  Line numbers below are from Nov 9.
 - **Role:** the IR interpreter behind `fid run`. It walks the SSA IR of a
   lowered module (core included), one instruction at a time, over a
   simulated byte memory, and runs the `p_*` builtins itself.

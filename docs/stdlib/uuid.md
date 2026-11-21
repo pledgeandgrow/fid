@@ -27,9 +27,9 @@ pub struct UUID {
 
 | Name | Type |
 |------|------|
-| `bytes` | `Vec,  // 16 bytes` |
+| `bytes` | `Vec<i64>` |
 
-*Defined at line 21*
+*Defined at line 17*
 
 ---
 
@@ -44,7 +44,7 @@ pub fn uuid_v4() -> UUID {
 
 **Returns:** `UUID`
 
-*Defined at line 29*
+*Defined at line 35*
 
 ---
 
@@ -58,7 +58,7 @@ pub fn uuid_nil() -> UUID {
 
 **Returns:** `UUID`
 
-*Defined at line 46*
+*Defined at line 63*
 
 ---
 
@@ -67,16 +67,16 @@ pub fn uuid_nil() -> UUID {
 Generate a UUID from a Vec of 16 bytes.
 
 ```fides
-pub fn uuid_from_bytes(bytes: Vec) -> UUID {
+pub fn uuid_from_bytes(bytes: Vec<i64>) -> UUID {
 ```
 
 **Parameters:**
 
-- `bytes`: `Vec`
+- `bytes`: `Vec<i64>`
 
 **Returns:** `UUID`
 
-*Defined at line 57*
+*Defined at line 82*
 
 ---
 
@@ -94,7 +94,7 @@ pub fn uuid_to_string(u: UUID) -> str {
 
 **Returns:** `str`
 
-*Defined at line 73*
+*Defined at line 103*
 
 ---
 
@@ -112,7 +112,7 @@ pub fn uuid_to_string_upper(u: UUID) -> str {
 
 **Returns:** `str`
 
-*Defined at line 90*
+*Defined at line 125*
 
 ---
 
@@ -130,7 +130,7 @@ pub fn uuid_to_urn(u: UUID) -> str {
 
 **Returns:** `str`
 
-*Defined at line 96*
+*Defined at line 134*
 
 ---
 
@@ -149,7 +149,7 @@ pub fn uuid_parse(s: str) -> UUID {
 
 **Returns:** `UUID`
 
-*Defined at line 104*
+*Defined at line 149*
 
 ---
 
@@ -168,7 +168,7 @@ pub fn uuid_equal(a: UUID, b: UUID) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 143*
+*Defined at line 226*
 
 ---
 
@@ -186,7 +186,7 @@ pub fn uuid_is_nil(u: UUID) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 155*
+*Defined at line 241*
 
 ---
 
@@ -204,7 +204,7 @@ pub fn uuid_version(u: UUID) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 167*
+*Defined at line 256*
 
 ---
 
@@ -223,7 +223,7 @@ pub fn uuid_variant(u: UUID) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 173*
+*Defined at line 265*
 
 ---
 

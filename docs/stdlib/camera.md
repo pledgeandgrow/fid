@@ -59,7 +59,7 @@ pub struct Camera2D {
 | `max_y` | `f64` |
 | `has_bounds` | `bool` |
 
-*Defined at line 28*
+*Defined at line 25*
 
 ---
 
@@ -78,7 +78,7 @@ pub fn camera2d_create(viewport_w: i64, viewport_h: i64) -> Camera2D {
 
 **Returns:** `Camera2D`
 
-*Defined at line 50*
+*Defined at line 67*
 
 ---
 
@@ -98,7 +98,7 @@ pub fn camera2d_follow(cam: &mut Camera2D, tx: f64, ty: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 65*
+*Defined at line 74*
 
 ---
 
@@ -120,7 +120,7 @@ pub fn camera2d_set_bounds(cam: &mut Camera2D, min_x: f64, min_y: f64, max_x: f6
 
 **Returns:** `void`
 
-*Defined at line 71*
+*Defined at line 80*
 
 ---
 
@@ -139,7 +139,7 @@ pub fn camera2d_set_zoom(cam: &mut Camera2D, zoom: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 80*
+*Defined at line 89*
 
 ---
 
@@ -160,7 +160,7 @@ pub fn camera2d_zoom_at(cam: &mut Camera2D, world_x: f64, world_y: f64, factor: 
 
 **Returns:** `void`
 
-*Defined at line 86*
+*Defined at line 98*
 
 ---
 
@@ -179,7 +179,7 @@ pub fn camera2d_shake(cam: &mut Camera2D, amount: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 96*
+*Defined at line 110*
 
 ---
 
@@ -198,7 +198,7 @@ pub fn camera2d_update(cam: &mut Camera2D, dt: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 101*
+*Defined at line 115*
 
 ---
 
@@ -218,7 +218,7 @@ pub fn camera2d_screen_to_world(cam: &Camera2D, sx: i64, sy: i64) -> vec2 {
 
 **Returns:** `vec2`
 
-*Defined at line 133*
+*Defined at line 159*
 
 ---
 
@@ -238,7 +238,7 @@ pub fn camera2d_world_to_screen(cam: &Camera2D, wx: f64, wy: f64) -> vec2 {
 
 **Returns:** `vec2`
 
-*Defined at line 140*
+*Defined at line 166*
 
 ---
 
@@ -256,7 +256,7 @@ pub fn camera2d_view_offset(cam: &Camera2D) -> vec2 {
 
 **Returns:** `vec2`
 
-*Defined at line 147*
+*Defined at line 173*
 
 ---
 
@@ -278,7 +278,7 @@ pub fn camera2d_is_visible(cam: &Camera2D, wx: f64, wy: f64, ww: f64, wh: f64) -
 
 **Returns:** `bool`
 
-*Defined at line 154*
+*Defined at line 180*
 
 ---
 
@@ -305,7 +305,7 @@ pub struct Camera3D {
 | `proj_matrix` | `mat4` |
 | `dirty` | `bool` |
 
-*Defined at line 164*
+*Defined at line 189*
 
 ---
 
@@ -328,7 +328,7 @@ pub fn camera3d_create(pos: vec3, target: vec3, fov_deg: f64, aspect: f64, near:
 
 **Returns:** `Camera3D`
 
-*Defined at line 180*
+*Defined at line 209*
 
 ---
 
@@ -346,7 +346,7 @@ pub fn camera3d_update(cam: &mut Camera3D) -> void {
 
 **Returns:** `void`
 
-*Defined at line 198*
+*Defined at line 216*
 
 ---
 
@@ -364,7 +364,7 @@ pub fn camera3d_view_matrix(cam: &Camera3D) -> mat4 {
 
 **Returns:** `mat4`
 
-*Defined at line 205*
+*Defined at line 223*
 
 ---
 
@@ -382,7 +382,7 @@ pub fn camera3d_projection(cam: &Camera3D) -> mat4 {
 
 **Returns:** `mat4`
 
-*Defined at line 210*
+*Defined at line 228*
 
 ---
 
@@ -400,7 +400,7 @@ pub fn camera3d_view_proj(cam: &Camera3D) -> mat4 {
 
 **Returns:** `mat4`
 
-*Defined at line 215*
+*Defined at line 233*
 
 ---
 
@@ -418,7 +418,7 @@ pub fn camera3d_forward(cam: &Camera3D) -> vec3 {
 
 **Returns:** `vec3`
 
-*Defined at line 220*
+*Defined at line 238*
 
 ---
 
@@ -436,7 +436,7 @@ pub fn camera3d_right(cam: &Camera3D) -> vec3 {
 
 **Returns:** `vec3`
 
-*Defined at line 225*
+*Defined at line 243*
 
 ---
 
@@ -456,7 +456,7 @@ pub fn camera3d_orbit(cam: &mut Camera3D, dyaw: f64, dpitch: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 231*
+*Defined at line 249*
 
 ---
 
@@ -475,7 +475,7 @@ pub fn camera3d_move_forward(cam: &mut Camera3D, dist: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 246*
+*Defined at line 269*
 
 ---
 
@@ -494,7 +494,7 @@ pub fn camera3d_move_right(cam: &mut Camera3D, dist: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 254*
+*Defined at line 277*
 
 ---
 
@@ -513,7 +513,7 @@ pub fn camera3d_set_aspect(cam: &mut Camera3D, aspect: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 262*
+*Defined at line 285*
 
 ---
 
@@ -530,7 +530,7 @@ pub struct Ray3D {
 | `origin` | `vec3` |
 | `direction` | `vec3` |
 
-*Defined at line 267*
+*Defined at line 290*
 
 ---
 
@@ -550,7 +550,7 @@ pub fn camera3d_screen_to_ray(cam: &Camera3D, ndc_x: f64, ndc_y: f64) -> Ray3D {
 
 **Returns:** `Ray3D`
 
-*Defined at line 273*
+*Defined at line 296*
 
 ---
 
@@ -568,7 +568,7 @@ pub fn camera3d_fps_update(cam: &mut Camera3D) -> void {
 
 **Returns:** `void`
 
-*Defined at line 295*
+*Defined at line 316*
 
 ---
 

@@ -1,6 +1,13 @@
 # 0004: One ownership rule, one data layout
 
-- **Status:** accepted; implemented (Nov 7), not yet built or tested.
+- **Status:** accepted; implemented (Nov 7) in `fid` only. Nov 21: the
+  tree built in one step from a self-hosted stage 0 passes the leak gate
+  (`scripts/leak-check.sh`, the 10 programs of `tests/leaks`). The frozen
+  `fidesc` lowering has none of it (no temporary drops), so a `fid` built
+  by `fidesc` runs out of memory compiling the tree (known-bugs 2g.79).
+  Structs inside a `Vec` are held in its buffer since release D15
+  (`LOWER_INLINE_STRUCTS`, AGENTS.md known bug 25), which the "Left"
+  below predates. Nov 7 text:
   Done: counted strings (core, C and native runtimes), Vec/HashMap element
   ownership by type id, the lowering's ownership pass with generated
   drop/dup functions (`LOWER_RC`), null-free builtins with `Option`

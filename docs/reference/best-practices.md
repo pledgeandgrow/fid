@@ -226,8 +226,8 @@ order. Same source → different binary on each compile. This affects:
 ### Why It Matters
 
 - **Reproducible builds are impossible** — a key feature for a systems language
-- **Golden file comparison is noisy** — the `bisect.sh` script normalizes this,
-  but it's a band-aid
+- **Golden file comparison is noisy** — a bisect script was meant to
+  normalize this, but it was never written (`scripts/bisect.sh` does not exist)
 - **Caching is broken** — if output changes, you can't cache compilation
 
 ### The Fix (When You Have Time)
@@ -249,11 +249,11 @@ need a map for output, use `BTreeMap` or `IndexMap`.
 
 ```
                     ┌─────────────┐
-                    │  End-to-end │  fidesc test (543 .fd files, Nov 9)
+                    │  End-to-end │  fidesc test (1,682 .fd, Nov 21)
                     │   tests     │  ← tells you SOMETHING broke
                     └──────┬──────┘
                   ┌────────┴────────┐
-                  │  Golden files   │  bisect.sh (IR/PIR/asm per test)
+                  │  Golden files   │  dump-ir / dump-pir / codegen by hand
                   │  (intermediate) │  ← tells you WHICH LAYER broke
                   └────────┬────────┘
                 ┌──────────┴──────────┐
@@ -268,8 +268,10 @@ need a map for output, use `BTreeMap` or `IndexMap`.
    that exposes it before fixing the code
 2. **Fix the bug** — the test should now pass
 3. **Run `./verify.sh`** — make sure nothing else broke
-4. **If something broke, bisect** — `./scripts/bisect.sh <test_name>`
-5. **Update golden files** — `./scripts/gen_golden.sh` if codegen changed
+4. **If something broke, bisect** — by hand with `dump-ir`, `dump-pir`,
+   `codegen --peephole` (`scripts/bisect.sh` does not exist)
+5. **Update golden files** — by hand in `tests/bootstrap/golden/` if codegen
+   changed (`scripts/gen_golden.sh` does not exist)
 
 ### What Tests Don't Catch
 
@@ -384,7 +386,8 @@ Format: `type(scope): description` where type is one of:
 ### Debugging Hierarchy
 
 1. **Run `./verify.sh`** — see the exact failure pattern
-2. **Run `./scripts/bisect.sh <test_name>`** — find which layer broke
+2. **Bisect the layer** — `dump-ir`, `dump-pir`, `codegen --peephole` on the
+   test (there is no `scripts/bisect.sh`)
 3. **Add targeted `eprintln!`** — dump the IR/PIR/asm at the failing point
 4. **Compare to interpreter output** — is the interpreter also wrong?
 5. **Read the assembly** — `fidesc codegen <file> --target x86-64` and read it
@@ -430,9 +433,9 @@ The smaller the reproducer, the faster you find the bug.
 ### After Editing
 
 1. Run `./verify.sh` — check for regressions
-2. If regressions: `./scripts/bisect.sh <failing_test>`
+2. If regressions: bisect the layer with `dump-ir` / `dump-pir` / `codegen --peephole`
 3. If no regressions: `./verify.sh --save` to update baseline
-4. If you changed codegen: `./scripts/gen_golden.sh` to update golden files
+4. If you changed codegen: capture the golden files by hand (no `scripts/gen_golden.sh`)
 
 ### The "Three Files" Rule
 
@@ -524,9 +527,9 @@ compare with the ELF64 emitter's approach (they share similar structure).
 ```
 BEFORE editing:     ./verify.sh
 AFTER editing:      ./verify.sh
-If regressions:     ./scripts/bisect.sh <test_name>
+If regressions:     dump-ir / dump-pir / codegen --peephole (no bisect.sh)
 If no regressions:  ./verify.sh --save
-If codegen changed: ./scripts/gen_golden.sh
+If codegen changed: capture golden files by hand (no gen_golden.sh)
 
 HIGH-RISK FILES (always verify):
   regalloc.rs, peephole.rs, elf64.rs, pe.rs, codegen_x64.rs,

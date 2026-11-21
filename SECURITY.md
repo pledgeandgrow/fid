@@ -24,7 +24,7 @@ reporters in the release notes unless you ask us not to.
 
 ## What counts
 
-Fides makes safety promises, so a broken promise is a security bug even
+Fid makes safety promises, so a broken promise is a security bug even
 when no exploit is shown:
 
 - **Miscompilation of a safety guarantee**: a bounds or overflow check
@@ -34,7 +34,7 @@ when no exploit is shown:
 - **Memory safety in the runtimes**: use after free, double free, buffer
   overflow or data races in the C runtime (`compiler/codegen_c.fd`), the
   native runtimes (`stdlib/pe_runtime/`, `stdlib/linux_runtime/`) or core
-  (`stdlib/core.fd`) reachable from safe Fides code.
+  (`stdlib/core.fd`) reachable from safe Fid code.
 - **The standard library's parsers and network code**: HTTP, TLS, WebSocket,
   JSON, compression decoders and the like, given hostile input.
 - **The installer and release artifacts**: anything that lets a release or
@@ -58,7 +58,7 @@ on its own (it is a build tool, not a supported compiler).
 
 ## Not for safety-critical use
 
-Fides is not certified for medical, avionics, automotive or other
+Fid is not certified for medical, avionics, automotive or other
 safety-critical systems. `fid qualify` writes evidence about a program; it
 is not a certification. See [docs/reference/safety-rules.md](docs/reference/safety-rules.md)
 for exactly which rules the compiler enforces.

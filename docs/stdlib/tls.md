@@ -1,5 +1,9 @@
 # tls — Fides Documentation
 
+`use tls;` loads `stdlib/tls_windows.fd` (Schannel) on Windows and
+`stdlib/tls_unix.fd` (OpenSSL) on Linux, macOS and FreeBSD; a cross build
+takes the target's. Both have the functions below.
+
 ## Contents
 
 - [tls_client](#tls_client) (function)
@@ -28,7 +32,7 @@ pub fn tls_client(fd: i64, host: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 289*
+*Defined in tls_unix.fd at line 313, tls_windows.fd at line 516*
 
 ---
 
@@ -47,7 +51,7 @@ pub fn tls_connect(host: str, port: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 295*
+*Defined in tls_unix.fd at line 325, tls_windows.fd at line 522*
 
 ---
 
@@ -67,13 +71,15 @@ pub fn tls_connect_unchecked(host: str, port: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 309*
+*Defined in tls_unix.fd at line 339, tls_windows.fd at line 557*
 
 ---
 
 ## tls_server
 
-Server credentials from a PKCS#12 file. Returns 0 on failure.
+Server credentials. Returns 0 on failure. On Windows (Schannel) from a
+PKCS#12 file and its password; elsewhere (OpenSSL) from PEM files:
+`tls_server(cert_path: str, key_path: str)`.
 
 ```fides
 pub fn tls_server(pfx_path: str, password: str) -> i64 {
@@ -86,7 +92,7 @@ pub fn tls_server(pfx_path: str, password: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 323*
+*Defined in tls_unix.fd at line 492, tls_windows.fd at line 727*
 
 ---
 
@@ -106,7 +112,7 @@ pub fn tls_accept(server: i64, fd: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 371*
+*Defined in tls_unix.fd at line 506, tls_windows.fd at line 788*
 
 ---
 
@@ -124,7 +130,7 @@ pub fn tls_session_fd(s: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 383*
+*Defined in tls_unix.fd at line 511, tls_windows.fd at line 860*
 
 ---
 
@@ -144,7 +150,7 @@ pub fn tls_session_send(s: i64, addr: i64, n: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 388*
+*Defined in tls_unix.fd at line 516, tls_windows.fd at line 903*
 
 ---
 
@@ -166,7 +172,7 @@ pub fn tls_session_recv(s: i64, addr: i64, n: i64, timeout_ms: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 425*
+*Defined in tls_unix.fd at line 531, tls_windows.fd at line 940*
 
 ---
 
@@ -185,7 +191,7 @@ pub fn tls_session_close(s: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 508*
+*Defined in tls_unix.fd at line 549, tls_windows.fd at line 1117*
 
 ---
 

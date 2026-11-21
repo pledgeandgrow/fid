@@ -5201,13 +5201,17 @@ pub fn PeirGen_gen_to_str(self: & mut PeirGen) -> void {
     PeirEnc_push(& mut self.enc, PEIR_R12);
     PeirEnc_push(& mut self.enc, PEIR_R13);
     PeirEnc_push(& mut self.enc, PEIR_R14);
-    PeirEnc_sub_rsp_i32(& mut self.enc, 56);
-    // 32 shadow + 16 buf + 8 align
+    PeirEnc_sub_rsp_i32(& mut self.enc, 72);
+    // 32 shadow + 32 buf + 8 align
 
-    // r12 = value, r13 = buffer ptr (stack at rbp-40), r14 = digit count
+    // r12 = value, r13 = buffer ptr (stack at rbp-56), r14 = digit count.
+    // OP21 (known-bugs 2g.96): the buffer was 16 bytes at rbp-40, under
+    // the saved r14 at rbp-24: a number of 16 or more characters (i64::MIN
+    // is 20 and its NUL) overwrote the caller's r14, and test_simd_i64's
+    // `wrap:` line crashed. 32 bytes [rbp-56, rbp-24), above the shadow
+    // space [rbp-96, rbp-64) p_malloc may write.
     PeirEnc_mov_rr(& mut self.enc, PEIR_R12, PEIR_RCX);
-    PeirEnc_lea_rbp(& mut self.enc, PEIR_R13, - 40);
-    // 20-byte buffer on stack
+    PeirEnc_lea_rbp(& mut self.enc, PEIR_R13, - 56);
     PeirEnc_xor_self(& mut self.enc, PEIR_R14);
 
     // Handle 0 specially
@@ -5363,7 +5367,7 @@ pub fn PeirGen_gen_to_str(self: & mut PeirGen) -> void {
 
     PeirEnc_place_label(& mut self.enc, ts_zero_ret);
 
-    PeirEnc_add_rsp_i32(& mut self.enc, 56);
+    PeirEnc_add_rsp_i32(& mut self.enc, 72);
     PeirEnc_pop(& mut self.enc, PEIR_R14);
     PeirEnc_pop(& mut self.enc, PEIR_R13);
     PeirEnc_pop(& mut self.enc, PEIR_R12);
@@ -8098,11 +8102,26 @@ pub fn PeirGen_gen_argv(self: & mut PeirGen) -> void {
     PeirEnc_test_rr(& mut self.enc, PEIR_R14, PEIR_R14);
     PeirEnc_jcc_label(& mut self.enc, 0x4, cmd_null);
     // jz
-    // Allocate a copy of the token (up to 4KB)
+    // Allocate a copy of the token: its length + 1 (it ends at a space
+    // or NUL). RL16: this passed the token's address as the size (rcx),
+    // a block of megabytes per argument that `--leaks` reported
+    var len_lp: i64 = PeirEnc_alloc_label(& mut self.enc);
+    var len_end: i64 = PeirEnc_alloc_label(& mut self.enc);
     PeirEnc_mov_rr(& mut self.enc, PEIR_RCX, PEIR_R14);
-    // src
-    PeirEnc_mov_imm32(& mut self.enc, PEIR_RDX, 0x1000);
-    // max 4KB
+    PeirEnc_place_label(& mut self.enc, len_lp);
+    PeirEnc_xor_self(& mut self.enc, PEIR_RDX);
+    PeirEnc_mov_reg8_ptr(& mut self.enc, PEIR_RDX, PEIR_RCX);
+    PeirEnc_test_rr(& mut self.enc, PEIR_RDX, PEIR_RDX);
+    PeirEnc_jcc_label(& mut self.enc, 0x4, len_end);
+    // jz — NUL
+    PeirEnc_cmp_r8_i8(& mut self.enc, PEIR_RDX, 32);
+    PeirEnc_jcc_label(& mut self.enc, 0x4, len_end);
+    // je — space
+    PeirEnc_inc_r(& mut self.enc, PEIR_RCX);
+    PeirEnc_jmp_label(& mut self.enc, len_lp);
+    PeirEnc_place_label(& mut self.enc, len_end);
+    PeirEnc_sub_rr(& mut self.enc, PEIR_RCX, PEIR_R14);
+    PeirEnc_inc_r(& mut self.enc, PEIR_RCX);
     PeirEnc_sub_rsp_i32(& mut self.enc, 32);
     PeirEnc_call_label(& mut self.enc, HashMap_get(self.func_labels, "p_malloc"));
     PeirEnc_add_rsp_i32(& mut self.enc, 32);

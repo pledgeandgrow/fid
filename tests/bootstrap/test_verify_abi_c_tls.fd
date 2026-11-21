@@ -1,0 +1,73 @@
+// C functions that read the C library's thread-local state (2g.99,
+// own-backend roadmap RL25): strtod and strtol read the locale through a
+// thread-local pointer, toupper and isalpha read the locale's tables. A
+// dynamically linked x86_64-linux image of the machine layer moved the
+// thread pointer (fs) to the runtime's own thread block, so libc read its
+// locale from the block's neighbours: strtod faulted ("Invalid memory
+// access ... at 0x8", test_verify_abi_c_mixed). The runtime's block is
+// now the executable's own static TLS (compiler/nat_ir.fd nat_tls_get:
+// fs:[-8], PT_TLS) and the C library keeps its thread pointer. Each
+// result is printed as an integer.
+//
+// Expected output:
+// strtod 3500 3 -125 6
+// strtol 255 2 -42 3
+// atof 2750
+// toupper 65 90 49
+// isalpha 1 0
+// again 3500
+
+extern "C" include "<stdlib.h>" {
+    fn strtod(s: *u8, end: *i64) -> f64;
+    fn strtol(s: *u8, end: *i64, base: i32) -> i64;
+    fn atof(s: *u8) -> f64;
+}
+
+extern "C" include "<ctype.h>" {
+    fn toupper(c: i32) -> i32;
+    fn isalpha(c: i32) -> i32;
+}
+
+fn milli(x: f64) -> i64 {
+    return (x * 1000.0) as i64;
+}
+
+@unsafe
+fn main() -> i64 {
+    val endbuf: *u8 = p_malloc(16);
+    val s1: str = "3.5kg";
+    val s2: str = "-0.125";
+    val d1: f64 = strtod(s1 as *u8, endbuf as *i64);
+    val u1: i64 = *(endbuf as *i64) - (s1 as i64);
+    val d2: f64 = strtod(s2 as *u8, endbuf as *i64);
+    val u2: i64 = *(endbuf as *i64) - (s2 as i64);
+    println("strtod " + int_to_str(milli(d1)) + " " + int_to_str(u1) + " " + int_to_str(milli(d2)) + " " + int_to_str(u2));
+
+    val h: str = "ff;x";
+    val n: str = "-42";
+    val l1: i64 = strtol(h as *u8, endbuf as *i64, 16);
+    val e1: i64 = *(endbuf as *i64) - (h as i64);
+    val l2: i64 = strtol(n as *u8, endbuf as *i64, 10);
+    val e2: i64 = *(endbuf as *i64) - (n as i64);
+    println("strtol " + int_to_str(l1) + " " + int_to_str(e1) + " " + int_to_str(l2) + " " + int_to_str(e2));
+
+    val a: str = "2.75";
+    println("atof " + int_to_str(milli(atof(a as *u8))));
+
+    println("toupper " + int_to_str(toupper(97) as i64) + " " + int_to_str(toupper(122) as i64) + " " + int_to_str(toupper(49) as i64));
+    var al: i64 = 0;
+    if isalpha(113) != 0 {
+        al = 1;
+    }
+    var dg: i64 = 0;
+    if isalpha(55) != 0 {
+        dg = 1;
+    }
+    println("isalpha " + int_to_str(al) + " " + int_to_str(dg));
+
+    // the runtime's own thread block still works after the C calls (a
+    // string built and printed goes through it)
+    println("again " + int_to_str(milli(strtod(s1 as *u8, endbuf as *i64))));
+    p_free(endbuf);
+    return 0;
+}

@@ -45,7 +45,7 @@ pub fn zeros(shape: Vec<i64>) -> Tensor {
 
 **Returns:** `Tensor`
 
-*Defined at line 14*
+*Defined at line 13*
 
 ---
 
@@ -63,7 +63,7 @@ pub fn ones(shape: Vec<i64>) -> Tensor {
 
 **Returns:** `Tensor`
 
-*Defined at line 19*
+*Defined at line 18*
 
 ---
 
@@ -82,7 +82,7 @@ pub fn filled(shape: Vec<i64>, value: f64) -> Tensor {
 
 **Returns:** `Tensor`
 
-*Defined at line 24*
+*Defined at line 23*
 
 ---
 
@@ -101,7 +101,7 @@ pub fn from_vec(data: Vec<i64>, shape: Vec<i64>) -> Tensor {
 
 **Returns:** `Tensor`
 
-*Defined at line 29*
+*Defined at line 28*
 
 ---
 
@@ -120,7 +120,7 @@ pub fn get(t: Tensor, indices: Vec<i64>) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 34*
+*Defined at line 33*
 
 ---
 
@@ -140,7 +140,7 @@ pub fn set(t: Tensor, indices: Vec<i64>, value: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 39*
+*Defined at line 38*
 
 ---
 
@@ -158,7 +158,7 @@ pub fn shape(t: Tensor) -> Vec<i64> {
 
 **Returns:** `Vec<i64>`
 
-*Defined at line 44*
+*Defined at line 43*
 
 ---
 
@@ -176,7 +176,7 @@ pub fn ndim(t: Tensor) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 49*
+*Defined at line 48*
 
 ---
 
@@ -194,7 +194,7 @@ pub fn size(t: Tensor) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 54*
+*Defined at line 53*
 
 ---
 
@@ -213,7 +213,7 @@ pub fn reshape(t: Tensor, new_shape: Vec<i64>) -> Tensor {
 
 **Returns:** `Tensor`
 
-*Defined at line 59*
+*Defined at line 58*
 
 ---
 
@@ -231,7 +231,7 @@ pub fn transpose(t: Tensor) -> Tensor {
 
 **Returns:** `Tensor`
 
-*Defined at line 64*
+*Defined at line 63*
 
 ---
 
@@ -250,7 +250,7 @@ pub fn add(a: Tensor, b: Tensor) -> Tensor {
 
 **Returns:** `Tensor`
 
-*Defined at line 69*
+*Defined at line 68*
 
 ---
 
@@ -269,7 +269,7 @@ pub fn sub(a: Tensor, b: Tensor) -> Tensor {
 
 **Returns:** `Tensor`
 
-*Defined at line 74*
+*Defined at line 73*
 
 ---
 
@@ -288,7 +288,7 @@ pub fn mul(a: Tensor, b: Tensor) -> Tensor {
 
 **Returns:** `Tensor`
 
-*Defined at line 79*
+*Defined at line 78*
 
 ---
 
@@ -307,7 +307,7 @@ pub fn scale(t: Tensor, s: f64) -> Tensor {
 
 **Returns:** `Tensor`
 
-*Defined at line 84*
+*Defined at line 83*
 
 ---
 
@@ -326,7 +326,7 @@ pub fn matmul(a: Tensor, b: Tensor) -> Tensor {
 
 **Returns:** `Tensor`
 
-*Defined at line 89*
+*Defined at line 103*
 
 ---
 
@@ -345,7 +345,7 @@ pub fn dot(a: Tensor, b: Tensor) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 94*
+*Defined at line 108*
 
 ---
 
@@ -363,7 +363,7 @@ pub fn sum(t: Tensor) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 99*
+*Defined at line 113*
 
 ---
 
@@ -381,7 +381,7 @@ pub fn mean(t: Tensor) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 104*
+*Defined at line 118*
 
 ---
 
@@ -399,7 +399,7 @@ pub fn max(t: Tensor) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 109*
+*Defined at line 123*
 
 ---
 
@@ -417,7 +417,7 @@ pub fn min(t: Tensor) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 114*
+*Defined at line 128*
 
 ---
 
@@ -435,7 +435,7 @@ pub fn relu(t: Tensor) -> Tensor {
 
 **Returns:** `Tensor`
 
-*Defined at line 119*
+*Defined at line 133*
 
 ---
 
@@ -453,7 +453,7 @@ pub fn sigmoid(t: Tensor) -> Tensor {
 
 **Returns:** `Tensor`
 
-*Defined at line 124*
+*Defined at line 138*
 
 ---
 
@@ -471,7 +471,7 @@ pub fn softmax(t: Tensor) -> Tensor {
 
 **Returns:** `Tensor`
 
-*Defined at line 129*
+*Defined at line 143*
 
 ---
 
@@ -489,7 +489,7 @@ pub fn to_str(t: Tensor) -> str {
 
 **Returns:** `str`
 
-*Defined at line 134*
+*Defined at line 148*
 
 ---
 
@@ -507,7 +507,7 @@ pub fn to_json(t: Tensor) -> str {
 
 **Returns:** `str`
 
-*Defined at line 139*
+*Defined at line 153*
 
 ---
 
@@ -525,7 +525,7 @@ pub fn clone(t: Tensor) -> Tensor {
 
 **Returns:** `Tensor`
 
-*Defined at line 144*
+*Defined at line 158*
 
 ---
 

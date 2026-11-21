@@ -229,7 +229,7 @@ fn main() -> i64 { return 0; }
 ```
 $ fid check crash_fail.fd
 ...
-error[E097]: Safety error (crashfree): function 'handler' is safety-annotated but calls 'build_response',
+error[E097]: Safety error (crashfree): function 'handler' is safety-annotated but calls 'build_response', (line 4)
 ...
 ```
 

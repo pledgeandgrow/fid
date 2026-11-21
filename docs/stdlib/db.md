@@ -16,7 +16,7 @@
 impl MemoryDB {
 ```
 
-*Defined at line 36*
+*Defined at line 30*
 
 ---
 
@@ -45,7 +45,7 @@ pub fn query_one<T: Database>(db: T, sql: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 59*
+*Defined at line 64*
 
 ---
 
@@ -64,7 +64,7 @@ pub fn query_scalar<T: Database>(db: T, sql: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 69*
+*Defined at line 74*
 
 ---
 
@@ -84,7 +84,7 @@ pub fn insert<T: Database>(db: T, table: str, values: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 81*
+*Defined at line 86*
 
 ---
 
@@ -104,7 +104,7 @@ pub fn delete<T: Database>(db: T, table: str, condition: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 88*
+*Defined at line 93*
 
 ---
 
@@ -125,7 +125,7 @@ pub fn update<T: Database>(db: T, table: str, set_clause: str, condition: str) -
 
 **Returns:** `i64`
 
-*Defined at line 95*
+*Defined at line 100*
 
 ---
 

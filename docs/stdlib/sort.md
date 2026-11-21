@@ -20,38 +20,40 @@
 
 ## sort_quick
 
-Sort a Vec in ascending order using quicksort.
-In-place, average O(n log n).
+Sort a Vec in ascending order (introsort: median-of-3 quicksort with a
+heapsort fallback, insertion sort on small ranges, recursion bounded to
+the smaller side). Worst case O(n log n), recursion depth O(log n) even
+on sorted or adversarial input.
 
 ```fides
-pub fn sort_quick(v: Vec) -> void {
+pub fn sort_quick(v: &mut Vec<i64>) -> void {
 ```
 
 **Parameters:**
 
-- `v`: `Vec`
+- `v`: `&mut Vec<i64>`
 
 **Returns:** `void`
 
-*Defined at line 22*
+*Defined at line 30*
 
 ---
 
 ## sort_quick_desc
 
-Sort a Vec in descending order using quicksort.
+Sort a Vec in descending order (same introsort, descending comparator).
 
 ```fides
-pub fn sort_quick_desc(v: Vec) -> void {
+pub fn sort_quick_desc(v: &mut Vec<i64>) -> void {
 ```
 
 **Parameters:**
 
-- `v`: `Vec`
+- `v`: `&mut Vec<i64>`
 
 **Returns:** `void`
 
-*Defined at line 28*
+*Defined at line 45*
 
 ---
 
@@ -60,16 +62,16 @@ pub fn sort_quick_desc(v: Vec) -> void {
 Sort a Vec using insertion sort. O(n²) but fast for small arrays.
 
 ```fides
-pub fn sort_insertion(v: Vec) -> void {
+pub fn sort_insertion(v: &mut Vec<i64>) -> void {
 ```
 
 **Parameters:**
 
-- `v`: `Vec`
+- `v`: `&mut Vec<i64>`
 
 **Returns:** `void`
 
-*Defined at line 34*
+*Defined at line 59*
 
 ---
 
@@ -78,16 +80,16 @@ pub fn sort_insertion(v: Vec) -> void {
 Sort a Vec using bubble sort. O(n²), simple but slow.
 
 ```fides
-pub fn sort_bubble(v: Vec) -> void {
+pub fn sort_bubble(v: &mut Vec<i64>) -> void {
 ```
 
 **Parameters:**
 
-- `v`: `Vec`
+- `v`: `&mut Vec<i64>`
 
 **Returns:** `void`
 
-*Defined at line 55*
+*Defined at line 86*
 
 ---
 
@@ -96,16 +98,16 @@ pub fn sort_bubble(v: Vec) -> void {
 Sort a Vec using selection sort. O(n²), minimal swaps.
 
 ```fides
-pub fn sort_selection(v: Vec) -> void {
+pub fn sort_selection(v: &mut Vec<i64>) -> void {
 ```
 
 **Parameters:**
 
-- `v`: `Vec`
+- `v`: `&mut Vec<i64>`
 
 **Returns:** `void`
 
-*Defined at line 74*
+*Defined at line 111*
 
 ---
 
@@ -115,17 +117,17 @@ Sort a Vec using a custom comparator function.
 Comparator returns: negative if a < b, 0 if equal, positive if a > b.
 
 ```fides
-pub fn sort_by(v: Vec, cmp: fn(i64, i64) -> i64) -> void {
+pub fn sort_by(v: &mut Vec<i64>, cmp: fn(i64, i64) -> i64) -> void {
 ```
 
 **Parameters:**
 
-- `v`: `Vec`
-- `cmp`: `fn(i64`
+- `v`: `&mut Vec<i64>`
+- `cmp`: `fn(i64, i64) -> i64`
 
 **Returns:** `void`
 
-*Defined at line 99*
+*Defined at line 143*
 
 ---
 
@@ -134,16 +136,16 @@ pub fn sort_by(v: Vec, cmp: fn(i64, i64) -> i64) -> void {
 Check if a Vec is sorted in ascending order.
 
 ```fides
-pub fn sort_is_sorted(v: Vec) -> bool {
+pub fn sort_is_sorted(v: Vec<i64>) -> bool {
 ```
 
 **Parameters:**
 
-- `v`: `Vec`
+- `v`: `Vec<i64>`
 
 **Returns:** `bool`
 
-*Defined at line 107*
+*Defined at line 221*
 
 ---
 
@@ -152,16 +154,16 @@ pub fn sort_is_sorted(v: Vec) -> bool {
 Check if a Vec is sorted in descending order.
 
 ```fides
-pub fn sort_is_sorted_desc(v: Vec) -> bool {
+pub fn sort_is_sorted_desc(v: Vec<i64>) -> bool {
 ```
 
 **Parameters:**
 
-- `v`: `Vec`
+- `v`: `Vec<i64>`
 
 **Returns:** `bool`
 
-*Defined at line 120*
+*Defined at line 239*
 
 ---
 
@@ -170,16 +172,16 @@ pub fn sort_is_sorted_desc(v: Vec) -> bool {
 Return a sorted copy of a Vec (ascending).
 
 ```fides
-pub fn sort_copy(v: Vec) -> Vec {
+pub fn sort_copy(v: Vec<i64>) -> Vec<i64> {
 ```
 
 **Parameters:**
 
-- `v`: `Vec`
+- `v`: `Vec<i64>`
 
-**Returns:** `Vec`
+**Returns:** `Vec<i64>`
 
-*Defined at line 133*
+*Defined at line 259*
 
 ---
 
@@ -188,16 +190,16 @@ pub fn sort_copy(v: Vec) -> Vec {
 Reverse a Vec in place.
 
 ```fides
-pub fn sort_reverse(v: Vec) -> void {
+pub fn sort_reverse(v: &mut Vec<i64>) -> void {
 ```
 
 **Parameters:**
 
-- `v`: `Vec`
+- `v`: `&mut Vec<i64>`
 
 **Returns:** `void`
 
-*Defined at line 145*
+*Defined at line 278*
 
 ---
 
@@ -207,17 +209,17 @@ Find the index of a value in a sorted Vec using binary search.
 Returns the index if found, -1 if not found.
 
 ```fides
-pub fn sort_binary_search(v: Vec, target: i64) -> i64 {
+pub fn sort_binary_search(v: Vec<i64>, target: i64) -> i64 {
 ```
 
 **Parameters:**
 
-- `v`: `Vec`
+- `v`: `Vec<i64>`
 - `target`: `i64`
 
 **Returns:** `i64`
 
-*Defined at line 158*
+*Defined at line 297*
 
 ---
 
@@ -227,72 +229,79 @@ Find the insertion point for a value in a sorted Vec.
 Returns the index where the value should be inserted to maintain order.
 
 ```fides
-pub fn sort_lower_bound(v: Vec, target: i64) -> i64 {
+pub fn sort_lower_bound(v: Vec<i64>, target: i64) -> i64 {
 ```
 
 **Parameters:**
 
-- `v`: `Vec`
+- `v`: `Vec<i64>`
 - `target`: `i64`
 
 **Returns:** `i64`
 
-*Defined at line 178*
+*Defined at line 324*
 
 ---
 
 ## sort_quick_range
 
+Sort the elements at indexes lo..=hi in place, ascending (introsort).
+
 ```fides
-pub fn sort_quick_range(v: Vec, lo: i64, hi: i64) -> void {
+pub fn sort_quick_range(v: &mut Vec<i64>, lo: i64, hi: i64) -> void {
 ```
 
 **Parameters:**
 
-- `v`: `Vec`
+- `v`: `&mut Vec<i64>`
 - `lo`: `i64`
 - `hi`: `i64`
 
 **Returns:** `void`
 
-*Defined at line 194*
+*Defined at line 348*
 
 ---
 
 ## sort_quick_desc_range
 
+Sort the elements at indexes lo..=hi in place, descending (introsort).
+
 ```fides
-pub fn sort_quick_desc_range(v: Vec, lo: i64, hi: i64) -> void {
+pub fn sort_quick_desc_range(v: &mut Vec<i64>, lo: i64, hi: i64) -> void {
 ```
 
 **Parameters:**
 
-- `v`: `Vec`
+- `v`: `&mut Vec<i64>`
 - `lo`: `i64`
 - `hi`: `i64`
 
 **Returns:** `void`
 
-*Defined at line 216*
+*Defined at line 362*
 
 ---
 
 ## sort_by_range
 
+Sort the elements at indexes lo..=hi in place with a comparison
+function (negative when a comes before b) — introsort.
+
 ```fides
-pub fn sort_by_range(v: Vec, lo: i64, hi: i64, cmp: fn(i64, i64) -> i64) -> void {
+pub fn sort_by_range(v: &mut Vec<i64>, lo: i64, hi: i64, cmp: fn(i64, i64) -> i64) -> void {
 ```
 
 **Parameters:**
 
-- `v`: `Vec`
+- `v`: `&mut Vec<i64>`
 - `lo`: `i64`
 - `hi`: `i64`
-- `cmp`: `fn(i64`
+- `cmp`: `fn(i64, i64) -> i64`
 
 **Returns:** `void`
 
-*Defined at line 238*
+*Defined at line 378*
 
 ---
 

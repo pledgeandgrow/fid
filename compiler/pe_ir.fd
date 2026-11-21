@@ -158,6 +158,40 @@ fn pe_ir_strs_contains(v: Vec<str>, s: str) -> bool {
     return false;
 }
 
+/// The Fides runtime functions the executable needs (ir.fd
+/// pe_ir_needed_functions), and under `--leaks` (RL16) also what the
+/// p_malloc / p_free thunks and the exit hook call: pert_leak_malloc,
+/// pert_leak_free, pert_leak_exit. Known-bugs 2g.81: without them as
+/// roots, nat_frame_ret / nat_frame_next (pe_lk_walk's stack walk) were
+/// not wanted, stayed ud2, and every --leaks image stopped with an
+/// illegal instruction at its first allocation.
+fn pe_ir_needed_fns(module: & IrModule) -> Vec<str> {
+    var needed: Vec<str> = pe_ir_needed_functions(module);
+    if !g_pe_leaks {
+        return needed;
+    }
+    var roots: Vec<str> = Vec::new();
+    if pe_module_has_fn(module, "pert_leak_malloc") {
+        roots.push("pert_leak_malloc");
+    }
+    if pe_module_has_fn(module, "pert_leak_free") {
+        roots.push("pert_leak_free");
+    }
+    if pe_module_has_fn(module, "pert_leak_exit") {
+        roots.push("pert_leak_exit");
+    }
+    if roots.len() == 0 {
+        return needed;
+    }
+    var more: Vec<str> = pe_ir_reachable_from(module, roots);
+    var i: i64 = 0;
+    while i < more.len() {
+        needed = pe_ir_strs_insert_sorted(needed, more.get(i));
+        i = i + 1;
+    }
+    return needed;
+}
+
 /// Insert `s` into sorted Vec<str> `v` (BTreeSet<String>::insert).
 fn pe_ir_strs_insert_sorted(v: Vec<str>, s: str) -> Vec<str> {
     var v = v;
@@ -661,7 +695,7 @@ pub fn PeirGen_generate(self: & mut PeirGen, module: & IrModule) -> Vec {
 
     // The C functions the program reaches, from the DLLs it links
     pe_clear_extra_imports();
-    var reached: Vec<str> = pe_ir_needed_functions(module);
+    var reached: Vec<str> = pe_ir_needed_fns(module);
     var xi: i64 = 0;
     while xi < module.extern_decls.len() {
         var xd: ExternDecl = module.extern_decls.get(xi);
@@ -896,7 +930,7 @@ pub fn PeirGen_generate(self: & mut PeirGen, module: & IrModule) -> Vec {
     }
     // (only those the program reaches: the runtime function they hand
     // over to is left out otherwise)
-    var needed: Vec<str> = pe_ir_needed_functions(module);
+    var needed: Vec<str> = pe_ir_needed_fns(module);
     // MI20: the nat_* primitives an extern declaration the program reaches
     // names (by its C name: `fn nat_x as y(...)` too) are made
     var nwi: i64 = 0;
@@ -1390,6 +1424,15 @@ fn PeirGen_gen_nat_tables(self: & mut PeirGen) {
     var names: Vec<str> = Vec::new();
     var offs: Vec<i64> = Vec::new();
     var seen: i64 = HashMap_new();
+    // RL16: the entry point too, as `__fid_entry` (the COFF symbols' name):
+    // a return address in it was named after the function placed before
+    // it, and --leaks' stack walk took the entry's blocks for the program's
+    if !HashMap_contains(self.func_labels, "__fid_entry") {
+        var entry_l: i64 = PeirEnc_alloc_label(& mut self.enc);
+        PeirEnc_set_label(& mut self.enc, entry_l, self.entry_offset);
+        HashMap_insert(self.func_labels, "__fid_entry", entry_l);
+    }
+    PeirGen_symbol_add(self, "__fid_entry", seen, & mut names, & mut offs);
     var mfns: Vec<str> = self.module_fns;
     var i: i64 = 0;
     while i < mfns.len() {
@@ -2377,6 +2420,7 @@ fn PeirGen_gen_insts(self: & mut PeirGen, ids: Vec<i64>, n: i64, frame: & mut Pe
         }
         // OP13: a call whose result the next instruction returns
         self.tail_next = false;
+        var tail_skip: i64 = 1;
         if self.tail_ok && ii2 + 1 < n {
             match IrFunction_get_inst(func, ids.get(ii2 + 1)) {
                 OptInst::Some(rinst) => {
@@ -2397,6 +2441,12 @@ fn PeirGen_gen_insts(self: & mut PeirGen, ids: Vec<i64>, n: i64, frame: & mut Pe
                 OptInst::None => {
                 }
             }
+            // or that it stores in a result slot that the block it jumps
+            // to returns (an inlined callee's `return g(x)`)
+            if !self.tail_next && ii2 + 2 < n && peir_tail_via_slot(func, ids, ii2, inst_id) {
+                self.tail_next = true;
+                tail_skip = 2;
+            }
         }
         match IrFunction_get_inst(func, inst_id) {
             OptInst::Some(inst) => {
@@ -2407,12 +2457,199 @@ fn PeirGen_gen_insts(self: & mut PeirGen, ids: Vec<i64>, n: i64, frame: & mut Pe
         }
         self.tail_next = false;
         if self.tail_done {
-            // the Return is the jump just emitted
+            // the Return (or the store and jump to it) is the jump just
+            // emitted
             self.tail_done = false;
-            ii2 = ii2 + 1;
+            ii2 = ii2 + tail_skip;
         }
         ii2 = ii2 + 1;
     }
+}
+
+/// OP13 (known-bugs 2g.98): the call ids[at] (value `call`) is in tail
+/// position through a result slot: the next instructions are `store call
+/// -> slot` (a stack alloca, of the call's type) and `jump B`, and B,
+/// after blocks that only jump on, starts `l = load slot; return l`. The
+/// IR optimizer's inliner gives this shape to an inlined `return g(x)`
+/// (is_even inlined into is_odd: is_odd's `return is_odd(n - 2)` stored
+/// into is_even's result slot), so the call was a call and 100 million
+/// levels overflowed the stack. On that path nothing writes the slot
+/// between the store and the load, so the value returned is the call's.
+fn peir_tail_via_slot(func: & IrFunction, ids: Vec<i64>, at: i64, call: i64) -> bool {
+    match IrFunction_get_inst(func, call) {
+        OptInst::Some(ci) => {
+            match ci {
+                Inst::Call(_, _, _, _) => {
+                }
+                _ => {
+                    return false;
+                }
+            }
+        }
+        OptInst::None => {
+            return false;
+        }
+    }
+    var slot: i64 = 0 - 1;
+    var st_ty: OptIrType = OptIrType::None;
+    match IrFunction_get_inst(func, ids.get(at + 1)) {
+        OptInst::Some(si) => {
+            match si {
+                Inst::Store(sptr, sval, sty) => {
+                    if sval != call {
+                        return false;
+                    }
+                    slot = sptr;
+                    st_ty = sty;
+                }
+                _ => {
+                    return false;
+                }
+            }
+        }
+        OptInst::None => {
+            return false;
+        }
+    }
+    // the slot is a frame alloca (peir_frame_escapes has checked that
+    // its address goes nowhere)
+    match IrFunction_get_inst(func, slot) {
+        OptInst::Some(ai) => {
+            match ai {
+                Inst::Alloca(_, _) => {
+                }
+                _ => {
+                    return false;
+                }
+            }
+        }
+        OptInst::None => {
+            return false;
+        }
+    }
+    var target: i64 = 0 - 1;
+    match IrFunction_get_inst(func, ids.get(at + 2)) {
+        OptInst::Some(ji) => {
+            match ji {
+                Inst::Jump(jt) => {
+                    target = jt;
+                }
+                _ => {
+                    return false;
+                }
+            }
+        }
+        OptInst::None => {
+            return false;
+        }
+    }
+    var call_ty: IrType = IrType::Void;
+    match IrFunction_get_meta(func, call) {
+        OptValueMeta::Some(cm) => {
+            call_ty = cm.ty;
+        }
+        OptValueMeta::None => {
+            return false;
+        }
+    }
+    match st_ty {
+        OptIrType::Some(sty2) => {
+            if !ir_type_eq(sty2, call_ty) {
+                return false;
+            }
+        }
+        OptIrType::None => {
+        }
+    }
+    var hops: i64 = 0;
+    while hops < 8 {
+        var bpos: i64 = 0 - 1;
+        var bi: i64 = 0;
+        while bi < func.blocks.len() && bpos < 0 {
+            if func.blocks.get(bi).id == target {
+                bpos = bi;
+            }
+            bi = bi + 1;
+        }
+        if bpos < 0 {
+            return false;
+        }
+        var bids: Vec<i64> = func.blocks.get(bpos).instructions;
+        if bids.len() < 1 {
+            return false;
+        }
+        var on_to: i64 = 0 - 1;
+        if bids.len() == 1 {
+            // a block that only jumps on
+            match IrFunction_get_inst(func, bids.get(0)) {
+                OptInst::Some(oj) => {
+                    match oj {
+                        Inst::Jump(jt2) => {
+                            on_to = jt2;
+                        }
+                        _ => {
+                        }
+                    }
+                }
+                OptInst::None => {
+                }
+            }
+            if on_to < 0 {
+                return false;
+            }
+            target = on_to;
+            hops = hops + 1;
+        } else {
+            return peir_slot_load_return(func, bids, slot, call_ty);
+        }
+    }
+    return false;
+}
+
+/// peir_tail_via_slot's last step: the block (its instructions `bids`)
+/// starts `l = load slot` (of type ty) and `return l`.
+fn peir_slot_load_return(func: & IrFunction, bids: Vec<i64>, slot: i64, call_ty: IrType) -> bool {
+    var lid: i64 = bids.get(0);
+    match IrFunction_get_inst(func, lid) {
+        OptInst::Some(li) => {
+            match li {
+                Inst::Load(lptr, lty) => {
+                    if lptr != slot || !ir_type_eq(lty, call_ty) {
+                        return false;
+                    }
+                }
+                _ => {
+                    return false;
+                }
+            }
+        }
+        OptInst::None => {
+            return false;
+        }
+    }
+    match IrFunction_get_inst(func, bids.get(1)) {
+        OptInst::Some(ri) => {
+            match ri {
+                Inst::Return(rv) => {
+                    match rv {
+                        OptValueId::Some(rvid) => {
+                            return rvid == lid;
+                        }
+                        OptValueId::None => {
+                            return false;
+                        }
+                    }
+                }
+                _ => {
+                    return false;
+                }
+            }
+        }
+        OptInst::None => {
+            return false;
+        }
+    }
+    return false;
 }
 
 /// A loop header that only tests: a few loads, constants, integer
@@ -3321,8 +3558,16 @@ fn peir_global_ra(func: & IrFunction, module: & IrModule, frame: & mut PeStackFr
                     var ck2: i64 = w2 * 64 + bit;
                     if ck2 < nc {
                         if ((lin >> bit) & 1) != 0 {
-                            if bstart.get(b) < lo.get(ck2) {
-                                lo.set(ck2, bstart.get(b));
+                            // 2g.80: live into the block is live before its
+                            // first instruction, one position earlier. At
+                            // bstart a value whose last use (or dead
+                            // definition) is there may hand its register
+                            // to one starting there (peir_ra_scan); a
+                            // value defined in a block laid out later
+                            // (unrolled copies, chained backwards) would
+                            // start exactly there and share it while live.
+                            if bstart.get(b) - 1 < lo.get(ck2) {
+                                lo.set(ck2, bstart.get(b) - 1);
                             }
                             if bstart.get(b) > hi.get(ck2) {
                                 hi.set(ck2, bstart.get(b));
@@ -3983,11 +4228,13 @@ pub fn PeirGen_gen_inst(self: & mut PeirGen, id: i64, inst: Inst, next_cond: i64
         }
 
         Inst::ConstFloat(value, ty) => {
-            // ConstFloat stores the f64 value; Rust emits `bits as u32` for
-            // F32 (the low 32 bits of the f64 bit pattern) and the full
-            // bits for F64.
+            // ConstFloat holds the f64 value: an F32 constant is that value
+            // rounded to an f32, its 32 bits (as codegen_c and nat_ir).
+            // MI17 (known-bugs 2g.95): this took the low 32 bits of the
+            // f64's pattern, 0.0 for 2^63, so the range checks of a
+            // saturating f32 `as i64` sent every value to i64::MAX/MIN.
             if ir_type_eq(ty, IrType::F32) {
-                var bits32: i64 = p_f64_to_bits(value) & 0xFFFFFFFF;
+                var bits32: i64 = p_f32_to_bits(value) & 0xFFFFFFFF;
                 PeirEnc_mov_imm32(& mut self.enc, PEIR_RAX, bits32);
                 PeirEnc_mov_mem_rbp_reg(& mut self.enc, dst, PEIR_RAX);
             } else {

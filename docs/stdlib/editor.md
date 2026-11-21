@@ -51,14 +51,20 @@ pub struct EditorEntity {
 |------|------|
 | `id` | `i64` |
 | `name` | `str` |
-| `x` | `f64, pub y: f64, pub z: f64` |
-| `rx` | `f64, pub ry: f64, pub rz: f64` |
-| `sx` | `f64, pub sy: f64, pub sz: f64` |
+| `x` | `f64` |
+| `y` | `f64` |
+| `z` | `f64` |
+| `rx` | `f64` |
+| `ry` | `f64` |
+| `rz` | `f64` |
+| `sx` | `f64` |
+| `sy` | `f64` |
+| `sz` | `f64` |
 | `visible` | `bool` |
 | `locked` | `bool` |
 | `selected` | `bool` |
 
-*Defined at line 22*
+*Defined at line 18*
 
 ---
 
@@ -81,13 +87,15 @@ pub struct EditorState {
 | `snap_scale` | `f64` |
 | `grid_visible` | `bool` |
 | `grid_size` | `f64` |
-| `camera_x` | `f64, pub camera_y: f64, pub camera_z: f64` |
+| `camera_x` | `f64` |
+| `camera_y` | `f64` |
+| `camera_z` | `f64` |
 | `show_inspector` | `bool` |
 | `show_hierarchy` | `bool` |
 | `show_gizmo` | `bool` |
 | `max_undo` | `i64` |
 
-*Defined at line 33*
+*Defined at line 35*
 
 ---
 
@@ -97,7 +105,7 @@ pub struct EditorState {
 pub const GIZMO_TRANSLATE: i64 = 0;
 ```
 
-*Defined at line 50*
+*Defined at line 54*
 
 ---
 
@@ -107,7 +115,7 @@ pub const GIZMO_TRANSLATE: i64 = 0;
 pub const GIZMO_ROTATE: i64 = 1;
 ```
 
-*Defined at line 51*
+*Defined at line 54*
 
 ---
 
@@ -117,7 +125,7 @@ pub const GIZMO_ROTATE: i64 = 1;
 pub const GIZMO_SCALE: i64 = 2;
 ```
 
-*Defined at line 52*
+*Defined at line 54*
 
 ---
 
@@ -131,7 +139,7 @@ pub fn editor_create() -> EditorState {
 
 **Returns:** `EditorState`
 
-*Defined at line 55*
+*Defined at line 69*
 
 ---
 
@@ -149,7 +157,7 @@ pub fn editor_init(ed: &mut EditorState) -> void {
 
 **Returns:** `void`
 
-*Defined at line 76*
+*Defined at line 77*
 
 ---
 
@@ -172,7 +180,7 @@ pub fn editor_add_entity(ed: &mut EditorState, id: i64, name: str, x: f64, y: f6
 
 **Returns:** `void`
 
-*Defined at line 82*
+*Defined at line 83*
 
 ---
 
@@ -191,7 +199,7 @@ pub fn editor_select(ed: &mut EditorState, id: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 96*
+*Defined at line 90*
 
 ---
 
@@ -209,7 +217,7 @@ pub fn editor_deselect_all(ed: &mut EditorState) -> void {
 
 **Returns:** `void`
 
-*Defined at line 108*
+*Defined at line 102*
 
 ---
 
@@ -227,7 +235,7 @@ pub fn editor_get_selected(ed: &EditorState) -> EditorEntity {
 
 **Returns:** `EditorEntity`
 
-*Defined at line 131*
+*Defined at line 129*
 
 ---
 
@@ -248,7 +256,7 @@ pub fn editor_move_selected(ed: &mut EditorState, dx: f64, dy: f64, dz: f64) -> 
 
 **Returns:** `void`
 
-*Defined at line 146*
+*Defined at line 140*
 
 ---
 
@@ -269,7 +277,7 @@ pub fn editor_rotate_selected(ed: &mut EditorState, dx: f64, dy: f64, dz: f64) -
 
 **Returns:** `void`
 
-*Defined at line 169*
+*Defined at line 167*
 
 ---
 
@@ -290,7 +298,7 @@ pub fn editor_scale_selected(ed: &mut EditorState, dx: f64, dy: f64, dz: f64) ->
 
 **Returns:** `void`
 
-*Defined at line 192*
+*Defined at line 194*
 
 ---
 
@@ -309,7 +317,7 @@ pub fn editor_set_gizmo_mode(ed: &mut EditorState, mode: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 219*
+*Defined at line 231*
 
 ---
 
@@ -327,7 +335,7 @@ pub fn editor_toggle_snap(ed: &mut EditorState) -> void {
 
 **Returns:** `void`
 
-*Defined at line 224*
+*Defined at line 236*
 
 ---
 
@@ -346,7 +354,7 @@ pub fn editor_set_snap_translate(ed: &mut EditorState, val: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 229*
+*Defined at line 241*
 
 ---
 
@@ -365,7 +373,7 @@ pub fn editor_set_snap_rotate(ed: &mut EditorState, val: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 234*
+*Defined at line 246*
 
 ---
 
@@ -384,7 +392,7 @@ pub fn editor_set_snap_scale(ed: &mut EditorState, val: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 239*
+*Defined at line 251*
 
 ---
 
@@ -403,7 +411,7 @@ pub fn editor_set_grid_size(ed: &mut EditorState, size: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 244*
+*Defined at line 256*
 
 ---
 
@@ -421,7 +429,7 @@ pub fn editor_toggle_grid(ed: &mut EditorState) -> void {
 
 **Returns:** `void`
 
-*Defined at line 249*
+*Defined at line 261*
 
 ---
 
@@ -442,7 +450,7 @@ pub fn editor_set_camera(ed: &mut EditorState, x: f64, y: f64, z: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 254*
+*Defined at line 266*
 
 ---
 
@@ -460,7 +468,7 @@ pub fn editor_delete_selected(ed: &mut EditorState) -> void {
 
 **Returns:** `void`
 
-*Defined at line 261*
+*Defined at line 273*
 
 ---
 
@@ -478,7 +486,7 @@ pub fn editor_duplicate_selected(ed: &mut EditorState) -> void {
 
 **Returns:** `void`
 
-*Defined at line 269*
+*Defined at line 283*
 
 ---
 
@@ -497,7 +505,7 @@ pub fn editor_toggle_visibility(ed: &mut EditorState, id: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 287*
+*Defined at line 296*
 
 ---
 
@@ -516,7 +524,7 @@ pub fn editor_toggle_lock(ed: &mut EditorState, id: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 301*
+*Defined at line 310*
 
 ---
 
@@ -534,7 +542,7 @@ pub fn editor_entity_count(ed: &EditorState) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 315*
+*Defined at line 324*
 
 ---
 
@@ -553,7 +561,7 @@ pub fn editor_get_entity(ed: &EditorState, idx: i64) -> EditorEntity {
 
 **Returns:** `EditorEntity`
 
-*Defined at line 320*
+*Defined at line 329*
 
 ---
 
@@ -571,7 +579,7 @@ pub fn editor_selected_id(ed: &EditorState) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 325*
+*Defined at line 334*
 
 ---
 
@@ -589,7 +597,7 @@ pub fn editor_gizmo_mode(ed: &EditorState) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 330*
+*Defined at line 339*
 
 ---
 
@@ -607,7 +615,7 @@ pub fn editor_snap_enabled(ed: &EditorState) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 335*
+*Defined at line 344*
 
 ---
 
@@ -625,7 +633,7 @@ pub fn editor_grid_visible(ed: &EditorState) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 340*
+*Defined at line 349*
 
 ---
 
@@ -644,7 +652,7 @@ pub fn editor_show_inspector(ed: &mut EditorState, show: bool) -> void {
 
 **Returns:** `void`
 
-*Defined at line 345*
+*Defined at line 354*
 
 ---
 
@@ -663,7 +671,7 @@ pub fn editor_show_hierarchy(ed: &mut EditorState, show: bool) -> void {
 
 **Returns:** `void`
 
-*Defined at line 350*
+*Defined at line 359*
 
 ---
 
@@ -681,7 +689,7 @@ pub fn editor_clear(ed: &mut EditorState) -> void {
 
 **Returns:** `void`
 
-*Defined at line 355*
+*Defined at line 364*
 
 ---
 
@@ -700,7 +708,7 @@ pub fn editor_set_max_undo(ed: &mut EditorState, max: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 361*
+*Defined at line 370*
 
 ---
 

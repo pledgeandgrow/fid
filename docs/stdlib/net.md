@@ -54,7 +54,7 @@
 pub const AF_INET: i64 = 2;
 ```
 
-*Defined at line 49*
+*Defined at line 56*
 
 ---
 
@@ -64,7 +64,7 @@ pub const AF_INET: i64 = 2;
 pub const SOCK_DGRAM: i64 = 2;
 ```
 
-*Defined at line 50*
+*Defined at line 56*
 
 ---
 
@@ -74,7 +74,7 @@ pub const SOCK_DGRAM: i64 = 2;
 pub const SOCK_STREAM: i64 = 1;
 ```
 
-*Defined at line 51*
+*Defined at line 56*
 
 ---
 
@@ -84,7 +84,7 @@ pub const SOCK_STREAM: i64 = 1;
 pub const SOL_SOCKET: i64 = 1;
 ```
 
-*Defined at line 52*
+*Defined at line 56*
 
 ---
 
@@ -94,7 +94,7 @@ pub const SOL_SOCKET: i64 = 1;
 pub const SO_REUSEADDR: i64 = 2;
 ```
 
-*Defined at line 53*
+*Defined at line 56*
 
 ---
 
@@ -104,7 +104,7 @@ pub const SO_REUSEADDR: i64 = 2;
 pub const SO_BROADCAST: i64 = 6;
 ```
 
-*Defined at line 54*
+*Defined at line 56*
 
 ---
 
@@ -114,7 +114,7 @@ pub const SO_BROADCAST: i64 = 6;
 pub const SO_RCVTIMEO: i64 = 20;
 ```
 
-*Defined at line 55*
+*Defined at line 56*
 
 ---
 
@@ -142,7 +142,7 @@ pub struct NetAddr {
 | `port` | `i64,      // port number` |
 | `raw` | `i64,       // raw sockaddr_in pointer (native)` |
 
-*Defined at line 61*
+*Defined at line 60*
 
 ---
 
@@ -161,7 +161,7 @@ pub fn net_addr_create(ip_str: str, port: i64) -> NetAddr {
 
 **Returns:** `NetAddr`
 
-*Defined at line 68*
+*Defined at line 69*
 
 ---
 
@@ -179,7 +179,7 @@ pub fn net_addr_any(port: i64) -> NetAddr {
 
 **Returns:** `NetAddr`
 
-*Defined at line 77*
+*Defined at line 81*
 
 ---
 
@@ -193,7 +193,7 @@ pub fn net_socket_create() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 84*
+*Defined at line 88*
 
 ---
 
@@ -207,7 +207,7 @@ pub fn net_socket_create_tcp() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 89*
+*Defined at line 94*
 
 ---
 
@@ -227,7 +227,7 @@ pub fn net_bind(sock: i64, port: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 95*
+*Defined at line 101*
 
 ---
 
@@ -245,7 +245,7 @@ pub fn net_set_nonblocking(sock: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 103*
+*Defined at line 119*
 
 ---
 
@@ -264,7 +264,7 @@ pub fn net_set_recv_timeout(sock: i64, timeout_ms: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 108*
+*Defined at line 124*
 
 ---
 
@@ -282,7 +282,7 @@ pub fn net_set_reuseaddr(sock: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 113*
+*Defined at line 129*
 
 ---
 
@@ -300,7 +300,7 @@ pub fn net_close(sock: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 119*
+*Defined at line 135*
 
 ---
 
@@ -322,7 +322,7 @@ pub fn net_send_to(sock: i64, data: i64, len: i64, addr: &NetAddr) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 127*
+*Defined at line 149*
 
 ---
 
@@ -345,7 +345,7 @@ pub fn net_recv_from(sock: i64, buf: i64, len: i64, from_addr: &mut NetAddr) -> 
 
 **Returns:** `i64`
 
-*Defined at line 134*
+*Defined at line 165*
 
 ---
 
@@ -364,7 +364,7 @@ pub fn net_connect(sock: i64, addr: &NetAddr) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 139*
+*Defined at line 184*
 
 ---
 
@@ -384,7 +384,7 @@ pub fn net_send(sock: i64, data: i64, len: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 144*
+*Defined at line 199*
 
 ---
 
@@ -404,7 +404,7 @@ pub fn net_recv(sock: i64, buf: i64, len: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 149*
+*Defined at line 214*
 
 ---
 
@@ -422,7 +422,7 @@ pub struct NetBuffer {
 | `size` | `i64` |
 | `pos` | `i64` |
 
-*Defined at line 155*
+*Defined at line 426*
 
 ---
 
@@ -438,7 +438,7 @@ pub fn net_buffer_create(size: i64) -> NetBuffer {
 
 **Returns:** `NetBuffer`
 
-*Defined at line 161*
+*Defined at line 432*
 
 ---
 
@@ -455,7 +455,7 @@ pub fn net_buffer_write_u8(buf: &mut NetBuffer, val: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 175*
+*Defined at line 444*
 
 ---
 
@@ -472,7 +472,7 @@ pub fn net_buffer_write_u16(buf: &mut NetBuffer, val: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 182*
+*Defined at line 451*
 
 ---
 
@@ -489,7 +489,7 @@ pub fn net_buffer_write_u32(buf: &mut NetBuffer, val: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 187*
+*Defined at line 456*
 
 ---
 
@@ -505,7 +505,7 @@ pub fn net_buffer_read_u8(buf: &mut NetBuffer) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 194*
+*Defined at line 463*
 
 ---
 
@@ -521,7 +521,7 @@ pub fn net_buffer_read_u16(buf: &mut NetBuffer) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 201*
+*Defined at line 472*
 
 ---
 
@@ -537,7 +537,7 @@ pub fn net_buffer_read_u32(buf: &mut NetBuffer) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 207*
+*Defined at line 478*
 
 ---
 
@@ -553,7 +553,7 @@ pub fn net_buffer_reset(buf: &mut NetBuffer) -> void {
 
 **Returns:** `void`
 
-*Defined at line 215*
+*Defined at line 486*
 
 ---
 
@@ -569,7 +569,7 @@ pub fn net_buffer_remaining(buf: &NetBuffer) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 219*
+*Defined at line 490*
 
 ---
 
@@ -579,7 +579,7 @@ pub fn net_buffer_remaining(buf: &NetBuffer) -> i64 {
 pub const MSG_TYPE_DATA: i64 = 0;
 ```
 
-*Defined at line 235*
+*Defined at line 519*
 
 ---
 
@@ -589,7 +589,7 @@ pub const MSG_TYPE_DATA: i64 = 0;
 pub const MSG_TYPE_ACK: i64 = 1;
 ```
 
-*Defined at line 236*
+*Defined at line 519*
 
 ---
 
@@ -599,7 +599,7 @@ pub const MSG_TYPE_ACK: i64 = 1;
 pub const MSG_TYPE_PING: i64 = 2;
 ```
 
-*Defined at line 237*
+*Defined at line 519*
 
 ---
 
@@ -609,7 +609,7 @@ pub const MSG_TYPE_PING: i64 = 2;
 pub const MSG_TYPE_PONG: i64 = 3;
 ```
 
-*Defined at line 238*
+*Defined at line 519*
 
 ---
 
@@ -630,7 +630,7 @@ pub struct ReliableMessage {
 | `acked` | `bool` |
 | `send_count` | `i64` |
 
-*Defined at line 240*
+*Defined at line 526*
 
 ---
 
@@ -649,10 +649,11 @@ pub struct ReliableConnection {
 | `next_msg_id` | `i64` |
 | `pending` | `Vec<ReliableMessage>` |
 | `received_ids` | `Vec<i64>` |
-| `rtt` | `f64,              // round-trip time estimate (ms)` |
-| `timeout_ms` | `i64,       // retransmission timeout` |
+| `rtt` | `f64` |
+| `timeout_ms` | `i64` |
+| `outgoing` | `Vec<Vec<i64>>` |
 
-*Defined at line 249*
+*Defined at line 535*
 
 ---
 
@@ -669,7 +670,7 @@ pub fn net_reliable_create(sock: i64, remote: NetAddr) -> ReliableConnection {
 
 **Returns:** `ReliableConnection`
 
-*Defined at line 259*
+*Defined at line 564*
 
 ---
 
@@ -688,26 +689,26 @@ pub fn net_reliable_send(conn: &mut ReliableConnection, data: Vec<i64>) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 272*
+*Defined at line 643*
 
 ---
 
 ## net_reliable_recv
 
-Process incoming data (check for ACKs or data messages).
+As net_reliable_recv_at with the time unknown (no round-trip sample).
 
 ```fides
-pub fn net_reliable_recv(conn: &mut ReliableConnection, data: Vec<i64>) -> void {
+pub fn net_reliable_recv(conn: &mut ReliableConnection, packet: Vec<i64>) -> NetReceived {
 ```
 
 **Parameters:**
 
 - `conn`: `&mut ReliableConnection`
-- `data`: `Vec<i64>`
+- `packet`: `Vec<i64>`
 
-**Returns:** `void`
+**Returns:** `NetReceived`
 
-*Defined at line 297*
+*Defined at line 746*
 
 ---
 
@@ -726,7 +727,7 @@ pub fn net_reliable_update(conn: &mut ReliableConnection, current_time: i64) -> 
 
 **Returns:** `void`
 
-*Defined at line 347*
+*Defined at line 752*
 
 ---
 
@@ -744,7 +745,7 @@ pub fn net_reliable_pending_count(conn: &ReliableConnection) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 389*
+*Defined at line 771*
 
 ---
 
@@ -762,7 +763,7 @@ pub fn net_reliable_rtt(conn: &ReliableConnection) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 394*
+*Defined at line 785*
 
 ---
 

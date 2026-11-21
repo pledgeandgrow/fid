@@ -24,6 +24,13 @@ where the bytes come from.
 | `ElfEmitter_build_elf` → `ElfEmitter_build_elf_img` | elf64.fd | ELF ET_REL (`codegen --elf`) | no: fixed |
 | `MachOEmitter_build_macho` → `MachOEmitter_build_macho_img` | macho.fd | Mach-O MH_OBJECT (`codegen --macho`) | no: fixed |
 
+Since the PIR path was retired (MI18, Nov 17), `fid codegen --elf`,
+`--coff` and `--macho` write the machine layer's objects through `cmd_build`
+(main.fd `codegen_target`), not the last three writers above: coff.fd and
+macho.fd are reached by nothing main.fd reaches, elf64.fd and linker.fd only
+by `build-x86`. Nov 21 (known-bugs 2g.110): `codegen --coff` and
+`emit --obj --nat` fail on every program (`undefined symbol: FreeLibrary`).
+
 ## The old bodies are gone (Nov 17)
 
 Until Nov 17 every writer kept its old body behind `img_old()`

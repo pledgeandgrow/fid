@@ -1,5 +1,11 @@
 # Section A remediation — pure rewiring pass
 
+> **A record of Oct 2026** (the 52-module compiler, `fidesc run` probes).
+> Several of the modules it rewired are unreached now: MI18 (Nov 17)
+> removed the PIR path (`build_executable`, `runtime_parts_with_caps*`;
+> docs/pir-retired.md), and `fid codegen` builds through the machine
+> layer. For today's state see PROGRESS.md and each module's page.
+
 Scope: the "A" list from the dead-module triage — items fixable by rewiring
 existing code, with no new OS/runtime primitives. Items needing `ptrace`,
 `readdir`, `mkdir`, file-error returns, the interpreter debug hook, or

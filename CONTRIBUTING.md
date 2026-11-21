@@ -1,7 +1,8 @@
-# Contributing to Fides
+# Contributing to Fid
 
-Thanks for your interest. Fides is a self-hosted systems language: the
-compiler `fid` is written in Fides (`compiler/*.fd`) and compiles itself.
+Thanks for your interest. Fid is a self-hosted systems language: its
+compiler, Fides (the `fid` command), is written in Fid (`compiler/*.fd`)
+and compiles itself.
 This page is how to build it, test a change, and send it.
 
 - Questions and ideas: [Discussions](https://github.com/pledgeandgrow/fid/discussions)
@@ -36,6 +37,15 @@ A one-stage build is enough while you work. The 3-stage bootstrap checks
 that the compiler reproduces itself byte for byte; run it before a change
 that touches lowering, the C generator or the core library lands. Compiler
 builds use a lot of CPU and memory: run one at a time.
+
+Two known problems (Nov 21, 2026). A cold start from `fidesc` cannot pass
+stage 2 of the bootstrap: a fid built by `fidesc` runs out of memory
+self-compiling the tree (known-bugs.md 2g.79, roadmap CB8). Start from a recent
+self-hosted fid instead (`STAGE0=<path to fid> ./scripts/bootstrap.sh`, or
+a pinned `release/stage0/fid`; one of Nov 18 builds today's tree). And when a split unit fails to compile,
+`build-selfhost.sh` falls back to one unit at -O0 and still exits 0
+(2g.86): if it prints "split build failed", the fid it made is about 17x
+slower.
 
 ## Test
 

@@ -1,7 +1,8 @@
 # tensor.fd
 
 - **Path:** `compiler/tensor.fd` — module `compiler::tensor`
-- **LOC:** 757 (2026-11-09). Rust `src/tensor.rs`: 609.
+- **LOC:** 832 (2026-11-21; 757 on Nov 9). Rust `src/tensor.rs`: 609. Nov 21: imported by
+  interp.fd and main.fd; the findings were not re-checked.
 - **Role:** the interpreter's tensor library: `TensorData` (shape, strides,
   `Vec<f64>` data), creation, indexing, elementwise ops, matmul/dot,
   reductions, relu/sigmoid/softmax, Q8 quantization helpers, JSON/string

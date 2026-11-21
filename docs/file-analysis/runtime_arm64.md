@@ -3,7 +3,8 @@
 Re-audited 2026-11-09 (previous audit 2026-10-22/23).
 
 - **Path:** `compiler/runtime_arm64.fd`
-- **LOC:** 800
+- **LOC:** 805 (2026-11-21; 800 on Nov 9). Nov 21: nothing imports it;
+  `compiler.fd` `build_executable` is gone (MI18, Nov 17).
 - **Role:** builds the AArch64 Linux runtime as asm text (`_start`,
   print helpers, allocator over mmap, vec basics, panic stubs, capability
   stubs) and assembles it with `arm64_enc`. Returns `RuntimeParts` and a

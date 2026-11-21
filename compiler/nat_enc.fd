@@ -2530,6 +2530,11 @@ pub var g_nat_ldyn_interp: i64 = 0 - 1;
 pub var g_nat_ldyn_interp_len: i64 = 0;
 pub var g_nat_ldyn_dyn: i64 = 0 - 1;
 pub var g_nat_ldyn_dyn_len: i64 = 0;
+/// 2g.99: the image offset of a dynamically linked x86-64 executable's
+/// PT_TLS block (8 bytes, zero, no file bytes: the dynamic loader puts it
+/// right below the thread pointer, where nat_ir.fd's nat_tls_get reads the
+/// runtime's thread block); -1: none.
+pub var g_nat_elf_tls: i64 = 0 - 1;
 
 /// A static Linux executable of `image`, entered at image offset `entry`
 /// (CI2: dynamically linked when g_nat_ldyn_dyn is set: PT_INTERP and
@@ -2899,6 +2904,11 @@ pub fn nat_elf_img(arch: i64, image: & Vec<i64>, entry: i64) -> Vec<i64> {
     if ldyn {
         phnum = phnum + 2;
     }
+    // 2g.99: the runtime's static TLS word of a dynamically linked image
+    var tls_seg: bool = ldyn && g_nat_elf_tls >= 0 && g_nat_elf_tls <= image.len();
+    if tls_seg {
+        phnum = phnum + 1;
+    }
     if dsplit > 0 {
         phnum = phnum + 2;
     }
@@ -2937,6 +2947,11 @@ pub fn nat_elf_img(arch: i64, image: & Vec<i64>, entry: i64) -> Vec<i64> {
         // PT_DYNAMIC, read/write (the dynamic linker writes DT_DEBUG)
         img_elf_phdr(& mut out, 2, 6, 0x1000 + g_nat_ldyn_dyn, base + g_nat_ldyn_dyn, g_nat_ldyn_dyn_len, g_nat_ldyn_dyn_len, 8);
     }
+    if tls_seg {
+        // PT_TLS, read-only template of no bytes, 8 bytes of TLS (the
+        // executable's block: fs - 8 on x86-64), 8-aligned
+        img_elf_phdr(& mut out, 7, 4, 0x1000 + g_nat_elf_tls, base + g_nat_elf_tls, 0, 8, 8);
+    }
     img_pad_to(& mut out, 0x1000);
     img_append(& mut out, image);
     return out;
@@ -2967,6 +2982,183 @@ pub fn nat_pe_dll_for(lib: str) -> str {
         return lib;
     }
     return lib + ".dll";
+}
+
+/// CB9 (2g.106): an environment variable, "" when it is not set.
+fn nat_env_str(name: str) -> str {
+    match env_var(name) {
+        Option::Some(v) => {
+            return v;
+        }
+        Option::None => {
+        }
+    }
+    return "";
+}
+
+fn nat_rd_u16(b: & Vec<i64>, at: i64) -> i64 {
+    if at < 0 || at + 2 > b.len() {
+        return 0 - 1;
+    }
+    return (b.get(at) & 255) | ((b.get(at + 1) & 255) << 8);
+}
+
+fn nat_rd_u32(b: & Vec<i64>, at: i64) -> i64 {
+    if at < 0 || at + 4 > b.len() {
+        return 0 - 1;
+    }
+    return (b.get(at) & 255) | ((b.get(at + 1) & 255) << 8) | ((b.get(at + 2) & 255) << 16) | ((b.get(at + 3) & 255) << 24);
+}
+
+/// CB9: the file offset of RVA `rva` of the PE image `b` whose `nsec`
+/// section headers start at `sec`; -1 when no section holds it.
+fn nat_pe_rva_off(b: & Vec<i64>, sec: i64, nsec: i64, rva: i64) -> i64 {
+    var k: i64 = 0;
+    while k < nsec {
+        var h: i64 = sec + k * 40;
+        var size: i64 = nat_rd_u32(b, h + 8);
+        var va: i64 = nat_rd_u32(b, h + 12);
+        var raw: i64 = nat_rd_u32(b, h + 16);
+        if raw > size {
+            size = raw;
+        }
+        if va >= 0 && rva >= va && rva < va + size {
+            return rva - va + nat_rd_u32(b, h + 20);
+        }
+        k = k + 1;
+    }
+    return 0 - 1;
+}
+
+/// CB9 (2g.106): the names the export directory of the PE image (a DLL)
+/// `b` holds, as a set (name -> 1); 0 when `b` is not a PE image with
+/// one.
+pub fn nat_pe_export_set(b: & Vec<i64>) -> i64 {
+    if b.len() < 64 || nat_rd_u16(b, 0) != 0x5A4D {
+        return 0;
+    }
+    var pe: i64 = nat_rd_u32(b, 60);
+    if pe <= 0 || nat_rd_u32(b, pe) != 0x4550 {
+        return 0;
+    }
+    var nsec: i64 = nat_rd_u16(b, pe + 6);
+    var opt: i64 = pe + 24;
+    var sec: i64 = opt + nat_rd_u16(b, pe + 20);
+    // the data directories after 96 bytes of a PE32 optional header, 112
+    // of a PE32+ one (magic 0x20b); the export directory is the first
+    var dd: i64 = opt + 96;
+    if nat_rd_u16(b, opt) == 0x20B {
+        dd = opt + 112;
+    }
+    var exp_rva: i64 = nat_rd_u32(b, dd);
+    if exp_rva <= 0 || nsec <= 0 {
+        return 0;
+    }
+    var ed: i64 = nat_pe_rva_off(b, sec, nsec, exp_rva);
+    if ed < 0 {
+        return 0;
+    }
+    var count: i64 = nat_rd_u32(b, ed + 24);
+    var names: i64 = nat_pe_rva_off(b, sec, nsec, nat_rd_u32(b, ed + 32));
+    if names < 0 || count < 0 {
+        return 0;
+    }
+    var set: i64 = HashMap_new();
+    var i: i64 = 0;
+    while i < count {
+        var at: i64 = nat_pe_rva_off(b, sec, nsec, nat_rd_u32(b, names + 4 * i));
+        if at >= 0 {
+            var nb: Vec<i64> = Vec::new();
+            var j: i64 = at;
+            while j < b.len() && b.get(j) != 0 && j - at < 512 {
+                nb.push(b.get(j));
+                j = j + 1;
+            }
+            if nb.len() > 0 {
+                HashMap_insert(set, str_from_bytes(nb), 1);
+            }
+        }
+        i = i + 1;
+    }
+    return set;
+}
+
+/// CB9 (2g.106): where the DLL `dll` (nat_pe_dll_for's name) is on this
+/// machine: in a directory of FID_NAT_LIBPATH (separated by ';'), else the
+/// Windows system folder (%SystemRoot%\System32, which exists only on a
+/// Windows build machine); "" when it is in none.
+pub fn nat_pe_find_dll(dll: str) -> str {
+    var dirs: Vec<str> = Vec::new();
+    var lp: str = nat_env_str("FID_NAT_LIBPATH");
+    if str_len(lp) > 0 {
+        var parts: Vec<str> = str_split(lp, ";");
+        var pi: i64 = 0;
+        while pi < parts.len() {
+            if str_len(parts.get(pi)) > 0 {
+                dirs.push(parts.get(pi));
+            }
+            pi = pi + 1;
+        }
+    }
+    var root: str = nat_env_str("SystemRoot");
+    if str_len(root) == 0 {
+        root = nat_env_str("windir");
+    }
+    if str_len(root) > 0 {
+        dirs.push(root + "\\System32");
+    }
+    if str_contains(dll, "/") || str_contains(dll, "\\") {
+        if p_file_exists(dll) != 0 {
+            return dll;
+        }
+        return "";
+    }
+    var di: i64 = 0;
+    while di < dirs.len() {
+        var path: str = dirs.get(di) + "\\" + dll;
+        if p_file_exists(path) != 0 {
+            return path;
+        }
+        di = di + 1;
+    }
+    return "";
+}
+
+/// CB9 (2g.106): the C functions of `names` that the DLL each one is
+/// imported from (nat_pe_dll_for of its entry of `libs`) does not export,
+/// as far as this machine can tell: a name is listed only when its DLL was
+/// found and read (nat_pe_find_dll) and its export directory lacks it. A
+/// missing DLL lists nothing (the loader reports it by name), as on Linux
+/// (nat_elf_link_missing).
+pub fn nat_pe_link_missing(names: & Vec<str>, libs: & Vec<str>) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    // dll -> 1 + index into sets (0 in sets: not readable)
+    var seen: i64 = HashMap_new();
+    var sets: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < names.len() {
+        var lib: str = "";
+        if i < libs.len() {
+            lib = libs.get(i);
+        }
+        var dll: str = nat_pe_dll_for(lib);
+        if !HashMap_contains(seen, dll) {
+            var set: i64 = 0;
+            var path: str = nat_pe_find_dll(dll);
+            if path != "" {
+                var b: Vec<i64> = p_file_read_bytes(path);
+                set = nat_pe_export_set(& b);
+            }
+            sets.push(set);
+            HashMap_insert(seen, dll, sets.len());
+        }
+        var s: i64 = sets.get(HashMap_get(seen, dll) - 1);
+        if s != 0 && !HashMap_contains(s, names.get(i)) {
+            out.push(names.get(i));
+        }
+        i = i + 1;
+    }
+    return out;
 }
 
 /// TG15: a stub signature (ng_ldyn_sig's form) without the variadic
@@ -6161,6 +6353,17 @@ pub fn x64_load_fs(e: & mut NatEnc, r: i64, disp: i64) {
     NatEnc_u32(e, disp);
 }
 
+/// fs:[disp] = r (2g.99: the runtime's thread block in the executable's
+/// static TLS, nat_ir.fd nat_tls_set)
+pub fn x64_store_fs(e: & mut NatEnc, r: i64, disp: i64) {
+    NatEnc_byte(e, 0x64);
+    x64_rex(e, true, r, 0, 0, false);
+    NatEnc_byte(e, 0x89);
+    NatEnc_byte(e, ((r & 7) << 3) | 4);
+    NatEnc_byte(e, 0x25);
+    NatEnc_u32(e, disp);
+}
+
 /// r = gs:[disp] (Windows: the thread environment block)
 pub fn x64_load_gs(e: & mut NatEnc, r: i64, disp: i64) {
     NatEnc_byte(e, 0x65);
@@ -7351,6 +7554,114 @@ pub fn nat_macho_import(lib: str, sym: str) -> str {
         return sym;
     }
     return path + "|" + sym;
+}
+
+/// CB9 (2g.106): a byte that ends a symbol of a text-based stub (.tbd: a
+/// YAML list such as `symbols: [ _a, _b ]`, or quoted names).
+fn nat_tbd_delim(c: i64) -> bool {
+    return c == 32 || c == 9 || c == 10 || c == 13 || c == 44 || c == 91 || c == 93 || c == 39 || c == 34;
+}
+
+/// CB9 (2g.106): does the text-based stub `b` (its bytes) name `sym` (with
+/// its leading underscore) as a whole word?
+pub fn nat_tbd_has(b: & Vec<i64>, sym: str) -> bool {
+    var n: i64 = str_len(sym);
+    if n == 0 {
+        return false;
+    }
+    var first: i64 = str_byte_at(sym, 0);
+    var i: i64 = 0;
+    while i + n <= b.len() {
+        if b.get(i) == first && (i == 0 || nat_tbd_delim(b.get(i - 1))) && (i + n == b.len() || nat_tbd_delim(b.get(i + n))) {
+            var j: i64 = 1;
+            while j < n && b.get(i + j) == str_byte_at(sym, j) {
+                j = j + 1;
+            }
+            if j == n {
+                return true;
+            }
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// CB9 (2g.106): the macOS SDK whose text-based stubs say what each system
+/// library exports: SDKROOT, else the Command Line Tools' or Xcode's (on a
+/// Mac); "" when there is none (a build on another system).
+pub fn nat_macho_sdk() -> str {
+    var cands: Vec<str> = Vec::new();
+    var env: str = nat_env_str("SDKROOT");
+    if str_len(env) > 0 {
+        cands.push(env);
+    }
+    cands.push("/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk");
+    cands.push("/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk");
+    var i: i64 = 0;
+    while i < cands.len() {
+        if p_file_exists(cands.get(i) + "/usr/lib/libSystem.B.tbd") != 0 {
+            return cands.get(i);
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+/// CB9 (2g.106): the text-based stub in `sdk` of the dylib at `path`
+/// (nat_macho_dylib_path's result): the path without ".dylib" plus ".tbd";
+/// "" for a path relative to the program (@rpath, ...).
+pub fn nat_macho_tbd_path(sdk: str, path: str) -> str {
+    if !str_starts_with(path, "/") {
+        return "";
+    }
+    if str_ends_with(path, ".dylib") {
+        return sdk + str_slice(path, 0, str_len(path) - 6) + ".tbd";
+    }
+    return sdk + path + ".tbd";
+}
+
+/// CB9 (2g.106): the C functions of `names` that the dylib each is bound
+/// from (nat_macho_dylib_path of its entry of `libs`; libSystem's stub
+/// holds its re-exported libraries too, libm's among them) does not export,
+/// as the SDK's text-based stubs say (nat_macho_sdk): a name is listed only
+/// when its stub was found and read and does not name it. Without an SDK
+/// (or the stub) nothing is listed: dyld reports the symbol by name.
+pub fn nat_macho_link_missing(names: & Vec<str>, libs: & Vec<str>) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    if names.len() == 0 {
+        return out;
+    }
+    var sdk: str = nat_macho_sdk();
+    if sdk == "" {
+        return out;
+    }
+    // stub path -> 1 + index into blobs (an empty blob: not readable)
+    var seen: i64 = HashMap_new();
+    var blobs: Vec<Vec<i64>> = Vec::new();
+    var i: i64 = 0;
+    while i < names.len() {
+        var lib: str = "";
+        if i < libs.len() {
+            lib = libs.get(i);
+        }
+        var tbd: str = nat_macho_tbd_path(sdk, nat_macho_dylib_path(lib));
+        if tbd != "" {
+            if !HashMap_contains(seen, tbd) {
+                var b: Vec<i64> = Vec::new();
+                if p_file_exists(tbd) != 0 {
+                    b = p_file_read_bytes(tbd);
+                }
+                blobs.push(b);
+                HashMap_insert(seen, tbd, blobs.len());
+            }
+            var bb: Vec<i64> = blobs.get(HashMap_get(seen, tbd) - 1);
+            if bb.len() > 0 && !nat_tbd_has(& bb, "_" + names.get(i)) {
+                out.push(names.get(i));
+            }
+        }
+        i = i + 1;
+    }
+    return out;
 }
 
 /// TG15: `imp_names` (nat_macho) split into what dyld binds: the symbols,

@@ -86,7 +86,10 @@ same result. A key outside the type's range never matches.
 - `tests/nattools/machine_jtab_check.sh`: every Linux target and `--nat`
   Windows, default / `FID_NAT_OFF=jtab` / `FID_SWITCH=off` and a PIE, with
   `FID_VERIFY=1`; which functions hold a table; the indirect jump in the
-  x86-64 binary.
+  x86-64 binary. Nov 21 (roadmap MI27 check): it fails 5 checks because
+  `digit_name` and `live_across` are now inlined into `main`, and with
+  inlining off `bits3` gets a table the check says it must not; the tables
+  themselves work (test_machine_jtab is right on every target and PIE).
 - `tests/bootstrap/test_irswitch_narrow.fd` and
   `tests/nattools/machine_switch_narrow_check.sh` (ME28): switches on
   `u8`, `u16`, `i16`, `u32` and `i32` values, on the C path (a C `switch`

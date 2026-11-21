@@ -6,7 +6,7 @@ Use **GitHub Discussions** — https://github.com/pledgeandgrow/fid/discussions
 
 - **Q&A**: usage questions, "how do I…", error messages you can't decode.
 - **Ideas**: language/library proposals — expect honest feedback on scope.
-- **Show and tell**: things you built with Fides.
+- **Show and tell**: things you built with Fid.
 
 ## Bugs
 
@@ -30,4 +30,4 @@ the input and both outputs if you can. See
 
 Security disclosures: do NOT file public issues for exploitable bugs —
 contact the maintainers privately first (see the security policy in
-`docs/roadmap/security-roadmap.md`).
+[SECURITY.md](SECURITY.md)).

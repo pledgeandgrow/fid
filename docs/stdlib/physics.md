@@ -47,7 +47,7 @@ pub struct AABB {
 | `width` | `f64,   // box width` |
 | `height` | `f64,  // box height` |
 
-*Defined at line 18*
+*Defined at line 17*
 
 ---
 
@@ -68,7 +68,7 @@ pub fn physics_aabb_new(x: f64, y: f64, width: f64, height: f64) -> AABB {
 
 **Returns:** `AABB`
 
-*Defined at line 26*
+*Defined at line 40*
 
 ---
 
@@ -87,7 +87,7 @@ pub fn physics_aabb_collides(a: AABB, b: AABB) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 31*
+*Defined at line 47*
 
 ---
 
@@ -107,7 +107,7 @@ pub fn physics_aabb_contains_point(box: AABB, px: f64, py: f64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 40*
+*Defined at line 64*
 
 ---
 
@@ -125,7 +125,7 @@ pub fn physics_aabb_center(box: AABB) -> (f64, f64) {
 
 **Returns:** `(f64, f64)`
 
-*Defined at line 45*
+*Defined at line 69*
 
 ---
 
@@ -145,7 +145,7 @@ pub fn physics_aabb_overlap(a: AABB, b: AABB) -> (f64, f64, f64, f64) {
 
 **Returns:** `(f64, f64, f64, f64)`
 
-*Defined at line 51*
+*Defined at line 75*
 
 ---
 
@@ -165,7 +165,7 @@ pub fn physics_aabb_mtv(a: AABB, b: AABB) -> (f64, f64) {
 
 **Returns:** `(f64, f64)`
 
-*Defined at line 69*
+*Defined at line 101*
 
 ---
 
@@ -183,7 +183,7 @@ pub struct Circle {
 | `cy` | `f64,    // center y` |
 | `radius` | `f64` |
 
-*Defined at line 101*
+*Defined at line 145*
 
 ---
 
@@ -203,7 +203,7 @@ pub fn physics_circle_new(cx: f64, cy: f64, radius: f64) -> Circle {
 
 **Returns:** `Circle`
 
-*Defined at line 108*
+*Defined at line 154*
 
 ---
 
@@ -222,7 +222,7 @@ pub fn physics_circle_collides(a: Circle, b: Circle) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 113*
+*Defined at line 161*
 
 ---
 
@@ -242,7 +242,7 @@ pub fn physics_circle_contains(c: Circle, px: f64, py: f64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 121*
+*Defined at line 169*
 
 ---
 
@@ -261,7 +261,7 @@ pub fn physics_circle_distance(a: Circle, b: Circle) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 128*
+*Defined at line 176*
 
 ---
 
@@ -281,7 +281,7 @@ pub struct Ray {
 | `dir_y` | `f64` |
 | `max_dist` | `f64, // maximum ray distance` |
 
-*Defined at line 146*
+*Defined at line 196*
 
 ---
 
@@ -303,7 +303,7 @@ pub fn physics_ray_new(ox: f64, oy: f64, dx: f64, dy: f64, max_dist: f64) -> Ray
 
 **Returns:** `Ray`
 
-*Defined at line 155*
+*Defined at line 206*
 
 ---
 
@@ -323,7 +323,7 @@ pub fn physics_ray_vs_aabb(ray: Ray, box: AABB) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 182*
+*Defined at line 229*
 
 ---
 
@@ -342,7 +342,7 @@ pub fn physics_ray_vs_circle(ray: Ray, c: Circle) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 222*
+*Defined at line 282*
 
 ---
 
@@ -369,7 +369,7 @@ pub struct Body {
 | `grounded` | `bool,   // is the body on the ground?` |
 | `active` | `bool,     // is the body being simulated?` |
 
-*Defined at line 263*
+*Defined at line 325*
 
 ---
 
@@ -390,7 +390,7 @@ pub fn physics_body_create(x: f64, y: f64, width: f64, height: f64) -> Body {
 
 **Returns:** `Body`
 
-*Defined at line 279*
+*Defined at line 352*
 
 ---
 
@@ -410,7 +410,7 @@ pub fn physics_body_set_velocity(body: &mut Body, vx: f64, vy: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 297*
+*Defined at line 359*
 
 ---
 
@@ -430,7 +430,7 @@ pub fn physics_body_set_acceleration(body: &mut Body, ax: f64, ay: f64) -> void 
 
 **Returns:** `void`
 
-*Defined at line 303*
+*Defined at line 365*
 
 ---
 
@@ -449,7 +449,7 @@ pub fn physics_body_set_mass(body: &mut Body, mass: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 309*
+*Defined at line 371*
 
 ---
 
@@ -468,7 +468,7 @@ pub fn physics_body_set_restitution(body: &mut Body, r: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 314*
+*Defined at line 376*
 
 ---
 
@@ -488,7 +488,7 @@ pub fn physics_body_apply_force(body: &mut Body, fx: f64, fy: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 319*
+*Defined at line 381*
 
 ---
 
@@ -508,7 +508,7 @@ pub fn physics_body_apply_impulse(body: &mut Body, ix: f64, iy: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 327*
+*Defined at line 389*
 
 ---
 
@@ -529,7 +529,7 @@ pub fn physics_body_update(body: &mut Body, dt: f64, gravity: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 336*
+*Defined at line 398*
 
 ---
 
@@ -547,7 +547,7 @@ pub fn physics_body_aabb(body: Body) -> AABB {
 
 **Returns:** `AABB`
 
-*Defined at line 359*
+*Defined at line 423*
 
 ---
 
@@ -567,7 +567,7 @@ pub fn physics_resolve_collision(a: &mut Body, b: Body) -> void {
 
 **Returns:** `void`
 
-*Defined at line 372*
+*Defined at line 433*
 
 ---
 
@@ -587,7 +587,7 @@ pub fn physics_resolve_vs_static(body: &mut Body, tile: AABB) -> void {
 
 **Returns:** `void`
 
-*Defined at line 403*
+*Defined at line 463*
 
 ---
 
@@ -607,7 +607,7 @@ pub fn physics_elastic_collision(a: &mut Body, b: &mut Body) -> void {
 
 **Returns:** `void`
 
-*Defined at line 443*
+*Defined at line 503*
 
 ---
 

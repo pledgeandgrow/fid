@@ -27,7 +27,7 @@ pub struct FetchResult {
 | `body` | `str` |
 | `error` | `str` |
 
-*Defined at line 23*
+*Defined at line 20*
 
 ---
 
@@ -49,7 +49,7 @@ pub fn fetch_with(method: str, url: str, headers: str, body: str) -> FetchResult
 
 **Returns:** `FetchResult`
 
-*Defined at line 127*
+*Defined at line 132*
 
 ---
 
@@ -67,7 +67,7 @@ pub fn fetch(url: str) -> FetchResult {
 
 **Returns:** `FetchResult`
 
-*Defined at line 148*
+*Defined at line 153*
 
 ---
 
@@ -87,14 +87,17 @@ pub fn fetch_post(url: str, content_type: str, body: str) -> FetchResult {
 
 **Returns:** `FetchResult`
 
-*Defined at line 153*
+*Defined at line 158*
 
 ---
 
 ## https_serve_scoped
 
+As https_serve, with memory that stays flat: the handler borrows each
+request, as with http_serve_scoped.
+
 ```fides
-pub fn https_serve_scoped(port: i64, cert: str, key: str, handler: fn(HttpRequest) -> str) -> bool {
+pub fn https_serve_scoped(port: i64, cert: str, key: str, handler: fn(ScopedRequest) -> str) -> bool {
 ```
 
 **Parameters:**
@@ -102,11 +105,11 @@ pub fn https_serve_scoped(port: i64, cert: str, key: str, handler: fn(HttpReques
 - `port`: `i64`
 - `cert`: `str`
 - `key`: `str`
-- `handler`: `fn(HttpRequest) -> str`
+- `handler`: `fn(ScopedRequest) -> str`
 
 **Returns:** `bool`
 
-*Defined at line 159*
+*Defined at line 164*
 
 ---
 
@@ -128,7 +131,7 @@ pub fn https_serve(port: i64, cert: str, key: str, handler: fn(HttpRequest) -> s
 
 **Returns:** `bool`
 
-*Defined at line 166*
+*Defined at line 171*
 
 ---
 

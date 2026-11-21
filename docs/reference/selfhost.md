@@ -1,9 +1,9 @@
 # Self-Hosted Fides Compiler
 
-> **Status (Nov 19, 2026):** the self-hosted compiler `fid` (`compiler/*.fd`,
-> 80 modules, 360,594 lines; 56 reached from `main.fd`) is the release
+> **Status (Nov 21, 2026):** the self-hosted compiler `fid` (`compiler/*.fd`,
+> 80 modules, 360,657 lines; 56 reached from `main.fd`) is the release
 > compiler and defines the language ([reference.md](reference.md)); the Rust
-> compiler `fidesc` (`src/*.rs`, 57 files, 113,416 lines) is frozen and builds
+> compiler `fidesc` (`src/*.rs`, 57 files, 114,184 lines) is frozen and builds
 > stage 1 and runs the test harness. `RELEASE=1 CC="zig cc"
 > ./scripts/bootstrap.sh` builds `fid` in three stages, each stage's C split
 > into 8 units compiled at -O2 when the previous stage has `fid split-c`,
@@ -11,8 +11,11 @@
 > runs a program from an installed layout; the installer ships it as
 > `fid.exe`. The fixpoint was last reached on Nov 8 (67 MB of C, with the
 > ownership layouts of proposal 0004); later changes were checked on
-> one-stage builds. `fid` compiles itself to C in 74 s when built at -O2
-> (229 s at -O0); `fidesc` takes ~21 s.
+> one-stage builds. A `fid` built by `fidesc` runs out of memory
+> self-compiling the current tree (known-bugs 2g.79); on Nov 21 the tree
+> was built in one step from a self-hosted stage 0 (the fid of Nov 18)
+> instead. `fid` compiles itself to C in 57 s when built at -O2 (Nov 21);
+> `fidesc` takes ~45 s.
 >
 > The last full suite run is Nov 2 (Rust harness, `fidesc` as compiler:
 > interp 339/339, C 343/343, PE 345/345, expected-fail 89/89); it has not
@@ -24,16 +27,19 @@
 > (compiler/pe_ir*.fd, with the compiler/iropt.fd optimizer), Linux
 > AArch64/RISC-V/x86-64 and opt-in Windows `--nat` from the machine layer
 > (compiler/nat_ir.fd, nat_enc.fd, runtime in stdlib/linux_runtime/). The
-> old PIR path (`build --native` with the default target: opt.fd,
-> codegen_x64, elf64, linker) panics in opt.fd `pass_jump_thread`;
-> compiler/pe.fd is reached only by `emit --boot`, which panics. Native async
+> old PIR path (opt.fd, codegen_x64, elf64, linker, pe.fd) is on no build
+> path since Nov 17 (MI18): `build --native` is the machine layer on every
+> target, and `emit --boot` builds the bootable image through pe_ir. Native async
 > under `emit` broke in builds of Nov 9 afternoon (iropt passes; fixed again in the evening's fid31, known-bugs 2f.2). Open items:
 > [known-bugs.md §2g](known-bugs.md#2g-nov-9-2026--module-audit-open-bugs)
 > (Nov 9 audit) and §2f. Each module is described in
 > `docs/file-analysis/<module>.md` (all rewritten Nov 9).
 > Current counts are in [§ Numbers](#numbers).
 > Most of this file is the history of getting here; commands below that
-> mention `release.fid.exe` or `C:\tcc` are historical.
+> mention `release.fid.exe` or `C:\tcc` are historical, and so are
+> `build-selfhost.ps1`, `verify-stage-diff.ps1`, `verify-stdout-diff.ps1` and
+> `scripts/bisect.sh`, which do not exist (Nov 21): bisect with the `dump-*`
+> commands, build with `scripts/build-selfhost.sh` or `scripts/bootstrap.sh`.
 
 > Consolidated 2026-10-24 from selfhost/ README, agent-guide, COORDINATION, architecture, build-pipeline, language-constraints, path-to-fixpoint, capability-comparison, vision-analysis. Living ledgers now live alongside it in `docs/reference/`: `known-bugs.md` (includes the port-gap-analysis appendix), `calling-conventions.md`.
 
@@ -94,32 +100,31 @@ cargo build --release
 ### Numbers
 
 The one place project counts and measurements are kept (other docs round
-them and link here). Counted with `wc -l` on Nov 19, 2026 (unchanged by the Nov 20 stage-0
-fixes, which touch `src/*.rs`, scripts and docs only).
+them and link here). Counted with `wc -l` on Nov 21, 2026 (HEAD 7897c78).
 
 | Component | Files | Lines |
 |-----------|-------|-------|
-| Self-hosted compiler (`compiler/*.fd`) | 80 (56 reached from `main.fd`) | 360,594 |
-| Rust compiler (`src/*.rs`, frozen) | 57 | 113,416 |
+| Self-hosted compiler (`compiler/*.fd`) | 80 (56 reached from `main.fd`) | 360,657 |
+| Rust compiler (`src/*.rs`, frozen) | 57 | 114,184 |
 | Stdlib (`stdlib/*.fd`) | 403 | 259,299 |
 | Native runtimes (`stdlib/pe_runtime/`, `stdlib/linux_runtime/`) | 4 + 7 | 10,602 + 13,229 |
 | Tools (`tools/*.fd`) | 12 | — |
-| Tests (`tests/bootstrap/`) | 1,752 .fd (1,681 top level, 456 expected-fail; 71 in subdirs) | — |
+| Tests (`tests/bootstrap/`) | 1,753 .fd (1,682 top level, 458 expected-fail `*_fail.fd`/`*_fail2.fd`; 71 in subdirs) | — |
 | Tests (`tests/selfhost/`) | 57 .fd | — |
 | Tests (`tests/conformance/`) | 1,596 .fd (each checks a rule of reference.md §1–§13) | — |
 | Tests (`tests/leaks/`) | 10 .fd + .expected (`scripts/leak-check.sh`) | — |
 | Tests (`tests/nattools/`) | 68 .fd + check scripts | — |
 | Tests (`tests/projects/`) | 52 .fd | — |
 | Tests (`tests/verify/`) | 50 .fd | — |
-| Tests (`tests/tooling/`) | 14 .fd + 126 `*-check.sh` | — |
+| Tests (`tests/tooling/`) | 14 .fd + 126 scripts (118 `*-check.sh`) | — |
 | Examples (`examples/`) | 12 .fd | — |
-| Installer (`installer/`) | 6 | — |
+| Installer (`installer/`) | 5 tracked (built `*-Setup-*.exe` files are git-ignored) | — |
 | Compiler module docs (`docs/file-analysis/`) | 69 of 80 modules | — |
 | CI workflows (`.github/workflows/`) | 13 | — |
 
 | Measurement | Value |
 |-------------|-------|
-| Last full suite (Rust harness, `fidesc` as the compiler) | Nov 2: interp 339/339, C 343/343, PE 345/345, expected-fail 89/89 — the suite has grown ~3x since (1,752 bootstrap files); a fresh full run is part of the 1.0 release prep |
+| Last full suite (Rust harness, `fidesc` as the compiler) | Nov 2: interp 339/339, C 343/343, PE 345/345, expected-fail 89/89 — the suite has grown ~3x since (1,753 bootstrap files); a fresh full run is part of the 1.0 release prep |
 | Full suite with `fid` as the compiler | not run |
 | Native Linux suite (`NATIVE=1 scripts/cross-test.sh`, Nov 9) | AArch64 273, RISC-V 271, x86-64 272 of 317 match the interpreter |
 | Windows x64 on the machine layer (`fid emit --nat`, Nov 9) | 301 of 338 |
@@ -2020,8 +2025,8 @@ Also a compiled artifact. The source is `compiler/lower.fd`.
 Download `Fides-Setup-1.0.0.exe` from
 [GitHub Releases](https://github.com/pledgeandgrow/fid/releases/tag/v1.0.0)
 and run it. This installs:
-- the compilers to `C:\Program Files\Fides\` (`installer/fides.nsi` today ships `fid.exe`, the self-hosted compiler, plus `fidesc.exe`, `ark.exe`, `scribe.exe`, `veil.exe`)
-- Standard library to `C:\Program Files\Fides\stdlib\` (99 modules in v1.0.0; 146 in the tree on Nov 9)
+- the compilers to `C:\Program Files\Fides\` (`C:\Program Files\Fid\` today; `installer/fides.nsi` ships `fid.exe`, the self-hosted compiler, plus `fidesc.exe`, `ark.exe`, `scribe.exe`, `veil.exe`)
+- Standard library to `C:\Program Files\Fides\stdlib\` (99 modules in v1.0.0; 403 in the tree on Nov 21)
 - C runtime files to `C:\Program Files\Fides\runtime\`
 - Documentation to `C:\Program Files\Fides\docs\`
 - PATH integration (system-wide)
@@ -2043,10 +2048,13 @@ makensis fides.nsi
 
 Or trigger the workflow manually:
 ```bash
-gh workflow run build-installer.yml -f version=1.0.0
+gh workflow run release.yml -f version=1.0.0
 ```
 
-The workflow (`.github/workflows/build-installer.yml`):
+The workflow was `.github/workflows/build-installer.yml` in v1.0.0; it is
+`.github/workflows/release.yml` now (Nov 21), which builds `release/fid.exe`
+with the 3-stage release bootstrap and runs `installer/build-installer.sh`.
+The v1.0.0 workflow:
 1. Builds the Rust bootstrap compiler (`cargo build --release`)
 2. Copies `fidesc.exe` as `fides.exe` (the shipped compiler)
 3. Installs NSIS via Chocolatey
@@ -2444,7 +2452,7 @@ Probe tests for self-hosting behavior:
 
 ```
 fid/
-├── compiler/             # Self-hosted Fides compiler modules (80 .fd files, 360,594 lines, Nov 19; list below is from session 16)
+├── compiler/             # Self-hosted Fides compiler modules (80 .fd files, 360,657 lines, Nov 21; list below is from session 16)
 │   ├── main.fd           # CLI entry point (ccompile + build + lsp + test + fmt + ...)
 │   ├── compiler.fd       # Pipeline driver
 │   ├── token.fd          # Token kinds (133 variants)
@@ -2472,19 +2480,19 @@ fid/
 │   └── inc.fd            # Incremental compilation cache
 ├── docs/reference/       # This documentation (selfhost.md, known-bugs.md, ...)
 ├── release/              # Self-hosted build artifacts (gitignored)
-├── src/                  # Rust reference compiler, frozen (57 .rs files, 113,416 lines)
+├── src/                  # Rust reference compiler, frozen (57 .rs files, 114,184 lines)
 ├── stdlib/               # Fides standard library (403 .fd modules, 259,299 lines)
-├── tests/bootstrap/      # Language tests (1,752 .fd files)
+├── tests/bootstrap/      # Language tests (1,753 .fd files)
 ├── tests/selfhost/       # Self-host module tests (57 .fd files)
 ├── tests/selfhost/       # Bootstrap probe tests
 ├── target/               # Rust build artifacts
 ├── verify.sh             # Full Rust compiler verification
-├── verify-selfhost.sh    # Self-host verification
-├── verify-fixpoint.ps1   # Bootstrap fixpoint (Windows)
-├── verify-stdout-diff.ps1
-├── verify-stage-diff.ps1
-└── build-selfhost.ps1    # Build the self-hosted compiler (Windows)
+└── verify-selfhost.sh    # Self-host verification
 ```
+
+(The `verify-fixpoint.ps1`, `verify-stdout-diff.ps1`, `verify-stage-diff.ps1`
+and `build-selfhost.ps1` scripts once listed here no longer exist (Nov 21):
+use `scripts/bootstrap.sh` and `scripts/build-selfhost.sh`.)
 
 ---
 

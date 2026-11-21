@@ -83,7 +83,10 @@ if [ "$(uname -s)" = Linux ] || { [ "$WINHOST" = 1 ] && command -v wsl >/dev/nul
             chmod +x "$OUT/leaky-linux"
             "$OUT/leaky-linux" > "$OUT/linux.out" 2> "$OUT/linux.err"
         else
-            wsl -e bash -c "cp '$(wsl wslpath -a "$(cygpath -w "$OUT/leaky-linux")" | tr -d '\r')' /tmp/fid-leaky-linux && chmod +x /tmp/fid-leaky-linux && /tmp/fid-leaky-linux" > "$OUT/linux.out" 2> "$OUT/linux.err"
+            # wslpath run with -e (no shell: `wsl wslpath C:\...` lost the
+            # backslashes) on a path with forward slashes (cygpath -m)
+            lin=$(MSYS_NO_PATHCONV=1 wsl.exe -e wslpath -a "$(cygpath -m "$OUT/leaky-linux")" 2> /dev/null | tr -d '\r' | grep -v '^wsl: ' | tail -1)
+            MSYS_NO_PATHCONV=1 wsl.exe -e bash -c "cp '$lin' /tmp/fid-leaky-linux && chmod +x /tmp/fid-leaky-linux && /tmp/fid-leaky-linux" > "$OUT/linux.out" 2> "$OUT/linux.err"
         fi
         check_report "x86_64-linux" "$OUT/linux.err"
     else

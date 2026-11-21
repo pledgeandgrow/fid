@@ -33,7 +33,7 @@
 pub const COLLIDER_SPHERE: i64 = 0;
 ```
 
-*Defined at line 29*
+*Defined at line 26*
 
 ---
 
@@ -43,7 +43,7 @@ pub const COLLIDER_SPHERE: i64 = 0;
 pub const COLLIDER_BOX: i64 = 1;
 ```
 
-*Defined at line 30*
+*Defined at line 26*
 
 ---
 
@@ -53,7 +53,7 @@ pub const COLLIDER_BOX: i64 = 1;
 pub const COLLIDER_PLANE: i64 = 2;
 ```
 
-*Defined at line 31*
+*Defined at line 26*
 
 ---
 
@@ -70,7 +70,7 @@ pub struct Sphere {
 | `center` | `vec3` |
 | `radius` | `f64` |
 
-*Defined at line 33*
+*Defined at line 27*
 
 ---
 
@@ -87,7 +87,7 @@ pub struct Aabb3 {
 | `min` | `vec3` |
 | `max` | `vec3` |
 
-*Defined at line 38*
+*Defined at line 32*
 
 ---
 
@@ -104,7 +104,7 @@ pub struct Plane3 {
 | `normal` | `vec3` |
 | `distance` | `f64,    // distance from origin along normal` |
 
-*Defined at line 43*
+*Defined at line 37*
 
 ---
 
@@ -133,7 +133,7 @@ pub struct RigidBody3 {
 | `radius` | `f64,           // for sphere collider` |
 | `half_extents` | `vec3,   // for box collider` |
 
-*Defined at line 50*
+*Defined at line 44*
 
 ---
 
@@ -151,7 +151,7 @@ pub fn phys3d_create_body(pos: vec3, half_ext: vec3, mass: f64) -> RigidBody3 {
 
 **Returns:** `RigidBody3`
 
-*Defined at line 67*
+*Defined at line 66*
 
 ---
 
@@ -169,7 +169,7 @@ pub fn phys3d_create_sphere(pos: vec3, radius: f64, mass: f64) -> RigidBody3 {
 
 **Returns:** `RigidBody3`
 
-*Defined at line 91*
+*Defined at line 80*
 
 ---
 
@@ -186,7 +186,7 @@ pub fn phys3d_create_static_plane(normal: vec3, distance: f64) -> RigidBody3 {
 
 **Returns:** `RigidBody3`
 
-*Defined at line 112*
+*Defined at line 94*
 
 ---
 
@@ -202,7 +202,7 @@ pub fn phys3d_set_gravity(g: vec3) -> void {
 
 **Returns:** `void`
 
-*Defined at line 137*
+*Defined at line 107*
 
 ---
 
@@ -214,7 +214,7 @@ pub fn phys3d_get_gravity() -> vec3 {
 
 **Returns:** `vec3`
 
-*Defined at line 143*
+*Defined at line 113*
 
 ---
 
@@ -231,7 +231,7 @@ pub fn phys3d_apply_force(body: &mut RigidBody3, force: vec3) -> void {
 
 **Returns:** `void`
 
-*Defined at line 147*
+*Defined at line 117*
 
 ---
 
@@ -248,7 +248,7 @@ pub fn phys3d_apply_impulse(body: &mut RigidBody3, impulse: vec3) -> void {
 
 **Returns:** `void`
 
-*Defined at line 151*
+*Defined at line 121*
 
 ---
 
@@ -265,7 +265,7 @@ pub fn phys3d_apply_gravity(body: &mut RigidBody3, dt: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 156*
+*Defined at line 128*
 
 ---
 
@@ -282,7 +282,7 @@ pub fn phys3d_step(body: &mut RigidBody3, dt: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 163*
+*Defined at line 137*
 
 ---
 
@@ -301,7 +301,7 @@ pub struct Contact3 {
 | `point` | `vec3,        // contact point` |
 | `has_contact` | `bool` |
 
-*Defined at line 190*
+*Defined at line 166*
 
 ---
 
@@ -318,7 +318,7 @@ pub fn phys3d_sphere_vs_sphere(a: &RigidBody3, b: &RigidBody3) -> Contact3 {
 
 **Returns:** `Contact3`
 
-*Defined at line 198*
+*Defined at line 186*
 
 ---
 
@@ -335,7 +335,7 @@ pub fn phys3d_aabb_vs_aabb(a: &RigidBody3, b: &RigidBody3) -> Contact3 {
 
 **Returns:** `Contact3`
 
-*Defined at line 225*
+*Defined at line 210*
 
 ---
 
@@ -352,7 +352,7 @@ pub fn phys3d_sphere_vs_plane(sphere: &RigidBody3, plane: &RigidBody3) -> Contac
 
 **Returns:** `Contact3`
 
-*Defined at line 288*
+*Defined at line 277*
 
 ---
 
@@ -369,7 +369,7 @@ pub fn phys3d_sphere_vs_aabb(sphere: &RigidBody3, box_body: &RigidBody3) -> Cont
 
 **Returns:** `Contact3`
 
-*Defined at line 314*
+*Defined at line 303*
 
 ---
 
@@ -387,7 +387,7 @@ pub fn phys3d_resolve_contact(a: &mut RigidBody3, b: &mut RigidBody3, contact: &
 
 **Returns:** `void`
 
-*Defined at line 358*
+*Defined at line 356*
 
 ---
 
@@ -404,7 +404,7 @@ pub fn phys3d_check_collision(a: &RigidBody3, b: &RigidBody3) -> Contact3 {
 
 **Returns:** `Contact3`
 
-*Defined at line 429*
+*Defined at line 431*
 
 ---
 
@@ -413,17 +413,17 @@ pub fn phys3d_check_collision(a: &RigidBody3, b: &RigidBody3) -> Contact3 {
 Resolve all collisions in a list of bodies (brute force, O(n^2)).
 
 ```fides
-pub fn phys3d_resolve_all(bodies: Vec<RigidBody3>, dt: f64) -> void {
+pub fn phys3d_resolve_all(bodies: &mut Vec<RigidBody3>, dt: f64) -> void {
 ```
 
 **Parameters:**
 
-- `bodies`: `Vec<RigidBody3>`
+- `bodies`: `&mut Vec<RigidBody3>`
 - `dt`: `f64`
 
 **Returns:** `void`
 
-*Defined at line 462*
+*Defined at line 461*
 
 ---
 

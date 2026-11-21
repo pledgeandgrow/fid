@@ -41,7 +41,7 @@
 pub const OTA_STATE_IDLE: i64        = 0;
 ```
 
-*Defined at line 53*
+*Defined at line 54*
 
 ---
 
@@ -61,7 +61,7 @@ pub const OTA_STATE_DOWNLOADING: i64 = 1;
 pub const OTA_STATE_VERIFYING: i64   = 2;
 ```
 
-*Defined at line 55*
+*Defined at line 54*
 
 ---
 
@@ -71,7 +71,7 @@ pub const OTA_STATE_VERIFYING: i64   = 2;
 pub const OTA_STATE_APPLYING: i64    = 3;
 ```
 
-*Defined at line 56*
+*Defined at line 54*
 
 ---
 
@@ -81,7 +81,7 @@ pub const OTA_STATE_APPLYING: i64    = 3;
 pub const OTA_STATE_COMMITTED: i64   = 4;
 ```
 
-*Defined at line 57*
+*Defined at line 54*
 
 ---
 
@@ -91,7 +91,7 @@ pub const OTA_STATE_COMMITTED: i64   = 4;
 pub const OTA_STATE_ROLLBACK: i64    = 5;
 ```
 
-*Defined at line 58*
+*Defined at line 54*
 
 ---
 
@@ -101,7 +101,7 @@ pub const OTA_STATE_ROLLBACK: i64    = 5;
 pub const OTA_STATE_FAILED: i64      = 6;
 ```
 
-*Defined at line 59*
+*Defined at line 54*
 
 ---
 
@@ -119,7 +119,7 @@ pub fn ota_state_name(state: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 62*
+*Defined at line 56*
 
 ---
 
@@ -145,7 +145,7 @@ pub struct OTAManifest {
 | `timestamp` | `i64,        // manifest creation time` |
 | `description` | `str` |
 
-*Defined at line 80*
+*Defined at line 88*
 
 ---
 
@@ -165,7 +165,7 @@ pub fn ota_manifest_new(filename: str, size: i64, checksum: str) -> OTAManifest 
 
 **Returns:** `OTAManifest`
 
-*Defined at line 93*
+*Defined at line 114*
 
 ---
 
@@ -174,15 +174,17 @@ pub fn ota_manifest_new(filename: str, size: i64, checksum: str) -> OTAManifest 
 Set version information.
 
 ```fides
-pub fn ota_manifest_set_version(manifest: OTAManifest, version: str,
+pub fn ota_manifest_set_version(manifest: &mut OTAManifest, version: str, min_ver: str, max_ver: str) -> void {
 ```
 
 **Parameters:**
 
-- `manifest`: `OTAManifest`
+- `manifest`: `&mut OTAManifest`
 - `version`: `str`
+- `min_ver`: `str`
+- `max_ver`: `str`
 
-*Defined at line 108*
+*Defined at line 121*
 
 ---
 
@@ -191,17 +193,17 @@ pub fn ota_manifest_set_version(manifest: OTAManifest, version: str,
 Set signature.
 
 ```fides
-pub fn ota_manifest_set_signature(manifest: OTAManifest, signature: str) -> void {
+pub fn ota_manifest_set_signature(manifest: &mut OTAManifest, signature: str) -> void {
 ```
 
 **Parameters:**
 
-- `manifest`: `OTAManifest`
+- `manifest`: `&mut OTAManifest`
 - `signature`: `str`
 
 **Returns:** `void`
 
-*Defined at line 116*
+*Defined at line 128*
 
 ---
 
@@ -210,17 +212,17 @@ pub fn ota_manifest_set_signature(manifest: OTAManifest, signature: str) -> void
 Set description.
 
 ```fides
-pub fn ota_manifest_set_description(manifest: OTAManifest, desc: str) -> void {
+pub fn ota_manifest_set_description(manifest: &mut OTAManifest, desc: str) -> void {
 ```
 
 **Parameters:**
 
-- `manifest`: `OTAManifest`
+- `manifest`: `&mut OTAManifest`
 - `desc`: `str`
 
 **Returns:** `void`
 
-*Defined at line 121*
+*Defined at line 133*
 
 ---
 
@@ -238,7 +240,7 @@ pub fn ota_verify_manifest(manifest: OTAManifest) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 126*
+*Defined at line 150*
 
 ---
 
@@ -257,7 +259,7 @@ pub fn ota_check_compatibility(manifest: OTAManifest, current_version: str) -> b
 
 **Returns:** `bool`
 
-*Defined at line 142*
+*Defined at line 182*
 
 ---
 
@@ -281,7 +283,7 @@ pub struct OTASession {
 | `retry_count` | `i64` |
 | `max_retries` | `i64` |
 
-*Defined at line 161*
+*Defined at line 201*
 
 ---
 
@@ -299,7 +301,7 @@ pub fn ota_session_new(manifest: OTAManifest) -> OTASession {
 
 **Returns:** `OTASession`
 
-*Defined at line 172*
+*Defined at line 212*
 
 ---
 
@@ -308,16 +310,16 @@ pub fn ota_session_new(manifest: OTAManifest) -> OTASession {
 Start downloading the update.
 
 ```fides
-pub fn ota_session_start_download(session: OTASession) -> void {
+pub fn ota_session_start_download(session: &mut OTASession) -> void {
 ```
 
 **Parameters:**
 
-- `session`: `OTASession`
+- `session`: `&mut OTASession`
 
 **Returns:** `void`
 
-*Defined at line 185*
+*Defined at line 219*
 
 ---
 
@@ -326,17 +328,17 @@ pub fn ota_session_start_download(session: OTASession) -> void {
 Update download progress.
 
 ```fides
-pub fn ota_session_download_progress(session: OTASession, bytes: i64) -> void {
+pub fn ota_session_download_progress(session: &mut OTASession, bytes: i64) -> void {
 ```
 
 **Parameters:**
 
-- `session`: `OTASession`
+- `session`: `&mut OTASession`
 - `bytes`: `i64`
 
 **Returns:** `void`
 
-*Defined at line 191*
+*Defined at line 225*
 
 ---
 
@@ -354,7 +356,7 @@ pub fn ota_session_download_percent(session: OTASession) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 199*
+*Defined at line 233*
 
 ---
 
@@ -365,17 +367,17 @@ binary_data: the downloaded bytes.
 Returns true if verification succeeds.
 
 ```fides
-pub fn ota_session_verify(session: OTASession, binary_data: Vec) -> bool {
+pub fn ota_session_verify(session: &mut OTASession, binary_data: Vec<i64>) -> bool {
 ```
 
 **Parameters:**
 
-- `session`: `OTASession`
-- `binary_data`: `Vec`
+- `session`: `&mut OTASession`
+- `binary_data`: `Vec<i64>`
 
 **Returns:** `bool`
 
-*Defined at line 209*
+*Defined at line 243*
 
 ---
 
@@ -384,16 +386,16 @@ pub fn ota_session_verify(session: OTASession, binary_data: Vec) -> bool {
 Apply the update (transition to applying state).
 
 ```fides
-pub fn ota_session_apply(session: OTASession) -> void {
+pub fn ota_session_apply(session: &mut OTASession) -> void {
 ```
 
 **Parameters:**
 
-- `session`: `OTASession`
+- `session`: `&mut OTASession`
 
 **Returns:** `void`
 
-*Defined at line 230*
+*Defined at line 264*
 
 ---
 
@@ -402,16 +404,16 @@ pub fn ota_session_apply(session: OTASession) -> void {
 Commit the update (mark as committed, can't rollback).
 
 ```fides
-pub fn ota_session_commit(session: OTASession) -> void {
+pub fn ota_session_commit(session: &mut OTASession) -> void {
 ```
 
 **Parameters:**
 
-- `session`: `OTASession`
+- `session`: `&mut OTASession`
 
 **Returns:** `void`
 
-*Defined at line 235*
+*Defined at line 269*
 
 ---
 
@@ -420,16 +422,16 @@ pub fn ota_session_commit(session: OTASession) -> void {
 Rollback the update (revert to previous version).
 
 ```fides
-pub fn ota_session_rollback(session: OTASession) -> void {
+pub fn ota_session_rollback(session: &mut OTASession) -> void {
 ```
 
 **Parameters:**
 
-- `session`: `OTASession`
+- `session`: `&mut OTASession`
 
 **Returns:** `void`
 
-*Defined at line 240*
+*Defined at line 274*
 
 ---
 
@@ -438,17 +440,17 @@ pub fn ota_session_rollback(session: OTASession) -> void {
 Mark the session as failed.
 
 ```fides
-pub fn ota_session_fail(session: OTASession, error_msg: str) -> void {
+pub fn ota_session_fail(session: &mut OTASession, error_msg: str) -> void {
 ```
 
 **Parameters:**
 
-- `session`: `OTASession`
+- `session`: `&mut OTASession`
 - `error_msg`: `str`
 
 **Returns:** `void`
 
-*Defined at line 245*
+*Defined at line 279*
 
 ---
 
@@ -466,7 +468,7 @@ pub fn ota_session_can_retry(session: OTASession) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 251*
+*Defined at line 285*
 
 ---
 
@@ -475,16 +477,16 @@ pub fn ota_session_can_retry(session: OTASession) -> bool {
 Retry the download.
 
 ```fides
-pub fn ota_session_retry(session: OTASession) -> void {
+pub fn ota_session_retry(session: &mut OTASession) -> void {
 ```
 
 **Parameters:**
 
-- `session`: `OTASession`
+- `session`: `&mut OTASession`
 
 **Returns:** `void`
 
-*Defined at line 256*
+*Defined at line 290*
 
 ---
 
@@ -502,7 +504,7 @@ pub fn ota_session_state_name(session: OTASession) -> str {
 
 **Returns:** `str`
 
-*Defined at line 265*
+*Defined at line 299*
 
 ---
 
@@ -520,9 +522,9 @@ pub struct DiffEntry {
 |------|------|
 | `offset` | `i64` |
 | `length` | `i64` |
-| `data` | `Vec` |
+| `data` | `Vec<i64>` |
 
-*Defined at line 276*
+*Defined at line 310*
 
 ---
 
@@ -532,17 +534,17 @@ Create a binary diff between old and new data.
 Returns a Vec of DiffEntry (flattened as alternating offset/length/data).
 
 ```fides
-pub fn ota_binary_diff(old_data: Vec, new_data: Vec) -> Vec {
+pub fn ota_binary_diff(old_data: Vec<i64>, new_data: Vec<i64>) -> Vec<i64> {
 ```
 
 **Parameters:**
 
-- `old_data`: `Vec`
-- `new_data`: `Vec`
+- `old_data`: `Vec<i64>`
+- `new_data`: `Vec<i64>`
 
-**Returns:** `Vec`
+**Returns:** `Vec<i64>`
 
-*Defined at line 284*
+*Defined at line 318*
 
 ---
 
@@ -551,16 +553,16 @@ pub fn ota_binary_diff(old_data: Vec, new_data: Vec) -> Vec {
 Compute the size of a binary diff (number of changed bytes).
 
 ```fides
-pub fn ota_diff_size(diff: Vec) -> i64 {
+pub fn ota_diff_size(diff: Vec<i64>) -> i64 {
 ```
 
 **Parameters:**
 
-- `diff`: `Vec`
+- `diff`: `Vec<i64>`
 
 **Returns:** `i64`
 
-*Defined at line 323*
+*Defined at line 357*
 
 ---
 
@@ -569,16 +571,16 @@ pub fn ota_diff_size(diff: Vec) -> i64 {
 Get the number of changed regions in a diff.
 
 ```fides
-pub fn ota_diff_region_count(diff: Vec) -> i64 {
+pub fn ota_diff_region_count(diff: Vec<i64>) -> i64 {
 ```
 
 **Parameters:**
 
-- `diff`: `Vec`
+- `diff`: `Vec<i64>`
 
 **Returns:** `i64`
 
-*Defined at line 334*
+*Defined at line 368*
 
 ---
 

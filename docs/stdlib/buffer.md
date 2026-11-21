@@ -20,10 +20,10 @@ pub struct ByteCursor {
 
 | Name | Type |
 |------|------|
-| `data` | `Vec` |
-| `pos` | `i64,   // read cursor` |
+| `data` | `Vec<i64>` |
+| `pos` | `i64` |
 
-*Defined at line 19*
+*Defined at line 16*
 
 ---
 
@@ -33,7 +33,7 @@ pub struct ByteCursor {
 impl ByteCursor {
 ```
 
-*Defined at line 24*
+*Defined at line 16*
 
 ---
 
@@ -47,7 +47,7 @@ pub fn buffer_new() -> ByteCursor {
 
 **Returns:** `ByteCursor`
 
-*Defined at line 297*
+*Defined at line 345*
 
 ---
 
@@ -56,16 +56,16 @@ pub fn buffer_new() -> ByteCursor {
 Create a buffer from an existing Vec of bytes.
 
 ```fides
-pub fn buffer_from_bytes(bytes: Vec) -> ByteCursor {
+pub fn buffer_from_bytes(bytes: Vec<i64>) -> ByteCursor {
 ```
 
 **Parameters:**
 
-- `bytes`: `Vec`
+- `bytes`: `Vec<i64>`
 
 **Returns:** `ByteCursor`
 
-*Defined at line 302*
+*Defined at line 352*
 
 ---
 
@@ -83,7 +83,7 @@ pub fn buffer_from_string(s: str) -> ByteCursor {
 
 **Returns:** `ByteCursor`
 
-*Defined at line 307*
+*Defined at line 359*
 
 ---
 

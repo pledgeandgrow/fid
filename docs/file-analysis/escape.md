@@ -8,7 +8,8 @@
 > (a reference passed to a builtin outside the program).
 
 - **Path:** `compiler/escape.fd`
-- **LOC:** 1,589 (Rust `src/escape.rs`: 972)
+- **LOC:** 2,570 (2026-11-21; 1,589 on Nov 9; Rust `src/escape.rs`: 972). Line numbers below
+  are from Nov 9; the findings were not re-checked.
 - **Role:** References are second-class (Swift `inout` / Hylo style): they may be passed to calls, held in locals and returned when they come from a reference parameter, never stored anywhere they could outlive what they point to. Runs after type checking.
 - **Imports:** `core`, `vec`, `string`, `compiler::ast`.
 

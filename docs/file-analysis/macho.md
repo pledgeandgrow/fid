@@ -1,9 +1,17 @@
 # macho.fd — Mach-O 64-bit object writer (x86-64)
 
+> **Nov 21: dead.** Nothing imports it. Since MI18 (Nov 17) `fid codegen
+> --macho` builds a Mach-O object through the machine layer (nat_enc.fd,
+> the macOS target of the architecture). `MachOEmitter_build_macho` now
+> writes through image_writer.fd (`MachOEmitter_build_macho_img`, TG13;
+> the old body wrote 88-byte section headers). Native macOS executables
+> come from the machine layer (`--target x86_64-macos|aarch64-macos`,
+> `nat_macho`). The callers below are as of Nov 9.
+
 Re-audited 2026-11-09 (previous audit 2026-10-22/23).
 
 - **Path:** `compiler/macho.fd`
-- **LOC:** 445
+- **LOC:** 363 (2026-11-21; 445 on Nov 9)
 - **Role:** format-only writer: assembles via the shared `ElfEmitter`
   (elf64.fd) and translates to Mach-O (`__TEXT,__text`, `__TEXT,__const`,
   per-section relocations with BRANCH / SIGNED / UNSIGNED types, nlist_64

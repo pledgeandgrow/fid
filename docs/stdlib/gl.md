@@ -80,7 +80,7 @@
 pub const GL_DEPTH_TEST: i64 = 0x0B71;
 ```
 
-*Defined at line 83*
+*Defined at line 87*
 
 ---
 
@@ -90,7 +90,7 @@ pub const GL_DEPTH_TEST: i64 = 0x0B71;
 pub const GL_CULL_FACE: i64 = 0x0B44;
 ```
 
-*Defined at line 84*
+*Defined at line 87*
 
 ---
 
@@ -100,7 +100,7 @@ pub const GL_CULL_FACE: i64 = 0x0B44;
 pub const GL_BLEND: i64 = 0x0BE2;
 ```
 
-*Defined at line 85*
+*Defined at line 87*
 
 ---
 
@@ -110,7 +110,7 @@ pub const GL_BLEND: i64 = 0x0BE2;
 pub const GL_TEXTURE_2D: i64 = 0x0DE1;
 ```
 
-*Defined at line 86*
+*Defined at line 87*
 
 ---
 
@@ -130,7 +130,7 @@ pub const GL_TEXTURE0: i64 = 0x84C0;
 pub const GL_TRIANGLES: i64 = 0x0004;
 ```
 
-*Defined at line 89*
+*Defined at line 88*
 
 ---
 
@@ -140,7 +140,7 @@ pub const GL_TRIANGLES: i64 = 0x0004;
 pub const GL_TRIANGLE_STRIP: i64 = 0x0005;
 ```
 
-*Defined at line 90*
+*Defined at line 88*
 
 ---
 
@@ -150,7 +150,7 @@ pub const GL_TRIANGLE_STRIP: i64 = 0x0005;
 pub const GL_TRIANGLE_FAN: i64 = 0x0006;
 ```
 
-*Defined at line 91*
+*Defined at line 88*
 
 ---
 
@@ -160,7 +160,7 @@ pub const GL_TRIANGLE_FAN: i64 = 0x0006;
 pub const GL_LINES: i64 = 0x0001;
 ```
 
-*Defined at line 92*
+*Defined at line 88*
 
 ---
 
@@ -170,7 +170,7 @@ pub const GL_LINES: i64 = 0x0001;
 pub const GL_LINE_STRIP: i64 = 0x0003;
 ```
 
-*Defined at line 93*
+*Defined at line 88*
 
 ---
 
@@ -180,7 +180,7 @@ pub const GL_LINE_STRIP: i64 = 0x0003;
 pub const GL_POINTS: i64 = 0x0000;
 ```
 
-*Defined at line 94*
+*Defined at line 88*
 
 ---
 
@@ -190,7 +190,7 @@ pub const GL_POINTS: i64 = 0x0000;
 pub const GL_COLOR_BUFFER_BIT: i64 = 0x4000;
 ```
 
-*Defined at line 96*
+*Defined at line 89*
 
 ---
 
@@ -200,7 +200,7 @@ pub const GL_COLOR_BUFFER_BIT: i64 = 0x4000;
 pub const GL_DEPTH_BUFFER_BIT: i64 = 0x100;
 ```
 
-*Defined at line 97*
+*Defined at line 89*
 
 ---
 
@@ -210,7 +210,7 @@ pub const GL_DEPTH_BUFFER_BIT: i64 = 0x100;
 pub const GL_ARRAY_BUFFER: i64 = 0x8892;
 ```
 
-*Defined at line 99*
+*Defined at line 90*
 
 ---
 
@@ -220,7 +220,7 @@ pub const GL_ARRAY_BUFFER: i64 = 0x8892;
 pub const GL_ELEMENT_ARRAY_BUFFER: i64 = 0x8893;
 ```
 
-*Defined at line 100*
+*Defined at line 90*
 
 ---
 
@@ -230,7 +230,7 @@ pub const GL_ELEMENT_ARRAY_BUFFER: i64 = 0x8893;
 pub const GL_STATIC_DRAW: i64 = 0x88E4;
 ```
 
-*Defined at line 102*
+*Defined at line 91*
 
 ---
 
@@ -240,7 +240,7 @@ pub const GL_STATIC_DRAW: i64 = 0x88E4;
 pub const GL_DYNAMIC_DRAW: i64 = 0x88E8;
 ```
 
-*Defined at line 103*
+*Defined at line 91*
 
 ---
 
@@ -250,7 +250,7 @@ pub const GL_DYNAMIC_DRAW: i64 = 0x88E8;
 pub const GL_STREAM_DRAW: i64 = 0x88E0;
 ```
 
-*Defined at line 104*
+*Defined at line 91*
 
 ---
 
@@ -260,7 +260,7 @@ pub const GL_STREAM_DRAW: i64 = 0x88E0;
 pub const GL_FLOAT: i64 = 0x1406;
 ```
 
-*Defined at line 106*
+*Defined at line 92*
 
 ---
 
@@ -270,7 +270,7 @@ pub const GL_FLOAT: i64 = 0x1406;
 pub const GL_UNSIGNED_INT: i64 = 0x1405;
 ```
 
-*Defined at line 107*
+*Defined at line 92*
 
 ---
 
@@ -280,7 +280,7 @@ pub const GL_UNSIGNED_INT: i64 = 0x1405;
 pub const GL_UNSIGNED_BYTE: i64 = 0x1401;
 ```
 
-*Defined at line 108*
+*Defined at line 92*
 
 ---
 
@@ -290,7 +290,7 @@ pub const GL_UNSIGNED_BYTE: i64 = 0x1401;
 pub const GL_RGB: i64 = 0x1907;
 ```
 
-*Defined at line 110*
+*Defined at line 93*
 
 ---
 
@@ -300,7 +300,7 @@ pub const GL_RGB: i64 = 0x1907;
 pub const GL_RGBA: i64 = 0x1908;
 ```
 
-*Defined at line 111*
+*Defined at line 93*
 
 ---
 
@@ -310,7 +310,7 @@ pub const GL_RGBA: i64 = 0x1908;
 pub const GL_TEXTURE_MIN_FILTER: i64 = 0x2801;
 ```
 
-*Defined at line 112*
+*Defined at line 93*
 
 ---
 
@@ -320,7 +320,7 @@ pub const GL_TEXTURE_MIN_FILTER: i64 = 0x2801;
 pub const GL_TEXTURE_MAG_FILTER: i64 = 0x2800;
 ```
 
-*Defined at line 113*
+*Defined at line 93*
 
 ---
 
@@ -330,7 +330,7 @@ pub const GL_TEXTURE_MAG_FILTER: i64 = 0x2800;
 pub const GL_TEXTURE_WRAP_S: i64 = 0x2802;
 ```
 
-*Defined at line 114*
+*Defined at line 93*
 
 ---
 
@@ -340,7 +340,7 @@ pub const GL_TEXTURE_WRAP_S: i64 = 0x2802;
 pub const GL_TEXTURE_WRAP_T: i64 = 0x2803;
 ```
 
-*Defined at line 115*
+*Defined at line 93*
 
 ---
 
@@ -350,7 +350,7 @@ pub const GL_TEXTURE_WRAP_T: i64 = 0x2803;
 pub const GL_LINEAR: i64 = 0x2601;
 ```
 
-*Defined at line 116*
+*Defined at line 93*
 
 ---
 
@@ -360,7 +360,7 @@ pub const GL_LINEAR: i64 = 0x2601;
 pub const GL_NEAREST: i64 = 0x2600;
 ```
 
-*Defined at line 117*
+*Defined at line 93*
 
 ---
 
@@ -370,7 +370,7 @@ pub const GL_NEAREST: i64 = 0x2600;
 pub const GL_CLAMP_TO_EDGE: i64 = 0x812F;
 ```
 
-*Defined at line 118*
+*Defined at line 93*
 
 ---
 
@@ -380,7 +380,7 @@ pub const GL_CLAMP_TO_EDGE: i64 = 0x812F;
 pub const GL_REPEAT: i64 = 0x2901;
 ```
 
-*Defined at line 119*
+*Defined at line 93*
 
 ---
 
@@ -390,7 +390,7 @@ pub const GL_REPEAT: i64 = 0x2901;
 pub const GL_NO_ERROR: i64 = 0;
 ```
 
-*Defined at line 121*
+*Defined at line 94*
 
 ---
 
@@ -400,7 +400,7 @@ pub const GL_NO_ERROR: i64 = 0;
 pub const GL_INVALID_ENUM: i64 = 0x0500;
 ```
 
-*Defined at line 122*
+*Defined at line 94*
 
 ---
 
@@ -410,7 +410,7 @@ pub const GL_INVALID_ENUM: i64 = 0x0500;
 pub const GL_INVALID_VALUE: i64 = 0x0501;
 ```
 
-*Defined at line 123*
+*Defined at line 94*
 
 ---
 
@@ -420,7 +420,7 @@ pub const GL_INVALID_VALUE: i64 = 0x0501;
 pub const GL_INVALID_OPERATION: i64 = 0x0502;
 ```
 
-*Defined at line 124*
+*Defined at line 94*
 
 ---
 
@@ -430,7 +430,7 @@ pub const GL_INVALID_OPERATION: i64 = 0x0502;
 pub const GL_OUT_OF_MEMORY: i64 = 0x0505;
 ```
 
-*Defined at line 125*
+*Defined at line 94*
 
 ---
 
@@ -440,7 +440,7 @@ pub const GL_OUT_OF_MEMORY: i64 = 0x0505;
 pub const GL_FRONT: i64 = 0x0404;
 ```
 
-*Defined at line 127*
+*Defined at line 95*
 
 ---
 
@@ -450,7 +450,7 @@ pub const GL_FRONT: i64 = 0x0404;
 pub const GL_BACK: i64 = 0x0405;
 ```
 
-*Defined at line 128*
+*Defined at line 95*
 
 ---
 
@@ -460,7 +460,7 @@ pub const GL_BACK: i64 = 0x0405;
 pub const GL_CW: i64 = 0x0900;
 ```
 
-*Defined at line 129*
+*Defined at line 95*
 
 ---
 
@@ -470,7 +470,7 @@ pub const GL_CW: i64 = 0x0900;
 pub const GL_CCW: i64 = 0x0901;
 ```
 
-*Defined at line 130*
+*Defined at line 95*
 
 ---
 
@@ -480,7 +480,7 @@ pub const GL_CCW: i64 = 0x0901;
 pub const GL_SRC_ALPHA: i64 = 0x0302;
 ```
 
-*Defined at line 132*
+*Defined at line 96*
 
 ---
 
@@ -490,7 +490,7 @@ pub const GL_SRC_ALPHA: i64 = 0x0302;
 pub const GL_ONE_MINUS_SRC_ALPHA: i64 = 0x0303;
 ```
 
-*Defined at line 133*
+*Defined at line 96*
 
 ---
 
@@ -504,7 +504,7 @@ pub fn gl_init() -> void {
 
 **Returns:** `void`
 
-*Defined at line 138*
+*Defined at line 100*
 
 ---
 
@@ -518,7 +518,7 @@ pub fn gl_clear_screen() -> void {
 
 **Returns:** `void`
 
-*Defined at line 145*
+*Defined at line 107*
 
 ---
 
@@ -537,7 +537,7 @@ pub fn gl_set_viewport(w: i64, h: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 150*
+*Defined at line 112*
 
 ---
 
@@ -551,7 +551,7 @@ pub fn gl_check_errors() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 155*
+*Defined at line 117*
 
 ---
 
@@ -565,7 +565,7 @@ pub fn gl_gen_buffer() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 160*
+*Defined at line 122*
 
 ---
 
@@ -579,7 +579,7 @@ pub fn gl_gen_vertex_array() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 168*
+*Defined at line 131*
 
 ---
 
@@ -593,7 +593,7 @@ pub fn gl_gen_texture() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 176*
+*Defined at line 140*
 
 ---
 
@@ -611,7 +611,7 @@ pub fn gl_delete_buffer(buf: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 184*
+*Defined at line 149*
 
 ---
 
@@ -629,7 +629,7 @@ pub fn gl_delete_vertex_array(arr: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 191*
+*Defined at line 156*
 
 ---
 
@@ -647,7 +647,7 @@ pub fn gl_delete_texture(tex: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 198*
+*Defined at line 163*
 
 ---
 
@@ -666,7 +666,7 @@ pub fn gl_draw_triangles(first: i64, count: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 205*
+*Defined at line 170*
 
 ---
 
@@ -684,7 +684,7 @@ pub fn gl_draw_triangles_indexed(count: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 210*
+*Defined at line 175*
 
 ---
 
@@ -698,7 +698,7 @@ pub fn gl_set_texture_defaults() -> void {
 
 **Returns:** `void`
 
-*Defined at line 215*
+*Defined at line 180*
 
 ---
 
@@ -712,7 +712,7 @@ pub fn gl_enable_blend() -> void {
 
 **Returns:** `void`
 
-*Defined at line 223*
+*Defined at line 188*
 
 ---
 
@@ -730,7 +730,7 @@ pub fn gl_error_string(err: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 229*
+*Defined at line 200*
 
 ---
 
@@ -740,7 +740,7 @@ pub fn gl_error_string(err: i64) -> str {
 pub const GL_VERTEX_SHADER: i64 = 0x8B31;
 ```
 
-*Defined at line 273*
+*Defined at line 256*
 
 ---
 
@@ -750,7 +750,7 @@ pub const GL_VERTEX_SHADER: i64 = 0x8B31;
 pub const GL_FRAGMENT_SHADER: i64 = 0x8B30;
 ```
 
-*Defined at line 274*
+*Defined at line 256*
 
 ---
 
@@ -760,7 +760,7 @@ pub const GL_FRAGMENT_SHADER: i64 = 0x8B30;
 pub const GL_COMPILE_STATUS: i64 = 0x8B81;
 ```
 
-*Defined at line 277*
+*Defined at line 258*
 
 ---
 
@@ -770,7 +770,7 @@ pub const GL_COMPILE_STATUS: i64 = 0x8B81;
 pub const GL_LINK_STATUS: i64 = 0x8B82;
 ```
 
-*Defined at line 278*
+*Defined at line 258*
 
 ---
 
@@ -789,7 +789,7 @@ pub fn gl_compile_shader_src(shader_type: i64, source: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 281*
+*Defined at line 284*
 
 ---
 
@@ -809,7 +809,7 @@ pub fn gl_create_program_from_src(vert_src: str, frag_src: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 307*
+*Defined at line 314*
 
 ---
 
@@ -828,7 +828,7 @@ pub fn gl_set_uniform_mat4(location: i64, mat: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 349*
+*Defined at line 359*
 
 ---
 
@@ -847,7 +847,7 @@ pub fn gl_set_uniform_f(location: i64, value: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 354*
+*Defined at line 364*
 
 ---
 
@@ -866,7 +866,7 @@ pub fn gl_set_uniform_i(location: i64, value: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 359*
+*Defined at line 369*
 
 ---
 
@@ -885,7 +885,7 @@ pub fn gl_get_uniform(program: i64, name: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 364*
+*Defined at line 374*
 
 ---
 
@@ -904,7 +904,7 @@ pub fn gl_get_attrib(program: i64, name: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 369*
+*Defined at line 379*
 
 ---
 
@@ -916,7 +916,7 @@ Basic vertex shader for 3D rendering with MVP matrix.
 pub const DEFAULT_VERT_SHADER: str = "#version 330 core\nlayout(location = 0) in vec3 aPos;\nlayout(location = 1) in vec3 aNormal;\nlayout(location = 2) in vec2 aTexCoord;\nuniform mat4 model;\nuniform mat4 view;\nuniform mat4 projection;\nout vec2 TexCoord;\nout vec3 Normal;\nvoid main() {\n    gl_Position = projection * view * model * vec4(aPos, 1.0);\n    TexCoord = aTexCoord;\n    Normal = mat3(transpose(inverse(model))) * aNormal;\n}\n";
 ```
 
-*Defined at line 376*
+*Defined at line 386*
 
 ---
 
@@ -928,7 +928,7 @@ Basic fragment shader with texture sampling.
 pub const DEFAULT_FRAG_SHADER: str = "#version 330 core\nin vec2 TexCoord;\nin vec3 Normal;\nout vec4 FragColor;\nuniform sampler2D texture1;\nvoid main() {\n    FragColor = texture(texture1, TexCoord);\n}\n";
 ```
 
-*Defined at line 379*
+*Defined at line 388*
 
 ---
 
@@ -942,7 +942,7 @@ pub fn gl_create_default_program() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 382*
+*Defined at line 390*
 
 ---
 

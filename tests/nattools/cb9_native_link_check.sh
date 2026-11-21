@@ -47,7 +47,7 @@ check() {
         fail=$((fail + 1))
         return
     fi
-    if grep -qF "$MSG" "$OUT/$name.log" && grep -qF "$LOC" "$OUT/$name.log"; then
+    if grep -qF -- "$MSG" "$OUT/$name.log" && grep -qF -- "$LOC" "$OUT/$name.log"; then
         echo "  ok    $name"
     else
         echo "  FAIL  $name: no Fides link error with the declaration (see $OUT/$name.log)"

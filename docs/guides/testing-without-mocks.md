@@ -68,12 +68,14 @@ Such a call is `p_file_*`, `p_dir_*`, `p_mkdir`/`p_remove`/`p_rename`,
 `p_dns_*`, or `p_http_*` other than the build and parse helpers. Core's
 `read_file` is one of them; `fs_read_text` is the faked one.
 
-Not covered yet: fs's `File` type, `fs_list_dir`, `fs_mkdir` and raw
-TCP/UDP sockets (stdlib/net.fd) still use the real system, so a
-`@hermetic` test that reaches them is rejected. A function passed as a
-value (a callback) is not followed by the check.
+Directories (`fs_list_dir`, `fs_mkdir`, `fs_mkdir_all`, `fs_rename`,
+`fs_rmdir`, ...), fs's `File` handles and stdlib/net's raw sockets
+(`world_fake_sockets`, `world_no_sockets`, `world_real_sockets`) consult
+the fakes too, so a `@hermetic` test may reach them. A function passed as
+a value (a callback) is not followed by the check.
 
 Tests: `test_world_files`, `test_world_clock`, `test_world_net` (one per
-effect), `test_world_fakes` (all three together), `test_world_hermetic`,
+effect), `test_world_dirs`, `test_world_sockets`, `test_world_fakes` (all
+three together), `test_world_hermetic`, `test_world_hermetic_sockets`,
 and the rejected `test_world_hermetic_fail`,
 `test_world_hermetic_clock_fail`, `test_world_hermetic_net_fail`.

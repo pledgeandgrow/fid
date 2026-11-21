@@ -57,3 +57,9 @@ s stubs, l of L layouts` for each unit, `[inc] ir instances: ...`, and
 Checks: `bash tests/tooling/inc-ir-units-check.sh`, `scripts/inc-check.sh`
 (`SUITE=1`, `FIXPOINT=1`), tests/tooling/inc-layouts-check.sh,
 tests/tooling/inc-instance-check.sh.
+
+Known bug (Nov 21, 2026, known-bugs 2g.92): on this path a `dyn` call whose
+impl is in another unit gets no dispatch candidates, and the program aborts
+(inc-ir-units-check.sh exits 127 after its third line); `FIDES_INC_IR=off`
+works. Also on this path: no `[inc] layouts` debug line, and a new struct in
+a library unit rebuilds main's unit.

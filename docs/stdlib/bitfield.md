@@ -79,7 +79,7 @@ pub fn bit(value: i64, pos: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 27*
+*Defined at line 26*
 
 ---
 
@@ -96,7 +96,7 @@ pub fn set_bit(value: i64, pos: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 32*
+*Defined at line 31*
 
 ---
 
@@ -113,7 +113,7 @@ pub fn clear_bit(value: i64, pos: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 37*
+*Defined at line 36*
 
 ---
 
@@ -130,7 +130,7 @@ pub fn toggle_bit(value: i64, pos: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 42*
+*Defined at line 41*
 
 ---
 
@@ -148,7 +148,7 @@ pub fn write_bit(value: i64, pos: i64, bit_val: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 47*
+*Defined at line 46*
 
 ---
 
@@ -166,7 +166,7 @@ pub fn get(value: i64, offset: i64, width: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 60*
+*Defined at line 68*
 
 ---
 
@@ -185,7 +185,7 @@ pub fn set(value: i64, offset: i64, width: i64, field_val: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 68*
+*Defined at line 79*
 
 ---
 
@@ -195,7 +195,7 @@ pub fn set(value: i64, offset: i64, width: i64, field_val: i64) -> i64 {
 pub const CR0_PE: i64 = 0;    // Protection Enable
 ```
 
-*Defined at line 79*
+*Defined at line 90*
 
 ---
 
@@ -205,7 +205,7 @@ pub const CR0_PE: i64 = 0;    // Protection Enable
 pub const CR0_MP: i64 = 1;    // Monitor coProcessor
 ```
 
-*Defined at line 80*
+*Defined at line 91*
 
 ---
 
@@ -215,7 +215,7 @@ pub const CR0_MP: i64 = 1;    // Monitor coProcessor
 pub const CR0_EM: i64 = 2;    // Emulation
 ```
 
-*Defined at line 81*
+*Defined at line 92*
 
 ---
 
@@ -225,7 +225,7 @@ pub const CR0_EM: i64 = 2;    // Emulation
 pub const CR0_TS: i64 = 3;    // Task Switched
 ```
 
-*Defined at line 82*
+*Defined at line 93*
 
 ---
 
@@ -235,7 +235,7 @@ pub const CR0_TS: i64 = 3;    // Task Switched
 pub const CR0_ET: i64 = 4;    // Extension Type
 ```
 
-*Defined at line 83*
+*Defined at line 94*
 
 ---
 
@@ -245,7 +245,7 @@ pub const CR0_ET: i64 = 4;    // Extension Type
 pub const CR0_NE: i64 = 5;    // Numeric Error
 ```
 
-*Defined at line 84*
+*Defined at line 95*
 
 ---
 
@@ -255,7 +255,7 @@ pub const CR0_NE: i64 = 5;    // Numeric Error
 pub const CR0_WP: i64 = 16;   // Write Protect
 ```
 
-*Defined at line 85*
+*Defined at line 96*
 
 ---
 
@@ -265,7 +265,7 @@ pub const CR0_WP: i64 = 16;   // Write Protect
 pub const CR0_AM: i64 = 18;   // Alignment Mask
 ```
 
-*Defined at line 86*
+*Defined at line 97*
 
 ---
 
@@ -275,7 +275,7 @@ pub const CR0_AM: i64 = 18;   // Alignment Mask
 pub const CR0_NW: i64 = 29;   // Not Write-through
 ```
 
-*Defined at line 87*
+*Defined at line 98*
 
 ---
 
@@ -285,7 +285,7 @@ pub const CR0_NW: i64 = 29;   // Not Write-through
 pub const CR0_CD: i64 = 30;   // Cache Disable
 ```
 
-*Defined at line 88*
+*Defined at line 99*
 
 ---
 
@@ -295,7 +295,7 @@ pub const CR0_CD: i64 = 30;   // Cache Disable
 pub const CR0_PG: i64 = 31;   // Paging Enable
 ```
 
-*Defined at line 89*
+*Defined at line 100*
 
 ---
 
@@ -305,7 +305,7 @@ pub const CR0_PG: i64 = 31;   // Paging Enable
 pub const CR4_VME: i64 = 0;       // Virtual 8086 Mode Extensions
 ```
 
-*Defined at line 92*
+*Defined at line 103*
 
 ---
 
@@ -315,7 +315,7 @@ pub const CR4_VME: i64 = 0;       // Virtual 8086 Mode Extensions
 pub const CR4_PVI: i64 = 1;       // Protected-Mode Virtual Interrupts
 ```
 
-*Defined at line 93*
+*Defined at line 104*
 
 ---
 
@@ -325,7 +325,7 @@ pub const CR4_PVI: i64 = 1;       // Protected-Mode Virtual Interrupts
 pub const CR4_TSD: i64 = 2;       // Time Stamp Disable
 ```
 
-*Defined at line 94*
+*Defined at line 105*
 
 ---
 
@@ -335,7 +335,7 @@ pub const CR4_TSD: i64 = 2;       // Time Stamp Disable
 pub const CR4_DE: i64 = 3;        // Debugging Extensions
 ```
 
-*Defined at line 95*
+*Defined at line 106*
 
 ---
 
@@ -345,7 +345,7 @@ pub const CR4_DE: i64 = 3;        // Debugging Extensions
 pub const CR4_PSE: i64 = 4;       // Page Size Extension
 ```
 
-*Defined at line 96*
+*Defined at line 107*
 
 ---
 
@@ -355,7 +355,7 @@ pub const CR4_PSE: i64 = 4;       // Page Size Extension
 pub const CR4_PAE: i64 = 5;       // Physical Address Extension
 ```
 
-*Defined at line 97*
+*Defined at line 108*
 
 ---
 
@@ -365,7 +365,7 @@ pub const CR4_PAE: i64 = 5;       // Physical Address Extension
 pub const CR4_MCE: i64 = 6;       // Machine Check Enable
 ```
 
-*Defined at line 98*
+*Defined at line 109*
 
 ---
 
@@ -375,7 +375,7 @@ pub const CR4_MCE: i64 = 6;       // Machine Check Enable
 pub const CR4_PGE: i64 = 7;       // Page Global Enable
 ```
 
-*Defined at line 99*
+*Defined at line 110*
 
 ---
 
@@ -385,7 +385,7 @@ pub const CR4_PGE: i64 = 7;       // Page Global Enable
 pub const CR4_PCE: i64 = 8;       // Performance Counter Enable
 ```
 
-*Defined at line 100*
+*Defined at line 111*
 
 ---
 
@@ -395,7 +395,7 @@ pub const CR4_PCE: i64 = 8;       // Performance Counter Enable
 pub const CR4_OSFXSR: i64 = 9;    // OS FXSAVE/FXRSTOR Support
 ```
 
-*Defined at line 101*
+*Defined at line 112*
 
 ---
 
@@ -405,7 +405,7 @@ pub const CR4_OSFXSR: i64 = 9;    // OS FXSAVE/FXRSTOR Support
 pub const CR4_OSXMMEXCPT: i64 = 10; // OS XMM Exception Support
 ```
 
-*Defined at line 102*
+*Defined at line 113*
 
 ---
 
@@ -415,7 +415,7 @@ pub const CR4_OSXMMEXCPT: i64 = 10; // OS XMM Exception Support
 pub const CR4_SMEP: i64 = 20;     // Supervisor Mode Execution Prevention
 ```
 
-*Defined at line 103*
+*Defined at line 114*
 
 ---
 
@@ -425,7 +425,7 @@ pub const CR4_SMEP: i64 = 20;     // Supervisor Mode Execution Prevention
 pub const CR4_SMAP: i64 = 21;     // Supervisor Mode Access Prevention
 ```
 
-*Defined at line 104*
+*Defined at line 115*
 
 ---
 
@@ -435,7 +435,7 @@ pub const CR4_SMAP: i64 = 21;     // Supervisor Mode Access Prevention
 pub const EFER_SCE: i64 = 0;      // System Call Extensions
 ```
 
-*Defined at line 107*
+*Defined at line 118*
 
 ---
 
@@ -445,7 +445,7 @@ pub const EFER_SCE: i64 = 0;      // System Call Extensions
 pub const EFER_LME: i64 = 8;      // Long Mode Enable
 ```
 
-*Defined at line 108*
+*Defined at line 119*
 
 ---
 
@@ -455,7 +455,7 @@ pub const EFER_LME: i64 = 8;      // Long Mode Enable
 pub const EFER_LMA: i64 = 10;     // Long Mode Active
 ```
 
-*Defined at line 109*
+*Defined at line 120*
 
 ---
 
@@ -465,7 +465,7 @@ pub const EFER_LMA: i64 = 10;     // Long Mode Active
 pub const EFER_NXE: i64 = 11;     // No-Execute Enable
 ```
 
-*Defined at line 110*
+*Defined at line 121*
 
 ---
 
@@ -475,7 +475,7 @@ pub const EFER_NXE: i64 = 11;     // No-Execute Enable
 pub const EFER_SVME: i64 = 12;    // Secure Virtual Machine Enable
 ```
 
-*Defined at line 111*
+*Defined at line 122*
 
 ---
 
@@ -485,7 +485,7 @@ pub const EFER_SVME: i64 = 12;    // Secure Virtual Machine Enable
 pub const PTE_PRESENT: i64 = 0;   // Present bit
 ```
 
-*Defined at line 115*
+*Defined at line 126*
 
 ---
 
@@ -495,7 +495,7 @@ pub const PTE_PRESENT: i64 = 0;   // Present bit
 pub const PTE_WRITABLE: i64 = 1;  // Read/Write bit
 ```
 
-*Defined at line 116*
+*Defined at line 127*
 
 ---
 
@@ -505,7 +505,7 @@ pub const PTE_WRITABLE: i64 = 1;  // Read/Write bit
 pub const PTE_USER: i64 = 2;      // User/Supervisor bit
 ```
 
-*Defined at line 117*
+*Defined at line 128*
 
 ---
 
@@ -515,7 +515,7 @@ pub const PTE_USER: i64 = 2;      // User/Supervisor bit
 pub const PTE_WRITE_THROUGH: i64 = 3; // Page-level Write-Through
 ```
 
-*Defined at line 118*
+*Defined at line 129*
 
 ---
 
@@ -525,7 +525,7 @@ pub const PTE_WRITE_THROUGH: i64 = 3; // Page-level Write-Through
 pub const PTE_CACHE_DISABLE: i64 = 4; // Page-level Cache Disable
 ```
 
-*Defined at line 119*
+*Defined at line 130*
 
 ---
 
@@ -535,7 +535,7 @@ pub const PTE_CACHE_DISABLE: i64 = 4; // Page-level Cache Disable
 pub const PTE_ACCESSED: i64 = 5;  // Accessed bit
 ```
 
-*Defined at line 120*
+*Defined at line 131*
 
 ---
 
@@ -545,7 +545,7 @@ pub const PTE_ACCESSED: i64 = 5;  // Accessed bit
 pub const PTE_DIRTY: i64 = 6;     // Dirty bit
 ```
 
-*Defined at line 121*
+*Defined at line 132*
 
 ---
 
@@ -555,7 +555,7 @@ pub const PTE_DIRTY: i64 = 6;     // Dirty bit
 pub const PTE_HUGE: i64 = 7;      // Huge page (PS bit)
 ```
 
-*Defined at line 122*
+*Defined at line 133*
 
 ---
 
@@ -565,7 +565,7 @@ pub const PTE_HUGE: i64 = 7;      // Huge page (PS bit)
 pub const PTE_GLOBAL: i64 = 8;    // Global page
 ```
 
-*Defined at line 123*
+*Defined at line 134*
 
 ---
 
@@ -575,7 +575,7 @@ pub const PTE_GLOBAL: i64 = 8;    // Global page
 pub const PTE_NX: i64 = 63;       // No-Execute bit (in PAE mode)
 ```
 
-*Defined at line 124*
+*Defined at line 135*
 
 ---
 
@@ -585,7 +585,7 @@ pub const PTE_NX: i64 = 63;       // No-Execute bit (in PAE mode)
 pub const GDT_PRESENT: i64 = 7;   // Present bit (bit 7 of access byte)
 ```
 
-*Defined at line 129*
+*Defined at line 140*
 
 ---
 
@@ -595,7 +595,7 @@ pub const GDT_PRESENT: i64 = 7;   // Present bit (bit 7 of access byte)
 pub const GDT_DPL: i64 = 5;       // Descriptor Privilege Level (bits 5-6)
 ```
 
-*Defined at line 130*
+*Defined at line 141*
 
 ---
 
@@ -605,7 +605,7 @@ pub const GDT_DPL: i64 = 5;       // Descriptor Privilege Level (bits 5-6)
 pub const GDT_S: i64 = 4;         // Descriptor type (1 = code/data)
 ```
 
-*Defined at line 131*
+*Defined at line 142*
 
 ---
 
@@ -615,7 +615,7 @@ pub const GDT_S: i64 = 4;         // Descriptor type (1 = code/data)
 pub const GDT_EXECUTABLE: i64 = 3; // Executable (1 = code, 0 = data)
 ```
 
-*Defined at line 132*
+*Defined at line 143*
 
 ---
 
@@ -625,7 +625,7 @@ pub const GDT_EXECUTABLE: i64 = 3; // Executable (1 = code, 0 = data)
 pub const GDT_DC: i64 = 2;        // Direction/Conforming
 ```
 
-*Defined at line 133*
+*Defined at line 144*
 
 ---
 
@@ -635,7 +635,7 @@ pub const GDT_DC: i64 = 2;        // Direction/Conforming
 pub const GDT_RW: i64 = 1;        // Read/Write
 ```
 
-*Defined at line 134*
+*Defined at line 145*
 
 ---
 
@@ -645,7 +645,7 @@ pub const GDT_RW: i64 = 1;        // Read/Write
 pub const GDT_ACCESSED: i64 = 0;  // Accessed bit
 ```
 
-*Defined at line 135*
+*Defined at line 146*
 
 ---
 
@@ -655,7 +655,7 @@ pub const GDT_ACCESSED: i64 = 0;  // Accessed bit
 pub const GDT_GRANULARITY: i64 = 7; // Granularity (1 = 4KB)
 ```
 
-*Defined at line 138*
+*Defined at line 149*
 
 ---
 
@@ -665,7 +665,7 @@ pub const GDT_GRANULARITY: i64 = 7; // Granularity (1 = 4KB)
 pub const GDT_DB: i64 = 6;        // Default operation size (1 = 32-bit)
 ```
 
-*Defined at line 139*
+*Defined at line 150*
 
 ---
 
@@ -675,7 +675,7 @@ pub const GDT_DB: i64 = 6;        // Default operation size (1 = 32-bit)
 pub const GDT_L: i64 = 5;         // Long mode (1 = 64-bit)
 ```
 
-*Defined at line 140*
+*Defined at line 151*
 
 ---
 
@@ -685,7 +685,7 @@ pub const GDT_L: i64 = 5;         // Long mode (1 = 64-bit)
 pub const GDT_AVL: i64 = 4;       // Available for use by system
 ```
 
-*Defined at line 141*
+*Defined at line 152*
 
 ---
 
@@ -695,7 +695,7 @@ pub const GDT_AVL: i64 = 4;       // Available for use by system
 pub const IDT_TASK_GATE: i64 = 0x5;
 ```
 
-*Defined at line 146*
+*Defined at line 157*
 
 ---
 
@@ -705,7 +705,7 @@ pub const IDT_TASK_GATE: i64 = 0x5;
 pub const IDT_INT_GATE_16: i64 = 0x6;
 ```
 
-*Defined at line 147*
+*Defined at line 157*
 
 ---
 
@@ -715,7 +715,7 @@ pub const IDT_INT_GATE_16: i64 = 0x6;
 pub const IDT_TRAP_GATE_16: i64 = 0x7;
 ```
 
-*Defined at line 148*
+*Defined at line 157*
 
 ---
 
@@ -725,7 +725,7 @@ pub const IDT_TRAP_GATE_16: i64 = 0x7;
 pub const IDT_INT_GATE_32: i64 = 0xE;
 ```
 
-*Defined at line 149*
+*Defined at line 157*
 
 ---
 
@@ -735,7 +735,7 @@ pub const IDT_INT_GATE_32: i64 = 0xE;
 pub const IDT_TRAP_GATE_32: i64 = 0xF;
 ```
 
-*Defined at line 150*
+*Defined at line 157*
 
 ---
 
@@ -745,7 +745,7 @@ pub const IDT_TRAP_GATE_32: i64 = 0xF;
 pub const IDT_PRESENT: i64 = 7;
 ```
 
-*Defined at line 153*
+*Defined at line 159*
 
 ---
 

@@ -3,7 +3,9 @@
 Re-audited 2026-11-09 (previous audit 2026-10-22, run 2).
 
 - **Path:** `compiler/arm64_enc.fd`
-- **LOC:** 1,854
+- **LOC:** 2,433 (2026-11-21; 1,854 on Nov 9). Nov 21: still dead; its
+  only importer is runtime_arm64.fd, and `compiler.fd` `build_executable`
+  is gone (MI18, Nov 17).
 - **Role:** AArch64 asm text → bytes, symbols, rodata, relocations
   (`assemble_arm64`). Port of `src/arm64_enc.rs`. Unrelated to the
   `a64_*` encoders in `nat_enc.fd` that the working native backend uses.

@@ -4,7 +4,10 @@
 > Still dead, and now it no longer type-checks.
 
 - **Path:** `compiler/flat_ast.fd`
-- **LOC:** 1,316 (was 1,287; Rust `src/flat_ast.rs`: 780)
+- **LOC:** 1,476 (2026-11-21; 1,316 on Nov 9, 1,287 on Oct 22; Rust `src/flat_ast.rs`: 780).
+  Nov 21: still dead, and `dump-ast-flat` still runs `cmd_ast`. It passes
+  `fid check` again since Nov 15 (known-bugs 2g.22: the missing
+  `AsmDir::Clobber` arm). Line numbers below are from Nov 9.
 - **Role:** `Program` to an indented line-per-node text (`type_flat`, `expr_flat`, `stmt_flat`,
   `func_flat`, `program_flat`). Meant for `dump-ast-flat` and parser differential tests.
 

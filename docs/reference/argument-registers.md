@@ -122,3 +122,11 @@ finds the handler's bytes in a `--nat` image (with the hints on and with
   program on every target with `FID_VERIFY=1`, with and without
   `FID_NAT_OFF=argfree` (output, `[argfree]` lines, reloads), and the
   mutation.
+
+Nov 21 (roadmap RA3/RA7 check, fid built from a self-hosted stage 0): on
+AArch64 and RISC-V this passes. On x86-64 (Linux and `--nat` Windows) the
+`FID_VERIFY=1` allocation checker rejects assignments made with the hints
+and fills (test_machine_argfree, test_machine_simd and others), gone with
+`FID_NAT_OFF=arghint` or `argfree`; the programs print the right output
+without `FID_VERIFY`, so either the assignment or the checker is wrong
+(known-bugs 2g.88).

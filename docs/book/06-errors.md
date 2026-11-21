@@ -60,8 +60,8 @@ What a panic guarantees, on every path (`fid run`, C, native):
 
 The trace's detail depends on how the program was built. The interpreter
 shows lines (the `at line` on the `Panic:` line itself is, today, the line
-of the `p_panic` call inside `core.fd`'s `panic` function, 63 with the
-Nov 17 tree; the trace below it, `panic at line 4`, is your line); a C
+of the `p_panic` call inside `core.fd`'s `panic` function, 71 with the
+Nov 21 tree; the trace below it, `panic at line 4`, is your line); a C
 build (`fid ccompile`) shows the function names it can
 find on the machine stack (`- main`); a native Windows build from
 `fid emit` prints the message without a trace. When you need a trace from
@@ -103,7 +103,7 @@ fn main() -> i64 {
 
 ```
 $ fid run assert.fd
-Panic: total too big: 4 at line 29
+Panic: total too big: 4 at line 37
 stack trace:
     → assert_msg...
     ↳ called from main
@@ -251,9 +251,9 @@ error: empty port
 ```
 
 Why write it by hand? Because core's `str_parse_int` returns **0 on
-failure** — `str_parse_int("forty-two")` is `0` — and there is no
-checked integer parser in the standard library today. When 0 is a valid
-input, validate first.
+failure** — `str_parse_int("forty-two")` is `0`. When 0 is a valid
+input, validate first, or use `str_parse_int_opt` (`use string;`), which
+returns `Option::None` for text that is not an integer.
 
 `Result` has `is_ok`, `is_err`, `unwrap`, `unwrap_or`, `ok` (to an
 `Option`), `err`, `map`, `map_err`, `and_then`, `expect`,

@@ -30,7 +30,7 @@ pub fn kv_cache_new(num_layers: i64, max_seq_len: i64, window_size: i64, head_di
 
 **Returns:** `i64`
 
-*Defined at line 16*
+*Defined at line 24*
 
 ---
 
@@ -51,7 +51,7 @@ pub fn kv_cache_append(cache: i64, layer: i64, k: Tensor, v: Tensor) -> void {
 
 **Returns:** `void`
 
-*Defined at line 21*
+*Defined at line 29*
 
 ---
 
@@ -70,7 +70,7 @@ pub fn kv_cache_get(cache: i64, layer: i64) -> Tensor {
 
 **Returns:** `Tensor`
 
-*Defined at line 26*
+*Defined at line 34*
 
 ---
 
@@ -89,7 +89,7 @@ pub fn kv_cache_len(cache: i64, layer: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 31*
+*Defined at line 39*
 
 ---
 
@@ -107,7 +107,7 @@ pub fn kv_cache_clear(cache: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 36*
+*Defined at line 44*
 
 ---
 
@@ -126,7 +126,7 @@ pub fn kv_cache_evict(cache: i64, n: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 41*
+*Defined at line 49*
 
 ---
 

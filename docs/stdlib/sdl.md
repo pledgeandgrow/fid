@@ -121,7 +121,7 @@
 pub const SDL_INIT_VIDEO: i64 = 0x00000020;
 ```
 
-*Defined at line 86*
+*Defined at line 92*
 
 ---
 
@@ -131,7 +131,7 @@ pub const SDL_INIT_VIDEO: i64 = 0x00000020;
 pub const SDL_INIT_AUDIO: i64 = 0x00000010;
 ```
 
-*Defined at line 87*
+*Defined at line 92*
 
 ---
 
@@ -141,7 +141,7 @@ pub const SDL_INIT_AUDIO: i64 = 0x00000010;
 pub const SDL_INIT_EVENTS: i64 = 0x00004000;
 ```
 
-*Defined at line 88*
+*Defined at line 92*
 
 ---
 
@@ -151,7 +151,7 @@ pub const SDL_INIT_EVENTS: i64 = 0x00004000;
 pub const SDL_INIT_GAMECONTROLLER: i64 = 0x00002000;
 ```
 
-*Defined at line 89*
+*Defined at line 92*
 
 ---
 
@@ -161,7 +161,7 @@ pub const SDL_INIT_GAMECONTROLLER: i64 = 0x00002000;
 pub const SDL_WINDOWPOS_CENTERED: i64 = 0x2FFF0000;
 ```
 
-*Defined at line 92*
+*Defined at line 94*
 
 ---
 
@@ -171,7 +171,7 @@ pub const SDL_WINDOWPOS_CENTERED: i64 = 0x2FFF0000;
 pub const SDL_WINDOWPOS_UNDEFINED: i64 = 0x1FFF0000;
 ```
 
-*Defined at line 93*
+*Defined at line 94*
 
 ---
 
@@ -191,7 +191,7 @@ pub const SDL_WINDOW_FULLSCREEN: i64 = 0x00000001;
 pub const SDL_WINDOW_OPENGL: i64 = 0x00000002;
 ```
 
-*Defined at line 97*
+*Defined at line 96*
 
 ---
 
@@ -201,7 +201,7 @@ pub const SDL_WINDOW_OPENGL: i64 = 0x00000002;
 pub const SDL_WINDOW_RESIZABLE: i64 = 0x00000020;
 ```
 
-*Defined at line 98*
+*Defined at line 96*
 
 ---
 
@@ -211,7 +211,7 @@ pub const SDL_WINDOW_RESIZABLE: i64 = 0x00000020;
 pub const SDL_WINDOW_SHOWN: i64 = 0x00000004;
 ```
 
-*Defined at line 99*
+*Defined at line 96*
 
 ---
 
@@ -221,7 +221,7 @@ pub const SDL_WINDOW_SHOWN: i64 = 0x00000004;
 pub const SDL_RENDERER_ACCELERATED: i64 = 0x00000002;
 ```
 
-*Defined at line 102*
+*Defined at line 98*
 
 ---
 
@@ -231,7 +231,7 @@ pub const SDL_RENDERER_ACCELERATED: i64 = 0x00000002;
 pub const SDL_RENDERER_VSYNC: i64 = 0x00000004;
 ```
 
-*Defined at line 103*
+*Defined at line 98*
 
 ---
 
@@ -241,7 +241,7 @@ pub const SDL_RENDERER_VSYNC: i64 = 0x00000004;
 pub const SDL_RENDERER_SOFTWARE: i64 = 0x00000001;
 ```
 
-*Defined at line 104*
+*Defined at line 98*
 
 ---
 
@@ -251,7 +251,7 @@ pub const SDL_RENDERER_SOFTWARE: i64 = 0x00000001;
 pub const SDL_QUIT: i64 = 0x100;
 ```
 
-*Defined at line 107*
+*Defined at line 100*
 
 ---
 
@@ -261,7 +261,7 @@ pub const SDL_QUIT: i64 = 0x100;
 pub const SDL_KEYDOWN: i64 = 0x300;
 ```
 
-*Defined at line 108*
+*Defined at line 100*
 
 ---
 
@@ -271,7 +271,7 @@ pub const SDL_KEYDOWN: i64 = 0x300;
 pub const SDL_KEYUP: i64 = 0x301;
 ```
 
-*Defined at line 109*
+*Defined at line 100*
 
 ---
 
@@ -281,7 +281,7 @@ pub const SDL_KEYUP: i64 = 0x301;
 pub const SDL_MOUSEMOTION: i64 = 0x400;
 ```
 
-*Defined at line 110*
+*Defined at line 100*
 
 ---
 
@@ -291,7 +291,7 @@ pub const SDL_MOUSEMOTION: i64 = 0x400;
 pub const SDL_MOUSEBUTTONDOWN: i64 = 0x401;
 ```
 
-*Defined at line 111*
+*Defined at line 100*
 
 ---
 
@@ -301,7 +301,7 @@ pub const SDL_MOUSEBUTTONDOWN: i64 = 0x401;
 pub const SDL_MOUSEBUTTONUP: i64 = 0x402;
 ```
 
-*Defined at line 112*
+*Defined at line 100*
 
 ---
 
@@ -311,7 +311,7 @@ pub const SDL_MOUSEBUTTONUP: i64 = 0x402;
 pub const SDL_SCANCODE_UNKNOWN: i64 = 0;
 ```
 
-*Defined at line 115*
+*Defined at line 102*
 
 ---
 
@@ -321,7 +321,7 @@ pub const SDL_SCANCODE_UNKNOWN: i64 = 0;
 pub const SDL_SCANCODE_A: i64 = 4;
 ```
 
-*Defined at line 116*
+*Defined at line 102*
 
 ---
 
@@ -331,7 +331,7 @@ pub const SDL_SCANCODE_A: i64 = 4;
 pub const SDL_SCANCODE_B: i64 = 5;
 ```
 
-*Defined at line 117*
+*Defined at line 102*
 
 ---
 
@@ -341,7 +341,7 @@ pub const SDL_SCANCODE_B: i64 = 5;
 pub const SDL_SCANCODE_C: i64 = 6;
 ```
 
-*Defined at line 118*
+*Defined at line 102*
 
 ---
 
@@ -351,7 +351,7 @@ pub const SDL_SCANCODE_C: i64 = 6;
 pub const SDL_SCANCODE_D: i64 = 7;
 ```
 
-*Defined at line 119*
+*Defined at line 102*
 
 ---
 
@@ -361,7 +361,7 @@ pub const SDL_SCANCODE_D: i64 = 7;
 pub const SDL_SCANCODE_E: i64 = 8;
 ```
 
-*Defined at line 120*
+*Defined at line 102*
 
 ---
 
@@ -371,7 +371,7 @@ pub const SDL_SCANCODE_E: i64 = 8;
 pub const SDL_SCANCODE_F: i64 = 9;
 ```
 
-*Defined at line 121*
+*Defined at line 102*
 
 ---
 
@@ -381,7 +381,7 @@ pub const SDL_SCANCODE_F: i64 = 9;
 pub const SDL_SCANCODE_G: i64 = 10;
 ```
 
-*Defined at line 122*
+*Defined at line 102*
 
 ---
 
@@ -391,7 +391,7 @@ pub const SDL_SCANCODE_G: i64 = 10;
 pub const SDL_SCANCODE_H: i64 = 11;
 ```
 
-*Defined at line 123*
+*Defined at line 102*
 
 ---
 
@@ -401,7 +401,7 @@ pub const SDL_SCANCODE_H: i64 = 11;
 pub const SDL_SCANCODE_I: i64 = 12;
 ```
 
-*Defined at line 124*
+*Defined at line 102*
 
 ---
 
@@ -411,7 +411,7 @@ pub const SDL_SCANCODE_I: i64 = 12;
 pub const SDL_SCANCODE_J: i64 = 13;
 ```
 
-*Defined at line 125*
+*Defined at line 102*
 
 ---
 
@@ -421,7 +421,7 @@ pub const SDL_SCANCODE_J: i64 = 13;
 pub const SDL_SCANCODE_K: i64 = 14;
 ```
 
-*Defined at line 126*
+*Defined at line 102*
 
 ---
 
@@ -431,7 +431,7 @@ pub const SDL_SCANCODE_K: i64 = 14;
 pub const SDL_SCANCODE_L: i64 = 15;
 ```
 
-*Defined at line 127*
+*Defined at line 102*
 
 ---
 
@@ -441,7 +441,7 @@ pub const SDL_SCANCODE_L: i64 = 15;
 pub const SDL_SCANCODE_M: i64 = 16;
 ```
 
-*Defined at line 128*
+*Defined at line 102*
 
 ---
 
@@ -451,7 +451,7 @@ pub const SDL_SCANCODE_M: i64 = 16;
 pub const SDL_SCANCODE_N: i64 = 17;
 ```
 
-*Defined at line 129*
+*Defined at line 102*
 
 ---
 
@@ -461,7 +461,7 @@ pub const SDL_SCANCODE_N: i64 = 17;
 pub const SDL_SCANCODE_O: i64 = 18;
 ```
 
-*Defined at line 130*
+*Defined at line 102*
 
 ---
 
@@ -471,7 +471,7 @@ pub const SDL_SCANCODE_O: i64 = 18;
 pub const SDL_SCANCODE_P: i64 = 19;
 ```
 
-*Defined at line 131*
+*Defined at line 102*
 
 ---
 
@@ -481,7 +481,7 @@ pub const SDL_SCANCODE_P: i64 = 19;
 pub const SDL_SCANCODE_Q: i64 = 20;
 ```
 
-*Defined at line 132*
+*Defined at line 102*
 
 ---
 
@@ -491,7 +491,7 @@ pub const SDL_SCANCODE_Q: i64 = 20;
 pub const SDL_SCANCODE_R: i64 = 21;
 ```
 
-*Defined at line 133*
+*Defined at line 102*
 
 ---
 
@@ -501,7 +501,7 @@ pub const SDL_SCANCODE_R: i64 = 21;
 pub const SDL_SCANCODE_S: i64 = 22;
 ```
 
-*Defined at line 134*
+*Defined at line 102*
 
 ---
 
@@ -511,7 +511,7 @@ pub const SDL_SCANCODE_S: i64 = 22;
 pub const SDL_SCANCODE_T: i64 = 23;
 ```
 
-*Defined at line 135*
+*Defined at line 102*
 
 ---
 
@@ -521,7 +521,7 @@ pub const SDL_SCANCODE_T: i64 = 23;
 pub const SDL_SCANCODE_U: i64 = 24;
 ```
 
-*Defined at line 136*
+*Defined at line 102*
 
 ---
 
@@ -531,7 +531,7 @@ pub const SDL_SCANCODE_U: i64 = 24;
 pub const SDL_SCANCODE_V: i64 = 25;
 ```
 
-*Defined at line 137*
+*Defined at line 102*
 
 ---
 
@@ -541,7 +541,7 @@ pub const SDL_SCANCODE_V: i64 = 25;
 pub const SDL_SCANCODE_W: i64 = 26;
 ```
 
-*Defined at line 138*
+*Defined at line 102*
 
 ---
 
@@ -551,7 +551,7 @@ pub const SDL_SCANCODE_W: i64 = 26;
 pub const SDL_SCANCODE_X: i64 = 27;
 ```
 
-*Defined at line 139*
+*Defined at line 102*
 
 ---
 
@@ -561,7 +561,7 @@ pub const SDL_SCANCODE_X: i64 = 27;
 pub const SDL_SCANCODE_Y: i64 = 28;
 ```
 
-*Defined at line 140*
+*Defined at line 102*
 
 ---
 
@@ -571,7 +571,7 @@ pub const SDL_SCANCODE_Y: i64 = 28;
 pub const SDL_SCANCODE_Z: i64 = 29;
 ```
 
-*Defined at line 141*
+*Defined at line 102*
 
 ---
 
@@ -581,7 +581,7 @@ pub const SDL_SCANCODE_Z: i64 = 29;
 pub const SDL_SCANCODE_1: i64 = 30;
 ```
 
-*Defined at line 142*
+*Defined at line 102*
 
 ---
 
@@ -591,7 +591,7 @@ pub const SDL_SCANCODE_1: i64 = 30;
 pub const SDL_SCANCODE_2: i64 = 31;
 ```
 
-*Defined at line 143*
+*Defined at line 102*
 
 ---
 
@@ -601,7 +601,7 @@ pub const SDL_SCANCODE_2: i64 = 31;
 pub const SDL_SCANCODE_3: i64 = 32;
 ```
 
-*Defined at line 144*
+*Defined at line 102*
 
 ---
 
@@ -611,7 +611,7 @@ pub const SDL_SCANCODE_3: i64 = 32;
 pub const SDL_SCANCODE_4: i64 = 33;
 ```
 
-*Defined at line 145*
+*Defined at line 102*
 
 ---
 
@@ -621,7 +621,7 @@ pub const SDL_SCANCODE_4: i64 = 33;
 pub const SDL_SCANCODE_5: i64 = 34;
 ```
 
-*Defined at line 146*
+*Defined at line 102*
 
 ---
 
@@ -631,7 +631,7 @@ pub const SDL_SCANCODE_5: i64 = 34;
 pub const SDL_SCANCODE_6: i64 = 35;
 ```
 
-*Defined at line 147*
+*Defined at line 102*
 
 ---
 
@@ -641,7 +641,7 @@ pub const SDL_SCANCODE_6: i64 = 35;
 pub const SDL_SCANCODE_7: i64 = 36;
 ```
 
-*Defined at line 148*
+*Defined at line 102*
 
 ---
 
@@ -651,7 +651,7 @@ pub const SDL_SCANCODE_7: i64 = 36;
 pub const SDL_SCANCODE_8: i64 = 37;
 ```
 
-*Defined at line 149*
+*Defined at line 102*
 
 ---
 
@@ -661,7 +661,7 @@ pub const SDL_SCANCODE_8: i64 = 37;
 pub const SDL_SCANCODE_9: i64 = 38;
 ```
 
-*Defined at line 150*
+*Defined at line 102*
 
 ---
 
@@ -671,7 +671,7 @@ pub const SDL_SCANCODE_9: i64 = 38;
 pub const SDL_SCANCODE_0: i64 = 39;
 ```
 
-*Defined at line 151*
+*Defined at line 102*
 
 ---
 
@@ -681,7 +681,7 @@ pub const SDL_SCANCODE_0: i64 = 39;
 pub const SDL_SCANCODE_RETURN: i64 = 40;
 ```
 
-*Defined at line 152*
+*Defined at line 102*
 
 ---
 
@@ -691,7 +691,7 @@ pub const SDL_SCANCODE_RETURN: i64 = 40;
 pub const SDL_SCANCODE_ESCAPE: i64 = 41;
 ```
 
-*Defined at line 153*
+*Defined at line 102*
 
 ---
 
@@ -701,7 +701,7 @@ pub const SDL_SCANCODE_ESCAPE: i64 = 41;
 pub const SDL_SCANCODE_BACKSPACE: i64 = 42;
 ```
 
-*Defined at line 154*
+*Defined at line 102*
 
 ---
 
@@ -711,7 +711,7 @@ pub const SDL_SCANCODE_BACKSPACE: i64 = 42;
 pub const SDL_SCANCODE_TAB: i64 = 43;
 ```
 
-*Defined at line 155*
+*Defined at line 102*
 
 ---
 
@@ -721,7 +721,7 @@ pub const SDL_SCANCODE_TAB: i64 = 43;
 pub const SDL_SCANCODE_SPACE: i64 = 44;
 ```
 
-*Defined at line 156*
+*Defined at line 102*
 
 ---
 
@@ -731,7 +731,7 @@ pub const SDL_SCANCODE_SPACE: i64 = 44;
 pub const SDL_SCANCODE_LEFT: i64 = 80;
 ```
 
-*Defined at line 157*
+*Defined at line 102*
 
 ---
 
@@ -741,7 +741,7 @@ pub const SDL_SCANCODE_LEFT: i64 = 80;
 pub const SDL_SCANCODE_RIGHT: i64 = 79;
 ```
 
-*Defined at line 158*
+*Defined at line 102*
 
 ---
 
@@ -751,7 +751,7 @@ pub const SDL_SCANCODE_RIGHT: i64 = 79;
 pub const SDL_SCANCODE_UP: i64 = 82;
 ```
 
-*Defined at line 159*
+*Defined at line 102*
 
 ---
 
@@ -761,7 +761,7 @@ pub const SDL_SCANCODE_UP: i64 = 82;
 pub const SDL_SCANCODE_DOWN: i64 = 81;
 ```
 
-*Defined at line 160*
+*Defined at line 102*
 
 ---
 
@@ -771,7 +771,7 @@ pub const SDL_SCANCODE_DOWN: i64 = 81;
 pub const SDL_SCANCODE_LSHIFT: i64 = 225;
 ```
 
-*Defined at line 161*
+*Defined at line 102*
 
 ---
 
@@ -781,7 +781,7 @@ pub const SDL_SCANCODE_LSHIFT: i64 = 225;
 pub const SDL_SCANCODE_RSHIFT: i64 = 229;
 ```
 
-*Defined at line 162*
+*Defined at line 102*
 
 ---
 
@@ -791,7 +791,7 @@ pub const SDL_SCANCODE_RSHIFT: i64 = 229;
 pub const SDL_SCANCODE_LCTRL: i64 = 224;
 ```
 
-*Defined at line 163*
+*Defined at line 102*
 
 ---
 
@@ -801,7 +801,7 @@ pub const SDL_SCANCODE_LCTRL: i64 = 224;
 pub const SDL_SCANCODE_RCTRL: i64 = 228;
 ```
 
-*Defined at line 164*
+*Defined at line 102*
 
 ---
 
@@ -811,7 +811,7 @@ pub const SDL_SCANCODE_RCTRL: i64 = 228;
 pub const SDL_BUTTON_LEFT: i64 = 1;
 ```
 
-*Defined at line 167*
+*Defined at line 104*
 
 ---
 
@@ -821,7 +821,7 @@ pub const SDL_BUTTON_LEFT: i64 = 1;
 pub const SDL_BUTTON_MIDDLE: i64 = 2;
 ```
 
-*Defined at line 168*
+*Defined at line 104*
 
 ---
 
@@ -831,7 +831,7 @@ pub const SDL_BUTTON_MIDDLE: i64 = 2;
 pub const SDL_BUTTON_RIGHT: i64 = 3;
 ```
 
-*Defined at line 169*
+*Defined at line 104*
 
 ---
 
@@ -841,7 +841,7 @@ pub const SDL_BUTTON_RIGHT: i64 = 3;
 pub const AUDIO_S16SYS: i64 = 0x8010;
 ```
 
-*Defined at line 172*
+*Defined at line 106*
 
 ---
 
@@ -860,7 +860,7 @@ pub fn sdl_init(flags: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 178*
+*Defined at line 111*
 
 ---
 
@@ -874,7 +874,7 @@ pub fn sdl_quit() -> void {
 
 **Returns:** `void`
 
-*Defined at line 183*
+*Defined at line 116*
 
 ---
 
@@ -895,7 +895,7 @@ pub fn sdl_create_window(title: str, width: i64, height: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 189*
+*Defined at line 122*
 
 ---
 
@@ -914,7 +914,7 @@ pub fn sdl_create_renderer(win: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 195*
+*Defined at line 128*
 
 ---
 
@@ -932,7 +932,7 @@ pub fn sdl_destroy_renderer(ren: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 200*
+*Defined at line 133*
 
 ---
 
@@ -950,7 +950,7 @@ pub fn sdl_destroy_window(win: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 205*
+*Defined at line 138*
 
 ---
 
@@ -968,7 +968,7 @@ pub fn sdl_render_clear(ren: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 210*
+*Defined at line 143*
 
 ---
 
@@ -986,7 +986,7 @@ pub fn sdl_render_present(ren: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 215*
+*Defined at line 148*
 
 ---
 
@@ -1008,7 +1008,7 @@ pub fn sdl_set_draw_color(ren: i64, r: i64, g: i64, b: i64, a: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 220*
+*Defined at line 153*
 
 ---
 
@@ -1027,7 +1027,7 @@ pub fn sdl_fill_rect(ren: i64, rect: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 225*
+*Defined at line 158*
 
 ---
 
@@ -1049,7 +1049,7 @@ pub fn sdl_draw_line(ren: i64, x1: i64, y1: i64, x2: i64, y2: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 230*
+*Defined at line 163*
 
 ---
 
@@ -1069,7 +1069,7 @@ pub fn sdl_draw_point(ren: i64, x: i64, y: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 235*
+*Defined at line 168*
 
 ---
 
@@ -1087,7 +1087,7 @@ pub fn sdl_delay(ms: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 240*
+*Defined at line 173*
 
 ---
 
@@ -1101,7 +1101,7 @@ pub fn sdl_get_ticks() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 245*
+*Defined at line 178*
 
 ---
 
@@ -1115,7 +1115,7 @@ pub fn sdl_get_error() -> str {
 
 **Returns:** `str`
 
-*Defined at line 250*
+*Defined at line 183*
 
 ---
 
@@ -1137,7 +1137,7 @@ pub struct SdlInputState {
 | `prev_mouse_buttons` | `i64` |
 | `quit_requested` | `bool` |
 
-*Defined at line 257*
+*Defined at line 190*
 
 ---
 
@@ -1151,7 +1151,7 @@ pub fn sdl_input_create() -> SdlInputState {
 
 **Returns:** `SdlInputState`
 
-*Defined at line 268*
+*Defined at line 213*
 
 ---
 
@@ -1170,7 +1170,7 @@ pub fn sdl_poll_events(state: &mut SdlInputState) -> void {
 
 **Returns:** `void`
 
-*Defined at line 290*
+*Defined at line 229*
 
 ---
 
@@ -1189,7 +1189,7 @@ pub fn sdl_key_held(state: &SdlInputState, scancode: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 320*
+*Defined at line 262*
 
 ---
 
@@ -1208,7 +1208,7 @@ pub fn sdl_key_pressed(state: &SdlInputState, scancode: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 326*
+*Defined at line 270*
 
 ---
 
@@ -1227,7 +1227,7 @@ pub fn sdl_key_released(state: &SdlInputState, scancode: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 332*
+*Defined at line 278*
 
 ---
 
@@ -1246,7 +1246,7 @@ pub fn sdl_mouse_held(state: &SdlInputState, button: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 338*
+*Defined at line 286*
 
 ---
 
@@ -1265,7 +1265,7 @@ pub fn sdl_mouse_pressed(state: &SdlInputState, button: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 343*
+*Defined at line 291*
 
 ---
 
@@ -1283,7 +1283,7 @@ pub fn sdl_mouse_x(state: &SdlInputState) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 350*
+*Defined at line 298*
 
 ---
 
@@ -1301,7 +1301,7 @@ pub fn sdl_mouse_y(state: &SdlInputState) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 355*
+*Defined at line 303*
 
 ---
 
@@ -1319,7 +1319,7 @@ pub fn sdl_quit_requested(state: &SdlInputState) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 360*
+*Defined at line 308*
 
 ---
 
@@ -1339,7 +1339,7 @@ pub fn sdl_load_texture(ren: i64, path: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 368*
+*Defined at line 316*
 
 ---
 
@@ -1357,7 +1357,7 @@ pub fn sdl_destroy_texture(tex: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 377*
+*Defined at line 327*
 
 ---
 
@@ -1381,7 +1381,7 @@ pub fn sdl_draw_texture(ren: i64, tex: i64, x: i64, y: i64, w: i64, h: i64) -> v
 
 **Returns:** `void`
 
-*Defined at line 383*
+*Defined at line 333*
 
 ---
 
@@ -1396,7 +1396,7 @@ pub fn sdl_audio_init() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 398*
+*Defined at line 350*
 
 ---
 
@@ -1410,7 +1410,7 @@ pub fn sdl_audio_shutdown() -> void {
 
 **Returns:** `void`
 
-*Defined at line 403*
+*Defined at line 355*
 
 ---
 
@@ -1428,7 +1428,7 @@ pub fn sdl_audio_load(path: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 408*
+*Defined at line 360*
 
 ---
 
@@ -1450,7 +1450,7 @@ pub fn sdl_audio_play(channel: i64, chunk: i64, loops: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 415*
+*Defined at line 367*
 
 ---
 
@@ -1468,7 +1468,7 @@ pub fn sdl_audio_stop(channel: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 420*
+*Defined at line 372*
 
 ---
 
@@ -1487,7 +1487,7 @@ pub fn sdl_audio_volume(channel: i64, volume: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 425*
+*Defined at line 377*
 
 ---
 
@@ -1505,7 +1505,7 @@ pub fn sdl_audio_free(chunk: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 430*
+*Defined at line 382*
 
 ---
 
@@ -1523,7 +1523,7 @@ pub fn sdl_audio_playing(channel: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 435*
+*Defined at line 387*
 
 ---
 
@@ -1541,7 +1541,7 @@ pub fn sdl_audio_pause(channel: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 440*
+*Defined at line 392*
 
 ---
 
@@ -1559,7 +1559,7 @@ pub fn sdl_audio_resume(channel: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 445*
+*Defined at line 397*
 
 ---
 

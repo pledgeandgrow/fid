@@ -24,7 +24,7 @@
 pub const METRIC_COUNTER: i64 = 0;
 ```
 
-*Defined at line 19*
+*Defined at line 15*
 
 ---
 
@@ -34,7 +34,7 @@ pub const METRIC_COUNTER: i64 = 0;
 pub const METRIC_GAUGE: i64 = 1;
 ```
 
-*Defined at line 20*
+*Defined at line 15*
 
 ---
 
@@ -44,7 +44,7 @@ pub const METRIC_GAUGE: i64 = 1;
 pub const METRIC_HISTOGRAM: i64 = 2;
 ```
 
-*Defined at line 21*
+*Defined at line 15*
 
 ---
 
@@ -71,7 +71,7 @@ pub struct Metrics {
 | `bounds` | `Vec<i64>` |
 | `buckets` | `Vec<i64>` |
 
-*Defined at line 25*
+*Defined at line 18*
 
 ---
 
@@ -83,7 +83,7 @@ pub fn metrics_new() -> Metrics {
 
 **Returns:** `Metrics`
 
-*Defined at line 39*
+*Defined at line 43*
 
 ---
 
@@ -101,7 +101,7 @@ pub fn metrics_valid_name(name: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 48*
+*Defined at line 54*
 
 ---
 
@@ -110,18 +110,18 @@ pub fn metrics_valid_name(name: str) -> bool {
 A counter: only goes up.
 
 ```fides
-pub fn metrics_counter(m: Metrics, name: str, help: str) -> i64 {
+pub fn metrics_counter(m: &mut Metrics, name: str, help: str) -> i64 {
 ```
 
 **Parameters:**
 
-- `m`: `Metrics`
+- `m`: `&mut Metrics`
 - `name`: `str`
 - `help`: `str`
 
 **Returns:** `i64`
 
-*Defined at line 79*
+*Defined at line 93*
 
 ---
 
@@ -130,18 +130,18 @@ pub fn metrics_counter(m: Metrics, name: str, help: str) -> i64 {
 A gauge: set to any value.
 
 ```fides
-pub fn metrics_gauge(m: Metrics, name: str, help: str) -> i64 {
+pub fn metrics_gauge(m: &mut Metrics, name: str, help: str) -> i64 {
 ```
 
 **Parameters:**
 
-- `m`: `Metrics`
+- `m`: `&mut Metrics`
 - `name`: `str`
 - `help`: `str`
 
 **Returns:** `i64`
 
-*Defined at line 84*
+*Defined at line 105*
 
 ---
 
@@ -150,19 +150,19 @@ pub fn metrics_gauge(m: Metrics, name: str, help: str) -> i64 {
 A histogram with the given upper bounds, in increasing order.
 
 ```fides
-pub fn metrics_histogram(m: Metrics, name: str, help: str, upper: Vec<i64>) -> i64 {
+pub fn metrics_histogram(m: &mut Metrics, name: str, help: str, upper: Vec<i64>) -> i64 {
 ```
 
 **Parameters:**
 
-- `m`: `Metrics`
+- `m`: `&mut Metrics`
 - `name`: `str`
 - `help`: `str`
 - `upper`: `Vec<i64>`
 
 **Returns:** `i64`
 
-*Defined at line 89*
+*Defined at line 120*
 
 ---
 
@@ -171,16 +171,16 @@ pub fn metrics_histogram(m: Metrics, name: str, help: str, upper: Vec<i64>) -> i
 Add `by` (>= 0) to a counter, or to a gauge.
 
 ```fides
-pub fn metrics_inc(m: Metrics, id: i64, by: i64) {
+pub fn metrics_inc(m: &mut Metrics, id: i64, by: i64) {
 ```
 
 **Parameters:**
 
-- `m`: `Metrics`
+- `m`: `&mut Metrics`
 - `id`: `i64`
 - `by`: `i64`
 
-*Defined at line 103*
+*Defined at line 136*
 
 ---
 
@@ -189,16 +189,16 @@ pub fn metrics_inc(m: Metrics, id: i64, by: i64) {
 Set a gauge.
 
 ```fides
-pub fn metrics_set(m: Metrics, id: i64, value: i64) {
+pub fn metrics_set(m: &mut Metrics, id: i64, value: i64) {
 ```
 
 **Parameters:**
 
-- `m`: `Metrics`
+- `m`: `&mut Metrics`
 - `id`: `i64`
 - `value`: `i64`
 
-*Defined at line 109*
+*Defined at line 144*
 
 ---
 
@@ -207,16 +207,16 @@ pub fn metrics_set(m: Metrics, id: i64, value: i64) {
 Record one value in a histogram.
 
 ```fides
-pub fn metrics_observe(m: Metrics, id: i64, value: i64) {
+pub fn metrics_observe(m: &mut Metrics, id: i64, value: i64) {
 ```
 
 **Parameters:**
 
-- `m`: `Metrics`
+- `m`: `&mut Metrics`
 - `id`: `i64`
 - `value`: `i64`
 
-*Defined at line 115*
+*Defined at line 152*
 
 ---
 
@@ -235,7 +235,7 @@ pub fn metrics_get(m: Metrics, id: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 131*
+*Defined at line 170*
 
 ---
 
@@ -254,7 +254,7 @@ pub fn metrics_count(m: Metrics, id: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 136*
+*Defined at line 175*
 
 ---
 
@@ -272,7 +272,7 @@ pub fn metrics_text(m: Metrics) -> str {
 
 **Returns:** `str`
 
-*Defined at line 141*
+*Defined at line 180*
 
 ---
 

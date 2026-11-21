@@ -25,7 +25,7 @@ pub struct Money {
 |------|------|
 | `cents` | `i64` |
 
-*Defined at line 16*
+*Defined at line 14*
 
 ---
 
@@ -44,7 +44,7 @@ pub fn Money_new(cents: i64) -> Money {
 
 **Returns:** `Money`
 
-*Defined at line 25*
+*Defined at line 31*
 
 ---
 
@@ -63,7 +63,7 @@ pub fn Money_from_dollars(dollars: i64, cents: i64) -> Money {
 
 **Returns:** `Money`
 
-*Defined at line 30*
+*Defined at line 38*
 
 ---
 
@@ -79,7 +79,7 @@ pub fn Money_from_cents(cents: i64) -> Money {
 
 **Returns:** `Money`
 
-*Defined at line 40*
+*Defined at line 47*
 
 ---
 
@@ -96,7 +96,7 @@ pub fn Money_add(a: Money, b: Money) -> Money {
 
 **Returns:** `Money`
 
-*Defined at line 48*
+*Defined at line 59*
 
 ---
 
@@ -113,7 +113,7 @@ pub fn Money_sub(a: Money, b: Money) -> Money {
 
 **Returns:** `Money`
 
-*Defined at line 54*
+*Defined at line 93*
 
 ---
 
@@ -129,40 +129,44 @@ pub fn Money_to_cents(m: Money) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 60*
+*Defined at line 101*
 
 ---
 
 ## Money_is_non_negative
 
+Is the amount non-negative? Borrows, consumes nothing.
+
 ```fides
-pub fn Money_is_non_negative(m: Money) -> bool {
+@conserve pub fn Money_is_non_negative(m: &Money) -> bool {
 ```
 
 **Parameters:**
 
-- `m`: `Money`
+- `m`: `&Money`
 
 **Returns:** `bool`
 
-*Defined at line 66*
+*Defined at line 80*
 
 ---
 
 ## Money_eq
 
+Are the two amounts equal? Borrows both, consumes nothing.
+
 ```fides
-pub fn Money_eq(a: Money, b: Money) -> bool {
+@conserve pub fn Money_eq(a: &Money, b: &Money) -> bool {
 ```
 
 **Parameters:**
 
-- `a`: `Money`
-- `b`: `Money`
+- `a`: `&Money`
+- `b`: `&Money`
 
 **Returns:** `bool`
 
-*Defined at line 72*
+*Defined at line 85*
 
 ---
 
@@ -180,7 +184,7 @@ pub fn Money_print(m: Money) -> void {
 
 **Returns:** `void`
 
-*Defined at line 77*
+*Defined at line 106*
 
 ---
 

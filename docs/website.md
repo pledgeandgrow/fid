@@ -1,6 +1,6 @@
 # The website
 
-The project website is a Fides program: [`tools/site.fd`](../tools/site.fd)
+The project website is a Fid program: [`tools/site.fd`](../tools/site.fd)
 (roadmap AD2). It renders the repository's Markdown to HTML when a page is
 asked for, with one layout (header, navigation, a sidebar of the section's
 pages) and one stylesheet, both served by the program. The site loads nothing
@@ -50,7 +50,9 @@ relative, so the directory works at any URL path; `--base` is only for
 `404.html`, which GitHub Pages shows for a path of any depth and so links
 from the site's root (`/fid/` for `pledgeandgrow.github.io/fid/`, `/` by
 default). Publish the directory as it is (a `gh-pages` branch, or the
-`actions/upload-pages-artifact` step). A section's `README.md` is also
+`actions/upload-pages-artifact` step). `.github/workflows/pages.yml` does
+this on a push to `main` that changes a page, after merging the weekly
+benchmark runs into `docs/benchmarks.md` (`bench/page-merge.sh`). A section's `README.md` is also
 written as its `index.html`, so `/docs/book/` works without a server.
 
 ## URLs

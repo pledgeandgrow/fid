@@ -88,7 +88,8 @@ It is written for `--debug`, `-g` (main.fd sets `g_nat_win_dwarf`),
 `FID_NAT_DWARF=1` or `FID_PE_DEBUG=1`; a plain `--nat` build keeps only its
 COFF symbols, byte for byte as before (`compiler/nat_ir.fd`
 `ng_dbg_win_dwarf`, `ng_dbg_lines_ok`). Visual Studio and WinDbg read PDB
-files, not DWARF: no PDB is written yet.
+files, not DWARF: `emit -g` also writes a PDB (`compiler/pdb.fd`,
+[windows-pdb.md](windows-pdb.md)).
 
 Check: `bash tests/nattools/pe_nat_dwarf_check.sh` (the unit test
 `tests/nattools/pe_nat_dwarf_unit.fd`, then `--nat` builds of

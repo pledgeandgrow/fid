@@ -47,7 +47,7 @@ pub fn sync_atomic_alloc(initial: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 23*
+*Defined at line 34*
 
 ---
 
@@ -65,7 +65,7 @@ pub fn sync_atomic_load(addr: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 30*
+*Defined at line 41*
 
 ---
 
@@ -84,7 +84,7 @@ pub fn sync_atomic_store(addr: i64, value: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 35*
+*Defined at line 46*
 
 ---
 
@@ -104,7 +104,7 @@ pub fn sync_atomic_cas(addr: i64, expected: i64, new_val: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 40*
+*Defined at line 51*
 
 ---
 
@@ -123,7 +123,7 @@ pub fn sync_atomic_add(addr: i64, value: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 45*
+*Defined at line 56*
 
 ---
 
@@ -137,7 +137,7 @@ pub fn sync_mutex_create() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 50*
+*Defined at line 61*
 
 ---
 
@@ -155,7 +155,7 @@ pub fn sync_mutex_lock(m: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 55*
+*Defined at line 66*
 
 ---
 
@@ -173,7 +173,7 @@ pub fn sync_mutex_unlock(m: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 60*
+*Defined at line 71*
 
 ---
 
@@ -188,7 +188,7 @@ pub fn sync_tls_create() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 81*
+*Defined at line 92*
 
 ---
 
@@ -206,7 +206,7 @@ pub fn sync_tls_get(key: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 86*
+*Defined at line 97*
 
 ---
 
@@ -225,7 +225,7 @@ pub fn sync_tls_set(key: i64, value: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 91*
+*Defined at line 102*
 
 ---
 
@@ -240,7 +240,7 @@ pub fn sync_rwlock_create() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 101*
+*Defined at line 112*
 
 ---
 
@@ -258,7 +258,7 @@ pub fn sync_rwlock_read_lock(rwlock: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 120*
+*Defined at line 133*
 
 ---
 
@@ -276,7 +276,7 @@ pub fn sync_rwlock_read_unlock(rwlock: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 136*
+*Defined at line 153*
 
 ---
 
@@ -294,7 +294,7 @@ pub fn sync_rwlock_write_lock(rwlock: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 150*
+*Defined at line 169*
 
 ---
 
@@ -312,7 +312,7 @@ pub fn sync_rwlock_write_unlock(rwlock: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 158*
+*Defined at line 178*
 
 ---
 
@@ -330,7 +330,7 @@ pub fn atomic_u64_new(initial: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 170*
+*Defined at line 191*
 
 ---
 
@@ -348,7 +348,7 @@ pub fn atomic_u64_load(addr: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 175*
+*Defined at line 196*
 
 ---
 
@@ -367,7 +367,7 @@ pub fn atomic_u64_store(addr: i64, value: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 180*
+*Defined at line 201*
 
 ---
 
@@ -386,7 +386,7 @@ pub fn atomic_u64_fetch_add(addr: i64, value: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 185*
+*Defined at line 206*
 
 ---
 
@@ -406,7 +406,7 @@ pub fn atomic_u64_cas(addr: i64, expected: i64, new_val: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 190*
+*Defined at line 211*
 
 ---
 
@@ -427,7 +427,7 @@ pub fn sync_spawn(func_name: str, num_args: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 197*
+*Defined at line 218*
 
 ---
 
@@ -437,7 +437,7 @@ pub fn sync_spawn(func_name: str, num_args: i64) -> i64 {
 pub const SYNC_CHAN_PENDING: i64 = -9223372036854775807;
 ```
 
-*Defined at line 220*
+*Defined at line 241*
 
 ---
 
@@ -456,7 +456,7 @@ pub fn sync_channel_create(capacity: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 224*
+*Defined at line 244*
 
 ---
 
@@ -476,7 +476,7 @@ pub fn sync_channel_send(ch: i64, value: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 230*
+*Defined at line 250*
 
 ---
 
@@ -495,7 +495,7 @@ pub fn sync_channel_recv(ch: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 236*
+*Defined at line 256*
 
 ---
 
@@ -515,7 +515,7 @@ pub fn sync_channel_try_recv(ch: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 243*
+*Defined at line 263*
 
 ---
 
@@ -533,7 +533,7 @@ pub fn sync_channel_close(ch: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 248*
+*Defined at line 268*
 
 ---
 
@@ -551,7 +551,7 @@ pub fn sync_channel_is_closed(ch: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 253*
+*Defined at line 273*
 
 ---
 

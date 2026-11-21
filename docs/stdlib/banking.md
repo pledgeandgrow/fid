@@ -46,7 +46,7 @@ pub struct Account {
 | `id` | `i64` |
 | `balance` | `Money` |
 
-*Defined at line 30*
+*Defined at line 28*
 
 ---
 
@@ -66,7 +66,7 @@ pub fn Account_open(id: i64, initial_cents: i64) -> Account {
 
 **Returns:** `Account`
 
-*Defined at line 39*
+*Defined at line 37*
 
 ---
 
@@ -83,7 +83,7 @@ pub fn Account_deposit(acc: Account, amount: Money) -> Account {
 
 **Returns:** `Account`
 
-*Defined at line 49*
+*Defined at line 48*
 
 ---
 
@@ -100,7 +100,7 @@ pub fn Account_withdraw(acc: Account, withdraw_cents: i64) -> (Account, Money) {
 
 **Returns:** `(Account, Money)`
 
-*Defined at line 59*
+*Defined at line 62*
 
 ---
 
@@ -118,7 +118,7 @@ pub fn Account_transfer(from: Account, to: Account, amount_cents: i64) -> (Accou
 
 **Returns:** `(Account, Account)`
 
-*Defined at line 71*
+*Defined at line 86*
 
 ---
 
@@ -135,7 +135,7 @@ pub fn Account_accrue_interest(acc: Account, rate_bps: i64) -> Account {
 
 **Returns:** `Account`
 
-*Defined at line 88*
+*Defined at line 106*
 
 ---
 
@@ -151,7 +151,7 @@ pub fn Account_balance_cents(acc: Account) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 97*
+*Defined at line 117*
 
 ---
 
@@ -167,7 +167,7 @@ pub fn Account_id(acc: Account) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 103*
+*Defined at line 123*
 
 ---
 
@@ -185,7 +185,7 @@ pub fn Account_print(acc: Account) -> void {
 
 **Returns:** `void`
 
-*Defined at line 108*
+*Defined at line 128*
 
 ---
 
@@ -197,7 +197,7 @@ Account state constants.
 pub const ACCOUNT_STATE_ACTIVE: i64  = 0;
 ```
 
-*Defined at line 142*
+*Defined at line 162*
 
 ---
 
@@ -207,7 +207,7 @@ pub const ACCOUNT_STATE_ACTIVE: i64  = 0;
 pub const ACCOUNT_STATE_FROZEN: i64  = 1;
 ```
 
-*Defined at line 143*
+*Defined at line 162*
 
 ---
 
@@ -217,7 +217,7 @@ pub const ACCOUNT_STATE_FROZEN: i64  = 1;
 pub const ACCOUNT_STATE_CLOSED: i64  = 2;
 ```
 
-*Defined at line 144*
+*Defined at line 162*
 
 ---
 
@@ -234,7 +234,7 @@ pub struct AccountActive {
 | `id` | `i64` |
 | `balance` | `Money` |
 
-*Defined at line 148*
+*Defined at line 164*
 
 ---
 
@@ -251,7 +251,7 @@ pub struct AccountFrozen {
 | `id` | `i64` |
 | `balance` | `Money` |
 
-*Defined at line 155*
+*Defined at line 170*
 
 ---
 
@@ -268,7 +268,7 @@ pub struct AccountClosed {
 | `id` | `i64` |
 | `balance` | `Money` |
 
-*Defined at line 162*
+*Defined at line 176*
 
 ---
 
@@ -287,7 +287,7 @@ pub fn AccountActive_open(id: i64, initial_cents: i64) -> AccountActive {
 
 **Returns:** `AccountActive`
 
-*Defined at line 170*
+*Defined at line 184*
 
 ---
 
@@ -304,7 +304,7 @@ pub fn AccountActive_deposit(acc: AccountActive, amount: Money) -> AccountActive
 
 **Returns:** `AccountActive`
 
-*Defined at line 176*
+*Defined at line 191*
 
 ---
 
@@ -321,7 +321,7 @@ pub fn AccountActive_withdraw(acc: AccountActive, withdraw_cents: i64) -> (Accou
 
 **Returns:** `(AccountActive, Money)`
 
-*Defined at line 183*
+*Defined at line 202*
 
 ---
 
@@ -336,7 +336,7 @@ pub fn AccountActive_transfer(from: AccountActive, to: AccountActive,
 - `from`: `AccountActive`
 - `to`: `AccountActive`
 
-*Defined at line 192*
+*Defined at line 215*
 
 ---
 
@@ -352,7 +352,7 @@ pub fn AccountActive_freeze(acc: AccountActive) -> AccountFrozen {
 
 **Returns:** `AccountFrozen`
 
-*Defined at line 203*
+*Defined at line 228*
 
 ---
 
@@ -368,7 +368,7 @@ pub fn AccountActive_close(acc: AccountActive) -> AccountClosed {
 
 **Returns:** `AccountClosed`
 
-*Defined at line 209*
+*Defined at line 235*
 
 ---
 
@@ -384,7 +384,7 @@ pub fn AccountActive_balance_cents(acc: AccountActive) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 215*
+*Defined at line 243*
 
 ---
 
@@ -400,7 +400,7 @@ pub fn AccountActive_id(acc: AccountActive) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 221*
+*Defined at line 249*
 
 ---
 
@@ -416,7 +416,7 @@ pub fn AccountFrozen_unfreeze(acc: AccountFrozen) -> AccountActive {
 
 **Returns:** `AccountActive`
 
-*Defined at line 232*
+*Defined at line 259*
 
 ---
 
@@ -432,7 +432,7 @@ pub fn AccountFrozen_close(acc: AccountFrozen) -> AccountClosed {
 
 **Returns:** `AccountClosed`
 
-*Defined at line 238*
+*Defined at line 266*
 
 ---
 
@@ -448,7 +448,7 @@ pub fn AccountFrozen_balance_cents(acc: AccountFrozen) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 244*
+*Defined at line 274*
 
 ---
 
@@ -464,7 +464,7 @@ pub fn AccountFrozen_id(acc: AccountFrozen) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 250*
+*Defined at line 280*
 
 ---
 
@@ -480,7 +480,7 @@ pub fn AccountClosed_balance_cents(acc: AccountClosed) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 261*
+*Defined at line 291*
 
 ---
 
@@ -496,7 +496,7 @@ pub fn AccountClosed_id(acc: AccountClosed) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 267*
+*Defined at line 297*
 
 ---
 
@@ -512,7 +512,7 @@ pub fn account_state_name(state: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 273*
+*Defined at line 302*
 
 ---
 

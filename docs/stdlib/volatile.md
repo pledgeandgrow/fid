@@ -27,7 +27,7 @@ pub struct Volatile {
 |------|------|
 | `addr` | `i64` |
 
-*Defined at line 29*
+*Defined at line 35*
 
 ---
 
@@ -37,7 +37,7 @@ pub struct Volatile {
 impl Volatile {
 ```
 
-*Defined at line 33*
+*Defined at line 35*
 
 ---
 
@@ -54,7 +54,7 @@ pub fn ptr_add(ptr: i64, n: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 95*
+*Defined at line 116*
 
 ---
 
@@ -71,7 +71,7 @@ pub fn ptr_offset(ptr: i64, n: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 100*
+*Defined at line 121*
 
 ---
 
@@ -87,7 +87,7 @@ pub fn ptr_read_volatile(ptr: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 105*
+*Defined at line 128*
 
 ---
 
@@ -104,7 +104,7 @@ pub fn ptr_write_volatile(ptr: i64, value: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 110*
+*Defined at line 135*
 
 ---
 
@@ -120,7 +120,7 @@ pub fn ptr_read_volatile8(ptr: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 115*
+*Defined at line 142*
 
 ---
 
@@ -137,7 +137,7 @@ pub fn ptr_write_volatile8(ptr: i64, value: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 120*
+*Defined at line 149*
 
 ---
 
@@ -153,7 +153,7 @@ pub fn ptr_read_volatile32(ptr: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 125*
+*Defined at line 156*
 
 ---
 
@@ -170,7 +170,7 @@ pub fn ptr_write_volatile32(ptr: i64, value: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 130*
+*Defined at line 163*
 
 ---
 
@@ -186,7 +186,7 @@ pub fn ptr_read(ptr: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 135*
+*Defined at line 171*
 
 ---
 
@@ -203,7 +203,7 @@ pub fn ptr_write(ptr: i64, value: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 141*
+*Defined at line 184*
 
 ---
 

@@ -67,7 +67,7 @@ pub fn time_from_timestamp(ts: i64) -> LogicalTime {
 
 **Returns:** `LogicalTime`
 
-*Defined at line 28*
+*Defined at line 31*
 
 ---
 
@@ -88,7 +88,7 @@ pub fn time_new(year: i64, month: i64, day: i64, hour: i64, minute: i64, second:
 
 **Returns:** `LogicalTime`
 
-*Defined at line 36*
+*Defined at line 46*
 
 ---
 
@@ -106,7 +106,7 @@ pub fn time_from_date(year: i64, month: i64, day: i64) -> LogicalTime {
 
 **Returns:** `LogicalTime`
 
-*Defined at line 67*
+*Defined at line 82*
 
 ---
 
@@ -122,7 +122,7 @@ pub fn time_get_year(t: LogicalTime) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 105*
+*Defined at line 131*
 
 ---
 
@@ -138,7 +138,7 @@ pub fn time_get_month(t: LogicalTime) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 113*
+*Defined at line 141*
 
 ---
 
@@ -154,7 +154,7 @@ pub fn time_get_day(t: LogicalTime) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 121*
+*Defined at line 151*
 
 ---
 
@@ -170,7 +170,7 @@ pub fn time_get_hour(t: LogicalTime) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 129*
+*Defined at line 161*
 
 ---
 
@@ -186,7 +186,7 @@ pub fn time_get_minute(t: LogicalTime) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 140*
+*Defined at line 174*
 
 ---
 
@@ -202,7 +202,7 @@ pub fn time_get_second(t: LogicalTime) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 151*
+*Defined at line 187*
 
 ---
 
@@ -218,7 +218,7 @@ pub fn time_get_weekday(t: LogicalTime) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 162*
+*Defined at line 201*
 
 ---
 
@@ -235,7 +235,7 @@ pub fn time_add_seconds(t: LogicalTime, seconds: i64) -> LogicalTime {
 
 **Returns:** `LogicalTime`
 
-*Defined at line 184*
+*Defined at line 226*
 
 ---
 
@@ -252,7 +252,7 @@ pub fn time_sub_seconds(t: LogicalTime, seconds: i64) -> LogicalTime {
 
 **Returns:** `LogicalTime`
 
-*Defined at line 190*
+*Defined at line 237*
 
 ---
 
@@ -269,7 +269,7 @@ pub fn time_add_minutes(t: LogicalTime, minutes: i64) -> LogicalTime {
 
 **Returns:** `LogicalTime`
 
-*Defined at line 196*
+*Defined at line 247*
 
 ---
 
@@ -286,7 +286,7 @@ pub fn time_add_hours(t: LogicalTime, hours: i64) -> LogicalTime {
 
 **Returns:** `LogicalTime`
 
-*Defined at line 202*
+*Defined at line 257*
 
 ---
 
@@ -303,7 +303,7 @@ pub fn time_add_days(t: LogicalTime, days: i64) -> LogicalTime {
 
 **Returns:** `LogicalTime`
 
-*Defined at line 208*
+*Defined at line 268*
 
 ---
 
@@ -320,7 +320,7 @@ pub fn time_diff_seconds(a: LogicalTime, b: LogicalTime) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 214*
+*Defined at line 280*
 
 ---
 
@@ -337,7 +337,7 @@ pub fn time_diff_days(a: LogicalTime, b: LogicalTime) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 220*
+*Defined at line 290*
 
 ---
 
@@ -354,7 +354,7 @@ pub fn time_before(a: LogicalTime, b: LogicalTime) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 228*
+*Defined at line 300*
 
 ---
 
@@ -371,7 +371,7 @@ pub fn time_after(a: LogicalTime, b: LogicalTime) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 234*
+*Defined at line 308*
 
 ---
 
@@ -388,7 +388,7 @@ pub fn time_eq(a: LogicalTime, b: LogicalTime) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 240*
+*Defined at line 316*
 
 ---
 
@@ -405,7 +405,7 @@ pub fn time_before_eq(a: LogicalTime, b: LogicalTime) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 246*
+*Defined at line 325*
 
 ---
 
@@ -421,7 +421,7 @@ pub fn time_to_iso(t: LogicalTime) -> str {
 
 **Returns:** `str`
 
-*Defined at line 282*
+*Defined at line 361*
 
 ---
 
@@ -437,7 +437,7 @@ pub fn time_to_date_string(t: LogicalTime) -> str {
 
 **Returns:** `str`
 
-*Defined at line 307*
+*Defined at line 388*
 
 ---
 
@@ -453,7 +453,7 @@ pub fn is_leap_year(year: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 324*
+*Defined at line 409*
 
 ---
 
@@ -469,7 +469,7 @@ pub fn time_get_day_of_year(t: LogicalTime) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 333*
+*Defined at line 427*
 
 ---
 
@@ -486,7 +486,7 @@ pub fn days_in_month(year: i64, month: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 340*
+*Defined at line 438*
 
 ---
 
@@ -501,7 +501,7 @@ pub fn clock_now_ns() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 369*
+*Defined at line 491*
 
 ---
 
@@ -516,7 +516,7 @@ pub fn clock_now_us() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 375*
+*Defined at line 498*
 
 ---
 
@@ -531,7 +531,7 @@ pub fn clock_now_ms() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 381*
+*Defined at line 511*
 
 ---
 
@@ -550,7 +550,7 @@ pub fn clock_elapsed_ns(start: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 387*
+*Defined at line 523*
 
 ---
 
@@ -568,7 +568,7 @@ pub fn clock_elapsed_us(start: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 392*
+*Defined at line 528*
 
 ---
 
@@ -586,7 +586,7 @@ pub fn clock_elapsed_ms(start: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 397*
+*Defined at line 533*
 
 ---
 

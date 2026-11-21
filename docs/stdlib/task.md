@@ -28,7 +28,7 @@ pub fn task_go(name: str, arg: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 19*
+*Defined at line 31*
 
 ---
 
@@ -42,7 +42,7 @@ pub fn task_yield() -> void {
 
 **Returns:** `void`
 
-*Defined at line 24*
+*Defined at line 36*
 
 ---
 
@@ -57,7 +57,7 @@ pub fn task_run() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 30*
+*Defined at line 42*
 
 ---
 
@@ -75,7 +75,7 @@ pub fn task_sleep(ms: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 35*
+*Defined at line 47*
 
 ---
 
@@ -95,7 +95,7 @@ pub fn task_wait_read(fd: i64, timeout_ms: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 41*
+*Defined at line 53*
 
 ---
 
@@ -114,7 +114,7 @@ pub fn task_wait_write(fd: i64, timeout_ms: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 46*
+*Defined at line 58*
 
 ---
 
@@ -132,7 +132,7 @@ pub fn task_detach(t: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 51*
+*Defined at line 63*
 
 ---
 
@@ -150,7 +150,7 @@ pub fn task_done(t: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 56*
+*Defined at line 68*
 
 ---
 
@@ -168,7 +168,7 @@ pub fn task_result(t: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 61*
+*Defined at line 73*
 
 ---
 

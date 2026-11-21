@@ -24,19 +24,30 @@ pub struct Particle {
 
 | Name | Type |
 |------|------|
-| `x` | `f64, pub y: f64` |
-| `vx` | `f64, pub vy: f64` |
-| `life` | `f64,             // remaining lifetime` |
-| `max_life` | `f64,         // initial lifetime` |
-| `size` | `f64,             // current size` |
+| `x` | `f64` |
+| `y` | `f64` |
+| `vx` | `f64` |
+| `vy` | `f64` |
+| `life` | `f64` |
+| `max_life` | `f64` |
+| `size` | `f64` |
 | `start_size` | `f64` |
 | `end_size` | `f64` |
-| `r` | `i64, pub g: i64, pub b: i64, pub a: i64` |
-| `start_r` | `i64, pub start_g: i64, pub start_b: i64, pub start_a: i64` |
-| `end_r` | `i64, pub end_g: i64, pub end_b: i64, pub end_a: i64` |
+| `r` | `i64` |
+| `g` | `i64` |
+| `b` | `i64` |
+| `a` | `i64` |
+| `start_r` | `i64` |
+| `start_g` | `i64` |
+| `start_b` | `i64` |
+| `start_a` | `i64` |
+| `end_r` | `i64` |
+| `end_g` | `i64` |
+| `end_b` | `i64` |
+| `end_a` | `i64` |
 | `active` | `bool` |
 
-*Defined at line 28*
+*Defined at line 25*
 
 ---
 
@@ -50,23 +61,32 @@ pub struct ParticleEmitter {
 
 | Name | Type |
 |------|------|
-| `x` | `f64, pub y: f64,       // emitter position` |
-| `rate` | `f64,                 // particles per second (0 = burst only)` |
-| `lifetime` | `f64,            // particle lifetime in seconds` |
-| `spread` | `f64,              // angle spread in radians (0 = directional)` |
-| `angle` | `f64,               // emission direction (radians)` |
-| `speed_min` | `f64, pub speed_max: f64` |
-| `size_start` | `f64, pub size_end: f64` |
-| `gravity` | `f64,              // downward acceleration` |
-| `drag` | `f64,                 // velocity damping (0 = none, 1 = stop)` |
-| `color_start_r` | `i64, pub color_start_g: i64, pub color_start_b: i64, pub color_start_a: i64` |
-| `color_end_r` | `i64, pub color_end_g: i64, pub color_end_b: i64, pub color_end_a: i64` |
+| `x` | `f64` |
+| `y` | `f64` |
+| `rate` | `f64` |
+| `lifetime` | `f64` |
+| `spread` | `f64` |
+| `angle` | `f64` |
+| `speed_min` | `f64` |
+| `speed_max` | `f64` |
+| `size_start` | `f64` |
+| `size_end` | `f64` |
+| `gravity` | `f64` |
+| `drag` | `f64` |
+| `color_start_r` | `i64` |
+| `color_start_g` | `i64` |
+| `color_start_b` | `i64` |
+| `color_start_a` | `i64` |
+| `color_end_r` | `i64` |
+| `color_end_g` | `i64` |
+| `color_end_b` | `i64` |
+| `color_end_a` | `i64` |
 | `particles` | `Vec<Particle>` |
 | `max_particles` | `i64` |
-| `emit_accum` | `f64,          // fractional emission accumulator` |
+| `emit_accum` | `f64` |
 | `active` | `bool` |
 
-*Defined at line 44*
+*Defined at line 55*
 
 ---
 
@@ -84,7 +104,7 @@ pub fn particle_emitter_create(max_particles: i64) -> ParticleEmitter {
 
 **Returns:** `ParticleEmitter`
 
-*Defined at line 63*
+*Defined at line 103*
 
 ---
 
@@ -102,7 +122,7 @@ pub fn particle_emit_one(em: &mut ParticleEmitter) -> void {
 
 **Returns:** `void`
 
-*Defined at line 96*
+*Defined at line 119*
 
 ---
 
@@ -121,7 +141,7 @@ pub fn particle_emitter_burst(em: &mut ParticleEmitter, count: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 142*
+*Defined at line 167*
 
 ---
 
@@ -140,7 +160,7 @@ pub fn particle_emitter_update(em: &mut ParticleEmitter, dt: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 151*
+*Defined at line 176*
 
 ---
 
@@ -158,7 +178,7 @@ pub fn particle_emitter_count(em: &ParticleEmitter) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 200*
+*Defined at line 231*
 
 ---
 
@@ -178,7 +198,7 @@ pub fn particle_emitter_set_pos(em: &mut ParticleEmitter, x: f64, y: f64) -> voi
 
 **Returns:** `void`
 
-*Defined at line 211*
+*Defined at line 244*
 
 ---
 
@@ -196,7 +216,7 @@ pub fn particle_emitter_stop(em: &mut ParticleEmitter) -> void {
 
 **Returns:** `void`
 
-*Defined at line 217*
+*Defined at line 250*
 
 ---
 
@@ -214,7 +234,7 @@ pub fn particle_emitter_start(em: &mut ParticleEmitter) -> void {
 
 **Returns:** `void`
 
-*Defined at line 222*
+*Defined at line 255*
 
 ---
 
@@ -232,7 +252,7 @@ pub fn particle_emitter_clear(em: &mut ParticleEmitter) -> void {
 
 **Returns:** `void`
 
-*Defined at line 227*
+*Defined at line 260*
 
 ---
 

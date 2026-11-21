@@ -1,10 +1,30 @@
 # compiler.fd — pipeline orchestrator
 
+> **Nov 21:** 13,483 lines (4,502 on Nov 9). It imports 28 compiler
+> modules (39 on Nov 9): `codegen`, `pir`, `opt`, `regalloc`,
+> `codegen_x64/arm64/riscv`, `peephole`, `runtime_*` and `pe` are gone,
+> `ast_ser`, `ir_ser`, `build_info` are new. `build_executable` was removed
+> with the PIR path (MI18, Nov 17); `build_x86_linux` (`build-x86`) still
+> uses elf64 and linker. Fixed Nov 15: `--borrowck=warn` prints the
+> warnings (known-bugs 2g.9), `--debug` makes `@cfg(debug)` hold
+> (`g_cfg_debug`, 2g.14), a function two imports define is renamed per
+> module (2g.37). Still true: the unconditional `[build]`/`[prof]` stderr
+> lines; partly fixed: a type error in an imported module names that
+> module (2g.27). New: `ccompile --fuzz-cov` panics with a double free in
+> `build_program_with_path_borrowck` (2g.83). Also new here: the
+> checked-library AST artifact and the import cache on disk (CS2, CB1; see
+> ast_ser.md). In the working tree (uncommitted, Nov 21): after
+> `substitute`, `build_program_with_path_borrowck` returns
+> `comptime_subst_errors()` through `enrich_errors` (:5443-5457) — an
+> explicit `comptime` that cannot be evaluated is a compile error again
+> (`FID_CT_FALLBACK=1` keeps the warn-and-run behavior; comptime_eval.md).
+> Line numbers below are from Nov 9.
+
 > **Re-audited 2026-11-09** against the working tree (4,502 lines; 2,841 at
 > the 2026-10-22/23 audit). Probes with the latest self-hosted binary (s18).
 
 - **Path:** `compiler/compiler.fd`
-- **LOC:** 4,502
+- **LOC:** 13,483 (2026-11-21; 4,502 on Nov 9)
 - **Role:** the front-end driver and the backend entry points. Owns stdlib
   and runtime loading, import resolution, program merging, the AST passes
   (@cfg, @derive, `==` synthesis, desugaring, default trait methods,
@@ -90,7 +110,7 @@ methods, merge, type check, escape, secrecy, borrow check, monomorphize.
 
 ## Findings — verified live (s18 probes)
 
-### HIGH — `--borrowck=warn` prints nothing (STILL TRUE)
+### HIGH — `--borrowck=warn` prints nothing (STILL TRUE on Nov 9; FIXED Nov 15, 2g.9)
 
 compiler.fd:1734-1748 (and :908-921 in no-std) read `bc.errors`;
 borrowck.fd:1357 puts warn-mode violations in `bc.warnings`. Probe:
@@ -103,7 +123,7 @@ E.g. :1131, :1204-1234, :1291-1311 (one line per import), :1617-1794,
 :1809-1849. Seen on every probe. `--time` (`time_mark`/`time_report`,
 :1053-1081) is the gated replacement, but the old lines stay.
 
-### LOW — `@cfg(debug)` never holds (NEW)
+### LOW — `@cfg(debug)` never holds (NEW on Nov 9; FIXED Nov 15, 2g.14)
 
 `check_cfg` is always called with `is_debug = false` (:2737-2756):
 `@cfg(debug)` items are always dropped and `@cfg(release)` kept, also for

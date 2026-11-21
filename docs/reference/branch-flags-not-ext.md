@@ -59,3 +59,11 @@ It also prints the spill effect of `ng_fuse_xblock`, whose longer ranges
 of the compared values may spill. It sums `[stats] spilled / reloads`
 over the brflags tests and `bench/fides/{fib,loop,sieve}.fd`, with and
 without `FID_NAT_OFF=brxblock`.
+
+Nov 21 (roadmap RA19 check, fid built from a self-hosted stage 0): the two
+test programs print the right output, and with `FID_IROPT_OFF=inline,inline2`
+`not_if`, `and_if`, `or_if` and the `xb_n*` cases lose their SETCCs. In a
+default build both check scripts fail, because the functions are inlined;
+`ext_if`, `xb_ext` and `xb` keep their SETCCs, and the x86-64 / `--nat`
+`FID_VERIFY=1` builds of brflags2 hit the argument-register check
+(known-bugs 2g.88).

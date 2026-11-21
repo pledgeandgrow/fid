@@ -5,7 +5,14 @@
 > across function boundaries.
 
 - **Path:** `compiler/fmt.fd`
-- **LOC:** 1,179 (Rust `src/fmt.rs`: 1,236)
+- **LOC:** 2,196 (2026-11-21; 1,179 on Nov 9; Rust `src/fmt.rs`: 1,236).
+  Nov 21: the three corruption bugs below are fixed. Nov 15 (known-bugs
+  2g.6): a generic `<` must close with only type tokens inside and no name
+  after, `>>` closes two, and `fid fmt` refuses to write when the tokens
+  would change (`fmt_same_tokens`). Nov 19 (2g.62): prefix operators stay
+  on their operand (no more `& v`) and a declaration after an annotation on
+  its own line starts cleanly. lsp.fd imports it too now (formatting).
+  Line numbers below are from Nov 9.
 - **Role:** token-based (not AST) formatter: `fmt_tokenize` → `need_space` → `format_source`.
   Keeps comments and blank lines, 4-space indent from brace depth.
 

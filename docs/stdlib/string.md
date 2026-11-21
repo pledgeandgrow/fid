@@ -31,17 +31,17 @@ Join a Vec of strings with a separator.
 str_join(["a", "b", "c"], "-") → "a-b-c"
 
 ```fides
-pub fn str_join(parts: Vec, sep: str) -> str {
+pub fn str_join(parts: Vec<str>, sep: str) -> str {
 ```
 
 **Parameters:**
 
-- `parts`: `Vec`
+- `parts`: `Vec<str>`
 - `sep`: `str`
 
 **Returns:** `str`
 
-*Defined at line 20*
+*Defined at line 25*
 
 ---
 
@@ -52,17 +52,17 @@ Concatenates groups of 1000 parts, then concatenates the groups.
 This reduces the number of large intermediate strings.
 
 ```fides
-pub fn str_join_fast(parts: Vec, sep: str) -> str {
+pub fn str_join_fast(parts: Vec<str>, sep: str) -> str {
 ```
 
 **Parameters:**
 
-- `parts`: `Vec`
+- `parts`: `Vec<str>`
 - `sep`: `str`
 
 **Returns:** `str`
 
-*Defined at line 36*
+*Defined at line 63*
 
 ---
 
@@ -71,17 +71,17 @@ pub fn str_join_fast(parts: Vec, sep: str) -> str {
 Join a Vec of i64 values with a separator.
 
 ```fides
-pub fn str_join_ints(nums: Vec, sep: str) -> str {
+pub fn str_join_ints(nums: Vec<i64>, sep: str) -> str {
 ```
 
 **Parameters:**
 
-- `nums`: `Vec`
+- `nums`: `Vec<i64>`
 - `sep`: `str`
 
 **Returns:** `str`
 
-*Defined at line 56*
+*Defined at line 94*
 
 ---
 
@@ -99,7 +99,7 @@ pub fn str_reverse(s: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 71*
+*Defined at line 114*
 
 ---
 
@@ -117,7 +117,7 @@ pub fn str_capitalize(s: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 84*
+*Defined at line 132*
 
 ---
 
@@ -135,7 +135,7 @@ pub fn str_title(s: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 101*
+*Defined at line 156*
 
 ---
 
@@ -156,7 +156,7 @@ pub fn str_pad_left(s: str, width: i64, ch: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 129*
+*Defined at line 190*
 
 ---
 
@@ -177,7 +177,7 @@ pub fn str_pad_right(s: str, width: i64, ch: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 138*
+*Defined at line 204*
 
 ---
 
@@ -198,7 +198,7 @@ pub fn str_center(s: str, width: i64, ch: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 147*
+*Defined at line 218*
 
 ---
 
@@ -217,7 +217,7 @@ pub fn str_count(s: str, sub: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 162*
+*Defined at line 239*
 
 ---
 
@@ -236,7 +236,7 @@ pub fn str_count_char(s: str, ch: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 180*
+*Defined at line 262*
 
 ---
 
@@ -256,7 +256,7 @@ pub fn str_find_nth(s: str, sub: str, n: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 193*
+*Defined at line 280*
 
 ---
 
@@ -274,7 +274,7 @@ pub fn str_is_blank(s: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 214*
+*Defined at line 309*
 
 ---
 
@@ -292,7 +292,7 @@ pub fn str_is_numeric(s: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 226*
+*Defined at line 325*
 
 ---
 
@@ -310,7 +310,7 @@ pub fn str_is_alpha(s: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 239*
+*Defined at line 344*
 
 ---
 
@@ -328,7 +328,7 @@ pub fn str_is_alphanumeric(s: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 252*
+*Defined at line 363*
 
 ---
 
@@ -347,7 +347,7 @@ pub fn str_strip_char(s: str, ch: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 268*
+*Defined at line 384*
 
 ---
 
@@ -366,7 +366,7 @@ pub fn str_remove_char(s: str, ch: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 282*
+*Defined at line 400*
 
 ---
 
@@ -384,7 +384,7 @@ pub fn bool_to_str(b: bool) -> str {
 
 **Returns:** `str`
 
-*Defined at line 298*
+*Defined at line 420*
 
 ---
 
@@ -403,7 +403,7 @@ pub fn int_to_str_padded(n: i64, width: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 304*
+*Defined at line 431*
 
 ---
 
@@ -421,7 +421,7 @@ pub fn int_to_hex(n: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 310*
+*Defined at line 446*
 
 ---
 
@@ -439,7 +439,7 @@ pub fn int_to_bin(n: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 330*
+*Defined at line 484*
 
 ---
 

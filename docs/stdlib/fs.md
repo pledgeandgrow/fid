@@ -32,7 +32,7 @@ pub fn fs_exists(path: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 43*
+*Defined at line 22*
 
 ---
 
@@ -50,7 +50,7 @@ pub fn fs_file_size(path: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 51*
+*Defined at line 28*
 
 ---
 
@@ -68,7 +68,7 @@ pub fn fs_read_text(path: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 63*
+*Defined at line 39*
 
 ---
 
@@ -77,16 +77,16 @@ pub fn fs_read_text(path: str) -> str {
 Read a file as a Vec of bytes. Returns empty Vec if file doesn't exist.
 
 ```fides
-pub fn fs_read_bytes(path: str) -> Vec {
+pub fn fs_read_bytes(path: str) -> Vec<i64> {
 ```
 
 **Parameters:**
 
 - `path`: `str`
 
-**Returns:** `Vec`
+**Returns:** `Vec<i64>`
 
-*Defined at line 88*
+*Defined at line 67*
 
 ---
 
@@ -95,16 +95,16 @@ pub fn fs_read_bytes(path: str) -> Vec {
 Read a file as lines. Returns empty Vec if file doesn't exist.
 
 ```fides
-pub fn fs_read_lines(path: str) -> Vec {
+pub fn fs_read_lines(path: str) -> Vec<str> {
 ```
 
 **Parameters:**
 
 - `path`: `str`
 
-**Returns:** `Vec`
+**Returns:** `Vec<str>`
 
-*Defined at line 112*
+*Defined at line 87*
 
 ---
 
@@ -123,7 +123,7 @@ pub fn fs_write_text(path: str, content: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 121*
+*Defined at line 110*
 
 ---
 
@@ -132,17 +132,17 @@ pub fn fs_write_text(path: str, content: str) -> bool {
 Write bytes to a file. Overwrites if exists. Returns true on success.
 
 ```fides
-pub fn fs_write_bytes(path: str, bytes: Vec) -> bool {
+pub fn fs_write_bytes(path: str, bytes: Vec<i64>) -> bool {
 ```
 
 **Parameters:**
 
 - `path`: `str`
-- `bytes`: `Vec`
+- `bytes`: `Vec<i64>`
 
 **Returns:** `bool`
 
-*Defined at line 137*
+*Defined at line 122*
 
 ---
 
@@ -161,7 +161,7 @@ pub fn fs_append_text(path: str, content: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 152*
+*Defined at line 134*
 
 ---
 
@@ -179,7 +179,7 @@ pub fn fs_delete(path: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 170*
+*Defined at line 202*
 
 ---
 
@@ -198,26 +198,27 @@ pub fn fs_rename(old_path: str, new_path: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 175*
+*Defined at line 208*
 
 ---
 
 ## fs_list_dir
 
-List files in a directory. Returns a Vec of file names.
+List entries in a directory (names only, no "." or "..").
 Returns empty Vec if directory doesn't exist or can't be opened.
+(Under a fake file system the names are sorted.)
 
 ```fides
-pub fn fs_list_dir(path: str) -> Vec {
+pub fn fs_list_dir(path: str) -> Vec<str> {
 ```
 
 **Parameters:**
 
 - `path`: `str`
 
-**Returns:** `Vec`
+**Returns:** `Vec<str>`
 
-*Defined at line 183*
+*Defined at line 218*
 
 ---
 
@@ -235,7 +236,7 @@ pub fn fs_is_dir(path: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 200*
+*Defined at line 228*
 
 ---
 
@@ -253,7 +254,7 @@ pub fn fs_is_file(path: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 208*
+*Defined at line 234*
 
 ---
 
@@ -272,7 +273,7 @@ pub fn fs_join(a: str, b: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 215*
+*Defined at line 484*
 
 ---
 
@@ -291,7 +292,7 @@ pub fn fs_path_in(dir: str, filename: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 230*
+*Defined at line 555*
 
 ---
 

@@ -31,10 +31,12 @@ pub struct BroadAabb {
 | Name | Type |
 |------|------|
 | `id` | `i64` |
-| `min_x` | `f64, pub min_y: f64` |
-| `max_x` | `f64, pub max_y: f64` |
+| `min_x` | `f64` |
+| `min_y` | `f64` |
+| `max_x` | `f64` |
+| `max_y` | `f64` |
 
-*Defined at line 30*
+*Defined at line 27*
 
 ---
 
@@ -50,7 +52,7 @@ pub struct SpatialHashCell {
 |------|------|
 | `ids` | `Vec<i64>` |
 
-*Defined at line 38*
+*Defined at line 37*
 
 ---
 
@@ -69,7 +71,7 @@ pub struct SpatialHashGrid {
 | `cell_count` | `i64` |
 | `aabbs` | `Vec<BroadAabb>` |
 
-*Defined at line 42*
+*Defined at line 41*
 
 ---
 
@@ -87,7 +89,7 @@ pub fn spatial_hash_create(cell_size: f64) -> SpatialHashGrid {
 
 **Returns:** `SpatialHashGrid`
 
-*Defined at line 50*
+*Defined at line 60*
 
 ---
 
@@ -110,7 +112,7 @@ pub fn spatial_hash_insert(grid: &mut SpatialHashGrid, id: i64, min_x: f64, min_
 
 **Returns:** `void`
 
-*Defined at line 68*
+*Defined at line 77*
 
 ---
 
@@ -132,7 +134,7 @@ pub fn spatial_hash_query(grid: &SpatialHashGrid, min_x: f64, min_y: f64, max_x:
 
 **Returns:** `Vec<i64>`
 
-*Defined at line 101*
+*Defined at line 110*
 
 ---
 
@@ -150,7 +152,7 @@ pub fn spatial_hash_query_pairs(grid: &SpatialHashGrid) -> Vec<i64> {
 
 **Returns:** `Vec<i64>`
 
-*Defined at line 139*
+*Defined at line 151*
 
 ---
 
@@ -168,7 +170,7 @@ pub fn spatial_hash_clear(grid: &mut SpatialHashGrid) -> void {
 
 **Returns:** `void`
 
-*Defined at line 172*
+*Defined at line 188*
 
 ---
 
@@ -186,7 +188,7 @@ pub fn spatial_hash_count(grid: &SpatialHashGrid) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 184*
+*Defined at line 200*
 
 ---
 
@@ -204,7 +206,7 @@ pub struct SapEndpoint {
 | `value` | `f64` |
 | `is_min` | `bool,     // true = min endpoint, false = max` |
 
-*Defined at line 190*
+*Defined at line 206*
 
 ---
 
@@ -221,7 +223,7 @@ pub struct SweepAndPrune {
 | `endpoints` | `Vec<SapEndpoint>` |
 | `aabbs` | `Vec<BroadAabb>` |
 
-*Defined at line 196*
+*Defined at line 212*
 
 ---
 
@@ -233,7 +235,7 @@ pub fn sap_create() -> SweepAndPrune {
 
 **Returns:** `SweepAndPrune`
 
-*Defined at line 201*
+*Defined at line 217*
 
 ---
 
@@ -254,7 +256,7 @@ pub fn sap_insert(sap: &mut SweepAndPrune, id: i64, min_x: f64, max_x: f64) -> v
 
 **Returns:** `void`
 
-*Defined at line 209*
+*Defined at line 224*
 
 ---
 
@@ -272,7 +274,7 @@ pub fn sap_query_pairs(sap: &mut SweepAndPrune) -> Vec<i64> {
 
 **Returns:** `Vec<i64>`
 
-*Defined at line 242*
+*Defined at line 259*
 
 ---
 
@@ -290,7 +292,7 @@ pub fn sap_clear(sap: &mut SweepAndPrune) -> void {
 
 **Returns:** `void`
 
-*Defined at line 278*
+*Defined at line 295*
 
 ---
 
@@ -308,7 +310,7 @@ pub fn sap_count(sap: &SweepAndPrune) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 284*
+*Defined at line 301*
 
 ---
 
@@ -329,7 +331,7 @@ pub fn sap_update(sap: &mut SweepAndPrune, id: i64, min_x: f64, max_x: f64) -> v
 
 **Returns:** `void`
 
-*Defined at line 289*
+*Defined at line 306*
 
 ---
 

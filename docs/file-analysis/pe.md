@@ -1,5 +1,11 @@
 # pe.fd — old PIR-based PE / flat / multiboot writer + Win64 stub library
 
+> **Nov 21: dead.** Nothing imports it. `emit --boot` builds the kernel
+> through pe_ir since Nov 15 (`PEIR_BARE_BOOT`, release G1; main.fd), and
+> the PEIR_BARE_BOOT-off route to `generate_boot_binary` was removed with
+> the PIR path (MI18, Nov 17). 7,878 lines now. The callers below are as
+> of Nov 9.
+
 > **Re-audited 2026-11-09** against the current source, with live probes
 > (`s18.exe` and `release/fid.exe`, test files in a scratch folder). Since the
 > 10-23 audit the native Windows path moved to `compiler/pe_ir*.fd` (see
@@ -8,7 +14,7 @@
 > (`generate_pe`) and the flat writer (`generate_flat_binary`) have no callers.
 
 - **Path:** `compiler/pe.fd`
-- **LOC:** 6,857 (6,852 on 10-23). Last changed in git on Nov 3 (e655b58).
+- **LOC:** 7,878 (2026-11-21; 6,857 on Nov 9, 6,852 on 10-23).
 - **Role:** Takes the PIR L3 module, prints it as x86-64 assembly
   (`codegen_x64.generate_asm` + `peephole_optimize`), assembles it with
   `ElfEmitter`, then links the user code with a library of hand-encoded

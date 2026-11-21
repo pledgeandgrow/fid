@@ -46,8 +46,8 @@ cargo build --release
 
 # Rebuild the self-hosted compiler: 3 stages + fixpoint → release/fid.exe
 RELEASE=1 CC="zig cc" ./scripts/bootstrap.sh
-# or a single stage for development (dump-c + compile → release/fid.exe,
-# same name, no fixpoint check)
+# or a single stage for development (dump-c + compile → release/fid-dev.exe,
+# no fixpoint check; STAGE0=release/fid.exe for the fast -O2 split path)
 ./scripts/build-selfhost.sh
 
 # Build a native ELF64 executable on Linux (zero external tools needed)
@@ -67,28 +67,28 @@ cargo run -- test
 | Task | Use | Why |
 |------|-----|-----|
 | Writing and running Fides programs | `fid.exe` (self-hosted) or `fidesc.exe` | Both give the same output |
-| Native Windows .exe with no C compiler | `fidesc.exe emit` | The self-hosted native backend is not working yet |
+| Native Windows .exe with no C compiler | `fid.exe emit` | The self-hosted native backend (pe_ir) is the default; `fidesc.exe emit` is the frozen one |
 | Adding stdlib modules, tests | either; run `fidesc test` | The test harness is in the Rust compiler |
-| Changing `compiler/*.fd` | `fidesc.exe` (Rust) to build stage 1 | Then `RELEASE=1 scripts/bootstrap.sh` to check the fixpoint |
+| Changing `compiler/*.fd` | `fidesc.exe` (Rust) to build stage 1, or a self-hosted fid as `STAGE0` | Then `RELEASE=1 scripts/bootstrap.sh` to check the fixpoint. Nov 21: a fidesc-built stage 1 runs out of memory on the current tree (known-bugs 2g.79), so start from a self-hosted fid |
 | Adding new language features | `fidesc.exe` (Rust) first, then port to `compiler/*.fd` | New features need both compilers |
 
 ### CLI Commands
 
 | Command | Description |
 |---------|-------------|
-| `build <file.fd> -o <out>` | `fid`: same as `emit` (native PE on a Windows host; through C on other hosts without `--target`; `build --native` with the default target, the PIR path, crashes). `fidesc build --target x86-64\|arm64\|riscv64-linux\|x86-64-windows`: its own ELF64/PE path, tier 2–3. |
+| `build <file.fd> -o <out>` | `fid`: same as `emit` (native PE on a Windows host; on Linux and macOS the machine layer for the host, through C only for a program it rejects or with `--via-c`; `build --native` is the machine layer, nat_ir, since Nov 17). `fidesc build --target x86-64\|arm64\|riscv64-linux\|x86-64-windows`: its own ELF64/PE path, tier 2–3. |
 | `emit <file.fd> -o <out.exe> [--checked-alloc]` | **Native Windows executable**, no C compiler: IR → x86-64 machine code → PE. `--checked-alloc` puts every block on pages of its own (use after free and overruns fault; written Nov 4, not yet run on the suite). |
-| `emit <file.fd> -o <out.bin> --bare` | Bare-metal flat binary (`fid` since Nov 6: loaded at 0x10000, print to COM1; not yet run under QEMU) |
+| `emit <file.fd> -o <out.bin> --bare` | Bare-metal bootable image (`fid`: Multiboot, loaded at 0x100000 unless `--load <address>`, print to COM1; `--boot` is the same; the Bare-metal CI lane boots a `--bare` Multiboot kernel under QEMU, scripts/bare-qemu-test.sh) |
 | `ccompile <file.fd> -o <out>` | C codegen pipeline: lex → parse → typecheck → lower → C source → `gcc`/`clang` → executable |
 | `run <file.fd> [--leaks] [--checked-alloc]` | Interpret the IR (no external tools). `--leaks` / `--checked-alloc` run the program through C with the debug allocator. |
 | `check <file.fd>` | Type, borrow and escape checks only |
 | `qualify <file.fd> [-o out.json]` | Safety evidence as JSON: compiler and source hashes, check result, annotated functions, each rule with its tests ([safety-rules.md](safety-rules.md)). Always "NOT_QUALIFIED". |
 | `audit <file.fd> [--stdlib] [--strict]` | List the `unsafe` code a program reaches, with its `// SAFETY:` comments |
 | `ir <file.fd>` | Lex → parse → typecheck → lower → print SSA IR |
-| `pir <file.fd> [1\|2\|3\|all] [--opt]` | Lower to PIR (L1/L2/L3) and print; `--opt` runs optimization passes (panics in `fid`, Nov 9) |
-| `opt <file.fd> [pass1,pass2,...]` | Run PIR optimizer and print statistics (`fid` ignores the pass list and panics in `jump_thread_redirect`, Nov 9) |
-| `codegen <file.fd> --target <arch> [--peephole] [--elf\|--macho\|--coff <o>]` | Generate assembly for x86-64, ARM64, or RISC-V; optionally emit object files |
-| `wasm <file.fd> -o <out.wasm> [--wat]` | WebAssembly backend: PIR → WASM binary |
+| `pir <file.fd> [1\|2\|3\|all] [--opt]` | `fidesc`: lower to PIR (L1/L2/L3) and print; `--opt` runs optimization passes. `fid` has no PIR path since Nov 17 (MI18): `pir` only says where its views went |
+| `opt <file.fd> [pass1,pass2,...]` | `fidesc`: run the PIR optimizer and print statistics. `fid opt` prints the IR after the IR optimizer the machine layer runs |
+| `codegen <file.fd> --target <arch> [--peephole] [--elf\|--macho\|--coff <o>]` | Generate assembly for x86-64, ARM64, or RISC-V; optionally emit object files. In `fid` this is the machine layer's code (as `fid disasm` prints it) or its object file; `--peephole` is `fidesc`'s |
+| `wasm <file.fd> -o <out.wasm> [--wat]` | WebAssembly backend: PIR → WASM binary (`fidesc`); `fid wasm` (compiler/wasm.fd) goes from the IR to a WASI module |
 | `gpu <file.fd>` | SPIR-V GPU backend: PIR → SPIR-V binary |
 | `tokens <file.fd>` | Lex only — print token stream |
 | `ast <file.fd>` | Lex + parse — print AST tree |
@@ -103,9 +103,9 @@ cargo run -- test
 | `fmt <file.fd>` | Format a Fides source file |
 | `lint <file.fd>` | Lint checks (unused functions, unused imports) |
 | `bench <file.fd> [-n <count>] [--ccompile]` | Benchmark a file (interpreter or C native) |
-| `debug <file.fd>` | Interactive debugger (breakpoints, step, locals) |
-| `replay <trace.fdtrace>` | Replay a recorded execution trace |
-| `autopsy <file.fd>` | Native binary debug (ptrace-based, Linux only) |
+| `debug <file.fd>` | `fidesc` only: interactive debugger (breakpoints, step, locals) |
+| `replay <trace.fdtrace>` | Replay a recorded execution trace (`fid replay` runs a `fid run --record` recording again) |
+| `autopsy <file.fd>` | `fidesc` only: native binary debug (ptrace-based, Linux only) |
 | `version` | Print compiler version |
 
 ---
@@ -490,24 +490,25 @@ fid/
 │   ├── pe_ir.fd / pe_ir_enc.fd / pe_ir_stubs.fd  # Native Windows x64 (default `emit`)
 │   ├── nat_ir.fd / nat_enc.fd  # Machine layer: Linux AArch64/RISC-V/x86-64, `--nat` Windows
 │   ├── fmt.fd / lsp.fd / json.fd / scribe.fd / veil.fd / ark.fd / cparser.fd  # Tools
+│   ├── x86.fd / elf64.fd / linker.fd  # `build-x86` (x86 stack-machine backend)
 │   ├── pir.fd / opt.fd / regalloc.fd / peephole.fd / codegen_x64.fd / codegen_arm64.fd / codegen_riscv.fd
-│   ├── elf64.fd / linker.fd / coff.fd / macho.fd / x86.fd / pe.fd / runtime_*.fd / *_enc.fd  # Old PIR path
-│   ├── wasm.fd / gpu.fd    # Experimental back ends (output does not validate)
+│   ├── coff.fd / macho.fd / pe.fd / runtime_linux|arm64|riscv.fd / arm64_enc.fd / riscv_enc.fd  # Old PIR path (not reached since Nov 17, MI18)
+│   ├── wasm.fd / gpu.fd    # `fid wasm` (valid WASI modules since Nov 15), `fid gpu` (SPIR-V/PTX, experimental)
 │   └── autograd.fd / codegen.fd / debugger.fd / diag.fd / embedded.fd / flat_ast.fd / hotreload.fd / native_debugger.fd / runtime.fd  # Not used
-├── src/                    # Rust bootstrap reference (57 files, ~112K lines)
+├── src/                    # Rust bootstrap reference (57 files, ~114K lines)
 │   ├── main.rs             # CLI entry point (used to generate first-generation C)
 │   ├── escape.rs           # Reference escape analysis (Rust twin of escape.fd)
 │   ├── dwarf.rs            # DWARF debug info (started)
 │   ├── ...                 # Mirrors compiler/*.fd in Rust (reference implementation)
 │   └── bin/                # Binary entry points (fidesc, ark, scribe, veil)
-├── stdlib/                 # 146 standard library modules (~51K lines)
+├── stdlib/                 # 403 standard library modules (~259K lines; + pe_runtime/, linux_runtime/)
 │   ├── core.fd             # Option, Result, println, assert, max, min, abs, clamp
 │   ├── vec.fd              # Vec<T> with iterator adapters
 │   ├── rc.fd               # Rc<T> / Arc<T> reference counting
-│   └── ...                 # 101 more modules (math, banking, medical, tensor, game/*)
+│   └── ...                 # 399 more modules (math, banking, medical, tensor, games, protocols, ...)
 │                           #   kernel.fd + uefi.fd moved to the fides-os project
-├── tests/                  # 348 .fd test files (302 bootstrap + 46 selfhost) + harness
-├── examples/               # 10 example programs
+├── tests/                  # bootstrap (1,753 .fd), conformance (1,596), selfhost (57), nattools, projects, verify, tooling, ... + harness
+├── examples/               # 12 example programs
 ├── release/                # Self-hosted compiler binaries + generated C (gitignored)
 │   └── fid.exe             # Self-hosted compiler (RELEASE=1 scripts/bootstrap.sh: 3 stages,
 │                           #   fixpoint; scripts/build-selfhost.sh: 1 stage)

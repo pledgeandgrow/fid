@@ -15,7 +15,7 @@ to expose control; Fides keeps ownership/borrow safety and lets you
 | `@This()`, `@intCast` | plain casts `x as T` — fewer builtins, more library |
 | `struct { ... }` | `struct X { ... }` — nominal, with `impl` blocks |
 | `error{...}` + `!T` | `Result`/`Option` + `panic` — errors are values or traps, not error-sets |
-| `defer` | none — explicit cleanup, `@zeroize` for secrets |
+| `defer` | `defer { ... }` — at function exit, not block exit; `@zeroize` for secrets |
 | `Allocator` params | none — `p_malloc`/`p_free` runtime, ownership inserts frees |
 | `std.fmt.print` | `println(...)` |
 | `@safety`/`ReleaseSmall` | annotations: `@crashfree`, `@no-alloc`, `@packed`, `@repr(C)`, `@simd` |
@@ -33,15 +33,18 @@ specific checks with annotations.
 - `@wrapping` opts into wrap-around arithmetic for a function.
 - `@packed`/`@repr(C)` give exact/`extern` layouts — the Fides answer
   to `packed struct`/`extern struct`.
-- Inline assembly exists with clobber lists (50+ x86 ops) — see
-  `compiler/pe.fd` and `docs/reference/reference.md`.
+- Inline assembly (`asm!`) exists with clobber lists: pe_ir and the
+  machine layer run its template in the process, a `--bare` build encodes
+  50+ x86 instructions (`compiler/pe_ir_stubs.fd` `pe_asm_encode`); see
+  `docs/reference/reference.md`.
 
 ## Where Fides is lower-level than Zig, and where it isn't
 
 Lower-level / more exposed:
-- Direct PE/ELF emission with no C toolchain (`fid emit`), bare-metal
-  `--no-std`, `@interrupt`/`@firmware`/`@cpu_local` for OS work,
-  constant-time verification of generated asm (`fid`-level CT check).
+- Direct PE/ELF/Mach-O emission with no C toolchain (`fid emit`),
+  bare-metal `fid emit --bare`, `@interrupt`/`@firmware` for OS work,
+  `@constant_time` checked again on the generated machine code (pe_ir,
+  nat_ir).
 
 Not lower-level:
 - No `comptime` metaprogramming parity. Fides's `comptime` evaluates
@@ -61,7 +64,8 @@ monomorphizer (`compiler/mono.fd`) stamps per-type copies, same as Zig.
 ## Porting checklist
 
 - `error{}` unions → `Result` or `panic` (decide: is it recoverable?).
-- `defer` → explicit calls or `@zeroize`.
+- `defer` → `defer { ... }` (it runs at function exit, so a loop body's
+  cleanup becomes an explicit call), or `@zeroize`.
 - allocator arguments → delete; use owned `Vec`/stdlib containers.
 - `comptime` type-building → generics + `cap`, or runtime dispatch.
 - `@setRuntimeSafety(false)` regions → `@crashfree`/`@wrapping`

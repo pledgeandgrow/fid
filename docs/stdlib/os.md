@@ -38,7 +38,7 @@ pub fn os_getenv(name: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 32*
+*Defined at line 35*
 
 ---
 
@@ -57,7 +57,7 @@ pub fn os_getenv_or(name: str, default: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 37*
+*Defined at line 52*
 
 ---
 
@@ -75,7 +75,7 @@ pub fn os_hasenv(name: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 44*
+*Defined at line 61*
 
 ---
 
@@ -89,7 +89,7 @@ pub fn os_argc() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 51*
+*Defined at line 68*
 
 ---
 
@@ -107,7 +107,7 @@ pub fn os_argv(idx: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 56*
+*Defined at line 73*
 
 ---
 
@@ -116,12 +116,12 @@ pub fn os_argv(idx: i64) -> str {
 Get all command-line arguments as a Vec of strings.
 
 ```fides
-pub fn os_args() -> Vec {
+pub fn os_args() -> Vec<str> {
 ```
 
-**Returns:** `Vec`
+**Returns:** `Vec<str>`
 
-*Defined at line 61*
+*Defined at line 85*
 
 ---
 
@@ -139,7 +139,7 @@ pub fn os_exit(code: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 75*
+*Defined at line 99*
 
 ---
 
@@ -153,7 +153,7 @@ pub fn os_exit_success() -> void {
 
 **Returns:** `void`
 
-*Defined at line 80*
+*Defined at line 104*
 
 ---
 
@@ -167,7 +167,7 @@ pub fn os_exit_failure() -> void {
 
 **Returns:** `void`
 
-*Defined at line 85*
+*Defined at line 109*
 
 ---
 
@@ -185,7 +185,7 @@ pub fn os_system(cmd: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 90*
+*Defined at line 114*
 
 ---
 
@@ -199,7 +199,7 @@ pub fn os_name() -> str {
 
 **Returns:** `str`
 
-*Defined at line 97*
+*Defined at line 125*
 
 ---
 
@@ -213,7 +213,7 @@ pub fn os_home_dir() -> str {
 
 **Returns:** `str`
 
-*Defined at line 105*
+*Defined at line 151*
 
 ---
 
@@ -227,7 +227,7 @@ pub fn os_cwd() -> str {
 
 **Returns:** `str`
 
-*Defined at line 112*
+*Defined at line 175*
 
 ---
 
@@ -241,7 +241,7 @@ pub fn os_user() -> str {
 
 **Returns:** `str`
 
-*Defined at line 119*
+*Defined at line 185*
 
 ---
 
@@ -255,7 +255,7 @@ pub fn os_hostname() -> str {
 
 **Returns:** `str`
 
-*Defined at line 128*
+*Defined at line 207*
 
 ---
 
@@ -269,7 +269,7 @@ pub fn os_shell() -> str {
 
 **Returns:** `str`
 
-*Defined at line 135*
+*Defined at line 221*
 
 ---
 
@@ -283,7 +283,7 @@ pub fn os_term() -> str {
 
 **Returns:** `str`
 
-*Defined at line 142*
+*Defined at line 239*
 
 ---
 
@@ -292,12 +292,12 @@ pub fn os_term() -> str {
 Get the PATH environment variable as a Vec of paths.
 
 ```fides
-pub fn os_path() -> Vec {
+pub fn os_path() -> Vec<str> {
 ```
 
-**Returns:** `Vec`
+**Returns:** `Vec<str>`
 
-*Defined at line 149*
+*Defined at line 248*
 
 ---
 
@@ -311,7 +311,7 @@ pub fn os_tmp_dir() -> str {
 
 **Returns:** `str`
 
-*Defined at line 158*
+*Defined at line 260*
 
 ---
 
@@ -325,7 +325,7 @@ pub fn os_path_sep() -> str {
 
 **Returns:** `str`
 
-*Defined at line 171*
+*Defined at line 289*
 
 ---
 
@@ -339,7 +339,7 @@ pub fn os_path_list_sep() -> str {
 
 **Returns:** `str`
 
-*Defined at line 176*
+*Defined at line 300*
 
 ---
 

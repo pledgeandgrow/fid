@@ -67,7 +67,7 @@ that runs to its end at once.
 
 ## No kill: cancellation stops a task at its next checkpoint
 
-Fides has no preemptive kill, on any backend. A task stopped mid-way would
+Fid has no preemptive kill, on any backend. A task stopped mid-way would
 skip the drops of what it owns (a file, a lock, a buffer), and nothing
 unwinds (reference §8.2: no drop or cleanup code runs after a panic either).
 Cancelling is a request:

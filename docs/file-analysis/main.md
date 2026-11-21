@@ -4,8 +4,29 @@
 > audit: 2026-10-22/23 (1,916 LOC then). Probes run with the latest
 > self-hosted binary (s18) on scratch files.
 
+> **Nov 21:** 9,570 lines; it imports 36 compiler modules (new: `pgo`,
+> `image_writer`, `mir`, `build_info`, `ir_ser`, `disasm`, `pdb`; gone:
+> the PIR-path modules, `coff`, `macho`). The dispatch now knows 55
+> command names (aliases counted), among them `dump-mir`, `disasm`,
+> `emit-ir`, `ir-fuzz`, `reduce`, `split-c`, `fuzz`, `fix`, `explain`,
+> `serve`, `doc`, `inspect`, `replay`, `repl`, `qualify`, `notebook`.
+> Changed since the audit below: MI18 (Nov 17) removed the PIR path, so
+> `pir`/`dump-pir` print where their views went, `opt` prints the IR after
+> iropt, `codegen` builds through the machine layer (an object with
+> `--elf/--coff/--macho`, else a disassembly), and `build --native` is the
+> machine layer on every target (the default `x86-64` is `x86_64-linux`;
+> the "crashes" finding no longer applies). On a Linux or macOS host `fid
+> build` with no `--target` builds through the machine layer (CB4); the
+> "weaker C path" finding applies only to `--via-c` / `FIDES_BUILD_VIA_C=1`
+> and to the fallback for a program the machine layer rejects. `fid test`
+> runs the bootstrap suite itself. `run --trace f,g` traces calls (CT10).
+> Still true: `run --timeout` is only printed with `-v`. New open: the
+> Windows reduce watchdog runs a .bat by bare name (known-bugs 2g.105),
+> `ccompile --cpu x86-64-v3` with zig cc passes `-march=x86-64-v3`, which
+> zig 0.16 rejects (2g.111). Line numbers below are from Nov 9.
+
 - **Path:** `compiler/main.fd`
-- **LOC:** 3,349
+- **LOC:** 9,570 (2026-11-21; 3,349 on Nov 9)
 - **Role:** `pub fn main` of `fid`. Reads global flags, then a string
   dispatch to `cmd_*` functions. Most commands are thin shells over
   `compiler.fd` (pipeline), `codegen_c.fd` (via compiler.fd), `nat_ir.fd`,

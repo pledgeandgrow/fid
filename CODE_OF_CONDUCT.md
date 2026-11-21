@@ -1,6 +1,6 @@
 # Code of Conduct
 
-This Code of Conduct applies to every space the Fides project runs: the
+This Code of Conduct applies to every space the Fid project runs: the
 compiler and website repositories, issue trackers, pull requests, GitHub
 Discussions, and any event or channel the project operates. It also applies
 when someone represents the project in public.

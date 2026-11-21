@@ -47,7 +47,7 @@ pub struct UiContext {
 | `active_color_g` | `i64` |
 | `active_color_b` | `i64` |
 
-*Defined at line 28*
+*Defined at line 24*
 
 ---
 
@@ -61,7 +61,7 @@ pub fn ui_create() -> UiContext {
 
 **Returns:** `UiContext`
 
-*Defined at line 52*
+*Defined at line 53*
 
 ---
 
@@ -81,7 +81,7 @@ pub fn ui_begin(ctx: &mut UiContext, ren: i64, input: &SdlInputState) -> void {
 
 **Returns:** `void`
 
-*Defined at line 78*
+*Defined at line 60*
 
 ---
 
@@ -99,7 +99,7 @@ pub fn ui_end(ctx: &mut UiContext) -> void {
 
 **Returns:** `void`
 
-*Defined at line 89*
+*Defined at line 71*
 
 ---
 
@@ -122,7 +122,7 @@ pub fn ui_button(ctx: &mut UiContext, label: str, x: i64, y: i64, w: i64, h: i64
 
 **Returns:** `bool`
 
-*Defined at line 146*
+*Defined at line 129*
 
 ---
 
@@ -147,7 +147,7 @@ pub fn ui_slider(ctx: &mut UiContext, x: i64, y: i64, w: i64, h: i64, min: f64, 
 
 **Returns:** `f64`
 
-*Defined at line 193*
+*Defined at line 176*
 
 ---
 
@@ -169,7 +169,7 @@ pub fn ui_checkbox(ctx: &mut UiContext, label: str, x: i64, y: i64, checked: boo
 
 **Returns:** `bool`
 
-*Defined at line 239*
+*Defined at line 234*
 
 ---
 
@@ -190,7 +190,7 @@ pub fn ui_label(ctx: &UiContext, text: str, x: i64, y: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 282*
+*Defined at line 277*
 
 ---
 
@@ -212,7 +212,7 @@ pub fn ui_panel(ctx: &UiContext, x: i64, y: i64, w: i64, h: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 287*
+*Defined at line 282*
 
 ---
 
@@ -235,7 +235,7 @@ pub fn ui_progress_bar(ctx: &UiContext, x: i64, y: i64, w: i64, h: i64, progress
 
 **Returns:** `void`
 
-*Defined at line 293*
+*Defined at line 288*
 
 ---
 
@@ -258,7 +258,7 @@ pub fn ui_text_input(ctx: &mut UiContext, x: i64, y: i64, w: i64, h: i64, text: 
 
 **Returns:** `str`
 
-*Defined at line 307*
+*Defined at line 306*
 
 ---
 
@@ -299,7 +299,7 @@ pub fn ui_next_row(y: i64, h: i64, spacing: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 343*
+*Defined at line 349*
 
 ---
 

@@ -1,9 +1,16 @@
 # coff.fd — COFF (.obj) writer for Windows AMD64
 
+> **Nov 21: dead.** Nothing imports it. Since MI18 (Nov 17) `fid codegen
+> --coff` builds a COFF object through the machine layer (nat_enc.fd), and
+> that fails on every program with `undefined symbol: FreeLibrary`
+> (known-bugs 2g.110). `CoffEmitter_build_coff` now writes through
+> image_writer.fd (`CoffEmitter_build_coff_img`, TG13). The callers below
+> are as of Nov 9.
+
 Re-audited 2026-11-09 (previous audit 2026-10-22/23).
 
 - **Path:** `compiler/coff.fd`
-- **LOC:** 426
+- **LOC:** 300 (2026-11-21; 426 on Nov 9)
 - **Role:** format-only writer. `emit_coff_file` assembles the asm with the
   shared `ElfEmitter` (elf64.fd), `CoffEmitter_import` copies its text,
   rodata, symbols and relocations, `CoffEmitter_build_coff` writes the COFF

@@ -1,0 +1,79 @@
+// 2g.98 / MI28 (docs/roadmap/llvm-roadmap.md): mutual recursion returning
+// narrow values (bool, u8, i32), three million levels deep, natively only
+// (tests/nattools/tailcall_ext_check.sh). After the mid-end inlines one
+// function of a pair into the other, the call's result is stored into a
+// promoted local of the narrow type: an extension of the result
+// (compiler/nat_ir.fd ng_vz_slot_st) between the call and the return. The
+// callee leaves its result extended (M7), so the call is still in tail
+// position (ng_tail_ext_kept) and becomes a jump; before, it stayed a
+// call on AArch64 and RISC-V and the stack overflowed (is_odd called from
+// is_odd). `narrowed` truncates an i64 result: that extension changes the
+// value and stays (its call is no jump).
+// Expected output:
+// true
+// false
+// 41
+// 42
+// -7
+// 7
+// 44
+
+fn is_even(n: i64) -> bool {
+    if n == 0 {
+        return true;
+    }
+    return is_odd(n - 1);
+}
+
+fn is_odd(n: i64) -> bool {
+    if n == 0 {
+        return false;
+    }
+    return is_even(n - 1);
+}
+
+fn down8(n: i64, v: u8) -> u8 {
+    if n == 0 {
+        return v;
+    }
+    return up8(n - 1, v);
+}
+
+fn up8(n: i64, v: u8) -> u8 {
+    if n == 0 {
+        return v + 1;
+    }
+    return down8(n - 1, v);
+}
+
+fn neg32(n: i64, v: i32) -> i32 {
+    if n == 0 {
+        return v;
+    }
+    return pos32(n - 1, v);
+}
+
+fn pos32(n: i64, v: i32) -> i32 {
+    if n == 0 {
+        return 0 - v;
+    }
+    return neg32(n - 1, v);
+}
+
+fn wide(n: i64) -> i64 {
+    return n + 256;
+}
+
+fn narrowed(n: i64) -> u8 {
+    return wide(n) as u8;
+}
+
+fn main() {
+    println(is_even(3000000));
+    println(is_even(3000001));
+    println(down8(3000000, 41));
+    println(down8(3000001, 41));
+    println(neg32(3000000, 0 - 7));
+    println(neg32(3000001, 0 - 7));
+    println(narrowed(44));
+}

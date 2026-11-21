@@ -38,7 +38,7 @@ pub fn clinical_bmi(weight_kg: f64, height_m: f64) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 33*
+*Defined at line 40*
 
 ---
 
@@ -56,7 +56,7 @@ pub fn clinical_bmi_category(bmi: f64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 42*
+*Defined at line 49*
 
 ---
 
@@ -75,7 +75,7 @@ pub fn clinical_bmi_imperial(weight_lb: f64, height_in: f64) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 51*
+*Defined at line 64*
 
 ---
 
@@ -99,7 +99,7 @@ pub fn clinical_gfr_egfr(serum_creatinine: f64, age: i64, is_female: i64) -> f64
 
 **Returns:** `f64`
 
-*Defined at line 72*
+*Defined at line 85*
 
 ---
 
@@ -119,7 +119,7 @@ pub fn clinical_ckd_stage(egfr: f64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 102*
+*Defined at line 119*
 
 ---
 
@@ -139,7 +139,7 @@ pub fn clinical_chads2vasc(chf: i64, htn: i64, age: i64, diabetes: i64,
 - `age`: `i64`
 - `diabetes`: `i64`
 
-*Defined at line 120*
+*Defined at line 147*
 
 ---
 
@@ -157,7 +157,7 @@ pub fn clinical_chads2vasc_risk(score: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 143*
+*Defined at line 176*
 
 ---
 
@@ -178,7 +178,7 @@ pub fn clinical_meld(creatinine: f64, bilirubin: f64, inr: f64) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 158*
+*Defined at line 195*
 
 ---
 
@@ -200,7 +200,7 @@ pub fn clinical_dose_by_weight(dose_mg_per_kg: f64, weight_kg: f64) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 188*
+*Defined at line 232*
 
 ---
 
@@ -220,7 +220,7 @@ pub fn clinical_dose_young(adult_dose: f64, age_years: i64) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 195*
+*Defined at line 239*
 
 ---
 
@@ -240,7 +240,7 @@ pub fn clinical_dose_clark(adult_dose: f64, weight_lb: f64) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 206*
+*Defined at line 250*
 
 ---
 
@@ -260,7 +260,7 @@ pub fn clinical_creatinine_clearance(age: i64, weight_kg: f64,
 - `age`: `i64`
 - `weight_kg`: `f64`
 
-*Defined at line 215*
+*Defined at line 259*
 
 ---
 
@@ -278,7 +278,7 @@ pub fn clinical_c_to_f(celsius: f64) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 230*
+*Defined at line 273*
 
 ---
 
@@ -296,7 +296,7 @@ pub fn clinical_f_to_c(fahrenheit: f64) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 235*
+*Defined at line 278*
 
 ---
 
@@ -314,7 +314,7 @@ pub fn clinical_max_hr(age: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 242*
+*Defined at line 285*
 
 ---
 
@@ -324,16 +324,16 @@ Calculate target heart rate zone (50-85% of max HR).
 Returns (lower, upper) as a Vec [lower, upper].
 
 ```fides
-pub fn clinical_target_hr_zone(age: i64) -> Vec {
+pub fn clinical_target_hr_zone(age: i64) -> Vec<i64> {
 ```
 
 **Parameters:**
 
 - `age`: `i64`
 
-**Returns:** `Vec`
+**Returns:** `Vec<i64>`
 
-*Defined at line 248*
+*Defined at line 291*
 
 ---
 
@@ -354,7 +354,7 @@ pub fn clinical_anion_gap(sodium: i64, chloride: i64, bicarbonate: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 260*
+*Defined at line 303*
 
 ---
 
@@ -372,7 +372,7 @@ pub fn clinical_anion_gap_normal(gap: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 265*
+*Defined at line 308*
 
 ---
 
@@ -392,7 +392,7 @@ pub fn clinical_news2(resp_rate: i64, spo2: i64, air_or_o2: i64,
 - `spo2`: `i64`
 - `air_or_o2`: `i64`
 
-*Defined at line 278*
+*Defined at line 321*
 
 ---
 
@@ -410,7 +410,7 @@ pub fn clinical_news2_category(score: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 325*
+*Defined at line 392*
 
 ---
 

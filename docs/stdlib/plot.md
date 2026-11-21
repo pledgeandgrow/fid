@@ -26,7 +26,7 @@ pub fn plot_debug_header(title: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 113*
+*Defined at line 112*
 
 ---
 
@@ -45,7 +45,7 @@ pub fn plot_debug_frame(x_label: str, y_label: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 118*
+*Defined at line 117*
 
 ---
 
@@ -65,7 +65,7 @@ pub fn plot_debug_combined(title: str, x_label: str, y_label: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 123*
+*Defined at line 134*
 
 ---
 
@@ -88,7 +88,7 @@ pub fn plot_line(data_x: Vec<f64>, data_y: Vec<f64>, title: str, x_label: str, y
 
 **Returns:** `str`
 
-*Defined at line 155*
+*Defined at line 170*
 
 ---
 
@@ -109,7 +109,7 @@ pub fn plot_bar(data: Vec<f64>, labels: Vec<str>, title: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 205*
+*Defined at line 226*
 
 ---
 
@@ -130,7 +130,7 @@ pub fn plot_scatter(data_x: Vec<f64>, data_y: Vec<f64>, title: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 255*
+*Defined at line 283*
 
 ---
 
@@ -149,7 +149,7 @@ pub fn plot_to_file(svg: str, path: str) -> void {
 
 **Returns:** `void`
 
-*Defined at line 291*
+*Defined at line 323*
 
 ---
 
@@ -168,7 +168,7 @@ pub fn plot_html(svg: str, title: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 296*
+*Defined at line 328*
 
 ---
 
@@ -188,7 +188,7 @@ pub fn plot_render_html(svg: str, title: str, path: str) -> void {
 
 **Returns:** `void`
 
-*Defined at line 309*
+*Defined at line 341*
 
 ---
 

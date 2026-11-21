@@ -40,7 +40,7 @@
 pub const TOUCH_NONE: i64 = 0;
 ```
 
-*Defined at line 21*
+*Defined at line 17*
 
 ---
 
@@ -50,7 +50,7 @@ pub const TOUCH_NONE: i64 = 0;
 pub const TOUCH_BEGAN: i64 = 1;
 ```
 
-*Defined at line 22*
+*Defined at line 17*
 
 ---
 
@@ -60,7 +60,7 @@ pub const TOUCH_BEGAN: i64 = 1;
 pub const TOUCH_MOVED: i64 = 2;
 ```
 
-*Defined at line 23*
+*Defined at line 17*
 
 ---
 
@@ -70,7 +70,7 @@ pub const TOUCH_MOVED: i64 = 2;
 pub const TOUCH_ENDED: i64 = 3;
 ```
 
-*Defined at line 24*
+*Defined at line 17*
 
 ---
 
@@ -80,7 +80,7 @@ pub const TOUCH_ENDED: i64 = 3;
 pub const TOUCH_CANCELLED: i64 = 4;
 ```
 
-*Defined at line 25*
+*Defined at line 17*
 
 ---
 
@@ -90,7 +90,7 @@ pub const TOUCH_CANCELLED: i64 = 4;
 pub const MAX_TOUCHES: i64 = 10;
 ```
 
-*Defined at line 27*
+*Defined at line 18*
 
 ---
 
@@ -116,7 +116,7 @@ pub struct Touch {
 | `timestamp` | `f64` |
 | `active` | `bool` |
 
-*Defined at line 31*
+*Defined at line 21*
 
 ---
 
@@ -143,7 +143,7 @@ pub struct TouchState {
 | `swipe_active` | `bool` |
 | `swipe_direction` | `i64` |
 
-*Defined at line 45*
+*Defined at line 35*
 
 ---
 
@@ -157,7 +157,7 @@ pub fn touch_create() -> TouchState {
 
 **Returns:** `TouchState`
 
-*Defined at line 61*
+*Defined at line 63*
 
 ---
 
@@ -175,7 +175,7 @@ pub fn touch_init(ts: &mut TouchState) -> void {
 
 **Returns:** `void`
 
-*Defined at line 94*
+*Defined at line 78*
 
 ---
 
@@ -195,7 +195,7 @@ pub fn touch_set_screen_size(ts: &mut TouchState, w: f64, h: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 116*
+*Defined at line 93*
 
 ---
 
@@ -218,7 +218,7 @@ pub fn touch_begin(ts: &mut TouchState, id: i64, x: f64, y: f64, pressure: f64, 
 
 **Returns:** `void`
 
-*Defined at line 144*
+*Defined at line 123*
 
 ---
 
@@ -240,7 +240,7 @@ pub fn touch_move(ts: &mut TouchState, id: i64, x: f64, y: f64, pressure: f64) -
 
 **Returns:** `void`
 
-*Defined at line 163*
+*Defined at line 144*
 
 ---
 
@@ -259,7 +259,7 @@ pub fn touch_end(ts: &mut TouchState, id: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 177*
+*Defined at line 160*
 
 ---
 
@@ -278,7 +278,7 @@ pub fn touch_cancel(ts: &mut TouchState, id: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 186*
+*Defined at line 171*
 
 ---
 
@@ -296,7 +296,7 @@ pub fn touch_update(ts: &mut TouchState) -> void {
 
 **Returns:** `void`
 
-*Defined at line 195*
+*Defined at line 182*
 
 ---
 
@@ -314,7 +314,7 @@ pub fn touch_count(ts: &TouchState) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 269*
+*Defined at line 265*
 
 ---
 
@@ -333,7 +333,7 @@ pub fn touch_get(ts: &TouchState, idx: i64) -> Touch {
 
 **Returns:** `Touch`
 
-*Defined at line 280*
+*Defined at line 278*
 
 ---
 
@@ -351,7 +351,7 @@ pub fn touch_is_tap(ts: &TouchState) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 298*
+*Defined at line 296*
 
 ---
 
@@ -423,7 +423,7 @@ pub fn touch_pan_active(ts: &TouchState) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 344*
+*Defined at line 348*
 
 ---
 
@@ -441,7 +441,7 @@ pub fn touch_pan_delta(ts: &TouchState) -> vec2 {
 
 **Returns:** `vec2`
 
-*Defined at line 349*
+*Defined at line 353*
 
 ---
 
@@ -459,7 +459,7 @@ pub fn touch_swipe_active(ts: &TouchState) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 362*
+*Defined at line 366*
 
 ---
 
@@ -477,7 +477,7 @@ pub fn touch_swipe_direction(ts: &TouchState) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 367*
+*Defined at line 371*
 
 ---
 
@@ -495,7 +495,7 @@ pub fn touch_swipe_delta(ts: &TouchState) -> vec2 {
 
 **Returns:** `vec2`
 
-*Defined at line 372*
+*Defined at line 376*
 
 ---
 
@@ -514,7 +514,7 @@ pub fn touch_to_pixels(ts: &TouchState, t: &Touch) -> vec2 {
 
 **Returns:** `vec2`
 
-*Defined at line 385*
+*Defined at line 389*
 
 ---
 
@@ -534,7 +534,7 @@ pub fn touch_set_tap_threshold(ts: &mut TouchState, max_dist: f64, max_duration:
 
 **Returns:** `void`
 
-*Defined at line 390*
+*Defined at line 394*
 
 ---
 
@@ -553,7 +553,7 @@ pub fn touch_set_swipe_threshold(ts: &mut TouchState, min_dist: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 396*
+*Defined at line 400*
 
 ---
 
@@ -571,7 +571,7 @@ pub fn touch_clear(ts: &mut TouchState) -> void {
 
 **Returns:** `void`
 
-*Defined at line 401*
+*Defined at line 405*
 
 ---
 

@@ -40,7 +40,7 @@ pub struct Terrain {
 | `max_height` | `f64` |
 | `min_height` | `f64` |
 
-*Defined at line 24*
+*Defined at line 20*
 
 ---
 
@@ -60,7 +60,7 @@ pub fn terrain_create(width: i64, height: i64, spacing: f64) -> Terrain {
 
 **Returns:** `Terrain`
 
-*Defined at line 36*
+*Defined at line 45*
 
 ---
 
@@ -80,7 +80,7 @@ pub fn terrain_set_origin(t: &mut Terrain, x: f64, z: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 56*
+*Defined at line 58*
 
 ---
 
@@ -101,7 +101,7 @@ pub fn terrain_set_height(t: &mut Terrain, gx: i64, gy: i64, h: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 62*
+*Defined at line 64*
 
 ---
 
@@ -121,7 +121,7 @@ pub fn terrain_get_height_grid(t: &Terrain, gx: i64, gy: i64) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 68*
+*Defined at line 72*
 
 ---
 
@@ -141,7 +141,7 @@ pub fn terrain_height_at(t: &Terrain, wx: f64, wz: f64) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 74*
+*Defined at line 80*
 
 ---
 
@@ -161,7 +161,7 @@ pub fn terrain_normal_at(t: &Terrain, wx: f64, wz: f64) -> vec3 {
 
 **Returns:** `vec3`
 
-*Defined at line 102*
+*Defined at line 120*
 
 ---
 
@@ -179,7 +179,7 @@ pub fn terrain_generate_sine(t: &mut Terrain) -> void {
 
 **Returns:** `void`
 
-*Defined at line 121*
+*Defined at line 139*
 
 ---
 
@@ -197,7 +197,7 @@ pub fn terrain_generate_flat(t: &mut Terrain) -> void {
 
 **Returns:** `void`
 
-*Defined at line 144*
+*Defined at line 166*
 
 ---
 
@@ -216,7 +216,7 @@ pub fn terrain_generate_noise(t: &mut Terrain, amplitude: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 155*
+*Defined at line 177*
 
 ---
 
@@ -238,7 +238,7 @@ pub fn terrain_raise_circle(t: &mut Terrain, cx: f64, cz: f64, radius: f64, amou
 
 **Returns:** `void`
 
-*Defined at line 178*
+*Defined at line 204*
 
 ---
 
@@ -256,7 +256,7 @@ pub fn terrain_to_mesh(t: &Terrain) -> Mesh {
 
 **Returns:** `Mesh`
 
-*Defined at line 210*
+*Defined at line 244*
 
 ---
 
@@ -274,7 +274,7 @@ pub fn terrain_world_width(t: &Terrain) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 259*
+*Defined at line 293*
 
 ---
 
@@ -292,7 +292,7 @@ pub fn terrain_world_depth(t: &Terrain) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 264*
+*Defined at line 298*
 
 ---
 
@@ -310,7 +310,7 @@ pub fn terrain_vertex_count(t: &Terrain) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 269*
+*Defined at line 303*
 
 ---
 
@@ -328,7 +328,7 @@ pub fn terrain_triangle_count(t: &Terrain) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 274*
+*Defined at line 308*
 
 ---
 
@@ -348,7 +348,7 @@ pub fn terrain_in_bounds(t: &Terrain, wx: f64, wz: f64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 279*
+*Defined at line 313*
 
 ---
 
@@ -366,7 +366,7 @@ pub fn terrain_smooth(t: &mut Terrain) -> void {
 
 **Returns:** `void`
 
-*Defined at line 288*
+*Defined at line 322*
 
 ---
 

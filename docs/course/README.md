@@ -4,8 +4,9 @@
 > built on the Fid book (`docs/book/`) and the language reference
 > (`docs/reference/reference.md`). **Fid** is the language, **Fides** the
 > compiler, `fid` the command. Every complete example in the lecture notes
-> is run by `tests/course/check_course.py`; the notes were last checked
-> against `fid` 0.8.0-unstable (Nov 16, 2026 build) on Nov 17, 2026.
+> is run by `tests/course/check_course.py`; the notes and the labs were
+> last checked against `fid` 1.0.0+dev (built from the Nov 21 tree) on
+> Nov 21, 2026.
 
 ## The course in one paragraph
 

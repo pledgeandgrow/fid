@@ -18,7 +18,7 @@ daemons in C, this is the shortest distance.
 | `NULL` | `Option::None` — can't deref without checking |
 | `return -1` errors | `Option`/`Result`, or `panic` for fatal |
 | `switch` | `match x { ... }` |
-| `goto cleanup` | none — early `return` + explicit cleanup |
+| `goto cleanup` | `defer { ... }` (runs when the function returns) or early `return` |
 | `#include` | `use module;` — real modules, not text inclusion |
 | `-DNDEBUG` asserts | `panic` stays in release; checks are semantic |
 | `gcc x.c -o x` | `fid emit x.fd` (native) or `fid ccompile x.fd` (via C) |
@@ -39,12 +39,17 @@ daemons in C, this is the shortest distance.
 
 - `@repr(C)` — exact C ABI layout for FFI/hardware structs.
 - `@packed` — `__attribute__((packed))`: field_align=1, no padding.
-- `@cpu_local` — per-CPU variables via GS segment (kernel-grade).
-- Inline asm with clobber lists — 50+ x86 instructions in `compiler/pe.fd`.
-- `--no-std` — bare-metal mode, no core.fd: freestanding like `-ffreestanding`.
+- `@cpu_local` — per-CPU variables via the GS segment; no backend
+  generates them today (only the retired `compiler/pe.fd` did).
+- Inline `asm!` with clobber lists — pe_ir and the machine layer run its
+  template in the process; a `--bare` build encodes 50+ x86 instructions
+  (`compiler/pe_ir_stubs.fd` `pe_asm_encode`).
+- `fid emit --bare` — bare-metal mode, no stdlib or core.fd: freestanding
+  like `-ffreestanding`.
 - `p_inb`/`p_outb`/MMIO-style volatile access (`use volatile;`).
-- Constant-time enforcement: post-codegen CT verifier scans the emitted
-  asm for data-dependent branches/memory ops (`test_ct_asm.fd`).
+- Constant-time enforcement: `@constant_time` code may not branch on,
+  divide or index by a secret; the source is checked, then the C path and
+  the native backends' code (pe_ir, nat_ir) again (`test_ct_asm.fd`).
 - FFI: `fid parse-header <h>` generates bindings from a C header.
 
 ## Ownership — the part that isn't C

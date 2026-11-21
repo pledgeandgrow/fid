@@ -73,3 +73,8 @@ the magic input is found within 20000 inputs and saved, the same input on
 a second run, the saved input fails `fid test` until the bug is fixed and
 passes after, it seeds the next fuzz run, and a passing target's corpus
 grows.
+
+Known bug (Nov 21, 2026, known-bugs 2g.83): `ccompile --fuzz-cov` panics
+with `Double free` in the compiler (from `build_program_with_path_borrowck`),
+so the coverage build of that check dies: no target is found, no input is
+saved and no corpus grows.

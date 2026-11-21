@@ -3,7 +3,21 @@
 > **Re-audited 2026-11-09** against the working tree (inc.fd has a small
 > uncommitted edit: FID_IROPT_*/FID_NAT_OFF added to the build key).
 
-**Path:** `compiler/inc.fd` — **889 lines** (166 on Oct 22). Imports `ir`.
+> **Nov 21:** 1,751 lines; imports `build_info` and `ir`. The build key
+> now also holds `FID_VALIDATE`, `FID_TV_PAIRS`, `FID_TV_INJECT(_IN)`,
+> `FID_REGION_ARENA`, `FID_PE_OFF`, `FID_PE_CT_OFF`, `FID_PE_SYMS` and
+> `FID_PE_DEBUG`; `FIDES_CFLAGS` is in the C artifact key (main.fd). Still
+> missing, so a stamp hit skips the work they ask for (known-bugs 2g.15,
+> open): `FID_VERIFY`, `FID_RULES_ON`, `FID_NAT_ON`, `FID_LIBFACTS*`. A
+> release build keys every cache on `fid_build_source` plus the
+> executable's size instead of a hash of the whole executable (D9,
+> build_info.md). New open: a function-cache hit image is not
+> byte-identical to a cache-off one (2g.82), a fresh project never takes
+> core's unit from the seeded store (2g.91), and a `dyn` call whose impl
+> is in another IR unit of `ccompile --inc` has no dispatch candidates
+> (2g.92). Line numbers below are from Nov 9.
+
+**Path:** `compiler/inc.fd` — **889 lines** on Nov 9 (1,751 on Nov 21; 166 on Oct 22). Imports `ir`.
 
 **Role:** four caches plus helpers.
 

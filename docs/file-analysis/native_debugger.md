@@ -1,7 +1,8 @@
 # native_debugger.fd — native (ptrace) debugger skeleton
 
 - **Path:** `compiler/native_debugger.fd` — module `compiler::native_debugger`
-- **LOC:** 544 (2026-11-09, unchanged). Rust `src/native_debugger.rs`: 311.
+- **LOC:** 521 (2026-11-21; 544 on Nov 9). Rust `src/native_debugger.rs`: 311.
+  Nov 21: still dead; no `native-debug` or `autopsy` command.
 - **Role:** register structs (`Regs`, `UserRegs` = `user_regs_struct`),
   breakpoints, command parsing, `compile_to_native` (C via
   `ccompile_source_with_path`, then `gcc -g -O0`), and a command loop where

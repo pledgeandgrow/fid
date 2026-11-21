@@ -39,7 +39,7 @@ pub struct ResultValue {
 | `value` | `i64` |
 | `error` | `i64` |
 
-*Defined at line 22*
+*Defined at line 28*
 
 ---
 
@@ -57,7 +57,7 @@ pub fn ResultValue_ok(value: i64) -> ResultValue {
 
 **Returns:** `ResultValue`
 
-*Defined at line 31*
+*Defined at line 41*
 
 ---
 
@@ -75,7 +75,7 @@ pub fn ResultValue_err(error: i64) -> ResultValue {
 
 **Returns:** `ResultValue`
 
-*Defined at line 36*
+*Defined at line 51*
 
 ---
 
@@ -93,7 +93,7 @@ pub fn resultvalue_is_ok(r: ResultValue) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 43*
+*Defined at line 63*
 
 ---
 
@@ -111,7 +111,7 @@ pub fn resultvalue_is_err(r: ResultValue) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 48*
+*Defined at line 71*
 
 ---
 
@@ -129,7 +129,7 @@ pub fn resultvalue_unwrap(r: ResultValue) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 55*
+*Defined at line 81*
 
 ---
 
@@ -147,7 +147,7 @@ pub fn resultvalue_unwrap_err(r: ResultValue) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 64*
+*Defined at line 93*
 
 ---
 
@@ -166,7 +166,7 @@ pub fn resultvalue_unwrap_or(r: ResultValue, default: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 73*
+*Defined at line 106*
 
 ---
 
@@ -185,7 +185,7 @@ pub fn resultvalue_unwrap_or_else(r: ResultValue, fallback: fn(i64) -> i64) -> i
 
 **Returns:** `i64`
 
-*Defined at line 79*
+*Defined at line 118*
 
 ---
 
@@ -204,7 +204,7 @@ pub fn resultvalue_expect(r: ResultValue, msg: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 85*
+*Defined at line 129*
 
 ---
 
@@ -223,7 +223,7 @@ pub fn resultvalue_map(r: ResultValue, f: fn(i64) -> i64) -> ResultValue {
 
 **Returns:** `ResultValue`
 
-*Defined at line 96*
+*Defined at line 146*
 
 ---
 
@@ -242,7 +242,7 @@ pub fn resultvalue_map_err(r: ResultValue, f: fn(i64) -> i64) -> ResultValue {
 
 **Returns:** `ResultValue`
 
-*Defined at line 104*
+*Defined at line 158*
 
 ---
 
@@ -262,7 +262,7 @@ pub fn resultvalue_and_then(r: ResultValue, f: fn(i64) -> ResultValue) -> Result
 
 **Returns:** `ResultValue`
 
-*Defined at line 113*
+*Defined at line 167*
 
 ---
 
@@ -281,7 +281,7 @@ pub fn resultvalue_or_else(r: ResultValue, f: fn(i64) -> ResultValue) -> ResultV
 
 **Returns:** `ResultValue`
 
-*Defined at line 121*
+*Defined at line 175*
 
 ---
 
@@ -299,7 +299,7 @@ pub fn resultvalue_ok_option(r: ResultValue) -> Option {
 
 **Returns:** `Option`
 
-*Defined at line 131*
+*Defined at line 191*
 
 ---
 
@@ -317,7 +317,7 @@ pub fn resultvalue_err_option(r: ResultValue) -> Option {
 
 **Returns:** `Option`
 
-*Defined at line 139*
+*Defined at line 205*
 
 ---
 
@@ -336,7 +336,7 @@ pub fn resultvalue_contains(r: ResultValue, value: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 149*
+*Defined at line 219*
 
 ---
 
@@ -355,7 +355,7 @@ pub fn resultvalue_contains_err(r: ResultValue, error: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 154*
+*Defined at line 227*
 
 ---
 
@@ -373,7 +373,7 @@ pub fn resultvalue_to_str(r: ResultValue) -> str {
 
 **Returns:** `str`
 
-*Defined at line 159*
+*Defined at line 235*
 
 ---
 

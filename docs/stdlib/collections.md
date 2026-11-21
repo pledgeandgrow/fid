@@ -28,10 +28,11 @@ pub struct Deque<T> {
 
 | Name | Type |
 |------|------|
-| `data` | `Vec` |
+| `data` | `Vec<i64>` |
 | `head` | `i64` |
+| `count` | `i64` |
 
-*Defined at line 22*
+*Defined at line 34*
 
 ---
 
@@ -41,7 +42,7 @@ pub struct Deque<T> {
 impl Deque {
 ```
 
-*Defined at line 27*
+*Defined at line 34*
 
 ---
 
@@ -57,13 +58,13 @@ pub struct LinkedList {
 
 | Name | Type |
 |------|------|
-| `values` | `Vec,    // value of each node` |
-| `nexts` | `Vec,     // next index of each node (-1 if none)` |
-| `head` | `i64,      // index of head node, -1 if empty` |
-| `tail` | `i64,      // index of tail node, -1 if empty` |
+| `values` | `Vec<i64>` |
+| `nexts` | `Vec<i64>` |
+| `head` | `i64` |
+| `tail` | `i64` |
 | `size` | `i64` |
 
-*Defined at line 140*
+*Defined at line 255*
 
 ---
 
@@ -73,7 +74,7 @@ pub struct LinkedList {
 impl LinkedList {
 ```
 
-*Defined at line 148*
+*Defined at line 255*
 
 ---
 
@@ -90,9 +91,9 @@ pub struct Set {
 
 | Name | Type |
 |------|------|
-| `data` | `Vec` |
+| `data` | `Vec<i64>` |
 
-*Defined at line 265*
+*Defined at line 404*
 
 ---
 
@@ -102,7 +103,7 @@ pub struct Set {
 impl Set {
 ```
 
-*Defined at line 269*
+*Defined at line 404*
 
 ---
 
@@ -118,7 +119,7 @@ pub struct HashSet {
 |------|------|
 | `table` | `i64,  // pointer to hash table block` |
 
-*Defined at line 398*
+*Defined at line 603*
 
 ---
 
@@ -128,7 +129,7 @@ pub struct HashSet {
 impl HashSet {
 ```
 
-*Defined at line 402*
+*Defined at line 603*
 
 ---
 
@@ -142,10 +143,10 @@ pub struct BTreeMap {
 
 | Name | Type |
 |------|------|
-| `keys` | `Vec,    // sorted keys` |
-| `values` | `Vec,  // parallel values (values[i] corresponds to keys[i])` |
+| `keys` | `Vec<i64>` |
+| `values` | `Vec<i64>` |
 
-*Defined at line 704*
+*Defined at line 918*
 
 ---
 
@@ -155,7 +156,7 @@ pub struct BTreeMap {
 impl BTreeMap {
 ```
 
-*Defined at line 709*
+*Defined at line 918*
 
 ---
 
@@ -169,9 +170,9 @@ pub struct BTreeSet {
 
 | Name | Type |
 |------|------|
-| `data` | `Vec,  // sorted keys` |
+| `data` | `Vec<i64>` |
 
-*Defined at line 839*
+*Defined at line 1070*
 
 ---
 
@@ -181,7 +182,7 @@ pub struct BTreeSet {
 impl BTreeSet {
 ```
 
-*Defined at line 843*
+*Defined at line 1070*
 
 ---
 

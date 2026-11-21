@@ -70,6 +70,11 @@ mode. It checks that:
 
 It prints each request's time and whether the 100 ms target was met.
 
+Known bug (Nov 21, 2026, known-bugs 2g.82): the machine layer's function
+cache does not keep images byte-identical. A cache-hit image differs from a
+cache-off one, and `fid serve` rebuilds differ from a one-shot emit, so the
+first check above fails. Every image still runs the same.
+
 ## What is left
 
 - **Lowering.** Every build lowers every reachable function again. The

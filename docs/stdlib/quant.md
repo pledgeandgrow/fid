@@ -24,7 +24,7 @@ pub fn quantize_q8(t: Tensor, scale: f64, zero_point: i64) -> Tensor {
 
 **Returns:** `Tensor`
 
-*Defined at line 17*
+*Defined at line 24*
 
 ---
 
@@ -44,7 +44,7 @@ pub fn dequantize_q8(t: Tensor, scale: f64, zero_point: i64) -> Tensor {
 
 **Returns:** `Tensor`
 
-*Defined at line 22*
+*Defined at line 29*
 
 ---
 
@@ -67,7 +67,7 @@ pub fn qmatmul(a: Tensor, b: Tensor) -> Tensor {
 
 **Returns:** `Tensor`
 
-*Defined at line 31*
+*Defined at line 38*
 
 ---
 
@@ -86,7 +86,7 @@ pub fn find_quant_params(t: Tensor) -> str {
 
 **Returns:** `str`
 
-*Defined at line 37*
+*Defined at line 44*
 
 ---
 

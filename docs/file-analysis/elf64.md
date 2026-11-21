@@ -2,8 +2,19 @@
 
 Re-audited 2026-11-09 (previous audit 2026-10-22/23).
 
+> **Nov 21:** only `fid build-x86` reaches this module now
+> (`build_x86_linux` in compiler.fd). MI18 (Nov 17) removed
+> `build_executable`, `fid codegen --elf|--coff|--macho` builds objects
+> through the machine layer (nat_enc.fd), `emit --boot` goes through
+> pe_ir, and pe.fd, coff.fd, macho.fd and runtime_linux.fd are unreached.
+> Finding 1 (56-byte section headers) is fixed (known-bugs 2g.16, TG13):
+> `ElfEmitter_build_elf` calls `ElfEmitter_build_elf_img`, which writes
+> through image_writer.fd (64-byte headers, `r_info = symbol << 32 |
+> type`, locals first, `.rodata` labels defined); the old body is gone.
+> The callers table below is of Nov 9.
+
 - **Path:** `compiler/elf64.fd`
-- **LOC:** 2,780
+- **LOC:** 3,554 (2026-11-21; 2,780 on Nov 9)
 - **Role:** the assembler of the old PIR-era backends: AT&T x86-64 text
   → machine code, symbols and relocations (`ElfEmitter_assemble`), then an
   ELF64 relocatable object (`ElfEmitter_build_elf`). Also `encode_asm_block`

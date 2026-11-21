@@ -22,7 +22,7 @@ pub fn __alloc(size: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 13*
+*Defined at line 12*
 
 ---
 
@@ -41,7 +41,7 @@ pub fn __free(ptr: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 19*
+*Defined at line 18*
 
 ---
 
@@ -59,7 +59,7 @@ pub fn __alloc_bytes(size: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 24*
+*Defined at line 23*
 
 ---
 
@@ -79,7 +79,7 @@ pub fn __alloc_array(count: i64, elem_size: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 30*
+*Defined at line 37*
 
 ---
 

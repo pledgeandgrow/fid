@@ -1,7 +1,7 @@
 # Internal tools: which are in Fides
 
 Roadmap AD4: every internal tool that can be in Fides is. This is the list of
-the project's own tools (Nov 15, 2026), what each is written in, and, for the
+the project's own tools (Nov 15, 2026; line counts of Nov 21), what each is written in, and, for the
 ones that are not in Fides, whether they could be and what stands in the way.
 
 **In Fides now:** the compiler and everything built into it (`fid lint`,
@@ -65,9 +65,9 @@ above), **no** (the tool is someone else's, or must not depend on `fid`).
 |---|---|---|---|---|
 | `scripts/release-notes.py` | Python, 39 lines | **ported**: `tools/release_notes.fd` | — | Same output on the real changelog (below). |
 | `scripts/release-checksums.sh` | Bash, 48 | **ported**: `tools/release_checksums.fd` | — | Uses `stdlib/crypto.fd`'s SHA-256; needs no `sha256sum`. |
-| `scripts/doctest.py` | Python, 125 | **yes** (`tools/doctest.fd`, Nov 17) | — | Extracts `/// Example:` blocks, runs each with `fid run`, 60 s timeout (native-only ones built and run with `--emit`). Same arguments and output; `tests/tools/doctest/check.sh` compares the two. |
+| `scripts/doctest.py` | Python, 259 | **yes** (`tools/doctest.fd`, Nov 17) | — | Extracts `/// Example:` blocks, runs each with `fid run`, 60 s timeout (native-only ones built and run with `--emit`). Same arguments and output; `tests/tools/doctest/check.sh` compares the two. |
 | `scripts/gen-brotli-dict.py` | Python, 88 | no | yes | Base64 of a binary file into Fides literals, checked by SHA-256: `encoding` and `crypto` have both. Run once; low value. |
-| `installer/build-installer.sh` | Bash, 157 | no | no | Drives NSIS. |
+| `installer/build-installer.sh` | Bash, 261 | no | no | Drives NSIS. |
 | `.github/workflows/*.yml`, `scripts/ci/cross.yml` | YAML | no | no | GitHub Actions. |
 | `scribe` (Rust `src/scribe.rs`) | Rust, 882 | **ported**: `compiler/scribe.fd` through `tools/scribe.fd` | — | Takes the Rust tool's command line (`-o`/`-f`, `--help`, `--version`, errors on stderr with exit 1); the installer builds it through C, and `tests/tooling/tools-selfbuild-check.sh` compares it with the Rust tool. |
 | website | — | **`tools/site.fd`** | — | New (AD2). |
@@ -76,59 +76,59 @@ above), **no** (the tool is someone else's, or must not depend on `fid`).
 
 | Tool | Language | In Fides? | Could be | Notes |
 |---|---|---|---|---|
-| `scripts/bootstrap.sh` | Bash, 223 | no | after P, but should not | Builds `fid` from `fidesc` and checks the fixpoint: it must work when no `fid` works. Keep in shell. |
-| `scripts/build-selfhost.sh` | Bash, 117 | no | no | Same reason. |
-| `scripts/verify/clean-bootstrap.sh`, `build-variant.sh`, `repro.sh` | Bash, 63/94/85 | no | after P | `git archive`, copies of the tree, rebuilds, byte comparison. `repro.sh`'s comparison could be Fides today. |
-| `verify.sh`, `verify-selfhost.sh` | Bash, 170/322 | no | after P | Drive Cargo and `fidesc test` (the Rust harness). |
-| `tests/harness.rs` (`fidesc test`) | Rust, 841 | no | after P | The suite runner of the frozen Rust compiler. A Fides runner would also free the suite from `fidesc` (needs timeouts and parallel children). |
-| `scripts/check-stdlib.sh` | Bash, 25 | **yes** (`tools/check_stdlib.fd`, Nov 17) | — | Builds one tiny program per stdlib module. The port has the same output and builds `JOBS=n` at once. |
-| `scripts/compile-gate.sh`, `bench/compile-check.sh` | Bash, 89/87 | no | after P | Parse `fid emit --time` lines, best of N, compare with a baseline file. The comparison is easy Fides; the runs need P only for a timeout. |
+| `scripts/bootstrap.sh` | Bash, 239 | no | after P, but should not | Builds `fid` from a pinned stage 0 (`release/stage0/fid`) or from `fidesc` and checks the fixpoint: it must work when no `fid` works. Keep in shell. |
+| `scripts/build-selfhost.sh` | Bash, 119 | no | no | Same reason. |
+| `scripts/verify/clean-bootstrap.sh`, `build-variant.sh`, `repro.sh` | Bash, 122/137/246 | no | after P | `git archive`, copies of the tree, rebuilds, byte comparison. `repro.sh`'s comparison could be Fides today. |
+| `verify.sh`, `verify-selfhost.sh` | Bash, 208/328 | no | after P | Drive Cargo and `fidesc test` (the Rust harness). |
+| `tests/harness.rs` (`fidesc test`) | Rust, 861 | no | after P | The suite runner of the frozen Rust compiler. A Fides runner would also free the suite from `fidesc` (needs timeouts and parallel children). |
+| `scripts/check-stdlib.sh` | Bash, 27 | **yes** (`tools/check_stdlib.fd`, Nov 17) | — | Builds one tiny program per stdlib module. The port has the same output and builds `JOBS=n` at once. |
+| `scripts/compile-gate.sh`, `bench/compile-check.sh` | Bash, 96/87 | no | after P | Parse `fid emit --time` lines, best of N, compare with a baseline file. The comparison is easy Fides; the runs need P only for a timeout. |
 | `scripts/stale-cache-test.sh` | Bash, 49 | no | after P | Edits inputs, rebuilds, checks the cache was not reused. |
-| `scripts/leak-check.sh` | Bash, 50 | no | after P | Runs `fid run --leaks`, compares with `.expected`. |
-| `scripts/nat-gate.sh`, `pass-matrix.sh`, `me-measure.sh` | Bash, 72/33/65 | no | after P | Native builds with checkers on, then results compared. |
+| `scripts/leak-check.sh` | Bash, 62 | no | after P | Runs `fid run --leaks`, compares with `.expected`. |
+| `scripts/nat-gate.sh`, `pass-matrix.sh`, `me-measure.sh` | Bash, 91/214/65 | no | after P | Native builds with checkers on, then results compared. |
 | `scripts/rules-smt.sh` | Bash, 36 | no | after P | Runs z3 on files `fid test-rules --smt` writes; z3 stays. |
-| `scripts/enc-oracle.py` | Python, 359 | no | after P | Our encoders against clang's assembler; clang stays, the driver could move. |
-| `scripts/macho-check.py` | Python, 297 | **ported**: `tools/macho_check.fd` | — | Same output and exit status on the aarch64-macos and x86_64-macos hello builds and on 124 of 126 damaged copies; the other 2 crash the script (UnicodeEncodeError on a name byte >= 0x80 on a cp1252 console). Native `emit` is blocked by `use crypto`'s @secret errors (known-bugs 2g.71): build it through C. |
+| `scripts/enc-oracle.py` | Python, 362 | no | after P | Our encoders against clang's assembler; clang stays, the driver could move. |
+| `scripts/macho-check.py` | Python, 297 | **ported**: `tools/macho_check.fd` | — | Same output and exit status on the aarch64-macos and x86_64-macos hello builds and on 124 of 126 damaged copies; the other 2 crash the script (UnicodeEncodeError on a name byte >= 0x80 on a cp1252 console). Native `emit` was blocked by `use crypto`'s @secret errors (known-bugs 2g.71, fixed Nov 19). |
 
 ### Testing on other targets
 
 | Tool | Language | In Fides? | Could be | Notes |
 |---|---|---|---|---|
-| `scripts/cross-test.sh` | Bash, 158 | no | after P | `zig cc` cross builds, qemu-user or Node runs, `JOBS` in parallel, timeouts. |
-| `scripts/wasm-test.sh` | Bash, 93 | no | after P | Same, for `fid wasm`. |
-| `scripts/wasm-run.mjs` | JavaScript, 45 | no | no | It is the WASI host: it must be Node. |
+| `scripts/cross-test.sh` | Bash, 434 | no | after P | `zig cc` cross builds, qemu-user or Node runs, `JOBS` in parallel, timeouts. |
+| `scripts/wasm-test.sh` | Bash, 106 | no | after P | Same, for `fid wasm`. |
+| `scripts/wasm-run.mjs` | JavaScript, 106 | no | no | It is the WASI host: it must be Node. |
 | `scripts/bare-qemu-test.sh` | Bash, 179 | no | after P | Boots kernels under QEMU with a timeout. |
 | `scripts/bare-run.c` | C, 113 | no | not yet | Maps a bare binary and jumps into it (Linux); Fides could with `mmap` and a call through a raw pointer, but this is the harness that checks such code. |
-| `scripts/sanitize.sh` | Bash, 66 | no | after P | ASan/UBSan builds through C. |
+| `scripts/sanitize.sh` | Bash, 192 | no | after P | ASan/UBSan builds through C. |
 
 ### Verification and fuzzing
 
 | Tool | Language | In Fides? | Could be | Notes |
 |---|---|---|---|---|
-| `scripts/fuzz/gen_programs.py`, `gen_vs_c.py` | Python, 178/657 | no | after P | Random program generators (`stdlib/random.fd` exists); running each candidate needs timeouts. A generator written in Fides would also test Fides. |
-| `scripts/fuzz/fuzz_frontend.py`, `fuzz_parsers.py` | Python, 210/141 | no | after P | Mutate inputs, run `fid check` / parsers, classify crashes. |
-| `scripts/fuzz/reduce.py` | Python, 128 | no | after P | Delta debugging over a failing program. |
-| `scripts/fuzz/triage.py` | Python, 75 | **ported**: `tools/fuzz_triage.fd` | — | Same output on a keep directory written as gen_vs_c.py writes them and on 6 random ones (decoding, newline translation, repr, grouping). Native `emit` is blocked by `memchr` missing from the msvcrt imports (2g.58): build it through C. |
-| `scripts/fuzz/nightly.sh` | Bash, 57 | no | after P | Runs the above. |
-| `scripts/verify/expect.py` | Python, 176 | no | after P | Every backend on a test file, checks what it must do. |
-| `scripts/verify/variants.py` | Python, 288 | no | after P | Builds with passes off / broken on purpose. |
-| `scripts/verify/coverage.py`, `cov_instrument.py` | Python, 202/95 | no | after P / yes | `cov_instrument.py` rewrites generated C (text in, text out): yes. `coverage.py` drives runs. |
-| `scripts/verify/chaos.py`, `soak.py`, `interleave.py` | Python, 212/108/117 | no | after P | Long-running children killed, restarted or starved on purpose: need spawn and kill. `soak.py` also reads a child's memory use. |
+| `scripts/fuzz/gen_programs.py`, `gen_vs_c.py` | Python, 590/1,121 | no | after P | Random program generators (`stdlib/random.fd` exists); running each candidate needs timeouts. A generator written in Fides would also test Fides. |
+| `scripts/fuzz/fuzz_frontend.py`, `fuzz_parsers.py` | Python, 317/156 | no | after P | Mutate inputs, run `fid check` / parsers, classify crashes. |
+| `scripts/fuzz/reduce.py` | Python, 234 | no | after P | Delta debugging over a failing program. |
+| `scripts/fuzz/triage.py` | Python, 156 | **ported**: `tools/fuzz_triage.fd` | — | Same output on a keep directory written as gen_vs_c.py writes them and on 6 random ones (decoding, newline translation, repr, grouping). Native `emit` was blocked by `memchr` missing from the msvcrt imports (2g.58, fixed Nov 16). |
+| `scripts/fuzz/nightly.sh` | Bash, 88 | no | after P | Runs the above. |
+| `scripts/verify/expect.py` | Python, 294 | no | after P | Every backend on a test file, checks what it must do. |
+| `scripts/verify/variants.py` | Python, 765 | no | after P | Builds with passes off / broken on purpose. |
+| `scripts/verify/coverage.py`, `cov_instrument.py` | Python, 671/232 | no | after P / yes | `cov_instrument.py` rewrites generated C (text in, text out): yes. `coverage.py` drives runs. |
+| `scripts/verify/chaos.py`, `soak.py`, `interleave.py` | Python, 358/108/207 | no | after P | Long-running children killed, restarted or starved on purpose: need spawn and kill. `soak.py` also reads a child's memory use. |
 
 ### Benchmarks
 
 | Tool | Language | In Fides? | Could be | Notes |
 |---|---|---|---|---|
-| `bench/run.sh` | Bash, 91 | no | after P | Builds five languages' programs, best of N wall time, a table. |
-| `bench/check.sh` | Bash, 90 | no | after P | Same, against `bench/baseline.txt`. |
+| `bench/run.sh` | Bash, 184 | no | after P | Builds five languages' programs, best of N wall time, a table. |
+| `bench/check.sh` | Bash, 169 | no | after P | Same, against `bench/baseline.txt`. |
 
 ### Package manager, docs, coverage (Rust binaries)
 
 | Tool | Rust | Fides | State |
 |---|---|---|---|
-| `ark` | `src/ark.rs`, 881 lines | `compiler/ark.fd` 761, `tools/ark.fd`, `fid ark` | Fides version builds and runs (`version`, `list`); since Nov 16 the installer builds it from `tools/ark.fd` with the shipped fid.exe through C (release N8). |
-| `scribe` | `src/scribe.rs`, 882 | `compiler/scribe.fd` 1,023, `tools/scribe.fd`, `fid doc` | `tools/scribe.fd` takes the Rust tool's command line (`-o`/`-f`, `--help`, `--version`, errors on stderr with exit 1); the installer builds it with the shipped fid.exe through C; `tests/tooling/tools-selfbuild-check.sh` compares it with the Rust scribe. |
-| `veil` | `src/veil.rs`, 367 | `compiler/veil.fd` 655, `tools/veil.fd`, `fid veil` | As scribe: the Rust tool's command line, built by the installer through C, compared with the Rust veil by `tests/tooling/tools-selfbuild-check.sh`. Only `fid emit tools/veil.fd` (pe_ir) runs out of memory, since veil imports the whole compiler (AD1). |
+| `ark` | `src/ark.rs`, 881 lines | `compiler/ark.fd` 7,169, `tools/ark.fd`, `fid ark` | Fides version builds and runs (`version`, `list`); since Nov 16 the installer builds it from `tools/ark.fd` with the shipped fid.exe through C (release N8). |
+| `scribe` | `src/scribe.rs`, 882 | `compiler/scribe.fd` 1,910, `tools/scribe.fd`, `fid doc` | `tools/scribe.fd` takes the Rust tool's command line (`-o`/`-f`, `--help`, `--version`, errors on stderr with exit 1); the installer builds it with the shipped fid.exe through C; `tests/tooling/tools-selfbuild-check.sh` compares it with the Rust scribe. |
+| `veil` | `src/veil.rs`, 367 | `compiler/veil.fd` 742, `tools/veil.fd`, `fid veil` | As scribe: the Rust tool's command line, built by the installer through C, compared with the Rust veil by `tests/tooling/tools-selfbuild-check.sh`. Only `fid emit tools/veil.fd` (pe_ir) runs out of memory, since veil imports the whole compiler (AD1). |
 
 ## The ports, checked
 

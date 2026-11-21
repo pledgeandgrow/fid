@@ -45,7 +45,7 @@ pub struct Bone {
 | `global_scale` | `vec3,  // computed global scale` |
 | `offset_matrix` | `mat4, // inverse bind pose matrix` |
 
-*Defined at line 35*
+*Defined at line 31*
 
 ---
 
@@ -62,7 +62,7 @@ pub struct Skeleton {
 | `bones` | `Vec<Bone>` |
 | `finalized` | `bool` |
 
-*Defined at line 47*
+*Defined at line 50*
 
 ---
 
@@ -74,7 +74,7 @@ pub fn skel_create() -> Skeleton {
 
 **Returns:** `Skeleton`
 
-*Defined at line 52*
+*Defined at line 68*
 
 ---
 
@@ -96,7 +96,7 @@ pub fn skel_add_bone(skel: &mut Skeleton, parent: i64, name: str, pos: vec3, rot
 
 **Returns:** `i64`
 
-*Defined at line 60*
+*Defined at line 75*
 
 ---
 
@@ -115,7 +115,7 @@ pub fn skel_find_bone(skel: &Skeleton, name: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 77*
+*Defined at line 84*
 
 ---
 
@@ -133,7 +133,7 @@ pub fn skel_compute_globals(skel: &mut Skeleton) -> void {
 
 **Returns:** `void`
 
-*Defined at line 89*
+*Defined at line 96*
 
 ---
 
@@ -151,7 +151,7 @@ pub fn skel_finalize(skel: &mut Skeleton) -> void {
 
 **Returns:** `void`
 
-*Defined at line 121*
+*Defined at line 120*
 
 ---
 
@@ -169,7 +169,7 @@ pub fn skel_bone_count(skel: &Skeleton) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 142*
+*Defined at line 138*
 
 ---
 
@@ -188,7 +188,7 @@ pub struct Keyframe {
 | `rotation` | `quat` |
 | `scale` | `vec3` |
 
-*Defined at line 148*
+*Defined at line 144*
 
 ---
 
@@ -204,7 +204,7 @@ pub struct AnimationTrack {
 |------|------|
 | `keyframes` | `Vec<Keyframe>` |
 
-*Defined at line 155*
+*Defined at line 152*
 
 ---
 
@@ -224,7 +224,7 @@ pub struct Animation {
 | `duration` | `f64` |
 | `looping` | `bool` |
 
-*Defined at line 159*
+*Defined at line 156*
 
 ---
 
@@ -243,7 +243,7 @@ pub fn skel_create_animation(name: str, bone_count: i64) -> Animation {
 
 **Returns:** `Animation`
 
-*Defined at line 168*
+*Defined at line 166*
 
 ---
 
@@ -266,7 +266,7 @@ pub fn skel_set_keyframe(anim: &mut Animation, bone_idx: i64, time: f64, pos: ve
 
 **Returns:** `void`
 
-*Defined at line 185*
+*Defined at line 181*
 
 ---
 
@@ -286,7 +286,7 @@ pub fn skel_sample_animation(anim: &Animation, time: f64) -> Vec<Keyframe> {
 
 **Returns:** `Vec<Keyframe>`
 
-*Defined at line 220*
+*Defined at line 218*
 
 ---
 
@@ -307,7 +307,7 @@ pub fn skel_compute_pose(skel: &mut Skeleton, anim: &Animation, time: f64) -> vo
 
 **Returns:** `void`
 
-*Defined at line 281*
+*Defined at line 280*
 
 ---
 
@@ -324,7 +324,7 @@ pub struct VertexWeight {
 | `bone_indices` | `Vec<i64>,   // up to 4 bone indices` |
 | `bone_weights` | `Vec<f64>,   // up to 4 bone weights (sum to 1.0)` |
 
-*Defined at line 303*
+*Defined at line 302*
 
 ---
 
@@ -385,7 +385,7 @@ pub fn skel_set_vertex_weight(skin: &mut Skin, vertex_idx: i64, b0: i64, b1: i64
 
 **Returns:** `void`
 
-*Defined at line 337*
+*Defined at line 335*
 
 ---
 
@@ -426,7 +426,7 @@ pub fn skel_blend_samples(a: Vec<Keyframe>, b: Vec<Keyframe>, weight: f64) -> Ve
 
 **Returns:** `Vec<Keyframe>`
 
-*Defined at line 377*
+*Defined at line 379*
 
 ---
 
@@ -449,7 +449,7 @@ pub fn skel_blend_poses(skel: &mut Skeleton, anim_a: &Animation, anim_b: &Animat
 
 **Returns:** `void`
 
-*Defined at line 395*
+*Defined at line 394*
 
 ---
 

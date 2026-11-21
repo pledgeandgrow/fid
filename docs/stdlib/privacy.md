@@ -10,7 +10,7 @@
 impl PrivCounter {
 ```
 
-*Defined at line 10*
+*Defined at line 7*
 
 ---
 

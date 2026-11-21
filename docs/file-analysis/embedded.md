@@ -1,7 +1,9 @@
 # embedded.fd — embedded/IoT scaffolding
 
 - **Path:** `compiler/embedded.fd` — module `compiler::embedded`
-- **LOC:** 511 (2026-11-09, unchanged). Rust `src/embedded.rs`: 622.
+- **LOC:** 504 (2026-11-21; 511 on Nov 9). Rust `src/embedded.rs`: 622.
+  Nov 21: still dead, nothing imports it. The Cortex-M code generator is
+  nat_thumb.fd, not this module.
 - **Role:** four "Phase 5B" models: `FixedBufferAllocator` (a bump
   allocator over a `Vec<i64>`), `BinarySizeOptimizer` (size report and
   advice strings), `RealTimeAnalyzer` (flags → Safe/Violation), and

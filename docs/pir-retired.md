@@ -38,10 +38,10 @@ after allocation), `fid disasm` (machine code), `fid explain <f> --stages
   `riscv_enc`, `runtime_riscv`. `elf64`, `linker` and `x86` stay:
   `fid build-x86` (`build_x86_linux`) uses them.
 
-After this, `main.fd` reaches `pir.fd` only through `elf64.fd`'s
-`use compiler::pir;` (elf64 uses nothing from it). Once that line is
-dropped, these files are reached by nothing the compiler imports and can
-be deleted: `pir.fd`, `opt.fd`, `regalloc.fd`, `codegen_x64.fd`,
+After this, `main.fd` reached `pir.fd` only through `elf64.fd`'s
+`use compiler::pir;` (elf64 used nothing from it). That line is gone
+(Nov 21: elf64.fd imports only core, vec, string and image_writer), so these
+files are reached by nothing the compiler imports and can be deleted: `pir.fd`, `opt.fd`, `regalloc.fd`, `codegen_x64.fd`,
 `codegen_arm64.fd`, `codegen_riscv.fd`, `peephole.fd`, `pe.fd`,
 `codegen.fd`, `arm64_enc.fd`, `riscv_enc.fd`, `runtime_arm64.fd`,
 `runtime_riscv.fd`, `runtime_linux.fd`, with `tests/selfhost/test_pir.fd`

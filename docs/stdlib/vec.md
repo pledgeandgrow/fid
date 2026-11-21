@@ -29,7 +29,7 @@ pub struct Vec<T> {
 | `len` | `i64` |
 | `cap` | `i64` |
 
-*Defined at line 21*
+*Defined at line 36*
 
 ---
 
@@ -39,89 +39,101 @@ pub struct Vec<T> {
 impl Vec {
 ```
 
-*Defined at line 27*
+*Defined at line 36*
 
 ---
 
 ## vec_take
 
+The first `n` elements (all of them if there are fewer) as a new Vec.
+
 ```fides
-pub fn vec_take(self: i64, n: i64) -> i64 {
+pub fn vec_take(self: Vec<i64>, n: i64) -> Vec<i64> {
 ```
 
 **Parameters:**
 
-- `self`: `i64`
+- `self`: `Vec<i64>`
 - `n`: `i64`
 
-**Returns:** `i64`
+**Returns:** `Vec<i64>`
 
-*Defined at line 278*
+*Defined at line 241*
 
 ---
 
 ## vec_skip
 
+Everything after the first `n` elements, as a new Vec.
+
 ```fides
-pub fn vec_skip(self: i64, n: i64) -> i64 {
+pub fn vec_skip(self: Vec<i64>, n: i64) -> Vec<i64> {
 ```
 
 **Parameters:**
 
-- `self`: `i64`
+- `self`: `Vec<i64>`
 - `n`: `i64`
 
-**Returns:** `i64`
+**Returns:** `Vec<i64>`
 
-*Defined at line 291*
+*Defined at line 264*
 
 ---
 
 ## vec_zip
 
+The elements of both Vecs interleaved pairwise (a0, b0, a1, b1, ...),
+up to the length of the shorter one.
+
 ```fides
-pub fn vec_zip(self: i64, other: i64) -> i64 {
+pub fn vec_zip(self: Vec<i64>, other: Vec<i64>) -> Vec<i64> {
 ```
 
 **Parameters:**
 
-- `self`: `i64`
-- `other`: `i64`
+- `self`: `Vec<i64>`
+- `other`: `Vec<i64>`
 
-**Returns:** `i64`
+**Returns:** `Vec<i64>`
 
-*Defined at line 304*
+*Defined at line 291*
 
 ---
 
 ## vec_enumerate
 
+Index and element pairs flattened into one Vec (0, v0, 1, v1, ...).
+
 ```fides
-pub fn vec_enumerate(self: i64) -> i64 {
+pub fn vec_enumerate(self: Vec<i64>) -> Vec<i64> {
 ```
 
 **Parameters:**
 
-- `self`: `i64`
+- `self`: `Vec<i64>`
 
-**Returns:** `i64`
+**Returns:** `Vec<i64>`
 
-*Defined at line 319*
+*Defined at line 317*
 
 ---
 
 ## vec_flat_map
 
+Concatenation of the Vecs that `f` returns for each element (`f`
+returns a Vec handle as an i64).
+
 ```fides
-pub fn vec_flat_map(self: i64, f: fn(i64) -> i64) -> i64 {
+pub fn vec_flat_map(self: Vec<i64>, f: fn(i64) -> i64) -> Vec<i64> {
 ```
 
 **Parameters:**
 
-- `self`: `i64`
+- `self`: `Vec<i64>`
 - `f`: `fn(i64) -> i64`
 
-**Returns:** `i64`
+**Returns:** `Vec<i64>`
 
 *Defined at line 331*
 
@@ -129,85 +141,97 @@ pub fn vec_flat_map(self: i64, f: fn(i64) -> i64) -> i64 {
 
 ## vec_chunk
 
+The start index of each chunk of `size` elements.
+A size <= 0 gives an empty Vec (never an infinite loop).
+
 ```fides
-pub fn vec_chunk(self: i64, size: i64) -> i64 {
+pub fn vec_chunk(self: Vec<i64>, size: i64) -> Vec<i64> {
 ```
 
 **Parameters:**
 
-- `self`: `i64`
+- `self`: `Vec<i64>`
 - `size`: `i64`
 
-**Returns:** `i64`
+**Returns:** `Vec<i64>`
 
-*Defined at line 348*
+*Defined at line 357*
 
 ---
 
 ## vec_window
 
+The start index of every full window of `size` consecutive elements.
+
 ```fides
-pub fn vec_window(self: i64, size: i64) -> i64 {
+pub fn vec_window(self: Vec<i64>, size: i64) -> Vec<i64> {
 ```
 
 **Parameters:**
 
-- `self`: `i64`
+- `self`: `Vec<i64>`
 - `size`: `i64`
 
-**Returns:** `i64`
+**Returns:** `Vec<i64>`
 
-*Defined at line 359*
+*Defined at line 379*
 
 ---
 
 ## vec_dedup
 
+Remove consecutive duplicates in place (sort first to remove all).
+
 ```fides
-pub fn vec_dedup(self: i64) -> void {
+pub fn vec_dedup(self: &mut Vec<i64>) -> void {
 ```
 
 **Parameters:**
 
-- `self`: `i64`
+- `self`: `&mut Vec<i64>`
 
 **Returns:** `void`
 
-*Defined at line 371*
+*Defined at line 401*
 
 ---
 
 ## vec_sort_by
 
+Sort in place with a comparison function (negative, zero or positive,
+like `a - b`). Heapsort: O(n log n) worst case, in place, no recursion.
+
 ```fides
-pub fn vec_sort_by(self: i64, cmp: fn(i64, i64) -> i64) -> void {
+pub fn vec_sort_by(self: &mut Vec<i64>, cmp: fn(i64, i64) -> i64) -> void {
 ```
 
 **Parameters:**
 
-- `self`: `i64`
-- `cmp`: `fn(i64`
+- `self`: `&mut Vec<i64>`
+- `cmp`: `fn(i64, i64) -> i64`
 
 **Returns:** `void`
 
-*Defined at line 386*
+*Defined at line 427*
 
 ---
 
 ## vec_contains_val
 
+Whether the Vec holds `value`.
+
 ```fides
-pub fn vec_contains_val(self: i64, value: i64) -> bool {
+pub fn vec_contains_val(self: Vec<i64>, value: i64) -> bool {
 ```
 
 **Parameters:**
 
-- `self`: `i64`
+- `self`: `Vec<i64>`
 - `value`: `i64`
 
 **Returns:** `bool`
 
-*Defined at line 402*
+*Defined at line 480*
 
 ---
 

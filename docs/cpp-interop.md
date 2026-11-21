@@ -5,7 +5,7 @@ C++ header with compiler/cparser.fd and binds it in three ways:
 
 - functions with C linkage (`extern "C" { }`, `extern "C" int f(..)`) are
   called directly, as from a C header; a function of `namespace a::b` is
-  `a_b_<name>` in Fides (its C symbol unchanged);
+  `a_b_<name>` in Fid (its C symbol unchanged);
 - everything else the header itself declares (not the system headers it
   includes) goes through generated `extern "C"` shims: a C++ file written
   to the temporary directory (`fidcpp_<stem>_<hash>.cpp`, the hash of the
@@ -16,7 +16,7 @@ C++ header with compiler/cparser.fd and binds it in three ways:
 
 ## What is bound
 
-| C++ | Fides |
+| C++ | Fid |
 |-----|-------|
 | `int a::f(int)` | `a_f(x: i32) -> i32` |
 | an overload | `a_f_2`, `a_f_3`, ... (noted in the bindings) |
@@ -32,7 +32,7 @@ C++ header with compiler/cparser.fd and binds it in three ways:
 | a pointer to a struct or typedef | an address (`i64`) |
 
 A program names a template instantiation by calling it: `a_f_` followed by
-one Fides type name per template parameter (`i8` .. `u64`, `f32`, `f64`,
+one Fid type name per template parameter (`i8` .. `u64`, `f32`, `f64`,
 `bool`, `str`), so `shapes_biggest_f64(2.5, 1.5)` instantiates
 `shapes::biggest<double>`.
 

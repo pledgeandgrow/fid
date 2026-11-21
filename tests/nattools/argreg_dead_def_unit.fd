@@ -1,0 +1,103 @@
+// 2g.88 (docs/reference/known-bugs.md; WP7, RA3, RA7 in
+// docs/roadmap/llvm-roadmap.md): a dead definition (a value defined and
+// never read: its hull is one position long) must not take an argument
+// register whose own value is still to be read after it. RA3's fill
+// (compiler/nat_ir.fd ng_arg_free over ng_af_fit) and RA7's hints
+// (ng_arg_fit) checked r's own value only before the range's last
+// position, so a dead `li` between `mov rdi, a` and the call took rdi
+// and overwrote the argument; the allocation checker (ng_mir_check_args)
+// rejected it: "instruction 3 defines v65 in argument register 7, whose
+// argument or result is still to be read" (test_machine_simd's case_n on
+// x86-64 with RA4's split, FID_NAT_ON=splitall builds). Through
+// nat_argfree_unit / nat_arghint_check_unit, on hand-made machine IR:
+//   0 prologue; 1 a = rdi; 2 rdi = a; 3 d = 7 (dead); 4 rsi = a;
+//   5 call; 6 epilogue
+// a starts in r12, d spilled. d must not take rdi (the call's first
+// argument is in it from 2 to 5); rsi is free there (written at 4), so
+// d takes rsi. Forcing d into rdi is rejected.
+// Op codes are compiler/nat_ir.fd's MO_* numbers (MO_LI 1, MO_MOV 2,
+// MO_CALL 9, MO_PROLOGUE 36, MO_EPILOGUE 37); values are vregs 64 and up;
+// x86-64 registers rsi 6, rdi 7, r12 12.
+// Run:
+//   fid run tests/nattools/argreg_dead_def_unit.fd
+// Expected output:
+// x64 dead def: 12 6 filled 1 traded 0 freed 0
+// x64 dead def: sound
+// x64 dead def in rdi: rejected
+// a64 dead def: 19 1 filled 1 traded 0 freed 0
+// a64 dead def: sound
+use core;
+use vec;
+use string;
+use compiler::nat_enc;
+use compiler::nat_ir;
+
+fn op(v: & mut Vec<i64>, o: i64, r0: i64, r1: i64, r2: i64, i0: i64) {
+    v.push(o);
+    v.push(r0);
+    v.push(r1);
+    v.push(r2);
+    v.push(i0);
+    v.push(0);
+    v.push(0);
+}
+
+fn show(res: & Vec<i64>, nv: i64) -> str {
+    var s: str = "";
+    var i: i64 = 0;
+    while i < nv {
+        if i > 0 {
+            s = s + " ";
+        }
+        s = s + int_to_str(res.get(i));
+        i = i + 1;
+    }
+    return s + " filled " + int_to_str(res.get(nv)) + " traded " + int_to_str(res.get(nv + 1)) + " freed " + int_to_str(res.get(nv + 2));
+}
+
+fn verdict(msg: str) -> str {
+    if str_len(msg) == 0 {
+        return "sound";
+    }
+    return "rejected";
+}
+
+fn regs2(a: i64, b: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    v.push(a);
+    v.push(b);
+    return v;
+}
+
+/// a = argument register r0 (the parameter); argument 0 = a; d = 7, never
+/// read; argument 1 = a; call; return
+fn dead_shape(r0: i64, r1: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    op(& mut v, 36, 0, 0, 0, 0);
+    op(& mut v, 2, 64, r0, 0, 0);
+    op(& mut v, 2, r0, 64, 0, 0);
+    op(& mut v, 1, 65, 0, 0, 7);
+    op(& mut v, 2, r1, 64, 0, 0);
+    op(& mut v, 9, 0, 0, 0, 99);
+    op(& mut v, 37, 0, 0, 0, 0);
+    return v;
+}
+
+fn run_case(arch: i64, name: str, flat: & Vec<i64>, nv: i64, init: & Vec<i64>) {
+    var res: Vec<i64> = nat_argfree_unit(arch, flat, nv, init, false);
+    println(name + ": " + show(& res, nv));
+    println(name + ": " + verdict(nat_arghint_check_unit(arch, flat, nv, & res)));
+}
+
+fn main() {
+    var x: Vec<i64> = dead_shape(7, 6);
+    var init: Vec<i64> = regs2(12, 0 - 1);
+    run_case(NAT_X64, "x64 dead def", & x, 2, & init);
+    var forced: Vec<i64> = regs2(12, 7);
+    println("x64 dead def in rdi: " + verdict(nat_arghint_check_unit(NAT_X64, & x, 2, & forced)));
+
+    // AArch64: x0 and x1 the argument registers, x19 callee-saved
+    var a: Vec<i64> = dead_shape(0, 1);
+    var ainit: Vec<i64> = regs2(19, 0 - 1);
+    run_case(NAT_A64, "a64 dead def", & a, 2, & ainit);
+}

@@ -7,10 +7,10 @@
 > not measurements. What is true today:
 >
 > - **Compile speed:** `fidesc emit` builds hello world in 0.39 s (Nov 3);
->   `fid` turns its own 158,516 lines into C in 74 s when built at -O2
->   (Nov 9; about 2,100 lines/s; type check 18 s, borrow check 5 s, mono
->   5 s, lowering 24 s, C generation 20 s), 229 s at -O0, and `fidesc` in
->   ~21 s. Go and Zig compile on the order of 100,000
+>   `fid` turns its own ~361K lines into C in 57 s when built at -O2
+>   (Nov 21; about 6,300 lines/s; type check 4.8 s, borrow check 0.7 s,
+>   mono 0.6 s, lowering 32.9 s, C generation 19.3 s; Nov 9: 158,516 lines
+>   in 74 s), and `fidesc` in ~45 s. Go and Zig compile on the order of 100,000
 >   lines/s. "Sub-second" holds for small programs only.
 > - **Runtime speed:** fib(40) 1.34 s native, 0.81 s through C, 0.53 s Rust
 >   ([scoreboard](../roadmap/competitive-roadmap.md#the-scoreboard)).
@@ -23,8 +23,10 @@
 > - **Borrow checker:** Fides has one (`--borrowck=on` by default); it is
 >   simpler than Rust's because references cannot be stored or returned.
 > - **Platforms:** native output is Windows x64 (`fid emit`; async and
->   tasks work natively since Nov 6); Linux through C; ARM64, RISC-V, WASM, macOS, native ELF and
->   bare metal are experimental / incomplete ([platforms](platforms.md)). The
+>   tasks work natively since Nov 6) and, partly tested, Linux x64, ARM64
+>   and RISC-V 64 (`fid emit --target ...-linux`, the machine layer); other
+>   systems through C; WASM, macOS native and bare metal are experimental
+>   ([platforms](platforms.md)). The
 >   embedded and robotics niches below depend on those targets.
 > - **Generics** (proposal 0002) are in `fid`: inference or an error, bounds
 >   checked, turbofish with arity check.
@@ -35,7 +37,7 @@
 >   ownership rule of proposal 0004 (Nov 7–8; data shared until the first
 >   write), struct copies included (Nov 15); the full suite has not run
 >   with `fid` as the compiler.
-> - **Safety annotations** are 17 checked rules
+> - **Safety annotations** are 21 checked rules
 >   ([safety-rules.md](safety-rules.md)); `fid qualify` writes evidence that
 >   always says `NOT_QUALIFIED`. Fides is not suitable for medical,
 >   automotive or avionics use: the medical, automotive and avionics sections
@@ -85,10 +87,12 @@
 >   pointers, and IO are not rolled back; assigning a global inside a txn is
 >   an error (`test_txn_abort`, `test_txn_global_fail`). A panic still ends
 >   the program.
-> - **Not working in `fid`:** `build-x86` (out of memory), `fid wasm` (the module fails
->   `WebAssembly.validate`), stack traces in natively built programs (the
->   panic message only), ARM64/RISC-V codegen (assembly text that nothing
->   assembles or runs). The 23-pass optimizer, peephole and LTO rows below
+> - **Not working in `fid`:** `build-x86` (out of memory on Nov 6; its exe
+>   is untested since, known-bugs 2g.16). Fixed since: `fid wasm` modules
+>   validate and run (Nov 15, 316 of 344 suite tests), and ARM64/RISC-V
+>   native code comes from the machine layer (`fid emit --target
+>   aarch64-linux|riscv64-linux`, Nov 7–9; the old PIR assembly text was
+>   removed Nov 17). The 23-pass optimizer, peephole and LTO rows below
 >   are `fidesc`'s `build` path; `fid emit` runs a small IR optimizer.
 >
 > Numbers: [selfhost.md → Numbers](selfhost.md#numbers).
@@ -220,8 +224,9 @@ extern "C" fn SSL_CTX_new(method: *const SSL_METHOD) -> *mut SSL_CTX;
 $ fidesc emit hello.fd
 Emitted native executable (113152 bytes)   ← 0.39 s, Nov 3
 ```
-Large programs are slower: the compiler itself (158,516 lines) takes 74 s
-to turn into C with an -O2 `fid` (Nov 9; CS1–CS7 in the competitive roadmap).
+Large programs are slower: the compiler itself (~361K lines) takes 57 s
+to turn into C with an -O2 `fid` (Nov 21; 74 s for 158,516 lines on Nov 9;
+CS1–CS7 in the competitive roadmap).
 
 ### Hot Reload (target)
 `fidesc watch` rebuilds and reruns the program on save and reports which
@@ -369,9 +374,9 @@ Advocacy (people recommend Fides to others)
 | Dimension | Current | Target | How |
 |---|---|---|---|
 | Performance | 7/10 | 9/10 | Custom codegen with 23 opt passes (enabled by default), LTO (`--lto`), loop vectorization + SLP (SSE2, constant trips). No PGO, no variable-trip vectorization. LLVM is 20+ years ahead but gap is narrowing. |
-| Safety | 8/10 | 10/10 | Capabilities + effects + sandbox + borrow checker + reference escape check + 17 safety rules enforced at compile time. Data races: globals need a lock, spawned arguments must be `@send`; a `Vec` passed to a thread is shared unchecked. `var b = a` on a `Vec` aliases (copy-on-write off). Binary hardening (stack canaries, PIE, RELRO, NX stack). |
+| Safety | 8/10 | 10/10 | Capabilities + effects + sandbox + borrow checker + reference escape check + 21 safety rules enforced at compile time. Data races: globals need a lock, spawned arguments must be `@send`; a `Vec` passed to a thread is shared unchecked. `var b = a` on a `Vec` shares the data until the first write (copy-on-write, proposal 0004). Binary hardening (stack canaries, PIE, RELRO, NX stack). |
 | Flexibility | 7/10 | 10/10 | Inline assembly (x86 only), comptime, FFI, dynamic loading, conditional compilation. Bare metal and ARM64/RISC-V are incomplete. No C++ interop. |
-| Compilation | 5/10 | 10/10 | Custom IR, no LLVM, integrated linker on Windows. Sub-second for small programs; ~1,000 lines/s for `fid` on large ones (Nov 6) |
+| Compilation | 5/10 | 10/10 | Custom IR, no LLVM, integrated linker on Windows. Sub-second for small programs; ~6,300 lines/s for `fid` on its own source (Nov 21) |
 | Ecosystem | 2/10 | 8/10 | Package manager (ark) implemented, no crates registry yet, doc generator (scribe) implemented, 403 stdlib modules. Rust has 100k+ crates. C has everything. |
 | Metaprogramming | 8/10 | 10/10 | comptime is powerful: `@derive(Debug/Clone/Serialize/Deserialize)`, `comptime gen { }`, reflection. No procedural macros. |
 | Concurrency | 6/10 | 10/10 | OS threads (`spawn`, `@send` arguments), `parallel { }`, green tasks (`async fn`, `task` module), bounded MPSC channels, `select`, atomics (`use atomic`). Native async works since Nov 6. |
@@ -381,12 +386,12 @@ Advocacy (people recommend Fides to others)
 | Community | 1/10 | 7/10 | Independent, no corporate backing. Rust has Mozilla/AWS/Google. Zig has Zig Foundation. |
 
 > **Current state (Aug 2026, corrected Nov 6):**
-> - ⚠️ **Compilation is fast only for small programs** — sub-second for hello world; the 158,516-line compiler takes 74 s with an -O2 `fid` (Nov 9)
+> - ⚠️ **Compilation is fast only for small programs** — sub-second for hello world; the ~361K-line compiler takes 57 s with an -O2 `fid` (Nov 21; 74 s for 158,516 lines on Nov 9)
 > - ✅ **Safety checks work** — effects + capabilities (per call) + borrow checker + escape check are enforced at compile time; regions are scopes with budgets
 > - ⚠️ **Hot reload is recompile-and-restart** — `fidesc watch` rebuilds and reruns (Linux ELF), reports changed functions, keeps `persist` variables; no in-process swap
 > - ✅ **Custom toolchain works** — self-hosted codegen, linker, ELF/PE/Mach-O/COFF emitters
-> - ⚠️ **`sandbox { }`** — rejects direct IO calls in the block; IO through a called function or `p_file_read` gets through (Nov 6)
-> - ⚠️ **Memory budgets** — `region r with budget(N)` counts declared locals only, not heap growth (Nov 6)
+> - ✅ **`sandbox { }`** — rejects IO in the block and in any function it calls, `p_file_read` included (fixed by Nov 15; until then IO through a called function got through)
+> - ✅ **Memory budgets** — `region r with budget(N)` counts heap growth too, through any function the block calls (fixed by Nov 15; until then declared locals only)
 > - ✅ **`watch --diff` works** — PIR L2 line diff + binary size delta on each reload
 > - ✅ **Capability-aware linking works** — `--caps` flag strips ungranted functions from binary
 > - ✅ **Optimizer enabled by default** — 23 passes including const-fold, CSE, GVN, DCE, DSE, inline, unroll, TCO, loop-vec, SLP. `--lto` for aggressive cross-module inlining.
@@ -435,8 +440,8 @@ What can you do in Fides that you can't do in any other language?
 - **Write a safe OS kernel with hot reload** — Rust can do safe kernels but no hot reload. Zig can do hot reload but no safety. C can do kernels but no safety. *(Note: Fides's kernel story is theoretical — no real kernel has been written in Fides yet.)*
 - **Write a robot control system with real-time guarantees and memory safety** — Rust's async doesn't support real-time well. Zig has no safety. C has no safety. *(Note: Fides's real-time effects are parsed but the runtime doesn't enforce deadlines yet.)*
 - **Deploy a web server with zero external dependencies** — Rust needs a linker. Zig needs a linker. C needs everything. *(Note: Fides's HTTP stdlib is basic — not production-grade.)*
-- **Run untrusted plugins with compile-time proof they can't do IO** — the goal of `sandbox { }`. ❌ Not today: a function called from the block can do IO (Nov 6).
-- **Prove an embedded system stays within 4KB of memory at compile time** — the goal of `region r with budget(4096)`. ❌ Not today: the budget counts declared locals, not heap allocations (Nov 6).
+- **Run untrusted plugins with compile-time proof they can't do IO** — the goal of `sandbox { }`. Checked since Nov 15: IO in a function called from the block is rejected too (until then it got through).
+- **Prove an embedded system stays within 4KB of memory at compile time** — the goal of `region r with budget(4096)`. Checked since Nov 15: heap growth counts, and what has no size known at compile time is rejected (until then only declared locals counted).
 - **Strip all network code from a binary by not granting the Net capability** — `fidesc build --caps "IO"` removes Net-dependent functions. No other linker does this. ✅ This works today.
 - **See what the optimizer did when you changed one line** — `fidesc watch --diff` shows PIR + binary size changes. LLVM compilers are black boxes. ✅ This works today.
 
@@ -718,9 +723,9 @@ Fides's authority is explicit and revocable, verified at compile time.
 | Register allocation | ✅ Graph coloring (mature) | ⚠️ Linear scan (known bug) |
 | Zero-cost abstractions | ✅ Yes | ✅ Yes (capabilities, effects, regions all zero-cost) |
 | Inline assembly | ✅ Yes (all architectures) | ⚠️ Yes (`asm!`) — x86 only |
-| Bare metal support | ✅ Yes | ⚠️ `fid emit --bare` since Nov 6 (flat binary, COM1; not yet run under QEMU) |
+| Bare metal support | ✅ Yes | ⚠️ `fid emit --bare` since Nov 6 (Multiboot flat binary, COM1; bare-metal.yml boots the test_bare_* tests under QEMU, green Nov 20) |
 | SIMD | ✅ Yes (intrinsics, auto-vec) | ✅ Yes (stdlib `simd.fd` + auto-vec) |
-| Compilation speed | ⚠️ Fast but needs external tools | ⚠️ Not measured against Zig; `fid` ~1,000 lines/s on large code (Nov 6) |
+| Compilation speed | ⚠️ Fast but needs external tools | ⚠️ Not measured against Zig; `fid` ~6,300 lines/s on its own source (Nov 21) |
 | Binary size | ⚠️ Can be small with effort | ✅ Smaller by default (DCE, no libc, `--caps` stripping) |
 
 **Verdict:** C wins on raw code quality today (LLVM/GCC have 40+ years of
@@ -813,7 +818,7 @@ doesn't.
 | macOS | ✅ Full (native) | ⚠️ Mach-O objects (not fully tested) |
 | WASM | ⚠️ Emscripten (external) | ⚠️ Native `fidesc wasm` (no WASI) |
 | GPU | ❌ CUDA/OpenCL (external) | ✅ Native SPIR-V `fidesc gpu` |
-| Bare metal | ✅ Yes (mature) | ⚠️ `fid emit --bare` since Nov 6 (flat binary, COM1; not yet run under QEMU) |
+| Bare metal | ✅ Yes (mature) | ⚠️ `fid emit --bare` since Nov 6 (Multiboot flat binary, COM1; bare-metal.yml boots the test_bare_* tests under QEMU, green Nov 20) |
 | ARM64 | ✅ Full (cross-compile) | ✅ Full (zero-tool cross-compile) |
 | RISC-V | ✅ Full (cross-compile) | ✅ Full (zero-tool cross-compile) |
 | Cross-compilation | ✅ Mature cross-toolchains | ✅ Zero-tool (`--target arm64-linux`) |
@@ -917,9 +922,9 @@ can't do IO.
 | Register allocation | ✅ Graph coloring (LLVM) | ⚠️ Linear scan (known bug) |
 | Zero-cost abstractions | ✅ Yes | ✅ Yes |
 | Inline assembly | ✅ Yes (`asm!`, all arches) | ⚠️ Yes (`asm!`) — x86 only |
-| Bare metal | ✅ Yes (`no_std`) | ⚠️ `fid emit --bare` since Nov 6 (flat binary, COM1; not yet run under QEMU) |
+| Bare metal | ✅ Yes (`no_std`) | ⚠️ `fid emit --bare` since Nov 6 (Multiboot flat binary, COM1; bare-metal.yml boots the test_bare_* tests under QEMU, green Nov 20) |
 | SIMD | ✅ Yes (std::simd, auto-vec) | ✅ Yes (stdlib `simd.fd` + auto-vec) |
-| Compilation speed | ❌ Slow on large projects | ⚠️ Sub-second for small programs; 74 s for `fid`'s own 158,516 lines with an -O2 `fid` (Nov 9) |
+| Compilation speed | ❌ Slow on large projects | ⚠️ Sub-second for small programs; 57 s for `fid`'s own ~361K lines with an -O2 `fid` (Nov 21) |
 | Binary size | ⚠️ Moderate (monomorphization bloat) | ✅ Small (DCE + `--caps` stripping) |
 | Escape analysis | ✅ LLVM | ❌ Not yet |
 | Tail call optimization | ✅ LLVM | ✅ TCO (enabled by default) |

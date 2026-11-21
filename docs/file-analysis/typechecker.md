@@ -6,7 +6,21 @@
 > the edges (guards, generic types, methods), listed below.
 
 - **Path:** `compiler/typechecker.fd`
-- **LOC:** 12,526 (was 7,673 on 10-22; Rust `src/typechecker.rs`: 8,684). 132 `TypeChecker_*` functions.
+- **LOC:** 24,758 (2026-11-21; 12,526 on Nov 9, 7,673 on 10-22; Rust `src/typechecker.rs`: 8,684). 215 `TypeChecker_*` functions (132 on Nov 9).
+- **Nov 21:** fixed since the audit below: a guarded arm covers nothing and
+  generic enums (`Option<T>`, `Result`, user `E<T>`, `&E`) are checked by
+  variants (known-bugs 2g.7, Nov 15; the first two MEDIUM findings);
+  generic structs can be used (test_generic_struct,
+  test_generic_struct_return; a literal that leaves a bare `T` field open
+  is an error, 2g.28); a function two imports define is "ambiguous", not
+  "undefined" (2g.37). Still true: an unknown trait in a bound is skipped
+  (`!TypeChecker_is_trait_name(self, tr)`). New open: `a ?? b` on
+  `Option<str>` typed `i64` (2g.54), `?` in a function returning `i64`
+  (2g.55), `for x in v` over `&Vec<i64>` (2g.56), indexing a global Vec
+  (2g.74), `"n = " + 5` accepted (2g.75), a non-void function that can end
+  without `return` (2g.76), an integer literal named by its narrowest type
+  in an error (2g.87), 14 of 422 expect-error tests fail (2g.112). Line
+  numbers below are from Nov 9.
 - **Role:** Types, effects, capabilities, safety annotations, generics (bounds, inference), borrowed strings and `@scoped` structs, linear types, `@send`/`@sync`, sandbox checks. Runs on every compile path.
 - **Imports:** `core`, `vec`, `string`, `compiler::ast`, `compiler::escape` (`esc_idents_stmts`, for linear captures at :8374).
 

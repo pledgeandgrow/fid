@@ -4,7 +4,12 @@
 > The two Oct 23 findings (f-string stub, missing resume/spawn scope/cancel scope) are fixed.
 
 - **Path:** `compiler/parser.fd`
-- **LOC:** 5,708 (was 5,358; Rust `src/parser.rs`: 3,657)
+- **LOC:** 10,621 (2026-11-21; 5,708 on Nov 9, 5,358 on Oct 22; Rust `src/parser.rs`: 3,657).
+  Nov 21: imported by compiler, comptime_eval, main, pe_ir and secrecy. A capitalised
+  `Name { field:` is a struct literal even when the struct comes from an import (known-bugs
+  2g.38, fixed Nov 15, test_import_struct_lit). `parse_expr_iterative` is still there (only
+  called from itself). The other findings were not re-checked; line numbers below are from
+  Nov 9.
 - **Role:** `Vec<Token>` to `Program`. Each `parse_*` returns a `ParseResult*` enum (Ok/Err).
   Errors are collected per top-level item; `parse()` returns them joined with `"\n"` (:569-571).
 

@@ -9,81 +9,110 @@ sessions; their docs say so). The open bugs that audit found are collected
 in `docs/reference/known-bugs.md` §2g. This table replaces the 2026-10-22/23
 one; that pass's record follows the template below.
 
-> **Coverage gap (Nov 19):** `compiler/` now has 80 modules. The 11 added
-> since the audit have no page yet: `ast_ser`, `build_info`, `disasm`,
-> `image_writer`, `ir_ser`, `mir`, `nat_thumb`, `pdb`, `pgo`, `ssa`, `tv`.
+> **Nov 21 update:** `compiler/` has 80 modules (361,858 lines, `wc -l
+> compiler/*.fd`; 360,657 at HEAD, 9 files hold +1,201 uncommitted lines:
+> compiler, comptime_eval, iropt, iropt_me, lower, nat_enc, nat_ir, pe_ir,
+> pe_ir_stubs); 56 are reached from main.fd through `use`, 24 are not.
+> The 11 modules added since the audit have a page now (rows 69-79). Every
+> page's line count is of Nov 21, and each page has a dated note on what
+> changed since Nov 9: fixes (known-bugs 2g.1-2g.78), the new open bugs of
+> the Nov 21 check (2g.79-2g.113) and the retirement of the PIR path
+> (MI18, Nov 17; docs/pir-retired.md), which made pir, opt, regalloc,
+> peephole, codegen_x64/arm64/riscv, coff, macho, pe, the PIR runtimes and
+> assemblers unreachable. The findings below each note were not all
+> re-checked; their line numbers are of the day the page was written. The
+> State column is of Nov 21; the headlines keep the Nov 9 finding where it
+> still holds.
+>
+> **Nov 21, uncommitted:** the 9 working-tree diffs fix known-bugs 2g.80,
+> 2g.81, 2g.88, 2g.89, 2g.94-2g.96, 2g.98, 2g.99, 2g.106, 2g.109 and 2g.110,
+> harden comptime evaluation (fatal errors, fuel, traces, checked
+> arithmetic, lowerer-computed layouts) and cache the FID_NAT_* switches
+> once per image (RA14). The affected pages carry a "Nov 21, uncommitted"
+> note; whether the suite agrees is not re-checked here.
 
-| # | File | State (Nov 9) | Headline |
-|---|------|---------------|----------|
-| 1 | [ark.fd](ark.md) | live, buggy | `fid ark`. Directory path deps "do not exist" on Windows; `lock` drops deps; `update <name>` ignores the name |
+| # | File | State (Nov 21) | Headline |
+|---|------|----------------|----------|
+| 1 | [ark.fd](ark.md) | live | `fid ark`, now 7,169 lines with a registry (the pacts index). Directory pacts, file pacts and the empty lock no longer reproduce (2g.63); `update <name>`, git pacts and the lock contents not re-checked |
 | 2 | [arm64_enc.fd](arm64_enc.md) | dead | No command reaches it. Earlier fp/mov sp/LSL/rodata bugs fixed; new: 64-bit `asr #imm` encoded as LSR |
-| 3 | [ast.fd](ast.md) | live | 37 importers. Unused `use string`, duplicate helpers, silent fallback values |
+| 3 | [ast.fd](ast.md) | live | 44 importers (34 reached). Unused `use string`, duplicate helpers, silent fallback values |
 | 4 | [autograd.fd](autograd.md) | dead | No importer; no-op shim. Header gradient table wrong for mul/matmul |
-| 5 | [borrowck.fd](borrowck.md) | live | `--borrowck=warn` prints nothing; `_ => {}` hides Cast/Tuple/Pipe (`g(&mut x,&mut x) as i64` accepted); nested field writes unchecked |
-| 6 | [checks.fd](checks.md) | live | Counted loops, ranges, `Vec::filled` bounds. asm clobber id -1 panics `peir_loop_facts`; ownership calls defeat the loop proof |
-| 7 | [codegen.fd](codegen.md) | dead | Imported by compiler.fd, nothing called; still compiled into every self-compile |
-| 8 | [codegen_arm64.fd](codegen_arm64.md) | partly live | `codegen --target arm64`: `return` instead of `ret`, lost string args |
-| 9 | [codegen_c.fd](codegen_c.md) | live | `f32 %` and float bit casts give invalid C; libc-name clashes; unbounded thread tables |
-| 10 | [codegen_riscv.fd](codegen_riscv.md) | partly live | Same as arm64; `sub reg, sp, imm` |
-| 11 | [codegen_x64.fd](codegen_x64.md) | partly live | PIR commands only; call ABI has no xmm/sret; scratch registers overlap the pool |
-| 12 | [coff.fd](coff.md) | live | `codegen --coff` valid; slow symbol lookups; no >65,535 relocations |
-| 13 | [compiler.fd](compiler.md) | live | Pipeline. `--borrowck=warn` reads `bc.errors`; `@cfg(debug)` never holds; unconditional `[build]` stderr |
-| 14 | [comptime_eval.fd](comptime_eval.md) | live | `if` assignments inside a `comptime fn` lost; errors dropped; impl methods not substituted |
+| 5 | [borrowck.fd](borrowck.md) | live | `--borrowck=warn`, casts and nested field writes fixed Nov 15 (2g.9); `swap(&mut v[0], &mut v[1])` rejected (2g.73) |
+| 6 | [checks.fd](checks.md) | live | Counted loops, ranges, `Vec::filled` bounds. The asm clobber crash is fixed (2g.53); ownership calls defeat the loop proof |
+| 7 | [codegen.fd](codegen.md) | dead | Nothing imports it since MI18; no longer compiled into `fid` |
+| 8 | [codegen_arm64.fd](codegen_arm64.md) | dead | Unreached since MI18 (Nov 17): `codegen --target arm64` is the machine layer |
+| 9 | [codegen_c.fd](codegen_c.md) | live | `f32 %`, float bit casts and libc-name clashes fixed (2g.13); open: `byte` vs rpcndr.h (2g.69), extern names equal to core's (2g.107), unbounded thread tables |
+| 10 | [codegen_riscv.fd](codegen_riscv.md) | dead | Unreached since MI18: `codegen --target riscv` is the machine layer |
+| 11 | [codegen_x64.fd](codegen_x64.md) | dead | Unreached since MI18 (only pe.fd imports it) |
+| 12 | [coff.fd](coff.md) | dead | Unreached since MI18; `codegen --coff` goes through nat_enc and fails on every program (2g.110) |
+| 13 | [compiler.fd](compiler.md) | live | Pipeline, 13,468 lines. warn mode and `@cfg(debug)` fixed (2g.9, 2g.14); unconditional `[build]`/`[prof]` stderr; `ccompile --fuzz-cov` double free (2g.83) |
+| 14 | [comptime_eval.fd](comptime_eval.md) | live | `if` assignments in a `comptime fn` kept and errors returned (2g.19); impl-method substitution not re-checked |
 | 15 | [cowcheck.fd](cowcheck.md) | partly live | Report opt-in (`FIDES_COW_CHECK`), premise stale; walkers live in lowering |
-| 16 | [cparser.fd](cparser.md) | live | `parse-header`, rewritten (macros, typedefs). `long` always i32; `#ifdef` not evaluated |
-| 17 | [csplit.fd](csplit.md) | live | `split-c`, used by the release build. `cs_strip_static` strips `static` from function locals (in the shipped fid.exe) |
-| 18 | [debugger.fd](debugger.md) | dead | No `debug` command; `str_find_char` gets a string, commands never split |
-| 19 | [diag.fd](diag.md) | dead | Not wired; fails `fid check`; fid prints no error codes |
-| 20 | [egraph.fd](egraph.md) | live | nat_ir path. Wrapping reassociation in checked code; quadratic `!!b` scan |
-| 21 | [elf64.fd](elf64.md) | partly live | 56-byte section headers (sh_addr never written): readelf rejects, linker reads nothing; arm64/riscv `--elf` empty |
+| 16 | [cparser.fd](cparser.md) | live | `parse-header`. `#if`/`#ifdef` evaluated where known (LG15); parameters keep their C type (2g.62); `long` always i32 |
+| 17 | [csplit.fd](csplit.md) | live | `split-c`, used by the release build. `static` stripped from the function head only (2g.1 fixed) |
+| 18 | [debugger.fd](debugger.md) | dead | No `debug` command (`fid replay` exists, CT7, without this module); `str_find_char` gets a string, commands never split |
+| 19 | [diag.fd](diag.md) | dead | Not wired; passes `fid check` again (2g.22); fid prints no error codes |
+| 20 | [egraph.fd](egraph.md) | live | Machine-layer path and `emit-ir --mid-end`. Wrapping reassociation in checked code; quadratic `!!b` scan (not re-checked) |
+| 21 | [elf64.fd](elf64.md) | partly live | `build-x86` only. 64-byte section headers through image_writer (2g.16 fixed, TG13) |
 | 22 | [embedded.fd](embedded.md) | dead | No importer (dead in Rust too); unchecked functions reported Safe(0) |
 | 23 | [escape.fd](escape.md) | live | Solid on probes; a ref passed to a `p_*` builtin is unchecked |
-| 24 | [flat_ast.fd](flat_ast.md) | dead | Not imported; `dump-ast-flat` prints the summary; fails `fid check` |
-| 25 | [fmt.fd](fmt.md) | live, destructive | `a<b` / `>>` collapse the rest of the file; overwrites the input |
-| 26 | [gpu.fd](gpu.md) | partly live | SPIR-V word counts off by one; PTX labels and registers wrong |
-| 27 | [green_thread.fd](green_thread.md) | partly live | Interpreter only. A thread that yields twice blocks the next |
+| 24 | [flat_ast.fd](flat_ast.md) | dead | Not imported; `dump-ast-flat` prints the summary; passes `fid check` again (2g.22) |
+| 25 | [fmt.fd](fmt.md) | live | `a<b`, `>>` and prefix-operator corruption fixed (2g.6, 2g.62); refuses to write when tokens would change |
+| 26 | [gpu.fd](gpu.md) | partly live | Rewritten from the IR (2g.21); SPIR-V has no structured control flow; calls, memory, floats not translated |
+| 27 | [green_thread.fd](green_thread.md) | partly live | Interpreter only. A thread that yields twice blocks the next (2g.20) |
 | 28 | [hotreload.fd](hotreload.md) | dead | `fid watch` runs bench; missing builtins |
-| 29 | [inc.fd](inc.md) | live | Stamps, `.fidcache`, core stamp. Key omits FID_VERIFY/FIDES_CFLAGS/FID_RULES_ON/FID_NAT_ON; memory key ignores borrowck mode |
-| 30 | [interp.fd](interp.md) | live | `fid run`. printf unformatted; memory never reused; no FFI beyond a few libc calls, no interleaving tasks |
-| 31 | [ir.fd](ir.md) | live | Indexes, reachability, dead functions. `IrModule_get_function` does not check the name; some lookups still scan |
-| 32 | [iropt.fd](iropt.md) | live | ~20 passes, Windows and nat_ir paths. SCCP narrow-int folding and NaN-unsound branchfacts, both on by default |
-| 33 | [iropt_me.fd](iropt_me.md) | partly live | All opt-in. Alias query treats raw pointer params as disjoint `&mut` |
-| 34 | [irverify.fd](irverify.md) | live, opt-in | `FID_VERIFY=1`; reports asm clobbers; skipped on a stamp hit |
+| 29 | [inc.fd](inc.md) | live | Stamps, `.fidcache`, core stamp. Key still omits FID_VERIFY/FID_RULES_ON/FID_NAT_ON/FID_LIBFACTS* (2g.15); function cache not byte-identical (2g.82); seeded store, IR units (2g.91, 2g.92) |
+| 30 | [interp.fd](interp.md) | live | `fid run`. Tasks interleave (LG11); printf unformatted (2g.20); `str` params (2g.45), OOM (2g.49), u64 printed signed (2g.52) |
+| 31 | [ir.fd](ir.md) | live | Indexes, reachability, the pe_ir name helpers. `IrModule_get_function` does not check the name |
+| 32 | [iropt.fd](iropt.md) | live | Mid-end, 11,143 lines. SCCP and NaN branchfacts fixed (2g.11, 2g.12); SCCP overflow on the compiler (2g.89); memo mismatches (2g.93) |
+| 33 | [iropt_me.fd](iropt_me.md) | live | 15 passes on by default (`IME_DEFAULT_ON`, ssa among them). Unroll with a dead store on pe_ir (2g.80), sra (2g.94) |
+| 34 | [irverify.fd](irverify.md) | live, opt-in | `FID_VERIFY=1`; skipped on a stamp hit; rejects two suite programs after iropt (2g.109) |
 | 35 | [json.fd](json.md) | live | Malformed numbers accepted; surrogate pairs not combined |
-| 36 | [lexer.fd](lexer.md) | live | `5e3` lexes as `5` `e3`; unknown char ends an imported module silently |
-| 37 | [linker.fd](linker.md) | partly live | Links no user code (elf64 headers); missing entry not an error |
-| 38 | [lower.fd](lower.md) | live | Ownership 0004. Uninitialised var from match payload freed twice (veil); asm clobber id -1; some calls without effects; struct copy shares Vec fields |
-| 39 | [lsp.fd](lsp.md) | partly live | Diagnostics only (at line 0); symbol requests end in Double free |
-| 40 | [macho.fd](macho.md) | live | `codegen --macho` header correct, never linked; x86-64 only |
-| 41 | [main.fd](main.md) | live | Dispatch of 40 commands. `build --native` (default target) panics; POSIX `build` uses a cruder C command |
-| 42 | [mono.fd](mono.md) | live | Generic calls inside closures, f-strings, `\|>`, sandbox, parallel not renamed; no turbofish on the no-std path |
-| 43 | [nat_enc.fd](nat_enc.md) | live | Encoders and ELF/PE writers. Linux image is one RWX segment |
-| 44 | [nat_ir.fd](nat_ir.md) | live | Machine layer for Linux AArch64/RISC-V/x86-64 and `--nat`. Uncommitted WP17/WP8 code latent or inert |
+| 36 | [lexer.fd](lexer.md) | live | `5e3` fixed; an unknown character is a `BadChar` error token (2g.18) |
+| 37 | [linker.fd](linker.md) | partly live | `build-x86` only; header cause fixed (TG13), exe not run since; missing entry not an error |
+| 38 | [lower.fd](lower.md) | live | Ownership 0004, 27,878 lines. 2g.2, 2g.3 and the clobber crash fixed; function-pointer struct results (2g.47), global u64 (2g.72) |
+| 39 | [lsp.fd](lsp.md) | live | Double free and line-0 diagnostics fixed (2g.5); references, signatureHelp, inlayHint, codeAction, formatting added |
+| 40 | [macho.fd](macho.md) | dead | Unreached since MI18; `codegen --macho` and macOS executables come from nat_enc |
+| 41 | [main.fd](main.md) | live | 55 command names. `build --native` is the machine layer (MI18); POSIX `build` too (CB4); `run --timeout` not enforced |
+| 42 | [mono.fd](mono.md) | live | Nested generic calls renamed (2g.8); no turbofish on the no-std path; `Vec.map` type change (2g.66), packs (2g.84), trait defaults (2g.97) |
+| 43 | [nat_enc.fd](nat_enc.md) | live | Encoders and writers (through image_writer). Linux code R+X, data RW (TG14); DWARF/CFI (2g.102, 2g.103), COFF objects (2g.110) |
+| 44 | [nat_ir.fd](nat_ir.md) | live | Machine layer, 40,799 lines: Linux, macOS, `--nat`, Cortex-M (nat_thumb). Page out of date; 2g.82, 2g.88, 2g.98, 2g.99 |
 | 45 | [native_debugger.fd](native_debugger.md) | dead | No ptrace builtins |
-| 46 | [opt.fd](opt.md) | dead in practice | `optimize_l2` panics on hello world (`jump_thread_redirect`) |
-| 47 | [parser.fd](parser.md) | live | f-strings fixed. Dead, wrong `parse_expr_iterative`; module globals never reset |
-| 48 | [pe.fd](pe.md) | dead | Only `emit --boot` reaches it, and it panics (IAT read in boot mode) |
-| 49 | [pe_ir.fd](pe_ir.md) | live | Default Windows backend. Concurrency refused or wrong in current builds; `build --native --target windows` panics in PIR opt |
-| 50 | [pe_ir_enc.fd](pe_ir_enc.md) | live | Import directory size fixed at 20; no ASLR; writable `.rdata` |
-| 51 | [pe_ir_stubs.fd](pe_ir_stubs.md) | live | Dead machine `p_vec_*` stubs still emitted (32-byte header); helpers moving to ir.fd |
-| 52 | [peephole.fd](peephole.md) | partly live | not/imul/cmp/test counted as setting flags: a following `testq` can be dropped |
-| 53 | [pir.fd](pir.md) | partly live | Diagnostic commands only. StructCopy fixed; a string constant naming a function becomes `ImmFunc` |
-| 53b | [reach.fd](reach.md) | live (emit only) | Added Nov 10: which functions `emit` lowers; `FID_LOWER_ALL=1` lowers all |
-| 54 | [regalloc.fd](regalloc.md) | partly live | PIR path only; no serious bugs; O(n^2) sort |
+| 46 | [opt.fd](opt.md) | dead | Unreached since MI18; `fid opt` prints the IR after iropt. Jump-threading fix (2g.17) never run |
+| 47 | [parser.fd](parser.md) | live | Imported struct literals fixed (2g.38). Dead `parse_expr_iterative`; module globals never reset |
+| 48 | [pe.fd](pe.md) | dead | Unreached; `emit --boot` goes through pe_ir (`PEIR_BARE_BOOT`) |
+| 49 | [pe_ir.fd](pe_ir.md) | live | Default Windows backend. Concurrency refusal not re-checked; `--leaks` exes crash (2g.81), f32 cast (2g.95), tail calls (2g.98), `-g` locals (2g.104) |
+| 50 | [pe_ir_enc.fd](pe_ir_enc.md) | live | Import directory size fixed at 20; no ASLR; writable `.rdata` (still true) |
+| 51 | [pe_ir_stubs.fd](pe_ir_stubs.md) | live | Old machine `p_vec_*` stubs still in the stub list; name helpers moved to ir.fd |
+| 52 | [peephole.fd](peephole.md) | dead | Unreached since MI18 (only pe.fd imports it) |
+| 53 | [pir.fd](pir.md) | dead | Unreached since MI18; `fid pir`/`dump-pir` print where the views went |
+| 53b | [reach.fd](reach.md) | live (emit only) | Which functions `emit` lowers; `drop` methods are roots (2g.23); `--lib --export` callees not lowered (2g.85) |
+| 54 | [regalloc.fd](regalloc.md) | dead | Unreached since MI18 (only codegen_x64 imports it) |
 | 55 | [riscv_enc.fd](riscv_enc.md) | dead | No command reaches it; no rodata in its result |
-| 56 | [rules.fd](rules.md) | live | nat_ir path, `test-rules`. Read-only call merging (opt-in) misses loop writes; facts format mismatch |
-| 57 | [runtime.fd](runtime.md) | dead | Fails `fid check`; replaced by stdlib/linux_runtime |
+| 56 | [rules.fd](rules.md) | live | Machine-layer path, `test-rules`. Read-only call merging on by default (Nov 17) after the loop-write fix; facts format mismatch |
+| 57 | [runtime.fd](runtime.md) | dead | Type error fixed in the source (2g.22); replaced by stdlib/linux_runtime |
 | 58 | [runtime_arm64.fd](runtime_arm64.md) | dead | Assembler errors return empty parts |
-| 59 | [runtime_linux.fd](runtime_linux.md) | dead in practice | PIR path never builds; layouts predate 0004 |
+| 59 | [runtime_linux.fd](runtime_linux.md) | dead | `build_executable` gone (MI18); layouts predate 0004 |
 | 60 | [runtime_riscv.fd](runtime_riscv.md) | dead | As runtime_arm64 |
-| 61 | [scribe.fd](scribe.md) | live, buggy | `fid doc`. CRLF names keep `;`, `::` file names, missing folders not created |
-| 62 | [secrecy.fd](secrecy.md) | live | Match guards on secrets and file-write sinks leak |
+| 61 | [scribe.fd](scribe.md) | live | `fid doc`. CRLF names, `::` file names, missing folders fixed in the source (AD1, TL11) |
+| 62 | [secrecy.fd](secrecy.md) | live | Guards and file-write sinks fixed (2g.10); `use crypto` fails @secret on native emit (2g.71) |
 | 63 | [tensor.fd](tensor.md) | live | Interpreter only. 12-term exp; no per-dimension bounds |
-| 64 | [token.fd](token.md) | live | 279 lines; keyword range check depends on declaration order |
-| 65 | [typechecker.fd](typechecker.md) | live | Exhaustiveness ignores guards and generic enums; generic structs rejected; unknown bound traits accepted |
-| 66 | [veil.fd](veil.md) | partly live | `fid veil` dies with Double free before the report (lower bug); coverage would be 0% |
-| 67 | [wasm.fd](wasm.md) | partly live | Every module fails validation; hello is 129 KB |
-| 68 | [x86.fd](x86.md) | partly live | `build-x86` writes a 120-byte exe that segfaults |
+| 64 | [token.fd](token.md) | live | 686 lines, 140 variants (`BadChar` new); keyword range check depends on declaration order |
+| 65 | [typechecker.fd](typechecker.md) | live | Guards, generic enums, generic structs fixed (2g.7, 2g.28); unknown bound traits accepted; 2g.54-56, 2g.74-76, 2g.112 |
+| 66 | [veil.fd](veil.md) | live | `fid veil` double free fixed (2g.2); the interpreter records coverage now; `test --coverage` fix of Nov 18 (2g.30) |
+| 67 | [wasm.fd](wasm.md) | live | Rewritten Nov 15: validates, 316 of 344 suite tests match `fid run`; struct through a function value (2g.108) |
+| 68 | [x86.fd](x86.md) | partly live | `build-x86`; the elf64 header cause is fixed, the exe not run since |
+| 69 | [ast_ser.fd](ast_ser.md) | live | New. AST codec: checked-library artifact (`FID_ASTCACHE`) and import cache (`FID_IMPCACHE`); unused entry points, stale header |
+| 70 | [build_info.fd](build_info.md) | live | New. `fid version` (1.0.0+dev), release stamp written by scripts/build-info.sh |
+| 71 | [disasm.fd](disasm.md) | live | New. `fid disasm`, table-driven; x86-64 round trip fails on `shl r, 1`; nat_enc does not use the table's words |
+| 72 | [image_writer.fd](image_writer.md) | live | New. One writer for ELF, PE/COFF, Mach-O (TG13); stale header names `build_executable` |
+| 73 | [ir_ser.fd](ir_ser.md) | live | New. IR codec: lowered-IR cache, mid-end and iropt memos, `.fir` files, `ir-fuzz`; memo mismatches (2g.93) |
+| 74 | [mir.fd](mir.md) | live | New. The machine IR (MI1): `MInst`, liveness, verifier, block parameters (opt-in) |
+| 75 | [nat_thumb.fd](nat_thumb.md) | live | New. Cortex-M Thumb-2 (PL5), thumbv7m-none/linux; no floats; no-OS images not run |
+| 76 | [pdb.fd](pdb.md) | live | New. PDB for `emit -g` (pe_ir, `--nat`), read by dbghelp; no variables |
+| 77 | [pgo.fd](pgo.md) | live | New. `run --profile` / `--profile-use` (OP30), `--trace` list |
+| 78 | [ssa.fd](ssa.md) | live | New. SSA round trip in the mid-end (ME3), on by default; 2% more instructions than promote on one test |
+| 79 | [tv.fd](tv.md) | live, opt-in | New. Translation validation (`--validate`); rejects inline2 on `Str_drop` (2g.90) |
 
 ## Per-file report template
 

@@ -39,7 +39,8 @@ R1–R3, R6, C1–C3 and C5 are as described.
   end reaches (a global, persistent storage, a call through a function
   value or trait object, a C function, an unknown builtin, or a function
   that does) runs with no region current. `FID_REGION_DEBUG=1` prints each
-  such call.
+  such call. The summaries are in `compiler/lower.fd` (`lw_rg_retains`,
+  `lw_rg_finish`); no `compiler/region.fd` was written (step 4 below).
 - **Stores follow the container** (added to R3). While a region deeper
   than a container's is current, an element stored into it (`Vec_push`,
   `Vec_set`, `Vec_insert`, the `_mem` forms, `HashMap_insert`, and the C

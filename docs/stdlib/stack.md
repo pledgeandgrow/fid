@@ -17,9 +17,9 @@ pub struct Stack<T> {
 
 | Name | Type |
 |------|------|
-| `data` | `Vec` |
+| `data` | `Vec<i64>` |
 
-*Defined at line 19*
+*Defined at line 37*
 
 ---
 
@@ -29,7 +29,7 @@ pub struct Stack<T> {
 impl Stack {
 ```
 
-*Defined at line 23*
+*Defined at line 37*
 
 ---
 

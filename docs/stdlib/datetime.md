@@ -61,7 +61,7 @@ pub fn dt_parse(s: str) -> (bool, i64) {
 
 **Returns:** `(bool, i64)`
 
-*Defined at line 77*
+*Defined at line 95*
 
 ---
 
@@ -80,7 +80,7 @@ pub fn dt_parse_or_epoch(s: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 179*
+*Defined at line 242*
 
 ---
 
@@ -98,7 +98,7 @@ pub fn dt_parse_time(s: str) -> LogicalTime {
 
 **Returns:** `LogicalTime`
 
-*Defined at line 186*
+*Defined at line 255*
 
 ---
 
@@ -116,7 +116,7 @@ pub fn dt_is_valid(s: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 191*
+*Defined at line 264*
 
 ---
 
@@ -134,7 +134,7 @@ pub fn dt_weekday_name(wd: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 199*
+*Defined at line 275*
 
 ---
 
@@ -152,7 +152,7 @@ pub fn dt_weekday_short(wd: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 211*
+*Defined at line 304*
 
 ---
 
@@ -170,7 +170,7 @@ pub fn dt_month_name(m: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 216*
+*Defined at line 312*
 
 ---
 
@@ -188,7 +188,7 @@ pub fn dt_month_short(m: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 233*
+*Defined at line 356*
 
 ---
 
@@ -210,7 +210,7 @@ pub fn dt_format(t: LogicalTime, fmt: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 257*
+*Defined at line 584*
 
 ---
 
@@ -228,7 +228,7 @@ pub fn dt_to_iso(t: LogicalTime) -> str {
 
 **Returns:** `str`
 
-*Defined at line 333*
+*Defined at line 1198*
 
 ---
 
@@ -246,7 +246,7 @@ pub fn dt_to_date(t: LogicalTime) -> str {
 
 **Returns:** `str`
 
-*Defined at line 338*
+*Defined at line 1206*
 
 ---
 
@@ -264,7 +264,7 @@ pub fn dt_to_rfc2822(t: LogicalTime) -> str {
 
 **Returns:** `str`
 
-*Defined at line 343*
+*Defined at line 1214*
 
 ---
 
@@ -282,7 +282,7 @@ pub fn dt_from_seconds(ts: i64) -> LogicalTime {
 
 **Returns:** `LogicalTime`
 
-*Defined at line 354*
+*Defined at line 1222*
 
 ---
 
@@ -300,7 +300,7 @@ pub fn dt_to_seconds(t: LogicalTime) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 359*
+*Defined at line 1230*
 
 ---
 
@@ -315,7 +315,7 @@ pub fn dt_now() -> LogicalTime {
 
 **Returns:** `LogicalTime`
 
-*Defined at line 365*
+*Defined at line 1241*
 
 ---
 
@@ -333,7 +333,7 @@ pub struct Duration {
 |------|------|
 | `seconds` | `i64` |
 
-*Defined at line 372*
+*Defined at line 1262*
 
 ---
 
@@ -349,7 +349,7 @@ pub fn dur_seconds(n: i64) -> Duration { return Duration { seconds: n }; }
 
 **Returns:** `Duration`
 
-*Defined at line 376*
+*Defined at line 1270*
 
 ---
 
@@ -365,7 +365,7 @@ pub fn dur_minutes(n: i64) -> Duration { return Duration { seconds: n * 60 }; }
 
 **Returns:** `Duration`
 
-*Defined at line 377*
+*Defined at line 1279*
 
 ---
 
@@ -381,7 +381,7 @@ pub fn dur_hours(n: i64) -> Duration { return Duration { seconds: n * 3600 }; }
 
 **Returns:** `Duration`
 
-*Defined at line 378*
+*Defined at line 1288*
 
 ---
 
@@ -397,7 +397,7 @@ pub fn dur_days(n: i64) -> Duration { return Duration { seconds: n * 86400 }; }
 
 **Returns:** `Duration`
 
-*Defined at line 379*
+*Defined at line 1297*
 
 ---
 
@@ -413,7 +413,7 @@ pub fn dur_weeks(n: i64) -> Duration { return Duration { seconds: n * 604800 }; 
 
 **Returns:** `Duration`
 
-*Defined at line 380*
+*Defined at line 1306*
 
 ---
 
@@ -431,7 +431,7 @@ pub fn dur_millis(n: i64) -> Duration { return Duration { seconds: n / 1000 }; }
 
 **Returns:** `Duration`
 
-*Defined at line 382*
+*Defined at line 1315*
 
 ---
 
@@ -447,7 +447,7 @@ pub fn dur_to_seconds(d: Duration) -> i64 { return d.seconds; }
 
 **Returns:** `i64`
 
-*Defined at line 384*
+*Defined at line 1325*
 
 ---
 
@@ -463,7 +463,7 @@ pub fn dur_to_millis(d: Duration) -> i64 { return d.seconds * 1000; }
 
 **Returns:** `i64`
 
-*Defined at line 385*
+*Defined at line 1332*
 
 ---
 
@@ -480,7 +480,7 @@ pub fn dur_add(a: Duration, b: Duration) -> Duration {
 
 **Returns:** `Duration`
 
-*Defined at line 387*
+*Defined at line 1340*
 
 ---
 
@@ -497,7 +497,7 @@ pub fn dur_sub(a: Duration, b: Duration) -> Duration {
 
 **Returns:** `Duration`
 
-*Defined at line 390*
+*Defined at line 1349*
 
 ---
 
@@ -513,7 +513,7 @@ pub fn dur_neg(d: Duration) -> Duration {
 
 **Returns:** `Duration`
 
-*Defined at line 393*
+*Defined at line 1358*
 
 ---
 
@@ -529,7 +529,7 @@ pub fn dur_abs(d: Duration) -> Duration {
 
 **Returns:** `Duration`
 
-*Defined at line 396*
+*Defined at line 1367*
 
 ---
 
@@ -548,7 +548,7 @@ pub fn dt_diff(a: LogicalTime, b: LogicalTime) -> Duration {
 
 **Returns:** `Duration`
 
-*Defined at line 402*
+*Defined at line 1382*
 
 ---
 
@@ -567,7 +567,7 @@ pub fn dt_add(t: LogicalTime, d: Duration) -> LogicalTime {
 
 **Returns:** `LogicalTime`
 
-*Defined at line 407*
+*Defined at line 1393*
 
 ---
 
@@ -584,7 +584,7 @@ pub fn dt_sub(t: LogicalTime, d: Duration) -> LogicalTime {
 
 **Returns:** `LogicalTime`
 
-*Defined at line 410*
+*Defined at line 1401*
 
 ---
 
@@ -604,7 +604,7 @@ pub fn dur_parse(s: str) -> (bool, i64) {
 
 **Returns:** `(bool, i64)`
 
-*Defined at line 417*
+*Defined at line 1415*
 
 ---
 
@@ -622,7 +622,7 @@ pub fn dur_parse_or_zero(s: str) -> Duration {
 
 **Returns:** `Duration`
 
-*Defined at line 456*
+*Defined at line 1478*
 
 ---
 
@@ -641,7 +641,7 @@ pub fn dur_format(d: Duration) -> str {
 
 **Returns:** `str`
 
-*Defined at line 464*
+*Defined at line 1497*
 
 ---
 
@@ -660,7 +660,7 @@ pub fn dur_format_hms(d: Duration) -> str {
 
 **Returns:** `str`
 
-*Defined at line 492*
+*Defined at line 1542*
 
 ---
 

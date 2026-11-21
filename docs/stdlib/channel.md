@@ -21,7 +21,7 @@ pub fn CHAN_CLOSED() -> i64 { return -9223372036854775807; }
 
 **Returns:** `i64`
 
-*Defined at line 30*
+*Defined at line 29*
 
 ---
 
@@ -40,7 +40,7 @@ pub fn channel_create(capacity: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 34*
+*Defined at line 45*
 
 ---
 
@@ -60,7 +60,7 @@ pub fn channel_send(ch: i64, value: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 40*
+*Defined at line 51*
 
 ---
 
@@ -79,7 +79,7 @@ pub fn channel_recv(ch: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 46*
+*Defined at line 57*
 
 ---
 
@@ -99,7 +99,7 @@ pub fn channel_try_recv(ch: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 53*
+*Defined at line 64*
 
 ---
 
@@ -119,7 +119,7 @@ pub fn channel_close(ch: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 60*
+*Defined at line 71*
 
 ---
 
@@ -137,7 +137,7 @@ pub fn channel_is_closed(ch: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 65*
+*Defined at line 76*
 
 ---
 

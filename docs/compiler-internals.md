@@ -19,17 +19,23 @@ source .fd
    |  mono.fd                        monomorphization
    |  lower.fd                       IrModule (IrFunction + Inst); annotations -> IrFunction flags
    |  iropt.fd / iropt_me.fd         mid-end passes (module + per-function)
-   |  rules.fd                       effects-based rewrites, pure/read CSE, lib-facts consumer
+   |  ssa.fd / egraph.fd             SSA inside the mid-end; e-graph rewrites, store-to-load forwarding
+   |  rules.fd                       rewrite rules, pure/read CSE, lib-facts consumer
+   |  tv.fd                          translation validation (--validate / FID_VALIDATE=1)
    v
    backend (one of):
      codegen_c.fd                   C text -> zig cc / cl / tcc      (`fid ccompile`)
      pe_ir.fd / pe_ir_stubs.fd      direct PE .exe, Windows          (`fid emit`, default)
-     nat_ir.fd / nat_enc.fd         direct ELF, x86_64/aarch64/riscv64 Linux (`emit --target *-linux`)
+     nat_ir.fd / nat_enc.fd         direct ELF, x86_64/aarch64/riscv64 Linux (`emit --target *-linux`),
+                                    `--nat` Windows PE, macOS Mach-O
      (`fid codegen --target` / `fid disasm` print the machine layer's code;
       codegen_x64/arm64/riscv.fd, the old asm text paths, are no longer reached)
      wasm.fd                        WASM/WAT (`fid wasm`)
-   runtime: runtime.fd (shared), runtime_linux.fd (nat syscalls), pe_runtime/
-   linker: linker.fd, elf64.fd, coff.fd, macho.fd
+   runtime: stdlib/core.fd, stdlib/pe_runtime/ (pe_ir), stdlib/linux_runtime/ (nat_ir),
+            the C runtime embedded in codegen_c.fd
+   image files: image_writer.fd (ELF, PE/COFF, Mach-O), nat_enc.fd, pe_ir_enc.fd;
+            elf64.fd and linker.fd only for `build-x86`; coff.fd, macho.fd and
+            runtime*.fd belong to the retired PIR path (docs/pir-retired.md)
 ```
 
 Entry point: `compiler/main.fd` — command dispatch (`run`, `emit`, `build`,
@@ -48,7 +54,8 @@ holds `build_program*` — lex/parse/check/mono driver.
 - `Inst` variants include `Call(name, args, ret, effects)`, `CallPtr`,
   `DynCall(trait, method, receiver, args, ret)`, `MakeDyn`, `ConstFnRef`,
   `ConstInt/ConstStr/ConstBool`, `Load/Store`, `Alloca`, `GlobalAddr`,
-  `Jump/Branch` (no edge args — ME3 phis are blocked on this), `Return`.
+  `Jump/Branch` (no edge args: ssa.fd's phis exist only inside the mid-end
+  and go back to slots before a backend reads the IR, ME3/ME15), `Return`.
 
 Every value is an instruction id; defs are single-assignment, so "the def of
 v" is `IrFunction_get_inst(f, v)`.
@@ -58,28 +65,31 @@ v" is `IrFunction_get_inst(f, v)`.
 `iropt_native(module)` orchestrates. Order (see the pass list in the file):
 
 1. `iro_conv_mark` — mark `internal_conv` eligibility (direct-call-only fns).
-2. opt-in module passes via `FID_IROPT_ON`: `envtrim` (WP7), `ipcp` (WP13),
-   `spec` (WP14 cloning), `deadf` (post-opt DFE). `gconst` folds never-written
+2. module passes: `envtrim` (WP7), `spec` (WP14 cloning) and `deadf`
+   (post-opt DFE) are on unless `FID_IROPT_OFF` names them; `ipcp` (WP13)
+   is opt-in (`FID_IROPT_ON=ipcp`). `gconst` folds never-written
    globals. `devirt` rewrites `DynCall` when the receiver's `MakeDyn` is local.
 3. per-function passes: `fold`, `simplify`, `branchfold`, `branchfacts`,
    `sccp`, `promote`, `dse`, `dce`, `tailcall`, `gvn`, `licm` (+ `iropt_me`'s
-   restructuring passes).
+   restructuring passes: those in its `IME_DEFAULT_ON` list, among them
+   loops, sra, loadhoist, forward, inline2, unroll, version, ssa, are on by
+   default since Nov 16-17, 2026; switch, ivsr, rotate stay opt-in).
 4. `iro_libfacts` — write `FID_LIBFACTS` artifact.
 
 Kill switches: `FID_IROPT_OFF=<csv>` per pass, `FID_IROPT_ON=<csv>` for the
-opt-in ones, `FID_NAT_OFF=<csv>` for backend passes, `FID_NAT_ON=crashfree`
-for panic-check elision. Diagnostics: `FID_IROPT_STATS`, `FID_RULE_STATS`,
-`FID_DEBUG_CSE`, `FID_VERIFY=1` (IR verifier + RA checker).
+opt-in ones, `FID_NAT_OFF=<csv>` for backend passes (full list:
+docs/verification/kill-switches.md). Diagnostics: `FID_IROPT_STATS`,
+`FID_RULE_STATS`, `FID_VERIFY=1` (IR verifier + RA checker).
 
 **Why things are opt-in:** see `docs/verification/miscompile-log.md` —
 M9 (IPCP `&mut Vec`), M10 (DFE + runtime aliases), M11 (env-trim +
 `pe_runtime_alias` stand-ins). A pass that changed semantics in the field
 stays behind a flag until the full suite says otherwise.
 
-`rules.fd`: `EffectSet` ({Alloc, Diverge, Read, Write, IO}) machinery.
-`ru_ext_effects` computes externally-visible effects — local `Alloca`
-traffic and stores through unescaped allocas are invisible, `Diverge` is
-stripped for `@crashfree`, `Alloc` for `@no-alloc`. `ru_pure_cse` merges
+`rules.fd`: 27 integer rewrite rules as data (`ru_rules`), proved by z3
+(`fid test-rules --smt`). Effects (`EffectSet` in ir.fd: Alloc, IO, Net,
+Spawn, Diverge, Read, Write, ...) are joined over the call graph by
+iropt.fd's `iro_effect_masks`. `ru_pure_cse` merges
 pure/read-only calls under dominance + write barriers (typed Vec
 bookkeeping — an earlier string-keyed version could crash).
 

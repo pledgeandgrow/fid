@@ -4,8 +4,32 @@
 > edits; another session may be editing it). Probes ran with the latest
 > self-built compiler (`s18.exe`) on test files outside the repository.
 
-**Path:** `compiler/lower.fd` — **14,023 lines** (was 6,930 on Oct 22).
-358 functions. Imports `ast`, `cowcheck`, `ir`, `pe_ir`.
+> **Nov 21:** 27,881 lines; it also imports `ir_ser` (the lowered-IR
+> cache, `FID_IRCACHE`) and `pgo` (`pgo_apply` at the end of `lower`).
+> Fixed: the `asm!` clobber crash below (known-bugs 2g.53, Nov 16: the
+> consumers skip an input with id < 0; lowering still stores the clobber
+> as id -1); an uninitialised `var m: M;` assigned from a match payload is
+> no longer freed twice (2g.2, Nov 15, test_uninit_match_payload); `var t
+> = s` copies a struct's Vec fields (2g.3, Nov 15, test_struct_copy_vec).
+> New open: a struct-returning function called through a function-pointer
+> parameter gets the wrong arguments (2g.47), a global `u64` is read as
+> signed (2g.72), `a ?? b` on an `Option<str>` is typed `i64` (2g.54, with
+> the type checker), `FID_VERIFY=1` rejects test_ml_full after iropt
+> (2g.109). The frozen bootstrap's `src/lower.rs` has none of the
+> ownership section, which is why a fid built by fidesc runs out of
+> memory self-compiling the tree (2g.79).
+>
+> **Nov 21, uncommitted — 2g.109's lowering half is fixed:** a `select`
+> case's variable slot (and the `recv` slot) was emitted with
+> `Inst::Alloca` into the current region — inside one case's block — and
+> the next case and a later `select` found it by name in blocks it does
+> not dominate. Both are now `Lowerer_txn_raw_slot` entry-block slots
+> (:9201-9248). The mid-end half of the same bug is in iropt_me.fd.
+> Still open: 2g.47, 2g.54, 2g.72, 2g.79. Line numbers below are from
+> Nov 9.
+
+**Path:** `compiler/lower.fd` — **14,023 lines** on Nov 9 (27,881 on Nov 21; 6,930 on Oct 22).
+358 functions then. Imports `ast`, `cowcheck`, `ir`, `pe_ir`.
 
 **Role:** lowers the checked, monomorphized AST into the `Inst` IR of
 `ir.fd`. Builds the `IrModule` (layouts, externs, strings, globals), mangles

@@ -1,9 +1,13 @@
 # codegen_arm64.fd — PIR L3 → AArch64 assembly
 
+> **Nov 21: dead.** Nothing imports it. MI18 (Nov 17) removed the PIR
+> path: `fid codegen --target arm64` builds through the machine layer
+> (nat_ir, `aarch64-linux`). The callers below are as of Nov 9.
+
 Re-audited 2026-11-09 (previous audit 2026-10-22/23).
 
 - **Path:** `compiler/codegen_arm64.fd`
-- **LOC:** 553
+- **LOC:** 658 (2026-11-21; 553 on Nov 9)
 - **Role:** instruction selector of the old PIR path for AArch64: L3 →
   asm text, vregs mapped `id % 29` onto x0-x28, fixed 256-byte frame. Port
   of `src/codegen_arm64.rs`. The working AArch64 backend is now nat_ir

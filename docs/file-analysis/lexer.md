@@ -4,7 +4,11 @@
 > One Oct 23 bug is still open (`5e3`); string escapes are fixed.
 
 - **Path:** `compiler/lexer.fd`
-- **LOC:** 967 (Rust `src/lexer.rs`: 774)
+- **LOC:** 1,805 (2026-11-21; 967 on Nov 9; Rust `src/lexer.rs`: 774). Nov 21 (known-bugs
+  2g.18): `5e3` and `2E-3` lex as floats when digits follow the `e` (fixed Nov 15,
+  test_float_exponent); an unknown character is a `TokenKind::BadChar` error token, not an `Eof`
+  that ended an imported module, and compiler.fd returns an imported module's lex errors against
+  its own file (Nov 15-16). Line numbers below are from Nov 9.
 - **Role:** source text to `Vec<Token>`. Byte scanner with UTF-8-aware columns. Errors are
   collected in `Lexer.errors` as `"Error:line:col: msg"` strings, not printed.
 

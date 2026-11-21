@@ -6,7 +6,15 @@
 > expression kinds are never renamed (verified live).
 
 - **Path:** `compiler/mono.fd`
-- **LOC:** 3,054 (was 2,629 on 10-22; Rust `src/mono.rs`: 1,549)
+- **LOC:** 5,473 (2026-11-21; 3,054 on Nov 9, 2,629 on 10-22; Rust `src/mono.rs`: 1,549)
+- **Nov 21:** the HIGH finding below is fixed (known-bugs 2g.8, Nov 15): calls are rewritten
+  in closures (typed by their own parameters), f-strings, pipes, await/spawn/yield, sandbox,
+  txn, region, select, parallel, handle (test_generic_calls_nested). Still true: the no-std
+  path does not resolve turbofish (`mono_resolve_turbofish` is called once, on the hosted
+  path). New open: a `Vec.map` that changes the element type panics "Unknown function
+  'Vec_map'" under `fid run` (2g.66); an unrolled `for x in xs` over a variadic pack takes
+  the generic overload and ignores `break`/`continue` (2g.84); a trait default method calls a
+  specialized impl no specialization covers (2g.97). Line numbers below are from Nov 9.
 - **Role:** Clones each generic function and generic impl method per concrete type substitution, renames call sites to the mangled instance (`ident__i64`), resolves const generics and trait associated types, and resolves turbofish calls (`f::<T>(..)`) before type checking.
 - **Imports:** `core`, `vec`, `string`, `compiler::ast`.
 

@@ -1,19 +1,24 @@
 # Fides Compiler Architecture
 
-**Version:** 0.6.0
+**Version:** 1.0.0 (`fid version` prints `1.0.0+dev` on dev builds; compiler/build_info.fd)
 **Targets (Nov 19):** working: IR interpreter (`fid run`), C codegen (`fid ccompile`, cross targets through `zig cc`), native Windows x64 PE (`fid emit`, compiler/pe_ir*.fd), native Linux AArch64 / RISC-V 64 / x86-64 static ELF (`fid emit --target aarch64-linux|riscv64-linux|x86_64-linux`, the machine layer compiler/nat_ir.fd + nat_enc.fd), Windows x64 on the machine layer (opt-in `fid emit --nat`), native WebAssembly (`fid wasm`, WASI preview 1; 316/344 suite tests), native macOS Mach-O and universal binaries (build, not run on a Mac), Cortex-M Thumb-2 (compiler/nat_thumb.fd), UEFI and multiboot images (`emit --uefi`/`--boot`). Experimental / incomplete: the retired PIR path, PIR-era ARM64/RISC-V assembly, bare-metal flat binary (`emit --bare`).
 
-> **Current state (Nov 19, 2026).** The release compiler is the self-hosted
-> `fid` (`compiler/*.fd`, 80 modules, 360,594 lines). The Rust compiler
-> `fidesc` (`src/*.rs`, 57 files, 113,416 lines) is frozen: it builds stage 1
-> of the bootstrap and runs the test harness. Most of this document was
+> **Current state (Nov 21, 2026).** The release compiler is the self-hosted
+> `fid` (`compiler/*.fd`, 80 modules, 360,657 lines). The Rust compiler
+> `fidesc` (`src/*.rs`, 57 files, 114,184 lines) is frozen: it builds stage 1
+> of the bootstrap and runs the test harness. A fid built by fidesc runs out
+> of memory self-compiling the current tree (known-bugs 2g.79); on Nov 21
+> the tree was built in one step from a self-hosted stage 0 (the fid of
+> Nov 18) instead, and that build passes run, emit, ccompile and the
+> 10-program leak gate. Most of this document was
 > written for `fidesc`; the `src/*.rs` names below have `compiler/*.fd`
 > counterparts; the self-hosted pipeline as it is now is in § "Self-hosted
 > pipeline (Nov 9)" below. The 3-stage bootstrap reaches a byte-identical
 > fixpoint (stage 2 C == stage 3 C, 67 MB on Nov 8; not yet re-verified on the
 > current, ~2.3x larger tree); `fid` compiled itself to C in 74 s when built at
 > -O2 and 159K lines (type check 18 s, borrow check 5 s, mono
-> 5 s, lowering 24 s, C generation 20 s), 229 s at -O0. The
+> 5 s, lowering 24 s, C generation 20 s), 229 s at -O0; on Nov 21, 57 s at
+> -O2 for the 361K-line tree. The
 > stdlib has 403 modules, 259,299 lines (+ 4 in `stdlib/pe_runtime/`, 7 in `stdlib/linux_runtime/` incl. `darwin.fd` and `wasi.fd`). The
 > language is described rule by rule in [reference.md](reference.md).
 
@@ -122,7 +127,7 @@ External linkers (ld, lld, link.exe) are separate processes that:
 - **Bare metal**: no runtime — `--bare` mode emits flat binary with no stdlib
 - Panic handler (`p_panic`), print stubs (`p_print_str/int/bool/float/newline`), allocator (`p_malloc`/`p_free`/`p_alloc`), string ops (`p_str_concat`/`p_to_str`), Vec/HashMap/String ops
 
-#### 9. Custom Stdlib — ✅ 146 Modules (Nov 9)
+#### 9. Custom Stdlib — ✅ 403 Modules (Nov 21; selection below)
 - `stdlib/core.fd` (auto-included): `Option`, `Result`, `println`, `assert`, `assert_eq`, `max`, `min`, `abs`, `clamp`
 - `stdlib/vec.fd`: dynamic array (Vec<T> with push/pop/get/len)
 - `stdlib/math.fd`: sqrt, sin, cos, floor, ceil, pow, fabs, constants
@@ -227,7 +232,7 @@ Phase 6:
 
 #### ELF64 Emission (Linux) — ⚠️ Experimental
 - Direct byte emission in `src/elf64.rs`
-- Native backend on Linux via `fidesc build`; incomplete in `fid` (Linux x64 goes through C)
+- Native backend on Linux via `fidesc build`. In `fid`, static ELF for x86-64, AArch64 and RISC-V 64 comes from the machine layer (`fid emit --target x86_64-linux|aarch64-linux|riscv64-linux`, compiler/nat_ir.fd + nat_enc.fd); the PIR pipeline below is the `fidesc` one
 - Full PIR pipeline: L1 → L2 → L3 → codegen → peephole → ELF64
 - Relocations: `R_X86_64_PC32`, `R_X86_64_PLT32`, `R_X86_64_64`
 - Links against hand-encoded runtime (`runtime_linux.rs`) — raw machine code, no libc
@@ -242,8 +247,8 @@ Phase 6:
 - `src/coff.rs` — object file emission
 - `fidesc codegen <file> --coff <out.o>`
 
-#### Bare-Metal Flat Binary — ❌ Incomplete
-- `fidesc emit <file> --bare -o <bin>`; `fid emit --bare` panics
+#### Bare-Metal Flat Binary — ⚠️ Experimental
+- `fidesc emit <file> --bare -o <bin>`; `fid emit --bare` builds through pe_ir_stubs (`PeirGen_gen_bare_runtime`); the Bare-metal CI lane (bare-metal.yml, scripts/bare-qemu-test.sh) boots a `fid emit --bare` Multiboot kernel under QEMU
 - No file format headers — raw machine code at a fixed address
 - No stdlib, no runtime
 - For bootloaders, OS kernels, firmware, microcontrollers
@@ -601,7 +606,7 @@ PIR Level 3 → Register Allocator → Instruction Selector → Peephole → Bin
 
 ---
 
-### Custom Stdlib — 146 Modules (Nov 9; selection below)
+### Custom Stdlib — 403 Modules (Nov 21; selection below)
 
 | Module | File | Contents |
 |--------|------|----------|
@@ -618,7 +623,7 @@ PIR Level 3 → Register Allocator → Instruction Selector → Peephole → Bin
 | http | `stdlib/http.fd` | socket + HTTP parsing |
 | simd | `stdlib/simd.fd` | elementwise ops, dot, sum, scale (f64x2, f64x4, etc.) |
 | shape | `stdlib/shape.fd` | shape system for tensor ops |
-| Plus 124 more | | env, args, process, regex, quant, money, banking, alloc, file, time, typed_strings, memo, privacy, tilemap, sprite, flowfield, streaming, scene, physics, audio, input, task, … |
+| Plus 390 more | | env, args, process, regex, quant, money, banking, alloc, file, time, typed_strings, memo, privacy, tilemap, sprite, flowfield, streaming, scene, physics, audio, input, task, … |
 
 ---
 
@@ -669,7 +674,7 @@ PIR Level 3 → Register Allocator → Instruction Selector → Peephole → Bin
 #### Phase 6: Fides in Fides (Self-Hosting) — reached
 - Compiler rewritten in Fides (`compiler/*.fd`, 80 modules); `fid` is the release compiler
 - Fides compiler compiles itself: 3-stage bootstrap, byte-identical fixpoint (49 MB of C, Nov 6)
-- No Rust dependency for end users; stage 1 is still built by `fidesc` until a stage 0 is pinned (`PIN=1`; none yet)
+- No Rust dependency for end users; scripts/bootstrap.sh still starts from `fidesc` unless `STAGE0=<fid>` is given or a stage 0 is pinned (`PIN=1`; none yet: no release/stage0/, no scripts/stage0.sha256). A fidesc-built stage 1 runs out of memory on the current tree (known-bugs 2g.79); on Nov 21 the tree was built from the Nov 18 fid as stage 0
 - Compiler binary is a Fides binary
 - PIR optimizer runs on Fides compiler code
 - comptime specializes the compiler for the target
@@ -712,9 +717,10 @@ every command:
 | `ccompile`, `dump-c`, `split-c` | codegen_c.fd: IR to C99 plus an embedded C runtime; no IR optimizer; checks.fd drops proven bounds/overflow checks; then a C compiler (`CC`, zig cc, gcc, clang, tcc). `split-c` (csplit.fd) cuts the C into units |
 | `emit` / `build`, Windows host (default) | iropt.fd (IR optimizer), then pe_ir.fd + pe_ir_enc.fd + pe_ir_stubs.fd: machine code and a PE32+ file, no C compiler |
 | `emit --target aarch64-linux \| riscv64-linux \| x86_64-linux`, `emit --nat` | iropt.fd, rules.fd, egraph.fd, then the machine layer nat_ir.fd + nat_enc.fd: static ELF, or a PE for `--nat` |
-| `emit --bare`, `emit --elf` | pe_ir's flat binary / no-std ELF |
-| `build`, POSIX host, no `--target` | through C |
-| `build --native` (default target), `opt`, `pir --opt`, `codegen`, `gpu` | the old PIR path: pir.fd, opt.fd, regalloc.fd, codegen_x64/arm64/riscv.fd, peephole.fd, runtime_linux.fd, elf64.fd, linker.fd (`gpu`: pir.fd's L3 only). `emit --boot` left it for pe_ir (`PEIR_BARE_BOOT`, release G1). The optimizer's jump-threading panic (known-bugs 2g.17) was fixed Nov 15, not yet rebuilt; x86-64 objects still lack `sh_addr` (2g.16) |
+| `emit --bare` (= `--boot`), `emit --uefi` | pe_ir's bootable bare image (Multiboot 1 and 2, `--load <address>`, default 0x100000) / a UEFI application; no stdlib. `emit --elf` is `--target x86_64-linux` (nat_ir, with the stdlib) since release F4; `FID_ELF_PEIR=1` keeps pe_ir's no-std ELF |
+| `build`, POSIX host, no `--target` | the machine layer for the host (`host_native_target`); a program it rejects goes on through C; `--via-c` or `FIDES_BUILD_VIA_C=1` takes C directly |
+| `build --native`, `codegen` | the machine layer (nat_ir) since Nov 17 (MI18): the old PIR path (pir.fd, opt.fd, regalloc.fd, codegen_x64/arm64/riscv.fd, peephole.fd) is no longer reached from main.fd. `opt` prints the IR after the IR optimizer the machine layer runs; `pir`/`dump-pir` only say where their views went. `emit --boot` goes through pe_ir (`PEIR_BARE_BOOT`, release G1) |
+| `build-x86` | the x86 stack-machine backend: x86.fd, elf64.fd, linker.fd (x86-64 objects are well-formed since TG13, known-bugs 2g.16; the exe is untested) |
 | `wasm`, `gpu` | wasm.fd: valid WASI modules (Nov 15, release F9); gpu.fd: SPIR-V/PTX for integer kernels, rewritten Nov 15 (known-bugs 2g.21), SPIR-V branches unstructured |
 | `check`, `lint`, `fmt`, `lsp`, `doc`, `veil`, `ark`, `qualify`, `audit`, `parse-header`, `test`, `test-rules` | tools: main.fd dispatches each (full list in docs/file-analysis/main.md) |
 
@@ -731,9 +737,11 @@ call merging and the library-facts file (`FID_LIBFACTS`,
 `FID_LIBFACTS_IN`) use; `FID_IROPT_ON=icf` folds functions with the same
 IR (WP19).
 
-**Not reached from `main.fd`:** autograd, debugger, diag, embedded,
-flat_ast, hotreload, native_debugger, runtime. codegen.fd is imported by
-compiler.fd but nothing in it is called.
+**Not reached from `main.fd`** (Nov 21: 56 of the 80 modules are): the
+retired PIR path (pir, opt, regalloc, peephole, codegen_x64, codegen_arm64,
+codegen_riscv, pe, arm64_enc, riscv_enc, runtime_linux, runtime_arm64,
+runtime_riscv, coff, macho, codegen) and autograd, debugger, diag,
+embedded, flat_ast, hotreload, native_debugger, runtime.
 
 ## 1. Pipeline Overview (`fidesc`)
 
@@ -1264,11 +1272,12 @@ The compiler includes a suite of scripts and conventions for maintaining correct
 | Tool | Purpose |
 |------|---------|
 | `verify.sh` | Full verification: build (release) + run all tests + compare to baseline. Use `--save` to update baseline, `--quick` for build-only check. |
-| `scripts/bisect.sh <test>` | Bisect which compiler layer (lowering, PIR, codegen, peephole) broke a specific test. |
-| `scripts/gen_golden.sh` | Generate golden files for intermediate compiler stages (IR, PIR L1/L2/L3, codegen, peephole) for future bisect accuracy. |
+| `verify-selfhost.sh` | tests/selfhost/*.fd on 3 backends (the self-hosted components) |
 | `AGENTS.md` | Working guide for AI assistants and humans: build commands, high-risk file list, known bugs, coding conventions, debugging workflow. **Read before making changes.** |
 
-**Workflow:** Run `./verify.sh` before and after every change. If tests regress, use `./scripts/bisect.sh <test_name>` to isolate the layer. If codegen/regalloc/peephole/elf64/pe changed, also run `./scripts/gen_golden.sh` to keep golden files current.
+`scripts/bisect.sh` and `scripts/gen_golden.sh` do not exist (so `verify.sh --golden` fails).
+
+**Workflow:** Run `./verify.sh` before and after every change. If tests regress, bisect the layer by hand with the `dump-ir`, `dump-pir`, `codegen --peephole` commands; golden files in `tests/bootstrap/golden/` are captured by hand.
 
 ---
 

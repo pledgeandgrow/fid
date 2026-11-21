@@ -407,8 +407,8 @@ Most string operations call into the runtime:
 
 ## 9. The `Opt` Pattern
 
-Because Fides has no `?` operator and no `Option` combinators, the compiler
-uses explicit `Opt*` enums:
+Because the compiler was written before Fid had `?` and generic `Option`
+(both exist now), the compiler uses explicit `Opt*` enums:
 
 ```fides
 pub enum OptIrType { Some(IrType), None }
@@ -450,6 +450,7 @@ Notes:
 - The `__env` dummy pointer is `0` (a `ConstInt(0, I64)` cast to `void*`) for user functions.
 - For closures, the real `__env` pointer is passed first, then the hidden `__env` pointer is also first. The `__env` pointer is the same as the closure's environment in this design.
 - Struct returns always use a hidden SRET pointer as the first *real* parameter, before the `__env` dummy for user functions.
+- Since Nov 17 a call through a fn value (`CallPtr`) on the interpreter and C passes `(result, env, args)`: the result pointer of a struct or enum result first, then the environment (docs/stdlib-agent-bugs.md 2/14, test_fix_fnval_struct_ret). The native backends kept the older env-first order then (same ledger).
 
 ### Argument order for a struct-returning user function
 

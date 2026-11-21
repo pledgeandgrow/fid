@@ -218,7 +218,7 @@ fn main() -> i64 {
 
 ```
 $ fid check tx_twice_fail.fd
-error: Linear type error (line 10): variable 'a' was already consumed (moved), or a part of it was.
+error[E078]: Linear type error (line 10): variable 'a' was already consumed (moved), or a part of it was.
 ...
 ```
 

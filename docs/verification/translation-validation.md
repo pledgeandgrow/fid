@@ -6,6 +6,16 @@ section "What is built" at the end), not yet run on the suite. Before it
 original. This page records what is checked besides, the design chosen
 for the validator, and what is left.
 
+Nov 21 check (fid built from the self-hosted stage 0, roadmap VF6/RL5):
+`tests/tooling/tv-check.sh` ends 3 failed. The self-test (24 cases), the
+nine SMT examples and the 56 pairs of `tests/verify/tv` are as expected,
+but 6 of 12 faults injected after inline, gconst, fold, forward, sccp and
+dse are not caught (one reached the executable: 43 printed instead of 42),
+`FID_VALIDATE=1` rejects inline2 on `Str_drop` in test_ssa_validate and
+test_tv_inject (a miscompile or a false alarm, not triaged), and the
+tests produce no SMT obligation. So the passes below are not validated
+yet; the suite run with `SUITE=1` has still not been made.
+
 ## What is checked today (testing, not validation)
 
 - **VF4** (`scripts/verify/variants.py toggle`): every pass of

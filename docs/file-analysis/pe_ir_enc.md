@@ -3,8 +3,16 @@
 > **New 2026-11-09** (not in the 10-22 audit). Written from the current
 > source and live probes with `s18.exe` (see pe_ir.md for the probes).
 
+> **Nov 21:** 3,293 lines. It now imports `image_writer` (the PE is laid
+> out through it, TG13: `pe_build_file` calls `pe_build_file_img`) and
+> `nat_enc`, and also writes UEFI images (`pe_build_efi`, DYNAMIC_BASE |
+> NX_COMPAT, base relocations), COFF symbols and DWARF sections. The three
+> headline findings still hold in `pe_build_file_img`: data directory 1 has
+> size 20 whatever the number of DLLs, `dll_chars` is 0 (no ASLR) and
+> `.rdata` is 0xC0000040 (writable). Line numbers below are from Nov 9.
+
 - **Path:** `compiler/pe_ir_enc.fd`
-- **LOC:** 2,579 (INDEX.md still says 2,279). Ported from the top half of
+- **LOC:** 3,293 (2026-11-21); 2,579 on Nov 9 (INDEX.md then said 2,279). Ported from the top half of
   `src/pe.rs`, then extended (value registers, `link` DLLs, string headers).
 - **Role:** The byte layer of the pe_ir backend: `PeirEnc` (machine code,
   labels, RIP-relative references to .rdata), the register-slot convention,

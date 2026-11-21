@@ -53,6 +53,8 @@ modules another session was adding that day: 128 clean, 34 with warnings,
 network/crypto modules (201 lines). The 200 modules the other session was
 still writing are not in it: the gate requires a module missing from the
 baseline to be clean, so record them (`--save`) once that work is done.
+On Nov 21 the baseline still has those 201 lines; `stdlib/` has 403
+modules.
 
 ## Running it
 

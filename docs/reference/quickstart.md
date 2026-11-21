@@ -128,7 +128,7 @@ The installer (`Fides-Setup-0.8.0.exe`, 6.6 MB) includes:
 | Component | Description | Optional |
 |-----------|-------------|----------|
 | Fides Compiler | `fides.exe` — the compiler binary (`fid.exe` in installers built from the current tree) | No (required) |
-| Standard Library | 99 modules in v1.0.0 (137 in the tree on Nov 6) | Yes |
+| Standard Library | 99 modules in v1.0.0 (403 in the tree on Nov 21) | Yes |
 | C Runtime | Runtime support files | Yes |
 | Documentation | Language reference, guides, roadmap | Yes |
 | Examples | Sample `.fd` programs | Yes |

@@ -78,3 +78,10 @@ measured above shows how much that matters.
 
 Not measured yet: the compiler with this change had not been built when it
 was written. Add the table from fn-arena-emit-check.sh here.
+
+Nov 21 (roadmap SP11 check, fid built from a self-hosted stage 0):
+fn-arena-check passes (321 windows back at their mark), and `FID_VERIFY=1`
+arena builds give the same images on 3 targets. fn-arena-emit-check fails
+3: the native emit of compiler/main.fd does not finish (an iro_sccp
+overflow panic, known-bugs 2g.89, or out of memory), so the table is still
+missing.

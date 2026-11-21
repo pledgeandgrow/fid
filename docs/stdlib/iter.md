@@ -30,17 +30,17 @@
 Map each element through a function, returning a new Vec.
 
 ```fides
-pub fn iter_map(v: Vec, f: fn(i64) -> i64) -> Vec {
+pub fn iter_map(v: Vec<i64>, f: fn(i64) -> i64) -> Vec<i64> {
 ```
 
 **Parameters:**
 
-- `v`: `Vec`
+- `v`: `Vec<i64>`
 - `f`: `fn(i64) -> i64`
 
-**Returns:** `Vec`
+**Returns:** `Vec<i64>`
 
-*Defined at line 20*
+*Defined at line 23*
 
 ---
 
@@ -49,17 +49,17 @@ pub fn iter_map(v: Vec, f: fn(i64) -> i64) -> Vec {
 Filter elements that satisfy a predicate, returning a new Vec.
 
 ```fides
-pub fn iter_filter(v: Vec, pred: fn(i64) -> bool) -> Vec {
+pub fn iter_filter(v: Vec<i64>, pred: fn(i64) -> bool) -> Vec<i64> {
 ```
 
 **Parameters:**
 
-- `v`: `Vec`
+- `v`: `Vec<i64>`
 - `pred`: `fn(i64) -> bool`
 
-**Returns:** `Vec`
+**Returns:** `Vec<i64>`
 
-*Defined at line 31*
+*Defined at line 39*
 
 ---
 
@@ -69,18 +69,18 @@ Reduce a Vec to a single value using a function.
 iter_reduce([1,2,3], add) → add(add(0, 1), 2), 3) = 6
 
 ```fides
-pub fn iter_reduce(v: Vec, f: fn(i64, i64) -> i64, initial: i64) -> i64 {
+pub fn iter_reduce(v: Vec<i64>, f: fn(i64, i64) -> i64, initial: i64) -> i64 {
 ```
 
 **Parameters:**
 
-- `v`: `Vec`
-- `f`: `fn(i64`
+- `v`: `Vec<i64>`
+- `f`: `fn(i64, i64) -> i64`
 - `initial`: `i64`
 
 **Returns:** `i64`
 
-*Defined at line 45*
+*Defined at line 58*
 
 ---
 
@@ -89,16 +89,16 @@ pub fn iter_reduce(v: Vec, f: fn(i64, i64) -> i64, initial: i64) -> i64 {
 Sum all elements in a Vec.
 
 ```fides
-pub fn iter_sum(v: Vec) -> i64 {
+pub fn iter_sum(v: Vec<i64>) -> i64 {
 ```
 
 **Parameters:**
 
-- `v`: `Vec`
+- `v`: `Vec<i64>`
 
 **Returns:** `i64`
 
-*Defined at line 56*
+*Defined at line 72*
 
 ---
 
@@ -107,16 +107,16 @@ pub fn iter_sum(v: Vec) -> i64 {
 Product of all elements in a Vec.
 
 ```fides
-pub fn iter_product(v: Vec) -> i64 {
+pub fn iter_product(v: Vec<i64>) -> i64 {
 ```
 
 **Parameters:**
 
-- `v`: `Vec`
+- `v`: `Vec<i64>`
 
 **Returns:** `i64`
 
-*Defined at line 67*
+*Defined at line 86*
 
 ---
 
@@ -125,16 +125,16 @@ pub fn iter_product(v: Vec) -> i64 {
 Find the minimum element. Returns 0 if empty.
 
 ```fides
-pub fn iter_min(v: Vec) -> i64 {
+pub fn iter_min(v: Vec<i64>) -> i64 {
 ```
 
 **Parameters:**
 
-- `v`: `Vec`
+- `v`: `Vec<i64>`
 
 **Returns:** `i64`
 
-*Defined at line 78*
+*Defined at line 102*
 
 ---
 
@@ -143,16 +143,16 @@ pub fn iter_min(v: Vec) -> i64 {
 Find the maximum element. Returns 0 if empty.
 
 ```fides
-pub fn iter_max(v: Vec) -> i64 {
+pub fn iter_max(v: Vec<i64>) -> i64 {
 ```
 
 **Parameters:**
 
-- `v`: `Vec`
+- `v`: `Vec<i64>`
 
 **Returns:** `i64`
 
-*Defined at line 90*
+*Defined at line 123*
 
 ---
 
@@ -161,17 +161,17 @@ pub fn iter_max(v: Vec) -> i64 {
 Find the first index of a value. Returns -1 if not found.
 
 ```fides
-pub fn iter_find_index(v: Vec, value: i64) -> i64 {
+pub fn iter_find_index(v: Vec<i64>, value: i64) -> i64 {
 ```
 
 **Parameters:**
 
-- `v`: `Vec`
+- `v`: `Vec<i64>`
 - `value`: `i64`
 
 **Returns:** `i64`
 
-*Defined at line 104*
+*Defined at line 146*
 
 ---
 
@@ -180,17 +180,17 @@ pub fn iter_find_index(v: Vec, value: i64) -> i64 {
 Find the first index matching a predicate. Returns -1 if not found.
 
 ```fides
-pub fn iter_find(v: Vec, pred: fn(i64) -> bool) -> i64 {
+pub fn iter_find(v: Vec<i64>, pred: fn(i64) -> bool) -> i64 {
 ```
 
 **Parameters:**
 
-- `v`: `Vec`
+- `v`: `Vec<i64>`
 - `pred`: `fn(i64) -> bool`
 
 **Returns:** `i64`
 
-*Defined at line 114*
+*Defined at line 162*
 
 ---
 
@@ -199,17 +199,17 @@ pub fn iter_find(v: Vec, pred: fn(i64) -> bool) -> i64 {
 Check if any element satisfies a predicate.
 
 ```fides
-pub fn iter_any(v: Vec, pred: fn(i64) -> bool) -> bool {
+pub fn iter_any(v: Vec<i64>, pred: fn(i64) -> bool) -> bool {
 ```
 
 **Parameters:**
 
-- `v`: `Vec`
+- `v`: `Vec<i64>`
 - `pred`: `fn(i64) -> bool`
 
 **Returns:** `bool`
 
-*Defined at line 124*
+*Defined at line 177*
 
 ---
 
@@ -218,17 +218,17 @@ pub fn iter_any(v: Vec, pred: fn(i64) -> bool) -> bool {
 Check if all elements satisfy a predicate.
 
 ```fides
-pub fn iter_all(v: Vec, pred: fn(i64) -> bool) -> bool {
+pub fn iter_all(v: Vec<i64>, pred: fn(i64) -> bool) -> bool {
 ```
 
 **Parameters:**
 
-- `v`: `Vec`
+- `v`: `Vec<i64>`
 - `pred`: `fn(i64) -> bool`
 
 **Returns:** `bool`
 
-*Defined at line 134*
+*Defined at line 193*
 
 ---
 
@@ -237,17 +237,17 @@ pub fn iter_all(v: Vec, pred: fn(i64) -> bool) -> bool {
 Count elements that satisfy a predicate.
 
 ```fides
-pub fn iter_count(v: Vec, pred: fn(i64) -> bool) -> i64 {
+pub fn iter_count(v: Vec<i64>, pred: fn(i64) -> bool) -> i64 {
 ```
 
 **Parameters:**
 
-- `v`: `Vec`
+- `v`: `Vec<i64>`
 - `pred`: `fn(i64) -> bool`
 
 **Returns:** `i64`
 
-*Defined at line 144*
+*Defined at line 208*
 
 ---
 
@@ -258,16 +258,16 @@ Note: Since Vec elements are i64 (opaque pointers), this treats
 each element as a Vec pointer and flattens them.
 
 ```fides
-pub fn iter_flatten(v: Vec) -> Vec {
+pub fn iter_flatten(v: Vec<Vec<i64>>) -> Vec<i64> {
 ```
 
 **Parameters:**
 
-- `v`: `Vec`
+- `v`: `Vec<Vec<i64>>`
 
-**Returns:** `Vec`
+**Returns:** `Vec<i64>`
 
-*Defined at line 159*
+*Defined at line 233*
 
 ---
 
@@ -276,17 +276,17 @@ pub fn iter_flatten(v: Vec) -> Vec {
 Take the first n elements, returning a new Vec.
 
 ```fides
-pub fn iter_take(v: Vec, n: i64) -> Vec {
+pub fn iter_take(v: Vec<i64>, n: i64) -> Vec<i64> {
 ```
 
 **Parameters:**
 
-- `v`: `Vec`
+- `v`: `Vec<i64>`
 - `n`: `i64`
 
-**Returns:** `Vec`
+**Returns:** `Vec<i64>`
 
-*Defined at line 175*
+*Defined at line 254*
 
 ---
 
@@ -295,17 +295,17 @@ pub fn iter_take(v: Vec, n: i64) -> Vec {
 Skip the first n elements, returning a new Vec with the rest.
 
 ```fides
-pub fn iter_skip(v: Vec, n: i64) -> Vec {
+pub fn iter_skip(v: Vec<i64>, n: i64) -> Vec<i64> {
 ```
 
 **Parameters:**
 
-- `v`: `Vec`
+- `v`: `Vec<i64>`
 - `n`: `i64`
 
-**Returns:** `Vec`
+**Returns:** `Vec<i64>`
 
-*Defined at line 188*
+*Defined at line 274*
 
 ---
 
@@ -314,17 +314,17 @@ pub fn iter_skip(v: Vec, n: i64) -> Vec {
 Concatenate two Vecs.
 
 ```fides
-pub fn iter_chain(a: Vec, b: Vec) -> Vec {
+pub fn iter_chain(a: Vec<i64>, b: Vec<i64>) -> Vec<i64> {
 ```
 
 **Parameters:**
 
-- `a`: `Vec`
-- `b`: `Vec`
+- `a`: `Vec<i64>`
+- `b`: `Vec<i64>`
 
-**Returns:** `Vec`
+**Returns:** `Vec<i64>`
 
-*Defined at line 200*
+*Defined at line 292*
 
 ---
 
@@ -333,7 +333,7 @@ pub fn iter_chain(a: Vec, b: Vec) -> Vec {
 Generate a range [start, end) as a Vec.
 
 ```fides
-pub fn iter_range(start: i64, end: i64) -> Vec {
+pub fn iter_range(start: i64, end: i64) -> Vec<i64> {
 ```
 
 **Parameters:**
@@ -341,9 +341,9 @@ pub fn iter_range(start: i64, end: i64) -> Vec {
 - `start`: `i64`
 - `end`: `i64`
 
-**Returns:** `Vec`
+**Returns:** `Vec<i64>`
 
-*Defined at line 218*
+*Defined at line 316*
 
 ---
 
@@ -353,7 +353,7 @@ Generate a range with a step.
 iter_range_step(0, 10, 2) → [0, 2, 4, 6, 8]
 
 ```fides
-pub fn iter_range_step(start: i64, end: i64, step: i64) -> Vec {
+pub fn iter_range_step(start: i64, end: i64, step: i64) -> Vec<i64> {
 ```
 
 **Parameters:**
@@ -362,9 +362,9 @@ pub fn iter_range_step(start: i64, end: i64, step: i64) -> Vec {
 - `end`: `i64`
 - `step`: `i64`
 
-**Returns:** `Vec`
+**Returns:** `Vec<i64>`
 
-*Defined at line 230*
+*Defined at line 333*
 
 ---
 
@@ -373,7 +373,7 @@ pub fn iter_range_step(start: i64, end: i64, step: i64) -> Vec {
 Repeat a value n times.
 
 ```fides
-pub fn iter_repeat(value: i64, n: i64) -> Vec {
+pub fn iter_repeat(value: i64, n: i64) -> Vec<i64> {
 ```
 
 **Parameters:**
@@ -381,9 +381,9 @@ pub fn iter_repeat(value: i64, n: i64) -> Vec {
 - `value`: `i64`
 - `n`: `i64`
 
-**Returns:** `Vec`
+**Returns:** `Vec<i64>`
 
-*Defined at line 242*
+*Defined at line 352*
 
 ---
 
@@ -393,17 +393,17 @@ Partition a Vec into two: elements that pass and elements that fail the predicat
 Returns a Vec of two Vecs: [passing, failing].
 
 ```fides
-pub fn iter_partition(v: Vec, pred: fn(i64) -> bool) -> Vec {
+pub fn iter_partition(v: Vec<i64>, pred: fn(i64) -> bool) -> Vec<Vec<i64>> {
 ```
 
 **Parameters:**
 
-- `v`: `Vec`
+- `v`: `Vec<i64>`
 - `pred`: `fn(i64) -> bool`
 
-**Returns:** `Vec`
+**Returns:** `Vec<Vec<i64>>`
 
-*Defined at line 256*
+*Defined at line 373*
 
 ---
 
@@ -412,16 +412,16 @@ pub fn iter_partition(v: Vec, pred: fn(i64) -> bool) -> Vec {
 Deduplicate a Vec (remove consecutive duplicates).
 
 ```fides
-pub fn iter_dedup(v: Vec) -> Vec {
+pub fn iter_dedup(v: Vec<i64>) -> Vec<i64> {
 ```
 
 **Parameters:**
 
-- `v`: `Vec`
+- `v`: `Vec<i64>`
 
-**Returns:** `Vec`
+**Returns:** `Vec<i64>`
 
-*Defined at line 275*
+*Defined at line 398*
 
 ---
 
@@ -430,17 +430,17 @@ pub fn iter_dedup(v: Vec) -> Vec {
 Chunk a Vec into groups of `size` elements.
 
 ```fides
-pub fn iter_chunk(v: Vec, size: i64) -> Vec {
+pub fn iter_chunk(v: Vec<i64>, size: i64) -> Vec<Vec<i64>> {
 ```
 
 **Parameters:**
 
-- `v`: `Vec`
+- `v`: `Vec<i64>`
 - `size`: `i64`
 
-**Returns:** `Vec`
+**Returns:** `Vec<Vec<i64>>`
 
-*Defined at line 290*
+*Defined at line 422*
 
 ---
 

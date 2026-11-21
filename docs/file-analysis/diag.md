@@ -4,7 +4,12 @@
 > Still dead, and now it no longer type-checks.
 
 - **Path:** `compiler/diag.fd`
-- **LOC:** 659 (Rust `src/diag.rs`: 463)
+- **LOC:** 779 (2026-11-21; 659 on Nov 9; Rust `src/diag.rs`: 463).
+  Nov 21: still dead (nothing in `compiler/` imports it). The "does not
+  compile" finding below was fixed Nov 15 (known-bugs 2g.22: the
+  `Diag_with_*` builders changed a copy of their by-value parameter); diag.fd
+  and tests/selfhost/test_diag.fd pass `fid check`. Line numbers below are
+  from Nov 9.
 - **Role:** structured diagnostics: `Severity`, `ErrCode` (37 codes, `E001`..`E999`), `Diag`
   (source line, caret span, help, notes), `DiagList`, ANSI color rendering, `diag_extract_line`,
   Levenshtein "did you mean".

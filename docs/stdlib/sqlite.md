@@ -29,7 +29,7 @@ The struct and its field are not `pub`, but the methods below are, so a program
 uses the type through `SQLite::open(...)` and the method calls. The handle is
 not meant to be touched.
 
-*Defined at line 111*
+*Defined at line 94*
 
 ---
 
@@ -48,7 +48,7 @@ impl SQLite {
 - `SQLite::open_memory() -> SQLite`: the same with `":memory:"`, a private
   database that disappears when it is closed.
 
-*Defined at line 115*
+*Defined at line 94*
 
 ---
 
@@ -78,7 +78,7 @@ impl SQLite {
 - `close(self: SQLite)`: closes the connection. There is no check that it was
   not closed already.
 
-*Defined at line 148*
+*Defined at line 94*
 
 ---
 
@@ -96,7 +96,7 @@ pub fn last_insert_rowid(db: SQLite) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 242*
+*Defined at line 254*
 
 ---
 
@@ -114,7 +114,7 @@ pub fn changes(db: SQLite) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 247*
+*Defined at line 259*
 
 ---
 
@@ -132,7 +132,7 @@ pub fn error_message(db: SQLite) -> str {
 
 **Returns:** `str`
 
-*Defined at line 252*
+*Defined at line 264*
 
 ---
 

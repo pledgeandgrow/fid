@@ -32,16 +32,16 @@ pub struct MerkleTree {
 
 | Name | Type |
 |------|------|
-| `hashes` | `Vec,      // flat array: 16 bytes per node` |
-| `left_children` | `Vec,   // left child index per node (-1 if leaf)` |
-| `right_children` | `Vec,  // right child index per node (-1 if leaf)` |
-| `is_leaf_flags` | `Vec,   // 1 if leaf, 0 if internal` |
-| `leaf_data` | `Vec,       // data hash index for each leaf` |
-| `leaves` | `Vec,          // indices of leaf nodes` |
-| `root_index` | `i64,      // index of root node (-1 if empty)` |
+| `hashes` | `Vec<i64>` |
+| `left_children` | `Vec<i64>` |
+| `right_children` | `Vec<i64>` |
+| `is_leaf_flags` | `Vec<i64>` |
+| `leaf_data` | `Vec<i64>` |
+| `leaves` | `Vec<i64>` |
+| `root_index` | `i64` |
 | `node_count` | `i64` |
 
-*Defined at line 86*
+*Defined at line 84*
 
 ---
 
@@ -55,7 +55,7 @@ pub fn merkle_tree_new() -> MerkleTree {
 
 **Returns:** `MerkleTree`
 
-*Defined at line 98*
+*Defined at line 119*
 
 ---
 
@@ -65,17 +65,17 @@ Add a data leaf to the tree. Must call merkle_tree_build() after
 adding all leaves to compute the root.
 
 ```fides
-pub fn merkle_tree_add(tree: MerkleTree, data: str) -> i64 {
+pub fn merkle_tree_add(tree: &mut MerkleTree, data: str) -> i64 {
 ```
 
 **Parameters:**
 
-- `tree`: `MerkleTree`
+- `tree`: `&mut MerkleTree`
 - `data`: `str`
 
 **Returns:** `i64`
 
-*Defined at line 123*
+*Defined at line 137*
 
 ---
 
@@ -85,16 +85,16 @@ Build the tree from leaves and compute the root.
 Must be called after adding all leaves.
 
 ```fides
-pub fn merkle_tree_build(tree: MerkleTree) -> i64 {
+pub fn merkle_tree_build(tree: &mut MerkleTree) -> i64 {
 ```
 
 **Parameters:**
 
-- `tree`: `MerkleTree`
+- `tree`: `&mut MerkleTree`
 
 **Returns:** `i64`
 
-*Defined at line 153*
+*Defined at line 167*
 
 ---
 
@@ -103,16 +103,16 @@ pub fn merkle_tree_build(tree: MerkleTree) -> i64 {
 Get the root hash of the tree. Returns empty Vec if tree is empty.
 
 ```fides
-pub fn merkle_tree_root(tree: MerkleTree) -> Vec {
+pub fn merkle_tree_root(tree: MerkleTree) -> Vec<i64> {
 ```
 
 **Parameters:**
 
 - `tree`: `MerkleTree`
 
-**Returns:** `Vec`
+**Returns:** `Vec<i64>`
 
-*Defined at line 196*
+*Defined at line 209*
 
 ---
 
@@ -130,7 +130,7 @@ pub fn merkle_tree_root_hex(tree: MerkleTree) -> str {
 
 **Returns:** `str`
 
-*Defined at line 204*
+*Defined at line 217*
 
 ---
 
@@ -148,7 +148,7 @@ pub fn merkle_tree_leaf_count(tree: MerkleTree) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 213*
+*Defined at line 226*
 
 ---
 
@@ -168,7 +168,7 @@ pub fn merkle_tree_verify_data(tree: MerkleTree, data: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 219*
+*Defined at line 232*
 
 ---
 
@@ -187,7 +187,7 @@ pub struct KVEntry {
 | `key` | `str` |
 | `value` | `i64` |
 
-*Defined at line 243*
+*Defined at line 256*
 
 ---
 
@@ -203,11 +203,11 @@ pub struct KVStore {
 
 | Name | Type |
 |------|------|
-| `keys` | `Vec` |
-| `values` | `Vec` |
+| `keys` | `Vec<str>` |
+| `values` | `Vec<i64>` |
 | `count` | `i64` |
 
-*Defined at line 249*
+*Defined at line 262*
 
 ---
 
@@ -221,7 +221,7 @@ pub fn kv_store_new() -> KVStore {
 
 **Returns:** `KVStore`
 
-*Defined at line 256*
+*Defined at line 269*
 
 ---
 
@@ -230,18 +230,18 @@ pub fn kv_store_new() -> KVStore {
 Set a key-value pair. If key exists, updates the value.
 
 ```fides
-pub fn kv_store_set(store: KVStore, key: str, value: i64) -> void {
+pub fn kv_store_set(store: &mut KVStore, key: str, value: i64) -> void {
 ```
 
 **Parameters:**
 
-- `store`: `KVStore`
+- `store`: `&mut KVStore`
 - `key`: `str`
 - `value`: `i64`
 
 **Returns:** `void`
 
-*Defined at line 265*
+*Defined at line 276*
 
 ---
 
@@ -260,7 +260,7 @@ pub fn kv_store_get(store: KVStore, key: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 278*
+*Defined at line 289*
 
 ---
 
@@ -279,7 +279,7 @@ pub fn kv_store_has(store: KVStore, key: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 288*
+*Defined at line 299*
 
 ---
 
@@ -288,17 +288,17 @@ pub fn kv_store_has(store: KVStore, key: str) -> bool {
 Delete a key. Returns true if key was found and deleted.
 
 ```fides
-pub fn kv_store_delete(store: KVStore, key: str) -> bool {
+pub fn kv_store_delete(store: &mut KVStore, key: str) -> bool {
 ```
 
 **Parameters:**
 
-- `store`: `KVStore`
+- `store`: `&mut KVStore`
 - `key`: `str`
 
 **Returns:** `bool`
 
-*Defined at line 298*
+*Defined at line 309*
 
 ---
 
@@ -316,7 +316,7 @@ pub fn kv_store_count(store: KVStore) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 318*
+*Defined at line 329*
 
 ---
 
@@ -325,16 +325,16 @@ pub fn kv_store_count(store: KVStore) -> i64 {
 Compute a hash of all key-value pairs (for state root verification).
 
 ```fides
-pub fn kv_store_state_hash(store: KVStore) -> Vec {
+pub fn kv_store_state_hash(store: KVStore) -> Vec<i64> {
 ```
 
 **Parameters:**
 
 - `store`: `KVStore`
 
-**Returns:** `Vec`
+**Returns:** `Vec<i64>`
 
-*Defined at line 323*
+*Defined at line 334*
 
 ---
 

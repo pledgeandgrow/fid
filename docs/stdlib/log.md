@@ -36,7 +36,7 @@
 pub const LOG_TRACE: i64 = 10;
 ```
 
-*Defined at line 29*
+*Defined at line 26*
 
 ---
 
@@ -46,7 +46,7 @@ pub const LOG_TRACE: i64 = 10;
 pub const LOG_DEBUG: i64 = 20;
 ```
 
-*Defined at line 30*
+*Defined at line 26*
 
 ---
 
@@ -56,7 +56,7 @@ pub const LOG_DEBUG: i64 = 20;
 pub const LOG_INFO: i64 = 30;
 ```
 
-*Defined at line 31*
+*Defined at line 26*
 
 ---
 
@@ -66,7 +66,7 @@ pub const LOG_INFO: i64 = 30;
 pub const LOG_WARN: i64 = 40;
 ```
 
-*Defined at line 32*
+*Defined at line 26*
 
 ---
 
@@ -76,7 +76,7 @@ pub const LOG_WARN: i64 = 40;
 pub const LOG_ERROR: i64 = 50;
 ```
 
-*Defined at line 33*
+*Defined at line 26*
 
 ---
 
@@ -86,7 +86,7 @@ pub const LOG_ERROR: i64 = 50;
 pub const LOG_OFF: i64 = 100;
 ```
 
-*Defined at line 34*
+*Defined at line 26*
 
 ---
 
@@ -104,7 +104,7 @@ pub fn log_set_level(level: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 47*
+*Defined at line 43*
 
 ---
 
@@ -135,7 +135,7 @@ pub fn log_level_from_str(name: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 57*
+*Defined at line 61*
 
 ---
 
@@ -153,7 +153,7 @@ pub fn log_set_timestamps(on: bool) -> void {
 
 **Returns:** `void`
 
-*Defined at line 69*
+*Defined at line 89*
 
 ---
 
@@ -171,7 +171,7 @@ pub fn log_set_json(on: bool) -> void {
 
 **Returns:** `void`
 
-*Defined at line 74*
+*Defined at line 102*
 
 ---
 
@@ -185,7 +185,7 @@ pub fn log_to_stdout() -> void {
 
 **Returns:** `void`
 
-*Defined at line 79*
+*Defined at line 111*
 
 ---
 
@@ -199,7 +199,7 @@ pub fn log_to_stderr() -> void {
 
 **Returns:** `void`
 
-*Defined at line 85*
+*Defined at line 122*
 
 ---
 
@@ -217,7 +217,7 @@ pub fn log_to_file(path: str) -> void {
 
 **Returns:** `void`
 
-*Defined at line 91*
+*Defined at line 128*
 
 ---
 
@@ -235,7 +235,7 @@ pub fn log_json_escape(s: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 125*
+*Defined at line 173*
 
 ---
 
@@ -244,18 +244,18 @@ pub fn log_json_escape(s: str) -> str {
 Core: log at an explicit level with a field list (flat k,v pairs).
 
 ```fides
-pub fn log_logf(level: i64, msg: str, fields: Vec) -> void {
+pub fn log_logf(level: i64, msg: str, fields: Vec<str>) -> void {
 ```
 
 **Parameters:**
 
 - `level`: `i64`
 - `msg`: `str`
-- `fields`: `Vec`
+- `fields`: `Vec<str>`
 
 **Returns:** `void`
 
-*Defined at line 261*
+*Defined at line 347*
 
 ---
 
@@ -274,7 +274,7 @@ pub fn log_log(level: i64, msg: str) -> void {
 
 **Returns:** `void`
 
-*Defined at line 273*
+*Defined at line 364*
 
 ---
 
@@ -290,7 +290,7 @@ pub fn log_trace(msg: str) -> void { log_log(LOG_TRACE, msg); }
 
 **Returns:** `void`
 
-*Defined at line 280*
+*Defined at line 448*
 
 ---
 
@@ -306,7 +306,7 @@ pub fn log_debug(msg: str) -> void { log_log(LOG_DEBUG, msg); }
 
 **Returns:** `void`
 
-*Defined at line 281*
+*Defined at line 451*
 
 ---
 
@@ -322,7 +322,7 @@ pub fn log_info(msg: str) -> void { log_log(LOG_INFO, msg); }
 
 **Returns:** `void`
 
-*Defined at line 282*
+*Defined at line 459*
 
 ---
 
@@ -338,7 +338,7 @@ pub fn log_warn(msg: str) -> void { log_log(LOG_WARN, msg); }
 
 **Returns:** `void`
 
-*Defined at line 283*
+*Defined at line 462*
 
 ---
 
@@ -354,92 +354,95 @@ pub fn log_error(msg: str) -> void { log_log(LOG_ERROR, msg); }
 
 **Returns:** `void`
 
-*Defined at line 284*
+*Defined at line 465*
 
 ---
 
 ## log_tracef
 
 ```fides
-pub fn log_tracef(msg: str, fields: Vec) -> void { log_logf(LOG_TRACE, msg, fields); }
+pub fn log_tracef(msg: str, fields: Vec<str>) -> void {
 ```
 
 **Parameters:**
 
 - `msg`: `str`
-- `fields`: `Vec`
+- `fields`: `Vec<str>`
 
 **Returns:** `void`
 
-*Defined at line 286*
+*Defined at line 469*
 
 ---
 
 ## log_debugf
 
 ```fides
-pub fn log_debugf(msg: str, fields: Vec) -> void { log_logf(LOG_DEBUG, msg, fields); }
+pub fn log_debugf(msg: str, fields: Vec<str>) -> void {
 ```
 
 **Parameters:**
 
 - `msg`: `str`
-- `fields`: `Vec`
+- `fields`: `Vec<str>`
 
 **Returns:** `void`
 
-*Defined at line 287*
+*Defined at line 472*
 
 ---
 
 ## log_infof
 
+Log `msg` at INFO level with flat key, value fields (log_tracef,
+log_debugf, log_warnf and log_errorf are the same at their level).
+
 ```fides
-pub fn log_infof(msg: str, fields: Vec) -> void { log_logf(LOG_INFO, msg, fields); }
+pub fn log_infof(msg: str, fields: Vec<str>) -> void {
 ```
 
 **Parameters:**
 
 - `msg`: `str`
-- `fields`: `Vec`
+- `fields`: `Vec<str>`
 
 **Returns:** `void`
 
-*Defined at line 288*
+*Defined at line 482*
 
 ---
 
 ## log_warnf
 
 ```fides
-pub fn log_warnf(msg: str, fields: Vec) -> void { log_logf(LOG_WARN, msg, fields); }
+pub fn log_warnf(msg: str, fields: Vec<str>) -> void {
 ```
 
 **Parameters:**
 
 - `msg`: `str`
-- `fields`: `Vec`
+- `fields`: `Vec<str>`
 
 **Returns:** `void`
 
-*Defined at line 289*
+*Defined at line 485*
 
 ---
 
 ## log_errorf
 
 ```fides
-pub fn log_errorf(msg: str, fields: Vec) -> void { log_logf(LOG_ERROR, msg, fields); }
+pub fn log_errorf(msg: str, fields: Vec<str>) -> void {
 ```
 
 **Parameters:**
 
 - `msg`: `str`
-- `fields`: `Vec`
+- `fields`: `Vec<str>`
 
 **Returns:** `void`
 
-*Defined at line 290*
+*Defined at line 488*
 
 ---
 

@@ -28,7 +28,7 @@ pub fn file_read(path: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 13*
+*Defined at line 24*
 
 ---
 
@@ -72,7 +72,7 @@ pub fn file_write(path: str, content: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 23*
+*Defined at line 57*
 
 ---
 
@@ -92,7 +92,7 @@ pub fn file_append(path: str, content: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 29*
+*Defined at line 67*
 
 ---
 
@@ -110,7 +110,7 @@ pub fn file_exists(path: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 34*
+*Defined at line 76*
 
 ---
 
@@ -118,19 +118,22 @@ pub fn file_exists(path: str) -> bool {
 
 Write raw bytes to a file (binary mode). The bytes are provided as a Vec
 of byte values (0-255). Returns 0 on success, -1 on error.
+Binary-safe: p_file_write_vec uses fwrite with an explicit length, so
+bytes containing 0x00 are written correctly (known-bug 3.14 fix — routing
+through str_from_bytes + p_file_write truncated at the first NUL).
 
 ```fides
-pub fn file_write_bytes(path: str, bytes: Vec) -> i64 {
+pub fn file_write_bytes(path: str, bytes: Vec<i64>) -> i64 {
 ```
 
 **Parameters:**
 
 - `path`: `str`
-- `bytes`: `Vec`
+- `bytes`: `Vec<i64>`
 
 **Returns:** `i64`
 
-*Defined at line 44*
+*Defined at line 89*
 
 ---
 
@@ -138,18 +141,20 @@ pub fn file_write_bytes(path: str, bytes: Vec) -> i64 {
 
 Read a file as a Vec of byte values. Returns an empty Vec if the file
 doesn't exist or can't be read.
+Binary-safe: p_file_read_bytes preserves bytes past a 0x00 (unlike
+p_file_read + str_bytes, which truncate at the first NUL).
 
 ```fides
-pub fn file_read_bytes(path: str) -> Vec {
+pub fn file_read_bytes(path: str) -> Vec<i64> {
 ```
 
 **Parameters:**
 
 - `path`: `str`
 
-**Returns:** `Vec`
+**Returns:** `Vec<i64>`
 
-*Defined at line 53*
+*Defined at line 97*
 
 ---
 
@@ -170,7 +175,7 @@ pub fn file_write_raw(path: str, content: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 64*
+*Defined at line 108*
 
 ---
 
@@ -188,7 +193,7 @@ pub fn file_delete(path: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 69*
+*Defined at line 113*
 
 ---
 
@@ -206,7 +211,7 @@ pub fn file_size(path: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 74*
+*Defined at line 118*
 
 ---
 

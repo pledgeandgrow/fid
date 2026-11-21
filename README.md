@@ -137,7 +137,7 @@ Every message is explained on the [Compiler Errors](https://fid-lang.org/docs/er
 | **No lifetime annotations** | References are second-class: they cannot be stored or returned from a local, so there is nothing to annotate. Assignment copies; nothing moves out from under you. |
 | **Capabilities on imports** | `use lib with { IO }` and the compiler rejects that module's calls to the network or filesystem. Your `use` lines show what can touch what. |
 | **Effects in signatures** | `!IO`, `!Net`, `!{}`: inferred across the call graph, and under-declaring is a compile error. Handlers are resumable. |
-| **17 safety rules, each with a test that must fail** | `@no-alloc`, `@bounded-stack`, `@constant_time`, `@secret` and more. `fid qualify` writes the evidence as JSON. |
+| **21 safety rules, each with a test that must fail** | `@no-alloc`, `@bounded-stack`, `@constant_time`, `@secret` and more. `fid qualify` writes the evidence as JSON. |
 | **Checks that stay on** | Bounds, integer overflow and double frees panic in every build, not only in debug. |
 | **No macros** | `comptime` runs ordinary Fid code at compile time, with reflection over types. |
 | **No LLVM** | `fid emit` encodes machine code and writes Windows and Linux executables itself: no assembler, no linker, no C compiler. |
@@ -156,9 +156,11 @@ RELEASE=1 CC="zig cc" ./scripts/bootstrap.sh   # builds fid in 3 stages and chec
 ./release/fid run tests/bootstrap/hello.fd
 ```
 
+A cold start from the Rust compiler currently stops at stage 2: a fid built by `fidesc` runs out of memory compiling the whole tree ([known bug](docs/reference/known-bugs.md) 2g.79). Set `STAGE0` to a recent self-hosted `fid` to start from it instead (one of Nov 18 builds today's tree).
+
 **Nothing to install.** The [playground](https://fid-lang.org/playground) runs in your browser.
 
-Editor support for VS Code, Neovim, Helix, Emacs and Sublime is in [`editors/`](editors/README.md); `fid lsp` speaks the Language Server Protocol.
+Editor support for VS Code, Neovim, Helix, Emacs, Sublime and Zed (untested) is in [`editors/`](editors/README.md); `fid lsp` speaks the Language Server Protocol.
 
 ## The toolchain
 
@@ -216,7 +218,7 @@ One front end and one IR, three ways out. The native emitter has its own instruc
 The compiler checks itself as hard as it checks your code:
 
 - **Fixpoint.** Stage 2 and stage 3 of the bootstrap must produce byte-identical output on every release build.
-- **Proved rewrites.** The optimizer's 108 integer rewrite rules are proved with z3.
+- **Proved rewrites.** The optimizer's 27 integer rewrite rules are proved with z3 at 8, 16, 32 and 64 bits (108 obligations).
 - **Checked encoders.** The instruction encoders are compared with clang's assembler across 1,181 forms.
 - **Conformance.** 1,596 programs each check one rule of the [language reference](docs/reference/reference.md) (§1–§13).
 
@@ -250,6 +252,7 @@ Fid is young and moving fast.
 - **Releases:** v1.0.0 shipped Sep 9, 2026; the newest tagged build is the **v0.8.0-unstable** prerelease (Nov 10). The tree is in 1.0 release preparation — `fid version` reports `1.0.0+dev`.
 - **Generated code is slower than Rust's.** Through C, Fid is fastest on one of four benchmarks and up to 1.6 times slower on the others; native output is slower still. [Benchmarks, losses included](docs/benchmarks.md).
 - **The package index is just starting.** `ark` installs from a path, a git repository or [the pacts index](https://github.com/pledgeandgrow/pacts) (`fid ark add textkit`, verified on Windows, Linux CI and macOS CI); few pacts are published yet.
+- **The fixpoint was last verified on Nov 8, 2026,** on a tree less than half today's size. On Nov 21 the current tree built in one step from a self-hosted fid (Nov 18), and the result passes run, emit, ccompile and the leak gate.
 - **The full test suite has not been rerun with the current compiler.** Features are checked with their own tests on each backend, and the suite has grown ~3x since the last full run.
 - **Not for safety-critical use.** `fid qualify` produces evidence for review, not a certification.
 
@@ -273,12 +276,12 @@ The details: [status](docs/reference/status.md) · [known bugs](docs/reference/k
 compiler/    the compiler, in Fid: 80 modules, about 360K lines
 stdlib/      the standard library: 403 modules
 src/         the earlier compiler in Rust, frozen; it builds stage 1 and runs the test harness
-tests/       bootstrap (1,752 programs), conformance (1,596), selfhost (57),
+tests/       bootstrap (1,753 programs), conformance (1,596), selfhost (57),
              plus projects, verify, nattools, tooling and leak checks
 examples/    twelve complete programs
 tools/       ark, scribe, veil and friends, written in Fid
 docs/        book, guides, reference, proposals, roadmap, verification
-editors/     VS Code, Neovim, Helix, Emacs, Sublime
+editors/     VS Code, Neovim, Helix, Emacs, Sublime, Zed
 installer/   the Windows installer
 bench/       benchmark programs in Fid, Rust, Zig, C++ and Go
 scripts/     bootstrap, cross-target tests, fuzzing, verification

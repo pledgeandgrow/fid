@@ -43,7 +43,7 @@ pub const AUDIO_NO_CHANNEL: i64 = -1;
 pub const AUDIO_MAX_CHANNELS: i64 = 32;
 ```
 
-*Defined at line 26*
+*Defined at line 25*
 
 ---
 
@@ -57,7 +57,7 @@ pub fn audio_init() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 54*
+*Defined at line 55*
 
 ---
 
@@ -71,7 +71,7 @@ pub fn audio_shutdown() -> void {
 
 **Returns:** `void`
 
-*Defined at line 59*
+*Defined at line 60*
 
 ---
 
@@ -89,7 +89,7 @@ pub fn audio_load(path: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 66*
+*Defined at line 67*
 
 ---
 
@@ -108,7 +108,7 @@ pub fn audio_play(sound: i64, volume: f64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 73*
+*Defined at line 74*
 
 ---
 
@@ -126,7 +126,7 @@ pub fn audio_play_full(sound: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 78*
+*Defined at line 79*
 
 ---
 
@@ -144,7 +144,7 @@ pub fn audio_stop(channel: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 83*
+*Defined at line 84*
 
 ---
 
@@ -158,7 +158,7 @@ pub fn audio_stop_all() -> void {
 
 **Returns:** `void`
 
-*Defined at line 88*
+*Defined at line 89*
 
 ---
 
@@ -176,7 +176,7 @@ pub fn audio_pause(channel: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 93*
+*Defined at line 94*
 
 ---
 
@@ -194,7 +194,7 @@ pub fn audio_resume(channel: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 98*
+*Defined at line 99*
 
 ---
 
@@ -213,7 +213,7 @@ pub fn audio_set_volume(channel: i64, volume: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 105*
+*Defined at line 106*
 
 ---
 
@@ -232,7 +232,7 @@ pub fn audio_set_loop(channel: i64, looping: bool) -> void {
 
 **Returns:** `void`
 
-*Defined at line 110*
+*Defined at line 111*
 
 ---
 
@@ -251,7 +251,7 @@ pub fn audio_set_pan(channel: i64, pan: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 119*
+*Defined at line 120*
 
 ---
 
@@ -269,7 +269,7 @@ pub fn audio_is_playing(channel: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 124*
+*Defined at line 125*
 
 ---
 
@@ -287,7 +287,7 @@ pub fn audio_master_volume(volume: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 131*
+*Defined at line 132*
 
 ---
 
@@ -306,7 +306,7 @@ pub struct AudioState {
 | `music_channel` | `i64,  // dedicated music channel` |
 | `sfx_channels` | `Vec<i64>, // active SFX channels` |
 
-*Defined at line 141*
+*Defined at line 296*
 
 ---
 
@@ -320,7 +320,7 @@ pub fn audio_state_create() -> AudioState {
 
 **Returns:** `AudioState`
 
-*Defined at line 149*
+*Defined at line 312*
 
 ---
 
@@ -339,7 +339,7 @@ pub fn audio_state_set_volume(state: &mut AudioState, vol: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 159*
+*Defined at line 319*
 
 ---
 
@@ -357,7 +357,7 @@ pub fn audio_state_toggle_mute(state: &mut AudioState) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 167*
+*Defined at line 327*
 
 ---
 
@@ -376,7 +376,7 @@ pub fn audio_state_play_music(state: &mut AudioState, sound: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 178*
+*Defined at line 338*
 
 ---
 
@@ -394,7 +394,7 @@ pub fn audio_state_stop_music(state: &mut AudioState) -> void {
 
 **Returns:** `void`
 
-*Defined at line 187*
+*Defined at line 347*
 
 ---
 
@@ -414,7 +414,7 @@ pub fn audio_state_play_sfx(state: &mut AudioState, sound: i64, volume: f64) -> 
 
 **Returns:** `i64`
 
-*Defined at line 195*
+*Defined at line 355*
 
 ---
 
@@ -432,7 +432,7 @@ pub fn audio_state_cleanup_sfx(state: &mut AudioState) -> void {
 
 **Returns:** `void`
 
-*Defined at line 204*
+*Defined at line 364*
 
 ---
 

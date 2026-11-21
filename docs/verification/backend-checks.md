@@ -52,6 +52,14 @@ checks both on real programs built by the compiler under test (dynamically
 linked ELF executables of the three Linux targets; a COFF object of
 `codegen --coff` with long names); docs/verification/rl9-rl25-checks-2026-11-17.md.
 
+Nov 21 check (the tree built from a self-hosted stage 0, llvm-roadmap
+RL9): the ELF images of the three Linux targets carry `.dynamic` at
+PT_DYNAMIC and pass image-lint and readelf; `image-lint-check.sh` 0
+failed; `image-check.sh` on hello 22 passed, 1 failed: the COFF object of
+`codegen --coff` does not build (LoadLibraryA, GetProcAddress, FreeLibrary
+undefined). Not run with llvm-readobj, llvm-objdump or llvm-dwarfdump
+installed.
+
 ## RL11: a broken rule or pass must fail the suite
 
 Mutants are run-time switches of the compiler under test,
@@ -107,7 +115,9 @@ changed, the output did not).
    and the allocation checker), `FID_NAT_PAR=4`, `FID_NAT_FAST=1`,
    `--debug`, `-g`, `FID_NAT_FRAMES=1`, `--stats --remarks`,
    `FID_NAT_DUMP=*`, `--obj`, the function cache (`FID_FNCACHE`, built
-   twice: filled, then read), `FID_RULES_ON=readcse`, `FID_IROPT_ON=all`,
+   twice: filled, then read), `FID_RULES_ON=readcse` (since Nov 17 a
+   no-op: readcse is on by default and no rule reads FID_RULES_ON),
+   `FID_IROPT_ON=all`,
    the rule and e-graph statistics, each `FID_NAT_ON` opt-in pass, the
    CPU levels (`--cpu x86-64-v3/v4`, `armv8.1-a`, `armv9-a`,
    `rv64gc_zba_zbb`, `rv64gcv`, `rv64g`, `rva23u64`), the macOS targets
@@ -134,9 +144,9 @@ inside the compiler, so they count as lines with no C (not run).
 Without the line marks (a compiler whose C generator lacks
 FID_C_LINE_MARKS) the line figure is scripts/verify/coverage.py's
 block-weighted estimate and is labelled "est.". (Nov 18: the
-FID_C_LINE_MARKS hunk of compiler/codegen_c.fd `gen_function` was not in
-the tree yet; `dump-c` takes no `-g`, so `#line` directives are no way
-round it.)
+FID_C_LINE_MARKS hunk of compiler/codegen_c.fd was not in the tree yet,
+and `dump-c` takes no `-g`, so `#line` directives were no way round it;
+on Nov 21 the hunk is in, `cg_line_marks_on`.)
 
 Test: `tests/tooling/nat-coverage-check.sh` (on a small program: marks,
 counters, a line known uncovered and one known covered; BUILD=1 runs the

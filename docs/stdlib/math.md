@@ -46,7 +46,7 @@ pub fn math_pi() -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 32*
+*Defined at line 37*
 
 ---
 
@@ -58,7 +58,7 @@ pub fn math_e() -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 36*
+*Defined at line 45*
 
 ---
 
@@ -76,7 +76,7 @@ pub fn math_sqrt(x: f64) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 43*
+*Defined at line 56*
 
 ---
 
@@ -94,7 +94,7 @@ pub fn math_sin(x: f64) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 48*
+*Defined at line 64*
 
 ---
 
@@ -112,7 +112,7 @@ pub fn math_cos(x: f64) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 53*
+*Defined at line 72*
 
 ---
 
@@ -130,7 +130,7 @@ pub fn math_floor(x: f64) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 58*
+*Defined at line 81*
 
 ---
 
@@ -148,7 +148,7 @@ pub fn math_ceil(x: f64) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 63*
+*Defined at line 89*
 
 ---
 
@@ -167,7 +167,7 @@ pub fn math_pow(base: f64, exp: f64) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 68*
+*Defined at line 97*
 
 ---
 
@@ -185,7 +185,7 @@ pub fn math_fabs(x: f64) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 73*
+*Defined at line 105*
 
 ---
 
@@ -203,7 +203,7 @@ pub fn math_log(x: f64) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 78*
+*Defined at line 113*
 
 ---
 
@@ -221,7 +221,7 @@ pub fn math_exp(x: f64) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 83*
+*Defined at line 121*
 
 ---
 
@@ -239,7 +239,7 @@ pub fn math_abs_i64(n: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 88*
+*Defined at line 129*
 
 ---
 
@@ -258,7 +258,7 @@ pub fn math_max_f64(a: f64, b: f64) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 94*
+*Defined at line 140*
 
 ---
 
@@ -277,7 +277,7 @@ pub fn math_min_f64(a: f64, b: f64) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 100*
+*Defined at line 151*
 
 ---
 
@@ -297,7 +297,7 @@ pub fn math_clamp_f64(n: f64, lo: f64, hi: f64) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 106*
+*Defined at line 163*
 
 ---
 
@@ -307,7 +307,7 @@ pub fn math_clamp_f64(n: f64, lo: f64, hi: f64) -> f64 {
 pub struct vec2 { pub x: f64, pub y: f64 }
 ```
 
-*Defined at line 115*
+*Defined at line 229*
 
 ---
 
@@ -317,7 +317,7 @@ pub struct vec2 { pub x: f64, pub y: f64 }
 pub struct vec3 { pub x: f64, pub y: f64, pub z: f64 }
 ```
 
-*Defined at line 116*
+*Defined at line 243*
 
 ---
 
@@ -327,7 +327,7 @@ pub struct vec3 { pub x: f64, pub y: f64, pub z: f64 }
 pub struct vec4 { pub x: f64, pub y: f64, pub z: f64, pub w: f64 }
 ```
 
-*Defined at line 117*
+*Defined at line 255*
 
 ---
 
@@ -341,12 +341,24 @@ pub struct mat4 {
 
 | Name | Type |
 |------|------|
-| `m00` | `f64, pub m01: f64, pub m02: f64, pub m03: f64` |
-| `m10` | `f64, pub m11: f64, pub m12: f64, pub m13: f64` |
-| `m20` | `f64, pub m21: f64, pub m22: f64, pub m23: f64` |
-| `m30` | `f64, pub m31: f64, pub m32: f64, pub m33: f64` |
+| `m00` | `f64` |
+| `m01` | `f64` |
+| `m02` | `f64` |
+| `m03` | `f64` |
+| `m10` | `f64` |
+| `m11` | `f64` |
+| `m12` | `f64` |
+| `m13` | `f64` |
+| `m20` | `f64` |
+| `m21` | `f64` |
+| `m22` | `f64` |
+| `m23` | `f64` |
+| `m30` | `f64` |
+| `m31` | `f64` |
+| `m32` | `f64` |
+| `m33` | `f64` |
 
-*Defined at line 120*
+*Defined at line 193*
 
 ---
 
@@ -356,7 +368,7 @@ pub struct mat4 {
 pub struct quat { pub w: f64, pub x: f64, pub y: f64, pub z: f64 }
 ```
 
-*Defined at line 128*
+*Defined at line 267*
 
 ---
 
@@ -373,7 +385,7 @@ pub fn vec2(x: f64, y: f64) -> vec2 {
 
 **Returns:** `vec2`
 
-*Defined at line 132*
+*Defined at line 229*
 
 ---
 
@@ -391,7 +403,7 @@ pub fn vec3(x: f64, y: f64, z: f64) -> vec3 {
 
 **Returns:** `vec3`
 
-*Defined at line 136*
+*Defined at line 243*
 
 ---
 
@@ -410,7 +422,7 @@ pub fn vec4(x: f64, y: f64, z: f64, w: f64) -> vec4 {
 
 **Returns:** `vec4`
 
-*Defined at line 140*
+*Defined at line 255*
 
 ---
 
@@ -429,7 +441,7 @@ pub fn quat(w: f64, x: f64, y: f64, z: f64) -> quat {
 
 **Returns:** `quat`
 
-*Defined at line 144*
+*Defined at line 267*
 
 ---
 
@@ -445,7 +457,7 @@ pub fn radians(degrees: f64) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 150*
+*Defined at line 279*
 
 ---
 
@@ -461,7 +473,7 @@ pub fn degrees(radians: f64) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 154*
+*Defined at line 287*
 
 ---
 
@@ -479,7 +491,7 @@ pub fn lerp(a: f64, b: f64, t: f64) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 158*
+*Defined at line 295*
 
 ---
 
@@ -496,7 +508,7 @@ pub fn distance(a: vec3, b: vec3) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 162*
+*Defined at line 303*
 
 ---
 
@@ -506,7 +518,7 @@ pub fn distance(a: vec3, b: vec3) -> f64 {
 impl vec2 {
 ```
 
-*Defined at line 171*
+*Defined at line 229*
 
 ---
 
@@ -516,7 +528,7 @@ impl vec2 {
 impl vec3 {
 ```
 
-*Defined at line 205*
+*Defined at line 243*
 
 ---
 
@@ -526,7 +538,7 @@ impl vec3 {
 impl vec4 {
 ```
 
-*Defined at line 251*
+*Defined at line 255*
 
 ---
 
@@ -536,7 +548,7 @@ impl vec4 {
 impl mat4 {
 ```
 
-*Defined at line 294*
+*Defined at line 193*
 
 ---
 
@@ -552,7 +564,7 @@ pub fn translate(t: vec3) -> mat4 {
 
 **Returns:** `mat4`
 
-*Defined at line 347*
+*Defined at line 505*
 
 ---
 
@@ -568,7 +580,7 @@ pub fn mat_scale(s: f64) -> mat4 {
 
 **Returns:** `mat4`
 
-*Defined at line 356*
+*Defined at line 516*
 
 ---
 
@@ -578,7 +590,7 @@ pub fn mat_scale(s: f64) -> mat4 {
 impl quat {
 ```
 
-*Defined at line 367*
+*Defined at line 267*
 
 ---
 

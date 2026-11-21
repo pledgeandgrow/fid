@@ -3,7 +3,8 @@
 Re-audited 2026-11-09 (previous audit 2026-10-22/23).
 
 - **Path:** `compiler/runtime_riscv.fd`
-- **LOC:** 827
+- **LOC:** 832 (2026-11-21; 827 on Nov 9). Nov 21: nothing imports it;
+  `compiler.fd` `build_executable` is gone (MI18, Nov 17).
 - **Role:** the RV64 twin of runtime_arm64: runtime asm text assembled by
   `riscv_enc`, returned as `RuntimeParts` + relocations. Port of
   `src/runtime_riscv.rs`. The working native runtime is

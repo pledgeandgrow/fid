@@ -1,11 +1,44 @@
 # comptime_eval.fd
 
+> **Nov 21:** 4,985 lines (2,120 on Nov 9). Fixed Nov 15 (known-bugs
+> 2g.19): an assignment inside an `if` in a `comptime fn` is kept (the
+> body runs in `evaluate_block_rt`), with break/continue, compound
+> operators and shadowing; a statement the evaluator cannot run is an
+> error. The errors are no longer dropped: compiler.fd returns
+> `comptime_gen_errors()` after `process_gen` and `comptime_subst_errors()`
+> after `substitute` (`FID_CT_FALLBACK=1`: the old warn-and-run-at-run-time
+> behaviour). `comptime gen` may now add enums, constants, impls and trait
+> impls (LG9), and splices are expanded in impl methods too. Not re-checked:
+> whether `substitute` reaches impl and trait methods.
+>
+> **Nov 21, uncommitted:** the comptime-hardening pass (+345).
+> Evaluation has a fuel budget — `ct_fuel_left` charges every
+> `evaluate`/`evaluate_with_env`/`eval_binop`/`call_comptime_func` and
+> every statement of `evaluate_block_rt`; over 10^8 steps (default;
+> `FID_CT_FUEL` overrides) is an error, never a hang. Errors carry a
+> trace: `g_ct_call_stack` gets a frame per `comptime fn` call (popped
+> only on success, so a failure shows the whole chain), `ct_trace` prints
+> the innermost 8 plus "while running line N" (`g_ct_line`/`g_ct_subst_line`
+> from `ct_stmt_line`). Integer arithmetic is checked
+> (`ct_add/sub/mul_checked`, `i64::MIN / -1` and `-i64::MIN`, `<<` that
+> drops bits, shift amounts outside 0..63) — a wrapped constant table was
+> silent before. `Expr::Ident` resolves a program `const`
+> (`ct_find_const`/`ct_const_value`, nested consts bounded by the 400-deep
+> call guard). `str_repeat` is capped at 16 MB. `struct_size` and
+> `field_offset` now read a throwaway `Lowerer` with every struct and
+> enum laid out to a fixpoint (`ce_layout_lowerer`; the evaluator's own
+> copy of the layout rules — `ce_slot_size`, `ce_struct_layout`,
+> `ce_has_annotation` — is deleted; `use compiler::ir`, `compiler::lower`
+> are new). Splice errors reach the fatal list (`ct_fatal_splice`), and a
+> `reflect` error is fatal even under `FID_CT_FALLBACK` (it used to lower
+> to 0). Line numbers below are from Nov 9.
+
 > **Re-audited 2026-11-09** against the current source and the latest `fid` build (s18).
 > `return comptime` and loop accumulation are fixed; impl methods, `if` assignments inside
 > comptime functions, and dropped errors are still open.
 
 - **Path:** `compiler/comptime_eval.fd`
-- **LOC:** 2,120 (was 1,632; Rust `src/comptime.rs`: 1,358)
+- **LOC:** 4,985 (2026-11-21; 2,120 on Nov 9, 1,632 on Oct 22; Rust `src/comptime.rs`: 1,358)
 - **Role:** compile-time evaluation. `process_gen` runs `comptime gen { }` blocks, parses the
   string they produce and appends its functions and structs. `substitute` replaces each
   `comptime expr` / `comptime { }` / `comptime reflect(T)` with a literal, then evaluates calls to

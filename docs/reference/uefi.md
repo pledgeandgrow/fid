@@ -97,8 +97,8 @@ image by `tests/uefi/uefi_emit_driver.fd` (built the same way), passed
 `check_efi.py` and printed all eight expected lines under the same QEMU:
 `FID_UEFI_DRIVER=<driver.exe> UNIT=0 bash tests/uefi/run.sh` gave
 `PASS emit --uefi`, `PASS boot hello.efi`, `PASS boot unit.efi`.
-`fid emit --uefi` itself waits for the `--uefi` branch in
-`compiler/main.fd`.
+The `--uefi` branch of `compiler/main.fd` (`cmd_build`) is in the tree
+since; the Nov 17 run below went through it.
 
 Nov 17: rerun against the tree after the day's pe_ir changes (`--cpu`, the
 function cache, which bare and UEFI builds never use, and the nat_*

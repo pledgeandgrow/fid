@@ -99,7 +99,7 @@ Length in meters.
 pub struct Meters { pub value: f64 }
 ```
 
-*Defined at line 21*
+*Defined at line 26*
 
 ---
 
@@ -111,7 +111,7 @@ Mass in kilograms.
 pub struct Kilograms { pub value: f64 }
 ```
 
-*Defined at line 23*
+*Defined at line 31*
 
 ---
 
@@ -123,7 +123,7 @@ Time in seconds.
 pub struct Seconds { pub value: f64 }
 ```
 
-*Defined at line 25*
+*Defined at line 36*
 
 ---
 
@@ -135,7 +135,7 @@ Temperature in Kelvin.
 pub struct Kelvin { pub value: f64 }
 ```
 
-*Defined at line 27*
+*Defined at line 41*
 
 ---
 
@@ -147,7 +147,7 @@ Electric current in amperes.
 pub struct Amperes { pub value: f64 }
 ```
 
-*Defined at line 29*
+*Defined at line 46*
 
 ---
 
@@ -159,7 +159,7 @@ Amount of substance in moles.
 pub struct Moles { pub value: f64 }
 ```
 
-*Defined at line 31*
+*Defined at line 51*
 
 ---
 
@@ -171,7 +171,7 @@ Luminous intensity in candelas.
 pub struct Candelas { pub value: f64 }
 ```
 
-*Defined at line 33*
+*Defined at line 56*
 
 ---
 
@@ -183,7 +183,7 @@ Velocity in meters per second.
 pub struct MetersPerSecond { pub value: f64 }
 ```
 
-*Defined at line 38*
+*Defined at line 64*
 
 ---
 
@@ -195,7 +195,7 @@ Acceleration in meters per second squared.
 pub struct MetersPerSecond2 { pub value: f64 }
 ```
 
-*Defined at line 40*
+*Defined at line 69*
 
 ---
 
@@ -207,7 +207,7 @@ Force in newtons (kg·m/s²).
 pub struct Newtons { pub value: f64 }
 ```
 
-*Defined at line 42*
+*Defined at line 74*
 
 ---
 
@@ -219,7 +219,7 @@ Energy in joules (N·m).
 pub struct Joules { pub value: f64 }
 ```
 
-*Defined at line 44*
+*Defined at line 79*
 
 ---
 
@@ -231,7 +231,7 @@ Power in watts (J/s).
 pub struct Watts { pub value: f64 }
 ```
 
-*Defined at line 46*
+*Defined at line 84*
 
 ---
 
@@ -243,7 +243,7 @@ Pressure in pascals (N/m²).
 pub struct Pascals { pub value: f64 }
 ```
 
-*Defined at line 48*
+*Defined at line 89*
 
 ---
 
@@ -255,7 +255,7 @@ Frequency in hertz (1/s).
 pub struct Hertz { pub value: f64 }
 ```
 
-*Defined at line 50*
+*Defined at line 94*
 
 ---
 
@@ -267,7 +267,7 @@ Area in square meters.
 pub struct SquareMeters { pub value: f64 }
 ```
 
-*Defined at line 52*
+*Defined at line 99*
 
 ---
 
@@ -279,7 +279,7 @@ Volume in cubic meters.
 pub struct CubicMeters { pub value: f64 }
 ```
 
-*Defined at line 54*
+*Defined at line 104*
 
 ---
 
@@ -295,7 +295,7 @@ pub fn meters(v: f64) -> Meters { return Meters { value: v }; }
 
 **Returns:** `Meters`
 
-*Defined at line 58*
+*Defined at line 119*
 
 ---
 
@@ -311,7 +311,7 @@ pub fn kilograms(v: f64) -> Kilograms { return Kilograms { value: v }; }
 
 **Returns:** `Kilograms`
 
-*Defined at line 59*
+*Defined at line 124*
 
 ---
 
@@ -327,7 +327,7 @@ pub fn seconds(v: f64) -> Seconds { return Seconds { value: v }; }
 
 **Returns:** `Seconds`
 
-*Defined at line 60*
+*Defined at line 129*
 
 ---
 
@@ -343,7 +343,7 @@ pub fn kelvin(v: f64) -> Kelvin { return Kelvin { value: v }; }
 
 **Returns:** `Kelvin`
 
-*Defined at line 61*
+*Defined at line 134*
 
 ---
 
@@ -359,7 +359,7 @@ pub fn amperes(v: f64) -> Amperes { return Amperes { value: v }; }
 
 **Returns:** `Amperes`
 
-*Defined at line 62*
+*Defined at line 139*
 
 ---
 
@@ -375,7 +375,7 @@ pub fn moles(v: f64) -> Moles { return Moles { value: v }; }
 
 **Returns:** `Moles`
 
-*Defined at line 63*
+*Defined at line 144*
 
 ---
 
@@ -391,7 +391,7 @@ pub fn candelas(v: f64) -> Candelas { return Candelas { value: v }; }
 
 **Returns:** `Candelas`
 
-*Defined at line 64*
+*Defined at line 149*
 
 ---
 
@@ -407,7 +407,7 @@ pub fn meters_per_second(v: f64) -> MetersPerSecond { return MetersPerSecond { v
 
 **Returns:** `MetersPerSecond`
 
-*Defined at line 66*
+*Defined at line 155*
 
 ---
 
@@ -423,7 +423,7 @@ pub fn meters_per_second2(v: f64) -> MetersPerSecond2 { return MetersPerSecond2 
 
 **Returns:** `MetersPerSecond2`
 
-*Defined at line 67*
+*Defined at line 160*
 
 ---
 
@@ -439,7 +439,7 @@ pub fn newtons(v: f64) -> Newtons { return Newtons { value: v }; }
 
 **Returns:** `Newtons`
 
-*Defined at line 68*
+*Defined at line 165*
 
 ---
 
@@ -455,7 +455,7 @@ pub fn joules(v: f64) -> Joules { return Joules { value: v }; }
 
 **Returns:** `Joules`
 
-*Defined at line 69*
+*Defined at line 170*
 
 ---
 
@@ -471,7 +471,7 @@ pub fn watts(v: f64) -> Watts { return Watts { value: v }; }
 
 **Returns:** `Watts`
 
-*Defined at line 70*
+*Defined at line 175*
 
 ---
 
@@ -487,7 +487,7 @@ pub fn pascals(v: f64) -> Pascals { return Pascals { value: v }; }
 
 **Returns:** `Pascals`
 
-*Defined at line 71*
+*Defined at line 180*
 
 ---
 
@@ -503,7 +503,7 @@ pub fn hertz(v: f64) -> Hertz { return Hertz { value: v }; }
 
 **Returns:** `Hertz`
 
-*Defined at line 72*
+*Defined at line 185*
 
 ---
 
@@ -519,7 +519,7 @@ pub fn square_meters(v: f64) -> SquareMeters { return SquareMeters { value: v };
 
 **Returns:** `SquareMeters`
 
-*Defined at line 73*
+*Defined at line 190*
 
 ---
 
@@ -535,7 +535,7 @@ pub fn cubic_meters(v: f64) -> CubicMeters { return CubicMeters { value: v }; }
 
 **Returns:** `CubicMeters`
 
-*Defined at line 74*
+*Defined at line 195*
 
 ---
 
@@ -553,7 +553,7 @@ pub fn km_to_m(km: f64) -> Meters { return meters(km * 1000.0); }
 
 **Returns:** `Meters`
 
-*Defined at line 79*
+*Defined at line 204*
 
 ---
 
@@ -571,7 +571,7 @@ pub fn m_to_km(m: Meters) -> f64 { return m.value / 1000.0; }
 
 **Returns:** `f64`
 
-*Defined at line 82*
+*Defined at line 209*
 
 ---
 
@@ -589,7 +589,7 @@ pub fn cm_to_m(cm: f64) -> Meters { return meters(cm / 100.0); }
 
 **Returns:** `Meters`
 
-*Defined at line 85*
+*Defined at line 214*
 
 ---
 
@@ -607,7 +607,7 @@ pub fn m_to_cm(m: Meters) -> f64 { return m.value * 100.0; }
 
 **Returns:** `f64`
 
-*Defined at line 88*
+*Defined at line 219*
 
 ---
 
@@ -625,7 +625,7 @@ pub fn mm_to_m(mm: f64) -> Meters { return meters(mm / 1000.0); }
 
 **Returns:** `Meters`
 
-*Defined at line 91*
+*Defined at line 224*
 
 ---
 
@@ -643,7 +643,7 @@ pub fn m_to_mm(m: Meters) -> f64 { return m.value * 1000.0; }
 
 **Returns:** `f64`
 
-*Defined at line 94*
+*Defined at line 229*
 
 ---
 
@@ -661,7 +661,7 @@ pub fn miles_to_m(miles: f64) -> Meters { return meters(miles * 1609.344); }
 
 **Returns:** `Meters`
 
-*Defined at line 97*
+*Defined at line 234*
 
 ---
 
@@ -679,7 +679,7 @@ pub fn m_to_miles(m: Meters) -> f64 { return m.value / 1609.344; }
 
 **Returns:** `f64`
 
-*Defined at line 100*
+*Defined at line 239*
 
 ---
 
@@ -697,7 +697,7 @@ pub fn feet_to_m(ft: f64) -> Meters { return meters(ft * 0.3048); }
 
 **Returns:** `Meters`
 
-*Defined at line 103*
+*Defined at line 244*
 
 ---
 
@@ -715,7 +715,7 @@ pub fn m_to_feet(m: Meters) -> f64 { return m.value / 0.3048; }
 
 **Returns:** `f64`
 
-*Defined at line 106*
+*Defined at line 249*
 
 ---
 
@@ -733,7 +733,7 @@ pub fn inches_to_m(inch: f64) -> Meters { return meters(inch * 0.0254); }
 
 **Returns:** `Meters`
 
-*Defined at line 109*
+*Defined at line 254*
 
 ---
 
@@ -751,7 +751,7 @@ pub fn m_to_inches(m: Meters) -> f64 { return m.value / 0.0254; }
 
 **Returns:** `f64`
 
-*Defined at line 112*
+*Defined at line 259*
 
 ---
 
@@ -769,7 +769,7 @@ pub fn g_to_kg(g: f64) -> Kilograms { return kilograms(g / 1000.0); }
 
 **Returns:** `Kilograms`
 
-*Defined at line 115*
+*Defined at line 264*
 
 ---
 
@@ -787,7 +787,7 @@ pub fn kg_to_g(kg: Kilograms) -> f64 { return kg.value * 1000.0; }
 
 **Returns:** `f64`
 
-*Defined at line 118*
+*Defined at line 269*
 
 ---
 
@@ -805,7 +805,7 @@ pub fn lb_to_kg(lb: f64) -> Kilograms { return kilograms(lb * 0.453592); }
 
 **Returns:** `Kilograms`
 
-*Defined at line 121*
+*Defined at line 274*
 
 ---
 
@@ -823,7 +823,7 @@ pub fn kg_to_lb(kg: Kilograms) -> f64 { return kg.value / 0.453592; }
 
 **Returns:** `f64`
 
-*Defined at line 124*
+*Defined at line 279*
 
 ---
 
@@ -841,7 +841,7 @@ pub fn celsius_to_kelvin(c: f64) -> Kelvin { return kelvin(c + 273.15); }
 
 **Returns:** `Kelvin`
 
-*Defined at line 127*
+*Defined at line 284*
 
 ---
 
@@ -859,7 +859,7 @@ pub fn kelvin_to_celsius(k: Kelvin) -> f64 { return k.value - 273.15; }
 
 **Returns:** `f64`
 
-*Defined at line 130*
+*Defined at line 289*
 
 ---
 
@@ -877,7 +877,7 @@ pub fn fahrenheit_to_kelvin(f: f64) -> Kelvin { return kelvin((f - 32.0) * 5.0 /
 
 **Returns:** `Kelvin`
 
-*Defined at line 133*
+*Defined at line 294*
 
 ---
 
@@ -895,7 +895,7 @@ pub fn kelvin_to_fahrenheit(k: Kelvin) -> f64 { return (k.value - 273.15) * 9.0 
 
 **Returns:** `f64`
 
-*Defined at line 136*
+*Defined at line 299*
 
 ---
 
@@ -913,7 +913,7 @@ pub fn minutes_to_s(min: f64) -> Seconds { return seconds(min * 60.0); }
 
 **Returns:** `Seconds`
 
-*Defined at line 139*
+*Defined at line 304*
 
 ---
 
@@ -931,7 +931,7 @@ pub fn hours_to_s(h: f64) -> Seconds { return seconds(h * 3600.0); }
 
 **Returns:** `Seconds`
 
-*Defined at line 142*
+*Defined at line 309*
 
 ---
 
@@ -949,7 +949,7 @@ pub fn days_to_s(d: f64) -> Seconds { return seconds(d * 86400.0); }
 
 **Returns:** `Seconds`
 
-*Defined at line 145*
+*Defined at line 314*
 
 ---
 
@@ -967,7 +967,7 @@ pub fn s_to_minutes(s: Seconds) -> f64 { return s.value / 60.0; }
 
 **Returns:** `f64`
 
-*Defined at line 148*
+*Defined at line 319*
 
 ---
 
@@ -985,7 +985,7 @@ pub fn s_to_hours(s: Seconds) -> f64 { return s.value / 3600.0; }
 
 **Returns:** `f64`
 
-*Defined at line 151*
+*Defined at line 324*
 
 ---
 
@@ -1004,7 +1004,7 @@ pub fn velocity(d: Meters, t: Seconds) -> MetersPerSecond {
 
 **Returns:** `MetersPerSecond`
 
-*Defined at line 156*
+*Defined at line 331*
 
 ---
 
@@ -1023,7 +1023,7 @@ pub fn acceleration(v: MetersPerSecond, t: Seconds) -> MetersPerSecond2 {
 
 **Returns:** `MetersPerSecond2`
 
-*Defined at line 161*
+*Defined at line 336*
 
 ---
 
@@ -1042,7 +1042,7 @@ pub fn force(m: Kilograms, a: MetersPerSecond2) -> Newtons {
 
 **Returns:** `Newtons`
 
-*Defined at line 166*
+*Defined at line 343*
 
 ---
 
@@ -1061,7 +1061,7 @@ pub fn energy(f: Newtons, d: Meters) -> Joules {
 
 **Returns:** `Joules`
 
-*Defined at line 171*
+*Defined at line 348*
 
 ---
 
@@ -1080,7 +1080,7 @@ pub fn power(e: Joules, t: Seconds) -> Watts {
 
 **Returns:** `Watts`
 
-*Defined at line 176*
+*Defined at line 353*
 
 ---
 
@@ -1099,7 +1099,7 @@ pub fn pressure(f: Newtons, a: SquareMeters) -> Pascals {
 
 **Returns:** `Pascals`
 
-*Defined at line 181*
+*Defined at line 358*
 
 ---
 
@@ -1117,7 +1117,7 @@ pub fn frequency(period: Seconds) -> Hertz {
 
 **Returns:** `Hertz`
 
-*Defined at line 186*
+*Defined at line 363*
 
 ---
 
@@ -1136,7 +1136,7 @@ pub fn area(length: Meters, width: Meters) -> SquareMeters {
 
 **Returns:** `SquareMeters`
 
-*Defined at line 191*
+*Defined at line 368*
 
 ---
 
@@ -1156,7 +1156,7 @@ pub fn volume(length: Meters, width: Meters, height: Meters) -> CubicMeters {
 
 **Returns:** `CubicMeters`
 
-*Defined at line 196*
+*Defined at line 373*
 
 ---
 
@@ -1173,7 +1173,7 @@ pub fn meters_add(a: Meters, b: Meters) -> Meters { return meters(a.value + b.va
 
 **Returns:** `Meters`
 
-*Defined at line 202*
+*Defined at line 379*
 
 ---
 
@@ -1190,7 +1190,7 @@ pub fn meters_sub(a: Meters, b: Meters) -> Meters { return meters(a.value - b.va
 
 **Returns:** `Meters`
 
-*Defined at line 203*
+*Defined at line 382*
 
 ---
 
@@ -1207,7 +1207,7 @@ pub fn seconds_add(a: Seconds, b: Seconds) -> Seconds { return seconds(a.value +
 
 **Returns:** `Seconds`
 
-*Defined at line 204*
+*Defined at line 385*
 
 ---
 
@@ -1224,7 +1224,7 @@ pub fn seconds_sub(a: Seconds, b: Seconds) -> Seconds { return seconds(a.value -
 
 **Returns:** `Seconds`
 
-*Defined at line 205*
+*Defined at line 388*
 
 ---
 
@@ -1241,7 +1241,7 @@ pub fn kg_add(a: Kilograms, b: Kilograms) -> Kilograms { return kilograms(a.valu
 
 **Returns:** `Kilograms`
 
-*Defined at line 206*
+*Defined at line 391*
 
 ---
 
@@ -1258,7 +1258,7 @@ pub fn kg_sub(a: Kilograms, b: Kilograms) -> Kilograms { return kilograms(a.valu
 
 **Returns:** `Kilograms`
 
-*Defined at line 207*
+*Defined at line 394*
 
 ---
 
@@ -1275,7 +1275,7 @@ pub fn newtons_add(a: Newtons, b: Newtons) -> Newtons { return newtons(a.value +
 
 **Returns:** `Newtons`
 
-*Defined at line 208*
+*Defined at line 397*
 
 ---
 
@@ -1292,7 +1292,7 @@ pub fn newtons_sub(a: Newtons, b: Newtons) -> Newtons { return newtons(a.value -
 
 **Returns:** `Newtons`
 
-*Defined at line 209*
+*Defined at line 400*
 
 ---
 
@@ -1309,7 +1309,7 @@ pub fn joules_add(a: Joules, b: Joules) -> Joules { return joules(a.value + b.va
 
 **Returns:** `Joules`
 
-*Defined at line 210*
+*Defined at line 403*
 
 ---
 
@@ -1326,7 +1326,7 @@ pub fn joules_sub(a: Joules, b: Joules) -> Joules { return joules(a.value - b.va
 
 **Returns:** `Joules`
 
-*Defined at line 211*
+*Defined at line 406*
 
 ---
 
@@ -1343,7 +1343,7 @@ pub fn watts_add(a: Watts, b: Watts) -> Watts { return watts(a.value + b.value);
 
 **Returns:** `Watts`
 
-*Defined at line 212*
+*Defined at line 409*
 
 ---
 
@@ -1360,7 +1360,7 @@ pub fn watts_sub(a: Watts, b: Watts) -> Watts { return watts(a.value - b.value);
 
 **Returns:** `Watts`
 
-*Defined at line 213*
+*Defined at line 412*
 
 ---
 
@@ -1372,7 +1372,7 @@ Speed of light in vacuum (m/s).
 pub const SPEED_OF_LIGHT: f64 = 299792458.0;
 ```
 
-*Defined at line 218*
+*Defined at line 557*
 
 ---
 
@@ -1384,7 +1384,7 @@ Gravitational constant (m³ kg⁻¹ s⁻²).
 pub const G_GRAVITATIONAL: f64 = 0.00000000006674;
 ```
 
-*Defined at line 221*
+*Defined at line 559*
 
 ---
 
@@ -1396,7 +1396,7 @@ Standard gravity on Earth (m/s²).
 pub const G_EARTH: f64 = 9.80665;
 ```
 
-*Defined at line 224*
+*Defined at line 561*
 
 ---
 
@@ -1408,7 +1408,7 @@ Avogadro's number (mol⁻¹).
 pub const AVOGADRO: f64 = 602214076000000000000000.0;
 ```
 
-*Defined at line 227*
+*Defined at line 563*
 
 ---
 
@@ -1420,7 +1420,7 @@ Boltzmann constant (J/K).
 pub const BOLTZMANN: f64 = 0.00000000000000000000001380649;
 ```
 
-*Defined at line 230*
+*Defined at line 565*
 
 ---
 
@@ -1432,7 +1432,7 @@ Planck constant (J·s).
 pub const PLANCK: f64 = 0.000000000000000000000000000000000662607015;
 ```
 
-*Defined at line 233*
+*Defined at line 567*
 
 ---
 
@@ -1444,7 +1444,7 @@ Elementary charge (C).
 pub const ELEMENTARY_CHARGE: f64 = 0.0000000000000000001602176634;
 ```
 
-*Defined at line 236*
+*Defined at line 569*
 
 ---
 
@@ -1456,7 +1456,7 @@ Gas constant (J mol⁻¹ K⁻¹).
 pub const GAS_CONSTANT: f64 = 8.314462618;
 ```
 
-*Defined at line 239*
+*Defined at line 571*
 
 ---
 
@@ -1468,7 +1468,7 @@ Atmospheric pressure at sea level (Pa).
 pub const ATM_PRESSURE: f64 = 101325.0;
 ```
 
-*Defined at line 242*
+*Defined at line 573*
 
 ---
 
@@ -1480,7 +1480,7 @@ Absolute zero in Celsius.
 pub const ABSOLUTE_ZERO_C: f64 = -273.15;
 ```
 
-*Defined at line 245*
+*Defined at line 575*
 
 ---
 

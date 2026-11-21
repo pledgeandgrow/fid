@@ -32,7 +32,7 @@ pub fn load_csv(path: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 31*
+*Defined at line 29*
 
 ---
 
@@ -51,7 +51,7 @@ pub fn parse_csv(content: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 38*
+*Defined at line 39*
 
 ---
 
@@ -61,16 +61,16 @@ Parse a single CSV row into a Vec of cell values.
 Handles quoted fields: "hello, world" → hello, world
 
 ```fides
-pub fn parse_csv_row(line: str) -> Vec {
+pub fn parse_csv_row(line: str) -> Vec<str> {
 ```
 
 **Parameters:**
 
 - `line`: `str`
 
-**Returns:** `Vec`
+**Returns:** `Vec<str>`
 
-*Defined at line 73*
+*Defined at line 91*
 
 ---
 
@@ -89,7 +89,7 @@ pub fn csv_headers(csv_json: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 105*
+*Defined at line 126*
 
 ---
 
@@ -109,7 +109,7 @@ pub fn csv_row(csv_json: str, row_idx: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 120*
+*Defined at line 145*
 
 ---
 
@@ -128,7 +128,7 @@ pub fn csv_get(row_json: str, col_name: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 125*
+*Defined at line 150*
 
 ---
 
@@ -146,7 +146,7 @@ pub fn csv_row_count(csv_json: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 130*
+*Defined at line 155*
 
 ---
 
@@ -164,7 +164,7 @@ pub fn load_json(path: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 137*
+*Defined at line 163*
 
 ---
 
@@ -183,7 +183,7 @@ pub fn json_get_value(json_str: str, key: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 143*
+*Defined at line 169*
 
 ---
 
@@ -203,7 +203,7 @@ pub fn infer_json_schema(json_str: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 150*
+*Defined at line 176*
 
 ---
 

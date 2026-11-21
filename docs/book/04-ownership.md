@@ -142,8 +142,10 @@ into warnings while you port code; don't ship with it.
 A reference can be passed to a call, held in a local, and returned when
 it comes from a reference parameter. It can never be *kept*: not in a
 struct field, a `Vec`, a global, a task, or a closure that outlives what
-it points to. That is why Fid needs no lifetime annotations, and why a
-reference can never dangle.
+it points to. That is why most Fid code needs no lifetime annotations,
+and why a reference can never dangle. The one exception is a struct with
+a lifetime parameter, `struct View<'a> { r: &'a i64 }`: it may hold a
+reference, and is then held like a reference itself (reference §8.4).
 
 ```fides
 // refs.fd
@@ -181,7 +183,7 @@ What it rejects:
 
 ```fides
 // store_fail.fd
-struct Holder { r: &i64 }            // error: a struct cannot hold a reference
+struct Holder { r: &i64 }            // error: no lifetime parameter to hold it
 
 fn main() -> i64 {
     var a: i64 = 1;
@@ -193,7 +195,7 @@ fn main() -> i64 {
 ```
 $ fid check store_fail.fd
 ...
-error: Reference error (line 0): in 'Holder', field 'Holder.r' has type '&i64', which stores a reference; references can only be passed to calls, held in locals and returned
+error: Reference error (line 0): in 'Holder', field 'Holder.r' has type '&i64', which stores a reference; references can only be passed to calls, held in locals and returned; to hold one, give the struct a lifetime parameter: `struct Holder<'a> { r: &'a T }`
 ...
 ```
 
@@ -307,12 +309,16 @@ fn main() -> i64 {
 $ CC="zig cc" fid run leaky.fd --leaks
 ...
 user0,user1,user2
-fid --leaks: 1 block(s), 64 bytes, never freed; by where they were allocated:
+fid --leaks: 2 block(s), 98 bytes, never freed; by where they were allocated:
         64 bytes in      1 block(s): main, allocated at leaky.fd:14
+        34 bytes in      1 block(s): p_str_alloc <- p_str_buf <- str_from_bytes <- str_join, allocated at leaky.fd:11
 ```
 
-Without the `unsafe` block it ends with `fid --leaks: every block was
-freed`: the strings and the `Vec` are freed by the compiler.
+The 64 bytes are the deliberate leak. The 34 bytes are a bug of the
+Nov 21 tree: the string `str_join` returns is never freed, even when it
+is bound to a local. Without both it would end with `fid --leaks: every
+block was freed`: the other strings and the `Vec` are freed by the
+compiler.
 
 ```fides
 // uaf.fd

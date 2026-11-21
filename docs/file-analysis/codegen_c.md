@@ -1,12 +1,27 @@
 # codegen_c.fd — IR → C99 backend
 
+> **Nov 21:** 16,565 lines (8,519 on Nov 9); it also imports `build_info`.
+> Fixed Nov 15 (known-bugs 2g.13): `f32 %` is `fmodf`, a bit cast to or
+> from a float is a C value conversion, and a user function named like a
+> function of the runtime's headers is renamed `p_<name>_user`
+> (`cg_libc_clash`; test_cwasm_f32_ops, test_cwasm_libc_names). Also fixed:
+> printing a tensor freed with C `free()` (2g.33). New open: a call written
+> as a `match` scrutinee crashed the stage-0 C generator (2g.26), two
+> signature-mismatched socket calls in `dump-c compiler/main.fd` (2g.31), a
+> user function named `byte` collides with rpcndr.h on Windows (2g.69), an
+> extern C name equal to a core function stops core's rename (2g.107).
+> `fid build` on a Linux or macOS host now goes through the machine layer
+> (CB4); the C path is `ccompile`, `dump-c`, `run --leaks/--checked-alloc`,
+> `build --via-c` and the fallback when the machine layer rejects a
+> program. Line numbers below are from Nov 9.
+
 > **Re-audited 2026-11-09** against the working tree (8,519 lines; 5,877
 > at the 2026-10-22/23 audit). Probes with the latest self-hosted binary
 > (s18) and `zig cc -fsyntax-only`.
 
 - **Path:** `compiler/codegen_c.fd`
-- **LOC:** 8,519 (about 4,400 of them are the C runtime as `wln` strings,
-  `emit_runtime_impl` :4046-8418)
+- **LOC:** 16,565 (2026-11-21). On Nov 9: 8,519, about 4,400 of them the
+  C runtime as `wln` strings (`emit_runtime_impl` :4046-8418)
 - **Role:** `IrModule` → one C translation unit plus its runtime. The
   path of `ccompile`, `dump-c`, `run --leaks/--checked-alloc`, `test`,
   `bench`, `profile`, `repl`, and `fid build` on POSIX. Imports ast, ir,

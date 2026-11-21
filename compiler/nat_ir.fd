@@ -8085,8 +8085,45 @@ pub struct NatFnRec {
     pub secret: bool,
 }
 
+/// RA14: the switch variables read once per image (ng_env_cache_load, by
+/// nat_generate_image1 on the main thread before any emission worker
+/// starts), as "," + value + "," ("": not set), and FID_VERIFY /
+/// FID_NAT_FAST set. ng_on and the others were a getenv each, and the
+/// allocator asks per move (the copy hints) and per call (IPRA): in a debug
+/// build's allocation (RA14's fast allocator) the lookups were a good part
+/// of its time. Before the first image (unit hooks) they read the
+/// environment as before.
+var g_ng_env_ok: bool = false;
+var g_ng_env_off: str = "";
+var g_ng_env_on: str = "";
+var g_ng_env_mut: str = "";
+var g_ng_env_verify: bool = false;
+var g_ng_env_fast: bool = false;
+
+fn ng_env_list(name: str) -> str {
+    var v: str = p_getenv(name);
+    if (v as i64) == 0 || str_len(v) == 0 {
+        return "";
+    }
+    return "," + v + ",";
+}
+
+fn ng_env_cache_load() {
+    g_ng_env_off = ng_env_list("FID_NAT_OFF");
+    g_ng_env_on = ng_env_list("FID_NAT_ON");
+    g_ng_env_mut = ng_env_list("FID_NAT_MUTATE");
+    var v: str = p_getenv("FID_VERIFY");
+    g_ng_env_verify = (v as i64) != 0 && str_len(v) > 0;
+    var fv: str = p_getenv("FID_NAT_FAST");
+    g_ng_env_fast = (fv as i64) != 0 && str_len(fv) > 0 && fv != "0";
+    g_ng_env_ok = true;
+}
+
 /// A backend switch, on unless FID_NAT_OFF names it.
 fn ng_on(name: str) -> bool {
+    if g_ng_env_ok {
+        return str_len(g_ng_env_off) == 0 || !str_contains(g_ng_env_off, "," + name + ",");
+    }
     var off: str = p_getenv("FID_NAT_OFF");
     if (off as i64) == 0 || str_len(off) == 0 {
         return true;
@@ -8104,6 +8141,9 @@ fn ng_on(name: str) -> bool {
 /// register is taken even when a move in between wrote it). Never set in
 /// a real build.
 fn ng_mutant(name: str) -> bool {
+    if g_ng_env_ok {
+        return str_len(g_ng_env_mut) > 0 && str_contains(g_ng_env_mut, "," + name + ",");
+    }
     var mu: str = p_getenv("FID_NAT_MUTATE");
     if (mu as i64) == 0 || str_len(mu) == 0 {
         return false;
@@ -8115,6 +8155,9 @@ fn ng_verify_on() -> bool {
     if g_ng_verify_unit {
         // RA4: tests/nattools/split_alloc_unit.fd (nat_split_alloc_unit)
         return true;
+    }
+    if g_ng_env_ok {
+        return g_ng_env_verify;
     }
     var v: str = p_getenv("FID_VERIFY");
     return (v as i64) != 0 && str_len(v) > 0;
@@ -13547,7 +13590,25 @@ fn ng_arg_fit(ph: & NgPhys, r: i64, lo: i64, hi: i64, blind: bool) -> bool {
         }
         k = k + 1;
     }
-    return true;
+    return ng_arg_fit_end(ph, r, hi);
+}
+
+/// RA7 / RA3 (2g.88): at the last position `hi` of a range, r's own value
+/// may be live after it only when that operation writes r by name (the
+/// operand copy `mov r, v` a hint is for). Else the range's value is
+/// defined there (a dead definition, the hull one position long: an `li`
+/// whose use add-immediate selection folded away) and would overwrite the
+/// argument or result r holds; before, such a range took r (the allocation
+/// checker's "defines vN in argument register R, whose argument or result
+/// is still to be read": case_n of test_machine_simd on x86-64 with RA4's
+/// split, FID_NAT_ON=splitall). Elsewhere the value is live before hi too,
+/// and [lo, hi) already excludes it.
+fn ng_arg_fit_end(ph: & NgPhys, r: i64, hi: i64) -> bool {
+    if hi < 0 || hi >= ph.live.len() {
+        return false;
+    }
+    var bit: i64 = 1 << r;
+    return (ph.live.get(hi) & bit) == 0 || (ph.wr.get(hi) & bit) != 0;
 }
 
 /// RA7: after the scan (and RA2), each integer range a move ties to an
@@ -13754,7 +13815,7 @@ fn ng_af_prefix(ph: & NgPhys, cands: i64, blind: bool, n: i64, pimp: & mut Vec<V
 /// RA3: ng_arg_fit(ph, r, lo, hi, blind) from the prefix counts of
 /// ng_af_prefix: no implicit use of r in [lo, hi], no write by name and no
 /// own value of r live after any operation in [lo, hi).
-fn ng_af_fit(pimp: & Vec<Vec<i64>>, pnam: & Vec<Vec<i64>>, r: i64, lo: i64, hi: i64) -> bool {
+fn ng_af_fit(ph: & NgPhys, pimp: & Vec<Vec<i64>>, pnam: & Vec<Vec<i64>>, r: i64, lo: i64, hi: i64) -> bool {
     if r < 0 || r >= pimp.len() || lo < 0 || hi < lo {
         return false;
     }
@@ -13766,7 +13827,8 @@ fn ng_af_fit(pimp: & Vec<Vec<i64>>, pnam: & Vec<Vec<i64>>, r: i64, lo: i64, hi: 
     if a.get(hi + 1) - a.get(lo) != 0 {
         return false;
     }
-    return b.get(hi) - b.get(lo) == 0;
+    // (2g.88: and at hi, as ng_arg_fit)
+    return b.get(hi) - b.get(lo) == 0 && ng_arg_fit_end(ph, r, hi);
 }
 
 /// RA3: no range of `lst` (other than v) shares a position with v's hull.
@@ -13872,7 +13934,7 @@ fn ng_arg_free(g: & NatGen, mir: & Vec<MInst>, mb: & MBlocks, lo: & Vec<i64>, hi
         var ri: i64 = 0;
         while !got && ri < aregs.len() {
             var r: i64 = aregs.get(ri);
-            if ng_af_fit(& pimp, & pnam, r, lo.get(v), hi.get(v)) {
+            if ng_af_fit(& ph, & pimp, & pnam, r, lo.get(v), hi.get(v)) {
                 var lr: Vec<i64> = lists.get(r);
                 if ng_af_free(& lr, lo, hi, v) {
                     lr.push(v);
@@ -13961,7 +14023,7 @@ fn ng_arg_free(g: & NatGen, mir: & Vec<MInst>, mb: & MBlocks, lo: & Vec<i64>, hi
                     if ti >= 0 {
                         tr0 = aregs.get(ti);
                     }
-                    if tr0 >= 0 && ng_af_fit(& pimp, & pnam, tr0, lo.get(o), hi.get(o)) {
+                    if tr0 >= 0 && ng_af_fit(& ph, & pimp, & pnam, tr0, lo.get(o), hi.get(o)) {
                         var tl: Vec<i64> = lists.get(tr0);
                         if ng_af_free(& tl, lo, hi, o) && ng_af_free_t(& tv, & tr, tr0, lo, hi, o) {
                             tg = tr0;
@@ -17980,6 +18042,9 @@ fn ng_fast_alloc_on() -> bool {
     if g_nat_fast {
         return true;
     }
+    if g_ng_env_ok {
+        return g_ng_env_fast;
+    }
     var v: str = p_getenv("FID_NAT_FAST");
     if (v as i64) == 0 {
         return false;
@@ -19712,6 +19777,50 @@ fn ng_tail_own_rr2(g: & NatGen, rec: & NatFnRec) -> bool {
     return HashMap_contains_i(g.rr_size, own) && HashMap_get_i(g.rr_size, own) > 8;
 }
 
+/// MI28 (2g.98): the extension each recorded function's narrow result
+/// leaves in the result register (name -> 1 + NEXT_*; bool NEXT_ZB): M7
+/// keeps a narrow value extended as its type says (ng_narrow_kind), so a
+/// Fides function returns one so. Filled as functions are recorded
+/// (ng_ret_ext_note), cleared at the start of each image (a function the
+/// cache replays has no entry: its calls keep their extension).
+var g_ng_ret_ext: i64 = 0;
+
+fn ng_ret_ext_reset() {
+    g_ng_ret_ext = HashMap_new();
+}
+
+fn ng_ret_ext_note(name: str, ty: IrType) {
+    if g_ng_ret_ext == 0 {
+        g_ng_ret_ext = HashMap_new();
+    }
+    var kind: i64 = ng_narrow_kind(ty);
+    if ir_type_eq(ty, IrType::Bool) {
+        kind = NEXT_ZB;
+    }
+    if kind > 0 {
+        HashMap_insert(g_ng_ret_ext, name, 1 + kind);
+    }
+}
+
+/// MI28 (2g.98): does the result of a call to label `label` already satisfy
+/// extension `kind`? Then `ext d, s, kind` of that result keeps it as it is
+/// (a bool result stored into a promoted bool local after inlining), and
+/// the call may still become a jump: the callee leaves its result extended
+/// (ng_ret_ext_note). Seen as is_odd's call of itself (is_even inlined)
+/// staying a call on AArch64 and RISC-V, tests/nattools/tailcall_deep.fd.
+fn ng_tail_ext_kept(g: & NatGen, label: i64, kind: i64) -> bool {
+    var key: str = int_to_str(label);
+    if g_ng_ret_ext == 0 || !HashMap_contains(g.label_fn, key) {
+        return false;
+    }
+    var name: str = HashMap_get(g.label_fn, key);
+    if !HashMap_contains(g_ng_ret_ext, name) {
+        return false;
+    }
+    var ck: i64 = HashMap_get(g_ng_ret_ext, name) - 1;
+    return kind >= NEXT_SB && kind <= NEXT_ZW && ng_ext_keeps(ck, kind);
+}
+
 /// OP13: is the MO_CALL at `k` a sibling call in tail position? Its target
 /// is a compiled Fides function (not a primitive or an import thunk, not
 /// one returning in two registers), and from the call, through moves,
@@ -19767,6 +19876,20 @@ fn ng_tail_at(g: & NatGen, rec: & NatFnRec, al: & NatAlloc, k: i64, place: i64) 
                 res = res | (1 << pd);
             } else {
                 res = res & (0 - 1 - (1 << pd));
+            }
+            j = j + 1;
+        } else if t.op == MO_EXT && ng_tail_ext_kept(g, m.i0, t.i0) {
+            // (2g.98: an extension the callee's result already satisfies
+            // copies it)
+            var ed: i64 = ng_tail_phys(al, t.r0, nv);
+            var es: i64 = ng_tail_phys(al, t.r1, nv);
+            if ed < 0 || ed >= 63 || es < 0 || es >= 63 {
+                return false;
+            }
+            if (res & (1 << es)) != 0 {
+                res = res | (1 << ed);
+            } else {
+                res = res & (0 - 1 - (1 << ed));
             }
             j = j + 1;
         } else {
@@ -21761,6 +21884,30 @@ fn ng_rf_walk(g: & NatGen, rec: & NatFnRec, feeds: & Vec<i64>, bmap: i64, offs: 
 /// OP12 / LF24: the result slots of calls returning in two registers, and
 /// the slots they are copied to, in vregs (see above). `feeds` from
 /// ng_rr_caller_rewrite. Returns the number of slots replaced.
+/// 2g.94: where ng_rf_promote sets its words to 0: at the first label after
+/// the prologue (the entry block's), after the moves of the incoming
+/// arguments out of their registers. Right after the prologue a word's
+/// definition could take an argument register still to be read (the
+/// allocation checker's "defines vN in argument register"; a natively
+/// built parser read a clobbered `self`). -1: no prologue.
+fn ng_rf_zero_at(mir: & Vec<MInst>) -> i64 {
+    var pro: i64 = 0 - 1;
+    var k: i64 = 0;
+    while k < mir.len() {
+        var op: i64 = mir.get(k).op;
+        if op == MO_PROLOGUE && pro < 0 {
+            pro = k;
+        } else if pro >= 0 && op == MO_PLACE {
+            return k;
+        }
+        k = k + 1;
+    }
+    if pro >= 0 {
+        return pro + 1;
+    }
+    return 0 - 1;
+}
+
 fn ng_rf_promote(g: & NatGen, rec: & mut NatFnRec, feeds: & Vec<i64>) -> i64 {
     var n: i64 = rec.mir.len();
     var nv: i64 = rec.nvreg - NG_VBASE;
@@ -21926,12 +22073,28 @@ fn ng_rf_promote(g: & NatGen, rec: & mut NatFnRec, feeds: & Vec<i64>) -> i64 {
         return 0;
     }
     var out: Vec<MInst> = Vec::new();
+    var zero_at: i64 = ng_rf_zero_at(& rec.mir);
     k = 0;
     while k < n {
         var m2: MInst = rec.mir.get(k);
         var ai2: i64 = acc_at.get(k);
         var ci2: i64 = cp_at.get(k);
         var done: bool = false;
+        if k == zero_at {
+            // every word starts as 0 (no read before a write is left
+            // without a definition)
+            s = 0;
+            while s < ns {
+                if wbase.get(s) >= 0 {
+                    var wi: i64 = 0;
+                    while wi < (ext.get(s) + 7) / 8 {
+                        out.push(ng_mi(MO_LI, wbase.get(s) + wi, 0, 0, 0, 0, 0));
+                        wi = wi + 1;
+                    }
+                }
+                s = s + 1;
+            }
+        }
         if ai2 >= 0 && wbase.get(accs.get(ai2)) >= 0 {
             var sl: i64 = accs.get(ai2);
             var dd: i64 = accs.get(ai2 + 1);
@@ -22038,21 +22201,6 @@ fn ng_rf_promote(g: & NatGen, rec: & mut NatFnRec, feeds: & Vec<i64>) -> i64 {
         }
         if !done {
             out.push(m2);
-        }
-        if m2.op == MO_PROLOGUE {
-            // every word starts as 0 (no read before a write is left
-            // without a definition)
-            s = 0;
-            while s < ns {
-                if wbase.get(s) >= 0 {
-                    var wi: i64 = 0;
-                    while wi < (ext.get(s) + 7) / 8 {
-                        out.push(ng_mi(MO_LI, wbase.get(s) + wi, 0, 0, 0, 0, 0));
-                        wi = wi + 1;
-                    }
-                }
-                s = s + 1;
-            }
         }
         k = k + 1;
     }
@@ -25189,7 +25337,9 @@ fn ng_gen_primitives_x64_linux(g: & mut NatGen) {
     x64_mov(& mut g.e, 10, 1);
     // ctid
     x64_mov(& mut g.e, 8, 11);
-    // tls
+    // tls: the thread pointer is the block + 72, so that fs:[-8] is the
+    // block's word at +64, its own address (2g.99: see nat_tls_get)
+    x64_add_imm(& mut g.e, 8, 72);
     x64_mov(& mut g.e, 6, 9);
     // newsp
     x64_li(& mut g.e, 2, 0);
@@ -25215,17 +25365,43 @@ fn ng_gen_primitives_x64_linux(g: & mut NatGen) {
     x64_mov(& mut g.e, 7, 0);
     x64_ret(& mut g.e);
 
-    // The thread pointer: fs; the block's word at +64 is its own address
+    // The thread pointer: fs. The block is the word at fs:[-8]: where the
+    // static TLS of the executable is (variant II: an 8-byte PT_TLS block
+    // right below the thread pointer), so a dynamically linked image (CI2)
+    // keeps the C library's thread pointer, whose TLS strtod and the rest of
+    // libc read (2g.99: with fs moved to the block, strtod read its locale
+    // from the block's neighbours and faulted at 0x8). A static image (and
+    // a thread of nat_clone_thread) sets fs to the block + 72: fs:[-8] is
+    // then the block's word at +64, its own address.
     ng_prim(g, "nat_tls_get");
-    x64_load_fs(& mut g.e, 7, 64);
+    x64_load_fs(& mut g.e, 7, 0 - 8);
     x64_ret(& mut g.e);
+    // nat_tls_set(v): without a thread pointer yet (arch_prctl(ARCH_GET_FS)
+    // gives 0: a static image's first thread), fs = v + 72; else fs:[-8] = v
     ng_prim(g, "nat_tls_set");
-    x64_mov(& mut g.e, 6, 7);
-    x64_li(& mut g.e, 7, 4098);
+    var tls_have: i64 = NatEnc_label(& mut g.e);
+    x64_mov(& mut g.e, 2, 7);
+    x64_add_imm(& mut g.e, 4, 0 - 16);
+    x64_li(& mut g.e, 0, 0);
+    x64_store(& mut g.e, 0, 4, 0, 8);
+    x64_mov(& mut g.e, 6, 4);
+    // ARCH_GET_FS
+    x64_li(& mut g.e, 7, 4099);
+    x64_li(& mut g.e, 0, 158);
+    x64_syscall(& mut g.e);
+    x64_load(& mut g.e, 0, 4, 0, 8, true);
+    x64_add_imm(& mut g.e, 4, 16);
+    x64_test(& mut g.e, 0, 0);
+    x64_jcc(& mut g.e, X64_NE, tls_have);
+    x64_lea(& mut g.e, 6, 2, 72);
     // ARCH_SET_FS
+    x64_li(& mut g.e, 7, 4098);
     x64_li(& mut g.e, 0, 158);
     // arch_prctl
     x64_syscall(& mut g.e);
+    x64_ret(& mut g.e);
+    NatEnc_place(& mut g.e, tls_have);
+    x64_store_fs(& mut g.e, 2, 0 - 8);
     x64_ret(& mut g.e);
 
     // Signals: the handler (sig, info, uc) calls pe_on_signal_uc(sig, info,
@@ -29942,6 +30118,8 @@ fn ng_gen_function(g: & mut NatGen, name: str, func: & IrFunction, module: & IrM
         }
         // DB7: the MIR as instruction selection recorded it
         ng_dump_mir(name, "selection", & g.mir);
+        // MI28 (2g.98): the extension its narrow result leaves
+        ng_ret_ext_note(name, func.ret_ty);
         g.recs.push(NatFnRec {
             name: name, mir: ng_cold_last(& g.mir, 0, 0), nvreg: g.nvreg, base_frame: ng_vz_frame_end(base_frame), slots: g.slots, is_ct: is_ct, sret_v: sret_v, sret_size: sret_size, secret: secret
         });
@@ -31016,6 +31194,9 @@ fn ng_collect_dyn_types(g: & mut NatGen, module: & IrModule) {
 
 /// A backend switch that is off unless FID_NAT_ON names it.
 fn ng_opt_in(name: str) -> bool {
+    if g_ng_env_ok {
+        return str_len(g_ng_env_on) > 0 && str_contains(g_ng_env_on, "," + name + ",");
+    }
     var on: str = p_getenv("FID_NAT_ON");
     if (on as i64) == 0 || str_len(on) == 0 {
         return false;
@@ -31333,6 +31514,8 @@ fn nat_generate_image1(module: IrModule, arch: i64, win: bool, mac: bool) -> Res
         return ResultBytes::Err(c_vec1("native backend: the program has no `main` function"));
     }
     nat_enc_image_start(g_nat_lines_file);
+    // RA14: the switch variables, once per image
+    ng_env_cache_load();
     if ng_verify_on() {
         // RL6: instruction selection checked on values (nat_sel_check)
         var serr: str = nat_sel_check(arch);
@@ -31345,6 +31528,8 @@ fn nat_generate_image1(module: IrModule, arch: i64, win: bool, mac: bool) -> Res
     g.win = win;
     g.mac = mac;
     g_nat_ldfwd_n = 0;
+    // MI28 (2g.98): this image's functions' result extensions
+    ng_ret_ext_reset();
     // TG14: a position-independent Linux executable (`--pie` / `--no-pie`,
     // else FID_NAT_ON=pie: nat_pie_wanted; it becomes the default once the
     // suite has run with it on the three Linux targets); Mach-O is always
@@ -31599,6 +31784,15 @@ fn nat_generate_image1(module: IrModule, arch: i64, win: bool, mac: bool) -> Res
     if !g.win && !g.mac && ng_ldyn_ok(& g) && g.ld.names.len() > 0 {
         c_missing = nat_elf_link_missing(arch, & g.ld.names, & g.ld.libs);
     }
+    // 2g.106: `--nat` Windows from each DLL's export directory (the DLLs of
+    // this machine's system folder or FID_NAT_LIBPATH), macOS from the SDK's
+    // text-based stubs (nat_enc.fd nat_pe_link_missing,
+    // nat_macho_link_missing; nothing when they are not here)
+    if g.win && ng_ldyn_ok(& g) && g.ld.names.len() > 0 {
+        c_missing = nat_pe_link_missing(& g.ld.names, & g.ld.libs);
+    } else if g.mac && ng_ldyn_ok(& g) && g.ld.names.len() > 0 {
+        c_missing = nat_macho_link_missing(& g.ld.names, & g.ld.libs);
+    }
     var other_unres: Vec<str> = Vec::new();
     var uix: i64 = 0;
     while uix < g.unresolved.len() {
@@ -31844,8 +32038,18 @@ fn NatLdyn_new() -> NatLdyn {
 /// relocates them).
 fn ng_ldyn_ok(g: & NatGen) -> bool {
     // TG15: Linux (ELF dynamic section), macOS (GOT slots dyld binds:
-    // nat_macho) and --nat Windows (IAT entries: ng_gen_win_imports)
-    return !g_nat_object && ng_on("ldyn");
+    // nat_macho) and --nat Windows (IAT entries: ng_gen_win_imports).
+    // 2g.110: a COFF or Mach-O object too: its import slots become
+    // relocations against the functions (nat_enc.fd nat_coff_object,
+    // nat_macho_object), so the runtime's kernel32 functions (LoadLibraryA,
+    // GetProcAddress, FreeLibrary: linux_runtime/win.fd) and the program's
+    // C functions resolve when it is linked; before, every --obj --nat
+    // build stopped on them as undefined. An ELF object has no dynamic
+    // section of its own: still none there.
+    if g_nat_object && !g.win && !g.mac {
+        return false;
+    }
+    return ng_on("ldyn");
 }
 
 /// TG15: the relocation that binds a GOT slot to a symbol's address:
@@ -32710,6 +32914,7 @@ const NG_LDYN_INTERP: str = "/lib64/ld-linux-x86-64.so.2";
 fn ng_ldyn_set_segments(g: & NatGen) {
     g_nat_ldyn_interp = 0 - 1;
     g_nat_ldyn_dyn = 0 - 1;
+    g_nat_elf_tls = 0 - 1;
     if g.ld.names.len() == 0 || g.ld.dyn_label < 0 {
         return;
     }
@@ -32717,6 +32922,12 @@ fn ng_ldyn_set_segments(g: & NatGen) {
     g_nat_ldyn_interp_len = str_len(ng_ldyn_interp(g)) + 1;
     g_nat_ldyn_dyn = NatEnc_label_offset(& g.e, g.ld.dyn_label);
     g_nat_ldyn_dyn_len = NatEnc_label_offset(& g.e, g.ld.dyn_end_label) - g_nat_ldyn_dyn;
+    // 2g.99: x86-64 keeps the runtime's thread block in the executable's
+    // static TLS (nat_tls_get reads fs:[-8]); the dynamic loader makes that
+    // block from PT_TLS (no file bytes: any 8-aligned place of the image)
+    if ng_x64(g) && (g_nat_ldyn_dyn & 7) == 0 {
+        g_nat_elf_tls = g_nat_ldyn_dyn;
+    }
 }
 
 // --- CT9: debug info names Fides functions and types as written ----------

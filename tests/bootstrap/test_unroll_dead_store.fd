@@ -1,0 +1,116 @@
+// known-bugs 2g.80 (ME24, OP11): a loop with a dead store in its body,
+// partially unrolled by the mid-end (compiler/iropt_me.fd ime_unroll_one,
+// on by default), printed 9900 for the sum 0..99 from the default `fid
+// emit` (pe_ir). The copies of the body are chained backwards (the last
+// copy is laid out first), so a value made in one copy and read in the
+// next is defined in a block laid out after its use; pe_ir's allocator
+// (pe_ir.fd peir_global_ra) started its interval at the reading block's
+// first instruction, where the dead product of that copy took the same
+// register. Every loop below must print what it computes without
+// unrolling, on every backend.
+//
+// Expected output:
+// 4950
+// 4950
+// 9900
+// 9900
+// 4851
+// 66
+// 286
+// 1275
+
+fn loopsum() -> i64 {
+    // 100 trips: by 4; `waste` is never read
+    var s: i64 = 0;
+    var waste: i64 = 0;
+    var i: i64 = 0;
+    while i < 100 {
+        waste = i * i;
+        s = s + i;
+        i = i + 1;
+    }
+    return s;
+}
+
+fn two_sums() -> i64 {
+    // two accumulators and two dead stores
+    var s: i64 = 0;
+    var t: i64 = 0;
+    var w1: i64 = 0;
+    var w2: i64 = 0;
+    var i: i64 = 0;
+    while i < 100 {
+        w1 = i * 3;
+        s = s + i;
+        w2 = s + 7;
+        t = t + 2 * i;
+        i = i + 1;
+    }
+    println(s);
+    return t;
+}
+
+fn evens() -> i64 {
+    // step 2, 100 trips
+    var s: i64 = 0;
+    var waste: i64 = 0;
+    var i: i64 = 0;
+    while i < 200 {
+        waste = i + 7;
+        s = s + i;
+        i = i + 2;
+    }
+    return s;
+}
+
+fn peeled() -> i64 {
+    // 99 trips: the remainder peeled in front of the header
+    var s: i64 = 0;
+    var waste: i64 = 0;
+    var i: i64 = 0;
+    while i < 99 {
+        waste = i * i;
+        s = s + i;
+        i = i + 1;
+    }
+    return s;
+}
+
+fn chained() -> i64 {
+    // b reads the a of the same trip: values flow from copy to copy
+    var a: i64 = 0;
+    var b: i64 = 0;
+    var waste: i64 = 0;
+    var i: i64 = 0;
+    while i < 12 {
+        waste = a * i;
+        a = a + i;
+        b = b + a;
+        i = i + 1;
+    }
+    println(a);
+    return b;
+}
+
+fn runtime(n: i64) -> i64 {
+    // a bound known only when the loop runs
+    var s: i64 = 0;
+    var waste: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        waste = i * i;
+        s = s + i + 1;
+        i = i + 1;
+    }
+    return s;
+}
+
+fn main() -> i64 {
+    println(loopsum());
+    println(two_sums());
+    println(evens());
+    println(peeled());
+    println(chained());
+    println(runtime(50));
+    return 0;
+}

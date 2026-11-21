@@ -28,7 +28,7 @@ Path separator (always '/' for portability).
 pub const PATH_SEP: str = "/";
 ```
 
-*Defined at line 21*
+*Defined at line 20*
 
 ---
 
@@ -42,7 +42,7 @@ pub fn path_sep() -> str {
 
 **Returns:** `str`
 
-*Defined at line 24*
+*Defined at line 25*
 
 ---
 
@@ -64,7 +64,7 @@ pub fn path_join(a: str, b: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 34*
+*Defined at line 92*
 
 ---
 
@@ -74,16 +74,16 @@ Join multiple path components.
 path_join_many(["a", "b", "c"]) → "a/b/c"
 
 ```fides
-pub fn path_join_many(parts: Vec) -> str {
+pub fn path_join_many(parts: Vec<str>) -> str {
 ```
 
 **Parameters:**
 
-- `parts`: `Vec`
+- `parts`: `Vec<str>`
 
 **Returns:** `str`
 
-*Defined at line 50*
+*Defined at line 121*
 
 ---
 
@@ -93,16 +93,16 @@ Split a path into (dirname, basename).
 path_split("/a/b/c.txt") → ("/a/b", "c.txt")
 
 ```fides
-pub fn path_split(path: str) -> Vec {
+pub fn path_split(path: str) -> Vec<str> {
 ```
 
 **Parameters:**
 
 - `path`: `str`
 
-**Returns:** `Vec`
+**Returns:** `Vec<str>`
 
-*Defined at line 65*
+*Defined at line 143*
 
 ---
 
@@ -121,7 +121,7 @@ pub fn path_dirname(path: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 85*
+*Defined at line 166*
 
 ---
 
@@ -140,7 +140,7 @@ pub fn path_basename(path: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 94*
+*Defined at line 191*
 
 ---
 
@@ -161,7 +161,7 @@ pub fn path_extension(path: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 106*
+*Defined at line 213*
 
 ---
 
@@ -181,7 +181,7 @@ pub fn path_stem(path: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 116*
+*Defined at line 229*
 
 ---
 
@@ -202,7 +202,7 @@ pub fn path_set_extension(path: str, ext: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 126*
+*Defined at line 245*
 
 ---
 
@@ -213,16 +213,16 @@ path_normalize("a/./b/../c") → "a/c"
 path_normalize("/a/b/../c") → "/a/c"
 
 ```fides
-pub fn path_normalize(path: str) -> str {
+pub fn path_normalize(path0: str) -> str {
 ```
 
 **Parameters:**
 
-- `path`: `str`
+- `path0`: `str`
 
 **Returns:** `str`
 
-*Defined at line 141*
+*Defined at line 264*
 
 ---
 
@@ -240,7 +240,7 @@ pub fn path_is_absolute(path: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 181*
+*Defined at line 336*
 
 ---
 
@@ -258,7 +258,7 @@ pub fn path_is_relative(path: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 187*
+*Defined at line 352*
 
 ---
 
@@ -277,7 +277,7 @@ pub fn path_has_extension(path: str, ext: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 192*
+*Defined at line 361*
 
 ---
 
@@ -287,16 +287,16 @@ Split a path into its components.
 path_components("/a/b/c") → ["", "a", "b", "c"]
 
 ```fides
-pub fn path_components(path: str) -> Vec {
+pub fn path_components(path: str) -> Vec<str> {
 ```
 
 **Parameters:**
 
 - `path`: `str`
 
-**Returns:** `Vec`
+**Returns:** `Vec<str>`
 
-*Defined at line 201*
+*Defined at line 375*
 
 ---
 
@@ -314,7 +314,7 @@ pub fn path_parent(path: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 206*
+*Defined at line 383*
 
 ---
 
@@ -332,7 +332,7 @@ pub fn path_depth(path: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 212*
+*Defined at line 395*
 
 ---
 

@@ -5,7 +5,8 @@
 > no `Stmt::Resume`) are fixed.
 
 - **Path:** `compiler/ast.fd`
-- **LOC:** 1,289 (was 1,153; Rust `src/ast.rs`: 936)
+- **LOC:** 2,640 (2026-11-21; 1,289 on Nov 9, 1,153 on Oct 22; Rust `src/ast.rs`: 936).
+  Line numbers and counts below are from Nov 9.
 - **Role:** the AST vocabulary: `Type` (28 variants), `Expr` (41), `Stmt` (33), `Pattern` (7),
   operator enums, declaration structs, `Program`, constructors, unbox helpers, `type_to_str`,
   and a few shared helpers used across the compiler.
@@ -14,6 +15,8 @@
 
 37 compiler modules import it (every pipeline stage plus `lsp`, `gpu`, `wasm`, `egraph`,
 `rules`, `iropt`, `nat_ir`, `cowcheck`, `checks`, `flat_ast`) and 12 selfhost tests.
+Nov 21: 44 modules (new: `ast_ser`, `ir_ser`, `ssa`, `tv`, `nat_thumb`, ...), 34 of them
+reached from main.fd.
 
 | Helper | Uses outside ast.fd | Files |
 |---|---|---|

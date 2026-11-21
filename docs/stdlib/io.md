@@ -29,7 +29,7 @@
 pub const STDIN: i64 = 0;
 ```
 
-*Defined at line 29*
+*Defined at line 31*
 
 ---
 
@@ -39,7 +39,7 @@ pub const STDIN: i64 = 0;
 pub const STDOUT: i64 = 1;
 ```
 
-*Defined at line 30*
+*Defined at line 31*
 
 ---
 
@@ -67,7 +67,7 @@ pub fn io_print(s: str) -> void {
 
 **Returns:** `void`
 
-*Defined at line 36*
+*Defined at line 42*
 
 ---
 
@@ -85,7 +85,7 @@ pub fn io_println(s: str) -> void {
 
 **Returns:** `void`
 
-*Defined at line 41*
+*Defined at line 47*
 
 ---
 
@@ -103,7 +103,7 @@ pub fn io_print_int(n: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 46*
+*Defined at line 52*
 
 ---
 
@@ -121,7 +121,7 @@ pub fn io_println_int(n: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 51*
+*Defined at line 57*
 
 ---
 
@@ -139,7 +139,7 @@ pub fn io_eprint(s: str) -> void {
 
 **Returns:** `void`
 
-*Defined at line 56*
+*Defined at line 62*
 
 ---
 
@@ -157,7 +157,7 @@ pub fn io_eprintln(s: str) -> void {
 
 **Returns:** `void`
 
-*Defined at line 61*
+*Defined at line 67*
 
 ---
 
@@ -175,7 +175,7 @@ pub fn io_putc(ch: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 67*
+*Defined at line 73*
 
 ---
 
@@ -189,7 +189,7 @@ pub fn io_newline() -> void {
 
 **Returns:** `void`
 
-*Defined at line 72*
+*Defined at line 78*
 
 ---
 
@@ -203,7 +203,7 @@ pub fn io_getc() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 79*
+*Defined at line 86*
 
 ---
 
@@ -218,7 +218,7 @@ pub fn io_readln() -> str {
 
 **Returns:** `str`
 
-*Defined at line 85*
+*Defined at line 92*
 
 ---
 
@@ -232,7 +232,7 @@ pub fn io_read_all() -> str {
 
 **Returns:** `str`
 
-*Defined at line 96*
+*Defined at line 104*
 
 ---
 
@@ -241,12 +241,12 @@ pub fn io_read_all() -> str {
 Read all of stdin into a Vec of lines.
 
 ```fides
-pub fn io_read_lines() -> Vec {
+pub fn io_read_lines() -> Vec<str> {
 ```
 
-**Returns:** `Vec`
+**Returns:** `Vec<str>`
 
-*Defined at line 107*
+*Defined at line 115*
 
 ---
 
@@ -260,7 +260,7 @@ pub fn io_flush() -> void {
 
 **Returns:** `void`
 
-*Defined at line 129*
+*Defined at line 138*
 
 ---
 
@@ -274,7 +274,7 @@ pub fn io_flush_err() -> void {
 
 **Returns:** `void`
 
-*Defined at line 134*
+*Defined at line 143*
 
 ---
 
@@ -283,16 +283,16 @@ pub fn io_flush_err() -> void {
 Print multiple values separated by spaces, followed by a newline.
 
 ```fides
-pub fn io_print_args(args: Vec) -> void {
+pub fn io_print_args(args: Vec<i64>) -> void {
 ```
 
 **Parameters:**
 
-- `args`: `Vec`
+- `args`: `Vec<i64>`
 
 **Returns:** `void`
 
-*Defined at line 141*
+*Defined at line 149*
 
 ---
 
@@ -311,7 +311,7 @@ pub fn io_print_separator(ch: i64, width: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 152*
+*Defined at line 164*
 
 ---
 
@@ -330,7 +330,7 @@ pub fn io_print_header(title: str, width: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 162*
+*Defined at line 174*
 
 ---
 

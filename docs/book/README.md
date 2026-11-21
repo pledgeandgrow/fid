@@ -4,7 +4,9 @@
 > language, **Fides** the compiler, `fid` the command. Status: draft —
 > every chapter is written and was checked example by example against
 > `fid` 0.8.0-unstable (chapters 5–8 and 10 on Nov 15, 1–4 and 9 on
-> Nov 17, 2026); each says where that build falls short.
+> Nov 17, 2026), then rechecked with `tests/book/check_book.py` against
+> `fid` 1.0.0+dev (built from the Nov 21 tree) on Nov 21, 2026; each says
+> where that build falls short.
 > Reference material lives in `docs/reference/`; this book teaches rather
 > than enumerates.
 

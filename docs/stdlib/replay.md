@@ -44,14 +44,17 @@ pub struct ReplayFrame {
 |------|------|
 | `frame_number` | `i64` |
 | `key_count` | `i64` |
-| `key0` | `i64, pub key1: i64, pub key2: i64, pub key3: i64` |
+| `key0` | `i64` |
+| `key1` | `i64` |
+| `key2` | `i64` |
+| `key3` | `i64` |
 | `mouse_x` | `i64` |
 | `mouse_y` | `i64` |
 | `mouse_buttons` | `i64` |
 | `dt_ms` | `i64` |
 | `seed` | `i64` |
 
-*Defined at line 27*
+*Defined at line 23*
 
 ---
 
@@ -73,7 +76,7 @@ pub struct ReplayHeader {
 | `game_version` | `str` |
 | `recorded_at` | `i64` |
 
-*Defined at line 38*
+*Defined at line 37*
 
 ---
 
@@ -105,7 +108,7 @@ pub struct Replay {
 | `read_pos` | `i64` |
 | `read_data` | `Vec<i64>` |
 
-*Defined at line 48*
+*Defined at line 47*
 
 ---
 
@@ -115,7 +118,7 @@ pub struct Replay {
 pub const REPLAY_IDLE: i64 = 0;
 ```
 
-*Defined at line 68*
+*Defined at line 67*
 
 ---
 
@@ -125,7 +128,7 @@ pub const REPLAY_IDLE: i64 = 0;
 pub const REPLAY_RECORDING: i64 = 1;
 ```
 
-*Defined at line 69*
+*Defined at line 67*
 
 ---
 
@@ -135,7 +138,7 @@ pub const REPLAY_RECORDING: i64 = 1;
 pub const REPLAY_PLAYING: i64 = 2;
 ```
 
-*Defined at line 70*
+*Defined at line 67*
 
 ---
 
@@ -145,7 +148,7 @@ pub const REPLAY_PLAYING: i64 = 2;
 pub const REPLAY_MAGIC: i64 = 0x46505244;
 ```
 
-*Defined at line 71*
+*Defined at line 67*
 
 ---
 
@@ -155,7 +158,7 @@ pub const REPLAY_MAGIC: i64 = 0x46505244;
 pub const REPLAY_VERSION: i64 = 1;
 ```
 
-*Defined at line 72*
+*Defined at line 67*
 
 ---
 
@@ -169,7 +172,7 @@ pub fn replay_create() -> Replay {
 
 **Returns:** `Replay`
 
-*Defined at line 75*
+*Defined at line 87*
 
 ---
 
@@ -190,7 +193,7 @@ pub fn replay_start_recording(rp: &mut Replay, seed: i64, game_name: str, game_v
 
 **Returns:** `void`
 
-*Defined at line 106*
+*Defined at line 96*
 
 ---
 
@@ -214,7 +217,7 @@ pub fn replay_record_frame(rp: &mut Replay, keys: Vec<i64>, mouse_x: i64, mouse_
 
 **Returns:** `void`
 
-*Defined at line 132*
+*Defined at line 116*
 
 ---
 
@@ -232,7 +235,7 @@ pub fn replay_stop_recording(rp: &mut Replay) -> void {
 
 **Returns:** `void`
 
-*Defined at line 157*
+*Defined at line 156*
 
 ---
 
@@ -250,7 +253,7 @@ pub fn replay_start_playback(rp: &mut Replay) -> void {
 
 **Returns:** `void`
 
-*Defined at line 162*
+*Defined at line 161*
 
 ---
 
@@ -264,7 +267,7 @@ pub fn replay_make_frame() -> ReplayFrame {
 
 **Returns:** `ReplayFrame`
 
-*Defined at line 169*
+*Defined at line 170*
 
 ---
 
@@ -283,7 +286,7 @@ pub fn replay_get_frame_into(rp: &Replay, out: &mut ReplayFrame) -> void {
 
 **Returns:** `void`
 
-*Defined at line 179*
+*Defined at line 177*
 
 ---
 
@@ -301,7 +304,7 @@ pub fn replay_get_frame(rp: &Replay) -> ReplayFrame {
 
 **Returns:** `ReplayFrame`
 
-*Defined at line 210*
+*Defined at line 220*
 
 ---
 
@@ -319,7 +322,7 @@ pub fn replay_next_frame(rp: &mut Replay) -> void {
 
 **Returns:** `void`
 
-*Defined at line 222*
+*Defined at line 229*
 
 ---
 
@@ -337,7 +340,7 @@ pub fn replay_is_finished(rp: &Replay) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 231*
+*Defined at line 240*
 
 ---
 
@@ -355,7 +358,7 @@ pub fn replay_stop_playback(rp: &mut Replay) -> void {
 
 **Returns:** `void`
 
-*Defined at line 236*
+*Defined at line 245*
 
 ---
 
@@ -373,7 +376,7 @@ pub fn replay_mode(rp: &Replay) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 241*
+*Defined at line 250*
 
 ---
 
@@ -391,7 +394,7 @@ pub fn replay_frame_count(rp: &Replay) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 246*
+*Defined at line 255*
 
 ---
 
@@ -409,7 +412,7 @@ pub fn replay_current_frame_idx(rp: &Replay) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 251*
+*Defined at line 260*
 
 ---
 
@@ -427,7 +430,7 @@ pub fn replay_start_seed(rp: &Replay) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 256*
+*Defined at line 265*
 
 ---
 
@@ -445,7 +448,7 @@ pub fn replay_progress(rp: &Replay) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 261*
+*Defined at line 270*
 
 ---
 
@@ -464,7 +467,7 @@ pub fn replay_seek(rp: &mut Replay, frame: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 267*
+*Defined at line 278*
 
 ---
 
@@ -483,7 +486,7 @@ pub fn replay_set_max_frames(rp: &mut Replay, max: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 277*
+*Defined at line 291*
 
 ---
 
@@ -502,7 +505,7 @@ pub fn replay_save(rp: &Replay, path: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 282*
+*Defined at line 296*
 
 ---
 
@@ -521,7 +524,7 @@ pub fn replay_load(rp: &mut Replay, path: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 309*
+*Defined at line 323*
 
 ---
 
@@ -539,7 +542,7 @@ pub fn replay_clear(rp: &mut Replay) -> void {
 
 **Returns:** `void`
 
-*Defined at line 381*
+*Defined at line 397*
 
 ---
 

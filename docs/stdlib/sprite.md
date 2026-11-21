@@ -59,7 +59,7 @@ pub struct Animation {
 | `looping` | `bool,         // does it loop?` |
 | `finished` | `bool,        // has a non-looping animation finished?` |
 
-*Defined at line 17*
+*Defined at line 16*
 
 ---
 
@@ -78,7 +78,7 @@ pub fn sprite_anim_create(frame_count: i64, frame_duration: f64) -> Animation {
 
 **Returns:** `Animation`
 
-*Defined at line 28*
+*Defined at line 45*
 
 ---
 
@@ -97,7 +97,7 @@ pub fn sprite_anim_play(anim: &mut Animation, start_frame: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 41*
+*Defined at line 52*
 
 ---
 
@@ -115,7 +115,7 @@ pub fn sprite_anim_stop(anim: &mut Animation) -> void {
 
 **Returns:** `void`
 
-*Defined at line 49*
+*Defined at line 60*
 
 ---
 
@@ -134,7 +134,7 @@ pub fn sprite_anim_set_looping(anim: &mut Animation, looping: bool) -> void {
 
 **Returns:** `void`
 
-*Defined at line 54*
+*Defined at line 65*
 
 ---
 
@@ -153,7 +153,7 @@ pub fn sprite_anim_update(anim: &mut Animation, dt: f64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 59*
+*Defined at line 70*
 
 ---
 
@@ -171,7 +171,7 @@ pub fn sprite_anim_reset(anim: &mut Animation) -> void {
 
 **Returns:** `void`
 
-*Defined at line 86*
+*Defined at line 97*
 
 ---
 
@@ -189,7 +189,7 @@ pub fn sprite_anim_is_finished(anim: Animation) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 93*
+*Defined at line 104*
 
 ---
 
@@ -207,7 +207,7 @@ pub fn sprite_anim_get_frame(anim: Animation) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 98*
+*Defined at line 109*
 
 ---
 
@@ -225,7 +225,7 @@ pub fn sprite_anim_total_duration(anim: Animation) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 103*
+*Defined at line 114*
 
 ---
 
@@ -246,7 +246,7 @@ pub struct AtlasRegion {
 | `origin_x` | `i64, // center x for rotation/scaling (relative to top-left)` |
 | `origin_y` | `i64, // center y for rotation/scaling` |
 
-*Defined at line 112*
+*Defined at line 123*
 
 ---
 
@@ -267,7 +267,7 @@ pub fn sprite_region_new(x: i64, y: i64, width: i64, height: i64) -> AtlasRegion
 
 **Returns:** `AtlasRegion`
 
-*Defined at line 122*
+*Defined at line 138*
 
 ---
 
@@ -290,7 +290,7 @@ pub fn sprite_region_with_origin(x: i64, y: i64, width: i64, height: i64, origin
 
 **Returns:** `AtlasRegion`
 
-*Defined at line 134*
+*Defined at line 145*
 
 ---
 
@@ -315,7 +315,7 @@ pub struct Sprite {
 | `flip_y` | `bool,         // flip vertically?` |
 | `alpha` | `f64,           // opacity (0.0 = transparent, 1.0 = opaque)` |
 
-*Defined at line 147*
+*Defined at line 153*
 
 ---
 
@@ -335,7 +335,7 @@ pub fn sprite_create(src_rect: AtlasRegion, x: f64, y: f64) -> Sprite {
 
 **Returns:** `Sprite`
 
-*Defined at line 161*
+*Defined at line 176*
 
 ---
 
@@ -355,7 +355,7 @@ pub fn sprite_move(s: &mut Sprite, dx: f64, dy: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 177*
+*Defined at line 183*
 
 ---
 
@@ -375,7 +375,7 @@ pub fn sprite_set_pos(s: &mut Sprite, x: f64, y: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 183*
+*Defined at line 189*
 
 ---
 
@@ -395,7 +395,7 @@ pub fn sprite_set_scale(s: &mut Sprite, sx: f64, sy: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 189*
+*Defined at line 195*
 
 ---
 
@@ -414,7 +414,7 @@ pub fn sprite_set_rotation(s: &mut Sprite, rot: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 195*
+*Defined at line 201*
 
 ---
 
@@ -433,7 +433,7 @@ pub fn sprite_set_visible(s: &mut Sprite, visible: bool) -> void {
 
 **Returns:** `void`
 
-*Defined at line 200*
+*Defined at line 206*
 
 ---
 
@@ -452,7 +452,7 @@ pub fn sprite_set_alpha(s: &mut Sprite, alpha: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 205*
+*Defined at line 211*
 
 ---
 
@@ -471,7 +471,7 @@ pub fn sprite_set_flip_x(s: &mut Sprite, flip: bool) -> void {
 
 **Returns:** `void`
 
-*Defined at line 210*
+*Defined at line 216*
 
 ---
 
@@ -490,7 +490,7 @@ pub fn sprite_set_flip_y(s: &mut Sprite, flip: bool) -> void {
 
 **Returns:** `void`
 
-*Defined at line 215*
+*Defined at line 221*
 
 ---
 
@@ -509,7 +509,7 @@ pub fn sprite_set_region(s: &mut Sprite, src_rect: AtlasRegion) -> void {
 
 **Returns:** `void`
 
-*Defined at line 220*
+*Defined at line 226*
 
 ---
 
@@ -527,7 +527,7 @@ pub fn sprite_bounds(s: Sprite) -> (f64, f64, f64, f64) {
 
 **Returns:** `(f64, f64, f64, f64)`
 
-*Defined at line 225*
+*Defined at line 231*
 
 ---
 
@@ -543,7 +543,7 @@ pub struct PaletteSwap {
 |------|------|
 | `entries` | `Vec<i64>,  // pairs: [old0, new0, old1, new1, ...]` |
 
-*Defined at line 243*
+*Defined at line 249*
 
 ---
 
@@ -557,7 +557,7 @@ pub fn sprite_palette_create() -> PaletteSwap {
 
 **Returns:** `PaletteSwap`
 
-*Defined at line 248*
+*Defined at line 254*
 
 ---
 
@@ -577,7 +577,7 @@ pub fn sprite_palette_add(palette: &mut PaletteSwap, old_color: i64, new_color: 
 
 **Returns:** `void`
 
-*Defined at line 253*
+*Defined at line 261*
 
 ---
 
@@ -597,7 +597,7 @@ pub fn sprite_palette_apply(palette: PaletteSwap, color: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 260*
+*Defined at line 268*
 
 ---
 
@@ -616,7 +616,7 @@ pub fn sprite_palette_apply_buffer(palette: PaletteSwap, pixels: &mut Vec<i64>) 
 
 **Returns:** `void`
 
-*Defined at line 272*
+*Defined at line 280*
 
 ---
 
@@ -633,7 +633,7 @@ pub struct AnimController {
 | `animations` | `Vec<Animation>` |
 | `current` | `i64,  // index of current animation` |
 
-*Defined at line 287*
+*Defined at line 295*
 
 ---
 
@@ -647,7 +647,7 @@ pub fn sprite_controller_create() -> AnimController {
 
 **Returns:** `AnimController`
 
-*Defined at line 293*
+*Defined at line 301*
 
 ---
 
@@ -666,7 +666,7 @@ pub fn sprite_controller_add(controller: &mut AnimController, anim: Animation) -
 
 **Returns:** `i64`
 
-*Defined at line 301*
+*Defined at line 308*
 
 ---
 
@@ -685,7 +685,7 @@ pub fn sprite_controller_play(controller: &mut AnimController, track: i64) -> vo
 
 **Returns:** `void`
 
-*Defined at line 308*
+*Defined at line 315*
 
 ---
 
@@ -704,7 +704,7 @@ pub fn sprite_controller_update(controller: &mut AnimController, dt: f64) -> i64
 
 **Returns:** `i64`
 
-*Defined at line 319*
+*Defined at line 327*
 
 ---
 
@@ -722,7 +722,7 @@ pub fn sprite_controller_current_track(controller: AnimController) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 332*
+*Defined at line 339*
 
 ---
 

@@ -1,7 +1,18 @@
 # veil.fd
 
 - **Path:** `compiler/veil.fd` — module `compiler::veil`
-- **LOC:** 516 (2026-11-09). Rust `src/veil.rs`: 367.
+- **LOC:** 742 (2026-11-21; 516 on Nov 9). Rust `src/veil.rs`: 367.
+- **Nov 21:** finding 1 is fixed (known-bugs 2g.2, Nov 15: the lowering
+  freed an uninitialised `var m: M;` from a match payload twice). Finding
+  2 no longer holds in the source: `Interpreter_set_debug_hook` now turns
+  on coverage recording (`cov_on`), the interpreter records every
+  instruction run, and `vl_cover_module` reads it back
+  (`Interpreter_cov_count`/`_cov_fn`/`_cov_id`); not re-run here.
+  `fid test --coverage` double-freed in `run_with_coverage` when the
+  covered program panicked; a fix was written Nov 18 (2g.30: the result's
+  payload is lent to `vl_cover_module`), confirmed when
+  tests/tooling/test-coverage-check.sh passes. It also imports
+  `comptime_eval` and `ast`. Line numbers below are from Nov 9.
 - **Role:** the `veil` coverage tool: function / line / instruction
   coverage of one program run in the interpreter, as a text or HTML report.
 - **Status:** reached from the CLI, but **broken**: it crashes before it

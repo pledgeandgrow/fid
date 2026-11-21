@@ -1,10 +1,15 @@
 # regalloc.fd — linear-scan register allocator (PIR path)
 
+> **Nov 21: dead.** Its only importer, codegen_x64.fd, is unreached since
+> MI18 (Nov 17) removed the PIR path (`fid codegen`, `build --native` and
+> `emit --boot` no longer use it). 1,505 lines now. The callers below are
+> as of Nov 9.
+
 > **Re-audited 2026-11-09.** Same features as Oct 23. Nov 3 (e655b58) fixed a family of helpers
 > that sorted or filled a by-value `Vec` (value semantics dropped the writes). Only the PIR x86-64
 > path uses this file; the native backends have their own allocators (pe_ir, nat_ir).
 
-- **Path:** `compiler/regalloc.fd` — **1,354 LOC** (Rust `src/regalloc.rs` = 1,509)
+- **Path:** `compiler/regalloc.fd` — **1,505 LOC** (2026-11-21; 1,354 on Nov 9; Rust `src/regalloc.rs` = 1,509)
 - **Role:** `allocate(func, pure_funcs, no_alloc_funcs)` (:283) and `allocate_module` (:555):
   live intervals over L3, argument preassignment, free pool and eviction, spill slots,
   rematerialized constants, callee-saved tracking.

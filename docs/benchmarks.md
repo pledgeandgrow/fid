@@ -7,7 +7,7 @@ program is not the way a good programmer of that language would write it,
 
 ## What is measured
 
-Four programs, each written in Fides, Rust, Zig, C++ and Go, in
+Four programs, each written in Fid, Rust, Zig, C++ and Go, in
 [`bench/`](../bench/README.md):
 
 | Program | What it measures | Prints |
@@ -32,10 +32,12 @@ included), in seconds.
 Real work (BM4: sorting, string building, hashing, a small compiler, JSON,
 regex, file reading; `SUITE=work ./bench/run.sh`) is in the Nov 17 entry of
 [Results](#results), and so is the Benchmarks Game set (BM3, `SUITE=game
-./bench/run.sh`, ten programs). Not measured yet (roadmap BM5–BM8):
-service benchmarks with the client
-on another machine, compile speed at 10k–1M lines against rivals, Linux
-runs, several runs with the spread reported. Binary size, startup and peak
+./bench/run.sh`, ten programs). Compile speed at 10k–1M lines against
+the rivals (BM6) and service benchmarks with the client on the same machine
+(BM5) are in the Nov 16–17 entries; spreads are reported since Nov 17. Not
+here yet: a service client on another machine, and Linux runs (BM8:
+verify-weekly.yml runs `bench/run.sh` on Linux and pages.yml merges its
+runs into the published page; none is in this file). Binary size, startup and peak
 memory (BM7, `bench/size.sh`) are in the Nov 17 entry of
 [Results](#results).
 
@@ -437,10 +439,11 @@ were about as slow on this run.
 
 These have no rival measured beside them:
 
-- **Self-compile** (`fid dump-c compiler/main.fd`, 158,516 lines of Fides to
-  67 MB of C): 74 s on Nov 9 with the compiler built at -O2 in 8 split
-  units, 229 s at -O0; ~133 s on Nov 6. The Rust bootstrap compiler `fidesc`
-  does it in ~21 s. About 2,100 lines a second: the widest gap to Go and Zig
+- **Self-compile** (`fid dump-c compiler/main.fd`): 57 s on Nov 21 for
+  the 361K-line compiler, built at -O2 in 8 split units (about 6,300 lines
+  a second); `fidesc` (Rust) takes ~45 s on the same tree (Nov 20). Earlier,
+  on 158,516 lines (67 MB of C): 74 s on Nov 9 at -O2, 229 s at -O0; ~133 s
+  on Nov 6; `fidesc` ~21 s. Still the widest gap to Go and Zig
   (roadmap CS1–CS7). Source: [selfhost.md, Numbers](reference/selfhost.md#numbers).
 - **Compile-time baselines** per stage, for `tests/bootstrap/hello.fd` and a
   mid-size test, in `bench/compile-baseline.txt` (Nov 9; e.g. hello.fd, native

@@ -3,7 +3,10 @@
 > **First audit 2026-11-09.** Probes with the latest self-hosted binary (s18).
 
 - **Path:** `compiler/csplit.fd`
-- **LOC:** 482 (no `module` line; imported as `compiler::csplit`)
+- **LOC:** 590 (2026-11-21; 482 on Nov 9; no `module` line; imported as
+  `compiler::csplit`). Nov 21: the `cs_strip_static` finding below is
+  fixed (known-bugs 2g.1, Nov 15): `static` is stripped from the function
+  head only. Line numbers below are from Nov 9.
 - **Role:** `fid split-c <in.c> <prefix> <n>`. Reads a C file as top-level
   items (preprocessor lines, declarations, function definitions; strings,
   chars and comments skipped while counting braces; only the first branch

@@ -33,7 +33,7 @@ pub fn assert_ndim(t: Tensor, expected: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 16*
+*Defined at line 26*
 
 ---
 
@@ -52,7 +52,7 @@ pub fn assert_size(t: Tensor, expected: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 29*
+*Defined at line 39*
 
 ---
 
@@ -72,7 +72,7 @@ pub fn assert_same_shape(a: Tensor, b: Tensor, op: str) -> void {
 
 **Returns:** `void`
 
-*Defined at line 42*
+*Defined at line 52*
 
 ---
 
@@ -92,7 +92,7 @@ pub fn assert_matmul_compatible(a: Tensor, b: Tensor) -> void {
 
 **Returns:** `void`
 
-*Defined at line 79*
+*Defined at line 89*
 
 ---
 
@@ -111,7 +111,7 @@ pub fn assert_reshape(t: Tensor, new_size: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 105*
+*Defined at line 115*
 
 ---
 
@@ -121,7 +121,7 @@ pub fn assert_reshape(t: Tensor, new_size: i64) -> void {
 pub const shape_1x1: Vec<i64> = vec_lit(1, 1);
 ```
 
-*Defined at line 121*
+*Defined at line 131*
 
 ---
 
@@ -131,7 +131,7 @@ pub const shape_1x1: Vec<i64> = vec_lit(1, 1);
 pub const shape_2x2: Vec<i64> = vec_lit(2, 2);
 ```
 
-*Defined at line 122*
+*Defined at line 131*
 
 ---
 
@@ -141,7 +141,7 @@ pub const shape_2x2: Vec<i64> = vec_lit(2, 2);
 pub const shape_2x3: Vec<i64> = vec_lit(2, 3);
 ```
 
-*Defined at line 123*
+*Defined at line 131*
 
 ---
 
@@ -151,7 +151,7 @@ pub const shape_2x3: Vec<i64> = vec_lit(2, 3);
 pub const shape_3x2: Vec<i64> = vec_lit(3, 2);
 ```
 
-*Defined at line 124*
+*Defined at line 131*
 
 ---
 
@@ -161,7 +161,7 @@ pub const shape_3x2: Vec<i64> = vec_lit(3, 2);
 pub const shape_3x4: Vec<i64> = vec_lit(3, 4);
 ```
 
-*Defined at line 125*
+*Defined at line 131*
 
 ---
 
@@ -171,7 +171,7 @@ pub const shape_3x4: Vec<i64> = vec_lit(3, 4);
 pub const shape_4x2: Vec<i64> = vec_lit(4, 2);
 ```
 
-*Defined at line 126*
+*Defined at line 131*
 
 ---
 
@@ -181,7 +181,7 @@ pub const shape_4x2: Vec<i64> = vec_lit(4, 2);
 pub const shape_4x4: Vec<i64> = vec_lit(4, 4);
 ```
 
-*Defined at line 127*
+*Defined at line 131*
 
 ---
 
@@ -191,7 +191,7 @@ pub const shape_4x4: Vec<i64> = vec_lit(4, 4);
 pub const shape_1x3: Vec<i64> = vec_lit(1, 3);
 ```
 
-*Defined at line 128*
+*Defined at line 131*
 
 ---
 
@@ -201,7 +201,7 @@ pub const shape_1x3: Vec<i64> = vec_lit(1, 3);
 pub const shape_1x4: Vec<i64> = vec_lit(1, 4);
 ```
 
-*Defined at line 129*
+*Defined at line 131*
 
 ---
 
@@ -211,7 +211,7 @@ pub const shape_1x4: Vec<i64> = vec_lit(1, 4);
 pub const shape_4x1: Vec<i64> = vec_lit(4, 1);
 ```
 
-*Defined at line 130*
+*Defined at line 131*
 
 ---
 

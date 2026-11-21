@@ -31,7 +31,7 @@ pub struct Ray2D {
 | `origin` | `vec2` |
 | `direction` | `vec2,   // normalized` |
 
-*Defined at line 28*
+*Defined at line 25*
 
 ---
 
@@ -50,7 +50,7 @@ pub struct RayHit2D {
 | `point` | `vec2,       // intersection point` |
 | `normal` | `vec2,      // surface normal at hit` |
 
-*Defined at line 33*
+*Defined at line 30*
 
 ---
 
@@ -67,7 +67,7 @@ pub fn ray2d_create(origin: vec2, direction: vec2) -> Ray2D {
 
 **Returns:** `Ray2D`
 
-*Defined at line 40*
+*Defined at line 39*
 
 ---
 
@@ -90,7 +90,7 @@ pub fn ray2d_vs_aabb(ray: Ray2D, minx: f64, miny: f64, maxx: f64, maxy: f64) -> 
 
 **Returns:** `RayHit2D`
 
-*Defined at line 49*
+*Defined at line 56*
 
 ---
 
@@ -111,7 +111,7 @@ pub fn ray2d_vs_circle(ray: Ray2D, cx: f64, cy: f64, radius: f64) -> RayHit2D {
 
 **Returns:** `RayHit2D`
 
-*Defined at line 99*
+*Defined at line 133*
 
 ---
 
@@ -133,7 +133,7 @@ pub fn ray2d_vs_segment(ray: Ray2D, x1: f64, y1: f64, x2: f64, y2: f64) -> RayHi
 
 **Returns:** `RayHit2D`
 
-*Defined at line 132*
+*Defined at line 172*
 
 ---
 
@@ -150,7 +150,7 @@ pub struct Ray3D {
 | `origin` | `vec3` |
 | `direction` | `vec3,   // normalized` |
 
-*Defined at line 164*
+*Defined at line 207*
 
 ---
 
@@ -169,7 +169,7 @@ pub struct RayHit3D {
 | `point` | `vec3` |
 | `normal` | `vec3` |
 
-*Defined at line 169*
+*Defined at line 212*
 
 ---
 
@@ -186,7 +186,7 @@ pub fn ray3d_create(origin: vec3, direction: vec3) -> Ray3D {
 
 **Returns:** `Ray3D`
 
-*Defined at line 176*
+*Defined at line 219*
 
 ---
 
@@ -210,7 +210,7 @@ pub fn ray3d_vs_aabb(ray: Ray3D, minx: f64, miny: f64, minz: f64, maxx: f64, max
 
 **Returns:** `RayHit3D`
 
-*Defined at line 184*
+*Defined at line 226*
 
 ---
 
@@ -230,7 +230,7 @@ pub fn ray3d_vs_sphere(ray: Ray3D, center: vec3, radius: f64) -> RayHit3D {
 
 **Returns:** `RayHit3D`
 
-*Defined at line 255*
+*Defined at line 339*
 
 ---
 
@@ -251,7 +251,7 @@ pub fn ray3d_vs_plane(ray: Ray3D, normal: vec3, distance: f64) -> RayHit3D {
 
 **Returns:** `RayHit3D`
 
-*Defined at line 283*
+*Defined at line 373*
 
 ---
 
@@ -272,7 +272,7 @@ pub fn ray3d_vs_triangle(ray: Ray3D, v0: vec3, v1: vec3, v2: vec3) -> RayHit3D {
 
 **Returns:** `RayHit3D`
 
-*Defined at line 304*
+*Defined at line 398*
 
 ---
 
@@ -291,7 +291,7 @@ pub fn ray2d_at(ray: Ray2D, t: f64) -> vec2 {
 
 **Returns:** `vec2`
 
-*Defined at line 340*
+*Defined at line 444*
 
 ---
 
@@ -310,7 +310,7 @@ pub fn ray3d_at(ray: Ray3D, t: f64) -> vec3 {
 
 **Returns:** `vec3`
 
-*Defined at line 345*
+*Defined at line 449*
 
 ---
 

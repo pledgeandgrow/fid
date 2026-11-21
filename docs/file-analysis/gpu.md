@@ -4,8 +4,21 @@
 > `GpuStrI64`/`GpuI64I64` structs and `str_equal` → `==` (commit e1b2c3f).
 > Probes with the latest self-hosted binary (s18).
 
+> **Nov 21:** rewritten Nov 15-16 (known-bugs 2g.21). It reads the IR
+> (`compiler::ir`, `ast`), not PIR's L3 (MI18), so `fid gpu` no longer
+> keeps pir.fd on a build path. SPIR-V: word counts, result ids on types,
+> opcode and Int64 capability numbers, types before the function, one
+> OpVariable per register, OpLabel per block, a named entry point, `--text`
+> opcode names; PTX: `bra` targets are the block labels, registers and
+> parameters declared, `ret`, comparisons and shifts.
+> scripts/spirv-check.py checks a .spv's structure. Left: SPIR-V branches
+> have no OpSelectionMerge/OpLoopMerge (Vulkan's validator wants structured
+> control flow); calls, memory and floats are not translated (counted, a
+> warning). Integer kernels only. The findings below describe the module
+> before the rewrite.
+
 - **Path:** `compiler/gpu.fd`
-- **LOC:** 826 (Rust `src/gpu.rs`: 590)
+- **LOC:** 1,385 (2026-11-21; 826 on Nov 9; Rust `src/gpu.rs`: 590)
 - **Role:** PIR L3 → SPIR-V words (`SpirVCodeGen`, `generate_spirv` :786,
   `generate_spirv_text` :793 + `disassemble` :523) and L3 → PTX text
   (`PtxCodeGen`, `generate_ptx` :800).

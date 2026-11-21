@@ -7,7 +7,9 @@
 > (s18) and Node's `WebAssembly.Module`.
 
 - **Path:** `compiler/wasm.fd`
-- **LOC:** 1,656 (Rust `src/wasm.rs`: 1,277)
+- **LOC:** 4,247 (2026-11-21; 1,656 on Nov 9; Rust `src/wasm.rs`: 1,277). Nov 21: imported by
+  compiler.fd and main.fd (`fid wasm`), and imports `checks`; `fid wasm` runs no IR optimizer.
+  New open (known-bugs 2g.108): a struct returned through a function value comes back wrong.
 - **Role:** `IrModule` → WASM binary (`generate_wasm` :1580), or a section
   listing (`dump_wat` :1586). `WasmBuf` byte emitter; host imports from
   `env`; control flow as a `cur_block` local + `br $dispatch` loop.

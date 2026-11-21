@@ -136,9 +136,9 @@ pub struct CanFrame {
 | `dlc` | `i64` |
 | `is_extended` | `bool` |
 | `is_remote` | `bool` |
-| `data` | `Vec` |
+| `data` | `Vec<i64>` |
 
-*Defined at line 40*
+*Defined at line 39*
 
 ---
 
@@ -148,17 +148,17 @@ Create a standard (11-bit ID) data frame.
 ID must be in range 0x000-0x7FF. DLC is the data length code (0-8).
 
 ```fides
-pub fn can_frame_standard(id: i64, data: Vec) -> CanFrame {
+pub fn can_frame_standard(id: i64, data: Vec<i64>) -> CanFrame {
 ```
 
 **Parameters:**
 
 - `id`: `i64`
-- `data`: `Vec`
+- `data`: `Vec<i64>`
 
 **Returns:** `CanFrame`
 
-*Defined at line 52*
+*Defined at line 62*
 
 ---
 
@@ -168,17 +168,17 @@ Create an extended (29-bit ID) data frame.
 ID must be in range 0x00000000-0x1FFFFFFF.
 
 ```fides
-pub fn can_frame_extended(id: i64, data: Vec) -> CanFrame {
+pub fn can_frame_extended(id: i64, data: Vec<i64>) -> CanFrame {
 ```
 
 **Parameters:**
 
 - `id`: `i64`
-- `data`: `Vec`
+- `data`: `Vec<i64>`
 
 **Returns:** `CanFrame`
 
-*Defined at line 64*
+*Defined at line 70*
 
 ---
 
@@ -197,7 +197,7 @@ pub fn can_frame_remote_standard(id: i64, dlc: i64) -> CanFrame {
 
 **Returns:** `CanFrame`
 
-*Defined at line 75*
+*Defined at line 77*
 
 ---
 
@@ -216,7 +216,7 @@ pub fn can_frame_remote_extended(id: i64, dlc: i64) -> CanFrame {
 
 **Returns:** `CanFrame`
 
-*Defined at line 86*
+*Defined at line 84*
 
 ---
 
@@ -234,7 +234,7 @@ pub fn can_frame_id(frame: CanFrame) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 99*
+*Defined at line 93*
 
 ---
 
@@ -252,7 +252,7 @@ pub fn can_frame_dlc(frame: CanFrame) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 104*
+*Defined at line 98*
 
 ---
 
@@ -270,7 +270,7 @@ pub fn can_frame_is_extended(frame: CanFrame) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 109*
+*Defined at line 103*
 
 ---
 
@@ -288,7 +288,7 @@ pub fn can_frame_is_remote(frame: CanFrame) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 114*
+*Defined at line 108*
 
 ---
 
@@ -297,16 +297,16 @@ pub fn can_frame_is_remote(frame: CanFrame) -> bool {
 Get the data payload as a Vec of bytes.
 
 ```fides
-pub fn can_frame_data(frame: CanFrame) -> Vec {
+pub fn can_frame_data(frame: CanFrame) -> Vec<i64> {
 ```
 
 **Parameters:**
 
 - `frame`: `CanFrame`
 
-**Returns:** `Vec`
+**Returns:** `Vec<i64>`
 
-*Defined at line 119*
+*Defined at line 113*
 
 ---
 
@@ -326,7 +326,7 @@ pub fn can_frame_byte(frame: CanFrame, index: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 125*
+*Defined at line 119*
 
 ---
 
@@ -344,7 +344,7 @@ pub fn can_validate_standard_id(id: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 135*
+*Defined at line 129*
 
 ---
 
@@ -362,7 +362,7 @@ pub fn can_validate_extended_id(id: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 140*
+*Defined at line 134*
 
 ---
 
@@ -380,7 +380,7 @@ pub fn can_validate_dlc(dlc: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 145*
+*Defined at line 139*
 
 ---
 
@@ -404,7 +404,7 @@ pub fn j1939_id(priority: i64, reserved: i64, data_page: i64,
 - `reserved`: `i64`
 - `data_page`: `i64`
 
-*Defined at line 165*
+*Defined at line 159*
 
 ---
 
@@ -422,7 +422,7 @@ pub fn j1939_priority(id: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 177*
+*Defined at line 170*
 
 ---
 
@@ -440,7 +440,7 @@ pub fn j1939_pdu_format(id: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 182*
+*Defined at line 175*
 
 ---
 
@@ -458,7 +458,7 @@ pub fn j1939_pdu_specific(id: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 187*
+*Defined at line 180*
 
 ---
 
@@ -476,7 +476,7 @@ pub fn j1939_source_addr(id: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 192*
+*Defined at line 185*
 
 ---
 
@@ -494,7 +494,7 @@ pub fn j1939_is_pdu1(id: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 197*
+*Defined at line 190*
 
 ---
 
@@ -512,7 +512,7 @@ pub fn j1939_is_pdu2(id: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 202*
+*Defined at line 195*
 
 ---
 
@@ -532,7 +532,7 @@ pub fn j1939_pgn(id: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 209*
+*Defined at line 202*
 
 ---
 
@@ -544,7 +544,7 @@ UDS Service IDs (ISO 14229-1)
 pub const UDS_SERVICE_DIAGNOSTIC_SESSION_CONTROL: i64   = 0x10;
 ```
 
-*Defined at line 229*
+*Defined at line 222*
 
 ---
 
@@ -554,7 +554,7 @@ pub const UDS_SERVICE_DIAGNOSTIC_SESSION_CONTROL: i64   = 0x10;
 pub const UDS_SERVICE_ECU_RESET: i64                    = 0x11;
 ```
 
-*Defined at line 230*
+*Defined at line 222*
 
 ---
 
@@ -564,7 +564,7 @@ pub const UDS_SERVICE_ECU_RESET: i64                    = 0x11;
 pub const UDS_SERVICE_CLEAR_DTC: i64                    = 0x14;
 ```
 
-*Defined at line 231*
+*Defined at line 222*
 
 ---
 
@@ -574,7 +574,7 @@ pub const UDS_SERVICE_CLEAR_DTC: i64                    = 0x14;
 pub const UDS_SERVICE_READ_DTC: i64                     = 0x19;
 ```
 
-*Defined at line 232*
+*Defined at line 222*
 
 ---
 
@@ -584,7 +584,7 @@ pub const UDS_SERVICE_READ_DTC: i64                     = 0x19;
 pub const UDS_SERVICE_READ_DATA_BY_ID: i64              = 0x22;
 ```
 
-*Defined at line 233*
+*Defined at line 222*
 
 ---
 
@@ -594,7 +594,7 @@ pub const UDS_SERVICE_READ_DATA_BY_ID: i64              = 0x22;
 pub const UDS_SERVICE_READ_MEMORY_BY_ADDR: i64          = 0x23;
 ```
 
-*Defined at line 234*
+*Defined at line 222*
 
 ---
 
@@ -604,7 +604,7 @@ pub const UDS_SERVICE_READ_MEMORY_BY_ADDR: i64          = 0x23;
 pub const UDS_SERVICE_WRITE_DATA_BY_ID: i64             = 0x2E;
 ```
 
-*Defined at line 235*
+*Defined at line 222*
 
 ---
 
@@ -614,7 +614,7 @@ pub const UDS_SERVICE_WRITE_DATA_BY_ID: i64             = 0x2E;
 pub const UDS_SERVICE_INPUT_OUTPUT_CONTROL_BY_ID: i64   = 0x2F;
 ```
 
-*Defined at line 236*
+*Defined at line 222*
 
 ---
 
@@ -624,7 +624,7 @@ pub const UDS_SERVICE_INPUT_OUTPUT_CONTROL_BY_ID: i64   = 0x2F;
 pub const UDS_SERVICE_ROUTINE_CONTROL: i64              = 0x31;
 ```
 
-*Defined at line 237*
+*Defined at line 222*
 
 ---
 
@@ -634,7 +634,7 @@ pub const UDS_SERVICE_ROUTINE_CONTROL: i64              = 0x31;
 pub const UDS_SERVICE_REQUEST_DOWNLOAD: i64             = 0x34;
 ```
 
-*Defined at line 238*
+*Defined at line 222*
 
 ---
 
@@ -644,7 +644,7 @@ pub const UDS_SERVICE_REQUEST_DOWNLOAD: i64             = 0x34;
 pub const UDS_SERVICE_REQUEST_UPLOAD: i64               = 0x35;
 ```
 
-*Defined at line 239*
+*Defined at line 222*
 
 ---
 
@@ -654,7 +654,7 @@ pub const UDS_SERVICE_REQUEST_UPLOAD: i64               = 0x35;
 pub const UDS_SERVICE_TRANSFER_DATA: i64                = 0x36;
 ```
 
-*Defined at line 240*
+*Defined at line 222*
 
 ---
 
@@ -664,7 +664,7 @@ pub const UDS_SERVICE_TRANSFER_DATA: i64                = 0x36;
 pub const UDS_SERVICE_REQUEST_TRANSFER_EXIT: i64        = 0x37;
 ```
 
-*Defined at line 241*
+*Defined at line 222*
 
 ---
 
@@ -674,7 +674,7 @@ pub const UDS_SERVICE_REQUEST_TRANSFER_EXIT: i64        = 0x37;
 pub const UDS_SERVICE_REQUEST_FILE_TRANSFER: i64        = 0x38;
 ```
 
-*Defined at line 242*
+*Defined at line 222*
 
 ---
 
@@ -684,7 +684,7 @@ pub const UDS_SERVICE_REQUEST_FILE_TRANSFER: i64        = 0x38;
 pub const UDS_SERVICE_TESTER_PRESENT: i64               = 0x3E;
 ```
 
-*Defined at line 243*
+*Defined at line 222*
 
 ---
 
@@ -694,7 +694,7 @@ pub const UDS_SERVICE_TESTER_PRESENT: i64               = 0x3E;
 pub const UDS_SERVICE_ACCESS_TIMING: i64                = 0x83;
 ```
 
-*Defined at line 244*
+*Defined at line 222*
 
 ---
 
@@ -704,7 +704,7 @@ pub const UDS_SERVICE_ACCESS_TIMING: i64                = 0x83;
 pub const UDS_SERVICE_SECURED_DATA_TRANSMISSION: i64    = 0x84;
 ```
 
-*Defined at line 245*
+*Defined at line 222*
 
 ---
 
@@ -714,7 +714,7 @@ pub const UDS_SERVICE_SECURED_DATA_TRANSMISSION: i64    = 0x84;
 pub const UDS_SERVICE_CONTROL_DTC_SETTING: i64          = 0x85;
 ```
 
-*Defined at line 246*
+*Defined at line 222*
 
 ---
 
@@ -724,7 +724,7 @@ pub const UDS_SERVICE_CONTROL_DTC_SETTING: i64          = 0x85;
 pub const UDS_SERVICE_RESPONSE_ON_EVENT: i64            = 0x86;
 ```
 
-*Defined at line 247*
+*Defined at line 222*
 
 ---
 
@@ -734,7 +734,7 @@ pub const UDS_SERVICE_RESPONSE_ON_EVENT: i64            = 0x86;
 pub const UDS_SERVICE_LINK_CONTROL: i64                 = 0x87;
 ```
 
-*Defined at line 248*
+*Defined at line 222*
 
 ---
 
@@ -744,7 +744,7 @@ pub const UDS_SERVICE_LINK_CONTROL: i64                 = 0x87;
 pub const UDS_SERVICE_READ_DATA_BY_PERIODIC_ID: i64     = 0x2A;
 ```
 
-*Defined at line 249*
+*Defined at line 222*
 
 ---
 
@@ -754,7 +754,7 @@ pub const UDS_SERVICE_READ_DATA_BY_PERIODIC_ID: i64     = 0x2A;
 pub const UDS_SERVICE_DYNAMICALLY_DEFINE_DATA_ID: i64   = 0x2C;
 ```
 
-*Defined at line 250*
+*Defined at line 222*
 
 ---
 
@@ -764,7 +764,7 @@ pub const UDS_SERVICE_DYNAMICALLY_DEFINE_DATA_ID: i64   = 0x2C;
 pub const UDS_SERVICE_DEFINE_DATA_BY_ID: i64            = 0x2B;
 ```
 
-*Defined at line 251*
+*Defined at line 222*
 
 ---
 
@@ -774,7 +774,7 @@ pub const UDS_SERVICE_DEFINE_DATA_BY_ID: i64            = 0x2B;
 pub const UDS_SERVICE_WRITE_MEMORY_BY_ADDR: i64         = 0x3D;
 ```
 
-*Defined at line 252*
+*Defined at line 222*
 
 ---
 
@@ -784,7 +784,7 @@ pub const UDS_SERVICE_WRITE_MEMORY_BY_ADDR: i64         = 0x3D;
 pub const UDS_SERVICE_COMMUNICATION_CONTROL: i64        = 0x28;
 ```
 
-*Defined at line 253*
+*Defined at line 222*
 
 ---
 
@@ -794,7 +794,7 @@ pub const UDS_SERVICE_COMMUNICATION_CONTROL: i64        = 0x28;
 pub const UDS_SERVICE_AUTHENTICATION: i64               = 0x29;
 ```
 
-*Defined at line 254*
+*Defined at line 222*
 
 ---
 
@@ -806,7 +806,7 @@ UDS Negative Response Codes (NRC)
 pub const UDS_NRC_GENERAL_REJECT: i64                   = 0x10;
 ```
 
-*Defined at line 257*
+*Defined at line 224*
 
 ---
 
@@ -816,7 +816,7 @@ pub const UDS_NRC_GENERAL_REJECT: i64                   = 0x10;
 pub const UDS_NRC_SERVICE_NOT_SUPPORTED: i64            = 0x11;
 ```
 
-*Defined at line 258*
+*Defined at line 224*
 
 ---
 
@@ -826,7 +826,7 @@ pub const UDS_NRC_SERVICE_NOT_SUPPORTED: i64            = 0x11;
 pub const UDS_NRC_SUB_FUNCTION_NOT_SUPPORTED: i64       = 0x12;
 ```
 
-*Defined at line 259*
+*Defined at line 224*
 
 ---
 
@@ -836,7 +836,7 @@ pub const UDS_NRC_SUB_FUNCTION_NOT_SUPPORTED: i64       = 0x12;
 pub const UDS_NRC_INVALID_FORMAT: i64                   = 0x13;
 ```
 
-*Defined at line 260*
+*Defined at line 224*
 
 ---
 
@@ -846,7 +846,7 @@ pub const UDS_NRC_INVALID_FORMAT: i64                   = 0x13;
 pub const UDS_NRC_RESPONSE_TOO_LONG: i64                = 0x14;
 ```
 
-*Defined at line 261*
+*Defined at line 224*
 
 ---
 
@@ -856,7 +856,7 @@ pub const UDS_NRC_RESPONSE_TOO_LONG: i64                = 0x14;
 pub const UDS_NRC_BUSY_REPEAT_REQUEST: i64              = 0x21;
 ```
 
-*Defined at line 262*
+*Defined at line 224*
 
 ---
 
@@ -866,7 +866,7 @@ pub const UDS_NRC_BUSY_REPEAT_REQUEST: i64              = 0x21;
 pub const UDS_NRC_CONDITIONS_NOT_CORRECT: i64           = 0x22;
 ```
 
-*Defined at line 263*
+*Defined at line 224*
 
 ---
 
@@ -876,7 +876,7 @@ pub const UDS_NRC_CONDITIONS_NOT_CORRECT: i64           = 0x22;
 pub const UDS_NRC_REQUEST_SEQUENCE_ERROR: i64           = 0x24;
 ```
 
-*Defined at line 264*
+*Defined at line 224*
 
 ---
 
@@ -886,7 +886,7 @@ pub const UDS_NRC_REQUEST_SEQUENCE_ERROR: i64           = 0x24;
 pub const UDS_NRC_REQUEST_OUT_OF_RANGE: i64             = 0x31;
 ```
 
-*Defined at line 265*
+*Defined at line 224*
 
 ---
 
@@ -896,7 +896,7 @@ pub const UDS_NRC_REQUEST_OUT_OF_RANGE: i64             = 0x31;
 pub const UDS_NRC_SECURITY_ACCESS_DENIED: i64           = 0x33;
 ```
 
-*Defined at line 266*
+*Defined at line 224*
 
 ---
 
@@ -906,7 +906,7 @@ pub const UDS_NRC_SECURITY_ACCESS_DENIED: i64           = 0x33;
 pub const UDS_NRC_INVALID_KEY: i64                      = 0x35;
 ```
 
-*Defined at line 267*
+*Defined at line 224*
 
 ---
 
@@ -916,7 +916,7 @@ pub const UDS_NRC_INVALID_KEY: i64                      = 0x35;
 pub const UDS_NRC_EXCEEDED_NUMBER_OF_ATTEMPTS: i64      = 0x36;
 ```
 
-*Defined at line 268*
+*Defined at line 224*
 
 ---
 
@@ -926,7 +926,7 @@ pub const UDS_NRC_EXCEEDED_NUMBER_OF_ATTEMPTS: i64      = 0x36;
 pub const UDS_NRC_REQUIRED_TIME_DELAY_NOT_EXPIRED: i64  = 0x37;
 ```
 
-*Defined at line 269*
+*Defined at line 224*
 
 ---
 
@@ -936,7 +936,7 @@ pub const UDS_NRC_REQUIRED_TIME_DELAY_NOT_EXPIRED: i64  = 0x37;
 pub const UDS_NRC_RESPONSE_PENDING: i64                 = 0x78;
 ```
 
-*Defined at line 270*
+*Defined at line 224*
 
 ---
 
@@ -946,7 +946,7 @@ pub const UDS_NRC_RESPONSE_PENDING: i64                 = 0x78;
 pub const UDS_NRC_SUB_FUNCTION_NOT_SUPPORTED_ACTIVE: i64 = 0x7E;
 ```
 
-*Defined at line 271*
+*Defined at line 224*
 
 ---
 
@@ -956,7 +956,7 @@ pub const UDS_NRC_SUB_FUNCTION_NOT_SUPPORTED_ACTIVE: i64 = 0x7E;
 pub const UDS_NRC_SERVICE_NOT_SUPPORTED_ACTIVE: i64     = 0x7F;
 ```
 
-*Defined at line 272*
+*Defined at line 224*
 
 ---
 
@@ -975,7 +975,7 @@ pub fn uds_service_id(frame: CanFrame) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 276*
+*Defined at line 227*
 
 ---
 
@@ -994,7 +994,7 @@ pub fn uds_sub_function(frame: CanFrame) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 285*
+*Defined at line 236*
 
 ---
 
@@ -1004,16 +1004,16 @@ Extract UDS data payload (bytes after service ID + sub-function).
 Returns a Vec of the remaining bytes.
 
 ```fides
-pub fn uds_data(frame: CanFrame) -> Vec {
+pub fn uds_data(frame: CanFrame) -> Vec<i64> {
 ```
 
 **Parameters:**
 
 - `frame`: `CanFrame`
 
-**Returns:** `Vec`
+**Returns:** `Vec<i64>`
 
-*Defined at line 294*
+*Defined at line 245*
 
 ---
 
@@ -1024,17 +1024,17 @@ The response service ID is (request_service_id | 0x40).
 Format: [Service ID + 0x40] [Sub-function] [data...]
 
 ```fides
-pub fn uds_response_positive(request: CanFrame, response_data: Vec) -> CanFrame {
+pub fn uds_response_positive(request: CanFrame, response_data: Vec<i64>) -> CanFrame {
 ```
 
 **Parameters:**
 
 - `request`: `CanFrame`
-- `response_data`: `Vec`
+- `response_data`: `Vec<i64>`
 
 **Returns:** `CanFrame`
 
-*Defined at line 308*
+*Defined at line 259*
 
 ---
 
@@ -1054,7 +1054,7 @@ pub fn uds_response_negative(request: CanFrame, nrc: i64) -> CanFrame {
 
 **Returns:** `CanFrame`
 
-*Defined at line 324*
+*Defined at line 275*
 
 ---
 
@@ -1072,7 +1072,7 @@ pub fn uds_is_positive_response(frame: CanFrame) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 334*
+*Defined at line 285*
 
 ---
 
@@ -1090,7 +1090,7 @@ pub fn uds_is_negative_response(frame: CanFrame) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 340*
+*Defined at line 291*
 
 ---
 
@@ -1109,7 +1109,7 @@ pub fn uds_nrc(frame: CanFrame) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 346*
+*Defined at line 297*
 
 ---
 
@@ -1121,7 +1121,7 @@ DTC system prefixes
 pub const DTC_SYSTEM_POWERTRAIN: i64 = 0;
 ```
 
-*Defined at line 365*
+*Defined at line 316*
 
 ---
 
@@ -1131,7 +1131,7 @@ pub const DTC_SYSTEM_POWERTRAIN: i64 = 0;
 pub const DTC_SYSTEM_CHASSIS: i64    = 1;
 ```
 
-*Defined at line 366*
+*Defined at line 316*
 
 ---
 
@@ -1141,7 +1141,7 @@ pub const DTC_SYSTEM_CHASSIS: i64    = 1;
 pub const DTC_SYSTEM_BODY: i64       = 2;
 ```
 
-*Defined at line 367*
+*Defined at line 316*
 
 ---
 
@@ -1151,7 +1151,7 @@ pub const DTC_SYSTEM_BODY: i64       = 2;
 pub const DTC_SYSTEM_NETWORK: i64    = 3;
 ```
 
-*Defined at line 368*
+*Defined at line 316*
 
 ---
 
@@ -1171,7 +1171,7 @@ pub fn dtc_encode(system: i64, code: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 372*
+*Defined at line 319*
 
 ---
 
@@ -1189,7 +1189,7 @@ pub fn dtc_system(dtc: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 377*
+*Defined at line 324*
 
 ---
 
@@ -1207,7 +1207,7 @@ pub fn dtc_code(dtc: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 382*
+*Defined at line 329*
 
 ---
 
@@ -1225,7 +1225,7 @@ pub fn dtc_system_char(dtc: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 387*
+*Defined at line 334*
 
 ---
 
@@ -1239,7 +1239,7 @@ pub fn obd_read_dtcs() -> CanFrame {
 
 **Returns:** `CanFrame`
 
-*Defined at line 398*
+*Defined at line 351*
 
 ---
 
@@ -1253,7 +1253,7 @@ pub fn obd_clear_dtcs() -> CanFrame {
 
 **Returns:** `CanFrame`
 
-*Defined at line 405*
+*Defined at line 358*
 
 ---
 
@@ -1267,7 +1267,7 @@ pub fn obd_supported_pids() -> CanFrame {
 
 **Returns:** `CanFrame`
 
-*Defined at line 412*
+*Defined at line 365*
 
 ---
 
@@ -1282,7 +1282,7 @@ pub fn obd_engine_rpm_request() -> CanFrame {
 
 **Returns:** `CanFrame`
 
-*Defined at line 421*
+*Defined at line 374*
 
 ---
 
@@ -1301,7 +1301,7 @@ pub fn obd_decode_engine_rpm(frame: CanFrame) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 430*
+*Defined at line 383*
 
 ---
 
@@ -1315,7 +1315,7 @@ pub fn obd_vehicle_speed_request() -> CanFrame {
 
 **Returns:** `CanFrame`
 
-*Defined at line 440*
+*Defined at line 399*
 
 ---
 
@@ -1334,7 +1334,7 @@ pub fn obd_decode_vehicle_speed(frame: CanFrame) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 449*
+*Defined at line 408*
 
 ---
 
@@ -1349,7 +1349,7 @@ pub fn obd_coolant_temp_request() -> CanFrame {
 
 **Returns:** `CanFrame`
 
-*Defined at line 458*
+*Defined at line 423*
 
 ---
 
@@ -1368,7 +1368,7 @@ pub fn obd_decode_coolant_temp(frame: CanFrame) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 467*
+*Defined at line 432*
 
 ---
 
@@ -1380,7 +1380,7 @@ OBD-II functional broadcast ID (requests to all ECUs).
 pub const OBD_BROADCAST_ID: i64 = 0x7DF;
 ```
 
-*Defined at line 477*
+*Defined at line 448*
 
 ---
 
@@ -1392,7 +1392,7 @@ OBD-II ECU response ID base (0x7E8-0x7EF for 8 ECUs).
 pub const OBD_RESPONSE_BASE: i64 = 0x7E8;
 ```
 
-*Defined at line 480*
+*Defined at line 450*
 
 ---
 
@@ -1412,7 +1412,7 @@ pub fn obd_request_to_ecu(ecu: i64, mode: i64, pid: i64) -> CanFrame {
 
 **Returns:** `CanFrame`
 
-*Defined at line 483*
+*Defined at line 452*
 
 ---
 
@@ -1431,7 +1431,7 @@ pub fn obd_is_response_from_ecu(frame: CanFrame, ecu: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 491*
+*Defined at line 460*
 
 ---
 
@@ -1449,7 +1449,7 @@ pub fn obd_is_response(frame: CanFrame) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 496*
+*Defined at line 465*
 
 ---
 
@@ -1461,7 +1461,7 @@ UDS Session Types
 pub const UDS_SESSION_DEFAULT: i64       = 0x01;
 ```
 
-*Defined at line 503*
+*Defined at line 472*
 
 ---
 
@@ -1471,7 +1471,7 @@ pub const UDS_SESSION_DEFAULT: i64       = 0x01;
 pub const UDS_SESSION_PROGRAMMING: i64   = 0x02;
 ```
 
-*Defined at line 504*
+*Defined at line 472*
 
 ---
 
@@ -1481,7 +1481,7 @@ pub const UDS_SESSION_PROGRAMMING: i64   = 0x02;
 pub const UDS_SESSION_EXTENDED: i64      = 0x03;
 ```
 
-*Defined at line 505*
+*Defined at line 472*
 
 ---
 
@@ -1491,7 +1491,7 @@ pub const UDS_SESSION_EXTENDED: i64      = 0x03;
 pub const UDS_SESSION_SAFETY: i64        = 0x04;
 ```
 
-*Defined at line 506*
+*Defined at line 472*
 
 ---
 
@@ -1501,7 +1501,7 @@ pub const UDS_SESSION_SAFETY: i64        = 0x04;
 pub const UDS_SESSION_PROTECTION: i64    = 0x05;
 ```
 
-*Defined at line 507*
+*Defined at line 472*
 
 ---
 
@@ -1519,7 +1519,7 @@ pub fn uds_session_control(session: i64) -> CanFrame {
 
 **Returns:** `CanFrame`
 
-*Defined at line 510*
+*Defined at line 474*
 
 ---
 
@@ -1531,7 +1531,7 @@ UDS Reset Types
 pub const UDS_RESET_HARD: i64      = 0x01;
 ```
 
-*Defined at line 520*
+*Defined at line 484*
 
 ---
 
@@ -1541,7 +1541,7 @@ pub const UDS_RESET_HARD: i64      = 0x01;
 pub const UDS_RESET_KEY_OFF: i64   = 0x02;
 ```
 
-*Defined at line 521*
+*Defined at line 484*
 
 ---
 
@@ -1551,7 +1551,7 @@ pub const UDS_RESET_KEY_OFF: i64   = 0x02;
 pub const UDS_RESET_SOFT: i64      = 0x03;
 ```
 
-*Defined at line 522*
+*Defined at line 484*
 
 ---
 
@@ -1561,7 +1561,7 @@ pub const UDS_RESET_SOFT: i64      = 0x03;
 pub const UDS_RESET_ENABLE_RAPID: i64 = 0x04;
 ```
 
-*Defined at line 523*
+*Defined at line 484*
 
 ---
 
@@ -1571,7 +1571,7 @@ pub const UDS_RESET_ENABLE_RAPID: i64 = 0x04;
 pub const UDS_RESET_DISABLE_RAPID: i64 = 0x05;
 ```
 
-*Defined at line 524*
+*Defined at line 484*
 
 ---
 
@@ -1589,7 +1589,7 @@ pub fn uds_ecu_reset(reset_type: i64) -> CanFrame {
 
 **Returns:** `CanFrame`
 
-*Defined at line 527*
+*Defined at line 486*
 
 ---
 
@@ -1607,7 +1607,7 @@ pub fn uds_security_access_request_seed(level: i64) -> CanFrame {
 
 **Returns:** `CanFrame`
 
-*Defined at line 537*
+*Defined at line 496*
 
 ---
 
@@ -1616,17 +1616,17 @@ pub fn uds_security_access_request_seed(level: i64) -> CanFrame {
 Build a UDS Security Access - Send Key frame.
 
 ```fides
-pub fn uds_security_access_send_key(level: i64, key: Vec) -> CanFrame {
+pub fn uds_security_access_send_key(level: i64, key: Vec<i64>) -> CanFrame {
 ```
 
 **Parameters:**
 
 - `level`: `i64`
-- `key`: `Vec`
+- `key`: `Vec<i64>`
 
 **Returns:** `CanFrame`
 
-*Defined at line 545*
+*Defined at line 504*
 
 ---
 
@@ -1645,7 +1645,7 @@ pub fn uds_read_data_by_id(did: i64) -> CanFrame {
 
 **Returns:** `CanFrame`
 
-*Defined at line 559*
+*Defined at line 518*
 
 ---
 
@@ -1657,7 +1657,7 @@ Common UDS Data Identifiers
 pub const UDS_DID_VIN: i64                       = 0xF190;
 ```
 
-*Defined at line 568*
+*Defined at line 527*
 
 ---
 
@@ -1667,7 +1667,7 @@ pub const UDS_DID_VIN: i64                       = 0xF190;
 pub const UDS_DID_ECU_SERIAL_NUMBER: i64         = 0xF18C;
 ```
 
-*Defined at line 569*
+*Defined at line 527*
 
 ---
 
@@ -1677,7 +1677,7 @@ pub const UDS_DID_ECU_SERIAL_NUMBER: i64         = 0xF18C;
 pub const UDS_DID_ECU_MANUFACTURE_DATE: i64      = 0xF18B;
 ```
 
-*Defined at line 570*
+*Defined at line 527*
 
 ---
 
@@ -1687,7 +1687,7 @@ pub const UDS_DID_ECU_MANUFACTURE_DATE: i64      = 0xF18B;
 pub const UDS_DID_ECU_SOFTWARE_VERSION: i64      = 0xF191;
 ```
 
-*Defined at line 571*
+*Defined at line 527*
 
 ---
 
@@ -1697,7 +1697,7 @@ pub const UDS_DID_ECU_SOFTWARE_VERSION: i64      = 0xF191;
 pub const UDS_DID_ECU_HARDWARE_VERSION: i64      = 0xF192;
 ```
 
-*Defined at line 572*
+*Defined at line 527*
 
 ---
 
@@ -1707,7 +1707,7 @@ pub const UDS_DID_ECU_HARDWARE_VERSION: i64      = 0xF192;
 pub const UDS_DID_BOOT_SOFTWARE_IDENTIFICATION: i64 = 0xF195;
 ```
 
-*Defined at line 573*
+*Defined at line 527*
 
 ---
 
@@ -1726,7 +1726,7 @@ pub fn can_frame_print(frame: CanFrame) -> void {
 
 **Returns:** `void`
 
-*Defined at line 579*
+*Defined at line 532*
 
 ---
 

@@ -57,7 +57,10 @@ ends. A try that runs past the limit is killed together with every process
 it started:
 
 - POSIX: a watchdog shell kills the process tree (`pgrep -P`).
-- Windows: PowerShell `WaitForExit`, then `taskkill /T`.
+- Windows: PowerShell `WaitForExit`, then `taskkill /T`. Known bug
+  (Nov 21, known-bugs 2g.105): the watchdog runs `_fid_reduce_cmd.bat` by
+  bare name, so with `NoDefaultCurrentDirectoryInExePath=1` set every try
+  fails and none is stopped.
 
 The killed try counts as the failure `timeout`. It is kept only when the
 input itself timed out, so `fid reduce` can also shrink a program that

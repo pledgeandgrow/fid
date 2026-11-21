@@ -2,7 +2,21 @@
 
 > **New doc, 2026-11-09.**
 
-**Path:** `compiler/irverify.fd` — **144 lines**. Imports `ast`, `ir`,
+> **Nov 21:** 166 lines. The `asm!` clobber report is gone since
+> `peir_inst_operands` (checks.fd), which it reads operands through, skips
+> id -1 (known-bugs 2g.53, Nov 16). A stamp hit still
+> skips it (`FID_VERIFY` is not in the build key, 2g.15). New open: it
+> rejects two suite programs after iropt (2g.109).
+>
+> **Nov 21, uncommitted:** the two 2g.109 causes were fixed where they
+> lived — the select-statement slot a dominated block found by name is an
+> entry-block `Lowerer_txn_raw_slot` now (lower.fd), and `ime_remap`
+> covers `PersistLoad`/`PersistSave`/`Backward` while
+> `ime_unrenamed_uses` keeps values remap cannot rename (iropt_me.fd).
+> Whether `FID_VERIFY=1` passes the two suite programs now is not
+> re-checked here. Line numbers below are from Nov 9.
+
+**Path:** `compiler/irverify.fd` — **144 lines** on Nov 9 (166 on Nov 21). Imports `ast`, `ir`,
 `checks`, `iropt` (for `iro_cfg`, `iro_dominates`). One constant:
 `IV_MAX_ERRORS = 20`.
 

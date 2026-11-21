@@ -36,7 +36,7 @@ pub struct Flowfield {
 | `target_y` | `i64` |
 | `computed` | `bool` |
 
-*Defined at line 25*
+*Defined at line 24*
 
 ---
 
@@ -55,7 +55,7 @@ pub fn flowfield_create(width: i64, height: i64) -> Flowfield {
 
 **Returns:** `Flowfield`
 
-*Defined at line 39*
+*Defined at line 54*
 
 ---
 
@@ -75,7 +75,7 @@ pub fn flowfield_set_target(ff: &mut Flowfield, x: i64, y: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 65*
+*Defined at line 74*
 
 ---
 
@@ -95,7 +95,7 @@ pub fn flowfield_set_blocked(ff: &mut Flowfield, x: i64, y: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 75*
+*Defined at line 84*
 
 ---
 
@@ -115,7 +115,7 @@ pub fn flowfield_set_passable(ff: &mut Flowfield, x: i64, y: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 84*
+*Defined at line 93*
 
 ---
 
@@ -135,7 +135,7 @@ pub fn flowfield_is_blocked(ff: Flowfield, x: i64, y: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 93*
+*Defined at line 102*
 
 ---
 
@@ -154,7 +154,7 @@ pub fn flowfield_compute(ff: &mut Flowfield) -> void {
 
 **Returns:** `void`
 
-*Defined at line 108*
+*Defined at line 117*
 
 ---
 
@@ -173,7 +173,7 @@ pub fn flowfield_compute_dirs(ff: &mut Flowfield) -> void {
 
 **Returns:** `void`
 
-*Defined at line 179*
+*Defined at line 189*
 
 ---
 
@@ -194,7 +194,7 @@ pub fn flowfield_get_dir(ff: Flowfield, x: i64, y: i64) -> (i64, i64) {
 
 **Returns:** `(i64, i64)`
 
-*Defined at line 248*
+*Defined at line 258*
 
 ---
 
@@ -214,7 +214,7 @@ pub fn flowfield_get_distance(ff: Flowfield, x: i64, y: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 257*
+*Defined at line 267*
 
 ---
 
@@ -234,7 +234,7 @@ pub fn flowfield_has_path(ff: Flowfield, x: i64, y: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 265*
+*Defined at line 275*
 
 ---
 
@@ -252,7 +252,7 @@ pub fn flowfield_is_computed(ff: Flowfield) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 274*
+*Defined at line 284*
 
 ---
 
@@ -273,7 +273,7 @@ pub fn flowfield_add_cost(ff: &mut Flowfield, x: i64, y: i64, cost: i64) -> void
 
 **Returns:** `void`
 
-*Defined at line 284*
+*Defined at line 294*
 
 ---
 
@@ -291,7 +291,7 @@ pub fn flowfield_reset(ff: &mut Flowfield) -> void {
 
 **Returns:** `void`
 
-*Defined at line 298*
+*Defined at line 308*
 
 ---
 

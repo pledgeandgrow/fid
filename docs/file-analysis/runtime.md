@@ -1,7 +1,10 @@
 # runtime.fd — Fides-authored runtime scaffold (superseded)
 
 - **Path:** `compiler/runtime.fd` — module `compiler::runtime`
-- **LOC:** 546 (2026-11-09).
+- **LOC:** 619 (2026-11-21; 546 on Nov 9). Nov 21: still dead. The
+  type error was fixed in the source on Nov 16 (known-bugs 2g.22): its own
+  helper `rt_str_length` replaced the call of core's private
+  `p_str_length`; not re-checked with `fid check` since.
 - **Role (intended):** the `p_*` builtins of native binaries written once in
   Fides over a small `rt_sys_*` per-arch ABI (`extern "C"` block :76-87):
   a first-fit allocator over `rt_sys_mmap`, memset/memcpy, C-string

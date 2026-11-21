@@ -3,7 +3,13 @@
 > **New doc, 2026-11-09.** Working tree has a small uncommitted edit
 > (`peir_inst_of` returns `Unreachable` for a missing id, M9).
 
-**Path:** `compiler/checks.fd` — **1,332 lines**. Imports `ast`, `ir`.
+> **Nov 21:** 6,705 lines now; it also imports `inc`, and 12 modules
+> import it (also `ssa`, `tv`, `iropt_me`, `wasm`). Fixed Nov 16
+> (known-bugs 2g.53, the asm clobber below): `peir_inst_operands` skips an
+> input with id < 0, and so do ir.fd's reference list, nat_ir and pe_ir.
+> `PEIR_RANGES` is still `true`. Line numbers below are from Nov 9.
+
+**Path:** `compiler/checks.fd` — **1,332 lines** on Nov 9 (6,705 on Nov 21). Imports `ast`, `ir`.
 
 **Role:** per-function analysis that marks operations needing no overflow
 or bounds check. `peir_unchecked_ops(f, nvals)` returns a flag per value:

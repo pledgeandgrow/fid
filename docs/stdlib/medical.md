@@ -56,7 +56,7 @@
 pub const HL7_ADT_A01: i64 = 1;  // Admit a patient
 ```
 
-*Defined at line 20*
+*Defined at line 18*
 
 ---
 
@@ -66,7 +66,7 @@ pub const HL7_ADT_A01: i64 = 1;  // Admit a patient
 pub const HL7_ADT_A02: i64 = 2;  // Transfer a patient
 ```
 
-*Defined at line 21*
+*Defined at line 19*
 
 ---
 
@@ -76,7 +76,7 @@ pub const HL7_ADT_A02: i64 = 2;  // Transfer a patient
 pub const HL7_ADT_A03: i64 = 3;  // Discharge a patient
 ```
 
-*Defined at line 22*
+*Defined at line 20*
 
 ---
 
@@ -86,7 +86,7 @@ pub const HL7_ADT_A03: i64 = 3;  // Discharge a patient
 pub const HL7_ADT_A04: i64 = 4;  // Register a patient
 ```
 
-*Defined at line 23*
+*Defined at line 21*
 
 ---
 
@@ -96,7 +96,7 @@ pub const HL7_ADT_A04: i64 = 4;  // Register a patient
 pub const HL7_ADT_A08: i64 = 8;  // Update patient information
 ```
 
-*Defined at line 24*
+*Defined at line 22*
 
 ---
 
@@ -106,7 +106,7 @@ pub const HL7_ADT_A08: i64 = 8;  // Update patient information
 pub const HL7_ORU_R01: i64 = 10; // Observation result
 ```
 
-*Defined at line 25*
+*Defined at line 23*
 
 ---
 
@@ -116,7 +116,7 @@ pub const HL7_ORU_R01: i64 = 10; // Observation result
 pub const HL7_OUL_R22: i64 = 11; // Unsolicited lab observation
 ```
 
-*Defined at line 26*
+*Defined at line 24*
 
 ---
 
@@ -126,7 +126,7 @@ pub const HL7_OUL_R22: i64 = 11; // Unsolicited lab observation
 pub const HL7_MDM_T02: i64 = 12; // Medical document notification
 ```
 
-*Defined at line 27*
+*Defined at line 25*
 
 ---
 
@@ -144,7 +144,7 @@ pub fn hl7_msg_type_code(msg_type: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 30*
+*Defined at line 28*
 
 ---
 
@@ -162,7 +162,7 @@ pub fn hl7_msg_type_name(msg_type: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 43*
+*Defined at line 57*
 
 ---
 
@@ -184,10 +184,10 @@ pub struct HL7Message {
 | `sending_facility` | `str` |
 | `receiving_app` | `str` |
 | `receiving_facility` | `str` |
-| `timestamp` | `str,    // YYYYMMDDHHMMSS` |
-| `segments` | `Vec,     // Vec of segment strings` |
+| `timestamp` | `str` |
+| `segments` | `Vec<str>` |
 
-*Defined at line 58*
+*Defined at line 88*
 
 ---
 
@@ -205,7 +205,7 @@ pub fn hl7_new(msg_type: i64, msg_id: str, sending_app: str,
 - `msg_id`: `str`
 - `sending_app`: `str`
 
-*Defined at line 70*
+*Defined at line 110*
 
 ---
 
@@ -214,18 +214,18 @@ pub fn hl7_new(msg_type: i64, msg_id: str, sending_app: str,
 Set receiving application and facility.
 
 ```fides
-pub fn hl7_set_receiver(msg: HL7Message, app: str, facility: str) -> void {
+pub fn hl7_set_receiver(msg: &mut HL7Message, app: str, facility: str) -> void {
 ```
 
 **Parameters:**
 
-- `msg`: `HL7Message`
+- `msg`: `&mut HL7Message`
 - `app`: `str`
 - `facility`: `str`
 
 **Returns:** `void`
 
-*Defined at line 85*
+*Defined at line 117*
 
 ---
 
@@ -234,17 +234,17 @@ pub fn hl7_set_receiver(msg: HL7Message, app: str, facility: str) -> void {
 Add a segment to the message.
 
 ```fides
-pub fn hl7_add_segment(msg: HL7Message, segment: str) -> void {
+pub fn hl7_add_segment(msg: &mut HL7Message, segment: str) -> void {
 ```
 
 **Parameters:**
 
-- `msg`: `HL7Message`
+- `msg`: `&mut HL7Message`
 - `segment`: `str`
 
 **Returns:** `void`
 
-*Defined at line 91*
+*Defined at line 123*
 
 ---
 
@@ -262,7 +262,7 @@ pub fn hl7_segment_count(msg: HL7Message) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 96*
+*Defined at line 128*
 
 ---
 
@@ -280,7 +280,7 @@ pub fn hl7_msh_segment(msg: HL7Message) -> str {
 
 **Returns:** `str`
 
-*Defined at line 103*
+*Defined at line 135*
 
 ---
 
@@ -297,7 +297,7 @@ pub fn hl7_pid_segment(patient_id: str, patient_name: str,
 - `patient_id`: `str`
 - `patient_name`: `str`
 
-*Defined at line 113*
+*Defined at line 141*
 
 ---
 
@@ -314,7 +314,7 @@ pub fn hl7_pv1_segment(patient_class: str, assigned_location: str,
 - `patient_class`: `str`
 - `assigned_location`: `str`
 
-*Defined at line 121*
+*Defined at line 147*
 
 ---
 
@@ -332,7 +332,7 @@ pub fn hl7_obx_segment(set_id: i64, value_type: str, observation_id: str,
 - `value_type`: `str`
 - `observation_id`: `str`
 
-*Defined at line 129*
+*Defined at line 153*
 
 ---
 
@@ -349,7 +349,7 @@ pub fn hl7_adt_a01(sending_facility: str, patient_id: str,
 - `sending_facility`: `str`
 - `patient_id`: `str`
 
-*Defined at line 139*
+*Defined at line 161*
 
 ---
 
@@ -368,7 +368,7 @@ pub fn hl7_adt_a03(sending_facility: str, patient_id: str) -> HL7Message {
 
 **Returns:** `HL7Message`
 
-*Defined at line 155*
+*Defined at line 176*
 
 ---
 
@@ -386,7 +386,7 @@ pub fn hl7_serialize(msg: HL7Message) -> str {
 
 **Returns:** `str`
 
-*Defined at line 168*
+*Defined at line 189*
 
 ---
 
@@ -405,7 +405,7 @@ pub fn hl7_parse(text: str) -> HL7Message {
 
 **Returns:** `HL7Message`
 
-*Defined at line 183*
+*Defined at line 205*
 
 ---
 
@@ -424,7 +424,7 @@ pub fn hl7_get_field(segment: str, field_num: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 216*
+*Defined at line 244*
 
 ---
 
@@ -442,7 +442,7 @@ pub fn hl7_segment_type(segment: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 225*
+*Defined at line 253*
 
 ---
 
@@ -452,7 +452,7 @@ pub fn hl7_segment_type(segment: str) -> str {
 pub const FHIR_PATIENT: i64    = 0;
 ```
 
-*Defined at line 231*
+*Defined at line 259*
 
 ---
 
@@ -462,7 +462,7 @@ pub const FHIR_PATIENT: i64    = 0;
 pub const FHIR_OBSERVATION: i64 = 1;
 ```
 
-*Defined at line 232*
+*Defined at line 259*
 
 ---
 
@@ -472,7 +472,7 @@ pub const FHIR_OBSERVATION: i64 = 1;
 pub const FHIR_CONDITION: i64  = 2;
 ```
 
-*Defined at line 233*
+*Defined at line 259*
 
 ---
 
@@ -482,7 +482,7 @@ pub const FHIR_CONDITION: i64  = 2;
 pub const FHIR_MEDICATION: i64 = 3;
 ```
 
-*Defined at line 234*
+*Defined at line 259*
 
 ---
 
@@ -492,7 +492,7 @@ pub const FHIR_MEDICATION: i64 = 3;
 pub const FHIR_ENCOUNTER: i64  = 4;
 ```
 
-*Defined at line 235*
+*Defined at line 259*
 
 ---
 
@@ -502,7 +502,7 @@ pub const FHIR_ENCOUNTER: i64  = 4;
 pub const FHIR_PRACTITIONER: i64 = 5;
 ```
 
-*Defined at line 236*
+*Defined at line 259*
 
 ---
 
@@ -520,7 +520,7 @@ pub fn fhir_resource_name(resource_type: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 239*
+*Defined at line 261*
 
 ---
 
@@ -538,7 +538,7 @@ pub fn icd10_validate(code: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 252*
+*Defined at line 286*
 
 ---
 
@@ -548,7 +548,7 @@ pub fn icd10_validate(code: str) -> bool {
 pub const LOINC_GLUCOSE: str       = "2339-0";  // Glucose
 ```
 
-*Defined at line 273*
+*Defined at line 327*
 
 ---
 
@@ -558,7 +558,7 @@ pub const LOINC_GLUCOSE: str       = "2339-0";  // Glucose
 pub const LOINC_HEMOGLOBIN_A1C: str = "4548-4"; // HbA1c
 ```
 
-*Defined at line 274*
+*Defined at line 328*
 
 ---
 
@@ -568,7 +568,7 @@ pub const LOINC_HEMOGLOBIN_A1C: str = "4548-4"; // HbA1c
 pub const LOINC_CHOLESTEROL: str    = "2093-3";  // Cholesterol
 ```
 
-*Defined at line 275*
+*Defined at line 329*
 
 ---
 
@@ -578,7 +578,7 @@ pub const LOINC_CHOLESTEROL: str    = "2093-3";  // Cholesterol
 pub const LOINC_CREATININE: str     = "2160-0";  // Creatinine
 ```
 
-*Defined at line 276*
+*Defined at line 330*
 
 ---
 
@@ -588,7 +588,7 @@ pub const LOINC_CREATININE: str     = "2160-0";  // Creatinine
 pub const LOINC_WBC: str            = "6690-2";  // White Blood Cell
 ```
 
-*Defined at line 277*
+*Defined at line 331*
 
 ---
 
@@ -598,7 +598,7 @@ pub const LOINC_WBC: str            = "6690-2";  // White Blood Cell
 pub const LOINC_RBC: str            = "789-8";   // Red Blood Cell
 ```
 
-*Defined at line 278*
+*Defined at line 332*
 
 ---
 
@@ -608,7 +608,7 @@ pub const LOINC_RBC: str            = "789-8";   // Red Blood Cell
 pub const LOINC_PLATELETS: str      = "777-3";   // Platelets
 ```
 
-*Defined at line 279*
+*Defined at line 333*
 
 ---
 
@@ -618,7 +618,7 @@ pub const LOINC_PLATELETS: str      = "777-3";   // Platelets
 pub const LOINC_SODIUM: str         = "2951-2";  // Sodium
 ```
 
-*Defined at line 280*
+*Defined at line 334*
 
 ---
 
@@ -628,7 +628,7 @@ pub const LOINC_SODIUM: str         = "2951-2";  // Sodium
 pub const LOINC_POTASSIUM: str      = "2823-3";  // Potassium
 ```
 
-*Defined at line 281*
+*Defined at line 335*
 
 ---
 
@@ -638,7 +638,7 @@ pub const LOINC_POTASSIUM: str      = "2823-3";  // Potassium
 pub const LOINC_TEMPERATURE: str    = "8310-5";  // Body Temperature
 ```
 
-*Defined at line 282*
+*Defined at line 336*
 
 ---
 
@@ -648,7 +648,7 @@ pub const LOINC_TEMPERATURE: str    = "8310-5";  // Body Temperature
 pub const LOINC_HEART_RATE: str     = "8867-4";  // Heart Rate
 ```
 
-*Defined at line 283*
+*Defined at line 337*
 
 ---
 
@@ -658,7 +658,7 @@ pub const LOINC_HEART_RATE: str     = "8867-4";  // Heart Rate
 pub const LOINC_BP_SYSTOLIC: str    = "8480-6";  // BP Systolic
 ```
 
-*Defined at line 284*
+*Defined at line 338*
 
 ---
 
@@ -668,7 +668,7 @@ pub const LOINC_BP_SYSTOLIC: str    = "8480-6";  // BP Systolic
 pub const LOINC_BP_DIASTOLIC: str   = "8462-4";  // BP Diastolic
 ```
 
-*Defined at line 285*
+*Defined at line 339*
 
 ---
 
@@ -678,7 +678,7 @@ pub const LOINC_BP_DIASTOLIC: str   = "8462-4";  // BP Diastolic
 pub const LOINC_SPO2: str           = "59408-5"; // Oxygen Saturation
 ```
 
-*Defined at line 286*
+*Defined at line 340*
 
 ---
 

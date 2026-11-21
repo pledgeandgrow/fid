@@ -62,6 +62,10 @@ units of two different modules call stays in the unit of its generic
 generic has its own core unit. A program that edits core never hits.
 
 Check: `bash tests/tooling/inc-seed-store-check.sh` (FID=<fid>, CC=<cc>).
+Known bug (Nov 21, 2026, known-bugs 2g.91): a fresh project never takes
+core's unit from the seeded store (steps 3 and 4 of that check fail: core's
+unit key differs between the seed build and the fresh project). Seeding and
+`FIDES_SEED_STORE=off` work.
 
 ## B8: globals in a per-module build
 

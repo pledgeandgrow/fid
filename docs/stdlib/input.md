@@ -151,7 +151,7 @@
 pub const KEY_UNKNOWN: i64 = 0;
 ```
 
-*Defined at line 26*
+*Defined at line 25*
 
 ---
 
@@ -161,7 +161,7 @@ pub const KEY_UNKNOWN: i64 = 0;
 pub const KEY_SPACE: i64 = 32;
 ```
 
-*Defined at line 27*
+*Defined at line 25*
 
 ---
 
@@ -171,7 +171,7 @@ pub const KEY_SPACE: i64 = 32;
 pub const KEY_APOSTROPHE: i64 = 39;
 ```
 
-*Defined at line 28*
+*Defined at line 25*
 
 ---
 
@@ -181,7 +181,7 @@ pub const KEY_APOSTROPHE: i64 = 39;
 pub const KEY_COMMA: i64 = 44;
 ```
 
-*Defined at line 29*
+*Defined at line 25*
 
 ---
 
@@ -191,7 +191,7 @@ pub const KEY_COMMA: i64 = 44;
 pub const KEY_MINUS: i64 = 45;
 ```
 
-*Defined at line 30*
+*Defined at line 25*
 
 ---
 
@@ -201,7 +201,7 @@ pub const KEY_MINUS: i64 = 45;
 pub const KEY_PERIOD: i64 = 46;
 ```
 
-*Defined at line 31*
+*Defined at line 25*
 
 ---
 
@@ -211,7 +211,7 @@ pub const KEY_PERIOD: i64 = 46;
 pub const KEY_SLASH: i64 = 47;
 ```
 
-*Defined at line 32*
+*Defined at line 25*
 
 ---
 
@@ -221,7 +221,7 @@ pub const KEY_SLASH: i64 = 47;
 pub const KEY_0: i64 = 48;
 ```
 
-*Defined at line 33*
+*Defined at line 25*
 
 ---
 
@@ -231,7 +231,7 @@ pub const KEY_0: i64 = 48;
 pub const KEY_1: i64 = 49;
 ```
 
-*Defined at line 34*
+*Defined at line 25*
 
 ---
 
@@ -241,7 +241,7 @@ pub const KEY_1: i64 = 49;
 pub const KEY_2: i64 = 50;
 ```
 
-*Defined at line 35*
+*Defined at line 25*
 
 ---
 
@@ -251,7 +251,7 @@ pub const KEY_2: i64 = 50;
 pub const KEY_3: i64 = 51;
 ```
 
-*Defined at line 36*
+*Defined at line 25*
 
 ---
 
@@ -261,7 +261,7 @@ pub const KEY_3: i64 = 51;
 pub const KEY_4: i64 = 52;
 ```
 
-*Defined at line 37*
+*Defined at line 25*
 
 ---
 
@@ -271,7 +271,7 @@ pub const KEY_4: i64 = 52;
 pub const KEY_5: i64 = 53;
 ```
 
-*Defined at line 38*
+*Defined at line 25*
 
 ---
 
@@ -281,7 +281,7 @@ pub const KEY_5: i64 = 53;
 pub const KEY_6: i64 = 54;
 ```
 
-*Defined at line 39*
+*Defined at line 25*
 
 ---
 
@@ -291,7 +291,7 @@ pub const KEY_6: i64 = 54;
 pub const KEY_7: i64 = 55;
 ```
 
-*Defined at line 40*
+*Defined at line 25*
 
 ---
 
@@ -301,7 +301,7 @@ pub const KEY_7: i64 = 55;
 pub const KEY_8: i64 = 56;
 ```
 
-*Defined at line 41*
+*Defined at line 25*
 
 ---
 
@@ -311,7 +311,7 @@ pub const KEY_8: i64 = 56;
 pub const KEY_9: i64 = 57;
 ```
 
-*Defined at line 42*
+*Defined at line 25*
 
 ---
 
@@ -321,7 +321,7 @@ pub const KEY_9: i64 = 57;
 pub const KEY_SEMICOLON: i64 = 59;
 ```
 
-*Defined at line 43*
+*Defined at line 25*
 
 ---
 
@@ -331,7 +331,7 @@ pub const KEY_SEMICOLON: i64 = 59;
 pub const KEY_EQUAL: i64 = 61;
 ```
 
-*Defined at line 44*
+*Defined at line 25*
 
 ---
 
@@ -341,7 +341,7 @@ pub const KEY_EQUAL: i64 = 61;
 pub const KEY_A: i64 = 65;
 ```
 
-*Defined at line 45*
+*Defined at line 25*
 
 ---
 
@@ -351,7 +351,7 @@ pub const KEY_A: i64 = 65;
 pub const KEY_B: i64 = 66;
 ```
 
-*Defined at line 46*
+*Defined at line 25*
 
 ---
 
@@ -361,7 +361,7 @@ pub const KEY_B: i64 = 66;
 pub const KEY_C: i64 = 67;
 ```
 
-*Defined at line 47*
+*Defined at line 25*
 
 ---
 
@@ -371,7 +371,7 @@ pub const KEY_C: i64 = 67;
 pub const KEY_D: i64 = 68;
 ```
 
-*Defined at line 48*
+*Defined at line 25*
 
 ---
 
@@ -381,7 +381,7 @@ pub const KEY_D: i64 = 68;
 pub const KEY_E: i64 = 69;
 ```
 
-*Defined at line 49*
+*Defined at line 25*
 
 ---
 
@@ -391,7 +391,7 @@ pub const KEY_E: i64 = 69;
 pub const KEY_F: i64 = 70;
 ```
 
-*Defined at line 50*
+*Defined at line 25*
 
 ---
 
@@ -401,7 +401,7 @@ pub const KEY_F: i64 = 70;
 pub const KEY_G: i64 = 71;
 ```
 
-*Defined at line 51*
+*Defined at line 25*
 
 ---
 
@@ -411,7 +411,7 @@ pub const KEY_G: i64 = 71;
 pub const KEY_H: i64 = 72;
 ```
 
-*Defined at line 52*
+*Defined at line 25*
 
 ---
 
@@ -421,7 +421,7 @@ pub const KEY_H: i64 = 72;
 pub const KEY_I: i64 = 73;
 ```
 
-*Defined at line 53*
+*Defined at line 25*
 
 ---
 
@@ -431,7 +431,7 @@ pub const KEY_I: i64 = 73;
 pub const KEY_J: i64 = 74;
 ```
 
-*Defined at line 54*
+*Defined at line 25*
 
 ---
 
@@ -441,7 +441,7 @@ pub const KEY_J: i64 = 74;
 pub const KEY_K: i64 = 75;
 ```
 
-*Defined at line 55*
+*Defined at line 25*
 
 ---
 
@@ -451,7 +451,7 @@ pub const KEY_K: i64 = 75;
 pub const KEY_L: i64 = 76;
 ```
 
-*Defined at line 56*
+*Defined at line 25*
 
 ---
 
@@ -461,7 +461,7 @@ pub const KEY_L: i64 = 76;
 pub const KEY_M: i64 = 77;
 ```
 
-*Defined at line 57*
+*Defined at line 25*
 
 ---
 
@@ -471,7 +471,7 @@ pub const KEY_M: i64 = 77;
 pub const KEY_N: i64 = 78;
 ```
 
-*Defined at line 58*
+*Defined at line 25*
 
 ---
 
@@ -481,7 +481,7 @@ pub const KEY_N: i64 = 78;
 pub const KEY_O: i64 = 79;
 ```
 
-*Defined at line 59*
+*Defined at line 25*
 
 ---
 
@@ -491,7 +491,7 @@ pub const KEY_O: i64 = 79;
 pub const KEY_P: i64 = 80;
 ```
 
-*Defined at line 60*
+*Defined at line 25*
 
 ---
 
@@ -501,7 +501,7 @@ pub const KEY_P: i64 = 80;
 pub const KEY_Q: i64 = 81;
 ```
 
-*Defined at line 61*
+*Defined at line 25*
 
 ---
 
@@ -511,7 +511,7 @@ pub const KEY_Q: i64 = 81;
 pub const KEY_R: i64 = 82;
 ```
 
-*Defined at line 62*
+*Defined at line 25*
 
 ---
 
@@ -521,7 +521,7 @@ pub const KEY_R: i64 = 82;
 pub const KEY_S: i64 = 83;
 ```
 
-*Defined at line 63*
+*Defined at line 25*
 
 ---
 
@@ -531,7 +531,7 @@ pub const KEY_S: i64 = 83;
 pub const KEY_T: i64 = 84;
 ```
 
-*Defined at line 64*
+*Defined at line 25*
 
 ---
 
@@ -541,7 +541,7 @@ pub const KEY_T: i64 = 84;
 pub const KEY_U: i64 = 85;
 ```
 
-*Defined at line 65*
+*Defined at line 25*
 
 ---
 
@@ -551,7 +551,7 @@ pub const KEY_U: i64 = 85;
 pub const KEY_V: i64 = 86;
 ```
 
-*Defined at line 66*
+*Defined at line 25*
 
 ---
 
@@ -561,7 +561,7 @@ pub const KEY_V: i64 = 86;
 pub const KEY_W: i64 = 87;
 ```
 
-*Defined at line 67*
+*Defined at line 25*
 
 ---
 
@@ -571,7 +571,7 @@ pub const KEY_W: i64 = 87;
 pub const KEY_X: i64 = 88;
 ```
 
-*Defined at line 68*
+*Defined at line 25*
 
 ---
 
@@ -581,7 +581,7 @@ pub const KEY_X: i64 = 88;
 pub const KEY_Y: i64 = 89;
 ```
 
-*Defined at line 69*
+*Defined at line 25*
 
 ---
 
@@ -591,7 +591,7 @@ pub const KEY_Y: i64 = 89;
 pub const KEY_Z: i64 = 90;
 ```
 
-*Defined at line 70*
+*Defined at line 25*
 
 ---
 
@@ -601,7 +601,7 @@ pub const KEY_Z: i64 = 90;
 pub const KEY_LEFT_BRACKET: i64 = 91;
 ```
 
-*Defined at line 71*
+*Defined at line 25*
 
 ---
 
@@ -611,7 +611,7 @@ pub const KEY_LEFT_BRACKET: i64 = 91;
 pub const KEY_BACKSLASH: i64 = 92;
 ```
 
-*Defined at line 72*
+*Defined at line 25*
 
 ---
 
@@ -621,7 +621,7 @@ pub const KEY_BACKSLASH: i64 = 92;
 pub const KEY_RIGHT_BRACKET: i64 = 93;
 ```
 
-*Defined at line 73*
+*Defined at line 25*
 
 ---
 
@@ -631,7 +631,7 @@ pub const KEY_RIGHT_BRACKET: i64 = 93;
 pub const KEY_BACKTICK: i64 = 96;
 ```
 
-*Defined at line 74*
+*Defined at line 25*
 
 ---
 
@@ -641,7 +641,7 @@ pub const KEY_BACKTICK: i64 = 96;
 pub const KEY_ESCAPE: i64 = 256;
 ```
 
-*Defined at line 75*
+*Defined at line 25*
 
 ---
 
@@ -651,7 +651,7 @@ pub const KEY_ESCAPE: i64 = 256;
 pub const KEY_ENTER: i64 = 257;
 ```
 
-*Defined at line 76*
+*Defined at line 25*
 
 ---
 
@@ -661,7 +661,7 @@ pub const KEY_ENTER: i64 = 257;
 pub const KEY_TAB: i64 = 258;
 ```
 
-*Defined at line 77*
+*Defined at line 25*
 
 ---
 
@@ -671,7 +671,7 @@ pub const KEY_TAB: i64 = 258;
 pub const KEY_BACKSPACE: i64 = 259;
 ```
 
-*Defined at line 78*
+*Defined at line 25*
 
 ---
 
@@ -681,7 +681,7 @@ pub const KEY_BACKSPACE: i64 = 259;
 pub const KEY_INSERT: i64 = 260;
 ```
 
-*Defined at line 79*
+*Defined at line 25*
 
 ---
 
@@ -691,7 +691,7 @@ pub const KEY_INSERT: i64 = 260;
 pub const KEY_DELETE: i64 = 261;
 ```
 
-*Defined at line 80*
+*Defined at line 25*
 
 ---
 
@@ -701,7 +701,7 @@ pub const KEY_DELETE: i64 = 261;
 pub const KEY_RIGHT: i64 = 262;
 ```
 
-*Defined at line 81*
+*Defined at line 25*
 
 ---
 
@@ -711,7 +711,7 @@ pub const KEY_RIGHT: i64 = 262;
 pub const KEY_LEFT: i64 = 263;
 ```
 
-*Defined at line 82*
+*Defined at line 25*
 
 ---
 
@@ -721,7 +721,7 @@ pub const KEY_LEFT: i64 = 263;
 pub const KEY_DOWN: i64 = 264;
 ```
 
-*Defined at line 83*
+*Defined at line 25*
 
 ---
 
@@ -731,7 +731,7 @@ pub const KEY_DOWN: i64 = 264;
 pub const KEY_UP: i64 = 265;
 ```
 
-*Defined at line 84*
+*Defined at line 25*
 
 ---
 
@@ -741,7 +741,7 @@ pub const KEY_UP: i64 = 265;
 pub const KEY_PAGE_UP: i64 = 266;
 ```
 
-*Defined at line 85*
+*Defined at line 25*
 
 ---
 
@@ -751,7 +751,7 @@ pub const KEY_PAGE_UP: i64 = 266;
 pub const KEY_PAGE_DOWN: i64 = 267;
 ```
 
-*Defined at line 86*
+*Defined at line 25*
 
 ---
 
@@ -761,7 +761,7 @@ pub const KEY_PAGE_DOWN: i64 = 267;
 pub const KEY_HOME: i64 = 268;
 ```
 
-*Defined at line 87*
+*Defined at line 25*
 
 ---
 
@@ -771,7 +771,7 @@ pub const KEY_HOME: i64 = 268;
 pub const KEY_END: i64 = 269;
 ```
 
-*Defined at line 88*
+*Defined at line 25*
 
 ---
 
@@ -781,7 +781,7 @@ pub const KEY_END: i64 = 269;
 pub const KEY_CAPS_LOCK: i64 = 280;
 ```
 
-*Defined at line 89*
+*Defined at line 25*
 
 ---
 
@@ -791,7 +791,7 @@ pub const KEY_CAPS_LOCK: i64 = 280;
 pub const KEY_SCROLL_LOCK: i64 = 281;
 ```
 
-*Defined at line 90*
+*Defined at line 25*
 
 ---
 
@@ -801,7 +801,7 @@ pub const KEY_SCROLL_LOCK: i64 = 281;
 pub const KEY_NUM_LOCK: i64 = 282;
 ```
 
-*Defined at line 91*
+*Defined at line 25*
 
 ---
 
@@ -811,7 +811,7 @@ pub const KEY_NUM_LOCK: i64 = 282;
 pub const KEY_PRINT_SCREEN: i64 = 283;
 ```
 
-*Defined at line 92*
+*Defined at line 25*
 
 ---
 
@@ -821,7 +821,7 @@ pub const KEY_PRINT_SCREEN: i64 = 283;
 pub const KEY_PAUSE: i64 = 284;
 ```
 
-*Defined at line 93*
+*Defined at line 25*
 
 ---
 
@@ -831,7 +831,7 @@ pub const KEY_PAUSE: i64 = 284;
 pub const KEY_F1: i64 = 290;
 ```
 
-*Defined at line 94*
+*Defined at line 25*
 
 ---
 
@@ -841,7 +841,7 @@ pub const KEY_F1: i64 = 290;
 pub const KEY_F2: i64 = 291;
 ```
 
-*Defined at line 95*
+*Defined at line 25*
 
 ---
 
@@ -851,7 +851,7 @@ pub const KEY_F2: i64 = 291;
 pub const KEY_F3: i64 = 292;
 ```
 
-*Defined at line 96*
+*Defined at line 25*
 
 ---
 
@@ -861,7 +861,7 @@ pub const KEY_F3: i64 = 292;
 pub const KEY_F4: i64 = 293;
 ```
 
-*Defined at line 97*
+*Defined at line 25*
 
 ---
 
@@ -871,7 +871,7 @@ pub const KEY_F4: i64 = 293;
 pub const KEY_F5: i64 = 294;
 ```
 
-*Defined at line 98*
+*Defined at line 25*
 
 ---
 
@@ -881,7 +881,7 @@ pub const KEY_F5: i64 = 294;
 pub const KEY_F6: i64 = 295;
 ```
 
-*Defined at line 99*
+*Defined at line 25*
 
 ---
 
@@ -891,7 +891,7 @@ pub const KEY_F6: i64 = 295;
 pub const KEY_F7: i64 = 296;
 ```
 
-*Defined at line 100*
+*Defined at line 25*
 
 ---
 
@@ -901,7 +901,7 @@ pub const KEY_F7: i64 = 296;
 pub const KEY_F8: i64 = 297;
 ```
 
-*Defined at line 101*
+*Defined at line 25*
 
 ---
 
@@ -911,7 +911,7 @@ pub const KEY_F8: i64 = 297;
 pub const KEY_F9: i64 = 298;
 ```
 
-*Defined at line 102*
+*Defined at line 25*
 
 ---
 
@@ -921,7 +921,7 @@ pub const KEY_F9: i64 = 298;
 pub const KEY_F10: i64 = 299;
 ```
 
-*Defined at line 103*
+*Defined at line 25*
 
 ---
 
@@ -931,7 +931,7 @@ pub const KEY_F10: i64 = 299;
 pub const KEY_F11: i64 = 300;
 ```
 
-*Defined at line 104*
+*Defined at line 25*
 
 ---
 
@@ -941,7 +941,7 @@ pub const KEY_F11: i64 = 300;
 pub const KEY_F12: i64 = 301;
 ```
 
-*Defined at line 105*
+*Defined at line 25*
 
 ---
 
@@ -951,7 +951,7 @@ pub const KEY_F12: i64 = 301;
 pub const KEY_LEFT_SHIFT: i64 = 340;
 ```
 
-*Defined at line 106*
+*Defined at line 25*
 
 ---
 
@@ -961,7 +961,7 @@ pub const KEY_LEFT_SHIFT: i64 = 340;
 pub const KEY_LEFT_CONTROL: i64 = 341;
 ```
 
-*Defined at line 107*
+*Defined at line 25*
 
 ---
 
@@ -971,7 +971,7 @@ pub const KEY_LEFT_CONTROL: i64 = 341;
 pub const KEY_LEFT_ALT: i64 = 342;
 ```
 
-*Defined at line 108*
+*Defined at line 25*
 
 ---
 
@@ -981,7 +981,7 @@ pub const KEY_LEFT_ALT: i64 = 342;
 pub const KEY_LEFT_SUPER: i64 = 343;
 ```
 
-*Defined at line 109*
+*Defined at line 25*
 
 ---
 
@@ -991,7 +991,7 @@ pub const KEY_LEFT_SUPER: i64 = 343;
 pub const KEY_RIGHT_SHIFT: i64 = 344;
 ```
 
-*Defined at line 110*
+*Defined at line 25*
 
 ---
 
@@ -1001,7 +1001,7 @@ pub const KEY_RIGHT_SHIFT: i64 = 344;
 pub const KEY_RIGHT_CONTROL: i64 = 345;
 ```
 
-*Defined at line 111*
+*Defined at line 25*
 
 ---
 
@@ -1011,7 +1011,7 @@ pub const KEY_RIGHT_CONTROL: i64 = 345;
 pub const KEY_RIGHT_ALT: i64 = 346;
 ```
 
-*Defined at line 112*
+*Defined at line 25*
 
 ---
 
@@ -1021,7 +1021,7 @@ pub const KEY_RIGHT_ALT: i64 = 346;
 pub const KEY_RIGHT_SUPER: i64 = 347;
 ```
 
-*Defined at line 113*
+*Defined at line 25*
 
 ---
 
@@ -1031,7 +1031,7 @@ pub const KEY_RIGHT_SUPER: i64 = 347;
 pub const MOUSE_LEFT: i64 = 0;
 ```
 
-*Defined at line 117*
+*Defined at line 28*
 
 ---
 
@@ -1041,7 +1041,7 @@ pub const MOUSE_LEFT: i64 = 0;
 pub const MOUSE_RIGHT: i64 = 1;
 ```
 
-*Defined at line 118*
+*Defined at line 28*
 
 ---
 
@@ -1051,7 +1051,7 @@ pub const MOUSE_RIGHT: i64 = 1;
 pub const MOUSE_MIDDLE: i64 = 2;
 ```
 
-*Defined at line 119*
+*Defined at line 28*
 
 ---
 
@@ -1061,7 +1061,7 @@ pub const MOUSE_MIDDLE: i64 = 2;
 pub const MOUSE_X1: i64 = 3;
 ```
 
-*Defined at line 120*
+*Defined at line 28*
 
 ---
 
@@ -1071,7 +1071,7 @@ pub const MOUSE_X1: i64 = 3;
 pub const MOUSE_X2: i64 = 4;
 ```
 
-*Defined at line 121*
+*Defined at line 28*
 
 ---
 
@@ -1081,7 +1081,7 @@ pub const MOUSE_X2: i64 = 4;
 pub const GAMEPAD_A: i64 = 0;
 ```
 
-*Defined at line 125*
+*Defined at line 31*
 
 ---
 
@@ -1091,7 +1091,7 @@ pub const GAMEPAD_A: i64 = 0;
 pub const GAMEPAD_B: i64 = 1;
 ```
 
-*Defined at line 126*
+*Defined at line 31*
 
 ---
 
@@ -1101,7 +1101,7 @@ pub const GAMEPAD_B: i64 = 1;
 pub const GAMEPAD_X: i64 = 2;
 ```
 
-*Defined at line 127*
+*Defined at line 31*
 
 ---
 
@@ -1111,7 +1111,7 @@ pub const GAMEPAD_X: i64 = 2;
 pub const GAMEPAD_Y: i64 = 3;
 ```
 
-*Defined at line 128*
+*Defined at line 31*
 
 ---
 
@@ -1121,7 +1121,7 @@ pub const GAMEPAD_Y: i64 = 3;
 pub const GAMEPAD_LEFT_BUMPER: i64 = 4;
 ```
 
-*Defined at line 129*
+*Defined at line 31*
 
 ---
 
@@ -1131,7 +1131,7 @@ pub const GAMEPAD_LEFT_BUMPER: i64 = 4;
 pub const GAMEPAD_RIGHT_BUMPER: i64 = 5;
 ```
 
-*Defined at line 130*
+*Defined at line 31*
 
 ---
 
@@ -1141,7 +1141,7 @@ pub const GAMEPAD_RIGHT_BUMPER: i64 = 5;
 pub const GAMEPAD_BACK: i64 = 6;
 ```
 
-*Defined at line 131*
+*Defined at line 31*
 
 ---
 
@@ -1151,7 +1151,7 @@ pub const GAMEPAD_BACK: i64 = 6;
 pub const GAMEPAD_START: i64 = 7;
 ```
 
-*Defined at line 132*
+*Defined at line 31*
 
 ---
 
@@ -1161,7 +1161,7 @@ pub const GAMEPAD_START: i64 = 7;
 pub const GAMEPAD_GUIDE: i64 = 8;
 ```
 
-*Defined at line 133*
+*Defined at line 31*
 
 ---
 
@@ -1171,7 +1171,7 @@ pub const GAMEPAD_GUIDE: i64 = 8;
 pub const GAMEPAD_LEFT_THUMB: i64 = 9;
 ```
 
-*Defined at line 134*
+*Defined at line 31*
 
 ---
 
@@ -1181,7 +1181,7 @@ pub const GAMEPAD_LEFT_THUMB: i64 = 9;
 pub const GAMEPAD_RIGHT_THUMB: i64 = 10;
 ```
 
-*Defined at line 135*
+*Defined at line 31*
 
 ---
 
@@ -1191,7 +1191,7 @@ pub const GAMEPAD_RIGHT_THUMB: i64 = 10;
 pub const GAMEPAD_DPAD_UP: i64 = 11;
 ```
 
-*Defined at line 136*
+*Defined at line 31*
 
 ---
 
@@ -1201,7 +1201,7 @@ pub const GAMEPAD_DPAD_UP: i64 = 11;
 pub const GAMEPAD_DPAD_RIGHT: i64 = 12;
 ```
 
-*Defined at line 137*
+*Defined at line 31*
 
 ---
 
@@ -1211,7 +1211,7 @@ pub const GAMEPAD_DPAD_RIGHT: i64 = 12;
 pub const GAMEPAD_DPAD_DOWN: i64 = 13;
 ```
 
-*Defined at line 138*
+*Defined at line 31*
 
 ---
 
@@ -1221,7 +1221,7 @@ pub const GAMEPAD_DPAD_DOWN: i64 = 13;
 pub const GAMEPAD_DPAD_LEFT: i64 = 14;
 ```
 
-*Defined at line 139*
+*Defined at line 31*
 
 ---
 
@@ -1254,7 +1254,7 @@ pub struct InputState {
 | `gamepad_left_trigger` | `f64,  // 0.0 to 1.0` |
 | `gamepad_right_trigger` | `f64` |
 
-*Defined at line 149*
+*Defined at line 40*
 
 ---
 
@@ -1268,7 +1268,7 @@ pub fn input_init() -> void {
 
 **Returns:** `void`
 
-*Defined at line 186*
+*Defined at line 87*
 
 ---
 
@@ -1282,7 +1282,7 @@ pub fn input_create() -> InputState {
 
 **Returns:** `InputState`
 
-*Defined at line 191*
+*Defined at line 100*
 
 ---
 
@@ -1301,7 +1301,7 @@ pub fn input_update(state: &mut InputState) -> void {
 
 **Returns:** `void`
 
-*Defined at line 245*
+*Defined at line 137*
 
 ---
 
@@ -1320,7 +1320,7 @@ pub fn input_key_held(state: InputState, key: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 281*
+*Defined at line 173*
 
 ---
 
@@ -1339,7 +1339,7 @@ pub fn input_key_pressed(state: InputState, key: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 289*
+*Defined at line 181*
 
 ---
 
@@ -1358,7 +1358,7 @@ pub fn input_key_released(state: InputState, key: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 297*
+*Defined at line 189*
 
 ---
 
@@ -1378,7 +1378,7 @@ pub fn input_set_key(state: &mut InputState, key: i64, held: bool) -> void {
 
 **Returns:** `void`
 
-*Defined at line 305*
+*Defined at line 197*
 
 ---
 
@@ -1396,7 +1396,7 @@ pub fn input_mouse_x(state: InputState) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 317*
+*Defined at line 211*
 
 ---
 
@@ -1414,7 +1414,7 @@ pub fn input_mouse_y(state: InputState) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 322*
+*Defined at line 216*
 
 ---
 
@@ -1432,7 +1432,7 @@ pub fn input_mouse_delta(state: InputState) -> (i64, i64) {
 
 **Returns:** `(i64, i64)`
 
-*Defined at line 327*
+*Defined at line 221*
 
 ---
 
@@ -1450,7 +1450,7 @@ pub fn input_mouse_wheel(state: InputState) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 332*
+*Defined at line 226*
 
 ---
 
@@ -1469,7 +1469,7 @@ pub fn input_mouse_held(state: InputState, button: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 337*
+*Defined at line 231*
 
 ---
 
@@ -1488,7 +1488,7 @@ pub fn input_mouse_pressed(state: InputState, button: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 345*
+*Defined at line 239*
 
 ---
 
@@ -1507,7 +1507,7 @@ pub fn input_mouse_released(state: InputState, button: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 353*
+*Defined at line 247*
 
 ---
 
@@ -1527,7 +1527,7 @@ pub fn input_set_mouse_pos(state: &mut InputState, x: i64, y: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 361*
+*Defined at line 255*
 
 ---
 
@@ -1547,7 +1547,7 @@ pub fn input_set_mouse_button(state: &mut InputState, button: i64, held: bool) -
 
 **Returns:** `void`
 
-*Defined at line 369*
+*Defined at line 263*
 
 ---
 
@@ -1566,7 +1566,7 @@ pub fn input_set_mouse_wheel(state: &mut InputState, delta: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 379*
+*Defined at line 275*
 
 ---
 
@@ -1584,7 +1584,7 @@ pub fn input_gamepad_connected(state: InputState) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 386*
+*Defined at line 282*
 
 ---
 
@@ -1603,7 +1603,7 @@ pub fn input_gamepad_held(state: InputState, button: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 391*
+*Defined at line 287*
 
 ---
 
@@ -1622,7 +1622,7 @@ pub fn input_gamepad_pressed(state: InputState, button: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 399*
+*Defined at line 295*
 
 ---
 
@@ -1640,7 +1640,7 @@ pub fn input_gamepad_left_x(state: InputState) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 407*
+*Defined at line 303*
 
 ---
 
@@ -1658,7 +1658,7 @@ pub fn input_gamepad_left_y(state: InputState) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 412*
+*Defined at line 308*
 
 ---
 
@@ -1676,7 +1676,7 @@ pub fn input_gamepad_right_x(state: InputState) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 417*
+*Defined at line 313*
 
 ---
 
@@ -1694,7 +1694,7 @@ pub fn input_gamepad_right_y(state: InputState) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 422*
+*Defined at line 318*
 
 ---
 
@@ -1712,7 +1712,7 @@ pub fn input_gamepad_left_trigger(state: InputState) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 427*
+*Defined at line 323*
 
 ---
 
@@ -1730,7 +1730,7 @@ pub fn input_gamepad_right_trigger(state: InputState) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 432*
+*Defined at line 328*
 
 ---
 
@@ -1750,7 +1750,7 @@ pub fn input_set_gamepad_button(state: &mut InputState, button: i64, held: bool)
 
 **Returns:** `void`
 
-*Defined at line 437*
+*Defined at line 333*
 
 ---
 
@@ -1774,7 +1774,7 @@ pub fn input_set_gamepad_axes(state: &mut InputState, lx: f64, ly: f64, rx: f64,
 
 **Returns:** `void`
 
-*Defined at line 447*
+*Defined at line 345*
 
 ---
 
@@ -1793,7 +1793,7 @@ pub fn input_set_gamepad_connected(state: &mut InputState, connected: bool) -> v
 
 **Returns:** `void`
 
-*Defined at line 457*
+*Defined at line 355*
 
 ---
 
@@ -1811,7 +1811,7 @@ pub fn input_shift_held(state: InputState) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 464*
+*Defined at line 362*
 
 ---
 
@@ -1829,7 +1829,7 @@ pub fn input_ctrl_held(state: InputState) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 469*
+*Defined at line 367*
 
 ---
 
@@ -1847,7 +1847,7 @@ pub fn input_alt_held(state: InputState) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 474*
+*Defined at line 372*
 
 ---
 
@@ -1866,7 +1866,7 @@ pub fn input_direction(state: InputState) -> (f64, f64) {
 
 **Returns:** `(f64, f64)`
 
-*Defined at line 482*
+*Defined at line 380*
 
 ---
 

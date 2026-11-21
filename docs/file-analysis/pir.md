@@ -1,10 +1,19 @@
 # pir.fd — PIR L1/L2/L3 transforms
 
+> **Nov 21: dead.** MI18 (Nov 17) removed the PIR path: `compiler.fd`
+> `build_executable` is gone, `fid pir`/`dump-pir` only print where their
+> views went (`cmd_pir_removed`: dump-ir, opt, dump-mir, disasm), `fid opt`
+> prints the IR after iropt, `fid codegen` and `build --native` go to the
+> machine layer, and `fid gpu` reads the IR (gpu.fd, Nov 16). Its importers
+> (codegen_arm64, codegen_riscv, codegen_x64, opt, pe, regalloc) are all
+> unreached from main.fd. 3,364 lines now. The callers below are as of
+> Nov 9.
+
 > **Re-audited 2026-11-09.** StructCopy fixed (Oct 23/24). PIR is no longer on any default build
 > path; it backs `pir`, `opt`, `codegen`, `gpu`, `emit --boot` and `build --native` (default
 > target only).
 
-- **Path:** `compiler/pir.fd` — **2,704 LOC** (Rust `src/pir.rs` = 2,262)
+- **Path:** `compiler/pir.fd` — **3,364 LOC** (2026-11-21; 2,704 on Nov 9; Rust `src/pir.rs` = 2,262)
 - **Role:** `lower_ir_to_l1` (:964), `lower_l1_to_l2` (:1284), `lower_l2_to_l3` (:1504), plus
   `format_l1/l2/l3` printers.
 

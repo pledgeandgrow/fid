@@ -1,7 +1,10 @@
 # debugger.fd — interactive IR debugger (scaffold)
 
 - **Path:** `compiler/debugger.fd` — module `compiler::debugger`
-- **LOC:** 977 (2026-11-09, unchanged). Rust `src/debugger.rs`: 965.
+- **LOC:** 978 (2026-11-21; 977 on Nov 9). Rust `src/debugger.rs`: 965.
+  Nov 21: still dead, nothing imports it, and `fid` has no `debug`
+  command. `fid replay` exists now (CT7, main.fd `cmd_replay`): it runs a
+  recording of `fid run --record` again; it does not use this module.
 - **Role:** debugger state and helpers: breakpoints, watches, command
   parsing, source listing, IR/effect/locals printers, trace save/load/replay,
   and `Debugger_run`, which builds and runs the program in the interpreter.

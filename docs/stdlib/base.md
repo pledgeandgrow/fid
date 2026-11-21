@@ -1,5 +1,9 @@
 # base — Fides Documentation
 
+From `stdlib/pe_runtime/base.fd`: the runtime of native Windows
+executables (`fid emit`, pe_ir), which runs builtin `p_X` as `pert_X`. It
+is merged into those builds, not imported with `use`.
+
 ## Contents
 
 - [pert_int_to_float](#pert_int_to_float) (function)
@@ -87,7 +91,7 @@ pub fn pert_int_to_float(x: i64) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 60*
+*Defined at line 71*
 
 ---
 
@@ -103,7 +107,7 @@ pub fn pert_float_to_int(x: f64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 64*
+*Defined at line 75*
 
 ---
 
@@ -119,7 +123,7 @@ pub fn pert_f64_to_bits(x: f64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 68*
+*Defined at line 79*
 
 ---
 
@@ -135,7 +139,7 @@ pub fn pert_f64_from_bits(bits: i64) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 72*
+*Defined at line 83*
 
 ---
 
@@ -153,7 +157,7 @@ pub fn pert_f32_to_bits(x: f32) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 77*
+*Defined at line 88*
 
 ---
 
@@ -169,7 +173,7 @@ pub fn pert_f32_from_bits(bits: i64) -> f32 {
 
 **Returns:** `f32`
 
-*Defined at line 85*
+*Defined at line 96*
 
 ---
 
@@ -187,7 +191,7 @@ pub fn pert_str_to_float(s: str) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 90*
+*Defined at line 101*
 
 ---
 
@@ -205,7 +209,7 @@ pub fn pert_str_to_int(s: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 98*
+*Defined at line 109*
 
 ---
 
@@ -225,7 +229,7 @@ pub fn pert_str_equal(a: i64, b: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 107*
+*Defined at line 161*
 
 ---
 
@@ -244,7 +248,7 @@ pub fn pert_to_str_float(val: f64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 179*
+*Defined at line 284*
 
 ---
 
@@ -260,7 +264,7 @@ pub fn pert_float_to_str(val: f64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 235*
+*Defined at line 343*
 
 ---
 
@@ -274,7 +278,7 @@ pub fn pert_print_float(val: f64) {
 
 - `val`: `f64`
 
-*Defined at line 239*
+*Defined at line 347*
 
 ---
 
@@ -290,7 +294,7 @@ pub fn pert_file_exists(path: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 290*
+*Defined at line 436*
 
 ---
 
@@ -307,7 +311,7 @@ pub fn pert_file_append(path: str, content: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 299*
+*Defined at line 445*
 
 ---
 
@@ -323,7 +327,7 @@ pub fn pert_file_delete(path: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 309*
+*Defined at line 461*
 
 ---
 
@@ -339,7 +343,7 @@ pub fn pert_file_size(path: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 316*
+*Defined at line 468*
 
 ---
 
@@ -357,7 +361,7 @@ pub fn pert_file_read_bytes(path: str) -> Vec<i64> {
 
 **Returns:** `Vec<i64>`
 
-*Defined at line 331*
+*Defined at line 483*
 
 ---
 
@@ -376,7 +380,7 @@ pub fn pert_file_write_vec(path: str, v: Vec<i64>) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 352*
+*Defined at line 504*
 
 ---
 
@@ -392,7 +396,7 @@ pub fn pert_file_hash(path: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 373*
+*Defined at line 655*
 
 ---
 
@@ -408,7 +412,7 @@ pub fn pert_c_putchar(c: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 398*
+*Defined at line 680*
 
 ---
 
@@ -424,7 +428,7 @@ pub fn pert_c_puts(s: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 403*
+*Defined at line 685*
 
 ---
 
@@ -436,7 +440,7 @@ pub fn pert_clock_now() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 421*
+*Defined at line 750*
 
 ---
 
@@ -448,7 +452,7 @@ pub fn pert_clock_now_us() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 425*
+*Defined at line 754*
 
 ---
 
@@ -460,7 +464,7 @@ pub fn pert_clock_now_ms() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 429*
+*Defined at line 758*
 
 ---
 
@@ -477,7 +481,7 @@ pub fn pert_exit(code: i64) {
 
 - `code`: `i64`
 
-*Defined at line 435*
+*Defined at line 764*
 
 ---
 
@@ -495,7 +499,7 @@ pub fn pert_getenv(name: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 440*
+*Defined at line 776*
 
 ---
 
@@ -511,7 +515,7 @@ pub fn pert_is_dir(path: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 446*
+*Defined at line 905*
 
 ---
 
@@ -528,7 +532,7 @@ pub fn pert_rename(a: str, b: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 456*
+*Defined at line 915*
 
 ---
 
@@ -544,7 +548,7 @@ pub fn pert_mkdir(path: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 463*
+*Defined at line 922*
 
 ---
 
@@ -562,7 +566,7 @@ pub fn pert_rmdir(path: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 471*
+*Defined at line 930*
 
 ---
 
@@ -574,7 +578,7 @@ pub fn pert_getpid() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 478*
+*Defined at line 937*
 
 ---
 
@@ -592,7 +596,7 @@ pub fn pert_dir_list(path: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 508*
+*Defined at line 967*
 
 ---
 
@@ -611,7 +615,7 @@ pub fn pert_process_run(cmd: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 570*
+*Defined at line 1029*
 
 ---
 
@@ -627,7 +631,7 @@ pub fn pert_process_stdout(h: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 600*
+*Defined at line 1083*
 
 ---
 
@@ -643,7 +647,7 @@ pub fn pert_process_stderr(h: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 604*
+*Defined at line 1091*
 
 ---
 
@@ -659,7 +663,7 @@ pub fn pert_process_code(h: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 608*
+*Defined at line 1098*
 
 ---
 
@@ -673,7 +677,7 @@ pub fn pert_process_close(h: i64) {
 
 - `h`: `i64`
 
-*Defined at line 615*
+*Defined at line 1105*
 
 ---
 
@@ -690,7 +694,7 @@ pub fn pert_regex_match(s: str, pattern: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 625*
+*Defined at line 1115*
 
 ---
 
@@ -706,7 +710,7 @@ pub fn pert_alloc(size: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 661*
+*Defined at line 1201*
 
 ---
 
@@ -722,7 +726,7 @@ pub fn pert_volatile_load(addr: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 665*
+*Defined at line 1205*
 
 ---
 
@@ -737,7 +741,7 @@ pub fn pert_volatile_store(addr: i64, val: i64) {
 - `addr`: `i64`
 - `val`: `i64`
 
-*Defined at line 672*
+*Defined at line 1214*
 
 ---
 
@@ -753,7 +757,7 @@ pub fn pert_volatile_load8(addr: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 677*
+*Defined at line 1220*
 
 ---
 
@@ -768,7 +772,7 @@ pub fn pert_volatile_store8(addr: i64, val: i64) {
 - `addr`: `i64`
 - `val`: `i64`
 
-*Defined at line 681*
+*Defined at line 1224*
 
 ---
 
@@ -784,7 +788,7 @@ pub fn pert_volatile_load32(addr: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 685*
+*Defined at line 1228*
 
 ---
 
@@ -799,7 +803,7 @@ pub fn pert_volatile_store32(addr: i64, val: i64) {
 - `addr`: `i64`
 - `val`: `i64`
 
-*Defined at line 692*
+*Defined at line 1236*
 
 ---
 
@@ -816,7 +820,7 @@ pub fn pert_simd_add(a: Vec<f64>, b: Vec<f64>) -> Vec<f64> {
 
 **Returns:** `Vec<f64>`
 
-*Defined at line 699*
+*Defined at line 1244*
 
 ---
 
@@ -833,7 +837,7 @@ pub fn pert_simd_sub(a: Vec<f64>, b: Vec<f64>) -> Vec<f64> {
 
 **Returns:** `Vec<f64>`
 
-*Defined at line 709*
+*Defined at line 1254*
 
 ---
 
@@ -850,7 +854,7 @@ pub fn pert_simd_mul(a: Vec<f64>, b: Vec<f64>) -> Vec<f64> {
 
 **Returns:** `Vec<f64>`
 
-*Defined at line 719*
+*Defined at line 1264*
 
 ---
 
@@ -869,7 +873,7 @@ pub fn pert_simd_div(a: Vec<f64>, b: Vec<f64>) -> Vec<f64> {
 
 **Returns:** `Vec<f64>`
 
-*Defined at line 730*
+*Defined at line 1275*
 
 ---
 
@@ -886,7 +890,7 @@ pub fn pert_simd_dot(a: Vec<f64>, b: Vec<f64>) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 745*
+*Defined at line 1290*
 
 ---
 
@@ -902,7 +906,7 @@ pub fn pert_simd_sum(a: Vec<f64>) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 755*
+*Defined at line 1300*
 
 ---
 
@@ -919,7 +923,7 @@ pub fn pert_simd_scale(a: Vec<f64>, k: f64) -> Vec<f64> {
 
 **Returns:** `Vec<f64>`
 
-*Defined at line 765*
+*Defined at line 1310*
 
 ---
 
@@ -935,7 +939,7 @@ pub fn pert_simd_from_vec(v: Vec<i64>) -> Vec<f64> {
 
 **Returns:** `Vec<f64>`
 
-*Defined at line 775*
+*Defined at line 1320*
 
 ---
 
@@ -953,7 +957,7 @@ pub fn pert_simd_to_str(a: Vec<f64>) -> str {
 
 **Returns:** `str`
 
-*Defined at line 786*
+*Defined at line 1331*
 
 ---
 
@@ -971,7 +975,7 @@ pub fn pert_dl_open(path: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 812*
+*Defined at line 1357*
 
 ---
 
@@ -988,7 +992,7 @@ pub fn pert_dl_sym(handle: i64, symbol: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 820*
+*Defined at line 1365*
 
 ---
 
@@ -1002,7 +1006,7 @@ pub fn pert_dl_close(handle: i64) {
 
 - `handle`: `i64`
 
-*Defined at line 827*
+*Defined at line 1372*
 
 ---
 
@@ -1021,7 +1025,7 @@ pub fn pert_dl_call(func: i64, arg: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 831*
+*Defined at line 1378*
 
 ---
 
@@ -1037,7 +1041,7 @@ pub fn pert_allocator_create(arg: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 837*
+*Defined at line 1506*
 
 ---
 
@@ -1054,7 +1058,7 @@ pub fn pert_allocator_alloc(alloc: i64, size: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 841*
+*Defined at line 1510*
 
 ---
 
@@ -1069,7 +1073,7 @@ pub fn pert_allocator_free(alloc: i64, ptr: i64) {
 - `alloc`: `i64`
 - `ptr`: `i64`
 
-*Defined at line 848*
+*Defined at line 1517*
 
 ---
 
@@ -1085,7 +1089,7 @@ pub fn pert_allocator_stats(alloc: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 852*
+*Defined at line 1521*
 
 ---
 
@@ -1097,7 +1101,7 @@ pub fn pert_ecs_create_entity() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 885*
+*Defined at line 1554*
 
 ---
 
@@ -1109,7 +1113,7 @@ pub fn pert_ecs_entity_count() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 891*
+*Defined at line 1560*
 
 ---
 
@@ -1126,7 +1130,7 @@ pub fn pert_ecs_has(name: str, entity: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 895*
+*Defined at line 1564*
 
 ---
 
@@ -1143,7 +1147,7 @@ pub fn pert_ecs_get(name: str, entity: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 910*
+*Defined at line 1579*
 
 ---
 
@@ -1163,7 +1167,7 @@ pub fn pert_ecs_add(name: str, entity: i64, value: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 926*
+*Defined at line 1595*
 
 ---
 
@@ -1182,7 +1186,7 @@ pub fn pert_ecs_remove(name: str, entity: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 942*
+*Defined at line 1611*
 
 ---
 
@@ -1195,7 +1199,7 @@ pending; flushing all C streams mirrors `fflush(stdout)` anyway.
 pub fn pert_flush_stdout() {
 ```
 
-*Defined at line 977*
+*Defined at line 1646*
 
 ---
 
@@ -1207,7 +1211,7 @@ pub fn pert_stdin_eof() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 981*
+*Defined at line 1650*
 
 ---
 
@@ -1226,7 +1230,7 @@ pub fn pert_read_stdin(n: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 987*
+*Defined at line 1656*
 
 ---
 
@@ -1242,7 +1246,7 @@ pub fn pert_read_line() -> str {
 
 **Returns:** `str`
 
-*Defined at line 1018*
+*Defined at line 1687*
 
 ---
 

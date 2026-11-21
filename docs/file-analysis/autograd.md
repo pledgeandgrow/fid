@@ -1,7 +1,9 @@
 # autograd.fd — file analysis
 
 - **Path:** `compiler/autograd.fd` — module `compiler::autograd`
-- **LOC:** 41 (2026-11-09, unchanged). Rust `src/autograd.rs`: 32.
+- **LOC:** 35 (2026-11-21; 41 on Nov 9). Rust `src/autograd.rs`: 32.
+  Nov 21: still dead, nothing imports it. Line numbers into other files
+  below are from Nov 9.
 - **Role:** a no-op shim: `process_module(&mut IrModule)` does nothing.
   Gradients are computed at run time, not by an IR pass.
 - **Status:** DEAD. Nothing imports it.

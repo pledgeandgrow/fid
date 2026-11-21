@@ -59,7 +59,7 @@ pub fn fmt_int_width(n: i64, width: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 26*
+*Defined at line 29*
 
 ---
 
@@ -78,7 +78,7 @@ pub fn fmt_int_zero_pad(n: i64, width: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 31*
+*Defined at line 38*
 
 ---
 
@@ -96,7 +96,7 @@ pub fn fmt_int_signed(n: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 36*
+*Defined at line 48*
 
 ---
 
@@ -114,7 +114,7 @@ pub fn fmt_hex(n: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 44*
+*Defined at line 59*
 
 ---
 
@@ -132,7 +132,7 @@ pub fn fmt_hex_prefix(n: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 49*
+*Defined at line 67*
 
 ---
 
@@ -151,7 +151,7 @@ pub fn fmt_hex_width(n: i64, width: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 54*
+*Defined at line 75*
 
 ---
 
@@ -169,7 +169,7 @@ pub fn fmt_bin(n: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 59*
+*Defined at line 83*
 
 ---
 
@@ -187,7 +187,7 @@ pub fn fmt_bin_prefix(n: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 64*
+*Defined at line 91*
 
 ---
 
@@ -205,7 +205,7 @@ pub fn fmt_octal(n: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 69*
+*Defined at line 100*
 
 ---
 
@@ -225,7 +225,7 @@ pub fn fmt_float(f: f64, decimals: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 90*
+*Defined at line 129*
 
 ---
 
@@ -243,7 +243,7 @@ pub fn fmt_float_default(f: f64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 112*
+*Defined at line 154*
 
 ---
 
@@ -263,7 +263,7 @@ pub fn fmt_percent(f: f64, decimals: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 118*
+*Defined at line 163*
 
 ---
 
@@ -281,7 +281,7 @@ pub fn fmt_bool(b: bool) -> str {
 
 **Returns:** `str`
 
-*Defined at line 125*
+*Defined at line 173*
 
 ---
 
@@ -299,7 +299,7 @@ pub fn fmt_yes_no(b: bool) -> str {
 
 **Returns:** `str`
 
-*Defined at line 130*
+*Defined at line 181*
 
 ---
 
@@ -318,7 +318,7 @@ pub fn fmt_pad_left(s: str, width: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 138*
+*Defined at line 194*
 
 ---
 
@@ -337,7 +337,7 @@ pub fn fmt_pad_right(s: str, width: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 143*
+*Defined at line 202*
 
 ---
 
@@ -356,7 +356,7 @@ pub fn fmt_pad_center(s: str, width: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 148*
+*Defined at line 210*
 
 ---
 
@@ -375,7 +375,7 @@ pub fn fmt_commas(n: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 156*
+*Defined at line 223*
 
 ---
 
@@ -395,7 +395,7 @@ pub fn fmt_bytes(bytes: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 190*
+*Defined at line 265*
 
 ---
 
@@ -405,54 +405,56 @@ Format a Vec of strings as a row in a table (pipe-separated).
 fmt_row(["Name", "Age", "City"]) → "| Name | Age | City |"
 
 ```fides
-pub fn fmt_row(cols: Vec) -> str {
+pub fn fmt_row(cols: Vec<str>) -> str {
 ```
 
 **Parameters:**
 
-- `cols`: `Vec`
+- `cols`: `Vec<str>`
 
 **Returns:** `str`
 
-*Defined at line 211*
+*Defined at line 291*
 
 ---
 
 ## fmt_separator
 
 Format a separator line for a table with N columns of given widths.
-fmt_separator([5, 3, 5]) → "+-----+---+-----+"
+Each column gets its width plus 2 dashes (the cell padding of fmt_row):
+fmt_separator([3, 1]) → "+-----+---+"
 
 ```fides
-pub fn fmt_separator(widths: Vec) -> str {
+pub fn fmt_separator(widths: Vec<i64>) -> str {
 ```
 
 **Parameters:**
 
-- `widths`: `Vec`
+- `widths`: `Vec<i64>`
 
 **Returns:** `str`
 
-*Defined at line 225*
+*Defined at line 311*
 
 ---
 
 ## fmt_row_widths
 
-Format a table row with specific column widths (left-aligned).
+Format a table row with specific column widths (cells right-aligned,
+padded on the left by fmt_pad_left).
 
 ```fides
-pub fn fmt_row_widths(cols: Vec, widths: Vec) -> str {
+pub fn fmt_row_widths(cols: Vec<str>, widths: Vec<i64>) -> str {
 ```
 
 **Parameters:**
 
-- `cols`: `Vec`
-- `widths`: `Vec`
+- `cols`: `Vec<str>`
+- `widths`: `Vec<i64>`
 
 **Returns:** `str`
 
-*Defined at line 237*
+*Defined at line 333*
 
 ---
 

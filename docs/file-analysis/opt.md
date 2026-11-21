@@ -1,10 +1,17 @@
 # opt.fd — PIR L2 optimizer
 
+> **Nov 21: dead.** MI18 (Nov 17) removed the PIR path: nothing imports
+> opt.fd, `fid opt` now prints the IR after iropt (main.fd `cmd_opt`,
+> `iropt_native`), `fid pir --opt` is gone and `build --native` is the
+> machine layer. The jump-threading panic below was fixed in the source on
+> Nov 15 (known-bugs 2g.17: `find_block_index`), never run since. 9,497
+> lines now. The callers below are as of Nov 9.
+
 > **Re-audited 2026-11-09.** The optimizer now panics on every program (`hello.fd`) in
 > `pass_jump_thread`; it is reached only from `fid opt`, `fid pir --opt` and `fid build --native`
 > with the default target, none of them a default path. Earlier findings re-checked below.
 
-- **Path:** `compiler/opt.fd` — **7,764 LOC** (was 7,923 on Oct 23; Rust `src/opt.rs` = 8,573)
+- **Path:** `compiler/opt.fd` — **9,497 LOC** (2026-11-21; 7,764 on Nov 9, 7,923 on Oct 23; Rust `src/opt.rs` = 8,573)
 - **Role:** the L2 pass pipeline over PIR — 22 `Pass` variants, 19 in `Pass_all()` (:118),
   fixpoint driver `optimize_l2_with` (:243: `optimize_l2` 8 iterations, `optimize_l2_lto` 16),
   S-1A gating (`pass_relevant_for_module` :320), final `topo_sort_block` (:4396).

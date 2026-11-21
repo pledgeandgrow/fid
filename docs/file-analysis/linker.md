@@ -2,8 +2,17 @@
 
 Re-audited 2026-11-09 (previous audit 2026-10-22/23).
 
+> **Nov 21:** only `fid build-x86` reaches this module now
+> (`build_x86_linux` in compiler.fd; `build_executable` was removed with
+> the PIR path, MI18). Finding 1 has its cause fixed: elf64's objects have
+> 64-byte section headers since TG13 (known-bugs 2g.16), but no build-x86
+> executable has been run since. `Linker_build_executable` writes through
+> image_writer.fd (`Linker_build_executable_img`). Finding 2 still holds:
+> a missing entry symbol gives entry offset 0. Line numbers below are from
+> Nov 9.
+
 - **Path:** `compiler/linker.fd`
-- **LOC:** 1,077
+- **LOC:** 1,067 (2026-11-21; 1,077 on Nov 9)
 - **Role:** reads ELF64 relocatable objects from `elf64.fd` (or raw
   arm64/riscv assembler output), adds a runtime blob (text, symbols,
   rodata, relocations), patches x86-64 / AArch64 / RISC-V relocations,

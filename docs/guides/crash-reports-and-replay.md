@@ -21,7 +21,7 @@ message and the trace (innermost call first):
 
 ```
 Crash of ./server
-  build:   fid 0.8.0-unstable (C)
+  build:   fid 1.0.0+dev (C)
   panic:   empty age field
   trace (innermost call first):
     - parse_age
@@ -52,8 +52,12 @@ end
 something else: it reports a crash of the compiler itself (the stage and
 the function it failed in, and how to reduce the program).
 
-Not yet: programs built natively (`fid emit`, pe_ir and the machine
-layer) print the trace but do not write the report.
+Programs built natively (`fid emit`: pe_ir, `--nat` and the Linux targets)
+write the report too, a stack overflow included (Nov 17; checked Nov 21
+for pe_ir, `--nat` and x86_64-linux). Their traces are not right yet: an
+inlined innermost function is missing from them and the last `called from`
+line is malformed, and their version line is always `fid 1.0.0+dev
+(native)`.
 
 ## The task chain of a panic in a task
 
@@ -69,7 +73,8 @@ task chain: b <- a <- main
 
 `b <- a` means `a` awaits `b`; the chain ends at `main` (or `(thread)` off
 the main thread), or with `(started by f)` for a task nobody awaits yet.
-The line is in the crash report too. Not yet in natively built programs.
+The line is in the crash report too. Natively built programs print it as
+well (`emit`, `emit --nat` and x86_64-linux, checked Nov 21).
 
 ## Recording and replaying a run (`fid run --record`, `fid replay`)
 

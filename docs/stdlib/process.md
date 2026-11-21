@@ -19,7 +19,7 @@ pub fn process_exit(code: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 16*
+*Defined at line 18*
 
 ---
 
@@ -38,7 +38,7 @@ pub fn process_system(cmd: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 22*
+*Defined at line 24*
 
 ---
 

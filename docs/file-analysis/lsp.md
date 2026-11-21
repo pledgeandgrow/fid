@@ -4,7 +4,13 @@
 > New: every symbol request crashes the server (double free). Oct 23 findings still true.
 
 - **Path:** `compiler/lsp.fd`
-- **LOC:** 1,082 (Rust `src/lsp.rs`: 1,039)
+- **LOC:** 4,576 (2026-11-21; 1,082 on Nov 9; Rust `src/lsp.rs`: 1,039). Nov 21: the two
+  NEW live findings below are fixed (known-bugs 2g.5, Nov 15): the double free had the same
+  cause as 2g.2 (`var program: Program;` from a match payload), and diagnostics take the line
+  of a `(line N)` or ` --> f:L:C` message (`parse_error_position`, compiler.fd). The server now also answers
+  `initialized`, `textDocument/references`, `signatureHelp`, `inlayHint`, `codeAction` and
+  `formatting` (fmt.fd), and imports `build_info`, `comptime_eval`, `fmt`. The code-inspection
+  findings were not re-checked; line numbers below are from Nov 9.
 - **Role:** language server over stdio: Content-Length framing, `initialize`, `shutdown`, `exit`,
   `didOpen` / `didChange` (full sync) / `didClose`, `publishDiagnostics`, `completion`, `hover`,
   `definition`, `rename`; `-32601` for unknown requests.

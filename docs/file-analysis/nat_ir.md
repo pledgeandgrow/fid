@@ -8,8 +8,59 @@ showed about 240 uncommitted lines: WP5 indirect-call masks, WP8 leaf
 frames, WP11 `@crashfree`, WP17 cold blocks). Line numbers below are from
 the first read and shift.
 
+> **Nov 21:** 41,010 lines, the largest compiler module; this page
+> describes the 5,548-line file of Nov 9 and is out of date in most
+> details (the uncommitted WP5/WP8/WP11/WP17 work it mentions is
+> committed). Since then: the MIR is its own module (mir.md) and Cortex-M
+> code generation is nat_thumb.fd; targets are AArch64/RISC-V 64/x86-64
+> Linux, x86-64 and AArch64 macOS (Mach-O), `--nat` Windows (PE) and
+> `thumbv7m-none|linux`; `build --native` with the default `x86-64` comes
+> here too (`x86_64-linux`, MI18), and on a Linux or macOS host plain `fid
+> build` does (CB4). New passes and switches are listed in AGENTS.md and
+> docs/verification/kill-switches.md (`FID_NAT_OFF`, `FID_NAT_ON`,
+> `FID_NAT_DUMP`, `FID_VERIFY`). It also imports `mir`, `nat_thumb`,
+> `checks`, `inc`, `ast_ser`, `pgo` and `pe_ir_stubs`. Open bugs of Nov 21:
+> function-cache hits are not byte-identical (known-bugs 2g.82), the
+> allocation checker rejects argument-register hints on x86-64 (2g.88),
+> mutual and sibling tail calls are emitted as calls (2g.98), a
+> dynamically linked x86_64-linux image crashes in libc `strtod` (2g.99),
+> x86-64 CFI (2g.103, with nat_enc).
+>
+> **Nov 21, uncommitted — 2g.88, 2g.94, 2g.98, 2g.99, 2g.110 fixed; the
+> env switches are cached once per image (RA14).** `ng_env_cache_load`
+> (:8111) reads `FID_NAT_OFF`/`FID_NAT_ON`/`FID_NAT_MUTATE`,
+> `FID_VERIFY` and `FID_NAT_FAST` once on the main thread before the
+> emission workers; `ng_on`, `ng_mutant`, `ng_verify_on`, `ng_opt_in` and
+> `ng_fast_alloc_on` consulted `getenv` per move and per call, a large
+> share of a debug build's allocation time. 2g.88: `ng_arg_fit_end`
+> (:13606) lets a range take an argument register through its last
+> position only when that operation writes the register by name — a dead
+> definition there overwrote an argument or result still to be read
+> (`ng_af_fit` applies the same check to the prefix-count form). 2g.94:
+> `ng_rf_promote` wrote its accumulator zero-words right after the
+> prologue, where a word could take an argument register still to be
+> read; `ng_rf_zero_at` (:21893) moves the block of `li`s to the first
+> label after the prologue (a natively built parser had read a clobbered
+> `self`). 2g.98 (MI28): `g_ng_ret_ext` records each recorded function's
+> narrow-result extension (`ng_ret_ext_note`, reset per image), and
+> `ng_tail_ext_kept` keeps a `MO_EXT` in tail position transparent when
+> the callee's result already satisfies it — `is_odd`/`is_even` mutual
+> recursion is a jump again on AArch64 and RISC-V. 2g.99: the runtime's
+> thread block lives in the executable's static TLS — `nat_tls_get`
+> reads `fs:[-8]` (variant II, PT_TLS in nat_enc), so a dynamically
+> linked image keeps libc's thread pointer (whose TLS `strtod` reads;
+> moving `fs` to the block faulted at 0x8). `nat_tls_set` uses
+> `ARCH_GET_FS`: no thread pointer yet (a static image) → `fs = v + 72`,
+> else `fs:[-8] = v`; `nat_clone_thread` passes block + 72 the same way.
+> 2g.106 wires `nat_pe_link_missing` / `nat_macho_link_missing` into
+> `nat_generate_image1` for `--nat` Windows and macOS. 2g.110:
+> `ng_ldyn_ok` no longer refuses a COFF or Mach-O object (`--obj --nat`)
+> — the import slots become relocations and the runtime's kernel32 calls
+> resolve at link; only an ELF object still has no dynamic section.
+> Still open: 2g.82 (function-cache hits not byte-identical), 2g.103.
+
 - **Path:** `compiler/nat_ir.fd`
-- **LOC:** 5,548 (first read, 2026-11-09)
+- **LOC:** 41,010 (2026-11-21); 5,548 at the first read, 2026-11-09
 - **Role:** the own native backend of `fid`. It lowers the IR (after
   iropt, rules and the e-graph) to machine code for AArch64, RISC-V 64 and
   x86-64, and writes a static Linux ELF or a Windows PE. Encoders and the

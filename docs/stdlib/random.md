@@ -32,20 +32,25 @@ pub struct RngState {
 | Name | Type |
 |------|------|
 | `state` | `i64` |
+| `seeded` | `bool` |
 
-*Defined at line 19*
+*Defined at line 26*
 
 ---
 
 ## RNG_DEFAULT:
 
-Global RNG state instance.
+The process-wide generator. Seeds lazily from OS entropy; random_seed()
+and random_seed_time() set an explicit sequence.
 
 ```fides
-pub const RNG_DEFAULT: RngState = RngState { state: 1 };
+var RNG_DEFAULT: RngState = RngState {
+    state: 0,
+    seeded: false
+};
 ```
 
-*Defined at line 24*
+*Defined at line 99*
 
 ---
 
@@ -63,7 +68,7 @@ pub fn random_seed(seed: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 29*
+*Defined at line 113*
 
 ---
 
@@ -79,7 +84,7 @@ pub fn random_seed_time() -> void {
 
 **Returns:** `void`
 
-*Defined at line 40*
+*Defined at line 120*
 
 ---
 
@@ -93,7 +98,7 @@ pub fn random_raw() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 55*
+*Defined at line 138*
 
 ---
 
@@ -111,7 +116,7 @@ pub fn random_int(max: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 60*
+*Defined at line 153*
 
 ---
 
@@ -130,7 +135,7 @@ pub fn random_int_range(min: i64, max: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 66*
+*Defined at line 163*
 
 ---
 
@@ -144,7 +149,7 @@ pub fn random_float() -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 75*
+*Defined at line 184*
 
 ---
 
@@ -162,7 +167,7 @@ pub fn random_float_max(max: f64) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 80*
+*Defined at line 190*
 
 ---
 
@@ -181,7 +186,7 @@ pub fn random_float_range(min: f64, max: f64) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 85*
+*Defined at line 195*
 
 ---
 
@@ -195,7 +200,7 @@ pub fn random_bool() -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 92*
+*Defined at line 229*
 
 ---
 
@@ -204,16 +209,16 @@ pub fn random_bool() -> bool {
 Pick a random element from a Vec. Returns 0 if empty.
 
 ```fides
-pub fn random_choice(v: Vec) -> i64 {
+pub fn random_choice(v: Vec<i64>) -> i64 {
 ```
 
 **Parameters:**
 
-- `v`: `Vec`
+- `v`: `Vec<i64>`
 
 **Returns:** `i64`
 
-*Defined at line 97*
+*Defined at line 241*
 
 ---
 
@@ -231,7 +236,7 @@ pub fn random_choice_idx(len: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 103*
+*Defined at line 249*
 
 ---
 
@@ -240,16 +245,16 @@ pub fn random_choice_idx(len: i64) -> i64 {
 Shuffle a Vec in place (Fisher-Yates).
 
 ```fides
-pub fn random_shuffle(v: Vec) -> void {
+pub fn random_shuffle(v: &mut Vec<i64>) -> void {
 ```
 
 **Parameters:**
 
-- `v`: `Vec`
+- `v`: `&mut Vec<i64>`
 
 **Returns:** `void`
 
-*Defined at line 111*
+*Defined at line 264*
 
 ---
 
@@ -263,7 +268,7 @@ pub fn random_byte() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 123*
+*Defined at line 283*
 
 ---
 
@@ -281,7 +286,7 @@ pub fn random_hex(length: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 128*
+*Defined at line 304*
 
 ---
 

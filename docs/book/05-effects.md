@@ -25,7 +25,7 @@ call, to a fixpoint:
 | `Net` | sockets, HTTP, TLS, DNS |
 | `Spawn` | starting threads or processes |
 | `Diverge` | `panic` (`p_panic`) |
-| `Alloc` | the runtime's allocation builtins (`p_vec_new`, `p_map_insert`, `p_string_concat`, …) — see the caveat below |
+| `Alloc` | string `+` and f-strings, creating and growing a `Vec` or `HashMap`, the runtime's allocation builtins (`p_vec_new`, `p_map_insert`, `p_string_concat`, …) |
 | `Read`, `Write`, `Diff`, `Noise`, `Comm` | the KV-cache, autodiff, differential-privacy and multi-device builtins |
 
 A function calling `println` has `IO`; so does every function that calls
@@ -43,7 +43,7 @@ fn add(a: i64, b: i64) -> i64 !{} {
     return a + b;
 }
 
-fn greet(name: str) -> void !IO {
+fn greet(name: str) -> void !{IO, Alloc} {
     println("hello, " + name);
 }
 
@@ -79,7 +79,7 @@ error: Effect error: function 'add' has inferred effect '!IO' but only declared 
 ```
 
 `!{}` is the useful one: it says "this function does no I/O, touches no
-network, starts nothing and never panics". A `panic` inside one is
+network, starts nothing, allocates nothing and never panics". A `panic` inside one is
 `Diverge`:
 
 ```
@@ -95,12 +95,11 @@ fn check(x: i64) -> i64 !Diverge {
 }
 ```
 
-`!{}` does **not** mean "allocates nothing". `Alloc` is inferred from the
-runtime's allocation builtins, and `Vec`, `HashMap` and string `+` are
-written in Fid in `core.fd` on top of lower-level calls, so today a `!{}`
-function may build Vecs and strings freely. When allocation is what you
-want to rule out, use `@no-alloc` (below), which looks at `Vec::new`,
-`push`, string `+` and the rest directly.
+`greet` declares `Alloc` because `"hello, " + name` builds a new string.
+Since Nov 19 (known-bugs 2g.65) `Alloc` is inferred from string `+`,
+f-strings, `Vec::new`, `push` and the other `Vec` and `HashMap` methods,
+so a `!{}` function builds no Vecs or strings. `@no-alloc` (below) says
+the same as an annotation.
 
 ### Functions that take functions
 
@@ -459,8 +458,8 @@ experiment, not the way to structure I/O.
 
 ## Common mistakes
 
-- **Using `!{}` to mean "no allocation".** It doesn't catch `Vec::new`,
-  `push` or string `+` today. Use `@no-alloc` for that.
+- **Declaring `!IO` on a function that builds strings.** String `+`,
+  f-strings and `push` are `Alloc`: declare `!{IO, Alloc}`.
 - **Annotating a method.** Annotations are not allowed inside `impl`;
   write a free function.
 - **One `@crashfree` function in a sea of plain ones.** It can only call

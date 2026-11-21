@@ -11,16 +11,16 @@ Fides has an ownership type system, generics, and algebraic-ish
 | `func f(a int) int` | `fn f(a: i64) -> i64` |
 | `x := 1` | `val x = 1` (immutable) or `var x = 1` |
 | `return v, err` | `return Option::Some(v)` / `Result`, or `panic` |
-| `if err != nil` | `match r { Result::Ok(v) => .. }` or `r ?? default` |
+| `if err != nil` | `match r { Result::Ok(v) => .. }`, `r?` (return the error) or `r ?? default` |
 | `interface { M() }` | `cap T { fn m(self) -> i64; }` — *explicit* `impl T for X` |
 | `struct{}` | `struct X { field: i64 }` |
 | `go f()` | `task_go("f", 0)` or `spawn` / `parallel { a | b }` |
 | `chan int` | `use channel;` |
-| `defer f()` | none — cleanup is explicit (or `@zeroize` for secrets) |
+| `defer f()` | `defer { f(); }` — runs when the function returns, last first |
 | `nil` | none — `Option::None` |
 | `append(v, x)` | `v.push(x)` |
 | `map[string]int` | `HashMap::new()` + `m.insert("k", v)` |
-| `fmt.Println` | `println(...)` — takes a `str`, not `any` |
+| `fmt.Println` | `println(...)` — takes a `str`, not `any`; `f"{x}"` builds one |
 | `go build` | `fid emit file.fd` |
 
 ## The mental-model changes
@@ -57,8 +57,8 @@ var v: i64 = task_result(t);
 
 ## What you'll miss, and what replaces it
 
-- `defer`: write the cleanup before `return`s; `@zeroize` covers the
-  security-relevant case (wipe on scope exit).
+- `recover()`: none; a panic ends the whole program, also from a task.
+  `@zeroize` wipes secrets on scope exit.
 - implicit interfaces: explicit `impl` is more boilerplate, but the
   compiler can devirtualize single-impl calls — the explicitness is a
   feature for the optimizer.

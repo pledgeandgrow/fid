@@ -64,15 +64,20 @@ The first measurement, on stage0 itself, is the table further up.
 
 ## Left
 
-- `compiler/ir.fd` `IrFunction_emit` (another group's file): it takes the
-  block out of `self.blocks` with `get`, pushes the new instruction and sets
-  it back, so the push finds the instruction list with two owners and
-  copies it, once per instruction emitted: quadratic in a block's length,
+- `compiler/ir.fd` `IrFunction_emit` (another group's file): it took the
+  block out of `self.blocks` with `get`, pushed the new instruction and set
+  it back, so the push found the instruction list with two owners and
+  copied it, once per instruction emitted: quadratic in a block's length,
   the largest single cost left (half the lowering time of the long
   function). Setting a fresh `BasicBlock_new(block_idx)` in its place right
   after the `get` makes the push change the list in place (checked on a
   stand-alone program: 20,000 pushes, 1,373 ms before, 2 ms after, same
-  contents). The same in `IrFunction_add_block_param`.
+  contents). Done since: `IrFunction_emit_line` does this (comment CS4),
+  and so does `IrFunction_add_block_param`.
+- Nov 21 (roadmap SP12 check, fid built from a self-hosted stage 0):
+  lowering is still super-linear: `sp12_scaling.sh` at N=400 fails (twice
+  the statements take 3.8–4.6x, limit 3.5); `check compiler/main.fd
+  --time` takes 35 s.
 - `lw_rc_cancel_param_slots` (`lw_ps_*`) and `Lowerer_lookup_alloca_type`
   still scan per candidate; they were 22% and 10% of the long-function
   bench after the changes above.
@@ -85,7 +90,7 @@ The first measurement, on stage0 itself, is the table further up.
 ## Checking it
 
 - `bash tests/perf/sp12_scaling.sh` (FID set): lower(2N) / lower(N) below
-  3.0, and the generated program's output equal to what `sp12_gen.py
+  `MAX_RATIO` (default 3.5), and the generated program's output equal to what `sp12_gen.py
   --expect` computes.
 - `tests/selfhost/test_cow_names.fd`: `cow_names_stmt` agrees with
   `cow_uses_stmt` for every statement and name of its fixture.

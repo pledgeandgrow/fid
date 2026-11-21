@@ -24,7 +24,7 @@ Fid's effects (reference §9.1):
 | `Net` | sockets, HTTP, TLS, DNS |
 | `Spawn` | threads and processes |
 | `Diverge` | `panic` |
-| `Alloc` | the runtime's allocation builtins |
+| `Alloc` | string `+` and f-strings, creating and growing a `Vec` or `HashMap`, the runtime's allocation builtins |
 | `Read`, `Write`, `Diff`, `Noise`, `Comm` | KV cache, autodiff, differential privacy, multi-device builtins |
 
 Effects are **inferred**: each function gets the union of the effects of
@@ -51,8 +51,9 @@ fn main() -> i64 {
 
 ```
 $ fid check pure_fail.fd
-error: Unknown annotation '@pure' on 'sq': no compiler pass consumes this name
+error[E078]: Unknown annotation '@pure' on 'sq': no compiler pass consumes this name (line 3)
     and it will be silently ignored. Check the spelling.
+...
 ```
 
 ## 2. Functional core, imperative shell
@@ -83,14 +84,14 @@ fn fold(v: Vec<i64>, f: fn(i64, i64) -> i64, init: i64) -> i64 {
 fn add(a: i64, b: i64) -> i64 { return a + b; }
 fn max(a: i64, b: i64) -> i64 { if a > b { return a; } return b; }
 
-fn summary(temps: Vec<i64>) -> str !{} {
+fn summary(temps: Vec<i64>) -> str !Alloc {
     val hottest: i64 = fold(temps, max, -1000);
     val mean: i64 = fold(temps, add, 0) / temps.len();
     return "mean " + int_to_str(celsius_to_f(mean)) + "F, hottest " + classify(celsius_to_f(hottest));
 }
 
 // The imperative shell: all the IO is here.
-fn report(day: str, temps: Vec<i64>) -> void !IO {
+fn report(day: str, temps: Vec<i64>) -> void !{IO, Alloc} {
     println(day + ": " + summary(temps));
 }
 
@@ -113,6 +114,10 @@ $ fid run core_shell.fd
 mon: mean 51F, hottest mild
 tue: mean 78F, hottest hot
 ```
+
+`summary` builds its result with string `+`, which is `Alloc` (since
+Nov 19, known-bugs 2g.65), so it declares `!Alloc`: it may allocate, and
+still cannot print.
 
 Effects are **transitive**: a helper's `println` is the caller's `IO`, at
 any depth. This is where the system earns its keep, because the print is
@@ -141,8 +146,13 @@ fn main() -> i64 {
 
 ```
 $ fid check hidden_io_fail.fd
-error[E110]: Effect error: function 'total' has inferred effect '!IO' but only declared effects not including it
+error[E110]: Effect error: function 'total' has inferred effect '!IO' but only declared effects not including it (line 11)
+...
+error[E110]: Effect error: function 'total' has inferred effect '!Alloc' but only declared effects not including it (line 11)
+...
 ```
+
+(The second error is `trace`'s string `+`, also two calls away.)
 
 A panic is an effect too (`Diverge`), so a function declared `!{}` cannot
 panic explicitly. (Overflow and bounds checks are not counted as
@@ -163,7 +173,8 @@ fn main() -> i64 {
 
 ```
 $ fid check diverge_fail.fd
-error[E110]: Effect error: function 'checked_div' has inferred effect '!Diverge' but only declared effects not including it
+error[E110]: Effect error: function 'checked_div' has inferred effect '!Diverge' but only declared effects not including it (line 2)
+...
 ```
 
 The fix is to say so, `-> i64 !Diverge`, or better to return a `Result`.
@@ -205,7 +216,10 @@ fn main() -> i64 {
 
 ```
 $ fid check ho_fail.fd
-error[E110]: Effect error: function 'sum' has inferred effect '!IO' but only declared effects not including it
+error[E110]: Effect error: function 'sum' has inferred effect '!IO' but only declared effects not including it (line 13)
+...
+error[E110]: Effect error: function 'sum' has inferred effect '!Alloc' but only declared effects not including it (line 13)
+...
 ```
 
 The precise rule: a call through a function *parameter* adds nothing to
@@ -219,10 +233,10 @@ trace, such as one read from a struct field, counts as every effect.
 Read reference §9.1 for the full list. In short: unknown effect names in
 a declaration are accepted (a typo is a silent no-op); `impl` methods are
 not checked against their own declarations, only when a declared function
-calls them; a function without a declaration is not checked at all; and
-`Alloc` is not produced by `Vec` and string operations written in Fid in
-`core.fd`, so `!{}` does not mean "allocates nothing" (`@no-alloc` does,
-week 9).
+calls them; and a function without a declaration is not checked at all.
+(Until Nov 19, `Alloc` was not produced by `Vec` and string operations
+written in Fid in `core.fd`; it now is, so `!{}` rules them out.
+`@no-alloc`, week 9, is the annotation form.)
 
 ## 5. Effect handlers
 
@@ -283,9 +297,9 @@ The lab for this week is [Lab 8 — A pure core, an effectful shell, and closure
 
 1. Add a `debug: bool` parameter to `summary` that prints intermediate
    values. What happens to its declaration, and to `report`'s? Redesign
-   so the core stays `!{}` and the shell does the printing.
+   so the core stays free of `IO` and the shell does the printing.
 2. Write `map_vec(v: Vec<i64>, f: fn(i64) -> i64) -> Vec<i64>` and call it
-   from a `!{}` function with a closure that captures a multiplier. Then
+   from a `!Alloc` function with a closure that captures a multiplier. Then
    with a closure that prints. Explain each result with the rule of §3.
 3. Put a function value in a struct field and call it from a `!{}`
    function. What does the compiler infer, and why is that the only safe

@@ -392,10 +392,9 @@ What changed, and why:
 - **Nothing is freed by hand**, and `fid run topwords.fd --leaks` (which
   builds through C) reports `every block was freed`.
 
-Two things the port runs into today. `fid run` can't execute this
-program: the interpreter has no standard-input reading, and stops with
-`FFI function 'p_read_line' … is not available in the interpreter`. Build
-it, as above. And a Windows build from `fid emit` never sees the end of
+`fid run` reads standard input too (since Nov 19: compiler/interp.fd
+`interp_read_input`). One thing the port may run into: a Windows build
+from `fid emit` never sees the end of
 standard input (`read_line` keeps returning lines), so it loops; build
 through `ccompile` on Windows, or read the text from a file with
 `read_file(path)` instead.
@@ -403,8 +402,8 @@ through `ccompile` on Windows, or read the text from a file with
 ## What doesn't carry over
 
 - **No REPL workflow.** You edit a file and run `fid run file.fd`. Under
-  `fid run` the interpreter can't read standard input or call C
-  functions, and it is much slower than a built program; for anything
+  `fid run` the interpreter can't call C functions (a few libc calls
+  aside), and it is much slower than a built program; for anything
   timed or interactive, `fid emit` or `fid ccompile` and run the
   executable. It also has a few bugs builds don't: today `for s in shapes`
   over a `Vec` of enum values gives wrong payloads under `fid run`

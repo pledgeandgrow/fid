@@ -5,7 +5,7 @@
 >
 > **Fides is self-hosted and independent.** The primary compiler is in
 > `compiler/*.fd` (80 modules, ~361K lines). The Rust source in `src/*.rs`
-> (57 files, ~113K lines) is the bootstrap reference, frozen: it builds
+> (57 files, ~114K lines) is the bootstrap reference, frozen: it builds
 > stage 1 when `compiler/*.fd` changes and runs the test harness. The
 > language is what `fid` accepts: docs/reference/reference.md.
 >
@@ -23,14 +23,21 @@
 # Release build: 3 stages, fixpoint checked, installed as
 # release/fid.exe (the installer ships it as fid.exe)
 RELEASE=1 CC="zig cc" ./scripts/bootstrap.sh
+#   Stage 0: release/stage0/fid(.exe) pinned by scripts/stage0.sha256, else
+#   fidesc; STAGE0=<exe> overrides. Neither pin file exists (Nov 21), and
+#   from fidesc stage 2 runs out of memory (known-bugs 2g.79, roadmap CB8):
+#   pass STAGE0=<a self-hosted fid>.
 .\release\fid.exe run      tests/bootstrap/hello.fd
 .\release\fid.exe ccompile tests/bootstrap/hello.fd -o hello.exe  # needs a C compiler
 
-# Single stage (development; same output name, not fixpoint-checked):
+# Single stage (development; not fixpoint-checked):
 # release/fid-dev.c (generated C) + release/fid-dev(.exe)
 ./scripts/build-selfhost.sh          # stage-0 dump-c + C compile → release/fid-dev.exe
 #   (8 units at -O2 when STAGE0 has `fid split-c`, else one unit at -O0;
-#    STAGE0=release/fid.exe for the fast path: fid at -O2 runs ~17x faster)
+#    STAGE0=release/fid.exe for the fast path: fid at -O2 runs ~17x faster;
+#    STAGE0 defaults to fidesc, which has no split-c. A failed split build
+#    falls back to one unit at -O0 and still exits 0, 2g.86: look for
+#    "8 units at -O2" in its output)
 
 .\release\fid.exe dump-c compiler/main.fd > c2.c   # self-compile (fixpoint)
 .\release\fid.exe run tests/bootstrap/hello.fd    # interpreter (as fidesc run)
@@ -116,8 +123,9 @@ cargo build
 node scripts/wasm-run.mjs out.wasm
 # Native Linux AArch64 / RISC-V 64 / x86-64, no C compiler (compiler/nat_ir.fd:
 # machine IR, one allocator; nat_enc.fd encoders; runtime stdlib/linux_runtime/);
-# NATIVE=1 for the suite. `--target x86_64-linux` uses this backend; `--elf` /
-# `--target linux` stay on pe_ir's no-stdlib ELF path.
+# NATIVE=1 for the suite. `--target x86_64-linux` uses this backend, and so
+# do `--elf` / `--target linux` (Release F4); FID_ELF_PEIR=1 keeps pe_ir's
+# old no-stdlib ELF path.
 .\release\fid.exe emit <file.fd> --target aarch64-linux -o out
 .\release\fid.exe emit <file.fd> --target x86_64-linux -o out
 # Windows x64 on the same machine layer (opt-in; pe_ir stays the default):
@@ -205,7 +213,8 @@ FID=release/fid.exe JOBS=4 bash scripts/cross-test.sh aarch64-linux
 ./target/release/fidesc parse-header <header.h>
 
 # Debug a Fides program (interactive debugger; fidesc only: fid has no
-# debug/replay/autopsy command, compiler/debugger.fd is not wired)
+# debug/autopsy command, compiler/debugger.fd is not wired. `fid replay
+# <trace>` replays its own traces, written by `fid run <file.fd> --record`)
 ./target/release/fidesc debug <file.fd>
 
 # Replay a recorded execution trace
@@ -233,10 +242,11 @@ FID=release/fid.exe JOBS=4 bash scripts/cross-test.sh aarch64-linux
 # Build the Windows installer (requires NSIS)
 # On Windows: cd installer && makensis fides.nsi
 # On CI: triggered automatically by GitHub Actions on release tags
-# Manual trigger: gh workflow run build-installer.yml -f version=1.0.0
+# (release.yml, on a v* tag; it also builds the Linux archive)
+# Manual trigger: gh workflow run release.yml -f version=1.0.0
 ```
 
-## Current Baseline (Nov 20 2026 — stage-0 fixes pushed; full suite last run Nov 2)
+## Current Baseline (Nov 21 2026 — builds from a self-hosted stage 0; full suite last run Nov 2)
 
 > Project-wide numbers are kept in docs/reference/selfhost.md → "Numbers"
 > (CURRENT.md was removed on Nov 8); keep the two in step.
@@ -250,7 +260,9 @@ FID=release/fid.exe JOBS=4 bash scripts/cross-test.sh aarch64-linux
 > fidesc-BUILT fid self-compiling the 361K tree needs >16 GB (the frozen
 > lowering emits no 0004 temporary drops) — the 3-stage bootstrap from
 > fidesc cannot pass stage 2 until the rc-ownership lowering is ported to
-> src/lower.rs.
+> src/lower.rs. Nov 21: part of it is ported (owners for Vec/HashMap
+> elements, the C runtime's 0004 string layer); statement temporaries and
+> parameters are not yet.
 >
 > Nov 21: the wall is in the fidesc-built stage 1 only. A self-hosted fid
 > of Nov 18 used as stage 0 compiled the unmodified Nov 20 tree (86cc919)
@@ -263,7 +275,7 @@ FID=release/fid.exe JOBS=4 bash scripts/cross-test.sh aarch64-linux
 
 ```
 SELF-HOSTED COMPILER (primary source):
-  compiler/*.fd:  80 modules, 360,594 lines — THE COMPILER. 56 are reached
+  compiler/*.fd:  80 modules, 360,657 lines — THE COMPILER. 56 are reached
                   from main.fd; 24 are imported by nothing that main.fd
                   reaches (the whole retired PIR path — pir, opt, regalloc,
                   peephole, codegen_x64/arm64/riscv, pe, arm64_enc,
@@ -283,12 +295,14 @@ SELF-HOSTED COMPILER (primary source):
   Fixpoint:       VERIFIED byte-for-byte (stage2 == stage3, 49 MB of C,
                   Nov 6; again Nov 8 with ownership 0004, 67 MB of C, in a
                   3-stage rebuild from a source snapshot). NOT re-verified
-                  on the Nov 19 tree — the compiler grew ~2.3x since.
+                  on the Nov 19 tree or later — the compiler grew ~2.3x
+                  since.
   Bootstrap:      5 generations verified (Rust → c1 → c2 → c3 → c4 → c5)
-  Binary:         release/fid.exe, shipped as fid.exe. release/fid.exe
-                  (Nov 10) still predates the current stdlib; release/
-                  fid-dev.exe was rebuilt Nov 20 from the current tree and
-                  runs it. A fidesc-built binary self-compiling the whole
+  Binary:         release/fid.exe, shipped as fid.exe. release/ is local
+                  and gitignored, and other sessions rebuild it (fid.exe
+                  and fid-dev.exe were both rebuilt Nov 21): check which
+                  stage 0 built a binary (release/fid-dev.log, .cc.log)
+                  before trusting or timing it. A fidesc-built binary self-compiling the whole
                   tree hits the 2g.79 memory wall — see the blocker note
                   above. Nov 21: a fid built from a self-hosted stage 0
                   (the Nov 18 fid) builds the current tree in one step and
@@ -312,15 +326,17 @@ SELF-HOSTED COMPILER (primary source):
                   SPLIT=1 or tcc: one unit at -O0).
 
 RUST BOOTSTRAP (reference + test harness):
-  src/*.rs:       57 files, 113,416 lines — bootstrap reference (frozen)
+  src/*.rs:       57 files, 114,184 lines — bootstrap reference (frozen;
+                  Nov 21: the CB8 ownership port in lower.rs/codegen_c.rs)
   Used when:      compiler/*.fd changes (builds stage 1); runs `fidesc test`
   Suite (Nov 2):  interp 339/339, C 343/343, PE 345/345, expected-fail 89/89
                   (saved baseline: an earlier run, 334/338/341). The suite
                   is ~3.3x larger now — a fresh full run is part of the
                   1.0 release prep.
 
-WINDOWS INSTALLER (v1.0.0):
-  installer/:     NSIS script + build helper (6 files, incl. the 0.8.0 setup)
+WINDOWS INSTALLER (fides.nsi's default VERSION is 0.8.0):
+  installer/:     NSIS script + build helper (5 tracked files; the built
+                  Fid-Setup-*.exe beside them are not tracked)
   CI:            .github/workflows/: 13 workflows — ci.yml, tier1.yml and
                  tier2.yml (scripts/tier1.sh/tier2.sh lanes on Windows,
                  Linux, Linux-ARM, macOS), suite-all.yml, macos.yml,
@@ -330,13 +346,15 @@ WINDOWS INSTALLER (v1.0.0):
   Output:        Fid-Setup-<version>.exe (named Fides-Setup up to
                  0.8.0; Fides-Setup-1.0.0.exe was 2.5 MB, tested on Windows)
   Ships:         fid.exe = self-hosted (release/fid.exe), fidesc.exe =
-                 Rust compiler, stdlib/ and examples/ beside them
+                 Rust compiler, ark/scribe/veil, stdlib/ and examples/
+                 beside them
   Version:       build_info.fd base "1.0.0" → `fid version` prints
-                 1.0.0+dev on dev builds; tags: v1.0.0 (Sep 9),
-                 v0.8.0-unstable (Nov 10)
+                 1.0.0+dev on dev builds; tags: v0.7 (Sep 9, the commit
+                 "Fides v1.0.0"), v0.8.0-unstable (Nov 10),
+                 v0.8.1-unstable (Nov 21, on origin)
 
 TESTS:
-  tests/bootstrap/:  1,752 .fd — 1,681 at top level (456 expected-fail),
+  tests/bootstrap/:  1,753 .fd — 1,682 at top level (459 expected-fail),
                      71 in subdirs: at_import, baseline, capability,
                      diag_dup, diagnostics, effects, golden, nattools,
                      race_lib, regions, safety, spec_lib, trait_conflict
@@ -348,7 +366,7 @@ TESTS:
   tests/projects/:  52 .fd — whole-program fixtures (cli, service, game,
                     embed, library, workspace, ...)
   tests/verify/:    50 .fd — bug reproductions, soak/interleave, tv pairs
-  tests/tooling/:   14 .fd + 126 *-check.sh — per-feature tool checks
+  tests/tooling/:   14 .fd + 126 .sh (118 *-check.sh) — per-feature tool checks
                     (crash reports, LSP probes, caches, repl, docs, serve)
   tests/ also:      ark, book, c2fd, cancel, cascade, checked_alloc,
                     course, ct, ctx_switch, db, determinism, fmt, fuzz,
@@ -512,7 +530,8 @@ Binaries:     4 (fidesc, ark, scribe, veil) + the self-hosted fid
   into commits f9c55d8/087609a by mistake; it is now in `.gitignore`. Agents
   build in their scratch folder (`CARGO_TARGET_DIR`), not in the repository.
 - `release/` — Self-hosted compiler output: `fid.exe` (from the release
-  bootstrap, or a single stage with `fid.c` from build-selfhost.sh) — gitignored
+  bootstrap) and `fid-dev.exe` + `fid-dev.c` (a single stage from
+  build-selfhost.sh) — gitignored
 - `compiler/` — Self-hosted compiler source (80 `.fd` modules) — THE PRIMARY COMPILER
 
 **Changelog:** See `docs/reference/changelog.md` for the full history of
@@ -529,14 +548,14 @@ touching them.
 
 | File | Risk | Why |
 |------|------|-----|
-| `src/regalloc.rs` | **CRITICAL** | Linear scan allocator (~1100 LOC). F-1A: constant rematerialization (`Location::Remat`). F-1D: effect-aware register allocation — calls to pure functions (in `L3Module.pure_functions`) only clobber RAX, not all caller-saved registers. I-2D: calls to `@no-alloc` functions (in `L3Module.no_alloc_functions`) also only clobber RAX. `@medical` functions included in no-alloc set. S-17: deterministic interval sorting (secondary key: vreg ID) to prevent non-deterministic codegen from HashMap iteration order. Any change here affects EVERY function. |
+| `src/regalloc.rs` | **CRITICAL** | Linear scan allocator (~1,500 lines). F-1A: constant rematerialization (`Location::Remat`). F-1D: effect-aware register allocation — calls to pure functions (in `L3Module.pure_functions`) only clobber RAX, not all caller-saved registers. I-2D: calls to `@no-alloc` functions (in `L3Module.no_alloc_functions`) also only clobber RAX. `@medical` functions included in no-alloc set. S-17: deterministic interval sorting (secondary key: vreg ID) to prevent non-deterministic codegen from HashMap iteration order. Any change here affects EVERY function. |
 | `src/peephole.rs` | **CRITICAL** | 9 passes, always on in `build`. A wrong transform silently corrupts all output. |
-| `src/elf64.rs` | **HIGH** | ELF64 header bytes, section layout, relocations (R_X86_64_PC32/PLT32/64). Off-by-one = corrupt binary. Self-hosted port in `compiler/elf64.fd` (2,423 LOC, 85% parity) includes full x86-64 instruction encoder, assembly parser, and ELF builder. |
+| `src/elf64.rs` | **HIGH** | ELF64 header bytes, section layout, relocations (R_X86_64_PC32/PLT32/64). Off-by-one = corrupt binary. Self-hosted port in `compiler/elf64.fd` (2,423 LOC and 85% parity when ported; 3,554 lines on Nov 21) includes full x86-64 instruction encoder, assembly parser, and ELF builder. |
 | `src/pe.rs` | **HIGH** | PE header bytes, import table (kernel32.dll + msvcrt.dll: every name in `IMPORTS`/`MSVCRT_IMPORTS` must be a real export, or no program starts), section layout. Off-by-one = corrupt .exe. Machine-code stubs must not keep a value in a volatile register (rcx, rdx, r8–r11) across a call (HeapFree clobbers them). |
 | `stdlib/linux_runtime/*.fd` | **MEDIUM** | The runtime of the machine layer (compiler/nat_ir.fd): Linux system calls (base, conc, math, sys) and `win.fd` for `--nat` Windows over kernel32/ws2_32. Merged into every nat_ir build. |
 | `compiler/nat_ir.fd`, `compiler/nat_enc.fd` | **HIGH** | Machine IR, register allocator and encoders of the Linux targets and `--nat`. Checks: `FID_VERIFY=1`, `scripts/enc-oracle.py`, `scripts/pass-matrix.sh`. |
 | `compiler/pe_ir*.fd` | **HIGH** | Default Windows native backend: machine code, imports, PE writer. Same byte-level risk as `src/pe.rs`. |
-| `stdlib/pe_runtime/*.fd` | **MEDIUM** | The Fides runtime of native Windows executables (pe_ir): builtin `p_X` and `__X` run `pert_X` (base, conc, tensor, data); `pert_c_<C name>` overrides a C function. Merged into the Windows `emit`/`build` (also `build --native --target windows`), not into `--bare`, `--elf`, `--boot` or C; `data.fd` and `tensor.fd` are also merged into every nat_ir build (Linux targets, `--nat`). A type error here breaks those builds. `p_vec_*` never reaches `pert_*`: `pe_runtime_alias` sends it to core first. Helpers prefixed `pe_`/`pet_`/`ped_` (unused ones are left out of the .exe). |
+| `stdlib/pe_runtime/*.fd` | **MEDIUM** | The Fides runtime of native Windows executables (pe_ir): builtin `p_X` and `__X` run `pert_X` (base, conc, tensor, data); `pert_c_<C name>` overrides a C function. Merged into the Windows `emit`/`build` (also `build --native --target windows`), not into `--bare`, `--boot`, pe_ir's ELF path (`FID_ELF_PEIR=1 --elf`) or C; `data.fd` and `tensor.fd` are also merged into every nat_ir build (Linux targets, `--elf`, `--nat`). A type error here breaks those builds. `p_vec_*` never reaches `pert_*`: `pe_runtime_alias` sends it to core first. Helpers prefixed `pe_`/`pet_`/`ped_` (unused ones are left out of the .exe). |
 | `src/coff.rs` | **HIGH** | COFF object file format. Same byte-level risk as PE/ELF. |
 | `src/macho.rs` | **HIGH** | Mach-O object file format. Same byte-level risk. |
 | `src/codegen_x64.rs` | **HIGH** | PIR L3 → x86-64 instruction encoding. ModRM/SIB bytes, REX prefixes, ABI rules. |
@@ -549,7 +568,7 @@ touching them.
 | `src/comptime.rs` | **LOW** | Comptime evaluation engine. Evaluates `comptime <expr>`, `comptime { block }`, `comptime reflect_op(T)`, `comptime gen { block }` at compile time. I-5A: Aggressive comptime evaluation — auto-evaluates calls to `comptime fn` functions with all-literal args (no explicit `comptime` wrapper needed). I-5D: Comptime loop unrolling — unrolls `for` loops with literal bounds (≤16 iterations, ≤16 body stmts) at AST level. Also eliminates dead `if` branches with literal conditions. |
 | `src/runtime_linux.rs` | **HIGH** | Hand-encoded x86-64 machine code (raw bytes). No assembler — every byte is manual. |
 | `src/linker.rs` | **MEDIUM** | Relocation resolution. Wrong offset = crash or silent corruption. |
-| `src/interp.rs` | **MEDIUM** | The reference oracle (~6060 LOC). If this is wrong, all backends "match" but produce wrong results. `p_vec_new` uses `vec_side_table` to separate raw struct fields from `Value::Vec`. `run_function` auto-detects missing `__env` param and inserts dummy. Self-hosted port in `compiler/interp.fd` (7,456 lines, Nov 9) ran every test program `fidesc run` did (Oct 27); it cannot run FFI other than a few libc calls or `sysconf`; tasks interleave (LG11, docs/interp-tasks.md). |
+| `src/interp.rs` | **MEDIUM** | The reference oracle (~6,950 lines). If this is wrong, all backends "match" but produce wrong results. `p_vec_new` uses `vec_side_table` to separate raw struct fields from `Value::Vec`. `run_function` auto-detects missing `__env` param and inserts dummy. Self-hosted port in `compiler/interp.fd` (7,456 lines on Nov 9; 14,130 on Nov 21) ran every test program `fidesc run` did (Oct 27); it cannot run FFI other than a few libc calls or `sysconf`; tasks interleave (LG11, docs/interp-tasks.md). |
 
 ## LOWER-RISK FILES
 
@@ -577,8 +596,9 @@ touching them.
 > 3. CB3: Backend test parity — ✅ resolved (Nov 2: 339/339 interp, 343/343 C, 345/345 PE)
 > 4. CB4: Parser debug prints — ✅ resolved (Session 19)
 > 5. CB5: Self-hosted compiler build fails — ✅ resolved (Session 20, all 50 modules type-check)
-> 6. CB6: PE emitter stubs — partially resolved (Session 20, 6/15 fixed, 9 p_string_* remain)
+> 6. CB6: PE emitter stubs — ✅ resolved in the old PIR emitter (pe.fd), which is no longer the native path
 > 7. CB7: ELF64 symbol table dump — ✅ resolved (Session 20)
+> 8. CB8: 3-stage bootstrap from fidesc dies at stage 2 (out of memory, known-bugs 2g.79) — open (Nov 20); a self-hosted stage 0 avoids it
 
 1. **Self-hosted compiler: what still differs from `fidesc`** (Oct 27).
    `run` matches on all 302 test programs and all 10 examples; `ccompile`
@@ -592,8 +612,9 @@ touching them.
      (MI18): `--native` is now the machine layer (nat_ir) on every target,
      the default `x86-64` being `x86_64-linux`; a target it has no code for
      is an error. `fid emit` (pe_ir on Windows, nat_ir for Linux targets) is
-     the working native path; compiler/pe.fd is reached only by `emit --boot`,
-     which panics.
+     the working native path. compiler/pe.fd is reached by nothing:
+     `emit --boot` builds the bootable image through pe_ir, as `--bare`
+     does (`PEIR_BARE_BOOT`).
    Fixed Oct 25–27 (docs/reference/known-bugs.md §2e): block jumps ended
    functions, byte loads read side-table strings, builtins shadowed core
    functions, the comptime loop unroller, String/HashMap result types,
@@ -634,7 +655,10 @@ touching them.
    in annotated code. `@wrapping` exempts generated overflow branches.
    The recursion-guard and stack-canary sequences are exempt. **x86-64 ELF
    only** — the PE path emits machine code directly and is not yet covered;
-   ARM64/RISC-V are not covered.
+   ARM64/RISC-V are not covered. (That is fidesc. In fid, `@constant_time`
+   code is checked on pe_ir's and nat_ir's final machine code (J7) and, in
+   the C generator, on the IR it is handed; FID_PE_CT_OFF / FID_C_CT_OFF
+   turn the pe_ir and C checks off.)
 
 6. **Session-16 regression — bare runtime stubs**: the `p_hlt`/`p_cli`/
    `p_sti`/`p_inb`/`p_outb`/`p_serial_*` stubs lost in the
@@ -712,8 +736,8 @@ touching them.
    page. `zig cc` off Windows needs `-lunwind` for `_Unwind_Backtrace`
    (main.rs, main.fd, bootstrap.sh, build-selfhost.sh add it).
 
-16. **One `Vec` implementation** (`pe_runtime_alias`, `pe_ir_stubs.fd`,
-   moving to ir.fd on Nov 9; `interp.rs core_vec_fn`): every native
+16. **One `Vec` implementation** (`pe_runtime_alias`, in `compiler/ir.fd`
+   since Nov 9; `interp.rs core_vec_fn`): every native
    `p_vec_*` builtin (pe_ir and nat_ir) runs core's `Vec_*` function.
    compiler/interp.fd keeps its own `p_vec_*` over simulated memory, and
    pe_ir still emits its old machine `p_vec_*` stubs (unused). Do not add a backend stub with its own semantics; the old ones
@@ -762,8 +786,9 @@ touching them.
    `Str_dup`/`Vec_share`/`HashMap_share`/`__own_dup_N`); temporaries are
    dropped at the end of their statement (`Lowerer_lower_stmt` wrapper);
    parameters are borrowed (one the body changes is copied at entry).
-   `LOWER_COW` and the auto-drop passes (`lw_auto_drop_vecs/strs`) are off:
-   do not turn them back on with it, they would free values twice. Do not
+   Copy-on-write (`LOWER_COW`) is retired (CM3) and the auto-drop passes
+   (`lw_auto_drop_vecs/strs`) run only with `LOWER_RC` off: do not bring
+   either back with it, they would free values twice. Do not
    store a str/Vec/map anywhere without going through these helpers; a
    value cast to `i64` (`f() as i64`) is the raw word's to free by hand.
 
@@ -950,7 +975,7 @@ the frozen Rust compiler.
 | `src/pir.rs` | Multi-level PIR (L1/L2/L3) |
 | `src/opt.rs` | PIR optimizer (enabled by default in `build`, `--lto` for aggressive inlining) |
 | `src/peephole.rs` | 9-pass peephole (always on in `build`) |
-| `src/regalloc.rs` | Linear scan register allocator (⚠️ known bug) |
+| `src/regalloc.rs` | Linear scan register allocator (Known Bugs 7 and 11: both fixed) |
 | `src/mono.rs` | Generic monomorphization |
 | `src/comptime.rs` | Compile-time eval + reflection |
 | `src/pe.rs` | PE emitter (Windows) |

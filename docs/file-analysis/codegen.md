@@ -1,11 +1,14 @@
 # codegen.fd — legacy AST → ARM64 asm generator (dead)
 
+> **Nov 21:** compiler.fd no longer imports it: nothing does, so it is no
+> longer compiled into `fid`. 1,557 lines now.
+
 > **Re-audited 2026-11-09.** Since 10-23 the only changes are a rename
 > (`cg_ArmStringConstEntry_new`) and three no-op `Stmt` arms (Resume,
 > SpawnScope, CancelScope) from commit 6c33558 (Oct 24).
 
 - **Path:** `compiler/codegen.fd`
-- **LOC:** 1,497
+- **LOC:** 1,557 (2026-11-21; 1,497 on Nov 9)
 - **Role:** walks the AST (`Program`) straight to AArch64 assembly text
   (no IR, no regalloc). Port of `src/codegen.rs`. The live ARM64 paths are
   `nat_ir.fd` (machine layer) and the PIR-era `codegen_arm64.fd`.

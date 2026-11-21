@@ -48,7 +48,7 @@ pub struct ProfileSample {
 | `depth` | `i64` |
 | `parent` | `i64` |
 
-*Defined at line 25*
+*Defined at line 22*
 
 ---
 
@@ -69,7 +69,7 @@ pub struct FrameProfile {
 | `texture_binds` | `i64` |
 | `shader_switches` | `i64` |
 
-*Defined at line 33*
+*Defined at line 30*
 
 ---
 
@@ -108,7 +108,7 @@ pub struct Profiler {
 | `cur_shader_switches` | `i64` |
 | `cur_frame_start` | `f64` |
 
-*Defined at line 42*
+*Defined at line 39*
 
 ---
 
@@ -122,7 +122,7 @@ pub fn profiler_create() -> Profiler {
 
 **Returns:** `Profiler`
 
-*Defined at line 70*
+*Defined at line 78*
 
 ---
 
@@ -140,7 +140,7 @@ pub fn profiler_init(p: &mut Profiler) -> void {
 
 **Returns:** `void`
 
-*Defined at line 100*
+*Defined at line 85*
 
 ---
 
@@ -159,7 +159,7 @@ pub fn profiler_set_enabled(p: &mut Profiler, enabled: bool) -> void {
 
 **Returns:** `void`
 
-*Defined at line 119*
+*Defined at line 104*
 
 ---
 
@@ -177,7 +177,7 @@ pub fn profiler_begin_frame(p: &mut Profiler) -> void {
 
 **Returns:** `void`
 
-*Defined at line 124*
+*Defined at line 109*
 
 ---
 
@@ -196,7 +196,7 @@ pub fn profiler_begin(p: &mut Profiler, name: str) -> void {
 
 **Returns:** `void`
 
-*Defined at line 143*
+*Defined at line 130*
 
 ---
 
@@ -205,17 +205,17 @@ pub fn profiler_begin(p: &mut Profiler, name: str) -> void {
 End a profiled scope.
 
 ```fides
-pub fn profiler_end(p: &mut Profiler, name: str) -> void {
+pub fn profiler_end(p: &mut Profiler, _name: str) -> void {
 ```
 
 **Parameters:**
 
 - `p`: `&mut Profiler`
-- `name`: `str`
+- `_name`: `str`
 
 **Returns:** `void`
 
-*Defined at line 163*
+*Defined at line 152*
 
 ---
 
@@ -233,7 +233,7 @@ pub fn profiler_count_draw_call(p: &mut Profiler) -> void {
 
 **Returns:** `void`
 
-*Defined at line 176*
+*Defined at line 169*
 
 ---
 
@@ -252,7 +252,7 @@ pub fn profiler_count_triangles(p: &mut Profiler, count: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 181*
+*Defined at line 174*
 
 ---
 
@@ -270,7 +270,7 @@ pub fn profiler_count_texture_bind(p: &mut Profiler) -> void {
 
 **Returns:** `void`
 
-*Defined at line 186*
+*Defined at line 179*
 
 ---
 
@@ -288,7 +288,7 @@ pub fn profiler_count_shader_switch(p: &mut Profiler) -> void {
 
 **Returns:** `void`
 
-*Defined at line 191*
+*Defined at line 184*
 
 ---
 
@@ -306,7 +306,7 @@ pub fn profiler_end_frame(p: &mut Profiler) -> void {
 
 **Returns:** `void`
 
-*Defined at line 196*
+*Defined at line 189*
 
 ---
 
@@ -324,7 +324,7 @@ pub fn profiler_frame_time(p: &Profiler) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 233*
+*Defined at line 232*
 
 ---
 
@@ -342,7 +342,7 @@ pub fn profiler_fps(p: &Profiler) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 239*
+*Defined at line 240*
 
 ---
 
@@ -360,7 +360,7 @@ pub fn profiler_draw_calls(p: &Profiler) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 244*
+*Defined at line 245*
 
 ---
 
@@ -378,7 +378,7 @@ pub fn profiler_triangles(p: &Profiler) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 250*
+*Defined at line 253*
 
 ---
 
@@ -396,7 +396,7 @@ pub fn profiler_min_frame(p: &Profiler) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 256*
+*Defined at line 261*
 
 ---
 
@@ -414,7 +414,7 @@ pub fn profiler_max_frame(p: &Profiler) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 261*
+*Defined at line 266*
 
 ---
 
@@ -432,7 +432,7 @@ pub fn profiler_frame_count(p: &Profiler) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 266*
+*Defined at line 271*
 
 ---
 
@@ -451,7 +451,7 @@ pub fn profiler_get_sample(p: &Profiler, name: str) -> ProfileSample {
 
 **Returns:** `ProfileSample`
 
-*Defined at line 271*
+*Defined at line 276*
 
 ---
 
@@ -469,7 +469,7 @@ pub fn profiler_last_frame(p: &Profiler) -> FrameProfile {
 
 **Returns:** `FrameProfile`
 
-*Defined at line 292*
+*Defined at line 293*
 
 ---
 
@@ -487,7 +487,7 @@ pub fn profiler_reset(p: &mut Profiler) -> void {
 
 **Returns:** `void`
 
-*Defined at line 304*
+*Defined at line 300*
 
 ---
 
@@ -505,7 +505,7 @@ pub fn profiler_frame_time_history(p: &Profiler) -> str {
 
 **Returns:** `str`
 
-*Defined at line 316*
+*Defined at line 312*
 
 ---
 
@@ -523,7 +523,7 @@ pub fn profiler_shutdown(p: &mut Profiler) -> void {
 
 **Returns:** `void`
 
-*Defined at line 328*
+*Defined at line 326*
 
 ---
 
@@ -542,7 +542,7 @@ pub fn profiler_set_max_frames(p: &mut Profiler, max: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 342*
+*Defined at line 340*
 
 ---
 
@@ -560,7 +560,7 @@ pub fn profiler_sample_count(p: &Profiler) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 352*
+*Defined at line 350*
 
 ---
 
@@ -579,7 +579,7 @@ pub fn profiler_get_sample_idx(p: &Profiler, idx: i64) -> ProfileSample {
 
 **Returns:** `ProfileSample`
 
-*Defined at line 357*
+*Defined at line 355*
 
 ---
 

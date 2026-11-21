@@ -22,7 +22,7 @@ pub fn dp_noise(t: Tensor, sigma: f64) -> Tensor {
 
 **Returns:** `Tensor`
 
-*Defined at line 12*
+*Defined at line 19*
 
 ---
 
@@ -41,7 +41,7 @@ pub fn gaussian_noise(shape: Vec<i64>, sigma: f64) -> Tensor {
 
 **Returns:** `Tensor`
 
-*Defined at line 17*
+*Defined at line 24*
 
 ---
 
@@ -60,7 +60,7 @@ pub fn dropout(t: Tensor, p: f64) -> Tensor {
 
 **Returns:** `Tensor`
 
-*Defined at line 22*
+*Defined at line 29*
 
 ---
 

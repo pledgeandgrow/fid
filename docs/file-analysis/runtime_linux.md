@@ -3,7 +3,11 @@
 Re-audited 2026-11-09 (previous audit 2026-10-22/23).
 
 - **Path:** `compiler/runtime_linux.fd`
-- **LOC:** 4,399
+- **LOC:** 4,685 (2026-11-21; 4,399 on Nov 9). Nov 21: dead. Its importers
+  are runtime_arm64.fd and runtime_riscv.fd, both unreached, and
+  `compiler.fd` `build_executable` is gone (MI18, Nov 17): `build
+  --native` with the default target is the machine layer (`x86_64-linux`),
+  whose runtime is stdlib/linux_runtime.
 - **Role:** the runtime blob linked into `build --native` x86-64 ELF
   output: raw machine-code bytes for `_start`, syscalls, mmap allocator,
   print, vec basics, stubs; plus an asm text block (strings, maps, more vec

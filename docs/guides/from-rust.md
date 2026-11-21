@@ -17,7 +17,7 @@ and a few genuinely different ideas (effects, `cap`, annotations).
 | `Box<dyn T>` / `&dyn T` | `dyn T` — cast with `x as dyn T` |
 | `match x { Some(v) => .. }` | `match x { Option::Some(v: i64) => { .. } }` |
 | `x.unwrap_or(0)` | `x ?? 0` |
-| `println!("{}", v)` | `println(int_to_str(v))` — no format strings |
+| `println!("{}", v)` | `println(f"{v}")` or `println(int_to_str(v))` — format strings without specifiers |
 | `Vec<T>` methods | `Vec::new()`, `v.push`, `v.get`, `v.len` — same idea |
 | `use crate::m` | `use m;` or `use compiler::m;` (path namespaced) |
 | `#[derive]` | none — write the impl |
@@ -40,10 +40,12 @@ and a few genuinely different ideas (effects, `cap`, annotations).
 - **No explicit lifetimes.** Because references can't escape, the
   borrow checker doesn't need `<'a>` annotations anywhere.
 - **No macros.** No `macro_rules!`, no proc macros. `println` is a
-  builtin, not a macro — so no `{:?}` formatting.
+  builtin, not a macro; `f"{x}"` builds a `str` but has no format
+  specifiers (no `{:?}`, `{x:#x}`).
 - **`panic`, not `Result`-everywhere.** Functions that can fail
-  recoverably return `Option`/`Result`, but the default error path is
-  `panic(...)` with a trace — more like Go's model than Rust's `?`.
+  recoverably return `Option`/`Result`, and `e?` passes a `None` or `Err`
+  up as Rust's `?` does, but the default error path is `panic(...)` with a
+  trace.
 - **Annotation-driven codegen.** `@crashfree` (may not panic),
   `@no-alloc`, `@wrapping`, `@send`, `@secret`, `@repr(C)`,
   `@packed`, `@simd` — these are *trusted* contracts the compiler uses;

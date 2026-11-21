@@ -42,7 +42,7 @@ pub fn bit_get(n: i64, idx: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 16*
+*Defined at line 19*
 
 ---
 
@@ -61,7 +61,7 @@ pub fn bit_set(n: i64, idx: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 21*
+*Defined at line 27*
 
 ---
 
@@ -80,7 +80,7 @@ pub fn bit_clear(n: i64, idx: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 26*
+*Defined at line 35*
 
 ---
 
@@ -99,7 +99,7 @@ pub fn bit_toggle(n: i64, idx: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 31*
+*Defined at line 44*
 
 ---
 
@@ -117,7 +117,7 @@ pub fn bit_popcount(n: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 38*
+*Defined at line 58*
 
 ---
 
@@ -135,7 +135,7 @@ pub fn bit_leading_zeros(n: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 49*
+*Defined at line 71*
 
 ---
 
@@ -153,7 +153,7 @@ pub fn bit_trailing_zeros(n: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 62*
+*Defined at line 111*
 
 ---
 
@@ -171,7 +171,7 @@ pub fn bit_highest_set(n: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 74*
+*Defined at line 123*
 
 ---
 
@@ -189,7 +189,7 @@ pub fn bit_lowest_set(n: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 87*
+*Defined at line 141*
 
 ---
 
@@ -208,7 +208,7 @@ pub fn bit_rotate_left(n: i64, k: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 95*
+*Defined at line 155*
 
 ---
 
@@ -227,7 +227,7 @@ pub fn bit_rotate_right(n: i64, k: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 102*
+*Defined at line 168*
 
 ---
 
@@ -246,7 +246,7 @@ pub fn bit_byte_at(n: i64, idx: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 111*
+*Defined at line 182*
 
 ---
 
@@ -264,7 +264,7 @@ pub fn bit_high_nibble(n: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 116*
+*Defined at line 190*
 
 ---
 
@@ -282,7 +282,7 @@ pub fn bit_low_nibble(n: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 121*
+*Defined at line 198*
 
 ---
 
@@ -300,7 +300,7 @@ pub fn bit_is_power_of_two(n: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 128*
+*Defined at line 209*
 
 ---
 
@@ -319,7 +319,7 @@ pub fn bit_next_power_of_two(n: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 135*
+*Defined at line 222*
 
 ---
 
@@ -337,7 +337,7 @@ pub fn bit_ceil(n: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 147*
+*Defined at line 243*
 
 ---
 
@@ -355,7 +355,7 @@ pub fn bit_log2(n: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 152*
+*Defined at line 252*
 
 ---
 
@@ -373,7 +373,7 @@ pub fn bit_reverse_byte(b: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 160*
+*Defined at line 266*
 
 ---
 
@@ -391,7 +391,7 @@ pub fn bit_reverse(n: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 181*
+*Defined at line 290*
 
 ---
 
@@ -410,7 +410,7 @@ pub fn bit_mask(count: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 195*
+*Defined at line 308*
 
 ---
 
@@ -428,7 +428,7 @@ pub fn bit_mask_high(count: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 202*
+*Defined at line 323*
 
 ---
 
@@ -448,7 +448,7 @@ pub fn bit_extract(n: i64, offset: i64, bits: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 209*
+*Defined at line 337*
 
 ---
 
@@ -469,7 +469,7 @@ pub fn bit_insert(n: i64, value: i64, offset: i64, bits: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 214*
+*Defined at line 346*
 
 ---
 

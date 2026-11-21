@@ -4,7 +4,16 @@
 > uncommitted edits (+439/-117 against HEAD) and grew while this audit ran
 > (2,733 → 2,908 lines): line numbers are from the last read.
 
-**Path:** `compiler/ir.fd` — **2,908 lines** (2,551 on Oct 22). Imports
+> **Nov 21:** 5,991 lines; `Inst` has 44 variants; 33 modules import it
+> (new: `ssa`, `tv`, `ir_ser`, `pgo`, `gpu`, `nat_thumb`, `comptime_eval`;
+> 25 of the 33 are reached from main.fd). The pe_ir_stubs helpers (`pert_name`,
+> `pe_runtime_alias`, `pe_ir_reachable_from`, ...) now live here. Fixed
+> Nov 16 (known-bugs 2g.53): the reference list skips an `asm!` clobber
+> (id -1). Still true: `IrModule_get_function` returns the function at the
+> index `fn_index` holds without checking its name (SP10's position lookup
+> next to it does check). Line numbers below are from Nov 9.
+
+**Path:** `compiler/ir.fd` — **2,908 lines** on Nov 9 (5,991 on Nov 21; 2,551 on Oct 22). Imports
 `ast` only.
 
 **Role:** the typed SSA IR every stage after lowering shares: `IrType`,

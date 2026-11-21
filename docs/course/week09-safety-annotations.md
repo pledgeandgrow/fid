@@ -139,20 +139,24 @@ fn main() -> i64 {
 
 ```
 $ fid check rules_fail.fd
-error[E097]: Safety error (crashfree): function 'average' uses '/'.
+error[E097]: Safety error (crashfree): function 'average' uses '/'. (line 5)
     Division/modulo by zero aborts at runtime.
     Crashfree functions cannot use '/' unless the divisor is proven non-zero.
     Fix: use a checked-divide helper, or remove the safety annotation.
-error[E097]: Safety error (crashfree): function 'uses_helper' is safety-annotated but calls 'helper',
+...
+error[E097]: Safety error (crashfree): function 'uses_helper' is safety-annotated but calls 'helper', (line 10)
     which has no safety annotations.
     A safety-annotated function can only call other safety-annotated functions.
     Fix: add safety annotations to 'helper', or remove the call from 'uses_helper'.
-error[E097]: Safety error (safety-annotated): function 'record' is @no-alloc but uses .push(), which allocates.
+...
+error[E097]: Safety error (safety-annotated): function 'record' is @no-alloc but uses .push(), which allocates. (line 15)
     Dynamic allocation is forbidden — deterministic memory usage required.
     Fix: use a fixed-size array or a buffer passed in, or remove the safety annotation.
-error[E097]: Safety error (safety-annotated): function 'fact' is @no-recursion but calls itself.
+...
+error[E097]: Safety error (safety-annotated): function 'fact' is @no-recursion but calls itself. (line 20)
     Recursion is forbidden — stack overflow is a safety risk.
     Fix: convert to an iterative loop, or remove the safety annotation.
+...
 ```
 
 ## 4. Determinism
@@ -183,9 +187,9 @@ fn main() -> i64 {
 
 ```
 $ fid check det_fail.fd
-error[E097]: Determinism error: function 'scaled' is @deterministic but uses floating-point.
+error[E097]: Determinism error: function 'scaled' is @deterministic but uses floating-point. (line 3)
 ...
-error[E097]: Determinism error: function 'stamp' is @deterministic but has effect '!IO'.
+error[E097]: Determinism error: function 'stamp' is @deterministic but has effect '!IO'. (line 8)
 ...
 ```
 

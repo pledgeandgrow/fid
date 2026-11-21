@@ -16,7 +16,7 @@ pub fn args_len() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 19*
+*Defined at line 22*
 
 ---
 
@@ -36,7 +36,7 @@ pub fn args_get(index: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 26*
+*Defined at line 33*
 
 ---
 
@@ -50,7 +50,7 @@ pub fn args_program_name() -> str {
 
 **Returns:** `str`
 
-*Defined at line 35*
+*Defined at line 48*
 
 ---
 

@@ -26,7 +26,7 @@ pub fn json_parse(s: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 26*
+*Defined at line 780*
 
 ---
 
@@ -45,7 +45,7 @@ pub fn json_string(s: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 32*
+*Defined at line 641*
 
 ---
 
@@ -67,7 +67,7 @@ pub fn json_get(s: str, key: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 40*
+*Defined at line 801*
 
 ---
 
@@ -88,7 +88,7 @@ pub fn json_at(s: str, idx: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 47*
+*Defined at line 823*
 
 ---
 
@@ -107,7 +107,7 @@ pub fn json_type(s: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 53*
+*Defined at line 842*
 
 ---
 
@@ -126,7 +126,7 @@ pub fn json_len(s: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 59*
+*Defined at line 855*
 
 ---
 
@@ -144,7 +144,7 @@ pub fn json_pretty(s: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 64*
+*Defined at line 884*
 
 ---
 
@@ -163,7 +163,7 @@ pub fn json_pair(key: str, value: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 69*
+*Defined at line 945*
 
 ---
 

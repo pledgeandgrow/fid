@@ -39,7 +39,7 @@
 pub const _SC_PAGESIZE: i64 = 30;
 ```
 
-*Defined at line 30*
+*Defined at line 43*
 
 ---
 
@@ -49,7 +49,7 @@ pub const _SC_PAGESIZE: i64 = 30;
 pub const _SC_CLK_TCK: i64 = 2;
 ```
 
-*Defined at line 31*
+*Defined at line 43*
 
 ---
 
@@ -59,7 +59,7 @@ pub const _SC_CLK_TCK: i64 = 2;
 pub const _SC_NPROCESSORS_ONLN: i64 = 84;
 ```
 
-*Defined at line 32*
+*Defined at line 43*
 
 ---
 
@@ -69,7 +69,7 @@ pub const _SC_NPROCESSORS_ONLN: i64 = 84;
 pub const _SC_NPROCESSORS_CONF: i64 = 83;
 ```
 
-*Defined at line 33*
+*Defined at line 43*
 
 ---
 
@@ -79,7 +79,7 @@ pub const _SC_NPROCESSORS_CONF: i64 = 83;
 pub const _SC_PHYS_PAGES: i64 = 85;
 ```
 
-*Defined at line 34*
+*Defined at line 43*
 
 ---
 
@@ -89,7 +89,7 @@ pub const _SC_PHYS_PAGES: i64 = 85;
 pub const _SC_AVPHYS_PAGES: i64 = 86;
 ```
 
-*Defined at line 35*
+*Defined at line 43*
 
 ---
 
@@ -103,7 +103,7 @@ pub fn sys_arch() -> str {
 
 **Returns:** `str`
 
-*Defined at line 40*
+*Defined at line 249*
 
 ---
 
@@ -117,7 +117,7 @@ pub fn sys_cpu_count() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 48*
+*Defined at line 286*
 
 ---
 
@@ -131,7 +131,7 @@ pub fn sys_cpu_count_conf() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 55*
+*Defined at line 295*
 
 ---
 
@@ -145,7 +145,7 @@ pub fn sys_page_size() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 64*
+*Defined at line 306*
 
 ---
 
@@ -159,7 +159,7 @@ pub fn sys_total_memory() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 71*
+*Defined at line 315*
 
 ---
 
@@ -173,7 +173,7 @@ pub fn sys_available_memory() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 78*
+*Defined at line 325*
 
 ---
 
@@ -187,7 +187,7 @@ pub fn sys_total_memory_kb() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 85*
+*Defined at line 335*
 
 ---
 
@@ -201,7 +201,7 @@ pub fn sys_total_memory_mb() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 90*
+*Defined at line 340*
 
 ---
 
@@ -215,7 +215,7 @@ pub fn sys_total_memory_gb() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 95*
+*Defined at line 345*
 
 ---
 
@@ -229,7 +229,7 @@ pub fn sys_pid() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 102*
+*Defined at line 352*
 
 ---
 
@@ -243,7 +243,7 @@ pub fn sys_ppid() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 107*
+*Defined at line 357*
 
 ---
 
@@ -257,7 +257,7 @@ pub fn sys_uid() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 112*
+*Defined at line 362*
 
 ---
 
@@ -271,7 +271,7 @@ pub fn sys_gid() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 117*
+*Defined at line 367*
 
 ---
 
@@ -285,7 +285,7 @@ pub fn sys_clk_tck() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 124*
+*Defined at line 374*
 
 ---
 
@@ -299,7 +299,7 @@ pub fn sys_is_linux() -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 133*
+*Defined at line 385*
 
 ---
 
@@ -313,7 +313,7 @@ pub fn sys_is_macos() -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 138*
+*Defined at line 390*
 
 ---
 
@@ -327,7 +327,7 @@ pub fn sys_is_windows() -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 144*
+*Defined at line 396*
 
 ---
 
@@ -341,7 +341,7 @@ pub fn sys_is_64bit() -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 150*
+*Defined at line 402*
 
 ---
 
@@ -355,7 +355,7 @@ pub fn sys_is_32bit() -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 155*
+*Defined at line 407*
 
 ---
 
@@ -369,7 +369,7 @@ pub fn sys_is_little_endian() -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 162*
+*Defined at line 416*
 
 ---
 
@@ -383,7 +383,7 @@ pub fn sys_is_big_endian() -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 172*
+*Defined at line 434*
 
 ---
 
@@ -407,7 +407,7 @@ pub struct SystemInfo {
 | `pid` | `i64` |
 | `uid` | `i64` |
 
-*Defined at line 179*
+*Defined at line 441*
 
 ---
 
@@ -421,7 +421,7 @@ pub fn sys_info() -> SystemInfo {
 
 **Returns:** `SystemInfo`
 
-*Defined at line 190*
+*Defined at line 452*
 
 ---
 
@@ -439,7 +439,7 @@ pub fn sys_info_string(info: SystemInfo) -> str {
 
 **Returns:** `str`
 
-*Defined at line 203*
+*Defined at line 459*
 
 ---
 

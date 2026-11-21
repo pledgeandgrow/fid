@@ -1,5 +1,9 @@
 # conc — Fides Documentation
 
+From `stdlib/pe_runtime/conc.fd`: the concurrency part of the runtime of
+native Windows executables (`fid emit`, pe_ir), which runs builtin `p_X`
+as `pert_X`. It is merged into those builds, not imported with `use`.
+
 ## Contents
 
 - [pert_thread_spawn_v](#pert_thread_spawn_v) (function)
@@ -55,7 +59,7 @@ pub fn pert_thread_spawn_v(name: str, nargs: i64, argv: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 96*
+*Defined at line 310*
 
 ---
 
@@ -73,7 +77,7 @@ pub fn pert_executor_spawn_v(name: str, nargs: i64, argv: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 121*
+*Defined at line 339*
 
 ---
 
@@ -91,7 +95,7 @@ pub fn pert_thread_main(block: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 126*
+*Defined at line 344*
 
 ---
 
@@ -108,7 +112,7 @@ pub fn pert_co_go(name: str, arg: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 147*
+*Defined at line 2026*
 
 ---
 
@@ -118,7 +122,7 @@ pub fn pert_co_go(name: str, arg: i64) -> i64 {
 pub fn pert_co_yield() {
 ```
 
-*Defined at line 181*
+*Defined at line 2053*
 
 ---
 
@@ -130,7 +134,7 @@ pub fn pert_co_run() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 187*
+*Defined at line 2126*
 
 ---
 
@@ -146,7 +150,7 @@ pub fn pert_co_done(t: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 215*
+*Defined at line 2574*
 
 ---
 
@@ -162,7 +166,7 @@ pub fn pert_co_result(t: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 222*
+*Defined at line 2578*
 
 ---
 
@@ -178,7 +182,7 @@ pub fn pert_future_ready(value: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 257*
+*Defined at line 2610*
 
 ---
 
@@ -194,7 +198,7 @@ pub fn pert_future_poll(f: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 261*
+*Defined at line 2614*
 
 ---
 
@@ -210,7 +214,7 @@ pub fn pert_task_poll(f: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 272*
+*Defined at line 2628*
 
 ---
 
@@ -226,7 +230,7 @@ pub fn pert_task_is_ready(f: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 276*
+*Defined at line 2632*
 
 ---
 
@@ -242,7 +246,7 @@ pub fn pert_task_poll_nonblocking(f: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 287*
+*Defined at line 2646*
 
 ---
 
@@ -254,7 +258,7 @@ pub fn pert_executor_new() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 301*
+*Defined at line 2666*
 
 ---
 
@@ -271,7 +275,7 @@ pub fn pert_executor_block_on(exec: i64, f: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 307*
+*Defined at line 2672*
 
 ---
 
@@ -289,7 +293,7 @@ pub fn pert_executor_run_all(exec: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 312*
+*Defined at line 2679*
 
 ---
 
@@ -307,7 +311,7 @@ pub fn pert_executor_poll_all(exec: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 326*
+*Defined at line 2702*
 
 ---
 
@@ -327,7 +331,7 @@ pub fn pert_executor_cancel(exec: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 345*
+*Defined at line 2721*
 
 ---
 
@@ -343,7 +347,7 @@ pub fn pert_shared_alloc(size: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 364*
+*Defined at line 2740*
 
 ---
 
@@ -359,7 +363,7 @@ pub fn pert_atomic_load(addr: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 371*
+*Defined at line 2747*
 
 ---
 
@@ -374,7 +378,7 @@ pub fn pert_atomic_store(addr: i64, value: i64) {
 - `addr`: `i64`
 - `value`: `i64`
 
-*Defined at line 375*
+*Defined at line 2752*
 
 ---
 
@@ -393,7 +397,7 @@ pub fn pert_atomic_add(addr: i64, value: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 380*
+*Defined at line 2758*
 
 ---
 
@@ -410,7 +414,7 @@ pub fn pert_atomic_sub(addr: i64, value: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 386*
+*Defined at line 2765*
 
 ---
 
@@ -428,7 +432,7 @@ pub fn pert_atomic_cas(addr: i64, expected: i64, new_value: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 390*
+*Defined at line 2769*
 
 ---
 
@@ -443,7 +447,7 @@ pub fn pert_mutex_init() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 396*
+*Defined at line 2776*
 
 ---
 
@@ -457,7 +461,7 @@ pub fn pert_mutex_lock(m: i64) {
 
 - `m`: `i64`
 
-*Defined at line 402*
+*Defined at line 2782*
 
 ---
 
@@ -471,7 +475,7 @@ pub fn pert_mutex_unlock(m: i64) {
 
 - `m`: `i64`
 
-*Defined at line 406*
+*Defined at line 2787*
 
 ---
 
@@ -483,7 +487,7 @@ pub fn pert_tls_create() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 410*
+*Defined at line 2792*
 
 ---
 
@@ -499,7 +503,7 @@ pub fn pert_tls_get(key: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 414*
+*Defined at line 2796*
 
 ---
 
@@ -514,7 +518,7 @@ pub fn pert_tls_set(key: i64, value: i64) {
 - `key`: `i64`
 - `value`: `i64`
 
-*Defined at line 418*
+*Defined at line 2800*
 
 ---
 
@@ -530,7 +534,7 @@ pub fn pert_chan_create(capacity: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 426*
+*Defined at line 2808*
 
 ---
 
@@ -549,7 +553,7 @@ pub fn pert_chan_send(ch: i64, value: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 440*
+*Defined at line 2822*
 
 ---
 
@@ -567,7 +571,7 @@ pub fn pert_chan_recv(ch: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 472*
+*Defined at line 2866*
 
 ---
 
@@ -585,7 +589,7 @@ pub fn pert_chan_try_recv(ch: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 490*
+*Defined at line 2896*
 
 ---
 
@@ -599,7 +603,7 @@ pub fn pert_chan_close(ch: i64) {
 
 - `ch`: `i64`
 
-*Defined at line 508*
+*Defined at line 2914*
 
 ---
 
@@ -615,7 +619,7 @@ pub fn pert_chan_is_closed(ch: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 519*
+*Defined at line 2925*
 
 ---
 

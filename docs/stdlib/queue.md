@@ -17,10 +17,10 @@ pub struct Queue<T> {
 
 | Name | Type |
 |------|------|
-| `data` | `Vec` |
-| `head` | `i64` |
+| `inbox` | `Vec<i64>` |
+| `outbox` | `Vec<i64>` |
 
-*Defined at line 19*
+*Defined at line 39*
 
 ---
 
@@ -30,7 +30,7 @@ pub struct Queue<T> {
 impl Queue {
 ```
 
-*Defined at line 24*
+*Defined at line 39*
 
 ---
 

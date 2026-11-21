@@ -98,7 +98,7 @@ fn main() -> i64 {
 
 ```
 $ fid check grades_io_fail.fd
-error: Capability error (module 'grades'): 'file_write()' requires 'FS' capability (not granted to module 'grades')
+error: Capability error: 'file_write()' requires 'FS' capability (not granted to module 'grades') (module 'grades', line 13)
 ...
 ```
 
@@ -185,8 +185,10 @@ fn main() -> i64 {
 
 ```
 $ fid check exfil_fail.fd
-error[E091]: Sandbox error: 'vowel_score()' has effect '!IO' -- all capabilities are revoked inside sandbox, including in the functions it calls
-error[E091]: Sandbox error: 'phone_home()' has effect '!IO' -- all capabilities are revoked inside sandbox, including in the functions it calls
+error[E091]: Sandbox error: 'vowel_score()' has effect '!IO' -- all capabilities are revoked inside sandbox, including in the functions it calls (line 17)
+...
+error[E091]: Sandbox error: 'phone_home()' has effect '!IO' -- all capabilities are revoked inside sandbox, including in the functions it calls (line 18)
+...
 ```
 
 A sandbox is a compile-time guarantee about *source code*. It does not

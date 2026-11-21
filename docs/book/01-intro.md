@@ -11,8 +11,8 @@ with a compiler small enough to read.
   Linux ELF directly (x86-64, AArch64, RISC-V 64). A C path
   (`fid ccompile` + zig cc/cl/tcc) covers the rest.
 - **Ownership without a GC**: one owner per value, borrows checked at
-  compile time, frees inserted for you. No lifetimes — references can't
-  escape, so they don't need them.
+  compile time, frees inserted for you. References can't escape, so most
+  code writes no lifetimes (a struct that holds a reference takes one).
 - **Effects in the type**: the compiler works out what each function does
   (`IO`, `Net`, `Spawn`, `Diverge`, `Alloc`); write `!{}`, `!IO` or
   `!{IO, Net}` after the result type and the body is held to it
@@ -20,8 +20,9 @@ with a compiler small enough to read.
 - **Annotation-driven contracts**: `@crashfree`, `@no-alloc`,
   `@wrapping`, `@send`, `@secret`, `@repr(C)`, `@packed`, `@simd`,
   `@interrupt`, `@firmware` — for services, kernels, and crypto alike.
-- **Self-hosted and fixpoint-verified**: the compiler compiles itself
-  byte-for-byte identically (stage 2 == stage 3 on every release build).
+- **Self-hosted and fixpoint-verified**: the release bootstrap checks
+  that the compiler compiles itself byte-for-byte identically (stage 2 ==
+  stage 3); last verified on Nov 8, 2026, on a smaller tree.
 
 ## Install
 
@@ -33,8 +34,12 @@ with a compiler small enough to read.
   `runtime/`; unpack it anywhere and put `bin/` on `PATH`.
 - **From source**: `RELEASE=1 CC="zig cc" ./scripts/bootstrap.sh` builds
   the compiler in three stages and checks that stage 2 and stage 3 are
-  the same (`release/fid.exe`). For development,
-  `./scripts/build-selfhost.sh` builds one stage, `release/fid-dev.exe`.
+  the same (`release/fid.exe`). Stage 0 is a self-hosted `fid` (the
+  pinned `release/stage0/fid.exe`, or `STAGE0=<fid>`): a `fid` built by
+  the Rust compiler runs out of memory compiling today's tree
+  (known-bugs 2g.79). For development, `./scripts/build-selfhost.sh`
+  builds one stage, `release/fid-dev.exe` (check that it built at -O2:
+  it can fall back to -O0 without saying so, 2g.86).
 
 `fid run` and `fid emit` need nothing else. `fid ccompile` (and
 `fid run --leaks`) also need a C compiler: `zig cc` works on every host
@@ -48,9 +53,9 @@ fid ...
 ...
 ```
 
-The first line is `fid` and the version (`fid 0.8.0-unstable (self-hosted
-Fides compiler)` for the build this book was checked with); the next lines
-say how the binary was built.
+The first line is `fid` and the version (`fid 1.0.0+dev (self-hosted
+Fides compiler)` for the development build this book was last checked
+with, Nov 21, 2026); the next lines say how the binary was built.
 
 then run a first program: `fid run examples\hello.fd` from the install
 directory (the installer puts `hello.fd` in `examples\`), or
@@ -76,7 +81,8 @@ examples/    small programs
 - Not stable: the language still moves; `docs/reference/stability.md`
   tracks what is promised.
 - Not a cargo-style ecosystem yet: `ark` (chapter 7) installs pacts from
-  a path or git, and its registry index has few packages.
+  a path, git or the pacts index (pledgeandgrow/pacts), which has few
+  packages yet.
 - Not proven-safe for kernels today: bare-metal/`@firmware`/`@interrupt`
   exist and `fides-os` exercises them, but the runtime is young.
 
@@ -90,8 +96,9 @@ examples/    small programs
   `FID_HOME` to the directory that holds `stdlib/`. And because
   `./stdlib` comes first, running from a directory with a `stdlib/` of
   its own (an old checkout) uses that one.
-- **`fid ccompile` without a C compiler.** With no `CC` set, `fid` tries
-  `tcc`, and the build ends with `C compilation failed`. Set
+- **`fid ccompile` without a C compiler.** With no `CC` set, `fid` looks
+  for `gcc`, `clang`, `tcc` and `cl.exe` (`cc` too on Linux); with none
+  of them the build ends with `C compilation failed`. Set
   `CC="zig cc"`, or use `fid emit`, which needs no C compiler.
 - **Using `fidesc` for your programs.** `fidesc.exe` is the frozen Rust
   bootstrap compiler. It lacks generics checks, safety annotations,

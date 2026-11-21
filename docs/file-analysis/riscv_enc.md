@@ -3,7 +3,9 @@
 Re-audited 2026-11-09 (previous audit 2026-10-22/23).
 
 - **Path:** `compiler/riscv_enc.fd`
-- **LOC:** 1,191
+- **LOC:** 1,577 (2026-11-21; 1,191 on Nov 9). Nov 21: still dead; its
+  only importer is runtime_riscv.fd, and `compiler.fd` `build_executable`
+  is gone (MI18, Nov 17).
 - **Role:** RISC-V asm text → bytes, symbols, relocations
   (`assemble_riscv`): I/S/B/J encodings, `li` expansion, directives,
   local branch resolution. Port of `src/riscv_enc.rs`. Unrelated to the

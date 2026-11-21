@@ -1,10 +1,21 @@
 # ark.fd
 
+> **Nov 21:** the module grew from 761 to 7,169 lines (a registry: the
+> package index pledgeandgrow/pacts, `ark add <name>` with no flag as a
+> registry dependency, `build`/`b`, `test`/`t`, `prebuild`, `targets`,
+> `vendor`, `audit`, `api`, `publish`, `yank`). A directory pact with
+> backslash paths, a file pact and the empty lock no longer reproduce
+> the findings below (known-bugs 2g.63, verified Nov 21 on Windows:
+> tests/ark green with the current fid-dev; the earlier failures came from
+> scripts preferring the stale release/fid.exe). The other findings were
+> not re-checked. The rest of this page is the Nov 9 audit; its line
+> numbers are of that file.
+
 > **Re-audited 2026-11-09** against the current source and the latest `fid` build (s18, native,
 > so `p_system` runs `cmd.exe`). Only change since Oct 22: `str_equal` → `==` (merge 62fcc30).
 
 - **Path:** `compiler/ark.fd`
-- **LOC:** 761 (Rust `src/ark.rs`: 707)
+- **LOC:** 7,169 (2026-11-21; 761 on Nov 9; Rust `src/ark.rs`: 707 then)
 - **Role:** package manager: `ark.toml` manifest, `ark.lock`, pacts installed into `ark_modules/`.
   Commands `init`, `add`, `install`/`i`, `remove`/`rm`, `list`/`ls`, `lock`, `update`, `search`,
   `publish` (both stubs), `version`, `help`. Small TOML reader.

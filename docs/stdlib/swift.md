@@ -42,7 +42,7 @@
 pub const SWIFT_MT103: i64  = 103;  // Customer Credit Transfer
 ```
 
-*Defined at line 27*
+*Defined at line 25*
 
 ---
 
@@ -52,7 +52,7 @@ pub const SWIFT_MT103: i64  = 103;  // Customer Credit Transfer
 pub const SWIFT_MT202: i64  = 202;  // General Financial Institution Transfer
 ```
 
-*Defined at line 28*
+*Defined at line 26*
 
 ---
 
@@ -62,7 +62,7 @@ pub const SWIFT_MT202: i64  = 202;  // General Financial Institution Transfer
 pub const SWIFT_MT900: i64  = 900;  // Confirmation of Debit
 ```
 
-*Defined at line 29*
+*Defined at line 27*
 
 ---
 
@@ -72,7 +72,7 @@ pub const SWIFT_MT900: i64  = 900;  // Confirmation of Debit
 pub const SWIFT_MT910: i64  = 910;  // Confirmation of Credit
 ```
 
-*Defined at line 30*
+*Defined at line 28*
 
 ---
 
@@ -82,7 +82,7 @@ pub const SWIFT_MT910: i64  = 910;  // Confirmation of Credit
 pub const SWIFT_MT940: i64  = 940;  // Statement Message
 ```
 
-*Defined at line 31*
+*Defined at line 29*
 
 ---
 
@@ -92,7 +92,7 @@ pub const SWIFT_MT940: i64  = 940;  // Statement Message
 pub const SWIFT_MT942: i64  = 942;  // Interim Transaction Report
 ```
 
-*Defined at line 32*
+*Defined at line 30*
 
 ---
 
@@ -102,7 +102,7 @@ pub const SWIFT_MT942: i64  = 942;  // Interim Transaction Report
 pub const SWIFT_MT199: i64  = 199;  // Free Format Message
 ```
 
-*Defined at line 33*
+*Defined at line 31*
 
 ---
 
@@ -112,7 +112,7 @@ pub const SWIFT_MT199: i64  = 199;  // Free Format Message
 pub const SWIFT_MT299: i64  = 299;  // Free Format Message (FIN)
 ```
 
-*Defined at line 34*
+*Defined at line 32*
 
 ---
 
@@ -122,7 +122,7 @@ pub const SWIFT_MT299: i64  = 299;  // Free Format Message (FIN)
 pub const SWIFT_MT300: i64  = 300;  // Foreign Exchange Confirmation
 ```
 
-*Defined at line 35*
+*Defined at line 33*
 
 ---
 
@@ -132,7 +132,7 @@ pub const SWIFT_MT300: i64  = 300;  // Foreign Exchange Confirmation
 pub const SWIFT_MT320: i64  = 320;  // Loan/Deposit Confirmation
 ```
 
-*Defined at line 36*
+*Defined at line 34*
 
 ---
 
@@ -142,7 +142,7 @@ pub const SWIFT_MT320: i64  = 320;  // Loan/Deposit Confirmation
 pub const SWIFT_MT700: i64  = 700;  // Issue of a Documentary Credit
 ```
 
-*Defined at line 37*
+*Defined at line 35*
 
 ---
 
@@ -152,7 +152,7 @@ pub const SWIFT_MT700: i64  = 700;  // Issue of a Documentary Credit
 pub const SWIFT_MT760: i64  = 760;  // Guarantee
 ```
 
-*Defined at line 38*
+*Defined at line 36*
 
 ---
 
@@ -170,7 +170,7 @@ pub fn swift_mt_name(mt: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 41*
+*Defined at line 39*
 
 ---
 
@@ -188,7 +188,7 @@ pub fn swift_bic_validate(bic: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 67*
+*Defined at line 99*
 
 ---
 
@@ -206,7 +206,7 @@ pub fn swift_bic_bank_code(bic: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 83*
+*Defined at line 115*
 
 ---
 
@@ -224,7 +224,7 @@ pub fn swift_bic_country(bic: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 88*
+*Defined at line 120*
 
 ---
 
@@ -242,7 +242,7 @@ pub fn swift_bic_location(bic: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 93*
+*Defined at line 125*
 
 ---
 
@@ -261,7 +261,7 @@ pub fn swift_bic_branch(bic: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 99*
+*Defined at line 131*
 
 ---
 
@@ -279,7 +279,7 @@ pub fn swift_iban_validate_length(iban: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 113*
+*Defined at line 145*
 
 ---
 
@@ -297,7 +297,7 @@ pub fn swift_iban_country(iban: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 140*
+*Defined at line 202*
 
 ---
 
@@ -315,7 +315,7 @@ pub fn swift_iban_check_digits(iban: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 145*
+*Defined at line 207*
 
 ---
 
@@ -333,7 +333,7 @@ pub fn swift_iban_bban(iban: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 150*
+*Defined at line 212*
 
 ---
 
@@ -361,7 +361,7 @@ pub struct MT103 {
 | `remittance_info` | `str` |
 | `value_date` | `str,    // YYMMDD` |
 
-*Defined at line 160*
+*Defined at line 222*
 
 ---
 
@@ -379,7 +379,7 @@ pub fn swift_mt103_new(sender_bic: str, receiver_bic: str, amount_cents: i64,
 - `receiver_bic`: `str`
 - `amount_cents`: `i64`
 
-*Defined at line 175*
+*Defined at line 239*
 
 ---
 
@@ -388,18 +388,18 @@ pub fn swift_mt103_new(sender_bic: str, receiver_bic: str, amount_cents: i64,
 Set ordering customer (party initiating the payment).
 
 ```fides
-pub fn swift_mt103_set_ordering(msg: MT103, customer: str, institution: str) -> void {
+pub fn swift_mt103_set_ordering(msg: &mut MT103, customer: str, institution: str) -> void {
 ```
 
 **Parameters:**
 
-- `msg`: `MT103`
+- `msg`: `&mut MT103`
 - `customer`: `str`
 - `institution`: `str`
 
 **Returns:** `void`
 
-*Defined at line 193*
+*Defined at line 246*
 
 ---
 
@@ -408,18 +408,18 @@ pub fn swift_mt103_set_ordering(msg: MT103, customer: str, institution: str) -> 
 Set beneficiary customer (party receiving the payment).
 
 ```fides
-pub fn swift_mt103_set_beneficiary(msg: MT103, customer: str, institution: str) -> void {
+pub fn swift_mt103_set_beneficiary(msg: &mut MT103, customer: str, institution: str) -> void {
 ```
 
 **Parameters:**
 
-- `msg`: `MT103`
+- `msg`: `&mut MT103`
 - `customer`: `str`
 - `institution`: `str`
 
 **Returns:** `void`
 
-*Defined at line 199*
+*Defined at line 252*
 
 ---
 
@@ -428,17 +428,17 @@ pub fn swift_mt103_set_beneficiary(msg: MT103, customer: str, institution: str) 
 Set remittance information (payment reference).
 
 ```fides
-pub fn swift_mt103_set_remittance(msg: MT103, info: str) -> void {
+pub fn swift_mt103_set_remittance(msg: &mut MT103, info: str) -> void {
 ```
 
 **Parameters:**
 
-- `msg`: `MT103`
+- `msg`: `&mut MT103`
 - `info`: `str`
 
 **Returns:** `void`
 
-*Defined at line 205*
+*Defined at line 258*
 
 ---
 
@@ -447,17 +447,17 @@ pub fn swift_mt103_set_remittance(msg: MT103, info: str) -> void {
 Set value date (YYMMDD format).
 
 ```fides
-pub fn swift_mt103_set_value_date(msg: MT103, date: str) -> void {
+pub fn swift_mt103_set_value_date(msg: &mut MT103, date: str) -> void {
 ```
 
 **Parameters:**
 
-- `msg`: `MT103`
+- `msg`: `&mut MT103`
 - `date`: `str`
 
 **Returns:** `void`
 
-*Defined at line 210*
+*Defined at line 263*
 
 ---
 
@@ -475,7 +475,7 @@ pub fn swift_mt103_serialize(msg: MT103) -> str {
 
 **Returns:** `str`
 
-*Defined at line 215*
+*Defined at line 268*
 
 ---
 
@@ -493,7 +493,7 @@ pub fn swift_mt103_amount_major(msg: MT103) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 256*
+*Defined at line 309*
 
 ---
 
@@ -511,7 +511,7 @@ pub fn swift_mt103_amount_formatted(msg: MT103) -> str {
 
 **Returns:** `str`
 
-*Defined at line 261*
+*Defined at line 314*
 
 ---
 
@@ -522,16 +522,16 @@ Format: ":TAG:VALUE" (e.g. ":20:REF12345")
 Returns (tag, value) as a Vec [tag_str, value_str].
 
 ```fides
-pub fn swift_parse_field(line: str) -> Vec {
+pub fn swift_parse_field(line: str) -> Vec<str> {
 ```
 
 **Parameters:**
 
 - `line`: `str`
 
-**Returns:** `Vec`
+**Returns:** `Vec<str>`
 
-*Defined at line 277*
+*Defined at line 330*
 
 ---
 
@@ -551,7 +551,7 @@ pub fn swift_extract_field(text: str, tag: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 311*
+*Defined at line 366*
 
 ---
 

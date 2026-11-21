@@ -1,5 +1,13 @@
 # borrowck.fd — Borrow checker
 
+> **Nov 21:** 3,486 lines (2,230 on Nov 9). Fixed Nov 15 (known-bugs
+> 2g.9): `--borrowck=warn` prints `bc.warnings`; casts and pipes are
+> descended (`g(&mut x, &mut x) as i64` is rejected); a nested field write
+> `s.a.z =` checks every prefix (test_borrow_cast_fail,
+> test_borrow_nested_field_fail). New open (2g.73): `swap(&mut v[0], &mut
+> v[1])` is rejected ("a mutable borrow is already reserved"). Line
+> numbers below are from Nov 9.
+
 > **Re-audited 2026-11-09** against the current source, with live probes
 > (`s18.exe run`). Fixed since 10-22: field assignment on a variable,
 > trait impl bodies, read-only methods, `for`-loop invalidation, the dead
@@ -7,7 +15,7 @@
 > hide casts and tuples, nested field writes, closures.
 
 - **Path:** `compiler/borrowck.fd`
-- **LOC:** 2,230 (was 2,067 on 10-22; Rust `src/borrowck.rs`: 1,221)
+- **LOC:** 3,486 (2026-11-21; 2,230 on Nov 9, 2,067 on 10-22; Rust `src/borrowck.rs`: 1,221)
 - **Role:** Lexical/NLL borrow checker, a separate pass after type checking, escape and secrecy, before comptime `substitute` and mono.
 - **Imports:** `core`, `vec`, `string`, `compiler::ast`.
 

@@ -53,7 +53,7 @@
 pub const UNIFORM_FLOAT: i64 = 0;
 ```
 
-*Defined at line 32*
+*Defined at line 27*
 
 ---
 
@@ -63,7 +63,7 @@ pub const UNIFORM_FLOAT: i64 = 0;
 pub const UNIFORM_INT: i64 = 1;
 ```
 
-*Defined at line 33*
+*Defined at line 27*
 
 ---
 
@@ -73,7 +73,7 @@ pub const UNIFORM_INT: i64 = 1;
 pub const UNIFORM_VEC3: i64 = 2;
 ```
 
-*Defined at line 34*
+*Defined at line 27*
 
 ---
 
@@ -83,7 +83,7 @@ pub const UNIFORM_VEC3: i64 = 2;
 pub const UNIFORM_VEC4: i64 = 3;
 ```
 
-*Defined at line 35*
+*Defined at line 27*
 
 ---
 
@@ -93,7 +93,7 @@ pub const UNIFORM_VEC4: i64 = 3;
 pub const UNIFORM_MAT4: i64 = 4;
 ```
 
-*Defined at line 36*
+*Defined at line 27*
 
 ---
 
@@ -103,7 +103,7 @@ pub const UNIFORM_MAT4: i64 = 4;
 pub const UNIFORM_TEXTURE: i64 = 5;
 ```
 
-*Defined at line 37*
+*Defined at line 27*
 
 ---
 
@@ -126,7 +126,7 @@ pub struct UniformValue {
 | `texture_unit` | `i64` |
 | `location` | `i64,    // cached uniform location` |
 
-*Defined at line 39*
+*Defined at line 28*
 
 ---
 
@@ -149,7 +149,7 @@ pub struct Material {
 | `depth_write` | `bool` |
 | `valid` | `bool` |
 
-*Defined at line 50*
+*Defined at line 40*
 
 ---
 
@@ -159,7 +159,7 @@ pub struct Material {
 pub const BLEND_OPAQUE: i64 = 0;
 ```
 
-*Defined at line 61*
+*Defined at line 54*
 
 ---
 
@@ -169,7 +169,7 @@ pub const BLEND_OPAQUE: i64 = 0;
 pub const BLEND_ALPHA: i64 = 1;
 ```
 
-*Defined at line 62*
+*Defined at line 54*
 
 ---
 
@@ -179,7 +179,7 @@ pub const BLEND_ALPHA: i64 = 1;
 pub const BLEND_ADDITIVE: i64 = 2;
 ```
 
-*Defined at line 63*
+*Defined at line 54*
 
 ---
 
@@ -189,7 +189,7 @@ pub const BLEND_ADDITIVE: i64 = 2;
 pub const CULL_NONE: i64 = 0;
 ```
 
-*Defined at line 65*
+*Defined at line 55*
 
 ---
 
@@ -199,7 +199,7 @@ pub const CULL_NONE: i64 = 0;
 pub const CULL_BACK: i64 = 1;
 ```
 
-*Defined at line 66*
+*Defined at line 55*
 
 ---
 
@@ -209,7 +209,7 @@ pub const CULL_BACK: i64 = 1;
 pub const CULL_FRONT: i64 = 2;
 ```
 
-*Defined at line 67*
+*Defined at line 55*
 
 ---
 
@@ -228,7 +228,7 @@ pub fn material_create(shader_name: str) -> Material {
 
 **Returns:** `Material`
 
-*Defined at line 71*
+*Defined at line 64*
 
 ---
 
@@ -248,7 +248,7 @@ pub fn material_create_custom(name: str, vert_src: str, frag_src: str) -> Materi
 
 **Returns:** `Material`
 
-*Defined at line 108*
+*Defined at line 94*
 
 ---
 
@@ -268,7 +268,7 @@ pub fn material_set_float(mat: &mut Material, name: str, val: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 133*
+*Defined at line 114*
 
 ---
 
@@ -288,7 +288,7 @@ pub fn material_set_int(mat: &mut Material, name: str, val: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 151*
+*Defined at line 128*
 
 ---
 
@@ -308,7 +308,7 @@ pub fn material_set_vec3(mat: &mut Material, name: str, val: vec3) -> void {
 
 **Returns:** `void`
 
-*Defined at line 169*
+*Defined at line 142*
 
 ---
 
@@ -328,7 +328,7 @@ pub fn material_set_vec4(mat: &mut Material, name: str, val: vec4) -> void {
 
 **Returns:** `void`
 
-*Defined at line 187*
+*Defined at line 156*
 
 ---
 
@@ -348,7 +348,7 @@ pub fn material_set_mat4(mat: &mut Material, name: str, val: mat4) -> void {
 
 **Returns:** `void`
 
-*Defined at line 205*
+*Defined at line 170*
 
 ---
 
@@ -368,7 +368,7 @@ pub fn material_set_texture(mat: &mut Material, name: str, unit: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 223*
+*Defined at line 184*
 
 ---
 
@@ -386,7 +386,7 @@ pub fn material_bind(mat: &Material) -> void {
 
 **Returns:** `void`
 
-*Defined at line 241*
+*Defined at line 198*
 
 ---
 
@@ -405,7 +405,7 @@ pub fn material_set_blend(mat: &mut Material, mode: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 280*
+*Defined at line 246*
 
 ---
 
@@ -424,7 +424,7 @@ pub fn material_set_cull(mat: &mut Material, mode: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 285*
+*Defined at line 251*
 
 ---
 
@@ -444,7 +444,7 @@ pub fn material_set_depth(mat: &mut Material, test: bool, write: bool) -> void {
 
 **Returns:** `void`
 
-*Defined at line 290*
+*Defined at line 256*
 
 ---
 
@@ -462,7 +462,7 @@ pub fn material_destroy(mat: &mut Material) -> void {
 
 **Returns:** `void`
 
-*Defined at line 296*
+*Defined at line 262*
 
 ---
 
@@ -480,7 +480,7 @@ pub fn material_program(mat: &Material) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 306*
+*Defined at line 272*
 
 ---
 
@@ -498,7 +498,7 @@ pub fn material_is_valid(mat: &Material) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 311*
+*Defined at line 277*
 
 ---
 
@@ -516,7 +516,7 @@ pub fn material_uniform_count(mat: &Material) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 316*
+*Defined at line 282*
 
 ---
 
@@ -526,7 +526,7 @@ pub fn material_uniform_count(mat: &Material) -> i64 {
 pub const SHADER_UNLIT_VERT: str = "#version 330 core\nlayout(location = 0) in vec3 aPos;\nuniform mat4 model;\nuniform mat4 view;\nuniform mat4 projection;\nvoid main() {\n    gl_Position = projection * view * model * vec4(aPos, 1.0);\n}\n";
 ```
 
-*Defined at line 322*
+*Defined at line 288*
 
 ---
 
@@ -536,7 +536,7 @@ pub const SHADER_UNLIT_VERT: str = "#version 330 core\nlayout(location = 0) in v
 pub const SHADER_UNLIT_FRAG: str = "#version 330 core\nuniform vec3 color;\nout vec4 FragColor;\nvoid main() {\n    FragColor = vec4(color, 1.0);\n}\n";
 ```
 
-*Defined at line 324*
+*Defined at line 289*
 
 ---
 
@@ -546,7 +546,7 @@ pub const SHADER_UNLIT_FRAG: str = "#version 330 core\nuniform vec3 color;\nout 
 pub const SHADER_DIFFUSE_VERT: str = "#version 330 core\nlayout(location = 0) in vec3 aPos;\nlayout(location = 1) in vec3 aNormal;\nuniform mat4 model;\nuniform mat4 view;\nuniform mat4 projection;\nout vec3 Normal;\nout vec3 FragPos;\nvoid main() {\n    FragPos = vec3(model * vec4(aPos, 1.0));\n    Normal = mat3(transpose(inverse(model))) * aNormal;\n    gl_Position = projection * view * vec4(FragPos, 1.0);\n}\n";
 ```
 
-*Defined at line 326*
+*Defined at line 290*
 
 ---
 
@@ -556,7 +556,7 @@ pub const SHADER_DIFFUSE_VERT: str = "#version 330 core\nlayout(location = 0) in
 pub const SHADER_DIFFUSE_FRAG: str = "#version 330 core\nin vec3 Normal;\nin vec3 FragPos;\nuniform vec3 lightPos;\nuniform vec3 lightColor;\nuniform vec3 objectColor;\nout vec4 FragColor;\nvoid main() {\n    vec3 ambient = 0.1 * lightColor;\n    vec3 norm = normalize(Normal);\n    vec3 lightDir = normalize(lightPos - FragPos);\n    float diff = max(dot(norm, lightDir), 0.0);\n    vec3 diffuse = diff * lightColor;\n    vec3 result = (ambient + diffuse) * objectColor;\n    FragColor = vec4(result, 1.0);\n}\n";
 ```
 
-*Defined at line 328*
+*Defined at line 291*
 
 ---
 
@@ -566,7 +566,7 @@ pub const SHADER_DIFFUSE_FRAG: str = "#version 330 core\nin vec3 Normal;\nin vec
 pub const SHADER_TEXT_VERT: str = "#version 330 core\nlayout(location = 0) in vec2 aPos;\nlayout(location = 1) in vec2 aTexCoord;\nout vec2 TexCoord;\nuniform mat4 projection;\nvoid main() {\n    gl_Position = projection * vec4(aPos, 0.0, 1.0);\n    TexCoord = aTexCoord;\n}\n";
 ```
 
-*Defined at line 330*
+*Defined at line 292*
 
 ---
 
@@ -576,7 +576,7 @@ pub const SHADER_TEXT_VERT: str = "#version 330 core\nlayout(location = 0) in ve
 pub const SHADER_TEXT_FRAG: str = "#version 330 core\nin vec2 TexCoord;\nout vec4 FragColor;\nuniform sampler2D text;\nuniform vec3 textColor;\nvoid main() {\n    vec4 sampled = vec4(1.0, 1.0, 1.0, texture(text, TexCoord).r);\n    FragColor = vec4(textColor, 1.0) * sampled;\n}\n";
 ```
 
-*Defined at line 332*
+*Defined at line 293*
 
 ---
 
@@ -586,7 +586,7 @@ pub const SHADER_TEXT_FRAG: str = "#version 330 core\nin vec2 TexCoord;\nout vec
 pub const SHADER_POST_VERT: str = "#version 330 core\nlayout(location = 0) in vec2 aPos;\nlayout(location = 1) in vec2 aTexCoord;\nout vec2 TexCoord;\nvoid main() {\n    gl_Position = vec4(aPos, 0.0, 1.0);\n    TexCoord = aTexCoord;\n}\n";
 ```
 
-*Defined at line 334*
+*Defined at line 294*
 
 ---
 
@@ -596,7 +596,7 @@ pub const SHADER_POST_VERT: str = "#version 330 core\nlayout(location = 0) in ve
 pub const SHADER_POST_FRAG: str = "#version 330 core\nin vec2 TexCoord;\nout vec4 FragColor;\nuniform sampler2D screenTexture;\nvoid main() {\n    FragColor = texture(screenTexture, TexCoord);\n}\n";
 ```
 
-*Defined at line 336*
+*Defined at line 295*
 
 ---
 
@@ -613,7 +613,7 @@ pub struct MaterialCache {
 | `materials` | `Vec<Material>` |
 | `names` | `Vec<str>` |
 
-*Defined at line 340*
+*Defined at line 298*
 
 ---
 
@@ -627,7 +627,7 @@ pub fn material_cache_create() -> MaterialCache {
 
 **Returns:** `MaterialCache`
 
-*Defined at line 346*
+*Defined at line 304*
 
 ---
 
@@ -646,7 +646,7 @@ pub fn material_cache_get(cache: &mut MaterialCache, shader_name: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 356*
+*Defined at line 313*
 
 ---
 
@@ -665,7 +665,7 @@ pub fn material_cache_get_idx(cache: &MaterialCache, idx: i64) -> Material {
 
 **Returns:** `Material`
 
-*Defined at line 371*
+*Defined at line 328*
 
 ---
 
@@ -683,7 +683,7 @@ pub fn material_cache_clear(cache: &mut MaterialCache) -> void {
 
 **Returns:** `void`
 
-*Defined at line 376*
+*Defined at line 333*
 
 ---
 
@@ -701,7 +701,7 @@ pub fn material_cache_count(cache: &MaterialCache) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 382*
+*Defined at line 339*
 
 ---
 

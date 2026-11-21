@@ -5,7 +5,12 @@
 > read plus live probes (`s18.exe run`).
 
 - **Path:** `compiler/secrecy.fd`
-- **LOC:** 953 (Rust `src/secrecy.rs`: 774)
+- **LOC:** 1,349 (2026-11-21; 953 on Nov 9; Rust `src/secrecy.rs`: 774). Nov 21: the two leaks
+  in the PROGRESS row are fixed (known-bugs 2g.10, Nov 15): a guard on a secret taints its arm and
+  the later ones, and `p_file_write_vec`, `write_file`, `p_write*`, `p_fs_write*` and socket/net
+  writes are sinks (test_secret_guard_fail, test_secret_file_vec_fail). New open (2g.71): a native
+  `emit` of a program with `use crypto` fails the @secret check inside `crypto_hmac_sha256`,
+  reported against the user's file. Line numbers below are from Nov 9.
 - **Role:** A secret never reaches an output. Sources: `@secret` parameters and locals, results of `@secret` functions. Sinks: output and logging calls, network and file writes, globals, writes through reference parameters, `spawn`, calls through function values. `@sensitive` is the same check one notch down, released by `privacy::release` or `@declassify`.
 - **Imports:** `core`, `vec`, `string`, `compiler::ast`, `compiler::parser` (`parser_saw_secret`), `compiler::escape` (`esc_idents_stmts`).
 

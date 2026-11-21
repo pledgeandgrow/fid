@@ -27,7 +27,7 @@ pub fn add(a: Vec<f64>, b: Vec<f64>) -> Vec<f64> {
 
 **Returns:** `Vec<f64>`
 
-*Defined at line 17*
+*Defined at line 45*
 
 ---
 
@@ -46,7 +46,7 @@ pub fn sub(a: Vec<f64>, b: Vec<f64>) -> Vec<f64> {
 
 **Returns:** `Vec<f64>`
 
-*Defined at line 22*
+*Defined at line 50*
 
 ---
 
@@ -65,7 +65,7 @@ pub fn mul(a: Vec<f64>, b: Vec<f64>) -> Vec<f64> {
 
 **Returns:** `Vec<f64>`
 
-*Defined at line 27*
+*Defined at line 55*
 
 ---
 
@@ -84,7 +84,7 @@ pub fn div(a: Vec<f64>, b: Vec<f64>) -> Vec<f64> {
 
 **Returns:** `Vec<f64>`
 
-*Defined at line 32*
+*Defined at line 60*
 
 ---
 
@@ -103,7 +103,7 @@ pub fn dot(a: Vec<f64>, b: Vec<f64>) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 37*
+*Defined at line 65*
 
 ---
 
@@ -121,7 +121,7 @@ pub fn sum(a: Vec<f64>) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 42*
+*Defined at line 70*
 
 ---
 
@@ -140,7 +140,7 @@ pub fn scale(a: Vec<f64>, s: f64) -> Vec<f64> {
 
 **Returns:** `Vec<f64>`
 
-*Defined at line 47*
+*Defined at line 75*
 
 ---
 
@@ -158,7 +158,7 @@ pub fn from_vec(a: Vec<f64>) -> Vec<f64> {
 
 **Returns:** `Vec<f64>`
 
-*Defined at line 52*
+*Defined at line 80*
 
 ---
 
@@ -176,7 +176,7 @@ pub fn to_str(a: Vec<f64>) -> str {
 
 **Returns:** `str`
 
-*Defined at line 57*
+*Defined at line 85*
 
 ---
 

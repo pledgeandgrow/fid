@@ -90,7 +90,7 @@ fn main() -> i64 {
 
 ```
 $ fid check send_fail.fd
-error: Thread safety error (line 9): argument 1 of the spawned call has type &mut Vec<i64>, which is not @send.
+error[E078]: Thread safety error (line 9): argument 1 of the spawned call has type &mut Vec<i64>, which is not @send.
     Fix: pass a value (numbers, strings, structs of such values) or mark the struct @send.
 ...
 ```
@@ -129,8 +129,8 @@ reviewer. The race check accepts a function that calls *any* function
 named like a lock, without checking that the lock is held around the
 write; memory shared through `p_shared_alloc`, raw pointers or C is not
 checked; `@sync` is recorded and not enforced. Tasks (`task_go`, `async`)
-are scheduled M:N in compiled programs and run to completion under `fid
-run`, so their interleaving, and any output that depends on it, can
+are scheduled M:N in compiled programs and switch only where they wait
+under `fid run` (docs/interp-tasks.md), so their interleaving, and any output that depends on it, can
 differ between the two (reference §10.7 says what is ordered). These are
 the open edges of the design, and good material for a project.
 

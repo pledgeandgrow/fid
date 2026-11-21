@@ -41,7 +41,7 @@ pub struct SQLString {
 |------|------|
 | `value` | `str` |
 
-*Defined at line 38*
+*Defined at line 37*
 
 ---
 
@@ -51,7 +51,7 @@ pub struct SQLString {
 impl SQLString {
 ```
 
-*Defined at line 42*
+*Defined at line 37*
 
 ---
 
@@ -70,7 +70,7 @@ pub fn sql_query(sql: str) -> SQLString {
 
 **Returns:** `SQLString`
 
-*Defined at line 73*
+*Defined at line 94*
 
 ---
 
@@ -88,7 +88,7 @@ pub fn sql_literal(sql: str) -> SQLString {
 
 **Returns:** `SQLString`
 
-*Defined at line 78*
+*Defined at line 101*
 
 ---
 
@@ -108,7 +108,7 @@ pub fn sql_escape(input: str) -> SQLString {
 
 **Returns:** `SQLString`
 
-*Defined at line 85*
+*Defined at line 110*
 
 ---
 
@@ -129,7 +129,7 @@ pub fn sql_bind(query: SQLString, param: str) -> SQLString {
 
 **Returns:** `SQLString`
 
-*Defined at line 93*
+*Defined at line 143*
 
 ---
 
@@ -148,7 +148,7 @@ pub fn sql_bind_int(query: SQLString, param: i64) -> SQLString {
 
 **Returns:** `SQLString`
 
-*Defined at line 100*
+*Defined at line 163*
 
 ---
 
@@ -167,7 +167,7 @@ pub struct ShellString {
 |------|------|
 | `value` | `str` |
 
-*Defined at line 109*
+*Defined at line 180*
 
 ---
 
@@ -177,7 +177,7 @@ pub struct ShellString {
 impl ShellString {
 ```
 
-*Defined at line 113*
+*Defined at line 180*
 
 ---
 
@@ -195,7 +195,7 @@ pub fn shell_cmd(cmd: str) -> ShellString {
 
 **Returns:** `ShellString`
 
-*Defined at line 142*
+*Defined at line 235*
 
 ---
 
@@ -214,7 +214,7 @@ pub fn shell_escape(input: str) -> ShellString {
 
 **Returns:** `ShellString`
 
-*Defined at line 148*
+*Defined at line 243*
 
 ---
 
@@ -233,7 +233,7 @@ pub struct HTMLString {
 |------|------|
 | `value` | `str` |
 
-*Defined at line 159*
+*Defined at line 256*
 
 ---
 
@@ -243,7 +243,7 @@ pub struct HTMLString {
 impl HTMLString {
 ```
 
-*Defined at line 163*
+*Defined at line 256*
 
 ---
 
@@ -261,7 +261,7 @@ pub fn html_literal(html: str) -> HTMLString {
 
 **Returns:** `HTMLString`
 
-*Defined at line 176*
+*Defined at line 275*
 
 ---
 
@@ -280,7 +280,7 @@ pub fn html_escape(input: str) -> HTMLString {
 
 **Returns:** `HTMLString`
 
-*Defined at line 182*
+*Defined at line 283*
 
 ---
 
@@ -298,7 +298,7 @@ pub fn html_attr_escape(input: str) -> HTMLString {
 
 **Returns:** `HTMLString`
 
-*Defined at line 193*
+*Defined at line 296*
 
 ---
 
@@ -317,7 +317,7 @@ pub struct JSONString {
 |------|------|
 | `value` | `str` |
 
-*Defined at line 205*
+*Defined at line 310*
 
 ---
 
@@ -327,7 +327,7 @@ pub struct JSONString {
 impl JSONString {
 ```
 
-*Defined at line 209*
+*Defined at line 310*
 
 ---
 
@@ -346,7 +346,7 @@ pub fn json_escape(input: str) -> JSONString {
 
 **Returns:** `JSONString`
 
-*Defined at line 218*
+*Defined at line 323*
 
 ---
 
@@ -365,7 +365,7 @@ pub struct PathString {
 |------|------|
 | `value` | `str` |
 
-*Defined at line 231*
+*Defined at line 338*
 
 ---
 
@@ -375,7 +375,7 @@ pub struct PathString {
 impl PathString {
 ```
 
-*Defined at line 235*
+*Defined at line 338*
 
 ---
 
@@ -394,7 +394,7 @@ pub fn path_safe(input: str) -> PathString {
 
 **Returns:** `PathString`
 
-*Defined at line 251*
+*Defined at line 360*
 
 ---
 
@@ -412,7 +412,7 @@ pub fn path_literal(path: str) -> PathString {
 
 **Returns:** `PathString`
 
-*Defined at line 259*
+*Defined at line 372*
 
 ---
 

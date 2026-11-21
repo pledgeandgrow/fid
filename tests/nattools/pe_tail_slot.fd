@@ -1,0 +1,73 @@
+// OP13 (known-bugs 2g.98), pe_ir (the default Windows `fid emit`): a tail
+// call the IR optimizer's inliner turned into a store to the inlined
+// callee's result slot, a jump, then `load; return` (is_even inlined into
+// is_odd: is_odd's `return is_odd(n - 2)`). pe_ir took only a call whose
+// result the next instruction returns for a tail call, so these were
+// calls again and scripts/pe-win/tail_deep.fd overflowed the stack. A
+// hundred million levels of mutual recursion (bool and i64 results, a
+// three-way cycle) need the jumps (as calls: more than pe_ir's 4 GB
+// stack). Checked by tests/nattools/pe_tail_slot_check.sh.
+// Expected output:
+// true
+// false
+// 50000003
+// 2
+// 1
+
+fn is_even(n: i64) -> bool {
+    if n == 0 {
+        return true;
+    }
+    return is_odd(n - 1);
+}
+
+fn is_odd(n: i64) -> bool {
+    if n == 0 {
+        return false;
+    }
+    return is_even(n - 1);
+}
+
+fn up(n: i64, acc: i64) -> i64 {
+    if n == 0 {
+        return acc;
+    }
+    return down(n - 1, acc + 2);
+}
+
+fn down(n: i64, acc: i64) -> i64 {
+    if n == 0 {
+        return acc + 3;
+    }
+    return up(n - 1, acc - 1);
+}
+
+fn r0(n: i64) -> i64 {
+    if n == 0 {
+        return 0;
+    }
+    return r1(n - 1);
+}
+
+fn r1(n: i64) -> i64 {
+    if n == 0 {
+        return 1;
+    }
+    return r2(n - 1);
+}
+
+fn r2(n: i64) -> i64 {
+    if n == 0 {
+        return 2;
+    }
+    return r0(n - 1);
+}
+
+fn main() -> i64 {
+    println(is_even(100000000));
+    println(is_odd(100000000));
+    println(up(100000000, 3));
+    println(r0(100000001));
+    println(r1(99999999));
+    return 0;
+}

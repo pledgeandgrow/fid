@@ -40,7 +40,7 @@ pub struct TestRunner {
 | `failed` | `i64` |
 | `current_test` | `str` |
 
-*Defined at line 19*
+*Defined at line 16*
 
 ---
 
@@ -54,7 +54,7 @@ pub fn test_runner_new() -> TestRunner {
 
 **Returns:** `TestRunner`
 
-*Defined at line 26*
+*Defined at line 35*
 
 ---
 
@@ -63,17 +63,17 @@ pub fn test_runner_new() -> TestRunner {
 Begin a named test.
 
 ```fides
-pub fn test_begin(runner: TestRunner, name: str) -> void {
+pub fn test_begin(runner: &mut TestRunner, name: str) -> void {
 ```
 
 **Parameters:**
 
-- `runner`: `TestRunner`
+- `runner`: `&mut TestRunner`
 - `name`: `str`
 
 **Returns:** `void`
 
-*Defined at line 31*
+*Defined at line 42*
 
 ---
 
@@ -82,16 +82,16 @@ pub fn test_begin(runner: TestRunner, name: str) -> void {
 End the current test (mark as passed).
 
 ```fides
-pub fn test_pass(runner: TestRunner) -> void {
+pub fn test_pass(runner: &mut TestRunner) -> void {
 ```
 
 **Parameters:**
 
-- `runner`: `TestRunner`
+- `runner`: `&mut TestRunner`
 
 **Returns:** `void`
 
-*Defined at line 38*
+*Defined at line 49*
 
 ---
 
@@ -100,17 +100,17 @@ pub fn test_pass(runner: TestRunner) -> void {
 Mark the current test as failed.
 
 ```fides
-pub fn test_fail(runner: TestRunner, msg: str) -> void {
+pub fn test_fail(runner: &mut TestRunner, msg: str) -> void {
 ```
 
 **Parameters:**
 
-- `runner`: `TestRunner`
+- `runner`: `&mut TestRunner`
 - `msg`: `str`
 
 **Returns:** `void`
 
-*Defined at line 43*
+*Defined at line 54*
 
 ---
 
@@ -128,7 +128,7 @@ pub fn test_summary(runner: TestRunner) -> void {
 
 **Returns:** `void`
 
-*Defined at line 50*
+*Defined at line 61*
 
 ---
 
@@ -146,7 +146,7 @@ pub fn test_all_passed(runner: TestRunner) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 68*
+*Defined at line 79*
 
 ---
 
@@ -166,7 +166,7 @@ pub fn test_assert_eq(a: i64, b: i64, msg: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 75*
+*Defined at line 86*
 
 ---
 
@@ -186,7 +186,7 @@ pub fn test_assert_ne(a: i64, b: i64, msg: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 89*
+*Defined at line 100*
 
 ---
 
@@ -205,7 +205,7 @@ pub fn test_assert_true(cond: bool, msg: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 101*
+*Defined at line 112*
 
 ---
 
@@ -224,7 +224,7 @@ pub fn test_assert_false(cond: bool, msg: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 111*
+*Defined at line 122*
 
 ---
 
@@ -245,7 +245,7 @@ pub fn test_assert_approx_eq(a: f64, b: f64, epsilon: f64, msg: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 122*
+*Defined at line 133*
 
 ---
 
@@ -265,7 +265,7 @@ pub fn test_assert_gt(a: i64, b: i64, msg: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 139*
+*Defined at line 152*
 
 ---
 
@@ -285,7 +285,7 @@ pub fn test_assert_lt(a: i64, b: i64, msg: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 153*
+*Defined at line 166*
 
 ---
 
@@ -306,7 +306,7 @@ pub fn test_assert_in_range(value: i64, lo: i64, hi: i64, msg: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 167*
+*Defined at line 180*
 
 ---
 
@@ -326,7 +326,7 @@ pub fn test_assert_str_eq(a: str, b: str, msg: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 184*
+*Defined at line 197*
 
 ---
 
@@ -335,17 +335,17 @@ pub fn test_assert_str_eq(a: str, b: str, msg: str) -> bool {
 Assert a Vec is empty.
 
 ```fides
-pub fn test_assert_empty(v: Vec, msg: str) -> bool {
+pub fn test_assert_empty(v: Vec<i64>, msg: str) -> bool {
 ```
 
 **Parameters:**
 
-- `v`: `Vec`
+- `v`: `Vec<i64>`
 - `msg`: `str`
 
 **Returns:** `bool`
 
-*Defined at line 199*
+*Defined at line 212*
 
 ---
 
@@ -354,18 +354,18 @@ pub fn test_assert_empty(v: Vec, msg: str) -> bool {
 Assert a Vec has a specific length.
 
 ```fides
-pub fn test_assert_len(v: Vec, expected: i64, msg: str) -> bool {
+pub fn test_assert_len(v: Vec<i64>, expected: i64, msg: str) -> bool {
 ```
 
 **Parameters:**
 
-- `v`: `Vec`
+- `v`: `Vec<i64>`
 - `expected`: `i64`
 - `msg`: `str`
 
 **Returns:** `bool`
 
-*Defined at line 211*
+*Defined at line 224*
 
 ---
 
@@ -374,18 +374,18 @@ pub fn test_assert_len(v: Vec, expected: i64, msg: str) -> bool {
 Assert a Vec contains a value.
 
 ```fides
-pub fn test_assert_contains(v: Vec, value: i64, msg: str) -> bool {
+pub fn test_assert_contains(v: Vec<i64>, value: i64, msg: str) -> bool {
 ```
 
 **Parameters:**
 
-- `v`: `Vec`
+- `v`: `Vec<i64>`
 - `value`: `i64`
 - `msg`: `str`
 
 **Returns:** `bool`
 
-*Defined at line 225*
+*Defined at line 238*
 
 ---
 
@@ -404,7 +404,7 @@ pub fn test_assert_or_abort(cond: bool, msg: str) -> void {
 
 **Returns:** `void`
 
-*Defined at line 239*
+*Defined at line 252*
 
 ---
 
@@ -424,7 +424,7 @@ pub fn test_assert_eq_or_abort(a: i64, b: i64, msg: str) -> void {
 
 **Returns:** `void`
 
-*Defined at line 248*
+*Defined at line 261*
 
 ---
 

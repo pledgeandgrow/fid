@@ -68,7 +68,10 @@ must be careful with.
 A reference may be passed to a call, held in a local, and returned when it
 comes from a reference parameter. It may **not** be stored: not in a
 struct field, an enum, a `Vec`, a `Box`, a global, a closure that escapes,
-or another task. Nor may it outlive the block of what it points to.
+or another task. Nor may it outlive the block of what it points to. The
+one exception is a struct with a lifetime parameter,
+`struct View<'a> { r: &'a i64 }`: it may hold a reference in a field, and
+a value of it is then held like a reference (reference §8.4).
 
 What is allowed covers most uses of references:
 
@@ -208,13 +211,14 @@ things at once:
 
 - no reference can dangle, and the check is local to one function plus
   the signatures it calls;
-- no struct needs lifetime parameters, so most programs never write a
-  lifetime;
+- only a struct that holds a reference needs a lifetime parameter, so
+  most programs never write a lifetime;
 - the heap graph has no reference edges, so it cannot have cycles through
   references, and reference counting (week 5) frees everything.
 
-The cost is expressiveness: no iterator struct over a borrowed `Vec`, no
-parser holding a `&str` of its input, no graph of `&Node`. The idioms
+The cost is expressiveness: an iterator or parser struct over borrowed
+data (`struct View<'a>`) lives only in locals and calls, never in a `Vec`
+or on the heap, and there is no graph of `&Node`. The idioms
 that replace them (book chapter 4, "What to do instead"): store an index
 or key, keep an owned copy, or pass the reference down the call tree.
 

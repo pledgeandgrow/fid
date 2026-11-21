@@ -3,7 +3,32 @@
 > **New doc 2026-11-09.** Every pass here is opt-in and, per the roadmap, none has been run on
 > the suite yet. Read at 2,342 lines.
 
-- **Path:** `compiler/iropt_me.fd` — **2,342 LOC**
+> **Nov 21: no longer all opt-in.** `ime_on(name)` is true for the passes
+> of `IME_DEFAULT_ON` unless `FID_IROPT_OFF` names them: loops, sra,
+> loadhoist, forward, matchfacts, inline2, inlineclo, lendref, unroll,
+> linear, placefwd, vecalias, version, ssa, ssaexit (ME22/ME26 on Nov 16,
+> unroll and version on Nov 17); the others still need `FID_IROPT_ON`. The
+> module imports `checks`, `ssa` (the SSA round trip, ssa.md), `tv` and
+> `pgo` too. New open: partial unrolling miscompiles a loop with a dead
+> store on pe_ir (known-bugs 2g.80), translation validation rejects inline2
+> on `Str_drop` (2g.90), the `ime_sra` miscompile crashes a `--nat` build
+> of the front end (2g.94). 6,560 lines now. The text below is of Nov 9.
+>
+> **Nov 21, uncommitted:** 6,608 lines. 2g.109's mid-end half is fixed
+> here: `ime_remap` renames the operands of `PersistLoad`, `PersistSave`
+> and `Backward` (a forward-renamed load's `backward` read a value defined
+> nowhere), and `ime_unrenamed_uses` (:352) marks every value an
+> instruction remap cannot rename reads (a TryUnwrap, an asm! input) so
+> `ime_forward` leaves it itself. A counted-loop `step` of `i64::MIN` is
+> rejected in `ime_reduce_one` (`-i64::MIN` does not exist; the 2g.89
+> family). 2g.80 and 2g.94 turned out to live elsewhere and are fixed
+> there: the dead-store miscompile was pe_ir's global register allocator
+> starting a later-laid-out block's value on a live register (pe_ir.md),
+> and the sra crash was `ng_rf_promote` writing its zero-words before the
+> argument moves of the prologue (nat_ir.md `ng_rf_zero_at`). Still open:
+> inline2 on `Str_drop` (2g.90).
+
+- **Path:** `compiler/iropt_me.fd` — **2,342 LOC** on Nov 9 (6,608 on Nov 21)
 - **Role:** the mid-end passes that change the CFG or memory shape, called by `iropt_native`
   (iropt.fd), plus an alias query built from language rules (LF1-LF4).
 

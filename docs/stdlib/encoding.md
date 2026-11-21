@@ -38,16 +38,16 @@ buffer). This is the right way to turn decoded bytes into a string;
 `str_from_bytes` re-encodes each element as a codepoint instead.
 
 ```fides
-pub fn enc_bytes_to_str(bytes: Vec) -> str {
+pub fn enc_bytes_to_str(bytes: Vec<i64>) -> str {
 ```
 
 **Parameters:**
 
-- `bytes`: `Vec`
+- `bytes`: `Vec<i64>`
 
 **Returns:** `str`
 
-*Defined at line 36*
+*Defined at line 42*
 
 ---
 
@@ -56,16 +56,16 @@ pub fn enc_bytes_to_str(bytes: Vec) -> str {
 A `str` -> its raw bytes (same as str_bytes, kept for API symmetry).
 
 ```fides
-pub fn enc_str_to_bytes(s: str) -> Vec {
+pub fn enc_str_to_bytes(s: str) -> Vec<i64> {
 ```
 
 **Parameters:**
 
 - `s`: `str`
 
-**Returns:** `Vec`
+**Returns:** `Vec<i64>`
 
-*Defined at line 51*
+*Defined at line 68*
 
 ---
 
@@ -74,16 +74,16 @@ pub fn enc_str_to_bytes(s: str) -> Vec {
 Encode a byte Vec to base64 text (RFC 4648 with '=' padding).
 
 ```fides
-pub fn b64_encode_bytes(bytes: Vec) -> str {
+pub fn b64_encode_bytes(bytes: Vec<i64>) -> str {
 ```
 
 **Parameters:**
 
-- `bytes`: `Vec`
+- `bytes`: `Vec<i64>`
 
 **Returns:** `str`
 
-*Defined at line 62*
+*Defined at line 84*
 
 ---
 
@@ -101,7 +101,7 @@ pub fn b64_encode(s: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 94*
+*Defined at line 121*
 
 ---
 
@@ -112,16 +112,16 @@ Whitespace is skipped; '=' ends the stream. Invalid characters make the
 decode stop at the first bad group (lenient, like most libraries).
 
 ```fides
-pub fn b64_decode_bytes(s: str) -> Vec {
+pub fn b64_decode_bytes(s: str) -> Vec<i64> {
 ```
 
 **Parameters:**
 
 - `s`: `str`
 
-**Returns:** `Vec`
+**Returns:** `Vec<i64>`
 
-*Defined at line 115*
+*Defined at line 162*
 
 ---
 
@@ -141,7 +141,7 @@ pub fn b64_decode(s: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 165*
+*Defined at line 215*
 
 ---
 
@@ -160,7 +160,7 @@ pub fn b64_valid(s: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 171*
+*Defined at line 225*
 
 ---
 
@@ -169,16 +169,16 @@ pub fn b64_valid(s: str) -> bool {
 Encode a byte Vec to lowercase hex text ("0a3f...").
 
 ```fides
-pub fn hex_encode_bytes(bytes: Vec) -> str {
+pub fn hex_encode_bytes(bytes: Vec<i64>) -> str {
 ```
 
 **Parameters:**
 
-- `bytes`: `Vec`
+- `bytes`: `Vec<i64>`
 
 **Returns:** `str`
 
-*Defined at line 205*
+*Defined at line 265*
 
 ---
 
@@ -187,16 +187,16 @@ pub fn hex_encode_bytes(bytes: Vec) -> str {
 Encode a byte Vec to uppercase hex text ("0A3F...").
 
 ```fides
-pub fn hex_encode_bytes_upper(bytes: Vec) -> str {
+pub fn hex_encode_bytes_upper(bytes: Vec<i64>) -> str {
 ```
 
 **Parameters:**
 
-- `bytes`: `Vec`
+- `bytes`: `Vec<i64>`
 
 **Returns:** `str`
 
-*Defined at line 219*
+*Defined at line 286*
 
 ---
 
@@ -214,7 +214,7 @@ pub fn hex_encode(s: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 233*
+*Defined at line 305*
 
 ---
 
@@ -232,7 +232,7 @@ pub fn hex_encode_upper(s: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 238*
+*Defined at line 313*
 
 ---
 
@@ -242,16 +242,16 @@ Decode hex text to a byte Vec. Whitespace is skipped. Stops at the
 first invalid character (or an odd trailing half-byte).
 
 ```fides
-pub fn hex_decode_bytes(s: str) -> Vec {
+pub fn hex_decode_bytes(s: str) -> Vec<i64> {
 ```
 
 **Parameters:**
 
 - `s`: `str`
 
-**Returns:** `Vec`
+**Returns:** `Vec<i64>`
 
-*Defined at line 252*
+*Defined at line 341*
 
 ---
 
@@ -269,7 +269,7 @@ pub fn hex_decode(s: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 277*
+*Defined at line 371*
 
 ---
 
@@ -288,7 +288,7 @@ pub fn hex_valid(s: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 283*
+*Defined at line 382*
 
 ---
 
@@ -298,16 +298,16 @@ Percent-encode a byte Vec: unreserved bytes pass through, everything
 else becomes %XX (uppercase hex).
 
 ```fides
-pub fn url_encode_bytes(bytes: Vec) -> str {
+pub fn url_encode_bytes(bytes: Vec<i64>) -> str {
 ```
 
 **Parameters:**
 
-- `bytes`: `Vec`
+- `bytes`: `Vec<i64>`
 
 **Returns:** `str`
 
-*Defined at line 314*
+*Defined at line 428*
 
 ---
 
@@ -326,7 +326,7 @@ pub fn url_encode(s: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 334*
+*Defined at line 455*
 
 ---
 
@@ -344,7 +344,7 @@ pub fn url_encode_component(s: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 339*
+*Defined at line 463*
 
 ---
 
@@ -363,7 +363,7 @@ pub fn url_encode_form(s: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 345*
+*Defined at line 472*
 
 ---
 
@@ -373,16 +373,16 @@ Decode percent-encoded text to a byte Vec.
 "%XX" -> byte XX, "+" stays "+", a malformed '%' is passed through.
 
 ```fides
-pub fn url_decode_bytes(s: str) -> Vec {
+pub fn url_decode_bytes(s: str) -> Vec<i64> {
 ```
 
 **Parameters:**
 
 - `s`: `str`
 
-**Returns:** `Vec`
+**Returns:** `Vec<i64>`
 
-*Defined at line 368*
+*Defined at line 503*
 
 ---
 
@@ -401,7 +401,7 @@ pub fn url_decode(s: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 399*
+*Defined at line 538*
 
 ---
 
@@ -419,7 +419,7 @@ pub fn url_decode_form(s: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 404*
+*Defined at line 546*
 
 ---
 
@@ -429,16 +429,16 @@ Check that a byte Vec is valid UTF-8 (no overlongs, no surrogates,
 no out-of-range codepoints, truncated sequences rejected).
 
 ```fides
-pub fn utf8_valid_bytes(bytes: Vec) -> bool {
+pub fn utf8_valid_bytes(bytes: Vec<i64>) -> bool {
 ```
 
 **Parameters:**
 
-- `bytes`: `Vec`
+- `bytes`: `Vec<i64>`
 
 **Returns:** `bool`
 
-*Defined at line 427*
+*Defined at line 586*
 
 ---
 
@@ -456,7 +456,7 @@ pub fn utf8_valid(s: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 462*
+*Defined at line 649*
 
 ---
 
@@ -466,16 +466,16 @@ Decode a string to a Vec of Unicode codepoints (i64).
 Invalid sequences decode as U+FFFD (65533) and consume one byte.
 
 ```fides
-pub fn utf8_decode(s: str) -> Vec {
+pub fn utf8_decode(s: str) -> Vec<i64> {
 ```
 
 **Parameters:**
 
 - `s`: `str`
 
-**Returns:** `Vec`
+**Returns:** `Vec<i64>`
 
-*Defined at line 468*
+*Defined at line 661*
 
 ---
 
@@ -494,7 +494,7 @@ pub fn utf8_len(s: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 519*
+*Defined at line 718*
 
 ---
 
@@ -513,7 +513,7 @@ pub fn utf8_encode(cp: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 540*
+*Defined at line 745*
 
 ---
 
@@ -523,16 +523,16 @@ Raw UTF-8 bytes of one codepoint as a Vec<i64> (for byte pipelines).
 Codepoints above U+10FFFF and surrogates encode as U+FFFD.
 
 ```fides
-pub fn utf8_encode_bytes(cp: i64) -> Vec {
+pub fn utf8_encode_bytes(cp: i64) -> Vec<i64> {
 ```
 
 **Parameters:**
 
 - `cp`: `i64`
 
-**Returns:** `Vec`
+**Returns:** `Vec<i64>`
 
-*Defined at line 553*
+*Defined at line 764*
 
 ---
 
@@ -541,16 +541,16 @@ pub fn utf8_encode_bytes(cp: i64) -> Vec {
 Encode a Vec of codepoints as a UTF-8 string.
 
 ```fides
-pub fn utf8_encode_all(cps: Vec) -> str {
+pub fn utf8_encode_all(cps: Vec<i64>) -> str {
 ```
 
 **Parameters:**
 
-- `cps`: `Vec`
+- `cps`: `Vec<i64>`
 
 **Returns:** `str`
 
-*Defined at line 578*
+*Defined at line 794*
 
 ---
 

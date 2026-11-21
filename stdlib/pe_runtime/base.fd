@@ -348,6 +348,41 @@ pub fn pert_print_float(val: f64) {
     p_print_str(pert_to_str_float(val));
 }
 
+/// p_to_str (int_to_str): v in decimal, a counted string (proposal 0004)
+/// as the C runtime's and the machine layer's (linux_runtime pert_to_str).
+/// RL16 (known-bugs 2g.81): the machine stub p_to_str made a plain
+/// p_malloc buffer, which no drop frees (Str_drop leaves a string without
+/// a count alone): every int_to_str leaked, as `--leaks` showed. Digits
+/// are taken on the negative side, where i64::MIN has its value.
+pub fn pert_to_str(v: i64) -> str {
+    var x: i64 = v;
+    if x > 0 {
+        x = 0 - x;
+    }
+    var n: i64 = 1;
+    var t: i64 = x;
+    while t <= 0 - 10 {
+        t = t / 10;
+        n = n + 1;
+    }
+    var at: i64 = 0;
+    if v < 0 {
+        at = 1;
+    }
+    var buf: i64 = p_str_buf(n + at);
+    if at == 1 {
+        pe_set_byte(buf, 0, 45);
+    }
+    var i: i64 = n - 1;
+    while i >= 0 {
+        pe_set_byte(buf, at + i, 48 - (x % 10));
+        x = x / 10;
+        i = i - 1;
+    }
+    // (counted already: p_str_adopt hands it over as it is)
+    return p_str_adopt(buf);
+}
+
 /// A NUL-terminated buffer as a str.
 fn pe_buf_str(buf: i64) -> str {
     return buf;
@@ -2726,8 +2761,15 @@ extern "C" {
 }
 
 const PE_LK_PREFIX: i64 = 48;
-const PE_LK_LIVE: i64 = 0xF1DE5D00000000A5;
-const PE_LK_DEAD: i64 = 0xF1DE5E00000000A5;
+// The allocator's magic (live / freed) with class 0xA5, which no block of
+// the allocator has (its classes are below 64): core's p_str_adopt frees a
+// plain buffer whose header has the live magic (P_BLOCK_MAGIC_CORE), so a
+// tracked block must carry it too, or every runtime string adopted (the
+// p_to_str of int_to_str) was reported as a leak (known-bugs 2g.81); a
+// tracked block freed twice reaches the allocator with the freed magic:
+// "double free".
+const PE_LK_LIVE: i64 = 0xF1DE5A00000000A5;
+const PE_LK_DEAD: i64 = 0xF1DE5B00000000A5;
 
 var pe_lk_page: i64 = 0;   // [0] lock [8, 16) cached readable region [64, 112) MBI [128] count cell [160, 192) digits
 var pe_lk_on: i64 = 0;     // 1 once an allocation came through here
@@ -2862,6 +2904,13 @@ fn pe_lk_walk(fp0: i64) {
         // past the program's code: system code (a thread's start), stop
         if !pe_lk_in_code(ret - 1) { return; }
         var name: i64 = pe_lk_name_at(ret - 1);
+        // the entry point's own blocks (made before main runs, kept to
+        // the end: the start block of nat_start_sp, its p_argv strings)
+        // are the runtime's
+        if name != 0 && pe_lk_name_is(name, "__fid_entry" as i64) {
+            pe_lk_w_prog = 0;
+            return;
+        }
         if name != 0 && !pe_lk_is_entry(name) {
             var rt: bool = pe_lk_rt_name(name);
             if first {

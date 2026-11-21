@@ -96,3 +96,11 @@ each image runs as a fresh build of its source (output and exit code),
 that the unchanged functions keep their addresses
 (tests/nattools/relink_syms.py), that readelf decodes the line program,
 and that `FID_NAT_OFF=relink` lays the code out afresh.
+
+Nov 21 (roadmap SP7 check, fid built from a self-hosted stage 0): relinking
+in memory works when the layout is kept (AArch64, build 4: 241 functions in
+place, 1 compiled again), but `relink_check.sh` fails 10 checks: an edited
+program never reuses the kept layout ("a fresh layout (the last build was
+of another target, cache or program)"), 149 of 241 unchanged functions
+move, and on x86-64 and `--nat` the changed function goes after the
+others.

@@ -25,7 +25,7 @@ pub fn regex_matches(s: str, pattern: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 16*
+*Defined at line 32*
 
 ---
 
@@ -45,7 +45,7 @@ pub fn regex_find(s: str, sub: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 22*
+*Defined at line 1462*
 
 ---
 
@@ -64,7 +64,7 @@ pub fn regex_contains(s: str, sub: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 27*
+*Defined at line 1470*
 
 ---
 
@@ -83,7 +83,7 @@ pub fn regex_starts_with(s: str, prefix: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 32*
+*Defined at line 1478*
 
 ---
 
@@ -102,7 +102,7 @@ pub fn regex_ends_with(s: str, suffix: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 37*
+*Defined at line 1486*
 
 ---
 
@@ -120,7 +120,7 @@ pub fn regex_len(s: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 42*
+*Defined at line 1494*
 
 ---
 

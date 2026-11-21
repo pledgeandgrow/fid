@@ -4,7 +4,12 @@
 > Oct 23 findings still true; two new live bugs on Windows (CRLF module names, `::` file names).
 
 - **Path:** `compiler/scribe.fd`
-- **LOC:** 989 (Rust `src/scribe.rs`: 881)
+- **LOC:** 1,910 (2026-11-21; 989 on Nov 9; Rust `src/scribe.rs`: 881). Nov 21: the first
+  three findings below are fixed in the source (AD1, TL11): the module name ends at its `;`
+  and is trimmed (`extract_module_name`), a page's file name is the module name with `::` as
+  `_` (`scribe_page_name`), and the output directory and its parents are made first
+  (`scribe_mkdir_all`), with the page write checked. Not re-run. It imports `build_info` (the generator label). Line
+  numbers below are from Nov 9.
 - **Role:** documentation generator. Scans lines (not the AST) for `///` comments and
   `fn` / `struct` / `enum` / `impl` / `const` / `cap` declarations, renders HTML (sidebar, CSS) or
   Markdown, writes `<output>/<module>.<html|md>`.

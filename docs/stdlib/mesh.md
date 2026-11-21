@@ -28,9 +28,11 @@ pub struct Vertex {
 
 | Name | Type |
 |------|------|
-| `x` | `f64, pub y: f64, pub z: f64` |
+| `x` | `f64` |
+| `y` | `f64` |
+| `z` | `f64` |
 
-*Defined at line 25*
+*Defined at line 21*
 
 ---
 
@@ -44,9 +46,10 @@ pub struct TexCoord {
 
 | Name | Type |
 |------|------|
-| `u` | `f64, pub v: f64` |
+| `u` | `f64` |
+| `v` | `f64` |
 
-*Defined at line 29*
+*Defined at line 27*
 
 ---
 
@@ -60,11 +63,17 @@ pub struct Face {
 
 | Name | Type |
 |------|------|
-| `v0` | `i64, pub v1: i64, pub v2: i64,   // vertex indices (0-based)` |
-| `t0` | `i64, pub t1: i64, pub t2: i64,   // texcoord indices (-1 if none)` |
-| `n0` | `i64, pub n1: i64, pub n2: i64,   // normal indices (-1 if none)` |
+| `v0` | `i64` |
+| `v1` | `i64` |
+| `v2` | `i64` |
+| `t0` | `i64` |
+| `t1` | `i64` |
+| `t2` | `i64` |
+| `n0` | `i64` |
+| `n1` | `i64` |
+| `n2` | `i64` |
 
-*Defined at line 33*
+*Defined at line 32*
 
 ---
 
@@ -85,7 +94,7 @@ pub struct Mesh {
 | `valid` | `bool` |
 | `name` | `str` |
 
-*Defined at line 39*
+*Defined at line 46*
 
 ---
 
@@ -97,7 +106,7 @@ pub fn mesh_create() -> Mesh {
 
 **Returns:** `Mesh`
 
-*Defined at line 50*
+*Defined at line 61*
 
 ---
 
@@ -117,7 +126,7 @@ pub fn vertex_create(x: f64, y: f64, z: f64) -> Vertex {
 
 **Returns:** `Vertex`
 
-*Defined at line 62*
+*Defined at line 68*
 
 ---
 
@@ -137,7 +146,7 @@ pub fn face_create(v0: i64, v1: i64, v2: i64) -> Face {
 
 **Returns:** `Face`
 
-*Defined at line 67*
+*Defined at line 82*
 
 ---
 
@@ -155,7 +164,7 @@ pub fn mesh_create_cube(size: f64) -> Mesh {
 
 **Returns:** `Mesh`
 
-*Defined at line 76*
+*Defined at line 98*
 
 ---
 
@@ -174,7 +183,7 @@ pub fn mesh_create_plane(width: f64, depth: f64) -> Mesh {
 
 **Returns:** `Mesh`
 
-*Defined at line 118*
+*Defined at line 180*
 
 ---
 
@@ -194,7 +203,7 @@ pub fn mesh_load_obj(path: str) -> Mesh {
 
 **Returns:** `Mesh`
 
-*Defined at line 152*
+*Defined at line 226*
 
 ---
 
@@ -213,7 +222,7 @@ pub fn mesh_compute_normals(m: &mut Mesh) -> void {
 
 **Returns:** `void`
 
-*Defined at line 281*
+*Defined at line 394*
 
 ---
 
@@ -232,7 +241,7 @@ pub fn mesh_transform(m: &mut Mesh, mat: mat4) -> void {
 
 **Returns:** `void`
 
-*Defined at line 333*
+*Defined at line 446*
 
 ---
 
@@ -250,7 +259,7 @@ pub fn mesh_triangle_count(m: &Mesh) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 350*
+*Defined at line 463*
 
 ---
 
@@ -268,7 +277,7 @@ pub fn mesh_vertex_count(m: &Mesh) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 355*
+*Defined at line 468*
 
 ---
 
@@ -286,7 +295,7 @@ pub fn mesh_free(m: &mut Mesh) -> void {
 
 **Returns:** `void`
 
-*Defined at line 360*
+*Defined at line 473*
 
 ---
 

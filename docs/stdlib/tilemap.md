@@ -40,7 +40,7 @@
 pub const TILE_EMPTY: i64 = 0;
 ```
 
-*Defined at line 21*
+*Defined at line 20*
 
 ---
 
@@ -50,7 +50,7 @@ pub const TILE_EMPTY: i64 = 0;
 pub const TILE_WALL: i64 = 1;
 ```
 
-*Defined at line 22*
+*Defined at line 20*
 
 ---
 
@@ -60,7 +60,7 @@ pub const TILE_WALL: i64 = 1;
 pub const TILE_FLOOR: i64 = 2;
 ```
 
-*Defined at line 23*
+*Defined at line 20*
 
 ---
 
@@ -70,7 +70,7 @@ pub const TILE_FLOOR: i64 = 2;
 pub const TILE_WATER: i64 = 3;
 ```
 
-*Defined at line 24*
+*Defined at line 20*
 
 ---
 
@@ -80,7 +80,7 @@ pub const TILE_WATER: i64 = 3;
 pub const TILE_GRASS: i64 = 4;
 ```
 
-*Defined at line 25*
+*Defined at line 20*
 
 ---
 
@@ -90,7 +90,7 @@ pub const TILE_GRASS: i64 = 4;
 pub const TILE_DIRT: i64 = 5;
 ```
 
-*Defined at line 26*
+*Defined at line 20*
 
 ---
 
@@ -100,7 +100,7 @@ pub const TILE_DIRT: i64 = 5;
 pub const TILE_STONE: i64 = 6;
 ```
 
-*Defined at line 27*
+*Defined at line 20*
 
 ---
 
@@ -110,7 +110,7 @@ pub const TILE_STONE: i64 = 6;
 pub const TILE_SAND: i64 = 7;
 ```
 
-*Defined at line 28*
+*Defined at line 20*
 
 ---
 
@@ -120,7 +120,7 @@ pub const TILE_SAND: i64 = 7;
 pub const TILE_LAVA: i64 = 8;
 ```
 
-*Defined at line 29*
+*Defined at line 20*
 
 ---
 
@@ -130,7 +130,7 @@ pub const TILE_LAVA: i64 = 8;
 pub const TILE_ICE: i64 = 9;
 ```
 
-*Defined at line 30*
+*Defined at line 20*
 
 ---
 
@@ -150,7 +150,7 @@ pub struct Tilemap {
 | `tiles` | `Vec<i64>,      // flat grid: tiles[y * width + x]` |
 | `solid_flags` | `Vec<i64>, // 1 = solid (blocks movement), 0 = passable` |
 
-*Defined at line 37*
+*Defined at line 26*
 
 ---
 
@@ -170,7 +170,7 @@ pub fn tilemap_create(width: i64, height: i64, tile_size: i64) -> Tilemap {
 
 **Returns:** `Tilemap`
 
-*Defined at line 48*
+*Defined at line 50*
 
 ---
 
@@ -191,7 +191,7 @@ pub fn tilemap_from_grid(width: i64, height: i64, tile_size: i64, tiles: Vec<i64
 
 **Returns:** `Tilemap`
 
-*Defined at line 67*
+*Defined at line 65*
 
 ---
 
@@ -211,7 +211,7 @@ pub fn tilemap_get(tm: Tilemap, x: i64, y: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 94*
+*Defined at line 88*
 
 ---
 
@@ -233,7 +233,7 @@ pub fn tilemap_set(tm: &mut Tilemap, x: i64, y: i64, tile_id: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 103*
+*Defined at line 97*
 
 ---
 
@@ -255,7 +255,7 @@ pub fn tilemap_set_with_solid(tm: &mut Tilemap, x: i64, y: i64, tile_id: i64, is
 
 **Returns:** `void`
 
-*Defined at line 117*
+*Defined at line 111*
 
 ---
 
@@ -275,7 +275,7 @@ pub fn tilemap_is_solid(tm: Tilemap, x: i64, y: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 131*
+*Defined at line 125*
 
 ---
 
@@ -295,7 +295,7 @@ pub fn tilemap_is_passable(tm: Tilemap, x: i64, y: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 140*
+*Defined at line 135*
 
 ---
 
@@ -315,7 +315,7 @@ pub fn tilemap_get_at_pixel(tm: Tilemap, px: i64, py: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 145*
+*Defined at line 140*
 
 ---
 
@@ -335,7 +335,7 @@ pub fn tilemap_is_solid_at_pixel(tm: Tilemap, px: i64, py: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 152*
+*Defined at line 147*
 
 ---
 
@@ -358,7 +358,7 @@ pub fn tilemap_box_collides(tm: Tilemap, px: i64, py: i64, pw: i64, ph: i64) -> 
 
 **Returns:** `bool`
 
-*Defined at line 162*
+*Defined at line 157*
 
 ---
 
@@ -382,7 +382,7 @@ pub fn tilemap_move_x(tm: Tilemap, px: i64, py: i64, pw: i64, ph: i64, dx: i64) 
 
 **Returns:** `i64`
 
-*Defined at line 185*
+*Defined at line 180*
 
 ---
 
@@ -406,7 +406,7 @@ pub fn tilemap_move_y(tm: Tilemap, px: i64, py: i64, pw: i64, ph: i64, dy: i64) 
 
 **Returns:** `i64`
 
-*Defined at line 204*
+*Defined at line 199*
 
 ---
 
@@ -426,7 +426,7 @@ pub fn tilemap_auto_tile(tm: Tilemap, x: i64, y: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 238*
+*Defined at line 233*
 
 ---
 
@@ -446,7 +446,7 @@ pub fn tilemap_auto_tile_4dir(tm: Tilemap, x: i64, y: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 265*
+*Defined at line 276*
 
 ---
 
@@ -469,7 +469,7 @@ pub fn tilemap_fill_rect(tm: &mut Tilemap, x0: i64, y0: i64, x1: i64, y1: i64, t
 
 **Returns:** `void`
 
-*Defined at line 282*
+*Defined at line 301*
 
 ---
 
@@ -488,7 +488,7 @@ pub fn tilemap_fill_all(tm: &mut Tilemap, tile_id: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 295*
+*Defined at line 314*
 
 ---
 
@@ -507,7 +507,7 @@ pub fn tilemap_fill_border(tm: &mut Tilemap, tile_id: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 300*
+*Defined at line 319*
 
 ---
 
@@ -526,7 +526,7 @@ pub fn tilemap_count_tile(tm: Tilemap, tile_id: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 316*
+*Defined at line 335*
 
 ---
 
@@ -544,7 +544,7 @@ pub fn tilemap_count_solid(tm: Tilemap) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 329*
+*Defined at line 348*
 
 ---
 
@@ -567,7 +567,7 @@ pub fn tilemap_line_of_sight(tm: Tilemap, x0: i64, y0: i64, x1: i64, y1: i64) ->
 
 **Returns:** `bool`
 
-*Defined at line 345*
+*Defined at line 364*
 
 ---
 

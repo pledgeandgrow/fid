@@ -4,8 +4,43 @@
 
 Audited 2026-11-09 (new doc).
 
+> **Nov 21:** 12,948 lines (1,369 on Nov 9), most of it written after
+> this audit. Its file writers now lay out through image_writer.fd (TG13:
+> `nat_elf`, `nat_elf_debug`, `nat_elf_object`, `nat_pe`,
+> `nat_pe_symbols`, `nat_macho`, `nat_macho_fat`), `nat_pe` attaches a PDB
+> for `--nat -g` (pdb.fd), and it imports `pgo`. Importers: nat_ir,
+> nat_thumb (the `t2_*`/`t_*` Thumb-2 encoders), pe_ir_enc and disasm.
+> Finding 2 is fixed for Linux (TG14, `FID_NAT_OFF=wxsplit` turns it
+> off): the code is mapped read/execute and the data read/write from the
+> next page, with PT_GNU_STACK; Linux images can be position-independent
+> (`--pie`). New open: DWARF of optimized builds gives an inlined
+> function's line to its caller (known-bugs 2g.102), x86-64 CFI names
+> saves the prologue does not make (2g.103), `--nat` Windows and macOS
+> builds accept a call to an undefined C function (2g.106), COFF objects
+> (`codegen --coff`, `emit --obj --nat`) fail with `undefined symbol:
+> FreeLibrary` (2g.110). The text below is of Nov 9.
+>
+> **Nov 21, uncommitted — 2g.106 fixed, and the TLS half of 2g.99.**
+> `nat_pe_link_missing` (:3133) is the Windows `nat_elf_link_missing`: it
+> finds each import's DLL (`nat_pe_find_dll`: `FID_NAT_LIBPATH` directories
+> separated by ';', else `%SystemRoot%\System32`), reads its export
+> directory (`nat_pe_export_set`, with `nat_pe_rva_off`/`nat_rd_u16/32`)
+> and lists the C names it does not export; an unreadable DLL lists
+> nothing, the loader reports it. `nat_macho_link_missing` (:7629) does
+> the same on macOS against the SDK's text-based stubs (`nat_macho_sdk`:
+> SDKROOT, then the Command Line Tools' and Xcode's; `nat_macho_tbd_path`,
+> `nat_tbd_has` — libSystem's stub covers its re-exports, libm among
+> them). For 2g.99 `nat_elf_img` writes a PT_TLS program header
+> (`g_nat_elf_tls`, set by nat_ir's `ng_ldyn_set_segments` for a
+> dynamically linked x86-64 image): an 8-byte read-only template with no
+> file bytes, so the executable's static TLS block lands right below the
+> thread pointer where `nat_tls_get` reads `fs:[-8]`; `x64_store_fs`
+> encodes the matching store. 2g.110's fix is on the nat_ir side
+> (`ng_ldyn_ok` no longer refuses a COFF or Mach-O object). Still open:
+> the DWARF/CFI findings (2g.102, 2g.103).
+
 - **Path:** `compiler/nat_enc.fd`
-- **LOC:** 1,369
+- **LOC:** 12,948 (2026-11-21; 1,369 on Nov 9)
 - **Role:** the byte layer under `nat_ir.fd`: a code buffer with labels
   and fixups, AArch64, RISC-V 64 and x86-64 instruction encoders, a static
   ELF writer (with optional symbols and DWARF), and a PE32+ writer.

@@ -32,7 +32,7 @@ pub struct Rc {
 | `count_addr` | `i64` |
 | `value` | `i64` |
 
-*Defined at line 36*
+*Defined at line 33*
 
 ---
 
@@ -50,7 +50,7 @@ pub fn rc_new(val: i64) -> Rc {
 
 **Returns:** `Rc`
 
-*Defined at line 42*
+*Defined at line 54*
 
 ---
 
@@ -68,7 +68,7 @@ pub fn rc_clone(r: Rc) -> Rc {
 
 **Returns:** `Rc`
 
-*Defined at line 49*
+*Defined at line 63*
 
 ---
 
@@ -86,7 +86,7 @@ pub fn rc_get(r: Rc) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 55*
+*Defined at line 71*
 
 ---
 
@@ -104,7 +104,7 @@ pub fn rc_count(r: Rc) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 60*
+*Defined at line 76*
 
 ---
 
@@ -122,7 +122,7 @@ pub fn rc_drop(r: Rc) -> void {
 
 **Returns:** `void`
 
-*Defined at line 65*
+*Defined at line 81*
 
 ---
 
@@ -141,7 +141,7 @@ pub struct Arc {
 | `count_addr` | `i64` |
 | `value` | `i64` |
 
-*Defined at line 75*
+*Defined at line 91*
 
 ---
 
@@ -159,7 +159,7 @@ pub fn arc_new(val: i64) -> Arc {
 
 **Returns:** `Arc`
 
-*Defined at line 81*
+*Defined at line 97*
 
 ---
 
@@ -177,7 +177,7 @@ pub fn arc_clone(a: Arc) -> Arc {
 
 **Returns:** `Arc`
 
-*Defined at line 88*
+*Defined at line 106*
 
 ---
 
@@ -195,7 +195,7 @@ pub fn arc_get(a: Arc) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 94*
+*Defined at line 114*
 
 ---
 
@@ -213,7 +213,7 @@ pub fn arc_count(a: Arc) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 99*
+*Defined at line 119*
 
 ---
 
@@ -231,7 +231,7 @@ pub fn arc_drop(a: Arc) -> void {
 
 **Returns:** `void`
 
-*Defined at line 104*
+*Defined at line 124*
 
 ---
 

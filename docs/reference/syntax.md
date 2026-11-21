@@ -1,13 +1,13 @@
 # Fides Language Syntax Specification
 
 **Version:** 0.5.0
-**Status (Nov 6, 2026):** self-hosted compiler `fid` with bootstrap fixpoint. Backends: interpreter (`fid run`), C (`fid ccompile`), native Windows x64 (`fid emit`); Linux x64 through C. ARM64, RISC-V, WASM, macOS, native ELF and bare metal are experimental / incomplete.
+**Status (Nov 21, 2026):** self-hosted compiler `fid` with bootstrap fixpoint. Backends: interpreter (`fid run`), C (`fid ccompile`), native Windows x64 (`fid emit`), native Linux x64/ARM64/RISC-V 64 on the machine layer (`fid emit --target x86_64-linux|aarch64-linux|riscv64-linux`, partly tested). WASM, macOS, `--nat` Windows and bare metal are experimental or partly tested ([platforms.md](platforms.md)).
 
 > **Implementation Status:** This document describes the language design, with implementation status marked in places (✅ working / ⚠️ partial / ❌ parsed-only or planned). The language is what the self-hosted compiler `fid` accepts; [reference.md](reference.md) describes it rule by rule from the compiler source and is right where this document disagrees. See `features.md` for the feature matrix and `architecture.md` for the compiler pipeline.
 >
-> **Self-hosting status (Nov 9, 2026):** The Fides compiler is self-hosted: 68 modules (158,516 lines, Nov 9), bootstrap fixpoint (stage 2 C == stage 3 C, 49 MB) checked on every release build. (First reached in session 15 with 25 modules.) Counts: [selfhost.md → Numbers](selfhost.md#numbers).
+> **Self-hosting status (Nov 21, 2026):** The Fides compiler is self-hosted: 80 modules (360,657 lines, Nov 21), bootstrap fixpoint (stage 2 C == stage 3 C, 49 MB on Nov 6, 67 MB on Nov 8) checked on every release build; not re-verified on the current tree (known-bugs 2g.79). (First reached in session 15 with 25 modules.) Counts: [selfhost.md → Numbers](selfhost.md#numbers).
 >
-> **Tier 3 OS features (session 16):** inline asm clobber lists, `--no-std` bare-metal mode, cross-compilation target dispatch. `stdlib/uefi.fd` and `stdlib/kernel.fd` moved to the fides-os project; bare metal is incomplete (`emit --bare` panics).
+> **Tier 3 OS features (session 16):** inline asm clobber lists, bare-metal mode (`--bare`; there is no `--no-std` flag), cross-compilation target dispatch. `stdlib/uefi.fd` and `stdlib/kernel.fd` moved to the fides-os project; `fid emit --bare` writes Multiboot flat binaries that bare-metal.yml boots under QEMU (platforms.md).
 
 ## 1. Design Philosophy
 
@@ -102,7 +102,7 @@ true        false
 | `comptime` | Compile-time code execution |
 | `defer` | Deferred cleanup (Go-style) |
 | `spawn` | Spawn concurrent task (✅ implemented — OS thread model) |
-| `async` / `await` | Async functions (✅ green tasks on their own stacks; `await e` is prefix; native async crashes) |
+| `async` / `await` | Async functions (✅ green tasks on their own stacks; `await e` is prefix; native async under `fid emit` broke in builds of Nov 9 afternoon and was fixed that evening, known-bugs 2f.2) |
 | `try` | Try blocks for error handling |
 | `unsafe` | Unsafe block (skip bounds checks — framework/stdlib use only) |
 | `sandbox` | Sandbox block (restricted execution context) |
@@ -1237,7 +1237,7 @@ and the ARM64/RISC-V arches never do (`test_cfg.fd`, all three backends).
 
 ## 16. Concurrency (✅ Implemented — Phase 7.6)
 
-> **Implementation status:** `spawn f(args)` starts `f` on an OS thread and gives a `Future<T>`. An `async fn` runs as a green task on its own stack; `await e` (prefix) waits for a `Future<T>` and gives `T`. `async fn` with `f64` or struct arguments and results runs as a task (interpreter and C). Native (`fid emit`) programs that use async or spawn+await crash (`test_async`, `test_async_float_struct`). `yield e` evaluates `e`; it is not a suspension. Details: [reference.md §10](reference.md#10-concurrency).
+> **Implementation status:** `spawn f(args)` starts `f` on an OS thread and gives a `Future<T>`. An `async fn` runs as a green task on its own stack; `await e` (prefix) waits for a `Future<T>` and gives `T`. `async fn` with `f64` or struct arguments and results runs as a task (interpreter and C). Native (`fid emit`) programs that use async or spawn+await crashed in builds of Nov 9 afternoon (`test_async`, `test_async_float_struct`); fixed that evening in fid31, which matches the interpreter on pe_ir and `--nat` (known-bugs 2f.2). `yield e` evaluates `e`; it is not a suspension. Details: [reference.md §10](reference.md#10-concurrency).
 
 ### 16.1 Async / Await
 

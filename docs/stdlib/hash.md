@@ -29,7 +29,7 @@ pub fn hash_str(s: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 19*
+*Defined at line 22*
 
 ---
 
@@ -38,16 +38,16 @@ pub fn hash_str(s: str) -> i64 {
 FNV-1a hash of a Vec of bytes.
 
 ```fides
-pub fn hash_bytes(bytes: Vec) -> i64 {
+pub fn hash_bytes(bytes: Vec<i64>) -> i64 {
 ```
 
 **Parameters:**
 
-- `bytes`: `Vec`
+- `bytes`: `Vec<i64>`
 
 **Returns:** `i64`
 
-*Defined at line 31*
+*Defined at line 41*
 
 ---
 
@@ -65,7 +65,7 @@ pub fn hash_i64(n: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 43*
+*Defined at line 57*
 
 ---
 
@@ -85,7 +85,7 @@ pub fn hash_combine(a: i64, b: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 58*
+*Defined at line 79*
 
 ---
 
@@ -94,16 +94,16 @@ pub fn hash_combine(a: i64, b: i64) -> i64 {
 Hash a Vec of i64 values by combining their hashes.
 
 ```fides
-pub fn hash_vec(v: Vec) -> i64 {
+pub fn hash_vec(v: Vec<i64>) -> i64 {
 ```
 
 **Parameters:**
 
-- `v`: `Vec`
+- `v`: `Vec<i64>`
 
 **Returns:** `i64`
 
-*Defined at line 63*
+*Defined at line 93*
 
 ---
 
@@ -121,7 +121,7 @@ pub fn hash_djb2(s: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 76*
+*Defined at line 111*
 
 ---
 
@@ -130,16 +130,16 @@ pub fn hash_djb2(s: str) -> i64 {
 DJB2 hash of a Vec of bytes.
 
 ```fides
-pub fn hash_djb2_bytes(bytes: Vec) -> i64 {
+pub fn hash_djb2_bytes(bytes: Vec<i64>) -> i64 {
 ```
 
 **Parameters:**
 
-- `bytes`: `Vec`
+- `bytes`: `Vec<i64>`
 
 **Returns:** `i64`
 
-*Defined at line 87*
+*Defined at line 127*
 
 ---
 
@@ -148,16 +148,16 @@ pub fn hash_djb2_bytes(bytes: Vec) -> i64 {
 Simple sum checksum of a Vec of bytes. NOT a real checksum.
 
 ```fides
-pub fn hash_checksum(bytes: Vec) -> i64 {
+pub fn hash_checksum(bytes: Vec<i64>) -> i64 {
 ```
 
 **Parameters:**
 
-- `bytes`: `Vec`
+- `bytes`: `Vec<i64>`
 
 **Returns:** `i64`
 
-*Defined at line 100*
+*Defined at line 145*
 
 ---
 
@@ -166,16 +166,16 @@ pub fn hash_checksum(bytes: Vec) -> i64 {
 XOR checksum of a Vec of bytes.
 
 ```fides
-pub fn hash_xor_checksum(bytes: Vec) -> i64 {
+pub fn hash_xor_checksum(bytes: Vec<i64>) -> i64 {
 ```
 
 **Parameters:**
 
-- `bytes`: `Vec`
+- `bytes`: `Vec<i64>`
 
 **Returns:** `i64`
 
-*Defined at line 111*
+*Defined at line 161*
 
 ---
 
@@ -185,16 +185,16 @@ CRC32 checksum of a Vec of bytes.
 Uses the standard CRC-32 polynomial (0xEDB88320).
 
 ```fides
-pub fn hash_crc32(bytes: Vec) -> i64 {
+pub fn hash_crc32(bytes: Vec<i64>) -> i64 {
 ```
 
 **Parameters:**
 
-- `bytes`: `Vec`
+- `bytes`: `Vec<i64>`
 
 **Returns:** `i64`
 
-*Defined at line 125*
+*Defined at line 180*
 
 ---
 
@@ -212,7 +212,7 @@ pub fn hash_crc32_str(s: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 145*
+*Defined at line 205*
 
 ---
 

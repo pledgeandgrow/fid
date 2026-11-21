@@ -4,7 +4,7 @@
 > to executable binary, covering the type system, memory model, effect system,
 > and compilation pipeline.**
 
-*Last updated: Nov 6, 2026. The language is what `fid` accepts; the rule-by-rule reference is [reference.md](reference.md).*
+*Last updated: Nov 6, 2026; §1, §8 and §10 checked against the tree Nov 21. The language is what `fid` accepts; the rule-by-rule reference is [reference.md](reference.md).*
 
 ## Table of Contents
 
@@ -25,9 +25,10 @@
 
 Fides is a systems programming language designed around three principles:
 **safety by construction, verifiable correctness, and zero external
-dependencies.** It compiles to C99 and to native Windows x64 executables,
-and includes a built-in interpreter. ARM64, RISC-V, Linux ELF and
-WebAssembly backends exist but are not finished or not tested on every
+dependencies.** It compiles to C99, to native Windows x64 executables and
+to static Linux ELF for x86-64, AArch64 and RISC-V 64 (the machine layer,
+`fid emit --target <triple>`), and includes a built-in interpreter. macOS,
+WebAssembly and bare-metal backends exist but are not finished or not tested on every
 commit (see [platforms](platforms.md)).
 
 ### What Makes Fides Different
@@ -37,9 +38,9 @@ commit (see [platforms](platforms.md)).
 | Memory safety | Compile-time (ownership + regions) | Compile-time (ownership + lifetimes) | Manual |
 | Effect tracking | First-class (effects in type system) | None | None |
 | Capability security | Compile-time capability grants | None | None |
-| Dependency model | No LLVM; native Windows output needs no C compiler or linker (`fid emit`); other targets go through a C compiler | External (crates, LLVM) | External (libc) |
-| Codegen | Direct machine code (Windows x64) or C99 | Via LLVM | Via gcc/clang |
-| Self-hosting | ✅ Achieved (80 modules, 360,594 lines, bootstrap fixpoint verified Nov 6 and Nov 8 — before the ~2.3x Nov 10–19 growth) | Yes | Yes |
+| Dependency model | No LLVM; native Windows and Linux output needs no C compiler or linker (`fid emit`); other targets go through a C compiler | External (crates, LLVM) | External (libc) |
+| Codegen | Direct machine code (Windows x64; Linux x86-64, AArch64, RISC-V 64) or C99 | Via LLVM | Via gcc/clang |
+| Self-hosting | ✅ Achieved (80 modules, 360,657 lines, bootstrap fixpoint verified Nov 6 and Nov 8 — before the ~2.3x Nov 10–19 growth) | Yes | Yes |
 
 ### Design Philosophy
 
@@ -167,7 +168,8 @@ AST → typed SSA IR. Key transformations:
 
 #### 2.6 PIR Lowering (`pir.rs` / `pir.fd`)
 
-SSA IR → three-level PIR (Portable IR):
+SSA IR → three-level PIR (Portable IR). This is `fidesc`'s native path;
+in `fid`, pir.fd is no longer reached from main.fd since Nov 17 (MI18):
 - **L1:** Adds named regions, capability sets, effect sets to IR instructions
 - **L2:** Drops region handles, converts to memory regions, keeps SSA form
 - **L3:** Lowers to virtual registers (`VReg`) and stack slots — the final
@@ -175,10 +177,11 @@ SSA IR → three-level PIR (Portable IR):
 
 #### 2.7 Optimization (`opt.rs` / `opt.fd`)
 
-The PIR optimizer serves the old PIR native path (`build --native`, which
-crashes in `fid`). `fid emit` uses its own small IR optimizer
-(`compiler/iropt.fd`: inlining of small single-block functions, constant
-folding, dead code removal). The PIR optimizer has 23 passes over L2 PIR:
+The PIR optimizer serves `fidesc`'s PIR native path; `fid` no longer
+reaches opt.fd (Nov 17, MI18). `fid emit` runs its own IR optimizer
+(`compiler/iropt.fd`, with the mid-end iropt_me.fd, rules.fd and
+egraph.fd; `FID_IROPT_OFF`/`FID_IROPT_ON` select passes). The C path runs
+no IR optimizer. The PIR optimizer has 23 passes over L2 PIR:
 - **Constant folding** — evaluate constant expressions at compile time
 - **CSE/GVN** — common subexpression elimination / global value numbering
 - **DCE/DSE** — dead code/store elimination
@@ -1225,22 +1228,26 @@ assembler, linker or C compiler (`compiler/pe_ir.fd`, `pe_ir_enc.fd`,
 `pe_ir_stubs.fd`):
 - A small IR optimizer first (`compiler/iropt.fd`): inlining of small
   single-block functions, constant folding, dead code removal
-- Values kept in 7 callee-saved registers (hottest locals, parameters,
-  short-lived temporaries); there is no full register allocator (no
-  cross-block values, caller-saved registers, or floats in xmm)
+- A whole-function linear-scan register allocator (`PEIR_GLOBAL_RA`, with
+  f64 values in xmm registers, `PEIR_XMM_RA`; `FID_PE_OFF=ra` keeps every
+  value in its frame slot)
 - The runtime is Fides code in `stdlib/pe_runtime/*.fd`, merged into every
   program; C library functions through `extern "C"` thunks
 - Native async/tasks crashed until Nov 6 and broke again in builds of Nov 9 afternoon (iropt passes; fixed again in the evening's fid31, known-bugs 2f.2) (`test_async`, `test_async_float_struct`; known-bugs 2f.2)
 
-The older PIR path (`build --native`: PIR L3, linear scan allocation,
-peephole) crashes. ELF64, Mach-O, ARM64 and RISC-V emitters exist and are
-experimental / incomplete; Linux x64 goes through C.
+The older PIR path (PIR L3, linear scan allocation, peephole) was removed
+from `fid` on Nov 17 (MI18): `build --native` is the machine layer
+(compiler/nat_ir.fd + nat_enc.fd), which writes static ELF for Linux
+x86-64, AArch64 and RISC-V 64 (`fid emit --target <triple>`) and, opt-in,
+Windows x64 (`fid emit --nat`). Its Mach-O output builds but is not run on
+a Mac.
 
 ### 8.4 Runtime Library
 
 The runtime functions, all named `p_*`, are C in the C backend, Fides
-(`stdlib/pe_runtime/*.fd`) in native Windows executables, and hand-encoded
-machine code in the experimental Linux runtime (`runtime_linux.fd`):
+(`stdlib/pe_runtime/*.fd`) in native Windows executables, and Fides
+(`stdlib/linux_runtime/*.fd`) in machine-layer executables (the older
+hand-encoded `compiler/runtime_linux.fd` is no longer reached):
 - Memory: `p_malloc`, `p_free`, `p_region_free`
 - Strings: `p_str_concat`, `p_str_equal`, `p_to_str`, `p_float_to_str`
 - Collections: `p_vec_new/push/pop/len/get/set`, `p_map_*`
@@ -1292,19 +1299,19 @@ ret, mfence, sfence, lfence, pause, wbinvd, int, leave, cld, std, ud2.
 ```
 # Compile with zero stdlib dependencies
 fid emit kernel.fd --bare
-fid emit kernel.fd --no-std
-fid emit kernel.fd --no-stdlib
 ```
 
-In `--bare`/`--no-std` mode, the compiler:
+(`fid` has no `--no-std`/`--no-stdlib` flag; no-std is what `--bare` builds,
+compiler.fd `build_program_no_std`.) In `--bare` mode, the compiler:
 1. Skips loading `stdlib/core.fd` entirely
 2. Typechecks the user program alone (no stdlib merge)
-3. Skips import resolution (no stdlib to import from)
+3. Resolves `use` imports from disk, except `core`
 4. Produces output with zero hidden runtime dependencies
 
 This is for kernel/UEFI/bare-metal development where the program must
-not depend on any stdlib functions. Bare metal is incomplete: `emit --bare`
-panics today.
+not depend on any stdlib functions. Bare metal is experimental: `emit --bare`
+builds through pe_ir (`PeirGen_gen_bare_runtime`), and the Bare-metal CI
+lane boots a `--bare` Multiboot kernel under QEMU.
 
 ### `@cpu_local` Variables (Per-CPU Data)
 
@@ -1460,8 +1467,8 @@ Fides has 403 stdlib modules (259,299 lines, Nov 19), plus 4 in
 ## 10. Self-Hosting
 
 **The Fides compiler is self-hosted.** The compiler has been rewritten from
-Rust (`src/*.rs`, 57 files, 113,416 lines) into Fides (`compiler/*.fd`, 80
-modules, 360,594 lines) and achieves a **bootstrap fixpoint**: the self-hosted
+Rust (`src/*.rs`, 57 files, 114,184 lines) into Fides (`compiler/*.fd`, 80
+modules, 360,657 lines; Nov 21) and achieves a **bootstrap fixpoint**: the self-hosted
 compiler reproduces byte-identical output across generations.
 
 ### Current State (Nov 6, 2026)
@@ -1472,6 +1479,12 @@ compiler reproduces byte-identical output across generations.
   built from a pinned stage 0 (`release/stage0/fid.exe`, checked against
   `scripts/stage0.sha256`) when one exists, otherwise cold from `fidesc`;
   `PIN=1` pins the last stage after a fixpoint. No stage 0 is pinned yet.
+- Nov 21: a fid built by `fidesc` runs out of memory self-compiling the
+  current tree (known-bugs 2g.79), so the 3-stage bootstrap from `fidesc`
+  stops at stage 2. The tree was built in one step from the self-hosted
+  fid of Nov 18 as stage 0 (15 MB at -O2, 8 split units), and the result
+  passes run, emit, ccompile and the 10-program leak gate. The fixpoint was
+  last verified on Nov 8, before the tree grew ~2.3x.
 - `fid` compiles itself to C in ~133 s (type check 59 s, borrow check 16 s,
   lowering 20 s, C generation 12 s; Nov 6), ~6x slower than `fidesc` (~21 s).
 - `fid run` and `fid ccompile` matched `fidesc` on the 302 test programs of
@@ -1564,9 +1577,12 @@ reserve is insufficient for the compiler's deep recursion.
   344 suite tests match) and bare metal (`emit --bare` boots under QEMU
   since Nov 15, release G1) are incomplete.
 - **Self-compile speed**: 74 s with the compiler built at -O2 (Nov 9), ~3.5x
-  slower than `fidesc`.
-- **Written, not run yet**: `fid emit --checked-alloc` (guard pages),
-  `scripts/sanitize.sh` (ASan/UBSan through C), `scripts/fuzz/nightly.sh`.
+  slower than `fidesc`; 57 s at -O2 on Nov 21 for the 361K-line tree.
+  scripts/build-selfhost.sh can fall back to one unit at -O0 without an
+  error (about 17x slower; known-bugs 2g.86).
+- **Written, not run yet**: `fid emit --checked-alloc` (guard pages).
+  `scripts/sanitize.sh` (ASan/UBSan through C) and `scripts/fuzz/nightly.sh`
+  were first run Nov 16–17 and are in CI (ci.yml, verify-nightly.yml).
 
 ---
 

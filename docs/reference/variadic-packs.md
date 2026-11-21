@@ -55,7 +55,7 @@ Type error (in 'pick'): the pack 'xs' (`...xs: T`) has no single type: its eleme
   not supported (the call is left as written and the checker rejects it).
 - A local variable named like the pack inside the pack function's body is
   read as the pack.
-- `fid lint` and the `--no-std` build run `mono_desugar_variadics` but do
+- `fid lint` and the no-stdlib build (`--bare`, `--elf`, `--boot`) run `mono_desugar_variadics` but do
   not read its errors; a misused pack there reports `undefined variable`.
 
 Tests: tests/bootstrap/test_variadic_pack.fd, test_variadic_pack_jumps.fd,

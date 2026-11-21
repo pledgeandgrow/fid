@@ -1,7 +1,8 @@
 # hotreload.fd — watch-mode / hot-reload scaffold
 
 - **Path:** `compiler/hotreload.fd` — module `compiler::hotreload`
-- **LOC:** 636 (2026-11-09, unchanged). Rust `src/hotreload.rs`: 559.
+- **LOC:** 626 (2026-11-21; 636 on Nov 9). Rust `src/hotreload.rs`: 559.
+  Nov 21: still dead; `fid watch` still runs `cmd_bench`.
 - **Role:** per-function change detection over IR (`FunctionSnapshot`,
   `FunctionDiff`, FNV-style hashes), `compile_and_run` (lower, then run in
   the interpreter), `PersistentState` (key=value file between reloads),

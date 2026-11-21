@@ -36,7 +36,7 @@ pub struct GameLoop {
 | `max_frame_time` | `f64,  // cap to prevent spiral of death (seconds)` |
 | `total_frames` | `i64,    // total frames since start` |
 
-*Defined at line 30*
+*Defined at line 27*
 
 ---
 
@@ -54,7 +54,7 @@ pub fn gameloop_create(target_fps: i64) -> GameLoop {
 
 **Returns:** `GameLoop`
 
-*Defined at line 44*
+*Defined at line 60*
 
 ---
 
@@ -74,7 +74,7 @@ pub fn gameloop_step(gl: &mut GameLoop) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 66*
+*Defined at line 73*
 
 ---
 
@@ -92,7 +92,7 @@ pub fn gameloop_stop(gl: &mut GameLoop) -> void {
 
 **Returns:** `void`
 
-*Defined at line 98*
+*Defined at line 105*
 
 ---
 
@@ -110,7 +110,7 @@ pub fn gameloop_fps(gl: &GameLoop) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 103*
+*Defined at line 110*
 
 ---
 
@@ -128,7 +128,7 @@ pub fn gameloop_dt(gl: &GameLoop) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 108*
+*Defined at line 115*
 
 ---
 
@@ -146,7 +146,7 @@ pub fn gameloop_total_frames(gl: &GameLoop) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 113*
+*Defined at line 120*
 
 ---
 
@@ -166,7 +166,7 @@ pub fn gameloop_alpha(gl: &GameLoop) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 120*
+*Defined at line 127*
 
 ---
 
@@ -187,7 +187,7 @@ pub struct SimpleLoop {
 | `fps` | `i64` |
 | `fps_timer` | `i64` |
 
-*Defined at line 132*
+*Defined at line 139*
 
 ---
 
@@ -199,7 +199,7 @@ pub fn simpleloop_create() -> SimpleLoop {
 
 **Returns:** `SimpleLoop`
 
-*Defined at line 141*
+*Defined at line 149*
 
 ---
 
@@ -217,7 +217,7 @@ pub fn simpleloop_step(sl: &mut SimpleLoop) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 153*
+*Defined at line 156*
 
 ---
 
@@ -233,7 +233,7 @@ pub fn simpleloop_stop(sl: &mut SimpleLoop) -> void {
 
 **Returns:** `void`
 
-*Defined at line 175*
+*Defined at line 178*
 
 ---
 

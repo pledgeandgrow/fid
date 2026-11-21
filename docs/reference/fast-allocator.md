@@ -58,13 +58,18 @@ the same time, `test_compiler_sized.fd` for x86_64-linux:
 | `--debug` (mid-end off) | 2862 ms | 16.6 s | 17.3% |
 | `--debug` with `FID_NAT_FAST=1` | 2470 ms | 15.1 s | 16.3% |
 
+Nov 21, with the allocation-only row (fid built from the self-hosted stage
+0 at 86cc919, the roadmap's RA14 check): in debug mode the allocation is
+11–13% of the build (test_compiler_sized 11.2%, test_machine_probe 12.4%,
+compiler/main.fd 13.1%), so the 10% bound fails there; `--fast-alloc` with
+the mid-end is 6.1–9.5%. The main.fd rows with the mid-end on panic in
+iro_sccp (known-bugs 2g.89).
+
 With the mid-end on, the fast allocator's allocation and emission together
 are under 10% of the build, so its allocation is too. A debug build has no
-mid-end, so the same work is a larger share: whether allocation alone is
-under 10% there needs the allocation row, from the script above with the
-final compiler. Those numbers, and the self-compile's (`--self`), go here
-and into the roadmap's RA14 entry once measured. If the fast modes fail
-the 10% bound, the next places to look in the fast path of
+mid-end, so the same work is a larger share, and the Nov 21 allocation
+row shows allocation alone is over 10% there. Since the fast modes fail
+the 10% bound in debug builds, the next places to look in the fast path of
 `ng_mir_alloc` are the call clobber masks (`ng_call_mask_i`, once per
 call), the register classes (`ng_mir_classes_c`) and the per-vreg tables,
 which are allocated for every vreg of the function even when most of them

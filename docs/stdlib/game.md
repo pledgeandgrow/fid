@@ -34,7 +34,7 @@ pub fn game_config_new() -> GameConfig {
 
 **Returns:** `GameConfig`
 
-*Defined at line 44*
+*Defined at line 55*
 
 ---
 
@@ -52,7 +52,7 @@ pub fn game_config_with_fps(fps: i64) -> GameConfig {
 
 **Returns:** `GameConfig`
 
-*Defined at line 54*
+*Defined at line 62*
 
 ---
 
@@ -73,7 +73,7 @@ pub fn game_loop(config: GameConfig, update_fn: fn(f64) -> void, render_fn: fn()
 
 **Returns:** `void`
 
-*Defined at line 63*
+*Defined at line 71*
 
 ---
 
@@ -93,7 +93,7 @@ pub fn game_frame(config: GameConfig, update_fn: fn(f64) -> void, render_fn: fn(
 
 **Returns:** `void`
 
-*Defined at line 75*
+*Defined at line 83*
 
 ---
 
@@ -112,7 +112,7 @@ pub fn load_asset(path: str) -> AssetHandle {
 
 **Returns:** `AssetHandle`
 
-*Defined at line 94*
+*Defined at line 101*
 
 ---
 
@@ -130,7 +130,7 @@ pub fn load_texture(path: str) -> AssetHandle {
 
 **Returns:** `AssetHandle`
 
-*Defined at line 103*
+*Defined at line 110*
 
 ---
 
@@ -148,7 +148,7 @@ pub fn load_sound(path: str) -> AssetHandle {
 
 **Returns:** `AssetHandle`
 
-*Defined at line 108*
+*Defined at line 115*
 
 ---
 
@@ -166,7 +166,7 @@ pub fn load_model(path: str) -> AssetHandle {
 
 **Returns:** `AssetHandle`
 
-*Defined at line 113*
+*Defined at line 120*
 
 ---
 
@@ -175,16 +175,16 @@ pub fn load_model(path: str) -> AssetHandle {
 Dispatch a key down event.
 
 ```fides
-pub fn input_key_down(key: i64) -> void {
+pub fn input_key_down(_key: i64) -> void {
 ```
 
 **Parameters:**
 
-- `key`: `i64`
+- `_key`: `i64`
 
 **Returns:** `void`
 
-*Defined at line 130*
+*Defined at line 132*
 
 ---
 
@@ -193,16 +193,16 @@ pub fn input_key_down(key: i64) -> void {
 Dispatch a key up event.
 
 ```fides
-pub fn input_key_up(key: i64) -> void {
+pub fn input_key_up(_key: i64) -> void {
 ```
 
 **Parameters:**
 
-- `key`: `i64`
+- `_key`: `i64`
 
 **Returns:** `void`
 
-*Defined at line 135*
+*Defined at line 137*
 
 ---
 
@@ -211,17 +211,17 @@ pub fn input_key_up(key: i64) -> void {
 Dispatch a mouse move event.
 
 ```fides
-pub fn input_mouse_move(x: i64, y: i64) -> void {
+pub fn input_mouse_move(_x: i64, _y: i64) -> void {
 ```
 
 **Parameters:**
 
-- `x`: `i64`
-- `y`: `i64`
+- `_x`: `i64`
+- `_y`: `i64`
 
 **Returns:** `void`
 
-*Defined at line 140*
+*Defined at line 142*
 
 ---
 
@@ -241,7 +241,7 @@ pub fn render_clear(r: f64, g: f64, b: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 150*
+*Defined at line 184*
 
 ---
 
@@ -265,7 +265,7 @@ pub fn render_rect(x: f64, y: f64, w: f64, h: f64, r: f64, g: f64, b: f64) -> vo
 
 **Returns:** `void`
 
-*Defined at line 156*
+*Defined at line 190*
 
 ---
 
@@ -288,7 +288,7 @@ pub fn render_circle(x: f64, y: f64, radius: f64, r: f64, g: f64, b: f64) -> voi
 
 **Returns:** `void`
 
-*Defined at line 161*
+*Defined at line 206*
 
 ---
 
@@ -308,7 +308,7 @@ pub fn render_text(x: f64, y: f64, text: str) -> void {
 
 **Returns:** `void`
 
-*Defined at line 166*
+*Defined at line 225*
 
 ---
 
@@ -322,7 +322,7 @@ pub fn render_present() -> void {
 
 **Returns:** `void`
 
-*Defined at line 171*
+*Defined at line 249*
 
 ---
 
@@ -332,16 +332,16 @@ Compile a game script. In comptime mode, this generates native code.
 For now, it's a no-op (scripts are compiled normally).
 
 ```fides
-pub fn compile_script(source: str) -> void {
+pub fn compile_script(_source: str) -> void {
 ```
 
 **Parameters:**
 
-- `source`: `str`
+- `_source`: `str`
 
 **Returns:** `void`
 
-*Defined at line 195*
+*Defined at line 289*
 
 ---
 
@@ -356,7 +356,7 @@ pub fn hot_reload() -> void {
 
 **Returns:** `void`
 
-*Defined at line 208*
+*Defined at line 301*
 
 ---
 
@@ -378,7 +378,7 @@ pub fn physics_move(pos_x: f64, pos_y: f64, vel_x: f64, vel_y: f64, dt: f64) -> 
 
 **Returns:** `(f64, f64)`
 
-*Defined at line 218*
+*Defined at line 310*
 
 ---
 
@@ -398,7 +398,7 @@ pub fn physics_gravity(vel_y: f64, gravity: f64, dt: f64) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 225*
+*Defined at line 317*
 
 ---
 
@@ -417,7 +417,7 @@ pub fn physics_aabb_overlap(x1: f64, y1: f64, w1: f64, h1: f64,
 - `w1`: `f64`
 - `h1`: `f64`
 
-*Defined at line 230*
+*Defined at line 322*
 
 ---
 

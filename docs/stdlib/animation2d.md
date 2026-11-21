@@ -39,7 +39,7 @@ pub struct AnimState2D {
 | `looping` | `bool` |
 | `row` | `i64,             // row in sprite sheet (for grid layout)` |
 
-*Defined at line 25*
+*Defined at line 21*
 
 ---
 
@@ -62,7 +62,7 @@ pub struct Animation2D {
 | `frame_w` | `i64,          // frame width in pixels` |
 | `frame_h` | `i64,          // frame height in pixels` |
 
-*Defined at line 34*
+*Defined at line 33*
 
 ---
 
@@ -81,7 +81,7 @@ pub fn anim2d_create(frame_w: i64, frame_h: i64) -> Animation2D {
 
 **Returns:** `Animation2D`
 
-*Defined at line 46*
+*Defined at line 64*
 
 ---
 
@@ -105,7 +105,7 @@ pub fn anim2d_add_state(anim: &mut Animation2D, name: str, start_frame: i64, fra
 
 **Returns:** `i64`
 
-*Defined at line 61*
+*Defined at line 72*
 
 ---
 
@@ -129,7 +129,7 @@ pub fn anim2d_add_state_row(anim: &mut Animation2D, name: str, start_frame: i64,
 
 **Returns:** `i64`
 
-*Defined at line 75*
+*Defined at line 81*
 
 ---
 
@@ -148,7 +148,7 @@ pub fn anim2d_find_state(anim: &Animation2D, name: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 89*
+*Defined at line 90*
 
 ---
 
@@ -167,7 +167,7 @@ pub fn anim2d_play(anim: &mut Animation2D, name: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 101*
+*Defined at line 102*
 
 ---
 
@@ -186,7 +186,7 @@ pub fn anim2d_play_idx(anim: &mut Animation2D, idx: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 113*
+*Defined at line 119*
 
 ---
 
@@ -205,7 +205,7 @@ pub fn anim2d_update(anim: &mut Animation2D, dt: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 123*
+*Defined at line 133*
 
 ---
 
@@ -223,7 +223,7 @@ pub fn anim2d_current_frame(anim: &Animation2D) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 145*
+*Defined at line 157*
 
 ---
 
@@ -241,7 +241,7 @@ pub fn anim2d_current_row(anim: &Animation2D) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 152*
+*Defined at line 166*
 
 ---
 
@@ -260,7 +260,7 @@ pub fn anim2d_source_rect(anim: &Animation2D, sheet_cols: i64) -> vec4 {
 
 **Returns:** `vec4`
 
-*Defined at line 158*
+*Defined at line 174*
 
 ---
 
@@ -278,7 +278,7 @@ pub fn anim2d_current_state_name(anim: &Animation2D) -> str {
 
 **Returns:** `str`
 
-*Defined at line 167*
+*Defined at line 183*
 
 ---
 
@@ -296,7 +296,7 @@ pub fn anim2d_is_finished(anim: &Animation2D) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 173*
+*Defined at line 191*
 
 ---
 
@@ -315,7 +315,7 @@ pub fn anim2d_set_speed(anim: &mut Animation2D, speed: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 178*
+*Defined at line 196*
 
 ---
 
@@ -333,7 +333,7 @@ pub fn anim2d_reset(anim: &mut Animation2D) -> void {
 
 **Returns:** `void`
 
-*Defined at line 184*
+*Defined at line 204*
 
 ---
 
@@ -351,7 +351,7 @@ pub fn anim2d_state_count(anim: &Animation2D) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 191*
+*Defined at line 211*
 
 ---
 
@@ -369,7 +369,7 @@ pub fn anim2d_duration(anim: &Animation2D) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 196*
+*Defined at line 216*
 
 ---
 
@@ -387,7 +387,7 @@ pub fn anim2d_progress(anim: &Animation2D) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 203*
+*Defined at line 225*
 
 ---
 

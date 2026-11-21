@@ -60,7 +60,7 @@ pub struct SerializeWriter {
 |------|------|
 | `data` | `Vec<i64>` |
 
-*Defined at line 36*
+*Defined at line 33*
 
 ---
 
@@ -72,7 +72,7 @@ pub fn serialize_writer_create() -> SerializeWriter {
 
 **Returns:** `SerializeWriter`
 
-*Defined at line 40*
+*Defined at line 53*
 
 ---
 
@@ -89,7 +89,7 @@ pub fn serialize_write_u8(w: &mut SerializeWriter, val: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 44*
+*Defined at line 59*
 
 ---
 
@@ -106,7 +106,7 @@ pub fn serialize_write_u16(w: &mut SerializeWriter, val: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 48*
+*Defined at line 63*
 
 ---
 
@@ -123,7 +123,7 @@ pub fn serialize_write_i32(w: &mut SerializeWriter, val: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 53*
+*Defined at line 68*
 
 ---
 
@@ -140,7 +140,7 @@ pub fn serialize_write_f64(w: &mut SerializeWriter, val: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 60*
+*Defined at line 75*
 
 ---
 
@@ -157,7 +157,7 @@ pub fn serialize_write_bool(w: &mut SerializeWriter, val: bool) -> void {
 
 **Returns:** `void`
 
-*Defined at line 70*
+*Defined at line 85*
 
 ---
 
@@ -174,24 +174,24 @@ pub fn serialize_write_str(w: &mut SerializeWriter, val: str) -> void {
 
 **Returns:** `void`
 
-*Defined at line 74*
+*Defined at line 93*
 
 ---
 
 ## serialize_write_bytes
 
 ```fides
-pub fn serialize_write_bytes(w: &mut SerializeWriter, data: Vec<i64>) -> void {
+pub fn serialize_write_bytes(w: &mut SerializeWriter, data: &mut Vec<i64>) -> void {
 ```
 
 **Parameters:**
 
 - `w`: `&mut SerializeWriter`
-- `data`: `Vec<i64>`
+- `data`: `&mut Vec<i64>`
 
 **Returns:** `void`
 
-*Defined at line 84*
+*Defined at line 103*
 
 ---
 
@@ -210,7 +210,7 @@ pub fn serialize_save(w: &SerializeWriter, path: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 94*
+*Defined at line 113*
 
 ---
 
@@ -228,7 +228,7 @@ pub fn serialize_data(w: &SerializeWriter) -> Vec<i64> {
 
 **Returns:** `Vec<i64>`
 
-*Defined at line 100*
+*Defined at line 119*
 
 ---
 
@@ -246,7 +246,7 @@ pub fn serialize_size(w: &SerializeWriter) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 105*
+*Defined at line 124*
 
 ---
 
@@ -263,7 +263,7 @@ pub struct SerializeReader {
 | `data` | `Vec<i64>` |
 | `pos` | `i64` |
 
-*Defined at line 111*
+*Defined at line 130*
 
 ---
 
@@ -279,7 +279,7 @@ pub fn serialize_reader_create(data: Vec<i64>) -> SerializeReader {
 
 **Returns:** `SerializeReader`
 
-*Defined at line 116*
+*Defined at line 135*
 
 ---
 
@@ -297,7 +297,7 @@ pub fn serialize_load(path: str) -> SerializeReader {
 
 **Returns:** `SerializeReader`
 
-*Defined at line 121*
+*Defined at line 142*
 
 ---
 
@@ -313,7 +313,7 @@ pub fn serialize_read_u8(r: &mut SerializeReader) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 136*
+*Defined at line 162*
 
 ---
 
@@ -329,7 +329,7 @@ pub fn serialize_read_u16(r: &mut SerializeReader) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 143*
+*Defined at line 171*
 
 ---
 
@@ -345,7 +345,7 @@ pub fn serialize_read_i32(r: &mut SerializeReader) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 149*
+*Defined at line 177*
 
 ---
 
@@ -361,7 +361,7 @@ pub fn serialize_read_f64(r: &mut SerializeReader) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 157*
+*Defined at line 191*
 
 ---
 
@@ -377,7 +377,7 @@ pub fn serialize_read_bool(r: &mut SerializeReader) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 167*
+*Defined at line 201*
 
 ---
 
@@ -393,7 +393,7 @@ pub fn serialize_read_str(r: &mut SerializeReader) -> str {
 
 **Returns:** `str`
 
-*Defined at line 171*
+*Defined at line 205*
 
 ---
 
@@ -409,7 +409,7 @@ pub fn serialize_read_bytes(r: &mut SerializeReader) -> Vec<i64> {
 
 **Returns:** `Vec<i64>`
 
-*Defined at line 184*
+*Defined at line 221*
 
 ---
 
@@ -425,7 +425,7 @@ pub fn serialize_reader_remaining(r: &SerializeReader) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 195*
+*Defined at line 232*
 
 ---
 
@@ -441,7 +441,7 @@ pub fn serialize_reader_eof(r: &SerializeReader) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 199*
+*Defined at line 236*
 
 ---
 
@@ -457,7 +457,7 @@ pub fn serialize_reader_reset(r: &mut SerializeReader) -> void {
 
 **Returns:** `void`
 
-*Defined at line 203*
+*Defined at line 240*
 
 ---
 
@@ -475,7 +475,7 @@ pub struct JsonWriter {
 | `indent` | `i64` |
 | `pretty` | `bool` |
 
-*Defined at line 209*
+*Defined at line 246*
 
 ---
 
@@ -487,7 +487,7 @@ pub fn json_writer_create() -> JsonWriter {
 
 **Returns:** `JsonWriter`
 
-*Defined at line 215*
+*Defined at line 252*
 
 ---
 
@@ -499,7 +499,7 @@ pub fn json_writer_pretty() -> JsonWriter {
 
 **Returns:** `JsonWriter`
 
-*Defined at line 219*
+*Defined at line 258*
 
 ---
 
@@ -515,7 +515,7 @@ pub fn json_object_begin(w: &mut JsonWriter) -> void {
 
 **Returns:** `void`
 
-*Defined at line 238*
+*Defined at line 281*
 
 ---
 
@@ -531,7 +531,7 @@ pub fn json_array_begin(w: &mut JsonWriter) -> void {
 
 **Returns:** `void`
 
-*Defined at line 248*
+*Defined at line 291*
 
 ---
 
@@ -547,7 +547,7 @@ pub fn json_array_end(w: &mut JsonWriter) -> void {
 
 **Returns:** `void`
 
-*Defined at line 253*
+*Defined at line 296*
 
 ---
 
@@ -564,7 +564,7 @@ pub fn json_key(w: &mut JsonWriter, key: str) -> void {
 
 **Returns:** `void`
 
-*Defined at line 258*
+*Defined at line 301*
 
 ---
 
@@ -581,7 +581,7 @@ pub fn json_write_string(w: &mut JsonWriter, val: str) -> void {
 
 **Returns:** `void`
 
-*Defined at line 263*
+*Defined at line 308*
 
 ---
 
@@ -598,7 +598,7 @@ pub fn json_number(w: &mut JsonWriter, val: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 267*
+*Defined at line 312*
 
 ---
 
@@ -615,7 +615,7 @@ pub fn json_int(w: &mut JsonWriter, val: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 271*
+*Defined at line 316*
 
 ---
 
@@ -632,7 +632,7 @@ pub fn json_write_bool(w: &mut JsonWriter, val: bool) -> void {
 
 **Returns:** `void`
 
-*Defined at line 275*
+*Defined at line 320*
 
 ---
 
@@ -648,7 +648,7 @@ pub fn json_write_null(w: &mut JsonWriter) -> void {
 
 **Returns:** `void`
 
-*Defined at line 279*
+*Defined at line 328*
 
 ---
 
@@ -664,7 +664,7 @@ pub fn json_comma(w: &mut JsonWriter) -> void {
 
 **Returns:** `void`
 
-*Defined at line 283*
+*Defined at line 332*
 
 ---
 
@@ -680,7 +680,7 @@ pub fn json_result(w: &JsonWriter) -> str {
 
 **Returns:** `str`
 
-*Defined at line 287*
+*Defined at line 336*
 
 ---
 
@@ -699,7 +699,7 @@ pub fn json_save(w: &JsonWriter, path: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 292*
+*Defined at line 341*
 
 ---
 
@@ -719,7 +719,7 @@ pub struct JsonValue {
 | `float_val` | `f64` |
 | `str_val` | `str` |
 
-*Defined at line 301*
+*Defined at line 350*
 
 ---
 
@@ -736,7 +736,7 @@ pub fn json_parse_int(source: str, key: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 309*
+*Defined at line 359*
 
 ---
 
@@ -753,7 +753,7 @@ pub fn json_parse_float(source: str, key: str) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 317*
+*Defined at line 369*
 
 ---
 
@@ -770,7 +770,7 @@ pub fn json_parse_string(source: str, key: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 325*
+*Defined at line 379*
 
 ---
 
@@ -787,7 +787,7 @@ pub fn json_parse_bool(source: str, key: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 335*
+*Defined at line 393*
 
 ---
 

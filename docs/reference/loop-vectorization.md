@@ -128,9 +128,14 @@ ends in `spilled to N vector slots`.
 
 ## Numbers
 
-Not measured yet: the compiler with the vectorizer had not been built when
-it was written. Run tests/nattools/vectorize_bench.sh and put its table
-here.
+Nov 21 (roadmap OP22 check, fid built from a self-hosted stage 0):
+vectorize_bench.sh gives 534 ms vectorized against 1,058 ms scalar on
+`--nat`. test_vectorize prints its 39 lines, and every image (SSE, AVX2,
+NEON, RVV at VLEN 128 and 256, and the off builds) prints the expected
+output. Reductions (xor/or/and/sum accumulators, float sums) are never
+vectorized ("the accumulator read in the loop header"), and
+vectorize_check.sh fails 22 checks: its functions are now inlined into
+`one()`, and it passes MSYS paths to wsl.exe.
 
 ## Left
 

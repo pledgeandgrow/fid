@@ -6,8 +6,48 @@
 > imports, PE writer) and pe_ir_stubs.md (runtime stubs, Fides runtime,
 > reachability).
 
+> **Nov 21:** 9,010 lines (4,667 on Nov 9). It now imports `ast_ser`,
+> `cparser`, `inc`, `ir_ser`, `lexer`, `parser`, `pdb`, `pgo` and `token`
+> as well. `compiler.fd` `build_executable` is gone (MI18, Nov 17), so the
+> MEDIUM "`build --native --target windows` crashes" finding no longer
+> applies (`--native` is the machine layer). Debug builds carry DWARF line
+> tables and a PDB (`emit -g`, DB3; pdb.md); cold blocks follow a
+> `--profile-use` profile (pgo.md); `emit --boot` builds a Multiboot kernel
+> here (`PEIR_BARE_BOOT`, Nov 15). The HIGH concurrency finding below was
+> not re-checked. New open (known-bugs): a dead store in a partially
+> unrolled loop (2g.80), `--leaks` executables crash at once (2g.81), an
+> f32 result cast `as i64` gives i64::MAX (2g.95), test_simd_i64 crashes in
+> its `wrap:` case (2g.96), mutual tail calls overflow the stack (2g.98),
+> `FID_PROF=folded` stacks start at a wrong root (2g.101), wrong local
+> values under `emit -g` (2g.104), fixed arrays past ~28 KB passed by value
+> (2g.23, second entry). Fixed: `str_find`/`str_contains` needed `memchr`
+> (2g.58, Nov 16). Line numbers below are from Nov 9.
+>
+> **Nov 21, uncommitted — 2g.80, 2g.81, 2g.95 and 2g.98 fixed.** 2g.81:
+> `pe_ir_needed_fns` (:168) adds `pert_leak_malloc`/`pert_leak_free`/
+> `pert_leak_exit` and everything reachable from them to the wanted roots
+> under `--leaks` — `nat_frame_ret`/`nat_frame_next` had stayed `ud2`, so
+> every `--leaks` image stopped with an illegal instruction at its first
+> allocation. RL16: `__fid_entry` joins the nat tables as the COFF
+> symbols' name for the entry point — a return address in it was named
+> after the function placed before it, and `--leaks`' stack walk took the
+> entry's blocks for the program's. 2g.95 (MI17): `ConstFloat` for `F32`
+> stored the low 32 bits of the f64 pattern (`0.0` for 2^63), so the
+> range checks of a saturating f32 `as i64` sent every value to
+> i64::MAX/MIN; it now emits `p_f32_to_bits` (:4237). 2g.98 (OP13):
+> `peir_tail_via_slot`/`peir_slot_load_return` (:2478/:2611) recognise a
+> call in tail position through a result slot — `store call -> alloca`,
+> `jump B`, and B (through blocks that only jump on, ≤8 hops) starts
+> `load slot; return` — the shape the inliner gives `return g(x)`; the
+> emitted jump skips the store and jump (`tail_skip = 2`), and mutual
+> recursion no longer overflows the stack. 2g.80: `peir_global_ra`'s
+> live-into-block lower bound is `bstart - 1`, not `bstart` — a value
+> defined in a block laid out later (unrolled copies, chained backwards)
+> had started exactly there and shared a register while live. Still
+> open: 2g.101, 2g.104, 2g.23 (second entry).
+
 - **Path:** `compiler/pe_ir.fd`
-- **LOC:** 4,667 (INDEX.md still says 3,102). Ported from `src/pe.rs`
+- **LOC:** 9,010 (2026-11-21); 4,667 on Nov 9 (INDEX.md then said 3,102). Ported from `src/pe.rs`
   (`PeStackFrame`, `PeirGen::generate`, `gen_function`, `gen_inst`,
   `gen_int_binop`, `gen_float_binop`), then grown well past it (register
   allocation, inline Vec calls, loop rotation, bare/ELF output).

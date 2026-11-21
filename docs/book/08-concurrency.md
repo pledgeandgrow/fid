@@ -66,10 +66,11 @@ The functions of `stdlib/task.fd`:
 In compiled programs (C and native) tasks are scheduled M:N over a
 worker per CPU, and they also switch at blocking calls the runtime can
 poll and at loop safepoints the compiler inserts, so one busy loop does
-not starve the rest. **Under `fid run` a task runs to its end as soon as
-it starts** — the interpreter has a single call stack — so `task_yield`
-does nothing there. Output order that depends on interleaving can differ
-between `fid run` and a build.
+not starve the rest. **Under `fid run` tasks interleave too, but only at
+the waits** (`task_yield`, `task_sleep`, `await`, a channel receive;
+docs/interp-tasks.md, LG11): one thread, no safepoints in loops. Output
+order that depends on interleaving can differ between `fid run` and a
+build.
 
 ### Structured groups: TaskScope
 
@@ -398,8 +399,8 @@ fn main() -> i64 {
 }
 ```
 
-This prints `slow 2` from a C build. Under `fid run` it currently crashes
-(`Invalid memory access`), so try `select` through `fid ccompile`.
+This prints `slow 2`, under `fid run` (Nov 21 tree; it crashed with
+`Invalid memory access` on Nov 15) and from a C build.
 
 ## Panics in concurrent code
 
@@ -448,10 +449,6 @@ caller decides.
 - **Spawning with a reference.** `spawn f(&x)` is rejected. Pass the value.
 - **Writing a global from a thread.** Take a mutex, use the atomics, or
   return the value through `await`.
-- **Timing or ordering results under `fid run`.** The interpreter runs
-  each task to completion when it starts. Measure and test interleaving
-  in a build.
-- **Iterating a borrowed Vec with `for x in v`.** Inside
-  `fn f(v: &Vec<i64>)`, `for x in v` gives `x` the type `&Vec<i64>`
-  today, and `s + x` fails with "arithmetic requires numeric types".
-  Write `for x in *v`, or loop over `0..v.len()` with `v.get(i)`.
+- **Timing or ordering results under `fid run`.** The interpreter
+  switches tasks only where they wait, on one thread. Measure and test
+  interleaving in a build.
