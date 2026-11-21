@@ -1629,6 +1629,13 @@ impl CCodeGen {
 
     fn emit_string_consts(&mut self, module: &IrModule) {
         wln!(self, "// ─── String constants ───");
+        // Proposal 0004: a literal carries the two-word header
+        // [P_STR_STATIC][len] in front of its bytes (core p_str_free reads
+        // it and leaves a literal's memory alone; p_str_length reads the
+        // length). A plain .rdata char[] has no header, so the words in
+        // front of it are whatever sits there — core can then free s-16 or
+        // read a garbage length. The struct keeps the data pointer 8-aligned
+        // and the #define keeps every `_strN` reference the data bytes.
         let mut idx = 0;
         for func in module.functions.values() {
             for block in &func.blocks {
@@ -1638,7 +1645,9 @@ impl CCodeGen {
                             let name = format!("_str{}", idx);
                             idx += 1;
                             let escaped = Self::escape_c_string(value);
-                            wln!(self, "static const char {}[] = \"{}\";", name, escaped);
+                            wln!(self, "static const struct {{ uint64_t hdr; uint64_t len; char bytes[{}+1]; }} {}_s = {{ 0x4649444553545202ULL, (uint64_t){}, \"{}\" }};",
+                                 value.len(), name, value.len(), escaped);
+                            wln!(self, "#define {} ((const char*)&{}_s.bytes)", name, name);
                             self.string_consts.insert(value.clone(), name);
                         }
                     }
@@ -1647,7 +1656,9 @@ impl CCodeGen {
                             let cname = format!("_str{}", idx);
                             idx += 1;
                             let escaped = Self::escape_c_string(name);
-                            wln!(self, "static const char {}[] = \"{}\";", cname, escaped);
+                            wln!(self, "static const struct {{ uint64_t hdr; uint64_t len; char bytes[{}+1]; }} {}_s = {{ 0x4649444553545202ULL, (uint64_t){}, \"{}\" }};",
+                                 name.len(), cname, name.len(), escaped);
+                            wln!(self, "#define {} ((const char*)&{}_s.bytes)", cname, cname);
                             self.string_consts.insert(name.clone(), cname);
                         }
                     }
@@ -3397,10 +3408,11 @@ impl CCodeGen {
         wln!(self, "    if (size < 0) { fprintf(stderr, \"p_malloc: negative size %lld\\n\", (long long)size); abort(); }");
         wln!(self, "    size_t total = (size_t)size + 8;");
         wln!(self, "    if (total > ((size_t)1 << 20)) {");
-        wln!(self, "        uint64_t* big = (uint64_t*)calloc(1, total);");
+        wln!(self, "        uint64_t* big = (uint64_t*)calloc(1, total + 8);");
         wln!(self, "        if (!big) { fprintf(stderr, \"p_malloc: OOM allocating %zu bytes\\n\", total); abort(); }");
         wln!(self, "        big[0] = P_BLOCK_MAGIC | P_CLASS_LARGE;");
-        wln!(self, "        return big + 1;");
+        wln!(self, "        big[1] = (uint64_t)total; /* p_realloc reads it */");
+        wln!(self, "        return big + 2;");
         wln!(self, "    }");
         wln!(self, "    int k = 4;");
         wln!(self, "    while (((size_t)1 << k) < total) k++;");
@@ -3436,14 +3448,70 @@ impl CCodeGen {
         wln!(self, "    if (!ptr) return;");
         wln!(self, "    uint64_t* b = (uint64_t*)ptr;");
         wln!(self, "    uint64_t h = b[-1];");
-        wln!(self, "    if ((h & ~(uint64_t)0xFF) == P_BLOCK_FREED) p_panic(\"Double free\");");
-        wln!(self, "    if ((h & ~(uint64_t)0xFF) != P_BLOCK_MAGIC) p_panic(\"Invalid free: not an allocated block\");");
-        wln!(self, "    int k = (int)(h & 0xFF);");
-        wln!(self, "    b[-1] = P_BLOCK_FREED | (uint64_t)k;");
-        wln!(self, "    if (k == P_CLASS_LARGE) { free(b - 1); return; }");
-        wln!(self, "    b[0] = (uint64_t)__p_free_lists[k];");
-        wln!(self, "    __p_free_lists[k] = b;");
+        wln!(self, "    /* small: [magic|k] at -8; large: [magic|63][total] at -16/-8 */");
+        wln!(self, "    if ((h & ~(uint64_t)0xFF) == P_BLOCK_MAGIC && (h & 0xFF) != P_CLASS_LARGE) {");
+        wln!(self, "        int k = (int)(h & 0xFF);");
+        wln!(self, "        b[-1] = P_BLOCK_FREED | (uint64_t)k;");
+        wln!(self, "        b[0] = (uint64_t)__p_free_lists[k];");
+        wln!(self, "        __p_free_lists[k] = b;");
+        wln!(self, "        return;");
+        wln!(self, "    }");
+        wln!(self, "    uint64_t h2 = b[-2];");
+        wln!(self, "    if ((h2 & ~(uint64_t)0xFF) == P_BLOCK_MAGIC && (h2 & 0xFF) == P_CLASS_LARGE) { b[-2] = P_BLOCK_FREED | P_CLASS_LARGE; free(b - 2); return; }");
+        wln!(self, "    if ((h & ~(uint64_t)0xFF) == P_BLOCK_FREED || (h2 & ~(uint64_t)0xFF) == P_BLOCK_FREED) p_panic(\"Double free\");");
+        wln!(self, "    p_panic(\"Invalid free: not an allocated block\");");
         wln!(self, "}");
+        // ─── 0004 allocator unification ───────────────────────────────────────
+        // The runtime's own string/buffer producers used the C library's
+        // malloc/strdup, so their results were plain blocks: the 0004 drop
+        // code (p_str_free / Vec_drop) probed the words in front of them,
+        // sometimes matched a plausible header, wrote P_STR_DEAD into a
+        // block header and freed mid-block — the heap corrupted a few
+        // allocations later (the fid emit crash in pe_dll_found). From here
+        // on the runtime allocates through the p_ family only.
+        // Block layouts: small [magic|k] at -8 (k even, from 2*klass);
+        // large (>1 MB) [magic|63][total] at -16/-8, data at -0.
+        wln!(self, "void* p_realloc(void* p, int64_t n) {{");
+        wln!(self, "    if (!p) return p_malloc(n);");
+        wln!(self, "    if (n <= 0) {{ p_free(p); return NULL; }}");
+        wln!(self, "    uint64_t* w = (uint64_t*)p;");
+        wln!(self, "    int64_t old = 0;");
+        wln!(self, "    uint64_t m2 = w[-2];");
+        wln!(self, "    if ((m2 & ~(uint64_t)0xFF) == P_BLOCK_MAGIC && (m2 & 0xFF) == P_CLASS_LARGE) {{");
+        wln!(self, "        old = (int64_t)w[-1];");
+        wln!(self, "    }} else {{");
+        wln!(self, "        uint64_t m1 = w[-1];");
+        wln!(self, "        int k = (int)(m1 & 0xFF);");
+        wln!(self, "        /* stored k is 2*class (or 2*class-1 for the shrunk class) */");
+        wln!(self, "        int c = (k + 1) / 2;");
+        wln!(self, "        old = (int64_t)1 << c;");
+        wln!(self, "        if (k == 2 * c - 1) {{ old -= old / 4; }}");
+        wln!(self, "        old -= 8;");
+        wln!(self, "    }}");
+        wln!(self, "    if (old < 0) old = 0;");
+        wln!(self, "    void* r = p_malloc(n);");
+        wln!(self, "    if (!r) return NULL;");
+        wln!(self, "    memcpy(r, p, (size_t)(old < n ? old : n));");
+        wln!(self, "    p_free(p);");
+        wln!(self, "    return r;");
+        wln!(self, "}}");
+        wln!(self, "void* p_calloc(int64_t n, int64_t sz) {{");
+        wln!(self, "    void* r = p_malloc(n * sz);");
+        wln!(self, "    if (r) memset(r, 0, (size_t)(n * sz));");
+        wln!(self, "    return r;");
+        wln!(self, "}}");
+        wln!(self, "char* p_strdup_p(const char* s) {{");
+        wln!(self, "    if (!s) return NULL;");
+        wln!(self, "    size_t l = strlen(s);");
+        wln!(self, "    char* r = (char*)p_malloc((int64_t)(l + 1));");
+        wln!(self, "    if (r) memcpy(r, s, l + 1);");
+        wln!(self, "    return r;");
+        wln!(self, "}}");
+        wln!(self, "#define malloc(n) p_malloc((int64_t)(n))");
+        wln!(self, "#define calloc(n, sz) p_calloc((int64_t)(n), (int64_t)(sz))");
+        wln!(self, "#define realloc(p, n) p_realloc((p), (int64_t)(n))");
+        wln!(self, "#define free(p) p_free(p)");
+        wln!(self, "#define strdup(s) p_strdup_p(s)");
         // stdlib regions allocate from the arena, so it releases them too.
         wln!(self, "void p_region_free(void* region) { (void)region; }");
         wln!(self, "void p_memset(void* ptr, int val, int64_t size) { if (ptr && size > 0) memset(ptr, val, (size_t)size); }");
@@ -3674,6 +3742,24 @@ impl CCodeGen {
         // [P_STR_RC + 1][len] bytes NUL), as fid's runtime does (runtime.fd
         // p_str_wrap) — the stdlib and the compiler's own sources use the
         // raw result as a str (pe_ir_enc.fd pe_dll_found).
+        wln!(self, "// 0004: a counted copy of a const string (the input is not freed)");
+        wln!(self, "static char* __p_str_copy_c(const char* s) {{");
+        wln!(self, "    if (!s) return NULL;");
+        wln!(self, "    size_t n = strlen(s);");
+        wln!(self, "    uint64_t* b = (uint64_t*)p_malloc((int64_t)(16 + n + 1));");
+        wln!(self, "    if (!b) return NULL;");
+        wln!(self, "    b[0] = 0x4649444500000000ULL + 1; /* P_STR_RC, one owner */");
+        wln!(self, "    b[1] = (uint64_t)n;");
+        wln!(self, "    memcpy((char*)(b + 2), s, n + 1);");
+        wln!(self, "    return (char*)(b + 2);");
+        wln!(self, "}}");
+        wln!(self, "// 0004: take ownership of a raw p_malloc string (counted copy, raw freed)");
+        wln!(self, "static char* p_str_own_c(char* s) {{");
+        wln!(self, "    if (!s) return s;");
+        wln!(self, "    char* r = __p_str_copy_c(s);");
+        wln!(self, "    p_free(s);");
+        wln!(self, "    return r;");
+        wln!(self, "}}");
         wln!(self, "static char* __p_str_wrap(const char* s) {{");
         wln!(self, "    if (!s) return NULL;");
         wln!(self, "    /* one counted copy per distinct name: p_getenv is called from");
@@ -4753,7 +4839,7 @@ impl CCodeGen {
         wln!(self, "    return -(int64_t)(idx + 1);");
         wln!(self, "}");
         // Shared memory — simple malloc-based, atomics use C11 stdatomic
-        wln!(self, "int64_t p_shared_alloc(int64_t size) { if (size < 0) return 0; uint64_t* b = (uint64_t*)calloc(1, (size_t)size + 8); if (!b) { p_panic(\"p_shared_alloc: out of memory\"); } b[0] = P_BLOCK_MAGIC | P_CLASS_LARGE; return (int64_t)(intptr_t)(b + 1); }");
+        wln!(self, "int64_t p_shared_alloc(int64_t size) { if (size < 0) return 0; void* r = p_malloc(size); if (!r) { p_panic(\"p_shared_alloc: out of memory\"); } return (int64_t)(intptr_t)r; }");
         wln!(self, "int64_t p_atomic_load(int64_t addr) { return atomic_load((atomic_int_least64_t*)(intptr_t)addr); }");
         wln!(self, "void p_atomic_store(int64_t addr, int64_t val) { atomic_store((atomic_int_least64_t*)(intptr_t)addr, val); }");
         wln!(self, "bool p_atomic_cas(int64_t addr, int64_t expected, int64_t new_val) {");
@@ -6946,6 +7032,9 @@ pub fn generate_c_units(
     let mut global_defs: Vec<String> = Vec::new();
     let mut global_externs: Vec<String> = Vec::new();
     let mut str_decls: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    // a 0004 literal spans two lines (struct decl + #define): collected here
+    let mut pending_str_name: Option<String> = None;
+    let mut str_decl_text = String::new();
     for line in prelude.lines() {
         let t = line.trim_start();
         if t.starts_with("static ") && t.contains(" _g_") {
@@ -6953,6 +7042,21 @@ pub fn generate_c_units(
             let decl = decl.trim_end_matches(';');
             global_defs.push(format!("{};", decl));
             global_externs.push(format!("extern {};", decl));
+        } else if t.starts_with("static const struct { uint64_t hdr; uint64_t len; char bytes[")
+                   && t.contains("_s = { 0x4649444553545202ULL") {
+            // Proposal-0004 literal: the struct declaration, and the #define
+            // that names its data bytes, belong to the same unit together
+            if let Some(name) = t.split("_s =").next().map(|d| d.rsplit(' ').next().unwrap_or("").to_string()) {
+                pending_str_name = Some(name);
+                str_decl_text.clear();
+                str_decl_text.push_str(line);
+                str_decl_text.push('\n');
+            }
+        } else if t.starts_with("#define _str") && t.contains("((const char*)&") && pending_str_name.is_some() {
+            str_decl_text.push_str(line);
+            if let Some(name) = pending_str_name.take() {
+                str_decls.insert(name, str_decl_text.clone());
+            }
         } else if t.starts_with("static const char _str") {
             if let Some(rest) = t.strip_prefix("static const char ") {
                 let name = rest.split('[').next().unwrap_or("").trim().to_string();
