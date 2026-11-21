@@ -29,8 +29,10 @@
 > select-statement slots a dominated block found by name move to the entry
 > block (lower.fd `Lowerer_txn_raw_slot`), and `ime_remap` covers
 > `PersistLoad`/`PersistSave`/`Backward` with `ime_unrenamed_uses` keeping
-> the values remap cannot rename (iropt_me.fd). Still open: the memo
-> mismatches (2g.93). Line numbers below are from Nov 9.
+> the values remap cannot rename (iropt_me.fd). 2g.93 fixed Nov 21
+> (c082ee6): `imc_verify_post` (ir_ser.fd) hashes the post-pass bytes of a
+> verified hit — comparing the recorded bytes-hash with `mec_fn_hash`
+> reported every changed function as a mismatch. Line numbers below are from Nov 9.
 
 - **Path:** `compiler/iropt.fd` — **3,656 LOC** on Nov 9 (11,145 on Nov 21)
 - **Role:** the IR optimizer that runs on `IrModule` before the own native backends (pe_ir and

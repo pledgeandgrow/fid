@@ -12,7 +12,10 @@
   2g.20). New open: `p_string_len`/`p_string_from` on a `str` parameter
   (2g.45), out-of-memory under pressure (2g.49), fixed arrays as results
   or reference parameters (2g.51), `u64` printed signed (2g.52), a panic's
-  line is core's `panic` wrapper (2g.77), a flaky parallel spawn (2g.113).
+  line is core's `panic` wrapper (2g.77). Fixed Nov 21 (c082ee6): the flaky
+  parallel spawn (2g.113) — `ipx_wait` re-reads the exit-code file up to 2 s,
+  since cmd's `echo %errorlevel%> file` creates it before writing
+  (interp-process-spawn-load-check.sh).
   Line numbers below are from Nov 9.
 - **Role:** the IR interpreter behind `fid run`. It walks the SSA IR of a
   lowered module (core included), one instruction at a time, over a

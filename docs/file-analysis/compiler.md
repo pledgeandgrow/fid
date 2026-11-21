@@ -18,7 +18,7 @@
 > `comptime_subst_errors()` through `enrich_errors` (:5443-5457) — an
 > explicit `comptime` that cannot be evaluated is a compile error again
 > (`FID_CT_FALLBACK=1` keeps the warn-and-run behavior; comptime_eval.md).
-> In the working tree (uncommitted, Nov 21): `substitute` now runs a
+> In the Nov 21 comptime commits: `substitute` now runs a
 > second time on `mono_result` right after `monomorphize` — "comptime
 > over instantiations" (§4.11): a generic function's comptime nodes, the
 > reflection its `comptime T: type` parameters drive, are evaluated once

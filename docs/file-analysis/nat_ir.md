@@ -20,11 +20,11 @@ the first read and shift.
 > docs/verification/kill-switches.md (`FID_NAT_OFF`, `FID_NAT_ON`,
 > `FID_NAT_DUMP`, `FID_VERIFY`). It also imports `mir`, `nat_thumb`,
 > `checks`, `inc`, `ast_ser`, `pgo` and `pe_ir_stubs`. Open bugs of Nov 21:
-> function-cache hits are not byte-identical (known-bugs 2g.82), the
-> allocation checker rejects argument-register hints on x86-64 (2g.88),
-> mutual and sibling tail calls are emitted as calls (2g.98), a
-> dynamically linked x86_64-linux image crashes in libc `strtod` (2g.99),
-> x86-64 CFI (2g.103, with nat_enc).
+> function-cache hits are not byte-identical (known-bugs 2g.82; the
+> hit-order cause fixed below — the whole not re-verified), x86-64 CFI
+> (2g.103, with nat_enc; partly checker artifact — see the check scripts).
+> Fixed since the check, below: 2g.88 (checker miss on argument-register
+> hints), 2g.94, 2g.98 (tail calls), 2g.99 (strtod/TLS), 2g.110.
 >
 > **Nov 21 (5fb5516) — 2g.88, 2g.94, 2g.98, 2g.99, 2g.110 fixed; the
 > env switches are cached once per image (RA14).** `ng_env_cache_load`
@@ -150,7 +150,7 @@ Before it: `set_native_runtime("linux_runtime")` merges
   functions of the input file (DB1).
 - **x86-64 xmm cache**: a chain of f64 operations keeps operands in
   xmm0/xmm1 instead of moving them again.
-- **In the uncommitted working copy**: `FID_NAT_ON=crashfree` drops panic
+- **Committed since the Nov 9 audit**: `FID_NAT_ON=crashfree` drops panic
   checks in `@crashfree` functions (WP11); `ng_call_mask_i` traces indirect
   call targets (WP5); leaf functions skip the frame (WP8); `ng_cold_last`
   moves segments that end in a trap to the end of the function (WP17).

@@ -12,10 +12,11 @@ one; that pass's record follows the template below.
 > **Nov 21 update:** `compiler/` has 80 modules (361,942 lines, `wc -l
 > compiler/*.fd`; 360,657 before debcee9 and 5fb5516, which grew 9 files
 > by +1,201 lines: compiler, comptime_eval, iropt, iropt_me, lower,
-> nat_enc, nat_ir, pe_ir, pe_ir_stubs; three files hold +84 uncommitted
-> lines for `comptime T: type`: parser.fd +61 parses them, comptime_eval.fd
-> +4 skips generics in pass 1, compiler.fd +19 re-runs `substitute` after
-> mono); 56 are reached from main.fd through `use`, 24 are not.
+> nat_enc, nat_ir, pe_ir, pe_ir_stubs; +84 lines for `comptime T: type`
+> landed in the comptime commits of the same day (parser.fd +61 parses
+> them, comptime_eval.fd +4 skips generics in pass 1, compiler.fd +19
+> re-runs `substitute` after mono); 56 are reached from main.fd through
+> `use`, 24 are not.
 > The 11 modules added since the audit have a page now (rows 69-79). Every
 > page's line count is of Nov 21, and each page has a dated note on what
 > changed since Nov 9: fixes (known-bugs 2g.1-2g.78), the new open bugs of
@@ -49,8 +50,8 @@ one; that pass's record follows the template below.
 | 10 | [codegen_riscv.fd](codegen_riscv.md) | dead | Unreached since MI18: `codegen --target riscv` is the machine layer |
 | 11 | [codegen_x64.fd](codegen_x64.md) | dead | Unreached since MI18 (only pe.fd imports it) |
 | 12 | [coff.fd](coff.md) | dead | Unreached since MI18; `codegen --coff` goes through nat_enc and fails on every program (2g.110) |
-| 13 | [compiler.fd](compiler.md) | live | Pipeline, 13,502 lines. warn mode and `@cfg(debug)` fixed (2g.9, 2g.14); unconditional `[build]`/`[prof]` stderr; `ccompile --fuzz-cov` double free (2g.83). debcee9: an unevaluated `comptime` is a compile error again. Uncommitted: second `substitute` pass post-mono (comptime over instantiations, §4.11) |
-| 14 | [comptime_eval.fd](comptime_eval.md) | live | `if` assignments in a `comptime fn` kept and errors returned (2g.19). debcee9 hardening (+345): fuel (`FID_CT_FUEL`), call-stack traces, checked arithmetic, consts evaluated, layouts read off a real `Lowerer`; impl-method substitution not re-checked. Uncommitted: generics skipped until the post-mono `substitute` (`comptime T: type`, §4.11) |
+| 13 | [compiler.fd](compiler.md) | live | Pipeline, 13,502 lines. warn mode and `@cfg(debug)` fixed (2g.9, 2g.14); unconditional `[build]`/`[prof]` stderr; `ccompile --fuzz-cov` double free (2g.83). debcee9: an unevaluated `comptime` is a compile error again. Comptime commits: a second `substitute` pass post-mono (comptime over instantiations, §4.11) |
+| 14 | [comptime_eval.fd](comptime_eval.md) | live | `if` assignments in a `comptime fn` kept and errors returned (2g.19). debcee9 hardening (+345): fuel (`FID_CT_FUEL`), call-stack traces, checked arithmetic, consts evaluated, layouts read off a real `Lowerer`; impl-method substitution not re-checked. Comptime commits: generics skipped until the post-mono `substitute` (`comptime T: type`, §4.11) |
 | 15 | [cowcheck.fd](cowcheck.md) | partly live | Report opt-in (`FIDES_COW_CHECK`), premise stale; walkers live in lowering |
 | 16 | [cparser.fd](cparser.md) | live | `parse-header`. `#if`/`#ifdef` evaluated where known (LG15); parameters keep their C type (2g.62); `long` always i32 |
 | 17 | [csplit.fd](csplit.md) | live | `split-c`, used by the release build. `static` stripped from the function head only (2g.1 fixed) |
@@ -83,7 +84,7 @@ one; that pass's record follows the template below.
 | 44 | [nat_ir.fd](nat_ir.md) | live | Machine layer, 41,010 lines: Linux, macOS, `--nat`, Cortex-M (nat_thumb). Page out of date. 5fb5516: FID_NAT_* cached per image (RA14); 2g.88, 2g.94, 2g.98 (MI28), 2g.99, 2g.110 fixed; 2g.82, 2g.103 |
 | 45 | [native_debugger.fd](native_debugger.md) | dead | No ptrace builtins |
 | 46 | [opt.fd](opt.md) | dead | Unreached since MI18; `fid opt` prints the IR after iropt. Jump-threading fix (2g.17) never run |
-| 47 | [parser.fd](parser.md) | live | 10,682 lines. Imported struct literals fixed (2g.38). Dead `parse_expr_iterative`; module globals never reset. Uncommitted: `comptime T: type` params parse, join `type_params` on `fn`/methods, rejected elsewhere |
+| 47 | [parser.fd](parser.md) | live | 10,682 lines. Imported struct literals fixed (2g.38). Dead `parse_expr_iterative`; module globals never reset. Comptime commits: `comptime T: type` params parse, join `type_params` on `fn`/methods, rejected elsewhere |
 | 48 | [pe.fd](pe.md) | dead | Unreached; `emit --boot` goes through pe_ir (`PEIR_BARE_BOOT`) |
 | 49 | [pe_ir.fd](pe_ir.md) | live | Default Windows backend, 9,010 lines. 5fb5516: `--leaks` roots (2g.81), f32 cast (2g.95), tail calls via a result slot (2g.98), global-RA bound (2g.80) fixed; `-g` locals (2g.104), FID_PROF root (2g.101); concurrency refusal not re-checked |
 | 50 | [pe_ir_enc.fd](pe_ir_enc.md) | live | Import directory size fixed at 20; no ASLR; writable `.rdata` (still true) |

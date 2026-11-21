@@ -9,7 +9,9 @@
 > as a `match` scrutinee crashed the stage-0 C generator (2g.26), two
 > signature-mismatched socket calls in `dump-c compiler/main.fd` (2g.31), a
 > user function named `byte` collides with rpcndr.h on Windows (2g.69), an
-> extern C name equal to a core function stops core's rename (2g.107).
+> extern C name equal to a core function stopped core's rename (2g.107,
+> fixed Nov 21: the extern registers only when no Fides function has the
+> name, so `abs` keeps `p_abs`; lg15-extern-core-name-check.sh).
 > `fid build` on a Linux or macOS host now goes through the machine layer
 > (CB4); the C path is `ccompile`, `dump-c`, `run --leaks/--checked-alloc`,
 > `build --via-c` and the fallback when the machine layer rejects a

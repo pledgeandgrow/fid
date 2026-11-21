@@ -18,8 +18,11 @@
   `Option<str>` typed `i64` (2g.54), `?` in a function returning `i64`
   (2g.55), `for x in v` over `&Vec<i64>` (2g.56), indexing a global Vec
   (2g.74), `"n = " + 5` accepted (2g.75), a non-void function that can end
-  without `return` (2g.76), an integer literal named by its narrowest type
-  in an error (2g.87), 14 of 422 expect-error tests fail (2g.112). Line
+  without `return` (2g.76). Nov 21: an integer literal is named `i64` in
+  an error now (2g.87 fixed, c082ee6); of 2g.112's 14 expect-error
+  failures the nesting test reaches the type checker's limit again and
+  four expectations were corrected — diag_reverse_operator_type,
+  frontend_trait_self and world_hermetic_clock are still accepted. Line
   numbers below are from Nov 9.
 - **Role:** Types, effects, capabilities, safety annotations, generics (bounds, inference), borrowed strings and `@scoped` structs, linear types, `@send`/`@sync`, sandbox checks. Runs on every compile path.
 - **Imports:** `core`, `vec`, `string`, `compiler::ast`, `compiler::escape` (`esc_idents_stmts`, for linear captures at :8374).

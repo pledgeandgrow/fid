@@ -3,9 +3,10 @@
 > **Nov 15:** every method named `drop` is a root (the compiler calls it at scope exit; known-bugs 2g.23).
 
 - **Path:** `compiler/reach.fd`
-- **LOC:** 515 (2026-11-21; 305 on 2026-11-10). Imported by main.fd and compiler.fd. New open
-  (known-bugs 2g.85): in a `--lib` build the callees of `--export` roots are not lowered, so an
-  export that calls a non-exported function returns 0 (`FID_LOWER_ALL=1` gives the right value).
+- **LOC:** 515 (2026-11-21; 305 on 2026-11-10). Imported by main.fd and compiler.fd. Fixed
+  Nov 21 (c082ee6, known-bugs 2g.85): the `--export` names are reachability roots
+  (`CGen_lib_export_names` feeds compiler.fd's `c_reach_keep_set`), so a `--lib` build
+  lowers what an export calls.
   Line numbers below are from Nov 10.
 - **Role:** compile time (competitive-roadmap CS4). Computes on the AST the
   set of functions a native build can reach, so lower.fd lowers only those.

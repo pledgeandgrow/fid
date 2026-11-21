@@ -14,14 +14,15 @@
 > tables and a PDB (`emit -g`, DB3; pdb.md); cold blocks follow a
 > `--profile-use` profile (pgo.md); `emit --boot` builds a Multiboot kernel
 > here (`PEIR_BARE_BOOT`, Nov 15). The HIGH concurrency finding below was
-> not re-checked. New open (known-bugs): a dead store in a partially
-> unrolled loop (2g.80), `--leaks` executables crash at once (2g.81), an
-> f32 result cast `as i64` gives i64::MAX (2g.95), test_simd_i64 crashes in
-> its `wrap:` case (2g.96), mutual tail calls overflow the stack (2g.98),
-> `FID_PROF=folded` stacks start at a wrong root (2g.101), wrong local
-> values under `emit -g` (2g.104), fixed arrays past ~28 KB passed by value
-> (2g.23, second entry). Fixed: `str_find`/`str_contains` needed `memchr`
-> (2g.58, Nov 16). Line numbers below are from Nov 9.
+> not re-checked. New on Nov 21, all fixed since (below and in c082ee6):
+> a dead store in a partially unrolled loop (2g.80), `--leaks` executables
+> crashed at once (2g.81), an f32 result cast `as i64` gave i64::MAX
+> (2g.95), test_simd_i64 crashed in its `wrap:` case (2g.96, fixed in
+> pe_ir_stubs), mutual tail calls overflowed the stack (2g.98),
+> `FID_PROF=folded` stacks started at a wrong root (2g.101), wrong local
+> values under `emit -g` (2g.104). Still open: fixed arrays past ~28 KB
+> passed by value (2g.23, second entry). Fixed: `str_find`/`str_contains`
+> needed `memchr` (2g.58, Nov 16). Line numbers below are from Nov 9.
 >
 > **Nov 21 (5fb5516) — 2g.80, 2g.81, 2g.95 and 2g.98 fixed.** 2g.81:
 > `pe_ir_needed_fns` (:168) adds `pert_leak_malloc`/`pert_leak_free`/
@@ -43,8 +44,13 @@
 > recursion no longer overflows the stack. 2g.80: `peir_global_ra`'s
 > live-into-block lower bound is `bstart - 1`, not `bstart` — a value
 > defined in a block laid out later (unrolled copies, chained backwards)
-> had started exactly there and shared a register while live. Still
-> open: 2g.101, 2g.104, 2g.23 (second entry).
+> had started exactly there and shared a register while live. Nov 21
+> (c082ee6): 2g.101 and 2g.104 fixed — the folded profile roots at
+> `__fid_entry` (`pe_pf_entry_b` in pe_runtime/conc.fd, SL15's report
+> clock too), and `peir_dbg_live` counts only the instructions in a
+> function's blocks (an inst the mid-end detached showed its stale slots
+> for main's locals; FID_PE_DEBUG_RA=1 marks parameters no-register so
+> they keep their frame slots). Still open: 2g.23 (second entry).
 
 - **Path:** `compiler/pe_ir.fd`
 - **LOC:** 9,010 (2026-11-21); 4,667 on Nov 9 (INDEX.md then said 3,102). Ported from `src/pe.rs`

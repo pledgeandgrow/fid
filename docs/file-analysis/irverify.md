@@ -5,8 +5,9 @@
 > **Nov 21:** 166 lines. The `asm!` clobber report is gone since
 > `peir_inst_operands` (checks.fd), which it reads operands through, skips
 > id -1 (known-bugs 2g.53, Nov 16). A stamp hit still
-> skips it (`FID_VERIFY` is not in the build key, 2g.15). New open: it
-> rejects two suite programs after iropt (2g.109).
+> skips it (`FID_VERIFY` is not in the build key, 2g.15). New on Nov 21:
+> it rejected two suite programs after iropt (2g.109, fixed the same day —
+> below; suite not re-run).
 >
 > **Nov 21 (5fb5516):** the two 2g.109 causes were fixed where they
 > lived — the select-statement slot a dominated block found by name is an

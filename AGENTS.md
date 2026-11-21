@@ -35,9 +35,16 @@ RELEASE=1 CC="zig cc" ./scripts/bootstrap.sh
 ./scripts/build-selfhost.sh          # stage-0 dump-c + C compile → release/fid-dev.exe
 #   (8 units at -O2 when STAGE0 has `fid split-c`, else one unit at -O0;
 #    STAGE0=release/fid.exe for the fast path: fid at -O2 runs ~17x faster;
-#    STAGE0 defaults to fidesc, which has no split-c. A failed split build
-#    falls back to one unit at -O0 and still exits 0, 2g.86: look for
-#    "8 units at -O2" in its output)
+#    STAGE0 defaults to release/stage0/fid.exe — pinned Nov 21 to a
+#    self-hosted 1.0.0+dev, hash in scripts/stage0.sha256 — else fidesc,
+#    which has no split-c. A failed split build falls back to one unit
+#    at -O0 and still exits 0, 2g.86: look for "8 units at -O2" in its
+#    output. SPLIT=1 CC=tcc is the fastest way to *a* fid for a one-shot
+#    smoke test; the -O2 split is worth it when the new fid itself does
+#    heavy compiling. `fid emit compiler/main.fd` is NOT a dev shortcut
+#    yet: Nov 21 it finished in 5m18s (iropt 97s + pe_ir emission 188s)
+#    but the produced binary panicked on `run hello` — unresolved-label
+#    warnings, a live pe_ir miscompile of the tree.)
 
 .\release\fid.exe dump-c compiler/main.fd > c2.c   # self-compile (fixpoint)
 .\release\fid.exe run tests/bootstrap/hello.fd    # interpreter (as fidesc run)

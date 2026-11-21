@@ -8,7 +8,7 @@
   Nov 21: imported by compiler, comptime_eval, main, pe_ir and secrecy. A capitalised
   `Name { field:` is a struct literal even when the struct comes from an import (known-bugs
   2g.38, fixed Nov 15, test_import_struct_lit). `parse_expr_iterative` is still there (only
-  called from itself). In the working tree (uncommitted, Nov 21):
+  called from itself). In the Nov 21 comptime commits:
   `comptime T: type` parameters (reference.md §4.11). `parse_params`
   accepts `comptime name : type` and collects `name` in the new
   `p_ct_type_params` field (:306, reset at entry :2874); other comptime

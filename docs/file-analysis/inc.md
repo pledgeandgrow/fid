@@ -12,10 +12,12 @@
 > release build keys every cache on `fid_build_source` plus the
 > executable's size instead of a hash of the whole executable (D9,
 > build_info.md). New open: a function-cache hit image is not
-> byte-identical to a cache-off one (2g.82), a fresh project never takes
-> core's unit from the seeded store (2g.91), and a `dyn` call whose impl
-> is in another IR unit of `ccompile --inc` has no dispatch candidates
-> (2g.92). Line numbers below are from Nov 9.
+> byte-identical to a cache-off one (2g.82 — its hit-order cause fixed
+> Nov 21, nc_skel_fn replays the recording's asks first; the whole not
+> re-verified), a fresh project never takes core's unit from the seeded
+> store (2g.91), and a `dyn` call whose impl is in another IR unit of
+> `ccompile --inc` has no dispatch candidates (2g.92; repro check
+> tests/tooling/inc-ir-dispatch-check.sh). Line numbers below are from Nov 9.
 
 **Path:** `compiler/inc.fd` — **889 lines** on Nov 9 (1,751 on Nov 21; 166 on Oct 22). Imports `ir`.
 

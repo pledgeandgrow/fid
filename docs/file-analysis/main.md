@@ -20,10 +20,12 @@
 > "weaker C path" finding applies only to `--via-c` / `FIDES_BUILD_VIA_C=1`
 > and to the fallback for a program the machine layer rejects. `fid test`
 > runs the bootstrap suite itself. `run --trace f,g` traces calls (CT10).
-> Still true: `run --timeout` is only printed with `-v`. New open: the
-> Windows reduce watchdog runs a .bat by bare name (known-bugs 2g.105),
-> `ccompile --cpu x86-64-v3` with zig cc passes `-march=x86-64-v3`, which
-> zig 0.16 rejects (2g.111). Line numbers below are from Nov 9.
+> Still true: `run --timeout` is only printed with `-v`. New open, both
+> fixed Nov 21 (c082ee6): the Windows reduce watchdog ran a .bat by bare
+> name — it runs `.\_fid_reduce_cmd.bat` now (2g.105); `ccompile --cpu
+> x86-64-v3` with zig cc passed `-march=x86-64-v3`, which zig 0.16
+> rejected — the names are mapped to zig's spelling (2g.111,
+> op20-zig-cpu-check.sh). Line numbers below are from Nov 9.
 
 - **Path:** `compiler/main.fd`
 - **LOC:** 9,570 (2026-11-21; 3,349 on Nov 9)

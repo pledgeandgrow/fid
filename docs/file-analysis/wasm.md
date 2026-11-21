@@ -9,7 +9,9 @@
 - **Path:** `compiler/wasm.fd`
 - **LOC:** 4,247 (2026-11-21; 1,656 on Nov 9; Rust `src/wasm.rs`: 1,277). Nov 21: imported by
   compiler.fd and main.fd (`fid wasm`), and imports `checks`; `fid wasm` runs no IR optimizer.
-  New open (known-bugs 2g.108): a struct returned through a function value comes back wrong.
+  Fixed Nov 21 (c082ee6, known-bugs 2g.108): a struct returned through a function value
+  came back wrong — `CallPtr` now passes the out-pointer first, before the env, as a
+  direct call and nat_ir do.
 - **Role:** `IrModule` → WASM binary (`generate_wasm` :1580), or a section
   listing (`dump_wat` :1586). `WasmBuf` byte emitter; host imports from
   `env`; control flow as a `cur_block` local + `br $dispatch` loop.

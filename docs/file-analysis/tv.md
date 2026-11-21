@@ -48,10 +48,18 @@ expectations are caught, but `FID_VALIDATE=1 emit test_ssa_validate.fd`
 rejects inline2 on `Str_drop` ("the blocks changed"; 1 rejected, 25 not
 checkable of 37), so tv-check ends with 3 failed (known-bugs 2g.90).
 
+Fixed Nov 21 (c082ee6, 2g.90): the Str_drop rejection was a false alarm —
+inline2 also copies multi-block callees and splits blocks, which sits
+outside iro_inline's witness, so a result whose blocks changed is `n/a`,
+not rejected (`tv_blocks_kept`). Injected faults now go to a value the
+function's behavior depends on (`tv_live_of`, `tv_pure_value`; the
+module's constant globals are facts, `tv_gconst_facts`), which is why
+most "not caught" faults had rightly changed nothing. tv-check not re-run.
+
 ## Findings
 
-- **MEDIUM — OPEN (2g.90):** the inline2 rejection on `Str_drop` is not
-  triaged: a miscompile in inline2 or a false alarm of the check.
+- **MEDIUM — FIXED Nov 21 (2g.90):** the inline2 rejection on `Str_drop`
+  was a false alarm of the check, fixed as above.
 - **INFO:** the checks trust the IR's effect annotations (a call marked
   pure is a function of its arguments) and leave dominance to the IR
   verifier (irverify.fd, `FID_VERIFY=1`). Results neither check applies to

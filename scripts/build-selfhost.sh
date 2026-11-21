@@ -16,7 +16,15 @@
 set -u
 cd "$(dirname "$0")/.." || exit 1
 OUT=release
-STAGE0="${STAGE0:-./target/release/fidesc}"
+# As scripts/bootstrap.sh: prefer the pinned self-hosted stage 0 (which has
+# `split-c` and builds 8 units at -O2) over a cold fidesc start.
+STAGE0="${STAGE0:-}"
+if [ -z "$STAGE0" ]; then
+  for cand in "release/stage0/fid.exe" "release/stage0/fid"; do
+    [ -x "$cand" ] && STAGE0="$cand" && break
+  done
+  STAGE0="${STAGE0:-./target/release/fidesc}"
+fi
 mkdir -p "$OUT"
 
 if [ -n "${CC:-}" ]; then

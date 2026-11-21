@@ -208,6 +208,7 @@ the debug table; `SUITE=1` for B8, `FIXPOINT=1` for B9). Not run yet
         `Shape::area` dispatch has no candidates; inc-ir-units-check.sh
         fails 3 checks); the `[inc] layouts` debug line is missing; no
         static instance copies (B3); SUITE=1 not run.
+      Nov 21: a repro check of the cross-unit dispatch gap (2g.92) was added — tests/tooling/inc-ir-dispatch-check.sh; not fixed.
 - [~] B2. Cross-module type info: struct layouts and enum tags must be
         identical across module objects — export a canonical layout table,
         hash it, include in the module's dep key.
@@ -235,6 +236,7 @@ the debug table; `SUITE=1` for B8, `FIXPOINT=1` for B9). Not run yet
         only. Left: on the default IR-unit path a new struct in lib1 also
         rebuilds main, and there is no per-unit layout table or `[inc]
         layouts` line (both checks fail); SUITE=1 not run.
+      Nov 21: see B1 — the same repro covers a unit that must not rebuild on another's struct edit; not fixed.
 - [~] B3. Monomorphization policy: generic instances are emitted in the
         *caller's* module unit (like C++ templates) — an instance's key
         includes the generic's source hash + the concrete type args.
@@ -400,6 +402,7 @@ the debug table; `SUITE=1` for B8, `FIXPOINT=1` for B9). Not run yet
         keeping the files ran out of memory (shared machine), so whether the
         difference is real is unknown. Next: rerun on a quiet machine with
         the script's trap off and diff ref.c against inc.c.
+      Nov 21 (c082ee6): inc-check.sh's FIXPOINT keeps work under KEEP=<dir> (ref.c, inc.c, logs) and reports a failed dump-c separately from a C difference.
 
 ## Phase C — Effect-scoped invalidation (the novel part)
 

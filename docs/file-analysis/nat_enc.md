@@ -13,12 +13,15 @@ Audited 2026-11-09 (new doc).
 > Finding 2 is fixed for Linux (TG14, `FID_NAT_OFF=wxsplit` turns it
 > off): the code is mapped read/execute and the data read/write from the
 > next page, with PT_GNU_STACK; Linux images can be position-independent
-> (`--pie`). New open: DWARF of optimized builds gives an inlined
-> function's line to its caller (known-bugs 2g.102), x86-64 CFI names
-> saves the prologue does not make (2g.103), `--nat` Windows and macOS
-> builds accept a call to an undefined C function (2g.106), COFF objects
-> (`codegen --coff`, `emit --obj --nat`) fail with `undefined symbol:
-> FreeLibrary` (2g.110). The text below is of Nov 9.
+> (`--pie`). New on Nov 21: DWARF of optimized builds gave an inlined
+> function's line to its caller (known-bugs 2g.102 — decl_line fixed
+> Nov 21 in c082ee6, `nat_dbg_decl_line` scans the function's own rows;
+> the shadowed-name half is open), x86-64 CFI names saves the prologue
+> does not make (2g.103 — the check scripts now model deferred saves and
+> remember/restore_state; the stores question not re-checked). Fixed in
+> 5fb5516 (below): `--nat` Windows and macOS builds accepted a call to an
+> undefined C function (2g.106), COFF objects failed with `undefined
+> symbol: FreeLibrary` (2g.110). The text below is of Nov 9.
 >
 > **Nov 21 (5fb5516) — 2g.106 fixed, and the TLS half of 2g.99.**
 > `nat_pe_link_missing` (:3133) is the Windows `nat_elf_link_missing`: it
@@ -36,8 +39,13 @@ Audited 2026-11-09 (new doc).
 > file bytes, so the executable's static TLS block lands right below the
 > thread pointer where `nat_tls_get` reads `fs:[-8]`; `x64_store_fs`
 > encodes the matching store. 2g.110's fix is on the nat_ir side
-> (`ng_ldyn_ok` no longer refuses a COFF or Mach-O object). Still open:
-> the DWARF/CFI findings (2g.102, 2g.103).
+> (`ng_ldyn_ok` no longer refuses a COFF or Mach-O object). Nov 21
+> (c082ee6): `nat_dbg_decl_line` scans the function's own rows for its
+> `fn` line — a function starting with inlined code no longer takes the
+> callee's decl_line (the DB2 half of 2g.102). Still open: the
+> shadowed-name half of 2g.102 and the CFI findings (2g.103, partly
+> checker artifact — cfi_saves_check.py and sw_cfi_check.py now model
+> deferred saves and DW_CFA_remember/restore_state).
 
 - **Path:** `compiler/nat_enc.fd`
 - **LOC:** 12,948 (2026-11-21; 1,369 on Nov 9)

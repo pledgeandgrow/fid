@@ -35,7 +35,7 @@
 > `ce_has_annotation` — is deleted; `use compiler::ir`, `compiler::lower`
 > are new). Splice errors reach the fatal list (`ct_fatal_splice`), and a
 > `reflect` error is fatal even under `FID_CT_FALLBACK` (it used to lower
-> to 0). In the working tree (uncommitted, Nov 21): generics are
+> to 0). In the Nov 21 comptime commits: generics are
 > templates — `substitute`'s need-scan and the `ct_comptime_fns`
 > registration both skip any function with `type_params` (:1577, :1628),
 > so a generic's comptime nodes and a generic `comptime fn` are left for

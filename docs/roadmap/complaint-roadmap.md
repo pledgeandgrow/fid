@@ -66,6 +66,7 @@ The ten that matter most, in order:
       1), and nat_ir re-emits pe_win_dl_load/find/unload/call on every warm
       build. The front end still runs on the whole program (~1.0 s wall per
       edit through pe_ir).
+      Nov 21: see CS6 — the memo-verify mismatches (2g.93) were the comparison, not the replay.
 - [~] CB4. **"CMake, Makefiles, build.rs: a second language just to build"** (C,
       C++, Rust). One command, `fid build`, no build scripts; native Windows
       executables need no linker. Left: the same on Linux and macOS (L).
@@ -134,6 +135,7 @@ The ten that matter most, in order:
       grep: it needs `grep -qF -- "$LOC"`). Left: --nat Windows and both
       macOS targets build such a program with no error (it exits 127 at
       run time); fix the script's grep and its WSL library copy.
+      Nov 21 (5fb5516, 2g.106): `--nat` Windows and macOS name an undefined C function at build time (nat_pe_link_missing, nat_macho_link_missing; cb9_dll_sdk_check.sh).
 
 ## Track CM — Memory and safety
 
@@ -509,6 +511,7 @@ The ten that matter most, in order:
       location (scale.acc/step); the checks fail by default (no room for
       DB3's .buildid, test functions the inliner now removes,
       dbg_run_check.py matches a line without its file); gdb not run.
+      Nov 21: the shadowed-name half of 2g.102 stays open; the decl_line half is fixed (llvm DB2).
 - [ ] CT7. **"The bug only happens in production"** (all). Record the inputs every
       effect brings in; replay the run exactly, in the interpreter, step by step (L).
 - [~] CT8. **"Coverage needs another tool"** (C, C++, Go before 1.20). `fid test
@@ -815,6 +818,7 @@ The ten that matter most, in order:
       test_frontend_units_dims_int_fail expects `got i64`, but the compiler
       says `got i8` (the literal 2 is typed i8), so the suite's expected-fail
       check fails on it: fix the message or the test. Not run on Linux.
+      Nov 21 (c082ee6, 2g.87): an unsuffixed integer literal is named `i64` in the message (test_diag_int_literal_i64_fail).
 
 ## Track CO — Observability and production
 
@@ -895,6 +899,7 @@ The ten that matter most, in order:
       `-| called from main` line, so the native trace and `fid inspect`
       checks fail on all three; the native version string is hard-coded
       (`fid 1.0.0+dev (native)`); macOS and a Linux host not run.
+      Nov 21 (c082ee6, 2g.100): panic and its callers are never inlined (ime_panic_frame; FID_IROPT_OFF=panicframe restores it), so the innermost function keeps a frame in the native trace; the report's line format and hard-coded version not re-checked.
 
 ## Track CI — Interop and platforms
 
@@ -910,6 +915,7 @@ The ten that matter most, in order:
       (`conflicting types for 'abs'`: core's `abs` is emitted unrenamed once
       stdlib.h declares it, codegen_c.fd sanitize_c_name); --nat Windows and
       macOS nat_ir do not call C functions.
+      Nov 21 (c082ee6, 2g.107): an extern name registers only when no Fides function has it — core's `abs` keeps `p_abs` under stdlib.h's extern.
 - [ ] CI2. **"cgo makes builds slow and cross-compiling hard"** (Go). C calls cost
       nothing at build time on the native backend (no C compiler) (M).
 - [~] CI3. **"Callbacks from C are unsafe and awkward"** (Rust, Go). A named Fides

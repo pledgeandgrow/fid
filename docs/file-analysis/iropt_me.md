@@ -25,8 +25,11 @@
 > there: the dead-store miscompile was pe_ir's global register allocator
 > starting a later-laid-out block's value on a live register (pe_ir.md),
 > and the sra crash was `ng_rf_promote` writing its zero-words before the
-> argument moves of the prologue (nat_ir.md `ng_rf_zero_at`). Still open:
-> inline2 on `Str_drop` (2g.90).
+> argument moves of the prologue (nat_ir.md `ng_rf_zero_at`). 2g.90 is
+> fixed in tv.fd (c082ee6): the inline2 rejection on `Str_drop` was a
+> false alarm (a result whose blocks changed is `n/a`, not a fault), and
+> `ime_panic_frame` keeps `panic` and its callers out of inlining for the
+> native crash trace (CO9).
 
 - **Path:** `compiler/iropt_me.fd` — **2,342 LOC** on Nov 9 (6,608 on Nov 21)
 - **Role:** the mid-end passes that change the CFG or memory shape, called by `iropt_native`
