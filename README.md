@@ -14,7 +14,7 @@
 
 <p align="center">
   <a href="https://fid-lang.org/playground"><img alt="Try it in your browser" src="https://img.shields.io/badge/try%20it-in%20your%20browser-C2255C?style=for-the-badge"></a>
-  <a href="https://fid-lang.org/docs/install"><img alt="Install" src="https://img.shields.io/badge/install-v0.8.0--unstable-262626?style=for-the-badge"></a>
+  <a href="https://fid-lang.org/docs/install"><img alt="Install" src="https://img.shields.io/badge/install-v0.8.2--unstable-262626?style=for-the-badge"></a>
   <a href="https://fid-lang.org/docs"><img alt="Documentation" src="https://img.shields.io/badge/read-the%20docs-262626?style=for-the-badge"></a>
 </p>
 
@@ -249,10 +249,10 @@ Signatures for every module: [API reference](https://fid-lang.org/reference).
 
 Fid is young and moving fast.
 
-- **Releases:** v1.0.0 shipped Sep 9, 2026; the newest tagged build is the **v0.8.0-unstable** prerelease (Nov 10). The tree is in 1.0 release preparation — `fid version` reports `1.0.0+dev`.
+- **Releases:** v1.0.0 shipped Sep 9, 2026; the newest tagged build is the **v0.8.2-unstable** prerelease (Nov 21). The tree is in 1.0 release preparation — `fid version` reports `1.0.0+dev`.
 - **Generated code is slower than Rust's.** Through C, Fid is fastest on one of four benchmarks and up to 1.6 times slower on the others; native output is slower still. [Benchmarks, losses included](docs/benchmarks.md).
 - **The package index is just starting.** `ark` installs from a path, a git repository or [the pacts index](https://github.com/pledgeandgrow/pacts) (`fid ark add textkit`, verified on Windows, Linux CI and macOS CI); few pacts are published yet.
-- **The fixpoint was last verified on Nov 8, 2026,** on a tree less than half today's size. On Nov 21 the current tree built in one step from a self-hosted fid (Nov 18), and the result passes run, emit, ccompile and the leak gate.
+- **The fixpoint was re-verified on Nov 21, 2026:** stage 2 and stage 3 are byte-identical on the current ~361K-line tree, and the result passes run, emit, ccompile and the leak gate.
 - **The full test suite has not been rerun with the current compiler.** Features are checked with their own tests on each backend, and the suite has grown ~3x since the last full run.
 - **Not for safety-critical use.** `fid qualify` produces evidence for review, not a certification.
 
