@@ -9,7 +9,7 @@
 # starts with it (`guard = guard + 1;`, `region.x = 1;`) is read as that
 # keyword's statement and fails; await/comptime/spawn/try also fail as an
 # operand, so those may not name a variable at all. On Nov 15 every CI build
-# (ci.yml, macos.yml, bench.yml, bare-metal.yml) stopped at stage 1 with
+# (ci.yml, bench.yml, bare-metal.yml) stopped at stage 1 with
 # "Parse error at 2183:31: unexpected token 'Eq'": a `guard = guard + 1;` in
 # compiler/comptime_eval.fd. This check finds those statements without
 # building anything, so it can run first in CI.

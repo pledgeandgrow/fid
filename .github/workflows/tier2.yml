@@ -10,12 +10,12 @@
 #                                   (scripts/cross-test.sh NATIVE=1).
 #                                   (GitHub retired macos-13: macos-15-intel
 #                                   is its Intel runner now.)
-#   riscv64-linux  ubuntu-latest    `fid emit --target riscv64-linux`: hello
-#                                   and the suite under qemu-riscv64 (user
-#                                   mode), against `fid run`
-#   Both also run the suite through C (`fid ccompile`, zig cc) with
-#   scripts/tier2.sh: lane c:x86_64-macos on the Intel Mac, c:riscv64-linux
-#   under qemu.
+#                                   Also runs the ark checks (N1, pacts) —
+#                                   the only macOS job that does.
+#   It also runs the suite through C (`fid ccompile`, zig cc) with
+#   scripts/tier2.sh, lane c:x86_64-macos. riscv64-linux used to run here
+#   too; suite-all.yml covers both its lanes under qemu, so this job was
+#   dropped.
 #   aarch64-windows and x86_64-freebsd (C through zig cc): the suite is
 #   built on ubuntu-latest by scripts/tier2.sh (job build-only: every binary
 #   checked by scripts/bin-target-check.py), then run where it runs:
@@ -50,9 +50,6 @@ jobs:
           - platform: macos-x64
             os: macos-15-intel
             target: x86_64-macos
-          - platform: riscv64-linux
-            os: ubuntu-latest
-            target: riscv64-linux
     runs-on: ${{ matrix.os }}
     timeout-minutes: 300
     defaults:
@@ -66,12 +63,6 @@ jobs:
       - uses: mlugg/setup-zig@v2.2.1
         with:
           version: 0.16.0
-      - name: mold and qemu-user (Linux)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq mold qemu-user
-      - name: RISC-V C library for qemu-user (CI4; dynamic native programs)
-        if: matrix.target == 'riscv64-linux'
-        run: sudo apt-get install -y -qq libc6-riscv64-cross
       - name: coreutils (macOS; GNU timeout for the suite scripts)
         if: runner.os == 'macOS'
         run: |
@@ -100,10 +91,7 @@ jobs:
           esac
           chmod +x build/tier2/hello
           ./release/fid run tests/bootstrap/hello.fd > build/tier2/hello.ref
-          case "$TARGET" in
-            riscv64-linux) qemu-riscv64 build/tier2/hello > build/tier2/hello.got ;;
-            *)             ./build/tier2/hello > build/tier2/hello.got ;;
-          esac
+          ./build/tier2/hello > build/tier2/hello.got
           diff -u build/tier2/hello.ref build/tier2/hello.got
 
       - name: The suite on ${{ matrix.target }}, compared with the interpreter
@@ -117,6 +105,21 @@ jobs:
           TARGET: ${{ matrix.target }}
           CC: zig cc
         run: LANES="c:$TARGET" FID=release/fid JOBS=3 bash scripts/tier2.sh
+
+      - name: ark on a clean machine, and the package index (N1, pacts)
+        # the only macOS job that checks ark (macos.yml was folded into
+        # this one): a clean-machine workflow, the four suites, and the
+        # live package index
+        if: always()
+        env:
+          CC: zig cc
+        run: |
+          bash scripts/ark-check.sh release/fid
+          for t in ark-paths ark-features ark-projects ark-registry; do
+            echo "== $t"
+            bash tests/ark/$t.sh ./release/fid
+          done
+          ./release/fid ark search textkit | grep -q '^textkit 1\.'
 
       - name: Every suite binary is a well-formed Mach-O (x86_64-macos)
         if: always() && matrix.target == 'x86_64-macos'

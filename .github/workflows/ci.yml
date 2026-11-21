@@ -1,7 +1,8 @@
 # Quick checks on every push and pull request to main.
 #
 #   rust      the frozen Rust bootstrap compiler (src/) builds and its unit
-#             tests pass, on Linux and Windows; it runs hello.fd.
+#             tests pass on Linux (Windows: the selfhost-windows job builds
+#             the same compiler and more); it runs hello.fd.
 #   selfhost  the self-hosted compiler fid is built from compiler/*.fd in one
 #             stage (scripts/build-selfhost.sh) and runs and compiles a few
 #             programs, and the leak gate passes; `fid build` needs no C
@@ -12,10 +13,12 @@
 #             example projects, fmt and lint on the tree, the installed layout.
 #   selfhost-windows  the same user-facing checks on Windows.
 #   natgate   the own-backend gate (scripts/nat-gate.sh), the whole suite on
-#             x86_64-linux, aarch64-linux and riscv64-linux (qemu-user): the
-#             IR verifier and the allocation checker on every emit; the
-#             rules proved by z3 (scripts/rules-smt.sh); the encoder oracles
-#             (scripts/enc-oracle.py).
+#             x86_64-linux: the IR verifier and the allocation checker on
+#             every emit; the rules proved by z3 (scripts/rules-smt.sh); the
+#             encoder oracles for all three architectures
+#             (scripts/enc-oracle.py). aarch64-linux runs the suite on real
+#             hardware in tier1.yml, riscv64-linux under qemu in
+#             suite-all.yml, so they do not also run here.
 #   gates     checks of the tree alone: the miscompile log names a test for
 #             every fixed bug, every pass switch is documented, every gate a
 #             roadmap goal put into CI is still wired (ci-wiring-check.sh).
@@ -28,7 +31,7 @@
 # The fuzzers and sanitizers run every night (verify-nightly.yml); the
 # clean-tree bootstrap, mutants, pass toggles, coverage and the Linux
 # benchmark tables every week (verify-weekly.yml); the 5% slowdown gate on
-# every push (bench.yml).
+# every pull request (bench.yml).
 
 name: CI
 
@@ -48,17 +51,12 @@ concurrency:
 
 jobs:
   rust:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: mold (the Linux linker .cargo/config.toml asks for)
-        if: runner.os == 'Linux'
+      - name: mold (the linker .cargo/config.toml asks for)
         run: sudo apt-get update -qq && sudo apt-get install -y -qq mold
       - name: Build
         run: cargo build --release
@@ -224,16 +222,18 @@ jobs:
   natgate:
     # The own-backend gate (docs/roadmap/llvm-roadmap.md RL7, RA16): the IR
     # verifier and the register-allocation checker on every emit of the
-    # whole suite (ALL=1), one job per Linux target: x86_64-linux runs
-    # natively on ubuntu-latest, AArch64 and RISC-V 64 under qemu-user.
+    # whole suite (ALL=1), on x86_64-linux natively. aarch64-linux runs the
+    # suite on real hardware in tier1.yml and riscv64-linux under qemu in
+    # suite-all.yml, so natgate does not repeat them under qemu.
     # The rewrite rules are tested and proved by z3 (ME17; REQUIRE_Z3=1
-    # makes a missing solver a failure, not a skip); the encoder oracles run
-    # once, on the x86_64-linux job. (The compile-time gate, SP15, is in
-    # bench.yml, which builds the base commit's fid on the same runner.)
+    # makes a missing solver a failure, not a skip); the encoder oracles for
+    # all three architectures run on this job. (The compile-time gate, SP15,
+    # is in bench.yml, which builds the base commit's fid on the same
+    # runner.)
     strategy:
       fail-fast: false
       matrix:
-        target: [x86_64-linux, aarch64-linux, riscv64-linux]
+        target: [x86_64-linux]
     runs-on: ubuntu-latest
     timeout-minutes: 240
     steps:
@@ -242,15 +242,8 @@ jobs:
       - uses: mlugg/setup-zig@v2.2.1
         with:
           version: 0.16.0
-      - name: mold, qemu-user
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq mold qemu-user
-      - name: The target's C library for qemu-user (CI4)
-        # A native Linux program that calls C functions is dynamic (CI2):
-        # qemu-user loads it with /usr/<arch>-linux-gnu's ld.so, which
-        # cross-test.sh's run-all.sh passes as QEMU_LD_PREFIX. Without it
-        # such tests are SKIP, and REQUIRE_LOADER=1 below fails the gate.
-        if: matrix.target != 'x86_64-linux'
-        run: sudo apt-get install -y -qq libc6-arm64-cross libc6-riscv64-cross
+      - name: mold
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq mold
       - name: z3 (the z3-solver wheel; rules-smt.sh uses its Python module)
         run: python3 -m pip install --quiet z3-solver
       - name: Build the Rust bootstrap compiler
@@ -260,7 +253,6 @@ jobs:
           CC: zig cc
         run: ./scripts/build-selfhost.sh
       - name: Rules proved by z3, every obligation unsat (ME17)
-        if: matrix.target == 'x86_64-linux'
         run: bash scripts/rules-smt.sh release/fid-dev
       - name: nat-gate on ${{ matrix.target }}, the whole suite (RA16)
         env:
@@ -287,7 +279,6 @@ jobs:
         # program compared with `fid run`. Reported, not yet a gate: wine
         # is not Windows (scripts/cross-from-linux.sh is the gate, on a
         # Windows host with WSL: the PEs built in WSL run on Windows itself)
-        if: matrix.target == 'x86_64-linux'
         continue-on-error: true
         env:
           FID: release/fid-dev
@@ -298,7 +289,7 @@ jobs:
           sudo apt-get install -y -qq --no-install-recommends wine wine64
           bash scripts/cross-test.sh x86_64-windows-pe
       - name: Windows PEs from Linux, results
-        if: always() && matrix.target == 'x86_64-linux'
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: cross-windows-from-linux-${{ github.run_id }}
@@ -308,7 +299,6 @@ jobs:
       - name: Encoder oracles, AArch64 / RV64 / x86-64 against clang (RL8, TG4)
         # every instruction form nat_enc.fd emits, encoded by fid and by
         # clang's assembler (zig cc -c); the exit status counts mismatches
-        if: matrix.target == 'x86_64-linux'
         run: python3 scripts/enc-oracle.py --fid release/fid-dev --zig zig
 
   gates:

@@ -4,8 +4,9 @@
 # the tree only). Each check names the goal; a workflow edit that drops one
 # fails here instead of silently.
 #
-#   RA16  ci.yml natgate: ALL=1 nat-gate.sh on x86_64/aarch64/riscv64-linux,
-#         with qemu-user
+#   RA16  ci.yml natgate: ALL=1 nat-gate.sh on x86_64-linux (aarch64-linux
+#         runs on real hardware in tier1.yml, riscv64-linux under qemu in
+#         suite-all.yml)
 #   ME17  ci.yml: z3-solver installed, scripts/rules-smt.sh run
 #   SP15  bench.yml: scripts/compile-gate.sh, base records, head checked
 #   CU7   ci.yml: doctest.py --emit for the native-only examples
@@ -24,7 +25,7 @@
 #   RL2   every lane of scripts/suite-all.sh run on push and pull request
 #         (tier1.yml, suite-all.yml; scripts/suite-lanes-check.sh)
 #   F5    ci.yml gates: stage0-names-check.sh (sources parse with fidesc,
-#         which every fid build, macos.yml and fides-os's CI start from)
+#         which every fid build and fides-os's CI start from)
 #   I6    verify-nightly.yml: soak_http.py over a socket under wrk
 #   M8    ci.yml: sanitize.sh on a sample; verify-nightly.yml: on the suite
 #   N2    ci.yml: quickstart-check.sh on Linux and Windows
@@ -51,8 +52,7 @@ need() {
 W=.github/workflows
 need RA16 $W/ci.yml "bash scripts/nat-gate.sh \${{ matrix.target }}"
 need RA16 $W/ci.yml 'ALL: "1"'
-need RA16 $W/ci.yml "target: [x86_64-linux, aarch64-linux, riscv64-linux]"
-need RA16 $W/ci.yml "qemu-user"
+need RA16 $W/ci.yml "target: [x86_64-linux]"
 need ME17 $W/ci.yml "pip install --quiet z3-solver"
 need ME17 $W/ci.yml "bash scripts/rules-smt.sh release/fid-dev"
 need ME17 $W/ci.yml 'REQUIRE_Z3: "1"'
@@ -124,8 +124,8 @@ need BM10 $W/verify-weekly.yml "name: bench-weekly-history"
 need BM10 $W/pages.yml "bash bench/page-merge.sh"
 need RT11 $W/verify-weekly.yml "bash bench/idle/run.sh"
 need VF4 $W/verify-weekly.yml "variant: [peir-global-ra, peir-coalesce, peir-volatile-ra, peir-xmm-ra, peir-rotate]"
-# batch 8: AD3 fides-os booted by every compiler change, PL7 the suite on
-# macOS, TL10 the editor configs exercised
+# batch 8: AD3 fides-os booted weekly (not per push: its drift is not the
+# commit's), PL7 the suite on macOS, TL10 the editor configs exercised
 need AD3 $W/bare-metal.yml "repository: pledgeandgrow/fides-os"
 need AD3 $W/bare-metal.yml "run: bash scripts/fides-os-boot.sh"
 need AD3 $W/bare-metal.yml "run: SELFTEST=1 bash scripts/fides-os-boot.sh"
@@ -169,16 +169,15 @@ need PL2 $W/tier1.yml "bash tests/tooling/pl2-lane-skips-check.sh"
 need PL2 scripts/cross-test.sh 'LANE_SKIPS="${LANE_SKIPS:-scripts/lane-skips.txt}"'
 need PL2 scripts/cross-test.sh "bin-target-check.py --loader -"
 need PL2 scripts/bin-target-check.py "def runtime_imports(d):"
-# CI4: the native Linux suite on all three targets runs every test, the
-# dynamic ones too (the target's C library for qemu-user, REQUIRE_LOADER)
-need CI4 $W/ci.yml "libc6-arm64-cross libc6-riscv64-cross"
+# CI4: the native Linux suite runs every test, the dynamic ones too (the
+# target's C library for qemu-user, REQUIRE_LOADER): x86_64-linux in
+# ci.yml natgate, riscv64-linux under qemu in suite-all.yml
 need CI4 $W/ci.yml 'REQUIRE_LOADER: "1"'
 need CI4 scripts/nat-gate.sh 'if [ "${REQUIRE_LOADER:-}" = 1 ]'
 need CI4 $W/suite-all.yml "libc6-riscv64-cross"
-need CI4 $W/tier2.yml "libc6-riscv64-cross"
-# PL3: Tier 2 builds and runs x86_64-macos (Mach-O checked) and riscv64-linux
+# PL3: Tier 2 builds and runs x86_64-macos (Mach-O checked); riscv64-linux
+# moved to suite-all.yml (both its lanes under qemu)
 need PL3 $W/tier2.yml "target: x86_64-macos"
-need PL3 $W/tier2.yml "target: riscv64-linux"
 need PL3 $W/tier2.yml "python3 scripts/macho-check.py"
 need PL3 $W/tier2.yml 'bash scripts/cross-test.sh "$TARGET"'
 # PL3: all four through C (scripts/tier2.sh), Windows ARM64 and FreeBSD
