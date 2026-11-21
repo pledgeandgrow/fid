@@ -22,7 +22,7 @@ Tests that need SDL2, OpenGL, libsqlite3 or POSIX headers are skipped unless
 added Nov 4–6 were checked with quick runs (`fid run`, `fid ccompile`,
 `fid emit`, outputs compared): among them `test_generics_full`,
 `test_generic_infer_fail`, `test_generic_bound_fail`,
-`test_turbofish_arity_fail`, `test_if_expr_value`, `test_cfg` (all 3
+`test_diag_turbofish_count_fail`, `test_if_expr_value`, `test_cfg` (all 3
 backends), `test_mem_owned_drop`, `test_iter_invalidation_fail`,
 `test_race_ptr_fail`, `test_parallel_branches` (all 3 backends),
 `test_borrowed_str`, `test_borrowed_str_return_fail`,

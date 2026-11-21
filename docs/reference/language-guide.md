@@ -286,7 +286,7 @@ result mentions a parameter; a type parameter nothing gives is an error.
 Bounds (`T: A + B`) are checked at each call; a turbofish `f::<T>()` must give
 as many types as `f` has parameters (`test_generics_full.fd`,
 `test_generic_infer_fail.fd`, `test_generic_bound_fail.fd`,
-`test_turbofish_arity_fail.fd`). Methods of a generic `impl` are typed per
+`test_diag_turbofish_count_fail.fd`). Methods of a generic `impl` are typed per
 receiver. There are no `where` clauses.
 
 ### 3.5 Traits (caps)

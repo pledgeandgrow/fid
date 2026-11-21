@@ -1010,7 +1010,7 @@ gp             = T [":" Trait {"+" Trait}] | N ":" int-type
 - An integer literal given for a type parameter is an `i64`.
 - `f::<T, U>(args)` gives the type arguments; their number must equal the
   function's type parameters (`mono.fd:mono_turbofish_callee`;
-  `test_turbofish_arity_fail.fd`). Only a plain function name takes a turbofish.
+  `test_diag_turbofish_count_fail.fd`). Only a plain function name takes a turbofish.
 - A reference cannot be a generic argument (§8.4).
 - Methods of a generic `impl` are typed per receiver: on a `Slot<f64>` the
   method's `T` is `f64`. On a value written without type arguments (a bare

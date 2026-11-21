@@ -2036,10 +2036,9 @@ fn real_main() {
                 "test_sensitive_fail",
                 // CO6: a required config key no source supplies panics
                 "test_config_missing_fail",
-                // Proposal 0002: inference, bounds and turbofish arity
+                // Proposal 0002: inference and bounds
                 "test_generic_infer_fail",
                 "test_generic_bound_fail",
-                "test_turbofish_arity_fail",
                 // Release L1: safety annotations see methods, fn parameters,
                 // loop trip counts and @tainted parameters
                 "test_safety_method_alloc_fail",
@@ -2109,32 +2108,8 @@ fn real_main() {
                     }
                 }
             }
-            // Also scan tests/selfhost/ — self-hosted compiler module tests (SH-6).
-            // probe_* and test_pe_ir_* are development diagnostics that need
-            // the compiler's own modules: not part of the suite.
-            if let Ok(entries) = fs::read_dir("tests/selfhost") {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.extension().map_or(false, |e| e == "fd") {
-                        let stem = path.file_stem().unwrap().to_string_lossy().to_string();
-                        if stem.starts_with("probe") || stem.starts_with("test_pe_ir") {
-                            continue;
-                        }
-                        let is_fail = expected_fail.contains(&stem.as_str());
-                        let is_bench = stem.starts_with("bench_");
-
-                        if fail_only {
-                            if is_fail {
-                                test_files.push(path.to_string_lossy().to_string());
-                            }
-                        } else {
-                            if !is_fail && !is_bench {
-                                test_files.push(path.to_string_lossy().to_string());
-                            }
-                        }
-                    }
-                }
-            }
+            // tests/selfhost/ is owned by verify-selfhost.sh (3 backends, its
+            // own baseline): the suite does not scan it.
             test_files.sort();
 
             if test_files.is_empty() {

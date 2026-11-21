@@ -9172,7 +9172,7 @@ needs its own verification pass that rejects non-conforming code.
 keeps its type, a type parameter is inferred or an error, bounds `T: A + B`
 are checked, turbofish has an arity check (`test_generics_full`,
 `test_generic_infer_fail`, `test_generic_bound_fail`,
-`test_turbofish_arity_fail`). Left: per-instantiation layout (a payload is one
+`test_diag_turbofish_count_fail`). Left: per-instantiation layout (a payload is one
 word; wide values go through a heap copy that is not freed), method-level type
 parameters. `fidesc` is frozen and does not get this.
 

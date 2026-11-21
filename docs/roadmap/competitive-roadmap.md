@@ -1770,7 +1770,7 @@ Reach what Rust, Go, Zig and C++ programmers expect on day one.
       Done (release K9, in `fid`): every bound of `T: A + B` is checked at the
       call; a type parameter is inferred or an error; turbofish with an arity
       check (`test_generic_bound_fail`, `test_generic_infer_fail`,
-      `test_turbofish_arity_fail`). Left: associated types, default methods
+      `test_diag_turbofish_count_fail`). Left: associated types, default methods
       and trait objects, not checked against this goal.
       Nov 15: an impl method is checked against the trait's (parameter
       count, `self`, and every parameter and return type the trait writes

@@ -11458,8 +11458,8 @@ mod tests {
     /// canonical sequence covering every encoder helper (including the
     /// R12/R13 SIB and disp8=0 cases), resolves labels and RIP-relative
     /// references, then builds .rdata and a full PE file. Writes three hex
-    /// lines (text, rdata, pe) to pe_enc_ref.txt for `fidesc run
-    /// tests/selfhost/test_pe_ir_enc.fd` output to be diffed against.
+    /// lines (text, rdata, pe) to pe_enc_ref.txt for a selfhost-side
+    /// encoding test's output to be diffed against.
     #[test]
     fn dump_pe_ir_enc_reference() {
         fn hex(v: &[u8]) -> String {

@@ -60,7 +60,7 @@ In the self-hosted compiler (`compiler/*.fd`); the Rust compiler is frozen
   the heap, so `Option<Pt>` returned from a function stays valid, and copied
   back out on a match. Tests: `test_generics_full.fd`, `test_generics_real.fd`,
   `test_generic_infer_fail.fd`, `test_generic_bound_fail.fd`,
-  `test_turbofish_arity_fail.fd`.
+  `test_diag_turbofish_count_fail.fd`.
 - Left: generic structs and enums laid out per instantiation (a payload is
   still one word; wide values go through a heap copy, which is not freed);
   method-level type parameters (`map<U>`, core's `map` is `fn(T) -> T`);
@@ -74,7 +74,7 @@ the type parameter 'T' of 'make'"), bounds `T: A + B` are checked at the call
 turbofish `f::<T>()` must give as many types as `f` has parameters. Tests:
 `test_generics_full.fd`, `test_generics_real.fd`,
 `test_generic_infer_fail.fd`, `test_generic_bound_fail.fd`,
-`safety/test_generic_unbound_fail.fd`, `test_turbofish_arity_fail.fd`
+`safety/test_generic_unbound_fail.fd`, `test_diag_turbofish_count_fail.fd`
 (checked with `fid run`, `fid ccompile` and `fid emit`; the full suite has
 not been rerun since Nov 2). The rules: [reference.md §7](../reference/reference.md#7-generics).
 The "Left" list above was written on Nov 3 and has not been rechecked.

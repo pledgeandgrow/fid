@@ -1103,7 +1103,7 @@ mentions a parameter (`val z: i64 = zero();`). A parameter nothing gives is an
 error (`cannot infer the type parameter 'T' of 'make'`). Bounds `T: A + B` are
 checked at each call. Tests: `test_generics_full.fd`,
 `test_generic_infer_fail.fd`, `test_generic_bound_fail.fd`,
-`test_turbofish_arity_fail.fd`; design: proposal 0002. There are no `where`
+`test_diag_turbofish_count_fail.fd`; design: proposal 0002. There are no `where`
 clauses.
 
 ### 13.2 Generic Types

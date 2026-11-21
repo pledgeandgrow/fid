@@ -44,7 +44,7 @@ reference.md is right. Counts: [selfhost.md → Numbers](selfhost.md#numbers).*
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| Generics (proposal 0002) | ✅ | Inference or an error, bounds `T: A + B` checked, turbofish `f::<T>()` with arity check (`test_generics_full`, `test_generic_infer_fail`, `test_generic_bound_fail`, `test_turbofish_arity_fail`) |
+| Generics (proposal 0002) | ✅ | Inference or an error, bounds `T: A + B` checked, turbofish `f::<T>()` with arity check (`test_generics_full`, `test_generic_infer_fail`, `test_generic_bound_fail`, `test_diag_turbofish_count_fail`) |
 | `if`/`match` values | ✅ | The value of the branch taken, also as a function's last statement (`test_if_expr_value`) |
 | `@cfg` | ✅ | `platform`/`os = "…"`, `linux`/`windows`/`macos`, arch, debug/release filter functions and structs; the host OS decides; `release` always on, `debug` off (`test_cfg`, all 3 backends) |
 | Freeing memory | ✅ | Vec/HashMap locals, a `Vec<str>`/`Vec<Vec>` that owns its elements, collections declared in a `region` at its end, string temporaries (`test_mem_owned_drop`). No GC; everything else lives until exit (leaks, never dangles) |
