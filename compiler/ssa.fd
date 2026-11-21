@@ -1653,6 +1653,10 @@ fn ssa_materialize(f: & mut IrFunction, cfg: & IroCfg, st: & SsaState, exits: & 
         }
     }
     {
+        // per use, a fresh load right before it (the slot model's exact
+        // position: a store to the slot between the phi's block and the
+        // use must be seen by the use, which a load at the block top
+        // would miss)
         var vphi2: Vec<i64> = peir_zeros(f.next_value + 1);
         var k5: i64 = 0;
         while k5 < np2 {
@@ -1663,48 +1667,41 @@ fn ssa_materialize(f: & mut IrFunction, cfg: & IroCfg, st: & SsaState, exits: & 
         }
         var b3: i64 = 0;
         while b3 < nb {
-            var m3: Vec<i64> = peir_zeros(f.next_value + 1);
-            var fresh: Vec<i64> = Vec::new();
-            var any3: bool = false;
             var ops4: Vec<i64> = Vec::new();
             var bids3: Vec<i64> = f.blocks.get(b3).instructions;
+            var out3: Vec<i64> = Vec::new();
+            var any3: bool = false;
             var w4: i64 = 0;
             while w4 < bids3.len() {
                 ops4.clear();
                 peir_inst_operands(peir_inst_of(f, bids3.get(w4)), & mut ops4);
+                var hit: i64 = 0 - 1;
                 var o3: i64 = 0;
-                while o3 < ops4.len() {
+                while o3 < ops4.len() && hit < 0 {
                     var u3: i64 = ops4.get(o3);
-                    if u3 >= 0 && u3 < vphi2.len() && vphi2.get(u3) > 0 && m3.get(u3) == 0 && st.ph_block.get(vphi2.get(u3) - 1) != b3 {
-                        var k4: i64 = vphi2.get(u3) - 1;
-                        var ty3: IrType = ssa_alloca_ty(f, st.cands.get(st.ph_cand.get(k4)));
-                        var ld3: i64 = ssa_detached(f, Inst::Load(slot.get(k4), ty3));
-                        m3.set(u3, ld3 + 1);
-                        fresh.push(ld3);
-                        any3 = true;
+                    if u3 >= 0 && u3 < vphi2.len() && vphi2.get(u3) > 0 && st.ph_block.get(vphi2.get(u3) - 1) != b3 {
+                        hit = u3;
                     }
                     o3 = o3 + 1;
+                }
+                if hit >= 0 {
+                    var k4: i64 = vphi2.get(hit) - 1;
+                    var ty3: IrType = ssa_alloca_ty(f, st.cands.get(st.ph_cand.get(k4)));
+                    var ld3: i64 = ssa_detached(f, Inst::Load(slot.get(k4), ty3));
+                    var m3: Vec<i64> = peir_zeros(f.next_value + 1);
+                    m3.set(hit, ld3 + 1);
+                    out3.push(ld3);
+                    out3.push(bids3.get(w4));
+                    IrFunction_set_inst(f, bids3.get(w4), ssa_remap(peir_inst_of(f, bids3.get(w4)), & m3));
+                    any3 = true;
+                } else {
+                    out3.push(bids3.get(w4));
                 }
                 w4 = w4 + 1;
             }
             if any3 {
-                var bids4: Vec<i64> = Vec::new();
-                var f3: i64 = 0;
-                while f3 < fresh.len() {
-                    bids4.push(fresh.get(f3));
-                    f3 = f3 + 1;
-                }
-                var w5: i64 = 0;
-                while w5 < bids3.len() {
-                    var qid2: i64 = bids3.get(w5);
-                    if qid2 != 0 - 1 {
-                        IrFunction_set_inst(f, qid2, ssa_remap(peir_inst_of(f, qid2), & m3));
-                    }
-                    bids4.push(qid2);
-                    w5 = w5 + 1;
-                }
                 var blk3: BasicBlock = f.blocks.get(b3);
-                blk3.instructions = bids4;
+                blk3.instructions = out3;
                 f.blocks.set(b3, blk3);
             }
             b3 = b3 + 1;

@@ -240,6 +240,11 @@ in memory. This track is where most of the speed is.
       10-30% slower with inline2 on (best of 5: 3,699 -> 4,053 ms); on
       --nat, test_ai_stdlib and test_machine_brflags2 fail the allocation
       checker under FID_VERIFY=1 only with inline2 on; a whole-suite run.
+      Nov 21 (evening): test_machine_brflags2 and test_regex_linear pass
+      FID_VERIFY=1 on --nat with inline2 on again (the 2g.88 operand-copy
+      fix, ng_arg_fit_end's cpy bit); test_ai_stdlib still needs a re-run
+      with a self-hosted-lineage binary (the fidesc-built class runs out
+      of arena on it, 2g.79).
 - [x] OP6. Constant propagation, folding and branch elimination (M).
       Done (Nov 4, native path): integer arithmetic and comparisons on two
       constants are folded when the result cannot overflow. Left: propagation,
@@ -299,6 +304,9 @@ in memory. This track is where most of the speed is.
       (licmguard 3 and 6 operations, vecdata 4 reads). Left: licmguard and
       vecdata are still opt-in, waiting for the full NAT=1 licmguard-check
       suite run (only a 60-program sample was run).
+      Nov 21 (evening): on by default — `licmguard` and `vecdata` joined
+      IME_DEFAULT_ON (compiler/iropt_me.fd); FID_IROPT_OFF turns each off.
+      Nov 21: see WP19 — the FID_VERIFY rejections (2g.109) are fixed in lower and iropt_me.
 - [~] OP10. Strength reduction and induction variables (M).
       Partial (this session, `iro_iv`, gate `FID_IROPT_OFF=iv`,
       debug `FID_IV_DBG=1`): finds a plain local stored once per
@@ -359,6 +367,7 @@ in memory. This track is where most of the speed is.
       0 by default, above 0 only with FID_IROPT_OFF=inline2). Left: fix
       partial unrolling on pe_ir or take `unroll` out of IME_DEFAULT_ON;
       SUITE=1 and BENCH=1 not run.
+      Nov 21 (5fb5516): the partial-unroll miscompile the check hit (2g.80) was pe_ir's global register allocator (llvm ME24), fixed there — the unroller itself was right (test_unroll_dead_store).
 - [~] OP12. Scalar replacement of structs, and returning small structs in registers
       (L).
       Checked Nov 15 (llvm ME26, ME27): written, opt-in
@@ -497,6 +506,7 @@ in memory. This track is where most of the speed is.
       x86-64, RISC-V and --nat Windows; split_alloc_unit has 1 rejected x64
       random program; 5 of 69 test_machine programs fail FID_VERIFY=1 on
       x86-64 by default (they pass with FID_NAT_OFF=argfree or arghint).
+      Nov 21: 2g.88 fixed — the allocation checker's rejection of argument-register work was its own miss (llvm RA3/RA7).
 - [~] OP17. Floats in xmm registers, not stack slots (L). Done Nov 7: f64
       values and locals get xmm6/xmm7 (callee-saved, all 128 bits saved) and,
       with no call in their live range, xmm2-xmm5; every move to and from a
@@ -540,6 +550,16 @@ in memory. This track is where most of the speed is.
       fused into a read-modify-write (a load-op and a separate store); the
       memcmp mutant segfaults instead of running; a NATIVE=1 cross-test of
       x86_64-linux and --nat beyond a sample.
+      Nov 21 (evening): the load-on-the-right case fuses. The two-address
+      form (`and d, d, x`, d the operation's own destination) blocked the
+      operand-safety check (the deleted operation "defined" its other
+      operand) and the unchanged-register test (ng_fb_same saw the
+      operation, not the operand's value): ng_fuse_rmw now allows k itself
+      to define the other operand (ng_fb_defines_any_but) and accepts the
+      register unchanged from the operation to the store when nothing
+      between rewrites it (ng_fb_redef). `fn fr(p: & mut C, x) {
+      p.b = x & p.b; }` compiles to one `and [rdi+8], rdx` on --nat, same
+      output as before. Left: the memcmp mutant; the cross-test.
 - [x] OP19. A peephole pass on the native path (M).
       Verified Nov 15: the machine layer's `ng_peep` (compiler/nat_ir.fd,
       on MIR before allocation, every target; `FID_NAT_OFF=peep`):
@@ -565,6 +585,7 @@ in memory. This track is where most of the speed is.
       (0 -> 3), baseline gives the default image. Left: `ccompile --cpu
       x86-64-v3` with CC="zig cc" does not build (zig wants x86_64_v3:
       "unknown CPU"); ANDN is not selected on pe_ir.
+      Nov 21 (c082ee6, 2g.111): `--cpu` names are mapped to zig's spelling (`x86-64-v3` → `x86_64_v3`; op20-zig-cpu-check.sh).
 
 **Vectorization**
 
@@ -583,6 +604,7 @@ in memory. This track is where most of the speed is.
       panics (invalid memory access) at its wrapping case;
       test_machine_simd fails the allocation checker on sse, avx2 and --nat
       (the arghint/argfree issue); f32 SIMD (Vec<f32> element reads wrong).
+      Nov 21: the crash under this goal's check (2g.96, test_simd_i64) was pe_ir_stubs' itoa buffer clobbering r14, fixed — not the @simd lowering.
 - [~] OP22. Automatic loop vectorization: SSE2, AVX2 (XL).
       (Checked Nov 15: no vectorizer in iropt.fd or nat_ir.fd; it needs
       OP21's vector MIR first. The old PIR path's `loop-vec` pass (opt.fd)
@@ -597,6 +619,16 @@ in memory. This track is where most of the speed is.
       vectorized ("the accumulator read in the loop header");
       vectorize_check.sh fails 22 checks, because its functions are now
       inlined into one() and it passes MSYS paths to wsl.exe.
+      Nov 21 (evening): the accumulator's load may sit in the loop header
+      (nat_ir.fd ng_vz_class: after the ssa round trip the phi-slot load
+      is the header's top instruction) — it is the same loop-carried start
+      value the generated code loads before the vector loop, so the
+      reduction shape is accepted there too. With K10's is_simd riding
+      inlining (iropt_me.fd ime_inline_site), a @simd checked reduction
+      still vectorizes with the default ssa on. Left: the checked + lanes
+      outside @simd, AVX2 lanes 2/3 of a reduction (MO_VLANE reads 0/1
+      only), float sums (f64 stores of the accumulator are refused by the
+      store-shape check).
 - [~] OP23. Vectorized `memcpy`, `memchr`, string compare and hashing in the runtime
       (M).
       Nov 17: the Linux runtime's copy, compare, search and hash go through
@@ -646,6 +678,17 @@ in memory. This track is where most of the speed is.
       check; inner_sq and sq_big lose their checks with rangedom off too,
       so the test no longer shows what rangedom does; the suite with
       rangedom off against the default.
+      Nov 21 (evening): a back edge no longer empties a loop header's
+      range set (checks.fd peir_join_set + peir_join_stored): a fact every
+      scanned way in carries survives when the back edge cannot break it —
+      a fact on a value the loop body never re-defines, or on a plain
+      local the body never stores (the store walk is bounded; a fact it
+      cannot prove is dropped, as before). Sound in one pass: the fact
+      holds at the first entry and the body preserves it. Left for the
+      sieve's outer `p * p` and `m + p`: the Vec::filled bound of a
+      parameter (the cf/dom fact on n) does not reach the square rule's
+      bound at the outer header (p gets isqrt(i64), not isqrt(2^48)) — a
+      filled-fact plumbing gap this does not touch.
 - [~] OP25. Effects drive optimization: `pure` calls merged, moved out of loops and
       removed; no-write calls keep memory facts alive (L).
       Merged (llvm WP9): `ru_pure_cse` (compiler/rules.fd, native paths)
@@ -1334,6 +1377,7 @@ This is the race we can win outright, since no rival's speed comes for free.
       test_hashmap 98/116) although the executables are byte-identical, so
       the memo is not shown sound (it is already on by default for `emit
       -o` through CB3); a one-line edit still takes 700 ms (target 100).
+      Nov 21 (c082ee6, 2g.93): the verify comparison hashes the post-pass bytes of a hit (imc_verify_post) — the mismatches were comparing unlike hashes, not wrong replays.
 - [x] CS7. A fast debug mode with no optimizer, and a release mode (S).
       Done: `--debug` (C at -O0) and `--release` (-O2) on `ccompile` in both compilers.
 - [x] CS8. No linear scans in the self-hosted compiler: tables, not `Vec` searches
@@ -1476,6 +1520,7 @@ language lives.
       SMT obligation. So the Nov 16 "Done" does not hold: these passes are
       not validated yet. Left: catch those faults, triage the inline2
       rejection, SMT obligations, then the SUITE=1 run.
+      Nov 21 (c082ee6, 2g.90): tv distinguishes a real fault from a witness out of scope (`n/a` when inline2 changed the blocks) and injects into values the output depends on (tv_live_of).
 - [~] VF7. Mutation testing of the compiler: a broken pass must fail a test (L).
       Verified Nov 15: the tool exists, `scripts/verify/variants.py mutate`
       (Nov 7; backend mutants added under RL11): eleven mutants (fold,
@@ -1991,6 +2036,7 @@ Reach what Rust, Go, Zig and C++ programmers expect on day one.
       ("conflicting types for 'abs'": an extern C name equal to a core
       function stops core's abs -> p_abs rename), while `fid emit` of it
       prints 5; --nat Windows and macOS still call no C functions.
+      Nov 21 (c082ee6, 2g.107): an extern C name no longer stops a core function's rename (`abs` stays `p_abs`; lg15-extern-core-name-check.sh).
 - [~] LG16. C++ interop for the common cases (XL).
       Nov 16 (not yet built), the first step: a C++ header (`.hpp`, `.hh`,
       `.hxx`, or one with `namespace`) imports through compiler/cparser.fd
@@ -2373,6 +2419,7 @@ owning what we ship.
       (pert_prof_watch_main resets its ticks on every report, so the event
       at 0.8 s restarts the 1 s timer); sl15-check.sh mangles WSL paths and
       takes Git Bash's PID for the Windows one.
+      Nov 21 (c082ee6, 2g.101): pert_prof_watch_main's periodic report keeps its own clock — an event-triggered report no longer restarts the 1 s timer.
 - [x] SL16. Big integers and decimals (M).
       Done: `stdlib/bigint.fd` (`test_bigint.fd`) and `stdlib/decimal.fd`:
       exact decimals on a BigInt mantissa, division and rounding to a scale
@@ -2527,6 +2574,7 @@ Go and Rust won developers with tools as much as with languages.
       texts, and diag_reverse_operator_type, frontend_trait_self and
       world_hermetic_clock are accepted by `check`; errors on structs
       still have no line.
+      Nov 21: the nesting test reaches the type checker's 512 limit through an operator chain (2g.112) and four expectations were corrected; diag_reverse_operator_type, frontend_trait_self and world_hermetic_clock are still accepted.
 - [~] TL3. `fid fix`: applies suggested fixes, and upgrades code between versions (L).
       Done (Nov 15): `fid fix <file.fd> [--check]` (main.fd cmd_fix, the fix
       engine in lsp.fd fix_suggestions/fix_apply, shared with the editor's

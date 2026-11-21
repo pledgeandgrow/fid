@@ -221,6 +221,14 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       on AArch64, 1968 on RISC-V) with 0 spills, but machine_frame_check
       wants under 512 bytes and fails on 3 targets. Left: what else takes
       ~1.9 KB of big's frame; pe_ir's frame (MI17).
+      Nov 21 (evening): spilled vregs whose position ranges never overlap
+      share one slot (ng_mir_alloc_body: a linear range covers every point
+      a vreg's slot is written or read, so disjoint ranges cannot see each
+      other's bytes; the scan is bounded at 4096 spilled vregs). Measured
+      on `big` (x86_64-linux): frame 1952 before and after — its spills'
+      ranges overlap, so nothing is shared there; the 1.9 KB is something
+      else (machine_frame_check's under-512 goal is still open, and its
+      stdlib-parse leg is flaky on the fidesc-built binary class).
 - [ ] MI9. Struct values as several MIR values when small (scalar replacement at
       the machine level), memory otherwise (M).
 - [x] MI10. A MIR verifier: every use defined, every block terminated, operand
@@ -296,6 +304,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       pe_ir: loop 6635 vs 2274 ms, sieve 1381 vs 501, hashmap 2340 vs 1622
       (fib and bench_float faster). Left: the checker failures, speed, the
       suites with winfregs/splitfloat.
+      Nov 21: 2g.88 fixed (see RA3) — the checker's rejection of argument-register hints on x86-64 was its own miss.
 - [x] MI15. A Linux x86-64 target on MIR for free once x64 is ported: the ELF
       writer of `nat_enc.fd`, the Linux runtime, x64 selection (M).
       Nov 9: Linux x86-64 on the MIR (`fid emit --target x86_64-linux`): its own
@@ -327,6 +336,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       mi5_nat_peir_check on a 75-program sample: 72 same, 3 where `--nat`
       fixes pe_ir. Left: that pe_ir bug, the full-suite comparison, then
       retiring the lowerings (pe_ir is still the default).
+      Nov 21 (5fb5516, 2g.95): pe_ir's ConstFloat for F32 emits `p_f32_to_bits(value)` — it stored the f64 pattern's low 32 bits (0.0 for 2^63), which sent the saturating `f32 as i64` check to i64::MAX/MIN.
 - [~] MI18. Retire the old PIR path (`pir.fd`, `opt.fd`, `regalloc.fd`,
       `codegen_x64.fd`) and `build --native` with it (S).
       Nov 16: no build reaches PIR any more. `build --native` is the machine
@@ -365,6 +375,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       (kernel32 imports undefined), and the REPL `:opt` checks fail on
       inlined functions. Left: COFF, deleting the PIR files (still in the
       tree), STRICT=1, test_pir/test_opt in verify-selfhost.sh.
+      Nov 21: see RL9 — the COFF object path through nat_enc works (2g.110); coff.fd stays unreached.
 - [ ] MI19. Runtime primitives (`nat_ctx_swap`, atomics, `nat_clone_thread`,
       trampolines) written once in MIR where they can be, per target only where
       they must be (M).
@@ -465,6 +476,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       one frame. On AArch64 and RISC-V tailcall_deep overflows the stack
       (is_odd called from is_odd): those calls are not jumps there. Left:
       that; the check's runner passes Windows paths to wsl.exe.
+      Nov 21 (5fb5516, 2g.98): sibling and mutual tail calls are jumps again — pe_ir recognizes `Return(call)` and the inliner's store-call-to-slot shape (peir_tail_via_slot, peir_slot_forward, peir_slot_load_return; pe_tail_slot_check.sh; FID_PE_OFF=tail restores the call), and nat_ir keeps a tail call when the result needs MO_EXT (g_ng_ret_ext; the AArch64/RISC-V tailcall_deep overflow).
 - [x] MI29. Stack probes for frames over a page, so a large frame cannot jump over
       the guard region (S).
       Nov 15 (written; checked by the final build): `ng_probe_frame`
@@ -521,6 +533,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       whose argument or result is still to be read"): 5 of 69 test_machine
       programs under FID_VERIFY=1; without it they run right. Left: fix
       that (the assignment or the checker).
+      Nov 21: 2g.88 fixed — the checker now allows a range to end at a self-copy of the argument register into the range's value (ng_arg_fit_end); the argument-register passes stay on.
 - [~] RA4. Live-range splitting at calls and at loop boundaries, with spill code
       placed outside loops (L).
       Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
@@ -531,6 +544,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       programs agree with split off and on. Left: split_alloc_unit rejects 1
       x64 program, the splitall builds fail the argument-register check on
       x86-64, RISC-V and Windows, the suite spill numbers.
+      Nov 21: 2g.88 fixed (see RA3); the FID_NAT_ON=splitall rejections were the same checker miss.
 - [x] RA5. Spill weights from loop depth and use counts (M).
       Nov 9: `ng_spill_weights`: each use or definition 8^(loop depth), the
       loops from back edges in the MIR; with no register free the cheapest
@@ -556,6 +570,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       FID_VERIFY=1 the native suite fails on x86-64 Linux and `--nat`
       Windows (5 of 69 test_machine programs, with RA3's fill); the full
       suite.
+      Nov 21: 2g.88 fixed (see RA3) — hint- and fill-built assignments pass the allocation checker again (argreg_dead_def_check.sh).
 - [x] RA8. Rematerialization of constants, addresses of globals and frame slots
       instead of spills (M).
       Nov 9: constants: a vreg defined once by MO_LI is never stored, a spilled
@@ -626,6 +641,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       the mid-end is 6.1–9.5%). The main.fd default and fast-alloc rows
       panic in iro_sccp (integer overflow on subtraction). Left: a faster
       fast path, that panic, a run on a quiet machine.
+      Nov 21 (5fb5516): the FID_NAT_* switches are read once per image (ng_env_cache_load, g_ng_env_ok) instead of per move (copy hints) and per call (IPRA) — a large share of a debug build's allocation time. The SCCP panic the check hit (2g.89) is also fixed (SP11).
 - [x] RA15. An allocation checker: replay the allocated code symbolically and
       prove every use reads the value it should (regalloc2's checker) (L).
       Nov 8: `ng_mir_check`, an independent exact liveness walk; it found a real
@@ -657,6 +673,12 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       spilling, RISC-V 1.07 (slower, under qemu). Left: the RISC-V cost, the
       ratio table in docs/reference/callee-saved-floats.md, programs that
       start tasks; x86-64 has no callee-saved floats in this scheme.
+      Nov 21 (evening): callee-saved float registers are off on RV64
+      (ng_fcs_on): the measured 1.07 said twelve d-registers saved and
+      restored in every prologue cost more than the spills they avoided;
+      AArch64 (0.89) keeps them. A per-function cost model can bring them
+      back; the fcallee tests and the mutation are unaffected (the pool is
+      empty, ranges spill).
 - [~] RA19. A value used only as a branch condition stays in flags where the
       target has them (M).
       Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
@@ -813,6 +835,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       allocation check on every x86-64 target under FID_VERIFY=1, the pe_ir
       build of test_simd_i64 crashes in its wrap section, reductions (red6,
       redk) are not vectorized.
+      Nov 21 (5fb5516): the test_simd_i64 crash the check hit (2g.96) was an itoa scratch buffer under saved r14 in pe_ir_stubs, not SIMD codegen — fixed; the sse/avx2/neon/rvv images were right.
 - [~] TG12. Object files (COFF, ELF, Mach-O) from the same writer as executables,
       for linking with C (release F4) (M).
       Nov 16, ELF: `fid emit <file> --obj --target <linux> -o x.o` (main.fd
@@ -849,6 +872,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       x86_64/aarch64 Mach-O objects link. `fid emit --obj --nat` on a real
       program fails (the runtime's LoadLibraryA/GetProcAddress/FreeLibrary
       undefined). Left: that; running the Mach-O objects (no Mac).
+      Nov 21: see RL9 — `emit --obj --nat` and `codegen --coff` resolve the runtime's kernel32 imports now (2g.110).
 - [x] TG13. One image writer for PE, ELF and Mach-O: sections, relocations, symbol
       tables, written once (L).
       compiler/image_writer.fd; every writer (nat_enc.fd nat_elf /
@@ -1087,6 +1111,9 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       9 PASS on `--nat` (1063 values floated, 0 undone), all 8 x86_64-linux
       images right, a 60-test sample 52 SAME, 0 differ. Left: the full
       suite on `--nat` and Linux, the pass matrix, then the default.
+      Nov 21 (evening): on by default (egraph.fd: g_eg_skel = on_e &&
+      eg_on("egskel"); FID_NAT_OFF=egskel turns it off) on the strength of
+      those runs; the full suite with it on is still owed.
 - [x] ME8. Extraction by cost, with each value placed at the latest dominating
       point that covers its uses: LICM and sinking fall out (L).
       Extraction by cost; an instruction is rewritten in place into its class's
@@ -1189,6 +1216,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       machine load), and with inline2 on test_regex_linear fails the
       `--nat` allocation check under FID_VERIFY=1 (only
       `FID_IROPT_OFF=inline2` fixes it). Left: those, the full suite.
+      Nov 21: 2g.88 fixed (see RA3) — envtrim and inline2 exposed more cases of the checker miss, not new bugs.
 - [~] ME21. Inlining decisions from the call graph bottom-up, with sizes known
       after the callee is optimized (M).
       Nov 9: written, opt-in (`FID_IROPT_ON=inline2`), not run on the suite yet: post-order over
@@ -1265,6 +1293,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       (`waste = i * i`) doubles the sum, and FID_VERIFY=1 is silent.
       unroll-check also fails 3 (with inline2 on, no peeled or run-time
       unrolling shows). Left: fix it or take `unroll` out of IME_DEFAULT_ON.
+      Fixed Nov 21 (5fb5516): the miscompile the check hit (2g.80) was pe_ir's global register allocator, not the unroller — a value live into a block started at the block's first instruction and shared a register with a value defined in a block laid out later (the unrolled copies, chained backwards); live-in now starts at `bstart - 1` (test_unroll_dead_store; verify-clean-check.sh runs it under FID_VERIFY on both backends).
 - [~] ME25. Loop versioning: a fast copy without checks when a cheap test at the
       entry proves them unnecessary (M).
       Not started: the copy needs a way to tell the backends that its checks
@@ -1296,6 +1325,19 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       test_counted_loop_step and test_version_negstart_fail version no loop
       once the default `ssa` runs (3 and 2 with ssa off). Left: versioning
       after ssa, the full suite.
+      Nov 21 (evening): found and fixed. ssa's back-conversion put a phi's
+      load at the top of its own block, but a use of that VALUE in another
+      block (the accumulator read after its loop: `print %58`, %58 the
+      loop header's load) kept reading the header's last execution —
+      breaking ssa's own "only that block reads the slot" contract, and
+      making iro_version_one rightly refuse ("a value of the loop is read
+      outside it"). ssa_materialize now gives every such use a fresh
+      Load of the slot immediately before it (the slot model's exact
+      position; FID_VERSION_WHY=1 in iropt.fd names the pass's refusals).
+      version-default-check: 0 failed — 4/3/2/2 loops versioned by default,
+      outputs and panics right on and off (build flakiness on the
+      fidesc-built binary class aside, 2g.79). test_vectorize's interp
+      output is byte-identical to its expected block again.
 - [~] ME26. Scalar replacement of aggregates on SSA: struct fields as separate
       values (M).
       Nov 9: written, opt-in (`FID_IROPT_ON=sra`), not run on the suite yet: a struct local
@@ -1424,6 +1466,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       (66) and gets one more move on RISC-V (68 vs 67), and the hints trip
       the allocation checker on x86-64 (test_machine_simd, test_ai_stdlib).
       Left: those, or the hints opt-in again; the native suite.
+      Nov 21: 2g.88 fixed (see RA3).
 - [~] WP7. `__env` dropped from functions that never read it, at every call (S).
       `iro_env_trim` (`compiler/iropt.fd`): removes `params[0]` and the
       matching `args[0]` at every direct `Inst::Call`. Address-taken
@@ -1464,6 +1507,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       x86_64-linux), test_ai_stdlib and test_machine_brflags2; each builds
       with `FID_IROPT_OFF=envtrim` (or `FID_NAT_OFF=arghint`/`argfree`).
       Left: fix that (RA7/RA3) or make envtrim opt-in again; the suite.
+      Nov 21 (5fb5516): the argument-register checker failures the check hit (2g.88) were the checker's own — a range may end at an op that writes the register by name or copies it into the range's value (ng_arg_fit_end, NgPhys.cpy; argreg_dead_def_check.sh).
 - [x] WP8. Leaf functions without frames, with no frame record where traces do not
       need it (S).
       `g.leaf` in nat_ir: a function with no calls, no callee-saved spills
@@ -1607,6 +1651,11 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       "deadf functions: 0": the PE88 prune runs first and drops them (154
       with FID_PE_PRUNE=0). Left: the check (or deadf for functions), the
       full suite.
+      Nov 21 (evening): the check reads its deadf counters with
+      FID_PE_PRUNE=0 (tests/tooling/wp-defaults-check.sh): the emit path
+      lowers only what reach.fd finds reachable, so what the passes make
+      dead is gone before iropt counts it (155 with the prune off, 0
+      without); the outputs stay checked with the prune at its default.
 - [x] WP16. Devirtualization: `dyn` calls whose receiver type is known become
       direct calls; closures called at one site are inlined (M).
       `iro_devirt` (`compiler/iropt.fd`): a `DynCall` whose receiver's
@@ -1669,6 +1718,14 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       built, 3 shared). Left: icf is not on by default and folds nothing in
       its own test (test_midend_icf prints no folded line even with
       `FID_IROPT_ON=icf`); only an 82-test sample was run.
+      Nov 21 (evening): the test's small identical functions were inlined
+      away by the default inline2 before icf ran — its bodies are now over
+      inline2's callee budget (24 checked mul/add lines, ~100 instructions)
+      and fold with the defaults on (1 folded; interp and the folded native
+      agree). icf is on by default (iropt.fd gates it on
+      `iro_pass_on("icf")` alone; FID_IROPT_OFF=icf turns it off). Left: a
+      suite run with it on.
+      Nov 21 (5fb5516, 2g.109): FID_VERIFY=1 is clean on the two rejected programs — a select's recv_alloca/case slots live in the entry block (lower.fd), and ime_remap renames PersistLoad/PersistSave/Backward's operands (iropt_me.fd; test_select_case_slots, verify-clean-check.sh).
 - [x] WP20. Whole-program mode stays the default; a library build records the
       facts (clobbers, effects, sizes) its users need (M).
       Found Nov 15: `FID_LIBFACTS=<path>` already wrote `fn <name> params=N
@@ -1832,6 +1889,10 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       fails 2: loops over a `& Vec` / `&mut Vec` parameter
       (test_counted_loop_step, test_version_negstart_fail, double_first)
       are not versioned. Left: those loops, the full suite.
+      Nov 21 (evening): versioned — the ssa back-conversion fix (ME25's
+      entry: a phi's load value read in another block now loads the slot
+      again before the use) restored them; version-default-check reports
+      3 and 2 loops for those tests again, 0 failed.
 - [x] LF12. Narrow types as ranges: a `u8` value needs no overflow check on a
       widening add (S). `peir_type_range` on narrow loads and `IntExtend`.
 - [~] LF13. Escape analysis: a `Vec`, `str` or struct that never leaves its function
@@ -1853,6 +1914,15 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       tests/leaks/stack_vbuf_str are right on run, ccompile and emit; leak
       gate 10/10. Left: other string producers, Vec::new()+push buffers,
       temporaries and structs on the stack.
+      Nov 21 (evening): `int_to_str` of a local joins them — core
+      Int_to_str_into (core.fd) renders into the caller's stack area as
+      [P_STR_STATIC][len] digits NUL (the value kept <= 0 so INT64_MIN
+      needs no negation; the heap p_to_str when the area cannot be used),
+      and lw_rc_stack_strs_fn rewrites `h = p_to_str(x)` to
+      `Int_to_str_into(env, area, 128, x)` under the same readers-only
+      rule (test_stack_str_int.fd: INT64_MIN, INT64_MAX, concat, lengths
+      on run; `--leaks` needs a self-hosted-lineage binary). Left: the
+      data-dependent and unbounded producers, Vec::new()+push buffers.
 - [~] LF14. Scalar replacement of a non-escaping `Vec` of known small length (M).
       Nov 16: built and tested (test_midend_vec_sroa.fd, `fid run` and
       `fid emit` with FID_IROPT_ON=vecsroa and without): iropt.fd `iro_vec_sroa` (run by
@@ -1881,6 +1951,17 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       (pick_len, both_arms, loop_copy, kept, local_arms keep their
       Str_dup/Str_drop; 3 counts removed, 4 wanted). Left: str parameter and
       local copies (the dup now sits behind a region-stack branch).
+      Nov 21 (evening): they are cancelled. Two matchers were at fault,
+      not the region stack: lw_ps_lit_store_ok's backward walk stopped at
+      the drop's own operand load and at the null of the clearing store
+      (`load t; drop(t); t = null` — ConstNull read as may-free; the skip
+      is local to that walk, lw_rc_may_free untouched), and the wrapped
+      shape (a BitCast of Str_dup's result stored) is matched beside the
+      plain in-place count. tests/rc_cancel/check.sh: pick_len 2->0,
+      both_arms 2->0, loop_copy 2->0, kept 4->2, local_arms 2->0 counts
+      (drops fewer in step); the programs print their expected lines
+      through `run` (the check's `--leaks` leg segfaults on the
+      fidesc-built binary class, hello included — pre-existing, 2g.79).
 - [~] LF16. Copy-on-write checks removed where a value has one owner provably (M).
       Low gain now: the C and native fast paths test the capacity's sign once.
       Nov 16: built and tested (test_midend_sole_owner.fd, `fid emit` with
@@ -2082,6 +2163,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       test_machine_fncache and test_repro_fncache on 3 targets, and after a
       one-function edit nothing is reused (0 hits, 240 compiled). Left:
       reuse after an edit, hit == miss.
+      Nov 21 (c082ee6): nc_skel_fn replays the recording's register asks first (2g.82, fncache_hit_order_check.sh).
 - [~] SP7. Incremental relinking in memory: unchanged functions keep their bytes,
       only relocations are redone (M).
       On an FID_FNCACHE hit a function's bytes are replayed at the new
@@ -2103,6 +2185,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       debug 1241/899 ms on a busy machine), and the image after an edit
       differs from a one-shot emit (sp8-edit-rebuild-check fails steps 2
       and 3). Left: under 100 ms, the same image as a one-shot build.
+      Nov 21: see SP20 — hit-order fixed; `fid serve` rebuilds not re-checked.
 - [~] SP9. Front end in parallel per module where modules do not depend on each
       other (L).
       Competitive CS5: `FID_PAR=N` splits the borrow check's functions over
@@ -2137,6 +2220,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       fn-arena-emit-check fails 3: the native emit of compiler/main.fd does
       not finish (an iro_sccp overflow panic or out of memory). Left: that
       comparison, the `--leaks` run of an arena compiler.
+      Nov 21 (5fb5516): 2g.89 fixed — iro_sccp_eval bounds every BinOp before computing it and BitNot folds as `av ^ -1`, so `emit compiler/main.fd` no longer panics on the mid-end (test_sccp_bitnot_min).
 - [~] SP12. Self-compile under 60 s, then under 10 s (M, then L).
       Competitive CS4: `dump-c compiler/main.fd` ~25 s wall with the -O2
       compiler (under 60 s). Left: under 10 s (lowering and C generation
@@ -2167,6 +2251,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       and by hand an image from the warm cache after a one-line edit differs
       from a `--no-cache` build (32,352 bytes; both run right). Left: 5x,
       warm images equal to fresh ones, the lowered-IR cache by default.
+      Nov 21: see SP20 — the hit-order cause of 2g.82 is fixed; a warm `--debug` image vs `--no-cache` is not re-checked.
 - [~] SP14. The e-graph bounded so the release mode stays within 2x of debug (S).
       Bounded: egraph.fd `EG_MAX_NODES` (20,000) and `EG_MAX_ROUNDS` (8).
       Left: the 2x measured (hello: e-graph 140 of 631 ms, CS1).
@@ -2190,6 +2275,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       with `FID_IROPT_OFF=sra`, so the ime_sra miscompile is still there),
       the extern probe is not rejected, the x86_64-linux main stack
       overflows. Left: those, then the compiler built by `fid emit`.
+      Nov 21 (5fb5516, 2g.94): the `--nat` crash of a self-hosted front end was nat_ir's ng_rf_promote writing a promoted field's zero-words before the prologue's argument moves — ng_rf_zero_at emits them after; ime_sra itself was right.
 - [x] SP17. Memory of a build under 1 GB for the compiler itself (M).
       Measured Nov 15: `fid check compiler/main.fd` peaks at ~550 MB —
       under 1 GB. (`dump-c` peaks higher through the 76 MB C text but a
@@ -2231,6 +2317,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       from the miss images on 3 targets (25,603 bytes on x86-64); the hit
       images run the same. The C compares, cache misses and the tail-call
       summary part are byte-identical.
+      Nov 21 (c082ee6): one cause of 2g.82 fixed — a cache-hit image orders its functions as the recording asked, before the skeleton's call edges (nc_skel_fn; fncache_hit_order_check.sh). Byte-identical as a whole (debug sections, `fid serve`) not re-verified.
 
 ## Track RL — Reliability: trusted without decades (25)
 
@@ -2300,6 +2387,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       ("the blocks changed"; 1 rejected, 25 not checkable of 37), so
       tv-check ends 3 failed. Left: triage that rejection (a miscompile or a
       false alarm), the suite with validation.
+      Nov 21 (c082ee6, 2g.90): injected faults now go to a value the function's behavior depends on (tv_live_of, tv_pure_value; constant globals are facts, tv_gconst_facts) — the 'not caught' cases were faults that changed nothing; the inline2/Str_drop rejection was a false witness (`n/a` when the blocks changed).
 - [x] RL6. Translation validation for instruction selection: each selected
       sequence evaluated against its MIR operation on random values (M).
       Nov 16: under FID_VERIFY=1 every machine-layer build first runs
@@ -2355,6 +2443,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       (`codegen --coff`) does not build (LoadLibraryA, GetProcAddress,
       FreeLibrary undefined). Left: the COFF path, a run with
       llvm-readobj/objdump/dwarfdump installed.
+      Nov 21 (5fb5516, 2g.110): COFF objects name their imports — nat_coff_imports writes undefined symbols, ADDR64 relocations and /DEFAULTLIB: directives (coff_obj_imports_check.sh).
 - [x] RL10. Fuzzing of the IR -> machine code path with random IR (not only random
       source), so backend bugs show without front-end limits (M).
       Nov 16: a whole module to a file and back (ir_ser.fd ir_module_save /
@@ -2452,6 +2541,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       pe_leaks_check fails 5, the pe_ir leak gate fails 10 of 10, and pe_ir
       `--checked-alloc` with `--leaks` crashes the same way. Left: the pe_ir
       wiring of the p_malloc/p_free thunks.
+      Nov 21 (5fb5516): `--leaks` runs on pe_ir — the pert_leak_* thunks and the stack walk's functions are emission roots (`pe_ir_needed_fns`; without them the walk was ud2, 2g.81), the pe_lk_* layer is in pe_runtime/base.fd and `pert_to_str` no longer leaks a p_malloc buffer. Left: nat_ir targets.
 - [x] RL17. Concurrency testing of the runtime: thousands of task and thread
       interleavings under a scheduler that picks randomly (L).
       Nov 16: FIDES_SCHED_RANDOM=<seed> in both native runtimes
@@ -2517,6 +2607,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       Windows reduce watchdog runs `_fid_reduce_cmd.bat` by bare name, which
       fails where cmd does not search the current directory (with that
       unset, 1 try was stopped as it should). Left: those two.
+      Nov 21 (c082ee6, 2g.105): the reduce watchdog runs `.\_fid_reduce_cmd.bat`, so NoDefaultCurrentDirectoryInExePath=1 no longer kills every try.
 - [x] RL21. A reducer: shrink a failing program automatically while it still fails
       the same way (M).
       `scripts/fuzz/reduce.py`: it shrank programs on which two backends
@@ -2566,6 +2657,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       test_verify_abi_c_mixed crashes in libc strtod (invalid memory access
       at 0x8). Left: that; the aarch64/riscv64 dynamic lanes (no target
       glibc here); the macOS lanes.
+      Nov 21 (5fb5516, 2g.99): a dynamic x86-64 image now writes a PT_TLS phdr and keeps its TLS block at `fs:[-8]` (a thread's at fs+72) — libc's strtod no longer faults (ldyn_tls_check.sh).
 
 ## Track DB — Debugging and visibility (10)
 
@@ -2622,6 +2714,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       callee's `fn` line (56, want 76), and inlined functions have no
       subprogram. Left: nat_dbg_decl_line from the function's own
       declaration, test functions kept out of line, lldb and llvm-dwarfdump.
+      Nov 21 (c082ee6, 2g.102): nat_dbg_decl_line scans the function's own rows for its `fn` line — a function that begins with inlined code no longer takes the callee's decl_line.
 - [x] DB3. PDB / CodeView on Windows (L).
       Done (Nov 15), first step on the default Windows backend: `fid emit`
       images carry a COFF symbol table after the sections (pe_ir_enc.fd
@@ -2670,6 +2763,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       the outer binding (x = 6, want 50), optimized main has 0 of 12 values
       after inlining, and a cache hit changes the debug sections. Left: all
       of that; gdb and llvm-dwarfdump runs.
+      Nov 21: the shadowed-name half of 2g.102 stays open (no DW_TAG_lexical_block reaches a shadowed binding); the decl_line half is fixed (DB2).
 - [x] DB5. Panic and crash traces from frame records, no per-call bookkeeping
       (the C path, native Linux).
 - [~] DB6. Unwind information (Windows `.pdata`, DWARF CFI) so system debuggers and
@@ -2706,6 +2800,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       stores nothing, and shrink-wrapped functions emit DW_CFA_restore
       before any rule on all 3 targets. Left: those; pe_unwind_check for
       the `--nat` .pdata was not run.
+      Nov 21 (c082ee6): the CFI checks model saves deferred to a shrink-wrapped block and the rules DW_CFA_remember/restore_state keep (2g.103 was partly checker artifact); the CFA-24 stores question is not re-checked.
 - [~] DB7. `fid explain <function>`: the IR, the MIR after each stage, the machine
       code, side by side (M).
       Nov 15: `fid explain <file> --stages <fn> [--target t]` (also `fid
@@ -2786,6 +2881,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       pe_ir `FID_PROF=1`, but fails 2: pe_ir folded stacks start at a wrong
       root frame (`__c_fn_pe_console_ctrl;main;...`), so no stack begins at
       main. Left: the entry point's symbol on pe_ir, macOS, pprof output.
+      Nov 21 (c082ee6, 2g.101): the folded stack roots at `__fid_entry` — it is in the nat name tables and pe_pf_entry_b records its bucket; and the periodic report keeps its own clock (SL15's two-reports-instead-of-three).
 - [~] DB10. Symbol maps for every image we write, readable by `addr2line`-style
       tools (S).
       The symbol table (DB2). Checked Nov 15: Linux ELF (`.symtab`) and the

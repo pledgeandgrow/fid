@@ -46,7 +46,19 @@
 // family>,... turns single rule families off (RL3, eg_rules_off_mask);
 // FID_NAT_MUTATE=eg<family> breaks one on purpose (RL11, eg_mutate_mask).
 
-module compiler::egraph; use core; use vec; use string; use compiler::ast; use compiler::ir; use compiler::checks; use compiler::iropt; use compiler::inc; use compiler::ir_ser; use compiler::ssa; const EG_MAX_NODES: i64 = 20000; const EG_MAX_ROUNDS: i64 = 8;  // Node kinds
+module compiler::egraph;
+use core;
+use vec;
+use string;
+use compiler::ast;
+use compiler::ir;
+use compiler::checks;
+use compiler::iropt;
+use compiler::inc;
+use compiler::ir_ser;
+use compiler::ssa;
+const EG_MAX_NODES: i64 = 20000;
+const EG_MAX_ROUNDS: i64 = 8;  // Node kinds
 const EK_LEAF: i64 = 0;  // an opaque value: `a` is its id
 const EK_CONST: i64 = 1;  // `a` is the integer (booleans 0 / 1)
 const EK_BIN: i64 = 2;  // `op` a binary code, children a, b
@@ -59,12 +71,32 @@ const EK_FCONST: i64 = 7;  // a float constant: `a` its f64 bit pattern (p_f64_t
 const EK_FBIN: i64 = 8;  // a float operation: `op` a binary code, children a, b, ty the operands' type
 const EK_FNEG: i64 = 9;  // float negation, child a
 // Cast codes
-const EC_EXT: i64 = 1; const EC_TRUNC: i64 = 2; const EC_BITCAST: i64 = 3; const EC_I2F: i64 = 4; const EC_F2I: i64 = 5;
+const EC_EXT: i64 = 1;
+const EC_TRUNC: i64 = 2;
+const EC_BITCAST: i64 = 3;
+const EC_I2F: i64 = 4;
+const EC_F2I: i64 = 5;
 // f64 bit patterns the float rules look for
 const EG_F_ONE: i64 = 4607182418800017408;  // 1.0
 
 // Binary codes (as compiler/rules.fd)
-const EB_ADD: i64 = 1; const EB_SUB: i64 = 2; const EB_MUL: i64 = 3; const EB_DIV: i64 = 4; const EB_MOD: i64 = 5; const EB_AND: i64 = 6; const EB_OR: i64 = 7; const EB_XOR: i64 = 8; const EB_SHL: i64 = 9; const EB_SHR: i64 = 10; const EB_EQ: i64 = 11; const EB_NE: i64 = 12; const EB_LT: i64 = 13; const EB_LE: i64 = 14; const EB_GT: i64 = 15; const EB_GE: i64 = 16; pub struct ENode {
+const EB_ADD: i64 = 1;
+const EB_SUB: i64 = 2;
+const EB_MUL: i64 = 3;
+const EB_DIV: i64 = 4;
+const EB_MOD: i64 = 5;
+const EB_AND: i64 = 6;
+const EB_OR: i64 = 7;
+const EB_XOR: i64 = 8;
+const EB_SHL: i64 = 9;
+const EB_SHR: i64 = 10;
+const EB_EQ: i64 = 11;
+const EB_NE: i64 = 12;
+const EB_LT: i64 = 13;
+const EB_LE: i64 = 14;
+const EB_GT: i64 = 15;
+const EB_GE: i64 = 16;
+pub struct ENode {
     pub kind: i64,
     pub op: i64,
     pub a: i64,
@@ -153,7 +185,7 @@ var g_eg_st_pl_sunk: i64 = 0;
 var g_eg_st_pl_skipped: i64 = 0;
 
 /// SP14: set g's budgets from its seed (the nodes there are now).
-fn eg_budget(g: & mut EGraph) {
+fn eg_budget(g: &mut EGraph) {
     var seed: i64 = g.nodes.len();
     var nl: i64 = EG_MAX_NODES;
     if seed < (EG_MAX_NODES - EG_GROW_BASE) / EG_GROW_PER_SEED {
@@ -168,7 +200,7 @@ fn eg_budget(g: & mut EGraph) {
 }
 
 /// SP14: true while g may still grow and work (a round stops at either).
-fn eg_room(g: & EGraph) -> bool {
+fn eg_room(g: &EGraph) -> bool {
     return g.nodes.len() < g.node_limit && g.work < g.work_limit;
 }
 
@@ -323,7 +355,7 @@ fn eg_mut(bit: i64) -> bool {
     return (g_eg_mutate & bit) != 0;
 }
 
-fn eg_find(g: & mut EGraph, c: i64) -> i64 {
+fn eg_find(g: &mut EGraph, c: i64) -> i64 {
     var r: i64 = c;
     while g.parent.get(r) != r {
         r = g.parent.get(r);
@@ -337,7 +369,7 @@ fn eg_find(g: & mut EGraph, c: i64) -> i64 {
     return r;
 }
 
-fn eg_key(g: & mut EGraph, n: ENode) -> str {
+fn eg_key(g: &mut EGraph, n: ENode) -> str {
     var a: i64 = n.a;
     var b: i64 = n.b;
     if n.kind == EK_BIN || n.kind == EK_FBIN {
@@ -351,7 +383,7 @@ fn eg_key(g: & mut EGraph, n: ENode) -> str {
 }
 
 /// The class of node n, adding it (and a class) when it is new.
-fn eg_add(g: & mut EGraph, n: ENode) -> i64 {
+fn eg_add(g: &mut EGraph, n: ENode) -> i64 {
     var key: str = eg_key(g, n);
     if HashMap_contains(g.hash, key) {
         return eg_find(g, g.node_class.get(HashMap_get(g.hash, key)));
@@ -393,7 +425,7 @@ fn eg_min_node(a: i64, b: i64) -> i64 {
     return b;
 }
 
-fn eg_union(g: & mut EGraph, a: i64, b: i64) -> bool {
+fn eg_union(g: &mut EGraph, a: i64, b: i64) -> bool {
     var ra: i64 = eg_find(g, a);
     var rb: i64 = eg_find(g, b);
     if ra == rb {
@@ -418,7 +450,7 @@ fn eg_union(g: & mut EGraph, a: i64, b: i64) -> bool {
 
 /// Restore congruence: nodes whose canonical keys now coincide join one
 /// class (repeat until stable).
-fn eg_rebuild(g: & mut EGraph) {
+fn eg_rebuild(g: &mut EGraph) {
     var changed: bool = true;
     while changed {
         changed = false;
@@ -442,7 +474,7 @@ fn eg_rebuild(g: & mut EGraph) {
 
 /// The constant of class c: [1, value] or [0]. SP14: read from the class's
 /// root (kconst), not from a scan of every node.
-fn eg_class_const(g: & mut EGraph, c: i64) -> Vec<i64> {
+fn eg_class_const(g: &mut EGraph, c: i64) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     var rc: i64 = eg_find(g, c);
     var k: i64 = g.kconst.get(rc);
@@ -479,7 +511,8 @@ fn eg_signed(ty: str) -> bool {
 
 /// Fold a op b of type ty, as the program would compute it: [1, value], or
 /// [0] when it would panic (overflow, division by zero) or does not fit.
-@wrapping fn eg_fold(op: i64, a: i64, b: i64, ty: str, wrapping: bool) -> Vec<i64> {
+@wrapping
+fn eg_fold(op: i64, a: i64, b: i64, ty: str, wrapping: bool) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     var r: i64 = 0;
     var bits: i64 = eg_bits(ty);
@@ -575,7 +608,8 @@ fn eg_signed(ty: str) -> bool {
 /// type ty as the program computes it: [1, value], or [0] when it would
 /// panic or not fit (the negation of the minimum, of an unsigned value
 /// other than 0, or a result outside a narrow type).
-@wrapping fn eg_fold_unary(kind: i64, a: i64, ty: str) -> Vec<i64> {
+@wrapping
+fn eg_fold_unary(kind: i64, a: i64, ty: str) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     var min: i64 = 0 - 9223372036854775807 - 1;
     var bits: i64 = eg_bits(ty);
@@ -771,7 +805,7 @@ fn eg_num_ty(t: IrType) -> str {
 
 /// ME7: the f64 bit pattern of class c's float constant: [1, bits] or [0].
 /// SP14: read from the class's root (kfconst), not from a scan.
-fn eg_class_fconst(g: & mut EGraph, c: i64) -> Vec<i64> {
+fn eg_class_fconst(g: &mut EGraph, c: i64) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     var rc: i64 = eg_find(g, c);
     var k: i64 = g.kfconst.get(rc);
@@ -792,7 +826,7 @@ fn eg_class_fconst(g: & mut EGraph, c: i64) -> Vec<i64> {
 /// x / 1.0 = x, x - 0.0 = x (-0.0 - 0.0 is -0.0), x + -0.0 = x, and
 /// -(-x) = x. Not x + 0.0 (-0.0 + 0.0 is +0.0), x * 0.0, x - x or x == x,
 /// and no reassociation or constant folding.
-fn eg_float_rules(g: & mut EGraph, n: ENode, c: i64, count: i64) -> bool {
+fn eg_float_rules(g: &mut EGraph, n: ENode, c: i64, count: i64) -> bool {
     var any: bool = false;
     if n.kind == EK_FBIN {
         var flip: i64 = 0;
@@ -974,7 +1008,7 @@ fn eg_fold_rule(op: i64, a: i64, b: i64, ty: str, wrapping: bool) -> Vec<i64> {
 
 /// One round of every rule over the nodes there are now: true if anything
 /// was joined.
-fn eg_round(g: & mut EGraph) -> bool {
+fn eg_round(g: &mut EGraph) -> bool {
     var any: bool = false;
     var count: i64 = g.nodes.len();
     var unions0: i64 = g.unions;
@@ -1180,7 +1214,7 @@ fn eg_round(g: & mut EGraph) -> bool {
 
 /// Class c holds x + k for a constant k: [1, class of x, k], else [0].
 /// SP14: only the additions (g.adds, in order), not every node.
-fn eg_add_const_child(g: & mut EGraph, c: i64, ty: str) -> Vec<i64> {
+fn eg_add_const_child(g: &mut EGraph, c: i64, ty: str) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     var rc: i64 = eg_find(g, c);
     var ai: i64 = 0;
@@ -1351,7 +1385,7 @@ fn eg_int_ty(t: IrType) -> str {
     return "";
 }
 
-fn eg_meta_ty(f: & IrFunction, id: i64) -> IrType {
+fn eg_meta_ty(f: &IrFunction, id: i64) -> IrType {
     match IrFunction_get_meta(f, id) {
         OptValueMeta::Some(m) => {
             return m.ty;
@@ -1366,7 +1400,7 @@ fn eg_meta_ty(f: & IrFunction, id: i64) -> IrType {
 /// has no instruction (AGENTS.md item 27): its type is in func.params, so
 /// an operation on a parameter becomes a node too. (Forwarding keeps
 /// eg_meta_ty: it never forwards a parameter.)
-fn eg_value_ty(f: & IrFunction, id: i64) -> IrType {
+fn eg_value_ty(f: &IrFunction, id: i64) -> IrType {
     var t: IrType = eg_meta_ty(f, id);
     if !ir_type_eq(t, IrType::Void) {
         return t;
@@ -1381,7 +1415,7 @@ fn eg_value_ty(f: & IrFunction, id: i64) -> IrType {
     return IrType::Void;
 }
 
-fn eg_set_inst(f: & mut IrFunction, id: i64, inst: Inst) {
+fn eg_set_inst(f: &mut IrFunction, id: i64, inst: Inst) {
     var at: i64 = f.inst_at.get(id) - 1;
     var ve: ValueIdInst = f.insts.get(at);
     ve.inst = inst;
@@ -1391,7 +1425,7 @@ fn eg_set_inst(f: & mut IrFunction, id: i64, inst: Inst) {
 }
 
 /// The e-graph pass over one function: how many instructions it rewrote.
-fn eg_function(f: & mut IrFunction, module: & IrModule) -> i64 {
+fn eg_function(f: &mut IrFunction, module: &IrModule) -> i64 {
     var cfg: IroCfg = iro_cfg(f);
     var g: EGraph = EGraph {
         nodes: Vec::new(), node_class: Vec::new(), parent: Vec::new(), hash: HashMap_new(), wrapping: f.is_wrapping, unions: 0, kconst: Vec::new(), kfconst: Vec::new(), unary: Vec::new(), adds: Vec::new(), work: 0, work_limit: EG_MAX_WORK, node_limit: EG_MAX_NODES
@@ -1459,7 +1493,7 @@ fn eg_function(f: & mut IrFunction, module: & IrModule) -> i64 {
                     Inst::ConstInt(v, t) => {
                         var ts: str = eg_int_ty(t);
                         if ts != "" {
-                            c = eg_add(& mut g, ENode {
+                            c = eg_add(&mut g, ENode {
                                 kind: EK_CONST, op: 0, a: v, b: 0, ty: ts
                             });
                         }
@@ -1469,7 +1503,7 @@ fn eg_function(f: & mut IrFunction, module: & IrModule) -> i64 {
                         if b {
                             bv = 1;
                         }
-                        c = eg_add(& mut g, ENode {
+                        c = eg_add(&mut g, ENode {
                             kind: EK_CONST, op: 0, a: bv, b: 0, ty: "bool"
                         });
                     }
@@ -1477,9 +1511,9 @@ fn eg_function(f: & mut IrFunction, module: & IrModule) -> i64 {
                         var code: i64 = eg_binop(op);
                         var ots: str = eg_int_ty(eg_value_ty(f, a));
                         if code != 0 && ots != "" && ots != "bool" && eg_int_ty(eg_value_ty(f, b2)) == ots && eg_int_ty(t) != "" {
-                            var ca: i64 = eg_value(& mut g, & mut cls, a);
-                            var cb: i64 = eg_value(& mut g, & mut cls, b2);
-                            c = eg_add(& mut g, ENode {
+                            var ca: i64 = eg_value(&mut g, &mut cls, a);
+                            var cb: i64 = eg_value(&mut g, &mut cls, b2);
+                            c = eg_add(&mut g, ENode {
                                 kind: EK_BIN, op: code, a: ca, b: cb, ty: ots
                             });
                         }
@@ -1487,9 +1521,9 @@ fn eg_function(f: & mut IrFunction, module: & IrModule) -> i64 {
                         // one float type; bit operations are not float)
                         var fts: str = eg_float_ty(eg_value_ty(f, a));
                         if c < 0 && fts != "" && eg_float_ty(eg_value_ty(f, b2)) == fts && (code == EB_ADD || code == EB_SUB || code == EB_MUL || code == EB_DIV || eg_is_cmp(code)) && eg_num_ty(t) != "" {
-                            var fa: i64 = eg_value(& mut g, & mut cls, a);
-                            var fb: i64 = eg_value(& mut g, & mut cls, b2);
-                            c = eg_add(& mut g, ENode {
+                            var fa: i64 = eg_value(&mut g, &mut cls, a);
+                            var fb: i64 = eg_value(&mut g, &mut cls, b2);
+                            c = eg_add(&mut g, ENode {
                                 kind: EK_FBIN, op: code, a: fa, b: fb, ty: fts
                             });
                         }
@@ -1497,7 +1531,7 @@ fn eg_function(f: & mut IrFunction, module: & IrModule) -> i64 {
                     Inst::ConstFloat(fv, ft) => {
                         var cfs: str = eg_float_ty(ft);
                         if cfs != "" {
-                            c = eg_add(& mut g, ENode {
+                            c = eg_add(&mut g, ENode {
                                 kind: EK_FCONST, op: 0, a: p_f64_to_bits(fv), b: 0, ty: cfs
                             });
                         }
@@ -1506,19 +1540,19 @@ fn eg_function(f: & mut IrFunction, module: & IrModule) -> i64 {
                     // A bit cast to its own type is its operand (the move
                     // this pass and the inliner write).
                     Inst::BitCast(xv, xf, xt) => {
-                        c = eg_cast_class(& mut g, & mut cls, f, EC_BITCAST, xv, xf, xt);
+                        c = eg_cast_class(&mut g, &mut cls, f, EC_BITCAST, xv, xf, xt);
                     }
                     Inst::IntExtend(xv2, xf2, xt2) => {
-                        c = eg_cast_class(& mut g, & mut cls, f, EC_EXT, xv2, xf2, xt2);
+                        c = eg_cast_class(&mut g, &mut cls, f, EC_EXT, xv2, xf2, xt2);
                     }
                     Inst::IntTrunc(xv3, xf3, xt3) => {
-                        c = eg_cast_class(& mut g, & mut cls, f, EC_TRUNC, xv3, xf3, xt3);
+                        c = eg_cast_class(&mut g, &mut cls, f, EC_TRUNC, xv3, xf3, xt3);
                     }
                     Inst::IntToFloat(xv4, xf4, xt4) => {
-                        c = eg_cast_class(& mut g, & mut cls, f, EC_I2F, xv4, xf4, xt4);
+                        c = eg_cast_class(&mut g, &mut cls, f, EC_I2F, xv4, xf4, xt4);
                     }
                     Inst::FloatToInt(xv5, xf5, xt5) => {
-                        c = eg_cast_class(& mut g, & mut cls, f, EC_F2I, xv5, xf5, xt5);
+                        c = eg_cast_class(&mut g, &mut cls, f, EC_F2I, xv5, xf5, xt5);
                     }
                     // ME7: unary operations are pure values too: -x and ~x
                     // of an integer, !b of a boolean (operand and result of
@@ -1545,8 +1579,8 @@ fn eg_function(f: & mut IrFunction, module: & IrModule) -> i64 {
                                 }
                             }
                             if ukind != 0 {
-                                var cu: i64 = eg_value(& mut g, & mut cls, ua);
-                                c = eg_add(& mut g, ENode {
+                                var cu: i64 = eg_value(&mut g, &mut cls, ua);
+                                c = eg_add(&mut g, ENode {
                                     kind: ukind, op: 0, a: cu, b: 0, ty: uts
                                 });
                             }
@@ -1557,8 +1591,8 @@ fn eg_function(f: & mut IrFunction, module: & IrModule) -> i64 {
                         if ufs != "" && eg_float_ty(eg_value_ty(f, ua)) == ufs {
                             match uop {
                                 UnaryOp::Neg => {
-                                    var cuf: i64 = eg_value(& mut g, & mut cls, ua);
-                                    c = eg_add(& mut g, ENode {
+                                    var cuf: i64 = eg_value(&mut g, &mut cls, ua);
+                                    c = eg_add(&mut g, ENode {
                                         kind: EK_FNEG, op: 0, a: cuf, b: 0, ty: ufs
                                     });
                                 }
@@ -1599,12 +1633,12 @@ fn eg_function(f: & mut IrFunction, module: & IrModule) -> i64 {
     }
     // SP14: the budgets follow the function's size; the rounds stop at the
     // first of EG_MAX_ROUNDS, the node limit and the work limit
-    eg_budget(& mut g);
+    eg_budget(&mut g);
     var seed: i64 = g.nodes.len();
     var round: i64 = 0;
     var more: bool = true;
-    while more && round < EG_MAX_ROUNDS && eg_room(& g) {
-        more = eg_round(& mut g);
+    while more && round < EG_MAX_ROUNDS && eg_room(&g) {
+        more = eg_round(&mut g);
         round = round + 1;
     }
     g_eg_st_fns = g_eg_st_fns + 1;
@@ -1646,7 +1680,7 @@ fn eg_function(f: & mut IrFunction, module: & IrModule) -> i64 {
         i = 0;
         while i < g.nodes.len() {
             var nd: ENode = g.nodes.get(i);
-            var rc: i64 = eg_find(& mut g, g.node_class.get(i));
+            var rc: i64 = eg_find(&mut g, g.node_class.get(i));
             var cost: i64 = 1000000000;
             if nd.kind == EK_LEAF {
                 cost = 0;
@@ -1655,8 +1689,8 @@ fn eg_function(f: & mut IrFunction, module: & IrModule) -> i64 {
                 cost = 1;
             }
             if nd.kind == EK_BIN {
-                var x: i64 = bcost.get(eg_find(& mut g, nd.a));
-                var y: i64 = bcost.get(eg_find(& mut g, nd.b));
+                var x: i64 = bcost.get(eg_find(&mut g, nd.a));
+                var y: i64 = bcost.get(eg_find(&mut g, nd.b));
                 if x < 1000000000 && y < 1000000000 {
                     cost = eg_cost(nd.op) + x + y;
                 }
@@ -1668,14 +1702,14 @@ fn eg_function(f: & mut IrFunction, module: & IrModule) -> i64 {
             // ME7: a float operation costs as an integer one; a cast one
             // more than its operand
             if nd.kind == EK_FBIN {
-                var fx: i64 = bcost.get(eg_find(& mut g, nd.a));
-                var fy: i64 = bcost.get(eg_find(& mut g, nd.b));
+                var fx: i64 = bcost.get(eg_find(&mut g, nd.a));
+                var fy: i64 = bcost.get(eg_find(&mut g, nd.b));
                 if fx < 1000000000 && fy < 1000000000 {
                     cost = eg_cost(nd.op) + fx + fy;
                 }
             }
             if nd.kind == EK_NEG || nd.kind == EK_NOT || nd.kind == EK_BNOT || nd.kind == EK_CAST || nd.kind == EK_FNEG {
-                var ux: i64 = bcost.get(eg_find(& mut g, nd.a));
+                var ux: i64 = bcost.get(eg_find(&mut g, nd.a));
                 if ux < 1000000000 {
                     cost = 1 + ux;
                 }
@@ -1700,7 +1734,7 @@ fn eg_function(f: & mut IrFunction, module: & IrModule) -> i64 {
     while i < f.params.len() {
         var pv: i64 = f.params.get(i).id;
         if pv >= 0 && pv < n && cls.get(pv) >= 0 {
-            var pc: i64 = eg_find(& mut g, cls.get(pv));
+            var pc: i64 = eg_find(&mut g, cls.get(pv));
             var pl: Vec<i64> = members.get(pc);
             pl.push(pv);
             members.set(pc, pl);
@@ -1712,7 +1746,7 @@ fn eg_function(f: & mut IrFunction, module: & IrModule) -> i64 {
     while oi < order.len() {
         var ov: i64 = order.get(oi);
         if cls.get(ov) >= 0 {
-            var oc: i64 = eg_find(& mut g, cls.get(ov));
+            var oc: i64 = eg_find(&mut g, cls.get(ov));
             var ol: Vec<i64> = members.get(oc);
             ol.push(ov);
             members.set(oc, ol);
@@ -1727,7 +1761,7 @@ fn eg_function(f: & mut IrFunction, module: & IrModule) -> i64 {
         var id3: i64 = order.get(oi);
         var c3: i64 = cls.get(id3);
         if c3 >= 0 {
-            var rc3: i64 = eg_find(& mut g, c3);
+            var rc3: i64 = eg_find(&mut g, c3);
             var bn: i64 = best.get(rc3);
             var tty: IrType = eg_meta_ty(f, id3);
             if bn >= 0 {
@@ -1768,7 +1802,7 @@ fn eg_function(f: & mut IrFunction, module: & IrModule) -> i64 {
                 }
                 if !done && !is_const_now {
                     // An earlier value of the same class: a move
-                    var prev: i64 = eg_member_before(& members, & cfg, & blk, & pos, rc3, id3, f);
+                    var prev: i64 = eg_member_before(&members, &cfg, &blk, &pos, rc3, id3, f);
                     if prev >= 0 && ir_type_eq(eg_value_ty(f, prev), tty) {
                         // ME7: a bit cast to its own type is in its operand's
                         // class: already the move it would become
@@ -1792,8 +1826,8 @@ fn eg_function(f: & mut IrFunction, module: & IrModule) -> i64 {
                 if !done && bnode.kind == EK_BIN && !is_const_now {
                     var cost_now: i64 = eg_inst_cost(cur);
                     if eg_cost(bnode.op) < cost_now {
-                        var va: i64 = eg_member_before(& members, & cfg, & blk, & pos, eg_find(& mut g, bnode.a), id3, f);
-                        var vb: i64 = eg_member_before(& members, & cfg, & blk, & pos, eg_find(& mut g, bnode.b), id3, f);
+                        var va: i64 = eg_member_before(&members, &cfg, &blk, &pos, eg_find(&mut g, bnode.a), id3, f);
+                        var vb: i64 = eg_member_before(&members, &cfg, &blk, &pos, eg_find(&mut g, bnode.b), id3, f);
                         if va >= 0 && vb >= 0 {
                             match cur {
                                 Inst::BinOp(_, _, _, rt) => {
@@ -1817,7 +1851,7 @@ fn eg_function(f: & mut IrFunction, module: & IrModule) -> i64 {
     // their classes (eg_skeleton); not in @constant_time code or code that
     // holds a secret, where where work happens is part of the contract
     if g_eg_skel && !f.is_constant_time && !f.has_secret {
-        g_eg_last_skel = eg_skeleton(f, & mut g, & cls, & own, & best, & cfg);
+        g_eg_last_skel = eg_skeleton(f, &mut g, &cls, &own, &best, &cfg);
     }
     return rewrites;
 }
@@ -1834,7 +1868,7 @@ fn eg_inst_cost(inst: Inst) -> i64 {
 }
 
 /// The class of value v: its own when it has one, else a new leaf.
-fn eg_value(g: & mut EGraph, cls: & mut Vec<i64>, v: i64) -> i64 {
+fn eg_value(g: &mut EGraph, cls: &mut Vec<i64>, v: i64) -> i64 {
     if v >= 0 && v < cls.len() && cls.get(v) >= 0 {
         return cls.get(v);
     }
@@ -1850,7 +1884,7 @@ fn eg_value(g: & mut EGraph, cls: & mut Vec<i64>, v: i64) -> i64 {
 /// ME7: the class of cast `op` of value v from type `from` to type `to`:
 /// -1 when either type is not one the e-graph knows or v is not of type
 /// `from`; v's own class for a bit cast to the same type; else a cast node.
-fn eg_cast_class(g: & mut EGraph, cls: & mut Vec<i64>, f: & IrFunction, op: i64, v: i64, from: IrType, to: IrType) -> i64 {
+fn eg_cast_class(g: &mut EGraph, cls: &mut Vec<i64>, f: &IrFunction, op: i64, v: i64, from: IrType, to: IrType) -> i64 {
     var fs: str = eg_num_ty(from);
     var ts: str = eg_num_ty(to);
     if fs == "" || ts == "" || eg_num_ty(eg_value_ty(f, v)) != fs {
@@ -1867,7 +1901,7 @@ fn eg_cast_class(g: & mut EGraph, cls: & mut Vec<i64>, f: & IrFunction, op: i64,
 
 /// A value of class rc available at `at`: a parameter, or an instruction
 /// whose block dominates at's (earlier in the same block). -1 if none.
-fn eg_member_before(members: & Vec<Vec<i64>>, cfg: & IroCfg, blk: & Vec<i64>, pos: & Vec<i64>, rc: i64, at: i64, f: & IrFunction) -> i64 {
+fn eg_member_before(members: &Vec<Vec<i64>>, cfg: &IroCfg, blk: &Vec<i64>, pos: &Vec<i64>, rc: i64, at: i64, f: &IrFunction) -> i64 {
     if rc < 0 || rc >= members.len() {
         return 0 - 1;
     }
@@ -1900,7 +1934,7 @@ fn eg_member_before(members: & Vec<Vec<i64>>, cfg: & IroCfg, blk: & Vec<i64>, po
 // --- Store-to-load forwarding ---------------------------------------------
 
 /// Forward loads of locals: how many loads became moves.
-fn eg_forward(f: & mut IrFunction) -> i64 {
+fn eg_forward(f: &mut IrFunction) -> i64 {
     var cfg: IroCfg = iro_cfg(f);
     var n: i64 = f.next_value;
     var i: i64 = 0;
@@ -1967,7 +2001,7 @@ fn eg_forward(f: & mut IrFunction) -> i64 {
         }
         if ok_ptr < 0 {
             ops.clear();
-            peir_inst_operands(ve2.inst, & mut ops);
+            peir_inst_operands(ve2.inst, &mut ops);
             var k: i64 = 0;
             while k < ops.len() {
                 var u: i64 = ops.get(k);
@@ -2027,7 +2061,7 @@ fn eg_forward(f: & mut IrFunction) -> i64 {
                                 } else if nstores.get(lp) == 1 {
                                     var st: i64 = the_store.get(lp);
                                     var sb: i64 = blk.get(st);
-                                    if sb >= 0 && sb != b && iro_dominates(& cfg, sb, b) {
+                                    if sb >= 0 && sb != b && iro_dominates(&cfg, sb, b) {
                                         match IrFunction_get_inst(f, st) {
                                             OptInst::Some(sinst) => {
                                                 match sinst {
@@ -2108,7 +2142,7 @@ fn eg_opt_in(name: str) -> bool {
 /// float arithmetic and comparisons, !, ~, a float's or @wrapping integer's
 /// negation, integer widening and narrowing, integer to float, and moves.
 /// 1: movable, 2: movable and a comparison, 0: stays.
-fn eg_place_kind(f: & IrFunction, inst: Inst) -> i64 {
+fn eg_place_kind(f: &IrFunction, inst: Inst) -> i64 {
     match inst {
         Inst::BinOp(op, a, b, _) => {
             var code: i64 = eg_binop(op);
@@ -2198,7 +2232,7 @@ fn eg_place_kind(f: & IrFunction, inst: Inst) -> i64 {
 }
 
 /// The nearest common dominator of blocks a and b (block indexes).
-fn eg_dom_lca(cfg: & IroCfg, a0: i64, b: i64) -> i64 {
+fn eg_dom_lca(cfg: &IroCfg, a0: i64, b: i64) -> i64 {
     var a: i64 = a0;
     var hops: i64 = 0;
     while !iro_dominates(cfg, a, b) && hops <= cfg.n {
@@ -2217,7 +2251,7 @@ fn eg_dom_lca(cfg: & IroCfg, a0: i64, b: i64) -> i64 {
 
 /// Is block `b` a place a value of block `home` may go without running
 /// more often: outside every loop, or in a loop that holds `home` too?
-fn eg_place_ok(lt: & IroLoops, b: i64, home: i64) -> bool {
+fn eg_place_ok(lt: &IroLoops, b: i64, home: i64) -> bool {
     if b < 0 || b >= lt.head_of.len() {
         return false;
     }
@@ -2230,12 +2264,12 @@ fn eg_place_ok(lt: & IroLoops, b: i64, home: i64) -> bool {
 }
 
 /// ME8: place every movable value of `f` (eg_place_kind): how many moved.
-fn eg_place(f: & mut IrFunction) -> i64 {
+fn eg_place(f: &mut IrFunction) -> i64 {
     if f.blocks.len() < 2 {
         return 0;
     }
     var cfg: IroCfg = iro_cfg(f);
-    var lt: IroLoops = iro_loops(& cfg);
+    var lt: IroLoops = iro_loops(&cfg);
     var n: i64 = f.next_value;
     var i: i64 = 0;
     while i < f.insts.len() {
@@ -2281,7 +2315,7 @@ fn eg_place(f: & mut IrFunction) -> i64 {
                 blk.set(id, bi);
                 var inst: Inst = peir_inst_of(f, id);
                 var ops: Vec<i64> = Vec::new();
-                peir_inst_operands(inst, & mut ops);
+                peir_inst_operands(inst, &mut ops);
                 var is_branch: bool = false;
                 match inst {
                     Inst::Branch(_, _, _) => {
@@ -2372,7 +2406,7 @@ fn eg_place(f: & mut IrFunction) -> i64 {
             } else if late == 0 - 1 {
                 late = ub;
             } else {
-                late = eg_dom_lca(& cfg, late, ub);
+                late = eg_dom_lca(&cfg, late, ub);
                 if late < 0 {
                     late = 0 - 2;
                     ui = ulist.len();
@@ -2380,25 +2414,25 @@ fn eg_place(f: & mut IrFunction) -> i64 {
             }
             ui = ui + 1;
         }
-        if late < 0 || !iro_dominates(& cfg, home, late) {
+        if late < 0 || !iro_dominates(&cfg, home, late) {
             continue;
         }
         // early: the deepest block of its operands (they all dominate home)
         var early: i64 = entry_b;
         var ops2: Vec<i64> = Vec::new();
-        peir_inst_operands(inst2, & mut ops2);
+        peir_inst_operands(inst2, &mut ops2);
         var oj: i64 = 0;
         while oj < ops2.len() {
             var ov: i64 = ops2.get(oj);
             if ov >= 0 && ov < n && blk.get(ov) >= 0 {
                 var obk: i64 = blk.get(ov);
-                if iro_dominates(& cfg, early, obk) {
+                if iro_dominates(&cfg, early, obk) {
                     early = obk;
                 }
             }
             oj = oj + 1;
         }
-        if !iro_dominates(& cfg, early, home) {
+        if !iro_dominates(&cfg, early, home) {
             continue;
         }
         // From late up to early: the allowed block in the fewest loops,
@@ -2409,7 +2443,7 @@ fn eg_place(f: & mut IrFunction) -> i64 {
         var steps: i64 = 0;
         var found: bool = false;
         while steps <= cfg.n {
-            var allowed: bool = eg_place_ok(& lt, cur, home);
+            var allowed: bool = eg_place_ok(&lt, cur, home);
             if kind == 2 && by_branch.get(id2) != 0 && cur != late && cur != home {
                 allowed = false;
             }
@@ -2482,7 +2516,7 @@ fn eg_place(f: & mut IrFunction) -> i64 {
         if lt.depth.get(best) < lt.depth.get(home) {
             g_eg_st_pl_hoisted = g_eg_st_pl_hoisted + 1;
         }
-        if iro_dominates(& cfg, home, best) {
+        if iro_dominates(&cfg, home, best) {
             g_eg_st_pl_sunk = g_eg_st_pl_sunk + 1;
         }
     }
@@ -2623,7 +2657,7 @@ fn eg_sk_operand_ty(n: ENode) -> IrType {
 /// ME7: may node n be made anywhere its operands are? It reads no memory
 /// and cannot panic: the eg_place_kind instructions, a constant within its
 /// type, and in @wrapping code a shift by a constant below the width.
-fn eg_sk_safe(g: & mut EGraph, n: ENode) -> bool {
+fn eg_sk_safe(g: &mut EGraph, n: ENode) -> bool {
     var is_float: bool = n.ty == "f32" || n.ty == "f64";
     if n.kind == EK_CONST {
         return eg_ty_code(n.ty) != 0 && !is_float && eg_in_range(n.a, n.ty);
@@ -2723,7 +2757,7 @@ fn eg_sk_inst(n: ENode, va: i64, vb: i64) -> Inst {
     return Inst::Unreachable;
 }
 
-fn eg_sk_grow(s: & mut EgSk, id: i64) {
+fn eg_sk_grow(s: &mut EgSk, id: i64) {
     while s.blk.len() <= id {
         s.blk.push(0 - 1);
         s.floating.push(0);
@@ -2732,12 +2766,12 @@ fn eg_sk_grow(s: & mut EgSk, id: i64) {
     }
 }
 
-fn eg_sk_new(nv: i64, nc: i64, best: & Vec<i64>) -> EgSk {
+fn eg_sk_new(nv: i64, nc: i64, best: &Vec<i64>) -> EgSk {
     var s: EgSk = EgSk {
         blk: Vec::new(), floating: Vec::new(), seen: Vec::new(), placed: Vec::new(), avail: Vec::new(), nodes_of: Vec::new(), orig: Vec::new(), busy: Vec::new(), best: Vec::new(), entry: 0, work: 0, ok: true, reused: 0, fresh: 0
     };
     if nv > 0 {
-        eg_sk_grow(& mut s, nv - 1);
+        eg_sk_grow(&mut s, nv - 1);
     }
     var i: i64 = 0;
     while i < nc {
@@ -2759,7 +2793,7 @@ fn eg_sk_new(nv: i64, nc: i64, best: & Vec<i64>) -> EgSk {
 }
 
 /// ME7: is value v available at the walk's current point in block u?
-fn eg_sk_avail(s: & EgSk, cfg: & IroCfg, v: i64, u: i64) -> bool {
+fn eg_sk_avail(s: &EgSk, cfg: &IroCfg, v: i64, u: i64) -> bool {
     if v < 0 || v >= s.blk.len() {
         return false;
     }
@@ -2776,7 +2810,7 @@ fn eg_sk_avail(s: & EgSk, cfg: & IroCfg, v: i64, u: i64) -> bool {
 /// ME7: where a value made for a use in block u goes: on the dominator
 /// path from u up to `early` (the block of its deepest operand), the block
 /// in the fewest loops, the latest one among equals.
-fn eg_sk_block(cfg: & IroCfg, lt: & IroLoops, early: i64, u: i64) -> i64 {
+fn eg_sk_block(cfg: &IroCfg, lt: &IroLoops, early: i64, u: i64) -> i64 {
     if u < 0 || u >= lt.depth.len() {
         return u;
     }
@@ -2806,7 +2840,7 @@ fn eg_sk_block(cfg: & IroCfg, lt: & IroLoops, early: i64, u: i64) -> i64 {
 }
 
 /// ME7: put value `id` into block b, before its terminator.
-fn eg_sk_insert(f: & mut IrFunction, b: i64, id: i64) {
+fn eg_sk_insert(f: &mut IrFunction, b: i64, id: i64) {
     var bb: BasicBlock = f.blocks.get(b);
     var l: Vec<i64> = bb.instructions;
     var at: i64 = l.len();
@@ -2831,7 +2865,7 @@ fn eg_sk_insert(f: & mut IrFunction, b: i64, id: i64) {
 }
 
 /// ME7: a new instruction of `f` in no block yet (its type from `inst`).
-fn eg_detached(f: & mut IrFunction, inst: Inst) -> i64 {
+fn eg_detached(f: &mut IrFunction, inst: Inst) -> i64 {
     var keep: i64 = f.current_block_idx;
     if keep < 0 || keep >= f.blocks.len() {
         f.current_block_idx = 0;
@@ -2848,7 +2882,7 @@ fn eg_detached(f: & mut IrFunction, inst: Inst) -> i64 {
 /// ME7: a value of class c available for a use in block u (the walk's
 /// current point), elaborated if there is none: its id, or -1. A value
 /// made in u goes to `cur`, the part of u's new list before the use.
-fn eg_sk_elab(f: & mut IrFunction, g: & mut EGraph, s: & mut EgSk, cfg: & IroCfg, lt: & IroLoops, c: i64, u: i64, for_branch: bool, cur: & mut Vec<i64>) -> i64 {
+fn eg_sk_elab(f: &mut IrFunction, g: &mut EGraph, s: &mut EgSk, cfg: &IroCfg, lt: &IroLoops, c: i64, u: i64, for_branch: bool, cur: &mut Vec<i64>) -> i64 {
     s.work = s.work + 1;
     if s.work > EG_SK_MAX_WORK || !s.ok {
         s.ok = false;
@@ -2897,7 +2931,7 @@ fn eg_sk_elab(f: & mut IrFunction, g: & mut EGraph, s: & mut EgSk, cfg: & IroCfg
 /// ME7: make node nd of class rc for a use in block u: its value, or -1
 /// when it cannot be made there (a leaf not available, a node that may
 /// panic, an operand that cannot be elaborated, a type that differs).
-fn eg_sk_make(f: & mut IrFunction, g: & mut EGraph, s: & mut EgSk, cfg: & IroCfg, lt: & IroLoops, rc: i64, nd: i64, u: i64, for_branch: bool, cur: & mut Vec<i64>) -> i64 {
+fn eg_sk_make(f: &mut IrFunction, g: &mut EGraph, s: &mut EgSk, cfg: &IroCfg, lt: &IroLoops, rc: i64, nd: i64, u: i64, for_branch: bool, cur: &mut Vec<i64>) -> i64 {
     var n: ENode = g.nodes.get(nd);
     if n.kind == EK_LEAF {
         var lv: i64 = n.a;
@@ -2978,7 +3012,7 @@ fn eg_sk_make(f: & mut IrFunction, g: & mut EGraph, s: & mut EgSk, cfg: & IroCfg
     return id;
 }
 
-fn eg_sk_pin(pinned: & mut Vec<i64>, v: i64) {
+fn eg_sk_pin(pinned: &mut Vec<i64>, v: i64) {
     if v >= 0 && v < pinned.len() {
         pinned.set(v, 1);
     }
@@ -2988,7 +3022,7 @@ fn eg_sk_pin(pinned: & mut Vec<i64>, v: i64) {
 /// `cls` value id -> class, `own` value id -> 1 when the class came from
 /// its own instruction, `best` class -> cheapest node. How many pure values
 /// left the skeleton (0: nothing changed, also when it was put back).
-fn eg_skeleton(f: & mut IrFunction, g: & mut EGraph, cls: & Vec<i64>, own: & Vec<i64>, best: & Vec<i64>, cfg: & IroCfg) -> i64 {
+fn eg_skeleton(f: &mut IrFunction, g: &mut EGraph, cls: &Vec<i64>, own: &Vec<i64>, best: &Vec<i64>, cfg: &IroCfg) -> i64 {
     if f.blocks.len() == 0 || cfg.rpo.len() == 0 {
         return 0;
     }
@@ -3007,7 +3041,7 @@ fn eg_skeleton(f: & mut IrFunction, g: & mut EGraph, cls: & Vec<i64>, own: & Vec
         while k < ids.len() {
             var inst: Inst = peir_inst_of(f, ids.get(k));
             var ops: Vec<i64> = Vec::new();
-            peir_inst_operands(inst, & mut ops);
+            peir_inst_operands(inst, &mut ops);
             if ops.len() > 0 {
                 var pin_all: bool = !reachable;
                 if !pin_all {
@@ -3022,7 +3056,7 @@ fn eg_skeleton(f: & mut IrFunction, g: & mut EGraph, cls: & Vec<i64>, own: & Vec
                         o = o + 1;
                     }
                     var ops2: Vec<i64> = Vec::new();
-                    peir_inst_operands(ssa_remap(inst, & tm), & mut ops2);
+                    peir_inst_operands(ssa_remap(inst, &tm), &mut ops2);
                     var got: i64 = 0;
                     o = 0;
                     while o < ops2.len() {
@@ -3044,7 +3078,7 @@ fn eg_skeleton(f: & mut IrFunction, g: & mut EGraph, cls: & Vec<i64>, own: & Vec
                 if pin_all {
                     var p: i64 = 0;
                     while p < ops.len() {
-                        eg_sk_pin(& mut pinned, ops.get(p));
+                        eg_sk_pin(&mut pinned, ops.get(p));
                         p = p + 1;
                     }
                 }
@@ -3055,22 +3089,22 @@ fn eg_skeleton(f: & mut IrFunction, g: & mut EGraph, cls: & Vec<i64>, own: & Vec
     }
     var li: i64 = 0;
     while li < f.locals.len() {
-        eg_sk_pin(& mut pinned, f.locals.get(li).id);
+        eg_sk_pin(&mut pinned, f.locals.get(li).id);
         li = li + 1;
     }
     li = 0;
     while li < f.persist_vars.len() {
-        eg_sk_pin(& mut pinned, f.persist_vars.get(li).id);
+        eg_sk_pin(&mut pinned, f.persist_vars.get(li).id);
         li = li + 1;
     }
     li = 0;
     while li < f.drop_locals.len() {
-        eg_sk_pin(& mut pinned, f.drop_locals.get(li).id);
+        eg_sk_pin(&mut pinned, f.drop_locals.get(li).id);
         li = li + 1;
     }
     li = 0;
     while li < f.zeroize_locals.len() {
-        eg_sk_pin(& mut pinned, f.zeroize_locals.get(li).id);
+        eg_sk_pin(&mut pinned, f.zeroize_locals.get(li).id);
         li = li + 1;
     }
     // Classes, blocks, and the pure values that leave the skeleton
@@ -3158,7 +3192,7 @@ fn eg_skeleton(f: & mut IrFunction, g: & mut EGraph, cls: & Vec<i64>, own: & Vec
             }
             var sinst: Inst = peir_inst_of(f, sid);
             var sops: Vec<i64> = Vec::new();
-            peir_inst_operands(sinst, & mut sops);
+            peir_inst_operands(sinst, &mut sops);
             var is_br: bool = false;
             match sinst {
                 Inst::Branch(_, _, _) => {
@@ -3172,7 +3206,7 @@ fn eg_skeleton(f: & mut IrFunction, g: & mut EGraph, cls: & Vec<i64>, own: & Vec
             while so < sops.len() && s.ok {
                 var ov: i64 = sops.get(so);
                 if ov >= 0 && ov < nv && s.floating.get(ov) == 1 && tm.get(ov) == 0 {
-                    var e: i64 = eg_sk_elab(f, g, & mut s, cfg, & lt, cls.get(ov), u, is_br, & mut cur);
+                    var e: i64 = eg_sk_elab(f, g, &mut s, cfg, &lt, cls.get(ov), u, is_br, &mut cur);
                     // the value read in its place must have its type (an
                     // equal value of a class is reused without a check)
                     if e >= 0 && e != ov && !ir_type_eq(eg_value_ty(f, e), eg_value_ty(f, ov)) {
@@ -3188,7 +3222,7 @@ fn eg_skeleton(f: & mut IrFunction, g: & mut EGraph, cls: & Vec<i64>, own: & Vec
                 so = so + 1;
             }
             if mapped.len() > 0 {
-                eg_set_inst(f, sid, ssa_remap(sinst, & tm));
+                eg_set_inst(f, sid, ssa_remap(sinst, &tm));
                 var mi: i64 = 0;
                 while mi < mapped.len() {
                     tm.set(mapped.get(mi), 0);
@@ -3246,7 +3280,7 @@ fn eg_vec_without(xs: Vec<i64>, v: i64) -> Vec<i64> {
 
 /// Forwarding, the e-graph and placing on one function: [loads forwarded,
 /// instructions rewritten, values placed].
-fn eg_one(f: & mut IrFunction, module: & IrModule, on_f: bool, on_e: bool, on_p: bool) -> Vec<i64> {
+fn eg_one(f: &mut IrFunction, module: &IrModule, on_f: bool, on_e: bool, on_p: bool) -> Vec<i64> {
     var a: i64 = 0;
     var e: i64 = 0;
     var pl: i64 = 0;
@@ -3275,7 +3309,7 @@ fn eg_one(f: & mut IrFunction, module: & IrModule, on_f: bool, on_e: bool, on_p:
 
 /// The pass over every function: [loads forwarded, instructions rewritten,
 /// values placed (ME8, opt-in)].
-pub fn egraph_run(module: & mut IrModule) -> Vec<i64> {
+pub fn egraph_run(module: &mut IrModule) -> Vec<i64> {
     var nf: i64 = 0;
     var ne: i64 = 0;
     var np: i64 = 0;
@@ -3357,7 +3391,7 @@ pub fn egraph_run(module: & mut IrModule) -> Vec<i64> {
             var at: i64 = mec_lookup(key, f.name);
             var done: bool = false;
             if at > 0 {
-                if mec_apply_at(at, & mut f) {
+                if mec_apply_at(at, &mut f) {
                     done = true;
                     var e: MecEntry = mec_entry(at);
                     nf = nf + e.c1;
@@ -3369,7 +3403,7 @@ pub fn egraph_run(module: & mut IrModule) -> Vec<i64> {
             if !done {
                 var pre: IrFunction = f;
                 mec_log_begin();
-                var cs: Vec<i64> = eg_one(& mut f, module, on_f, on_e, on_p);
+                var cs: Vec<i64> = eg_one(&mut f, module, on_f, on_e, on_p);
                 mec_log_end();
                 nf = nf + cs.get(0);
                 ne = ne + cs.get(1);
@@ -3378,7 +3412,7 @@ pub fn egraph_run(module: & mut IrModule) -> Vec<i64> {
                 var _post: i64 = mec_note(key, pre, pre_h, f, c > 0, cs.get(0), cs.get(1), cs.get(2));
             }
         } else {
-            var cs2: Vec<i64> = eg_one(& mut f, module, on_f, on_e, on_p);
+            var cs2: Vec<i64> = eg_one(&mut f, module, on_f, on_e, on_p);
             nf = nf + cs2.get(0);
             ne = ne + cs2.get(1);
             np = np + cs2.get(2);
@@ -3473,7 +3507,8 @@ fn eg_smt_int_tys() -> Vec<str> {
 }
 
 /// ME7: the 64-bit pattern of v as an SMT-LIB literal (#x and 16 digits).
-@wrapping fn eg_smt_hex(v: i64) -> str {
+@wrapping
+fn eg_smt_hex(v: i64) -> str {
     var digits: str = "0123456789abcdef";
     var out: str = "#x";
     var i: i64 = 15;
@@ -3928,7 +3963,7 @@ fn eg_smt_float(ft: str) -> Vec<str> {
 
 /// ME7: write dir/eg_<name>.smt2 asserting one of `obs` (an obligation's
 /// negation each); 1 written, 0 nothing to write, -1 not written.
-fn eg_smt_write(dir: str, name: str, logic: str, decls: str, obs: & Vec<str>) -> i64 {
+fn eg_smt_write(dir: str, name: str, logic: str, decls: str, obs: &Vec<str>) -> i64 {
     if obs.len() == 0 {
         return 0;
     }
@@ -3992,7 +4027,7 @@ pub fn egraph_smt(dir: str) -> i64 {
                     if wrapping {
                         mode = "_w";
                     }
-                    var r: i64 = eg_smt_write(dir, fam + "_" + ty + mode, "QF_BV", decls, & obs);
+                    var r: i64 = eg_smt_write(dir, fam + "_" + ty + mode, "QF_BV", decls, &obs);
                     if r > 0 {
                         written = written + 1;
                     }
@@ -4017,7 +4052,7 @@ pub fn egraph_smt(dir: str) -> i64 {
         }
         bv = bv + 1;
     }
-    var rb: i64 = eg_smt_write(dir, "invol_unaryfold_bool", "QF_BV", "(declare-const b Bool)\n", & bobs);
+    var rb: i64 = eg_smt_write(dir, "invol_unaryfold_bool", "QF_BV", "(declare-const b Bool)\n", &bobs);
     if rb > 0 {
         written = written + 1;
     }
@@ -4045,7 +4080,7 @@ pub fn egraph_smt(dir: str) -> i64 {
         while fj < froms.len() {
             var from: str = froms.get(fj);
             var cobs: Vec<str> = eg_smt_castfold(cop, from);
-            var rc: i64 = eg_smt_write(dir, "castfold_" + cname + "_" + from, "QF_BV", "(declare-const c (_ BitVec 64))\n", & cobs);
+            var rc: i64 = eg_smt_write(dir, "castfold_" + cname + "_" + from, "QF_BV", "(declare-const c (_ BitVec 64))\n", &cobs);
             if rc > 0 {
                 written = written + 1;
             }
@@ -4068,7 +4103,7 @@ pub fn egraph_smt(dir: str) -> i64 {
             es = "8 24";
         }
         var fobs: Vec<str> = eg_smt_float(ft);
-        var rf: i64 = eg_smt_write(dir, "float_" + ft, "QF_FP", "(declare-const x (_ FloatingPoint " + es + "))\n(declare-const y (_ FloatingPoint " + es + "))\n", & fobs);
+        var rf: i64 = eg_smt_write(dir, "float_" + ft, "QF_FP", "(declare-const x (_ FloatingPoint " + es + "))\n(declare-const y (_ FloatingPoint " + es + "))\n", &fobs);
         if rf > 0 {
             written = written + 1;
         }

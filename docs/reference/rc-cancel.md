@@ -72,6 +72,12 @@ That is safe when:
   that say when its value goes.
 * Not in a function that opens a region (`lw_rg_has_region`).
 
+  A `str` copy counts in place and is cancelled the same way (Nov 21):
+  `Str_dup`'s result may be wrapped in a `BitCast` by the region lowering,
+  and the clearing `t = null` after the drop is part of the pattern
+  (`lw_ps_lit_store_ok` walks back over the drop's own operand load and
+  the null of the store).
+
 When all hold, the count goes, every drop of `t`'s slot goes, and a Vec or
 map slot is stored the source itself instead of the share.
 

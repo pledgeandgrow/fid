@@ -60,7 +60,17 @@
 // (small structs returned in registers) is a calling convention of
 // pe_ir/nat_ir. Neither is here.
 
-module compiler::iropt_me; use core; use vec; use string; use compiler::ast; use compiler::ir; use compiler::checks; use compiler::ssa; use compiler::tv; use compiler::pgo;  /// Is mid-end pass `name` on? Only when FID_IROPT_ON names it (or "all")
+module compiler::iropt_me;
+use core;
+use vec;
+use string;
+use compiler::ast;
+use compiler::ir;
+use compiler::checks;
+use compiler::ssa;
+use compiler::tv;
+use compiler::pgo;
+/// Is mid-end pass `name` on? Only when FID_IROPT_ON names it (or "all")
 /// and FID_IROPT_OFF does not. The passes of IME_DEFAULT_ON are on unless
 /// FID_IROPT_OFF names them.
 pub fn ime_on(name: str) -> bool {
@@ -198,7 +208,7 @@ const IME_DEFAULT_ON: str = ",loops,sra,loadhoist,forward,matchfacts,inline2,inl
 // --- Helpers ----------------------------------------------------------------
 
 /// A new instruction in `f` that is in no block yet (its type from `inst`).
-fn ime_detached(f: & mut IrFunction, inst: Inst) -> i64 {
+fn ime_detached(f: &mut IrFunction, inst: Inst) -> i64 {
     var id: i64 = IrFunction_emit(f, inst);
     var last: i64 = f.current_block_idx;
     var blk: BasicBlock = f.blocks.get(last);
@@ -218,7 +228,7 @@ fn ime_has(v: Vec<i64>, x: i64) -> bool {
     return false;
 }
 
-fn ime_size(f: & IrFunction) -> i64 {
+fn ime_size(f: &IrFunction) -> i64 {
     var n: i64 = 0;
     var b: i64 = 0;
     while b < f.blocks.len() {
@@ -228,7 +238,7 @@ fn ime_size(f: & IrFunction) -> i64 {
     return n;
 }
 
-fn ime_block_index(f: & IrFunction, bid: i64) -> i64 {
+fn ime_block_index(f: &IrFunction, bid: i64) -> i64 {
     var b: i64 = 0;
     while b < f.blocks.len() {
         if f.blocks.get(b).id == bid {
@@ -236,18 +246,18 @@ fn ime_block_index(f: & IrFunction, bid: i64) -> i64 {
         }
         b = b + 1;
     }
-    return - 1;
+    return -1;
 }
 
 /// The value `id` names after a copy (map: old id -> new id + 1).
-fn ime_v(map: & Vec<i64>, id: i64) -> i64 {
+fn ime_v(map: &Vec<i64>, id: i64) -> i64 {
     if id >= 0 && id < map.len() && map.get(id) != 0 {
         return map.get(id) - 1;
     }
     return id;
 }
 
-fn ime_vs(map: & Vec<i64>, v: Vec<i64>) -> Vec<i64> {
+fn ime_vs(map: &Vec<i64>, v: Vec<i64>) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     var i: i64 = 0;
     while i < v.len() {
@@ -259,7 +269,7 @@ fn ime_vs(map: & Vec<i64>, v: Vec<i64>) -> Vec<i64> {
 
 /// `inst` with its values renamed through `vm` and its block targets
 /// through `bm` (both: old -> new + 1, 0 = the same).
-fn ime_remap(inst: Inst, vm: & Vec<i64>, bm: & Vec<i64>) -> Inst {
+fn ime_remap(inst: Inst, vm: &Vec<i64>, bm: &Vec<i64>) -> Inst {
     match inst {
         Inst::BinOp(op, a, b, t) => {
             return Inst::BinOp(op, ime_v(vm, a), ime_v(vm, b), t);
@@ -351,14 +361,14 @@ fn ime_remap(inst: Inst, vm: & Vec<i64>, bm: & Vec<i64>) -> Inst {
 
 /// 2g.109: per value (1), whether an instruction ime_remap does not rename
 /// reads it (a TryUnwrap, an asm! input): such a value must stay itself.
-fn ime_unrenamed_uses(f: & IrFunction) -> Vec<i64> {
+fn ime_unrenamed_uses(f: &IrFunction) -> Vec<i64> {
     var bad: Vec<i64> = peir_zeros(f.next_value + 1);
     var i: i64 = 0;
     while i < f.insts.len() {
         var inst: Inst = f.insts.get(i).inst;
         if !ime_remap_covers(inst) {
             var ops: Vec<i64> = Vec::new();
-            peir_inst_operands(inst, & mut ops);
+            peir_inst_operands(inst, &mut ops);
             var o: i64 = 0;
             while o < ops.len() {
                 var v: i64 = ops.get(o);
@@ -376,7 +386,7 @@ fn ime_unrenamed_uses(f: & IrFunction) -> Vec<i64> {
 /// Give copy `nid` (in `f`) the source line of `oid` (in `from`): a panic
 /// in copied code still says where it is (types, regions, effects stay
 /// the copy's own).
-fn ime_copy_line(f: & mut IrFunction, from: & IrFunction, oid: i64, nid: i64) {
+fn ime_copy_line(f: &mut IrFunction, from: &IrFunction, oid: i64, nid: i64) {
     // DB1: copied code keeps the file it came from (ir.fd)
     ir_copy_value_file(from.name, oid, f.name, nid);
     match IrFunction_get_meta(from, oid) {
@@ -397,7 +407,7 @@ fn ime_copy_line(f: & mut IrFunction, from: & IrFunction, oid: i64, nid: i64) {
 }
 
 /// ime_copy_line within one function.
-fn ime_copy_line_self(f: & mut IrFunction, oid: i64, nid: i64) {
+fn ime_copy_line_self(f: &mut IrFunction, oid: i64, nid: i64) {
     // DB1: a copy within one function keeps the file of what it copies
     ir_copy_value_file(f.name, oid, f.name, nid);
     var line: OptU64 = OptU64::None;
@@ -425,7 +435,7 @@ fn ime_copy_line_self(f: & mut IrFunction, oid: i64, nid: i64) {
 }
 
 /// The value type of `id` (I64 when unknown).
-fn ime_type(f: & IrFunction, id: i64) -> IrType {
+fn ime_type(f: &IrFunction, id: i64) -> IrType {
     match IrFunction_get_meta(f, id) {
         OptValueMeta::Some(m) => {
             return m.ty;
@@ -437,7 +447,7 @@ fn ime_type(f: & IrFunction, id: i64) -> IrType {
 }
 
 /// The constant `id` holds, as OptI64 (i64 constants only).
-fn ime_const(f: & IrFunction, id: i64) -> OptI64 {
+fn ime_const(f: &IrFunction, id: i64) -> OptI64 {
     match peir_inst_of(f, id) {
         Inst::ConstInt(v, t) => {
             if ir_type_eq(t, IrType::I64) {
@@ -451,7 +461,7 @@ fn ime_const(f: & IrFunction, id: i64) -> OptI64 {
 }
 
 /// Every block's predecessor list again, from the terminators.
-fn ime_recompute_preds(f: & mut IrFunction) {
+fn ime_recompute_preds(f: &mut IrFunction) {
     var n: i64 = f.blocks.len();
     var preds: Vec<Vec<i64>> = Vec::new();
     var b: i64 = 0;
@@ -466,12 +476,12 @@ fn ime_recompute_preds(f: & mut IrFunction) {
             var from: i64 = f.blocks.get(b).id;
             match peir_inst_of(f, ids.get(ids.len() - 1)) {
                 Inst::Jump(t) => {
-                    ime_add_pred(f, & mut preds, t, from);
+                    ime_add_pred(f, &mut preds, t, from);
                 }
                 Inst::Branch(_, t, e) => {
-                    ime_add_pred(f, & mut preds, t, from);
+                    ime_add_pred(f, &mut preds, t, from);
                     if e != t {
-                        ime_add_pred(f, & mut preds, e, from);
+                        ime_add_pred(f, &mut preds, e, from);
                     }
                 }
                 _ => {
@@ -489,7 +499,7 @@ fn ime_recompute_preds(f: & mut IrFunction) {
     }
 }
 
-fn ime_add_pred(f: & IrFunction, preds: & mut Vec<Vec<i64>>, target: i64, from: i64) {
+fn ime_add_pred(f: &IrFunction, preds: &mut Vec<Vec<i64>>, target: i64, from: i64) {
     var ti: i64 = ime_block_index(f, target);
     if ti < 0 {
         return;
@@ -500,7 +510,7 @@ fn ime_add_pred(f: & IrFunction, preds: & mut Vec<Vec<i64>>, target: i64, from: 
 }
 
 /// The terminator of block index `bi` with every edge to `from` sent to `to`.
-fn ime_retarget(f: & mut IrFunction, bi: i64, from: i64, to: i64) {
+fn ime_retarget(f: &mut IrFunction, bi: i64, from: i64, to: i64) {
     var ids: Vec<i64> = f.blocks.get(bi).instructions;
     if ids.len() == 0 {
         return;
@@ -529,7 +539,7 @@ fn ime_retarget(f: & mut IrFunction, bi: i64, from: i64, to: i64) {
 }
 
 /// A new block (its index) holding just `Jump(to)`.
-fn ime_jump_block(f: & mut IrFunction, to: i64) -> i64 {
+fn ime_jump_block(f: &mut IrFunction, to: i64) -> i64 {
     var nid: i64 = IrFunction_new_block(f);
     var ni: i64 = f.blocks.len() - 1;
     var jid: i64 = ime_detached(f, Inst::Jump(to));
@@ -540,7 +550,7 @@ fn ime_jump_block(f: & mut IrFunction, to: i64) -> i64 {
 }
 
 /// Put allocation `id` at the front of the entry block.
-fn ime_into_entry(f: & mut IrFunction, id: i64) {
+fn ime_into_entry(f: &mut IrFunction, id: i64) {
     var blk: BasicBlock = f.blocks.get(0);
     var ids: Vec<i64> = Vec::new();
     ids.push(id);
@@ -560,18 +570,18 @@ fn ime_into_entry(f: & mut IrFunction, id: i64) {
 // iropt, egraph, rules and irverify); these two names stay for the passes
 // below.
 
-fn ime_cfg(f: & IrFunction) -> IroCfg {
+fn ime_cfg(f: &IrFunction) -> IroCfg {
     return iro_cfg(f);
 }
 
 /// Does block index `a` dominate block index `b`? (false when either is
 /// unreachable; O(1) on the dominator tree's intervals)
-fn ime_dom(cfg: & IroCfg, a: i64, b: i64) -> bool {
+fn ime_dom(cfg: &IroCfg, a: i64, b: i64) -> bool {
     return iro_dominates(cfg, a, b);
 }
 
 /// Remove the blocks the entry no longer reaches.
-fn ime_drop_unreachable(f: & mut IrFunction) {
+fn ime_drop_unreachable(f: &mut IrFunction) {
     var cfg: IroCfg = ime_cfg(f);
     if cfg.n == 0 {
         return;
@@ -600,7 +610,7 @@ fn ime_drop_unreachable(f: & mut IrFunction) {
 /// The blocks (indexes, flags) of the loop with header `h`: the body the
 /// shared loop tree computed (ME2: compiler/checks.fd iro_loop_body; the
 /// same set this file's own walk from the latches gave).
-fn ime_loop_body(lt: & IroLoops, h: i64) -> Vec<i64> {
+fn ime_loop_body(lt: &IroLoops, h: i64) -> Vec<i64> {
     return iro_loop_body(lt, h);
 }
 
@@ -613,10 +623,14 @@ fn ime_loop_body(lt: & IroLoops, h: i64) -> Vec<i64> {
 // --- ME20, ME21: inlining -----------------------------------------------------
 
 /// A callee of at most this many instructions is inlined at any call site.
-const IME_INLINE_MAX: i64 = 60;  /// A callee with a single call site in the module: up to this size.
-const IME_INLINE_ONCE_MAX: i64 = 400;  /// No caller grows past this many instructions by inlining.
-const IME_CALLER_MAX: i64 = 4000;  /// Call sites inlined into one function at most (one pass).
-const IME_SITES_MAX: i64 = 64; fn ime_scalar_or_void(t: IrType) -> bool {
+const IME_INLINE_MAX: i64 = 60;
+/// A callee with a single call site in the module: up to this size.
+const IME_INLINE_ONCE_MAX: i64 = 400;
+/// No caller grows past this many instructions by inlining.
+const IME_CALLER_MAX: i64 = 4000;
+/// Call sites inlined into one function at most (one pass).
+const IME_SITES_MAX: i64 = 64;
+fn ime_scalar_or_void(t: IrType) -> bool {
     match t {
         IrType::Void => {
             return true;
@@ -698,7 +712,7 @@ fn ime_backend_named(name: str) -> bool {
 }
 
 /// May `g`'s body be copied into another function?
-fn ime_callee_ok(g: & IrFunction) -> bool {
+fn ime_callee_ok(g: &IrFunction) -> bool {
     // OP5: a GPU kernel (@kernel) is launched, not called: its body stays
     // its own (as iropt's dead-function and parameter passes keep it)
     if g.name == "main" || g.is_interrupt || g.is_kernel || g.blocks.len() == 0 {
@@ -784,7 +798,7 @@ fn ime_panic_frame(callee: str, called: str) -> bool {
 /// (its parameters are the arguments, its allocas go to f's entry block),
 /// each return stores the result and jumps to the rest, and the call
 /// becomes a load of the result there.
-fn ime_inline_site(f: & mut IrFunction, g: & IrFunction, bi: i64, k: i64, call_id: i64, args: Vec<i64>) {
+fn ime_inline_site(f: &mut IrFunction, g: &IrFunction, bi: i64, k: i64, call_id: i64, args: Vec<i64>) {
     // K10: @simd rides along — the annotation's guards and checked-op
     // vectorization then cover the copied loops (without this, inlining a
     // @simd callee into a plain caller left the caller is_simd = false, so
@@ -819,7 +833,7 @@ fn ime_inline_site(f: & mut IrFunction, g: & IrFunction, bi: i64, k: i64, call_i
         _ => {
         }
     }
-    var rslot: i64 = - 1;
+    var rslot: i64 = -1;
     var rest: Vec<i64> = Vec::new();
     if has_ret {
         rslot = ime_detached(f, Inst::Alloca(g.ret_ty, Region::Stack));
@@ -899,7 +913,7 @@ fn ime_inline_site(f: & mut IrFunction, g: & IrFunction, bi: i64, k: i64, call_i
         var q2: i64 = 0;
         while q2 < gids2.len() {
             var gi2: i64 = gids2.get(q2);
-            var ni: i64 = ime_v(& vm, gi2);
+            var ni: i64 = ime_v(&vm, gi2);
             var inst: Inst = peir_inst_of(g, gi2);
             match inst {
                 Inst::Alloca(_, _) => {
@@ -910,7 +924,7 @@ fn ime_inline_site(f: & mut IrFunction, g: & IrFunction, bi: i64, k: i64, call_i
                     match rv {
                         OptValueId::Some(v) => {
                             if has_ret {
-                                var st: i64 = ime_detached(f, Inst::Store(rslot, ime_v(& vm, v), OptIrType::Some(g.ret_ty)));
+                                var st: i64 = ime_detached(f, Inst::Store(rslot, ime_v(&vm, v), OptIrType::Some(g.ret_ty)));
                                 out.push(st);
                             }
                         }
@@ -921,7 +935,7 @@ fn ime_inline_site(f: & mut IrFunction, g: & IrFunction, bi: i64, k: i64, call_i
                     out.push(ni);
                 }
                 _ => {
-                    IrFunction_set_inst(f, ni, ime_remap(inst, & vm, & bm));
+                    IrFunction_set_inst(f, ni, ime_remap(inst, &vm, &bm));
                     out.push(ni);
                 }
             }
@@ -934,7 +948,7 @@ fn ime_inline_site(f: & mut IrFunction, g: & IrFunction, bi: i64, k: i64, call_i
     }
     // the call's block ends in a jump into the callee (its allocas, if it
     // is the entry block, are already at its front)
-    var entry_new: i64 = ime_v(& bm, g.blocks.get(0).id);
+    var entry_new: i64 = ime_v(&bm, g.blocks.get(0).id);
     var jid: i64 = ime_detached(f, Inst::Jump(entry_new));
     var hb: BasicBlock = f.blocks.get(bi);
     hb.instructions.push(jid);
@@ -1078,7 +1092,7 @@ pub fn ime_inline_stats_line() -> str {
 /// module up to IME_INLINE_ONCE_MAX; else up to IME_INLINE_MAX in a loop,
 /// IME_INLINE_FLAT_MAX outside every loop, plus IME_CONST_ARG_BONUS for
 /// each constant argument (ME20: the g_ime_lim_* values of those).
-fn ime_inline_cheap(f: & IrFunction, cost: i64, args: & Vec<i64>, in_loop: bool, once: bool) -> bool {
+fn ime_inline_cheap(f: &IrFunction, cost: i64, args: &Vec<i64>, in_loop: bool, once: bool) -> bool {
     if once && cost <= g_ime_lim_once {
         return true;
     }
@@ -1113,7 +1127,7 @@ fn ime_inline_cheap(f: & IrFunction, cost: i64, args: & Vec<i64>, in_loop: bool,
 /// each callee's size and whether it may be inlined at all (ime_callee_ok),
 /// found once per callee instead of at each of its call sites in each
 /// rescan; ime_inline_with forgets a function's words when it changes.
-fn ime_inline_function(module: & IrModule, f: & mut IrFunction, names: i64, sites: & Vec<i64>, closures_only: bool, budget: & mut Vec<i64>, memo: & mut Vec<i64>) -> bool {
+fn ime_inline_function(module: &IrModule, f: &mut IrFunction, names: i64, sites: &Vec<i64>, closures_only: bool, budget: &mut Vec<i64>, memo: &mut Vec<i64>) -> bool {
     var any: bool = false;
     var done: i64 = 0;
     var again: bool = true;
@@ -1154,9 +1168,9 @@ fn ime_inline_function(module: & IrModule, f: & mut IrFunction, names: i64, site
                             g_ime_inl_weighed = g_ime_inl_weighed + 1;
                             if memo.get(2 * gi) < 0 {
                                 var gm: IrFunction = module.functions.get(gi).func;
-                                memo.set(2 * gi, ime_size(& gm));
+                                memo.set(2 * gi, ime_size(&gm));
                                 var okw: i64 = 0;
-                                if ime_callee_ok(& gm) {
+                                if ime_callee_ok(&gm) {
                                     okw = 1;
                                 }
                                 memo.set(2 * gi + 1, okw);
@@ -1166,12 +1180,12 @@ fn ime_inline_function(module: & IrModule, f: & mut IrFunction, names: i64, site
                             var once: bool = sites.get(gi) == 1;
                             if !have_depth {
                                 var lcfg: IroCfg = ime_cfg(f);
-                                var lt: IroLoops = iro_loops(& lcfg);
+                                var lt: IroLoops = iro_loops(&lcfg);
                                 depth = lt.depth;
                                 have_depth = true;
                             }
                             var in_loop: bool = b < depth.len() && depth.get(b) > 0;
-                            var cheap: bool = ime_inline_cheap(f, cost, & args, in_loop, once);
+                            var cheap: bool = ime_inline_cheap(f, cost, &args, in_loop, once);
                             // OP5: profile weights (`--profile-use`, pgo.fd)
                             // (OP30: by the call's block when the profile counts blocks)
                             cheap = ime_inline_weigh(cn, cost, cheap, f.name, f.blocks.get(b).id);
@@ -1200,7 +1214,7 @@ fn ime_inline_function(module: & IrModule, f: & mut IrFunction, names: i64, site
                                 // other code, where no backend would verify it
                                 var ct_ok: bool = !g.is_constant_time || f.is_constant_time;
                                 if ct_ok && g.is_wrapping == f.is_wrapping && args.len() == g.params.len() {
-                                    ime_inline_site(f, & g, b, k, ids.get(k), args);
+                                    ime_inline_site(f, &g, b, k, ids.get(k), args);
                                     fsize = ime_size(f);
                                     if charge > 0 {
                                         budget.set(0, budget.get(0) - charge);
@@ -1261,14 +1275,14 @@ fn ime_inline_weigh(callee: str, cost: i64, cheap: bool, caller: str, site: i64)
 /// ME20, ME21: inline across the module, callees before their callers
 /// (post-order over the call graph), so a callee's size is its size after
 /// its own inlining.
-pub fn ime_inline(module: & mut IrModule) {
+pub fn ime_inline(module: &mut IrModule) {
     ime_inline_with(module, false, 0);
 }
 
 /// ME20: ime_inline into the functions named in `reach` (a HashMap from
 /// name; 0: every function) only: a function main never reaches is not
 /// worth growing (iropt optimizes only what main reaches, CS1).
-pub fn ime_inline_reached(module: & mut IrModule, reach: i64) {
+pub fn ime_inline_reached(module: &mut IrModule, reach: i64) {
     ime_inline_with(module, false, reach);
 }
 
@@ -1277,11 +1291,11 @@ pub fn ime_inline_reached(module: & mut IrModule, reach: i64) {
 /// at one site in the module, is copied into its caller up to
 /// IME_INLINE_ONCE_MAX instructions. A step towards inline2 by default
 /// (ME20): the closure's own body is all that moves (FID_IROPT_ON=inlineclo).
-pub fn ime_inline_closures(module: & mut IrModule) {
+pub fn ime_inline_closures(module: &mut IrModule) {
     ime_inline_with(module, true, 0);
 }
 
-fn ime_inline_with(module: & mut IrModule, closures_only: bool, reach: i64) {
+fn ime_inline_with(module: &mut IrModule, closures_only: bool, reach: i64) {
     // ME20: the limits of this build (FID_INLINE2_LIMITS)
     ime_inline_limits_load();
     var n: i64 = module.functions.len();
@@ -1305,13 +1319,13 @@ fn ime_inline_with(module: & mut IrModule, closures_only: bool, reach: i64) {
         var cs: Vec<i64> = Vec::new();
         if reach == 0 || HashMap_contains(reach, module.functions.get(i).name) {
             var f: IrFunction = module.functions.get(i).func;
-            into = into + ime_size(& f);
+            into = into + ime_size(&f);
             var b: i64 = 0;
             while b < f.blocks.len() {
                 var ids: Vec<i64> = f.blocks.get(b).instructions;
                 var k: i64 = 0;
                 while k < ids.len() {
-                    match peir_inst_of(& f, ids.get(k)) {
+                    match peir_inst_of(&f, ids.get(k)) {
                         Inst::Call(cn, _, _, _) => {
                             if HashMap_contains(names, cn) {
                                 var ci: i64 = HashMap_get(names, cn) - 1;
@@ -1380,7 +1394,7 @@ fn ime_inline_with(module: & mut IrModule, closures_only: bool, reach: i64) {
     var memo: Vec<i64> = Vec::new();
     i = 0;
     while i < 2 * n {
-        memo.push(- 1);
+        memo.push(-1);
         i = i + 1;
     }
     var oi: i64 = 0;
@@ -1389,12 +1403,12 @@ fn ime_inline_with(module: & mut IrModule, closures_only: bool, reach: i64) {
         var entry: IrFunctionEntry = module.functions.get(fi);
         var f2: IrFunction = entry.func;
         var reached: bool = reach == 0 || HashMap_contains(reach, f2.name);
-        if reached && !f2.is_interrupt && ime_inline_function(module, & mut f2, names, & sites, closures_only, & mut budget, & mut memo) {
+        if reached && !f2.is_interrupt && ime_inline_function(module, &mut f2, names, &sites, closures_only, &mut budget, &mut memo) {
             entry.func = f2;
             module.functions.set(fi, entry);
             // its size (and what it calls) changed: weigh it again
-            memo.set(2 * fi, - 1);
-            memo.set(2 * fi + 1, - 1);
+            memo.set(2 * fi, -1);
+            memo.set(2 * fi + 1, -1);
         }
         oi = oi + 1;
     }
@@ -1404,7 +1418,7 @@ fn ime_inline_with(module: & mut IrModule, closures_only: bool, reach: i64) {
 
 /// Give every loop a preheader, one latch and dedicated exits. True when
 /// anything changed (the CFG is then recomputed by the caller).
-pub fn ime_canonical_loops(f: & mut IrFunction) -> bool {
+pub fn ime_canonical_loops(f: &mut IrFunction) -> bool {
     var changed: bool = false;
     var rounds: i64 = 0;
     var again: bool = true;
@@ -1412,14 +1426,14 @@ pub fn ime_canonical_loops(f: & mut IrFunction) -> bool {
         again = false;
         rounds = rounds + 1;
         var cfg: IroCfg = ime_cfg(f);
-        var lt: IroLoops = iro_loops(& cfg);
+        var lt: IroLoops = iro_loops(&cfg);
         var hs: Vec<i64> = lt.found;
         var hi: i64 = 0;
         while hi < hs.len() && !again {
             var h: i64 = hs.get(hi);
             var hid: i64 = f.blocks.get(h).id;
             var lat: Vec<i64> = lt.latches.get(h);
-            var body: Vec<i64> = ime_loop_body(& lt, h);
+            var body: Vec<i64> = ime_loop_body(&lt, h);
             // the preheader: one outside predecessor that only goes here
             var outside: Vec<i64> = Vec::new();
             var ps: Vec<i64> = cfg.preds.get(h);
@@ -1507,7 +1521,7 @@ var g_ime_unroll_rt_n: i64 = 0;
 var g_ime_unroll_cold_n: i64 = 0;
 
 /// A local only loads and stores of whole values use.
-fn ime_plain_locals(f: & IrFunction) -> Vec<i64> {
+fn ime_plain_locals(f: &IrFunction) -> Vec<i64> {
     var plain: Vec<i64> = peir_zeros(f.next_value + 1);
     var i: i64 = 0;
     while i < f.insts.len() {
@@ -1527,7 +1541,7 @@ fn ime_plain_locals(f: & IrFunction) -> Vec<i64> {
     while i < f.insts.len() {
         var inst: Inst = f.insts.get(i).inst;
         var ops: Vec<i64> = Vec::new();
-        peir_inst_operands(inst, & mut ops);
+        peir_inst_operands(inst, &mut ops);
         var o: i64 = 0;
         while o < ops.len() {
             var v: i64 = ops.get(o);
@@ -1572,7 +1586,7 @@ fn ime_plain_locals(f: & IrFunction) -> Vec<i64> {
 /// traps nowhere the multiply would not. FID_IROPT_OFF=ivbound keeps it to
 /// @wrapping functions. Exit values of the loop's variable are ssaexit's
 /// (compiler/ssa.fd, on by default since OP2).
-pub fn ime_strength_reduce(f: & mut IrFunction) -> bool {
+pub fn ime_strength_reduce(f: &mut IrFunction) -> bool {
     var bounded_ok: bool = !f.is_wrapping && !iro_named_off(p_getenv("FID_IROPT_OFF"), "ivbound");
     if !f.is_wrapping && !bounded_ok {
         return false;
@@ -1580,15 +1594,15 @@ pub fn ime_strength_reduce(f: & mut IrFunction) -> bool {
     var changed: bool = false;
     var cfg: IroCfg = ime_cfg(f);
     var plain: Vec<i64> = ime_plain_locals(f);
-    var lt: IroLoops = iro_loops(& cfg);
+    var lt: IroLoops = iro_loops(&cfg);
     var hs: Vec<i64> = lt.found;
     var hi: i64 = 0;
     while hi < hs.len() {
         var h: i64 = hs.get(hi);
         var lat: Vec<i64> = lt.latches.get(h);
-        var body: Vec<i64> = ime_loop_body(& lt, h);
+        var body: Vec<i64> = ime_loop_body(&lt, h);
         // the preheader (canonical form): h's only outside predecessor
-        var pre: i64 = - 1;
+        var pre: i64 = -1;
         var ps: Vec<i64> = cfg.preds.get(h);
         var k: i64 = 0;
         while k < ps.len() {
@@ -1596,7 +1610,7 @@ pub fn ime_strength_reduce(f: & mut IrFunction) -> bool {
                 if pre < 0 {
                     pre = ps.get(k);
                 } else {
-                    pre = - 2;
+                    pre = -2;
                 }
             }
             k = k + 1;
@@ -1641,7 +1655,7 @@ pub fn ime_strength_reduce(f: & mut IrFunction) -> bool {
                             Inst::BinOp(op, l, r, t) => {
                                 if binop_eq(op, BinOp::Mul) && ir_type_eq(t, IrType::I64) {
                                     var c: i64 = 0;
-                                    var ld: i64 = - 1;
+                                    var ld: i64 = -1;
                                     match ime_const(f, r) {
                                         OptI64::Some(cv) => {
                                             c = cv;
@@ -1659,7 +1673,7 @@ pub fn ime_strength_reduce(f: & mut IrFunction) -> bool {
                                         }
                                     }
                                     if ld >= 0 {
-                                        if ime_reduce_one(f, & cfg, body, h, store_blk, plain, stores, store_at, ids2, q2, mid, ld, c, pre) {
+                                        if ime_reduce_one(f, &cfg, body, h, store_blk, plain, stores, store_at, ids2, q2, mid, ld, c, pre) {
                                             changed = true;
                                         }
                                     }
@@ -1679,9 +1693,9 @@ pub fn ime_strength_reduce(f: & mut IrFunction) -> bool {
     return changed;
 }
 
-fn ime_reduce_one(f: & mut IrFunction, cfg: & IroCfg, body: Vec<i64>, head: i64, store_blk: Vec<i64>, plain: Vec<i64>, stores: Vec<i64>, store_at: Vec<i64>, ids: Vec<i64>, pos: i64, mid: i64, ld: i64, c: i64, pre: i64) -> bool {
+fn ime_reduce_one(f: &mut IrFunction, cfg: &IroCfg, body: Vec<i64>, head: i64, store_blk: Vec<i64>, plain: Vec<i64>, stores: Vec<i64>, store_at: Vec<i64>, ids: Vec<i64>, pos: i64, mid: i64, ld: i64, c: i64, pre: i64) -> bool {
     // ld = load(i), in this block before the product, no store to i between
-    var slot: i64 = - 1;
+    var slot: i64 = -1;
     match peir_inst_of(f, ld) {
         Inst::Load(p, _) => {
             slot = p;
@@ -1692,7 +1706,7 @@ fn ime_reduce_one(f: & mut IrFunction, cfg: & IroCfg, body: Vec<i64>, head: i64,
     if slot < 0 || slot >= plain.len() || plain.get(slot) != 1 || stores.get(slot) != 1 {
         return false;
     }
-    var lpos: i64 = - 1;
+    var lpos: i64 = -1;
     var q: i64 = 0;
     while q < pos {
         if ids.get(q) == ld {
@@ -1833,8 +1847,11 @@ pub fn ime_loop_stats_line() -> str {
 
 // --- ME24: loop unrolling ----------------------------------------------------
 
-const IME_UNROLL_TRIPS: i64 = 8; const IME_UNROLL_INSTS: i64 = 160;  /// Largest body (instructions) unrolled partially.
-const IME_UNROLL_BODY_MAX: i64 = 40;  /// A loop of one header and one body block, `while i < C { body; i = i +
+const IME_UNROLL_TRIPS: i64 = 8;
+const IME_UNROLL_INSTS: i64 = 160;
+/// Largest body (instructions) unrolled partially.
+const IME_UNROLL_BODY_MAX: i64 = 40;
+/// A loop of one header and one body block, `while i < C { body; i = i +
 /// s }` with i a constant c0 when the loop is entered, runs a known number
 /// of times; when that is at most IME_UNROLL_TRIPS (and the copies stay
 /// small) the body is copied that many times and the loop goes. A longer
@@ -1842,14 +1859,14 @@ const IME_UNROLL_BODY_MAX: i64 = 40;  /// A loop of one header and one body bloc
 /// that many copies of its body per trip around it (partial unrolling). The
 /// header's test only reads (loads and a comparison), so leaving it out
 /// changes nothing; every operation of the body runs as before, in order.
-pub fn ime_unroll(f: & mut IrFunction) -> bool {
+pub fn ime_unroll(f: &mut IrFunction) -> bool {
     var cfg: IroCfg = ime_cfg(f);
     var plain: Vec<i64> = ime_plain_locals(f);
-    var lt: IroLoops = iro_loops(& cfg);
+    var lt: IroLoops = iro_loops(&cfg);
     var hs: Vec<i64> = lt.found;
     var hi: i64 = 0;
     while hi < hs.len() {
-        if ime_unroll_one(f, & cfg, plain, hs.get(hi), lt.latches.get(hs.get(hi))) {
+        if ime_unroll_one(f, &cfg, plain, hs.get(hi), lt.latches.get(hs.get(hi))) {
             ime_drop_unreachable(f);
             return true;
         }
@@ -1858,7 +1875,7 @@ pub fn ime_unroll(f: & mut IrFunction) -> bool {
     return false;
 }
 
-fn ime_unroll_one(f: & mut IrFunction, cfg: & IroCfg, plain: Vec<i64>, h: i64, lat: Vec<i64>) -> bool {
+fn ime_unroll_one(f: &mut IrFunction, cfg: &IroCfg, plain: Vec<i64>, h: i64, lat: Vec<i64>) -> bool {
     if lat.len() != 1 {
         return false;
     }
@@ -1885,8 +1902,8 @@ fn ime_unroll_one(f: & mut IrFunction, cfg: & IroCfg, plain: Vec<i64>, h: i64, l
         g_ime_unroll_cold_n = g_ime_unroll_cold_n + 1;
         return false;
     }
-    var exit_id: i64 = - 1;
-    var cond: i64 = - 1;
+    var exit_id: i64 = -1;
+    var cond: i64 = -1;
     match peir_inst_of(f, hids.get(hids.len() - 1)) {
         Inst::Branch(c, t, e) => {
             if t == bid {
@@ -1923,10 +1940,10 @@ fn ime_unroll_one(f: & mut IrFunction, cfg: & IroCfg, plain: Vec<i64>, h: i64, l
     }
     // cond: load(i) < C (or <=, !=); OP11: or load(i) < n, n a value
     // the loop does not change (a trip count known only when it runs)
-    var slot: i64 = - 1;
+    var slot: i64 = -1;
     var limit: i64 = 0;
-    var kind: i64 = - 1;
-    var rv: i64 = - 1;
+    var kind: i64 = -1;
+    var rv: i64 = -1;
     var rconst: bool = false;
     match peir_inst_of(f, cond) {
         Inst::BinOp(op, l, r, _) => {
@@ -2014,7 +2031,7 @@ fn ime_unroll_one(f: & mut IrFunction, cfg: & IroCfg, plain: Vec<i64>, h: i64, l
     // of a local only loads and stores reach that the body never stores.
     // Only `<` and `<=`, and a step small enough to scale; the body must
     // end in its jump back to the header.
-    var rslot: i64 = - 1;
+    var rslot: i64 = -1;
     if !rconst {
         if kind == 2 || step > 1048576 || bids.len() == 0 {
             return false;
@@ -2068,7 +2085,7 @@ fn ime_unroll_one(f: & mut IrFunction, cfg: & IroCfg, plain: Vec<i64>, h: i64, l
         }
     }
     // i's value on entry: the last store to it in the preheader's chain
-    var pre: i64 = - 1;
+    var pre: i64 = -1;
     var ps: Vec<i64> = cfg.preds.get(h);
     q = 0;
     while q < ps.len() {
@@ -2236,7 +2253,7 @@ fn ime_unroll_one(f: & mut IrFunction, cfg: & IroCfg, plain: Vec<i64>, h: i64, l
         var k: i64 = 0;
         while k < ids.len() {
             var ops: Vec<i64> = Vec::new();
-            peir_inst_operands(peir_inst_of(f, ids.get(k)), & mut ops);
+            peir_inst_operands(peir_inst_of(f, ids.get(k)), &mut ops);
             var o: i64 = 0;
             while o < ops.len() {
                 var v: i64 = ops.get(o);
@@ -2285,7 +2302,7 @@ fn ime_unroll_one(f: & mut IrFunction, cfg: & IroCfg, plain: Vec<i64>, h: i64, l
         bm.set(hid, next_target + 1);
         q = 0;
         while q < bids.len() {
-            IrFunction_set_inst(f, tmp.get(q), ime_remap(peir_inst_of(f, bids.get(q)), & vm, & bm));
+            IrFunction_set_inst(f, tmp.get(q), ime_remap(peir_inst_of(f, bids.get(q)), &vm, &bm));
             q = q + 1;
         }
         var nb: BasicBlock = f.blocks.get(ni);
@@ -2349,7 +2366,7 @@ fn ime_unroll_one(f: & mut IrFunction, cfg: & IroCfg, plain: Vec<i64>, h: i64, l
 
 /// OP11: does the loop body `bids` read or write a Vec element by index
 /// (the calls checks.fd's counted-loop proof frees of bounds checks)?
-fn ime_unroll_proved_calls(f: & IrFunction, bids: Vec<i64>) -> bool {
+fn ime_unroll_proved_calls(f: &IrFunction, bids: Vec<i64>) -> bool {
     var q: i64 = 0;
     while q < bids.len() {
         match peir_inst_of(f, bids.get(q)) {
@@ -2369,7 +2386,7 @@ fn ime_unroll_proved_calls(f: & IrFunction, bids: Vec<i64>) -> bool {
 /// Does block index `bi` end in a Jump or Branch whose every edge goes to
 /// block id `to` or elsewhere, so ime_retarget moves its edges to `to`?
 /// (false for a Switch or no terminator)
-fn ime_jumps_only_to(f: & IrFunction, bi: i64, to: i64) -> bool {
+fn ime_jumps_only_to(f: &IrFunction, bi: i64, to: i64) -> bool {
     if bi < 0 || bi >= f.blocks.len() {
         return false;
     }
@@ -2392,7 +2409,7 @@ fn ime_jumps_only_to(f: & IrFunction, bi: i64, to: i64) -> bool {
 
 /// A copy of the loop body `bids` in a new block (its id returned), its
 /// values renamed and its jumps to the header `hid` sent to `target`.
-fn ime_unroll_copy(f: & mut IrFunction, bids: Vec<i64>, hid: i64, target: i64) -> i64 {
+fn ime_unroll_copy(f: &mut IrFunction, bids: Vec<i64>, hid: i64, target: i64) -> i64 {
     var nid: i64 = IrFunction_new_block(f);
     var ni: i64 = f.blocks.len() - 1;
     var vm: Vec<i64> = peir_zeros(f.next_value + 2);
@@ -2411,7 +2428,7 @@ fn ime_unroll_copy(f: & mut IrFunction, bids: Vec<i64>, hid: i64, target: i64) -
     bm.set(hid, target + 1);
     q = 0;
     while q < bids.len() {
-        IrFunction_set_inst(f, tmp.get(q), ime_remap(peir_inst_of(f, bids.get(q)), & vm, & bm));
+        IrFunction_set_inst(f, tmp.get(q), ime_remap(peir_inst_of(f, bids.get(q)), &vm, &bm));
         q = q + 1;
     }
     var nb: BasicBlock = f.blocks.get(ni);
@@ -2455,7 +2472,7 @@ pub fn ime_rotate_count() -> i64 {
 /// Can a header made of `ids` be copied to its latch? pe_ir's
 /// peir_rotatable: at most 12 instructions, loads, integer constants and
 /// operations and Vec_len calls, then a Branch.
-fn ime_rotatable(f: & IrFunction, ids: Vec<i64>) -> bool {
+fn ime_rotatable(f: &IrFunction, ids: Vec<i64>) -> bool {
     var n: i64 = ids.len();
     if n < 2 || n > 12 {
         return false;
@@ -2504,7 +2521,7 @@ fn ime_rotatable(f: & IrFunction, ids: Vec<i64>) -> bool {
 }
 
 /// ME23: rotate the loops of `f` (see above). True when one changed.
-pub fn ime_rotate(f: & mut IrFunction) -> bool {
+pub fn ime_rotate(f: &mut IrFunction) -> bool {
     // LF18: no new branches in code the backends verify as constant time
     if f.is_constant_time {
         return false;
@@ -2517,11 +2534,11 @@ pub fn ime_rotate(f: & mut IrFunction) -> bool {
     while again && rounds < 256 {
         again = false;
         var cfg: IroCfg = ime_cfg(f);
-        var lt: IroLoops = iro_loops(& cfg);
+        var lt: IroLoops = iro_loops(&cfg);
         var hs: Vec<i64> = lt.found;
         var hi: i64 = 0;
         while hi < hs.len() && !again {
-            if ime_rotate_one(f, & cfg, & lt, hs.get(hi)) {
+            if ime_rotate_one(f, &cfg, &lt, hs.get(hi)) {
                 again = true;
                 changed = true;
                 g_ime_rotate_n = g_ime_rotate_n + 1;
@@ -2612,21 +2629,21 @@ fn ime_remap_covers(inst: Inst) -> bool {
 }
 
 /// The Jump target (block id) of the last instruction of `ids`, or -1.
-fn ime_jump_target(f: & IrFunction, ids: Vec<i64>) -> i64 {
+fn ime_jump_target(f: &IrFunction, ids: Vec<i64>) -> i64 {
     if ids.len() == 0 {
-        return - 1;
+        return -1;
     }
     match peir_inst_of(f, ids.get(ids.len() - 1)) {
         Inst::Jump(t) => {
             return t;
         }
         _ => {
-            return - 1;
+            return -1;
         }
     }
 }
 
-fn ime_rotate_one(f: & mut IrFunction, cfg: & IroCfg, lt: & IroLoops, h: i64) -> bool {
+fn ime_rotate_one(f: &mut IrFunction, cfg: &IroCfg, lt: &IroLoops, h: i64) -> bool {
     var lat: Vec<i64> = lt.latches.get(h);
     if lat.len() != 1 {
         return false;
@@ -2662,8 +2679,8 @@ fn ime_rotate_one(f: & mut IrFunction, cfg: & IroCfg, lt: & IroLoops, h: i64) ->
     }
     // H: Branch(c, T, X), T in the loop, X out of it, each entered only
     // from H
-    var ti: i64 = - 1;
-    var ei: i64 = - 1;
+    var ti: i64 = -1;
+    var ei: i64 = -1;
     match peir_inst_of(f, hids.get(hids.len() - 1)) {
         Inst::Branch(_, t, e) => {
             if t >= 0 && t < cfg.index.len() {
@@ -2752,7 +2769,7 @@ fn ime_rotate_one(f: & mut IrFunction, cfg: & IroCfg, lt: & IroLoops, h: i64) ->
             var q: i64 = 0;
             while q < bids.len() {
                 ops.clear();
-                peir_inst_operands(peir_inst_of(f, bids.get(q)), & mut ops);
+                peir_inst_operands(peir_inst_of(f, bids.get(q)), &mut ops);
                 var o: i64 = 0;
                 while o < ops.len() {
                     var u: i64 = ops.get(o);
@@ -2805,7 +2822,7 @@ fn ime_rotate_one(f: & mut IrFunction, cfg: & IroCfg, lt: & IroLoops, h: i64) ->
     }
     k = 0;
     while k < hids.len() {
-        IrFunction_set_inst(f, clones.get(k), ime_remap(peir_inst_of(f, hids.get(k)), & vm, & bm));
+        IrFunction_set_inst(f, clones.get(k), ime_remap(peir_inst_of(f, hids.get(k)), &vm, &bm));
         k = k + 1;
     }
     // --- the reloads at the top of T and X, and their readers renamed
@@ -2840,9 +2857,9 @@ fn ime_rotate_one(f: & mut IrFunction, cfg: & IroCfg, lt: & IroLoops, h: i64) ->
                     while q2 < rids.len() {
                         var qi: Inst = peir_inst_of(f, rids.get(q2));
                         if in_t {
-                            IrFunction_set_inst(f, rids.get(q2), ime_remap(qi, & mt, & bm));
+                            IrFunction_set_inst(f, rids.get(q2), ime_remap(qi, &mt, &bm));
                         } else {
-                            IrFunction_set_inst(f, rids.get(q2), ime_remap(qi, & mx, & bm));
+                            IrFunction_set_inst(f, rids.get(q2), ime_remap(qi, &mx, &bm));
                         }
                         q2 = q2 + 1;
                     }
@@ -2908,7 +2925,7 @@ fn ime_sra_word_store(t: OptIrType) -> bool {
 /// A struct local whose every use is a field address used only by loads
 /// and stores becomes one local per field: each field address is replaced
 /// by that field's own local, and the struct's allocation goes.
-pub fn ime_sra(f: & mut IrFunction) -> bool {
+pub fn ime_sra(f: &mut IrFunction) -> bool {
     var n: i64 = f.next_value + 1;
     // candidate allocas: Alloca of a non-scalar type
     var cand: Vec<i64> = peir_zeros(n);
@@ -2949,7 +2966,7 @@ pub fn ime_sra(f: & mut IrFunction) -> bool {
     while i < f.insts.len() {
         var ve2: ValueIdInst = f.insts.get(i);
         var ops: Vec<i64> = Vec::new();
-        peir_inst_operands(ve2.inst, & mut ops);
+        peir_inst_operands(ve2.inst, &mut ops);
         var o: i64 = 0;
         while o < ops.len() {
             var v: i64 = ops.get(o);
@@ -2979,7 +2996,7 @@ pub fn ime_sra(f: & mut IrFunction) -> bool {
     while i < f.insts.len() {
         var ve3: ValueIdInst = f.insts.get(i);
         var ops3: Vec<i64> = Vec::new();
-        peir_inst_operands(ve3.inst, & mut ops3);
+        peir_inst_operands(ve3.inst, &mut ops3);
         var o3: i64 = 0;
         while o3 < ops3.len() {
             var g: i64 = ops3.get(o3);
@@ -3049,7 +3066,7 @@ pub fn ime_sra(f: & mut IrFunction) -> bool {
     i = 0;
     while i < f.insts.len() {
         var e: ValueIdInst = f.insts.get(i);
-        e.inst = ime_remap(e.inst, & vm, & no_blocks);
+        e.inst = ime_remap(e.inst, &vm, &no_blocks);
         f.insts.set(i, e);
         i = i + 1;
     }
@@ -3084,7 +3101,7 @@ pub struct ImeCase {
     pub ok: bool,
 }
 
-fn ime_case_of(f: & IrFunction, c: i64, plain: & Vec<i64>) -> ImeCase {
+fn ime_case_of(f: &IrFunction, c: i64, plain: &Vec<i64>) -> ImeCase {
     var none: ImeCase = ImeCase {
         key: 0, k: 0, ok: false
     };
@@ -3137,7 +3154,7 @@ fn ime_case_of(f: & IrFunction, c: i64, plain: & Vec<i64>) -> ImeCase {
 /// Is block index `bi` a link of a test chain: only constants, a load of
 /// the tested local, the comparison and a Branch (it computes nothing
 /// else, so a jump past it changes nothing but which test runs)?
-fn ime_test_block(f: & IrFunction, bi: i64) -> bool {
+fn ime_test_block(f: &IrFunction, bi: i64) -> bool {
     var ids: Vec<i64> = f.blocks.get(bi).instructions;
     if ids.len() < 2 || ids.len() > 4 {
         return false;
@@ -3160,10 +3177,11 @@ fn ime_test_block(f: & IrFunction, bi: i64) -> bool {
     return true;
 }
 
-const IME_SWITCH_MIN: i64 = 4;  /// A chain of tests `x == k1 -> T1 else x == k2 -> T2 else ... -> D` on one
+const IME_SWITCH_MIN: i64 = 4;
+/// A chain of tests `x == k1 -> T1 else x == k2 -> T2 else ... -> D` on one
 /// value becomes a balanced tree of `x < k` tests ending in `x == k`
 /// tests: log2(n) comparisons instead of n.
-pub fn ime_switch(f: & mut IrFunction) -> bool {
+pub fn ime_switch(f: &mut IrFunction) -> bool {
     var plain: Vec<i64> = ime_plain_locals(f);
     var cfg: IroCfg = ime_cfg(f);
     var a: i64 = 0;
@@ -3172,7 +3190,7 @@ pub fn ime_switch(f: & mut IrFunction) -> bool {
         if ids.len() > 0 {
             match peir_inst_of(f, ids.get(ids.len() - 1)) {
                 Inst::Branch(c, t, e) => {
-                    var first: ImeCase = ime_case_of(f, c, & plain);
+                    var first: ImeCase = ime_case_of(f, c, &plain);
                     if first.ok {
                         // follow the chain
                         var keys: Vec<i64> = Vec::new();
@@ -3180,7 +3198,7 @@ pub fn ime_switch(f: & mut IrFunction) -> bool {
                         keys.push(first.k);
                         targets.push(t);
                         var next: i64 = e;
-                        var x_id: i64 = - 1;
+                        var x_id: i64 = -1;
                         match peir_inst_of(f, c) {
                             Inst::BinOp(_, l0, r0, _) => {
                                 x_id = l0;
@@ -3204,7 +3222,7 @@ pub fn ime_switch(f: & mut IrFunction) -> bool {
                                 var nids: Vec<i64> = f.blocks.get(ni).instructions;
                                 match peir_inst_of(f, nids.get(nids.len() - 1)) {
                                     Inst::Branch(c2, t2, e2) => {
-                                        var cs: ImeCase = ime_case_of(f, c2, & plain);
+                                        var cs: ImeCase = ime_case_of(f, c2, &plain);
                                         if cs.ok && cs.key == first.key {
                                             if !ime_has(keys, cs.k) {
                                                 keys.push(cs.k);
@@ -3237,7 +3255,7 @@ pub fn ime_switch(f: & mut IrFunction) -> bool {
 }
 
 /// The tree: blocks in `f`, each a comparison of x; returns the root's id.
-fn ime_build_switch(f: & mut IrFunction, a: i64, x: i64, keys: Vec<i64>, targets: Vec<i64>, dflt: i64) {
+fn ime_build_switch(f: &mut IrFunction, a: i64, x: i64, keys: Vec<i64>, targets: Vec<i64>, dflt: i64) {
     // sort the cases by key
     var ks: Vec<i64> = keys;
     var ts: Vec<i64> = targets;
@@ -3262,7 +3280,7 @@ fn ime_build_switch(f: & mut IrFunction, a: i64, x: i64, keys: Vec<i64>, targets
     ime_recompute_preds(f);
 }
 
-fn ime_switch_node(f: & mut IrFunction, x: i64, ks: Vec<i64>, ts: Vec<i64>, lo: i64, hi: i64, dflt: i64) -> i64 {
+fn ime_switch_node(f: &mut IrFunction, x: i64, ks: Vec<i64>, ts: Vec<i64>, lo: i64, hi: i64, dflt: i64) -> i64 {
     if hi - lo <= 2 {
         // a short chain of equality tests
         var after: i64 = dflt;
@@ -3306,7 +3324,7 @@ fn ime_switch_node(f: & mut IrFunction, x: i64, ks: Vec<i64>, ts: Vec<i64>, lo: 
 /// Run mid-end pass `name` on `f`; with --validate (compiler/tv.fd, VF6)
 /// its result is checked against `f` before it and undone when rejected.
 /// Fides calls are resolved statically, so the name dispatches.
-fn ime_tv_run(name: str, f: & mut IrFunction) -> bool {
+fn ime_tv_run(name: str, f: &mut IrFunction) -> bool {
     if !tv_on() {
         return ime_tv_pass(name, f);
     }
@@ -3314,10 +3332,10 @@ fn ime_tv_run(name: str, f: & mut IrFunction) -> bool {
     if !ime_tv_pass(name, f) {
         return false;
     }
-    return tv_after(name, & pre, f);
+    return tv_after(name, &pre, f);
 }
 
-fn ime_tv_pass(name: str, f: & mut IrFunction) -> bool {
+fn ime_tv_pass(name: str, f: &mut IrFunction) -> bool {
     if name == "sra" {
         return ime_sra(f);
     }
@@ -3357,11 +3375,11 @@ fn ime_tv_pass(name: str, f: & mut IrFunction) -> bool {
 /// ME23: loop rotation, run by iropt_native last on each function (after
 /// licm and versioning, which want the test in the header); with
 /// --validate the result is checked (compiler/tv.fd).
-pub fn ime_rotate_pass(f: & mut IrFunction) -> bool {
+pub fn ime_rotate_pass(f: &mut IrFunction) -> bool {
     return ime_tv_run("rotate", f);
 }
 
-pub fn ime_function_passes(f: & mut IrFunction) -> bool {
+pub fn ime_function_passes(f: &mut IrFunction) -> bool {
     var changed: bool = false;
     if ime_on("sra") && ime_tr("sra", f.name) && ime_tv_run("sra", f) {
         changed = true;
@@ -3422,7 +3440,7 @@ pub fn ime_function_passes(f: & mut IrFunction) -> bool {
         ime_trace("ssa", f.name);
         var tv_pre: IrFunction = tv_before(f);
         if ssa_round_trip(f, ime_on("ssaexit")) {
-            if tv_after("ssa", & tv_pre, f) {
+            if tv_after("ssa", &tv_pre, f) {
                 changed = true;
             }
         }
@@ -3465,7 +3483,7 @@ pub fn ime_function_passes(f: & mut IrFunction) -> bool {
 /// Can `inst` be computed once more, or passed over, with nothing seen and
 /// no panic: constants, loads of plain locals, integer comparisons and bit
 /// operations, widening and casts?
-fn ime_guard_clonable(inst: Inst, plain: & Vec<i64>) -> bool {
+fn ime_guard_clonable(inst: Inst, plain: &Vec<i64>) -> bool {
     match inst {
         Inst::ConstInt(_, _) => {
             return true;
@@ -3530,7 +3548,7 @@ fn ime_guard_clonable(inst: Inst, plain: & Vec<i64>) -> bool {
 /// cheap to make again in G: a constant, or a load of a plain local the
 /// loop never stores (`stored`: per slot, 1 when a block of the loop
 /// stores it; a plain local's address goes nowhere, so no call writes it)?
-fn ime_guard_leaf(f: & IrFunction, id: i64, plain: & Vec<i64>, stored: & Vec<i64>) -> bool {
+fn ime_guard_leaf(f: &IrFunction, id: i64, plain: &Vec<i64>, stored: &Vec<i64>) -> bool {
     match peir_inst_of(f, id) {
         Inst::ConstInt(_, _) => {
             return true;
@@ -3613,7 +3631,7 @@ pub fn ime_nowrite_count() -> i64 {
 
 /// The guard transform above, loop by loop (the CFG is computed again
 /// after each change). True when anything moved.
-pub fn ime_licm_guard(f: & mut IrFunction) -> bool {
+pub fn ime_licm_guard(f: &mut IrFunction) -> bool {
     if f.blocks.len() < 2 || f.is_constant_time {
         return false;
     }
@@ -3630,9 +3648,9 @@ pub fn ime_licm_guard(f: & mut IrFunction) -> bool {
 }
 
 /// One loop of `f` transformed, the first (in header order) that can be.
-fn ime_licm_guard_one(f: & mut IrFunction) -> bool {
+fn ime_licm_guard_one(f: &mut IrFunction) -> bool {
     var cfg: IroCfg = ime_cfg(f);
-    var lt: IroLoops = iro_loops(& cfg);
+    var lt: IroLoops = iro_loops(&cfg);
     var hs: Vec<i64> = lt.found;
     if hs.len() == 0 {
         return false;
@@ -3658,7 +3676,7 @@ fn ime_licm_guard_one(f: & mut IrFunction) -> bool {
     }
     var hi: i64 = 0;
     while hi < hs.len() {
-        if ime_licm_guard_loop(f, & cfg, & lt, lt.latches.get(hs.get(hi)), hs.get(hi), plain, def_b) {
+        if ime_licm_guard_loop(f, &cfg, &lt, lt.latches.get(hs.get(hi)), hs.get(hi), plain, def_b) {
             ime_recompute_preds(f);
             return true;
         }
@@ -3667,7 +3685,7 @@ fn ime_licm_guard_one(f: & mut IrFunction) -> bool {
     return false;
 }
 
-fn ime_licm_guard_loop(f: & mut IrFunction, cfg: & IroCfg, lt: & IroLoops, lat: Vec<i64>, h: i64, plain: Vec<i64>, def_b: Vec<i64>) -> bool {
+fn ime_licm_guard_loop(f: &mut IrFunction, cfg: &IroCfg, lt: &IroLoops, lat: Vec<i64>, h: i64, plain: Vec<i64>, def_b: Vec<i64>) -> bool {
     var hid: i64 = f.blocks.get(h).id;
     var body: Vec<i64> = ime_loop_body(lt, h);
     // P: the one block outside the loop that enters it, by a jump
@@ -3740,7 +3758,7 @@ fn ime_licm_guard_loop(f: & mut IrFunction, cfg: & IroCfg, lt: & IroLoops, lat: 
     }
     k = 0;
     while k + 1 < hids.len() {
-        if !ime_guard_clonable(peir_inst_of(f, hids.get(k)), & plain) {
+        if !ime_guard_clonable(peir_inst_of(f, hids.get(k)), &plain) {
             return false;
         }
         k = k + 1;
@@ -3779,11 +3797,11 @@ fn ime_licm_guard_loop(f: & mut IrFunction, cfg: & IroCfg, lt: & IroLoops, lat: 
     // entering B reaches through quiet blocks only (ime_guard_reaches): the
     // first pass reaches D's start exactly when it enters B, so the guard
     // is the header's test again, as for B
-    var moved: Vec<i64> = ime_guard_moves(f, f.blocks.get(bb).instructions, & body, & def_b, & plain, & stored);
+    var moved: Vec<i64> = ime_guard_moves(f, f.blocks.get(bb).instructions, &body, &def_b, &plain, &stored);
     var db: i64 = 0;
     while moved.len() == 0 && db < cfg.n {
-        if db != h && db != bb && body.get(db) == 1 && ime_guard_reaches(f, cfg, & body, h, bb, db, & plain) {
-            moved = ime_guard_moves(f, f.blocks.get(db).instructions, & body, & def_b, & plain, & stored);
+        if db != h && db != bb && body.get(db) == 1 && ime_guard_reaches(f, cfg, &body, h, bb, db, &plain) {
+            moved = ime_guard_moves(f, f.blocks.get(db).instructions, &body, &def_b, &plain, &stored);
         }
         db = db + 1;
     }
@@ -3800,11 +3818,11 @@ fn ime_licm_guard_loop(f: & mut IrFunction, cfg: & IroCfg, lt: & IroLoops, lat: 
         var mid: i64 = moved.get(m);
         var minst: Inst = peir_inst_of(f, mid);
         var mops: Vec<i64> = Vec::new();
-        peir_inst_operands(minst, & mut mops);
+        peir_inst_operands(minst, &mut mops);
         var o2: i64 = 0;
         while o2 < mops.len() {
             var cv2: i64 = mops.get(o2);
-            if ime_v(& vm, cv2) == cv2 && cv2 >= 0 && cv2 < def_b.len() && def_b.get(cv2) >= 0 && body.get(def_b.get(cv2)) == 1 && ime_guard_leaf(f, cv2, & plain, & stored) {
+            if ime_v(&vm, cv2) == cv2 && cv2 >= 0 && cv2 < def_b.len() && def_b.get(cv2) >= 0 && body.get(def_b.get(cv2)) == 1 && ime_guard_leaf(f, cv2, &plain, &stored) {
                 // a constant or an unchanging load of the loop: made again
                 // in G
                 var nc: i64 = ime_detached(f, peir_inst_of(f, cv2));
@@ -3813,7 +3831,7 @@ fn ime_licm_guard_loop(f: & mut IrFunction, cfg: & IroCfg, lt: & IroLoops, lat: 
             }
             o2 = o2 + 1;
         }
-        var nv: i64 = ime_detached(f, ime_remap(minst, & vm, & vm));
+        var nv: i64 = ime_detached(f, ime_remap(minst, &vm, &vm));
         gins.push(nv);
         // its source line goes with it (a panic there names the same line)
         match IrFunction_get_meta(f, mid) {
@@ -3850,12 +3868,12 @@ fn ime_licm_guard_loop(f: & mut IrFunction, cfg: & IroCfg, lt: & IroLoops, lat: 
     k = 0;
     while k + 1 < hids.len() {
         var hidv: i64 = hids.get(k);
-        var cl: i64 = ime_detached(f, ime_remap(peir_inst_of(f, hidv), & hm, & hm));
+        var cl: i64 = ime_detached(f, ime_remap(peir_inst_of(f, hidv), &hm, &hm));
         pins.push(cl);
         hm.set(hidv, cl + 1);
         k = k + 1;
     }
-    var c2: i64 = ime_v(& hm, c);
+    var c2: i64 = ime_v(&hm, c);
     var br: i64 = 0;
     if into_on_true {
         br = ime_detached(f, Inst::Branch(c2, gid, p2id));
@@ -3899,7 +3917,7 @@ pub fn ime_vecdata_count() -> i64 {
 /// bool result, ime_guard_call_ok) moves the same way: it reads no memory,
 /// so nothing passed over can change its value, and its panic comes where
 /// the first pass would have raised it.
-fn ime_guard_moves(f: & IrFunction, bids: Vec<i64>, body: & Vec<i64>, def_b: & Vec<i64>, plain: & Vec<i64>, stored: & Vec<i64>) -> Vec<i64> {
+fn ime_guard_moves(f: &IrFunction, bids: Vec<i64>, body: &Vec<i64>, def_b: &Vec<i64>, plain: &Vec<i64>, stored: &Vec<i64>) -> Vec<i64> {
     var moved: Vec<i64> = Vec::new();
     var k: i64 = 0;
     while k < bids.len() {
@@ -3921,7 +3939,7 @@ fn ime_guard_moves(f: & IrFunction, bids: Vec<i64>, body: & Vec<i64>, def_b: & V
         }
         if arith {
             var ops: Vec<i64> = Vec::new();
-            peir_inst_operands(inst, & mut ops);
+            peir_inst_operands(inst, &mut ops);
             var o: i64 = 0;
             while o < ops.len() && arith {
                 var ov: i64 = ops.get(o);
@@ -3953,7 +3971,7 @@ const IME_GUARD_WALK: i64 = 32;
 /// loop, or round a cycle of its own (an inner loop might not end)? Then
 /// every pass of the loop that enters B reaches D's start, with nothing a
 /// program could see on the way.
-fn ime_guard_reaches(f: & IrFunction, cfg: & IroCfg, body: & Vec<i64>, h: i64, from: i64, to: i64, plain: & Vec<i64>) -> bool {
+fn ime_guard_reaches(f: &IrFunction, cfg: &IroCfg, body: &Vec<i64>, h: i64, from: i64, to: i64, plain: &Vec<i64>) -> bool {
     if from == to {
         return true;
     }
@@ -4045,7 +4063,7 @@ fn ime_guard_reaches(f: & IrFunction, cfg: & IroCfg, body: & Vec<i64>, h: i64, f
 
 /// The static type of value `v` of `f`, parameters included (a parameter
 /// has no instruction: its type is in f.params).
-fn ime_vd_type(f: & IrFunction, v: i64) -> IrType {
+fn ime_vd_type(f: &IrFunction, v: i64) -> IrType {
     var i: i64 = 0;
     while i < f.params.len() {
         if f.params.get(i).id == v {
@@ -4081,7 +4099,7 @@ fn ime_vd_words(t: IrType) -> bool {
 /// to it changes what it holds. Owned slots (drop locals) count: they are
 /// dropped when their scope ends, which a loop that calls only the Vec
 /// reads above never does.
-fn ime_vd_slots(f: & IrFunction) -> Vec<i64> {
+fn ime_vd_slots(f: &IrFunction) -> Vec<i64> {
     var sl: Vec<i64> = peir_zeros(f.next_value + 1);
     var i: i64 = 0;
     while i < f.insts.len() {
@@ -4101,7 +4119,7 @@ fn ime_vd_slots(f: & IrFunction) -> Vec<i64> {
     while i < f.insts.len() {
         var inst: Inst = f.insts.get(i).inst;
         var ops: Vec<i64> = Vec::new();
-        peir_inst_operands(inst, & mut ops);
+        peir_inst_operands(inst, &mut ops);
         var o: i64 = 0;
         while o < ops.len() {
             var v: i64 = ops.get(o);
@@ -4129,7 +4147,7 @@ fn ime_vd_slots(f: & IrFunction) -> Vec<i64> {
 }
 
 /// The slot (ime_vd_slots) value `v` was loaded from, or -1.
-fn ime_vd_root_slot(f: & IrFunction, v: i64, slots: & Vec<i64>) -> i64 {
+fn ime_vd_root_slot(f: &IrFunction, v: i64, slots: &Vec<i64>) -> i64 {
     match peir_inst_of(f, v) {
         Inst::Load(p, _) => {
             if p >= 0 && p < slots.len() && slots.get(p) == 1 {
@@ -4139,11 +4157,11 @@ fn ime_vd_root_slot(f: & IrFunction, v: i64, slots: & Vec<i64>) -> i64 {
         _ => {
         }
     }
-    return - 1;
+    return -1;
 }
 
 /// Put instruction `nid` just before instruction `at` in block index `b`.
-fn ime_vd_insert_before(f: & mut IrFunction, b: i64, at: i64, nid: i64) {
+fn ime_vd_insert_before(f: &mut IrFunction, b: i64, at: i64, nid: i64) {
     var blk: BasicBlock = f.blocks.get(b);
     var ids: Vec<i64> = Vec::new();
     var k: i64 = 0;
@@ -4160,7 +4178,7 @@ fn ime_vd_insert_before(f: & mut IrFunction, b: i64, at: i64, nid: i64) {
 
 /// Is block index `b`, of the loop of header `h` (its blocks `body`), in a
 /// loop nested inside that one?
-fn ime_vd_nested(lt: & IroLoops, hs: & Vec<i64>, h: i64, body: & Vec<i64>, b: i64) -> bool {
+fn ime_vd_nested(lt: &IroLoops, hs: &Vec<i64>, h: i64, body: &Vec<i64>, b: i64) -> bool {
     var i: i64 = 0;
     while i < hs.len() {
         var h2: i64 = hs.get(i);
@@ -4179,12 +4197,12 @@ fn ime_vd_nested(lt: & IroLoops, hs: & Vec<i64>, h: i64, body: & Vec<i64>, b: i6
 /// innermost loop that holds it: that loop's preheader jumps straight to
 /// its header, and the proof read v's length there or before the loop, so
 /// v is a live Vec when P loads its word 0. True when a read changed.
-pub fn ime_vec_data(f: & mut IrFunction) -> bool {
+pub fn ime_vec_data(f: &mut IrFunction) -> bool {
     if f.blocks.len() < 2 || f.is_constant_time {
         return false;
     }
     var cfg: IroCfg = ime_cfg(f);
-    var lt: IroLoops = iro_loops(& cfg);
+    var lt: IroLoops = iro_loops(&cfg);
     var hs: Vec<i64> = lt.found;
     if hs.len() == 0 {
         return false;
@@ -4197,7 +4215,7 @@ pub fn ime_vec_data(f: & mut IrFunction) -> bool {
     var hi: i64 = 0;
     while hi < hs.len() {
         // no block is added: the CFG and loop tree stay right
-        if ime_vec_data_loop(f, & cfg, & lt, & hs, hs.get(hi), & flags, & slots, & unesc) {
+        if ime_vec_data_loop(f, &cfg, &lt, &hs, hs.get(hi), &flags, &slots, &unesc) {
             changed = true;
         }
         hi = hi + 1;
@@ -4205,7 +4223,7 @@ pub fn ime_vec_data(f: & mut IrFunction) -> bool {
     return changed;
 }
 
-fn ime_vec_data_loop(f: & mut IrFunction, cfg: & IroCfg, lt: & IroLoops, hs: & Vec<i64>, h: i64, flags: & Vec<i64>, slots: & Vec<i64>, unesc: & Vec<i64>) -> bool {
+fn ime_vec_data_loop(f: &mut IrFunction, cfg: &IroCfg, lt: &IroLoops, hs: &Vec<i64>, h: i64, flags: &Vec<i64>, slots: &Vec<i64>, unesc: &Vec<i64>) -> bool {
     var hid: i64 = f.blocks.get(h).id;
     var body: Vec<i64> = ime_loop_body(lt, h);
     // P: the one block outside the loop that enters it, by a jump
@@ -4282,7 +4300,7 @@ fn ime_vec_data_loop(f: & mut IrFunction, cfg: & IroCfg, lt: & IroLoops, hs: & V
                     }
                     Inst::Call(cn, cargs, crt, _) => {
                         if cn == "Vec_get" || cn == "p_vec_get" {
-                            if cargs.len() >= 2 && id >= 0 && id < flags.len() && (flags.get(id) & 1) != 0 && ir_type_eq(crt, IrType::I64) && !ime_vd_nested(lt, hs, h, & body, b) {
+                            if cargs.len() >= 2 && id >= 0 && id < flags.len() && (flags.get(id) & 1) != 0 && ir_type_eq(crt, IrType::I64) && !ime_vd_nested(lt, hs, h, &body, b) {
                                 acc.push(id);
                                 acc_b.push(b);
                             }
@@ -4493,7 +4511,7 @@ pub struct ImeAddr {
     pub path: str,
 }
 
-fn ime_param_index(f: & IrFunction, v: i64) -> i64 {
+fn ime_param_index(f: &IrFunction, v: i64) -> i64 {
     var i: i64 = 0;
     while i < f.params.len() {
         if f.params.get(i).id == v {
@@ -4501,11 +4519,11 @@ fn ime_param_index(f: & IrFunction, v: i64) -> i64 {
         }
         i = i + 1;
     }
-    return - 1;
+    return -1;
 }
 
 /// The borrow kind the lowering gave value `v`: 2 `&mut`, 1 `&`, 0 none.
-fn ime_borrow(f: & IrFunction, v: i64) -> i64 {
+fn ime_borrow(f: &IrFunction, v: i64) -> i64 {
     match IrFunction_get_meta(f, v) {
         OptValueMeta::Some(m) => {
             match m.borrow_kind {
@@ -4540,7 +4558,7 @@ fn ime_raw_ptr(t: IrType) -> bool {
     }
 }
 
-fn ime_addr(f: & IrFunction, p0: i64) -> ImeAddr {
+fn ime_addr(f: &IrFunction, p0: i64) -> ImeAddr {
     var p: i64 = p0;
     var path: str = "";
     var steps: i64 = 0;
@@ -4637,7 +4655,7 @@ fn ime_addr(f: & IrFunction, p0: i64) -> ImeAddr {
 /// address also goes to reference parameters of direct calls that never
 /// let it go (LF2, ime_lends_ref) is 2: only a call it is passed to can
 /// read or write it, the reference ends with that call.
-pub fn ime_unescaped(f: & IrFunction) -> Vec<i64> {
+pub fn ime_unescaped(f: &IrFunction) -> Vec<i64> {
     // OP26: every user of the query starts here: the Vec owners of the
     // last function (ime_vb_owners) are computed again
     g_ime_vb_gen = g_ime_vb_gen + 1;
@@ -4681,7 +4699,7 @@ pub fn ime_unescaped(f: & IrFunction) -> Vec<i64> {
         i = 0;
         while i < f.insts.len() {
             var ve2: ValueIdInst = f.insts.get(i);
-            var from: i64 = - 1;
+            var from: i64 = -1;
             match ve2.inst {
                 Inst::GetFieldPtr(q, _, _) => {
                     from = q;
@@ -4717,12 +4735,12 @@ pub fn ime_unescaped(f: & IrFunction) -> Vec<i64> {
     while i < f.insts.len() {
         var ve3: ValueIdInst = f.insts.get(i);
         var ops: Vec<i64> = Vec::new();
-        peir_inst_operands(ve3.inst, & mut ops);
+        peir_inst_operands(ve3.inst, &mut ops);
         var o: i64 = 0;
         while o < ops.len() {
             var v: i64 = ops.get(o);
             if v >= 0 && v < n {
-                var loc: i64 = - 1;
+                var loc: i64 = -1;
                 if ok.get(v) == 1 {
                     loc = v;
                 }
@@ -4851,7 +4869,7 @@ pub fn ime_forget_ref_params() {
 /// LF2: fill g_ime_ref_params from the module (whole program: the callee
 /// of a direct call is the module's function of that name). Run once
 /// before the per-function passes (iropt_native).
-pub fn ime_note_ref_params(module: & IrModule) {
+pub fn ime_note_ref_params(module: &IrModule) {
     var map: i64 = HashMap_new();
     var masks: Vec<i64> = Vec::new();
     // dependencies: function index, its parameter bit, callee, position
@@ -4862,7 +4880,7 @@ pub fn ime_note_ref_params(module: & IrModule) {
     var fi: i64 = 0;
     while fi < module.functions.len() {
         var entry: IrFunctionEntry = module.functions.get(fi);
-        var mask: i64 = ime_ref_param_mask(& entry.func, fi, & mut dep_fn, & mut dep_bit, & mut dep_callee, & mut dep_pos);
+        var mask: i64 = ime_ref_param_mask(&entry.func, fi, &mut dep_fn, &mut dep_bit, &mut dep_callee, &mut dep_pos);
         masks.push(mask);
         HashMap_insert(map, entry.name, fi + 1);
         fi = fi + 1;
@@ -4912,7 +4930,7 @@ pub fn ime_note_ref_params(module: & IrModule) {
 /// The reference parameters of f whose uses are all fine by themselves;
 /// uses as arguments of direct calls are fine if the callee's parameter
 /// is (recorded as dependencies for the fixpoint).
-fn ime_ref_param_mask(f: & IrFunction, fi: i64, dep_fn: & mut Vec<i64>, dep_bit: & mut Vec<i64>, dep_callee: & mut Vec<str>, dep_pos: & mut Vec<i64>) -> i64 {
+fn ime_ref_param_mask(f: &IrFunction, fi: i64, dep_fn: &mut Vec<i64>, dep_bit: &mut Vec<i64>, dep_callee: &mut Vec<str>, dep_pos: &mut Vec<i64>) -> i64 {
     // LF2 (default on since Nov 17): a function without a body here (its
     // code is elsewhere) proves nothing about what it does with a reference
     if f.blocks.len() == 0 {
@@ -4941,7 +4959,7 @@ fn ime_ref_param_mask(f: & IrFunction, fi: i64, dep_fn: & mut Vec<i64>, dep_bit:
         var i: i64 = 0;
         while i < f.insts.len() {
             var ve: ValueIdInst = f.insts.get(i);
-            var from: i64 = - 1;
+            var from: i64 = -1;
             match ve.inst {
                 Inst::GetFieldPtr(q, _, _) => {
                     from = q;
@@ -4967,7 +4985,7 @@ fn ime_ref_param_mask(f: & IrFunction, fi: i64, dep_fn: & mut Vec<i64>, dep_bit:
     while i2 < f.insts.len() {
         var ve2: ValueIdInst = f.insts.get(i2);
         var ops: Vec<i64> = Vec::new();
-        peir_inst_operands(ve2.inst, & mut ops);
+        peir_inst_operands(ve2.inst, &mut ops);
         var o: i64 = 0;
         while o < ops.len() {
             var v: i64 = ops.get(o);
@@ -5019,9 +5037,9 @@ fn ime_ref_param_mask(f: & IrFunction, fi: i64, dep_fn: & mut Vec<i64>, dep_bit:
 
 /// Is `inst` given an address derived from local `base` (an operand
 /// whose place is that local's)?
-fn ime_given_local(f: & IrFunction, inst: Inst, base: i64) -> bool {
+fn ime_given_local(f: &IrFunction, inst: Inst, base: i64) -> bool {
     var ops: Vec<i64> = Vec::new();
-    peir_inst_operands(inst, & mut ops);
+    peir_inst_operands(inst, &mut ops);
     var i: i64 = 0;
     while i < ops.len() {
         var b: ImeAddr = ime_addr(f, ops.get(i));
@@ -5060,7 +5078,7 @@ fn ime_paths_overlap(a: str, b: str) -> bool {
     return true;
 }
 
-fn ime_global_name(f: & IrFunction, id: i64) -> str {
+fn ime_global_name(f: &IrFunction, id: i64) -> str {
     match peir_inst_of(f, id) {
         Inst::GlobalAddr(x, _) => {
             return x;
@@ -5072,7 +5090,7 @@ fn ime_global_name(f: & IrFunction, id: i64) -> str {
 }
 
 /// LF4: may the places at addresses p and q overlap?
-pub fn ime_may_alias(f: & IrFunction, unesc: & Vec<i64>, p: i64, q: i64) -> bool {
+pub fn ime_may_alias(f: &IrFunction, unesc: &Vec<i64>, p: i64, q: i64) -> bool {
     if p == q {
         return true;
     }
@@ -5146,7 +5164,7 @@ pub fn ime_may_alias(f: & IrFunction, unesc: & Vec<i64>, p: i64, q: i64) -> bool
 /// writes what its pointer arguments reach and anything that escaped
 /// (unknown places, globals); never an unescaped local, nor a parameter's
 /// place no argument is derived from.
-fn ime_call_writes(f: & IrFunction, unesc: & Vec<i64>, args: Vec<i64>, p: i64) -> bool {
+fn ime_call_writes(f: &IrFunction, unesc: &Vec<i64>, args: Vec<i64>, p: i64) -> bool {
     var a: ImeAddr = ime_addr(f, p);
     // OP26 (LF3): a Vec's element, by what the call is given (a call of
     // unknown name: ime_writes handles direct calls by name)
@@ -5205,7 +5223,7 @@ fn ime_call_writes(f: & IrFunction, unesc: & Vec<i64>, args: Vec<i64>, p: i64) -
 }
 
 /// Does `inst` write memory that may overlap the place at p?
-fn ime_writes(f: & IrFunction, unesc: & Vec<i64>, inst: Inst, p: i64) -> bool {
+fn ime_writes(f: &IrFunction, unesc: &Vec<i64>, inst: Inst, p: i64) -> bool {
     match inst {
         Inst::Store(q, _, _) => {
             return ime_may_alias(f, unesc, p, q);
@@ -5291,7 +5309,7 @@ fn ime_barrier(inst: Inst) -> bool {
 
 /// A place that is valid to read even where the original load did not run
 /// (a local's or a parameter's own fields): a hoisted load cannot fault.
-fn ime_safe_to_read(f: & IrFunction, p: i64) -> bool {
+fn ime_safe_to_read(f: &IrFunction, p: i64) -> bool {
     var a: ImeAddr = ime_addr(f, p);
     return (a.kind == 1 || a.kind == 2 || a.kind == 4) && !str_contains(a.path, "e");
 }
@@ -5334,7 +5352,7 @@ fn ime_is_write(inst: Inst) -> bool {
 // --- LF4 in DSE: stores overwritten before anything reads them ---------------
 
 /// The type a store writes (its own, or the stored value's).
-fn ime_store_ty(f: & IrFunction, ot: OptIrType, v: i64) -> IrType {
+fn ime_store_ty(f: &IrFunction, ot: OptIrType, v: i64) -> IrType {
     match ot {
         OptIrType::Some(t) => {
             return t;
@@ -5350,7 +5368,7 @@ fn ime_store_ty(f: & IrFunction, ot: OptIrType, v: i64) -> IrType {
 /// type, and a struct is copied from where v points (`val eb = ea` of an
 /// enum is such a store: no load of `ea` comes before it). When p's type is
 /// unknown (a parameter has no meta), a pointer to a struct stored counts.
-fn ime_store_copies(f: & IrFunction, p: i64, v: i64, ot: OptIrType) -> bool {
+fn ime_store_copies(f: &IrFunction, p: i64, v: i64, ot: OptIrType) -> bool {
     var t: IrType = IrType::Void;
     var have: bool = false;
     match ot {
@@ -5400,7 +5418,7 @@ fn ime_store_copies(f: & IrFunction, p: i64, v: i64, ot: OptIrType) -> bool {
 /// Are p and q certainly the same place: the same address value, or the
 /// same local or written parameter reached by the same fields (no element
 /// steps, no view as another type)?
-fn ime_same_place(f: & IrFunction, p: i64, q: i64) -> bool {
+fn ime_same_place(f: &IrFunction, p: i64, q: i64) -> bool {
     if p == q {
         return true;
     }
@@ -5421,7 +5439,7 @@ fn ime_same_place(f: & IrFunction, p: i64, q: i64) -> bool {
 /// else (what a `&mut` refers to may be a global the callee reads by name).
 /// Anything else that is not plain arithmetic on values counts as a read
 /// unless p is such a local.
-fn ime_reads(f: & IrFunction, unesc: & Vec<i64>, inst: Inst, p: i64) -> bool {
+fn ime_reads(f: &IrFunction, unesc: &Vec<i64>, inst: Inst, p: i64) -> bool {
     match inst {
         Inst::Load(q, _) => {
             return ime_may_alias(f, unesc, p, q);
@@ -5524,9 +5542,9 @@ fn ime_reads(f: & IrFunction, unesc: & Vec<i64>, inst: Inst, p: i64) -> bool {
 }
 
 /// OP26: is `inst` given an address derived from parameter `base`?
-fn ime_given_param(f: & IrFunction, inst: Inst, base: i64) -> bool {
+fn ime_given_param(f: &IrFunction, inst: Inst, base: i64) -> bool {
     var ops: Vec<i64> = Vec::new();
-    peir_inst_operands(inst, & mut ops);
+    peir_inst_operands(inst, &mut ops);
     var i: i64 = 0;
     while i < ops.len() {
         var b: ImeAddr = ime_addr(f, ops.get(i));
@@ -5544,7 +5562,7 @@ fn ime_given_param(f: & IrFunction, inst: Inst, base: i64) -> bool {
 /// offset depends on the element type, which the path does not record)
 /// and no view as another type ("c"). Globals are not compared (each
 /// GlobalAddr is its own base).
-fn ime_addr_same_place(f: & IrFunction, a: ImeAddr, q: i64) -> bool {
+fn ime_addr_same_place(f: &IrFunction, a: ImeAddr, q: i64) -> bool {
     if a.kind < 0 || a.kind == 3 {
         return false;
     }
@@ -5574,7 +5592,7 @@ fn ime_addr_same_place(f: & IrFunction, a: ImeAddr, q: i64) -> bool {
 
 /// OP26: is parameter `pid` of `f` a @linear struct (the lowering marks its
 /// meta, lower.fd Lowerer_lower_function)?
-fn ime_param_linear(f: & IrFunction, pid: i64) -> bool {
+fn ime_param_linear(f: &IrFunction, pid: i64) -> bool {
     match IrFunction_get_meta(f, pid) {
         OptValueMeta::Some(m) => {
             return m.is_linear;
@@ -5642,7 +5660,7 @@ pub fn ime_vecalias_count() -> i64 {
 
 /// The header h when value `d` is a Vec<i64>'s data pointer (a word load of
 /// BitCast(h), h a Vec<i64>: word 0 of the header), else -1.
-fn ime_vb_header_of_data(f: & IrFunction, d: i64) -> i64 {
+fn ime_vb_header_of_data(f: &IrFunction, d: i64) -> i64 {
     match peir_inst_of(f, d) {
         Inst::Load(hp, lt) => {
             if ir_type_eq(lt, IrType::I64) {
@@ -5666,7 +5684,7 @@ fn ime_vb_header_of_data(f: & IrFunction, d: i64) -> i64 {
 /// The header whose buffer address `p` is an element of (GetElemPtr of a
 /// Vec<i64>'s data pointer), else -1. Independent of vecalias: the counter
 /// of reused reads counts with it off too.
-fn ime_vb_elem_header(f: & IrFunction, p: i64) -> i64 {
+fn ime_vb_elem_header(f: &IrFunction, p: i64) -> i64 {
     match peir_inst_of(f, p) {
         Inst::GetElemPtr(d, _, _) => {
             return ime_vb_header_of_data(f, d);
@@ -5679,7 +5697,7 @@ fn ime_vb_elem_header(f: & IrFunction, p: i64) -> i64 {
 
 /// The owner of Vec<i64> header `h`: the parameter it is, or the home slot
 /// it belongs to (ime_vb_owners); -1 when it has none the query knows.
-fn ime_vb_header_owner(f: & IrFunction, h: i64) -> i64 {
+fn ime_vb_header_owner(f: &IrFunction, h: i64) -> i64 {
     if ime_param_index(f, h) >= 0 {
         if ime_vd_words(ime_vd_type(f, h)) {
             return h;
@@ -5696,7 +5714,7 @@ fn ime_vb_header_owner(f: & IrFunction, h: i64) -> i64 {
 /// Per value of `f`: home slot + 1 when it is one of that slot's headers
 /// (loaded from it, or a fresh owner stored into it), else 0. Computed once
 /// per function and generation (ime_unescaped starts a generation).
-fn ime_vb_owners(f: & IrFunction) -> Vec<i64> {
+fn ime_vb_owners(f: &IrFunction) -> Vec<i64> {
     var k: Vec<i64> = g_ime_vb_key;
     if k.len() == 4 && k.get(0) == g_ime_vb_gen && k.get(1) == f.next_value && k.get(2) == f.insts.len() && k.get(3) == str_len(f.name) {
         return g_ime_vb_own;
@@ -5731,7 +5749,7 @@ fn ime_vb_fresh_call(cn: str) -> bool {
 
 /// Value `v` is one of slot `s`'s headers; a value of two slots makes both
 /// lose the fact.
-fn ime_vb_join(own: & mut Vec<i64>, bad: & mut Vec<i64>, v: i64, s: i64) {
+fn ime_vb_join(own: &mut Vec<i64>, bad: &mut Vec<i64>, v: i64, s: i64) {
     if v < 0 || v >= own.len() || s < 0 || s >= bad.len() {
         return;
     }
@@ -5750,7 +5768,7 @@ fn ime_vb_join(own: & mut Vec<i64>, bad: & mut Vec<i64>, v: i64, s: i64) {
 
 /// The home slots of `f` and their headers (see the section head): per
 /// value, slot + 1 or 0.
-fn ime_vb_compute(f: & IrFunction) -> Vec<i64> {
+fn ime_vb_compute(f: &IrFunction) -> Vec<i64> {
     var n: i64 = f.next_value + 1;
     var own: Vec<i64> = peir_zeros(n);
     var bad: Vec<i64> = peir_zeros(n);
@@ -5796,7 +5814,7 @@ fn ime_vb_compute(f: & IrFunction) -> Vec<i64> {
         match ve2.inst {
             Inst::Load(lp, _) => {
                 if lp >= 0 && lp < n && cand.get(lp) == 1 {
-                    ime_vb_join(& mut own, & mut bad, ve2.id, lp);
+                    ime_vb_join(&mut own, &mut bad, ve2.id, lp);
                 }
             }
             Inst::Store(sp, sv, _) => {
@@ -5808,7 +5826,7 @@ fn ime_vb_compute(f: & IrFunction) -> Vec<i64> {
                         }
                         Inst::Call(scn, _, _, _) => {
                             if ime_vb_fresh_call(scn) {
-                                ime_vb_join(& mut own, & mut bad, sv, sp);
+                                ime_vb_join(&mut own, &mut bad, sv, sp);
                             } else {
                                 bad.set(sp, 1);
                             }
@@ -5876,7 +5894,7 @@ fn ime_vb_compute(f: & IrFunction) -> Vec<i64> {
     while i < f.insts.len() {
         var ve6: ValueIdInst = f.insts.get(i);
         var ops: Vec<i64> = Vec::new();
-        peir_inst_operands(ve6.inst, & mut ops);
+        peir_inst_operands(ve6.inst, &mut ops);
         var o: i64 = 0;
         while o < ops.len() {
             var v: i64 = ops.get(o);
@@ -5972,7 +5990,7 @@ fn ime_vb_compute(f: & IrFunction) -> Vec<i64> {
 /// of its headers, or the slot itself), a parameter, or -1 (a value read
 /// from memory, a call's result, a constant: none of those is a pointer to
 /// a home slot's header or buffer, which only the values above hold).
-fn ime_vb_root(f: & IrFunction, own: & Vec<i64>, a0: i64) -> i64 {
+fn ime_vb_root(f: &IrFunction, own: &Vec<i64>, a0: i64) -> i64 {
     var a: i64 = a0;
     var steps: i64 = 0;
     while steps < 32 {
@@ -6014,11 +6032,11 @@ fn ime_vb_root(f: & IrFunction, own: & Vec<i64>, a0: i64) -> i64 {
 /// OP26 (LF3): may a call (to `name` when `direct`) with these arguments
 /// write an element of the buffer of Vec<i64> owner `x` (ime_addr kind 5's
 /// base)? See the section head.
-fn ime_vb_call_writes(f: & IrFunction, name: str, direct: bool, args: Vec<i64>, x: i64) -> bool {
+fn ime_vb_call_writes(f: &IrFunction, name: str, direct: bool, args: Vec<i64>, x: i64) -> bool {
     var own: Vec<i64> = ime_vb_owners(f);
     var i: i64 = 0;
     while i < args.len() {
-        if ime_vb_root(f, & own, args.get(i)) == x {
+        if ime_vb_root(f, &own, args.get(i)) == x {
             return true;
         }
         i = i + 1;
@@ -6057,7 +6075,7 @@ fn ime_vb_call_writes(f: & IrFunction, name: str, direct: bool, args: Vec<i64>, 
 /// OP26 (placefwd): are p and q one element: GetElemPtr of the same base
 /// and index values (through ime_forward's map of reused loads) and the
 /// same element type?
-fn ime_same_elem(f: & IrFunction, map: & Vec<i64>, p: i64, q: i64) -> bool {
+fn ime_same_elem(f: &IrFunction, map: &Vec<i64>, p: i64, q: i64) -> bool {
     match peir_inst_of(f, p) {
         Inst::GetElemPtr(pb, pix, pt) => {
             match peir_inst_of(f, q) {
@@ -6075,7 +6093,7 @@ fn ime_same_elem(f: & IrFunction, map: & Vec<i64>, p: i64, q: i64) -> bool {
 }
 
 /// Does the backend read local `loc` by itself (drops, @zeroize, @persist)?
-fn ime_backend_reads(f: & IrFunction, loc: i64) -> bool {
+fn ime_backend_reads(f: &IrFunction, loc: i64) -> bool {
     var i: i64 = 0;
     while i < f.drop_locals.len() {
         if f.drop_locals.get(i).id == loc {
@@ -6106,7 +6124,7 @@ fn ime_backend_reads(f: & IrFunction, loc: i64) -> bool {
 /// that may read it (ime_reads) or leave the block, is dead. Locals the
 /// backend reads by itself (drops, @zeroize, @persist: LF19) and globals
 /// are left alone. The stored values stay; only the stores go.
-pub fn ime_overwritten_stores(f: & mut IrFunction) -> bool {
+pub fn ime_overwritten_stores(f: &mut IrFunction) -> bool {
     var unesc: Vec<i64> = ime_unescaped(f);
     var changed: bool = false;
     var b: i64 = 0;
@@ -6131,7 +6149,7 @@ pub fn ime_overwritten_stores(f: & mut IrFunction) -> bool {
                         var i0: i64 = 0;
                         while i0 < pend.len() {
                             var j0: i64 = pend.get(i0);
-                            var pj0: i64 = - 1;
+                            var pj0: i64 = -1;
                             match peir_inst_of(f, ids.get(j0)) {
                                 Inst::Store(sp0, _, _) => {
                                     pj0 = sp0;
@@ -6139,7 +6157,7 @@ pub fn ime_overwritten_stores(f: & mut IrFunction) -> bool {
                                 _ => {
                                 }
                             }
-                            if pj0 >= 0 && !ime_may_alias(f, & unesc, pj0, v) {
+                            if pj0 >= 0 && !ime_may_alias(f, &unesc, pj0, v) {
                                 np0.push(j0);
                             }
                             i0 = i0 + 1;
@@ -6187,7 +6205,7 @@ pub fn ime_overwritten_stores(f: & mut IrFunction) -> bool {
                     var i2: i64 = 0;
                     while i2 < pend.len() {
                         var j2: i64 = pend.get(i2);
-                        var pj2: i64 = - 1;
+                        var pj2: i64 = -1;
                         match peir_inst_of(f, ids.get(j2)) {
                             Inst::Store(sp, _, _) => {
                                 pj2 = sp;
@@ -6195,7 +6213,7 @@ pub fn ime_overwritten_stores(f: & mut IrFunction) -> bool {
                             _ => {
                             }
                         }
-                        if pj2 >= 0 && !ime_reads(f, & unesc, inst, pj2) {
+                        if pj2 >= 0 && !ime_reads(f, &unesc, inst, pj2) {
                             np2.push(j2);
                         }
                         i2 = i2 + 1;
@@ -6240,18 +6258,18 @@ fn ime_is_panic(inst: Inst) -> bool {
 /// In a loop with a preheader, a load whose address is computed before the
 /// loop and whose place nothing in the loop may write (LF4) moves to the
 /// preheader: it reads the same value on every iteration.
-pub fn ime_hoist_loads(f: & mut IrFunction) -> bool {
+pub fn ime_hoist_loads(f: &mut IrFunction) -> bool {
     var changed: bool = false;
     var cfg: IroCfg = ime_cfg(f);
     var unesc: Vec<i64> = ime_unescaped(f);
-    var lt: IroLoops = iro_loops(& cfg);
+    var lt: IroLoops = iro_loops(&cfg);
     var hs: Vec<i64> = lt.found;
     var hi: i64 = 0;
     while hi < hs.len() {
         var h: i64 = hs.get(hi);
         var lat: Vec<i64> = lt.latches.get(h);
-        var body: Vec<i64> = ime_loop_body(& lt, h);
-        var pre: i64 = - 1;
+        var body: Vec<i64> = ime_loop_body(&lt, h);
+        var pre: i64 = -1;
         var ps: Vec<i64> = cfg.preds.get(h);
         var k: i64 = 0;
         while k < ps.len() {
@@ -6259,7 +6277,7 @@ pub fn ime_hoist_loads(f: & mut IrFunction) -> bool {
                 if pre < 0 {
                     pre = ps.get(k);
                 } else {
-                    pre = - 2;
+                    pre = -2;
                 }
             }
             k = k + 1;
@@ -6298,7 +6316,7 @@ pub fn ime_hoist_loads(f: & mut IrFunction) -> bool {
                                     var clobbered: bool = false;
                                     var w: i64 = 0;
                                     while w < writes.len() && !clobbered {
-                                        if ime_writes(f, & unesc, peir_inst_of(f, writes.get(w)), p) {
+                                        if ime_writes(f, &unesc, peir_inst_of(f, writes.get(w)), p) {
                                             clobbered = true;
                                         }
                                         w = w + 1;
@@ -6357,7 +6375,7 @@ pub fn ime_hoist_loads(f: & mut IrFunction) -> bool {
 /// In each block, a load of a place whose value is known (just stored, or
 /// loaded and not written since, per LF4) becomes that value. Only values
 /// of the load's own type are forwarded.
-pub fn ime_forward(f: & mut IrFunction) -> bool {
+pub fn ime_forward(f: &mut IrFunction) -> bool {
     var unesc: Vec<i64> = ime_unescaped(f);
     var placefwd: bool = ime_on("placefwd");
     var n: i64 = f.next_value + 1;
@@ -6378,7 +6396,7 @@ pub fn ime_forward(f: & mut IrFunction) -> bool {
             var done: bool = false;
             match inst {
                 Inst::Load(p, t) => {
-                    var known: i64 = - 1;
+                    var known: i64 = -1;
                     var i: i64 = 0;
                     // OP26 (`placefwd`, on by default since Nov 17): one place reached
                     // by two address instructions (`t.a` read twice) counts
@@ -6392,13 +6410,13 @@ pub fn ime_forward(f: & mut IrFunction) -> bool {
                     while i < addrs.len() {
                         // OP26: with placefwd also one element (the same
                         // base, index and element type: ime_same_elem)
-                        if addrs.get(i) == p || (placefwd && (ime_addr_same_place(f, lpa, addrs.get(i)) || ime_same_elem(f, & map, p, addrs.get(i)))) {
+                        if addrs.get(i) == p || (placefwd && (ime_addr_same_place(f, lpa, addrs.get(i)) || ime_same_elem(f, &map, p, addrs.get(i)))) {
                             known = vals.get(i);
                         }
                         i = i + 1;
                     }
                     if known >= 0 && ir_type_eq(ime_type(f, known), t) && id < map.len() && (id >= fixed.len() || fixed.get(id) == 0) {
-                        map.set(id, ime_v(& map, known) + 1);
+                        map.set(id, ime_v(&map, known) + 1);
                         dead.set(id, 1);
                         any = true;
                         // OP26: a read of a Vec<i64>'s element made by
@@ -6417,14 +6435,14 @@ pub fn ime_forward(f: & mut IrFunction) -> bool {
                     var nv: Vec<i64> = Vec::new();
                     var i2: i64 = 0;
                     while i2 < addrs.len() {
-                        if !ime_may_alias(f, & unesc, addrs.get(i2), p2) {
+                        if !ime_may_alias(f, &unesc, addrs.get(i2), p2) {
                             na.push(addrs.get(i2));
                             nv.push(vals.get(i2));
                         }
                         i2 = i2 + 1;
                     }
                     na.push(p2);
-                    nv.push(ime_v(& map, v));
+                    nv.push(ime_v(&map, v));
                     addrs = na;
                     vals = nv;
                     done = true;
@@ -6441,7 +6459,7 @@ pub fn ime_forward(f: & mut IrFunction) -> bool {
                     var nv2: Vec<i64> = Vec::new();
                     var i3: i64 = 0;
                     while i3 < addrs.len() {
-                        if !ime_writes(f, & unesc, inst, addrs.get(i3)) {
+                        if !ime_writes(f, &unesc, inst, addrs.get(i3)) {
                             na2.push(addrs.get(i3));
                             nv2.push(vals.get(i3));
                         }
@@ -6463,7 +6481,7 @@ pub fn ime_forward(f: & mut IrFunction) -> bool {
     var i4: i64 = 0;
     while i4 < f.insts.len() {
         var e: ValueIdInst = f.insts.get(i4);
-        e.inst = ime_remap(e.inst, & map, & nob);
+        e.inst = ime_remap(e.inst, &map, &nob);
         f.insts.set(i4, e);
         i4 = i4 + 1;
     }
@@ -6492,7 +6510,7 @@ pub fn ime_forward(f: & mut IrFunction) -> bool {
 /// every load of that same address in the blocks T dominates reads k, as
 /// long as nothing in that area may write it (LF4): it becomes the
 /// constant, so a later test of the same tag folds.
-pub fn ime_match_facts(f: & mut IrFunction) -> bool {
+pub fn ime_match_facts(f: &mut IrFunction) -> bool {
     var changed: bool = false;
     var cfg: IroCfg = ime_cfg(f);
     var unesc: Vec<i64> = ime_unescaped(f);
@@ -6500,9 +6518,9 @@ pub fn ime_match_facts(f: & mut IrFunction) -> bool {
     while b < cfg.n {
         var ids: Vec<i64> = f.blocks.get(b).instructions;
         if ids.len() > 0 {
-            var addr: i64 = - 1;
+            var addr: i64 = -1;
             var kv: i64 = 0;
-            var tgt: i64 = - 1;
+            var tgt: i64 = -1;
             match peir_inst_of(f, ids.get(ids.len() - 1)) {
                 Inst::Branch(c, t, _) => {
                     match peir_inst_of(f, c) {
@@ -6534,14 +6552,14 @@ pub fn ime_match_facts(f: & mut IrFunction) -> bool {
                 _ => {
                 }
             }
-            var ti: i64 = - 1;
+            var ti: i64 = -1;
             if tgt >= 0 && tgt < cfg.index.len() {
                 ti = cfg.index.get(tgt);
             }
             // the tested load is in this block, and nothing after it here
             // may write the tag before the branch
             if addr >= 0 {
-                var tload: i64 = - 1;
+                var tload: i64 = -1;
                 match peir_inst_of(f, ids.get(ids.len() - 1)) {
                     Inst::Branch(c2, _, _) => {
                         match peir_inst_of(f, c2) {
@@ -6555,7 +6573,7 @@ pub fn ime_match_facts(f: & mut IrFunction) -> bool {
                     _ => {
                     }
                 }
-                var pl: i64 = - 1;
+                var pl: i64 = -1;
                 var s: i64 = 0;
                 while s < ids.len() {
                     if ids.get(s) == tload {
@@ -6564,13 +6582,13 @@ pub fn ime_match_facts(f: & mut IrFunction) -> bool {
                     s = s + 1;
                 }
                 if pl < 0 {
-                    addr = - 1;
+                    addr = -1;
                 } else {
                     s = pl + 1;
                     while s < ids.len() && addr >= 0 {
                         var sinst: Inst = peir_inst_of(f, ids.get(s));
-                        if ime_barrier(sinst) || ime_writes(f, & unesc, sinst, addr) {
-                            addr = - 1;
+                        if ime_barrier(sinst) || ime_writes(f, &unesc, sinst, addr) {
+                            addr = -1;
                         }
                         s = s + 1;
                     }
@@ -6580,7 +6598,7 @@ pub fn ime_match_facts(f: & mut IrFunction) -> bool {
                 var area: Vec<i64> = Vec::new();
                 var x: i64 = 0;
                 while x < cfg.n {
-                    if ime_dom(& cfg, ti, x) {
+                    if ime_dom(&cfg, ti, x) {
                         area.push(x);
                     }
                     x = x + 1;
@@ -6592,7 +6610,7 @@ pub fn ime_match_facts(f: & mut IrFunction) -> bool {
                     var q: i64 = 0;
                     while q < rids.len() && clean {
                         var rinst: Inst = peir_inst_of(f, rids.get(q));
-                        if ime_barrier(rinst) || ime_writes(f, & unesc, rinst, addr) {
+                        if ime_barrier(rinst) || ime_writes(f, &unesc, rinst, addr) {
                             clean = false;
                         }
                         q = q + 1;

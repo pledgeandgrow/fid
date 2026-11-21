@@ -27,7 +27,21 @@
 // Every pass leaves the program's meaning as it was; when in doubt it does
 // nothing.
 
-module compiler::iropt; use core; use vec; use string; use compiler::ast; use compiler::ir; use compiler::checks; use compiler::pe_ir_stubs; use compiler::iropt_me; use compiler::ssa; use compiler::tv; use compiler::ast_ser; use compiler::ir_ser; use compiler::pgo;  /// Largest callee (instructions, its return included) that is inlined.
+module compiler::iropt;
+use core;
+use vec;
+use string;
+use compiler::ast;
+use compiler::ir;
+use compiler::checks;
+use compiler::pe_ir_stubs;
+use compiler::iropt_me;
+use compiler::ssa;
+use compiler::tv;
+use compiler::ast_ser;
+use compiler::ir_ser;
+use compiler::pgo;
+/// Largest callee (instructions, its return included) that is inlined.
 const IRO_INLINE_MAX: i64 = 16;
 /// SP2: per-pass times of the last iropt_native for the --time table
 /// (compiler.fd time_mark adds them under its "iropt" row).
@@ -51,7 +65,7 @@ pub fn iropt_pass_time_ms() -> Vec<i64> {
 }
 
 /// Run every pass on `module` (the pass manager: see iro_pass_on).
-pub fn iropt_native(module: & mut IrModule) {
+pub fn iropt_native(module: &mut IrModule) {
     var stats: bool = iro_stats_on();
     // SP2: the per-pass times are also kept for the --time table
     // (g_iro_time_on, set by compiler.fd set_time_on)
@@ -79,7 +93,7 @@ pub fn iropt_native(module: & mut IrModule) {
     var tm_r: i64 = iro_clock(timing);
     var reach0: i64 = iro_mid_reach(module);
     var nfn0: i64 = module.functions.len();
-    iro_time_note(& mut tp_names, & mut tp_ms, & mut tp_hits, "midreach", timing, tm_r);
+    iro_time_note(&mut tp_names, &mut tp_ms, &mut tp_hits, "midreach", timing, tm_r);
     // LG5/LG6: resolve closure-env CallPtrs to direct Calls before the
     // inliner runs so the tiny closures flatten like any other call.
     if on_cdev {
@@ -93,13 +107,13 @@ pub fn iropt_native(module: & mut IrModule) {
                 continue;
             }
             var cfn: IrFunction = cent.func;
-            if iro_closure_devirt(module, & mut cfn) {
+            if iro_closure_devirt(module, &mut cfn) {
                 cent.func = cfn;
                 module.functions.set(cfi, cent);
             }
             cfi = cfi + 1;
         }
-        iro_time_note(& mut tp_names, & mut tp_ms, & mut tp_hits, "closuredevirt", timing, tm0);
+        iro_time_note(&mut tp_names, &mut tp_ms, &mut tp_hits, "closuredevirt", timing, tm0);
     }
     // LG5: clone higher-order fns per known closure env so their inner
     // CallPtr dispatch becomes a direct Call — inlinable below.
@@ -111,10 +125,10 @@ pub fn iropt_native(module: & mut IrModule) {
         // tv_mod_after) and undone as a whole when a function is rejected
         var tvm_hof: TvMod = tv_mod_before(module);
         n_hof = iro_hof_specialize_in(module, reach0);
-        if !tv_mod_after("hofspec", & tvm_hof, module) {
+        if !tv_mod_after("hofspec", &tvm_hof, module) {
             n_hof = 0;
         }
-        iro_time_note(& mut tp_names, & mut tp_ms, & mut tp_hits, "hofspec", timing, tm0);
+        iro_time_note(&mut tp_names, &mut tp_ms, &mut tp_hits, "hofspec", timing, tm0);
     }
     // OP14: clone a function per concrete type of a `dyn` argument whose
     // trait calls it makes on that parameter (they become direct calls,
@@ -124,7 +138,7 @@ pub fn iropt_native(module: & mut IrModule) {
         tm0 = iro_clock(timing);
         ime_trace("dynspec", "-");
         n_dspec = iro_dyn_specialize(module);
-        iro_time_note(& mut tp_names, & mut tp_ms, & mut tp_hits, "dynspec", timing, tm0);
+        iro_time_note(&mut tp_names, &mut tp_ms, &mut tp_hits, "dynspec", timing, tm0);
     }
     // OP14: a trait call or closure call on a value read from a struct
     // field every store of which stores one dyn type / one closure target
@@ -135,8 +149,8 @@ pub fn iropt_native(module: & mut IrModule) {
     if iro_pass_on("fielddevirt") {
         tm0 = iro_clock(timing);
         ime_trace("fielddevirt", "-");
-        iro_field_devirt(module, & mut n_fdv);
-        iro_time_note(& mut tp_names, & mut tp_ms, & mut tp_hits, "fielddevirt", timing, tm0);
+        iro_field_devirt(module, &mut n_fdv);
+        iro_time_note(&mut tp_names, &mut tp_ms, &mut tp_hits, "fielddevirt", timing, tm0);
     }
     // LF16, LF14 (opt-in: FID_IROPT_ON=soleown, vecsroa; iro_vec_locals):
     // vec_own on a Vec nothing shares goes, a small local Vec of words
@@ -147,7 +161,7 @@ pub fn iropt_native(module: & mut IrModule) {
         tm0 = iro_clock(timing);
         ime_trace("vecsroa", "-");
         iro_vec_locals(module, on_soleown, on_vecsroa);
-        iro_time_note(& mut tp_names, & mut tp_ms, & mut tp_hits, "vecsroa", timing, tm0);
+        iro_time_note(&mut tp_names, &mut tp_ms, &mut tp_hits, "vecsroa", timing, tm0);
     }
     // SP3: functions added since reach0 was computed (hofspec's and
     // dynspec's clones) are inlined into like the functions they copy
@@ -164,8 +178,8 @@ pub fn iropt_native(module: & mut IrModule) {
         var tvm_inl: TvMod = tv_mod_before(module);
         // SP3: only into functions main reaches (and hofspec's clones)
         iro_inline_in(module, reach0);
-        var _tv_inl: bool = tv_mod_after("inline", & tvm_inl, module);
-        iro_time_note(& mut tp_names, & mut tp_ms, & mut tp_hits, "inline", timing, tm0);
+        var _tv_inl: bool = tv_mod_after("inline", &tvm_inl, module);
+        iro_time_note(&mut tp_names, &mut tp_ms, &mut tp_hits, "inline", timing, tm0);
     }
     // ME20, ME21: inlining across functions, bottom-up, only into functions
     // main reaches (on by default since OP5: iropt_me.fd IME_DEFAULT_ON;
@@ -175,8 +189,8 @@ pub fn iropt_native(module: & mut IrModule) {
         ime_trace("inline2", "-");
         var tvm_inl2: TvMod = tv_mod_before(module);
         ime_inline_reached(module, iro_inline_reach(module));
-        var _tv_inl2: bool = tv_mod_after("inline2", & tvm_inl2, module);
-        iro_time_note(& mut tp_names, & mut tp_ms, & mut tp_hits, "inline2", timing, tm0);
+        var _tv_inl2: bool = tv_mod_after("inline2", &tvm_inl2, module);
+        iro_time_note(&mut tp_names, &mut tp_ms, &mut tp_hits, "inline2", timing, tm0);
     } else if ime_on("inlineclo") {
         // WP16: inline2's once-called rule for closures only, when inline2
         // is off (on by default since Nov 17: iropt_me.fd IME_DEFAULT_ON;
@@ -185,8 +199,8 @@ pub fn iropt_native(module: & mut IrModule) {
         ime_trace("inlineclo", "-");
         var tvm_clo: TvMod = tv_mod_before(module);
         ime_inline_closures(module);
-        var _tv_clo: bool = tv_mod_after("inlineclo", & tvm_clo, module);
-        iro_time_note(& mut tp_names, & mut tp_ms, & mut tp_hits, "inlineclo", timing, tm0);
+        var _tv_clo: bool = tv_mod_after("inlineclo", &tvm_clo, module);
+        iro_time_note(&mut tp_names, &mut tp_ms, &mut tp_hits, "inlineclo", timing, tm0);
     }
     var n_fold: i64 = 0;
     var n_spec: i64 = 0;
@@ -291,7 +305,7 @@ pub fn iropt_native(module: & mut IrModule) {
         tm0 = iro_clock(timing);
         ime_trace("envtrim", "-");
         n_envtrim = iro_env_trim(module);
-        iro_time_note(& mut tp_names, & mut tp_ms, & mut tp_hits, "envtrim", timing, tm0);
+        iro_time_note(&mut tp_names, &mut tp_ms, &mut tp_hits, "envtrim", timing, tm0);
     }
     // WP13: constants from the call sites move into the callees first, so the
     // per-function passes below see them.
@@ -300,10 +314,10 @@ pub fn iropt_native(module: & mut IrModule) {
         ime_trace("ipcp", "-");
         var tvm_ipcp: TvMod = tv_mod_before(module);
         n_ipcp = iro_ipcp(module);
-        if !tv_mod_after("ipcp", & tvm_ipcp, module) {
+        if !tv_mod_after("ipcp", &tvm_ipcp, module) {
             n_ipcp = 0;
         }
-        iro_time_note(& mut tp_names, & mut tp_ms, & mut tp_hits, "ipcp", timing, tm0);
+        iro_time_note(&mut tp_names, &mut tp_ms, &mut tp_hits, "ipcp", timing, tm0);
     }
     // WP14: mixed constant/varying parameters get specialized clones.
     if has_main && on_spec {
@@ -315,10 +329,10 @@ pub fn iropt_native(module: & mut IrModule) {
         // the constant into them (before, they were skipped as unreached:
         // spec cloned but changed no instruction)
         n_spec = iro_specialize(module, reach);
-        if !tv_mod_after("spec", & tvm_spec, module) {
+        if !tv_mod_after("spec", &tvm_spec, module) {
             n_spec = 0;
         }
-        iro_time_note(& mut tp_names, & mut tp_ms, & mut tp_hits, "spec", timing, tm0);
+        iro_time_note(&mut tp_names, &mut tp_ms, &mut tp_hits, "spec", timing, tm0);
     }
     // WP18: never-written globals fold to their initializer.
     if has_main && on_gconst {
@@ -326,10 +340,10 @@ pub fn iropt_native(module: & mut IrModule) {
         ime_trace("gconst", "-");
         var tvm_gc: TvMod = tv_mod_before(module);
         n_gconst = iro_const_globals_in(module, mid_reach);
-        if !tv_mod_after("gconst", & tvm_gc, module) {
+        if !tv_mod_after("gconst", &tvm_gc, module) {
             n_gconst = 0;
         }
-        iro_time_note(& mut tp_names, & mut tp_ms, & mut tp_hits, "gconst", timing, tm0);
+        iro_time_note(&mut tp_names, &mut tp_ms, &mut tp_hits, "gconst", timing, tm0);
     }
     // LF10 (checks.fd peir_note_param_ranges, opt-in: FID_IROPT_ON=
     // paramrange): an internal function's i64 parameters start at the
@@ -344,7 +358,7 @@ pub fn iropt_native(module: & mut IrModule) {
         tm0 = iro_clock(timing);
         ime_trace("paramrange", "-");
         peir_note_param_ranges(module);
-        iro_time_note(& mut tp_names, & mut tp_ms, & mut tp_hits, "paramrange", timing, tm0);
+        iro_time_note(&mut tp_names, &mut tp_ms, &mut tp_hits, "paramrange", timing, tm0);
     }
     // OP25: what each function does, transitively, so LICM can move a call
     // that does nothing but compute (and maybe panic) out of a loop's
@@ -356,7 +370,7 @@ pub fn iropt_native(module: & mut IrModule) {
         tm0 = iro_clock(timing);
         ime_trace("licmcall", "-");
         licm_masks = iro_effect_masks_in(module, mid_reach);
-        iro_time_note(& mut tp_names, & mut tp_ms, & mut tp_hits, "licmcall", timing, tm0);
+        iro_time_note(&mut tp_names, &mut tp_ms, &mut tp_hits, "licmcall", timing, tm0);
     }
     // OP25 (Nov 16; on by default since Nov 17, FID_IROPT_OFF=quietcall):
     // the functions every call of which ends without a panic (no loop, no
@@ -376,7 +390,7 @@ pub fn iropt_native(module: & mut IrModule) {
             quiet_masks = iro_effect_masks_in(module, mid_reach);
         }
         g_iro_quiet = iro_quiet_fns_in(module, mid_reach);
-        iro_time_note(& mut tp_names, & mut tp_ms, & mut tp_hits, "quietcall", timing, tm0);
+        iro_time_note(&mut tp_names, &mut tp_ms, &mut tp_hits, "quietcall", timing, tm0);
     }
     var n_dcall: i64 = 0;
     // OP25: the same masks, by name, for the mid-end passes of iropt_me,
@@ -426,7 +440,7 @@ pub fn iropt_native(module: & mut IrModule) {
             fpi = fpi + 1;
         }
         ime_set_call_facts(pure_set, nowrite_set);
-        iro_time_note(& mut tp_names, & mut tp_ms, & mut tp_hits, "callfacts", timing, tm0);
+        iro_time_note(&mut tp_names, &mut tp_ms, &mut tp_hits, "callfacts", timing, tm0);
     }
     // LF2: reference parameters no callee lets go of, so the alias query
     // (iropt_me) knows a local passed by `&`/`&mut` is reached only by the
@@ -438,7 +452,7 @@ pub fn iropt_native(module: & mut IrModule) {
         tm0 = iro_clock(timing);
         ime_trace("lendref", "-");
         ime_note_ref_params(module);
-        iro_time_note(& mut tp_names, & mut tp_ms, & mut tp_hits, "lendref", timing, tm0);
+        iro_time_note(&mut tp_names, &mut tp_ms, &mut tp_hits, "lendref", timing, tm0);
     } else {
         ime_forget_ref_params();
     }
@@ -458,7 +472,7 @@ pub fn iropt_native(module: & mut IrModule) {
         var imc_flags: i64 = iro_imc_bit(on_fold, 0) + iro_imc_bit(on_simplify, 1) + iro_imc_bit(on_branch, 2) + iro_imc_bit(on_facts, 3) + iro_imc_bit(on_sccp, 4) + iro_imc_bit(on_promote, 5) + iro_imc_bit(on_devirt, 6) + iro_imc_bit(on_cdev, 7) + iro_imc_bit(on_dse, 8) + iro_imc_bit(on_quiet, 9) + iro_imc_bit(on_dce, 10) + iro_imc_bit(on_tail, 11) + iro_imc_bit(on_gvn, 12) + iro_imc_bit(on_licm, 13) + iro_imc_bit(on_iv, 14) + iro_imc_bit(on_version, 15) + iro_imc_bit(on_guardcall, 16) + iro_imc_bit(on_nowrite, 17) + iro_imc_bit(has_main, 18) + iro_imc_bit(licm_masks.len() > 0, 19) + iro_imc_bit(quiet_masks.len() > 0, 20) + iro_imc_bit(on_rotate, 21);
         imc_salt = iro_imc_salt(module, imc_flags);
         imc = iro_imc_prepare(module, reach, has_main);
-        iro_time_note(& mut tp_names, & mut tp_ms, & mut tp_hits, "irocache", timing, tm0);
+        iro_time_note(&mut tp_names, &mut tp_ms, &mut tp_hits, "irocache", timing, tm0);
     }
     // 2g.90 (VF6): with --validate, the runs that check the passes below
     // read the module's constant globals as their literals
@@ -478,7 +492,7 @@ pub fn iropt_native(module: & mut IrModule) {
         var imc_at: i64 = 0;
         var imc_done: bool = false;
         if imc_on {
-            imc_key = iro_imc_key(& mut imc, module, i, imc_salt);
+            imc_key = iro_imc_key(&mut imc, module, i, imc_salt);
             if imc_key == 0 {
                 imc_nokey_note(entry.name);
             } else {
@@ -511,37 +525,37 @@ pub fn iropt_native(module: & mut IrModule) {
         // hand below)
         iro_uses_arm();
         if stats {
-            insts_before = insts_before + iro_count_insts(& f);
+            insts_before = insts_before + iro_count_insts(&f);
         }
         // ME22-ME28 (compiler/iropt_me.fd, opt-in): restructuring first,
         // so the cleanup passes below see their result
         tm0 = iro_clock(timing);
-        if ime_function_passes(& mut f) {
+        if ime_function_passes(&mut f) {
             changed = true;
             iro_uses_forget();
         }
-        iro_time_note(& mut tp_names, & mut tp_ms, & mut tp_hits, "midend", timing, tm0);
-        if on_fold && iro_time(& mut tp_names, & mut tp_ms, & mut tp_hits, "fold", timing, & mut f) {
+        iro_time_note(&mut tp_names, &mut tp_ms, &mut tp_hits, "midend", timing, tm0);
+        if on_fold && iro_time(&mut tp_names, &mut tp_ms, &mut tp_hits, "fold", timing, &mut f) {
             changed = true;
             n_fold = n_fold + 1;
         }
-        if on_simplify && iro_time(& mut tp_names, & mut tp_ms, & mut tp_hits, "simplify", timing, & mut f) {
+        if on_simplify && iro_time(&mut tp_names, &mut tp_ms, &mut tp_hits, "simplify", timing, &mut f) {
             changed = true;
             n_simp = n_simp + 1;
         }
-        if on_branch && iro_time(& mut tp_names, & mut tp_ms, & mut tp_hits, "branchfold", timing, & mut f) {
+        if on_branch && iro_time(&mut tp_names, &mut tp_ms, &mut tp_hits, "branchfold", timing, &mut f) {
             changed = true;
             n_branch = n_branch + 1;
         }
-        if on_facts && iro_time(& mut tp_names, & mut tp_ms, & mut tp_hits, "branchfacts", timing, & mut f) {
+        if on_facts && iro_time(&mut tp_names, &mut tp_ms, &mut tp_hits, "branchfacts", timing, &mut f) {
             changed = true;
             n_facts = n_facts + 1;
         }
-        if on_sccp && iro_time(& mut tp_names, & mut tp_ms, & mut tp_hits, "sccp", timing, & mut f) {
+        if on_sccp && iro_time(&mut tp_names, &mut tp_ms, &mut tp_hits, "sccp", timing, &mut f) {
             changed = true;
             n_sccp = n_sccp + 1;
         }
-        if on_promote && iro_promote_here(& f, on_ssa_me, promote_named) && iro_time(& mut tp_names, & mut tp_ms, & mut tp_hits, "promote", timing, & mut f) {
+        if on_promote && iro_promote_here(&f, on_ssa_me, promote_named) && iro_time(&mut tp_names, &mut tp_ms, &mut tp_hits, "promote", timing, &mut f) {
             changed = true;
             n_promote = n_promote + 1;
         }
@@ -549,13 +563,13 @@ pub fn iropt_native(module: & mut IrModule) {
             tm0 = iro_clock(timing);
             ime_trace("devirt", f.name);
             // VF6: with --validate the result is checked (tv.fd tv_devirt)
-            var tv_dpre: IrFunction = tv_before(& f);
-            var dv: bool = iro_devirt(module, & mut f);
-            if dv && !tv_after_devirt(module, & tv_dpre, & mut f) {
+            var tv_dpre: IrFunction = tv_before(&f);
+            var dv: bool = iro_devirt(module, &mut f);
+            if dv && !tv_after_devirt(module, &tv_dpre, &mut f) {
                 dv = false;
                 iro_uses_forget();
             }
-            iro_time_note(& mut tp_names, & mut tp_ms, & mut tp_hits, "devirt", timing, tm0);
+            iro_time_note(&mut tp_names, &mut tp_ms, &mut tp_hits, "devirt", timing, tm0);
             if dv {
                 changed = true;
                 n_devirt = n_devirt + 1;
@@ -568,15 +582,15 @@ pub fn iropt_native(module: & mut IrModule) {
         if on_cdev {
             tm0 = iro_clock(timing);
             ime_trace("closuredevirt", f.name);
-            var cdv: bool = iro_closure_devirt(module, & mut f);
-            iro_time_note(& mut tp_names, & mut tp_ms, & mut tp_hits, "closuredevirt", timing, tm0);
+            var cdv: bool = iro_closure_devirt(module, &mut f);
+            iro_time_note(&mut tp_names, &mut tp_ms, &mut tp_hits, "closuredevirt", timing, tm0);
             if cdv {
                 changed = true;
                 n_cdev = n_cdev + 1;
                 iro_uses_forget();
             }
         }
-        if on_dse && iro_time(& mut tp_names, & mut tp_ms, & mut tp_hits, "dse", timing, & mut f) {
+        if on_dse && iro_time(&mut tp_names, &mut tp_ms, &mut tp_hits, "dse", timing, &mut f) {
             changed = true;
             n_dse = n_dse + 1;
         }
@@ -585,23 +599,23 @@ pub fn iropt_native(module: & mut IrModule) {
         if on_quiet {
             tm0 = iro_clock(timing);
             ime_trace("quietcall", f.name);
-            var dcl: bool = iro_dead_calls(module, & quiet_masks, & mut f);
-            iro_time_note(& mut tp_names, & mut tp_ms, & mut tp_hits, "quietcall", timing, tm0);
+            var dcl: bool = iro_dead_calls(module, &quiet_masks, &mut f);
+            iro_time_note(&mut tp_names, &mut tp_ms, &mut tp_hits, "quietcall", timing, tm0);
             if dcl {
                 changed = true;
                 n_dcall = n_dcall + 1;
                 iro_uses_forget();
             }
         }
-        if on_dce && iro_time(& mut tp_names, & mut tp_ms, & mut tp_hits, "dce", timing, & mut f) {
+        if on_dce && iro_time(&mut tp_names, &mut tp_ms, &mut tp_hits, "dce", timing, &mut f) {
             changed = true;
             n_dce = n_dce + 1;
         }
-        if on_tail && iro_time(& mut tp_names, & mut tp_ms, & mut tp_hits, "tailcall", timing, & mut f) {
+        if on_tail && iro_time(&mut tp_names, &mut tp_ms, &mut tp_hits, "tailcall", timing, &mut f) {
             changed = true;
             n_tail = n_tail + 1;
         }
-        if on_gvn && iro_time(& mut tp_names, & mut tp_ms, & mut tp_hits, "gvn", timing, & mut f) {
+        if on_gvn && iro_time(&mut tp_names, &mut tp_ms, &mut tp_hits, "gvn", timing, &mut f) {
             changed = true;
             n_gvn = n_gvn + 1;
         }
@@ -611,23 +625,23 @@ pub fn iropt_native(module: & mut IrModule) {
             ime_trace("licm", f.name);
             // VF6: with --validate the result is checked (tv.fd tv_licm),
             // trusting the effect masks for the calls it moved
-            var tv_lpre: IrFunction = tv_before(& f);
-            var lc: bool = iro_licm(module, & licm_masks, & mut f);
+            var tv_lpre: IrFunction = tv_before(&f);
+            var lc: bool = iro_licm(module, &licm_masks, &mut f);
             if lc && tv_on() {
-                iro_tv_licm_calls(module, & licm_masks, & f);
-                if !tv_after("licm", & tv_lpre, & mut f) {
+                iro_tv_licm_calls(module, &licm_masks, &f);
+                if !tv_after("licm", &tv_lpre, &mut f) {
                     lc = false;
                     iro_uses_forget();
                 }
             }
-            iro_time_note(& mut tp_names, & mut tp_ms, & mut tp_hits, "licm", timing, tm0);
+            iro_time_note(&mut tp_names, &mut tp_ms, &mut tp_hits, "licm", timing, tm0);
             if lc {
                 changed = true;
                 n_licm = n_licm + 1;
                 iro_uses_forget();
             }
         }
-        if on_iv && iro_time(& mut tp_names, & mut tp_ms, & mut tp_hits, "iv", timing, & mut f) {
+        if on_iv && iro_time(&mut tp_names, &mut tp_ms, &mut tp_hits, "iv", timing, &mut f) {
             changed = true;
             n_iv = n_iv + 1;
         }
@@ -638,7 +652,7 @@ pub fn iropt_native(module: & mut IrModule) {
             ime_trace("version", f.name);
             f = iro_version(f);
             iro_uses_forget();
-            iro_time_note(& mut tp_names, & mut tp_ms, & mut tp_hits, "version", timing, tm0);
+            iro_time_note(&mut tp_names, &mut tp_ms, &mut tp_hits, "version", timing, tm0);
             if g_iro_nver > 0 {
                 changed = true;
                 n_ver = n_ver + g_iro_nver;
@@ -650,8 +664,8 @@ pub fn iropt_native(module: & mut IrModule) {
         if on_rotate {
             tm0 = iro_clock(timing);
             ime_trace("rotate", f.name);
-            var rot: bool = ime_rotate_pass(& mut f);
-            iro_time_note(& mut tp_names, & mut tp_ms, & mut tp_hits, "rotate", timing, tm0);
+            var rot: bool = ime_rotate_pass(&mut f);
+            iro_time_note(&mut tp_names, &mut tp_ms, &mut tp_hits, "rotate", timing, tm0);
             if rot {
                 changed = true;
                 n_rot = n_rot + 1;
@@ -659,7 +673,7 @@ pub fn iropt_native(module: & mut IrModule) {
             }
         }
         if stats {
-            insts_after = insts_after + iro_count_insts(& f);
+            insts_after = insts_after + iro_count_insts(&f);
         }
         // CS6: what the passes made of it, for the next build (a verified
         // hit: compared with what the memo held)
@@ -697,10 +711,10 @@ pub fn iropt_native(module: & mut IrModule) {
         ime_trace("icf", "-");
         var tvm_icf: TvMod = tv_mod_before(module);
         n_icf = iro_fold_identical(module);
-        if !tv_mod_after("icf", & tvm_icf, module) {
+        if !tv_mod_after("icf", &tvm_icf, module) {
             n_icf = 0;
         }
-        iro_time_note(& mut tp_names, & mut tp_ms, & mut tp_hits, "icf", timing, tm0);
+        iro_time_note(&mut tp_names, &mut tp_ms, &mut tp_hits, "icf", timing, tm0);
     }
     // WP15: functions optimization made unreachable (callers inlined,
     // calls rewritten) are removed now, not only before optimization.
@@ -721,7 +735,7 @@ pub fn iropt_native(module: & mut IrModule) {
         ime_trace("deadf", "-");
         deadf = IrModule_dead_function_elimination(module);
         deadg = IrModule_dead_global_elimination(module);
-        iro_time_note(& mut tp_names, & mut tp_ms, & mut tp_hits, "deadf", timing, tm0);
+        iro_time_note(&mut tp_names, &mut tp_ms, &mut tp_hits, "deadf", timing, tm0);
     }
     // WP20: emit the library-facts artifact when the consumer asked for one.
     iro_libfacts(module);
@@ -741,7 +755,7 @@ pub fn iropt_native(module: & mut IrModule) {
         if on_quiet {
             // OP25: tests/tooling/quietcall-egplace-check.sh and
             // op25-check.sh read this line
-            p_eprint_str("iropt: quietcall " + int_to_str(iro_count_ones(& g_iro_quiet)) + " quiet functions, dead calls removed in " + int_to_str(n_dcall) + " functions\n");
+            p_eprint_str("iropt: quietcall " + int_to_str(iro_count_ones(&g_iro_quiet)) + " quiet functions, dead calls removed in " + int_to_str(n_dcall) + " functions\n");
         }
         // OP25: calls the guard moved out of loops (licmguard), and how often
         // a call that writes nothing kept a memory fact (loadhoist, forward,
@@ -847,7 +861,7 @@ fn iro_imc_bit(b: bool, k: i64) -> i64 {
 
 /// `name` used by a function: its position goes to `out` when the module
 /// defines it, else it is folded into the hash `ext` (returned).
-fn iro_imc_name(module: & IrModule, name: str, out: & mut Vec<i64>, ext: i64) -> i64 {
+fn iro_imc_name(module: &IrModule, name: str, out: &mut Vec<i64>, ext: i64) -> i64 {
     var p: i64 = IrModule_fn_pos(module, name);
     if p >= 0 {
         out.push(p);
@@ -861,7 +875,7 @@ fn iro_imc_name(module: & IrModule, name: str, out: & mut Vec<i64>, ext: i64) ->
 /// implements the trait or that a MakeDyn of `f` makes (devirt and the
 /// effect masks look those up). Returns the hash of the names the module
 /// does not define.
-fn iro_imc_refs(module: & IrModule, f: & IrFunction, out: & mut Vec<i64>) -> i64 {
+fn iro_imc_refs(module: &IrModule, f: &IrFunction, out: &mut Vec<i64>) -> i64 {
     var ext: i64 = 0;
     var methods: Vec<str> = Vec::new();
     var types: Vec<str> = Vec::new();
@@ -913,7 +927,7 @@ fn iro_imc_refs(module: & IrModule, f: & IrFunction, out: & mut Vec<i64>) -> i64
 /// The memo's view of `module` before the loop (`reach`: what the loop
 /// runs on when `has_main`). Hashes every function the loop runs on now,
 /// before it changes any.
-fn iro_imc_prepare(module: & IrModule, reach: i64, has_main: bool) -> IroImc {
+fn iro_imc_prepare(module: &IrModule, reach: i64, has_main: bool) -> IroImc {
     var m: IroImc = iro_imc_empty();
     m.budget = IRO_IMC_BUDGET;
     var j: i64 = 0;
@@ -921,7 +935,7 @@ fn iro_imc_prepare(module: & IrModule, reach: i64, has_main: bool) -> IroImc {
         var ent: IrFunctionEntry = module.functions.get(j);
         var f: IrFunction = ent.func;
         var rs: Vec<i64> = Vec::new();
-        m.ext.push(iro_imc_refs(module, & f, & mut rs));
+        m.ext.push(iro_imc_refs(module, &f, &mut rs));
         m.refs.push(rs);
         m.mark.push(0);
         if !has_main || HashMap_contains(reach, ent.name) {
@@ -939,7 +953,7 @@ fn iro_imc_prepare(module: & IrModule, reach: i64, has_main: bool) -> IroImc {
 /// The run's switches (`flags`, iropt_native) and the module's tables a
 /// per-function pass may consult: the environment the passes read, the
 /// trait tables, externs, C callbacks, globals and struct names.
-fn iro_imc_salt(module: & IrModule, flags: i64) -> i64 {
+fn iro_imc_salt(module: &IrModule, flags: i64) -> i64 {
     var h: i64 = mec_mix(MEC_IROPT, flags);
     h = mec_mix(h, imc_env_h("FID_IROPT_OFF"));
     h = mec_mix(h, imc_env_h("FID_IROPT_ON"));
@@ -1002,7 +1016,7 @@ fn iro_imc_salt(module: & IrModule, flags: i64) -> i64 {
 /// undefined names it uses, whether the loop runs on it, and which member
 /// is `i` (a member before `i` is seen by the passes after its own passes,
 /// one after it before).
-fn iro_imc_key(imc: & mut IroImc, module: & IrModule, i: i64, salt: i64) -> i64 {
+fn iro_imc_key(imc: &mut IroImc, module: &IrModule, i: i64, salt: i64) -> i64 {
     if imc.budget <= 0 || i < 0 || i >= imc.pre_h.len() {
         return 0;
     }
@@ -1058,7 +1072,7 @@ fn iro_imc_key(imc: & mut IroImc, module: & IrModule, i: i64, salt: i64) -> i64 
 
 /// Run pass `name` on `f`, adding its time to the table when `stats`.
 /// Fides calls are resolved statically, so the name dispatches.
-fn iro_time(names: & mut Vec<str>, ms: & mut Vec<i64>, hits: & mut Vec<i64>, name: str, stats: bool, f: & mut IrFunction) -> bool {
+fn iro_time(names: &mut Vec<str>, ms: &mut Vec<i64>, hits: &mut Vec<i64>, name: str, stats: bool, f: &mut IrFunction) -> bool {
     // RL20: "[iropt] <pass> <fn>" under FID_CRASH_TRACE (iropt_me.fd)
     ime_trace(name, f.name);
     var t0: i64 = 0;
@@ -1106,7 +1120,7 @@ fn iro_time(names: & mut Vec<str>, ms: & mut Vec<i64>, hits: & mut Vec<i64>, nam
         // OP3: the pass changed `f`; use lists cached before no longer hold
         iro_uses_forget();
     }
-    if changed && !tv_after(name, & tv_pre, f) {
+    if changed && !tv_after(name, &tv_pre, f) {
         changed = false;
     }
     iro_time_note(names, ms, hits, name, stats, t0);
@@ -1123,7 +1137,7 @@ fn iro_clock(stats: bool) -> i64 {
 
 /// ME20: the functions main reaches, as a HashMap from name (for
 /// ime_inline_reached); 0 when the module has no main (every function).
-fn iro_inline_reach(module: & IrModule) -> i64 {
+fn iro_inline_reach(module: &IrModule) -> i64 {
     var has_main: bool = false;
     var i: i64 = 0;
     while i < module.functions.len() && !has_main {
@@ -1166,7 +1180,7 @@ fn iro_inline_reach(module: & IrModule) -> i64 {
 /// SP3: the functions the mid-end works on: a HashMap of the names main
 /// reaches (pe_ir_reachable_functions), or 0 (every function) when the
 /// module has no main or FID_IROPT_OFF names `midreach`.
-pub fn iro_mid_reach(module: & IrModule) -> i64 {
+pub fn iro_mid_reach(module: &IrModule) -> i64 {
     if !iro_pass_on("midreach") {
         return 0;
     }
@@ -1186,7 +1200,7 @@ pub fn iro_in_reach(reach: i64, name: str) -> bool {
 /// An empty Vec when `reach` is 0: every function. The facts of a function
 /// in the set depend only on functions in the set, so they are the same as
 /// when every function is analysed.
-fn iro_call_closure(module: & IrModule, reach: i64) -> Vec<i64> {
+fn iro_call_closure(module: &IrModule, reach: i64) -> Vec<i64> {
     var in_set: Vec<i64> = Vec::new();
     if reach == 0 {
         return in_set;
@@ -1226,7 +1240,7 @@ fn iro_call_closure(module: & IrModule, reach: i64) -> Vec<i64> {
 }
 
 /// SP3: is position `i` in `keep` (iro_call_closure; empty: every one)?
-fn iro_kept_at(keep: & Vec<i64>, i: i64) -> bool {
+fn iro_kept_at(keep: &Vec<i64>, i: i64) -> bool {
     return keep.len() == 0 || (i < keep.len() && keep.get(i) == 1);
 }
 
@@ -1234,7 +1248,7 @@ fn iro_kept_at(keep: & Vec<i64>, i: i64) -> bool {
 /// (one call more), when `stats`. For what iro_time cannot dispatch: the
 /// module passes, the passes that read the module (devirt), and the
 /// opt-in iropt_me passes together ("midend").
-fn iro_time_note(names: & mut Vec<str>, ms: & mut Vec<i64>, hits: & mut Vec<i64>, name: str, stats: bool, t0: i64) {
+fn iro_time_note(names: &mut Vec<str>, ms: &mut Vec<i64>, hits: &mut Vec<i64>, name: str, stats: bool, t0: i64) {
     if !stats {
         return;
     }
@@ -1257,7 +1271,7 @@ fn iro_time_note(names: & mut Vec<str>, ms: & mut Vec<i64>, hits: & mut Vec<i64>
 
 /// Instruction `to` of `f` gets the source line of instruction `from` of
 /// `src` (only the line: its type, region and effects stay).
-fn iro_copy_line(src: & IrFunction, from: i64, f: & mut IrFunction, to: i64) {
+fn iro_copy_line(src: &IrFunction, from: i64, f: &mut IrFunction, to: i64) {
     // DB1: inlined code keeps the file it came from (ir.fd)
     ir_copy_value_file(src.name, from, f.name, to);
     match IrFunction_get_meta(src, from) {
@@ -1278,7 +1292,7 @@ fn iro_copy_line(src: & IrFunction, from: i64, f: & mut IrFunction, to: i64) {
 }
 
 /// A new instruction in `f` that is in no block yet.
-fn iro_detached(f: & mut IrFunction, inst: Inst) -> i64 {
+fn iro_detached(f: &mut IrFunction, inst: Inst) -> i64 {
     var id: i64 = IrFunction_emit(f, inst);
     var last: i64 = f.current_block_idx;
     var blk: BasicBlock = f.blocks.get(last);
@@ -1478,9 +1492,9 @@ pub struct IroBody {
     pub ret: i64,
 }
 
-fn iro_body(callee: & IrFunction, caller: & IrFunction, site: i64) -> IroBody {
+fn iro_body(callee: &IrFunction, caller: &IrFunction, site: i64) -> IroBody {
     var none: IroBody = IroBody {
-        insts: Vec::new(), ret: - 1
+        insts: Vec::new(), ret: -1
     };
     if callee.blocks.len() != 1 {
         return none;
@@ -1515,7 +1529,7 @@ fn iro_body(callee: & IrFunction, caller: & IrFunction, site: i64) -> IroBody {
         return none;
     }
     var body: Vec<i64> = Vec::new();
-    var ret: i64 = - 1;
+    var ret: i64 = -1;
     var i: i64 = 0;
     while i < ids.len() {
         var id: i64 = ids.get(i);
@@ -1591,7 +1605,7 @@ pub fn iropt_inline_remarks(filt: str) -> Vec<str> {
 
 /// Why iro_body does not inline `callee` into `caller` (its tests in its
 /// order), or "" when it would.
-fn iro_not_inlined_why(callee: & IrFunction, caller: & IrFunction, site: i64) -> str {
+fn iro_not_inlined_why(callee: &IrFunction, caller: &IrFunction, site: i64) -> str {
     if callee.blocks.len() != 1 {
         return "more than one block (" + int_to_str(callee.blocks.len()) + "): only straight-line callees are inlined";
     }
@@ -1648,7 +1662,7 @@ fn iro_not_inlined_why(callee: & IrFunction, caller: & IrFunction, site: i64) ->
                     }
                     _ => {
                         if !iro_inlinable_inst(inst) {
-                            return "it does " + inst_kind_name(& inst) + " (calls, prints, memory and regions are not inlined)";
+                            return "it does " + inst_kind_name(&inst) + " (calls, prints, memory and regions are not inlined)";
                         }
                     }
                 }
@@ -1663,7 +1677,7 @@ fn iro_not_inlined_why(callee: & IrFunction, caller: & IrFunction, site: i64) ->
 }
 
 /// Note why `callee` was not inlined into `caller` (once per pair).
-fn iro_remark_inline(caller: & IrFunction, callee: & IrFunction, why: str) {
+fn iro_remark_inline(caller: &IrFunction, callee: &IrFunction, why: str) {
     if str_len(why) == 0 {
         return;
     }
@@ -1679,13 +1693,13 @@ fn iro_remark_inline(caller: & IrFunction, callee: & IrFunction, why: str) {
 }
 
 /// Inline small functions at their call sites, in every function.
-pub fn iro_inline(module: & mut IrModule) {
+pub fn iro_inline(module: &mut IrModule) {
     iro_inline_in(module, 0);
 }
 
 /// SP3: iro_inline into the functions `reach` (iro_mid_reach) holds only;
 /// `reach` 0: every function.
-pub fn iro_inline_in(module: & mut IrModule, reach: i64) {
+pub fn iro_inline_in(module: &mut IrModule, reach: i64) {
     var fi: i64 = 0;
     while fi < module.functions.len() {
         var entry: IrFunctionEntry = module.functions.get(fi);
@@ -1694,7 +1708,7 @@ pub fn iro_inline_in(module: & mut IrModule, reach: i64) {
             continue;
         }
         var f: IrFunction = entry.func;
-        if iro_inline_function(module, & mut f) {
+        if iro_inline_function(module, &mut f) {
             entry.func = f;
             module.functions.set(fi, entry);
         }
@@ -1702,7 +1716,7 @@ pub fn iro_inline_in(module: & mut IrModule, reach: i64) {
     }
 }
 
-fn iro_inline_function(module: & IrModule, f: & mut IrFunction) -> bool {
+fn iro_inline_function(module: &IrModule, f: &mut IrFunction) -> bool {
     var changed: bool = false;
     var b: i64 = 0;
     while b < f.blocks.len() {
@@ -1721,9 +1735,9 @@ fn iro_inline_function(module: & IrModule, f: & mut IrFunction) -> bool {
                                 match IrModule_get_function(module, name) {
                                     OptIrFunction::Some(callee) => {
                                         // OP30: the call's block weighs it (a block profile)
-                                        var body: IroBody = iro_body(& callee, f, blk.id);
+                                        var body: IroBody = iro_body(&callee, f, blk.id);
                                         if g_iro_remarks_on && body.ret < 0 {
-                                            iro_remark_inline(f, & callee, iro_not_inlined_why(& callee, f, blk.id));
+                                            iro_remark_inline(f, &callee, iro_not_inlined_why(&callee, f, blk.id));
                                         }
                                         if body.ret >= 0 && callee.params.len() == args.len() {
                                             // callee value -> caller value + 1
@@ -1744,12 +1758,12 @@ fn iro_inline_function(module: & IrModule, f: & mut IrFunction) -> bool {
                                             var q: i64 = 0;
                                             while q < body.insts.len() {
                                                 var cid: i64 = body.insts.get(q);
-                                                match IrFunction_get_inst(& callee, cid) {
+                                                match IrFunction_get_inst(&callee, cid) {
                                                     OptInst::Some(cinst) => {
                                                         var nid: i64 = iro_detached(f, iro_remap(cinst, map));
                                                         // the callee's source line (a panic in inlined
                                                         // code says where, as the interpreter does)
-                                                        iro_copy_line(& callee, cid, f, nid);
+                                                        iro_copy_line(&callee, cid, f, nid);
                                                         if cid < map.len() {
                                                             map.set(cid, nid + 1);
                                                         }
@@ -1793,7 +1807,7 @@ fn iro_inline_function(module: & IrModule, f: & mut IrFunction) -> bool {
 
 // --- Constant folding (release D6) ------------------------------------------
 
-fn iro_const_int(f: & IrFunction, id: i64) -> OptI64 {
+fn iro_const_int(f: &IrFunction, id: i64) -> OptI64 {
     match IrFunction_get_inst(f, id) {
         OptInst::Some(inst) => {
             match inst {
@@ -1816,10 +1830,12 @@ fn iro_const_int(f: & IrFunction, id: i64) -> OptI64 {
     return OptI64::None;
 }
 
-const IRO_I64_MAX: i64 = 9223372036854775807; const IRO_SQRT_MAX: i64 = 3037000499;  /// Fold integer BinOps of two i64 constants. Arithmetic is folded only when
+const IRO_I64_MAX: i64 = 9223372036854775807;
+const IRO_SQRT_MAX: i64 = 3037000499;
+/// Fold integer BinOps of two i64 constants. Arithmetic is folded only when
 /// it cannot overflow (an overflow must still panic at run time), division
 /// and remainder never (a zero divisor must panic too).
-fn iro_fold(f: & mut IrFunction) -> bool {
+fn iro_fold(f: &mut IrFunction) -> bool {
     var changed: bool = false;
     var b: i64 = 0;
     while b < f.blocks.len() {
@@ -1965,7 +1981,7 @@ fn iro_pure(inst: Inst) -> bool {
 }
 
 /// Drop pure values nothing reads (folding leaves their operands unused).
-fn iro_dce(f: & mut IrFunction) -> bool {
+fn iro_dce(f: &mut IrFunction) -> bool {
     var any: bool = false;
     var round: i64 = 0;
     while round < 3 {
@@ -1983,7 +1999,7 @@ fn iro_dce(f: & mut IrFunction) -> bool {
                 match IrFunction_get_inst(f, ids.get(k)) {
                     OptInst::Some(inst) => {
                         var ops: Vec<i64> = Vec::new();
-                        peir_inst_operands(inst, & mut ops);
+                        peir_inst_operands(inst, &mut ops);
                         var o: i64 = 0;
                         while o < ops.len() {
                             var v: i64 = ops.get(o);
@@ -2042,13 +2058,14 @@ fn iro_dce(f: & mut IrFunction) -> bool {
 
 // --- Induction-variable strength reduction (OP10) ----------------------------
 
-const IRO_IV: bool = true; fn iro_iv_dbg() -> bool {
+const IRO_IV: bool = true;
+fn iro_iv_dbg() -> bool {
     var d: str = p_getenv("FID_IV_DBG");
     return (d as i64) != 0 && str_len(d) > 0;
 }
 
 /// Insert a detached instruction into block `bi` at position `pos`.
-fn iro_iv_insert(f: & mut IrFunction, bi: i64, pos: i64, inst: Inst) -> i64 {
+fn iro_iv_insert(f: &mut IrFunction, bi: i64, pos: i64, inst: Inst) -> i64 {
     var id: i64 = iro_detached(f, inst);
     var blk: BasicBlock = f.blocks.get(bi);
     var ids: Vec<i64> = Vec::new();
@@ -2069,7 +2086,7 @@ fn iro_iv_insert(f: & mut IrFunction, bi: i64, pos: i64, inst: Inst) -> i64 {
 }
 
 /// `id` as a `Load` of local `loc`, or -1.
-fn iro_iv_load_of(f: & IrFunction, id: i64, loc: i64) -> bool {
+fn iro_iv_load_of(f: &IrFunction, id: i64, loc: i64) -> bool {
     match peir_inst_of(f, id) {
         Inst::Load(p, _) => {
             return p == loc;
@@ -2081,11 +2098,11 @@ fn iro_iv_load_of(f: & IrFunction, id: i64, loc: i64) -> bool {
 }
 
 /// `sv` as `Load(loc) + ConstInt` or `Load(loc) - ConstInt`: the step, or none.
-fn iro_iv_step(f: & IrFunction, sv: i64, loc: i64) -> OptI64 {
+fn iro_iv_step(f: &IrFunction, sv: i64, loc: i64) -> OptI64 {
     match peir_inst_of(f, sv) {
         Inst::BinOp(op, a, b, _) => {
             var sgn: i64 = 0;
-            var cid: i64 = - 1;
+            var cid: i64 = -1;
             if binop_eq(op, BinOp::Add) {
                 if iro_iv_load_of(f, a, loc) {
                     cid = b;
@@ -2097,7 +2114,7 @@ fn iro_iv_step(f: & IrFunction, sv: i64, loc: i64) -> OptI64 {
             } else if binop_eq(op, BinOp::Sub) {
                 if iro_iv_load_of(f, a, loc) {
                     cid = b;
-                    sgn = - 1;
+                    sgn = -1;
                 }
             }
             if cid < 0 {
@@ -2125,7 +2142,7 @@ fn iro_iv_step(f: & IrFunction, sv: i64, loc: i64) -> OptI64 {
 /// same store — the shadow and the product stay in the same epoch
 /// because the multiply's load and the multiply sit in one block with
 /// no `Store(L)` between them.
-fn iro_iv_loop(f: & mut IrFunction, cfg: & IroCfg, head: i64, lat: Vec<i64>, lbody: Vec<i64>, plain: Vec<i64>, flags: Vec<i64>) -> bool {
+fn iro_iv_loop(f: &mut IrFunction, cfg: &IroCfg, head: i64, lat: Vec<i64>, lbody: Vec<i64>, plain: Vec<i64>, flags: Vec<i64>) -> bool {
     var n: i64 = f.blocks.len();
     var dbg: bool = iro_iv_dbg();
     if dbg {
@@ -2138,7 +2155,7 @@ fn iro_iv_loop(f: & mut IrFunction, cfg: & IroCfg, head: i64, lat: Vec<i64>, lbo
     // loop's test (iro_iv_bounded)
     var bounded_ok: bool = !iro_named_off(p_getenv("FID_IROPT_OFF"), "ivbound");
     // The one outside predecessor of the header, ending in a jump
-    var pre: i64 = - 1;
+    var pre: i64 = -1;
     var hp: Vec<i64> = cfg.preds.get(head);
     i = 0;
     while i < hp.len() {
@@ -2262,9 +2279,9 @@ fn iro_iv_loop(f: & mut IrFunction, cfg: & IroCfg, head: i64, lat: Vec<i64>, lbo
                         // FID_IROPT_OFF=ivbound: @wrapping only again)
                         if binop_eq(op, BinOp::Mul) && ir_type_eq(t, IrType::I64) {
                             if f.is_wrapping || bounded_ok {
-                                var vi: i64 = - 1;
-                                var ci: i64 = - 1;
-                                var li: i64 = - 1;
+                                var vi: i64 = -1;
+                                var ci: i64 = -1;
+                                var li: i64 = -1;
                                 // operand forms: Mul(load, const) or Mul(const, load)
                                 i = 0;
                                 while i < iv_loc.len() {
@@ -2285,8 +2302,8 @@ fn iro_iv_loop(f: & mut IrFunction, cfg: & IroCfg, head: i64, lat: Vec<i64>, lbo
                                         OptI64::Some(c) => {
                                             // the load must be in this block, before
                                             // w, with no Store(L) between them
-                                            var lp: i64 = - 1;
-                                            var stp: i64 = - 1;
+                                            var lp: i64 = -1;
+                                            var stp: i64 = -1;
                                             var loc3: i64 = iv_loc.get(vi);
                                             var k4: i64 = 0;
                                             while k4 < ids3.len() {
@@ -2315,7 +2332,7 @@ fn iro_iv_loop(f: & mut IrFunction, cfg: & IroCfg, head: i64, lat: Vec<i64>, lbo
                                             }
                                             if lp >= 0 && lp < k3 && stp < 0 && fits {
                                                 // shadow for (iv, c) once
-                                                var si: i64 = - 1;
+                                                var si: i64 = -1;
                                                 i = 0;
                                                 while i < sh_loc.len() {
                                                     if sh_iv.get(i) == vi && sh_c.get(i) == c {
@@ -2323,7 +2340,7 @@ fn iro_iv_loop(f: & mut IrFunction, cfg: & IroCfg, head: i64, lat: Vec<i64>, lbo
                                                     }
                                                     i = i + 1;
                                                 }
-                                                var slot: i64 = - 1;
+                                                var slot: i64 = -1;
                                                 if si < 0 {
                                                     slot = iro_iv_insert(f, 0, 0, Inst::Alloca(IrType::I64, Region::Stack));
                                                     var lastp: i64 = f.blocks.get(pre).instructions.len() - 1;
@@ -2373,14 +2390,14 @@ fn iro_iv_loop(f: & mut IrFunction, cfg: & IroCfg, head: i64, lat: Vec<i64>, lbo
     return changed;
 }
 
-fn iro_iv(f: & mut IrFunction) -> bool {
+fn iro_iv(f: &mut IrFunction) -> bool {
     var cfg: IroCfg = iro_cfg(f);
     if cfg.n == 0 {
         return false;
     }
     // ME2: the shared loop tree (back edges to a dominating header); a
     // function without loops skips the facts below
-    var loops: IroLoops = iro_loops(& cfg);
+    var loops: IroLoops = iro_loops(&cfg);
     if loops.headers.len() == 0 {
         return false;
     }
@@ -2394,7 +2411,7 @@ fn iro_iv(f: & mut IrFunction) -> bool {
     var head: i64 = cfg.n - 1;
     while head >= 0 {
         if latches.get(head).len() > 0 {
-            if iro_iv_loop(f, & cfg, head, latches.get(head), iro_loop_body(& loops, head), plain, flags) {
+            if iro_iv_loop(f, &cfg, head, latches.get(head), iro_loop_body(&loops, head), plain, flags) {
                 changed = true;
             }
         }
@@ -2405,8 +2422,9 @@ fn iro_iv(f: & mut IrFunction) -> bool {
 
 // --- Loop-invariant code motion ---------------------------------------------
 
-const IRO_LICM: bool = true;  /// A local only loads and stores use (its address goes nowhere).
-fn iro_plain_locals(f: & IrFunction) -> Vec<i64> {
+const IRO_LICM: bool = true;
+/// A local only loads and stores use (its address goes nowhere).
+fn iro_plain_locals(f: &IrFunction) -> Vec<i64> {
     var plain: Vec<i64> = peir_zeros(f.next_value + 1);
     var i: i64 = 0;
     while i < f.insts.len() {
@@ -2426,7 +2444,7 @@ fn iro_plain_locals(f: & IrFunction) -> Vec<i64> {
     while i < f.insts.len() {
         var inst: Inst = f.insts.get(i).inst;
         var ops: Vec<i64> = Vec::new();
-        peir_inst_operands(inst, & mut ops);
+        peir_inst_operands(inst, &mut ops);
         var o: i64 = 0;
         while o < ops.len() {
             var v: i64 = ops.get(o);
@@ -2463,7 +2481,7 @@ fn iro_len_safe_call(name: str) -> bool {
 /// must neither panic nor do anything a caller could see (iro_removable:
 /// constants, address arithmetic, comparisons, bit operations, widening, a
 /// load of a plain local), or be a stack slot.
-fn iro_licm_quiet(inst: Inst, plain: & Vec<i64>) -> bool {
+fn iro_licm_quiet(inst: Inst, plain: &Vec<i64>) -> bool {
     match inst {
         Inst::Alloca(_, _) => {
             return true;
@@ -2476,7 +2494,7 @@ fn iro_licm_quiet(inst: Inst, plain: & Vec<i64>) -> bool {
 
 /// Is value `id` of `f` a constant (no operands: it may move to any block
 /// that dominates its use)?
-fn iro_licm_const(f: & IrFunction, id: i64) -> bool {
+fn iro_licm_const(f: &IrFunction, id: i64) -> bool {
     match peir_inst_of(f, id) {
         Inst::ConstInt(_, _) => {
             return true;
@@ -2504,7 +2522,7 @@ fn iro_vec_without(xs: Vec<i64>, v: i64) -> Vec<i64> {
 }
 
 /// How many times each value of `f` is read by an instruction of a block.
-fn iro_use_counts(f: & IrFunction) -> Vec<i64> {
+fn iro_use_counts(f: &IrFunction) -> Vec<i64> {
     var cnt: Vec<i64> = peir_zeros(f.next_value + 1);
     var b: i64 = 0;
     while b < f.blocks.len() {
@@ -2512,7 +2530,7 @@ fn iro_use_counts(f: & IrFunction) -> Vec<i64> {
         var k: i64 = 0;
         while k < ids.len() {
             var ops: Vec<i64> = Vec::new();
-            peir_inst_operands(peir_inst_of(f, ids.get(k)), & mut ops);
+            peir_inst_operands(peir_inst_of(f, ids.get(k)), &mut ops);
             var o: i64 = 0;
             while o < ops.len() {
                 var v: i64 = ops.get(o);
@@ -2532,7 +2550,7 @@ fn iro_use_counts(f: & IrFunction) -> Vec<i64> {
 /// by the effect masks (tv.fd tv_licm trusts them, as it trusts the call
 /// sites' effect annotations): 2 a quiet call, 1 one with no effect but a
 /// panic.
-fn iro_tv_licm_calls(module: & IrModule, masks: & Vec<i64>, f: & IrFunction) {
+fn iro_tv_licm_calls(module: &IrModule, masks: &Vec<i64>, f: &IrFunction) {
     var b: i64 = 0;
     while b < f.blocks.len() {
         var ids: Vec<i64> = f.blocks.get(b).instructions;
@@ -2540,9 +2558,9 @@ fn iro_tv_licm_calls(module: & IrModule, masks: & Vec<i64>, f: & IrFunction) {
         while k < ids.len() {
             match peir_inst_of(f, ids.get(k)) {
                 Inst::Call(cn, _cargs, crt, ce) => {
-                    if iro_quiet_call(module, masks, cn, & ce, crt, false) && !ir_type_eq(crt, IrType::Void) {
+                    if iro_quiet_call(module, masks, cn, &ce, crt, false) && !ir_type_eq(crt, IrType::Void) {
                         tv_trust_call(cn, 2);
-                    } else if iro_licm_pure_call(module, masks, cn, & ce, crt) {
+                    } else if iro_licm_pure_call(module, masks, cn, &ce, crt) {
                         tv_trust_call(cn, 1);
                     }
                 }
@@ -2561,7 +2579,7 @@ fn iro_tv_licm_calls(module: & IrModule, masks: & Vec<i64>, f: & IrFunction) {
 /// prints nothing (iro_effect_masks); a panic is allowed (iro_licm_loop
 /// keeps it where it would have been seen). Its result is an integer or a
 /// bool, so no owner or drop goes with it.
-fn iro_licm_pure_call(module: & IrModule, masks: & Vec<i64>, name: str, site: & EffectSet, ret: IrType) -> bool {
+fn iro_licm_pure_call(module: &IrModule, masks: &Vec<i64>, name: str, site: &EffectSet, ret: IrType) -> bool {
     if masks.len() == 0 {
         return false;
     }
@@ -2577,7 +2595,7 @@ fn iro_licm_pure_call(module: & IrModule, masks: & Vec<i64>, name: str, site: & 
 
 /// Loop-invariant code motion (OP9). `masks` is iro_effect_masks(module)
 /// (empty: no call but `len` moves, OP25).
-fn iro_licm(module: & IrModule, masks: & Vec<i64>, f: & mut IrFunction) -> bool {
+fn iro_licm(module: &IrModule, masks: &Vec<i64>, f: &mut IrFunction) -> bool {
     if f.blocks.len() < 2 {
         return false;
     }
@@ -2585,7 +2603,7 @@ fn iro_licm(module: & IrModule, masks: & Vec<i64>, f: & mut IrFunction) -> bool 
     // that dominates them)
     var cfg: IroCfg = iro_cfg(f);
     var n: i64 = cfg.n;
-    var loops: IroLoops = iro_loops(& cfg);
+    var loops: IroLoops = iro_loops(&cfg);
     if loops.headers.len() == 0 {
         return false;
     }
@@ -2598,7 +2616,7 @@ fn iro_licm(module: & IrModule, masks: & Vec<i64>, f: & mut IrFunction) -> bool 
     // Which block defines each value (-1: a parameter, or none)
     var def_b: Vec<i64> = Vec::new();
     while def_b.len() <= f.next_value {
-        def_b.push(- 1);
+        def_b.push(-1);
     }
     b = 0;
     while b < n {
@@ -2617,7 +2635,7 @@ fn iro_licm(module: & IrModule, masks: & Vec<i64>, f: & mut IrFunction) -> bool 
     var head: i64 = n - 1;
     while head >= 0 {
         if latches.get(head).len() > 0 {
-            if iro_licm_loop(module, masks, f, head, iro_loop_body(& loops, head), preds, n, plain, uses, & mut def_b) {
+            if iro_licm_loop(module, masks, f, head, iro_loop_body(&loops, head), preds, n, plain, uses, &mut def_b) {
                 changed = true;
             }
         }
@@ -2637,12 +2655,12 @@ fn iro_licm(module: & IrModule, masks: & Vec<i64>, f: & mut IrFunction) -> bool 
 // computed, and its panic raised, at the same point as the first time it
 // was, with nothing a program could see in between; and its operands do
 // not change, so every later iteration would compute the same value.
-fn iro_licm_loop(module: & IrModule, masks: & Vec<i64>, f: & mut IrFunction, head: i64, lbody: Vec<i64>, preds: Vec<Vec<i64>>, n: i64, plain: Vec<i64>, uses: Vec<i64>, def_b: & mut Vec<i64>) -> bool {
+fn iro_licm_loop(module: &IrModule, masks: &Vec<i64>, f: &mut IrFunction, head: i64, lbody: Vec<i64>, preds: Vec<Vec<i64>>, n: i64, plain: Vec<i64>, uses: Vec<i64>, def_b: &mut Vec<i64>) -> bool {
     // ME2: the loop's blocks from the shared loop tree (iro_loop_body)
     var body: Vec<i64> = lbody;
     var i: i64 = 0;
     // The one block that enters the loop, by a jump to its header
-    var pre: i64 = - 1;
+    var pre: i64 = -1;
     var hp: Vec<i64> = preds.get(head);
     i = 0;
     while i < hp.len() {
@@ -2732,14 +2750,14 @@ fn iro_licm_loop(module: & IrModule, masks: & Vec<i64>, f: & mut IrFunction, hea
                             if !can {
                                 // OP25: a call with no effect but a panic
                                 // (its arguments are checked below)
-                                can = quiet && iro_licm_pure_call(module, masks, cn, & ce, crt);
+                                can = quiet && iro_licm_pure_call(module, masks, cn, &ce, crt);
                             }
                             if !can {
                                 // OP25 (quietcall): from any block, a call
                                 // that ends, never panics and touches no
                                 // memory: running it ahead of time changes
                                 // nothing but when its value is computed
-                                can = iro_quiet_call(module, masks, cn, & ce, crt, false) && !ir_type_eq(crt, IrType::Void);
+                                can = iro_quiet_call(module, masks, cn, &ce, crt, false) && !ir_type_eq(crt, IrType::Void);
                             }
                         }
                         Inst::UnaryOp(_, _, uty) => {
@@ -2803,7 +2821,7 @@ fn iro_licm_loop(module: & IrModule, masks: & Vec<i64>, f: & mut IrFunction, hea
                     if can {
                         // every operand from outside the loop (or already moved)
                         var ops: Vec<i64> = Vec::new();
-                        peir_inst_operands(inst, & mut ops);
+                        peir_inst_operands(inst, &mut ops);
                         var o: i64 = 0;
                         while o < ops.len() {
                             var ov: i64 = ops.get(o);
@@ -2846,7 +2864,7 @@ fn iro_licm_loop(module: & IrModule, masks: & Vec<i64>, f: & mut IrFunction, hea
                         keep.push(id);
                         // what may panic or be seen stays here: nothing
                         // after it may move ahead of it
-                        if quiet && !iro_licm_quiet(inst, & plain) {
+                        if quiet && !iro_licm_quiet(inst, &plain) {
                             quiet = false;
                         }
                     }
@@ -2906,14 +2924,14 @@ fn iro_stats_on() -> bool {
 
 // --- Renaming every operand -------------------------------------------------
 
-fn iro_mm(map: & Vec<i64>, id: i64) -> i64 {
+fn iro_mm(map: &Vec<i64>, id: i64) -> i64 {
     if id >= 0 && id < map.len() && map.get(id) != 0 {
         return map.get(id) - 1;
     }
     return id;
 }
 
-fn iro_mm_vec(map: & Vec<i64>, v: Vec<i64>) -> Vec<i64> {
+fn iro_mm_vec(map: &Vec<i64>, v: Vec<i64>) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     var i: i64 = 0;
     while i < v.len() {
@@ -2926,7 +2944,7 @@ fn iro_mm_vec(map: & Vec<i64>, v: Vec<i64>) -> Vec<i64> {
 /// `inst` with every operand renamed through `map` (id -> new id + 1).
 /// TryUnwrap and Asm are left as they are: iro_unhandled_uses keeps their
 /// operands from being renamed.
-fn iro_remap_all(inst: Inst, map: & Vec<i64>) -> Inst {
+fn iro_remap_all(inst: Inst, map: &Vec<i64>) -> Inst {
     match inst {
         Inst::BinOp(op, a, b, t) => {
             return Inst::BinOp(op, iro_mm(map, a), iro_mm(map, b), t);
@@ -3010,7 +3028,7 @@ fn iro_remap_all(inst: Inst, map: & Vec<i64>) -> Inst {
 }
 
 /// Values a TryUnwrap or Asm reads: never renamed.
-fn iro_unhandled_uses(f: & IrFunction) -> Vec<i64> {
+fn iro_unhandled_uses(f: &IrFunction) -> Vec<i64> {
     var bad: Vec<i64> = peir_zeros(f.next_value + 1);
     var i: i64 = 0;
     while i < f.insts.len() {
@@ -3028,7 +3046,7 @@ fn iro_unhandled_uses(f: & IrFunction) -> Vec<i64> {
         }
         if mark {
             var ops: Vec<i64> = Vec::new();
-            peir_inst_operands(inst, & mut ops);
+            peir_inst_operands(inst, &mut ops);
             var o: i64 = 0;
             while o < ops.len() {
                 var v: i64 = ops.get(o);
@@ -3053,7 +3071,7 @@ fn iro_unhandled_uses(f: & IrFunction) -> Vec<i64> {
 }
 
 /// Rename operands in every instruction of `f`.
-fn iro_apply_map(f: & mut IrFunction, map: & Vec<i64>) {
+fn iro_apply_map(f: &mut IrFunction, map: &Vec<i64>) {
     var i: i64 = 0;
     while i < f.insts.len() {
         var entry: ValueIdInst = f.insts.get(i);
@@ -3072,7 +3090,8 @@ fn iro_apply_map(f: & mut IrFunction, map: & Vec<i64>) {
 // local comes between. Constants are left alone (the native backend keeps
 // a constant used in its own block as an immediate).
 
-const IRO_GVN: bool = true; fn iro_binop_code(op: BinOp) -> str {
+const IRO_GVN: bool = true;
+fn iro_binop_code(op: BinOp) -> str {
     match op {
         BinOp::Add => {
             return "a";
@@ -3180,7 +3199,7 @@ fn iro_gvn_key(inst: Inst) -> str {
     return "";
 }
 
-fn iro_gvn(f: & mut IrFunction) -> bool {
+fn iro_gvn(f: &mut IrFunction) -> bool {
     if f.blocks.len() == 0 {
         return false;
     }
@@ -3204,7 +3223,7 @@ fn iro_gvn(f: & mut IrFunction) -> bool {
         while k < ids.len() {
             var id: i64 = ids.get(k);
             if id >= 0 && id < map.len() {
-                var inst: Inst = iro_remap_all(peir_inst_of(f, id), & map);
+                var inst: Inst = iro_remap_all(peir_inst_of(f, id), &map);
                 match inst {
                     Inst::Store(sp, _, _) => {
                         if sp >= 0 && sp < lastload.len() {
@@ -3227,11 +3246,11 @@ fn iro_gvn(f: & mut IrFunction) -> bool {
                 }
                 var key: str = iro_gvn_key(inst);
                 if str_len(key) > 0 && bad.get(id) == 0 {
-                    var found: i64 = - 1;
+                    var found: i64 = -1;
                     if heads.contains(key) {
                         var e: i64 = heads.get(key);
                         while e >= 0 && found < 0 {
-                            if iro_dominates(& cfg, e_blk.get(e), b) {
+                            if iro_dominates(&cfg, e_blk.get(e), b) {
                                 found = e_id.get(e);
                             }
                             e = e_next.get(e);
@@ -3242,7 +3261,7 @@ fn iro_gvn(f: & mut IrFunction) -> bool {
                         dead.set(id, 1);
                         any = true;
                     } else {
-                        var prev: i64 = - 1;
+                        var prev: i64 = -1;
                         if heads.contains(key) {
                             prev = heads.get(key);
                         }
@@ -3274,7 +3293,7 @@ fn iro_gvn(f: & mut IrFunction) -> bool {
         }
         i = i + 1;
     }
-    iro_apply_map(f, & map);
+    iro_apply_map(f, &map);
     var b2: i64 = 0;
     while b2 < f.blocks.len() {
         var blk: BasicBlock = f.blocks.get(b2);
@@ -3302,7 +3321,8 @@ fn iro_gvn(f: & mut IrFunction) -> bool {
 // parameters' slots, jump to the start. The parameters move into locals a
 // new entry block sets up (the native backend keeps them in registers).
 
-const IRO_TAILCALL: bool = true; fn iro_tailcalls(f: & mut IrFunction) -> bool {
+const IRO_TAILCALL: bool = true;
+fn iro_tailcalls(f: &mut IrFunction) -> bool {
     var n: i64 = f.blocks.len();
     if n == 0 || f.is_interrupt {
         return false;
@@ -3316,7 +3336,7 @@ const IRO_TAILCALL: bool = true; fn iro_tailcalls(f: & mut IrFunction) -> bool {
         var k: i64 = 0;
         while k < ids.len() {
             var ops: Vec<i64> = Vec::new();
-            peir_inst_operands(peir_inst_of(f, ids.get(k)), & mut ops);
+            peir_inst_operands(peir_inst_of(f, ids.get(k)), &mut ops);
             var o: i64 = 0;
             while o < ops.len() {
                 var v: i64 = ops.get(o);
@@ -3424,7 +3444,7 @@ const IRO_TAILCALL: bool = true; fn iro_tailcalls(f: & mut IrFunction) -> bool {
             var id: i64 = blk.instructions.get(k2);
             var inst: Inst = peir_inst_of(f, id);
             var ops2: Vec<i64> = Vec::new();
-            peir_inst_operands(inst, & mut ops2);
+            peir_inst_operands(inst, &mut ops2);
             var touched: Vec<i64> = Vec::new();
             var o2: i64 = 0;
             while o2 < ops2.len() {
@@ -3440,7 +3460,7 @@ const IRO_TAILCALL: bool = true; fn iro_tailcalls(f: & mut IrFunction) -> bool {
                 o2 = o2 + 1;
             }
             if touched.len() > 0 {
-                IrFunction_set_inst(f, id, iro_remap_all(inst, & pmap));
+                IrFunction_set_inst(f, id, iro_remap_all(inst, &pmap));
                 var t: i64 = 0;
                 while t < touched.len() {
                     pmap.set(touched.get(t), 0);
@@ -3501,7 +3521,7 @@ fn peir_has_id(v: Vec<i64>, x: i64) -> bool {
 // --- The mid-end (llvm-roadmap Track ME) -----------------------------------
 
 /// Instructions in the blocks of `f` (ME30's measure).
-fn iro_count_insts(f: & IrFunction) -> i64 {
+fn iro_count_insts(f: &IrFunction) -> i64 {
     var n: i64 = 0;
     var b: i64 = 0;
     while b < f.blocks.len() {
@@ -3523,7 +3543,7 @@ pub struct IroUses {
     pub pos_of: Vec<i64>,
 }
 
-pub fn iro_uses(f: & IrFunction) -> IroUses {
+pub fn iro_uses(f: &IrFunction) -> IroUses {
     g_iro_uses_builds = g_iro_uses_builds + 1;
     var n: i64 = f.next_value + 1;
     var u: IroUses = IroUses {
@@ -3532,8 +3552,8 @@ pub fn iro_uses(f: & IrFunction) -> IroUses {
     var z: i64 = 0;
     while z < n {
         u.users.push(Vec::new());
-        u.block_of.push(- 1);
-        u.pos_of.push(- 1);
+        u.block_of.push(-1);
+        u.pos_of.push(-1);
         z = z + 1;
     }
     var b: i64 = 0;
@@ -3547,7 +3567,7 @@ pub fn iro_uses(f: & IrFunction) -> IroUses {
                 u.pos_of.set(id, k);
             }
             var ops: Vec<i64> = Vec::new();
-            peir_inst_operands(peir_inst_of(f, id), & mut ops);
+            peir_inst_operands(peir_inst_of(f, id), &mut ops);
             var o: i64 = 0;
             while o < ops.len() {
                 var v: i64 = ops.get(o);
@@ -3567,9 +3587,9 @@ pub fn iro_uses(f: & IrFunction) -> IroUses {
 }
 
 /// Instruction `id` no longer reads its operands (it is removed or replaced).
-fn iro_uses_drop(u: & mut IroUses, f: & IrFunction, id: i64) {
+fn iro_uses_drop(u: &mut IroUses, f: &IrFunction, id: i64) {
     var ops: Vec<i64> = Vec::new();
-    peir_inst_operands(peir_inst_of(f, id), & mut ops);
+    peir_inst_operands(peir_inst_of(f, id), &mut ops);
     var o: i64 = 0;
     while o < ops.len() {
         var v: i64 = ops.get(o);
@@ -3584,22 +3604,22 @@ fn iro_uses_drop(u: & mut IroUses, f: & IrFunction, id: i64) {
 /// fresh instructions after `u` was built). count/block_of/pos_of stay
 /// exact; the `users` lists only grow, so a dropped use still lists its
 /// former user — passes that consume `users` must rebuild instead.
-fn iro_uses_grow(u: & mut IroUses, n: i64) {
+fn iro_uses_grow(u: &mut IroUses, n: i64) {
     while u.count.len() < n {
         u.count.push(0);
         var e: Vec<i64> = Vec::new();
         u.users.push(e);
-        u.block_of.push(- 1);
-        u.pos_of.push(- 1);
+        u.block_of.push(-1);
+        u.pos_of.push(-1);
     }
 }
 
 /// Instruction `id` now reads its operands (a replacement was stored).
 /// Grows `u` first so fresh ids are covered; keeps count and users exact.
-fn iro_uses_add_ops(u: & mut IroUses, f: & IrFunction, id: i64) {
+fn iro_uses_add_ops(u: &mut IroUses, f: &IrFunction, id: i64) {
     iro_uses_grow(u, f.next_value + 1);
     var ops: Vec<i64> = Vec::new();
-    peir_inst_operands(peir_inst_of(f, id), & mut ops);
+    peir_inst_operands(peir_inst_of(f, id), &mut ops);
     var o: i64 = 0;
     while o < ops.len() {
         var v: i64 = ops.get(o);
@@ -3615,10 +3635,10 @@ fn iro_uses_add_ops(u: & mut IroUses, f: & IrFunction, id: i64) {
 
 /// Fresh detached instruction `id` was inserted into block `b` (its
 /// operands, if any, still need `iro_uses_add_ops`).
-fn iro_uses_reg(u: & mut IroUses, id: i64, b: i64) {
+fn iro_uses_reg(u: &mut IroUses, id: i64, b: i64) {
     iro_uses_grow(u, id + 1);
     u.block_of.set(id, b);
-    u.pos_of.set(id, - 1);
+    u.pos_of.set(id, -1);
 }
 
 // --- OP3: use lists shared between passes ------------------------------------
@@ -3687,7 +3707,7 @@ pub fn iro_uses_forget() {
 /// What `iro_uses` reads of the shape of `f`: next_value (the size of its
 /// arrays), the block count, then per block its id, its instruction count
 /// and its instruction ids in order.
-fn iro_uses_key(f: & IrFunction) -> Vec<i64> {
+fn iro_uses_key(f: &IrFunction) -> Vec<i64> {
     var key: Vec<i64> = Vec::new();
     key.push(f.next_value);
     key.push(f.blocks.len());
@@ -3723,7 +3743,7 @@ fn iro_uses_same_key(a: Vec<i64>, b: Vec<i64>) -> bool {
 /// The use lists of `f` for a pass that reads them before it changes
 /// anything: the cached ones when no pass changed `f` since they were built
 /// (and its shape still matches), else built (and cached while armed).
-fn iro_uses_entry(f: & IrFunction) -> IroUses {
+fn iro_uses_entry(f: &IrFunction) -> IroUses {
     if !g_iro_uses_armed {
         return iro_uses(f);
     }
@@ -3745,7 +3765,7 @@ fn iro_uses_entry(f: & IrFunction) -> IroUses {
 }
 
 /// The block index whose id is `bid`, or -1.
-fn iro_block_index(f: & IrFunction, bid: i64) -> i64 {
+fn iro_block_index(f: &IrFunction, bid: i64) -> i64 {
     var b: i64 = 0;
     while b < f.blocks.len() {
         if f.blocks.get(b).id == bid {
@@ -3753,11 +3773,11 @@ fn iro_block_index(f: & IrFunction, bid: i64) -> i64 {
         }
         b = b + 1;
     }
-    return - 1;
+    return -1;
 }
 
 /// `id` without the predecessor `from` (an edge from it is gone).
-fn iro_drop_pred(f: & mut IrFunction, bid: i64, from: i64) {
+fn iro_drop_pred(f: &mut IrFunction, bid: i64, from: i64) {
     var bi: i64 = iro_block_index(f, bid);
     if bi < 0 {
         return;
@@ -3784,7 +3804,7 @@ fn iro_drop_pred(f: & mut IrFunction, bid: i64, from: i64) {
 // inlining), or whose two targets are one block, becomes a jump. The
 // block left out loses that predecessor; when nothing reaches it any more
 // the backends' unreachable-block handling drops or keeps it as before.
-fn iro_branch_fold(f: & mut IrFunction) -> bool {
+fn iro_branch_fold(f: &mut IrFunction) -> bool {
     var changed: bool = false;
     var b: i64 = 0;
     while b < f.blocks.len() {
@@ -3794,8 +3814,8 @@ fn iro_branch_fold(f: & mut IrFunction) -> bool {
             var tid: i64 = blk.instructions.get(nk - 1);
             match peir_inst_of(f, tid) {
                 Inst::Branch(c, t, e) => {
-                    var to: i64 = - 1;
-                    var gone: i64 = - 1;
+                    var to: i64 = -1;
+                    var gone: i64 = -1;
                     if t == e {
                         to = t;
                     } else {
@@ -3836,7 +3856,7 @@ fn iro_branch_fold(f: & mut IrFunction) -> bool {
 /// Remove the blocks no jump or branch from the entry reaches any more
 /// (a folded branch's other side), so no pass or backend sees code that
 /// uses values from blocks that no longer dominate it.
-fn iro_drop_unreachable(f: & mut IrFunction) {
+fn iro_drop_unreachable(f: &mut IrFunction) {
     var cfg: IroCfg = iro_cfg(f);
     if cfg.n == 0 {
         return;
@@ -3915,7 +3935,7 @@ fn iro_cmp_mirror(m: i64) -> i64 {
 /// instruction's comparison must be: 1, 0, or -1 when unsettled.
 fn iro_cmp_implied(possible: i64, inst_mask: i64) -> i64 {
     if inst_mask == 0 {
-        return - 1;
+        return -1;
     }
     if (possible & inst_mask) == possible {
         return 1;
@@ -3923,11 +3943,11 @@ fn iro_cmp_implied(possible: i64, inst_mask: i64) -> i64 {
     if (possible & inst_mask) == 0 {
         return 0;
     }
-    return - 1;
+    return -1;
 }
 
 /// A ConstBool `v` at the head of block `bi`; its id.
-fn iro_bool_before(f: & mut IrFunction, bi: i64, v: bool) -> i64 {
+fn iro_bool_before(f: &mut IrFunction, bi: i64, v: bool) -> i64 {
     var cid: i64 = iro_detached(f, Inst::ConstBool(v));
     var blk: BasicBlock = f.blocks.get(bi);
     var ids: Vec<i64> = Vec::new();
@@ -3944,7 +3964,7 @@ fn iro_bool_before(f: & mut IrFunction, bi: i64, v: bool) -> i64 {
 
 /// Rewrite every use of `v` in blocks dominated by `dom` to `cid`
 /// (`map` has `v` -> `cid` + 1 only). Use lists `u` find the candidates.
-fn iro_rewrite_uses(f: & mut IrFunction, u: & IroUses, cfg: & IroCfg, v: i64, dom: i64, map: & Vec<i64>) -> bool {
+fn iro_rewrite_uses(f: &mut IrFunction, u: &IroUses, cfg: &IroCfg, v: i64, dom: i64, map: &Vec<i64>) -> bool {
     var changed: bool = false;
     if v < 0 || v >= u.users.len() {
         return false;
@@ -3963,7 +3983,7 @@ fn iro_rewrite_uses(f: & mut IrFunction, u: & IroUses, cfg: & IroCfg, v: i64, do
     return changed;
 }
 
-fn iro_branch_facts(f: & mut IrFunction) -> bool {
+fn iro_branch_facts(f: &mut IrFunction) -> bool {
     if f.blocks.len() == 0 {
         return false;
     }
@@ -3986,9 +4006,9 @@ fn iro_branch_facts(f: & mut IrFunction) -> bool {
                     if t1 != t2 {
                         // what the condition says about its operands
                         var cmask: i64 = 0;
-                        var cx: i64 = - 1;
-                        var cy: i64 = - 1;
-                        var notof: i64 = - 1;
+                        var cx: i64 = -1;
+                        var cy: i64 = -1;
+                        var notof: i64 = -1;
                         match peir_inst_of(f, c) {
                             Inst::BinOp(cop, lx, ly, _) => {
                                 cmask = iro_cmp_mask(cop);
@@ -4033,7 +4053,7 @@ fn iro_branch_facts(f: & mut IrFunction) -> bool {
                                 tgt = t2;
                                 truth = false;
                             }
-                            var ti: i64 = - 1;
+                            var ti: i64 = -1;
                             if tgt >= 0 && tgt < cfg.index.len() {
                                 ti = cfg.index.get(tgt);
                             }
@@ -4045,10 +4065,10 @@ fn iro_branch_facts(f: & mut IrFunction) -> bool {
                                     if !truth {
                                         possible = 7 - cmask;
                                     }
-                                    var cid: i64 = - 1;
+                                    var cid: i64 = -1;
                                     var i2: i64 = 0;
                                     while i2 < f.blocks.len() {
-                                        if i2 == ti || iro_dominates(& cfg, ti, i2) {
+                                        if i2 == ti || iro_dominates(&cfg, ti, i2) {
                                             var db: BasicBlock = f.blocks.get(i2);
                                             var k2: i64 = 0;
                                             while k2 < db.instructions.len() {
@@ -4059,7 +4079,7 @@ fn iro_branch_facts(f: & mut IrFunction) -> bool {
                                                 match ui {
                                                     Inst::BinOp(iop, il, ir, _) => {
                                                         if cmask != 0 && iop_is_cmp(iop) && (truth || !fcmp) {
-                                                            var m: i64 = - 1;
+                                                            var m: i64 = -1;
                                                             if il == cx && ir == cy {
                                                                 m = iro_cmp_implied(possible, iro_cmp_mask(iop));
                                                             } else if il == cy && ir == cx {
@@ -4077,7 +4097,7 @@ fn iro_branch_facts(f: & mut IrFunction) -> bool {
                                                 // and c itself is `val` here
                                                 var uses_c: bool = false;
                                                 var ops2: Vec<i64> = Vec::new();
-                                                peir_inst_operands(ui, & mut ops2);
+                                                peir_inst_operands(ui, &mut ops2);
                                                 var o2: i64 = 0;
                                                 while o2 < ops2.len() {
                                                     if ops2.get(o2) == c {
@@ -4090,7 +4110,7 @@ fn iro_branch_facts(f: & mut IrFunction) -> bool {
                                                         cid = iro_bool_before(f, ti, truth);
                                                         mp.set(c, cid + 1);
                                                     }
-                                                    IrFunction_set_inst(f, uid, iro_remap_all(ui, & mp));
+                                                    IrFunction_set_inst(f, uid, iro_remap_all(ui, &mp));
                                                     changed = true;
                                                 }
                                                 k2 = k2 + 1;
@@ -4108,10 +4128,10 @@ fn iro_branch_facts(f: & mut IrFunction) -> bool {
                                         while ui3 < us3.len() {
                                             var uid3: i64 = us3.get(ui3);
                                             var ub3: i64 = u.block_of.get(uid3);
-                                            if ub3 == ti || (ub3 >= 0 && iro_dominates(& cfg, ti, ub3)) {
+                                            if ub3 == ti || (ub3 >= 0 && iro_dominates(&cfg, ti, ub3)) {
                                                 var cid2: i64 = iro_bool_before(f, ti, !truth);
                                                 mp2.set(notof, cid2 + 1);
-                                                IrFunction_set_inst(f, uid3, iro_remap_all(peir_inst_of(f, uid3), & mp2));
+                                                IrFunction_set_inst(f, uid3, iro_remap_all(peir_inst_of(f, uid3), &mp2));
                                                 mp2.set(notof, 0);
                                                 changed = true;
                                             }
@@ -4150,7 +4170,7 @@ fn iop_is_cmp(op: BinOp) -> bool {
 // Const-valued instructions become ConstInt/ConstBool; a branch on a
 // constant loses the dead edge; unreachable blocks are dropped after.
 
-fn iro_sccp_eval(op: BinOp, a: i64, b: i64, out: & mut Vec<i64>) {
+fn iro_sccp_eval(op: BinOp, a: i64, b: i64, out: &mut Vec<i64>) {
     // out: [tag, value]; tag 1 const, 2 varying (a fold that would panic
     // is varying, not a constant — the runtime raises the panic).
     var r: i64 = 0;
@@ -4338,7 +4358,7 @@ fn iro_fits(v: i64, t: IrType) -> bool {
 }
 
 /// The type of value `id` in `f` (I64 when it has none recorded).
-fn iro_value_ty(f: & IrFunction, id: i64) -> IrType {
+fn iro_value_ty(f: &IrFunction, id: i64) -> IrType {
     match IrFunction_get_meta(f, id) {
         OptValueMeta::Some(m) => {
             return m.ty;
@@ -4395,7 +4415,7 @@ fn iro_eval_narrow(v: i64, to: IrType) -> i64 {
     return r;
 }
 
-fn iro_sccp(f: & mut IrFunction) -> bool {
+fn iro_sccp(f: &mut IrFunction) -> bool {
     var cfg: IroCfg = iro_cfg(f);
     if cfg.n == 0 {
         return false;
@@ -4405,7 +4425,7 @@ fn iro_sccp(f: & mut IrFunction) -> bool {
     // 0 top, 1 const, 2 varying
     var lat_v: Vec<i64> = peir_zeros(n);
     var live: Vec<i64> = peir_zeros(cfg.n);
-    var entry_b: i64 = - 1;
+    var entry_b: i64 = -1;
     var e: i64 = 0;
     while e < f.blocks.len() {
         if f.blocks.get(e).id == f.entry {
@@ -4451,7 +4471,7 @@ fn iro_sccp(f: & mut IrFunction) -> bool {
                     Inst::BinOp(op, a, bb, t) => {
                         if iro_int_ty(t) && a >= 0 && a < n && bb >= 0 && bb < n && lat_t.get(a) == 1 && lat_t.get(bb) == 1 {
                             var ev: Vec<i64> = Vec::new();
-                            iro_sccp_eval(op, lat_v.get(a), lat_v.get(bb), & mut ev);
+                            iro_sccp_eval(op, lat_v.get(a), lat_v.get(bb), &mut ev);
                             tag = ev.get(0);
                             cval = ev.get(1);
                             // a comparison is typed Bool: its operands
@@ -4545,7 +4565,7 @@ fn iro_sccp(f: & mut IrFunction) -> bool {
                 }
                 Inst::Branch(c, t1, t2) => {
                     var is_c: bool = c >= 0 && c < n && lat_t.get(c) == 1;
-                    var keep_t: i64 = - 1;
+                    var keep_t: i64 = -1;
                     if is_c {
                         if lat_v.get(c) != 0 {
                             keep_t = t1;
@@ -4573,7 +4593,7 @@ fn iro_sccp(f: & mut IrFunction) -> bool {
             var mi: i64 = 0;
             while mi < mark.len() {
                 var mid: i64 = mark.get(mi);
-                var midx: i64 = - 1;
+                var midx: i64 = -1;
                 if mid >= 0 && mid < cfg.index.len() {
                     midx = cfg.index.get(mid);
                 }
@@ -4669,7 +4689,7 @@ fn iro_sccp(f: & mut IrFunction) -> bool {
 // the local; what a panic between them would skip is never seen, since
 // nothing unwinds). The stored values stay: only the stores go.
 
-fn iro_backend_reads(f: & IrFunction, loc: i64) -> bool {
+fn iro_backend_reads(f: &IrFunction, loc: i64) -> bool {
     var i: i64 = 0;
     while i < f.drop_locals.len() {
         if f.drop_locals.get(i).id == loc {
@@ -4716,7 +4736,7 @@ fn iro_dse_barrier(inst: Inst) -> bool {
     }
 }
 
-fn iro_dse(f: & mut IrFunction) -> bool {
+fn iro_dse(f: &mut IrFunction) -> bool {
     var plain: Vec<i64> = iro_plain_locals(f);
     var n: i64 = plain.len();
     // the plain locals that are read at all
@@ -4810,7 +4830,7 @@ fn iro_dse(f: & mut IrFunction) -> bool {
 /// memory others write and do nothing else (comparisons, bit operations,
 /// widening, a load of a plain local). Checked arithmetic is not among
 /// them: dropping it would drop its overflow panic.
-fn iro_removable(inst: Inst, plain: & Vec<i64>) -> bool {
+fn iro_removable(inst: Inst, plain: &Vec<i64>) -> bool {
     if iro_pure(inst) {
         return true;
     }
@@ -4832,7 +4852,7 @@ fn iro_removable(inst: Inst, plain: & Vec<i64>) -> bool {
 
 /// DCE with iro_removable, until nothing more goes (the values the dead
 /// stores stored, the loads and comparisons only they used).
-fn iro_dce_more(f: & mut IrFunction) -> bool {
+fn iro_dce_more(f: &mut IrFunction) -> bool {
     var plain: Vec<i64> = iro_plain_locals(f);
     var any: bool = false;
     var round: i64 = 0;
@@ -4847,7 +4867,7 @@ fn iro_dce_more(f: & mut IrFunction) -> bool {
             var k: i64 = 0;
             while k < blk.instructions.len() {
                 var id: i64 = blk.instructions.get(k);
-                if id >= 0 && id < u.count.len() && u.count.get(id) == 0 && iro_removable(peir_inst_of(f, id), & plain) {
+                if id >= 0 && id < u.count.len() && u.count.get(id) == 0 && iro_removable(peir_inst_of(f, id), &plain) {
                     gone = true;
                 } else {
                     keep.push(id);
@@ -4883,19 +4903,19 @@ fn iro_dce_more(f: & mut IrFunction) -> bool {
 /// k when c is 2^k (1 <= k <= 62), else -1.
 fn iro_log2(c: i64) -> i64 {
     if c < 2 {
-        return - 1;
+        return -1;
     }
     var k: i64 = 0;
     var v: i64 = c;
     while v > 1 {
         if (v & 1) != 0 {
-            return - 1;
+            return -1;
         }
         v = v >> 1;
         k = k + 1;
     }
     if k > 62 {
-        return - 1;
+        return -1;
     }
     return k;
 }
@@ -4922,7 +4942,7 @@ fn iro_unsigned(t: IrType) -> bool {
 
 /// The signed step `id` adds to its first operand: x + c is c, x - c is -c
 /// (OptI64::None when it is not one, or -c would not fit).
-fn iro_step(f: & IrFunction, id: i64) -> OptI64 {
+fn iro_step(f: &IrFunction, id: i64) -> OptI64 {
     match peir_inst_of(f, id) {
         Inst::BinOp(op, _, r, t) => {
             if !ir_type_eq(t, IrType::I64) {
@@ -4947,19 +4967,19 @@ fn iro_step(f: & IrFunction, id: i64) -> OptI64 {
     return OptI64::None;
 }
 
-fn iro_first_operand(f: & IrFunction, id: i64) -> i64 {
+fn iro_first_operand(f: &IrFunction, id: i64) -> i64 {
     match peir_inst_of(f, id) {
         Inst::BinOp(_, l, _, _) => {
             return l;
         }
         _ => {
-            return - 1;
+            return -1;
         }
     }
 }
 
 /// A constant placed in front of position `pos` of block `bi`.
-fn iro_const_before(f: & mut IrFunction, bi: i64, pos: i64, v: i64, t: IrType) -> i64 {
+fn iro_const_before(f: &mut IrFunction, bi: i64, pos: i64, v: i64, t: IrType) -> i64 {
     var cid: i64 = iro_detached(f, Inst::ConstInt(v, t));
     var blk: BasicBlock = f.blocks.get(bi);
     var ids: Vec<i64> = Vec::new();
@@ -4979,7 +4999,7 @@ fn iro_const_before(f: & mut IrFunction, bi: i64, pos: i64, v: i64, t: IrType) -
     return cid;
 }
 
-fn iro_remove_from_block(f: & mut IrFunction, id: i64) {
+fn iro_remove_from_block(f: &mut IrFunction, id: i64) {
     var b: i64 = 0;
     while b < f.blocks.len() {
         var blk: BasicBlock = f.blocks.get(b);
@@ -5042,7 +5062,7 @@ fn iro_int_ty(t: IrType) -> bool {
 
 /// `v` renamed through `map` until it maps nowhere (the value an identity
 /// leaves behind can itself have been folded).
-fn iro_map_final(map: & Vec<i64>, v: i64) -> i64 {
+fn iro_map_final(map: &Vec<i64>, v: i64) -> i64 {
     var x: i64 = v;
     var gi: i64 = 0;
     while x >= 0 && x < map.len() && map.get(x) != 0 && gi < 10000 {
@@ -5053,7 +5073,7 @@ fn iro_map_final(map: & Vec<i64>, v: i64) -> i64 {
 }
 
 /// A ConstBool instruction as 0/1.
-fn iro_const_bool_val(f: & IrFunction, id: i64) -> OptI64 {
+fn iro_const_bool_val(f: &IrFunction, id: i64) -> OptI64 {
     match peir_inst_of(f, id) {
         Inst::ConstBool(v) => {
             if v {
@@ -5072,7 +5092,7 @@ fn iro_const_bool_val(f: & IrFunction, id: i64) -> OptI64 {
 /// checked arithmetic `x / x`, `0 / x`, `0 % x` and `0 << x` stay
 /// (they can still panic); `x + 0`, `x * 0`, `x / 1`, `x % 1`, `x - x`,
 /// `x << 0` and every bit op never can.
-fn iro_identities(f: & mut IrFunction) -> bool {
+fn iro_identities(f: &mut IrFunction) -> bool {
     var bad: Vec<i64> = iro_unhandled_uses(f);
     var map: Vec<i64> = peir_zeros(f.next_value + 1);
     var dead: Vec<i64> = peir_zeros(f.next_value + 1);
@@ -5084,8 +5104,8 @@ fn iro_identities(f: & mut IrFunction) -> bool {
         while k < ids.len() {
             var id: i64 = ids.get(k);
             if id >= 0 && id < bad.len() && bad.get(id) == 0 {
-                var alias: i64 = - 1;
-                var bkonst: i64 = - 1;
+                var alias: i64 = -1;
+                var bkonst: i64 = -1;
                 match peir_inst_of(f, id) {
                     Inst::BinOp(op, l, r, t) => {
                         var lkonst: OptI64 = iro_const_int(f, l);
@@ -5184,8 +5204,8 @@ fn iro_identities(f: & mut IrFunction) -> bool {
                             } else if binop_eq(op, BinOp::And) || binop_eq(op, BinOp::Or) {
                                 var lb: OptI64 = iro_const_bool_val(f, l);
                                 var rb: OptI64 = iro_const_bool_val(f, r);
-                                var lbv: i64 = - 1;
-                                var rbv: i64 = - 1;
+                                var lbv: i64 = -1;
+                                var rbv: i64 = -1;
                                 match lb {
                                     OptI64::Some(v) => {
                                         lbv = v;
@@ -5294,7 +5314,7 @@ fn iro_identities(f: & mut IrFunction) -> bool {
                     }
                 }
                 if alias >= 0 && alias < map.len() {
-                    var fx: i64 = iro_map_final(& map, alias);
+                    var fx: i64 = iro_map_final(&map, alias);
                     if fx != id {
                         map.set(id, fx + 1);
                         dead.set(id, 1);
@@ -5311,7 +5331,7 @@ fn iro_identities(f: & mut IrFunction) -> bool {
         b = b + 1;
     }
     if changed {
-        iro_apply_map(f, & map);
+        iro_apply_map(f, &map);
         b = 0;
         while b < f.blocks.len() {
             var blk: BasicBlock = f.blocks.get(b);
@@ -5332,7 +5352,7 @@ fn iro_identities(f: & mut IrFunction) -> bool {
     return changed;
 }
 
-fn iro_simplify(f: & mut IrFunction) -> bool {
+fn iro_simplify(f: &mut IrFunction) -> bool {
     var changed: bool = false;
     if iro_identities(f) {
         changed = true;
@@ -5364,8 +5384,8 @@ fn iro_simplify(f: & mut IrFunction) -> bool {
                                                 var x: i64 = iro_first_operand(f, l);
                                                 var d: i64 = d1 + d2;
                                                 var cid: i64 = 0;
-                                                iro_uses_drop(& mut u, f, id);
-                                                iro_uses_drop(& mut u, f, l);
+                                                iro_uses_drop(&mut u, f, id);
+                                                iro_uses_drop(&mut u, f, l);
                                                 if d > 0 {
                                                     cid = iro_const_before(f, b, k, d, t);
                                                     IrFunction_set_inst(f, id, Inst::BinOp(BinOp::Add, x, cid, t));
@@ -5373,8 +5393,8 @@ fn iro_simplify(f: & mut IrFunction) -> bool {
                                                     cid = iro_const_before(f, b, k, 0 - d, t);
                                                     IrFunction_set_inst(f, id, Inst::BinOp(BinOp::Sub, x, cid, t));
                                                 }
-                                                iro_uses_reg(& mut u, cid, b);
-                                                iro_uses_add_ops(& mut u, f, id);
+                                                iro_uses_reg(&mut u, cid, b);
+                                                iro_uses_add_ops(&mut u, f, id);
                                                 iro_remove_from_block(f, l);
                                                 changed = true;
                                                 done = true;
@@ -5393,8 +5413,8 @@ fn iro_simplify(f: & mut IrFunction) -> bool {
                     if !done && binop_eq(op, BinOp::Mul) && (ir_type_eq(t, IrType::I64) || iro_unsigned(t)) {
                         var unchecked: bool = f.is_wrapping || (id < flags.len() && (flags.get(id) & 1) != 0);
                         if unchecked {
-                            var x2: i64 = - 1;
-                            var sh: i64 = - 1;
+                            var x2: i64 = -1;
+                            var sh: i64 = -1;
                             match iro_const_int(f, r) {
                                 OptI64::Some(c) => {
                                     sh = iro_log2(c);
@@ -5412,11 +5432,11 @@ fn iro_simplify(f: & mut IrFunction) -> bool {
                                 }
                             }
                             if sh > 0 {
-                                iro_uses_drop(& mut u, f, id);
+                                iro_uses_drop(&mut u, f, id);
                                 var kid: i64 = iro_const_before(f, b, k, sh, t);
                                 IrFunction_set_inst(f, id, Inst::BinOp(BinOp::Shl, x2, kid, t));
-                                iro_uses_reg(& mut u, kid, b);
-                                iro_uses_add_ops(& mut u, f, id);
+                                iro_uses_reg(&mut u, kid, b);
+                                iro_uses_add_ops(&mut u, f, id);
                                 changed = true;
                                 done = true;
                             }
@@ -5429,8 +5449,8 @@ fn iro_simplify(f: & mut IrFunction) -> bool {
                             OptI64::Some(c3) => {
                                 var sh2: i64 = iro_log2(c3);
                                 if nonneg && sh2 > 0 {
-                                    iro_uses_drop(& mut u, f, id);
-                                    var kid2: i64 = - 1;
+                                    iro_uses_drop(&mut u, f, id);
+                                    var kid2: i64 = -1;
                                     if binop_eq(op, BinOp::Div) {
                                         kid2 = iro_const_before(f, b, k, sh2, t);
                                         IrFunction_set_inst(f, id, Inst::BinOp(BinOp::Shr, l, kid2, t));
@@ -5438,8 +5458,8 @@ fn iro_simplify(f: & mut IrFunction) -> bool {
                                         kid2 = iro_const_before(f, b, k, c3 - 1, t);
                                         IrFunction_set_inst(f, id, Inst::BinOp(BinOp::BitAnd, l, kid2, t));
                                     }
-                                    iro_uses_reg(& mut u, kid2, b);
-                                    iro_uses_add_ops(& mut u, f, id);
+                                    iro_uses_reg(&mut u, kid2, b);
+                                    iro_uses_add_ops(&mut u, f, id);
                                     changed = true;
                                 }
                             }
@@ -5470,13 +5490,13 @@ fn iro_simplify(f: & mut IrFunction) -> bool {
 // (iro_promote_here).
 /// The value a store instruction stores now: its operand may have been
 /// renamed by a promotion since the event table recorded the store's id.
-fn iro_store_val(f: & IrFunction, iid: i64) -> i64 {
+fn iro_store_val(f: &IrFunction, iid: i64) -> i64 {
     match peir_inst_of(f, iid) {
         Inst::Store(_, sv, _) => {
             return sv;
         }
         _ => {
-            return - 1;
+            return -1;
         }
     }
 }
@@ -5493,14 +5513,14 @@ fn iro_store_val(f: & IrFunction, iid: i64) -> i64 {
 /// 6,000-10,000 (same output, same executable size) for 191 ms of
 /// test_collections' 3,984 ms in iropt
 /// (docs/perf/mid-end/me3-promote-retired.txt).
-fn iro_promote_here(f: & IrFunction, on_ssa: bool, named: bool) -> bool {
+fn iro_promote_here(f: &IrFunction, on_ssa: bool, named: bool) -> bool {
     if named || !on_ssa {
         return true;
     }
     return !ssa_takes(f);
 }
 
-fn iro_promote(f: & mut IrFunction) -> bool {
+fn iro_promote(f: &mut IrFunction) -> bool {
     var cfg: IroCfg = iro_cfg(f);
     if cfg.n == 0 {
         return false;
@@ -5562,8 +5582,8 @@ fn iro_promote(f: & mut IrFunction) -> bool {
     var deadl: Vec<i64> = peir_zeros(nv);
     var i: i64 = 0;
     while i < cfg.n {
-        in_st.push(- 1);
-        out_st.push(- 1);
+        in_st.push(-1);
+        out_st.push(-1);
         i = i + 1;
     }
     var a: i64 = 0;
@@ -5576,20 +5596,20 @@ fn iro_promote(f: & mut IrFunction) -> bool {
                 var ri: i64 = 0;
                 while ri < cfg.rpo.len() {
                     var bi: i64 = cfg.rpo.get(ri);
-                    var m: i64 = - 3;
+                    var m: i64 = -3;
                     var ps: Vec<i64> = cfg.preds.get(bi);
                     var pi: i64 = 0;
                     while pi < ps.len() {
                         var s: i64 = out_st.get(ps.get(pi));
-                        if m == - 3 {
+                        if m == -3 {
                             m = s;
                         } else if m != s {
-                            m = - 2;
+                            m = -2;
                         }
                         pi = pi + 1;
                     }
-                    if m == - 3 {
-                        m = - 1;
+                    if m == -3 {
+                        m = -1;
                     }
                     if in_st.get(bi) != m {
                         in_st.set(bi, m);
@@ -5676,7 +5696,7 @@ fn iro_promote(f: & mut IrFunction) -> bool {
                         if iid2 >= 0 && iid2 < nv && deadl.get(iid2) == 1 {
                             dropped = true;
                         } else {
-                            IrFunction_set_inst(f, iid2, iro_remap_all(peir_inst_of(f, iid2), & map));
+                            IrFunction_set_inst(f, iid2, iro_remap_all(peir_inst_of(f, iid2), &map));
                             keep.push(iid2);
                         }
                         k4 = k4 + 1;
@@ -5698,8 +5718,8 @@ fn iro_promote(f: & mut IrFunction) -> bool {
             }
             var rs: i64 = 0;
             while rs < cfg.n {
-                in_st.set(rs, - 1);
-                out_st.set(rs, - 1);
+                in_st.set(rs, -1);
+                out_st.set(rs, -1);
                 rs = rs + 1;
             }
         }
@@ -5726,7 +5746,7 @@ fn iro_name_in(v: Vec<str>, s: str) -> bool {
 /// by that constant inside the callee. One pass collects per-candidate
 /// constant arguments (flattened, at most 8 parameters); a second pass emits
 /// the constants into each candidate's entry block and renames the uses.
-pub fn iro_ipcp(module: & mut IrModule) -> i64 {
+pub fn iro_ipcp(module: &mut IrModule) -> i64 {
     var count: i64 = 0;
     var nfn: i64 = module.functions.len();
     var fidx: i64 = HashMap_new();
@@ -5807,7 +5827,7 @@ pub fn iro_ipcp(module: & mut IrModule) -> i64 {
         while ii < g.insts.len() {
             match g.insts.get(ii).inst {
                 Inst::Call(nm, args, _r, _e) => {
-                    var ci: i64 = - 1;
+                    var ci: i64 = -1;
                     if HashMap_contains(cidx, nm) {
                         ci = HashMap_get(cidx, nm) - 1;
                     } else {
@@ -5865,11 +5885,11 @@ pub fn iro_ipcp(module: & mut IrModule) -> i64 {
                                     }
                                     var old: i64 = cvals.get(ci * 8 + aj);
                                     if got == 0 {
-                                        cvals.set(ci * 8 + aj, - 1);
+                                        cvals.set(ci * 8 + aj, -1);
                                     } else if old == 0 {
                                         cvals.set(ci * 8 + aj, cval + 2);
                                     } else if old != cval + 2 {
-                                        cvals.set(ci * 8 + aj, - 1);
+                                        cvals.set(ci * 8 + aj, -1);
                                     }
                                 }
                                 aj = aj + 1;
@@ -5897,13 +5917,13 @@ pub fn iro_ipcp(module: & mut IrModule) -> i64 {
                 if cv > 0 {
                     var p: ValueIdType = f.params.get(j2);
                     var v: i64 = cv - 2;
-                    var nid: i64 = - 1;
+                    var nid: i64 = -1;
                     if ir_type_eq(p.ty, IrType::Bool) {
                         f.current_block_idx = 0;
-                        nid = IrFunction_emit(& mut f, Inst::ConstBool(v != 0));
+                        nid = IrFunction_emit(&mut f, Inst::ConstBool(v != 0));
                     } else if iro_int_ty(p.ty) {
                         f.current_block_idx = 0;
-                        nid = IrFunction_emit(& mut f, Inst::ConstInt(v, p.ty));
+                        nid = IrFunction_emit(&mut f, Inst::ConstInt(v, p.ty));
                     }
                     if nid >= 0 {
                         var blk0: BasicBlock = f.blocks.get(0);
@@ -5924,7 +5944,7 @@ pub fn iro_ipcp(module: & mut IrModule) -> i64 {
                         var vi: i64 = 0;
                         while vi < f.insts.len() {
                             var ve: ValueIdInst = f.insts.get(vi);
-                            ve.inst = iro_remap_all(ve.inst, & map);
+                            ve.inst = iro_remap_all(ve.inst, &map);
                             f.insts.set(vi, ve);
                             vi = vi + 1;
                         }
@@ -5946,7 +5966,7 @@ pub fn iro_ipcp(module: & mut IrModule) -> i64 {
 
 /// WP16: a DynCall whose receiver is a MakeDyn of a known type is a direct
 /// call to type_method — the type-id dispatch chain can be skipped.
-fn iro_devirt(module: & IrModule, f: & mut IrFunction) -> bool {
+fn iro_devirt(module: &IrModule, f: &mut IrFunction) -> bool {
     var changed: bool = false;
     var bi: i64 = 0;
     while bi < f.blocks.len() {
@@ -6020,8 +6040,8 @@ fn iro_devirt(module: & IrModule, f: & mut IrFunction) -> bool {
 /// Resolve a CallPtr fp (or a call argument holding a closure env) to
 /// the env-building instruction: the value itself, or the unique value
 /// every Store parks in the slot a Load reads. -1 when not resolvable.
-fn iro_cdev_env_of(f: & IrFunction, fp: i64) -> i64 {
-    var lptr: i64 = - 1;
+fn iro_cdev_env_of(f: &IrFunction, fp: i64) -> i64 {
+    var lptr: i64 = -1;
     match peir_inst_of(f, fp) {
         Inst::Load(lp, _) => {
             lptr = lp;
@@ -6030,7 +6050,7 @@ fn iro_cdev_env_of(f: & IrFunction, fp: i64) -> i64 {
             return fp;
         }
     }
-    var env_id: i64 = - 1;
+    var env_id: i64 = -1;
     var b: i64 = 0;
     while b < f.blocks.len() {
         var ids: Vec<i64> = f.blocks.get(b).instructions;
@@ -6043,7 +6063,7 @@ fn iro_cdev_env_of(f: & IrFunction, fp: i64) -> i64 {
                             env_id = sv;
                         } else {
                             if env_id != sv {
-                                env_id = - 2;
+                                env_id = -2;
                             }
                         }
                     }
@@ -6055,15 +6075,15 @@ fn iro_cdev_env_of(f: & IrFunction, fp: i64) -> i64 {
         }
         b = b + 1;
     }
-    if env_id == - 2 {
-        return - 1;
+    if env_id == -2 {
+        return -1;
     }
     return env_id;
 }
 
 /// The byte size of a Lowerer_make_fn_env env: `p_malloc(ConstInt)`.
 /// 0 when `env_id` is not such a call.
-fn iro_cdev_env_size(f: & IrFunction, env_id: i64) -> i64 {
+fn iro_cdev_env_size(f: &IrFunction, env_id: i64) -> i64 {
     match peir_inst_of(f, env_id) {
         Inst::Call(nm, margs, _, _) => {
             if nm == "p_malloc" && margs.len() > 0 {
@@ -6110,14 +6130,14 @@ fn iro_cdev_env_size(f: & IrFunction, env_id: i64) -> i64 {
 const IRO_C_FNPTR: str = "__fid_c_fnptr";
 
 /// The ConstFnRef stored at env field 0 (the closure's target), or "".
-fn iro_cdev_fname_of(f: & IrFunction, u: & IroUses, env_id: i64) -> str {
+fn iro_cdev_fname_of(f: &IrFunction, u: &IroUses, env_id: i64) -> str {
     var us: Vec<i64> = u.users.get(env_id);
     var i: i64 = 0;
     while i < us.len() {
         var uid: i64 = us.get(i);
         match peir_inst_of(f, uid) {
             Inst::GetElemPtr(_, gidx, _) => {
-                var off: i64 = - 1;
+                var off: i64 = -1;
                 match peir_inst_of(f, gidx) {
                     Inst::ConstInt(ov, _) => {
                         off = ov;
@@ -6170,7 +6190,7 @@ struct CdevEnv {
 /// Does the devirtualized callee treat its __env parameter (arg 0) as
 /// field access only? env passed on as a call arg, stored anywhere, or
 /// returned would dangle a stack-allocated env.
-fn iro_cdev_callee_ok(cf: & IrFunction) -> bool {
+fn iro_cdev_callee_ok(cf: &IrFunction) -> bool {
     if cf.params.len() == 0 {
         return false;
     }
@@ -6201,7 +6221,7 @@ fn iro_cdev_callee_ok(cf: & IrFunction) -> bool {
         while k2 < ids2.len() {
             var id2: i64 = ids2.get(k2);
             var ops: Vec<i64> = Vec::new();
-            peir_inst_operands(peir_inst_of(cf, id2), & mut ops);
+            peir_inst_operands(peir_inst_of(cf, id2), &mut ops);
             var o: i64 = 0;
             while o < ops.len() {
                 var v: i64 = ops.get(o);
@@ -6248,7 +6268,7 @@ fn iro_cdev_callee_ok(cf: & IrFunction) -> bool {
 /// GetElemPtr field writes at init, CallPtrs that call it, and Stores
 /// that park it in a local slot whose Loads feed CallPtrs. Collects the
 /// ConstFnRef stored at field 0 and every reachable CallPtr site.
-fn iro_cdev_scan(module: & IrModule, f: & IrFunction, u: & IroUses, env_id: i64) -> CdevEnv {
+fn iro_cdev_scan(module: &IrModule, f: &IrFunction, u: &IroUses, env_id: i64) -> CdevEnv {
     var r: CdevEnv = CdevEnv {
         fname: "", escape: false, msafe: true, calls: Vec::new()
     };
@@ -6258,7 +6278,7 @@ fn iro_cdev_scan(module: & IrModule, f: & IrFunction, u: & IroUses, env_id: i64)
         var uid: i64 = us.get(ui);
         match peir_inst_of(f, uid) {
             Inst::GetElemPtr(_, gidx, _) => {
-                var off: i64 = - 1;
+                var off: i64 = -1;
                 match peir_inst_of(f, gidx) {
                     Inst::ConstInt(ov, _) => {
                         off = ov;
@@ -6401,7 +6421,7 @@ fn iro_cdev_scan(module: & IrModule, f: & IrFunction, u: & IroUses, env_id: i64)
     if r.fname != "" {
         match IrModule_get_function(module, r.fname) {
             OptIrFunction::Some(cf) => {
-                if !iro_cdev_callee_ok(& cf) {
+                if !iro_cdev_callee_ok(&cf) {
                     r.msafe = false;
                 }
             }
@@ -6447,7 +6467,7 @@ fn iro_cp_direct_args(env: i64, cargs: Vec<i64>, cret: IrType) -> Vec<i64> {
 /// Lowerer_make_fn_env — is an indirect call to a known target. Rewrite
 /// it to a direct Call (inlinable downstream) and, when the env provably
 /// stays inside this frame, move it from p_malloc to a stack Alloca.
-fn iro_closure_devirt(module: & IrModule, f: & mut IrFunction) -> bool {
+fn iro_closure_devirt(module: &IrModule, f: &mut IrFunction) -> bool {
     // Cheap pre-scan: most functions have no CallPtr at all.
     var any: bool = false;
     var b0: i64 = 0;
@@ -6490,7 +6510,7 @@ fn iro_closure_devirt(module: & IrModule, f: & mut IrFunction) -> bool {
                     }
                     if env_size > 0 {
                         done_envs.push(env_id);
-                        var r: CdevEnv = iro_cdev_scan(module, f, & u, env_id);
+                        var r: CdevEnv = iro_cdev_scan(module, f, &u, env_id);
                         if r.fname != "" && r.calls.len() > 0 {
                             var n_eff: EffectSet = EffectSet_new();
                             match IrModule_get_function(module, r.fname) {
@@ -6570,7 +6590,7 @@ fn iro_closure_devirt(module: & IrModule, f: & mut IrFunction) -> bool {
 /// CallPtr on that parameter to a direct Call — after inlining the clone
 /// is the plain loop LG5 wants. The generic HOF stays for callers whose
 /// env is not statically known.
-pub fn iro_hof_specialize(module: & mut IrModule) -> i64 {
+pub fn iro_hof_specialize(module: &mut IrModule) -> i64 {
     return iro_hof_specialize_in(module, 0);
 }
 
@@ -6580,7 +6600,7 @@ pub fn iro_hof_specialize(module: & mut IrModule) -> i64 {
 /// function that calls one with a CallPtr is looked at closely (its use
 /// lists built): the same clones and rewrites as a scan of everything,
 /// without a list search per call or use lists for every function.
-pub fn iro_hof_specialize_in(module: & mut IrModule, reach: i64) -> i64 {
+pub fn iro_hof_specialize_in(module: &mut IrModule, reach: i64) -> i64 {
     var count: i64 = 0;
     var fidx: i64 = HashMap_new();
     var nfn: i64 = module.functions.len();
@@ -6685,7 +6705,7 @@ pub fn iro_hof_specialize_in(module: & mut IrModule, reach: i64) -> i64 {
             fi = fi + 1;
             continue;
         }
-        var u: IroUses = iro_uses(& g);
+        var u: IroUses = iro_uses(&g);
         var g_changed: bool = false;
         var bi: i64 = 0;
         while bi < g.blocks.len() {
@@ -6693,7 +6713,7 @@ pub fn iro_hof_specialize_in(module: & mut IrModule, reach: i64) -> i64 {
             var k: i64 = 0;
             while k < ids.len() {
                 var iid: i64 = ids.get(k);
-                match peir_inst_of(& g, iid) {
+                match peir_inst_of(&g, iid) {
                     Inst::Call(hof, hargs, hret, heff) => {
                         var hok: bool = HashMap_contains(fidx, hof) && hof != "main" && !HashMap_contains(taken, hof) && !HashMap_contains(dyn_names, hof) && !HashMap_contains(ext_names, hof) && !iro_name_in(module.c_callbacks, hof) && !str_starts_with(hof, "p_") && !str_starts_with(hof, "pe_") && !str_starts_with(hof, "pert_") && !str_starts_with(hof, "nat_");
                         if hok {
@@ -6712,7 +6732,7 @@ pub fn iro_hof_specialize_in(module: & mut IrModule, reach: i64) -> i64 {
                                                 if cfp == pid {
                                                     has_callptr = true;
                                                 }
-                                                if iro_cdev_env_of(& cf, cfp) == pid {
+                                                if iro_cdev_env_of(&cf, cfp) == pid {
                                                     has_callptr = true;
                                                 }
                                             }
@@ -6722,14 +6742,14 @@ pub fn iro_hof_specialize_in(module: & mut IrModule, reach: i64) -> i64 {
                                         ci = ci + 1;
                                     }
                                     if has_callptr {
-                                        var env_id: i64 = iro_cdev_env_of(& g, hargs.get(aj));
+                                        var env_id: i64 = iro_cdev_env_of(&g, hargs.get(aj));
                                         var env_size: i64 = 0;
                                         if env_id >= 0 {
-                                            env_size = iro_cdev_env_size(& g, env_id);
+                                            env_size = iro_cdev_env_size(&g, env_id);
                                         }
                                         var fname: str = "";
                                         if env_size > 0 {
-                                            fname = iro_cdev_fname_of(& g, & u, env_id);
+                                            fname = iro_cdev_fname_of(&g, &u, env_id);
                                         }
                                         var hdbg: str = p_getenv("FID_HOF_DBG");
                                         if (hdbg as i64) != 0 {
@@ -6752,13 +6772,13 @@ pub fn iro_hof_specialize_in(module: & mut IrModule, reach: i64) -> i64 {
                                                     var vei: ValueIdInst = nf.insts.get(ri);
                                                     match vei.inst {
                                                         Inst::CallPtr(cfp2, cargs2, cret2, _ce2, chas2) => {
-                                                            if cfp2 == pid || iro_cdev_env_of(& nf, cfp2) == pid {
+                                                            if cfp2 == pid || iro_cdev_env_of(&nf, cfp2) == pid {
                                                                 var nargs2: Vec<i64> = Vec::new();
                                                                 var env_arg2: i64 = pid;
                                                                 if !chas2 {
-                                                                    env_arg2 = iro_detached(& mut nf, Inst::ConstInt(0, IrType::I64));
+                                                                    env_arg2 = iro_detached(&mut nf, Inst::ConstInt(0, IrType::I64));
                                                                     // detached inst — place it just before the CallPtr it feeds
-                                                                    var cb2: i64 = - 1;
+                                                                    var cb2: i64 = -1;
                                                                     var bb2: i64 = 0;
                                                                     while bb2 < nf.blocks.len() {
                                                                         if iro_i64_in(nf.blocks.get(bb2).instructions, vei.id) {
@@ -6784,7 +6804,7 @@ pub fn iro_hof_specialize_in(module: & mut IrModule, reach: i64) -> i64 {
                                                                 }
                                                                 // (a struct result's pointer first)
                                                                 nargs2 = iro_cp_direct_args(env_arg2, cargs2, cret2);
-                                                                IrFunction_set_inst(& mut nf, vei.id, Inst::Call(fname, nargs2, cret2, n_eff));
+                                                                IrFunction_set_inst(&mut nf, vei.id, Inst::Call(fname, nargs2, cret2, n_eff));
                                                             }
                                                         }
                                                         _ => {
@@ -6796,7 +6816,7 @@ pub fn iro_hof_specialize_in(module: & mut IrModule, reach: i64) -> i64 {
                                                 HashMap_insert(fidx, cname, module.functions.len());
                                                 count = count + 1;
                                             }
-                                            IrFunction_set_inst(& mut g, iid, Inst::Call(cname, hargs, hret, heff));
+                                            IrFunction_set_inst(&mut g, iid, Inst::Call(cname, hargs, hret, heff));
                                             g_changed = true;
                                         }
                                     }
@@ -6828,16 +6848,16 @@ pub fn iro_hof_specialize_in(module: & mut IrModule, reach: i64) -> i64 {
 /// of block index `bi`: `a` itself, or a load of a local only loads and
 /// stores reach (`plain`) whose one store, earlier in that block, stores
 /// it. -1 when neither. (A MakeDyn's operand then dominates the call.)
-fn iro_dspec_make_of(g: & IrFunction, plain: & Vec<i64>, a: i64, bi: i64, k: i64) -> i64 {
+fn iro_dspec_make_of(g: &IrFunction, plain: &Vec<i64>, a: i64, bi: i64, k: i64) -> i64 {
     match peir_inst_of(g, a) {
         Inst::MakeDyn(_, _, _) => {
             return a;
         }
         Inst::Load(p, _) => {
             if p < 0 || p >= plain.len() || plain.get(p) != 1 {
-                return - 1;
+                return -1;
             }
-            var found: i64 = - 1;
+            var found: i64 = -1;
             var nst: i64 = 0;
             var b: i64 = 0;
             while b < g.blocks.len() {
@@ -6861,7 +6881,7 @@ fn iro_dspec_make_of(g: & IrFunction, plain: & Vec<i64>, a: i64, bi: i64, k: i64
                 b = b + 1;
             }
             if nst != 1 || found < 0 {
-                return - 1;
+                return -1;
             }
             match peir_inst_of(g, found) {
                 Inst::MakeDyn(_, _, _) => {
@@ -6874,11 +6894,11 @@ fn iro_dspec_make_of(g: & IrFunction, plain: & Vec<i64>, a: i64, bi: i64, k: i64
         _ => {
         }
     }
-    return - 1;
+    return -1;
 }
 
 /// The type of value `v` of `g` (a parameter's from `g.params`).
-fn iro_dspec_ty(g: & IrFunction, v: i64) -> IrType {
+fn iro_dspec_ty(g: &IrFunction, v: i64) -> IrType {
     var i: i64 = 0;
     while i < g.params.len() {
         if g.params.get(i).id == v {
@@ -6899,7 +6919,7 @@ fn iro_dspec_ty(g: & IrFunction, v: i64) -> IrType {
 /// Does `cf` make a DynCall on parameter `pid` (the parameter itself, or
 /// a load of the one local it is copied into) that `tname`'s method
 /// answers directly? Some(the type that method takes its receiver as).
-fn iro_dspec_recv(module: & IrModule, cf: & IrFunction, pid: i64, tname: str) -> OptIrType {
+fn iro_dspec_recv(module: &IrModule, cf: &IrFunction, pid: i64, tname: str) -> OptIrType {
     var i: i64 = 0;
     while i < cf.insts.len() {
         match cf.insts.get(i).inst {
@@ -6937,7 +6957,7 @@ fn iro_dspec_recv(module: & IrModule, cf: & IrFunction, pid: i64, tname: str) ->
 /// runtime, extern, name-called, address-taken or trait-target function;
 /// callees of at most 200 instructions. One clone per (callee, position,
 /// T); the original stays for every other caller. FID_IROPT_OFF=dynspec.
-pub fn iro_dyn_specialize(module: & mut IrModule) -> i64 {
+pub fn iro_dyn_specialize(module: &mut IrModule) -> i64 {
     var count: i64 = 0;
     var fidx: i64 = HashMap_new();
     var nfn: i64 = module.functions.len();
@@ -7002,7 +7022,7 @@ pub fn iro_dyn_specialize(module: & mut IrModule) -> i64 {
     fi = 0;
     while fi < nfn {
         var g: IrFunction = module.functions.get(fi).func;
-        var plain: Vec<i64> = iro_plain_locals(& g);
+        var plain: Vec<i64> = iro_plain_locals(&g);
         var g_changed: bool = false;
         var bi: i64 = 0;
         while bi < g.blocks.len() {
@@ -7010,7 +7030,7 @@ pub fn iro_dyn_specialize(module: & mut IrModule) -> i64 {
             var k: i64 = 0;
             while k < ids.len() {
                 var iid: i64 = ids.get(k);
-                match peir_inst_of(& g, iid) {
+                match peir_inst_of(&g, iid) {
                     Inst::Call(callee, cargs, cret, ceff) => {
                         var cok: bool = HashMap_contains(fidx, callee) && callee != "main" && !iro_name_in(taken, callee) && !iro_name_in(dyn_names, callee) && !iro_name_in(ext_names, callee) && !iro_name_in(module.c_callbacks, callee) && !str_starts_with(callee, "p_") && !str_starts_with(callee, "pe_") && !str_starts_with(callee, "pert_") && !str_starts_with(callee, "nat_") && !str_contains(callee, "__dyn");
                         if cok {
@@ -7019,11 +7039,11 @@ pub fn iro_dyn_specialize(module: & mut IrModule) -> i64 {
                                 var done: bool = false;
                                 var aj: i64 = 0;
                                 while aj < cargs.len() && !done {
-                                    var mk: i64 = iro_dspec_make_of(& g, & plain, cargs.get(aj), bi, k);
+                                    var mk: i64 = iro_dspec_make_of(&g, &plain, cargs.get(aj), bi, k);
                                     if mk >= 0 {
-                                        var xv: i64 = - 1;
+                                        var xv: i64 = -1;
                                         var tname: str = "";
-                                        match peir_inst_of(& g, mk) {
+                                        match peir_inst_of(&g, mk) {
                                             Inst::MakeDyn(mv, mt, _) => {
                                                 xv = mv;
                                                 tname = mt;
@@ -7032,9 +7052,9 @@ pub fn iro_dyn_specialize(module: & mut IrModule) -> i64 {
                                             }
                                         }
                                         var pid: i64 = cf.params.get(aj).id;
-                                        var xty: IrType = iro_dspec_ty(& g, xv);
+                                        var xty: IrType = iro_dspec_ty(&g, xv);
                                         var recv_ok: bool = false;
-                                        match iro_dspec_recv(module, & cf, pid, tname) {
+                                        match iro_dspec_recv(module, &cf, pid, tname) {
                                             OptIrType::Some(rty) => {
                                                 xty = rty;
                                                 recv_ok = true;
@@ -7046,48 +7066,48 @@ pub fn iro_dyn_specialize(module: & mut IrModule) -> i64 {
                                             var cname: str = callee + "__dyn" + int_to_str(aj) + "_" + tname;
                                             if !HashMap_contains(fidx, cname) {
                                                 var nf: IrFunction = iro_clone_function(cf, cname);
-                                                var np: i64 = IrFunction_new_value(& mut nf, ValueMeta_new(xty));
+                                                var np: i64 = IrFunction_new_value(&mut nf, ValueMeta_new(xty));
                                                 nf.params.push(ValueIdType_new(np, xty));
                                                 var ri: i64 = 0;
                                                 while ri < nf.insts.len() {
                                                     var vei: ValueIdInst = nf.insts.get(ri);
                                                     match vei.inst {
                                                         Inst::DynCall(_dt, dm2, dargs2, dret2, _de2) => {
-                                                            if dargs2.len() > 0 && iro_cdev_env_of(& nf, dargs2.get(0)) == pid {
+                                                            if dargs2.len() > 0 && iro_cdev_env_of(&nf, dargs2.get(0)) == pid {
                                                                 var mname: str = tname + "_" + dm2;
                                                                 match IrModule_get_function(module, mname) {
                                                                     OptIrFunction::Some(mf) => {
-                                                                      if mf.params.len() == dargs2.len() + 1 {
-                                                                        var env2: i64 = iro_detached(& mut nf, Inst::ConstInt(0, IrType::I64));
-                                                                        var cb2: i64 = 0;
-                                                                        while cb2 < nf.blocks.len() {
-                                                                            var blk4: BasicBlock = nf.blocks.get(cb2);
-                                                                            if iro_i64_in(blk4.instructions, vei.id) {
-                                                                                var ins4: Vec<i64> = Vec::new();
-                                                                                var ki4: i64 = 0;
-                                                                                while ki4 < blk4.instructions.len() {
-                                                                                    var oid4: i64 = blk4.instructions.get(ki4);
-                                                                                    if oid4 == vei.id {
-                                                                                        ins4.push(env2);
+                                                                        if mf.params.len() == dargs2.len() + 1 {
+                                                                            var env2: i64 = iro_detached(&mut nf, Inst::ConstInt(0, IrType::I64));
+                                                                            var cb2: i64 = 0;
+                                                                            while cb2 < nf.blocks.len() {
+                                                                                var blk4: BasicBlock = nf.blocks.get(cb2);
+                                                                                if iro_i64_in(blk4.instructions, vei.id) {
+                                                                                    var ins4: Vec<i64> = Vec::new();
+                                                                                    var ki4: i64 = 0;
+                                                                                    while ki4 < blk4.instructions.len() {
+                                                                                        var oid4: i64 = blk4.instructions.get(ki4);
+                                                                                        if oid4 == vei.id {
+                                                                                            ins4.push(env2);
+                                                                                        }
+                                                                                        ins4.push(oid4);
+                                                                                        ki4 = ki4 + 1;
                                                                                     }
-                                                                                    ins4.push(oid4);
-                                                                                    ki4 = ki4 + 1;
+                                                                                    blk4.instructions = ins4;
+                                                                                    nf.blocks.set(cb2, blk4);
                                                                                 }
-                                                                                blk4.instructions = ins4;
-                                                                                nf.blocks.set(cb2, blk4);
+                                                                                cb2 = cb2 + 1;
                                                                             }
-                                                                            cb2 = cb2 + 1;
+                                                                            var nargs2: Vec<i64> = Vec::new();
+                                                                            nargs2.push(env2);
+                                                                            nargs2.push(np);
+                                                                            var ai2: i64 = 1;
+                                                                            while ai2 < dargs2.len() {
+                                                                                nargs2.push(dargs2.get(ai2));
+                                                                                ai2 = ai2 + 1;
+                                                                            }
+                                                                            IrFunction_set_inst(&mut nf, vei.id, Inst::Call(mname, nargs2, dret2, mf.effects));
                                                                         }
-                                                                        var nargs2: Vec<i64> = Vec::new();
-                                                                        nargs2.push(env2);
-                                                                        nargs2.push(np);
-                                                                        var ai2: i64 = 1;
-                                                                        while ai2 < dargs2.len() {
-                                                                            nargs2.push(dargs2.get(ai2));
-                                                                            ai2 = ai2 + 1;
-                                                                        }
-                                                                        IrFunction_set_inst(& mut nf, vei.id, Inst::Call(mname, nargs2, dret2, mf.effects));
-                                                                      }
                                                                     }
                                                                     OptIrFunction::None => {
                                                                     }
@@ -7110,7 +7130,7 @@ pub fn iro_dyn_specialize(module: & mut IrModule) -> i64 {
                                                 ai = ai + 1;
                                             }
                                             nargs.push(xv);
-                                            IrFunction_set_inst(& mut g, iid, Inst::Call(cname, nargs, cret, ceff));
+                                            IrFunction_set_inst(&mut g, iid, Inst::Call(cname, nargs, cret, ceff));
                                             g_changed = true;
                                             done = true;
                                         }
@@ -7160,7 +7180,7 @@ struct IroFdv {
 /// The field a load or store address `p` of `g` names, "S#i" (struct S,
 /// field i), when `p` is a GetFieldPtr on a value typed as S or as a
 /// pointer to S; "" for any other address.
-fn iro_fdv_key(g: & IrFunction, p: i64) -> str {
+fn iro_fdv_key(g: &IrFunction, p: i64) -> str {
     match peir_inst_of(g, p) {
         Inst::GetFieldPtr(base, idx, _) => {
             var sn: str = "";
@@ -7229,7 +7249,7 @@ fn iro_fdv_word(t: IrType) -> bool {
 /// For each plain local of `g` (`plain`, iro_plain_locals) stored exactly
 /// once: the value that store stores, + 1; 0 (none) or -1 (several) for
 /// every other value id.
-fn iro_fdv_once(g: & IrFunction, plain: & Vec<i64>) -> Vec<i64> {
+fn iro_fdv_once(g: &IrFunction, plain: &Vec<i64>) -> Vec<i64> {
     var once: Vec<i64> = peir_zeros(g.next_value + 1);
     var b: i64 = 0;
     while b < g.blocks.len() {
@@ -7242,7 +7262,7 @@ fn iro_fdv_once(g: & IrFunction, plain: & Vec<i64>) -> Vec<i64> {
                         if once.get(sp) == 0 {
                             once.set(sp, sv + 1);
                         } else {
-                            once.set(sp, - 1);
+                            once.set(sp, -1);
                         }
                     }
                 }
@@ -7258,7 +7278,7 @@ fn iro_fdv_once(g: & IrFunction, plain: & Vec<i64>) -> Vec<i64> {
 
 /// What value `v` of `g` stands for: when `v` loads a plain local stored
 /// exactly once (`once`, iro_fdv_once), the value stored; else `v`.
-fn iro_fdv_src(g: & IrFunction, once: & Vec<i64>, v: i64) -> i64 {
+fn iro_fdv_src(g: &IrFunction, once: &Vec<i64>, v: i64) -> i64 {
     match peir_inst_of(g, v) {
         Inst::Load(p, _) => {
             if p >= 0 && p < once.len() && once.get(p) > 0 {
@@ -7272,7 +7292,7 @@ fn iro_fdv_src(g: & IrFunction, once: & Vec<i64>, v: i64) -> i64 {
 }
 
 /// The slot of field `key` (index `idx`), made on first sight.
-fn iro_fdv_slot(fx: & mut IroFdv, key: str, idx: i64) -> i64 {
+fn iro_fdv_slot(fx: &mut IroFdv, key: str, idx: i64) -> i64 {
     if HashMap_contains(fx.at, key) {
         return HashMap_get(fx.at, key) - 1;
     }
@@ -7280,7 +7300,7 @@ fn iro_fdv_slot(fx: & mut IroFdv, key: str, idx: i64) -> i64 {
     var bi: i64 = 0;
     while bi < fx.bad_structs.len() {
         if str_starts_with(key, fx.bad_structs.get(bi) + "#") {
-            st = - 1;
+            st = -1;
         }
         bi = bi + 1;
     }
@@ -7295,18 +7315,18 @@ fn iro_fdv_slot(fx: & mut IroFdv, key: str, idx: i64) -> i64 {
 
 /// One more store of slot `s`: of dyn type / closure target `val` ("" when
 /// it stores anything else).
-fn iro_fdv_merge(fx: & mut IroFdv, s: i64, closure: bool, val: str) {
+fn iro_fdv_merge(fx: &mut IroFdv, s: i64, closure: bool, val: str) {
     if closure {
         if fx.cstate.get(s) < 0 {
             return;
         }
         if str_len(val) == 0 {
-            fx.cstate.set(s, - 1);
+            fx.cstate.set(s, -1);
         } else if fx.cstate.get(s) == 0 {
             fx.cstate.set(s, 1);
             fx.cval.set(s, val);
         } else if fx.cval.get(s) != val {
-            fx.cstate.set(s, - 1);
+            fx.cstate.set(s, -1);
         }
         return;
     }
@@ -7314,23 +7334,23 @@ fn iro_fdv_merge(fx: & mut IroFdv, s: i64, closure: bool, val: str) {
         return;
     }
     if str_len(val) == 0 {
-        fx.dstate.set(s, - 1);
+        fx.dstate.set(s, -1);
     } else if fx.dstate.get(s) == 0 {
         fx.dstate.set(s, 1);
         fx.dval.set(s, val);
     } else if fx.dval.get(s) != val {
-        fx.dstate.set(s, - 1);
+        fx.dstate.set(s, -1);
     }
 }
 
 /// Field address `p` of `g` is used other than to load from or store to
 /// (passed to a call, copied into, `&mut s.f`): what it holds is not known.
-fn iro_fdv_lose(fx: & mut IroFdv, g: & IrFunction, p: i64) {
+fn iro_fdv_lose(fx: &mut IroFdv, g: &IrFunction, p: i64) {
     var key: str = iro_fdv_key(g, p);
     if str_len(key) > 0 {
-        var s: i64 = iro_fdv_slot(fx, key, - 1);
-        fx.dstate.set(s, - 1);
-        fx.cstate.set(s, - 1);
+        var s: i64 = iro_fdv_slot(fx, key, -1);
+        fx.dstate.set(s, -1);
+        fx.cstate.set(s, -1);
         return;
     }
     match peir_inst_of(g, p) {
@@ -7345,9 +7365,9 @@ fn iro_fdv_lose(fx: & mut IroFdv, g: & IrFunction, p: i64) {
 }
 
 /// Add what `g`'s stores to struct fields store to `fx`.
-fn iro_fdv_collect(g: & IrFunction, fx: & mut IroFdv) {
+fn iro_fdv_collect(g: &IrFunction, fx: &mut IroFdv) {
     var plain: Vec<i64> = iro_plain_locals(g);
-    var once: Vec<i64> = iro_fdv_once(g, & plain);
+    var once: Vec<i64> = iro_fdv_once(g, &plain);
     var u: IroUses = IroUses {
         count: Vec::new(), users: Vec::new(), block_of: Vec::new(), pos_of: Vec::new()
     };
@@ -7359,7 +7379,7 @@ fn iro_fdv_collect(g: & IrFunction, fx: & mut IroFdv) {
         while j < ids.len() {
             var inst: Inst = peir_inst_of(g, ids.get(j));
             var ops: Vec<i64> = Vec::new();
-            peir_inst_operands(inst, & mut ops);
+            peir_inst_operands(inst, &mut ops);
             var o: i64 = 0;
             while o < ops.len() {
                 var v: i64 = ops.get(o);
@@ -7394,7 +7414,7 @@ fn iro_fdv_collect(g: & IrFunction, fx: & mut IroFdv) {
                     match peir_inst_of(g, sp) {
                         Inst::GetFieldPtr(_, sidx, sfty) => {
                             var key: str = iro_fdv_key(g, sp);
-                            var src: i64 = iro_fdv_src(g, & once, sv);
+                            var src: i64 = iro_fdv_src(g, &once, sv);
                             var dv: str = "";
                             var cv: str = "";
                             var copy: bool = false;
@@ -7413,7 +7433,7 @@ fn iro_fdv_collect(g: & IrFunction, fx: & mut IroFdv) {
                                             u = iro_uses(g);
                                             have_u = true;
                                         }
-                                        cv = iro_cdev_fname_of(g, & u, src);
+                                        cv = iro_cdev_fname_of(g, &u, src);
                                     }
                                 }
                             }
@@ -7444,14 +7464,14 @@ fn iro_fdv_collect(g: & IrFunction, fx: & mut IroFdv) {
 
 /// The slot whose facts value `v` of `g` has when it is (through a local
 /// stored once with it) a load of a struct field; -1 when none.
-fn iro_fdv_fact(g: & IrFunction, fx: & IroFdv, once: & Vec<i64>, v: i64) -> i64 {
+fn iro_fdv_fact(g: &IrFunction, fx: &IroFdv, once: &Vec<i64>, v: i64) -> i64 {
     var src: i64 = iro_fdv_src(g, once, v);
     match peir_inst_of(g, src) {
         Inst::Load(q, _) => {
             var key: str = iro_fdv_key(g, q);
             if str_len(key) > 0 && HashMap_contains(fx.at, key) {
                 var s: i64 = HashMap_get(fx.at, key) - 1;
-                var idx: i64 = - 1;
+                var idx: i64 = -1;
                 match peir_inst_of(g, q) {
                     Inst::GetFieldPtr(_, qi, _) => {
                         idx = qi;
@@ -7467,12 +7487,12 @@ fn iro_fdv_fact(g: & IrFunction, fx: & IroFdv, once: & Vec<i64>, v: i64) -> i64 
         _ => {
         }
     }
-    return - 1;
+    return -1;
 }
 
 /// Put the detached instructions `pre` (in order) just before `at` in
 /// block `bi` of `g`.
-fn iro_fdv_put_before(g: & mut IrFunction, bi: i64, at: i64, pre: & Vec<i64>) {
+fn iro_fdv_put_before(g: &mut IrFunction, bi: i64, at: i64, pre: &Vec<i64>) {
     var blk: BasicBlock = g.blocks.get(bi);
     var ins: Vec<i64> = Vec::new();
     var k: i64 = 0;
@@ -7495,9 +7515,9 @@ fn iro_fdv_put_before(g: & mut IrFunction, bi: i64, at: i64, pre: & Vec<i64>) {
 /// Make `g`'s trait calls and closure calls on values read from a field
 /// with a known type / target (fx) direct calls. `counts` [0] dyn, [1]
 /// closure calls made direct.
-fn iro_fdv_rewrite(module: & IrModule, g: & mut IrFunction, fx: & IroFdv, counts: & mut Vec<i64>) -> bool {
+fn iro_fdv_rewrite(module: &IrModule, g: &mut IrFunction, fx: &IroFdv, counts: &mut Vec<i64>) -> bool {
     var plain: Vec<i64> = iro_plain_locals(g);
-    var once: Vec<i64> = iro_fdv_once(g, & plain);
+    var once: Vec<i64> = iro_fdv_once(g, &plain);
     var changed: bool = false;
     var bi: i64 = 0;
     while bi < g.blocks.len() {
@@ -7508,7 +7528,7 @@ fn iro_fdv_rewrite(module: & IrModule, g: & mut IrFunction, fx: & IroFdv, counts
             match peir_inst_of(g, iid) {
                 Inst::DynCall(_dt, dm, dargs, dret, _de) => {
                     if dargs.len() > 0 {
-                        var s: i64 = iro_fdv_fact(g, fx, & once, dargs.get(0));
+                        var s: i64 = iro_fdv_fact(g, fx, &once, dargs.get(0));
                         if s >= 0 && fx.dstate.get(s) == 1 {
                             var mname: str = fx.dval.get(s) + "_" + dm;
                             match IrModule_get_function(module, mname) {
@@ -7528,7 +7548,7 @@ fn iro_fdv_rewrite(module: & IrModule, g: & mut IrFunction, fx: & IroFdv, counts
                                         pre.push(at);
                                         pre.push(recv);
                                         pre.push(env0);
-                                        iro_fdv_put_before(g, bi, iid, & pre);
+                                        iro_fdv_put_before(g, bi, iid, &pre);
                                         var nargs: Vec<i64> = Vec::new();
                                         nargs.push(env0);
                                         nargs.push(recv);
@@ -7549,7 +7569,7 @@ fn iro_fdv_rewrite(module: & IrModule, g: & mut IrFunction, fx: & IroFdv, counts
                     }
                 }
                 Inst::CallPtr(fp, cargs, cret, _ce, _chas) => {
-                    var s2: i64 = iro_fdv_fact(g, fx, & once, fp);
+                    var s2: i64 = iro_fdv_fact(g, fx, &once, fp);
                     if s2 >= 0 && fx.cstate.get(s2) == 1 {
                         var fname: str = fx.cval.get(s2);
                         match IrModule_get_function(module, fname) {
@@ -7596,7 +7616,7 @@ fn iro_fdv_rewrite(module: & IrModule, g: & mut IrFunction, fx: & IroFdv, counts
 /// dyn or closure store or opaque field address on a pointer of no known
 /// struct. `counts` gets the dyn calls ([0]) and closure calls ([1]) made
 /// direct; returns their sum. FID_IROPT_OFF=fielddevirt.
-pub fn iro_field_devirt(module: & mut IrModule, counts: & mut Vec<i64>) -> i64 {
+pub fn iro_field_devirt(module: &mut IrModule, counts: &mut Vec<i64>) -> i64 {
     while counts.len() < 2 {
         counts.push(0);
     }
@@ -7655,7 +7675,7 @@ pub fn iro_field_devirt(module: & mut IrModule, counts: & mut Vec<i64>) -> i64 {
             si2 = si2 + 1;
         }
         if has_gfp {
-            iro_fdv_collect(& g, & mut fx);
+            iro_fdv_collect(&g, &mut fx);
         }
         fi = fi + 1;
     }
@@ -7688,7 +7708,7 @@ pub fn iro_field_devirt(module: & mut IrModule, counts: & mut Vec<i64>) -> i64 {
             }
             si3 = si3 + 1;
         }
-        if has_call && iro_fdv_rewrite(module, & mut g2, & fx, counts) {
+        if has_call && iro_fdv_rewrite(module, &mut g2, &fx, counts) {
             var ent: IrFunctionEntry = module.functions.get(fi);
             ent.func = g2;
             module.functions.set(fi, ent);
@@ -7701,7 +7721,7 @@ pub fn iro_field_devirt(module: & mut IrModule, counts: & mut Vec<i64>) -> i64 {
 /// WP18: a global with a constant initializer whose address is only ever
 /// loaded — never stored through and never escaping — has its loads folded
 /// to the initializer. cval per global: 0 not an int constant, -1 excluded.
-pub fn iro_const_globals(module: & mut IrModule) -> i64 {
+pub fn iro_const_globals(module: &mut IrModule) -> i64 {
     return iro_const_globals_in(module, 0);
 }
 
@@ -7709,7 +7729,7 @@ pub fn iro_const_globals(module: & mut IrModule) -> i64 {
 /// (iro_mid_reach) holds only (`reach` 0: every function); which globals
 /// are never written is still decided over every function. A function
 /// that takes the address of no candidate global costs one scan, no tables.
-pub fn iro_const_globals_in(module: & mut IrModule, reach: i64) -> i64 {
+pub fn iro_const_globals_in(module: &mut IrModule, reach: i64) -> i64 {
     var count: i64 = 0;
     if module.globals.len() == 0 {
         return 0;
@@ -7796,7 +7816,7 @@ pub fn iro_const_globals_in(module: & mut IrModule, reach: i64) -> i64 {
                 while jj < f.insts.len() {
                     var ve2: ValueIdInst = f.insts.get(jj);
                     var ops: Vec<i64> = Vec::new();
-                    peir_inst_operands(ve2.inst, & mut ops);
+                    peir_inst_operands(ve2.inst, &mut ops);
                     var oi: i64 = 0;
                     while oi < ops.len() {
                         var o: i64 = ops.get(oi);
@@ -7826,13 +7846,14 @@ pub fn iro_const_globals_in(module: & mut IrModule, reach: i64) -> i64 {
                 var kk: i64 = 0;
                 if phase == 0 {
                     kk = f.insts.len();
-                } while kk < f.insts.len() {
+                }
+                while kk < f.insts.len() {
                     var ve3: ValueIdInst = f.insts.get(kk);
                     match ve3.inst {
                         Inst::Load(p, lty) => {
                             if p >= 0 && p < cand.len() && cand.get(p) > 0 && bad.get(p) == 0 && iro_int_ty(lty) {
                                 var cv2: i64 = cval.get(cand.get(p) - 1) - 2;
-                                IrFunction_set_inst(& mut f, ve3.id, Inst::ConstInt(cv2, lty));
+                                IrFunction_set_inst(&mut f, ve3.id, Inst::ConstInt(cv2, lty));
                                 count = count + 1;
                             }
                         }
@@ -7867,8 +7888,8 @@ fn iro_i64_in(v: Vec<i64>, x: i64) -> bool {
 
 /// Emit a constant for parameter `p` at the front of the entry block and
 /// rewrite its uses — shared by specialization's clones.
-fn iro_emit_param_const(f: & mut IrFunction, pid: i64, pty: IrType, v: i64) -> bool {
-    var nid: i64 = - 1;
+fn iro_emit_param_const(f: &mut IrFunction, pid: i64, pty: IrType, v: i64) -> bool {
+    var nid: i64 = -1;
     if ir_type_eq(pty, IrType::Bool) {
         f.current_block_idx = 0;
         nid = IrFunction_emit(f, Inst::ConstBool(v != 0));
@@ -7897,7 +7918,7 @@ fn iro_emit_param_const(f: & mut IrFunction, pid: i64, pty: IrType, v: i64) -> b
     var vi: i64 = 0;
     while vi < f.insts.len() {
         var ve: ValueIdInst = f.insts.get(vi);
-        ve.inst = iro_remap_all(ve.inst, & map);
+        ve.inst = iro_remap_all(ve.inst, &map);
         f.insts.set(vi, ve);
         vi = vi + 1;
     }
@@ -7944,7 +7965,7 @@ fn iro_clone_function(f: IrFunction, newname: str) -> IrFunction {
 /// which all read the same flag when picking a register count. Runs
 /// unconditionally (unlike env trimming): the flag only selects a wider
 /// arg-register set in the backend; it changes no signatures.
-pub fn iro_conv_mark(module: & mut IrModule) -> i64 {
+pub fn iro_conv_mark(module: &mut IrModule) -> i64 {
     var nfn: i64 = module.functions.len();
     var pinned: i64 = iro_conv_pinned(module);
     var count: i64 = 0;
@@ -7976,7 +7997,7 @@ pub fn iro_conv_mark(module: & mut IrModule) -> i64 {
 /// ir_data_named_fns), a `dyn` method target (`Type_method` of a MakeDyn
 /// type and a DynCall method), externs and C callbacks. A table of names;
 /// the caller drops it.
-fn iro_conv_pinned(module: & IrModule) -> i64 {
+fn iro_conv_pinned(module: &IrModule) -> i64 {
     var pinned: i64 = HashMap_new();
     var seen_t: i64 = HashMap_new();
     var seen_m: i64 = HashMap_new();
@@ -8075,7 +8096,7 @@ fn iro_conv_free(pinned: i64, name: str, is_interrupt: bool, is_kernel: bool) ->
 /// Address-taken functions (ConstFnRef), trait-impl targets of DynCall,
 /// externs, C callbacks and runtime helpers keep the uniform convention —
 /// CallPtr always passes an environment.
-pub fn iro_env_trim(module: & mut IrModule) -> i64 {
+pub fn iro_env_trim(module: &mut IrModule) -> i64 {
     var count: i64 = 0;
     var nfn: i64 = module.functions.len();
     // WP7 (Nov 17): the exclusions are WP6's (iro_conv_pinned, a table:
@@ -8104,7 +8125,7 @@ pub fn iro_env_trim(module: & mut IrModule) -> i64 {
             var ii: i64 = 0;
             while ii < g.insts.len() && !used {
                 var ops: Vec<i64> = Vec::new();
-                peir_inst_operands(g.insts.get(ii).inst, & mut ops);
+                peir_inst_operands(g.insts.get(ii).inst, &mut ops);
                 var oi: i64 = 0;
                 while oi < ops.len() {
                     if ops.get(oi) == env_id {
@@ -8191,7 +8212,7 @@ fn iro_spec_sat(x: i64) -> i64 {
 /// in the profiled run when there is a profile (`--profile-use`, pgo.fd;
 /// a function the run never called weighs 0). Indexed by value id; 0 for
 /// anything but a call.
-fn iro_call_weights(g: & IrFunction) -> Vec<i64> {
+fn iro_call_weights(g: &IrFunction) -> Vec<i64> {
     var w: Vec<i64> = peir_zeros(g.next_value + 1);
     var base: i64 = 1;
     if pgo_count("main") > 0 {
@@ -8204,7 +8225,7 @@ fn iro_call_weights(g: & IrFunction) -> Vec<i64> {
         }
     }
     var cfg: IroCfg = iro_cfg(g);
-    var lt: IroLoops = iro_loops(& cfg);
+    var lt: IroLoops = iro_loops(&cfg);
     var b: i64 = 0;
     while b < g.blocks.len() {
         var d: i64 = 0;
@@ -8245,7 +8266,7 @@ fn iro_call_weights(g: & IrFunction) -> Vec<i64> {
 /// the sites function by function, so they are the run of `site_f` equal
 /// to site_f[s] around s. The function's loops are found once for all of
 /// them.
-fn iro_spec_site_weights(module: & IrModule, site_f: & Vec<i64>, site_i: & Vec<i64>, site_w: & mut Vec<i64>, s: i64) {
+fn iro_spec_site_weights(module: &IrModule, site_f: &Vec<i64>, site_i: &Vec<i64>, site_w: &mut Vec<i64>, s: i64) {
     var f: i64 = site_f.get(s);
     var lo: i64 = s;
     while lo > 0 && site_f.get(lo - 1) == f {
@@ -8256,7 +8277,7 @@ fn iro_spec_site_weights(module: & IrModule, site_f: & Vec<i64>, site_i: & Vec<i
         hi = hi + 1;
     }
     var g: IrFunction = module.functions.get(f).func;
-    var wts: Vec<i64> = iro_call_weights(& g);
+    var wts: Vec<i64> = iro_call_weights(&g);
     var k: i64 = lo;
     while k < hi {
         var w: i64 = 1;
@@ -8278,7 +8299,7 @@ fn iro_spec_hottest(vals: Vec<i64>, wts: Vec<i64>, most: i64) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     var used: Vec<i64> = peir_zeros(vals.len());
     while out.len() < most {
-        var best: i64 = - 1;
+        var best: i64 = -1;
         var i: i64 = 0;
         while i < vals.len() {
             if used.get(i) == 0 && wts.get(i) >= IRO_SPEC_HOT && (best < 0 || wts.get(i) > wts.get(best)) {
@@ -8302,7 +8323,7 @@ fn iro_spec_hottest(vals: Vec<i64>, wts: Vec<i64>, most: i64) -> Vec<i64> {
 /// in functions `reach` holds (what main reaches, a table of names) count;
 /// every clone made is added to `reach`, so the per-function passes
 /// optimize it with its constant.
-pub fn iro_specialize(module: & mut IrModule, reach: i64) -> i64 {
+pub fn iro_specialize(module: &mut IrModule, reach: i64) -> i64 {
     var count: i64 = 0;
     var nfn: i64 = module.functions.len();
     var fidx: i64 = HashMap_new();
@@ -8397,7 +8418,7 @@ pub fn iro_specialize(module: & mut IrModule, reach: i64) -> i64 {
         while ii < g.insts.len() {
             match g.insts.get(ii).inst {
                 Inst::Call(nm, args, _r, _e) => {
-                    var ci: i64 = - 1;
+                    var ci: i64 = -1;
                     if HashMap_contains(cidx, nm) {
                         ci = HashMap_get(cidx, nm) - 1;
                     } else {
@@ -8412,8 +8433,8 @@ pub fn iro_specialize(module: & mut IrModule, reach: i64) -> i64 {
                                 ci = cands.len();
                                 cands.push(at);
                                 npar.push(np0);
-                                cand_head.push(- 1);
-                                cand_tail.push(- 1);
+                                cand_head.push(-1);
+                                cand_tail.push(-1);
                                 var q: i64 = 0;
                                 while q < 8 {
                                     mixed.push(0);
@@ -8431,8 +8452,8 @@ pub fn iro_specialize(module: & mut IrModule, reach: i64) -> i64 {
                             var s: i64 = site_f.len();
                             site_f.push(fi);
                             site_i.push(ii);
-                            site_next.push(- 1);
-                            site_w.push(- 1);
+                            site_next.push(-1);
+                            site_w.push(-1);
                             site_moved.push(0);
                             if cand_tail.get(ci) < 0 {
                                 cand_head.set(ci, s);
@@ -8522,10 +8543,10 @@ pub fn iro_specialize(module: & mut IrModule, reach: i64) -> i64 {
                     var bv4: i64 = site_av.get(s2 * 8 + j2);
                     if site_moved.get(s2) == 0 && site_ac.get(s2 * 8 + j2) == 1 && bv4 >= 0 && bv4 < 1000000 {
                         if site_w.get(s2) < 0 {
-                            iro_spec_site_weights(module, & site_f, & site_i, & mut site_w, s2);
+                            iro_spec_site_weights(module, &site_f, &site_i, &mut site_w, s2);
                         }
                         var sw4: i64 = site_w.get(s2);
-                        var at4: i64 = - 1;
+                        var at4: i64 = -1;
                         var vq4: i64 = 0;
                         while vq4 < allv.len() {
                             if allv.get(vq4) == bv4 {
@@ -8550,7 +8571,7 @@ pub fn iro_specialize(module: & mut IrModule, reach: i64) -> i64 {
                     if !HashMap_contains(fidx, cname) {
                         var nf: IrFunction = iro_clone_function(cent.func, cname);
                         var pj: ValueIdType = nf.params.get(j2);
-                        if iro_emit_param_const(& mut nf, pj.id, pj.ty, cv) {
+                        if iro_emit_param_const(&mut nf, pj.id, pj.ty, cv) {
                             module.functions.push(IrFunctionEntry_new(cname, nf));
                             HashMap_insert(reach, cname, 1);
                             clones = clones + 1;
@@ -8606,7 +8627,17 @@ pub fn iro_specialize(module: & mut IrModule, reach: i64) -> i64 {
 // over the whole module (recursion included: a fixpoint). The rules' call
 // merging (compiler/rules.fd) and the library-facts file use them.
 
-const IRO_EB_ALLOC: i64 = 1; const IRO_EB_IO: i64 = 2; const IRO_EB_NET: i64 = 4; const IRO_EB_SPAWN: i64 = 8; const IRO_EB_DIVERGE: i64 = 16; const IRO_EB_READ: i64 = 32; const IRO_EB_WRITE: i64 = 64; const IRO_EB_DIFF: i64 = 128; const IRO_EB_NOISE: i64 = 256; const IRO_EB_COMM: i64 = 512;  /// The bit of one effect in an effect mask.
+const IRO_EB_ALLOC: i64 = 1;
+const IRO_EB_IO: i64 = 2;
+const IRO_EB_NET: i64 = 4;
+const IRO_EB_SPAWN: i64 = 8;
+const IRO_EB_DIVERGE: i64 = 16;
+const IRO_EB_READ: i64 = 32;
+const IRO_EB_WRITE: i64 = 64;
+const IRO_EB_DIFF: i64 = 128;
+const IRO_EB_NOISE: i64 = 256;
+const IRO_EB_COMM: i64 = 512;
+/// The bit of one effect in an effect mask.
 pub fn iro_eff_bit(e: Effect) -> i64 {
     match e {
         Effect::Alloc => {
@@ -8644,7 +8675,7 @@ pub fn iro_eff_bit(e: Effect) -> i64 {
 }
 
 /// The mask of an effect set.
-pub fn iro_eff_mask(s: & EffectSet) -> i64 {
+pub fn iro_eff_mask(s: &EffectSet) -> i64 {
     var m: i64 = 0;
     var i: i64 = 0;
     while i < s.effects.len() {
@@ -8658,34 +8689,34 @@ pub fn iro_eff_mask(s: & EffectSet) -> i64 {
 pub fn iro_mask_effects(m: i64) -> EffectSet {
     var s: EffectSet = EffectSet_new();
     if (m & IRO_EB_ALLOC) != 0 {
-        EffectSet_add(& mut s, Effect::Alloc);
+        EffectSet_add(&mut s, Effect::Alloc);
     }
     if (m & IRO_EB_IO) != 0 {
-        EffectSet_add(& mut s, Effect::IO);
+        EffectSet_add(&mut s, Effect::IO);
     }
     if (m & IRO_EB_NET) != 0 {
-        EffectSet_add(& mut s, Effect::Net);
+        EffectSet_add(&mut s, Effect::Net);
     }
     if (m & IRO_EB_SPAWN) != 0 {
-        EffectSet_add(& mut s, Effect::Spawn);
+        EffectSet_add(&mut s, Effect::Spawn);
     }
     if (m & IRO_EB_DIVERGE) != 0 {
-        EffectSet_add(& mut s, Effect::Diverge);
+        EffectSet_add(&mut s, Effect::Diverge);
     }
     if (m & IRO_EB_READ) != 0 {
-        EffectSet_add(& mut s, Effect::Read);
+        EffectSet_add(&mut s, Effect::Read);
     }
     if (m & IRO_EB_WRITE) != 0 {
-        EffectSet_add(& mut s, Effect::Write);
+        EffectSet_add(&mut s, Effect::Write);
     }
     if (m & IRO_EB_DIFF) != 0 {
-        EffectSet_add(& mut s, Effect::Diff);
+        EffectSet_add(&mut s, Effect::Diff);
     }
     if (m & IRO_EB_NOISE) != 0 {
-        EffectSet_add(& mut s, Effect::Noise);
+        EffectSet_add(&mut s, Effect::Noise);
     }
     if (m & IRO_EB_COMM) != 0 {
-        EffectSet_add(& mut s, Effect::Comm);
+        EffectSet_add(&mut s, Effect::Comm);
     }
     return s;
 }
@@ -8710,11 +8741,11 @@ pub fn iro_mask_no_write(m: i64) -> bool {
 /// The memory a value addresses: its id chased back through field and
 /// element pointers and casts (an Alloca id for a local's address; the
 /// value itself for anything else).
-pub fn iro_mem_base(f: & IrFunction, id0: i64) -> i64 {
+pub fn iro_mem_base(f: &IrFunction, id0: i64) -> i64 {
     var id: i64 = id0;
     var steps: i64 = 0;
     while steps < 16 {
-        var next: i64 = - 1;
+        var next: i64 = -1;
         match peir_inst_of(f, id) {
             Inst::GetFieldPtr(p, _, _) => {
                 next = p;
@@ -8741,7 +8772,8 @@ pub fn iro_mem_base(f: & IrFunction, id0: i64) -> i64 {
 /// through field and element pointers, casts, width changes and address
 /// arithmetic (`p as i64 + 8` stored somewhere still lets the local be
 /// reached). Past IRO_ESC_STEPS values every Alloca of `f` is marked.
-const IRO_ESC_STEPS: i64 = 256; fn iro_esc_mark(f: & IrFunction, esc: & mut Vec<i64>, v: i64) {
+const IRO_ESC_STEPS: i64 = 256;
+fn iro_esc_mark(f: &IrFunction, esc: &mut Vec<i64>, v: i64) {
     var work: Vec<i64> = Vec::new();
     work.push(v);
     var steps: i64 = 0;
@@ -8784,7 +8816,7 @@ const IRO_ESC_STEPS: i64 = 256; fn iro_esc_mark(f: & IrFunction, esc: & mut Vec<
     }
 }
 
-fn iro_esc_mark_all(f: & IrFunction, esc: & mut Vec<i64>) {
+fn iro_esc_mark_all(f: &IrFunction, esc: &mut Vec<i64>) {
     var i: i64 = 0;
     while i < f.insts.len() {
         var ve: ValueIdInst = f.insts.get(i);
@@ -8801,7 +8833,7 @@ fn iro_esc_mark_all(f: & IrFunction, esc: & mut Vec<i64>) {
     }
 }
 
-fn iro_esc_mark_vec(f: & IrFunction, esc: & mut Vec<i64>, vs: Vec<i64>) {
+fn iro_esc_mark_vec(f: &IrFunction, esc: &mut Vec<i64>, vs: Vec<i64>) {
     var i: i64 = 0;
     while i < vs.len() {
         iro_esc_mark(f, esc, vs.get(i));
@@ -8813,38 +8845,38 @@ fn iro_esc_mark_vec(f: & IrFunction, esc: & mut Vec<i64>, vs: Vec<i64>) {
 /// address leaves the function: call arguments, stored values, struct
 /// copies, persisted values, returns. Loads and stores through any other
 /// Alloca touch only the function's own frame.
-pub fn iro_esc_of(f: & IrFunction) -> Vec<i64> {
+pub fn iro_esc_of(f: &IrFunction) -> Vec<i64> {
     var esc: Vec<i64> = peir_zeros(f.next_value + 1);
     var i: i64 = 0;
     while i < f.insts.len() {
         match f.insts.get(i).inst {
             Inst::Call(_n, args, _r, _e) => {
-                iro_esc_mark_vec(f, & mut esc, args);
+                iro_esc_mark_vec(f, &mut esc, args);
             }
             Inst::CallPtr(fp, args2, _r2, _e2, _z) => {
-                iro_esc_mark(f, & mut esc, fp);
-                iro_esc_mark_vec(f, & mut esc, args2);
+                iro_esc_mark(f, &mut esc, fp);
+                iro_esc_mark_vec(f, &mut esc, args2);
             }
             Inst::DynCall(_t, _m, args3, _r3, _e3) => {
-                iro_esc_mark_vec(f, & mut esc, args3);
+                iro_esc_mark_vec(f, &mut esc, args3);
             }
             Inst::MakeDyn(dv, _dt, _dn) => {
-                iro_esc_mark(f, & mut esc, dv);
+                iro_esc_mark(f, &mut esc, dv);
             }
             Inst::Store(_p, v, _t) => {
-                iro_esc_mark(f, & mut esc, v);
+                iro_esc_mark(f, &mut esc, v);
             }
             Inst::StructCopy(d, s, _t2) => {
-                iro_esc_mark(f, & mut esc, d);
-                iro_esc_mark(f, & mut esc, s);
+                iro_esc_mark(f, &mut esc, d);
+                iro_esc_mark(f, &mut esc, s);
             }
             Inst::PersistSave(_pn, v2) => {
-                iro_esc_mark(f, & mut esc, v2);
+                iro_esc_mark(f, &mut esc, v2);
             }
             Inst::Return(rv) => {
                 match rv {
                     OptValueId::Some(v3) => {
-                        iro_esc_mark(f, & mut esc, v3);
+                        iro_esc_mark(f, &mut esc, v3);
                     }
                     OptValueId::None => {
                     }
@@ -8852,7 +8884,7 @@ pub fn iro_esc_of(f: & IrFunction) -> Vec<i64> {
             }
             // inline assembly may do anything with what it is given
             Inst::Asm(_, _, _, _) => {
-                iro_esc_mark_all(f, & mut esc);
+                iro_esc_mark_all(f, &mut esc);
             }
             _ => {
             }
@@ -8863,7 +8895,7 @@ pub fn iro_esc_of(f: & IrFunction) -> Vec<i64> {
 }
 
 /// Is `p` an address into a local of `f` that nothing outside it can see?
-pub fn iro_local_addr(f: & IrFunction, esc: & Vec<i64>, p: i64) -> bool {
+pub fn iro_local_addr(f: &IrFunction, esc: &Vec<i64>, p: i64) -> bool {
     var b: i64 = iro_mem_base(f, p);
     match peir_inst_of(f, b) {
         Inst::Alloca(_, _) => {
@@ -8880,7 +8912,7 @@ pub fn iro_local_addr(f: & IrFunction, esc: & Vec<i64>, p: i64) -> bool {
 /// what lowering said it is (plus a write when that is more than reading);
 /// a library function is what its facts file says (WP20); anything else may
 /// write.
-pub fn iro_absent_call_mask(name: str, site: & EffectSet) -> i64 {
+pub fn iro_absent_call_mask(name: str, site: &EffectSet) -> i64 {
     var m: i64 = iro_eff_mask(site);
     if str_starts_with(name, "p_") {
         if !EffectSet_is_read_only(site) {
@@ -8898,7 +8930,7 @@ pub fn iro_absent_call_mask(name: str, site: & EffectSet) -> i64 {
 /// The effects of `f`'s own instructions that a caller can see (no callee
 /// of `f` counted, except those the module does not define); the module
 /// functions it calls directly are added to `callees` (positions).
-fn iro_local_ext_mask(module: & IrModule, f: & IrFunction, callees: & mut Vec<i64>) -> i64 {
+fn iro_local_ext_mask(module: &IrModule, f: &IrFunction, callees: &mut Vec<i64>) -> i64 {
     var esc: Vec<i64> = iro_esc_of(f);
     var m: i64 = 0;
     var i: i64 = 0;
@@ -8909,12 +8941,12 @@ fn iro_local_ext_mask(module: & IrModule, f: & IrFunction, callees: & mut Vec<i6
             Inst::Alloca(_, _) => {
             }
             Inst::Load(p, _t) => {
-                if !iro_local_addr(f, & esc, p) {
+                if !iro_local_addr(f, &esc, p) {
                     m = m | IRO_EB_READ;
                 }
             }
             Inst::Store(p2, _v, _t2) => {
-                if !iro_local_addr(f, & esc, p2) {
+                if !iro_local_addr(f, &esc, p2) {
                     m = m | IRO_EB_WRITE;
                 }
             }
@@ -8922,22 +8954,22 @@ fn iro_local_ext_mask(module: & IrModule, f: & IrFunction, callees: & mut Vec<i6
                 var pos: i64 = IrModule_fn_pos(module, cn);
                 if pos >= 0 {
                     if iro_site_effects_count(cn) {
-                        m = m | iro_eff_mask(& ce);
+                        m = m | iro_eff_mask(&ce);
                     }
                     callees.push(pos);
                 } else {
-                    m = m | iro_absent_call_mask(cn, & ce);
+                    m = m | iro_absent_call_mask(cn, &ce);
                 }
             }
             Inst::CallPtr(_fp, _pa, _pr, pe, _pz) => {
-                m = m | iro_eff_mask(& pe) | IRO_EB_READ | IRO_EB_WRITE;
+                m = m | iro_eff_mask(&pe) | IRO_EB_READ | IRO_EB_WRITE;
             }
             Inst::DynCall(_dt, _dm, _da, _dr, de) => {
-                m = m | iro_eff_mask(& de) | IRO_EB_READ | IRO_EB_WRITE;
+                m = m | iro_eff_mask(&de) | IRO_EB_READ | IRO_EB_WRITE;
             }
             _ => {
-                var ie: EffectSet = inst_effects(& inst);
-                m = m | iro_eff_mask(& ie);
+                var ie: EffectSet = inst_effects(&inst);
+                m = m | iro_eff_mask(&ie);
             }
         }
         i = i + 1;
@@ -8961,7 +8993,7 @@ fn iro_local_ext_mask(module: & IrModule, f: & IrFunction, callees: & mut Vec<i6
 /// the call as one that allocates nothing. The typechecker enforces the
 /// annotation (a @no-alloc function that allocates is rejected,
 /// safety-rules.md), so the mask is never wrong for checked code.
-fn iro_mask_annotated(f: & IrFunction, m0: i64) -> i64 {
+fn iro_mask_annotated(f: &IrFunction, m0: i64) -> i64 {
     var m: i64 = m0;
     if f.is_crashfree && (m & IRO_EB_DIVERGE) != 0 {
         m = m - IRO_EB_DIVERGE;
@@ -8977,7 +9009,7 @@ fn iro_mask_annotated(f: & IrFunction, m0: i64) -> i64 {
 /// transitively. Callees are visited first (post-order over the call
 /// graph), so an acyclic program settles in one round and the next round
 /// confirms it; recursion takes a round per step around a cycle.
-pub fn iro_effect_masks(module: & IrModule) -> Vec<i64> {
+pub fn iro_effect_masks(module: &IrModule) -> Vec<i64> {
     return iro_effect_masks_in(module, 0);
 }
 
@@ -8989,7 +9021,7 @@ const IRO_EB_ALL: i64 = 1023;
 /// and their callees, transitively (iro_call_closure): the same masks as
 /// over the whole module for those; IRO_EB_ALL for the others, which no
 /// function of the set calls. `reach` 0: every function.
-pub fn iro_effect_masks_in(module: & IrModule, reach: i64) -> Vec<i64> {
+pub fn iro_effect_masks_in(module: &IrModule, reach: i64) -> Vec<i64> {
     var n: i64 = module.functions.len();
     var keep: Vec<i64> = iro_call_closure(module, reach);
     var masks: Vec<i64> = Vec::new();
@@ -8997,10 +9029,10 @@ pub fn iro_effect_masks_in(module: & IrModule, reach: i64) -> Vec<i64> {
     var i: i64 = 0;
     while i < n {
         var cs: Vec<i64> = Vec::new();
-        if iro_kept_at(& keep, i) {
+        if iro_kept_at(&keep, i) {
             var f: IrFunction = module.functions.get(i).func;
-            var lm: i64 = iro_local_ext_mask(module, & f, & mut cs);
-            masks.push(iro_mask_annotated(& f, lm));
+            var lm: i64 = iro_local_ext_mask(module, &f, &mut cs);
+            masks.push(iro_mask_annotated(&f, lm));
         } else {
             masks.push(IRO_EB_ALL);
         }
@@ -9057,9 +9089,9 @@ pub fn iro_effect_masks_in(module: & IrModule, reach: i64) -> Vec<i64> {
                 ci = ci + 1;
             }
             // SP3: a function left out keeps IRO_EB_ALL
-            if iro_kept_at(& keep, fi) {
+            if iro_kept_at(&keep, fi) {
                 var f2: IrFunction = module.functions.get(fi).func;
-                m = iro_mask_annotated(& f2, m);
+                m = iro_mask_annotated(&f2, m);
                 if m != masks.get(fi) {
                     masks.set(fi, m);
                     changed = true;
@@ -9074,7 +9106,7 @@ pub fn iro_effect_masks_in(module: & IrModule, reach: i64) -> Vec<i64> {
 /// The effect mask of a call to `name` with call-site effects `site`, given
 /// the module's masks (iro_effect_masks): a module function's transitive
 /// mask, or iro_absent_call_mask.
-pub fn iro_call_mask(module: & IrModule, masks: & Vec<i64>, name: str, site: & EffectSet) -> i64 {
+pub fn iro_call_mask(module: &IrModule, masks: &Vec<i64>, name: str, site: &EffectSet) -> i64 {
     var pos: i64 = IrModule_fn_pos(module, name);
     if pos >= 0 && pos < masks.len() {
         if iro_site_effects_count(name) {
@@ -9101,7 +9133,7 @@ var g_iro_quiet: Vec<i64> = Vec::new();
 /// turn: `callees` gets their positions). Division of integers, shifts,
 /// float-to-integer conversion, panics and everything else are not.
 /// Comparisons only of words (iro_quiet_word): one of strings reads them.
-fn iro_quiet_inst(module: & IrModule, f: & IrFunction, inst: Inst, callees: & mut Vec<i64>) -> bool {
+fn iro_quiet_inst(module: &IrModule, f: &IrFunction, inst: Inst, callees: &mut Vec<i64>) -> bool {
     match inst {
         Inst::ConstInt(_, _) => {
             return true;
@@ -9239,7 +9271,7 @@ fn iro_quiet_inst(module: & IrModule, f: & IrFunction, inst: Inst, callees: & mu
 /// OP25: is value `v` of `f` a plain word a comparison only looks at (an
 /// integer, a bool or a float), not a pointer, whose comparison may read
 /// what it points to (a string's bytes)?
-fn iro_quiet_word(f: & IrFunction, v: i64) -> bool {
+fn iro_quiet_word(f: &IrFunction, v: i64) -> bool {
     var t: IrType = iro_value_ty(f, v);
     return ir_type_is_int(t) || ir_type_is_float(t) || ir_type_eq(t, IrType::Bool);
 }
@@ -9248,7 +9280,7 @@ fn iro_quiet_word(f: & IrFunction, v: i64) -> bool {
 /// positions go to `callees`)? No loop: every edge between reachable blocks
 /// goes forward in reverse postorder (a cycle has an edge that does not),
 /// and every instruction of a reachable block passes iro_quiet_inst.
-fn iro_quiet_local(module: & IrModule, f: & IrFunction, callees: & mut Vec<i64>) -> bool {
+fn iro_quiet_local(module: &IrModule, f: &IrFunction, callees: &mut Vec<i64>) -> bool {
     if f.blocks.len() == 0 {
         return false;
     }
@@ -9305,7 +9337,7 @@ fn iro_quiet_local(module: & IrModule, f: & IrFunction, callees: & mut Vec<i64>)
 /// all its callees do, so recursion is never proved (a call cycle could run
 /// for ever, or overflow the stack). What it reads or writes is not asked
 /// here: iro_effect_masks says that.
-pub fn iro_quiet_fns(module: & IrModule) -> Vec<i64> {
+pub fn iro_quiet_fns(module: &IrModule) -> Vec<i64> {
     return iro_quiet_fns_in(module, 0);
 }
 
@@ -9313,7 +9345,7 @@ pub fn iro_quiet_fns(module: & IrModule) -> Vec<i64> {
 /// their callees, transitively (iro_call_closure): the same answer as over
 /// the whole module for those, 0 (not proved) for the others, which no
 /// function of the set calls. `reach` 0: every function.
-pub fn iro_quiet_fns_in(module: & IrModule, reach: i64) -> Vec<i64> {
+pub fn iro_quiet_fns_in(module: &IrModule, reach: i64) -> Vec<i64> {
     var n: i64 = module.functions.len();
     var keep: Vec<i64> = iro_call_closure(module, reach);
     var local: Vec<i64> = peir_zeros(n);
@@ -9321,9 +9353,9 @@ pub fn iro_quiet_fns_in(module: & IrModule, reach: i64) -> Vec<i64> {
     var i: i64 = 0;
     while i < n {
         var cs: Vec<i64> = Vec::new();
-        if iro_kept_at(& keep, i) {
+        if iro_kept_at(&keep, i) {
             var f: IrFunction = module.functions.get(i).func;
-            if iro_quiet_local(module, & f, & mut cs) {
+            if iro_quiet_local(module, &f, &mut cs) {
                 local.set(i, 1);
             }
         }
@@ -9359,7 +9391,7 @@ pub fn iro_quiet_fns_in(module: & IrModule, reach: i64) -> Vec<i64> {
 }
 
 /// How many entries of `xs` are 1.
-fn iro_count_ones(xs: & Vec<i64>) -> i64 {
+fn iro_count_ones(xs: &Vec<i64>) -> i64 {
     var c: i64 = 0;
     var i: i64 = 0;
     while i < xs.len() {
@@ -9376,7 +9408,7 @@ fn iro_count_ones(xs: & Vec<i64>) -> i64 {
 /// iro_effect_masks): reading allowed when `may_read`? Program functions
 /// only, with a result no owner goes with (an integer, bool, float or
 /// nothing).
-fn iro_quiet_call(module: & IrModule, masks: & Vec<i64>, name: str, site: & EffectSet, ret: IrType, may_read: bool) -> bool {
+fn iro_quiet_call(module: &IrModule, masks: &Vec<i64>, name: str, site: &EffectSet, ret: IrType, may_read: bool) -> bool {
     // OP15: cold_path() and @cold calls mark their block cold for the
     // native block layout (nat_ir ng_cold_call_labels): never removed
     if is_cold_fn_hint(name) {
@@ -9402,7 +9434,7 @@ fn iro_quiet_call(module: & IrModule, masks: & Vec<i64>, name: str, site: & Effe
 /// OP25: remove the calls of `f` whose result nothing reads, when the call
 /// ends, never panics and writes nothing (iro_quiet_call: reads are
 /// allowed, nothing can see them). Their arguments are left to `dce`.
-fn iro_dead_calls(module: & IrModule, masks: & Vec<i64>, f: & mut IrFunction) -> bool {
+fn iro_dead_calls(module: &IrModule, masks: &Vec<i64>, f: &mut IrFunction) -> bool {
     var any: bool = false;
     var round: i64 = 0;
     while round < 3 {
@@ -9420,7 +9452,7 @@ fn iro_dead_calls(module: & IrModule, masks: & Vec<i64>, f: & mut IrFunction) ->
                 if id >= 0 && id < uses.len() && uses.get(id) == 0 {
                     match peir_inst_of(f, id) {
                         Inst::Call(cn, _, crt, ce) => {
-                            drop = iro_quiet_call(module, masks, cn, & ce, crt, true);
+                            drop = iro_quiet_call(module, masks, cn, &ce, crt, true);
                         }
                         _ => {
                         }
@@ -9606,7 +9638,7 @@ pub fn iro_lib_mask(name: str) -> i64 {
 /// which iro_lib_load reads back) and annotation flags, for consumers that
 /// build against the library without whole-program mode. The machine layer
 /// appends its `ext` lines (clobbers, sizes) to the same file.
-pub fn iro_libfacts(module: & IrModule) {
+pub fn iro_libfacts(module: &IrModule) {
     var path: str = p_getenv("FID_LIBFACTS");
     if (path as i64) == 0 || str_len(path) == 0 {
         return;
@@ -9617,7 +9649,7 @@ pub fn iro_libfacts(module: & IrModule) {
     while fi < module.functions.len() {
         var f: IrFunction = module.functions.get(fi).func;
         var fx: EffectSet = iro_mask_effects(masks.get(fi));
-        var line: str = "fn " + f.name + " params=" + int_to_str(f.params.len()) + " effects=" + EffectSet_to_str(& fx);
+        var line: str = "fn " + f.name + " params=" + int_to_str(f.params.len()) + " effects=" + EffectSet_to_str(&fx);
         if f.internal_conv {
             line = line + " conv=internal";
         }
@@ -9664,7 +9696,7 @@ pub fn iro_libfacts(module: & IrModule) {
 /// they go to? Not runtime and backend functions, which the backends
 /// recognise by name (Vec_*, print, len, *_len, p_*, ..), entry points,
 /// C callbacks, interrupt handlers and kernels.
-fn iro_icf_candidate(module: & IrModule, f: & IrFunction, at: i64) -> bool {
+fn iro_icf_candidate(module: &IrModule, f: &IrFunction, at: i64) -> bool {
     var nm: str = f.name;
     if nm == "main" || nm == "main_entry" || nm == "print" || nm == "println" || nm == "len" {
         return false;
@@ -9685,12 +9717,13 @@ fn iro_icf_candidate(module: & IrModule, f: & IrFunction, at: i64) -> bool {
 /// The serialized IR of `f`; its name is the first 8 + len(name) bytes.
 fn iro_icf_bytes(f: IrFunction) -> Vec<i64> {
     var b: AwBuf = awbuf_new();
-    iw_irfunc(& mut b, f);
+    iw_irfunc(&mut b, f);
     return b.bytes;
 }
 
 /// A hash of `v` from position `from` on.
-@wrapping fn iro_icf_hash(v: & Vec<i64>, from: i64) -> i64 {
+@wrapping
+fn iro_icf_hash(v: &Vec<i64>, from: i64) -> i64 {
     var h: i64 = 17;
     var i: i64 = from;
     while i < v.len() {
@@ -9701,7 +9734,7 @@ fn iro_icf_bytes(f: IrFunction) -> Vec<i64> {
 }
 
 /// Are `a` from `ao` on and `b` from `bo` on the same bytes?
-fn iro_icf_same(a: & Vec<i64>, ao: i64, b: & Vec<i64>, bo: i64) -> bool {
+fn iro_icf_same(a: &Vec<i64>, ao: i64, b: &Vec<i64>, bo: i64) -> bool {
     var n: i64 = a.len() - ao;
     if n != b.len() - bo {
         return false;
@@ -9720,7 +9753,7 @@ fn iro_icf_same(a: & Vec<i64>, ao: i64, b: & Vec<i64>, bo: i64) -> bool {
 /// earlier function's to that earlier one. Returns the functions folded.
 /// Only functions that share a cheap signature (instruction, block,
 /// parameter and value counts) with another are serialized.
-pub fn iro_fold_identical(module: & mut IrModule) -> i64 {
+pub fn iro_fold_identical(module: &mut IrModule) -> i64 {
     var n: i64 = module.functions.len();
     var sigs: Vec<str> = Vec::new();
     var counts: i64 = HashMap_new();
@@ -9728,7 +9761,7 @@ pub fn iro_fold_identical(module: & mut IrModule) -> i64 {
     while i < n {
         var f: IrFunction = module.functions.get(i).func;
         var sig: str = "";
-        if iro_icf_candidate(module, & f, i) {
+        if iro_icf_candidate(module, &f, i) {
             sig = int_to_str(f.insts.len()) + "/" + int_to_str(f.blocks.len()) + "/" + int_to_str(f.params.len()) + "/" + int_to_str(f.next_value);
             HashMap_insert(counts, sig, HashMap_get(counts, sig) + 1);
         }
@@ -9754,7 +9787,7 @@ pub fn iro_fold_identical(module: & mut IrModule) -> i64 {
             by = iro_icf_bytes(module.functions.get(i).func);
             var skip: i64 = 8 + str_len(nm);
             skips.set(i, skip);
-            var key: str = sg + "#" + int_to_str(iro_icf_hash(& by, skip));
+            var key: str = sg + "#" + int_to_str(iro_icf_hash(&by, skip));
             var slot: i64 = HashMap_get(keys, key) - 1;
             if slot < 0 {
                 HashMap_insert(keys, key, groups.len() + 1);
@@ -9767,7 +9800,7 @@ pub fn iro_fold_identical(module: & mut IrModule) -> i64 {
                 while mi < members.len() && to < 0 {
                     var j: i64 = members.get(mi);
                     var bj: Vec<i64> = bytes.get(j);
-                    if iro_icf_same(& by, skip, & bj, skips.get(j)) {
+                    if iro_icf_same(&by, skip, &bj, skips.get(j)) {
                         to = j;
                     }
                     mi = mi + 1;
@@ -9888,12 +9921,12 @@ fn iro_version(f0: IrFunction) -> IrFunction {
     var again: bool = true;
     while again && rounds < 4 {
         again = false;
-        var cfg: IroCfg = iro_cfg(& f);
-        var facts: PeirLoopFacts = peir_loop_facts(& f, f.next_value + 1);
+        var cfg: IroCfg = iro_cfg(&f);
+        var facts: PeirLoopFacts = peir_loop_facts(&f, f.next_value + 1);
         var h: i64 = 0;
         while h < cfg.n {
             var vf: IrFunction = f;
-            if iro_version_one(& mut vf, & cfg, & facts, h) {
+            if iro_version_one(&mut vf, &cfg, &facts, h) {
                 f = vf;
                 g_iro_nver = g_iro_nver + 1;
                 again = true;
@@ -9907,7 +9940,7 @@ fn iro_version(f0: IrFunction) -> IrFunction {
 }
 
 /// Is value `v` of `f` a 64-bit signed integer (parameters included)?
-fn iro_version_i64(f: & IrFunction, v: i64) -> bool {
+fn iro_version_i64(f: &IrFunction, v: i64) -> bool {
     var i: i64 = 0;
     while i < f.params.len() {
         if f.params.get(i).id == v {
@@ -9926,7 +9959,7 @@ fn iro_version_i64(f: & IrFunction, v: i64) -> bool {
 }
 
 /// The value `id` names in the copy (map: old id -> new id + 1).
-fn iro_vm(map: & Vec<i64>, id: i64) -> i64 {
+fn iro_vm(map: &Vec<i64>, id: i64) -> i64 {
     if id >= 0 && id < map.len() && map.get(id) != 0 {
         return map.get(id) - 1;
     }
@@ -9982,7 +10015,7 @@ fn iro_version_copyable(inst: Inst) -> bool {
 }
 
 /// Version the loop headed by block index `h`, if it qualifies.
-fn iro_version_one(f: & mut IrFunction, cfg: & IroCfg, facts: & PeirLoopFacts, h: i64) -> bool {
+fn iro_version_one(f: &mut IrFunction, cfg: &IroCfg, facts: &PeirLoopFacts, h: i64) -> bool {
     var n: i64 = cfg.n;
     var latches: Vec<i64> = Vec::new();
     var outside: Vec<i64> = Vec::new();
@@ -10044,7 +10077,7 @@ fn iro_version_one(f: & mut IrFunction, cfg: & IroCfg, facts: & PeirLoopFacts, h
     if hids.len() == 0 {
         return false;
     }
-    var cond: i64 = - 1;
+    var cond: i64 = -1;
     match peir_inst_of(f, hids.get(hids.len() - 1)) {
         Inst::Branch(c, t, e) => {
             if t < 0 || t >= cfg.index.len() || e < 0 || e >= cfg.index.len() {
@@ -10059,8 +10092,8 @@ fn iro_version_one(f: & mut IrFunction, cfg: & IroCfg, facts: & PeirLoopFacts, h
             return iro_version_no("header does not end in a branch");
         }
     }
-    var left: i64 = - 1;
-    var right: i64 = - 1;
+    var left: i64 = -1;
+    var right: i64 = -1;
     match peir_inst_of(f, cond) {
         Inst::BinOp(op, l, r, _) => {
             match op {
@@ -10077,7 +10110,7 @@ fn iro_version_one(f: & mut IrFunction, cfg: & IroCfg, facts: & PeirLoopFacts, h
             return iro_version_no("header test not a binary operation");
         }
     }
-    var islot: i64 = - 1;
+    var islot: i64 = -1;
     match peir_inst_of(f, left) {
         Inst::Load(p, ty) => {
             match ty {
@@ -10102,7 +10135,7 @@ fn iro_version_one(f: & mut IrFunction, cfg: & IroCfg, facts: & PeirLoopFacts, h
     // where each value is defined (block index), and the loop's size
     var def_b: Vec<i64> = Vec::new();
     while def_b.len() < f.next_value + 1 {
-        def_b.push(- 1);
+        def_b.push(-1);
     }
     var size: i64 = 0;
     var b2: i64 = 0;
@@ -10138,7 +10171,7 @@ fn iro_version_one(f: & mut IrFunction, cfg: & IroCfg, facts: & PeirLoopFacts, h
             var k2: i64 = 0;
             while k2 < ids2.len() {
                 ops.clear();
-                peir_inst_operands(peir_inst_of(f, ids2.get(k2)), & mut ops);
+                peir_inst_operands(peir_inst_of(f, ids2.get(k2)), &mut ops);
                 var o: i64 = 0;
                 while o < ops.len() {
                     var u: i64 = ops.get(o);
@@ -10154,7 +10187,7 @@ fn iro_version_one(f: & mut IrFunction, cfg: & IroCfg, facts: & PeirLoopFacts, h
     }
     // the bound: a value from before the loop, or a reload of a plain slot
     // the loop never stores
-    var rslot: i64 = - 1;
+    var rslot: i64 = -1;
     var rty: IrType = IrType::I64;
     if right >= 0 && right < def_b.len() && def_b.get(right) >= 0 && body.get(def_b.get(right)) != 0 {
         match peir_inst_of(f, right) {
@@ -10187,8 +10220,8 @@ fn iro_version_one(f: & mut IrFunction, cfg: & IroCfg, facts: & PeirLoopFacts, h
     }
     // a Vec access `v.get(i)` / `v.set(i, x)` in the loop: v from before the
     // loop, or a reload of a slot the loop never stores
-    var vval: i64 = - 1;
-    var vslot: i64 = - 1;
+    var vval: i64 = -1;
+    var vslot: i64 = -1;
     var vty: IrType = IrType::I64;
     b2 = 0;
     while b2 < n && vval < 0 && vslot < 0 {
@@ -10198,7 +10231,7 @@ fn iro_version_one(f: & mut IrFunction, cfg: & IroCfg, facts: & PeirLoopFacts, h
             while k3 < ids3.len() && vval < 0 && vslot < 0 {
                 match peir_inst_of(f, ids3.get(k3)) {
                     Inst::Call(name, args, _, _) => {
-                        var at: i64 = - 1;
+                        var at: i64 = -1;
                         if (name == "Vec_get" || name == "p_vec_get") && args.len() >= 2 {
                             at = args.len() - 2;
                         }
@@ -10290,15 +10323,15 @@ fn iro_version_one(f: & mut IrFunction, cfg: & IroCfg, facts: & PeirLoopFacts, h
         var k5: i64 = 0;
         while k5 < ob.instructions.len() {
             var oid2: i64 = ob.instructions.get(k5);
-            var nid2: i64 = iro_vm(& vmap, oid2);
-            var ninst: Inst = iro_remap_all(peir_inst_of(f, oid2), & vmap);
+            var nid2: i64 = iro_vm(&vmap, oid2);
+            var ninst: Inst = iro_remap_all(peir_inst_of(f, oid2), &vmap);
             var fin: Inst = ninst;
             match ninst {
                 Inst::Jump(jt) => {
-                    fin = Inst::Jump(iro_vm(& bmap, jt));
+                    fin = Inst::Jump(iro_vm(&bmap, jt));
                 }
                 Inst::Branch(bc, bt, be) => {
-                    fin = Inst::Branch(bc, iro_vm(& bmap, bt), iro_vm(& bmap, be));
+                    fin = Inst::Branch(bc, iro_vm(&bmap, bt), iro_vm(&bmap, be));
                 }
                 _ => {
                 }
@@ -10313,7 +10346,7 @@ fn iro_version_one(f: & mut IrFunction, cfg: & IroCfg, facts: & PeirLoopFacts, h
         f.blocks.set(nb_index, nblk);
         ci = ci + 1;
     }
-    var hcopy: i64 = iro_vm(& bmap, hid);
+    var hcopy: i64 = iro_vm(&bmap, hid);
     // --- the tests: in the preheader `n > 0`, then in a block of their own
     // `n <= v.len() && i >= 0` (a null Vec is never measured)
     var gid: i64 = IrFunction_new_block(f);
@@ -10350,7 +10383,7 @@ fn iro_version_one(f: & mut IrFunction, cfg: & IroCfg, facts: & PeirLoopFacts, h
     largs.push(env0);
     largs.push(vl);
     var leff: EffectSet = EffectSet_new();
-    EffectSet_add(& mut leff, Effect::Read);
+    EffectSet_add(&mut leff, Effect::Read);
     var lcall: i64 = iro_detached(f, Inst::Call("Vec_len", largs, IrType::I64, leff));
     g_new.push(lcall);
     var n1: i64 = right;
@@ -10407,7 +10440,7 @@ fn iro_version_one(f: & mut IrFunction, cfg: & IroCfg, facts: & PeirLoopFacts, h
 /// Nov 17) and rotated (when `rotate` is), as iropt_native leaves them, so
 /// the report lists a versioned copy's checks as removed (counted loop)
 /// and the original loop's as kept. Returns how many loops were versioned.
-pub fn iro_explain_loops(module: & mut IrModule) -> i64 {
+pub fn iro_explain_loops(module: &mut IrModule) -> i64 {
     var on_version: bool = iro_pass_on("version") && ime_on("version");
     var on_rotate: bool = iro_pass_on("rotate") && ime_on("rotate");
     if !on_version && !on_rotate {
@@ -10426,7 +10459,7 @@ pub fn iro_explain_loops(module: & mut IrModule) -> i64 {
                 nver = nver + g_iro_nver;
             }
         }
-        if on_rotate && ime_rotate(& mut f) {
+        if on_rotate && ime_rotate(&mut f) {
             changed = true;
         }
         if changed {
@@ -10439,7 +10472,7 @@ pub fn iro_explain_loops(module: & mut IrModule) -> i64 {
 }
 
 /// The copy `nid` keeps the source line of `oid` (a panic in it says where).
-fn iro_version_line(f: & mut IrFunction, oid: i64, nid: i64) {
+fn iro_version_line(f: &mut IrFunction, oid: i64, nid: i64) {
     match IrFunction_get_meta(f, oid) {
         OptValueMeta::Some(om) => {
             match IrFunction_get_meta(f, nid) {
@@ -10485,7 +10518,7 @@ var g_iro_vsroa_n: i64 = 0;
 var g_iro_soleown_n: i64 = 0;
 
 /// LF14 (`sroa`) and LF16 (`sole`) over the module.
-fn iro_vec_locals(module: & mut IrModule, sole: bool, sroa: bool) {
+fn iro_vec_locals(module: &mut IrModule, sole: bool, sroa: bool) {
     g_iro_vsroa_n = 0;
     g_iro_soleown_n = 0;
     var vfi: i64 = 0;
@@ -10494,11 +10527,11 @@ fn iro_vec_locals(module: & mut IrModule, sole: bool, sroa: bool) {
         if !str_starts_with(vent.name, "Vec_") && !str_starts_with(vent.name, "vec_") {
             var vfn: IrFunction = vent.func;
             var vch: bool = false;
-            if vfn.blocks.len() > 0 && vfn.persist_vars.len() == 0 && !iro_vl_has_region(& vfn) {
-                if sole && iro_sole_owner(& mut vfn) {
+            if vfn.blocks.len() > 0 && vfn.persist_vars.len() == 0 && !iro_vl_has_region(&vfn) {
+                if sole && iro_sole_owner(&mut vfn) {
                     vch = true;
                 }
-                if sroa && iro_vec_sroa(& mut vfn) {
+                if sroa && iro_vec_sroa(&mut vfn) {
                     vch = true;
                 }
             }
@@ -10515,7 +10548,7 @@ fn iro_vec_locals(module: & mut IrModule, sole: bool, sroa: bool) {
 }
 
 /// Does `f` open a region (LF14 and LF16 leave it alone)?
-fn iro_vl_has_region(f: & IrFunction) -> bool {
+fn iro_vl_has_region(f: &IrFunction) -> bool {
     var ri: i64 = 0;
     while ri < f.insts.len() {
         match f.insts.get(ri).inst {
@@ -10531,7 +10564,7 @@ fn iro_vl_has_region(f: & IrFunction) -> bool {
 }
 
 /// A zero or null, or a cast of one (what an owned slot is cleared to).
-fn iro_vl_zero(f: & IrFunction, v: i64) -> bool {
+fn iro_vl_zero(f: &IrFunction, v: i64) -> bool {
     match IrFunction_get_inst(f, v) {
         OptInst::Some(zinst) => {
             match zinst {
@@ -10559,14 +10592,14 @@ fn iro_vl_minus_ones(n: i64) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     var mi: i64 = 0;
     while mi < n {
-        out.push(- 1);
+        out.push(-1);
         mi = mi + 1;
     }
     return out;
 }
 
 /// Take the instructions `dead` marks out of every block of `f`.
-fn iro_vl_drop_dead(f: & mut IrFunction, dead: & Vec<i64>) {
+fn iro_vl_drop_dead(f: &mut IrFunction, dead: &Vec<i64>) {
     var db: i64 = 0;
     while db < f.blocks.len() {
         var dblk: BasicBlock = f.blocks.get(db);
@@ -10635,7 +10668,7 @@ fn iro_sole_new(cn: str, n: i64) -> bool {
 /// stored; every other use of h, and every use of a value loaded from S, is
 /// argument 1 of iro_sole_safe_call. Nothing can share its buffer, so a
 /// vec_own on h or on such a load does nothing and is removed.
-fn iro_sole_owner(f: & mut IrFunction) -> bool {
+fn iro_sole_owner(f: &mut IrFunction) -> bool {
     var nv: i64 = f.next_value + 1;
     var created: Vec<i64> = peir_zeros(nv);
     var slot_ok: Vec<i64> = peir_zeros(nv);
@@ -10692,10 +10725,10 @@ fn iro_sole_owner(f: & mut IrFunction) -> bool {
                             created.set(sv2, 0);
                         }
                         slot_of.set(sv2, sp2);
-                        if h_of.get(sp2) == - 1 {
+                        if h_of.get(sp2) == -1 {
                             h_of.set(sp2, sv2);
                         } else if h_of.get(sp2) != sv2 {
-                            h_of.set(sp2, - 2);
+                            h_of.set(sp2, -2);
                         }
                     }
                 }
@@ -10713,7 +10746,7 @@ fn iro_sole_owner(f: & mut IrFunction) -> bool {
         var k3: i64 = 0;
         while k3 < ids3.len() {
             var inst3: Inst = peir_inst_of(f, ids3.get(k3));
-            var refs3: Vec<i64> = inst_value_refs(& inst3);
+            var refs3: Vec<i64> = inst_value_refs(&inst3);
             var r3: i64 = 0;
             while r3 < refs3.len() {
                 var u: i64 = refs3.get(r3);
@@ -10806,7 +10839,7 @@ fn iro_sole_owner(f: & mut IrFunction) -> bool {
     if nd == 0 {
         return false;
     }
-    iro_vl_drop_dead(f, & dead);
+    iro_vl_drop_dead(f, &dead);
     g_iro_soleown_n = g_iro_soleown_n + nd;
     return true;
 }
@@ -10814,7 +10847,7 @@ fn iro_sole_owner(f: & mut IrFunction) -> bool {
 // --- LF14: a small local Vec in stack slots ----------------------------------
 
 /// Is `id` the constant `want` (an i64)?
-fn iro_vs_const_is(f: & IrFunction, id: i64, want: i64) -> bool {
+fn iro_vs_const_is(f: &IrFunction, id: i64, want: i64) -> bool {
     match iro_const_int(f, id) {
         OptI64::Some(cv) => {
             return cv == want;
@@ -10828,7 +10861,7 @@ fn iro_vs_const_is(f: & IrFunction, id: i64, want: i64) -> bool {
 /// Does `inst` make an empty Vec of plain words: Vec_new_typed,
 /// Vec_init_typed (LF13's stack header) or Vec_new_sized of element code 0
 /// and type id 0?
-fn iro_vs_plain_new(f: & IrFunction, inst: Inst) -> bool {
+fn iro_vs_plain_new(f: &IrFunction, inst: Inst) -> bool {
     match inst {
         Inst::Call(pcn, pcargs, _, _) => {
             if pcn == "Vec_new_typed" && pcargs.len() == 3 {
@@ -10848,7 +10881,7 @@ fn iro_vs_plain_new(f: & IrFunction, inst: Inst) -> bool {
 }
 
 /// Is value `id` of `f` a stack slot?
-fn iro_vs_is_alloca(f: & IrFunction, id: i64) -> bool {
+fn iro_vs_is_alloca(f: &IrFunction, id: i64) -> bool {
     match peir_inst_of(f, id) {
         Inst::Alloca(_, _) => {
             return true;
@@ -10870,11 +10903,11 @@ fn iro_vs_arg(inst: Inst, i: i64) -> i64 {
         _ => {
         }
     }
-    return - 1;
+    return -1;
 }
 
 /// The i64 constant at `id` when it is one and not negative, else -1.
-fn iro_vs_index(f: & IrFunction, id: i64) -> i64 {
+fn iro_vs_index(f: &IrFunction, id: i64) -> i64 {
     match iro_const_int(f, id) {
         OptI64::Some(xc) => {
             if xc >= 0 {
@@ -10884,12 +10917,12 @@ fn iro_vs_index(f: & IrFunction, id: i64) -> i64 {
         OptI64::None => {
         }
     }
-    return - 1;
+    return -1;
 }
 
 /// A use of the Vec's slot `slot` that LF14 allows: a load, or a store of h
 /// or of a zero.
-fn iro_vs_slot_use_ok(f: & IrFunction, inst: Inst, slot: i64, h: i64) -> bool {
+fn iro_vs_slot_use_ok(f: &IrFunction, inst: Inst, slot: i64, h: i64) -> bool {
     match inst {
         Inst::Load(qlp, _) => {
             return qlp == slot;
@@ -10908,7 +10941,7 @@ fn iro_vs_slot_use_ok(f: & IrFunction, inst: Inst, slot: i64, h: i64) -> bool {
 /// 6 the store of h into its slot; 0 anything else. In a call the handle is
 /// argument 1 and no other argument is a handle; pushed and set values and
 /// the results of get and len are i64 words.
-fn iro_vs_classify(f: & IrFunction, inst: Inst, kind: & Vec<i64>, slot: i64) -> i64 {
+fn iro_vs_classify(f: &IrFunction, inst: Inst, kind: &Vec<i64>, slot: i64) -> i64 {
     match inst {
         Inst::Store(wsp, wsv, _) => {
             if slot >= 0 && wsp == slot && wsv >= 0 && wsv < kind.len() && kind.get(wsv) == 1 {
@@ -10951,7 +10984,7 @@ fn iro_vs_classify(f: & IrFunction, inst: Inst, kind: & Vec<i64>, slot: i64) -> 
 }
 
 /// LF14 in one function (see above): true when a Vec went.
-fn iro_vec_sroa(f: & mut IrFunction) -> bool {
+fn iro_vec_sroa(f: &mut IrFunction) -> bool {
     var cands: Vec<i64> = Vec::new();
     var cb: i64 = 0;
     while cb < f.blocks.len() {
@@ -10978,14 +11011,14 @@ fn iro_vec_sroa(f: & mut IrFunction) -> bool {
 }
 
 /// LF14 for the Vec made by instruction `h`: true when it became slots.
-fn iro_vec_sroa_one(f: & mut IrFunction, h: i64) -> bool {
+fn iro_vec_sroa_one(f: &mut IrFunction, h: i64) -> bool {
     var nv: i64 = f.next_value + 1;
     if h < 0 || h >= nv {
         return false;
     }
     // 1: the slot h is stored in (-1: none) and h's block
-    var slot: i64 = - 1;
-    var hb: i64 = - 1;
+    var slot: i64 = -1;
+    var hb: i64 = -1;
     var b1: i64 = 0;
     while b1 < f.blocks.len() {
         var ids1: Vec<i64> = f.blocks.get(b1).instructions;
@@ -11035,7 +11068,7 @@ fn iro_vec_sroa_one(f: & mut IrFunction, h: i64) -> bool {
                     _ => {
                     }
                 }
-                if peir_has_id(inst_value_refs(& inst2), slot) && !iro_vs_slot_use_ok(f, inst2, slot, h) {
+                if peir_has_id(inst_value_refs(&inst2), slot) && !iro_vs_slot_use_ok(f, inst2, slot, h) {
                     return false;
                 }
                 k2 = k2 + 1;
@@ -11073,7 +11106,7 @@ fn iro_vec_sroa_one(f: & mut IrFunction, h: i64) -> bool {
                     }
                 }
             }
-            var refs3: Vec<i64> = inst_value_refs(& inst3);
+            var refs3: Vec<i64> = inst_value_refs(&inst3);
             var touches: bool = false;
             var r3: i64 = 0;
             while r3 < refs3.len() {
@@ -11084,7 +11117,7 @@ fn iro_vec_sroa_one(f: & mut IrFunction, h: i64) -> bool {
                 r3 = r3 + 1;
             }
             if touches {
-                var w: i64 = iro_vs_classify(f, inst3, & kind, slot);
+                var w: i64 = iro_vs_classify(f, inst3, &kind, slot);
                 if w == 0 || iid3 < 0 || iid3 >= nv {
                     return false;
                 }
@@ -11157,7 +11190,7 @@ fn iro_vec_sroa_one(f: & mut IrFunction, h: i64) -> bool {
         }
         b4 = b4 + 1;
     }
-    iro_vl_drop_dead(f, & dead);
+    iro_vl_drop_dead(f, &dead);
     // the slots at the start of the entry block
     var eblk: BasicBlock = f.blocks.get(0);
     var fresh: Vec<i64> = Vec::new();
