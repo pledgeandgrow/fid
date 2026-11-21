@@ -4,7 +4,7 @@
 > Fides compiler safely. Read this before making changes.
 >
 > **Fides is self-hosted and independent.** The primary compiler is in
-> `compiler/*.fd` (80 modules, ~361K lines). The Rust source in `src/*.rs`
+> `compiler/*.fd` (80 modules, ~367K lines). The Rust source in `src/*.rs`
 > (57 files, ~114K lines) is the bootstrap reference, frozen: it builds
 > stage 1 when `compiler/*.fd` changes and runs the test harness. The
 > language is what `fid` accepts: docs/reference/reference.md.
@@ -287,14 +287,14 @@ FID=release/fid.exe JOBS=4 bash scripts/cross-test.sh aarch64-linux
 
 ```
 SELF-HOSTED COMPILER (primary source):
-  compiler/*.fd:  80 modules, 361,942 lines — THE COMPILER. 56 are reached
+  compiler/*.fd:  80 modules, 367,384 lines (Nov 21 evening) — THE COMPILER. 56 are reached
                   from main.fd; 24 are imported by nothing that main.fd
                   reaches (the whole retired PIR path — pir, opt, regalloc,
                   peephole, codegen_x64/arm64/riscv, pe, arm64_enc,
                   riscv_enc, runtime_linux/arm64/riscv, coff, macho,
                   codegen — plus autograd, debugger, diag, embedded,
                   flat_ast, hotreload, native_debugger, runtime)
-  New modules     since the Nov 9 audit (no file-analysis page yet):
+  New modules     since the Nov 9 audit (each has a file-analysis page now):
                   ssa (mid-end SSA: mem2reg, dead phis, loop exit values),
                   mir (the machine IR of the machine layer), tv
                   (translation validation, --validate), disasm (fid disasm,
@@ -342,7 +342,7 @@ SELF-HOSTED COMPILER (primary source):
                   SPLIT=1 or tcc: one unit at -O0).
 
 RUST BOOTSTRAP (reference + test harness):
-  src/*.rs:       57 files, 114,184 lines — bootstrap reference (frozen;
+  src/*.rs:       57 files, 114,319 lines — bootstrap reference (frozen;
                   Nov 21: the CB8 ownership port in lower.rs/codegen_c.rs)
   Used when:      compiler/*.fd changes (builds stage 1); runs `fidesc test`
   Suite (Nov 2):  interp 339/339, C 343/343, PE 345/345, expected-fail 89/89
@@ -353,9 +353,9 @@ RUST BOOTSTRAP (reference + test harness):
 WINDOWS INSTALLER (fides.nsi's default VERSION is 0.8.0):
   installer/:     NSIS script + build helper (5 tracked files; the built
                   Fid-Setup-*.exe beside them are not tracked)
-  CI:            .github/workflows/: 13 workflows — ci.yml, tier1.yml and
+  CI:            .github/workflows/: 12 workflows — ci.yml, tier1.yml and
                  tier2.yml (scripts/tier1.sh/tier2.sh lanes on Windows,
-                 Linux, Linux-ARM, macOS), suite-all.yml, macos.yml,
+                 Linux, Linux-ARM, macOS), suite-all.yml,
                  macos-native.yml, release.yml, bench.yml, bare-metal.yml,
                  editors.yml, pages.yml, verify-nightly.yml,
                  verify-weekly.yml
@@ -370,19 +370,19 @@ WINDOWS INSTALLER (fides.nsi's default VERSION is 0.8.0):
                  v0.8.1-unstable (Nov 21, on origin)
 
 TESTS:
-  tests/bootstrap/:  1,753 .fd — 1,682 at top level (459 expected-fail),
-                     71 in subdirs: at_import, baseline, capability,
+  tests/bootstrap/:  1,763 .fd — 1,693 at top level (458 expected-fail),
+                     70 in subdirs: at_import, baseline, capability,
                      diag_dup, diagnostics, effects, golden, nattools,
                      race_lib, regions, safety, spec_lib, trait_conflict
-  tests/conformance/: 1,596 .fd, one per rule of reference.md §1–§13
+  tests/conformance/: 1,598 .fd, one per rule of reference.md §1–§13
                      (`//! error:` = rejected); _modules/ + known-gaps.txt
-  tests/selfhost/:  57 .fd files (verify-selfhost.sh)
-  tests/leaks/:     10 programs + .expected (scripts/leak-check.sh)
-  tests/nattools/:  68 .fd + machine-layer check scripts
+  tests/selfhost/:  48 .fd files (verify-selfhost.sh)
+  tests/leaks/:     11 programs + .expected (scripts/leak-check.sh)
+  tests/nattools/:  72 .fd + machine-layer check scripts
   tests/projects/:  52 .fd — whole-program fixtures (cli, service, game,
                     embed, library, workspace, ...)
   tests/verify/:    50 .fd — bug reproductions, soak/interleave, tv pairs
-  tests/tooling/:   14 .fd + 126 .sh (118 *-check.sh) — per-feature tool checks
+  tests/tooling/:   14 .fd + 132 .sh (124 *-check.sh) — per-feature tool checks
                     (crash reports, LSP probes, caches, repl, docs, serve)
   tests/ also:      ark, book, c2fd, cancel, cascade, checked_alloc,
                     course, ct, ctx_switch, db, determinism, fmt, fuzz,
@@ -391,7 +391,7 @@ TESTS:
   Baseline:         tests/bootstrap/baseline/test_results.txt
 
 STDLIB:
-  stdlib/*.fd:    403 modules, 259,299 lines — core/collections, text and
+  stdlib/*.fd:    403 modules, 278,462 lines (259,299 before the formatter repair, a1bede6) — core/collections, text and
                   data formats, the HTTP/2/3+QUIC and TLS 1.3 stacks,
                   databases (postgres/mysql/mongodb/redis/sqlite),
                   crypto incl. post-quantum (pqc, hpke, jose), wireguard,
@@ -409,9 +409,9 @@ STDLIB:
                   bpe, safetensors); mobile/desktop interop (jni, objc,
                   swift, android_ndk, webview); finance (money, banking,
                   quant, decimal)
-  Runtimes:       stdlib/pe_runtime/ (4 files, 10,602 lines: native
+  Runtimes:       stdlib/pe_runtime/ (4 files, 11,048 lines: native
                   Windows, pe_ir) and stdlib/linux_runtime/ (7 files,
-                  13,229 lines: nat_ir's Linux targets and --nat Windows;
+                  15,687 lines: nat_ir's Linux targets and --nat Windows;
                   darwin.fd for native macOS, wasi.fd for `fid wasm`).
                   kernel/uefi moved to the fides-os project
 

@@ -992,7 +992,7 @@ Source: `parser.fd:parse_func`, `typechecker.fd:TypeChecker_check_generic_call`,
 
 ```
 generic-params = "<" gp {"," gp} ">"
-gp             = T [":" Trait {"+" Trait}] | N ":" int-type
+gp             = T [":" Trait {"+" Trait}] | N ":" int-type | "const" N ":" int-type
 ```
 
 - Functions, structs, enums, `impl` blocks and trait impls take type
@@ -1001,6 +1001,19 @@ gp             = T [":" Trait {"+" Trait}] | N ":" int-type
   checked at each call.
 - `N: i64` (any integer type keyword) declares a const parameter; `[T; N]` in
   a parameter takes the array's length (`test_const_generic.fd`).
+- Structs and `impl` blocks take const parameters too, written `const N:
+  usize` (or `N: i64`): `struct Matrix<T, const N: usize>` takes a number as
+  its argument (`Matrix<i64, 3>`), and the size is part of the type, so
+  `Matrix<i64, 3>` and `Matrix<i64, 2>` are different types. A function
+  generic over `N` (`fn trace<const N: usize>(m: Matrix<i64, N>)`) gets `N`
+  from the argument's type, and in `impl<T, const N: usize> Matrix<T, N>`
+  every method sees `N` as a constant; each size is its own instantiation
+  (`test_const_generic_struct.fd`, `test_const_generic_impl.fd`). A const
+  parameter's type must be an integer type
+  (`test_diag_parse_struct_const_type_fail.fd`). A size mismatch is an
+  error that still names the internal form of the number, e.g. `expects
+  'Matrix<i64, __const_2>', got 'Matrix<i64, __const_3>'`
+  (`test_const_generic_struct_size_fail.fd`).
 - Generic functions are monomorphised: each set of type arguments gets its own
   copy (`mono.fd`).
 
@@ -1577,7 +1590,7 @@ holds (`compiler.fd:apply_cfg_filter`, `check_cfg`; `test_cfg.fd`). Arguments:
 
 | Argument | Holds when |
 |---|---|
-| `linux`, `windows`, `macos`; `platform = "…"`, `os = "…"` with those values | `fid` itself runs on that system (from the `OS` environment variable and `/proc/self/exe`) |
+| `linux`, `windows`, `macos`; `platform = "…"`, `os = "…"` with those values | the target's system is that one: the one `--target` names, else the system `fid` runs on (from the `OS` environment variable, `/proc/self/exe` and `/bin/freebsd-version`; `compiler.fd:apply_cfg_filter`) |
 | `x86_64`, `aarch64`, `arm64`, `riscv64`, `riscv`; `arch = "…"`, `target_arch = "…"` with those values | the target's architecture is that one (`compiler.fd:cfg_arch_is`; `arm64` is `aarch64`, `riscv` is `riscv64`; `x86_64` when there is no `--target`) |
 | `feature = "f"` | ark turned feature `f` on for the project |
 | `release` | the build is not under `--debug` |

@@ -114,36 +114,36 @@ tests' expected blocks (a 120-test old-vs-new sample: 0 real differences,
 
 | Component | Files | Lines |
 |-----------|-------|-------|
-| Self-hosted compiler (`compiler/*.fd`) | 80 (56 reached from `main.fd`) | 361,942 |
-| Rust compiler (`src/*.rs`, frozen) | 57 | 114,184 |
-| Stdlib (`stdlib/*.fd`) | 403 | 259,299 |
-| Native runtimes (`stdlib/pe_runtime/`, `stdlib/linux_runtime/`) | 4 + 7 | 10,602 + 13,229 |
+| Self-hosted compiler (`compiler/*.fd`) | 80 (56 reached from `main.fd`) | 367,384 (HEAD, Nov 21 evening; 361,942 that morning) |
+| Rust compiler (`src/*.rs`, frozen) | 57 | 114,319 |
+| Stdlib (`stdlib/*.fd`) | 403 (396 with a `module` line) | 278,462 (259,299 before the formatter repair was applied to the tree, a1bede6) |
+| Native runtimes (`stdlib/pe_runtime/`, `stdlib/linux_runtime/`) | 4 + 7 | 11,048 + 15,687 |
 | Tools (`tools/*.fd`) | 12 | — |
-| Tests (`tests/bootstrap/`) | 1,753 .fd (1,682 top level, 458 expected-fail `*_fail.fd`/`*_fail2.fd`; 71 in subdirs) | — |
-| Tests (`tests/selfhost/`) | 57 .fd | — |
-| Tests (`tests/conformance/`) | 1,596 .fd (each checks a rule of reference.md §1–§13) | — |
-| Tests (`tests/leaks/`) | 10 .fd + .expected (`scripts/leak-check.sh`) | — |
-| Tests (`tests/nattools/`) | 68 .fd + check scripts | — |
+| Tests (`tests/bootstrap/`) | 1,763 .fd (1,693 top level, 458 expected-fail `*_fail.fd`/`*_fail2.fd`; 70 in subdirs) | — |
+| Tests (`tests/selfhost/`) | 48 .fd (duplicates removed, 649fb91) | — |
+| Tests (`tests/conformance/`) | 1,598 .fd (each checks a rule of reference.md §1–§13) | — |
+| Tests (`tests/leaks/`) | 11 .fd + .expected (`scripts/leak-check.sh`) | — |
+| Tests (`tests/nattools/`) | 72 .fd + check scripts | — |
 | Tests (`tests/projects/`) | 52 .fd | — |
 | Tests (`tests/verify/`) | 50 .fd | — |
-| Tests (`tests/tooling/`) | 14 .fd + 126 scripts (118 `*-check.sh`) | — |
+| Tests (`tests/tooling/`) | 14 .fd + 132 scripts (124 `*-check.sh`) | — |
 | Examples (`examples/`) | 12 .fd | — |
 | Installer (`installer/`) | 5 tracked (built `*-Setup-*.exe` files are git-ignored) | — |
-| Compiler module docs (`docs/file-analysis/`) | 69 of 80 modules | — |
-| CI workflows (`.github/workflows/`) | 13 | — |
+| Compiler module docs (`docs/file-analysis/`) | 80 of 80 modules | — |
+| CI workflows (`.github/workflows/`) | 12 | — |
 
 | Measurement | Value |
 |-------------|-------|
-| Last full suite (Rust harness, `fidesc` as the compiler) | Nov 2: interp 339/339, C 343/343, PE 345/345, expected-fail 89/89 — the suite has grown ~3x since (1,753 bootstrap files); a fresh full run is part of the 1.0 release prep |
+| Last full suite (Rust harness, `fidesc` as the compiler) | Nov 2: interp 339/339, C 343/343, PE 345/345, expected-fail 89/89 — the suite has grown ~3x since (1,763 bootstrap files); a fresh full run is part of the 1.0 release prep |
 | Full suite with `fid` as the compiler | not run |
 | Native Linux suite (`NATIVE=1 scripts/cross-test.sh`, Nov 9) | AArch64 273, RISC-V 271, x86-64 272 of 317 match the interpreter |
 | Windows x64 on the machine layer (`fid emit --nat`, Nov 9) | 301 of 338 |
 | WebAssembly native (`fid wasm`, Nov 15) | 316 of 344 suite tests match `fid run`; tasks switch stacks since Nov 18 |
-| Bootstrap fixpoint | stage 2 C == stage 3 C: Nov 6 (49 MB), Nov 8 (67 MB, ownership 0004); NOT re-verifiable on the Nov 19 tree from fidesc until CB8/2g.79 (a fidesc-built fid needs >16 GB to self-compile it; the 0004 temporary drops must be ported to `src/lower.rs` first). From a self-hosted stage 0 it can be: see the next row |
+| Bootstrap fixpoint | stage 2 C == stage 3 C: Nov 6 (49 MB), Nov 8 (67 MB, ownership 0004), **Nov 21** (123,338,942 bytes, from the pinned self-hosted stage 0 `release/stage0/fid.exe`, hash in `scripts/stage0.sha256`; fb7c937, release/gate-nov21-c.log; all three stages fell back to one unit at -O0 for lack of memory). From fidesc it is still not reachable: a fidesc-built fid needs >16 GB to self-compile the tree (CB8/2g.79; statement temporaries ported to `src/lower.rs` Nov 21, 558d0bc, the wall not re-measured) |
 | Build from a self-hosted stage 0 (Nov 21) | the Nov 18 fid compiled the unmodified Nov 20 tree (86cc919) in one step: 121 MB of C in ~5 min (lower 252 s, codegen 81 s), 8 split units at -O2, a 15 MB fid. It passes run, emit (pe_ir) and ccompile of hello and the leak gate (10/10), with none of the fidesc-built fid's crashes. So the 3-stage bootstrap can start from a released fid instead of fidesc. `scripts/build-selfhost.sh`'s split -O2 step failed silently there and fell back to one unit at -O0 with exit 0 (2g.86); the 8 units were built by hand |
 | Roadmap goal check (Nov 21, with that fid) | 224 goals: 87 validated, 121 partly, 15 failed, 1 not checkable here; the bugs found are known-bugs.md 2g.80-2g.113 |
 | Self-compile (`dump-c compiler/main.fd`) | Nov 21 (361K lines): 57 s with the compiler built at -O2 in 8 split units (type check 4.8 s, borrow check 0.7, mono 0.6, front end 16.6 in all, lowering 32.9, C 19.3; CS4); `check compiler/main.fd --time` 35 s. Nov 9 (158K lines): 74 s with the compiler built at -O2 in 8 split units (type check 18 s, borrow check 5, mono 5, lowering 24, C 20), 229 s at -O0; Nov 6: ~133 s; `fidesc` (Rust, Nov 20, 361K lines): dump-c ~45 s peaking ~600 MB — the compiler is now ~2.3x larger |
-| Version (`compiler/build_info.fd`) | base `1.0.0` (`fid version` prints `1.0.0+dev` on a dev build); tags: v1.0.0 (Sep 9), v0.8.0-unstable (Nov 10) |
+| Version (`compiler/build_info.fd`) | base `1.0.0` (`fid version` prints `1.0.0+dev` on a dev build); tags: v0.7 (Sep 9, the commit "Fides v1.0.0"), v0.8.0-unstable (Nov 10), v0.8.1-unstable (Nov 21) |
 
 Session 30 (Oct 2026) for comparison: compiler 54 files / 104,439 lines, Rust
 55 / 100,935, stdlib 104 / 30,446, 302 bootstrap tests. Nov 9 for comparison:
