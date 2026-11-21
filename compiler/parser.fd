@@ -1359,6 +1359,20 @@ impl Parser {
                 self.advance();
                 is_pub = true;
             }
+            // Field annotations (§4.11): @secret, @zeroize, ... on a struct
+            // field — what annotation reflection (field_annotations) reads
+            // and the safety checks act on. As on a parameter.
+            var field_annotations: Vec<Annotation> = Vec::new();
+            while self.check(TokenKind::At) {
+                match self.parse_at_annotation() {
+                    ParseResultAnnotation::Ok(ann) => {
+                        field_annotations.push(ann);
+                    }
+                    ParseResultAnnotation::Err(e) => {
+                        return ParseResultStructDef::Err(e);
+                    }
+                }
+            }
             var fname: str = "";
             match self.expect_ident_or_keyword() {
                 ParseResultStr::Ok(s) => {
@@ -1386,6 +1400,7 @@ impl Parser {
                 }
             }
             var field: Param = Param_new(fname, fty, is_pub);
+            field.annotations = field_annotations;
             // LG3: a field's lifetimes are the struct's own
             var f_lts: Vec<str> = pd_lt_since(self.lt_seen, f_lt_start);
             var fli: i64 = 0;

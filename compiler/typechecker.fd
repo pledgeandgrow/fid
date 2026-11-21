@@ -1734,12 +1734,20 @@ fn TypeChecker_struct_operator_fits(self: & mut TypeChecker, sname: str, m: str,
     if !info.has_self || info.param_types.len() != 2 {
         return false;
     }
-    return TypeChecker_types_compatible(self, info.param_types.get(1), ot);
+    // 2g.112: an integer is no operand of a method taking a float, nor a
+    // float of one taking an integer: the operator's call passes the word
+    // as it is (`2 * v` with `rmul(self, k: f64)` multiplied by the bits
+    // of 2), and types_compatible lets the literal through
+    val pt: Type = info.param_types.get(1);
+    if (TypeChecker_is_float(self, pt) && TypeChecker_is_integer(self, ot)) || (TypeChecker_is_integer(self, pt) && TypeChecker_is_float(self, ot)) {
+        return false;
+    }
+    return TypeChecker_types_compatible(self, pt, ot);
 }
 
 /// `a op b` with `a` of struct type `sname`: its operator method, or for a
 /// unit the dimension rule (see the section comment).
-fn TypeChecker_check_struct_or_dim_operator(self: & mut TypeChecker, op: BinOp, sname: str, lt: Type, rt: Type) -> Type {
+fn TypeChecker_check_struct_or_dim_operator(self: & mut TypeChecker, op: BinOp, sname: str, lt: Type, rt: Type, rexpr: Expr) -> Type {
     var m: str = tc_operator_method(op);
     if tc_struct_dim(sname) == 0 || TypeChecker_struct_operator_fits(self, sname, m, rt) {
         return TypeChecker_check_struct_operator(self, op, sname, rt);
@@ -1748,11 +1756,12 @@ fn TypeChecker_check_struct_or_dim_operator(self: & mut TypeChecker, op: BinOp, 
     if (m == "add" || m == "sub" || m == "rem") && TypeChecker_method_find(self, sname, m) >= 0 {
         return TypeChecker_check_struct_operator(self, op, sname, rt);
     }
-    return TypeChecker_check_dim_operator(self, m, sname, lt, rt);
+    return TypeChecker_check_dim_operator(self, m, sname, lt, rt, tc_operand_type_str(rexpr, rt));
 }
 
-/// The dimension rule with a unit `lname` on the left.
-fn TypeChecker_check_dim_operator(self: & mut TypeChecker, m: str, lname: str, lt: Type, rt: Type) -> Type {
+/// The dimension rule with a unit `lname` on the left; `rtn` names the
+/// right operand's type in messages (tc_operand_type_str).
+fn TypeChecker_check_dim_operator(self: & mut TypeChecker, m: str, lname: str, lt: Type, rt: Type, rtn: str) -> Type {
     if type_eq(rt, Type::Never) {
         return Type::Never;
     }
@@ -1769,7 +1778,7 @@ fn TypeChecker_check_dim_operator(self: & mut TypeChecker, m: str, lname: str, l
         if rd != 0 {
             self.errors.push("Type error (line " + int_to_str(self.current_line) + "): `" + lname + " " + sym + " " + rname + "`: units of different dimensions (" + dim_to_str(tc_struct_dim(lname)) + " and " + dim_to_str(rd) + ") do not add; a unit adds only to itself.");
         } else {
-            self.errors.push("Type error (line " + int_to_str(self.current_line) + "): `" + lname + " " + sym + " " + type_to_str(rt) + "`: a unit adds only to a value of its own unit (" + lname + ").");
+            self.errors.push("Type error (line " + int_to_str(self.current_line) + "): `" + lname + " " + sym + " " + rtn + "`: a unit adds only to a value of its own unit (" + lname + ").");
         }
         return Type::Never;
     }
@@ -1779,7 +1788,7 @@ fn TypeChecker_check_dim_operator(self: & mut TypeChecker, m: str, lname: str, l
     if rd != 0 {
         return TypeChecker_dim_result(self, m, lname, tc_struct_dim(lname), rname, rd);
     }
-    self.errors.push("Type error (line " + int_to_str(self.current_line) + "): `" + lname + " " + sym + " " + type_to_str(rt) + "`: a unit multiplies and divides by an f64 or by another unit (a struct marked @dimension), got " + type_to_str(rt) + ".");
+    self.errors.push("Type error (line " + int_to_str(self.current_line) + "): `" + lname + " " + sym + " " + rtn + "`: a unit multiplies and divides by an f64 or by another unit (a struct marked @dimension), got " + rtn + ".");
     return Type::Never;
 }
 
@@ -1860,14 +1869,15 @@ fn TypeChecker_check_right_struct_operator(self: & mut TypeChecker, op: BinOp, l
     }
     if TypeChecker_method_find(self, rname, rm) >= 0 {
         // it has the method, for another operand type
-        return TypeChecker_check_struct_operator_named(self, rname, rm, m, lt);
+        return TypeChecker_check_struct_operator_named(self, rname, rm, m, tc_operand_type_str(lexpr, lt));
     }
     return Type::Infer;
 }
 
-/// `rname.rm` exists but does not take `lt`: the error naming both.
-fn TypeChecker_check_struct_operator_named(self: & mut TypeChecker, rname: str, rm: str, m: str, lt: Type) -> Type {
-    self.errors.push("Type error (line " + int_to_str(self.current_line) + "): `" + type_to_str(lt) + " " + tc_operator_symbol(m) + " " + rname + "`: `" + rname + "." + rm + "` must take self and one operand of type " + type_to_str(lt) + ".");
+/// `rname.rm` exists but does not take an operand of type `ltn` (as a
+/// message names it, tc_operand_type_str): the error naming both.
+fn TypeChecker_check_struct_operator_named(self: & mut TypeChecker, rname: str, rm: str, m: str, ltn: str) -> Type {
+    self.errors.push("Type error (line " + int_to_str(self.current_line) + "): `" + ltn + " " + tc_operator_symbol(m) + " " + rname + "`: `" + rname + "." + rm + "` must take self and one operand of type " + ltn + ".");
     return Type::Never;
 }
 
@@ -2677,6 +2687,48 @@ fn tc_lg4_index_of(v: Vec<str>, s: str) -> i64 {
     return - 1;
 }
 
+/// 2g.112: `own` and the names in `ts` that tc_trait_ty_concrete's rule
+/// would take for type parameters (a capitalised name of one or two
+/// letters) but that name a declared struct or enum and no type parameter
+/// of the impl (`impl_tps`): with them in the list tc_lg4_ty_concrete
+/// counts them concrete. `fn make(self) -> Self` in `impl Make for Pt`
+/// reads `Pt`, which was taken for a parameter, so an impl returning i64
+/// was accepted.
+fn TypeChecker_lg4_declared_short(self: & TypeChecker, ts: str, own: Vec<str>, impl_tps: Vec<str>) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var oi: i64 = 0;
+    while oi < own.len() {
+        out.push(own.get(oi));
+        oi = oi + 1;
+    }
+    var n: i64 = str_len(ts);
+    var i: i64 = 0;
+    while i < n {
+        var c: i64 = str_byte_at(ts, i);
+        var is_start: bool = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95;
+        if is_start {
+            var j: i64 = i;
+            while j < n {
+                var d: i64 = str_byte_at(ts, j);
+                if !((d >= 65 && d <= 90) || (d >= 97 && d <= 122) || (d >= 48 && d <= 57) || d == 95) {
+                    break;
+                }
+                j = j + 1;
+            }
+            if c >= 65 && c <= 90 && j - i <= 2 {
+                val w: str = str_slice(ts, i, j);
+                if !tc_str_vec_contains(impl_tps, w) && !tc_str_vec_contains(out, w) && (tc_is_struct(self, w) || TypeChecker_is_known_enum(self, w)) {
+                    out.push(w);
+                }
+            }
+            i = j;
+        } else {
+            i = i + 1;
+        }
+    }
+    return out;
+}
+
 /// An impl method `im` against the trait's method `tm` (LG4): the same
 /// number of parameters after `self`, and the same parameter and return
 /// types wherever the trait writes a concrete type.
@@ -2762,14 +2814,14 @@ fn TypeChecker_check_impl_sig(self: & mut TypeChecker, ti: TraitImpl, tm: TraitM
     while k < tn {
         var ts: str = type_to_str(TypeChecker_resolve_type(self, tc_impl_view_type(tc_subst_type_params(tm.params.get(t0 + k).ty, lg4_from, lg4_to), view)));
         var ist: str = type_to_str(TypeChecker_resolve_type(self, tc_impl_view_type(im.params.get(i0 + k).ty, view)));
-        if tc_lg4_ty_concrete(ts, assoc_names, lg4_own) && ts != ist {
+        if tc_lg4_ty_concrete(ts, assoc_names, TypeChecker_lg4_declared_short(self, ts, lg4_own, ti.type_params)) && ts != ist {
             self.errors.push("Type error: " + where_s + ": parameter '" + im.params.get(i0 + k).name + "' is " + ist + "; the trait's method says " + ts);
         }
         k = k + 1;
     }
     var tr: str = type_to_str(TypeChecker_resolve_type(self, tc_impl_view_type(tc_subst_type_params(tm.ret_ty, lg4_from, lg4_to), view)));
     var ir: str = type_to_str(TypeChecker_resolve_type(self, tc_impl_view_type(im.ret_ty, view)));
-    if tc_lg4_ty_concrete(tr, assoc_names, lg4_own) && tr != ir {
+    if tc_lg4_ty_concrete(tr, assoc_names, TypeChecker_lg4_declared_short(self, tr, lg4_own, ti.type_params)) && tr != ir {
         self.errors.push("Type error: " + where_s + " returns " + ir + "; the trait's method returns " + tr);
     }
     TypeChecker_check_impl_lifetimes(self, where_s, tm, im);
@@ -3444,8 +3496,7 @@ pub fn TypeChecker_check_bodies(self: & mut TypeChecker, program: Program) {
     TypeChecker_verify_tainted(self, program);
     // CA4: lock order across the call graph (a cycle is a deadlock)
     TypeChecker_verify_lock_order(self, program);
-    // CT1: a @hermetic test reaches the world only through stdlib/world
-    TypeChecker_verify_hermetic(self, program);
+    // (CT1 @hermetic: after the bodies, below)
     // rm-P9: @redundant (F45), @partitioned (F47), @serverless (F32)
     TypeChecker_verify_redundant(self, program);
     TypeChecker_verify_partitioned(self, program);
@@ -3524,6 +3575,13 @@ pub fn TypeChecker_check_bodies(self: & mut TypeChecker, program: Program) {
     }
     TypeChecker_ce9_check_calls(self);
     TypeChecker_verify_method_calls(self, program);
+    // CT1: a @hermetic test reaches the world only through stdlib/world.
+    // After the bodies (2g.112): its search follows the method calls
+    // `x.m(..)` that checking the bodies recorded
+    // (TypeChecker_record_method_call); run with the other annotation
+    // checks before them, it saw none, so a test reaching the clock
+    // through `t.elapsed()` was accepted
+    TypeChecker_verify_hermetic(self, program);
     TypeChecker_verify_no_races(self, program);
     tc_place_fn_errors(self, tl2_from, program);
 }
@@ -19673,7 +19731,7 @@ fn TypeChecker_check_expr_inner(self: & mut TypeChecker, expr: Expr, hint: Type)
                     Type::Named(oln) => {
                         if !tc_is_vec_type(oln) && tc_is_struct(self, oln) && !TypeChecker_is_typed_string(self, lt_r) {
                             // and on units, the dimension rule (CL10, section "units of measure")
-                            return TypeChecker_check_struct_or_dim_operator(self, op, oln, lt_r, rt_r);
+                            return TypeChecker_check_struct_or_dim_operator(self, op, oln, lt_r, rt_r, box_expr_unbox(right));
                         }
                         cl10_left_struct = tc_is_struct(self, oln);
                     }
@@ -20081,6 +20139,37 @@ fn TypeChecker_check_expr_inner(self: & mut TypeChecker, expr: Expr, hint: Type)
             // §4.11: compile_error("msg") and comptime_assert(cond, "msg")
             // are the evaluator's (comptime_eval.fd); at run time there is
             // nothing they could do, so they are comptime-only.
+            // §4.11 annotation reflection and file embed: pure comptime
+            // builtins of the evaluator (comptime_eval.fd), comptime-only
+            if callee == "field_count_of" {
+                if g_tc_comptime_depth == 0 {
+                    self.errors.push("Comptime error (line " + int_to_str(self.current_line) + "): field_count_of() reads the program's declarations while compiling: call it in comptime code.");
+                    return Type::Never;
+                }
+                return Type::I64;
+            }
+            if callee == "field_annotations" || callee == "struct_annotations" || callee == "field_names_of" {
+                if g_tc_comptime_depth == 0 {
+                    self.errors.push("Comptime error (line " + int_to_str(self.current_line) + "): " + callee + "() reads the program's declarations while compiling: call it in comptime code.");
+                    return Type::Never;
+                }
+                var vec_str_args: Vec<Type> = Vec::new();
+                vec_str_args.push(Type::Str);
+                return Type::Generic("Vec", vec_str_args);
+            }
+            if callee == "embed" {
+                if g_tc_comptime_depth == 0 {
+                    self.errors.push("Comptime error (line " + int_to_str(self.current_line) + "): embed() reads a file while compiling: call it in comptime code.");
+                    return Type::Never;
+                }
+                if arg_types.len() != 1 || !type_eq(arg_types.get(0), Type::Str) {
+                    self.errors.push("Type error (line " + int_to_str(self.current_line) + "): embed takes one argument, the file's path (a str)");
+                    return Type::Never;
+                }
+                var vec_i64_args: Vec<Type> = Vec::new();
+                vec_i64_args.push(Type::I64);
+                return Type::Generic("Vec", vec_i64_args);
+            }
             if callee == "compile_error" {
                 if g_tc_comptime_depth == 0 {
                     self.errors.push("Comptime error (line " + int_to_str(self.current_line) + "): compile_error() reports while compiling: call it in comptime code (a `comptime fn`, a `comptime { }` block, a `comptime if` condition).");
@@ -21027,6 +21116,8 @@ fn TypeChecker_check_expr_inner(self: & mut TypeChecker, expr: Expr, hint: Type)
                 ReflectOp::FieldCount => {
                     return Type::I64;
                 }
+                // A comptime Vec<str> (§4.11): .len/.get compose at
+                // compile time, a Vec where it lands in the program
                 ReflectOp::FieldNames => {
                     return Type::Array(Box::new(Type::Str), 0);
                 }

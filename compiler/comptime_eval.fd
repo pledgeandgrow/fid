@@ -1118,6 +1118,166 @@ fn ct_io_message(msg: str) -> bool {
     return false;
 }
 
+/// §4.11 annotation reflection: the names of the annotations on a struct
+/// (`struct_annotations("S")`) or one of its fields
+/// (`field_annotations("S", "f")`), as a comptime Vec<str>. Compile-time
+/// code acts on the safety annotations a declaration carries: a serializer
+/// generated from reflection can refuse a @secret field, a zeroizer can
+/// find the @zeroize ones.
+fn ct_annotations_call(callee: str, a: Vec<Expr>, original: & Program) -> ResultExpr {
+    // String-named siblings of the reflect ops (§4.11): what a comptime fn
+    // composes on inside its body (field_names_of / field_count_of), where
+    // a type operand cannot be written — a comptime fn's parameters and
+    // locals are values, and `comptime T: type` hands the name over with
+    // `comptime type_name(T)`.
+    if callee == "field_count_of" {
+        if a.len() != 1 {
+            return ResultExpr::Err("field_count_of takes one argument, the struct's name (a str)");
+        }
+        match a.get(0) {
+            Expr::StringLit(sn0) => {
+                var ci: i64 = ce_find_struct(original, sn0);
+                if ci < 0 {
+                    return ResultExpr::Err("field_count_of: '" + sn0 + "' is not a struct");
+                }
+                return ResultExpr::Ok(Expr::IntLit(original.structs.get(ci).fields.len()));
+            }
+            _ => {
+            }
+        }
+        return ResultExpr::Err("field_count_of takes the struct's name as a string");
+    }
+    if callee == "field_names_of" {
+        if a.len() != 1 {
+            return ResultExpr::Err("field_names_of takes one argument, the struct's name (a str)");
+        }
+        match a.get(0) {
+            Expr::StringLit(sn1) => {
+                var ci1: i64 = ce_find_struct(original, sn1);
+                if ci1 < 0 {
+                    return ResultExpr::Err("field_names_of: '" + sn1 + "' is not a struct");
+                }
+                var ns: Vec<str> = Vec::new();
+                var fi1: i64 = 0;
+                var sfields: Vec<Param> = original.structs.get(ci1).fields;
+                while fi1 < sfields.len() {
+                    ns.push(sfields.get(fi1).name);
+                    fi1 = fi1 + 1;
+                }
+                return ResultExpr::Ok(ct_str_vec(ns));
+            }
+            _ => {
+            }
+        }
+        return ResultExpr::Err("field_names_of takes the struct's name as a string");
+    }
+    if callee == "struct_annotations" {
+        if a.len() != 1 {
+            return ResultExpr::Err("struct_annotations takes one argument, the struct's name (as type_name gives it)");
+        }
+        match a.get(0) {
+            Expr::StringLit(sn) => {
+                var si: i64 = ce_find_struct(original, sn);
+                if si < 0 {
+                    return ResultExpr::Err("struct_annotations: '" + sn + "' is not a struct");
+                }
+                var names: Vec<str> = Vec::new();
+                var ai: i64 = 0;
+                var anns: Vec<Annotation> = original.structs.get(si).annotations;
+                while ai < anns.len() {
+                    names.push(anns.get(ai).name);
+                    ai = ai + 1;
+                }
+                return ResultExpr::Ok(ct_str_vec(names));
+            }
+            _ => {
+            }
+        }
+        return ResultExpr::Err("struct_annotations takes the struct's name as a string (type_name(T) composes)");
+    }
+    // field_annotations("S", "f")
+    if a.len() != 2 {
+        return ResultExpr::Err("field_annotations takes two arguments, the struct's name and the field's (as strings)");
+    }
+    var sname: str = "";
+    var fname: str = "";
+    match a.get(0) {
+        Expr::StringLit(sn2) => {
+            sname = sn2;
+        }
+        _ => {
+            return ResultExpr::Err("field_annotations takes the struct's name as a string (type_name(T) composes)");
+        }
+    }
+    match a.get(1) {
+        Expr::StringLit(fn2) => {
+            fname = fn2;
+        }
+        _ => {
+            return ResultExpr::Err("field_annotations takes the field's name as a string");
+        }
+    }
+    var si2: i64 = ce_find_struct(original, sname);
+    if si2 < 0 {
+        return ResultExpr::Err("field_annotations: '" + sname + "' is not a struct");
+    }
+    var sd: StructDef = original.structs.get(si2);
+    var fi: i64 = 0;
+    while fi < sd.fields.len() {
+        var fld: Param = sd.fields.get(fi);
+        if fld.name == fname {
+            var names2: Vec<str> = Vec::new();
+            var ai2: i64 = 0;
+            while ai2 < fld.annotations.len() {
+                names2.push(fld.annotations.get(ai2).name);
+                ai2 = ai2 + 1;
+            }
+            return ResultExpr::Ok(ct_str_vec(names2));
+        }
+        fi = fi + 1;
+    }
+    return ResultExpr::Err("field_annotations: struct '" + sname + "' has no field '" + fname + "'");
+}
+
+/// §4.11: embed("path") reads a file of the project while compiling, its
+/// bytes a comptime Vec<i64> — the one file read comptime code may do. The
+/// path is relative to the directory fid runs in (the project root), never
+/// absolute and never leaving it (`..` is an error).
+fn ct_embed_call(a: Vec<Expr>) -> ResultExpr {
+    if a.len() != 1 {
+        return ResultExpr::Err("embed takes one argument, the file's path relative to the project (a str)");
+    }
+    var path: str = "";
+    match a.get(0) {
+        Expr::StringLit(pth) => {
+            path = pth;
+        }
+        _ => {
+            return ResultExpr::Err("embed takes the file's path as a string");
+        }
+    }
+    if str_len(path) == 0 {
+        return ResultExpr::Err("embed: the path is empty");
+    }
+    if str_starts_with(path, "/") || str_starts_with(path, "\\") || str_len(path) > 1 && str_byte_at(path, 1) == 58 {
+        return ResultExpr::Err("embed: '" + path + "' is absolute: the path is relative to the project root");
+    }
+    if str_contains(path, "..") {
+        return ResultExpr::Err("embed: '" + path + "' leaves the project: no `..` in the path");
+    }
+    var bytes: Vec<i64> = p_file_read_bytes(path);
+    if bytes.len() == 0 {
+        return ResultExpr::Err("embed: cannot read '" + path + "' from the project root (missing or empty)");
+    }
+    var els: Vec<Expr> = Vec::new();
+    var bi: i64 = 0;
+    while bi < bytes.len() {
+        els.push(Expr::IntLit(bytes.get(bi)));
+        bi = bi + 1;
+    }
+    return ResultExpr::Ok(ct_vec_of(Type::I64, els));
+}
+
 /// `gensym(prefix)` with its argument already evaluated.
 fn ct_gensym_call(args: Vec<Expr>, original: & Program) -> ResultExpr {
     if args.len() != 1 {
@@ -3307,7 +3467,14 @@ fn evaluate(expr: & Expr, original: & Program) -> ResultExpr {
     if !ct_fuel_left() {
         return ct_out_of_fuel();
     }
+    // A method on a comptime table (.len, .get on a reflect result) needs
+    // the env-aware evaluator's table handling; an empty env serves (the
+    // tables arrive as values, not names)
     match expr {
+        Expr::MethodCall(_, _, _) => {
+            var empty_env: ComptimeEnv = ComptimeEnv_new();
+            return evaluate_with_env(expr, & empty_env, original);
+        }
         Expr::Ident(name) => {
             var ci: i64 = ct_find_const(original, name);
             if ci >= 0 {
@@ -3389,6 +3556,50 @@ fn evaluate(expr: & Expr, original: & Program) -> ResultExpr {
                 fi = fi + 1;
             }
 
+                // §4.11 reflection over annotations: the names on a struct
+                // (struct_annotations) or one of its fields
+                // (field_annotations), so compile-time code can act on the
+                // safety annotations (@secret, @zeroize, ...) a declaration
+                // carries — type arguments come as strings (type_name(T)
+                // composes inside a comptime T: type function).
+                if callee == "field_annotations" || callee == "struct_annotations" || callee == "field_names_of" || callee == "field_count_of" {
+                    var fa_args: Vec<Expr> = Vec::new();
+                    var fai: i64 = 0;
+                    while fai < args.len() {
+                        var fa_e: Expr = args.get(fai);
+                        match evaluate(& fa_e, original) {
+                            ResultExpr::Err(fam) => {
+                                return ResultExpr::Err(fam);
+                            }
+                            ResultExpr::Ok(fav) => {
+                                fa_args.push(fav);
+                            }
+                        }
+                        fai = fai + 1;
+                    }
+                    return ct_annotations_call(callee, fa_args, original);
+                }
+                // §4.11: embed("path") reads a file of the project while
+                // compiling (its bytes a comptime Vec<i64>): the one file
+                // read comptime code may do, relative to the source's
+                // directory and never leaving it
+                if callee == "embed" {
+                    var em_args: Vec<Expr> = Vec::new();
+                    var emi: i64 = 0;
+                    while emi < args.len() {
+                        var em_e: Expr = args.get(emi);
+                        match evaluate(& em_e, original) {
+                            ResultExpr::Err(emm) => {
+                                return ResultExpr::Err(emm);
+                            }
+                            ResultExpr::Ok(emv) => {
+                                em_args.push(emv);
+                            }
+                        }
+                        emi = emi + 1;
+                    }
+                    return ct_embed_call(em_args);
+                }
                 if callee == "compile_error" {
                     var ce_args: Vec<Expr> = Vec::new();
                     var cei: i64 = 0;
@@ -4138,6 +4349,50 @@ fn evaluate_with_env(expr: & Expr, env: & ComptimeEnv, original: & Program) -> R
                 fi = fi + 1;
             }
 
+                // §4.11 reflection over annotations: the names on a struct
+                // (struct_annotations) or one of its fields
+                // (field_annotations), so compile-time code can act on the
+                // safety annotations (@secret, @zeroize, ...) a declaration
+                // carries — type arguments come as strings (type_name(T)
+                // composes inside a comptime T: type function).
+                if callee == "field_annotations" || callee == "struct_annotations" || callee == "field_names_of" || callee == "field_count_of" {
+                    var fa_args: Vec<Expr> = Vec::new();
+                    var fai: i64 = 0;
+                    while fai < args.len() {
+                        var fa_e: Expr = args.get(fai);
+                        match evaluate_with_env(& fa_e, env, original) {
+                            ResultExpr::Err(fam) => {
+                                return ResultExpr::Err(fam);
+                            }
+                            ResultExpr::Ok(fav) => {
+                                fa_args.push(fav);
+                            }
+                        }
+                        fai = fai + 1;
+                    }
+                    return ct_annotations_call(callee, fa_args, original);
+                }
+                // §4.11: embed("path") reads a file of the project while
+                // compiling (its bytes a comptime Vec<i64>): the one file
+                // read comptime code may do, relative to the source's
+                // directory and never leaving it
+                if callee == "embed" {
+                    var em_args: Vec<Expr> = Vec::new();
+                    var emi: i64 = 0;
+                    while emi < args.len() {
+                        var em_e: Expr = args.get(emi);
+                        match evaluate_with_env(& em_e, env, original) {
+                            ResultExpr::Err(emm) => {
+                                return ResultExpr::Err(emm);
+                            }
+                            ResultExpr::Ok(emv) => {
+                                em_args.push(emv);
+                            }
+                        }
+                        emi = emi + 1;
+                    }
+                    return ct_embed_call(em_args);
+                }
                 if callee == "compile_error" {
                     var ce_args: Vec<Expr> = Vec::new();
                     var cei: i64 = 0;
@@ -4905,6 +5160,10 @@ fn ce_layout_lowerer(original: & Program) -> Lowerer {
 }
 
 fn ce_str_array(items: Vec<str>) -> Expr {
+    // An array literal, as ever: `[i]` indexing works where it lands in the
+    // program (test_comptime_function_effects.fd). Comptime code that
+    // composes with .len/.get uses the string-named builtins
+    // (field_names_of & co.), which give comptime Vec tables.
     var elements: Vec<Expr> = Vec::new();
     var i: i64 = 0;
     while i < items.len() {

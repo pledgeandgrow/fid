@@ -786,6 +786,20 @@ fn make_adder(n: i64) -> fn(i64) -> i64 {
   must be known at compile time (`s4_11_inline_for_unknown_bound_fail.fd`);
   at most 4096 iterations unroll, and `break`/`continue` are errors in the
   body (there is no loop to leave).
+- A struct field carries `@annotations` as a parameter does (`@secret token:
+  str`), and annotation reflection reads them: `comptime
+  struct_annotations("S")` and `comptime field_annotations("S", "f")` give
+  the names as a comptime Vec<str>, so compile-time code can act on the
+  safety annotations a declaration carries (`s4_11_field_annotations.fd`).
+  The string-named `field_names_of("S")` and `field_count_of("S")` complete
+  the set a comptime fn composes on inside its body — a `comptime T: type`
+  function hands the name over with `comptime type_name(T)`
+  (`s4_11_secret_field_comptime.fd`).
+- `comptime embed("path")` reads a file of the project while compiling, its
+  bytes a comptime Vec<i64> — the one file read comptime code may do. The
+  path is relative to the project root and never leaves it (`..` and
+  absolute paths are errors) (`s4_11_embed.fd`,
+  `s4_11_embed_escape_rejected.fd`).
 - `compile_error("msg")` in comptime code stops the build with the message
   (`s4_11_compile_error.fd`); `comptime_assert(cond, "msg")` checks while
   compiling — false stops the build, true leaves nothing in the program
