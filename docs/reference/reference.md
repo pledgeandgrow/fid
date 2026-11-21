@@ -760,6 +760,13 @@ fn make_adder(n: i64) -> fn(i64) -> i64 {
   left shift that drops bits and division/modulo corner overflow are errors
   with the operands in the message, never silently wrapped values
   (`s4_11_arith_overflow_rejected.fd`, `s4_11_shift_amount_rejected.fd`).
+- A comptime value landing in a narrower integer declaration is checked
+  while compiling, and the error names the value: `val x: i8 = comptime
+  (200 + 100)` is "the comptime value 300 does not fit in i8"
+  (`s4_11_comptime_value_fit_rejected.fd`) — the type checker folds what
+  comptime computes (consts resolve) and range-checks it as the literal it
+  will become.
+
 - A comptime error names the statement it failed on and the chain of
   comptime calls that produced it (`s4_11_error_trace_names_fn.fd`).
 - Evaluation has a fuel budget (100 million steps by default, `FID_CT_FUEL`

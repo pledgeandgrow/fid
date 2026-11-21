@@ -24,7 +24,7 @@
 //
 // Dependencies: compiler::ast, compiler::ir
 
-module compiler::typechecker;
+module compiler::typechecker; use compiler::comptime_eval;
 use core;
 use vec;
 use string;
@@ -2079,7 +2079,14 @@ fn tc_unquote(s: str) -> str {
     return s;
 }
 
+/// The program being compiled (register_program's last), for the comptime
+/// fold (§4.11): what a comptime expression computes is checked as the
+/// literal it will become. A copy — one Vec element, set per registration.
+var g_tc_program_copy: Vec<Program> = Vec::new();
+
 pub fn TypeChecker_register_program(self: &mut TypeChecker, program: Program, module: str) {
+    g_tc_program_copy = Vec::new();
+    g_tc_program_copy.push(program);
     self.current_module = module;
     // Release M2: the program being compiled is registered last
     g_tc_program_module = module;
@@ -14260,6 +14267,30 @@ fn tc_literal_fits(v: i64, negative: bool, bits: i64, signed: bool) -> bool {
     return v >= 0 && v < (1 << bits);
 }
 
+/// The literal a comptime expression computes (comptime_eval.fd evaluate;
+/// consts resolve there), or the expression back when it does not fold —
+/// the substitution pass reports evaluation errors, the checker only folds.
+fn tc_comptime_fold(e: Expr) -> Expr {
+    if g_tc_program_copy.len() == 0 {
+        return e;
+    }
+    var prog: Program = g_tc_program_copy.get(0);
+    match evaluate(& e, & prog) {
+        ResultExpr::Ok(v) => {
+            match v {
+                Expr::IntLit(_) => {
+                    return v;
+                }
+                _ => {
+                }
+            }
+        }
+        ResultExpr::Err(_) => {
+        }
+    }
+    return e;
+}
+
 /// src/typechecker.rs check_value_fits: a value given to an integer type
 /// must fit it.
 fn TypeChecker_check_value_fits(self: &mut TypeChecker, declared0: Type, actual0: Type, expr: Expr, line: i64) {
@@ -14271,10 +14302,31 @@ fn TypeChecker_check_value_fits(self: &mut TypeChecker, declared0: Type, actual0
     var signed: bool = tc_int_signed(declared);
     var checked: bool = false;
     var fits: bool = true;
+    var ct_fold_val: i64 = 0;
+    var ct_fold_named: bool = false;
     match expr {
         Expr::IntLit(v) => {
             checked = true;
             fits = tc_literal_fits(v, false, bits, signed);
+        }
+        // §4.11: what comptime computes is a literal at run time — fold it
+        // here, so its value is range-checked and named in the error
+        Expr::Comptime(ct_inner) => {
+            var ct_folded: Expr = tc_comptime_fold(box_expr_unbox(ct_inner));
+            match ct_folded {
+                Expr::IntLit(ct_v) => {
+                    checked = true;
+                    ct_fold_val = ct_v;
+                    ct_fold_named = true;
+                    if ct_v < 0 {
+                        fits = tc_literal_fits(0 - ct_v, true, bits, signed);
+                    } else {
+                        fits = tc_literal_fits(ct_v, false, bits, signed);
+                    }
+                }
+                _ => {
+                }
+            }
         }
         Expr::Unary(op, e) => {
             match op {
@@ -14297,7 +14349,11 @@ fn TypeChecker_check_value_fits(self: &mut TypeChecker, declared0: Type, actual0
     }
     if checked {
         if !fits {
-            self.errors.push("Type error (line " + int_to_str(line) + "): the literal does not fit in " + type_to_str(declared) + ".");
+            if ct_fold_named {
+                self.errors.push("Type error (line " + int_to_str(line) + "): the comptime value " + int_to_str(ct_fold_val) + " does not fit in " + type_to_str(declared) + ".");
+            } else {
+                self.errors.push("Type error (line " + int_to_str(line) + "): the literal does not fit in " + type_to_str(declared) + ".");
+            }
         }
         return;
     }
