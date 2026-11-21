@@ -298,7 +298,7 @@ Questions go to [Discussions](https://github.com/pledgeandgrow/fid/discussions),
 <details>
 <summary><b>How is Fid different from Rust?</b></summary>
 
-No lifetime annotations: references cannot be stored or returned from a local. Assignment copies instead of moving. No macros; `comptime` instead. Capability grants and effect annotations are built in. Fid is younger, has no package registry, and its generated code is slower. [Full comparison](docs/guides/from-rust.md).
+No lifetime annotations: references cannot be stored or returned from a local. Assignment copies instead of moving. No macros; `comptime` instead. Capability grants and effect annotations are built in. Fid is younger, its package index is just starting, and its generated code is slower. [Full comparison](docs/guides/from-rust.md).
 
 </details>
 

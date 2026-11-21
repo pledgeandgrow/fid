@@ -23,7 +23,8 @@ license = "MIT"
 [dependencies]
 textkit = { path = "../textkit" }
 mylib = { git = "https://example.org/mylib.git", tag = "v1.2.0" }
-c = "^1.2"                 # a package of the index (ARK_INDEX)
+c = "^1.2"                 # a package of the index (ARK_INDEX, default
+                             # github.com/pledgeandgrow/pacts)
 
 [dev-dependencies]
 testkit = { path = "../testkit" }

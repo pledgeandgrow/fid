@@ -661,7 +661,7 @@ the coldest of cold starts.
 | 10x easier concurrency than Rust | **Plausible** | Effect handlers + channels + select are simpler than Rust's async/Send/Sync/Pin. No "async coloring" of functions. But Fides lacks data race prevention (Send/Sync). |
 | 10x smaller binaries than C | **Plausible** | Dead code elimination at IR level, no libc, `--caps` stripping. But C with `-Os` and manual stripping can get close. |
 | 10x safer than Rust | **Not plausible** | Rust's borrow checker is proven at scale (Firefox, Linux kernel). Fides's regions are unproven in production. Both are memory-safe. |
-| 10x better DX than Rust | **Plausible for iteration** | Hot reload + fast compilation + LSP + formatter + linter. But Rust has mature registry — Fides has ark (package manager), scribe (doc generator), veil (coverage), probe (debugger, `fidesc` only) implemented, but no registry yet. |
+| 10x better DX than Rust | **Plausible for iteration** | Hot reload + fast compilation + LSP + formatter + linter. But Rust has mature registry — Fides has ark (package manager), scribe (doc generator), veil (coverage), probe (debugger, `fidesc` only) implemented; the package index (github.com/pledgeandgrow/pacts) is live with the first pacts. |
 
 **The "100x" is about compilation speed and iteration, not runtime performance
 or overall developer experience.** Fides compiles fast and hot-reloads, but

@@ -124,8 +124,10 @@ fixes, which touch `src/*.rs`, scripts and docs only).
 | Native Linux suite (`NATIVE=1 scripts/cross-test.sh`, Nov 9) | AArch64 273, RISC-V 271, x86-64 272 of 317 match the interpreter |
 | Windows x64 on the machine layer (`fid emit --nat`, Nov 9) | 301 of 338 |
 | WebAssembly native (`fid wasm`, Nov 15) | 316 of 344 suite tests match `fid run`; tasks switch stacks since Nov 18 |
-| Bootstrap fixpoint | stage 2 C == stage 3 C: Nov 6 (49 MB), Nov 8 (67 MB, ownership 0004); NOT re-verifiable on the Nov 19 tree from fidesc until CB8/2g.79 (a fidesc-built fid needs >16 GB to self-compile it; the 0004 temporary drops must be ported to `src/lower.rs` first) |
-| Self-compile (`dump-c compiler/main.fd`) | Nov 9: 74 s with the compiler built at -O2 in 8 split units (type check 18 s, borrow check 5, mono 5, lowering 24, C 20), 229 s at -O0; Nov 6: ~133 s; `fidesc` (Rust, Nov 20, 361K lines): dump-c ~45 s peaking ~600 MB — the compiler is now ~2.3x larger |
+| Bootstrap fixpoint | stage 2 C == stage 3 C: Nov 6 (49 MB), Nov 8 (67 MB, ownership 0004); NOT re-verifiable on the Nov 19 tree from fidesc until CB8/2g.79 (a fidesc-built fid needs >16 GB to self-compile it; the 0004 temporary drops must be ported to `src/lower.rs` first). From a self-hosted stage 0 it can be: see the next row |
+| Build from a self-hosted stage 0 (Nov 21) | the Nov 18 fid compiled the unmodified Nov 20 tree (86cc919) in one step: 121 MB of C in ~5 min (lower 252 s, codegen 81 s), 8 split units at -O2, a 15 MB fid. It passes run, emit (pe_ir) and ccompile of hello and the leak gate (10/10), with none of the fidesc-built fid's crashes. So the 3-stage bootstrap can start from a released fid instead of fidesc. `scripts/build-selfhost.sh`'s split -O2 step failed silently there and fell back to one unit at -O0 with exit 0 (2g.86); the 8 units were built by hand |
+| Roadmap goal check (Nov 21, with that fid) | 224 goals: 87 validated, 121 partly, 15 failed, 1 not checkable here; the bugs found are known-bugs.md 2g.80-2g.113 |
+| Self-compile (`dump-c compiler/main.fd`) | Nov 21 (361K lines): 57 s with the compiler built at -O2 in 8 split units (type check 4.8 s, borrow check 0.7, mono 0.6, front end 16.6 in all, lowering 32.9, C 19.3; CS4); `check compiler/main.fd --time` 35 s. Nov 9 (158K lines): 74 s with the compiler built at -O2 in 8 split units (type check 18 s, borrow check 5, mono 5, lowering 24, C 20), 229 s at -O0; Nov 6: ~133 s; `fidesc` (Rust, Nov 20, 361K lines): dump-c ~45 s peaking ~600 MB — the compiler is now ~2.3x larger |
 | Version (`compiler/build_info.fd`) | base `1.0.0` (`fid version` prints `1.0.0+dev` on a dev build); tags: v1.0.0 (Sep 9), v0.8.0-unstable (Nov 10) |
 
 Session 30 (Oct 2026) for comparison: compiler 54 files / 104,439 lines, Rust
@@ -3433,7 +3435,7 @@ implementation (session 11) and not core codegen bugs.
 - Benchmarking (`fidesc bench`)
 - Stack traces on panic
 - C header parser → Fides FFI bindings
-- Package manager (ark -- path/git deps, no registry yet)
+- Package manager (ark -- path/git deps + the pacts index: ARK_INDEX, default github.com/pledgeandgrow/pacts)
 - Doc generator (scribe)
 - Coverage tool (veil)
 
