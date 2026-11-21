@@ -257,6 +257,21 @@ if [[ "$1" == "--save" ]]; then
     exit 0
 fi
 
+# --- Comptime oracle: comptime result == run result (VF, §4.11) ---
+# Seeded comptime fns (arithmetic, loops, strings, tables), each checked
+# comptime-evaluated against the same fn at run time. A difference is a
+# comptime_eval.fd bug; the run stops the verification.
+echo ""
+echo "=== Comptime oracle (comptime == run) ==="
+ORACLE_PY=python3
+command -v "$ORACLE_PY" >/dev/null 2>&1 || ORACLE_PY=python
+for SEED in 1 2; do
+    if ! "$ORACLE_PY" scripts/comptime-oracle.py --fid "$FID" --seed "$SEED"; then
+        echo -e "${RED}comptime oracle failed (seed $SEED)${NC}"
+        exit 1
+    fi
+done
+
 # --- Diff mode: compare to baseline ---
 if [[ ! -f "$BASELINE_FILE" ]]; then
     echo ""
