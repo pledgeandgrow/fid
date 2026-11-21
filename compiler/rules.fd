@@ -63,6 +63,44 @@ const RR_OTHER: i64 = 0;  // the operand that is not the constant (x)
 const RR_CONST: i64 = 1;  // the integer constant `rc`
 const RR_TRUE: i64 = 2;
 const RR_FALSE: i64 = 3;
+// TG2: what a rule needs of its operands beyond the shape match, as bit
+// flags checked before the rule fires. A rule with a precondition it does
+// not declare (or declares and the caller does not check) is a bug the
+// selftest reports; the point is that a future machine-level rule (immediate
+// fits, register class) states what it needs here and the framework is
+// already checking it.
+const RP_INT: i64 = 1;          // both operands integer (ru_is_int)
+const RP_SAME_TY: i64 = 2;      // both operands the same type
+const RP_SHIFT_LT_64: i64 = 4;  // a shift's amount < the width (64)
+const RP_DIV_NONZERO: i64 = 8;  // the divisor is not zero
+
+/// Whether rule `r` fires on operand type `ty` with its constant `c`:
+/// every declared precondition must hold. The caller has already matched
+/// the shape; this is the extra gate.
+pub fn ru_precond_ok(r: RuRule, ty: IrType, other_ty: IrType) -> bool {
+    if (r.precond & RP_INT) != 0 {
+        if !ru_is_int(ty) || !ru_is_int(other_ty) {
+            return false;
+        }
+    }
+    if (r.precond & RP_SAME_TY) != 0 {
+        if !ir_type_eq(ty, other_ty) {
+            return false;
+        }
+    }
+    if (r.precond & RP_SHIFT_LT_64) != 0 {
+        if r.c < 0 || r.c >= 64 {
+            return false;
+        }
+    }
+    if (r.precond & RP_DIV_NONZERO) != 0 {
+        if r.c == 0 {
+            return false;
+        }
+    }
+    return true;
+}
+
 pub struct RuRule {
     pub name: str,
     pub op: i64,
@@ -70,44 +108,45 @@ pub struct RuRule {
     pub c: i64,
     pub res: i64,
     pub rc: i64,
+    pub precond: i64,
 }
 
-fn ru(name: str, op: i64, shape: i64, c: i64, res: i64, rc: i64) -> RuRule {
+fn ru(name: str, op: i64, shape: i64, c: i64, res: i64, rc: i64, precond: i64) -> RuRule {
     return RuRule {
-        name: name, op: op, shape: shape, c: c, res: res, rc: rc
+        name: name, op: op, shape: shape, c: c, res: res, rc: rc, precond: precond
     };
 }
 
 /// The rules, in the order they are tried.
 pub fn ru_rules() -> Vec<RuRule> {
     var v: Vec<RuRule> = Vec::new();
-    v.push(ru("x + 0 = x", RU_ADD, RS_RIGHT, 0, RR_OTHER, 0));
-    v.push(ru("0 + x = x", RU_ADD, RS_LEFT, 0, RR_OTHER, 0));
-    v.push(ru("x - 0 = x", RU_SUB, RS_RIGHT, 0, RR_OTHER, 0));
-    v.push(ru("x - x = 0", RU_SUB, RS_SAME, 0, RR_CONST, 0));
-    v.push(ru("x * 1 = x", RU_MUL, RS_RIGHT, 1, RR_OTHER, 0));
-    v.push(ru("1 * x = x", RU_MUL, RS_LEFT, 1, RR_OTHER, 0));
-    v.push(ru("x * 0 = 0", RU_MUL, RS_RIGHT, 0, RR_CONST, 0));
-    v.push(ru("0 * x = 0", RU_MUL, RS_LEFT, 0, RR_CONST, 0));
-    v.push(ru("x / 1 = x", RU_DIV, RS_RIGHT, 1, RR_OTHER, 0));
-    v.push(ru("x & 0 = 0", RU_AND, RS_RIGHT, 0, RR_CONST, 0));
-    v.push(ru("0 & x = 0", RU_AND, RS_LEFT, 0, RR_CONST, 0));
-    v.push(ru("x & -1 = x", RU_AND, RS_RIGHT, 0 - 1, RR_OTHER, 0));
-    v.push(ru("x & x = x", RU_AND, RS_SAME, 0, RR_OTHER, 0));
-    v.push(ru("x | 0 = x", RU_OR, RS_RIGHT, 0, RR_OTHER, 0));
-    v.push(ru("0 | x = x", RU_OR, RS_LEFT, 0, RR_OTHER, 0));
-    v.push(ru("x | x = x", RU_OR, RS_SAME, 0, RR_OTHER, 0));
-    v.push(ru("x ^ 0 = x", RU_XOR, RS_RIGHT, 0, RR_OTHER, 0));
-    v.push(ru("0 ^ x = x", RU_XOR, RS_LEFT, 0, RR_OTHER, 0));
-    v.push(ru("x ^ x = 0", RU_XOR, RS_SAME, 0, RR_CONST, 0));
-    v.push(ru("x << 0 = x", RU_SHL, RS_RIGHT, 0, RR_OTHER, 0));
-    v.push(ru("x >> 0 = x", RU_SHR, RS_RIGHT, 0, RR_OTHER, 0));
-    v.push(ru("x == x", RU_EQ, RS_SAME, 0, RR_TRUE, 0));
-    v.push(ru("x != x", RU_NE, RS_SAME, 0, RR_FALSE, 0));
-    v.push(ru("x < x", RU_LT, RS_SAME, 0, RR_FALSE, 0));
-    v.push(ru("x <= x", RU_LE, RS_SAME, 0, RR_TRUE, 0));
-    v.push(ru("x > x", RU_GT, RS_SAME, 0, RR_FALSE, 0));
-    v.push(ru("x >= x", RU_GE, RS_SAME, 0, RR_TRUE, 0));
+    v.push(ru("x + 0 = x", RU_ADD, RS_RIGHT, 0, RR_OTHER, 0, RP_INT | RP_SAME_TY));
+    v.push(ru("0 + x = x", RU_ADD, RS_LEFT, 0, RR_OTHER, 0, RP_INT | RP_SAME_TY));
+    v.push(ru("x - 0 = x", RU_SUB, RS_RIGHT, 0, RR_OTHER, 0, RP_INT | RP_SAME_TY));
+    v.push(ru("x - x = 0", RU_SUB, RS_SAME, 0, RR_CONST, 0, RP_INT | RP_SAME_TY));
+    v.push(ru("x * 1 = x", RU_MUL, RS_RIGHT, 1, RR_OTHER, 0, RP_INT | RP_SAME_TY));
+    v.push(ru("1 * x = x", RU_MUL, RS_LEFT, 1, RR_OTHER, 0, RP_INT | RP_SAME_TY));
+    v.push(ru("x * 0 = 0", RU_MUL, RS_RIGHT, 0, RR_CONST, 0, RP_INT | RP_SAME_TY));
+    v.push(ru("0 * x = 0", RU_MUL, RS_LEFT, 0, RR_CONST, 0, RP_INT | RP_SAME_TY));
+    v.push(ru("x / 1 = x", RU_DIV, RS_RIGHT, 1, RR_OTHER, 0, RP_INT | RP_SAME_TY | RP_DIV_NONZERO));
+    v.push(ru("x & 0 = 0", RU_AND, RS_RIGHT, 0, RR_CONST, 0, RP_INT | RP_SAME_TY));
+    v.push(ru("0 & x = 0", RU_AND, RS_LEFT, 0, RR_CONST, 0, RP_INT | RP_SAME_TY));
+    v.push(ru("x & -1 = x", RU_AND, RS_RIGHT, 0 - 1, RR_OTHER, 0, RP_INT | RP_SAME_TY));
+    v.push(ru("x & x = x", RU_AND, RS_SAME, 0, RR_OTHER, 0, RP_INT | RP_SAME_TY));
+    v.push(ru("x | 0 = x", RU_OR, RS_RIGHT, 0, RR_OTHER, 0, RP_INT | RP_SAME_TY));
+    v.push(ru("0 | x = x", RU_OR, RS_LEFT, 0, RR_OTHER, 0, RP_INT | RP_SAME_TY));
+    v.push(ru("x | x = x", RU_OR, RS_SAME, 0, RR_OTHER, 0, RP_INT | RP_SAME_TY));
+    v.push(ru("x ^ 0 = x", RU_XOR, RS_RIGHT, 0, RR_OTHER, 0, RP_INT | RP_SAME_TY));
+    v.push(ru("0 ^ x = x", RU_XOR, RS_LEFT, 0, RR_OTHER, 0, RP_INT | RP_SAME_TY));
+    v.push(ru("x ^ x = 0", RU_XOR, RS_SAME, 0, RR_CONST, 0, RP_INT | RP_SAME_TY));
+    v.push(ru("x << 0 = x", RU_SHL, RS_RIGHT, 0, RR_OTHER, 0, RP_INT | RP_SAME_TY | RP_SHIFT_LT_64));
+    v.push(ru("x >> 0 = x", RU_SHR, RS_RIGHT, 0, RR_OTHER, 0, RP_INT | RP_SAME_TY | RP_SHIFT_LT_64));
+    v.push(ru("x == x", RU_EQ, RS_SAME, 0, RR_TRUE, 0, RP_INT | RP_SAME_TY));
+    v.push(ru("x != x", RU_NE, RS_SAME, 0, RR_FALSE, 0, RP_INT | RP_SAME_TY));
+    v.push(ru("x < x", RU_LT, RS_SAME, 0, RR_FALSE, 0, RP_INT | RP_SAME_TY));
+    v.push(ru("x <= x", RU_LE, RS_SAME, 0, RR_TRUE, 0, RP_INT | RP_SAME_TY));
+    v.push(ru("x > x", RU_GT, RS_SAME, 0, RR_FALSE, 0, RP_INT | RP_SAME_TY));
+    v.push(ru("x >= x", RU_GE, RS_SAME, 0, RR_TRUE, 0, RP_INT | RP_SAME_TY));
     ru_mutate_rules(&mut v);
     return v;
 }
@@ -160,7 +199,7 @@ fn ru_mutated(v: &Vec<RuRule>, at: i64, shift: bool) -> RuRule {
     } else {
         res = RR_TRUE;
     }
-    return ru("MUTANT " + r.name, r.op, r.shape, c, res, rc);
+    return ru("MUTANT " + r.name, r.op, r.shape, c, res, rc, r.precond);
 }
 
 fn ru_mutate_rules(v: &mut Vec<RuRule>) {
@@ -197,7 +236,7 @@ fn ru_rules_off(v: &mut Vec<RuRule>) {
     while i < v.len() {
         if every || str_contains(list, "," + int_to_str(i) + ",") {
             var r: RuRule = v.get(i);
-            v.set(i, ru(r.name, 0, r.shape, r.c, r.res, r.rc));
+            v.set(i, ru(r.name, 0, r.shape, r.c, r.res, r.rc, r.precond));
         }
         i = i + 1;
     }
@@ -326,7 +365,7 @@ fn ru_rewrite(f: &mut IrFunction, rules: &Vec<RuRule>) -> i64 {
                     while ri < rules.len() && !done {
                         var r: RuRule = rules.get(ri);
                         var other: i64 = 0 - 1;
-                        if r.op == code {
+                        if r.op == code && ru_precond_ok(r, aty, ru_meta_ty(f, if r.shape == RS_RIGHT { a } else { b })) {
                             if r.shape == RS_RIGHT && cb.get(0) == 1 && cb.get(1) == r.c {
                                 other = a;
                             }
@@ -971,6 +1010,21 @@ pub fn rules_selftest() -> i64 {
                 bad = bad + 1;
             }
             xi = xi + 1;
+        }
+        // TG2: the rule's preconditions hold for these operands (they are
+        // integers, and the rule's own constant meets any shift or division
+        // constraint it declares). A rule that declares RP_SHIFT_LT_64 with
+        // c >= 64, or RP_DIV_NONZERO with c == 0, is a bug: its
+        // preconditions contradict its own shape.
+        if (r.precond & RP_SHIFT_LT_64) != 0 && (r.c < 0 || r.c >= 64) {
+            print("FAIL  " + r.name + " (declares shift < 64 but c = " + int_to_str(r.c) + ")\n");
+            fails = fails + 1;
+            bad = bad + 1;
+        }
+        if (r.precond & RP_DIV_NONZERO) != 0 && r.c == 0 {
+            print("FAIL  " + r.name + " (declares divisor != 0 but c = 0)\n");
+            fails = fails + 1;
+            bad = bad + 1;
         }
         if bad == 0 {
             print("ok    " + r.name + "\n");

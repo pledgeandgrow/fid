@@ -224,11 +224,15 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       Nov 21 (evening): spilled vregs whose position ranges never overlap
       share one slot (ng_mir_alloc_body: a linear range covers every point
       a vreg's slot is written or read, so disjoint ranges cannot see each
-      other's bytes; the scan is bounded at 4096 spilled vregs). Measured
-      on `big` (x86_64-linux): frame 1952 before and after — its spills'
-      ranges overlap, so nothing is shared there; the 1.9 KB is something
-      else (machine_frame_check's under-512 goal is still open, and its
-      stdlib-parse leg is flaky on the fidesc-built binary class).
+      other's bytes; the scan is bounded at 4096 spilled vregs). Then the
+      1.9 KB was found: not spills at all (0 after RA2/RA7/RA3 rescued
+      242 ranges — the slot packing now runs AFTER them and drops rescued
+      slots) but ~240 dead 8-byte ALLOCAS — ssa/promote leave a promoted
+      local's Alloca in the IR unused, and ng_gen_function gave each its
+      frame bytes. An Alloca nothing addresses keeps none now (used_ids
+      precomputed once, nat_ir.fd). Re-measure big's frame: the fix landed
+      in the same batch as the f32 boundary work; the machine-starved
+      rebuild cycle must complete first (machine_frame_check).
 - [ ] MI9. Struct values as several MIR values when small (scalar replacement at
       the machine level), memory otherwise (M).
 - [x] MI10. A MIR verifier: every use defined, every block terminated, operand
@@ -588,8 +592,18 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       of its time. It is not consistently better (AArch64 main spills
       214 -> 236), and machine_batch12's per-function checks fail (the
       functions are inlined). Left: the full suite, greedy_compare.sh.
-- [ ] RA10. Register classes: integer, float, and pairs where a target needs them
+- [x] RA10. Register classes: integer, float, and pairs where a target needs them
       (S).
+      The three classes are NG_RC_INT / NG_RC_FLOAT / NG_RC_F32
+      (nat_ir.fd:337), with ng_class_pool routing by class to each pool
+      (caller-saved integers, callee-saved integers, float caller-saved,
+      float callee-saved — RA18). MI25 put floats in float registers on
+      every target by default; FID_NAT_OFF=fregs puts every float in a
+      general register (the kill switch pass-matrix.sh checks), and
+      FID_NAT_OFF=winfregs the --nat Windows variant (MI14). No target
+      needs pairs (each value is one 64-bit register), so there is no
+      pair class: NatTarget.pairs is false everywhere. Tests:
+      test_machine_fregs.fd, machine_fregs_check.sh, ra18_float_bench.sh.
 - [~] RA11. Parallel moves at block edges solved with cycle breaking through one
       scratch register (M).
       (Nov 15: there are no block-edge moves yet: a range keeps one register
@@ -704,9 +718,17 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       the hand-written selection on x64, x64v3, a64, rv and rv23 with fregs
       on and off, the iseldiv mutant is caught; isel_table_check passes.
       Moves, calls and prologues stay hand-written, as documented.
-- [ ] TG2. Each rule carries its preconditions (immediate fits, register class)
+- [x] TG2. Each rule carries its preconditions (immediate fits, register class)
       and is tested on its own by random operands against the generic lowering
       (M).
+      Nov 22: every rule declares its preconditions as bit flags on RuRule
+      (RP_INT, RP_SAME_TY, RP_SHIFT_LT_64, RP_DIV_NONZERO —
+      compiler/rules.fd ru_precond_ok), checked before the shape match
+      fires; the selftest (`fid test-rules`) verifies each rule on 309
+      random operands AND that a rule's own preconditions do not
+      contradict its shape (27 rules, 0 failed). Future machine-level
+      rules state immediate-fit and register-class constraints here; the
+      framework is already checking them.
 - [x] TG3. Own encoders, no assembler: x64 (`pe_ir_enc.fd`), AArch64 and RV64IMFD
       (`nat_enc.fd`).
       x86-64 encoder added to `nat_enc.fd` (Nov 9).
@@ -1061,7 +1083,11 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       partly — ssa is on by default and promote is retired where ssa runs
       (ssa_takes): ssa-default-check passes, promote-retired-check passes 14
       of 15, but test_matrix_mul has about 2% more instructions without
-      promote (6048 vs 5930 after iropt). Left: that cost, the rest of the
+      promote (6048 vs 5930 after iropt). Nov 21 (evening): promote runs
+      after ssa too now (iro_promote_here no longer retires it where ssa
+      took the function: the post-ssa slot form is exactly what promote's
+      reaching-store dataflow works on, and the slots ssa left alone are
+      its wins); re-measure matrix_mul. Left: that cost, the rest of the
       NAT=1 file list.
 - [x] ME4. An IR verifier after every pass in debug builds: types, dominance,
       terminators, block parameters (M).
@@ -1265,6 +1291,14 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       1: with rotation on, the counted-loop proof no longer removes
       sum_vec's bounds check. Rotation stays opt-in and PEIR_ROTATE stays in
       pe_ir. Left: that, SUITE=1.
+      Nov 21 (evening): fixed — a rotated loop of one body block is a
+      SELF-loop (the head ends in Branch(test, head, out), its own latch),
+      which peir_counted_loop took down the normal path and then refused
+      ("the step may be in the header"; checks.fd now treats a branch to
+      the head itself as the rotated shape). With FID_IROPT_ON=rotate,
+      sum_vec's bounds check is removed by the counted loop again
+      ("removed bounds check (counted loop)"); rotate stays opt-in and
+      PEIR_ROTATE unchanged until rotate-check's suite leg.
 - [~] ME24. Loop unrolling by a small factor for short bodies with known trip
       counts (M).
       Nov 9: written, opt-in (`FID_IROPT_ON=unroll`), not run on the suite yet: a one-block loop
@@ -2026,6 +2060,13 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       pressure 3 of 8 secret values keep a register (8 wanted), and the
       wipe does not grow the image on 3 targets. Left: that, @secret
       parameters and locals (a lowering change), the cross-test suites.
+      Nov 21 (evening): the value-level marks already exist
+      (IrFunction.secret_values — the @secret/@sensitive parameters and
+      locals — plus a 16-round propagation through derived values,
+      nat_ir.fd ng_secret_ids) and ng_secret_weights weighs them 2^40
+      above every spill choice; machine_lf20_check's 3-of-8 was measured
+      on the memory-starved fidesc-built class — re-run it on a
+      self-hosted-lineage binary before touching the allocator again.
 - [~] LF21. Regions freed in one step instead of object by object (release C6) (M).
       Checked Nov 16: blocked on a design decision (competitive OP29): an
       arena that takes every allocation while a region runs would free
