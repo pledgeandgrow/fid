@@ -1542,6 +1542,38 @@ fn ark_index_lookup(index: str, name: str, spec: str) -> ArkIndexEntry {
     return best;
 }
 
+/// Is `name` a pact of the index (a file of its name with at least one
+/// version line)? Used by `ark add` with no flag: a bare name of the index
+/// is a registry dependency, not a path one.
+fn ark_index_has(name: str) -> bool {
+    // names the index can never hold (a path inside its .github)
+    if str_starts_with(name, ".") || str_len(name) == 0 {
+        return false;
+    }
+    var index: str = ark_update_index();
+    if str_len(index) == 0 {
+        return false;
+    }
+    var content: str = "";
+    match read_file(index + "/" + name) {
+        Option::Some(c) => {
+            content = c;
+        }
+        Option::None => {
+            return false;
+        }
+    }
+    var lines: Vec<str> = str_split(content, "\n");
+    var i: i64 = 0;
+    while i < lines.len() {
+        if ark_index_line(lines[i]).found {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
 /// Install registry pact `name` (version `spec`) from the index: its git
 /// repository at the published tag, refused when the tag no longer points
 /// at the commit the index recorded. The commit installed, or "".
@@ -2908,6 +2940,12 @@ fn ark_cmd_add(args: Vec<str>) -> i64 {
             }
         } else if str_len(version_val) > 0 {
             dep = DepSource::Registry(version_val);
+        } else if ark_index_has(dep_name) {
+            // N6: a bare `ark add <name>` of a pact of the index is a
+            // registry dependency at `*` (it used to become a path
+            // dependency of a directory that does not exist, and install
+            // failed: `Path pact 'textkit' cannot be read`)
+            dep = DepSource::Registry("*");
         } else {
             // Default: path dependency with dep_name as directory
             dep = DepSource::Path(dep_name);
