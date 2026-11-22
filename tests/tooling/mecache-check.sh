@@ -163,7 +163,7 @@ same_three() {  # same_three <name> <file>
   # recorded by check 4): unrecordable = misses - recorded, 0 when warm
   c_line=$(grep '^\[mecache\] egraph:' "$OUT/${name}_cold.log" | head -1)
   case "$c_line" in
-    *', 0 hits,'*) c_unrec=$(printf '%s' "$c_line" | sed 's/^.*: 0 hits, \([0-9]*\) misses, \([0-9]*\) recorded.*/\1 \2/' | awk '{print $1 - $2}') ;;
+    *': 0 hits,'*) c_unrec=$(printf '%s' "$c_line" | sed 's/^.*: 0 hits, \([0-9]*\) misses, \([0-9]*\) recorded.*/\1 \2/' | awk '{print $1 - $2}') ;;
     *) c_unrec=0 ;;
   esac
   if [ -z "$w_miss" ] || [ -z "$c_unrec" ] || [ "$w_miss" != "$c_unrec" ]; then
