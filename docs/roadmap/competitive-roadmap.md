@@ -2386,7 +2386,7 @@ Reach what Rust, Go, Zig and C++ programmers expect on day one.
       and test_frontend_gen_eq pass on run, ccompile and emit. Left: no
       token-tree macro system; hygiene comes from gensym and the clash
       errors.
-- [x]       Nov 22 audit: done by the second arm of the acceptance — the comptime
+      Nov 22 audit: done by the second arm of the acceptance — the comptime
       covers what macros do: code generation (comptime gen + comptime
       splice in expression position, expand before anything else,
       comptime_eval.fd:589-593, ct_expand_splices :2792), compile-time
@@ -2397,7 +2397,7 @@ Reach what Rust, Go, Zig and C++ programmers expect on day one.
       queries. No token-tree macro parse form exists — by design; a
       guaranteed hygiene algorithm (beyond gensym + clash errors) would
       be new work if ever wanted.
-LG10. Error handling with context and no allocation on the happy path (M).
+- [~] LG10. Error handling with context and no allocation on the happy path (M).
       `Result.context(msg)`, `with_context(f)`, `Option.context(msg)` (complaint
       CE1).
 - [x] LG11. Structured concurrency with cancellation and timeouts (L).
