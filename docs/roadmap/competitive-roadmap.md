@@ -1166,6 +1166,12 @@ Some of the largest costs are in how data is laid out, not in the optimizer.
       field holding a struct (`Pair<Cell, i64>` keys) is hashed by address,
       and test_generic_struct_drop exits 1 (not in the tree).
 - [~] RT6. Generics fully monomorphized, so a `Vec<f64>` holds floats as floats (L).
+      Nov 22 audit: mostly done — f64 elements stored inline unboxed
+      (lower.fd:8938-8945 p_f64_to_bits), element inference from pushes
+      (typechecker.fd:13246 TypeChecker_rt6_note_push; test_vec_infer_*
+      family). Precise gap: a `let` inside a closure body or a generic
+      impl method keeps the untyped-Vec behaviour; lw_vec_elem_code
+      (lower.fd:8326) has codes only for u8..i32.
       Done (Nov 3, verified): `val x: f64 = v.get(0)` round-trips 1.5 — the
       monomorphized layout already stores floats as floats when the element
       type is known. Left: `print(v.get(0))` on an untyped `Vec::new()`
@@ -2218,6 +2224,13 @@ Reach what Rust, Go, Zig and C++ programmers expect on day one.
       `test_borrowed_str_return_fail`, `test_borrowed_str_pass_fail`,
       `test_scoped_store_fail`.
 - [~] LG3. Lifetimes the borrow checker can prove across functions, without
+      Nov 22 audit: mostly done — signature-derived summaries
+      (borrowck.fd:529-568), NLL last-use (:2335-2353), escape check
+      (escape.fd:1043-1062). Precise gap: reads are not checked against
+      an active `&mut` (only `&path` creation borrowck.fd:2324-2331 and
+      mutations :2396-2408 are; using `m` while `r = id_mut(m)` is live
+      passes); struct lifetime args are matched positionally, generic
+      structs are not instantiated by lifetime (parser.fd:3864-3873).
       second-class limits where that matters (XL).
       Done (Nov 13 check): `fn f(p: &i64) -> &i64` — parameter-derived borrow
       returns are inferred and check clean.
@@ -2257,6 +2270,13 @@ Reach what Rust, Go, Zig and C++ programmers expect on day one.
       test_frontend_lifetime_struct_store_fail gives 2 errors (the first
       matches); not run on the Linux targets.
 - [~] LG4. Traits: bounds checked, associated types, default methods, trait objects
+      Nov 22 audit: mostly done — bounds at calls (typechecker.fd:15699,
+      :21798), associated types (:2440-2573, :2919-2962), default methods
+      (compiler.fd:10858), trait objects on every backend (DynCall).
+      Precise gap: the artifact cache drops generic trait methods'
+      metadata (ast_ser.fd:2138-2143 skips annotations/type_params/
+      is_async deliberately); GATs and generic impls stay uncompared
+      (tc_impl_view_subst returns empty :2921-2923).
       (release K9 is the start) (L).
       Done (release K9, in `fid`): every bound of `T: A + B` is checked at the
       call; a type parameter is inferred or an error; turbofish with an arity
@@ -2550,6 +2570,14 @@ Reach what Rust, Go, Zig and C++ programmers expect on day one.
       _native_libc, test_at_import_cpp*; lg15-extern-core-name-check.sh
       PASS (build/lg15-vf15-check.out).
 - [~] LG16. C++ interop for the common cases (XL).
+      Nov 22 audit: far more than the roadmap suggested — extern "C++"
+      shim generation with classes as opaque handles, method/get/set
+      wrappers, function-template instantiation, std::string crossing and
+      exception catch (cparser.fd:2472-2498; tests at_import/
+      test_at_import_cpp*, _tmpl). Precise gap (self-declared :2496-2498):
+      class templates, operators, rvalue references, function pointers,
+      variadics, std containers; and `fid emit` does not compile shims
+      (the cpp: link marker is ccompile-only, main.fd:4658-4673).
       Nov 16 (not yet built), the first step: a C++ header (`.hpp`, `.hh`,
       `.hxx`, or one with `namespace`) imports through compiler/cparser.fd
       like a C one (`use lib` finds `lib.hpp`; `@import("lib.hpp")`).
@@ -2634,6 +2662,12 @@ owning what we ship.
       Windows Schannel server-side ALPN run, which waits for a run with a
       .pfx certificate.
 - [~] SL2. HTTP/3 and QUIC (XL).
+      Nov 22 audit: mostly done — stdlib/quic(+_conn/_frame/_tls/_udp).fd,
+      http3.fd, qpack.fd over udp.fd; tests test_stdlib_quic_*, tests/net
+      quic_udp_*, http3_udp_loopback, http3_curl_server, quic_curl_interop,
+      http3_public. Precise gap (self-declared at quic_conn.fd:52-53):
+      0-RTT anti-replay, path MTU discovery, ECN, pacing, preferred
+      address; RFC 9368 version_information absent.
       Done Nov 17: QUIC v1 and HTTP/3 in pure Fides (`stdlib/quic*.fd`,
       `tls13.fd`, `aes_gcm.fd`, `http3.fd`, `qpack.fd`, `http3_udp.fd`)
       over `stdlib/udp.fd` (the OS socket API, IPv4 and IPv6, no hand
@@ -2655,6 +2689,11 @@ owning what we ship.
       client over IPv6 and IPv4) and a TLS round trip with a self-signed
       certificate on C and native. Left: permessage-deflate.
 - [~] SL4. TLS 1.3 on every platform (release I7) (M).
+      Nov 22 audit: mostly done — tls_client13/tls_connect13 on Windows
+      (tls_windows.fd:466,:566,:572) and Unix OpenSSL (tls_unix.fd:409,
+      :425); test_tls13_local, scripts/verify/tls13_live.fd. Precise gap:
+      the native-lane run (tier1 disagree.txt:493 — inside the general
+      native-Windows breakage, not TLS code).
       Verified live: `tls_connect13("github.com", 443)` over Schannel
       negotiates SP_PROT_TLS1_3_CLIENT (8192, checked via
       tls_session_protocol) — the SCH_CRED + TLS_PARAMETERS credentials
@@ -2713,6 +2752,12 @@ owning what we ship.
       resolver on --nat, pe_ir and x86_64-linux (-1 for an invalid name).
       Done. The cache and the other paths were not rechecked.
 - [~] SL6. JSON at simdjson-class speed (L).
+      Nov 22 audit: infrastructure done (json_index indexed DOM json.fd:1475
+      + jd_* :1488-1546, SWAR j_plain_words :137 with interp guard;
+      test_json_swar), speed target not: docs/benchmarks.md:234-236 records
+      42-178 MB/s vs simdjson 2-3 GB/s. Precise gap: SIMD byte lanes
+      (nat_ir ng_simd_call is f64/i64 only) and json_index's Vec-push
+      bound — 1-2 orders of magnitude, real engineering.
       Measured (5.9 MB nested doc, PE emit): `json_is_valid` ~10 MB/s,
       `json_parse` (validate + canonicalize) ~1.6 MB/s — three orders of
       magnitude from simdjson-class. `j_canon` now writes into one
@@ -3006,6 +3051,10 @@ owning what we ship.
       exact decimals on a BigInt mantissa, division and rounding to a scale
       with six rounding modes (half-even by default); `test_decimal.fd`.
 - [~] SL17. Files, paths and processes complete on every platform (M).
+      Nov 22 audit: mostly done — path.fd (17 pub fns, drives/UNC), fs.fd
+      (67), process.fd:18-51, file.fd; test_files_spec covers all three.
+      Precise gap: the native-Windows lane run (inside the general
+      native-lane breakage) — module code is not the gap.
       Done: `stdlib/path.fd` reads both separators, Windows drives and UNC
       roots in join, split, normalize, parent and components
       (`test_path.fd`). 
@@ -3025,6 +3074,13 @@ owning what we ship.
       test_cback_proc_tmpdir.fd). Left: a rerun of the suite on every
       backend.
 - [~] SL18. Crypto through reviewed libraries, the set of release J5 (L).
+      Nov 22 audit: mostly done — J5 set through OS libraries
+      (crypto_bind.fd BCrypt/CNG, crypto_bind_unix.fd OpenSSL EVP,
+      crypto_bind_rsa.fd with Wycheproof), pure-Fides primitives with
+      published vectors, and beyond-J5 pqc/hpke/jose. Precise gap: the
+      qualified external review itself (review-index.md says J9 stays
+      open until signed off) and a macOS CI crypto run — external work,
+      not code.
       Done: `test_crypto_tls_vectors.fd` proves the primitives against
       published vectors — ChaCha20 block/stream (RFC 8439 §2.3.2/§2.4.2),
       Poly1305 (§2.5.2), ChaCha20-Poly1305 AEAD encrypt+decrypt (§2.8.2),
@@ -3048,6 +3104,11 @@ owning what we ship.
       Left: the external review (docs/security/review-index.md) and a macOS
       CI run.
 - [~] SL19. Every public function documented with an example that runs in CI (L).
+      Nov 22 audit: mostly done — scripts/doctest.py + tools/doctest.fd,
+      CI-wired (ci.yml:123,:128, enforced by ci-wiring-check.sh CU7);
+      737 /// Example: blocks over 147 files (was 528/31). Precise gap:
+      examples on the rest (quic.fd 0, fs.fd 1, ~6000 pub items) —
+      mechanical writing, no code or CI work left.
       Done: `scripts/doctest.py` extracts `/// Example:` code blocks from
       .fd sources and runs each as a program through `fid run` — CI-gatable
       (exit 1 on any failure); `(native only)` marker skips FFI examples on
@@ -3118,6 +3179,12 @@ Go and Rust won developers with tools as much as with languages.
       scripts/tl-check.sh over scripts/tl/fuzz_target.fd (run after the
       next build). Coverage-guided fuzzing of the compiler itself stays VF3.
 - [~] TL2. Error messages as good as Rust's, each with a suggested fix, and a test
+      Nov 22: the ratchet failure fixed — 4 new diag tests cover the
+      comptime builtin messages (test_diag_comptime_{reflect,embed,
+      compile_error,assert}_fail.fd: each fires exactly its two errors),
+      and Fix lines were added to those plus the @dimension unit message;
+      diag-coverage.py: 360/360 tested (100%), exit 0. Full Rust-grade
+      coverage of every message with a Fix (47%) remains long-form work.
       per error (L).
       Done (Nov 3): every diagnostic in `typechecker.rs`/`borrowck.rs` now carries
       a `Fix:` or `Hint:` line with a concrete code suggestion — borrow
@@ -3184,6 +3251,13 @@ Go and Rust won developers with tools as much as with languages.
       fix_suggestions (lsp.fd:2915); the edition-stop is by design
       (main.fd:3640-3641). Done.
 - [~] TL4. LSP complete: references, rename, formatting, signature help, inlay
+      Nov 22 audit: mostly done, close — completion/hover/rename/
+      references/signatureHelp/inlayHint/codeAction/formatting all
+      dispatch (lsp.fd:144-201, :346-369); rename is scope-aware
+      (:1017-1035), references cross-file (:1377-1405), inlay hints index
+      imported functions (:3776-3782). Precise gap: no type hint on
+      turbofish (`::<`) calls; methods of types from other modules are
+      not indexed for hints.
       hints, code actions (release N7 is the start) (L).
       Done: `fid lsp` (compiler/lsp.fd) answers references, rename,
       formatting (fmt.fd) and signature help (there before), and Nov 15
@@ -3204,6 +3278,13 @@ Go and Rust won developers with tools as much as with languages.
       modules are not indexed for hints; a local that shadows a function
       name takes its calls.
 - [~] TL5. Debugger support with line tables on every platform (release N9) (L).
+      Nov 22 audit: mostly done — line tables on every platform
+      (nat_enc.fd:3994-4003 DWARF, :8154-8160 Mach-O, :3708-3709 PE;
+      pdb.fd writes a real PDB, DB3 validated Nov 21); `fid replay`
+      replays --record traces (main.fd:346-347). Precise gaps: `fid` has
+      no interactive `debug` command (compiler/debugger.fd is wired into
+      fidesc only), and DB4 variable locations are open (no
+      DW_TAG_variable in images) — the real remaining work.
      Done: `-g`/`--debug` on `fidesc emit`/`build`/`ccompile` — PE gets
      `.debug_abbrev/.debug_info/.debug_line/.debug_str` (DWARF v4, per-instruction
      line tables); the C backend emits `#line` back to `.fd` source and passes
@@ -3292,6 +3373,13 @@ Go and Rust won developers with tools as much as with languages.
       exercises only a path pact (a git-pact leg needs a local repo) —
       optional test work.
 - [~] TL10. Editor support beyond VS Code: Neovim, JetBrains, Zed (M).
+      Nov 22 audit: mostly done — emacs/helix/neovim/sublime/zed configs
+      plus a Tree-sitter grammar with corpus; CI runs the toolchain
+      (editors.yml:48-50, zed-check.sh REQUIRE=1, parse-rate >= 90%).
+      Precise gap: editors/tree-sitter-fides/src/ (the generated
+      parser.c) is not committed and editors/zed/extension.toml:15 pins
+      rev = "main" instead of a commit; neither Zed nor Neovim was run
+      locally (CI-only validation).
       Done: configs for Neovim, Helix, Emacs, Sublime and JetBrains (LSP4IJ) in `editors/`, untested. Left: testing them, Zed (needs a grammar).
       Nov 15: the Neovim config turns inlay hints on; the server side of
       every editor is checked without an editor by scripts/tl/lsp_probe.py.
