@@ -2907,7 +2907,7 @@ owning what we ship.
       CSV and dialects, protobuf, YAML library/spec, XML library/spec/DTD
       and namespaces, and TOML library/spec/suite-spec all build and pass,
       including YAML examples 2.11 and 2.25.
-- [~] SL12. Database drivers: PostgreSQL, MySQL, SQLite, with parameter binding (L).
+- [x] SL12. Database drivers: PostgreSQL, MySQL, SQLite, with parameter binding (L).
       Done: `stdlib/sqlite.fd` binds the system sqlite3 (`SQLite::open*`,
       exec/query → JSON rows) and implements `db.fd`'s `Database`
       capability; `SQLite::query_params` binds parameters through
