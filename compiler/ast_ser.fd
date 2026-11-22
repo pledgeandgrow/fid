@@ -98,6 +98,7 @@ pub fn ar_str(r: &mut ArBuf) -> str {
     var i: i64 = 0;
     while i < n {
         var p: *mut u8 = (s + i) as * mut u8;
+        // SAFETY: p writes s's owned byte buffer at index i < its length.
         unsafe {
             *p = ar_u8(r) as u8;
         }
@@ -2135,12 +2136,18 @@ pub fn aw_traitmethod(b: &mut AwBuf, m: TraitMethod) {
     aw_bool(b, m.has_self);
     aw_bool(b, m.is_pub);
     aw_optstmts(b, m.default_body);
-    // LG3: m.annotations (a result's `@lifetime`) is not written: the
-    // artifact holds only the library, whose traits name no lifetimes, and
-    // its format (compiler.fd astcache_save, version 3) stays as it is.
-    // LG4: m.type_params / m.type_param_bounds (a generic trait method's)
-    // likewise: no library trait has a generic method. LG14: m.is_async
-    // likewise: no library trait has an async method
+    // LG3/LG4/LG14 (version 5): a trait method's annotations, its own
+    // type parameters and bounds, and is_async — a library trait with a
+    // generic, lifetime-bearing or async method no longer loses them
+    aw_annotations(b, m.annotations);
+    aw_strs(b, m.type_params);
+    aw_i64(b, m.type_param_bounds.len());
+    var bi: i64 = 0;
+    while bi < m.type_param_bounds.len() {
+        aw_strpair(b, m.type_param_bounds.get(bi));
+        bi = bi + 1;
+    }
+    aw_bool(b, m.is_async);
 }
 
 pub fn ar_traitmethod(r: &mut ArBuf) -> TraitMethod {
@@ -2150,6 +2157,15 @@ pub fn ar_traitmethod(r: &mut ArBuf) -> TraitMethod {
     m.has_self = ar_bool(r);
     m.is_pub = ar_bool(r);
     m.default_body = ar_optstmts(r);
+    m.annotations = ar_annotations(r);
+    m.type_params = ar_strs(r);
+    var bn: i64 = ar_i64(r);
+    var bi: i64 = 0;
+    while bi < bn {
+        m.type_param_bounds.push(ar_strpair(r));
+        bi = bi + 1;
+    }
+    m.is_async = ar_bool(r);
     return m;
 }
 
@@ -2703,6 +2719,7 @@ pub fn ast_bytes_to_str(bytes: Vec<i64>) -> str {
     var i: i64 = 0;
     while i < bytes.len() {
         var p: *mut u8 = (s + i) as * mut u8;
+        // SAFETY: p writes s's owned byte buffer at index i < its length.
         unsafe {
             *p = bytes.get(i) as u8;
         }

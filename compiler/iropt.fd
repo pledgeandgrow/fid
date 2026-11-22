@@ -11202,6 +11202,16 @@ fn iro_vs_zero_reaches(cfg: &IroCfg, zero_blocks: &Vec<i64>, to: i64) -> bool {
     return false;
 }
 
+/// LF14 debug (FID_VSROA_DBG=1): why the candidate of instruction `h`
+/// died, at instruction `at` (-1: before the scan)
+fn iro_vs_dbg(msg: str, h: i64, at: i64) -> void {
+    var d: str = p_getenv("FID_VSROA_DBG");
+    if str_len(d) > 0 && d != "0" {
+        p_eprint_str("[vsroa] h=" + int_to_str(h) + " at=" + int_to_str(at) + " " + msg + "
+");
+    }
+}
+
 /// LF14 for the Vec made by instruction `h`: true when it became slots.
 fn iro_vec_sroa_one(f: &mut IrFunction, h: i64) -> bool {
     var nv: i64 = f.next_value + 1;
@@ -11224,6 +11234,7 @@ fn iro_vec_sroa_one(f: &mut IrFunction, h: i64) -> bool {
                 Inst::Store(sp1, sv1, _) => {
                     if sv1 == h {
                         if sp1 == h || (slot >= 0 && slot != sp1) || !iro_vs_is_alloca(f, sp1) {
+                            iro_vs_dbg("slot-conflict", h, iid1);
                             return false;
                         }
                         slot = sp1;
@@ -11271,6 +11282,7 @@ fn iro_vec_sroa_one(f: &mut IrFunction, h: i64) -> bool {
                     }
                 }
                 if peir_has_id(inst_value_refs(&inst2), slot) && !iro_vs_slot_use_ok(f, inst2, slot, h) {
+                    iro_vs_dbg("slot-use-not-ok", h, iid2);
                     return false;
                 }
                 k2 = k2 + 1;
@@ -11338,6 +11350,7 @@ fn iro_vec_sroa_one(f: &mut IrFunction, h: i64) -> bool {
             if touches {
                 var w: i64 = iro_vs_classify(f, inst3, &kind, slot);
                 if w == 0 || iid3 < 0 || iid3 >= nv {
+                    iro_vs_dbg("unclassified-touch", h, iid3);
                     return false;
                 }
                 if w <= 4 {
@@ -11354,12 +11367,14 @@ fn iro_vec_sroa_one(f: &mut IrFunction, h: i64) -> bool {
                         hv_holds = true;
                     }
                     if !hv_holds {
+                        iro_vs_dbg("handle-does-not-hold", h, iid3);
                         return false;
                     }
                 }
                 if w == 1 {
                     // every push before any read: the length is known
                     if read || n >= IRO_VSROA_MAX {
+                        iro_vs_dbg(if read { "push-after-read" } else { "push-over-max" }, h, iid3);
                         return false;
                     }
                     at.set(iid3, n);
@@ -11369,6 +11384,7 @@ fn iro_vec_sroa_one(f: &mut IrFunction, h: i64) -> bool {
                     // an index the pushes made: no bounds panic to keep
                     var ix: i64 = iro_vs_index(f, iro_vs_arg(inst3, 2));
                     if ix < 0 || ix >= n {
+                        iro_vs_dbg("index-out-of-pushes", h, iid3);
                         return false;
                     }
                     at.set(iid3, ix);
