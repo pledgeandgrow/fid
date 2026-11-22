@@ -1388,11 +1388,59 @@ fn irc_wentry(b: &mut AwBuf, e: IrcEntry) {
 
 /// Initialize the cache for one lower() call; returns immediately when
 /// FID_IRCACHE is unset or the salt differs (file rewritten at finish).
-pub fn irc_begin(program: Program) {
-    var path: str = env_or_empty("FID_IRCACHE");
-    if str_len(path) == 0 && !g_irc_mem {
-        g_irc_on = false;
-        return;
+/// Where the lowered-IR cache lives, or "" when it is off. FID_IRCACHE
+/// overrides (an explicit file path); off/no/0/none/false, FIDES_NO_CACHE,
+/// `--no-cache` or a machine without TEMP/TMPDIR turns it off. Pruned
+/// builds (`fid emit`, reach.fd) and full builds (run/dump-c/ccompile)
+/// keep separate files: a finish rewrites the file with only the entries
+/// the build used, so mixing them would thrash (each emit would shrink
+/// what a dump-c filled in, and back).
+fn irc_path(pruned: bool) -> str {
+    var v: str = env_or_empty("FID_IRCACHE");
+    if v == "0" || v == "off" || v == "no" || v == "none" || v == "false" {
+        return "";
+    }
+    if str_len(v) > 0 {
+        return v;
+    }
+    if str_len(env_or_empty("FIDES_NO_CACHE")) > 0 {
+        return "";
+    }
+    var n: i64 = argv_count();
+    var i: i64 = 1;
+    while i < n {
+        if argv_at(i) == "--no-cache" {
+            return "";
+        }
+        i = i + 1;
+    }
+    var tmp: str = env_or_empty("TEMP");
+    if tmp == "" {
+        tmp = env_or_empty("TMPDIR");
+    }
+    if tmp == "" {
+        tmp = "/tmp";
+    }
+    var tag: str = "fid-irc-";
+    if pruned {
+        tag = "fid-ircp-";
+    }
+    return tmp + "/" + tag + int_to_str(inc_compiler_hash()) + ".bin";
+}
+
+pub fn irc_begin(program: Program, pruned: bool) {
+    // D9 (Nov 22): on by default — <TEMP>/fid-irc[p]-<compiler hash>.bin,
+    // the same pattern as the mecache/imc caches. This caches the LOWERED
+    // IR, so a warm build skips re-lowering what it lowered last time
+    // (the stdlib of a hello-world emit; ~everything of a self-compile).
+    // `fid serve` keeps its in-memory variant.
+    var path: str = "";
+    if !g_irc_mem {
+        path = irc_path(pruned);
+        if str_len(path) == 0 {
+            g_irc_on = false;
+            return;
+        }
     }
     g_irc_on = true;
     g_irc_path = path;
@@ -1542,6 +1590,12 @@ pub fn irc_replay(r: &mut ArBuf, module: &mut IrModule, l: &mut Lowerer) -> IrFu
 pub fn irc_finish() {
     if !g_irc_on {
         return;
+    }
+    // FID_IRCACHE_STATS=1: "[ircache] H hits, R recorded" (to stderr, so
+    // it never lands in a redirected dump-c)
+    if str_len(env_or_empty("FID_IRCACHE_STATS")) > 0 {
+        p_eprint_str("[ircache] " + int_to_str(g_irc_hits) + " hits, " + int_to_str(g_irc_new.len()) + " recorded
+");
     }
     // SP8: in memory (`fid serve`, g_irc_mem): keep the records for the
     // next build
@@ -2387,10 +2441,13 @@ fn mec_rvec(r: &mut ArBuf) -> Vec<i64> {
 }
 
 /// What the logged writes left in `f`: [count, (position, id, instruction)
-/// ...] [count, (block, its instruction ids) ...]. Empty when it cannot be
-/// replayed (a position outside f, a string constant a replay would have
-/// to intern).
-fn mec_delta(f: &IrFunction) -> Vec<i64> {
+/// ...] [count, (block, its instruction ids) ...] then, when the pass
+/// appended values (the e-graph's skeleton), [count, (id, meta) ...] and
+/// the final next_value. `pre_len` is the instruction count before the
+/// pass: a position at or past it is an appended value. Empty when it
+/// cannot be replayed (a position outside f, a string constant a replay
+/// would have to intern).
+fn mec_delta(f: &IrFunction, pre_len: i64) -> Vec<i64> {
     var b: AwBuf = awbuf_new();
     var mark: Vec<i64> = Vec::new();
     var i: i64 = 0;
@@ -2409,22 +2466,6 @@ fn mec_delta(f: &IrFunction) -> Vec<i64> {
             mark.set(at, 1);
             pos.push(at);
         }
-        i = i + 1;
-    }
-    aw_i64(&mut b, pos.len());
-    i = 0;
-    while i < pos.len() {
-        var vi: ValueIdInst = f.insts.get(pos.get(i));
-        match vi.inst {
-            Inst::ConstStr(_) => {
-                return Vec::new();
-            }
-            _ => {
-            }
-        }
-        aw_i64(&mut b, pos.get(i));
-        aw_i64(&mut b, vi.id);
-        iw_inst(&mut b, vi.inst);
         i = i + 1;
     }
     var bmark: Vec<i64> = Vec::new();
@@ -2446,6 +2487,46 @@ fn mec_delta(f: &IrFunction) -> Vec<i64> {
         }
         i = i + 1;
     }
+    // an appended value (the skeleton's fresh instructions) is referenced
+    // only by the blocks it was put into: every id a serialized block
+    // names that the changed table does not hold is serialized too
+    i = 0;
+    while i < bpos.len() {
+        var ids2: Vec<i64> = f.blocks.get(bpos.get(i)).instructions;
+        var k2: i64 = 0;
+        while k2 < ids2.len() {
+            var vid: i64 = ids2.get(k2);
+            if vid >= 0 && vid < f.inst_at.len() {
+                var vat: i64 = f.inst_at.get(vid) - 1;
+                if vat >= 0 && vat < f.insts.len() && mark.get(vat) == 0 && f.insts.get(vat).id == vid {
+                    mark.set(vat, 1);
+                    pos.push(vat);
+                }
+            }
+            k2 = k2 + 1;
+        }
+        i = i + 1;
+    }
+    var min_new: i64 = -1;
+    aw_i64(&mut b, pos.len());
+    i = 0;
+    while i < pos.len() {
+        var vi: ValueIdInst = f.insts.get(pos.get(i));
+        match vi.inst {
+            Inst::ConstStr(_) => {
+                return Vec::new();
+            }
+            _ => {
+            }
+        }
+        aw_i64(&mut b, pos.get(i));
+        aw_i64(&mut b, vi.id);
+        iw_inst(&mut b, vi.inst);
+        if pos.get(i) >= pre_len && (min_new < 0 || vi.id < min_new) {
+            min_new = vi.id;
+        }
+        i = i + 1;
+    }
     aw_i64(&mut b, bpos.len());
     i = 0;
     while i < bpos.len() {
@@ -2454,35 +2535,81 @@ fn mec_delta(f: &IrFunction) -> Vec<i64> {
         iw_vec_i64(&mut b, bb.instructions);
         i = i + 1;
     }
+    // the metas of the appended values and of everything from the first
+    // appended id on (the skeleton pads the table with Void before them);
+    // nothing when the pass only rewrote (the old memo behavior)
+    var mids: Vec<i64> = Vec::new();
+    if min_new >= 0 {
+        i = 0;
+        while i < pos.len() {
+            mids.push(f.insts.get(pos.get(i)).id);
+            i = i + 1;
+        }
+        i = 0;
+        while i < f.value_metas.len() {
+            var vm2: ValueIdMeta = f.value_metas.get(i);
+            if vm2.id >= min_new {
+                mids.push(vm2.id);
+            }
+            i = i + 1;
+        }
+    }
+    aw_i64(&mut b, mids.len());
+    i = 0;
+    while i < mids.len() {
+        var vm3: ValueIdMeta = f.value_metas.get(mids.get(i));
+        aw_i64(&mut b, vm3.id);
+        iw_meta(&mut b, vm3.meta);
+        i = i + 1;
+    }
+    aw_i64(&mut b, f.next_value);
     return b.bytes;
 }
 
 /// Replay a change (mec_delta) on `f`: false, and `f` unchanged, when it
 /// does not fit (every part is read and checked before anything is set).
+/// A position at f.insts.len() appends the instruction (the e-graph
+/// skeleton's fresh values); the metas and next_value tail is optional
+/// (deltas written before it end after the blocks).
 fn mec_apply(f: &mut IrFunction, delta: Vec<i64>) -> bool {
     if delta.len() == 0 {
         return true;
     }
     var r: ArBuf = arbuf_new(delta);
     var n: i64 = ar_i64(&mut r);
-    if !r.ok || n < 0 || n > f.insts.len() {
+    if !r.ok || n < 0 || n > 100000000 {
         return false;
     }
     var ats: Vec<i64> = Vec::new();
     var ins: Vec<ValueIdInst> = Vec::new();
+    var app: Vec<bool> = Vec::new();
+    var napp: i64 = 0;
     var i: i64 = 0;
     while i < n {
         var at: i64 = ar_i64(&mut r);
         var id: i64 = ar_i64(&mut r);
         var inst: Inst = ir_inst(&mut r);
-        if !r.ok || at < 0 || at >= f.insts.len() {
+        if !r.ok || at < 0 || at > f.insts.len() + napp {
             return false;
         }
-        if f.insts.get(at).id != id {
-            return false;
+        if at >= f.insts.len() {
+            // an appended value: the delta's positions are the post-pass
+            // ones, so the k-th append sits exactly k past the end
+            if at != f.insts.len() + napp {
+                return false;
+            }
+            ats.push(at);
+            ins.push(ValueIdInst_new(id, inst));
+            app.push(true);
+            napp = napp + 1;
+        } else {
+            if f.insts.get(at).id != id {
+                return false;
+            }
+            ats.push(at);
+            ins.push(ValueIdInst_new(id, inst));
+            app.push(false);
         }
-        ats.push(at);
-        ins.push(ValueIdInst_new(id, inst));
         i = i + 1;
     }
     var nb: i64 = ar_i64(&mut r);
@@ -2502,12 +2629,43 @@ fn mec_apply(f: &mut IrFunction, delta: Vec<i64>) -> bool {
         bls.push(ids);
         i = i + 1;
     }
+    // the optional tail: appended metas and the final next_value
+    var mids: Vec<i64> = Vec::new();
+    var mts: Vec<ValueMeta> = Vec::new();
+    var nv2: i64 = 0 - 1;
+    var have_tail: bool = false;
+    if r.ok && r.pos < delta.len() {
+        have_tail = true;
+        var nm: i64 = ar_i64(&mut r);
+        if !r.ok || nm < 0 || nm > 100000000 {
+            return false;
+        }
+        i = 0;
+        while i < nm {
+            var mid: i64 = ar_i64(&mut r);
+            var mt: ValueMeta = ir_meta(&mut r);
+            if !r.ok || mid < 0 {
+                return false;
+            }
+            mids.push(mid);
+            mts.push(mt);
+            i = i + 1;
+        }
+        nv2 = ar_i64(&mut r);
+        if !r.ok {
+            return false;
+        }
+    }
     if !r.ok || r.pos != delta.len() {
         return false;
     }
     i = 0;
     while i < ats.len() {
-        f.insts.set(ats.get(i), ins.get(i));
+        if app.get(i) == 1 {
+            f.insts.push(ins.get(i));
+        } else {
+            f.insts.set(ats.get(i), ins.get(i));
+        }
         i = i + 1;
     }
     i = 0;
@@ -2516,6 +2674,32 @@ fn mec_apply(f: &mut IrFunction, delta: Vec<i64>) -> bool {
         bb.instructions = bls.get(i);
         f.blocks.set(bis.get(i), bb);
         i = i + 1;
+    }
+    if have_tail {
+        i = 0;
+        while i < mids.len() {
+            while f.value_metas.len() <= mids.get(i) {
+                f.value_metas.push(ValueIdMeta_new(f.value_metas.len(), ValueMeta_new(IrType::Void)));
+            }
+            f.value_metas.set(mids.get(i), ValueIdMeta_new(mids.get(i), mts.get(i)));
+            i = i + 1;
+        }
+        if nv2 > f.next_value {
+            f.next_value = nv2;
+        }
+        while f.inst_at.len() < f.next_value {
+            f.inst_at.push(0);
+        }
+        i = 0;
+        while i < ats.len() {
+            if app.get(i) == 1 {
+                var aid: i64 = ins.get(i).id;
+                if aid >= 0 && aid < f.inst_at.len() {
+                    f.inst_at.set(aid, ats.get(i) + 1);
+                }
+            }
+            i = i + 1;
+        }
     }
     return true;
 }
@@ -2544,7 +2728,7 @@ pub fn mec_note(key: i64, pre: IrFunction, pre_h: i64, f: IrFunction, changed: b
         return pre_h;
     }
     var post_h: i64 = mec_fn_hash(f);
-    var d: Vec<i64> = mec_delta(&f);
+    var d: Vec<i64> = mec_delta(&f, pre.insts.len());
     if d.len() == 0 {
         return post_h;
     }
