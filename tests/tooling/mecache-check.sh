@@ -134,6 +134,10 @@ same_three() {  # same_three <name> <file>
   local name="$1" src="$2"
   build "${name}_off" "$src" FID_MECACHE=off || { fail "$name: build with the memo off (see $OUT/${name}_off.log)"; return; }
   build "${name}_off2" "$src" FID_MECACHE=off || { fail "$name: second build with the memo off"; return; }
+  # each program's cold starts from an empty memo (the file is shared
+  # across this check's programs; without this, a later program's cold
+  # already hits and the unrecordable count below has nothing to read)
+  rm -f "$MEC"
   build "${name}_cold" "$src" FID_MECACHE="$MEC" || { fail "$name: cold build (see $OUT/${name}_cold.log)"; return; }
   build "${name}_warm" "$src" FID_MECACHE="$MEC" || { fail "$name: warm build (see $OUT/${name}_warm.log)"; return; }
   local o_off o_cold o_warm
