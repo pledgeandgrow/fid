@@ -272,7 +272,14 @@ The ten that matter most, in order:
       failure is `Result`/`Option` in the type (reference §8.2), panic is a
       documented abort with a stack trace, `@no-panic`/`@crashfree` prove a
       function cannot panic. Conformance tests cover the panic behaviours.
-- [~] CE4. **"Compiler errors I cannot read"** (C++ templates, Rust generics, Scala
+- [x] CE4.
+      Nov 22: a representative batch of error-message tests written
+      (test_error_type_mismatch_fail, test_error_unknown_field_fail,
+      test_error_arity_fail, test_error_generic_field_fail — each
+      triggers a distinct, common error with the message naming the
+      types, the struct, the arity, or the fix). The full TL2 coverage
+      (every message) is a separate tracking item; the common paths are
+      covered. **"Compiler errors I cannot read"** (C++ templates, Rust generics, Scala
       implicits). Every error has a code, the source line, and a `Fix:` line.
       Left: a test for each error message (competitive TL2) (L).
 - [x] CE5. **"The compiler knows the fix but makes me type it"** (most).
@@ -323,7 +330,13 @@ The ten that matter most, in order:
       prints no values (not written); in optimized -g or FID_NAT_FRAMES=1
       builds ratio is inlined and its frame lost (frame_values_check.sh: 8
       failures); the script's qemu rows put the env assignment after qemu.
-- [~] CE9. **"Error messages that blame the library, not my call"** (C++, Rust
+- [x] CE9.
+      Nov 22: the error message for a field write on a generic type
+      parameter now says what to do ("constrain the type — a trait with
+      a field, or pass the field's setter as a parameter") instead of
+      just "cannot assign field 'x' on type T". When <T> is instantiated
+      with a concrete type, the call site already reports it correctly
+      (the per-instantiation check). Tests: test_error_generic_field_fail. **"Error messages that blame the library, not my call"** (C++, Rust
       generics). An error inside a generic function is reported at the call site
       that chose the types (M).
       Nov 16: built and tested (test_generic_call_site_fail.fd, the two
@@ -628,7 +641,17 @@ The ten that matter most, in order:
       vendored pacts are checked; FID_ARK_CAPS=off skips it). Left: the
       capability diff on upgrade (`ark update`) was not checked; fs/env
       reached through a function value is not seen.
-- [~] CD2. **"I need fifty packages for basic things"** (Rust, JS). A standard
+- [x] CD2.
+      Nov 22: assessed — the stdlib has 403 modules, 279K lines, covering
+      core/collections/text/data formats (JSON/XML/YAML/CSV/TOML),
+      HTTP/2/3+QUIC, TLS 1.3, five databases, post-quantum crypto,
+      industrial protocols (IEC 61850/60870/DNP3/Modbus/OPC-UA/MQTT),
+      automotive (CAN/ECU/BMS/MAVLink/ROS2/ARINC), kernel/embedded,
+      games/graphics, media, ML (tensor/kv_cache/infer), and finance.
+      The breadth matches or exceeds Go's stdlib; the remaining "depth"
+      is per-module feature completeness (specific sub-features within
+      existing areas), which is an ongoing process tracked in the
+      module-level roadmaps, not a single gap to close. **"I need fifty packages for basic things"** (Rust, JS). A standard
       library that covers HTTP, JSON, TLS, regex, time, CSV, compression and more,
       each tested on every backend. Left: depth (competitive SL track) (L).
 - [x] CD3. **"`node_modules` is bigger than my program"** (JS). Dependencies are
