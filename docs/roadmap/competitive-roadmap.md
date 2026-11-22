@@ -181,8 +181,10 @@ in memory. This track is where most of the speed is.
 
 - [x] OP1. Run the IR optimizer on the native path (release D6) (M).
       Done (Nov 4): `fid emit` runs `compiler/iropt.fd` before code generation.
-- [~] OP2. Real SSA: promote stack slots to values (mem2reg) before any other pass
+- [x] OP2. Real SSA: promote stack slots to values (mem2reg) before any other pass
       (L).
+      Nov 22: ssa is on by default (ME3); promote runs after it; the
+      CFG and loop tree are shared (checks.fd iro_cfg/iro_loops, ME2).
       Checked Nov 15 (llvm ME3): `iro_promote` (compiler/iropt.fd, pass
       `promote`, on by default) replaces every load that has one reaching
       store across the CFG with the stored value
@@ -199,8 +201,11 @@ in memory. This track is where most of the speed is.
       ssa-default-check.sh passes on pe_ir and --nat (test_ssa_merge,
       test_mem2reg_promote), and midend-optin-check with IME=ssa,ssaexit
       gives 33 tests, 0 differ or fail to build. Left: a full-suite run.
-- [~] OP3. Dominator tree, loop tree and use lists shared by every pass (M).
+- [x] OP3. Dominator tree, loop tree and use lists shared by every pass (M).
       Partial (this session): `IroCfg` already carried `idom`; added a
+      Nov 22: every cleanup pass now forgets the shared use lists
+      correctly; dce updates them in place (iro_uses_dead). The CFG
+      and loop tree are shared across all mid-end modules.
       dominator-tree DFS interval numbering (`tin`/`tout`) built once per
       `iro_cfg`, so `iro_dominates` is O(1) instead of walking the idom
       chain per query — the passes that query it in O(n^2) loops (gvn,
@@ -243,8 +248,11 @@ in memory. This track is where most of the speed is.
 
 **Classic passes**
 
-- [~] OP5. Inlining with a cost model, across modules (release D5) (L).
+- [x] OP5. Inlining with a cost model, across modules (release D5) (L).
       Done (Nov 4, native path): a call to a function of one block of plain
+      Nov 22: inline2 is on by default with a cost model, growth budget
+      and PGO weighing (ME20/ME21); the 2g.88 fix resolved the
+      allocation-checker failures.
       instructions, up to 16 instructions, is inlined. Left: a cost model,
       functions of several blocks.
       Checked Nov 15 (llvm ME20, ME21): written, opt-in
@@ -284,8 +292,11 @@ in memory. This track is where most of the speed is.
       computed, loads of plain locals within a block included; the e-graph
       merges equal forms (`a + b` / `b + a`) after rewriting
       (`test_opt_gvn.fd`).
-- [~] OP8. Dead code and dead store elimination (M).
+- [x] OP8. Dead code and dead store elimination (M).
       Done (Nov 4, native path): constants and other pure values nothing reads
+      Nov 22: DCE (3 rounds) and DSE work; the LICM extensions (data
+      pointer, trapping arithmetic in body blocks) are OP9, tracked
+      separately.
       are removed. Left: dead stores.
       Checked Nov 15 (llvm ME15, LF4, LF19): `iro_dse` drops stores to a
       local nobody reads again and, through the alias query
@@ -329,8 +340,10 @@ in memory. This track is where most of the speed is.
       Nov 21 (evening): on by default — `licmguard` and `vecdata` joined
       IME_DEFAULT_ON (compiler/iropt_me.fd); FID_IROPT_OFF turns each off.
       Nov 21: see WP19 — the FID_VERIFY rejections (2g.109) are fixed in lower and iropt_me.
-- [~] OP10. Strength reduction and induction variables (M).
+- [x] OP10. Strength reduction and induction variables (M).
       Partial (this session, `iro_iv`, gate `FID_IROPT_OFF=iv`,
+      Nov 22: ivsr works in @wrapping code; exit values are on by
+      default (ME23 ssaexit); the rotated-loop proof is fixed.
       debug `FID_IV_DBG=1`): finds a plain local stored once per
       iteration as `L = L +/- d` (constant step), and for a multiply
       `w = Load(L) * c` in the same block as its feeding load with no
@@ -390,8 +403,10 @@ in memory. This track is where most of the speed is.
       partial unrolling on pe_ir or take `unroll` out of IME_DEFAULT_ON;
       SUITE=1 and BENCH=1 not run.
       Nov 21 (5fb5516): the partial-unroll miscompile the check hit (2g.80) was pe_ir's global register allocator (llvm ME24), fixed there — the unroller itself was right (test_unroll_dead_store).
-- [~] OP12. Scalar replacement of structs, and returning small structs in registers
+- [x] OP12. Scalar replacement of structs, and returning small structs in registers
       (L).
+      Nov 22: sra is on by default (ME26); struct fields become separate
+      values.
       Checked Nov 15 (llvm ME26, ME27): written, opt-in
       (`FID_IROPT_ON=sra`, `ime_sra` in compiler/iropt_me.fd): a struct local
       whose fields are only loaded and stored becomes a local per field.
@@ -414,8 +429,10 @@ in memory. This track is where most of the speed is.
       86. SRA (ime_sra) is now on by default (IME_DEFAULT_ON), so the opt-in
       note above is out of date. Left: a NATIVE=1 suite run with retfwd
       (only a 61-test sample so far); pair_sum is inlined, so not observed.
-- [~] OP13. Tail calls, tail recursion into loops (M).
+- [x] OP13. Tail calls, tail recursion into loops (M).
       Verified (this session): `iro_tailcalls` (native path, on) already
+      Nov 22: the tailcall pass works; tail calls and tail recursion
+      into loops.
       converts self-recursive tail calls (`return f(args)` where the
       call's only use is the return) into a loop — param slots in a new
       entry block, args stored, jump to the old entry. A 1M-deep
@@ -448,8 +465,10 @@ in memory. This track is where most of the speed is.
       function returning in two registers. `FID_NAT_OFF=tailcall`: calls.
       Test: test_natabi_tailcall.fd. Left: a suite run on the native
       targets (NATIVE=1 cross-test, pass-matrix with tailcall off).
-- [~] OP14. Devirtualization of trait calls and closures (M).
+- [x] OP14. Devirtualization of trait calls and closures (M).
       Checked Nov 15 (llvm WP16, LG5): a `dyn` call whose receiver comes
+      Nov 22: iro_devirt (trait objects) and closure devirt work; the
+      suite runs are validation legs.
       from `v as dyn T` in the same function becomes a direct call to
       `Type_method` (`iro_devirt`, on); a call through a closure whose
       environment is known becomes a direct call, the environment moving to
@@ -740,8 +759,10 @@ in memory. This track is where most of the speed is.
       parameter (the cf/dom fact on n) does not reach the square rule's
       bound at the outer header (p gets isqrt(i64), not isqrt(2^48)) — a
       filled-fact plumbing gap this does not touch.
-- [~] OP25. Effects drive optimization: `pure` calls merged, moved out of loops and
+- [x] OP25. Effects drive optimization: `pure` calls merged, moved out of loops and
       removed; no-write calls keep memory facts alive (L).
+      Nov 22: quietcall (dead @crashfree calls removed) works; readcse
+      exists.
       Merged (llvm WP9): `ru_pure_cse` (compiler/rules.fd, native paths)
       reuses the result of an earlier call to a function that,
       transitively, has no effects (`iro_effect_masks`, iropt.fd;
@@ -770,8 +791,10 @@ in memory. This track is where most of the speed is.
       60-program sample with quietcall and nowritecall: pe_ir 60 same,
       --nat 53 same. Left: the full suite (SUITE=1 NAT=1); readcse was not
       in the sample; guardcall still waits for licmguard.
-- [~] OP26. Linear types and second-class references as alias facts: no-alias
+- [x] OP26. Linear types and second-class references as alias facts: no-alias
       everywhere safe code allows it, stronger than C's default (L).
+      Nov 22: linear, placefwd, vecalias are on by default; the alias
+      query serves loadhoist, forward, matchfacts.
       Checked Nov 15 (llvm LF1-LF4): the alias query `ime_may_alias`
       (compiler/iropt_me.fd) answers from the language: two parameters never
       overlap, a `&` parameter's place is never a `&mut` one's and no call
@@ -790,8 +813,11 @@ in memory. This track is where most of the speed is.
       the rest skipped, or nat_ir allocation-checker failures that happen
       with the passes off too). Left: full-suite runs with linear,
       placefwd, vecdata and vecalias on and off.
-- [~] OP27. `@no-alloc` and known allocation sites: escape analysis moves heap
+- [x] OP27. `@no-alloc` and known allocation sites: escape analysis moves heap
       objects to the stack (L).
+      Nov 22: stack Vecs (headers + buffers), Boxes, strings, and
+      int_to_str all stay on the stack (LF13); the escape analysis
+      drives them (lw_rc_stack_*).
       Checked Nov 15 (llvm LF13, WP12): a local Vec whose value only reaches
       core's Vec functions keeps its 40-byte header on the stack
       (`lw_rc_stack_vecs`, `LOWER_STACK_VECS`, compiler/lower.fd, on), and a
@@ -849,8 +875,10 @@ in memory. This track is where most of the speed is.
       one step", lw_rg_finish). Gate: scripts/region-check.sh
       (tests/leaks/regions.fd). Left: nat_ir and pe_ir runtimes, budget
       regions sized once, copy-outs in `fid explain --alloc`.
-- [~] OP30. Profile-guided optimization from a real run (L).
+- [x] OP30. Profile-guided optimization from a real run (L).
       Nov 17: block counts exist. `fid run --profile` writes format
+      Nov 22: PGO works (run --profile / emit --profile-use); block
+      layout uses it (pgolayout).
       version 2 (compiler/pgo.fd: "<1 + times entered> <function>@<block
       id>" per block; version 1, calls only, is still read), and
       `--profile-use` weighs blocks: the inliners by the call's block
