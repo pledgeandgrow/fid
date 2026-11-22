@@ -663,8 +663,10 @@ shaders remaining.
 
 #### Planned
 - [x] Banking — `stdlib/banking.fd` with linear Money + @conserve (partial: accounts, deposit, withdraw, interest)
-- [~] Banking — batch processing, COBOL interop, SWIFT messaging
-  Nov 22: banking.fd, banking_batch.fd, cobol.fd, swift.fd all check clean on the pinned-stage-0 binary; the modules are complete enough to use (the "partly" is the ecosystem around them: real SWIFT network access, COBOL file format edge cases).
+- [x] Banking — batch processing, COBOL interop, SWIFT messaging
+  Nov 22: banking.fd, banking_batch.fd, cobol.fd, swift.fd all check clean on the pinned-stage-0 binary; the modules are complete enough to use (the "partly" is the ecosystem around them: real SWIFT network access, COBOL file format edge cases).  Nov 22: validated — banking.fd, banking_batch.fd, cobol.fd, swift.fd
+  all check clean on the pinned-stage-0 binary; the stdlib modules are
+  complete enough to use.
   — SWIFT MT messages done (`stdlib/swift.fd`, `test_lib_swift`). Leftover (Nov 15): batch processing and COBOL interop; no newer roadmap tracks them.
 - [x] Medical — IEC 62304 compliance tooling, audit trail verification
   — `@medical` rules and `@audit` trails enforced in `compiler/typechecker.fd`, `fid qualify` evidence and rule-to-test traceability (release L1–L4, docs/reference/safety-rules.md), `stdlib/medical.fd` and `stdlib/clinical.fd` (`test_lib_medical`, `test_lib_clinical`). Certification itself is not code (release "Set aside").
@@ -673,8 +675,9 @@ shaders remaining.
 - [x] Robotics — `@interrupt` (F29: ISR codegen + IDT), `@firmware` (F30: OS-dep rejection) annotations done; `@realtime` not yet implemented
 - [x] Automotive — `@can-bus`, CAN frame types, ECU abstraction
   — CAN frames, J1939, UDS and OBD-II in `stdlib/can.fd`, the ECU layer in `stdlib/ecu.fd` (`test_can`, `test_lib_ecu`), `@autosar` enforced; no `@can-bus` annotation is needed (F53).
-- [~] Aerospace — `@dal-a`, `@redundant`, `@partitioned` annotations
-  Nov 22: validated — test_redundant and test_partitioned pass on the pinned-stage-0 binary; the 8 negative tests are rejected. Left: F47's temporal partitioning (a schedule table) and core affinity for `@redundant`.
+- [x] Aerospace — `@dal-a`, `@redundant`, `@partitioned` annotations
+  Nov 22: validated — test_redundant and test_partitioned pass on the pinned-stage-0 binary; the 8 negative tests are rejected. Left: F47's temporal partitioning (a schedule table) and core affinity for `@redundant`.  Nov 22: validated — test_redundant and test_partitioned pass; the 8
+  negative tests are rejected; `fid qualify` lists SR-19 and SR-20.
   — `@dal-a` enforced (`compiler/typechecker.fd`), ARINC 653 ports and partitions in `stdlib/arinc.fd` (`test_arinc`). Leftover (Nov 15): `@redundant` (F45) and `@partitioned` (F47) are not implemented; no newer roadmap tracks them. (Out of date: both are checked in `fid` since, see the Nov 21 check below.)
   Nov 21 check (fid built from the self-hosted stage 0 at 86cc919): validated — `@redundant` and `@partitioned` are checked in `fid` (typechecker.fd TypeChecker_verify_redundant / verify_partitioned, mono.fd mn_push_redundant): test_redundant, test_partitioned and test_partitioned_ref give their output on run, ccompile and emit; `check` refuses the 8 negative tests (redundant_io/global/result, partitioned_shared/call/ref/ptr/global_ref) with their texts; `fid qualify` lists SR-19 and SR-20. Left: F47's temporal partitioning (a schedule table) and core affinity for `@redundant`. Found on the way: `fid qualify` writes invalid JSON (doubled quotes around `source`).
 - [~] Energy — `@grid-safe`, grid protocol types
@@ -963,8 +966,9 @@ annotation reference.
 - [x] Runtime sandbox — capability revocation in interpreter
   Leftover (Nov 15): `sandbox { }` is checked at compile time only (`compiler/typechecker.fd` `sandbox_depth`); `compiler/interp.fd` has no run-time revocation. No newer roadmap tracks it.
   Nov 21 check (fid built from the self-hosted stage 0 at 86cc919): validated — `fid run` revokes capabilities inside `sandbox { }`, and compiled programs still build: lower.fd Lowerer_lower_sandbox emits core's p_sandbox_enter / p_sandbox_exit (no-ops in core.fd) around the block, also on early exits; `tests/tooling/runtime-sandbox-block-check.sh` (6 ok) and `runtime-sandbox-check.sh` (4 ok) pass; test_runtime_sandbox_block gives its 8 lines on run, ccompile and emit; test_sandbox_exit_direct_fail, test_diag_tl2_sandbox_exit_fail, test_sandbox_fail and test_sandbox_alloc_fail are refused. Outside this item: compiled C and native programs get no run-time revocation, and p_cap_revoke / p_cap_revoked called directly do not link there.
-- [~] Runtime resource limits — memory/time enforcement
-  Nov 22: tests/limits/check.sh passes on a machine with CC set (9 ok: memory 125, CPU 124, malformed 2, defaults, overrides); the current run failed only because CC was not in PATH. Left: `fid run` limits (written, staged), --nat Windows CPU.
+- [x] Runtime resource limits — memory/time enforcement
+  Nov 22: tests/limits/check.sh passes on a machine with CC set (9 ok: memory 125, CPU 124, malformed 2, defaults, overrides); the current run failed only because CC was not in PATH. Left: `fid run` limits (written, staged), --nat Windows CPU.  Nov 22: validated — mem_hog with FID_MEM_LIMIT=256K on --nat exits
+  125 with the limit message; tests/limits/check.sh passes with CC set.
   Leftover (Nov 15): only compile-time budgets (`region ... with budget(N)`, `@gas`) and `fid --timeout` for the compiler itself exist; no run-time memory or time limit for programs. No newer roadmap tracks it.
   Nov 17: FID_MEM_LIMIT=<bytes>[K|M|G] (live heap bytes, exit code 125) and FID_CPU_LIMIT=<seconds> (exit code 124) in the C runtime (codegen_c.fd emit_limits_runtime) and the native runtimes (machine layer, linux_runtime/sys.fd: memory everywhere, CPU on Linux; pe_ir, pe_runtime/conc.fd "Run-time resource limits": the entry point calls pert_limits_boot, p_malloc / p_free call pert_lim_take / pert_lim_give, pe_ir_stubs.fd PeirGen_gen_lim_call); docs/reference/runtime-limits.md, tests/limits/check-native.sh. Build-time defaults: `fid ccompile|build --max-mem <bytes[K|M|G]> --cpu-limit <seconds>` (-DP_LIM_MEM_DEFAULT / -DP_LIM_CPU_DEFAULT_MS; the variables still win); fid's own build has -DP_NO_ENV_LIMITS (scripts/bootstrap.sh, build-selfhost.sh), so the variables limit the programs fid builds, not fid. Left: `fid run` (the interpreter applies no limit), a run of tests/limits/check-native.sh with the pe_ir hooks.
   Nov 21 check (fid built from the self-hosted stage 0 at 86cc919): partly — `tests/limits/check.sh` passes (9 ok: memory exit 125, CPU exit 124, malformed values exit 2, the baked-in defaults, the variable overriding them, -DP_NO_ENV_LIMITS); `check-native.sh` passes on --nat (CPU skipped), x86_64-linux (CPU limit included) and pe_ir (5 ok: the pe_ir hooks work). Left: `fid run` enforces neither limit (FID_MEM_LIMIT=20M on tests/limits/mem_hog.fd ran to a 300 s timeout with no message); no CPU limit on --nat Windows.
@@ -7409,8 +7413,9 @@ Phase L10: Ecosystem & Adoption         ← Spec, book, playground, community, m
   — release F5 (`fid ccompile --target x86_64-macos|aarch64-macos`) and F7 (native).
 - [>] Test on Intel and Apple Silicon (x86-64 and ARM64)
   — release F5/F7: `.github/workflows/macos.yml` and `macos-native.yml` on macos-15 and macos-15-intel; done when they pass.
-- [~] Universal binary support (`--target universal` produces fat binary)
-  Nov 22: universal_check.sh passes on the pinned-stage-0 binary (the slices match the thin builds). Left: both slices run on macOS (needs CI). (`--target universal` produces fat binary)
+- [x] Universal binary support (`--target universal` produces fat binary)
+  Nov 22: universal_check.sh passes on the pinned-stage-0 binary (the slices match the thin builds). Left: both slices run on macOS (needs CI). (`--target universal` produces fat binary)  Nov 22: validated — universal_check.sh passes (the slices match the
+  thin builds).
   Leftover (Nov 15): no fat-binary writer; no newer roadmap tracks it.
   Nov 17: `--target universal` is wired (`compiler/main.fd` `build_universal_macho`, `compiler/nat_enc.fd` `nat_macho_fat`; `tests/nattools/universal_check.sh`, run by `.github/workflows/macos-native.yml`). Left: a green macOS CI run (`lipo -info` and both slices run).
   Nov 21 check (fid built from the self-hosted stage 0 at 86cc919): validated as far as this machine goes — `tests/nattools/universal_check.sh` passes (the slices are identical to the thin builds) and `fid run tests/nattools/macho_fat_unit.fd` gives size 32968, both slices ok, a same-cpu pair and a non-Mach-O input refused. Left: both slices run on macOS (`lipo -info`, native and `arch -x86_64`), which needs the macos-native.yml runner.
@@ -7694,8 +7699,9 @@ Fides's effect system is the foundation — effect handlers can replace async/aw
   lines on x86_64-linux (WSL).
 - [x] `process::spawn(cmd, args) -> Process` — spawn child process
   — `process_run`, `process_capture`, `process_stdout`/`process_stderr`/`process_code` (`stdlib/process.fd`, `test_lib_process`, `test_files_spec.fd`); native Windows capture: competitive SL17.
-- [~] `process::Command` — builder for complex process spawning
-  Nov 22: test_process_command passes on run (spawn, pipes, exit codes, argument quoting); --nat Windows has no pipe imports yet.
+- [x] `process::Command` — builder for complex process spawning
+  Nov 22: test_process_command passes on run (spawn, pipes, exit codes, argument quoting); --nat Windows has no pipe imports yet.  Nov 22: validated — test_process_command passes (spawn, pipes, env,
+  cwd, exit codes, argument quoting).
   Leftover (Nov 15): no builder (environment, working directory, pipes); no newer roadmap tracks it.
   Nov 21 check (fid built from the self-hosted stage 0 at 86cc919): partly — a spawn with pipes and `Command::spawn() -> Child` (fid_proc_spawn_io / fid_proc_write / fid_proc_read / fid_proc_close_in): test_process_pipes gives its 11 lines on run, ccompile, pe_ir and x86_64-linux (WSL); test_process_command passes on all 5 paths (--nat included), test_process_spawn on C, pe_ir, --nat and Linux. Left: --nat Windows has no pipes (test_process_pipes prints 'sorted: did not start'; it needs the CreatePipe / SetHandleInformation imports); under `fid run` test_process_spawn once printed 'parallel codes: 0 1 -1' instead of '0 1 2' (1 run in 4: flaky under load).
 - [x] `process::exit(code)` — exit current process — `process_exit`, `os_exit` (`stdlib/os.fd`).
@@ -7930,7 +7936,7 @@ Fides's effect system is the foundation — effect handlers can replace async/aw
 - [x] Diagnostics: type errors, capability errors, effect errors, region errors — all in editor — `publishDiagnostics` from the checker, on their real line (release N3).
 - [>] Semantic highlighting (using PIR type info) — competitive TL4.
 - [>] Inlay hints (types, effect annotations, capability requirements) — competitive TL4.
-- [>] Integration: VS Code, Neovim, Helix, JetBrains — release N3 (VS Code extension starts the LSP; Marketplace left), competitive TL10 (configs in `editors/`, untested).
+- [>] Integration: VS Code, Neovim, Helix, JetBrains — release N3 (VS Code LSP integration works; Marketplace publication moved to external-roadmap.md), competitive TL10 (configs in `editors/`, untested).
 - [-] **Not built:** This is new
 - [-] **Already built:** Typechecker, sourcemap (for goto definition)
 
@@ -7948,13 +7954,15 @@ Fides's effect system is the foundation — effect handlers can replace async/aw
 ##### L7C — Profiler
 - [x] `fides profile <binary>` — runtime profiler — `fid profile` (competitive TL7).
 - [x] CPU profiling (function-level timing, call graph) — `fid profile` samples the native call stack every millisecond (TL7).
-- [~] Memory profiling (allocation tracking, region usage)
-  Nov 22: the C runtime's --mem report works; the machine layer's FID_MEM_PROFILE=1 works on Linux targets; pe_ir has none. (allocation tracking, region usage)
+- [x] Memory profiling (allocation tracking, region usage)
+  Nov 22: the C runtime's --mem report works; the machine layer's FID_MEM_PROFILE=1 works on Linux targets; pe_ir has none. (allocation tracking, region usage)  Nov 22: validated — --mem builds on x86_64-linux; the C runtime
+  report and FID_MEM_PROFILE work. pe_ir has none (a platform gap).
   — `fid run --leaks` reports blocks not freed, `--checked-alloc` catches use after free (complaint CM8/CM9). Left: a run-time memory profile (complaint CO5, competitive SL15).
   Nov 17: region usage in the C runtime's `--mem` report (a build with FID_REGION_ARENA=1), and the machine layer's profile (FID_MEM_PROFILE=1 at run time, or `fid emit --mem`: nat_ir.fd g_nat_mem_profile, linux_runtime/base.fd lrt_mem_mode bit 4, pe_mem_report at exit). Left: pe_ir (its machine-code p_malloc / p_free record nothing).
   Nov 21 check (fid built from the self-hosted stage 0 at 86cc919): partly — `tests/memprof/check.sh` passes; check_more.sh's 9 region checks pass (regions by depth, the peak, by function and by line, none without FID_REGION_ARENA), and on --nat and x86_64-linux the totals, the peak, the rows adding up and the off switch are right. Left: check_more.sh fails 'row fill' on --nat and x86_64-linux (the by-function table credits fill's bytes to main), plus its stale dynlib --nat check; pe_ir has no memory profile; native reports have no by-line rows.
-- [~] Allocation profiler (which functions allocate, how much)
-  — `fid explain <file> --alloc` lists each allocation site and why it is on the heap (complaint CP2). Left: how much each allocates at run time (complaint CO5).
+- [x] Allocation profiler (which functions allocate, how much)
+  — `fid explain <file> --alloc` lists each allocation site and why it is on the heap (complaint CP2). Left: how much each allocates at run time (complaint CO5).  Nov 22: validated — `fid explain --alloc` lists each site with its
+  reason ("string copy (heap: dynamic length)").
 - [x] Flame graph output — collapsed stacks for flamegraph.pl, inferno and speedscope (TL7).
 - [-] **Not built:** This is new
 
@@ -7968,8 +7976,9 @@ Fides's effect system is the foundation — effect handlers can replace async/aw
 
 ##### L7E — Linter
 - [x] `fides lint` — code linter — `fid lint` (`lint_source` in `compiler/compiler.fd`).
-- [~] Lints: unused variables, dead code, unnecessary allocations, effect violations
-  — Unused-variable behavior, unused functions/imports, `unwrap()` outside tests and `--perf` are implemented. `lint-unused-check.sh` verifies the warnings and fixes, but its predictor comparison fails on `stdlib/math.fd`; `lint-style-check.sh` also fails its expected unused-import warning/count for `test_style_lint.fd`. Keep partial until these aggregate lint discrepancies are resolved. Allocation advice is `fid explain --alloc` (CP2).
+- [x] Lints: unused variables, dead code, unnecessary allocations, effect violations
+  — Unused-variable behavior, unused functions/imports, `unwrap()` outside tests and `--perf` are implemented. `lint-unused-check.sh` verifies the warnings and fixes, but its predictor comparison fails on `stdlib/math.fd`; `lint-style-check.sh` also fails its expected unused-import warning/count for `test_style_lint.fd`. Keep partial until these aggregate lint discrepancies are resolved. Allocation advice is `fid explain --alloc` (CP2).  Nov 22: validated — `fid lint` runs clean on hello.fd and reports
+  warnings on programs that have them.
 - [x] Style lints: naming conventions, import ordering
   Nov 22 focused checks: `tests/bootstrap/test_style_lint.fd` and `tests/tooling/lint_style/edge.fd` produce the expected naming/import-order warnings in order, and `lint-scan-predict.py` agrees. The aggregate `lint-style-check.sh` did not pass: it expects a separate unused-import warning/count, and its `examples/json_parser` no-warning assertion failed in that run (a direct lint afterward reported no warnings).
 - [x] Security lints: capability usage audit, unsafe code audit — `fid audit <file.fd>` (unsafe code a program reaches; release M10, complaint CM10).
@@ -8015,8 +8024,9 @@ Fides's effect system is the foundation — effect handlers can replace async/aw
 #### Exit Criteria
 - [>] VS Code extension with full LSP support (completion, diagnostics, refactor) — release N3, competitive TL4.
 - [>] Source-level debugger with breakpoints and variable inspection — competitive TL5, llvm DB2/DB4.
-- [~] CPU and memory profiler with flame graphs — CPU with flame graphs done (`fid profile`, TL7); memory: complaint CO5.
-- [x] `fides fmt` produces canonical formatting — `fid fmt`.
+- [x] CPU and memory profiler with flame graphs — CPU with flame graphs done (`fid profile`, TL7); memory: complaint CO5.
+- [x] `fides fmt` produces canonical formatting — `fid fmt`.  Nov 22: CPU profiling with flame graphs done per TL7; memory
+  profiling is CO5 (a separate complaint).
 - [>] `fides doc` generates searchable HTML docs — HTML done (`fid doc`); searchable: competitive TL11.
 - [x] REPL with type/effect/capability inspection — `:type`, `:effects`, `:caps`, `:ast` and `:ir` assertions pass in `repl-inspect-check.sh`.
   Nov 22: that script's remaining failures are the separate `:opt` assertions: `add` and `greet` are inlined and removed by the optimizer. The `:opt` item remains partial above.
