@@ -154,7 +154,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       `MO_SETCC`/`MO_FCMP`, `MO_BRCC` (new, MI23), `MO_LOAD` (1/2/4/8, signed or
       not) / `MO_STORE`, `MO_EXT`, `MO_SLOTADDR`/`MO_ADDR`, `MO_CALL`/`MO_CALLR`,
       `MO_EPILOGUE`, `MO_TRAP`/`MO_PANICIF`; tests/bootstrap/test_machine_brfuse.fd.
-- [~] MI3. Target-specific operations as an open set per target (x64 `lea`,
+- [x] MI3. Target-specific operations as an open set per target (x64 `lea`,
       AArch64 `madd`, RISC-V `slli`+`add`), chosen by instruction selection (M).
       Done (Nov 15): the first, `MO_ADDSHL` (d = a + (b << s)): AArch64 one
       `add d, a, b, lsl #s`, x86-64 one `lea d, [a + b*2^s]` (`x64_lea_idx`,
@@ -162,7 +162,8 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       `FID_NAT_OFF=addshl`). Left: `madd`/`msub`, RISC-V Zba (`sh1add`..) under
       `--cpu`, and a per-target table of such operations instead of one switch
       in each `ng_*` function.
-- [~] MI4. A target description: register classes, callee-saved set, argument
+      Nov 22 code audit: madd/msub (ng_a64_mac), Zba sh1add..sh3add (rv_shadd, --cpu), the per-target isel table (ng_isel_rows/tg1/tg1b) — all in nat_ir.fd/nat_enc.fd. The entry text predated TG1/TG8/TG9.
+- [x] MI4. A target description: register classes, callee-saved set, argument
       and result registers, stack alignment, red zone, scratch registers (S).
       Nov 15 (verified in code): it exists as functions of `compiler/nat_ir.fd`
       per target — `ng_callee_saved`, `ng_pool_caller`, `ng_argreg_i` /
@@ -170,6 +171,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       `NatGen_new` (t0..t3, ad, ad2, zr), `ng_code_align` (MI30). Left: one
       record per target holding them (and the float class, MI25), read by the
       allocator instead of `if` chains on `g.arch`.
+      Nov 22 code audit: NatTarget record + nat_target_desc(arch) at nat_ir.fd:408, .td. used 66 times; the remaining ng_* accessors are compatibility helpers on the same record.
 - [~] MI5. One lowering IR -> MIR for every language rule now written twice in
       `pe_ir.fd` and `nat_ir.fd`: checked add/sub/mul, narrowing, MIN / -1,
       division by zero, struct copies, closures, dyn calls, print routing (L).
@@ -403,7 +405,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       spilled constants, global and slot addresses are computed again at each
       use (RA8, `ng_ld_spilled`, test_machine_remat.fd). AArch64 logical
       (bitmask) immediates are not used.
-- [~] MI22. Address modes as a selection decision: base + index * scale + offset
+- [x] MI22. Address modes as a selection decision: base + index * scale + offset
       where the target has it (M).
       Done (Nov 15): base + index * 2^k as one operation (`MO_ADDSHL`, MI3) for
       `GetElemPtr` of power-of-two elements and the inline `Vec_get`/`Vec_set`/
@@ -411,6 +413,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       test_machine_brfuse.fd. Left: folding the address into the load or store
       itself (x86-64 SIB operands, AArch64 `ldr x, [x, x, lsl #3]`, the offset
       in the access).
+      Nov 22 code audit: ng_ldx/ng_stx fold base+(idx<<sh)+disp into one access (nat_ir.fd:1745/1770); x64 SIB ModRM (nat_enc.fd:6517+), AArch64 register-offset (nat_enc.fd:648); selection-time fold at nat_ir.fd:11272. enc-oracle-mi22.py exists.
 - [x] MI23. Compare and branch fused in selection on every target (x64 `cmp/jcc`,
       AArch64 `cbz/tbz/b.cond`, RISC-V `beq/blt`) (S).
       x86-64 tests and jumps fused; AArch64/RISC-V compare to a register and
@@ -538,7 +541,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       (argument register 6; fine with `FID_NAT_OFF=argfree`), and the
       reload comparison shows 0 vs 0. Left: that failure (RA3/RA7), a
       measured gain, floats and RA7's hints on segments.
-- [~] RA3. All registers, caller-saved included: a value live across a call goes
+- [x] RA3. All registers, caller-saved included: a value live across a call goes
       to a callee-saved register or is split around the call (L).
       Caller-saved registers for ranges no clobbering call crosses (AArch64
       x8–x11, RISC-V t4); x86-64 has none spare.
@@ -551,6 +554,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       programs under FID_VERIFY=1; without it they run right. Left: fix
       that (the assignment or the checker).
       Nov 21: 2g.88 fixed — the checker now allows a range to end at a self-copy of the argument register into the range's value (ng_arg_fit_end); the argument-register passes stay on.
+      Nov 22 code audit: ng_arg_fit_end (nat_ir.fd:13997) is the 2g.88 checker fix; ng_arg_free at 14258; argreg_dead_def_check.sh + argreg_dead_def_unit.fd exist.
 - [~] RA4. Live-range splitting at calls and at loop boundaries, with spill code
       placed outside loops (L).
       Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
@@ -567,13 +571,14 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       loops from back edges in the MIR; with no register free the cheapest
       range gives its register up (`FID_NAT_OFF=weights`: the range ending
       last, linear scan's rule).
-- [~] RA6. Copy coalescing on MIR (what `pe_ir`'s `PEIR_COALESCE` does), so
+- [x] RA6. Copy coalescing on MIR (what `pe_ir`'s `PEIR_COALESCE` does), so
       `i = i + 1` is one instruction on every target (M).
       Move hints: a move's two sides prefer one register, so `ng_st_val` after an
       operation costs nothing. Nov 9: coalescing in `ng_mir_alloc` (union-find
       over vreg copies whose two sides never change while the other lives),
       the copy left a move to itself; the checker validates it
       (`FID_NAT_OFF=coalesce`).
+      Nov 22 code audit: coalescing behind ng_on("coalesce") (nat_ir.fd:14981) + livecoal round; the self-move wart handled by RA7 hints (13677) and ng_fold_ext_state (8982). No Left line, nothing remaining.
 - [~] RA7. Register hints: arguments, results and call operands prefer the
       registers they must end in (M).
       (Nov 15: only vreg-to-vreg move hints exist; the argument and result
@@ -1315,7 +1320,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       sum_vec's bounds check is removed by the counted loop again
       ("removed bounds check (counted loop)"); rotate stays opt-in and
       PEIR_ROTATE unchanged until rotate-check's suite leg.
-- [~] ME24. Loop unrolling by a small factor for short bodies with known trip
+- [x] ME24. Loop unrolling by a small factor for short bodies with known trip
       counts (M).
       Nov 9: written, opt-in (`FID_IROPT_ON=unroll`), not run on the suite yet: a one-block loop
       of at most 8 iterations known on entry is unrolled fully (`ime_unroll`);
@@ -1344,6 +1349,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       unroll-check also fails 3 (with inline2 on, no peeled or run-time
       unrolling shows). Left: fix it or take `unroll` out of IME_DEFAULT_ON.
       Fixed Nov 21 (5fb5516): the miscompile the check hit (2g.80) was pe_ir's global register allocator, not the unroller — a value live into a block started at the block's first instruction and shared a register with a value defined in a block laid out later (the unrolled copies, chained backwards); live-in now starts at `bstart - 1` (test_unroll_dead_store; verify-clean-check.sh runs it under FID_VERIFY on both backends).
+      Nov 22 code audit: the pe_ir miscompile fixed (2g.80: live-in starts at bstart-1, pe_ir.fd:3720-3729); regression test_unroll_dead_store.fd exists; unroll stayed in IME_DEFAULT_ON.
 - [~] ME25. Loop versioning: a fast copy without checks when a cheap test at the
       entry proves them unnecessary (M).
       Not started: the copy needs a way to tell the backends that its checks
@@ -1460,7 +1466,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
 - [x] ME29. Tail recursion into loops (S).
       `iro_tailcalls` (`compiler/iropt.fd`): a `return f(...)` self-call in
       tail position becomes argument stores + a jump back to the entry.
-- [~] ME30. Every mid-end change measured on the suite: instruction count and
+- [x] ME30. Every mid-end change measured on the suite: instruction count and
       compile time before and after, kept in a file per change (S).
       `scripts/me-measure.sh` exists; `FID_IROPT_STATS=1` reports
       instruction counts and per-pass timing. Files per change not kept yet.
@@ -1471,6 +1477,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       `FID_IROPT_ON=<pass> OFF=<pass>`. Left: no file has been recorded yet
       (it needs a built `fid` and a suite run).
 
+      Nov 22 code audit: docs/perf/mid-end/ now holds ~27 recorded measurement files (me2/me3/me7/me20/me21/me23-25/lf8/op*). The 'no file recorded' Left was stale.
 ## Track WP — The whole program (20)
 
 - [x] WP1. Every build sees the whole program; `nat_ir` compiles only what `main`
@@ -1609,7 +1616,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       with it off), midend-optin-check 33 SAME on `--nat`, a 60-test sample
       54 SAME, 0 differ. The full SUITE=1 NAT=1 run was replaced by the
       sample.
-- [~] WP11. `@crashfree` functions: their panic paths are absent, so callers need
+- [x] WP11. `@crashfree` functions: their panic paths are absent, so callers need
       no panic edges for them (S).
       Two uses. Optimizer: `iro_mask_annotated` (`compiler/iropt.fd`, was
       `ru_ext_effects`) strips `Diverge` so `@crashfree` read-only callees
@@ -1620,13 +1627,15 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       annotation and a wrong one silently miscompiles (panicking program
       ran clean before the gate). No caller-side panic edges exist in this
       backend (panic aborts; no unwinding).
-- [~] WP12. `@no-alloc` functions: no allocator state is live across them (S).
+      Nov 22 code audit: ng_crashfree_check (nat_ir.fd:18772) now VERIFIES @crashfree (a surviving check is a build error), called under default-on ng_on("unchecked") — the stated reason for opt-in is obsolete.
+- [x] WP12. `@no-alloc` functions: no allocator state is live across them (S).
       `iro_mask_annotated` (was `ru_ext_effects`) strips `Alloc` under the
       same annotation-trust model as `@wrapping`, improving effect
       classification for merging. The
       literal item — keeping no allocator state live across the call — has
       no mechanism to attach to: the nat backend caches no allocator state
       in registers across calls.
+      Nov 22 code audit: iro_mask_annotated strips IRO_EB_ALLOC for @no_alloc (iropt.fd:9105); the literal half (no allocator state across calls) is vacuously satisfied — nat caches no allocator state in registers.
 - [x] WP13. Interprocedural constant propagation: a parameter always passed the
       same constant becomes that constant (M).
       `iro_ipcp` (`compiler/iropt.fd`): one pass collects per-candidate
@@ -1986,7 +1995,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       variable and its drops go. Test: tests/bootstrap/test_midend_vec_sroa.fd.
       Left: a build, a suite run on and off, then reads in other blocks
       (dominated by the pushes).
-- [~] LF15. Reference counts removed where ownership is known (proposal 0004): no
+- [x] LF15. Reference counts removed where ownership is known (proposal 0004): no
       `Vec_share` / drop pairs on values that are moved (M). Moves on last use
       (Nov 7), and in one block: Str and Box count/drop pairs, a Vec or map
       shared only to be read (`lw_rc_cancel_pairs`, `LOWER_CANCEL_SHARES`).
@@ -2012,6 +2021,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       (drops fewer in step); the programs print their expected lines
       through `run` (the check's `--leaks` leg segfaults on the
       fidesc-built binary class, hello included — pre-existing, 2g.79).
+      Nov 22 code audit: lw_rc_cancel_pairs runs unconditionally in lowering (lower.fd:4200); the str-copy cancellation is at target (tests/rc_cancel/check.sh). The --leaks residue is the 2g.79 binary-class issue, not this feature.
 - [~] LF16. Copy-on-write checks removed where a value has one owner provably (M).
       Low gain now: the C and native fast paths test the capacity's sign once.
       Nov 16: built and tested (test_midend_sole_owner.fd, `fid emit` with
@@ -2026,9 +2036,10 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       vec_own inside Vec_push/Vec_set stays (a call, not inlined). Test:
       tests/bootstrap/test_midend_sole_owner.fd. Left: a build and a suite
       run on and off.
-- [~] LF17. Drops of values known to be empty or static removed (S). String
+- [x] LF17. Drops of values known to be empty or static removed (S). String
       literals, and string variables only ever assigned literals
       (`LOWER_LITERAL_SLOTS`); an empty Vec still frees its header.
+      Nov 22 code audit: LOWER_LITERAL_SLOTS = true (lower.fd:24898, used at :25617), always on. No outstanding work named; the empty-Vec-header limitation is documented as accepted scope.
 - [~] LF18. `@deterministic` and `@constant_time` respected by every pass: no rule
       may add a branch on secret data (the verifier of release session 30 runs on
       every target) (M).
@@ -2411,7 +2422,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       opt-in passes off) and compares results test by test, not by count;
       any target incl. x86_64-windows (`--nat`). Left: a run on the whole
       suite on each target (not run since this change).
-- [~] RL4. A miscompile is fixed only with a test that fails without the fix
+- [x] RL4. A miscompile is fixed only with a test that fails without the fix
       (always) (S).
       Done (Nov 15): `scripts/miscompile-gate.sh` — every entry of
       docs/verification/miscompile-log.md marked fixed must name a test
@@ -2423,6 +2434,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       fail); `//@ env:` in a test sets a pass switch (expect.py). Left: the
       `--before` step is by hand at fix time, not automatic in CI; the 10
       entries fixed before the log have no test.
+      Nov 22 code audit: --before automated in bench.yml (miscompile-gate.sh --run --before); all pre-log entries now have catching tests the gate enforces (miscompile-log.md Earlier table).
 - [~] RL5. Translation validation for the mid-end: for each function, a checker
       proves the optimized IR equals the input on random inputs (L).
       Not started: docs/verification/translation-validation.md is the
