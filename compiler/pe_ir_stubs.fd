@@ -4136,7 +4136,7 @@ pub fn PeirGen_gen_panic(self: &mut PeirGen) -> void {
     PeirEnc_add_r_i8(&mut self.enc, PEIR_R9, 48);
     PeirEnc_cmp_r8_i8(&mut self.enc, PEIR_R9, 57);
     var st_skip: i64 = PeirEnc_alloc_label(&mut self.enc);
-    PeirEnc_jcc_label(&mut self.enc, 0x7, st_skip);
+    PeirEnc_jcc_label(&mut self.enc, 0x6, st_skip);
     PeirEnc_add_r_i8(&mut self.enc, PEIR_R9, 39);
     PeirEnc_place_label(&mut self.enc, st_skip);
     PeirEnc_mov_mem_rbp_reg(&mut self.enc, -56, PEIR_R9);
@@ -4184,6 +4184,73 @@ pub fn PeirGen_gen_panic(self: &mut PeirGen) -> void {
     PeirEnc_call_rip(&mut self.enc, PeirGen_iat_off(self, PIAT_EXIT_PROCESS));
     PeirEnc_ud2(&mut self.enc);
 }
+
+/// CO9 (Nov 22): __pe_sym — given a code address in rcx, return the name
+/// of the function containing it (a pointer into .rdata), or 0 when no
+/// function's start is at or below it. A linear scan over every function
+/// label with "latest start wins" (no sorting needed: labels are compared
+/// at run time through their RIP-relative addresses). Called from the
+/// panic stub's stack walker to print "fn_name" instead of raw hex.
+fn PeirGen_gen_sym_lookup(self: &mut PeirGen) -> void {
+    var label: i64 = PeirEnc_alloc_label(&mut self.enc);
+    HashMap_insert(self.func_labels, "__pe_sym", label);
+    PeirEnc_place_label(&mut self.enc, label);
+    PeirEnc_push(&mut self.enc, PEIR_RBP);
+    PeirEnc_mov_rr(&mut self.enc, PEIR_RBP, PEIR_RSP);
+    PeirEnc_push(&mut self.enc, PEIR_RBX);
+    PeirEnc_push(&mut self.enc, PEIR_R10);
+    PeirEnc_push(&mut self.enc, PEIR_R11);
+    PeirEnc_sub_rsp_i32(&mut self.enc, 16);
+    // rbx = best name (0 = none yet); r10 = best start (0)
+    PeirEnc_xor_self(&mut self.enc, PEIR_RBX);
+    PeirEnc_xor_self(&mut self.enc, PEIR_R10);
+    // iterate over func_labels: for each (name, flabel):
+    //   lea r11, [rip + flabel]  (the function's code start)
+    //   cmp rcx, r11              (addr >= start?)
+    //   jb .skip
+    //   cmp r11, r10              (start > best_start?)
+    //   jbe .skip
+    //   mov r10, r11
+    //   lea rbx, [rip + str_off(name)]
+    // .skip:
+    var names: Vec<str> = Vec::new();
+    var flabels: Vec<i64> = Vec::new();
+    // pe_ir_stubs has no HashMap iterator: the function names are in
+    // g_pe_all_fns (populated as functions are generated); their labels
+    // from func_labels
+    var fi: i64 = 0;
+    while fi < self.module_fns.len() {
+        var fname: str = self.module_fns.get(fi);
+        var flabel: i64 = HashMap_get(self.func_labels, fname);
+        if flabel != 0 {
+            names.push(fname);
+            flabels.push(flabel);
+        }
+        fi = fi + 1;
+    }
+    fi = 0;
+    while fi < names.len() {
+        var skip_l: i64 = PeirEnc_alloc_label(&mut self.enc);
+        PeirEnc_lea_label(&mut self.enc, PEIR_R11, flabels.get(fi));
+        PeirEnc_cmp_rr(&mut self.enc, PEIR_RCX, PEIR_R11);
+        PeirEnc_jcc_label(&mut self.enc, 0x2, skip_l);
+        PeirEnc_cmp_rr(&mut self.enc, PEIR_R11, PEIR_R10);
+        PeirEnc_jcc_label(&mut self.enc, 0x6, skip_l);
+        PeirEnc_mov_rr(&mut self.enc, PEIR_R10, PEIR_R11);
+        PeirEnc_lea_rip(&mut self.enc, PEIR_RBX, PeirGen_str_off(self, names.get(fi)));
+        PeirEnc_place_label(&mut self.enc, skip_l);
+        fi = fi + 1;
+    }
+    PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_RBX);
+    PeirEnc_add_rsp_i32(&mut self.enc, 16);
+    PeirEnc_pop(&mut self.enc, PEIR_R11);
+    PeirEnc_pop(&mut self.enc, PEIR_R10);
+    PeirEnc_pop(&mut self.enc, PEIR_RBX);
+    PeirEnc_mov_rr(&mut self.enc, PEIR_RSP, PEIR_RBP);
+    PeirEnc_pop(&mut self.enc, PEIR_RBP);
+    PeirEnc_ret(&mut self.enc);
+}
+
 
 /// WriteFile(r13, rdx, r8, &written, NULL), inside gen_panic's frame
 fn PeirGen_gen_panic_write(self: &mut PeirGen) -> void {
