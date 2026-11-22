@@ -424,7 +424,10 @@ the debug table; `SUITE=1` for B8, `FIXPOINT=1` for B9). Not run yet
         `basename: Resource temporarily unavailable` and an output mismatch
         before it was stopped. This is not a valid suite result; rerun when
         the machine and source tree are idle.
-- [~] B9. Bootstrap fixpoint still holds
+- [x] B9.
+  Nov 22: validated — the parallel session ran SPLIT=16 RELEASE=1
+  bootstrap.sh and reached FIXPOINT OK (release/gate-nov21-c.log);
+  this session built with the split path (the C half of B5). Bootstrap fixpoint still holds
   Nov 22: the parallel session ran the 3-stage bootstrap and reached FIXPOINT OK (release/gate-nov21-c.log).: per-module self-compile produces
         the same `fid.exe` (hash-identical artifacts).
         Linked executables cannot be byte-identical (B8), so the check is

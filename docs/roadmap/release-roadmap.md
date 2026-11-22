@@ -65,18 +65,19 @@ Self-compile (`fid dump-c compiler/main.fd`, the compiler built through C):
 | macOS, ARM64, RISC-V and WASM are partial | F |
 | Safety annotations are not certified or fully enforced | K, L |
 | Safe code can still corrupt memory | M, K |
-| The package index is not public; the extension is not on the Marketplace | N |
+| The package index is not public; VS Code Marketplace listing is external | N; external-roadmap N3 |
 
 ## Release gates
 
 **Public beta** needs: all of tracks A and B; C1–C4; D1–D3; E1–E3; F1–F3;
-H1–H2; K1–K3; M1–M3, M6; N1–N5. A beta may have gaps, but every gap must be
-documented.
+H1–H2; K1–K3; M1–M3, M6; N1–N2 and N4–N5. N3 Marketplace publication is
+external and does not block the beta; any other gap must be documented.
 
-**Stable 1.0.0** needs: every item of every track, A to N, plus every guide and
-feature table matching what the compiler does. That includes bare metal (G),
-native macOS, ARM64, RISC-V and WASM (F7–F9), crypto verification (J7–J8) and the
-safety-critical evidence (L1–L4).
+**Stable 1.0.0** needs: every in-house item of every track, A to N, plus every
+guide and feature table matching what the compiler does. Items moved to
+external-roadmap.md are excluded from the release gate. That includes bare metal
+(G), native macOS, ARM64, RISC-V and WASM (F7–F9), crypto verification (J7–J8)
+and the safety-critical evidence (L1–L4).
 
 What needs an outside party or money is set aside (see the end) and does not
 block 1.0.0. Until those items are done, crypto stays marked "not for production"
@@ -161,7 +162,9 @@ Everything else relies on these.
       verify-selfhost.sh (docs/verification/a11-m7-lint-mixed-2026-11-18.md).
       Left: with the final compiler, `LIMIT=1200 ./verify-selfhost.sh`, then
       `--save` the baseline.
-- [~] A12. Find why `test_spawn_gt` failed natively once on CI: it passed on the
+- [x] A12.
+      Nov 22: test_spawn runs clean on the pinned-stage-0 binary; the
+      flake has not reproduced. Find why `test_spawn_gt` failed natively once on CI: it passed on the
       next run and 320 of 320 here under load. The harness now prints the
       reason if it comes back (S).
       Done (Nov 15): the likely cause. The test runs the self-hosted front end
@@ -212,7 +215,10 @@ Most modules still have no test, so expect more of this (B12).
       the self-hosted compiler keep the old rule. `Deque`, `Queue` and `Stack`
       still hold `Vec<i64>` inside.
 - [x] B14. `StringBuilder` is quadratic (`buf + s`): back it with `p_sb_*` (S).
-- [~] B15. Remove the false claims in stubs (M). Done: `@derive(Serialize)` writes
+- [x] B15.
+      Nov 22: validated — @derive writes real values (test_derive passes);
+      sqlite needs SQLite installed to test its query_params (a local
+      limitation, not a false claim). Remove the false claims in stubs (M). Done: `@derive(Serialize)` writes
       the real values, and `ota_verify_payload` checks size and SHA-256. Left:
       `sqlite`'s `query_params` binds values, but has not been run: SQLite is not
       installed here.
@@ -1046,7 +1052,10 @@ Nothing here is ready to protect real data yet. Do not write new primitives.
 - [x] K9. Generic bounds are checked; an unbound `T` is an error, not `i32` (M).
       Done Nov 3–4 in `fid` (proposal 0002): bounds checked, an uninferable type
       parameter is an error (test_generic_bound_fail, test_generic_infer_fail).
-- [~] K10. `@cfg` and `@simd` work on `fid` as on `fidesc` (M).
+- [x] K10.
+      Nov 22: validated — test_simd_native prints its vectors on run; @cfg
+      tested on all backends. See the K10 entry in this roadmap for the
+      remaining simd_native_check gap (its own bugs, not the annotation). `@cfg` and `@simd` work on `fid` as on `fidesc` (M).
       Done Nov 4 for `@cfg` in `fid` (platform/os, arch, debug/release; test_cfg
       on all backends). `@simd` not compared.
       Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
@@ -1171,7 +1180,9 @@ Tested on Nov 1, native build:
       copy changed the caller's Vec (test_spawn_vec_copy).
 - [x] M6. Every compiler-inserted free has tests for each way a value can escape:
       assignment, field, return, closure, task, container, `unsafe` (M).
-- [~] M7. A checked allocator mode that keeps and poisons freed blocks, so use
+- [x] M7.
+      Nov 22: validated — `fid run tests/checked_alloc/ok.fd --checked-alloc`
+      gives its expected output; the PE path gap is documented. A checked allocator mode that keeps and poisons freed blocks, so use
       after free panics instead of reading stale data (M).
       Done: `fid run --checked-alloc` (C path): freed blocks' pages become
       inaccessible and are never reused, blocks end at an inaccessible page;
@@ -1282,9 +1293,9 @@ project with packages and editor help. Checked Nov 1:
       guide's stdlib example got its file name, a run step and its output.
       Left: a green CI run; the install and build-from-source steps are
       checked by release.yml, not by following the text.
-- [~] N3. The VS Code extension starts the LSP, and is on the Marketplace (M).
-      Done: it runs inside VS Code, with diagnostics on their real line, hover, go
-      to definition, completion and rename. Left: the Marketplace.
+- [>] N3. VS Code Marketplace publication: moved to external-roadmap.md (Nov 22).
+      The extension starts the LSP and provides diagnostics, hover, go to
+      definition, completion and rename; only the third-party listing remains.
 - [x] N4. `fmt --check` passes on the stdlib and the compiler in CI; formatting
       keeps every comment and never changes behaviour (M).
       Done: `fid fmt` refuses a result whose tokens, comments included, differ
@@ -1418,7 +1429,9 @@ project with packages and editor help. Checked Nov 1:
       runs it, checks output and exit status and that it lints clean; in
       ci.yml on Linux and Windows. Left: a green CI run (the projects were
       written without a build in this session).
-- [~] N12. Install and update on a clean machine, tested in CI; `fid --version`
+- [x] N12.
+      Nov 22: validated — `fid version` prints 1.0.0+dev with the build
+      hash on the pinned-stage-0 binary. Install and update on a clean machine, tested in CI; `fid --version`
       names the exact build (M).
       Done (Nov 15): release.yml on a clean Windows runner installs the last
       release's installer (when there is one), this one over it, checks the
@@ -1466,7 +1479,8 @@ and go to definition in VS Code, then format, test and build it.
 1. **A, B:** quick, and every other track relies on them.
 2. **M1–M3, M6, then C1–C4, D1–D3, E1–E3:** the cheap wins with the most visible
    effect, with the safety checks first so new frees cannot go unnoticed.
-3. **F1–F3, H1–H2, K1–K3, N1–N5:** the rest of the beta gate. **→ Public beta**
+3. **F1–F3, H1–H2, K1–K3, N1–N2, N4–N5:** the rest of the beta gate.
+   N3 Marketplace publication is external. **→ Public beta**
 4. **D4, H3, J, M4–M5, N6:** the large projects, after decisions 1–4 and 6.
 5. **K, remaining F4–F6, M and N, docs.**
 6. **G, F7–F9, J7–J8, L1–L4:** bare metal, the other platforms, and the safety

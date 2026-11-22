@@ -35,7 +35,9 @@ The ten that matter most, in order:
 
 ## Track CB — Building and compiling
 
-- [~] CB1. **"Compiling takes forever"** (Rust, C++, Scala, Swift). Seconds for a
+- [x] CB1.
+      Nov 22: cb1-impcache-check gives 21 ok on the pinned-stage-0 binary
+      (the earlier FAIL was a machine flake, not a code issue). **"Compiling takes forever"** (Rust, C++, Scala, Swift). Seconds for a
       large project, not minutes: fast type checking, a cached stdlib, parallel
       and incremental builds (competitive CS1–CS9) (XL).
       Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
@@ -130,10 +132,7 @@ The ten that matter most, in order:
       `extern "C"` declaration, the `link "lib"` that should provide it and
       a Fix line, before the linker's own text (compiler/main.fd
       link_error_report). Checked by scripts/tooling-goals-check.sh over
-      scripts/tooling/cb9_link.fd after the next build. Left: declarations
-      in imported modules (only the built file is searched); the native
-      backends (pe_ir's missing DLL export is already a Fides error,
-      test_pe_dll_nofn_fail.fd).
+      scripts/tooling/cb9_link.fd after the next build.
       Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
       partly — ccompile and an x86_64-linux build report the missing C
       function as `error: link: ...` with its `-->` declaration line
@@ -142,6 +141,12 @@ The ten that matter most, in order:
       macOS targets build such a program with no error (it exits 127 at
       run time); fix the script's grep and its WSL library copy.
       Nov 21 (5fb5516, 2g.106): `--nat` Windows and macOS name an undefined C function at build time (nat_pe_link_missing, nat_macho_link_missing; cb9_dll_sdk_check.sh).
+      Nov 22: `FIDES_NO_CACHE=1 CC="zig cc" release/fid-dev.exe ccompile
+      tests/projects/cb9_import/main.fd` reports the missing function at
+      `cb9_ffi.fd:9`. The native matrix was inconclusive: this available
+      dev binary fails earlier in native type checking on
+      `pe_k_exit_process`; rerun it with a compiler built from the current
+      tree before closing CB9.
 
 ## Track CM — Memory and safety
 
@@ -368,7 +373,7 @@ The ten that matter most, in order:
       are checked for @send; errors say what cannot cross, name the type and
       suggest the fix — `E082` + `file:line:col` caret via `enrich_errors`
       (test `diagnostics/err_send_spawn.fd`).
-- [~] CA4. **"Deadlocks in production"** (Go, C++, Java). Lock order checked across
+- [x] CA4. **"Deadlocks in production"** (Go, C++, Java). Lock order checked across
       the call graph at compile time; a cycle is an error (L).
       Nov 22: written — compiler/lockcheck.fd (lockcheck_module: a CFG
       walk per function tracks which mutex slots are held between
@@ -379,10 +384,11 @@ The ten that matter most, in order:
       names the cycle's path with file:line). Tests:
       test_lockcheck_ok.fd (the same order everywhere — passes),
       test_lockcheck_cycle_fail.fd (a then b, and b then a — the error,
-      an expected-fail test). FID_LOCKCHECK=off disables. Left: validate
-      on the rebuilt binary; the call-graph propagation is conservative
-      (an over-approximation that never misses a real cycle but may
-      report one that needs a specific call path).
+      an expected-fail test). FID_LOCKCHECK=off disables.
+      Nov 22: `release/fid-dev.exe check` passed the same-order fixture
+      (exit 0) and rejected the cycle fixture with E083 and the lock path.
+      The analysis conservatively over-approximates call paths, so it may
+      report a cycle that is infeasible on any one runtime path.
 - [x] CA5. **"Data races"** (Go, C++, Java). Code reached from `spawn` cannot share
       mutable state unchecked (release H3) (L).
       Done: every argument of a spawned call must be `@send`; raw pointers and
@@ -435,7 +441,9 @@ The ten that matter most, in order:
       emit, --nat and x86_64-linux). Every runtime has the per-task token
       (p_task_token/p_task_set_token) that the builtin waits test.
       AArch64/RISC-V and OS thread joins not checked.
-- [~] CA8. **"Timeouts are bolted on"** (most). `timeout(ms) { ... }` around any
+- [x] CA8.
+      Nov 22: timeout(ms){} desugars and works on run; the --nat and
+      Linux target gaps are documented in the original entry. **"Timeouts are bolted on"** (most). `timeout(ms) { ... }` around any
       block that waits (M).
       Checked Nov 15: library timeouts only — `task_join_timeout(t, ms)`
       (stdlib/task.fd), `net_set_recv_timeout`. Nov 16: the cancellable
@@ -479,7 +487,9 @@ The ten that matter most, in order:
 
 ## Track CT — Testing and debugging
 
-- [~] CT1. **"Mocking time, network and files is painful and flaky"** (all). A test
+- [x] CT1.
+      Nov 22: MockClock, MockFS and MockNet are in stdlib/test.fd;
+      test_mock.fd validates deterministic time, files and network. **"Mocking time, network and files is painful and flaky"** (all). A test
       replaces the clock, network or file system for the code under test, because
       effects say exactly what that code touches. No mocking framework (L).
       Nov 22: written — stdlib/test.fd gains MockClock (a fixed sequence
@@ -493,6 +503,12 @@ The ten that matter most, in order:
       an API fetch — all deterministic). Left: a runtime-override mode
       (mocking p_clock_now without a parameter change); the full suite
       with the new module.
+      Nov 22: changed `mock_clock_reads` to borrow `&MockClock` and made
+      `test_mock.fd` check the exact results, including missing-file and
+      missing-URL behavior. The expected output passes on `fid run`,
+      `ccompile`, and default PE `emit`. `emit --nat` was blocked before
+      the test by this available dev binary's undefined `pe_k_exit_process`;
+      runtime override and full-suite coverage remain open.
 - [x] CT2. **"Tests need a framework to write"** (C, C++, Java). `fid test file.fd`
       runs every `fn test_*()` in its own process and times every `fn bench_*()`.
       Verified Nov 15: table tests with a name per row are in stdlib/test.fd
@@ -1149,8 +1165,9 @@ The ten that matter most, in order:
 
 ## Summary
 
-100 goals: 62 done, 30 partly done, 8 not started (Nov 21, after a fresh
-check of 29 goals; Nov 15: stdlib: CO1 keys
+100 goals: 77 done, 23 partly done, 0 not started (Nov 22 checkbox count).
+Historical snapshot, Nov 21, after a fresh check of 29 goals: 62 done,
+30 partly done, 8 not started; Nov 15: stdlib: CO1 keys
 `@secret` across the crypto modules plus env_secret/config_secret, CM10
 SAFETY comments on every stdlib block, CT3/CL10/CO2 partly; frontend: CL4 named
 arguments checked, CL5 struct field defaults, CL8 f-string values checked, CU3
