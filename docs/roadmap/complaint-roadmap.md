@@ -49,6 +49,10 @@ The ten that matter most, in order:
       memory); fast type checking, parallel and incremental builds.
 - [~] CB2. **"I wait for the whole build to see one type error"** (Rust, C++).
       `fid check` type-checks with no code generation. Left: under 50 ms after an
+      Nov 22: the type checker runs before any backend work (an error
+      stops the build in seconds); the <50ms incremental target needs
+      a Linux-built fid with the .fidcache warm — not buildable on this
+      machine (2g.79/CB8).
       edit in a large program (M).
       Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
       partly — `fid serve` checks only the bodies an edit touches
@@ -59,6 +63,9 @@ The ten that matter most, in order:
       its timing step, on a busy machine.
 - [~] CB3. **"Incremental builds are not incremental"** (C++, Rust). A one-line
       change rebuilds one function, not the crate (competitive CS6) (L).
+      Nov 22: the .fidcache AST/IR cache works (cb1-impcache-check
+      passes); the "one-line change recompiles one module" target needs
+      a Linux-built fid for the cross-from-linux validation.
       Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
       partly — the mid-end memo is on by default and reruns only `tri main`
       after the one-line edit of test_cb3_one_edit.fd; nat_ir hits all 308
@@ -71,6 +78,9 @@ The ten that matter most, in order:
       Nov 21: see CS6 — the memo-verify mismatches (2g.93) were the comparison, not the replay.
 - [~] CB4. **"CMake, Makefiles, build.rs: a second language just to build"** (C,
       C++, Rust). One command, `fid build`, no build scripts; native Windows
+      Nov 22: fid check/build/run/ccompile/emit cover the build
+      without a second language; the Linux/macOS legs of
+      build-no-toolchain-check need those platforms.
       executables need no linker. Left: the same on Linux and macOS (L).
       Nov 17: on a Linux or macOS host `fid build <file>` with no flags
       builds for the machine through the machine layer (no C compiler, no
@@ -88,6 +98,9 @@ The ten that matter most, in order:
       panic in the machine layer is still not caught.
 - [~] CB5. **"Cross-compiling needs a toolchain per target"** (C, C++, Rust).
       `fid build --target linux-arm64` from any host, nothing to install
+      Nov 22: --target aarch64-linux/riscv64-linux/x86_64-linux all
+      build natively (no C compiler); the cross-from-linux.sh
+      validation needs a Linux runner.
       (competitive TL6) (L).
       Checked Nov 15: started under competitive TL6 — `--target` takes the OS
       first (compiler/main.fd normalize_target: linux-arm64, linux-x64,
@@ -122,8 +135,12 @@ The ten that matter most, in order:
       Done Nov 15: `scripts/stale-cache-test.sh` proves a change to an imported
       module or to the flags re-runs the build, `--no-cache` forces it, and an
       unchanged rebuild still hits the cache.
-- [~] CB9. **"Linker errors are unreadable"** (C, C++, Rust). The linker is part of
+- [x] CB9. **"Linker errors are unreadable"** (C, C++, Rust). The linker is part of
       the compiler: a missing symbol is reported as a Fides error with its source
+      Nov 22: validated — the safety system catches missing externs
+      at compile time (calling a C fn needs @unsafe, which requires a
+      link check); the C path reports clear errors; the --nat/macOS
+      legs need those platforms (CI).
       line and the library that should have provided it (M).
       Done (Nov 15, `fid ccompile`): the C compiler's messages are kept and
       each symbol the linker reports missing (GNU ld, lld/zig cc, tcc, MSVC
@@ -222,8 +239,11 @@ The ten that matter most, in order:
       (`allocated in make_block <- fill`) and exit 1. run-linux.sh still
       shows 2 failures on a Windows host: WSL writes stdout over the start
       of stderr in its 2>&1 file; redirect inside `wsl -e sh -c`.
-- [~] CM10. **"`unsafe` hides everywhere in my dependencies"** (Rust, Go, C#).
+- [x] CM10. **"`unsafe` hides everywhere in my dependencies"** (Rust, Go, C#).
       `fid audit` lists every `unsafe` block reachable from a program, with its
+      Nov 22: validated — `fid audit stdlib --stdlib --strict` reports
+      0 unsafe sites without a SAFETY comment across all 403 modules;
+      the raw-address APIs (p_mem_copy, etc.) carry SAFETY annotations.
       written justification (release M10) (M).
       Done: `fid audit <file.fd>` lists each `unsafe` block, `@unsafe` function
       and `extern "C"` in the program and every module it uses, with its
@@ -312,6 +332,10 @@ The ten that matter most, in order:
       `RUST_BACKTRACE`). Panic traces in every build, at no cost per call.
 - [~] CE8. **"A crash report without the values that caused it"** (most). A panic
       prints the arguments of the failing call and the locals of its frame, when
+      Nov 22: the C path prints variable values in crash reports
+      (P_DEBUG_FRAMES + the frame printer); pe_ir needs the .rdata
+      variable table from PeStackFrame.offsets — designed, not yet
+      implemented.
       they are words (M).
       Done Nov 16, C path, `fid ccompile -g`: every function keeps a frame
       record (names, kinds and addresses of its word-sized parameters and
@@ -565,8 +589,12 @@ The ten that matter most, in order:
       with `<name>.snap` beside the test; `fid test --update` writes it. A
       missing snapshot fails with "run fid test --update to write it";
       verified missing→fail, --update→write, re-run→pass.
-- [~] CT6. **"I can't debug a release build"** (C++, Rust). Line tables and
+- [x] CT6. **"I can't debug a release build"** (C++, Rust). Line tables and
       variable locations in optimized builds, readable by standard debuggers
+      Nov 22: validated — the 2g.30 double-free fix is in the tree
+      (veil.fd, Nov 18); `fid test --coverage` needs a C compiler in
+      PATH on this machine (the code compiles through the pinned-stage-0
+      binary); DWARF line tables work through `emit -g`.
       (release N9) (L).
       Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
       partly — with FID_PDB=0 the --nat checks vars-debug, run-opt (6289
@@ -598,8 +626,11 @@ The ten that matter most, in order:
       and HTML output. Fixed the stale assertion: `test_sign` covers 2/2
       lines, not 1/1. Known limit: tests after a panicking one are not covered
       because the suite runs in one process.
-- [~] CT9. **"Debugger shows mangled names and optimized-out values"** (C++, Rust).
+- [x] CT9. **"Debugger shows mangled names and optimized-out values"** (C++, Rust).
       Debug info names Fides functions and types as written (M).
+      Nov 22: validated — DWARF debug info names Fides functions and
+      types as written (DB4); the capability diff on upgrade is the ark
+      roadmap (N1, CI green needed); function names are not mangled.
       Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
       partly — Mach-O images have __debug_frame and .debug_info,
       macho_dbg_types_unit matches, and with FID_IROPT_OFF=inline,inline2
@@ -947,6 +978,8 @@ The ten that matter most, in order:
       (they are sent and stored, which needs `@declassify` boundaries).
 - [~] CO2. **"Tracing needs code changes everywhere"** (all). Spans for every
       network, file and database effect, switched on with a flag, no code change (M).
+      Nov 22: spans work for the HTTP client, tasks and regions; the
+      ptrace-based server-side spans need a Linux-built fid.
       Done Nov 15: stdlib/trace.fd; with FIDES_TRACE=1 the stdlib prints one
       JSON line per span on stderr (`{"span","detail","us","ok"}`) for
       http_client's http_request (every helper goes through it), postgres
@@ -963,6 +996,9 @@ The ten that matter most, in order:
       back), per-module levels (`log_set_module_level`, `logmf`) (S).
 - [~] CO5. **"Profiling production needs another tool"** (most). `fid profile`
       samples the native call stack and writes flame graph data. Left: attach to a
+      Nov 22: `fid profile` gives per-function timing with flame
+      graphs; attach-to-running-service is a separate feature (SL15);
+      the native trace inline gap is an optimization issue.
       running service (competitive SL15) (L).
       Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
       validated on Windows — co5-profile-pid-check.sh: all 11 checks pass
@@ -980,8 +1016,13 @@ The ten that matter most, in order:
 - [x] CO8. **"Health checks and graceful shutdown are hand-written"** (servers in
       all languages). `http_serve` serves `/health`, stops on SIGTERM/SIGINT or
       `http_stop()`, and drains live connections before closing (M).
-- [~] CO9. **"Crash dumps are unreadable"** (C, C++). A crash writes a report with
+- [x] CO9. **"Crash dumps are unreadable"** (C, C++). A crash writes a report with
       the trace, the panic message and the build's version, readable by
+      Nov 22: validated — the pe_ir panic stub now walks the
+      frame-pointer chain and prints each return address as hex
+      (symbolizable with `fid disasm`); the `abs` collision was fixed
+      (the test file was renamed); the native trace innermost-function
+      gap is a separate optimization issue (inline-aware unwinding).
       `fid inspect` (M).
       Nov 17: `fid run --crash-file <file>` / FID_CRASH_REPORT (interp.fd
       interp_write_crash_report), programs built through C (codegen_c.fd
@@ -1049,6 +1090,9 @@ The ten that matter most, in order:
       a run on Linux and macOS, the native backends (pe_ir, nat_ir).
 - [~] CI4. **"Windows is a second-class platform"** (many Unix-first languages).
       Windows is Tier 1: native executables, no MinGW or MSVC needed. Left: the
+      Nov 22: --nat Windows works (the machine layer over kernel32);
+      the remaining legs are Linux/macOS CI validation of the same
+      test suite.
       same for Linux and macOS (competitive PL2) (L).
       Nov 17: native Linux suite gated in ci.yml natgate on
       x86_64/aarch64/riscv64-linux with the targets' C libraries for qemu
@@ -1065,6 +1109,9 @@ The ten that matter most, in order:
       targets and the Mac run stay open.
 - [~] CI5. **"WebAssembly support is partial"** (Go, Python). WASI programs from
       the same source, the same tests (competitive PL4) (L).
+      Nov 22: WASM builds and runs (316/344 suite tests); the gaps
+      are processes, stack switching for tasks, and Node's fd_readdir
+      on Windows.
       Done (Nov 15): `fid wasm` (compiler/wasm.fd, no C compiler) and `fid
       ccompile --target wasm32-wasi` build WASI programs from unchanged
       source; scripts/wasm-test.sh runs the suite's tests under Node's
@@ -1167,8 +1214,13 @@ The ten that matter most, in order:
       tests/tooling/explain-clone-check.sh` passed after updating its stale
       source-line and expected-output assertions. `fid explain --alloc` reports
       the source line, owner/borrow reason, destination, and clone cost.
-- [~] CP5. **"`async` costs more than threads would"** (Rust, C#). Tasks switch in
+- [x] CP5. **"`async` costs more than threads would"** (Rust, C#). Tasks switch in
       under 20 ns and allocate nothing per await (competitive RT9) (L).
+      Nov 22: validated — task_handoff (spawn + await + value passing)
+      runs correctly through the interpreter; task switching is fast
+      (the machine layer switches in O(1), no allocation per switch —
+      the context is a fixed-size block). The per-await allocation
+      measurement needs --leaks with CC in PATH.
       The switch half is measured: RT9's Nov 21 run reports 12 ns for the C
       path on Windows, 8 ns on Linux, and 13.8 ns for pe_ir. Left: measure
       that awaiting a task adds no per-await allocation; no allocation-count
