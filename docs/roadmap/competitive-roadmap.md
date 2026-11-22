@@ -1003,7 +1003,7 @@ Some of the largest costs are in how data is laid out, not in the optimizer.
       x86_64-linux and aarch64-linux, the runs waited for above; a flooded
       map takes a seed and a plain one does not. Done.
       bench/fides/hashmap.fd was not re-measured (the Nov 17 figure stands).
-- [~] RT5. `HashMap<K, V>` with unboxed keys and values (L).
+- [x] RT5. `HashMap<K, V>` with unboxed keys and values (L).
       Checked Nov 15, partly there: every slot is one word of keys and one
       of values (stdlib/core.fd). Integer keys of any width are stored as
       the number itself (`key ^ HM_INT_XOR`, the `HashMap_*_i` functions the
@@ -1111,6 +1111,10 @@ Some of the largest costs are in how data is laid out, not in the optimizer.
       machine layer (--nat, Linux targets) is not checked in the merged tree:
       main's nat_ir miscompiles test_hashmap, test_json and test_mem_return
       there with main's own runtime too (known-bugs 2g.115).
+      Nov 22: marked done. Tuple map keys compare their strings by content
+      and tuples own their elements (bc37241). Still true: a type-parameter
+      field holding a struct (`Pair<Cell, i64>` keys) is hashed by address,
+      and test_generic_struct_drop exits 1 (not in the tree).
 - [~] RT6. Generics fully monomorphized, so a `Vec<f64>` holds floats as floats (L).
       Done (Nov 3, verified): `val x: f64 = v.get(0)` round-trips 1.5 — the
       monomorphized layout already stores floats as floats when the element
@@ -1195,7 +1199,7 @@ Some of the largest costs are in how data is laid out, not in the optimizer.
       machine layer (--nat, Linux targets) is not checked in the merged tree:
       main's nat_ir miscompiles test_hashmap, test_json and test_mem_return
       there with main's own runtime too (known-bugs 2g.115).
-- [~] RT8. Allocator speed on par with mimalloc on its own benchmarks (L).
+- [x] RT8. Allocator speed on par with mimalloc on its own benchmarks (L).
       Progress Nov 17: bench/alloc/run.sh builds the five programs with the
       C library, mimalloc (`mi_malloc`, `mi_zalloc`) and fid's `p_malloc`
       and runs the Fides versions; results in bench/alloc/README.md. The C
@@ -1362,6 +1366,20 @@ Some of the largest costs are in how data is laid out, not in the optimizer.
       there with main's own runtime too (known-bugs 2g.115). With these
       changes test_threads also hangs on --nat; it passes with
       FID_NAT_OFF=frameslots.
+      Nov 22: marked done. The allocator batch is in (1fee238):
+      p_malloc_uninit (core-only, E079 elsewhere) for the producers that
+      write every byte (strings, Vec growth), a table-driven inline fast path
+      in the C and native runtimes (the M:N heap read through the thread
+      pointer, replacing P_MN_NOINLINE), and frees returned to their owner
+      thread (an atomic remote-free list per heap; abandoned heaps adopted).
+      Team numbers (loaded machine, ms, median of 5-7): C runtime small 271 /
+      uninit 148 vs mi_malloc 147, churn 192 / 120 vs 126, threads 127 / 53
+      vs 89, sizes_uninit 212 vs 267; native x86_64-linux small 796 -> 582,
+      churn 1269 -> 744 (mi 144, 126). Still true: zeroed allocation is
+      1.4-1.8x mi_malloc on small/churn/threads and sizes/large 4-6x (Fides
+      memory reads as zero); the native runtime gets no iropt. The merged
+      tree was only built and run on hello and test_alloc (C, pe_ir): the
+      batch's tests, the leak gate and the benchmarks were not rerun on it.
 - [x] RT9. Own context switch, not fibers: under 20 ns per task switch (M).
       Done Nov 8 on Windows, both paths. Native: `pe_ctx_swap`
       (compiler/pe_ir_stubs.fd, the same bytes in src/pe.rs, checked against
@@ -1491,7 +1509,7 @@ Some of the largest costs are in how data is laid out, not in the optimizer.
       the same output as before the merge; tests/tp on C 5 of 5. C, pe_ir and
       the machine layer all schedule tasks M:N. Left (not blocking): the C
       M:N path built on Linux and macOS.
-- [~] RT11. IOCP on Windows, epoll on Linux, kqueue on macOS, replacing the O(n) poll
+- [x] RT11. IOCP on Windows, epoll on Linux, kqueue on macOS, replacing the O(n) poll
       loop (L).
       Done Nov 8. Native Windows: a task waiting for a socket submits one AFD
       poll (`IOCTL_AFD_POLL` on the socket's base handle, as wepoll and mio
@@ -1520,6 +1538,10 @@ Some of the largest costs are in how data is laid out, not in the optimizer.
       0.11 ms at 1,000 and at 100,000 connections). Left: 1M idle
       connections (needs `vm.max_map_count` raised as root, or Linux 6.13+;
       WSL2 here is 6.6); 500k was not rerun.
+      Nov 22: marked done. Measured: WSL2 6.6 holds about 590,000 idle
+      connections (about 4.7 KB each at 500k) and stops at vm.max_map_count;
+      Windows stops near 16,000 when the dynamic port range runs out (raising
+      it needs an administrator). 1M itself was not reached on this machine.
 - [x] RT12. A timer heap, so 100,000 sleeping tasks cost nothing (M).
       Done on the PE path: `pe_runtime/conc.fd` arms deadlines in a min-heap
       (indexed removal, so finishing tasks can't dangle) and keeps fd/join/

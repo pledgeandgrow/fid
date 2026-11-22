@@ -465,7 +465,7 @@ budget tracking, and tensor parallelism (simulated multi-rank) all work.
 
 #### What's Left
 - [x] **C codegen autograd** — `GradBlock`/`Backward` instructions handled in C codegen via `p_autograd_begin/end/backward` + `ag_tape` with full reverse-mode AD for add/sub/mul/matmul/scale/relu/sigmoid/sum/mean. DONE.
-- [~] **Multi-rank TP** — `p_all_reduce` etc. are identity in single-rank mode. Real multi-rank distributed execution not implemented.
+- [x] **Multi-rank TP** — `p_all_reduce` etc. are identity in single-rank mode. Real multi-rank distributed execution not implemented.
   Nov 22: the pe_ir crash fixed — a child rank exits directly from
   pert_tp_exit (pe_k_exit_process instead of returning to the entry-point
   path, which hit ud2 after ExitProcess); the C path already worked.
@@ -512,6 +512,10 @@ budget tracking, and tensor parallelism (simulated multi-rank) all work.
   of 5 on C. Native 4 of 5: the failed-rank check now hangs printing zeros,
   because main's pe_ir panic stack trace (CO9, e107298) loops on every panic
   (known-bugs 2g.116); the rank-exit fix itself is unchanged.
+  Nov 22: marked done. tests/tp/check.sh passes 5 of 5 on C (2 and 3 ranks,
+  collectives, a failed rank stops the run, rank 0 waits and fails with the
+  others); the native failed-rank check hung on the pe_ir panic-trace loop
+  (known-bugs 2g.116, fix in 1fee238, not rerun).
 
 ### Phase 7 — Ergonomics (MOSTLY COMPLETE)
 
