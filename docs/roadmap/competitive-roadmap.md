@@ -1709,7 +1709,14 @@ This is the race we can win outright, since no rival's speed comes for free.
       blocks only, so a memo entry cannot replay it (the memo gate's own
       comment). The scoped lever for the 0.5 s target: extend mec_delta to
       record added instructions, then re-enable the memo with the skeleton
-      on (~140 ms of egraph per emit on hello).
+      on (~140 ms of egraph per emit on hello). Fix shape (ir_ser.fd
+      mec_delta :2409 / its replay :2476): (a) added BLOCKS currently
+      abort the delta at the range check (bi >= f.blocks.len() → empty);
+      serialize them with their index; (b) an instruction referenced by a
+      serialized block list but never logged via eg_set_inst dangles on
+      replay — walk the serialized blocks' ids and emit any inst entry
+      missing from the changed table. ~60-100 lines; silent-miscompile
+      class — land it fresh with cache-tv-check as the gate.
       Done: ~360 ms (Nov 2, fidesc); ~370 ms internal build time today
       (`fid emit hello.fd --target x86_64-linux`, ~780 ms wall incl. process
       start; type check ~85, borrow ~170, mid-end ~170).
