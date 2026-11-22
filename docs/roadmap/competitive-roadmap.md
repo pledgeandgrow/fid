@@ -943,7 +943,11 @@ in memory. This track is where most of the speed is.
       unrolling skips the cold loop); pgo-bench.sh: 1,349 ms without the
       profile, 1,149 ms with it (1.17x, one micro-benchmark, busy machine).
       Left: a suite run with a profile, and benchmark gains on a quiet
-      machine.
+      machine. Nov 22 (fid-nov22.exe): the flow re-verified on the current
+      tree — run --profile wrote nbody.fprof (3.5 KB block counts), emit
+      --profile-use consumed it, and the PGO binary prints the same
+      -169087605 as the plain build (19 ms vs 23 ms best-of-3 — the
+      benchmark's working set is too small to separate).
 - [x] OP31. Whole-program mode by default: every build sees all the code (M).
       Checked Nov 15, done (llvm WP1): every command merges the program, its
       imports, core and the runtime into one module before lowering
@@ -1203,6 +1207,20 @@ Some of the largest costs are in how data is laid out, not in the optimizer.
       family). Precise gap: a `let` inside a closure body or a generic
       impl method keeps the untyped-Vec behaviour; lw_vec_elem_code
       (lower.fd:8326) has codes only for u8..i32.
+      Nov 22 probe (pre-existing: fid, stage0 and fid-mec all show it):
+      `var g = fn(y: f64) -> f64 { var u = Vec::new(); u.push(y); return
+      u.get(0); };` prints u.get(0) as raw BITS (4613937818241073152 =
+      3.0), and an error-probe shows the push lands on the DEFAULT
+      Vec<str> — note_push does not act inside closure bodies. A plain
+      inner BLOCK at top level works (same three lines) — not scope
+      push/pop mechanics. All static paths trace correctly (note_let at
+      check_stmt_inner :18876, note_push at check_expr_inner :22018,
+      the Closure arm :21332 checks its body through the same
+      check_stmts_value -> check_stmt), so the cause is subtler: either
+      a different Closure arm runs first, or the lower-side rt6_elem_at
+      name match (fname "main__closure..." vs key "main") fails. Next:
+      one instrumented run — FID_RT6_DBG prints in note_let/note_push/
+      rt6_find (which fired, which key, found k or -1).
       Done (Nov 3, verified): `val x: f64 = v.get(0)` round-trips 1.5 — the
       monomorphized layout already stores floats as floats when the element
       type is known. Left: `print(v.get(0))` on an untyped `Vec::new()`
@@ -1872,6 +1890,15 @@ This is the race we can win outright, since no rival's speed comes for free.
       opaque; IR is not. Left for <10 s: make `lower()` itself faster —
       profile for hot spots (the pass is per-fn linear work today), or cut
       what it lowers; there is no artifact shortcut here.
+      Nov 22 re-measure (best of 5, `emit --nat`, -O2 fid): the 4.5x warm
+      loss no longer reproduces (SP13's byte codec shrank the artifact),
+      but it is still a wash-to-loss: plain hello 3403 ms warm vs 3321
+      no-cache, `use vec` hello 3433 vs 3373; core's IR alone is an
+      11.4 MB artifact. Verdict unchanged: post-lower is the wrong cache
+      point. The opt-in gained real off-values, `FID_IRCACHE=auto` paths
+      (pruned and full builds in separate files), per-entry check words
+      (ver 3) and a stats line — release-roadmap D9,
+      tests/tooling/ircache-check.sh.
       Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
       partly — `dump-c compiler/main.fd` with the -O2 compiler (8 units)
       takes 57 s wall for today's 361K-line tree (121 MB of C): under 60 s.
@@ -2060,6 +2087,11 @@ language lives.
       pipeline (the IR optimizer's passes and the machine layer's), and
       verify-nightly.yml runs `check` (1500) and `emit` (400) every night.
       Left: the coverage-guided run, long runs.
+      Left: the coverage-guided run, long runs.
+      Nov 22 assessment: `vf3-cov-run.sh` needs a fid built with the
+      coverage counters (`--fuzz-cov`); SL13's note records that path
+      still panicking on a double free in ccompile --fuzz-cov — blocked on
+      that fix, not on effort. Not run today.
 - [~] VF4. Run every optimizer pass on and off over the whole suite: output must not
       change (M).
       Done (Nov 7–8): `scripts/verify/variants.py toggle` — the iropt passes
@@ -2080,6 +2112,13 @@ language lives.
       120 sampled tests and 20 generated ones each week. Left: the five
       `PEIR_*` variants (pe_ir is Windows-only, the weekly job is Linux), the
       whole suite, a recorded run.
+      the whole suite, a recorded run.
+      Nov 22 assessment: the run-time-switch half is covered weekly; the
+      recorded-run item still wants the five `PEIR_*` variant compilers
+      (Windows-only pe_ir, so this host is the right one — one
+      build-variant.sh build each). Not run today (host memory budget
+      after the day's builds); the emit-lane suite result above
+      (1631/1791 with fid-nov22) is the current pass-matrix datapoint.
 - [~] VF5. Each optimization has a test that fails if the pass is wrong (M).
       Nov 22 audit: the "left" tests now exist (49fb2b9):
       test_verify_opt_dse_sccp_iv, _ipcp_gconst, _promote_facts,
@@ -2141,6 +2180,13 @@ language lives.
       verify-weekly.yml runs it over the VF5 and `test_verify_*` tests and
       20 generated programs each week. Left: a recorded run; mutants of the
       other passes.
+      other passes.
+      Nov 22 assessment: a recorded `variants.py mutate` run needs each
+      mutant compiler built by build-variant.sh (one dump-c + C compile of
+      the whole compiler per mutant — several GB and minutes each); the
+      iropt-switch mutants need no build but the recorded run covers the
+      built mutants. Not run today (host memory budget after the day's
+      self-hosted builds); the weekly job keeps covering it.
 - [~] VF8. Line and branch coverage of `compiler/*.fd` over 90%, reported in CI (L).
       Verified Nov 15: `scripts/verify/cov_instrument.py` (a counter at
       every function and IR block of the compiler's C) and
@@ -2156,6 +2202,10 @@ language lives.
       results in docs/verification/vf8-coverage.md, check
       tests/tooling/vf8-coverage-check.sh. Left: the first recorded run,
       and the tests that bring each reached module to 90%.
+      and the tests that bring each reached module to 90%.
+      Nov 22 assessment: `vf8-run.sh` needs a fid built with the
+      FID_C_LINE_MARKS instrumentation — another dedicated compiler
+      build; not run today (host memory budget).
 
 **Proving behaviour**
 
@@ -2232,7 +2282,7 @@ language lives.
       were byte-identical between two directories, and again with 4
       workers (FID_NAT_PAR/FID_PAR). Left unchanged: the `COMPILER=1`
       (build fid itself twice) and cross-host MANIFEST legs.
-- [~] VF13. A second bootstrap path checked regularly: fixpoint from a clean tree (S).
+- [x] VF13. A second bootstrap path checked regularly: fixpoint from a clean tree (S).
       Nov 22 audit: the Nov 18 blocker is resolved — the then-uncommitted
       modules (tv/ssa/pdb/mir/disasm/image_writer/nat_thumb/build_info)
       are all tracked; clean-bootstrap.sh dry runs pass. Remaining: the
@@ -2245,6 +2295,14 @@ language lives.
       stages beside the other sessions' builds. Nov 15: scheduled, the
       `bootstrap` job of verify-weekly.yml (every Saturday, on a fresh
       runner). Left: its first run.
+      Nov 22: run by hand in WSL (kali, gcc 15, fid-nov22-linux — a
+      self-hosted fid of the merged tree — as STAGE0 over `git archive
+      HEAD`): stage 1 dump-c 76 s + C 334 s, stage 2 dump-c 65 s, stage 3
+      dump-c; fides-c3 built and reports `fid 1.0.0+dev`, and stage 2's
+      and stage 3's generated C are byte-identical (126,335,453 bytes):
+      the fixpoint holds from a clean tree without the Rust compiler.
+      (The scripted run was finished by hand after the WSL session was
+      recycled mid-stage-2; stage times are of a loaded machine.)
 
 **Hardening the runtime**
 
@@ -2313,6 +2371,19 @@ language lives.
       access"), C4 (Linux: `file_append` reports success when the disk is
       full), C5 (out of memory aborts with SIGABRT). Left: clock jumps
       (libfaketime or a VM), partitions between machines.
+      Nov 22 (WSL kali, chaos.c by fid-nov22.exe, gcc 15): `chaos_linux.py
+      clock` — 20/21 cases pass over no jump, realtime ±1 h and all-clocks
+      +1 h through clockjump.so (the project's own LD_PRELOAD shim; no
+      libfaketime needed): sleeps, tasks, timeouts, tokens, cosleeps and
+      waitfds all keep their real times under the jumps. The one failure:
+      "clock tasks (all clocks +1h)" wakes 600/300/900 instead of
+      300/600/900 — all deadlines expire at the jump but the runtime
+      dequeues them out of deadline order. `chaos_linux.py partition`
+      (two user namespaces + veth + nftables, `unshare -rn`): 4/6 —
+      whole-answer fetch, mid-answer read timeout, heal-after-2.5 s and
+      connect-timeout all pass; the two blocking-with-no-timeout cases
+      (mid-answer read, connect into the partition) hung and were killed
+      at 12 s — a caller without a timeout never learns the link is dead.
 - [~] VF18. Sharded tests on thousands of task and thread interleavings (L).
       Done (Nov 7): `scripts/verify/interleave.py` runs
       `tests/verify/interleave.fd` (atomics, a mutex, a channel pipeline,
@@ -2322,6 +2393,14 @@ language lives.
       3000 runs on 4 shards each week. Left: that run recorded, async
       tasks, a controlled scheduler (it perturbs the OS scheduler; it does
       not choose switches).
+      Nov 22 (run of record, build/interleave-linux/record-nov22.md):
+      3000 runs on 4 shards each on ccompile and emit in WSL (kali,
+      fid-nov22-linux): one distinct result each, PASS — 465 s and 422 s.
+      The earlier Windows attempt's four "divergent" seeds were the
+      host's page-file exhaustion (`Panic: could not start a thread`,
+      WinError 1455 while spawning), not schedule faults; under WSL's
+      memory budget none recurred. Left as before: async tasks, a
+      controlled scheduler.
 
 **Learning from every bug**
 
