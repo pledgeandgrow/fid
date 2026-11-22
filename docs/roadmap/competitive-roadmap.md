@@ -3679,7 +3679,13 @@ Only this produces true production years. It starts now, at small scale.
       ark`): a program linking a prebuilt library prints '0 0 false'.
       Left: veil's report, the prebuilt-library call path, and shipping
       the Fides tools in place of the Rust ones.
-- [~] AD2. The project website served by a Fides program (M).
+- [x] AD2. The project website served by a Fides program (M).
+      Nov 22 audit: done — the Nov 21 "Left: hosting it" is stale:
+      .github/workflows/pages.yml (since 49fb2b9) ccompiles tools/site.fd
+      with release/fid-dev, runs site --build _site, deploys via
+      actions/deploy-pages@v4 — 28 runs, green through today;
+      test_site_render.fd and docs/website.md in the tree. The custom
+      fid-lang.org domain is the separate website repo, outside this item.
       Done (Nov 15): `tools/site.fd` renders README, the book, cookbook,
       guides and reference when requested, through `stdlib/markdown.fd`
       (fixed: `_` inside words, indented fences, list continuations,
@@ -3741,7 +3747,12 @@ Only this produces true production years. It starts now, at small scale.
 
 **Being reachable**
 
-- [~] AD6. The book: a full guide, from first program to writing a service (L).
+- [x] AD6. The book: a full guide, from first program to writing a service (L).
+      Nov 22 audit: done — docs/book/ has all 10 chapters;
+      tests/book/check_book.py runs every chapter's examples and sessions
+      and ci.yml:152-153 runs it on every push (stronger than the "at each
+      release" acceptance); the Nov 22 note records the passing run
+      (47 checks, 0 failures).
       Nov 15: all ten chapters of `docs/book/` are written. Chapters 5-8 and
       10 (effects and annotations, errors, toolchain, concurrency, shipping)
       go concepts, runnable examples, common mistakes; every complete example
