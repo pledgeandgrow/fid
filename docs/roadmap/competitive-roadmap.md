@@ -1223,6 +1223,19 @@ Some of the largest costs are in how data is laid out, not in the optimizer.
       on all three, and no other test is newly rejected. Left: a `let` in a
       closure body or a generic impl method keeps the old untyped
       behaviour; a full-suite run.
+      Nov 22 (`release/fid-nov22.exe`, the stage-0 self-hosted build of the
+      merged tree): `expect.py --backends emit tests/bootstrap` — 1631 of
+      1791 pass. Of the 160 failures ~47 are the runner's indented-comment
+      quirk (expected lines keep 2-4 leading spaces the programs never
+      printed — they fail identically on `run`), ~54 are `// expect-error:`
+      tests only the fidesc harness reads, ~10 are the sha/hash family of
+      the new 2g.118 (shared native-path miscompile: sha256, sha1, hmac,
+      jose, ws, kdf vectors all differ from run/ccompile, the same wrong
+      value on pe_ir and --nat), ~8 are seeded-random output
+      (ecdsa/hpke/acme/entropy), the alloc_* failures track the in-flight
+      RT8 heap work, and the rest are single miscompiles under triage
+      (test_verify_nat_coalesce, test_verify_abi_c_tls sign extension,
+      test_std_dsp/apriltag/jose_pk).
 - [x] RT7. Allocator: per-thread caches (release H8), freed memory returned to the
       system (L).
       Done (written Nov 4): per-thread arenas and free lists in the C runtime,
@@ -1684,6 +1697,14 @@ one machine; 100,000 requests/s on one core.
 This is the race we can win outright, since no rival's speed comes for free.
 
 - [~] CS1. `emit` of hello world under 0.5 s (release D9), then under 0.1 s (L).
+      Nov 22 audit: NOT done — best on record 631 ms, ~0.7 s through
+      pe_ir after an edit; lower 185-275 ms, iropt 70-180 ms and native
+      code 43-310 ms rerun every build, and the lowered-IR cache measured
+      4.5x slower than lowering. CAVEAT: the Nov 22 mecache FAILs are NOT
+      regressions — h_damaged.log fails on a core.fd:607 type error
+      (nat_win_call 10 args, wants 11); Nov 21's pass is the last clean
+      result. Missed by the entry: the e-graph memo is OFF by default
+      (egraph.fd:3329,:3356-3358).
       Done: ~360 ms (Nov 2, fidesc); ~370 ms internal build time today
       (`fid emit hello.fd --target x86_64-linux`, ~780 ms wall incl. process
       start; type check ~85, borrow ~170, mid-end ~170).
@@ -1720,6 +1741,12 @@ This is the race we can win outright, since no rival's speed comes for free.
       internal through pe_ir after a one-line edit and 2.4 s through --nat
       (loaded machine); lowering, iropt and native code still run in full
       on every build.
+      Nov 22 (`release/fid-nov22.exe`, a stage-0 self-hosted build of the
+      merged tree at -O1/-O0 — a -O2 fid is faster): `emit
+      tests/bootstrap/hello.fd` with the output removed first, three runs:
+      total build 425, 426, 463 ms (typecheck ~180, lower ~172, iropt ~97,
+      native ~155). Under 0.5 s on a deliberately slower-compiled fid;
+      the 0.1 s stretch stays open.
 - [x] CS2. Cache the checked stdlib in a binary form, not re-parsed each build (L).
       Done: trusted-module fast path — the baked-in core.fd and backend runtime
       skip per-function body checks and error reporting (~26 ms off hello's
@@ -1761,6 +1788,14 @@ This is the race we can win outright, since no rival's speed comes for free.
       half; the text cache format there costs ~20 s to load at -O0 and
       wants the same byte treatment).
 - [~] CS3. Borrow checking linear in program size (release D8) (M). On the
+      Nov 22 audit: mostly done — prefix queries are table lookups
+      (borrowck.fd:2029-2072), remaining scans are not program-size, and
+      cs3-borrowck-scaling.sh PASSES flat to 160k lines (29-33 µs/line).
+      Precise gap: the 1M-line run (benchmarks.md recorded 1477 s,
+      "grows much faster than the program") — hypothesis: the [time]
+      borrowck mark (compiler.fd:5528) also covers map teardown
+      (free_maps :5475,:5502). The CS8 "prefix queries remain" note is
+      stale.
       compiler itself: 16 s (Nov 6).
       Nov 8: the reference-escape check iterates its fixpoint only over the
       functions whose result can hold a reference (scalars, strings and
@@ -1780,6 +1815,12 @@ This is the race we can win outright, since no rival's speed comes for free.
       ms (~17x); borrowck of the compiler is ~0.16-0.6 s of a ~5 s check.
       All expected-fail borrow diagnostics byte-identical.
 - [~] CS4. Self-compile under 60 s (release), then under 10 s (L). Nov 9: 74 s
+      Nov 22 audit: under 60 s MET — release/gate-nov21-c.log records
+      dump-c in 32 s with the -O2 stage 0; the fixpoint caveat is
+      superseded (FIXPOINT OK + RELEASE OK at :12-13). Precise gap: under
+      10 s (lowering 19.7 s, C gen 10.3 s, front end 8.7 s); and the
+      -O0-built release/fid.exe takes 368 s for the same work — the bar
+      is met by the -O2 class only.
       with the compiler built at -O2 (8 split units), against 229 s at -O0;
       the -O2 compiler emits the same C (fixpoint). Of the 74 s: type check
       18 s, borrow check 5, mono 5, lowering 24, C generation 20.
@@ -1823,6 +1864,12 @@ This is the race we can win outright, since no rival's speed comes for free.
       (extern strlen is not available in the interpreter); no fixpoint or
       suite check in this run.
 - [~] CS5. Parallel front end and code generation on all cores (L).
+      Nov 22 audit: NOT done — all parallelism is opt-in slices (lex
+      FID_PAR, borrowck 64+ units, escape/secrecy reporting, nat codegen
+      FID_NAT_PAR; the five spawn sites in compiler/ are the only ones);
+      parse, body typecheck, mono, lowering, iropt, C and pe_ir codegen
+      are sequential. par_check ok. What is parallel is too small to pay
+      for the spawn (borrowck ~15 ms of hello's 147-251 ms front end).
       Done (borrowck slice, opt-in): `FID_PAR=N` splits the borrow check's
       function set across N workers (own `BorrowChecker` each, chunks merged
       in order — diagnostics byte-identical to sequential, verified on an
@@ -1856,6 +1903,14 @@ This is the race we can win outright, since no rival's speed comes for free.
       bodies, import resolution, lowering and code generation are not
       parallel; FID_PAR is opt-in; no timing comparison was run.
 - [~] CS6. Incremental native builds per function, under 100 ms for a one-line
+      Nov 22 audit: the soundness Left is RESOLVED — build/
+      cache-tv-check.out (Nov 22 01:43): irocache-check 0 failed, 0
+      mismatches; edits rerun only the edited function and match the
+      no-memo build. The nat_ir function cache is on by default for every
+      machine-layer emit (main.fd:7921-7927; the "debug-only" comment at
+      :7099 is stale). Precise gap: the time — a one-line edit is ~700 ms
+      through pe_ir (front end + lowering rerun whole-program, nothing
+      caches them); machine-layer edit-reuse 0/240 (SP6).
       change (L).
       Done: whole-output incremental caching on `emit`, `ccompile`, and `build`
       — `.fides-stamp` records compiler identity, output hash, and every dep
@@ -2009,6 +2064,11 @@ language lives.
       `PEIR_*` variants (pe_ir is Windows-only, the weekly job is Linux), the
       whole suite, a recorded run.
 - [~] VF5. Each optimization has a test that fails if the pass is wrong (M).
+      Nov 22 audit: the "left" tests now exist (49fb2b9):
+      test_verify_opt_dse_sccp_iv, _ipcp_gconst, _promote_facts,
+      _spec_devirt_icf. Remaining: hofspec/branchfacts/closuredevirt/iv,
+      the machine layer's kill-switches, one full expect.py pass on all
+      backends.
       Done (Nov 7): `tests/bootstrap/test_opt_{fold,inline,dce,gvn,tailcall,
       licm,ranges,ranges_pop_fail,regalloc}.fd`, each a program whose output
       changes when its pass is wrong (unsigned folds, argument order, values
@@ -2024,6 +2084,11 @@ language lives.
       iropt passes (ipcp, promote, spec, hofspec, devirt, icf, gconst,
       branchfacts, ...) and the machine layer's (kill-switches.md).
 - [~] VF6. Translation validation: a checker proves each optimized function matches
+      Nov 22 audit: the Nov 21 failure is largely fixed — build/
+      tv-check-rerun.out: 22 faults caught none missed, 0 rejected, SMT
+      obligations all proved; tv-check still fails on 1 SMT example of 9.
+      Remaining: that example, the SUITE=1 suite-wide run, licm/inline/
+      module passes.
       the original, on a chosen set of passes (XL).
       Scoped (Nov 7): docs/verification/translation-validation.md — witnesses
       from each iropt pass checked by a separate small checker, SMT for
@@ -2078,6 +2143,12 @@ language lives.
 **Proving behaviour**
 
 - [~] VF9. A written formal semantics of the core language (XL).
+      Nov 22 audit: the entry lags the tree — docs/verification/
+      semantics-2.md covers floats, strings, enums, generics, closures,
+      references, effects, concurrency, memory, traits/regions/async
+      (§5-§19), each rule tied to test_verify_semantics_ext.fd; the
+      "Left: floats, strings..." list is done. Remaining (its §22): no
+      mechanisation in a proof assistant.
       First piece (Nov 7): docs/verification/semantics.md, a big-step
       semantics of the integer core (types, checked/wrapping arithmetic,
       casts, shifts, short circuit, `if` values, loops, match, calls,
@@ -2104,6 +2175,12 @@ language lives.
       Left: run on every backend with the final compiler; fix the CF
       findings.
 - [~] VF11. A proof of the memory-safety claim on a small core calculus (XL).
+      Nov 22 audit: the entry lags the tree — beyond the pen-and-paper
+      calculus there is a machine-checked bounded model (scripts/verify/
+      own_model.py: CoW, boxes, structs/enums, closures, Rc, two refs)
+      and own_diff.py comparing the lowering against it; the check
+      exists (last artifact: 1 failed). Remaining: the mechanised
+      proof-assistant proof and a green model check.
       First piece (Nov 7): docs/verification/memory-safety-core.md — the
       calculus of proposal 0004's ownership rule, its invariant and a
       pen-and-paper preservation/progress sketch, with the five compiler
@@ -2130,7 +2207,20 @@ language lives.
       linker. FIDES_NO_REPRO=1 turns it off. Left: a run showing two
       directories give the same bytes (scripts/driver-goals-check.sh does it
       on Windows), a `COMPILER=1` run.
+      Nov 22 (`FID=release/fid-nov22.exe`, `CC="zig cc"`):
+      `scripts/verify/repro.sh` — 72 of 72 outputs reproducible: for
+      hello, test_struct_eq, test_closure, test_hashmap, strings and
+      test_opt_regalloc the dump-c text, pe_ir emit, zig-cc ccompile,
+      `emit --target` x86_64/aarch64/riscv64-linux images and `emit --nat`
+      were byte-identical between two directories, and again with 4
+      workers (FID_NAT_PAR/FID_PAR). Left unchanged: the `COMPILER=1`
+      (build fid itself twice) and cross-host MANIFEST legs.
 - [~] VF13. A second bootstrap path checked regularly: fixpoint from a clean tree (S).
+      Nov 22 audit: the Nov 18 blocker is resolved — the then-uncommitted
+      modules (tv/ssa/pdb/mir/disasm/image_writer/nat_thumb/build_info)
+      are all tracked; clean-bootstrap.sh dry runs pass. Remaining: the
+      actual 3-stage fixpoint run has never completed (no
+      build/clean-bootstrap artifact).
       Written (Nov 7): `scripts/verify/clean-bootstrap.sh` — `git archive
       HEAD` (or `--worktree`) into a new directory, cargo builds the Rust
       compiler there, `scripts/bootstrap.sh` 3 stages with the fixpoint check,
@@ -2448,7 +2538,13 @@ Reach what Rust, Go, Zig and C++ programmers expect on day one.
       queries. No token-tree macro parse form exists — by design; a
       guaranteed hygiene algorithm (beyond gensym + clash errors) would
       be new work if ever wanted.
-- [~] LG10. Error handling with context and no allocation on the happy path (M).
+- [x] LG10. Error handling with context and no allocation on the happy path (M).
+      Nov 22 audit: done against the acceptance — Result.context returns
+      Ok untouched and builds the message only in the Err arm
+      (core.fd:328-337), with_context calls f only on Err (:340-349),
+      Option.context (:356-365); documented (reference.md §13.2) and
+      tested (test_result_context.fd; conformance s13_2_*). No-allocation
+      on the happy path follows from the code (no test asserts it).
       `Result.context(msg)`, `with_context(f)`, `Option.context(msg)` (complaint
       CE1).
 - [x] LG11. Structured concurrency with cancellation and timeouts (L).
@@ -3463,6 +3559,12 @@ Every platform gets a tier, and a tier means CI, not a hope.
       best effort (S).
       Done: `docs/reference/platforms.md`.
 - [~] PL2. Tier 1: Windows x64, Linux x64, macOS ARM64, Linux ARM64 (release F4–F8)
+      Nov 22 audit: the three Nov 22 blocker fixes are in the tree
+      (cross-test HOST_ARCH; native_debugger PTRACE_GETREGSET;
+      pe_win_stat st_dev/st_ino). Precise gap: a green tier1.yml run has
+      never happened (33 runs: 30 cancelled, 2 failed, 0 success) and
+      macOS ARM64's self-hosted fid dies in the 3-stage fixpoint
+      (CB8/2g.79) — the single blocker also behind PL7 and PL6's iOS.
       (XL).
       Nov 17: scripts/tier1.sh (lanes, expected-fail, binaries) per
       platform; .github/workflows/tier1.yml on windows-latest,
@@ -3489,6 +3591,11 @@ Every platform gets a tier, and a tier means CI, not a hope.
       in the worktree). Left: green full runs
       on all four; macos-arm64 has no machine here (CI's macos-15).
 - [~] PL3. Tier 2: Windows ARM64, macOS x64, FreeBSD, RISC-V (L).
+      Nov 22 audit: all four targets build and pass bin-target-check; 7
+      riscv64 binaries ran under qemu matching `fid run` (Nov 21).
+      Precise gap: the Windows ARM64, FreeBSD and macOS x64 binaries have
+      never been EXECUTED (format checked only); tier2.yml has never been
+      green (31 runs, 0 success).
       Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
       validated — `@cfg` knows freebsd and unix (test_cfg, test_cfg_unix,
       test_cfg_platforms pass), and tier2-targets-check.sh passes: every
@@ -3498,6 +3605,12 @@ Every platform gets a tier, and a tier means CI, not a hope.
       ARM64, FreeBSD and macOS x64 binaries (only their file format was
       checked here; tier2.yml's jobs were not looked at).
 - [~] PL4. WebAssembly with WASI (release F9) (L).
+      Nov 22 audit: wasi_snapshot_preview1-only imports, _start export,
+      task switching validated (task-switch-check.sh 3 passed); CI lane
+      wired in suite-all.yml. Precise gaps: the full suite through
+      wasm-test.sh (316/344; sample: test_fix_fnval_struct_ret fails),
+      threads run to their end (preview 1 has none), lane 0 successes
+      (4 failed, 27 cancelled).
       Done: `fidesc wasm` emits a runnable .wasm (80 KB on hello) via
       `src/wasm.rs`/`compiler/wasm.fd`. Left: it imports a custom Fides
       `env` host API (`p_print`, `p_str_concat`, `p_panic`, …), not
@@ -3538,6 +3651,11 @@ Every platform gets a tier, and a tier means CI, not a hope.
       suite through wasm-test.sh (a 40-test sample: 35 pass, and
       test_fix_fnval_struct_ret fails); threads; the CI lane not checked.
 - [~] PL5. Freestanding and embedded: Cortex-M, RISC-V boards, with no OS (release G)
+      Nov 22 audit: Thumb-2 oracles green (enc-oracle-pl5.py 226 forms,
+      op21 662 forms, 0 mismatches), test_thumb_core 23/23, thumb_check
+      10 passed under qemu-arm. Precise gap: the no-OS images (vector
+      table, UART, semihosting exit) have never been executed — no
+      qemu-system-arm locally and bare-metal.yml has no thumb step.
       (L).
       Done: `--no-std` skips `core.fd` and still emits static ELFs —
       verified on `riscv64-linux` (43 KB) and `arm64-linux` (40 KB) with
@@ -3553,12 +3671,24 @@ Every platform gets a tier, and a tier means CI, not a hope.
       lm3s6965evb). Left: the no-OS images (vector table, UART, semihosting
       exit) were not run: no qemu-system-arm here.
 - [~] PL6. Android and iOS (XL).
+      Nov 22 audit: NOT done, and the entry understates what exists —
+      stdlib/jni.fd, objc.fd, android_ndk.fd (+lifecycle/biometrics/
+      haptics) since 49fb2b9: bridge logic tested in the interpreter
+      against fake VMs (test_std_jni, test_std_objc). Nothing links for
+      real: no android/ios target in normalize_target, no .so/apk/ipa
+      production, iOS blocked behind PL7's Mach-O-on-Mac gap.
       Done: the static arm64-linux ELF is Android-adjacent — direct
       syscalls, no libc dependency, so it should run under `adb shell`
       (unverified on a device). Left: device testing, Android NDK/ABI
       quirks, and iOS entirely (needs the Mach-O backend + Apple syscall
       numbers + code signing).
 - [~] PL7. Native backends for ELF and Mach-O, sharing one encoder (L).
+      Nov 22 audit: the one-encoder claim is real — nat_enc.fd (13,289
+      lines) holds nat_elf (:2712), nat_pe (:3501) and nat_macho (:8133,
+      PIE, dyld binds, ad-hoc signature) over the single nat_ir MIR;
+      macos-native.yml is fully written. Precise gap: no Mach-O binary
+      has ever run on a Mac — all 4 completed runs died in the self-hosted
+      fixpoint (CB8/2g.79), the same blocker as PL2's macOS lane.
       Done: `build --target` emits valid static ELF64 executables for all
       three arches with zero external tools — x86-64-linux, arm64-linux, and
       riscv64-linux all produce correct ELF headers (machine 62/183/243,
@@ -3619,10 +3749,24 @@ Trust is built by what we do not break.
       test_frontend_edition, `_2027_fail`, `_unknown_fail`. The `--no-std`
       pipeline records no editions (every file is in the default).
 - [~] ST4. A release every six weeks, on a date, whatever is ready (M).
+      Nov 22 audit: PROCESS/FUTURE — the policy is written
+      (stability.md:101-102) and four dated prereleases exist (v0.7
+      through v0.8.2-unstable), but none demonstrates the cadence (9-week
+      gap, then same-day tags) and release.yml (which would mechanize it)
+      has 0 runs. Cannot be code-done.
       Done: the policy. Left: the first dated release.
 - [~] ST5. Long-term support releases with security fixes (M).
+      Nov 22 audit: PROCESS/FUTURE — the LTS policy exists
+      (stability.md:103) but no LTS release can exist until releases
+      accumulate; nothing to verify yet.
       Done: the policy. Left: the first LTS release.
 - [~] ST6. Before each release, build every known public Fides project, as Rust's
+      Nov 22 audit: mostly done — scripts/crater.sh + projects.txt +
+      baseline.txt (saved Nov 17 from the 0.8.0 fid; the "no baseline"
+      Left is stale) + the crater job in release.yml:222-254. Precise
+      gaps: projects.txt holds only this repo's own fixtures (no known
+      external project yet), and release.yml has ZERO runs ever — all
+      four tags were cut without the gate.
       crater does (L).
       Done: the rule. Nov 15: the list, `scripts/crater/projects.txt` (local or
       git source, command, files), and `scripts/crater.sh`, which copies or
@@ -3640,6 +3784,12 @@ Trust is built by what we do not break.
 - [x] ST9. Release notes that name every breaking change (S).
       Done: the rule in `docs/reference/stability.md` and `CONTRIBUTING.md`.
 - [~] ST10. Signed checksums for every download (S).
+      Nov 22 audit: mostly done — release.yml:278-299 makes SHA256SUMS
+      over installer+tar.gz+docs and attests provenance per file; the
+      root SHA256SUMS is tracked (1fee238) and v0.8.2 carries the asset.
+      Precise gaps: never proven on a real release (release.yml 0 runs;
+      nothing signed to verify), and Authenticode still has no
+      certificate (FIDES_SIGN_PFX).
       Done: `SHA256SUMS` and a Sigstore build provenance attestation per archive in `release.yml`. Left: proven on a real release.
       Nov 15 (checked): that release.yml was gone — commit 9f2ba40 (Nov 2)
       deleted it and build-installer.yml, and it never had an attestation
@@ -3660,6 +3810,12 @@ Only this produces true production years. It starts now, at small scale.
 **Using it ourselves**
 
 - [~] AD1. `ark`, `scribe` and `veil` written in Fides (release N8) (L). The
+      Nov 22 audit: mostly done — the "shipped binaries are still Rust"
+      gap is closed in code: installer/build-installer.sh (1fee238,
+      Nov 22) builds ark/scribe/veil from tools/*.fd via the shipped fid
+      by default (FIDES_RUST_TOOLS=1 opts back). Precise gaps: veil's
+      report fidelity and ark's prebuilt-library path (tools-selfbuild-
+      check), and no released installer ships them yet.
       implementations exist in `compiler/{ark,scribe,veil}.fd` and now have
       standalone `fn main` entries in `tools/`. `ark.exe` builds and runs
       end-to-end (`version`, `list` verified); `scribe.exe` builds and
@@ -3705,6 +3861,12 @@ Only this produces true production years. It starts now, at small scale.
       KB after 300, 450 and 600); test_site_render prints its 51 lines.
       Left: hosting it (a Pages workflow or a server of ours).
 - [~] AD3. `fides-os` as a standing test of bare-metal work (release G4) (M).
+      Nov 22 audit: mostly done — bare-metal.yml's fides-os job (weekly
+      + dispatch) + scripts/fides-os-boot.sh + the Nov 17 boot doc exist;
+      the standing test works as designed (the first dispatch reported
+      drift correctly). Precise gap (external): pledgeandgrow/fides-os
+      @main no longer compiles against current fid (fat32/proc/p_malloc
+      signatures) — a green run waits on that repo catching up.
       Nov 17: scripts/fides-os-boot.sh boots minimal, shell (banner,
       command list, prompt) and shell-input (echo and mem typed through
       the PS/2 keyboard via QEMU sendkey, timer ticking); bare-metal.yml
@@ -3725,6 +3887,13 @@ Only this produces true production years. It starts now, at small scale.
       current compiler (work in that repo), plus FIDES_OS_TOKEN if it is
       private.
 - [~] AD4. Every internal tool that can be in Fides is (M).
+      Nov 22 audit: mostly done — 12 tools/*.fd; ported per
+      docs/internal-tools.md: release_notes, release_checksums,
+      macho_check, fuzz_triage, doctest + ark/scribe/veil (+ the installer
+      flip, AD1). Precise gaps: doctest.fd differs from doctest.py in
+      --emit mode (no "native:" summary line, 2/3 differ), and ~20
+      drivers remain (scripts/fuzz/*, scripts/verify/*, enc-oracle,
+      tests/harness.rs, verify.sh family).
       Done (Nov 15): `docs/internal-tools.md` lists every script and tool
       and what keeps it out of Fides. Ported, with the same output as the
       originals (kept): `tools/release_notes.fd` (scripts/release-notes.py)
