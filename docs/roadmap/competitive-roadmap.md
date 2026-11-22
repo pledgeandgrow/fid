@@ -13,6 +13,8 @@ someone choose Fides over a language with fifteen years of production use?
 Goals already in the release roadmap are named here, not repeated.
 [complaint-roadmap.md](complaint-roadmap.md) starts from the other side: what
 developers complain about in the languages they use today.
+[end-roadmap.md](end-roadmap.md) holds the final-gate goals moved out of the
+roadmaps: do them at the very end, once the code stops moving.
 
 ## What maturity is
 
@@ -153,31 +155,10 @@ Nothing below means anything until this exists.
       there); `.github/workflows/verify-weekly.yml` runs every set on Linux,
       best of 5, tables kept as artifacts. Left: a quiet-machine Windows run
       and the first Linux run, published.
-- [~] BM9. CI fails on a slowdown over 5%, per benchmark (release D7, tighter) (M).
-      Done (Nov 4): `bench/check.sh` fails on a slowdown over `LIMIT_PCT` against
-      `bench/baseline.txt`. Verified Nov 15: `.github/workflows/bench.yml`
-      already ran it in CI (base commit records, head checked, 10%). Nov 15:
-      `check.sh --ab` runs the base and head executables in turn on the
-      runner and re-measures a program over the limit before failing;
-      bench.yml now uses it with `LIMIT_PCT=5`. Left: CI runs to show 5%
-      holds without false failures; the BM3/BM4 sets in the gate
-      (`SUITES="game work"`) once they have built.
-- [~] BM10. A public page of results over time, losses included (M).
-      Verified Nov 15: docs/benchmarks.md is that page (Nov 2, 3 and 15
-      runs, weak spots, a corrections policy). Nov 15: `bench/history.sh`
-      adds a run's tables to it unchanged, newest first. Left: on the
-      website, and kept up (the weekly Linux tables are artifacts, added by
-      hand).
+- [>] BM9. CI fails on a slowdown over 5%, per benchmark (release D7, tighter) (M).: moved to end-roadmap.md (Nov 22 — final-gate work, do when the code stops moving).
 
-**Acceptance:** anyone can reproduce every number with one command.
+- [>] BM10. A public page of results over time, losses included (M).: moved to end-roadmap.md (Nov 22 — final-gate work, do when the code stops moving).
 
-## Track OP — Optimizer
-
-Today the native path keeps most values in stack slots (seven callee-saved
-registers hold the hottest values), runs a small IR optimizer and leaves floats
-in memory. This track is where most of the speed is.
-
-**Foundations**
 
 - [x] OP1. Run the IR optimizer on the native path (release D6) (M).
       Done (Nov 4): `fid emit` runs `compiler/iropt.fd` before code generation.
@@ -1955,6 +1936,10 @@ This is the race we can win outright, since no rival's speed comes for free.
       :7099 is stale). Precise gap: the time — a one-line edit is ~700 ms
       through pe_ir (front end + lowering rerun whole-program, nothing
       caches them); machine-layer edit-reuse 0/240 (SP6).
+      Nov 22 evening: with the e-graph memo live under the skeleton
+      (CS1's note), a warm rebuild also skips ~80% of the e-graph's
+      per-emit time; the remaining 700 ms -> 100 ms path is the same
+      wall as CS1's (front end + lowering rerun whole-program).
       change (L).
       Done: whole-output incremental caching on `emit`, `ccompile`, and `build`
       — `.fides-stamp` records compiler identity, output hash, and every dep
@@ -2340,27 +2325,8 @@ language lives.
       (`test_runtime_tls_record.fd`). It is fuzz target `tls` of
       fuzz_parsers.py (binary seeds; `tests/fuzz/parsers.fd`). Left: a run
       of the tls target, long runs.
-- [~] VF16. Week-long soak tests of a service under load, with flat memory (release
-      I6 is 24 hours) (M).
-      Done (Nov 7): `scripts/verify/soak.py` runs `tests/verify/soak_service.fd`
-      (HTTP head parse, JSON, a bounded cache) and fits the memory slope of
-      the second half. Run: fails at once — L1, ~3.9 KB leaked per request on
-      the C path, out of memory after ~1 M requests (15 s); `fid run --leaks`
-      names the sites. Checked Nov 16 by reading: L1 was measured on Nov 7,
-      before ownership (proposal 0004, Nov 8) made the lowering drop every
-      string, Vec and map it names (the sites `--leaks` listed are core's
-      and the lowering's: String_slice, concatenation, int_to_str, the Vecs
-      of http_parse_head and json_get_*); http.fd and json.fd keep no string
-      outside it, and core's HashMap_remove and Vec_clear drop what they
-      remove. Nov 16-17, a real socket server under load
-      (`scripts/verify/soak_http.py`, docs/verification/soak-http.md): it
-      leaked per request on kept-alive connections; found and fixed Nov 17
-      (docs/verification/soak-http-leak.md: a handler's result called
-      through a function value, and `hc_text`, each kept a second owner).
-      After it `soak.py` and `soak_http.py` are flat; a 30-minute socket
-      soak took 10.1 million requests, 0 failed, at 6.0 MB (slope -0.04
-      MB/hour). Left: the 24-hour run (started Nov 17 16:46,
-      build/soak-http-24h/) and the week-long run.
+- [>] VF16. Week-long soak tests of a service under load, with flat memory (release: moved to end-roadmap.md (Nov 22 — final-gate work, do when the code stops moving).
+
 - [~] VF17. Chaos tests: dropped connections, full disks, out of memory, clock jumps
       (L).
       Done (Nov 7): `scripts/verify/chaos.py` + `tests/verify/chaos.fd`.
@@ -3326,29 +3292,8 @@ owning what we ship.
       `test_crypto_bind_rsa.fd`, the same output on BCrypt and OpenSSL.
       Left: the external review (docs/security/review-index.md) and a macOS
       CI run.
-- [~] SL19. Every public function documented with an example that runs in CI (L).
-      Nov 22 audit: mostly done — scripts/doctest.py + tools/doctest.fd,
-      CI-wired (ci.yml:123,:128, enforced by ci-wiring-check.sh CU7);
-      737 /// Example: blocks over 147 files (was 528/31). Precise gap:
-      examples on the rest (quic.fd 0, fs.fd 1, ~6000 pub items) —
-      mechanical writing, no code or CI work left.
-      Done: `scripts/doctest.py` extracts `/// Example:` code blocks from
-      .fd sources and runs each as a program through `fid run` — CI-gatable
-      (exit 1 on any failure); `(native only)` marker skips FFI examples on
-      the interpreter. Nov 15: 528 examples (519 run, 0 fail, 9 native
-      only) over 6706 pub items; each checks its result with `assert` or
-      `assert_eq` (doctest.py looks only at the exit code). The 31 most used
-      modules have an example for nearly every public function: string, vec,
-      collections, iter, fmt, math, json, encoding, path, time, datetime,
-      sort, set, queue, stack, bigint, decimal, regex, hash, random, result,
-      csv, uuid, semver, url, log, metrics, bits, bitset, args, env. Writing
-      them fixed `utf8_encode` for U+0080-U+00FF, `random`'s state (a `pub
-      const` never advanced: every `uuid_v4()` was the same), `bit_mask(63)`,
-      `fmt_bytes`, and the smallstr and rope lengths. Left: the other
-      modules; examples on methods (doctest.py reads `/// Example:` at
-      column 0 only); doctest.py's failure line is the first `[build]`
-      line rather than the error.
-      examples (`scribe` renders docs only).
+- [>] SL19. Every public function documented with an example that runs in CI (L).: moved to end-roadmap.md (Nov 22 — final-gate work, do when the code stops moving).
+
 - [x] SL20. OS-development primitives: firmware tables, buses, memory (M).
       Done (Nov 10): the parse/layout halves a kernel needs, pure Fides so
       they run anywhere — `elf.fd` (ELF64 ehdr/phdr/shdr + names), `acpi.fd`
@@ -3844,66 +3789,20 @@ Trust is built by what we do not break.
       `@deprecated` function is an error). docs/reference/stability.md;
       test_frontend_edition, `_2027_fail`, `_unknown_fail`. The `--no-std`
       pipeline records no editions (every file is in the default).
-- [~] ST4. A release every six weeks, on a date, whatever is ready (M).
-      Nov 22 audit: PROCESS/FUTURE — the policy is written
-      (stability.md:101-102) and four dated prereleases exist (v0.7
-      through v0.8.2-unstable), but none demonstrates the cadence (9-week
-      gap, then same-day tags) and release.yml (which would mechanize it)
-      has 0 runs. Cannot be code-done.
-      Done: the policy. Left: the first dated release.
-- [~] ST5. Long-term support releases with security fixes (M).
-      Nov 22 audit: PROCESS/FUTURE — the LTS policy exists
-      (stability.md:103) but no LTS release can exist until releases
-      accumulate; nothing to verify yet.
-      Done: the policy. Left: the first LTS release.
-- [~] ST6. Before each release, build every known public Fides project, as Rust's
-      Nov 22 audit: mostly done — scripts/crater.sh + projects.txt +
-      baseline.txt (saved Nov 17 from the 0.8.0 fid; the "no baseline"
-      Left is stale) + the crater job in release.yml:222-254. Precise
-      gaps: projects.txt holds only this repo's own fixtures (no known
-      external project yet), and release.yml has ZERO runs ever — all
-      four tags were cut without the gate.
-      crater does (L).
-      Done: the rule. Nov 15: the list, `scripts/crater/projects.txt` (local or
-      git source, command, files), and `scripts/crater.sh`, which copies or
-      clones each, runs `ark install` where there is an ark.toml, builds each
-      file (`check`, `run` or `ccompile`) and fails on a file that built with
-      the last release (`scripts/crater/baseline.txt`) and does not now; the
-      `crater` job of `.github/workflows/release.yml` runs it with the new fid.
-      Left: no public project outside this repository is known, so the list
-      holds this repository's examples and tests/projects; the first baseline
-      (`scripts/crater.sh --save` with a release's fid).
+- [>] ST4. A release every six weeks, on a date, whatever is ready (M).: moved to end-roadmap.md (Nov 22 — final-gate work, do when the code stops moving).
+
+- [>] ST5. Long-term support releases with security fixes (M).: moved to end-roadmap.md (Nov 22 — final-gate work, do when the code stops moving).
+
+- [>] ST6. Before each release, build every known public Fides project, as Rust's: moved to end-roadmap.md (Nov 22 — final-gate work, do when the code stops moving).
+
 - [x] ST7. A public process for language changes (S).
       Done: proposals in `docs/proposals/`, the process in `docs/reference/stability.md`.
 - [x] ST8. A security policy, a contact, and published advisories (S).
       Done: `SECURITY.md` (private reporting, response times, advisories).
 - [x] ST9. Release notes that name every breaking change (S).
       Done: the rule in `docs/reference/stability.md` and `CONTRIBUTING.md`.
-- [~] ST10. Signed checksums for every download (S).
-      Nov 22 audit: mostly done — release.yml:278-299 makes SHA256SUMS
-      over installer+tar.gz+docs and attests provenance per file; the
-      root SHA256SUMS is tracked (1fee238) and v0.8.2 carries the asset.
-      Precise gaps: never proven on a real release (release.yml 0 runs;
-      nothing signed to verify), and Authenticode still has no
-      certificate (FIDES_SIGN_PFX).
-      Done: `SHA256SUMS` and a Sigstore build provenance attestation per archive in `release.yml`. Left: proven on a real release.
-      Nov 15 (checked): that release.yml was gone — commit 9f2ba40 (Nov 2)
-      deleted it and build-installer.yml, and it never had an attestation
-      step. A new `.github/workflows/release.yml` builds the installer and the
-      Linux archive, writes `SHA256SUMS` over both and one
-      `actions/attest-build-provenance` attestation per file, and attaches
-      them to a draft release of the tag; `scripts/release-checksums.sh`
-      stays for a local build. Left: proven on a real release; Authenticode
-      signing of the installer needs a certificate (installer/build-installer.sh
-      `FIDES_SIGN_PFX`).
+- [>] ST10. Signed checksums for every download (S).: moved to end-roadmap.md (Nov 22 — final-gate work, do when the code stops moving).
 
-**Acceptance:** two years of releases with no unannounced break.
-
-## Track AD — Real use
-
-Only this produces true production years. It starts now, at small scale.
-
-**Using it ourselves**
 
 - [~] AD1. `ark`, `scribe` and `veil` written in Fides (release N8) (L). The
       Nov 22 audit: mostly done — the "shipped binaries are still Rust"
@@ -4053,13 +3952,8 @@ Only this produces true production years. It starts now, at small scale.
 **Earning users**
 
 - [>] AD12. A public launch once the beta gate is met: moved to external-roadmap.md (Nov 21).
-- [~] AD13. Publish the benchmarks (BM10), and invite corrections (S).
-      Done (Nov 15): `docs/benchmarks.md` (a page of the site): what is
-      measured and how to reproduce it, every result in the repo (Nov 2,
-      Nov 3, a Nov 15 run through C on a busy machine), where Fides loses,
-      and a corrections section pointing to GitHub issues. Left: putting it
-      online (AD2's hosting), a quiet-machine run with native numbers and
-      the spread (BM8), results kept over time (BM10).
+- [>] AD13. Publish the benchmarks (BM10), and invite corrections (S).: moved to end-roadmap.md (Nov 22 — final-gate work, do when the code stops moving).
+
 - [>] AD14. Ten external projects built on Fides: moved to external-roadmap.md (Nov 21).
 - [>] AD15. Ten contributors outside the core: moved to external-roadmap.md (Nov 21).
 - [>] AD16. A first company running Fides in production: moved to external-roadmap.md (Nov 21).
