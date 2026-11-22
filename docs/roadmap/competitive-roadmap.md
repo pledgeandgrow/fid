@@ -122,12 +122,14 @@ Nothing below means anything until this exists.
       HOST/PORT). Verified locally: scripts/service-bench-check.sh PASS
       (selftests agree; fides-c, go and node answered every test right,
       2 s each: plaintext/json/db/queries ~33k/30k/29k/20k req/s for
-      fides-c on a busy Windows machine). Weekly CI step exists
-      (verify-weekly.yml under wrk on Linux) but has no run yet.
-      Left: a recorded run with the client on a separate machine (the
-      harness supports it; none done), a real database server (the
-      documented deviation — the World table is in memory), and native
-      fides on Windows (pe_ir lacks p_signal_check/p_signal_register).
+      fides-c on a busy Windows machine). Separate-machine client
+      verified Nov 22: load.py in WSL drove the Windows fides-c server
+      over TCP — plaintext/json/db/queries
+      17.8k/24.4k/14.9k/15.9k req/s, every reply checked. Weekly CI step
+      exists (verify-weekly.yml under wrk on Linux) but has no run yet.
+      Left: a real database server (the documented deviation — the
+      World table is in memory) and native fides on Windows (pe_ir
+      lacks p_signal_check/p_signal_register).
 - [~] BM6. Compile-speed benchmarks: hello world, 10k, 100k and 1M lines, clean and
       one-line change (M).
       Done (Nov 15): `bench/compile-speed.sh` with `bench/gen_lines.py` (the
@@ -3521,4 +3523,6 @@ These cost money and do not block anything above.
 
 - [>] Paid security audits, toolchain certification, a bug bounty, a foundation,
       full-time staff, conferences: moved to external-roadmap.md (Nov 21).
-- [ ] Dedicated benchmark and fuzzing machines; a laptop and free CI come first.
+- [>] Dedicated benchmark and fuzzing machines: moved to external-roadmap.md
+      (Nov 22); provisioning requires funded, dedicated runners outside this
+      code-only work.

@@ -558,6 +558,21 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       (argument register 6; fine with `FID_NAT_OFF=argfree`), and the
       reload comparison shows 0 vs 0. Left: that failure (RA3/RA7), a
       measured gain, floats and RA7's hints on segments.
+      Nov 22 float plan (moderate, well-scoped): ng_float_assign
+      (nat_ir.fd:18001) is a hull-based scan — it takes no segs parameter at
+      all; segments already exist for float vregs (ng_class_segs computes
+      them for every vreg, and :15205–15222 removes float ranges from the
+      integer scan by setting lo = −1, keeping only the start in `flo`).
+      Work: pass segs + class into ng_float_assign, replace hull expiry and
+      interference with ng_seg_free / ng_seg_hits, and replace its
+      call-crossing test with a per-segment legality check against the FLOAT
+      pools (ng_float_pool, ng_float_callee_pool, mask ng_float_mask) — not
+      ng_reg_ok + the integer IPRA masks. Float spills currently have no
+      second chance at all (ng_alloc_holes runs before ng_float_assign);
+      add a float holes round after it. RA7/RA3 keep treating float argument
+      registers separately (they already take rcls). FID_VERIFY's checker
+      must validate float assignments per segment, not per hull. Extend
+      tests/nattools/seg_unit.fd — it covers the integer scan only.
 - [x] RA3. All registers, caller-saved included: a value live across a call goes
       to a callee-saved register or is split around the call (L).
       Caller-saved registers for ranges no clobbering call crosses (AArch64
@@ -1925,6 +1940,22 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       though the in-process harness removes it) and range-dom-check fails 5
       (sieve keeps 4 overflow checks, filled_scale none, rangedom off
       changes nothing for inner_sq/sq_big). Left: those, SUITE=1.
+      Nov 22 root-cause audit of the 4 sieve checks: (1) parameter ranges
+      (LF10) are the missing bound — with n ∈ [1000,10000] from the two call
+      sites peir_square_local fires (it needs n's high bound finite:
+      `nh < PEIR_I64_MAX`), giving p ∈ [−100,100] in the body, which covers
+      both muls (corner products fit), p+1 and m+p; that is exactly LF10's
+      pending default flip. (2) The condition mul `p * p < n` is computed in
+      the header block BEFORE the branch, so a forward edge fact can never
+      apply to it — peir_lf_update's picker only picks locals the body
+      stores, never seeds from the loop's own condition; deriving p's bound
+      from the condition via peir_square_local at header entry removes it.
+      (3) `m < n` is a relational fact over the back edge — the large one
+      (a relation domain; today only expressible as an interval when n is
+      bounded). The inner_sq/sq_big "rangedom off changes nothing" lines are
+      range_set_main.fd's own in-process harness cases — the dominator-fact
+      wiring itself may have regressed in the self-hosted build; check that
+      first.
 - [x] LF9. Ranges from conditions: inside `if i < n`, `i < n` is a fact (M).
       Holds in blocks with that branch as their only way in, and through
       jumps from them (`peir_range_refine`); since Nov 15 also through
@@ -1999,6 +2030,22 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       rule (test_stack_str_int.fd: INT64_MIN, INT64_MAX, concat, lengths
       on run; `--leaks` needs a self-hosted-lineage binary). Left: the
       data-dependent and unbounded producers, Vec::new()+push buffers.
+      Nov 22 producer audit (the full producer list is lower.fd:22396; the
+      pattern match at :24117 covers exactly p_str_concat and p_to_str):
+      bounded/easy — p_char_to_str (≤4 bytes), p_bool_to_str /
+      p_to_str_bool ("true"/"false"): constant-size results, need only a
+      Char_to_str_into / Bool_to_str_into core entry point (the
+      Int_to_str_into shape) and two names at the match. Data-dependent
+      (medium) — p_float_to_str / p_to_str_float: up to ~330 chars, need
+      Float_to_str_into(env, area, cap, x) with a cap policy and the
+      Str_concat_into-style heap fallback. Unbounded (hard) — p_to_str_vec,
+      p_to_str_map, p_str_join_n, p_sb_to_str, the json/tensor/simd dumpers:
+      output length is a runtime function of a whole data structure; a
+      512-byte frame area defeats the budget rationale, so a two-phase
+      render-length-then-render core API is the way. Vec::new()+push stack
+      buffers need a static push-count bound (counted-loop facts LF7/LF8
+      feeding the escape pass) or a core Vec_init_stackbuf that promotes to
+      heap on push overflow — that entry point does not exist today.
 - [~] LF14. Scalar replacement of a non-escaping `Vec` of known small length (M).
       Nov 16: built and tested (test_midend_vec_sroa.fd, `fid run` and
       `fid emit` with FID_IROPT_ON=vecsroa and without): iropt.fd `iro_vec_sroa` (run by
@@ -2249,6 +2296,25 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       one-function edit nothing is reused (0 hits, 240 compiled). Left:
       reuse after an edit, hit == miss.
       Nov 21 (c082ee6): nc_skel_fn replays the recording's register asks first (2g.82, fncache_hit_order_check.sh).
+      Nov 22 root-cause audit: hit ≠ miss is neither registers nor relocation
+      kind — it is image layout driven by label allocation order. (1) The
+      recorded log (nc_log) covers only F:/S:/G:/N: asks during ng_gen_function;
+      labels made at emission time — internal block labels (NatEnc_label) and
+      panic-line stubs (ng_panic_label, key "which:line") — are re-created by
+      nc_replay in ng_mir_finish's postorder, not interleaved as in a fresh
+      build, so anything ordered by label creation (panic stubs g.pl_list,
+      strings g.strs, globals g.globs, named_fns) comes out reordered and every
+      fixup in replayed bytes resolves to different offsets. Fix: extend the
+      log to emission-time label asks, or make emission-time labels
+      identity-keyed like P: already is. (2) Edit-reuse 0/240: nc_give_up_callers
+      drops the entry and every caller that recorded *anything* (trigger
+      `dep_masks >= 0` — true for essentially every call edge) instead of
+      comparing the recompiled callee's new mask against the recorded one
+      before dropping; nc_masks_hold already computes that comparison at
+      replay. (3) MI28 tail-call summaries are order-dependent (native-fncache
+      §88–95): a hit caller can get a call where a fresh build emitted a jump;
+      needs a deterministic summary ask order. All local changes, none alter
+      codegen semantics.
 - [~] SP7. Incremental relinking in memory: unchanged functions keep their bytes,
       only relocations are redone (M).
       On an FID_FNCACHE hit a function's bytes are replayed at the new
@@ -2289,6 +2355,27 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       same over 10 runs, lex_par_bench 1013 ms on 1 thread to 255 ms on 8
       (same tokens), imports_par_check ok. Left: parsing, type check and
       escape per module in parallel.
+      Nov 22 blocker audit. Parser: 15 g_* globals are written during a parse
+      and would race (g_import_set, g_qualified_calls, g_at_imports,
+      g_turbofish_types, g_pd_sequential_vars — the last two accumulate across
+      ALL parses and are read later by mono.fd/lower.fd); worse, module N's
+      parse consumes the accumulated struct/enum name sets of modules 1..N-1
+      (cached_parse's struct_names/enum_names, with a deferral scheme), which
+      is the real cross-module data dependency. Typecheck: one TypeChecker
+      instance accumulates every module's symbol tables (register_program is
+      the shared-table writer; bodies mostly read), plus 35 module globals
+      written while checking (g_tc_program_module, g_tc_program_copy, the
+      generic-call memo g_tc_gc_*, spec sets, comptime depth — the comptime
+      evaluator runs the interpreter mid-check). The pattern to copy already
+      exists: escape.fd's parallel reporting pass (esc_par_copy, per-worker
+      checker copies, globals set before spawn / reset after await). Plan:
+      (1) move the g_pd_* scratch into Parser, make turbofish/sequential vars
+      per-program mergeable Vecs; (2) parse level-by-level over modgraph_levels
+      (already computed), seeding name sets from a token-level pre-scan
+      (extend token_use_paths to type names) instead of parse order;
+      (3) typecheck = sequential registration then parallel body-checking with
+      per-worker memo/spec sets merged deterministically. Parse-level
+      parallelism is moderate; typecheck is the hard one.
 - [~] SP10. No linear scans anywhere in the compiler: every lookup by name or id is
       a table (release CS8) (M).
       Competitive CS8: instructions, functions, strings, structs, methods,

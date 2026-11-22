@@ -889,7 +889,7 @@ Depends on B, C, H5 and J.
       Bodies are text: a zero byte ends them. `http_serve_scoped` keeps memory
       flat, on the promise that a handler keeps no request string.
 - [x] I5. `examples/http_server` runs on a native build (S).
-- [ ] I6. A sample service survives a 24-hour load test (M). A short run:
+- [~] I6. A sample service survives a 24-hour load test (M). A short run:
       160,000 requests stay at 5.2 MB with `http_serve_scoped`. The harness
       exists: `scripts/verify/soak.py` (--duration 86400) samples memory and
       heartbeats of `tests/verify/soak_service.fd`, an in-process request
@@ -898,9 +898,10 @@ Depends on B, C, H5 and J.
       per-request leak on kept-alive connections is fixed
       (docs/verification/soak-http-leak.md), and a 30-minute socket soak
       passed flat: 10.1 million requests, 0 failed, 6.0 MB, slope -0.04
-      MB/hour. The 24-hour run was started Nov 17 16:46 into
-      build/soak-http-24h/. Left: its result, and a rerun with the release
-      compiler of this tree.
+      MB/hour. Nov 22 audit: the recorded `build/soak-http-24h/` result
+      directory is absent, so there is no 24-hour result to verify. Left:
+      a 24-hour run and a rerun with the release compiler of this tree.
+      Keep partial.
 - [x] I7. TLS 1.3 on Windows: Schannel needs its newer credentials structure
       (SCH_CRED + TLS_PARAMETERS); the SP_PROT_TLS1_3 bit in SCHANNEL_CRED
       fails the handshake (S). Done: `tls_client13`/`tls_connect13`/
