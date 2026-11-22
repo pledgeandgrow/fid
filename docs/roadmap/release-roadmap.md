@@ -376,6 +376,20 @@ the fastest build-to-native among compiled languages, and native code within
       0.28 s. Left: the 0.5 s target (the lowered stdlib is not cached); a
       RELEASE=1 build (the `src-` cache key); cross-test x86_64-windows and
       x86_64-linux against FID_PE_PRUNE=0.
+      Nov 22: the lowered-IR cache was built out and measured, and stays
+      OFF by default. Best of 5 (loaded machine, -O2 fid, `emit --nat`):
+      plain hello 3403 ms warm vs 3321 no-cache, a `use vec` hello 3433 vs
+      3373 — replaying a lowered IrFunction costs about what lowering it
+      does (both build the same Vec/Inst objects), and the declaration
+      salt, the per-function AST keys and the rewrite of core's 11.4 MB IR
+      eat the rest. Landed while measuring: FID_IRCACHE=off/0/no/none/
+      false really turn it off (they were read as file paths),
+      FID_IRCACHE=auto picks <TEMP>/fid-irc[p]-<hash>.bin with pruned
+      (emit) and full (run/dump-c/ccompile) builds in separate files, a
+      per-entry check word (format ver 3) stops a torn or damaged file
+      from replaying silently wrong IR, FID_IRCACHE_STATS=1 counts
+      (tests/tooling/ircache-check.sh gates it). The 0.5 s target needs a
+      cheaper artifact than lowered IR, or a faster lower().
 - [x] D11. Per-call cost on the C path (M). Functions no longer push and pop a
       call-stack array: panic traces walk the machine stack (unwind tables on
       Windows, `_Unwind_Backtrace` elsewhere; `zig cc` off Windows links

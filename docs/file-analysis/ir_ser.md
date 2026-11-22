@@ -10,9 +10,22 @@
   `ir_irfunc`, `iw_irtype`, `ir_irtype`) over the `AwBuf`/`ArBuf` byte
   buffers of ast_ser.fd. Instructions name functions, strings and globals
   by name, so a replayed function needs no fixups. On it:
-  1. **Lowered-IR cache** (competitive-roadmap CS4, `irc_*`,
-     `FID_IRCACHE=<file>`): per function, keyed by a hash of its AST
-     (`aw_func`); `fid serve` keeps it in memory (`FID_SERVE_IRCACHE=1`).
+  1. **Lowered-IR cache** (CS4; D9, `irc_*`): per function, keyed by a
+     hash of its AST (`aw_func`), salted by every declaration of the
+     program; a finish rewrites the file with only what the build used.
+     OFF by default — measured Nov 22 (D9): replaying a lowered
+     IrFunction costs about what lowering it does, so a warm hit saves
+     nothing (hello 82 ms slower warm, best of 5; core's IR alone is
+     11.4 MB). Opt-in: `FID_IRCACHE=<file>`, or `FID_IRCACHE=auto` for
+     `<TEMP>/fid-irc-<hash>.bin` (full builds: run/dump-c/ccompile) and
+     `<TEMP>/fid-ircp-<hash>.bin` (`fid emit`'s pruned builds, reach.fd)
+     — separate, so the two modes do not thrash each other's entries.
+     `FID_IRCACHE=off` (0, no, none, false), `FIDES_NO_CACHE=1` and
+     `--no-cache` turn it off; `FID_IRCACHE_STATS=1` counts (stderr).
+     Ver 3: a check word per entry (hash ^ key), so a torn or damaged
+     file stops loading at the first bad entry instead of replaying
+     silently wrong IR. `fid serve` keeps it in memory
+     (`FID_SERVE_IRCACHE=1`). Gate: tests/tooling/ircache-check.sh.
   2. **Mid-end memo** (CS1, `mec_*`, `FID_MECACHE`): what the rules
      (rules.fd) and the e-graph (egraph.fd) changed in a function, keyed
      by the function's content hash, the run's switches, the callees'
@@ -51,7 +64,8 @@
 
 ## Checks
 
-tests/tooling/mecache-check.sh, tests/tooling/irocache-check.sh.
+tests/tooling/mecache-check.sh, tests/tooling/irocache-check.sh,
+tests/tooling/ircache-check.sh.
 
 ## Findings
 
