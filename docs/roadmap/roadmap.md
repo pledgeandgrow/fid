@@ -471,7 +471,11 @@ budget tracking, and tensor parallelism (simulated multi-rank) all work.
   path, which hit ud2 after ExitProcess); the C path already worked.
   Needs the rebuilt binary to validate. Left: --nat (crashes with a null
   pointer at 0x1c, a different bug).
-  Nov 22: the C/WSL path works (tests/tp/check.sh passes); pe_ir crashes at pert_tp_exit. Native multi-rank is the left item.
+  The Nov 22 PE failure above predates the `pert_tp_exit` source fix. A
+  rerun with `release/fid-dev.exe` (built at 00:29, before the 01:55 runtime
+  change) still shows `Illegal instruction`, so it does not validate or
+  falsify the fix; rebuild and rerun `TP_TARGET=native`. The `--nat` null
+  pointer and ARM64/RISC-V target runs remain open.
   Leftover (Nov 15): still identity in `fid` (`compiler/interp.fd` and the C runtime's `p_all_reduce` in `compiler/codegen_c.fd`); no newer roadmap tracks it.
   Nov 21 check (fid built from the self-hosted stage 0 at 86cc919): partly — multi-rank TP on the native runtimes (stdlib/pe_runtime/tensor.fd: pert_tp_init, collectives through rank 0, send/recv, pert_tp_exit): `tests/tp/check.sh` passes through C and with TP_TARGET=x86_64-linux (WSL). Left: native Windows (pe_ir) multi-rank programs print their results and then end with 'Panic: Illegal instruction' (3 of the 5 tp checks fail, as does a 3-line program calling p_tp_init(2)), apparently in the new pert_tp_exit entry-point path (pe_ir_stubs.fd ~8379); aarch64 and riscv64 not run.
 
@@ -693,20 +697,24 @@ shaders remaining.
   @grid-safe function with a blocking call is rejected with the right
   error; clean @grid-safe code passes and runs. The roadmap note was
   stale from Nov 15.
-  Nov 22: scada.fd (Modbus RTU/TCP) checks and test_lib_scada passes; @grid-safe (F59) is not implemented.
-  — Modbus RTU/TCP in `stdlib/scada.fd` (`test_lib_scada`). Leftover (Nov 15): `@grid-safe` (F59) is not implemented.
+  Nov 22 validation (`release/fid-dev.exe`): `test_grid_safe`, all four
+  negative allocation/blocking/dispatch/helper tests, `test_lib_grid`,
+  `test_lib_scada`, and native-PE `test_std_microgrid` pass. The microgrid
+  interpreter run exceeded its timeout, so the native result was used.
 - [x] Serverless — `@serverless`, cold-start optimization
   Nov 22: validated — @serverless IS implemented (typechecker.fd
   TypeChecker_verify_serverless: the handler and everything it reaches
   writes no module global, starts no task, reads no code-running global
   initializer — with the full explanation in each error). A handler that
   writes a global is rejected; clean handlers pass and run. The --entry
-  build flag works (emit/ccompile); cold start is measured. The roadmap
-  note was stale from Nov 15.
-  Nov 22: --entry works (emit/ccompile run a handler from argv/stdin); the F32 @serverless annotation is the left item.
-  Leftover (Nov 15): `@serverless` (F32) is not implemented. Small native binaries with no runtime start-up exist already (complaint CP7, CP8).
-  Nov 17: the build side exists: `--entry <handler>` builds a function as the program's entry (`compiler/main.fd` `entry_wrap_source`); cold start is measured by `bench/coldstart.sh` (docs/perf/serverless-coldstart.md). Left: the `@serverless` annotation (F32).
-  Nov 21 check (fid built from the self-hosted stage 0 at 86cc919): partly — `--entry` works: `emit --entry` runs the handler from argv and stdin ('200 /hello 11', '404 /missing 0'), `ccompile --entry` too, and bad handlers (unknown, main, two parameters) are refused; `tests/tooling/serverless-entry-check.sh` passes all but 2 checks. Left: those 2 (the disasm reach checks look for route, main_only_report and handle_request, which are inlined, also with FID_IROPT_OFF=inline: the fixture needs functions that stay out of line); `bench/coldstart.sh` on a quiet machine; the `@serverless` annotation (F32).
+  build flag works (emit/ccompile); the actual quiet-machine cold-start
+  measurement is still pending.
+  Nov 22 validation (`release/fid-dev.exe`): positive handler tests and
+  global-write/task/global-initializer rejection tests pass. After fixing
+  Git Bash temp-path conversion, argv/stdin execution, C compilation, and
+  handler argument validation pass. Two disassembly name checks still fail
+  because the fixture functions are inlined; `docs/perf/serverless-coldstart.md`
+  still calls for real Windows and Linux measurements. Keep partial.
 
 #### What's Left
 **Most of Phase 9.** The safety annotations and a partial banking stdlib are
@@ -8295,14 +8303,12 @@ Fides's effect system is the foundation — effect handlers can replace async/aw
 - [x] Web-based Fides IDE (run in browser) — fides-lang.org/playground, a WASI build of the compiler in a worker (competitive TL8).
 - [x] Edit, compile (to WASM), run, share — TL8 (run, tokens, AST, IR, effects). Sharing links: not checked here.
 - [x] Embeddable (like Rust Playground)
-  Nov 22: validated — the playground exists at fides-lang.org/playground
-  (TL8 [x]: the real compiler as a WASI WebAssembly build in a module
-  worker, run/tokens/AST/IR/effects modes, 15 s timeouts, stdlib
-  virtualized into the WASI fs). The WASM path builds and runs on this
-  machine (fid emit --target wasm32-wasi).
-  Nov 22: the WASM path (fid wasm) validates and runs; the playground needs a browser build of the compiler.
-  Nov 22: `docs/playground/embed.js` and `embed.html` pass `node scripts/playground-embed-check.mjs` with the WASM assets. Still not deployed: these files are absent from the website's `public/playground/`, and the cross-origin hosting/CORS step remains.
-  Nov 22 rerun: `node scripts/playground-embed-check.mjs` passes all embed presets, inspection modes, share-link handling, and page wiring against the available WASM assets. Deployment and cross-origin iframe validation remain open; keep partial.
+  Nov 22: the local implementation passes `node
+  scripts/playground-embed-check.mjs` with the available WASM assets,
+  including presets, inspection modes, share links, and page wiring. The
+  website's `public/playground/` still lacks `embed.html` and `embed.js`;
+  DNS also prevented a live-site check here. Deployment and cross-origin
+  iframe validation remain open.
 - [>] Links from documentation and book — competitive AD6 (book), TL11 (docs).
 - [-] **Already built:** WASM backend (Phase 5D)
 - [-] **Not redoing:** WASM backend — building playground on top
