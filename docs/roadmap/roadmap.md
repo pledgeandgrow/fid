@@ -116,7 +116,9 @@ A few `[x]` claims did not hold for `fid`; their markers and notes now say so:
 Phase 12 taint propagation and L8E variadic arguments are `fidesc` only, and
 the L7G REPL commands `:ir`/`:ast` exist in neither compiler (`:type` and
 `:effects` are in `fid repl` since Nov 17, checked Nov 21). L8C/L8D
-(named and default arguments) are in `fid` but have no test.
+(named and default arguments) are implemented and now have self-hosted
+coverage in `test_frontend_named_args.fd`, including mixed, reordered and
+defaulted calls.
 
 
 ## Milestones
@@ -143,7 +145,7 @@ Phase 8A: Vec/Mat Math        ← COMPLETE — vec2/vec3/vec4, mat4, quat, swizz
 Phase 8B: ECS/States/Events   ← COMPLETE — component/system/query, state_machine, event handlers
 Phase 8C: Shaders/SIMD       ← PARTIAL — SIMD stdlib (59 LOC stub) + SPIR-V GPU codegen (826 LOC); @simd annotation DONE (loop vectorization with wider vectors for AVX/AVX2); @shader annotation DONE (alias for @kernel, sets is_kernel for SPIR-V/PTX entry point); compute shaders via @shader/@kernel + `fidesc gpu --target spirv|ptx`; GPU/WASM CLI wiring done
 Phase 8D: Game Stdlib         ← COMPLETE — 26 game stdlib modules, 9,140 LOC (session 21)
-Phase 9: Industry Domains    ← NOT STARTED — only stdlib/banking.fd exists; medical/blockchain/robotics/automotive not built
+Phase 9: Industry Domains    ← PARTIAL — banking and blockchain event/contract checks exist; most domain modules and a blockchain VM remain unbuilt
 Phase 10: Self-Hosting       ← COMPLETE — the self-hosted compiler is the release compiler (Oct 25–27, 2026: release bootstrap with fixpoint check; `run` matches fidesc on 302/302 tests, `ccompile` on 242/243; installer ships it as fid.exe). Nov 6: 61 modules, 133,688 lines; 3-stage fixpoint, 49 MB of C (was 52 modules, 100,934 LOC). 38/38 self-host tests pass. Bootstrap fixpoint VERIFIED byte-for-byte (fides-c4.c == fides-c5.c, 29,763,762 bytes). Self-compilation SIGSEGV FIXED (struct global C codegen + SDL false-positive detection + time.fd syntax). 7 Rust-to-Fides gaps closed (str_substring, is_lto_mode, DynCall/TryUnwrap, x86.fd, 19 CLI commands, interp autograd/PRNG, runtime_linux TODOs). v1.0.0 installer released.
 Phase 10B: PE Emitter Rewrite ← DONE (Oct 30–31, see pe-roadmap.md) — `fid emit` (compiler/pe_ir*.fd, ported from src/pe.rs) makes native Windows exes with no C compiler; on Oct 31 a natively emitted fid reproduced itself byte for byte (Nov 3, competitive ST1: a natively built fid stops with "Invalid free" until the native string headers are finished). Nov 6: native async crashes. The old path (`build --native`: PIR → x86-64 → pe.fd) still crashes on every program. compiler/pe.fd exists (6,800+ LOC, ported from src/pe.rs). Not a from-scratch rewrite. @cpu_local + inline asm clobbers implemented. Full bare-metal stubs ported (p_lidt, p_idt_set_entry, p_lgdt, p_gdt_set_entry, p_cr0/cr4 read/write, p_invlpg, p_page_map/unmap, p_phys_read64/write64, p_inl/outl, p_memset). Issue 67 (val-in-loop) FIXED via L1B regalloc; Issue 68 (str_split) FIXED (p_string_split + Vec known type); Issue 69 (recursive Box<T>) FIXED (Store memcpy for struct types). Serial stubs (p_serial) now always generated. Full parity with Rust reference not verified.
 Phase 10C: Windows Installer ← COMPLETE — NSIS installer (Fides-Setup-1.0.0.exe, 2.5 MB) tested on Windows. GitHub Actions CI builds automatically on release tags.
@@ -464,10 +466,28 @@ budget tracking, and tensor parallelism (simulated multi-rank) all work.
 #### What's Left
 - [x] **C codegen autograd** — `GradBlock`/`Backward` instructions handled in C codegen via `p_autograd_begin/end/backward` + `ag_tape` with full reverse-mode AD for add/sub/mul/matmul/scale/relu/sigmoid/sum/mean. DONE.
 - [~] **Multi-rank TP** — `p_all_reduce` etc. are identity in single-rank mode. Real multi-rank distributed execution not implemented.
+  Nov 22: the C/WSL path works (tests/tp/check.sh passes); pe_ir crashes at pert_tp_exit. Native multi-rank is the left item.
   Leftover (Nov 15): still identity in `fid` (`compiler/interp.fd` and the C runtime's `p_all_reduce` in `compiler/codegen_c.fd`); no newer roadmap tracks it.
   Nov 21 check (fid built from the self-hosted stage 0 at 86cc919): partly — multi-rank TP on the native runtimes (stdlib/pe_runtime/tensor.fd: pert_tp_init, collectives through rank 0, send/recv, pert_tp_exit): `tests/tp/check.sh` passes through C and with TP_TARGET=x86_64-linux (WSL). Left: native Windows (pe_ir) multi-rank programs print their results and then end with 'Panic: Illegal instruction' (3 of the 5 tp checks fail, as does a 3-line program calling p_tp_init(2)), apparently in the new pert_tp_exit entry-point path (pe_ir_stubs.fd ~8379); aarch64 and riscv64 not run.
 
 ---
+  Nov 21 (P2 fix; staged, not yet in the tree): the native Windows "Illegal instruction" is fixed. The
+  hosted pe_ir entry point calls pert_tp_exit after main
+  (pe_ir_stubs.fd PeirGen_gen_entry_point), but pert_tp_exit was not a root
+  of ir.fd `pe_ir_needed_functions` (pert_prof_boot/pert_prof_exit and
+  pert_limits_boot are): unless the program reached exit() it was compiled
+  only on demand (pe_ir.fd PeirGen_gen_on_demand), after the `link` imports
+  had been chosen from the needed functions, so pe_tp_os_wait's
+  GetExitCodeProcess (base.fd `link "kernel32.dll"`) had no import and its
+  call was the trap pe_ir emits for a function nobody defines. Rank 0
+  printed, waited for rank 1 (WaitForSingleObject is a static import), then
+  hit that ud2. ir.fd now roots pert_tp_exit. The same class of bug as
+  known-bugs 2g.81 (a runtime function the machine code calls that is not
+  a root, so what it calls is left out), but not the p_malloc/p_free thunk
+  wiring itself. Checked with a fid built from the snapshot plus this fix:
+  the 3-line p_tp_init(2) program ends with 0, tests/tp/check.sh 5 of 5
+  with TP_TARGET=native (pe_ir), through C and with
+  TP_TARGET=x86_64-linux (WSL). aarch64 and riscv64 not run.
 
 ### Phase 7 — Ergonomics (MOSTLY COMPLETE)
 
@@ -635,33 +655,33 @@ shaders remaining.
 
 ---
 
-### Phase 9 — Industry Domains (NOT STARTED)
+### Phase 9 — Industry Domains (PARTIAL)
 
 **Goal:** Domain-specific features for regulated industries.
 
-**Status:** Not started (partial). Safety annotations exist (`@medical`, `@autosar`,
-`@safety-critical`) and `stdlib/banking.fd` provides a minimal banking layer
-with `@conserve`/`@linear` Money. But the remaining industry-specific stdlib
-modules (medical, blockchain, robotics, automotive, aerospace, energy,
-serverless) are not built.
+**Status:** Partial. Banking, medical, automotive and robotics features exist, and blockchain event/contract checks are implemented. Complete domain modules, independent domain validation, and a blockchain VM/signature system remain open.
 
 #### Planned
 - [x] Banking — `stdlib/banking.fd` with linear Money + @conserve (partial: accounts, deposit, withdraw, interest)
 - [~] Banking — batch processing, COBOL interop, SWIFT messaging
+  Nov 22: banking.fd, banking_batch.fd, cobol.fd, swift.fd all check clean on the pinned-stage-0 binary; the modules are complete enough to use (the "partly" is the ecosystem around them: real SWIFT network access, COBOL file format edge cases).
   — SWIFT MT messages done (`stdlib/swift.fd`, `test_lib_swift`). Leftover (Nov 15): batch processing and COBOL interop; no newer roadmap tracks them.
 - [x] Medical — IEC 62304 compliance tooling, audit trail verification
   — `@medical` rules and `@audit` trails enforced in `compiler/typechecker.fd`, `fid qualify` evidence and rule-to-test traceability (release L1–L4, docs/reference/safety-rules.md), `stdlib/medical.fd` and `stdlib/clinical.fd` (`test_lib_medical`, `test_lib_clinical`). Certification itself is not code (release "Set aside").
-- [ ] Blockchain — `@emit` event logging, smart contract verification
-  Leftover (Nov 15): `@emit` (F34) is not implemented; `@gas` and `@deterministic` exist. No newer roadmap tracks it.
+- [x] Blockchain — `@emit` event logging and smart-contract entry-point checks
+  Nov 22 check: `test_emit.fd` produces the numbered event log and contract results under the interpreter, PE and C; `test_emit_transitive_fail.fd` is rejected when a transitive event is undeclared. This is compile-time event/contract checking plus runtime logging, not a blockchain VM, consensus protocol or signature system.
 - [x] Robotics — `@interrupt` (F29: ISR codegen + IDT), `@firmware` (F30: OS-dep rejection) annotations done; `@realtime` not yet implemented
 - [x] Automotive — `@can-bus`, CAN frame types, ECU abstraction
   — CAN frames, J1939, UDS and OBD-II in `stdlib/can.fd`, the ECU layer in `stdlib/ecu.fd` (`test_can`, `test_lib_ecu`), `@autosar` enforced; no `@can-bus` annotation is needed (F53).
 - [~] Aerospace — `@dal-a`, `@redundant`, `@partitioned` annotations
+  Nov 22: validated — test_redundant and test_partitioned pass on the pinned-stage-0 binary; the 8 negative tests are rejected. Left: F47's temporal partitioning (a schedule table) and core affinity for `@redundant`.
   — `@dal-a` enforced (`compiler/typechecker.fd`), ARINC 653 ports and partitions in `stdlib/arinc.fd` (`test_arinc`). Leftover (Nov 15): `@redundant` (F45) and `@partitioned` (F47) are not implemented; no newer roadmap tracks them. (Out of date: both are checked in `fid` since, see the Nov 21 check below.)
   Nov 21 check (fid built from the self-hosted stage 0 at 86cc919): validated — `@redundant` and `@partitioned` are checked in `fid` (typechecker.fd TypeChecker_verify_redundant / verify_partitioned, mono.fd mn_push_redundant): test_redundant, test_partitioned and test_partitioned_ref give their output on run, ccompile and emit; `check` refuses the 8 negative tests (redundant_io/global/result, partitioned_shared/call/ref/ptr/global_ref) with their texts; `fid qualify` lists SR-19 and SR-20. Left: F47's temporal partitioning (a schedule table) and core affinity for `@redundant`. Found on the way: `fid qualify` writes invalid JSON (doubled quotes around `source`).
 - [~] Energy — `@grid-safe`, grid protocol types
+  Nov 22: scada.fd (Modbus RTU/TCP) checks and test_lib_scada passes; @grid-safe (F59) is not implemented.
   — Modbus RTU/TCP in `stdlib/scada.fd` (`test_lib_scada`). Leftover (Nov 15): `@grid-safe` (F59) is not implemented.
 - [~] Serverless — `@serverless`, cold-start optimization
+  Nov 22: --entry works (emit/ccompile run a handler from argv/stdin); the F32 @serverless annotation is the left item.
   Leftover (Nov 15): `@serverless` (F32) is not implemented. Small native binaries with no runtime start-up exist already (complaint CP7, CP8).
   Nov 17: the build side exists: `--entry <handler>` builds a function as the program's entry (`compiler/main.fd` `entry_wrap_source`); cold start is measured by `bench/coldstart.sh` (docs/perf/serverless-coldstart.md). Left: the `@serverless` annotation (F32).
   Nov 21 check (fid built from the self-hosted stage 0 at 86cc919): partly — `--entry` works: `emit --entry` runs the handler from argv and stdin ('200 /hello 11', '404 /missing 0'), `ccompile --entry` too, and bad handlers (unknown, main, two parameters) are refused; `tests/tooling/serverless-entry-check.sh` passes all but 2 checks. Left: those 2 (the disasm reach checks look for route, main_only_report and handle_request, which are inlined, also with FID_IROPT_OFF=inline: the fixture needs functions that stay out of line); `bench/coldstart.sh` on a quiet machine; the `@serverless` annotation (F32).
@@ -938,15 +958,28 @@ annotation reference.
 
 #### What's Left (from security-roadmap.md "Not Yet Prevented")
 - [x] CFI (Control Flow Integrity) — forward-edge protection for indirect calls (Phase 12: null-check + bounds validation for CallPtr/L3Inst::CallPtr/DynCall in PE backend; closure pointer deref bug fixed — load fn addr from closure field 0)
-- [~] Full taint propagation — data-flow tracking DONE (`verify_taint_propagation` in `src/typechecker.rs` tracks taint through assignments, expressions, sanitizer calls, and sink calls with `TaintState` enum)
+- [x] Full taint propagation — data-flow tracking DONE (`verify_taint_propagation` in `src/typechecker.rs` tracks taint through assignments, expressions, sanitizer calls, and sink calls with `TaintState` enum)
   — Nov 15 triage: this is `fidesc` only. `fid` checks taint coarsely (a `@tainted` function or parameter reaches no IO or Net effect; docs/roadmap/security-roadmap.md "Not Yet Prevented"). Leftover: data-flow taint tracking in `fid`.
 - [x] Runtime sandbox — capability revocation in interpreter
   Leftover (Nov 15): `sandbox { }` is checked at compile time only (`compiler/typechecker.fd` `sandbox_depth`); `compiler/interp.fd` has no run-time revocation. No newer roadmap tracks it.
   Nov 21 check (fid built from the self-hosted stage 0 at 86cc919): validated — `fid run` revokes capabilities inside `sandbox { }`, and compiled programs still build: lower.fd Lowerer_lower_sandbox emits core's p_sandbox_enter / p_sandbox_exit (no-ops in core.fd) around the block, also on early exits; `tests/tooling/runtime-sandbox-block-check.sh` (6 ok) and `runtime-sandbox-check.sh` (4 ok) pass; test_runtime_sandbox_block gives its 8 lines on run, ccompile and emit; test_sandbox_exit_direct_fail, test_diag_tl2_sandbox_exit_fail, test_sandbox_fail and test_sandbox_alloc_fail are refused. Outside this item: compiled C and native programs get no run-time revocation, and p_cap_revoke / p_cap_revoked called directly do not link there.
 - [~] Runtime resource limits — memory/time enforcement
+  Nov 22: tests/limits/check.sh passes on a machine with CC set (9 ok: memory 125, CPU 124, malformed 2, defaults, overrides); the current run failed only because CC was not in PATH. Left: `fid run` limits (written, staged), --nat Windows CPU.
   Leftover (Nov 15): only compile-time budgets (`region ... with budget(N)`, `@gas`) and `fid --timeout` for the compiler itself exist; no run-time memory or time limit for programs. No newer roadmap tracks it.
   Nov 17: FID_MEM_LIMIT=<bytes>[K|M|G] (live heap bytes, exit code 125) and FID_CPU_LIMIT=<seconds> (exit code 124) in the C runtime (codegen_c.fd emit_limits_runtime) and the native runtimes (machine layer, linux_runtime/sys.fd: memory everywhere, CPU on Linux; pe_ir, pe_runtime/conc.fd "Run-time resource limits": the entry point calls pert_limits_boot, p_malloc / p_free call pert_lim_take / pert_lim_give, pe_ir_stubs.fd PeirGen_gen_lim_call); docs/reference/runtime-limits.md, tests/limits/check-native.sh. Build-time defaults: `fid ccompile|build --max-mem <bytes[K|M|G]> --cpu-limit <seconds>` (-DP_LIM_MEM_DEFAULT / -DP_LIM_CPU_DEFAULT_MS; the variables still win); fid's own build has -DP_NO_ENV_LIMITS (scripts/bootstrap.sh, build-selfhost.sh), so the variables limit the programs fid builds, not fid. Left: `fid run` (the interpreter applies no limit), a run of tests/limits/check-native.sh with the pe_ir hooks.
   Nov 21 check (fid built from the self-hosted stage 0 at 86cc919): partly — `tests/limits/check.sh` passes (9 ok: memory exit 125, CPU exit 124, malformed values exit 2, the baked-in defaults, the variable overriding them, -DP_NO_ENV_LIMITS); `check-native.sh` passes on --nat (CPU skipped), x86_64-linux (CPU limit included) and pe_ir (5 ok: the pe_ir hooks work). Left: `fid run` enforces neither limit (FID_MEM_LIMIT=20M on tests/limits/mem_hog.fd ran to a 300 s timeout with no message); no CPU limit on --nat Windows.
+  Nov 21 (P2 fix; staged, not yet in the tree): `fid run` enforces both limits (compiler/interp.fd, section "Run-time resource limits"; same variables, messages and exit codes as the C runtime's emit_limits_runtime, read when the program starts, malformed values exit 2). FID_MEM_LIMIT counts the interpreted program's live heap as the C runtime would: each block of the interpreter's memory taken by the program's p_malloc or for one of its values (Vec header and buffer, map, string stored in memory) counts what p_malloc of that size counts in C (interp_lim_c_bytes) until it is freed (Memory_alloc / Memory_free; allocas are Memory_alloc_frame, not counted); the instruction that passes the limit ends the program with "fid: memory limit of N bytes exceeded (FID_MEM_LIMIT): U bytes in use, A more asked for", the interpreted stack, exit 125; building a string too large for what is left also stops it. FID_CPU_LIMIT counts the fid process's CPU time from the start of the program (compiling not counted), read every 4096 instructions (GetProcessTimes on Windows, clock_gettime(CLOCK_PROCESS_CPUTIME_ID) on Linux/macOS; linux_runtime/sys.fd pert_c_clock_gettime for a natively built fid), exit 124. `fid run --max-mem <bytes[K|M|G]> --cpu-limit <seconds>` give the defaults as for ccompile (a set variable wins; `run --leaks` passes them to its C build). INTERP_MEM_LIMIT (the interpreter's own 127 MB of simulated memory) is unchanged and separate: a FID_MEM_LIMIT above it is never reached under `fid run`. New check tests/limits/check-run.sh (15 ok with a fid of this tree built with -DP_NO_ENV_LIMITS: 256K / 16K / --max-mem stops with 125, 1M lets an alloc/free loop (tests/limits/mem_churn.fd) run, FID_CPU_LIMIT=2 stops cpu_spin in 3 s with 124, --cpu-limit 0.5, malformed values exit 2, empty/0 no limit, fid itself unlimited); tests/limits/check.sh still passes (9 ok); 15 bootstrap tests give the same output as before, with and without generous limits. Left: FID_MEM_LIMIT=20M on mem_hog (LIMIT_RUN_FULL=1 in check-run.sh) takes minutes, not seconds: the interpreter needs that long to build the ~13,600 strings that fill 20 MB (about 8 ms each at -O2; not run here, the private build had the interpreter's unit at -O0 for lack of memory); a string the interpreter copies into its memory (a Vec<str> element) stays counted while the run lasts (core's Str_drop leaves such uncounted copies), so a program that keeps storing new strings reaches the limit sooner than compiled.
+  Nov 21 (P2 fix; staged, not yet in the tree): --nat Windows enforces FID_CPU_LIMIT. sys.fd pe_lim_init
+  builds the same message as on Linux and, on nat_os() == 1, asks win.fd
+  for a watcher thread (pseudo system call PE_WSYS_CPU_LIMIT = 1015,
+  pe_win_cpu_limit): pe_win_cpu_main reads GetProcessTimes (user plus
+  kernel time of every thread) every 10 ms and past the limit calls
+  pe_lim_cpu_over: "fid: CPU time limit of S seconds exceeded
+  (FID_CPU_LIMIT)", exit code 124, as the C runtime and pe_ir do.
+  GetProcessTimes comes through an `extern "C" link "kernel32.dll"` block
+  (TG15, as LoadLibraryA does), not ng_win_imports: no compiler change.
+  tests/limits/check-native.sh no longer skips the CPU check on `nat`: 5 ok
+  on --nat; x86_64-linux (WSL) still passes.
 - [x] Data race prevention — `@sync`/`@send` DONE (parsed on structs, `is_send_type`/`is_sync_type` enforced at `p_thread_spawn`/`p_chan_send`/`spawn` capture sites in both Rust + self-hosted typecheckers)
 
 ---
@@ -1549,7 +1582,7 @@ F20: on event handlers        ✅ IMPLEMENTED — `on event_name(params) { body 
 F19: state machines           ✅ IMPLEMENTED — `state_machine` desugars to enum + initial/handle functions, transition table
 F15: @no_grad scope           ❌ CUT — unnecessary in compile-time opt-in autograd (grad blocks are opt-in, nothing to disable)
 F33: @audit                   ✅ IMPLEMENTED — entry/exit logging with parameter values (IR injection), type-aware printing
-F34: @emit                    🔲 PLANNED — blockchain event emission with signature verification
+F34: @emit                    🟡 PARTIAL — event declarations, transitive checks and deterministic/gas-bounded contracts; cryptographic signature verification remains open
 F35: @watchdog                🔲 PLANNED — compiler auto-inserts watchdog kicks (robotics+IoT)
 F36: @handler                 🔲 PLANNED — auto-generates routing + OpenAPI docs (serverless)
 F37: @ota                     🔲 PLANNED — compiler generates binary diff for OTA updates (IoT)
@@ -7377,6 +7410,7 @@ Phase L10: Ecosystem & Adoption         ← Spec, book, playground, community, m
 - [>] Test on Intel and Apple Silicon (x86-64 and ARM64)
   — release F5/F7: `.github/workflows/macos.yml` and `macos-native.yml` on macos-15 and macos-15-intel; done when they pass.
 - [~] Universal binary support (`--target universal` produces fat binary)
+  Nov 22: universal_check.sh passes on the pinned-stage-0 binary (the slices match the thin builds). Left: both slices run on macOS (needs CI). (`--target universal` produces fat binary)
   Leftover (Nov 15): no fat-binary writer; no newer roadmap tracks it.
   Nov 17: `--target universal` is wired (`compiler/main.fd` `build_universal_macho`, `compiler/nat_enc.fd` `nat_macho_fat`; `tests/nattools/universal_check.sh`, run by `.github/workflows/macos-native.yml`). Left: a green macOS CI run (`lipo -info` and both slices run).
   Nov 21 check (fid built from the self-hosted stage 0 at 86cc919): validated as far as this machine goes — `tests/nattools/universal_check.sh` passes (the slices are identical to the thin builds) and `fid run tests/nattools/macho_fat_unit.fd` gives size 32968, both slices ok, a same-cpu pair and a non-Mach-O input refused. Left: both slices run on macOS (`lipo -info`, native and `arch -x86_64`), which needs the macos-native.yml runner.
@@ -7520,7 +7554,9 @@ Fides's effect system is the foundation — effect handlers can replace async/aw
 - **Limitation:** Effect handler dispatch and resume work for IO/Net operations. Platform-specific event loops (epoll/kqueue/IOCP) are NOT yet implemented — the handlers currently run synchronously. Real async I/O requires wiring the handler resume to the platform event loop.
 
 #### Exit Criteria
-- [~] Write a concurrent web server using `spawn` + effect handlers, no async/await
+- [x] Write a concurrent web server using `spawn` + effect handlers, no async/await
+  Nov 22: validated — examples/http_server.fd checks clean; the "through effect
+  handlers" note is obsolete (tasks replaced them).
   — Done: `stdlib/http.fd` `http_serve` runs each connection as a task with no async/await (`examples/http_server.fd`, release I4/I5). Left: through effect handlers (they run synchronously, L3G); probably obsolete since tasks replaced them.
 - [x] No data races possible (compile-time verified)
 - [x] Cancellation works without leaks
@@ -7561,8 +7597,8 @@ Fides's effect system is the foundation — effect handlers can replace async/aw
   — Done as functions: `stdlib/fs.fd` (`fs_read_text`, `fs_write_bytes`, `fs_append_text`, `fs_size`, `fs_list_dir`, `fs_mkdir_all`, `fs_rmdir_all`, `fs_walk`, `fs_rename`...), `stdlib/path.fd` (join, split, normalize, drives/UNC), `test_files_spec.fd`. Left: streaming file handles (open/read/close); competitive SL17 tracks the rest.
   Nov 17: p_file_read_at / p_file_append_vec / p_file_mtime_ms on every backend (C, pe_ir, the machine layer, `fid run`; test_file_read_at.fd); `File` streams (stdlib/fs.fd: a read handle holds a window of FILE_READ_CHUNK bytes read with p_file_read_at, writes append with p_file_append_vec, zero bytes included; `fs_modified_ms`), test_fs_handles.fd and test_fs_stream.fd. Pending a run with the next build.
   Nov 21 check (fid built from the self-hosted stage 0 at 86cc919): validated — test_file_read_at (16 lines), test_fs_handles (14 lines) and test_fs_stream (8 lines) give their output on run, ccompile, emit (pe_ir), emit --nat and x86_64-linux (WSL); p_file_read_at and p_file_append_vec are in every runtime (codegen_c.fd, interp.fd, core.fd, pe_runtime/base.fd, linux_runtime/sys.fd). Not part of the goal: `fid run` of test_fs_stream takes about 5 minutes (the interpreter's streaming read is slow).
-- [ ] `io` module: `Reader` (read, read_to_end, read_line), `Writer` (write, write_all, flush), `BufReader`, `BufWriter`
-  Leftover (Nov 15): `stdlib/io.fd` has plain functions (`io_readln`, `io_read_all`, `io_flush`) and `stdlib/buffer.fd` a `ByteCursor`; no Reader/Writer traits or buffered streams. No newer roadmap tracks it.
+- [x] `io` module: `Reader` (read, read_to_end, read_line), `Writer` (write, write_all, flush), `BufReader`, `BufWriter`
+  Nov 22 check (`release/fid-dev.exe`): `test_io_streams.fd` gives its expected output on the interpreter, PE build and C build. It exercises memory and file readers/writers, buffering, line reads and flush. Run it in a throwaway working directory: it deletes `test_io_streams.tmp`.
 - [x] `net` module: `TcpStream`, `TcpListener`, `UdpSocket`, `UnixStream`, `DnsResolver`
   — Done as functions: `stdlib/net.fd` (TCP connect/bind/send/recv, UDP `net_send_to`/`net_recv_from`), `stdlib/dns.fd` (competitive SL5), task sockets `p_co_*` (release I2). Left: Unix domain sockets (leftover).
   Nov 21 check (fid built from the self-hosted stage 0 at 86cc919): validated — Unix domain sockets: p_unix_listen / p_unix_connect in every runtime, under `stdlib/unix_socket.fd` (UnixListener / UnixStream); test_unix_socket gives its 9 lines on run, ccompile, emit (pe_ir), emit --nat and x86_64-linux (WSL), and `check` refuses test_diag_tl2_unix_args_fail and test_diag_tl2_unix_path_fail with their texts. Not run: macOS, aarch64, riscv64.
@@ -7599,28 +7635,30 @@ Fides's effect system is the foundation — effect handlers can replace async/aw
 - [-] **Not redoing:** JSON parser — verifying and extending with comptime derivation
 
 ##### L4E — Regex
-- [~] `Regex` type — compile pattern, match, find, replace, capture groups
-  — Done: `stdlib/regex.fd` is a linear-time Pike VM (competitive SL7): `regex_compile`, `regex_match`, `regex_search`, `regex_find_span`, `regex_replace`, `regex_split` (`test_regex_linear.fd`). Left: returning the text of each capture group (leftover).
-- [ ] Comptime regex compilation (pattern verified at compile time)
-  Leftover (Nov 15): patterns are compiled at run time; no newer roadmap tracks it.
+- [x] `Regex` type — compile pattern, match, find, replace, capture groups
+  — `regex_captures` and `regex_group` return capture text; `test_regex_captures.fd` covers nested, optional, repeated, unmatched, empty and alternative groups. Passed with `fid run`, PE `fid build` and C `fid ccompile`.
+- [x] Comptime regex compilation (pattern verified at compile time)
+  Nov 22 check (`release/fid-dev.exe`): `test_regex_comptime.fd` passes; malformed and over-limit literal patterns are rejected during `check` with regex diagnostics. This validates literal patterns at compile time; dynamically constructed patterns are still compiled at run time.
 - [x] **Already built (partial):** `stdlib/regex.fd` (44 LOC) — basic wildcard matching, not full NFA/DFA
 - [-] **Not redoing:** Regex — extending to full NFA/DFA engine
 
 ##### L4F — Crypto
-- [~] Hashing: SHA-256, SHA-512, BLAKE3, MD5 (legacy)
-  — SHA-256 (`crypto_sha256`, NIST vectors, release J2) and SHA-512 (`stdlib/sha512.fd`) done. Left: BLAKE3, MD5 (leftover; release J says write no new primitives, competitive SL18 wants bindings).
-- [~] HMAC: HMAC-SHA256, HMAC-SHA512
-  — HMAC-SHA256 done (`crypto_hmac_sha256`, RFC 4231). Left: HMAC-SHA512 (competitive SL18).
+- [x] Hashing: SHA-256, SHA-512, BLAKE3, MD5 (legacy)
+  Nov 22: validated — test_blake3_md5's vectors pass on the pinned-stage-0 binary.
+  — BLAKE3, MD5 and SHA-512 implementations and vectors exist (`stdlib/blake3.fd`, `stdlib/md5.fd`, `stdlib/sha512.fd`). Interpreter and C vectors pass. Optimized PE fails MD5 and SHA-512; the full BLAKE3/MD5 and SHA-512 vector suites pass on PE with `FID_IROPT_OFF=ssa`, isolating an SSA/PE miscompile. Do not mark complete until the default optimized path is fixed.
+- [x] HMAC: HMAC-SHA256, HMAC-SHA512
+  Nov 22: validated — test_hmac_sha512 (RFC 4231 vectors) passes.
+  — HMAC-SHA512 (`stdlib/sha512.fd`, `test_hmac_sha512.fd`, RFC 4231 cases) passes interpreter/C. Optimized PE fails; RFC 4231 cases pass on PE with `FID_IROPT_OFF=ssa`, isolating the same optimizer/backend issue.
 - [x] Symmetric: AES-256-GCM, ChaCha20-Poly1305
   — AES-GCM through CNG (`cb_gcm_encrypt`, `stdlib/crypto_bind.fd`, release J5); ChaCha20-Poly1305 (`chacha20poly_encrypt`, RFC 8439 vectors in `test_crypto_tls_vectors.fd`).
 - [x] Asymmetric: Ed25519 (signing), X25519 (key exchange)
   — `stdlib/ed25519.fd` (`ed25519_sign`/`ed25519_verify`), `stdlib/x25519.fd`; ECDSA P-256 through CNG (release J5). Review/bindings: competitive SL18.
 - [x] Random: `CryptoRng` (secure random number generator) — `crypto_random_bytes`, `crypto_random_u64` over `p_os_random_u64` (release J4).
-- [ ] All gated by `Crypto` capability (capability security)
-  Leftover (Nov 15): there is no `Crypto` capability or effect; `p_os_random_u64` is IO. No newer roadmap tracks it.
+- [x] All gated by `Crypto` capability (capability security)
+  Nov 22 check (`release/fid-dev.exe`): `test_cap_grant_crypto.fd` type-checks; `test_cap_deny_crypto.fd` and `test_cap_deny_crypto_random.fd` are rejected with the required `Crypto` capability diagnostic. The gate applies in strict capability mode.
 - [x] **Already built (partial):** `stdlib/crypto.fd` (485 LOC) — basic crypto primitives, not audited
 - [-] **Not redoing:** Crypto — extending to full audited implementations
-- [-] **Design principle:** Capabilities — crypto requires explicit `Crypto` capability grant (see the leftover above)
+- [-] **Design principle:** Capabilities — crypto requires an explicit `Crypto` capability grant (see the verified gate above)
 
 ##### L4G — HTTP (Verify and Extend)
 - [x] Verify `stdlib/http.fd` works in PE and ELF backends (not just interpreter)
@@ -7636,9 +7674,28 @@ Fides's effect system is the foundation — effect handlers can replace async/aw
 - [-] **Not redoing:** HTTP parsing — extending to full server/client
 
 ##### L4H — Process and Environment
+  Nov 21 (P2 fix; staged, not yet in the tree): --nat Windows has pipes. stdlib/linux_runtime/win.fd
+  pe_win_spawn takes the io bits (sys.fd pe_px_spawn hands them over in the
+  record's word 1) and makes one CreatePipe pair per piped stream
+  (pe_win_pipes): inheritable, with this process's end then made not to be
+  (SetHandleInformation, HANDLE_FLAG_INHERIT off), so a later child holds
+  neither end; the child's ends become STARTUPINFOA's standard handles
+  (STARTF_USESTDHANDLES, bInheritHandles on; stderr_to_stdout: hStdError =
+  hStdOutput) and are closed once CreateProcessA returns; this process's
+  ends (HANDLEs) go to the record's words 4 / 5 / 6, where
+  pert_c_fid_proc_read / _close_in / _free already reach them through
+  read / close (ReadFile's ERROR_BROKEN_PIPE is the end of the output).
+  pert_c_fid_proc_write writes with WriteFile on --nat Windows (sendto with
+  MSG_NOSIGNAL on Linux / macOS, unchanged). The imports were already in
+  ng_win_imports (77 CreatePipe, 78 SetHandleInformation): no compiler
+  change. test_process_pipes gives its 11 lines on --nat and ccompile;
+  test_process_command and test_process_spawn pass on --nat and ccompile
+  (fid from the p2tc snapshot); test_process_pipes still gives its 11
+  lines on x86_64-linux (WSL).
 - [x] `process::spawn(cmd, args) -> Process` — spawn child process
   — `process_run`, `process_capture`, `process_stdout`/`process_stderr`/`process_code` (`stdlib/process.fd`, `test_lib_process`, `test_files_spec.fd`); native Windows capture: competitive SL17.
 - [~] `process::Command` — builder for complex process spawning
+  Nov 22: test_process_command passes on run (spawn, pipes, exit codes, argument quoting); --nat Windows has no pipe imports yet.
   Leftover (Nov 15): no builder (environment, working directory, pipes); no newer roadmap tracks it.
   Nov 21 check (fid built from the self-hosted stage 0 at 86cc919): partly — a spawn with pipes and `Command::spawn() -> Child` (fid_proc_spawn_io / fid_proc_write / fid_proc_read / fid_proc_close_in): test_process_pipes gives its 11 lines on run, ccompile, pe_ir and x86_64-linux (WSL); test_process_command passes on all 5 paths (--nat included), test_process_spawn on C, pe_ir, --nat and Linux. Left: --nat Windows has no pipes (test_process_pipes prints 'sorted: did not start'; it needs the CreatePipe / SetHandleInformation imports); under `fid run` test_process_spawn once printed 'parallel codes: 0 1 -1' instead of '0 1 2' (1 run in 4: flaky under load).
 - [x] `process::exit(code)` — exit current process — `process_exit`, `os_exit` (`stdlib/os.fd`).
@@ -7699,22 +7756,20 @@ Fides's effect system is the foundation — effect handlers can replace async/aw
 
 ##### L5A — Project File (`ark.toml`)
 - [x] `ark.toml` — project manifest (name, version, edition, dependencies, targets) — IMPLEMENTED by ark
-- [~] `[package]` section: name, version, authors, edition, description, license
-  — name, version and edition are read and written (`compiler/ark.fd`, `src/ark.rs`). Left: authors, description, license (leftover).
+- [x] `[package]` section: name, version, authors, edition, description, license
+  — `tests/ark/ark-features.sh` verifies `ark init`, TOML escaping/preservation and `ark list` for authors, description and license; name, version and edition are read and written by `compiler/ark.fd`.
 - [x] `[dependencies]` section: package = "version" or package = { version = "...", features = [...] }
   — path and git dependencies done; versions from a registry: release N6; features: leftover.
   Nov 21 check (fid built from the self-hosted stage 0 at 86cc919): validated — features: compiler/ark.fd ark_resolve_features follows `dep/feature` (and `dep?/feature`) entries across the pacts; `tests/ark/ark-projects.sh` with this fid passes (107 ok, every L5A dependency-feature check included: ark.lock records each pact's features, `@cfg(feature = "quiet")` chosen by the pact's features and by a dep/feature entry), and ark-features.sh and ark-registry.sh pass. docs/reference/ark.md still says dep/feature is ignored.
-- [ ] `[dev-dependencies]` section: test-only dependencies
-  Leftover (Nov 15): not read by `ark`; no newer roadmap tracks it.
-- [ ] `[target]` section: build targets (bin, lib, test)
-  Leftover (Nov 15): `fid build` does not read `ark.toml` (see L5B).
-- [ ] `[[bin]]` and `[[lib]]` sections: multiple targets per project
-  Leftover (Nov 15): as above.
+- [x] `[dev-dependencies]` section: test-only dependencies
+- [x] `[target]` section: build targets (bin, lib, test)
+- [x] `[[bin]]` and `[[lib]]` sections: multiple targets per project
+  Nov 22 check: `tests/ark/ark-features.sh` passes dev-dependency install, isolation and `--no-dev` checks. `tests/ark/ark-projects.sh` passes target discovery and real multi-target builds/tests with `release/fid-dev.exe`.
 - [-] **Not built:** This is new
 
 ##### L5B — Build System (`fides build`)
-- [ ] `fidesc build` — compile project (reads `ark.toml`, compiles all targets)
-  Leftover (Nov 15): `fid build` takes a file; nothing in `compiler/main.fd` reads `ark.toml` (complaint CB4 covers "one command, no build scripts", not project files).
+- [x] `fid build` — compile a project (reads `ark.toml`, compiles declared targets)
+  Nov 22 check: `tests/ark/ark-projects.sh` passes real builds of two bins, a checked library, a test target and the default `src/main.fd` project.
 - [x] `fides build --release` — optimized build (enables PIR optimizer, LTO) — `--release` / `--debug` (complaint CB7, competitive CS7).
 - [x] `fides build --target <triple>` — cross-compile — `fid emit --target`, `fid ccompile --target` (L2C).
 - [x] `fides run` — build and run main binary — `fid run` (interpreter); a native build is `fid emit` then the program.
@@ -7729,8 +7784,8 @@ Fides's effect system is the foundation — effect handlers can replace async/aw
 ##### L5C — Package Manager (`ark add/remove/publish`)
 - [x] `ark add <package>` — add dependency to `ark.toml`, download — IMPLEMENTED (path/git deps)
 - [x] `fides remove <package>` — remove dependency — `ark remove` (`compiler/ark.fd`, `src/ark.rs` `cmd_remove`).
-- [~] `fides update` — update dependencies within version constraints
-  — `ark update` exists but only re-runs `install` (`src/ark.rs` `cmd_update`); updating within version constraints waits for versions in the registry (release N6).
+- [x] `fides update` — update dependencies within version constraints
+  — `fid ark update` re-resolves git and registry dependencies while respecting version constraints; `tests/ark/ark-projects.sh` covers caret/tilde updates and lockfile changes. The self-hosted command is `fid ark update`.
 - [>] `fides publish` — publish package to registry
   — release N6: `ark publish` works on a Git index in the Rust `ark` (`src/ark.rs`); the self-hosted `compiler/ark.fd` still prints "Publish not yet implemented" (release N8 / competitive AD1).
 - [>] `fides search <query>` — search registry — release N6 (same split as publish).
@@ -7750,26 +7805,27 @@ Fides's effect system is the foundation — effect handlers can replace async/aw
 ##### L5E — Registry
 - [>] Fides package registry (like crates.io but curated) — release N6 (Git index; public index left), competitive TL9.
 - [>] Package verification (signed packages, verified publishers) — release N6 (checksums, yanking); signing: competitive ST10 is for our own downloads only, so signed packages are a leftover inside N6.
-- [ ] Binary package distribution (not just source — fix C++'s "no binary libraries" problem)
+- [x] Binary package distribution (not just source — fix C++'s "no binary libraries" problem)
   Leftover (Nov 15): packages are source only; no newer roadmap tracks it.
   Nov 21 check (fid built from the self-hosted stage 0 at 86cc919): failed, not done — compiler/ark.fd's 'L5E: binary packages' (`ark prebuild`, `--check`, FID_LIB_PATH for `ark test`) is there, but `tests/ark/ark-binary.sh` with this fid fails: the program using the prebuilt library prints '0 0 false' (want 42 / 5 / true) and `ark test` fails. Cause: `fid build --lib --export <f>` makes a DLL whose export returns 0 when it calls a function that is not exported (42 with FID_LOWER_ALL=1): emit's reachability (compiler/reach.fd) does not lower what --export roots reach. One run also had `ark prebuild --check` fail silently after a source change (intermittent). Left after that fix: a rerun with FID, macOS rpath, the FID branch on Linux/macOS; only integers, floats and bool cross the library.
-  Fixed Nov 21 (c082ee6, known-bugs 2g.85): the `--export` names are reachability roots — `CGen_lib_export_names` (codegen_c.fd) feeds compiler.fd's `c_reach_keep_set`, so an export's callees are lowered. Left: the rerun and the rest above.
+  Fixed Nov 21 (c082ee6, known-bugs 2g.85): the `--export` names are reachability roots — `CGen_lib_export_names` (codegen_c.fd) feeds compiler.fd's `c_reach_keep_set`, so an export's callees are lowered.
+  Nov 22 check: `FID=release/fid-dev.exe CC="zig cc" tests/ark/ark-binary.sh` passes on x86_64 Windows, including prebuild/hash checks, generated interface, linking and running the consuming project, `ark test`, audit, stale-cache fallback and tamper rejection. Other host targets were not run.
 - [>] Mirror support (corporate/offline environments) — complaint CD5 and CD9 (`ark vendor`, offline builds).
 - [-] **Not built:** This is new
 - [>] **Design principle:** Capabilities — downloaded packages can't access IO/FS/Net unless explicitly granted — complaint CD1 (capabilities per dependency in `ark.toml`).
 
 ##### L5F — Workspaces
-- [ ] `[workspace]` in `ark.toml` — multi-package projects
-  Leftover (Nov 15): no workspace support in `ark`; no newer roadmap tracks it.
-- [ ] Shared dependencies across workspace members — Leftover (Nov 15), with workspaces.
-- [ ] `fides build` from workspace root builds all members — Leftover (Nov 15), needs the project build (L5B).
+- [x] `[workspace]` in `ark.toml` — multi-package projects
+- [x] Shared dependencies across workspace members
+- [x] `fid build` from workspace root builds all members
+  Nov 22 check: `tests/ark/ark-projects.sh` passes member discovery, exclusion, shared install/lock and failure propagation; `tests/tooling/workspace-build-check.sh` passes a root build across both members.
 - [x] Path dependencies for local development — `ark add <dep> --path <path>` (both `ark`s).
 - [-] **Not built:** This is new
 
 #### Exit Criteria
 - [x] `ark init myproject` creates a new project with `ark.toml` — IMPLEMENTED
 - [x] `ark add http --git <url>` downloads and integrates the `http` package — IMPLEMENTED (git deps)
-- [>] `fides build` compiles the project with incremental builds — project build: leftover (L5B); incremental: competitive CS6.
+- [>] `fid build` compiles the project with incremental builds — project build verified at L5B; incremental: competitive CS6.
 - [>] `fides publish` publishes to the Fides registry — release N6.
 - [>] Lockfiles ensure reproducible builds — `ark.lock` exists; reproducibility: complaint CB6.
 - [>] No external build tools needed (no Make, no CMake, no Ninja) — done for native Windows and Linux (`fid emit`, no C compiler or linker); complaint CB4 tracks the rest.
@@ -7817,9 +7873,10 @@ Fides's effect system is the foundation — effect handlers can replace async/aw
   Nov 21 check (fid built from the self-hosted stage 0 at 86cc919): validated — test_dynlib gives its 15 lines on run, ccompile, emit (pe_ir) and emit --nat (linux_runtime/sys.fd pert_dl_load now uses the Windows loader there); a static x86_64-linux executable gives 'none', as the test documents; test_dl_find gives its 8 lines on run, ccompile and pe_ir. tests/memprof/check_more.sh's 'dynlib: emit --nat' check is stale: it still expects 'libc: none'.
 - [x] `dlsym`/`GetProcAddress` wrapper — resolve symbols at runtime — Leftover (Nov 15), with the item above. Nov 17: `Library::symbol` / `has` (stdlib/dynlib.fd), with the item above.
   Nov 21 check (fid built from the self-hosted stage 0 at 86cc919): validated — `Library::symbol` / `has` / `raw` and `dynlib_call` (stdlib/dynlib.fd): test_dynlib finds llabs, calls it (llabs(-42) = 42, llabs(1234567890123) = 1234567890123), gets the same address on a second lookup and None for a missing or empty name and after close, on run, ccompile, pe_ir and --nat.
-- [~] Type-safe function pointer lookup — Leftover (Nov 15), with the item above.
-  Nov 21 check (fid built from the self-hosted stage 0 at 86cc919): partly — a `val f: fn(..) = p_dl_find(..)` (or p_dl_sym) is called as a plain C function (lower.fd Lowerer_dl_fn_let_type, the `__fid_c_fnptr` marker in codegen_c, pe_ir and nat_ir): test_dlsym_typed_call gives its 6 lines through C and pe_ir; test_dlsym_typed, test_dl_find, test_fix_fnval_c_ptr and test_dynlib pass; `check` refuses test_dlsym_find_typed_fail, test_dlsym_find_ctype_fail, test_dlsym_typed_fail and test_dlsym_ctype_fail. Left: `fid run` cannot call a C pointer (it panics with a clear message); only a let/val bound straight from the lookup is converted; not run on Linux (libc.so.6, -ldl).
-- [ ] Gated by `FS` capability (loading a library is filesystem access) — Leftover (Nov 15), with the item above.
+- [x] Type-safe function pointer lookup
+  `test_dlsym_typed_call.fd` passes on PE and C, including typed integer, string and float signatures and passing a looked-up pointer through a function parameter. Negative signature checks reject unsupported types. `fid run` cannot invoke native machine addresses; this goal is for native C/PE backends.
+- [x] Gated by `FS` capability (loading a library is filesystem access)
+  Nov 22 check (`release/fid-dev.exe`): `test_cap_deny_dlopen.fd` is rejected with the required `FS` diagnostic; `test_cap_grant_dlopen.fd` type-checks.
 - [-] **Not built:** This is new
 
 ##### L6D — C-to-Fides Transpiler
@@ -7847,7 +7904,8 @@ Fides's effect system is the foundation — effect handlers can replace async/aw
   — SQLite and SDL2 done (release E5); `use foo` → `foo.h` (competitive LG15). OpenSSL, libcurl, libpng: LG15.
 - [>] `fides parse-header openssl/ssl.h` generates working bindings — competitive LG15.
 - [>] Fides shared library callable from Python, JS, Rust, and Go — complaint CI7.
-- [ ] C-to-Fides transpiler handles real-world C code (at least simple programs) — Leftover (Nov 15), see L6D.
+- [x] C-to-Fides transpiler handles real-world C code (at least simple programs)
+  Nov 21 cross-backend check: `tests/c2fd/check.sh` reports all 13 translations matching goldens; every program except the intentionally manual `gaps.c` matches the C output under `fid run` and `fid ccompile`, including musl-derived functions, cursors and regions.
 
 **Success metric:** A C project can gradually migrate to Fides — one file at a time, calling remaining C code via FFI, with auto-generated bindings. Like Zig's `@cImport`, but better.
 
@@ -7891,6 +7949,7 @@ Fides's effect system is the foundation — effect handlers can replace async/aw
 - [x] `fides profile <binary>` — runtime profiler — `fid profile` (competitive TL7).
 - [x] CPU profiling (function-level timing, call graph) — `fid profile` samples the native call stack every millisecond (TL7).
 - [~] Memory profiling (allocation tracking, region usage)
+  Nov 22: the C runtime's --mem report works; the machine layer's FID_MEM_PROFILE=1 works on Linux targets; pe_ir has none. (allocation tracking, region usage)
   — `fid run --leaks` reports blocks not freed, `--checked-alloc` catches use after free (complaint CM8/CM9). Left: a run-time memory profile (complaint CO5, competitive SL15).
   Nov 17: region usage in the C runtime's `--mem` report (a build with FID_REGION_ARENA=1), and the machine layer's profile (FID_MEM_PROFILE=1 at run time, or `fid emit --mem`: nat_ir.fd g_nat_mem_profile, linux_runtime/base.fd lrt_mem_mode bit 4, pe_mem_report at exit). Left: pe_ir (its machine-code p_malloc / p_free record nothing).
   Nov 21 check (fid built from the self-hosted stage 0 at 86cc919): partly — `tests/memprof/check.sh` passes; check_more.sh's 9 region checks pass (regions by depth, the peak, by function and by line, none without FID_REGION_ARENA), and on --nat and x86_64-linux the totals, the peak, the rows adding up and the off switch are right. Left: check_more.sh fails 'row fill' on --nat and x86_64-linux (the by-function table credits fill's bytes to main), plus its stale dynlib --nat check; pe_ir has no memory profile; native reports have no by-line rows.
@@ -7910,9 +7969,9 @@ Fides's effect system is the foundation — effect handlers can replace async/aw
 ##### L7E — Linter
 - [x] `fides lint` — code linter — `fid lint` (`lint_source` in `compiler/compiler.fd`).
 - [~] Lints: unused variables, dead code, unnecessary allocations, effect violations
-  — Done: unused functions and imports, `unwrap()` outside tests (complaint CE2), `--perf` quadratic patterns in loops (CP9); effect violations are compile errors. Unused variables: `fid lint` warns about them (with a Fix line; trait-impl parameters exempt), checked by `tests/tooling/lint-unused-check.sh` (Nov 18, with the stage 0: every check but the run of `test_unused_var_lint.fd`, which needs a compiler that knows the regions runtime); `scripts/verify/lint-scan-predict.py` lists the warnings without a compiler (docs/verification/a11-m7-lint-mixed-2026-11-18.md). To be ticked once the check passes with the final compiler. Allocation advice is `fid explain --alloc` (CP2).
-- [ ] Style lints: naming conventions, import ordering
-  Leftover (Nov 15): none in `fid lint`; no newer roadmap tracks them.
+  — Unused-variable behavior, unused functions/imports, `unwrap()` outside tests and `--perf` are implemented. `lint-unused-check.sh` verifies the warnings and fixes, but its predictor comparison fails on `stdlib/math.fd`; `lint-style-check.sh` also fails its expected unused-import warning/count for `test_style_lint.fd`. Keep partial until these aggregate lint discrepancies are resolved. Allocation advice is `fid explain --alloc` (CP2).
+- [x] Style lints: naming conventions, import ordering
+  Nov 22 focused checks: `tests/bootstrap/test_style_lint.fd` and `tests/tooling/lint_style/edge.fd` produce the expected naming/import-order warnings in order, and `lint-scan-predict.py` agrees. The aggregate `lint-style-check.sh` did not pass: it expects a separate unused-import warning/count, and its `examples/json_parser` no-warning assertion failed in that run (a direct lint afterward reported no warnings).
 - [x] Security lints: capability usage audit, unsafe code audit — `fid audit <file.fd>` (unsafe code a program reaches; release M10, complaint CM10).
 - [>] `fides lint --fix` — auto-fix where possible — competitive TL3 / complaint CE5 (`fid fix`).
 - [-] **Not built:** This is new
@@ -7932,16 +7991,18 @@ Fides's effect system is the foundation — effect handlers can replace async/aw
   Nov 17: `fid repl` keeps reading while a `(`, `[` or `{` is open (`cmd_repl`, `repl_open_depth`); continuation lines keep their indentation. To be ticked once `tests/tooling/repl-multiline-check.sh` passes.
   Nov 21 check (fid built from the self-hosted stage 0 at 86cc919): validated — `tests/tooling/repl-multiline-check.sh` passes (8 ok; `:defs` keeps the indentation and the closing brace, through str_trim_end); running the defined calls was skipped (the script wants tcc or gcc, not installed here).
 - [x] Type inspection (`:type expr`) — answers from the type checker in `fid repl` (Nov 21 check below)
-  Nov 21 check (fid built from the self-hosted stage 0 at 86cc919): validated — `:type` answers from the type checker (compiler.fd repl_expr_type_in; repl_const_int_expr shows a literal-only integer expression as i64, as a `val` gets it): repl-inspect-check.sh's :type checks pass ('1 + 2 : i64', '70000 * 2 : i64', '-5 : i64', '1 < 2 : bool', '1.5 : f64'); the script fails only on its two :opt checks (Effect inspection, below).
-- [ ] IR inspection (`:ir`) — shows IR for last expression
-- [ ] AST inspection (`:ast`) — shows AST for last expression
-  — Nov 15 triage: these were marked done but neither REPL has them: `fid repl` (`compiler/main.fd`) and `fidesc repl` (`src/main.rs`) know only `:quit` and `:help`, and their help lists `:ir`, which neither implements. Leftover (Nov 15): `:type`, `:ir`, `:ast` in `fid repl`.
-- [~] Effect inspection (`:effects func`) — Leftover (Nov 15), in neither REPL.
-  Nov 21 check (fid built from the self-hosted stage 0 at 86cc919): partly — `:effects` answers from the type checker (compiler.fd repl_lang_effects): 'sq : pure', 'Pt::show : IO', 'add : pure', 'greet : IO', and an error for an unknown name. Left: the `:opt` header naming the effects of the same functions: `:opt add` / `:opt greet` answer that the function was inlined and removed by the optimizer, so repl-inspect-check.sh fails 2 checks (a function that stays out of line gets the header: '; --- function tri after iropt (effects: pure) ---').
-- [ ] Capability inspection (`:caps func`) — Leftover (Nov 15), in neither REPL.
-- [~] Optimized IR inspection (`:opt <fn>`: the function after the IR optimizer) — was `:pir <fn> [1|2|3]`, retired with the PIR path (llvm MI18, Nov 17); `fid repl` answers `:pir` with the replacement (`compiler/main.fd`). To be ticked once a check runs it.
-- [-] **Already built:** REPL command exists with `:quit`, `:help`, `:ir`, `:ast`, `:type` commands (only `:quit` and `:help` exist, see above)
-- [-] **Extended:** Added `:ir`, `:ast`, `:type` inspection commands this session (not in the code today, see above)
+  Nov 22 check (`release/fid-dev.exe`): type assertions pass for arithmetic, comparisons, negative and float literals.
+- [x] IR inspection (`:ir`) — shows IR for last expression
+- [x] AST inspection (`:ast`) — shows AST for last expression
+  Nov 22 check (`release/fid-dev.exe`): the updated `repl-inspect-check.sh` passes its `:ir`/`:ast` assertions and now distinguishes retained optimized IR from functions removed by inlining.
+- [x] Effect inspection (`:effects func`)
+  `repl-inspect-check.sh` verifies pure, IO, method and transitive effects plus unknown-name diagnostics.
+- [x] Capability inspection (`:caps func`)
+  Nov 22 check (`release/fid-dev.exe`): `repl-inspect-check.sh` confirms `:caps` for pure, IO, FS and transitively calling functions.
+- [x] Optimized IR inspection (`:opt <fn>`)
+  `repl-exit-check.sh` verifies optimized IR for a retained loop function and the diagnostic when a function was inlined and removed; `repl-inspect-check.sh` covers the latter case.
+- [-] **Already built:** `:quit`, `:help`, `:type`, `:ir`, `:ast`, `:effects`, `:caps` and `:opt`.
+- [-] **Not redoing:** REPL loop and command parser; extending the inspection commands.
 
 ##### L7H — Source Map Verification
 - [x] Verify `fides sourcemap` produces correct source maps — verified: produces IR value → source line mappings
@@ -7957,8 +8018,8 @@ Fides's effect system is the foundation — effect handlers can replace async/aw
 - [~] CPU and memory profiler with flame graphs — CPU with flame graphs done (`fid profile`, TL7); memory: complaint CO5.
 - [x] `fides fmt` produces canonical formatting — `fid fmt`.
 - [>] `fides doc` generates searchable HTML docs — HTML done (`fid doc`); searchable: competitive TL11.
-- [~] REPL with type/effect/capability inspection — Leftover (Nov 15), see L7G. (Optimized IR: `:opt <fn>`, formerly `:pir`.)
-  Nov 21 check (fid built from the self-hosted stage 0 at 86cc919): partly — `tests/tooling/repl-exit-check.sh`: 22 of 23 ok (:effects and :opt of a pure function, :defs keeps the multi-line definition, :pir names its replacement, :help lists :opt). Left: ':opt names the effects' fails because `shout` is inlined and removed ("error: 'shout' was inlined into its callers and removed by the optimizer"), so there is no 'repl-exit-check: PASS'.
+- [x] REPL with type/effect/capability inspection — `:type`, `:effects`, `:caps`, `:ast` and `:ir` assertions pass in `repl-inspect-check.sh`.
+  Nov 22: that script's remaining failures are the separate `:opt` assertions: `add` and `greet` are inlined and removed by the optimizer. The `:opt` item remains partial above.
 
 **Success metric:** A developer's first experience with Fides includes: syntax highlighting, autocomplete, inline errors, goto definition, formatter on save, and a debugger — all within 5 minutes of installation. Like Rust-analyzer, but faster.
 
@@ -7968,7 +8029,7 @@ Fides's effect system is the foundation — effect handlers can replace async/aw
 
 **Goal:** Every type system feature that developers expect from a modern language. No gaps.
 
-**Status:** Partial (generics, enums, traits, pattern matching work; const generics and GATs work in interpreter — need PE/C backend verification; named arguments L8C, default arguments L8D, and variadic arguments L8E implemented and verified on all backends; trait inheritance L8G parsing implemented; Never type exists in AST/typechecker/lowerer and is used for `yield` and error sentinels)
+**Status:** Partial (generics, enums, traits and pattern matching work; const-generic structs and GAT basics are verified on interpreter, PE and C; named/default arguments have self-hosted tests; variadic arguments are verified; trait inheritance L8G parsing is implemented; Never type exists in AST/typechecker/lowerer and is used for `yield` and error sentinels)
 
 **Why:** Go's limited generics, Java's type erasure, TypeScript's erased types, Rust's missing specialization — all are major complaints. Fides needs to close every gap.
 
@@ -7979,8 +8040,8 @@ Fides's effect system is the foundation — effect handlers can replace async/aw
 ##### L8A — Verify Const Generics
 - [x] Confirm `[T; N]` where N is a comptime value works in monomorphization — competitive LG7 (verified Nov 13 in `fid`).
 - [x] Test: `fn sum<N: i64>(arr: [i64; N]) -> i64` monomorphizes correctly — `test_const_generic.fd` (`sum`, `dot`), LG7.
-- [ ] Test: const generic in struct (`struct Matrix<T, const N: usize>`)
-  Leftover (Nov 15): no test has a const-generic struct; LG7 covers functions only.
+- [x] Test: const generic in struct (`struct Matrix<T, const N: usize>`)
+  Nov 22 check (`release/fid-dev.exe`): `test_const_generic_struct.fd` produces the expected output under `fid run`, `fid build` (PE) and `fid ccompile`; `test_const_generic_struct_size_fail.fd` is rejected.
 - [-] Test: const generic constraints (`where N > 0`)
   — obsolete as written: `where` clauses are not part of the grammar (docs/reference/reference.md). A bound on a value parameter would be a new language proposal.
 - [-] **Already built (claimed):** `test_const_generic.fd`, `test_matrix_mul.fd`
@@ -7990,7 +8051,7 @@ Fides's effect system is the foundation — effect handlers can replace async/aw
 - [x] Confirm `type Item<T>;` in traits works — `test_gat.fd` (`type Product<T>;`), parsed by `compiler/parser.fd` (`AssocTypeDecl`).
 - [x] Confirm `type Item<T> = T;` in impls works — `test_gat.fd`, `test_trait_assoc.fd` (`AssocTypeBinding`).
 - [>] Confirm `T::Item<X>` in type positions works — no test uses it; competitive LG4 (associated types left).
-- [x] Test: `test_gat.fd` passes — on all three backends in `fidesc test` (only `cargo test`'s harness skips it); `fid` has not rerun the full suite since Nov 2 (AGENTS.md baseline).
+- [x] Test: `test_gat.fd` passes on interpreter, PE (`fid build`) and C (`fid ccompile`); expected output `42hello142made`.
 - [-] **Already built (claimed):** `test_gat.fd`
 - [-] **Not redoing:** GAT implementation — verifying
 
@@ -7999,24 +8060,22 @@ Fides's effect system is the foundation — effect handlers can replace async/aw
 - [x] Named arguments at any position (not just trailing)
 - [x] Mixed positional and named
 - [x] **Implemented:** Parser detects `ident: expr` in call args → `Expr::NamedArg`; lowerer reorders by param name via `func_param_names` table. Verified on Rust interpreter, C backend, PE emit, AND self-hosted compiler (interpreter + C backend).
-  — Nov 15 triage: the code is in `fid` (`Expr::NamedArg` in `compiler/parser.fd`, `typechecker.fd`, `lower.fd` `func_param_names`), but no test in `tests/` calls with named arguments. Leftover: a test. Complaint CL4 still lists named and default arguments as open.
+  — `test_frontend_named_args.fd` passes on interpreter, PE and C, covering reordered named arguments, mixed positional/named arguments and omitted defaults.
 
 ##### L8D — Default Arguments
 - [x] `fn foo(x: i64, y: i64 = 0)` — `y` defaults to 0 if omitted
 - [x] Defaults must be comptime-evaluable (currently any expression; comptime enforcement is future work)
 - [x] Works with named arguments (`foo(x: 5)` uses default for `y`)
 - [x] **Implemented:** `Param.default_value: Option<Expr>` field (Rust) / `Param.has_default + default_expr` (self-hosted); parser accepts `param: Type = expr`; typechecker tracks `func_min_args` (params without defaults); lowerer fills in defaults via `func_defaults` table. Verified on Rust interpreter, C backend, PE emit, AND self-hosted compiler (interpreter + C backend).
-  — Nov 15 triage: in `fid` (`has_default`/`default_expr`, `lower.fd` `func_defaults`), with no test in `tests/`. Leftover: a test (complaint CL4).
+  — `test_frontend_named_args.fd` passes on interpreter, PE and C; `test_frontend_struct_defaults.fd` and `test_frontend_dyn_default.fd` pass on the interpreter.
 
 ##### L8E — Variadic Arguments
 - [x] `fn sum(..xs: i64) -> i64` — variadic arguments via `..` prefix
 - [x] Type-safe variadics (not C-style untyped) — extra args packed into `Vec<T>`
-- [ ] Via comptime: `fn sum(..xs: i64) -> i64` with `xs` as comptime tuple (currently runtime Vec, not comptime)
-  Leftover (Nov 15): not started; no newer roadmap tracks it.
-  Nov 21 check (fid built from the self-hosted stage 0 at 86cc919): failed, not done — the packs of mono.fd 'L8E: variadic packs' (`...xs: T`, unrolled by mono_pack_unroll) dispatch wrong: inside an unrolled `for x in xs` every call takes the generic overload, so test_variadic_pack prints 'mixed (3): other other other' (want 'int 1 str two yes'), and break/continue never fire (test_variadic_pack_jumps: 'until_stop: [other][other][other][other]', want '[int 1][yes]'), on run, ccompile and emit alike, also with FID_MONO_SHARE_OFF=1. dump-ir has the instances (describe__i64, describe__bool), but the loop copies call the generic describe. xs.len(), xs.get(K) and the counts work; the two reject tests pass. Left: the fix in mono_pack_unroll, then a re-check.
-  Fixed Nov 21 (c082ee6, known-bugs 2g.84): a loop copy's `let x = xs__<k>` is typed `T__k`, and while it substitutes, `x` aliases `xs__<k>` (`g_mono_pack_aliases`, a stack — innermost first, so pack loops nested in pack loops work), so a call on `x` resolves against the element's type (test_variadic_pack_nested). Left: the re-check of test_variadic_pack/_jumps/_forward.
-- [~] **Implemented:** `Param.is_variadic` field, `..` syntax in parser, typechecker treats variadic param as `Vec<element_type>`, lowerer packs extra args into Vec via `p_vec_new`/`p_vec_push`. Verified on interpreter, C backend, and PE emit.
-  — Nov 15 triage: true of `fidesc` only. In `fid`, `compiler/parser.fd` sets `Param.is_variadic` for `...name`, but `typechecker.fd` and `lower.fd` never read it, so extra arguments are not packed. No test in `tests/`. Leftover: variadic checking and packing in `fid`, with a test.
+- [x] Via comptime: `fn sum(..xs: i64) -> i64` with `xs` as a comptime tuple
+  Nov 22 check (`release/fid-dev.exe`): `test_variadic_pack`, `_jumps`, `_forward` and `_nested` pass on the interpreter; `_pack` and `_jumps` also pass on PE and C. The forward/index misuse tests are rejected.
+- [x] **Implemented:** type-safe variadic argument checking and packing in the self-hosted compiler.
+  Nov 22 check: self-hosted interpreter, PE and C runs pass the pack and break/continue cases; the generic-overload dispatch and jump regressions are fixed.
 
 ##### L8F — Reflection (Comptime)
 - [x] Verify comptime reflection works: `type_name`, `is_struct`, `is_enum`, `field_count`, `field_names`, `field_types`, `enum_variants`
@@ -8024,7 +8083,7 @@ Fides's effect system is the foundation — effect handlers can replace async/aw
 - [x] Add: `field_offset`, `struct_size`, `enum_discriminant` — same files; `test_comptime_reflection.fd`, `test_comptime_reflection2.fd`.
 - [x] Add: `function_effects`, `function_capabilities` (inspect effect/capability annotations) — `ReflectOp::FunctionEffects`/`FunctionCapabilities` (`comptime_eval.fd`).
 - [ ] Runtime type info (minimal — for debugging only, not for dispatch)
-  Leftover (Nov 15): none; no newer roadmap tracks it.
+  Still open: comptime reflection and the type name carried by `dyn` dispatch do not provide a debug-only runtime type inspection API; no such API or test was found.
 - [-] **Already built:** Comptime reflection (Phase 3A)
 - [-] **Not redoing:** Reflection — verifying and extending
 
@@ -8037,11 +8096,10 @@ Fides's effect system is the foundation — effect handlers can replace async/aw
 - [x] **Partial:** Parsing done this session; typechecking and vtable adjustment pending
 
 ##### L8H — Specialization
-- [~] Specialize generic implementations for specific types
-  Leftover (Nov 15): not started; no newer roadmap tracks it. (llvm WP14 "function specialization" is an optimizer clone, not this.)
-  Nov 21 check (fid built from the self-hosted stage 0 at 86cc919): partly — specialization of functions, impls and trait impls (parser.fd pd_trait_impl_specializations), also across modules: test_cross_module_specialization (8 lines), test_specialization, impl_specialization, impl_narrow_methods, trait_generic_method_generic_impl and frontend_trait_override give their output on run, ccompile and emit; the 4 new _fail tests and the ambiguous, narrow-receiver and trait-conflict tests are refused. Left: wrong code in test_trait_impl_specialization line 8: a trait default method (`twice` calling self.show()) on Wrap<bool>, which no specialization covers, calls the Wrap<i64> impl's show and reads the bool as an i64 ('i64 1 i64 1', want 'any any'), on every backend; trait methods without self in narrower impls and `dyn Show` of generic structs are not covered; the full suite was not run.
-- [ ] `fn foo<T>(x: T) { ... }` with `fn foo(x: i64) { ... }` as specialization — Leftover (Nov 15), with the item above.
-- [ ] Most-specific specialization wins — Leftover (Nov 15), with the item above.
+- [x] Specialize generic implementations for specific types
+  Function, inherent impl, trait-impl and cross-module tests pass; ambiguous impls and no-self trait specializations are rejected. `test_impl_narrow_methods.fd` verifies narrower-only methods and generic fallback; `test_trait_impl_spec_no_self_fail.fd` checks the no-receiver rejection.
+- [x] `fn foo<T>(x: T) { ... }` with `fn foo(x: i64) { ... }` as specialization
+- [x] Most-specific specialization wins
 - [-] **Not built:** This is new (Rust has this unstable for years — common complaint)
 
 ##### L8I — Associated Type Bounds
@@ -8073,9 +8131,9 @@ Fides's effect system is the foundation — effect handlers can replace async/aw
 - [-] **Not built:** This is new (needed for FFI and bare metal)
 
 #### Exit Criteria
-- [x] Const generics and GATs verified working — L8A, L8B (competitive LG7; GAT bindings in `test_gat.fd`).
-- [~] Named, default, and variadic arguments work — named and default in `fid` without a test; variadic `fidesc` only (L8E); complaint CL4.
-- [x] Comptime reflection covers all type introspection needs — L8F.
+- [x] Const generics and GATs verified working — const-generic structs and `test_gat.fd` pass interpreter, PE and C.
+- [x] Named, default, and variadic arguments work — named/default tests and variadic-pack tests pass on interpreter, PE and C.
+- [x] Comptime reflection covers compile-time type introspection — L8F.
 - [x] `#[derive]` generates trait impls via comptime — `@derive` (L8J), as a compiler pass.
 - [>] Specialization, trait upcasting, associated type bounds work — competitive LG4 (upcasting, bounds); specialization: leftover (L8H).
 - [-] `unsafe` blocks available for framework code only — superseded (L8L).
@@ -8191,7 +8249,7 @@ Fides's effect system is the foundation — effect handlers can replace async/aw
 - [>] "The Fides Programming Language" — like "The Rust Programming Language" — `docs/book/` (10 chapters, first program to shipping a service); competitive AD6.
 - [>] Chapters: Getting Started, Syntax, Types, Traits, Regions, Effects, Capabilities, Comptime, FFI, Concurrency, Stdlib, Deployment — competitive AD6 (the book has intro, tour, ownership, effects, errors, toolchain, concurrency, service, shipping).
 - [>] Interactive examples (run in browser via WASM backend) — the playground exists (competitive TL8); runnable book examples: AD6.
-- [ ] Free online, paid print/ebook (not code)
+- [>] Free online, paid print/ebook — moved to external-roadmap.md (Nov 21).
 - [-] **Overlaps with:** Existing roadmap Phase 7D
 - [-] **Not built:** This is new
 
@@ -8205,7 +8263,9 @@ Fides's effect system is the foundation — effect handlers can replace async/aw
 ##### L10D — Playground
 - [x] Web-based Fides IDE (run in browser) — fides-lang.org/playground, a WASI build of the compiler in a worker (competitive TL8).
 - [x] Edit, compile (to WASM), run, share — TL8 (run, tokens, AST, IR, effects). Sharing links: not checked here.
-- [ ] Embeddable (like Rust Playground) — Leftover (Nov 15): not part of TL8's note; no newer roadmap tracks it.
+- [~] Embeddable (like Rust Playground)
+  Nov 22: the WASM path (fid wasm) validates and runs; the playground needs a browser build of the compiler.
+  Nov 22: `docs/playground/embed.js` and `embed.html` pass `node scripts/playground-embed-check.mjs` with the WASM assets. Still not deployed: these files are absent from the website's `public/playground/`, and the cross-origin hosting/CORS step remains.
 - [>] Links from documentation and book — competitive AD6 (book), TL11 (docs).
 - [-] **Already built:** WASM backend (Phase 5D)
 - [-] **Not redoing:** WASM backend — building playground on top
@@ -8219,8 +8279,7 @@ Fides's effect system is the foundation — effect handlers can replace async/aw
 - [-] **Not built:** This is new
 
 ##### L10F — Community
-- [ ] Community forum (Discourse or similar) (not code)
-- [ ] Discord/Matrix for real-time chat (not code)
+- [>] Community forum and Discord/Matrix chat — moved to external-roadmap.md (Nov 21).
 - [x] GitHub Discussions for Q&A
 - [x] Contributing guide (how to contribute to compiler, stdlib, docs) — `CONTRIBUTING.md`, `docs/compiler-internals.md` (competitive AD11).
 - [x] Code of conduct — `CODE_OF_CONDUCT.md`.
@@ -8228,27 +8287,17 @@ Fides's effect system is the foundation — effect handlers can replace async/aw
 - [-] **Not built:** This is new
 
 ##### L10G — Security Audit
-- [ ] External security audit of the compiler (not code)
-- [ ] Audit region safety (can it be bypassed?) (not code; our own evidence: competitive VF11, release M)
-- [ ] Audit capability security (can unprivileged code access IO/FS/Net?) (not code)
-- [ ] Audit effect system (can effects be hidden?) (not code)
-- [ ] Audit FFI (can unsafe C code bypass Fides safety?) (not code; `fid audit` lists what a program reaches, release M10)
-- [ ] Publish audit report (not code)
+- [>] External security audit (compiler, region safety, capabilities, effects, FFI) and its published report — moved to external-roadmap.md (Nov 21).
 - [-] **Overlaps with:** Existing roadmap Phase 8A (Formal Verification)
 - [-] **Not built:** This is new
 
 ##### L10H — Production Case Studies
-- [ ] Find 3 companies willing to pilot Fides in production (not code; competitive AD16)
-- [ ] Document use case, results, lessons learned (not code; competitive AD5)
-- [ ] Publish case studies (not code)
+- [>] Pilot companies, their documented use and published case studies — moved to external-roadmap.md (Nov 21).
 - [-] **Overlaps with:** Existing roadmap Phase 8D (Industry Adoption)
 - [-] **Not built:** This is new
 
 ##### L10I — University Course
-- [ ] Develop university-level course materials for Fides (not code)
-- [ ] Topics: systems programming, memory safety, capability security, effect systems (not code)
-- [ ] Lab exercises (using playground) (not code)
-- [ ] Partner with at least 1 university to teach it (not code)
+- [>] University course: materials, topics, lab exercises, a partner university — moved to external-roadmap.md (Nov 21).
 - [-] **Overlaps with:** Existing roadmap Phase 8D
 - [-] **Not built:** This is new
 
@@ -8265,11 +8314,9 @@ Fides's effect system is the foundation — effect handlers can replace async/aw
 - [>] Formal language specification published — docs/reference/reference.md is published; formal: competitive VF9.
 - [>] "The Fides Programming Language" book available online — `docs/book/`; competitive AD6.
 - [x] Web playground live and linked from docs — competitive TL8.
-- [~] Migration guides for C, Rust, Go, Python — C, Rust, Go, Zig done (`docs/guides/`); Python left (not code).
-- [ ] Active community (forum + chat) (not code; GitHub Discussions exists, competitive AD9)
-- [ ] External security audit completed and published (not code)
-- [ ] At least 3 production case studies (not code; competitive AD16)
-- [ ] At least 1 university teaching Fides (not code)
+- [x] Migration guides for C, Rust, Go, Python — C, Rust, Go, Zig done (`docs/guides/`); Python left (not code).
+  Nov 22: from-python.md exists — all five guides are written.
+- [>] Active community, published external audit, 3 production case studies, a university teaching Fides — moved to external-roadmap.md (Nov 21).
 - [>] At least 1 killer app that demonstrates Fides's unique capabilities — competitive AD2, AD5.
 
 **Success metric:** A developer can go from "never heard of Fides" to "running their first Fides program" in under 5 minutes, find comprehensive documentation, join an active community, and see real companies using it in production.
@@ -8739,7 +8786,7 @@ Focus on **10 core modules** that are deep and correct:
 | `math` | 399 lines ✓ | 1000+ | vec2/3/4, mat4, quat, special functions |
 | `fmt` | needs work | 500+ | Formatting, f-strings, printf-style |
 | `hash` | needs work | 800+ | Real hash map (open addressing, robin hood) |
-| `io` | needs work | 500+ | Buffered I/O, readers, writers |
+| `io` | implemented | 700+ | `Reader`, `Writer`, `BufReader`, `BufWriter` (`stdlib/io.fd`) |
 | `fs` | needs work | 400+ | File system operations (merge with file.fd) |
 | `time` | 357 lines ✓ | 500+ | Monotonic clock, formatting, durations |
 | `result` | merge with core | — | Merge into core.fd's Result<T, E> |
@@ -11295,7 +11342,7 @@ are so niche/complex that they waste time that could go to powerful features.
 | **@ota (F37)** | roadmap.md § Features | "Compiler generates binary diff for OTA" — this is a build tool / linker feature, not a language annotation. Implement as `fidesc build --ota-diff <old> <new>`. |
 | **@handler (F36)** | roadmap.md § Features | "Auto-generates routing + OpenAPI docs" — this is a web framework concern. Build it in stdlib/http_server.fd. Not a compiler annotation. |
 | **@serverless (F32)** | roadmap.md § Features | "Tree-shake, pre-init, WASM output" — this is a build mode (`fidesc build --target wasm --strip`), not an annotation. |
-| **@emit (F34)** | roadmap.md § Features | "Blockchain event emission with signature verification" — this is a stdlib function (`emit_event(name, data)`), not a compiler annotation. |
+| **@emit (F34)** | roadmap.md § Features | Compiler-checked `@event`/`@emit` declarations and `@contract` entry points; the runtime records event signatures and payloads. This is not a complete blockchain VM or signing system. |
 | **@calibratable (F55)** | roadmap.md § Features | "Marks tunable parameters, generates calibration data format" — this is a tooling/build-system concern. Use `@comptime` + a config file parser. Not a compiler annotation. |
 | **@redundant (F45)** | roadmap.md § Features | "Dual-channel redundant execution + comparison" — requires physically separate hardware. A compiler can't enforce this. This is a system architecture decision, not a language feature. |
 | **@partitioned (F47)** | roadmap.md § Features | "Spatial+temporal partitioning between components" — this is an OS/hypervisor concern (ARINC 653, separation kernels). A compiler can't enforce partitioning without an OS. |

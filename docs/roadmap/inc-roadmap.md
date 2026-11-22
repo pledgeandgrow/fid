@@ -4,16 +4,13 @@
 > modules never recompile; semantic (effect-scoped) dependencies skip work
 > that a call graph alone would demand.
 >
-> Created: Oct 30, 2026. Status (Nov 15): Phase A done on both compilers —
-> including A11's remote CAS end-to-end; Phase B done *at the C level*
-> (`--inc`, both compilers); the per-module-IR split (B1–B5) and bootstrap
-> fixpoint check (B9) stay open; Phase C realized as per-unit prototype
-> scoping (see below) — all C-acceptance items verified on fidesc, emit
-> parity verified on fid. Nov 15 (fid): unit objects keyed so exported
-> names count (a rename reused a stale object), `a::b` modules build,
-> literals scoped per unit, generic method instances placed with their
-> generic; B4 decided, B2/B3/B5 partly, `scripts/inc-check.sh` for B8/B9
-> (not run yet). B1 not started.
+> Created: Oct 30, 2026. Status (Nov 21 late): Phase A done on both compilers —
+> including A11's remote CAS end-to-end; Phase B done at the C level. On the
+> v0.8.2 release binary, targeted checks pass for the default IR-unit path
+> (B1–B3) and seed-store reuse (2g.91/B6); cross-unit dyn/function-value
+> dispatch (2g.92) is fixed. The v0.8.2 installer matches the published
+> SHA-256 and includes the generated seed cache. The whole-suite runs (B5,
+> B8) and a current-source incremental bootstrap fixpoint (B9) remain open.
 
 ## Where it stands
 
@@ -178,7 +175,7 @@ modules, a one-unit body edit, an exported-fn rename, a new literal,
 the debug table; `SUITE=1` for B8, `FIXPOINT=1` for B9). Not run yet
 (written Nov 15, no build in that session).
 
-- [~] B1. Per-module IR boundary: `lower()` emits one `IrModule` per source
+- [x] B1. Per-module IR boundary: `lower()` emits one `IrModule` per source
         module plus a link table (exports, extern decls, struct layouts).
         Checked Nov 15: not started. Lowering, mono and the IR are
         whole-program; module provenance exists only as a name → module
@@ -209,7 +206,13 @@ the debug table; `SUITE=1` for B8, `FIXPOINT=1` for B9). Not run yet
         fails 3 checks); the `[inc] layouts` debug line is missing; no
         static instance copies (B3); SUITE=1 not run.
       Nov 21: a repro check of the cross-unit dispatch gap (2g.92) was added — tests/tooling/inc-ir-dispatch-check.sh; not fixed.
-- [~] B2. Cross-module type info: struct layouts and enum tags must be
+      Nov 21 late (release/fid.exe, v0.8.2): DONE — the dispatch fix
+      (ccompile_inc_prepare's per-unit trait-impl table and function-value
+      candidate stubs) shipped in the release build:
+      inc-ir-dispatch-check.sh and inc-ir-units-check.sh both PASS
+      (cross-unit dyn calls, function-value calls, edit isolation,
+      comment-invariant keys). The only owed run left is SUITE=1 (B8).
+- [x] B2. Cross-module type info: struct layouts and enum tags must be
         identical across module objects — export a canonical layout table,
         hash it, include in the module's dep key.
         Done at the C level, by construction: every unit carries the same
@@ -237,7 +240,12 @@ the debug table; `SUITE=1` for B8, `FIXPOINT=1` for B9). Not run yet
         rebuilds main, and there is no per-unit layout table or `[inc]
         layouts` line (both checks fail); SUITE=1 not run.
       Nov 21: see B1 — the same repro covers a unit that must not rebuild on another's struct edit; not fixed.
-- [~] B3. Monomorphization policy: generic instances are emitted in the
+      Nov 21 late (release/fid.exe, v0.8.2): DONE on the default IR-unit
+      path — inc-layouts-check.sh and inc-layouts-ffi-check.sh PASS: a new
+      struct in lib1 rebuilds lib1 only (main untouched), the `[inc]
+      layouts` debug line prints per-unit struct/extern counts, and
+      FIDES_INC_LAYOUTS=off still rebuilds everything as the control.
+- [x] B3. Monomorphization policy: generic instances are emitted in the
         *caller's* module unit (like C++ templates) — an instance's key
         includes the generic's source hash + the concrete type args.
         Done (Nov 15, `func_module_of` in `compiler/compiler.fd`): every
@@ -267,6 +275,12 @@ the debug table; `SUITE=1` for B8, `FIXPOINT=1` for B9). Not run yet
         static copies, so an instance two units call stays in its generic's
         unit and rebuilds it (4 of 5 units rebuilt, want 3); the SUITE=1
         and tcc runs.
+        Nov 21 late (release/fid.exe, v0.8.2): DONE on the default IR-unit
+        path — inc-instance-copies-check.sh PASSES all checks:
+        `twice__bool`/`pick__bool` defined in lib1 with a `static` copy in
+        lib2 and none in gen, `[inc] instance copies: 3 static copies of 3
+        of 3 instances`, and the move/home controls behave. SUITE=1 is
+        covered under B8.
 - [x] B4. Whole-program opt boundary: keep `optimize_l2` whole-program for
         `fid build` (correctness over speed); add `--inc` mode running
         per-module opt only, documented as producing slower binaries.
@@ -279,6 +293,7 @@ the debug table; `SUITE=1` for B8, `FIXPOINT=1` for B9). Not run yet
         slower. Decision for the deferred conflict below: `--inc` for dev
         builds, whole-program for release.
 - [~] B5. Backend split: C codegen and PE codegen emit one object per
+  Nov 22: the C half (split_c_units + build_c_units) works; the PE half is the design decision.
         module; linker merges. PE path needs an object format or a
         late-link step inside `pe_ir` — design decision recorded here.
         C half done: `split_c_units` + `build_c_units`, one `.o` per
@@ -309,12 +324,16 @@ the debug table; `SUITE=1` for B8, `FIXPOINT=1` for B9). Not run yet
         off); pe-win-check.sh: 181 hits, 1 miss; pe_fncache_check.sh on
         hello and every 30th bootstrap test: 40 identical images, edit and
         off ok. Left: the run on the whole suite (only a 1-in-30 sample).
+        Nov 21 late: attempted pe_fncache_check.sh on the full bootstrap
+        suite with JOBS=4, but stopped it when another session's full
+        verify and build chain caused resource contention. No valid suite
+        count was produced; rerun serially or on an idle machine.
         Seen on the way, not the cache: scripts/pe-win/tail_deep.fd
         overflows the stack (OP13 sibling tail calls).
-- [~] B6. Stdlib ships prebuilt: warm-cache story exists via `.fidcache`
+- [x] B6. Stdlib ships prebuilt: warm-cache story exists via `.fidcache`
         + `FIDES_CAS` (A11) — a seeded store or remote CAS serves stdlib
-        objects with zero compilation. Installer does not yet bundle a
-        `.fidcache/` for the stdlib modules.
+        objects with zero compilation. The installer includes a seeded
+        `.fidcache/`.
         Checked Nov 15: a bundled store would rarely hit. A `core` unit's
         key includes the whole program's shared prelude (every struct and
         extern of the program) and the instances of core's generics the
@@ -348,6 +367,20 @@ the debug table; `SUITE=1` for B8, `FIXPOINT=1` for B9). Not run yet
         2 of 2 units: core, main`), nor does an installed fid: core's unit
         key still differs between the seed build and the fresh project.
         The installer hunks were not checked.
+        Nov 21 late (release/fid.exe, v0.8.2): inc-seed-store-check.sh
+        PASSES all six: a fresh project prints
+        `Took 1 of 2 units from the seeded store; Compiling 1 of 2 units:
+        main`, an installed-layout fid reads `<fid dir>/cache` with no env,
+        FIDES_SEED_STORE=off compiles core, and nothing writes into the
+        store. 2g.91 fixed: core's dispatch functions (__p_elem_drop,
+        __p_elem_dup, __p_mem_drop, __p_mem_dup, __p_key_strs) are placed
+        in main's unit, so core's unit key no longer depends on the
+        program's types. Installer packaging verified Nov 21: the local
+        `installer/Fid-Setup-0.8.2.exe` hash is
+        `e650d399990825c3ca8c574d9360c2867e5cd83989d5bf74d2e9c008847db30e`,
+        matching the published asset; `build/installer/cache` contains 25
+        seeded objects and `installer/fides.nsi` embeds those files under
+        `$INSTDIR\cache`.
 
 ### Per-module acceptance
 
@@ -360,7 +393,8 @@ the debug table; `SUITE=1` for B8, `FIXPOINT=1` for B9). Not run yet
         spans or duplicated across units), `static` helpers stay per-unit
         (internal linkage), moved-def prototypes stand in place (macro
         expansions mid-prelude keep seeing their callees).
-- [~] B8. Output equality verified — the 10-module slice and an 8-round
+- [~] B8. Output equality verified
+  Nov 22: the 10-module slice and the edit loop verified (prior); verify.sh baseline not rerun. — the 10-module slice and an 8-round
         randomized edit loop both produce `--inc` binaries whose program
         output matches single-TU exactly (54908 == 54908). Linked
         binaries are NOT byte-identical (object/section layout differs
@@ -385,7 +419,13 @@ the debug table; `SUITE=1` for B8, `FIXPOINT=1` for B9). Not run yet
         different. Left: the full `SUITE=1 scripts/inc-check.sh` (3+ hours)
         was not run, so no counts yet; B1 found one mismatch it would hit
         (dyn calls across units on the IR path).
-- [~] B9. Bootstrap fixpoint still holds: per-module self-compile produces
+        Nov 21 late: attempted SUITE=1 on release/fid.exe, but it overlapped
+        another session's full verify/build chain; the run hit a transient
+        `basename: Resource temporarily unavailable` and an output mismatch
+        before it was stopped. This is not a valid suite result; rerun when
+        the machine and source tree are idle.
+- [~] B9. Bootstrap fixpoint still holds
+  Nov 22: the parallel session ran the 3-stage bootstrap and reached FIXPOINT OK (release/gate-nov21-c.log).: per-module self-compile produces
         the same `fid.exe` (hash-identical artifacts).
         Linked executables cannot be byte-identical (B8), so the check is
         on what can be: `FIXPOINT=1 scripts/inc-check.sh` builds the
@@ -403,6 +443,14 @@ the debug table; `SUITE=1` for B8, `FIXPOINT=1` for B9). Not run yet
         difference is real is unknown. Next: rerun on a quiet machine with
         the script's trap off and diff ref.c against inc.c.
       Nov 21 (c082ee6): inc-check.sh's FIXPOINT keeps work under KEEP=<dir> (ref.c, inc.c, logs) and reports a failed dump-c separately from a C difference.
+        Nov 21 late: retried with KEEP=build/inc-fixpoint on release/fid.exe.
+        The fixture passed, and 70 units were generated, but ccompile
+        --inc compiler/main.fd failed with `Panic: out of memory (allocating
+        2147483656 bytes)` while other heavy builds were active. Also,
+        release/fid.exe predates the current compiler sources, so this run
+        cannot establish the current-source fixpoint even if it completes.
+        Rerun after building a fid from the current frozen source tree and
+        when the machine is idle.
 
 ## Phase C — Effect-scoped invalidation (the novel part)
 
