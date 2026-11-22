@@ -1377,6 +1377,10 @@ pub fn irc_fn_key(f: Func) -> i64 {
 fn irc_rentry(r: &mut ArBuf) -> IrcEntry {
     var e: IrcEntry = IrcEntry_new(ar_i64(r), ar_str(r), Vec::new());
     e.bytes = ir_bytes(r);
+    var chk: i64 = ar_i64(r);
+    if r.ok && chk != (irc_hash_bytes(e.bytes) ^ e.key) {
+        r.ok = false;
+    }
     return e;
 }
 
@@ -1384,24 +1388,29 @@ fn irc_wentry(b: &mut AwBuf, e: IrcEntry) {
     aw_i64(b, e.key);
     aw_str(b, e.name);
     iw_bytes(b, e.bytes);
+    // ver 3: a check word per entry (the hash of its bytes ^ its key), as
+    // the mecache has — a torn or damaged file (two fid processes writing
+    // the same TEMP file) stops loading at the first bad entry instead of
+    // replaying silently wrong IR
+    aw_i64(b, irc_hash_bytes(e.bytes) ^ e.key);
 }
 
-/// Initialize the cache for one lower() call; returns immediately when
-/// FID_IRCACHE is unset or the salt differs (file rewritten at finish).
-/// Where the lowered-IR cache lives, or "" when it is off. FID_IRCACHE
-/// overrides (an explicit file path); off/no/0/none/false, FIDES_NO_CACHE,
-/// `--no-cache` or a machine without TEMP/TMPDIR turns it off. Pruned
-/// builds (`fid emit`, reach.fd) and full builds (run/dump-c/ccompile)
-/// keep separate files: a finish rewrites the file with only the entries
-/// the build used, so mixing them would thrash (each emit would shrink
-/// what a dump-c filled in, and back).
+/// Where the lowered-IR cache lives, or "" when it is off. Off by
+/// default: measured Nov 22 (release-roadmap D9), replaying a lowered
+/// IrFunction costs about what lowering it does (both build the same
+/// Vec/Inst objects), so a warm hit saves nothing after the salt, the
+/// per-function AST keys and the rewrite of the artifact (a hello emit
+/// was 82 ms SLOWER warm, best of 5; core's IR alone is an 11 MB file).
+/// FID_IRCACHE=<file> names a file; FID_IRCACHE=auto picks
+/// <TEMP>/fid-irc[p]-<compiler hash>.bin (p: `fid emit`'s pruned builds —
+/// reach.fd lowers the reachable only; run/dump-c/ccompile lower
+/// everything, and a finish rewrites the file with only what the build
+/// used, so the two modes keep separate files). off/no/0/none/false,
+/// FIDES_NO_CACHE and `--no-cache` turn it off whatever else is set.
 fn irc_path(pruned: bool) -> str {
     var v: str = env_or_empty("FID_IRCACHE");
     if v == "0" || v == "off" || v == "no" || v == "none" || v == "false" {
         return "";
-    }
-    if str_len(v) > 0 {
-        return v;
     }
     if str_len(env_or_empty("FIDES_NO_CACHE")) > 0 {
         return "";
@@ -1413,6 +1422,9 @@ fn irc_path(pruned: bool) -> str {
             return "";
         }
         i = i + 1;
+    }
+    if str_len(v) == 0 || v != "auto" {
+        return v;
     }
     var tmp: str = env_or_empty("TEMP");
     if tmp == "" {
@@ -1428,12 +1440,10 @@ fn irc_path(pruned: bool) -> str {
     return tmp + "/" + tag + int_to_str(inc_compiler_hash()) + ".bin";
 }
 
+/// Initialize the cache for one lower() call; returns immediately when
+/// FID_IRCACHE names no file (the default), or the salt differs (the
+/// file is rewritten at finish either way).
 pub fn irc_begin(program: Program, pruned: bool) {
-    // D9 (Nov 22): on by default — <TEMP>/fid-irc[p]-<compiler hash>.bin,
-    // the same pattern as the mecache/imc caches. This caches the LOWERED
-    // IR, so a warm build skips re-lowering what it lowered last time
-    // (the stdlib of a hello-world emit; ~everything of a self-compile).
-    // `fid serve` keeps its in-memory variant.
     var path: str = "";
     if !g_irc_mem {
         path = irc_path(pruned);
@@ -1475,8 +1485,9 @@ pub fn irc_begin(program: Program, pruned: bool) {
     var ver: i64 = ar_i64(&mut r);
     var salt: i64 = ar_i64(&mut r);
     var count: i64 = ar_i64(&mut r);
-    // ver 2 (SP13): byte buffers one byte per byte (iw_bytes)
-    if magic != 5062211 || ver != 2 || salt != g_irc_salt {
+    // ver 2 (SP13): byte buffers one byte per byte (iw_bytes); ver 3:
+    // a check word after each entry
+    if magic != 5062211 || ver != 3 || salt != g_irc_salt {
         return;
     }
     var i: i64 = 0;
@@ -1607,7 +1618,7 @@ pub fn irc_finish() {
     }
     var b: AwBuf = awbuf_new();
     aw_i64(&mut b, 5062211);
-    aw_i64(&mut b, 2);
+    aw_i64(&mut b, 3);
     aw_i64(&mut b, g_irc_salt);
     aw_i64(&mut b, g_irc_new.len());
     var i: i64 = 0;
@@ -2489,7 +2500,10 @@ fn mec_delta(f: &IrFunction, pre_len: i64) -> Vec<i64> {
     }
     // an appended value (the skeleton's fresh instructions) is referenced
     // only by the blocks it was put into: every id a serialized block
-    // names that the changed table does not hold is serialized too
+    // names whose position is in the appended zone (at or past pre_len)
+    // is serialized too — an existing id's body the replay target already
+    // holds, and pulling it in would expose the delta to what it cannot
+    // serialize (a string constant a replay would have to intern)
     i = 0;
     while i < bpos.len() {
         var ids2: Vec<i64> = f.blocks.get(bpos.get(i)).instructions;
@@ -2498,7 +2512,7 @@ fn mec_delta(f: &IrFunction, pre_len: i64) -> Vec<i64> {
             var vid: i64 = ids2.get(k2);
             if vid >= 0 && vid < f.inst_at.len() {
                 var vat: i64 = f.inst_at.get(vid) - 1;
-                if vat >= 0 && vat < f.insts.len() && mark.get(vat) == 0 && f.insts.get(vat).id == vid {
+                if vat >= pre_len && vat < f.insts.len() && mark.get(vat) == 0 && f.insts.get(vat).id == vid {
                     mark.set(vat, 1);
                     pos.push(vat);
                 }
