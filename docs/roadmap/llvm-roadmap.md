@@ -236,8 +236,14 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       is 32 bytes (was 1952 — 61x smaller; the under-512 goal is met with
       room). machine_frame_check's other legs (MI22 encoder oracle,
       remat's frame) still to re-run on a quiet machine.
-- [ ] MI9. Struct values as several MIR values when small (scalar replacement at
+- [~] MI9. Struct values as several MIR values when small (scalar replacement at
       the machine level), memory otherwise (M).
+      Nov 22 audit: `ng_rr_plan`/`ng_rf_promote` already keep eligible
+      one- and two-word struct results and copied result slots in MIR vregs;
+      `test_natabi_retregs.fd`, `test_natabi_retfwd.fd`, and
+      `test_natabi_optmatch.fd` cover those paths. Left: general scalar
+      replacement of small local structs that are not returned through the
+      direct-call result-slot path. Keep partial.
 - [x] MI10. A MIR verifier: every use defined, every block terminated, operand
       classes match the operation; run after each MIR stage in debug builds (M).
       The allocation checker (RA15) runs over the MIR with `FID_VERIFY=1`; a
@@ -383,9 +389,15 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       inlined functions. Left: COFF, deleting the PIR files (still in the
       tree), STRICT=1, test_pir/test_opt in verify-selfhost.sh.
       Nov 21: see RL9 — the COFF object path through nat_enc works (2g.110); coff.fd stays unreached.
-- [ ] MI19. Runtime primitives (`nat_ctx_swap`, atomics, `nat_clone_thread`,
+- [~] MI19. Runtime primitives (`nat_ctx_swap`, atomics, `nat_clone_thread`,
       trampolines) written once in MIR where they can be, per target only where
       they must be (M).
+      Nov 22 audit: `nat_ctx_swap` and the task trampoline share one
+      architecture-layer generator; atomic operations, thread creation,
+      TLS, signals, and entry points still have target-specific encoders.
+      The shared operations are not yet represented as MIR operations.
+      `machine_frame_check.sh` covers the task primitives; full multi-target
+      verification remains owed. Keep partial.
 - [~] MI20. Machine code primitives for the runtime already exist per target
       (`ng_gen_primitives*` in `nat_ir.fd`, the stubs of `pe_ir_stubs.fd`); move
       them behind one interface (M).
@@ -2045,7 +2057,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       literals, and string variables only ever assigned literals
       (`LOWER_LITERAL_SLOTS`); an empty Vec still frees its header.
       Nov 22 code audit: LOWER_LITERAL_SLOTS = true (lower.fd:24898, used at :25617), always on. No outstanding work named; the empty-Vec-header limitation is documented as accepted scope.
-- [~] LF18. `@deterministic` and `@constant_time` respected by every pass: no rule
+- [x] LF18. `@deterministic` and `@constant_time` respected by every pass: no rule
       may add a branch on secret data (the verifier of release session 30 runs on
       every target) (M).
       Nov 15: the mid-end keeps @constant_time code where a verifier sees
@@ -2250,7 +2262,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       layout (the last build was of another target, cache or program)"),
       149 of 241 unchanged functions move, and on x86-64 and `--nat` the
       changed function goes after the others. Left: those (SP6's problem).
-- [ ] SP8. A one-line edit rebuilds in under 100 ms (with SP4–SP7) (L).
+- [~] SP8. A one-line edit rebuilds in under 100 ms (with SP4–SP7) (L).
       ~0.5 s on hello with every cache warm (CS6, Nov 13).
       Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
       failed — `fid serve` builds after an edit re-check only what the edit
@@ -2259,6 +2271,14 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       differs from a one-shot emit (sp8-edit-rebuild-check fails steps 2
       and 3). Left: under 100 ms, the same image as a one-shot build.
       Nov 21: see SP20 — hit-order fixed; `fid serve` rebuilds not re-checked.
+      Nov 22 audit: warm AST/module/body/function caches exist and the
+      in-memory IR cache is opt-in (`FID_SERVE_IRCACHE=1`); the measured
+      latency and image mismatch above still fail acceptance. Keep partial.
+      Nov 22 ad-hoc probe with `FID_SERVE_IRCACHE=1` (`release/fid.exe`,
+      x86_64-linux): the edited rebuild took 9266 ms; its output matched a
+      one-shot emit for the small 3-body fixture. This was on a busy host
+      during other builds, so it is diagnostic, not a benchmark result;
+      it confirms the 100 ms target is not close.
 - [~] SP9. Front end in parallel per module where modules do not depend on each
       other (L).
       Competitive CS5: `FID_PAR=N` splits the borrow check's functions over
