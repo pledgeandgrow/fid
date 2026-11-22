@@ -151,8 +151,13 @@ same_three() {  # same_three <name> <file>
     fail "$name: mid-end counts differ: off '$(counts "${name}_off")' cold '$(counts "${name}_cold")' warm '$(counts "${name}_warm")'"
     return
   fi
-  if ! grep -qE '^\[mecache\] egraph: [1-9][0-9]* hits, 0 misses' "$OUT/${name}_warm.log"; then
-    fail "$name: the warm build missed ($(line "${name}_warm" egraph))"
+  # warm must hit, and may miss only what cold could not record (a
+  # string constant a delta cannot serialize without interning it) — the
+  # same functions, deterministically, recomputed every time
+  w_miss=$(sed -n 's/^\[mecache\] egraph: [1-9][0-9]* hits, \([0-9]*\) misses.*/\1/p' "$OUT/${name}_warm.log" | head -1)
+  c_unrec=$(sed -n 's/^\[mecache\] egraph: 0 hits, \([0-9]*\) misses, \([0-9]*\) recorded.*/\1 \2/p' "$OUT/${name}_cold.log" | head -1 | awk '{print $1 - $2}')
+  if [ -z "$w_miss" ] || [ -z "$c_unrec" ] || [ "$w_miss" != "$c_unrec" ]; then
+    fail "$name: the warm build missed ($(line "${name}_warm" egraph); cold left $c_unrec unrecorded)"
     return
   fi
   if cmp -s "$OUT/${name}_off$EXE" "$OUT/${name}_off2$EXE"; then
