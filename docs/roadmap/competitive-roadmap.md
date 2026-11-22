@@ -1702,20 +1702,26 @@ This is the race we can win outright, since no rival's speed comes for free.
       4.5x slower than lowering. CAVEAT: the Nov 22 mecache FAILs are NOT
       regressions — h_damaged.log fails on a core.fd:607 type error
       (nat_win_call 10 args, wants 11); Nov 21's pass is the last clean
-      result. Missed by the entry: the e-graph memo is OFF by default
-      (egraph.fd:3329,:3356-3358) — root cause: the side-effect skeleton
-      ADDS instructions, and mec_delta records rewritten instructions and
-      blocks only, so a memo entry cannot replay it (the memo gate's own
-      comment). The scoped lever for the 0.5 s target: extend mec_delta to
-      record added instructions, then re-enable the memo with the skeleton
-      on (~140 ms of egraph per emit on hello). Fix shape (ir_ser.fd
-      mec_delta :2409 / its replay :2476): (a) added BLOCKS currently
-      abort the delta at the range check (bi >= f.blocks.len() → empty);
-      serialize them with their index; (b) an instruction referenced by a
-      serialized block list but never logged via eg_set_inst dangles on
-      replay — walk the serialized blocks' ids and emit any inst entry
-      missing from the changed table. ~60-100 lines; silent-miscompile
-      class — land it fresh with cache-tv-check as the gate.
+      Nov 22 evening: DONE — the e-graph memo now runs WITH the skeleton.
+      mec_delta (ir_ser.fd) appends: the instructions the skeleton put
+      only into rewritten block lists (collected from the appended zone
+      only — pulling existing bodies in exposed the delta to what it
+      cannot serialize), their metas from the first appended id on, and
+      the final next_value; mec_apply appends sequentially and grows
+      inst_at/metas to next_value; the egraph memo key now mixes
+      g_eg_skel (switches must not cross). A delta that does not
+      round-trip is simply not recorded (mec_note verifies against a
+      hash covering inst_at, value_metas and next_value). Validated with
+      a -O0 fid-mec under suite load (build/mecache-check-v4.out):
+      mecache-check 11/12 — hello/families/unary executables
+      BYTE-IDENTICAL memo-off/cold/warm, 205/205 recorded and hit,
+      kill-switches and damaged-file behavior right; TIME=1 rows:
+      egraph 760 ms cold -> 148-150 ms warm (-80%), rules 262 -> 178.
+      The remaining lever for the 0.5 s target is lower (185 ms) +
+      iropt (68 ms); the memo's one boundary: a function whose LOGGED
+      rewrite is a string constant records nothing (interning a ConstStr
+      on replay is unimplemented) — it recomputes, correctly (rulesrand's
+      1 of 245).
       Done: ~360 ms (Nov 2, fidesc); ~370 ms internal build time today
       (`fid emit hello.fd --target x86_64-linux`, ~780 ms wall incl. process
       start; type check ~85, borrow ~170, mid-end ~170).
