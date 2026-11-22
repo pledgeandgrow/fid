@@ -11134,6 +11134,74 @@ fn iro_vec_sroa(f: &mut IrFunction) -> bool {
     return changed;
 }
 
+/// true when a path of CFG edges leads `from` to `to` (DFS over succs).
+/// strict: from itself does not count — `reaches(b, b, strict)` is true
+/// only when a cycle leads back into b.
+fn iro_vs_reaches(cfg: &IroCfg, from: i64, to: i64, strict: bool) -> bool {
+    if from < 0 || to < 0 || from >= cfg.succs.len() || to >= cfg.succs.len() {
+        return false;
+    }
+    if from == to && !strict {
+        return true;
+    }
+    var seen: Vec<i64> = peir_zeros(cfg.succs.len());
+    var stack: Vec<i64> = Vec::new();
+    var ss0: Vec<i64> = cfg.succs.get(from);
+    var k0: i64 = 0;
+    while k0 < ss0.len() {
+        var nx0: i64 = ss0.get(k0);
+        if nx0 == to {
+            return true;
+        }
+        if nx0 >= 0 && nx0 < seen.len() && seen.get(nx0) == 0 {
+            seen.set(nx0, 1);
+            stack.push(nx0);
+        }
+        k0 = k0 + 1;
+    }
+    seen.set(from, 1);
+    while stack.len() > 0 {
+        var cur: i64 = stack.get(stack.len() - 1);
+        stack.pop();
+        var ss: Vec<i64> = cfg.succs.get(cur);
+        var k: i64 = 0;
+        while k < ss.len() {
+            var nx: i64 = ss.get(k);
+            if nx == to {
+                return true;
+            }
+            if nx >= 0 && nx < seen.len() && seen.get(nx) == 0 {
+                seen.set(nx, 1);
+                stack.push(nx);
+            }
+            k = k + 1;
+        }
+    }
+    return false;
+}
+
+/// true when a block that clears the slot (the ownership lowering's
+/// `v = null` after the drop) can reach `to` on some path. A clearing
+/// store in `to` itself counts only through a cycle back into `to`
+/// (a read before it in the same block is checked by order there).
+fn iro_vs_zero_reaches(cfg: &IroCfg, zero_blocks: &Vec<i64>, to: i64) -> bool {
+    var i: i64 = 0;
+    while i < zero_blocks.len() {
+        var z: i64 = zero_blocks.get(i);
+        if z != to {
+            if iro_vs_reaches(cfg, z, to, false) {
+                return true;
+            }
+        } else {
+            if iro_vs_reaches(cfg, z, to, true) {
+                return true;
+            }
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
 /// LF14 for the Vec made by instruction `h`: true when it became slots.
 fn iro_vec_sroa_one(f: &mut IrFunction, h: i64) -> bool {
     var nv: i64 = f.next_value + 1;
@@ -11172,9 +11240,14 @@ fn iro_vec_sroa_one(f: &mut IrFunction, h: i64) -> bool {
         return false;
     }
     // 2: the handles, h (1) and the loads of its slot (2); the slot is only
-    // loaded, and stored h or a zero
+    // loaded, and stored h or a zero. zero_blocks holds the blocks that
+    // clear the slot (the ownership lowering's `v = null` after the drop):
+    // a load of the slot in a block hb dominates holds h there when no
+    // clearing block can reach it on any path (reads in dominated blocks,
+    // LF14 Nov 22).
     var kind: Vec<i64> = peir_zeros(nv);
     kind.set(h, 1);
+    var zero_blocks: Vec<i64> = Vec::new();
     if slot >= 0 {
         var b2: i64 = 0;
         while b2 < f.blocks.len() {
@@ -11189,6 +11262,11 @@ fn iro_vec_sroa_one(f: &mut IrFunction, h: i64) -> bool {
                             kind.set(iid2, 2);
                         }
                     }
+                    Inst::Store(sp2, sv2, _) => {
+                        if sp2 == slot && sv2 != h {
+                            zero_blocks.push(b2);
+                        }
+                    }
                     _ => {
                     }
                 }
@@ -11200,6 +11278,7 @@ fn iro_vec_sroa_one(f: &mut IrFunction, h: i64) -> bool {
             b2 = b2 + 1;
         }
     }
+    var cfg: IroCfg = iro_cfg(f);
     // 3: every use of a handle, in block order. In h's block a load of the
     // slot after the store of h (and no zero since) holds this run's h (3).
     var act: Vec<i64> = peir_zeros(nv);
@@ -11210,6 +11289,11 @@ fn iro_vec_sroa_one(f: &mut IrFunction, h: i64) -> bool {
     while b3 < f.blocks.len() {
         var ids3: Vec<i64> = f.blocks.get(b3).instructions;
         var live: bool = false;
+        // LF14: for a read in a dominated block, whether this block is
+        // clear of clearing stores (a same-block one before the read is
+        // fine; the per-block flag below follows the scan order)
+        var blk_ok: bool = slot >= 0 && zero_blocks.len() <= 16 && !iro_vs_zero_reaches(&cfg, &zero_blocks, b3);
+        var cleared_yet: bool = false;
         var k3: i64 = 0;
         while k3 < ids3.len() {
             var iid3: i64 = ids3.get(k3);
@@ -11224,6 +11308,17 @@ fn iro_vec_sroa_one(f: &mut IrFunction, h: i64) -> bool {
                     Inst::Load(lp3, _) => {
                         if lp3 == slot && live && iid3 >= 0 && iid3 < nv {
                             kind.set(iid3, 3);
+                        }
+                    }
+                    _ => {
+                    }
+                }
+            }
+            if slot >= 0 {
+                match inst3 {
+                    Inst::Store(zp3, zv3, _) => {
+                        if zp3 == slot && zv3 != h {
+                            cleared_yet = true;
                         }
                     }
                     _ => {
@@ -11247,9 +11342,18 @@ fn iro_vec_sroa_one(f: &mut IrFunction, h: i64) -> bool {
                 }
                 if w <= 4 {
                     // a push, get, set or len: in h's block, on h itself or
-                    // on a load that holds it
+                    // on a load that holds it. A get, set or len may also
+                    // read a load of the slot in a block hb dominates, when
+                    // no block that clears the slot can reach the read on
+                    // any path (and a same-block clearing store not yet
+                    // passed): every push is in hb, which the domination
+                    // makes run first (LF14, Nov 22).
                     var hv: i64 = iro_vs_arg(inst3, 1);
-                    if b3 != hb || hv < 0 || hv >= nv || (kind.get(hv) != 1 && kind.get(hv) != 3) {
+                    var hv_holds: bool = b3 == hb && hv >= 0 && hv < nv && (kind.get(hv) == 1 || kind.get(hv) == 3);
+                    if !hv_holds && b3 != hb && w >= 2 && w <= 4 && hv >= 0 && hv < nv && kind.get(hv) == 2 && blk_ok && !cleared_yet && iro_dominates(&cfg, hb, b3) {
+                        hv_holds = true;
+                    }
+                    if !hv_holds {
                         return false;
                     }
                 }

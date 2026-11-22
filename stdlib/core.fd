@@ -6415,6 +6415,40 @@ pub fn Int_to_str_into(buf: i64, cap: i64, x: i64) -> str {
     return p + 1;
 }
 
+/// `bool_to_str` built in a caller's stack area `buf` of `cap` bytes (LF13,
+/// Nov 22: a local `p_bool_to_str` string that never leaves its function)
+/// as [P_STR_STATIC][len] bytes NUL, as Int_to_str_into does for digits. An
+/// area that cannot be ours (or too small for "false": 16 header + 5 + 1)
+/// gives the heap copy p_bool_to_str makes.
+pub fn Bool_to_str_into(buf: i64, cap: i64, b: bool) -> str {
+    if buf == 0 || (buf & 7) != 0 || cap < 24 {
+        return p_bool_to_str(b);
+    }
+    var n: i64 = 4;
+    if !b {
+        n = 5;
+    }
+    var r: i64 = buf + 16;
+    if b {
+        p_str_copy_n(r, "true" as i64, 4);
+    } else {
+        p_str_copy_n(r, "false" as i64, 5);
+    }
+    var ep: *mut u8 = r + n;
+    // SAFETY: r + n = buf + 16 + n <= buf + 21 < buf + cap (cap >= 24).
+    unsafe {
+        *ep = 0;
+    }
+    var hp: *mut i64 = buf;
+    var lp: *mut i64 = buf + 8;
+    // SAFETY: the two header words at the start of the area (cap >= 24 > 16).
+    unsafe {
+        *hp = P_STR_STATIC;
+        *lp = n;
+    }
+    return r;
+}
+
 /// `a + b` built in a caller's stack area `buf` of `cap` bytes (LF13: a
 /// local string that never leaves its function) as [P_STR_STATIC][len]
 /// bytes NUL, so a drop leaves it alone. A result that does not fit, or an

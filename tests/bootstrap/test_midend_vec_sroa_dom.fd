@@ -1,0 +1,82 @@
+// LF14 (compiler/iropt.fd iro_vec_sroa, FID_IROPT_ON=vecsroa): a get, set
+// or len may read a local Vec in a block the creation block dominates
+// (Nov 22): every push is in the creation block, which the domination
+// makes run first, and the slot is stored the Vec and nothing else. A
+// read in a block the creation does NOT dominate (a sibling branch), or
+// after a zero store of the slot, keeps the Vec. The program prints the
+// same with the pass on and off.
+//
+// Expected output:
+// 30
+// 2
+// 73
+// 15
+// 5
+
+// a read in an if-branch the creation block dominates
+fn read_in_branch(c: bool) -> i64 {
+    var v: Vec<i64> = Vec::new();
+    v.push(10);
+    v.push(20);
+    if c {
+        return v.get(0) + v.get(1);
+    }
+    return 0 - 1;
+}
+
+// a len in a dominated block
+fn len_in_branch(c: bool) -> i64 {
+    var v: Vec<i64> = Vec::new();
+    v.push(1);
+    v.push(2);
+    if c {
+        return v.len();
+    }
+    return 0;
+}
+
+// a set in a dominated block, read after the branch joins back
+fn set_in_branch(c: bool) -> i64 {
+    var v: Vec<i64> = Vec::new();
+    v.push(3);
+    v.push(4);
+    if c {
+        v.set(0, 73);
+    }
+    return v.get(0);
+}
+
+// a read in a loop body the creation dominates
+fn read_in_loop() -> i64 {
+    var v: Vec<i64> = Vec::new();
+    v.push(5);
+    v.push(6);
+    var t: i64 = 0;
+    var i: i64 = 0;
+    while i < 3 {
+        t = t + v.get(0);
+        i = i + 1;
+    }
+    return t;
+}
+
+// a read where the creation does not dominate (a sibling branch): the Vec
+// is made in the other arm, the read happens after the join — stays a Vec
+fn sibling(c: bool) -> i64 {
+    if c {
+        var v: Vec<i64> = Vec::new();
+        v.push(7);
+        v.push(8);
+        return v.get(0) + v.get(1);
+    }
+    return 5;
+}
+
+
+fn main() {
+    println(read_in_branch(true));
+    println(len_in_branch(true));
+    println(set_in_branch(true));
+    println(read_in_loop());
+    println(sibling(false));
+}

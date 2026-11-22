@@ -24604,7 +24604,7 @@ fn lw_rc_stack_vecs(module: & mut IrModule) {
     // concatenated strings that stay in their frame, where core has the
     // entry points
     var vbuf_ok: bool = LOWER_STACK_VBUFS && lw_module_has_fn(module, "Vec_init_filled_at") && lw_module_has_fn(module, "Vec_drop_stackbuf");
-    var strs_ok: bool = LOWER_STACK_STRS && (lw_module_has_fn(module, "Str_concat_into") || lw_module_has_fn(module, "Int_to_str_into"));
+    var strs_ok: bool = LOWER_STACK_STRS && (lw_module_has_fn(module, "Str_concat_into") || lw_module_has_fn(module, "Int_to_str_into") || lw_module_has_fn(module, "Bool_to_str_into"));
     // OP27: Boxes that stay in their frame, where core can drop what a
     // Box holds in place
     var boxes_ok: bool = LOWER_STACK_BOXES && lw_module_has_fn(module, "__p_mem_drop");
@@ -25554,7 +25554,7 @@ const LOWER_STACK_STRS: bool = true;
 const LOWER_STACK_STR_BYTES: i64 = 128;
 /// At most this many stack strings in one function (512 bytes of frame:
 /// deep recursion must not run out of stack).
-const LOWER_STACK_STR_MAX: i64 = 4;
+const LOWER_STACK_STR_MAX: i64 = 8;
 
 /// Whether LF13's stack strings look at function `name`: not core's own
 /// string, Vec, map, Box or region functions.
@@ -25602,7 +25602,7 @@ pub fn lw_rc_stack_strs_fn(f: & mut IrFunction) -> bool {
         if ve_id >= 0 && ve_id < nv {
             match f.insts.get(i).inst {
                 Inst::Call(cn, cargs, _, _) => {
-                    if (cn == "p_str_concat" && cargs.len() == 2) || (cn == "p_to_str" && cargs.len() == 1) {
+                    if (cn == "p_str_concat" && cargs.len() == 2) || (cn == "p_to_str" && cargs.len() == 1) || ((cn == "p_bool_to_str" || cn == "p_to_str_bool") && cargs.len() == 1) {
                         created.set(ve_id, 1);
                         any = true;
                     }
@@ -25659,12 +25659,29 @@ pub fn lw_rc_stack_strs_fn(f: & mut IrFunction) -> bool {
         while r < refs.len() {
             var u: i64 = refs.get(r);
             if u >= 0 && u < nv {
-                // h: only its one store into a slot
+                // h: only its one store into a slot, or — a temporary —
+                // reader-call arguments, a print, or its drop (LF13
+                // temporaries, Nov 22: an f-string's inner concats and
+                // conversions are rewritten into their own areas; the drop
+                // of a static area result is a no-op)
                 if created.get(u) == 1 {
                     var fine_h: bool = false;
                     match f.insts.get(i).inst {
                         Inst::Store(hsp, hsv, _) => {
                             fine_h = hsv == u && hsp != u;
+                        }
+                        Inst::Print(_, _) => {
+                            fine_h = true;
+                        }
+                        Inst::Call(hcn, hcargs, _, _) => {
+                            fine_h = lw_rc_str_reader(hcn) || (hcn == "Str_drop" && hcargs.len() == 2 && hcargs.get(1) == u && hcargs.get(0) != u);
+                        }
+                        Inst::BitCast(bc_src, _, _) => {
+                            // a cast of the temporary (the i64 word a call
+                            // takes) is fine when the cast itself only
+                            // feeds readers or the drop — checked where the
+                            // cast's uses are, as for a loaded value
+                            fine_h = bc_src == u;
                         }
                         _ => {
                         }
@@ -25712,20 +25729,34 @@ pub fn lw_rc_stack_strs_fn(f: & mut IrFunction) -> bool {
                     }
                 }
                 // a cast of such a value: only argument 1 of its Str_drop
+                // (a cast of a created temporary is checked the same way,
+                // LF13 temporaries, Nov 22)
                 var cs: i64 = cast_from.get(u);
                 if cs >= 0 {
                     var cls: i64 = loaded_from.get(cs);
-                    if cls >= 0 && ok_slot.get(cls) == 1 {
+                    var crt: i64 = -1;
+                    if cls < 0 && created.get(cs) == 1 {
+                        crt = cs;
+                    }
+                    if (cls >= 0 && ok_slot.get(cls) == 1) || crt >= 0 {
                         var fine_c: bool = false;
                         match f.insts.get(i).inst {
                             Inst::Call(dcn, dcargs, _, _) => {
-                                fine_c = dcn == "Str_drop" && dcargs.len() == 2 && dcargs.get(1) == u && dcargs.get(0) != u;
+                                // its drop, or a reader call the cast is an
+                                // argument of (the i64 word p_str_concat and
+                                // friends take; a reader never keeps it)
+                                fine_c = (dcn == "Str_drop" && dcargs.len() == 2 && dcargs.get(1) == u && dcargs.get(0) != u) || lw_rc_str_reader(dcn);
                             }
                             _ => {
                             }
                         }
                         if !fine_c {
-                            ok_slot.set(cls, 0);
+                            if cls >= 0 {
+                                ok_slot.set(cls, 0);
+                            }
+                            if crt >= 0 {
+                                created.set(crt, 0);
+                            }
                         }
                     }
                 }
@@ -25739,9 +25770,18 @@ pub fn lw_rc_stack_strs_fn(f: & mut IrFunction) -> bool {
     var made: i64 = 0;
     var h: i64 = 0;
     while h < nv && made < LOWER_STACK_STR_MAX {
-        if created.get(h) == 1 && slot_of.get(h) >= 0 {
+        if created.get(h) == 1 {
+            var go: bool = false;
             var sl: i64 = slot_of.get(h);
-            if ok_slot.get(sl) == 1 && h_of.get(sl) == h && lw_rc_stack_str_rewrite(f, h, & mut pro) {
+            if sl >= 0 && ok_slot.get(sl) == 1 && h_of.get(sl) == h {
+                go = true;
+            }
+            if sl < 0 {
+                // a qualifying temporary: no slot, only readers, prints
+                // and its drop (LF13 temporaries, Nov 22)
+                go = true;
+            }
+            if go && lw_rc_stack_str_rewrite(f, h, & mut pro) {
                 made = made + 1;
             }
         }
@@ -25788,7 +25828,8 @@ fn lw_rc_stack_str_rewrite(f: & mut IrFunction, h: i64, pro: & mut Vec<i64>) -> 
     match e.inst {
         Inst::Call(cn, cargs, cty, ceff) => {
             var to_str: bool = cn == "p_to_str" && cargs.len() == 1;
-            if (cn != "p_str_concat" || cargs.len() != 2) && !to_str {
+            var to_bool: bool = (cn == "p_bool_to_str" || cn == "p_to_str_bool") && cargs.len() == 1;
+            if (cn != "p_str_concat" || cargs.len() != 2) && !to_str && !to_bool {
                 return false;
             }
             var words: i64 = LOWER_STACK_STR_BYTES / 8;
@@ -25808,6 +25849,10 @@ fn lw_rc_stack_str_rewrite(f: & mut IrFunction, h: i64, pro: & mut Vec<i64>) -> 
                 // LF13 (Nov 21): int_to_str of a local, into the area
                 na.push(cargs.get(0));
                 e.inst = Inst::Call("Int_to_str_into", na, cty, ceff);
+            } else if to_bool {
+                // LF13 (Nov 22): bool_to_str of a local, into the area
+                na.push(cargs.get(0));
+                e.inst = Inst::Call("Bool_to_str_into", na, cty, ceff);
             } else {
                 // the operands as the words core takes (as p_str_append's
                 // are), cast right before the call
