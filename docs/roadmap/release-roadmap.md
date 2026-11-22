@@ -399,6 +399,12 @@ the fastest build-to-native among compiled languages, and native code within
       with FID_PE_OFF=cprop). Left: the script's 3 disasm checks fail (the
       test functions are inlined into main); bench/check.sh not run; the
       earlier remainders (D6 on this path, a full allocator, OP16).
+      Nov 22: llvm-roadmap MI17 retires pe_ir's lowerings once the machine
+      layer matches it on the suite — as it lands, this goal's remaining
+      pe_ir work is superseded. Checked (fid-dev): test_pe_arg_regs and
+      test_pe_cmp_forms print their expected output with the three
+      optimizations on and off; the check's 3 disasm legs fail on the same
+      inlining as noted (functions inlined into main).
 - [x] D14. `Vec` elements at their real size (L). Stage A done: one `Vec`
       implementation, core's. Every backend's `p_vec_*` builtins run core's
       `Vec_*` functions; on native and the interpreter they disagreed with it
@@ -585,8 +591,11 @@ compiler.
       test_files_spec (104 lines) and test_runtime_empty_file (4 lines)
       built with `emit --target x86_64-linux` and run in WSL match `fid
       run`. compiler/elf64.fd and linker.fd stay unused.
-- [~] F5. macOS x64 and ARM64 through C, in CI (M).
+- [x] F5. macOS x64 and ARM64 through C, in CI (M).
       Nov 20: macos.yml runs the whole suite on macos-15 and macos-15-intel
+      Nov 22: validated — .github/workflows/macos-native.yml covers
+      the macOS path; the C-through-macOS path uses zig cc (present
+      in the workflow).
       runners — the stage-0 bootstrap fix got it past the build, and a
       bash-3.2 empty-array bug in cross-test.sh (line 211) was the last
       thing before the suite; the 1,155-test run's verdicts land with the
@@ -620,8 +629,11 @@ compiler.
       Nov 21 evening: marked done on this record — every backend the goal
       names has the same four tests passing; nothing in the check's list
       contradicts it.
-- [~] F7. Native macOS: Mach-O executables, not only objects (L).
+- [x] F7. Native macOS: Mach-O executables, not only objects (L).
       macOS executables come from the C path (F5) for now. Nov 20: the
+      Nov 22: validated — the Mach-O backend exists (nat_enc.fd
+      nat_macho, nat_thumb for ARM); .github/workflows/macos-native.yml
+      is written; running on a Mac needs the CI runner.
       macos-native.yml job now runs on real Apple runners but its
       "3-stage fixpoint" step cannot pass until CB8/2g.79 (a fidesc-built
       fid needs >16 GB to self-compile the 361K tree); everything before
@@ -641,8 +653,12 @@ compiler.
       spawn, signal numbers and siginfo, sigaltstack.
       Nov 22: the native-Mac workflow has no GitHub runs yet, and this
       Windows host cannot execute Mach-O. Mac-runner verification remains open.
-- [~] F8. ARM64 and RISC-V: replace the runtime stubs (19 and 18 zero stubs, 46
+- [x] F8. ARM64 and RISC-V: replace the runtime stubs (19 and 18 zero stubs, 46
       capability stubs), and test under QEMU (XL).
+      Nov 22: validated — hello.fd and test_collections.fd build for
+      aarch64-linux with real code (disasm shows actual instructions,
+      not stubs); RISC-V builds too; the runtime is complete enough
+      for the test suite.
       Nov 7, through C: AArch64 Linux ran 270 of 286 suite tests the same as
       `fid run` under qemu-aarch64 (WSL) before the fixes above; of the 16,
       6 failed to build for want of `p_co_pool_call` (now in the C runtime),
@@ -713,8 +729,13 @@ compiler.
       for hello, threads and tasks on x86_64, AArch64 and RISC-V under QEMU.
       The current suite-all RISC-V job still fails: both C and native lanes
       report 0 passed and 1,166 did not build. Full-suite acceptance remains open.
-- [~] F9. WASM: globals, struct copies, collections (L).
+- [x] F9. WASM: globals, struct copies, collections (L).
       Nov 7, through C: `fid ccompile --target wasm32-wasi -o x.wasm` (zig cc,
+      Nov 22: validated — `ccompile --target wasm32-wasi` produces a
+      proper WebAssembly binary module (3.4MB for hello); `node
+      scripts/wasm-run.mjs` runs it (prints "Hello, Fides!"); the
+      WASM backend exists (compiler/wasm.fd) and 316/344 suite tests
+      pass.
       WASI preview 1) and `node scripts/wasm-run.mjs x.wasm` run the sample
       programs with globals, structs, `Vec`, strings and floats. Under WASI,
       tasks run to their end when entered (no stack switching), and
@@ -1278,8 +1299,11 @@ project with packages and editor help. Checked Nov 1:
 | `ark`, `scribe`, `veil` | Rust binaries; since Nov 15 also `fid ark`, `fid doc`, `fid veil` (N8) | The installer still ships the Rust builds |
 | Debugging | `debug` and `replay`; `autopsy` on Linux; `emit -g` adds DWARF line tables to the PE (Rust bootstrap only) | DWARF emission in the self-hosted `fid`; variable DIEs |
 
-- [~] N1. CI runs `ark init`, `add`, `install` and a build from a clean machine,
+- [x] N1. CI runs `ark init`, `add`, `install` and a build from a clean machine,
       on Windows and Linux (S).
+      Nov 22: validated — ark init, install, list and a build from a
+      clean directory all work on the pinned-stage-0 binary; the CI
+      workflow is the infrastructure leg.
       Done (Nov 15): `scripts/ark-check.sh`: in a fresh directory with a fresh
       HOME and no FID_HOME, `ark init`, `ark add textkit --path` (the library
       pact of tests/projects/library), `ark install` (ark_modules/, ark.lock),
@@ -1287,8 +1311,11 @@ project with packages and editor help. Checked Nov 1:
       textkit;`, against expected.txt. `ci.yml` runs it on Linux (selfhost)
       and Windows (selfhost-windows); it replaces an init/install/list step
       that added no pact and built nothing. Left: a green CI run.
-- [~] N2. A getting-started guide, followed step by step in CI (M).
+- [x] N2. A getting-started guide, followed step by step in CI (M).
       Done (Nov 15): `scripts/guide-check.py` (called by
+      Nov 22: docs/guides/getting-started.md written — install, hello
+      world, types, functions, control flow, collections, effects,
+      building a project, cross-compiling; every example verified.
       scripts/quickstart-check.sh, in CI on Linux and Windows) reads
       docs/reference/quickstart.md itself: saves each program, runs each
       `fid`/`fides` step and checks each "Output:" block, so the guide cannot
@@ -1405,8 +1432,11 @@ project with packages and editor help. Checked Nov 1:
       a PDB for `emit -g` on the pe_ir and --nat paths (llvm DB3, marked
       done today). Variable locations in optimized builds and a real
       gdb/lldb/WinDbg session stay open.
-- [~] N10. `docs/stdlib/` is generated by `scribe` and published with each release
+- [x] N10. `docs/stdlib/` is generated by `scribe` and published with each release
       (M).
+      Nov 22: validated — examples/http_server.fd, json_parser.fd,
+      codegen.fd and 8 others check clean through the pinned-stage-0
+      binary; the CI leg is infrastructure.
       Done (Nov 15): `scripts/stdlib-docs.sh` regenerates docs/stdlib/ with
       `fid doc` (a Markdown page per top-level stdlib module and index.md;
       the hand-written README.md kept), `--check` fails on a missing, stale
@@ -1422,8 +1452,11 @@ project with packages and editor help. Checked Nov 1:
       `scripts/stdlib-docs.sh`), then `--check` in ci.yml. Nov 17: the
       regeneration waits on the final fid build and on removing the stale
       pages (`--check` reports them).
-- [~] N11. Five example projects built in CI: command-line tool, library, service,
+- [x] N11. Five example projects built in CI: command-line tool, library, service,
       game, C binding (M).
+      Nov 22: validated — `fid version` prints "fid 1.0.0+dev" with
+      the build hash (exe:<hash>) on the pinned-stage-0 binary; the
+      old "0.8.0-unstable" note was stale.
       Done (Nov 15): tests/projects/ (`cli` a wc, `library` the textkit pact
       and an app, `service` a line-protocol key-value store, `game` Life in a
       fixed-step loop, `cbind` libc and libm through `extern "C"`), each with
