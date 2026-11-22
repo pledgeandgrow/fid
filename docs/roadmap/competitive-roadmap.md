@@ -1704,7 +1704,12 @@ This is the race we can win outright, since no rival's speed comes for free.
       regressions — h_damaged.log fails on a core.fd:607 type error
       (nat_win_call 10 args, wants 11); Nov 21's pass is the last clean
       result. Missed by the entry: the e-graph memo is OFF by default
-      (egraph.fd:3329,:3356-3358).
+      (egraph.fd:3329,:3356-3358) — root cause: the side-effect skeleton
+      ADDS instructions, and mec_delta records rewritten instructions and
+      blocks only, so a memo entry cannot replay it (the memo gate's own
+      comment). The scoped lever for the 0.5 s target: extend mec_delta to
+      record added instructions, then re-enable the memo with the skeleton
+      on (~140 ms of egraph per emit on hello).
       Done: ~360 ms (Nov 2, fidesc); ~370 ms internal build time today
       (`fid emit hello.fd --target x86_64-linux`, ~780 ms wall incl. process
       start; type check ~85, borrow ~170, mid-end ~170).
