@@ -15,42 +15,43 @@ module compiler::main;
 use core;
 use vec;
 use string;
+use compiler::ark;
 use compiler::ast;
-use compiler::token;
-use compiler::lexer;
-use compiler::parser;
-use compiler::ir;
-use compiler::pgo;
-use compiler::image_writer;
-use compiler::mir;
+use compiler::build_info;
+use compiler::checks;
 use compiler::compiler;
+use compiler::cparser;
+use compiler::csplit;
+use compiler::debugger;
+use compiler::disasm;
+use compiler::egraph;
+use compiler::fmt;
+use compiler::gpu;
+use compiler::image_writer;
 use compiler::inc;
+use compiler::ir;
+use compiler::ir_ser;
+use compiler::iropt;
+use compiler::irverify;
+use compiler::json;
+use compiler::lexer;
+use compiler::lower;
+use compiler::lsp;
+use compiler::mir;
+use compiler::nat_ir;
+use compiler::parser;
+use compiler::pdb;
 use compiler::pe_ir;
 use compiler::pe_ir_stubs;
-use compiler::fmt;
-use compiler::lower;
-use compiler::scribe;
-use compiler::veil;
-use compiler::tensor;
-use compiler::gpu;
-use compiler::wasm;
-use compiler::lsp;
-use compiler::ark;
-use compiler::cparser;
-use compiler::iropt;
-use compiler::nat_ir;
-use compiler::rules;
-use compiler::checks;
-use compiler::irverify;
-use compiler::egraph;
-use compiler::typechecker;
-use compiler::json;
-use compiler::csplit;
+use compiler::pgo;
 use compiler::reach;
-use compiler::build_info;
-use compiler::ir_ser;
-use compiler::disasm;
-use compiler::pdb;
+use compiler::rules;
+use compiler::scribe;
+use compiler::tensor;
+use compiler::token;
+use compiler::typechecker;
+use compiler::veil;
+use compiler::wasm;
 // --- Global flag state ---------------------------------------------------
 // Parsed from --borrowck= and --timeout flags before command dispatch.
 // Fides does not support module-level mutable vars, so these are passed
@@ -345,6 +346,10 @@ pub fn main() -> i64 {
     // CT7: run a recording of `fid run --record` again, its inputs from it
     if command == "replay" {
         return cmd_replay(n, start, g_borrowck);
+    }
+    // TL5: the interactive IR debugger (compiler/debugger.fd), as fidesc's
+    if command == "debug" {
+        return cmd_debug(n, start);
     }
     if command == "ark" {
         return ark_main();
@@ -722,13 +727,6 @@ fn zig_unwind(cc: str) -> str {
 }
 
 // --- Helper: read source file or error -----------------------------------
-fn read_source_or_error(path: str) -> str {
-    var source: str = c_file_read(path);
-    if str_len(source) == 0 {
-        return "";
-    }
-    return source;
-}
 
 // --- Helper: print errors from Vec<str> ----------------------------------
 fn print_errors(errs: Vec<str>) {
@@ -4404,7 +4402,7 @@ fn build_c_units_ir(cc: str, gcc_opt: str, is_tcc: bool, output: str, libs: str,
     if !is_tcc {
         flags = flags + " -Wno-incompatible-pointer-types -fstack-protector-strong -fPIE -fno-strict-overflow -fno-strict-aliasing";
     }
-    var objs: str = "";
+    var objs: Vec<str> = Vec::new();
     var stale: Vec<str> = Vec::new();
     var generated: Vec<str> = Vec::new();
     var reused: i64 = 0;
@@ -4465,7 +4463,7 @@ fn build_c_units_ir(cc: str, gcc_opt: str, is_tcc: bool, output: str, libs: str,
             inc_seed_put(g_seed_store_out, seed_ir, o_path);
             seeded.push(name);
         }
-        objs = objs + " " + o_path;
+        objs.push(o_path);
         i = i + 1;
     }
     if str_len(g_seed_store_out) > 0 {
@@ -4497,7 +4495,7 @@ fn build_c_units_ir(cc: str, gcc_opt: str, is_tcc: bool, output: str, libs: str,
     if !is_posix_host() {
         system_libs = system_libs + " -lws2_32" + repro_win_flags(cc, false);
     }
-    if p_system(link + objs + system_libs + libs) != 0 {
+    if p_system(link + " " + str_join(objs, " ") + system_libs + libs) != 0 {
         print("link failed\n");
         return 1;
     }
@@ -4523,7 +4521,7 @@ fn build_c_units(c_code: str, cc: str, gcc_opt: str, is_tcc: bool, output: str, 
     if !is_tcc {
         flags = flags + " -Wno-incompatible-pointer-types -fstack-protector-strong -fPIE -fno-strict-overflow -fno-strict-aliasing";
     }
-    var objs: str = "";
+    var objs: Vec<str> = Vec::new();
     var stale: Vec<str> = Vec::new();
     var i: i64 = 0;
     while i < units.len() {
@@ -4554,7 +4552,7 @@ fn build_c_units(c_code: str, cc: str, gcc_opt: str, is_tcc: bool, output: str, 
                 inc_artifact_put(art, o_path);
             }
         }
-        objs = objs + " " + o_path;
+        objs.push(o_path);
         i = i + 1;
     }
     if stale.len() == 0 {
@@ -4586,7 +4584,7 @@ fn build_c_units(c_code: str, cc: str, gcc_opt: str, is_tcc: bool, output: str, 
         // CB6: no time stamp or PDB in the PE of an --inc build either
         system_libs = system_libs + " -lws2_32" + repro_win_flags(cc, false);
     }
-    if p_system(link + objs + system_libs + libs) != 0 {
+    if p_system(link + " " + str_join(objs, " ") + system_libs + libs) != 0 {
         print("link failed\n");
         return 1;
     }
@@ -4855,7 +4853,7 @@ fn link_error_report(text: str, source: str, input: str) -> str {
     return out;
 }
 
-fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
+fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, _g_timeout: i64) -> i64 {
     // SP2: `--time`, the per-stage table, with the C compiler as a row
     var t_start: i64 = p_clock_now_ms();
     if has_flag(n, start, "--time") {
@@ -5898,6 +5896,63 @@ fn program_func_is_user(name: str, source: str) -> bool {
 // SAFETY: comment.
 
 /// The file a `use` line names, or "" (a module not found is skipped).
+fn audit_ident_byte(b: i64) -> bool {
+    return (b >= 97 && b <= 122) || (b >= 65 && b <= 90) || (b >= 48 && b <= 57) || b == 95;
+}
+
+/// Source text with string literals and `//` comments removed, so an
+/// `"unsafe {"` inside a literal is not mistaken for a block and a `//`
+/// inside a string no longer truncates the line.
+fn audit_code_only(code: str) -> str {
+    var bytes: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    val n: i64 = str_len(code);
+    while i < n {
+        val b: i64 = str_byte_at(code, i);
+        if b == 34 {
+            i = i + 1;
+            var done: bool = false;
+            while i < n && !done {
+                val c2: i64 = str_byte_at(code, i);
+                if c2 == 92 {
+                    i = i + 1;
+                } else if c2 == 34 {
+                    done = true;
+                }
+                i = i + 1;
+            }
+        } else if b == 47 && i + 1 < n && str_byte_at(code, i + 1) == 47 {
+            i = n;
+        } else {
+            bytes.push(b);
+            i = i + 1;
+        }
+    }
+    return str_from_bytes(bytes);
+}
+
+/// Is `t` an `unsafe {` (or bare `unsafe`) line, matched on a token
+/// boundary so `is_unsafe {` does not count?
+fn audit_is_unsafe_block(t: str) -> bool {
+    if t == "unsafe" {
+        return true;
+    }
+    var rest: str = t;
+    var off: i64 = 0;
+    while str_len(rest) > 0 {
+        val i: i64 = str_find(rest, "unsafe {");
+        if i < 0 {
+            return false;
+        }
+        if off + i == 0 || !audit_ident_byte(str_byte_at(t, off + i - 1)) {
+            return true;
+        }
+        off = off + i + 1;
+        rest = str_slice(rest, i + 1, str_len(rest));
+    }
+    return false;
+}
+
 fn audit_module_file(spec: str, from_file: str) -> str {
     var m: str = spec;
     val brace: i64 = str_find(m, "::{");
@@ -6004,12 +6059,7 @@ fn cmd_audit(n: i64, start: i64) -> i64 {
         var bare: i64 = 0;
         var li: i64 = 0;
         while li < lines.len() {
-            var code: str = lines.get(li);
-            val cm: i64 = str_find(code, "//");
-            if cm >= 0 {
-                code = str_slice(code, 0, cm);
-            }
-            val t: str = str_trim(code);
+            val t: str = str_trim(audit_code_only(lines.get(li)));
             if str_starts_with(t, "use ") {
                 val spec: str = str_trim(str_replace(str_slice(t, 4, str_len(t)), ";", ""));
                 val dep: str = audit_module_file(spec, file);
@@ -6026,13 +6076,13 @@ fn cmd_audit(n: i64, start: i64) -> i64 {
                 }
             }
             var kind: str = "";
-            if str_contains(t, "unsafe {") || t == "unsafe" {
+            if audit_is_unsafe_block(t) {
                 kind = "unsafe block";
             }
             if str_starts_with(t, "@unsafe") {
                 kind = "@unsafe function";
             }
-            if str_contains(t, "extern \"C\"") {
+            if str_starts_with(t, "extern") {
                 kind = "extern \"C\"";
             }
             if str_len(kind) > 0 {
@@ -9381,7 +9431,7 @@ fn nat_write_object(m: IrModule, arch: i64, win: bool, mac: bool, out: str) -> i
 /// (default: lib<stem>.so, lib<stem>.dylib or <stem>.dll for the target).
 /// Built by gcc, clang or zig cc (CC, else the first found); cl.exe is not
 /// supported here (/LD and a .def file would be needed).
-fn ccompile_lib(n: i64, start: i64, source: str, input: str, g_borrowck: str, output: str) -> i64 {
+fn ccompile_lib(n: i64, start: i64, source: str, input: str, g_borrowck: str, _output: str) -> i64 {
     var target: str = normalize_target(get_flag_value(n, start, "--target", ""));
     var os: str = cross_target_os(target);
     if os == "" {
@@ -9544,6 +9594,7 @@ fn print_usage() {
     p_eprint_str("  fid test     <file.fd>               Run its fn test_*() (one process each), time fn bench_*()\n");
     p_eprint_str("  fid bench    <file.fd> [-n <count>]   Benchmark: run N times\n");
     p_eprint_str("  fid fuzz     <file.fd> [--seeds <n>]  Run its fn fuzz_*(data: Vec<u8>) on n inputs (1000)\n");
+    p_eprint_str("  fid debug    <file.fd>               Interactive IR debugger (break, step, print)\n");
     p_eprint_str("  fid lint     <file.fd>               Run lint checks\n");
     p_eprint_str("  fid check    <file.fd>               Type, borrow and effect checks only\n");
     p_eprint_str("  fid fix      <file.fd> [--check]     Apply the suggested fixes (each kept only if it helps)\n");
@@ -9709,5 +9760,26 @@ fn cmd_inspect(n: i64, start: i64) -> i64 {
 
 // --- cmd_debug ------------------------------------------------------------
 // Interactive IR debugger. Runs the interpreter with breakpoints.
+fn cmd_debug(n: i64, start: i64) -> i64 {
+    if start + 2 > n {
+        p_eprint_str("Usage: fid debug <file.fd>\n");
+        p_eprint_str("  Interactive debugger with breakpoints, stepping, variable inspection.\n");
+        p_eprint_str("  Commands: break, step, continue, print, backtrace, list, ir, effects, quit\n");
+        return 1;
+    }
+    var path: str = argv_at(start + 1);
+    var source: str = "";
+    match read_file(path) {
+        Option::Some(t) => {
+            source = t;
+        }
+        Option::None => {
+            p_eprint_str("error: cannot read " + path + "\n");
+            return 1;
+        }
+    }
+    var dbg = debugger.Debugger_new(source, path);
+    return debugger.Debugger_run(&mut dbg, source, path);
+}
 // --- cmd_native_debug ----------------------------------------------------
 // Native binary debugger (Linux ptrace). Compiles to C, runs under ptrace.
