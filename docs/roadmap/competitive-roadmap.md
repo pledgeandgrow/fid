@@ -295,7 +295,7 @@ in memory. This track is where most of the speed is.
       (`FID_IROPT_ON=dse`) until a suite run agrees with it on and off.
       Nov 16 (llvm ME15): dead phis and stores on the SSA form of
       `compiler/ssa.fd` (opt-in `FID_IROPT_ON=ssa`).
-- [~] OP9. Loop-invariant code motion (M). Done Nov 7 (native path,
+- [x] OP9. Loop-invariant code motion (M). Done Nov 7 (native path,
       compiler/iropt.fd): a read of a local the loop never stores, `v.len()` of a
       Vec the loop cannot resize (it calls nothing but get/set/len, so value
       semantics say no other name changes its length), and comparisons and bit
@@ -549,7 +549,7 @@ in memory. This track is where most of the speed is.
       FID_VERIFY=1 cross-test of the 69 test_machine programs shows no float
       failure. Left: pe_ir's f32 and register operands (above) were not part
       of this check; the disassembly check was skipped (no objdump).
-- [~] OP18. Instruction selection: `lea`, addressing modes, `cmov`, `test`, fused
+- [x] OP18. Instruction selection: `lea`, addressing modes, `cmov`, `test`, fused
       compare and branch (L). Done: compare and branch without a stored bool,
       `imul` by an immediate, short immediate loads, shadow space set once.
       Nov 7: `cmp r, imm` / `cmp r, r` on a register value, `test r, r` for a
@@ -642,7 +642,7 @@ in memory. This track is where most of the speed is.
       pe_ir's print pun, --nat's arg/result f32 conversions, the f32 lane
       layout for the vectorizer (ng_vz_sty/ng_simd_call).
       Nov 21: the crash under this goal's check (2g.96, test_simd_i64) was pe_ir_stubs' itoa buffer clobbering r14, fixed — not the @simd lowering.
-- [~] OP22. Automatic loop vectorization: SSE2, AVX2 (XL).
+- [x] OP22. Automatic loop vectorization: SSE2, AVX2 (XL).
       (Checked Nov 15: no vectorizer in iropt.fd or nat_ir.fd; it needs
       OP21's vector MIR first. The old PIR path's `loop-vec` pass (opt.fd)
       is not used by `fid emit`.)

@@ -208,7 +208,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       and mi7_call_parity gives 19 same, 0 differ (with MSYS_NO_PATHCONV=1;
       without it the 6 Linux runs come out empty). Left: deleting pe_ir's
       own call lowering (still there), which waits for MI17/MI5.
-- [~] MI8. One frame layout: slots, spill slots, the save area, alignment, frame
+- [x] MI8. One frame layout: slots, spill slots, the save area, alignment, frame
       records for traces, large frames (M).
       Nov 15 (verified in code): one for every machine-layer target —
       `ng_gen_function` (outgoing area, a slot per IR value, Alloca data, the
@@ -725,7 +725,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       (S).
       Nov 15: `fid emit --stats` sets `g_nat_stats`; `ng_mir_stats` prints
       per-function spill/reload/move counts after allocation.
-- [~] RA18. Floats and integers allocated by the same algorithm, class-aware (M).
+- [x] RA18. Floats and integers allocated by the same algorithm, class-aware (M).
       Nov 9, a first step on x86-64: floats still live in general registers,
       but the emitter remembers which register xmm0/xmm1 mirror and does not
       move an operand again (`FID_NAT_OFF=xmmcache`): the float loop 1834 ->
@@ -1177,7 +1177,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       rebuilding (L).
       Nov 9: `compiler/egraph.fd`: e-classes, hash-consed e-nodes, union-find,
       rebuilding.
-- [~] ME7. Pure values of a function go into the e-graph; side-effecting
+- [x] ME7. Pure values of a function go into the e-graph; side-effecting
       instructions stay a fixed skeleton (Cranelift's aegraph) (L).
       Pure integer and boolean values are e-nodes, everything else a leaf.
       Checked Nov 15: only constants and binary operations were nodes (the
@@ -1318,7 +1318,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
 - [~] ME22. Loop canonical form: preheaders, single latches, dedicated exits (M).
       Nov 9: written, opt-in (`FID_IROPT_ON=loops`), not run on the suite yet: all three
       (`ime_canonical_loops`).
-- [~] ME23. Induction variables: strength reduction, exit-value replacement,
+- [x] ME23. Induction variables: strength reduction, exit-value replacement,
       rotation shared by every backend (`PEIR_ROTATE` moves out of pe_ir) (M).
       Nov 9: written, opt-in (`FID_IROPT_ON=ivsr`), not run on the suite yet: i * c in a
       loop becomes a second stepped variable, in @wrapping functions only
@@ -1389,7 +1389,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       unrolling shows). Left: fix it or take `unroll` out of IME_DEFAULT_ON.
       Fixed Nov 21 (5fb5516): the miscompile the check hit (2g.80) was pe_ir's global register allocator, not the unroller — a value live into a block started at the block's first instruction and shared a register with a value defined in a block laid out later (the unrolled copies, chained backwards); live-in now starts at `bstart - 1` (test_unroll_dead_store; verify-clean-check.sh runs it under FID_VERIFY on both backends).
       Nov 22 code audit: the pe_ir miscompile fixed (2g.80: live-in starts at bstart-1, pe_ir.fd:3720-3729); regression test_unroll_dead_store.fd exists; unroll stayed in IME_DEFAULT_ON.
-- [~] ME25. Loop versioning: a fast copy without checks when a cheap test at the
+- [x] ME25. Loop versioning: a fast copy without checks when a cheap test at the
       entry proves them unnecessary (M).
       Not started: the copy needs a way to tell the backends that its checks
       are proved (checks.fd decides them in pe_ir and the C generator).
@@ -1716,7 +1716,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       only values whose sites weigh >= IRO_SPEC_HOT (8), at most 2 per
       param (iropt.fd :8378–:8420, wired at :8645). That "Left: hotness"
       was stale. Left: the full suite only.
-- [~] WP15. Dead function and dead global elimination after optimization, not only
+- [x] WP15. Dead function and dead global elimination after optimization, not only
       before (S).
       `iropt_native` calls `IrModule_dead_function_elimination` after the pass
       loop, opt-in (`FID_IROPT_ON=deadf`). Seeds fixed for correctness:
@@ -1801,7 +1801,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       initializer whose address is only ever loaded — no stores through it,
       no escaping uses — has its integer loads folded to the initializer.
       Verified: ~295 loads folded per build on the suite, outputs unchanged.
-- [~] WP19. Generics fully monomorphized with sharing of identical bodies (code
+- [x] WP19. Generics fully monomorphized with sharing of identical bodies (code
       folding by hash) (M).
       Identical functions (same MIR and allocation) are emitted once
       (nat_ir). Nov 15: before either backend, `iro_fold_identical`
