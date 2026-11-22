@@ -14,7 +14,7 @@
 #      Gadget) parses calc.fd again (another key) and still reuses geo.fd
 #   4. an edited module is parsed again and its new code runs
 #   5. damaged cache files are ignored (parsed again, same output)
-#   6. the core artifact (version 3: core stored once when nothing is
+#   6. the core artifact (version 4: core stored once when nothing is
 #      merged): a warm `check` hits it
 # TIME=1 also times `fid check compiler/main.fd --time` cold and warm and
 # requires the warm `[time] imports` to be lower (minutes; quiet machine).
@@ -93,7 +93,7 @@ done
 expect_out "damaged cache" "$TMP/d.out" "$MAIN_OUT"
 expect_sum "damaged cache" "$TMP/d.err" "0 hit(s), 2 parsed, 2 saved"
 
-# 6. the core artifact, version 3
+# 6. the core artifact, version 4
 ASTF="$TMPW/core.bin"
 FID_ASTCACHE="$ASTF" "$FID" check tests/bootstrap/hello.fd > /dev/null 2>&1
 m1=$(stat -c %Y "$TMP/core.bin" 2>/dev/null)
@@ -103,7 +103,7 @@ code=$?
 m2=$(stat -c %Y "$TMP/core.bin" 2>/dev/null)
 # a hit reads the artifact and does not write it again
 if [ $code -eq 0 ] && [ -s "$TMP/core.bin" ] && [ -n "$m1" ] && [ "$m1" = "$m2" ]; then ok "core artifact written once, then read"; else bad "core artifact (exit $code, mtime $m1 -> $m2)"; fi
-if [ -s "$TMP/core.bin" ] && [ "$(od -An -tu1 -j8 -N1 "$TMP/core.bin" | tr -d ' ')" = "3" ]; then ok "core artifact is version 3"; else bad "core artifact is not version 3"; fi
+if [ -s "$TMP/core.bin" ] && [ "$(od -An -tu1 -j8 -N1 "$TMP/core.bin" | tr -d ' ')" = "4" ]; then ok "core artifact is version 4"; else bad "core artifact is not version 4"; fi
 
 # TIME=1: the self-compile's front end, cold and warm
 if [ "${TIME:-0}" = "1" ]; then

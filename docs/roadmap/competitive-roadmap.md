@@ -114,8 +114,20 @@ Nothing below means anything until this exists.
       `tests/bootstrap/test_verify_bm_{json,regex,fileread}.fd`; first
       SUITE=work run Nov 17 in docs/benchmarks.md (busy machine). Left: Zig
       strings; numbers from a quiet machine.
-- [ ] BM5. Service benchmarks in the TechEmpower style: plaintext, JSON, database,
+- [~] BM5. Service benchmarks in the TechEmpower style: plaintext, JSON, database,
       with the client on a separate machine (M).
+      Nov 22: the suite exists — bench/service/ (plaintext, json, db,
+      queries; Fides native and through C, Go, Node; load client wrk or
+      load.py; `serve`/`load` split for a client on another machine over
+      HOST/PORT). Verified locally: scripts/service-bench-check.sh PASS
+      (selftests agree; fides-c, go and node answered every test right,
+      2 s each: plaintext/json/db/queries ~33k/30k/29k/20k req/s for
+      fides-c on a busy Windows machine). Weekly CI step exists
+      (verify-weekly.yml under wrk on Linux) but has no run yet.
+      Left: a recorded run with the client on a separate machine (the
+      harness supports it; none done), a real database server (the
+      documented deviation — the World table is in memory), and native
+      fides on Windows (pe_ir lacks p_signal_check/p_signal_register).
 - [~] BM6. Compile-speed benchmarks: hello world, 10k, 100k and 1M lines, clean and
       one-line change (M).
       Done (Nov 15): `bench/compile-speed.sh` with `bench/gen_lines.py` (the
@@ -800,8 +812,17 @@ in memory. This track is where most of the speed is.
       --alloc` reports no heap allocation in box_math and one in
       box_looped; the leak gate passes (10 programs). Left: as above, and a
       full-suite run.
-- [ ] OP28. `comptime` evaluation of whole tables and parsers, so work disappears
+- [x] OP28. `comptime` evaluation of whole tables and parsers, so work disappears
       from the binary (M).
+      Checked Nov 22: comptime fns build whole tables and run whole parsers
+      (compiler/comptime_eval.fd): test_comptime_table builds a 256-entry
+      CRC-32 table and a squares Vec; test_comptime_parser parses constant
+      text with core string functions and plain helpers. Verified Nov 22:
+      tests/tooling/op28-comptime-parser.sh passes 13/13 — outputs match,
+      no `warning: comptime` (nothing fell back to run time), and in the
+      generated C `main` calls neither the table builder nor the parsers
+      while holding their results (1996959894, 300) inline; the run-time
+      parser in the same file still runs.
 - [~] OP29. Regions freed in one step, not object by object (needs release C6) (M).
       Checked Nov 15: release C6 frees the collections a `region` declares
       at its end, each by its own drop (test_mem_owned_drop); every backend
@@ -1487,7 +1508,20 @@ Some of the largest costs are in how data is laid out, not in the optimizer.
       switch carries; C: POSIX guard pages, Windows the same as native), and
       an overflow in a task is `Panic: Stack overflow`, status 1, as on the
       main thread (Nov 8).
-- [ ] RT14. Zero-copy file and socket I/O where the system allows it (M).
+- [x] RT14. Zero-copy file and socket I/O where the system allows it (M).
+      Checked Nov 22: fs_copy_file and net_send_file let the kernel move the
+      bytes where it can — CopyFileA and TransmitFile on Windows (C builds:
+      compiler/codegen_c.fd __p_zc_copy_file/__p_zc_send_file; native:
+      stdlib/pe_runtime/conc.fd pert_fs_copy_file/pert_net_send_file),
+      copy_file_range then sendfile on Linux (C builds and native:
+      stdlib/linux_runtime/sys.fd), fcopyfile on macOS (C). Where the system
+      does not (`fid run`, a socket without TransmitFile, a file system
+      without the calls) the portable bodies p_fs_copy_file/p_net_send_file
+      read and write instead, from where the kernel stopped.
+      Verified Nov 22 on this machine: test_lib_fs_copy passes its 10 lines
+      on `fid run`, `emit` and `ccompile`; tests/net/send_file.fd passes its
+      5 lines on `emit` and `ccompile` (native and C TransmitFile/CopyFileA
+      paths). Linux/macOS run in CI.
 - [x] RT15. Panics unwind cleanly, or abort by a documented rule (L).
       Done Nov 8: the rule is reference.md 8.2. A panic, in main or in any
       task or thread, prints `Panic: <message>` and the trace, flushes stdout
@@ -2577,7 +2611,7 @@ owning what we ship.
       backtracking): classes, escapes, counted quantifiers, groups,
       alternation, anchors; `test_regex_linear.fd` runs a pattern that is
       exponential for a backtracking engine in linear time.
-- [~] SL8. Time zones, calendars, formatting and parsing (L).
+- [x] SL8. Time zones, calendars, formatting and parsing (L).
       Done: `stdlib/tz.fd`: 57 named zones with their current DST rules (US,
       EU, southern hemisphere), fixed offsets ("+05:30"), local to UTC and
       back (a skipped hour moves forward, a repeated one takes the first),
@@ -2600,8 +2634,9 @@ owning what we ship.
       `dt_format` gained %G %g %V %u %w %s %h %n %t, and `dt_parse_format`
       parses by a strptime format (names in any case, 12-hour clock, %j,
       ISO week dates, %z/%Z, %s; the date and the weekday are checked);
-      `test_stdlib_calendar.fd` against Python's datetime and dateutil (not
-      yet run). Nov 17: the tabular Islamic calendar (the four leap-year
+      `test_stdlib_calendar.fd` against Python's datetime and dateutil
+      (passed Nov 22 with `fid run`). Nov 17: the tabular Islamic calendar
+      (the four leap-year
       rules, civil and astronomical epochs) and the Hebrew calendar (molad
       of Tishri, the four postponements, Adar I/II) in stdlib/calendar.fd;
       month and weekday names of fr de es it pt ar (CLDR 47) in
@@ -2610,6 +2645,11 @@ owning what we ship.
       HebrewCalendar/HijriCalendar and chabad.org molad times. Left
       (optional): the Chinese calendar. (Marked done once the Nov 17 build
       passes `test_stdlib_calendar_lunar`.)
+      Nov 22 validation (`release/fid-dev.exe`): `test_tz`, `test_tzif`,
+      `test_tz_julian`, and `test_stdlib_calendar` pass under `fid run`;
+      the lunar-calendar test passes as a native PE. Its interpreter run
+      exceeded 180 seconds, so it was validated natively instead. The
+      Chinese calendar remains optional.
 - [x] SL9. Unicode: normalization, segmentation, case folding (L).
       Done: `stdlib/unicode_data.fd` (generated from Unicode 16, packed
       fixed-width-decimal tables — const arrays re-evaluate per access on
@@ -2637,7 +2677,7 @@ owning what we ship.
       streams and 1,800 corrupted ones decode as the reference decoder
       does; 39,000 corrupted zstd streams never panic). Left: compressing
       encoders for zstd and brotli.
-- [~] SL11. Encoding: base64, hex, CSV, XML, YAML, TOML, protobuf (L).
+- [x] SL11. Encoding: base64, hex, CSV, XML, YAML, TOML, protobuf (L).
       Done: CSV (RFC 4180, `test_csv.fd`) and the protobuf wire format
       (`stdlib/protobuf.fd`: varint, zigzag, fixed, length-delimited,
       packed, skipping unknown fields; `test_protobuf.fd` against bytes from
@@ -2669,6 +2709,10 @@ owning what we ship.
       (`xml_load_with`; `test_xml_dtd_ns.fd`). The TOML suite runs natively
       (2g.41 fixed in pe_ir's `p_str_concat`). Nothing is left once the
       Nov 17 build passes these tests.
+      Nov 22 validation (`release/fid-dev.exe` native PE): `test_encoding`,
+      CSV and dialects, protobuf, YAML library/spec, XML library/spec/DTD
+      and namespaces, and TOML library/spec/suite-spec all build and pass,
+      including YAML examples 2.11 and 2.25.
 - [~] SL12. Database drivers: PostgreSQL, MySQL, SQLite, with parameter binding (L).
       Done: `stdlib/sqlite.fd` binds the system sqlite3 (`SQLite::open*`,
       exec/query → JSON rows) and implements `db.fd`'s `Database`
@@ -2718,12 +2762,18 @@ owning what we ship.
       fuzz_shapes grows no corpus. `fid test -run <test>/<row>` works
       (driver-goals-check: the SL13 rows are ok). Left: that double free,
       then find, save, replay and corpus growth through sl13-fuzz-check.sh.
+      Nov 22 validation (`release/fid-dev.exe`): native
+      `test_stdlib_table.fd` matches its expected row output, and
+      `sl13-fuzz-check.sh` passes all seven stages (coverage, deterministic
+      saved input, replay, fixed regression, corpus seeding and growth).
+      The benchmark-runner path still needs a clean, reproducible check;
+      keep partial.
 - [x] SL14. Structured logging and metrics (M).
       Done: `metrics` (counters, gauges, histograms, Prometheus text format,
       `metrics_serve`); `log` with fields, JSON lines (`log_render_json`) and
       per-module levels (`logmf`, `log_set_module_level`), tests `test_log`,
       `test_log_module` (complaint CO3, CO4).
-- [~] SL15. A sampling profiler reachable from a running service (L).
+- [x] SL15. A sampling profiler reachable from a running service (L).
       Nov 16, native Linux (linux_runtime/sys.fd, on DB9's SIGPROF sampler):
       with FID_PROF set, `kill -USR2 <pid>` prints the profile so far to
       stderr while the program runs on, and FID_PROF_EVERY=<s> prints it
@@ -2793,6 +2843,20 @@ owning what we ship.
       ./fid.exe): run, ccompile, emit and x86_64-linux name prof_burn; no
       event without FID_PROF; 2 reports with FID_PROF=1; 3 with
       FID_PROF_EVERY=1; 3 with the event set by PowerShell.
+      Nov 22 rerun (`FID=release/fid-dev.exe`, `CC="zig cc"`): interpreter,
+      C, Windows native, event-triggered and periodic reports pass. The
+      WSL subcheck fails before running its binary (`chmod: cannot access
+      't_lx'`), so this rerun does not reconfirm the Linux path; keep partial.
+      Nov 22 follow-up: `sl15-check.sh` now invokes `wslpath` with
+      `wsl.exe -e` and disables MSYS path rewriting. Shell syntax and a
+      Git Bash-to-WSL path smoke pass; the end-to-end profiler rerun is
+      recorded below.
+      Nov 22 validation (`FID=release/fid-dev.exe`, `CC="zig cc"`):
+      `tests/prof/sl15-check.sh` passes end to end: interpreter, C, Windows
+      native, Linux x86_64 under WSL, profiler reports on the named event,
+      periodic reports, no report when disabled, and an event set by another
+      process. Together with the Linux running-service sampling probe above,
+      the service profiler acceptance is met.
 - [x] SL16. Big integers and decimals (M).
       Done: `stdlib/bigint.fd` (`test_bigint.fd`) and `stdlib/decimal.fd`:
       exact decimals on a BigInt mantissa, division and rounding to a scale
@@ -3121,7 +3185,7 @@ Every platform gets a tier, and a tier means CI, not a hope.
 - [x] PL1. Publish tiers: Tier 1 is tested on each commit, Tier 2 builds, Tier 3 is
       best effort (S).
       Done: `docs/reference/platforms.md`.
-- [ ] PL2. Tier 1: Windows x64, Linux x64, macOS ARM64, Linux ARM64 (release F4–F8)
+- [~] PL2. Tier 1: Windows x64, Linux x64, macOS ARM64, Linux ARM64 (release F4–F8)
       (XL).
       Nov 17: scripts/tier1.sh (lanes, expected-fail, binaries) per
       platform; .github/workflows/tier1.yml on windows-latest,
@@ -3130,6 +3194,17 @@ Every platform gets a tier, and a tier means CI, not a hope.
       loader are SKIP; bin-target-check.py fails runtime names imported
       from a shared library (docs/reference/tier-checks.md). Left: green
       full runs on all four (validation run and CI).
+      Nov 22: two blockers fixed on this machine. pl2-lane-skips-check
+      failed on a real aarch64 host (ubuntu-24.04-arm): cross-test.sh
+      dropped the qemu runner on `uname -m`, ignoring HOST_ARCH, so the
+      stand-in ELFs were exec'd directly (rc 126); the runner now follows
+      HOST_ARCH and the check forces x86_64 — PASS in WSL. A smoke tier1
+      (c and pe lanes PASS on Windows) exposed an `--nat` lane bug:
+      fs_copy_file onto itself returned 0 and emptied the file —
+      pe_win_stat never filled st_dev/st_ino, so pe_zc_same_file always
+      said different files; pe_win_stat now fills them through
+      GetFileInformationByHandle (import slot 80). Left: green full runs
+      on all four; macos-arm64 has no machine here (CI's macos-15).
 - [~] PL3. Tier 2: Windows ARM64, macOS x64, FreeBSD, RISC-V (L).
       Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
       validated — `@cfg` knows freebsd and unix (test_cfg, test_cfg_unix,
@@ -3340,7 +3415,7 @@ Only this produces true production years. It starts now, at small scale.
       site-memory-check.sh: PASS (59,196 KB after 150 requests, then 26,316
       KB after 300, 450 and 600); test_site_render prints its 51 lines.
       Left: hosting it (a Pages workflow or a server of ours).
-- [ ] AD3. `fides-os` as a standing test of bare-metal work (release G4) (M).
+- [~] AD3. `fides-os` as a standing test of bare-metal work (release G4) (M).
       Nov 17: scripts/fides-os-boot.sh boots minimal, shell (banner,
       command list, prompt) and shell-input (echo and mem typed through
       the PS/2 keyboard via QEMU sendkey, timer ticking); bare-metal.yml
@@ -3349,7 +3424,14 @@ Only this produces true production years. It starts now, at small scale.
       (docs/verification/fides-os-boot-2026-11-17.md). The 4 `guard`
       statements in compiler/ that stopped stage 0 are renamed
       (`FROM=compiler/main.fd scripts/stage0-names-check.sh`: PASS, Nov 18).
-      Left: a green CI run, FIDES_OS_TOKEN if fides-os is private.
+      Nov 22: in CI the fides-os job is correctly skipped on push events
+      (weekly/dispatch only); it still has no green run — the `qemu` job
+      it follows fails building the bare tests with the fidesc-built
+      stage 1 (the known-bugs 2g.79 wall; the pinned self-hosted stage 0
+      exists only as a Windows release/stage0/fid.exe, uncommitted, so CI
+      falls back to fidesc). Left: a green CI run — which needs either a
+      Linux stage-0 binary or the src/lower.rs temps port — and
+      FIDES_OS_TOKEN if fides-os is private.
 - [~] AD4. Every internal tool that can be in Fides is (M).
       Done (Nov 15): `docs/internal-tools.md` lists every script and tool
       and what keeps it out of Fides. Ported, with the same output as the

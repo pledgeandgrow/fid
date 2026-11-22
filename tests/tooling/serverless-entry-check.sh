@@ -15,7 +15,14 @@ export MSYS_NO_PATHCONV=1
 T=$(mktemp -d 2>/dev/null || echo "${TMPDIR:-/tmp}/fid_entry_$$")
 mkdir -p "$T"
 X=""
-case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) X=".exe" ;; esac
+TFID="$T"
+case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*)
+        X=".exe"
+        # `fid.exe` needs a Windows path; keep T's POSIX form for shell I/O.
+        TFID=$(cygpath -m "$T")
+        ;;
+esac
 fail=0
 ok() { echo "ok   $1"; }
 bad() { echo "FAIL $1"; fail=1; }
@@ -26,7 +33,7 @@ got=$("$FID" run "$SRC" 2>/dev/null | tr -d '\r')
 [ "$got" = "$want_whole" ] && ok "fid run: the whole program" || bad "fid run: got '$got'"
 
 # 2. the handler as the entry point: request from argv[1], else stdin
-if "$FID" emit "$SRC" --entry handle_request -o "$T/h$X" >"$T/emit.log" 2>&1; then
+if "$FID" emit "$SRC" --entry handle_request -o "$TFID/h$X" >"$T/emit.log" 2>&1; then
     got=$("$T/h$X" /hello | tr -d '\r')
     [ "$got" = "200 /hello 11" ] && ok "emit --entry: argv[1] request" || bad "emit --entry: argv[1] request: '$got'"
     got=$(echo /missing | "$T/h$X" | tr -d '\r')
@@ -39,14 +46,30 @@ else
 fi
 
 # 3. only what the handler reaches is lowered (x86-64 Linux listing on any host)
-"$FID" disasm "$SRC" --target x86_64-linux --entry handle_request >"$T/entry.s" 2>/dev/null
-"$FID" disasm "$SRC" --target x86_64-linux >"$T/whole.s" 2>/dev/null
-grep -q "<main_only_report>:" "$T/whole.s" && ok "whole program has main_only_report" || bad "whole program: no <main_only_report> in the listing"
-grep -q "<handle_request>:" "$T/entry.s" && grep -q "<route>:" "$T/entry.s" && ok "--entry keeps handle_request and route" || bad "--entry: handle_request or route missing"
-if grep -q "<main_only_report>:" "$T/entry.s" || grep -q "<fid_entry_program_main>:" "$T/entry.s"; then
-    bad "--entry: main's own code was lowered"
-else
-    ok "--entry: main and main_only_report not lowered"
+entry_disasm=1
+whole_disasm=1
+if ! "$FID" disasm "$SRC" --target x86_64-linux --entry handle_request >"$T/entry.s" 2>"$T/entry.err"; then
+    entry_error=$(tail -1 "$T/entry.s")
+    [ -n "$entry_error" ] || entry_error=$(tail -1 "$T/entry.err")
+    bad "--entry disassembly failed: $entry_error"
+    entry_disasm=0
+fi
+if ! "$FID" disasm "$SRC" --target x86_64-linux >"$T/whole.s" 2>"$T/whole.err"; then
+    whole_error=$(tail -1 "$T/whole.s")
+    [ -n "$whole_error" ] || whole_error=$(tail -1 "$T/whole.err")
+    bad "whole-program disassembly failed: $whole_error"
+    whole_disasm=0
+fi
+if [ $whole_disasm -eq 1 ]; then
+    grep -q "<main_only_report>:" "$T/whole.s" && ok "whole program has main_only_report" || bad "whole program: no <main_only_report> in the listing"
+fi
+if [ $entry_disasm -eq 1 ]; then
+    grep -q "<handle_request>:" "$T/entry.s" && grep -q "<route>:" "$T/entry.s" && ok "--entry keeps handle_request and route" || bad "--entry: handle_request or route missing"
+    if grep -q "<main_only_report>:" "$T/entry.s" || grep -q "<fid_entry_program_main>:" "$T/entry.s"; then
+        bad "--entry: main's own code was lowered"
+    else
+        ok "--entry: main and main_only_report not lowered"
+    fi
 fi
 
 # 4. errors
@@ -71,12 +94,12 @@ fn main() {
     println(int_to_str(add(1, 2)));
 }
 EOF
-if "$FID" emit "$T/two.fd" --entry add -o "$T/x$X" >"$T/e3.log" 2>&1; then
+if "$FID" emit "$TFID/two.fd" --entry add -o "$TFID/x$X" >"$T/e3.log" 2>&1; then
     bad "--entry with two parameters accepted"
 else
     grep -qF "2 parameters" "$T/e3.log" && ok "two-parameter handler refused" || bad "two-parameter handler: $(tail -1 "$T/e3.log")"
 fi
-if "$FID" emit "$T/two.fd" --entry ping -o "$T/p$X" >"$T/e4.log" 2>&1; then
+if "$FID" emit "$TFID/two.fd" --entry ping -o "$TFID/p$X" >"$T/e4.log" 2>&1; then
     got=$("$T/p$X" | tr -d '\r')
     [ "$got" = "7" ] && ok "handler without a request, i64 result" || bad "ping: '$got'"
     grep -qF "not marked @serverless" "$T/e4.log" && ok "unmarked handler noted" || bad "unmarked handler: no note"
@@ -91,7 +114,7 @@ if [ -n "${CC:-}" ]; then have_cc=1; fi
 for c in zig tcc gcc cc; do command -v $c >/dev/null 2>&1 && have_cc=1; done
 if [ -z "${CC:-}" ] && command -v zig >/dev/null 2>&1; then export CC="zig cc"; fi
 if [ $have_cc -eq 1 ]; then
-    if "$FID" ccompile "$SRC" --entry handle_request -o "$T/hc$X" >"$T/c.log" 2>&1; then
+    if "$FID" ccompile "$SRC" --entry handle_request -o "$TFID/hc$X" >"$T/c.log" 2>&1; then
         got=$("$T/hc$X" /hello | tr -d '\r')
         [ "$got" = "200 /hello 11" ] && ok "ccompile --entry" || bad "ccompile --entry: '$got'"
     else

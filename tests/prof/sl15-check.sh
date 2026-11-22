@@ -73,9 +73,13 @@ fi
 # 1d. Windows: the Linux x86-64 build under WSL
 if [ $WIN -eq 1 ] && command -v wsl.exe > /dev/null 2>&1; then
     if "$FID" emit "$T" --target x86_64-linux -o "$D/t_lx" > "$D/lx.log" 2>&1; then
-        WD=$(wsl.exe wslpath -a "$(cygpath -w "$PWD/$D")" 2> /dev/null | tr -d '\r')
-        wsl.exe -e sh -c "cd '$WD' && chmod +x t_lx && ./t_lx > lx.out 2> lx.err"
-        check_run "emit x86_64-linux (WSL)" "$D/lx.out" "$D/lx.err"
+        WIN_DIR=$(cygpath -m "$PWD/$D")
+        WD=$(MSYS_NO_PATHCONV=1 wsl.exe -e wslpath -a "$WIN_DIR" 2> /dev/null | tr -d '\r')
+        if [ -n "$WD" ] && MSYS_NO_PATHCONV=1 wsl.exe -e sh -c "cd '$WD' && chmod +x t_lx && ./t_lx > lx.out 2> lx.err"; then
+            check_run "emit x86_64-linux (WSL)" "$D/lx.out" "$D/lx.err"
+        else
+            bad "emit x86_64-linux (WSL): could not resolve or run $WIN_DIR"
+        fi
     else
         bad "emit --target x86_64-linux failed"; tail -20 "$D/lx.log"
     fi

@@ -64,7 +64,7 @@ hasx ":caps of a pure function" "tri : none"
 hasx ":caps of a printing function" "shout : IO"
 hasx ":caps of a file read" "slurp : FS"
 has ":opt of a pure function" "; --- function tri after iropt (effects: pure) ---"
-has ":opt names the effects" "; --- function shout after iropt (effects: IO"
+haserr ":opt explains an inlined function" "error: 'shout' was inlined into its callers and removed by the optimizer"
 haserr ":pir says it was removed" ":pir was removed with the PIR path"
 # continuation lines are kept as typed, indentation included
 has ":defs keeps the multi-line definition" "    while i <= n {"

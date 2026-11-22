@@ -3484,6 +3484,14 @@ fn lw_apply_infer_rets(p: Program) -> Program {
 }
 
 pub fn Lowerer_lower_program(self: & mut Lowerer, program_in: Program) -> IrModule {
+    // 0008: the parser's sequential vars (Vec<E..>) route to VecV_*
+    g_lw_sequential_vars = Vec::new();
+    var sv_i: i64 = 0;
+    val sv_src: Vec<str> = parser_sequential_vars();
+    while sv_i < sv_src.len() {
+        g_lw_sequential_vars.push(sv_src.get(sv_i));
+        sv_i = sv_i + 1;
+    }
     var program: Program = lw_apply_infer_rets(program_in);
     // Register constants
     var i: i64 = 0;
@@ -11277,6 +11285,28 @@ fn Lowerer_lower_stmt_inner(self: & mut Lowerer, stmt: Stmt) {
 // statement-dropping bug in long functions. Lowerer_lower_expr is ~16K lines
 // of generated C, and statements in the MethodCall branch were being dropped.
 /// The element AST type of a Vec<E..> receiver expression.
+// --- 0008: the @sequential vars (their Vec method calls route to VecV_*) --
+var g_lw_sequential_vars: Vec<str> = Vec::new();
+
+/// Whether `e` (an Ident) names a var declared Vec<E..> (the parser's
+/// sequential list, copied by Lowerer_lower_program).
+fn lw_is_sequential_var(e: Expr) -> bool {
+    match e {
+        Expr::Ident(n) => {
+            var i: i64 = 0;
+            while i < g_lw_sequential_vars.len() {
+                if g_lw_sequential_vars.get(i) == n {
+                    return true;
+                }
+                i = i + 1;
+            }
+        }
+        _ => {
+        }
+    }
+    return false;
+}
+
 fn Lowerer_vecv_elem_ast(self: & Lowerer, receiver: Expr) -> Type {
     match receiver {
         Expr::Ident(vn) => {
@@ -11284,7 +11314,7 @@ fn Lowerer_vecv_elem_ast(self: & Lowerer, receiver: Expr) -> Type {
                 OptType::Some(at) => {
                     match at {
                         Type::Generic(gn, ga) => {
-                            if gn == "VecV" && ga.len() == 1 {
+                            if gn == "Vec" && ga.len() == 1 {
                                 return ga.get(0);
                             }
                         }
@@ -11428,10 +11458,6 @@ pub fn Lowerer_lower_method_call(self: & mut Lowerer, receiver: Box<Expr>, metho
             if name == "Vec" && method == "filled" && args.len() == 2 && Lowerer_has_function(self, "Vec_filled_typed") {
                 return Lowerer_lower_vec_filled(self, args, Type::Infer);
             }
-            if name == "VecV" && method == "new" {
-                var venv: i64 = Lowerer_emit_inst(self, Inst::ConstInt(0, IrType::I64));
-                return Lowerer_emit_inst(self, Inst::Call("VecV_new", lw_c_vec1_i64(venv), IrType::Opaque("VecV"), EffectSet_new()));
-            }
             if name == "Vec" && method == "new" {
                 var dummy_env: i64 = Lowerer_emit_inst(self, Inst::ConstInt(0, IrType::I64));
                 return Lowerer_emit_inst(self, Inst::Call("Vec_new", lw_c_vec1_i64(dummy_env), IrType::Opaque("Vec"), EffectSet_new()));
@@ -11472,30 +11498,9 @@ pub fn Lowerer_lower_method_call(self: & mut Lowerer, receiver: Box<Expr>, metho
     var recv_val: i64 = Lowerer_lower_expr(self, lw_box_expr_unbox(receiver));
     var recv_ty: IrType = Lowerer_get_value_type(self, recv_val);
 
-    // 0008 (FID_CONTIGUOUS): a Vec<E..>'s methods — the variant stream's
-    // own core functions (the generic Vec_ path must not touch it)
-    var vv_hit: bool = false;
-    match recv_ty {
-        IrType::Ptr(vv_inner) => {
-            match box_ir_type_unbox(vv_inner) {
-                IrType::Opaque(vv_on) => {
-                    if vv_on == "VecV" {
-                        vv_hit = true;
-                    }
-                }
-                _ => {
-                }
-            }
-        }
-        IrType::Opaque(vv_on2) => {
-            if vv_on2 == "VecV" {
-                vv_hit = true;
-            }
-        }
-        _ => {
-        }
-    }
-    if vv_hit {
+    // 0008 (FID_CONTIGUOUS): a @sequential Vec<E>'s methods — the variant
+    // stream's own core functions (the generic Vec_ path must not touch it)
+    if lw_is_sequential_var(lw_box_expr_unbox(receiver)) {
         return Lowerer_vecv_method(self, receiver, recv_val, method, args);
     }
 

@@ -9040,18 +9040,28 @@ fn temp_drop_fn(f: &IrFunction, id: &ValueId) -> Option<&'static str> {
     }
 }
 
-/// Whether `inst` may end a statement that owns a temporary: it reads the
-/// value through its handle and keeps no reference to it (VEC_LOCAL_CALLS
-/// and the map reads), or prints it. A user outside this set — a Store,
-/// an arbitrary call — is left alone, never a dangling drop.
-fn temp_user_keeps_nothing(inst: &Inst) -> bool {
+/// Whether this use may end a statement temporary. Container receivers are
+/// local uses; owned values passed to mutators are transferred, not dropped.
+fn temp_user_keeps_nothing(inst: &Inst, value: ValueId) -> bool {
     match inst {
-        Inst::Call { func, .. } => {
-            VEC_LOCAL_CALLS.contains(&func.as_str())
-                || matches!(
-                    func.as_str(),
-                    "Vec_to_str" | "HashMap_get" | "HashMap_insert" | "HashMap_keys" | "HashMap_share"
-                )
+        Inst::Call { func, args, .. } => {
+            let receiver = args.get(1) == Some(&value);
+            let stored_arg = match func.as_str() {
+                "Vec_push" => args.get(2) == Some(&value),
+                "Vec_set" => args.get(3) == Some(&value),
+                "HashMap_insert" | "HashMap_insert_i" | "HashMap_set" | "HashMap_set_i" => {
+                    args.get(2..).is_some_and(|tail| tail.contains(&value))
+                }
+                _ => false,
+            };
+            !stored_arg
+                && receiver
+                && (VEC_LOCAL_CALLS.contains(&func.as_str())
+                    || matches!(
+                        func.as_str(),
+                        "Vec_to_str" | "HashMap_get" | "HashMap_insert" | "HashMap_insert_i"
+                            | "HashMap_set" | "HashMap_set_i" | "HashMap_keys" | "HashMap_share"
+                    ))
         }
         Inst::Print { .. } => true,
         _ => false,
@@ -9092,7 +9102,7 @@ fn drop_function_vecs(f: &mut IrFunction, borrows: &VecBorrows) {
         }
         let ok = f.instructions.get(&u).map_or(false, |ui| match ui {
             Inst::Call { func, .. } if func == "Vec_drop" || func == "HashMap_drop" || func == "Str_drop" => false,
-            _ => temp_user_keeps_nothing(ui),
+            _ => temp_user_keeps_nothing(ui, *id),
         });
         if ok {
             temps.entry(u).or_default().push((*id, drop_fn));

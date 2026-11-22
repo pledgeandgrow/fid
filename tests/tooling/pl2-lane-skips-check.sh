@@ -62,8 +62,10 @@ mkdir -p "$TMP/noloader" "$TMP/sysroot/lib"
 
 lane() {  # lane <name> <QEMU_LD_PREFIX>: the four tests on aarch64-linux
   : > "$FAKE_LOG"
+  # HOST_ARCH=x86_64: the check is of the qemu path; on an aarch64 host
+  # (ubuntu-24.04-arm, PL2) cross-test.sh would run the fake ELFs itself
   PATH="$TMP/bin:$PATH" QEMU_LD_PREFIX="$2" NATIVE=1 FID="$TMP/bin/fid" OUT="$TMP/out-$1" JOBS=1 \
-    LANE_SKIPS="$TMP/skips.txt" bash scripts/cross-test.sh aarch64-linux \
+    HOST_ARCH=x86_64 LANE_SKIPS="$TMP/skips.txt" bash scripts/cross-test.sh aarch64-linux \
     "$TMP/t_static.fd" "$TMP/t_cdyn.fd" "$TMP/t_rtdyn.fd" "$TMP/t_skipme.fd" > "$TMP/$1.log" 2>&1
 }
 res() { grep -a "^[A-Z]* *$2\b" "$TMP/out-$1-native/results.txt" 2>/dev/null; }

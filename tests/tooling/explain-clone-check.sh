@@ -11,15 +11,13 @@ fail=0
 has() {
     if grep -qF -- "$2" "$OUT"; then echo "ok   $1"; else echo "FAIL $1: no line with: $2"; fail=1; fi
 }
-# keep_both: `var b: Vec<i64> = a;` is line 30
-has "Vec share in keep_both" "line 30: clone required here because \`a\` still owns the value"
-has "copy kept in b" "the copy is kept in \`b\`"
+# keep_both: `var b: Vec<i64> = a;` is line 31
+has "Vec share in keep_both" "line 31: clone required here because \`a\` still owns the value (reading a variable borrows it), and the copy is kept in \`b\`"
 has "share cost" "a Vec share: the buffer is copied only when one of the two changes it"
-# into_field: the parameter kept in a field (line 39)
-has "parameter borrowed" "line 39: clone required here because it is a parameter, and parameters are borrowed"
-# copy_str: `var t: str = s;` (line 45)
-has "string copy" "line 45: clone required here because \`s\` still owns the value"
-has "string kept in t" "the copy is kept in \`t\`"
+# into_field: the parameter kept in a field (line 40); this also exercises a
+# string owner increment without copying its bytes.
+has "parameter borrowed" "line 40: clone required here because it is a parameter, and parameters are borrowed (the caller keeps its owner)"
+has "copy kept in a field" "the copy is kept in a struct field"
 has "string cost" "the string's owner count goes up: no bytes are copied"
 rm -f "$OUT"
 exit $fail

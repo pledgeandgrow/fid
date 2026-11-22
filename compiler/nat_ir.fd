@@ -6240,6 +6240,12 @@ fn ng_sw_plan(g: &NatGen, rec: &NatFnRec, al: &NatAlloc) -> Vec<i64> {
             if m3.op == MO_EPILOGUE || m3.op == MO_CALL {
                 exitb.set(b, 1);
             }
+            // RA12: a tail call (MI28) is a MO_JMP to a function, not to
+            // a placed label — the block leaves the function too, so its
+            // callee-saved registers must be restored
+            if m3.op == MO_JMP && m3.i0 >= 0 && !HashMap_contains_i(labs, m3.i0) {
+                exitb.set(b, 1);
+            }
             if m3.op >= 0 && m3.op != MO_LINE && m3.op != MO_PLACE && m3.op != MO_PROLOGUE && m3.op != MO_EPILOGUE {
                 var f: i64 = 0;
                 while f < 3 {
@@ -31902,7 +31908,9 @@ pub fn nat_pie_wanted() -> bool {
     if g_nat_pie_req < 0 {
         return false;
     }
-    return ng_opt_in("pie");
+    // TG14: PIE is the default on Linux targets (since Nov 22): --pie /
+    // --no-pie override; FID_NAT_OFF=pie turns it off for a comparison
+    return true;
 }
 
 /// TG14: the first thing a position-independent executable's _start does.
@@ -35635,6 +35643,9 @@ fn ng_win_imports() -> Vec<str> {
     v.push("kernel32.dll|SetHandleInformation");
     // 79: the working set (win.fd PE_W_MEM_INFO, pert_mem_resident, RT7)
     v.push("kernel32.dll|K32GetProcessMemoryInfo");
+    // 80: a file's identity (win.fd PE_W_FILE_INFO: pe_win_stat fills st_dev
+    // and st_ino, which sys.fd's pe_zc_same_file compares, RT14)
+    v.push("kernel32.dll|GetFileInformationByHandle");
     return v;
 }
 

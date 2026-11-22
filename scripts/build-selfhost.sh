@@ -1,12 +1,13 @@
 #!/bin/bash
 # build-selfhost.sh — build the self-hosted Fides compiler into release/.
 #
-# Output:
-#   release/fid-dev.c    — generated C source (fidesc dump-c compiler/main.fd)
-#   release/fid-dev.exe  — compiled binary (with 256MB-stack wrapper)
+# Output (OUT, default `release`):
+#   $OUT/fid-dev.c    — generated C source (fidesc dump-c compiler/main.fd)
+#   $OUT/fid-dev.exe  — compiled binary (with 256MB-stack wrapper)
 #
 # Usage:
 #   ./scripts/build-selfhost.sh            # dump-c + compile
+#   OUT=/tmp/fid-dev-next ./scripts/build-selfhost.sh  # isolated output
 #   STAGE0=./build/bootstrap/fides-c3 ./scripts/build-selfhost.sh   # self-compile
 #
 # C compiler: $CC if set, else the first of tcc, gcc, clang, `zig cc`.
@@ -15,7 +16,7 @@
 # (optimizing it whole needs >16GB RAM with clang).
 set -u
 cd "$(dirname "$0")/.." || exit 1
-OUT=release
+OUT="${OUT:-release}"
 # As scripts/bootstrap.sh: prefer the pinned self-hosted stage 0 (which has
 # `split-c` and builds 8 units at -O2) over a cold fidesc start.
 STAGE0="${STAGE0:-}"

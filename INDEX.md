@@ -89,6 +89,7 @@ and `AGENTS.md` first when working on the compiler.
 | [roadmap/inc-roadmap.md](docs/roadmap/inc-roadmap.md) | Incremental compilation. |
 | [roadmap/complaint-roadmap.md](docs/roadmap/complaint-roadmap.md) | Developer complaints about other languages and Fid's answers. |
 | [roadmap/llvm-roadmap.md](docs/roadmap/llvm-roadmap.md) | Own-backend roadmap: one machine layer, SSA and a rules mid-end, whole-program and language-fact optimizations, compile speed, reliability (200 goals). |
+| [roadmap/external-roadmap.md](docs/roadmap/external-roadmap.md) | Goals no code can finish: security audits and a bug bounty, certification, production use, community, teaching, a foundation. |
 | [roadmap/safety-critical.md](docs/roadmap/safety-critical.md) | Safety-critical roadmap (IEC 62304 / DO-178C class work). |
 | [roadmap/security-roadmap.md](docs/roadmap/security-roadmap.md) | Security hardening guide and exploit-class coverage. |
 | [roadmap/bug-audit-2026-10-22.md](docs/roadmap/bug-audit-2026-10-22.md) | Dated bug-audit snapshot. |

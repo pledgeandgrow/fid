@@ -86,9 +86,12 @@ case "$TARGET" in
   *) echo "unknown target: $TARGET"; exit 1 ;;
 esac
 # A Linux host of the target's own architecture (an ARM64 runner for
-# aarch64-linux, PL2) runs the binaries itself, without qemu
+# aarch64-linux, PL2) runs the binaries itself, without qemu. HARCH, not
+# uname -m: HOST_ARCH says what the host runs natively when the shell
+# cannot tell (the pl2 lane-skips check forces x86_64 to keep qemu on an
+# ARM64 runner)
 if [ "$HOST" = linux ]; then
-  case "$(uname -m)-$RUNNER" in
+  case "$HARCH-$RUNNER" in
     aarch64-qemu-aarch64|arm64-qemu-aarch64|riscv64-qemu-riscv64) RUNNER="" ;;
   esac
 fi

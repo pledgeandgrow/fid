@@ -39,14 +39,14 @@ extern "C" {
     // machine layer's interface name (prim_interface_names), the Fides
     // name the one this runtime calls; pe_ir gives both the same bytes
     // (PeirGen_nat_alias)
-    fn nat_atomic_load as pe_atomic_load(addr: i64) -> i64;
-    fn nat_atomic_store as pe_atomic_store(addr: i64, value: i64);
-    fn nat_atomic_add as pe_atomic_add(addr: i64, value: i64) -> i64;
-    fn nat_atomic_cas as pe_atomic_cas(addr: i64, expected: i64, new_value: i64) -> bool;
+    fn nat_atomic_load as nat_atomic_load(addr: i64) -> i64;
+    fn nat_atomic_store as nat_atomic_store(addr: i64, value: i64);
+    fn nat_atomic_add as nat_atomic_add(addr: i64, value: i64) -> i64;
+    fn nat_atomic_cas as nat_atomic_cas(addr: i64, expected: i64, new_value: i64) -> bool;
     fn pe_fn_lookup(name: str) -> i64;
-    fn nat_call_fn as pe_call_fn(addr: i64, nargs: i64, argv: i64) -> i64;
+    fn nat_call_fn as nat_call_fn(addr: i64, nargs: i64, argv: i64) -> i64;
     fn pe_thread_entry_addr() -> i64;
-    fn nat_ctx_swap as pe_ctx_swap(save: i64, sp: i64);
+    fn nat_ctx_swap as nat_ctx_swap(save: i64, sp: i64);
     fn nat_ctx_tramp as pe_ctx_tramp_addr() -> i64;
 }
 
@@ -261,11 +261,11 @@ fn pe_rnd_init() {
 @wrapping
 fn pe_rnd_next() -> i64 {
     while true {
-        var x: i64 = pe_atomic_load(pert_rnd);
+        var x: i64 = nat_atomic_load(pert_rnd);
         var y: i64 = x ^ (x << 13);
         y = y ^ ((y >> 7) & 0x01FFFFFFFFFFFFFF);
         y = y ^ (y << 17);
-        if pe_atomic_cas(pert_rnd, x, y) == true {
+        if nat_atomic_cas(pert_rnd, x, y) == true {
             return y & 0x7FFFFFFFFFFFFFFF;
         }
     }
@@ -354,9 +354,9 @@ pub fn pert_thread_main(block: i64) -> i64 {
     if pe_load(block + 96) == 0 {
         pe_pf_thread_start(pe_load(block));
     }
-    var result: i64 = pe_call_fn(pe_load(block), pe_load(block + 8), block + 16);
+    var result: i64 = nat_call_fn(pe_load(block), pe_load(block + 8), block + 16);
     pe_store(block + 88, result);
-    pe_atomic_store(block + 80, 1);
+    nat_atomic_store(block + 80, 1);
     // A task runs on its own stack: it ends by giving control back for good
     if pe_load(block + 96) != 0 {
         pe_co_leave();
@@ -400,14 +400,14 @@ fn pe_ctx_thread() -> i64 {
 /// another thread can still be leaving there: claim it before writing its
 /// block (where it returns to), or it reads this thread's values on its way out.
 fn pe_ctx_claim(to: i64) {
-    while pe_atomic_load(to + 16) != 0 {
+    while nat_atomic_load(to + 16) != 0 {
     }
     pe_store(to + 16, 1);
 }
 
 /// Save the running context in `from`, resume `to` (claimed)
 fn pe_ctx_resume(from: i64, to: i64) {
-    pe_ctx_swap(from, pe_load(to));
+    nat_ctx_swap(from, pe_load(to));
 }
 
 /// Save the running context in `from`, resume `to` (once it is saved)
@@ -596,8 +596,8 @@ fn pe_lq_rec(wid: i64) -> i64 {
 /// Tasks on worker wid's ring, a snapshot (thieves may change it at once).
 fn pe_lq_size(wid: i64) -> i64 {
     var q: i64 = pe_lq_rec(wid);
-    var t: i64 = pe_atomic_load(q);
-    var b: i64 = pe_atomic_load(q + 64);
+    var t: i64 = nat_atomic_load(q);
+    var b: i64 = nat_atomic_load(q + 64);
     if b > t {
         return b - t;
     }
@@ -619,7 +619,7 @@ fn pe_lq_total() -> i64 {
 fn pe_lq_push(t: i64, wid: i64) -> bool {
     var q: i64 = pe_lq_rec(wid);
     var b: i64 = pe_load(q + 64);  // only this thread writes bottom
-    if b - pe_atomic_load(q) >= PE_LQ_CAP {
+    if b - nat_atomic_load(q) >= PE_LQ_CAP {
         return false;
     }
     pe_store(pe_load(q + 128) + (b & (PE_LQ_CAP - 1)) * 8, t);
@@ -628,7 +628,7 @@ fn pe_lq_push(t: i64, wid: i64) -> bool {
     } else {
         // xchg: the slot is visible before the index, and the caller's
         // read of pert_idle after it cannot pass it (no lost wake-up)
-        pe_atomic_store(q + 64, b + 1);
+        nat_atomic_store(q + 64, b + 1);
     }
     return true;
 }
@@ -639,8 +639,8 @@ fn pe_lq_pop(wid: i64) -> i64 {
     var q: i64 = pe_lq_rec(wid);
     var buf: i64 = pe_load(q + 128);
     while true {
-        var t: i64 = pe_atomic_load(q);
-        var b: i64 = pe_atomic_load(q + 64);
+        var t: i64 = nat_atomic_load(q);
+        var b: i64 = nat_atomic_load(q + 64);
         if b - t <= 0 {
             return 0;
         }
@@ -652,7 +652,7 @@ fn pe_lq_pop(wid: i64) -> i64 {
             pe_store(task + 192, 0);
             return task;
         }
-        if pe_atomic_cas(q, t, t + 1) == true {
+        if nat_atomic_cas(q, t, t + 1) == true {
             pe_store(task + 192, 0);
             return task;
         }
@@ -672,8 +672,8 @@ fn pe_lq_steal_half(wid: i64, v: i64) -> i64 {
     var mb: i64 = pe_load(mine + 64);
     var mask: i64 = PE_LQ_CAP - 1;
     while true {
-        var t: i64 = pe_atomic_load(q);
-        var b: i64 = pe_atomic_load(q + 64);
+        var t: i64 = nat_atomic_load(q);
+        var b: i64 = nat_atomic_load(q + 64);
         var n: i64 = b - t;
         if n <= 0 {
             return 0;
@@ -687,10 +687,10 @@ fn pe_lq_steal_half(wid: i64, v: i64) -> i64 {
             pe_store(mbuf + ((mb + i) & mask) * 8, pe_load(vbuf + ((t + i) & mask) * 8));
             i = i + 1;
         }
-        if pe_atomic_cas(q, t, t + n) == true {
+        if nat_atomic_cas(q, t, t + n) == true {
             var run: i64 = pe_load(mbuf + ((mb + n - 1) & mask) * 8);
             if n > 1 {
-                pe_atomic_store(mine + 64, mb + n - 1);
+                nat_atomic_store(mine + 64, mb + n - 1);
             }
             pe_store(run + 192, 0);
             return run;
@@ -790,14 +790,14 @@ fn pe_lq_spill(t: i64, wid: i64) {
     var q: i64 = pe_lq_rec(wid);
     var buf: i64 = pe_load(q + 128);
     var b: i64 = pe_load(q + 64);
-    var top: i64 = pe_atomic_load(q);
+    var top: i64 = nat_atomic_load(q);
     var half: i64 = (b - top) / 2;
     var claimed: bool = half <= 0;
     while !claimed {
-        if pe_atomic_cas(q, top, top + half) == true {
+        if nat_atomic_cas(q, top, top + half) == true {
             claimed = true;
         } else {
-            top = pe_atomic_load(q);
+            top = nat_atomic_load(q);
             half = (b - top) / 2;
             if half <= 0 {
                 half = 0;
@@ -831,7 +831,7 @@ fn pe_wq_push(t: i64) {
     if wid != 0 {
         if !pe_lq_push(t, wid - 1) {
             pe_lq_spill(t, wid - 1);
-        } else if pe_atomic_load(pert_idle) > 0 {
+        } else if nat_atomic_load(pert_idle) > 0 {
             pe_wq_signal();
         }
         return;
@@ -849,7 +849,7 @@ fn pe_wq_push_yielded(t: i64, wid: i64) {
     var backlog: bool = pe_lq_size(wid) != 0 || pert_wq_head != 0;
     if !pe_lq_push(t, wid) {
         pe_lq_spill(t, wid);
-    } else if backlog && pe_atomic_load(pert_idle) > 0 {
+    } else if backlog && nat_atomic_load(pert_idle) > 0 {
         pe_wq_signal();
     }
 }
@@ -881,7 +881,7 @@ fn pe_rnd_take_locked(wid: i64) -> i64 {
             j = j - 1;
         }
         pe_store(buf + (top & mask) * 8, cur);
-        pe_atomic_store(q, top + 1);
+        nat_atomic_store(q, top + 1);
     } else {
         cur = pert_wq_head;
         while i < k - nl {
@@ -938,11 +938,11 @@ fn pe_wq_pop(wid: i64) -> i64 {
             return t;
         }
         pe_k_lock(pert_wq);
-        pe_atomic_add(pert_idle, 1);
+        nat_atomic_add(pert_idle, 1);
         if pert_wq_head == 0 && pe_lq_total() == 0 {
             pe_k_cond_wait(pert_wq + 8, pert_wq, pe_infinite(), 0);
         }
-        pe_atomic_add(pert_idle, 0 - 1);
+        nat_atomic_add(pert_idle, 0 - 1);
         pe_k_unlock(pert_wq);
     }
     return 0;
@@ -1021,20 +1021,20 @@ fn pe_tok_cancelled(tok: i64) -> bool {
     var depth: i64 = 0;
     var now: i64 = 0;
     while t != 0 && depth < 64 {
-        if pe_atomic_load(t) != 0 {
+        if nat_atomic_load(t) != 0 {
             return true;
         }
-        var dl: i64 = pe_atomic_load(t + 8);
+        var dl: i64 = nat_atomic_load(t + 8);
         if dl != 0 {
             if now == 0 {
                 now = pert_clock_mono_ms();
             }
             if now >= dl {
-                pe_atomic_store(t, 1);
+                nat_atomic_store(t, 1);
                 return true;
             }
         }
-        t = pe_atomic_load(t + 16);
+        t = nat_atomic_load(t + 16);
         depth = depth + 1;
     }
     return false;
@@ -1051,7 +1051,7 @@ fn pe_tok_slice(tok: i64, left: i64) -> i64 {
     var t: i64 = tok;
     var depth: i64 = 0;
     while t != 0 && depth < 64 {
-        var dl: i64 = pe_atomic_load(t + 8);
+        var dl: i64 = nat_atomic_load(t + 8);
         if dl != 0 {
             var r: i64 = 0;
             if dl > now {
@@ -1061,7 +1061,7 @@ fn pe_tok_slice(tok: i64, left: i64) -> i64 {
                 s = r;
             }
         }
-        t = pe_atomic_load(t + 16);
+        t = nat_atomic_load(t + 16);
         depth = depth + 1;
     }
     return s;
@@ -1139,7 +1139,7 @@ pub fn pert_task_chain() {
 fn pe_co_new(name: str, nargs: i64, argv: i64) -> i64 {
     var block: i64 = pe_co_new_block(name, nargs, argv);
     pe_wq_push(block);
-    pe_atomic_add(pert_offq, 0 - 1);
+    nat_atomic_add(pert_offq, 0 - 1);
     return block;
 }
 
@@ -1199,8 +1199,8 @@ fn pe_co_new_block(name: str, nargs: i64, argv: i64) -> i64 {
     pe_k_unlock(pert_reg);
     // Live but on no queue until its creator queues or enters it: the
     // deadlock detector must not count it as stuck (RT10)
-    pe_atomic_add(pert_offq, 1);
-    pe_atomic_add(pert_live, 1);
+    nat_atomic_add(pert_offq, 1);
+    nat_atomic_add(pert_live, 1);
     return block;
 }
 
@@ -1568,7 +1568,7 @@ fn pe_co_finish_task(block: i64) {
     pe_k_unlock(pert_reg);
     pe_ctx_free(pe_load(block + 104));
     pe_k_lock(pert_done);
-    pe_atomic_add(pert_live, 0 - 1);
+    nat_atomic_add(pert_live, 0 - 1);
     pe_k_cond_broadcast(pert_done + 8);
     pe_k_unlock(pert_done);
     if pe_load(block + 160) != 0 {
@@ -1662,8 +1662,8 @@ pub fn pert_poller_main(id: i64) -> i64 {
         // Soonest deadline is the heap top; armed timers count as waiters.
         first = pe_timer_peek();
         waiters = waiters + pert_timer_n + pert_afd_n;
-        var live_n: i64 = pe_atomic_load(pert_live);
-        var idle_n: i64 = pe_atomic_load(pert_idle);
+        var live_n: i64 = nat_atomic_load(pert_live);
+        var idle_n: i64 = nat_atomic_load(pert_idle);
         var queue_empty: bool = pert_wq_head == 0 && pe_lq_total() == 0;
         pe_k_unlock(pert_reg);
 
@@ -1674,7 +1674,7 @@ pub fn pert_poller_main(id: i64) -> i64 {
         // A task still being made, or run inline by `async` on a thread that
         // is not a worker, is not stuck: main spawning 200,000 tasks while
         // the workers drained the queue panicked here (RT10 bench)
-        var looks_dead: bool = live_n > 0 && queue_empty && idle_n >= pert_nworkers && waiters == 0 && pe_atomic_load(pert_offq) == 0;
+        var looks_dead: bool = live_n > 0 && queue_empty && idle_n >= pert_nworkers && waiters == 0 && nat_atomic_load(pert_offq) == 0;
         if looks_dead {
             pert_dl_streak = pert_dl_streak + 1;
         } else {
@@ -1963,7 +1963,7 @@ pub fn pert_co_pool_call(name: str, nargs: i64, argv: i64) -> i64 {
     var cur: i64 = pe_co_cur();
     var fn_addr: i64 = pe_fn_lookup(name);
     if cur == 0 || fn_addr == 0 {
-        return pe_call_fn(fn_addr, nargs, argv);
+        return nat_call_fn(fn_addr, nargs, argv);
     }
     var job: i64 = pe_zeroed(16);
     pe_store(job, fn_addr);
@@ -2011,9 +2011,9 @@ pub fn pert_pool_main(id: i64) -> i64 {
             pert_pool_tail = 0;
         }
         pe_k_unlock(pert_poolq);
-        var r: i64 = pe_call_fn(pe_load(job), pe_load(job + 8), job + 16);
+        var r: i64 = nat_call_fn(pe_load(job), pe_load(job + 8), job + 16);
         pe_store(job + 88, r);
-        pe_atomic_store(job + 80, 1);
+        nat_atomic_store(job + 80, 1);
         // Wake the waiting task under the registry lock: unlink it if its
         // wait_add already ran, then mark it queued so workers never push it
         // a second time.
@@ -2062,7 +2062,7 @@ pub fn pert_co_async_v(name: str, nargs: i64, argv: i64) -> i64 {
         // It yielded: queue it. A blocked one is the poller/pool's to wake.
         pe_wq_push(block);
     }
-    pe_atomic_add(pert_offq, 0 - 1);
+    nat_atomic_add(pert_offq, 0 - 1);
     return block | (0x7FA5 << 48);
 }
 
@@ -2113,7 +2113,7 @@ fn pe_co_handoff(c: i64) -> bool {
     var backlog: bool = pe_lq_size(wid) != 0 || pert_wq_head != 0;
     if !pe_lq_push(c, wid) {
         pe_lq_spill(c, wid);
-    } else if backlog && pe_atomic_load(pert_idle) > 0 {
+    } else if backlog && nat_atomic_load(pert_idle) > 0 {
         pe_wq_signal();
     }
     // `c` is on a queue before its registers are saved: a worker that takes
@@ -2142,7 +2142,7 @@ pub fn pert_co_tick() {
 pub fn pert_co_run() -> i64 {
     pe_co_ensure();
     pe_k_lock(pert_done);
-    while pe_atomic_load(pert_live) > 0 {
+    while nat_atomic_load(pert_live) > 0 {
         pe_k_cond_wait(pert_done + 8, pert_done, 50, 0);
     }
     pe_k_unlock(pert_done);
@@ -2607,7 +2607,7 @@ fn pe_task_index(f: i64) -> i64 {
 }
 
 fn pe_task_done(idx: i64) -> bool {
-    return pe_atomic_load(pe_load(pert_thread_blocks + idx * 8) + 80) != 0;
+    return nat_atomic_load(pe_load(pert_thread_blocks + idx * 8) + 80) != 0;
 }
 
 /// Join thread idx (once) and return its result.
@@ -2702,9 +2702,9 @@ pub fn pert_executor_run_all(exec: i64) -> i64 {
         i = i + 1;
     }
     if pert_live != 0 {
-        var joined: i64 = pe_atomic_load(pert_live);
+        var joined: i64 = nat_atomic_load(pert_live);
         pe_k_lock(pert_done);
-        while pe_atomic_load(pert_live) > 0 {
+        while nat_atomic_load(pert_live) > 0 {
             pe_k_cond_wait(pert_done + 8, pert_done, 50, 0);
         }
         pe_k_unlock(pert_done);
@@ -2761,29 +2761,29 @@ pub fn pert_shared_alloc(size: i64) -> i64 {
 
 pub fn pert_atomic_load(addr: i64) -> i64 {
     pe_rnd_jitter();
-    return pe_atomic_load(addr);
+    return nat_atomic_load(addr);
 }
 
 pub fn pert_atomic_store(addr: i64, value: i64) {
     pe_rnd_jitter();
-    pe_atomic_store(addr, value);
+    nat_atomic_store(addr, value);
 }
 
 /// The previous value.
 pub fn pert_atomic_add(addr: i64, value: i64) -> i64 {
     pe_rnd_jitter();
-    return pe_atomic_add(addr, value);
+    return nat_atomic_add(addr, value);
 }
 
 /// The previous value.
 @wrapping
 pub fn pert_atomic_sub(addr: i64, value: i64) -> i64 {
-    return pe_atomic_add(addr, 0 - value);
+    return nat_atomic_add(addr, 0 - value);
 }
 
 pub fn pert_atomic_cas(addr: i64, expected: i64, new_value: i64) -> bool {
     pe_rnd_jitter();
-    return pe_atomic_cas(addr, expected, new_value);
+    return nat_atomic_cas(addr, expected, new_value);
 }
 
 /// A mutex: an SRW lock (not recursive, released by its owner, as a
@@ -3328,7 +3328,7 @@ fn pe_pf_reg_init() {
 /// (suspend, get context, query) and its TEB. Once per thread id.
 fn pe_pf_add_self() {
     pe_pf_reg_init();
-    var n: i64 = pe_atomic_load(pe_pf_tcount);
+    var n: i64 = nat_atomic_load(pe_pf_tcount);
     if n >= PE_PF_MAXT {
         return;
     }
@@ -3352,7 +3352,7 @@ fn pe_pf_add_self() {
         teb = pe_load(info + 8);
     }
     p_free(info);
-    var at: i64 = pe_atomic_add(pe_pf_tcount, 1);
+    var at: i64 = nat_atomic_add(pe_pf_tcount, 1);
     if at >= PE_PF_MAXT {
         pe_k_close_handle(h);
         return;
@@ -3361,7 +3361,7 @@ fn pe_pf_add_self() {
     pe_store(rec + 8, teb);
     pe_store(rec + 16, 0);
     pe_store(rec + 24, tid);
-    pe_atomic_store(rec, h);
+    nat_atomic_store(rec, h);
 }
 
 /// pert_thread_main, on each new OS thread running `entry`: registered,
@@ -3370,7 +3370,7 @@ fn pe_pf_thread_start(entry: i64) {
     if entry == pe_pf_sampler_fn || entry == pe_pf_watch_fn {
         return;
     }
-    if pe_pf_tcount != 0 && pe_atomic_load(pe_pf_tcount) >= PE_PF_MAXT {
+    if pe_pf_tcount != 0 && nat_atomic_load(pe_pf_tcount) >= PE_PF_MAXT {
         return;
     }
     pe_pf_add_self();
@@ -3710,14 +3710,14 @@ fn pe_pf_sample(h: i64, teb: i64, ctx: i64) {
 fn pe_pf_round(ctx: i64, cyc: i64) {
     var prime: bool = pe_pf_prime != 0;
     pe_pf_prime = 0;
-    var n: i64 = pe_atomic_load(pe_pf_tcount);
+    var n: i64 = nat_atomic_load(pe_pf_tcount);
     if n > PE_PF_MAXT {
         n = PE_PF_MAXT;
     }
     var i: i64 = 0;
     while i < n && pe_pf_on != 0 {
         var rec: i64 = pe_pf_threads + i * 32;
-        var h: i64 = pe_atomic_load(rec);
+        var h: i64 = nat_atomic_load(rec);
         if h != 0 && pe_pf_cycles(h, cyc) != 0 {
             var c: i64 = pe_load(cyc);
             if c != pe_load(rec + 16) {
@@ -4177,9 +4177,9 @@ pub fn pert_lim_take(n: i64) -> i64 {
     if pe_lim_mem == 0 {
         return 0;
     }
-    var before: i64 = pe_atomic_add(pe_lim_used, n);
+    var before: i64 = nat_atomic_add(pe_lim_used, n);
     if before + n > pe_lim_mem {
-        pe_atomic_add(pe_lim_used, 0 - n);
+        nat_atomic_add(pe_lim_used, 0 - n);
         var h: i64 = pe_k_std_handle(0 - 12);
         pe_lim_say("fid: memory limit of " as i64);
         pe_cr_put_int(h, pe_lim_scratch, pe_lim_scratch + 8, pe_lim_mem);
@@ -4198,7 +4198,7 @@ pub fn pert_lim_give(n: i64) -> i64 {
     if pe_lim_mem == 0 {
         return 0;
     }
-    pe_atomic_add(pe_lim_used, 0 - n);
+    nat_atomic_add(pe_lim_used, 0 - n);
     return 0;
 }
 

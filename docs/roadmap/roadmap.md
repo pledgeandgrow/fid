@@ -475,7 +475,10 @@ budget tracking, and tensor parallelism (simulated multi-rank) all work.
   rerun with `release/fid-dev.exe` (built at 00:29, before the 01:55 runtime
   change) still shows `Illegal instruction`, so it does not validate or
   falsify the fix; rebuild and rerun `TP_TARGET=native`. The `--nat` null
-  pointer and ARM64/RISC-V target runs remain open.
+  pointer and ARM64/RISC-V target runs remain open. A Linux-target disasm
+  also fails typechecking because the shared tensor runtime now calls
+  Windows-only `pe_k_exit_process`; this cross-target regression needs a
+  platform-correct exit hook.
   Leftover (Nov 15): still identity in `fid` (`compiler/interp.fd` and the C runtime's `p_all_reduce` in `compiler/codegen_c.fd`); no newer roadmap tracks it.
   Nov 21 check (fid built from the self-hosted stage 0 at 86cc919): partly — multi-rank TP on the native runtimes (stdlib/pe_runtime/tensor.fd: pert_tp_init, collectives through rank 0, send/recv, pert_tp_exit): `tests/tp/check.sh` passes through C and with TP_TARGET=x86_64-linux (WSL). Left: native Windows (pe_ir) multi-rank programs print their results and then end with 'Panic: Illegal instruction' (3 of the 5 tp checks fail, as does a 3-line program calling p_tp_init(2)), apparently in the new pert_tp_exit entry-point path (pe_ir_stubs.fd ~8379); aarch64 and riscv64 not run.
 
@@ -701,7 +704,7 @@ shaders remaining.
   negative allocation/blocking/dispatch/helper tests, `test_lib_grid`,
   `test_lib_scada`, and native-PE `test_std_microgrid` pass. The microgrid
   interpreter run exceeded its timeout, so the native result was used.
-- [x] Serverless — `@serverless`, cold-start optimization
+- [~] Serverless — `@serverless`, cold-start optimization
   Nov 22: validated — @serverless IS implemented (typechecker.fd
   TypeChecker_verify_serverless: the handler and everything it reaches
   writes no module global, starts no task, reads no code-running global
@@ -712,8 +715,9 @@ shaders remaining.
   Nov 22 validation (`release/fid-dev.exe`): positive handler tests and
   global-write/task/global-initializer rejection tests pass. After fixing
   Git Bash temp-path conversion, argv/stdin execution, C compilation, and
-  handler argument validation pass. Two disassembly name checks still fail
-  because the fixture functions are inlined; `docs/perf/serverless-coldstart.md`
+  handler argument validation pass. The Linux-target disassembly checks
+  fail before codegen: shared `pe_runtime/tensor.fd` references the
+  Windows-only `pe_k_exit_process` symbol. `docs/perf/serverless-coldstart.md`
   still calls for real Windows and Linux measurements. Keep partial.
 
 #### What's Left
@@ -8121,8 +8125,14 @@ Fides's effect system is the foundation — effect handlers can replace async/aw
   — `ReflectOp` in `compiler/parser.fd`, evaluated in `compiler/comptime_eval.fd`, typed in `typechecker.fd`; `test_comptime_reflect.fd`.
 - [x] Add: `field_offset`, `struct_size`, `enum_discriminant` — same files; `test_comptime_reflection.fd`, `test_comptime_reflection2.fd`.
 - [x] Add: `function_effects`, `function_capabilities` (inspect effect/capability annotations) — `ReflectOp::FunctionEffects`/`FunctionCapabilities` (`comptime_eval.fd`).
-- [ ] Runtime type info (minimal — for debugging only, not for dispatch)
-  Still open: comptime reflection and the type name carried by `dyn` dispatch do not provide a debug-only runtime type inspection API; no such API or test was found.
+- [x] Runtime type info (minimal — for debugging only, not for dispatch)
+  Nov 22 validation: `type_name_of(x)` is the debug-facing API; the
+  compiler resolves the static type to a string constant after
+  monomorphization, and the expression itself is not evaluated. The
+  `tests/bootstrap/test_type_name_of.fd` run passed on `release/fid.exe`,
+  covering primitive, Vec, struct, enum, arithmetic, generic, error-message,
+  and side-effect-free argument cases. This intentionally does not expose
+  dynamic `dyn` dispatch metadata.
 - [-] **Already built:** Comptime reflection (Phase 3A)
 - [-] **Not redoing:** Reflection — verifying and extending
 
@@ -8302,7 +8312,7 @@ Fides's effect system is the foundation — effect handlers can replace async/aw
 ##### L10D — Playground
 - [x] Web-based Fides IDE (run in browser) — fides-lang.org/playground, a WASI build of the compiler in a worker (competitive TL8).
 - [x] Edit, compile (to WASM), run, share — TL8 (run, tokens, AST, IR, effects). Sharing links: not checked here.
-- [x] Embeddable (like Rust Playground)
+- [~] Embeddable (like Rust Playground)
   Nov 22: the local implementation passes `node
   scripts/playground-embed-check.mjs` with the available WASM assets,
   including presets, inspection modes, share links, and page wiring. The

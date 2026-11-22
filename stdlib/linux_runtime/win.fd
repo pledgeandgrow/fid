@@ -106,6 +106,8 @@ const PE_W_SET_HANDLE_INFO: i64 = 78;  // kernel32 SetHandleInformation
 // 79: the working set (pe_win_mem_resident, RT7)
 const PE_W_MEM_INFO: i64 = 79;  // kernel32 K32GetProcessMemoryInfo
 
+const PE_W_FILE_INFO: i64 = 80;  // kernel32 GetFileInformationByHandle
+
 const PE_WTAG_SOCK: i64 = 281474976710656;  // 1 << 48
 const PE_WTAG_DIR: i64 = 562949953421312;  // 2 << 48
 const PE_WTAG_MASK: i64 = 0 - 281474976710656;
@@ -597,6 +599,21 @@ fn pe_win_stat(path0: i64, st: i64) -> i64 {
     pe_st(st + 72, pe_ld(st + 88));
     pe_st(st + 104, pe_ld(st + 88));
     pert_free(data);
+    // st_dev and st_ino, which sys.fd's pe_zc_same_file compares (RT14):
+    // the volume serial and file index need an open handle —
+    // FILE_READ_ATTRIBUTES and FILE_FLAG_BACKUP_SEMANTICS, so a folder's
+    // stat has them too. Zeros when the file cannot be opened (its
+    // attributes were still read: an identity is a bonus, not a condition)
+    var idh: i64 = nat_win_call(PE_W_CREATE_FILE, path, 128, 7, 0, 3, 33554432, 0, 0, 0, 0);
+    if idh != 0 - 1 {
+        var inf: i64 = pert_malloc(52);
+        if pe_w32(pe_w(PE_W_FILE_INFO, idh, inf, 0, 0)) != 0 {
+            pe_st(st, pe_win_ld32(inf + 28));
+            pe_st(st + 8, (pe_win_ld32(inf + 44) << 32) | pe_win_ld32(inf + 48));
+        }
+        pert_free(inf);
+        pe_w(PE_W_CLOSE_HANDLE, idh, 0, 0, 0);
+    }
     return 0;
 }
 

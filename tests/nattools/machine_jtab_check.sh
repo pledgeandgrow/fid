@@ -12,7 +12,7 @@
 # successor) three ways: by default, with FID_NAT_OFF=jtab (the tree of
 # compares, as before) and with FID_SWITCH=off (no Switch at all). All
 # three must print the file's expected output where this host can run
-# them. The default build's MIR (FID_NAT_DUMP='*') must hold a `jtab` in
+# them. The default build's MIR (FID_IROPT_OFF=inline,inline2 FID_NAT_DUMP='*') must hold a `jtab` in
 # digit_name, holes, neg_base, apply, live_across and wide64 and none in
 # sparse and bits3; the other two builds none at all. x86_64-linux is also
 # built as a PIE (FID_NAT_ON=pie: the table needs no relocation) and run.

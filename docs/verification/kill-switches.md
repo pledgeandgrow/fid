@@ -53,6 +53,7 @@ own `ng_on` reads `FID_NAT_OFF` only.
 | `FID_IROPT_OFF=promote` | locals promoted from memory to values (mem2reg), in the functions `ssa` does not take (ME3, `iro_promote_here`) |
 | `FID_IROPT_OFF=devirt` | a dynamic call whose receiver is a `MakeDyn` of a known type made direct (WP16) |
 | `FID_IROPT_OFF=gconst` | never-written globals folded to their initializer (WP18) |
+| `FID_IROPT_OFF=icf` | identical-function folding: equal IR functions (generic instances, specialized clones) call through the first (WP19; whole program only) |
 | `FID_IROPT_OFF=quietcall` | unused calls that end, never panic and write nothing removed; quiet calls out of any loop block (OP25, iropt.fd iro_quiet_fns) |
 | `FID_IROPT_OFF=guardcall` | calls with no effect but a panic moved out of loops by the licmguard guard (OP25, iropt_me.fd ime_guard_moves) |
 | `FID_IROPT_OFF=nowritecall` | memory facts kept across calls that write nothing (OP25, LF5/LF6, iropt_me.fd ime_writes) |
@@ -94,7 +95,6 @@ lendref (since Nov 17). `FID_IROPT_OFF=<name>` still turns one off when
 | `FID_IROPT_ON=matchfacts` | in a match arm, the scrutinee's tag is a constant (LF23). On by default since Nov 16 (`IME_DEFAULT_ON`): `FID_IROPT_OFF=matchfacts` |
 | `FID_IROPT_ON=ssa` | the SSA round trip (`compiler/ssa.fd`, ME3/ME15): locals become values with phis, dead phis and stores go, phis go back to slots before any backend reads the IR. On by default since Nov 16 (iropt_me.fd `IME_DEFAULT_ON`): `FID_IROPT_OFF=ssa` turns it off |
 | `FID_IROPT_ON=ssaexit` | with `ssa`: after a counted loop with constant bounds, its variable is a constant (ME23 exit values). On by default since Nov 16 (`IME_DEFAULT_ON`): `FID_IROPT_OFF=ssaexit` turns it off |
-| `FID_IROPT_ON=icf` | functions whose IR is the same (generic instances, specialized clones) all called through the first of them (WP19; whole program only) |
 | `FID_IROPT_ON=inlineclo` | inline2's once-called rule for closures alone, when inline2 is off (WP16). On by default since Nov 17 (`IME_DEFAULT_ON`): `FID_IROPT_OFF=inlineclo`; tests/tooling/inlineclo-check.sh |
 | `FID_IROPT_ON=lendref` | with dse, loadhoist, forward or matchfacts: what a call lent by reference cannot change kept known across it (whole program only). On by default since Nov 17 (`IME_DEFAULT_ON`): `FID_IROPT_OFF=lendref`; tests/tooling/lendref-check.sh |
 | `FID_IROPT_ON=licmguard` | calls with no effect but a panic moved out of loops behind a guard (OP25, `ime_guard_moves`; with `FID_IROPT_OFF=guardcall` not); tests/tooling/licmguard-check.sh |
@@ -344,7 +344,7 @@ not check them (Nov 21):
 | `FID_IROPT_OFF` | `cfgcache` | the cached CFG, dominator and loop trees and use lists (OP3) |
 | `FID_IROPT_OFF` | `readcse`, `egplace` | the same as in `FID_NAT_OFF` (rules.fd, egraph.fd) |
 | `FID_IROPT_ON` | `paramrange` | parameters start at the ranges every call gives them (LF10, opt-in) |
-| `FID_IROPT_ON` | `egskel` | the e-graph's side-effect skeleton (ME7, opt-in) |
+| `FID_NAT_OFF` | `egskel` (`FID_NAT_OFF=egskel`) | the e-graph's side-effect skeleton (ME7, opt-in) |
 | `FID_NAT_OFF` | `declline` | DB2: a function's declaration line is its `fn` line in the debug info (nat_enc.fd); off: the first row's line |
 | `FID_NAT_OFF` | `ehframe` | DB6: `.eh_frame` and `.eh_frame_hdr` in Linux images (nat_enc.fd) |
 

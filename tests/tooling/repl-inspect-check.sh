@@ -17,6 +17,15 @@ printf '%s\n' \
     'fn load() -> i64 { var s: i64 = p_file_read("x.txt"); return s; }' \
     'fn uses_load() -> i64 { return load(); }' \
     'fn sq(n: i64) -> i64 { var r: i64 = n * n; return r; }' \
+    'fn tri(n: i64) -> i64 {' \
+    '    var s: i64 = 0;' \
+    '    var i: i64 = 1;' \
+    '    while i <= n {' \
+    '        s = s + i;' \
+    '        i = i + 1;' \
+    '    }' \
+    '    return s;' \
+    '}' \
     'struct Pt { x: i64 }' \
     'impl Pt { fn show(self: Pt) -> i64 { println("pt"); return self.x; } }' \
     ':effects sq' \
@@ -36,7 +45,7 @@ printf '%s\n' \
     ':caps add' \
     ':caps load' \
     ':caps uses_load' \
-    ':opt add' \
+    ':opt tri' \
     ':opt greet' \
     ':pir add' \
     ':effects nosuch' \
@@ -51,7 +60,7 @@ hasn() {
 hasx() {
     hasn "$1" "$2" 1
 }
-hasn "seven definitions kept" "defined" 7
+hasn "eight definitions kept" "defined" 8
 has ":type sees a session function" "add(1, 2) : i64"
 # integer literals are i64, as in a `val` without a type (not i8 / i32)
 hasx ":type of literals added" "1 + 2 : i64"
@@ -80,12 +89,12 @@ hasx ":caps of a printing function" "greet : IO"
 hasx ":caps of a pure function" "add : none"
 hasx ":caps of a file read" "load : FS"
 hasx ":caps through a session function" "uses_load : FS"
-has ":opt header of a pure function" "; --- function add after iropt (effects: pure) ---"
-has ":opt header names the effects" "; --- function greet after iropt (effects: IO"
-if [ "$(grep -c '^fn add(' "$OUT")" -ge 2 ]; then echo "ok   :opt prints the function's IR (as :ir does)"; else echo "FAIL :opt prints the function's IR: fewer than two 'fn add(' lines"; fail=1; fi
+if grep -qF "error: 'tri' was inlined into its callers and removed by the optimizer" "$ERR"; then echo "ok   :opt explains an inlined function"; else echo "FAIL :opt explains an inlined function"; fail=1; fi
+if grep -qF "error: 'greet' was inlined into its callers and removed by the optimizer" "$ERR"; then echo "ok   :opt explains an inlined function"; else echo "FAIL :opt explains an inlined function"; fail=1; fi
 if grep -qF ":pir was removed with the PIR path" "$ERR"; then echo "ok   :pir says it was removed"; else echo "FAIL :pir says it was removed"; fail=1; fi
 if grep -qF "no function 'nosuch'" "$ERR"; then echo "ok   :effects of an unknown function"; else echo "FAIL :effects of an unknown function: no error"; fail=1; fi
 has ":defs lists the definitions" "fn uses_load() -> i64 { return load(); }"
+has ":defs lists the inspected loop function" "    while i <= n {"
 if [ $fail -ne 0 ]; then
     echo "--- repl output ---"
     cat "$OUT"
