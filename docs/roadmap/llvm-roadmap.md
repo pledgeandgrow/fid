@@ -812,6 +812,12 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       on 3 tests (`shl rbx, 1` emitted as C1 /n 1 reassembles as D1 /n).
       Left: nat_enc.fd's encoders still use their own words (no EFW_ use),
       and that round trip (emit D1 or accept the alternative).
+      Nov 22: the round trip half written (unbuilt, in the batch) —
+      x64_shift_imm emits the D1 /ext form for n == 1 (one byte shorter,
+      the canonical form clang gives `C1 /ext 1` back as), so our shift
+      bytes reassemble to themselves; disasm already decodes D1. The EFW_
+      unification is still open (nat_enc.fd uses its own constants,
+      disasm.fd has all 411 EFW_ references).
 - [x] TG6. Branch relaxation: short forms where the target reaches, long forms
       only when needed (x64 `jcc rel8`, RISC-V `b` vs `jal` vs `auipc+jalr`) (M).
       Nov 15: `ng_mir_emit` (nat_ir.fd) emits a function with every branch
@@ -1703,6 +1709,12 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       (was 878); a 60-test sample 0 differ on pe_ir (the `--nat` failures
       are not spec's). Left: hotness (every candidate within the limits is
       cloned), the full suite.
+      Nov 22 code audit: hotness is IN (since 49fb2b9) — iro_spec_site_
+      weights weighs each recorded site by iro_call_weights (profile-aware:
+      pgo_count base × loop depth ×8, capped), and iro_spec_hottest clones
+      only values whose sites weigh >= IRO_SPEC_HOT (8), at most 2 per
+      param (iropt.fd :8378–:8420, wired at :8645). That "Left: hotness"
+      was stale. Left: the full suite only.
 - [~] WP15. Dead function and dead global elimination after optimization, not only
       before (S).
       `iropt_native` calls `IrModule_dead_function_elimination` after the pass
@@ -2030,12 +2042,25 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       rule (test_stack_str_int.fd: INT64_MIN, INT64_MAX, concat, lengths
       on run; `--leaks` needs a self-hosted-lineage binary). Left: the
       data-dependent and unbounded producers, Vec::new()+push buffers.
+      Nov 22: `bool_to_str` joins it (unbuilt, in the batch) — core
+      Bool_to_str_into renders "true"/"false" into the area
+      ([P_STR_STATIC][len], cap >= 24, the heap p_bool_to_str when the
+      area cannot be used), and lw_rc_stack_strs_fn rewrites
+      `h = p_bool_to_str(b)` (the lowerer's f-string bool conversion;
+      p_to_str_bool accepted too) under the same readers-only rule. Test:
+      tests/bootstrap/test_stack_str_bool.fd (baseline interpreter run
+      matches). p_char_to_str is not a producer any more: RT3's static
+      one-byte table never allocates. Left: the build and suite legs.
       Nov 22 producer audit (the full producer list is lower.fd:22396; the
       pattern match at :24117 covers exactly p_str_concat and p_to_str):
-      bounded/easy — p_char_to_str (≤4 bytes), p_bool_to_str /
-      p_to_str_bool ("true"/"false"): constant-size results, need only a
-      Char_to_str_into / Bool_to_str_into core entry point (the
-      Int_to_str_into shape) and two names at the match. Data-dependent
+      p_char_to_str is NOT a producer any more — RT3 (pe_runtime/linux_
+      runtime/codegen_c __p_chr1) hands out one of 256 static one-byte
+      strings, so it never allocates; only the call and a no-op drop
+      remain. p_bool_to_str / p_to_str_bool ("true"/"false") DOES allocate
+      on every backend (C: p_malloc(6); native: pe_dup): Bool_to_str_into
+      (the Int_to_str_into shape) written Nov 22 with the pattern-match
+      entries; stdlib bool_to_str itself returns literals, the allocating
+      path is the lowerer's interpolation conversion. Data-dependent
       (medium) — p_float_to_str / p_to_str_float: up to ~330 chars, need
       Float_to_str_into(env, area, cap, x) with a cap policy and the
       Str_concat_into-style heap fallback. Unbounded (hard) — p_to_str_vec,
@@ -2059,6 +2084,15 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       variable and its drops go. Test: tests/bootstrap/test_midend_vec_sroa.fd.
       Left: a build, a suite run on and off, then reads in other blocks
       (dominated by the pushes).
+      Nov 22: reads in dominated blocks written (unbuilt, in the batch):
+      a get, set or len may run on a load of the Vec's slot in a block
+      h's block dominates, when the slot is stored h and nothing else
+      (slot_stores == 1; a zero store would reach the read on some path)
+      — every push is in h's block, which the domination makes run first.
+      Pushes stay in h's block. Test: tests/bootstrap/test_midend_vec_sroa_
+      dom.fd (branch read/len/set, loop read, a non-dominated sibling that
+      stays a Vec; baseline run through the interpreter matches). Left:
+      the build and suite legs.
 - [x] LF15. Reference counts removed where ownership is known (proposal 0004): no
       `Vec_share` / drop pairs on values that are moved (M). Moves on last use
       (Nov 7), and in one block: Str and Box count/drop pairs, a Vec or map
