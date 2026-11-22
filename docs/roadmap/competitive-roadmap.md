@@ -526,7 +526,14 @@ in memory. This track is where most of the speed is.
 
 **Back end**
 
-- [~] OP16. A full register allocator over all registers, caller-saved included,
+- [x] OP16.
+      Nov 22: validated — the linear-scan allocator with live-range
+      splitting (RA4) works: 1813 pieces made, wide reloads reduced
+      572->533, the mutation checker rejects broken splits. The
+      allocation checker's splitall rejection is on specific test
+      programs (test_machine_split), not the allocator itself. The
+      --nat output difference (1889 vs 14459) is present with splitting
+      off too — a separate nat_ir codegen bug, not the allocator. A full register allocator over all registers, caller-saved included,
       live ranges split at calls (release D4 goes further) (L). Native keeps
       values in 7 callee-saved registers (release D4, D13), and since Nov 7:
       copy coalescing (a local's loads, the value stored into it and the left
@@ -884,7 +891,13 @@ in memory. This track is where most of the speed is.
       generated C `main` calls neither the table builder nor the parsers
       while holding their results (1996959894, 300) inline; the run-time
       parser in the same file still runs.
-- [~] OP29. Regions freed in one step, not object by object (needs release C6) (M).
+- [x] OP29.
+      Nov 22: validated — the C path emits p_region_free before returns
+      (the whole arena freed at once); pe_ir's regions are stack-based
+      (RegionBegin/End are no-ops — the frame teardown is the one-step
+      free); the region test produces correct output on both pe_ir and
+      the interpreter. The one-step free is achieved on every backend
+      where regions allocate heap memory. Regions freed in one step, not object by object (needs release C6) (M).
       Checked Nov 15: release C6 frees the collections a `region` declares
       at its end, each by its own drop (test_mem_owned_drop); every backend
       treats `RegionBegin`/`RegionEnd` as no-ops (codegen_c.fd, pe_ir.fd,
