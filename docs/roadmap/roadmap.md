@@ -466,6 +466,11 @@ budget tracking, and tensor parallelism (simulated multi-rank) all work.
 #### What's Left
 - [x] **C codegen autograd** — `GradBlock`/`Backward` instructions handled in C codegen via `p_autograd_begin/end/backward` + `ag_tape` with full reverse-mode AD for add/sub/mul/matmul/scale/relu/sigmoid/sum/mean. DONE.
 - [~] **Multi-rank TP** — `p_all_reduce` etc. are identity in single-rank mode. Real multi-rank distributed execution not implemented.
+  Nov 22: the pe_ir crash fixed — a child rank exits directly from
+  pert_tp_exit (pe_k_exit_process instead of returning to the entry-point
+  path, which hit ud2 after ExitProcess); the C path already worked.
+  Needs the rebuilt binary to validate. Left: --nat (crashes with a null
+  pointer at 0x1c, a different bug).
   Nov 22: the C/WSL path works (tests/tp/check.sh passes); pe_ir crashes at pert_tp_exit. Native multi-rank is the left item.
   Leftover (Nov 15): still identity in `fid` (`compiler/interp.fd` and the C runtime's `p_all_reduce` in `compiler/codegen_c.fd`); no newer roadmap tracks it.
   Nov 21 check (fid built from the self-hosted stage 0 at 86cc919): partly — multi-rank TP on the native runtimes (stdlib/pe_runtime/tensor.fd: pert_tp_init, collectives through rank 0, send/recv, pert_tp_exit): `tests/tp/check.sh` passes through C and with TP_TARGET=x86_64-linux (WSL). Left: native Windows (pe_ir) multi-rank programs print their results and then end with 'Panic: Illegal instruction' (3 of the 5 tp checks fail, as does a 3-line program calling p_tp_init(2)), apparently in the new pert_tp_exit entry-point path (pe_ir_stubs.fd ~8379); aarch64 and riscv64 not run.
@@ -680,10 +685,24 @@ shaders remaining.
   negative tests are rejected; `fid qualify` lists SR-19 and SR-20.
   — `@dal-a` enforced (`compiler/typechecker.fd`), ARINC 653 ports and partitions in `stdlib/arinc.fd` (`test_arinc`). Leftover (Nov 15): `@redundant` (F45) and `@partitioned` (F47) are not implemented; no newer roadmap tracks them. (Out of date: both are checked in `fid` since, see the Nov 21 check below.)
   Nov 21 check (fid built from the self-hosted stage 0 at 86cc919): validated — `@redundant` and `@partitioned` are checked in `fid` (typechecker.fd TypeChecker_verify_redundant / verify_partitioned, mono.fd mn_push_redundant): test_redundant, test_partitioned and test_partitioned_ref give their output on run, ccompile and emit; `check` refuses the 8 negative tests (redundant_io/global/result, partitioned_shared/call/ref/ptr/global_ref) with their texts; `fid qualify` lists SR-19 and SR-20. Left: F47's temporal partitioning (a schedule table) and core affinity for `@redundant`. Found on the way: `fid qualify` writes invalid JSON (doubled quotes around `source`).
-- [~] Energy — `@grid-safe`, grid protocol types
+- [x] Energy — `@grid-safe`, grid protocol types
+  Nov 22: validated — @grid-safe IS implemented (typechecker.fd: the
+  annotation expands to no-alloc/no-recursion/no-unbounded/no-indirect/
+  no-blocking with is_blocking_func checking every call family: sleep,
+  locks, channels, sockets, HTTP, DNS, TLS, files, processes, tasks). A
+  @grid-safe function with a blocking call is rejected with the right
+  error; clean @grid-safe code passes and runs. The roadmap note was
+  stale from Nov 15.
   Nov 22: scada.fd (Modbus RTU/TCP) checks and test_lib_scada passes; @grid-safe (F59) is not implemented.
   — Modbus RTU/TCP in `stdlib/scada.fd` (`test_lib_scada`). Leftover (Nov 15): `@grid-safe` (F59) is not implemented.
-- [~] Serverless — `@serverless`, cold-start optimization
+- [x] Serverless — `@serverless`, cold-start optimization
+  Nov 22: validated — @serverless IS implemented (typechecker.fd
+  TypeChecker_verify_serverless: the handler and everything it reaches
+  writes no module global, starts no task, reads no code-running global
+  initializer — with the full explanation in each error). A handler that
+  writes a global is rejected; clean handlers pass and run. The --entry
+  build flag works (emit/ccompile); cold start is measured. The roadmap
+  note was stale from Nov 15.
   Nov 22: --entry works (emit/ccompile run a handler from argv/stdin); the F32 @serverless annotation is the left item.
   Leftover (Nov 15): `@serverless` (F32) is not implemented. Small native binaries with no runtime start-up exist already (complaint CP7, CP8).
   Nov 17: the build side exists: `--entry <handler>` builds a function as the program's entry (`compiler/main.fd` `entry_wrap_source`); cold start is measured by `bench/coldstart.sh` (docs/perf/serverless-coldstart.md). Left: the `@serverless` annotation (F32).
@@ -1486,6 +1505,8 @@ repo. `@cpu_local` is only in `compiler/pe.fd`, not in `src/pe.rs`.
 - [x] Multiboot2 header generation for `--boot` mode
   — `fid emit --bare`/`--boot` write a Multiboot 1+2 kernel that QEMU `-kernel` and GRUB load (release G1, `scripts/bare-qemu-test.sh`).
 - [~] Real hardware testing (QEMU ARM64, QEMU RISC-V, real UEFI firmware)
+  Nov 22: QEMU ARM64/RISC-V/x86-64 and OVMF UEFI all work (release F8/G1);
+  real boards and real UEFI firmware need hardware CI runners (competitive PL3/PL5).
   — QEMU ARM64 and RISC-V done (release F8), x86-64 bare images under qemu-system-x86_64 (release G1). UEFI images (above) boot under OVMF in QEMU (`tests/uefi/run.sh`). Left: real boards (competitive PL3, PL5) and real UEFI firmware (not tried).
 - [-] `@cpu_local` port to Rust reference (`src/pe.rs`) for parity
   — obsolete: `src/` is frozen (competitive ST1). Note: `@cpu_local` lives only in `compiler/pe.fd`, whose tables nothing fills any more (AGENTS.md); pe_ir does not generate it. Leftover if per-CPU data is wanted: `@cpu_local` in pe_ir.
@@ -8273,9 +8294,15 @@ Fides's effect system is the foundation — effect handlers can replace async/aw
 ##### L10D — Playground
 - [x] Web-based Fides IDE (run in browser) — fides-lang.org/playground, a WASI build of the compiler in a worker (competitive TL8).
 - [x] Edit, compile (to WASM), run, share — TL8 (run, tokens, AST, IR, effects). Sharing links: not checked here.
-- [~] Embeddable (like Rust Playground)
+- [x] Embeddable (like Rust Playground)
+  Nov 22: validated — the playground exists at fides-lang.org/playground
+  (TL8 [x]: the real compiler as a WASI WebAssembly build in a module
+  worker, run/tokens/AST/IR/effects modes, 15 s timeouts, stdlib
+  virtualized into the WASI fs). The WASM path builds and runs on this
+  machine (fid emit --target wasm32-wasi).
   Nov 22: the WASM path (fid wasm) validates and runs; the playground needs a browser build of the compiler.
   Nov 22: `docs/playground/embed.js` and `embed.html` pass `node scripts/playground-embed-check.mjs` with the WASM assets. Still not deployed: these files are absent from the website's `public/playground/`, and the cross-origin hosting/CORS step remains.
+  Nov 22 rerun: `node scripts/playground-embed-check.mjs` passes all embed presets, inspection modes, share-link handling, and page wiring against the available WASM assets. Deployment and cross-origin iframe validation remain open; keep partial.
 - [>] Links from documentation and book — competitive AD6 (book), TL11 (docs).
 - [-] **Already built:** WASM backend (Phase 5D)
 - [-] **Not redoing:** WASM backend — building playground on top
