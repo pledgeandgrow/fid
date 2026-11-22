@@ -3725,6 +3725,20 @@ Every platform gets a tier, and a tier means CI, not a hope.
       the thumbv7m-none qemu-user board; image shape for mps2-an385 and
       lm3s6965evb). Left: the no-OS images (vector table, UART, semihosting
       exit) were not run: no qemu-system-arm here.
+      Nov 22: the no-OS images RUN — qemu-system-arm installed (WSL, apt),
+      thumb_check.sh 11 passed 0 failed: the mps2-an385 board images boot
+      under qemu-system-arm (-semihosting-config, UART on stdio) and print
+      the same lines with the same exit statuses as `fid run` for both
+      test_thumb_core and thumb_exit. lm3s6965evb: thumb_exit's image
+      (312 KB) outgrew the board's 256 KB flash — a capacity fact the
+      emit reports cleanly ("does not fit in the board's flash"), now a
+      documented skip in thumb_check.sh; the whole check also runs under
+      WSL from Windows (the MSYS path mangling of wsl.exe arguments broke
+      the board runs from Git Bash — run it inside WSL instead).
+      bare-metal.yml installs qemu-system-arm + qemu-user and runs
+      thumb_check.sh as its own step. Left: RISC-V no-OS boards (no
+      emitter for a riscv64 `none` target), and a green bare-metal.yml
+      run with the new step.
 - [~] PL6. Android and iOS (XL).
       Nov 22 audit: NOT done, and the entry understates what exists —
       stdlib/jni.fd, objc.fd, android_ndk.fd (+lifecycle/biometrics/
