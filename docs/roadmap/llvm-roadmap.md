@@ -812,12 +812,13 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       on 3 tests (`shl rbx, 1` emitted as C1 /n 1 reassembles as D1 /n).
       Left: nat_enc.fd's encoders still use their own words (no EFW_ use),
       and that round trip (emit D1 or accept the alternative).
-      Nov 22: the round trip half written (unbuilt, in the batch) —
-      x64_shift_imm emits the D1 /ext form for n == 1 (one byte shorter,
-      the canonical form clang gives `C1 /ext 1` back as), so our shift
-      bytes reassemble to themselves; disasm already decodes D1. The EFW_
-      unification is still open (nat_enc.fd uses its own constants,
-      disasm.fd has all 411 EFW_ references).
+      Nov 22: the round trip half done — x64_shift_imm emits the D1 /ext
+      form for n == 1 (one byte shorter, the canonical form clang gives
+      `C1 /ext 1` back as); disasm already decodes D1. Validated with a
+      built -O0 fid: enc-oracle 1192 forms 0 mismatches, and a 40-step
+      shift loop prints the same on pe_ir, --nat and the interpreter.
+      The EFW_ unification is still open (nat_enc.fd uses its own
+      constants, disasm.fd has all 411 EFW_ references).
 - [x] TG6. Branch relaxation: short forms where the target reaches, long forms
       only when needed (x64 `jcc rel8`, RISC-V `b` vs `jal` vs `auipc+jalr`) (M).
       Nov 15: `ng_mir_emit` (nat_ir.fd) emits a function with every branch
@@ -2042,15 +2043,27 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       rule (test_stack_str_int.fd: INT64_MIN, INT64_MAX, concat, lengths
       on run; `--leaks` needs a self-hosted-lineage binary). Left: the
       data-dependent and unbounded producers, Vec::new()+push buffers.
-      Nov 22: `bool_to_str` joins it (unbuilt, in the batch) — core
-      Bool_to_str_into renders "true"/"false" into the area
-      ([P_STR_STATIC][len], cap >= 24, the heap p_bool_to_str when the
-      area cannot be used), and lw_rc_stack_strs_fn rewrites
-      `h = p_bool_to_str(b)` (the lowerer's f-string bool conversion;
-      p_to_str_bool accepted too) under the same readers-only rule. Test:
-      tests/bootstrap/test_stack_str_bool.fd (baseline interpreter run
-      matches). p_char_to_str is not a producer any more: RT3's static
-      one-byte table never allocates. Left: the build and suite legs.
+      Nov 22: `bool_to_str` joins it — core Bool_to_str_into renders
+      "true"/"false" into the area ([P_STR_STATIC][len], cap >= 24, the
+      heap p_bool_to_str when the area cannot be used), and
+      lw_rc_stack_strs_fn rewrites `h = p_bool_to_str(b)` (the lowerer's
+      f-string bool conversion; p_to_str_bool accepted too). BUILT AND
+      VALIDATED (a -O0 fid from the self-hosted stage 0): the f-string
+      temps too — a created value used only through its BitCast by
+      reader calls, a print or its drop now rewrites into its own area
+      (the casts the f-string lowering makes were what disqualified
+      them), LOWER_STACK_STR_MAX 4 -> 8 (an f-string with one embedded
+      value uses up to 3 areas). test_stack_str_bool.fd: all three
+      conversions in areas, no p_bool_to_str call left in main, --leaks
+      clean; test_stack_str/_vbuf/_int byte-identical. That closes the
+      "temporaries" Left below for strings. p_char_to_str is not a
+      producer any more: RT3's static one-byte table never allocates.
+      Also: test_stack_str_int.fd's header expected 3 where the program
+      prints 5 (str_len("-451|")), fixed; fidesc's interpreter panics on
+      it (BitAnd on a Ptr in core's p_str_hdr_len) — pre-existing, the
+      test had never run under fidesc (suite last run Nov 2). Left: the
+      data-dependent and unbounded producers, Vec::new()+push buffers,
+      the suite legs.
       Nov 22 producer audit (the full producer list is lower.fd:22396; the
       pattern match at :24117 covers exactly p_str_concat and p_to_str):
       p_char_to_str is NOT a producer any more — RT3 (pe_runtime/linux_
@@ -2084,15 +2097,22 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       variable and its drops go. Test: tests/bootstrap/test_midend_vec_sroa.fd.
       Left: a build, a suite run on and off, then reads in other blocks
       (dominated by the pushes).
-      Nov 22: reads in dominated blocks written (unbuilt, in the batch):
-      a get, set or len may run on a load of the Vec's slot in a block
-      h's block dominates, when the slot is stored h and nothing else
-      (slot_stores == 1; a zero store would reach the read on some path)
-      — every push is in h's block, which the domination makes run first.
-      Pushes stay in h's block. Test: tests/bootstrap/test_midend_vec_sroa_
-      dom.fd (branch read/len/set, loop read, a non-dominated sibling that
-      stays a Vec; baseline run through the interpreter matches). Left:
-      the build and suite legs.
+      Nov 22: reads in dominated blocks — the rule is in but does not
+      fire yet. A get, set or len on a load of the Vec's slot in a block
+      hb dominates qualifies when no block that clears the slot (the
+      ownership lowering's `v = null` after the drop — it always exists,
+      which is why a first `slot_stores == 1` rule could never fire) can
+      reach the read on any path (DFS over cfg.succs; a same-block
+      clearing store only before the read, in scan order; a cycle back
+      into the read's block disqualifies; iro_vs_reaches/iro_vs_zero_
+      reaches, zero-block budget 16). Built and behavior-verified
+      (test_midend_vec_sroa_dom.fd right with the pass on and off;
+      original test still converts 4), but the count stays 1 on the new
+      test (only the same-block sibling): some other check rejects every
+      cross-block read and the shape-variants probing (join-read,
+      tail-read) all convert 0 — one instrumented run (trace the
+      rejection point in iro_vec_sroa_one) finishes it. Left: that, the
+      build/suite legs.
 - [x] LF15. Reference counts removed where ownership is known (proposal 0004): no
       `Vec_share` / drop pairs on values that are moved (M). Moves on last use
       (Nov 7), and in one block: Str and Box count/drop pairs, a Vec or map
