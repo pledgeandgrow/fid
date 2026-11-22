@@ -743,7 +743,10 @@ The ten that matter most, in order:
       Done Nov 15: `scripts/release-notes.py` renders the newest changelog
       section as release notes, pulling breaking-change lines into a
       `## Breaking changes` section on top.
-- [~] CU7. **"Old tutorials no longer compile"** (fast-moving languages). Examples in
+- [x] CU7.
+      Nov 22: validated — http_server.fd and json_parser.fd build through
+      `emit --nat` on the pinned-stage-0 binary; the CI leg is the left
+      part of the release roadmap's N11. **"Old tutorials no longer compile"** (fast-moving languages). Examples in
       the docs are compiled and run in CI, so docs and compiler never drift
       (competitive SL19) (M).
       Done Nov 15: `scripts/doctest.py` runs every `/// Example:` block in
@@ -1001,7 +1004,10 @@ The ten that matter most, in order:
       Nov 22: a C `abs` import built and ran through both the default PE
       backend and `--nat` Linux using `fid emit` only; neither build invoked
       a C compiler.
-- [~] CI3. **"Callbacks from C are unsafe and awkward"** (Rust, Go). A named Fides
+- [x] CI3.
+      Nov 22: validated — test_c_callback_user_data passes through
+      ccompile (qsort_s with a struct pointer as context, read and changed
+      from inside the callback, on all three calling conventions). **"Callbacks from C are unsafe and awkward"** (Rust, Go). A named Fides
       function passes as a C callback; a closure that captures is rejected with
       the fix (done for named functions). Left: user data pointers (S).
       Nov 16: user data pointers written: `&mut st as *u8` is the struct's
