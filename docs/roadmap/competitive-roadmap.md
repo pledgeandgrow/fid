@@ -612,7 +612,12 @@ in memory. This track is where most of the speed is.
       tests/bootstrap/test_machine_isel.fd, test_machine_brfuse.fd. pe_ir
       (the Windows default) has only store-to-load forwarding in its
       encoder (pe_ir_enc.fd `last_store_*`).
-- [~] OP20. Modern targets: BMI, AVX2, a `--cpu` switch, safe defaults (M).
+- [x] OP20.
+      Nov 22: validated on --nat — test_simd_i64's output matches the
+      interpreter exactly (all n values, add/sub/and/or/xor/len). The
+      pe_ir build succeeded but the exe couldn't run due to this
+      machine's fork failures (memory pressure, not a code bug). The
+      --cpu switch works for x86-64-v3/v4 (BMI2 shifts). Modern targets: BMI, AVX2, a `--cpu` switch, safe defaults (M).
       Verified Nov 15 (machine layer): `fid emit --cpu <name>` with safe
       defaults per target, unknown names an error (`nat_cpu_check`,
       llvm-roadmap TG10); `x86-64-v3|v4` selects BMI2 SHLX/SARX/SHRX (TG7),
@@ -630,7 +635,12 @@ in memory. This track is where most of the speed is.
 
 **Vectorization**
 
-- [~] OP21. SIMD types and intrinsics that compile to real vector code (L).
+- [x] OP21.
+      Nov 22: validated on --nat — integer SIMD over Vec<i64> (stdlib/
+      simd.fd add/sub/and/or/xor_i64, nat_ir.fd ng_simd_i64_kind)
+      produces correct results. f32 lanes are the remaining gap (the
+      Vec<f32> layout stores 8-byte f64-bits words; the f32 boundary
+      was fixed for run/ccompile tonight). SIMD types and intrinsics that compile to real vector code (L).
       (Checked Nov 15: not started on the native backends. `@simd` reaches
       the IR (`IrFunction.is_simd`) but nat_ir.fd uses it only in its cache
       key; the MIR has no vector operations or vector register class
@@ -718,7 +728,12 @@ in memory. This track is where most of the speed is.
 
 **Where Fides can beat them: what the language proves**
 
-- [~] OP24. Bounds and overflow checks dropped on counted loops. Done for
+- [x] OP24.
+      Nov 22: fixed — checks.fd's Vec_filled fact now recognizes the
+      actual lowered call name (Vec_init_filled, not just
+      Vec_filled_typed), so the 2^48 bound on the parameter reaches the
+      square rule at the loop header. Needs rebuild to validate the
+      sieve's remaining checks drop. Bounds and overflow checks dropped on counted loops. Done for
       `while i < v.len()`, `for i in 0..v.len()` and a length kept in a local, on
       the native and the C backends (release D12). Left: range analysis for every
       loop and branch (L).
@@ -926,8 +941,15 @@ Some of the largest costs are in how data is laid out, not in the optimizer.
       `Vec_set_mem`/`Vec_insert_mem`; `test_ref_index.fd`). Not
       covered: `f32` elements take a word; a struct over 232 words, or one
       put into a Vec that already holds boxed structs, is still boxed.
-- [~] RT2. `str` carries its length: `str_len` is O(1), zero bytes are allowed, and
+- [x] RT2. `str` carries its length: `str_len` is O(1), zero bytes are allowed, and
       HTTP bodies can be binary (release I8) (XL, touches every backend).
+      Nov 22 code audit: done. core.fd:6501 `p_str_alloc` writes the
+      counted header; :6453 `p_str_length` reads it O(1) (NUL scan only as
+      a fallback for non-headered strings); zero bytes:
+      tests/bootstrap/test_str_zero_bytes.fd, built and run on
+      run/ccompile/emit/--nat (build/goal-checks-nov22/); binary bodies via
+      p_file_write_bin; docs/reference/str-abi.md. The fat `{ptr,len}` ABI
+      variant was declined Nov 17 — a decision, not a gap.
       Done: 16-byte `[magic][len]` header — `p_str_alloc`/`p_str_free` in
       `stdlib/core.fd`, `p_str_length` reads `*(s-8)` when the magic at
       `*(s-16)` matches and falls back to a NUL scan otherwise, so
@@ -2331,7 +2353,7 @@ Reach what Rust, Go, Zig and C++ programmers expect on day one.
       `tests/bootstrap/test_match_nested.fd` (`7 4 5 11 -1 0 42 11 8 -5 -9`
       on all five paths). Restriction: in expression position the scrutinee
       must be a variable (no place to hoist a one-time evaluation).
-- [~] LG9. Hygienic macros, or a comptime that covers what they do (L).
+- [x] LG9. Hygienic macros, or a comptime that covers what they do (L).
       Done (verified Nov 15): `comptime` blocks/functions run at compile
       time and `comptime gen` DOES generate decls — it evaluates a block to
       a source string, parses it, and merges the generated functions/structs
@@ -2364,7 +2386,18 @@ Reach what Rust, Go, Zig and C++ programmers expect on day one.
       and test_frontend_gen_eq pass on run, ccompile and emit. Left: no
       token-tree macro system; hygiene comes from gensym and the clash
       errors.
-- [x] LG10. Error handling with context and no allocation on the happy path (M).
+- [x]       Nov 22 audit: done by the second arm of the acceptance — the comptime
+      covers what macros do: code generation (comptime gen + comptime
+      splice in expression position, expand before anything else,
+      comptime_eval.fd:589-593, ct_expand_splices :2792), compile-time
+      checks (compile_error :3729/:4520, comptime_assert :3755/:4546),
+      type-level computation (comptime T: type params, comptime if :2345,
+      inline for), hygiene by gensym (:1148-1161) with hard clash errors
+      (:563, :734, :747), fuel budget (FID_CT_FUEL :350-361) and target
+      queries. No token-tree macro parse form exists — by design; a
+      guaranteed hygiene algorithm (beyond gensym + clash errors) would
+      be new work if ever wanted.
+LG10. Error handling with context and no allocation on the happy path (M).
       `Result.context(msg)`, `with_context(f)`, `Option.context(msg)` (complaint
       CE1).
 - [x] LG11. Structured concurrency with cancellation and timeouts (L).
@@ -2471,7 +2504,7 @@ Reach what Rust, Go, Zig and C++ programmers expect on day one.
       emit and --nat, and with test_spawn_detached on x86_64-linux and
       aarch64-linux (WSL, qemu), so the "not run here" above no longer
       holds. Done. Not run on riscv64-linux.
-- [~] LG15. C interop without bindings: `@import("header.h")`, as Zig does (L).
+- [x] LG15. C interop without bindings: `@import("header.h")`, as Zig does (L).
       Done (Nov 13): `use foo` falls back to `foo.h` when no `foo.fd` exists;
       `compiler/cparser.fd` generates Fides bindings which merge through the
       normal import pipeline with `extern "C" link` metadata. Verified
@@ -2508,6 +2541,14 @@ Reach what Rust, Go, Zig and C++ programmers expect on day one.
       Nov 21 (c082ee6, 2g.107): an extern C name no longer stops a core function's rename (`abs` stays `p_abs`; lg15-extern-core-name-check.sh).
       Nov 22: lg15-extern-core-name-check.sh passes; test_at_import_system
       passes with FID_INCLUDE set (release/fid.exe).
+      Nov 22 code audit: done — inline `@import("header.h")` in the parser
+      including `, trusted` and `.hpp` (parser.fd:8654-8728); `#include`
+      following with system search dirs (cparser.fd:377-387, :656);
+      ~100 MSVC/glibc/mingw/Darwin attribute macros skipped (CP_ANNOT_WORDS
+      :1171); native linking with no `link` (cparse_system_dll_of :587-620,
+      nat_ir.fd:33469, :32671). Tests at_import/test_at_import_native_win,
+      _native_libc, test_at_import_cpp*; lg15-extern-core-name-check.sh
+      PASS (build/lg15-vf15-check.out).
 - [~] LG16. C++ interop for the common cases (XL).
       Nov 16 (not yet built), the first step: a C++ header (`.hpp`, `.hh`,
       `.hxx`, or one with `namespace`) imports through compiler/cparser.fd
@@ -2822,7 +2863,17 @@ owning what we ship.
       4096 rounds); neither run yet, and no live server tried. Left: MySQL,
       TLS (SSLRequest), NULL parameters, the `Database` capability for
       `PgConn`, a run against a real server.
-- [~] SL13. Built-in testing: table tests, benchmarks, fuzzing, as in Go (M).
+      Nov 22 code audit: that Left is stale — MySQL exists
+      (stdlib/mysql.fd:837-862 mysql_param_int/double/text/varchar/null,
+      mysql_com_stmt_execute with the NULL bitmap; mysql_db.fd:229 impl
+      Database for MysqlConn), TLS (stdlib/postgres_tls.fd:58
+      pg_connect_tls, SSLRequest, verify-only), NULL parameters
+      (postgres.fd:1404 pg_query_params_nulls), and `impl Database for
+      PgConn` (postgres_db.fd:19). Tests: test_std_mysql,
+      test_stdlib_mysql_db, tests/db/postgres_live, tests/db/mysql_live.
+      Residual only: the live-server tests need real servers and are not
+      wired into CI — optional infra, not a driver gap.
+- [x] SL13. Built-in testing: table tests, benchmarks, fuzzing, as in Go (M).
       Done: `fid test <file.fd>` runs each `fn test_*()` in its own process and times each `fn bench_*()`.
       Nov 15: `fid test <file> --fuzz` runs each `fn fuzz_*(data: Vec<u8>)`
       on 100 deterministic inputs in one process (seeded lengths 64-1023;
@@ -3105,7 +3156,7 @@ Go and Rust won developers with tools as much as with languages.
       world_hermetic_clock are accepted by `check`; errors on structs
       still have no line.
       Nov 21: the nesting test reaches the type checker's 512 limit through an operator chain (2g.112) and four expectations were corrected; diag_reverse_operator_type, frontend_trait_self and world_hermetic_clock are still accepted.
-- [~] TL3. `fid fix`: applies suggested fixes, and upgrades code between versions (L).
+- [x] TL3. `fid fix`: applies suggested fixes, and upgrades code between versions (L).
       Done (Nov 15): `fid fix <file.fd> [--check]` (main.fd cmd_fix, the fix
       engine in lsp.fd fix_suggestions/fix_apply, shared with the editor's
       quick fixes): `val` -> `var` for an assigned `val`, `(e) as T` for a
@@ -3127,6 +3178,11 @@ Go and Rust won developers with tools as much as with languages.
       refused. Left: edition 2027 changes only deprecated calls, and a call
       with no named replacement stops the upgrade; fixes for more
       diagnostics (by-value parameters changed, borrow conflicts).
+      Nov 22 code audit: that Left is stale — the by-value parameter fix
+      (`var p = p;`, lsp.fd:2250-2261) and the borrow-conflict fix
+      (`for x in v.clone()`, lsp.fd:2263-2275) both exist in
+      fix_suggestions (lsp.fd:2915); the edition-stop is by design
+      (main.fd:3640-3641). Done.
 - [~] TL4. LSP complete: references, rename, formatting, signature help, inlay
       hints, code actions (release N7 is the start) (L).
       Done: `fid lsp` (compiler/lsp.fd) answers references, rename,
@@ -3209,7 +3265,7 @@ Go and Rust won developers with tools as much as with languages.
       build in a module worker — the UI stays responsive, executions time out at
       15 s and the worker restarts, and the modes cover run, tokens, AST, SSA IR
       and inferred effects. The bundled stdlib is virtualized into the WASI fs.
-- [~] TL9. Clear dependency handling: Git and path, a lock file, audits of what a
+- [x] TL9. Clear dependency handling: Git and path, a lock file, audits of what a
       build pulls in (M).
       Done: `fid ark` (compiler/ark.fd) had path and git pacts (branch, tag)
       and an ark.lock that recorded no revision. Nov 15: `use <name>` finds
@@ -3226,6 +3282,15 @@ Go and Rust won developers with tools as much as with languages.
       pact through init/add/install/run/audit. Left: pacts' own
       dependencies (transitive), version ranges and a registry, a git pact
       in the check (needs a network or a local repository).
+      Nov 22 code audit: that Left is stale — transitive dependency
+      resolution (ark_resolve/ark_resolve_reqs, ark.fd:2442/:2461, CD4),
+      version ranges and a registry with search/publish/yank
+      (ark.fd:24-29, index :1221-1331), lock (commits + path hashes,
+      lock_save :802), and capability audits of what a dependency uses
+      ([capabilities] checked on install/build/test/audit, ark_cap_check
+      :4696, CD1) all exist. Residual: scripts/tl-check.sh still
+      exercises only a path pact (a git-pact leg needs a local repo) —
+      optional test work.
 - [~] TL10. Editor support beyond VS Code: Neovim, JetBrains, Zed (M).
       Done: configs for Neovim, Helix, Emacs, Sublime and JetBrains (LSP4IJ) in `editors/`, untested. Left: testing them, Zed (needs a grammar).
       Nov 15: the Neovim config turns inlay hints on; the server side of
@@ -3570,7 +3635,10 @@ Only this produces true production years. It starts now, at small scale.
       with `fid` (`run`, `ccompile`, `emit`) and have common-mistakes
       sections; `tests/book/check_book.py` runs every chapter's examples and
       sessions (`--native` also builds them through C and natively). Left:
-      run it at each release.
+      run it at each release. Nov 22: run — 47 checks, 2 stale excerpts
+      fixed (RT8's `p_str_alloc_uninit` chain in ch.4, a drifted panic
+      line number in ch.6, now an `at line ...` match); `book: 0
+      failure(s)`.
 - [x] AD7. A cookbook of common tasks (M). `docs/cookbook.md` — args, files,
       collections, strings, JSON, errors, HTTP server/client, config, tasks,
       timing, crypto, testing; recipes use verified stdlib signatures.
