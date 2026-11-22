@@ -228,6 +228,11 @@ var g_rt6_depths: Vec<i64> = Vec::new();
 var g_rt6_states: Vec<i64> = Vec::new();
 var g_rt6_types: Vec<Type> = Vec::new();
 var g_rt6_closed: Vec<bool> = Vec::new();
+// RT5: a record of a `let` whose value is a map (rt6_add_map): an untyped
+// `var m = HashMap::new()` typed by its first insert of a struct or tuple
+// key (TypeChecker_rt5_note_insert) holds the whole map type,
+// `HashMap<K, V>`, which the lowering asks rt6_map_at for.
+var g_rt6_maps: Vec<bool> = Vec::new();
 
 /// How many records there are (0: nothing to look up).
 pub fn rt6_count() -> i64 {
@@ -244,6 +249,7 @@ pub fn rt6_reset() {
     g_rt6_states = Vec::new();
     g_rt6_types = Vec::new();
     g_rt6_closed = Vec::new();
+    g_rt6_maps = Vec::new();
 }
 
 pub fn rt6_add(key: str, name: str, line: i64, depth: i64, state: i64) {
@@ -254,6 +260,18 @@ pub fn rt6_add(key: str, name: str, line: i64, depth: i64, state: i64) {
     g_rt6_states.push(state);
     g_rt6_types.push(Type::Infer);
     g_rt6_closed.push(false);
+    g_rt6_maps.push(false);
+}
+
+/// rt6_add for a `let` whose value is a map (RT5).
+pub fn rt6_add_map(key: str, name: str, line: i64, depth: i64, state: i64) {
+    rt6_add(key, name, line, depth, state);
+    g_rt6_maps.set(g_rt6_maps.len() - 1, true);
+}
+
+/// Whether record `k` is a map's (rt6_add_map).
+pub fn rt6_is_map(k: i64) -> bool {
+    return g_rt6_maps.get(k);
 }
 
 pub fn rt6_state(k: i64) -> i64 {
@@ -307,7 +325,7 @@ pub fn rt6_elem_at(fname: str, name: str, line: i64) -> OptType {
     var et: Type = Type::Infer;
     var k: i64 = 0;
     while k < g_rt6_names.len() {
-        if g_rt6_lines.get(k) == line && g_rt6_names.get(k) == name {
+        if g_rt6_lines.get(k) == line && g_rt6_names.get(k) == name && !g_rt6_maps.get(k) {
             var key: str = g_rt6_fns.get(k);
             if key == fname || str_starts_with(fname, key + "__") {
                 if g_rt6_states.get(k) != 1 {
@@ -324,6 +342,36 @@ pub fn rt6_elem_at(fname: str, name: str, line: i64) -> OptType {
     }
     if found {
         return OptType::Some(et);
+    }
+    return OptType::None;
+}
+
+/// RT5: the map type (`HashMap<K, V>`) the first insert gave the map of an
+/// untyped `var name = HashMap::new()` at `line` in function `fname` (as
+/// the lowering names it), if every check of that `let` typed it, and the
+/// same way.
+pub fn rt6_map_at(fname: str, name: str, line: i64) -> OptType {
+    var found: bool = false;
+    var mt: Type = Type::Infer;
+    var k: i64 = 0;
+    while k < g_rt6_names.len() {
+        if g_rt6_lines.get(k) == line && g_rt6_names.get(k) == name && g_rt6_maps.get(k) {
+            var key: str = g_rt6_fns.get(k);
+            if key == fname || str_starts_with(fname, key + "__") {
+                if g_rt6_states.get(k) != 1 {
+                    return OptType::None;
+                }
+                if found && type_to_str(mt) != type_to_str(g_rt6_types.get(k)) {
+                    return OptType::None;
+                }
+                found = true;
+                mt = g_rt6_types.get(k);
+            }
+        }
+        k = k + 1;
+    }
+    if found {
+        return OptType::Some(mt);
     }
     return OptType::None;
 }

@@ -1,0 +1,225 @@
+// RT8: every way the allocator hands memory out again reads as zero in
+// the bytes asked for. The C runtime (compiler/codegen_c.fd) has, beyond
+// test_alloc_reuse_zero's cases:
+//   - blocks of 64 KB and more zeroed with non-temporal stores
+//     (__p_zero_big), at every alignment of their end;
+//   - the span cache: a large block's pages (over 1 MB) kept while a thread
+//     keeps asking for large blocks, and zeroed when they are handed out
+//     again, for the same size or a smaller one;
+//   - free blocks cut from the rest of a full chunk (P_BLOCK_ZERO), handed
+//     out without zeroing;
+//   - free blocks of 256 KB and more decommitted by the trim once idle and
+//     committed again when reused.
+// The native Linux runtime (stdlib/linux_runtime/base.fd) zeroes the bytes
+// asked for and cuts chunk rests the same way. Each case fills what it
+// frees with 0xFF bytes and counts the bytes asked for again that are not
+// zero.
+//
+// Expected output:
+//   big sizes not zero: 0
+//   span cache not zero: 0
+//   chunk rests not zero: 0
+//   decommitted not zero: 0
+//   kept blocks intact: true
+
+// fill n bytes at p with 0xFF: whole words, then the bytes after them
+@unsafe
+fn fill(p: i64, n: i64) {
+    var i: i64 = 0;
+    while i + 8 <= n {
+        var w: *mut i64 = p + i;
+        unsafe { *w = -1; }
+        i = i + 8;
+    }
+    while i < n {
+        var b: *mut u8 = p + i;
+        unsafe { *b = 255; }
+        i = i + 1;
+    }
+}
+
+// the bytes of the n at p that are not zero
+@unsafe
+fn nonzero(p: i64, n: i64) -> i64 {
+    var bad: i64 = 0;
+    var i: i64 = 0;
+    while i + 8 <= n {
+        var w: *mut i64 = p + i;
+        var v: i64 = 0;
+        unsafe { v = *w; }
+        if v != 0 {
+            bad = bad + 1;
+        }
+        i = i + 8;
+    }
+    while i < n {
+        var b: *mut u8 = p + i;
+        var x: i64 = 0;
+        unsafe { x = (*b) as i64; }
+        if x != 0 {
+            bad = bad + 1;
+        }
+        i = i + 1;
+    }
+    return bad;
+}
+
+// whether the n bytes at p are all 0xFF
+@unsafe
+fn all_ff(p: i64, n: i64) -> bool {
+    var i: i64 = 0;
+    while i < n {
+        var b: *mut u8 = p + i;
+        var x: i64 = 0;
+        unsafe { x = (*b) as i64; }
+        if x != 255 {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// fill a block of `size` bytes, free it, ask for `again` bytes: the bytes
+// of the new block that are not zero
+@unsafe
+fn reuse(size: i64, again: i64) -> i64 {
+    val a: i64 = p_malloc(size);
+    fill(a, size);
+    p_free(a);
+    val b: i64 = p_malloc(again);
+    val bad: i64 = nonzero(b, again);
+    p_free(b);
+    return bad;
+}
+
+@unsafe
+fn main() -> i64 {
+    val kept: i64 = p_malloc(100);
+    fill(kept, 100);
+
+    // 64 KB and up, ends at each offset of a 16-byte line
+    var bad: i64 = 0;
+    var d: i64 = 0;
+    while d < 24 {
+        bad = bad + reuse(65536 + d, 65536 + d);
+        bad = bad + reuse(70000 + d, 66000 + d);
+        bad = bad + reuse(300000 + d, 299000 + d);
+        bad = bad + reuse(1000000 + d, 990000 + d);
+        d = d + 1;
+    }
+    println("big sizes not zero: " + int_to_str(bad));
+
+    // large blocks, many in a row (the span cache keeps their pages), each
+    // filled, freed and asked for again at the same or a smaller size
+    bad = 0;
+    var r: i64 = 0;
+    while r < 40 {
+        val n: i64 = 2097152 + (r % 7) * 4099;
+        val a: i64 = p_malloc(n);
+        val b: i64 = p_malloc(n / 2 + 1048576);
+        fill(a, n);
+        fill(b, n / 2 + 1048576);
+        p_free(a);
+        p_free(b);
+        val c: i64 = p_malloc(n);
+        val e: i64 = p_malloc(n - 300000);
+        bad = bad + nonzero(c, n) + nonzero(e, n - 300000);
+        fill(c, n);
+        fill(e, n - 300000);
+        p_free(c);
+        p_free(e);
+        r = r + 1;
+    }
+    println("span cache not zero: " + int_to_str(bad));
+
+    // fill several chunks with blocks of mixed sizes (each full chunk's rest
+    // goes on the free lists), free them all after filling, and ask again
+    bad = 0;
+    var blocks: Vec<i64> = Vec::new();
+    var sizes: Vec<i64> = Vec::new();
+    var seed: i64 = 7;
+    var i: i64 = 0;
+    while i < 3000 {
+        seed = (seed * 1103515245 + 12345) % 2147483648;
+        val n2: i64 = 16 + (seed >> 8) % 40000;
+        val p: i64 = p_malloc(n2);
+        bad = bad + nonzero(p, n2);
+        fill(p, n2);
+        blocks.push(p);
+        sizes.push(n2);
+        i = i + 1;
+    }
+    i = 0;
+    while i < 3000 {
+        p_free(blocks.get(i));
+        i = i + 1;
+    }
+    i = 0;
+    while i < 3000 {
+        seed = (seed * 1103515245 + 12345) % 2147483648;
+        val n3: i64 = 16 + (seed >> 8) % 40000;
+        val p2: i64 = p_malloc(n3);
+        bad = bad + nonzero(p2, n3);
+        blocks.set(i, p2);
+        i = i + 1;
+    }
+    i = 0;
+    while i < 3000 {
+        p_free(blocks.get(i));
+        i = i + 1;
+    }
+    println("chunk rests not zero: " + int_to_str(bad));
+
+    // 300 KB blocks with a small block kept after each (no chunk empties),
+    // freed in rounds: enough free bytes for several trims, which
+    // decommit the blocks that stayed free; then all asked for again
+    bad = 0;
+    var bigs: Vec<i64> = Vec::new();
+    var pins: Vec<i64> = Vec::new();
+    i = 0;
+    while i < 200 {
+        val p3: i64 = p_malloc(300000);
+        fill(p3, 300000);
+        bigs.push(p3);
+        val pin: i64 = p_malloc(40);
+        fill(pin, 40);
+        pins.push(pin);
+        i = i + 1;
+    }
+    var round: i64 = 0;
+    while round < 4 {
+        i = 0;
+        while i < 200 {
+            p_free(bigs.get(i));
+            i = i + 1;
+        }
+        i = 0;
+        while i < 200 {
+            val p4: i64 = p_malloc(300000 - round * 1000);
+            bad = bad + nonzero(p4, 300000 - round * 1000);
+            fill(p4, 300000 - round * 1000);
+            bigs.set(i, p4);
+            i = i + 1;
+        }
+        round = round + 1;
+    }
+    var intact: bool = all_ff(kept, 100);
+    i = 0;
+    while i < 200 {
+        if !all_ff(pins.get(i), 40) {
+            intact = false;
+        }
+        p_free(bigs.get(i));
+        p_free(pins.get(i));
+        i = i + 1;
+    }
+    println("decommitted not zero: " + int_to_str(bad));
+    p_free(kept);
+    if intact {
+        println("kept blocks intact: true");
+    } else {
+        println("kept blocks intact: false");
+    }
+    return 0;
+}

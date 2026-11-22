@@ -1,0 +1,28 @@
+// Expected to fail at run time: two tasks await each other, so neither
+// can ever finish. The C runtime panics with "Tasks are deadlocked: each
+// one awaits another" (exit code 1) instead of hanging: one scheduler per
+// thread when its pass finds nothing to run or wait for (FIDES_WORKERS=1),
+// and M:N when every unfinished task is parked awaiting another
+// (compiler/codegen_c.fd __p_mn_settle). "not reached" is never printed.
+use task;
+
+var g_a: i64 = 0;
+var g_b: i64 = 0;
+
+fn a(x: i64) -> i64 {
+    task_sleep(20);
+    return p_future_poll(g_b | (32677 << 48));
+}
+
+fn b(x: i64) -> i64 {
+    task_sleep(20);
+    return p_future_poll(g_a | (32677 << 48));
+}
+
+fn main() -> i64 {
+    g_a = task_go("a", 0);
+    g_b = task_go("b", 0);
+    task_run();
+    println("not reached");
+    return 0;
+}

@@ -127,6 +127,8 @@ const PE_WSYS_KILL: i64 = 1012;
 const PE_WSYS_CLOSE: i64 = 1013;
 // base.fd pert_mem_resident (RT7): the working set in bytes, -1 unknown
 const PE_WSYS_MEM_RESIDENT: i64 = 1014;
+// sys.fd pe_lim_init (roadmap P12): FID_CPU_LIMIT's watcher thread
+const PE_WSYS_CPU_LIMIT: i64 = 1015;
 // sys.fd pert_dl_load / pert_dl_find / pert_dl_unload / pert_dl_call
 // (roadmap L6C): the OS loader, pe_win_dl_* below
 const PE_WSYS_DL_LOAD: i64 = 1040;
@@ -374,6 +376,8 @@ pub fn pe_win_thread_main(p: i64) {
     pert_free(p);
     nat_call_fn(entry, 1, argv);
     pert_free(argv);
+    // RT8: its heap to the pool (base.fd), after its last free
+    pe_heap_thread_end();
     nat_atomic_store(ctid, 0);
     pe_w(PE_W_WAKE_ALL, ctid, 0, 0, 0);
     pe_w(PE_W_EXIT_THREAD, 0, 0, 0, 0);
@@ -977,6 +981,16 @@ fn pe_win_sh(cmd: i64) -> i64 {
 // out the file for stdout, err the one for stderr ("" each: stderr goes
 // with stdout, which is ours when out is ""). rec gets the process handle
 // (word 0) and id (word 3). 0, or -1 when it did not start.
+// roadmap L4H: rec's word 1 holds the io bits on the way in (sys.fd
+// pe_px_spawn; 1 / 2 / 4: a pipe for the child's stdin / stdout / stderr,
+// 8: its stderr where its stdout goes). Each pipe is a CreatePipe pair
+// made inheritable, this process's end then made not to be
+// (SetHandleInformation), so only the child holds the other end and a
+// later child holds neither; the child's ends go to STARTUPINFOA's
+// standard handles (STARTF_USESTDHANDLES) and are closed here once it has
+// started. This process's ends go to rec's words 4 / 5 / 6 (-1: none):
+// they are HANDLEs, which pe_win_read / pe_win_write / pe_win_close take
+// as file descriptors (ReadFile gives 0 at the end: ERROR_BROKEN_PIPE).
 
 /// Argument a, quoted, written at `at`; returns the end.
 fn pe_win_quote_arg(at: i64, a: i64) -> i64 {
@@ -1028,7 +1042,71 @@ fn pe_win_quote_arg(at: i64, a: i64) -> i64 {
     return w + 1;
 }
 
+/// Close the HANDLEs among the n words at hs that are not -1.
+fn pe_win_close_ends(hs: i64, n: i64) {
+    var k: i64 = 0;
+    while k < n {
+        if pe_ld(hs + k * 8) != 0 - 1 {
+            pe_w(PE_W_CLOSE_HANDLE, pe_ld(hs + k * 8), 0, 0, 0);
+            pe_st(hs + k * 8, 0 - 1);
+        }
+        k = k + 1;
+    }
+}
+
+/// roadmap L4H: a pipe for each of io's bits 1, 2, 4 (the child's stdin,
+/// stdout, stderr). ends: 6 words, [2k] this process's end of stream k
+/// (not inheritable), [2k + 1] the child's (inheritable); -1 where none.
+/// False, everything closed, when a pipe cannot be made.
+fn pe_win_pipes(io: i64, ends: i64) -> bool {
+    var k: i64 = 0;
+    while k < 6 {
+        pe_st(ends + k * 8, 0 - 1);
+        k = k + 1;
+    }
+    // SECURITY_ATTRIBUTES {24, NULL, inherit}; the two HANDLE cells
+    var sa: i64 = pert_malloc(24);
+    pe_zero(sa, 24);
+    pe_win_st32(sa, 24);
+    pe_win_st32(sa + 16, 1);
+    var cells: i64 = pe_zeroed(2);
+    var ok: bool = true;
+    k = 0;
+    while ok && k < 3 {
+        if (io & (1 << k)) != 0 {
+            pe_st(cells, 0);
+            pe_st(cells + 8, 0);
+            if pe_w32(pe_w(PE_W_CREATE_PIPE, cells, cells + 8, sa, 0)) == 0 {
+                ok = false;
+            } else {
+                // stdin: the child reads, we write; stdout / stderr: the
+                // other way
+                var ours: i64 = pe_ld(cells);
+                var theirs: i64 = pe_ld(cells + 8);
+                if k == 0 {
+                    ours = pe_ld(cells + 8);
+                    theirs = pe_ld(cells);
+                }
+                pe_st(ends + k * 16, ours);
+                pe_st(ends + k * 16 + 8, theirs);
+                // HANDLE_FLAG_INHERIT off for our end
+                if pe_w32(pe_w(PE_W_SET_HANDLE_INFO, ours, 1, 0, 0)) == 0 {
+                    ok = false;
+                }
+            }
+        }
+        k = k + 1;
+    }
+    pert_free(cells);
+    pert_free(sa);
+    if !ok {
+        pe_win_close_ends(ends, 6);
+    }
+    return ok;
+}
+
 fn pe_win_spawn(argv: i64, envp: i64, dir: i64, out: i64, rec: i64, err: i64) -> i64 {
+    val io: i64 = pe_ld(rec + 8) & 15;
     var len: i64 = 1;
     var i: i64 = 0;
     while pe_ld(argv + i * 8) != 0 {
@@ -1115,24 +1193,57 @@ fn pe_win_spawn(argv: i64, envp: i64, dir: i64, out: i64, rec: i64, err: i64) ->
             pert_free(pi);
             return 0 - 1;
         }
-        pe_win_st32(si + 60, 256);  // STARTF_USESTDHANDLES
-        pe_st(si + 80, pe_w(PE_W_GET_STD_HANDLE, 4294967286, 0, 0, 0));  // STD_INPUT_HANDLE
-        var so: i64 = fh;
-        if !has_out {
-            so = pe_w(PE_W_GET_STD_HANDLE, 4294967285, 0, 0, 0);
-        }  // STD_OUTPUT_HANDLE
-        var se: i64 = eh;
-        if !has_err {
-            se = so;
-            if !has_out {
-                se = pe_w(PE_W_GET_STD_HANDLE, 4294967284, 0, 0, 0);
-            }  // STD_ERROR_HANDLE
+    }
+    // roadmap L4H: the pipes (6 words, see pe_win_pipes)
+    var ends: i64 = pe_zeroed(6);
+    if !pe_win_pipes(io, ends) {
+        if fh != 0 - 1 {
+            pe_w(PE_W_CLOSE_HANDLE, fh, 0, 0, 0);
         }
+        if eh != 0 - 1 {
+            pe_w(PE_W_CLOSE_HANDLE, eh, 0, 0, 0);
+        }
+        pert_free(ends);
+        pert_free(line);
+        if envb != 0 {
+            pert_free(envb);
+        }
+        pert_free(si);
+        pert_free(pi);
+        return 0 - 1;
+    }
+    val handles: bool = has_out || has_err || io != 0;
+    if handles {
+        pe_win_st32(si + 60, 256);  // STARTF_USESTDHANDLES
+        var hin: i64 = pe_ld(ends + 8);
+        if (io & 1) == 0 {
+            hin = pe_w(PE_W_GET_STD_HANDLE, 4294967286, 0, 0, 0);
+        }  // STD_INPUT_HANDLE
+        var so: i64 = pe_ld(ends + 24);
+        if (io & 2) == 0 {
+            so = fh;
+            if !has_out {
+                so = pe_w(PE_W_GET_STD_HANDLE, 4294967285, 0, 0, 0);
+            }  // STD_OUTPUT_HANDLE
+        }
+        var se: i64 = pe_ld(ends + 40);
+        if (io & 4) == 0 {
+            if (io & 8) != 0 {
+                se = so;
+            } else if has_err {
+                se = eh;
+            } else if has_out {
+                se = fh;
+            } else {
+                se = pe_w(PE_W_GET_STD_HANDLE, 4294967284, 0, 0, 0);  // STD_ERROR_HANDLE
+            }
+        }
+        pe_st(si + 80, hin);
         pe_st(si + 88, so);
         pe_st(si + 96, se);
     }
     var inherit: i64 = 0;
-    if has_out || has_err {
+    if handles {
         inherit = 1;
     }
     var d: i64 = 0;
@@ -1146,6 +1257,18 @@ fn pe_win_spawn(argv: i64, envp: i64, dir: i64, out: i64, rec: i64, err: i64) ->
     if eh != 0 - 1 {
         pe_w(PE_W_CLOSE_HANDLE, eh, 0, 0, 0);
     }
+    // the child's ends (and ours too when it did not start)
+    var k2: i64 = 0;
+    while k2 < 3 {
+        pe_win_close_ends(ends + k2 * 16 + 8, 1);
+        if ok == 0 {
+            pe_win_close_ends(ends + k2 * 16, 1);
+        } else {
+            pe_st(rec + 32 + k2 * 8, pe_ld(ends + k2 * 16));
+        }
+        k2 = k2 + 1;
+    }
+    pert_free(ends);
     pert_free(line);
     if envb != 0 {
         pert_free(envb);
@@ -1900,6 +2023,9 @@ pub fn pe_win_syscall(n: i64, a: i64, b: i64, c: i64, d: i64, e: i64, f: i64) ->
     if n == PE_WSYS_MEM_RESIDENT {
         return pe_win_mem_resident();
     }
+    if n == PE_WSYS_CPU_LIMIT {
+        return pe_win_cpu_limit(a);
+    }
     if n == PE_WSYS_DL_LOAD {
         return pe_win_dl_load(a);
     }
@@ -1990,6 +2116,58 @@ fn pe_win_mem_resident() -> i64 {
     }
     pert_free(pmc);
     return r;
+}
+
+// ─── FID_CPU_LIMIT (roadmap P12) ────────────────────────────────────────
+// Windows has no RLIMIT_CPU / SIGXCPU: as the C runtime and pe_ir do
+// (codegen_c.fd emit_limits_runtime, pe_runtime/conc.fd
+// pert_lim_watch_main), a thread reads the process's CPU time (user plus
+// kernel, every thread's: GetProcessTimes) every 10 ms, and past the limit
+// sys.fd pe_lim_cpu_over writes "fid: CPU time limit of S seconds exceeded
+// (FID_CPU_LIMIT)" and ends the process with exit code 124. GetProcessTimes
+// is imported as any `extern "C"` function with a `link` is (TG15, as the
+// loader's functions below), not through ng_win_imports. The thread starts
+// before the sampling profiler, which so does not sample it.
+
+extern "C" link "kernel32.dll" {
+    fn GetProcessTimes as pe_wcpu_times(proc: i64, created: i64, exited: i64, kernel: i64, user: i64) -> i64;
+}
+
+var pe_win_cpu_max: i64 = 0;  // the limit in 100 ns units
+var pe_win_cpu_ft: i64 = 0;  // GetProcessTimes' four FILETIMEs
+
+/// The watcher for a limit of ms milliseconds: 0, or -1 when its thread
+/// could not start (the limit is then not enforced).
+fn pe_win_cpu_limit(ms: i64) -> i64 {
+    if ms <= 0 {
+        return 0;
+    }
+    pe_win_cpu_max = ms * 10000;
+    pe_win_cpu_ft = pe_zeroed(4);
+    val entry: i64 = pe_fn_lookup("pe_win_cpu_main");
+    if entry == 0 {
+        return 0 - 1;
+    }
+    if pe_spawn_os(entry, 0, pe_zeroed(1)) < 0 {
+        return 0 - 1;
+    }
+    return 0;
+}
+
+/// The watcher thread: allocates nothing while it looks; never returns
+/// (the process ends with it, or past the limit by it).
+pub fn pe_win_cpu_main(id: i64) -> i64 {
+    val ft: i64 = pe_win_cpu_ft;
+    while true {
+        // the current process is the handle -1
+        if (pe_wcpu_times(0 - 1, ft, ft + 8, ft + 16, ft + 24) & 4294967295) != 0 {
+            if pe_ld(ft + 16) + pe_ld(ft + 24) >= pe_win_cpu_max {
+                pe_lim_cpu_over();
+            }
+        }
+        pe_w(PE_W_SLEEP, 10, 0, 0, 0);
+    }
+    return 0;
 }
 
 // ─── The sampling profiler (llvm-roadmap DB9) ───────────────────────────

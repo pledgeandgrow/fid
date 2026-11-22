@@ -1,0 +1,173 @@
+// Competitive RT10: the C runtime runs tasks M:N (compiler/codegen_c.fd
+// "M:N tasks"): worker threads with a ring each, work stealing, a global
+// queue, a poller thread. This shows tasks on more than one worker at once,
+// a task going on on another worker after it waited, and tasks a task
+// spawns being taken by other workers. It asks for 4 workers first
+// (p_co_workers, before the first task), so the output does not depend on
+// the machine's CPUs or FIDES_WORKERS.
+//   - at once: 4 tasks that each spin until all 4 have started (no task
+//     switch: each holds its worker) finish only if 4 workers run them at
+//     the same time;
+//   - moved: a task spawns a task that holds the worker until the first
+//     one is back, then sleeps: it comes back from the poller through the
+//     global queue and another worker takes it (tried until it moves, at
+//     most 200 times);
+//   - fan-out: one task spawns 2,000 tasks while it keeps its worker
+//     (they go to its ring, which spills to the global queue): other
+//     workers steal them, and every task runs once.
+//
+// C path only (p_co_worker is the C runtime's):
+//   CC="zig cc" $FID ccompile tests/ctx_switch/c_task_migrate.fd -o mig.exe
+//   ./mig.exe
+//
+// Expected output:
+// workers: 4
+// at once: 4 tasks on 4 workers
+// moved after a sleep: true
+// fan-out: 2000 tasks, sum 2001000, run elsewhere: true
+// workers now: 4
+extern "C" {
+    fn p_co_workers(n: i64) -> i64;
+    fn p_co_worker() -> i64;
+}
+use string;
+use task;
+use sync;
+
+var g_started: i64 = 0;
+var g_slots: i64 = 0;
+var g_back: i64 = 0;
+var g_sum: i64 = 0;
+var g_cnt: i64 = 0;
+var g_far: i64 = 0;
+var g_home: i64 = 0;
+
+fn worker_id() -> i64 {
+    var w: i64 = 0;
+    unsafe {
+        w = p_co_worker();
+    }
+    return w;
+}
+
+/// Spins until 4 tasks have started (10 s at most): 1 when all 4 ran at once.
+fn together(i: i64) -> i64 {
+    sync_atomic_add(g_started, 1);
+    val w: i64 = worker_id();
+    if w >= 1 && w <= 16 {
+        sync_atomic_store(g_slots + w * 8, 1);
+    }
+    val t0: i64 = p_clock_now_ms();
+    while sync_atomic_load(g_started) < 4 && p_clock_now_ms() - t0 < 10000 {
+    }
+    if sync_atomic_load(g_started) >= 4 {
+        return 1;
+    }
+    return 0;
+}
+
+/// Holds its worker (no switch) until the mover is back, 10 s at most.
+fn hog(x: i64) -> i64 {
+    val t0: i64 = p_clock_now_ms();
+    while sync_atomic_load(g_back) == 0 && p_clock_now_ms() - t0 < 10000 {
+    }
+    return x;
+}
+
+/// 1 once it came back from a sleep on another worker than it slept on.
+fn mover(x: i64) -> i64 {
+    var tries: i64 = 0;
+    while tries < 200 {
+        sync_atomic_store(g_back, 0);
+        val w0: i64 = worker_id();
+        val h: i64 = task_go("hog", tries);
+        task_detach(h);
+        task_sleep(2);
+        val w1: i64 = worker_id();
+        sync_atomic_store(g_back, 1);
+        if w1 != w0 && w0 != 0 && w1 != 0 {
+            return 1;
+        }
+        // let the hog end before the next try
+        task_sleep(1);
+        tries = tries + 1;
+    }
+    return 0;
+}
+
+fn leaf(i: i64) -> i64 {
+    sync_atomic_add(g_sum, i);
+    if worker_id() != sync_atomic_load(g_home) {
+        sync_atomic_add(g_far, 1);
+    }
+    task_yield();
+    sync_atomic_add(g_cnt, 1);
+    return i;
+}
+
+/// Spawns n leaves without a switch: they wait on its ring and the global
+/// queue until other workers take them.
+fn fan_out(n: i64) -> i64 {
+    sync_atomic_store(g_home, worker_id());
+    var i: i64 = 1;
+    while i <= n {
+        task_detach(task_go("leaf", i));
+        i = i + 1;
+    }
+    return n;
+}
+
+fn main() -> i64 {
+    var asked: i64 = 0;
+    unsafe {
+        asked = p_co_workers(4);
+    }
+    println("workers: " + int_to_str(asked));
+    g_started = sync_atomic_alloc(0);
+    g_back = sync_atomic_alloc(0);
+    g_sum = sync_atomic_alloc(0);
+    g_cnt = sync_atomic_alloc(0);
+    g_far = sync_atomic_alloc(0);
+    g_home = sync_atomic_alloc(0);
+    g_slots = p_shared_alloc(17 * 8);
+    var k: i64 = 0;
+    while k <= 16 {
+        sync_atomic_store(g_slots + k * 8, 0);
+        k = k + 1;
+    }
+
+    var ts: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 4 {
+        ts.push(task_go("together", i));
+        i = i + 1;
+    }
+    task_run();
+    var all: i64 = 0;
+    i = 0;
+    while i < ts.len() {
+        all = all + task_result(ts.get(i));
+        i = i + 1;
+    }
+    var distinct: i64 = 0;
+    k = 1;
+    while k <= 16 {
+        distinct = distinct + sync_atomic_load(g_slots + k * 8);
+        k = k + 1;
+    }
+    println("at once: " + int_to_str(all) + " tasks on " + int_to_str(distinct) + " workers");
+
+    val m: i64 = task_go("mover", 0);
+    task_run();
+    println("moved after a sleep: " + bool_to_str(task_result(m) == 1));
+
+    val f: i64 = task_go("fan_out", 2000);
+    task_run();
+    println("fan-out: " + int_to_str(sync_atomic_load(g_cnt)) + " tasks, sum " + int_to_str(sync_atomic_load(g_sum)) + ", run elsewhere: " + bool_to_str(sync_atomic_load(g_far) > 0));
+    var now: i64 = 0;
+    unsafe {
+        now = p_co_workers(0);
+    }
+    println("workers now: " + int_to_str(now));
+    return 0;
+}

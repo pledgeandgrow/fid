@@ -1,0 +1,160 @@
+// Competitive roadmap RT5: tuple keys holding strings, generic struct keys
+// and a map written without its type. A tuple key's strings are hashed
+// and compared as text (a tuple is numbered as a struct of its shape and
+// __p_key_strs names its string words; the tuple owns its strings, and the
+// map's copy of the key takes its owners over, as a struct key's does),
+// so a key whose text is built at run time apart from the inserted one
+// finds its value: through insert, get, get_or, contains, remove, keys()
+// and values(). The same for a tuple nesting a tuple and a struct with a
+// string, for an instance of a generic struct (`Pair<str, i64>`), and for
+// `var u = HashMap::new()` typed by its first insert (the type checker's
+// HashMap<(str, i64), i64>, which the lowering takes as if written). Every
+// block is freed (`fid run --leaks`), the generic struct keys' strings too
+// (a `Pair { a: s, .. }` literal is owned as its instance, Pair<str, i64>).
+// Expected output:
+// pairs 50 found 50 wrong 0
+// absent 0 literal 30 none -1
+// again 50 555
+// removed 48 has10 0 has12 1
+// keys 48 found 48 sum 140 values 12545
+// nested 3 found 3 absent 0 removed 2
+// generic 20 found 20 absent 0 removed 19
+// untyped 3 found 3 absent 0 keys 3 sum 6
+// done
+
+struct Named {
+    id: i64,
+    name: str,
+}
+
+struct Pair<A, B> {
+    a: A,
+    b: B,
+}
+
+fn key_text(i: i64) -> str {
+    return "k" + int_to_str(i);
+}
+
+fn yes(b: bool) -> i64 {
+    if b {
+        return 1;
+    }
+    return 0;
+}
+
+fn main() {
+    // (str, i64) keys whose text is built at run time
+    var m: HashMap<(str, i64), i64> = HashMap::new();
+    var i: i64 = 0;
+    while i < 50 {
+        m.insert((key_text(i), i % 7), i * 10);
+        i = i + 1;
+    }
+    var found: i64 = 0;
+    var wrong: i64 = 0;
+    i = 0;
+    while i < 50 {
+        val s: str = "k" + int_to_str(i);
+        if m.contains((s, i % 7)) {
+            found = found + 1;
+            if m.get((s, i % 7)) != i * 10 {
+                wrong = wrong + 1;
+            }
+        }
+        i = i + 1;
+    }
+    println("pairs " + int_to_str(m.len()) + " found " + int_to_str(found) + " wrong " + int_to_str(wrong));
+    var absent: i64 = 0;
+    absent = absent + yes(m.contains(("k1", 2)));
+    absent = absent + yes(m.contains(("k" + "60", 4)));
+    println("absent " + int_to_str(absent) + " literal " + int_to_str(m.get_or(("k3", 3), 0 - 1)) + " none " + int_to_str(m.get_or(("k3", 4), 0 - 1)));
+    // an insert of a key already there (equal text) replaces its value
+    m.insert(("k" + int_to_str(5), 5), 555);
+    println("again " + int_to_str(m.len()) + " " + int_to_str(m.get(("k5", 5))));
+    m.remove((key_text(10), 3));
+    m.remove(("k" + "11", 4));
+    m.remove(("k12", 0));
+    println("removed " + int_to_str(m.len()) + " has10 " + int_to_str(yes(m.contains(("k10", 3)))) + " has12 " + int_to_str(yes(m.contains(("k1" + "2", 5)))));
+    // keys() and values()
+    val ks: Vec<(str, i64)> = m.keys();
+    var kfound: i64 = 0;
+    var ksum: i64 = 0;
+    var j: i64 = 0;
+    while j < ks.len() {
+        val kk: (str, i64) = ks.get(j);
+        val (kt, kn) = kk;
+        ksum = ksum + kn;
+        if m.contains((kt, kn)) && m.contains(("k" + str_slice(kt, 1, str_len(kt)), kn)) {
+            kfound = kfound + 1;
+        }
+        j = j + 1;
+    }
+    val vs: Vec<i64> = m.values();
+    var vsum: i64 = 0;
+    j = 0;
+    while j < vs.len() {
+        vsum = vsum + vs.get(j);
+        j = j + 1;
+    }
+    println("keys " + int_to_str(ks.len()) + " found " + int_to_str(kfound) + " sum " + int_to_str(ksum) + " values " + int_to_str(vsum));
+
+    // a tuple nesting a tuple and a struct holding a string (tuple layouts
+    // are named by their shape: the nested (str, i64) is the layout of the
+    // keys above)
+    var deep: HashMap<((str, i64), Named, i64), i64> = HashMap::new();
+    deep.insert((("a" + "b", 1), Named { id: 7, name: "x" + "y" }, 2), 1);
+    deep.insert((("ab", 1), Named { id: 7, name: "xz" }, 2), 2);
+    deep.insert((("ab", 2), Named { id: 7, name: "xy" }, 1), 3);
+    var dfound: i64 = 0;
+    dfound = dfound + yes(deep.get_or((("a" + "b", 1), Named { id: 7, name: "xy" }, 2), 0) == 1);
+    dfound = dfound + yes(deep.get_or((("ab", 1), Named { id: 7, name: "x" + "z" }, 2), 0) == 2);
+    dfound = dfound + yes(deep.get_or((("a" + "b", 2), Named { id: 7, name: "xy" }, 1), 0) == 3);
+    var dabsent: i64 = yes(deep.contains((("ab", 1), Named { id: 8, name: "xy" }, 2)));
+    dabsent = dabsent + yes(deep.contains((("ab", 1), Named { id: 7, name: "yx" }, 2)));
+    deep.remove((("a" + "b", 2), Named { id: 7, name: "x" + "y" }, 1));
+    println("nested " + int_to_str(3) + " found " + int_to_str(dfound) + " absent " + int_to_str(dabsent) + " removed " + int_to_str(deep.len()));
+
+    // an instance of a generic struct as the key
+    var gen: HashMap<Pair<str, i64>, i64> = HashMap::new();
+    i = 0;
+    while i < 20 {
+        gen.insert(Pair { a: key_text(i), b: i }, i + 100);
+        i = i + 1;
+    }
+    var gfound: i64 = 0;
+    i = 0;
+    while i < 20 {
+        if gen.get_or(Pair { a: "k" + int_to_str(i), b: i }, 0) == i + 100 {
+            gfound = gfound + 1;
+        }
+        i = i + 1;
+    }
+    var gabsent: i64 = yes(gen.contains(Pair { a: "k" + "3", b: 4 }));
+    gen.remove(Pair { a: "k" + "3", b: 3 });
+    println("generic " + int_to_str(20) + " found " + int_to_str(gfound) + " absent " + int_to_str(gabsent) + " removed " + int_to_str(gen.len()));
+
+    // a map written without its type: its first insert types it
+    var u = HashMap::new();
+    u.insert(("o" + "ne", 1), 10);
+    u.insert(("two", 2), 20);
+    u.insert((key_text(3), 3), 30);
+    var ufound: i64 = 0;
+    ufound = ufound + yes(u.get(("one", 1)) == 10);
+    ufound = ufound + yes(u.get_or(("tw" + "o", 2), 0) == 20);
+    ufound = ufound + yes(u.contains(("k3", 3)));
+    val uabsent: i64 = yes(u.contains(("one", 2)));
+    val uks: Vec<(str, i64)> = u.keys();
+    var usum: i64 = 0;
+    j = 0;
+    while j < uks.len() {
+        val uk: (str, i64) = uks.get(j);
+        val (ut, un) = uk;
+        if u.contains((ut, un)) {
+            usum = usum + un;
+        }
+        j = j + 1;
+    }
+    println("untyped " + int_to_str(u.len()) + " found " + int_to_str(ufound) + " absent " + int_to_str(uabsent) + " keys " + int_to_str(uks.len()) + " sum " + int_to_str(usum));
+    println("done");
+}

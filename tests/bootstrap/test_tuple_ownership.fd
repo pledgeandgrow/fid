@@ -1,0 +1,204 @@
+// A tuple owns its elements (proposal 0004; competitive roadmap RT5), as a
+// struct of its shape owns its fields: a string, a Vec or a struct put in
+// a tuple is kept by it (a temporary handed over, anything else counted
+// again), and the tuple is dropped and copied as a whole. Before, such an
+// element stayed a temporary of its statement, dropped at the statement's
+// end while the tuple still held it: `val u = (Named { .. "n" + y }, 3)`
+// crashed and `val t = ("a" + s, 1)` held a freed string. Covered: tuple
+// locals, reassignment, results (sret), arguments (borrowed), a parameter
+// the callee assigns, destructuring (each name owns its element), nested
+// tuples, Vec elements (push in a loop, index set, pop, get, for), map
+// values and keys, a tuple field of a struct (and of its copy), a tuple
+// enum payload and Option<(str, i64)>, a struct field of a generic
+// instance type (held inline), a tuple declared first and set later, and
+// tuples made and dropped in a loop. Every block is freed
+// (`fid run --leaks`).
+// Expected output:
+// aqr 1
+// nyqr 5
+// zqr 2
+// wqr! 6
+// mqr qr?
+// pqr7 aqr1 aqr
+// qr+9 aqr1
+// iqr 8 jqr kqr
+// vec 4 e0setqre2e3 e440 61
+// map 4 againqr100 v22 4 againqr w3 0
+// hqr 12 gqr
+// cqr13 hqr12
+// sqr 14
+// oqr 15
+// paqr 17 pbqr 17
+// lqr 18
+// loop 240
+// done
+
+struct Named {
+    id: i64,
+    name: str,
+}
+
+struct Pair<A, B> {
+    a: A,
+    b: B,
+}
+
+struct Holder {
+    t: (str, i64),
+    tag: str,
+}
+
+struct Outer {
+    h: Pair<str, i64>,
+    n: i64,
+}
+
+enum Shape {
+    Pt((str, i64)),
+    Empty,
+}
+
+fn mk(s: str, n: i64) -> (str, i64) {
+    return (s + "!", n);
+}
+
+fn mk_var(s: str) -> (Named, str) {
+    val t = (Named { id: 4, name: "m" + s }, s + "?");
+    return t;
+}
+
+fn show(t: (str, i64)) -> str {
+    val (a, b) = t;
+    return a + int_to_str(b);
+}
+
+fn bump(t: (str, i64), s: str) -> str {
+    t = (s + "+", 9);
+    val (a, b) = t;
+    return a + int_to_str(b);
+}
+
+fn yes(b: bool) -> i64 {
+    if b {
+        return 1;
+    }
+    return 0;
+}
+
+fn main() {
+    val s: str = "q" + "r";
+    val y: str = "y" + s;
+    // a string temporary in a tuple, read after its statement
+    val t = ("a" + s, 1);
+    val (ta, tb) = t;
+    println(ta + " " + int_to_str(tb));
+    // a struct temporary in a tuple
+    val u = (Named { id: 2, name: "n" + y }, 3);
+    val (un, uk) = u;
+    println(un.name + " " + int_to_str(un.id + uk));
+    // reassignment drops the old tuple
+    var r = ("x" + s, 1);
+    r = ("z" + s, 2);
+    val (ra, rb) = r;
+    println(ra + " " + int_to_str(rb));
+    // results: a literal, and a variable moved out
+    val (ma, mb) = mk("w" + s, 6);
+    println(ma + " " + int_to_str(mb));
+    val mv = mk_var(s);
+    val (mn, ms) = mv;
+    println(mn.name + " " + ms);
+    // arguments are borrowed: the caller's tuple stays its own
+    println(show(("p" + s, 7)) + " " + show(t) + " " + ta);
+    println(bump(t, s) + " " + show(t));
+    // nested tuples and a struct in a tuple
+    val nest = (("i" + s, 8), Named { id: 9, name: "j" + s }, "k" + s);
+    val (ni, nn, nk) = nest;
+    val (nis, nin) = ni;
+    println(nis + " " + int_to_str(nin) + " " + nn.name + " " + nk);
+    // Vec elements: pushed in a loop (one literal's stack slot each pass),
+    // set by index, popped, read in a for loop
+    var v: Vec<(str, i64)> = Vec::new();
+    var i: i64 = 0;
+    while i < 5 {
+        v.push(("e" + int_to_str(i), i * 10));
+        i = i + 1;
+    }
+    v[1] = ("set" + s, 11);
+    val last: (str, i64) = v.pop();
+    val (la, lb) = last;
+    var vsum: i64 = 0;
+    var vtext: str = "";
+    for e in v {
+        val (ea, eb) = e;
+        vtext = vtext + ea;
+        vsum = vsum + eb;
+    }
+    println("vec " + int_to_str(v.len()) + " " + vtext + " " + la + int_to_str(lb) + " " + int_to_str(vsum));
+    // map values and keys (a key or a value inserted again replaces)
+    var mvals: HashMap<str, (str, i64)> = HashMap::new();
+    var mkeys: HashMap<(str, i64), str> = HashMap::new();
+    i = 0;
+    while i < 4 {
+        mvals.insert("k" + int_to_str(i), ("v" + int_to_str(i), i));
+        mkeys.insert(("k" + int_to_str(i), i), "w" + int_to_str(i));
+        i = i + 1;
+    }
+    mvals.insert("k1", ("again" + s, 100));
+    mkeys.insert(("k1", 1), "again" + s);
+    val g1: (str, i64) = mvals.get("k1");
+    val (g1a, g1b) = g1;
+    val g2: (str, i64) = mvals.get("k2");
+    val (g2a, g2b) = g2;
+    println("map " + int_to_str(mvals.len()) + " " + g1a + int_to_str(g1b) + " " + g2a + int_to_str(g2b) + " " + int_to_str(mkeys.len()) + " " + mkeys.get(("k1", 1)) + " " + mkeys.get(("k" + "3", 3)) + " " + int_to_str(yes(mkeys.contains(("k2", 3)))));
+    // a tuple field of a struct, and of the struct's copy
+    val hd = Holder { t: ("h" + s, 12), tag: "g" + s };
+    val (hta, htb) = hd.t;
+    println(hta + " " + int_to_str(htb) + " " + hd.tag);
+    var hcopy = hd;
+    hcopy.t = ("c" + s, 13);
+    val (hca, hcb) = hcopy.t;
+    val (hda, hdb) = hd.t;
+    println(hca + int_to_str(hcb) + " " + hda + int_to_str(hdb));
+    // a tuple enum payload, and an Option of a tuple
+    val sh = Shape::Pt(("s" + s, 14));
+    match sh {
+        Shape::Pt(p) => {
+            val (pa, pb) = p;
+            println(pa + " " + int_to_str(pb));
+        }
+        Shape::Empty => {
+            println("empty");
+        }
+    }
+    var maybe: Option<(str, i64)> = Option::Some(("o" + s, 15));
+    match maybe {
+        Option::Some(mt) => {
+            val (moa, mob) = mt;
+            println(moa + " " + int_to_str(mob));
+        }
+        Option::None => {
+            println("none");
+        }
+    }
+    // a struct field of a generic instance type, held inline
+    val o = Outer { h: Pair { a: "pa" + s, b: 16 }, n: 1 };
+    var o2 = o;
+    o2.h = Pair { a: "pb" + s, b: 17 };
+    println(o.h.a + " " + int_to_str(o.h.b + o.n) + " " + o2.h.a + " " + int_to_str(o2.h.b));
+    // a tuple declared first, set later
+    var late: (str, i64);
+    late = ("l" + s, 18);
+    val (lta, ltb) = late;
+    println(lta + " " + int_to_str(ltb));
+    // tuples made and dropped in each pass of a loop
+    var lsum: i64 = 0;
+    i = 0;
+    while i < 20 {
+        val lt = ("n" + int_to_str(i), Named { id: i, name: "m" + int_to_str(i) });
+        val (lts, ltn) = lt;
+        lsum = lsum + str_len(lts) + ltn.id;
+        i = i + 1;
+    }
+    println("loop " + int_to_str(lsum));
+    println("done");
+}

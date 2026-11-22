@@ -483,7 +483,7 @@ budget tracking, and tensor parallelism (simulated multi-rank) all work.
   Nov 21 check (fid built from the self-hosted stage 0 at 86cc919): partly — multi-rank TP on the native runtimes (stdlib/pe_runtime/tensor.fd: pert_tp_init, collectives through rank 0, send/recv, pert_tp_exit): `tests/tp/check.sh` passes through C and with TP_TARGET=x86_64-linux (WSL). Left: native Windows (pe_ir) multi-rank programs print their results and then end with 'Panic: Illegal instruction' (3 of the 5 tp checks fail, as does a 3-line program calling p_tp_init(2)), apparently in the new pert_tp_exit entry-point path (pe_ir_stubs.fd ~8379); aarch64 and riscv64 not run.
 
 ---
-  Nov 21 (P2 fix; staged, not yet in the tree): the native Windows "Illegal instruction" is fixed. The
+  Nov 21 (P2 fix, in the tree Nov 22): the native Windows "Illegal instruction" is fixed. The
   hosted pe_ir entry point calls pert_tp_exit after main
   (pe_ir_stubs.fd PeirGen_gen_entry_point), but pert_tp_exit was not a root
   of ir.fd `pe_ir_needed_functions` (pert_prof_boot/pert_prof_exit and
@@ -500,6 +500,10 @@ budget tracking, and tensor parallelism (simulated multi-rank) all work.
   the 3-line p_tp_init(2) program ends with 0, tests/tp/check.sh 5 of 5
   with TP_TARGET=native (pe_ir), through C and with
   TP_TARGET=x86_64-linux (WSL). aarch64 and riscv64 not run.
+  Nov 22 (landed; compiler built from the merged tree): tests/tp/check.sh 5
+  of 5 on C. Native 4 of 5: the failed-rank check now hangs printing zeros,
+  because main's pe_ir panic stack trace (CO9, e107298) loops on every panic
+  (known-bugs 2g.116); the rank-exit fix itself is unchanged.
 
 ### Phase 7 — Ergonomics (MOSTLY COMPLETE)
 
@@ -1003,8 +1007,8 @@ annotation reference.
   Leftover (Nov 15): only compile-time budgets (`region ... with budget(N)`, `@gas`) and `fid --timeout` for the compiler itself exist; no run-time memory or time limit for programs. No newer roadmap tracks it.
   Nov 17: FID_MEM_LIMIT=<bytes>[K|M|G] (live heap bytes, exit code 125) and FID_CPU_LIMIT=<seconds> (exit code 124) in the C runtime (codegen_c.fd emit_limits_runtime) and the native runtimes (machine layer, linux_runtime/sys.fd: memory everywhere, CPU on Linux; pe_ir, pe_runtime/conc.fd "Run-time resource limits": the entry point calls pert_limits_boot, p_malloc / p_free call pert_lim_take / pert_lim_give, pe_ir_stubs.fd PeirGen_gen_lim_call); docs/reference/runtime-limits.md, tests/limits/check-native.sh. Build-time defaults: `fid ccompile|build --max-mem <bytes[K|M|G]> --cpu-limit <seconds>` (-DP_LIM_MEM_DEFAULT / -DP_LIM_CPU_DEFAULT_MS; the variables still win); fid's own build has -DP_NO_ENV_LIMITS (scripts/bootstrap.sh, build-selfhost.sh), so the variables limit the programs fid builds, not fid. Left: `fid run` (the interpreter applies no limit), a run of tests/limits/check-native.sh with the pe_ir hooks.
   Nov 21 check (fid built from the self-hosted stage 0 at 86cc919): partly — `tests/limits/check.sh` passes (9 ok: memory exit 125, CPU exit 124, malformed values exit 2, the baked-in defaults, the variable overriding them, -DP_NO_ENV_LIMITS); `check-native.sh` passes on --nat (CPU skipped), x86_64-linux (CPU limit included) and pe_ir (5 ok: the pe_ir hooks work). Left: `fid run` enforces neither limit (FID_MEM_LIMIT=20M on tests/limits/mem_hog.fd ran to a 300 s timeout with no message); no CPU limit on --nat Windows.
-  Nov 21 (P2 fix; staged, not yet in the tree): `fid run` enforces both limits (compiler/interp.fd, section "Run-time resource limits"; same variables, messages and exit codes as the C runtime's emit_limits_runtime, read when the program starts, malformed values exit 2). FID_MEM_LIMIT counts the interpreted program's live heap as the C runtime would: each block of the interpreter's memory taken by the program's p_malloc or for one of its values (Vec header and buffer, map, string stored in memory) counts what p_malloc of that size counts in C (interp_lim_c_bytes) until it is freed (Memory_alloc / Memory_free; allocas are Memory_alloc_frame, not counted); the instruction that passes the limit ends the program with "fid: memory limit of N bytes exceeded (FID_MEM_LIMIT): U bytes in use, A more asked for", the interpreted stack, exit 125; building a string too large for what is left also stops it. FID_CPU_LIMIT counts the fid process's CPU time from the start of the program (compiling not counted), read every 4096 instructions (GetProcessTimes on Windows, clock_gettime(CLOCK_PROCESS_CPUTIME_ID) on Linux/macOS; linux_runtime/sys.fd pert_c_clock_gettime for a natively built fid), exit 124. `fid run --max-mem <bytes[K|M|G]> --cpu-limit <seconds>` give the defaults as for ccompile (a set variable wins; `run --leaks` passes them to its C build). INTERP_MEM_LIMIT (the interpreter's own 127 MB of simulated memory) is unchanged and separate: a FID_MEM_LIMIT above it is never reached under `fid run`. New check tests/limits/check-run.sh (15 ok with a fid of this tree built with -DP_NO_ENV_LIMITS: 256K / 16K / --max-mem stops with 125, 1M lets an alloc/free loop (tests/limits/mem_churn.fd) run, FID_CPU_LIMIT=2 stops cpu_spin in 3 s with 124, --cpu-limit 0.5, malformed values exit 2, empty/0 no limit, fid itself unlimited); tests/limits/check.sh still passes (9 ok); 15 bootstrap tests give the same output as before, with and without generous limits. Left: FID_MEM_LIMIT=20M on mem_hog (LIMIT_RUN_FULL=1 in check-run.sh) takes minutes, not seconds: the interpreter needs that long to build the ~13,600 strings that fill 20 MB (about 8 ms each at -O2; not run here, the private build had the interpreter's unit at -O0 for lack of memory); a string the interpreter copies into its memory (a Vec<str> element) stays counted while the run lasts (core's Str_drop leaves such uncounted copies), so a program that keeps storing new strings reaches the limit sooner than compiled.
-  Nov 21 (P2 fix; staged, not yet in the tree): --nat Windows enforces FID_CPU_LIMIT. sys.fd pe_lim_init
+  Nov 21 (P2 fix, in the tree Nov 22): `fid run` enforces both limits (compiler/interp.fd, section "Run-time resource limits"; same variables, messages and exit codes as the C runtime's emit_limits_runtime, read when the program starts, malformed values exit 2). FID_MEM_LIMIT counts the interpreted program's live heap as the C runtime would: each block of the interpreter's memory taken by the program's p_malloc or for one of its values (Vec header and buffer, map, string stored in memory) counts what p_malloc of that size counts in C (interp_lim_c_bytes) until it is freed (Memory_alloc / Memory_free; allocas are Memory_alloc_frame, not counted); the instruction that passes the limit ends the program with "fid: memory limit of N bytes exceeded (FID_MEM_LIMIT): U bytes in use, A more asked for", the interpreted stack, exit 125; building a string too large for what is left also stops it. FID_CPU_LIMIT counts the fid process's CPU time from the start of the program (compiling not counted), read every 4096 instructions (GetProcessTimes on Windows, clock_gettime(CLOCK_PROCESS_CPUTIME_ID) on Linux/macOS; linux_runtime/sys.fd pert_c_clock_gettime for a natively built fid), exit 124. `fid run --max-mem <bytes[K|M|G]> --cpu-limit <seconds>` give the defaults as for ccompile (a set variable wins; `run --leaks` passes them to its C build). INTERP_MEM_LIMIT (the interpreter's own 127 MB of simulated memory) is unchanged and separate: a FID_MEM_LIMIT above it is never reached under `fid run`. New check tests/limits/check-run.sh (15 ok with a fid of this tree built with -DP_NO_ENV_LIMITS: 256K / 16K / --max-mem stops with 125, 1M lets an alloc/free loop (tests/limits/mem_churn.fd) run, FID_CPU_LIMIT=2 stops cpu_spin in 3 s with 124, --cpu-limit 0.5, malformed values exit 2, empty/0 no limit, fid itself unlimited); tests/limits/check.sh still passes (9 ok); 15 bootstrap tests give the same output as before, with and without generous limits. Left: FID_MEM_LIMIT=20M on mem_hog (LIMIT_RUN_FULL=1 in check-run.sh) takes minutes, not seconds: the interpreter needs that long to build the ~13,600 strings that fill 20 MB (about 8 ms each at -O2; not run here, the private build had the interpreter's unit at -O0 for lack of memory); a string the interpreter copies into its memory (a Vec<str> element) stays counted while the run lasts (core's Str_drop leaves such uncounted copies), so a program that keeps storing new strings reaches the limit sooner than compiled.
+  Nov 21 (P2 fix, in the tree Nov 22): --nat Windows enforces FID_CPU_LIMIT. sys.fd pe_lim_init
   builds the same message as on Linux and, on nat_os() == 1, asks win.fd
   for a watcher thread (pseudo system call PE_WSYS_CPU_LIMIT = 1015,
   pe_win_cpu_limit): pe_win_cpu_main reads GetProcessTimes (user plus
@@ -1015,6 +1019,10 @@ annotation reference.
   (TG15, as LoadLibraryA does), not ng_win_imports: no compiler change.
   tests/limits/check-native.sh no longer skips the CPU check on `nat`: 5 ok
   on --nat; x86_64-linux (WSL) still passes.
+  Nov 22 (landed; compiler built from the merged tree):
+  tests/limits/check-run.sh 15 of 15 and check-native.sh on pe_ir 5 of 5.
+  --nat and x86_64-linux not rechecked in the merged tree (known-bugs
+  2g.115).
 - [x] Data race prevention — `@sync`/`@send` DONE (parsed on structs, `is_send_type`/`is_sync_type` enforced at `p_thread_spawn`/`p_chan_send`/`spawn` capture sites in both Rust + self-hosted typecheckers)
 
 ---
@@ -7712,7 +7720,7 @@ Fides's effect system is the foundation — effect handlers can replace async/aw
 - [-] **Not redoing:** HTTP parsing — extending to full server/client
 
 ##### L4H — Process and Environment
-  Nov 21 (P2 fix; staged, not yet in the tree): --nat Windows has pipes. stdlib/linux_runtime/win.fd
+  Nov 21 (P2 fix, in the tree Nov 22): --nat Windows has pipes. stdlib/linux_runtime/win.fd
   pe_win_spawn takes the io bits (sys.fd pe_px_spawn hands them over in the
   record's word 1) and makes one CreatePipe pair per piped stream
   (pe_win_pipes): inheritable, with this process's end then made not to be
@@ -7730,6 +7738,10 @@ Fides's effect system is the foundation — effect handlers can replace async/aw
   test_process_command and test_process_spawn pass on --nat and ccompile
   (fid from the p2tc snapshot); test_process_pipes still gives its 11
   lines on x86_64-linux (WSL).
+  Nov 22 (landed; compiler built from the merged tree): test_process_pipes
+  passes on ccompile and pe_ir emit. On --nat and x86_64-linux it crashes in
+  the merged tree and with main's own runtime alike (known-bugs 2g.115); it
+  passed on --nat before the merge.
 - [x] `process::spawn(cmd, args) -> Process` — spawn child process
   — `process_run`, `process_capture`, `process_stdout`/`process_stderr`/`process_code` (`stdlib/process.fd`, `test_lib_process`, `test_files_spec.fd`); native Windows capture: competitive SL17.
 - [x] `process::Command` — builder for complex process spawning

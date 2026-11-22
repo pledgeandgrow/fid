@@ -20,7 +20,9 @@
 #
 # What each backend enforces (docs/reference/runtime-limits.md):
 #   machine layer, Linux targets: memory and CPU time
-#   --nat Windows, macOS, WASI:   memory only (the CPU check is skipped)
+#   --nat Windows:                memory and CPU time (a watcher thread
+#                                 reading GetProcessTimes, win.fd)
+#   macOS, WASI:                  memory only (the CPU check is skipped)
 #   pe_ir (default Windows):      both, once its entry point calls
 #                                 pert_limits_boot and its p_malloc/p_free
 #                                 call pert_lim_take/pert_lim_give
@@ -39,7 +41,7 @@ INWSL=0
 CPU=1
 case "$TARGET" in
     "")             [ $HOSTW = 1 ] && EXE=".exe" ;;
-    nat)            EMIT=(--nat); EXE=".exe"; CPU=0 ;;
+    nat)            EMIT=(--nat); EXE=".exe" ;;
     x86_64-linux)   EMIT=(--target x86_64-linux); [ $HOSTW = 1 ] && INWSL=1 ;;
     aarch64-linux)  EMIT=(--target aarch64-linux); RUNNER=qemu-aarch64; [ $HOSTW = 1 ] && INWSL=1 ;;
     riscv64-linux)  EMIT=(--target riscv64-linux); RUNNER=qemu-riscv64; [ $HOSTW = 1 ] && INWSL=1 ;;

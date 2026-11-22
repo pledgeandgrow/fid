@@ -1,0 +1,147 @@
+// Tuple layouts are named by their shape (compiler/lower.fd
+// lw_tuple_layout_name: `__tuple_2_pl` for (str, i64)), not by their
+// length. Named `__tuple_2`, `(str, i64)` and `((str, i64), i64)` shared
+// one layout, the last one registered, and the other's fields were read
+// at its offsets (a nested tuple's first word as its address): both
+// shapes here, and (Cell, i64), (f64, str) and (i64, (f64, bool)), in one
+// program, as literals (annotated and not), as function results, through
+// a tuple parameter, in Vecs and as map keys. Every block is freed
+// (`fid run --leaks`).
+// Expected output:
+// xy 3
+// xy 4 5
+// lit 6 7
+// xy 8
+// xy 9 10
+// xy 11 12
+// 7 xy 13
+// 2.5 xy
+// 14 0.5 1
+// xy 15
+// vec 3 xy1 b2 11 xy110 c220 36
+// map 20 found 20 deep 20 found 20 absent 0
+// done
+
+struct Cell {
+    id: i64,
+    name: str,
+}
+
+fn mk(s: str, n: i64) -> (str, i64) {
+    return (s, n);
+}
+
+fn mk2(s: str, n: i64, m: i64) -> ((str, i64), i64) {
+    return ((s, n), m);
+}
+
+fn swap(t: (i64, str)) -> (str, i64) {
+    val (a, b) = t;
+    return (b, a);
+}
+
+fn yes(b: bool) -> i64 {
+    if b {
+        return 1;
+    }
+    return 0;
+}
+
+fn main() {
+    val x: str = "x" + "y";
+    // two shapes of length 2 from functions
+    val a = mk(x, 3);
+    val (as1, an) = a;
+    println(as1 + " " + int_to_str(an));
+    val b = mk2(x, 4, 5);
+    val (bi, bm) = b;
+    val (bs, bn) = bi;
+    println(bs + " " + int_to_str(bn) + " " + int_to_str(bm));
+    val (ci, cm) = mk2("lit", 6, 7);
+    val (cs, cn) = ci;
+    println(cs + " " + int_to_str(cn) + " " + int_to_str(cm));
+    // the same shapes as literals, annotated and not
+    val d: (str, i64) = (x, 8);
+    val (ds, dn) = d;
+    println(ds + " " + int_to_str(dn));
+    val e: ((str, i64), i64) = ((x, 9), 10);
+    val (ei, em) = e;
+    val (es, en) = ei;
+    println(es + " " + int_to_str(en) + " " + int_to_str(em));
+    val f = ((x, 11), 12);
+    val (fi, fm) = f;
+    val (fs, fn2) = fi;
+    println(fs + " " + int_to_str(fn2) + " " + int_to_str(fm));
+    // a struct, a float and a nested tuple of other types, length 2 too
+    val cell = Cell { id: 7, name: x };
+    val g = (cell, 13);
+    val (gc, gk) = g;
+    println(int_to_str(gc.id) + " " + gc.name + " " + int_to_str(gk));
+    val h = (2.5, x);
+    val (hf, hs) = h;
+    println(float_to_str(hf) + " " + hs);
+    val k = (14, (0.5, true));
+    val (kn, kp) = k;
+    val (kf, kb) = kp;
+    println(int_to_str(kn) + " " + float_to_str(kf) + " " + int_to_str(yes(kb)));
+    // a tuple parameter of yet another shape, (i64, str)
+    val (ws, wn) = swap((15, x));
+    println(ws + " " + int_to_str(wn));
+    // Vecs of the two shapes
+    var v1: Vec<(str, i64)> = Vec::new();
+    v1.push((x, 1));
+    v1.push(("b", 2));
+    v1.push((x, 3));
+    var v2: Vec<((str, i64), i64)> = Vec::new();
+    v2.push(((x, 1), 10));
+    v2.push((("c", 2), 20));
+    var vsum: i64 = 0;
+    var j: i64 = 0;
+    while j < v1.len() {
+        val t1: (str, i64) = v1.get(j);
+        val (t1s, t1n) = t1;
+        vsum = vsum + t1n + str_len(t1s);
+        j = j + 1;
+    }
+    val u0: (str, i64) = v1.get(0);
+    val (u0s, u0n) = u0;
+    val u1: (str, i64) = v1.get(1);
+    val (u1s, u1n) = u1;
+    var wsum: i64 = 0;
+    j = 0;
+    while j < v2.len() {
+        val t2: ((str, i64), i64) = v2.get(j);
+        val (t2i, t2m) = t2;
+        val (t2s, t2n) = t2i;
+        wsum = wsum + t2n + t2m + str_len(t2s);
+        j = j + 1;
+    }
+    val w0: ((str, i64), i64) = v2.get(0);
+    val (w0i, w0m) = w0;
+    val (w0s, w0n) = w0i;
+    val w1: ((str, i64), i64) = v2.get(1);
+    val (w1i, w1m) = w1;
+    val (w1s, w1n) = w1i;
+    println("vec " + int_to_str(v1.len()) + " " + u0s + int_to_str(u0n) + " " + u1s + int_to_str(u1n) + " " + int_to_str(vsum) + " " + w0s + int_to_str(w0n) + int_to_str(w0m) + " " + w1s + int_to_str(w1n) + int_to_str(w1m) + " " + int_to_str(wsum));
+    // map keys of the two shapes, built apart from the lookups' keys
+    var m1: HashMap<(str, i64), i64> = HashMap::new();
+    var m2: HashMap<((str, i64), i64), i64> = HashMap::new();
+    var i: i64 = 0;
+    while i < 20 {
+        m1.insert(("k" + int_to_str(i), i), i);
+        m2.insert((("k" + int_to_str(i), i), i * 2), i);
+        i = i + 1;
+    }
+    var found1: i64 = 0;
+    var found2: i64 = 0;
+    i = 0;
+    while i < 20 {
+        val ks: str = "k" + int_to_str(i);
+        found1 = found1 + yes(m1.get_or((ks, i), 0 - 1) == i);
+        found2 = found2 + yes(m2.get_or(((ks, i), i * 2), 0 - 1) == i);
+        i = i + 1;
+    }
+    val absent: i64 = yes(m2.contains((("k3", 3), 3))) + yes(m1.contains(("k3", 4)));
+    println("map " + int_to_str(m1.len()) + " found " + int_to_str(found1) + " deep " + int_to_str(m2.len()) + " found " + int_to_str(found2) + " absent " + int_to_str(absent));
+    println("done");
+}

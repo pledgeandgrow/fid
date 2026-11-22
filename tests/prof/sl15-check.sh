@@ -16,6 +16,11 @@
 #     exit; under FID_PROF_EVERY=1 every second too; without FID_PROF there
 #     is no event and no report.
 # Exit 0 when every check passes.
+# Runs from Git Bash on Windows, and from WSL with a Windows fid
+# (FID=release/fid.exe: the Windows checks, and the Linux build runs in WSL
+# itself). Another process names the event with the Windows process id,
+# which the service prints first on stderr ("pid <n>"): the shell's $! is
+# its own (Git Bash's or WSL's) number for the program.
 FID=${FID:-release/fid.exe}
 T=tests/bootstrap/test_prof_sampling.fd
 SVC=tests/prof/sl15_service.fd
@@ -32,7 +37,16 @@ ok() { echo "ok   $1"; }
 bad() { echo "FAIL $1"; fail=1; }
 EXE=""
 WIN=0
+INWSL=0
 case "$(uname -s 2>/dev/null)" in MINGW*|MSYS*|CYGWIN*) EXE=".exe"; WIN=1 ;; esac
+# WSL with a Windows fid: Windows executables run through interop, and an
+# environment variable reaches them only when WSLENV names it
+if [ $WIN -eq 0 ] && grep -qi microsoft /proc/version 2> /dev/null; then
+    case "$FID" in
+        *.exe) EXE=".exe"; WIN=1; INWSL=1
+               export WSLENV="FID_PROF:FID_PROF_EVERY:SL15_SVC_MS${WSLENV:+:$WSLENV}" ;;
+    esac
+fi
 
 # The expected stdout: the "// Expected output:" lines of the test
 sed -n '/^\/\/ Expected output:/,/^[^/]/p' "$T" | grep '^// ' | grep -v 'Expected output:' | sed 's#^// ##' > "$D/want.txt"
@@ -70,15 +84,23 @@ else
     bad "emit failed"; tail -20 "$D/emit.log"
 fi
 
-# 1d. Windows: the Linux x86-64 build under WSL
-if [ $WIN -eq 1 ] && command -v wsl.exe > /dev/null 2>&1; then
+# 1d. Windows: the Linux x86-64 build under WSL (in WSL itself: directly).
+# From Git Bash the folder goes to wslpath with forward slashes, through
+# `wsl.exe -e` (no shell that eats backslashes), MSYS's path conversion off.
+if [ $WIN -eq 1 ] && { [ $INWSL -eq 1 ] || command -v wsl.exe > /dev/null 2>&1; }; then
     if "$FID" emit "$T" --target x86_64-linux -o "$D/t_lx" > "$D/lx.log" 2>&1; then
-        WIN_DIR=$(cygpath -m "$PWD/$D")
-        WD=$(MSYS_NO_PATHCONV=1 wsl.exe -e wslpath -a "$WIN_DIR" 2> /dev/null | tr -d '\r')
-        if [ -n "$WD" ] && MSYS_NO_PATHCONV=1 wsl.exe -e sh -c "cd '$WD' && chmod +x t_lx && ./t_lx > lx.out 2> lx.err"; then
+        if [ $INWSL -eq 1 ]; then
+            chmod +x "$D/t_lx"
+            "./$D/t_lx" > "$D/lx.out" 2> "$D/lx.err"
             check_run "emit x86_64-linux (WSL)" "$D/lx.out" "$D/lx.err"
         else
-            bad "emit x86_64-linux (WSL): could not resolve or run $WIN_DIR"
+            WIN_DIR=$(cygpath -m "$PWD/$D")
+            WD=$(MSYS_NO_PATHCONV=1 wsl.exe -e wslpath -a "$WIN_DIR" 2> /dev/null | tr -d '\r')
+            if [ -n "$WD" ] && MSYS_NO_PATHCONV=1 wsl.exe -e sh -c "cd '$WD' && chmod +x t_lx && ./t_lx > lx.out 2> lx.err"; then
+                check_run "emit x86_64-linux (WSL)" "$D/lx.out" "$D/lx.err"
+            else
+                bad "emit x86_64-linux (WSL): could not resolve or run $WIN_DIR"
+            fi
         fi
     else
         bad "emit --target x86_64-linux failed"; tail -20 "$D/lx.log"
@@ -108,21 +130,33 @@ if [ $WIN -eq 1 ]; then
         else
             bad "FID_PROF_EVERY=1: $n report(s)"; cat "$D/s2.err"
         fi
-        # From another process: PowerShell sets the event while it runs
+        # From another process: PowerShell sets the event while it runs.
+        # Each half of the service takes 4 s here (SL15_SVC_MS): PowerShell
+        # can take seconds to start on a busy machine, and its Set must come
+        # before the service's own at the half, not with it
         if command -v powershell.exe > /dev/null 2>&1; then
-            FID_PROF=1 "./$D/svc.exe" > "$D/s3.out" 2> "$D/s3.err" &
+            SL15_SVC_MS=4000 FID_PROF=1 "./$D/svc.exe" > "$D/s3.out" 2> "$D/s3.err" &
             BG=$!
-            sleep 0.4
-            WPID=$BG
-            [ -r "/proc/$BG/winpid" ] && WPID=$(cat "/proc/$BG/winpid")
-            powershell.exe -NoProfile -Command "[System.Threading.EventWaitHandle]::OpenExisting('Local\\fid-prof-$WPID').Set() | Out-Null" > /dev/null 2>&1
+            # its Windows process id: the service's first line on stderr
+            WPID=""
+            k=0
+            while [ -z "$WPID" ] && [ $k -lt 60 ]; do
+                sleep 0.05
+                WPID=$(sed -n 's/^pid \([0-9][0-9]*\).*/\1/p' "$D/s3.err" 2> /dev/null | head -1)
+                k=$((k + 1))
+            done
+            # the watcher thread makes the event right after start
+            sleep 0.3
+            if [ -n "$WPID" ]; then
+                MSYS_NO_PATHCONV=1 powershell.exe -NoProfile -Command "[System.Threading.EventWaitHandle]::OpenExisting('Local\\fid-prof-$WPID').Set() | Out-Null" > /dev/null 2>&1
+            fi
             wait "$BG"
             BG=""
             n=$(grep -c "profile (FID_PROF)" "$D/s3.err")
             if [ "$n" -ge 3 ]; then
                 ok "an event set from another process: $n reports"
             else
-                bad "an event set from another process: $n report(s)"; cat "$D/s3.err"
+                bad "an event set from another process (pid ${WPID:-not printed}): $n report(s)"; cat "$D/s3.err"
             fi
         fi
     else

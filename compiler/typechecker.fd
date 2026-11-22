@@ -13161,7 +13161,7 @@ fn TypeChecker_rt6_note_let(self: &mut TypeChecker, name: str, typable: bool, li
 /// `name = expr`: a bare Vec given another value than a new empty one (which
 /// the lowering makes with the variable's type) is not typed by a later push.
 fn TypeChecker_rt6_assigned(self: &TypeChecker, name: str, expr: Expr) {
-    if tc_rt6_is_vec_new(expr) {
+    if tc_rt6_is_vec_new(expr) || tc_rt5_is_map_new(expr) {
         return;
     }
     var k: i64 = rt6_find(TypeChecker_rt6_fn_key(self), name);
@@ -13247,6 +13247,22 @@ fn TypeChecker_rt6_note_push(self: &mut TypeChecker, receiver: Expr, recv_ty: Ty
     if rt6_count() == 0 {
         return recv_ty;
     }
+    if method == "insert" && arg_types.len() == 2 {
+        var on_map: bool = false;
+        match recv_ty {
+            Type::Named(mn) => {
+                on_map = mn == "HashMap";
+            }
+            Type::Generic(mgn, _) => {
+                on_map = mgn == "HashMap";
+            }
+            _ => {
+            }
+        }
+        if on_map {
+            return TypeChecker_rt5_note_insert(self, receiver, recv_ty, arg_types);
+        }
+    }
     var bare: bool = false;
     match recv_ty {
         Type::Named(bn) => {
@@ -13311,6 +13327,166 @@ fn TypeChecker_rt6_retype(self: &mut TypeChecker, name: str, ty: Type) {
         }
         i = i - 1;
     }
+}
+
+// --- RT5: an untyped `HashMap::new()` typed by its first insert ----------
+//
+// `var m = HashMap::new()` written without a type is a HashMap<str, i64>
+// here, and a map of word keys to the lowering. Its first insert of a
+// struct or tuple key (`m.insert((s, 1), 2)`, `m.insert(Cell { .. }, v)`)
+// makes it a HashMap<K, V> of that key and value type: here (the variable
+// is retyped, so `m.keys()` is a Vec<K> and `m.get(k)` a V) and in the
+// lowering (Lowerer_rt6_let_type gives the `let` that type, so the map
+// takes the path a written `HashMap<K, V>` takes: a struct or tuple key is
+// hashed and compared field by field, a string in it as text). A first
+// insert of any other key leaves it as it was. The records are RT6's
+// (ast.fd rt6_add_map, rt6_map_at).
+
+fn tc_rt5_is_map_new(e: Expr) -> bool {
+    match e {
+        Expr::MethodCall(recv, m, args) => {
+            if m != "new" || args.len() != 0 {
+                return false;
+            }
+            match box_expr_unbox(recv) {
+                Expr::Ident(rn) => {
+                    return rn == "HashMap";
+                }
+                _ => {
+                }
+            }
+        }
+        _ => {
+        }
+    }
+    return false;
+}
+
+/// Note a `let` of `name` whose value is a map. Only an untyped `var m =
+/// HashMap::new()` can be typed by an insert; any other one is noted when
+/// it hides such a variable of the same name (so an insert into it does
+/// not type the outer one), and not otherwise (records are looked up by
+/// a scan: a program of typed maps adds none).
+fn TypeChecker_rt5_note_map_let(self: &mut TypeChecker, name: str, ty: OptType, expr: Expr, line: i64) {
+    var state: i64 = 2;
+    match ty {
+        OptType::None => {
+            if tc_rt5_is_map_new(expr) {
+                state = 0;
+            }
+        }
+        OptType::Some(_) => {
+        }
+    }
+    var key: str = TypeChecker_rt6_fn_key(self);
+    if state != 0 && (rt6_count() == 0 || rt6_find(key, name) < 0) {
+        return;
+    }
+    rt6_add_map(key, name, line, self.scopes.len(), state);
+}
+
+/// Whether `t` is a struct or tuple key a map can take as written: a tuple
+/// of numbers, bools, strings, such structs and such tuples; a struct that
+/// is not generic; an instance of a generic struct whose arguments are such
+/// types.
+fn TypeChecker_rt5_key_ok(self: &mut TypeChecker, t: Type, depth: i64) -> bool {
+    if depth > 8 || TypeChecker_type_contains_param(self, t) {
+        return false;
+    }
+    match t {
+        Type::Tuple(es) => {
+            if es.len() == 0 {
+                return false;
+            }
+            var i: i64 = 0;
+            while i < es.len() {
+                if !TypeChecker_rt5_part_ok(self, es.get(i), depth + 1) {
+                    return false;
+                }
+                i = i + 1;
+            }
+            return true;
+        }
+        Type::Named(n) => {
+            if n == "String" || n == "Vec" || n == "HashMap" || n == "Box" || str_vec_contains(self.current_type_params, n) {
+                return false;
+            }
+            return tc_is_struct(self, n) && !tc_str_vec_contains(self.struct_tp_names, n);
+        }
+        Type::Generic(gn, gargs) => {
+            if !tc_is_struct(self, gn) || !tc_str_vec_contains(self.struct_tp_names, gn) || gargs.len() == 0 {
+                return false;
+            }
+            var j: i64 = 0;
+            while j < gargs.len() {
+                if !TypeChecker_rt5_part_ok(self, gargs.get(j), depth + 1) {
+                    return false;
+                }
+                j = j + 1;
+            }
+            return true;
+        }
+        _ => {
+        }
+    }
+    return false;
+}
+
+/// A part of a struct or tuple key: a number, bool or string, or a key
+/// TypeChecker_rt5_key_ok takes.
+fn TypeChecker_rt5_part_ok(self: &mut TypeChecker, t: Type, depth: i64) -> bool {
+    if tc_is_str(t) || TypeChecker_is_integer(self, t) {
+        return true;
+    }
+    match t {
+        Type::Bool => {
+            return true;
+        }
+        Type::F64 => {
+            return true;
+        }
+        _ => {
+        }
+    }
+    return TypeChecker_rt5_key_ok(self, t, depth);
+}
+
+/// `receiver.insert(key, value)` on a map of type `recv_ty`: the first
+/// insert into an untyped `var m = HashMap::new()` types it when the key is
+/// a struct or tuple (see above). Returns the receiver's type from here on.
+fn TypeChecker_rt5_note_insert(self: &mut TypeChecker, receiver: Expr, recv_ty: Type, arg_types: Vec<Type>) -> Type {
+    var rn: str = "";
+    match receiver {
+        Expr::Ident(n) => {
+            rn = n;
+        }
+        _ => {
+            return recv_ty;
+        }
+    }
+    var k: i64 = rt6_find(TypeChecker_rt6_fn_key(self), rn);
+    if k < 0 || !rt6_is_map(k) || rt6_state(k) != 0 {
+        return recv_ty;
+    }
+    var kt: Type = arg_types.get(0);
+    if !TypeChecker_rt5_key_ok(self, kt, 0) {
+        rt6_set_state(k, 2);
+        return recv_ty;
+    }
+    var vt: Type = arg_types.get(1);
+    if tc_is_str(vt) {
+        vt = Type::Str;
+    } else if !TypeChecker_is_integer(self, vt) && !TypeChecker_rt6_type_ok(self, vt) {
+        rt6_set_state(k, 2);
+        return recv_ty;
+    }
+    var ga: Vec<Type> = Vec::new();
+    ga.push(kt);
+    ga.push(vt);
+    var mt: Type = Type::Generic("HashMap", ga);
+    rt6_set_typed(k, mt);
+    TypeChecker_rt6_retype(self, rn, mt);
+    return mt;
 }
 
 // --- Type utilities ------------------------------------------------------
@@ -18670,6 +18846,16 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
                             }
                         }
                         TypeChecker_rt6_note_let(self, name, typable, line);
+                    }
+                    if fvn == "HashMap" {
+                        TypeChecker_rt5_note_map_let(self, name, ty, expr, line);
+                    }
+                }
+                Type::Generic(fgn, _) => {
+                    // RT5: an untyped `HashMap::new()` (HashMap<str, i64>
+                    // until its first insert says otherwise)
+                    if fgn == "HashMap" {
+                        TypeChecker_rt5_note_map_let(self, name, ty, expr, line);
                     }
                 }
                 _ => {

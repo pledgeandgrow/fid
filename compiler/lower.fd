@@ -1011,6 +1011,34 @@ pub fn Lowerer_lookup_pattern_enum(self: & Lowerer, enum_name: str, variant: str
 /// through `word_repr` unchanged.
 pub fn Lowerer_pattern_binding_ir_types(self: & Lowerer, enum_name: str, variant: str, bindings: Vec<Binding>) -> Vec<IrType> {
     var ast_tys: Vec<Type> = Lowerer_pattern_binding_ast_types(self, enum_name, variant, bindings);
+    // The declared payload types: a tuple or a generic struct instance is
+    // held inline (Lowerer_held_ir, as the enum's layout keeps it)
+    var decl_tys: Vec<Type> = Vec::new();
+    var decl_params: Vec<str> = Vec::new();
+    match Lowerer_lookup_pattern_enum(self, enum_name, variant) {
+        OptEnumDef::Some(pdef) => {
+            decl_params = pdef.type_params;
+            var pvi: i64 = 0;
+            while pvi < pdef.variants.len() {
+                if pdef.variants.get(pvi).name == variant {
+                    match pdef.variants.get(pvi).data {
+                        OptParams::Some(pps) => {
+                            var ppi: i64 = 0;
+                            while ppi < pps.len() {
+                                decl_tys.push(pps.get(ppi).ty);
+                                ppi = ppi + 1;
+                            }
+                        }
+                        OptParams::None => {
+                        }
+                    }
+                }
+                pvi = pvi + 1;
+            }
+        }
+        OptEnumDef::None => {
+        }
+    }
     var result: Vec<IrType> = Vec::new();
     var bi: i64 = 0;
     while bi < ast_tys.len() {
@@ -1018,6 +1046,21 @@ pub fn Lowerer_pattern_binding_ir_types(self: & Lowerer, enum_name: str, variant
         // inline data. Box<T> lowers to Ptr(Struct(T)) which is already a
         // word - word_repr leaves it unchanged.
         var lowered: IrType = Lowerer_lower_type(self, ast_tys.get(bi));
+        if bi < decl_tys.len() && !lw_rc_is_param(decl_tys.get(bi), decl_params) {
+            match lowered {
+                IrType::Struct(_) => {
+                }
+                _ => {
+                    match Lowerer_held_ir(self, decl_tys.get(bi), decl_params) {
+                        IrType::Struct(hsn) => {
+                            lowered = IrType::Struct(hsn);
+                        }
+                        _ => {
+                        }
+                    }
+                }
+            }
+        }
         match lowered {
             IrType::Struct(_) => {
                 result.push(lowered);
@@ -1665,6 +1708,27 @@ fn Lowerer_rt6_let_type(self: & Lowerer, name: str, ty: OptType, expr: Expr, lin
         }
         OptType::None => {
         }
+    }
+    // RT5: `var m = HashMap::new()` the type checker typed from its first
+    // insert of a struct or tuple key: the `HashMap<K, V>` it found, so the
+    // map takes the path of a written type (ast.fd rt6_map_at)
+    if lw_is_map_new_expr(expr) && self.has_current_func {
+        match rt6_map_at(self.current_func.name, name, line) {
+            OptType::Some(mt) => {
+                match mt {
+                    Type::Generic(mn, margs) => {
+                        if mn == "HashMap" && margs.len() == 2 {
+                            return OptType::Some(mt);
+                        }
+                    }
+                    _ => {
+                    }
+                }
+            }
+            OptType::None => {
+            }
+        }
+        return OptType::None;
     }
     if !lw_is_vec_new_expr(expr) || !self.has_current_func {
         return OptType::None;
@@ -2426,7 +2490,7 @@ pub fn Lowerer_lower_type(self: & Lowerer, ty: Type) -> IrType {
 /// convention treats them as aggregate types.
 /// Used only at function signature boundaries (return type + call sites).
 /// Field type of a tuple element: a struct pointer is stored inline as the
-/// struct (src/lower.rs TupleLit / __tuple_N layouts).
+/// struct (src/lower.rs TupleLit; Lowerer_register_tuple_layout).
 pub fn lw_tuple_field_ty(ty: IrType) -> IrType {
     match ty {
         IrType::Ptr(inner) => {
@@ -2445,13 +2509,216 @@ pub fn lw_tuple_field_ty(ty: IrType) -> IrType {
     return ty;
 }
 
-/// Register the __tuple_N layout for a tuple of IR element types.
-pub fn Lowerer_register_tuple_layout(self: & mut Lowerer, elem_tys: Vec<IrType>) {
-    var layout: StructLayout = StructLayout_new("__tuple_" + int_to_str(elem_tys.len()));
-    var offset: i64 = 0;
+/// The tuple layout a value of IR type `t` is (a `__tuple_` struct, or a
+/// pointer to one), or "".
+fn lw_tuple_struct_name(t: IrType) -> str {
+    match t {
+        IrType::Struct(sn) => {
+            if str_starts_with(sn, "__tuple_") {
+                return sn;
+            }
+        }
+        IrType::Ptr(inner) => {
+            match box_ir_type_unbox(inner) {
+                IrType::Struct(sn2) => {
+                    if str_starts_with(sn2, "__tuple_") {
+                        return sn2;
+                    }
+                }
+                _ => {
+                }
+            }
+        }
+        _ => {
+        }
+    }
+    return "";
+}
+
+/// The code of a tuple field's IR type in its layout's name
+/// (lw_tuple_layout_name): a letter for each scalar, `p` a pointer (a
+/// string), `s<len>_<name>` a struct held inline (a nested tuple too), `v`
+/// nothing, `w` any other word, `x<size>_` any other room.
+fn lw_tuple_field_code(ty: IrType) -> str {
+    match ty {
+        IrType::I8 => {
+            return "b";
+        }
+        IrType::I16 => {
+            return "h";
+        }
+        IrType::I32 => {
+            return "i";
+        }
+        IrType::I64 => {
+            return "l";
+        }
+        IrType::U8 => {
+            return "B";
+        }
+        IrType::U16 => {
+            return "H";
+        }
+        IrType::U32 => {
+            return "I";
+        }
+        IrType::U64 => {
+            return "L";
+        }
+        IrType::F32 => {
+            return "f";
+        }
+        IrType::F64 => {
+            return "d";
+        }
+        IrType::Bool => {
+            return "z";
+        }
+        IrType::Ptr(_) => {
+            return "p";
+        }
+        IrType::Struct(sn) => {
+            return "s" + int_to_str(str_len(sn)) + "_" + sn;
+        }
+        IrType::Void => {
+            return "v";
+        }
+        _ => {
+        }
+    }
+    var size: i64 = ir_type_size(ty);
+    if size == 8 {
+        return "w";
+    }
+    return "x" + int_to_str(size) + "_";
+}
+
+/// The name of the layout of a tuple whose fields (lw_tuple_field_ty of
+/// the element types) are `ftys`: `__tuple_<n>_<codes>`, one code per field
+/// (lw_tuple_field_code), `__tuple_0` for the empty tuple. Named by its
+/// shape, so two tuples of one length, `(str, i64)` and `((str, i64),
+/// i64)`, have a layout each (a name made of the length alone gave both
+/// one layout, the last registered, and the other's fields were read at
+/// its offsets). The name holds the field types: a cached function's
+/// layouts are made again from it (Lowerer_irc_tuple_layouts).
+pub fn lw_tuple_layout_name(ftys: Vec<IrType>) -> str {
+    var name: str = "__tuple_" + int_to_str(ftys.len());
+    if ftys.len() == 0 {
+        return name;
+    }
+    name = name + "_";
+    var i: i64 = 0;
+    while i < ftys.len() {
+        name = name + lw_tuple_field_code(ftys.get(i));
+        i = i + 1;
+    }
+    return name;
+}
+
+/// The digits of `s` from byte `at` on, as a number, and where they end
+/// (lw_tuple_name_fields): [value, end]; end == at when there are none.
+fn lw_tuple_name_num(s: str, at: i64) -> Vec<i64> {
+    var v: i64 = 0;
+    var i: i64 = at;
+    while i < str_len(s) && str_byte_at(s, i) >= 48 && str_byte_at(s, i) <= 57 {
+        v = v * 10 + (str_byte_at(s, i) - 48);
+        i = i + 1;
+    }
+    var out: Vec<i64> = Vec::new();
+    out.push(v);
+    out.push(i);
+    return out;
+}
+
+/// The field types a tuple layout name (lw_tuple_layout_name) holds, as
+/// types that lay it out the same (a pointer is a `*u8`, a word an opaque
+/// word, other room a byte array); an empty list when `name` is no such
+/// name (or is `__tuple_0`).
+pub fn lw_tuple_name_fields(name: str) -> Vec<IrType> {
+    var out: Vec<IrType> = Vec::new();
+    var none: Vec<IrType> = Vec::new();
+    if !str_starts_with(name, "__tuple_") {
+        return none;
+    }
+    var nn: Vec<i64> = lw_tuple_name_num(name, 8);
+    var n: i64 = nn.get(0);
+    var at: i64 = nn.get(1);
+    if at == 8 || n <= 0 || at >= str_len(name) || str_byte_at(name, at) != 95 {
+        return none;
+    }
+    at = at + 1;
+    while at < str_len(name) {
+        var c: i64 = str_byte_at(name, at);
+        at = at + 1;
+        if c == 98 {
+            out.push(IrType::I8);
+        } else if c == 104 {
+            out.push(IrType::I16);
+        } else if c == 105 {
+            out.push(IrType::I32);
+        } else if c == 108 {
+            out.push(IrType::I64);
+        } else if c == 66 {
+            out.push(IrType::U8);
+        } else if c == 72 {
+            out.push(IrType::U16);
+        } else if c == 73 {
+            out.push(IrType::U32);
+        } else if c == 76 {
+            out.push(IrType::U64);
+        } else if c == 102 {
+            out.push(IrType::F32);
+        } else if c == 100 {
+            out.push(IrType::F64);
+        } else if c == 122 {
+            out.push(IrType::Bool);
+        } else if c == 112 {
+            out.push(lw_ptr_u8());
+        } else if c == 118 {
+            out.push(IrType::Void);
+        } else if c == 119 {
+            out.push(IrType::Opaque("tuple"));
+        } else if c == 115 || c == 120 {
+            var ln: Vec<i64> = lw_tuple_name_num(name, at);
+            if ln.get(1) == at || ln.get(1) >= str_len(name) || str_byte_at(name, ln.get(1)) != 95 {
+                return none;
+            }
+            at = ln.get(1) + 1;
+            if c == 120 {
+                out.push(IrType::Array(Box::new(IrType::U8), ln.get(0)));
+            } else {
+                if at + ln.get(0) > str_len(name) {
+                    return none;
+                }
+                out.push(IrType::Struct(str_slice(name, at, at + ln.get(0))));
+                at = at + ln.get(0);
+            }
+        } else {
+            return none;
+        }
+    }
+    if out.len() != n {
+        return none;
+    }
+    return out;
+}
+
+/// Register the layout of a tuple of IR element types (a field each,
+/// lw_tuple_field_ty of its type, every field at a multiple of 8) under
+/// its shape's name (lw_tuple_layout_name), and return that name.
+pub fn Lowerer_register_tuple_layout(self: & mut Lowerer, elem_tys: Vec<IrType>) -> str {
+    var ftys: Vec<IrType> = Vec::new();
     var i: i64 = 0;
     while i < elem_tys.len() {
-        var field_ty: IrType = lw_tuple_field_ty(elem_tys.get(i));
+        ftys.push(lw_tuple_field_ty(elem_tys.get(i)));
+        i = i + 1;
+    }
+    var name: str = lw_tuple_layout_name(ftys);
+    var layout: StructLayout = StructLayout_new(name);
+    var offset: i64 = 0;
+    i = 0;
+    while i < ftys.len() {
+        var field_ty: IrType = ftys.get(i);
         layout.fields.push(StringIrTypeOffset_new("_" + int_to_str(i), field_ty, offset));
         offset = offset + IrModule_type_size(& self.module, field_ty);
         offset = (offset + 7) / 8 * 8;
@@ -2460,31 +2727,104 @@ pub fn Lowerer_register_tuple_layout(self: & mut Lowerer, elem_tys: Vec<IrType>)
     layout.size = offset;
     layout.align = 8;
     IrModule_add_struct(& mut self.module, layout);
+    return name;
 }
 
-/// A function returning a tuple registers its __tuple_N layout.
-pub fn Lowerer_register_ret_tuple(self: & mut Lowerer, ret: Type) {
-    match ret {
-        Type::Tuple(types) => {
-            var tys: Vec<IrType> = Vec::new();
-            var i: i64 = 0;
-            while i < types.len() {
-                tys.push(Lowerer_lower_type(self, types.get(i)));
-                i = i + 1;
+/// Register the layout tuple name `name` (lw_tuple_layout_name) stands for
+/// when the module has none, its nested tuples' first (an IR cache hit
+/// replays a function without lowering its tuple literals).
+fn Lowerer_register_tuple_name(self: & mut Lowerer, name: str, depth: i64) {
+    if depth > 16 || !str_starts_with(name, "__tuple_") {
+        return;
+    }
+    match IrModule_get_struct(& self.module, name) {
+        OptStructLayout::Some(_) => {
+            return;
+        }
+        OptStructLayout::None => {
+        }
+    }
+    var ftys: Vec<IrType> = lw_tuple_name_fields(name);
+    if ftys.len() == 0 {
+        return;
+    }
+    var i: i64 = 0;
+    while i < ftys.len() {
+        match ftys.get(i) {
+            IrType::Struct(sub) => {
+                Lowerer_register_tuple_name(self, sub, depth + 1);
             }
-            Lowerer_register_tuple_layout(self, tys);
+            _ => {
+            }
+        }
+        i = i + 1;
+    }
+    var _n: str = Lowerer_register_tuple_layout(self, ftys);
+}
+
+/// The tuple layout names IR type `t` holds (through pointers), registered
+/// (Lowerer_register_tuple_name).
+fn Lowerer_register_tuple_names_in(self: & mut Lowerer, t: IrType, depth: i64) {
+    if depth > 8 {
+        return;
+    }
+    match t {
+        IrType::Struct(sn) => {
+            Lowerer_register_tuple_name(self, sn, 0);
+        }
+        IrType::Ptr(inner) => {
+            Lowerer_register_tuple_names_in(self, box_ir_type_unbox(inner), depth + 1);
         }
         _ => {
         }
     }
 }
 
-pub fn Lowerer_lower_type_sret(self: & Lowerer, ty: Type) -> IrType {
-    // Tuples are __tuple_N structs, so the SRET convention returns them
-    // (Opaque("tuple") returned a dangling pointer to a stack alloca).
-    match ty {
+/// An IR cache hit (FID_IRCACHE): the layouts of the tuples cached function
+/// `f` uses, made again from their names (its tuple literals registered
+/// them when it was lowered, and they are not lowered now).
+fn Lowerer_irc_tuple_layouts(self: & mut Lowerer, f: IrFunction) {
+    var i: i64 = 0;
+    while i < f.value_metas.len() {
+        Lowerer_register_tuple_names_in(self, f.value_metas.get(i).meta.ty, 0);
+        i = i + 1;
+    }
+    i = 0;
+    while i < f.insts.len() {
+        match f.insts.get(i).inst {
+            Inst::Alloca(at, _) => {
+                Lowerer_register_tuple_names_in(self, at, 0);
+            }
+            Inst::StructCopy(_, _, ct) => {
+                Lowerer_register_tuple_names_in(self, ct, 0);
+            }
+            _ => {
+            }
+        }
+        i = i + 1;
+    }
+}
+
+/// A function returning a tuple registers its layout, as a tuple literal
+/// of its element types lays it out (Lowerer_key_tuple_ir: a nested tuple
+/// and a struct inline).
+pub fn Lowerer_register_ret_tuple(self: & mut Lowerer, ret: Type) {
+    match Lowerer_resolve_type(self, ret) {
         Type::Tuple(types) => {
-            return IrType::Struct("__tuple_" + int_to_str(types.len()));
+            var _rt: IrType = Lowerer_key_tuple_ir(self, types);
+        }
+        _ => {
+        }
+    }
+}
+
+pub fn Lowerer_lower_type_sret(self: & mut Lowerer, ty: Type) -> IrType {
+    // Tuples are structs (their shape's layout, Lowerer_key_tuple_ir), so
+    // the SRET convention returns them (Opaque("tuple") returned a
+    // dangling pointer to a stack alloca).
+    match Lowerer_resolve_type(self, ty) {
+        Type::Tuple(types) => {
+            return Lowerer_key_tuple_ir(self, types);
         }
         _ => {
         }
@@ -2757,6 +3097,16 @@ pub fn Lowerer_resolve_self_in_type(self: & Lowerer, ty: Type) -> Type {
 // --- Struct/Enum layout computation ---------------------------------------
 
 pub fn Lowerer_compute_struct_layout(self: & mut Lowerer, def: StructDef) {
+    // the layouts of the tuples its fields hold inline (Lowerer_held_ir),
+    // again at each round of the layout fixpoint (a struct in a tuple may
+    // have grown)
+    var hi: i64 = 0;
+    while hi < def.fields.len() {
+        if !lw_rc_is_param(def.fields.get(hi).ty, def.type_params) {
+            Lowerer_register_held_layouts(self, def.fields.get(hi).ty, def.type_params);
+        }
+        hi = hi + 1;
+    }
     var layout: StructLayout = Lowerer_make_struct_layout(self, def);
     // CS4: in place (as Lowerer_lower_program's own add_struct). Taking
     // the module out and putting it back copied it: its layout list, the
@@ -2802,7 +3152,11 @@ pub fn Lowerer_make_struct_layout(self: & Lowerer, def: StructDef) -> StructLayo
     var i: i64 = 0;
     while i < def.fields.len() {
         var field: Param = def.fields.get(i);
-        var ir_ty: IrType = Lowerer_lower_type(self, field.ty);
+        // A tuple field and a generic struct instance field are held inline
+        // (Lowerer_held_ir), as their values and their drops (__own_drop_)
+        // keep them: as one word the field held the address of a value on
+        // the stack, and the drop read that word as the value
+        var ir_ty: IrType = Lowerer_held_ir(self, field.ty, def.type_params);
         // A field typed by one of the struct's type parameters is one word
         // (as a generic enum's payload): `first: A` lowered as a struct
         // named A, and a literal stored nothing in it (2f.11)
@@ -2954,6 +3308,24 @@ pub fn Lowerer_make_struct_layout(self: & Lowerer, def: StructDef) -> StructLayo
 }
 
 pub fn Lowerer_compute_enum_layout(self: & mut Lowerer, def: EnumDef) {
+    // the layouts of the tuples its payloads hold inline (Lowerer_held_ir)
+    var hv: i64 = 0;
+    while hv < def.variants.len() {
+        match def.variants.get(hv).data {
+            OptParams::Some(hps) => {
+                var hp: i64 = 0;
+                while hp < hps.len() {
+                    if !lw_rc_is_param(hps.get(hp).ty, def.type_params) {
+                        Lowerer_register_held_layouts(self, hps.get(hp).ty, def.type_params);
+                    }
+                    hp = hp + 1;
+                }
+            }
+            OptParams::None => {
+            }
+        }
+        hv = hv + 1;
+    }
     var layout: StructLayout = Lowerer_make_enum_layout(self, def);
     // CS4: in place, as Lowerer_compute_struct_layout
     IrModule_add_struct(& mut self.module, layout);
@@ -2972,7 +3344,12 @@ pub fn Lowerer_make_enum_layout(self: & Lowerer, def: EnumDef) -> StructLayout {
                 var variant_size: i64 = 0;
                 var fi: i64 = 0;
                 while fi < data.len() {
+                    // a tuple or a generic struct instance inline
+                    // (Lowerer_held_ir)
                     var ir_ty: IrType = Lowerer_lower_type(self, data.get(fi).ty);
+                    if !lw_rc_is_param(data.get(fi).ty, def.type_params) {
+                        ir_ty = Lowerer_held_ir(self, data.get(fi).ty, def.type_params);
+                    }
                     var field_size: i64 = 8;
                     match ir_ty {
                         IrType::Struct(sname) => {
@@ -5854,11 +6231,15 @@ pub fn Lowerer_lower_func(self: & mut Lowerer, func: Func) {
             if rr.ok && cached_fn.name == func.name {
                 var ri: i64 = 0;
                 while ri < g_irc_rtypes.len() {
+                    // (a tuple too: a struct of its shape, its layout
+                    // registered by Lowerer_rc_type_index)
                     var _rix: i64 = Lowerer_rc_type_index(self, g_irc_rtypes.get(ri));
                     ri = ri + 1;
                 }
                 g_irc_rtypes = Vec::new();
                 Lowerer_register_ret_tuple(self, func.ret_ty);
+                // its tuple literals' layouts, from their names
+                Lowerer_irc_tuple_layouts(self, cached_fn);
                 irc_reintern(& mut self.module, cached_fn);
                 IrModule_add_function(& mut self.module, cached_fn);
                 return;
@@ -6273,6 +6654,14 @@ fn Lowerer_lower_func_body(self: & mut Lowerer, func: Func) {
                     IrFunction_bind_local(& mut self.current_func, rp.name, mine);
                     pb_vals.set(rpi, mine);
                     Lowerer_rc_add_slot(self, mine, rp.ty);
+                    // A tuple parameter the body assigns: the copy is its
+                    // slot, held inline as a tuple variable's (its word
+                    // slot took a whole tuple's copy)
+                    if Lowerer_rc_tuple_elems(self, rp.ty).len() > 0 && lw_c_str_vec_contains(assigned_params, rp.name) {
+                        Lowerer_insert_alloca(self, rp.name, mine);
+                        Lowerer_insert_alloca_type(self, mine, Lowerer_rc_mem_ir(self, rp.ty));
+                        owned_params.push(rp.name);
+                    }
                 } else {
                     var pslot: i64 = Lowerer_rc_new_slot(self, pb_tys.get(rpi), rp.ty);
                     Lowerer_emit_inst(self, Inst::Store(pslot, mine, OptIrType::None));
@@ -6287,7 +6676,26 @@ fn Lowerer_lower_func_body(self: & mut Lowerer, func: Func) {
     }
     var pbi: i64 = 0;
     while pbi < pb_names.len() {
+        // a tuple parameter (of plain elements) the body assigns: a copy
+        // held inline, as a tuple variable's
+        var sp_tes: Vec<Type> = Vec::new();
         if lw_c_str_vec_contains(assigned_params, pb_names.get(pbi)) && !lw_c_str_vec_contains(owned_params, pb_names.get(pbi)) {
+            var spi: i64 = 0;
+            while spi < func.params.len() {
+                if func.params.get(spi).name == pb_names.get(pbi) {
+                    sp_tes = Lowerer_rc_tuple_elems(self, func.params.get(spi).ty);
+                }
+                spi = spi + 1;
+            }
+        }
+        if sp_tes.len() > 0 {
+            var tslot_ty: IrType = Lowerer_key_tuple_ir(self, sp_tes);
+            var tslot: i64 = Lowerer_emit_inst(self, Inst::Alloca(tslot_ty, Lowerer_current_region(self)));
+            var tsrc: i64 = Lowerer_rc_tuple_ptr(self, pb_vals.get(pbi), Type::Tuple(sp_tes));
+            Lowerer_emit_inst(self, Inst::Store(tslot, tsrc, OptIrType::Some(tslot_ty)));
+            Lowerer_insert_alloca(self, pb_names.get(pbi), tslot);
+            Lowerer_insert_alloca_type(self, tslot, tslot_ty);
+        } else if lw_c_str_vec_contains(assigned_params, pb_names.get(pbi)) && !lw_c_str_vec_contains(owned_params, pb_names.get(pbi)) {
             var slot: i64 = Lowerer_emit_inst(self, Inst::Alloca(pb_tys.get(pbi), Lowerer_current_region(self)));
             var _st: i64 = Lowerer_emit_inst(self, Inst::Store(slot, pb_vals.get(pbi), OptIrType::None));
             Lowerer_insert_alloca(self, pb_names.get(pbi), slot);
@@ -8566,6 +8974,27 @@ fn lw_is_vec_new_expr(e: Expr) -> bool {
     return false;
 }
 
+/// Whether `e` is `HashMap::new()`.
+fn lw_is_map_new_expr(e: Expr) -> bool {
+    match e {
+        Expr::MethodCall(recv, m, args) => {
+            if m != "new" || args.len() != 0 {
+                return false;
+            }
+            match lw_box_expr_unbox(recv) {
+                Expr::Ident(rn) => {
+                    return rn == "HashMap";
+                }
+                _ => {
+                }
+            }
+        }
+        _ => {
+        }
+    }
+    return false;
+}
+
 /// A `let`'s value: `var v: Vec<u8> = Vec::new()` makes a Vec with its
 /// elements at their size (D14); anything else lowers as usual.
 fn Lowerer_lower_let_value_typed(self: & mut Lowerer, ty: OptType, expr: Expr, plain_copy: bool) -> i64 {
@@ -8621,6 +9050,39 @@ fn Lowerer_dl_fn_let_type(self: & Lowerer, ty: OptType, expr: Expr) -> OptType {
         }
     }
     return OptType::None;
+}
+
+/// IrType::Struct(name) for `ir`, the IR type of an instance of a generic
+/// struct of the program (IrType::Generic("Pair", ..): its values are laid
+/// out as the struct's one layout), else `ir`.
+fn Lowerer_generic_struct_ir(self: & Lowerer, ir: IrType) -> IrType {
+    match ir {
+        IrType::Generic(gname, _) => {
+            var rn: str = Lowerer_resolve_struct_name(self, gname);
+            if rn == "Vec" || rn == "HashMap" || rn == "Box" || rn == "Rc" || rn == "Arc" {
+                return ir;
+            }
+            match Lowerer_lookup_struct(self, rn) {
+                OptStructDef::Some(sd) => {
+                    if sd.type_params.len() == 0 {
+                        return ir;
+                    }
+                    match IrModule_get_struct(& self.module, rn) {
+                        OptStructLayout::Some(_) => {
+                            return IrType::Struct(rn);
+                        }
+                        OptStructLayout::None => {
+                        }
+                    }
+                }
+                OptStructDef::None => {
+                }
+            }
+        }
+        _ => {
+        }
+    }
+    return ir;
 }
 
 fn Lowerer_lower_let_stmt(self: & mut Lowerer, name: str, ty: OptType, expr: Expr, _is_mut: bool, is_persist: bool, annotations: Vec<Annotation>, _line: i64) {
@@ -8714,19 +9176,31 @@ fn Lowerer_lower_let_stmt(self: & mut Lowerer, name: str, ty: OptType, expr: Exp
                 own_ty = Lowerer_rc_temp_type(self, lval);
                 match own_ty {
                     Type::Infer => {
-                        own_ty = Lowerer_rc_expr_type(self, expr);
+                        // (a tuple literal that is no temporary owns
+                        // nothing: its inferred type may not place its
+                        // elements as it does)
+                        match expr {
+                            Expr::TupleLit(_) => {
+                            }
+                            _ => {
+                                own_ty = Lowerer_rc_expr_type(self, expr);
+                            }
+                        }
                     }
                     _ => {
                     }
                 }
-                // a generic struct literal: Pair<i64, str>, not Pair
+                // a generic struct literal: Pair<i64, str>, not Pair (the
+                // literal's own temporary already says which it owns)
                 match expr {
                     Expr::StructLit(_, _, _) => {
-                        match Lowerer_infer_expr_ast_type(self, expr) {
-                            Type::Generic(gsn, gsa) => {
-                                own_ty = Type::Generic(gsn, gsa);
-                            }
-                            _ => {
+                        if Lowerer_rc_kind(self, own_ty) == RC_NONE {
+                            match Lowerer_infer_expr_ast_type(self, expr) {
+                                Type::Generic(gsn, gsa) => {
+                                    own_ty = Type::Generic(gsn, gsa);
+                                }
+                                _ => {
+                                }
                             }
                         }
                     }
@@ -8738,12 +9212,31 @@ fn Lowerer_lower_let_stmt(self: & mut Lowerer, name: str, ty: OptType, expr: Exp
         lval = Lowerer_rc_own_value(self, lval, own_ty);
     }
     self.let_hint = saved_hint;
+    // A tuple variable holds the tuple inline, a struct of its shape: a
+    // value that is its address as a word (a Vec's or a map's element, a
+    // parameter) is typed as that address
+    var let_tes: Vec<Type> = Vec::new();
+    match ty {
+        OptType::Some(lt0) => {
+            let_tes = Lowerer_rc_tuple_elems(self, Lowerer_resolve_self_in_type(self, lt0));
+        }
+        OptType::None => {
+            let_tes = Lowerer_rc_tuple_elems(self, own_ty);
+        }
+    }
+    if let_tes.len() > 0 {
+        lval = Lowerer_rc_tuple_ptr(self, lval, Type::Tuple(let_tes));
+    }
 
     var val_ty: IrType = Lowerer_get_value_type(self, lval);
     var ir_ty: IrType = val_ty;
     match ty {
         OptType::Some(t) => {
-            var declared_ir: IrType = Lowerer_lower_type(self, t);
+            // A generic struct instance (`Pair<str, i64>`) is held inline as
+            // the struct, as an unannotated `val p = Pair { .. }` is: as a
+            // Generic its slot kept a pointer to the value, which no owner
+            // dropped (its strings leaked)
+            var declared_ir: IrType = Lowerer_generic_struct_ir(self, Lowerer_lower_type(self, t));
             // CI5: an array value is its pointer (as the OptType::None
             // branch below keeps it), so a declared `[T; N]` slot holds that
             // pointer; an Array-typed slot got the pointer stored into it
@@ -8756,7 +9249,27 @@ fn Lowerer_lower_let_stmt(self: & mut Lowerer, name: str, ty: OptType, expr: Exp
                 _ => {
                 }
             }
-            if declared_arr {
+            // a declared tuple: the slot is the value's tuple struct when
+            // it places the elements as the declared type's layout does
+            // (the drop reads them there), else the declared layout
+            var let_tuple_slot: str = "";
+            if let_tes.len() > 0 {
+                var ltn: str = "";
+                match Lowerer_key_tuple_ir(self, let_tes) {
+                    IrType::Struct(ltd) => {
+                        ltn = ltd;
+                    }
+                    _ => {
+                    }
+                }
+                var lvn: str = lw_tuple_struct_name(val_ty);
+                if str_len(lvn) > 0 && str_len(ltn) > 0 && Lowerer_tuple_layouts_agree(self, lvn, ltn) {
+                    let_tuple_slot = lvn;
+                }
+            }
+            if str_len(let_tuple_slot) > 0 {
+                ir_ty = IrType::Struct(let_tuple_slot);
+            } else if declared_arr {
                 ir_ty = IrType::Ptr(Box::new(declared_ir));
             } else if ir_type_is_aggregate(declared_ir) && ir_type_is_ptr(val_ty) {
                 match val_ty {
@@ -9084,9 +9597,17 @@ fn Lowerer_lower_index_assign_stmt(self: & mut Lowerer, array_name: Box<Expr>, i
                 }
             }
         }
+        // a tuple element is a struct of its shape (as a push stores it,
+        // Lowerer_box_vec_element)
+        var ia_tes: Vec<Type> = Lowerer_rc_tuple_elems(self, Lowerer_rc_vec_elem_ast(self, lw_box_expr_unbox(array_name)));
+        if ia_tes.len() > 0 {
+            vec_elem_ty = Lowerer_key_tuple_ir(self, ia_tes);
+            iet = Type::Tuple(ia_tes);
+        }
         match op {
             AssignOp::Assign => {
                 var set_val: i64 = Lowerer_lower_owned(self, expr, iet);
+                set_val = Lowerer_rc_tuple_ptr(self, set_val, iet);
                 if Lowerer_vec_set_mem(self, arr_val, idx_val, set_val, vec_elem_ty, iet) {
                     return;
                 }
@@ -10226,6 +10747,12 @@ fn Lowerer_lower_stmt_inner(self: & mut Lowerer, stmt: Stmt) {
         }
         Stmt::LetUninit(name, ty, annotations, _line) => {
             var ir_ty: IrType = Lowerer_lower_type(self, ty);
+            // a tuple is held inline, a struct of its shape (as `val t:
+            // (A, B) = ..` holds it): one word took a whole tuple's copy
+            var lu_tes: Vec<Type> = Lowerer_rc_tuple_elems(self, ty);
+            if lu_tes.len() > 0 {
+                ir_ty = Lowerer_key_tuple_ir(self, lu_tes);
+            }
             var alloca: i64 = 0;
             // An owning variable starts empty (zeroed in the entry block)
             var uk: i64 = Lowerer_rc_kind(self, ty);
@@ -10260,6 +10787,8 @@ fn Lowerer_lower_stmt_inner(self: & mut Lowerer, stmt: Stmt) {
         }
         Stmt::LetTuple(names, expr, _line) => {
             var tuple_ptr: i64 = Lowerer_lower_expr(self, expr);
+            // the value as lowered (a temporary of the statement, maybe)
+            var tuple_src: i64 = tuple_ptr;
             var n: i64 = names.len();
             // Element types: the callee's tuple return type, or the
             // variable's recorded AST type (src/lower.rs).
@@ -10298,27 +10827,144 @@ fn Lowerer_lower_stmt_inner(self: & mut Lowerer, stmt: Stmt) {
                 _ => {
                 }
             }
+            // any other expression whose type is known (a Vec's get, a
+            // method's result, an alias of a tuple type)
+            if elem_ast.len() == 0 {
+                match lw_rc_strip_ref(Lowerer_resolve_type(self, Lowerer_rc_expr_type(self, expr))) {
+                    Type::Tuple(ets3) => {
+                        elem_ast = ets3;
+                    }
+                    _ => {
+                    }
+                }
+            }
+            // The tuple's layout (its shape's, lw_tuple_layout_name): the
+            // value's own when it is a tuple struct (a literal, a call's
+            // result), else the one its element types give, the value's
+            // address typed as it. Its fields are read at the layout's
+            // offsets with its types: a nested tuple and a struct are
+            // inline (as a literal stores them), not words (index * 8 and
+            // Opaque("tuple") read a nested tuple's first word as its
+            // address).
+            var tup_fields: Vec<StringIrTypeOffset> = Vec::new();
+            var tup_name: str = lw_tuple_struct_name(Lowerer_get_value_type(self, tuple_ptr));
+            if str_len(tup_name) == 0 && elem_ast.len() == n && n > 0 {
+                match Lowerer_key_tuple_ir(self, elem_ast) {
+                    IrType::Struct(ktn) => {
+                        tup_name = ktn;
+                        var tpv: IrType = Lowerer_get_value_type(self, tuple_ptr);
+                        tuple_ptr = Lowerer_emit_inst(self, Inst::BitCast(tuple_ptr, tpv, IrType::Ptr(Box::new(IrType::Struct(ktn)))));
+                    }
+                    _ => {
+                    }
+                }
+            }
+            if str_len(tup_name) > 0 {
+                match IrModule_get_struct(& self.module, tup_name) {
+                    OptStructLayout::Some(tlay) => {
+                        tup_fields = tlay.fields;
+                    }
+                    OptStructLayout::None => {
+                    }
+                }
+            }
+            var field_tys: Vec<IrType> = Vec::new();
+            var fti: i64 = 0;
+            while fti < n {
+                var fty0: IrType = IrType::I64;
+                if fti < tup_fields.len() {
+                    fty0 = tup_fields.get(fti).ty;
+                } else if fti < elem_ast.len() {
+                    fty0 = Lowerer_lower_type(self, elem_ast.get(fti));
+                }
+                field_tys.push(fty0);
+                fti = fti + 1;
+            }
+            // Ownership (proposal 0004): each name owns its element, as a
+            // variable owns what it keeps. The tuple's own type says how
+            // (a temporary's, else its element types); a temporary (a
+            // literal, a call's result) hands its elements over and is not
+            // dropped, any other tuple (a variable, a parameter, a Vec's
+            // element) keeps its own and each name gets one more owner. An
+            // element owned inline must be read as a struct (else it stays
+            // a borrowed copy, as before).
+            var own_es: Vec<Type> = Vec::new();
+            var lt_moving: bool = false;
+            if self.own_on {
+                var src_tes: Vec<Type> = Lowerer_rc_tuple_elems(self, Lowerer_rc_temp_type(self, tuple_src));
+                if src_tes.len() == n {
+                    own_es = src_tes;
+                    lt_moving = true;
+                } else if elem_ast.len() == n {
+                    own_es = elem_ast;
+                }
+            }
+            var own_ok: Vec<bool> = Vec::new();
+            var oi: i64 = 0;
+            while oi < n {
+                var ok: bool = false;
+                if oi < own_es.len() {
+                    var ok_k: i64 = Lowerer_rc_kind(self, own_es.get(oi));
+                    if ok_k != RC_NONE {
+                        ok = true;
+                        if ok_k == RC_MEM {
+                            match field_tys.get(oi) {
+                                IrType::Struct(_) => {
+                                }
+                                _ => {
+                                    ok = false;
+                                    lt_moving = false;
+                                }
+                            }
+                        }
+                    }
+                }
+                own_ok.push(ok);
+                oi = oi + 1;
+            }
+            if lt_moving {
+                lt_moving = Lowerer_rc_claim(self, tuple_src);
+            }
             var ti: i64 = 0;
             while ti < n {
-                var field_ty: IrType = IrType::I64;
-                if ti < elem_ast.len() {
-                    field_ty = Lowerer_lower_type(self, elem_ast.get(ti));
-                }
+                var field_ty: IrType = field_tys.get(ti);
                 var name: str = names.get(ti);
+                var owns: bool = own_ok.get(ti);
                 var elem_ptr: i64 = Lowerer_emit_inst(self, Inst::GetFieldPtr(tuple_ptr, ti, field_ty));
-                var alloca: i64 = Lowerer_emit_inst(self, Inst::Alloca(field_ty, Lowerer_current_region(self)));
+                var alloca: i64 = 0;
+                if owns {
+                    alloca = Lowerer_rc_new_slot(self, field_ty, own_es.get(ti));
+                } else {
+                    alloca = Lowerer_emit_inst(self, Inst::Alloca(field_ty, Lowerer_current_region(self)));
+                }
                 Lowerer_insert_alloca_type(self, alloca, field_ty);
                 match field_ty {
                     IrType::Struct(_) => {
                         // Struct element stored inline: copy it out.
                         var _c: i64 = Lowerer_emit_inst(self, Inst::StructCopy(alloca, elem_ptr, field_ty));
+                        if owns && !lt_moving {
+                            Lowerer_rc_call_mem(self, "__own_dup_", alloca, own_es.get(ti));
+                        }
                     }
                     _ => {
                         var elem_val: i64 = Lowerer_emit_inst(self, Inst::Load(elem_ptr, field_ty));
+                        if owns && !lt_moving {
+                            elem_val = Lowerer_rc_dup(self, elem_val, own_es.get(ti));
+                        }
                         var _s: i64 = Lowerer_emit_inst(self, Inst::Store(alloca, elem_val, OptIrType::None));
                     }
                 }
+                if owns {
+                    Lowerer_rc_add_slot(self, alloca, own_es.get(ti));
+                }
                 Lowerer_insert_alloca(self, name, alloca);
+                // its element type, so a nested tuple destructures and a
+                // string reads as one
+                if owns {
+                    Lowerer_insert_var_ast_type(self, name, own_es.get(ti));
+                } else if ti < elem_ast.len() {
+                    Lowerer_insert_var_ast_type(self, name, elem_ast.get(ti));
+                }
                 Lowerer_bind_local(self, name, alloca);
                 ti = ti + 1;
             }
@@ -10438,16 +11084,30 @@ fn Lowerer_lower_stmt_inner(self: & mut Lowerer, stmt: Stmt) {
                             // copy (memcpy); a slot holding a pointer to the
                             // struct takes the new pointer: copying the struct
                             // into an 8-byte pointer slot overflowed it.
-                            var val_ty: IrType = Lowerer_get_value_type(self, rv);
                             var store_ty: OptIrType = OptIrType::None;
                             var slot_holds_ptr: bool = false;
+                            var slot_inline: bool = false;
                             match Lowerer_lookup_alloca_type(self, alloca) {
                                 OptIrType::Some(slot_ty) => {
                                     slot_holds_ptr = ir_type_is_ptr(slot_ty);
+                                    match slot_ty {
+                                        IrType::Struct(_) => {
+                                            slot_inline = true;
+                                        }
+                                        _ => {
+                                        }
+                                    }
                                 }
                                 OptIrType::None => {
                                 }
                             }
+                            // a tuple slot holds the tuple inline: a value
+                            // that is its address as a word is copied from
+                            // that address
+                            if slot_inline {
+                                rv = Lowerer_rc_tuple_ptr(self, rv, avty);
+                            }
+                            var val_ty: IrType = Lowerer_get_value_type(self, rv);
                             match val_ty {
                                 IrType::Ptr(inner) => {
                                     var inner_ty: IrType = box_ir_type_unbox(inner);
@@ -10845,6 +11505,9 @@ fn Lowerer_lower_stmt_inner(self: & mut Lowerer, stmt: Stmt) {
                                     } else {
                                         fval = Lowerer_lower_value(self, expr);
                                     }
+                                    // a tuple or a generic instance field is
+                                    // held inline: the value's address
+                                    fval = Lowerer_held_addr(self, fval, field_ty);
                                     var fold: i64 = - 1;
                                     if fk == RC_MEM {
                                         Lowerer_rc_call_mem(self, "__own_drop_", field_ptr, fast);
@@ -11790,6 +12453,8 @@ pub fn Lowerer_lower_method_call(self: & mut Lowerer, receiver: Box<Expr>, metho
             if ksize > 0 && self.own_on {
                 ktid = Lowerer_rc_tid(self, mkv2.get(0));
             }
+            // (a tuple key too: a struct of its shape, whose drop and
+            // copy are its own and whose strings __p_key_strs names)
             if ktid < 16 || ktid >= 0x8000 {
                 ktid = 0;
             }
@@ -12181,6 +12846,27 @@ pub fn Lowerer_box_vec_element(self: & mut Lowerer, call_args: & mut Vec<i64>, r
         _ => {
         }
     }
+    // A tuple element (of a Vec, or a map's value) is a struct of its
+    // shape, stored as a struct is (in the buffer, or boxed): as a word the
+    // Vec kept the address of a tuple on the stack, which its drop and
+    // copies (by the element type, a tuple's own) then read
+    var tuple_et: Type = Type::Infer;
+    if str_starts_with(mangled, "HashMap_") {
+        var bkv: Vec<Type> = Lowerer_rc_map_kv_ast(self, lw_box_expr_unbox(receiver));
+        if bkv.len() == 2 {
+            tuple_et = bkv.get(1);
+        }
+    } else {
+        tuple_et = Lowerer_rc_vec_elem_ast(self, lw_box_expr_unbox(receiver));
+    }
+    var tuple_es: Vec<Type> = Lowerer_rc_tuple_elems(self, tuple_et);
+    if tuple_es.len() > 0 {
+        vec_elem_ty = Lowerer_key_tuple_ir(self, tuple_es);
+        found_elem = true;
+        // the value: the tuple's address
+        var tvi: i64 = call_args.len() - 1;
+        call_args.set(tvi, Lowerer_rc_tuple_ptr(self, call_args.get(tvi), tuple_et));
+    }
     if found_elem {
         match vec_elem_ty {
             IrType::Struct(_) => {
@@ -12240,8 +12926,10 @@ fn Lowerer_vec_mem_size(self: & mut Lowerer, mangled: str, st: IrType) -> i64 {
 }
 
 /// The IR struct type of a map key of AST type `t` when it is a struct of
-/// the program or a tuple (a __tuple_N, its layout registered here as a
-/// tuple literal registers it), else I64 (a word key: number, str, ...).
+/// the program (a generic one's instance too: `Pair<str, i64>` is laid out
+/// as `Pair`) or a tuple (its shape's layout, registered here as a
+/// tuple literal registers it, Lowerer_key_tuple_ir), else I64 (a word
+/// key: number, str, ...).
 fn Lowerer_map_struct_key_ir(self: & mut Lowerer, t: Type) -> IrType {
     var rt: Type = Lowerer_resolve_type(self, t);
     match rt {
@@ -12249,14 +12937,7 @@ fn Lowerer_map_struct_key_ir(self: & mut Lowerer, t: Type) -> IrType {
             if es.len() == 0 {
                 return IrType::I64;
             }
-            var tys: Vec<IrType> = Vec::new();
-            var i: i64 = 0;
-            while i < es.len() {
-                tys.push(Lowerer_lower_type(self, es.get(i)));
-                i = i + 1;
-            }
-            Lowerer_register_tuple_layout(self, tys);
-            return IrType::Struct("__tuple_" + int_to_str(es.len()));
+            return Lowerer_key_tuple_ir(self, es);
         }
         _ => {
         }
@@ -12280,7 +12961,355 @@ fn Lowerer_map_struct_key_ir(self: & mut Lowerer, t: Type) -> IrType {
         _ => {
         }
     }
+    // a generic struct's instance (lowered as IrType::Generic): the
+    // struct's one layout, a type parameter's field a word
+    return Lowerer_key_struct_layout_ir(self, rt);
+}
+
+/// IrType::Struct(name) of a struct-typed `t` (a generic instance too)
+/// whose layout the module has, else I64.
+fn Lowerer_key_struct_layout_ir(self: & mut Lowerer, t: Type) -> IrType {
+    var name: str = lw_rc_type_name(t);
+    if name == "" || name == "Vec" || name == "HashMap" || name == "Box" || name == "Rc" || name == "Arc" {
+        return IrType::I64;
+    }
+    match Lowerer_lookup_struct(self, name) {
+        OptStructDef::Some(_) => {
+            match IrModule_get_struct(& self.module, name) {
+                OptStructLayout::Some(_) => {
+                    return IrType::Struct(name);
+                }
+                OptStructLayout::None => {
+                }
+            }
+        }
+        OptStructDef::None => {
+        }
+    }
     return IrType::I64;
+}
+
+/// The IR type a tuple key's element of AST type `t` is stored as, as a
+/// tuple literal stores it (lw_tuple_field_ty of its value's type): a
+/// nested tuple inline as its layout (registered), a struct of
+/// the program (a generic one's instance too) inline as the struct,
+/// anything else as Lowerer_lower_type gives it (RT5).
+fn Lowerer_key_elem_ir(self: & mut Lowerer, t: Type) -> IrType {
+    var rt: Type = Lowerer_resolve_type(self, t);
+    match rt {
+        Type::Tuple(es) => {
+            if es.len() > 0 {
+                return Lowerer_key_tuple_ir(self, es);
+            }
+        }
+        _ => {
+        }
+    }
+    return Lowerer_held_elem_ir(self, rt);
+}
+
+/// Lowerer_key_elem_ir without registering anything: a nested tuple is
+/// its shape's layout by name (Lowerer_tuple_name_ro), a struct of the
+/// program whose layout the module has (a generic one's instance too)
+/// inline as the struct, anything else as Lowerer_lower_type gives it.
+fn Lowerer_held_elem_ir(self: & Lowerer, t: Type) -> IrType {
+    var rt: Type = Lowerer_resolve_type(self, t);
+    match rt {
+        Type::Tuple(es) => {
+            if es.len() > 0 {
+                return IrType::Struct(Lowerer_tuple_name_ro(self, es));
+            }
+        }
+        _ => {
+        }
+    }
+    var name: str = lw_rc_type_name(rt);
+    if name != "" && name != "Vec" && name != "HashMap" && name != "Box" && name != "Rc" && name != "Arc" {
+        match Lowerer_lookup_struct(self, name) {
+            OptStructDef::Some(_) => {
+                match IrModule_get_struct(& self.module, name) {
+                    OptStructLayout::Some(_) => {
+                        return IrType::Struct(name);
+                    }
+                    OptStructLayout::None => {
+                    }
+                }
+            }
+            OptStructDef::None => {
+            }
+        }
+    }
+    return Lowerer_lower_type(self, rt);
+}
+
+/// The name of the layout of a tuple of AST element types `es`, as
+/// Lowerer_key_tuple_ir names (and registers) it (lw_tuple_layout_name of
+/// the elements' Lowerer_held_elem_ir), without registering it.
+fn Lowerer_tuple_name_ro(self: & Lowerer, es: Vec<Type>) -> str {
+    var ftys: Vec<IrType> = Vec::new();
+    var i: i64 = 0;
+    while i < es.len() {
+        ftys.push(lw_tuple_field_ty(Lowerer_held_elem_ir(self, es.get(i))));
+        i = i + 1;
+    }
+    return lw_tuple_layout_name(ftys);
+}
+
+/// The element types of `t` when it is a non-empty tuple (an alias
+/// resolved; not a reference to one), else an empty list.
+fn Lowerer_rc_tuple_elems(self: & Lowerer, t: Type) -> Vec<Type> {
+    match Lowerer_resolve_type(self, t) {
+        Type::Tuple(es) => {
+            return es;
+        }
+        _ => {
+        }
+    }
+    var none: Vec<Type> = Vec::new();
+    return none;
+}
+
+/// Whether AST type `t` names one of `params` anywhere in it.
+fn lw_type_mentions(t: Type, params: Vec<str>) -> bool {
+    if params.len() == 0 {
+        return false;
+    }
+    match t {
+        Type::Named(n) => {
+            return lw_c_str_vec_contains(params, n);
+        }
+        Type::Generic(_, a) => {
+            var i: i64 = 0;
+            while i < a.len() {
+                if lw_type_mentions(a.get(i), params) {
+                    return true;
+                }
+                i = i + 1;
+            }
+        }
+        Type::Tuple(es) => {
+            var j: i64 = 0;
+            while j < es.len() {
+                if lw_type_mentions(es.get(j), params) {
+                    return true;
+                }
+                j = j + 1;
+            }
+        }
+        Type::Ref(inner, _) => {
+            return lw_type_mentions(lw_box_type_unbox(inner), params);
+        }
+        _ => {
+        }
+    }
+    return false;
+}
+
+/// The IR type a struct field or an enum payload (not a type parameter)
+/// of AST type `t` is held as, `params` the type parameters of the struct
+/// or enum: a tuple inline as its shape's layout (one that names a type
+/// parameter stays a word: its layout depends on the instance), a generic
+/// struct's instance inline as the struct (Lowerer_generic_struct_ir), as
+/// a tuple literal and a variable hold them; anything else as
+/// Lowerer_lower_type gives it. The layouts are registered before
+/// (Lowerer_register_held_layouts): one that is not yet stays a word.
+fn Lowerer_held_ir(self: & Lowerer, t: Type, params: Vec<str>) -> IrType {
+    var rt: Type = Lowerer_resolve_type(self, t);
+    var lowered: IrType = Lowerer_lower_type(self, rt);
+    match rt {
+        Type::Tuple(es) => {
+            if es.len() > 0 && !lw_type_mentions(rt, params) {
+                var tn: str = Lowerer_tuple_name_ro(self, es);
+                match IrModule_get_struct(& self.module, tn) {
+                    OptStructLayout::Some(_) => {
+                        return IrType::Struct(tn);
+                    }
+                    OptStructLayout::None => {
+                    }
+                }
+            }
+            return lowered;
+        }
+        Type::Generic(_, _) => {
+            return Lowerer_generic_struct_ir(self, lowered);
+        }
+        _ => {
+        }
+    }
+    return lowered;
+}
+
+/// Register the layout of the tuple a struct field or an enum payload of
+/// AST type `t` holds inline (Lowerer_held_ir), `params` the type
+/// parameters of the struct or enum.
+fn Lowerer_register_held_layouts(self: & mut Lowerer, t: Type, params: Vec<str>) {
+    var rt: Type = Lowerer_resolve_type(self, t);
+    match rt {
+        Type::Tuple(es) => {
+            if es.len() > 0 && !lw_type_mentions(rt, params) {
+                var _r: IrType = Lowerer_key_tuple_ir(self, es);
+            }
+        }
+        _ => {
+        }
+    }
+}
+
+/// Whether the tuple layouts `a` and `b` place their fields alike (as
+/// many fields, at the same offsets, the same size): a value laid out as
+/// one is read correctly as the other.
+fn Lowerer_tuple_layouts_agree(self: & Lowerer, a: str, b: str) -> bool {
+    if a == b {
+        return true;
+    }
+    match IrModule_get_struct(& self.module, a) {
+        OptStructLayout::Some(la) => {
+            match IrModule_get_struct(& self.module, b) {
+                OptStructLayout::Some(lb) => {
+                    if la.size != lb.size || la.fields.len() != lb.fields.len() {
+                        return false;
+                    }
+                    var i: i64 = 0;
+                    while i < la.fields.len() {
+                        if la.fields.get(i).offset != lb.fields.get(i).offset {
+                            return false;
+                        }
+                        i = i + 1;
+                    }
+                    return true;
+                }
+                OptStructLayout::None => {
+                }
+            }
+        }
+        OptStructLayout::None => {
+        }
+    }
+    return false;
+}
+
+/// `v` typed as a pointer to the struct `held` (an IR struct type) when it
+/// is a word holding that struct's address (a tuple or a generic struct
+/// instance a parameter or a Vec gives as a word: Opaque("tuple"), a
+/// Generic), else `v` itself.
+fn Lowerer_held_addr(self: & mut Lowerer, v: i64, held: IrType) -> i64 {
+    match held {
+        IrType::Struct(_) => {
+        }
+        _ => {
+            return v;
+        }
+    }
+    var vt: IrType = Lowerer_get_value_type(self, v);
+    match vt {
+        IrType::Ptr(_) => {
+            return v;
+        }
+        IrType::Struct(_) => {
+            return v;
+        }
+        IrType::Opaque(hon) => {
+            if hon != "tuple" {
+                return v;
+            }
+        }
+        IrType::Generic(_, _) => {
+        }
+        _ => {
+            return v;
+        }
+    }
+    return Lowerer_emit_inst(self, Inst::BitCast(v, vt, IrType::Ptr(Box::new(held))));
+}
+
+/// `v` as the address of the tuple of AST type `t` it is (a word that
+/// holds a tuple's address: a parameter, a Vec's or a map's element, ...),
+/// typed as a pointer to its layout; `v` itself when it already is a
+/// pointer to a struct, or `t` is no tuple.
+fn Lowerer_rc_tuple_ptr(self: & mut Lowerer, v: i64, t: Type) -> i64 {
+    var es: Vec<Type> = Lowerer_rc_tuple_elems(self, t);
+    if es.len() == 0 {
+        return v;
+    }
+    var vt: IrType = Lowerer_get_value_type(self, v);
+    match vt {
+        IrType::Ptr(inner) => {
+            match box_ir_type_unbox(inner) {
+                IrType::Struct(_) => {
+                    return v;
+                }
+                _ => {
+                }
+            }
+        }
+        _ => {
+        }
+    }
+    var st: IrType = Lowerer_key_tuple_ir(self, es);
+    return Lowerer_emit_inst(self, Inst::BitCast(v, vt, IrType::Ptr(Box::new(st))));
+}
+
+/// The IR struct of a tuple (a map key or any other) of AST element types `es`, its
+/// layout (and its nested tuples') registered as a tuple literal of those
+/// types registers it (RT5: Opaque("tuple"), what Lowerer_lower_type gives
+/// a nested tuple, is one word where the literal keeps the tuple inline).
+fn Lowerer_key_tuple_ir(self: & mut Lowerer, es: Vec<Type>) -> IrType {
+    var tys: Vec<IrType> = Vec::new();
+    var i: i64 = 0;
+    while i < es.len() {
+        tys.push(Lowerer_key_elem_ir(self, es.get(i)));
+        i = i + 1;
+    }
+    return IrType::Struct(Lowerer_register_tuple_layout(self, tys));
+}
+
+/// Which words of a tuple of AST element types `es`, laid out from byte
+/// `base` as Lowerer_key_tuple_ir lays it out, hold strings: bit
+/// (offset / 8) for a `str` element, the strings of a struct element
+/// (Lowerer_rc_key_strs_mask) and of a nested tuple; words from 64 on give
+/// nothing (RT5: core's hm_fields_hash / hm_fields_eq read them as text).
+fn Lowerer_key_tuple_mask(self: & mut Lowerer, es: Vec<Type>, base: i64, depth: i64) -> i64 {
+    var mask: i64 = 0;
+    if depth > 16 {
+        return mask;
+    }
+    var off: i64 = 0;
+    var i: i64 = 0;
+    while i < es.len() {
+        var et: Type = Lowerer_resolve_type(self, es.get(i));
+        var fty: IrType = Lowerer_key_elem_ir(self, et);
+        var at: i64 = base + off;
+        var nested: bool = false;
+        match et {
+            Type::Tuple(ies) => {
+                if ies.len() > 0 {
+                    nested = true;
+                    mask = mask | Lowerer_key_tuple_mask(self, ies, at, depth + 1);
+                }
+            }
+            _ => {
+            }
+        }
+        if !nested {
+            if Lowerer_rc_kind(self, et) == RC_STR || lw_is_borrowed_str(et) {
+                if at % 8 == 0 && at / 8 < 64 {
+                    mask = mask | lw_key_bit(at / 8);
+                }
+            } else if Lowerer_rc_is_mem_type(self, et) {
+                match Lowerer_lookup_struct(self, lw_rc_type_name(et)) {
+                    OptStructDef::Some(_) => {
+                        mask = mask | Lowerer_rc_key_strs_mask(self, et, at, depth + 1);
+                    }
+                    OptStructDef::None => {
+                    }
+                }
+            }
+        }
+        off = off + IrModule_type_size(& self.module, fty);
+        off = (off + 7) / 8 * 8;
+        i = i + 1;
+    }
+    return mask;
 }
 
 /// `v[i] = x` for a struct element stored in the buffer: Vec_set_mem(v, i,
@@ -14334,6 +15363,22 @@ fn Lowerer_lower_field_access_expr(self: & mut Lowerer, obj: Box<Expr>, field: s
             _ => {
             }
         }
+        // a struct or an enum (a generic struct's instance too): the word
+        // is the address of its heap copy, read as a pointer to it (so
+        // `p.a.name` and `val c: Cell = p.a` read the struct)
+        match Lowerer_generic_struct_ir(self, want) {
+            IrType::Struct(wsn) => {
+                match IrModule_get_struct(& self.module, wsn) {
+                    OptStructLayout::Some(_) => {
+                        return Lowerer_emit_inst(self, Inst::Load(field_ptr, IrType::Ptr(Box::new(IrType::Struct(wsn)))));
+                    }
+                    OptStructLayout::None => {
+                    }
+                }
+            }
+            _ => {
+            }
+        }
     }
     return Lowerer_emit_inst(self, Inst::Load(field_ptr, field_ty));
 }
@@ -15280,9 +16325,69 @@ fn Lowerer_lower_struct_lit_expr(self: & mut Lowerer, name: str, fields: Vec<Fie
         OptBoxExpr::None => {
         }
     }
+    // A generic struct's literal is owned as its instance (Pair<str, i64>):
+    // the let's declared type, the spread source's type, or the types of
+    // what its type-parameter fields are given (owned as those types).
+    // Owned as `Pair` it owned nothing (its parameters unknown), was no
+    // temporary, and its strings were never dropped.
+    var gen_params: Vec<str> = Vec::new();
+    var gen_args: Vec<Type> = Vec::new();
+    var gen_fixed: bool = false;
+    if self.own_on && real_name != "Vec" && real_name != "HashMap" && real_name != "Box" && real_name != "Rc" && real_name != "Arc" {
+        match Lowerer_lookup_struct(self, real_name) {
+            OptStructDef::Some(gsd) => {
+                gen_params = gsd.type_params;
+            }
+            OptStructDef::None => {
+            }
+        }
+    }
+    if gen_params.len() > 0 {
+        match self.let_hint {
+            OptType::Some(glh) => {
+                var grt: Type = lw_rc_strip_ref(Lowerer_resolve_type(self, glh));
+                if lw_rc_type_name(grt) == real_name && lw_rc_type_args(grt).len() == gen_params.len() {
+                    lit_ty = grt;
+                    gen_fixed = true;
+                }
+            }
+            OptType::None => {
+            }
+        }
+        if !gen_fixed {
+            match spread {
+                OptBoxExpr::Some(gse) => {
+                    var gst: Type = lw_rc_strip_ref(Lowerer_resolve_type(self, Lowerer_rc_expr_type(self, lw_box_expr_unbox(gse))));
+                    if lw_rc_type_name(gst) == real_name && lw_rc_type_args(gst).len() == gen_params.len() {
+                        lit_ty = gst;
+                        gen_fixed = true;
+                    }
+                }
+                OptBoxExpr::None => {
+                }
+            }
+        }
+        if gen_fixed {
+            gen_args = lw_rc_type_args(lit_ty);
+        } else if has_spread {
+            // a copy of a source of unknown instance: owned as before
+            gen_params = Vec::new();
+        } else {
+            gen_args = lw_rc_type_args(Lowerer_struct_lit_ast_type(self, real_name, fields));
+            if gen_args.len() != gen_params.len() {
+                gen_params = Vec::new();
+            }
+        }
+    }
     if self.own_on && has_spread && Lowerer_rc_kind(self, lit_ty) == RC_MEM {
         Lowerer_rc_call_mem(self, "__own_dup_", alloca, lit_ty);
     }
+    // The type-parameter fields: the field, its value and its parameter
+    // (one given a struct or an enum is boxed below when the literal is
+    // owned)
+    var box_ptrs: Vec<i64> = Vec::new();
+    var box_vals: Vec<i64> = Vec::new();
+    var box_params: Vec<i64> = Vec::new();
 
     match IrModule_get_struct(& self.module, real_name) {
         OptStructLayout::Some(layout) => {
@@ -15310,6 +16415,32 @@ fn Lowerer_lower_struct_lit_expr(self: & mut Lowerer, name: str, fields: Vec<Fie
                 } else {
                     field_val = Lowerer_lower_value(self, field_init.value);
                 }
+                // A type-parameter field of a generic literal: the instance
+                // takes the type it is owned as; one the instance says owns
+                // something that was not owned gets an owner of its own
+                // (the instance's drop drops what it says)
+                var gpi: i64 = - 1;
+                if gen_params.len() > 0 {
+                    gpi = lw_rc_param_index(Lowerer_rc_field_ast_type(self, real_name, field_init.name), gen_params);
+                }
+                if gpi >= 0 && gpi < gen_args.len() {
+                    var vk: i64 = Lowerer_rc_kind(self, lfty);
+                    if vk != RC_NONE {
+                        // (a string, Vec or map the inference typed alike
+                        // keeps its fuller type: its drop is the same)
+                        var ak: i64 = Lowerer_rc_kind(self, gen_args.get(gpi));
+                        var same: bool = ak == vk && (vk == RC_STR || vk == RC_VEC || vk == RC_MAP);
+                        if !gen_fixed && !same {
+                            gen_args.set(gpi, lfty);
+                        }
+                    } else if Lowerer_rc_kind(self, gen_args.get(gpi)) != RC_NONE {
+                        lfty = gen_args.get(gpi);
+                        field_val = Lowerer_rc_own_value(self, field_val, lfty);
+                    }
+                    if gen_fixed {
+                        lfty = gen_args.get(gpi);
+                    }
+                }
                 var field_idx: i64 = - 1;
                 var fj: i64 = 0;
                 while fj < layout.fields.len() && field_idx < 0 {
@@ -15321,7 +16452,11 @@ fn Lowerer_lower_struct_lit_expr(self: & mut Lowerer, name: str, fields: Vec<Fie
                 if field_idx >= 0 {
                     var field_ty: IrType = layout.fields.get(field_idx).ty;
                     var field_ptr: i64 = Lowerer_emit_inst(self, Inst::GetFieldPtr(alloca, field_idx, field_ty));
-                    if self.own_on && has_spread {
+                    if self.own_on && has_spread && gpi >= 0 {
+                        // The spread's copy of a type-parameter field (a
+                        // word: a struct is a pointer to its heap copy)
+                        Lowerer_rc_gen_param_payload(self, Lowerer_rc_as_i64(self, field_ptr), 0, lfty, false);
+                    } else if self.own_on && has_spread {
                         // The spread's copy of this field is replaced
                         var sk: i64 = Lowerer_rc_kind(self, lfty);
                         if sk == RC_MEM {
@@ -15344,9 +16479,17 @@ fn Lowerer_lower_struct_lit_expr(self: & mut Lowerer, name: str, fields: Vec<Fie
                             _ => {
                             }
                         }
+                        if gpi >= 0 {
+                            box_ptrs.push(field_ptr);
+                            box_vals.push(field_val);
+                            box_params.push(gpi);
+                        }
                     }
                     match field_ty {
                         IrType::Struct(field_struct_name) => {
+                            // a tuple or a generic instance given as a word
+                            // (a parameter's) is the address of its value
+                            field_val = Lowerer_held_addr(self, field_val, field_ty);
                             Lowerer_emit_struct_copy(self, field_val, field_ptr, field_struct_name);
                         }
                         _ => {
@@ -15368,18 +16511,78 @@ fn Lowerer_lower_struct_lit_expr(self: & mut Lowerer, name: str, fields: Vec<Fie
     }
 
     // A new struct: a temporary the statement owns
-    match self.let_hint {
-        OptType::Some(lh) => {
-            if lw_rc_type_name(Lowerer_resolve_type(self, lh)) == real_name {
-                lit_ty = Lowerer_resolve_type(self, lh);
+    if gen_params.len() > 0 {
+        if !gen_fixed {
+            lit_ty = Type::Generic(real_name, gen_args);
+        }
+        // A type-parameter field holds a struct (or an enum) as a pointer
+        // to its heap copy, as a generic enum's payload does: what the
+        // instance's drop frees and its dup copies
+        // (Lowerer_rc_gen_param_payload, by the instance's type argument); a
+        // pointer to the value itself was freed by that drop, and left
+        // dangling by a return
+        if Lowerer_rc_kind(self, lit_ty) == RC_MEM {
+            var largs: Vec<Type> = lw_rc_type_args(lit_ty);
+            var bi: i64 = 0;
+            while bi < box_ptrs.len() {
+                var bp: i64 = box_params.get(bi);
+                if bp < largs.len() && Lowerer_rc_is_mem_type(self, Lowerer_resolve_type(self, largs.get(bp))) {
+                    var bty: IrType = Lowerer_rc_mem_ir(self, largs.get(bp));
+                    var bsize: i64 = IrModule_type_size(& self.module, bty);
+                    if bsize < 8 {
+                        bsize = 8;
+                    }
+                    var bsz: i64 = Lowerer_emit_inst(self, Inst::ConstInt(bsize, IrType::I64));
+                    var bheap: i64 = Lowerer_emit_inst(self, Inst::Call("p_malloc", lw_c_vec1_i64(bsz), IrType::Ptr(Box::new(bty)), EffectSet_new()));
+                    // the value is the address of the struct (a word too)
+                    var bsrc: i64 = box_vals.get(bi);
+                    var bvt: IrType = Lowerer_get_value_type(self, bsrc);
+                    match bvt {
+                        IrType::Ptr(_) => {
+                        }
+                        _ => {
+                            bsrc = Lowerer_emit_inst(self, Inst::BitCast(bsrc, bvt, IrType::Ptr(Box::new(bty))));
+                        }
+                    }
+                    Lowerer_emit_inst(self, Inst::Store(bheap, bsrc, OptIrType::Some(bty)));
+                    Lowerer_emit_inst(self, Inst::Store(box_ptrs.get(bi), bheap, OptIrType::None));
+                }
+                bi = bi + 1;
             }
         }
-        OptType::None => {
+    } else {
+        match self.let_hint {
+            OptType::Some(lh) => {
+                if lw_rc_type_name(Lowerer_resolve_type(self, lh)) == real_name {
+                    lit_ty = Lowerer_resolve_type(self, lh);
+                }
+            }
+            OptType::None => {
+            }
         }
     }
     Lowerer_rc_temp(self, alloca, lit_ty);
     return alloca;
 }
+
+/// The position of type parameter `t` (a Named type) among `params`, or -1.
+fn lw_rc_param_index(t: Type, params: Vec<str>) -> i64 {
+    match t {
+        Type::Named(n) => {
+            var i: i64 = 0;
+            while i < params.len() {
+                if params.get(i) == n {
+                    return i;
+                }
+                i = i + 1;
+            }
+        }
+        _ => {
+        }
+    }
+    return - 1;
+}
+
 
 fn Lowerer_lower_fstring_expr(self: & mut Lowerer, parts: Vec<FStringPart>) -> i64 {
     var result: i64 = Lowerer_emit_inst(self, Inst::ConstStr(""));
@@ -16141,21 +17344,88 @@ pub fn Lowerer_lower_expr(self: & mut Lowerer, expr: Expr) -> i64 {
             return Lowerer_lower_cast(self, val, src_ty, dst_ty);
         }
         Expr::TupleLit(elements) => {
-            // As src/lower.rs: a __tuple_N struct on the stack; struct
+            // As src/lower.rs: a tuple struct on the stack; struct
             // elements are stored inline (no dangling pointers when the
             // tuple is returned).
+            // Ownership (proposal 0004): a tuple owns its elements, as a
+            // struct its fields: each element is kept (a temporary handed
+            // over, anything else counted again) as the type its value has
+            // (Lowerer_rc_value_type), and
+            // the tuple is a temporary of the statement. Before, a string or
+            // a struct put in a tuple was a temporary dropped at the
+            // statement's end while the tuple still held it.
             var n: i64 = elements.len();
             var elem_vals: Vec<i64> = Vec::new();
             var elem_tys: Vec<IrType> = Vec::new();
+            var elem_asts: Vec<Type> = Vec::new();
             var i: i64 = 0;
             while i < n {
-                var ev: i64 = Lowerer_lower_expr(self, elements.get(i));
+                var el: Expr = elements.get(i);
+                // (a variable is counted again, not moved on its last use:
+                // a tuple some place keeps without an owner, an array
+                // literal's element, is dropped with its statement, and the
+                // variable's value must outlive it as before)
+                var ev: i64 = Lowerer_lower_expr(self, el);
+                var east: Type = Type::Infer;
+                if self.own_on {
+                    east = Lowerer_rc_value_type(self, el, ev);
+                    if Lowerer_rc_kind(self, east) != RC_NONE {
+                        ev = Lowerer_rc_own_value(self, ev, east);
+                    }
+                }
+                // the element's type in the tuple's type: what it is owned
+                // as (a struct its value's IR type names is kept: the
+                // tuple's layout must place it as this literal does), else
+                // the inferred one when that owns nothing either (a tuple
+                // must not drop what it was not given an owner of)
+                if Lowerer_rc_kind(self, east) == RC_NONE {
+                    var vague: bool = false;
+                    match east {
+                        Type::Infer => {
+                            vague = true;
+                        }
+                        Type::Named(vn) => {
+                            vague = str_starts_with(vn, "__tuple_");
+                        }
+                        _ => {
+                        }
+                    }
+                    if vague {
+                        var inferred: Type = Lowerer_enum_arg_ast_type(self, el);
+                        if Lowerer_rc_kind(self, inferred) == RC_NONE {
+                            east = inferred;
+                        }
+                    }
+                }
+                // a nested tuple held as a word (a parameter's, a Vec's
+                // element) is its address: kept inline, as the tuple's type
+                // lays it out (Lowerer_key_elem_ir)
+                ev = Lowerer_rc_tuple_ptr(self, ev, east);
+                elem_asts.push(east);
                 elem_vals.push(ev);
-                elem_tys.push(Lowerer_get_value_type(self, ev));
+                var evt: IrType = Lowerer_get_value_type(self, ev);
+                // a generic struct instance held as a word (a parameter's
+                // value) is the address of the struct: kept inline, as the
+                // tuple's type lays it out (Lowerer_key_elem_ir)
+                match evt {
+                    IrType::Generic(_, _) => {
+                        match Lowerer_generic_struct_ir(self, evt) {
+                            IrType::Struct(egs) => {
+                                evt = IrType::Ptr(Box::new(IrType::Struct(egs)));
+                            }
+                            _ => {
+                            }
+                        }
+                    }
+                    _ => {
+                    }
+                }
+                elem_tys.push(evt);
                 i = i + 1;
             }
-            Lowerer_register_tuple_layout(self, elem_tys);
-            var alloca: i64 = Lowerer_emit_inst(self, Inst::Alloca(IrType::Struct("__tuple_" + int_to_str(n)), Lowerer_current_region(self)));
+            // the layout of its shape (lw_tuple_layout_name)
+            var tuple_name: str = Lowerer_register_tuple_layout(self, elem_tys);
+            var alloca: i64 = Lowerer_emit_inst(self, Inst::Alloca(IrType::Struct(tuple_name), Lowerer_current_region(self)));
             i = 0;
             while i < n {
                 var vty: IrType = elem_tys.get(i);
@@ -16181,6 +17451,15 @@ pub fn Lowerer_lower_expr(self: & mut Lowerer, expr: Expr) -> i64 {
                     var _s: i64 = Lowerer_emit_inst(self, Inst::Store(elem_ptr, elem_vals.get(i), OptIrType::None));
                 }
                 i = i + 1;
+            }
+            // A new tuple: a temporary the statement owns, of the tuple of
+            // its elements' types, when that type's layout (what its drop
+            // and copies read) places the elements where this one does
+            if self.own_on && n > 0 {
+                var tty: Type = Type::Tuple(elem_asts);
+                if Lowerer_rc_kind(self, tty) == RC_MEM && Lowerer_tuple_layouts_agree(self, tuple_name, Lowerer_tuple_name_ro(self, elem_asts)) {
+                    Lowerer_rc_temp(self, alloca, tty);
+                }
             }
             return alloca;
         }
@@ -16468,10 +17747,36 @@ pub fn Lowerer_lower_expr(self: & mut Lowerer, expr: Expr) -> i64 {
                         }
                         declared_ir_ty = word_repr(arg_ty);
                     } else {
-                        declared_ir_ty = Lowerer_lower_type(self, declared_ast_ty);
+                        // a tuple and a generic struct instance inline too,
+                        // as the enum's layout holds them (Lowerer_held_ir)
+                        declared_ir_ty = Lowerer_held_ir(self, declared_ast_ty, enum_type_params);
                         match declared_ir_ty {
                             IrType::Struct(_) => {
                                 is_inline_struct = true;
+                                // the value's address (a word holding it:
+                                // a parameter's tuple or generic instance)
+                                var held_word: bool = true;
+                                match Lowerer_lower_type(self, declared_ast_ty) {
+                                    IrType::Struct(_) => {
+                                        held_word = false;
+                                    }
+                                    _ => {
+                                    }
+                                }
+                                match arg_ty {
+                                    IrType::Ptr(_) => {
+                                        held_word = false;
+                                    }
+                                    IrType::Struct(_) => {
+                                        held_word = false;
+                                    }
+                                    _ => {
+                                    }
+                                }
+                                if held_word {
+                                    arg_val = Lowerer_emit_inst(self, Inst::BitCast(arg_val, arg_ty, IrType::Ptr(Box::new(declared_ir_ty))));
+                                    arg_ty = IrType::Ptr(Box::new(declared_ir_ty));
+                                }
                             }
                             _ => {
                                 is_inline_struct = false;
@@ -18071,6 +19376,13 @@ pub fn Lowerer_lower_for(self: & mut Lowerer, loop_var: str, iterator: Expr, bod
 
             // Check if Vec
             if ir_type_is_opaque_named(iter_ty, "Vec") {
+                // a tuple element is read where the Vec holds it (its
+                // address): its type, so `val (a, b) = t` reads its fields
+                // at its layout's offsets and owns copies of them
+                var for_et: Type = Lowerer_rc_vec_elem_ast(self, iterator);
+                if Lowerer_rc_tuple_elems(self, for_et).len() > 0 {
+                    Lowerer_insert_var_ast_type(self, loop_var, for_et);
+                }
                 Lowerer_lower_for_vec(self, loop_var, iter_val, body);
                 return;
             }
@@ -20464,6 +21776,18 @@ pub fn Lowerer_infer_expr_ast_type(self: & Lowerer, expr: Expr) -> Type {
         Expr::StructLit(sln, slf, _) => {
             return Lowerer_struct_lit_ast_type(self, sln, slf);
         }
+        // A tuple literal: the tuple of its elements' types (a
+        // concatenation a string), so a variable holding it destructures
+        // with its element types (its strings read as strings)
+        Expr::TupleLit(tes) => {
+            var tts: Vec<Type> = Vec::new();
+            var tei: i64 = 0;
+            while tei < tes.len() {
+                tts.push(Lowerer_enum_arg_ast_type(self, tes.get(tei)));
+                tei = tei + 1;
+            }
+            return Type::Tuple(tts);
+        }
         // A field of a generic struct instance: its declared type with the
         // instance's type arguments
         Expr::FieldAccess(fobj, ffield) => {
@@ -20503,6 +21827,22 @@ pub fn Lowerer_infer_expr_ast_type(self: & Lowerer, expr: Expr) -> Type {
                                     match Lowerer_resolve_type(self, psd.fields.get(pi).ty) {
                                         Type::Func(_, _) => {
                                             return psd.fields.get(pi).ty;
+                                        }
+                                        // a generic struct's instance (held
+                                        // inline, Lowerer_held_ir): its
+                                        // fields read with its type
+                                        // arguments (`o.h.a` a string)
+                                        Type::Generic(pgn, _) => {
+                                            var pgk: bool = pgn != "Vec" && pgn != "HashMap" && pgn != "Box" && pgn != "Rc" && pgn != "Arc";
+                                            match Lowerer_lookup_struct(self, pgn) {
+                                                OptStructDef::Some(pgsd) => {
+                                                    if pgk && pgsd.type_params.len() > 0 {
+                                                        return psd.fields.get(pi).ty;
+                                                    }
+                                                }
+                                                OptStructDef::None => {
+                                                }
+                                            }
                                         }
                                         _ => {
                                         }
@@ -21260,7 +22600,8 @@ pub fn Lowerer_lower_vec_sret_call(self: & mut Lowerer, func_name: str, ret_ty: 
 
 // --- Ownership (proposal 0004) --------------------------------------------
 // One rule for every managed value (str, Vec, HashMap, and the structs,
-// enums and generic instances that hold them): a variable owns its value
+// enums, tuples and generic instances that hold them; a tuple is a struct
+// of its shape, Lowerer_key_tuple_ir): a variable owns its value
 // and drops it when its scope ends; reading a variable borrows it; a value
 // kept somewhere (a variable, a field, an element, a return value) is
 // counted again (dup) unless it is a temporary, which is handed over.
@@ -21411,7 +22752,8 @@ fn Lowerer_field_is_type_param(self: & Lowerer, sn: str, field: str) -> bool {
 }
 
 /// A generic struct literal's type: Pair<A, B> with the types of the
-/// values given to its type-parameter fields (known-bugs 2f.11).
+/// values given to its type-parameter fields (known-bugs 2f.11), a
+/// concatenation a string (Lowerer_enum_arg_ast_type).
 fn Lowerer_struct_lit_ast_type(self: & Lowerer, name: str, fields: Vec<FieldInit>) -> Type {
     match Lowerer_lookup_struct(self, name) {
         OptStructDef::Some(sd) => {
@@ -21432,7 +22774,11 @@ fn Lowerer_struct_lit_ast_type(self: & Lowerer, name: str, fields: Vec<FieldInit
                                 var k: i64 = 0;
                                 while k < fields.len() {
                                     if fields.get(k).name == sd.fields.get(fi).name {
-                                        found = Lowerer_infer_expr_ast_type(self, fields.get(k).value);
+                                        // `"k" + s` is a string (that
+                                        // inference types every `+` as
+                                        // i64: the field read as a number
+                                        // and its string was never dropped)
+                                        found = Lowerer_enum_arg_ast_type(self, fields.get(k).value);
                                     }
                                     k = k + 1;
                                 }
@@ -21521,8 +22867,16 @@ fn lw_rc_type_args(t: Type) -> Vec<Type> {
     return none;
 }
 
-/// Whether `t` is a struct or an enum of the program.
+/// Whether `t` is a struct or an enum of the program, or a tuple (a
+/// struct of its shape: it owns its elements, proposal 0004).
 fn Lowerer_rc_is_mem_type(self: & Lowerer, t: Type) -> bool {
+    match t {
+        Type::Tuple(tes) => {
+            return tes.len() > 0;
+        }
+        _ => {
+        }
+    }
     var name: str = lw_rc_type_name(t);
     if name == "" || name == "Vec" || name == "HashMap" || name == "Box" || name == "Rc" || name == "Arc" {
         return false;
@@ -21548,6 +22902,14 @@ fn Lowerer_rc_is_mem_type(self: & Lowerer, t: Type) -> bool {
 /// variant of enum `t`, with its type parameters replaced by its arguments.
 fn Lowerer_rc_field_types(self: & Lowerer, t: Type) -> Vec<Type> {
     var out: Vec<Type> = Vec::new();
+    // a tuple's elements
+    match t {
+        Type::Tuple(tes) => {
+            return tes;
+        }
+        _ => {
+        }
+    }
     var name: str = lw_rc_type_name(t);
     if name == "" {
         return out;
@@ -21622,6 +22984,9 @@ pub fn Lowerer_rc_kind(self: & mut Lowerer, t0: Type) -> i64 {
                 return RC_NONE;
             }
         }
+        // a tuple is a struct of its shape (its layout, Lowerer_key_tuple_ir)
+        Type::Tuple(_) => {
+        }
         _ => {
             return RC_NONE;
         }
@@ -21633,6 +22998,14 @@ pub fn Lowerer_rc_kind(self: & mut Lowerer, t0: Type) -> i64 {
     var cached: i64 = HashMap_get(self.own_kind_cache, key);
     if cached > 0 {
         return cached - 1;
+    }
+    // a tuple's layout is there for whatever owns it (its drop, its copies)
+    match t {
+        Type::Tuple(kes) => {
+            var _kt: IrType = Lowerer_key_tuple_ir(self, kes);
+        }
+        _ => {
+        }
     }
     // Plain while its fields are looked at: a type that holds itself does
     // so through a Box or a Vec, never inline
@@ -21657,6 +23030,14 @@ pub fn Lowerer_rc_type_index(self: & mut Lowerer, t0: Type) -> i64 {
     var at: i64 = HashMap_get(self.own_type_index, key);
     if at > 0 {
         return at - 1;
+    }
+    // a tuple's glue reads it at its layout's offsets (Lowerer_rc_mem_ir)
+    match t {
+        Type::Tuple(tes) => {
+            var _tl: IrType = Lowerer_key_tuple_ir(self, tes);
+        }
+        _ => {
+        }
     }
     self.own_types.push(OwnType {
         key: key, ty: t
@@ -21717,9 +23098,18 @@ fn Lowerer_rc_box_call(self: & mut Lowerer, b: i64, t: Type, dup: bool) -> i64 {
     return - 1;
 }
 
-/// The IR struct type of a struct-like AST type.
+/// The IR struct type of a struct-like AST type (a tuple's: its shape's
+/// layout, registered by Lowerer_rc_kind and Lowerer_rc_type_index).
 fn Lowerer_rc_mem_ir(self: & Lowerer, t: Type) -> IrType {
-    return IrType::Struct(lw_rc_type_name(Lowerer_resolve_type(self, t)));
+    var rt: Type = Lowerer_resolve_type(self, t);
+    match rt {
+        Type::Tuple(tes) => {
+            return IrType::Struct(Lowerer_tuple_name_ro(self, tes));
+        }
+        _ => {
+        }
+    }
+    return IrType::Struct(lw_rc_type_name(rt));
 }
 
 fn Lowerer_rc_env(self: & mut Lowerer) -> i64 {
@@ -21787,6 +23177,8 @@ pub fn Lowerer_rc_dup(self: & mut Lowerer, v: i64, t: Type) -> i64 {
     if k == RC_MEM {
         var sty: IrType = Lowerer_rc_mem_ir(self, t);
         var copy: i64 = Lowerer_emit_inst(self, Inst::Alloca(sty, Region::Stack));
+        // a tuple held as a word is its address
+        v = Lowerer_rc_tuple_ptr(self, v, t);
         Lowerer_emit_inst(self, Inst::Store(copy, v, OptIrType::Some(sty)));
         Lowerer_rc_call_mem(self, "__own_dup_", copy, t);
         return copy;
@@ -21926,6 +23318,11 @@ pub fn Lowerer_rc_own_value(self: & mut Lowerer, v: i64, t: Type) -> i64 {
         // kept outside the regions it may come from (proposal 0005)
         if self.rg_keep_out {
             return Lowerer_rg_keep_out(self, v, t);
+        }
+        // a tuple kept as a struct of its shape: its address (a popped
+        // element is a word)
+        if Lowerer_rc_kind(self, t) == RC_MEM {
+            return Lowerer_rc_tuple_ptr(self, v, t);
         }
         return v;
     }
@@ -22632,9 +24029,69 @@ fn Lowerer_rc_field_offset(self: & Lowerer, sn: str, name: str) -> i64 {
     return - 1;
 }
 
-/// The body of __own_drop_<idx> / __own_dup_<idx> for struct or enum `t`,
-/// whose memory starts at `p` (an i64).
+/// The IR type of field `name` in IR struct `sn`'s layout, or I64.
+fn Lowerer_rc_field_ir(self: & Lowerer, sn: str, name: str) -> IrType {
+    match IrModule_get_struct(& self.module, sn) {
+        OptStructLayout::Some(layout) => {
+            var i: i64 = 0;
+            while i < layout.fields.len() {
+                if layout.fields.get(i).name == name {
+                    return layout.fields.get(i).ty;
+                }
+                i = i + 1;
+            }
+        }
+        OptStructLayout::None => {
+        }
+    }
+    return IrType::I64;
+}
+
+/// Whether a field (or a payload) of AST type `t` held as IR type `held`
+/// is what the glue reads there: a struct-like value inline (a struct),
+/// anything else as its word. A tuple whose type names a type parameter
+/// is a word (Lowerer_held_ir) the glue leaves alone.
+fn Lowerer_rc_held_inline(self: & mut Lowerer, held: IrType, t: Type) -> bool {
+    if Lowerer_rc_kind(self, t) != RC_MEM {
+        return true;
+    }
+    match held {
+        IrType::Struct(_) => {
+            return true;
+        }
+        _ => {
+        }
+    }
+    return false;
+}
+
+/// The body of __own_drop_<idx> / __own_dup_<idx> for struct or enum `t`
+/// (or tuple), whose memory starts at `p` (an i64).
 fn Lowerer_rc_gen_body(self: & mut Lowerer, p: i64, t: Type, dup: bool) {
+    // A tuple: each element at its layout's offset (Lowerer_rc_mem_ir, as
+    // a tuple literal stores them: a struct, an enum and a nested tuple
+    // inline)
+    match t {
+        Type::Tuple(tes) => {
+            var tn: str = Lowerer_tuple_name_ro(self, tes);
+            match IrModule_get_struct(& self.module, tn) {
+                OptStructLayout::Some(tlay) => {
+                    var ti: i64 = 0;
+                    while ti < tes.len() && ti < tlay.fields.len() {
+                        if Lowerer_rc_held_inline(self, tlay.fields.get(ti).ty, tes.get(ti)) {
+                            Lowerer_rc_gen_field(self, p, tlay.fields.get(ti).offset, tes.get(ti), dup);
+                        }
+                        ti = ti + 1;
+                    }
+                }
+                OptStructLayout::None => {
+                }
+            }
+            return;
+        }
+        _ => {
+        }
+    }
     var name: str = lw_rc_type_name(t);
     var args: Vec<Type> = lw_rc_type_args(t);
     match Lowerer_lookup_struct(self, name) {
@@ -22647,7 +24104,7 @@ fn Lowerer_rc_gen_body(self: & mut Lowerer, p: i64, t: Type, dup: bool) {
                     var ft: Type = lw_rc_subst(f.ty, sd.type_params, args);
                     if lw_rc_is_param(f.ty, sd.type_params) {
                         Lowerer_rc_gen_param_payload(self, p, off, ft, dup);
-                    } else {
+                    } else if Lowerer_rc_held_inline(self, Lowerer_rc_field_ir(self, name, f.name), ft) {
                         Lowerer_rc_gen_field(self, p, off, ft, dup);
                     }
                 }
@@ -22691,8 +24148,13 @@ fn Lowerer_rc_gen_body(self: & mut Lowerer, p: i64, t: Type, dup: bool) {
                                     Lowerer_rc_gen_param_payload(self, p, slot * 8, pt, dup);
                                     slot = slot + 1;
                                 } else {
-                                    Lowerer_rc_gen_field(self, p, slot * 8, pt, dup);
-                                    slot = slot + Lowerer_enum_field_slots(self, Lowerer_lower_type(self, decl));
+                                    // as the enum's layout holds it (a tuple
+                                    // and a generic instance inline)
+                                    var held: IrType = Lowerer_held_ir(self, decl, ed.type_params);
+                                    if Lowerer_rc_held_inline(self, held, pt) {
+                                        Lowerer_rc_gen_field(self, p, slot * 8, pt, dup);
+                                    }
+                                    slot = slot + Lowerer_enum_field_slots(self, held);
                                 }
                                 qi = qi + 1;
                             }
@@ -22887,6 +24349,17 @@ fn Lowerer_rc_key_strs_mask(self: & mut Lowerer, t: Type, base: i64, depth: i64)
         return mask;
     }
     var rt: Type = Lowerer_resolve_type(self, t);
+    // a tuple (a map's tuple key, a tuple field): its elements' strings
+    match rt {
+        Type::Tuple(tes) => {
+            if tes.len() > 0 {
+                return Lowerer_key_tuple_mask(self, tes, base, depth + 1);
+            }
+            return mask;
+        }
+        _ => {
+        }
+    }
     var name: str = lw_rc_type_name(rt);
     if !Lowerer_rc_is_mem_type(self, rt) {
         return mask;
@@ -22905,9 +24378,23 @@ fn Lowerer_rc_key_strs_mask(self: & mut Lowerer, t: Type, base: i64, depth: i64)
                         if at % 8 == 0 && at / 8 < 64 {
                             mask = mask | lw_key_bit(at / 8);
                         }
+                    } else if lw_rc_is_param(f.ty, sd.type_params) {
+                        // a type parameter's field is one word: a struct
+                        // argument is a pointer to a heap copy, not inline
+                        // (Lowerer_rc_gen_param_payload)
                     } else {
                         var frt: Type = Lowerer_resolve_type(self, ft);
-                        if Lowerer_rc_is_mem_type(self, frt) {
+                        var ftes: Vec<Type> = Lowerer_rc_tuple_elems(self, frt);
+                        if ftes.len() > 0 {
+                            // a tuple field held inline (Lowerer_held_ir)
+                            match Lowerer_rc_field_ir(self, name, f.name) {
+                                IrType::Struct(_) => {
+                                    mask = mask | Lowerer_key_tuple_mask(self, ftes, at, depth + 1);
+                                }
+                                _ => {
+                                }
+                            }
+                        } else if Lowerer_rc_is_mem_type(self, frt) {
                             match Lowerer_lookup_struct(self, lw_rc_type_name(frt)) {
                                 OptStructDef::Some(_) => {
                                     mask = mask | Lowerer_rc_key_strs_mask(self, frt, at, depth + 1);
@@ -22927,10 +24414,11 @@ fn Lowerer_rc_key_strs_mask(self: & mut Lowerer, t: Type, base: i64, depth: i64)
     return mask;
 }
 
-/// The body of core's `__p_key_strs(tid) -> i64`: for the struct type
-/// numbered 16 + i, the words of it that hold strings
-/// (Lowerer_rc_key_strs_mask); 0 for any other type. A struct key of a map
-/// (HashMap_insert_k) then hashes and compares those words as text.
+/// The body of core's `__p_key_strs(tid) -> i64`: for the struct (or
+/// tuple) type numbered 16 + i, the words of it that hold strings
+/// (Lowerer_rc_key_strs_mask); 0 for any other type. A struct or tuple key
+/// of a map (HashMap_insert_k) then hashes and compares those words as
+/// text.
 fn Lowerer_rc_gen_key_strs_fn(self: & mut Lowerer) {
     var fname: str = "__p_key_strs";
     if !Lowerer_has_function(self, fname) {

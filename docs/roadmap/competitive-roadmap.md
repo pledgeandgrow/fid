@@ -1036,7 +1036,7 @@ Some of the largest costs are in how data is laid out, not in the optimizer.
       i64), i64>` key built at run time is not found by equal text built
       separately (`contains` gave false); generic struct keys; maps whose
       type the lowering cannot see.
-      Nov 21 (P2 fix; staged, not yet in the tree): the three things left are done. Tuple keys: a
+      Nov 21 (P2 fix, in the tree Nov 22): the three things left are done. Tuple keys: a
       tuple key holding strings (in a nested tuple or in a struct inside
       it too) is numbered 0x8000 + j by the lowering
       (Lowerer_key_tuple_tid, Lowerer_key_tuple_mask; core's
@@ -1066,7 +1066,7 @@ Some of the largest costs are in how data is laid out, not in the optimizer.
       test_verify_d22_hashmap_str_keys, test_stdlib_hashmap_flood,
       test_vec_infer_tc and test_generic_struct; the three RT5 tests and
       the tuple part of the new one free every block (--leaks).
-      Nov 21 (P2 fix; staged, not yet in the tree, G2): two of the RT5 leftovers are done. Tuple
+      Nov 21 (P2 fix, in the tree Nov 22, G2): two of the RT5 leftovers are done. Tuple
       layouts are named by their shape, not their length
       (lower.fd lw_tuple_layout_name: `__tuple_2_pl` for (str, i64),
       `__tuple_2_s12___tuple_2_pll` for ((str, i64), i64), a code per
@@ -1102,6 +1102,15 @@ Some of the largest costs are in how data is laid out, not in the optimizer.
       tuple still holds it, outside map keys); a non-generic struct's field
       of a generic instance type (`p: Pair<str, i64>`) is one word that
       the drop reads as inline.
+      Nov 22 (landed; compiler built from the merged tree, 8 units at -O2):
+      test_map_tuple_str_keys, test_tuple_shapes and test_tuple_ownership
+      pass on run, ccompile and pe_ir emit, with the same output as the
+      tested tree before the merge: a tuple key's strings are compared by
+      content. test_generic_struct_drop exits 1 on every backend (the
+      type-parameter leftover above), so it is not in the tree yet. The
+      machine layer (--nat, Linux targets) is not checked in the merged tree:
+      main's nat_ir miscompiles test_hashmap, test_json and test_mem_return
+      there with main's own runtime too (known-bugs 2g.115).
 - [~] RT6. Generics fully monomorphized, so a `Vec<f64>` holds floats as floats (L).
       Done (Nov 3, verified): `val x: f64 = v.get(0)` round-trips 1.5 — the
       monomorphized layout already stores floats as floats when the element
@@ -1123,7 +1132,7 @@ Some of the largest costs are in how data is laid out, not in the optimizer.
       on all three, and no other test is newly rejected. Left: a `let` in a
       closure body or a generic impl method keeps the old untyped
       behaviour; a full-suite run.
-- [~] RT7. Allocator: per-thread caches (release H8), freed memory returned to the
+- [x] RT7. Allocator: per-thread caches (release H8), freed memory returned to the
       system (L).
       Done (written Nov 4): per-thread arenas and free lists in the C runtime,
       per-thread free lists in the native runtime; every native test runs
@@ -1142,7 +1151,7 @@ Some of the largest costs are in how data is laid out, not in the optimizer.
       is right on ccompile and emit. Left: pe_ir (the default Windows
       `emit`) returns only the large block: small blocks stay resident (99
       MB held after they are freed).
-      Nov 21 (P2 fix; staged, not yet in the tree): the pe_ir allocator (the default Windows `emit`)
+      Nov 21 (P2 fix, in the tree Nov 22): the pe_ir allocator (the default Windows `emit`)
       gives freed memory back as well. Each thread now bumps blocks out of
       its own 4 MB chunk (4 MB-aligned and VirtualAlloc'd, with no lock or
       atomic on the bump; the old global `lock xadd` bump and its race on a
@@ -1178,6 +1187,14 @@ Some of the largest costs are in how data is laid out, not in the optimizer.
       read zero and keep their data. It passes on emit (with and without
       FID_MEM_RETURN=0), --nat and ccompile; `fid run` passes it in 23 s
       (its string part builds each string from one 32,000-byte text). Left: a run of the full suite on emit.
+      Nov 22 (landed; compiler built from the merged tree): test_mem_return,
+      test_mem_return_reuse, test_alloc_threads_stress, test_alloc and
+      test_allocator pass on ccompile and pe_ir emit, with the same output as
+      before the merge; the leak gate passes (11 of 11). Every backend now
+      returns freed memory. Left (not blocking): the full suite on emit. The
+      machine layer (--nat, Linux targets) is not checked in the merged tree:
+      main's nat_ir miscompiles test_hashmap, test_json and test_mem_return
+      there with main's own runtime too (known-bugs 2g.115).
 - [~] RT8. Allocator speed on par with mimalloc on its own benchmarks (L).
       Progress Nov 17: bench/alloc/run.sh builds the five programs with the
       C library, mimalloc (`mi_malloc`, `mi_zalloc`) and fid's `p_malloc`
@@ -1199,7 +1216,7 @@ Some of the largest costs are in how data is laid out, not in the optimizer.
       Left: sizes (3.9x) and large (5.0x) against mi_malloc; this run did
       not reproduce fid beating mi_zalloc on all five (slower on small and
       threads); the native runtimes' allocators.
-      Nov 21 (P2 fix; staged, not yet in the tree): the C runtime's allocator (compiler/codegen_c.fd,
+      Nov 21 (P2 fix, in the tree Nov 22): the C runtime's allocator (compiler/codegen_c.fd,
       new emit_block_alloc_runtime; emit_mem_return_runtime). p_malloc and
       p_free are a leaf fast path (a class block from this thread's free
       list or current chunk, no lock, no registers saved; the size class
@@ -1255,7 +1272,7 @@ Some of the largest costs are in how data is laid out, not in the optimizer.
       heap still has one lock once threads run.
 "Nov 21 (P2 fix)" one (the C runtime's):
 
-      Nov 21 (P2 fix; staged, not yet in the tree, native runtime): the native allocator (stdlib/linux_runtime/base.fd:
+      Nov 21 (P2 fix, in the tree Nov 22, native runtime): the native allocator (stdlib/linux_runtime/base.fd:
       Linux x86-64/AArch64/RISC-V, --nat Windows, macOS, WASI) gives each
       thread a heap of its own ("Per-thread heaps"): free lists, the chunk
       it bumps blocks from, a span cache, in pages of their own, reached
@@ -1334,6 +1351,17 @@ Some of the largest costs are in how data is laid out, not in the optimizer.
       free (team B's delayed decommit is the C runtime's only); a remote
       free still lands on the freeing thread's lists in all three
       runtimes (no return to the owner).
+      Nov 22 (landed; compiler built from the merged tree): the C and native
+      allocator changes above are in; test_alloc_zero_paths,
+      test_alloc_thread_heaps and test_alloc_reuse_zero pass on ccompile and
+      pe_ir emit. Not mimalloc parity: the next batch is allocation without
+      zeroing where every byte is written anyway (p_malloc_uninit), a
+      mimalloc-style fast path and frees returned to their owner thread. The
+      machine layer (--nat, Linux targets) is not checked in the merged tree:
+      main's nat_ir miscompiles test_hashmap, test_json and test_mem_return
+      there with main's own runtime too (known-bugs 2g.115). With these
+      changes test_threads also hangs on --nat; it passes with
+      FID_NAT_OFF=frameslots.
 - [x] RT9. Own context switch, not fibers: under 20 ns per task switch (M).
       Done Nov 8 on Windows, both paths. Native: `pe_ctx_swap`
       (compiler/pe_ir_stubs.fd, the same bytes in src/pe.rs, checked against
@@ -1360,7 +1388,7 @@ Some of the largest costs are in how data is laid out, not in the optimizer.
       (zig cc) best 12 ns on Windows x64 and 8 ns on Linux x86-64 (WSL),
       pe_ir 13.8 ns (ctx_swap_bench.fd); measured on a shared machine.
       Done.
-- [~] RT10. Tasks across all cores: M:N scheduling with work stealing (XL).
+- [x] RT10. Tasks across all cores: M:N scheduling with work stealing (XL).
       Done: per-worker local queues — `pe_wq_push` targets the running
       worker's queue via `pert_tls_wid` (spawn locality); `pe_wq_pop` drains
       own queue → global → steals a sibling's head. All run queues share
@@ -1382,7 +1410,7 @@ Some of the largest costs are in how data is laid out, not in the optimizer.
       machine). Left: the C runtime is still one cooperative scheduler per
       OS thread (no M:N, no stealing); the locality gain over the old
       shared-lock queues is not measured.
-      Nov 21 (P2 fix; staged, not yet in the tree): the C runtime is M:N too (compiler/codegen_c.fd
+      Nov 21 (P2 fix, in the tree Nov 22): the C runtime is M:N too (compiler/codegen_c.fd
       "M:N tasks", P_MN: wherever it has its own context switch, P_OWN_CTX,
       and GNU atomics; not --lib, not -g). Worker threads, one per CPU up to
       16 (FIDES_WORKERS=<n> 1-16, as the native runtimes; a program's
@@ -1457,6 +1485,12 @@ Some of the largest costs are in how data is laid out, not in the optimizer.
       under M:N (test_lowering_async_generic_task, about 1 run in 60): in the
       merged tree println is one locked write on the C path (0 broken lines
       of 24,001 in a 16-worker stress test; about 7,700 without the lock).
+      Nov 22 (landed; compiler built from the merged tree): test_tasks,
+      test_tasks_10k, test_threads and tests/ctx_switch/c_task_migrate pass,
+      and c_task_deadlock_fail is refused, on ccompile and pe_ir emit, with
+      the same output as before the merge; tests/tp on C 5 of 5. C, pe_ir and
+      the machine layer all schedule tasks M:N. Left (not blocking): the C
+      M:N path built on Linux and macOS.
 - [~] RT11. IOCP on Windows, epoll on Linux, kqueue on macOS, replacing the O(n) poll
       loop (L).
       Done Nov 8. Native Windows: a task waiting for a socket submits one AFD
@@ -2422,6 +2456,8 @@ Reach what Rust, Go, Zig and C++ programmers expect on day one.
       function stops core's abs -> p_abs rename), while `fid emit` of it
       prints 5; --nat Windows and macOS still call no C functions.
       Nov 21 (c082ee6, 2g.107): an extern C name no longer stops a core function's rename (`abs` stays `p_abs`; lg15-extern-core-name-check.sh).
+      Nov 22: lg15-extern-core-name-check.sh passes; test_at_import_system
+      passes with FID_INCLUDE set (release/fid.exe).
 - [~] LG16. C++ interop for the common cases (XL).
       Nov 16 (not yet built), the first step: a C++ header (`.hpp`, `.hh`,
       `.hxx`, or one with `namespace`) imports through compiler/cparser.fd
@@ -2608,6 +2644,8 @@ owning what we ship.
       lanes in simd.fd (nat_ir `ng_simd_call` is f64/i64 only), so no
       vector scan. (Marked done once the Nov 17 build passes
       `test_json_swar`.)
+      Nov 22: test_json_swar passes on C and pe_ir (release/fid.exe); the
+      speed was not measured.
 - [x] SL7. A linear-time regex engine (L).
       Done: `regex_match` in `stdlib/regex.fd` is a Pike VM (no
       backtracking): classes, escapes, counted quantifiers, groups,
@@ -2821,7 +2859,7 @@ owning what we ship.
       at 0.8 s restarts the 1 s timer); sl15-check.sh mangles WSL paths and
       takes Git Bash's PID for the Windows one.
       Nov 21 (c082ee6, 2g.101): pert_prof_watch_main's periodic report keeps its own clock — an event-triggered report no longer restarts the 1 s timer.
-      Nov 21 (P2 fix; staged, not yet in the tree): the periodic report keeps its own schedule.
+      Nov 21 (P2 fix, in the tree Nov 22): the periodic report keeps its own schedule.
       pe_runtime/conc.fd `pert_prof_watch_main` reports every
       FID_PROF_EVERY seconds on GetTickCount64 (`next` moves on by one
       period only when a periodic report is due, and the wait for the event
@@ -2859,6 +2897,9 @@ owning what we ship.
       periodic reports, no report when disabled, and an event set by another
       process. Together with the Linux running-service sampling probe above,
       the service profiler acceptance is met.
+      Nov 22 (landed; compiler built from the merged tree):
+      tests/prof/sl15-check.sh 12 of 12 (run, ccompile, emit, x86_64-linux in
+      WSL, the service checks).
 - [x] SL16. Big integers and decimals (M).
       Done: `stdlib/bigint.fd` (`test_bigint.fd`) and `stdlib/decimal.fd`:
       exact decimals on a BigInt mantissa, division and rounding to a scale

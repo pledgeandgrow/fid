@@ -12,6 +12,12 @@
 // event set
 // done
 // Without FID_PROF there is no event ("no event", then "done").
+// The first line on stderr is "pid <n>", the process id the event is named
+// after: the one another process needs (sl15-check.sh reads it, as the shell
+// it runs in may know the program under another id: Git Bash's, WSL's).
+// SL15_SVC_MS=<ms> makes each half that long (800 by default): time for
+// another process (PowerShell starts slowly) to set the event in the
+// first half.
 
 extern "C" link "kernel32.dll" {
     fn OpenEventA as svc_open_event(access: i64, inherit: i64, name: str) -> i64;
@@ -39,7 +45,18 @@ fn svc_work(ms: i64) -> i64 {
 }
 
 fn main() {
-    var r: i64 = svc_work(800);
+    p_eprint_str("pid " + int_to_str(p_getpid()) + "\n");
+    var half: i64 = 800;
+    match env_var("SL15_SVC_MS") {
+        Option::Some(v) => {
+            if str_parse_int(v) > 0 {
+                half = str_parse_int(v);
+            }
+        }
+        Option::None => {
+        }
+    }
+    var r: i64 = svc_work(half);
     // EVENT_MODIFY_STATE
     val name = "Local\\fid-prof-" + int_to_str(p_getpid());
     var h: i64 = 0;
@@ -56,7 +73,7 @@ fn main() {
     } else {
         println("event set");
     }
-    r = r + svc_work(800);
+    r = r + svc_work(half);
     if r >= 0 {
         println("done");
     }

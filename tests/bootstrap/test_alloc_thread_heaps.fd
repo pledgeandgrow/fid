@@ -1,0 +1,223 @@
+// RT8: the native runtime's per-thread heaps (stdlib/linux_runtime/base.fd,
+// "Per-thread heaps"): each thread allocates and frees on its own lists
+// without a lock; a block freed by a thread that did not make it goes on
+// the freeing thread's lists; a thread that ends gives its empty chunks
+// back and its lists to a pool the others adopt; each thread keeps a span
+// cache of large blocks while it asks for them often.
+//   - Four threads make 600 numbered blocks each; four other threads (not
+//     the main one) check and free them once the makers have ended, then
+//     ask for the same sizes again: the blocks must read zero.
+//   - Sixteen threads one after another hold 32 MB of strings each and drop
+//     them: the memory must be reused, not added up (where the resident size
+//     is known: below 96 MB more than at the start).
+//   - Four threads at once ask for 40 large blocks each (2 MB and more, the
+//     span cache) and fill them: each must read zero in the bytes asked for
+//     and keep what it was given while it is held.
+//
+// Expected output:
+//   cross-thread frees: 2400 kept their numbers
+//   reused after cross-thread frees: zeroed
+//   16 threads of 32 MB, one after another: memory reused
+//   large blocks on 4 threads: 160 zeroed and intact
+
+const MB: i64 = 1048576;
+
+/// The size of raw block i of a thread's `seed`: 16 to 40008 bytes
+fn block_size(seed: i64, i: i64) -> i64 {
+    return 16 + ((seed + i * 7919) % 5000) * 8;
+}
+
+/// n raw blocks made on this thread, block i holding seed * 1000 + i at its
+/// start and end; the address of the table of their addresses.
+@unsafe
+fn make_blocks(seed: i64, n: i64) -> i64 {
+    val tab: i64 = p_malloc(n * 8);
+    var i: i64 = 0;
+    while i < n {
+        val size: i64 = block_size(seed, i);
+        val b: i64 = p_malloc(size);
+        val bp: * mut i64 = b;
+        val ep: * mut i64 = b + size - 8;
+        val tp: * mut i64 = tab + i * 8;
+        unsafe {
+            * bp = seed * 1000 + i;
+            * ep = seed * 1000 + i;
+            * tp = b;
+        }
+        i = i + 1;
+    }
+    return tab;
+}
+
+/// The blocks of `tab` holding their numbers (each freed, the table too),
+/// then the same sizes asked for again on this thread: 100000 + the good
+/// ones when every new block read zero at its start and end.
+@unsafe
+fn check_free_reuse(tab: i64, seed: i64, n: i64) -> i64 {
+    var good: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        val tp: * mut i64 = tab + i * 8;
+        var b: i64 = 0;
+        unsafe { b = * tp; }
+        val bp: * mut i64 = b;
+        val ep: * mut i64 = b + block_size(seed, i) - 8;
+        var w: i64 = 0;
+        var e: i64 = 0;
+        unsafe {
+            w = * bp;
+            e = * ep;
+        }
+        if w == seed * 1000 + i && e == w {
+            good = good + 1;
+        }
+        p_free(b);
+        i = i + 1;
+    }
+    p_free(tab);
+    var zero: bool = true;
+    i = 0;
+    while i < n {
+        val size: i64 = block_size(seed, i);
+        val b: i64 = p_malloc(size);
+        val first: * mut i64 = b;
+        val last: * mut i64 = b + size - 8;
+        var w0: i64 = 1;
+        var w1: i64 = 1;
+        unsafe {
+            w0 = * first;
+            w1 = * last;
+        }
+        if w0 != 0 || w1 != 0 {
+            zero = false;
+        }
+        p_free(b);
+        i = i + 1;
+    }
+    if zero {
+        return 100000 + good;
+    }
+    return good;
+}
+
+/// 32 MB of strings held at once on this thread, then dropped.
+fn hold32(seed: i64) -> i64 {
+    val k: str = str_repeat("0123456789abcdef", 250);
+    var v: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < 8192 {
+        v.push(k + int_to_str(seed));
+        i = i + 1;
+    }
+    return v.len();
+}
+
+/// 40 large blocks of 2 MB and more, one after another, each checked to
+/// read zero at its start, middle and end, then filled there; one block
+/// held across them all must keep its words. The blocks that were right.
+@unsafe
+fn large_round(seed: i64) -> i64 {
+    val keep_n: i64 = 3 * MB;
+    val keep: i64 = p_malloc(keep_n);
+    val kp: * mut i64 = keep;
+    val kq: * mut i64 = keep + keep_n - 8;
+    unsafe {
+        * kp = seed;
+        * kq = seed + 1;
+    }
+    var good: i64 = 0;
+    var i: i64 = 0;
+    while i < 40 {
+        val size: i64 = 2 * MB + ((seed * 7 + i * 13) % 64) * 4096 + 8 * (i % 5);
+        val b: i64 = p_malloc(size);
+        val a0: * mut i64 = b;
+        val a1: * mut i64 = b + (size / 16) * 8;
+        val a2: * mut i64 = b + size - 8;
+        var w0: i64 = 1;
+        var w1: i64 = 1;
+        var w2: i64 = 1;
+        unsafe {
+            w0 = * a0;
+            w1 = * a1;
+            w2 = * a2;
+            * a0 = 0 - 1;
+            * a1 = 0 - 1;
+            * a2 = 0 - 1;
+        }
+        if w0 == 0 && w1 == 0 && w2 == 0 {
+            good = good + 1;
+        }
+        p_free(b);
+        i = i + 1;
+    }
+    var k0: i64 = 0;
+    var k1: i64 = 0;
+    unsafe {
+        k0 = * kp;
+        k1 = * kq;
+    }
+    p_free(keep);
+    if k0 != seed || k1 != seed + 1 {
+        return 0;
+    }
+    return good;
+}
+
+@unsafe
+fn main() -> i64 {
+    // blocks made on four threads, freed and asked for again on four others
+    val m0 = spawn make_blocks(1, 600);
+    val m1 = spawn make_blocks(2, 600);
+    val m2 = spawn make_blocks(3, 600);
+    val m3 = spawn make_blocks(4, 600);
+    val t0: i64 = await m0;
+    val t1: i64 = await m1;
+    val t2: i64 = await m2;
+    val t3: i64 = await m3;
+    val c0 = spawn check_free_reuse(t0, 1, 600);
+    val c1 = spawn check_free_reuse(t1, 2, 600);
+    val c2 = spawn check_free_reuse(t2, 3, 600);
+    val c3 = spawn check_free_reuse(t3, 4, 600);
+    val r0: i64 = await c0;
+    val r1: i64 = await c1;
+    val r2: i64 = await c2;
+    val r3: i64 = await c3;
+    println("cross-thread frees: " + int_to_str(r0 % 100000 + r1 % 100000 + r2 % 100000 + r3 % 100000) + " kept their numbers");
+    if r0 >= 100000 && r1 >= 100000 && r2 >= 100000 && r3 >= 100000 {
+        println("reused after cross-thread frees: zeroed");
+    } else {
+        println("reused after cross-thread frees: not zeroed");
+    }
+
+    // threads that end give their memory back or to the pool
+    val before: i64 = p_mem_resident();
+    var held: i64 = 0;
+    var s: i64 = 0;
+    while s < 16 {
+        val h = spawn hold32(s);
+        held = held + (await h);
+        s = s + 1;
+    }
+    val after: i64 = p_mem_resident();
+    var reused: bool = held == 16 * 8192;
+    if before > 0 && after > 0 {
+        p_eprint_str("resident " + int_to_str(before / MB) + " MB before, " + int_to_str(after / MB) + " MB after 16 threads\n");
+        if after - before >= 96 * MB {
+            reused = false;
+        }
+    }
+    if reused {
+        println("16 threads of 32 MB, one after another: memory reused");
+    } else {
+        println("16 threads of 32 MB, one after another: memory added up");
+    }
+
+    // large blocks: the span cache of each thread
+    val l0 = spawn large_round(1);
+    val l1 = spawn large_round(2);
+    val l2 = spawn large_round(3);
+    val l3 = spawn large_round(4);
+    val g: i64 = (await l0) + (await l1) + (await l2) + (await l3);
+    println("large blocks on 4 threads: " + int_to_str(g) + " zeroed and intact");
+    return 0;
+}

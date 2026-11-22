@@ -1,0 +1,225 @@
+// RT7: memory given back to the system and then reused. Big blocks (the
+// 384 KB class) freed while a small block pinned between each two keeps
+// their chunks from emptying lose their inside pages (C runtime:
+// __p_mem_trim; native Linux: at free; pe_ir: pert_alloc_trim); blocks of
+// the 24 KB class freed all at once empty whole chunks, which are released.
+// Then the same sizes are allocated again: every block must read zero all
+// through (a decommitted block's pages are committed again, the words
+// around them cleared) and keep what is written into it.
+//
+// Expected output:
+//   big blocks reused: zeroed
+//   big blocks reused: kept their data
+//   strings after the trim: as written
+//   small blocks reused: zeroed
+
+/// n raw blocks of `size` bytes, each with a 40-byte block after it that
+/// stays (in `pins`); every word of the big ones written; the table of
+/// their addresses.
+@unsafe
+fn make_big(n: i64, size: i64, pins: i64) -> i64 {
+    val tab: i64 = p_malloc(n * 8);
+    var i: i64 = 0;
+    while i < n {
+        val b: i64 = p_malloc(size);
+        var w: i64 = 0;
+        while w < size / 8 {
+            val p: * mut i64 = b + w * 8;
+            unsafe {
+                * p = i * 1000003 + w;
+            }
+            w = w + 1;
+        }
+        val tp: * mut i64 = tab + i * 8;
+        val pp: * mut i64 = pins + i * 8;
+        val pin: i64 = p_malloc(40);
+        unsafe {
+            * tp = b;
+            * pp = pin;
+        }
+        i = i + 1;
+    }
+    return tab;
+}
+
+/// Free the n blocks of `tab` and the table.
+@unsafe
+fn free_all(tab: i64, n: i64) {
+    var i: i64 = 0;
+    while i < n {
+        val tp: * mut i64 = tab + i * 8;
+        var b: i64 = 0;
+        unsafe {
+            b = * tp;
+        }
+        p_free(b);
+        i = i + 1;
+    }
+    p_free(tab);
+}
+
+/// n blocks of `size` again: each must read zero in every word; then each
+/// is filled with its own pattern, and all are checked after the last one
+/// is written. Returns 2 when both hold, 1 when only the zeroing does.
+@unsafe
+fn reuse_big(n: i64, size: i64) -> i64 {
+    val tab: i64 = p_malloc(n * 8);
+    var zero: bool = true;
+    var i: i64 = 0;
+    while i < n {
+        val b: i64 = p_malloc(size);
+        var w: i64 = 0;
+        while w < size / 8 {
+            val p: * mut i64 = b + w * 8;
+            var v: i64 = 0;
+            unsafe {
+                v = * p;
+                * p = i * 7 + w * 3 + 1;
+            }
+            if v != 0 {
+                zero = false;
+            }
+            w = w + 1;
+        }
+        val tp: * mut i64 = tab + i * 8;
+        unsafe {
+            * tp = b;
+        }
+        i = i + 1;
+    }
+    var kept: bool = true;
+    i = 0;
+    while i < n {
+        val tp: * mut i64 = tab + i * 8;
+        var b: i64 = 0;
+        unsafe {
+            b = * tp;
+        }
+        var w: i64 = 0;
+        while w < size / 8 {
+            val p: * mut i64 = b + w * 8;
+            var v: i64 = 0;
+            unsafe {
+                v = * p;
+            }
+            if v != i * 7 + w * 3 + 1 {
+                kept = false;
+            }
+            w = w + 8;
+        }
+        i = i + 1;
+    }
+    free_all(tab, n);
+    var r: i64 = 0;
+    if zero {
+        r = 1;
+        if kept {
+            r = 2;
+        }
+    }
+    return r;
+}
+
+/// 300 strings of 32000 bytes made and dropped, then 300 more checked.
+/// Each is one 32000-byte copy (a concatenation) of a text repeated once a
+/// round: str_repeat for each would take `fid run` minutes (it was over
+/// 900 s), for the same blocks natively.
+fn strings_again() -> bool {
+    val k: str = str_repeat("abcdefghij", 100);
+    var round: i64 = 0;
+    var ok: bool = true;
+    while round < 2 {
+        val big: str = str_repeat(k, 32);
+        var v: Vec<str> = Vec::new();
+        var i: i64 = 0;
+        while i < 300 {
+            v.push(big + int_to_str(i + round));
+            i = i + 1;
+        }
+        i = 0;
+        while i < 300 {
+            val s: str = v.get(i);
+            if str_len(s) != 32000 + str_len(int_to_str(i + round)) {
+                ok = false;
+            }
+            i = i + 37;
+        }
+        round = round + 1;
+    }
+    return ok;
+}
+
+/// 1000 blocks of 24000 bytes (the 24 KB class) freed, then 1000 again:
+/// their first, middle and last words read zero.
+@unsafe
+fn small_again() -> bool {
+    val n: i64 = 1000;
+    val size: i64 = 24000;
+    var round: i64 = 0;
+    var ok: bool = true;
+    while round < 2 {
+        val tab: i64 = p_malloc(n * 8);
+        var i: i64 = 0;
+        while i < n {
+            val b: i64 = p_malloc(size);
+            val p0: * mut i64 = b;
+            val p1: * mut i64 = b + size / 2;
+            val p2: * mut i64 = b + size - 8;
+            var v0: i64 = 0;
+            var v1: i64 = 0;
+            var v2: i64 = 0;
+            unsafe {
+                v0 = * p0;
+                v1 = * p1;
+                v2 = * p2;
+                * p0 = 5;
+                * p1 = 6;
+                * p2 = 7;
+            }
+            if v0 != 0 || v1 != 0 || v2 != 0 {
+                ok = false;
+            }
+            val tp: * mut i64 = tab + i * 8;
+            unsafe {
+                * tp = b;
+            }
+            i = i + 1;
+        }
+        free_all(tab, n);
+        round = round + 1;
+    }
+    return ok;
+}
+
+@unsafe
+fn main() -> i64 {
+    val n: i64 = 40;
+    val size: i64 = 300000;
+    val pins: i64 = p_malloc(n * 8);
+    val tab: i64 = make_big(n, size, pins);
+    free_all(tab, n);
+    // more frees past the threshold: a trim runs with the big blocks free
+    val r: i64 = reuse_big(n, size);
+    if r >= 1 {
+        println("big blocks reused: zeroed");
+    } else {
+        println("big blocks reused: not zeroed");
+    }
+    if r == 2 {
+        println("big blocks reused: kept their data");
+    } else {
+        println("big blocks reused: lost their data");
+    }
+    if strings_again() {
+        println("strings after the trim: as written");
+    } else {
+        println("strings after the trim: differ");
+    }
+    if small_again() {
+        println("small blocks reused: zeroed");
+    } else {
+        println("small blocks reused: not zeroed");
+    }
+    free_all(pins, n);
+    return 0;
+}

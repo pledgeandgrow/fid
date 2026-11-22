@@ -356,6 +356,11 @@ pub fn pert_thread_main(block: i64) -> i64 {
     }
     var result: i64 = nat_call_fn(pe_load(block), pe_load(block + 8), block + 16);
     pe_store(block + 88, result);
+    // RT7: an OS thread that ends gives its allocator chunk and free lists
+    // to the threads that stay (before its joiner can run on)
+    if pe_load(block + 96) == 0 {
+        pert_alloc_thread_end();
+    }
     nat_atomic_store(block + 80, 1);
     // A task runs on its own stack: it ends by giving control back for good
     if pe_load(block + 96) != 0 {
@@ -3771,34 +3776,47 @@ fn pe_pf_env_num(v: i64) -> i64 {
 
 /// The watcher thread: the report on request (the named event
 /// Local\fid-prof-<pid>, Ctrl-Break) and every FID_PROF_EVERY seconds.
+/// The periodic reports keep their own schedule on the monotonic clock
+/// (GetTickCount64): one asked for in between does not move the next.
 pub fn pert_prof_watch_main(id: i64) -> i64 {
     var every: i64 = pe_pf_env_num(pe_c_getenv("FID_PROF_EVERY") as i64);
     // auto-reset, not set
     var ev: i64 = pe_pf_create_event(0, 0, 0, "Local\\fid-prof-" + int_to_str(pe_k_getpid()));
-    // SL15 (known-bugs 2g.101): the periodic report keeps its own clock
-    // (GetTickCount64, ms). A report on request (the event, Ctrl-Break)
-    // restarted the count of 100 ms waits, so a report at 0.8 s moved the
-    // 1 s one to 1.8 s; and a wait the event ended early counted 100 ms.
-    var next_at: i64 = 0;
-    if every > 0 {
-        next_at = pe_k_ticks() + every * 1000;
-    }
+    var period: i64 = every * 1000;
+    var next: i64 = pe_k_ticks() + period;
     var alive: bool = true;
     while alive {
+        // wait at most 100 ms (Ctrl-Break's flag is looked at that often),
+        // and not past the next periodic report
+        var wait_ms: i64 = 100;
+        if period > 0 {
+            var left: i64 = next - pe_k_ticks();
+            if left < 0 {
+                left = 0;
+            }
+            if left < wait_ms {
+                wait_ms = left;
+            }
+        }
         var hit: bool = false;
         if ev != 0 {
-            if (pe_k_wait(ev, 100) as i64) == 0 {
+            if (pe_k_wait(ev, wait_ms) as i64) == 0 {
                 hit = true;
             }
         } else {
-            pe_k_sleep(100);
+            pe_k_sleep(wait_ms);
         }
         var due: bool = false;
-        if every > 0 {
+        if period > 0 {
             var now: i64 = pe_k_ticks();
-            if now >= next_at {
+            if now >= next {
                 due = true;
-                next_at = now + every * 1000;
+                // the next one a period later; past ones (a stalled
+                // watcher) are not made up
+                next = next + period;
+                if next <= now {
+                    next = now + period;
+                }
             }
         }
         if hit || pe_pf_req != 0 || due {
@@ -4120,8 +4138,13 @@ fn pe_lim_bad(name: i64, v: i64, kind: i64) {
     pe_k_exit_process(2);
 }
 
-/// Before main (the entry point): FID_MEM_LIMIT and FID_CPU_LIMIT.
+/// Before main (the entry point): FID_MEM_LIMIT and FID_CPU_LIMIT, and
+/// FID_MEM_RETURN (RT7, pert_alloc_trim).
 pub fn pert_limits_boot() {
+    var mr: i64 = pe_c_getenv("FID_MEM_RETURN") as i64;
+    if mr != 0 && pe_byte_at(mr, 0) == 48 && pe_byte_at(mr, 1) == 0 {
+        pe_al_keep = 1;
+    }
     pe_lim_scratch = pe_zeroed(8);
     var m: i64 = pe_c_getenv("FID_MEM_LIMIT") as i64;
     if m != 0 {
@@ -4200,6 +4223,389 @@ pub fn pert_lim_give(n: i64) -> i64 {
     }
     nat_atomic_add(pe_lim_used, 0 - n);
     return 0;
+}
+
+// ─── Freed memory back to the system (competitive RT7) ──────────────────
+// pe_ir's p_malloc / p_free are machine code (compiler/pe_ir_stubs.fd
+// PeirGen_gen_malloc / gen_free); the slow parts are here, as the C
+// runtime's __p_mem_trim (codegen_c.fd emit_mem_return_runtime) and
+// linux_runtime/base.fd pe_trim. None of them allocates: they run inside
+// p_malloc / p_free.
+//   - A thread bumps blocks of 16 bytes to 1 MB out of a chunk of its own:
+//     4 MB, aligned to 4 MB (8 MB reserved, the aligned half committed), so
+//     a block's chunk is its address rounded down. Header of a chunk (64
+//     bytes): [0] "FIDCHUNK" [8] the reservation [16] bytes handed out
+//     (set when it stops being a thread's chunk) [24] 1 while it is one
+//     [32] next [40] previous (the list of chunks, at st + 384) [48] the
+//     trim's sum [56] the trim's mark.
+//   - A thread's list array (512 bytes, its TLS slot, release H8): the free
+//     lists of classes 7..40 at class * 8, then [384] bump cursor [392]
+//     bump end [400] its chunk [408] bytes on its lists (resident: without
+//     the pages a trim took out of big blocks) [416] the next trim.
+//   - p_free past [416] calls pert_alloc_trim: under the lock (st + 376, an
+//     SRW lock), the chunks whose every handed-out byte is on this thread's
+//     lists (none of them any thread's chunk) are taken off the lists and
+//     released (MEM_RELEASE), but 2 such empty chunks kept; free blocks of
+//     256 KB and more lose their inside pages (MEM_DECOMMIT; the page of
+//     their header and list link stays: header bit 7 says so, p_malloc
+//     calls pert_alloc_recommit before it reuses one). A block freed by
+//     another thread is on that thread's lists, so its chunk is not empty
+//     for this one: a chunk is never released while a block of it is in
+//     use or on another thread's list. Next trim: what is left plus a
+//     quarter, at least 8 MB.
+//   - An OS thread that ends (pert_thread_main) gives its chunk up and its
+//     lists to a pool (st + 392) that the next thread to trim adopts.
+//   - FID_MEM_RETURN=0 (read by pert_limits_boot): no trim, nothing
+//     decommitted (large blocks go back with HeapFree either way).
+
+extern "C" {
+    // kernel32.dll (static import list, pe_ir_enc.fd pe_kernel32_imports)
+    fn GetProcessHeap as pe_al_heap() -> i64;
+    fn HeapFree as pe_al_heap_free(heap: i64, flags: i64, p: i64) -> i32;
+}
+
+const PE_AL_CHUNK: i64 = 4194304;  // a chunk's bytes (and alignment)
+const PE_AL_HDR: i64 = 64;  // its header; blocks follow
+const PE_AL_ST_TLS: i64 = 32;  // allocator state: TLS index + 1 of the list arrays
+const PE_AL_ST_LOCK: i64 = 376;  // the chunks' SRW lock
+const PE_AL_ST_CHUNKS: i64 = 384;  // the newest chunk
+const PE_AL_ST_POOL: i64 = 392;  // lists of ended threads (a list array)
+const PE_AL_CUR: i64 = 384;  // list array: bump cursor
+const PE_AL_END: i64 = 392;  // bump end
+const PE_AL_OWN: i64 = 400;  // the thread's chunk
+const PE_AL_FREE: i64 = 408;  // resident bytes on its lists
+const PE_AL_NEXT: i64 = 416;  // trim when [408] passes it
+const PE_AL_C_RESV: i64 = 8;
+const PE_AL_C_USED: i64 = 16;
+const PE_AL_C_LIVE: i64 = 24;
+const PE_AL_C_NEXT: i64 = 32;
+const PE_AL_C_PREV: i64 = 40;
+const PE_AL_C_SUM: i64 = 48;
+const PE_AL_C_MARK: i64 = 56;
+const PE_AL_FIRST: i64 = 7;  // the classes p_malloc makes
+const PE_AL_LAST: i64 = 40;
+const PE_AL_BIG: i64 = 36;  // 256 KB and more: decommitted when free
+const PE_AL_GONE: i64 = 128;  // header bit: inside pages decommitted
+const PE_AL_TRIM_MIN: i64 = 8388608;
+const PE_AL_KEEP_EMPTY: i64 = 2;
+
+var pe_al_st: i64 = 0;  // the allocator state (set by the first chunk)
+var pe_al_keep: i64 = 0;  // 1: FID_MEM_RETURN=0
+
+/// The bytes of a block of class c (as p_malloc makes them): 1 << (c / 2)
+/// for an even c, three quarters of the next power of two for an odd one.
+fn pe_al_bytes(c: i64) -> i64 {
+    if c % 2 == 0 {
+        return 1 << (c / 2);
+    }
+    return 3 << (c / 2 - 1);
+}
+
+/// The chunk of the block whose payload is at p.
+fn pe_al_chunk_of(p: i64) -> i64 {
+    return (p - 8) & (0 - PE_AL_CHUNK);
+}
+
+/// The first page a free block (payload p) can give back: the one after its
+/// header and list link.
+fn pe_al_lo(p: i64) -> i64 {
+    return (p + 8 + 4095) & (0 - 4096);
+}
+
+/// The end of the last whole page of the block (payload p, n bytes with
+/// its header).
+fn pe_al_hi(p: i64, n: i64) -> i64 {
+    return (p - 8 + n) & (0 - 4096);
+}
+
+/// Zero the words [a, b).
+fn pe_al_zero(a: i64, b: i64) {
+    var x: i64 = a;
+    while x < b {
+        pe_store(x, 0);
+        x = x + 8;
+    }
+}
+
+/// The chunk `c` stops being a thread's: its handed-out bytes are final
+/// (under the lock).
+fn pe_al_retire(c: i64, cur: i64) {
+    pe_store(c + PE_AL_C_USED, cur - (c + PE_AL_HDR));
+    pe_store(c + PE_AL_C_LIVE, 0);
+}
+
+/// The room left at the end of the thread's full chunk becomes free blocks
+/// on its lists (the largest classes that fit), so the chunk is not left
+/// with up to 1 MB nobody can use, and all of it can be found free.
+fn pe_al_carve_tail(arr: i64) {
+    var cur: i64 = pe_load(arr + PE_AL_CUR);
+    val lim: i64 = pe_load(arr + PE_AL_END);
+    var fb: i64 = pe_load(arr + PE_AL_FREE);
+    while lim - cur >= 16 {
+        var k: i64 = PE_AL_LAST;
+        while pe_al_bytes(k) > lim - cur {
+            k = k - 1;
+        }
+        val n: i64 = pe_al_bytes(k);
+        pe_store(cur, 0xF1DE5B0000000000 | k);  // a freed block of class k
+        pe_store(cur + 8, pe_load(arr + k * 8));
+        pe_store(arr + k * 8, cur + 8);
+        fb = fb + n;
+        cur = cur + n;
+    }
+    pe_store(arr + PE_AL_FREE, fb);
+    pe_store(arr + PE_AL_CUR, cur);
+}
+
+/// p_malloc found no room in this thread's chunk (or it has none): a new
+/// one for list array `arr`, its old one retired. 0 when the system has no
+/// memory left. `st` is the allocator state in .rdata.
+pub fn pert_alloc_chunk(st: i64, arr: i64) -> i64 {
+    pe_al_st = st;
+    var c: i64 = 0;
+    // 8 MB reserved (MEM_RESERVE), the 4 MB-aligned half committed
+    var r: i64 = pe_k_valloc(0, 2 * PE_AL_CHUNK, 0x2000, 4);
+    if r != 0 {
+        c = (r + PE_AL_CHUNK - 1) & (0 - PE_AL_CHUNK);
+        if pe_k_valloc(c, PE_AL_CHUNK, 0x1000, 4) == 0 {
+            pe_k_vfree(r, 0, 0x8000);
+            c = 0;
+        }
+    }
+    var old: i64 = pe_load(arr + PE_AL_OWN);
+    if old != 0 {
+        pe_al_carve_tail(arr);
+    }
+    pe_k_lock(st + PE_AL_ST_LOCK);
+    if old != 0 {
+        pe_al_retire(old, pe_load(arr + PE_AL_CUR));
+    }
+    pe_store(arr + PE_AL_CUR, 0);
+    pe_store(arr + PE_AL_END, 0);
+    pe_store(arr + PE_AL_OWN, 0);
+    if c != 0 {
+        pe_store(c, 0x4B4E554843444946);  // "FIDCHUNK"
+        pe_store(c + PE_AL_C_RESV, r);
+        pe_store(c + PE_AL_C_USED, 0);
+        pe_store(c + PE_AL_C_LIVE, 1);
+        var head: i64 = pe_load(st + PE_AL_ST_CHUNKS);
+        pe_store(c + PE_AL_C_NEXT, head);
+        pe_store(c + PE_AL_C_PREV, 0);
+        if head != 0 {
+            pe_store(head + PE_AL_C_PREV, c);
+        }
+        pe_store(st + PE_AL_ST_CHUNKS, c);
+        pe_store(arr + PE_AL_CUR, c + PE_AL_HDR);
+        pe_store(arr + PE_AL_END, c + PE_AL_CHUNK);
+        pe_store(arr + PE_AL_OWN, c);
+    }
+    pe_k_unlock(st + PE_AL_ST_LOCK);
+    if c == 0 {
+        return 0;
+    }
+    return 1;
+}
+
+/// p_malloc reuses the free block at payload p (n bytes with its header)
+/// whose inside pages a trim gave back: they are committed again (they read
+/// zero), the bytes around them are zeroed. 0 when the system has no
+/// memory left. The block is off the lists; [408] counted all n bytes off.
+pub fn pert_alloc_recommit(arr: i64, p: i64, n: i64) -> i64 {
+    val lo: i64 = pe_al_lo(p);
+    val hi: i64 = pe_al_hi(p, n);
+    if hi > lo {
+        if pe_k_valloc(lo, hi - lo, 0x1000, 4) == 0 {
+            return 0;
+        }
+        // those pages were not counted on the lists
+        pe_store(arr + PE_AL_FREE, pe_load(arr + PE_AL_FREE) + (hi - lo));
+        pe_al_zero(p, lo);
+        pe_al_zero(hi, p - 8 + n);
+    } else {
+        pe_al_zero(p, p - 8 + n);
+    }
+    return 1;
+}
+
+/// The last block of the list that starts at b (not 0).
+fn pe_al_tail(b: i64) -> i64 {
+    var t: i64 = b;
+    while pe_load(t) != 0 {
+        t = pe_load(t);
+    }
+    return t;
+}
+
+/// Move the free lists of list array `from` in front of those of `to`
+/// (under the lock): its blocks and their counted bytes.
+fn pe_al_splice(from: i64, to: i64) {
+    var k: i64 = PE_AL_FIRST;
+    while k <= PE_AL_LAST {
+        var b: i64 = pe_load(from + k * 8);
+        if b != 0 {
+            pe_store(pe_al_tail(b), pe_load(to + k * 8));
+            pe_store(to + k * 8, b);
+            pe_store(from + k * 8, 0);
+        }
+        k = k + 1;
+    }
+    pe_store(to + PE_AL_FREE, pe_load(to + PE_AL_FREE) + pe_load(from + PE_AL_FREE));
+    pe_store(from + PE_AL_FREE, 0);
+}
+
+/// p_free put more than [416] bytes on the lists of `arr` (this thread's):
+/// release its empty chunks, decommit its big free blocks, set the next
+/// threshold. `st` is the allocator state.
+pub fn pert_alloc_trim(st: i64, arr: i64) -> i64 {
+    pe_al_st = st;
+    if pe_al_keep != 0 {
+        // FID_MEM_RETURN=0: never again
+        pe_store(arr + PE_AL_NEXT, 9223372036854775807);
+        return 0;
+    }
+    if pe_load(arr + PE_AL_NEXT) == 0 {
+        // this thread's first free: the first threshold
+        pe_store(arr + PE_AL_NEXT, PE_AL_TRIM_MIN);
+        return 0;
+    }
+    pe_k_lock(st + PE_AL_ST_LOCK);
+    // the lists of ended threads become this thread's
+    val pool: i64 = pe_load(st + PE_AL_ST_POOL);
+    if pool != 0 {
+        pe_al_splice(pool, arr);
+    }
+    // each chunk's bytes on this thread's lists
+    var c: i64 = pe_load(st + PE_AL_ST_CHUNKS);
+    while c != 0 {
+        pe_store(c + PE_AL_C_SUM, 0);
+        pe_store(c + PE_AL_C_MARK, 0);
+        c = pe_load(c + PE_AL_C_NEXT);
+    }
+    var k: i64 = PE_AL_FIRST;
+    while k <= PE_AL_LAST {
+        val n: i64 = pe_al_bytes(k);
+        var b: i64 = pe_load(arr + k * 8);
+        while b != 0 {
+            val ch: i64 = pe_al_chunk_of(b);
+            pe_store(ch + PE_AL_C_SUM, pe_load(ch + PE_AL_C_SUM) + n);
+            b = pe_load(b);
+        }
+        k = k + 1;
+    }
+    // empty: no thread's chunk, every byte it handed out on these lists
+    var kept: i64 = 0;
+    var any: bool = false;
+    c = pe_load(st + PE_AL_ST_CHUNKS);
+    while c != 0 {
+        if pe_load(c + PE_AL_C_LIVE) == 0 && pe_load(c + PE_AL_C_SUM) == pe_load(c + PE_AL_C_USED) {
+            if kept < PE_AL_KEEP_EMPTY {
+                kept = kept + 1;
+            } else {
+                pe_store(c + PE_AL_C_MARK, 1);
+                any = true;
+            }
+        }
+        c = pe_load(c + PE_AL_C_NEXT);
+    }
+    // the blocks of those chunks off the lists; big free blocks' inside
+    // pages back to the system
+    var resident: i64 = pe_load(arr + PE_AL_FREE);
+    k = PE_AL_FIRST;
+    while k <= PE_AL_LAST {
+        val n: i64 = pe_al_bytes(k);
+        var link: i64 = arr + k * 8;
+        var b: i64 = pe_load(link);
+        while b != 0 {
+            val nb: i64 = pe_load(b);
+            val h: i64 = pe_load(b - 8);
+            var gone: i64 = 0;
+            if (h & PE_AL_GONE) != 0 {
+                gone = pe_al_hi(b, n) - pe_al_lo(b);
+            }
+            if pe_load(pe_al_chunk_of(b) + PE_AL_C_MARK) != 0 {
+                pe_store(link, nb);
+                resident = resident - (n - gone);
+            } else {
+                if k >= PE_AL_BIG && gone == 0 {
+                    val lo: i64 = pe_al_lo(b);
+                    val hi: i64 = pe_al_hi(b, n);
+                    if hi > lo && pe_k_vfree(lo, hi - lo, 0x4000) != 0 {
+                        pe_store(b - 8, h | PE_AL_GONE);
+                        resident = resident - (hi - lo);
+                    }
+                }
+                link = b;
+            }
+            b = nb;
+        }
+        k = k + 1;
+    }
+    pe_store(arr + PE_AL_FREE, resident);
+    // and the chunks themselves
+    if any {
+        c = pe_load(st + PE_AL_ST_CHUNKS);
+        while c != 0 {
+            val nc: i64 = pe_load(c + PE_AL_C_NEXT);
+            if pe_load(c + PE_AL_C_MARK) != 0 {
+                val pc: i64 = pe_load(c + PE_AL_C_PREV);
+                if pc != 0 {
+                    pe_store(pc + PE_AL_C_NEXT, nc);
+                } else {
+                    pe_store(st + PE_AL_ST_CHUNKS, nc);
+                }
+                if nc != 0 {
+                    pe_store(nc + PE_AL_C_PREV, pc);
+                }
+                pe_k_vfree(pe_load(c + PE_AL_C_RESV), 0, 0x8000);
+            }
+            c = nc;
+        }
+    }
+    pe_k_unlock(st + PE_AL_ST_LOCK);
+    var next: i64 = resident + resident / 4;
+    if next < PE_AL_TRIM_MIN {
+        next = PE_AL_TRIM_MIN;
+    }
+    pe_store(arr + PE_AL_NEXT, next);
+    return 0;
+}
+
+/// The OS thread running this ends (pert_thread_main): its chunk is retired
+/// and its free lists go to the pool the next trim adopts; its list array
+/// becomes the pool, or goes back to the heap.
+pub fn pert_alloc_thread_end() {
+    val st: i64 = pe_al_st;
+    if st == 0 {
+        return;
+    }
+    val ix: i64 = pe_load(st + PE_AL_ST_TLS) - 1;
+    if ix < 0 {
+        return;
+    }
+    val arr: i64 = pe_k_tls_get(ix);
+    if arr == 0 {
+        return;
+    }
+    pe_k_lock(st + PE_AL_ST_LOCK);
+    val old: i64 = pe_load(arr + PE_AL_OWN);
+    if old != 0 {
+        pe_al_retire(old, pe_load(arr + PE_AL_CUR));
+    }
+    pe_store(arr + PE_AL_CUR, 0);
+    pe_store(arr + PE_AL_END, 0);
+    pe_store(arr + PE_AL_OWN, 0);
+    val pool: i64 = pe_load(st + PE_AL_ST_POOL);
+    if pool == 0 {
+        pe_store(arr + PE_AL_NEXT, 0);
+        pe_store(st + PE_AL_ST_POOL, arr);
+    } else {
+        pe_al_splice(arr, pool);
+    }
+    pe_k_unlock(st + PE_AL_ST_LOCK);
+    pe_k_tls_set(ix, 0);
+    if pool != 0 {
+        pe_al_heap_free(pe_al_heap(), 0, arr);
+    }
 }
 
 // ─── Tensor-parallel ranks (roadmap P6) ─────────────────────────────────

@@ -1111,10 +1111,36 @@ fn cmd_fmt(n: i64, start: i64) -> i64 {
 //        --max-memory N, --timeout N, --trace
 fn cmd_run(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
     if start + 2 > n {
-        p_eprint_str("Usage: fid run <file.fd> [-v] [--release] [--max-recursion N] [--max-steps N] [--max-memory N] [--timeout N] [--trace <fn>[,<fn>...]] [--crash-file <file>] [--record <trace>] [--leaks] [--mem] [--checked-alloc]\n");
+        p_eprint_str("Usage: fid run <file.fd> [-v] [--release] [--max-recursion N] [--max-steps N] [--max-memory N] [--timeout N] [--trace <fn>[,<fn>...]] [--crash-file <file>] [--record <trace>] [--leaks] [--mem] [--checked-alloc] [--max-mem <bytes[K|M|G]>] [--cpu-limit <seconds>]\n");
         return 1;
     }
     var input: str = p_argv(start + 1);
+
+    // roadmap P12: --max-mem <bytes[K|M|G]> / --cpu-limit <seconds>, as
+    // ccompile takes them: the program's limits when FID_MEM_LIMIT /
+    // FID_CPU_LIMIT is not set (interp.fd interp_lim_setup); a set
+    // variable wins
+    var lim_args: str = "";
+    var run_lim_mem: i64 = 0;
+    var run_lim_cpu_ms: i64 = 0;
+    var run_mem_arg: str = get_flag_value(n, start, "--max-mem", "");
+    if str_len(run_mem_arg) > 0 {
+        run_lim_mem = lim_parse_bytes(run_mem_arg);
+        if run_lim_mem <= 0 {
+            print("Invalid --max-mem '" + run_mem_arg + "': use <bytes>[K|M|G], e.g. 64M\n");
+            return 1;
+        }
+        lim_args = lim_args + " --max-mem " + run_mem_arg;
+    }
+    var run_cpu_arg: str = get_flag_value(n, start, "--cpu-limit", "");
+    if str_len(run_cpu_arg) > 0 {
+        run_lim_cpu_ms = lim_parse_ms(run_cpu_arg);
+        if run_lim_cpu_ms <= 0 {
+            print("Invalid --cpu-limit '" + run_cpu_arg + "': use seconds, e.g. 2 or 0.5\n");
+            return 1;
+        }
+        lim_args = lim_args + " --cpu-limit " + run_cpu_arg;
+    }
 
     // --leaks / --checked-alloc: the interpreter has no allocator to watch, so
     // build through C with the debug allocator and run that
@@ -1135,7 +1161,7 @@ fn cmd_run(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
             mexe = "_fides_memcheck_tmp";
             mrun = "./_fides_memcheck_tmp";
         }
-        if p_system("\"" + p_argv(0) + "\" ccompile " + input + " -o " + mexe + " --debug" + mem_flags) != 0 {
+        if p_system("\"" + p_argv(0) + "\" ccompile " + input + " -o " + mexe + " --debug" + mem_flags + lim_args) != 0 {
             p_eprint_str("run: the build failed\n");
             return 1;
         }
@@ -1267,6 +1293,7 @@ fn cmd_run(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
             return 1;
         }
     }
+    run_limit_defaults(run_lim_mem, run_lim_cpu_ms);
     var run_rc: i64 = interpret_source_with_path(source, input, max_recursion, max_steps, max_memory_bytes, verbose, g_borrowck);
     if str_len(record_path) > 0 {
         run_record_finish(run_rc);

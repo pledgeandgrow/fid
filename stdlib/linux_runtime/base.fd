@@ -109,6 +109,24 @@ fn pe_copy(dst: i64, src: i64, n: i64) {
 
 fn pe_zero(dst: i64, n: i64) {
     var i: i64 = 0;
+    // RT8: through pointers, four words a turn, not a pe_st call per word
+    // (the allocator zeroes every block it hands out again: a large one of
+    // the span cache is megabytes)
+    while i + 32 <= n {
+        var w0: *mut i64 = dst + i;
+        var w1: *mut i64 = dst + i + 8;
+        var w2: *mut i64 = dst + i + 16;
+        var w3: *mut i64 = dst + i + 24;
+        // SAFETY: NOT checked here: i + 32 <= n, four words of the n bytes
+        // at dst the caller allocated (as pe_st's).
+        unsafe {
+            *w0 = 0;
+            *w1 = 0;
+            *w2 = 0;
+            *w3 = 0;
+        }
+        i = i + 32;
+    }
     while i + 8 <= n {
         pe_st(dst + i, 0);
         i = i + 8;
@@ -129,8 +147,16 @@ fn pe_sys(n: i64, a: i64, b: i64, c: i64) -> i64 {
 // once freed. Class 63 is a large block of its own mapping, its total size
 // in the word before the header. Freed blocks wait on a list per class
 // (the next one in their first payload word); a reused block is zeroed,
-// as fresh memory is. Once a second thread may run (pe_mt_on), one lock
-// guards the heap.
+// as fresh memory is.
+// RT8: each thread has a heap of its own ("Per-thread heaps" below): its
+// free lists, the chunk it bumps blocks out of, its span cache. A thread's
+// malloc and free take no lock. Once a second thread may run (pe_mt_on),
+// the heap lock guards only what threads share: the chunk table and a new
+// chunk, the pool of ended threads' lists, --leaks' list, the memory
+// profile (FID_MEM_LIMIT's count has a lock of its own). A block freed by
+// a thread that did not allocate it goes on the freeing thread's lists, as
+// in the C runtime and pe_ir: a block is on one list at a time, in use or
+// on exactly one thread's lists.
 
 const PE_LARGE: i64 = 63;
 
@@ -149,9 +175,6 @@ fn pe_null_str() -> i64 {
     return 0;
 }
 
-var pe_heap_cur: i64 = 0;
-var pe_heap_end: i64 = 0;
-var pe_free_lists: i64 = 0;
 // The size of a chunk pe_bump maps (4 MB). A global, not a literal, so that
 // a target with little RAM can give it a smaller initial value by name
 // (compiler/nat_thumb.fd th_gen_data overrides runtime globals' values).
@@ -166,96 +189,494 @@ fn pe_mmap(n: i64) -> i64 {
     return a;
 }
 
-/// `n` bytes of the current chunk (a multiple of 16), a new chunk of
-/// pe_heap_chunk bytes (4 MB) when it is full.
-fn pe_bump(n: i64) -> i64 {
-    if pe_heap_cur == 0 || pe_heap_cur + n > pe_heap_end {
-        var size: i64 = pe_heap_chunk;
-        if n > size {
-            size = n;
-        }
-        // RT7: the chunk left behind keeps how far it was handed out
-        if pe_heap_base != 0 {
-            pe_chunk_note_used(pe_heap_base, pe_heap_cur);
-        }
-        pe_heap_cur = pe_mmap(size);
-        pe_heap_end = pe_heap_cur + size;
-        pe_heap_base = pe_heap_cur;
-        pe_chunk_add(pe_heap_base, size);
-    }
-    var b: i64 = pe_heap_cur;
-    pe_heap_cur = pe_heap_cur + n;
-    return b;
+// ─── RT8: per-thread heaps ──────────────────────────────────────────────
+// A heap is PE_H_SIZE bytes of pages of its own (zeroed when mapped):
+//   [k * 8]       the free list of class k (4..20)
+//   [PE_H_CUR], [PE_H_END]  what is left of its chunk to bump blocks from
+//   [PE_H_BASE]   that chunk (0: none yet)
+//   [PE_H_FL]     the bytes on its lists (resident ones: a decommitted or
+//                 known-zero block is not counted)
+//   [PE_H_TRIM]   the trim runs when PE_H_FL passes it
+//   [PE_H_TS]     16 bytes for clock_gettime (the span cache's clock)
+//   [PE_H_SPN], [PE_H_SPB]  the span cache's spans and their bytes
+//   [PE_H_BT0], [PE_H_BCNT] the span cache's window: when it began, the
+//                 large blocks asked for since
+//   [PE_H_ANY]    (the pool) 1 when its lists may hold a block
+//   [PE_H_SPM + 8 i], [PE_H_SPAT + 8 i]  cached span i: its mapping, when
+//                 it was cached (ms)
+// Before a second thread may run there is one heap, pe_h0, and no lock;
+// the thread pointer is not read (on x86-64 it is not set up before
+// pe_rt_init). Then a thread reaches its heap through its block (pe_tls,
+// word PE_TLS_HEAP), read from the thread pointer at every call: a task
+// may resume on another thread, and then uses that thread's heap. A
+// thread's first allocation makes its heap; the first thread's stays
+// pe_h0. A thread that ends (pe_heap_thread_end) gives its empty chunks
+// back and its lists to a pool: a thread that finds its list of a class
+// empty takes the pool's of that class, and a trim takes all of them.
+
+const PE_H_SIZE: i64 = 1024;
+const PE_H_CUR: i64 = 168;
+const PE_H_END: i64 = 176;
+const PE_H_BASE: i64 = 184;
+const PE_H_FL: i64 = 192;
+const PE_H_TRIM: i64 = 200;
+const PE_H_TS: i64 = 208;
+const PE_H_SPN: i64 = 224;
+const PE_H_SPB: i64 = 232;
+const PE_H_BT0: i64 = 240;
+const PE_H_BCNT: i64 = 248;
+const PE_H_ANY: i64 = 256;
+const PE_H_SPM: i64 = 264;
+const PE_H_SPAT: i64 = 392;
+// the word of a thread's block (pe_tls) that holds its heap
+const PE_TLS_HEAP: i64 = 88;
+
+var pe_h0: i64 = 0;  // the first thread's heap
+var pe_pool: i64 = 0;  // a heap: the lists of threads that ended (under the heap lock)
+
+fn pe_heap_new() -> i64 {
+    val h: i64 = pe_mmap(PE_H_SIZE);
+    pe_st(h + PE_H_TRIM, PE_TRIM_MIN);
+    return h;
 }
 
-fn pe_lists() -> i64 {
-    if pe_free_lists == 0 {
-        pe_free_lists = pe_bump(512);
+/// This thread's heap.
+fn pe_heap() -> i64 {
+    if pe_mt == 0 {
+        if pe_h0 == 0 {
+            pe_h0 = pe_heap_new();
+        }
+        return pe_h0;
     }
-    return pe_free_lists;
+    val t: i64 = nat_tls_get();
+    if t != 0 {
+        val h: i64 = pe_ld(t + PE_TLS_HEAP);
+        if h != 0 {
+            return h;
+        }
+    }
+    return pe_heap_attach(t);
+}
+
+/// The first allocation of a thread (block t, 0 if it has none: a thread
+/// the runtime did not start gets one, from pages of its own, kept): its
+/// heap.
+fn pe_heap_attach(t0: i64) -> i64 {
+    var t: i64 = t0;
+    if t == 0 {
+        t = pe_mmap(4096);
+        pe_st(t + 64, t);
+        nat_tls_set(t);
+    }
+    val h: i64 = pe_heap_new();
+    pe_st(t + PE_TLS_HEAP, h);
+    return h;
+}
+
+/// `n` bytes of heap h's chunk (a multiple of 16), a new chunk of
+/// pe_heap_chunk bytes (4 MB) when it is full.
+fn pe_bump(h: i64, n: i64) -> i64 {
+    val b: i64 = pe_ld(h + PE_H_CUR);
+    if b != 0 && b + n <= pe_ld(h + PE_H_END) {
+        pe_st(h + PE_H_CUR, b + n);
+        return b;
+    }
+    val c: i64 = pe_chunk_new(h, n);
+    pe_st(h + PE_H_CUR, c + n);
+    return c;
+}
+
+/// A new chunk for heap h (at least n bytes). RT8: what is left of the old
+/// one goes on h's lists, known zero (pe_carve_tail); RT7: the old one
+/// keeps how far it was handed out. The chunk table is shared: under the
+/// heap lock.
+fn pe_chunk_new(h: i64, n: i64) -> i64 {
+    var size: i64 = pe_heap_chunk;
+    if n + PE_CHUNK_SKIP > size {
+        size = n + PE_CHUNK_SKIP;
+    }
+    pe_carve_tail(h);
+    val c: i64 = pe_mmap(size);
+    pe_glock();
+    val old: i64 = pe_ld(h + PE_H_BASE);
+    if old != 0 {
+        pe_chunk_retire(old, pe_ld(h + PE_H_CUR));
+    }
+    pe_chunk_add(c, size);
+    pe_gunlock();
+    pe_st(h + PE_H_BASE, c);
+    pe_st(h + PE_H_CUR, c + PE_CHUNK_SKIP);
+    pe_st(h + PE_H_END, c + size);
+    return c + PE_CHUNK_SKIP;
+}
+
+/// The first bytes of a chunk are never handed out: a block at the start
+/// of a mapping would have its payload 8 bytes in, and core reads the 16
+/// bytes before any 8-aligned string (Str_dup, Str_drop, p_str_len: the
+/// header of a counted string), which for a plain string there are the
+/// page before the mapping (--nat Windows: often not mapped, an access
+/// violation in Str_dup). pe_chunk_empty counts them as handed out.
+const PE_CHUNK_SKIP: i64 = 16;
+
+/// RT8: the rest of heap h's chunk, too small for the block asked for,
+/// cut into free blocks of the largest classes that fit, each marked
+/// PE_ZERO in its freed header: fresh pages, only the link word written, so
+/// pe_malloc_raw hands it out without zeroing it. Not counted in PE_H_FL
+/// (as a decommitted block is not): its pages are not resident.
+fn pe_carve_tail(h: i64) {
+    var cur: i64 = pe_ld(h + PE_H_CUR);
+    if cur == 0 {
+        return;
+    }
+    val end: i64 = pe_ld(h + PE_H_END);
+    var k: i64 = 20;
+    while k >= 4 {
+        val sz: i64 = 1 << k;
+        while end - cur >= sz {
+            val b: i64 = cur + 8;
+            cur = cur + sz;
+            pe_st(b - 8, pe_freed() + k + PE_ZERO);
+            pe_st(b, pe_ld(h + k * 8));
+            pe_st(h + k * 8, b);
+        }
+        k = k - 1;
+    }
+    pe_st(h + PE_H_CUR, cur);
+}
+
+/// Move the free lists of heap `from` in front of those of `to`, with their
+/// counted bytes (under the heap lock).
+fn pe_heap_splice(from: i64, to: i64) {
+    var k: i64 = 4;
+    while k <= 20 {
+        val b: i64 = pe_ld(from + k * 8);
+        if b != 0 {
+            var tl: i64 = b;
+            while pe_ld(tl) != 0 {
+                tl = pe_ld(tl);
+            }
+            pe_st(tl, pe_ld(to + k * 8));
+            pe_st(to + k * 8, b);
+            pe_st(from + k * 8, 0);
+            pe_st(to + PE_H_ANY, 1);
+        }
+        k = k + 1;
+    }
+    pe_st(to + PE_H_FL, pe_ld(to + PE_H_FL) + pe_ld(from + PE_H_FL));
+    pe_st(from + PE_H_FL, 0);
+    pe_st(from + PE_H_ANY, 0);
+}
+
+/// The pool's list of class k (threads that ended) becomes heap h's, whose
+/// own is empty; false when the pool has none. Only the class missing: the
+/// thread that asks for it (the main thread joining, say) does not take
+/// the blocks of the others. (The pool's head is read first without the
+/// lock: a hint.)
+fn pe_pool_adopt(h: i64, k: i64) -> bool {
+    if pe_pool == 0 || pe_ld(pe_pool + PE_H_ANY) == 0 || pe_ld(pe_pool + k * 8) == 0 {
+        return false;
+    }
+    var got: bool = false;
+    pe_glock();
+    val b: i64 = pe_ld(pe_pool + k * 8);
+    if b != 0 && pe_ld(h + k * 8) == 0 {
+        var res: i64 = 0;
+        var x: i64 = b;
+        while x != 0 {
+            if (pe_ld(x - 8) & (PE_DECOMMITTED + PE_ZERO)) == 0 {
+                res = res + (1 << k);
+            }
+            x = pe_ld(x);
+        }
+        pe_st(h + k * 8, b);
+        pe_st(pe_pool + k * 8, 0);
+        pe_st(pe_pool + PE_H_FL, pe_ld(pe_pool + PE_H_FL) - res);
+        pe_st(h + PE_H_FL, pe_ld(h + PE_H_FL) + res);
+        var any: i64 = 0;
+        var j: i64 = 4;
+        while j <= 20 {
+            if pe_ld(pe_pool + j * 8) != 0 {
+                any = 1;
+            }
+            j = j + 1;
+        }
+        pe_st(pe_pool + PE_H_ANY, any);
+        got = true;
+    }
+    pe_gunlock();
+    return got;
+}
+
+/// The OS thread running this ends (conc.fd pe_thread_main on Linux,
+/// win.fd / darwin.fd after their thread's last free): its cached spans
+/// are unmapped, its chunk retired (the rest cut into its lists), its empty
+/// chunks unmapped, its lists go to the pool and its heap's pages back.
+/// Nothing may allocate on this thread afterwards.
+pub fn pe_heap_thread_end() {
+    if pe_mt == 0 {
+        return;
+    }
+    val t: i64 = nat_tls_get();
+    if t == 0 {
+        return;
+    }
+    val h: i64 = pe_ld(t + PE_TLS_HEAP);
+    if h == 0 || h == pe_h0 {
+        return;
+    }
+    if pe_ld(h + PE_H_SPN) != 0 {
+        pe_span_purge(h, 0, true);
+    }
+    pe_carve_tail(h);
+    pe_glock();
+    val c: i64 = pe_ld(h + PE_H_BASE);
+    if c != 0 {
+        pe_chunk_retire(c, pe_ld(h + PE_H_CUR));
+    }
+    pe_gunlock();
+    pe_st(h + PE_H_BASE, 0);
+    pe_st(h + PE_H_CUR, 0);
+    pe_st(h + PE_H_END, 0);
+    if pe_mem_return_on() {
+        pe_trim_keep(h, 0, false);
+    }
+    pe_glock();
+    if pe_pool == 0 {
+        pe_pool = pe_heap_new();
+    }
+    pe_heap_splice(h, pe_pool);
+    pe_gunlock();
+    pe_st(t + PE_TLS_HEAP, 0);
+    pe_sys(PE_SYS_MUNMAP, h, PE_H_SIZE, 0);
+}
+
+// ─── RT8: the span cache ────────────────────────────────────────────────
+// As the C runtime's (codegen_c.fd emit_mem_return_runtime): a large
+// block's mapping (over 1 MB) is kept for this thread's next large block,
+// zeroed then in the bytes asked for instead of mapped again (fresh pages
+// cost a page fault each, several times slower than zeroing them in
+// place), only while the thread asks for large blocks often (PE_SPAN_WARM
+// in PE_SPAN_WARM_MS): one big block freed now and then is unmapped at
+// once, as before. At most PE_SPAN_N spans of PE_SPAN_MAX bytes each and
+// PE_SPAN_BYTES in all, per thread; a span not reused within
+// PE_SPAN_PURGE_MS is unmapped at the next large block, trim or the
+// thread's end. A cached span's header is freed (a second free of its
+// block panics). FID_SPAN_CACHE=0 turns it off.
+
+const PE_SPAN_N: i64 = 16;
+const PE_SPAN_BYTES: i64 = 67108864;
+const PE_SPAN_MAX: i64 = 8388608;
+const PE_SPAN_PURGE_MS: i64 = 250;
+const PE_SPAN_WARM: i64 = 8;
+const PE_SPAN_WARM_MS: i64 = 1000;
+
+var pe_span_on: i64 = 0 - 1;  // 1 on, 0 off (FID_SPAN_CACHE=0), -1 not read yet
+
+/// A millisecond clock (only its differences are used), through heap h's
+/// scratch words. On --nat Windows the clock allocates a block itself (it
+/// may run a trim: callers have h in order first).
+fn pe_ms(h: i64) -> i64 {
+    pe_st(h + PE_H_TS, 0);
+    pe_st(h + PE_H_TS + 8, 0);
+    pe_sys(PE_SYS_CLOCK_GETTIME, 1, h + PE_H_TS, 0);
+    return pe_ld(h + PE_H_TS) * 1000 + pe_ld(h + PE_H_TS + 8) / 1000000;
+}
+
+/// Cached span i out of heap h's cache (its pages stay).
+fn pe_span_drop(h: i64, i: i64) {
+    val last: i64 = pe_ld(h + PE_H_SPN) - 1;
+    pe_st(h + PE_H_SPB, pe_ld(h + PE_H_SPB) - pe_ld(pe_ld(h + PE_H_SPM + i * 8)));
+    pe_st(h + PE_H_SPM + i * 8, pe_ld(h + PE_H_SPM + last * 8));
+    pe_st(h + PE_H_SPAT + i * 8, pe_ld(h + PE_H_SPAT + last * 8));
+    pe_st(h + PE_H_SPN, last);
+}
+
+/// The cached spans not reused for PE_SPAN_PURGE_MS (all: every one) back
+/// to the system.
+fn pe_span_purge(h: i64, now: i64, all: bool) {
+    var i: i64 = 0;
+    while i < pe_ld(h + PE_H_SPN) {
+        if all || now - pe_ld(h + PE_H_SPAT + i * 8) >= PE_SPAN_PURGE_MS {
+            val m: i64 = pe_ld(h + PE_H_SPM + i * 8);
+            val s: i64 = pe_ld(m);
+            pe_span_drop(h, i);
+            pe_sys(PE_SYS_MUNMAP, m, s, 0);
+        } else {
+            i = i + 1;
+        }
+    }
+}
+
+/// A cached span of at least `span` bytes and at most a quarter more (the
+/// smallest), out of the cache; 0 when there is none.
+fn pe_span_take(h: i64, span: i64) -> i64 {
+    var best: i64 = 0 - 1;
+    var bs: i64 = 0;
+    var i: i64 = 0;
+    val cnt: i64 = pe_ld(h + PE_H_SPN);
+    while i < cnt {
+        val s: i64 = pe_ld(pe_ld(h + PE_H_SPM + i * 8));
+        if s >= span && s - span <= span / 4 && (best < 0 || s < bs) {
+            best = i;
+            bs = s;
+        }
+        i = i + 1;
+    }
+    if best < 0 {
+        return 0;
+    }
+    val m: i64 = pe_ld(h + PE_H_SPM + best * 8);
+    pe_span_drop(h, best);
+    return m;
+}
+
+/// A freed large block's mapping m (m[0]: its size), on heap h: cached when
+/// the thread is warm and it fits, else unmapped.
+fn pe_span_free(h: i64, m: i64) {
+    val span: i64 = pe_ld(m);
+    if pe_span_on < 0 {
+        val e: i64 = pe_env_raw("FID_SPAN_CACHE" as i64);
+        if e != 0 && pe_ldb(e) == 48 && pe_ldb(e + 1) == 0 {
+            pe_span_on = 0;
+        } else {
+            pe_span_on = 1;
+        }
+    }
+    if pe_span_on != 0 {
+        val now: i64 = pe_ms(h);
+        if pe_ld(h + PE_H_SPN) != 0 {
+            pe_span_purge(h, now, false);
+        }
+        if span <= PE_SPAN_MAX && pe_ld(h + PE_H_BCNT) >= PE_SPAN_WARM && now - pe_ld(h + PE_H_BT0) <= PE_SPAN_WARM_MS {
+            // room: the oldest spans go first
+            while pe_ld(h + PE_H_SPN) > 0 && (pe_ld(h + PE_H_SPN) >= PE_SPAN_N || pe_ld(h + PE_H_SPB) + span > PE_SPAN_BYTES) {
+                var o: i64 = 0;
+                var i: i64 = 1;
+                while i < pe_ld(h + PE_H_SPN) {
+                    if pe_ld(h + PE_H_SPAT + i * 8) < pe_ld(h + PE_H_SPAT + o * 8) {
+                        o = i;
+                    }
+                    i = i + 1;
+                }
+                val om: i64 = pe_ld(h + PE_H_SPM + o * 8);
+                val os: i64 = pe_ld(om);
+                pe_span_drop(h, o);
+                pe_sys(PE_SYS_MUNMAP, om, os, 0);
+            }
+            val at: i64 = pe_ld(h + PE_H_SPN);
+            if at < PE_SPAN_N {
+                pe_st(m + 8, pe_freed() + PE_LARGE);
+                pe_st(h + PE_H_SPM + at * 8, m);
+                pe_st(h + PE_H_SPAT + at * 8, now);
+                pe_st(h + PE_H_SPN, at + 1);
+                pe_st(h + PE_H_SPB, pe_ld(h + PE_H_SPB) + span);
+                return;
+            }
+        }
+    }
+    pe_sys(PE_SYS_MUNMAP, m, span, 0);
+}
+
+/// A large block of n bytes (over 1 MB with its header): a mapping of its
+/// own, [size][header] then the payload, or a cached span zeroed in the
+/// bytes asked for (to 16: nothing reads a block past its size).
+fn pe_large_alloc(n: i64) -> i64 {
+    var total: i64 = (n + 16 + 4095) & (0 - 4096);
+    val h: i64 = pe_heap();
+    val now: i64 = pe_ms(h);
+    if now - pe_ld(h + PE_H_BT0) > PE_SPAN_WARM_MS {
+        pe_st(h + PE_H_BT0, now);
+        pe_st(h + PE_H_BCNT, 0);
+    }
+    pe_st(h + PE_H_BCNT, pe_ld(h + PE_H_BCNT) + 1);
+    var big: i64 = 0;
+    if pe_ld(h + PE_H_SPN) != 0 {
+        big = pe_span_take(h, total);
+    }
+    if big != 0 {
+        total = pe_ld(big);
+        // roadmap P12: FID_MEM_LIMIT (sys.fd)
+        if lrt_lim_mem != 0 {
+            pe_lim_take_mt(total);
+        }
+        pe_zero(big + 16, (n + 15) & (0 - 16));
+    } else {
+        if lrt_lim_mem != 0 {
+            pe_lim_take_mt(total);
+        }
+        big = pe_mmap(total);
+        pe_st(big, total);
+    }
+    pe_st(big + 8, pe_magic() + PE_LARGE);
+    return big + 16;
 }
 
 // ─── RT7: chunks back to the system ─────────────────────────────────────
-// Every chunk pe_bump maps is in a table, [base, size, handed-out end] per
-// chunk, sorted by base (the current chunk's end is pe_heap_cur). pe_free_raw
-// counts the bytes on the free lists (pe_fl_bytes; a decommitted block is
-// not counted) and past pe_trim_next (8 MB, then what is left plus a
-// quarter, at least 8 MB) runs pe_trim: a chunk whose every handed-out byte
-// is on the free lists (one heap, one set of lists: then nothing in it is in
-// use) has its blocks taken off the lists and is unmapped, but the current
-// chunk and the two highest empty ones, for the next blocks.
-// FID_MEM_RETURN=0 turns it off, as in the C runtime.
+// Every chunk pe_bump maps is in a table, [base, size, handed-out end,
+// live] per chunk (PE_CE bytes), sorted by base; live is 1 while a thread
+// bumps blocks out of it (its handed-out end is then that thread's
+// PE_H_CUR). pe_free_raw counts the bytes on its thread's lists (PE_H_FL; a
+// decommitted block is not counted) and past PE_H_TRIM (8 MB, then what is
+// left plus a quarter, at least 8 MB) runs pe_trim: a chunk no thread
+// bumps from whose every handed-out byte is on this thread's lists (then
+// nothing in it is in use, and no other thread has a block of it: a block
+// is on one list at most) has its blocks taken off the lists and is
+// unmapped, but the two highest empty ones, for the next blocks. As team
+// C's pe_ir allocator and the C runtime. FID_MEM_RETURN=0 turns it off, as
+// in the C runtime.
 
-var pe_heap_base: i64 = 0;  // the current chunk's base
 var pe_chunk_tab: i64 = 0;
 var pe_chunk_n: i64 = 0;
 var pe_chunk_cap: i64 = 0;
-var pe_fl_bytes: i64 = 0;
-var pe_trim_next: i64 = 8388608;
 var pe_mem_return: i64 = 0 - 1;  // 1 on, 0 off, -1 not read yet
 
 const PE_TRIM_MIN: i64 = 8388608;
 const PE_KEEP_FREE_CHUNKS: i64 = 2;
+const PE_CE: i64 = 32;
 
+/// A new live chunk in the table (under the heap lock).
 fn pe_chunk_add(base: i64, size: i64) {
     if pe_chunk_n == pe_chunk_cap {
         var cap: i64 = pe_chunk_cap * 2;
-        if cap < 170 {
-            cap = 170;
-        }  // 4080 bytes: a page
-        val t: i64 = pe_mmap(((cap * 24) + 4095) & (0 - 4096));
+        if cap < 128 {
+            cap = 128;
+        }  // 4096 bytes: a page
+        val t: i64 = pe_mmap(((cap * PE_CE) + 4095) & (0 - 4096));
         var c: i64 = 0;
-        while c < pe_chunk_n * 3 {
+        while c < pe_chunk_n * (PE_CE / 8) {
             pe_st(t + c * 8, pe_ld(pe_chunk_tab + c * 8));
             c = c + 1;
         }
         if pe_chunk_tab != 0 {
-            pe_sys(PE_SYS_MUNMAP, pe_chunk_tab, ((pe_chunk_cap * 24) + 4095) & (0 - 4096), 0);
+            pe_sys(PE_SYS_MUNMAP, pe_chunk_tab, ((pe_chunk_cap * PE_CE) + 4095) & (0 - 4096), 0);
         }
         pe_chunk_tab = t;
         pe_chunk_cap = cap;
     }
     // after every entry of a lower base
     var j: i64 = pe_chunk_n;
-    while j > 0 && pe_ld(pe_chunk_tab + (j - 1) * 24) > base {
-        pe_st(pe_chunk_tab + j * 24, pe_ld(pe_chunk_tab + (j - 1) * 24));
-        pe_st(pe_chunk_tab + j * 24 + 8, pe_ld(pe_chunk_tab + (j - 1) * 24 + 8));
-        pe_st(pe_chunk_tab + j * 24 + 16, pe_ld(pe_chunk_tab + (j - 1) * 24 + 16));
+    while j > 0 && pe_ld(pe_chunk_tab + (j - 1) * PE_CE) > base {
+        var w: i64 = 0;
+        while w < PE_CE {
+            pe_st(pe_chunk_tab + j * PE_CE + w, pe_ld(pe_chunk_tab + (j - 1) * PE_CE + w));
+            w = w + 8;
+        }
         j = j - 1;
     }
-    pe_st(pe_chunk_tab + j * 24, base);
-    pe_st(pe_chunk_tab + j * 24 + 8, size);
-    pe_st(pe_chunk_tab + j * 24 + 16, base);
+    pe_st(pe_chunk_tab + j * PE_CE, base);
+    pe_st(pe_chunk_tab + j * PE_CE + 8, size);
+    pe_st(pe_chunk_tab + j * PE_CE + 16, base);
+    pe_st(pe_chunk_tab + j * PE_CE + 24, 1);
     pe_chunk_n = pe_chunk_n + 1;
 }
 
-/// The handed-out end of the chunk at index i
+/// The handed-out end of the chunk at index i (a live one's: its end)
 fn pe_chunk_used(i: i64) -> i64 {
-    val base: i64 = pe_ld(pe_chunk_tab + i * 24);
-    if base == pe_heap_base {
-        return pe_heap_cur;
+    val e: i64 = pe_chunk_tab + i * PE_CE;
+    if pe_ld(e + 24) != 0 {
+        return pe_ld(e) + pe_ld(e + 8);
     }
-    return pe_ld(pe_chunk_tab + i * 24 + 16);
+    return pe_ld(e + 16);
 }
 
 /// The index of the chunk whose handed-out bytes hold address a; -1
@@ -265,7 +686,7 @@ fn pe_chunk_at(a: i64) -> i64 {
     var at: i64 = 0 - 1;
     while lo <= hi {
         val mid: i64 = lo + (hi - lo) / 2;
-        if pe_ld(pe_chunk_tab + mid * 24) <= a {
+        if pe_ld(pe_chunk_tab + mid * PE_CE) <= a {
             at = mid;
             lo = mid + 1;
         } else {
@@ -278,29 +699,27 @@ fn pe_chunk_at(a: i64) -> i64 {
     return 0 - 1;
 }
 
-fn pe_chunk_note_used(base: i64, used: i64) {
-    var i: i64 = 0;
-    while i < pe_chunk_n {
-        if pe_ld(pe_chunk_tab + i * 24) == base {
-            pe_st(pe_chunk_tab + i * 24 + 16, used);
-            return;
-        }
-        i = i + 1;
+/// The chunk at base stops being a thread's: handed out up to `used`
+/// (under the heap lock).
+fn pe_chunk_retire(base: i64, used: i64) {
+    val i: i64 = pe_chunk_at(base);
+    if i >= 0 && pe_ld(pe_chunk_tab + i * PE_CE) == base {
+        pe_st(pe_chunk_tab + i * PE_CE + 16, used);
+        pe_st(pe_chunk_tab + i * PE_CE + 24, 0);
     }
 }
 
-/// Is the chunk at index i, with `free` of its bytes on the free lists,
-/// empty (and not the current one)?
+/// Is the chunk at index i, with `free` of its bytes on the lists looked
+/// at, empty (and no thread's)?
 fn pe_chunk_empty(i: i64, free: i64) -> bool {
-    val base: i64 = pe_ld(pe_chunk_tab + i * 24);
-    if base == pe_heap_base {
+    val e: i64 = pe_chunk_tab + i * PE_CE;
+    if pe_ld(e + 24) != 0 {
         return false;
     }
-    return free == pe_ld(pe_chunk_tab + i * 24 + 16) - base;
+    return free == pe_ld(e + 16) - pe_ld(e) - PE_CHUNK_SKIP;
 }
 
-/// Empty chunks back to the system (under the heap lock once threads run)
-fn pe_trim() {
+fn pe_mem_return_on() -> bool {
     if pe_mem_return < 0 {
         pe_mem_return = 1;
         val e: i64 = pe_env_raw("FID_MEM_RETURN" as i64);
@@ -308,22 +727,50 @@ fn pe_trim() {
             pe_mem_return = 0;
         }
     }
-    if pe_mem_return == 0 {
-        pe_trim_next = 0x7FFFFFFFFFFFFFFF;
+    return pe_mem_return != 0;
+}
+
+/// Heap h passed its threshold: stale cached spans and empty chunks back to
+/// the system, the next threshold.
+fn pe_trim(h: i64) {
+    // (and no trim inside this one: the clock may allocate, --nat Windows)
+    pe_st(h + PE_H_TRIM, 0x7FFFFFFFFFFFFFFF);
+    if pe_ld(h + PE_H_SPN) != 0 {
+        pe_span_purge(h, pe_ms(h), false);
+    }
+    // FID_MEM_RETURN=0: never again
+    if !pe_mem_return_on() {
         return;
+    }
+    pe_trim_keep(h, PE_KEEP_FREE_CHUNKS, true);
+    val fl: i64 = pe_ld(h + PE_H_FL);
+    var step: i64 = fl / 4;
+    if step < PE_TRIM_MIN {
+        step = PE_TRIM_MIN;
+    }
+    pe_st(h + PE_H_TRIM, fl + step);
+}
+
+/// The chunks every handed-out byte of which is on heap h's lists, but the
+/// `keep` highest, unmapped (their blocks off the lists); `adopt`: the
+/// pool's lists become h's first. Takes the heap lock (the table is
+/// shared; h's lists are its thread's). Allocates nothing.
+fn pe_trim_keep(h: i64, keep: i64, adopt: bool) {
+    pe_glock();
+    if adopt && pe_pool != 0 && pe_ld(pe_pool + PE_H_ANY) != 0 {
+        pe_heap_splice(pe_pool, h);
     }
     val n: i64 = pe_chunk_n;
     if n == 0 {
-        pe_trim_next = pe_fl_bytes + PE_TRIM_MIN;
+        pe_gunlock();
         return;
     }
     val fb_size: i64 = ((n * 8) + 4095) & (0 - 4096);
     val fb: i64 = pe_mmap(fb_size);  // zeroed
-    val lists: i64 = pe_lists();
     // the free bytes of each chunk
     var k: i64 = 4;
     while k <= 20 {
-        var b: i64 = pe_ld(lists + k * 8);
+        var b: i64 = pe_ld(h + k * 8);
         while b != 0 {
             val at: i64 = pe_chunk_at(b - 8);
             if at >= 0 {
@@ -333,7 +780,7 @@ fn pe_trim() {
         }
         k = k + 1;
     }
-    // the empty ones (-1 from here: to unmap), but the last two
+    // the empty ones (-1 from here: to unmap), but the last `keep`
     var empty: i64 = 0;
     var i: i64 = 0;
     while i < n {
@@ -342,7 +789,7 @@ fn pe_trim() {
         }
         i = i + 1;
     }
-    var drop: i64 = empty - PE_KEEP_FREE_CHUNKS;
+    var drop: i64 = empty - keep;
     i = 0;
     while i < n && drop > 0 {
         if pe_chunk_empty(i, pe_ld(fb + i * 8)) {
@@ -352,10 +799,11 @@ fn pe_trim() {
         i = i + 1;
     }
     // their blocks off the free lists
+    var fl: i64 = pe_ld(h + PE_H_FL);
     k = 4;
     while k <= 20 {
         var prev: i64 = 0;
-        var b2: i64 = pe_ld(lists + k * 8);
+        var b2: i64 = pe_ld(h + k * 8);
         while b2 != 0 {
             val nx: i64 = pe_ld(b2);
             val at2: i64 = pe_chunk_at(b2 - 8);
@@ -363,10 +811,10 @@ fn pe_trim() {
                 if prev != 0 {
                     pe_st(prev, nx);
                 } else {
-                    pe_st(lists + k * 8, nx);
+                    pe_st(h + k * 8, nx);
                 }
-                if (pe_ld(b2 - 8) & PE_DECOMMITTED) == 0 {
-                    pe_fl_bytes = pe_fl_bytes - (1 << k);
+                if (pe_ld(b2 - 8) & (PE_DECOMMITTED + PE_ZERO)) == 0 {
+                    fl = fl - (1 << k);
                 }
             } else {
                 prev = b2;
@@ -375,18 +823,21 @@ fn pe_trim() {
         }
         k = k + 1;
     }
+    pe_st(h + PE_H_FL, fl);
     // unmapped, out of the table
     var w: i64 = 0;
     i = 0;
     while i < n {
-        val e2: i64 = pe_chunk_tab + i * 24;
+        val e2: i64 = pe_chunk_tab + i * PE_CE;
         if pe_ld(fb + i * 8) < 0 {
             pe_sys(PE_SYS_MUNMAP, pe_ld(e2), pe_ld(e2 + 8), 0);
         } else {
             if w != i {
-                pe_st(pe_chunk_tab + w * 24, pe_ld(e2));
-                pe_st(pe_chunk_tab + w * 24 + 8, pe_ld(e2 + 8));
-                pe_st(pe_chunk_tab + w * 24 + 16, pe_ld(e2 + 16));
+                var c: i64 = 0;
+                while c < PE_CE {
+                    pe_st(pe_chunk_tab + w * PE_CE + c, pe_ld(e2 + c));
+                    c = c + 8;
+                }
             }
             w = w + 1;
         }
@@ -394,15 +845,12 @@ fn pe_trim() {
     }
     pe_chunk_n = w;
     pe_sys(PE_SYS_MUNMAP, fb, fb_size, 0);
-    var step: i64 = pe_fl_bytes / 4;
-    if step < PE_TRIM_MIN {
-        step = PE_TRIM_MIN;
-    }
-    pe_trim_next = pe_fl_bytes + step;
+    pe_gunlock();
 }
 
 var pe_mt: i64 = 0;  // 1 once threads may run
 var pe_heap_lock: i64 = 0;  // *i64
+var pe_lim_lock: i64 = 0;  // *i64: FID_MEM_LIMIT's count (sys.fd lrt_lim_used)
 
 /// A spinlock word: 0 free, 1 held.
 fn pe_lock(l: i64) {
@@ -415,38 +863,87 @@ fn pe_unlock(l: i64) {
     nat_atomic_store(l, 0);
 }
 
-/// Before a second thread can start: the heap gets its lock. Called by
-/// the only thread there is.
+/// The heap lock, once threads may run.
+fn pe_glock() {
+    if pe_mt != 0 {
+        pe_lock(pe_heap_lock);
+    }
+}
+
+fn pe_gunlock() {
+    if pe_mt != 0 {
+        pe_unlock(pe_heap_lock);
+    }
+}
+
+/// Before a second thread can start: the locks, and the first thread's
+/// block keeps pe_h0 as its heap. Called by the only thread there is.
 fn pe_mt_on() {
     if pe_mt == 0 {
-        pe_heap_lock = pe_bump(16);
-        pe_st(pe_heap_lock, 0);
+        val locks: i64 = pe_mmap(4096);
+        pe_heap_lock = locks;
+        pe_lim_lock = locks + 64;
+        val h: i64 = pe_heap();
+        var t: i64 = nat_tls_get();
+        if t == 0 {
+            t = pe_tls();
+        }
+        pe_st(t + PE_TLS_HEAP, h);
         pe_mt = 1;
     }
+}
+
+/// roadmap P12: FID_MEM_LIMIT's count (sys.fd pe_lim_take / pe_lim_give),
+/// under a lock of its own once threads run (the heaps take none). Past the
+/// limit one thread reports (pe_lim_take: the message, exit code 125), the
+/// others wait for it to end the process; the report runs outside the lock,
+/// as printing allocates on some layers (--nat Windows) and an allocation
+/// takes the lock again (the reporting thread's own goes through).
+fn pe_lim_take_mt(n: i64) {
+    if pe_mt == 0 {
+        pe_lim_take(n);
+        return;
+    }
+    pe_lock(pe_lim_lock);
+    if lrt_lim_used + n <= lrt_lim_mem {
+        lrt_lim_used = lrt_lim_used + n;
+        pe_unlock(pe_lim_lock);
+        return;
+    }
+    pe_unlock(pe_lim_lock);
+    var me: i64 = nat_tls_get();
+    if me == 0 {
+        me = 1;
+    }
+    val rep: i64 = pe_lim_lock + 8;
+    if nat_atomic_cas(rep, 0, me) == 0 && nat_atomic_load(rep) != me {
+        while true {
+            pe_sys(124, 0, 0, 0);
+        }  // sched_yield until the exit
+    }
+    pe_lim_take(n);
+}
+
+fn pe_lim_give_mt(n: i64) {
+    if pe_mt == 0 {
+        pe_lim_give(n);
+        return;
+    }
+    pe_lock(pe_lim_lock);
+    pe_lim_give(n);
+    pe_unlock(pe_lim_lock);
 }
 
 pub fn pert_malloc(size: i64) -> i64 {
     if lrt_mem_mode != 0 {
         return pe_dbg_malloc(size, nat_frame_fp());
     }
-    if pe_mt == 0 {
-        return pe_malloc_raw(size);
-    }
-    pe_lock(pe_heap_lock);
-    var r: i64 = pe_malloc_raw(size);
-    pe_unlock(pe_heap_lock);
-    return r;
+    return pe_malloc_raw(size);
 }
 
-/// A block of the normal allocator, under the heap lock once threads run.
+/// A block of the normal allocator.
 fn pe_plain_malloc(n: i64) -> i64 {
-    if pe_mt == 0 {
-        return pe_malloc_raw(n);
-    }
-    pe_lock(pe_heap_lock);
-    var r: i64 = pe_malloc_raw(n);
-    pe_unlock(pe_heap_lock);
-    return r;
+    return pe_malloc_raw(n);
 }
 
 // ─── RL16: --checked-alloc and --leaks ──────────────────────────────────
@@ -745,8 +1242,11 @@ fn pe_dbg_malloc(size: i64, fp: i64) -> i64 {
     return p;
 }
 
-/// pe_free_raw of a debug block (under the heap lock once threads run).
+/// pe_free_raw of a debug block. RT8: the lists it is on (--leaks, the
+/// memory profile, CM9's table) are shared: under the heap lock once
+/// threads run; the block under it goes back to this thread's heap.
 fn pe_dbg_free(p: i64) {
+    pe_glock();
     // L7C: a block the memory profile counted is no longer live
     if (pe_ld(p - 80) & 2) != 0 {
         lrt_mp_frees = lrt_mp_frees + 1;
@@ -771,11 +1271,12 @@ fn pe_dbg_free(p: i64) {
     pe_st(p - 8, pe_freed() + PE_DBG);
     var base: i64 = pe_ld(p - 48);
     var span: i64 = pe_ld(p - 40);
-    // CM9: its entry says freed (the caller holds the heap lock)
+    // CM9: its entry says freed
     var ck_ix: i64 = pe_ld(p - 56);
     if ck_ix > 0 && ck_ix <= lrt_ck_n {
         pe_st(lrt_ck_tab + (ck_ix - 1) * LRT_CK_ENT + 40, 1);
     }
+    pe_gunlock();
     if span > 0 {
         // inaccessible for good, a page at a time (the Windows layer takes
         // a longer PROT_NONE region for a stack guard)
@@ -1058,6 +1559,10 @@ fn pe_mem_report() {
     }
 }
 
+/// RT8: a block from this thread's heap, no lock: the head of its list of
+/// the class, else the pool's lists (threads that ended), else bumped out of
+/// its chunk; a large one (pe_large_alloc) of its own mapping or the span
+/// cache.
 fn pe_malloc_raw(size: i64) -> i64 {
     var n: i64 = size;
     if n < 0 {
@@ -1065,44 +1570,51 @@ fn pe_malloc_raw(size: i64) -> i64 {
     }
     var need: i64 = n + 8;
     if need > 1048576 {
-        var total: i64 = (n + 16 + 4095) & (0 - 4096);
-        // roadmap P12: FID_MEM_LIMIT (sys.fd)
-        if lrt_lim_mem != 0 {
-            pe_lim_take(total);
-        }
-        var big: i64 = pe_mmap(total);
-        pe_st(big, total);
-        pe_st(big + 8, pe_magic() + PE_LARGE);
-        return big + 16;
+        return pe_large_alloc(n);
     }
     var k: i64 = 4;
     while (1 << k) < need {
         k = k + 1;
     }
+    // roadmap P12: FID_MEM_LIMIT (sys.fd)
     if lrt_lim_mem != 0 {
-        pe_lim_take(1 << k);
+        pe_lim_take_mt(1 << k);
     }
-    var lists: i64 = pe_lists();
-    var head: i64 = pe_ld(lists + k * 8);
-    if head != 0 {
-        val was: i64 = pe_ld(head - 8);
-        pe_st(lists + k * 8, pe_ld(head));
-        pe_st(head - 8, pe_magic() + k);
-        if (was & PE_DECOMMITTED) != 0 {
-            // RT7: its inside pages are fresh zero pages: clear around them
-            val lo: i64 = pe_page_lo(head);
-            val hi: i64 = pe_page_hi(head, 1 << k);
-            pe_zero(head, lo - head);
-            pe_zero(hi, head - 8 + (1 << k) - hi);
-        } else {
-            pe_fl_bytes = pe_fl_bytes - (1 << k);
-            pe_zero(head, (1 << k) - 8);
+    val h: i64 = pe_heap();
+    var head: i64 = pe_ld(h + k * 8);
+    if head == 0 {
+        if pe_pool != 0 && pe_pool_adopt(h, k) {
+            head = pe_ld(h + k * 8);
         }
-        return head;
+        if head == 0 {
+            var b: i64 = pe_bump(h, 1 << k);
+            pe_st(b, pe_magic() + k);
+            return b + 8;
+        }
     }
-    var b: i64 = pe_bump(1 << k);
-    pe_st(b, pe_magic() + k);
-    return b + 8;
+    val was: i64 = pe_ld(head - 8);
+    pe_st(h + k * 8, pe_ld(head));
+    pe_st(head - 8, pe_magic() + k);
+    if (was & PE_DECOMMITTED) != 0 {
+        // RT7: its inside pages are fresh zero pages: clear around them
+        val lo: i64 = pe_page_lo(head);
+        val hi: i64 = pe_page_hi(head, 1 << k);
+        pe_zero(head, lo - head);
+        pe_zero(hi, head - 8 + (1 << k) - hi);
+    } else if (was & PE_ZERO) != 0 {
+        // RT8: cut from fresh pages (pe_carve_tail): zero but the link
+        pe_st(head, 0);
+    } else {
+        // RT8: the bytes asked for (to 16), not the whole class, as the
+        // C runtime: nothing reads a block past its size
+        pe_st(h + PE_H_FL, pe_ld(h + PE_H_FL) - (1 << k));
+        var zn: i64 = (n + 15) & (0 - 16);
+        if zn > (1 << k) - 8 {
+            zn = (1 << k) - 8;
+        }
+        pe_zero(head, zn);
+    }
+    return head;
 }
 
 pub fn pert_alloc(size: i64) -> i64 {
@@ -1116,19 +1628,16 @@ pub fn pert_free(p: i64) {
     if p == 0 {
         return;
     }
-    if pe_mt == 0 {
-        pe_free_raw(p);
-        return;
-    }
-    pe_lock(pe_heap_lock);
     pe_free_raw(p);
-    pe_unlock(pe_heap_lock);
 }
 
+/// RT8: onto this thread's heap, no lock (a block another thread allocated
+/// too, as the C runtime and pe_ir do); a large block to the span cache or
+/// the system.
 fn pe_free_raw(p: i64) {
-    var h: i64 = pe_ld(p - 8);
-    var k: i64 = h & 255;
-    var magic: i64 = h - k;
+    var hd: i64 = pe_ld(p - 8);
+    var k: i64 = hd & 255;
+    var magic: i64 = hd - k;
     if magic == pe_freed() {
         pert_panic("Double free" as i64);
     }
@@ -1141,28 +1650,29 @@ fn pe_free_raw(p: i64) {
     }
     if k == PE_LARGE {
         if lrt_lim_mem != 0 {
-            pe_lim_give(pe_ld(p - 16));
+            pe_lim_give_mt(pe_ld(p - 16));
         }
-        pe_sys(PE_SYS_MUNMAP, p - 16, pe_ld(p - 16), 0);
+        pe_span_free(pe_heap(), p - 16);
         return;
     }
     // roadmap P12: FID_MEM_LIMIT (sys.fd)
     if lrt_lim_mem != 0 {
-        pe_lim_give(1 << k);
+        pe_lim_give_mt(1 << k);
     }
     var mark: i64 = 0;
     if k >= PE_DECOMMIT_K && pe_decommit(p, 1 << k) {
         mark = PE_DECOMMITTED;
     }
     pe_st(p - 8, pe_freed() + k + mark);
-    var lists: i64 = pe_lists();
-    pe_st(p, pe_ld(lists + k * 8));
-    pe_st(lists + k * 8, p);
+    val h: i64 = pe_heap();
+    pe_st(p, pe_ld(h + k * 8));
+    pe_st(h + k * 8, p);
     // RT7: past the threshold, empty chunks go back to the system
     if mark == 0 {
-        pe_fl_bytes = pe_fl_bytes + (1 << k);
-        if pe_fl_bytes > pe_trim_next {
-            pe_trim();
+        val fl: i64 = pe_ld(h + PE_H_FL) + (1 << k);
+        pe_st(h + PE_H_FL, fl);
+        if fl > pe_ld(h + PE_H_TRIM) {
+            pe_trim(h);
         }
     }
 }
@@ -1176,6 +1686,8 @@ fn pe_free_raw(p: i64) {
 // reuse clears only the bytes around them.
 const PE_DECOMMIT_K: i64 = 18;
 const PE_DECOMMITTED: i64 = 64;
+// RT8: a free block cut from a chunk's fresh pages (pe_carve_tail)
+const PE_ZERO: i64 = 128;
 
 // The range is aligned to 64 KB, a multiple of every page size these
 // targets have (4 KB; 16 KB on Apple Silicon and some AArch64 Linux; 64 KB
@@ -1361,7 +1873,8 @@ pub fn pe_rt_exit(code: i64) {
 // scratch for the scheduler, [64] its own address (x86-64 reads the block
 // through fs: fs:[64]), [72] its worker index + 1 on a task worker (its
 // run-queue ring, conc.fd RT10), else 0, [80] the token slot of the code
-// outside tasks on this thread (conc.fd "Token slot", CA7/CA8).
+// outside tasks on this thread (conc.fd "Token slot", CA7/CA8), [88] its
+// heap (RT8, "Per-thread heaps"; 0 until its first allocation).
 
 const PE_SYS_FUTEX: i64 = 98;
 const PE_SYS_SIGALTSTACK: i64 = 132;
@@ -1370,8 +1883,8 @@ const PE_SYS_MPROTECT: i64 = 226;
 const PE_GUARD: i64 = 65536;
 
 fn pe_tls_new(glo: i64, ghi: i64) -> i64 {
-    var t: i64 = pert_malloc(88);
-    pe_zero(t, 88);
+    var t: i64 = pert_malloc(96);
+    pe_zero(t, 96);
     pe_st(t + 64, t);
     pe_st(t + 16, glo);
     pe_st(t + 24, ghi);
@@ -1381,6 +1894,12 @@ fn pe_tls_new(glo: i64, ghi: i64) -> i64 {
 /// This thread's block (made the first time a thread without one asks).
 fn pe_tls() -> i64 {
     var t: i64 = nat_tls_get();
+    // RT8: once threads run, a thread's first allocation gives it a block
+    // (pe_heap_attach) and keeps its heap there
+    if t == 0 && pe_mt != 0 {
+        pe_heap();
+        t = nat_tls_get();
+    }
     if t == 0 {
         t = pe_tls_new(0, 0);
         nat_tls_set(t);

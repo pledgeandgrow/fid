@@ -270,6 +270,21 @@ pub struct Memory {
     // A host string's address -> the address of the copy Memory_store_cstr
     // made of it (checked before reuse: Memory_cstr_cached)
     pub cstr_cache: I64Table,
+    // roadmap P12, FID_MEM_LIMIT under `fid run` (interp_lim_setup): the
+    // limit (0: none, and nothing below is kept), the live bytes of the
+    // program's heap as the C runtime counts them (each block Memory_alloc
+    // hands out while the limit is on counts what p_malloc of its size
+    // would, interp_lim_c_bytes, until Memory_free takes it back; a call's
+    // allocas, Memory_alloc_frame, are its stack and not counted), those
+    // bytes of each counted block (address -> Value::Int), and the first
+    // allocation past the limit: the bytes in use before it and its size
+    // (0: none yet; Interpreter_run_function stops the program once the
+    // instruction that made it is done).
+    pub lim_max: i64,
+    pub lim_used: i64,
+    pub lim_sizes: I64Table,
+    pub lim_hit_used: i64,
+    pub lim_hit_want: i64,
 }
 
 /// Size classes of Memory blocks: 8-byte steps up to 4096 bytes (classes
@@ -434,14 +449,72 @@ pub fn Memory_new() -> Memory {
         hi = hi + 1;
     }
     return Memory {
-        data: data, next_alloc: 0x1000, blocks: I64Table_new(), free_heads: heads, cstr_cache: I64Table_new()
+        data: data, next_alloc: 0x1000, blocks: I64Table_new(), free_heads: heads, cstr_cache: I64Table_new(), lim_max: 0, lim_used: 0, lim_sizes: I64Table_new(), lim_hit_used: 0, lim_hit_want: 0
     };
 }
 
 /// A zeroed block of at least `size` bytes, 8-byte aligned: a freed block
 /// of its size class when there is one, else new memory. 0 when the
-/// interpreter's memory (INTERP_MEM_LIMIT) is used up.
+/// interpreter's memory (INTERP_MEM_LIMIT) is used up. The block is the
+/// program's heap (FID_MEM_LIMIT counts it while it is live).
 pub fn Memory_alloc(self: &mut Memory, size: i64) -> i64 {
+    return Memory_alloc_in(self, size, true);
+}
+
+/// A block of a call's frame (an alloca): as Memory_alloc, but the stack,
+/// not the heap, so FID_MEM_LIMIT does not count it (C's frame is not
+/// counted either). Freed with Memory_free_frame.
+pub fn Memory_alloc_frame(self: &mut Memory, size: i64) -> i64 {
+    return Memory_alloc_in(self, size, false);
+}
+
+/// roadmap P12: what the C runtime's p_malloc(size) counts against
+/// FID_MEM_LIMIT (codegen_c.fd emit_limits_runtime and p_malloc): the size
+/// class of size + 8 (its header), a power of two from 16 or three
+/// quarters of one; past 1 MiB, the pages of its own mapping (the 8-byte
+/// header and three words before it, rounded up to 4 KiB pages).
+fn interp_lim_c_bytes(size: i64) -> i64 {
+    val total: i64 = size + 8;
+    if total > 1048576 {
+        return (total + 24 + 4095) / 4096 * 4096;
+    }
+    var sz: i64 = 16;
+    while sz < total {
+        sz = sz * 2;
+    }
+    if sz > 16 && total <= sz - sz / 4 {
+        sz = sz - sz / 4;
+    }
+    return sz;
+}
+
+/// roadmap P12: the block at `addr`, `size` bytes asked for, is live heap
+/// (FID_MEM_LIMIT is on): it counts what p_malloc(size) would in a
+/// compiled program. The first allocation that takes the program past the
+/// limit is noted (the bytes in use before it and what it asked for, as
+/// the C runtime reports them); the interpreter stops the program once the
+/// instruction that made it is done (Interpreter_lim_mem_over). The block
+/// is still handed out, so nothing in between reads a block that is not
+/// there.
+fn Memory_lim_take(self: &mut Memory, addr: i64, size: i64) {
+    val bytes: i64 = interp_lim_c_bytes(size);
+    if self.lim_hit_want == 0 {
+        // C checks a large block by its size with the header, then counts
+        // its mapping
+        var want: i64 = bytes;
+        if size + 8 > 1048576 {
+            want = size + 8;
+        }
+        if self.lim_used + want > self.lim_max {
+            self.lim_hit_used = self.lim_used;
+            self.lim_hit_want = want;
+        }
+    }
+    self.lim_used = self.lim_used + bytes;
+    I64Table_set(&mut self.lim_sizes, addr, Value::Int(bytes));
+}
+
+fn Memory_alloc_in(self: &mut Memory, size: i64, counted: bool) -> i64 {
     if size <= 0 {
         return self.next_alloc;
     }
@@ -462,6 +535,9 @@ pub fn Memory_alloc(self: &mut Memory, size: i64) -> i64 {
                 zi = zi + 1;
             }
             I64Table_set(&mut self.blocks, head, Value::Int(csize));
+            if counted && self.lim_max > 0 {
+                Memory_lim_take(self, head, size);
+            }
             return head;
         }
     }
@@ -486,14 +562,28 @@ pub fn Memory_alloc(self: &mut Memory, size: i64) -> i64 {
             i = i + 1;
         }
     }
+    if counted && self.lim_max > 0 {
+        Memory_lim_take(self, addr, size);
+    }
     return addr;
 }
 
 /// Free a block: it goes on its size class's free list (a block marked 1
 /// is never reused). A bad free fails as it does natively. Returns the
 /// panic message, "" when the free is fine. Interpreter_free_block also
-/// drops the side tables' entries for the block: free through it.
+/// drops the side tables' entries for the block: free through it. A block
+/// FID_MEM_LIMIT counted is taken off (also one marked 1: the program
+/// freed it, though the interpreter does not reuse it).
 pub fn Memory_free(self: &mut Memory, addr: i64) -> str {
+    return Memory_free_in(self, addr, true);
+}
+
+/// Free a block of a call's frame (Memory_alloc_frame): not counted.
+pub fn Memory_free_frame(self: &mut Memory, addr: i64) -> str {
+    return Memory_free_in(self, addr, false);
+}
+
+fn Memory_free_in(self: &mut Memory, addr: i64, counted: bool) -> str {
     var s: i64 = I64Table_find(&self.blocks, addr);
     if s < 0 {
         return "Invalid free: not an allocated block";
@@ -510,6 +600,22 @@ pub fn Memory_free(self: &mut Memory, addr: i64) -> str {
         }
     }
     I64Table_set(&mut self.blocks, addr, Value::Void);
+    if counted && self.lim_max > 0 {
+        match I64Table_get(&self.lim_sizes, addr) {
+            OptValue::Some(lv) => {
+                match lv {
+                    Value::Int(lb) => {
+                        self.lim_used = self.lim_used - lb;
+                    }
+                    _ => {
+                    }
+                }
+                I64Table_remove(&mut self.lim_sizes, addr);
+            }
+            OptValue::None => {
+            }
+        }
+    }
     if csize >= 8 {
         var cls: i64 = interp_mem_class(csize);
         if cls < self.free_heads.len() {
@@ -1187,7 +1293,7 @@ pub fn StrTable_set(t: &mut StrTable, key: str, val: i64) {
 
 fn Memory_clone(m: &Memory) -> Memory {
     return Memory {
-        data: m.data.clone(), next_alloc: m.next_alloc, blocks: I64Table_clone(&m.blocks), free_heads: m.free_heads.clone(), cstr_cache: I64Table_clone(&m.cstr_cache)
+        data: m.data.clone(), next_alloc: m.next_alloc, blocks: I64Table_clone(&m.blocks), free_heads: m.free_heads.clone(), cstr_cache: I64Table_clone(&m.cstr_cache), lim_max: m.lim_max, lim_used: m.lim_used, lim_sizes: I64Table_clone(&m.lim_sizes), lim_hit_used: m.lim_hit_used, lim_hit_want: m.lim_hit_want
     };
 }
 
@@ -1494,6 +1600,16 @@ pub fn Interpreter_free_block(self: &mut Interpreter, addr: i64) -> str {
         Interpreter_clear_block_side(self, addr, bsize);
     }
     return Memory_free(&mut self.memory, addr);
+}
+
+/// Free a dead alloca of a returning call (Memory_alloc_frame): as
+/// Interpreter_free_block, but its bytes were never the heap's.
+pub fn Interpreter_free_frame_block(self: &mut Interpreter, addr: i64) -> str {
+    var bsize: i64 = Memory_block_size(&self.memory, addr);
+    if bsize > 0 {
+        Interpreter_clear_block_side(self, addr, bsize);
+    }
+    return Memory_free_frame(&mut self.memory, addr);
 }
 
 // OptValue for opaque lookups
@@ -2134,6 +2250,15 @@ pub fn Interpreter_run_function(self: &mut Interpreter, func: IrFunction, args: 
                     break;
                 }
             }
+            // roadmap P12: FID_CPU_LIMIT, read every INTERP_LIM_CPU_EVERY
+            // instructions (interp_lim_cpu_check stops the program past it)
+            if g_ilim_cpu_ms > 0 {
+                g_ilim_cpu_tick = g_ilim_cpu_tick + 1;
+                if g_ilim_cpu_tick >= INTERP_LIM_CPU_EVERY {
+                    g_ilim_cpu_tick = 0;
+                    Interpreter_lim_cpu_check(self);
+                }
+            }
 
             if self.cov_on {
                 var ck: str = func.name + "#" + int_to_str(inst_id);
@@ -2183,6 +2308,11 @@ pub fn Interpreter_run_function(self: &mut Interpreter, func: IrFunction, args: 
                         }
                     }
                     var outcome: ExecOutcome = Interpreter_execute_inst(self, inst, inst_id, values, &func);
+                    // roadmap P12: the instruction took the program's heap
+                    // past FID_MEM_LIMIT (Memory_lim_take)
+                    if self.memory.lim_hit_want != 0 {
+                        Interpreter_lim_mem_over(self);
+                    }
                     match outcome {
                         ExecOutcome::Continue => {
                         }
@@ -2296,7 +2426,7 @@ pub fn Interpreter_run_function(self: &mut Interpreter, func: IrFunction, args: 
     // nothing returned points here.
     while self.frame_allocas.len() > frame_mark {
         var dead_slot: i64 = self.frame_allocas.pop();
-        Interpreter_free_block(self, dead_slot);
+        Interpreter_free_frame_block(self, dead_slot);
     }
 
     return result;
@@ -2672,7 +2802,8 @@ pub fn Interpreter_execute_inst(self: &mut Interpreter, inst: Inst, inst_id: i64
                     return ExecOutcome::Panic("Memory limit exceeded");
                 }
             }
-            var addr: i64 = Memory_alloc(&mut self.memory, size);
+            // the call's frame: not the heap FID_MEM_LIMIT counts
+            var addr: i64 = Memory_alloc_frame(&mut self.memory, size);
             if addr == 0 {
                 self.panic_stack_trace = OptStr::Some(Interpreter_format_call_stack(self));
                 return ExecOutcome::Panic("Out of memory: the interpreter holds at most " + int_to_str(INTERP_MEM_LIMIT) + " bytes");
@@ -5514,7 +5645,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: &mut Ve
         if args.len() > 1 {
             right = Interpreter_value_to_string(self, args.get(1));
         }
-        return ExecOutcome::Value(Value::Str(left + right));
+        return ExecOutcome::Value(Value::Str(Interpreter_lim_str(self, left + right)));
     }
     // SL15: the profiler a program drives (stdlib/profiler.fd prof_*). The
     // interpreter has no sampler: it counts calls (interp_prof_count)
@@ -5570,7 +5701,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: &mut Ve
             al = Interpreter_value_to_string(self, args.get(args.len() - 2));
             ar = Interpreter_value_to_string(self, args.get(args.len() - 1));
         }
-        return ExecOutcome::Value(Value::Str(al + ar));
+        return ExecOutcome::Value(Value::Str(Interpreter_lim_str(self, al + ar)));
     }
     // `s + int_to_str(n)` fused by the lowering (core's p_str_concat_int):
     // on the interpreter's own strings, as p_str_concat
@@ -5587,7 +5718,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: &mut Ve
                 }
             }
         }
-        return ExecOutcome::Value(Value::Str(cl + int_to_str(cn)));
+        return ExecOutcome::Value(Value::Str(Interpreter_lim_str(self, cl + int_to_str(cn))));
     }
     if name == "p_to_str" {
         if args.len() > 0 {
@@ -7046,7 +7177,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: &mut Ve
         if args.len() >= 2 {
             var left: str = Interpreter_value_to_string(self, args.get(0));
             var right: str = Interpreter_value_to_string(self, args.get(1));
-            return ExecOutcome::Value(Value::Str(left + right));
+            return ExecOutcome::Value(Value::Str(Interpreter_lim_str(self, left + right)));
         }
         return ExecOutcome::Value(Value::Str(""));
     }
@@ -7243,7 +7374,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: &mut Ve
                 _ => {
                 }
             }
-            return ExecOutcome::Value(Value::Str(str_repeat(s, n)));
+            return ExecOutcome::Value(Value::Str(Interpreter_lim_str(self, str_repeat(s, n))));
         }
         return ExecOutcome::Value(Value::Str(""));
     }
@@ -9738,11 +9869,357 @@ pub fn interpret_with_options_full2(module: IrModule, verbose: bool, release: bo
 }
 
 // ===========================================================================
+// Run-time resource limits of the interpreted program (roadmap P12)
+// ===========================================================================
+// `fid run` applies FID_MEM_LIMIT and FID_CPU_LIMIT as a program built
+// through C does (codegen_c.fd emit_limits_runtime): same variables,
+// messages and exit codes; read when the program starts (interp_lim_setup,
+// after it is compiled), so a malformed value stops it with exit code 2.
+//   FID_MEM_LIMIT=<bytes>[K|M|G]: the live bytes of the program's heap,
+//     in the sense of the C runtime's count: every block of the
+//     interpreter's memory that the program's p_malloc takes, and those
+//     the interpreter takes for the program's values (a Vec's header and
+//     buffer, a string stored in memory, a map), count while they are live
+//     what p_malloc of the same size counts in a compiled program (its
+//     size class, interp_lim_c_bytes); p_free (and anything that frees a block) takes
+//     them off, so allocating and freeing in a loop does not reach the
+//     limit. A call's allocas are its stack frame, not counted (C's frame
+//     is not either); nor are the string literals and globals laid out
+//     before the program starts. A string the interpreter holds as its own
+//     value counts once it is stored in memory; building one larger than
+//     what is left of the limit stops the program too. Past the limit:
+//     "fid: memory limit of N bytes exceeded (FID_MEM_LIMIT): U bytes in
+//     use, A more asked for", the interpreted stack trace, exit code 125,
+//     once the instruction that allocated is done.
+//   FID_CPU_LIMIT=<seconds>: the CPU time of the interpreted program, that
+//     is of the fid process from the moment the program starts (compiling
+//     it is not counted), read every INTERP_LIM_CPU_EVERY instructions
+//     (GetProcessTimes on Windows, clock_gettime's process CPU clock on
+//     Linux and macOS). Past it: "fid: CPU time limit of S seconds
+//     exceeded (FID_CPU_LIMIT)", exit code 124.
+// Unset, empty or 0: no limit. `fid run --max-mem <bytes[K|M|G]>
+// --cpu-limit <seconds>` give the limits when the variable is not set, as
+// they do for `fid ccompile` (interp_limit_defaults); a set variable wins.
+//
+// INTERP_MEM_LIMIT is another limit: how much simulated memory the
+// interpreter has at all (127 MB of the program's bytes, 1 GB of the
+// host's). Everything in it counts there, allocas and literals included,
+// and its blocks are only reused, never given back; past it an allocation
+// panics ("p_malloc: OOM ..."). So a FID_MEM_LIMIT at or above about 127 MB
+// is never reached under `fid run`: INTERP_MEM_LIMIT stops the program
+// first. The older `fid run --max-memory <MB>` compares the top of that
+// memory (next_alloc) with its limit when an alloca is made.
+//
+// fid itself must be built with -DP_NO_ENV_LIMITS (scripts/bootstrap.sh,
+// build-selfhost.sh), or its own C runtime applies the variables to the
+// whole fid process, compiling included.
+
+const INTERP_LIM_CPU_EVERY: i64 = 4096;
+var g_ilim_cpu_ms: i64 = 0;  // the CPU time limit in ms; 0: none
+var g_ilim_cpu_from: i64 = 0;  // the process's CPU time (ms) at the start
+var g_ilim_cpu_text: str = "";  // the limit as the message gives it
+var g_ilim_cpu_tick: i64 = 0;  // instructions since the last reading
+var g_ilim_def_mem: i64 = 0;  // `fid run --max-mem` in bytes; 0: none
+var g_ilim_def_cpu_ms: i64 = 0;  // `fid run --cpu-limit` in ms; 0: none
+
+// SAFETY: declared by the headers every generated C file includes
+// (<windows.h> on Windows, <time.h> elsewhere; `<stdint.h>` only keeps
+// the C backend from writing a prototype of its own); native Linux builds
+// run linux_runtime's pert_c_clock_gettime. The arguments are the
+// addresses of blocks interp_cpu_ms allocates, larger than what is written
+// there. Only the @cfg function of the host calls them.
+extern "C" include "<stdint.h>" {
+    fn GetProcessTimes as ilim_proc_times(process: i64, created: i64, exited: i64, kernel: i64, user: i64) -> i32;
+    fn clock_gettime as ilim_clock_gettime(clock: i64, ts: i64) -> i32;
+}
+
+/// The limits `fid run --max-mem` / `--cpu-limit` give (bytes, ms; 0:
+/// none): used when FID_MEM_LIMIT / FID_CPU_LIMIT is not set.
+pub fn interp_limit_defaults(mem_bytes: i64, cpu_ms: i64) {
+    g_ilim_def_mem = mem_bytes;
+    g_ilim_def_cpu_ms = cpu_ms;
+}
+
+/// The CPU time of the fid process in ms (user plus kernel, every
+/// thread's): GetProcessTimes (the current process is handle -1).
+@cfg(windows)
+fn interp_cpu_ms() -> i64 {
+    var ms: i64 = 0;
+    // SAFETY: a 32-byte block for the four 8-byte FILETIMEs, freed here
+    unsafe {
+        val b: i64 = p_malloc(32);
+        if b != 0 {
+            if ilim_proc_times(0 - 1, b, b + 8, b + 16, b + 24) != 0 {
+                var kp: *mut i64 = b + 16;
+                var up: *mut i64 = b + 24;
+                ms = (*kp + *up) / 10000;
+            }
+            p_free(b);
+        }
+    }
+    return ms;
+}
+
+/// Linux: clock_gettime(CLOCK_PROCESS_CPUTIME_ID = 2) in ms (a timespec
+/// is two 8-byte words); 0 when it fails. Each system's variant stands
+/// alone, so no other system's build refers to clock_gettime.
+@cfg(linux)
+fn interp_cpu_ms() -> i64 {
+    var ms: i64 = 0;
+    // SAFETY: a 32-byte block for the 16-byte timespec, freed here
+    unsafe {
+        val b: i64 = p_malloc(32);
+        if b != 0 {
+            if ilim_clock_gettime(2, b) == 0 {
+                var sp: *mut i64 = b;
+                var np: *mut i64 = b + 8;
+                ms = *sp * 1000 + *np / 1000000;
+            }
+            p_free(b);
+        }
+    }
+    return ms;
+}
+
+/// macOS: clock_gettime(CLOCK_PROCESS_CPUTIME_ID = 12), as on Linux.
+@cfg(macos)
+fn interp_cpu_ms() -> i64 {
+    var ms: i64 = 0;
+    // SAFETY: a 32-byte block for the 16-byte timespec, freed here
+    unsafe {
+        val b: i64 = p_malloc(32);
+        if b != 0 {
+            if ilim_clock_gettime(12, b) == 0 {
+                var sp: *mut i64 = b;
+                var np: *mut i64 = b + 8;
+                ms = *sp * 1000 + *np / 1000000;
+            }
+            p_free(b);
+        }
+    }
+    return ms;
+}
+
+fn interp_lim_digit(s: str, i: i64) -> bool {
+    return i < str_len(s) && str_byte_at(s, i) >= 48 && str_byte_at(s, i) <= 57;
+}
+
+/// A limit's value as the C runtime reads it (__p_lim_parse: strtod, then
+/// with `units` a K, M or G and a B): leading white space, a sign, digits
+/// with a decimal point, an exponent. 0 for an empty string, -1 when it is
+/// not such a number (or negative, or followed by anything else).
+fn interp_lim_parse(s: str, units: bool) -> f64 {
+    val n: i64 = str_len(s);
+    if n == 0 {
+        return 0.0;
+    }
+    var i: i64 = 0;
+    while i < n && (str_byte_at(s, i) == 32 || (str_byte_at(s, i) >= 9 && str_byte_at(s, i) <= 13)) {
+        i = i + 1;
+    }
+    var neg: bool = false;
+    if i < n && (str_byte_at(s, i) == 43 || str_byte_at(s, i) == 45) {
+        neg = str_byte_at(s, i) == 45;
+        i = i + 1;
+    }
+    var v: f64 = 0.0;
+    var digits: i64 = 0;
+    while interp_lim_digit(s, i) {
+        v = v * 10.0 + ((str_byte_at(s, i) - 48) as f64);
+        i = i + 1;
+        digits = digits + 1;
+    }
+    if i < n && str_byte_at(s, i) == 46 {
+        i = i + 1;
+        var scale: f64 = 0.1;
+        while interp_lim_digit(s, i) {
+            v = v + ((str_byte_at(s, i) - 48) as f64) * scale;
+            scale = scale / 10.0;
+            i = i + 1;
+            digits = digits + 1;
+        }
+    }
+    if digits == 0 {
+        return 0.0 - 1.0;
+    }
+    // an exponent only with digits after it (else strtod stops at the e)
+    if i < n && (str_byte_at(s, i) == 101 || str_byte_at(s, i) == 69) {
+        var j: i64 = i + 1;
+        var eneg: bool = false;
+        if j < n && (str_byte_at(s, j) == 43 || str_byte_at(s, j) == 45) {
+            eneg = str_byte_at(s, j) == 45;
+            j = j + 1;
+        }
+        if interp_lim_digit(s, j) {
+            var e: i64 = 0;
+            while interp_lim_digit(s, j) {
+                if e < 400 {
+                    e = e * 10 + (str_byte_at(s, j) - 48);
+                }
+                j = j + 1;
+            }
+            var k: i64 = 0;
+            while k < e && k < 400 {
+                if eneg {
+                    v = v / 10.0;
+                } else {
+                    v = v * 10.0;
+                }
+                k = k + 1;
+            }
+            i = j;
+        }
+    }
+    if neg && v > 0.0 {
+        return 0.0 - 1.0;
+    }
+    if units && i < n {
+        val u: i64 = str_byte_at(s, i);
+        if u == 75 || u == 107 {
+            v = v * 1024.0;
+            i = i + 1;
+        } else if u == 77 || u == 109 {
+            v = v * 1048576.0;
+            i = i + 1;
+        } else if u == 71 || u == 103 {
+            v = v * 1073741824.0;
+            i = i + 1;
+        }
+        if i < n && (str_byte_at(s, i) == 66 || str_byte_at(s, i) == 98) {
+            i = i + 1;
+        }
+    }
+    if i != n {
+        return 0.0 - 1.0;
+    }
+    return v;
+}
+
+/// `ms` milliseconds as seconds, as the C runtime prints a baked-in CPU
+/// limit ("%g": 2000 -> "2", 500 -> "0.5", 1250 -> "1.25").
+fn interp_lim_secs_text(ms: i64) -> str {
+    val whole: str = int_to_str(ms / 1000);
+    val frac: i64 = ms % 1000;
+    if frac == 0 {
+        return whole;
+    }
+    // 1000 + 250 = "1250": the three digits after the "1", then without
+    // their trailing zeros ("25")
+    var d: str = str_slice(int_to_str(1000 + frac), 1, 4);
+    while str_len(d) > 0 && str_byte_at(d, str_len(d) - 1) == 48 {
+        d = str_slice(d, 0, str_len(d) - 1);
+    }
+    return whole + "." + d;
+}
+
+/// The text of environment variable `name`, "" when it is not set.
+fn interp_lim_env(name: str) -> str {
+    match env_var(name) {
+        Option::Some(v) => {
+            return v;
+        }
+        Option::None => {
+        }
+    }
+    return "";
+}
+
+/// roadmap P12: read FID_MEM_LIMIT and FID_CPU_LIMIT (or the --max-mem /
+/// --cpu-limit defaults) for the program `self` is about to run. A value
+/// that is not a number stops fid with exit code 2, as a compiled program
+/// stops at start-up.
+pub fn interp_lim_setup(self: &mut Interpreter) {
+    g_ilim_cpu_ms = 0;
+    g_ilim_cpu_tick = 0;
+    var m: str = interp_lim_env("FID_MEM_LIMIT");
+    if str_len(m) == 0 && g_ilim_def_mem > 0 {
+        m = int_to_str(g_ilim_def_mem);
+    }
+    val mv: f64 = interp_lim_parse(m, true);
+    if mv < 0.0 {
+        p_eprint_str("fid: FID_MEM_LIMIT is not a size (bytes, or with K, M or G): '" + m + "'\n");
+        p_exit(2);
+    }
+    if mv > 0.0 {
+        var lim: i64 = 1;
+        if mv >= 9000000000000000000.0 {
+            lim = 9000000000000000000;
+        } else if mv >= 1.0 {
+            lim = mv as i64;
+        }
+        // counted from here: the blocks the program's run takes (not the
+        // literals Interpreter_new laid out, which a compiled program has
+        // in its image)
+        self.memory.lim_max = lim;
+        self.memory.lim_used = 0;
+        self.memory.lim_sizes = I64Table_new();
+        self.memory.lim_hit_used = 0;
+        self.memory.lim_hit_want = 0;
+    }
+    var t: str = interp_lim_env("FID_CPU_LIMIT");
+    if str_len(t) == 0 && g_ilim_def_cpu_ms > 0 {
+        t = interp_lim_secs_text(g_ilim_def_cpu_ms);
+    }
+    val tv: f64 = interp_lim_parse(t, false);
+    if tv < 0.0 {
+        p_eprint_str("fid: FID_CPU_LIMIT is not a number of seconds: '" + t + "'\n");
+        p_exit(2);
+    }
+    if tv <= 0.0 {
+        return;
+    }
+    var cpu_ms: i64 = 1;
+    if tv >= 9000000000000000.0 {
+        cpu_ms = 9000000000000000000;
+    } else if tv * 1000.0 >= 1.0 {
+        cpu_ms = (tv * 1000.0) as i64;
+    }
+    g_ilim_cpu_text = t;
+    g_ilim_cpu_from = interp_cpu_ms();
+    g_ilim_cpu_ms = cpu_ms;
+}
+
+/// FID_CPU_LIMIT: the program's CPU time so far against the limit.
+pub fn Interpreter_lim_cpu_check(self: &mut Interpreter) {
+    if interp_cpu_ms() - g_ilim_cpu_from >= g_ilim_cpu_ms {
+        p_eprint_str("fid: CPU time limit of " + g_ilim_cpu_text + " seconds exceeded (FID_CPU_LIMIT)\n");
+        p_exit(124);
+    }
+}
+
+/// FID_MEM_LIMIT: an allocation took the program past it (Memory_lim_take
+/// noted it): the C runtime's message, the interpreted stack, exit 125.
+pub fn Interpreter_lim_mem_over(self: &mut Interpreter) {
+    p_eprint_str("fid: memory limit of " + int_to_str(self.memory.lim_max) + " bytes exceeded (FID_MEM_LIMIT): " + int_to_str(self.memory.lim_hit_used) + " bytes in use, " + int_to_str(self.memory.lim_hit_want) + " more asked for\n");
+    val tr: str = Interpreter_format_call_stack(self);
+    if str_len(tr) > 0 {
+        p_eprint_str(tr);
+    }
+    p_exit(125);
+}
+
+/// FID_MEM_LIMIT and a string the interpreter builds as its own value
+/// (not in its memory yet): one that cannot fit beside what is in use (as
+/// its block, `len` + 17 bytes, would not in a compiled program) stops the
+/// program as an allocation past the limit does. Returns `s`.
+pub fn Interpreter_lim_str(self: &mut Interpreter, s: str) -> str {
+    if self.memory.lim_max > 0 && self.memory.lim_hit_want == 0 {
+        val want: i64 = interp_lim_c_bytes(str_len(s) + 17);
+        if self.memory.lim_used + want > self.memory.lim_max {
+            self.memory.lim_hit_used = self.memory.lim_used;
+            self.memory.lim_hit_want = want;
+        }
+    }
+    return s;
+}
+
+// ===========================================================================
 // interpret_ir_module -- run a pre-built IrModule, return exit code
 // ===========================================================================
 
 pub fn interpret_ir_module(ir_mod: IrModule) -> i64 {
     var interp_inst: Interpreter = Interpreter_new(ir_mod);
+    interp_lim_setup(&mut interp_inst);
     return Interpreter_run_and_print(&mut interp_inst);
 }
 
@@ -9760,6 +10237,8 @@ pub fn interpret_ir_module_with_options(ir_mod: IrModule, max_recursion: i64, ma
     if max_memory > 0 {
         Interpreter_set_max_memory(&mut interp_inst, max_memory);
     }
+    // roadmap P12: FID_MEM_LIMIT / FID_CPU_LIMIT
+    interp_lim_setup(&mut interp_inst);
     return Interpreter_run_and_print(&mut interp_inst);
 }
 
@@ -10209,6 +10688,17 @@ fn itask_mode() -> i64 {
     if g_itask_mode == 0 {
         g_itask_mode = 2;
         if g_rr_mode == 0 {
+            // RT10: one worker, so the C runtime's tasks share this thread
+            // as the interpreter's state needs (its default is a worker
+            // per CPU, tasks moving between them); asked by name before the
+            // first task, -1 from a runtime without workers
+            var wctl: str = "__p_co_workers";
+            var wr: i64 = p_thread_spawn(wctl, 1, 1);
+            if wr > 1 {
+                // tasks were started already, on several workers: they
+                // cannot share the interpreter, each runs to its end
+                return g_itask_mode;
+            }
             // p_co_stack by name: -1 from a runtime that has no such thing
             var ctl: str = "__p_co_stack";
             var r: i64 = p_thread_spawn(ctl, 1, ITASK_STACK);

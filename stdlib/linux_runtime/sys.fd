@@ -544,6 +544,14 @@ pub fn pert_c_getgid() -> i64 {
     return pe_sys(PE_SYS_GETGID, 0, 0, 0);
 }
 
+/// clock_gettime(clock, ts): the system call (0, or -errno where C gives
+/// -1). The compiler's interpreter reads its process CPU-time clock (2)
+/// through it for FID_CPU_LIMIT under `fid run` (interp.fd interp_cpu_ms),
+/// so a natively built fid needs no C library for it.
+pub fn pert_c_clock_gettime(clock: i64, ts: i64) -> i64 {
+    return pe_sys(PE_SYS_CLOCK_GETTIME, clock, ts, 0);
+}
+
 pub fn pert_c_getpagesize() -> i64 {
     return 4096;
 }
@@ -2356,8 +2364,9 @@ pub fn pert_c_fid_proc_spawn(argv_list: i64, env_list: i64, dir: i64, out: i64) 
 /// its stdout goes; a piped stream takes no file. Linux and macOS: each
 /// "pipe" is a connected AF_UNIX stream pair (pe_px_pairs: nat_ir's x86-64
 /// system call map has no pipe2 or dup3), placed at the child's descriptor
-/// 0 / 1 / 2 with fcntl(F_DUPFD) between fork and exec. --nat Windows has
-/// no pipes yet: a request for one fails (0).
+/// 0 / 1 / 2 with fcntl(F_DUPFD) between fork and exec. --nat Windows:
+/// CreatePipe pairs whose child ends are its standard handles (win.fd
+/// pe_win_spawn, pe_win_pipes); this process's ends are HANDLEs.
 pub fn pert_c_fid_proc_spawn_io(argv_list: i64, env_list: i64, dir: i64, out: i64, io: i64) -> i64 {
     return pe_px_spawn(argv_list, env_list, dir, out, io & 15);
 }
@@ -2559,12 +2568,11 @@ fn pe_px_spawn(argv_list: i64, env_list: i64, dir: i64, out: i64, io: i64) -> i6
     pe_st(rec + 40, 0 - 1);
     pe_st(rec + 48, 0 - 1);
     var ok: bool = false;
-    if nat_os() == 1 && (io & 7) != 0 {
-        // --nat Windows: no pipes yet (win.fd would need CreatePipe and
-        // SetHandleInformation among nat_ir's imports)
-        ok = false;
-    } else if nat_os() == 1 {
-        // --nat Windows: win.fd quotes the command line and starts it
+    if nat_os() == 1 {
+        // --nat Windows: win.fd quotes the command line and starts it;
+        // the io bits go in the record's word 1 (the pipes' ends come
+        // back in words 4 / 5 / 6), which is set to 0 below
+        pe_st(rec + 8, io);
         var wargv: i64 = pe_zeroed(av.len() + 1);
         var a: i64 = 0;
         while a < av.len() {
@@ -2794,7 +2802,13 @@ pub fn pert_c_fid_proc_write(h: i64, data: i64, n: i64) -> i64 {
     }
     var done: i64 = 0;
     while done < n {
-        val w: i64 = nat_syscall(PE_SYS_SENDTO, fd, data + done, n - done, 16384, 0, 0);
+        // --nat Windows: a pipe HANDLE, WriteFile (no SIGPIPE there)
+        var w: i64 = 0;
+        if nat_os() == 1 {
+            w = pe_sys(PE_SYS_WRITE, fd, data + done, n - done);
+        } else {
+            w = nat_syscall(PE_SYS_SENDTO, fd, data + done, n - done, 16384, 0, 0);
+        }
         if w == 0 - 4 {
         // EINTR: again
         } else if w <= 0 {
@@ -3688,13 +3702,15 @@ fn pe_main_stack_raise() {
 //   FID_CPU_LIMIT=<seconds>: the process's CPU time, every thread's. Linux:
 //     RLIMIT_CPU (whole seconds, rounded up) and SIGXCPU, which writes
 //     "fid: CPU time limit of S seconds exceeded (FID_CPU_LIMIT)" and exits
-//     with 124 (as `timeout`). macOS, WASI and `--nat` Windows: not
-//     enforced (their system-call layers have no CPU-time limit yet).
+//     with 124 (as `timeout`). `--nat` Windows: a watcher thread reading
+//     GetProcessTimes every 10 ms (win.fd pe_win_cpu_limit), the same
+//     message and exit code. macOS and WASI: not enforced (their
+//     system-call layers have no CPU-time limit yet).
 // Unset, empty or 0: no limit. A value that is not a number stops the
 // program at start-up with exit code 2, so a typo does not run unlimited.
 
 var lrt_lim_mem: i64 = 0;  // bytes; 0: no memory limit
-var lrt_lim_used: i64 = 0;  // live counted bytes (under the heap lock)
+var lrt_lim_used: i64 = 0;  // live counted bytes (base.fd pe_lim_take_mt: under pe_lim_lock)
 var lrt_lim_cpu_msg: i64 = 0;  // the CPU-limit message (0: no CPU limit)
 var lrt_lim_cpu_len: i64 = 0;
 const PE_SIGXCPU: i64 = 24;
@@ -3811,8 +3827,12 @@ fn pe_lim_init() {
     if ms == 0 {
         return;
     }
-    // Linux only (see above)
-    if nat_os() != 0 || nat_sig_handler() == 0 {
+    // Linux and --nat Windows only (see above)
+    val os: i64 = nat_os();
+    if os != 0 && os != 1 {
+        return;
+    }
+    if os == 0 && nat_sig_handler() == 0 {
         return;
     }
     var a: i64 = "fid: CPU time limit of " as i64;
@@ -3824,6 +3844,13 @@ fn pe_lim_init() {
     at = pe_lim_put(msg, at, b, pe_len(b));
     lrt_lim_cpu_len = at;
     lrt_lim_cpu_msg = msg;
+    if os == 1 {
+        // win.fd's watcher thread (PE_WSYS_CPU_LIMIT)
+        if nat_syscall(1015, ms, 0, 0, 0, 0, 0) != 0 {
+            lrt_lim_cpu_msg = 0;
+        }
+        return;
+    }
     if pe_sig_install(PE_SIGXCPU) != 0 {
         lrt_lim_cpu_msg = 0;
         return;
@@ -3841,8 +3868,8 @@ fn pe_lim_init() {
     pert_free(rl);
 }
 
-/// A block of n bytes is taken from FID_MEM_LIMIT (pe_malloc_raw, under
-/// the heap lock): past the limit, the program stops (exit code 125).
+/// A block of n bytes is taken from FID_MEM_LIMIT (pe_malloc_raw, through
+/// base.fd pe_lim_take_mt): past the limit, the program stops (exit code 125).
 /// Allocates nothing.
 fn pe_lim_take(n: i64) {
     if lrt_lim_used + n > lrt_lim_mem {
@@ -3859,7 +3886,7 @@ fn pe_lim_take(n: i64) {
     lrt_lim_used = lrt_lim_used + n;
 }
 
-/// A freed block's n bytes go back (pe_free_raw, under the heap lock). A
+/// A freed block's n bytes go back (pe_free_raw, pe_lim_give_mt). A
 /// block from before pe_lim_init was never counted: the count stays >= 0.
 fn pe_lim_give(n: i64) {
     lrt_lim_used = lrt_lim_used - n;
@@ -3868,8 +3895,9 @@ fn pe_lim_give(n: i64) {
     }
 }
 
-/// SIGXCPU of FID_CPU_LIMIT (pe_on_signal): the message, exit code 124.
-/// Allocates nothing.
+/// SIGXCPU of FID_CPU_LIMIT (pe_on_signal; --nat Windows: win.fd's
+/// watcher thread): the message, exit code 124. Allocates nothing (--nat
+/// Windows' WriteFile takes one word for its count).
 fn pe_lim_cpu_over() {
     pe_write_all(2, lrt_lim_cpu_msg, lrt_lim_cpu_len);
     pe_sys(PE_SYS_EXIT_GROUP, 124, 0, 0);
@@ -4339,7 +4367,10 @@ pub fn pe_prof_watch_main(id: i64) -> i64 {
         var due: bool = every > 0 && ticks >= every * 10;
         if pe_prof_dump_req != 0 || due {
             pe_prof_dump_req = 0;
-            ticks = 0;
+            // SL15: a report asked for (SIGUSR2) does not move the periodic one
+            if due {
+                ticks = 0;
+            }
             if pe_prof_on != 0 {
                 pe_prof_print();
             }

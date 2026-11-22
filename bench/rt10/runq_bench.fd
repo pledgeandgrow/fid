@@ -1,0 +1,100 @@
+// bench/rt10/runq_bench.fd — competitive RT10: the run queues alone. Making
+// and ending a task costs microseconds (its stack's pages: steal_bench's
+// ns per task are mostly that), so here `tasks` tasks are made once and each
+// yields `yields` times with `work` rounds of integer mixing between: every
+// yield is one push and one pop of a run queue (and a steal when a worker
+// runs dry). Prints the wall time per yield over all workers (lower is
+// better) and checks every task ran every round.
+//
+//   ./runq_bench [tasks] [yields] [work]        (default 2000 500 50)
+//   FIDES_RUNQ=shared ./runq_bench               the shared-lock queue
+//   FIDES_WORKERS=<n> ./runq_bench               n workers
+use task;
+use sync;
+
+var g_rounds: i64 = 0;
+var g_mix: i64 = 0;
+var g_yields: i64 = 500;
+var g_work: i64 = 50;
+
+@wrapping
+fn spin(seed: i64, rounds: i64) -> i64 {
+    var x: i64 = seed * 2654435761 + 1;
+    var i: i64 = 0;
+    while i < rounds {
+        x = (x ^ (x >> 13)) * 31 + i;
+        i = i + 1;
+    }
+    return x & 1023;
+}
+
+fn yielder(k: i64) -> i64 {
+    var m: i64 = 0;
+    var i: i64 = 0;
+    while i < g_yields {
+        m = m + spin(k + i, g_work);
+        task_yield();
+        i = i + 1;
+    }
+    sync_atomic_add(g_rounds, g_yields);
+    sync_atomic_add(g_mix, m);
+    return m;
+}
+
+fn main() -> i64 {
+    var n: i64 = 2000;
+    match arg_at(1) {
+        Option::Some(a) => {
+            n = str_parse_int(a);
+        }
+        Option::None => {
+        }
+    }
+    match arg_at(2) {
+        Option::Some(y) => {
+            g_yields = str_parse_int(y);
+        }
+        Option::None => {
+        }
+    }
+    match arg_at(3) {
+        Option::Some(w) => {
+            g_work = str_parse_int(w);
+        }
+        Option::None => {
+        }
+    }
+    g_rounds = sync_atomic_alloc(0);
+    g_mix = sync_atomic_alloc(0);
+    var want: i64 = 0;
+    var k: i64 = 1;
+    while k <= n {
+        var i: i64 = 0;
+        while i < g_yields {
+            want = want + spin(k + i, g_work);
+            i = i + 1;
+        }
+        k = k + 1;
+    }
+    var t0: i64 = p_clock_now();
+    k = 1;
+    while k <= n {
+        task_detach(task_go("yielder", k));
+        k = k + 1;
+    }
+    task_run();
+    var t1: i64 = p_clock_now();
+    var total: i64 = n * g_yields;
+    print("yield: ");
+    print(sync_atomic_load(g_rounds));
+    print(" yields, ");
+    print((t1 - t0) / total);
+    print(" ns per yield");
+    if sync_atomic_load(g_rounds) != total || sync_atomic_load(g_mix) != want {
+        print(" (WRONG RESULT)");
+        print("\n");
+        return 1;
+    }
+    print("\n");
+    return 0;
+}

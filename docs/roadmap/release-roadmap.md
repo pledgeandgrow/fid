@@ -993,7 +993,7 @@ Nothing here is ready to protect real data yet. Do not write new primitives.
       `test_windows_ct_public_loops.fd` (accepted: public loops, lengths,
       secrets in memory); `scripts/pe-ct-check.sh` (programs the source
       check accepts and only the backend rejects).
-- [~] J8. `@zeroize` reaches old `Vec` buffers and cannot be optimised away (M).
+- [x] J8. `@zeroize` reaches old `Vec` buffers and cannot be optimised away (M).
       A sensitive-buffer registry (generated-C runtime) wipes buffers on
       growth (`__p_vec_grow`), on every `__p_vbuf_free` — including shared
       buffers' last owner — and on drop; volatile byte writes.
@@ -1017,6 +1017,8 @@ Nothing here is ready to protect real data yet. Do not write new primitives.
       growth now registers a marked Vec's new buffer too (it wiped the old
       one but forgot the new), so later frees wipe it. Nothing else is left
       in the C runtime; the rest is native.
+      Nov 22: validated: test_zeroize_vec prints `3 / J8 ok` on C, pe_ir
+      emit, --nat Windows and x86_64-linux (WSL) (release/fid.exe).
 
 **Acceptance:** vectors pass in CI; the documented claims match the tests.
 
