@@ -3452,6 +3452,14 @@ Go and Rust won developers with tools as much as with languages.
       modules are not indexed for hints; a local that shadows a function
       name takes its calls.
 - [~] TL5. Debugger support with line tables on every platform (release N9) (L).
+      Nov 22 evening: `fid debug` is wired — cmd_debug (main.fd) reads
+      the file and runs compiler/debugger.fd's Debugger_new/Debugger_run
+      with the same flow as fidesc's; usage line added. Fixed on the way:
+      debugger.fd's bare `use compiler;` (it poisoned the whole import
+      set of any importer — use compiler::compiler; now) and its private
+      int_to_hex clashing with string.fd's (renamed dbg_int_to_hex).
+      Left: a run of the interactive session as validation (the module
+      checks clean; the command needs a tty).
       Nov 22 audit: mostly done — line tables on every platform
       (nat_enc.fd:3994-4003 DWARF, :8154-8160 Mach-O, :3708-3709 PE;
       pdb.fd writes a real PDB, DB3 validated Nov 21); `fid replay`

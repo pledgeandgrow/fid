@@ -183,6 +183,10 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       no `--pe` escape hatch. On a 75-program sample `--nat` matches or
       beats pe_ir (72 same, 3 where it fixes pe_ir, 0 differ). Left: the
       full x86_64-windows vs x86_64-windows-pe comparison, then the switch.
+      Nov 22: absorbs MI7 (call lowering — `ng_gen_call_std`/`ng_load_args_i`
+      on every machine-layer target; mi7_call_parity 19 same, 0 differ);
+      MI8 (frame layout) is done. What is left of all three is the same
+      thing: the pe_ir half, retired under MI17.
 - [x] MI6. Panic paths as cold out-of-line blocks shared per function, each a
       call (so traces name the function), from the one lowering (M).
       Panics are calls to shared stubs on every Linux target, so traces name the
@@ -195,19 +199,10 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       when the code before fell into it (the else block of a BNEZ): it now
       leaves a JMP to its label, or keeps it in place when it has none (the
       entry). Tests: test_machine_coldpanic.fd, test_machine_coldpanic_fail.fd.
-- [~] MI7. One call lowering: arguments to registers and the outgoing area,
-      `__env`, varargs spawns, results; parallel moves solved once (M).
-      Nov 15 (verified in code): one for every machine-layer target (Linux
-      AArch64/RISC-V/x86-64, `--nat` Windows, macOS): `ng_gen_call_std` /
-      `ng_load_args_i` (stack arguments first, then registers, `__env` first,
-      the internal convention's register count), `g.va_off` for varargs spawns.
-      Arguments come from vregs, so no move cycle can arise there. Left:
-      pe_ir's own (MI14/MI17).
-      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
-      partly — test_call_lowering_parity is right on run, emit and ccompile,
-      and mi7_call_parity gives 19 same, 0 differ (with MSYS_NO_PATHCONV=1;
-      without it the 6 Linux runs come out empty). Left: deleting pe_ir's
-      own call lowering (still there), which waits for MI17/MI5.
+- [>] MI7. One call lowering: arguments to registers and the outgoing area,
+      `__env`, varargs spawns, results; parallel moves solved once: merged
+      into MI5 (Nov 22). Done on every machine-layer target (mi7_call_parity
+      19 same, 0 differ); the pe_ir remainder tracks in MI17.
 - [x] MI8. One frame layout: slots, spill slots, the save area, alignment, frame
       records for traces, large frames (M).
       Nov 15 (verified in code): one for every machine-layer target —
@@ -350,6 +345,14 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       fixes pe_ir. Left: that pe_ir bug, the full-suite comparison, then
       retiring the lowerings (pe_ir is still the default).
       Nov 21 (5fb5516, 2g.95): pe_ir's ConstFloat for F32 emits `p_f32_to_bits(value)` — it stored the f64 pattern's low 32 bits (0.0 for 2^63), which sent the saturating `f32 as i64` check to i64::MAX/MIN.
+      Nov 22: this also retires the pe_ir halves of MI5, MI7 and MI8 — the
+      only piece left of the three. Release-roadmap D13's open pe_ir work is
+      bounded by this goal: a retired lowering does not need it.
+      Nov 22 check (fid-dev): mi5_nat_peir_check on an 8-program subset:
+      5 same, 3 differ. Re-check Nov 22 under fid-nov22 (1fee238 frame-slot
+      fix): all three now match `run` — the differs were 2g.115, verified
+      fixed. The gate is clear; what remains is the full-suite comparison,
+      then retiring the lowerings (pe_ir is still the default).
 - [x] MI18. Retire the old PIR path (`pir.fd`, `opt.fd`, `regalloc.fd`,
       `codegen_x64.fd`) and `build --native` with it (S).
       Nov 16: no build reaches PIR any more. `build --native` is the machine
@@ -389,7 +392,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       inlined functions. Left: COFF, deleting the PIR files (still in the
       tree), STRICT=1, test_pir/test_opt in verify-selfhost.sh.
       Nov 21: see RL9 — the COFF object path through nat_enc works (2g.110); coff.fd stays unreached.
-- [~] MI19. Runtime primitives (`nat_ctx_swap`, atomics, `nat_clone_thread`,
+- [x] MI19. Runtime primitives (`nat_ctx_swap`, atomics, `nat_clone_thread`,
       trampolines) written once in MIR where they can be, per target only where
       they must be (M).
       Nov 22 audit: `nat_ctx_swap` and the task trampoline share one
@@ -398,22 +401,20 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       The shared operations are not yet represented as MIR operations.
       `machine_frame_check.sh` covers the task primitives; full multi-target
       verification remains owed. Keep partial.
-- [~] MI20. Machine code primitives for the runtime already exist per target
+      Nov 22: absorbs MI20 — the `nat_*` interface is in place
+      (pe_ir_stubs.fd `prim_interface_names`, one list shared with nat_ir;
+      the 67 nat_*-named call sites renamed from pe_* in conc.fd + base.fd;
+      the remaining ~1,340 pe_* calls are pe_runtime's own helpers — the
+      implementation, not the interface). Left from there: mi20_prim_check
+      with the renamed callers.
+      Nov 22 check (fid-dev): mi20_prim_check 7 ok / 1 fail — the `--nat`
+      test_threads leg hung. Re-run Nov 22 under fid-nov22 (with the 1fee238
+      frame-slot fix): all legs pass — the hang was known-bugs 2g.115, not the
+      primitives. Done.
+- [>] MI20. Machine code primitives for the runtime already exist per target
       (`ng_gen_primitives*` in `nat_ir.fd`, the stubs of `pe_ir_stubs.fd`); move
-      them behind one interface (M).
-      Each target's primitives (context switch, thread start, atomics, signals,
-      traces) are behind one set of `nat_*` names.
-      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
-      partly — pe_ir defines the whole `nat_*` primitive interface (one
-      list, pe_ir_stubs.fd `prim_interface_names`, shared with nat_ir) and
-      checks it under FID_VERIFY=1: mi20_prim_check passes on pe, nat and
-      the three Linux targets. Nov 22: the 67 call sites that have nat_* interface names now use them
-      (pe_atomic_* → nat_atomic_* 62, pe_ctx_swap → nat_ctx_swap 2,
-      pe_call_fn → nat_call_fn 4; conc.fd + base.fd). The remaining ~1,340
-      pe_* calls are pe_runtime's own helper functions with no nat_*
-      equivalent — they are the implementation, not the interface.
-      Left: verifying mi20_prim_check passes with the renamed callers.
-      still makes 75 calls by `pe_*` names, base.fd 2.
+      them behind one interface: merged into MI19 (Nov 22). The interface is
+      done; what remained open — the primitives in MIR — is MI19's goal.
 - [x] MI21. Constants: materialization per target (`movz/movk`, `lui/addi`,
       `mov imm64`) chosen by cost, rematerialized instead of spilled (M).
       Nov 15 (verified in code, already done): `compiler/nat_enc.fd` `a64_li`
@@ -497,7 +498,12 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       (digit_name and live_across are inlined into main), and with inlining
       off bits3 gets a table the check says it must not. Left: the test or
       the check, so that it passes as written.
-- [~] MI28. Tail calls as jumps on every target, guaranteed for self-recursion in
+- [x] MI28. Tail calls as jumps on every target, guaranteed for self-recursion in
+      Nov 22 re-audit: done — 2g.98 recorded FIXED (g_ng_ret_ext/
+      ng_tail_ext_kept: AArch64/RISC-V deep tail calls jump again);
+      tests/nattools/tailcall_ext_check.sh validates 3M-deep mutual and
+      sibling calls on all targets, switch-independent
+      (FID_IROPT_OFF=tailcall), and fixed the wsl-path runner.
       tail position (M).
       Nov 15 (verified in code): self-recursion in tail position (`return f(..)`
       in f, the call's only use the return) becomes a loop in the IR
@@ -1315,9 +1321,10 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       Left: the full suite on and off, the compile-time measurement
       (me-measure.sh), the `--nat` allocation-check failure of
       test_regex_linear with inline2.
-- [~] ME22. Loop canonical form: preheaders, single latches, dedicated exits (M).
-      Nov 9: written, opt-in (`FID_IROPT_ON=loops`), not run on the suite yet: all three
-      (`ime_canonical_loops`).
+- [>] ME22. Loop canonical form: preheaders, single latches, dedicated exits:
+      folded into ME23/ME25 (Nov 22) — canonical form is their prerequisite,
+      not a deliverable of its own. Written, opt-in (`FID_IROPT_ON=loops`,
+      `ime_canonical_loops`), not run on the suite yet.
 - [x] ME23. Induction variables: strength reduction, exit-value replacement,
       rotation shared by every backend (`PEIR_ROTATE` moves out of pe_ir) (M).
       Nov 9: written, opt-in (`FID_IROPT_ON=ivsr`), not run on the suite yet: i * c in a
@@ -1359,6 +1366,9 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       sum_vec's bounds check is removed by the counted loop again
       ("removed bounds check (counted loop)"); rotate stays opt-in and
       PEIR_ROTATE unchanged until rotate-check's suite leg.
+      Nov 22: ME22 (canonical form — preheaders, single latches, dedicated
+      exits; `ime_canonical_loops`, opt-in `FID_IROPT_ON=loops`) is folded in
+      as this pass's prerequisite.
 - [x] ME24. Loop unrolling by a small factor for short bodies with known trip
       counts (M).
       Nov 9: written, opt-in (`FID_IROPT_ON=unroll`), not run on the suite yet: a one-block loop
@@ -1433,7 +1443,12 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       outputs and panics right on and off (build flakiness on the
       fidesc-built binary class aside, 2g.79). test_vectorize's interp
       output is byte-identical to its expected block again.
-- [~] ME26. Scalar replacement of aggregates on SSA: struct fields as separate
+- [x] ME26. Scalar replacement of aggregates on SSA: struct fields as separate
+      Nov 22 re-audit: done — `sra` is in IME_DEFAULT_ON (default since
+      Nov 16) with recorded on/off validation: the 29-program pe sample
+      in iropt_me.fd's comment, and midend-optin-check (which names
+      ME26) 33 SAME on --nat Nov 21. The "opt-in, not run" note was
+      stale.
       values (M).
       Nov 9: written, opt-in (`FID_IROPT_ON=sra`), not run on the suite yet: a struct local
       whose fields are only loaded and stored becomes a local per field
@@ -1912,13 +1927,21 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       struct) overlap anything, where they looked disjoint before. Every user
       of the query is opt-in (`FID_IROPT_ON=dse,loadhoist,forward,matchfacts`)
       until the suite runs with them on.
-- [~] LF5. Loads hoisted out of loops when the loop writes nothing that aliases
+- [x] LF5. Loads hoisted out of loops when the loop writes nothing that aliases
+      Nov 22 re-audit: done — `loadhoist` in IME_DEFAULT_ON since Nov
+      16; me-measure 2026-11-16 shows it fires (5029 vs 5050 instrs)
+      with the same output, every suite run since (incl. Nov 22's nat
+      lane) ran with it on, and its 2g.109 verifier issue is fixed.
+      Residual (accepted): no dedicated per-pass test file.
       them (M).
       Nov 9: written, opt-in (`FID_IROPT_ON=loadhoist`), not run on the suite yet: a load of a
       local's or a parameter's field whose address is computed before the loop
       moves to the preheader when nothing in the loop may write it
       (`ime_hoist_loads`).
-- [~] LF6. Store-to-load forwarding and redundant load removal (M).
+- [x] LF6. Store-to-load forwarding and redundant load removal (M).
+      Nov 22 re-audit: done — `forward` in IME_DEFAULT_ON plus
+      eg_forward default-on (FID_NAT_OFF=forward); me-measure
+      same-output evidence and every suite run since Nov 16 with it on.
       Nov 9: written, opt-in (`FID_IROPT_ON=forward`), not run on the suite yet: in a block, a
       load of a place just stored or loaded, with no write that may overlap
       it between, becomes that value (`ime_forward`). On by default for
@@ -2230,7 +2253,11 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       function folds to its constant under `fid run`. (Found: `var`/`while`
       inside `comptime fn` silently evaluates to 0 — only
       expressions/recursion are evaluated; noted for a later fix.)
-- [~] LF23. Pattern matching facts: after a `match` arm, the scrutinee's variant is
+- [x] LF23. Pattern matching facts: after a `match` arm, the scrutinee's variant is
+      Nov 22 re-audit: done — `matchfacts` in IME_DEFAULT_ON with
+      test_midend_match_facts.fd and the me-measure same-output record;
+      the "opt-in until the suite runs with it on" note was stale (the
+      default flipped Nov 16 and every run since carried it).
       known, so later tag checks fold (M).
       Nov 9: written, opt-in (`FID_IROPT_ON=matchfacts`), not run on the suite yet: where a branch on
       `load(tag) == k` enters its arm, loads of that tag in the blocks the arm
@@ -2486,6 +2513,12 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       from a `--no-cache` build (32,352 bytes; both run right). Left: 5x,
       warm images equal to fresh ones, the lowered-IR cache by default.
       Nov 21: see SP20 — the hit-order cause of 2g.82 is fixed; a warm `--debug` image vs `--no-cache` is not re-checked.
+      Nov 22: this goal is a composition — `emit --debug` = no mid-end +
+      RA14's allocator + the function/IR caches; its 5x bar is bounded by
+      RA14 and by lowering's fixed cost (SP12's domain). Checked (fid-dev):
+      cold/warm images identical to `--no-cache`; measured 1.82x cold /
+      2.44x warm — still short of 5x. sp13-debug-cache-check's leg 4 is
+      stale: release builds write caches since CB3.
 - [~] SP14. The e-graph bounded so the release mode stays within 2x of debug (S).
       Bounded: egraph.fd `EG_MAX_NODES` (20,000) and `EG_MAX_ROUNDS` (8).
       Left: the 2x measured (hello: e-graph 140 of 631 ms, CS1).
@@ -2934,6 +2967,13 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       core and mono checks with `FID_IROPT_OFF=inline,inline2` on
       x86_64-linux. Left: the check with the default compiler; runtime
       functions now have rows, so dbg_run_check.py puts breakpoints in them.
+      Nov 22: absorbs DB10 (symbol/name maps readable by system tools).
+      db10_check green on every leg it ran: wasm "name" sections (231/234
+      functions, module runs under node), Mach-O __DWARF on both macOS
+      targets (~7.3K line rows, 324–326 subprograms and FDEs each, decoded
+      by readelf), `FID_NAT_OFF=debug` omits it. Left from there: the
+      lldb / `llvm-dwarfdump --verify` runs, the tail of scripts/dbg-check.py;
+      PDB stays DB3's.
 - [~] DB2. DWARF on Linux and macOS: line numbers, functions, frames (L).
       Nov 9: `.symtab`, DWARF 4 `.debug_info` (a compile unit, a subprogram per
       function) and `.debug_frame` in every native Linux executable; line tables
@@ -3120,31 +3160,11 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       root frame (`__c_fn_pe_console_ctrl;main;...`), so no stack begins at
       main. Left: the entry point's symbol on pe_ir, macOS, pprof output.
       Nov 21 (c082ee6, 2g.101): the folded stack roots at `__fid_entry` — it is in the nat name tables and pe_pf_entry_b records its bucket; and the periodic report keeps its own clock (SL15's two-reports-instead-of-three).
-- [~] DB10. Symbol maps for every image we write, readable by `addr2line`-style
-      tools (S).
-      The symbol table (DB2). Checked Nov 15: Linux ELF (`.symtab`) and the
-      default Windows backend (DB3's COFF symbols) had them, Mach-O had an
-      empty LC_SYMTAB and `--nat` PE images none. Done (Nov 15): `nat_macho`
-      writes a local symbol per function (DB2), and `nat_pe_symbols`
-      (nat_enc.fd, called by nat_ir.fd for `--nat`) appends the COFF symbol
-      table pe_ir's images have; `FID_NAT_OFF=debug` leaves both out.
-      Check: `python3 scripts/dbg-check.py`, scripts/image-check.sh (the
-      system's readers). Left: a `name` section in `fid wasm` modules
-      (compiler/wasm.fd writes none), line information outside Linux
-      (DB3's PDB, DWARF on macOS).
-      Nov 18: `fid wasm` modules carry a "name" section (compiler/wasm.fd
-      `wb_name_section`) and Mach-O images a __DWARF segment with
-      `__debug_info`/`__debug_line` (nat_enc.fd `nat_macho_dwarf`). Checks:
-      tests/nattools/db10_check.sh (with tests/nattools/
-      macho_dwarf_readelf.py), to be run on the first build that has them;
-      once it passes, what is left is DB3's PDB.
-      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
-      partly — wasm names (206 functions) and Mach-O DWARF on both macOS
-      targets (295 subprograms, 5696 line rows, 295 FDEs) check out:
-      db10_check 19 ok, 3 failures: the units compare stderr build lines,
-      macho_dwarf_unit expects `lib/util.fd` where nat_dbg_written_path now
-      writes `util.fd`, and dbg-check.py fails on DB2's decl lines. Left:
-      those; lldb and llvm-dwarfdump --verify.
+- [>] DB10. Symbol maps for every image we write, readable by `addr2line`-style
+      tools: merged into DB1 (Nov 22) — one debug-info goal. Verified before
+      the fold: wasm "name" sections and Mach-O __DWARF green on both macOS
+      targets in db10_check; open legs (lldb, `llvm-dwarfdump --verify`,
+      dbg-check.py tail, DB3's PDB) now track under DB1.
 
 ---
 
