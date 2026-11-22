@@ -1796,11 +1796,16 @@ This is the race we can win outright, since no rival's speed comes for free.
       Nov 22 audit: mostly done — prefix queries are table lookups
       (borrowck.fd:2029-2072), remaining scans are not program-size, and
       cs3-borrowck-scaling.sh PASSES flat to 160k lines (29-33 µs/line).
-      Precise gap: the 1M-line run (benchmarks.md recorded 1477 s,
-      "grows much faster than the program") — hypothesis: the [time]
-      borrowck mark (compiler.fd:5528) also covers map teardown
-      (free_maps :5475,:5502). The CS8 "prefix queries remain" note is
-      stale.
+      Nov 22 measured (build/cs3-1m-check.out, roadmap sizes 10k/100k):
+      29,297 ns/line at 10k and 32,162 at 100k — FLAT (ratio 1.10
+      against the script's budget of 3). The 1M leg OOM'd on one
+      536,870,920-byte allocation with the suite co-loading the machine
+      (half a GB in one table: 2^26+1 words, value-id-indexed); a quiet
+      rerun is queued (build/cs3-1m-retry.out, fires at >=15 GB free).
+      The old 1477 s at 1M (benchmarks.md, Nov 17, -O0 stage-0 class)
+      predates the flat-table fixes and may also count map teardown
+      (the [time] borrowck mark spans free_maps, compiler.fd:5475-5528).
+      The CS8 "prefix queries remain" note is stale.
       compiler itself: 16 s (Nov 6).
       Nov 8: the reference-escape check iterates its fixpoint only over the
       functions whose result can hold a reference (scalars, strings and
