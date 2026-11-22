@@ -39,17 +39,17 @@ one; that pass's record follows the template below.
 | # | File | State (Nov 21) | Headline |
 |---|------|----------------|----------|
 | 1 | [ark.fd](ark.md) | live | `fid ark`, now 7,169 lines with a registry (the pacts index). Directory pacts, file pacts and the empty lock no longer reproduce (2g.63); `update <name>`, git pacts and the lock contents not re-checked |
-| 2 | [arm64_enc.fd](arm64_enc.md) | dead | No command reaches it. Earlier fp/mov sp/LSL/rodata bugs fixed; new: 64-bit `asr #imm` encoded as LSR |
+| 2 | arm64_enc.fd | dead | No command reaches it. Earlier fp/mov sp/LSL/rodata bugs fixed; new: 64-bit `asr #imm` encoded as LSR |
 | 3 | [ast.fd](ast.md) | live | 44 importers (34 reached). Unused `use string`, duplicate helpers, silent fallback values |
 | 4 | [autograd.fd](autograd.md) | dead | No importer; no-op shim. Header gradient table wrong for mul/matmul |
 | 5 | [borrowck.fd](borrowck.md) | live | `--borrowck=warn`, casts and nested field writes fixed Nov 15 (2g.9); `swap(&mut v[0], &mut v[1])` rejected (2g.73) |
 | 6 | [checks.fd](checks.md) | live | Counted loops, ranges, `Vec::filled` bounds. The asm clobber crash is fixed (2g.53); ownership calls defeat the loop proof |
-| 7 | [codegen.fd](codegen.md) | dead | Nothing imports it since MI18; no longer compiled into `fid` |
-| 8 | [codegen_arm64.fd](codegen_arm64.md) | dead | Unreached since MI18 (Nov 17): `codegen --target arm64` is the machine layer |
+| 7 | codegen.fd | dead | Nothing imports it since MI18; no longer compiled into `fid` |
+| 8 | codegen_arm64.fd | dead | Unreached since MI18 (Nov 17): `codegen --target arm64` is the machine layer |
 | 9 | [codegen_c.fd](codegen_c.md) | live | `f32 %`, float bit casts and libc-name clashes fixed (2g.13); open: `byte` vs rpcndr.h (2g.69), extern names equal to core's (2g.107), unbounded thread tables |
-| 10 | [codegen_riscv.fd](codegen_riscv.md) | dead | Unreached since MI18: `codegen --target riscv` is the machine layer |
-| 11 | [codegen_x64.fd](codegen_x64.md) | dead | Unreached since MI18 (only pe.fd imports it) |
-| 12 | [coff.fd](coff.md) | dead | Unreached since MI18; `codegen --coff` goes through nat_enc and fails on every program (2g.110) |
+| 10 | codegen_riscv.fd | dead | Unreached since MI18: `codegen --target riscv` is the machine layer |
+| 11 | codegen_x64.fd | dead | Unreached since MI18 (only pe.fd imports it) |
+| 12 | coff.fd | dead | Unreached since MI18; `codegen --coff` goes through nat_enc and fails on every program (2g.110) |
 | 13 | [compiler.fd](compiler.md) | live | Pipeline, 13,502 lines. warn mode and `@cfg(debug)` fixed (2g.9, 2g.14); unconditional `[build]`/`[prof]` stderr; `ccompile --fuzz-cov` double free (2g.83). debcee9: an unevaluated `comptime` is a compile error again. Comptime commits: a second `substitute` pass post-mono (comptime over instantiations, §4.11) |
 | 14 | [comptime_eval.fd](comptime_eval.md) | live | `if` assignments in a `comptime fn` kept and errors returned (2g.19). debcee9 hardening (+345): fuel (`FID_CT_FUEL`), call-stack traces, checked arithmetic, consts evaluated, layouts read off a real `Lowerer`; impl-method substitution not re-checked. Comptime commits: generics skipped until the post-mono `substitute` (`comptime T: type`, §4.11) |
 | 15 | [cowcheck.fd](cowcheck.md) | partly live | Report opt-in (`FIDES_COW_CHECK`), premise stale; walkers live in lowering |
@@ -77,28 +77,28 @@ one; that pass's record follows the template below.
 | 37 | [linker.fd](linker.md) | partly live | `build-x86` only; header cause fixed (TG13), exe not run since; missing entry not an error |
 | 38 | [lower.fd](lower.md) | live | Ownership 0004, 27,881 lines. 2g.2, 2g.3 and the clobber crash fixed; 5fb5516: select-stmt slots to the entry block (2g.109); function-pointer struct results (2g.47), global u64 (2g.72) |
 | 39 | [lsp.fd](lsp.md) | live | Double free and line-0 diagnostics fixed (2g.5); references, signatureHelp, inlayHint, codeAction, formatting added |
-| 40 | [macho.fd](macho.md) | dead | Unreached since MI18; `codegen --macho` and macOS executables come from nat_enc |
+| 40 | macho.fd | dead | Unreached since MI18; `codegen --macho` and macOS executables come from nat_enc |
 | 41 | [main.fd](main.md) | live | 55 command names. `build --native` is the machine layer (MI18); POSIX `build` too (CB4); `run --timeout` not enforced |
 | 42 | [mono.fd](mono.md) | live | Nested generic calls renamed (2g.8); no turbofish on the no-std path; `Vec.map` type change (2g.66), packs (2g.84), trait defaults (2g.97) |
 | 43 | [nat_enc.fd](nat_enc.md) | live | Encoders and writers (through image_writer), 12,948 lines. Linux code R+X, data RW (TG14). 5fb5516: link-missing checks for PE DLLs and macOS .tbd stubs (2g.106), PT_TLS for dyn x86-64 (2g.99); DWARF/CFI (2g.102, 2g.103) |
 | 44 | [nat_ir.fd](nat_ir.md) | live | Machine layer, 41,010 lines: Linux, macOS, `--nat`, Cortex-M (nat_thumb). Page out of date. 5fb5516: FID_NAT_* cached per image (RA14); 2g.88, 2g.94, 2g.98 (MI28), 2g.99, 2g.110 fixed; 2g.82, 2g.103 |
 | 45 | [native_debugger.fd](native_debugger.md) | dead | No ptrace builtins |
-| 46 | [opt.fd](opt.md) | dead | Unreached since MI18; `fid opt` prints the IR after iropt. Jump-threading fix (2g.17) never run |
+| 46 | opt.fd | dead | Unreached since MI18; `fid opt` prints the IR after iropt. Jump-threading fix (2g.17) never run |
 | 47 | [parser.fd](parser.md) | live | 10,682 lines. Imported struct literals fixed (2g.38). Dead `parse_expr_iterative`; module globals never reset. Comptime commits: `comptime T: type` params parse, join `type_params` on `fn`/methods, rejected elsewhere |
-| 48 | [pe.fd](pe.md) | dead | Unreached; `emit --boot` goes through pe_ir (`PEIR_BARE_BOOT`) |
+| 48 | pe.fd | dead | Unreached; `emit --boot` goes through pe_ir (`PEIR_BARE_BOOT`) |
 | 49 | [pe_ir.fd](pe_ir.md) | live | Default Windows backend, 9,010 lines. 5fb5516: `--leaks` roots (2g.81), f32 cast (2g.95), tail calls via a result slot (2g.98), global-RA bound (2g.80) fixed; `-g` locals (2g.104), FID_PROF root (2g.101); concurrency refusal not re-checked |
 | 50 | [pe_ir_enc.fd](pe_ir_enc.md) | live | Import directory size fixed at 20; no ASLR; writable `.rdata` (still true) |
 | 51 | [pe_ir_stubs.fd](pe_ir_stubs.md) | live | 10,196 lines. Old machine `p_vec_*` stubs still in the stub list; name helpers moved to ir.fd. 5fb5516: itoa buffer clobbered r14 (2g.96), argv token copy sized by its address (RL16) fixed |
-| 52 | [peephole.fd](peephole.md) | dead | Unreached since MI18 (only pe.fd imports it) |
-| 53 | [pir.fd](pir.md) | dead | Unreached since MI18; `fid pir`/`dump-pir` print where the views went |
+| 52 | peephole.fd | dead | Unreached since MI18 (only pe.fd imports it) |
+| 53 | pir.fd | dead | Unreached since MI18; `fid pir`/`dump-pir` print where the views went |
 | 53b | [reach.fd](reach.md) | live (emit only) | Which functions `emit` lowers; `drop` methods are roots (2g.23); `--lib --export` callees not lowered (2g.85) |
-| 54 | [regalloc.fd](regalloc.md) | dead | Unreached since MI18 (only codegen_x64 imports it) |
-| 55 | [riscv_enc.fd](riscv_enc.md) | dead | No command reaches it; no rodata in its result |
+| 54 | regalloc.fd | dead | Unreached since MI18 (only codegen_x64 imports it) |
+| 55 | riscv_enc.fd | dead | No command reaches it; no rodata in its result |
 | 56 | [rules.fd](rules.md) | live | Machine-layer path, `test-rules`. Read-only call merging on by default (Nov 17) after the loop-write fix; facts format mismatch |
 | 57 | [runtime.fd](runtime.md) | dead | Type error fixed in the source (2g.22); replaced by stdlib/linux_runtime |
-| 58 | [runtime_arm64.fd](runtime_arm64.md) | dead | Assembler errors return empty parts |
-| 59 | [runtime_linux.fd](runtime_linux.md) | dead | `build_executable` gone (MI18); layouts predate 0004 |
-| 60 | [runtime_riscv.fd](runtime_riscv.md) | dead | As runtime_arm64 |
+| 58 | runtime_arm64.fd | dead | Assembler errors return empty parts |
+| 59 | runtime_linux.fd | dead | `build_executable` gone (MI18); layouts predate 0004 |
+| 60 | runtime_riscv.fd | dead | As runtime_arm64 |
 | 61 | [scribe.fd](scribe.md) | live | `fid doc`. CRLF names, `::` file names, missing folders fixed in the source (AD1, TL11) |
 | 62 | [secrecy.fd](secrecy.md) | live | Guards and file-write sinks fixed (2g.10); `use crypto` fails @secret on native emit (2g.71) |
 | 63 | [tensor.fd](tensor.md) | live | Interpreter only. 12-term exp; no per-dimension bounds |

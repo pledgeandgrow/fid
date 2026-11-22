@@ -1,7 +1,7 @@
 #!/bin/bash
 # CB2 (docs/roadmap/complaint-roadmap.md): `fid serve` checks again only the
 # bodies an edit since its last clean check can reach (compiler/compiler.fd
-# cb2_skip_set), and stops after the borrow check. docs/incremental-check.md.
+# cb2_skip_set), and stops after the borrow check. docs/reference/incremental.md.
 #
 # Part A (correctness, a three-module program in a temporary directory):
 # every request's status and errors equal those of a server run with

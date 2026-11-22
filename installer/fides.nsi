@@ -214,7 +214,7 @@ SectionEnd
 ; ─── Section: Seeded store of unit objects (inc-roadmap B6) ──────────────
 ; Objects of the core and stdlib units, built by build-installer.sh with
 ; `fid ccompile --inc --seed-store`; an installed fid looks in
-; $INSTDIR\cache before compiling a unit (docs/inc-seed-store.md).
+; $INSTDIR\cache before compiling a unit (docs/reference/incremental.md).
 
 Section "Prebuilt standard library objects" SecCache
   SetOutPath "$INSTDIR\cache"

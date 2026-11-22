@@ -4233,11 +4233,11 @@ pub fn pert_lim_give(n: i64) -> i64 {
 // p_malloc / p_free.
 //   - A thread bumps blocks of 16 bytes to 1 MB out of a chunk of its own:
 //     4 MB, aligned to 4 MB (8 MB reserved, the aligned half committed), so
-//     a block's chunk is its address rounded down. Header of a chunk (64
+//     a block's chunk is its address rounded down. Header of a chunk (128
 //     bytes): [0] "FIDCHUNK" [8] the reservation [16] bytes handed out
 //     (set when it stops being a thread's chunk) [24] 1 while it is one
 //     [32] next [40] previous (the list of chunks, at st + 384) [48] the
-//     trim's sum [56] the trim's mark.
+//     trim's sum [56] the trim's mark [64] its owner slot (RT8).
 //   - A thread's list array (512 bytes, its TLS slot, release H8): the free
 //     lists of classes 7..40 at class * 8, then [384] bump cursor [392]
 //     bump end [400] its chunk [408] bytes on its lists (resident: without
@@ -4257,6 +4257,29 @@ pub fn pert_lim_give(n: i64) -> i64 {
 //     lists to a pool (st + 392) that the next thread to trim adopts.
 //   - FID_MEM_RETURN=0 (read by pert_limits_boot): no trim, nothing
 //     decommitted (large blocks go back with HeapFree either way).
+//   - Owner return (RT8, Nov 22): a chunk belongs to the thread that bumps
+//     blocks out of it; its header's [64] is that thread's owner slot, a
+//     word of the slot table (st + 408, PE_AL_OWNERS_N words, made with
+//     the first chunk; word 0 is the pool's slot). p_free of a block whose
+//     chunk's slot is not this thread's pushes the block on that slot (an
+//     atomic list: lock cmpxchg on the slot, the block's first word the
+//     link) and does nothing else; the owner takes the whole list (an
+//     exchange) when a class it asks for has no free block, before it
+//     bumps, and at each trim, and puts the blocks on its lists, where
+//     they are counted. A slot reads 0 (empty), 1 (closed: its thread
+//     ended) or the newest block. An ending thread (pert_alloc_thread_end)
+//     gives its chunks the pool's slot, then closes its own and takes what
+//     was on it: a free that finds a slot closed reads the chunk's slot
+//     again and pushes on the pool's, which the next trim takes with the
+//     pool's lists, so the chunks of a thread that ended can still be
+//     found empty and released. A closed slot goes to the next thread that
+//     needs one. Blocks on a slot are on no thread's lists: a trim never
+//     releases their chunk. A thread with no slot (the table full) has
+//     chunks whose blocks anyone frees into their own lists, as before.
+//     The list array's [424] is the thread's slot (its address; 0: none).
+//   - st + 400 (written by p_malloc's machine code): the offset in the TEB
+//     of the list arrays' TLS slot when its index is below 64, so p_malloc
+//     and p_free read the array with one gs: load (0: TlsGetValue).
 
 extern "C" {
     // kernel32.dll (static import list, pe_ir_enc.fd pe_kernel32_imports)
@@ -4265,7 +4288,7 @@ extern "C" {
 }
 
 const PE_AL_CHUNK: i64 = 4194304;  // a chunk's bytes (and alignment)
-const PE_AL_HDR: i64 = 64;  // its header; blocks follow
+const PE_AL_HDR: i64 = 128;  // its header; blocks follow
 const PE_AL_ST_TLS: i64 = 32;  // allocator state: TLS index + 1 of the list arrays
 const PE_AL_ST_LOCK: i64 = 376;  // the chunks' SRW lock
 const PE_AL_ST_CHUNKS: i64 = 384;  // the newest chunk
@@ -4275,6 +4298,11 @@ const PE_AL_END: i64 = 392;  // bump end
 const PE_AL_OWN: i64 = 400;  // the thread's chunk
 const PE_AL_FREE: i64 = 408;  // resident bytes on its lists
 const PE_AL_NEXT: i64 = 416;  // trim when [408] passes it
+const PE_AL_SLOT: i64 = 424;  // its owner slot's address (0: none)
+const PE_AL_ST_OWNERS: i64 = 408;  // allocator state: the owner slot table
+const PE_AL_ST_HI: i64 = 416;  // the highest slot given out
+const PE_AL_OWNERS_N: i64 = 4096;  // slots in the table (0 is the pool's)
+const PE_AL_C_OWNER: i64 = 64;  // chunk header: its owner slot
 const PE_AL_C_RESV: i64 = 8;
 const PE_AL_C_USED: i64 = 16;
 const PE_AL_C_LIVE: i64 = 24;
@@ -4357,6 +4385,67 @@ fn pe_al_carve_tail(arr: i64) {
     pe_store(arr + PE_AL_CUR, cur);
 }
 
+/// An owner slot for list array `arr` (under the lock): a closed one
+/// again, else the next unused one; none (0) when the table is full or
+/// cannot be made.
+fn pe_al_take_slot(st: i64, arr: i64) {
+    var tab: i64 = pe_load(st + PE_AL_ST_OWNERS);
+    if tab == 0 {
+        tab = pe_k_valloc(0, PE_AL_OWNERS_N * 8, 0x3000, 4);
+        if tab == 0 {
+            return;
+        }
+        pe_store(st + PE_AL_ST_OWNERS, tab);
+    }
+    val hi: i64 = pe_load(st + PE_AL_ST_HI);
+    var k: i64 = 1;
+    while k <= hi {
+        // a closed slot stays 1 (a free never pushes on it) until the
+        // lock's holder opens it again here
+        if nat_atomic_load(tab + k * 8) == 1 {
+            nat_atomic_store(tab + k * 8, 0);
+            pe_store(arr + PE_AL_SLOT, tab + k * 8);
+            return;
+        }
+        k = k + 1;
+    }
+    if hi + 1 < PE_AL_OWNERS_N {
+        pe_store(st + PE_AL_ST_HI, hi + 1);
+        nat_atomic_store(tab + (hi + 1) * 8, 0);
+        pe_store(arr + PE_AL_SLOT, tab + (hi + 1) * 8);
+    }
+}
+
+/// The blocks on owner slot `slot`, taken at once; the slot becomes `to`
+/// (0: open and empty, 1: closed).
+fn pe_al_slot_take(slot: i64, to: i64) -> i64 {
+    var v: i64 = nat_atomic_load(slot);
+    while nat_atomic_cas(slot, v, to) == false {
+        v = nat_atomic_load(slot);
+    }
+    return v;
+}
+
+/// The blocks other threads freed onto `slot` go on the lists of `arr`
+/// (each one's header says its class: their p_free wrote it); the slot
+/// becomes `to`.
+fn pe_al_drain(arr: i64, slot: i64, to: i64) {
+    var b: i64 = pe_al_slot_take(slot, to);
+    if b == 1 {
+        return;
+    }
+    var fb: i64 = pe_load(arr + PE_AL_FREE);
+    while b != 0 {
+        val nb: i64 = pe_load(b);
+        val k: i64 = pe_load(b - 8) & 63;
+        pe_store(b, pe_load(arr + k * 8));
+        pe_store(arr + k * 8, b);
+        fb = fb + pe_al_bytes(k);
+        b = nb;
+    }
+    pe_store(arr + PE_AL_FREE, fb);
+}
+
 /// p_malloc found no room in this thread's chunk (or it has none): a new
 /// one for list array `arr`, its old one retired. 0 when the system has no
 /// memory left. `st` is the allocator state in .rdata.
@@ -4384,10 +4473,14 @@ pub fn pert_alloc_chunk(st: i64, arr: i64) -> i64 {
     pe_store(arr + PE_AL_END, 0);
     pe_store(arr + PE_AL_OWN, 0);
     if c != 0 {
+        if pe_load(arr + PE_AL_SLOT) == 0 {
+            pe_al_take_slot(st, arr);
+        }
         pe_store(c, 0x4B4E554843444946);  // "FIDCHUNK"
         pe_store(c + PE_AL_C_RESV, r);
         pe_store(c + PE_AL_C_USED, 0);
         pe_store(c + PE_AL_C_LIVE, 1);
+        pe_store(c + PE_AL_C_OWNER, pe_load(arr + PE_AL_SLOT));
         var head: i64 = pe_load(st + PE_AL_ST_CHUNKS);
         pe_store(c + PE_AL_C_NEXT, head);
         pe_store(c + PE_AL_C_PREV, 0);
@@ -4473,6 +4566,16 @@ pub fn pert_alloc_trim(st: i64, arr: i64) -> i64 {
     val pool: i64 = pe_load(st + PE_AL_ST_POOL);
     if pool != 0 {
         pe_al_splice(pool, arr);
+    }
+    // RT8: what other threads freed of this thread's chunks, and of the
+    // chunks of threads that ended (the pool's slot)
+    val myslot: i64 = pe_load(arr + PE_AL_SLOT);
+    if myslot != 0 {
+        pe_al_drain(arr, myslot, 0);
+    }
+    val tab: i64 = pe_load(st + PE_AL_ST_OWNERS);
+    if tab != 0 {
+        pe_al_drain(arr, tab, 0);
     }
     // each chunk's bytes on this thread's lists
     var c: i64 = pe_load(st + PE_AL_ST_CHUNKS);
@@ -4594,6 +4697,22 @@ pub fn pert_alloc_thread_end() {
     pe_store(arr + PE_AL_CUR, 0);
     pe_store(arr + PE_AL_END, 0);
     pe_store(arr + PE_AL_OWN, 0);
+    // RT8: its chunks get the pool's slot first, then its own slot closes
+    // (a free that finds it closed reads the chunk's slot again) and what
+    // was on it joins its lists, which go to the pool
+    val slot: i64 = pe_load(arr + PE_AL_SLOT);
+    val tab: i64 = pe_load(st + PE_AL_ST_OWNERS);
+    if slot != 0 && tab != 0 {
+        var c: i64 = pe_load(st + PE_AL_ST_CHUNKS);
+        while c != 0 {
+            if pe_load(c + PE_AL_C_OWNER) == slot {
+                nat_atomic_store(c + PE_AL_C_OWNER, tab);
+            }
+            c = pe_load(c + PE_AL_C_NEXT);
+        }
+        pe_al_drain(arr, slot, 1);
+    }
+    pe_store(arr + PE_AL_SLOT, 0);
     val pool: i64 = pe_load(st + PE_AL_ST_POOL);
     if pool == 0 {
         pe_store(arr + PE_AL_NEXT, 0);

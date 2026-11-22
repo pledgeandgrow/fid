@@ -21,7 +21,7 @@ requests the server keeps:
 | machine code of each unchanged function | nat_ir.fd `g_nat_fncache_mem` | SP7, SP18 |
 
 The new part: a build request runs CB2's incremental body check
-(docs/incremental-check.md). The server compares the program's modules with
+(docs/reference/incremental.md). The server compares the program's modules with
 the last build whose checks passed. It checks again only the function
 bodies that an edit since then can reach: the edited items, and items that
 mention a name they define, followed to a fixpoint. Unlike a check request,

@@ -4,7 +4,7 @@
 (`docs/proposals/0004-ownership-and-layout.md`); reference §3.1 and §11
 (`@repr(C)`, `@packed`); `docs/reference/language-guide.md` §3.5
 ("Compile-time reflection") and §7.5 ("Enum Representation");
-`docs/vec.md`.
+`docs/stdlib/vec.md`.
 
 **After this week you can:** compute the size and field offsets of a
 struct under Fid's three layouts; draw a `str`, a `Vec` and an enum in

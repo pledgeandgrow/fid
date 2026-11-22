@@ -475,10 +475,18 @@ budget tracking, and tensor parallelism (simulated multi-rank) all work.
   rerun with `release/fid-dev.exe` (built at 00:29, before the 01:55 runtime
   change) still shows `Illegal instruction`, so it does not validate or
   falsify the fix; rebuild and rerun `TP_TARGET=native`. The `--nat` null
-  pointer and ARM64/RISC-V target runs remain open. A Linux-target disasm
-  also fails typechecking because the shared tensor runtime now calls
-  Windows-only `pe_k_exit_process`; this cross-target regression needs a
-  platform-correct exit hook.
+  pointer and ARM64/RISC-V target runs remain open.
+  Nov 22: added `pert_exit_now` to both runtime bases: PE uses
+  `ExitProcess`; the native Linux runtime uses `exit_group`. The available
+  `fid-dev.exe` now completes Linux-target serverless disassembly and emits
+  `tests/tp/rank_exit.fd` for x86_64-linux. The TP script under that target
+  exited after its target banner without per-case results, so end-to-end
+  Linux TP remains unverified.
+  `TP_TARGET=native` still fails 3/5 checks with `Panic: Illegal instruction`
+  on the available binary; an isolated current-tree build failed earlier
+  because its stage-0 lacks `HashMap_iter`, `HashMap_next`, and
+  `str_from_hash_key`. The PE fix therefore still needs a valid rebuilt
+  compiler before it can be confirmed.
   Leftover (Nov 15): still identity in `fid` (`compiler/interp.fd` and the C runtime's `p_all_reduce` in `compiler/codegen_c.fd`); no newer roadmap tracks it.
   Nov 21 check (fid built from the self-hosted stage 0 at 86cc919): partly — multi-rank TP on the native runtimes (stdlib/pe_runtime/tensor.fd: pert_tp_init, collectives through rank 0, send/recv, pert_tp_exit): `tests/tp/check.sh` passes through C and with TP_TARGET=x86_64-linux (WSL). Left: native Windows (pe_ir) multi-rank programs print their results and then end with 'Panic: Illegal instruction' (3 of the 5 tp checks fail, as does a 3-line program calling p_tp_init(2)), apparently in the new pert_tp_exit entry-point path (pe_ir_stubs.fd ~8379); aarch64 and riscv64 not run.
 
@@ -719,10 +727,12 @@ shaders remaining.
   Nov 22 validation (`release/fid-dev.exe`): positive handler tests and
   global-write/task/global-initializer rejection tests pass. After fixing
   Git Bash temp-path conversion, argv/stdin execution, C compilation, and
-  handler argument validation pass. The Linux-target disassembly checks
-  fail before codegen: shared `pe_runtime/tensor.fd` references the
-  Windows-only `pe_k_exit_process` symbol. `docs/perf/serverless-coldstart.md`
-  still calls for real Windows and Linux measurements. Keep partial.
+  handler argument validation pass. After adding the target-specific
+  `pert_exit_now`, the Linux-target disassembly commands reach codegen.
+  The remaining name checks fail because `main_only_report`, `handle_request`
+  and/or `route` are inlined, not because of the runtime type error.
+  `docs/perf/serverless-coldstart.md` still calls for real Windows and
+  Linux measurements. Keep partial.
 
 #### What's Left
 **Most of Phase 9.** The safety annotations and a partial banking stdlib are
@@ -1507,7 +1517,7 @@ repo. `@cpu_local` is only in `compiler/pe.fd`, not in `src/pe.rs`.
   - Cross-compilation dispatch in `compiler/compiler.fd` (ARM64/RISC-V backends)
 - [-] ~~UEFI boot services bindings (`stdlib/uefi.fd`, 287 lines)~~ — moved to the `fides-os` project
   - **MOVED to `fides-os` project** — `stdlib/uefi.fd` does not exist in this repo
-  - Only `docs/stdlib/uefi.md` remains (documentation)
+  - `docs/stdlib/uefi.md` (its stale doc page) deleted Nov 22
 
 #### What's Left
 - [-] ARM64 native codegen module for self-hosted compiler (codegen_arm64.fd exists, 557 LOC, needs verification)

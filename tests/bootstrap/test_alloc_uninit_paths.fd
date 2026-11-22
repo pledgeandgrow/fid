@@ -1,0 +1,306 @@
+// RT8 item 1: core's producers that write every byte they hand out take
+// their blocks from p_malloc_uninit (stdlib/core.fd: p_str_alloc_uninit,
+// vec_buf_alloc_uninit, Vec_new, Vec_share, HashMap_new/share/grow,
+// map_own, p_str_append). Their bytes are not zeroed, so each case first
+// leaves the heap dirty (blocks of the sizes it will ask for, filled with
+// 0xFF bytes and freed) and then checks that what core made reads back
+// exactly: the text and its NUL, every element, the map's entries. And a
+// p_malloc block still reads as zero after core's blocks of its size were
+// freed (the rule stays for every allocation user code can see).
+//
+// Expected output:
+//   strings ok: true
+//   nul ok: true
+//   appends ok: true
+//   vec ints ok: true
+//   vec bytes ok: true
+//   vec strs ok: true
+//   vec structs ok: true
+//   vec copies ok: true
+//   filled ok: true
+//   map ok: true
+//   map copy ok: true
+//   p_malloc still zero: true
+
+struct Pt {
+    x: i64,
+    y: i64,
+    z: i64,
+}
+
+@unsafe
+fn fill(p: i64, n: i64) {
+    var i: i64 = 0;
+    while i < n {
+        var b: *mut u8 = p + i;
+        unsafe { *b = 255; }
+        i = i + 1;
+    }
+}
+
+// the bytes of the n at p that are not zero
+@unsafe
+fn nonzero(p: i64, n: i64) -> i64 {
+    var bad: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        var b: *mut u8 = p + i;
+        var x: i64 = 0;
+        unsafe { x = (*b) as i64; }
+        if x != 0 {
+            bad = bad + 1;
+        }
+        i = i + 1;
+    }
+    return bad;
+}
+
+// leave blocks of every size up to `max` (and some larger) freed and full
+// of 0xFF, so the next ones handed out are dirty
+@unsafe
+fn dirty(max: i64) {
+    var blocks: Vec<i64> = Vec::new();
+    var n: i64 = 8;
+    while n <= max {
+        var k: i64 = 0;
+        while k < 4 {
+            val p: i64 = p_malloc(n);
+            fill(p, n);
+            blocks.push(p);
+            k = k + 1;
+        }
+        n = n + 8 + n / 8;
+    }
+    var i: i64 = blocks.len() - 1;
+    while i >= 0 {
+        p_free(blocks.get(i));
+        i = i - 1;
+    }
+}
+
+fn tf(b: bool) -> str {
+    if b {
+        return "true";
+    }
+    return "false";
+}
+
+@unsafe
+fn main() -> i64 {
+    dirty(70000);
+    // strings: copies, slices, case, replace, repeat, s + n (str_from_bytes
+    // is left to bench/alloc/fides/strings.fd: its result leaks under
+    // --leaks with the old core too)
+    var ok: bool = true;
+    val base: str = "The quick brown fox jumps over the lazy dog";
+    var r: i64 = 0;
+    while r < 50 {
+        dirty(512);
+        val c: str = str_clone(base);
+        val sl: str = str_slice(base, 4, 19);
+        val up: str = str_to_upper(sl);
+        val lo: str = str_to_lower("ABC-xyz");
+        val rp: str = str_replace(base, "o", "00");
+        val rr: str = str_repeat("ab", 7);
+        val sn: str = "v=" + int_to_str(r - 25);
+        ok = ok && c == base && sl == "quick brown fox" && up == "QUICK BROWN FOX";
+        ok = ok && lo == "abc-xyz" && rp == "The quick br00wn f00x jumps 00ver the lazy d00g";
+        ok = ok && rr == "ababababababab" && sn == str_concat("v=", int_to_str(r - 25));
+        r = r + 1;
+    }
+    println("strings ok: " + tf(ok));
+
+    // every string ends with a NUL right after its bytes
+    dirty(512);
+    var nul: bool = true;
+    var k: i64 = 0;
+    // (the source is 62 bytes)
+    while k <= 62 {
+        val s: str = str_slice("abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz", 0, k);
+        nul = nul && p_str_cstr_len(s as i64) == k && str_len(s) == k;
+        val t: str = str_repeat("q", k);
+        nul = nul && p_str_cstr_len(t as i64) == k;
+        k = k + 1;
+    }
+    println("nul ok: " + tf(nul));
+
+    // s = s + x grows its buffer in place (p_str_append)
+    dirty(70000);
+    var acc: str = "";
+    var expect_len: i64 = 0;
+    var i: i64 = 0;
+    while i < 3000 {
+        acc = acc + "xy";
+        acc = acc + int_to_str(i % 10);
+        expect_len = expect_len + 3;
+        i = i + 1;
+    }
+    var app: bool = str_len(acc) == expect_len && p_str_cstr_len(acc as i64) == expect_len;
+    app = app && str_slice(acc, 0, 9) == "xy0xy1xy2" && str_slice(acc, expect_len - 3, expect_len) == "xy9";
+    println("appends ok: " + tf(app));
+
+    // Vec<i64> grown by push, element by element
+    dirty(70000);
+    var ints: Vec<i64> = Vec::new();
+    i = 0;
+    while i < 5000 {
+        ints.push(i * 3 - 7);
+        i = i + 1;
+    }
+    var vi: bool = ints.len() == 5000;
+    i = 0;
+    while i < 5000 {
+        vi = vi && ints.get(i) == i * 3 - 7;
+        i = i + 1;
+    }
+    println("vec ints ok: " + tf(vi));
+
+    // Vec<u8> (one byte per element: vec_sz_reserve)
+    dirty(70000);
+    var bytes: Vec<u8> = Vec::new();
+    i = 0;
+    while i < 9000 {
+        bytes.push((i % 200) as u8);
+        i = i + 1;
+    }
+    var vb: bool = bytes.len() == 9000;
+    i = 0;
+    while i < 9000 {
+        vb = vb && (bytes.get(i) as i64) == i % 200;
+        i = i + 1;
+    }
+    println("vec bytes ok: " + tf(vb));
+
+    // Vec<str>
+    dirty(70000);
+    var strs: Vec<str> = Vec::new();
+    i = 0;
+    while i < 1500 {
+        strs.push("s" + int_to_str(i));
+        i = i + 1;
+    }
+    var vs: bool = strs.len() == 1500;
+    i = 0;
+    while i < 1500 {
+        vs = vs && strs.get(i) == "s" + int_to_str(i);
+        i = i + 1;
+    }
+    println("vec strs ok: " + tf(vs));
+
+    // Vec<Pt>: structs held in the buffer, grown, with an insert and a
+    // remove
+    dirty(70000);
+    var pts: Vec<Pt> = Vec::new();
+    i = 0;
+    while i < 1200 {
+        pts.push(Pt { x: i, y: i * 2, z: 0 - i });
+        i = i + 1;
+    }
+    pts.insert(3, Pt { x: 77, y: 78, z: 79 });
+    val gone: Pt = pts.remove(10);
+    var vp: bool = pts.len() == 1200 && gone.x == 9 && pts.get(3).x == 77 && pts.get(3).z == 79;
+    i = 11;
+    while i < 1200 {
+        val p: Pt = pts.get(i);
+        vp = vp && p.x == i && p.y == i * 2 && p.z == 0 - i;
+        i = i + 1;
+    }
+    println("vec structs ok: " + tf(vp));
+
+    // copies: a copy changed gets a buffer of its own (vec_own); the
+    // original keeps its elements
+    dirty(70000);
+    var orig: Vec<i64> = Vec::new();
+    var sorig: Vec<str> = Vec::new();
+    i = 0;
+    while i < 700 {
+        orig.push(i);
+        sorig.push(int_to_str(i));
+        i = i + 1;
+    }
+    var cp: Vec<i64> = orig;
+    var scp: Vec<str> = sorig;
+    cp.set(5, 500);
+    cp.push(700);
+    scp.set(6, "six");
+    scp.push("end");
+    var vc: bool = orig.len() == 700 && cp.len() == 701 && orig.get(5) == 5 && cp.get(5) == 500 && cp.get(700) == 700;
+    vc = vc && sorig.get(6) == "6" && scp.get(6) == "six" && scp.get(700) == "end" && scp.get(699) == "699";
+    i = 0;
+    while i < 700 {
+        if i != 5 {
+            vc = vc && cp.get(i) == i;
+        }
+        if i != 6 {
+            vc = vc && scp.get(i) == int_to_str(i);
+        }
+        i = i + 1;
+    }
+    println("vec copies ok: " + tf(vc));
+
+    // Vec::filled of words, bytes and strings
+    dirty(70000);
+    val fw: Vec<i64> = Vec::filled(3000, 42);
+    val fu: Vec<u8> = Vec::filled(3001, 7 as u8);
+    val fs: Vec<str> = Vec::filled(300, "fill");
+    var vf: bool = fw.len() == 3000 && fu.len() == 3001 && fs.len() == 300;
+    i = 0;
+    while i < 3000 {
+        vf = vf && fw.get(i) == 42 && (fu.get(i) as i64) == 7;
+        i = i + 1;
+    }
+    i = 0;
+    while i < 200 {
+        vf = vf && fs.get(i) == "fill";
+        i = i + 1;
+    }
+    println("filled ok: " + tf(vf));
+
+    // HashMap: grown (HashMap_grow), then a copy changed (map_own)
+    dirty(70000);
+    var m: HashMap<str, i64> = HashMap::new();
+    var mi: HashMap<i64, str> = HashMap::new();
+    i = 0;
+    while i < 2000 {
+        m.insert("k" + int_to_str(i), i * 5);
+        mi.insert(i * 11, "v" + int_to_str(i));
+        i = i + 1;
+    }
+    var vm: bool = m.len() == 2000 && mi.len() == 2000;
+    i = 0;
+    while i < 2000 {
+        vm = vm && m.get("k" + int_to_str(i)) == i * 5 && mi.get(i * 11) == "v" + int_to_str(i);
+        i = i + 1;
+    }
+    vm = vm && !m.contains_key("k2000") && !mi.contains_key(7);
+    println("map ok: " + tf(vm));
+
+    dirty(70000);
+    var m2: HashMap<str, i64> = m.clone();
+    m2.insert("k5", 0 - 5);
+    m2.insert("extra", 1);
+    var vm2: bool = m.get("k5") == 25 && m2.get("k5") == 0 - 5 && m2.len() == 2001 && m.len() == 2000 && !m.contains_key("extra");
+    i = 0;
+    while i < 2000 {
+        if i != 5 {
+            vm2 = vm2 && m2.get("k" + int_to_str(i)) == i * 5;
+        }
+        i = i + 1;
+    }
+    println("map copy ok: " + tf(vm2));
+
+    // what user code allocates still reads as zero, in blocks of the sizes
+    // core's dirty blocks just had
+    var zbad: i64 = 0;
+    var n: i64 = 8;
+    while n < 5000 {
+        val s: str = str_repeat("z", n);
+        val v: Vec<i64> = Vec::filled(n / 8 + 1, 0 - 1);
+        val p: i64 = p_malloc(n);
+        zbad = zbad + nonzero(p, n);
+        p_free(p);
+        n = n + 37;
+    }
+    println("p_malloc still zero: " + tf(zbad == 0));
+    return 0;
+}

@@ -1,0 +1,146 @@
+// Competitive RT8 x RT10: owner return under M:N (compiler/codegen_c.fd,
+// "the heaps"). Each worker thread allocates from a heap of its own; a block
+// freed on a worker whose heap did not make it goes back to its maker's
+// heap (its xfree), and a task reads the heap of the worker it runs on at
+// each allocation (it may go on on another worker after any switch).
+//   - 30 rounds: 32 maker tasks each make 400 numbered blocks (16 bytes to
+//     20 KB), yielding between them (so a maker moves between workers in
+//     the middle), every block must read zero where it was asked for; then
+//     32 checker tasks each check another maker's blocks and free them,
+//     wherever they run;
+//   - the memory is reused across the rounds, not added up (where the
+//     resident size is known: less than 64 MB more after round 30 than
+//     after round 3).
+//
+// C path only (p_co_workers is the C runtime's):
+//   CC="zig cc" $FID ccompile tests/ctx_switch/c_task_owner_return.fd -o or.exe
+//   ./or.exe
+//
+// Expected output:
+// workers: 16
+// blocks made and checked: 384000, wrong: 0, not zeroed: 0
+// memory reused across rounds: true
+extern "C" {
+    fn p_co_workers(n: i64) -> i64;
+}
+use string;
+use task;
+use sync;
+
+const MAKERS: i64 = 32;
+const PER: i64 = 400;
+
+var g_tabs: i64 = 0;
+var g_wrong: i64 = 0;
+var g_dirty: i64 = 0;
+var g_checked: i64 = 0;
+
+/// The size of block i of maker m in round r: 16 bytes to about 20 KB
+fn block_size(m: i64, r: i64, i: i64) -> i64 {
+    val x: i64 = (m * 131 + r * 17 + i * 7919) % 1000;
+    if x < 40 {
+        return 16384 + x * 100;
+    }
+    return 16 + (x % 120) * 8;
+}
+
+/// Maker m of round r: PER blocks, each checked zero at both ends and
+/// numbered there; their table goes to g_tabs[m]
+@unsafe
+fn maker(arg: i64) -> i64 {
+    val m: i64 = arg % 1000;
+    val r: i64 = arg / 1000;
+    val tab: i64 = p_malloc(PER * 8);
+    var i: i64 = 0;
+    while i < PER {
+        val size: i64 = block_size(m, r, i);
+        val b: i64 = p_malloc(size);
+        val bp: * mut i64 = b;
+        val ep: * mut i64 = b + size - 8;
+        val tp: * mut i64 = tab + i * 8;
+        unsafe {
+            if * bp != 0 || * ep != 0 {
+                sync_atomic_add(g_dirty, 1);
+            }
+            * bp = arg * 1000 + i;
+            * ep = arg * 1000 + i;
+            * tp = b;
+        }
+        if i % 50 == 0 {
+            task_yield();
+        }
+        i = i + 1;
+    }
+    sync_atomic_store(g_tabs + m * 8, tab);
+    return 0;
+}
+
+/// Checker of maker m's blocks of round r: each holds its number, then is
+/// freed (on whatever worker this task runs)
+@unsafe
+fn checker(arg: i64) -> i64 {
+    val m: i64 = arg % 1000;
+    val tab: i64 = sync_atomic_load(g_tabs + m * 8);
+    var i: i64 = 0;
+    while i < PER {
+        val tp: * mut i64 = tab + i * 8;
+        var b: i64 = 0;
+        unsafe {
+            b = * tp;
+        }
+        val size: i64 = block_size(m, arg / 1000, i);
+        val bp: * mut i64 = b;
+        val ep: * mut i64 = b + size - 8;
+        unsafe {
+            if * bp != arg * 1000 + i || * ep != arg * 1000 + i {
+                sync_atomic_add(g_wrong, 1);
+            }
+        }
+        p_free(b);
+        sync_atomic_add(g_checked, 1);
+        if i % 64 == 0 {
+            task_yield();
+        }
+        i = i + 1;
+    }
+    p_free(tab);
+    return 0;
+}
+
+@unsafe
+fn main() -> i64 {
+    var asked: i64 = 0;
+    unsafe {
+        asked = p_co_workers(16);
+    }
+    println("workers: " + int_to_str(asked));
+    g_tabs = p_shared_alloc(MAKERS * 8);
+    g_wrong = sync_atomic_alloc(0);
+    g_dirty = sync_atomic_alloc(0);
+    g_checked = sync_atomic_alloc(0);
+    var at3: i64 = 0;
+    var r: i64 = 0;
+    while r < 30 {
+        var m: i64 = 0;
+        while m < MAKERS {
+            task_detach(task_go("maker", r * 1000 + m));
+            m = m + 1;
+        }
+        task_run();
+        // each maker's blocks checked by a task of its own, after all are made
+        m = 0;
+        while m < MAKERS {
+            task_detach(task_go("checker", r * 1000 + (m + 7) % MAKERS));
+            m = m + 1;
+        }
+        task_run();
+        if r == 2 {
+            at3 = p_mem_resident();
+        }
+        r = r + 1;
+    }
+    val at30: i64 = p_mem_resident();
+    println("blocks made and checked: " + int_to_str(sync_atomic_load(g_checked)) + ", wrong: " + int_to_str(sync_atomic_load(g_wrong)) + ", not zeroed: " + int_to_str(sync_atomic_load(g_dirty)));
+    println("memory reused across rounds: " + bool_to_str(at3 < 0 || at30 - at3 < 64 * 1048576));
+    return 0;
+}

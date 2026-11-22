@@ -103,7 +103,7 @@ fn main() -> i64 {
 
 ```
 $ fid run assert.fd
-Panic: total too big: 4 at line 37
+Panic: total too big: 4 at line ...
 stack trace:
     → assert_msg...
     ↳ called from main

@@ -3246,7 +3246,13 @@ Every platform gets a tier, and a tier means CI, not a hope.
       fs_copy_file onto itself returned 0 and emptied the file —
       pe_win_stat never filled st_dev/st_ino, so pe_zc_same_file always
       said different files; pe_win_stat now fills them through
-      GetFileInformationByHandle (import slot 80). Left: green full runs
+      GetFileInformationByHandle (import slot 80); `self: 27 true` on
+      the --nat lane with a fid-dev rebuilt with the new import, and
+      the focused tier1 lane passes. Third blocker: the arm64 runner
+      itself failed cargo build — src/native_debugger.rs used the
+      x86-only PTRACE_GETREGS; it now uses PTRACE_GETREGSET/NT_PRSTATUS
+      on aarch64 (cargo check --target aarch64-unknown-linux-gnu PASS,
+      in the worktree). Left: green full runs
       on all four; macos-arm64 has no machine here (CI's macos-15).
 - [~] PL3. Tier 2: Windows ARM64, macOS x64, FreeBSD, RISC-V (L).
       Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
@@ -3468,13 +3474,16 @@ Only this produces true production years. It starts now, at small scale.
       statements in compiler/ that stopped stage 0 are renamed
       (`FROM=compiler/main.fd scripts/stage0-names-check.sh`: PASS, Nov 18).
       Nov 22: in CI the fides-os job is correctly skipped on push events
-      (weekly/dispatch only); it still has no green run — the `qemu` job
-      it follows fails building the bare tests with the fidesc-built
-      stage 1 (the known-bugs 2g.79 wall; the pinned self-hosted stage 0
-      exists only as a Windows release/stage0/fid.exe, uncommitted, so CI
-      falls back to fidesc). Left: a green CI run — which needs either a
-      Linux stage-0 binary or the src/lower.rs temps port — and
-      FIDES_OS_TOKEN if fides-os is private.
+      (weekly/dispatch only). The `qemu` job is green again (bare tests
+      build — run 44974093228). The fides-os job ran for the first time
+      on dispatch run 44974711969 and correctly reported fides-os's own
+      drift: pledgeandgrow/fides-os@main no longer compiles against this
+      fid — vfs fat32_read_file/fat32_create_file signature changes,
+      sched proc_set_priority/PROC_ZOMBIE/PROC_STOPPED/SIGKILL gone, and
+      new `p_malloc needs unsafe` safety errors. The standing test works
+      as designed; a green run now waits on fides-os catching up to the
+      current compiler (work in that repo), plus FIDES_OS_TOKEN if it is
+      private.
 - [~] AD4. Every internal tool that can be in Fides is (M).
       Done (Nov 15): `docs/internal-tools.md` lists every script and tool
       and what keeps it out of Fides. Ported, with the same output as the

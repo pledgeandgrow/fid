@@ -256,7 +256,7 @@ the debug table; `SUITE=1` for B8, `FIXPOINT=1` for B9). Not run yet
         linkage is needed (tcc and cl do not share one), and the unit's
         content key holds the instance's code, so it changes exactly when
         the generic's body or the type arguments do.
-        Policy (Nov 17, c_copy_instances_to_callers, docs/inc-instances.md):
+        Policy (Nov 17, c_copy_instances_to_callers, docs/reference/incremental.md):
         an instance only one other unit calls moves there. One that two or
         more units call, and that its generic's unit does not, has its
         external definition in the calling unit first by name and a
@@ -353,7 +353,7 @@ the debug table; `SUITE=1` for B8, `FIXPOINT=1` for B9). Not run yet
         --seed-store <dir>` to fill it; the unit key no longer holds the
         input/output names, `--inc`, `--seed-store`, CC or FID_HOME, and a
         unit other than main's carries only the globals and C functions it
-        uses (docs/inc-seed-store.md, tests/tooling/inc-seed-store-check.sh).
+        uses (docs/reference/incremental.md, tests/tooling/inc-seed-store-check.sh).
         installer/build-installer.sh fills build/installer/cache from hello
         and the examples (once per C compiler on PATH: an object's name
         holds the C compiler) and fides.nsi installs it as `$INSTDIR\cache`
@@ -408,7 +408,7 @@ the debug table; `SUITE=1` for B8, `FIXPOINT=1` for B9). Not run yet
         module-level global under `--inc` are fixed: main's unit lost the
         globals' initializers (`var x: i64 = 7` read 0), and the `static`
         `__init_globals` was copied into every unit's prelude ahead of the
-        globals it names (docs/inc-seed-store.md § B8,
+        globals it names (docs/reference/incremental.md § B8,
         tests/tooling/inc-globals-check.sh).
         Left: run it (not run: no build in that session); record the
         SUITE=1 counts here once it has run.

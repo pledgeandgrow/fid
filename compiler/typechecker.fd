@@ -8432,7 +8432,7 @@ fn ct_check_expr(e: Expr, secret: Vec<str>, line: i64, out_lines: &mut Vec<i64>,
 /// Calls forbidden in @realtime code: allocation, blocking IO, spawning,
 /// dynamic dispatch (the lists of src/typechecker.rs verify_realtime).
 fn tc_rt_forbidden_call(c: str) -> bool {
-    var names: str = " p_malloc p_free p_realloc p_alloc p_vec_new p_vec_push p_vec_push_str p_vec_insert p_vec_resize p_vec_extend p_hashmap_new p_hashmap_insert p_string_new p_string_push p_string_concat p_arena_new p_arena_alloc Vec_new Vec_push Vec_insert Vec_resize HashMap_new HashMap_insert String_new String_push push insert resize extend push_str p_file_read p_file_write p_file_open p_file_close p_socket_listen p_socket_accept p_socket_read p_socket_write p_socket_connect p_socket_close p_net_connect p_net_listen p_net_accept p_fs_read_async p_fs_write_async p_print p_print_int p_print_str p_eprint_str p_print_nl print println print_str print_nl print_int p_db_open p_db_query p_db_exec p_sleep p_usleep p_thread_spawn p_chan_send p_chan_recv p_executor_submit p_future_ready spawn p_make_dyn p_call_ptr p_dyn_call ";
+    var names: str = " p_malloc p_malloc_uninit p_str_alloc_uninit p_free p_realloc p_alloc p_vec_new p_vec_push p_vec_push_str p_vec_insert p_vec_resize p_vec_extend p_hashmap_new p_hashmap_insert p_string_new p_string_push p_string_concat p_arena_new p_arena_alloc Vec_new Vec_push Vec_insert Vec_resize HashMap_new HashMap_insert String_new String_push push insert resize extend push_str p_file_read p_file_write p_file_open p_file_close p_socket_listen p_socket_accept p_socket_read p_socket_write p_socket_connect p_socket_close p_net_connect p_net_listen p_net_accept p_fs_read_async p_fs_write_async p_print p_print_int p_print_str p_eprint_str p_print_nl print println print_str print_nl print_int p_db_open p_db_query p_db_exec p_sleep p_usleep p_thread_spawn p_chan_send p_chan_recv p_executor_submit p_future_ready spawn p_make_dyn p_call_ptr p_dyn_call ";
     return str_contains(names, " " + c + " ");
 }
 
@@ -16394,6 +16394,8 @@ fn tc_alloc_func_names() -> Vec<str> {
     alloc_funcs.push("p_string_push");
     alloc_funcs.push("p_string_concat");
     alloc_funcs.push("p_malloc");
+    alloc_funcs.push("p_malloc_uninit");
+    alloc_funcs.push("p_str_alloc_uninit");
     alloc_funcs.push("p_alloc");
     alloc_funcs.push("p_realloc");
     alloc_funcs.push("p_arena_new");
@@ -16447,11 +16449,37 @@ fn TypeChecker_budget_heap(self: &mut TypeChecker, what: str, bytes: i64) {
     self.region_budgets.push(rb);
 }
 
+/// RT8: builtins only core (and the runtimes merged into it) may call:
+/// p_malloc_uninit (a p_malloc block whose bytes are not zeroed) and core's
+/// p_str_alloc_uninit (a counted string whose bytes are not zeroed).
+pub fn tc_core_only_builtin(callee: str) -> bool {
+    return callee == "p_malloc_uninit" || callee == "p_str_alloc_uninit";
+}
+
+/// RT8: an allocation whose bytes are not zeroed is core's and the
+/// runtimes' (merged into core): they write every byte they hand out.
+/// Memory any other code gets reads as zero.
+fn TypeChecker_check_core_only(self: &mut TypeChecker, callee: str) {
+    if tc_core_only_builtin(callee) && self.current_module != "core" {
+        self.errors.push("Type error (line " + int_to_str(self.current_line) + "): " + callee + "() is internal to the core library: it returns memory whose bytes are not zeroed, and only stdlib/core.fd and the runtimes may call it.\n    Fix: use p_malloc(), whose block reads as zero.");
+    }
+}
+
+/// The raw-memory builtins whose calls need an `unsafe` block.
+fn tc_raw_memory_builtin(callee: str) -> bool {
+    return callee == "p_malloc" || callee == "p_alloc" || callee == "p_free" || callee == "p_realloc" || callee == "p_memcpy" || callee == "p_memset" || callee == "p_malloc_uninit";
+}
+
+/// The allocation builtins that need the Alloc capability.
+fn tc_alloc_cap_builtin(callee: str) -> bool {
+    return callee == "p_malloc" || callee == "p_free" || callee == "p_malloc_persistent" || callee == "p_arena_save" || callee == "p_arena_restore" || callee == "p_malloc_uninit";
+}
+
 /// A call inside a region with a budget: p_malloc(N) with a constant N
 /// and Vec::new() have a known size; any other allocating builtin, or a
 /// function that allocates (itself or through its callees), has none.
 fn TypeChecker_budget_call(self: &mut TypeChecker, callee: str, args: Vec<Expr>) {
-    if callee == "p_malloc" || callee == "p_alloc" {
+    if callee == "p_malloc" || callee == "p_alloc" || callee == "p_malloc_uninit" {
         if args.len() == 1 {
             match args.get(0) {
                 Expr::IntLit(n) => {
@@ -20198,7 +20226,13 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
                     }
                 }
             }
-            if callee == "p_malloc" || callee == "p_alloc" || callee == "p_free" || callee == "p_realloc" || callee == "p_memcpy" || callee == "p_memset" {
+            // RT8: p_malloc_uninit is core's (TypeChecker_check_core_only).
+            // Kept out of line: this function's C is at the size where one
+            // more inline check made zig cc 0.16 exit 5 with no message
+            if str_starts_with(callee, "p_") {
+                TypeChecker_check_core_only(self, callee);
+            }
+            if tc_raw_memory_builtin(callee) {
                 TypeChecker_require_unsafe(self, callee + "()");
             } else if str_vec_contains(self.extern_fns, callee) && !str_starts_with(callee, "p_") && tc_is_trusted_extern(callee) == false {
                 TypeChecker_require_unsafe(self, "calling the C function " + callee + "()");
@@ -20246,7 +20280,7 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
             if callee == "spawn" || callee == "exec" || callee == "system" || callee == "p_thread_spawn" {
                 TypeChecker_check_capability(self, "Spawn", callee + "()");
             }
-            if callee == "p_malloc" || callee == "p_free" || callee == "p_malloc_persistent" || callee == "p_arena_save" || callee == "p_arena_restore" {
+            if tc_alloc_cap_builtin(callee) {
                 TypeChecker_check_capability(self, "Alloc", callee + "()");
             }
             // Inside sandbox, what the callee does counts too: an IO builtin

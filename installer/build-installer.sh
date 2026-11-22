@@ -154,7 +154,7 @@ if [ ! -f "tests/bootstrap/hello.fd" ]; then
 fi
 echo "  OK"
 
-# The seeded store of unit objects (inc-roadmap B6, docs/inc-seed-store.md):
+# The seeded store of unit objects (inc-roadmap B6, docs/reference/incremental.md):
 # release/fid.exe builds hello and the examples per module with
 # `--seed-store`, which copies every unit's object but main's into
 # build/installer/cache; the installer puts it in $INSTDIR\cache, where an

@@ -311,7 +311,7 @@ $ CC="zig cc" fid run leaky.fd --leaks
 user0,user1,user2
 fid --leaks: 2 block(s), 98 bytes, never freed; by where they were allocated:
         64 bytes in      1 block(s): main, allocated at leaky.fd:14
-        34 bytes in      1 block(s): p_str_alloc <- p_str_buf <- str_from_bytes <- str_join, allocated at leaky.fd:11
+        34 bytes in      1 block(s): p_malloc_uninit <- p_str_alloc_uninit <- str_from_bytes <- str_join, allocated at leaky.fd:11
 ```
 
 The 64 bytes are the deliberate leak. The 34 bytes are a bug of the

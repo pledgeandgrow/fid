@@ -13,7 +13,7 @@
 # has no ASan runtime; clang-cl on Windows has one but is not wired here.)
 # On Windows, scripts/sanitize-wsl.sh does the same runs with the Windows
 # fid and gcc/clang inside WSL (first runs and findings:
-# docs/verification/infra-runs-2026-11-16-b7.md).
+# docs/verification/infra-runs-2026-11-16.md).
 #
 #   FID=release/fid.exe CC=clang ./scripts/sanitize.sh            # all tests
 #   ./scripts/sanitize.sh test_vec_builtins test_mem_owned_drop    # some

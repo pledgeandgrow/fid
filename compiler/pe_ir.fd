@@ -617,6 +617,11 @@ fn pe_runtime_stub_names() -> Vec<str> {
     v.push("p_arena_save");
     v.push("p_arena_restore");
     v.push("p_region_free");
+    // RT8: p_malloc without the zeroing (core's and the runtimes' buffers
+    // they fill; PeirGen_gen_malloc_uninit). Not named p_malloc_uninit:
+    // that is core's function (stdlib/core.fd), whose calls
+    // PeirGen_resolve_call routes here
+    v.push("__p_malloc_uninit");
     return v;
 }
 
@@ -923,9 +928,10 @@ pub fn PeirGen_generate(self: &mut PeirGen, module: &IrModule) -> Vec {
         rdata.data.push(0);
     }
     self.alloc_rdata_off = rdata.data.len();
+    // (RT8: zero but for p_malloc's class tables, peir_alloc_state_byte)
     var az: i64 = 0;
     while az < PEIR_ALLOC_STATE_SIZE {
-        rdata.data.push(0);
+        rdata.data.push(peir_alloc_state_byte(az));
         az = az + 1;
     }
 
@@ -5010,6 +5016,12 @@ pub fn PeirGen_gen_inst(self: &mut PeirGen, id: i64, inst: Inst, next_cond: i64,
                 call_args.push(OptValueId::None);
             }
             var ai: i64 = 0;
+            // RT8: a call of core's p_malloc_uninit(__env, size) routed to
+            // the allocator's stub (PeirGen_resolve_call), which takes
+            // p_malloc's rcx = size: the env word is left out
+            if target_func == "__p_malloc_uninit" && call_name == "p_malloc_uninit" && args.len() == 2 && pe_ir_strs_contains(self.module_fns, call_name) {
+                ai = 1;
+            }
             while ai < args.len() {
                 call_args.push(OptValueId::Some(args.get(ai)));
                 ai = ai + 1;

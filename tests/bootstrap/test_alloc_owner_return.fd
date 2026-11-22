@@ -1,0 +1,253 @@
+// RT8 (allocator batch): owner return in the native runtime
+// (stdlib/linux_runtime/base.fd, "Owner return"): a block freed by a thread
+// that did not allocate it goes back to its owner's remote-free list, which
+// the owner empties on its slow path; the heap of a thread that ended is
+// abandoned (the frees of its blocks still go to it) and taken over by the
+// next thread, or its remote frees go to the pool. Any backend runs it (on
+// the others a remote free is just a free).
+//   - producer and consumer: one thread makes 20,000 numbered blocks of
+//     16..527 bytes a round, another checks and frees them, 30 rounds; every
+//     block the producer gets must read zero at its first and last word
+//     (most of them are its own, given back by the consumer);
+//   - ended threads: 8 times, a thread makes 2,000 blocks and ends, main
+//     checks and frees them (into the ended thread's heap), and the next
+//     thread asks for the same sizes: zero, and the memory is reused (where
+//     the resident size is known: less than 64 MB more than before);
+//   - tasks: 400 tasks each make 64 blocks, yield (and may go on on another
+//     worker), free half of them there and leave the rest to main.
+//
+// Expected output:
+// producer/consumer: 600000 blocks kept their numbers, fresh blocks zeroed: true
+// ended threads: 16000 blocks kept their numbers, reused zeroed: true
+// ended threads: memory reused
+// tasks: 25600 blocks kept their numbers
+use task;
+use sync;
+
+/// The size of block i of round r: 16 to 527 bytes
+fn psize(r: i64, i: i64) -> i64 {
+    return 16 + ((r * 31 + i * 7919) % 512);
+}
+
+@unsafe
+fn st(a: i64, v: i64) {
+    val p: * mut i64 = a;
+    unsafe { * p = v; }
+}
+
+@unsafe
+fn ld(a: i64) -> i64 {
+    val p: * mut i64 = a;
+    var v: i64 = 0;
+    unsafe { v = * p; }
+    return v;
+}
+
+fn wait_for(turn: i64, want: i64) {
+    while sync_atomic_load(turn) != want {
+    }
+}
+
+/// `rounds` rounds of n blocks into tab; the count of fresh blocks that did
+/// not read zero.
+@unsafe
+fn producer(tab: i64, n: i64, turn: i64, rounds: i64) -> i64 {
+    var bad: i64 = 0;
+    var r: i64 = 0;
+    while r < rounds {
+        wait_for(turn, 2 * r);
+        var i: i64 = 0;
+        while i < n {
+            val size: i64 = psize(r, i);
+            val b: i64 = p_malloc(size);
+            if ld(b) != 0 || ld(b + ((size - 8) & (0 - 8))) != 0 {
+                bad = bad + 1;
+            }
+            st(b, r * 100000 + i);
+            st(b + ((size - 8) & (0 - 8)), r * 100000 + i);
+            st(tab + i * 8, b);
+            i = i + 1;
+        }
+        sync_atomic_store(turn, 2 * r + 1);
+        r = r + 1;
+    }
+    return bad;
+}
+
+/// Checks and frees what the producer made: the blocks that kept their
+/// numbers.
+@unsafe
+fn consumer(tab: i64, n: i64, turn: i64, rounds: i64) -> i64 {
+    var good: i64 = 0;
+    var r: i64 = 0;
+    while r < rounds {
+        wait_for(turn, 2 * r + 1);
+        var i: i64 = 0;
+        while i < n {
+            val b: i64 = ld(tab + i * 8);
+            val size: i64 = psize(r, i);
+            if ld(b) == r * 100000 + i && ld(b + ((size - 8) & (0 - 8))) == r * 100000 + i {
+                good = good + 1;
+            }
+            p_free(b);
+            i = i + 1;
+        }
+        sync_atomic_store(turn, 2 * r + 2);
+        r = r + 1;
+    }
+    return good;
+}
+
+/// The size of block i of an ended thread's round: 16 to 4008 bytes
+fn esize(i: i64) -> i64 {
+    return 16 + ((i * 613) % 500) * 8;
+}
+
+/// n numbered blocks (seed * 10000 + i), the table of their addresses.
+@unsafe
+fn make(seed: i64, n: i64) -> i64 {
+    val tab: i64 = p_malloc(n * 8);
+    var i: i64 = 0;
+    while i < n {
+        val b: i64 = p_malloc(esize(i));
+        st(b, seed * 10000 + i);
+        st(b + esize(i) - 8, seed * 10000 + i);
+        st(tab + i * 8, b);
+        i = i + 1;
+    }
+    return tab;
+}
+
+/// The same sizes again, on this thread: 1 when every block read zero.
+@unsafe
+fn again(n: i64) -> i64 {
+    val tab: i64 = p_malloc(n * 8);
+    var zero: i64 = 1;
+    var i: i64 = 0;
+    while i < n {
+        val b: i64 = p_malloc(esize(i));
+        if ld(b) != 0 || ld(b + esize(i) - 8) != 0 {
+            zero = 0;
+        }
+        st(b, 0 - 1);
+        st(b + esize(i) - 8, 0 - 1);
+        st(tab + i * 8, b);
+        i = i + 1;
+    }
+    i = 0;
+    while i < n {
+        p_free(ld(tab + i * 8));
+        i = i + 1;
+    }
+    p_free(tab);
+    return zero;
+}
+
+var g_tab: i64 = 0;
+var g_good: i64 = 0;
+
+/// Task i: 64 blocks, a yield (it may go on on another worker), half of
+/// them freed here, the rest left in g_tab for main.
+@unsafe
+fn tasky(i: i64) -> i64 {
+    val mine: i64 = p_malloc(64 * 8);
+    var j: i64 = 0;
+    while j < 64 {
+        val b: i64 = p_malloc(24 + j * 8);
+        st(b, i * 1000 + j);
+        st(mine + j * 8, b);
+        j = j + 1;
+    }
+    task_yield();
+    j = 0;
+    while j < 64 {
+        val b: i64 = ld(mine + j * 8);
+        if ld(b) == i * 1000 + j {
+            sync_atomic_add(g_good, 1);
+        }
+        if j % 2 == 0 {
+            p_free(b);
+        } else {
+            st(g_tab + (i * 32 + j / 2) * 8, b);
+        }
+        j = j + 1;
+    }
+    p_free(mine);
+    return i;
+}
+
+@unsafe
+fn main() -> i64 {
+    // producer and consumer
+    val n: i64 = 20000;
+    val rounds: i64 = 30;
+    val tab: i64 = p_malloc(n * 8);
+    val turn: i64 = sync_atomic_alloc(0);
+    val hp = spawn producer(tab, n, turn, rounds);
+    val hc = spawn consumer(tab, n, turn, rounds);
+    val bad: i64 = await hp;
+    val good: i64 = await hc;
+    var fresh: str = "true";
+    if bad != 0 {
+        fresh = "false (" + int_to_str(bad) + ")";
+    }
+    println("producer/consumer: " + int_to_str(good) + " blocks kept their numbers, fresh blocks zeroed: " + fresh);
+    p_free(tab);
+
+    // ended threads
+    val before: i64 = p_mem_resident();
+    var kept: i64 = 0;
+    var zeroed: bool = true;
+    var s: i64 = 0;
+    while s < 8 {
+        val hm = spawn make(s, 2000);
+        val t: i64 = await hm;
+        var i: i64 = 0;
+        while i < 2000 {
+            val b: i64 = ld(t + i * 8);
+            if ld(b) == s * 10000 + i && ld(b + esize(i) - 8) == s * 10000 + i {
+                kept = kept + 1;
+            }
+            p_free(b);
+            i = i + 1;
+        }
+        p_free(t);
+        val ha = spawn again(2000);
+        if (await ha) != 1 {
+            zeroed = false;
+        }
+        if again(2000) != 1 {
+            zeroed = false;
+        }
+        s = s + 1;
+    }
+    val after: i64 = p_mem_resident();
+    var zs: str = "false";
+    if zeroed {
+        zs = "true";
+    }
+    println("ended threads: " + int_to_str(kept) + " blocks kept their numbers, reused zeroed: " + zs);
+    if before > 0 && after > 0 && after - before >= 64 * 1048576 {
+        println("ended threads: memory added up");
+    } else {
+        println("ended threads: memory reused");
+    }
+
+    // tasks
+    g_tab = p_malloc(400 * 32 * 8);
+    g_good = sync_atomic_alloc(0);
+    var k: i64 = 0;
+    while k < 400 {
+        val _h: i64 = task_go("tasky", k);
+        k = k + 1;
+    }
+    task_run();
+    k = 0;
+    while k < 400 * 32 {
+        p_free(ld(g_tab + k * 8));
+        k = k + 1;
+    }
+    p_free(g_tab);
+    println("tasks: " + int_to_str(sync_atomic_load(g_good)) + " blocks kept their numbers");
+    return 0;
+}

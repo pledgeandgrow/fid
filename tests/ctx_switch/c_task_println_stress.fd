@@ -1,0 +1,51 @@
+// Competitive RT10 x RT8: 16 tasks on 16 workers print 1,500 lines each,
+// every line built from strings allocated on the worker the task runs on
+// and freed after the print, wherever the task is then (owner return); the
+// tasks yield every 10 lines, so they move between workers. No line may be
+// broken or mixed with another (println is one locked write on the C path)
+// and every string must hold what was put in it.
+//
+// C path only (p_co_workers is the C runtime's). The order of the lines
+// varies; check them:
+//   CC="zig cc" $FID ccompile tests/ctx_switch/c_task_println_stress.fd -o ps.exe
+//   ./ps.exe | grep -cE '^task ([0-9]+) line ([0-9]+) sq ([0-9]+)$'   # 24000
+//   ./ps.exe | awk '$1 == "task" && $6 != $4 * $4' | wc -l              # 0
+//   ./ps.exe | tail -1                                                   # done: 24000 lines
+extern "C" {
+    fn p_co_workers(n: i64) -> i64;
+}
+use string;
+use task;
+use sync;
+
+var g_lines: i64 = 0;
+
+fn printer(t: i64) -> i64 {
+    var j: i64 = 0;
+    while j < 1500 {
+        val line: str = "task " + int_to_str(t) + " line " + int_to_str(j) + " sq " + int_to_str(j * j);
+        println(line);
+        sync_atomic_add(g_lines, 1);
+        if j % 10 == 9 {
+            task_yield();
+        }
+        j = j + 1;
+    }
+    return j;
+}
+
+fn main() -> i64 {
+    var asked: i64 = 0;
+    unsafe {
+        asked = p_co_workers(16);
+    }
+    g_lines = sync_atomic_alloc(0);
+    var t: i64 = 0;
+    while t < 16 {
+        task_detach(task_go("printer", t));
+        t = t + 1;
+    }
+    task_run();
+    println("done: " + int_to_str(sync_atomic_load(g_lines)) + " lines");
+    return 0;
+}

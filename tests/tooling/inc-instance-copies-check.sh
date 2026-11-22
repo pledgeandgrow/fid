@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # inc-instance-copies-check.sh — B3 (docs/roadmap/inc-roadmap.md,
-# docs/inc-instances.md): with `fid ccompile --inc`, a generic instance that
+# docs/reference/incremental.md): with `fid ccompile --inc`, a generic instance that
 # two or more units call, and that its generic's own unit does not call,
 # has its definition in the calling unit first by name and a `static` copy
 # in every other calling unit (compiler/compiler.fd

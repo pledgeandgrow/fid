@@ -1,0 +1,193 @@
+// RT8 (owner return, pe_ir: compiler/pe_ir_stubs.fd PeirGen_gen_free and
+// stdlib/pe_runtime/conc.fd "Owner return"): a block freed by a thread
+// that did not allocate it goes back to the thread whose chunk holds it,
+// which takes it back when it next needs a block of its class. Runs on
+// every backend (the other runtimes have their own designs).
+//   - A thread that stays makes 2000 blocks of 4000 bytes 24 times; each
+//     time another thread frees all of them while the maker waits for it.
+//     The maker's next blocks must be the returned ones: the memory is
+//     reused, not added up (where the resident size is known: under 96 MB
+//     more at the end than at the start, 24 x 8 MB without the return).
+//   - Blocks of many sizes made by a thread that stays, checked and freed
+//     by another, then the same sizes asked for again by the maker: each
+//     reads zero at its start and end.
+//   - Blocks of a thread that ended, freed by another one (the chunks the
+//     ended thread left), then a thread that churns 64 MB: nothing breaks,
+//     and blocks made after it read zero.
+//
+// Expected output:
+//   24 rounds of remote frees: 48000 blocks kept their numbers
+//   maker reused its returned blocks
+//   remote frees while the maker runs: 1200 kept their numbers
+//   reused after remote frees: zeroed
+//   blocks of an ended thread: 900 kept their numbers
+//   after the churn: zeroed
+
+const MB: i64 = 1048576;
+
+/// The size of block i of a thread's `seed`: 16 to 40008 bytes
+fn block_size(seed: i64, i: i64) -> i64 {
+    return 16 + ((seed + i * 7919) % 5000) * 8;
+}
+
+@unsafe
+fn st(a: i64, v: i64) {
+    var p: * mut i64 = a;
+    unsafe { * p = v; }
+}
+
+@unsafe
+fn ld(a: i64) -> i64 {
+    var p: * mut i64 = a;
+    var v: i64 = 0;
+    unsafe { v = * p; }
+    return v;
+}
+
+/// n blocks of `size` bytes (size 0: block_size(seed, i)), block i holding
+/// seed * 100000 + i at its start and end; the table of their addresses.
+@unsafe
+fn make(seed: i64, n: i64, size: i64) -> i64 {
+    val tab: i64 = p_malloc(n * 8);
+    var i: i64 = 0;
+    while i < n {
+        var sz: i64 = size;
+        if sz == 0 {
+            sz = block_size(seed, i);
+        }
+        val b: i64 = p_malloc(sz);
+        st(b, seed * 100000 + i);
+        st(b + sz - 8, seed * 100000 + i);
+        st(tab + i * 8, b);
+        i = i + 1;
+    }
+    return tab;
+}
+
+/// The blocks of `tab` that hold their numbers, all freed (the table too).
+@unsafe
+fn check_free(tab: i64, seed: i64, n: i64, size: i64) -> i64 {
+    var good: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        var sz: i64 = size;
+        if sz == 0 {
+            sz = block_size(seed, i);
+        }
+        val b: i64 = ld(tab + i * 8);
+        if ld(b) == seed * 100000 + i && ld(b + sz - 8) == seed * 100000 + i {
+            good = good + 1;
+        }
+        p_free(b);
+        i = i + 1;
+    }
+    p_free(tab);
+    return good;
+}
+
+/// n blocks of the sizes of `seed` asked for and freed: true when each
+/// read zero at its start and end.
+@unsafe
+fn reads_zero(seed: i64, n: i64) -> bool {
+    var zero: bool = true;
+    var i: i64 = 0;
+    while i < n {
+        val sz: i64 = block_size(seed, i);
+        val b: i64 = p_malloc(sz);
+        if ld(b) != 0 || ld(b + sz - 8) != 0 {
+            zero = false;
+        }
+        st(b, 0 - 1);
+        st(b + sz - 8, 0 - 1);
+        p_free(b);
+        i = i + 1;
+    }
+    return zero;
+}
+
+/// The thread that stays: 24 rounds of 2000 blocks freed by another
+/// thread each. The blocks that kept their numbers.
+@unsafe
+fn maker(rounds: i64) -> i64 {
+    var good: i64 = 0;
+    var r: i64 = 0;
+    while r < rounds {
+        val tab: i64 = make(r + 1, 2000, 4000);
+        val c = spawn check_free(tab, r + 1, 2000, 4000);
+        good = good + (await c);
+        r = r + 1;
+    }
+    return good;
+}
+
+/// Blocks of many sizes freed by another thread while this one waits,
+/// then asked for again here: 100000 + the good ones when they read zero.
+@unsafe
+fn maker_reuse(seed: i64, n: i64) -> i64 {
+    val tab: i64 = make(seed, n, 0);
+    val c = spawn check_free(tab, seed, n, 0);
+    val good: i64 = await c;
+    if reads_zero(seed, n) {
+        return 100000 + good;
+    }
+    return good;
+}
+
+/// 64 MB of 1 KB blocks made and freed here, 4 MB at a time.
+@unsafe
+fn churn(seed: i64) -> i64 {
+    var k: i64 = 0;
+    var r: i64 = 0;
+    while r < 16 {
+        val tab: i64 = make(seed + r, 4096, 1024);
+        k = k + check_free(tab, seed + r, 4096, 1024);
+        r = r + 1;
+    }
+    return k;
+}
+
+@unsafe
+fn main() -> i64 {
+    val before: i64 = p_mem_resident();
+    val m = spawn maker(24);
+    val good: i64 = await m;
+    val after: i64 = p_mem_resident();
+    println("24 rounds of remote frees: " + int_to_str(good) + " blocks kept their numbers");
+    var reused: bool = true;
+    if before > 0 && after > 0 {
+        p_eprint_str("resident " + int_to_str(before / MB) + " MB before, " + int_to_str(after / MB) + " MB after\n");
+        if after - before >= 96 * MB {
+            reused = false;
+        }
+    }
+    if reused {
+        println("maker reused its returned blocks");
+    } else {
+        println("maker added its returned blocks up");
+    }
+
+    val a0 = spawn maker_reuse(7, 600);
+    val a1 = spawn maker_reuse(8, 600);
+    val r0: i64 = await a0;
+    val r1: i64 = await a1;
+    println("remote frees while the maker runs: " + int_to_str(r0 % 100000 + r1 % 100000) + " kept their numbers");
+    if r0 >= 100000 && r1 >= 100000 {
+        println("reused after remote frees: zeroed");
+    } else {
+        println("reused after remote frees: not zeroed");
+    }
+
+    // the maker ends before its blocks are freed
+    val e = spawn make(9, 900, 0);
+    val etab: i64 = await e;
+    val f = spawn check_free(etab, 9, 900, 0);
+    println("blocks of an ended thread: " + int_to_str(await f) + " kept their numbers");
+    val g = spawn churn(20);
+    val gk: i64 = await g;
+    if gk == 16 * 4096 && reads_zero(11, 900) {
+        println("after the churn: zeroed");
+    } else {
+        println("after the churn: " + int_to_str(gk) + " blocks, not zeroed");
+    }
+    return 0;
+}

@@ -3392,6 +3392,13 @@ fn emit_runtime_types(self: &mut CCodeGen) -> void {
     wln(self, "#endif");
     wln(self, "void p_set_max_recursion(int limit) { (void)limit; }");
     wln(self, "void* p_malloc(int64_t size);");
+    // RT8: a block like p_malloc's whose bytes are unspecified (core and the
+    // runtimes only, for producers that write every byte they hand out).
+    // The name p_malloc_uninit is core's function (stdlib/core.fd, with an
+    // environment word); fast_core_vec_body makes its body a call of this
+    wln(self, "void* __p_malloc_uninit(int64_t size);");
+    // (n bytes at p zeroed as p_malloc zeroes: Vec growth's spare capacity)
+    wln(self, "void __p_zero_tail(void* p, size_t n);");
     wln(self, "void* p_malloc_persistent(int64_t size);");
     wln(self, "void* p_alloc(int64_t size);");
     wln(self, "int64_t p_arena_save(void);");
@@ -3411,7 +3418,7 @@ fn emit_runtime_types(self: &mut CCodeGen) -> void {
     wln(self, "#define P_STR_COUNTED_C(w) ((uint64_t)((w) - P_STR_RC_C) < 0x100000000ULL && !(((w) - P_STR_RC_C) & 0x40000000LL) && (((w) - P_STR_RC_C) & 0x3FFFFFFFLL) >= 1)");
     wln(self, "static inline int64_t p_str_hdr_c(const char* s) { if (!s || ((uintptr_t)s & 7)) return -1; const int64_t* h = (const int64_t*)(s - 16); if ((h[0] == P_STR_MAGIC_C || h[0] == P_STR_STATIC_C || P_STR_COUNTED_C(h[0])) && h[1] >= 0 && h[1] < 0x10000000000LL) return h[1]; return -1; }");
     wln(self, "static inline int64_t p_slen(const char* s) { if (!s) return 0; int64_t n = p_str_hdr_c(s); return n >= 0 ? n : (int64_t)strlen(s); }");
-    wln(self, "static inline char* p_str_alloc_c(int64_t n) { char* b = (char*)p_malloc(n + 17); ((int64_t*)b)[0] = P_STR_RC_C + 1; ((int64_t*)b)[1] = n; b[16 + n] = 0; return b + 16; }");
+    wln(self, "static inline char* p_str_alloc_c(int64_t n) { char* b = (char*)__p_malloc_uninit(n + 17); ((int64_t*)b)[0] = P_STR_RC_C + 1; ((int64_t*)b)[1] = n; b[16 + n] = 0; return b + 16; }");
     wln(self, "static inline void p_str_free_c(char* s) { if (!s) return; if ((uintptr_t)s & 7) { p_free(s); return; } const int64_t* h = (const int64_t*)(s - 16); if (h[1] >= 0 && h[1] < 0x10000000000LL) { if (h[0] == P_STR_STATIC_C) return; if (h[0] == P_STR_MAGIC_C || P_STR_COUNTED_C(h[0])) { p_free(s - 16); return; } } p_free(s); }");
     // Counting a string inline (proposal 0004): one more owner, or one fewer
     // with a call to core's Str_drop only to free it (or to stop on a string
@@ -3532,12 +3539,18 @@ fn emit_runtime_types(self: &mut CCodeGen) -> void {
     wln(self, "        int64_t hd = P_IS_ARENA_HDR(hw) ? (int64_t)(hw & 0xFF) : 0;");
     wln(self, "        int64_t pm = __p_rs.mode;");
     wln(self, "        __p_rs.mode = hd <= __p_rs.live ? hd : 0;");
-    wln(self, "        nd = (int64_t*)p_malloc(nc * esz);");
+    wln(self, "        nd = (int64_t*)(nc * esz <= 1024 ? p_malloc(nc * esz) : __p_malloc_uninit(nc * esz));");
     wln(self, "        __p_rs.mode = pm;");
     wln(self, "    } else {");
-    wln(self, "        nd = (int64_t*)p_malloc(nc * esz);");
+    wln(self, "        nd = (int64_t*)(nc * esz <= 1024 ? p_malloc(nc * esz) : __p_malloc_uninit(nc * esz));");
     wln(self, "    }");
     wln(self, "    int64_t* od = (int64_t*)(intptr_t)h[0];");
+    // RT8: past 1 KB the old elements are copied and only the spare
+    // capacity past them is zeroed (a Vec's buffer reads zero past its
+    // length, as with p_malloc, with its stores: the C library's memset
+    // call costs more); up to it p_malloc's inline zeroing is cheaper
+    wln(self, "    int64_t ncopy = od ? h[1] : 0;");
+    wln(self, "    if (nc * esz > 1024 && nc > ncopy) __p_zero_tail((char*)nd + ncopy * esz, (size_t)((nc - ncopy) * esz));");
     wln(self, "    if (od) { memcpy(nd, od, (size_t)(h[1] * esz)); if (!shared) __p_vbuf_free(od); }");
     wln(self, "    if (__p_sensitive_at(h) >= 0) __p_sens_buf_add(nd, nc * esz);");
     wln(self, "    h[0] = (int64_t)(intptr_t)nd;");
@@ -5930,6 +5943,9 @@ fn emit_region_impl(self: &mut CCodeGen) {
     wln(self, "    else { a = (__p_rarena*)calloc(1, sizeof(__p_rarena)); if (!a) { fprintf(stderr, \"out of memory\\n\"); abort(); } }");
     wln(self, "    a->below = __p_rs.top; a->parent = __p_rs.mode;");
     wln(self, "    __p_rs.top = a; __p_rs.live++; __p_rs.mode = __p_rs.live;");
+    // RT8: p_malloc's inline path looks at regions only while one is live
+    // on some thread (P_ASLOW_RG for each)
+    wln(self, "    __P_ASLOW_ADD(P_ASLOW_RG);");
     wln(self, "}");
     // RegionEnd: every block of the arena at once; the region that was
     // current when it began is current again
@@ -5937,6 +5953,7 @@ fn emit_region_impl(self: &mut CCodeGen) {
     wln(self, "    __p_rarena* a = __p_rs.top;");
     wln(self, "    if (!a) return;");
     wln(self, "    __p_rs.top = a->below; __p_rs.live--;");
+    wln(self, "    __P_ASLOW_ADD(-P_ASLOW_RG);");
     wln(self, "    __p_rs.mode = a->parent <= __p_rs.live ? a->parent : __p_rs.live;");
     wln(self, "    __p_rchunk* c = a->chunks;");
     wln(self, "    while (c) { __p_rchunk* n = c->next; __p_rchunk_put(c); c = n; }");
@@ -5981,6 +5998,7 @@ fn emit_region_impl(self: &mut CCodeGen) {
     wln(self, "                while (p < c->ptr) { uint64_t h = *(uint64_t*)p; int64_t sz = (int64_t)((h >> 8) & 0xFFFFFFFFULL); *(uint64_t*)p = P_ARENA_HDR(sz, 0); p += ((size_t)sz + 15) & ~(size_t)7; }");
     wln(self, "            }");
     wln(self, "            __p_rs.top = a->below; __p_rs.live--;");
+    wln(self, "            __P_ASLOW_ADD(-P_ASLOW_RG);");
     wln(self, "            __p_rs.mode = a->parent <= __p_rs.live ? a->parent : __p_rs.live;");
     wln(self, "            a->below = __p_rarena_spare; __p_rarena_spare = a;");
     wln(self, "        }");
@@ -6322,9 +6340,15 @@ fn fast_core_vec_body(name: str, func: IrFunction, c_ret: str) -> Vec<str> {
     }
     var bounds: bool = fn_has_const_str(func, "Vec index out of bounds");
     if name == "Vec_new" && n == 1 && c_ret == "int64_t" {
-        out.push("    int64_t* __h = (int64_t*)p_malloc(40);");
+        // (all 40 bytes are written: RT8's p_malloc_uninit)
+        out.push("    int64_t* __h = (int64_t*)__p_malloc_uninit(40);");
         out.push("    __h[0] = 0; __h[1] = 0; __h[2] = 0; __h[3] = 0; __h[4] = 0;");
         out.push("    return (int64_t)(intptr_t)__h;");
+    } else if name == "p_malloc_uninit" && n == 2 && c_ret == "int64_t" {
+        // RT8: core's p_malloc_uninit (env, size; its Fides body is
+        // p_malloc's zeroed block, the fallback of every other backend) runs
+        // the C runtime's block without the zeroing
+        out.push("    return (int64_t)(intptr_t)__p_malloc_uninit(" + p.get(1) + ");");
     } else if name == "p_zero_words" && n == 3 && c_ret == "void" {
         // core's word loop as memset: the lowering zeroes every owning
         // struct slot of a function in its entry block with it (proposal
@@ -9664,23 +9688,36 @@ fn emit_os_mem_runtime(self: &mut CCodeGen) {
     wln(self, "}");
 }
 
+/// RT8: the heaps. Each thread allocates from a heap of its own (__p_heap:
+/// free lists by class, the 4 MB chunks it bumps blocks from, the counts
+/// below, a span cache), taken at its first allocation and given back to a
+/// pool when it ends (a POSIX key's destructor, a Windows TLS callback,
+/// p_thread_wrapper), where the next thread to start takes it whole. A
+/// chunk is aligned to its size and records its owner heap, so p_free finds
+/// a block's owner from its address: a block freed by a thread whose heap
+/// does not own it goes back to the owner (owner return: the owner's xfree,
+/// an atomic stack the owner takes whole on its slow path, at a trim and at
+/// its thread's end), never onto the freeing thread's lists. Heaps are never
+/// freed, so a block freed after its thread ended still finds its heap.
 /// RT7: freed memory goes back to the system. A large block (over 1 MB) is
 /// pages of its own (P_CLASS_MAPPED), unmapped by p_free. The smaller
-/// classes live in 4 MB chunks: p_free counts the bytes on this thread's
-/// free lists (__p_fl_bytes) and, past __p_trim_next (8 MB at first, then
-/// what is left plus a quarter, at least 8 MB), __p_mem_trim
-///   - finds the chunks of this thread whose every handed-out byte is on
-///     its free lists, takes their blocks off the lists and unmaps them
-///     (but the current chunk and the P_KEEP_FREE_CHUNKS highest empty
-///     ones, which the next allocations reuse);
+/// classes live in 4 MB chunks: p_free counts the bytes on its heap's free
+/// lists (fl_bytes) and, past trim_next (8 MB at first, then what is left
+/// plus a quarter, at least 8 MB), __p_heap_trim
+///   - takes over the chunks and blocks of the heaps of ended threads in the
+///     pool (__p_heap_merge_pool) and the blocks others freed into the heap;
+///   - finds the chunks of the heap whose every handed-out byte is on its
+///     free lists, takes their blocks off the lists and unmaps them (but the
+///     current chunk and the P_KEEP_FREE_CHUNKS first empty ones, which the
+///     next allocations reuse);
 ///   - decommits the inside pages of each other free block of 256 KB or
 ///     more (its header and link word stay): the header gets
 ///     P_BLOCK_DECOMMITTED, and p_malloc recommits it before reuse.
-/// A block another thread freed is on that thread's lists, so its chunk is
-/// not empty here: never unmapped while in use. Once p_arena_save has
-/// marked a position (chunk indexes), the thread gives no chunk back.
-/// FID_MEM_RETURN=0 turns the trimming off (to compare); large blocks are
-/// unmapped either way.
+/// Only the owner's lists hold a chunk's free blocks, so a chunk whose
+/// bytes are all on them holds nothing in use: never unmapped while in use.
+/// Once p_arena_save has marked a position (chunk indexes), the heap gives
+/// no chunk back. FID_MEM_RETURN=0 turns the trimming off (to compare);
+/// large blocks are unmapped either way.
 /// RT8: a free block of 256 KB or more is decommitted only once it has
 /// stayed free through a whole trim interval (p_free stamps it with
 /// __p_trim_epoch in its second word; a trim takes the ones stamped before
@@ -9698,10 +9735,23 @@ fn emit_os_mem_runtime(self: &mut CCodeGen) {
 /// unmapped at the next large block, trim or thread end.
 /// FID_SPAN_CACHE=0 turns it off.
 fn emit_mem_return_runtime(self: &mut CCodeGen) {
+    // RT8: the allocator's function attributes: P_ALLOC_COLD (out of line,
+    // rare), P_ALLOC_OUT (out of line: the inline paths save no registers),
+    // P_ZERO_ALWAYS (inlined even at -O1)
+    wln(self, "#if (defined(__GNUC__) || defined(__clang__)) && !defined(__TINYC__)");
+    wln(self, "#define P_ALLOC_COLD __attribute__((noinline, cold))");
+    wln(self, "#define P_ALLOC_OUT __attribute__((noinline))");
+    wln(self, "#define P_ZERO_ALWAYS __attribute__((always_inline))");
+    wln(self, "#else");
+    wln(self, "#define P_ALLOC_COLD");
+    wln(self, "#define P_ALLOC_OUT");
+    wln(self, "#define P_ZERO_ALWAYS");
+    wln(self, "#endif");
+    wln(self, "#define P_ZERO_INLINE P_ZERO_ALWAYS inline");
     wln(self, "#define P_CLASS_MAPPED 62");
     wln(self, "#define P_BLOCK_DECOMMITTED 0x80ULL");
     // RT8: a free block cut from a chunk's fresh pages (__p_chunk_carve):
-    // zero but its link word
+    // zero but its link word; such blocks wait on their own lists (zl)
     wln(self, "#define P_BLOCK_ZERO 0x40ULL");
     wln(self, "#ifndef P_TRIM_MIN");
     wln(self, "#define P_TRIM_MIN ((int64_t)8 << 20)");
@@ -9712,22 +9762,22 @@ fn emit_mem_return_runtime(self: &mut CCodeGen) {
     wln(self, "#ifndef P_KEEP_FREE_CHUNKS");
     wln(self, "#define P_KEEP_FREE_CHUNKS 2");
     wln(self, "#endif");
-    wln(self, "static P_THREAD_LOCAL int64_t __p_fl_bytes = 0;");
-    wln(self, "static P_THREAD_LOCAL int64_t __p_trim_next = P_TRIM_MIN;");
-    wln(self, "static P_THREAD_LOCAL int __p_arena_marked = 0;");
+    // (__p_zero's thresholds, emit_block_alloc_runtime: the free and the
+    // lists stamp blocks this big with the traffic)
+    wln(self, "#ifndef P_ZERO_NT_MIN");
+    wln(self, "#define P_ZERO_NT_MIN ((size_t)16 << 10)");
+    wln(self, "#endif");
+    wln(self, "#ifndef P_ZERO_HOT");
+    wln(self, "#define P_ZERO_HOT ((uint64_t)256 << 10)");
+    wln(self, "#endif");
     wln(self, "static int __p_mem_return = -1;");
-    wln(self, "static P_THREAD_LOCAL int64_t __p_trim_epoch = 1;");
-    // RT8: the bytes handed out on this thread so far; a freed block of 16
-    // KB or more keeps the count of its free (b[2]; a cached span m[1]),
-    // which tells __p_zero whether it is still likely in the cache
-    wln(self, "static P_THREAD_LOCAL uint64_t __p_traffic = 0;");
     // the bytes of size class k (as p_malloc rounds: 2^(k/2), or 3/4 of
     // 2^((k+1)/2) for odd k)
     wln(self, "static inline int64_t __p_cls_bytes(int k) {");
     wln(self, "    if (k & 1) { int64_t b = (int64_t)1 << ((k + 1) / 2); return b - b / 4; }");
     wln(self, "    return (int64_t)1 << (k / 2);");
     wln(self, "}");
-    // the same as a table, for p_free's fast path
+    // the same as a table, for the fast paths
     wln(self, "static const int64_t __p_cls_sz[41] = { 1, 2, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192, 12288, 16384, 24576, 32768, 49152, 65536, 98304, 131072, 196608, 262144, 393216, 524288, 786432, 1048576 };");
     // RT8: the span cache (the doc comment above)
     wln(self, "#ifndef P_SPAN_CACHE_N");
@@ -9748,15 +9798,168 @@ fn emit_mem_return_runtime(self: &mut CCodeGen) {
     wln(self, "#ifndef P_SPAN_WARM_MS");
     wln(self, "#define P_SPAN_WARM_MS 1000");
     wln(self, "#endif");
-    // (the arrays have P_SPAN_CACHE_N's default size written out: csplit
-    // declares them in its header, where the macro may not be set)
-    wln(self, "static P_THREAD_LOCAL uint64_t* __p_span_m[16];");
-    wln(self, "static P_THREAD_LOCAL uint64_t __p_span_at[16];");
-    wln(self, "static P_THREAD_LOCAL int64_t __p_span_n = 0;");
-    wln(self, "static P_THREAD_LOCAL int64_t __p_span_bytes = 0;");
-    wln(self, "static P_THREAD_LOCAL uint64_t __p_big_t0 = 0;");
-    wln(self, "static P_THREAD_LOCAL int64_t __p_big_cnt = 0;");
     wln(self, "static int __p_span_on = -1;");
+    // RT8: a heap (the per-thread state of the allocator, a thread's until
+    // it ends, then the next thread's that starts: __p_heap_attach). fl: the
+    // free lists by class (headers P_BLOCK_FREED | flags | k), the blocks of
+    // this heap's chunks only; zl: blocks cut from fresh pages, zero but
+    // their link word (not counted in fl_bytes: not resident yet); cur: the
+    // chunk blocks are bumped from, the last of the list head; the rest as
+    // the doc comment above says (the trim, the span cache: spans of 16 as
+    // P_SPAN_CACHE_N's default, written out for csplit). xfree, alone in its
+    // cache line: the blocks of this heap's chunks other threads freed (owner
+    // return), a stack they push on with a compare-and-swap and the heap
+    // takes whole (__p_heap_drain: on its slow path, at a trim, at its
+    // thread's end) with one exchange, so no pop races a push.
+    wln(self, "struct __p_heap {");
+    wln(self, "    uint64_t* fl[41];");
+    wln(self, "    uint64_t* zl[41];");
+    wln(self, "    __p_arena_chunk* cur;");
+    wln(self, "    __p_arena_chunk* head;");
+    wln(self, "    int64_t fl_bytes;");
+    wln(self, "    int64_t trim_next;");
+    wln(self, "    int64_t trim_epoch;");
+    wln(self, "    uint64_t traffic;");
+    wln(self, "    int64_t arena_marked;");
+    wln(self, "    uint64_t* span_m[16];");
+    wln(self, "    uint64_t span_at[16];");
+    wln(self, "    int64_t span_n;");
+    wln(self, "    int64_t span_bytes;");
+    wln(self, "    uint64_t big_t0;");
+    wln(self, "    int64_t big_cnt;");
+    wln(self, "    struct __p_heap* pool_next;");
+    wln(self, "    int64_t dead;");
+    wln(self, "    int64_t pool_freed;");
+    wln(self, "    int64_t pad0[8];");
+    wln(self, "    uint64_t* xfree;");
+    wln(self, "    int64_t pad1[8];");
+    wln(self, "};");
+    // atomics on a chunk's owner and a heap's xfree (GNU builtins, MSVC's
+    // intrinsics; TCC has no threads of its own here: plain accesses)
+    wln(self, "#if defined(__TINYC__)");
+    wln(self, "#define __P_OWNER(c) ((c)->owner)");
+    wln(self, "#define __P_SET_OWNER(c, h) ((c)->owner = (h))");
+    wln(self, "#define __P_XFREE_ANY(h) ((h)->xfree)");
+    wln(self, "#elif defined(_MSC_VER)");
+    wln(self, "#define __P_OWNER(c) (*(__p_heap* volatile*)&(c)->owner)");
+    wln(self, "#define __P_SET_OWNER(c, h) (*(__p_heap* volatile*)&(c)->owner = (h))");
+    wln(self, "#define __P_XFREE_ANY(h) (*(uint64_t* volatile*)&(h)->xfree)");
+    wln(self, "#else");
+    wln(self, "#define __P_OWNER(c) __atomic_load_n(&(c)->owner, __ATOMIC_ACQUIRE)");
+    wln(self, "#define __P_SET_OWNER(c, h) __atomic_store_n(&(c)->owner, (h), __ATOMIC_RELEASE)");
+    wln(self, "#define __P_XFREE_ANY(h) __atomic_load_n(&(h)->xfree, __ATOMIC_RELAXED)");
+    wln(self, "#endif");
+    // block b (header P_BLOCK_FREED | k written) onto heap o's xfree
+    wln(self, "static inline void __p_xfree_push(__p_heap* o, uint64_t* b) {");
+    wln(self, "#if defined(__TINYC__)");
+    wln(self, "    b[0] = (uint64_t)(uintptr_t)o->xfree;");
+    wln(self, "    o->xfree = b;");
+    wln(self, "#elif defined(_MSC_VER)");
+    wln(self, "    void* old = *(void* volatile*)&o->xfree;");
+    wln(self, "    for (;;) {");
+    wln(self, "        b[0] = (uint64_t)(uintptr_t)old;");
+    wln(self, "        void* seen = _InterlockedCompareExchangePointer((void* volatile*)&o->xfree, (void*)b, old);");
+    wln(self, "        if (seen == old) break;");
+    wln(self, "        old = seen;");
+    wln(self, "    }");
+    wln(self, "#else");
+    wln(self, "    uint64_t* old = __atomic_load_n(&o->xfree, __ATOMIC_RELAXED);");
+    wln(self, "    do { b[0] = (uint64_t)(uintptr_t)old; } while (!__atomic_compare_exchange_n(&o->xfree, &old, b, 1, __ATOMIC_RELEASE, __ATOMIC_RELAXED));");
+    wln(self, "#endif");
+    wln(self, "}");
+    // every block on heap h's xfree, taken off it (NULL: none)
+    wln(self, "static inline uint64_t* __p_xfree_take(__p_heap* h) {");
+    wln(self, "    if (!__P_XFREE_ANY(h)) return NULL;");
+    wln(self, "#if defined(__TINYC__)");
+    wln(self, "    uint64_t* b = h->xfree;");
+    wln(self, "    h->xfree = NULL;");
+    wln(self, "    return b;");
+    wln(self, "#elif defined(_MSC_VER)");
+    wln(self, "    return (uint64_t*)_InterlockedExchangePointer((void* volatile*)&h->xfree, NULL);");
+    wln(self, "#else");
+    wln(self, "    return __atomic_exchange_n(&h->xfree, (uint64_t*)NULL, __ATOMIC_ACQUIRE);");
+    wln(self, "#endif");
+    wln(self, "}");
+    // This thread's heap (NULL before its first allocation and after its end).
+    // RT10 x RT8: under M:N a task may go on on another worker thread after
+    // any call, and the C compiler takes a thread-local's address to be the
+    // same throughout a function, so code inlined into a task's function must
+    // not keep it across a call. __P_HEAP() reads it through the thread
+    // pointer, in an asm volatile the compiler runs again at each use, at an
+    // offset the same on every thread (__p_heap_tp, taken once by
+    // __p_heap_init): Windows x64, the TEB's TLS slot __p_heap_slot (gs:0x1480
+    // + 8 * slot, kept equal to __p_tl_heap by __p_heap_attach/detach; a
+    // slot past the TEB's 64, P_ASLOW_NOTP: the slow paths only); ELF, the
+    // thread-local's offset from the thread pointer (fs:0 on x86-64, read with
+    // one fs-relative load; tpidr_el0; tp). Where there is no such register
+    // (macOS, others) a function the compiler cannot inline reads it. Without
+    // M:N, the thread-local itself. The out-of-line paths read __p_tl_heap
+    // directly: a call of theirs runs on one thread.
+    wln(self, "static P_THREAD_LOCAL __p_heap* __p_tl_heap = NULL;");
+    wln(self, "static intptr_t __p_heap_tp = 0;");
+    wln(self, "static unsigned long __p_heap_slot = 0;");
+    wln(self, "#if defined(P_MN) && defined(__x86_64__) && defined(_WIN32)");
+    wln(self, "#define P_HEAP_TP 1");
+    wln(self, "static inline __p_heap* __p_heap_tp_load(void) { __p_heap* h; __asm__ volatile(\"movq %%gs:(%1), %0\" : \"=r\"(h) : \"r\"(__p_heap_tp)); return h; }");
+    wln(self, "#elif defined(P_MN) && defined(__x86_64__) && (defined(__linux__) || defined(__FreeBSD__))");
+    wln(self, "#define P_HEAP_TP 1");
+    wln(self, "static inline char* __p_tp(void) { char* t; __asm__ volatile(\"movq %%fs:0, %0\" : \"=r\"(t)); return t; }");
+    wln(self, "static inline __p_heap* __p_heap_tp_load(void) { __p_heap* h; __asm__ volatile(\"movq %%fs:(%1), %0\" : \"=r\"(h) : \"r\"(__p_heap_tp)); return h; }");
+    wln(self, "#elif defined(P_MN) && defined(__aarch64__) && (defined(__linux__) || defined(__FreeBSD__))");
+    wln(self, "#define P_HEAP_TP 1");
+    wln(self, "static inline char* __p_tp(void) { char* t; __asm__ volatile(\"mrs %0, tpidr_el0\" : \"=r\"(t)); return t; }");
+    wln(self, "static inline __p_heap* __p_heap_tp_load(void) { return *(__p_heap* const*)(__p_tp() + __p_heap_tp); }");
+    wln(self, "#elif defined(P_MN) && defined(__riscv) && defined(__linux__)");
+    wln(self, "#define P_HEAP_TP 1");
+    wln(self, "static inline char* __p_tp(void) { char* t; __asm__ volatile(\"mv %0, tp\" : \"=r\"(t)); return t; }");
+    wln(self, "static inline __p_heap* __p_heap_tp_load(void) { return *(__p_heap* const*)(__p_tp() + __p_heap_tp); }");
+    wln(self, "#endif");
+    wln(self, "#if defined(P_HEAP_TP)");
+    wln(self, "#define __P_HEAP() __p_heap_tp_load()");
+    wln(self, "#elif defined(P_MN)");
+    wln(self, "static P_MN_NOINLINE __p_heap* __p_heap_now(void) { __p_heap* h = __p_tl_heap; __asm__ volatile(\"\" ::: \"memory\"); return h; }");
+    wln(self, "#define __P_HEAP() __p_heap_now()");
+    wln(self, "#else");
+    wln(self, "#define __P_HEAP() (__p_tl_heap)");
+    wln(self, "#endif");
+    // this thread's heap is h (NULL: none): the thread-local, and on Windows
+    // the TEB slot __P_HEAP() reads
+    wln(self, "static void __p_heap_set(__p_heap* h) {");
+    wln(self, "    __p_tl_heap = h;");
+    wln(self, "#if defined(P_HEAP_TP) && defined(_WIN32)");
+    wln(self, "    if (__p_heap_tp) TlsSetValue((DWORD)__p_heap_slot, h);");
+    wln(self, "#endif");
+    wln(self, "}");
+    // The heaps of threads that ended (__p_heap_detach), under one lock: a
+    // thread's first allocation takes one whole (its chunks, lists and
+    // xfree; a chunk keeps its owner), and a trim takes over the chunks and
+    // blocks of those that hold any (__p_heap_merge_pool; __p_pool_full of
+    // them). Heaps are never freed, so a block pushed on one late is found.
+    // (the variables outside any #if: csplit gives unit 0's definitions to
+    // the other units through extern declarations)
+    wln(self, "static volatile long __p_pool_lk = 0;");
+    wln(self, "#if defined(__TINYC__)");
+    wln(self, "#define __P_POOL_LOCK() ((void)0)");
+    wln(self, "#define __P_POOL_UNLOCK() ((void)0)");
+    wln(self, "#elif defined(_MSC_VER)");
+    wln(self, "#include <intrin.h>");
+    wln(self, "#define __P_POOL_LOCK() while (_InterlockedExchange(&__p_pool_lk, 1)) {}");
+    wln(self, "#define __P_POOL_UNLOCK() _InterlockedExchange(&__p_pool_lk, 0)");
+    wln(self, "#else");
+    wln(self, "#define __P_POOL_LOCK() while (__sync_lock_test_and_set(&__p_pool_lk, 1)) {}");
+    wln(self, "#define __P_POOL_UNLOCK() __sync_lock_release(&__p_pool_lk)");
+    wln(self, "#endif");
+    wln(self, "static __p_heap* __p_pool = NULL;");
+    wln(self, "static volatile int64_t __p_pool_full = 0;");
+    // a thread's end is seen on POSIX by a key's destructor (any thread, the
+    // C library's own included), on Windows by a TLS callback (below)
+    wln(self, "#if !defined(_WIN32) && !defined(__wasi__) && !defined(__TINYC__)");
+    wln(self, "#include <pthread.h>");
+    wln(self, "#define P_HEAP_KEY 1");
+    wln(self, "#endif");
+    wln(self, "#ifdef P_HEAP_KEY");
+    wln(self, "static pthread_key_t __p_heap_key;");
+    wln(self, "#endif");
     // a millisecond clock (only its differences are used)
     wln(self, "#if !defined(_WIN32)");
     wln(self, "#include <time.h>");
@@ -9770,87 +9973,74 @@ fn emit_mem_return_runtime(self: &mut CCodeGen) {
     wln(self, "    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;");
     wln(self, "#endif");
     wln(self, "}");
-    // the cached spans not reused for P_SPAN_PURGE_MS (all: every one) back
-    // to the system
-    wln(self, "static void __p_span_purge(uint64_t now, int all) {");
+    // the cached spans of heap h not reused for P_SPAN_PURGE_MS (all: every
+    // one) back to the system
+    wln(self, "static void __p_span_purge(__p_heap* h, uint64_t now, int all) {");
     wln(self, "    int64_t i = 0;");
-    wln(self, "    while (i < __p_span_n) {");
-    wln(self, "        if (all || now - __p_span_at[i] >= (uint64_t)P_SPAN_PURGE_MS) {");
-    wln(self, "            uint64_t* m = __p_span_m[i];");
-    wln(self, "            __p_span_bytes -= (int64_t)m[0];");
+    wln(self, "    while (i < h->span_n) {");
+    wln(self, "        if (all || now - h->span_at[i] >= (uint64_t)P_SPAN_PURGE_MS) {");
+    wln(self, "            uint64_t* m = h->span_m[i];");
+    wln(self, "            h->span_bytes -= (int64_t)m[0];");
     wln(self, "            __p_os_unmap(m, (size_t)m[0]);");
-    wln(self, "            __p_span_n--;");
-    wln(self, "            __p_span_m[i] = __p_span_m[__p_span_n];");
-    wln(self, "            __p_span_at[i] = __p_span_at[__p_span_n];");
+    wln(self, "            h->span_n--;");
+    wln(self, "            h->span_m[i] = h->span_m[h->span_n];");
+    wln(self, "            h->span_at[i] = h->span_at[h->span_n];");
     wln(self, "        } else i++;");
     wln(self, "    }");
     wln(self, "}");
     // a cached span of at least `span` bytes and at most a quarter more
     // (the smallest), out of the cache; NULL when there is none
-    wln(self, "static uint64_t* __p_span_take(size_t span) {");
+    wln(self, "static uint64_t* __p_span_take(__p_heap* h, size_t span) {");
     wln(self, "    int64_t best = -1;");
     wln(self, "    size_t bs = 0;");
-    wln(self, "    for (int64_t i = 0; i < __p_span_n; i++) {");
-    wln(self, "        size_t s = (size_t)__p_span_m[i][0];");
+    wln(self, "    for (int64_t i = 0; i < h->span_n; i++) {");
+    wln(self, "        size_t s = (size_t)h->span_m[i][0];");
     wln(self, "        if (s >= span && s - span <= span / 4 && (best < 0 || s < bs)) { best = i; bs = s; }");
     wln(self, "    }");
     wln(self, "    if (best < 0) return NULL;");
-    wln(self, "    uint64_t* m = __p_span_m[best];");
-    wln(self, "    __p_span_n--;");
-    wln(self, "    __p_span_m[best] = __p_span_m[__p_span_n];");
-    wln(self, "    __p_span_at[best] = __p_span_at[__p_span_n];");
-    wln(self, "    __p_span_bytes -= (int64_t)bs;");
+    wln(self, "    uint64_t* m = h->span_m[best];");
+    wln(self, "    h->span_n--;");
+    wln(self, "    h->span_m[best] = h->span_m[h->span_n];");
+    wln(self, "    h->span_at[best] = h->span_at[h->span_n];");
+    wln(self, "    h->span_bytes -= (int64_t)bs;");
     wln(self, "    return m;");
     wln(self, "}");
     // a large block's allocation counts toward the warm window
-    wln(self, "static void __p_span_note_alloc(uint64_t now) {");
-    wln(self, "    if (now - __p_big_t0 > (uint64_t)P_SPAN_WARM_MS) { __p_big_t0 = now; __p_big_cnt = 0; }");
-    wln(self, "    __p_big_cnt++;");
+    wln(self, "static void __p_span_note_alloc(__p_heap* h, uint64_t now) {");
+    wln(self, "    if (now - h->big_t0 > (uint64_t)P_SPAN_WARM_MS) { h->big_t0 = now; h->big_cnt = 0; }");
+    wln(self, "    h->big_cnt++;");
     wln(self, "}");
-    // a freed large block's pages m (m[0]: their size): cached when the
-    // thread is warm and they fit, else unmapped
-    wln(self, "static void __p_span_free(uint64_t* m) {");
+    // a freed large block's pages m (m[0]: their size): cached in the
+    // freeing thread's heap h when it is warm and they fit, else unmapped
+    // (a span is pages of its own: nothing of another thread's next to it)
+    wln(self, "static void __p_span_free(__p_heap* h, uint64_t* m) {");
     wln(self, "    size_t span = (size_t)m[0];");
     wln(self, "    if (__p_span_on < 0) { const char* e = getenv(\"FID_SPAN_CACHE\"); __p_span_on = (e && e[0] == '0' && e[1] == 0) ? 0 : 1; }");
+    wln(self, "    if (!h) { __p_os_unmap(m, span); return; }");
     wln(self, "    uint64_t now = __p_ms_now();");
-    wln(self, "    if (__p_span_n) __p_span_purge(now, 0);");
-    wln(self, "    if (__p_span_on && span <= P_SPAN_CACHE_MAX && (int64_t)span <= P_SPAN_CACHE_BYTES && __p_big_cnt >= P_SPAN_WARM && now - __p_big_t0 <= (uint64_t)P_SPAN_WARM_MS) {");
+    wln(self, "    if (h->span_n) __p_span_purge(h, now, 0);");
+    wln(self, "    if (__p_span_on && span <= P_SPAN_CACHE_MAX && (int64_t)span <= P_SPAN_CACHE_BYTES && h->big_cnt >= P_SPAN_WARM && now - h->big_t0 <= (uint64_t)P_SPAN_WARM_MS) {");
     // room: the oldest spans go first
-    wln(self, "        while (__p_span_n > 0 && (__p_span_n >= P_SPAN_CACHE_N || __p_span_n >= 16 || __p_span_bytes + (int64_t)span > P_SPAN_CACHE_BYTES)) {");
+    wln(self, "        while (h->span_n > 0 && (h->span_n >= P_SPAN_CACHE_N || h->span_n >= 16 || h->span_bytes + (int64_t)span > P_SPAN_CACHE_BYTES)) {");
     wln(self, "            int64_t o = 0;");
-    wln(self, "            for (int64_t i = 1; i < __p_span_n; i++) if (__p_span_at[i] < __p_span_at[o]) o = i;");
-    wln(self, "            uint64_t* om = __p_span_m[o];");
-    wln(self, "            __p_span_bytes -= (int64_t)om[0];");
+    wln(self, "            for (int64_t i = 1; i < h->span_n; i++) if (h->span_at[i] < h->span_at[o]) o = i;");
+    wln(self, "            uint64_t* om = h->span_m[o];");
+    wln(self, "            h->span_bytes -= (int64_t)om[0];");
     wln(self, "            __p_os_unmap(om, (size_t)om[0]);");
-    wln(self, "            __p_span_n--;");
-    wln(self, "            __p_span_m[o] = __p_span_m[__p_span_n];");
-    wln(self, "            __p_span_at[o] = __p_span_at[__p_span_n];");
+    wln(self, "            h->span_n--;");
+    wln(self, "            h->span_m[o] = h->span_m[h->span_n];");
+    wln(self, "            h->span_at[o] = h->span_at[h->span_n];");
     wln(self, "        }");
-    wln(self, "        if (__p_span_n < P_SPAN_CACHE_N && __p_span_n < 16) {");
-    wln(self, "            m[1] = __p_traffic;");
-    wln(self, "            __p_span_m[__p_span_n] = m;");
-    wln(self, "            __p_span_at[__p_span_n] = now;");
-    wln(self, "            __p_span_n++;");
-    wln(self, "            __p_span_bytes += (int64_t)span;");
+    wln(self, "        if (h->span_n < P_SPAN_CACHE_N && h->span_n < 16) {");
+    wln(self, "            m[1] = h->traffic;");
+    wln(self, "            h->span_m[h->span_n] = m;");
+    wln(self, "            h->span_at[h->span_n] = now;");
+    wln(self, "            h->span_n++;");
+    wln(self, "            h->span_bytes += (int64_t)span;");
     wln(self, "            return;");
     wln(self, "        }");
     wln(self, "    }");
     wln(self, "    __p_os_unmap(m, span);");
-    wln(self, "}");
-    wln(self, "static int __p_chunk_cmp(const void* a, const void* b) {");
-    wln(self, "    const char* x = (*(__p_arena_chunk* const*)a)->base;");
-    wln(self, "    const char* y = (*(__p_arena_chunk* const*)b)->base;");
-    wln(self, "    return x < y ? -1 : (x > y ? 1 : 0);");
-    wln(self, "}");
-    // the chunk (of cs, sorted by base) whose handed-out bytes hold a; -1
-    wln(self, "static int64_t __p_chunk_at(__p_arena_chunk** cs, int64_t n, const char* a) {");
-    wln(self, "    int64_t lo = 0, hi = n - 1, at = -1;");
-    wln(self, "    while (lo <= hi) {");
-    wln(self, "        int64_t mid = lo + (hi - lo) / 2;");
-    wln(self, "        if (cs[mid]->base <= a) { at = mid; lo = mid + 1; } else hi = mid - 1;");
-    wln(self, "    }");
-    wln(self, "    if (at >= 0 && a < cs[at]->ptr) return at;");
-    wln(self, "    return -1;");
     wln(self, "}");
     // the whole pages inside free block b of sz bytes, after its link word
     // and before its end
@@ -9875,204 +10065,296 @@ fn emit_mem_return_runtime(self: &mut CCodeGen) {
     wln(self, "    char* end = (char*)(b - 1) + sz;");
     wln(self, "    memset(lo + n, 0, (size_t)(end - (lo + n)));");
     wln(self, "}");
-    // What threads leave when they end (__p_mem_thread_exit): their free
-    // lists and chunks, taken over by the next thread that trims.
-    // (the variables outside any #if: csplit gives unit 0's definitions to
-    // the other units through extern declarations)
-    wln(self, "static volatile long __p_orph_lk = 0;");
-    wln(self, "#if defined(__TINYC__)");
-    wln(self, "#define __P_ORPH_LOCK() ((void)0)");
-    wln(self, "#define __P_ORPH_UNLOCK() ((void)0)");
-    wln(self, "#elif defined(_MSC_VER)");
-    wln(self, "#include <intrin.h>");
-    wln(self, "#define __P_ORPH_LOCK() while (_InterlockedExchange(&__p_orph_lk, 1)) {}");
-    wln(self, "#define __P_ORPH_UNLOCK() _InterlockedExchange(&__p_orph_lk, 0)");
-    wln(self, "#else");
-    wln(self, "#define __P_ORPH_LOCK() while (__sync_lock_test_and_set(&__p_orph_lk, 1)) {}");
-    wln(self, "#define __P_ORPH_UNLOCK() __sync_lock_release(&__p_orph_lk)");
-    wln(self, "#endif");
-    wln(self, "static uint64_t* __p_orph_lists[41];");
-    wln(self, "static __p_arena_chunk* __p_orph_chunks = NULL;");
-    wln(self, "static volatile int __p_orph_any = 0;");
-    // adopted chunks go in front of the list: the current chunk stays its
-    // last, so an arena mark taken later still counts to it
-    wln(self, "static void __p_mem_adopt(void) {");
-    // (only under a current chunk: p_arena_save's mark 0 means "no chunk")
-    wln(self, "    if (!__p_orph_any || !__p_arena_cur) return;");
-    wln(self, "    __P_ORPH_LOCK();");
-    wln(self, "    for (int k = 0; k < 41; k++) {");
-    wln(self, "        uint64_t* b = __p_orph_lists[k];");
-    wln(self, "        if (!b) continue;");
-    wln(self, "        int64_t sz = __p_cls_bytes(k);");
-    wln(self, "        uint64_t* last = b;");
-    wln(self, "        for (;;) {");
-    wln(self, "            if (!(last[-1] & (P_BLOCK_DECOMMITTED | P_BLOCK_ZERO))) __p_fl_bytes += sz;");
-    wln(self, "            if (!last[0]) break;");
-    wln(self, "            last = (uint64_t*)(uintptr_t)last[0];");
-    wln(self, "        }");
-    wln(self, "        last[0] = (uint64_t)(uintptr_t)__p_free_lists[k];");
-    wln(self, "        __p_free_lists[k] = b;");
-    wln(self, "        __p_orph_lists[k] = NULL;");
-    wln(self, "    }");
-    wln(self, "    while (__p_orph_chunks) {");
-    wln(self, "        __p_arena_chunk* c = __p_orph_chunks;");
-    wln(self, "        __p_orph_chunks = c->next;");
-    wln(self, "        c->next = __p_arena_head;");
-    wln(self, "        __p_arena_head = c;");
-    wln(self, "    }");
-    wln(self, "    __p_orph_any = 0;");
-    wln(self, "    __P_ORPH_UNLOCK();");
+    // freed block b of class k onto heap h's list, stamped as p_free stamps
+    // (the trim's epoch on a block it may decommit, the traffic on one
+    // __p_zero may find cold)
+    wln(self, "static inline void __p_heap_put(__p_heap* h, uint64_t* b, int k) {");
+    wln(self, "    int64_t sz = __p_cls_sz[k];");
+    wln(self, "    if (sz >= P_DECOMMIT_MIN) b[1] = (uint64_t)h->trim_epoch;");
+    wln(self, "    if (sz >= (int64_t)P_ZERO_NT_MIN) b[2] = h->traffic;");
+    wln(self, "    b[0] = (uint64_t)(uintptr_t)h->fl[k];");
+    wln(self, "    h->fl[k] = b;");
+    wln(self, "    h->fl_bytes += sz;");
     wln(self, "}");
-    // (all: every big free block is decommitted, not only the idle ones)
-    wln(self, "static void __p_mem_trim_keep(int64_t keep, int adopt, int all) {");
-    // RT8: cached spans past their time (all of them at a thread's end)
-    wln(self, "    if (__p_span_n) __p_span_purge(__p_ms_now(), all);");
-    wln(self, "    if (__p_mem_return < 0) { const char* e = getenv(\"FID_MEM_RETURN\"); __p_mem_return = (e && e[0] == '0' && e[1] == 0) ? 0 : 1; }");
-    wln(self, "    if (!__p_mem_return || __p_arena_marked || P_SAN_ALLOC) { __p_trim_next = INT64_MAX; return; }");
-    wln(self, "    if (adopt) __p_mem_adopt();");
-    wln(self, "    int64_t n = 0, i = 0;");
-    wln(self, "    for (__p_arena_chunk* c = __p_arena_head; c; c = c->next) n++;");
-    wln(self, "    __p_arena_chunk** cs = NULL;");
-    wln(self, "    int64_t* fb = NULL;");
-    wln(self, "    if (n > 0) {");
-    wln(self, "        cs = (__p_arena_chunk**)malloc((size_t)n * sizeof(*cs));");
-    wln(self, "        fb = (int64_t*)calloc((size_t)n, sizeof(int64_t));");
-    wln(self, "        if (!cs || !fb) { free(cs); free(fb); __p_trim_next = __p_fl_bytes + P_TRIM_MIN; return; }");
-    wln(self, "        for (__p_arena_chunk* c = __p_arena_head; c; c = c->next) cs[i++] = c;");
-    wln(self, "        if (n > 1) qsort(cs, (size_t)n, sizeof(*cs), __p_chunk_cmp);");
+    // the blocks on heap `from`'s xfree, each where it belongs: on heap
+    // me's lists when me owns its chunk now, else on its owner's xfree (a
+    // block pushed on a heap whose chunks a trim took over meanwhile)
+    wln(self, "static void __p_heap_drain_into(__p_heap* from, __p_heap* me) {");
+    wln(self, "    uint64_t* b = __p_xfree_take(from);");
+    wln(self, "    while (b) {");
+    wln(self, "        uint64_t* nx = (uint64_t*)(uintptr_t)b[0];");
+    wln(self, "        __p_heap* o = __P_OWNER(__P_CHUNK_OF(b));");
+    wln(self, "        if (o == me) __p_heap_put(me, b, (int)(b[-1] & 0xFF));");
+    wln(self, "        else __p_xfree_push(o, b);");
+    wln(self, "        b = nx;");
     wln(self, "    }");
-    // the free bytes of each chunk of this thread
-    wln(self, "    for (int k = 0; k < 41; k++) {");
-    wln(self, "        int64_t sz = __p_cls_bytes(k);");
-    wln(self, "        for (uint64_t* b = __p_free_lists[k]; b; b = (uint64_t*)(uintptr_t)b[0]) {");
-    wln(self, "            int64_t at = __p_chunk_at(cs, n, (const char*)(b - 1));");
-    wln(self, "            if (at >= 0) fb[at] += sz;");
+    wln(self, "}");
+    wln(self, "static void __p_heap_drain(__p_heap* h) { __p_heap_drain_into(h, h); }");
+    // RT8: the rest of chunk c, too small for the block asked for, cut into
+    // free blocks of the largest classes that fit, marked zero (fresh pages,
+    // only their link word written) on heap h's zl lists, so p_malloc hands
+    // them out without zeroing them. Not counted in fl_bytes, as
+    // decommitted blocks are not: their pages are not resident, nothing to
+    // give back (counted, they set off trims that change nothing)
+    wln(self, "static void __p_chunk_carve(__p_heap* h, __p_arena_chunk* c) {");
+    wln(self, "    for (int k = 40; k >= 8; k--) {");
+    wln(self, "        int64_t sz = __p_cls_sz[k];");
+    wln(self, "        while (c->end - c->ptr >= sz) {");
+    wln(self, "            uint64_t* b = (uint64_t*)c->ptr + 1;");
+    wln(self, "            c->ptr += sz;");
+    wln(self, "            b[-1] = P_BLOCK_FREED | P_BLOCK_ZERO | (uint64_t)k;");
+    wln(self, "            b[0] = (uint64_t)(uintptr_t)h->zl[k];");
+    wln(self, "            h->zl[k] = b;");
     wln(self, "        }");
     wln(self, "    }");
-    // empty chunks (fb < 0 from here: to unmap), but the current one and
-    // the last P_KEEP_FREE_CHUNKS empty ones
+    wln(self, "}");
+    // list a appended to list *to (a's last block found by walking it)
+    wln(self, "static void __p_list_join(uint64_t** to, uint64_t* a) {");
+    wln(self, "    if (!a) return;");
+    wln(self, "    uint64_t* last = a;");
+    wln(self, "    while (last[0]) last = (uint64_t*)(uintptr_t)last[0];");
+    wln(self, "    last[0] = (uint64_t)(uintptr_t)*to;");
+    wln(self, "    *to = a;");
+    wln(self, "}");
+    // What threads leave when they end, taken over by heap me (a trim): the
+    // chunks of the pooled heaps that hold any become me's (owner set, put
+    // in front of me's list: me's current chunk stays its last, so an arena
+    // mark taken later still counts to it), their lists join me's, and what
+    // other threads freed into them goes where it belongs. The emptied heaps
+    // stay in the pool for new threads; the blocks other heaps there got late
+    // are passed on too. Not a heap with an arena mark (its chunk indexes).
+    wln(self, "static void __p_heap_merge_pool(__p_heap* me) {");
+    wln(self, "    if (!__p_pool_full) return;");
+    wln(self, "    __P_POOL_LOCK();");
+    wln(self, "    __p_heap* got = NULL;");
+    wln(self, "    __p_heap** pp = &__p_pool;");
+    wln(self, "    while (*pp) {");
+    wln(self, "        __p_heap* d = *pp;");
+    wln(self, "        if (d->head && !d->arena_marked) { *pp = d->pool_next; d->pool_next = got; got = d; __p_pool_full--; }");
+    wln(self, "        else pp = &d->pool_next;");
+    wln(self, "    }");
+    wln(self, "    __P_POOL_UNLOCK();");
+    wln(self, "    __p_heap* back = got;");
+    wln(self, "    while (got) {");
+    wln(self, "        __p_heap* d = got;");
+    wln(self, "        got = d->pool_next;");
+    wln(self, "        if (d->cur) { __p_chunk_carve(d, d->cur); d->cur = NULL; }");
+    wln(self, "        __p_arena_chunk* last = NULL;");
+    wln(self, "        for (__p_arena_chunk* c = d->head; c; c = c->next) { __P_SET_OWNER(c, me); last = c; }");
+    wln(self, "        last->next = me->head;");
+    wln(self, "        me->head = d->head;");
+    wln(self, "        d->head = NULL;");
+    wln(self, "        for (int k = 0; k < 41; k++) {");
+    wln(self, "            __p_list_join(&me->fl[k], d->fl[k]);");
+    wln(self, "            d->fl[k] = NULL;");
+    wln(self, "            __p_list_join(&me->zl[k], d->zl[k]);");
+    wln(self, "            d->zl[k] = NULL;");
+    wln(self, "        }");
+    wln(self, "        me->fl_bytes += d->fl_bytes;");
+    wln(self, "        d->fl_bytes = 0;");
+    wln(self, "        d->trim_next = P_TRIM_MIN;");
+    wln(self, "        d->dead = 0;");
+    wln(self, "        __p_heap_drain_into(d, me);");
+    wln(self, "    }");
+    wln(self, "    __P_POOL_LOCK();");
+    wln(self, "    while (back) {");
+    wln(self, "        __p_heap* d = back;");
+    wln(self, "        back = d->pool_next;");
+    wln(self, "        d->pool_next = __p_pool;");
+    wln(self, "        __p_pool = d;");
+    wln(self, "    }");
+    wln(self, "    for (__p_heap* d = __p_pool; d; d = d->pool_next) if (!d->head && __P_XFREE_ANY(d)) __p_heap_drain_into(d, me);");
+    wln(self, "    __P_POOL_UNLOCK();");
+    wln(self, "}");
+    // The trim of heap h (keep: the empty chunks to keep; adopt: take over
+    // the pool's heaps first; all: decommit every big free block, not only
+    // the idle ones). What other threads freed into h first goes on its lists.
+    wln(self, "static P_ALLOC_COLD void __p_heap_trim_keep(__p_heap* h, int64_t keep, int adopt, int all) {");
+    // RT8: cached spans past their time (all of them at a thread's end)
+    wln(self, "    if (h->span_n) __p_span_purge(h, __p_ms_now(), all);");
+    wln(self, "    if (__p_mem_return < 0) { const char* e = getenv(\"FID_MEM_RETURN\"); __p_mem_return = (e && e[0] == '0' && e[1] == 0) ? 0 : 1; }");
+    wln(self, "    if (!__p_mem_return || h->arena_marked || P_SAN_ALLOC) { h->trim_next = INT64_MAX; return; }");
+    wln(self, "    if (adopt) __p_heap_merge_pool(h);");
+    wln(self, "    __p_heap_drain(h);");
+    // the free bytes of each chunk of h (every block on h's lists is in one
+    // of h's chunks)
+    wln(self, "    for (__p_arena_chunk* c = h->head; c; c = c->next) c->fb = 0;");
+    wln(self, "    for (int k = 0; k < 41; k++) {");
+    wln(self, "        int64_t sz = __p_cls_sz[k];");
+    wln(self, "        for (uint64_t* b = h->fl[k]; b; b = (uint64_t*)(uintptr_t)b[0]) __P_CHUNK_OF(b)->fb += sz;");
+    wln(self, "        for (uint64_t* b = h->zl[k]; b; b = (uint64_t*)(uintptr_t)b[0]) __P_CHUNK_OF(b)->fb += sz;");
+    wln(self, "    }");
+    // empty chunks (fb -1 from here: to unmap), but the current one and the
+    // last `keep` empty ones
     wln(self, "    int64_t empty = 0;");
-    wln(self, "    for (i = 0; i < n; i++) if (cs[i] != __p_arena_cur && fb[i] == (int64_t)(cs[i]->ptr - cs[i]->base)) empty++;");
+    wln(self, "    for (__p_arena_chunk* c = h->head; c; c = c->next) if (c != h->cur && c->fb == (int64_t)(c->ptr - c->base)) empty++;");
     wln(self, "    int64_t drop = empty - keep;");
-    wln(self, "    for (i = 0; i < n && drop > 0; i++) {");
-    wln(self, "        if (cs[i] != __p_arena_cur && fb[i] == (int64_t)(cs[i]->ptr - cs[i]->base)) { fb[i] = -1; drop--; }");
+    wln(self, "    for (__p_arena_chunk* c = h->head; c && drop > 0; c = c->next) {");
+    wln(self, "        if (c != h->cur && c->fb == (int64_t)(c->ptr - c->base)) { c->fb = -1; drop--; }");
     wln(self, "    }");
     // off the lists: the blocks of the chunks to unmap; decommitted: the
     // inside of each other free block of P_DECOMMIT_MIN bytes or more
     wln(self, "    for (int k = 0; k < 41; k++) {");
-    wln(self, "        int64_t sz = __p_cls_bytes(k);");
+    wln(self, "        int64_t sz = __p_cls_sz[k];");
     wln(self, "        uint64_t* prev = NULL;");
-    wln(self, "        uint64_t* b = __p_free_lists[k];");
+    wln(self, "        uint64_t* b = h->zl[k];");
     wln(self, "        while (b) {");
     wln(self, "            uint64_t* nx = (uint64_t*)(uintptr_t)b[0];");
-    wln(self, "            int64_t at = __p_chunk_at(cs, n, (const char*)(b - 1));");
-    wln(self, "            if (at >= 0 && fb[at] < 0) {");
-    wln(self, "                if (prev) prev[0] = (uint64_t)(uintptr_t)nx; else __p_free_lists[k] = nx;");
-    wln(self, "                if (!(b[-1] & (P_BLOCK_DECOMMITTED | P_BLOCK_ZERO))) __p_fl_bytes -= sz;");
+    wln(self, "            if (__P_CHUNK_OF(b)->fb < 0) { if (prev) prev[0] = (uint64_t)(uintptr_t)nx; else h->zl[k] = nx; }");
+    wln(self, "            else prev = b;");
+    wln(self, "            b = nx;");
+    wln(self, "        }");
+    wln(self, "        prev = NULL;");
+    wln(self, "        b = h->fl[k];");
+    wln(self, "        while (b) {");
+    wln(self, "            uint64_t* nx = (uint64_t*)(uintptr_t)b[0];");
+    wln(self, "            if (__P_CHUNK_OF(b)->fb < 0) {");
+    wln(self, "                if (prev) prev[0] = (uint64_t)(uintptr_t)nx; else h->fl[k] = nx;");
+    wln(self, "                if (!(b[-1] & P_BLOCK_DECOMMITTED)) h->fl_bytes -= sz;");
     wln(self, "            } else {");
-    // RT8: only a block already free at the previous trim (its stamp,
-    // b[1], is read only while its pages are there), not a zero one (its
-    // untouched pages are not resident)
-    wln(self, "                if (sz >= P_DECOMMIT_MIN && !(b[-1] & (P_BLOCK_DECOMMITTED | P_BLOCK_ZERO)) && (all || (int64_t)b[1] < __p_trim_epoch)) {");
+    // RT8: only a block already free at the previous trim (its stamp, b[1],
+    // is read only while its pages are there)
+    wln(self, "                if (sz >= P_DECOMMIT_MIN && !(b[-1] & P_BLOCK_DECOMMITTED) && (all || (int64_t)b[1] < h->trim_epoch)) {");
     wln(self, "                    char* lo = NULL; size_t len = 0;");
-    wln(self, "                    if (__p_block_pages(b, sz, &lo, &len) && __p_os_decommit(lo, len)) { b[-1] |= P_BLOCK_DECOMMITTED; __p_fl_bytes -= sz; }");
+    wln(self, "                    if (__p_block_pages(b, sz, &lo, &len) && __p_os_decommit(lo, len)) { b[-1] |= P_BLOCK_DECOMMITTED; h->fl_bytes -= sz; }");
     wln(self, "                }");
     wln(self, "                prev = b;");
     wln(self, "            }");
     wln(self, "            b = nx;");
     wln(self, "        }");
     wln(self, "    }");
-    // unmap them (ptr NULL marks one), out of the chunk list
-    wln(self, "    for (i = 0; i < n; i++) if (fb[i] < 0) cs[i]->ptr = NULL;");
-    wln(self, "    __p_arena_chunk** pp = &__p_arena_head;");
-    wln(self, "    while (*pp) {");
-    wln(self, "        __p_arena_chunk* c = *pp;");
-    wln(self, "        if (!c->ptr) { *pp = c->next; __p_arena_free_chunk(c); } else pp = &c->next;");
+    // unmapped, out of the chunk list
+    wln(self, "    __p_arena_chunk** cp = &h->head;");
+    wln(self, "    while (*cp) {");
+    wln(self, "        __p_arena_chunk* c = *cp;");
+    wln(self, "        if (c->fb < 0) { *cp = c->next; __p_arena_free_chunk(c); } else cp = &c->next;");
     wln(self, "    }");
-    wln(self, "    free(cs);");
-    wln(self, "    free(fb);");
-    wln(self, "    int64_t step = __p_fl_bytes / 4;");
+    wln(self, "    int64_t step = h->fl_bytes / 4;");
     wln(self, "    if (step < P_TRIM_MIN) step = P_TRIM_MIN;");
-    wln(self, "    __p_trim_next = __p_fl_bytes + step;");
-    wln(self, "    __p_trim_epoch++;");
+    wln(self, "    h->trim_next = h->fl_bytes + step;");
+    wln(self, "    h->trim_epoch++;");
     wln(self, "}");
-    wln(self, "static void __p_mem_trim(void) { __p_mem_trim_keep(P_KEEP_FREE_CHUNKS, 1, 0); }");
-    // A thread that ends (p_thread_wrapper) gives back its empty chunks,
-    // the current one too, and leaves the rest (chunks holding blocks still
-    // in use elsewhere, free blocks of any chunk) to the other threads.
-    wln(self, "static void __p_mem_thread_exit(void) {");
-    wln(self, "#if !defined(__TINYC__)");
-    wln(self, "    if (P_SAN_ALLOC) return;");
-    wln(self, "    __p_arena_chunk* cur = __p_arena_cur;");
-    wln(self, "    __p_arena_cur = NULL;");
-    wln(self, "    __p_mem_trim_keep(0, 0, 1);");
-    wln(self, "    if (__p_mem_return != 1 || __p_arena_marked) { __p_arena_cur = cur; return; }");
-    wln(self, "    __P_ORPH_LOCK();");
-    wln(self, "    for (int k = 0; k < 41; k++) {");
-    wln(self, "        uint64_t* b = __p_free_lists[k];");
-    wln(self, "        if (!b) continue;");
-    wln(self, "        uint64_t* last = b;");
-    wln(self, "        while (last[0]) last = (uint64_t*)(uintptr_t)last[0];");
-    wln(self, "        last[0] = (uint64_t)(uintptr_t)__p_orph_lists[k];");
-    wln(self, "        __p_orph_lists[k] = b;");
-    wln(self, "        __p_free_lists[k] = NULL;");
-    wln(self, "    }");
-    wln(self, "    if (__p_arena_head) {");
-    wln(self, "        __p_arena_chunk* t = __p_arena_head;");
-    wln(self, "        while (t->next) t = t->next;");
-    wln(self, "        t->next = __p_orph_chunks;");
-    wln(self, "        __p_orph_chunks = __p_arena_head;");
-    wln(self, "    }");
-    wln(self, "    __p_orph_any = 1;");
-    wln(self, "    __P_ORPH_UNLOCK();");
-    wln(self, "    __p_arena_head = NULL;");
-    wln(self, "    __p_fl_bytes = 0;");
-    wln(self, "    __p_trim_next = P_TRIM_MIN;");
+    wln(self, "static P_ALLOC_COLD void __p_heap_trim(__p_heap* h) { __p_heap_trim_keep(h, P_KEEP_FREE_CHUNKS, 1, 0); }");
+    // Once, before the first allocation's heap: the TLS offset __P_HEAP()
+    // reads at, the thread-end key, the memory limit's bit; then the fast
+    // paths are open (P_ASLOW_INIT off)
+    wln(self, "static void __p_heap_detach(int full);");
+    wln(self, "#ifdef P_HEAP_KEY");
+    wln(self, "static void __p_heap_key_done(void* v) { (void)v; __p_heap_detach(1); }");
     wln(self, "#endif");
+    wln(self, "static P_ALLOC_COLD void __p_heap_init(void) {");
+    wln(self, "    __P_POOL_LOCK();");
+    wln(self, "    if (__P_ASLOW() & P_ASLOW_INIT) {");
+    wln(self, "#if defined(P_HEAP_TP) && defined(_WIN32)");
+    wln(self, "        DWORD slot = TlsAlloc();");
+    wln(self, "        if (slot < 64) { __p_heap_slot = slot; __p_heap_tp = 0x1480 + 8 * (intptr_t)slot; }");
+    wln(self, "        else { if (slot != TLS_OUT_OF_INDEXES) TlsFree(slot); __P_ASLOW_ADD(P_ASLOW_NOTP); }");
+    wln(self, "#elif defined(P_HEAP_TP)");
+    wln(self, "        __p_heap_tp = (intptr_t)((char*)&__p_tl_heap - __p_tp());");
+    wln(self, "#endif");
+    wln(self, "#ifdef P_HEAP_KEY");
+    wln(self, "        pthread_key_create(&__p_heap_key, __p_heap_key_done);");
+    wln(self, "#endif");
+    wln(self, "        if (__p_lim_mem && !(__P_ASLOW() & P_ASLOW_LIM)) __P_ASLOW_ADD(P_ASLOW_LIM);");
+    wln(self, "        __P_ASLOW_ADD(-P_ASLOW_INIT);");
+    wln(self, "    }");
+    wln(self, "    __P_POOL_UNLOCK();");
+    wln(self, "}");
+    // A heap for this thread, which has none: an ended thread's from the
+    // pool (its chunks, free blocks and xfree with it), else a new one
+    wln(self, "static P_ALLOC_COLD __p_heap* __p_heap_attach(void) {");
+    wln(self, "    if (__P_ASLOW() & P_ASLOW_INIT) __p_heap_init();");
+    wln(self, "    __P_POOL_LOCK();");
+    wln(self, "    __p_heap* h = __p_pool;");
+    wln(self, "    if (h) { __p_pool = h->pool_next; if (h->head) __p_pool_full--; }");
+    wln(self, "    __P_POOL_UNLOCK();");
+    wln(self, "    if (!h) {");
+    wln(self, "        h = (__p_heap*)calloc(1, sizeof(__p_heap));");
+    wln(self, "        if (!h) __p_oom(sizeof(__p_heap));");
+    wln(self, "        h->trim_next = P_TRIM_MIN;");
+    wln(self, "        h->trim_epoch = 1;");
+    wln(self, "    }");
+    wln(self, "    h->pool_next = NULL;");
+    wln(self, "    h->dead = 0;");
+    wln(self, "    __p_heap_set(h);");
+    wln(self, "#ifdef P_HEAP_KEY");
+    wln(self, "    pthread_setspecific(__p_heap_key, h);");
+    wln(self, "#endif");
+    wln(self, "    return h;");
+    wln(self, "}");
+    // A thread that ends (p_thread_wrapper, the key's destructor, the TLS
+    // callback; once): its heap goes to the pool, where the next thread to
+    // start takes it (or a trim its chunks); a block still in use elsewhere
+    // comes back to it when that thread frees it. full: first what others
+    // freed into the heap goes on its lists, the rest of its current chunk
+    // too (zero blocks), and its empty chunks and cached spans go back to the
+    // system (RT7). Not in the Windows TLS callback, which runs under the
+    // loader lock (every thread start and end waits for it): there only the
+    // heap is pooled, and the next thread or trim does the rest.
+    wln(self, "static void __p_heap_detach(int full) {");
+    wln(self, "#if !defined(__TINYC__)");
+    wln(self, "    __p_heap* h = __p_tl_heap;");
+    wln(self, "    if (!h) return;");
+    wln(self, "    __p_heap_set(NULL);");
+    wln(self, "#ifdef P_HEAP_KEY");
+    wln(self, "    pthread_setspecific(__p_heap_key, NULL);");
+    wln(self, "#endif");
+    wln(self, "    if (full && !P_SAN_ALLOC) {");
+    wln(self, "        __p_heap_drain(h);");
+    wln(self, "        if (h->cur && !h->arena_marked) { __p_chunk_carve(h, h->cur); h->cur = NULL; }");
+    wln(self, "        __p_heap_trim_keep(h, 0, 0, 1);");
+    wln(self, "    }");
+    wln(self, "    h->dead = 1;");
+    wln(self, "    __P_POOL_LOCK();");
+    wln(self, "    h->pool_next = __p_pool;");
+    wln(self, "    __p_pool = h;");
+    wln(self, "    if (h->head) __p_pool_full++;");
+    wln(self, "    __P_POOL_UNLOCK();");
+    wln(self, "#endif");
+    wln(self, "}");
+    wln(self, "static void __p_mem_thread_exit(void) { __p_heap_detach(1); }");
+    wln(self, "#if defined(_WIN32) && !defined(__TINYC__)");
+    wln(self, "static void NTAPI __p_heap_tls_cb(PVOID m, DWORD reason, PVOID r) { (void)m; (void)r; if (reason == DLL_THREAD_DETACH) __p_heap_detach(0); }");
+    wln(self, "#if defined(_MSC_VER)");
+    wln(self, "#pragma comment(linker, \"/INCLUDE:_tls_used\")");
+    wln(self, "#pragma comment(linker, \"/INCLUDE:__p_heap_tls_cbp\")");
+    wln(self, "#pragma section(\".CRT$XLB\", long, read)");
+    wln(self, "__declspec(allocate(\".CRT$XLB\")) PIMAGE_TLS_CALLBACK __p_heap_tls_cbp = __p_heap_tls_cb;");
+    wln(self, "#else");
+    wln(self, "PIMAGE_TLS_CALLBACK __p_heap_tls_cbp __attribute__((section(\".CRT$XLB\"), used)) = __p_heap_tls_cb;");
+    wln(self, "#endif");
+    wln(self, "#endif");
+    // RT8 x RT10: a worker that has nothing to run (it never ends): what
+    // other workers freed into its heap goes on its lists (a trim when they
+    // pass its threshold), its cached spans past their time back
+    wln(self, "static void __p_heap_idle(void) {");
+    wln(self, "    __p_heap* h = __p_tl_heap;");
+    wln(self, "    if (!h) return;");
+    wln(self, "    if (h->span_n) __p_span_purge(h, __p_ms_now(), 0);");
+    wln(self, "    if (__P_XFREE_ANY(h)) {");
+    wln(self, "        __p_heap_drain(h);");
+    wln(self, "        if (h->fl_bytes > h->trim_next) __p_heap_trim(h);");
+    wln(self, "    }");
     wln(self, "}");
 }
 
 /// RT8: the C runtime's block allocator: __p_zero / __p_zero_big, the size
-/// classes, p_malloc (a fast path for a class block from this thread's
-/// free list or current chunk; __p_malloc_full for the rest) and p_free
-/// (likewise, __p_free_full). Emitted after emit_mem_return_runtime (the
-/// trim, the span cache) and the embed log's renaming of p_malloc, whose
-/// text it carries in the middle.
+/// classes, p_malloc and p_malloc_uninit (an inline path for a small block
+/// from the head of this thread's free list, the class by table;
+/// __p_malloc_slow for the rest) and p_free (inline for a small block of
+/// this thread's heap, the owner's xfree for another's; __p_free_full for
+/// the rest). Emitted after emit_mem_return_runtime (the heaps, the trim,
+/// the span cache) and the embed log's renaming of p_malloc, whose text it
+/// carries in the middle.
 fn emit_block_alloc_runtime(self: &mut CCodeGen) {
-    // RT8: a reused block is zeroed here, so this is p_malloc's hot path.
-    // Up to 256 bytes: two overlapping stores of a constant size each, which
-    // the C compiler makes inline vector stores (the C library's memset
-    // call cost more than the rest of p_malloc: bench/alloc/run.sh, 2-3x on
-    // alloc/small, churn and threads); beyond that `rep stosb` on x86-64
-    // (memset elsewhere). A block of P_ZERO_NT_MIN bytes (16 KB) or more that
-    // is cold (`cold`: more than P_ZERO_HOT bytes, 256 KB, were handed out on
-    // this thread since it was freed, __p_traffic) is zeroed with stores that
-    // bypass the cache (__p_zero_big): the cache-filling ones read each line
-    // from memory before writing it (bench/alloc/large about 2x faster, sizes
-    // 1.4x); a block freed and asked for again right away is likely in the
-    // cache, where those stores are 5-9x faster than memory. n is a multiple
-    // of 8.
-    wln(self, "#if (defined(__GNUC__) || defined(__clang__)) && !defined(__TINYC__)");
-    wln(self, "#define P_ZERO_INLINE __attribute__((always_inline)) inline");
-    wln(self, "#define P_ALLOC_COLD __attribute__((noinline, cold))");
-    wln(self, "#else");
-    wln(self, "#define P_ZERO_INLINE inline");
-    wln(self, "#define P_ALLOC_COLD");
-    wln(self, "#endif");
-    wln(self, "#ifndef P_ZERO_NT_MIN");
-    wln(self, "#define P_ZERO_NT_MIN ((size_t)16 << 10)");
-    wln(self, "#endif");
-    wln(self, "#ifndef P_ZERO_HOT");
-    wln(self, "#define P_ZERO_HOT ((uint64_t)256 << 10)");
-    wln(self, "#endif");
+    // n bytes at p (16-aligned; n a multiple of 16, at least 64) zeroed with
+    // non-temporal stores (memset where there are none)
     wln(self, "#if (defined(__x86_64__) || defined(_M_X64)) && !defined(__TINYC__)");
     wln(self, "#include <emmintrin.h>");
     wln(self, "#define P_ZERO_NT 1");
     wln(self, "#else");
     wln(self, "#define P_ZERO_NT 0");
     wln(self, "#endif");
-    // n bytes at p (16-aligned; n a multiple of 16, at least 64) zeroed with
-    // non-temporal stores (memset where there are none)
     wln(self, "static void __p_zero_big(void* p, size_t n) {");
     wln(self, "#if P_ZERO_NT");
     wln(self, "    char* a = (char*)p;");
@@ -10090,7 +10372,9 @@ fn emit_block_alloc_runtime(self: &mut CCodeGen) {
     wln(self, "    memset(p, 0, n);");
     wln(self, "#endif");
     wln(self, "}");
-    wln(self, "static P_ZERO_INLINE void __p_zero(void* p, size_t n, int cold) {");
+    // (static inline in so many words: csplit copies an inline function into
+    // every unit, any other it gives to one)
+    wln(self, "static inline P_ZERO_ALWAYS void __p_zero(void* p, size_t n, int cold) {");
     wln(self, "    char* d = (char*)p;");
     wln(self, "    if (n <= 16) { if (n >= 8) { memset(d, 0, 8); memset(d + n - 8, 0, 8); } else if (n) memset(d, 0, n); return; }");
     wln(self, "    if (n <= 32) { memset(d, 0, 16); memset(d + n - 16, 0, 16); return; }");
@@ -10113,6 +10397,34 @@ fn emit_block_alloc_runtime(self: &mut CCodeGen) {
     wln(self, "    memset(d, 0, n);");
     wln(self, "#endif");
     wln(self, "}");
+    wln(self, "#if (defined(__GNUC__) || defined(__clang__)) && !defined(__TINYC__)");
+    wln(self, "#define P_OPAQUE(x) __asm__(\"\" : \"+r\"(x))");
+    wln(self, "#else");
+    wln(self, "#define P_OPAQUE(x) ((void)0)");
+    wln(self, "#endif");
+    // RT8: the bytes asked for of a small block (n 0 or at least 8 and a
+    // multiple of 8, at most 1 KB): stores of a constant size only, no `rep
+    // stosb` nor memset call (their registers would make every p_malloc save
+    // and restore three)
+    wln(self, "static inline P_ZERO_ALWAYS void __p_zero_small(void* p, size_t n) {");
+    wln(self, "    char* d = (char*)p;");
+    wln(self, "    if (n <= 16) { if (n) { memset(d, 0, 8); memset(d + n - 8, 0, 8); } return; }");
+    wln(self, "    if (n <= 32) { memset(d, 0, 16); memset(d + n - 16, 0, 16); return; }");
+    wln(self, "    if (n <= 64) { memset(d, 0, 32); memset(d + n - 32, 0, 32); return; }");
+    wln(self, "    if (n <= 128) { memset(d, 0, 64); memset(d + n - 64, 0, 64); return; }");
+    wln(self, "    if (n <= 256) { memset(d, 0, 128); memset(d + n - 128, 0, 128); return; }");
+    // (the step opaque to the compiler, which would make the loop a memset
+    // call)
+    wln(self, "    for (size_t i = 0; i + 64 < n; i += 64) { memset(d + i, 0, 64); P_OPAQUE(i); }");
+    wln(self, "    memset(d + n - 64, 0, 64);");
+    wln(self, "}");
+    // RT8: n bytes at p zeroed with p_malloc's stores (rep stosb on x86-64,
+    // not the C library's memset call): __p_vec_grow's spare capacity past
+    // the elements it copied into a p_malloc_uninit buffer
+    wln(self, "void __p_zero_tail(void* p, size_t n) {");
+    wln(self, "    if (n < 8) { if (n) memset(p, 0, n); return; }");
+    wln(self, "    __p_zero(p, n, 0);");
+    wln(self, "}");
     // RT8: the size class of a block of `total` bytes (header included,
     // total in 8..1 MB): k (the list index) and sz (its bytes). The power of
     // two at or above total in one instruction; 3/4 of it when that is enough
@@ -10124,131 +10436,196 @@ fn emit_block_alloc_runtime(self: &mut CCodeGen) {
     wln(self, "#define __P_CLASS_POW(total) __p_class_pow(total)");
     wln(self, "#endif");
     wln(self, "#define __P_CLASS(total, k, sz) do { k = __P_CLASS_POW(total); sz = (size_t)1 << k; k *= 2; if (k > 8 && (total) <= sz - sz / 4) { sz -= sz / 4; k--; } } while (0)");
-    // RT8: the rest of chunk c, too small for the block asked for, cut into
-    // free blocks of the largest classes that fit, marked zero
-    // (P_BLOCK_ZERO: fresh pages, only their link word written), so p_malloc
-    // hands them out without zeroing them. Not counted in __p_fl_bytes, as
-    // decommitted blocks are not: their pages are not resident, nothing to
-    // give back (counted, they set off trims that change nothing)
-    wln(self, "static void __p_chunk_carve(__p_arena_chunk* c) {");
-    wln(self, "    for (int k = 40; k >= 8; k--) {");
-    wln(self, "        int64_t sz = __p_cls_sz[k];");
-    wln(self, "        while (c->end - c->ptr >= sz) {");
-    wln(self, "            uint64_t* b = (uint64_t*)c->ptr + 1;");
-    wln(self, "            c->ptr += sz;");
-    wln(self, "            b[-1] = P_BLOCK_FREED | P_BLOCK_ZERO | (uint64_t)k;");
-    wln(self, "            b[0] = (uint64_t)(uintptr_t)__p_free_lists[k];");
-    wln(self, "            __p_free_lists[k] = b;");
-    wln(self, "        }");
-    wln(self, "    }");
-    wln(self, "}");
-    // The whole allocator: every case p_malloc's fast path (below) leaves to
-    // it (a negative size, a region, the memory limit, AddressSanitizer,
-    // large blocks, a decommitted or zero block, a new chunk). Out of line, so the
-    // fast path saves no registers.
-    wln(self, "static P_ALLOC_COLD void* __p_malloc_full(int64_t size) {");
-    wln(self, "    if (size < 0) { fprintf(stderr, \"p_malloc: negative size %lld\\n\", (long long)size); abort(); }");
-    wln(self, "    if (__p_rs.mode) return __p_rg_alloc(size);");
+    // RT8: the class of a small block by table (p_malloc's inline path):
+    // __p_cls_small[(size + 7) >> 3] is __P_CLASS's k for size + 8, size up
+    // to P_SMALL_MAX (a class of 1 KB at most: no stamps, never decommitted,
+    // zeroed with stores of a constant size)
+    wln(self, "#define P_SMALL_MAX 1016");
+    wln(self, "static const uint8_t __p_cls_small[128] = { 8, 8, 9, 10, 11, 11, 12, 12, 13, 13, 13, 13, 14, 14, 14, 14, 15, 15, 15, 15, 15, 15, 15, 15, 16, 16, 16, 16, 16, 16, 16, 16, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20 };");
+    // A large block (over 1 MB, or every block under AddressSanitizer) for
+    // heap h: [span][traffic][0][header] then the payload, pages of its own
+    // (RT7), or a span of h's cache (RT8) zeroed in place (the bytes asked
+    // for: nothing reads past them, as for class blocks; zero 0: not zeroed,
+    // p_malloc_uninit); calloc's without the OS's pages or under the
+    // sanitizer (S1: 16 bytes of room before the header, so the string and
+    // Vec buffer headers read at s - 16 / s - 24 stay inside the block)
+    wln(self, "static P_ALLOC_COLD void* __p_malloc_big(__p_heap* h, int64_t size, int zero) {");
     wln(self, "    size_t total = (size_t)size + 8;");
-    wln(self, "    if (P_SAN_ALLOC || total > ((size_t)1 << 20)) {");
-    wln(self, "        if (__p_lim_mem) __p_lim_take((int64_t)total);");
-    // RT7: a large block is pages of its own, unmapped when it is freed:
-    // [span][0][0][header] then the payload (the two zero words are S1's
-    // room below); RT8: or a span of the cache, zeroed in place (the bytes
-    // asked for: nothing reads past them, as for class blocks)
-    wln(self, "        if (!P_SAN_ALLOC && P_OSMEM) {");
-    wln(self, "            size_t pg = __p_os_page();");
-    wln(self, "            size_t span = (total + 24 + pg - 1) / pg * pg;");
-    wln(self, "            __p_span_note_alloc(__p_ms_now());");
-    wln(self, "            uint64_t* m = __p_span_n ? __p_span_take(span) : NULL;");
-    wln(self, "            if (m) {");
-    wln(self, "                span = (size_t)m[0];");
-    wln(self, "                int cold = __p_traffic - m[1] > P_ZERO_HOT;");
-    wln(self, "                m[1] = 0;");
-    wln(self, "                m[2] = 0;");
-    wln(self, "                __p_zero(m + 4, ((size_t)size + 15) & ~(size_t)15, cold);");
-    wln(self, "            } else {");
-    wln(self, "                m = (uint64_t*)__p_os_map(span);");
-    wln(self, "                if (!m) __p_oom(total);");
-    wln(self, "                m[0] = (uint64_t)span;");
-    wln(self, "            }");
-    wln(self, "            if (__p_lim_mem) __P_LIM_ADD((int64_t)span - (int64_t)total);");
-    wln(self, "            __p_traffic += span;");
-    wln(self, "            m[3] = P_BLOCK_MAGIC | P_CLASS_MAPPED;");
-    wln(self, "            return m + 4;");
+    wln(self, "    if (__p_lim_mem) __p_lim_take((int64_t)total);");
+    wln(self, "    if (!P_SAN_ALLOC && P_OSMEM) {");
+    wln(self, "        size_t pg = __p_os_page();");
+    wln(self, "        size_t span = (total + 24 + pg - 1) / pg * pg;");
+    wln(self, "        __p_span_note_alloc(h, __p_ms_now());");
+    wln(self, "        uint64_t* m = h->span_n ? __p_span_take(h, span) : NULL;");
+    wln(self, "        if (m) {");
+    wln(self, "            span = (size_t)m[0];");
+    wln(self, "            int cold = h->traffic - m[1] > P_ZERO_HOT;");
+    wln(self, "            m[1] = 0;");
+    wln(self, "            m[2] = 0;");
+    wln(self, "            if (zero) __p_zero(m + 4, ((size_t)size + 15) & ~(size_t)15, cold);");
+    wln(self, "        } else {");
+    wln(self, "            m = (uint64_t*)__p_os_map(span);");
+    wln(self, "            if (!m) __p_oom(total);");
+    wln(self, "            m[0] = (uint64_t)span;");
     wln(self, "        }");
-    // S1: 16 bytes of room before the header, so the string and Vec buffer
-    // headers read at s - 16 / s - 24 stay inside the calloc'd block
-    wln(self, "        uint64_t* big = (uint64_t*)calloc(1, total + 16);");
-    wln(self, "        if (!big) __p_oom(total);");
-    wln(self, "        if (__p_lim_mem) __P_LIM_ADD(__P_LIM_BIG(big) - (int64_t)total);");
-    wln(self, "        big += 2;");
-    wln(self, "        big[0] = P_BLOCK_MAGIC | P_CLASS_LARGE;");
-    wln(self, "        return big + 1;");
+    wln(self, "        if (__p_lim_mem) __P_LIM_ADD((int64_t)span - (int64_t)total);");
+    wln(self, "        h->traffic += span;");
+    wln(self, "        m[3] = P_BLOCK_MAGIC | P_CLASS_MAPPED;");
+    wln(self, "        return m + 4;");
     wln(self, "    }");
+    wln(self, "    uint64_t* big = (uint64_t*)calloc(1, total + 16);");
+    wln(self, "    if (!big) __p_oom(total);");
+    wln(self, "    if (__p_lim_mem) __P_LIM_ADD(__P_LIM_BIG(big) - (int64_t)total);");
+    wln(self, "    big += 2;");
+    wln(self, "    big[0] = P_BLOCK_MAGIC | P_CLASS_LARGE;");
+    wln(self, "    return big + 1;");
+    wln(self, "}");
+    // The rest of the allocator: every case p_malloc's inline path leaves to
+    // it (a negative size, the first allocation, a region, the memory limit,
+    // AddressSanitizer, blocks over P_SMALL_MAX, a thread with no heap yet,
+    // an empty free list: what other threads freed into the heap, the zero
+    // blocks, the current chunk, a new chunk). zero 0: p_malloc_uninit (a
+    // region's or a decommitted block reads zero all the same). Out of line,
+    // so the inline path saves no registers; it reads this thread's state
+    // directly (one call runs on one thread).
+    wln(self, "static P_ALLOC_OUT void* __p_malloc_slow(int64_t size, int zero) {");
+    wln(self, "    if (size < 0) { fprintf(stderr, \"p_malloc: negative size %lld\\n\", (long long)size); abort(); }");
+    wln(self, "    if (P_UNLIKELY(__P_ASLOW() & P_ASLOW_INIT)) __p_heap_init();");
+    wln(self, "    if (__P_ASLOW() >= P_ASLOW_RG && __p_rs.mode) return __p_rg_alloc(size);");
+    wln(self, "    __p_heap* h = __p_tl_heap;");
+    wln(self, "    if (P_UNLIKELY(!h)) h = __p_heap_attach();");
+    wln(self, "    size_t total = (size_t)size + 8;");
+    wln(self, "    if (P_SAN_ALLOC || total > ((size_t)1 << 20)) return __p_malloc_big(h, size, zero);");
     wln(self, "    int k;");
     wln(self, "    size_t sz;");
     wln(self, "    __P_CLASS(total, k, sz);");
     wln(self, "    if (__p_lim_mem) __p_lim_take((int64_t)sz);");
-    wln(self, "    __p_traffic += sz;");
-    wln(self, "    uint64_t* reused = __p_free_lists[k];");
-    wln(self, "    if (reused) {");
-    wln(self, "        __p_free_lists[k] = (uint64_t*)reused[0];");
+    wln(self, "    h->traffic += sz;");
+    wln(self, "    uint64_t* b = h->fl[k];");
+    // owner return: the blocks other threads freed into this heap, before
+    // any other memory
+    wln(self, "    if (!b && __P_XFREE_ANY(h)) { __p_heap_drain(h); b = h->fl[k]; }");
+    wln(self, "    if (b) {");
+    wln(self, "        h->fl[k] = (uint64_t*)(uintptr_t)b[0];");
     // RT7: a block whose pages went back to the system gets them again
     // (zeroed: its decommitted pages read as zero already)
-    wln(self, "        if (reused[-1] & P_BLOCK_DECOMMITTED) __p_block_recommit(reused, (int64_t)sz);");
-    // RT8: a block cut from a chunk's fresh pages is zero but its link word
-    wln(self, "        else if (reused[-1] & P_BLOCK_ZERO) reused[0] = 0;");
+    wln(self, "        if (b[-1] & P_BLOCK_DECOMMITTED) __p_block_recommit(b, (int64_t)sz);");
+    wln(self, "        else {");
+    wln(self, "            h->fl_bytes -= (int64_t)sz;");
     // RT8: only the bytes asked for (to 16) are zeroed, not the whole
     // class: nothing reads a block past its size (P_ZERO_FULL: the class)
     wln(self, "#ifdef P_ZERO_FULL");
-    wln(self, "        else { __p_fl_bytes -= (int64_t)sz; memset(reused, 0, sz - 8); }");
+    wln(self, "            if (zero) memset(b, 0, sz - 8);");
     wln(self, "#else");
-    wln(self, "        else { __p_fl_bytes -= (int64_t)sz; size_t zn = ((size_t)size + 15) & ~(size_t)15; if (zn > sz - 8) zn = sz - 8; __p_zero(reused, zn, zn >= P_ZERO_NT_MIN && __p_traffic - sz - reused[2] > P_ZERO_HOT); }");
+    wln(self, "            if (zero) { size_t zn = ((size_t)size + 15) & ~(size_t)15; if (zn > sz - 8) zn = sz - 8; __p_zero(b, zn, zn >= P_ZERO_NT_MIN && h->traffic - sz - b[2] > P_ZERO_HOT); }");
     wln(self, "#endif");
-    wln(self, "        reused[-1] = P_BLOCK_MAGIC | (uint64_t)k;");
-    wln(self, "        return reused;");
+    wln(self, "        }");
+    wln(self, "        b[-1] = P_BLOCK_MAGIC | (uint64_t)k;");
+    wln(self, "        return b;");
     wln(self, "    }");
-    // (after chunks adopted from ended threads, RT7: the current chunk is
-    // the list's last)
-    wln(self, "    if (!__p_arena_cur) {");
-    wln(self, "        __p_arena_cur = __p_arena_new_chunk();");
-    wln(self, "        if (__p_arena_cur) { if (!__p_arena_head) __p_arena_head = __p_arena_cur; else { __p_arena_chunk* t = __p_arena_head; while (t->next) t = t->next; t->next = __p_arena_cur; } }");
+    // RT8: a block cut from a chunk's fresh pages is zero but its link word
+    wln(self, "    b = h->zl[k];");
+    wln(self, "    if (b) {");
+    wln(self, "        h->zl[k] = (uint64_t*)(uintptr_t)b[0];");
+    wln(self, "        b[0] = 0;");
+    wln(self, "        b[-1] = P_BLOCK_MAGIC | (uint64_t)k;");
+    wln(self, "        return b;");
     wln(self, "    }");
-    wln(self, "    if (!__p_arena_cur) __p_oom(sz);");
-    wln(self, "    if (__p_arena_cur->ptr + sz > __p_arena_cur->end) {");
-    wln(self, "        __p_chunk_carve(__p_arena_cur);");
-    wln(self, "        __p_arena_chunk* nc = __p_arena_new_chunk();");
+    wln(self, "    __p_arena_chunk* c = h->cur;");
+    wln(self, "    if (!c || c->ptr + sz > c->end) {");
+    // the rest of the full chunk cut into zero blocks, one of them maybe this
+    // one's
+    wln(self, "        if (c) {");
+    wln(self, "            __p_chunk_carve(h, c);");
+    wln(self, "            b = h->zl[k];");
+    wln(self, "            if (b) {");
+    wln(self, "                h->zl[k] = (uint64_t*)(uintptr_t)b[0];");
+    wln(self, "                b[0] = 0;");
+    wln(self, "                b[-1] = P_BLOCK_MAGIC | (uint64_t)k;");
+    wln(self, "                return b;");
+    wln(self, "            }");
+    wln(self, "        }");
+    wln(self, "        __p_arena_chunk* nc = __p_arena_new_chunk(h);");
     wln(self, "        if (!nc) __p_oom(sz);");
-    wln(self, "        __p_arena_cur->next = nc;");
-    wln(self, "        __p_arena_cur = nc;");
+    // (the current chunk is the list's last: after chunks taken over from
+    // ended threads, RT7)
+    wln(self, "        if (c) c->next = nc;");
+    wln(self, "        else if (!h->head) h->head = nc;");
+    wln(self, "        else { __p_arena_chunk* t = h->head; while (t->next) t = t->next; t->next = nc; }");
+    wln(self, "        h->cur = c = nc;");
     wln(self, "    }");
-    wln(self, "    uint64_t* block = (uint64_t*)__p_arena_cur->ptr;");
-    wln(self, "    __p_arena_cur->ptr += sz;");
-    wln(self, "    block[0] = P_BLOCK_MAGIC | (uint64_t)k;");
-    wln(self, "    return block + 1;");
+    wln(self, "    b = (uint64_t*)c->ptr;");
+    wln(self, "    c->ptr += sz;");
+    wln(self, "    b[0] = P_BLOCK_MAGIC | (uint64_t)k;");
+    wln(self, "    return b + 1;");
     wln(self, "}");
-    // p_free's every case but a live class block's (or under the memory
-    // limit): a region's block, a double or invalid free, large blocks
-    wln(self, "static P_ALLOC_COLD void __p_free_full(uint64_t* b, uint64_t h) {");
+    // RT8: p_malloc's whole path for a small block: a class by table, the
+    // head of this thread's free list of the class, zeroed in the bytes asked
+    // for (zero 1; a constant at each use, so its test folds), its header;
+    // anything else is __p_malloc_slow's. Inline into the callers in the same
+    // unit (RT10 x RT8: the heap through __P_HEAP(), the slow paths' bits in
+    // one word read by every call: nothing cached across a task switch).
+    wln(self, "static inline P_ZERO_ALWAYS void* __p_malloc_inl(int64_t size, int zero) {");
+    wln(self, "    if (P_UNLIKELY((uint64_t)size > P_SMALL_MAX || __P_ASLOW())) return __p_malloc_slow(size, zero);");
+    wln(self, "    __p_heap* h = __P_HEAP();");
+    wln(self, "    if (P_UNLIKELY(!h)) return __p_malloc_slow(size, zero);");
+    wln(self, "    unsigned k = __p_cls_small[((uint64_t)size + 7) >> 3];");
+    wln(self, "    uint64_t* b = h->fl[k];");
+    wln(self, "    if (P_UNLIKELY(!b)) return __p_malloc_slow(size, zero);");
+    wln(self, "    int64_t sz = __p_cls_sz[k];");
+    wln(self, "    h->fl[k] = (uint64_t*)(uintptr_t)b[0];");
+    wln(self, "    h->fl_bytes -= sz;");
+    wln(self, "    h->traffic += (uint64_t)sz;");
+    wln(self, "    if (zero) {");
+    wln(self, "#ifdef P_ZERO_FULL");
+    wln(self, "        memset(b, 0, (size_t)sz - 8);");
+    wln(self, "#else");
+    wln(self, "        size_t zn = ((size_t)size + 15) & ~(size_t)15;");
+    wln(self, "        if (zn > (size_t)sz - 8) zn = (size_t)sz - 8;");
+    wln(self, "        __p_zero_small(b, zn);");
+    wln(self, "#endif");
+    wln(self, "    }");
+    wln(self, "    b[-1] = P_BLOCK_MAGIC | (uint64_t)k;");
+    wln(self, "    return b;");
+    wln(self, "}");
+    // RT8 owner return: a class block freed on a thread whose heap (h) does
+    // not own its chunk goes on the owner's xfree (marked freed here, so a
+    // second free of it panics), never on this thread's lists; into the heap
+    // of an ended thread, it counts toward a trim of this one (pool_freed:
+    // past P_TRIM_MIN this thread trims, and so takes the pooled heaps over, as
+    // its own frees would set it off; RT7: an ended thread's memory comes back
+    // even when no thread starts after it)
+    wln(self, "static P_ALLOC_COLD void __p_free_remote(uint64_t* b, uint64_t k, __p_heap* o, __p_heap* h) {");
+    wln(self, "    b[-1] = P_BLOCK_FREED | k;");
+    wln(self, "    __p_xfree_push(o, b);");
+    wln(self, "    if (h && o->dead && (h->pool_freed += __p_cls_sz[k]) > P_TRIM_MIN) { h->pool_freed = 0; __p_heap_trim(h); }");
+    wln(self, "}");
+    // a live class block b of class k: back to its owner (this thread's
+    // lists, stamped, a trim past the threshold; or the owner's xfree)
+    wln(self, "static P_ALLOC_OUT void __p_free_class(uint64_t* b, uint64_t k) {");
+    wln(self, "    __p_heap* o = __P_OWNER(__P_CHUNK_OF(b));");
+    wln(self, "    __p_heap* h = __p_tl_heap;");
+    wln(self, "    if (o != h) { __p_free_remote(b, k, o, h); return; }");
+    wln(self, "    b[-1] = P_BLOCK_FREED | k;");
+    wln(self, "    __p_heap_put(h, b, (int)k);");
+    // RT7: past the threshold, empty chunks go back to the system
+    wln(self, "    if (h->fl_bytes > h->trim_next) __p_heap_trim(h);");
+    wln(self, "}");
+    // p_free's every case but a live small class block's: a region's block,
+    // a double or invalid free, large blocks, the classes of 16 KB and more
+    // (they are stamped), the memory limit
+    wln(self, "static P_ALLOC_OUT void __p_free_full(uint64_t* b, uint64_t h) {");
     // a region's block: its region's end releases it (proposal 0005)
     wln(self, "    if (P_IS_ARENA_HDR(h)) return;");
     wln(self, "    if ((h & ~(uint64_t)0xFF) == P_BLOCK_FREED) p_panic(\"Double free\");");
     wln(self, "    if ((h & ~(uint64_t)0xFF) != P_BLOCK_MAGIC) p_panic(\"Invalid free: not an allocated block\");");
     wln(self, "    int k = (int)(h & 0xFF);");
-    wln(self, "    b[-1] = P_BLOCK_FREED | (uint64_t)k;");
-    wln(self, "    if (k == P_CLASS_LARGE) { if (__p_lim_mem) __P_LIM_ADD(-__P_LIM_BIG(b - 3)); free(b - 3); return; }");
+    wln(self, "    if (k == P_CLASS_LARGE) { b[-1] = P_BLOCK_FREED | (uint64_t)k; if (__p_lim_mem) __P_LIM_ADD(-__P_LIM_BIG(b - 3)); free(b - 3); return; }");
     // RT8: into the span cache, or unmapped
-    wln(self, "    if (k == P_CLASS_MAPPED) { if (__p_lim_mem) __P_LIM_ADD(-(int64_t)b[-4]); __p_span_free(b - 4); return; }");
+    wln(self, "    if (k == P_CLASS_MAPPED) { b[-1] = P_BLOCK_FREED | (uint64_t)k; if (__p_lim_mem) __P_LIM_ADD(-(int64_t)b[-4]); __p_span_free(__p_tl_heap, b - 4); return; }");
     wln(self, "    if (k > 40) p_panic(\"Invalid free: not an allocated block\");");
     wln(self, "    if (__p_lim_mem) __P_LIM_ADD(-__p_lim_class_bytes(k));");
-    wln(self, "    if (__p_cls_sz[k] >= P_DECOMMIT_MIN) b[1] = (uint64_t)__p_trim_epoch;");
-    wln(self, "    if (__p_cls_sz[k] >= (int64_t)P_ZERO_NT_MIN) b[2] = __p_traffic;");
-    wln(self, "    b[0] = (uint64_t)__p_free_lists[k];");
-    wln(self, "    __p_free_lists[k] = b;");
-    // RT7: past the threshold, empty chunks go back to the system
-    wln(self, "    __p_fl_bytes += __p_cls_sz[k];");
-    wln(self, "    if (__p_fl_bytes > __p_trim_next) __p_mem_trim();");
+    wln(self, "    __p_free_class(b, (uint64_t)k);");
     wln(self, "}");
     // Under the debug allocator the block allocator below is renamed; the
     // p_malloc/p_free after it record each block.
@@ -10261,46 +10638,24 @@ fn emit_block_alloc_runtime(self: &mut CCodeGen) {
     wln(self, "static");
     wln(self, "#endif");
     emit_embed_log_runtime(self);
-    // RT8: the fast path: a block of a class from this thread's free list
-    // (zeroed in the bytes asked for) or from the current chunk (fresh
-    // pages: zero already); everything else is __p_malloc_full's. A leaf
-    // function: no registers to save, no lock (the lists are this
-    // thread's).
-    // RT10 (M:N): out of line (P_MN_NOINLINE), so the caller on a task's
-    // stack never keeps this thread's free-list address across a switch
-    wln(self, "P_MN_NOINLINE void* p_malloc(int64_t size) {");
-    wln(self, "    if ((uint64_t)size > ((uint64_t)1 << 20) - 8 || P_SAN_ALLOC || __p_rs.mode || __p_lim_mem) return __p_malloc_full(size);");
-    wln(self, "    size_t total = (size_t)size + 8;");
-    wln(self, "    int k;");
-    wln(self, "    size_t sz;");
-    wln(self, "    __P_CLASS(total, k, sz);");
-    wln(self, "    uint64_t* reused = __p_free_lists[k];");
-    wln(self, "    if (reused) {");
-    wln(self, "        if (reused[-1] & (P_BLOCK_DECOMMITTED | P_BLOCK_ZERO)) return __p_malloc_full(size);");
-    wln(self, "        __p_free_lists[k] = (uint64_t*)reused[0];");
-    wln(self, "        __p_fl_bytes -= (int64_t)sz;");
-    wln(self, "#ifdef P_ZERO_FULL");
-    wln(self, "        memset(reused, 0, sz - 8);");
-    wln(self, "#else");
-    wln(self, "        { size_t zn = ((size_t)size + 15) & ~(size_t)15; if (zn > sz - 8) zn = sz - 8; __p_zero(reused, zn, zn >= P_ZERO_NT_MIN && __p_traffic - reused[2] > P_ZERO_HOT); }");
+    // RT8: p_malloc is __p_malloc_inl (zeroed); RT10's P_MN_NOINLINE is gone
+    // from it and p_free: they read the heap fresh at each call (__P_HEAP)
+    wln(self, "void* p_malloc(int64_t size) { return __p_malloc_inl(size, 1); }");
+    // RT8: __p_malloc_uninit, what core's p_malloc_uninit runs here
+    // (fast_core_vec_body), for core and the runtimes only (the type checker
+    // allows no other caller): a block exactly like p_malloc's (freed by
+    // p_free, the same limit, region and debug treatment) whose bytes are
+    // unspecified, for producers that write every byte they hand out. Under
+    // the debug allocator and the embed log it is the recording p_malloc
+    // (below them).
+    wln(self, "#if !defined(P_MEMCHECK) && !defined(P_EMBED_LOG)");
+    wln(self, "void* __p_malloc_uninit(int64_t size) { return __p_malloc_inl(size, 0); }");
     wln(self, "#endif");
-    wln(self, "        __p_traffic += sz;");
-    wln(self, "        reused[-1] = P_BLOCK_MAGIC | (uint64_t)k;");
-    wln(self, "        return reused;");
-    wln(self, "    }");
-    wln(self, "    __p_arena_chunk* c = __p_arena_cur;");
-    wln(self, "    if (!c || c->ptr + sz > c->end) return __p_malloc_full(size);");
-    wln(self, "    uint64_t* block = (uint64_t*)c->ptr;");
-    wln(self, "    c->ptr += sz;");
-    wln(self, "    __p_traffic += sz;");
-    wln(self, "    block[0] = P_BLOCK_MAGIC | (uint64_t)k;");
-    wln(self, "    return block + 1;");
-    wln(self, "}");
     wln(self, "void* p_malloc_persistent(int64_t size) { if (size < 0) return NULL; return malloc((size_t)size); }");
     wln(self, "#ifdef P_MEMCHECK");
     wln(self, "static");
     wln(self, "#endif");
-    wln(self, "P_MN_NOINLINE void p_free(void* ptr) {");
+    wln(self, "void p_free(void* ptr) {");
     wln(self, "    if (!ptr) return;");
     // CI6: a block a fides_call allocated and frees is no longer its own
     wln(self, "#ifdef P_EMBED_LOG");
@@ -10308,21 +10663,21 @@ fn emit_block_alloc_runtime(self: &mut CCodeGen) {
     wln(self, "#endif");
     wln(self, "    uint64_t* b = (uint64_t*)ptr;");
     wln(self, "    uint64_t h = b[-1];");
-    // RT8: a live class block's header is P_BLOCK_MAGIC | k, k at most 40
-    // (freed, a region's, large and invalid ones are __p_free_full's)
+    // RT8: a live class block's header is P_BLOCK_MAGIC | k; up to class 27
+    // (12 KB) here, the bigger ones are stamped (__p_free_full, as freed,
+    // a region's, large and invalid ones, and all under the memory limit)
     wln(self, "    uint64_t k = h ^ P_BLOCK_MAGIC;");
-    wln(self, "    if (k > 40 || __p_lim_mem) { __p_free_full(b, h); return; }");
+    wln(self, "    if (P_UNLIKELY(k > 27 || (__P_ASLOW() & (P_ASLOW_LIM | P_ASLOW_NOTP)))) { __p_free_full(b, h); return; }");
+    // owner return (RT8): a block of a chunk another heap owns goes back to it
+    wln(self, "    __p_heap* hp = __P_HEAP();");
+    wln(self, "    __p_heap* o = __P_OWNER(__P_CHUNK_OF(b));");
+    wln(self, "    if (P_UNLIKELY(o != hp)) { __p_free_remote(b, k, o, hp); return; }");
     wln(self, "    b[-1] = P_BLOCK_FREED | k;");
-    wln(self, "    int64_t sz = __p_cls_sz[k];");
-    // (the free stamp of a block the trim may decommit, RT8)
-    wln(self, "    if (sz >= P_DECOMMIT_MIN) b[1] = (uint64_t)__p_trim_epoch;");
-    // (and the traffic then, for __p_zero's cold test, RT8)
-    wln(self, "    if (sz >= (int64_t)P_ZERO_NT_MIN) b[2] = __p_traffic;");
-    wln(self, "    b[0] = (uint64_t)__p_free_lists[k];");
-    wln(self, "    __p_free_lists[k] = b;");
-    wln(self, "    __p_fl_bytes += sz;");
+    wln(self, "    b[0] = (uint64_t)(uintptr_t)hp->fl[k];");
+    wln(self, "    hp->fl[k] = b;");
+    wln(self, "    hp->fl_bytes += __p_cls_sz[k];");
     // RT7: past the threshold, empty chunks go back to the system
-    wln(self, "    if (__p_fl_bytes > __p_trim_next) __p_mem_trim();");
+    wln(self, "    if (P_UNLIKELY(hp->fl_bytes > hp->trim_next)) __p_heap_trim(hp);");
     wln(self, "}");
 }
 
@@ -10820,6 +11175,27 @@ fn emit_prof_api_runtime(self: &mut CCodeGen) {
 /// Unset, empty or 0: no limit, and the allocator does one test of a global.
 fn emit_limits_runtime(self: &mut CCodeGen) {
     wln(self, "static int64_t __p_lim_mem = 0;");
+    // RT8: what sends p_malloc past its inline path, in one word every call
+    // reads: P_ASLOW_INIT until the allocator is set up (__p_heap_init),
+    // P_ASLOW_LIM under FID_MEM_LIMIT, P_ASLOW_RG for each live region of any
+    // thread (the thread's own __p_rs.mode is looked at only then)
+    wln(self, "static int64_t __p_aslow = 1;");
+    wln(self, "#define P_ASLOW_INIT 1");
+    wln(self, "#define P_ASLOW_LIM 2");
+    // (Windows M:N without a TEB TLS slot for the heap: __P_HEAP cannot be
+    // read inline, every call takes the slow path)
+    wln(self, "#define P_ASLOW_NOTP 4");
+    wln(self, "#define P_ASLOW_RG 256");
+    wln(self, "#if defined(__TINYC__)");
+    wln(self, "#define __P_ASLOW() (__p_aslow)");
+    wln(self, "#define __P_ASLOW_ADD(v) ((void)(__p_aslow += (v)))");
+    wln(self, "#elif defined(_MSC_VER)");
+    wln(self, "#define __P_ASLOW() (*(volatile int64_t*)&__p_aslow)");
+    wln(self, "#define __P_ASLOW_ADD(v) ((void)_InterlockedExchangeAdd64((volatile long long*)&__p_aslow, (long long)(v)))");
+    wln(self, "#else");
+    wln(self, "#define __P_ASLOW() __atomic_load_n(&__p_aslow, __ATOMIC_ACQUIRE)");
+    wln(self, "#define __P_ASLOW_ADD(v) ((void)__atomic_fetch_add(&__p_aslow, (int64_t)(v), __ATOMIC_SEQ_CST))");
+    wln(self, "#endif");
     wln(self, "#ifdef _WIN32");
     wln(self, "#include <malloc.h>");
     wln(self, "static volatile long long __p_lim_used = 0;");
@@ -10922,6 +11298,7 @@ fn emit_limits_runtime(self: &mut CCodeGen) {
     wln(self, "    double mv = __p_lim_parse(m, 1);");
     wln(self, "    if (mv < 0) { fprintf(stderr, \"fid: FID_MEM_LIMIT is not a size (bytes, or with K, M or G): '%s'\\n\", m); exit(2); }");
     wln(self, "    if (mv > 0) __p_lim_mem = mv < 1 ? 1 : (int64_t)mv;");
+    wln(self, "    if (__p_lim_mem && !(__P_ASLOW() & P_ASLOW_LIM)) __P_ASLOW_ADD(P_ASLOW_LIM);");
     wln(self, "    const char* t = getenv(\"FID_CPU_LIMIT\");");
     wln(self, "#ifdef P_LIM_CPU_DEFAULT_MS");
     wln(self, "    static char tdef[32];");
@@ -11864,34 +12241,98 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     // This NEVER invalidates existing pointers (unlike realloc-based growth).
     // A chunk is pages of its own (RT7), so an empty one can be given back.
     wln(self, "#define __P_ARENA_CHUNK_SIZE (4*1024*1024)");
-    wln(self, "typedef struct __p_arena_chunk { char* base; char* ptr; char* end; struct __p_arena_chunk* next; } __p_arena_chunk;");
-    wln(self, "static P_THREAD_LOCAL __p_arena_chunk* __p_arena_head = NULL;");
-    wln(self, "static P_THREAD_LOCAL __p_arena_chunk* __p_arena_cur = NULL;");
-    wln(self, "static __p_arena_chunk* __p_arena_new_chunk(void) {");
-    wln(self, "    __p_arena_chunk* c = (__p_arena_chunk*)malloc(sizeof(__p_arena_chunk));");
-    wln(self, "    if (!c) return NULL;");
-    // blocks start 16 bytes into the mapping: string checks read the two
-    // words before a string (s - 16), which for the first block of a
-    // page-aligned chunk would be the unmapped page before it
-    wln(self, "    char* m = (char*)__p_os_map(__P_ARENA_CHUNK_SIZE);");
-    wln(self, "    if (!m) { free(c); return NULL; }");
-    wln(self, "    c->base = m + 16;");
+    // RT8: a chunk is __P_ARENA_CHUNK_SIZE bytes at an address that is a
+    // multiple of its size, so the chunk of a class block is the block's
+    // address with its low bits cleared (__P_CHUNK_OF); this header is the
+    // chunk's first 64 bytes and its blocks start at base, after it (string
+    // checks read the two words before a string: still the chunk's). owner is
+    // the heap whose lists the chunk's blocks go back to when they are freed
+    // (owner return, RT8): set when the chunk is made, changed only when a
+    // trim takes over the heap of a thread that ended (__p_heap_merge_pool).
+    // fb: the trim's count of the chunk's free bytes. raw: what to give back
+    // without the OS's pages (calloc's block).
+    wln(self, "typedef struct __p_heap __p_heap;");
+    wln(self, "typedef struct __p_arena_chunk { char* base; char* ptr; char* end; struct __p_arena_chunk* next; __p_heap* owner; void* raw; int64_t fb; int64_t pad; } __p_arena_chunk;");
+    wln(self, "#define __P_CHUNK_OF(p) ((__p_arena_chunk*)((uintptr_t)(p) & ~(uintptr_t)(__P_ARENA_CHUNK_SIZE - 1)))");
+    // where the next chunk is asked for first: right after the last one, which
+    // is aligned (one system call instead of three)
+    wln(self, "static char* volatile __p_chunk_hint = NULL;");
+    // __P_ARENA_CHUNK_SIZE bytes of zeroed pages at a multiple of their size,
+    // NULL when there are none
+    wln(self, "static char* __p_chunk_map(void** raw) {");
+    wln(self, "    const size_t n = (size_t)__P_ARENA_CHUNK_SIZE;");
+    wln(self, "#if P_OSMEM && defined(_WIN32)");
+    wln(self, "    for (int i = 0; i < 16; i++) {");
+    wln(self, "        char* want = __p_chunk_hint;");
+    wln(self, "        if (want) {");
+    wln(self, "            char* p = (char*)VirtualAlloc(want, n, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);");
+    wln(self, "            if (p == want) { __p_chunk_hint = p + n; *raw = p; return p; }");
+    wln(self, "            if (p) VirtualFree(p, 0, MEM_RELEASE);");
+    wln(self, "        }");
+    // twice the size reserved shows an aligned range, which is then taken
+    // alone (another thread may take it first: then again)
+    wln(self, "        char* r = (char*)VirtualAlloc(NULL, 2 * n, MEM_RESERVE, PAGE_NOACCESS);");
+    wln(self, "        if (!r) return NULL;");
+    wln(self, "        char* a = (char*)(((uintptr_t)r + n - 1) & ~(uintptr_t)(n - 1));");
+    wln(self, "        VirtualFree(r, 0, MEM_RELEASE);");
+    wln(self, "        char* q = (char*)VirtualAlloc(a, n, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);");
+    wln(self, "        if (q == a) { __p_chunk_hint = a + n; *raw = q; return q; }");
+    wln(self, "        if (q) VirtualFree(q, 0, MEM_RELEASE);");
+    wln(self, "        __p_chunk_hint = NULL;");
+    wln(self, "    }");
+    wln(self, "    return NULL;");
+    wln(self, "#elif P_OSMEM");
+    wln(self, "    char* want = __p_chunk_hint;");
+    wln(self, "    if (want) {");
+    wln(self, "        char* p = (char*)mmap(want, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);");
+    wln(self, "        if (p == want) { __p_chunk_hint = p + n; *raw = p; return p; }");
+    wln(self, "        if (p != (char*)MAP_FAILED) munmap(p, n);");
+    wln(self, "    }");
+    wln(self, "    char* r = (char*)mmap(NULL, 2 * n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);");
+    wln(self, "    if (r == (char*)MAP_FAILED) return NULL;");
+    wln(self, "    char* a = (char*)(((uintptr_t)r + n - 1) & ~(uintptr_t)(n - 1));");
+    wln(self, "    if (a > r) munmap(r, (size_t)(a - r));");
+    wln(self, "    if (r + 2 * n > a + n) munmap(a + n, (size_t)(r + 2 * n - (a + n)));");
+    wln(self, "    __p_chunk_hint = a + n;");
+    wln(self, "    *raw = a;");
+    wln(self, "    return a;");
+    wln(self, "#else");
+    wln(self, "    char* r = (char*)calloc(1, 2 * n);");
+    wln(self, "    if (!r) return NULL;");
+    wln(self, "    *raw = r;");
+    wln(self, "    return (char*)(((uintptr_t)r + n - 1) & ~(uintptr_t)(n - 1));");
+    wln(self, "#endif");
+    wln(self, "}");
+    wln(self, "static __p_arena_chunk* __p_arena_new_chunk(__p_heap* h) {");
+    wln(self, "    void* raw = NULL;");
+    wln(self, "    char* m = __p_chunk_map(&raw);");
+    wln(self, "    if (!m) return NULL;");
+    wln(self, "    __p_arena_chunk* c = (__p_arena_chunk*)m;");
+    wln(self, "    c->base = m + 64;");
     wln(self, "    c->ptr = c->base;");
     wln(self, "    c->end = m + __P_ARENA_CHUNK_SIZE;");
     wln(self, "    c->next = NULL;");
+    wln(self, "    c->owner = h;");
+    wln(self, "    c->raw = raw;");
+    wln(self, "    c->fb = 0;");
     wln(self, "    return c;");
     wln(self, "}");
-    wln(self, "static void __p_arena_free_chunk(__p_arena_chunk* c) { __p_os_unmap(c->base - 16, __P_ARENA_CHUNK_SIZE); free(c); }");
+    wln(self, "static void __p_arena_free_chunk(__p_arena_chunk* c) {");
+    wln(self, "#if P_OSMEM");
+    wln(self, "    __p_os_unmap(c, (size_t)__P_ARENA_CHUNK_SIZE);");
+    wln(self, "#else");
+    wln(self, "    free(c->raw);");
+    wln(self, "#endif");
+    wln(self, "}");
     // Blocks: an 8-byte header (P_BLOCK_MAGIC | size class) and the payload.
-    // Classes are powers of two up to 1 MB, refilled from the arena and
-    // reused through per-thread free lists; larger blocks are pages of
-    // their own (RT7: calloc's under AddressSanitizer or without an OS).
-    // A pointer without the magic (a block freed twice) is
-    // ignored by p_free. A reused block is zeroed, as fresh memory is.
+    // Classes are powers of two and 3/4 of them up to 1 MB, bumped from the
+    // chunks of this thread's heap and reused through its free lists
+    // (RT8: emit_mem_return_runtime); larger blocks are pages of their own
+    // (RT7: calloc's under AddressSanitizer or without an OS). A reused
+    // block is zeroed, as fresh memory is (p_malloc_uninit's is not).
     wln(self, "#define P_BLOCK_MAGIC 0xF1DE5A0000000000ULL");
     wln(self, "#define P_BLOCK_FREED 0xF1DE5B0000000000ULL");
     wln(self, "#define P_CLASS_LARGE 63");
-    wln(self, "static P_THREAD_LOCAL uint64_t* __p_free_lists[41];");
     // Under AddressSanitizer every block comes from calloc and goes back to
     // free, so a use after free or an overrun is reported (release M8:
     // scripts/sanitize.sh); the pooled classes would hide them.
@@ -12142,39 +12583,53 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    return p;");
     wln(self, "}");
     wln(self, "#endif");
+    // RT8: there __p_malloc_uninit is the recording p_malloc (zeroed: the
+    // same)
+    wln(self, "#if defined(P_MEMCHECK) || defined(P_EMBED_LOG)");
+    wln(self, "void* __p_malloc_uninit(int64_t size) { return p_malloc(size); }");
+    wln(self, "#endif");
     wln(self, "void* p_alloc(int64_t size) { return p_malloc(size); }");
     // stdlib regions allocate from the arena, so it releases them too.
     wln(self, "void p_region_free(void* region) { (void)region; }");
     // Arena mark: (1-based chunk index << 32) | offset in that chunk.
     // Restoring frees the chunks after the marked one: they only hold
     // memory allocated after the save.
+    // (RT8: the chunks of this thread's heap, through __P_HEAP: under M:N a
+    // task may go on on another thread)
     wln(self, "int64_t p_arena_save(void) {");
-    // RT7: a mark counts chunks, so this thread no longer gives any back
-    wln(self, "    __p_arena_marked = 1;");
+    wln(self, "    __p_heap* h = __P_HEAP();");
+    wln(self, "    if (!h) h = __p_heap_attach();");
+    // RT7: a mark counts chunks, so this heap no longer gives any back
+    wln(self, "    h->arena_marked = 1;");
     wln(self, "    int64_t idx = 0;");
-    wln(self, "    for (__p_arena_chunk* c = __p_arena_head; c; c = c->next) {");
+    wln(self, "    for (__p_arena_chunk* c = h->head; c; c = c->next) {");
     wln(self, "        idx++;");
-    wln(self, "        if (c == __p_arena_cur) return (idx << 32) | (int64_t)(c->ptr - c->base);");
+    wln(self, "        if (c == h->cur) return (idx << 32) | (int64_t)(c->ptr - c->base);");
     wln(self, "    }");
     wln(self, "    return 0;");
     wln(self, "}");
     wln(self, "void p_arena_restore(int64_t mark) {");
-    // Blocks past the mark may sit in the free lists: drop those lists.
-    wln(self, "    memset(__p_free_lists, 0, sizeof(__p_free_lists));");
-    wln(self, "    __p_fl_bytes = 0;");
+    wln(self, "    __p_heap* h = __P_HEAP();");
+    wln(self, "    if (!h) return;");
+    // Blocks past the mark may sit in the free lists (and among those other
+    // threads freed into the heap): drop those lists.
+    wln(self, "    memset(h->fl, 0, sizeof(h->fl));");
+    wln(self, "    memset(h->zl, 0, sizeof(h->zl));");
+    wln(self, "    h->fl_bytes = 0;");
+    wln(self, "    (void)__p_xfree_take(h);");
     wln(self, "    int64_t idx = mark >> 32, off = mark & 0xffffffffLL, i = 0;");
-    wln(self, "    __p_arena_chunk* keep = __p_arena_head;");
+    wln(self, "    __p_arena_chunk* keep = h->head;");
     wln(self, "    if (!keep) return;");
     wln(self, "    if (idx == 0) { keep->ptr = keep->base; }");
     wln(self, "    else {");
-    wln(self, "        for (__p_arena_chunk* c = __p_arena_head; c; c = c->next) { if (++i == idx) { keep = c; break; } }");
+    wln(self, "        for (__p_arena_chunk* c = h->head; c; c = c->next) { if (++i == idx) { keep = c; break; } }");
     wln(self, "        if (i != idx) return;");
     wln(self, "        keep->ptr = keep->base + off;");
     wln(self, "    }");
     wln(self, "    __p_arena_chunk* c = keep->next;");
     wln(self, "    keep->next = NULL;");
     wln(self, "    while (c) { __p_arena_chunk* n = c->next; __p_arena_free_chunk(c); c = n; }");
-    wln(self, "    __p_arena_cur = keep;");
+    wln(self, "    h->cur = keep;");
     wln(self, "}");
     // File I/O builtins
     wln(self, "static char* p_file_read__raw(const char* path);");
@@ -14285,9 +14740,10 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "        }");
     wln(self, "        if (!c && !__p_mn_shared) c = __p_lq_steal(id);");
     wln(self, "        if (!c) {");
-    // RT8 x RT10: a worker never ends, so its span cache (RT8) is purged
-    // here, before it sleeps, of spans unused for P_SPAN_PURGE_MS
-    wln(self, "            if (__p_span_n) __p_span_purge(__p_ms_now(), 0);");
+    // RT8 x RT10: a worker never ends, so before it sleeps its heap takes
+    // what other workers freed into it and its span cache (RT8) is purged of
+    // spans unused for P_SPAN_PURGE_MS (__p_heap_idle)
+    wln(self, "            __p_heap_idle();");
     wln(self, "            pthread_mutex_lock(&__p_gq_mx);");
     wln(self, "            P_AADD(&__p_mn_idle, 1);");
     wln(self, "            if (__p_gq_n == 0 && (__p_mn_shared || !__p_lq_any())) pthread_cond_wait(&__p_gq_cv, &__p_gq_mx);");
@@ -16340,7 +16796,8 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     // whole element buffer. Volatile stores so the wipe is not elided.
     wln(self, "void p_str_zeroize(void* s) {");
     wln(self, "    if (!s) return;");
-    wln(self, "    for (__p_arena_chunk* c = __p_arena_head; c; c = c->next) {");
+    wln(self, "    __p_heap* h = __P_HEAP();");
+    wln(self, "    for (__p_arena_chunk* c = h ? h->head : NULL; c; c = c->next) {");
     wln(self, "        if ((char*)s >= c->base && (char*)s < c->end) {");
     wln(self, "            volatile char* p = (volatile char*)s;");
     wln(self, "            while (p < (volatile char*)c->end && *p) { *p = 0; p++; }");

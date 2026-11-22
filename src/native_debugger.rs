@@ -209,19 +209,14 @@ impl NativeDebugger {
                         // Show current instruction
                         let regs = self.get_regs(pid);
                         if let Some(ref r) = regs {
-                            println!("  RIP=0x{:016x}", r.rip);
+                            println!("  PC=0x{:016x}", r.pc());
                         }
                     }
                 }
                 "regs" => {
                     let regs = self.get_regs(pid);
                     if let Some(ref r) = regs {
-                        println!("  RAX=0x{:016x}  RBX=0x{:016x}  RCX=0x{:016x}", r.rax, r.rbx, r.rcx);
-                        println!("  RDX=0x{:016x}  RSI=0x{:016x}  RDI=0x{:016x}", r.rdx, r.rsi, r.rdi);
-                        println!("  RSP=0x{:016x}  RBP=0x{:016x}  RIP=0x{:016x}", r.rsp, r.rbp, r.rip);
-                        println!("  R8 =0x{:016x}  R9 =0x{:016x}  R10=0x{:016x}", r.r8, r.r9, r.r10);
-                        println!("  R11=0x{:016x}  R12=0x{:016x}  R13=0x{:016x}", r.r11, r.r12, r.r13);
-                        println!("  R14=0x{:016x}  R15=0x{:016x}", r.r14, r.r15);
+                        r.print();
                     } else {
                         println!("  Failed to get registers");
                     }
@@ -262,7 +257,7 @@ impl NativeDebugger {
         0
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     fn get_regs(&self, pid: i32) -> Option<Regs> {
         #[repr(C)]
         struct UserRegs {
@@ -301,13 +296,112 @@ impl NativeDebugger {
             r15: regs.r15,
         })
     }
+
+    // aarch64 has no PTRACE_GETREGS: the GP registers come from
+    // PTRACE_GETREGSET with NT_PRSTATUS, which fills libc's
+    // user_regs_struct { regs[31], sp, pc, pstate }.
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    fn get_regs(&self, pid: i32) -> Option<Regs> {
+        let mut uregs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
+        let mut iov = libc::iovec {
+            iov_base: &mut uregs as *mut _ as *mut libc::c_void,
+            iov_len: std::mem::size_of::<libc::user_regs_struct>(),
+        };
+        let result = unsafe {
+            libc::ptrace(
+                libc::PTRACE_GETREGSET,
+                pid,
+                libc::NT_PRSTATUS as *const libc::c_void,
+                &mut iov as *mut _ as *mut libc::c_void,
+            )
+        };
+        if result < 0 {
+            return None;
+        }
+        Some(Regs {
+            x: uregs.regs,
+            sp: uregs.sp,
+            pc: uregs.pc,
+            pstate: uregs.pstate,
+        })
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        not(any(target_arch = "x86_64", target_arch = "aarch64"))
+    ))]
+    fn get_regs(&self, _pid: i32) -> Option<Regs> {
+        None
+    }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 struct Regs {
     rax: u64, rbx: u64, rcx: u64, rdx: u64,
     rsi: u64, rdi: u64, rsp: u64, rbp: u64,
     rip: u64, r8: u64, r9: u64, r10: u64,
     r11: u64, r12: u64, r13: u64, r14: u64,
     r15: u64,
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl Regs {
+    fn pc(&self) -> u64 {
+        self.rip
+    }
+
+    fn print(&self) {
+        println!("  RAX=0x{:016x}  RBX=0x{:016x}  RCX=0x{:016x}", self.rax, self.rbx, self.rcx);
+        println!("  RDX=0x{:016x}  RSI=0x{:016x}  RDI=0x{:016x}", self.rdx, self.rsi, self.rdi);
+        println!("  RSP=0x{:016x}  RBP=0x{:016x}  RIP=0x{:016x}", self.rsp, self.rbp, self.rip);
+        println!("  R8 =0x{:016x}  R9 =0x{:016x}  R10=0x{:016x}", self.r8, self.r9, self.r10);
+        println!("  R11=0x{:016x}  R12=0x{:016x}  R13=0x{:016x}", self.r11, self.r12, self.r13);
+        println!("  R14=0x{:016x}  R15=0x{:016x}", self.r14, self.r15);
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+struct Regs {
+    x: [u64; 31],
+    sp: u64,
+    pc: u64,
+    pstate: u64,
+}
+
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+impl Regs {
+    fn pc(&self) -> u64 {
+        self.pc
+    }
+
+    fn print(&self) {
+        for i in (0..31).step_by(3) {
+            let end = (i + 3).min(31);
+            let line: String = (i..end)
+                .map(|j| format!("  X{:<2}=0x{:016x}", j, self.x[j]))
+                .collect();
+            println!("{}", line);
+        }
+        println!("  SP =0x{:016x}  PC =0x{:016x}  PSTATE=0x{:016x}", self.sp, self.pc, self.pstate);
+    }
+}
+
+// Other Linux targets: get_regs returns None, so these are unreachable —
+// they exist so the call sites compile.
+#[cfg(all(
+    target_os = "linux",
+    not(any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
+struct Regs;
+
+#[cfg(all(
+    target_os = "linux",
+    not(any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
+impl Regs {
+    fn pc(&self) -> u64 {
+        0
+    }
+
+    fn print(&self) {}
 }

@@ -4,7 +4,7 @@ The first whole-suite run of the C path under AddressSanitizer +
 UndefinedBehaviorSanitizer, and ThreadSanitizer over every program that
 uses threads, tasks, channels or atomics. The sample run of Nov 16 (45
 programs, findings S1-S4) is in
-[infra-runs-2026-11-16-b7.md](infra-runs-2026-11-16-b7.md).
+[infra-runs-2026-11-16.md](infra-runs-2026-11-16.md#infra-runs-nov-16-2026-batch-7-bm10-rt11-vf4-vf5-vf14).
 
 ## How it was run
 

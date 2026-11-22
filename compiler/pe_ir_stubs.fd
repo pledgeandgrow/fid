@@ -898,6 +898,13 @@ pub fn PeirGen_resolve_call(self: &PeirGen, name: str) -> str {
     if p != "" && pe_strs_contains(self.module_fns, p) {
         return p;
     }
+    // RT8: core's p_malloc_uninit (its Fides body is p_malloc's zeroed
+    // block, the fallback of the backends without a path of their own) runs
+    // the allocator's stub without the zeroing, PeirGen_gen_malloc_uninit
+    // (rcx = size: the call site leaves core's env word out)
+    if name == "p_malloc_uninit" && HashMap_contains(self.func_labels, "__p_malloc_uninit") {
+        return "__p_malloc_uninit";
+    }
     return name;
 }
 
@@ -2058,6 +2065,7 @@ pub fn PeirGen_gen_bare_runtime(self: &mut PeirGen) -> void {
     PeirGen_gen_enter_user_mode(self);
     PeirGen_gen_serial_stubs(self);
     PeirGen_gen_malloc(self);
+    PeirGen_gen_malloc_uninit(self);
     PeirGen_gen_free(self);
     PeirGen_gen_memset(self);
 
@@ -2348,6 +2356,7 @@ pub fn PeirGen_gen_runtime_stubs(self: &mut PeirGen) -> void {
     PeirGen_gen_print_float(self);
     PeirGen_gen_panic(self);
     PeirGen_gen_malloc(self);
+    PeirGen_gen_malloc_uninit(self);
     PeirGen_gen_free(self);
     PeirGen_gen_memset(self);
     PeirGen_gen_str_concat(self);
@@ -4093,9 +4102,21 @@ pub fn PeirGen_gen_panic(self: &mut PeirGen) -> void {
 
     // CO9 (Nov 22): the stack trace — walk the frame-pointer chain
     // and print each return address as hex. Symbolizable with `fid disasm`.
+    // Everything the walk keeps lives in registers WriteFile preserves
+    // (Win64 callee-saved: r14 the frame, r15 the frame count, rsi the
+    // digit count, rdi the address being printed); the Nov 22 first
+    // version kept the digit count in rcx and the address in rax, which
+    // every WriteFile clobbers, so each panic printed '0's forever
+    // (known-bugs 2g.116). A frame is followed only while it is 8-aligned,
+    // at or above this stub's frame, below the thread's stack base
+    // (TEB gs:[8]) and each next frame is above the last, so a chain that
+    // ends in code without frame pointers stops instead of faulting.
+    // Four pushes: rsp stays 16-aligned for the calls.
     PeirEnc_push(&mut self.enc, PEIR_R14);
     PeirEnc_push(&mut self.enc, PEIR_R15);
-    // "trace:" + newline at [rbp-56]
+    PeirEnc_push(&mut self.enc, PEIR_RSI);
+    PeirEnc_push(&mut self.enc, PEIR_RDI);
+    // "trace" + newline at [rbp-56]
     PeirEnc_xor_self(&mut self.enc, PEIR_RAX);
     PeirEnc_mov_mem_rbp_reg(&mut self.enc, -48, PEIR_RAX);
     PeirEnc_mov_imm64(&mut self.enc, PEIR_RAX, 0x000A6563617274);
@@ -4103,9 +4124,9 @@ pub fn PeirGen_gen_panic(self: &mut PeirGen) -> void {
     PeirEnc_lea_rbp(&mut self.enc, PEIR_RDX, -56);
     PeirEnc_mov_imm32(&mut self.enc, PEIR_R8, 6);
     PeirGen_gen_panic_write(self);
-    // r14 = the caller's frame pointer (walk from our caller)
+    // r14 = this stub's frame: its [r14 + 8] returns into the panicking
+    // function, so that function is the first line
     PeirEnc_mov_rr(&mut self.enc, PEIR_R14, PEIR_RBP);
-    PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_R14, 0);
     PeirEnc_xor_self(&mut self.enc, PEIR_R15);
     var st_loop: i64 = PeirEnc_alloc_label(&mut self.enc);
     var st_done: i64 = PeirEnc_alloc_label(&mut self.enc);
@@ -4114,24 +4135,34 @@ pub fn PeirGen_gen_panic(self: &mut PeirGen) -> void {
     PeirEnc_jcc_label(&mut self.enc, 0x4, st_done);
     PeirEnc_cmp_r_imm(&mut self.enc, PEIR_R15, 32);
     PeirEnc_jcc_label(&mut self.enc, 0xD, st_done);
-    // the return address [r14 + 8] into rax
-    PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_RAX, 8, PEIR_R14);
-    // print rax as 16 hex digits (MSB first)
-    PeirEnc_mov_imm32(&mut self.enc, PEIR_RCX, 16);
+    // 8-aligned: shl rax, 61 of a copy leaves the low three bits
+    PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_R14);
+    PeirEnc_shl_r_i8(&mut self.enc, PEIR_RAX, 61);
+    PeirEnc_jcc_label(&mut self.enc, 0x5, st_done);
+    // not below this stub's frame (jb)
+    PeirEnc_cmp_rr(&mut self.enc, PEIR_R14, PEIR_RBP);
+    PeirEnc_jcc_label(&mut self.enc, 0x2, st_done);
+    // [r14 + 8] below the stack base: mov rax, gs:[8]; sub 16; r14 > it: stop
+    PeirEnc_emit_u8(&mut self.enc, 0x65);
+    PeirEnc_emit_u8(&mut self.enc, 0x48);
+    PeirEnc_emit_u8(&mut self.enc, 0x8B);
+    PeirEnc_emit_u8(&mut self.enc, 0x04);
+    PeirEnc_emit_u8(&mut self.enc, 0x25);
+    PeirEnc_emit_u32(&mut self.enc, 8);
+    PeirEnc_add_r_i8(&mut self.enc, PEIR_RAX, 0 - 16);
+    PeirEnc_cmp_rr(&mut self.enc, PEIR_R14, PEIR_RAX);
+    PeirEnc_jcc_label(&mut self.enc, 0x7, st_done);
+    // rdi = the return address [r14 + 8]; rsi = 16 digits (MSB first)
+    PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_RDI, PEIR_R14, 8);
+    PeirEnc_mov_imm32(&mut self.enc, PEIR_RSI, 16);
     var st_nib: i64 = PeirEnc_alloc_label(&mut self.enc);
     PeirEnc_place_label(&mut self.enc, st_nib);
-    // r9 = the top nibble of rax
-    PeirEnc_mov_rr(&mut self.enc, PEIR_R9, PEIR_RAX);
-    PeirEnc_mov_imm32(&mut self.enc, PEIR_R10, 60);
-    PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_RCX);  // keep count
-    // shr r9, 60: load 60 into cl then shr r9, cl
-    PeirEnc_push(&mut self.enc, PEIR_RCX);
+    // r9 = the top nibble of rdi (shr r9, cl with cl = 60)
+    PeirEnc_mov_rr(&mut self.enc, PEIR_R9, PEIR_RDI);
     PeirEnc_xor_rr(&mut self.enc, PEIR_RCX, PEIR_RCX);
     PeirEnc_mov_r8_imm(&mut self.enc, PEIR_RCX, 60);
     PeirEnc_shr_cl(&mut self.enc, PEIR_R9);
-    PeirEnc_pop(&mut self.enc, PEIR_RCX);
-    // shl rax, 4
-    PeirEnc_shl_r_i8(&mut self.enc, PEIR_RAX, 4);
+    PeirEnc_shl_r_i8(&mut self.enc, PEIR_RDI, 4);
     // char: '0' + nibble (or 'a' + nibble - 10)
     PeirEnc_add_r_i8(&mut self.enc, PEIR_R9, 48);
     PeirEnc_cmp_r8_i8(&mut self.enc, PEIR_R9, 57);
@@ -4143,7 +4174,7 @@ pub fn PeirGen_gen_panic(self: &mut PeirGen) -> void {
     PeirEnc_lea_rbp(&mut self.enc, PEIR_RDX, -56);
     PeirEnc_mov_imm32(&mut self.enc, PEIR_R8, 1);
     PeirGen_gen_panic_write(self);
-    PeirEnc_dec_r(&mut self.enc, PEIR_RCX);
+    PeirEnc_dec_r(&mut self.enc, PEIR_RSI);
     PeirEnc_jcc_label(&mut self.enc, 0x5, st_nib);
     // newline
     PeirEnc_mov_imm32(&mut self.enc, PEIR_RAX, 10);
@@ -4151,11 +4182,16 @@ pub fn PeirGen_gen_panic(self: &mut PeirGen) -> void {
     PeirEnc_lea_rbp(&mut self.enc, PEIR_RDX, -56);
     PeirEnc_mov_imm32(&mut self.enc, PEIR_R8, 1);
     PeirGen_gen_panic_write(self);
-    // next frame
-    PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_R14, 0);
+    // next frame [r14], only when it is above this one (jbe: stop)
+    PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_RAX, PEIR_R14, 0);
+    PeirEnc_cmp_rr(&mut self.enc, PEIR_RAX, PEIR_R14);
+    PeirEnc_jcc_label(&mut self.enc, 0x6, st_done);
+    PeirEnc_mov_rr(&mut self.enc, PEIR_R14, PEIR_RAX);
     PeirEnc_inc_r(&mut self.enc, PEIR_R15);
     PeirEnc_jmp_label(&mut self.enc, st_loop);
     PeirEnc_place_label(&mut self.enc, st_done);
+    PeirEnc_pop(&mut self.enc, PEIR_RDI);
+    PeirEnc_pop(&mut self.enc, PEIR_RSI);
     PeirEnc_pop(&mut self.enc, PEIR_R15);
     PeirEnc_pop(&mut self.enc, PEIR_R14);
 
@@ -4271,13 +4307,26 @@ fn PeirGen_gen_panic_write(self: &mut PeirGen) -> void {
 // RT7: a thread's list array (512 bytes; the free lists of classes 7..40 at
 // class * 8): +384 bump cursor, +392 bump end (in the thread's own 4 MB
 // chunk), +400 that chunk, +408 the resident bytes on its lists, +416 the
-// count past which p_free calls pert_alloc_trim (conc.fd has the same
-// offsets).
+// count past which p_free calls pert_alloc_trim, (RT8) +424 the thread's
+// owner slot (conc.fd has the same offsets, and the owner return's design
+// in "Freed memory back to the system").
+// RT8: allocator state +400 the TEB offset of the list arrays' TLS slot (0:
+// TlsGetValue), +408 / +416 the owner slot table and its highest slot
+// (conc.fd), then two tables pe_ir.fd fills (peir_alloc_state_byte): +448
+// the block bytes of each class (a word each, classes 0..40), +776 the
+// class of a request of s <= PEIR_SMALL_MAX bytes at (s + 15) >> 3. A
+// chunk's header word 64 is its owner slot.
 const PEIR_PT_CUR: i64 = 384;
 const PEIR_PT_END: i64 = 392;
 const PEIR_PT_FREE: i64 = 408;
 const PEIR_PT_NEXT: i64 = 416;
-pub const PEIR_ALLOC_STATE_SIZE: i64 = 448;
+const PEIR_PT_SLOT: i64 = 424;
+const PEIR_ST_TEBOFF: i64 = 400;
+pub const PEIR_ALLOC_BYTES: i64 = 448;
+pub const PEIR_ALLOC_CLS: i64 = 776;
+pub const PEIR_SMALL_MAX: i64 = 1016;
+const PEIR_CHUNK_OWNER: i64 = 64;
+pub const PEIR_ALLOC_STATE_SIZE: i64 = 960;
 const PEIR_ALLOC_LISTS: i64 = 32;
 const PEIR_NAT_TLS: i64 = 360;
 const PEIR_NAT_SSP: i64 = 368;  // A block's header: this magic | its size class. p_free turns it into
@@ -4601,12 +4650,38 @@ fn PeirGen_gen_alloc_unlock(self: &mut PeirGen, abase: i64) -> void {
 /// r9 = this thread's free-list array (release H8: a free list per thread,
 /// so p_malloc and p_free take no lock; only a new chunk or a trim does).
 /// The array (64 class heads) is made on a thread's first use and kept in a
-/// TLS slot allocated once. Needs rsp 16-aligned; clobbers rax, rcx, rdx,
-/// r8–r11. A block freed by another thread joins that thread's lists.
+/// TLS slot allocated once. RT8: when that slot's index is below 64 its
+/// offset in the TEB is at abase+400 and the array is one gs: load (the TEB's
+/// TlsSlots, as TlsGetValue reads them, without the call); otherwise, and on
+/// a thread's first use, TlsGetValue. Every register but r9 (and the flags)
+/// is kept, so the fast paths need no frame; any stack alignment.
 fn PeirGen_gen_my_lists(self: &mut PeirGen, abase: i64) -> void {
     var have: i64 = PeirEnc_alloc_label(&mut self.enc);
     var have_locked: i64 = PeirEnc_alloc_label(&mut self.enc);
     var done: i64 = PeirEnc_alloc_label(&mut self.enc);
+    var slow: i64 = PeirEnc_alloc_label(&mut self.enc);
+    var no_teb: i64 = PeirEnc_alloc_label(&mut self.enc);
+    PeirEnc_mov_reg_rip(&mut self.enc, PEIR_R9, abase + PEIR_ST_TEBOFF);
+    PeirEnc_test_rr(&mut self.enc, PEIR_R9, PEIR_R9);
+    PeirEnc_jcc_label(&mut self.enc, 0x4, slow);
+    // jz
+    pe_emit4(&mut self.enc, 0x65, 0x4D, 0x8B, 0x09);
+    // mov r9, gs:[r9]
+    PeirEnc_test_rr(&mut self.enc, PEIR_R9, PEIR_R9);
+    PeirEnc_jcc_label(&mut self.enc, 0x5, done);
+    // jnz
+    PeirEnc_place_label(&mut self.enc, slow);
+    // Slow: the volatile registers but r9 kept on an aligned frame
+    PeirEnc_push(&mut self.enc, PEIR_RBP);
+    PeirEnc_mov_rr(&mut self.enc, PEIR_RBP, PEIR_RSP);
+    PeirEnc_push(&mut self.enc, PEIR_RAX);
+    PeirEnc_push(&mut self.enc, PEIR_RCX);
+    PeirEnc_push(&mut self.enc, PEIR_RDX);
+    PeirEnc_push(&mut self.enc, PEIR_R8);
+    PeirEnc_push(&mut self.enc, PEIR_R10);
+    PeirEnc_push(&mut self.enc, PEIR_R11);
+    pe_emit4(&mut self.enc, 0x48, 0x83, 0xE4, 0xF0);
+    // and rsp, -16
     PeirEnc_mov_reg_rip(&mut self.enc, PEIR_RAX, abase + PEIR_ALLOC_LISTS);
     PeirEnc_test_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
     PeirEnc_jcc_label(&mut self.enc, 0x5, have);
@@ -4625,6 +4700,17 @@ fn PeirGen_gen_my_lists(self: &mut PeirGen, abase: i64) -> void {
     pe_emit3(&mut self.enc, 0x48, 0xFF, 0xC0);
     // inc rax
     PeirEnc_mov_rip_reg(&mut self.enc, abase + PEIR_ALLOC_LISTS, PEIR_RAX);
+    // RT8: an index below 64 is the TEB's TlsSlots[index], at 0x1480 +
+    // 8 * index from gs (published after the index: a thread that reads 0
+    // takes this slow path)
+    PeirEnc_lea_base_disp(&mut self.enc, PEIR_RDX, PEIR_RAX, -1);
+    PeirEnc_cmp_r_imm(&mut self.enc, PEIR_RDX, 64);
+    PeirEnc_jcc_label(&mut self.enc, 0x3, no_teb);
+    // jae
+    PeirEnc_shl_r_i8(&mut self.enc, PEIR_RDX, 3);
+    PeirEnc_add_r_i32(&mut self.enc, PEIR_RDX, 0x1480);
+    PeirEnc_mov_rip_reg(&mut self.enc, abase + PEIR_ST_TEBOFF, PEIR_RDX);
+    PeirEnc_place_label(&mut self.enc, no_teb);
     PeirEnc_place_label(&mut self.enc, have_locked);
     PeirGen_gen_alloc_unlock(self, abase);
     PeirEnc_place_label(&mut self.enc, have);
@@ -4635,8 +4721,9 @@ fn PeirGen_gen_my_lists(self: &mut PeirGen, abase: i64) -> void {
     PeirEnc_sub_rsp_i32(&mut self.enc, 32);
     PeirEnc_call_rip(&mut self.enc, PeirGen_iat_off(self, pe_import_slot("TlsGetValue")));
     PeirEnc_add_rsp_i32(&mut self.enc, 32);
+    var got: i64 = PeirEnc_alloc_label(&mut self.enc);
     PeirEnc_test_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
-    PeirEnc_jcc_label(&mut self.enc, 0x5, done);
+    PeirEnc_jcc_label(&mut self.enc, 0x5, got);
     // jnz
     // This thread's first block: its zeroed list array, kept in the slot
     PeirGen_gen_process_heap(self, abase);
@@ -4656,8 +4743,17 @@ fn PeirGen_gen_my_lists(self: &mut PeirGen, abase: i64) -> void {
     PeirEnc_call_rip(&mut self.enc, PeirGen_iat_off(self, pe_import_slot("TlsSetValue")));
     PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_RAX, PEIR_RSP, 32);
     PeirEnc_add_rsp_i32(&mut self.enc, 48);
-    PeirEnc_place_label(&mut self.enc, done);
+    PeirEnc_place_label(&mut self.enc, got);
     PeirEnc_mov_rr(&mut self.enc, PEIR_R9, PEIR_RAX);
+    PeirEnc_lea_base_disp(&mut self.enc, PEIR_RSP, PEIR_RBP, -48);
+    PeirEnc_pop(&mut self.enc, PEIR_R11);
+    PeirEnc_pop(&mut self.enc, PEIR_R10);
+    PeirEnc_pop(&mut self.enc, PEIR_R8);
+    PeirEnc_pop(&mut self.enc, PEIR_RDX);
+    PeirEnc_pop(&mut self.enc, PEIR_RCX);
+    PeirEnc_pop(&mut self.enc, PEIR_RAX);
+    PeirEnc_pop(&mut self.enc, PEIR_RBP);
+    PeirEnc_place_label(&mut self.enc, done);
 }
 
 /// r9 = address of the free list of class r13 (clobbers rax).
@@ -4722,6 +4818,444 @@ fn PeirGen_gen_leak_thunk(self: &mut PeirGen, target: str) -> void {
     PeirEnc_ret(&mut self.enc);
 }
 
+/// RT8: the block bytes of class c (as p_malloc makes them): 1 << (c / 2)
+/// for an even c, three quarters of the next power of two for an odd one;
+/// 0 below the first class (stdlib/pe_runtime/conc.fd pe_al_bytes).
+pub fn peir_class_bytes(c: i64) -> i64 {
+    if c < 7 {
+        return 0;
+    }
+    if c % 2 == 0 {
+        return 1 << (c / 2);
+    }
+    return 3 << (c / 2 - 1);
+}
+
+/// RT8: the class of a block of n bytes with its header (n >= 8): the
+/// power of two 2^b >= n (b at least 4) is class 2b, three quarters of it
+/// class 2b - 1 when that holds n (not for b = 4), as the machine code of
+/// PeirGen_gen_malloc_body computes for the sizes past the table.
+pub fn peir_class_for(n: i64) -> i64 {
+    var b: i64 = 4;
+    while (1 << b) < n {
+        b = b + 1;
+    }
+    if b != 4 && n <= (3 << (b - 2)) {
+        return 2 * b - 1;
+    }
+    return 2 * b;
+}
+
+/// RT8: the initial bytes of the allocator state in .rdata (pe_ir.fd
+/// writes them): zero, but the class tables: at PEIR_ALLOC_BYTES each
+/// class's block bytes (a word per class 0..40), at PEIR_ALLOC_CLS the
+/// class of a request of s bytes at index (s + 15) >> 3, s up to
+/// PEIR_SMALL_MAX (with the header: n = 8 * index).
+pub fn peir_alloc_state_byte(i: i64) -> i64 {
+    if i >= PEIR_ALLOC_BYTES && i < PEIR_ALLOC_BYTES + 41 * 8 {
+        var c: i64 = (i - PEIR_ALLOC_BYTES) / 8;
+        var k: i64 = (i - PEIR_ALLOC_BYTES) % 8;
+        return (peir_class_bytes(c) >> (8 * k)) & 255;
+    }
+    if i >= PEIR_ALLOC_CLS && i <= PEIR_ALLOC_CLS + (PEIR_SMALL_MAX + 15) / 8 {
+        var j: i64 = i - PEIR_ALLOC_CLS;
+        var n: i64 = 8 * j;
+        if n < 8 {
+            n = 8;
+        }
+        return peir_class_for(n);
+    }
+    return 0;
+}
+
+/// RT8: zero the rcx bytes asked for at rax (rounded up to 8; a block's
+/// payload holds them), then ret. Up to 32 bytes: two overlapping 16-byte
+/// stores (or one word); up to 2 KB a loop of 32-byte stores; beyond, rep
+/// stosb (rdi kept). Clobbers rcx, rdx, r10, xmm0.
+fn PeirGen_gen_zero_ret(self: &mut PeirGen) -> void {
+    var small: i64 = PeirEnc_alloc_label(&mut self.enc);
+    var big: i64 = PeirEnc_alloc_label(&mut self.enc);
+    var rep: i64 = PeirEnc_alloc_label(&mut self.enc);
+    var lp: i64 = PeirEnc_alloc_label(&mut self.enc);
+    var none: i64 = PeirEnc_alloc_label(&mut self.enc);
+    pe_emit4(&mut self.enc, 0x48, 0x83, 0xC1, 0x07);
+    // add rcx, 7
+    pe_emit4(&mut self.enc, 0x48, 0x83, 0xE1, 0xF8);
+    // and rcx, -8
+    PeirEnc_cmp_r_imm(&mut self.enc, PEIR_RCX, 16);
+    PeirEnc_jcc_label(&mut self.enc, 0x2, small);
+    // jb
+    PeirEnc_cmp_r_imm(&mut self.enc, PEIR_RCX, 32);
+    PeirEnc_jcc_label(&mut self.enc, 0x7, big);
+    // ja
+    pe_emit3(&mut self.enc, 0x0F, 0x57, 0xC0);
+    // xorps xmm0, xmm0
+    pe_emit3(&mut self.enc, 0x0F, 0x11, 0x00);
+    // movups [rax], xmm0
+    pe_emit4(&mut self.enc, 0x0F, 0x11, 0x44, 0x08);
+    PeirEnc_emit_u8(&mut self.enc, 0xF0);
+    // movups [rax + rcx - 16], xmm0
+    PeirEnc_ret(&mut self.enc);
+    // 0 or 8 bytes
+    PeirEnc_place_label(&mut self.enc, small);
+    PeirEnc_test_rr(&mut self.enc, PEIR_RCX, PEIR_RCX);
+    PeirEnc_jcc_label(&mut self.enc, 0x4, none);
+    // jz
+    pe_emit3(&mut self.enc, 0x48, 0xC7, 0x00);
+    PeirEnc_emit_i32(&mut self.enc, 0);
+    // mov qword [rax], 0
+    PeirEnc_place_label(&mut self.enc, none);
+    PeirEnc_ret(&mut self.enc);
+    // 40 bytes to 2 KB: [rax, rax + rcx - 32) by 32, then the last 32
+    PeirEnc_place_label(&mut self.enc, big);
+    PeirEnc_cmp_r_imm(&mut self.enc, PEIR_RCX, 2048);
+    PeirEnc_jcc_label(&mut self.enc, 0x7, rep);
+    // ja
+    pe_emit3(&mut self.enc, 0x0F, 0x57, 0xC0);
+    // xorps xmm0, xmm0
+    pe_emit4(&mut self.enc, 0x48, 0x8D, 0x54, 0x08);
+    PeirEnc_emit_u8(&mut self.enc, 0xE0);
+    // lea rdx, [rax + rcx - 32]
+    PeirEnc_mov_rr(&mut self.enc, PEIR_R10, PEIR_RAX);
+    PeirEnc_place_label(&mut self.enc, lp);
+    pe_emit4(&mut self.enc, 0x41, 0x0F, 0x11, 0x02);
+    // movups [r10], xmm0
+    pe_emit4(&mut self.enc, 0x41, 0x0F, 0x11, 0x42);
+    PeirEnc_emit_u8(&mut self.enc, 0x10);
+    // movups [r10 + 16], xmm0
+    pe_emit4(&mut self.enc, 0x49, 0x83, 0xC2, 0x20);
+    // add r10, 32
+    PeirEnc_cmp_rr(&mut self.enc, PEIR_R10, PEIR_RDX);
+    PeirEnc_jcc_label(&mut self.enc, 0x2, lp);
+    // jb
+    pe_emit3(&mut self.enc, 0x0F, 0x11, 0x02);
+    // movups [rdx], xmm0
+    pe_emit4(&mut self.enc, 0x0F, 0x11, 0x42, 0x10);
+    // movups [rdx + 16], xmm0
+    PeirEnc_ret(&mut self.enc);
+    // Past 2 KB: rep stosb
+    PeirEnc_place_label(&mut self.enc, rep);
+    PeirEnc_push(&mut self.enc, PEIR_RDI);
+    PeirEnc_mov_rr(&mut self.enc, PEIR_RDI, PEIR_RAX);
+    PeirEnc_mov_rr(&mut self.enc, PEIR_RDX, PEIR_RAX);
+    pe_emit2(&mut self.enc, 0x31, 0xC0);
+    // xor eax, eax
+    pe_emit2(&mut self.enc, 0xF3, 0xAA);
+    // rep stosb
+    PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_RDX);
+    PeirEnc_pop(&mut self.enc, PEIR_RDI);
+    PeirEnc_ret(&mut self.enc);
+}
+
+/// p_malloc / p_malloc_uninit (RT8) of the normal Windows build, from its
+/// label: rcx = size -> rax = the payload. `zero`: a reused block's bytes
+/// asked for are zeroed (fresh chunk memory and the system heap's large
+/// blocks read zero already); p_malloc_uninit leaves them as they are.
+/// The fast path is a leaf with no frame and no call: the class and its
+/// bytes from the tables in the allocator state (requests up to
+/// PEIR_SMALL_MAX; bsr past them), the list array from the TEB, a pop of
+/// the class's list or a bump in the thread's chunk. Registers: rcx the
+/// size, r8 the class, r11 its bytes, r9 the list array.
+fn PeirGen_gen_malloc_body(self: &mut PeirGen, zero: bool) -> void {
+    var abase: i64 = self.alloc_rdata_off;
+    var mid: i64 = PeirEnc_alloc_label(&mut self.enc);
+    var whole: i64 = PeirEnc_alloc_label(&mut self.enc);
+    var have_cls: i64 = PeirEnc_alloc_label(&mut self.enc);
+    var lim_slow: i64 = PeirEnc_alloc_label(&mut self.enc);
+    var after_lim: i64 = PeirEnc_alloc_label(&mut self.enc);
+    var pop: i64 = PeirEnc_alloc_label(&mut self.enc);
+    var refill: i64 = PeirEnc_alloc_label(&mut self.enc);
+    var dloop: i64 = PeirEnc_alloc_label(&mut self.enc);
+    var ddone: i64 = PeirEnc_alloc_label(&mut self.enc);
+    var bump: i64 = PeirEnc_alloc_label(&mut self.enc);
+    var new_chunk: i64 = PeirEnc_alloc_label(&mut self.enc);
+    var recommit: i64 = PeirEnc_alloc_label(&mut self.enc);
+    var oom: i64 = PeirEnc_alloc_label(&mut self.enc);
+    var large: i64 = PeirEnc_alloc_label(&mut self.enc);
+    var lout: i64 = PeirEnc_alloc_label(&mut self.enc);
+
+    // --- r8 = class, r11 = its block bytes: from the tables up to
+    // PEIR_SMALL_MAX bytes (a negative size is a huge unsigned one: the
+    // system heap refuses it, NULL)
+    PeirEnc_cmp_r_imm(&mut self.enc, PEIR_RCX, PEIR_SMALL_MAX);
+    PeirEnc_jcc_label(&mut self.enc, 0x7, mid);
+    // ja (unsigned)
+    PeirEnc_lea_base_disp(&mut self.enc, PEIR_RAX, PEIR_RCX, 15);
+    pe_emit4(&mut self.enc, 0x48, 0xC1, 0xE8, 0x03);
+    // shr rax, 3
+    PeirEnc_lea_rip(&mut self.enc, PEIR_R10, abase + PEIR_ALLOC_BYTES);
+    pe_emit4(&mut self.enc, 0x45, 0x0F, 0xB6, 0x84);
+    PeirEnc_emit_u8(&mut self.enc, 0x02);
+    PeirEnc_emit_i32(&mut self.enc, PEIR_ALLOC_CLS - PEIR_ALLOC_BYTES);
+    // movzx r8d, byte [r10 + rax + (CLS - BYTES)]
+    PeirEnc_mem_op(&mut self.enc, 0x8B, PEIR_R11, true, PEIR_R10, PEIR_R8, 0);
+    // mov r11, [r10 + r8 * 8]
+    PeirEnc_place_label(&mut self.enc, have_cls);
+
+    // --- P12: FID_MEM_LIMIT counts the block (r11 bytes), out of line
+    var has_lim: bool = HashMap_contains(self.func_labels, "pert_lim_take");
+    if has_lim {
+        if HashMap_contains(self.global_rdata_offsets, "pe_lim_mem") {
+            PeirEnc_mov_reg_rip(&mut self.enc, PEIR_RAX, HashMap_get(self.global_rdata_offsets, "pe_lim_mem"));
+            PeirEnc_test_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
+            PeirEnc_jcc_label(&mut self.enc, 0x5, lim_slow);
+            // jnz
+        } else {
+            PeirEnc_jmp_label(&mut self.enc, lim_slow);
+        }
+    }
+    PeirEnc_place_label(&mut self.enc, after_lim);
+
+    // --- pop this class's list of this thread's free blocks: no lock
+    PeirGen_gen_my_lists(self, abase);
+    PeirEnc_mem_op(&mut self.enc, 0x8B, PEIR_RAX, true, PEIR_R9, PEIR_R8, 0);
+    // mov rax, [r9 + r8 * 8]
+    PeirEnc_test_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
+    PeirEnc_jcc_label(&mut self.enc, 0x4, refill);
+    // jz
+    PeirEnc_place_label(&mut self.enc, pop);
+    PeirEnc_mov_reg_ptr(&mut self.enc, PEIR_RDX, PEIR_RAX);
+    PeirEnc_mem_op(&mut self.enc, 0x89, PEIR_RDX, true, PEIR_R9, PEIR_R8, 0);
+    // mov [r9 + r8 * 8], rdx
+    // RT7: r11 bytes fewer on this thread's lists
+    PeirEnc_mem_op(&mut self.enc, 0x29, PEIR_R11, true, PEIR_R9, -1, PEIR_PT_FREE);
+    // sub [r9 + FREE], r11
+    // The header again (rdx keeps the freed one)
+    PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_RDX, PEIR_RAX, -8);
+    PeirEnc_mov_imm64(&mut self.enc, PEIR_R10, PEIR_BLOCK_MAGIC);
+    PeirEnc_or_rr(&mut self.enc, PEIR_R10, PEIR_R8);
+    PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_RAX, -8, PEIR_R10);
+    // RT7: bit 7 of the freed header: a trim gave its inside pages back
+    pe_emit3(&mut self.enc, 0xF6, 0xC2, 0x80);
+    // test dl, 0x80
+    PeirEnc_jcc_label(&mut self.enc, 0x5, recommit);
+    // jnz
+    if zero {
+        PeirGen_gen_zero_ret(self);
+    } else {
+        PeirEnc_ret(&mut self.enc);
+    }
+
+    // --- the class's list is empty: first what other threads freed of
+    // this thread's chunks (RT8, its owner slot), then a bump
+    PeirEnc_place_label(&mut self.enc, refill);
+    PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_R10, PEIR_R9, PEIR_PT_SLOT);
+    PeirEnc_test_rr(&mut self.enc, PEIR_R10, PEIR_R10);
+    PeirEnc_jcc_label(&mut self.enc, 0x4, bump);
+    // jz: no slot
+    PeirEnc_mov_reg_ptr(&mut self.enc, PEIR_RAX, PEIR_R10);
+    PeirEnc_test_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
+    PeirEnc_jcc_label(&mut self.enc, 0x4, bump);
+    // jz: nothing on it
+    PeirEnc_xor_self(&mut self.enc, PEIR_RAX);
+    pe_emit3(&mut self.enc, 0x49, 0x87, 0x02);
+    // xchg [r10], rax: the whole list, the slot empty again
+    PeirEnc_push(&mut self.enc, PEIR_RCX);
+    PeirEnc_place_label(&mut self.enc, dloop);
+    PeirEnc_test_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
+    PeirEnc_jcc_label(&mut self.enc, 0x4, ddone);
+    // jz
+    PeirEnc_mov_reg_ptr(&mut self.enc, PEIR_RDX, PEIR_RAX);
+    // rdx = the next block; r10 = this one's class (its freed header)
+    pe_emit4(&mut self.enc, 0x44, 0x0F, 0xB6, 0x50);
+    PeirEnc_emit_u8(&mut self.enc, 0xF8);
+    // movzx r10d, byte [rax - 8]
+    pe_emit4(&mut self.enc, 0x41, 0x83, 0xE2, 0x3F);
+    // and r10d, 63
+    PeirEnc_mem_op(&mut self.enc, 0x8B, PEIR_RCX, true, PEIR_R9, PEIR_R10, 0);
+    PeirEnc_mov_ptr_reg(&mut self.enc, PEIR_RAX, PEIR_RCX);
+    PeirEnc_mem_op(&mut self.enc, 0x89, PEIR_RAX, true, PEIR_R9, PEIR_R10, 0);
+    // on its list; its bytes counted on this thread's
+    PeirEnc_lea_rip(&mut self.enc, PEIR_RCX, abase + PEIR_ALLOC_BYTES);
+    PeirEnc_mem_op(&mut self.enc, 0x8B, PEIR_RCX, true, PEIR_RCX, PEIR_R10, 0);
+    PeirEnc_mem_op(&mut self.enc, 0x01, PEIR_RCX, true, PEIR_R9, -1, PEIR_PT_FREE);
+    // add [r9 + FREE], rcx
+    PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_RDX);
+    PeirEnc_jmp_label(&mut self.enc, dloop);
+    PeirEnc_place_label(&mut self.enc, ddone);
+    PeirEnc_pop(&mut self.enc, PEIR_RCX);
+    PeirEnc_mem_op(&mut self.enc, 0x8B, PEIR_RAX, true, PEIR_R9, PEIR_R8, 0);
+    PeirEnc_test_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
+    PeirEnc_jcc_label(&mut self.enc, 0x5, pop);
+    // jnz
+
+    // --- bump in this thread's own chunk (RT7): no lock, no atomic. No
+    // chunk: cursor and end are 0, so cursor + r11 > end
+    PeirEnc_place_label(&mut self.enc, bump);
+    PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_RAX, PEIR_R9, PEIR_PT_CUR);
+    PeirEnc_lea_base_index(&mut self.enc, PEIR_RDX, PEIR_RAX, PEIR_R11, 0);
+    PeirEnc_mem_op(&mut self.enc, 0x3B, PEIR_RDX, true, PEIR_R9, -1, PEIR_PT_END);
+    // cmp rdx, [r9 + END]
+    PeirEnc_jcc_label(&mut self.enc, 0x7, new_chunk);
+    // ja: the chunk is full
+    PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_R9, PEIR_PT_CUR, PEIR_RDX);
+    // A new block at rax (fresh pages read zero): its header
+    PeirEnc_mov_imm64(&mut self.enc, PEIR_RDX, PEIR_BLOCK_MAGIC);
+    PeirEnc_or_rr(&mut self.enc, PEIR_RDX, PEIR_R8);
+    PeirEnc_mov_ptr_reg(&mut self.enc, PEIR_RAX, PEIR_RDX);
+    pe_emit4(&mut self.enc, 0x48, 0x83, 0xC0, 0x08);
+    // add rax, 8
+    PeirEnc_ret(&mut self.enc);
+
+    // --- a new chunk for this thread: pert_alloc_chunk(env 0, the
+    // allocator state, the list array) retires the old one, maps 4 MB and
+    // sets the cursor; 0: no memory. Entry rsp is 8 mod 16: five pushes
+    // and the shadow space align it.
+    PeirEnc_place_label(&mut self.enc, new_chunk);
+    PeirEnc_push(&mut self.enc, PEIR_RBP);
+    PeirEnc_mov_rr(&mut self.enc, PEIR_RBP, PEIR_RSP);
+    PeirEnc_push(&mut self.enc, PEIR_RCX);
+    PeirEnc_push(&mut self.enc, PEIR_R8);
+    PeirEnc_push(&mut self.enc, PEIR_R11);
+    PeirEnc_push(&mut self.enc, PEIR_R9);
+    PeirEnc_sub_rsp_i32(&mut self.enc, 32);
+    PeirEnc_lea_rip(&mut self.enc, PEIR_RDX, abase);
+    PeirEnc_mov_rr(&mut self.enc, PEIR_R8, PEIR_R9);
+    PeirEnc_xor_rr(&mut self.enc, PEIR_RCX, PEIR_RCX);
+    PeirGen_call_runtime(self, "pert_alloc_chunk");
+    PeirEnc_add_rsp_i32(&mut self.enc, 32);
+    PeirEnc_pop(&mut self.enc, PEIR_R9);
+    PeirEnc_pop(&mut self.enc, PEIR_R11);
+    PeirEnc_pop(&mut self.enc, PEIR_R8);
+    PeirEnc_pop(&mut self.enc, PEIR_RCX);
+    PeirEnc_pop(&mut self.enc, PEIR_RBP);
+    PeirEnc_test_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
+    PeirEnc_jcc_label(&mut self.enc, 0x5, bump);
+    // jnz: bump again, in the new chunk
+    PeirEnc_place_label(&mut self.enc, oom);
+    // no memory: NULL (the caller crashes on use, as before)
+    PeirEnc_xor_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
+    PeirEnc_ret(&mut self.enc);
+
+    // --- RT7: pert_alloc_recommit(env 0, list array, payload, block
+    // bytes) commits its pages again and zeroes the rest (both kinds);
+    // 0: no memory
+    PeirEnc_place_label(&mut self.enc, recommit);
+    PeirEnc_push(&mut self.enc, PEIR_RBP);
+    PeirEnc_mov_rr(&mut self.enc, PEIR_RBP, PEIR_RSP);
+    PeirEnc_push(&mut self.enc, PEIR_RAX);
+    PeirEnc_sub_rsp_i32(&mut self.enc, 40);
+    PeirEnc_mov_rr(&mut self.enc, PEIR_RDX, PEIR_R9);
+    PeirEnc_mov_rr(&mut self.enc, PEIR_R8, PEIR_RAX);
+    PeirEnc_mov_rr(&mut self.enc, PEIR_R9, PEIR_R11);
+    PeirEnc_xor_rr(&mut self.enc, PEIR_RCX, PEIR_RCX);
+    PeirGen_call_runtime(self, "pert_alloc_recommit");
+    PeirEnc_add_rsp_i32(&mut self.enc, 40);
+    PeirEnc_test_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
+    PeirEnc_pop(&mut self.enc, PEIR_RAX);
+    PeirEnc_pop(&mut self.enc, PEIR_RBP);
+    PeirEnc_jcc_label(&mut self.enc, 0x4, oom);
+    // jz (pop keeps the flags)
+    PeirEnc_ret(&mut self.enc);
+
+    // --- P12 out of line: pert_lim_take(env 0, r11 bytes), the size,
+    // class and bytes kept. Five pushes align rsp.
+    if has_lim {
+        PeirEnc_place_label(&mut self.enc, lim_slow);
+        PeirEnc_push(&mut self.enc, PEIR_RBP);
+        PeirEnc_mov_rr(&mut self.enc, PEIR_RBP, PEIR_RSP);
+        PeirEnc_push(&mut self.enc, PEIR_RCX);
+        PeirEnc_push(&mut self.enc, PEIR_R8);
+        PeirEnc_push(&mut self.enc, PEIR_R11);
+        PeirEnc_push(&mut self.enc, PEIR_RAX);
+        PeirEnc_mov_rr(&mut self.enc, PEIR_RDX, PEIR_R11);
+        PeirGen_gen_lim_call(self, "pert_lim_take");
+        PeirEnc_pop(&mut self.enc, PEIR_RAX);
+        PeirEnc_pop(&mut self.enc, PEIR_R11);
+        PeirEnc_pop(&mut self.enc, PEIR_R8);
+        PeirEnc_pop(&mut self.enc, PEIR_RCX);
+        PeirEnc_pop(&mut self.enc, PEIR_RBP);
+        PeirEnc_jmp_label(&mut self.enc, after_lim);
+    }
+
+    // --- past the table: rdx = size + header; over 1 MB a large block
+    PeirEnc_place_label(&mut self.enc, mid);
+    PeirEnc_lea_base_disp(&mut self.enc, PEIR_RDX, PEIR_RCX, 8);
+    PeirEnc_mov_imm64(&mut self.enc, PEIR_RAX, 1 << 20);
+    PeirEnc_cmp_rr(&mut self.enc, PEIR_RDX, PEIR_RAX);
+    PeirEnc_jcc_label(&mut self.enc, 0x7, large);
+    // ja
+    // b = bits(rdx - 1) (b > 10 here): class 2b, 2^b bytes, or three
+    // quarters of them (class 2b - 1) when that holds rdx
+    PeirEnc_lea_base_disp(&mut self.enc, PEIR_RAX, PEIR_RDX, -1);
+    pe_emit4(&mut self.enc, 0x48, 0x0F, 0xBD, 0xC0);
+    // bsr rax, rax
+    pe_emit3(&mut self.enc, 0x48, 0xFF, 0xC0);
+    // inc rax
+    PeirEnc_push(&mut self.enc, PEIR_RCX);
+    PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_RAX);
+    PeirEnc_mov_imm64(&mut self.enc, PEIR_R11, 1);
+    PeirEnc_shl_cl(&mut self.enc, PEIR_R11);
+    PeirEnc_lea_base_index(&mut self.enc, PEIR_R8, PEIR_RAX, PEIR_RAX, 0);
+    // lea r8, [rax + rax]
+    PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_R11);
+    pe_emit4(&mut self.enc, 0x48, 0xC1, 0xE8, 0x02);
+    // shr rax, 2
+    PeirEnc_lea_base_index(&mut self.enc, PEIR_RAX, PEIR_RAX, PEIR_RAX, 1);
+    // lea rax, [rax + rax * 2]
+    PeirEnc_cmp_rr(&mut self.enc, PEIR_RDX, PEIR_RAX);
+    PeirEnc_jcc_label(&mut self.enc, 0x7, whole);
+    // ja
+    PeirEnc_mov_rr(&mut self.enc, PEIR_R11, PEIR_RAX);
+    pe_emit3(&mut self.enc, 0x49, 0xFF, 0xC8);
+    // dec r8
+    PeirEnc_place_label(&mut self.enc, whole);
+    PeirEnc_pop(&mut self.enc, PEIR_RCX);
+    PeirEnc_jmp_label(&mut self.enc, have_cls);
+
+    // --- a large block (rdx bytes with its header): the system heap's,
+    // zeroed by it for p_malloc. Entry rsp is 8 mod 16: two pushes and 40
+    // align it, with shadow space.
+    PeirEnc_place_label(&mut self.enc, large);
+    PeirEnc_push(&mut self.enc, PEIR_RBP);
+    PeirEnc_mov_rr(&mut self.enc, PEIR_RBP, PEIR_RSP);
+    PeirEnc_push(&mut self.enc, PEIR_RDX);
+    PeirEnc_sub_rsp_i32(&mut self.enc, 40);
+    // P12: FID_MEM_LIMIT counts its bytes (what HeapSize gives back in
+    // p_free)
+    PeirGen_gen_lim_call(self, "pert_lim_take");
+    PeirGen_gen_process_heap(self, abase);
+    PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_RAX);
+    if zero {
+        PeirEnc_mov_imm64(&mut self.enc, PEIR_RDX, 8);
+        // HEAP_ZERO_MEMORY
+    } else {
+        PeirEnc_xor_self(&mut self.enc, PEIR_RDX);
+    }
+    PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_R8, PEIR_RBP, -8);
+    PeirEnc_call_rip(&mut self.enc, PeirGen_iat_off(self, PIAT_HEAP_ALLOC));
+    PeirEnc_test_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
+    PeirEnc_jcc_label(&mut self.enc, 0x4, lout);
+    // jz
+    PeirEnc_mov_imm64(&mut self.enc, PEIR_R8, PEIR_BLOCK_MAGIC | PEIR_CLASS_LARGE);
+    PeirEnc_mov_ptr_reg(&mut self.enc, PEIR_RAX, PEIR_R8);
+    pe_emit4(&mut self.enc, 0x48, 0x83, 0xC0, 0x08);
+    // add rax, 8
+    PeirEnc_place_label(&mut self.enc, lout);
+    PeirEnc_mov_rr(&mut self.enc, PEIR_RSP, PEIR_RBP);
+    PeirEnc_pop(&mut self.enc, PEIR_RBP);
+    PeirEnc_ret(&mut self.enc);
+}
+
+/// RT8: __p_malloc_uninit(rcx = size) -> rax, what core's p_malloc_uninit
+/// runs here (PeirGen_resolve_call): a block exactly as p_malloc's
+/// (same kind, freed by p_free, the same FID_MEM_LIMIT count) whose bytes
+/// are left as they are. Only core and the runtimes call it, for buffers
+/// they write in full. Under --leaks, --checked-alloc and in a bare build
+/// it is p_malloc (whose blocks read zero: the same, and every block
+/// tracked or guarded).
+pub fn PeirGen_gen_malloc_uninit(self: &mut PeirGen) -> void {
+    if !HashMap_contains(self.func_labels, "__p_malloc_uninit") {
+        return;
+    }
+    PeirGen_place_fn(self, "__p_malloc_uninit");
+    if self.bare_mode || g_pe_checked_alloc || (g_pe_leaks && !g_pe_uefi) {
+        PeirEnc_jmp_label(&mut self.enc, HashMap_get(self.func_labels, "p_malloc"));
+        return;
+    }
+    PeirGen_gen_malloc_body(self, false);
+}
+
 /// p_malloc(rcx = size) -> rax = ptr. Power-of-two blocks up to 1 MB (and
 /// three quarters of one), as in the C runtime: an 8-byte header, reused
 /// through the thread's free lists, refilled by a bump in the thread's own
@@ -4729,7 +5263,10 @@ fn PeirGen_gen_leak_thunk(self: &mut PeirGen, target: str) -> void {
 /// 4 MB-aligned range, so stdlib/pe_runtime/conc.fd pert_alloc_trim can
 /// find and release a chunk whose blocks are all free). Larger blocks are
 /// HeapAlloc's. A full chunk: pert_alloc_chunk maps the next one. A reused
-/// block whose inside pages a trim decommitted: pert_alloc_recommit.
+/// block whose inside pages a trim decommitted: pert_alloc_recommit. RT8:
+/// the fast path is a leaf (PeirGen_gen_malloc_body), a reused block is
+/// zeroed in the bytes asked for, and a thread takes back the blocks
+/// other threads freed of its chunks before it bumps.
 pub fn PeirGen_gen_malloc(self: &mut PeirGen) -> void {
     var label: i64 = HashMap_get(self.func_labels, "p_malloc");
     PeirEnc_place_label(&mut self.enc, label);
@@ -4782,220 +5319,15 @@ pub fn PeirGen_gen_malloc(self: &mut PeirGen) -> void {
     } else if g_pe_checked_alloc {
         PeirGen_gen_checked_malloc(self);
     } else {
-        var abase: i64 = self.alloc_rdata_off;
-        var bump: i64 = PeirEnc_alloc_label(&mut self.enc);
-        var new_chunk: i64 = PeirEnc_alloc_label(&mut self.enc);
-        var recommit: i64 = PeirEnc_alloc_label(&mut self.enc);
-        var oom: i64 = PeirEnc_alloc_label(&mut self.enc);
-        var large: i64 = PeirEnc_alloc_label(&mut self.enc);
-        var class_ok: i64 = PeirEnc_alloc_label(&mut self.enc);
-        var no_memory: i64 = PeirEnc_alloc_label(&mut self.enc);
-
-        PeirEnc_push(&mut self.enc, PEIR_RBP);
-        PeirEnc_mov_rr(&mut self.enc, PEIR_RBP, PEIR_RSP);
-        PeirEnc_push(&mut self.enc, PEIR_R12);
-        PeirEnc_push(&mut self.enc, PEIR_R13);
-
-        // r12 = size + header; over 1 MB is a large block
-        PeirEnc_mov_rr(&mut self.enc, PEIR_R12, PEIR_RCX);
-        pe_emit4(&mut self.enc, 0x49, 0x83, 0xC4, 0x08);
-        // add r12, 8
-        PeirEnc_mov_imm64(&mut self.enc, PEIR_RAX, 1 << 20);
-        PeirEnc_cmp_rr(&mut self.enc, PEIR_R12, PEIR_RAX);
-        PeirEnc_jcc_label(&mut self.enc, 0x7, large);
-        // ja
-
-        // r13 = size class = max(4, bits(r12 - 1)); r12 = block size
-        PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_R12);
-        pe_emit3(&mut self.enc, 0x48, 0xFF, 0xC8);
-        // dec rax
-        pe_emit4(&mut self.enc, 0x48, 0x0F, 0xBD, 0xC0);
-        // bsr rax, rax
-        pe_emit3(&mut self.enc, 0x48, 0xFF, 0xC0);
-        // inc rax
-        PeirEnc_mov_imm64(&mut self.enc, PEIR_RDX, 4);
-        PeirEnc_cmp_rr(&mut self.enc, PEIR_RAX, PEIR_RDX);
-        PeirEnc_jcc_label(&mut self.enc, 0x3, class_ok);
-        // jae
-        PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_RDX);
-        PeirEnc_place_label(&mut self.enc, class_ok);
-        PeirEnc_mov_rr(&mut self.enc, PEIR_R13, PEIR_RAX);
-        PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_RAX);
-        PeirEnc_mov_rr(&mut self.enc, PEIR_R8, PEIR_R12);
-        PeirEnc_mov_imm64(&mut self.enc, PEIR_R12, 1);
-        PeirEnc_shl_cl(&mut self.enc, PEIR_R12);
-        PeirEnc_add_rr(&mut self.enc, PEIR_R13, PEIR_R13);
-        // Three quarters of the block, if that holds it
-        var whole: i64 = PeirEnc_alloc_label(&mut self.enc);
-        PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_R12);
-        PeirEnc_shl_r_i8(&mut self.enc, PEIR_RAX, 1);
-        PeirEnc_add_rr(&mut self.enc, PEIR_RAX, PEIR_R12);
-        pe_emit4(&mut self.enc, 0x48, 0xC1, 0xE8, 0x02);
-        // shr rax, 2
-        PeirEnc_cmp_rr(&mut self.enc, PEIR_R8, PEIR_RAX);
-        PeirEnc_jcc_label(&mut self.enc, 0x7, whole);
-        // ja
-        pe_emit4(&mut self.enc, 0x49, 0x83, 0xFD, 0x08);
-        // cmp r13, 8
-        PeirEnc_jcc_label(&mut self.enc, 0x4, whole);
-        // je
-        PeirEnc_mov_rr(&mut self.enc, PEIR_R12, PEIR_RAX);
-        pe_emit3(&mut self.enc, 0x49, 0xFF, 0xCD);
-        // dec r13
-        PeirEnc_place_label(&mut self.enc, whole);
-
-        // P12: FID_MEM_LIMIT counts the block (r12 bytes); rsp is 16-aligned
-        // and nothing volatile is live here
-        PeirEnc_mov_rr(&mut self.enc, PEIR_RDX, PEIR_R12);
-        PeirGen_gen_lim_call(self, "pert_lim_take");
-
-        // Pop this class's list of this thread's free blocks: no lock
-        // (release H8). rsp is 16-aligned here (three pushes after the call).
-        // r9 = the thread's list array, r10 = the address of the list's head
-        PeirGen_gen_my_lists(self, abase);
-        PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_R13);
-        PeirEnc_shl_r_i8(&mut self.enc, PEIR_RAX, 3);
-        PeirEnc_mov_rr(&mut self.enc, PEIR_R10, PEIR_R9);
-        PeirEnc_add_rr(&mut self.enc, PEIR_R10, PEIR_RAX);
-        PeirEnc_mov_reg_ptr(&mut self.enc, PEIR_RAX, PEIR_R10);
-        PeirEnc_test_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
-        PeirEnc_jcc_label(&mut self.enc, 0x4, bump);
-        // jz
-        PeirEnc_mov_reg_ptr(&mut self.enc, PEIR_RDX, PEIR_RAX);
-        PeirEnc_mov_ptr_reg(&mut self.enc, PEIR_R10, PEIR_RDX);
-        // RT7: r12 bytes fewer on this thread's lists
-        PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_RDX, PEIR_R9, PEIR_PT_FREE);
-        PeirEnc_sub_rr(&mut self.enc, PEIR_RDX, PEIR_R12);
-        PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_R9, PEIR_PT_FREE, PEIR_RDX);
-        // Restore the header (rdx keeps the freed one), then zero the
-        // payload (as fresh memory is)
-        PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_RDX, PEIR_RAX, -8);
-        PeirEnc_mov_imm64(&mut self.enc, PEIR_R8, PEIR_BLOCK_MAGIC);
-        PeirEnc_or_rr(&mut self.enc, PEIR_R8, PEIR_R13);
-        PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_RAX, -8, PEIR_R8);
-        // RT7: bit 7 of the freed header: a trim gave its inside pages back
-        pe_emit3(&mut self.enc, 0xF6, 0xC2, 0x80);
-        // test dl, 0x80
-        PeirEnc_jcc_label(&mut self.enc, 0x5, recommit);
-        // jnz
-        PeirEnc_mov_rr(&mut self.enc, PEIR_R13, PEIR_RAX);
-        PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_RAX);
-        PeirEnc_xor_self(&mut self.enc, PEIR_RDX);
-        PeirEnc_mov_rr(&mut self.enc, PEIR_R8, PEIR_R12);
-        pe_emit4(&mut self.enc, 0x49, 0x83, 0xE8, 0x08);
-        // sub r8, 8
-        PeirEnc_sub_rsp_i32(&mut self.enc, 32);
-        PeirEnc_call_rip(&mut self.enc, PeirGen_iat_off(self, pe_import_slot("memset")));
-        PeirEnc_add_rsp_i32(&mut self.enc, 32);
-        PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_R13);
-        PeirEnc_pop(&mut self.enc, PEIR_R13);
-        PeirEnc_pop(&mut self.enc, PEIR_R12);
-        PeirEnc_pop(&mut self.enc, PEIR_RBP);
-        PeirEnc_ret(&mut self.enc);
-
-        // RT7: pert_alloc_recommit(env 0, list array, payload, block bytes)
-        // commits its pages again and zeroes the rest; 0: no memory
-        PeirEnc_place_label(&mut self.enc, recommit);
-        PeirEnc_mov_rr(&mut self.enc, PEIR_R13, PEIR_RAX);
-        PeirEnc_mov_rr(&mut self.enc, PEIR_RDX, PEIR_R9);
-        PeirEnc_mov_rr(&mut self.enc, PEIR_R8, PEIR_RAX);
-        PeirEnc_mov_rr(&mut self.enc, PEIR_R9, PEIR_R12);
-        PeirEnc_xor_rr(&mut self.enc, PEIR_RCX, PEIR_RCX);
-        PeirEnc_sub_rsp_i32(&mut self.enc, 32);
-        PeirGen_call_runtime(self, "pert_alloc_recommit");
-        PeirEnc_add_rsp_i32(&mut self.enc, 32);
-        PeirEnc_test_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
-        PeirEnc_jcc_label(&mut self.enc, 0x4, oom);
-        // jz
-        PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_R13);
-        PeirEnc_pop(&mut self.enc, PEIR_R13);
-        PeirEnc_pop(&mut self.enc, PEIR_R12);
-        PeirEnc_pop(&mut self.enc, PEIR_RBP);
-        PeirEnc_ret(&mut self.enc);
-
-        // A large block: zeroed by the system heap
-        PeirEnc_place_label(&mut self.enc, large);
-        // P12: FID_MEM_LIMIT counts its r12 bytes (what HeapSize gives back
-        // in p_free); rsp is 16-aligned, nothing volatile is live
-        PeirEnc_mov_rr(&mut self.enc, PEIR_RDX, PEIR_R12);
-        PeirGen_gen_lim_call(self, "pert_lim_take");
-        PeirGen_gen_process_heap(self, abase);
-        PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_RAX);
-        PeirEnc_mov_imm64(&mut self.enc, PEIR_RDX, 8);
-        // HEAP_ZERO_MEMORY
-        PeirEnc_mov_rr(&mut self.enc, PEIR_R8, PEIR_R12);
-        PeirEnc_sub_rsp_i32(&mut self.enc, 32);
-        PeirEnc_call_rip(&mut self.enc, PeirGen_iat_off(self, PIAT_HEAP_ALLOC));
-        PeirEnc_add_rsp_i32(&mut self.enc, 32);
-        PeirEnc_test_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
-        PeirEnc_jcc_label(&mut self.enc, 0x4, no_memory);
-        // jz
-        PeirEnc_mov_imm64(&mut self.enc, PEIR_R8, PEIR_BLOCK_MAGIC | PEIR_CLASS_LARGE);
-        PeirEnc_mov_ptr_reg(&mut self.enc, PEIR_RAX, PEIR_R8);
-        pe_emit4(&mut self.enc, 0x48, 0x83, 0xC0, 0x08);
-        // add rax, 8
-        PeirEnc_place_label(&mut self.enc, no_memory);
-        PeirEnc_pop(&mut self.enc, PEIR_R13);
-        PeirEnc_pop(&mut self.enc, PEIR_R12);
-        PeirEnc_pop(&mut self.enc, PEIR_RBP);
-        PeirEnc_ret(&mut self.enc);
-
-        // --- Bump in this thread's own chunk (RT7): no lock, no atomic ---
-        // r8 = cursor; it fits when cursor + r12 <= end (cursor 0: no chunk)
-        PeirEnc_place_label(&mut self.enc, bump);
-        PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_R8, PEIR_R9, PEIR_PT_CUR);
-        PeirEnc_test_rr(&mut self.enc, PEIR_R8, PEIR_R8);
-        PeirEnc_jcc_label(&mut self.enc, 0x4, new_chunk);
-        // jz
-        PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_R8);
-        PeirEnc_add_rr(&mut self.enc, PEIR_RAX, PEIR_R12);
-        PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_R10, PEIR_R9, PEIR_PT_END);
-        PeirEnc_cmp_rr(&mut self.enc, PEIR_RAX, PEIR_R10);
-        PeirEnc_jcc_label(&mut self.enc, 0x7, new_chunk);
-        // ja: the chunk is full
-        PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_R9, PEIR_PT_CUR, PEIR_RAX);
-        PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_R8);
-        // A new block at rax (fresh pages read zero): write its header
-        PeirEnc_mov_imm64(&mut self.enc, PEIR_R8, PEIR_BLOCK_MAGIC);
-        PeirEnc_or_rr(&mut self.enc, PEIR_R8, PEIR_R13);
-        PeirEnc_mov_ptr_reg(&mut self.enc, PEIR_RAX, PEIR_R8);
-        pe_emit4(&mut self.enc, 0x48, 0x83, 0xC0, 0x08);
-        // add rax, 8
-        PeirEnc_pop(&mut self.enc, PEIR_R13);
-        PeirEnc_pop(&mut self.enc, PEIR_R12);
-        PeirEnc_pop(&mut self.enc, PEIR_RBP);
-        PeirEnc_ret(&mut self.enc);
-
-        // --- A new chunk for this thread: pert_alloc_chunk(env 0, the
-        // allocator state, the list array) retires the old one, maps 4 MB
-        // and sets the cursor; 0: no memory. r9 waits at [rsp+32]; rsp
-        // stays 16-aligned.
-        PeirEnc_place_label(&mut self.enc, new_chunk);
-        PeirEnc_sub_rsp_i32(&mut self.enc, 48);
-        PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_RSP, 32, PEIR_R9);
-        PeirEnc_lea_rip(&mut self.enc, PEIR_RDX, abase);
-        PeirEnc_mov_rr(&mut self.enc, PEIR_R8, PEIR_R9);
-        PeirEnc_xor_rr(&mut self.enc, PEIR_RCX, PEIR_RCX);
-        PeirGen_call_runtime(self, "pert_alloc_chunk");
-        PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_R9, PEIR_RSP, 32);
-        PeirEnc_add_rsp_i32(&mut self.enc, 48);
-        PeirEnc_test_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
-        PeirEnc_jcc_label(&mut self.enc, 0x5, bump);
-        // jnz: bump again, in the new chunk
-
-        // oom: NULL (the caller crashes on use, as before)
-        PeirEnc_place_label(&mut self.enc, oom);
-        PeirEnc_xor_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
-        PeirEnc_pop(&mut self.enc, PEIR_R13);
-        PeirEnc_pop(&mut self.enc, PEIR_R12);
-        PeirEnc_pop(&mut self.enc, PEIR_RBP);
-        PeirEnc_ret(&mut self.enc);
+        PeirGen_gen_malloc_body(self, true);
     }
 }
 
 /// p_free(rcx = ptr): back on its class's free list, or to the system heap
 /// when large. Panics unless it is a live block. RT7: past the thread's
 /// threshold of free bytes, pert_alloc_trim gives memory back to the system.
+/// RT8: a block of another thread's chunk goes back to that thread (its
+/// owner slot); the path to this thread's lists is a leaf with no frame.
 pub fn PeirGen_gen_free(self: &mut PeirGen) -> void {
     var label: i64 = HashMap_get(self.func_labels, "p_free");
     PeirEnc_place_label(&mut self.enc, label);
@@ -5016,6 +5348,11 @@ pub fn PeirGen_gen_free(self: &mut PeirGen) -> void {
         var large: i64 = PeirEnc_alloc_label(&mut self.enc);
         var live: i64 = PeirEnc_alloc_label(&mut self.enc);
         var twice: i64 = PeirEnc_alloc_label(&mut self.enc);
+        var local: i64 = PeirEnc_alloc_label(&mut self.enc);
+        var local_rdx: i64 = PeirEnc_alloc_label(&mut self.enc);
+        var rcas: i64 = PeirEnc_alloc_label(&mut self.enc);
+        var reowner: i64 = PeirEnc_alloc_label(&mut self.enc);
+        var trim: i64 = PeirEnc_alloc_label(&mut self.enc);
         PeirEnc_test_rr(&mut self.enc, PEIR_RCX, PEIR_RCX);
         PeirEnc_jcc_label(&mut self.enc, 0x4, out);
         // jz
@@ -5054,59 +5391,95 @@ pub fn PeirGen_gen_free(self: &mut PeirGen) -> void {
         PeirEnc_cmp_rr(&mut self.enc, PEIR_RAX, PEIR_RDX);
         PeirEnc_jcc_label(&mut self.enc, 0x4, large);
         // je
-        // Push on this thread's list of the class: no lock (release H8).
-        // rcx (the block) and rax (its class) survive the lookup on the
-        // stack; entry rsp is 8 mod 16, so two pushes and 8 align it.
-        PeirEnc_push(&mut self.enc, PEIR_RCX);
-        PeirEnc_push(&mut self.enc, PEIR_RAX);
-        PeirEnc_sub_rsp_i32(&mut self.enc, 8);
-        // rdx = the block's bytes, from the class code c in rax (as
-        // PeirGen_gen_malloc makes it): 1 << (c >> 1) for an even c,
-        // 3 << ((c >> 1) - 1) for an odd one (three quarters of the next
-        // power of two); kept at [rsp] for the count of RT7
-        var odd_cls: i64 = PeirEnc_alloc_label(&mut self.enc);
-        var have_sz: i64 = PeirEnc_alloc_label(&mut self.enc);
-        PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_RAX);
-        pe_emit3(&mut self.enc, 0x48, 0xD1, 0xE9);
-        // shr rcx, 1
-        pe_emit2(&mut self.enc, 0xA8, 0x01);
-        // test al, 1
-        PeirEnc_jcc_label(&mut self.enc, 0x5, odd_cls);
-        // jnz
-        PeirEnc_mov_imm64(&mut self.enc, PEIR_RDX, 1);
-        PeirEnc_shl_cl(&mut self.enc, PEIR_RDX);
-        PeirEnc_jmp_label(&mut self.enc, have_sz);
-        PeirEnc_place_label(&mut self.enc, odd_cls);
-        pe_emit3(&mut self.enc, 0x48, 0xFF, 0xC9);
-        // dec rcx
-        PeirEnc_mov_imm64(&mut self.enc, PEIR_RDX, 3);
-        PeirEnc_shl_cl(&mut self.enc, PEIR_RDX);
-        PeirEnc_place_label(&mut self.enc, have_sz);
-        PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_RSP, 0, PEIR_RDX);
-        // P12: FID_MEM_LIMIT gets the block's bytes back (rdx); rcx and rax
-        // are on the stack
-        PeirGen_gen_lim_call(self, "pert_lim_give");
+        // A class block (rax = its class). P12: FID_MEM_LIMIT gets its
+        // bytes back, out of the way of the fast path: rbp, rax and rcx on
+        // the stack align it (entry rsp is 8 mod 16)
+        if HashMap_contains(self.func_labels, "pert_lim_give") {
+            var no_lim: i64 = PeirEnc_alloc_label(&mut self.enc);
+            if HashMap_contains(self.global_rdata_offsets, "pe_lim_mem") {
+                PeirEnc_mov_reg_rip(&mut self.enc, PEIR_RDX, HashMap_get(self.global_rdata_offsets, "pe_lim_mem"));
+                PeirEnc_test_rr(&mut self.enc, PEIR_RDX, PEIR_RDX);
+                PeirEnc_jcc_label(&mut self.enc, 0x4, no_lim);
+                // jz
+            }
+            PeirEnc_push(&mut self.enc, PEIR_RBP);
+            PeirEnc_push(&mut self.enc, PEIR_RAX);
+            PeirEnc_push(&mut self.enc, PEIR_RCX);
+            PeirEnc_lea_rip(&mut self.enc, PEIR_RDX, abase + PEIR_ALLOC_BYTES);
+            PeirEnc_mem_op(&mut self.enc, 0x8B, PEIR_RDX, true, PEIR_RDX, PEIR_RAX, 0);
+            PeirGen_gen_lim_call(self, "pert_lim_give");
+            PeirEnc_pop(&mut self.enc, PEIR_RCX);
+            PeirEnc_pop(&mut self.enc, PEIR_RAX);
+            PeirEnc_pop(&mut self.enc, PEIR_RBP);
+            PeirEnc_place_label(&mut self.enc, no_lim);
+        }
+        // r9 = this thread's list array (rax and rcx kept)
         PeirGen_gen_my_lists(self, abase);
-        PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_RDX, PEIR_RSP, 0);
-        PeirEnc_add_rsp_i32(&mut self.enc, 8);
-        PeirEnc_pop(&mut self.enc, PEIR_RAX);
-        PeirEnc_pop(&mut self.enc, PEIR_RCX);
-        // r10 = the address of the list's head; the block goes in front
-        PeirEnc_shl_r_i8(&mut self.enc, PEIR_RAX, 3);
-        PeirEnc_mov_rr(&mut self.enc, PEIR_R10, PEIR_R9);
-        PeirEnc_add_rr(&mut self.enc, PEIR_R10, PEIR_RAX);
-        PeirEnc_mov_reg_ptr(&mut self.enc, PEIR_R8, PEIR_R10);
-        PeirEnc_mov_ptr_reg(&mut self.enc, PEIR_RCX, PEIR_R8);
-        PeirEnc_mov_ptr_reg(&mut self.enc, PEIR_R10, PEIR_RCX);
-        // RT7: rdx more bytes on this thread's lists; past the threshold,
+        // RT8, owner return: r10 = the owner slot of the block's chunk (its
+        // 4 MB-aligned start, header word 64); this thread's own, or none:
+        // its lists
+        PeirEnc_lea_base_disp(&mut self.enc, PEIR_R10, PEIR_RCX, -8);
+        pe_emit3(&mut self.enc, 0x49, 0x81, 0xE2);
+        PeirEnc_emit_i32(&mut self.enc, 0 - 4194304);
+        // and r10, -4 MB
+        PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_R10, PEIR_R10, PEIR_CHUNK_OWNER);
+        PeirEnc_test_rr(&mut self.enc, PEIR_R10, PEIR_R10);
+        PeirEnc_jcc_label(&mut self.enc, 0x4, local);
+        // jz
+        PeirEnc_mem_op(&mut self.enc, 0x3B, PEIR_R10, true, PEIR_R9, -1, PEIR_PT_SLOT);
+        // cmp r10, [r9 + SLOT]
+        PeirEnc_jcc_label(&mut self.enc, 0x4, local);
+        // je
+        // Another thread's: push the block on its slot (rdx keeps the
+        // class). A closed slot (1): its thread ended, read the chunk's
+        // slot again (now the pool's)
+        PeirEnc_mov_rr(&mut self.enc, PEIR_RDX, PEIR_RAX);
+        PeirEnc_mov_reg_ptr(&mut self.enc, PEIR_RAX, PEIR_R10);
+        PeirEnc_place_label(&mut self.enc, rcas);
+        PeirEnc_cmp_r_imm(&mut self.enc, PEIR_RAX, 1);
+        PeirEnc_jcc_label(&mut self.enc, 0x4, reowner);
+        // je
+        PeirEnc_mov_ptr_reg(&mut self.enc, PEIR_RCX, PEIR_RAX);
+        // the link
+        pe_emit4(&mut self.enc, 0xF0, 0x49, 0x0F, 0xB1);
+        PeirEnc_emit_u8(&mut self.enc, 0x0A);
+        // lock cmpxchg [r10], rcx (rax: what it holds when that failed)
+        PeirEnc_jcc_label(&mut self.enc, 0x5, rcas);
+        // jnz
+        PeirEnc_ret(&mut self.enc);
+        PeirEnc_place_label(&mut self.enc, reowner);
+        PeirEnc_lea_base_disp(&mut self.enc, PEIR_RAX, PEIR_RCX, -8);
+        pe_emit2(&mut self.enc, 0x48, 0x25);
+        PeirEnc_emit_i32(&mut self.enc, 0 - 4194304);
+        // and rax, -4 MB
+        PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_RAX, PEIR_RAX, PEIR_CHUNK_OWNER);
+        PeirEnc_cmp_rr(&mut self.enc, PEIR_RAX, PEIR_R10);
+        PeirEnc_jcc_label(&mut self.enc, 0x4, local_rdx);
+        // je: still that slot, keep the block here
+        PeirEnc_mov_rr(&mut self.enc, PEIR_R10, PEIR_RAX);
+        PeirEnc_test_rr(&mut self.enc, PEIR_R10, PEIR_R10);
+        PeirEnc_jcc_label(&mut self.enc, 0x4, local_rdx);
+        PeirEnc_mem_op(&mut self.enc, 0x3B, PEIR_R10, true, PEIR_R9, -1, PEIR_PT_SLOT);
+        PeirEnc_jcc_label(&mut self.enc, 0x4, local_rdx);
+        PeirEnc_mov_reg_ptr(&mut self.enc, PEIR_RAX, PEIR_R10);
+        PeirEnc_jmp_label(&mut self.enc, rcas);
+        PeirEnc_place_label(&mut self.enc, local_rdx);
+        PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_RDX);
+        // On this thread's list of the class: no lock (release H8)
+        PeirEnc_place_label(&mut self.enc, local);
+        PeirEnc_mem_op(&mut self.enc, 0x8B, PEIR_RDX, true, PEIR_R9, PEIR_RAX, 0);
+        PeirEnc_mov_ptr_reg(&mut self.enc, PEIR_RCX, PEIR_RDX);
+        PeirEnc_mem_op(&mut self.enc, 0x89, PEIR_RCX, true, PEIR_R9, PEIR_RAX, 0);
+        // RT7: its bytes more on this thread's lists; past the threshold,
         // pert_alloc_trim(env 0, the allocator state, the list array)
         // (stdlib/pe_runtime/conc.fd) gives memory back to the system
-        var trim: i64 = PeirEnc_alloc_label(&mut self.enc);
-        PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_R8, PEIR_R9, PEIR_PT_FREE);
-        PeirEnc_add_rr(&mut self.enc, PEIR_R8, PEIR_RDX);
-        PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_R9, PEIR_PT_FREE, PEIR_R8);
-        PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_R10, PEIR_R9, PEIR_PT_NEXT);
-        PeirEnc_cmp_rr(&mut self.enc, PEIR_R8, PEIR_R10);
+        PeirEnc_lea_rip(&mut self.enc, PEIR_RDX, abase + PEIR_ALLOC_BYTES);
+        PeirEnc_mem_op(&mut self.enc, 0x8B, PEIR_RDX, true, PEIR_RDX, PEIR_RAX, 0);
+        PeirEnc_mem_op(&mut self.enc, 0x03, PEIR_RDX, true, PEIR_R9, -1, PEIR_PT_FREE);
+        // add rdx, [r9 + FREE]
+        PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_R9, PEIR_PT_FREE, PEIR_RDX);
+        PeirEnc_mem_op(&mut self.enc, 0x3B, PEIR_RDX, true, PEIR_R9, -1, PEIR_PT_NEXT);
+        // cmp rdx, [r9 + NEXT]
         PeirEnc_jcc_label(&mut self.enc, 0x7, trim);
         // ja (unsigned)
         PeirEnc_place_label(&mut self.enc, out);

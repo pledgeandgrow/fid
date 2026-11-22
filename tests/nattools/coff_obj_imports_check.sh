@@ -31,7 +31,7 @@ for src in tests/bootstrap/hello.fd tests/bootstrap/test_dl_find.fd tests/bootst
         bad "$base: emit --obj --nat failed: $(grep -v '^\[' "$OUT/$base.obj.log" | tail -3 | tr '\n' ' ')"
         continue
     fi
-    if ! "$FID" codegen "$src" --coff -o "$OUT/$base.cg.obj" >"$OUT/$base.cg.log" 2>&1 || [ ! -s "$OUT/$base.cg.obj" ]; then
+    if ! "$FID" codegen "$src" --coff "$OUT/$base.cg.obj" >"$OUT/$base.cg.log" 2>&1 || [ ! -s "$OUT/$base.cg.obj" ]; then
         bad "$base: codegen --coff failed: $(grep -v '^\[' "$OUT/$base.cg.log" | tail -3 | tr '\n' ' ')"
     else
         ok "$base: codegen --coff writes an object"

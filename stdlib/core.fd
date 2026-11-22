@@ -556,7 +556,7 @@ fn rg_back(prev: i64) {
 /// A copy of the `len`-byte string `s`, made where the current region (or
 /// the heap) keeps it.
 fn rg_str_copy(s: i64, len: i64) -> i64 {
-    var r: i64 = p_str_buf(len);
+    var r: i64 = p_str_alloc_uninit(len);
     p_str_copy_n(r, s, len);
     return r;
 }
@@ -577,8 +577,9 @@ fn rg_vec_copy(v: i64) -> i64 {
     if data == 0 || len <= 0 {
         return Vec_new_typed(vec_code(v), vec_tid(v));
     }
-    var tb: i64 = p_malloc(16);
-    var nv: i64 = p_malloc(40);
+    // RT8: every word of both is written below
+    var tb: i64 = p_malloc_uninit(16);
+    var nv: i64 = p_malloc_uninit(40);
     if tb == 0 || nv == 0 {
         p_panic("out of memory");
     }
@@ -595,7 +596,8 @@ fn rg_vec_copy(v: i64) -> i64 {
         i = i + 1;
     }
     var n16: *mut i64 = nv + 16;
-    // SAFETY: tb is the 16-byte box p_malloc just returned; word 2 of nv.
+    // SAFETY: tb is the 16-byte box p_malloc_uninit just returned; word 2
+    // of nv.
     unsafe {
         *t0 = 2;
         *t8 = len;
@@ -608,8 +610,9 @@ fn rg_vec_copy(v: i64) -> i64 {
 
 /// A copy of the map `m` of its own, as rg_vec_copy (map_own copies).
 fn rg_map_copy(m: i64) -> i64 {
-    var tb: i64 = p_malloc(8);
-    var nm: i64 = p_malloc(56);
+    // RT8: every word of both is written below
+    var tb: i64 = p_malloc_uninit(8);
+    var nm: i64 = p_malloc_uninit(56);
     if tb == 0 || nm == 0 {
         p_panic("out of memory");
     }
@@ -625,7 +628,8 @@ fn rg_map_copy(m: i64) -> i64 {
     }
     var t0: *mut i64 = tb;
     var n32: *mut i64 = nm + 32;
-    // SAFETY: tb is the 8-byte box p_malloc just returned; word 4 of nm.
+    // SAFETY: tb is the 8-byte box p_malloc_uninit just returned; word 4 of
+    // nm.
     unsafe {
         *t0 = 2;
         *n32 = tb;
@@ -650,7 +654,8 @@ fn rg_box_copy(b: i64, tid: i64) -> i64 {
     if size < 8 {
         return Box_dup(b);
     }
-    var nb: i64 = p_malloc(size);
+    // RT8: the count word and the size - 8 bytes after it are written below
+    var nb: i64 = p_malloc_uninit(size);
     if nb == 0 {
         p_panic("out of memory");
     }
@@ -658,7 +663,8 @@ fn rg_box_copy(b: i64, tid: i64) -> i64 {
         vec_copy_bytes(nb + 8, b, size - 8);
     }
     var cp: *mut i64 = nb;
-    // SAFETY: the count word of the size-byte block p_malloc just returned.
+    // SAFETY: the count word of the size-byte block p_malloc_uninit just
+    // returned.
     unsafe {
         *cp = P_BOX_RC + 1;
     }
@@ -730,7 +736,7 @@ fn rg_mem_fit(v: i64, x: i64, size: i64, tid: i64) {
     if cm == 0 || cd >= cm {
         return;
     }
-    var tmp: i64 = p_malloc(size);
+    var tmp: i64 = p_malloc_uninit(size);
     if tmp == 0 {
         p_panic("out of memory");
     }
@@ -743,14 +749,15 @@ fn rg_mem_fit(v: i64, x: i64, size: i64, tid: i64) {
 }
 
 pub fn Vec_new() -> i64 {
-    var ptr: i64 = p_malloc(40);
+    // RT8: the five words are written below
+    var ptr: i64 = p_malloc_uninit(40);
     var p0: *mut i64 = ptr;
     var p8: *mut i64 = ptr + 8;
     var p16: *mut i64 = ptr + 16;
     var p24: *mut i64 = ptr + 24;
     var p32: *mut i64 = ptr + 32;
-    // SAFETY: writes the five header words of the 40-byte block p_malloc just
-    // returned.
+    // SAFETY: writes the five header words of the 40-byte block
+    // p_malloc_uninit just returned.
     unsafe {
         *p0 = 0;
         *p8 = 0;
@@ -825,6 +832,35 @@ fn vec_buf_alloc(bytes: i64) -> i64 {
     return d;
 }
 
+/// RT8: vec_buf_alloc whose `bytes` are not zeroed, for a buffer whose
+/// elements are written before the Vec's length covers them: one filled
+/// whole, or a grown or copied one (its elements copied in, the room after
+/// them written by the push, insert or extend that takes it: no core
+/// function reads a Vec's buffer past its length). Core only, as
+/// p_malloc_uninit.
+@wrapping
+fn vec_buf_alloc_uninit(bytes: i64) -> i64 {
+    if !VEC_BUF_RC {
+        return p_malloc_uninit(bytes);
+    }
+    var b: i64 = p_malloc_uninit(bytes + 24);
+    if b == 0 {
+        return 0;
+    }
+    var d: i64 = b + 24;
+    var t0: *mut i64 = b;
+    var t8: *mut i64 = b + 8;
+    var t16: *mut i64 = b + 16;
+    // SAFETY: the three tag words in front of d, inside the bytes + 24 bytes
+    // p_malloc_uninit just returned.
+    unsafe {
+        *t0 = P_VBUF_KEY + d;
+        *t8 = 0;
+        *t16 = 0;
+    }
+    return d;
+}
+
 /// Whether the buffer at `d` has room for its box (vec_buf_alloc made it).
 @wrapping
 fn vec_buf_tagged(d: i64) -> bool {
@@ -879,7 +915,14 @@ pub fn Vec_filled_typed(n: i64, x: i64, code: i64, tid: i64) -> i64 {
         return v;
     }
     var esz: i64 = vec_esz(code);
-    var data: i64 = vec_buf_alloc(n * esz);
+    // RT8: every element is written below, except struct elements filled
+    // from a null `x` (vec_st leaves those as they are: zero)
+    var data: i64 = 0;
+    if code >= 16 && x == 0 {
+        data = vec_buf_alloc(n * esz);
+    } else {
+        data = vec_buf_alloc_uninit(n * esz);
+    }
     if data == 0 {
         p_panic("out of memory");
     }
@@ -1123,7 +1166,7 @@ fn vec_mem_dup_range(v: i64, data: i64, from: i64, to: i64) {
 /// A heap copy of the `size` bytes at `x` (a boxed struct element; what
 /// the struct holds moves with it).
 fn vec_mem_box(x: i64, size: i64) -> i64 {
-    var b: i64 = p_malloc(size);
+    var b: i64 = p_malloc_uninit(size);
     if b == 0 {
         p_panic("out of memory");
     }
@@ -1592,7 +1635,9 @@ fn vec_sz_reserve(v: i64, code: i64, need: i64) {
     }
     var esz: i64 = vec_esz(code);
     var rgp: i64 = rg_follow(v - 8);
-    var nd: i64 = vec_buf_alloc(nc * esz);
+    // RT8: the len elements are copied in; the rest is written by the push
+    // or insert that takes it
+    var nd: i64 = vec_buf_alloc_uninit(nc * esz);
     rg_back(rgp);
     var od: i64 = vec_sz_hdr(v, 0);
     var sens: i64 = p_sensitive_check(v);
@@ -1680,7 +1725,7 @@ fn vec_sz_remove(v: i64, code: i64, idx: i64) -> i64 {
         // the struct moves to the slot after the new end, where the caller
         // finds it (as after a pop)
         var esz: i64 = vec_esz(code);
-        var tmp: i64 = p_malloc(esz);
+        var tmp: i64 = p_malloc_uninit(esz);
         vec_copy_bytes(tmp, data + idx * esz, esz);
         var k: i64 = idx;
         while k + 1 < len {
@@ -1861,7 +1906,14 @@ pub fn Vec_init_filled(p: i64, n: i64, x: i64, code: i64, tid: i64) -> i64 {
     if n <= 0 {
         return p;
     }
-    var data: i64 = vec_buf_alloc(n * vec_esz(code));
+    // RT8: vec_fill_at writes every element, except struct elements filled
+    // from a null `x` (as in Vec_filled_typed)
+    var data: i64 = 0;
+    if code >= 16 && x == 0 {
+        data = vec_buf_alloc(n * vec_esz(code));
+    } else {
+        data = vec_buf_alloc_uninit(n * vec_esz(code));
+    }
     if data == 0 {
         p_panic("out of memory");
     }
@@ -2072,13 +2124,14 @@ pub fn Vec_share(v: i64) -> i64 {
         } else {
             // the box lives as long as the buffer: where the buffer is
             var rgb: i64 = rg_follow(data - 8);
-            bx = p_malloc(16);
+            // RT8: both words are written below
+            bx = p_malloc_uninit(16);
             rg_back(rgb);
         }
         var b0: *mut i64 = bx;
         var b8: *mut i64 = bx + 8;
-        // SAFETY: bx is a fresh 16-byte box from p_malloc, or the 16 bytes
-        // vec_buf_alloc kept in front of a tagged buffer.
+        // SAFETY: bx is a fresh 16-byte box from p_malloc_uninit, or the 16
+        // bytes vec_buf_alloc kept in front of a tagged buffer.
         unsafe {
             *b0 = 2;
             *b8 = cap;
@@ -2098,14 +2151,15 @@ pub fn Vec_share(v: i64) -> i64 {
             *rc = n + 1;
         }
     }
-    var nv: i64 = p_malloc(40);
+    // RT8: the five words are written below
+    var nv: i64 = p_malloc_uninit(40);
     var nv0: *mut i64 = nv;
     var nv8: *mut i64 = nv + 8;
     var nv16: *mut i64 = nv + 16;
     var nv24: *mut i64 = nv + 24;
     var nv32: *mut i64 = nv + 32;
-    // SAFETY: the five header words of the 40-byte block p_malloc just
-    // returned.
+    // SAFETY: the five header words of the 40-byte block p_malloc_uninit
+    // just returned.
     unsafe {
         *nv0 = data;
         *nv8 = len;
@@ -2184,7 +2238,9 @@ pub fn vec_own(v: i64) {
     }
     var vcode: i64 = vec_code(v);
     if vcode != 0 {
-        var snd: i64 = vec_buf_alloc(cap * vec_esz(vcode));
+        // RT8: the len elements are copied in; the rest is written by the
+        // push or insert that takes it
+        var snd: i64 = vec_buf_alloc_uninit(cap * vec_esz(vcode));
         vec_copy_bytes(snd, data, len * vec_esz(vcode));
         // structs in the buffer: the copy is one more owner of each
         vec_mem_dup_range(v, snd, 0, len);
@@ -2197,7 +2253,8 @@ pub fn vec_own(v: i64) {
         return;
     }
     var tid: i64 = vec_tid(v);
-    var nd: i64 = vec_buf_alloc(cap * 8);
+    // RT8: as above (the len words are written below)
+    var nd: i64 = vec_buf_alloc_uninit(cap * 8);
     var i: i64 = 0;
     while i < len {
         var src: *mut i64 = data + i * 8;
@@ -2345,7 +2402,9 @@ pub fn Vec_push(v: i64, value: i64) {
             new_capacity = capacity * 2;
         }
         var rgp: i64 = rg_follow(v - 8);
-        var new_data: i64 = vec_buf_alloc(new_capacity * 8);
+        // RT8: the len words are copied in; the rest is written by the push
+        // that takes it
+        var new_data: i64 = vec_buf_alloc_uninit(new_capacity * 8);
         rg_back(rgp);
 
         var i: i64 = 0;
@@ -3659,12 +3718,13 @@ fn p_str_compare(a: i64, b: i64) -> i64 {
 // compared as numbers; set by the `_i` functions the compiler calls for a
 // HashMap<i64, V>).
 pub fn HashMap_new() -> i64 {
-    var ptr: i64 = p_malloc(56);
+    // RT8: the seven words are written below
+    var ptr: i64 = p_malloc_uninit(56);
     var i: i64 = 0;
     while i < 7 {
         var pw: *mut i64 = ptr + i * 8;
-        // SAFETY: i < 7: the seven words of the 56-byte block p_malloc just
-        // returned.
+        // SAFETY: i < 7: the seven words of the 56-byte block p_malloc_uninit
+        // just returned.
         unsafe {
             *pw = 0;
         }
@@ -4840,13 +4900,14 @@ pub fn HashMap_share(m: i64) -> i64 {
     if p_region_word(0, 0) != 0 && rg_keep(m - 8) > 0 {
         return rg_map_copy(m);
     }
-    var nm: i64 = p_malloc(56);
+    // RT8: the seven words are copied below
+    var nm: i64 = p_malloc_uninit(56);
     var i: i64 = 0;
     while i < 7 {
         var src: *mut i64 = m + i * 8;
         var dst: *mut i64 = nm + i * 8;
         // SAFETY: i < 7: word i of m's 56-byte header and of the 56-byte
-        // block p_malloc just returned.
+        // block p_malloc_uninit just returned.
         unsafe {
             *dst = *src;
         }
@@ -4862,10 +4923,10 @@ pub fn HashMap_share(m: i64) -> i64 {
     if shared == 0 {
         // the box lives as long as the tables: where m is
         var rgb: i64 = rg_follow(m - 8);
-        var bx: i64 = p_malloc(8);
+        var bx: i64 = p_malloc_uninit(8);
         rg_back(rgb);
         var b0: *mut i64 = bx;
-        // SAFETY: bx is the 8-byte box p_malloc just returned; words 4 of
+        // SAFETY: bx is the 8-byte box p_malloc_uninit just returned; words 4 of
         // both headers.
         unsafe {
             *b0 = 2;
@@ -4931,7 +4992,8 @@ pub fn map_own(m: i64) {
     var kown: bool = hm_kown(m);
     var vtid: i64 = hm_vtid(m);
     if cap > 0 && keys != 0 {
-        var nk: i64 = p_malloc(cap * 8);
+        // RT8: every key word is written below
+        var nk: i64 = p_malloc_uninit(cap * 8);
         var hashed: bool = hm_hashed(m);
         var vwords: i64 = cap;
         if hashed {
@@ -4948,11 +5010,18 @@ pub fn map_own(m: i64) {
         var ms: i64 = hm_mem_size(m);
         var skeys: bool = hm_skey_size(m) > 0;
         var nv: i64 = 0;
+        // RT8: the values are written below and the rest is copied, except
+        // control bytes without hashes (a layout HashMap_grow never makes:
+        // that block is zeroed)
         if ms > 0 {
-            nv = p_malloc(hm_mem_off(cap) + cap * ms);
+            nv = p_malloc_uninit(hm_mem_off(cap) + cap * ms);
             vec_copy_bytes(nv + cap * 8, vals + cap * 8, hm_mem_off(cap) - cap * 8 + cap * ms);
         } else {
-            nv = p_malloc(vwords * 8 + extra);
+            if hashed || extra == 0 {
+                nv = p_malloc_uninit(vwords * 8 + extra);
+            } else {
+                nv = p_malloc(vwords * 8 + extra);
+            }
             if hashed {
                 vec_copy_bytes(nv + cap * 8, vals + cap * 8, cap * 8 + extra);
             }
@@ -5119,7 +5188,8 @@ fn HashMap_grow(m: i64) {
     }
 
     var rgp: i64 = rg_follow(m - 8);
-    var new_keys: i64 = p_malloc(new_capacity * 8);
+    // RT8: the keys are zeroed below (p_zero_words)
+    var new_keys: i64 = p_malloc_uninit(new_capacity * 8);
     // the values, then each slot's hash (HM_HASHED), then with HM_CTRL_ON
     // a control byte per slot (new_capacity is a power of two, 8 or more:
     // the bytes are whole words)
@@ -5132,7 +5202,15 @@ fn HashMap_grow(m: i64) {
     if ms > 0 {
         vbytes = hm_mem_off(new_capacity) + new_capacity * ms;
     }
-    var new_vals: i64 = p_malloc(vbytes);
+    // RT8: without inline structs the values, hashes and control bytes are
+    // all set below (p_zero_words, hm_ctrl_reset); with them an empty
+    // slot's struct is left as allocated, so that block is zeroed
+    var new_vals: i64 = 0;
+    if ms > 0 {
+        new_vals = p_malloc(vbytes);
+    } else {
+        new_vals = p_malloc_uninit(vbytes);
+    }
     rg_back(rgp);
     var old_hashed: bool = hm_hashed(m);
     var new_ctrl: i64 = new_vals + new_capacity * 16;
@@ -5812,13 +5890,13 @@ pub fn p_str_send_copy(s: i64) -> i64 {
     var n: i64 = str_len(s as str);
     // a raw counted buffer (one owner): a `str` local here would be
     // dropped at the return, freeing the copy
-    var r: i64 = p_str_buf(n);
+    var r: i64 = p_str_alloc_uninit(n);
     var i: i64 = 0;
     while i < n {
         var dp: *mut u8 = r + i;
         var sp: *mut u8 = s + i;
         // SAFETY: i < n = str_len(s): inside s's bytes, and inside r, which
-        // p_str_buf made with room for n bytes.
+        // p_str_alloc_uninit made with room for n bytes.
         unsafe {
             *dp = *sp;
         }
@@ -6064,7 +6142,7 @@ pub fn p_str_from_ptr(s: i64) -> str {
         return "";
     }
     var len: i64 = p_str_cstr_len(s);
-    var r: i64 = p_str_buf(len);
+    var r: i64 = p_str_alloc_uninit(len);
     p_str_copy_n(r, s, len);
     return r;
 }
@@ -6259,13 +6337,16 @@ pub fn p_str_append(s: i64, x: i64) -> str {
         }
     }
     var n: i64 = sl + xl;
-    var a: i64 = p_malloc(p_pow2_at_least(n + 17));
+    // RT8: the header, both texts and the NUL are written below; the room
+    // after them is written by a later append before anything reads it
+    var a: i64 = p_malloc_uninit(p_pow2_at_least(n + 17));
     if a == 0 {
         p_panic("out of memory");
     }
     var amp: *mut i64 = a;
     var alp: *mut i64 = a + 8;
-    // SAFETY: the two header words of the block p_malloc just returned.
+    // SAFETY: the two header words of the block p_malloc_uninit just
+    // returned.
     unsafe {
         *amp = P_STR_RC + P_STR_ROOM + 1;
         *alp = n;
@@ -6394,6 +6475,24 @@ fn p_str_length(s: i64) -> i64 {
     return count;
 }
 
+/// RT8: a block of `size` bytes as p_malloc gives (the same kind of block:
+/// freed by p_free; counted, limited, recorded and placed in the current
+/// region as p_malloc's are) whose bytes are unspecified, for core's
+/// producers that write every byte they hand out. Core and the runtimes
+/// only: a call from any other module is a type error (the type checker's
+/// tc_core_only_builtin), so memory any other code sees reads as zero.
+/// A runtime replaces it with its allocator's path that skips the zeroing:
+/// the C runtime this body (codegen_c.fd fast_core_vec_body), pe_ir and
+/// the machine layer with pert_malloc_uninit (stdlib/pe_runtime,
+/// stdlib/linux_runtime), which every call reaches first. This body is what
+/// the rest run (a zeroed block: the caller cannot tell) and what a stage 0
+/// whose runtime has no such path compiles. A core function, not a
+/// builtin: lowering passes it an environment word as to any core
+/// function, and the runtime's pert_malloc_uninit takes one too.
+pub fn p_malloc_uninit(size: i64) -> i64 {
+    return p_malloc(size);
+}
+
 // Allocate a headered string of `len` bytes: returns the data pointer
 // (alloc+16) with magic+len written. Caller fills bytes + NUL.
 // A counted string of `len` bytes with one owner (proposal 0004): returns
@@ -6411,6 +6510,30 @@ pub fn p_str_alloc(len: i64) -> i64 {
     unsafe {
         *mp = P_STR_RC + 1;
         *lp = len;
+    }
+    return a + 16;
+}
+
+/// RT8: p_str_alloc whose `len` bytes are not zeroed, the NUL after them
+/// written: for core's producers that write every byte of the text (a
+/// copy, a slice, a concatenation, a number's digits). Core and the
+/// runtimes only (the type checker's tc_core_only_builtin): every other
+/// string reads as zero until written.
+pub fn p_str_alloc_uninit(len: i64) -> i64 {
+    var a: i64 = p_malloc_uninit(len + 17);
+    if a == 0 {
+        p_panic("out of memory");
+    }
+    var mp: *mut i64 = a;
+    var lp: *mut i64 = a + 8;
+    var ep: *mut u8 = a + 16 + len;
+    // SAFETY: the two header words and the last byte (16 of header, len of
+    // data, then the NUL) of the len + 17-byte block p_malloc_uninit just
+    // returned.
+    unsafe {
+        *mp = P_STR_RC + 1;
+        *lp = len;
+        *ep = 0;
     }
     return a + 16;
 }
@@ -6493,7 +6616,7 @@ pub fn String_from(s: i64) -> str {
         return "";
     }
     var len: i64 = p_str_length(s);
-    var result: i64 = p_str_buf(len);
+    var result: i64 = p_str_alloc_uninit(len);
     p_str_copy_n(result, s, len);
     return result;
 }
@@ -6519,7 +6642,7 @@ pub fn String_is_empty(s: i64) -> bool {
 pub fn String_push_str(s: i64, other: i64) -> str {
     var s_len: i64 = p_str_length(s);
     var o_len: i64 = p_str_length(other);
-    var result: i64 = p_str_buf(s_len + o_len);
+    var result: i64 = p_str_alloc_uninit(s_len + o_len);
     p_str_copy_n(result, s, s_len);
     p_str_copy_n(result + s_len, other, o_len);
     return result;
@@ -6594,7 +6717,7 @@ fn p_str_map_case(s: i64, lo: i64, hi: i64, delta: i64) -> str {
         return "";
     }
     var len: i64 = p_str_length(s);
-    var result: i64 = p_str_buf(len);
+    var result: i64 = p_str_alloc_uninit(len);
     var i: i64 = 0;
     while i < len {
         var src_ptr: *mut u8 = s + i;
@@ -6607,7 +6730,7 @@ fn p_str_map_case(s: i64, lo: i64, hi: i64, delta: i64) -> str {
         if b >= lo && b <= hi {
             b = b + delta;
         }
-        // SAFETY: i < len: inside result, which p_str_buf(len) made.
+        // SAFETY: i < len: inside result, which p_str_alloc_uninit(len) made.
         unsafe {
             *dst_ptr = b;
         }
@@ -6648,7 +6771,7 @@ pub fn String_slice_len(s: i64, len: i64, start: i64, end: i64) -> str {
         return "";
     }
     var new_len: i64 = en - st;
-    var result: i64 = p_str_buf(new_len);
+    var result: i64 = p_str_alloc_uninit(new_len);
     p_str_copy_n(result, s + st, new_len);
     return result;
 }
@@ -6768,7 +6891,7 @@ pub fn String_replace(s: i64, from: i64, to: i64) -> str {
         }
     }
     // Second pass: the bytes
-    var result: i64 = p_str_buf(n);
+    var result: i64 = p_str_alloc_uninit(n);
     var out: i64 = 0;
     pos = 0;
     while pos < s_len {
@@ -6910,14 +7033,14 @@ pub fn p_str_concat_int(s: i64, n: i64) -> str {
     if n < 0 {
         total = total + 1;
     }
-    var r: i64 = p_str_buf(total);
+    var r: i64 = p_str_alloc_uninit(total);
     if sl > 0 {
         p_str_copy_n(r, s, sl);
     }
     if n < 0 {
         var mp: *mut u8 = r + sl;
         // SAFETY: n < 0: total = sl + nd + 1, so r + sl is inside the total
-        // bytes p_str_buf(total) made.
+        // bytes p_str_alloc_uninit(total) made.
         unsafe {
             *mp = 45;
         }
@@ -6944,7 +7067,7 @@ pub fn String_repeat(s: i64, n: i64) -> str {
         return "";
     }
     var len: i64 = p_str_length(s);
-    var result: i64 = p_str_buf(len * n);
+    var result: i64 = p_str_alloc_uninit(len * n);
     var i: i64 = 0;
     while i < n {
         p_str_copy_n(result + i * len, s, len);
@@ -7251,11 +7374,11 @@ pub fn str_from_bytes(bytes: Vec<i64>) -> str {
     if n == 0 {
         return "";
     }
-    var result: i64 = p_str_buf(n);
+    var result: i64 = p_str_alloc_uninit(n);
     var i: i64 = 0;
     while i < n {
         var ptr: *mut u8 = result + i;
-        // SAFETY: i < n: inside result, which p_str_buf(n) made.
+        // SAFETY: i < n: inside result, which p_str_alloc_uninit(n) made.
         unsafe {
             *ptr = bytes.get(i);
         }

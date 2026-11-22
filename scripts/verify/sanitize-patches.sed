@@ -1,5 +1,5 @@
 # scripts/verify/sanitize-patches.sed: the fixes of sanitizer findings S1-S3
-# (docs/verification/infra-runs-2026-11-16-b7.md) applied to generated C, so
+# (docs/verification/infra-runs-2026-11-16.md) applied to generated C, so
 # that a run looks past them before compiler/codegen_c.fd has them:
 #   PATCH=scripts/verify/sanitize-patches.sed bash scripts/sanitize-wsl.sh
 # A line that no longer matches (the fix is in) changes nothing.

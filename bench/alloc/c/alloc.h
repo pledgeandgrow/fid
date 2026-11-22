@@ -8,7 +8,11 @@
                       compiled with -Dmain=__fid_rt_main and linked in
      -DZERO           calloc / mi_zalloc: zeroed blocks, as fid's p_malloc
                       gives (Fides memory is zeroed when it is handed out;
-                      USE_FID is always zeroed)
+                      USE_FID is zeroed unless UNINIT)
+     -DUNINIT         no zeroing in any variant (ZERO ignored): fid's
+                      __p_malloc_uninit, the runtimes' own allocation for
+                      memory they write whole (RT8), against malloc and
+                      mi_malloc like for like (sizes_uninit.c)
    B_THREAD_* start and join a thread (pthreads, or Win32 threads). */
 #ifndef BENCH_ALLOC_H
 #define BENCH_ALLOC_H
@@ -17,10 +21,18 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(UNINIT) && defined(ZERO)
+#undef ZERO
+#endif
 #if defined(USE_FID)
 void* p_malloc(int64_t size);
+void* __p_malloc_uninit(int64_t size);
 void p_free(void* ptr);
+#if defined(UNINIT)
+#define B_MALLOC(n) __p_malloc_uninit((int64_t)(n))
+#else
 #define B_MALLOC(n) p_malloc((int64_t)(n))
+#endif
 #define B_FREE(p) p_free(p)
 #elif defined(USE_MIMALLOC)
 #include <mimalloc.h>

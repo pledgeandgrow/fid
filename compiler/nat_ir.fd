@@ -14835,6 +14835,73 @@ fn ng_mir_alloc(g: &mut NatGen, rec: &NatFnRec) -> NatAlloc {
 
 /// SP11: the allocation inside the window, its result copied out to the
 /// hold block (in the order ng_mir_alloc takes it back).
+/// MI8: give each vreg marked in `pack` an 8-byte frame slot from `base` up;
+/// returns the first byte past them. Vregs whose linear position ranges
+/// never overlap share a slot (a range covers every point the slot is
+/// written or read). A vreg joins a slot only when its range is disjoint
+/// from the range of EVERY vreg already in it: the Nov 21 first version
+/// checked only the first disjoint vreg it found, so a third value could
+/// land in a slot another live value still held (known-bugs 2g.115:
+/// test_threads, test_fstring_float on --nat). A vreg with no range (lo <
+/// 0) gets a slot of its own nobody shares; past 4096 vregs, a slot each
+/// (the scan is quadratic in the spilled count).
+fn ng_pack_spill_slots(spill: &mut Vec<i64>, pack: &Vec<i64>, lo: &Vec<i64>, hi: &Vec<i64>, nv: i64, base: i64) -> i64 {
+    var cur: i64 = base;
+    var s_off: Vec<i64> = Vec::new();
+    var s_head: Vec<i64> = Vec::new();
+    var s_ok: Vec<i64> = Vec::new();
+    var m_next: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < nv {
+        m_next.push(0 - 1);
+        i = i + 1;
+    }
+    i = 0;
+    while i < nv {
+        if pack.get(i) != 0 {
+            var share: i64 = 0 - 1;
+            var li: i64 = lo.get(i);
+            var hi_i: i64 = hi.get(i);
+            if i < 4096 && li >= 0 {
+                var s: i64 = 0;
+                while s < s_off.len() && share < 0 {
+                    if s_ok.get(s) != 0 {
+                        var fits: bool = true;
+                        var k: i64 = s_head.get(s);
+                        while k >= 0 && fits {
+                            if !(hi_i < lo.get(k) || hi.get(k) < li) {
+                                fits = false;
+                            }
+                            k = m_next.get(k);
+                        }
+                        if fits {
+                            share = s;
+                        }
+                    }
+                    s = s + 1;
+                }
+            }
+            if share >= 0 {
+                spill.set(i, s_off.get(share));
+                m_next.set(i, s_head.get(share));
+                s_head.set(share, i);
+            } else {
+                spill.set(i, cur);
+                s_off.push(cur);
+                s_head.push(i);
+                if i < 4096 && li >= 0 {
+                    s_ok.push(1);
+                } else {
+                    s_ok.push(0);
+                }
+                cur = cur + 8;
+            }
+        }
+        i = i + 1;
+    }
+    return cur;
+}
+
 fn ng_alloc_keep(g: &mut NatGen, rec: &NatFnRec) {
     var a: NatAlloc = ng_mir_alloc_body(g, rec);
     fn_arena_keep_words(a.assign);
@@ -15604,6 +15671,12 @@ fn ng_mir_alloc_body(g: &mut NatGen, rec: &NatFnRec) -> NatAlloc {
     }
     var cur: i64 = rec.base_frame;
     var own_slots: bool = !ng_on("frameslots");
+    var pack: Vec<i64> = Vec::new();
+    i = 0;
+    while i < nv {
+        pack.push(0);
+        i = i + 1;
+    }
     i = 0;
     while i < nv {
         if assign.get(i) == 0 - 1 {
@@ -15620,31 +15693,13 @@ fn ng_mir_alloc_body(g: &mut NatGen, rec: &NatFnRec) -> NatAlloc {
                 // (set below), none of its own
                 spill.set(i, 0 - 1);
             } else {
-                // MI8 (Nov 21): spilled vregs whose position ranges never
-                // overlap share one slot — a linear range covers every
-                // point a vreg's slot is written or read, so disjoint
-                // ranges cannot see each other's bytes. Bounded: the scan
-                // is quadratic in the spilled count.
-                var share: i64 = 0 - 1;
-                if i < 4096 {
-                    var j2: i64 = 0;
-                    while j2 < i && share < 0 {
-                        if spill.get(j2) >= rec.base_frame && lo.get(j2) >= 0 && lo.get(i) >= 0 && (hi.get(i) < lo.get(j2) || hi.get(j2) < lo.get(i)) {
-                            share = spill.get(j2);
-                        }
-                        j2 = j2 + 1;
-                    }
-                }
-                if share >= 0 {
-                    spill.set(i, share);
-                } else {
-                    spill.set(i, cur);
-                    cur = cur + 8;
-                }
+                // MI8 (Nov 21): packed below (ng_pack_spill_slots)
+                pack.set(i, 1);
             }
         }
         i = i + 1;
     }
+    cur = ng_pack_spill_slots(&mut spill, &pack, &lo, &hi, nv, cur);
     if n_coal > 0 {
         i = 0;
         while i < nv {
@@ -15710,31 +15765,17 @@ fn ng_mir_alloc_body(g: &mut NatGen, rec: &NatFnRec) -> NatAlloc {
     // ranges share, as in the first packing. FID_NAT_OFF=frameslots keeps
     // the old per-value layout (own_slots).
     if !own_slots {
-        var cur2: i64 = rec.base_frame;
         i = 0;
         while i < nv {
+            spill.set(i, 0 - 1);
             if assign.get(i) == 0 - 1 && !ng_remat_is(remat.get(i)) && !(n_coal > 0 && ng_find(& mut crep, i) != i) {
-                var share2: i64 = 0 - 1;
-                if i < 4096 {
-                    var j2: i64 = 0;
-                    while j2 < i && share2 < 0 {
-                        if spill.get(j2) >= rec.base_frame && lo.get(j2) >= 0 && lo.get(i) >= 0 && (hi.get(i) < lo.get(j2) || hi.get(j2) < lo.get(i)) {
-                            share2 = spill.get(j2);
-                        }
-                        j2 = j2 + 1;
-                    }
-                }
-                if share2 >= 0 {
-                    spill.set(i, share2);
-                } else {
-                    spill.set(i, cur2);
-                    cur2 = cur2 + 8;
-                }
+                pack.set(i, 1);
             } else {
-                spill.set(i, 0 - 1);
+                pack.set(i, 0);
             }
             i = i + 1;
         }
+        var cur2: i64 = ng_pack_spill_slots(&mut spill, &pack, &lo, &hi, nv, rec.base_frame);
         if n_coal > 0 {
             i = 0;
             while i < nv {
@@ -30631,7 +30672,8 @@ fn ng_gen_function(g: &mut NatGen, name: str, func: &IrFunction, module: &IrModu
                 // still name a value that exists) — nothing addresses it,
                 // so it keeps no frame bytes. big's ~240 dead 8-byte
                 // allocas were its 1.9 KB frame.
-                var aused: bool = ve.id >= 0 && ve.id < used_ids.len() && used_ids.get(ve.id) != 0;
+                // FID_NAT_OFF=deadalloca: every Alloca keeps its bytes
+                var aused: bool = !ng_on("deadalloca") || (ve.id >= 0 && ve.id < used_ids.len() && used_ids.get(ve.id) != 0);
                 if aused {
                     adata.set(ve.id, cur);
                     cur = cur + dsize;

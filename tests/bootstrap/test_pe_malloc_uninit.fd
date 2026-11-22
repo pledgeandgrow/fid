@@ -1,0 +1,195 @@
+// RT8 item 1 on pe_ir (compiler/pe_ir_stubs.fd PeirGen_gen_malloc_uninit,
+// the stub __p_malloc_uninit): PeirGen_resolve_call routes core's
+// p_malloc_uninit (stdlib/core.fd) to the allocator's stub without the
+// zeroing, so core's producers get blocks whose bytes are left as they are.
+// User code may not call p_malloc_uninit (team R0's rule:
+// test_malloc_uninit_fail.fd), so this test reaches the stub through core:
+// strings (p_str_alloc_uninit) and Vec growth (vec_buf_alloc_uninit), on
+// blocks left dirty, small ones and past 1 MB (the system heap's blocks,
+// which the stub asks for without HEAP_ZERO_MEMORY), mixed with p_malloc
+// blocks; p_malloc of the same sizes still reads zero afterwards.
+// tests/bootstrap/test_alloc_uninit_paths.fd checks every core producer on
+// every backend; this one adds the large blocks and the mix the stub has
+// paths of its own for. It gives the same output on every backend.
+//
+// Expected output:
+//   small strings: 300 lengths read back
+//   reused by p_malloc: zeroed
+//   large strings: 3 of 2 MB and more read back
+//   large vec: 400000 elements read back
+//   large reused by p_malloc: zeroed
+//   mixed with p_malloc: 4000 kept their numbers
+
+@unsafe
+fn st(a: i64, v: i64) {
+    var p: * mut i64 = a;
+    unsafe { * p = v; }
+}
+
+@unsafe
+fn ld(a: i64) -> i64 {
+    var p: * mut i64 = a;
+    var v: i64 = 0;
+    unsafe { v = * p; }
+    return v;
+}
+
+// every whole word of the n bytes at p set to -1
+@unsafe
+fn fill(p: i64, n: i64) {
+    var o: i64 = 0;
+    while o + 8 <= n {
+        st(p + o, 0 - 1);
+        o = o + 8;
+    }
+}
+
+// the whole words of the n bytes at p that are not zero
+@unsafe
+fn nonzero(p: i64, n: i64) -> i64 {
+    var bad: i64 = 0;
+    var o: i64 = 0;
+    while o + 8 <= n {
+        if ld(p + o) != 0 {
+            bad = bad + 1;
+        }
+        o = o + 8;
+    }
+    return bad;
+}
+
+// a string of n bytes reads back: its length, its last byte and the NUL
+// right after it (no byte of it zero)
+@unsafe
+fn str_ok(s: str, n: i64, last: str) -> bool {
+    return str_len(s) == n && p_str_cstr_len(s as i64) == n && str_slice(s, n - 1, n) == last;
+}
+
+// the first and the last 64 KB of the n bytes at p (n over 128 KB): a
+// large block's ends, without a call per word of megabytes
+@unsafe
+fn fill_ends(p: i64, n: i64) {
+    fill(p, 65536);
+    fill(p + (n / 8) * 8 - 65536, 65536);
+}
+
+@unsafe
+fn nonzero_ends(p: i64, n: i64) -> i64 {
+    return nonzero(p, 65536) + nonzero(p + (n / 8) * 8 - 65536, 65536);
+}
+
+@unsafe
+fn main() -> i64 {
+    // small: a dirty block of the size the string takes (16 bytes of
+    // header, n bytes, the NUL), freed, then the string, which reuses it
+    var ok: i64 = 0;
+    var n: i64 = 1;
+    while n <= 300 {
+        val d: i64 = p_malloc(n + 17);
+        fill(d, n + 17);
+        p_free(d);
+        val s: str = str_repeat("q", n);
+        if str_ok(s, n, "q") {
+            ok = ok + 1;
+        }
+        n = n + 1;
+    }
+    println("small strings: " + int_to_str(ok) + " lengths read back");
+    var bad: i64 = 0;
+    n = 1;
+    while n <= 300 {
+        val b: i64 = p_malloc(n + 17);
+        bad = bad + nonzero(b, n + 17);
+        p_free(b);
+        n = n + 1;
+    }
+    if bad == 0 {
+        println("reused by p_malloc: zeroed");
+    } else {
+        println("reused by p_malloc: not zeroed");
+    }
+
+    // past 1 MB: strings of 2, 2.5 and 3 MB on dirty blocks of their size
+    var large: i64 = 0;
+    var k: i64 = 0;
+    while k < 3 {
+        val sz: i64 = 2097152 + k * 524288;
+        val d: i64 = p_malloc(sz + 17);
+        fill_ends(d, sz + 17);
+        p_free(d);
+        val s: str = str_repeat("x", sz);
+        if str_ok(s, sz, "x") {
+            large = large + 1;
+        }
+        k = k + 1;
+    }
+    println("large strings: " + int_to_str(large) + " of 2 MB and more read back");
+
+    // a Vec<i64> grown by push past 1 MB (buffers to 4 MB)
+    val d4: i64 = p_malloc(4194304);
+    fill_ends(d4, 4194304);
+    p_free(d4);
+    var ints: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 400000 {
+        ints.push(i * 7 + 1);
+        i = i + 1;
+    }
+    var good: i64 = 0;
+    i = 0;
+    while i < ints.len() {
+        if ints.get(i) == i * 7 + 1 {
+            good = good + 1;
+        }
+        i = i + 1;
+    }
+    println("large vec: " + int_to_str(good) + " elements read back");
+    var lbad: i64 = 0;
+    k = 0;
+    while k < 3 {
+        val sz2: i64 = 2097152 + k * 524288;
+        val b2: i64 = p_malloc(sz2 + 17);
+        lbad = lbad + nonzero_ends(b2, sz2 + 17);
+        p_free(b2);
+        k = k + 1;
+    }
+    if lbad == 0 {
+        println("large reused by p_malloc: zeroed");
+    } else {
+        println("large reused by p_malloc: not zeroed");
+    }
+
+    // both kinds in turn: strings in a Vec, p_malloc blocks in a table
+    val tab: i64 = p_malloc(4000 * 8);
+    var strs: Vec<str> = Vec::new();
+    i = 0;
+    while i < 4000 {
+        if i % 2 == 0 {
+            strs.push(int_to_str(i) + str_repeat("m", i % 37));
+        } else {
+            val b3: i64 = p_malloc(16 + (i % 37) * 8);
+            st(b3, i);
+            st(tab + i * 8, b3);
+        }
+        i = i + 1;
+    }
+    var kept: i64 = 0;
+    i = 3999;
+    while i >= 0 {
+        if i % 2 == 0 {
+            if strs.get(i / 2) == int_to_str(i) + str_repeat("m", i % 37) {
+                kept = kept + 1;
+            }
+        } else {
+            val b4: i64 = ld(tab + i * 8);
+            if ld(b4) == i && nonzero(b4 + 8, 8 + (i % 37) * 8) == 0 {
+                kept = kept + 1;
+            }
+            p_free(b4);
+        }
+        i = i - 1;
+    }
+    p_free(tab);
+    println("mixed with p_malloc: " + int_to_str(kept) + " kept their numbers");
+    return 0;
+}
