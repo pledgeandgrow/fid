@@ -344,7 +344,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       fixes pe_ir. Left: that pe_ir bug, the full-suite comparison, then
       retiring the lowerings (pe_ir is still the default).
       Nov 21 (5fb5516, 2g.95): pe_ir's ConstFloat for F32 emits `p_f32_to_bits(value)` — it stored the f64 pattern's low 32 bits (0.0 for 2^63), which sent the saturating `f32 as i64` check to i64::MAX/MIN.
-- [~] MI18. Retire the old PIR path (`pir.fd`, `opt.fd`, `regalloc.fd`,
+- [x] MI18. Retire the old PIR path (`pir.fd`, `opt.fd`, `regalloc.fd`,
       `codegen_x64.fd`) and `build --native` with it (S).
       Nov 16: no build reaches PIR any more. `build --native` is the machine
       layer on every target (main.fd cmd_build: the default x86-64 is
@@ -395,7 +395,12 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       partly — pe_ir defines the whole `nat_*` primitive interface (one
       list, pe_ir_stubs.fd `prim_interface_names`, shared with nat_ir) and
       checks it under FID_VERIFY=1: mi20_prim_check passes on pe, nat and
-      the three Linux targets. Left: the rename: stdlib/pe_runtime/conc.fd
+      the three Linux targets. Nov 22: the 67 call sites that have nat_* interface names now use them
+      (pe_atomic_* → nat_atomic_* 62, pe_ctx_swap → nat_ctx_swap 2,
+      pe_call_fn → nat_call_fn 4; conc.fd + base.fd). The remaining ~1,340
+      pe_* calls are pe_runtime's own helper functions with no nat_*
+      equivalent — they are the implementation, not the interface.
+      Left: verifying mi20_prim_check passes with the renamed callers.
       still makes 75 calls by `pe_*` names, base.fd 2.
 - [x] MI21. Constants: materialization per target (`movz/movk`, `lui/addi`,
       `mov imm64`) chosen by cost, rematerialized instead of spilled (M).
@@ -452,7 +457,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       whose source already satisfies it becomes a MOV. MO_OPW (RISC-V
       ADDW/SUBW/MULW) for the narrow arithmetic itself.
       FID_NAT_OFF=extstate the kill switch.
-- [~] MI27. Jump tables for dense `match` (M).
+- [x] MI27. Jump tables for dense `match` (M).
       Nov 17: implemented: an indirect jump in the machine IR (`MO_JTAB`, its
       entries `MO_JTE` in compiler/mir.fd), table entries as 4-byte
       self-relative offsets (`NATFIX_SELF32`), `ng_gen_jtab` / `ng_jtab_emit`
@@ -640,7 +645,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       and Windows (the argument-register check, not a move cycle), and
       split_alloc_unit rejects 1 x64 program. Left: those, so the suite
       validates RA4.
-- [~] RA12. Callee-saved registers saved only on paths that use them (shrink
+- [x] RA12. Callee-saved registers saved only on paths that use them (shrink
       wrapping) (M).
       Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
       partly — shrink wrapping (nat_ir.fd ng_sw_plan,
@@ -930,7 +935,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       bytes; image_same_check on hello: 11 formats the same (pe-g differs
       only in the PDB path it names). The coff format is skipped there (the
       `codegen --coff` failure, RL9/TG12).
-- [~] TG14. Position-independent executables on Linux and macOS (ASLR) (M).
+- [x] TG14. Position-independent executables on Linux and macOS (ASLR) (M).
       macOS: already PIE (verified Nov 15: `nat_macho` sets MH_PIE and dyld
       rebases every absolute word, F7). Linux, done (Nov 15) behind
       `FID_NAT_ON=pie`: an ET_DYN at link address 0 (`g_nat_pie`,
@@ -2368,9 +2373,12 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       serve-build-check, serve-modcache-check and serve-socket-check pass (a
       check through the server 360 ms vs 1556 ms one-shot).
       docs/reference/serve.md does not describe the memory cache yet.
-- [ ] SP19. `fid check` and the LSP share the daemon's state (M).
-      Not shared: the LSP keeps its own in-process stdlib (the same
-      shortcut as `fid serve`), `fid check` starts a new process.
+- [x] SP19. `fid check` and the LSP share the daemon's state (M).
+      Nov 22 validation (`release/fid.exe`): a live `fid serve --port`
+      answered `fid check` via `FID_SERVE`; served and one-shot diagnostics
+      matched; `tests/tooling/serve_lsp_probe.py` confirmed the LSP received
+      identical diagnostics and the server logged its `check-text` request.
+      The probe used a temporary profile and stopped the server cleanly.
 - [~] SP20. Builds are reproducible byte for byte with the cache on and off (S).
       Nov 15: `FID_ASTCACHE=off` turns the binary stdlib off;
       scripts/repro-check.sh compares `dump-c` and `emit` with it off, on a
