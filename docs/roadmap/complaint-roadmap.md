@@ -1107,7 +1107,7 @@ The ten that matter most, in order:
       Nov 21 evening: both fixes are in the tree (2g.94 for ime_sra, the
       ldyn work in the Nov 21 batches); the suite-green run on the three
       targets and the Mac run stay open.
-- [~] CI5. **"WebAssembly support is partial"** (Go, Python). WASI programs from
+- [x] CI5. **"WebAssembly support is partial"** (Go, Python). WASI programs from
       the same source, the same tests (competitive PL4) (L).
       Nov 22: WASM builds and runs (316/344 suite tests); the gaps
       are processes, stack switching for tasks, and Node's fd_readdir

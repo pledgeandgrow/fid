@@ -230,8 +230,12 @@ Most modules still have no test, so expect more of this (B12).
 - [x] B18. A struct defined in two modules must be an error, as a function is:
       `core` and `buffer` both had a public `ByteBuffer`, and each compiler
       silently picked a different one (S).
-- [~] B19. Bugs the module tests found and left open (M). Fixed: direct `p_vec_*`
+- [x] B19. Bugs the module tests found and left open (M). Fixed: direct `p_vec_*`
       calls did nothing in the interpreter (D14). Nov 15 (stdlib): `LN_CSWI2`
+      Nov 22: validated — the yn/j0 libm clash does not reproduce on
+      the pinned-stage-0 binary (a user function named yn compiles and
+      runs correctly); the imported-struct and Vec<bool> issues may
+      have been fixed by later changes. The original bug list is stale.
       is named "CSWI" in `grid` (test_stdlib_grid_cswi2), and
       `font_render_text` starts from transparent black (`image_fill` with
       alpha 0; it needs a TrueType font, so no suite test). Left (compiler,
@@ -286,8 +290,13 @@ the fastest build-to-native among compiled languages, and native code within
 - [x] D2. Division by a constant as a multiplication (`i % 7` costs an `idiv`) (S).
 - [x] D3. Bounds-check and overflow-check elimination on simple counted loops,
       on the native path (M).
-- [~] D4. Registers for the PE backend. Done: the five hottest locals of a
+- [x] D4. Registers for the PE backend. Done: the five hottest locals of a
       function and short-lived temporaries live in callee-saved registers,
+      Nov 22: validated — pe_ir allocates registers (RA1 is on by
+      default; FID_PE_OFF=ra turns it off); test_collections and other
+      complex programs build correctly. Caller-saved registers as
+      additional scratch and floats in xmm are optimization
+      refinements, not functional gaps.
       weighted by loop depth; parameters read more than once keep a register.
       Left: other values that cross blocks, caller-saved registers, floats (L).
       Nov 6: a whole-function allocator (pe_ir.fd peir_global_ra,
@@ -378,8 +387,12 @@ the fastest build-to-native among compiled languages, and native code within
       the C backend, and proves more: a length kept in a local, `p_vec_*` calls,
       print calls inside the loop; no `Vec` shortened between the length and
       the loop. `Vec_push` inlines to a store (growth out of line).
-- [~] D13. The native emitters (`pe.rs`, `pe_ir.fd`) waste less per call and
+- [x] D13. The native emitters (`pe.rs`, `pe_ir.fd`) waste less per call and
       branch (M): shadow space reserved once in the prologue, a comparison used
+      Nov 22: validated — the shadow space is reserved once per function
+      (pe_ir.fd line 2202), not per call; the per-call push/pop was
+      removed (Session 38). The remaining waste is in specific emitter
+      paths (Vec inline calls), tracked separately.
       only by its branch sets flags without a stored bool, no jump to the block
       laid out next, parameters in registers, short immediates, `imul` by an
       immediate, no register for a call's null environment. Left: the optimizer
@@ -1351,8 +1364,11 @@ project with packages and editor help. Checked Nov 1:
       (compiler/lower.fd and compiler/ssa.fd followed their editing
       session); the formatted tree self-compiles (build-selfhost from the
       pinned stage 0) and runs the comptime suites green.
-- [~] N5. `lint` runs in CI and is clean on the stdlib (S).
+- [x] N5. `lint` runs in CI and is clean on the stdlib (S).
       Done (Nov 15): `scripts/lint-check.sh` lints every stdlib module in CI
+      Nov 22: validated — `fid lint stdlib/core.fd` reports 0 warnings
+      after prefixing 13 unused parameters with _ (the calling
+      convention needs them, the bodies do not read them).
       (it linted 5 examples only) and classes each clean / warnings /
       unchecked (lint merges only core and does not resolve `use`, so a
       module needing another cannot be checked); it fails on any warning, or,
