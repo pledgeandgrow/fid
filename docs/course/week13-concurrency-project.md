@@ -130,7 +130,7 @@ named like a lock, without checking that the lock is held around the
 write; memory shared through `p_shared_alloc`, raw pointers or C is not
 checked; `@sync` is recorded and not enforced. Tasks (`task_go`, `async`)
 are scheduled M:N in compiled programs and switch only where they wait
-under `fid run` (docs/interp-tasks.md), so their interleaving, and any output that depends on it, can
+under `fid run` (docs/reference/interp-tasks.md), so their interleaving, and any output that depends on it, can
 differ between the two (reference §10.7 says what is ordered). These are
 the open edges of the design, and good material for a project.
 

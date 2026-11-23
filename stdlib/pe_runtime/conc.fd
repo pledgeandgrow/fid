@@ -297,19 +297,72 @@ fn pe_rnd_jitter() {
 // Per thread i: its handle (0 once joined), its start block, its result.
 // Start block: [0] function, [1] nargs, [2..10) args, [10] done flag,
 // [11] result.
+// BG110: the table is chunked, as the C runtime's future table (BG9): a
+// directory of PE_THR_DIR chunks of PE_THR_CHUNK entries of three words
+// (handle, block, result), a chunk allocated when an index in it is first
+// handed out and never moved; an index is taken with an atomic add. It was
+// three fixed tables of 256 entries and an unlocked count: the 257th thread
+// could not start (its future was -1), and two threads spawning at once
+// could take one index.
 
-var pert_thread_count: i64 = 0;
-var pert_thread_handles: i64 = 0;
-var pert_thread_blocks: i64 = 0;
-var pert_task_results: i64 = 0;
+const PE_THR_CHUNK: i64 = 256;
+const PE_THR_DIR: i64 = 4096;
+
+var pert_thread_dir: i64 = 0;
+var pert_thread_ctr: i64 = 0;  // *i64: indexes handed out
 var pert_executor_count: i64 = 0;
 
 fn pe_thread_tables() {
-    if pert_thread_handles == 0 {
-        pert_thread_handles = pe_zeroed(256);
-        pert_thread_blocks = pe_zeroed(256);
-        pert_task_results = pe_zeroed(256);
+    if pert_thread_dir == 0 {
+        pert_thread_dir = pe_zeroed(PE_THR_DIR);
+        pert_thread_ctr = pe_zeroed(1);
     }
+}
+
+/// How many indexes were handed out (at most the table's size).
+fn pe_thread_count() -> i64 {
+    if pert_thread_ctr == 0 {
+        return 0;
+    }
+    var n: i64 = nat_atomic_load(pert_thread_ctr);
+    if n > PE_THR_CHUNK * PE_THR_DIR {
+        n = PE_THR_CHUNK * PE_THR_DIR;
+    }
+    return n;
+}
+
+/// The address of entry idx's three words, 0 while its chunk is not there
+/// yet (an index another thread is still handing out).
+fn pe_thr_slot(idx: i64) -> i64 {
+    if pert_thread_dir == 0 || idx < 0 || idx >= PE_THR_CHUNK * PE_THR_DIR {
+        return 0;
+    }
+    var ch: i64 = nat_atomic_load(pert_thread_dir + (idx / PE_THR_CHUNK) * 8);
+    if ch == 0 {
+        return 0;
+    }
+    return ch + (idx % PE_THR_CHUNK) * 24;
+}
+
+/// Make the chunk of entry idx (the first thread to need it allocates it;
+/// one that loses the race frees its copy).
+fn pe_thr_make(idx: i64) {
+    var at: i64 = pert_thread_dir + (idx / PE_THR_CHUNK) * 8;
+    if nat_atomic_load(at) == 0 {
+        var ch: i64 = pe_zeroed(PE_THR_CHUNK * 3);
+        if nat_atomic_cas(at, 0, ch) == false {
+            p_free(ch);
+        }
+    }
+}
+
+/// Entry idx's handle (0: joined, or not there yet).
+fn pe_thr_handle(idx: i64) -> i64 {
+    var s: i64 = pe_thr_slot(idx);
+    if s == 0 {
+        return 0;
+    }
+    return nat_atomic_load(s);
 }
 
 /// Start the program function `name` with argv[0..nargs) on a new thread.
@@ -323,11 +376,11 @@ pub fn pert_thread_spawn_v(name: str, nargs: i64, argv: i64) -> i64 {
         return -1;
     }
     pe_thread_tables();
-    var idx: i64 = pert_thread_count;
-    if idx >= 256 {
+    var idx: i64 = nat_atomic_add(pert_thread_ctr, 1);
+    if idx >= PE_THR_CHUNK * PE_THR_DIR {
         return -1;
     }
-    pert_thread_count = idx + 1;
+    pe_thr_make(idx);
     var block: i64 = pe_zeroed(14);
     pe_store(block, fn_addr);
     pe_store(block + 8, nargs);
@@ -336,9 +389,11 @@ pub fn pert_thread_spawn_v(name: str, nargs: i64, argv: i64) -> i64 {
         pe_store(block + 16 + i * 8, pe_load(argv + i * 8));
         i = i + 1;
     }
-    pe_store(pert_thread_blocks + idx * 8, block);
+    var slot: i64 = pe_thr_slot(idx);
+    pe_store(slot + 8, block);
     var handle: i64 = pe_k_create_thread(0, 0, pe_thread_entry_addr(), block, 0, 0);
-    pe_store(pert_thread_handles + idx * 8, handle);
+    // (the handle last: a scan that sees it finds the block)
+    nat_atomic_store(slot, handle);
     return 0 - (idx + 1);
 }
 
@@ -2605,26 +2660,31 @@ fn pe_task_index(f: i64) -> i64 {
         return -1;
     }
     var idx: i64 = 0 - (f + 1);
-    if idx >= pert_thread_count {
+    if idx >= pe_thread_count() {
         return -1;
     }
     return idx;
 }
 
 fn pe_task_done(idx: i64) -> bool {
-    return nat_atomic_load(pe_load(pert_thread_blocks + idx * 8) + 80) != 0;
+    return nat_atomic_load(pe_load(pe_thr_slot(idx) + 8) + 80) != 0;
 }
 
 /// Join thread idx (once) and return its result.
 fn pe_join(idx: i64) -> i64 {
-    var handle: i64 = pe_load(pert_thread_handles + idx * 8);
+    var handle: i64 = pe_thr_handle(idx);
     if handle != 0 {
+        var s: i64 = pe_thr_slot(idx);
         pe_k_wait(handle, pe_infinite());
         pe_k_close_handle(handle);
-        pe_store(pert_task_results + idx * 8, pe_load(pe_load(pert_thread_blocks + idx * 8) + 88));
-        pe_store(pert_thread_handles + idx * 8, 0);
+        pe_store(s + 16, pe_load(pe_load(s + 8) + 88));
+        nat_atomic_store(s, 0);
     }
-    return pe_load(pert_task_results + idx * 8);
+    var s2: i64 = pe_thr_slot(idx);
+    if s2 == 0 {
+        return 0;
+    }
+    return pe_load(s2 + 16);
 }
 
 pub fn pert_future_ready(value: i64) -> i64 {
@@ -2699,8 +2759,9 @@ pub fn pert_executor_block_on(exec: i64, f: i64) -> i64 {
 pub fn pert_executor_run_all(exec: i64) -> i64 {
     var count: i64 = 0;
     var i: i64 = 0;
-    while i < pert_thread_count {
-        if pe_load(pert_thread_handles + i * 8) != 0 {
+    var n: i64 = pe_thread_count();
+    while i < n {
+        if pe_thr_handle(i) != 0 {
             pe_join(i);
             count = count + 1;
         }
@@ -2722,8 +2783,9 @@ pub fn pert_executor_run_all(exec: i64) -> i64 {
 pub fn pert_executor_poll_all(exec: i64) -> i64 {
     var pending: i64 = 0;
     var i: i64 = 0;
-    while i < pert_thread_count {
-        if pe_load(pert_thread_handles + i * 8) != 0 {
+    var n: i64 = pe_thread_count();
+    while i < n {
+        if pe_thr_handle(i) != 0 {
             if pe_task_done(i) {
                 pe_join(i);
             } else {
@@ -2741,12 +2803,13 @@ pub fn pert_executor_poll_all(exec: i64) -> i64 {
 pub fn pert_executor_cancel(exec: i64) -> i64 {
     var count: i64 = 0;
     var i: i64 = 0;
-    while i < pert_thread_count {
-        if pe_load(pert_thread_handles + i * 8) != 0 {
+    var n: i64 = pe_thread_count();
+    while i < n {
+        if pe_thr_handle(i) != 0 {
             var was_done: bool = pe_task_done(i);
             pe_join(i);
             if !was_done {
-                pe_store(pert_task_results + i * 8, 0);
+                pe_store(pe_thr_slot(i) + 16, 0);
                 count = count + 1;
             }
         }
@@ -3285,7 +3348,6 @@ const PE_PF_DEPTH: i64 = 256;  // frames followed per sample
 var pe_pf_on: i64 = 0;  // 1 while samples are counted
 var pe_pf_m: i64 = 0;  // functions in nat_fn_names (0: no tables yet)
 var pe_pf_tab: i64 = 0;  // nat_fn_names(): [address, name]*, [end, 0]
-var pe_pf_entry_b: i64 = 0 - 1;  // the bucket of the entry point __fid_entry (-1: none)
 var pe_pf_self: i64 = 0;  // per bucket (m functions, primitives, other)
 var pe_pf_total: i64 = 0;  // per bucket: samples with it on the stack
 var pe_pf_stamp: i64 = 0;  // per bucket: the sample that counted it last
@@ -3406,13 +3468,6 @@ fn pe_pf_setup() -> bool {
     // in the table) is not one of the program's functions: stacks start at
     // main, as on the other backends. Its return addresses were also
     // counted under the function placed before it (__c_fn_pe_console_ctrl)
-    var e: i64 = 0;
-    while e < m {
-        if pe_pf_name_is(pe_load(tab + e * 16 + 8), "__fid_entry") {
-            pe_pf_entry_b = e;
-        }
-        e = e + 1;
-    }
     pe_pf_tab = tab;
     pe_pf_m = m;
     return true;
@@ -3451,8 +3506,11 @@ fn pe_pf_bucket(pc: i64) -> i64 {
             hi = mid - 1;
         }
     }
-    // the entry point: outside the program's functions (pe_pf_setup)
-    if lo == pe_pf_entry_b {
+    // The entry point is outside the program's functions. Its row's own
+    // name says so: a bucket cached in a `var` could be lost, as a
+    // non-constant initializer runs again when main starts (lower.fd's
+    // global_inits), after the boot hook's setup (known-bugs 2g.101).
+    if pe_pf_name_is(pe_load(tab + lo * 16 + 8), "__fid_entry") {
         return m + 1;
     }
     return lo;

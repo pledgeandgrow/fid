@@ -66,7 +66,7 @@ for src in $FILES; do
     base=$(basename "$src" .fd)
     want=$("$FID" run "$src" 2>&1)
     wrc=$?
-    want=$(echo "$want" | tr -d '\r')
+    want=$(echo "$want" | tr -d '\r' | grep -v '^\[')
     for mode in linux windows splitall; do
         exe="$base-$mode"
         targ=(--target x86_64-linux)

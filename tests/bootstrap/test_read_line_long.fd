@@ -1,0 +1,57 @@
+// BG41 (docs/roadmap/bugs-roadmap.md): the C runtime's p_read_line read
+// into a fixed 4096-byte buffer, so a line of 4096 bytes or more came back
+// as several lines of at most 4095. Now (compiler/codegen_c.fd
+// p_read_line, BG41) the buffer grows to the whole line. The program runs
+// itself with a file of long lines on its standard input; the child prints
+// the length of each line it reads.
+//@ backends: ccompile
+//
+// Expected output:
+// lengths: 5 4095 4096 10000 0 3
+use process;
+
+fn line_of(n: i64) -> str {
+    var s: str = "";
+    var i: i64 = 0;
+    while i < n {
+        s = s + "x";
+        i = i + 1;
+    }
+    return s;
+}
+
+fn child() -> i64 {
+    var out: str = "lengths:";
+    var going: bool = true;
+    while going {
+        match read_line() {
+            Option::Some(l) => { out = out + " " + int_to_str(str_len(l)); }
+            Option::None => { going = false; }
+        }
+    }
+    println(out);
+    return 0;
+}
+
+fn main() -> i64 {
+    match arg_at(1) {
+        Option::Some(a) => {
+            if a == "child" {
+                return child();
+            }
+        }
+        Option::None => {}
+    }
+    var me: str = "";
+    match arg_at(0) {
+        Option::Some(p) => { me = p; }
+        Option::None => {}
+    }
+    val input: str = "bg41_input_" + int_to_str(p_getpid()) + ".txt";
+    p_file_write(input, "short\n" + line_of(4095) + "\n" + line_of(4096) + "\n" + line_of(10000) + "\n\nend");
+    val h: i64 = process_run("\"" + me + "\" child < \"" + input + "\"");
+    println(str_trim(process_stdout(h)));
+    process_close(h);
+    p_file_delete(input);
+    return 0;
+}

@@ -89,3 +89,125 @@ they were written (Nov 15).
 
 See the VF lines of the roadmap for the numbers; each line there names the
 run it reports.
+
+---
+
+## `fid lint` on the standard library (release-roadmap N5)
+
+`scripts/lint-check.sh` lints every `stdlib/*.fd` module and compares the
+result with `scripts/lint-check.baseline` (one `module|state|count` line per
+module: `clean`, `warnings` with their count, or `unchecked` when the module
+does not pass `fid check`). CI runs it (`.github/workflows/ci.yml`, "lint on
+every stdlib module"). `fid lint` resolves `use` imports
+(`compiler/compiler.fd` `lint_with_imports`), so a module that needs another
+module is linted like any other; `tests/tooling/lint-imports-check.sh` checks
+that.
+
+### State on Nov 17
+
+Linted with the Nov 16 compiler (the stage-0 of the day's build), after the
+fixes below, on the 163 modules outside the network/crypto set and the 200
+modules another session was adding that day: 128 clean, 34 with warnings,
+1 unchecked. What is left is not wrong in the modules:
+
+| Kind | Modules | Why it stays |
+|------|---------|--------------|
+| `unused import` on a module that is used | 32 warnings (string, math, money, calendar, arena, encoding, postgres, datetime, unicode_data, db, ...) | The lint counts an import as used only when a called function starts with `<module>_`. `str_join` (string), `pledge_sqrt`/`vec3` (math), `Money_new`, `cal_*`, `frame_*`, `pg_*` do not. Needs the checker to ask which module registered the called name (`TypeChecker_get_item_module`). `use db` is used for its `cap Database` alone: traits are not registered with a module. |
+| `unused function` on a function used as a value or in an initializer | shape `vec_lit` (const initializers), trace `trace_state_new` (a global's initializer), xml `x_no_resolver` (`resolver: x_no_resolver`) | The lint collects calls in function bodies only. |
+| Naming | math `vec2 vec3 vec4 mat4 quat` (structs), sdl2_h's C constants (`SDLK_a`, `SDL_ScaleModeNearest`, ...), shape's `shape_2x3` constants | Public names used across the stdlib and its tests (`vec3` by most game modules); sdl2_h mirrors the C header. |
+| unchecked | scada | `fid check` rejects `modbus_crc16`: the safety-annotation check resolves `data.len()` on a `Vec<i64>` to `StringBuilder_len` (core's StringBuilder now has a `len` method). A checker bug, not the module's. |
+
+### What was fixed
+
+- Imports nothing used: `use string` in 42 modules, `use math` in plot and
+  units, `use tensor` in kv_cache, dp, shard and quant, `use encoding` in
+  unicode; a repeated `use` line in audio_mixer.
+- Import order (core, vec, string, then by name) in 15 modules.
+- Unused locals (bigint, camera, clinical, collections, fs, math slerp, skel,
+  tz) and dead private helpers (json `j_lit`/`j_scan_*` wrappers, regex's
+  token accessors, log `log_safe_byte`, semver `sv_full`, virtio `vu64`);
+  acpi `sdt_sig_str` is public now.
+- Parameters a stub or a fixed answer does not read are named `_x` (atomic's
+  `Order`, arena, async, ecs, events, game, world's refusing handlers, ...).
+- Unused parameters that were bugs:
+  - scene: `scene_update_entity`, `scene_set_velocity`, `scene_damage`,
+    `scene_set_tag` and `scene_despawn` changed a copy of the entity; they
+    store it back now (`tests/bootstrap/test_scene_entity_updates.fd`).
+  - sprite: `sprite_controller_update` dropped the advanced animation and
+    `sprite_controller_play` did not start the track; streaming:
+    `streaming_set_chunk_data` wrote nothing
+    (`tests/bootstrap/test_sprite_stream_updates.fd`).
+  - gl: `gl_compile_shader_src` passed null to glShaderSource and to
+    glGetShaderiv/glGetProgramiv (no source compiled; the status read
+    crashed or was always 0); it passes the source pointer array and reads
+    the status from a block now.
+- terrain's `hL`/`hR`/`hD`/`hU` are `h_l`/`h_r`/`h_d`/`h_u`.
+
+`scripts/lint-check.baseline` records these 163 modules, core and the 37
+network/crypto modules (201 lines). The 200 modules the other session was
+still writing are not in it: the gate requires a module missing from the
+baseline to be clean, so record them (`--save`) once that work is done.
+On Nov 21 the baseline still has those 201 lines; `stdlib/` has 403
+modules.
+
+### Running it
+
+```bash
+VERBOSE=1 bash scripts/lint-check.sh release/fid.exe   # every warning
+bash scripts/lint-check.sh --save release/fid.exe      # record the state
+```
+
+---
+
+## SL5: every address of a name, on every back end (Nov 17 2026)
+
+Competitive roadmap SL5 asks that a connect by name try every address the
+name has, IPv6 ones included, and that this be run against a real resolver.
+
+### What changed
+
+`--nat` Windows (the machine layer's PE, `stdlib/linux_runtime/win.fd`)
+asked `gethostbyname`, which gives IPv4 addresses only, and connected to the
+first one. Now:
+
+- `win.fd` `pe_win_resolve_all` (pseudo system call 1003) asks
+  `getaddrinfo` for any family and TCP, as pe_runtime's
+  `pert_net_connect_sync` does, and returns up to 16 records
+  `[family 2|10][IPv6 scope id][address]` in the order Windows ranks them
+  (RFC 6724), then frees the list with `freeaddrinfo`.
+- `sys.fd` `pert_net_connect` on Windows calls `pe_win_connect_all`, which
+  tries each record until one connects (`pe_connect_sa`, task-aware), with
+  the scope id kept for link-local IPv6. `pe_resolve6` on Windows uses the
+  same resolver (`pe_win_resolve6`) instead of giving up.
+- The two imports are `PE_W_GETADDRINFO` (75) and `PE_W_FREEADDRINFO` (76):
+  `compiler/nat_ir.fd` `ng_win_imports` must list
+  `ws2_32.dll|getaddrinfo` and `ws2_32.dll|freeaddrinfo` at those indexes
+  (after `ntdll.dll|NtSetTimerResolution`). Without them a `--nat` program
+  that connects by name reads the TLS index as an import and stops with
+  "Invalid memory access ... at 0x2" (seen with the Nov 16 compiler).
+
+### Runs (Nov 17, Nov 16 compiler `stage0`, today's runtime files)
+
+| Back end | Program | Result |
+|---|---|---|
+| pe_ir (default `fid emit`, Windows) | `tests/net/real_connect.fd` | connected, HTTP status line, `.invalid` gives -1 |
+| pe_ir | `tests/bootstrap/test_runtime_connect_retry.fd` | all five lines as expected (`::1: true`) |
+| native Linux x86-64 (`emit --target x86_64-linux`, WSL, resolv.conf nameserver 10.255.255.254) | `tests/net/real_connect.fd` | connected, HTTP status line, `.invalid` gives -1 |
+| native Linux x86-64 (WSL) | `test_runtime_connect_retry.fd` | all five lines as expected |
+| `--nat` Windows | `test_runtime_connect_retry.fd` | `listening: true`, then the crash above: the Nov 16 compiler has no getaddrinfo import. To be rerun with the final compiler. |
+
+The Nov 16 compiler's native Linux builds needed `FID_NAT_OFF=ldyn`: with
+load-time binding on, it imported the runtime primitive `nat_tls_set` from
+the C library ("undefined symbol: nat_tls_set"), a code generator matter
+outside the runtime.
+
+### How to check it again
+
+```bash
+FID_HOME=$PWD $FID emit tests/bootstrap/test_runtime_connect_retry.fd --nat -o r.exe && ./r.exe
+FID_HOME=$PWD $FID emit tests/net/real_connect.fd --nat -o n.exe && ./n.exe
+FID_HOME=$PWD $FID emit tests/net/real_connect.fd -o p.exe && ./p.exe
+FID_HOME=$PWD $FID emit tests/net/real_connect.fd --target x86_64-linux -o n_lx && wsl ./n_lx
+```
+
+Each prints the "Expected output" lines of its file.

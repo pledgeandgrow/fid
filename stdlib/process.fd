@@ -603,7 +603,12 @@ pub fn process_spawn_files(argv: Vec<str>, env: Vec<str>, dir: str, out_path: st
             return 0;
         }
     }
-    return fid_proc_spawn(a as i64, e as i64, dir as i64, f as i64);
+    // SAFETY: a, e, dir and f are NUL-terminated strings held by locals of
+    // this function (or the caller's dir) until the call returns; the
+    // runtime only reads them and copies what the child needs.
+    unsafe {
+        return fid_proc_spawn(a as i64, e as i64, dir as i64, f as i64);
+    }
 }
 
 /// Wait for child `h` at most `timeout_ms` milliseconds (negative: as long
@@ -615,8 +620,21 @@ pub fn process_wait(h: i64, timeout_ms: i64) -> Option<i64> {
     if h == 0 {
         return Option::None;
     }
-    if fid_proc_wait(h, timeout_ms) == 1 {
-        return Option::Some(fid_proc_code(h));
+    var done: i64 = 0;
+    var code: i64 = 0;
+    // SAFETY: sound only for an h process_spawn* returned and not yet
+    // released. The C runtime checks h against its child table (a bad
+    // handle gives -1), but the native runtimes (pe_runtime, linux_runtime)
+    // read h as the address of their child block: a made-up or released h
+    // is not caught there (release M10 report). Integers only otherwise.
+    unsafe {
+        done = fid_proc_wait(h, timeout_ms);
+        if done == 1 {
+            code = fid_proc_code(h);
+        }
+    }
+    if done == 1 {
+        return Option::Some(code);
     }
     return Option::None;
 }
@@ -627,7 +645,12 @@ pub fn process_kill(h: i64) -> bool {
     if h == 0 {
         return false;
     }
-    return fid_proc_kill(h) == 1;
+    // SAFETY: h must be a live handle from process_spawn*: see
+    // process_wait (the native runtimes read h as their child block's
+    // address). Integers in and out.
+    unsafe {
+        return fid_proc_kill(h) == 1;
+    }
 }
 
 /// The operating system's process id of child `h` (-1 for a bad handle).
@@ -635,13 +658,24 @@ pub fn process_child_pid(h: i64) -> i64 {
     if h == 0 {
         return -1;
     }
-    return fid_proc_pid(h);
+    // SAFETY: h must be a live handle from process_spawn*: see
+    // process_wait (the native runtimes read h as their child block's
+    // address). Integers in and out.
+    unsafe {
+        return fid_proc_pid(h);
+    }
 }
 
 /// Forget child `h` (wait for it first: one still running keeps running).
 pub fn process_release(h: i64) -> void {
     if h != 0 {
-        fid_proc_free(h);
+        // SAFETY: h must be a live handle from process_spawn*; the runtime
+        // frees that child's own record, handles and pipes, after which h
+        // is dead: the C runtime ignores a second release, the native
+        // runtimes would free their block again (see process_wait).
+        unsafe {
+            fid_proc_free(h);
+        }
     }
 }
 
@@ -798,7 +832,12 @@ pub fn process_spawn_io(argv: Vec<str>, env: Vec<str>, dir: str, io: i64) -> i64
         }
     }
     val none: str = "";
-    return fid_proc_spawn_io(a as i64, e as i64, dir as i64, none as i64, io & 15);
+    // SAFETY: a, e, dir and none are NUL-terminated strings that live until
+    // the call returns; the runtime only reads them (copying what the child
+    // needs), and io is masked to its four defined bits.
+    unsafe {
+        return fid_proc_spawn_io(a as i64, e as i64, dir as i64, none as i64, io & 15);
+    }
 }
 
 /// Write all of `data` to child `h`'s standard input pipe: false when it
@@ -811,13 +850,22 @@ pub fn process_write(h: i64, data: str) -> bool {
     if n == 0 {
         return true;
     }
-    return fid_proc_write(h, data as i64, n) == n;
+    // SAFETY: the runtime reads n = str_len(data) bytes at data, a string
+    // the caller holds until the call returns; h must be a live handle
+    // from process_spawn_io (see process_wait).
+    unsafe {
+        return fid_proc_write(h, data as i64, n) == n;
+    }
 }
 
 /// Close child `h`'s standard input pipe: it reads the end of its input.
 pub fn process_close_stdin(h: i64) -> void {
     if h != 0 {
-        fid_proc_close_in(h);
+        // SAFETY: closes the stdin pipe of child h only; h must be a live
+        // handle from process_spawn_io (see process_wait).
+        unsafe {
+            fid_proc_close_in(h);
+        }
     }
 }
 
@@ -829,19 +877,46 @@ pub fn process_read(h: i64, which: i64) -> Option<str> {
     if h == 0 {
         return Option::None;
     }
-    val buf: i64 = p_malloc(PROC_READ_CHUNK);
+    var buf: i64 = 0;
+    // SAFETY: p_malloc only allocates a fresh PROC_READ_CHUNK-byte buffer.
+    unsafe {
+        buf = p_malloc(PROC_READ_CHUNK);
+    }
     if buf == 0 {
         return Option::None;
     }
-    val n: i64 = fid_proc_read(h, which, buf, PROC_READ_CHUNK);
+    var n: i64 = 0;
+    // SAFETY: the runtime writes at most PROC_READ_CHUNK bytes (max) into
+    // buf, which holds exactly that many; h must be a live handle from
+    // process_spawn_io (see process_wait).
+    unsafe {
+        n = fid_proc_read(h, which, buf, PROC_READ_CHUNK);
+    }
     if n <= 0 {
-        p_free(buf);
+        // SAFETY: buf is this call's p_malloc buffer; nothing was read into
+        // it and it is not used again.
+        unsafe {
+            p_free(buf);
+        }
         return Option::None;
     }
     val r: i64 = p_str_buf(n);
-    p_str_copy_n(r, buf, n);
-    p_free(buf);
-    return Option::Some(p_str_adopt(r));
+    // SAFETY: r is the fresh n-byte string p_str_buf just made, and the
+    // runtime wrote n (0 < n <= PROC_READ_CHUNK) bytes into buf, which holds
+    // PROC_READ_CHUNK.
+    unsafe {
+        p_str_copy_n(r, buf, n);
+    }
+    // SAFETY: buf is this call's p_malloc buffer; its n bytes were copied
+    // into r just above and buf is not used again.
+    unsafe {
+        p_free(buf);
+    }
+    // SAFETY: r is this call's string from p_str_buf, held by nothing else:
+    // p_str_adopt hands its one owner to the result.
+    unsafe {
+        return Option::Some(p_str_adopt(r));
+    }
 }
 
 /// Everything child `h` writes to the stream until it closes it.

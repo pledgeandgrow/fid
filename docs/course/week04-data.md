@@ -2,7 +2,7 @@
 
 **Reading:** book chapter 3, sections "Closures" to "Modules"
 (`docs/book/03-tour.md`); reference §2.9 (modules), §4.10 (closures),
-§13.3–13.4 (Vec, HashMap, strings); `docs/cookbook.md`.
+§13.3–13.4 (Vec, HashMap, strings); `docs/guides/cookbook.md`.
 
 **After this week you can:** build programs out of modules; use `Vec`,
 `HashMap` and `str` with their cost in mind; pass behaviour as a function

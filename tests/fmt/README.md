@@ -29,3 +29,11 @@ under `fid run`.
   An annotation also keeps its own line when no blank line follows it
   (`@pure` / `fn f`): tests/bootstrap/test_fmt_prefix_ops.fd and
   tests/tooling/tools-2g62-check.sh check that.
+- `literals` (BG101, BG102, BG103, BG107): what the tokenizer keeps whole.
+  An f-string runs to its closing `"` past the strings inside its
+  interpolations, as the lexer reads it (`f"{tag("k")}"` printed
+  `f"{tag(" k ")}"`, a meaning change the token check missed: it used the
+  same tokenizer); a lifetime name is one word (`&' a i64`); `'\x41'` and
+  `'\u{1F600}'` are one char literal each; a block comment after `/` gets
+  a space before it (`10 //* two */ 2` was a line comment, which the token
+  check refused). Both files print `k and v`, `5`, `65`, `128512`, `5`.

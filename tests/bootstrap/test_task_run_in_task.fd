@@ -1,0 +1,45 @@
+// BG76 (docs/roadmap/bugs-roadmap.md): with one worker (M:N off) the C
+// runtime's p_co_run (task_run) called from inside a task ran a scheduler
+// pass of its own inside the pass that was running that task, over the
+// same task list: it entered the calling task again and the outer pass's
+// compaction of the list lost or repeated tasks. Now (compiler/codegen_c.fd
+// p_co_run, BG76) a task gives its turn until it is the only one left.
+//@ env: FIDES_WORKERS=1
+//@ backends: ccompile
+//
+// Expected output:
+// parent: 16
+// other: 10
+// later: 7
+// done
+use task;
+
+async fn child(k: i64) -> Future<i64> {
+    task_yield();
+    return k * 2;
+}
+
+async fn parent(n: i64) -> Future<i64> {
+    val a = child(1);
+    val b = child(2);
+    // waits for every other task of this thread, its own children included
+    task_run();
+    return (await a) + (await b) + n;
+}
+
+async fn later(k: i64) -> Future<i64> {
+    task_yield();
+    task_yield();
+    return k + 2;
+}
+
+fn main() {
+    val p = parent(10);
+    val q = child(5);
+    val r = later(5);
+    println("parent: " + int_to_str(await p));
+    println("other: " + int_to_str(await q));
+    println("later: " + int_to_str(await r));
+    task_run();
+    println("done");
+}

@@ -10,6 +10,10 @@
 // Alternative (no SDL2): use /dev/input/event* (evdev) or /dev/tty (console).
 // The SDL2 path is recommended for cross-platform compatibility.
 
+// its own header first: the C compiler checks each definition against
+// the declaration Fides binds to (pledge_input_init was int here and
+// long long there, unnoticed while this file did not include it)
+#include "pledge_input.h"
 #include <SDL2/SDL.h>
 #include <string.h>
 #include <stdio.h>
@@ -29,7 +33,11 @@ static int initialized = 0;
 
 // ─── pledge_input.h API (used by stdlib/input.fd) ────────────────────────
 
-int pledge_input_init(void) {
+// long long, as pledge_input.h declares it and stdlib/input.fd binds it
+// (`-> i64`): defined as int, the definition conflicted with its own
+// header, and a caller through the header read a 64-bit result the
+// function never set in full.
+long long pledge_input_init(void) {
     if (initialized) return 0;
     // SDL must already be initialized with SDL_INIT_VIDEO or SDL_INIT_EVENTS
     // We don't call SDL_Init here to avoid conflicting with the main SDL init.

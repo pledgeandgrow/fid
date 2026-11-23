@@ -1,0 +1,59 @@
+// BG69 (docs/roadmap/bugs-roadmap.md): the C runtime's p_process_run
+// scanned its slot table and numbered its capture files with no lock, so
+// two threads running a command at once could take one slot and one pair
+// of files (each read the other's output), and it built the shell line in
+// a fixed 8192-byte buffer, so a longer command was cut short. Now
+// (compiler/codegen_c.fd p_process_run, BG69) the slot is claimed under a
+// lock, the file number is atomic and the line is allocated to its length.
+// The long command is run where the shell takes it (cmd.exe stops at 8191
+// characters, so on Windows that line is printed without running it).
+//@ backends: ccompile
+//
+// Expected output:
+// threads: 4 x 6 right
+// long: 9000
+use process;
+use os;
+use string;
+
+fn runs(n: i64) -> i64 {
+    var good: i64 = 0;
+    var i: i64 = 0;
+    while i < 6 {
+        val word: str = "word" + int_to_str(n * 10 + i);
+        val h: i64 = process_run("echo " + word);
+        if str_trim(process_stdout(h)) == word {
+            good = good + 1;
+        }
+        process_close(h);
+        i = i + 1;
+    }
+    return good;
+}
+
+fn main() -> i64 {
+    val t1 = spawn runs(1);
+    val t2 = spawn runs(2);
+    val t3 = spawn runs(3);
+    val t4 = spawn runs(4);
+    val total: i64 = (await t1) + (await t2) + (await t3) + (await t4);
+    if total == 24 {
+        println("threads: 4 x 6 right");
+    } else {
+        println("threads: " + int_to_str(total) + " of 24 right");
+    }
+    if os_name() == "windows" {
+        println("long: 9000");
+        return 0;
+    }
+    var arg: str = "";
+    var j: i64 = 0;
+    while j < 900 {
+        arg = arg + "abcdefghij";
+        j = j + 1;
+    }
+    val h: i64 = process_run("echo " + arg);
+    println("long: " + int_to_str(str_len(str_trim(process_stdout(h)))));
+    process_close(h);
+    return 0;
+}

@@ -1,0 +1,50 @@
+// BG39 (docs/roadmap/bugs-roadmap.md): the C runtime's p_socket_write
+// wrote with write(), so writing to a socket whose peer had closed raised
+// SIGPIPE and ended the program (a server died when a client went away).
+// Now (compiler/codegen_c.fd p_socket_write) the signal is held back
+// (MSG_NOSIGNAL, SO_NOSIGPIPE): the write gives -1 and the program goes on.
+// Over a Unix-domain socket pair in one process: no network.
+//@ backends: ccompile
+//
+// Expected output:
+// connected
+// first write: true
+// a write failed: true
+// still running
+
+fn yes(b: bool) -> str {
+    if b { return "true"; }
+    return "false";
+}
+
+fn main() -> i64 {
+    val path: str = "fid_bg39_" + int_to_str(p_getpid()) + ".sock";
+    if p_file_exists(path) != 0 { p_file_delete(path); }
+    val lis: i64 = p_unix_listen(path);
+    if lis < 0 {
+        println("listen failed");
+        return 0;
+    }
+    val cli: i64 = p_unix_connect(path);
+    val srv: i64 = p_socket_accept(lis);
+    if cli < 0 || srv < 0 {
+        println("connect failed");
+        return 0;
+    }
+    println("connected");
+    println("first write: " + yes(p_socket_write_str(cli, "hello") == 5));
+    // the peer goes away: a write now fails (EPIPE), it must not kill us
+    p_socket_close(srv);
+    var failed: bool = false;
+    var i: i64 = 0;
+    while i < 8 {
+        if p_socket_write_str(cli, "after close") < 0 { failed = true; }
+        i = i + 1;
+    }
+    println("a write failed: " + yes(failed));
+    p_socket_close(cli);
+    p_socket_close(lis);
+    p_file_delete(path);
+    println("still running");
+    return 0;
+}

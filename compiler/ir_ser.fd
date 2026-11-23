@@ -1250,7 +1250,8 @@ pub fn ir_irfunc(r: &mut ArBuf) -> IrFunction {
 // --- Per-function lowered-IR cache (FID_IRCACHE) ---
 // Key: hash over the function's AST (aw_func). Salt: hash over the program's
 // declaration context a body can consult while lowering — struct/enum/global/
-// extern/trait decls plus every function and method *signature* (bodies are
+// const/type-alias/extern/trait decls, the compiler (BG37), plus every
+// function and method *signature* (bodies are
 // per-function keys, not salt: a body edit must not invalidate the world).
 // Env: FID_IRCACHE=<file>. Miss and uncached lowers produce identical modules.
 
@@ -1316,8 +1317,13 @@ fn irc_salt(program: Program) -> i64 {
     // 8: tuple layouts are named by their shape (lower.fd
     // lw_tuple_layout_name), not __tuple_N: records with the old names
     // are not replayed; 9: a tuple owns its elements (its drop and copy
-    // functions numbered as a struct's, a tuple field held inline)
-    aw_i64(&mut b, 9);
+    // functions numbered as a struct's, a tuple field held inline); 10
+    // (BG37): constants and type aliases, and the compiler, are in the salt
+    aw_i64(&mut b, 10);
+    // BG37: this compiler. FID_IRCACHE=auto's file is named by it, but a
+    // file FID_IRCACHE names was replayed by another build of fid (whose
+    // lowering may differ) when the declarations matched
+    aw_i64(&mut b, inc_compiler_hash());
     var i: i64 = 0;
     while i < program.structs.len() {
         aw_structdef(&mut b, program.structs.get(i));
@@ -1331,6 +1337,18 @@ fn irc_salt(program: Program) -> i64 {
     i = 0;
     while i < program.globals.len() {
         aw_globalvar(&mut b, program.globals.get(i));
+        i = i + 1;
+    }
+    // BG37: a body that reads a `const` or names a type alias lowers to
+    // what they are (a changed const replayed its old value)
+    i = 0;
+    while i < program.consts.len() {
+        aw_constdef(&mut b, program.consts.get(i));
+        i = i + 1;
+    }
+    i = 0;
+    while i < program.type_aliases.len() {
+        aw_typealias(&mut b, program.type_aliases.get(i));
         i = i + 1;
     }
     i = 0;

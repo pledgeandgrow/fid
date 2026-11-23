@@ -3,7 +3,7 @@
 **Reading:** book chapter 5, "Capabilities" and "sandbox"
 (`docs/book/05-effects.md`); reference §9.2, §9.3 and the `@secret` rows of
 §11; `docs/reference/language-guide.md` §5.2 and §5.4;
-`docs/pact-capabilities.md`.
+`docs/reference/pact-capabilities.md`.
 
 **After this week you can:** state a threat model for running code you
 did not write; grant a module only the capabilities it needs; run

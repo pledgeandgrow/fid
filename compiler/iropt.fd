@@ -1788,7 +1788,22 @@ fn iro_inline_function(module: &IrModule, f: &mut IrFunction) -> bool {
                                             while p < callee.params.len() {
                                                 var pid: i64 = callee.params.get(p).id;
                                                 if pid >= 0 && pid < map.len() {
-                                                    map.set(pid, args.get(p) + 1);
+                                                    // BG43: an argument of another type of the
+                                                    // same width (an I64 literal for a u64
+                                                    // parameter) goes through a BitCast to the
+                                                    // parameter's type, so what the body does by
+                                                    // its operands' type (unsigned compares,
+                                                    // divisions, shifts) stays unsigned
+                                                    var arg: i64 = args.get(p);
+                                                    var pty: IrType = callee.params.get(p).ty;
+                                                    var aty: IrType = iro_value_ty(f, arg);
+                                                    if iro_is_scalar(pty) && iro_is_scalar(aty) && !ir_type_eq(aty, pty) && ir_type_size(aty) == ir_type_size(pty) {
+                                                        var cid0: i64 = iro_detached(f, Inst::BitCast(arg, aty, pty));
+                                                        fresh.push(cid0);
+                                                        map.set(pid, cid0 + 1);
+                                                    } else {
+                                                        map.set(pid, arg + 1);
+                                                    }
                                                 }
                                                 p = p + 1;
                                             }
@@ -4661,7 +4676,11 @@ fn iro_sccp(f: &mut IrFunction) -> bool {
                     Inst::BitCast(a, _, tt) => {
                         if iro_int_ty(tt) && a >= 0 && a < n && lat_t.get(a) == 1 {
                             tag = 1;
-                            cval = lat_v.get(a);
+                            // BG42: the same bits read as tt (u32::MAX as
+                            // i32 is -1), as IntExtend/IntTrunc keep their
+                            // constants: an unnormalised 4294967295 typed
+                            // i32 made a later IntExtend give 4294967295
+                            cval = iro_eval_narrow(lat_v.get(a), tt);
                         }
                     }
                     _ => {

@@ -2711,7 +2711,7 @@ pub var g_nat_elf_tls: i64 = 0 - 1;
 /// PT_DYNAMIC around the one PT_LOAD).
 pub fn nat_elf(arch: i64, image: Vec<i64>, entry: i64) -> Vec<i64> {
     // TG13: a layout over image_writer (nat_elf_img; the old body, checked
-    // byte for byte against it on Nov 17, is gone: docs/image-writer.md)
+    // byte for byte against it on Nov 17, is gone: docs/reference/image-writer.md)
     return nat_elf_img(arch, &image, entry);
 }
 
@@ -2727,7 +2727,7 @@ pub fn nat_elf(arch: i64, image: Vec<i64>, entry: i64) -> Vec<i64> {
 
 // TG13: nat_elf and nat_pe as layouts over compiler/image_writer.fd (the
 // old bodies were checked byte for byte against them on Nov 17 and are
-// gone: docs/image-writer.md).
+// gone: docs/reference/image-writer.md).
 
 /// e_machine of the machine layer's targets.
 pub fn nat_elf_machine(arch: i64) -> i64 {
@@ -3148,10 +3148,53 @@ pub fn nat_pe_dll_for(lib: str) -> str {
     if lib == "GLU" {
         return "glu32.dll";
     }
+    // SQLite (release E2): its own sqlite3.dll when the build machine has
+    // one where Windows looks, else winsqlite3.dll, the copy every Windows
+    // 10 and 11 has in System32 (same API). pe_ir tries the two at start-up
+    // (pe_link_dll_candidates); this backend's imports are bound by the
+    // loader before main, so a missing sqlite3.dll stopped the program
+    // with STATUS_DLL_NOT_FOUND (0xC0000135) on a machine with only
+    // winsqlite3.dll: test_pe_sqlite, test_sqlite_params and
+    // test_parse_header_sqlite on the nat lane.
+    if lib == "sqlite3" || lib == "sqlite3.dll" {
+        if nat_dll_findable("sqlite3.dll") {
+            return "sqlite3.dll";
+        }
+        return "winsqlite3.dll";
+    }
     if str_ends_with(lib, ".dll") || str_ends_with(lib, ".DLL") {
         return lib;
     }
     return lib + ".dll";
+}
+
+/// Is `dll` where the Windows loader would find it for a program started
+/// here: the current folder, System32 (%SystemRoot%), or a PATH entry?
+fn nat_dll_findable(dll: str) -> bool {
+    if p_file_exists(dll) != 0 {
+        return true;
+    }
+    val root: str = nat_env_str("SystemRoot");
+    if root != "" && p_file_exists(root + "\\System32\\" + dll) != 0 {
+        return true;
+    }
+    val path: str = nat_env_str("PATH");
+    var start: i64 = 0;
+    var i: i64 = 0;
+    val n: i64 = str_len(path);
+    while i <= n {
+        if i == n || str_slice(path, i, i + 1) == ";" {
+            if i > start {
+                val dir: str = str_slice(path, start, i);
+                if p_file_exists(dir + "\\" + dll) != 0 || p_file_exists(dir + "/" + dll) != 0 {
+                    return true;
+                }
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return false;
 }
 
 /// CB9 (2g.106): an environment variable, "" when it is not set.
@@ -3500,7 +3543,7 @@ pub fn nat_pe_img(image: &Vec<i64>, entry: i64, data_off: i64, imp_off: i64, imp
 
 pub fn nat_pe(image: Vec<i64>, entry: i64, data_off: i64, imp_off: i64, imp_size: i64, iat_off: i64, iat_size: i64) -> Vec<i64> {
     // TG13: a layout over image_writer (nat_pe_img; the old body, checked
-    // byte for byte against it on Nov 17, is gone: docs/image-writer.md)
+    // byte for byte against it on Nov 17, is gone: docs/reference/image-writer.md)
     return nat_pe_img(&image, entry, data_off, imp_off, imp_size, iat_off, iat_size);
 }
 
@@ -5292,7 +5335,7 @@ pub fn nat_elf_debug(arch: i64, image: Vec<i64>, entry: i64, names: Vec<str>, st
     }
     // TG13: the sections and their headers from image_writer (the old
     // body, checked byte for byte against it on Nov 17 with
-    // FID_NAT_OFF=ehframe, is gone: docs/image-writer.md)
+    // FID_NAT_OFF=ehframe, is gone: docs/reference/image-writer.md)
     return nat_elf_debug_sections(out, image.len(), base, symtab, strtab, abbrev, info, frame, file, lrows, dloc, eh);
 }
 
@@ -8133,7 +8176,7 @@ fn nat_macho_dylib_named(out: &mut Vec<i64>, path: str) {
 pub fn nat_macho(arch: i64, image: Vec<i64>, entry: i64, data_off: i64, rebase_offs: Vec<i64>, imp_names: Vec<str>, imp_offs: Vec<i64>, names: Vec<str>, starts: Vec<i64>) -> Vec<i64> {
     // TG13: a layout over image_writer (nat_macho_img; the old body,
     // checked byte for byte against it on Nov 17, is gone:
-    // docs/image-writer.md). TG15's dylibs other than libSystem were only
+    // docs/reference/image-writer.md). TG15's dylibs other than libSystem were only
     // ever bound here.
     return nat_macho_img(arch, &image, entry, data_off, &rebase_offs, &imp_names, &imp_offs, &names, &starts);
 }
@@ -8822,7 +8865,7 @@ pub var g_nat_object: bool = false;
 pub fn nat_elf_object(arch: i64, image: Vec<i64>, entry: i64, names: Vec<str>, starts: Vec<i64>, ends: Vec<i64>, fixups: Vec<NatFix>) -> Vec<i64> {
     // TG13: a layout over image_writer (nat_elf_object_img; the old body,
     // checked byte for byte against it on Nov 17, is gone:
-    // docs/image-writer.md)
+    // docs/reference/image-writer.md)
     return nat_elf_object_img(arch, &image, entry, &names, &starts, &ends, &fixups);
 }
 

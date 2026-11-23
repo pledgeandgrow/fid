@@ -266,7 +266,7 @@ The details: [status](docs/reference/status.md) · [known bugs](docs/reference/k
 | [University course](docs/course/README.md) | 13 weeks of lecture notes: memory safety, effect systems, capability security, systems programming; a [lab per week](docs/course/labs/README.md) that opens in the playground |
 | [Coming from Rust](docs/guides/from-rust.md) · [Go](docs/guides/from-go.md) · [Zig](docs/guides/from-zig.md) · [C](docs/guides/from-c.md) · [Python](docs/guides/from-python.md) | What you already know, mapped onto Fid |
 | [Language reference](docs/reference/reference.md) | Every rule, with the compiler function that enforces it |
-| [Cookbook](docs/cookbook.md) | Files, JSON, HTTP, tasks |
+| [Cookbook](docs/guides/cookbook.md) | Files, JSON, HTTP, tasks |
 | [Examples](examples/) | A JSON parser, an HTTP server, a mini compiler, a neural network, a game loop |
 | [INDEX.md](INDEX.md) | A map of every document and compiler module |
 
@@ -291,7 +291,7 @@ scripts/     bootstrap, cross-target tests, fuzzing, verification
 
 Contributions are welcome, from a test program to a compiler change.
 
-1. Read [CONTRIBUTING.md](CONTRIBUTING.md) and, before touching `compiler/*.fd`, [AGENTS.md](AGENTS.md) and the [compiler internals](docs/compiler-internals.md).
+1. Read [CONTRIBUTING.md](CONTRIBUTING.md) and, before touching `compiler/*.fd`, [AGENTS.md](AGENTS.md) and the [compiler internals](docs/reference/compiler-internals.md).
 2. Build with the two commands under [Install](#install).
 3. Keep a change small: one fix, one test. `RELEASE=1 ./scripts/bootstrap.sh` must still reach its fixpoint.
 4. Language changes start as a [proposal](docs/proposals/0000-template.md).

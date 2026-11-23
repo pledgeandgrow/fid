@@ -603,9 +603,9 @@ Run all tests: `./target/release/fidesc test` (or `cargo test --test harness`)
 ### Learn & contribute
 
 - `docs/book/` — The Fides Book (draft): first program → writing a service
-- `docs/cookbook.md` — Common-task recipes (files, JSON, HTTP, tasks)
+- `docs/guides/cookbook.md` — Common-task recipes (files, JSON, HTTP, tasks)
 - `docs/guides/` — Coming from Rust / Go / Zig / C
-- `docs/compiler-internals.md` — Pipeline map for compiler contributors
+- `docs/reference/compiler-internals.md` — Pipeline map for compiler contributors
 - `SUPPORT.md` — Questions (Discussions), bugs (Issues), contributing
 
 ---

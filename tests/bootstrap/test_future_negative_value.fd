@@ -1,0 +1,43 @@
+// BG73 (docs/roadmap/bugs-roadmap.md): in the C runtime a thread future
+// was the negative word -(slot + 1) and every other word an eager future's
+// value, so an eager future that held a negative value (an async fn's
+// result, the bits of a negative f64) was taken for a thread: awaiting -1
+// joined the thread in slot 0 and gave its result, -5 joined slot 4 or
+// gave 0. Now (compiler/codegen_c.fd P_FT_TAG) a thread future is tagged
+// as a green task is, and any other word is a value.
+//@ backends: ccompile
+//
+// Expected output:
+// eager -1: -1
+// eager -5: -5
+// negative float: -2.5
+// thread: 40
+// zero: 0
+
+async fn neg(x: i64) -> Future<i64> {
+    return 0 - x;
+}
+
+async fn neg_half(x: i64) -> Future<f64> {
+    return (0 - x) as f64 / 2.0;
+}
+
+fn work(i: i64) -> i64 {
+    return i * 10;
+}
+
+fn main() -> i64 {
+    // a thread in the future table's first slots
+    val t = spawn work(4);
+    val f1 = neg(1);
+    println("eager -1: " + int_to_str(await f1));
+    val f5 = neg(5);
+    println("eager -5: " + int_to_str(await f5));
+    val ff = neg_half(5);
+    val v: f64 = await ff;
+    println("negative float: " + float_to_str(v));
+    println("thread: " + int_to_str(await t));
+    val f0 = neg(0);
+    println("zero: " + int_to_str(await f0));
+    return 0;
+}

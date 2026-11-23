@@ -102,6 +102,8 @@ extern "C" link "crypto" {
     fn EVP_sha384 as cu_sha384() -> i64;
     fn EVP_sha512 as cu_sha512() -> i64;
     fn CRYPTO_malloc as cu_crypto_malloc(n: i64, file: str, line: i64) -> i64;
+    // CRYPTO_free(p, file, line): gives back what CRYPTO_malloc returned
+    fn CRYPTO_free as cu_crypto_free(p: i64, file: str, line: i64);
 }
 
 // EVP_CTRL_GCM_SET_IVLEN, EVP_CTRL_GCM_GET_TAG, EVP_CTRL_GCM_SET_TAG
@@ -123,7 +125,7 @@ fn cu_get(p: i64) -> i64 {
     // SAFETY: private helper; every caller reads an 8-byte slot from
     // cu_slot() (cu_zeroed(8)) or a 4-byte length in one.
     unsafe {
-        var q: *mut i64 = p;
+        var q: *mut i64 = p as *mut i64;
         v = *q;
     }
     return v;
@@ -134,7 +136,7 @@ fn cu_byte(p: i64) -> i64 {
     // SAFETY: private helper; every caller reads p + i with i below the
     // length of a block it allocated (cu_zeroed, cu_buf).
     unsafe {
-        var q: *mut u8 = p;
+        var q: *mut u8 = p as *mut u8;
         v = (*q) as i64;
     }
     return v & 255;
@@ -144,7 +146,7 @@ fn cu_set_byte(p: i64, v: i64) {
     // SAFETY: private helper; every caller writes p + i with i below the
     // length of a block it allocated (cu_zeroed, cu_buf).
     unsafe {
-        var q: *mut u8 = p;
+        var q: *mut u8 = p as *mut u8;
         *q = (v & 255) as u8;
     }
 }
@@ -155,7 +157,13 @@ fn cu_zeroed(n: i64) -> i64 {
     if size < 8 {
         size = 8;
     }
-    val p: i64 = p_malloc(size);
+    var p: i64 = 0;
+    // SAFETY: only allocates: p_malloc returns a fresh block of size >= 8
+    // bytes (it panics rather than return a short one), and the loop below
+    // zeroes all of it before any caller reads a byte.
+    unsafe {
+        p = p_malloc(size);
+    }
     var i: i64 = 0;
     while i < size {
         cu_set_byte(p + i, 0);
@@ -213,7 +221,12 @@ fn cu_wipe_free(p: i64, n: i64) {
         cu_set_byte(p + i, 0);
         i = i + 1;
     }
-    p_free(p);
+    // SAFETY: private helper; every caller passes a block it allocated with
+    // cu_zeroed or cu_buf (at least n bytes) and hands it over here after
+    // the OpenSSL call that used it has returned: it is freed once.
+    unsafe {
+        p_free(p);
+    }
 }
 
 fn cu_push_u32le(out: &mut Vec<i64>, v: i64) {
@@ -232,13 +245,22 @@ fn cu_u32le(v: &Vec, at: i64) -> i64 {
 /// The GCM cipher for a key of `n` bytes, or 0.
 fn cu_gcm_cipher(n: i64) -> i64 {
     if n == 16 {
-        return cu_aes128_gcm();
+        // SAFETY: EVP_aes_128_gcm takes nothing and returns a static cipher.
+        unsafe {
+            return cu_aes128_gcm();
+        }
     }
     if n == 24 {
-        return cu_aes192_gcm();
+        // SAFETY: EVP_aes_192_gcm takes nothing and returns a static cipher.
+        unsafe {
+            return cu_aes192_gcm();
+        }
     }
     if n == 32 {
-        return cu_aes256_gcm();
+        // SAFETY: EVP_aes_256_gcm takes nothing and returns a static cipher.
+        unsafe {
+            return cu_aes256_gcm();
+        }
     }
     return 0;
 }
@@ -254,7 +276,12 @@ pub fn cb_gcm_encrypt(@secret key: &Vec, nonce: &Vec, aad: &Vec, pt: &Vec) -> Ve
     if cipher == 0 || nonce.len() == 0 {
         return out;
     }
-    val ctx: i64 = cu_ctx_new();
+    var ctx: i64 = 0;
+    // SAFETY: EVP_CIPHER_CTX_new takes nothing and returns a new context
+    // or 0, checked below.
+    unsafe {
+        ctx = cu_ctx_new();
+    }
     if ctx == 0 {
         return out;
     }
@@ -266,19 +293,32 @@ pub fn cb_gcm_encrypt(@secret key: &Vec, nonce: &Vec, aad: &Vec, pt: &Vec) -> Ve
     val ct: i64 = cu_zeroed(n + 16);
     val tag: i64 = cu_zeroed(16);
     val outl: i64 = cu_slot();
-    var ok: bool = cu_enc_init(ctx, cipher, 0, 0, 0) == 1;
-    ok = ok && cu_ctx_ctrl(ctx, CU_GCM_SET_IVLEN, nonce.len(), 0) == 1;
-    ok = ok && cu_enc_init(ctx, 0, 0, kb, nb) == 1;
-    if ok && aad.len() > 0 {
-        ok = cu_enc_update(ctx, 0, outl, ab, aad.len()) == 1;
-    }
+    var ok: bool = false;
     var written: i64 = 0;
-    if ok && n > 0 {
-        ok = cu_enc_update(ctx, ct, outl, pb, n) == 1;
-        written = cu_slot_int(outl);
+    // SAFETY: ctx is the context made above and cipher the GCM cipher whose
+    // key length is key.len(), so the init reads exactly the key.len() bytes
+    // of kb, and (after SET_IVLEN to nonce.len()) nonce.len() bytes of nb:
+    // both cu_buf copies of those Vecs. Each update reads aad.len() bytes of
+    // ab or n bytes of pb (cu_buf copies) and stores an int count into outl,
+    // an 8-byte slot; the AAD update has no output (0), the data update
+    // writes n bytes into ct (n + 16 bytes), and the final call, which for
+    // GCM writes no bytes, gets ct + written, still inside ct. GET_TAG
+    // writes 16 bytes into tag (cu_zeroed(16)). Each step runs only if the
+    // one before succeeded.
+    unsafe {
+        ok = cu_enc_init(ctx, cipher, 0, 0, 0) == 1;
+        ok = ok && cu_ctx_ctrl(ctx, CU_GCM_SET_IVLEN, nonce.len(), 0) == 1;
+        ok = ok && cu_enc_init(ctx, 0, 0, kb, nb) == 1;
+        if ok && aad.len() > 0 {
+            ok = cu_enc_update(ctx, 0, outl, ab, aad.len()) == 1;
+        }
+        if ok && n > 0 {
+            ok = cu_enc_update(ctx, ct, outl, pb, n) == 1;
+            written = cu_slot_int(outl);
+        }
+        ok = ok && cu_enc_final(ctx, ct + written, outl) == 1;
+        ok = ok && cu_ctx_ctrl(ctx, CU_GCM_GET_TAG, 16, tag) == 1;
     }
-    ok = ok && cu_enc_final(ctx, ct + written, outl) == 1;
-    ok = ok && cu_ctx_ctrl(ctx, CU_GCM_GET_TAG, 16, tag) == 1;
     if ok {
         out = cu_unbuf(ct, n);
         var i: i64 = 0;
@@ -287,14 +327,27 @@ pub fn cb_gcm_encrypt(@secret key: &Vec, nonce: &Vec, aad: &Vec, pt: &Vec) -> Ve
             i = i + 1;
         }
     }
-    cu_ctx_free(ctx);
+    // SAFETY: the context made above is freed once, after its last use.
+    unsafe {
+        cu_ctx_free(ctx);
+    }
     cu_wipe_free(kb, key.len());
-    p_free(nb);
-    p_free(ab);
+    // SAFETY: nb and ab (cu_buf above) were only read by OpenSSL, which
+    // has returned and keeps no pointer to them (the context is freed);
+    // each is freed once and not read again.
+    unsafe {
+        p_free(nb);
+        p_free(ab);
+    }
     cu_wipe_free(pb, n);
-    p_free(ct);
-    p_free(tag);
-    p_free(outl);
+    // SAFETY: ct, tag and outl are the blocks made above; their contents
+    // were copied into `out`, the context that wrote them is freed, and
+    // each is freed once and not read again.
+    unsafe {
+        p_free(ct);
+        p_free(tag);
+        p_free(outl);
+    }
     return out;
 }
 
@@ -312,7 +365,12 @@ pub fn cb_gcm_decrypt(@secret key: &Vec, nonce: &Vec, aad: &Vec, ct_tag: &Vec) -
     if cipher == 0 || nonce.len() == 0 {
         return out;
     }
-    val ctx: i64 = cu_ctx_new();
+    var ctx: i64 = 0;
+    // SAFETY: EVP_CIPHER_CTX_new takes nothing and returns a new context
+    // or 0, checked below.
+    unsafe {
+        ctx = cu_ctx_new();
+    }
     if ctx == 0 {
         return out;
     }
@@ -323,30 +381,53 @@ pub fn cb_gcm_decrypt(@secret key: &Vec, nonce: &Vec, aad: &Vec, ct_tag: &Vec) -
     val cb: i64 = cu_buf(ct_tag);
     val pt: i64 = cu_zeroed(n + 16);
     val outl: i64 = cu_slot();
-    var ok: bool = cu_dec_init(ctx, cipher, 0, 0, 0) == 1;
-    ok = ok && cu_ctx_ctrl(ctx, CU_GCM_SET_IVLEN, nonce.len(), 0) == 1;
-    ok = ok && cu_dec_init(ctx, 0, 0, kb, nb) == 1;
-    if ok && aad.len() > 0 {
-        ok = cu_dec_update(ctx, 0, outl, ab, aad.len()) == 1;
-    }
+    var ok: bool = false;
     var written: i64 = 0;
-    if ok && n > 0 {
-        ok = cu_dec_update(ctx, pt, outl, cb, n) == 1;
-        written = cu_slot_int(outl);
+    // SAFETY: as in cb_gcm_encrypt: the init reads key.len() bytes of kb
+    // (the cipher's own key length) and nonce.len() bytes of nb; the
+    // updates read aad.len() bytes of ab and the first n bytes of cb (the
+    // cu_buf copy of ct_tag, n + 16 bytes), store an int into the 8-byte
+    // slot outl and write n bytes into pt (n + 16 bytes). SET_TAG reads
+    // the 16 tag bytes at cb + n, inside cb, and the final call, which for
+    // GCM writes no bytes, gets pt + written, inside pt. Each step runs
+    // only if the one before succeeded.
+    unsafe {
+        ok = cu_dec_init(ctx, cipher, 0, 0, 0) == 1;
+        ok = ok && cu_ctx_ctrl(ctx, CU_GCM_SET_IVLEN, nonce.len(), 0) == 1;
+        ok = ok && cu_dec_init(ctx, 0, 0, kb, nb) == 1;
+        if ok && aad.len() > 0 {
+            ok = cu_dec_update(ctx, 0, outl, ab, aad.len()) == 1;
+        }
+        if ok && n > 0 {
+            ok = cu_dec_update(ctx, pt, outl, cb, n) == 1;
+            written = cu_slot_int(outl);
+        }
+        // The expected tag goes in before the final call, which checks it
+        ok = ok && cu_ctx_ctrl(ctx, CU_GCM_SET_TAG, 16, cb + n) == 1;
+        ok = ok && cu_dec_final(ctx, pt + written, outl) > 0;
     }
-    // The expected tag goes in before the final call, which checks it
-    ok = ok && cu_ctx_ctrl(ctx, CU_GCM_SET_TAG, 16, cb + n) == 1;
-    ok = ok && cu_dec_final(ctx, pt + written, outl) > 0;
     if ok {
         out = cu_unbuf(pt, n);
     }
-    cu_ctx_free(ctx);
+    // SAFETY: the context made above is freed once, after its last use.
+    unsafe {
+        cu_ctx_free(ctx);
+    }
     cu_wipe_free(kb, key.len());
-    p_free(nb);
-    p_free(ab);
-    p_free(cb);
+    // SAFETY: nb, ab and cb (cu_buf above) were only read by OpenSSL, which
+    // has returned and keeps no pointer to them (the context is freed);
+    // each is freed once and not read again.
+    unsafe {
+        p_free(nb);
+        p_free(ab);
+        p_free(cb);
+    }
     cu_wipe_free(pt, n);
-    p_free(outl);
+    // SAFETY: outl is the 8-byte slot from cu_slot(); nothing reads it after
+    // the calls above, and it is freed once.
+    unsafe {
+        p_free(outl);
+    }
     return out;
 }
 
@@ -364,11 +445,23 @@ pub fn cb_pbkdf2_derive(@secret password: &Vec, salt: &Vec, iters: i64, out_len:
     val pb: i64 = cu_buf(password);
     val sb: i64 = cu_buf(salt);
     val ob: i64 = cu_zeroed(out_len);
-    if cu_pbkdf2(pb, password.len(), sb, salt.len(), iters, cu_sha256(), out_len, ob) == 1 {
+    var r: i32 = 0;
+    // SAFETY: PKCS5_PBKDF2_HMAC reads password.len() bytes of pb and
+    // salt.len() bytes of sb (cu_buf copies of exactly those Vecs) and writes
+    // out_len bytes into ob, a cu_zeroed(out_len) block; EVP_sha256 returns
+    // a static digest.
+    unsafe {
+        r = cu_pbkdf2(pb, password.len(), sb, salt.len(), iters, cu_sha256(), out_len, ob);
+    }
+    if r == 1 {
         out = cu_unbuf(ob, out_len);
     }
     cu_wipe_free(pb, password.len());
-    p_free(sb);
+    // SAFETY: sb (cu_buf above) was only read by the derivation, which has
+    // returned; it is freed once and not read again.
+    unsafe {
+        p_free(sb);
+    }
     cu_wipe_free(ob, out_len);
     return out;
 }
@@ -380,7 +473,13 @@ pub fn cb_pbkdf2_derive(@secret password: &Vec, salt: &Vec, iters: i64, out_len:
 /// does not fit.
 fn cu_push_bn(out: &mut Vec<i64>, bn: i64) -> bool {
     val b: i64 = cu_zeroed(CU_COORD);
-    val ok: bool = cu_bn_to(bn, b, CU_COORD) == CU_COORD;
+    var ok: bool = false;
+    // SAFETY: BN_bn2binpad writes exactly CU_COORD bytes into b, a
+    // cu_zeroed(CU_COORD) block, or nothing (-1) when bn does not fit; bn is
+    // a live BIGNUM of the caller (one it made or a get0 of a key it holds).
+    unsafe {
+        ok = cu_bn_to(bn, b, CU_COORD) == CU_COORD;
+    }
     if ok {
         var i: i64 = 0;
         while i < CU_COORD {
@@ -395,10 +494,22 @@ fn cu_push_bn(out: &mut Vec<i64>, bn: i64) -> bool {
 /// The blob of `key`: public (X, Y) or private (X, Y, d). Empty on failure.
 fn cu_blob(key: i64, is_private: bool) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
-    val x: i64 = cu_bn_new();
-    val y: i64 = cu_bn_new();
+    var x: i64 = 0;
+    var y: i64 = 0;
+    // SAFETY: BN_new takes nothing and returns a new BIGNUM or 0 (checked
+    // below, and only non-zero ones are freed).
+    unsafe {
+        x = cu_bn_new();
+        y = cu_bn_new();
+    }
     var ok: bool = x != 0 && y != 0;
-    ok = ok && cu_point_xy(cu_ec_group(key), cu_ec_public(key), x, y, 0) == 1;
+    // SAFETY: key is an EC_KEY of the caller with a public key (generated
+    // or imported); its group and point are get0 views it owns, read only,
+    // and the coordinates go into the two BIGNUMs made above (only when
+    // both exist).
+    unsafe {
+        ok = ok && cu_point_xy(cu_ec_group(key), cu_ec_public(key), x, y, 0) == 1;
+    }
     if ok {
         if is_private {
             cu_push_u32le(&mut out, CU_P256_PRIVATE);
@@ -408,14 +519,22 @@ fn cu_blob(key: i64, is_private: bool) -> Vec<i64> {
         cu_push_u32le(&mut out, CU_COORD);
         ok = cu_push_bn(&mut out, x) && cu_push_bn(&mut out, y);
         if ok && is_private {
-            ok = cu_push_bn(&mut out, cu_ec_private(key));
+            // SAFETY: EC_KEY_get0_private_key returns the key's own scalar
+            // (a view, not freed here); cu_push_bn only reads it.
+            unsafe {
+                ok = cu_push_bn(&mut out, cu_ec_private(key));
+            }
         }
     }
-    if x != 0 {
-        cu_bn_free(x);
-    }
-    if y != 0 {
-        cu_bn_free(y);
+    // SAFETY: x and y are the BIGNUMs BN_new made above; each non-zero one
+    // is freed once, after its last use.
+    unsafe {
+        if x != 0 {
+            cu_bn_free(x);
+        }
+        if y != 0 {
+            cu_bn_free(y);
+        }
     }
     if !ok {
         return Vec::new();
@@ -425,17 +544,30 @@ fn cu_blob(key: i64, is_private: bool) -> Vec<i64> {
 
 /// Generate a P-256 key pair into priv_blob/pub_blob. 0 on success.
 pub fn cb_ecdsa_generate(priv_blob: &mut Vec, pub_blob: &mut Vec) -> i64 {
-    val key: i64 = cu_ec_new(CU_NID_P256);
+    var key: i64 = 0;
+    // SAFETY: EC_KEY_new_by_curve_name takes a curve NID and returns a new
+    // key or 0, checked below.
+    unsafe {
+        key = cu_ec_new(CU_NID_P256);
+    }
     if key == 0 {
         return -1;
     }
-    if cu_ec_generate(key) != 1 {
-        cu_ec_free(key);
-        return -1;
+    // SAFETY: key is the EC_KEY made above; on a failed generation it is
+    // freed once and the function returns.
+    unsafe {
+        if cu_ec_generate(key) != 1 {
+            cu_ec_free(key);
+            return -1;
+        }
     }
     val priv: Vec<i64> = cu_blob(key, true);
     val pubb: Vec<i64> = cu_blob(key, false);
-    cu_ec_free(key);
+    // SAFETY: the EC_KEY made above is freed once, after both blobs were
+    // copied out of it.
+    unsafe {
+        cu_ec_free(key);
+    }
     if priv.len() == 0 || pubb.len() == 0 {
         return -1;
     }
@@ -464,34 +596,70 @@ fn cu_import(blob: &Vec, is_private: bool) -> i64 {
     if blob.len() != want || cu_u32le(blob, 0) != magic || cu_u32le(blob, 4) != CU_COORD {
         return 0;
     }
-    val key: i64 = cu_ec_new(CU_NID_P256);
+    var key: i64 = 0;
+    // SAFETY: EC_KEY_new_by_curve_name takes a curve NID and returns a new
+    // key or 0, checked below.
+    unsafe {
+        key = cu_ec_new(CU_NID_P256);
+    }
     if key == 0 {
         return 0;
     }
     val xb: i64 = cu_buf_range(blob, 8, CU_COORD);
     val yb: i64 = cu_buf_range(blob, 8 + CU_COORD, CU_COORD);
-    val x: i64 = cu_bn_from(xb, CU_COORD, 0);
-    val y: i64 = cu_bn_from(yb, CU_COORD, 0);
-    p_free(xb);
-    p_free(yb);
-    var ok: bool = x != 0 && y != 0 && cu_ec_set_public(key, x, y) == 1;
-    if x != 0 {
-        cu_bn_free(x);
+    var x: i64 = 0;
+    var y: i64 = 0;
+    // SAFETY: BN_bin2bn reads CU_COORD bytes of xb and of yb, each a
+    // cu_buf_range block of exactly CU_COORD bytes (the blob's length was
+    // checked above), and returns a new BIGNUM or 0. It copies the bytes,
+    // so xb and yb are freed once right after and not read again.
+    unsafe {
+        x = cu_bn_from(xb, CU_COORD, 0);
+        y = cu_bn_from(yb, CU_COORD, 0);
+        p_free(xb);
+        p_free(yb);
     }
-    if y != 0 {
-        cu_bn_free(y);
+    var ok: bool = false;
+    // SAFETY: key is the EC_KEY made above; the call runs only when both
+    // BIGNUMs exist, and copies them (the key does not take them over).
+    unsafe {
+        ok = x != 0 && y != 0 && cu_ec_set_public(key, x, y) == 1;
+    }
+    // SAFETY: x and y are the BIGNUMs BN_bin2bn made above, copied into the
+    // key; each non-zero one is freed once.
+    unsafe {
+        if x != 0 {
+            cu_bn_free(x);
+        }
+        if y != 0 {
+            cu_bn_free(y);
+        }
     }
     if ok && is_private {
         val db: i64 = cu_buf_range(blob, 8 + 2 * CU_COORD, CU_COORD);
-        val d: i64 = cu_bn_from(db, CU_COORD, 0);
+        var d: i64 = 0;
+        // SAFETY: BN_bin2bn reads CU_COORD bytes of db, a cu_buf_range block
+        // of exactly that many bytes, and returns a new BIGNUM or 0.
+        unsafe {
+            d = cu_bn_from(db, CU_COORD, 0);
+        }
         cu_wipe_free(db, CU_COORD);
-        ok = d != 0 && cu_ec_set_private(key, d) == 1;
-        if d != 0 {
-            cu_bn_clear_free(d);
+        // SAFETY: EC_KEY_set_private_key runs only on a non-zero d and copies
+        // it into the key made above; d itself is then cleared and freed once
+        // (BN_clear_free), not read again.
+        unsafe {
+            ok = d != 0 && cu_ec_set_private(key, d) == 1;
+            if d != 0 {
+                cu_bn_clear_free(d);
+            }
         }
     }
     if !ok {
-        cu_ec_free(key);
+        // SAFETY: the EC_KEY made above is freed once and the function
+        // returns 0, so the caller never sees it.
+        unsafe {
+            cu_ec_free(key);
+        }
         return 0;
     }
     return key;
@@ -511,21 +679,40 @@ pub fn cb_ecdsa_sign(@secret priv_blob: &Vec, hash: &Vec) -> Vec<i64> {
         return out;
     }
     val hb: i64 = cu_buf(hash);
-    val sig: i64 = cu_ecdsa_sign(hb, 32, key);
-    p_free(hb);
+    var sig: i64 = 0;
+    // SAFETY: ECDSA_do_sign reads 32 bytes of hb (cu_buf of hash, whose
+    // length was checked to be 32) with the private EC_KEY cu_import made,
+    // and returns a new ECDSA_SIG or 0. hb is freed once right after and not
+    // read again.
+    unsafe {
+        sig = cu_ecdsa_sign(hb, 32, key);
+        p_free(hb);
+    }
     if sig != 0 {
         val rs: i64 = cu_slot();
         val ss: i64 = cu_slot();
-        cu_sig_get0(sig, rs, ss);
+        // SAFETY: ECDSA_SIG_get0 writes one BIGNUM pointer (a view owned by
+        // sig) into each of rs and ss, 8-byte cu_slot blocks.
+        unsafe {
+            cu_sig_get0(sig, rs, ss);
+        }
         var rsv: Vec<i64> = Vec::new();
         if cu_push_bn(&mut rsv, cu_get(rs)) && cu_push_bn(&mut rsv, cu_get(ss)) {
             out = rsv;
         }
-        p_free(rs);
-        p_free(ss);
-        cu_sig_free(sig);
+        // SAFETY: rs and ss are the cu_slot blocks above, read for the last
+        // time just above, each freed once; then the signature that owns
+        // r and s is freed once (the views are not used after).
+        unsafe {
+            p_free(rs);
+            p_free(ss);
+            cu_sig_free(sig);
+        }
     }
-    cu_ec_free(key);
+    // SAFETY: the EC_KEY cu_import made is freed once, after its last use.
+    unsafe {
+        cu_ec_free(key);
+    }
     return out;
 }
 
@@ -541,28 +728,52 @@ pub fn cb_ecdsa_verify(pub_blob: &Vec, hash: &Vec, sig: &Vec) -> bool {
     val hb: i64 = cu_buf(hash);
     val rb: i64 = cu_buf_range(sig, 0, CU_COORD);
     val sb: i64 = cu_buf_range(sig, CU_COORD, CU_COORD);
-    val r: i64 = cu_bn_from(rb, CU_COORD, 0);
-    val s: i64 = cu_bn_from(sb, CU_COORD, 0);
-    p_free(rb);
-    p_free(sb);
+    var r: i64 = 0;
+    var s: i64 = 0;
+    // SAFETY: BN_bin2bn reads CU_COORD bytes of rb and of sb, cu_buf_range
+    // blocks of exactly CU_COORD bytes (sig's length was checked to be 64),
+    // and copies them into new BIGNUMs (or 0); rb and sb are freed once
+    // right after and not read again.
+    unsafe {
+        r = cu_bn_from(rb, CU_COORD, 0);
+        s = cu_bn_from(sb, CU_COORD, 0);
+        p_free(rb);
+        p_free(sb);
+    }
     var ok: bool = false;
-    val es: i64 = cu_sig_new();
-    if es != 0 && r != 0 && s != 0 && cu_sig_set0(es, r, s) == 1 {
-        // The signature owns r and s now
-        ok = cu_ecdsa_verify(hb, 32, es, key) == 1;
-    } else {
-        if r != 0 {
-            cu_bn_free(r);
-        }
-        if s != 0 {
-            cu_bn_free(s);
+    var es: i64 = 0;
+    // SAFETY: ECDSA_SIG_new takes nothing and returns a new signature or 0.
+    unsafe {
+        es = cu_sig_new();
+    }
+    // SAFETY: ECDSA_SIG_set0 runs only with a non-zero es, r and s and on
+    // success takes r and s over; ECDSA_do_verify then reads 32 bytes of hb
+    // (cu_buf of hash, length checked) with the public EC_KEY cu_import
+    // made. Otherwise r and s were not taken, and each non-zero one is freed
+    // once here.
+    unsafe {
+        if es != 0 && r != 0 && s != 0 && cu_sig_set0(es, r, s) == 1 {
+            // The signature owns r and s now
+            ok = cu_ecdsa_verify(hb, 32, es, key) == 1;
+        } else {
+            if r != 0 {
+                cu_bn_free(r);
+            }
+            if s != 0 {
+                cu_bn_free(s);
+            }
         }
     }
-    if es != 0 {
-        cu_sig_free(es);
+    // SAFETY: es (with the r and s it may own) is freed once if it exists;
+    // hb (cu_buf above) is freed once after the verification read it; the
+    // EC_KEY cu_import made is freed once. None is used afterwards.
+    unsafe {
+        if es != 0 {
+            cu_sig_free(es);
+        }
+        p_free(hb);
+        cu_ec_free(key);
     }
-    p_free(hb);
-    cu_ec_free(key);
     return ok;
 }
 
@@ -594,7 +805,7 @@ fn cu_put(p: i64, v: i64) {
     // SAFETY: private helper; every caller writes an 8-byte slot from
     // cu_slot() (cu_zeroed(8)).
     unsafe {
-        var q: *mut i64 = p;
+        var q: *mut i64 = p as *mut i64;
         *q = v;
     }
 }
@@ -602,16 +813,28 @@ fn cu_put(p: i64, v: i64) {
 // The EVP_MD of a hash name, or 0.
 fn cu_md(alg: str) -> i64 {
     if alg == "SHA1" {
-        return cu_sha1();
+        // SAFETY: EVP_sha1 takes nothing and returns a static digest.
+        unsafe {
+            return cu_sha1();
+        }
     }
     if alg == "SHA256" {
-        return cu_sha256();
+        // SAFETY: EVP_sha256 takes nothing and returns a static digest.
+        unsafe {
+            return cu_sha256();
+        }
     }
     if alg == "SHA384" {
-        return cu_sha384();
+        // SAFETY: EVP_sha384 takes nothing and returns a static digest.
+        unsafe {
+            return cu_sha384();
+        }
     }
     if alg == "SHA512" {
-        return cu_sha512();
+        // SAFETY: EVP_sha512 takes nothing and returns a static digest.
+        unsafe {
+            return cu_sha512();
+        }
     }
     return 0;
 }
@@ -619,20 +842,37 @@ fn cu_md(alg: str) -> i64 {
 // A BIGNUM of big-endian bytes (0 on failure).
 fn cu_bn_of(v: &Vec) -> i64 {
     val b: i64 = cu_buf(v);
-    val bn: i64 = cu_bn_from(b, v.len(), 0);
+    var bn: i64 = 0;
+    // SAFETY: BN_bin2bn reads v.len() bytes of b (the cu_buf copy of v,
+    // at least that long) and returns a new BIGNUM or 0; it copies them.
+    unsafe {
+        bn = cu_bn_from(b, v.len(), 0);
+    }
     cu_wipe_free(b, v.len());
     return bn;
 }
 
 // The big-endian bytes of a BIGNUM, without leading zeros.
 fn cu_bn_bytes(bn: i64) -> Vec<i64> {
-    val n: i64 = (cu_bn_bits(bn) as i64 + 7) / 8;
+    var bits: i32 = 0;
+    // SAFETY: BN_num_bits only reads bn, a BIGNUM view of a live RSA key
+    // the caller holds.
+    unsafe {
+        bits = cu_bn_bits(bn);
+    }
+    val n: i64 = (bits as i64 + 7) / 8;
     if n <= 0 {
         return Vec::new();
     }
     val b: i64 = cu_zeroed(n);
     var out: Vec<i64> = Vec::new();
-    if cu_bn_to(bn, b, n) == n {
+    var w: i32 = 0;
+    // SAFETY: n is bn's own byte length, so BN_bn2binpad writes exactly n
+    // bytes into b, a cu_zeroed(n) block.
+    unsafe {
+        w = cu_bn_to(bn, b, n);
+    }
+    if w == n {
         out = cu_unbuf(b, n);
     }
     cu_wipe_free(b, n);
@@ -641,7 +881,11 @@ fn cu_bn_bytes(bn: i64) -> Vec<i64> {
 
 fn cu_bn_drop(bn: i64) {
     if bn != 0 {
-        cu_bn_clear_free(bn);
+        // SAFETY: private helper; callers pass a BIGNUM they made (cu_bn_of)
+        // and still own (no set0 call took it over), freed once here.
+        unsafe {
+            cu_bn_clear_free(bn);
+        }
     }
 }
 
@@ -653,7 +897,12 @@ fn cu_rsa_pkey(blob: &Vec, want_private: bool) -> i64 {
         return 0;
     }
     val full: bool = cbr_u32(blob, 0) == CBR_FULL;
-    val rsa: i64 = cu_rsa_new();
+    var rsa: i64 = 0;
+    // SAFETY: RSA_new takes nothing and returns a new RSA object or 0,
+    // checked below.
+    unsafe {
+        rsa = cu_rsa_new();
+    }
     if rsa == 0 {
         return 0;
     }
@@ -663,41 +912,67 @@ fn cu_rsa_pkey(blob: &Vec, want_private: bool) -> i64 {
     if full {
         d = cu_bn_of(&cbr_blob_part(blob, 7));
     }
-    if n == 0 || e == 0 || (full && d == 0) || cu_rsa_set0_key(rsa, n, e, d) != 1 {
-        cu_bn_drop(n);
-        cu_bn_drop(e);
-        cu_bn_drop(d);
-        cu_rsa_free(rsa);
-        return 0;
+    // SAFETY: RSA_set0_key runs only with non-zero n and e (and d for a
+    // full key), BIGNUMs cu_bn_of made, and takes them over on success. On
+    // failure it took nothing: the BIGNUMs and the RSA object made above
+    // are each freed once and the function returns.
+    unsafe {
+        if n == 0 || e == 0 || (full && d == 0) || cu_rsa_set0_key(rsa, n, e, d) != 1 {
+            cu_bn_drop(n);
+            cu_bn_drop(e);
+            cu_bn_drop(d);
+            cu_rsa_free(rsa);
+            return 0;
+        }
     }
     // the RSA object owns n, e and d now
     if full {
         val p: i64 = cu_bn_of(&cbr_blob_part(blob, 2));
         val q: i64 = cu_bn_of(&cbr_blob_part(blob, 3));
-        if p == 0 || q == 0 || cu_rsa_set0_factors(rsa, p, q) != 1 {
-            cu_bn_drop(p);
-            cu_bn_drop(q);
-            cu_rsa_free(rsa);
-            return 0;
+        // SAFETY: RSA_set0_factors runs only with non-zero p and q
+        // (cu_bn_of) and takes them over on success. On failure they are
+        // still ours and freed once, and rsa (which owns n, e, d) is freed
+        // once with them; the function returns.
+        unsafe {
+            if p == 0 || q == 0 || cu_rsa_set0_factors(rsa, p, q) != 1 {
+                cu_bn_drop(p);
+                cu_bn_drop(q);
+                cu_rsa_free(rsa);
+                return 0;
+            }
         }
         val dp: i64 = cu_bn_of(&cbr_blob_part(blob, 4));
         val dq: i64 = cu_bn_of(&cbr_blob_part(blob, 5));
         val qi: i64 = cu_bn_of(&cbr_blob_part(blob, 6));
-        if dp == 0 || dq == 0 || qi == 0 || cu_rsa_set0_crt(rsa, dp, dq, qi) != 1 {
-            cu_bn_drop(dp);
-            cu_bn_drop(dq);
-            cu_bn_drop(qi);
+        // SAFETY: as for the factors: RSA_set0_crt_params runs only with
+        // non-zero dp, dq, qi and takes them over on success; on failure
+        // they and rsa are each freed once and the function returns.
+        unsafe {
+            if dp == 0 || dq == 0 || qi == 0 || cu_rsa_set0_crt(rsa, dp, dq, qi) != 1 {
+                cu_bn_drop(dp);
+                cu_bn_drop(dq);
+                cu_bn_drop(qi);
+                cu_rsa_free(rsa);
+                return 0;
+            }
+        }
+    }
+    var pkey: i64 = 0;
+    // SAFETY: EVP_PKEY_new takes nothing and returns a new EVP_PKEY or 0.
+    unsafe {
+        pkey = cu_pkey_new();
+    }
+    // SAFETY: EVP_PKEY_assign runs only on a non-zero pkey and takes rsa
+    // over on success. On failure rsa is still ours: pkey (if made) and rsa
+    // are each freed once and the function returns.
+    unsafe {
+        if pkey == 0 || cu_pkey_assign(pkey, CU_PKEY_RSA, rsa) != 1 {
+            if pkey != 0 {
+                cu_pkey_free(pkey);
+            }
             cu_rsa_free(rsa);
             return 0;
         }
-    }
-    val pkey: i64 = cu_pkey_new();
-    if pkey == 0 || cu_pkey_assign(pkey, CU_PKEY_RSA, rsa) != 1 {
-        if pkey != 0 {
-            cu_pkey_free(pkey);
-        }
-        cu_rsa_free(rsa);
-        return 0;
     }
     return pkey;
 }
@@ -705,17 +980,23 @@ fn cu_rsa_pkey(blob: &Vec, want_private: bool) -> i64 {
 // Set the padding (and its hashes) of an initialized EVP_PKEY_CTX. True
 // when OpenSSL took every setting.
 fn cu_rsa_padding(ctx: i64, pad: i64, md: i64, salt_len: i64) -> bool {
-    if cu_pctx_ctrl(ctx, CU_PKEY_RSA, -1, CU_CTRL_PADDING, pad, 0) <= 0 {
-        return false;
-    }
-    if pad == CU_PAD_OAEP {
-        return cu_pctx_ctrl(ctx, CU_PKEY_RSA, -1, CU_CTRL_OAEP_MD, 0, md) > 0 && cu_pctx_ctrl(ctx, CU_PKEY_RSA, -1, CU_CTRL_MGF1_MD, 0, md) > 0;
-    }
-    if cu_pctx_ctrl(ctx, -1, -1, CU_CTRL_MD, 0, md) <= 0 {
-        return false;
-    }
-    if pad == CU_PAD_PSS {
-        return cu_pctx_ctrl(ctx, CU_PKEY_RSA, -1, CU_CTRL_SALTLEN, salt_len, 0) > 0 && cu_pctx_ctrl(ctx, CU_PKEY_RSA, -1, CU_CTRL_MGF1_MD, 0, md) > 0;
+    // SAFETY: every call is EVP_PKEY_CTX_ctrl on ctx, an initialized
+    // EVP_PKEY_CTX of the caller, with integer arguments or md, a static
+    // EVP_MD from cu_md (the p2 pointer the MD commands expect); none of
+    // these commands writes through p2.
+    unsafe {
+        if cu_pctx_ctrl(ctx, CU_PKEY_RSA, -1, CU_CTRL_PADDING, pad, 0) <= 0 {
+            return false;
+        }
+        if pad == CU_PAD_OAEP {
+            return cu_pctx_ctrl(ctx, CU_PKEY_RSA, -1, CU_CTRL_OAEP_MD, 0, md) > 0 && cu_pctx_ctrl(ctx, CU_PKEY_RSA, -1, CU_CTRL_MGF1_MD, 0, md) > 0;
+        }
+        if cu_pctx_ctrl(ctx, -1, -1, CU_CTRL_MD, 0, md) <= 0 {
+            return false;
+        }
+        if pad == CU_PAD_PSS {
+            return cu_pctx_ctrl(ctx, CU_PKEY_RSA, -1, CU_CTRL_SALTLEN, salt_len, 0) > 0 && cu_pctx_ctrl(ctx, CU_PKEY_RSA, -1, CU_CTRL_MGF1_MD, 0, md) > 0;
+        }
     }
     return true;
 }
@@ -726,18 +1007,31 @@ pub fn cb_rsa_generate(bits: i64, priv_blob: &mut Vec, pub_blob: &mut Vec) -> i6
     if bits < 1024 || bits > 16384 {
         return -1;
     }
-    val rsa: i64 = cu_rsa_new();
-    val e: i64 = cu_bn_new();
-    var ok: bool = rsa != 0 && e != 0 && cu_bn_set_word(e, 65537) == 1;
-    ok = ok && cu_rsa_generate(rsa, bits, e, 0) == 1;
+    var rsa: i64 = 0;
+    var e: i64 = 0;
+    var ok: bool = false;
+    // SAFETY: RSA_new and BN_new take nothing and return new objects or 0;
+    // BN_set_word and RSA_generate_key_ex run only on non-zero ones (the
+    // && chain), with integer arguments and no callback (0).
+    unsafe {
+        rsa = cu_rsa_new();
+        e = cu_bn_new();
+        ok = rsa != 0 && e != 0 && cu_bn_set_word(e, 65537) == 1;
+        ok = ok && cu_rsa_generate(rsa, bits, e, 0) == 1;
+    }
     var priv: Vec<i64> = Vec::new();
     var pubb: Vec<i64> = Vec::new();
     if ok {
         // the RSA object keeps these (get0)
         val s: i64 = cu_zeroed(64);
-        cu_rsa_get0_key(rsa, s, s + 8, s + 16);
-        cu_rsa_get0_factors(rsa, s + 24, s + 32);
-        cu_rsa_get0_crt(rsa, s + 40, s + 48, s + 56);
+        // SAFETY: the three get0 calls write eight BIGNUM pointers (views
+        // owned by rsa) into the 8-byte words s .. s + 56 of s, a
+        // cu_zeroed(64) block; rsa is the key generated above.
+        unsafe {
+            cu_rsa_get0_key(rsa, s, s + 8, s + 16);
+            cu_rsa_get0_factors(rsa, s + 24, s + 32);
+            cu_rsa_get0_crt(rsa, s + 40, s + 48, s + 56);
+        }
         val n: Vec<i64> = cu_bn_bytes(cu_get(s));
         val ev: Vec<i64> = cu_bn_bytes(cu_get(s + 8));
         val d: Vec<i64> = cu_bn_bytes(cu_get(s + 16));
@@ -746,15 +1040,24 @@ pub fn cb_rsa_generate(bits: i64, priv_blob: &mut Vec, pub_blob: &mut Vec) -> i6
         val dp: Vec<i64> = cu_bn_bytes(cu_get(s + 40));
         val dq: Vec<i64> = cu_bn_bytes(cu_get(s + 48));
         val qi: Vec<i64> = cu_bn_bytes(cu_get(s + 56));
-        p_free(s);
+        // SAFETY: s is the cu_zeroed(64) block above, all eight words read
+        // just above; it is freed once and not read again (the BIGNUMs it
+        // pointed to belong to rsa and are not freed here).
+        unsafe {
+            p_free(s);
+        }
         priv = cb_rsa_private_blob(&n, &ev, &d, &p, &q, &dp, &dq, &qi);
         pubb = cb_rsa_public_blob(&n, &ev);
     }
-    if e != 0 {
-        cu_bn_free(e);
-    }
-    if rsa != 0 {
-        cu_rsa_free(rsa);
+    // SAFETY: e (BN_new) and rsa (RSA_new) are each freed once if they
+    // exist; RSA_generate_key_ex copied e, and rsa is not used after.
+    unsafe {
+        if e != 0 {
+            cu_bn_free(e);
+        }
+        if rsa != 0 {
+            cu_rsa_free(rsa);
+        }
     }
     if priv.len() == 0 || pubb.len() == 0 {
         return -1;
@@ -786,23 +1089,41 @@ fn cu_rsa_sign(priv_blob: &Vec, hash_alg: str, hash: &Vec, pad: i64, salt_len: i
         return out;
     }
     val k: i64 = cb_rsa_modulus_len(priv_blob);
-    val ctx: i64 = cu_pctx_new(pkey, 0);
-    var ok: bool = ctx != 0 && cu_sign_init(ctx) == 1 && cu_rsa_padding(ctx, pad, md, salt_len);
+    var ctx: i64 = 0;
+    var ok: bool = false;
+    // SAFETY: EVP_PKEY_CTX_new makes a context for pkey (cu_rsa_pkey's key)
+    // or returns 0; EVP_PKEY_sign_init runs only on a non-zero one.
+    unsafe {
+        ctx = cu_pctx_new(pkey, 0);
+        ok = ctx != 0 && cu_sign_init(ctx) == 1 && cu_rsa_padding(ctx, pad, md, salt_len);
+    }
     val hb: i64 = cu_buf(hash);
     val sig: i64 = cu_zeroed(k);
     val len: i64 = cu_slot();
     cu_put(len, k);
-    ok = ok && cu_pkey_sign(ctx, sig, len, hb, hlen) == 1 && cu_get(len) == k;
+    // SAFETY: runs only with a ready context (ok). EVP_PKEY_sign reads hlen
+    // bytes of hb (cu_buf of hash, length checked to be hlen) and writes at
+    // most *len = k bytes into sig (cu_zeroed(k)): k is the blob's modulus
+    // length, at least the RSA_size of the n built from it. The size_t
+    // count goes into len, an 8-byte cu_slot.
+    unsafe {
+        ok = ok && cu_pkey_sign(ctx, sig, len, hb, hlen) == 1 && cu_get(len) == k;
+    }
     if ok {
         out = cu_unbuf(sig, k);
     }
-    p_free(hb);
-    p_free(sig);
-    p_free(len);
-    if ctx != 0 {
-        cu_pctx_free(ctx);
+    // SAFETY: hb, sig and len are the blocks made above, each freed once;
+    // the signature was copied into `out` and the sign call has returned.
+    // Then the context (if made) and pkey (cu_rsa_pkey) are freed once.
+    unsafe {
+        p_free(hb);
+        p_free(sig);
+        p_free(len);
+        if ctx != 0 {
+            cu_pctx_free(ctx);
+        }
+        cu_pkey_free(pkey);
     }
-    cu_pkey_free(pkey);
     return out;
 }
 
@@ -821,17 +1142,33 @@ fn cu_rsa_verify(pub_blob: &Vec, hash_alg: str, hash: &Vec, sig: &Vec, pad: i64,
     if pkey == 0 {
         return false;
     }
-    val ctx: i64 = cu_pctx_new(pkey, 0);
-    var ok: bool = ctx != 0 && cu_verify_init(ctx) == 1 && cu_rsa_padding(ctx, pad, md, salt_len);
+    var ctx: i64 = 0;
+    var ok: bool = false;
+    // SAFETY: EVP_PKEY_CTX_new makes a context for pkey (cu_rsa_pkey's key)
+    // or returns 0; EVP_PKEY_verify_init runs only on a non-zero one.
+    unsafe {
+        ctx = cu_pctx_new(pkey, 0);
+        ok = ctx != 0 && cu_verify_init(ctx) == 1 && cu_rsa_padding(ctx, pad, md, salt_len);
+    }
     val hb: i64 = cu_buf(hash);
     val sb: i64 = cu_buf(sig);
-    ok = ok && cu_pkey_verify(ctx, sb, k, hb, hlen) == 1;
-    p_free(hb);
-    p_free(sb);
-    if ctx != 0 {
-        cu_pctx_free(ctx);
+    // SAFETY: runs only with a ready context (ok); EVP_PKEY_verify only
+    // reads k bytes of sb and hlen bytes of hb, the cu_buf copies of sig and
+    // hash whose lengths were checked to be k and hlen.
+    unsafe {
+        ok = ok && cu_pkey_verify(ctx, sb, k, hb, hlen) == 1;
     }
-    cu_pkey_free(pkey);
+    // SAFETY: hb and sb (cu_buf above) were only read by the verification,
+    // which has returned, and are freed once; then the context (if made)
+    // and pkey (cu_rsa_pkey) are freed once.
+    unsafe {
+        p_free(hb);
+        p_free(sb);
+        if ctx != 0 {
+            cu_pctx_free(ctx);
+        }
+        cu_pkey_free(pkey);
+    }
     return ok;
 }
 
@@ -869,21 +1206,35 @@ pub fn cb_rsa_verify_pss(pub_blob: &Vec, hash_alg: str, hash: &Vec, sig: &Vec, s
 
 // An OAEP context of `pkey` for encryption or decryption with `label`.
 fn cu_oaep_ctx(pkey: i64, encrypt: bool, md: i64, label: &Vec) -> i64 {
-    val ctx: i64 = cu_pctx_new(pkey, 0);
+    var ctx: i64 = 0;
+    // SAFETY: EVP_PKEY_CTX_new makes a context for pkey, a live EVP_PKEY
+    // of the caller (cu_rsa_pkey), or returns 0, checked below.
+    unsafe {
+        ctx = cu_pctx_new(pkey, 0);
+    }
     if ctx == 0 {
         return 0;
     }
     var ok: bool = false;
-    if encrypt {
-        ok = cu_encrypt_init(ctx) == 1;
-    } else {
-        ok = cu_decrypt_init(ctx) == 1;
+    // SAFETY: the init calls take only ctx, the context made above.
+    unsafe {
+        if encrypt {
+            ok = cu_encrypt_init(ctx) == 1;
+        } else {
+            ok = cu_decrypt_init(ctx) == 1;
+        }
     }
     ok = ok && cu_rsa_padding(ctx, CU_PAD_OAEP, md, 0);
     if ok && label.len() > 0 {
         // OpenSSL takes the label over (EVP_PKEY_CTX_set0_rsa_oaep_label):
         // it must come from OpenSSL's allocator
-        val lab: i64 = cu_crypto_malloc(label.len(), "crypto_bind_unix", 0);
+        var lab: i64 = 0;
+        // SAFETY: CRYPTO_malloc allocates label.len() bytes (the file
+        // argument is a NUL-terminated string literal, read only for its
+        // debug bookkeeping) or returns 0, checked below.
+        unsafe {
+            lab = cu_crypto_malloc(label.len(), "crypto_bind_unix", 0);
+        }
         ok = lab != 0;
         if ok {
             var i: i64 = 0;
@@ -891,11 +1242,30 @@ fn cu_oaep_ctx(pkey: i64, encrypt: bool, md: i64, label: &Vec) -> i64 {
                 cu_set_byte(lab + i, label.get(i));
                 i = i + 1;
             }
-            ok = cu_pctx_ctrl(ctx, CU_PKEY_RSA, -1, CU_CTRL_OAEP_LABEL, label.len(), lab) > 0;
+            // SAFETY: lab holds exactly label.len() bytes, all written just
+            // above, passed with that length; on success the context owns
+            // lab and frees it with OpenSSL's allocator, and lab is not
+            // used here again.
+            unsafe {
+                ok = cu_pctx_ctrl(ctx, CU_PKEY_RSA, -1, CU_CTRL_OAEP_LABEL, label.len(), lab) > 0;
+            }
+            if !ok {
+                // SAFETY: the ctrl call failed, so the context did not take
+                // lab over (set0 takes ownership only on success): lab, from
+                // CRYPTO_malloc above, is given back once to OpenSSL's
+                // allocator and not used again. Before, it leaked.
+                unsafe {
+                    cu_crypto_free(lab, "crypto_bind_unix", 0);
+                }
+            }
         }
     }
     if !ok {
-        cu_pctx_free(ctx);
+        // SAFETY: the context made above is freed once and the function
+        // returns 0, so the caller never sees it.
+        unsafe {
+            cu_pctx_free(ctx);
+        }
         return 0;
     }
     return ctx;
@@ -923,15 +1293,32 @@ pub fn cb_rsa_encrypt_oaep(pub_blob: &Vec, hash_alg: str, msg: &Vec, label: &Vec
         val ct: i64 = cu_zeroed(k);
         val len: i64 = cu_slot();
         cu_put(len, k);
-        if cu_pkey_encrypt(ctx, ct, len, mb, msg.len()) == 1 && cu_get(len) == k {
+        var r: i32 = 0;
+        // SAFETY: ctx is the OAEP encryption context cu_oaep_ctx made.
+        // EVP_PKEY_encrypt reads msg.len() bytes of mb (cu_buf of msg) and
+        // writes at most *len = k bytes into ct (cu_zeroed(k)): k is the
+        // blob's modulus length, at least the key's RSA_size. The size_t
+        // count goes into len, an 8-byte cu_slot.
+        unsafe {
+            r = cu_pkey_encrypt(ctx, ct, len, mb, msg.len());
+        }
+        if r == 1 && cu_get(len) == k {
             out = cu_unbuf(ct, k);
         }
         cu_wipe_free(mb, msg.len());
-        p_free(ct);
-        p_free(len);
-        cu_pctx_free(ctx);
+        // SAFETY: ct and len are the blocks made above, read for the last
+        // time just above, each freed once; then the context is freed once.
+        unsafe {
+            p_free(ct);
+            p_free(len);
+            cu_pctx_free(ctx);
+        }
     }
-    cu_pkey_free(pkey);
+    // SAFETY: pkey (cu_rsa_pkey) is freed once, after the context that
+    // used it.
+    unsafe {
+        cu_pkey_free(pkey);
+    }
     return out;
 }
 
@@ -959,7 +1346,13 @@ pub fn cb_rsa_decrypt_oaep(@secret priv_blob: &Vec, hash_alg: str, ct: &Vec, lab
         val pt: i64 = cu_zeroed(k);
         val len: i64 = cu_slot();
         cu_put(len, k);
-        ok = cu_pkey_decrypt(ctx, pt, len, cb, k) == 1;
+        // SAFETY: ctx is the OAEP decryption context cu_oaep_ctx made.
+        // EVP_PKEY_decrypt reads k bytes of cb (cu_buf of ct, whose length
+        // was checked to be k) and writes at most *len = k bytes into pt
+        // (cu_zeroed(k)); the size_t count goes into len, an 8-byte cu_slot.
+        unsafe {
+            ok = cu_pkey_decrypt(ctx, pt, len, cb, k) == 1;
+        }
         val n: i64 = cu_get(len);
         ok = ok && n >= 0 && n <= k;
         if ok {
@@ -969,11 +1362,23 @@ pub fn cb_rsa_decrypt_oaep(@secret priv_blob: &Vec, hash_alg: str, ct: &Vec, lab
                 i = i + 1;
             }
         }
-        p_free(cb);
+        // SAFETY: cb (cu_buf above) was only read by the decryption, which
+        // has returned; it is freed once and not read again.
+        unsafe {
+            p_free(cb);
+        }
         cu_wipe_free(pt, k);
-        p_free(len);
-        cu_pctx_free(ctx);
+        // SAFETY: len is the cu_slot above, read into n already, freed once;
+        // then the context is freed once.
+        unsafe {
+            p_free(len);
+            cu_pctx_free(ctx);
+        }
     }
-    cu_pkey_free(pkey);
+    // SAFETY: pkey (cu_rsa_pkey) is freed once, after the context that
+    // used it.
+    unsafe {
+        cu_pkey_free(pkey);
+    }
     return ok;
 }

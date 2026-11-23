@@ -149,7 +149,7 @@ pub fn assoc_bindings_get(bindings: Vec<AssocBindingEntry>, name: str) -> OptTyp
 
 // --- Generic function info -----------------------------------------------
 // Rust: HashMap<String, (Func, Vec<String>)>
-// Fides: Vec<GenericFuncEntry>
+// Fides: GenericFuncMap (Vec + name index)
 
 pub struct GenericFuncEntry {
     pub name: str,
@@ -168,31 +168,42 @@ pub enum OptGenericFunc {
     None,
 }
 
-pub fn generic_funcs_get(map: Vec<GenericFuncEntry>, name: str) -> OptGenericFunc {
-    var i: i64 = 0;
-    while i < map.len() {
-        if map.get(i).name == name {
-            return OptGenericFunc::Some(map.get(i));
-        }
-        i = i + 1;
-    }
-    return OptGenericFunc::None;
+// SP10: the entries plus a name index (name -> position + 1, the first
+// entry of a name wins as a scan from the front would find it), so lookups
+// at each call site are not a scan of every generic.
+pub struct GenericFuncMap {
+    pub entries: Vec<GenericFuncEntry>,
+    pub index: i64,
 }
 
-pub fn generic_funcs_contains(map: Vec<GenericFuncEntry>, name: str) -> bool {
-    var i: i64 = 0;
-    while i < map.len() {
-        if map.get(i).name == name {
-            return true;
-        }
-        i = i + 1;
+pub fn GenericFuncMap_new() -> GenericFuncMap {
+    return GenericFuncMap {
+        entries: Vec::new(), index: HashMap_new(),
+    };
+}
+
+pub fn GenericFuncMap_push(map: &mut GenericFuncMap, e: GenericFuncEntry) {
+    if HashMap_get(map.index, e.name) == 0 {
+        HashMap_insert(map.index, e.name, map.entries.len() + 1);
     }
-    return false;
+    map.entries.push(e);
+}
+
+pub fn generic_funcs_get(map: GenericFuncMap, name: str) -> OptGenericFunc {
+    var at: i64 = HashMap_get(map.index, name);
+    if at == 0 {
+        return OptGenericFunc::None;
+    }
+    return OptGenericFunc::Some(map.entries.get(at - 1));
+}
+
+pub fn generic_funcs_contains(map: GenericFuncMap, name: str) -> bool {
+    return HashMap_get(map.index, name) != 0;
 }
 
 // --- Generic method info -------------------------------------------------
 // Rust: HashMap<(String, String), (Func, Vec<String>)>
-// Fides: Vec<GenericMethodEntry>
+// Fides: GenericMethodMap (Vec + name index)
 
 pub struct GenericMethodEntry {
     pub struct_name: str,
@@ -212,28 +223,36 @@ pub enum OptGenericMethod {
     None,
 }
 
-pub fn generic_methods_get(map: Vec<GenericMethodEntry>, struct_name: str, method_name: str) -> OptGenericMethod {
-    var i: i64 = 0;
-    while i < map.len() {
-        var entry: GenericMethodEntry = map.get(i);
-        if entry.struct_name == struct_name && entry.method_name == method_name {
-            return OptGenericMethod::Some(entry);
-        }
-        i = i + 1;
-    }
-    return OptGenericMethod::None;
+// SP10: as GenericFuncMap, keyed "struct::method".
+pub struct GenericMethodMap {
+    pub entries: Vec<GenericMethodEntry>,
+    pub index: i64,
 }
 
-pub fn generic_methods_contains(map: Vec<GenericMethodEntry>, struct_name: str, method_name: str) -> bool {
-    var i: i64 = 0;
-    while i < map.len() {
-        var entry: GenericMethodEntry = map.get(i);
-        if entry.struct_name == struct_name && entry.method_name == method_name {
-            return true;
-        }
-        i = i + 1;
+pub fn GenericMethodMap_new() -> GenericMethodMap {
+    return GenericMethodMap {
+        entries: Vec::new(), index: HashMap_new(),
+    };
+}
+
+pub fn GenericMethodMap_push(map: &mut GenericMethodMap, e: GenericMethodEntry) {
+    var key: str = e.struct_name + "::" + e.method_name;
+    if HashMap_get(map.index, key) == 0 {
+        HashMap_insert(map.index, key, map.entries.len() + 1);
     }
-    return false;
+    map.entries.push(e);
+}
+
+pub fn generic_methods_get(map: GenericMethodMap, struct_name: str, method_name: str) -> OptGenericMethod {
+    var at: i64 = HashMap_get(map.index, struct_name + "::" + method_name);
+    if at == 0 {
+        return OptGenericMethod::None;
+    }
+    return OptGenericMethod::Some(map.entries.get(at - 1));
+}
+
+pub fn generic_methods_contains(map: GenericMethodMap, struct_name: str, method_name: str) -> bool {
+    return HashMap_get(map.index, struct_name + "::" + method_name) != 0;
 }
 
 // --- Rename maps ---------------------------------------------------------
@@ -1808,23 +1827,26 @@ pub fn infer_from_pair(param: Type, arg: Type, type_params: Vec<str>, subst: &mu
 // --- Monomorphization context --------------------------------------------
 
 pub struct MonoCtx {
-    pub generics: Vec<GenericFuncEntry>,
-    pub generic_methods: Vec<GenericMethodEntry>,
+    pub generics: GenericFuncMap,
+    pub generic_methods: GenericMethodMap,
     pub instantiated: Vec<Func>,
     pub seen: Vec<str>,
+    // SP10: the same names as `seen`, for O(1) membership
+    pub seen_index: i64,
     pub trait_assoc_bindings: Vec<TraitAssocEntry>,
 }
 
 pub fn MonoCtx_new() -> MonoCtx {
     return MonoCtx {
-        generics: Vec::new(), generic_methods: Vec::new(), instantiated: Vec::new(), seen: Vec::new(), trait_assoc_bindings: Vec::new(),
+        generics: GenericFuncMap_new(), generic_methods: GenericMethodMap_new(), instantiated: Vec::new(), seen: Vec::new(), seen_index: HashMap_new(), trait_assoc_bindings: Vec::new(),
     };
 }
 
 pub fn MonoCtx_seen_insert(ctx: &mut MonoCtx, name: str) -> bool {
-    if str_vec_contains(ctx.seen, name) {
+    if HashMap_get(ctx.seen_index, name) != 0 {
         return false;
     }
+    HashMap_insert(ctx.seen_index, name, 1);
     ctx.seen.push(name);
     return true;
 }
@@ -1850,7 +1872,7 @@ pub fn mono_turbofish_errors() -> Vec<str> {
 
 /// The function a turbofish call `name::<#k>` calls: the instantiation of
 /// `name` with the k-th type arguments, queued to be created.
-fn mono_turbofish_callee(callee: str, generics: Vec<GenericFuncEntry>, in_func: str) -> str {
+fn mono_turbofish_callee(callee: str, generics: GenericFuncMap, in_func: str) -> str {
     var at: i64 = str_find(callee, "::<#");
     if at < 0 {
         return callee;
@@ -1895,9 +1917,9 @@ fn mono_turbofish_callee(callee: str, generics: Vec<GenericFuncEntry>, in_func: 
     return base;
 }
 
-fn mono_tf_body(f: Func, generics: Vec<GenericFuncEntry>) -> Func {
+fn mono_tf_body(f: Func, generics: GenericFuncMap) -> Func {
     var r: Func = f;
-    var no_methods: Vec<GenericMethodEntry> = Vec::new();
+    var no_methods: GenericMethodMap = GenericMethodMap_new();
     r.body = fixup_generic_calls(f.body, generics, no_methods, f);
     return r;
 }
@@ -1917,12 +1939,12 @@ pub fn mono_resolve_turbofish(program0: Program, table: Vec<Type>) -> Program {
     g_mono_tf_names = Vec::new();
     g_mono_tf_funcs = Vec::new();
     g_mono_tf_substs = Vec::new();
-    var generics: Vec<GenericFuncEntry> = Vec::new();
+    var generics: GenericFuncMap = GenericFuncMap_new();
     var i: i64 = 0;
     while i < program.funcs.len() {
         var f: Func = program.funcs.get(i);
         if f.type_params.len() > 0 {
-            generics.push(GenericFuncEntry_new(f.name, f, f.type_params));
+            GenericFuncMap_push(&mut generics, GenericFuncEntry_new(f.name, f, f.type_params));
         }
         i = i + 1;
     }
@@ -2008,6 +2030,10 @@ pub fn mono_resolve_turbofish(program0: Program, table: Vec<Type>) -> Program {
 // L8H: the program's specializations `name__spec<k>` (ast.fd
 // spec_base_name), for instantiate
 var g_mono_specs: Vec<Func> = Vec::new();
+// SP10: base name -> bucket of g_mono_spec_pos + 1, so "any spec of this
+// name" and "the specs of this name" are not scans of every spec
+var g_mono_spec_idx: i64 = 0;
+var g_mono_spec_pos: Vec<Vec<i64>> = Vec::new();
 // L8H: the methods of narrower impls that specialize a generic impl's
 // (`impl Wrap<i64> { fn show__spec1(self: Wrap<i64>) }`, parser.fd
 // pd_impl_specializations), the struct each is a method of, and its impl's
@@ -2015,6 +2041,8 @@ var g_mono_specs: Vec<Func> = Vec::new();
 var g_mono_mspecs: Vec<Func> = Vec::new();
 var g_mono_mspec_structs: Vec<str> = Vec::new();
 var g_mono_mspec_tps: Vec<Vec<str>> = Vec::new();
+var g_mono_mspec_idx: i64 = 0;
+var g_mono_mspec_pos: Vec<Vec<i64>> = Vec::new();
 
 fn mono_spec_setup(program: Program) {
     g_mono_specs = Vec::new();
@@ -2022,6 +2050,22 @@ fn mono_spec_setup(program: Program) {
     while i < program.funcs.len() {
         if spec_base_name(program.funcs.get(i).name) != "" {
             g_mono_specs.push(program.funcs.get(i));
+        }
+        i = i + 1;
+    }
+    g_mono_spec_idx = HashMap_new();
+    g_mono_spec_pos = Vec::new();
+    i = 0;
+    while i < g_mono_specs.len() {
+        var bn: str = spec_base_name(g_mono_specs.get(i).name);
+        var b: i64 = HashMap_get(g_mono_spec_idx, bn);
+        if b == 0 {
+            var np: Vec<i64> = Vec::new();
+            np.push(i);
+            g_mono_spec_pos.push(np);
+            HashMap_insert(g_mono_spec_idx, bn, g_mono_spec_pos.len());
+        } else {
+            g_mono_spec_pos.get(b - 1).push(i);
         }
         i = i + 1;
     }
@@ -2041,6 +2085,22 @@ fn mono_spec_setup(program: Program) {
                 g_mono_mspec_tps.push(imp.type_params);
             }
             j = j + 1;
+        }
+        i = i + 1;
+    }
+    g_mono_mspec_idx = HashMap_new();
+    g_mono_mspec_pos = Vec::new();
+    i = 0;
+    while i < g_mono_mspecs.len() {
+        var mk: str = g_mono_mspec_structs.get(i) + "::" + spec_base_name(g_mono_mspecs.get(i).name);
+        var mb: i64 = HashMap_get(g_mono_mspec_idx, mk);
+        if mb == 0 {
+            var mp: Vec<i64> = Vec::new();
+            mp.push(i);
+            g_mono_mspec_pos.push(mp);
+            HashMap_insert(g_mono_mspec_idx, mk, g_mono_mspec_pos.len());
+        } else {
+            g_mono_mspec_pos.get(mb - 1).push(i);
         }
         i = i + 1;
     }
@@ -2198,18 +2258,22 @@ pub fn mono_method_inst(struct_name: str, gen_func: Func, impl_tps: Vec<str>, su
         base.params = bps;
         cands.push(base);
         at.push(-1);
+        var spos: Vec<i64> = Vec::new();
+        var sb: i64 = HashMap_get(g_mono_mspec_idx, struct_name + "::" + gen_func.name);
+        if sb != 0 {
+            spos = g_mono_mspec_pos.get(sb - 1);
+        }
         var si: i64 = 0;
-        while si < g_mono_mspecs.len() {
-            if g_mono_mspec_structs.get(si) == struct_name && spec_base_name(g_mono_mspecs.get(si).name) == gen_func.name {
-                val sm: Func = g_mono_mspecs.get(si);
-                var c: Func = Func_new(sm.name, sm.ret_ty);
-                c.type_params = g_mono_mspec_tps.get(si);
-                var cps: Vec<Param> = Vec::new();
-                cps.push(Param_new("self", mono_self_value_type(sm.params.get(0).ty), false));
-                c.params = cps;
-                cands.push(c);
-                at.push(si);
-            }
+        while si < spos.len() {
+            var mi: i64 = spos.get(si);
+            val sm: Func = g_mono_mspecs.get(mi);
+            var c: Func = Func_new(sm.name, sm.ret_ty);
+            c.type_params = g_mono_mspec_tps.get(mi);
+            var cps: Vec<Param> = Vec::new();
+            cps.push(Param_new("self", mono_self_value_type(sm.params.get(0).ty), false));
+            c.params = cps;
+            cands.push(c);
+            at.push(mi);
             si = si + 1;
         }
         if cands.len() > 1 {
@@ -2312,8 +2376,8 @@ fn mono_va_pack(args: Vec<Expr>, fixed: i64, elem: Type) -> Vec<Expr> {
 
 fn mono_va_body(f: Func) -> Func {
     var r: Func = f;
-    var no_generics: Vec<GenericFuncEntry> = Vec::new();
-    var no_methods: Vec<GenericMethodEntry> = Vec::new();
+    var no_generics: GenericFuncMap = GenericFuncMap_new();
+    var no_methods: GenericMethodMap = GenericMethodMap_new();
     var nb: Vec<Stmt> = fixup_generic_calls(f.body, no_generics, no_methods, f);
     r.body = nb;
     return r;
@@ -3505,27 +3569,13 @@ fn mono_share_key(subst: Vec<SubstEntry>, may_share: bool) -> Vec<SubstEntry> {
 /// Whether a generic function's instances may share: not when it has L8H
 /// specializations (instantiate chooses among them by the spelled types).
 fn mono_share_fn_ok(name: str) -> bool {
-    var i: i64 = 0;
-    while i < g_mono_specs.len() {
-        if spec_base_name(g_mono_specs.get(i).name) == name {
-            return false;
-        }
-        i = i + 1;
-    }
-    return true;
+    return HashMap_get(g_mono_spec_idx, name) == 0;
 }
 
 /// Whether a generic method's instances may share: not when a narrower impl
 /// of its struct specializes it (mono_method_inst chooses by the types).
 fn mono_share_method_ok(struct_name: str, method_name: str) -> bool {
-    var i: i64 = 0;
-    while i < g_mono_mspecs.len() {
-        if g_mono_mspec_structs.get(i) == struct_name && spec_base_name(g_mono_mspecs.get(i).name) == method_name {
-            return false;
-        }
-        i = i + 1;
-    }
-    return true;
+    return HashMap_get(g_mono_mspec_idx, struct_name + "::" + method_name) == 0;
 }
 
 /// Counts an instance key (FID_MONO_STATS): `orig` as spelled, `canon` as
@@ -3570,6 +3620,7 @@ pub fn monomorphize(program: Program) -> Program {
         var func: Func = program.funcs.get(i);
         if func.type_params.len() == 0 {
             if str_contains(func.name, "__") {
+                HashMap_insert(ctx.seen_index, func.name, 1);
                 ctx.seen.push(func.name);
             }
             if mn_is_redundant(func) {
@@ -3583,7 +3634,7 @@ pub fn monomorphize(program: Program) -> Program {
                 concrete_funcs.push(func);
             }
         } else {
-            ctx.generics.push(GenericFuncEntry_new(func.name, func, func.type_params));
+            GenericFuncMap_push(&mut ctx.generics, GenericFuncEntry_new(func.name, func, func.type_params));
         }
         i = i + 1;
     }
@@ -3613,9 +3664,9 @@ pub fn monomorphize(program: Program) -> Program {
         var j: i64 = 0;
         while j < imp.methods.len() {
             if imp.type_params.len() > 0 {
-                ctx.generic_methods.push(GenericMethodEntry_new(imp.struct_name, imp.methods.get(j).name, imp.methods.get(j), mono_lg4_tps(imp.type_params, imp.methods.get(j))));
+                GenericMethodMap_push(&mut ctx.generic_methods, GenericMethodEntry_new(imp.struct_name, imp.methods.get(j).name, imp.methods.get(j), mono_lg4_tps(imp.type_params, imp.methods.get(j))));
             } else if mono_lg4_generic(imp.methods.get(j)) {
-                ctx.generic_methods.push(GenericMethodEntry_new(imp.struct_name, imp.methods.get(j).name, mono_lg4_self(imp.methods.get(j), imp.struct_name), imp.methods.get(j).type_params));
+                GenericMethodMap_push(&mut ctx.generic_methods, GenericMethodEntry_new(imp.struct_name, imp.methods.get(j).name, mono_lg4_self(imp.methods.get(j), imp.struct_name), imp.methods.get(j).type_params));
             }
             j = j + 1;
         }
@@ -3629,9 +3680,9 @@ pub fn monomorphize(program: Program) -> Program {
         var j: i64 = 0;
         while j < ti.methods.len() {
             if ti.type_params.len() > 0 {
-                ctx.generic_methods.push(GenericMethodEntry_new(ti.type_name, ti.methods.get(j).name, ti.methods.get(j), mono_lg4_tps(ti.type_params, ti.methods.get(j))));
+                GenericMethodMap_push(&mut ctx.generic_methods, GenericMethodEntry_new(ti.type_name, ti.methods.get(j).name, ti.methods.get(j), mono_lg4_tps(ti.type_params, ti.methods.get(j))));
             } else if mono_lg4_generic(ti.methods.get(j)) {
-                ctx.generic_methods.push(GenericMethodEntry_new(ti.type_name, ti.methods.get(j).name, mono_lg4_self(ti.methods.get(j), ti.type_name), ti.methods.get(j).type_params));
+                GenericMethodMap_push(&mut ctx.generic_methods, GenericMethodEntry_new(ti.type_name, ti.methods.get(j).name, mono_lg4_self(ti.methods.get(j), ti.type_name), ti.methods.get(j).type_params));
             }
             j = j + 1;
         }
@@ -3758,7 +3809,7 @@ pub fn monomorphize(program: Program) -> Program {
 // For each call to a generic, re-infer the substitution from argument types
 // and use the correct mangled name.
 
-pub fn fixup_generic_calls(stmts: Vec<Stmt>, generics: Vec<GenericFuncEntry>, gm: Vec<GenericMethodEntry>, current_func: Func) -> Vec<Stmt> {
+pub fn fixup_generic_calls(stmts: Vec<Stmt>, generics: GenericFuncMap, gm: GenericMethodMap, current_func: Func) -> Vec<Stmt> {
     var result: Vec<Stmt> = Vec::new();
     var i: i64 = 0;
     while i < stmts.len() {
@@ -3768,7 +3819,7 @@ pub fn fixup_generic_calls(stmts: Vec<Stmt>, generics: Vec<GenericFuncEntry>, gm
     return result;
 }
 
-pub fn fixup_generic_calls_stmt(stmt: Stmt, generics: Vec<GenericFuncEntry>, gm: Vec<GenericMethodEntry>, current_func: Func) -> Stmt {
+pub fn fixup_generic_calls_stmt(stmt: Stmt, generics: GenericFuncMap, gm: GenericMethodMap, current_func: Func) -> Stmt {
     match stmt {
         Stmt::Expr(e, line) => {
             return Stmt::Expr(fixup_generic_calls_expr(e, generics, gm, current_func), line);
@@ -4020,7 +4071,7 @@ pub fn subst_with_result(gen_func: Func, arg_types: Vec<Type>, type_params: Vec<
 /// A direct call to a generic function whose result has a declared type:
 /// renamed with that type for what the arguments leave unbound. One
 /// expression, or none.
-pub fn fixup_hinted_call(expr: Expr, hint: OptType, generics: Vec<GenericFuncEntry>, gm: Vec<GenericMethodEntry>, current_func: Func) -> Vec<Expr> {
+pub fn fixup_hinted_call(expr: Expr, hint: OptType, generics: GenericFuncMap, gm: GenericMethodMap, current_func: Func) -> Vec<Expr> {
     var out: Vec<Expr> = Vec::new();
     if g_mono_tf_only {
         return out;
@@ -4071,7 +4122,7 @@ pub fn fixup_hinted_call(expr: Expr, hint: OptType, generics: Vec<GenericFuncEnt
     return out;
 }
 
-fn fixup_match_arms(arms: Vec<MatchArm>, generics: Vec<GenericFuncEntry>, gm: Vec<GenericMethodEntry>, current_func: Func) -> Vec<MatchArm> {
+fn fixup_match_arms(arms: Vec<MatchArm>, generics: GenericFuncMap, gm: GenericMethodMap, current_func: Func) -> Vec<MatchArm> {
     var out: Vec<MatchArm> = Vec::new();
     var i: i64 = 0;
     while i < arms.len() {
@@ -4090,7 +4141,7 @@ fn fixup_match_arms(arms: Vec<MatchArm>, generics: Vec<GenericFuncEntry>, gm: Ve
     return out;
 }
 
-pub fn fixup_generic_calls_expr(expr: Expr, generics: Vec<GenericFuncEntry>, gm: Vec<GenericMethodEntry>, current_func: Func) -> Expr {
+pub fn fixup_generic_calls_expr(expr: Expr, generics: GenericFuncMap, gm: GenericMethodMap, current_func: Func) -> Expr {
     match expr {
         Expr::Call(callee, args) => {
             // First, recursively fix up args
@@ -4410,7 +4461,7 @@ fn mono_closure_ctx(outer: Func, params: Vec<Param>, body: Vec<Stmt>) -> Func {
     return f;
 }
 
-fn fixup_exprs(es: Vec<Expr>, generics: Vec<GenericFuncEntry>, gm: Vec<GenericMethodEntry>, current_func: Func) -> Vec<Expr> {
+fn fixup_exprs(es: Vec<Expr>, generics: GenericFuncMap, gm: GenericMethodMap, current_func: Func) -> Vec<Expr> {
     var out: Vec<Expr> = Vec::new();
     var i: i64 = 0;
     while i < es.len() {
@@ -4552,11 +4603,14 @@ pub fn instantiate(gen_func: Func, subst: Vec<SubstEntry>, mangled_name: str, ct
     if g_mono_specs.len() > 0 && spec_base_name(gen_func.name) == "" {
         var cands: Vec<Func> = Vec::new();
         cands.push(gen_func);
+        var spos: Vec<i64> = Vec::new();
+        var sb: i64 = HashMap_get(g_mono_spec_idx, gen_func.name);
+        if sb != 0 {
+            spos = g_mono_spec_pos.get(sb - 1);
+        }
         var si: i64 = 0;
-        while si < g_mono_specs.len() {
-            if spec_base_name(g_mono_specs.get(si).name) == gen_func.name {
-                cands.push(g_mono_specs.get(si));
-            }
+        while si < spos.len() {
+            cands.push(g_mono_specs.get(spos.get(si)));
             si = si + 1;
         }
         if cands.len() > 1 {
@@ -4619,11 +4673,11 @@ pub fn instantiate(gen_func: Func, subst: Vec<SubstEntry>, mangled_name: str, ct
 
 // --- Walk statements to find calls to generic functions ------------------
 
-pub fn collect_generic_calls_stmt(stmt: Stmt, generics: Vec<GenericFuncEntry>, generic_methods: Vec<GenericMethodEntry>, calls: &mut Vec<GenericCallEntry>, method_calls: &mut Vec<GenericMethodCallEntry>, current_func: Func,) {
+pub fn collect_generic_calls_stmt(stmt: Stmt, generics: GenericFuncMap, generic_methods: GenericMethodMap, calls: &mut Vec<GenericCallEntry>, method_calls: &mut Vec<GenericMethodCallEntry>, current_func: Func,) {
     collect_generic_calls_stmt_with_hint(stmt, generics, generic_methods, calls, method_calls, current_func, OptType::None);
 }
 
-pub fn collect_generic_calls_stmt_with_hint(stmt: Stmt, generics: Vec<GenericFuncEntry>, generic_methods: Vec<GenericMethodEntry>, calls: &mut Vec<GenericCallEntry>, method_calls: &mut Vec<GenericMethodCallEntry>, current_func: Func, expected_ty: OptType,) {
+pub fn collect_generic_calls_stmt_with_hint(stmt: Stmt, generics: GenericFuncMap, generic_methods: GenericMethodMap, calls: &mut Vec<GenericCallEntry>, method_calls: &mut Vec<GenericMethodCallEntry>, current_func: Func, expected_ty: OptType,) {
     match stmt {
         Stmt::Let(name, ty, expr, is_mut, is_persist, annotations, line) => {
             collect_generic_calls_expr_with_hint(expr, generics, generic_methods, calls, method_calls, current_func, ty);
@@ -4857,7 +4911,7 @@ pub fn collect_generic_calls_stmt_with_hint(stmt: Stmt, generics: Vec<GenericFun
 
 // --- Walk expressions to find calls to generic functions -----------------
 
-pub fn collect_generic_calls_expr_with_hint(expr: Expr, generics: Vec<GenericFuncEntry>, generic_methods: Vec<GenericMethodEntry>, calls: &mut Vec<GenericCallEntry>, method_calls: &mut Vec<GenericMethodCallEntry>, current_func: Func, expected_ty: OptType,) {
+pub fn collect_generic_calls_expr_with_hint(expr: Expr, generics: GenericFuncMap, generic_methods: GenericMethodMap, calls: &mut Vec<GenericCallEntry>, method_calls: &mut Vec<GenericMethodCallEntry>, current_func: Func, expected_ty: OptType,) {
     match expr {
         Expr::Call(callee, args) => {
             if generic_funcs_contains(generics, callee) {

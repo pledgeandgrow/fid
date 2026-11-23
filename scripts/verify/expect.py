@@ -33,10 +33,20 @@ The suite's own form is also read (tests/bootstrap/, scripts/bare-qemu-test.sh):
                          in `...` matches any line that starts with the rest
     // Expected exit: N  the exit status (default 0)
 
+A block's lines are compared with the output's without their leading and
+trailing blanks, as scripts/tier1.sh does (scripts/cross-test.sh block_of,
+same_as_block): a block may indent its lines (`//   sizes 0..300 not zero:
+0`), and a line of output that really starts with spaces is trimmed the
+same way. //> lines and golden files are compared exactly.
+
 A file with no //> or //! lines is checked against
 tests/bootstrap/golden/<name>.txt when that exists, and otherwise only for
-agreement between the backends. A `_fail.fd` file with no //! line must
-fail (a compile error or a nonzero exit) on every backend.
+agreement between the backends. A file that must be refused with no //!
+line must fail (a compile error or a nonzero exit) on every backend: a
+`_fail.fd` or `_fail2.fd` file, or one whose first three lines say
+`expect-error` (scripts/tier1.sh's rule, is_reject_test; before, a
+`_fail2.fd` or `expect-error` file that compiled to an error was reported
+as "does not compile").
 
 Exit status 0 when every file does what it says on every backend.
 """
@@ -64,7 +74,12 @@ def spec_of(path):
     with open(path, encoding="utf-8", errors="replace") as f:
         text = f.read()
     out = []
-    want = {"out": None, "panic": False, "error": None, "exit": None, "backends": None, "env": {}}
+    want = {"out": None, "panic": False, "error": None, "exit": None, "backends": None, "env": {},
+            "trim": False}
+    base = os.path.basename(path)
+    head3 = text.splitlines()[:3]
+    want["reject"] = (base.endswith("_fail.fd") or base.endswith("_fail2.fd")
+                      or any("expect-error" in l for l in head3))
     block = None  # lines of a "// Expected output:" block, while in it
     blocks = []
     for line in text.split("\n"):
@@ -102,6 +117,8 @@ def spec_of(path):
         blocks.append(block)
     if not out and blocks:
         out = blocks[0]
+        # BG114: a block's lines are compared trimmed, as by tier1.sh
+        want["trim"] = True
     if out or want["panic"] or want["exit"] is not None:
         want["out"] = "".join(o + "\n" for o in out)
     if want["out"] is None and want["error"] is None:
@@ -196,11 +213,15 @@ def on_backend(fid, b, path, work, env=None):
     return res
 
 
-def same_output(want, got):
-    """Line by line; an expected line ending in `...` matches by prefix."""
+def same_output(want, got, trim=False):
+    """Line by line; an expected line ending in `...` matches by prefix.
+    With `trim` (an `// Expected output:` block), the lines of both lose
+    their leading and trailing blanks first."""
     if want == got:
         return True
     wl, gl = want.split("\n"), got.split("\n")
+    if trim:
+        wl, gl = [w.strip(" \t") for w in wl], [g.strip(" \t") for g in gl]
     if len(wl) != len(gl):
         return False
     return all(w == g or (w.endswith("...") and g.startswith(w[:-3])) for w, g in zip(wl, gl))
@@ -225,22 +246,24 @@ def check_file(fid, path, backends, work):
     results = {b: on_backend(fid, b, path, work, want["env"]) for b in bs}
     for b, (rc, out, err) in results.items():
         if rc == "compile-error" or (b == "run" and isinstance(rc, int) and rc != 0 and "rror" in err and not out):
-            if not path.endswith("_fail.fd"):
+            if not want["reject"]:
                 problems.append(f"{b}: does not compile: {error_line(err)}")
             continue
         if want["out"] is not None:
             want_rc = 1 if want["panic"] else (want["exit"] if want["exit"] is not None else 0)
             if rc != want_rc:
                 problems.append(f"{b}: exit {rc}, expected {want_rc}")
-            if not same_output(want["out"], out):
+            if not same_output(want["out"], out, want["trim"]):
                 wl, gl = want["out"].split("\n"), out.split("\n")
+                if want["trim"]:
+                    wl, gl = [w.strip(" \t") for w in wl], [g.strip(" \t") for g in gl]
                 k = next((i for i in range(max(len(wl), len(gl)))
                           if i >= len(wl) or i >= len(gl) or wl[i] != gl[i]), 0)
                 problems.append(f"{b}: output line {k + 1}: expected {wl[k] if k < len(wl) else '<end>'!r}, "
                                 f"got {gl[k] if k < len(gl) else '<end>'!r}")
-        elif path.endswith("_fail.fd") and rc == 0:
+        elif want["reject"] and rc == 0:
             problems.append(f"{b}: succeeded, but must fail")
-    if want["out"] is None and not path.endswith("_fail.fd"):
+    if want["out"] is None and not want["reject"]:
         outs = {(rc, out) for rc, out, _ in results.values() if rc != "compile-error"}
         if len(outs) > 1:
             problems.append("backends disagree: " + "; ".join(

@@ -4625,7 +4625,10 @@ fn PeirGen_gen_alloc_lock(self: &mut PeirGen, abase: i64) -> void {
     PeirEnc_emit_u8(&mut self.enc, 0xBA);
     PeirEnc_emit_u8(&mut self.enc, 0x2D);
     // mod=00 reg=101 rm=101 -> [rip]+/5
-    self.enc.pending_rip_refs.push(PeirRipRef_new(self.enc.code.len(), abase + 24));
+    // BG48: an imm8 follows the disp32, so rip is one byte past where
+    // PeirEnc_resolve_rip_refs assumes (the field + 4): aim one byte low
+    // or the lock is the qword at abase+25 (over the free lists)
+    self.enc.pending_rip_refs.push(PeirRipRef_new(self.enc.code.len(), abase + 24 - 1));
     PeirEnc_emit_i32(&mut self.enc, 0);
     PeirEnc_emit_u8(&mut self.enc, 0x00);
     // imm8 = bit 0
@@ -4642,7 +4645,9 @@ fn PeirGen_gen_alloc_lock(self: &mut PeirGen, abase: i64) -> void {
 fn PeirGen_gen_alloc_unlock(self: &mut PeirGen, abase: i64) -> void {
     PeirEnc_emit_u8(&mut self.enc, 0xC6);
     PeirEnc_emit_u8(&mut self.enc, 0x05);
-    self.enc.pending_rip_refs.push(PeirRipRef_new(self.enc.code.len(), abase + 24));
+    // mov byte [rip + disp32], imm8 (C6 05 disp32 ib); BG48: rip is past
+    // the imm8, one byte after the field + 4
+    self.enc.pending_rip_refs.push(PeirRipRef_new(self.enc.code.len(), abase + 24 - 1));
     PeirEnc_emit_i32(&mut self.enc, 0);
     PeirEnc_emit_u8(&mut self.enc, 0x00);
 }
@@ -5682,14 +5687,20 @@ pub fn PeirGen_gen_str_concat(self: &mut PeirGen) -> void {
     PeirEnc_mov_rr(&mut self.enc, PEIR_R8, PEIR_R14);
     PeirEnc_call_rip(&mut self.enc, memcpy_off);
 
-    // memcpy(buf + len_l, right, len_r + 1) - +1 copies right's NUL,
-    // so the result is exactly "left" + "right" + NUL.
+    // memcpy(buf + len_l, right, len_r), then the NUL written here: BG49,
+    // copying len_r + 1 read a byte through a null right operand (len 0,
+    // as C's runtime treats it: ""), so the NUL no longer comes from right
     PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_R15);
     PeirEnc_add_rr(&mut self.enc, PEIR_RCX, PEIR_R14);
     PeirEnc_mov_rr(&mut self.enc, PEIR_RDX, PEIR_R13);
     PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_R8, -48);
-    PeirEnc_inc_r(&mut self.enc, PEIR_R8);
     PeirEnc_call_rip(&mut self.enc, memcpy_off);
+    // rcx = buf + len_l + len_r; mov byte [rcx], 0 (C6 01 00)
+    PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_R15);
+    PeirEnc_add_rr(&mut self.enc, PEIR_RCX, PEIR_R14);
+    PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_R10, -48);
+    PeirEnc_add_rr(&mut self.enc, PEIR_RCX, PEIR_R10);
+    pe_emit3(&mut self.enc, 0xC6, 0x01, 0x00);
 
     // Return buf
     PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_R15);
@@ -8714,16 +8725,22 @@ pub fn PeirGen_gen_str_join_n(self: &mut PeirGen) -> void {
     // vec len
     PeirEnc_sub_rsp_i32(&mut self.enc, 64);
     // Locals: [rbp-40] = result, [rbp-48] = write cursor, [rbp-56] = len.
-    // Two passes, each element's length counted once by msvcrt strlen;
-    // copies via memcpy to a running cursor (no result re-scan).
+    // Two passes, each element's length counted once (its header's, else
+    // strlen: PeirGen_emit_slen); copies via memcpy to a running cursor.
+    // BG93: the result is a counted string, as p_str_concat's (proposal
+    // 0004: [P_STR_RC + 1][len] then the bytes and a NUL; lower.fd lists
+    // p_str_join_n among the builtins that return a fresh owned string),
+    // not a plain p_malloc block, and the NUL is written at the end, so an
+    // empty Vec gives "" (it gave an unterminated byte) and a null element
+    // counts as "" (memcpy of len + 1 read through it).
     var strlen_off: i64 = PeirGen_iat_off(self, pe_import_slot("strlen"));
     var memcpy_off: i64 = PeirGen_iat_off(self, pe_import_slot("memcpy"));
     // r12 = vec, r15 = vec->len
     PeirEnc_mov_rr(&mut self.enc, PEIR_R12, PEIR_RCX);
     PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_R15, PEIR_R12, 8);
-    // Pass 1: total = 1 + sum(strlen(elem))
+    // Pass 1: r13 = sum(len(elem))
     PeirEnc_xor_self(&mut self.enc, PEIR_R14);
-    PeirEnc_mov_imm32(&mut self.enc, PEIR_R13, 1);
+    PeirEnc_xor_self(&mut self.enc, PEIR_R13);
     var sjn_len_loop: i64 = PeirEnc_alloc_label(&mut self.enc);
     var sjn_len_done: i64 = PeirEnc_alloc_label(&mut self.enc);
     PeirEnc_place_label(&mut self.enc, sjn_len_loop);
@@ -8737,14 +8754,21 @@ pub fn PeirGen_gen_str_join_n(self: &mut PeirGen) -> void {
     PeirEnc_add_rr(&mut self.enc, PEIR_RAX, PEIR_RDX);
     PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_RCX, PEIR_RAX, 0);
     // elem ptr
-    PeirEnc_call_rip(&mut self.enc, strlen_off);
+    PeirGen_emit_slen(self, strlen_off);
     PeirEnc_add_rr(&mut self.enc, PEIR_R13, PEIR_RAX);
     PeirEnc_inc_r(&mut self.enc, PEIR_R14);
     PeirEnc_jmp_label(&mut self.enc, sjn_len_loop);
     PeirEnc_place_label(&mut self.enc, sjn_len_done);
-    // result = cursor = malloc(total)
+    // block = p_malloc(16 + sum + 1)
     PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_R13);
+    PeirEnc_add_r_i32(&mut self.enc, PEIR_RCX, 17);
     PeirEnc_call_label(&mut self.enc, HashMap_get(self.func_labels, "p_malloc"));
+    // [block] = a count of one owner (core's P_STR_RC + 1); [block + 8] = sum
+    PeirEnc_mov_imm64(&mut self.enc, PEIR_R9, 0x4649444500000001);
+    PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_RAX, 0, PEIR_R9);
+    PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_RAX, 8, PEIR_R13);
+    // result = cursor = block + 16
+    PeirEnc_add_r_i32(&mut self.enc, PEIR_RAX, 16);
     PeirEnc_mov_mem_rbp_reg(&mut self.enc, -40, PEIR_RAX);
     PeirEnc_mov_mem_rbp_reg(&mut self.enc, -48, PEIR_RAX);
     // Pass 2: memcpy each element to the cursor
@@ -8763,16 +8787,14 @@ pub fn PeirGen_gen_str_join_n(self: &mut PeirGen) -> void {
     PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_R13, PEIR_RAX, 0);
     // r13 = elem
     PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_R13);
-    PeirEnc_call_rip(&mut self.enc, strlen_off);
+    PeirGen_emit_slen(self, strlen_off);
     PeirEnc_mov_mem_rbp_reg(&mut self.enc, -56, PEIR_RAX);
     // elem len
-    // memcpy(cursor, elem, len + 1) — +1 copies the NUL; overwritten by
-    // the next element and re-written at the end
+    // memcpy(cursor, elem, len)
     PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RCX, -48);
     // cursor
     PeirEnc_mov_rr(&mut self.enc, PEIR_RDX, PEIR_R13);
     PeirEnc_mov_rr(&mut self.enc, PEIR_R8, PEIR_RAX);
-    PeirEnc_inc_r(&mut self.enc, PEIR_R8);
     PeirEnc_call_rip(&mut self.enc, memcpy_off);
     // cursor += len
     PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RCX, -48);
@@ -8782,6 +8804,9 @@ pub fn PeirGen_gen_str_join_n(self: &mut PeirGen) -> void {
     PeirEnc_inc_r(&mut self.enc, PEIR_R14);
     PeirEnc_jmp_label(&mut self.enc, sjn_cat_loop);
     PeirEnc_place_label(&mut self.enc, sjn_cat_done);
+    // the NUL: rcx = cursor; mov byte [rcx], 0 (C6 01 00)
+    PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RCX, -48);
+    pe_emit3(&mut self.enc, 0xC6, 0x01, 0x00);
     // Return result
     PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RAX, -40);
     PeirEnc_add_rsp_i32(&mut self.enc, 64);

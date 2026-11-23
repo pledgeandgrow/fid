@@ -10,6 +10,13 @@ caller makes that promise. The check is `TypeChecker_require_unsafe` in
 
 - reading or writing through a raw pointer (`*mut T`, `*const T`);
 - `p_malloc`, `p_alloc`, `p_free`, `p_realloc`, `p_memcpy`, `p_memset`;
+- core's raw-memory writers (BG10, `tc_core_raw_memory_fn`): `p_mem_copy`,
+  `p_copy_words`, `p_zero_words`, `p_str_copy_n`, `p_str_free`,
+  `p_str_append`, `p_str_adopt`. Core's readers (`p_str_hash`,
+  `p_str_equal`, `p_bytes_eq`, `p_mem_find_byte`, `p_str_cstr_len`,
+  `p_str_hdr_len`), copiers (`p_str_from_ptr`, `p_str_take`) and allocators
+  (`p_str_alloc`, `p_str_buf`) stay callable in safe code, and so do core's
+  functions without the `p_` prefix (`vec_st`, `Str_drop`, `Box_drop_t`);
 - making a pointer from an integer;
 - calling an `extern "C"` function (one whose name does not start with `p_`
   and that no trusted header declares);
@@ -31,11 +38,13 @@ An `@unsafe` function's body is one `unsafe` block, so it may call other
 - the modules it imports from outside the standard library directory
   (`tc_note_module_file`, called by `compiler.fd record_module_file`).
 
-Not checked yet: the standard library (its `unsafe` blocks carry `// SAFETY:`
-comments, listed by `fid audit <file> --stdlib --strict`), the compiler's
-own modules (`compiler::*`), and a program that is itself a file of the
-standard library directory (`tc_note_program_file`, when the driver calls
-it).
+- the standard library's modules (release M10), except its trusted base:
+  `stdlib/core.fd`, `stdlib/pe_runtime/` and `stdlib/linux_runtime/`
+  (`tc_path_is_trusted_base`). Their `unsafe` blocks carry `// SAFETY:`
+  comments, listed by `fid audit <file> --stdlib --strict`.
+
+Not checked: the trusted base above and the compiler's own modules
+(`compiler::*`).
 
 ## How @unsafe functions are found
 

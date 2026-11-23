@@ -35,7 +35,7 @@ binaries. Dispatch is in compiler/main.fd (docs/file-analysis/main.md).
 | `lint <file>` | unused functions and imports, `unwrap()` outside tests | works (does not resolve `compiler::` imports) |
 | `fmt <file> [--check]` | formatter, rewrites the file | corrupted files until Nov 15 (known-bugs 2g.6, fixed) |
 | `test [<file>] [--fail]` | a file's `test_*`/`bench_*` functions, or the suite / expected-fail list | works on Windows; without a file broken on POSIX |
-| `fuzz <file> [--seeds N]` | a test file's `fuzz_*(data: Vec<u8>)` targets on N deterministic inputs (1000; `test --fuzz`: 100), coverage-guided (the harness is built with `ccompile --fuzz-cov`); failing inputs are saved under `testdata/fuzz/<target>/` and replayed by every `fid test`: [docs/fuzzing.md](../fuzzing.md) | new Nov 15 (TL1), checked by scripts/tl-check.sh |
+| `fuzz <file> [--seeds N]` | a test file's `fuzz_*(data: Vec<u8>)` targets on N deterministic inputs (1000; `test --fuzz`: 100), coverage-guided (the harness is built with `ccompile --fuzz-cov`); failing inputs are saved under `testdata/fuzz/<target>/` and replayed by every `fid test`: [docs/guides/fuzzing.md](../fuzzing.md) | new Nov 15 (TL1), checked by scripts/tl-check.sh |
 | `fix <file> [--check]` | applies the suggested fixes (`val` -> `var`, a narrowing `as T`, a misspelled name, an unused import), each kept only when the program then has fewer errors (or as many, none on the fixed line); `--check` writes nothing | new Nov 15 (TL3) |
 | `test-rules [--smt <dir>]` | checks the rewrite rules on values; writes SMT obligations | works |
 | `qualify <file>` | safety evidence as JSON | works |
@@ -49,7 +49,7 @@ binaries. Dispatch is in compiler/main.fd (docs/file-analysis/main.md).
 | `bench <file>`, `watch` | run an executable N times (`watch` is the same as `bench`) | works |
 | `repl` | compile and run each line with tcc/gcc | not checked Nov 9 |
 | `tokens`, `ast` (`dump-ast`, `dump-ast-raw`, `dump-ast-flat`), `ir`, `verify`, `sourcemap` | dumps (the four `ast` forms print the same summary) | work |
-| `opt <f> [--fn <n>]` | the IR after the IR optimizer the machine layer runs (iropt_native) | Nov 17 (llvm MI18; `pir`/`dump-pir` were retired with the PIR path and name this instead: docs/pir-retired.md) |
+| `opt <f> [--fn <n>]` | the IR after the IR optimizer the machine layer runs (iropt_native) | Nov 17 (llvm MI18; `pir`/`dump-pir` were retired with the PIR path and name this instead: docs/reference/pir-retired.md) |
 | `codegen <f> [--target t] [--fn <n>] [--elf/--coff/--macho <o>]` | the machine layer: a disassembly, or an object file as `emit --obj` | Nov 17 (llvm MI18) |
 | `wasm <file> -o <out.wasm>` | native WebAssembly (WASI) | modules validate and run; 316 of 344 suite tests match `fid run` (Nov 15, 2g.21) |
 | `build-x86`, `gpu` | experimental back ends | `gpu` rewritten Nov 15, not yet built; `build-x86`'s exe untested (2g.16, 2g.21; platforms.md, Tier 3) |

@@ -406,8 +406,10 @@ fn send_notification(msg: Json) -> void {
 fn publish_diagnostics(uri: str, text: str) -> void {
     // Determine source path from URI
     var source_path: OptStr = OptStr::None;
+    // BG53: the path decoded (`%3A`, `%20`, ...), as lsp_uri_path gives it:
+    // the raw URI text found no sibling module of the document
     if str_starts_with(uri, "file://") {
-        source_path = OptStr::Some(str_slice(uri, 7, str_len(uri)));
+        source_path = OptStr::Some(lsp_uri_path(uri));
     }
 
     var diags: Vec<StrTriple> = get_diagnostics(text, source_path);
@@ -2963,8 +2965,10 @@ fn handle_code_action(text: str, uri: str, first_line: i64, last_line: i64) -> J
     var actions: Vec<Json> = Vec::new();
     var errs: Vec<str> = Vec::new();
     var source_path: OptStr = OptStr::None;
+    // BG53: the path decoded (`%3A`, `%20`, ...), as lsp_uri_path gives it:
+    // the raw URI text found no sibling module of the document
     if str_starts_with(uri, "file://") {
-        source_path = OptStr::Some(str_slice(uri, 7, str_len(uri)));
+        source_path = OptStr::Some(lsp_uri_path(uri));
     }
     // SP19: from `fid serve --port` when FID_SERVE names it (as diagnostics)
     errs = check_text_errors(text, source_path);
@@ -3009,14 +3013,56 @@ fn handle_code_action(text: str, uri: str, first_line: i64, last_line: i64) -> J
 // other open documents and the .fd files of the document's directory that
 // declare it or `use` the module that does.
 
-/// The file path of a `file://` URI ("" for another scheme): `%XX` for
-/// `:` and space decoded, and `/C:/..` taken as `C:/..`.
+/// The value of hex digit `b` (a byte), or -1.
+fn lsp_hex_digit(b: i64) -> i64 {
+    if b >= 48 && b <= 57 {
+        return b - 48;
+    }
+    if b >= 65 && b <= 70 {
+        return b - 55;
+    }
+    if b >= 97 && b <= 102 {
+        return b - 87;
+    }
+    return -1;
+}
+
+/// `s` with every `%XX` replaced by the byte it stands for (RFC 3986
+/// percent-encoding; a `%` without two hex digits stays as it is). The
+/// bytes of a multi-byte UTF-8 character come back as they were.
+fn lsp_percent_decode(s: str) -> str {
+    if !str_contains(s, "%") {
+        return s;
+    }
+    var out: Vec<i64> = Vec::new();
+    var n: i64 = str_len(s);
+    var i: i64 = 0;
+    while i < n {
+        var b: i64 = str_byte_at(s, i) & 255;
+        var step: i64 = 1;
+        if b == 37 && i + 2 < n {
+            var hi: i64 = lsp_hex_digit(str_byte_at(s, i + 1) & 255);
+            var lo: i64 = lsp_hex_digit(str_byte_at(s, i + 2) & 255);
+            if hi >= 0 && lo >= 0 {
+                b = hi * 16 + lo;
+                step = 3;
+            }
+        }
+        out.push(b);
+        i = i + step;
+    }
+    return str_from_bytes(out);
+}
+
+/// The file path of a `file://` URI ("" for another scheme): every `%XX`
+/// decoded (BG53: editors send `file:///c%3A/my%20dir/x.fd`; only `%3A`
+/// and `%20` were, so a path with another escaped character found no
+/// sibling module), and `/C:/..` taken as `C:/..`.
 fn lsp_uri_path(uri: str) -> str {
     if !str_starts_with(uri, "file://") {
         return "";
     }
-    var p: str = str_slice(uri, 7, str_len(uri));
-    p = str_replace(str_replace(str_replace(p, "%3A", ":"), "%3a", ":"), "%20", " ");
+    var p: str = lsp_percent_decode(str_slice(uri, 7, str_len(uri)));
     if str_len(p) >= 3 && str_byte_at(p, 0) == 47 && str_byte_at(p, 2) == 58 {
         p = str_slice(p, 1, str_len(p));
     }
@@ -3478,7 +3524,8 @@ fn lsp_declares(text: str, name: str) -> i64 {
 /// The module name of a document: its file name without `.fd`.
 fn lsp_module_name(uri: str) -> str {
     var slash: i64 = c_str_find_last(uri, "/");
-    var base: str = str_slice(uri, slash + 1, str_len(uri));
+    // BG53: as the file's name, decoded
+    var base: str = lsp_percent_decode(str_slice(uri, slash + 1, str_len(uri)));
     if str_ends_with(base, ".fd") {
         base = str_slice(base, 0, str_len(base) - 3);
     }

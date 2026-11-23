@@ -4,7 +4,7 @@
 # (astcache), the imported modules' parses (modcache), the checked bodies
 # (CB2 in build requests: compiler.fd cb2_request_build), the machine code
 # of every unchanged function (nat_ir.fd g_nat_fncache_mem). See
-# docs/sp8-edit-rebuild.md.
+# docs/reference/incremental.md.
 #
 # On a program in a temporary directory, built through one `fid serve`
 # for $T (default x86_64-linux, any host; T=nat: Windows x64 through the

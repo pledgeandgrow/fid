@@ -42,13 +42,19 @@ PINNED="release/stage0/fid$X"
 if [ -z "${STAGE0:-}" ]; then
   if [ -x "$PINNED" ]; then
     STAGE0="$PINNED"
-    if [ -f scripts/stage0.sha256 ] && command -v sha256sum >/dev/null; then
-      want=$(cut -d' ' -f1 scripts/stage0.sha256)
+    # The pin that applies: stage0-fetch.sh records it next to the binary;
+    # a hand-placed fid.exe falls back to scripts/stage0.sha256.
+    PIN="$PINNED.sha256"; [ -f "$PIN" ] || PIN="scripts/stage0.sha256"
+    if [ -f "$PIN" ] && command -v sha256sum >/dev/null; then
+      want=$(cut -d' ' -f1 "$PIN")
       have=$(sha256sum "$PINNED" | cut -d' ' -f1)
       if [ "$want" != "$have" ]; then
-        echo "warning: $PINNED does not match scripts/stage0.sha256 (pin it again with PIN=1)"
+        echo "warning: $PINNED does not match $PIN (pin it again with PIN=1)"
       fi
     fi
+  elif [ "${FID_STAGE0_FETCH:-1}" != 0 ] && ./scripts/stage0-fetch.sh; then
+    # stage0-fetch.sh places the verified binary at $PINNED
+    STAGE0="$PINNED"
   else
     STAGE0=./target/release/fidesc
     echo "note: no pinned stage 0 ($PINNED); cold start from the frozen Rust compiler"

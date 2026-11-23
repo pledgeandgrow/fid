@@ -149,7 +149,7 @@ const TS_PFX_CNG: i64 = 512;
 const TS_KEY_PROV_INFO: i64 = 2;
 const TS_MACHINE_KEY: i64 = 32;
 fn ts_get(p: i64) -> i64 {
-    var a: *mut i64 = p;
+    var a: *mut i64 = p as *mut i64;
     var v: i64 = 0;
     // SAFETY: private helper; callers pass a word of a block this module
     // allocated (a session of TS_WORDS words, a ts_zeroed block). The public
@@ -162,7 +162,7 @@ fn ts_get(p: i64) -> i64 {
 }
 
 fn ts_set(p: i64, v: i64) {
-    var a: *mut i64 = p;
+    var a: *mut i64 = p as *mut i64;
     // SAFETY: private helper; as ts_get, a word of a block this module
     // allocated.
     unsafe {
@@ -179,12 +179,26 @@ fn ts_set32(p: i64, v: i64) {
 }
 
 fn ts_copy(dst: i64, src: i64, n: i64) {
-    ts_memmove(dst as * u8, src as * u8, n);
+    // SAFETY: private helper; memmove reads n bytes at src and writes n at
+    // dst, and allows them to overlap. Callers move bytes within a session's
+    // 65536-byte input buffer (n <= what it holds), from it into the
+    // 65536-byte plain buffer (a decrypted record is smaller than its
+    // input), into tls_session_send's message block (n <= TS_MAX) or between
+    // that and the caller's address/length pair of tls_session_send/recv
+    // (the caller's contract: n bytes valid at addr).
+    unsafe {
+        ts_memmove(dst as * u8, src as * u8, n);
+    }
 }
 
 /// `n` zeroed words.
 fn ts_zeroed(n: i64) -> i64 {
-    val block: i64 = p_malloc(n * 8);
+    var block: i64 = 0;
+    // SAFETY: a fresh n * 8-byte block; the loop below zeroes each of its n
+    // words and the caller owns it (and frees it with p_free).
+    unsafe {
+        block = p_malloc(n * 8);
+    }
     var i: i64 = 0;
     while i < n {
         ts_set(block + i * 8, 0);
@@ -260,27 +274,52 @@ fn ts_session(fd: i64) -> i64 {
     val s: i64 = ts_zeroed(TS_WORDS);
     ts_put(s, TS_FD, fd);
     ts_put(s, TS_CAP, 65536);
-    ts_put(s, TS_BUF, p_malloc(65536));
-    ts_put(s, TS_PLAIN, p_malloc(65536));
+    // SAFETY: two fresh 65536-byte blocks (TS_CAP), the input and plain
+    // buffers; the session owns them and ts_free_session frees them.
+    unsafe {
+        ts_put(s, TS_BUF, p_malloc(65536));
+        ts_put(s, TS_PLAIN, p_malloc(65536));
+    }
     return s;
 }
 
 fn ts_free_session(s: i64) {
-    p_free(ts_field(s, TS_BUF));
-    p_free(ts_field(s, TS_PLAIN));
+    // SAFETY: the two buffers ts_session allocated for s; s is being freed,
+    // so nothing reads them afterwards.
+    unsafe {
+        p_free(ts_field(s, TS_BUF));
+        p_free(ts_field(s, TS_PLAIN));
+    }
     if ts_field(s, TS_HOST) != 0 {
-        p_free(ts_field(s, TS_HOST));
+        // SAFETY: the ts_text_block the client stored in TS_HOST; only the
+        // session pointed to it.
+        unsafe {
+            p_free(ts_field(s, TS_HOST));
+        }
     }
     if ts_field(s, TS_CHOSEN) != 0 {
-        p_free(ts_field(s, TS_CHOSEN));
+        // SAFETY: the ts_text_block ts_handshake stored in TS_CHOSEN; only
+        // the session pointed to it.
+        unsafe {
+            p_free(ts_field(s, TS_CHOSEN));
+        }
     }
-    p_free(s);
+    // SAFETY: s is the ts_zeroed block of ts_session; the caller drops its
+    // handle (a closed or failed session is not used again).
+    unsafe {
+        p_free(s);
+    }
 }
 
 // A copy of `t` the session keeps: [length word][bytes].
 fn ts_text_block(t: str) -> i64 {
     val n: i64 = str_len(t);
-    val block: i64 = p_malloc(n + 16);
+    var block: i64 = 0;
+    // SAFETY: a fresh n + 16-byte block: the length word and the n bytes
+    // written below fit in it (8 + n bytes); the caller owns it.
+    unsafe {
+        block = p_malloc(n + 16);
+    }
     ts_set(block, n);
     var i: i64 = 0;
     while i < n {
@@ -308,11 +347,19 @@ fn ts_block_text(block: i64) -> str {
 /// The sizes EncryptMessage needs, once the handshake is done.
 fn ts_stream_sizes(s: i64) {
     val sizes: i64 = ts_zeroed(3);
-    sc_query(s + TS_CTX * 8, 4, sizes);
+    // SAFETY: SECPKG_ATTR_STREAM_SIZES (4) writes a SecPkgContext_StreamSizes
+    // (5 u32, 20 bytes) into sizes, 24 bytes; the context handle at s + 8 is
+    // the one the finished handshake made.
+    unsafe {
+        sc_query(s + TS_CTX * 8, 4, sizes);
+    }
     ts_put(s, TS_HEADER, ts_get32(sizes));
     ts_put(s, TS_TRAILER, ts_get32(sizes + 4));
     ts_put(s, TS_MAX, ts_get32(sizes + 8));
-    p_free(sizes);
+    // SAFETY: the ts_zeroed block above, read for the last time.
+    unsafe {
+        p_free(sizes);
+    }
 }
 
 /// The handshake, either side. Returns true once it is done.
@@ -367,13 +414,38 @@ fn ts_handshake(s: i64, host: str, server: bool) -> bool {
             }
             // ASC_REQ: sequence and replay detection, confidentiality,
             // allocate memory, stream
-            rc = sc_accept(cred, old, in_desc, 65820, 0, ctx, out_desc, attrs, expiry);
+            // SAFETY: cred is the server's credentials handle copied into
+            // the session (tls_accept), ctx the session's 2-word context
+            // slot (0 for old on the first call); in_desc describes 2 or 3
+            // SecBuffers in input (6 words), the token one over the `have`
+            // received bytes of buf; out_desc 1 buffer Schannel allocates
+            // (ASC_REQ_ALLOCATE_MEMORY, freed below); attrs and expiry are
+            // one-word blocks. All live until after the loop.
+            unsafe {
+                rc = sc_accept(cred, old, in_desc, 65820, 0, ctx, out_desc, attrs, expiry);
+            }
         } else if started {
-            rc = sc_init(cred, ctx, host, 33052, 0, 0, in_desc, 0, ctx, out_desc, attrs, expiry);
+            // SAFETY: as sc_accept above, on the client: cred is the
+            // handle ts_acquire* wrote into the session, ctx the context
+            // the first call made, host a NUL-terminated str (the name the
+            // certificate is checked against).
+            unsafe {
+                rc = sc_init(cred, ctx, host, 33052, 0, 0, in_desc, 0, ctx, out_desc, attrs, expiry);
+            }
         } else if alpn != 0 {
-            rc = sc_init(cred, 0, host, 33052, 0, 0, alpn_desc, 0, ctx, out_desc, attrs, expiry);
+            // SAFETY: the first client call: no context yet (0); the only
+            // input is alpn_desc, 1 SecBuffer over the ALPN block of
+            // ts_alpn_block_size bytes, owned by the caller for the
+            // handshake. Other arguments as in the call above.
+            unsafe {
+                rc = sc_init(cred, 0, host, 33052, 0, 0, alpn_desc, 0, ctx, out_desc, attrs, expiry);
+            }
         } else {
-            rc = sc_init(cred, 0, host, 33052, 0, 0, 0, 0, ctx, out_desc, attrs, expiry);
+            // SAFETY: the first client call without input (0); the other
+            // arguments as in the calls above.
+            unsafe {
+                rc = sc_init(cred, 0, host, 33052, 0, 0, 0, 0, ctx, out_desc, attrs, expiry);
+            }
         }
         if rc != TS_INCOMPLETE {
             started = true;
@@ -384,7 +456,12 @@ fn ts_handshake(s: i64, host: str, server: bool) -> bool {
             if out_size > 0 && p_co_send(fd, out_addr, out_size) != out_size {
                 failed = true;
             }
-            sc_free_buffer(out_addr);
+            // SAFETY: out_addr is the output token Schannel allocated in this
+            // round (ISC/ASC_REQ_ALLOCATE_MEMORY), sent above and not used
+            // again; the next round resets the output buffer to 0.
+            unsafe {
+                sc_free_buffer(out_addr);
+            }
         }
         if rc == TS_OK || rc == TS_CONTINUE {
             // What the call did not use stays in the buffer
@@ -405,14 +482,19 @@ fn ts_handshake(s: i64, host: str, server: bool) -> bool {
         }
     }
     ts_put(s, TS_HAVE, have);
-    p_free(attrs);
-    p_free(expiry);
-    p_free(input);
-    p_free(output);
-    p_free(in_desc);
-    p_free(out_desc);
-    p_free(alpn_buffers);
-    p_free(alpn_desc);
+    // SAFETY: the eight ts_zeroed/ts_desc blocks this function allocated;
+    // the loop is over and Schannel keeps no pointer to them (the output
+    // token it allocated was freed in its round).
+    unsafe {
+        p_free(attrs);
+        p_free(expiry);
+        p_free(input);
+        p_free(output);
+        p_free(in_desc);
+        p_free(out_desc);
+        p_free(alpn_buffers);
+        p_free(alpn_desc);
+    }
     if done {
         ts_stream_sizes(s);
         // what ALPN chose, kept: Schannel's answer to the query does not
@@ -440,9 +522,21 @@ fn ts_acquire(s: i64, usage: i64, flags: i64, cert_slot: i64) -> bool {
     // credentials structure (release-roadmap I7), not the protocol field.
     ts_set32(cred + 72, flags);
     val expiry: i64 = ts_zeroed(1);
-    val rc: i64 = sc_acquire(0, TS_PACKAGE, usage, 0, cred, 0, 0, s + TS_CRED * 8, expiry);
-    p_free(cred);
-    p_free(expiry);
+    var rc: i64 = 0;
+    // SAFETY: cred is an 80-byte SCHANNEL_CRED (ts_zeroed(10)) filled above,
+    // its paCred the caller's certificate slot or none; Schannel writes the
+    // 2-word credentials handle at s + 24 (a session's TS_CRED words, or
+    // tls_server's block, passed so that this lands at its word 0) and a
+    // one-word expiry into expiry. TS_PACKAGE is a NUL-terminated literal.
+    unsafe {
+        rc = sc_acquire(0, TS_PACKAGE, usage, 0, cred, 0, 0, s + TS_CRED * 8, expiry);
+    }
+    // SAFETY: the two ts_zeroed blocks above; AcquireCredentialsHandle
+    // copies what it needs, nothing points to them afterwards.
+    unsafe {
+        p_free(cred);
+        p_free(expiry);
+    }
     return rc == TS_OK;
 }
 
@@ -477,10 +571,20 @@ fn ts_acquire13(s: i64, usage: i64, flags: i64, cert_slot: i64, disabled: i64) -
     ts_set32(cred + 56, 1);
     ts_set(cred + 64, params);
     val expiry: i64 = ts_zeroed(1);
-    val rc: i64 = sc_acquire(0, TS_PACKAGE, usage, 0, cred, 0, 0, s + TS_CRED * 8, expiry);
-    p_free(cred);
-    p_free(params);
-    p_free(expiry);
+    var rc: i64 = 0;
+    // SAFETY: cred is a 72-byte SCH_CREDENTIALS (ts_zeroed(9)) pointing to
+    // one 40-byte TLS_PARAMETERS (params, ts_zeroed(5)); the handle and
+    // expiry outputs as in ts_acquire.
+    unsafe {
+        rc = sc_acquire(0, TS_PACKAGE, usage, 0, cred, 0, 0, s + TS_CRED * 8, expiry);
+    }
+    // SAFETY: the three ts_zeroed blocks above; Schannel keeps no pointer to
+    // them once AcquireCredentialsHandle has returned.
+    unsafe {
+        p_free(cred);
+        p_free(params);
+        p_free(expiry);
+    }
     return rc == TS_OK;
 }
 
@@ -514,10 +618,19 @@ fn ts_client_alpn(fd: i64, host: str, flags: i64, protos: str) -> i64 {
     val ok: bool = ts_handshake(s, host, false);
     ts_put(s, TS_ALPN, 0);
     if alpn != 0 {
-        p_free(alpn);
+        // SAFETY: the ts_alpn_block made above; the handshake that borrowed
+        // it is over and TS_ALPN was just cleared.
+        unsafe {
+            p_free(alpn);
+        }
     }
     if !ok {
-        sc_free_cred(s + TS_CRED * 8);
+        // SAFETY: the credentials handle ts_acquire_any wrote at s + 24,
+        // owned by this session (TS_OWNS_CRED), freed once: the session is
+        // freed next.
+        unsafe {
+            sc_free_cred(s + TS_CRED * 8);
+        }
         ts_free_session(s);
         return 0;
     }
@@ -533,7 +646,11 @@ fn ts_client13(fd: i64, host: str, flags: i64) -> i64 {
     ts_put(s, TS_OWNS_CRED, 1);
     ts_put(s, TS_HOST, ts_text_block(host));
     if !ts_handshake(s, host, false) {
-        sc_free_cred(s + TS_CRED * 8);
+        // SAFETY: the credentials handle ts_acquire13 wrote at s + 24, owned
+        // by this session, freed once: the session is freed next.
+        unsafe {
+            sc_free_cred(s + TS_CRED * 8);
+        }
         ts_free_session(s);
         return 0;
     }
@@ -652,20 +769,33 @@ pub fn tls_connect_alpn_unchecked(host: str, port: i64, protos: str) -> i64 {
 // (the first word is the one-element paCred array) and the store it came
 // from (ts_free_slot frees both). 0 on failure.
 fn ts_server_slot(pfx_path: str, password: str) -> i64 {
-    val file: *u8 = ts_fopen(pfx_path, "rb");
+    var file: *u8 = 0 as * u8;
+    // SAFETY: fopen reads two NUL-terminated strs (the path and "rb");
+    // the FILE it returns is closed below, a null one is checked next.
+    unsafe {
+        file = ts_fopen(pfx_path, "rb");
+    }
     if file as i64 == 0 {
         return 0;
     }
     val cap: i64 = 1048576;
-    val data: i64 = p_malloc(cap);
-    val size: i64 = ts_fread(data as * u8, 1, cap, file);
-    ts_fclose(file);
+    var data: i64 = 0;
+    var size: i64 = 0;
+    // SAFETY: data is a fresh cap-byte block, freed below once
+    // PFXImportCertStore has copied what it needs; fread writes at most
+    // 1 * cap bytes into it from the open FILE, which fclose then closes
+    // (not used afterwards).
+    unsafe {
+        data = p_malloc(cap);
+        size = ts_fread(data as * u8, 1, cap, file);
+        ts_fclose(file);
+    }
     // The password as UTF-16
     val n: i64 = str_len(password);
     val wide: i64 = ts_zeroed(n + 1);
     var i: i64 = 0;
     while i < n {
-        var p: *mut u16 = wide + i * 2;
+        var p: *mut u16 = (wide + i * 2) as *mut u16;
         // SAFETY: i < n and wide = ts_zeroed(n + 1) holds 8 * (n + 1) bytes:
         // the u16 at byte i * 2 is inside, and the rest stays zero (the NUL).
         unsafe {
@@ -679,17 +809,38 @@ fn ts_server_slot(pfx_path: str, password: str) -> i64 {
     // The key goes to the user's key store: Schannel cannot use one held only
     // in memory (PKCS12_NO_PERSIST_KEY gives SEC_E_NO_CREDENTIALS). It goes
     // to a CNG provider (TS_PFX_CNG), and tls_server_close deletes it.
-    val store: *u8 = sc_pfx_import(blob as * u8, wide as * u8, TS_PFX_CNG);
-    p_free(blob);
-    p_free(wide);
-    p_free(data);
+    var store: *u8 = 0 as * u8;
+    // SAFETY: blob is a CRYPT_DATA_BLOB (cbData = the size bytes fread
+    // wrote, pbData = data) and wide the NUL-terminated UTF-16 password
+    // (n + 1 zeroed words hold n u16 and the NUL); PFXImportCertStore only
+    // reads them and copies what it keeps into the store it returns.
+    unsafe {
+        store = sc_pfx_import(blob as * u8, wide as * u8, TS_PFX_CNG);
+    }
+    // SAFETY: the three blocks allocated above (ts_zeroed, ts_zeroed,
+    // p_malloc), not used after the import.
+    unsafe {
+        p_free(blob);
+        p_free(wide);
+        p_free(data);
+    }
     if store as i64 == 0 {
         return 0;
     }
     // X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, CERT_FIND_ANY
-    val cert: i64 = sc_find_cert(store, 65537, 0, 0, 0 as * u8, 0 as * u8) as i64;
+    var cert: i64 = 0;
+    // SAFETY: store is the non-null store PFXImportCertStore returned; no
+    // search parameter and no previous certificate (both null), as
+    // CERT_FIND_ANY allows.
+    unsafe {
+        cert = sc_find_cert(store, 65537, 0, 0, 0 as * u8, 0 as * u8) as i64;
+    }
     if cert == 0 {
-        sc_close_store(store, 0);
+        // SAFETY: the store opened by the import above, closed once and
+        // not used again (nothing was taken from it).
+        unsafe {
+            sc_close_store(store, 0);
+        }
         return 0;
     }
     val slot: i64 = ts_zeroed(2);
@@ -705,33 +856,82 @@ fn ts_server_slot(pfx_path: str, password: str) -> i64 {
 // False when there was none to delete or it could not be.
 fn ts_delete_key(cert: i64) -> bool {
     val size: i64 = ts_zeroed(1);
-    if sc_cert_prop(cert as * u8, TS_KEY_PROV_INFO, 0 as * u8, size as * u8) == 0 {
-        p_free(size);
+    var have_info: i64 = 0;
+    // SAFETY: cert is the certificate context of a ts_server_slot, not yet
+    // freed (ts_free_slot frees it after this); with a null data pointer
+    // CertGetCertificateContextProperty only writes the needed size into
+    // the DWORD at size (a one-word block).
+    unsafe {
+        have_info = sc_cert_prop(cert as * u8, TS_KEY_PROV_INFO, 0 as * u8, size as * u8);
+    }
+    if have_info == 0 {
+        // SAFETY: the ts_zeroed block above, not used again.
+        unsafe {
+            p_free(size);
+        }
         return false;
     }
     val n: i64 = ts_get32(size);
     val info: i64 = ts_zeroed(n / 8 + 2);
     var deleted: bool = false;
-    if n >= 24 && sc_cert_prop(cert as * u8, TS_KEY_PROV_INFO, info as * u8, size as * u8) != 0 && ts_get32(info + 16) == 0 {
+    var got_info: bool = false;
+    if n >= 24 {
+        // SAFETY: info holds 8 * (n / 8 + 2) >= n bytes, the size the first
+        // call asked for and the one passed in the DWORD at size; the
+        // property is copied into it.
+        unsafe {
+            got_info = sc_cert_prop(cert as * u8, TS_KEY_PROV_INFO, info as * u8, size as * u8) != 0;
+        }
+    }
+    if got_info && ts_get32(info + 16) == 0 {
         val prov: i64 = ts_zeroed(1);
         val key: i64 = ts_zeroed(1);
-        if nc_open_provider(prov as * u8, ts_get(info + 8) as * u8, 0) == 0 {
+        var opened: i64 = 0;
+        // SAFETY: prov is a one-word out-slot for the provider handle; the
+        // name is the NUL-terminated UTF-16 pwszProvName inside info (alive
+        // until info is freed below).
+        unsafe {
+            opened = nc_open_provider(prov as * u8, ts_get(info + 8) as * u8, 0);
+        }
+        if opened == 0 {
             val flags: i64 = ts_get32(info + 20) & TS_MACHINE_KEY;
-            if nc_open_key(ts_get(prov), key as * u8, ts_get(info) as * u8, 0, flags) == 0 {
+            var key_rc: i64 = 0;
+            // SAFETY: the provider handle just opened; key is a one-word
+            // out-slot; the container name is the NUL-terminated UTF-16
+            // pwszContainerName inside info.
+            unsafe {
+                key_rc = nc_open_key(ts_get(prov), key as * u8, ts_get(info) as * u8, 0, flags);
+            }
+            if key_rc == 0 {
                 // NCryptDeleteKey frees the key handle when it succeeds
-                if nc_delete_key(ts_get(key), 0) == 0 {
-                    deleted = true;
-                } else {
-                    nc_free_object(ts_get(key));
+                // SAFETY: the key handle NCryptOpenKey just returned: freed
+                // by NCryptDeleteKey on success, else by NCryptFreeObject,
+                // never both, and not used afterwards.
+                unsafe {
+                    if nc_delete_key(ts_get(key), 0) == 0 {
+                        deleted = true;
+                    } else {
+                        nc_free_object(ts_get(key));
+                    }
                 }
             }
-            nc_free_object(ts_get(prov));
+            // SAFETY: the provider handle opened above, freed once.
+            unsafe {
+                nc_free_object(ts_get(prov));
+            }
         }
-        p_free(prov);
-        p_free(key);
+        // SAFETY: the two ts_zeroed out-slots above, not used again.
+        unsafe {
+            p_free(prov);
+            p_free(key);
+        }
     }
-    p_free(info);
-    p_free(size);
+    // SAFETY: the two ts_zeroed blocks of this function; the names inside
+    // info were last read by the NCrypt calls above.
+    unsafe {
+        p_free(info);
+        p_free(size);
+    }
     return deleted;
 }
 
@@ -743,13 +943,27 @@ fn ts_free_slot(slot: i64) {
     val cert: i64 = ts_get(slot);
     if cert != 0 {
         ts_delete_key(cert);
-        sc_free_cert(cert as * u8);
+        // SAFETY: the certificate context CertFindCertificateInStore gave
+        // ts_server_slot, freed once here; the credentials that referenced
+        // it were freed first (tls_server_close) or never made (tls_server
+        // failing).
+        unsafe {
+            sc_free_cert(cert as * u8);
+        }
     }
     val store: i64 = ts_get(slot + 8);
     if store != 0 {
-        sc_close_store(store as * u8, 0);
+        // SAFETY: the store PFXImportCertStore opened for this slot, closed
+        // once, after its certificate was freed above.
+        unsafe {
+            sc_close_store(store as * u8, 0);
+        }
     }
-    p_free(slot);
+    // SAFETY: the slot's ts_zeroed block; its owner (the server block or
+    // the failing tls_server) drops it with this call.
+    unsafe {
+        p_free(slot);
+    }
 }
 
 /// Server credentials from a PKCS#12 file. Returns 0 on failure.
@@ -761,7 +975,11 @@ pub fn tls_server(pfx_path: str, password: str) -> i64 {
     val creds: i64 = ts_zeroed(TS_SERVER_WORDS);
     if !ts_acquire_any(creds - TS_CRED * 8, 1, 0, slot) {
         ts_free_slot(slot);
-        p_free(creds);
+        // SAFETY: the ts_zeroed block above; no credentials were acquired
+        // into it and it is not returned.
+        unsafe {
+            p_free(creds);
+        }
         return 0;
     }
     ts_set(creds + 24, slot);
@@ -779,7 +997,11 @@ pub fn tls_server13(pfx_path: str, password: str) -> i64 {
     val creds: i64 = ts_zeroed(TS_SERVER_WORDS);
     if !ts_acquire13(creds - TS_CRED * 8, 1, 0, slot, TS_ALL_BUT_TLS13) {
         ts_free_slot(slot);
-        p_free(creds);
+        // SAFETY: the ts_zeroed block above; no credentials were acquired
+        // into it and it is not returned.
+        unsafe {
+            p_free(creds);
+        }
         return 0;
     }
     ts_set(creds + 24, slot);
@@ -796,13 +1018,25 @@ pub fn tls_server_close(server: i64) -> i64 {
     if server == 0 {
         return 0;
     }
-    sc_free_cred(server);
+    // SAFETY: server is a tls_server/tls_server13 block, whose word 0-1 is
+    // the credentials handle acquired there; freed once (the caller closes
+    // a server once, when no handshake is using it).
+    unsafe {
+        sc_free_cred(server);
+    }
     val alpn: i64 = ts_get(server + 16);
     if alpn != 0 {
-        p_free(alpn);
+        // SAFETY: the ts_alpn_block tls_server_alpn stored; only handshakes
+        // borrow it, and none is running (the contract above).
+        unsafe {
+            p_free(alpn);
+        }
     }
     ts_free_slot(ts_get(server + 24));
-    p_free(server);
+    // SAFETY: the ts_zeroed block of tls_server, dropped by this call.
+    unsafe {
+        p_free(server);
+    }
     return 0;
 }
 
@@ -869,7 +1103,13 @@ fn ts_query_alpn(s: i64) -> str {
     // ProtoNegoExt (u32) at 4, ProtocolIdSize (u8) at 8, ProtocolId at 9
     // (up to 255 bytes): 264 bytes
     val info: i64 = ts_zeroed(33);
-    val rc: i64 = sc_query(s + TS_CTX * 8, TS_ATTR_ALPN, info);
+    var rc: i64 = 0;
+    // SAFETY: the session's context handle (non-zero, checked above);
+    // SECPKG_ATTR_APPLICATION_PROTOCOL writes a 264-byte
+    // SecPkgContext_ApplicationProtocol into info, 33 words = 264 bytes.
+    unsafe {
+        rc = sc_query(s + TS_CTX * 8, TS_ATTR_ALPN, info);
+    }
     var out: str = "";
     if rc == TS_OK && ts_get32(info) == TS_ALPN_OK {
         val n: i64 = p_volatile_load8(info + 8);
@@ -881,7 +1121,10 @@ fn ts_query_alpn(s: i64) -> str {
         }
         out = str_from_bytes(b);
     }
-    p_free(info);
+    // SAFETY: the ts_zeroed block above; its bytes were copied into out.
+    unsafe {
+        p_free(info);
+    }
     return out;
 }
 
@@ -897,13 +1140,25 @@ pub fn tls_session_protocol(s: i64) -> i64 {
         return -1;
     }
     val info: i64 = ts_zeroed(4);
-    val rc: i64 = sc_query(s + TS_CTX * 8, 90, info);
+    var rc: i64 = 0;
+    // SAFETY: the session's context handle (non-zero, checked above);
+    // SECPKG_ATTR_CONNECTION_INFO (90) writes a SecPkgContext_ConnectionInfo
+    // (7 u32, 28 bytes) into info, 32 bytes.
+    unsafe {
+        rc = sc_query(s + TS_CTX * 8, 90, info);
+    }
     if rc != 0 {
-        p_free(info);
+        // SAFETY: the ts_zeroed block above, not used again.
+        unsafe {
+            p_free(info);
+        }
         return -1;
     }
     val proto: i64 = ts_get32(info);
-    p_free(info);
+    // SAFETY: the ts_zeroed block above, read for the last time.
+    unsafe {
+        p_free(info);
+    }
     return proto;
 }
 
@@ -935,7 +1190,13 @@ pub fn tls_session_send(s: i64, addr: i64, n: i64) -> i64 {
     val most: i64 = ts_field(s, TS_MAX);
     val buffers: i64 = ts_zeroed(8);
     val desc: i64 = ts_desc(buffers, 4);
-    val msg: i64 = p_malloc(header + most + trailer);
+    var msg: i64 = 0;
+    // SAFETY: a fresh block for one TLS record: header, at most `most`
+    // (TS_MAX) data bytes and the trailer, the sizes ts_stream_sizes read;
+    // freed below.
+    unsafe {
+        msg = p_malloc(header + most + trailer);
+    }
     var sent: i64 = 0;
     while sent < n {
         var part: i64 = n - sent;
@@ -947,7 +1208,15 @@ pub fn tls_session_send(s: i64, addr: i64, n: i64) -> i64 {
         ts_buffer(buffers, 1, TB_DATA, msg + header, part);
         ts_buffer(buffers, 2, TB_TRAILER, msg + header + part, trailer);
         ts_buffer(buffers, 3, TB_EMPTY, 0, 0);
-        if sc_encrypt(s + TS_CTX * 8, 0, desc, 0) != TS_OK {
+        var enc_rc: i64 = 0;
+        // SAFETY: the session's context handle; desc describes the 4
+        // SecBuffers in buffers (8 words), which cover msg exactly: the
+        // header, the `part` <= TS_MAX data bytes and the trailer, so
+        // EncryptMessage encrypts in place inside msg.
+        unsafe {
+            enc_rc = sc_encrypt(s + TS_CTX * 8, 0, desc, 0);
+        }
+        if enc_rc != TS_OK {
             sent = -1;
             break;
         }
@@ -958,9 +1227,13 @@ pub fn tls_session_send(s: i64, addr: i64, n: i64) -> i64 {
         }
         sent = sent + part;
     }
-    p_free(msg);
-    p_free(desc);
-    p_free(buffers);
+    // SAFETY: the record block and the two ts_zeroed/ts_desc blocks of this
+    // function; the loop is over and nothing else points to them.
+    unsafe {
+        p_free(msg);
+        p_free(desc);
+        p_free(buffers);
+    }
     return sent;
 }
 
@@ -1014,7 +1287,14 @@ fn ts_decrypt(s: i64, buf: i64, plain: i64, have: i64) -> i64 {
     ts_buffer(buffers, 1, TB_EMPTY, 0, 0);
     ts_buffer(buffers, 2, TB_EMPTY, 0, 0);
     ts_buffer(buffers, 3, TB_EMPTY, 0, 0);
-    val rc: i64 = sc_decrypt(s + TS_CTX * 8, desc, 0, 0);
+    var rc: i64 = 0;
+    // SAFETY: the session's context handle; desc describes the 4 SecBuffers
+    // in buffers (8 words), the data one over the `have` received bytes of
+    // the session's input buffer: DecryptMessage decrypts in place there
+    // and points the output buffers into that same range.
+    unsafe {
+        rc = sc_decrypt(s + TS_CTX * 8, desc, 0, 0);
+    }
     var result: i64 = -1;
     if rc == TS_INCOMPLETE {
         result = 1;
@@ -1070,8 +1350,12 @@ fn ts_decrypt(s: i64, buf: i64, plain: i64, have: i64) -> i64 {
         ts_put(s, TS_POST, 1);
         result = ts_post_handshake(s, buf, extra);
     }
-    p_free(desc);
-    p_free(buffers);
+    // SAFETY: the ts_zeroed/ts_desc blocks of this function; the bytes the
+    // buffers pointed to were copied out above.
+    unsafe {
+        p_free(desc);
+        p_free(buffers);
+    }
     return result;
 }
 
@@ -1099,9 +1383,21 @@ fn ts_post_handshake(s: i64, buf: i64, have: i64) -> i64 {
     ts_buffer(output, 0, TB_TOKEN, 0, 0);
     var rc: i64 = 0;
     if ts_field(s, TS_SIDE) != 0 {
-        rc = sc_accept(cred, ctx, in_desc, 65820, 0, ctx, out_desc, attrs, expiry);
+        // SAFETY: the session's credentials handle (borrowed from its
+        // server, which must not be closed while sessions run) and its
+        // established context; in_desc describes 2 SecBuffers in input
+        // (4 words), the token one over the `have` bytes at buf; out_desc
+        // 1 buffer Schannel allocates (freed below); attrs and expiry are
+        // one-word blocks.
+        unsafe {
+            rc = sc_accept(cred, ctx, in_desc, 65820, 0, ctx, out_desc, attrs, expiry);
+        }
     } else {
-        rc = sc_init(cred, ctx, ts_block_text(ts_field(s, TS_HOST)), 33052, 0, 0, in_desc, 0, ctx, out_desc, attrs, expiry);
+        // SAFETY: as sc_accept above, with the client's own credentials and
+        // the host name kept in TS_HOST, as a NUL-terminated str.
+        unsafe {
+            rc = sc_init(cred, ctx, ts_block_text(ts_field(s, TS_HOST)), 33052, 0, 0, in_desc, 0, ctx, out_desc, attrs, expiry);
+        }
     }
     var result: i64 = 1;
     val out_size: i64 = ts_buffer_size(output, 0);
@@ -1110,7 +1406,11 @@ fn ts_post_handshake(s: i64, buf: i64, have: i64) -> i64 {
         if out_size > 0 && p_co_send(ts_field(s, TS_FD), out_addr, out_size) != out_size {
             result = -1;
         }
-        sc_free_buffer(out_addr);
+        // SAFETY: the output token Schannel allocated in the call above,
+        // sent and not used again.
+        unsafe {
+            sc_free_buffer(out_addr);
+        }
     }
     if rc == TS_OK || rc == TS_CONTINUE {
         var extra: i64 = 0;
@@ -1132,21 +1432,31 @@ fn ts_post_handshake(s: i64, buf: i64, have: i64) -> i64 {
     } else if rc != TS_INCOMPLETE {
         result = -1;
     }
-    p_free(attrs);
-    p_free(expiry);
-    p_free(input);
-    p_free(output);
-    p_free(in_desc);
-    p_free(out_desc);
+    // SAFETY: the six ts_zeroed/ts_desc blocks of this function; Schannel
+    // keeps no pointer to them once the call has returned.
+    unsafe {
+        p_free(attrs);
+        p_free(expiry);
+        p_free(input);
+        p_free(output);
+        p_free(in_desc);
+        p_free(out_desc);
+    }
     return result;
 }
 
 /// End the session and free it. The socket stays open: closing it is the
 /// caller's.
 pub fn tls_session_close(s: i64) -> i64 {
-    sc_delete(s + TS_CTX * 8);
-    if ts_field(s, TS_OWNS_CRED) != 0 {
-        sc_free_cred(s + TS_CRED * 8);
+    // SAFETY: s is a session tls_connect/tls_accept returned (only
+    // successful handshakes return one), so its context handle at s + 8 is
+    // valid; it is deleted once, and the credentials only when the session
+    // acquired them itself (TS_OWNS_CRED; a server's are its server's).
+    unsafe {
+        sc_delete(s + TS_CTX * 8);
+        if ts_field(s, TS_OWNS_CRED) != 0 {
+            sc_free_cred(s + TS_CRED * 8);
+        }
     }
     ts_free_session(s);
     return 0;

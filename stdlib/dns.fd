@@ -355,25 +355,49 @@ pub fn dns_query_records(hostname: str, qtype: i64, server: str, port: i64, time
     var addr: NetAddr = net_addr_create(server, port);
     var pkt: Vec = dns_build_query(hostname, qtype);
     var n: i64 = pkt.len();
-    var buf: i64 = p_malloc(n);
+    var buf: i64 = 0;
+    // SAFETY: a fresh n-byte block: the loop below writes the n bytes of
+    // the query into it.
+    unsafe {
+        buf = p_malloc(n);
+    }
     var i: i64 = 0;
     while i < n {
         p_volatile_store8(buf + i, pkt.get(i));
         i = i + 1;
     }
-    var sent: i64 = net_send_to(sock, buf, n, &addr);
+    var sent: i64 = 0;
+    // SAFETY: net_send_to's promise holds: buf holds the n readable bytes
+    // just written, owned here until the p_free below.
+    unsafe {
+        sent = net_send_to(sock, buf, n, &addr);
+    }
     if sent < 0 {
         net_close(sock);
-        p_free(buf);
+        // SAFETY: the query block above; the send has returned.
+        unsafe {
+            p_free(buf);
+        }
         return out;
     }
-    var rbuf: i64 = p_malloc(4096);
-    var got: i64 = net_recv_from(sock, rbuf, 4096, &mut addr);
+    var rbuf: i64 = 0;
+    var got: i64 = 0;
+    // SAFETY: rbuf is a fresh 4096-byte block, so net_recv_from's promise
+    // holds: it writes at most the 4096 bytes it is told.
+    unsafe {
+        rbuf = p_malloc(4096);
+        got = net_recv_from(sock, rbuf, 4096, &mut addr);
+    }
     if got > 0 {
         out = dns_parse_records(rbuf, got);
     }
-    p_free(rbuf);
-    p_free(buf);
+    // SAFETY: the reply and query blocks of this function; the records
+    // parsed from the reply are copies (DnsRecord values), so nothing
+    // points into either block afterwards.
+    unsafe {
+        p_free(rbuf);
+        p_free(buf);
+    }
     net_close(sock);
     return out;
 }

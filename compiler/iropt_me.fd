@@ -873,7 +873,30 @@ fn ime_inline_site(f: &mut IrFunction, g: &IrFunction, bi: i64, k: i64, call_id:
     while p < g.params.len() && p < args.len() {
         var pid: i64 = g.params.get(p).id;
         if pid >= 0 && pid < vm.len() {
-            vm.set(pid, args.get(p) + 1);
+            // BG43 (as iropt.fd's inliner): an integer argument of another
+            // type of the same width (an i64 literal for a u64 parameter)
+            // goes through a BitCast to the parameter's type, at the end of
+            // the call's block, so the body's unsigned compares, divisions
+            // and shifts stay unsigned
+            var arg: i64 = args.get(p);
+            var pty: IrType = g.params.get(p).ty;
+            var aty: IrType = pty;
+            match IrFunction_get_meta(f, arg) {
+                OptValueMeta::Some(am) => {
+                    aty = am.ty;
+                }
+                OptValueMeta::None => {
+                }
+            }
+            if ir_type_is_int(pty) && ir_type_is_int(aty) && !ir_type_eq(aty, pty) && ir_type_size(aty) == ir_type_size(pty) {
+                var bcid: i64 = ime_detached(f, Inst::BitCast(arg, aty, pty));
+                var hbc: BasicBlock = f.blocks.get(bi);
+                hbc.instructions.push(bcid);
+                f.blocks.set(bi, hbc);
+                vm.set(pid, bcid + 1);
+            } else {
+                vm.set(pid, arg + 1);
+            }
         }
         p = p + 1;
     }

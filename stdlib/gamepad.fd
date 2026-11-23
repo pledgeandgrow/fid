@@ -59,12 +59,25 @@ pub fn gp_sdl_poll(controller: i64) -> GpState {
     var s: GpState = gp_state_new();
     var b: i64 = 0;
     while b < GP_BUTTON_COUNT {
-        s.buttons.set(b, (gp_sdl_get_button(controller, b) as i64) != 0);
+        var pressed: u8 = 0;
+        // SAFETY: controller must be a handle from SDL_GameControllerOpen
+        // (gp_sdl_open), still open (SDL returns 0 for a null one); b is a
+        // button number below GP_BUTTON_COUNT, passed by value.
+        unsafe {
+            pressed = gp_sdl_get_button(controller, b);
+        }
+        s.buttons.set(b, (pressed as i64) != 0);
         b = b + 1;
     }
     var a: i64 = 0;
     while a < GP_AXIS_COUNT {
-        s.axes.set(a, gp_sdl_get_axis(controller, a) as i64);
+        var value: i16 = 0;
+        // SAFETY: controller as above; a is an axis number below
+        // GP_AXIS_COUNT, passed by value; SDL returns the axis as a value.
+        unsafe {
+            value = gp_sdl_get_axis(controller, a);
+        }
+        s.axes.set(a, value as i64);
         a = a + 1;
     }
     return s;
@@ -698,7 +711,14 @@ fn gp_motor(x: f64) -> i64 {
 
 /// Send the mix to a controller for the next `ms` milliseconds (SDL).
 pub fn gp_rumble_send(controller: i64, motors: &Vec<i64>, ms: i64) -> i64 {
-    return gp_sdl_rumble(controller, motors.get(0), motors.get(1), ms) as i64;
+    var r: i32 = 0;
+    // SAFETY: controller must be an open handle from gp_sdl_open (SDL
+    // reports a null one as an error, -1); the two motor strengths and the
+    // duration are values (Vec::get checks the indexes on our side).
+    unsafe {
+        r = gp_sdl_rumble(controller, motors.get(0), motors.get(1), ms);
+    }
+    return r as i64;
 }
 
 // ─── Hotplug ───────────────────────────────────────────────────────────────

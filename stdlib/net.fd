@@ -81,8 +81,14 @@ pub fn net_addr_create(ip_str: str, port: i64) -> NetAddr {
             ip: world_ip_value(ip_str), port: port, raw: 0,
         };
     }
+    var ip: i64 = 0;
+    // SAFETY: inet_addr only reads the NUL-terminated Fides string ip_str
+    // (held by the caller for the call) and returns an integer.
+    unsafe {
+        ip = pledge_net_inet_addr(ip_str);
+    }
     return NetAddr {
-        ip: pledge_net_inet_addr(ip_str), port: port, raw: 0,
+        ip: ip, port: port, raw: 0,
     };
 }
 
@@ -98,7 +104,11 @@ pub fn net_socket_create() -> i64 {
     if world_sockets_faked() {
         return world_sock_open(false);
     }
-    return pledge_net_socket(AF_INET, SOCK_DGRAM, 0);
+    // SAFETY: socket() takes three integers and returns a descriptor or
+    // -1; no memory of ours is read or written.
+    unsafe {
+        return pledge_net_socket(AF_INET, SOCK_DGRAM, 0);
+    }
 }
 
 /// Create a TCP socket. Returns socket file descriptor or -1 on error.
@@ -106,7 +116,11 @@ pub fn net_socket_create_tcp() -> i64 {
     if world_sockets_faked() {
         return world_sock_open(true);
     }
-    return pledge_net_socket(AF_INET, SOCK_STREAM, 0);
+    // SAFETY: socket() takes three integers and returns a descriptor or
+    // -1; no memory of ours is read or written.
+    unsafe {
+        return pledge_net_socket(AF_INET, SOCK_STREAM, 0);
+    }
 }
 
 /// Bind a socket to a port (for server use).
@@ -120,7 +134,12 @@ pub fn net_bind(sock: i64, port: i64) -> i64 {
         return world_sock_bind(sock, port);
     }
     val t0: i64 = trace_span_begin();
-    val r: i64 = pledge_net_bind(sock, port);
+    var r: i64 = 0;
+    // SAFETY: pledge_net_bind builds its sockaddr_in on its own stack from
+    // the integers sock and port; a bad descriptor only gives -1.
+    unsafe {
+        r = pledge_net_bind(sock, port);
+    }
     trace_span_end(t0, "net.bind", net_trace_detail(sock, port), r == 0);
     return r;
 }
@@ -132,12 +151,20 @@ fn net_trace_detail(sock: i64, n: i64) -> str {
 
 /// Set socket to non-blocking mode.
 pub fn net_set_nonblocking(sock: i64) -> i64 {
-    return pledge_net_set_nonblocking(sock);
+    // SAFETY: fcntl/ioctlsocket on the integer descriptor sock with the
+    // runtime's own flag word; a bad descriptor only gives -1.
+    unsafe {
+        return pledge_net_set_nonblocking(sock);
+    }
 }
 
 /// Set receive timeout in milliseconds.
 pub fn net_set_recv_timeout(sock: i64, timeout_ms: i64) -> i64 {
-    return pledge_net_set_recv_timeout(sock, timeout_ms);
+    // SAFETY: setsockopt with a timeval the runtime fills on its own stack
+    // from timeout_ms; a bad descriptor only gives -1.
+    unsafe {
+        return pledge_net_set_recv_timeout(sock, timeout_ms);
+    }
 }
 
 /// Enable address reuse (SO_REUSEADDR).
@@ -152,7 +179,12 @@ pub fn net_close(sock: i64) -> void {
         world_sock_close(sock);
         return;
     }
-    pledge_net_close(sock);
+    // SAFETY: close() takes the integer descriptor only; a bad one gives
+    // -1 (closing a descriptor still in use elsewhere is a logic error,
+    // not a memory one).
+    unsafe {
+        pledge_net_close(sock);
+    }
 }
 
 // ─── Send / Receive ──────────────────────────────────────────────────────
@@ -203,7 +235,12 @@ pub fn net_connect(sock: i64, addr: &NetAddr) -> i64 {
         trace_span_end(t0, "net.connect", net_trace_detail(sock, addr.port), fr == 0);
         return fr;
     }
-    val r: i64 = pledge_net_connect(sock, addr.ip, addr.port);
+    var r: i64 = 0;
+    // SAFETY: pledge_net_connect builds its sockaddr_in on its own stack
+    // from the integers addr.ip and addr.port; a bad descriptor gives -1.
+    unsafe {
+        r = pledge_net_connect(sock, addr.ip, addr.port);
+    }
     trace_span_end(t0, "net.connect", net_trace_detail(sock, addr.port), r == 0);
     return r;
 }
@@ -303,13 +340,17 @@ fn net_bytes_block(data: &Vec<i64>, n: i64) -> i64 {
     if n <= 0 {
         return 0;
     }
-    val buf: i64 = p_malloc(n);
+    var buf: i64 = 0;
+    // SAFETY: p_malloc only allocates the fresh n-byte block filled below.
+    unsafe {
+        buf = p_malloc(n);
+    }
     if buf == 0 {
         return 0;
     }
     var i: i64 = 0;
     while i < n {
-        var p: *mut u8 = buf + i;
+        var p: *mut u8 = (buf + i) as *mut u8;
         // SAFETY: i < n: inside the n bytes p_malloc just gave.
         unsafe {
             *p = (data.get(i) & 255) as u8;
@@ -328,7 +369,7 @@ fn net_block_bytes(buf: i64, n: i64, cap: i64) -> Vec<i64> {
     }
     var i: i64 = 0;
     while i < m {
-        var p: *mut u8 = buf + i;
+        var p: *mut u8 = (buf + i) as *mut u8;
         var b: i64 = 0;
         // SAFETY: i < m <= cap: inside the cap bytes the caller allocated.
         unsafe {
@@ -338,7 +379,12 @@ fn net_block_bytes(buf: i64, n: i64, cap: i64) -> Vec<i64> {
         i = i + 1;
     }
     if buf != 0 {
-        p_free(buf);
+        // SAFETY: buf is the p_malloc block net_recv_bytes(_from) made and
+        // handed over to this function; its bytes were copied into out
+        // above and the caller does not use it afterwards.
+        unsafe {
+            p_free(buf);
+        }
     }
     return out;
 }
@@ -349,7 +395,7 @@ fn net_peek_bytes(buf: i64, n: i64) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     var i: i64 = 0;
     while i < n {
-        var p: *mut u8 = buf + i;
+        var p: *mut u8 = (buf + i) as *mut u8;
         var b: i64 = 0;
         // SAFETY: i < n: inside the n bytes the caller of net_send or
         // net_send_to passed (the raw-buffer contract of those functions).
@@ -366,7 +412,7 @@ fn net_peek_bytes(buf: i64, n: i64) -> Vec<i64> {
 fn net_poke_bytes(buf: i64, data: &Vec<i64>) -> void {
     var i: i64 = 0;
     while i < data.len() {
-        var p: *mut u8 = buf + i;
+        var p: *mut u8 = (buf + i) as *mut u8;
         // SAFETY: data came from world_sock_recv(sock, len), so
         // data.len() <= len, the size of the buffer the caller passed.
         unsafe {
@@ -386,8 +432,14 @@ pub fn net_send_bytes(sock: i64, data: Vec<i64>) -> i64 {
     if buf == 0 {
         return -1;
     }
-    val r: i64 = net_send(sock, buf, n);
-    p_free(buf);
+    var r: i64 = 0;
+    // SAFETY: buf is the n-byte block net_bytes_block just filled (nonzero
+    // checked above), so net_send's contract holds: it reads n bytes we
+    // own. Then buf is freed and not used again.
+    unsafe {
+        r = net_send(sock, buf, n);
+        p_free(buf);
+    }
     return r;
 }
 
@@ -398,11 +450,20 @@ pub fn net_recv_bytes(sock: i64, max: i64) -> Vec<i64> {
     if max <= 0 {
         return none;
     }
-    val buf: i64 = p_malloc(max);
+    var buf: i64 = 0;
+    // SAFETY: p_malloc only allocates a fresh max-byte block.
+    unsafe {
+        buf = p_malloc(max);
+    }
     if buf == 0 {
         return none;
     }
-    val r: i64 = net_recv(sock, buf, max);
+    var r: i64 = 0;
+    // SAFETY: buf holds max bytes this function owns (nonzero checked), so
+    // net_recv's contract holds: it writes at most max bytes into buf.
+    unsafe {
+        r = net_recv(sock, buf, max);
+    }
     return net_block_bytes(buf, r, max);
 }
 
@@ -416,8 +477,14 @@ pub fn net_send_bytes_to(sock: i64, data: Vec<i64>, addr: &NetAddr) -> i64 {
     if buf == 0 {
         return -1;
     }
-    val r: i64 = net_send_to(sock, buf, n, addr);
-    p_free(buf);
+    var r: i64 = 0;
+    // SAFETY: buf is the n-byte block net_bytes_block just filled (nonzero
+    // checked above), so net_send_to's contract holds: it reads n bytes we
+    // own. Then buf is freed and not used again.
+    unsafe {
+        r = net_send_to(sock, buf, n, addr);
+        p_free(buf);
+    }
     return r;
 }
 
@@ -428,11 +495,21 @@ pub fn net_recv_bytes_from(sock: i64, max: i64, from_addr: &mut NetAddr) -> Vec<
     if max <= 0 {
         return none;
     }
-    val buf: i64 = p_malloc(max);
+    var buf: i64 = 0;
+    // SAFETY: p_malloc only allocates a fresh max-byte block.
+    unsafe {
+        buf = p_malloc(max);
+    }
     if buf == 0 {
         return none;
     }
-    val r: i64 = net_recv_from(sock, buf, max, from_addr);
+    var r: i64 = 0;
+    // SAFETY: buf holds max bytes this function owns (nonzero checked), so
+    // net_recv_from's contract holds: it writes at most max bytes into buf
+    // and the sender's address into *from_addr, a NetAddr we borrow.
+    unsafe {
+        r = net_recv_from(sock, buf, max, from_addr);
+    }
     return net_block_bytes(buf, r, max);
 }
 
@@ -623,14 +700,27 @@ fn net_reliable_transmit(conn: &mut ReliableConnection, packet: Vec<i64>) -> i64
         return n;
     }
     // The socket call takes the bytes at an address, not a Vec
-    val buf: i64 = p_malloc(n + 1);
+    var buf: i64 = 0;
+    // SAFETY: p_malloc only allocates a fresh (n + 1)-byte block.
+    unsafe {
+        buf = p_malloc(n + 1);
+    }
+    if buf == 0 {
+        return -1;
+    }
     var i: i64 = 0;
     while i < n {
         p_volatile_store8(buf + i, packet.get(i));
         i = i + 1;
     }
-    val sent: i64 = net_send_to(conn.sock, buf, n, &conn.remote);
-    p_free(buf);
+    var sent: i64 = 0;
+    // SAFETY: buf holds the n + 1 bytes allocated above (nonzero checked),
+    // its first n written with the packet, so net_send_to reads only bytes
+    // we own; buf is freed right after and not used again.
+    unsafe {
+        sent = net_send_to(conn.sock, buf, n, &conn.remote);
+        p_free(buf);
+    }
     return sent;
 }
 

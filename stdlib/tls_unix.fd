@@ -57,7 +57,12 @@ extern "C" link "ssl" {
 // SSL_CTRL_SET_MIN_PROTO_VERSION = 123, version, NULL); TLS1_3_VERSION is
 // 0x0304. True when the context took it.
 fn ts_min_tls13(ctx: i64) -> bool {
-    return ssl_ctx_ctrl(ctx, 123, 772, 0) == 1;
+    // SAFETY: ctx is a non-null SSL_CTX this module made (callers check);
+    // SSL_CTRL_SET_MIN_PROTO_VERSION only sets a field and reads no pointer
+    // (parg is NULL).
+    unsafe {
+        return ssl_ctx_ctrl(ctx, 123, 772, 0) == 1;
+    }
 }
 
 const TS_WANT_READ: i64 = 2;
@@ -68,7 +73,7 @@ const TS_TIMEOUT: i64 = 30000;
 const TS_SSL: i64 = 0;
 const TS_FD: i64 = 1;
 fn ts_get(p: i64) -> i64 {
-    var a: *mut i64 = p;
+    var a: *mut i64 = p as *mut i64;
     var v: i64 = 0;
     // SAFETY: private helper; callers pass a word of a 2-word session block
     // ts_session allocated. The public tls_session_* functions take the
@@ -81,7 +86,7 @@ fn ts_get(p: i64) -> i64 {
 }
 
 fn ts_set(p: i64, v: i64) {
-    var a: *mut i64 = p;
+    var a: *mut i64 = p as *mut i64;
     // SAFETY: private helper; as ts_get, a word of a session block this
     // module allocated.
     unsafe {
@@ -90,7 +95,12 @@ fn ts_set(p: i64, v: i64) {
 }
 
 fn ts_session(ssl: i64, fd: i64) -> i64 {
-    val s: i64 = p_malloc(16);
+    var s: i64 = 0;
+    // SAFETY: a fresh 16-byte block, the session's two words (written
+    // next); freed by tls_session_close or the failing handshake.
+    unsafe {
+        s = p_malloc(16);
+    }
     ts_set(s, ssl);
     ts_set(s + 8, fd);
     return s;
@@ -98,7 +108,12 @@ fn ts_session(ssl: i64, fd: i64) -> i64 {
 
 // Bytes (0..255 each) in a block of their own, for C.
 fn ts_bytes_block(b: Vec<i64>) -> i64 {
-    val block: i64 = p_malloc(b.len() + 8);
+    var block: i64 = 0;
+    // SAFETY: a fresh block of b.len() + 8 bytes: the loop below writes
+    // b.len() bytes into it; the caller owns it and frees it.
+    unsafe {
+        block = p_malloc(b.len() + 8);
+    }
     var i: i64 = 0;
     while i < b.len() {
         p_volatile_store8(block + i, b.get(i));
@@ -156,14 +171,26 @@ pub fn tls_server_alpn(server: i64, protos: str) -> bool {
         return false;
     }
     // [length word][bytes]; it lives as long as the server
-    val block: i64 = p_malloc(wire.len() + 16);
+    var block: i64 = 0;
+    // SAFETY: a fresh block of wire.len() + 16 bytes: the length word and
+    // wire.len() bytes written below fit (8 + wire.len()).
+    unsafe {
+        block = p_malloc(wire.len() + 16);
+    }
     ts_set(block, wire.len());
     var i: i64 = 0;
     while i < wire.len() {
         p_volatile_store8(block + 8 + i, wire.get(i));
         i = i + 1;
     }
-    ssl_ctx_set_alpn_select_cb(server, ts_alpn_select, block);
+    // SAFETY: server is the SSL_CTX of tls_server; ts_alpn_select has the
+    // C callback's six parameters, and block, its argument, stays allocated
+    // until tls_server_close has cleared the argument (or a later call here
+    // has replaced it: the new callback argument is set before
+    // ts_note_alpn_block frees the old block).
+    unsafe {
+        ssl_ctx_set_alpn_select_cb(server, ts_alpn_select, block);
+    }
     // tls_server_close frees it (a second call replaces the first block)
     ts_note_alpn_block(server, block);
     return true;
@@ -183,7 +210,13 @@ fn ts_drop_alpn_block(server: i64) {
     var i: i64 = 0;
     while i + 1 < ts_alpn_blocks.len() {
         if ts_alpn_blocks.get(i) == server {
-            p_free(ts_alpn_blocks.get(i + 1));
+            // SAFETY: the block tls_server_alpn allocated for this server;
+            // the server's select callback no longer has it as argument
+            // (replaced by a new block, or 0 in tls_server_close), and its
+            // pair is removed from the list just below.
+            unsafe {
+                p_free(ts_alpn_blocks.get(i + 1));
+            }
             // the last pair takes this one's place
             val last: i64 = ts_alpn_blocks.len() - 2;
             ts_alpn_blocks.set(i, ts_alpn_blocks.get(last));
@@ -204,9 +237,17 @@ pub fn tls_server_close(server: i64) -> i64 {
         return 0;
     }
     // no select callback may run after its block is freed
-    ssl_ctx_set_alpn_select_cb(server, ts_alpn_select, 0);
+    // SAFETY: server is the SSL_CTX of tls_server, still alive here; the
+    // callback gets 0 as argument, which it answers with NOACK.
+    unsafe {
+        ssl_ctx_set_alpn_select_cb(server, ts_alpn_select, 0);
+    }
     ts_drop_alpn_block(server);
-    ssl_ctx_free(server);
+    // SAFETY: the caller's reference to the SSL_CTX, dropped once; OpenSSL
+    // counts the references of open sessions and frees it after the last.
+    unsafe {
+        ssl_ctx_free(server);
+    }
     return 0;
 }
 
@@ -222,13 +263,26 @@ pub fn tls_session_alpn(s: i64) -> str {
         return "";
     }
     // const unsigned char *data; unsigned int len
-    val slots: i64 = p_malloc(16);
+    var slots: i64 = 0;
+    // SAFETY: a fresh 16-byte block, the two out-slots below; freed after
+    // they are read.
+    unsafe {
+        slots = p_malloc(16);
+    }
     ts_set(slots, 0);
     ts_set(slots + 8, 0);
-    ssl_get0_alpn_selected(ts_get(s), slots, slots + 8);
+    // SAFETY: the session's SSL object; OpenSSL writes a pointer (8 bytes)
+    // at slots and an unsigned int (4 bytes) at slots + 8, both inside the
+    // 16-byte block.
+    unsafe {
+        ssl_get0_alpn_selected(ts_get(s), slots, slots + 8);
+    }
     val data: i64 = ts_get(slots);
     val n: i64 = ts_get(slots + 8) & 4294967295;
-    p_free(slots);
+    // SAFETY: the block above; both slots were just read.
+    unsafe {
+        p_free(slots);
+    }
     if data == 0 || n == 0 {
         return "";
     }
@@ -239,7 +293,12 @@ pub fn tls_session_alpn(s: i64) -> str {
 /// False if it failed.
 fn ts_wait(s: i64, rc: i64, timeout_ms: i64) -> bool {
     val fd: i64 = ts_get(s + 8);
-    val e: i64 = ssl_get_error(ts_get(s), rc);
+    var e: i64 = 0;
+    // SAFETY: the session's live SSL object and the result of the call made
+    // on it just before; SSL_get_error reads only that object's state.
+    unsafe {
+        e = ssl_get_error(ts_get(s), rc);
+    }
     if e == TS_WANT_READ {
         return p_co_wait_fd(fd, 0, timeout_ms) != 0;
     }
@@ -251,10 +310,16 @@ fn ts_wait(s: i64, rc: i64, timeout_ms: i64) -> bool {
 
 var ts_client_ctx: i64 = 0;
 fn ts_client_context(verify: i64) -> i64 {
-    val ctx: i64 = ssl_ctx_new(ssl_client_method());
-    if ctx != 0 {
-        ssl_ctx_default_paths(ctx);
-        ssl_ctx_set_verify(ctx, verify, 0);
+    var ctx: i64 = 0;
+    // SAFETY: TLS_client_method returns a static method table that
+    // SSL_CTX_new takes; the two setters run only on a non-null context and
+    // pass no pointer (no verify callback: 0).
+    unsafe {
+        ctx = ssl_ctx_new(ssl_client_method());
+        if ctx != 0 {
+            ssl_ctx_default_paths(ctx);
+            ssl_ctx_set_verify(ctx, verify, 0);
+        }
     }
     return ctx;
 }
@@ -275,37 +340,64 @@ fn ts_handshake_alpn(ctx: i64, fd: i64, host: str, server: bool, protos: str) ->
         p_signal_register(13);
         ts_sigpipe_noted = true;
     }
-    val ssl: i64 = ssl_new(ctx);
+    var ssl: i64 = 0;
+    // SAFETY: ctx is a context this module made (a client context or the
+    // server of tls_server), non-null at every call site; SSL_new returns
+    // a new object or NULL, checked next.
+    unsafe {
+        ssl = ssl_new(ctx);
+    }
     if ssl == 0 {
         return 0;
     }
-    ssl_set_fd(ssl, fd);
+    // SAFETY: the SSL object just made and the caller's connected socket;
+    // SSL_set_fd only records the descriptor.
+    unsafe {
+        ssl_set_fd(ssl, fd);
+    }
     if !server {
         // SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_host_name
-        ssl_ctrl(ssl, 55, 0, host);
-        ssl_set_host(ssl, host);
+        // SAFETY: host is a NUL-terminated str; OpenSSL copies it for SNI
+        // and for the name check.
+        unsafe {
+            ssl_ctrl(ssl, 55, 0, host);
+            ssl_set_host(ssl, host);
+        }
         val wire: Vec<i64> = tls_alpn_wire(protos);
         if wire.len() > 0 {
             val block: i64 = ts_bytes_block(wire);
             // OpenSSL keeps its own copy
-            ssl_set_alpn_protos(ssl, block, wire.len());
-            p_free(block);
+            // SAFETY: block holds wire.len() bytes (ts_bytes_block), the
+            // length passed; SSL_set_alpn_protos copies them, so the block
+            // is freed right after and not used again.
+            unsafe {
+                ssl_set_alpn_protos(ssl, block, wire.len());
+                p_free(block);
+            }
         }
     }
     val s: i64 = ts_session(ssl, fd);
     while true {
         var rc: i64 = 0;
-        if server {
-            rc = ssl_accept(ssl);
-        } else {
-            rc = ssl_connect(ssl);
+        // SAFETY: the SSL object made above, with its socket set; the
+        // handshake reads and writes only through it.
+        unsafe {
+            if server {
+                rc = ssl_accept(ssl);
+            } else {
+                rc = ssl_connect(ssl);
+            }
         }
         if rc == 1 {
             return s;
         }
         if !ts_wait(s, rc, TS_TIMEOUT) {
-            ssl_free(ssl);
-            p_free(s);
+            // SAFETY: the failed handshake's SSL object and the session
+            // block ts_session made for it, freed once: s is not returned.
+            unsafe {
+                ssl_free(ssl);
+                p_free(s);
+            }
             return 0;
         }
     }
@@ -450,7 +542,11 @@ pub fn tls_connect13_unchecked(host: str, port: i64) -> i64 {
         if made != 0 && ts_min_tls13(made) {
             ts_unchecked13_ctx = made;
         } else if made != 0 {
-            ssl_ctx_free(made);
+            // SAFETY: the context just made, refused by ts_min_tls13, freed
+            // once and not kept anywhere.
+            unsafe {
+                ssl_ctx_free(made);
+            }
         }
     }
     val ctx: i64 = ts_unchecked13_ctx;
@@ -473,7 +569,11 @@ pub fn tls_server13(cert_path: str, key_path: str) -> i64 {
         return 0;
     }
     if !ts_min_tls13(ctx) {
-        ssl_ctx_free(ctx);
+        // SAFETY: the context tls_server just made, not returned: freed
+        // once, nothing else holds it.
+        unsafe {
+            ssl_ctx_free(ctx);
+        }
         return 0;
     }
     return ctx;
@@ -485,7 +585,12 @@ pub fn tls_session_version(s: i64) -> i64 {
     if s == 0 {
         return -1;
     }
-    val v: i64 = ssl_version(ts_get(s));
+    var v: i64 = 0;
+    // SAFETY: the session's SSL object (s is non-zero); SSL_version only
+    // reads it.
+    unsafe {
+        v = ssl_version(ts_get(s));
+    }
     if v <= 0 {
         return -1;
     }
@@ -494,12 +599,27 @@ pub fn tls_session_version(s: i64) -> i64 {
 
 /// Server credentials from PEM files. Returns 0 on failure.
 pub fn tls_server(cert_path: str, key_path: str) -> i64 {
-    val ctx: i64 = ssl_ctx_new(ssl_server_method());
+    var ctx: i64 = 0;
+    // SAFETY: TLS_server_method returns a static method table that
+    // SSL_CTX_new takes; the result is checked next.
+    unsafe {
+        ctx = ssl_ctx_new(ssl_server_method());
+    }
     if ctx == 0 {
         return 0;
     }
-    if ssl_ctx_cert(ctx, cert_path) != 1 || ssl_ctx_key(ctx, key_path, 1) != 1 {
-        ssl_ctx_free(ctx);
+    var loaded: bool = false;
+    // SAFETY: the context just made; both paths are NUL-terminated strs
+    // that OpenSSL only reads (it opens the files itself); the key is
+    // loaded only when the certificate was (as the `||` did).
+    unsafe {
+        loaded = ssl_ctx_cert(ctx, cert_path) == 1 && ssl_ctx_key(ctx, key_path, 1) == 1;
+    }
+    if !loaded {
+        // SAFETY: the context made above, not returned: freed once.
+        unsafe {
+            ssl_ctx_free(ctx);
+        }
         return 0;
     }
     return ctx;
@@ -520,7 +640,13 @@ pub fn tls_session_fd(s: i64) -> i64 {
 pub fn tls_session_send(s: i64, addr: i64, n: i64) -> i64 {
     var sent: i64 = 0;
     while sent < n {
-        val rc: i64 = ssl_write(ts_get(s), addr + sent, n - sent);
+        var rc: i64 = 0;
+        // SAFETY: the session's SSL object; SSL_write reads n - sent bytes
+        // at addr + sent, inside the n bytes the caller gives at addr (the
+        // caller's contract).
+        unsafe {
+            rc = ssl_write(ts_get(s), addr + sent, n - sent);
+        }
         if rc > 0 {
             sent = sent + rc;
         } else if !ts_wait(s, rc, TS_TIMEOUT) {
@@ -534,11 +660,21 @@ pub fn tls_session_send(s: i64, addr: i64, n: i64) -> i64 {
 /// closed; below 0 on an error or a timeout.
 pub fn tls_session_recv(s: i64, addr: i64, n: i64, timeout_ms: i64) -> i64 {
     while true {
-        val rc: i64 = ssl_read(ts_get(s), addr, n);
+        var rc: i64 = 0;
+        var e: i64 = 0;
+        // SAFETY: the session's SSL object; SSL_read writes at most n bytes
+        // at addr, the buffer the caller gives (the caller's contract);
+        // SSL_get_error reads that object's state after the call.
+        unsafe {
+            rc = ssl_read(ts_get(s), addr, n);
+            if rc <= 0 {
+                e = ssl_get_error(ts_get(s), rc);
+            }
+        }
         if rc > 0 {
             return rc;
         }
-        if ssl_get_error(ts_get(s), rc) == TS_ZERO_RETURN {
+        if e == TS_ZERO_RETURN {
             return 0;
         }
         if !ts_wait(s, rc, timeout_ms) {
@@ -551,8 +687,13 @@ pub fn tls_session_recv(s: i64, addr: i64, n: i64, timeout_ms: i64) -> i64 {
 /// End the session and free it. The socket stays open: closing it is the
 /// caller's.
 pub fn tls_session_close(s: i64) -> i64 {
-    ssl_shutdown(ts_get(s));
-    ssl_free(ts_get(s));
-    p_free(s);
+    // SAFETY: s is a session ts_handshake_alpn returned: its word 0 is the
+    // SSL object, shut down and freed once, then the session block
+    // ts_session allocated; the caller drops its handle.
+    unsafe {
+        ssl_shutdown(ts_get(s));
+        ssl_free(ts_get(s));
+        p_free(s);
+    }
     return 0;
 }

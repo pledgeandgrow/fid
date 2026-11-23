@@ -292,9 +292,17 @@ fn cp_load_file(st: &mut CHeaderState, path0: str) {
         return;
     }
     st.included.push(path);
-    var src: str = p_file_read(path);
-    if (src as i64) == 0 {
-        return;
+    // read_file (an owned, counted string): p_file_read's raw word used as
+    // a str had no string header, and pe_ir's string check stopped
+    // `cparse_header_file` there (test_cparser_include on emit)
+    var src: str = "";
+    match read_file(path) {
+        Option::Some(t) => {
+            src = t;
+        }
+        Option::None => {
+            return;
+        }
     }
     var text: str = cp_strip(src);
     var dir: str = cp_dir_of(path);
@@ -347,6 +355,12 @@ fn cp_load_file(st: &mut CHeaderState, path0: str) {
 
 const CP_INCLUDE_MAX_DEPTH: i64 = 16;
 const CP_INCLUDE_MAX_FILES: i64 = 400;
+
+/// BG95: the host's C ABI is Windows' (decided as cp_predefine does): there
+/// wchar_t is 16 bits and long double is a double.
+fn cp_on_windows() -> bool {
+    return cp_env("OS") == "Windows_NT";
+}
 
 /// The value of the environment variable `name`, "" when it is not set.
 fn cp_env(name: str) -> str {
@@ -1598,7 +1612,13 @@ fn cp_base_of(st: &CHeaderState, a: i64, b: i64) -> str {
         return "llong";
     }
     if longs == 1 && word == "double" {
-        return "double";
+        // BG95: `long double` is a double only in Windows' ABI; on Linux
+        // and macOS (x86-64) it is wider than any Fides float, so a
+        // function that takes or gives one is left out (cp_resolve: "?")
+        if cp_on_windows() {
+            return "double";
+        }
+        return "ldouble";
     }
     if longs == 1 {
         if unsigned {
@@ -1665,8 +1685,16 @@ fn cp_builtin(name: str) -> str {
     if name == "uint8_t" {
         return "u8";
     }
-    if name == "uint16_t" || name == "wchar_t" {
+    if name == "uint16_t" {
         return "u16";
+    }
+    // BG95: wchar_t is 16 bits unsigned in Windows' ABI, a 32-bit int on
+    // Linux and macOS
+    if name == "wchar_t" {
+        if cp_on_windows() {
+            return "u16";
+        }
+        return "i32";
     }
     if name == "uint32_t" {
         return "u32";
@@ -2167,11 +2195,27 @@ fn cp_ex_primary(st: &mut CHeaderState, e: &mut CpExpr) -> i64 {
     var k: i64 = e.kinds.get(e.pos);
     if t == "(" {
         if cp_ex_is_cast(st, e) {
+            // BG72: the value is converted to the type cast to
+            // (`((uint32_t)-1)` is 4294967295, not -1); a pointer keeps it
+            var cw: Vec<str> = Vec::new();
+            var ck: Vec<i64> = Vec::new();
+            var stars: i64 = 0;
+            e.pos = e.pos + 1;
             while cp_ex_peek(e) != ")" {
+                if cp_ex_peek(e) == "*" {
+                    stars = stars + 1;
+                } else {
+                    cw.push(e.toks.get(e.pos));
+                    ck.push(e.kinds.get(e.pos));
+                }
                 e.pos = e.pos + 1;
             }
             e.pos = e.pos + 1;
-            return cp_ex_unary(st, e);
+            var operand: i64 = cp_ex_unary(st, e);
+            if stars > 0 {
+                return operand;
+            }
+            return cp_cast_value(cp_resolve(st, cpx_base_of(cw, ck, 0, cw.len()), 0, 0), operand);
         }
         e.pos = e.pos + 1;
         var v: i64 = cp_ex_or(st, e);
@@ -2385,6 +2429,37 @@ fn cp_number(t: str, e: &mut CpExpr) -> i64 {
         }
         v = v * base + d;
         i = i + 1;
+    }
+    return v;
+}
+
+/// BG72: `v` converted to the integer type `ty` a cast names (cp_resolve's
+/// "u8", "i32", "bool", ...): truncated to its width, sign-extended when it
+/// is signed. Any other type (64 bits, a float, unknown) keeps `v`.
+fn cp_cast_value(ty: str, v: i64) -> i64 {
+    if ty == "u8" {
+        return v & 255;
+    }
+    if ty == "i8" {
+        return ((v & 255) ^ 128) - 128;
+    }
+    if ty == "u16" {
+        return v & 65535;
+    }
+    if ty == "i16" {
+        return ((v & 65535) ^ 32768) - 32768;
+    }
+    if ty == "u32" {
+        return v & 4294967295;
+    }
+    if ty == "i32" {
+        return ((v & 4294967295) ^ 2147483648) - 2147483648;
+    }
+    if ty == "bool" {
+        if v != 0 {
+            return 1;
+        }
+        return 0;
     }
     return v;
 }

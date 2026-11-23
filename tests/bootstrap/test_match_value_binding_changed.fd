@@ -1,0 +1,123 @@
+// Bugs roadmap BG32: the value form of `match` (`val n = match r { .. }`)
+// did not give a struct binding the arm changes a copy of its own, as the
+// statement form does (lower.fd Lowerer_mb_owns_copy, see
+// test_match_binding_changed.fd). Replacing a field of the binding dropped
+// the payload's list, which the scrutinee dropped again (a double free).
+// The scrutinee keeps its own value.
+//
+// Expected output:
+// c3
+// 1
+// z9
+// 1
+// a1 after
+// 2
+// 3 3
+// done
+
+struct P {
+    funcs: Vec<str>,
+    imps: Vec<str>,
+}
+
+enum PR {
+    Ok(P),
+    Err(str),
+}
+
+fn mk() -> PR {
+    var p: P = P { funcs: Vec::new(), imps: Vec::new() };
+    p.funcs.push("a" + int_to_str(1));
+    return PR::Ok(p);
+}
+
+fn change(user: & mut P) {
+    var nf: Vec<str> = Vec::new();
+    nf.push("b" + int_to_str(2));
+    nf.push("b" + int_to_str(3));
+    user.funcs = nf;
+}
+
+// a field replaced in the arm
+fn field_set() -> i64 {
+    var r: PR = mk();
+    val n: i64 = match r {
+        PR::Ok(user) => {
+            var nf: Vec<str> = Vec::new();
+            nf.push("c" + int_to_str(3));
+            user.funcs = nf;
+            println(user.funcs.get(0));
+            user.funcs.len()
+        }
+        PR::Err(_) => {
+            0
+        }
+    };
+    return n;
+}
+
+// the binding given a new value
+fn whole_set() -> i64 {
+    var r: PR = mk();
+    val n: i64 = match r {
+        PR::Ok(user) => {
+            user = P { funcs: Vec::new(), imps: Vec::new() };
+            user.funcs.push("z" + int_to_str(9));
+            println(user.funcs.get(0));
+            user.funcs.len()
+        }
+        PR::Err(_) => {
+            0
+        }
+    };
+    return n;
+}
+
+// the scrutinee is not changed by the arm's copy
+fn scrutinee_kept() -> i64 {
+    var r: PR = mk();
+    val n: i64 = match r {
+        PR::Ok(user) => {
+            change(& mut user);
+            user.funcs.len()
+        }
+        PR::Err(_) => {
+            0
+        }
+    };
+    match r {
+        PR::Ok(p2) => {
+            println(p2.funcs.get(0) + " after");
+        }
+        PR::Err(_) => {
+        }
+    }
+    return n;
+}
+
+fn main() {
+    println(int_to_str(field_set()));
+    println(int_to_str(whole_set()));
+    println(int_to_str(scrutinee_kept()));
+    // in a loop: each pass's copy is dropped at the arm's end
+    var n: i64 = 0;
+    var k: i64 = 0;
+    while k < 3 {
+        var r: PR = mk();
+        val got: i64 = match r {
+            PR::Ok(user) => {
+                var nf: Vec<str> = Vec::new();
+                nf.push("q");
+                user.funcs = nf;
+                user.funcs.len()
+            }
+            PR::Err(_) => {
+                0
+            }
+        };
+        n = n + got;
+        k = k + 1;
+    }
+    println(int_to_str(n) + " " + int_to_str(k));
+    println("done");
+}

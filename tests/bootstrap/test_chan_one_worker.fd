@@ -1,0 +1,85 @@
+// BG8 (docs/roadmap/bugs-roadmap.md): channels with one worker. With M:N
+// off (FIDES_WORKERS=1, FIDES_SCHED_RANDOM, one CPU) the C runtime runs one
+// cooperative scheduler per thread, and a send or receive that had to wait
+// slept on the channel's condition variable: the task or code that would
+// wake it runs on the same thread, so it never ran and the program hung.
+// Now (compiler/codegen_c.fd __p_chan_coop_wait) a task gives its turn to
+// the scheduler until the channel is ready, and code off a task (main)
+// runs this thread's tasks meanwhile.
+//   - the bug's trigger: a consumer receives before main sends;
+//   - a producer task sends more than the channel holds while main
+//     receives (main, off a task, runs the producer while it waits);
+//   - two tasks ping-pong over two channels of one place each.
+// C path and interpreter only: the native runtimes have their own channels.
+//@ env: FIDES_WORKERS=1
+//@ backends: run,ccompile
+//
+// Expected output:
+// 5
+// 55
+// 10
+// 9900
+// 100
+use channel;
+
+async fn consumer(ch: i64) -> Future<i64> {
+    return channel_recv(ch);
+}
+
+async fn producer(ch: i64, n: i64) -> Future<i64> {
+    var i: i64 = 0;
+    while i < n {
+        channel_send(ch, i + 1);
+        i = i + 1;
+    }
+    return n;
+}
+
+/// Sends 0..n-1 on `to`, adds up what comes back on `from`.
+async fn pinger(to: i64, from: i64, n: i64) -> Future<i64> {
+    var got: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        channel_send(to, i);
+        got = got + channel_recv(from);
+        i = i + 1;
+    }
+    return got;
+}
+
+/// Sends back twice each value it receives.
+async fn ponger(from: i64, to: i64, n: i64) -> Future<i64> {
+    var i: i64 = 0;
+    while i < n {
+        val v: i64 = channel_recv(from);
+        channel_send(to, v * 2);
+        i = i + 1;
+    }
+    return n;
+}
+
+fn main() -> i64 {
+    val ch = channel_create(1);
+    val f = consumer(ch);
+    channel_send(ch, 5);
+    println(await f);
+
+    val ch2 = channel_create(2);
+    val p = producer(ch2, 10);
+    var sum: i64 = 0;
+    var i: i64 = 0;
+    while i < 10 {
+        sum = sum + channel_recv(ch2);
+        i = i + 1;
+    }
+    println(sum);
+    println(await p);
+
+    val a = channel_create(1);
+    val b = channel_create(1);
+    val pi = pinger(a, b, 100);
+    val po = ponger(a, b, 100);
+    println(await pi);
+    println(await po);
+    return 0;
+}

@@ -33,7 +33,9 @@ extern "C" {
     fn getenv as pe_c_getenv(name: str) -> i64;
     fn atof as pe_c_atof(s: str) -> f64;
     fn _strtoi64 as pe_c_strtoi64(s: str, end: i64, base: i64) -> i64;
-    fn strtod as pe_c_strtod(s: str, end: i64) -> f64;
+    // (the text's address: a plain buffer, not a str, so no str is made of
+    // it and dropped, string header by construction)
+    fn strtod as pe_c_strtod(s: i64, end: i64) -> f64;
     fn _snprintf as pe_c_fmt_prec(buf: i64, size: i64, fmt: str, prec: i64, x: f64) -> i32;
     fn _snprintf as pe_c_fmt_f64(buf: i64, size: i64, fmt: str, x: f64) -> i32;
     fn system as pe_c_system(cmd: str) -> i64;
@@ -386,7 +388,7 @@ pub fn pert_to_str_float(val: f64) -> str {
         // M7: no str local owns buf: it would be dropped at the function's
         // end, after pe_trim_fraction_zeros freed buf (Str_drop then read
         // buf - 16 of the freed block); the temporary goes at this statement
-        val same: bool = pe_c_strtod(pe_buf_str(buf), 0) == val;
+        val same: bool = pe_c_strtod(buf, 0) == val;
         if same {
             return pe_trim_fraction_zeros(buf);
         }
@@ -439,14 +441,17 @@ pub fn pert_to_str(v: i64) -> str {
     return p_str_adopt(buf);
 }
 
-/// A NUL-terminated buffer as a str.
+/// A counted copy of the NUL-terminated buffer `buf` (the caller keeps
+/// buf). Before, buf itself was returned as the str: a plain block with no
+/// string header, which core's Str_drop/Str_dup now refuse (string header
+/// by construction; a temporary made of it stopped float_to_str).
 fn pe_buf_str(buf: i64) -> str {
-    return buf;
+    return p_str_from_ptr(buf);
 }
 
 /// "10.500" -> "10.5", "10.000" -> "10" (in place).
 fn pe_trim_fraction_zeros(buf: i64) -> str {
-    var len: i64 = p_str_length(pe_buf_str(buf));
+    var len: i64 = pe_c_strlen(buf);
     var dot: i64 = -1;
     var i: i64 = 0;
     while i < len {

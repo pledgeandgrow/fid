@@ -1,0 +1,45 @@
+// BG81 (docs/roadmap/bugs-roadmap.md): the C runtime's p_file_write and
+// p_file_append wrote with fputs, which stops at the first zero byte of a
+// counted string ("ab\0cd" wrote 2 bytes), and p_file_write gave 0 even
+// when the write or its flush failed. Now (compiler/codegen_c.fd
+// p_file_write) every byte is written and a failure is -1.
+// BG68: p_dir_list's second pass no longer writes past what the first pass
+// counted; listing a directory still gives every entry.
+//@ backends: ccompile
+//
+// Expected output:
+// write: 0 size 5
+// append: 0 size 8
+// cannot open: -1
+// entries: 3
+// removed: true
+
+fn yes_no(b: bool) -> str {
+    if b { return "true"; }
+    return "false";
+}
+
+fn main() -> i64 {
+    val dir: str = "build_bg81_" + int_to_str(p_getpid());
+    p_mkdir(dir);
+    val path: str = dir + "/nul.bin";
+    val w: i64 = p_file_write(path, "ab\0cd");
+    println("write: " + int_to_str(w) + " size " + int_to_str(p_file_size(path)));
+    val a: i64 = p_file_append(path, "\0yz");
+    println("append: " + int_to_str(a) + " size " + int_to_str(p_file_size(path)));
+    println("cannot open: " + int_to_str(p_file_write(dir + "/no such dir/x.txt", "x")));
+    p_file_write(dir + "/second.txt", "2");
+    p_file_write(dir + "/third.txt", "3");
+    val listing: str = p_dir_list(dir);
+    var n: i64 = 0;
+    if str_contains(listing, "nul.bin") { n = n + 1; }
+    if str_contains(listing, "second.txt") { n = n + 1; }
+    if str_contains(listing, "third.txt") { n = n + 1; }
+    println("entries: " + int_to_str(n));
+    p_file_delete(path);
+    p_file_delete(dir + "/second.txt");
+    p_file_delete(dir + "/third.txt");
+    p_rmdir(dir);
+    println("removed: " + yes_no(p_file_exists(path) == 0));
+    return 0;
+}

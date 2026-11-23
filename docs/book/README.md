@@ -49,7 +49,7 @@ when it fails.
   ownership model and chapter 6 for errors.
 - **Writing code that must not fail?** Chapters 5 and 6.
 - **Contributing to the compiler?** This book won't help — read
-  `docs/compiler-internals.md` and `AGENTS.md`.
+  `docs/reference/compiler-internals.md` and `AGENTS.md`.
 
 ## Conventions
 

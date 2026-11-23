@@ -2307,13 +2307,19 @@ fn substitute_stmt(stmt: &mut Stmt, original: &Program, errs: &mut Vec<str>) {
     // then rebuild the statement so the result is kept.
     match stmt {
         Stmt::Let(lname, lty, expr, lmut, lpersist, lann, lline) => {
+            // Only a value comptime computed is checked here (BG47): a plain
+            // literal is the type checker's (E079), and a u64 literal above
+            // i64::MAX is held as its raw bits, which read negative
+            val ct_had: bool = ct_scan_expr_sub(expr);
             substitute_expr(&mut expr, original, errs);
             // §4.11: the value comptime computed must fit the declared type
-            match lty {
-                OptType::Some(ct_fit_ty) => {
-                    ct_check_int_fit(ct_fit_ty, &expr, lname, errs);
-                }
-                OptType::None => {
+            if ct_had {
+                match lty {
+                    OptType::Some(ct_fit_ty) => {
+                        ct_check_int_fit(ct_fit_ty, &expr, lname, errs);
+                    }
+                    OptType::None => {
+                    }
                 }
             }
             * stmt = Stmt::Let(lname, lty, expr, lmut, lpersist, lann, lline);
@@ -3011,11 +3017,22 @@ fn aggressive_comptime_stmt(stmt: &mut Stmt, original: &Program) {
                         Expr::IntLit(s) => {
                             match end_e {
                                 Expr::IntLit(e) => {
+                                    // The count without overflow (BG84): only
+                                    // a span of 16 or less is unrolled, and
+                                    // e - s (+ 1) wraps for a wide range or
+                                    // one ending at i64::MAX
                                     var trip: i64 = 0;
-                                    if inclusive {
-                                        trip = e - s + 1;
-                                    } else {
-                                        trip = e - s;
+                                    if e > s || (inclusive && e == s) {
+                                        trip = 17;
+                                        if s >= 0 || e < 0 || e - 16 <= s {
+                                            var span: i64 = e - s;
+                                            if span <= 16 {
+                                                trip = span;
+                                                if inclusive {
+                                                    trip = span + 1;
+                                                }
+                                            }
+                                        }
                                     }
                                     // Check for break/continue in body
                                     var has_bc: bool = false;
@@ -3032,15 +3049,12 @@ fn aggressive_comptime_stmt(stmt: &mut Stmt, original: &Program) {
                                         // would rewrite it in place: body.get() is the
                                         // statement itself, not a copy, so every
                                         // iteration after the first saw the first's k.)
+                                        // Counted by iteration, not up to e + 1
+                                        // (which wraps at i64::MAX: BG84)
                                         var unrolled: Vec<Stmt> = Vec::new();
-                                        var last: i64 = 0;
-                                        if inclusive {
-                                            last = e + 1;
-                                        } else {
-                                            last = e;
-                                        }
-                                        var i: i64 = s;
-                                        while i < last {
+                                        var k: i64 = 0;
+                                        while k < trip {
+                                            var i: i64 = s + k;
                                             var iteration: Vec<Stmt> = Vec::new();
                                             iteration.push(Stmt::Let(loop_var, OptType::Some(Type::I64), Expr::IntLit(i), false, false, Vec::new(), 0));
                                             var si2: i64 = 0;
@@ -3049,7 +3063,7 @@ fn aggressive_comptime_stmt(stmt: &mut Stmt, original: &Program) {
                                                 si2 = si2 + 1;
                                             }
                                             unrolled.push(Stmt::If(Expr::BoolLit(true), iteration, OptStmts::None, 0));
-                                            i = i + 1;
+                                            k = k + 1;
                                         }
                                         // Replace the for loop with if true { unrolled }
                                         * stmt = Stmt::If(Expr::BoolLit(true), unrolled, OptStmts::None, 0);
@@ -3339,225 +3353,418 @@ fn ct_expr_has_break_or_continue(e: Expr) -> bool {
 }
 
 // --- Identifier replacement (for loop unrolling) -------------------------
+// Each function returns a new tree and changes nothing in place: a pattern
+// binding is a copy, and a statement list read with get() can share its
+// buffer with the loop body the next iteration copies again (BG27). Every
+// expression and statement form is visited (f-strings, match, tuples,
+// closures, ...). A name the body binds again (`val`, a match arm's
+// pattern, a closure parameter, an inner `for`, a select case, an effect
+// handler's parameter) hides the loop variable from there on.
 
-fn replace_ident_in_stmts(stmts: &mut Vec<Stmt>, name: str, replacement: Expr) {
-    var si: i64 = 0;
-    while si < stmts.len() {
-        var stmt: Stmt = stmts.get(si);
-        replace_ident_in_stmt(&mut stmt, name, replacement);
-        stmts.set(si, stmt);
-        si = si + 1;
-    }
-}
-
-fn replace_ident_in_stmt(stmt: &mut Stmt, name: str, replacement: Expr) {
-    // Every case rebuilds the statement: a pattern binding is a copy, so
-    // replacing into it and dropping it changed nothing (the loop variable
-    // stayed, and the unrolled body read a name nothing declared).
-    match stmt {
-        Stmt::Let(lname, lty, expr, lmut, lpersist, lann, lline) => {
-            replace_ident_in_expr(expr, name, replacement);
-            *stmt = Stmt::Let(lname, lty, expr, lmut, lpersist, lann, lline);
+/// Pattern `p` binds `name`.
+fn ct_pattern_binds(p: Pattern, name: str) -> bool {
+    match p {
+        Pattern::Ident(n) => {
+            return n == name;
         }
-        Stmt::LetTuple(tnames, expr, tline) => {
-            replace_ident_in_expr(expr, name, replacement);
-            *stmt = Stmt::LetTuple(tnames, expr, tline);
-        }
-        Stmt::Assign(aname, aop, expr, aline) => {
-            replace_ident_in_expr(expr, name, replacement);
-            *stmt = Stmt::Assign(aname, aop, expr, aline);
-        }
-        Stmt::IndexAssign(iname, index, iop, expr, iline) => {
-            replace_ident_in_expr(index, name, replacement);
-            replace_ident_in_expr(expr, name, replacement);
-            *stmt = Stmt::IndexAssign(iname, index, iop, expr, iline);
-        }
-        Stmt::DerefAssign(pexpr, dop, expr, dline) => {
-            replace_ident_in_expr(pexpr, name, replacement);
-            replace_ident_in_expr(expr, name, replacement);
-            *stmt = Stmt::DerefAssign(pexpr, dop, expr, dline);
-        }
-        Stmt::FieldAssign(oexpr, ffield, fop, expr, fline) => {
-            replace_ident_in_expr(oexpr, name, replacement);
-            replace_ident_in_expr(expr, name, replacement);
-            *stmt = Stmt::FieldAssign(oexpr, ffield, fop, expr, fline);
-        }
-        Stmt::Expr(e, eline) => {
-            replace_ident_in_expr(e, name, replacement);
-            *stmt = Stmt::Expr(e, eline);
-        }
-        Stmt::Return(opt, rline) => {
-            match opt {
-                OptBoxExpr::Some(e) => {
-                    var inner: Expr = ct_box_expr_unbox(e);
-                    replace_ident_in_expr(&mut inner, name, replacement);
-                    *stmt = Stmt::Return(OptBoxExpr::Some(box_expr_new(inner)), rline);
+        Pattern::EnumVariant(_, _, bindings) => {
+            var i: i64 = 0;
+            while i < bindings.len() {
+                if bindings.get(i).name == name {
+                    return true;
                 }
-                OptBoxExpr::None => {
-                }
+                i = i + 1;
             }
-        }
-        Stmt::If(cond, then_block, else_block, iline2) => {
-            replace_ident_in_expr(cond, name, replacement);
-            replace_ident_in_stmts(&mut then_block, name, replacement);
-            match else_block {
-                OptStmts::Some(eb) => {
-                    replace_ident_in_stmts(&mut eb, name, replacement);
-                }
-                OptStmts::None => {
-                }
-            }
-            * stmt = Stmt::If(cond, then_block, else_block, iline2);
-        }
-        Stmt::For(v, iterator, body, forline) => {
-            if v != name {
-                replace_ident_in_expr(iterator, name, replacement);
-                replace_ident_in_stmts(&mut body, name, replacement);
-            }
-            * stmt = Stmt::For(v, iterator, body, forline);
-        }
-        Stmt::While(cond, body, wline) => {
-            replace_ident_in_expr(cond, name, replacement);
-            replace_ident_in_stmts(&mut body, name, replacement);
-            *stmt = Stmt::While(cond, body, wline);
         }
         _ => {
         }
     }
+    return false;
 }
 
-fn replace_ident_in_expr(expr: &mut Expr, name: str, replacement: Expr) {
+/// Statement `stmt` declares `name` for the statements after it.
+fn ct_stmt_binds(stmt: Stmt, name: str) -> bool {
+    match stmt {
+        Stmt::Let(lname, _, _, _, _, _, _) => {
+            return lname == name;
+        }
+        Stmt::LetTuple(tnames, _, _) => {
+            var i: i64 = 0;
+            while i < tnames.len() {
+                if tnames.get(i) == name {
+                    return true;
+                }
+                i = i + 1;
+            }
+        }
+        Stmt::LetUninit(uname, _, _, _) => {
+            return uname == name;
+        }
+        _ => {
+        }
+    }
+    return false;
+}
+
+fn ct_str_in(names: Vec<str>, name: str) -> bool {
+    var i: i64 = 0;
+    while i < names.len() {
+        if names.get(i) == name {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// `stmts` with `name` replaced by `replacement` up to the statement that
+/// declares `name` again (its initializer still reads the outer one).
+fn replace_ident_in_stmts(stmts: Vec<Stmt>, name: str, replacement: Expr) -> Vec<Stmt> {
+    var out: Vec<Stmt> = Vec::new();
+    var hidden: bool = false;
+    var si: i64 = 0;
+    while si < stmts.len() {
+        if hidden {
+            out.push(stmts.get(si));
+        } else {
+            val s2: Stmt = replace_ident_in_stmt(stmts.get(si), name, replacement);
+            if ct_stmt_binds(s2, name) {
+                hidden = true;
+            }
+            out.push(s2);
+        }
+        si = si + 1;
+    }
+    return out;
+}
+
+fn ct_ri_opt_stmts(o: OptStmts, name: str, replacement: Expr) -> OptStmts {
+    match o {
+        OptStmts::Some(b) => {
+            return OptStmts::Some(replace_ident_in_stmts(b, name, replacement));
+        }
+        OptStmts::None => {
+        }
+    }
+    return OptStmts::None;
+}
+
+fn ct_ri_opt_box(o: OptBoxExpr, name: str, replacement: Expr) -> OptBoxExpr {
+    match o {
+        OptBoxExpr::Some(e) => {
+            return OptBoxExpr::Some(ct_ri_box(e, name, replacement));
+        }
+        OptBoxExpr::None => {
+        }
+    }
+    return OptBoxExpr::None;
+}
+
+fn ct_ri_box(b: Box<Expr>, name: str, replacement: Expr) -> Box<Expr> {
+    return box_expr_new(replace_ident_in_expr(ct_box_expr_unbox(b), name, replacement));
+}
+
+fn ct_ri_exprs(es: Vec<Expr>, name: str, replacement: Expr) -> Vec<Expr> {
+    var out: Vec<Expr> = Vec::new();
+    var i: i64 = 0;
+    while i < es.len() {
+        out.push(replace_ident_in_expr(es.get(i), name, replacement));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Match arms: an arm whose pattern binds `name` is left as it is.
+fn ct_ri_arms(arms: Vec<MatchArm>, name: str, replacement: Expr) -> Vec<MatchArm> {
+    var out: Vec<MatchArm> = Vec::new();
+    var ai: i64 = 0;
+    while ai < arms.len() {
+        var arm: MatchArm = arms.get(ai);
+        if !ct_pattern_binds(arm.pattern, name) {
+            arm.guard = ct_ri_opt_box(arm.guard, name, replacement);
+            arm.body = replace_ident_in_stmts(arm.body, name, replacement);
+        }
+        out.push(arm);
+        ai = ai + 1;
+    }
+    return out;
+}
+
+fn replace_ident_in_stmt(stmt: Stmt, name: str, replacement: Expr) -> Stmt {
+    match stmt {
+        Stmt::Let(lname, lty, expr, lmut, lpersist, lann, lline) => {
+            return Stmt::Let(lname, lty, replace_ident_in_expr(expr, name, replacement), lmut, lpersist, lann, lline);
+        }
+        Stmt::LetTuple(tnames, expr, tline) => {
+            return Stmt::LetTuple(tnames, replace_ident_in_expr(expr, name, replacement), tline);
+        }
+        Stmt::Assign(aname, aop, expr, aline) => {
+            return Stmt::Assign(aname, aop, replace_ident_in_expr(expr, name, replacement), aline);
+        }
+        Stmt::IndexAssign(iname, index, iop, expr, iline) => {
+            return Stmt::IndexAssign(iname, replace_ident_in_expr(index, name, replacement), iop, replace_ident_in_expr(expr, name, replacement), iline);
+        }
+        Stmt::DerefAssign(pexpr, dop, expr, dline) => {
+            return Stmt::DerefAssign(replace_ident_in_expr(pexpr, name, replacement), dop, replace_ident_in_expr(expr, name, replacement), dline);
+        }
+        Stmt::FieldAssign(oexpr, ffield, fop, expr, fline) => {
+            return Stmt::FieldAssign(replace_ident_in_expr(oexpr, name, replacement), ffield, fop, replace_ident_in_expr(expr, name, replacement), fline);
+        }
+        Stmt::Expr(e, eline) => {
+            return Stmt::Expr(replace_ident_in_expr(e, name, replacement), eline);
+        }
+        Stmt::Return(opt, rline) => {
+            return Stmt::Return(ct_ri_opt_box(opt, name, replacement), rline);
+        }
+        Stmt::Break(bopt, bline) => {
+            return Stmt::Break(ct_ri_opt_box(bopt, name, replacement), bline);
+        }
+        Stmt::If(cond, then_block, else_block, iline2) => {
+            return Stmt::If(replace_ident_in_expr(cond, name, replacement), replace_ident_in_stmts(then_block, name, replacement), ct_ri_opt_stmts(else_block, name, replacement), iline2);
+        }
+        Stmt::For(v, iterator, body, forline) => {
+            // The iterator is evaluated outside the inner loop's variable
+            val it2: Expr = replace_ident_in_expr(iterator, name, replacement);
+            if v == name {
+                return Stmt::For(v, it2, body, forline);
+            }
+            return Stmt::For(v, it2, replace_ident_in_stmts(body, name, replacement), forline);
+        }
+        Stmt::While(cond, body, wline) => {
+            return Stmt::While(replace_ident_in_expr(cond, name, replacement), replace_ident_in_stmts(body, name, replacement), wline);
+        }
+        Stmt::Loop(lbody, lline2) => {
+            return Stmt::Loop(replace_ident_in_stmts(lbody, name, replacement), lline2);
+        }
+        Stmt::Defer(dbody, dline2) => {
+            return Stmt::Defer(replace_ident_in_stmts(dbody, name, replacement), dline2);
+        }
+        Stmt::Match(scrut, arms, mline) => {
+            return Stmt::Match(replace_ident_in_expr(scrut, name, replacement), ct_ri_arms(arms, name, replacement), mline);
+        }
+        Stmt::Sandbox(sbody, sline) => {
+            return Stmt::Sandbox(replace_ident_in_stmts(sbody, name, replacement), sline);
+        }
+        Stmt::Unsafe(ubody, uline) => {
+            return Stmt::Unsafe(replace_ident_in_stmts(ubody, name, replacement), uline);
+        }
+        Stmt::Txn(tbody, tline2) => {
+            return Stmt::Txn(replace_ident_in_stmts(tbody, name, replacement), tline2);
+        }
+        Stmt::SpawnScope(spbody, spline) => {
+            return Stmt::SpawnScope(replace_ident_in_stmts(spbody, name, replacement), spline);
+        }
+        Stmt::RegionBlock(rname, ra, rb, rc, rd, rbody, rline2) => {
+            return Stmt::RegionBlock(rname, ra, rb, rc, rd, replace_ident_in_stmts(rbody, name, replacement), rline2);
+        }
+        Stmt::Parallel(brs, pline) => {
+            var nb: Vec<Vec<Stmt>> = Vec::new();
+            var bi: i64 = 0;
+            while bi < brs.len() {
+                nb.push(replace_ident_in_stmts(brs.get(bi), name, replacement));
+                bi = bi + 1;
+            }
+            return Stmt::Parallel(nb, pline);
+        }
+        Stmt::Handle(hbody, hs, hline) => {
+            var nh: Vec<EffectHandler> = Vec::new();
+            var hi: i64 = 0;
+            while hi < hs.len() {
+                var h: EffectHandler = hs.get(hi);
+                if !ct_str_in(h.params, name) {
+                    h.body = replace_ident_in_stmts(h.body, name, replacement);
+                }
+                nh.push(h);
+                hi = hi + 1;
+            }
+            return Stmt::Handle(replace_ident_in_stmts(hbody, name, replacement), nh, hline);
+        }
+        Stmt::Select(cases, sdefault, sline2) => {
+            var nc: Vec<SelectCase> = Vec::new();
+            var ci: i64 = 0;
+            while ci < cases.len() {
+                var c: SelectCase = cases.get(ci);
+                c.channel = replace_ident_in_expr(c.channel, name, replacement);
+                if c.var_name != name {
+                    c.body = replace_ident_in_stmts(c.body, name, replacement);
+                }
+                nc.push(c);
+                ci = ci + 1;
+            }
+            return Stmt::Select(nc, ct_ri_opt_stmts(sdefault, name, replacement), sline2);
+        }
+        Stmt::Do(deff, dop2, dargs, dline3) => {
+            return Stmt::Do(deff, dop2, ct_ri_exprs(dargs, name, replacement), dline3);
+        }
+        Stmt::Backward(be, bline2) => {
+            return Stmt::Backward(replace_ident_in_expr(be, name, replacement), bline2);
+        }
+        Stmt::Resume(rk, rv, rline3) => {
+            return Stmt::Resume(replace_ident_in_expr(rk, name, replacement), replace_ident_in_expr(rv, name, replacement), rline3);
+        }
+        _ => {
+        }
+    }
+    return stmt;
+}
+
+fn replace_ident_in_expr(expr: Expr, name: str, replacement: Expr) -> Expr {
     match expr {
         Expr::Ident(n) => {
             if n == name {
-                *expr = replacement;
+                return replacement;
             }
         }
         // `comptime (i * i)` inside an inline for's body: the loop variable
         // is its literal in the comptime expression too
         Expr::Comptime(inner) => {
-            var e2: Expr = ct_box_expr_unbox(inner);
-            replace_ident_in_expr(&mut e2, name, replacement);
-            *expr = Expr::Comptime(box_expr_new(e2));
+            return Expr::Comptime(ct_ri_box(inner, name, replacement));
         }
-        Expr::ComptimeBlock(stmts) => {
-            var st2: Vec<Stmt> = stmts;
-            replace_ident_in_stmts(&mut st2, name, replacement);
-            *expr = Expr::ComptimeBlock(st2);
+        Expr::ComptimeBlock(cstmts) => {
+            return Expr::ComptimeBlock(replace_ident_in_stmts(cstmts, name, replacement));
         }
         Expr::Binary(op, left, right) => {
-            var l: Expr = ct_box_expr_unbox(left);
-            var r: Expr = ct_box_expr_unbox(right);
-            replace_ident_in_expr(&mut l, name, replacement);
-            replace_ident_in_expr(&mut r, name, replacement);
-            *expr = Expr::Binary(op, box_expr_new(l), box_expr_new(r));
+            return Expr::Binary(op, ct_ri_box(left, name, replacement), ct_ri_box(right, name, replacement));
         }
         Expr::Unary(op, inner) => {
-            var e: Expr = ct_box_expr_unbox(inner);
-            replace_ident_in_expr(&mut e, name, replacement);
-            *expr = Expr::Unary(op, box_expr_new(e));
+            return Expr::Unary(op, ct_ri_box(inner, name, replacement));
         }
         Expr::Call(callee, args) => {
-            var ai: i64 = 0;
-            while ai < args.len() {
-                var a: Expr = args.get(ai);
-                replace_ident_in_expr(&mut a, name, replacement);
-                args.set(ai, a);
-                ai = ai + 1;
-            }
-            * expr = Expr::Call(callee, args);
+            return Expr::Call(callee, ct_ri_exprs(args, name, replacement));
         }
         Expr::MethodCall(receiver, mname, args) => {
-            var r: Expr = ct_box_expr_unbox(receiver);
-            replace_ident_in_expr(&mut r, name, replacement);
-            var ai: i64 = 0;
-            while ai < args.len() {
-                var a: Expr = args.get(ai);
-                replace_ident_in_expr(&mut a, name, replacement);
-                args.set(ai, a);
-                ai = ai + 1;
-            }
-            * expr = Expr::MethodCall(box_expr_new(r), mname, args);
+            return Expr::MethodCall(ct_ri_box(receiver, name, replacement), mname, ct_ri_exprs(args, name, replacement));
         }
         Expr::FieldAccess(inner, field) => {
-            var e: Expr = ct_box_expr_unbox(inner);
-            replace_ident_in_expr(&mut e, name, replacement);
-            *expr = Expr::FieldAccess(box_expr_new(e), field);
+            return Expr::FieldAccess(ct_ri_box(inner, name, replacement), field);
+        }
+        Expr::OptionalFieldAccess(inner, ofield) => {
+            return Expr::OptionalFieldAccess(ct_ri_box(inner, name, replacement), ofield);
         }
         Expr::Index(array, index) => {
-            var a: Expr = ct_box_expr_unbox(array);
-            var i: Expr = ct_box_expr_unbox(index);
-            replace_ident_in_expr(&mut a, name, replacement);
-            replace_ident_in_expr(&mut i, name, replacement);
-            *expr = Expr::Index(box_expr_new(a), box_expr_new(i));
+            return Expr::Index(ct_ri_box(array, name, replacement), ct_ri_box(index, name, replacement));
         }
         Expr::StructLit(sname, fields, base) => {
+            var nf: Vec<FieldInit> = Vec::new();
             var fi: i64 = 0;
             while fi < fields.len() {
                 var f: FieldInit = fields.get(fi);
-                replace_ident_in_expr(&mut f.value, name, replacement);
-                fields.set(fi, f);
+                f.value = replace_ident_in_expr(f.value, name, replacement);
+                nf.push(f);
                 fi = fi + 1;
             }
-            * expr = Expr::StructLit(sname, fields, base);
+            return Expr::StructLit(sname, nf, ct_ri_opt_box(base, name, replacement));
         }
         Expr::If(cond, then_block, else_block) => {
-            replace_ident_in_expr(cond, name, replacement);
-            var si: i64 = 0;
-            while si < then_block.len() {
-                var s: Stmt = then_block.get(si);
-                replace_ident_in_stmt(&mut s, name, replacement);
-                then_block.set(si, s);
-                si = si + 1;
-            }
-            match else_block {
-                OptStmts::Some(eb) => {
-                    var ei: i64 = 0;
-                    while ei < eb.len() {
-                        var s: Stmt = eb.get(ei);
-                        replace_ident_in_stmt(&mut s, name, replacement);
-                        eb.set(ei, s);
-                        ei = ei + 1;
-                    }
-                }
-                OptStmts::None => {
-                }
-            }
+            return Expr::If(ct_ri_box(cond, name, replacement), replace_ident_in_stmts(then_block, name, replacement), ct_ri_opt_stmts(else_block, name, replacement));
         }
-        Expr::Block(stmts) => {
-            var si: i64 = 0;
-            while si < stmts.len() {
-                var s: Stmt = stmts.get(si);
-                replace_ident_in_stmt(&mut s, name, replacement);
-                stmts.set(si, s);
-                si = si + 1;
-            }
+        Expr::Block(bstmts) => {
+            return Expr::Block(replace_ident_in_stmts(bstmts, name, replacement));
+        }
+        Expr::TryBlock(tstmts) => {
+            return Expr::TryBlock(replace_ident_in_stmts(tstmts, name, replacement));
         }
         Expr::Range(start, end, incl) => {
-            var s: Expr = ct_box_expr_unbox(start);
-            var e: Expr = ct_box_expr_unbox(end);
-            replace_ident_in_expr(&mut s, name, replacement);
-            replace_ident_in_expr(&mut e, name, replacement);
-            *expr = Expr::Range(box_expr_new(s), box_expr_new(e), incl);
+            return Expr::Range(ct_ri_box(start, name, replacement), ct_ri_box(end, name, replacement), incl);
+        }
+        Expr::ArrayLit(aty, elems) => {
+            return Expr::ArrayLit(aty, ct_ri_exprs(elems, name, replacement));
+        }
+        Expr::TupleLit(telems) => {
+            return Expr::TupleLit(ct_ri_exprs(telems, name, replacement));
+        }
+        Expr::EnumLit(ename, evariant, eargs) => {
+            return Expr::EnumLit(ename, evariant, ct_ri_exprs(eargs, name, replacement));
+        }
+        Expr::FString(parts) => {
+            var np: Vec<FStringPart> = Vec::new();
+            var pi: i64 = 0;
+            while pi < parts.len() {
+                match parts.get(pi) {
+                    FStringPart::Literal(ls) => {
+                        np.push(FStringPart::Literal(ls));
+                    }
+                    FStringPart::Expr(pe) => {
+                        np.push(FStringPart::Expr(replace_ident_in_expr(pe, name, replacement)));
+                    }
+                }
+                pi = pi + 1;
+            }
+            return Expr::FString(np);
+        }
+        Expr::Match(scrut, arms) => {
+            return Expr::Match(ct_ri_box(scrut, name, replacement), ct_ri_arms(arms, name, replacement));
+        }
+        Expr::Closure(cparams, cbody, cret) => {
+            var cpi: i64 = 0;
+            while cpi < cparams.len() {
+                if cparams.get(cpi).name == name {
+                    return Expr::Closure(cparams, cbody, cret);
+                }
+                cpi = cpi + 1;
+            }
+            return Expr::Closure(cparams, replace_ident_in_stmts(cbody, name, replacement), cret);
         }
         Expr::Ref(inner, is_mut) => {
-            var e: Expr = ct_box_expr_unbox(inner);
-            replace_ident_in_expr(&mut e, name, replacement);
-            *expr = Expr::Ref(box_expr_new(e), is_mut);
+            return Expr::Ref(ct_ri_box(inner, name, replacement), is_mut);
         }
         Expr::Deref(inner) => {
-            var e: Expr = ct_box_expr_unbox(inner);
-            replace_ident_in_expr(&mut e, name, replacement);
-            *expr = Expr::Deref(box_expr_new(e));
+            return Expr::Deref(ct_ri_box(inner, name, replacement));
+        }
+        Expr::StrConcat(sl, sr) => {
+            return Expr::StrConcat(ct_ri_box(sl, name, replacement), ct_ri_box(sr, name, replacement));
+        }
+        Expr::Try(te) => {
+            return Expr::Try(ct_ri_box(te, name, replacement));
+        }
+        Expr::Coalesce(cl, cr) => {
+            return Expr::Coalesce(ct_ri_box(cl, name, replacement), ct_ri_box(cr, name, replacement));
+        }
+        Expr::IsCheck(ie, iname) => {
+            return Expr::IsCheck(ct_ri_box(ie, name, replacement), iname);
         }
         Expr::Cast(inner, ty) => {
-            var e: Expr = ct_box_expr_unbox(inner);
-            replace_ident_in_expr(&mut e, name, replacement);
-            *expr = Expr::Cast(box_expr_new(e), ty);
+            return Expr::Cast(ct_ri_box(inner, name, replacement), ty);
+        }
+        Expr::QuantCast(qe, qty) => {
+            return Expr::QuantCast(ct_ri_box(qe, name, replacement), qty);
+        }
+        Expr::PipeForward(pl, pr) => {
+            return Expr::PipeForward(ct_ri_box(pl, name, replacement), ct_ri_box(pr, name, replacement));
+        }
+        Expr::Await(ae) => {
+            return Expr::Await(ct_ri_box(ae, name, replacement));
+        }
+        Expr::Spawn(spe) => {
+            return Expr::Spawn(ct_ri_box(spe, name, replacement));
+        }
+        Expr::Yield(ye) => {
+            return Expr::Yield(ct_ri_box(ye, name, replacement));
+        }
+        Expr::NamedArg(nname, ne) => {
+            return Expr::NamedArg(nname, ct_ri_box(ne, name, replacement));
+        }
+        Expr::Asm(atext, aops) => {
+            var no: Vec<AsmOperand> = Vec::new();
+            var oi: i64 = 0;
+            while oi < aops.len() {
+                var o: AsmOperand = aops.get(oi);
+                match o.direction {
+                    AsmDir::In => {
+                        o.expr = replace_ident_in_expr(o.expr, name, replacement);
+                    }
+                    _ => {
+                    }
+                }
+                no.push(o);
+                oi = oi + 1;
+            }
+            return Expr::Asm(atext, no);
         }
         _ => {
         }
     }
+    return expr;
 }
 
 // --- Evuation ----------------------------------------------------------
@@ -5891,12 +6098,22 @@ fn ec_unroll_inline(out: &mut Vec<Stmt>, fvar: str, range_e: Expr, body: Vec<Stm
                     return;
                 }
             }
-            var trip: i64 = b - a;
-            if incl {
-                trip = b - a + 1;
-            }
-            if trip < 0 {
-                trip = 0;
+            // The count without overflow (BG84): b - a wraps when the range
+            // spans more than i64::MAX, and b - a + 1 at a..=i64::MAX
+            var trip: i64 = 0;
+            if b > a || (incl && b == a) {
+                if a < 0 && b >= 0 && b - 4096 > a {
+                    errs.push("inline for (line " + int_to_str(line) + "): more than the 4096 iterations an inline for unrolls");
+                    return;
+                }
+                trip = b - a;
+                if trip > 4096 {
+                    errs.push("inline for (line " + int_to_str(line) + "): " + int_to_str(trip) + " iterations is more than the 4096 an inline for unrolls");
+                    return;
+                }
+                if incl {
+                    trip = trip + 1;
+                }
             }
             if trip > 4096 {
                 errs.push("inline for (line " + int_to_str(line) + "): " + int_to_str(trip) + " iterations is more than the 4096 an inline for unrolls");
@@ -5912,14 +6129,9 @@ fn ec_unroll_inline(out: &mut Vec<Stmt>, fvar: str, range_e: Expr, body: Vec<Stm
                     errs.push("inline for (line " + int_to_str(line) + "): the fuel budget ran out while unrolling (FID_CT_FUEL raises it)");
                     return;
                 }
-                var iter: Vec<Stmt> = Vec::new();
-                var bi: i64 = 0;
-                while bi < body.len() {
-                    var bs: Stmt = body.get(bi);
-                    replace_ident_in_stmt(&mut bs, fvar, Expr::IntLit(a + k));
-                    iter.push(bs);
-                    bi = bi + 1;
-                }
+                // A fresh copy per iteration, `fvar` replaced everywhere it
+                // is not declared again (BG27)
+                var iter: Vec<Stmt> = replace_ident_in_stmts(body, fvar, Expr::IntLit(a + k));
                 var expanded: Vec<Stmt> = ec_stmts(iter, original, errs);
                 var ei2: i64 = 0;
                 while ei2 < expanded.len() {

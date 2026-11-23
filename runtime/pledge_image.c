@@ -5,6 +5,10 @@
 // Build: gcc -c pledge_image.c -o pledge_image.o $(sdl2-config --cflags)
 // Link: -lSDL2 -lSDL2_image
 
+// its own header first: the C compiler checks each definition against
+// the declaration Fides binds to (pledge_input_init was int here and
+// long long there, unnoticed while this file did not include it)
+#include "pledge_image.h"
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_image.h>
 #include <stdio.h>

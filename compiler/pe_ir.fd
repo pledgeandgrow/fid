@@ -448,12 +448,88 @@ fn peir_pun_i64_f32(enc: & mut PeirEnc, voff: i64, dst: i64) {
     peir_store_f32_xmm0(enc, dst);
 }
 
+/// BG38: rax re-extended for a narrow integer type (M7: a signed narrow
+/// value is kept sign-extended over the word, an unsigned one
+/// zero-extended).
+fn peir_norm_narrow(enc: & mut PeirEnc, to: IrType) {
+    match to {
+        IrType::I8 => {
+            PeirEnc_movsx_r64_r8(enc, PEIR_RAX, PEIR_RAX);
+        }
+        IrType::U8 => {
+            PeirEnc_movzx_r32_r8(enc, PEIR_RAX, PEIR_RAX);
+        }
+        IrType::I16 => {
+            PeirEnc_movsx_r64_r16(enc, PEIR_RAX, PEIR_RAX);
+        }
+        IrType::U16 => {
+            PeirEnc_movzx_r32_r16(enc, PEIR_RAX, PEIR_RAX);
+        }
+        IrType::I32 => {
+            PeirEnc_movsxd_rr(enc, PEIR_RAX, PEIR_RAX);
+        }
+        IrType::U32 => {
+            // mov eax, eax (zero-extends the upper 32 bits)
+            PeirEnc_rex(enc, false, false, false, false);
+            PeirEnc_emit_u8(enc, 0x89);
+            PeirEnc_modrm_rr(enc, PEIR_RAX, PEIR_RAX);
+        }
+        _ => {
+        }
+    }
+}
+
+/// BG67: xmm0 = rax read as a u64 (f32 when `single`); rcx is clobbered.
+///   test rax, rax ; js big
+///   cvtsi2sd xmm0, rax ; jmp done
+/// big: (halved, its low bit kept so the rounding stays right; doubled)
+///   mov rcx, rax ; shr rcx, 1 ; and eax, 1 ; or rcx, rax
+///   cvtsi2sd xmm0, rcx ; addsd xmm0, xmm0
+/// done:
+fn peir_u64_to_float(enc: & mut PeirEnc, single: bool) {
+    var pfx: i64 = 0xF2;
+    if single {
+        pfx = 0xF3;
+    }
+    peir_emit2(enc, 0x48, 0x85);
+    PeirEnc_emit_u8(enc, 0xC0);
+    // js +7 (cvtsi2sd 5 bytes + jmp 2)
+    peir_emit2(enc, 0x78, 7);
+    peir_emit2(enc, pfx, 0x48);
+    peir_emit2(enc, 0x0F, 0x2A);
+    PeirEnc_emit_u8(enc, 0xC0);
+    // jmp +21 (the big path's bytes)
+    peir_emit2(enc, 0xEB, 21);
+    // mov rcx, rax (3)
+    peir_emit2(enc, 0x48, 0x89);
+    PeirEnc_emit_u8(enc, 0xC1);
+    // shr rcx, 1 (3)
+    peir_emit2(enc, 0x48, 0xD1);
+    PeirEnc_emit_u8(enc, 0xE9);
+    // and eax, 1 (3)
+    peir_emit2(enc, 0x83, 0xE0);
+    PeirEnc_emit_u8(enc, 0x01);
+    // or rcx, rax (3)
+    peir_emit2(enc, 0x48, 0x09);
+    PeirEnc_emit_u8(enc, 0xC1);
+    // cvtsi2sd/ss xmm0, rcx (5)
+    peir_emit2(enc, pfx, 0x48);
+    peir_emit2(enc, 0x0F, 0x2A);
+    PeirEnc_emit_u8(enc, 0xC1);
+    // addsd/ss xmm0, xmm0 (4)
+    peir_emit2(enc, pfx, 0x0F);
+    peir_emit2(enc, 0x58, 0xC0);
+}
+
 /// OP21: BitCast(f32 value -> i64 word): cvtss2sd; movq rax, xmm0; store.
 fn peir_pun_f32_i64(enc: & mut PeirEnc, voff: i64, dst: i64) {
     PeirEnc_movss_xmm_mem_rbp(enc, 0, voff);
     peir_cvt_float(enc, true);
+    // BG7: movq rax, xmm0 is 66 REX.W 0F 7E /r (0F D6 with mod 11 is
+    // movq xmm0, xmm0: rax kept whatever it held, so every f32 pushed to
+    // a Vec stored a stale word and read back 0)
     peir_emit2(enc, 0x66, 0x48);
-    peir_emit2(enc, 0x0F, 0xD6);
+    peir_emit2(enc, 0x0F, 0x7E);
     PeirEnc_emit_u8(enc, 0xC0);
     PeirEnc_mov_mem_rbp_reg(enc, dst, PEIR_RAX);
 }
@@ -4895,7 +4971,19 @@ pub fn PeirGen_gen_inst(self: &mut PeirGen, id: i64, inst: Inst, next_cond: i64,
 
         // --- Function Calls ---
         Inst::Call(call_name, args, _, _) => {
-            if PeirGen_inline_vec_call(self, call_name, args, dst, frame, func) {
+            // BG7: an f32 element (a Vec_get typed f32, a Vec_push/Vec_set of
+            // an f32) takes the call path below, which converts between the
+            // 4-byte single in the slot and the word holding its f64 bits
+            // (OP21); the inline fast paths move the raw word
+            var iv_f32: bool = ir_type_eq(peir_operand_ty(func, id), IrType::F32);
+            var iva: i64 = 0;
+            while iva < args.len() {
+                if ir_type_eq(peir_operand_ty(func, args.get(iva)), IrType::F32) {
+                    iv_f32 = true;
+                }
+                iva = iva + 1;
+            }
+            if !iv_f32 && PeirGen_inline_vec_call(self, call_name, args, dst, frame, func) {
                 return;
             }
             // An f64 lives in its slot as its bits: these copy the word (the
@@ -5286,10 +5374,20 @@ pub fn PeirGen_gen_inst(self: &mut PeirGen, id: i64, inst: Inst, next_cond: i64,
             PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, PEIR_RAX);
         }
 
-        Inst::IntToFloat(value, _, to) => {
+        Inst::IntToFloat(value, i2f_from, to) => {
             var voff: i64 = PeStackFrame_offset(frame, value);
             PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RAX, voff);
-            if ir_type_eq(to, IrType::F32) {
+            if ir_type_eq(i2f_from, IrType::U64) {
+                // BG67: a u64 at or above 2^63 is converted unsigned:
+                // halved with its low bit kept (round to odd), converted,
+                // doubled; cvtsi2sd read it as a negative i64
+                peir_u64_to_float(&mut self.enc, ir_type_eq(to, IrType::F32));
+                if ir_type_eq(to, IrType::F32) {
+                    peir_store_f32_xmm0(&mut self.enc, dst);
+                } else {
+                    PeirEnc_movsd_mem_rbp_xmm(&mut self.enc, dst, 0);
+                }
+            } else if ir_type_eq(to, IrType::F32) {
                 // OP17: cvtsi2ss xmm0, rax (it stored the low half of an
                 // f64's bits as the f32)
                 peir_emit2(&mut self.enc, 0xF3, 0x48);
@@ -5460,6 +5558,13 @@ pub fn PeirGen_gen_inst(self: &mut PeirGen, id: i64, inst: Inst, next_cond: i64,
                 peir_pun_f32_i64(&mut self.enc, voff, dst);
             } else {
                 PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RAX, voff);
+                if ir_type_is_int(bc_from) && ir_type_is_int(bc_to) && ir_type_size(bc_to) < 8 {
+                    // BG38: a same-width cast between signed and unsigned
+                    // (`200 as u8 as i8`) re-extends the word for the new
+                    // type, as IntTrunc does (M7): it kept 200, and `b + 1`
+                    // on that i8 failed its overflow check
+                    peir_norm_narrow(&mut self.enc, bc_to);
+                }
                 PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, PEIR_RAX);
             }
         }
@@ -5492,10 +5597,12 @@ pub fn PeirGen_gen_inst(self: &mut PeirGen, id: i64, inst: Inst, next_cond: i64,
                 }
                 if pr_f32 {
                     // movss xmm0, [rbp+off]; cvtss2sd; movq rcx, xmm0
+                    // (BG7: 66 REX.W 0F 7E C1; 0F D6 C1 is movq xmm1,
+                    // xmm0 and left rcx unset: println of an f32 printed 0)
                     PeirEnc_movss_xmm_mem_rbp(&mut self.enc, 0, voff);
                     peir_cvt_float(&mut self.enc, true);
                     peir_emit2(&mut self.enc, 0x66, 0x48);
-                    peir_emit2(&mut self.enc, 0x0F, 0xD6);
+                    peir_emit2(&mut self.enc, 0x0F, 0x7E);
                     PeirEnc_emit_u8(&mut self.enc, 0xC1);
                 } else {
                     PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RCX, voff);
@@ -7259,356 +7366,15 @@ fn PeirGen_gen_float_rem(self: &mut PeirGen, dst: i64, is_f32: bool) -> void {
     }
 }
 
-// ===========================================================================
-// J7: @constant_time on the default Windows backend (and --bare / --elf)
-// ===========================================================================
-//
-// The source-level check (TypeChecker_verify_constant_time) works on names
-// in the AST. This one runs on the IR this backend turns into machine code,
-// after lowering and the mid-end, and follows values through memory and
-// calls, so it also sees what the source check cannot: a secret that
-// reaches a loop bound through an `&mut` out-parameter, a field of a local
-// struct, or a global. nat_ir.fd's ng_ct_check is its machine-layer
-// counterpart for `--nat` and the Linux targets.
-//
-// Secret: every parameter (the IR does not keep @public), and every value
-// computed from a secret: arithmetic, comparisons, conversions, addresses,
-// a load from memory a secret was stored into (per alloca or global, flow-
-// insensitive), and the result of a call one of whose arguments is secret,
-// except a length query (`len`, `*_len`, `*_length`: lengths are public,
-// as in the source check). A call that is given a secret also makes the memory behind
-// every pointer it is given secret (it may store the secret there).
-//
-// Rejected in a @constant_time function:
-//   a conditional branch on a secret value (a jcc in this backend's code)
-//   integer division or remainder of a secret (idiv/div: variable latency),
-//     except a signed division by a constant >= 2, which this backend turns
-//     into a multiplication (PeirGen_gen_div_const)
-//   float division of a secret (divsd: variable latency)
-//   an indirect call (closure, function value, dyn method)
-// Not rejected: overflow, bounds and narrowing checks. Their jump is taken
-// only on a run that ends in a panic, so a run that completes executes the
-// same instructions whatever the secret is. Memory addresses are not
-// checked here either (a pointer to a secret buffer is not secret itself);
-// the source check rejects indexing by a secret.
-// FID_PE_CT_OFF=1 turns this check off (to compare, or around a false
-// positive: please report one).
-
-/// The alloca or global that pointer `v` is derived from (through field and
-/// element addresses and bit casts): its instruction id, or -1.
-fn peir_ct_root(func: &IrFunction, v: i64) -> i64 {
-    var cur: i64 = v;
-    var steps: i64 = 0;
-    while steps < 64 {
-        match peir_inst_of(func, cur) {
-            Inst::Alloca(_, _) => {
-                return cur;
-            }
-            Inst::GlobalAddr(_, _) => {
-                return cur;
-            }
-            Inst::GetFieldPtr(p, _, _) => {
-                cur = p;
-            }
-            Inst::GetElemPtr(p, _, _) => {
-                cur = p;
-            }
-            Inst::BitCast(p, _, _) => {
-                cur = p;
-            }
-            _ => {
-                return -1;
-            }
-        }
-        steps = steps + 1;
-    }
-    return -1;
-}
-
-/// The key of the memory `p` points into ("a:<alloca id>", "g:<global>"),
-/// or "" when it is not a local or a global.
-fn peir_ct_mem_key(func: &IrFunction, p: i64) -> str {
-    var root: i64 = peir_ct_root(func, p);
-    if root < 0 {
-        return "";
-    }
-    match peir_inst_of(func, root) {
-        Inst::GlobalAddr(gname, _) => {
-            return "g:" + gname;
-        }
-        _ => {
-        }
-    }
-    return "a:" + int_to_str(root);
-}
-
-/// Does `p` point into memory a secret was stored into?
-fn peir_ct_mem_secret(func: &IrFunction, mem: i64, p: i64) -> bool {
-    var key: str = peir_ct_mem_key(func, p);
-    if key == "" {
-        return false;
-    }
-    return HashMap_contains(mem, key);
-}
-
-/// Mark the memory `p` points into as holding a secret; true when it was
-/// not marked before.
-fn peir_ct_mem_mark(func: &IrFunction, mem: i64, p: i64) -> bool {
-    var key: str = peir_ct_mem_key(func, p);
-    if key == "" || HashMap_contains(mem, key) {
-        return false;
-    }
-    HashMap_insert(mem, key, 1);
-    return true;
-}
-
-fn peir_ct_sec(secret: &Vec<i64>, v: i64) -> bool {
-    return v >= 0 && v < secret.len() && secret.get(v) != 0;
-}
-
-/// Is any of `args` secret, or a pointer to memory holding a secret?
-fn peir_ct_args_secret(func: &IrFunction, secret: &Vec<i64>, mem: i64, args: Vec<i64>) -> bool {
-    var i: i64 = 0;
-    while i < args.len() {
-        var a: i64 = args.get(i);
-        if peir_ct_sec(secret, a) || peir_ct_mem_secret(func, mem, a) {
-            return true;
-        }
-        i = i + 1;
-    }
-    return false;
-}
-
-/// A call given a secret may store it behind any pointer it is given.
-fn peir_ct_args_mark(func: &IrFunction, mem: i64, args: Vec<i64>) -> bool {
-    var changed: bool = false;
-    var i: i64 = 0;
-    while i < args.len() {
-        if peir_ct_mem_mark(func, mem, args.get(i)) {
-            changed = true;
-        }
-        i = i + 1;
-    }
-    return changed;
-}
-
-/// A length query: its result is public (TypeChecker's ct_secret rule;
-/// a str's `.len()` lowers to p_str_length).
-fn peir_ct_is_len(name: str) -> bool {
-    return name == "len" || str_ends_with(name, "_len") || str_ends_with(name, "_length");
-}
-
-fn peir_ct_unsigned(ty: IrType) -> bool {
-    return ir_type_eq(ty, IrType::U8) || ir_type_eq(ty, IrType::U16) || ir_type_eq(ty, IrType::U32) || ir_type_eq(ty, IrType::U64);
-}
-
-/// " (line N)" for value `id` when the lowering recorded its source line.
-fn peir_ct_line(func: &IrFunction, id: i64) -> str {
-    match IrFunction_get_meta(func, id) {
-        OptValueMeta::Some(m) => {
-            match m.source_line {
-                OptU64::Some(v) => {
-                    if v > 0 {
-                        return " (line " + int_to_str(v as i64) + ")";
-                    }
-                }
-                OptU64::None => {
-                }
-            }
-        }
-        OptValueMeta::None => {
-        }
-    }
-    return "";
-}
+// J7: the IR-level @constant_time check (peir_ct_check and its helpers) is
+// in compiler/checks.fd, shared with the machine layer (nat_ir.fd's
+// ng_gen_function calls it too), so both native backends judge branches and
+// divisions on secrets by the same rule; this backend only reports it.
 
 /// Is the check turned off (FID_PE_CT_OFF set and not empty)?
 fn peir_ct_off() -> bool {
     var sw: str = peir_env_or_empty("FID_PE_CT_OFF");
     return str_len(sw) > 0 && sw != "0";
-}
-
-/// The violations of @constant_time function `func` (named `name`), one
-/// message each; empty when it is clean. See the section comment above.
-pub fn peir_ct_check(func: &IrFunction, name: str) -> Vec<str> {
-    var errs: Vec<str> = Vec::new();
-    var nvals: i64 = func.value_metas.len() + func.insts.len() + func.params.len() + 16;
-    if func.next_value + 1 > nvals {
-        nvals = func.next_value + 1;
-    }
-    var secret: Vec<i64> = peir_zeros(nvals);
-    var mem: i64 = HashMap_new();
-    var pi: i64 = 0;
-    while pi < func.params.len() {
-        var pid: i64 = func.params.get(pi).id;
-        if pid >= 0 && pid < nvals {
-            secret.set(pid, 1);
-        }
-        pi = pi + 1;
-    }
-    // The instructions of the function's blocks, in layout order
-    var ids: Vec<i64> = Vec::new();
-    var bi: i64 = 0;
-    while bi < func.blocks.len() {
-        var blk: BasicBlock = func.blocks.get(bi);
-        var k: i64 = 0;
-        while k < blk.instructions.len() {
-            ids.push(blk.instructions.get(k));
-            k = k + 1;
-        }
-        bi = bi + 1;
-    }
-    // Propagate to a fixpoint: secrets only grow, so each round that
-    // changes something marks at least one more value or memory root.
-    var changed: bool = true;
-    var rounds: i64 = 0;
-    while changed && rounds < nvals + 2 {
-        changed = false;
-        rounds = rounds + 1;
-        var ii: i64 = 0;
-        while ii < ids.len() {
-            var id: i64 = ids.get(ii);
-            var t: bool = false;
-            match peir_inst_of(func, id) {
-                Inst::BinOp(_, l, r, _) => {
-                    t = peir_ct_sec(&secret, l) || peir_ct_sec(&secret, r);
-                }
-                Inst::UnaryOp(_, x, _) => {
-                    t = peir_ct_sec(&secret, x);
-                }
-                Inst::BitCast(x, _, _) => {
-                    t = peir_ct_sec(&secret, x);
-                }
-                Inst::IntExtend(x, _, _) => {
-                    t = peir_ct_sec(&secret, x);
-                }
-                Inst::IntTrunc(x, _, _) => {
-                    t = peir_ct_sec(&secret, x);
-                }
-                Inst::IntToFloat(x, _, _) => {
-                    t = peir_ct_sec(&secret, x);
-                }
-                Inst::FloatToInt(x, _, _) => {
-                    t = peir_ct_sec(&secret, x);
-                }
-                Inst::GetFieldPtr(p, _, _) => {
-                    t = peir_ct_sec(&secret, p);
-                }
-                Inst::GetElemPtr(p, ix, _) => {
-                    t = peir_ct_sec(&secret, p) || peir_ct_sec(&secret, ix);
-                }
-                Inst::Load(p, _) => {
-                    t = peir_ct_sec(&secret, p) || peir_ct_mem_secret(func, mem, p);
-                }
-                Inst::Store(sptr, sval, _) => {
-                    if peir_ct_sec(&secret, sval) || peir_ct_mem_secret(func, mem, sval) {
-                        if peir_ct_mem_mark(func, mem, sptr) {
-                            changed = true;
-                        }
-                    }
-                }
-                Inst::StructCopy(cdst, csrc, _) => {
-                    if peir_ct_sec(&secret, csrc) || peir_ct_mem_secret(func, mem, csrc) {
-                        if peir_ct_mem_mark(func, mem, cdst) {
-                            changed = true;
-                        }
-                    }
-                }
-                Inst::Call(callee, cargs, _, _) => {
-                    var any: bool = peir_ct_args_secret(func, &secret, mem, cargs);
-                    if any {
-                        if !peir_ct_is_len(callee) {
-                            t = true;
-                        }
-                        if peir_ct_args_mark(func, mem, cargs) {
-                            changed = true;
-                        }
-                    }
-                }
-                Inst::CallPtr(fptr, pargs, _, _, _) => {
-                    var pany: bool = peir_ct_sec(&secret, fptr) || peir_ct_args_secret(func, &secret, mem, pargs);
-                    if pany {
-                        t = true;
-                        if peir_ct_args_mark(func, mem, pargs) {
-                            changed = true;
-                        }
-                    }
-                }
-                Inst::DynCall(_, _, dargs, _, _) => {
-                    if peir_ct_args_secret(func, &secret, mem, dargs) {
-                        t = true;
-                        if peir_ct_args_mark(func, mem, dargs) {
-                            changed = true;
-                        }
-                    }
-                }
-                _ => {
-                }
-            }
-            if t && id >= 0 && id < nvals && secret.get(id) == 0 {
-                secret.set(id, 1);
-                changed = true;
-            }
-            ii = ii + 1;
-        }
-    }
-    // What the code would do with the secrets
-    var ci: i64 = 0;
-    while ci < ids.len() {
-        var cid: i64 = ids.get(ci);
-        var what: str = "";
-        match peir_inst_of(func, cid) {
-            Inst::Branch(cond, _, _) => {
-                if peir_ct_sec(&secret, cond) {
-                    what = "conditional branch on secret data";
-                }
-            }
-            Inst::BinOp(op, l, r, ty) => {
-                var is_div: bool = false;
-                match op {
-                    BinOp::Div => {
-                        is_div = true;
-                    }
-                    BinOp::Mod => {
-                        is_div = true;
-                    }
-                    _ => {
-                    }
-                }
-                if is_div && (peir_ct_sec(&secret, l) || peir_ct_sec(&secret, r)) {
-                    if ir_type_is_float(ty) {
-                        what = "float division of secret data (variable latency)";
-                    } else {
-                        // A signed division by a constant >= 2 is a multiply
-                        var by_const: bool = false;
-                        match peir_inst_of(func, r) {
-                            Inst::ConstInt(d, _) => {
-                                by_const = d >= 2 && !peir_ct_unsigned(ty);
-                            }
-                            _ => {
-                            }
-                        }
-                        if !by_const {
-                            what = "integer division of secret data (variable latency)";
-                        }
-                    }
-                }
-            }
-            Inst::CallPtr(_, _, _, _, _) => {
-                what = "indirect call (closure or function value)";
-            }
-            Inst::DynCall(_, _, _, _, _) => {
-                what = "indirect call (dyn method)";
-            }
-            _ => {
-            }
-        }
-        if what != "" {
-            errs.push("@constant_time function '" + name + "': " + what + peir_ct_line(func, cid));
-        }
-        ci = ci + 1;
-    }
-    return errs;
 }
 
 /// The error lines of a build that @constant_time code fails: `what` names

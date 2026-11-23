@@ -183,6 +183,14 @@ pub fn set_c_debug_info(fd_file: str, source: str, c_file: str) {
     g_c_dbg_names = cg_source_fn_names(source);
 }
 
+/// BG50: -g off again (`fid serve` resets it between requests).
+pub fn clear_c_debug_info() {
+    g_c_dbg = false;
+    g_c_dbg_file_esc = "";
+    g_c_dbg_cfile_esc = "";
+    g_c_dbg_names = 0;
+}
+
 /// The C compiler flag -g needs (" -g", or "" without -g).
 pub fn c_debug_cflags() -> str {
     if g_c_dbg {
@@ -221,6 +229,11 @@ pub fn set_c_register_all(v: bool) {
 /// CGen_lib_header next to the library.
 pub fn CGen_lib_set(on: bool) {
     g_c_lib = on;
+}
+
+/// BG50: forget the `--export` names (`fid serve` between requests).
+pub fn CGen_lib_reset_exports() {
+    g_c_lib_extra = ",";
 }
 
 /// CI7: export `name` as well as the `@export` functions.
@@ -3423,8 +3436,11 @@ fn emit_runtime_types(self: &mut CCodeGen) -> void {
     // Counting a string inline (proposal 0004): one more owner, or one fewer
     // with a call to core's Str_drop only to free it (or to stop on a string
     // already freed)
-    wln(self, "#define P_STR_DUP(sv) do { int64_t __q = (int64_t)(sv); if (__q && !(__q & 7)) { int64_t* __h = (int64_t*)(intptr_t)(__q - 16); if (P_STR_COUNTED_C(__h[0]) && (uint64_t)__h[1] < 0x10000000000ULL && (__h[0] & 0x3FFFFFFFLL) < 0x3FFFFFFELL) __h[0] += 1; else if (__h[0] == 0x4649444553545203LL) Str_dup(0, __q); } } while (0)");
-    wln(self, "#define P_STR_DROP(sv) do { int64_t __q = (int64_t)(sv); if (__q && !(__q & 7)) { int64_t* __h = (int64_t*)(intptr_t)(__q - 16); if (P_STR_COUNTED_C(__h[0]) && (uint64_t)__h[1] < 0x10000000000ULL && (__h[0] & 0x3FFFFFFFLL) > 1) __h[0] -= 1; else if (P_STR_COUNTED_C(__h[0]) || __h[0] == 0x4649444553545203LL) Str_drop(0, __q); } } while (0)");
+    // (anything but a counted string's fast path or a literal goes to core:
+    // a freed string stops there, and so does a str without a string
+    // header, string header by construction, core p_str_no_header)
+    wln(self, "#define P_STR_DUP(sv) do { int64_t __q = (int64_t)(sv); if (__q) { if (!(__q & 7)) { int64_t* __h = (int64_t*)(intptr_t)(__q - 16); if (P_STR_COUNTED_C(__h[0]) && (uint64_t)__h[1] < 0x10000000000ULL && (__h[0] & 0x3FFFFFFFLL) < 0x3FFFFFFELL) __h[0] += 1; else if (__h[0] != P_STR_STATIC_C && __h[0] != P_STR_MAGIC_C) Str_dup(0, __q); } else Str_dup(0, __q); } } while (0)");
+    wln(self, "#define P_STR_DROP(sv) do { int64_t __q = (int64_t)(sv); if (__q) { if (!(__q & 7)) { int64_t* __h = (int64_t*)(intptr_t)(__q - 16); if (P_STR_COUNTED_C(__h[0]) && (uint64_t)__h[1] < 0x10000000000ULL && (__h[0] & 0x3FFFFFFFLL) > 1) __h[0] -= 1; else if (__h[0] != P_STR_STATIC_C && __h[0] != P_STR_MAGIC_C) Str_drop(0, __q); } else Str_drop(0, __q); } } while (0)");
     // A Fides string with one owner made from what a runtime function built:
     // a counted or literal string is itself; anything else is copied into a
     // counted one, and a plain block of the allocator is freed (a C heap or
@@ -3587,7 +3603,7 @@ fn emit_runtime_types(self: &mut CCodeGen) -> void {
     wln(self, "static inline int64_t __p_vec_get_u(void* e, int64_t v, int64_t i) { (void)e; int64_t* __hh = (int64_t*)(intptr_t)v; if (P_UNLIKELY(__hh[3])) return __p_vec_ld(__hh, i); return ((int64_t*)(intptr_t)__hh[0])[i]; } \\");
     wln(self, "static inline void __p_vec_set_u(void* e, int64_t v, int64_t i, int64_t x) { (void)e; int64_t* __hh = (int64_t*)(intptr_t)v; if (P_UNLIKELY(__hh[2] < 0)) __p_vec_grow(__hh); if (P_UNLIKELY(__hh[3])) { __p_vec_st(__hh, i, x); return; } ((int64_t*)(intptr_t)__hh[0])[i] = x; } \\");
     wln(self, "static inline void* __p_pvec_get_u(PVec* v, int64_t i) { return P_VEC_AT(v, i); } \\");
-    wln(self, "static inline void __p_pvec_set_u(PVec* v, int64_t i, void* x) { if (v->code) { __p_vec_st((int64_t*)v, i, (int64_t)(intptr_t)x); return; } P_VSLOT(v, i) = (int64_t)(intptr_t)x; }");
+    wln(self, "static inline void __p_pvec_set_u(PVec* v, int64_t i, void* x) { if (P_UNLIKELY(v->cap < 0)) __p_vec_grow((int64_t*)v); if (v->code) { __p_vec_st((int64_t*)v, i, (int64_t)(intptr_t)x); return; } P_VSLOT(v, i) = (int64_t)(intptr_t)x; }");
     wln(self, "P_VEC_UNCHECKED");
     wln(self, "char* p_file_read(const char* path);");
     wln(self, "int64_t p_file_write(const char* path, const char* content);");
@@ -6884,7 +6900,13 @@ fn cg_vec_get_word(self: &mut CCodeGen, func: IrFunction, id: i64, vec: str, idx
             conv = "((union { int64_t i; double d; }){ .i = __gw }).d";
         }
         IrType::F32 => {
-            conv = "((union { int32_t i; float f; }){ .i = (int32_t)__gw }).f";
+            // BG7: a Vec<f32> element word holds the single's F64 bits
+            // (the OP21 layout canon: cast_arg stores an f32 through
+            // `union { double d; int64_t i; }`), so the whole word is
+            // punned to a double and narrowed, as the Call result path
+            // does. The old low-32 pun read the double's low mantissa
+            // bits (1.5 printed 0).
+            conv = "(float)((union { int64_t i; double d; }){ .i = __gw }).d";
         }
         IrType::Bool => {
             conv = "(bool)(__gw != 0)";
@@ -7500,7 +7522,7 @@ fn gen_inst(self: &mut CCodeGen, inst: Inst, id: i64, func: IrFunction) -> void 
                         if oname == "any" {
                             wln(self, "    p_print_int((int64_t)" + arg_str + ");");
                         } else if oname == "Vec" {
-                            wln(self, "    { char* _s = (char*)Vec_to_str(0, (int64_t)" + arg_str + "); p_print_str(_s); }");
+                            wln(self, "    { char* _s = (char*)Vec_to_str(0, (int64_t)" + arg_str + "); p_print_str(_s); Str_drop(0, (int64_t)(intptr_t)_s); }");
                         } else if oname == "HashMap" {
                             wln(self, "    { char* _s = p_to_str_map((PMap*)" + arg_str + "); p_print_str(_s); p_str_free_c(_s); }");
                         } else if oname == "Tensor" {
@@ -7511,7 +7533,7 @@ fn gen_inst(self: &mut CCodeGen, inst: Inst, id: i64, func: IrFunction) -> void 
                     }
                     IrType::Generic(gname, _) => {
                         if gname == "Vec" {
-                            wln(self, "    { char* _s = (char*)Vec_to_str(0, (int64_t)" + arg_str + "); p_print_str(_s); }");
+                            wln(self, "    { char* _s = (char*)Vec_to_str(0, (int64_t)" + arg_str + "); p_print_str(_s); Str_drop(0, (int64_t)(intptr_t)_s); }");
                         } else if gname == "HashMap" {
                             wln(self, "    { char* _s = p_to_str_map((PMap*)" + arg_str + "); p_print_str(_s); p_str_free_c(_s); }");
                         } else {
@@ -7549,7 +7571,7 @@ fn gen_inst(self: &mut CCodeGen, inst: Inst, id: i64, func: IrFunction) -> void 
                         if oname == "any" {
                             wln(self, "    p_print_int((int64_t)" + arg_str + ");");
                         } else if oname == "Vec" {
-                            wln(self, "    { char* _s = (char*)Vec_to_str(0, (int64_t)" + arg_str + "); p_print_str(_s); }");
+                            wln(self, "    { char* _s = (char*)Vec_to_str(0, (int64_t)" + arg_str + "); p_print_str(_s); Str_drop(0, (int64_t)(intptr_t)_s); }");
                         } else if oname == "HashMap" {
                             wln(self, "    { char* _s = p_to_str_map((PMap*)" + arg_str + "); p_print_str(_s); p_str_free_c(_s); }");
                         } else if oname == "Tensor" {
@@ -7560,7 +7582,7 @@ fn gen_inst(self: &mut CCodeGen, inst: Inst, id: i64, func: IrFunction) -> void 
                     }
                     IrType::Generic(gname, _) => {
                         if gname == "Vec" {
-                            wln(self, "    { char* _s = (char*)Vec_to_str(0, (int64_t)" + arg_str + "); p_print_str(_s); }");
+                            wln(self, "    { char* _s = (char*)Vec_to_str(0, (int64_t)" + arg_str + "); p_print_str(_s); Str_drop(0, (int64_t)(intptr_t)_s); }");
                         } else if gname == "HashMap" {
                             wln(self, "    { char* _s = p_to_str_map((PMap*)" + arg_str + "); p_print_str(_s); p_str_free_c(_s); }");
                         } else {
@@ -8135,20 +8157,20 @@ fn gen_inst(self: &mut CCodeGen, inst: Inst, id: i64, func: IrFunction) -> void 
                 }
                 IrType::Generic(name, _) => {
                     if name == "Vec" {
-                        wln(self, "    { char* _s = (char*)Vec_to_str(0, (int64_t)" + v + "); p_print_str(_s); }");
+                        wln(self, "    { char* _s = (char*)Vec_to_str(0, (int64_t)" + v + "); p_print_str(_s); Str_drop(0, (int64_t)(intptr_t)_s); }");
                     } else if name == "HashMap" {
-                        wln(self, "    { char* _s = (char*)HashMap_to_str(0, (int64_t)" + v + "); p_print_str(_s); }");
+                        wln(self, "    { char* _s = (char*)HashMap_to_str(0, (int64_t)" + v + "); p_print_str(_s); Str_drop(0, (int64_t)(intptr_t)_s); }");
                     } else {
                         wln(self, "    p_print_int((int64_t)" + v + ");");
                     }
                 }
                 IrType::Opaque(name) => {
                     if name == "Vec" {
-                        wln(self, "    { char* _s = (char*)Vec_to_str(0, (int64_t)" + v + "); p_print_str(_s); }");
+                        wln(self, "    { char* _s = (char*)Vec_to_str(0, (int64_t)" + v + "); p_print_str(_s); Str_drop(0, (int64_t)(intptr_t)_s); }");
                     } else if name == "HashMap" {
                         // The self-hosted lowerer types HashMap::new() as
                         // Opaque("HashMap") (src/lower.rs: Generic).
-                        wln(self, "    { char* _s = (char*)HashMap_to_str(0, (int64_t)" + v + "); p_print_str(_s); }");
+                        wln(self, "    { char* _s = (char*)HashMap_to_str(0, (int64_t)" + v + "); p_print_str(_s); Str_drop(0, (int64_t)(intptr_t)_s); }");
                     } else if name == "String" {
                         wln(self, "    p_print_str((char*)" + v + ");");
                     } else if name == "Tensor" {
@@ -8999,9 +9021,10 @@ fn cg_mc_at_stmt(ln: i64) -> str {
 // LF18: @constant_time on the C path (ccompile, dump-c, build through C)
 // ===========================================================================
 //
-// The same IR-level check as pe_ir.fd's peir_ct_check (the default Windows
-// backend) and nat_ir.fd's ng_ct_check, run on the IR this generator turns
-// into C. It is a copy, not a call: codegen_c.fd may not import pe_ir
+// The same IR-level check as peir_ct_check, which pe_ir and (since Nov 22)
+// the machine layer both run; it moved from pe_ir.fd to checks.fd, which
+// this file imports, so this copy could now be replaced by a call (a later
+// cleanup). It was a copy because codegen_c.fd may not import pe_ir
 // (known-bugs trap 17: that doubled the C of every program). Keep the two
 // in step; the rules are the ones documented above peir_ct_check:
 //
@@ -11614,18 +11637,19 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    return v;");
     wln(self, "}");
     wln(self, "");
+    // BG40: push, set and insert go through the element code and the share
+    // box as core's Vec does: they grew a word buffer and stored 8 bytes
+    // whatever the element size (a heap overflow on a Vec<u8>), and took a
+    // negative capacity (a shared buffer, -box-1) for a full one, freeing
+    // data other Vecs hold. __p_vec_grow owns a shared buffer first (one
+    // owner left: kept; more: copied), grows at the element size and keeps
+    // the J8 wipe registry (a @zeroize Vec's new buffer).
     wln(self, "void p_vec_push(PVec* v, void* val) {");
     wln(self, "    if (!v) return;");
-    wln(self, "    if (v->len >= v->cap) {");
-    wln(self, "        v->cap = v->cap == 0 ? 8 : v->cap * 2;");
-    wln(self, "        void** new_data = (void**)p_malloc(v->cap * 8);");
-    wln(self, "        if (v->data && v->len > 0) { memcpy(new_data, v->data, (size_t)v->len * 8); }");
-    wln(self, "        if (v->data) { __p_vbuf_free((int64_t*)(intptr_t)v->data); }");
-    // J8: a @zeroize Vec's new buffer is wiped when it is freed in turn
-    wln(self, "        if (__p_sensitive_n > 0 && __p_sensitive_at(v) >= 0) __p_sens_buf_add(new_data, v->cap * 8);");
-    wln(self, "        v->data = new_data;");
-    wln(self, "    }");
-    wln(self, "    P_VSLOT(v, v->len) = (int64_t)(intptr_t)val; v->len++;");
+    wln(self, "    if (v->cap < 0 || v->len >= v->cap) __p_vec_grow((int64_t*)v);");
+    wln(self, "    if (v->code) __p_vec_st((int64_t*)v, v->len, (int64_t)(intptr_t)val);");
+    wln(self, "    else P_VSLOT(v, v->len) = (int64_t)(intptr_t)val;");
+    wln(self, "    v->len++;");
     wln(self, "}");
     wln(self, "");
     wln(self, "void* p_vec_get(PVec* v, int64_t idx) {");
@@ -11637,7 +11661,9 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "");
     wln(self, "void p_vec_set(PVec* v, int64_t idx, void* val) {");
     wln(self, "    if (!v || idx < 0 || idx >= v->len) return;");
-    wln(self, "    P_VSLOT(v, idx) = (int64_t)(intptr_t)val;");
+    wln(self, "    if (v->cap < 0) __p_vec_grow((int64_t*)v);");
+    wln(self, "    if (v->code) __p_vec_st((int64_t*)v, idx, (int64_t)(intptr_t)val);");
+    wln(self, "    else P_VSLOT(v, idx) = (int64_t)(intptr_t)val;");
     wln(self, "}");
     wln(self, "");
     wln(self, "int64_t p_vec_len(PVec* v) { return v ? v->len : 0; }");
@@ -12653,9 +12679,12 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "}");
     wln(self, "int64_t p_file_write(const char* path, const char* content) {");
     wln(self, "    if (P_CAP_DENIED(P_CAP_FS)) return -1;");
+    // BG81: a counted string's bytes, NULs included (fputs stopped at the
+    // first), and a failed write or flush is -1 (it was 0)
     wln(self, "    FILE* f = fopen(path, \"wb\");");
     wln(self, "    if (!f) return -1;");
-    wln(self, "    fputs(content, f); fclose(f); return 0;");
+    wln(self, "    size_t n = (size_t)p_slen(content);");
+    wln(self, "    int bad = n > 0 && fwrite(content, 1, n, f) != n; if (fclose(f) != 0) bad = 1; return bad ? -1 : 0;");
     wln(self, "}");
     wln(self, "int64_t p_file_write_bin(const char* path, const char* data, int64_t len) {");
     wln(self, "    if (P_CAP_DENIED(P_CAP_FS)) return -1;");
@@ -12673,7 +12702,9 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    if (!f) return -1;");
     // C4: a full disk is an error, not a silent success (the write or the
     // flush at fclose fails)
-    wln(self, "    int bad = fputs(content, f) < 0; if (fclose(f) != 0) bad = 1; return bad ? -1 : 0;");
+    // BG81: every byte of a counted string, as p_file_write
+    wln(self, "    size_t n = (size_t)p_slen(content);");
+    wln(self, "    int bad = n > 0 && fwrite(content, 1, n, f) != n; if (fclose(f) != 0) bad = 1; return bad ? -1 : 0;");
     wln(self, "}");
     wln(self, "int64_t p_file_delete(const char* path) { if (P_CAP_DENIED(P_CAP_FS)) return -1; return remove(path) == 0 ? 0 : -1; }");
     wln(self, "int64_t p_file_size(const char* path) { if (P_CAP_DENIED(P_CAP_FS)) return -1; FILE* f = fopen(path, \"rb\"); if (!f) return -1; fseek(f, 0, SEEK_END); int64_t sz = ftell(f); fclose(f); return (sz < 0 || (uint64_t)sz >= ((uint64_t)1 << 48)) ? -1 : sz; }");
@@ -12684,10 +12715,22 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "char* p_read_line(void) { return p_str_copy_c(p_read_line__raw()); }");
     wln(self, "static char* p_read_line__raw(void) {");
     wln(self, "    static char* __p_line_buf = NULL;");
-    wln(self, "    static int __p_line_cap = 0;");
-    wln(self, "    if (!__p_line_buf) { __p_line_cap = 4096; __p_line_buf = (char*)p_malloc_persistent(__p_line_cap); }");
-    wln(self, "    if (!fgets(__p_line_buf, __p_line_cap, stdin)) return NULL;");
-    wln(self, "    int len = (int)strlen(__p_line_buf);");
+    // BG41: a line longer than the buffer was returned in pieces (one per
+    // 4095 bytes): the buffer grows until the line's end (or the input's)
+    wln(self, "    static size_t __p_line_cap = 0;");
+    wln(self, "    if (!__p_line_buf) { __p_line_cap = 4096; __p_line_buf = (char*)p_malloc_persistent((int64_t)__p_line_cap); if (!__p_line_buf) return NULL; }");
+    wln(self, "    size_t len = 0;");
+    wln(self, "    for (;;) {");
+    wln(self, "        if (!fgets(__p_line_buf + len, (int)(__p_line_cap - len), stdin)) { if (len == 0) return NULL; break; }");
+    wln(self, "        len += strlen(__p_line_buf + len);");
+    wln(self, "        if (len > 0 && __p_line_buf[len - 1] == '\\n') break;");
+    // fgets stopped short of a full buffer: the input ended
+    wln(self, "        if (len + 1 < __p_line_cap) break;");
+    wln(self, "        if (__p_line_cap > 0x3FFFFFFF) break;");
+    wln(self, "        char* nb = (char*)realloc(__p_line_buf, __p_line_cap * 2);");
+    wln(self, "        if (!nb) break;");
+    wln(self, "        __p_line_buf = nb; __p_line_cap *= 2;");
+    wln(self, "    }");
     wln(self, "    while (len > 0 && (__p_line_buf[len-1] == '\\n' || __p_line_buf[len-1] == '\\r')) { __p_line_buf[--len] = 0; }");
     wln(self, "    return __p_line_buf;");
     wln(self, "}");
@@ -12775,25 +12818,51 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "#endif");
     wln(self, "    return d;");
     wln(self, "}");
+    // BG69: the slot table's lock and the capture-file number (TinyCC has
+    // no atomics here, as __p_xfree_take)
+    wln(self, "#if defined(__TINYC__)");
+    wln(self, "#define P_PROC_LOCK(l) ((void)(l))");
+    wln(self, "#define P_PROC_UNLOCK(l) ((void)(l))");
+    wln(self, "#define P_PROC_NEXT(c) ((*(c))++)");
+    wln(self, "#elif defined(_MSC_VER)");
+    wln(self, "#define P_PROC_LOCK(l) while (_InterlockedExchange((volatile long*)(l), 1)) { }");
+    wln(self, "#define P_PROC_UNLOCK(l) _InterlockedExchange((volatile long*)(l), 0)");
+    wln(self, "#define P_PROC_NEXT(c) (_InterlockedIncrement64((volatile long long*)(c)) - 1)");
+    wln(self, "#else");
+    wln(self, "#define P_PROC_LOCK(l) while (__atomic_exchange_n((l), 1, __ATOMIC_ACQUIRE)) { }");
+    wln(self, "#define P_PROC_UNLOCK(l) __atomic_store_n((l), 0, __ATOMIC_RELEASE)");
+    wln(self, "#define P_PROC_NEXT(c) __atomic_fetch_add((c), 1, __ATOMIC_RELAXED)");
+    wln(self, "#endif");
     wln(self, "int64_t p_process_run(const char* cmd) {");
     wln(self, "    if (!cmd || !*cmd || P_CAP_DENIED(P_CAP_PROC)) return 0;");
     wln(self, "#ifdef __wasi__");
     wln(self, "    p_panic(\"not available in WebAssembly: processes (p_process_run)\");");
     wln(self, "    return 0;");
     wln(self, "#else");
-    wln(self, "    static int ctr = 0;");
+    // BG69: two threads running commands at once took one slot and one pair
+    // of capture files (an unlocked scan, `ctr++`): the slot is claimed (used)
+    // under a lock and the number is atomic. The command line was cut at
+    // 8191 bytes (a fixed buffer): it is allocated to its length.
+    wln(self, "    static int64_t ctr = 0;");
+    wln(self, "    static long lk = 0;");
     wln(self, "    int slot = -1;");
-    wln(self, "    for (int i = 0; i < 128; i++) if (!__p_proc_table[i].used) { slot = i; break; }");
+    wln(self, "    P_PROC_LOCK(&lk);");
+    wln(self, "    for (int i = 0; i < 128; i++) if (!__p_proc_table[i].used) { slot = i; __p_proc_table[i].used = 2; break; }");
+    wln(self, "    P_PROC_UNLOCK(&lk);");
     wln(self, "    if (slot < 0) return 0;");
-    wln(self, "    char of[1024], ef[1024], full[8192];");
+    wln(self, "    int64_t k = P_PROC_NEXT(&ctr);");
+    wln(self, "    char of[1024], ef[1024];");
     wln(self, "    const char* td = __p_proc_tmpdir();");
     wln(self, "    size_t tdl = strlen(td);");
     wln(self, "    const char* sep = (tdl > 0 && (td[tdl - 1] == '/' || td[tdl - 1] == '\\\\')) ? \"\" : \"/\";");
-    wln(self, "    snprintf(of, sizeof of, \"%s%s.fides_proc_%ld_%d.out\", td, sep, (long)p_getpid(), ctr);");
-    wln(self, "    snprintf(ef, sizeof ef, \"%s%s.fides_proc_%ld_%d.err\", td, sep, (long)p_getpid(), ctr);");
-    wln(self, "    ctr++;");
-    wln(self, "    snprintf(full, sizeof full, \"( %s ) > \\\"%s\\\" 2> \\\"%s\\\"\", cmd, of, ef);");
+    wln(self, "    snprintf(of, sizeof of, \"%s%s.fides_proc_%ld_%lld.out\", td, sep, (long)p_getpid(), (long long)k);");
+    wln(self, "    snprintf(ef, sizeof ef, \"%s%s.fides_proc_%ld_%lld.err\", td, sep, (long)p_getpid(), (long long)k);");
+    wln(self, "    size_t fl = strlen(cmd) + strlen(of) + strlen(ef) + 32;");
+    wln(self, "    char* full = (char*)malloc(fl);");
+    wln(self, "    if (!full) { __p_proc_table[slot].used = 0; return 0; }");
+    wln(self, "    snprintf(full, fl, \"( %s ) > \\\"%s\\\" 2> \\\"%s\\\"\", cmd, of, ef);");
     wln(self, "    int st = system(full);");
+    wln(self, "    free(full);");
     wln(self, "#ifdef _WIN32");
     wln(self, "    __p_proc_table[slot].code = (int64_t)st;");
     wln(self, "#else");
@@ -13348,11 +13417,15 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    out[0] = 0;");
     wln(self, "    h = FindFirstFileA(pat, &fd);");
     wln(self, "    if (h == INVALID_HANDLE_VALUE) return out;");
-    wln(self, "    int first = 1;");
+    // BG68: the second pass writes no more than the first one counted (an
+    // entry made between the passes overflowed the buffer: it is left out)
+    wln(self, "    size_t used = 0;");
     wln(self, "    do {");
     wln(self, "        if (strcmp(fd.cFileName, \".\") && strcmp(fd.cFileName, \"..\")) {");
-    wln(self, "            if (!first) strcat(out, \"\\n\");");
-    wln(self, "            strcat(out, fd.cFileName); first = 0;");
+    wln(self, "            size_t nl = strlen(fd.cFileName), sep = used > 0 ? 1 : 0;");
+    wln(self, "            if (used + sep + nl + 1 > need) continue;");
+    wln(self, "            if (sep) out[used++] = '\\n';");
+    wln(self, "            memcpy(out + used, fd.cFileName, nl); used += nl; out[used] = 0;");
     wln(self, "        }");
     wln(self, "    } while (FindNextFileA(h, &fd));");
     wln(self, "    FindClose(h);");
@@ -13368,11 +13441,13 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    rewinddir(d);");
     wln(self, "    char* out = (char*)p_malloc((int64_t)need);");
     wln(self, "    out[0] = 0;");
-    wln(self, "    int first = 1;");
+    wln(self, "    size_t used = 0;");
     wln(self, "    while ((ent = readdir(d)) != NULL) {");
     wln(self, "        if (strcmp(ent->d_name, \".\") && strcmp(ent->d_name, \"..\")) {");
-    wln(self, "            if (!first) strcat(out, \"\\n\");");
-    wln(self, "            strcat(out, ent->d_name); first = 0;");
+    wln(self, "            size_t nl = strlen(ent->d_name), sep = used > 0 ? 1 : 0;");
+    wln(self, "            if (used + sep + nl + 1 > need) continue;");
+    wln(self, "            if (sep) out[used++] = '\\n';");
+    wln(self, "            memcpy(out + used, ent->d_name, nl); used += nl; out[used] = 0;");
     wln(self, "        }");
     wln(self, "    }");
     wln(self, "    closedir(d);");
@@ -13489,7 +13564,7 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     // Async/await runtime (Phase 7.6 + 8A)
     // Future model: p_future_ready wraps a value directly (eager).
     // p_thread_spawn returns a negative handle (-1, -2, ...) for thread-based futures.
-    // p_future_poll: if future >= 0, return it (eager). If negative, join the thread.
+    // p_future_poll: a thread future (P_FT_IS, BG73) joins the thread; any other word is an eager value.
     wln(self, "#ifdef _WIN32");
     wln(self, "typedef struct { HANDLE h; void* ret; void* (*fn)(void*); void* arg; } __p_win_thread;");
     wln(self, "typedef __p_win_thread* pthread_t;");
@@ -13513,23 +13588,25 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "#include <pthread.h>");
     wln(self, "#endif");
     wln(self, "int64_t p_future_ready(int64_t value) { return value; }");
-    // Thread join table - maps negative handle to pthread_t
-    wln(self, "static pthread_t p_thread_handles[256];");
-    wln(self, "static int p_thread_handle_count = 0;");
-    wln(self, "static int64_t p_task_results[256];");
+    // BG73: a thread future was -(slot + 1), so an eager future holding a
+    // negative value (an async fn's result -5, a negative f64's bits, a
+    // non-call `spawn -3`) was taken for a thread: awaiting it joined an
+    // unrelated thread or gave 0. It is tagged now, as a green task is
+    // (0x7FA5): 0x7FA4 in the top 16 bits, the slot below; every other
+    // word is an eager value
+    wln(self, "#define P_FT_TAG 0x7FA4ULL");
+    wln(self, "#define P_FT_FUT(idx) ((int64_t)((P_FT_TAG << 48) | (uint64_t)(idx)))");
+    wln(self, "#define P_FT_IS(f) (((uint64_t)(f) >> 48) == P_FT_TAG)");
+    wln(self, "#define P_FT_IDX(f) ((int64_t)((uint64_t)(f) & 0xFFFFFFFFFFFFULL))");
+    // Thread join table: BG9, the future table (__p_ft_*) is defined with
+    // the executor below, once the atomics are
     wln(self, "static int64_t __p_co_await(int64_t future);");
+    wln(self, "static int64_t __p_ft_poll(int64_t future);");
     wln(self, "int64_t p_future_poll(int64_t future) {");
     wln(self, "    if (((uint64_t)future >> 48) == 0x7FA5) return __p_co_await(future);");
-    wln(self, "    if (future >= 0) return future; // eager future");
-    wln(self, "    // Thread-based future: join and get result");
-    wln(self, "    int idx = -(future + 1);");
-    wln(self, "    if (idx < 0 || idx >= p_thread_handle_count) return 0;");
-    wln(self, "    if (p_thread_handles[idx] == 0) return p_task_results[idx]; // already joined");
-    wln(self, "    void* ret = NULL;");
-    wln(self, "    pthread_join(p_thread_handles[idx], &ret);");
-    wln(self, "    p_task_results[idx] = (int64_t)(intptr_t)ret;");
-    wln(self, "    p_thread_handles[idx] = 0;");
-    wln(self, "    return p_task_results[idx];");
+    wln(self, "    // Thread-based future: join and get result (BG9: __p_ft_poll)");
+    wln(self, "    if (P_FT_IS(future)) return __p_ft_poll(future);");
+    wln(self, "    return future; // eager future (BG73: negative values included)");
     wln(self, "}");
     // --- Phase 8A: Threads + atomics + mutex (using pthread) ---
     wln(self, "#ifndef _WIN32");
@@ -15295,6 +15372,17 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "#ifdef P_MN");
     wln(self, "    if (__p_mn_on()) return __p_mn_run();");
     wln(self, "#endif");
+    // BG76: called from a task (one worker), a pass here ran inside the pass
+    // that is running this task, over the same list (entering this task
+    // again, and the outer pass's compaction lost or repeated tasks). The
+    // task gives its turn instead until it is the only task of this thread
+    // left; with P_NO_CTX the others ran to their end when they started.
+    wln(self, "    if (__p_co_cur) {");
+    wln(self, "#ifndef P_NO_CTX");
+    wln(self, "        while (__p_co_count + __p_th_n + __p_co_pk_n > 1) __p_co_leave();");
+    wln(self, "#endif");
+    wln(self, "        return __p_co_total;");
+    wln(self, "    }");
     wln(self, "    for (;;) {");
     wln(self, "        int64_t ran;");
     wln(self, "        if (__p_co_round(&ran) == 0) return __p_co_total;");
@@ -15432,7 +15520,11 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     // it (a task that ended inside p_co_async, never having waited): freed
     // here at once, that pass read freed memory. Detached, the pass frees
     // it; one no longer in the list is freed now.
+    // BG45: a thread future (P_FT_FUT(slot), BG73) is let go in the future
+    // table: no scan joins it (`spawn detached` of a thread in a scope)
+    wln(self, "static void __p_ft_detach(int64_t future);");
     wln(self, "void p_co_detach(int64_t t) {");
+    wln(self, "    if (P_FT_IS(t)) { __p_ft_detach(t); return; }");
     wln(self, "    __p_co* c = (__p_co*)(uintptr_t)t;");
     wln(self, "#ifdef P_MN");
     wln(self, "    if (__p_mn_on()) {");
@@ -15606,10 +15698,178 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "}");
     // Phase A1: Executor + non-blocking task poll
     // Executor: just an ID - tasks are tracked via the thread handle table.
-    // Task done flags: maps future handle (negative index) to done flag.
-    wln(self, "static atomic_int p_task_done_flags[256];");
-    wln(self, "static int p_executor_count = 0;");
-    wln(self, "int64_t p_executor_new(void) { return (int64_t)(p_executor_count++); }");
+    // BG9: the future table (thread handle, result, done flag of each
+    // thread future), growable and locked; it replaces the three static
+    // arrays of 256 entries (p_thread_handles, p_task_results,
+    // p_task_done_flags) and the unlocked `p_thread_handle_count++`
+    wln(self, "/* BG9: the future table. A thread future (spawn, an executor's task, an");
+    wln(self, "   async I/O) is P_FT_FUT(idx), idx its slot. It was three static arrays of 256");
+    wln(self, "   and `int idx = p_thread_handle_count++;`: the 257th spawn wrote past them");
+    wln(self, "   and two threads spawning at once could take one index. Now the slots are");
+    wln(self, "   in chunks of P_FT_CHUNK, allocated when first needed and never moved (a");
+    wln(self, "   running thread keeps a pointer to its slot's done flag), reached through");
+    wln(self, "   a fixed directory, and an index is taken under __p_ft_lk (a spin lock on");
+    wln(self, "   an atomic word: nothing to initialise, the same code on Windows and");
+    wln(self, "   POSIX; held only to hand out an index and allocate a chunk). A slot is");
+    wln(self, "   not reused: a future can be awaited after something else joined it (the");
+    wln(self, "   end of a spawn scope, run_all and cancel join every thread and keep the");
+    wln(self, "   results for a later await), so its result must stay. A slot's state:");
+    wln(self, "   STARTING while its thread is created, RUNNING not joined yet, JOINING one");
+    wln(self, "   caller (the one whose compare-exchange took it) joins it with no lock");
+    wln(self, "   held while the others wait, JOINED its result is kept. Scans (run_all,");
+    wln(self, "   cancel, poll_all) start at __p_ft_lo, below which every slot is JOINED. */");
+    wln(self, "#define P_FT_CHUNK 4096");
+    wln(self, "#define P_FT_DIR 16384");
+    wln(self, "#define P_FT_RUNNING 0");
+    wln(self, "#define P_FT_JOINING 1");
+    wln(self, "#define P_FT_JOINED 2");
+    wln(self, "#define P_FT_STARTING 3");
+    wln(self, "typedef struct { pthread_t h; int64_t result; atomic_int done; atomic_int_least64_t state; } __p_ft_slot;");
+    wln(self, "static __p_ft_slot* __p_ft_dir[P_FT_DIR];");
+    wln(self, "static atomic_int_least64_t __p_ft_lk;");
+    wln(self, "static atomic_int_least64_t __p_ft_count;");
+    wln(self, "static atomic_int_least64_t __p_ft_lo;");
+    wln(self, "static void __p_ft_pause(int64_t ms) {");
+    wln(self, "#ifdef _WIN32");
+    wln(self, "    Sleep((DWORD)ms);");
+    wln(self, "#else");
+    wln(self, "    poll(NULL, 0, (int)ms);");
+    wln(self, "#endif");
+    wln(self, "}");
+    wln(self, "static void __p_ft_lock(void) {");
+    wln(self, "    for (;;) {");
+    wln(self, "        int64_t e = 0;");
+    wln(self, "        if (atomic_compare_exchange_strong(&__p_ft_lk, &e, 1)) return;");
+    wln(self, "        __p_ft_pause(0);");
+    wln(self, "    }");
+    wln(self, "}");
+    wln(self, "static void __p_ft_unlock(void) { atomic_store(&__p_ft_lk, 0); }");
+    wln(self, "/* the slot of index idx, NULL for an index never handed out */");
+    wln(self, "static __p_ft_slot* __p_ft_at(int64_t idx) {");
+    wln(self, "    if (idx < 0 || idx >= (int64_t)atomic_load(&__p_ft_count)) return NULL;");
+    wln(self, "    return &__p_ft_dir[idx / P_FT_CHUNK][idx % P_FT_CHUNK];");
+    wln(self, "}");
+    wln(self, "/* a new slot, STARTING; returns its index */");
+    wln(self, "static int64_t __p_ft_new(void) {");
+    wln(self, "    __p_ft_lock();");
+    wln(self, "    int64_t idx = (int64_t)atomic_load(&__p_ft_count);");
+    wln(self, "    if (idx >= (int64_t)P_FT_CHUNK * P_FT_DIR) { __p_ft_unlock(); p_panic(\"spawn: too many threads started (the future table is full)\"); }");
+    wln(self, "    __p_ft_slot* ch = __p_ft_dir[idx / P_FT_CHUNK];");
+    wln(self, "    if (!ch) {");
+    wln(self, "        ch = (__p_ft_slot*)calloc(P_FT_CHUNK, sizeof(__p_ft_slot));");
+    wln(self, "        if (!ch) { __p_ft_unlock(); p_panic(\"spawn: out of memory\"); }");
+    wln(self, "        __p_ft_dir[idx / P_FT_CHUNK] = ch;");
+    wln(self, "    }");
+    wln(self, "    __p_ft_slot* s = &ch[idx % P_FT_CHUNK];");
+    wln(self, "    s->result = 0;");
+    wln(self, "    atomic_init(&s->done, 0);");
+    wln(self, "    atomic_init(&s->state, P_FT_STARTING);");
+    // the count is stored last: a reader that sees idx below it sees the
+    // chunk pointer and the slot's fields
+    wln(self, "    atomic_store(&__p_ft_count, idx + 1);");
+    wln(self, "    __p_ft_unlock();");
+    wln(self, "    return idx;");
+    wln(self, "}");
+    wln(self, "/* its thread was created */");
+    wln(self, "static void __p_ft_started(__p_ft_slot* s, pthread_t h) {");
+    wln(self, "    s->h = h;");
+    wln(self, "    atomic_store(&s->state, P_FT_RUNNING);");
+    wln(self, "}");
+    wln(self, "/* it ran to its end when spawned (WASI: no threads) */");
+    wln(self, "static void __p_ft_ran(__p_ft_slot* s, int64_t result) {");
+    wln(self, "    s->result = result;");
+    wln(self, "    atomic_store(&s->done, 1);");
+    wln(self, "    atomic_store(&s->state, P_FT_JOINED);");
+    wln(self, "}");
+    wln(self, "/* Joins s's thread once, whoever asks first, and keeps its result; a");
+    wln(self, "   caller that comes while another joins it waits for the result. drop: an");
+    wln(self, "   unfinished thread's result is 0 (cancel), and *dropped says so. */");
+    wln(self, "static int64_t __p_ft_join(__p_ft_slot* s, int drop, int* dropped) {");
+    wln(self, "    for (;;) {");
+    wln(self, "        int64_t st = (int64_t)atomic_load(&s->state);");
+    wln(self, "        if (st == P_FT_JOINED) return s->result;");
+    wln(self, "        if (st == P_FT_RUNNING) {");
+    wln(self, "            int64_t e = P_FT_RUNNING;");
+    wln(self, "            if (atomic_compare_exchange_strong(&s->state, &e, P_FT_JOINING)) {");
+    wln(self, "                int was_done = atomic_load(&s->done) != 0;");
+    wln(self, "                void* ret = NULL;");
+    wln(self, "                pthread_join(s->h, &ret);");
+    wln(self, "                s->result = (drop && !was_done) ? 0 : (int64_t)(intptr_t)ret;");
+    wln(self, "                if (dropped) *dropped = drop && !was_done;");
+    wln(self, "                atomic_store(&s->state, P_FT_JOINED);");
+    wln(self, "                return s->result;");
+    wln(self, "            }");
+    wln(self, "            continue;");
+    wln(self, "        }");
+    wln(self, "        /* JOINING (another caller joins it) or STARTING (its spawn has not");
+    wln(self, "           returned yet, on another thread) */");
+    wln(self, "        __p_ft_pause(1);");
+    wln(self, "    }");
+    wln(self, "}");
+    wln(self, "static int64_t __p_ft_poll(int64_t future) {");
+    wln(self, "    __p_ft_slot* s = __p_ft_at(P_FT_IDX(future));");
+    wln(self, "    if (!s) return 0;");
+    wln(self, "    return __p_ft_join(s, 0, NULL);");
+    wln(self, "}");
+    // BG45: `spawn detached` of a thread (p_co_detach of its future): the
+    // thread is let go (pthread_detach; on Windows its handle closed, the
+    // small record the thread writes its result to kept) and the slot reads
+    // as joined with result 0, so no scan waits for it. One that someone
+    // already joins or joined is left to them.
+    wln(self, "static void __p_ft_detach(int64_t future) {");
+    wln(self, "    __p_ft_slot* s = __p_ft_at(P_FT_IDX(future));");
+    wln(self, "    if (!s) return;");
+    wln(self, "    int64_t e = P_FT_RUNNING;");
+    wln(self, "    if (!atomic_compare_exchange_strong(&s->state, &e, P_FT_JOINING)) return;");
+    wln(self, "#if defined(_WIN32)");
+    wln(self, "    CloseHandle(s->h->h);");
+    wln(self, "#elif !defined(__wasi__)");
+    wln(self, "    pthread_detach(s->h);");
+    wln(self, "#endif");
+    wln(self, "    s->result = 0;");
+    wln(self, "    atomic_store(&s->state, P_FT_JOINED);");
+    wln(self, "}");
+    wln(self, "/* One pass over the slots not known to be joined. mode 0 (run_all): join");
+    wln(self, "   each, returns how many were not joined yet; 1 (cancel): the same, an");
+    wln(self, "   unfinished thread's result dropped, returns how many were unfinished;");
+    wln(self, "   2 (poll_all): join the finished ones, returns how many are not. A slot");
+    wln(self, "   still STARTING belongs to a spawn running on another thread: left.");
+    wln(self, "   BG45: only the slots from `from` on (an executor's first slot: the");
+    wln(self, "   threads started since its scope began); a thread started before, which");
+    wln(self, "   nothing in the scope waits for, is left running. */");
+    wln(self, "static int64_t __p_ft_scan(int mode, int64_t from) {");
+    wln(self, "    int64_t n = (int64_t)atomic_load(&__p_ft_count);");
+    wln(self, "    int64_t glo = (int64_t)atomic_load(&__p_ft_lo);");
+    wln(self, "    int64_t lo = from > glo ? from : glo;");
+    wln(self, "    int64_t count = 0;");
+    wln(self, "    int64_t first_open = -1;");
+    wln(self, "    for (int64_t i = lo; i < n; i++) {");
+    wln(self, "        __p_ft_slot* s = &__p_ft_dir[i / P_FT_CHUNK][i % P_FT_CHUNK];");
+    wln(self, "        int64_t st = (int64_t)atomic_load(&s->state);");
+    wln(self, "        if (st == P_FT_JOINED) continue;");
+    wln(self, "        if (st == P_FT_STARTING) { if (first_open < 0) first_open = i; continue; }");
+    wln(self, "        if (mode == 2 && atomic_load(&s->done) == 0) { count++; if (first_open < 0) first_open = i; continue; }");
+    wln(self, "        int dropped = 0;");
+    wln(self, "        __p_ft_join(s, mode == 1, &dropped);");
+    wln(self, "        if (mode == 0 || (mode == 1 && dropped)) count++;");
+    wln(self, "    }");
+    // every slot below first_open (or n) is JOINED for good (slots are not
+    // reused): later scans skip them
+    // (BG45: only a scan that started at __p_ft_lo saw every slot below nlo)
+    wln(self, "    int64_t nlo = first_open < 0 ? n : first_open;");
+    wln(self, "    if (lo == glo) {");
+    wln(self, "        __p_ft_lock();");
+    wln(self, "        if (nlo > (int64_t)atomic_load(&__p_ft_lo)) atomic_store(&__p_ft_lo, nlo);");
+    wln(self, "        __p_ft_unlock();");
+    wln(self, "    }");
+    wln(self, "    return count;");
+    wln(self, "}");
+    // BG45: an executor (a spawn scope, async.fd's Executor) is the index of
+    // the first future-table slot after it: its run_all/cancel/poll_all
+    // reach the threads started from then on, not every thread of the
+    // program (a scope waited for a thread started before it, which may
+    // never end)
+    wln(self, "int64_t p_executor_new(void) { return (int64_t)atomic_load(&__p_ft_count); }");
     wln(self, "int64_t p_executor_spawn(int64_t exec, const char* func_name, int64_t num_args, ...) {");
     wln(self, "    (void)exec;");
     wln(self, "    int64_t (*fn)() = NULL;");
@@ -15622,38 +15882,32 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    va_list ap; va_start(ap, num_args);");
     wln(self, "    for (int64_t i = 0; i < num_args && i < 8; i++) ta->args[i] = va_arg(ap, int64_t);");
     wln(self, "    va_end(ap);");
-    wln(self, "    int idx = p_thread_handle_count++;");
-    wln(self, "    atomic_init(&p_task_done_flags[idx], 0);");
-    wln(self, "    ta->done = &p_task_done_flags[idx];");
+    // BG9: a slot of the future table, taken under its lock
+    wln(self, "    int64_t idx = __p_ft_new();");
+    wln(self, "    __p_ft_slot* fs = __p_ft_at(idx);");
+    wln(self, "    ta->done = &fs->done;");
     wln(self, "#ifdef __wasi__");
     wln(self, "    /* no threads under WASI: runs to its end now, as under fid wasm */");
-    wln(self, "    p_task_results[idx] = __p_thread_run(ta);");
-    wln(self, "    if (ta->done) atomic_store(ta->done, 1);");
-    wln(self, "    p_thread_handles[idx] = 0;");
+    wln(self, "    __p_ft_ran(fs, __p_thread_run(ta));");
     wln(self, "#else");
-    wln(self, "    pthread_t tid; pthread_create(&tid, NULL, p_thread_wrapper, ta);");
-    wln(self, "    p_thread_handles[idx] = tid;");
+    wln(self, "    pthread_t tid;");
+    wln(self, "    if (pthread_create(&tid, NULL, p_thread_wrapper, ta) != 0) p_panic(\"could not start a thread\");");
+    wln(self, "    __p_ft_started(fs, tid);");
     wln(self, "#endif");
-    wln(self, "    return -(int64_t)(idx + 1);");
+    wln(self, "    return P_FT_FUT(idx);");
     wln(self, "}");
     wln(self, "int64_t p_task_poll(int64_t future) {");
     wln(self, "    if (((uint64_t)future >> 48) == 0x7FA5) return p_future_poll(future);");
-    wln(self, "    if (future >= 0) return future; // eager future");
-    wln(self, "    int idx = -(future + 1);");
-    wln(self, "    if (idx < 0 || idx >= p_thread_handle_count) return 0;");
-    wln(self, "    if (p_thread_handles[idx] == 0) return p_task_results[idx]; // already joined");
-    wln(self, "    // A1: block until done (join). A2 will add non-blocking poll.");
-    wln(self, "    void* ret = NULL; pthread_join(p_thread_handles[idx], &ret);");
-    wln(self, "    p_task_results[idx] = (int64_t)(intptr_t)ret;");
-    wln(self, "    p_thread_handles[idx] = 0;");
-    wln(self, "    return p_task_results[idx];");
+    wln(self, "    if (!P_FT_IS(future)) return future; // eager future (BG73)");
+    wln(self, "    // A1: block until done (join); BG9: the future table");
+    wln(self, "    return __p_ft_poll(future);");
     wln(self, "}");
     wln(self, "bool p_task_is_ready(int64_t future) {");
     wln(self, "    if (((uint64_t)future >> 48) == 0x7FA5) return p_co_done(future & 0xFFFFFFFFFFFFLL) != 0;");
-    wln(self, "    if (future >= 0) return true;");
-    wln(self, "    int idx = -(future + 1);");
-    wln(self, "    if (idx < 0 || idx >= p_thread_handle_count) return false;");
-    wln(self, "    return atomic_load(&p_task_done_flags[idx]) != 0;");
+    wln(self, "    if (!P_FT_IS(future)) return true;");
+    wln(self, "    __p_ft_slot* s = __p_ft_at(P_FT_IDX(future));");
+    wln(self, "    if (!s) return false;");
+    wln(self, "    return atomic_load(&s->done) != 0;");
     wln(self, "}");
     wln(self, "int64_t p_executor_block_on(int64_t exec, int64_t future) {");
     wln(self, "    (void)exec;");
@@ -15663,54 +15917,27 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     // wait for any still running (no task outlives its scope), drop their
     // results (0, as in the interpreter), and return how many were cancelled.
     wln(self, "int64_t p_executor_cancel(int64_t exec) {");
-    wln(self, "    (void)exec;");
-    wln(self, "    int64_t count = 0;");
-    wln(self, "    for (int i = 0; i < p_thread_handle_count; i++) {");
-    wln(self, "        if (p_thread_handles[i] == 0) continue; // already joined");
-    wln(self, "        int was_done = atomic_load(&p_task_done_flags[i]);");
-    wln(self, "        void* ret = NULL; pthread_join(p_thread_handles[i], &ret);");
-    wln(self, "        p_task_results[i] = was_done ? (int64_t)(intptr_t)ret : 0;");
-    wln(self, "        if (!was_done) count++;");
-    wln(self, "        p_thread_handles[i] = 0;");
-    wln(self, "    }");
-    wln(self, "    return count;");
+    // BG9: __p_ft_scan joins each slot once (its compare-exchange) and
+    // starts past the slots already joined; BG45: and at the executor's first
+    wln(self, "    return __p_ft_scan(1, exec);");
     wln(self, "}");
     wln(self, "int64_t p_executor_run_all(int64_t exec) {");
-    wln(self, "    (void)exec;");
-    wln(self, "    int64_t count = 0;");
-    wln(self, "    for (int i = 0; i < p_thread_handle_count; i++) {");
-    wln(self, "        if (p_thread_handles[i] == 0) continue; // already joined");
-    wln(self, "        void* ret = NULL; pthread_join(p_thread_handles[i], &ret);");
-    wln(self, "        p_task_results[i] = (int64_t)(intptr_t)ret;");
-    wln(self, "        p_thread_handles[i] = 0; count++;");
-    wln(self, "    }");
-    wln(self, "    return count;");
+    wln(self, "    return __p_ft_scan(0, exec);");
     wln(self, "}");
     // A2: Non-blocking poll - returns PENDING_SENTINEL if task not done
     wln(self, "int64_t p_task_poll_nonblocking(int64_t future) {");
     wln(self, "    if (((uint64_t)future >> 48) == 0x7FA5) return p_co_done(future & 0xFFFFFFFFFFFFLL) ? p_future_poll(future) : (int64_t)0x8000000000000001LL;");
-    wln(self, "    if (future >= 0) return future; // eager future");
-    wln(self, "    int idx = -(future + 1);");
-    wln(self, "    if (idx < 0 || idx >= p_thread_handle_count) return 0;");
-    wln(self, "    if (atomic_load(&p_task_done_flags[idx]) == 0) {");
+    wln(self, "    if (!P_FT_IS(future)) return future; // eager future (BG73)");
+    wln(self, "    __p_ft_slot* s = __p_ft_at(P_FT_IDX(future));");
+    wln(self, "    if (!s) return 0;");
+    wln(self, "    if (atomic_load(&s->done) == 0) {");
     wln(self, "        return (int64_t)0x8000000000000001LL; // PENDING_SENTINEL");
     wln(self, "    }");
-    wln(self, "    if (p_thread_handles[idx] == 0) return p_task_results[idx]; // already joined");
-    wln(self, "    void* ret = NULL; pthread_join(p_thread_handles[idx], &ret);");
-    wln(self, "    p_task_results[idx] = (int64_t)(intptr_t)ret;");
-    wln(self, "    p_thread_handles[idx] = 0;");
-    wln(self, "    return p_task_results[idx];");
+    wln(self, "    return __p_ft_join(s, 0, NULL); // BG9: joined once, result kept");
     wln(self, "}");
     // A2: Non-blocking poll all - returns count of still-pending tasks
     wln(self, "int64_t p_executor_poll_all(int64_t exec) {");
-    wln(self, "    (void)exec;");
-    wln(self, "    int64_t pending = 0;");
-    wln(self, "    for (int i = 0; i < p_thread_handle_count; i++) {");
-    wln(self, "        if (p_thread_handles[i] == 0) continue; // already joined");
-    wln(self, "        if (atomic_load(&p_task_done_flags[i]) == 0) { pending++; }");
-    wln(self, "        else { void* ret = NULL; pthread_join(p_thread_handles[i], &ret); p_task_results[i] = (int64_t)(intptr_t)ret; p_thread_handles[i] = 0; }");
-    wln(self, "    }");
-    wln(self, "    return pending;");
+    wln(self, "    return __p_ft_scan(2, exec);");
     wln(self, "}");
     // --- Phase A3: Non-blocking IO (using threads for async) ---
     // Each async IO operation spawns a thread that performs the IO
@@ -15742,7 +15969,12 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "            break;");
     wln(self, "        }");
     wln(self, "        case 2: { // write");
+    // BG39: as p_socket_write, a peer that has gone gives -1, not SIGPIPE
+    wln(self, "#ifdef MSG_NOSIGNAL");
+    wln(self, "            ssize_t n = send((int)ia->sock, ia->buf, (size_t)ia->len, MSG_NOSIGNAL);");
+    wln(self, "#else");
     wln(self, "            ssize_t n = send((int)ia->sock, ia->buf, (size_t)ia->len, 0);");
+    wln(self, "#endif");
     wln(self, "            result = (n < 0) ? -1 : (int64_t)n;");
     wln(self, "            break;");
     wln(self, "        }");
@@ -15763,15 +15995,16 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "}");
     wln(self, "// Helper: spawn an IO thread and return a Future handle");
     wln(self, "static int64_t p_io_spawn(int op, int64_t sock, char* buf, int64_t len) {");
-    wln(self, "    int idx = p_thread_handle_count++;");
-    wln(self, "    atomic_init(&p_task_done_flags[idx], 0);");
+    // BG9: a slot of the future table (its result is set when joined)
+    wln(self, "    int64_t idx = __p_ft_new();");
+    wln(self, "    __p_ft_slot* fs = __p_ft_at(idx);");
     wln(self, "    p_io_arg_t* ia = (p_io_arg_t*)malloc(sizeof(p_io_arg_t));");
     wln(self, "    ia->sock = sock; ia->buf = buf; ia->len = len; ia->result = 0;");
-    wln(self, "    ia->done = &p_task_done_flags[idx]; ia->op = op; ia->caps = __p_caps;");
-    wln(self, "    pthread_t tid; pthread_create(&tid, NULL, p_io_worker, ia);");
-    wln(self, "    p_thread_handles[idx] = tid;");
-    wln(self, "    p_task_results[idx] = 0; // will be set by p_task_poll after join");
-    wln(self, "    return -(int64_t)(idx + 1);");
+    wln(self, "    ia->done = &fs->done; ia->op = op; ia->caps = __p_caps;");
+    wln(self, "    pthread_t tid;");
+    wln(self, "    if (pthread_create(&tid, NULL, p_io_worker, ia) != 0) p_panic(\"could not start a thread\");");
+    wln(self, "    __p_ft_started(fs, tid);");
+    wln(self, "    return P_FT_FUT(idx);");
     wln(self, "}");
     wln(self, "int64_t p_net_connect(const char* host, int64_t port) {");
     wln(self, "    if (P_CAP_DENIED(P_CAP_NET)) return -1;");
@@ -15876,31 +16109,32 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    va_list ap; va_start(ap, num_args);");
     wln(self, "    for (int64_t i = 0; i < num_args && i < 8; i++) ta->args[i] = va_arg(ap, int64_t);");
     wln(self, "    va_end(ap);");
-    wln(self, "    int idx = p_thread_handle_count++;");
-    wln(self, "    atomic_init(&p_task_done_flags[idx], 0);");
-    wln(self, "    ta->done = &p_task_done_flags[idx];");
+    // BG9: a slot of the future table, taken under its lock (was
+    // `p_thread_handle_count++` into arrays of 256)
+    wln(self, "    int64_t idx = __p_ft_new();");
+    wln(self, "    __p_ft_slot* fs = __p_ft_at(idx);");
+    wln(self, "    ta->done = &fs->done;");
     wln(self, "#ifdef __wasi__");
     wln(self, "    /* no threads under WASI: runs to its end now, as under fid wasm */");
-    wln(self, "    p_task_results[idx] = __p_thread_run(ta);");
-    wln(self, "    if (ta->done) atomic_store(ta->done, 1);");
-    wln(self, "    p_thread_handles[idx] = 0;");
+    wln(self, "    __p_ft_ran(fs, __p_thread_run(ta));");
     wln(self, "#else");
     wln(self, "    pthread_t tid;");
-    wln(self, "    pthread_create(&tid, NULL, p_thread_wrapper, ta);");
+    wln(self, "    if (pthread_create(&tid, NULL, p_thread_wrapper, ta) != 0) p_panic(\"could not start a thread\");");
     wln(self, "    // Store thread handle and return negative index as Future");
-    wln(self, "    p_thread_handles[idx] = tid;");
+    wln(self, "    __p_ft_started(fs, tid);");
     wln(self, "#endif");
-    wln(self, "    return -(int64_t)(idx + 1);");
+    wln(self, "    return P_FT_FUT(idx);");
     wln(self, "}");
     // p_thread_join — join a thread spawned by p_thread_spawn
     // handle is the negative value returned by p_thread_spawn: -(idx+1)
     wln(self, "void p_thread_join(int64_t handle) {");
-    wln(self, "    if (handle >= 0) return; // not a thread handle");
-    wln(self, "    int64_t idx = -handle - 1;");
-    wln(self, "    if (idx < 0 || idx >= p_thread_handle_count) return;");
-    // F9: 0 is a task already joined, or one WASI ran when it was spawned
-    wln(self, "    if (p_thread_handles[idx] == 0) return;");
-    wln(self, "    pthread_join(p_thread_handles[idx], NULL);");
+    wln(self, "    if (!P_FT_IS(handle)) return; // not a thread handle (BG73)");
+    // F9: a task already joined, or one WASI ran when it was spawned, is
+    // JOINED. BG9: the join keeps the result (an await after it reads it;
+    // it used to join the thread a second time)
+    wln(self, "    __p_ft_slot* s = __p_ft_at(P_FT_IDX(handle));");
+    wln(self, "    if (!s) return;");
+    wln(self, "    __p_ft_join(s, 0, NULL);");
     wln(self, "}");
     // Shared memory - simple malloc-based, atomics use C11 stdatomic
     wln(self, "int64_t p_shared_alloc(int64_t size) { if (size < 0) return 0; uint64_t* b = (uint64_t*)calloc(1, (size_t)size + 24); if (!b) { p_panic(\"p_shared_alloc: out of memory\"); } b += 2; b[0] = P_BLOCK_MAGIC | P_CLASS_LARGE; return (int64_t)(intptr_t)(b + 1); }");
@@ -15985,6 +16219,45 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    __p_mn_ready(c, 1);");
     wln(self, "}");
     wln(self, "#endif");
+    // BG8: with one scheduler per thread (M:N off) a blocked send/receive
+    // must let this thread's other tasks run, or the task that would wake it
+    // never does
+    wln(self, "/* BG8: one cooperative scheduler per thread (M:N off: FIDES_WORKERS=1,");
+    wln(self, "   FIDES_SCHED_RANDOM, one CPU, no P_MN). A send or receive that must wait");
+    wln(self, "   cannot sleep on the channel's condition variable when the task that");
+    wln(self, "   would wake it runs on this same thread: nothing would ever run it. So,");
+    wln(self, "   with the channel's mutex mx held and the condition false: in a task,");
+    wln(self, "   give the turn to the scheduler (mx unlocked meanwhile: no other task");
+    wln(self, "   of the thread may block on it), first as a plain yield and, after 64");
+    wln(self, "   turns with no progress (the other side is another OS thread), as 1 ms");
+    wln(self, "   naps so the thread does not spin; off a task (main, a thread's");
+    wln(self, "   function) with tasks of this thread unfinished, run a pass of them and");
+    wln(self, "   wait 1 ms at most for one that can run. mx is held again on return and");
+    wln(self, "   the caller tests its condition anew. 0: nothing was done, the caller");
+    wln(self, "   waits on the condition variable as before (no task on this thread,");
+    wln(self, "   M:N on: __p_mn_chan_park took the task's wait, or P_NO_CTX where a");
+    wln(self, "   task cannot switch out). */");
+    wln(self, "static int __p_chan_coop_wait(pthread_mutex_t* mx, int64_t* spins) {");
+    wln(self, "#ifdef P_NO_CTX");
+    wln(self, "    (void)mx; (void)spins;");
+    wln(self, "    return 0;");
+    wln(self, "#else");
+    wln(self, "    if (__p_mn_on()) return 0;");
+    wln(self, "    if (__p_co_cur) {");
+    wln(self, "        pthread_mutex_unlock(mx);");
+    wln(self, "        if (*spins < 64) { (*spins)++; __p_co_leave(); }");
+    wln(self, "        else __p_co_nap(1);");
+    wln(self, "        pthread_mutex_lock(mx);");
+    wln(self, "        return 1;");
+    wln(self, "    }");
+    wln(self, "    if (__p_co_count + __p_th_n + __p_co_pk_n == 0) return 0;");
+    wln(self, "    pthread_mutex_unlock(mx);");
+    wln(self, "    int64_t ran = 0;");
+    wln(self, "    if (__p_co_round(&ran) > 0) __p_co_wait(ran, 1);");
+    wln(self, "    pthread_mutex_lock(mx);");
+    wln(self, "    return 1;");
+    wln(self, "#endif");
+    wln(self, "}");
     wln(self, "int64_t p_chan_create(int64_t capacity) {");
     wln(self, "    if (capacity < 1) capacity = 1;");
     wln(self, "    p_channel_t* ch = (p_channel_t*)malloc(sizeof(p_channel_t) + capacity * sizeof(int64_t));");
@@ -16017,7 +16290,10 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "        while (ch->count == ch->capacity && !ch->closed && __p_mn_chan_park(ch, &ch->mutex, 1)) {}");
     wln(self, "    }");
     wln(self, "#endif");
+    // BG8: a task (or main with tasks) on one worker gives its turn instead
+    wln(self, "    int64_t __cw_spins = 0;");
     wln(self, "    while (ch->count == ch->capacity && !ch->closed) {");
+    wln(self, "        if (__p_chan_coop_wait(&ch->mutex, &__cw_spins)) continue;");
     wln(self, "        pthread_cond_wait(&ch->not_full, &ch->mutex);");
     wln(self, "    }");
     wln(self, "    if (ch->closed) {");
@@ -16054,7 +16330,10 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "        while (ch->count == 0 && !ch->closed && __p_mn_chan_park(ch, &ch->mutex, 0)) {}");
     wln(self, "    }");
     wln(self, "#endif");
+    // BG8: as p_chan_send
+    wln(self, "    int64_t __cw_spins = 0;");
     wln(self, "    while (ch->count == 0 && !ch->closed) {");
+    wln(self, "        if (__p_chan_coop_wait(&ch->mutex, &__cw_spins)) continue;");
     wln(self, "        pthread_cond_wait(&ch->not_empty, &ch->mutex);");
     wln(self, "    }");
     wln(self, "    if (ch->count == 0) {");
@@ -16283,10 +16562,16 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "void* p_vec_first(PVec* v) { return v->len > 0 ? P_VEC_AT(v, 0) : NULL; }");
     wln(self, "void* p_vec_last(PVec* v) { return v->len > 0 ? P_VEC_AT(v, v->len - 1) : NULL; }");
     wln(self, "void p_vec_insert(PVec* v, int64_t idx, void* val) {");
-    wln(self, "    if (idx < 0 || idx > v->len) return;");
-    wln(self, "    if (v->len >= v->cap) { v->cap = v->cap == 0 ? 8 : v->cap * 2; void** nd = (void**)p_malloc(v->cap * 8); if (v->data && v->len > 0) { memcpy(nd, v->data, (size_t)v->len * 8); } if (v->data) { __p_vbuf_free((int64_t*)(intptr_t)v->data); } if (__p_sensitive_n > 0 && __p_sensitive_at(v) >= 0) __p_sens_buf_add(nd, v->cap * 8); v->data = nd; }");
-    wln(self, "    memmove(&P_VSLOT(v, idx+1), &P_VSLOT(v, idx), (size_t)(v->len - idx) * 8);");
-    wln(self, "    P_VSLOT(v, idx) = (int64_t)(intptr_t)val; v->len++;");
+    // BG40: at the element size, on a buffer this Vec owns (p_vec_push)
+    wln(self, "    if (!v || idx < 0 || idx > v->len) return;");
+    wln(self, "    if (v->cap < 0 || v->len >= v->cap) __p_vec_grow((int64_t*)v);");
+    wln(self, "    int64_t hc = P_VEC_CODE((int64_t*)v);");
+    wln(self, "    int64_t esz = hc == 0 ? 8 : (hc < 0 ? -hc : (hc >= 16 ? (hc - 15) * 8 : hc));");
+    wln(self, "    char* d = (char*)v->data;");
+    wln(self, "    memmove(d + (idx + 1) * esz, d + idx * esz, (size_t)((v->len - idx) * esz));");
+    wln(self, "    if (v->code) __p_vec_st((int64_t*)v, idx, (int64_t)(intptr_t)val);");
+    wln(self, "    else P_VSLOT(v, idx) = (int64_t)(intptr_t)val;");
+    wln(self, "    v->len++;");
     wln(self, "}");
     wln(self, "void* p_vec_remove(PVec* v, int64_t idx) {");
     wln(self, "    if (idx < 0 || idx >= v->len) return NULL;");
@@ -16527,10 +16812,24 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    return (n < 0) ? -1 : (int64_t)n;");
     wln(self, "}");
     wln(self, "");
+    // BG39: a write to a socket whose peer has gone raised SIGPIPE, which
+    // ends the program (a server died when a client disconnected): it is
+    // held back, so the write gives -1 (EPIPE). MSG_NOSIGNAL where the
+    // system has it (a descriptor that is no socket is written as before),
+    // SO_NOSIGPIPE on the socket elsewhere (macOS, the BSDs).
+    wln(self, "#if !defined(_WIN32)");
+    wln(self, "#include <errno.h>");
+    wln(self, "#endif");
     wln(self, "int64_t p_socket_write(int64_t fd, const char* buf, int64_t len) {");
     wln(self, "#ifdef _WIN32");
     wln(self, "    int n = send((SOCKET)fd, buf, (int)len, 0);");
+    wln(self, "#elif defined(MSG_NOSIGNAL) && !defined(__wasi__)");
+    wln(self, "    ssize_t n = send((int)fd, buf, (size_t)len, MSG_NOSIGNAL);");
+    wln(self, "    if (n < 0 && errno == ENOTSOCK) n = write((int)fd, buf, (size_t)len);");
     wln(self, "#else");
+    wln(self, "#if defined(SO_NOSIGPIPE) && !defined(__wasi__)");
+    wln(self, "    { int one = 1; setsockopt((int)fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one); }");
+    wln(self, "#endif");
     wln(self, "    ssize_t n = write((int)fd, buf, (size_t)len);");
     wln(self, "#endif");
     wln(self, "    return (n < 0) ? -1 : (int64_t)n;");
@@ -17658,6 +17957,38 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    if (j->len >= j->cap) { j->cap = j->cap == 0 ? 8 : j->cap * 2; j->keys = (char**)realloc(j->keys, j->cap * sizeof(char*)); j->vals = (char**)realloc(j->vals, j->cap * sizeof(char*)); }");
     wln(self, "    j->keys[j->len] = key ? strdup(key) : strdup(\"\"); j->vals[j->len] = val ? strdup(val) : strdup(\"\"); j->len++;");
     wln(self, "}");
+    // BG97: a value that is an object or an array was read as a number up
+    // to the next `,`/`}`/space (`{"a":{"b":1}}` gave `{"a":"{\"b\":","b":1}`,
+    // not JSON). It is taken whole now: an object canonicalized as the
+    // outer one is, an array as it is written less its blanks; both are
+    // kept behind a mark byte (\x01) that the dump writes without quotes.
+    wln(self, "/* the end of the object or array at p: past its closing bracket (strings and");
+    wln(self, "   their escapes skipped) */");
+    wln(self, "static const char* _json_skip_nested(const char* p) {");
+    wln(self, "    int64_t depth = 0;");
+    wln(self, "    while (*p) {");
+    wln(self, "        char c = *p;");
+    wln(self, "        if (c == '\"') { p++; while (*p && *p != '\"') { if (*p == '\\\\' && p[1]) p++; p++; } if (*p) p++; continue; }");
+    wln(self, "        if (c == '{' || c == '[') depth++;");
+    wln(self, "        else if (c == '}' || c == ']') { depth--; if (depth <= 0) return p + 1; }");
+    wln(self, "        p++;");
+    wln(self, "    }");
+    wln(self, "    return p;");
+    wln(self, "}");
+    wln(self, "/* the mark byte, then the text [a, b) less the blanks outside strings */");
+    wln(self, "static char* _json_raw_compact(const char* a, const char* b) {");
+    wln(self, "    char* r = (char*)malloc((size_t)(b - a) + 2); size_t n = 0; int in_s = 0;");
+    wln(self, "    r[n++] = '\\x01';");
+    wln(self, "    for (const char* q = a; q < b; q++) {");
+    wln(self, "        char c = *q;");
+    wln(self, "        if (in_s) { r[n++] = c; if (c == '\\\\' && q + 1 < b) { r[n++] = *++q; continue; } if (c == '\"') in_s = 0; continue; }");
+    wln(self, "        if (c == '\"') in_s = 1;");
+    wln(self, "        if (c == ' ' || c == '\\t' || c == '\\n' || c == '\\r') continue;");
+    wln(self, "        r[n++] = c;");
+    wln(self, "    }");
+    wln(self, "    r[n] = 0;");
+    wln(self, "    return r;");
+    wln(self, "}");
     wln(self, "static char* p_json_parse__raw(const char* s);");
     wln(self, "char* p_json_parse(const char* s) { return p_str_own_libc_c(p_json_parse__raw(s)); }");
     wln(self, "static char* p_json_parse__raw(const char* s) {");
@@ -17678,10 +18009,25 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "            // Skip whitespace and colon");
     wln(self, "            while (*p && *p != ':') p++;");
     wln(self, "            if (*p) p++;");
-    wln(self, "            while (*p == ' ' || *p == '\\t') p++;");
+    wln(self, "            while (*p == ' ' || *p == '\\t' || *p == '\\n' || *p == '\\r') p++;");
     wln(self, "            // Parse value");
     wln(self, "            char* key = (char*)malloc(klen+1); memcpy(key, kstart, klen); key[klen] = 0;");
-    wln(self, "            if (*p == '\"') {");
+    wln(self, "            if (*p == '{' || *p == '[') {");
+    // BG97: a nested object or array, whole
+    wln(self, "                const char* vstart = p;");
+    wln(self, "                p = _json_skip_nested(p);");
+    wln(self, "                char* val;");
+    wln(self, "                if (*vstart == '{') {");
+    wln(self, "                    size_t sl = (size_t)(p - vstart);");
+    wln(self, "                    char* sub = (char*)malloc(sl + 1); memcpy(sub, vstart, sl); sub[sl] = 0;");
+    wln(self, "                    char* canon = p_json_parse__raw(sub); free(sub);");
+    wln(self, "                    size_t cl = strlen(canon);");
+    wln(self, "                    val = (char*)malloc(cl + 2); val[0] = '\\x01'; memcpy(val + 1, canon, cl + 1); free(canon);");
+    wln(self, "                } else {");
+    wln(self, "                    val = _json_raw_compact(vstart, p);");
+    wln(self, "                }");
+    wln(self, "                _json_append(j, key, val); free(key); free(val);");
+    wln(self, "            } else if (*p == '\"') {");
     wln(self, "                p++; const char* vstart = p;");
     wln(self, "                while (*p && *p != '\"') p++;");
     wln(self, "                size_t vlen = p - vstart;");
@@ -17742,6 +18088,8 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "        if (!pj->is_array) { size_t kl=strlen(pj->keys[i]); if (pos+kl+4>=cap){cap=(cap+kl)*2;result=(char*)realloc(result,cap);} result[pos++]='\"'; memcpy(result+pos,pj->keys[i],kl); pos+=kl; result[pos++]='\"'; result[pos++]=':'; }");
     wln(self, "        // Don't quote numbers, booleans, null");
     wln(self, "        const char* v = pj->vals[i];");
+    // BG97: a nested object or array (behind its mark) as it is
+    wln(self, "        if (*v == '\\x01') { size_t rl = strlen(v + 1); if (pos+rl+3>=cap){cap=(cap+rl)*2;result=(char*)realloc(result,cap);} memcpy(result+pos,v+1,rl); pos+=rl; continue; }");
     wln(self, "        bool is_numeric = (*v >= '0' && *v <= '9') || *v == '-';");
     wln(self, "        bool is_bool = strcmp(v, \"true\") == 0 || strcmp(v, \"false\") == 0;");
     wln(self, "        bool is_null = strcmp(v, \"null\") == 0;");

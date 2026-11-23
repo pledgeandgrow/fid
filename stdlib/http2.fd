@@ -882,14 +882,23 @@ pub fn h2_flush(c: &mut H2Conn) -> bool {
     if n == 0 || c.fd < 0 {
         return c.ok;
     }
-    var buf: i64 = p_malloc(n + 8);
+    var buf: i64 = 0;
+    // SAFETY: a fresh block of n + 8 bytes: the loop below writes the n
+    // queued bytes into it.
+    unsafe {
+        buf = p_malloc(n + 8);
+    }
     var i: i64 = 0;
     while i < n {
         p_volatile_store8(buf + i, c.out.get(i));
         i = i + 1;
     }
     val sent: i64 = h2_io_send(c, buf, n);
-    p_free(buf);
+    // SAFETY: the block above; the send has returned and keeps no pointer
+    // to it.
+    unsafe {
+        p_free(buf);
+    }
     c.out.clear();
     if sent != n {
         c.ok = false;
@@ -904,14 +913,23 @@ fn h2_fill(c: &mut H2Conn, timeout_ms: i64) -> i64 {
         c.inbuf = h2_sub(c.inbuf, c.inpos, c.inbuf.len());
         c.inpos = 0;
     }
-    var buf: i64 = p_malloc(16384);
+    var buf: i64 = 0;
+    // SAFETY: a fresh 16384-byte block, the size h2_io_recv is told it may
+    // fill.
+    unsafe {
+        buf = p_malloc(16384);
+    }
     val n: i64 = h2_io_recv(c, buf, 16384, timeout_ms);
     var i: i64 = 0;
     while i < n {
         c.inbuf.push(p_volatile_load8(buf + i));
         i = i + 1;
     }
-    p_free(buf);
+    // SAFETY: the block above; its n received bytes were copied into
+    // c.inbuf.
+    unsafe {
+        p_free(buf);
+    }
     return n;
 }
 
@@ -1856,7 +1874,13 @@ pub fn h2_job_request(t: str) -> HttpRequest {
 /// and a flag set once the response is there. The task is detached: the
 /// connection frees the slot.
 pub fn h2_handler_task(slot: i64) -> i64 {
-    val text: str = p_str_adopt(p_atomic_load(slot));
+    var text: str = "";
+    // SAFETY: word 0 of the slot is the request text h2_start_job stored
+    // as a raw word (h2_job_text): its one owner, taken here once, by the
+    // one task the slot was made for.
+    unsafe {
+        text = p_str_adopt(p_atomic_load(slot));
+    }
     val req: HttpRequest = h2_job_request(text);
     val h: fn(HttpRequest) -> str = h2_handler;
     // The handler's response as a raw word: one owner, handed over through
@@ -1868,7 +1892,13 @@ pub fn h2_handler_task(slot: i64) -> i64 {
 
 // Start the handler of stream `s` on a task of its own.
 fn h2_start_job(c: &mut H2Conn, s: H2Stream) {
-    val slot: i64 = p_malloc(24);
+    var slot: i64 = 0;
+    // SAFETY: a fresh 24-byte block, the job's three words (request,
+    // response, done flag), all stored next; the connection frees it once
+    // the task has set the flag (h2_collect_jobs, h2_finish_jobs).
+    unsafe {
+        slot = p_malloc(24);
+    }
     p_atomic_store(slot, h2_job_text(s) as i64);
     p_atomic_store(slot + 8, 0);
     p_atomic_store(slot + 16, 0);
@@ -1885,8 +1915,19 @@ pub fn h2_collect_jobs(c: &mut H2Conn) -> i64 {
         val slot: i64 = c.jobs.get(k);
         if p_atomic_load(slot + 16) != 0 {
             val id: i64 = c.job_ids.get(k);
-            val resp: str = p_str_adopt(p_atomic_load(slot + 8));
-            p_free(slot);
+            var resp: str = "";
+            // SAFETY: word 1 of a finished job's slot is the response its
+            // task stored as a raw word (h2_handler_task), one owner, taken
+            // here once: the slot leaves c.jobs right below.
+            unsafe {
+                resp = p_str_adopt(p_atomic_load(slot + 8));
+            }
+            // SAFETY: the job's slot from h2_start_job; its task stored the
+            // done flag as its last access to it, the response word was just
+            // taken, and the slot leaves c.jobs right below.
+            unsafe {
+                p_free(slot);
+            }
             c.jobs.remove(k);
             c.job_ids.remove(k);
             val sk: i64 = h2_stream_index(c, id);
@@ -1907,8 +1948,17 @@ fn h2_finish_jobs(c: &mut H2Conn) {
     while c.jobs.len() > 0 {
         val slot: i64 = c.jobs.get(0);
         if p_atomic_load(slot + 16) != 0 {
-            val resp: str = p_str_adopt(p_atomic_load(slot + 8));
-            p_free(slot);
+            var resp: str = "";
+            // SAFETY: as in h2_collect_jobs: the finished task's response,
+            // one owner, taken once (and dropped with resp).
+            unsafe {
+                resp = p_str_adopt(p_atomic_load(slot + 8));
+            }
+            // SAFETY: as in h2_collect_jobs: the finished task no longer
+            // touches the slot, and it leaves c.jobs right below.
+            unsafe {
+                p_free(slot);
+            }
             c.jobs.remove(0);
             c.job_ids.remove(0);
         } else {
@@ -1937,7 +1987,12 @@ fn h2_run_handlers(c: &mut H2Conn) {
                 // function value is no temporary, `val resp = h(req)` took a
                 // second owner and leaked every response; see http.fd
                 // http_scoped_dispatch)
-                val resp: str = p_str_adopt(h(req) as i64);
+                var resp: str = "";
+                // SAFETY: the word is the handler's fresh response, held by
+                // nothing else (above): adopted once.
+                unsafe {
+                    resp = p_str_adopt(h(req) as i64);
+                }
                 h2_respond(c, s.id, req.method == "HEAD", resp);
             }
         }
@@ -2311,7 +2366,12 @@ fn h2_h1_or_upgrade(c: &mut H2Conn) -> bool {
     plain.body = str_from_bytes(body);
     val h: fn(HttpRequest) -> str = h2_handler;
     // one owner for the handler's response (VF16)
-    val resp: str = p_str_adopt(h(plain) as i64);
+    var resp: str = "";
+    // SAFETY: the word is the handler's fresh response, held by nothing
+    // else (as in h2_run_handlers): adopted once.
+    unsafe {
+        resp = p_str_adopt(h(plain) as i64);
+    }
     h2_h1_write(c, h2_h1_response(resp, plain.method == "HEAD"));
     return false;
 }

@@ -6,6 +6,10 @@
 // Build: gcc -c pledge_net.c -o pledge_net.o
 // Link: (Linux: sockets in libc, no extra lib) (Windows: -lws2_32)
 
+// its own header first: the C compiler checks each definition against
+// the declaration Fides binds to (pledge_input_init was int here and
+// long long there, unnoticed while this file did not include it)
+#include "pledge_net.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>

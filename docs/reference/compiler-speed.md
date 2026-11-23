@@ -356,3 +356,226 @@ Check: `bash tests/mono_share/check.sh $FID`
 function whose serialized IR equals an earlier function's to that earlier
 one (opt-in `FID_IROPT_ON=icf` until a suite run shows the same output with
 it on and off: `tests/tooling/midend-optin-check.sh` with `IME=icf`).
+
+---
+
+## PE88: `fid emit` of a typical test in under 1 second
+
+Roadmap: docs/roadmap/pe-roadmap.md item 88 ("Native compile of a typical
+test in under 1 second"). The measure is the default Windows build,
+`fid emit <file.fd>` through pe_ir, with an -O2 compiler on a quiet machine
+and the caches warm (D9's checked-library stamp, the import and AST
+caches). `--no-cache` only skips the "up to date" answer for an unchanged
+output, so a timed run always builds.
+
+### How to measure
+
+    FID=release/fid.exe bash tests/tooling/pe88-emit-time-check.sh
+
+The script builds tests/bootstrap/hello.fd and test_collections.fd (a
+mid-size test: Vec, HashMap, strings) once to warm the caches, then `RUNS`
+times (default 5) with `--time`, and prints the stage table of the best run
+for each, with and without the prune below. It fails when a best total is
+not under `LIMIT_MS` (default 1000). It warns when other compiler processes
+are running: several fid or zig processes at once make a stage 10-200x
+slower (AGENTS.md), and such numbers are not the target's.
+
+### Where the time went (Nov 17, a -O0 compiler, a busy machine)
+
+`stage0.exe emit tests/bootstrap/hello.fd --no-cache --time`, before the
+prune (absolute numbers are an -O0 compiler's on a loaded machine; the
+shares are what matters):
+
+| Stage | ms | share |
+|---|---|---|
+| inc check (the compiler hashes its own 55 MB executable) | 290 | 4% |
+| front end (stdlib 350, typecheck 600, mono 370, lints 120) | 1650 | 21% |
+| lower | 2800-3450 | 36-38% |
+| iropt | 1350-1640 | 17% |
+| native code (pe_ir) | 1600-1880 | 20% |
+| total | 7700-9150 | |
+
+With `FID_IROPT_STATS=1` the mid-end shows why it is that slow for a
+12-line program: its per-function passes run on the 24 functions main
+reaches, but its module-wide passes (hofspec 593 ms, licmcall 162, inline
+154, gconst 87, closuredevirt 70) go over every function lowering made:
+main's, all of core and the whole merged runtime. pe_ir likewise generates
+only what main reaches but builds its string table, its list of needed
+runtime functions and a label for every function of the module. iropt's
+opt-in dead-function pass (`FID_IROPT_ON=deadf`) found 157 functions no
+code can call in hello.fd, but took 1446 ms itself: it and
+pe_ir_reachable_from look names up along a list.
+
+### What changed: pe88_prune (compiler/main.fd)
+
+Between lowering and the mid-end, a pe_ir build drops the functions no code
+can call (`[build] pe88: N of M functions no code can call dropped before
+the mid-end`, and a `prune` row in the `--time` table):
+
+- Roots: main, main_entry, every function ir.fd `ir_dfe_root` names (p_*,
+  __*, the whole Fides runtime pe_/pert_/pet_/ped_, nat_*, the Vec_* and
+  vec_raw_* stand-ins, the collection printers), functions handed to C,
+  interrupt handlers and kernels, externs, and functions some string of
+  the module names (string table, global initializers).
+- Edges, those of pe_ir_reachable_from: calls (the callee and what pe_ir
+  resolves it to: a pert_c_ override, core's stand-in, a pert_ function),
+  print and p_to_str with every formatter they may dispatch to, function
+  references, strings naming a function, `dyn` calls (every
+  `<type>_<method>`), autograd's builtins and the stubs' runtime functions
+  (pe_stub_deps). The set is a hash map, one pass over each kept function.
+- The runtime stays whole, so pe_ir resolves every builtin as before (a
+  stub calls p_malloc and the like by name and takes pert_X when the module
+  has it: dropping runtime functions could change which one it takes).
+- Should pe_ir fail on the pruned module with an error naming a function
+  the prune dropped (a pass called it by name, iropt's Vec_len for one;
+  ir_dfe_root keeps those), the build is made again from every function
+  and says so on stderr.
+- `FID_PE_PRUNE=0` (or `FID_LOWER_ALL=1`) keeps every function. Only the
+  pe_ir path prunes; the machine layer (`--nat`, Linux and macOS targets)
+  and the C path are unchanged.
+
+What it saves is the dropped functions' share of the module-wide passes
+and of pe_ir's module-wide work (157 functions of hello.fd's module, by
+iropt's count). The check script times both ways.
+
+### What is left (not in the driver's files)
+
+- Lowering, the largest stage, still turns all of core and the merged
+  runtime into IR: compiler/reach.fd roots every function with a runtime
+  prefix (pe_/pert_/pet_/ped_/p_/__). Rooting a `pert_X` only when a kept
+  body or a pe_ir stub names `p_X` would leave out most of the 6,700 runtime
+  lines for a small program; it needs the list of builtins pe_ir's stubs
+  call by name (`PeirGen_call_builtin`, `PeirGen_call_runtime` and
+  `func_labels` lookups: p_malloc, p_free, p_str_concat, p_print_str,
+  p_eprint_str, p_panic, p_to_str*, p_argc, p_argv, p_tensor_to_str, ...)
+  exported from pe_ir, so a stub never silently takes its machine version
+  for a runtime function that was not lowered.
+- pe_ir's own module-wide work is quadratic in places: pe_ir_reachable_from
+  (`pe_strs_contains(seen, f)` for every edge), the string table
+  (`pe_ir_strs_contains(all_strings, ...)`), and the `dyn` candidates
+  (every function scanned for each DynCall). Hash sets there shorten
+  `native code` for every build, pruned or not.
+- `inc check`: the compiler hashes its whole executable once per build
+  (compiler/inc.fd `inc_self_hash`, for the stamps and caches' keys): 30 ms
+  for an 8 MB compiler, about 200 ms for a 41 MB one (measured through
+  pe_ir's p_file_hash). A cache keyed by path, size and modification time
+  needs `p_file_mtime_ms` in pe_runtime, linux_runtime and the
+  interpreter (the C runtime has it).
+- The front end's share (typecheck of the merged runtime, mono) belongs to
+  the front end's roadmap items.
+
+---
+
+## Work stealing: per-worker lock-free run queues (competitive RT10)
+
+Where: `stdlib/pe_runtime/conc.fd` "Run queues" (native Windows, pe_ir,
+the default `fid emit`) and `stdlib/linux_runtime/conc.fd` "Worker rings"
+(the machine layer: Linux AArch64 / RISC-V 64 / x86-64 and `--nat` Windows).
+
+### Before
+
+Every worker had a local queue, but all queues (local and global) were
+linked lists under one lock (`pert_wq` in pe_runtime; one global list under
+`pe_q_lock` in linux_runtime). A spawn, a yield, a pop and a steal each took
+that lock, and a steal took one task.
+
+### Now
+
+- Each worker owns a bounded ring of 256 task slots, a Chase-Lev deque taken
+  FIFO (as Go's `runq` and Tokio's local queue). Only its worker pushes, at
+  `bottom`, with plain stores and one fenced store that publishes the slot
+  (`pe_atomic_store` is `xchg`; `nat_atomic_store` is `stlr` + `dmb` / fenced
+  on RISC-V). Its worker and thieves take at `top` by compare-and-swap, so a
+  slot is claimed once; no lock is taken. FIFO rather than the paper's
+  owner-LIFO: a task that yields goes behind the others on its ring.
+- A worker whose ring is dry takes the global queue's head and its share of
+  the rest (one worker's part, at most half a ring) in one lock hold, then
+  steals half of a sibling's ring in one CAS: the slots are copied to its own
+  ring's unpublished end, then claimed; a failed claim copies again. Victims
+  are tried from a rotating start.
+- A full ring moves its older half (claimed first, then read: only the owner
+  writes slots) and the new task to the global queue in one lock hold.
+- The global queue holds what threads that are not workers queue (the poller,
+  the blocking pool, main), and in linux_runtime every sleeper (the scan
+  that skips sleepers until they are due stays on the global queue) and
+  everything in random mode (RL17).
+- Parking: a worker counts itself idle (a locked add, a barrier), looks at
+  the rings once more, and only then sleeps. A push publishes its slot before
+  it reads the idle count, so either the pusher wakes the worker or the
+  worker sees the task.
+- Deadlock detector (pe_runtime): unchanged two-cycle rule; "queue empty" is
+  now the global queue plus a sum over the rings. A task made but not yet
+  queued, or run inline by `async` on a thread that is not a worker, no
+  longer looks stuck (`pert_offq`): main spawning 200,000 tasks while the
+  workers drained the queue panicked with "Tasks are deadlocked" before.
+- Task registry (pe_runtime): a finished task's registry slot is in its
+  block ([29]); finishing scanned the registry, which made tasks finishing
+  out of spawn order quadratic (the tree phase below: 72 us a task at
+  200,000 tasks, 4 us after).
+
+The C runtime (`compiler/codegen_c.fd`) has no shared run queue to replace:
+its tasks are a cooperative scheduler per OS thread (`P_THREAD_LOCAL`
+`__p_cos`), so they never move between cores. Giving it M:N scheduling is a
+separate, larger change.
+
+### Tests and benchmark
+
+- `tests/bootstrap/test_task_steal.fd`: fan-out from one task (5,000 tasks
+  through a 256-slot ring: spills and steals), a spawn tree (8,191 tasks),
+  3,000 tasks from main through the global queue, each yielding once.
+  Prints counts and sums; a lost or duplicated task changes them, a lost
+  wake-up hangs or panics.
+- `tests/ctx_switch/steal_bench.fd [tasks] [work]`: the same three shapes
+  with timings (ns per task) and a check of every result.
+
+Run each many times and with several worker counts:
+
+    $FID emit tests/bootstrap/test_task_steal.fd -o steal.exe
+    for i in $(seq 50); do ./steal.exe | md5sum; done | sort | uniq -c
+    for w in 1 2 3 16; do FIDES_WORKERS=$w ./steal.exe | md5sum; done
+    FIDES_SCHED_RANDOM=7 ./steal.exe        # slow (random 1 ms sleeps), same output
+    $FID emit tests/bootstrap/test_task_steal.fd --nat -o steal_nat.exe
+    NATIVE=1 FID=$FID JOBS=4 bash scripts/cross-test.sh aarch64-linux
+
+    $FID emit tests/ctx_switch/steal_bench.fd -o steal_bench.exe
+    ./steal_bench.exe 200000 100
+    FIDES_WORKERS=1 ./steal_bench.exe 200000 100
+
+### Measurements (Nov 17, stage-0 compiler with today's stdlib)
+
+Measured on a 16-thread Windows machine that was saturated by other builds
+(several compilers at once, memory exhausted: some runs died with "out of
+memory"), so these numbers are noisy and only show the order of magnitude.
+
+`steal_bench.exe 200000 100`, pe_runtime, ns per task, three runs each:
+
+| phase   | shared lock (before) | rings (now)          |
+|---------|----------------------|----------------------|
+| fan-out | 4538 / 5614 / 4988   | 5094 / 4350 / 4596   |
+| tree    | 4057 / 3680 / 4724   | 4234 / 4000 / 4151   |
+| global  | 15530 / 66765 / crash| 18124 / 36301 / 11501|
+
+("before" here is the old queues with this change's registry and detector
+fixes, so only the queues differ; without the registry fix the tree phase
+was 72,000-108,000 ns per task, and the global phase always panicked with
+a false deadlock.) At about 4-5 us a task the cost is dominated by making
+and finishing a task (its stack, the registry lock `pert_reg`, the
+`pert_done` broadcast at each finish), not by the run queues: the queue
+change does not show above the noise here. To see the queues alone,
+measure on a quiet machine, and then the next step is the per-task locks.
+
+Correctness (pe_runtime): `test_task_steal` 20/20 runs identical, with
+`FIDES_WORKERS` 1, 2, 3, 16 (5 runs each) identical, `FIDES_SCHED_RANDOM=7`
+identical (112 s: random sleeps); test_tasks, test_task_handoff,
+test_tasks_10k, test_runtime_sched_random, test_machine_tasks_once match
+their expected output 5/5; the async tests and test_pe_task_order,
+test_spawn_scope give the same output on 5 runs.
+
+linux_runtime: built with `--nat` (the same machine layer on Windows
+x86-64), `test_task_steal` 9/9 identical with the default and 1, 2, 3, 8
+workers. That needed `FID_NAT_OFF=purecse`: the stage-0 compiler's pure-call
+CSE (compiler/rules.fd) merges two `task_run()` calls (and two
+`sync_atomic_load(g)` of the same global) in one function, so the second
+`task_run()` returned at once, with the old queues as with the new ones.
+The Linux targets were not run: stage 0 cannot build them with today's
+runtime (`undefined symbol: nat_tls_set` from its x86-64 and AArch64 ELF).

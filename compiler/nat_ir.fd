@@ -18833,19 +18833,37 @@ fn ng_crashfree_check(rec: &NatFnRec) -> str {
     return "";
 }
 
+/// A function a @constant_time function may call without being
+/// @constant_time itself: what the source-level check
+/// (TypeChecker_verify_constant_time) and pe_ir's (peir_ct_check) allow.
+/// Runtime builtins (`p_*`, `__*`, and the runtime's own `pert_*`, `pe_*`,
+/// `nat_*` they lower to) and core's implementations of the built-in
+/// types' methods (`v.len()`, `v.get(i)` are calls of Vec_len, Vec_get
+/// here; the source check does not count a method on Vec, HashMap or str
+/// as a call). Before, `ct_sum`'s `v.get(i)` failed the build on the
+/// machine layer only (test_windows_ct_public_loops). A user function that
+/// is not @constant_time is still rejected.
+fn ng_ct_exempt_callee(name: str) -> bool {
+    return str_starts_with(name, "p_") || str_starts_with(name, "__") || str_starts_with(name, "pert_") || str_starts_with(name, "pe_") || str_starts_with(name, "nat_") || str_starts_with(name, "Vec_") || str_starts_with(name, "HashMap_") || str_starts_with(name, "Str_");
+}
+
 /// "" when the function is clean, else one line per violation.
+/// The machine-level half of J7: what only the final MIR shows (a divide
+/// instruction, an indirect call, a call of a function that is not
+/// @constant_time). Branches are judged on the IR, with taint, by the
+/// check pe_ir runs too (checks.fd peir_ct_check, called from the driver
+/// loop): a branch on a value derived from a secret is rejected there, a
+/// loop on a public counter passes. Before, every conditional branch and
+/// every overflow/bounds check (MO_PANICIF) was rejected here, so no
+/// @constant_time function with a loop built on this backend; a check
+/// whose jump is taken only on a run that ends in a panic executes the
+/// same instructions on every run that completes (pe_ir's rule).
 fn ng_ct_check(g: &NatGen, rec: &NatFnRec) -> str {
     var errs: str = "";
     var i: i64 = 0;
     while i < rec.mir.len() {
         var m: MInst = rec.mir.get(i);
         var what: str = "";
-        if mi_is_cond_br(m.op) {
-            what = "conditional branch";
-        }
-        if m.op == MO_PANICIF {
-            what = "data-dependent check";
-        }
         if m.op == MO_DIV || m.op == MO_REM {
             what = "integer division (variable latency)";
         }
@@ -20801,6 +20819,13 @@ fn ng_mir_emit_pass(g: &mut NatGen, rec: &NatFnRec, al: &NatAlloc, short: &Vec<i
                             p = ng_spill_reg(g, nscr);
                             ng_fmov_any(g, p, r, w32);
                             ng_xc_kill(g, p);
+                            if p == fwd_r {
+                                // BG57: the stored register (TG17's
+                                // forward) holds this float operand now: a
+                                // later operand of the same instruction
+                                // must load the stored vreg from its slot
+                                fwd_vi = 0 - 1;
+                            }
                             fb_v = v;
                             fb_p = p;
                             nscr = nscr + 1;
@@ -29488,28 +29513,37 @@ fn ng_gen_checked(g: &mut NatGen, kind: i64, ty: IrType, checked: bool) {
     if kind == 2 {
         which = NP_MUL;
     }
+    // BG55: the third scratch of the i64 checks. In the machine IR it is a
+    // fresh vreg: g.ad is the address scratch a spill reload with a far
+    // frame offset (RISC-V, AArch64) computes its address in, so a value
+    // left in it from one MIR instruction to the next could be overwritten
+    // (a missed or a false overflow). The direct path has no allocator.
+    var sc: i64 = g.ad;
     if checked && is_i64 {
+        if g.rec {
+            sc = ng_new_vreg(g);
+        }
         if kind == 0 {
             ng_add(g, g.t2, g.t0, g.t1);
             ng_xor(g, g.t3, g.t0, g.t2);
-            ng_xor(g, g.ad, g.t1, g.t2);
-            ng_and(g, g.t3, g.t3, g.ad);
+            ng_xor(g, sc, g.t1, g.t2);
+            ng_and(g, g.t3, g.t3, sc);
             ng_setcc(g, g.t3, g.t3, g.zr, NCC_LT);
             ng_panic_if(g, g.t3, which);
             ng_mov(g, g.t0, g.t2);
         } else if kind == 1 {
             ng_sub(g, g.t2, g.t0, g.t1);
             ng_xor(g, g.t3, g.t0, g.t1);
-            ng_xor(g, g.ad, g.t0, g.t2);
-            ng_and(g, g.t3, g.t3, g.ad);
+            ng_xor(g, sc, g.t0, g.t2);
+            ng_and(g, g.t3, g.t3, sc);
             ng_setcc(g, g.t3, g.t3, g.zr, NCC_LT);
             ng_panic_if(g, g.t3, which);
             ng_mov(g, g.t0, g.t2);
         } else {
             ng_mulh(g, g.t3, g.t0, g.t1, false);
             ng_mul(g, g.t2, g.t0, g.t1);
-            ng_asr63(g, g.ad, g.t2);
-            ng_setcc(g, g.t3, g.t3, g.ad, NCC_NE);
+            ng_asr63(g, sc, g.t2);
+            ng_setcc(g, g.t3, g.t3, sc, NCC_NE);
             ng_panic_if(g, g.t3, which);
             ng_mov(g, g.t0, g.t2);
         }
@@ -30856,7 +30890,7 @@ fn ng_gen_function(g: &mut NatGen, name: str, func: &IrFunction, module: &IrModu
         g.recs.push(NatFnRec {
             name: name, mir: ng_cold_last(&g.mir, 0, 0), nvreg: g.nvreg, base_frame: ng_vz_frame_end(base_frame), slots: g.slots, is_ct: is_ct, sret_v: sret_v, sret_size: sret_size, secret: secret
         });
-        if is_ct {
+        if is_ct || ng_ct_exempt_callee(name) {
             // labels are numbers: an integer-keyed map (a plain insert
             // hashed the label as a string and crashed, MI17)
             HashMap_insert_i(g.ct_labels, ng_fn_label(g, name), 1);
@@ -32408,7 +32442,7 @@ fn nat_generate_image1(module: IrModule, arch: i64, win: bool, mac: bool) -> Res
                 }
                 var nix: i64 = nc_lookup(&mut g, &func, &module);
                 if nix != 0 {
-                    nc_skel_fn(&mut g, name, nix);
+                    nc_skel_fn(&mut g, name, nix, func.is_constant_time);
                 } else if g.nc_on {
                     // SP6: the labels it asks for go with its entry
                     nc_log_begin();
@@ -32416,6 +32450,22 @@ fn nat_generate_image1(module: IrModule, arch: i64, win: bool, mac: bool) -> Res
                     nc_log_end(name);
                 } else {
                     ng_gen_function(&mut g, name, &func, &module);
+                }
+                // J7: the IR-level @constant_time check pe_ir runs
+                // (checks.fd peir_ct_check: a branch or a division on a
+                // value derived from a parameter, followed through memory
+                // and calls). It judges branches here too, so a loop on a
+                // public counter passes as it does on pe_ir; before, the
+                // machine-level check rejected every conditional branch
+                // (ge_scalarmult_ct, x25519_ladder_xz, ct_sum on the nat
+                // lane). It also covers a function replayed from the cache,
+                // which the machine-level check never sees.
+                // FID_NAT_OFF=ctir turns it off.
+                if func.is_constant_time && ng_on("ctir") {
+                    var cte: Vec<str> = peir_ct_check(&func, name);
+                    if cte.len() > 0 {
+                        return ResultBytes::Err(c_vec1("native backend: @constant_time violated: " + cte.get(0)));
+                    }
                 }
             }
             OptIrFunction::None => {
@@ -36630,7 +36680,9 @@ fn nc_hty(h: i64, t: IrType) -> i64 {
                 hh = nc_hty(hh, args.get(i));
                 i = i + 1;
             }
-            return hh;
+            // BG86: the count ends the list (Generic(G, [Generic(H, [a]), b])
+            // and Generic(G, [Generic(H, [a, b])]) hashed alike)
+            return nc_h(hh, args.len());
         }
     }
     return h;
@@ -36909,12 +36961,15 @@ fn nc_hinst(h: i64, inst: Inst) -> i64 {
                 hh = nc_h(nc_hs(hh, outs.get(i).name), outs.get(i).id);
                 i = i + 1;
             }
+            // BG86: the counts keep the outputs and the inputs apart (one
+            // output and no input hashed as no output and one input)
+            hh = nc_h(hh, outs.len());
             var j: i64 = 0;
             while j < ins.len() {
                 hh = nc_h(nc_hs(hh, ins.get(j).name), ins.get(j).id);
                 j = j + 1;
             }
-            return hh;
+            return nc_h(hh, ins.len());
         }
         Inst::RegionBegin(n, a, b, l) => {
             var hh: i64 = nc_hs(nc_h(h, 34), n);
@@ -37038,6 +37093,13 @@ fn nc_fn_hash(f: &IrFunction) -> i64 {
         // LF20: the frame wipe is part of the function's code
         h = nc_h(h, 88);
     }
+    // BG56: @constant_time changes the code (no SIMD, vectorization or
+    // writeback forms, the secret spill weights, the frame wipe) and
+    // secret_values picks the values the allocator spills last and wipes
+    if f.is_constant_time {
+        h = nc_h(h, 89);
+    }
+    h = nc_hids(h, f.secret_values);
     h = nc_hids(h, f.workgroup_size);
     h = nc_heff(h, f.effects);
     if f.is_wrapping {
@@ -37783,7 +37845,7 @@ fn nc_rv_jal_ra(e: &NcEntry, pos: i64) -> bool {
 /// A cache hit's record: a synthetic MIR with the same trap/call counts and
 /// the same call edges, so the postorder and the cold splitter see the same
 /// shape; allocation/emission is skipped for it.
-fn nc_skel_fn(g: &mut NatGen, name: str, ix: i64) {
+fn nc_skel_fn(g: &mut NatGen, name: str, ix: i64, is_ct: bool) {
     // CS6/SP20: its line rows' file, registered where ng_gen_function
     // would have registered it (the file table's order is the image's)
     var lon: bool = ng_dbg_lines_ok(g) && ng_on("debug") && HashMap_contains(g.line_fns, name);
@@ -37842,6 +37904,14 @@ fn nc_skel_fn(g: &mut NatGen, name: str, ix: i64) {
     while r < e.refs.len() {
         var rl: i64 = ng_fn_label(g, e.refs.get(r));
         r = r + 1;
+    }
+    // BG44: a @constant_time function (or one a @constant_time caller may
+    // call, ng_ct_exempt_callee) replayed from the cache is still one:
+    // ng_gen_function records its label in ct_labels, so without this a
+    // recompiled @constant_time caller of a cached callee failed the
+    // machine-level check ("not @constant_time")
+    if is_ct || ng_ct_exempt_callee(name) {
+        HashMap_insert_i(g.ct_labels, ng_fn_label(g, name), 1);
     }
     HashMap_insert(g.nc_hit, name, ix);
     g.nc_hit_names.push(name);

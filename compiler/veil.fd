@@ -303,20 +303,35 @@ pub fn collect_all_coverage(module: &IrModule) -> CoverageData {
 }
 
 /// Keep only what belongs to functions and methods `up` defines (a method
-/// lowers as `Type_method`, a generic instance as `name__...`).
+/// lowers as `Type_method`, a generic instance as `name__...`, a method
+/// of a generic struct as `Type__method__...`).
 fn vl_keep_user(data: &mut CoverageData, up: &Program) {
     var names: i64 = HashMap_new();
     var fi: i64 = 0;
     while fi < up.funcs.len() {
-        HashMap_insert(names, up.funcs.get(fi).name, 1);
+        // 2: a generic function's template, which runs only as its
+        // instances (`name__T`): left out of the report (vl_is_user)
+        var fkind: i64 = 1;
+        if up.funcs.get(fi).type_params.len() > 0 {
+            fkind = 2;
+        }
+        HashMap_insert(names, up.funcs.get(fi).name, fkind);
         fi = fi + 1;
     }
     var ii: i64 = 0;
     while ii < up.impls.len() {
         var imp: ImplDef = up.impls.get(ii);
+        var mkind: i64 = 1;
+        if imp.type_params.len() > 0 {
+            mkind = 2;
+        }
         var mi: i64 = 0;
         while mi < imp.methods.len() {
-            HashMap_insert(names, imp.struct_name + "_" + imp.methods.get(mi).name, 1);
+            var mk: i64 = mkind;
+            if imp.methods.get(mi).type_params.len() > 0 {
+                mk = 2;
+            }
+            HashMap_insert(names, imp.struct_name + "_" + imp.methods.get(mi).name, mk);
             mi = mi + 1;
         }
         ii = ii + 1;
@@ -330,12 +345,30 @@ fn vl_keep_user(data: &mut CoverageData, up: &Program) {
 }
 
 fn vl_is_user(names: i64, n: str) -> bool {
-    if HashMap_get(names, n) != 0 {
+    val kind: i64 = HashMap_get(names, n);
+    if kind == 2 {
+        // the template of a generic (`Cell_get` of `impl<T> Cell<T>`): it
+        // is lowered but never runs, so it showed as a function never
+        // called (Functions 2/3 for one generic method and main); its
+        // instances are matched below
+        return false;
+    }
+    if kind != 0 {
         return true;
     }
     var cut: i64 = str_find(n, "__");
     if cut > 0 && HashMap_get(names, str_slice(n, 0, cut)) != 0 {
         return true;
+    }
+    // a method of a generic struct lowers as `Type__method__T1_T2`
+    // (mono.fd mangle_method), its source name being `Type_method`: it was
+    // left out of the report (BG106)
+    if cut > 0 {
+        val rest: str = str_slice(n, cut + 2, str_len(n));
+        val cut2: i64 = str_find(rest, "__");
+        if cut2 > 0 && HashMap_get(names, str_slice(n, 0, cut) + "_" + str_slice(rest, 0, cut2)) != 0 {
+            return true;
+        }
     }
     return false;
 }

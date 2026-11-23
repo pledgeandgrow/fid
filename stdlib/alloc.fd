@@ -10,18 +10,32 @@ module alloc;
 /// Allocate `size` bytes on the heap. Returns a raw pointer (i64).
 /// The memory is uninitialized. Returns 0 on failure.
 pub fn __alloc(size: i64) -> i64 {
-    return p_malloc(size);
+    // SAFETY: p_malloc only allocates: it reads no memory of the caller's,
+    // and the fresh block's address is handed back as a plain i64.
+    unsafe {
+        return p_malloc(size);
+    }
 }
 
 /// Free a previously allocated pointer.
 /// Passing 0 (null) is a no-op.
 pub fn __free(ptr: i64) -> void {
-    p_free(ptr);
+    // SAFETY: NOT checked here. p_free is sound only when ptr is 0 or an
+    // address __alloc/__alloc_bytes/__alloc_array returned that has not
+    // been freed and is not used afterwards; this function cannot verify
+    // that, so the caller must uphold it (its contract is unsafe).
+    unsafe {
+        p_free(ptr);
+    }
 }
 
 /// Allocate `size` bytes (alias for __alloc).
 pub fn __alloc_bytes(size: i64) -> i64 {
-    return p_malloc(size);
+    // SAFETY: p_malloc only allocates a fresh block and returns its address
+    // as a plain i64; nothing is read or written through it here.
+    unsafe {
+        return p_malloc(size);
+    }
 }
 
 /// Allocate `count` elements of `elem_size` bytes each.
@@ -35,5 +49,10 @@ pub fn __alloc_bytes(size: i64) -> i64 {
 ///   assert(q != 0);
 ///   __free(q);
 pub fn __alloc_array(count: i64, elem_size: i64) -> i64 {
-    return p_malloc(count * elem_size);
+    // SAFETY: p_malloc only allocates a fresh block of count * elem_size
+    // bytes and returns its address as a plain i64; nothing is accessed
+    // through it here (an overflowing product only asks for a wrong size).
+    unsafe {
+        return p_malloc(count * elem_size);
+    }
 }

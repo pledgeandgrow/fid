@@ -1,0 +1,66 @@
+// A Vec of a generic struct's instance and a Vec in a type-parameter
+// field (Nov 22 ownership fixes, lower.fd):
+// - `Vec<Pair<Cell, i64>>`: each pushed value is stored in the Vec's buffer
+//   as its struct (Lowerer_generic_inst_struct_ir). Before, the Vec kept
+//   the address of the call's result slot, which the next push reused:
+//   every element read as the last one, and the Vec's drop freed their one
+//   shared Cell copy once per element ("Double free").
+// - `pv.a.get(0)` of a `Pair<Vec<str>, str>`: the element type comes from
+//   the field's type with the instance's arguments put in
+//   (Lowerer_vec_elem_ir_of). Before, it was an i64 word: printed as a
+//   number, and a concatenation with it lost its whole statement.
+//
+// Expected output:
+// 0 0 c0
+// 1 1 c1
+// 2 2 c2
+// sum 3
+// 2
+// a
+// bqr
+// tqr
+// vec 2 a bqr
+
+struct Cell {
+    id: i64,
+    name: str,
+}
+
+struct Pair<A, B> {
+    a: A,
+    b: B,
+}
+
+fn mk_cell(i: i64) -> Pair<Cell, i64> {
+    return Pair { a: Cell { id: i, name: "c" + int_to_str(i) }, b: i };
+}
+
+fn main() {
+    var cells: Vec<Pair<Cell, i64>> = Vec::new();
+    var i: i64 = 0;
+    while i < 3 {
+        cells.push(mk_cell(i));
+        i = i + 1;
+    }
+    var sum: i64 = 0;
+    i = 0;
+    while i < cells.len() {
+        val e: Pair<Cell, i64> = cells.get(i);
+        println(int_to_str(e.b) + " " + int_to_str(e.a.id) + " " + e.a.name);
+        sum = sum + e.b;
+        i = i + 1;
+    }
+    println("sum " + int_to_str(sum));
+
+    val x: str = "q" + "r";
+    var names: Vec<str> = Vec::new();
+    names.push("a" + "");
+    names.push("b" + x);
+    val pv: Pair<Vec<str>, str> = Pair { a: names, b: "t" + x };
+    println(int_to_str(pv.a.len()));
+    println(pv.a.get(0));
+    println(pv.a.get(1));
+    println(pv.b);
+    val n: i64 = pv.a.len();
+    println("vec " + int_to_str(n) + " " + pv.a.get(0) + " " + pv.a.get(1));
+}

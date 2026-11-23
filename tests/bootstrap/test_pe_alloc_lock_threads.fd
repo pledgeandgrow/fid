@@ -1,0 +1,57 @@
+// BG48 (docs/roadmap/bugs-roadmap.md): pe_ir's allocator spinlock
+// (compiler/pe_ir_stubs.fd PeirGen_gen_alloc_lock / _unlock) is
+// `lock bts qword [rip + d], 0` and `mov byte [rip + d], 0`: an imm8
+// follows the disp32, so rip is one byte past where the encoder's
+// rip-relative fixups assume. The lock was the qword at abase + 25,
+// misaligned and over the bytes after it. Now the fixups aim one byte
+// low and the lock is the word at abase + 24. The lock guards a new chunk
+// or a trim of the heap and the first per-thread setup: four threads that
+// each allocate and free thousands of strings take it many times.
+//
+// Expected output:
+// 8890
+// 8890
+// 8890
+// 8890
+// 35560
+
+fn churn(seed: i64) -> i64 {
+    var total: i64 = 0;
+    var round: i64 = 0;
+    while round < 4 {
+        var v: Vec<str> = Vec::new();
+        var i: i64 = 0;
+        while i < 2000 {
+            v.push("x" + int_to_str(i));
+            i = i + 1;
+        }
+        var n: i64 = 0;
+        var k: i64 = 0;
+        while k < v.len() {
+            n = n + str_len(v.get(k));
+            k = k + 1;
+        }
+        if round == seed % 4 {
+            total = n;
+        }
+        round = round + 1;
+    }
+    return total;
+}
+
+fn main() -> i64 {
+    val a = spawn churn(0);
+    val b = spawn churn(1);
+    val c = spawn churn(2);
+    val d = spawn churn(3);
+    val ra = await a;
+    val rb = await b;
+    val rc = await c;
+    val rd = await d;
+    println(ra);
+    println(rb);
+    println(rc);
+    println(rd);
+    println(ra + rb + rc + rd);
+    return 0;
+}

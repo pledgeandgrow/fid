@@ -29,11 +29,11 @@ use string;
 // `str_from_bytes` and `char_to_str` convert each element as a *codepoint*
 // (Latin-1-ish): 226 becomes "â" (bytes C3 A2), not byte 0xE2. To return a
 // string whose bytes are exactly the ones decoded, we write them into a
-// malloc'd NUL-terminated buffer — a raw byte string that every backend
-// treats as a `str`.
+// counted string from p_str_alloc (header, n bytes, NUL), which every
+// backend treats as a `str` and core's Str_dup/Str_drop can own.
 
-/// Bytes -> a `str` holding exactly those bytes (NUL-terminated heap
-/// buffer). This is the right way to turn decoded bytes into a string;
+/// Bytes -> a `str` holding exactly those bytes (a counted, NUL-terminated
+/// heap string). This is the right way to turn decoded bytes into a string;
 /// `str_from_bytes` re-encodes each element as a codepoint instead.
 ///
 /// Example:
@@ -42,22 +42,32 @@ use string;
 ///   assert_eq(enc_bytes_to_str(b), "hi");
 pub fn enc_bytes_to_str(bytes: Vec<i64>) -> str {
     var n = bytes.len();
-    var buf = p_malloc(n + 1);
+    // A counted string of n zeroed bytes with one owner: [P_STR_RC + 1][n]
+    // in front of buf, n bytes, then the NUL (p_str_alloc panics when out
+    // of memory). It was a plain p_malloc block, which has no string header
+    // for Str_dup/Str_drop to read.
+    val buf: i64 = p_str_alloc(n);
     var i = 0;
     while i < n {
-        var p: *mut u8 = buf + i;
-        // SAFETY: i < n and buf holds n + 1 bytes from p_malloc.
+        var p: *mut u8 = (buf + i) as *mut u8;
+        // SAFETY: i < n: one of the n data bytes of buf's string block.
         unsafe {
             *p = bytes.get(i) % 256;
         }
         i = i + 1;
     }
-    var pend: *mut u8 = buf + n;
-    // SAFETY: byte n of the (n + 1)-byte block: the terminating NUL.
+    var pend: *mut u8 = (buf + n) as *mut u8;
+    // SAFETY: byte n of buf's string block: the terminating NUL.
     unsafe {
         *pend = 0;
     }
-    return buf as str;
+    // SAFETY: buf is the data address p_str_alloc(n) returned: a counted
+    // string (header words at buf - 16 and buf - 8, length n) whose n bytes
+    // and NUL were written above, so it is a valid owned str; nothing else
+    // holds buf, and the one owner goes to the caller.
+    unsafe {
+        return buf as str;
+    }
 }
 
 /// A `str` -> its raw bytes (same as str_bytes, kept for API symmetry).

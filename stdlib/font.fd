@@ -65,10 +65,12 @@ pub struct Glyph {
 // helper must treat as "none"; any other out_ argument must be the address
 // of a buffer the caller allocated at the size the helper writes.
 extern "C" include "pledge_font.h" link "" {
-    // Load a TTF/OTF font from a file path. Returns 0 on success.
+    // Load a TTF/OTF font from a file path: the font's handle (the
+    // PledgeFont the helper malloc'd, > 0) on success, -1 on failure.
+    // out_font is not used.
     fn pledge_font_load(path: str, pixel_size: f64, out_font: i64) -> i64;
 
-    // Load a TTF/OTF font from raw bytes. Returns 0 on success.
+    // Load a TTF/OTF font from raw bytes: a handle as pledge_font_load.
     fn pledge_font_load_mem(data: i64, data_len: i64, pixel_size: f64, out_font: i64) -> i64;
 
     // Get a glyph bitmap for a codepoint. Returns 0 on success.
@@ -97,11 +99,21 @@ pub fn font_load(path: str, pixel_size: f64) -> Font {
 
     // In native builds, pledge_font_load reads the TTF file and initializes
     // stbtt_fontinfo. In the interpreter, this is a no-op (info stays 0).
-    var result = pledge_font_load(path, pixel_size, 0);
-    if result != 0 {
+    var result: i64 = 0;
+    // SAFETY: the helper (runtime/pledge_font.c) reads the NUL-terminated
+    // text of path (a Fides str alive for the call) and never touches
+    // out_font (0 here). It returns -1 on failure and, on success, the
+    // handle of the font it malloc'd, which font.info now keeps (before, a
+    // success was taken for a failure and the font leaked); font_free
+    // gives it back.
+    unsafe {
+        result = pledge_font_load(path, pixel_size, 0);
+    }
+    if result <= 0 {
         return font;
         // failure, info=0
     }
+    font.info = result;
 
     // Set metrics (would be filled by pledge_font_load in native builds)
     font.ascent = pixel_size * 0.8;
@@ -115,7 +127,13 @@ pub fn font_load(path: str, pixel_size: f64) -> Font {
 /// Free a font's resources.
 pub fn font_free(font: &mut Font) -> void {
     if font.info != 0 {
-        pledge_font_free(font.info);
+        // SAFETY: font.info is nonzero only when it holds a font the
+        // pledge_font helper allocated (font_load sets it from
+        // pledge_font_load's handle); it is zeroed right after, so this Font
+        // frees it once. Two copies of one Font freed would free it twice.
+        unsafe {
+            pledge_font_free(font.info);
+        }
         font.info = 0;
     }
     font.data = Vec::new();
@@ -137,7 +155,13 @@ pub fn font_get_glyph(font: &Font, codepoint: i64) -> Glyph {
 
     // In native builds, pledge_font_get_glyph calls stbtt_GetCodepointBitmap
     // and fills the glyph fields. The bitmap is a grayscale alpha buffer.
-    var result = pledge_font_get_glyph(font.info, codepoint, 0, 0, 0, 0, 0, 0);
+    var result: i64 = 0;
+    // SAFETY: font.info is a nonzero font from the pledge_font helper; every
+    // out_ argument is 0, and runtime/pledge_font.c skips each null output
+    // (no glyph field or bitmap is written) and frees its own bitmap.
+    unsafe {
+        result = pledge_font_get_glyph(font.info, codepoint, 0, 0, 0, 0, 0, 0);
+    }
     if result != 0 {
         return glyph;
         // glyph not found
@@ -159,7 +183,11 @@ pub fn font_kern(font: &Font, ch1: i64, ch2: i64) -> f64 {
     if font.info == 0 {
         return 0.0;
     }
-    return pledge_font_kern(font.info, ch1, ch2);
+    // SAFETY: font.info is a nonzero font from the pledge_font helper; the
+    // codepoints are values, and nothing is written.
+    unsafe {
+        return pledge_font_kern(font.info, ch1, ch2);
+    }
 }
 
 // ─── Text Measurement ────────────────────────────────────────────────────
@@ -170,7 +198,12 @@ pub fn font_text_width(font: &Font, text: str) -> i64 {
         // Fallback: estimate as char_count * pixel_size * 0.6
         return str_len(text) * (font.scale * 0.6) as i64;
     }
-    return pledge_font_text_width(font.info, text);
+    // SAFETY: font.info is a nonzero font from the pledge_font helper; the
+    // helper reads the NUL-terminated text (a Fides str alive for the call)
+    // up to its strlen and writes nothing.
+    unsafe {
+        return pledge_font_text_width(font.info, text);
+    }
 }
 
 /// Measure the height of a text string (line height * number of lines).

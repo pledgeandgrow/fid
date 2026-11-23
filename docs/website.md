@@ -10,7 +10,7 @@ from another host.
 |---|---|
 | Home | `README.md` |
 | The book | `docs/book/*.md` (its `README.md` is `/docs/book/`) |
-| Cookbook, benchmarks, internal tools, this page | `docs/cookbook.md`, `docs/benchmarks.md`, `docs/internal-tools.md`, `docs/website.md` |
+| Cookbook, benchmarks, internal tools, this page | `docs/guides/cookbook.md`, `docs/benchmarks.md`, `docs/reference/internal-tools.md`, `docs/website.md` |
 | Guides | `docs/guides/*.md` (`/docs/guides/` lists them) |
 | Reference | `docs/reference/*.md` (`/docs/reference/` lists them) |
 | All pages | `/pages.html`, generated |

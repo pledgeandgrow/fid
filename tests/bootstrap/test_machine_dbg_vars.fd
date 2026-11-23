@@ -21,12 +21,26 @@ struct Rect {
     h: i64,
 }
 
+// panic keeps the mid-end's inline2 off add_into (ime_panic_frame), so dst
+// stays a real pointer and the caller's slots it writes are never promoted
+// into plain SSA values: acc and step keep the frame slots the debug info
+// names a location for (register-resident variables have none yet, DB4).
+fn add_into(dst: &mut i64, add: i64) {
+    if add < 0 {
+        panic("negative add");
+    }
+    *dst = *dst + add;
+}
+
 fn scale(base: i64, factor: i64) -> i64 {
     var acc: i64 = 0;
     var step: i64 = 0;
+    if factor < 0 {
+        panic("negative factor");
+    }
     while step < factor {
-        acc = acc + base;
-        step = step + 1;
+        add_into(&mut acc, base);
+        add_into(&mut step, 1);
     }
     return acc;
 }
@@ -47,6 +61,11 @@ fn mix(x: i64, flag: bool) -> i64 {
 fn count_bytes(s: str) -> i64 {
     var n: i64 = 0;
     var i: i64 = 0;
+    // panic keeps the mid-end's inline2 off (ime_panic_frame): the Mach-O
+    // check wants count_bytes' own subprogram in __debug_info
+    if str_len(s) == 0 {
+        panic("empty");
+    }
     while i < str_len(s) {
         if str_byte_at(s, i) != 32 {
             n = n + 1;

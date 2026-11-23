@@ -526,6 +526,19 @@ fn lim_parse_ms(s: str) -> i64 {
     return whole * 1000 + frac_ms;
 }
 
+// --- Helper: write a build's output ----------------------------------------
+/// BG52: write the bytes of a build's output to `path`; false, after an
+/// error naming the file, when it cannot be written (a missing directory, a
+/// file in use, a read-only place), so the command fails instead of
+/// printing that it built the file.
+fn write_output_vec(path: str, bytes: Vec) -> bool {
+    if p_file_write_vec(path, bytes) != 0 {
+        print("Error: could not write the output file: " + path + "\n");
+        return false;
+    }
+    return true;
+}
+
 // --- Helper: find -o flag value ------------------------------------------
 fn find_output_arg(n: i64, start: i64, default: str) -> str {
     var i: i64 = start + 2;
@@ -724,6 +737,85 @@ fn zig_unwind(cc: str) -> str {
         return " -lunwind";
     }
     return "";
+}
+
+// --- Helper: paths in command lines (BG54) --------------------------------
+// shell_word (beside self_command, below) quotes a path for a command line.
+
+/// A command line whose first word is quoted (`"<fid>" ccompile ...`), run
+/// so that cmd.exe keeps its quotes: `cmd /C` drops the first and the last
+/// quote of a command that starts with one (AGENTS.md known bug 3), so on
+/// Windows it gets one more pair (project_run does the same).
+fn run_quoted_cmd(cmd: str) -> i64 {
+    return project_run(cmd);
+}
+
+// --- Helper: `ccompile --inc` for --target (BG71) -------------------------
+/// The C flags of one unit of an `--inc` build for target OS `tgt_os`, as
+/// the one-unit build's (cmd_ccompile): WebAssembly takes no stack
+/// protector or PIE, but WASI's emulation defines. (The flags are part of
+/// each object's cache key; for the other targets they are as before.)
+fn inc_unit_cflags(is_tcc: bool, tgt_os: str) -> str {
+    var flags: str = " -Wno-int-conversion";
+    if !is_tcc {
+        var hardening: str = " -fstack-protector-strong -fPIE";
+        if tgt_os == "wasi" {
+            hardening = " -D_WASI_EMULATED_MMAN -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_PROCESS_CLOCKS -D_WASI_EMULATED_GETPID";
+        }
+        flags = flags + " -Wno-incompatible-pointer-types" + hardening + " -fno-strict-overflow -fno-strict-aliasing";
+    }
+    return flags;
+}
+
+/// The link mode of an `--inc` build for target OS `tgt_os` (the one-unit
+/// build's): -static for a zig cross build to Linux, nothing for
+/// WebAssembly, the ELF-only -z options for Linux and FreeBSD only. Before,
+/// the host decided (a Windows host never gave the -z options, a macOS one
+/// did).
+fn inc_link_mode(is_tcc: bool, tgt_os: str, zig_cross: bool) -> str {
+    if is_tcc {
+        return "";
+    }
+    var mode: str = " -pie";
+    if zig_cross && tgt_os == "linux" {
+        mode = " -static";
+    }
+    if tgt_os == "wasi" {
+        mode = "";
+    }
+    if tgt_os == "linux" || tgt_os == "freebsd" {
+        mode = mode + " -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack";
+    }
+    return mode;
+}
+
+/// The system libraries of an `--inc` build for target OS `tgt_os` (the
+/// one-unit build's), not the host's: a Linux target from a Windows host
+/// got -lws2_32, and no target but the host's got -lunwind.
+fn inc_system_libs(cc: str, tgt_os: str, zig_cross: bool) -> str {
+    if tgt_os == "windows" {
+        return " -lm -lws2_32" + repro_win_flags(cc, false);
+    }
+    if tgt_os == "linux" {
+        var unwind: str = zig_unwind(cc);
+        if zig_cross {
+            unwind = " -lunwind";
+        }
+        return " -lm -lpthread" + unwind;
+    }
+    if tgt_os == "freebsd" {
+        if str_contains(cc, "zig") {
+            return " -lm -lpthread -lunwind";
+        }
+        return " -lm -lpthread";
+    }
+    if tgt_os == "macos" {
+        return " -lm -lpthread";
+    }
+    if tgt_os == "wasi" {
+        return " -lm -lwasi-emulated-mman -lwasi-emulated-signal -lwasi-emulated-process-clocks -lwasi-emulated-getpid";
+    }
+    return " -lm" + zig_unwind(cc);
 }
 
 // --- Helper: read source file or error -----------------------------------
@@ -1159,7 +1251,7 @@ fn cmd_run(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
             mexe = "_fides_memcheck_tmp";
             mrun = "./_fides_memcheck_tmp";
         }
-        if p_system("\"" + p_argv(0) + "\" ccompile " + input + " -o " + mexe + " --debug" + mem_flags + lim_args) != 0 {
+        if run_quoted_cmd("\"" + p_argv(0) + "\" ccompile " + shell_word(input) + " -o " + mexe + " --debug" + mem_flags + lim_args) != 0 {
             p_eprint_str("run: the build failed\n");
             return 1;
         }
@@ -2384,7 +2476,7 @@ fn cmd_test_file(n: i64, start: i64, fuzz_only: bool) -> i64 {
             cov_flags = " --fuzz-cov-std";
         }
     }
-    if p_system("\"" + p_argv(0) + "\" ccompile " + main_fd + " -o " + exe + " --dev-deps" + cov_flags) != 0 {
+    if run_quoted_cmd("\"" + p_argv(0) + "\" ccompile " + shell_word(main_fd) + " -o " + exe + " --dev-deps" + cov_flags) != 0 {
         p_file_delete(main_fd);
         p_eprint_str("fid test: the build failed\n");
         return 1;
@@ -2509,7 +2601,7 @@ fn cmd_test_file(n: i64, start: i64, fuzz_only: bool) -> i64 {
     // the report is printed whole after the child ends.
     if coverage {
         var cov_out: str = "_fides_cov_out.txt";
-        var cov_rc: i64 = p_system("\"" + p_argv(0) + "\" veil " + main_fd + " --output coverage > " + cov_out + " 2>&1");
+        var cov_rc: i64 = run_quoted_cmd("\"" + p_argv(0) + "\" veil " + shell_word(main_fd) + " --output coverage > " + cov_out + " 2>&1");
         match read_file(cov_out) {
             Option::Some(cov_text) => {
                 print(cov_text);
@@ -4355,7 +4447,9 @@ fn cmd_wasm(n: i64, start: i64, g_borrowck: str) -> i64 {
     }
     match result {
         ResultBytes::Ok(bytes) => {
-            p_file_write_vec(output, bytes);
+            if !write_output_vec(output, bytes) {
+                return 1;
+            }
             if wat_mode {
                 print("Emitted WAT text: ");
                 print(output);
@@ -4391,17 +4485,15 @@ fn cmd_wasm(n: i64, start: i64, g_borrowck: str) -> i64 {
 // object but main's in <dir>, under its names in the store: the seeded
 // store an installed toolchain reads (inc.fd inc_seed_get).
 var g_seed_store_out: str = "";
-fn build_c_units_ir(cc: str, gcc_opt: str, is_tcc: bool, output: str, libs: str, no_cache: bool) -> i64 {
+fn build_c_units_ir(cc: str, gcc_opt: str, is_tcc: bool, output: str, libs: str, no_cache: bool, tgt_os: str, zig_cross: bool) -> i64 {
     var stem: str = output;
     if str_ends_with(output, ".exe") {
         stem = str_slice(output, 0, str_len(output) - 4);
     }
     var tu_dir: str = stem + ".fides-tu";
     p_mkdir(tu_dir);
-    var flags: str = " -Wno-int-conversion";
-    if !is_tcc {
-        flags = flags + " -Wno-incompatible-pointer-types -fstack-protector-strong -fPIE -fno-strict-overflow -fno-strict-aliasing";
-    }
+    // BG71: the target's flags, not the host's
+    var flags: str = inc_unit_cflags(is_tcc, tgt_os);
     var objs: Vec<str> = Vec::new();
     var stale: Vec<str> = Vec::new();
     var generated: Vec<str> = Vec::new();
@@ -4441,7 +4533,7 @@ fn build_c_units_ir(cc: str, gcc_opt: str, is_tcc: bool, output: str, libs: str,
             }
             if !have_c {
                 stale.push(name);
-                if p_system(cc + " " + gcc_opt + flags + " -c -o " + o_path + " " + c_path) != 0 {
+                if p_system(cc + " " + gcc_opt + flags + " -c -o " + shell_word(o_path) + " " + shell_word(c_path)) != 0 {
                     print("C compilation failed: " + c_path + "\n");
                     return 1;
                 }
@@ -4463,7 +4555,7 @@ fn build_c_units_ir(cc: str, gcc_opt: str, is_tcc: bool, output: str, libs: str,
             inc_seed_put(g_seed_store_out, seed_ir, o_path);
             seeded.push(name);
         }
-        objs.push(o_path);
+        objs.push(shell_word(o_path));
         i = i + 1;
     }
     if str_len(g_seed_store_out) > 0 {
@@ -4483,18 +4575,10 @@ fn build_c_units_ir(cc: str, gcc_opt: str, is_tcc: bool, output: str, libs: str,
     } else {
         print("Compiling " + int_to_str(stale.len()) + " of " + int_to_str(n_units) + " units: " + str_join(stale, ", ") + "\n");
     }
-    var link: str = cc + " " + gcc_opt + flags + " -o " + output;
-    if !is_tcc {
-        link = link + " -pie";
-        // The -z options are ELF-only
-        if p_getenv("OS") != "Windows_NT" {
-            link = link + " -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack";
-        }
-    }
-    var system_libs: str = " -lm" + zig_unwind(cc);
-    if !is_posix_host() {
-        system_libs = system_libs + " -lws2_32" + repro_win_flags(cc, false);
-    }
+    // BG71: the target's link mode and system libraries (the -z options
+    // are ELF-only); BG54: the paths quoted
+    var link: str = cc + " " + gcc_opt + flags + " -o " + shell_word(output) + inc_link_mode(is_tcc, tgt_os, zig_cross);
+    var system_libs: str = inc_system_libs(cc, tgt_os, zig_cross);
     if p_system(link + " " + str_join(objs, " ") + system_libs + libs) != 0 {
         print("link failed\n");
         return 1;
@@ -4505,10 +4589,10 @@ fn build_c_units_ir(cc: str, gcc_opt: str, is_tcc: bool, output: str, libs: str,
 // Each unit compiles to a content-keyed object, reused while its C (modulo
 // comments, whitespace and the names of its `static` helpers) does not
 // change; then all link.
-fn build_c_units(c_code: str, cc: str, gcc_opt: str, is_tcc: bool, output: str, libs: str, no_cache: bool) -> i64 {
+fn build_c_units(c_code: str, cc: str, gcc_opt: str, is_tcc: bool, output: str, libs: str, no_cache: bool, tgt_os: str, zig_cross: bool) -> i64 {
     // B1: the units ccompile_inc_prepare made (c_code is not the C then)
     if incu_ready() {
-        return build_c_units_ir(cc, gcc_opt, is_tcc, output, libs, no_cache);
+        return build_c_units_ir(cc, gcc_opt, is_tcc, output, libs, no_cache, tgt_os, zig_cross);
     }
     var units: Vec<CUnit> = split_c_units(c_code);
     var stem: str = output;
@@ -4517,10 +4601,8 @@ fn build_c_units(c_code: str, cc: str, gcc_opt: str, is_tcc: bool, output: str, 
     }
     var tu_dir: str = stem + ".fides-tu";
     p_mkdir(tu_dir);
-    var flags: str = " -Wno-int-conversion";
-    if !is_tcc {
-        flags = flags + " -Wno-incompatible-pointer-types -fstack-protector-strong -fPIE -fno-strict-overflow -fno-strict-aliasing";
-    }
+    // BG71: the target's flags, not the host's
+    var flags: str = inc_unit_cflags(is_tcc, tgt_os);
     var objs: Vec<str> = Vec::new();
     var stale: Vec<str> = Vec::new();
     var i: i64 = 0;
@@ -4544,7 +4626,7 @@ fn build_c_units(c_code: str, cc: str, gcc_opt: str, is_tcc: bool, output: str, 
         }
         if !have {
             stale.push(unit.name);
-            if p_system(cc + " " + gcc_opt + flags + " -c -o " + o_path + " " + c_path) != 0 {
+            if p_system(cc + " " + gcc_opt + flags + " -c -o " + shell_word(o_path) + " " + shell_word(c_path)) != 0 {
                 print("C compilation failed: " + c_path + "\n");
                 return 1;
             }
@@ -4552,7 +4634,7 @@ fn build_c_units(c_code: str, cc: str, gcc_opt: str, is_tcc: bool, output: str, 
                 inc_artifact_put(art, o_path);
             }
         }
-        objs.push(o_path);
+        objs.push(shell_word(o_path));
         i = i + 1;
     }
     if stale.len() == 0 {
@@ -4571,19 +4653,11 @@ fn build_c_units(c_code: str, cc: str, gcc_opt: str, is_tcc: bool, output: str, 
         }
         print("Compiling " + int_to_str(stale.len()) + " of " + int_to_str(units.len()) + " units: " + names + "\n");
     }
-    var link: str = cc + " " + gcc_opt + flags + " -o " + output;
-    if !is_tcc {
-        link = link + " -pie";
-        // The -z options are ELF-only
-        if p_getenv("OS") != "Windows_NT" {
-            link = link + " -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack";
-        }
-    }
-    var system_libs: str = " -lm" + zig_unwind(cc);
-    if !is_posix_host() {
-        // CB6: no time stamp or PDB in the PE of an --inc build either
-        system_libs = system_libs + " -lws2_32" + repro_win_flags(cc, false);
-    }
+    // BG71: the target's link mode and system libraries (the -z options
+    // are ELF-only; CB6: no time stamp or PDB in the PE of an --inc build
+    // either, inc_system_libs); BG54: the paths quoted
+    var link: str = cc + " " + gcc_opt + flags + " -o " + shell_word(output) + inc_link_mode(is_tcc, tgt_os, zig_cross);
+    var system_libs: str = inc_system_libs(cc, tgt_os, zig_cross);
     if p_system(link + " " + str_join(objs, " ") + system_libs + libs) != 0 {
         print("link failed\n");
         return 1;
@@ -4619,7 +4693,10 @@ fn patch_pe_stack(exe_path: str) {
     // 256MB reserve
     pe_put_u64(&mut bytes, stack_off + 8, 16777216);
     // 16MB commit
-    p_file_write_vec(exe_path, bytes);
+    if p_file_write_vec(exe_path, bytes) != 0 {
+        p_eprint_str("[main] WARNING: PE stack patching failed: cannot write " + exe_path + ".\n");
+        return;
+    }
     p_eprint_str("[main] PE stack patched to 256MB.\n");
 }
 
@@ -5334,11 +5411,13 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, _g_timeout: i64) -> i64 {
                     print("--inc is not supported with cl.exe yet; use gcc/clang/zig cc\n");
                     return 1;
                 }
-                var rc: i64 = build_c_units(c_code, cc, gcc_opt, is_tcc, output, extra_libs, no_cache);
+                // BG71: built and linked for --target (tgt_os), not the host
+                var rc: i64 = build_c_units(c_code, cc, gcc_opt, is_tcc, output, extra_libs, no_cache, tgt_os, zig_cross);
                 if rc != 0 {
                     return rc;
                 }
-                if !is_posix_host() {
+                // a PE only (an ELF's bytes at the PE header's place are code)
+                if tgt_os == "windows" && !is_posix_host() {
                     patch_pe_stack(output);
                 }
                 inc_stamp_commit(stamp_path, build_key, c_hash, input, output);
@@ -5358,6 +5437,13 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, _g_timeout: i64) -> i64 {
                 }
                 art_path = inc_artifact_path(output, inc_canon_hash(c_code), cc, cc_opt + " " + target + extra_libs + " " + env_or_empty("FIDES_CFLAGS") + art_cpu + lim_defs);
                 if inc_artifact_get(art_path, output) {
+                    // BG36: the copy is a new file without the execute bit
+                    // (inc_artifact_get writes bytes); the C compiler set it
+                    // on the original ("Permission denied" on the second
+                    // `fid run --leaks`)
+                    if is_posix_host() {
+                        p_system("chmod +x " + shell_word(output) + " 2>/dev/null");
+                    }
                     inc_stamp_commit(stamp_path, build_key, c_hash, input, output);
                     print("Reused cached artifact: " + output + "\n");
                     return 0;
@@ -5369,13 +5455,13 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, _g_timeout: i64) -> i64 {
                 // cl.exe: /O2 /Fe:output file.c
                 // TL5: with -g, /Zi for the compile and /DEBUG for the link
                 // (c_debug_clflags, as c_debug_cflags for gcc/clang)
-                cc_cmd = cc + " " + cl_opt + c_debug_clflags() + " /nologo /Fe:" + output + " " + c_file;
+                cc_cmd = cc + " " + cl_opt + c_debug_clflags() + " /nologo /Fe:" + shell_word(output) + " " + shell_word(c_file);
                 if str_len(c_debug_clflags()) > 0 {
                     cc_cmd = cc_cmd + " /link /DEBUG";
                 }
                 // VF12 (R1): no time stamps in the objects or the PE
                 if repro_on() {
-                    cc_cmd = cc + " " + cl_opt + c_debug_clflags() + " /nologo /Brepro /Fe:" + output + " " + c_file + " /link /Brepro";
+                    cc_cmd = cc + " " + cl_opt + c_debug_clflags() + " /nologo /Brepro /Fe:" + shell_word(output) + " " + shell_word(c_file) + " /link /Brepro";
                     if str_len(c_debug_clflags()) > 0 {
                         cc_cmd = cc_cmd + " /DEBUG";
                     }
@@ -5384,9 +5470,9 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, _g_timeout: i64) -> i64 {
                 if is_tcc {
                     // tcc: minimal flags
                     if tgt_os != "windows" {
-                        cc_cmd = cc + " " + gcc_opt + " -w -o " + output + " " + c_file + " -lm" + extra_libs;
+                        cc_cmd = cc + " " + gcc_opt + " -w -o " + shell_word(output) + " " + shell_word(c_file) + " -lm" + extra_libs;
                     } else {
-                        cc_cmd = cc + " " + gcc_opt + " -w -o " + output + " " + c_file + " -lws2_32" + extra_libs;
+                        cc_cmd = cc + " " + gcc_opt + " -w -o " + shell_word(output) + " " + shell_word(c_file) + " -lws2_32" + extra_libs;
                     }
                 } else {
                     // gcc/clang: -O2 + hardening flags (as src/main.rs).
@@ -5406,7 +5492,7 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, _g_timeout: i64) -> i64 {
                         link_mode = "";
                         hardening = " -D_WASI_EMULATED_MMAN -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_PROCESS_CLOCKS -D_WASI_EMULATED_GETPID";
                     }
-                    var cc_flags: str = " " + gcc_opt + " -w -Wno-int-conversion -Wno-incompatible-pointer-types" + hardening + " -fno-strict-overflow -fno-strict-aliasing -o " + output + " " + c_file + link_mode;
+                    var cc_flags: str = " " + gcc_opt + " -w -Wno-int-conversion -Wno-incompatible-pointer-types" + hardening + " -fno-strict-overflow -fno-strict-aliasing -o " + shell_word(output) + " " + shell_word(c_file) + link_mode;
                     // FIDES_CFLAGS: extra C compiler flags, e.g. the
                     // sanitizers of scripts/sanitize.sh (release M8)
                     var user_cflags: str = env_or_empty("FIDES_CFLAGS");
@@ -5458,7 +5544,7 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, _g_timeout: i64) -> i64 {
             // symbol no library provides is reported as a Fides error
             // with the line of its declaration (link_error_report)
             var cc_err: str = c_file + ".err";
-            var ret: i64 = p_system(cc_cmd + " 2> " + cc_err);
+            var ret: i64 = p_system(cc_cmd + " 2> " + shell_word(cc_err));
             time_mark("C compiler", t_cc);
             var cc_err_text: str = "";
             match read_file(cc_err) {
@@ -5541,7 +5627,9 @@ fn cmd_build_x86(n: i64, start: i64) -> i64 {
     var result: ResultBytes = build_x86_linux(source, input);
     match result {
         ResultBytes::Ok(exe_bytes) => {
-            p_file_write_vec(output, exe_bytes);
+            if !write_output_vec(output, exe_bytes) {
+                return 1;
+            }
             p_eprint_str("Built native executable: ");
             p_eprint_str(output);
             p_eprint_str(" (x86 backend)\n");
@@ -5679,7 +5767,9 @@ fn cmd_gpu(n: i64, start: i64) -> i64 {
                         wi = wi + 1;
                     }
                     if str_len(output) > 0 {
-                        p_file_write_vec(output, bytes);
+                        if !write_output_vec(output, bytes) {
+                            return 1;
+                        }
                         p_eprint_str("Generated SPIR-V bytecode: " + output + " (" + int_to_str(words.len()) + " words)\n");
                     } else {
                         p_eprint_str("Generated " + int_to_str(words.len()) + " SPIR-V words (use -o to write binary)\n");
@@ -7216,6 +7306,18 @@ fn serve_reset_backend_state() {
     g_pe_dbg_shown_pairs = Vec::new();
     g_pdb_out = "";
     ir_value_files_reset();
+    // BG50: the C generator's switches a ccompile request sets (--profile,
+    // --leaks, --mem, --checked-alloc, --inc, --lib); before, a later
+    // request without the flag still built with the debug allocator
+    set_c_profile(false);
+    set_c_leaks(false);
+    set_c_mem_profile(false);
+    set_c_checked_alloc(false);
+    set_c_mem_source("", "");
+    set_c_unit_marks(false);
+    CGen_lib_set(false);
+    clear_c_debug_info();
+    CGen_lib_reset_exports();
 }
 
 /// L2B: `--target universal` (also `universal-macos`, `universal-darwin`,
@@ -7311,7 +7413,9 @@ fn build_universal_macho(n: i64, start: i64) -> i64 {
         print("Error: --target universal: the two slices are not an x86-64 and an AArch64 Mach-O\n");
         return 1;
     }
-    p_file_write_vec(output, fat);
+    if !write_output_vec(output, fat) {
+        return 1;
+    }
     if is_posix_host() {
         p_system("chmod +x '" + output + "' 2>/dev/null");
     }
@@ -7754,7 +7858,9 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
                 var elf_ir: IrModule = lower(program);
                 match pe_ir_generate_elf(elf_ir) {
                     ResultBytes::Ok(eb) => {
-                        p_file_write_vec(elf_out, eb);
+                        if !write_output_vec(elf_out, eb) {
+                            return 1;
+                        }
                         print("Emitted Linux executable: " + elf_out + " (" + int_to_str(eb.len()) + " bytes, static, no stdlib)\n");
                         return 0;
                     }
@@ -7808,7 +7914,9 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
                 match pe_ir_generate_uefi(uir, uhandler) {
                     ResultBytes::Ok(img) => {
                         var uefi_out: str = find_output_arg(n, start, "a.efi");
-                        p_file_write_vec(uefi_out, img);
+                        if !write_output_vec(uefi_out, img) {
+                            return 1;
+                        }
                         print("Emitted UEFI application: " + uefi_out + " (" + int_to_str(img.len()) + " bytes)\n");
                         return 0;
                     }
@@ -7881,7 +7989,9 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
                 }
                 // A flat binary is not an .exe: the -o name as given
                 var bare_out: str = find_output_arg(n, start, "a.bin");
-                p_file_write_vec(bare_out, bin);
+                if !write_output_vec(bare_out, bin) {
+                    return 1;
+                }
                 print("Emitted bare-metal binary: ");
                 print(bare_out);
                 print(" (");
@@ -8276,7 +8386,9 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
                             print(dlist);
                             return 0;
                         }
-                        p_file_write_vec(nat_out, nat_bytes);
+                        if !write_output_vec(nat_out, nat_bytes) {
+                            return 1;
+                        }
                         if is_posix_host() {
                             p_system("chmod +x '" + nat_out + "' 2>/dev/null");
                         }
@@ -8445,7 +8557,10 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
                         return 1;
                     }
                     ResultBytes::Ok(pe_bytes) => {
-                        p_file_write_vec(output, pe_bytes);
+                        // BG52: no stamp for an output that was not written
+                        if !write_output_vec(output, pe_bytes) {
+                            return 1;
+                        }
                         inc_stamp_commit_hash(stamp_path, build_key, 0, input, inc_bytes_hash(pe_bytes));
                         t_run = time_mark("write+stamp", t_run);
                         time_mark("total", t_start);
@@ -8475,14 +8590,14 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
                 var c_file: str = output + ".c";
                 p_file_write(c_file, c_source);
                 // Try gcc first, then clang
-                var cc_cmd: str = "gcc -O2 -o " + output + " " + c_file + " -lm 2>/dev/null";
+                var cc_cmd: str = "gcc -O2 -o " + shell_word(output) + " " + shell_word(c_file) + " -lm 2>/dev/null";
                 var cc_ret: i64 = p_system(cc_cmd);
                 if cc_ret != 0 {
-                    cc_cmd = "clang -O2 -o " + output + " " + c_file + " -lm 2>/dev/null";
+                    cc_cmd = "clang -O2 -o " + shell_word(output) + " " + shell_word(c_file) + " -lm 2>/dev/null";
                     cc_ret = p_system(cc_cmd);
                 }
                 if cc_ret != 0 {
-                    cc_cmd = "cc -O2 -o " + output + " " + c_file + " -lm";
+                    cc_cmd = "cc -O2 -o " + shell_word(output) + " " + shell_word(c_file) + " -lm";
                     cc_ret = p_system(cc_cmd);
                 }
                 if cc_ret != 0 {
@@ -8580,9 +8695,12 @@ fn crash_stage(name: str) {
     }
 }
 
-/// `a` as one shell word: quoted when it holds a space or a quote.
+/// `a` as one shell word: quoted when it holds a space or a quote. BG54:
+/// also when it holds a character cmd.exe or sh splits on, for the paths in
+/// the C compiler's and child commands' lines (a word without them is left
+/// as it is, so the command lines of ordinary paths do not change).
 fn shell_word(a: str) -> str {
-    if str_contains(a, " ") || str_contains(a, "\"") || str_contains(a, "&") || str_len(a) == 0 {
+    if str_contains(a, " ") || str_contains(a, "\"") || str_contains(a, "&") || str_len(a) == 0 || str_contains(a, "\t") || str_contains(a, "|") || str_contains(a, "<") || str_contains(a, ">") || str_contains(a, "(") || str_contains(a, ")") || str_contains(a, ";") || str_contains(a, "^") || str_contains(a, "'") {
         return "\"" + str_replace(a, "\"", "\\\"") + "\"";
     }
     return a;
@@ -9386,7 +9504,9 @@ fn cmd_emit_ir(n: i64, start: i64) -> i64 {
             return 1;
         }
         ResultBytes::Ok(bytes) => {
-            p_file_write_vec(out, bytes);
+            if !write_output_vec(out, bytes) {
+                return 1;
+            }
             if is_posix_host() {
                 p_system("chmod +x '" + out + "' 2>/dev/null");
             }
@@ -9415,7 +9535,9 @@ fn nat_write_object(m: IrModule, arch: i64, win: bool, mac: bool, out: str) -> i
             return 1;
         }
         ResultBytes::Ok(obytes) => {
-            p_file_write_vec(out, obytes);
+            if !write_output_vec(out, obytes) {
+                return 1;
+            }
             print("Wrote object file: " + out + "\n");
             return 0;
         }
@@ -9548,10 +9670,10 @@ fn ccompile_lib(n: i64, start: i64, source: str, input: str, g_borrowck: str, _o
     if os == "macos" {
         libs = libs + " -Wl,-install_name,@rpath/" + str_slice(lib_file, lslash + 1, str_len(lib_file));
     }
-    var cmd: str = repro_env_prefix() + cc + flags + " -o " + lib_file + " " + c_file + libs;
+    var cmd: str = repro_env_prefix() + cc + flags + " -o " + shell_word(lib_file) + " " + shell_word(c_file) + libs;
     crash_stage("C compiler (a library)");
     var cc_err: str = c_file + ".err";
-    var rc: i64 = p_system(cmd + " 2> " + cc_err);
+    var rc: i64 = p_system(cmd + " 2> " + shell_word(cc_err));
     var err_text: str = reduce_read(cc_err);
     p_file_delete(cc_err);
     if rc != 0 {

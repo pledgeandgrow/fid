@@ -74,7 +74,12 @@ pub fn serialize_write_i32(w: &mut SerializeWriter, val: i64) -> void {
 
 pub fn serialize_write_f64(w: &mut SerializeWriter, val: f64) -> void {
     // Write as 8 bytes (big-endian) using bit representation
-    var bits = pledge_f64_to_bits(val);
+    var bits: i64 = 0;
+    // SAFETY: pledge_f64_to_bits takes the double val by value and returns
+    // its bit pattern as an integer; it touches no memory of ours.
+    unsafe {
+        bits = pledge_f64_to_bits(val);
+    }
     var i = 0;
     while i < 8 {
         w.data.push((bits >> ((7 - i) * 8)) & 0xFF);
@@ -111,7 +116,14 @@ pub fn serialize_write_bytes(w: &mut SerializeWriter, data: &mut Vec<i64>) -> vo
 
 /// Save the writer's data to a file.
 pub fn serialize_save(w: &SerializeWriter, path: str) -> bool {
-    var result = pledge_serialize_save(path, w.data.len(), 0);
+    var result: i64 = 0;
+    // SAFETY: NOT shown sound. The path is a NUL-terminated Fides string,
+    // but `data` is 0 while `len` is w.data.len(): a C side that reads len
+    // bytes at data would read address 0. No pledge_serialize.h is in the
+    // repository, so the call does not link today (release M10 report).
+    unsafe {
+        result = pledge_serialize_save(path, w.data.len(), 0);
+    }
     return result == 0;
 }
 
@@ -141,7 +153,13 @@ pub fn serialize_reader_create(data: Vec<i64>) -> SerializeReader {
 /// Load a file into a reader.
 pub fn serialize_load(path: str) -> SerializeReader {
     var data = Vec::new();
-    var size = pledge_serialize_load(path, 0, 0);
+    var size: i64 = 0;
+    // SAFETY: path is a NUL-terminated Fides string; data 0 with max_size 0
+    // asks only for the file's size, so a C side may write nothing (no
+    // pledge_serialize.h is in the repository: the call does not link).
+    unsafe {
+        size = pledge_serialize_load(path, 0, 0);
+    }
     if size <= 0 {
         return SerializeReader {
             data: data, pos: 0
@@ -152,7 +170,12 @@ pub fn serialize_load(path: str) -> SerializeReader {
         data.push(0);
         i = i + 1;
     }
-    pledge_serialize_load(path, 0, 0);
+    // SAFETY: as above: data 0 and max_size 0 give the C side no buffer to
+    // write, so this cannot fill `data` (the comment below is wishful; the
+    // reader keeps size zeroes). Reported under release M10.
+    unsafe {
+        pledge_serialize_load(path, 0, 0);
+    }
     // native fills data
     return SerializeReader {
         data: data, pos: 0
@@ -195,7 +218,11 @@ pub fn serialize_read_f64(r: &mut SerializeReader) -> f64 {
         bits = (bits << 8) | serialize_read_u8(r);
         i = i + 1;
     }
-    return pledge_bits_to_f64(bits);
+    // SAFETY: pledge_bits_to_f64 takes the integer bits by value and returns
+    // the double with that bit pattern; it touches no memory of ours.
+    unsafe {
+        return pledge_bits_to_f64(bits);
+    }
 }
 
 pub fn serialize_read_bool(r: &mut SerializeReader) -> bool {

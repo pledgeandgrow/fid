@@ -1,0 +1,31 @@
+// expect-error: 'Counter.bump' runs on another thread and writes the global 'total' with no lock
+// Bugs roadmap BG26: the race check followed the functions a thread calls
+// by name only, so a method call (`c.bump()`) led nowhere: a method
+// writing a global with no lock, called from two spawned workers, was
+// accepted.
+var total: i64 = 0;
+
+struct Counter {
+    step: i64,
+}
+
+impl Counter {
+    fn bump(self: Counter) -> i64 {
+        total = total + self.step;
+        return total;
+    }
+}
+
+fn worker(step: i64) -> i64 {
+    val c: Counter = Counter { step: step };
+    return c.bump();
+}
+
+fn main() -> i64 {
+    val a = spawn worker(1);
+    val b = spawn worker(2);
+    await a;
+    await b;
+    println(int_to_str(total));
+    return 0;
+}

@@ -2236,6 +2236,20 @@ fn pe_write_all(fd: i64, buf: i64, n: i64) {
     }
 }
 
+/// Bytes before the NUL of the plain buffer `s` (no string header is read):
+/// pe_runtime/base.fd's name for C's strlen, which pe_runtime/tensor.fd
+/// (merged into machine-layer builds too) uses on its text buffers.
+fn pe_c_strlen(s: i64) -> i64 {
+    if s == 0 {
+        return 0;
+    }
+    var n: i64 = 0;
+    while pe_ldb(s + n) != 0 {
+        n = n + 1;
+    }
+    return n;
+}
+
 /// The length of a string: its header's (core's length-headered strings),
 /// else up to its NUL.
 fn pe_len(s: i64) -> i64 {
@@ -4773,7 +4787,12 @@ pub fn pert_argv(i: i64) -> str {
     if i < 0 || i >= pe_ld(sp) {
         return pe_null_str();
     }
-    return pe_ld(sp + 8 + i * 8);
+    // A counted copy, as pert_getenv's and the Windows runtime's: argv's
+    // strings are the kernel's bytes on the process stack, with no string
+    // header, and every str must carry one (string header by construction,
+    // core p_str_no_header). Returning the pointer itself made a str that
+    // core's Str_drop/Str_dup could only guess about.
+    return p_str_from_ptr(pe_ld(sp + 8 + i * 8));
 }
 
 pub fn pert_getenv(name: i64) -> str {

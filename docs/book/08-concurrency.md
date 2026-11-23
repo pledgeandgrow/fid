@@ -68,7 +68,7 @@ worker per CPU, and they also switch at blocking calls the runtime can
 poll and at loop safepoints the compiler inserts, so one busy loop does
 not starve the rest. **Under `fid run` tasks interleave too, but only at
 the waits** (`task_yield`, `task_sleep`, `await`, a channel receive;
-docs/interp-tasks.md, LG11): one thread, no safepoints in loops. Output
+docs/reference/interp-tasks.md, LG11): one thread, no safepoints in loops. Output
 order that depends on interleaving can differ between `fid run` and a
 build.
 

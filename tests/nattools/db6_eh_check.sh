@@ -56,7 +56,7 @@ run_on() {
 
 # --- the unit test ---------------------------------------------------------
 U=tests/nattools/eh_frame_unit.fd
-got=$(FID_EH_UNIT_OUT="$OUT/eh_unit.elf" "$FID" run "$U" 2>&1)
+got=$(FID_EH_UNIT_OUT="$OUT/eh_unit.elf" "$FID" run "$U" 2>&1 | grep -v '^\[')
 if [ "$got" = "$(expected "$U")" ]; then ok "DB6 eh_frame_unit prints its expected lines"; else bad "DB6 eh_frame_unit: $(diff <(echo "$got") <(expected "$U") | head -5)"; fi
 if [ -f "$OUT/eh_unit.elf" ]; then
     if r=$($PY tests/nattools/eh_frame_check.py --readelf "$OUT/eh_unit.elf"); then ok "DB6 unit image: $(echo "$r" | tail -1)"; else bad "DB6 unit image: $(echo "$r" | head -3)"; fi

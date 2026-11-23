@@ -661,7 +661,7 @@ The ten that matter most, in order:
       ark.toml's `[capabilities]` from the capabilities the compiler infers
       each imported pact to use (compiler.fd `cd1_check`, on every build
       through `build_program_with_path_borrowck`), with the call path that
-      needs each one (docs/pact-capabilities.md); `ark install`/`build`/
+      needs each one (docs/reference/pact-capabilities.md); `ark install`/`build`/
       `test`/`audit`/`update` check them by a scan of each pact's text
       (ark.fd `ark_cap_check`; `ark update` prints the diff). Left: a run
       of its checks, then [x]. Nov 22: cd1-direct-caps-check PASS.

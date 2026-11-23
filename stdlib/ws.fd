@@ -240,7 +240,12 @@ fn ws_io_write_str(fd: i64, tls: i64, text: str) -> i64 {
 // a time: what follows them is the first frames, which ws_recv reads.
 fn ws_read_headers(fd: i64, tls: i64) -> str {
     var bytes: Vec = Vec::new();
-    var buf: i64 = p_malloc(8);
+    var buf: i64 = 0;
+    // SAFETY: a fresh 8-byte block; each ws_io_read below writes 1 byte
+    // into it.
+    unsafe {
+        buf = p_malloc(8);
+    }
     var n: i64 = 0;
     while n < 65536 {
         if ws_io_read(fd, tls, buf, 1) <= 0 {
@@ -252,7 +257,10 @@ fn ws_read_headers(fd: i64, tls: i64) -> str {
             break;
         }
     }
-    p_free(buf);
+    // SAFETY: the block above; each byte read was copied into bytes.
+    unsafe {
+        p_free(buf);
+    }
     return str_from_bytes(bytes);
 }
 
@@ -393,14 +401,23 @@ pub fn ws_frame_encode(opcode: i64, payload: Vec, mask: bool) -> Vec {
 }
 
 fn ws_write_bytes(fd: i64, tls: i64, data: Vec) -> i64 {
-    var buf: i64 = p_malloc(data.len() + 4);
+    var buf: i64 = 0;
+    // SAFETY: a fresh block of data.len() + 4 bytes: the loop below writes
+    // data.len() bytes into it.
+    unsafe {
+        buf = p_malloc(data.len() + 4);
+    }
     var i: i64 = 0;
     while i < data.len() {
         p_volatile_store8(buf + i, data.get(i));
         i = i + 1;
     }
     var n: i64 = ws_io_write(fd, tls, buf, data.len());
-    p_free(buf);
+    // SAFETY: the block above; the write has returned and keeps no pointer
+    // to it.
+    unsafe {
+        p_free(buf);
+    }
     return n;
 }
 
@@ -416,7 +433,12 @@ fn ws_read_n(fd: i64, tls: i64, n: i64) -> Vec {
     if n < 0 || n > WS_MAX_PAYLOAD() {
         return out;
     }
-    var buf: i64 = p_malloc(n + 4);
+    var buf: i64 = 0;
+    // SAFETY: n is 0..WS_MAX_PAYLOAD (checked above): a fresh block of
+    // n + 4 bytes; the reads below write at most n - got bytes at buf + got.
+    unsafe {
+        buf = p_malloc(n + 4);
+    }
     var got: i64 = 0;
     var grd: i64 = 0;
     while got < n && grd < 1000 {
@@ -432,7 +454,10 @@ fn ws_read_n(fd: i64, tls: i64, n: i64) -> Vec {
         out.push(p_volatile_load8(buf + i));
         i = i + 1;
     }
-    p_free(buf);
+    // SAFETY: the block above; its got bytes were copied into out.
+    unsafe {
+        p_free(buf);
+    }
     return out;
 }
 

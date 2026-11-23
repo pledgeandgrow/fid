@@ -853,3 +853,232 @@ Not covered: vector operations (TG11 checks their rows byte for byte,
 `nat_vsel_check`), the memory-operand ALU (`MO_ALUM`, `MO_BRCCM`,
 `MO_SETCCM`, `MO_ALUMST`; `nat_memop_unit_check` checks their formation),
 jump tables, the prologue and epilogue, calls with float arguments.
+
+---
+
+## SP8: a one-line edit rebuilt by a warm `fid serve`
+
+Goal (docs/roadmap/llvm-roadmap.md, Track SP): a one-line edit rebuilds in
+under 100 ms, with the stdlib, the lowered functions and the machine code
+kept in a warm `fid serve`, and only the changed module or function checked
+and lowered again. On Nov 13, hello took about 0.5 s with every cache warm
+(CS6).
+
+### What a build request of `fid serve` reuses
+
+A build request is `emit <file> [flags]`, `build <file> [flags]` or
+`ccompile <file> [flags]` (compiler/main.fd `serve_build`). Between
+requests the server keeps:
+
+| What | Where | Since |
+|------|-------|-------|
+| core and the runtime, parsed and merged | compiler.fd `astcache_load`, `astcache_memo_merged` | SP4, SP18 |
+| core's checked bodies are skipped | inc.fd `inc_core_checked` (D9) | D9 |
+| imported modules' parses | compiler.fd `modcache_get` | CB2 |
+| **the program's checked bodies** | compiler.fd `cb2_request_build` (this goal) | SP8 |
+| machine code of each unchanged function | nat_ir.fd `g_nat_fncache_mem` | SP7, SP18 |
+
+The new part: a build request runs CB2's incremental body check
+(docs/reference/incremental.md). The server compares the program's modules with
+the last build whose checks passed. It checks again only the function
+bodies that an edit since then can reach: the edited items, and items that
+mention a name they define, followed to a fixpoint. Unlike a check request,
+the build goes on past the borrow check: comptime substitution,
+monomorphization, lowering and code generation.
+
+Skipping a body's checks does not change what gets lowered. The checkers
+read the Program and do not change it. Core's bodies are skipped the same
+way on every build (D9).
+
+A check request and a build request differ in their CB2 settings (the
+runtime merged, the @cfg target, `--debug`; compiler.fd `cb2_config`). So
+the first build after a check, or after a change of target, checks every
+body.
+
+Each build request writes one line on the server's stderr:
+
+    fid serve: emit prog.fd: 84 ms, 2 of 5 bodies checked
+
+This is the time from the request to the written output, followed by CB2's
+note. Over the socket (`fid serve --port`) the request's note also carries
+the time and CB2's note. Set `FID_CB2=off` to check every body on every
+request.
+
+Lints are not run in an incremental build request (as in a check request).
+Warnings that come from the checks themselves, such as a call to a
+`@deprecated` function, appear only when the body holding the call is
+checked again.
+
+### Measuring
+
+    FID=release/fid.exe bash tests/tooling/sp8-edit-rebuild-check.sh
+    T=nat ...            # Windows x64 through the machine layer (--nat)
+    MODE=debug ...       # only the debug mode (no mid-end, fast allocator)
+    STRICT_TIME=1 ...    # a rebuild of 100 ms or more fails the script
+
+The script edits one line of one function, then one line of another, and
+rebuilds after each edit through one server, in release mode and in debug
+mode. It checks that:
+
+- each rebuilt image is byte-identical to the one-shot `fid emit` of the
+  edited file;
+- CB2 checked fewer bodies than the program has;
+- a type error is reported, and the image is right again once the error is
+  taken out.
+
+It prints each request's time and whether the 100 ms target was met.
+
+Known bug (Nov 21, 2026, known-bugs 2g.82): the machine layer's function
+cache does not keep images byte-identical. A cache-hit image differs from a
+cache-off one, and `fid serve` rebuilds differ from a one-shot emit, so the
+first check above fails. Every image still runs the same.
+
+### What is left
+
+- **Lowering.** Every build lowers every reachable function again. The
+  lowered-IR cache (ir_ser.fd `irc_*`, FID_IRCACHE) is file-based, and its
+  records make files far too large for an edit loop. The in-memory mode it
+  needs (records kept between `lower()` calls of one process, the salt
+  compared in memory) is a change in compiler/ir_ser.fd. The server would
+  then turn it on, as it does `g_nat_fncache_mem`.
+- **The mid-end.** iropt, the rules and the e-graph run on the whole module
+  on every build. In release mode this is most of a warm rebuild. A cache
+  per function has to respect iropt's whole-module passes (inlining,
+  identical-code folding, facts about globals), so it belongs in iropt.fd.
+  In debug mode (`--debug`) there is no mid-end, so the edit loop's
+  target is measured there.
+- **Relinking.** The image is still laid out again in full. Only the
+  machine code of unchanged functions is replayed (SP7).
+
+---
+
+## pe_ir: the per-function cache and `--cpu`
+
+The default Windows backend (`compiler/pe_ir.fd`) has two switches added
+on Nov 16–17, 2026.
+
+### The per-function cache (inc-roadmap B5)
+
+`fid emit` (and `fid build`) for Windows saves each function's machine
+code before its labels and `.rdata` references are resolved. The
+references are stored by name: a function, an arithmetic panic stub, a
+string's text, a global, an import slot, or the allocator's state. A
+function's entry is keyed by its IR (`iw_irfunc`) and by a salt. The salt
+covers the compiler's own hash, the struct layouts, globals, externs,
+every labelled name, the C overrides, the named and cold functions,
+`FID_PE_OFF`, `FID_PE_CT_OFF`, `--cpu` and `--checked-alloc`.
+
+On the next build, a function whose key matches has its bytes copied to
+its new place, and its references are registered again. The image is
+laid out and linked from scratch on every build, so it comes out
+byte-identical to a build without the cache.
+
+These are never cached: `@interrupt` and `@constant_time` functions,
+`asm!`, dyn values, functions that call something nobody defines, and
+debug builds (`-g`, `FID_PE_DEBUG`).
+
+| Setting | Effect |
+|---|---|
+| (nothing) | on: the file `<output>.fides-fncache.pe` sits beside the output, like the build stamp `<output>.fides-stamp` |
+| `FID_FNCACHE=<path>` | the file `<path>.pe` |
+| `FID_FNCACHE=0` (or `off`, `no`, `none`, `false`), `--no-fncache` | off |
+| `FIDES_NO_CACHE=1`, `--no-cache` | off, unless `FID_FNCACHE` names a path |
+| `FID_PE_FNCACHE_STATS=1` | prints `[pe] fncache: N hits, M misses` |
+
+Code: `pe_fc_base_path`, `pe_fc_output`, `PeirGen_fc_start`,
+`PeirGen_fc_capture`, `PeirGen_fc_replay`, `PeirGen_fc_load`,
+`PeirGen_fc_finish` and `PeirGen_gen_cached`. The driver records the
+output with `pe_set_output_path`. Without that call, the `-o` of an
+`emit`/`build` command line is used.
+
+Checks:
+- `tests/nattools/pe_fncache_check.sh`: for every suite program it builds
+  without the cache, cold, warm and with the default cache, and every
+  image must be the same; it also checks an edit pair and the off
+  switches.
+- `scripts/pe-win-check.sh` (B5).
+
+### `--cpu` (competitive OP20)
+
+`fid emit --cpu <name>` takes the names that `nat_cpu_check` accepts for
+x86-64. An unknown name is an error. With `x86-64-v3` or `x86-64-v4`
+(`peir_bmi`), the backend uses these instructions:
+
+- `SHLX`/`SARX`/`SHRX` for a 64-bit shift by a variable count
+  (`PeirGen_shift_bmi`). The operands come straight from their registers
+  and `CL` is not needed.
+- `BLSR` for a 64-bit `x & (x - 1)` (`peir_blsr_src`, `PeirGen_gen_blsr`).
+  The `x - 1` is still generated, along with its overflow check.
+
+Without `--cpu`, and with `baseline` or `native`, the image is the same
+as before. The encoders `PeirEnc_shiftx`, `PeirEnc_blsr` and
+`PeirEnc_andn` (`compiler/pe_ir_enc.fd`) use the same encodings as the
+machine layer's `x64_shiftx`, `x64_blsr` and `x64_andn`.
+
+ANDN is not selected on pe_ir yet. pe_ir frees a value's register after
+its last use, so at the And, the operand of `!b` may already be gone. The
+fusion needs the Not to be skipped and `b` kept live.
+
+Check: `tests/nattools/pe_cpu_check.sh` runs
+`tests/bootstrap/test_pe_cpu_bits.fd`.
+
+---
+
+## One interface for the runtime's machine-code primitives (MI20)
+
+Every native backend defines the same set of `nat_*` primitives, the
+machine-code pieces a runtime cannot write in Fid: system calls and
+threads, the thread word, signals, atomics, the task context switch,
+calls by address, traces (frame records and the function tables), the
+start block, and a few target facts. The list is
+`prim_interface_names()` in `compiler/pe_ir_stubs.fd`.
+
+| Group | Names | Contract |
+|---|---|---|
+| system | `nat_syscall(n, a..f)` | a Linux system call by generic number; `-ENOSYS` on pe_ir |
+| threads | `nat_clone_thread(entry, arg, stack_top, ctid, tls)` | starts `entry(arg)` on a new thread whose thread word is `tls`; `*ctid` becomes 0 when it ends; the thread id, or `-EAGAIN` |
+| | `nat_tls_get()`, `nat_tls_set(v)` | the thread word |
+| signals | `nat_sig_handler()`, `nat_sig_restorer()` | the handler's address (Windows: the vectored exception handler) and the restorer's (0 on Windows) |
+| atomics | `nat_atomic_load/store/add/cas` | 8-byte, sequentially consistent; `add` returns the old value, `cas` 1 or 0 |
+| tasks | `nat_ctx_swap(save, sp)`, `nat_ctx_tramp()` | switch contexts; the trampoline a new context starts in (its saved layout belongs to the runtime of the target) |
+| calls | `nat_call_fn(addr, nargs, argv)` | `addr(env 0, argv[0..8])` |
+| traces | `nat_fn_table()` | `[name, address]` per function named by a string, then `[0, 0]` |
+| | `nat_fn_names()` | `[address, name]` per function in address order, then `[end of code, 0]` |
+| | `nat_frame_fp()`, `nat_frame_ret(fp)`, `nat_frame_next(fp)` | the caller's frame record, its return address, the next record |
+| start | `nat_start_sp()` | `[argc][argv...][0][envp...][0]` |
+| target | `nat_arch()`, `nat_os()`, `nat_fma(a, b, c)` | 1 AArch64, 2 RISC-V, 3 x86-64; 0 Linux, 1 Windows, 2 macOS; `a * b + c` rounded once on f64 bits |
+
+### Who defines them
+
+- The machine layer (`compiler/nat_ir.fd`): Linux x86-64, AArch64,
+  RISC-V, `emit --nat` Windows and macOS. `ng_prim_check` fails a build
+  under `FID_VERIFY=1` when one is missing.
+- pe_ir, the default Windows `fid emit` (`compiler/pe_ir_stubs.fd`,
+  `PeirGen_gen_nat_prims`; the tables in `compiler/pe_ir.fd`,
+  `PeirGen_gen_nat_tables`). Arguments come in the C convention (rcx,
+  rdx, r8, r9, then the stack). The atomics, `nat_call_fn`,
+  `nat_ctx_swap` and `nat_ctx_tramp` share the bytes of their `pe_*`
+  twins. A primitive is made only when a reached `extern "C"`
+  declaration names it, so images that use none are unchanged except for
+  a 2-byte trap per unused name. Under `FID_VERIFY=1` all of them are
+  made and `PeirGen_nat_check` fails the build ("the runtime primitives
+  of this target lack ...") if one is missing. The entry point allocates
+  the TLS index and builds the start block from the command line. The
+  tables hold absolute addresses, because the image loads at its preferred
+  base and has no relocations.
+
+### Checking
+
+`bash tests/nattools/mi20_prim_check.sh <fid>` builds
+`tests/nattools/mi20_prims.fd`, which calls every group of primitives by
+these names, with pe_ir and `--nat`, both with and without `FID_VERIFY=1`.
+With `LINUX=1` it also builds for the Linux targets. Each build must print
+the same lines.
+
+### Still to do
+
+`stdlib/pe_runtime` still calls the `pe_*` names (`pe_atomic_*`,
+`pe_call_fn`, `pe_ctx_swap`, `pe_ctx_tramp_addr`, `pe_fn_lookup`,
+`pe_thread_entry_addr`). The next steps are to move it to the `nat_*`
+names, and then to drop the `pe_*` twins from `pe_primitive_names` and
+`pe_stub_deps`.

@@ -367,7 +367,7 @@ DONE
 `len`, `pop`, `sort`, `contains` on a `Vec`; `insert`, `get`, `get_or`,
 `contains`, `remove`, `keys` on a map (`m.keys()` gives the keys sorted,
 not in insertion order).
-`docs/cookbook.md` has recipes; reference.md §13 lists everything.
+`docs/guides/cookbook.md` has recipes; reference.md §13 lists everything.
 
 ## Modules
 

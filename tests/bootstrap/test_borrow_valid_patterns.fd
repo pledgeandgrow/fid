@@ -1,0 +1,101 @@
+// BG12-BG16: patterns the borrow and escape checks keep accepting after
+// those fixes: a receiver read that ends before the change (`v.push(v.len())`,
+// two-phase), a shared borrow in a nested call next to a `&mut` (it ends
+// first), a borrow read under a cast that ends before a later push (NLL),
+// loops that borrow after their change in each iteration (in the body, or
+// into a variable declared outside that the iteration sets before reading),
+// `unwrap` on an Option of a non-reference and on one holding a reference
+// parameter, and changing methods / a `for` loop on a field with no live
+// borrow.
+// Expected output:
+// 3
+// 0
+// 3
+// 6
+// 9
+// 4
+// 0
+// 2
+// 9
+// 10
+struct Bag {
+    items: Vec<i64>,
+}
+
+fn get(p: &i64) -> i64 {
+    return *p;
+}
+
+fn add_into(a: &mut i64, n: i64) {
+    *a = *a + n;
+}
+
+fn pass(p: &i64) -> &i64 {
+    val o: Option<&i64> = Option::Some(p);
+    return o.unwrap();
+}
+
+fn main() -> i64 {
+    // BG13: the receiver's read ends before the push
+    var v: Vec<i64> = Vec::new();
+    v.push(v.len());
+    v.push(v.len());
+    v.push(v.len());
+    println(int_to_str(v.len()));
+
+    // BG12: read under a cast, then the borrow ends before the push
+    val r: &i64 = &v[0];
+    println(int_to_str((*r) as i64));
+    v.push(10);
+
+    // BG15: a borrow made after the change, in the body's own scope
+    var i: i64 = 0;
+    var total: i64 = 0;
+    while i < 3 {
+        v.push(i);
+        val e: &i64 = &v[1];
+        total = total + *e;
+        i = i + 1;
+    }
+    println(int_to_str(total));
+
+    // BG15: an outer borrower the iteration sets before it reads it
+    var w: Vec<i64> = Vec::new();
+    w.push(7);
+    var e2: &i64 = &w[0];
+    var j: i64 = 0;
+    var total2: i64 = 0;
+    while j < 3 {
+        v.push(j);
+        e2 = &v[2];
+        total2 = total2 + *e2;
+        j = j + 1;
+    }
+    println(int_to_str(total2));
+
+    // BG16: unwrap of an Option holding no reference, and of one holding
+    // a reference parameter
+    val o: Option<i64> = Option::Some(9);
+    println(int_to_str(o.unwrap()));
+    val y: i64 = 4;
+    println(int_to_str(*pass(&y)));
+
+    // BG14: a changing method on a field once its borrow has ended
+    var s: Bag = Bag { items: Vec::new() };
+    val ri: &Vec<i64> = &s.items;
+    println(int_to_str(ri.len()));
+    s.items.push(4);
+    s.items.push(5);
+    println(int_to_str(s.items.len()));
+    var sum: i64 = 0;
+    for x in s.items {
+        sum = sum + x;
+    }
+    println(int_to_str(sum));
+
+    // BG13: a shared borrow in a nested call ends before the `&mut`
+    var n2: i64 = 5;
+    add_into(&mut n2, get(&n2));
+    println(int_to_str(n2));
+    return 0;
+}

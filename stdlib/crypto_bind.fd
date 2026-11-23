@@ -58,7 +58,7 @@ fn cb_set(p: i64, v: i64) {
     // CB_AUTH_MODE_SIZE-byte cipher-mode struct at the field offsets of
     // BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO).
     unsafe {
-        var q: *mut i64 = p;
+        var q: *mut i64 = p as *mut i64;
         *q = v;
     }
 }
@@ -67,7 +67,7 @@ fn cb_set32(p: i64, v: i64) {
     // SAFETY: private helper; as cb_set, a 4-byte field inside a block the
     // caller allocated.
     unsafe {
-        var q: *mut i32 = p;
+        var q: *mut i32 = p as *mut i32;
         *q = v as i32;
     }
 }
@@ -77,7 +77,7 @@ fn cb_get(p: i64) -> i64 {
     // SAFETY: private helper; every caller reads an 8-byte handle slot it
     // allocated with cb_zeroed(8).
     unsafe {
-        var q: *mut i64 = p;
+        var q: *mut i64 = p as *mut i64;
         v = *q;
     }
     return v;
@@ -88,19 +88,26 @@ fn cb_get32(p: i64) -> i64 {
     // SAFETY: private helper; every caller reads a 4-byte length slot it
     // allocated with cb_zeroed(8).
     unsafe {
-        var q: *mut i32 = p;
+        var q: *mut i32 = p as *mut i32;
         v = (*q) as i64;
     }
     return v;
 }
 
 fn cb_zeroed(n: i64) -> i64 {
-    var p: i64 = p_malloc(n);
+    var p: i64 = 0;
+    // SAFETY: only allocates: p_malloc returns a fresh block of n bytes (it
+    // aborts on a negative size and panics when out of memory, so the block
+    // is never short), and the loop below zeroes all n bytes before any
+    // caller reads one.
+    unsafe {
+        p = p_malloc(n);
+    }
     var z: i64 = 0;
     while z < n {
         // SAFETY: z < n: inside the n-byte block p_malloc just returned.
         unsafe {
-            var b: *mut u8 = p + z;
+            var b: *mut u8 = (p + z) as *mut u8;
             *b = 0;
         }
         z = z + 1;
@@ -118,7 +125,7 @@ fn cb_wide(s: str) -> i64 {
         // SAFETY: i < n and w holds n * 2 + 2 bytes: the u16 at byte i * 2 is
         // inside.
         unsafe {
-            var p: *mut u16 = w + i * 2;
+            var p: *mut u16 = (w + i * 2) as *mut u16;
             *p = str_byte_at(s, i) as u16;
         }
         i = i + 1;
@@ -131,16 +138,22 @@ fn cb_wide(s: str) -> i64 {
 // reads it back.
 fn cb_buf(v: &Vec) -> i64 {
     val n: i64 = v.len();
-    var p: i64 = p_malloc(if n == 0 {
-        1
-    } else {
-        n
-    });
+    var p: i64 = 0;
+    // SAFETY: only allocates max(n, 1) bytes (one byte for an empty Vec, so
+    // the block still has an address); p_malloc panics rather than return a
+    // short block, and the loop below writes bytes 0 .. n - 1 of it.
+    unsafe {
+        p = p_malloc(if n == 0 {
+            1
+        } else {
+            n
+        });
+    }
     var i: i64 = 0;
     while i < n {
         // SAFETY: i < n and p holds max(n, 1) bytes.
         unsafe {
-            var b: *mut u8 = p + i;
+            var b: *mut u8 = (p + i) as *mut u8;
             *b = (v.get(i) & 255) as u8;
         }
         i = i + 1;
@@ -157,7 +170,7 @@ fn cb_unbuf(p: i64, n: i64) -> Vec<i64> {
         // cb_zeroed(n) buffers, the 16-byte tag, and BCrypt's reported
         // length, which is at most the buffer length passed to it.
         unsafe {
-            var q: *mut u8 = p + i;
+            var q: *mut u8 = (p + i) as *mut u8;
             b = (*q) as i64;
         }
         out.push(b & 255);
@@ -173,24 +186,55 @@ fn cb_unbuf(p: i64, n: i64) -> Vec<i64> {
 fn cb_aes_alg() -> i64 {
     var h: i64 = cb_zeroed(8);
     var w: i64 = cb_wide("AES");
-    if cb_open_alg(h as * mut u8, w as * mut u8, 0 as * mut u8, 0) != 0 {
-        p_free(w);
-        p_free(h);
-        return 0;
+    // SAFETY: BCryptOpenAlgorithmProvider reads the NUL-terminated UTF-16
+    // name w (cb_wide("AES")) and writes one handle into h, an 8-byte
+    // cb_zeroed slot; no implementation name (0). On failure no handle was
+    // made, and w and h, both allocated just above, are freed once before
+    // the return.
+    unsafe {
+        if cb_open_alg(h as * mut u8, w as * mut u8, 0 as * mut u8, 0) != 0 {
+            p_free(w);
+            p_free(h);
+            return 0;
+        }
     }
-    p_free(w);
+    // SAFETY: w (cb_wide above) was only read by the open call, which has
+    // returned; nothing reads it again.
+    unsafe {
+        p_free(w);
+    }
     var cm: i64 = cb_wide("ChainingMode");
     var gcm: i64 = cb_wide("ChainingModeGCM");
-    var r: i64 = cb_set_prop(cb_get(h) as * mut u8, cm as * mut u8, gcm as * mut u8, 32, 0);
-    p_free(cm);
-    p_free(gcm);
+    var r: i64 = 0;
+    // SAFETY: BCryptSetProperty reads the UTF-16 property name cm and 32
+    // bytes of gcm: "ChainingModeGCM" has 15 characters, so cb_wide made
+    // 15 * 2 + 2 = 32 bytes, the string with its NUL. cb_get(h) is the
+    // provider handle the successful open stored in h.
+    unsafe {
+        r = cb_set_prop(cb_get(h) as * mut u8, cm as * mut u8, gcm as * mut u8, 32, 0);
+    }
+    // SAFETY: cm and gcm (cb_wide above) were only read by BCryptSetProperty,
+    // which has returned; neither is read again.
+    unsafe {
+        p_free(cm);
+        p_free(gcm);
+    }
     if r != 0 {
-        cb_close_alg(cb_get(h) as * mut u8, 0);
-        p_free(h);
+        // SAFETY: closes, once, the provider handle the open stored in h;
+        // then frees h, the 8-byte cb_zeroed slot, after that last read. The
+        // function returns 0 right after, so neither is used again.
+        unsafe {
+            cb_close_alg(cb_get(h) as * mut u8, 0);
+            p_free(h);
+        }
         return 0;
     }
     var alg: i64 = cb_get(h);
-    p_free(h);
+    // SAFETY: h is the 8-byte cb_zeroed slot; its handle was copied to alg
+    // just above and h is not read again.
+    unsafe {
+        p_free(h);
+    }
     return alg;
 }
 
@@ -198,18 +242,40 @@ fn cb_key_obj_len(alg: i64) -> i64 {
     var w: i64 = cb_wide("ObjectLength");
     var out: i64 = cb_zeroed(8);
     var res: i64 = cb_zeroed(8);
-    var r: i64 = cb_get_prop(alg as * mut u8, w as * mut u8, out as * mut u8, 4, res as * mut u8, 0);
-    p_free(w);
+    var r: i64 = 0;
+    // SAFETY: BCryptGetProperty reads the UTF-16 name w (cb_wide), writes at
+    // most 4 bytes (the length passed) into out and a ULONG count into res,
+    // both 8-byte cb_zeroed blocks; alg is a provider handle from the caller
+    // (cb_aes_alg).
+    unsafe {
+        r = cb_get_prop(alg as * mut u8, w as * mut u8, out as * mut u8, 4, res as * mut u8, 0);
+    }
+    // SAFETY: w (cb_wide above) was only read by the call, which has
+    // returned; nothing reads it again.
+    unsafe {
+        p_free(w);
+    }
     var n: i64 = cb_get32(out);
-    p_free(out);
-    p_free(res);
+    // SAFETY: out and res are this function's cb_zeroed(8) blocks; out was
+    // read into n just above and res is never read: neither is used again.
+    unsafe {
+        p_free(out);
+        p_free(res);
+    }
     if r != 0 {
         return 0;
     }
     return n;
 }
 
-fn cb_sym_key(alg: i64, secret: &Vec) -> i64 {
+/// A BCrypt symmetric key for `secret`, or 0. Its key object (the AES key
+/// schedule CNG keeps for the key, obj_len bytes) is written to the 16-byte
+/// slot `obj` as [address, length]: the caller frees it with
+/// cb_sym_key_free after cb_destroy_key, as CNG reads it while the key
+/// lives (before, it was kept: one block per AES-GCM call never freed).
+fn cb_sym_key(alg: i64, secret: &Vec, obj: i64) -> i64 {
+    cb_set(obj, 0);
+    cb_set(obj + 8, 0);
     var obj_len: i64 = cb_key_obj_len(alg);
     if obj_len == 0 {
         return 0;
@@ -217,17 +283,54 @@ fn cb_sym_key(alg: i64, secret: &Vec) -> i64 {
     var key_obj: i64 = cb_zeroed(obj_len);
     var sec: i64 = cb_buf(secret);
     var h: i64 = cb_zeroed(8);
-    var r: i64 = cb_gen_sym(alg as * mut u8, h as * mut u8, key_obj as * mut u8, obj_len, sec as * mut u8, secret.len(), 0);
-    p_free(sec);
+    var r: i64 = 0;
+    // SAFETY: BCryptGenerateSymmetricKey uses key_obj, a cb_zeroed block of
+    // exactly obj_len bytes (the ObjectLength BCrypt reported for alg), as
+    // the key object, reads secret.len() bytes of sec (cb_buf of secret) and
+    // writes one key handle into h, an 8-byte cb_zeroed slot.
+    unsafe {
+        r = cb_gen_sym(alg as * mut u8, h as * mut u8, key_obj as * mut u8, obj_len, sec as * mut u8, secret.len(), 0);
+    }
+    // SAFETY: sec is the cb_buf copy made above; BCrypt has copied the
+    // secret into the key object, and sec is not read again.
+    unsafe {
+        p_free(sec);
+    }
     if r != 0 {
-        p_free(h);
-        p_free(key_obj);
+        // SAFETY: the generation failed, so no key uses key_obj; h and
+        // key_obj, both allocated above, are freed once and the function
+        // returns.
+        unsafe {
+            p_free(h);
+            p_free(key_obj);
+        }
         return 0;
     }
     var key: i64 = cb_get(h);
-    p_free(h);
+    // SAFETY: h is the 8-byte cb_zeroed slot; its handle was copied to key
+    // just above and h is not read again (key_obj is not freed here: the
+    // key still uses it; the caller frees it through `obj`).
+    unsafe {
+        p_free(h);
+    }
+    cb_set(obj, key_obj);
+    cb_set(obj + 8, obj_len);
     return key;
-    // key_obj intentionally kept: CNG reads it while the key lives
+}
+
+/// Free the key object cb_sym_key wrote to `obj` (after cb_destroy_key:
+/// CNG no longer reads it), wiped first since it holds the key schedule,
+/// then the slot itself.
+fn cb_sym_key_free(obj: i64) {
+    var ko: i64 = cb_get(obj);
+    if ko != 0 {
+        cb_wipe_free(ko, cb_get(obj + 8));
+    }
+    // SAFETY: obj is the 16-byte cb_zeroed slot its caller made for
+    // cb_sym_key; read just above and not used again.
+    unsafe {
+        p_free(obj);
+    }
 }
 
 // BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO in a buffer.
@@ -273,9 +376,16 @@ pub fn cb_gcm_encrypt(@secret key: &Vec, nonce: &Vec, aad: &Vec, pt: &Vec) -> Ve
     if alg == 0 {
         return out;
     }
-    var hkey: i64 = cb_sym_key(alg, key);
+    var kobj: i64 = cb_zeroed(16);
+    var hkey: i64 = cb_sym_key(alg, key, kobj);
     if hkey == 0 {
-        cb_close_alg(alg as * mut u8, 0);
+        // (no key object was kept: cb_sym_key freed it on failure)
+        cb_sym_key_free(kobj);
+        // SAFETY: closes, once, the provider cb_aes_alg opened above; no key
+        // was made from it and the function returns.
+        unsafe {
+            cb_close_alg(alg as * mut u8, 0);
+        }
         return out;
     }
     var nb: i64 = cb_buf(nonce);
@@ -290,7 +400,16 @@ pub fn cb_gcm_encrypt(@secret key: &Vec, nonce: &Vec, aad: &Vec, pt: &Vec) -> Ve
     var tag: i64 = cb_zeroed(16);
     var info: i64 = cb_auth_info(nb, nonce.len(), ab, aad.len(), tag, 16, n);
     var res: i64 = cb_zeroed(8);
-    var r: i64 = cb_encrypt(hkey as * mut u8, pb as * mut u8, n, info as * mut u8, 0 as * mut u8, 0, ct as * mut u8, n, res as * mut u8, 0);
+    var r: i64 = 0;
+    // SAFETY: BCryptEncrypt reads n bytes of pb (cb_buf of pt, max(n, 1)
+    // bytes) and info, the 88-byte BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO
+    // whose nonce and AAD pointers are nb and ab (cb_buf copies, passed with
+    // their own lengths) and whose tag pointer is tag (16 bytes, cbTag 16);
+    // it writes at most n bytes into ct (max(n, 1) bytes), the 16-byte tag
+    // and a ULONG count into res (8 bytes). hkey is the key cb_sym_key made.
+    unsafe {
+        r = cb_encrypt(hkey as * mut u8, pb as * mut u8, n, info as * mut u8, 0 as * mut u8, 0, ct as * mut u8, n, res as * mut u8, 0);
+    }
     if r == 0 {
         out = cb_unbuf(ct, n);
         var t: Vec<i64> = cb_unbuf(tag, 16);
@@ -300,15 +419,24 @@ pub fn cb_gcm_encrypt(@secret key: &Vec, nonce: &Vec, aad: &Vec, pt: &Vec) -> Ve
             i = i + 1;
         }
     }
-    p_free(nb);
-    p_free(ab);
-    p_free(pb);
-    p_free(ct);
-    p_free(tag);
-    p_free(info);
-    p_free(res);
-    cb_destroy_key(hkey as * mut u8);
-    cb_close_alg(alg as * mut u8, 0);
+    // SAFETY: nb, ab, pb, ct, tag, info and res are the blocks cb_buf,
+    // cb_zeroed and cb_auth_info made above, each freed once; BCryptEncrypt
+    // has returned and its output was copied into `out`, so none is read
+    // again. Then the key (cb_sym_key) is destroyed before its provider
+    // (cb_aes_alg) is closed, each once.
+    unsafe {
+        p_free(nb);
+        p_free(ab);
+        p_free(pb);
+        p_free(ct);
+        p_free(tag);
+        p_free(info);
+        p_free(res);
+        cb_destroy_key(hkey as * mut u8);
+        cb_close_alg(alg as * mut u8, 0);
+    }
+    // the key is destroyed: its key object can go
+    cb_sym_key_free(kobj);
     return out;
 }
 
@@ -326,9 +454,16 @@ pub fn cb_gcm_decrypt(@secret key: &Vec, nonce: &Vec, aad: &Vec, ct_tag: &Vec) -
     if alg == 0 {
         return out;
     }
-    var hkey: i64 = cb_sym_key(alg, key);
+    var kobj: i64 = cb_zeroed(16);
+    var hkey: i64 = cb_sym_key(alg, key, kobj);
     if hkey == 0 {
-        cb_close_alg(alg as * mut u8, 0);
+        // (no key object was kept: cb_sym_key freed it on failure)
+        cb_sym_key_free(kobj);
+        // SAFETY: closes, once, the provider cb_aes_alg opened above; no key
+        // was made from it and the function returns.
+        unsafe {
+            cb_close_alg(alg as * mut u8, 0);
+        }
         return out;
     }
     var n: i64 = ct_tag.len() - 16;
@@ -343,18 +478,36 @@ pub fn cb_gcm_decrypt(@secret key: &Vec, nonce: &Vec, aad: &Vec, ct_tag: &Vec) -
         n
     });
     var res: i64 = cb_zeroed(8);
-    var r: i64 = cb_decrypt(hkey as * mut u8, ctb as * mut u8, n, info as * mut u8, 0 as * mut u8, 0, pt as * mut u8, n, res as * mut u8, 0);
+    var r: i64 = 0;
+    // SAFETY: ctb is the cb_buf copy of ct_tag, n + 16 bytes (n >= 0 was
+    // checked above): BCryptDecrypt reads its first n bytes and, through
+    // info (the 88-byte cipher-mode struct), the 16-byte tag at ctb + n,
+    // the nonce nb and the AAD ab with their own lengths. It writes at most
+    // n bytes into pt (max(n, 1) bytes) and a ULONG count into res (8
+    // bytes). hkey is the key cb_sym_key made.
+    unsafe {
+        r = cb_decrypt(hkey as * mut u8, ctb as * mut u8, n, info as * mut u8, 0 as * mut u8, 0, pt as * mut u8, n, res as * mut u8, 0);
+    }
     if r == 0 {
         out = cb_unbuf(pt, n);
     }
-    p_free(ctb);
-    p_free(nb);
-    p_free(ab);
-    p_free(pt);
-    p_free(info);
-    p_free(res);
-    cb_destroy_key(hkey as * mut u8);
-    cb_close_alg(alg as * mut u8, 0);
+    // SAFETY: ctb, nb, ab, pt, info and res are the blocks cb_buf, cb_zeroed
+    // and cb_auth_info made above (tag points into ctb and is not freed by
+    // itself), each freed once; BCryptDecrypt has returned and its output
+    // was copied into `out`. Then the key (cb_sym_key) is destroyed before
+    // its provider (cb_aes_alg) is closed, each once.
+    unsafe {
+        p_free(ctb);
+        p_free(nb);
+        p_free(ab);
+        p_free(pt);
+        p_free(info);
+        p_free(res);
+        cb_destroy_key(hkey as * mut u8);
+        cb_close_alg(alg as * mut u8, 0);
+    }
+    // the key is destroyed: its key object can go
+    cb_sym_key_free(kobj);
     return out;
 }
 
@@ -366,27 +519,60 @@ pub fn cb_gcm_decrypt(@secret key: &Vec, nonce: &Vec, aad: &Vec, ct_tag: &Vec) -
 @declassify
 pub fn cb_pbkdf2_derive(@secret password: &Vec, salt: &Vec, iters: i64, out_len: i64) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
-    var h: i64 = cb_zeroed(8);
-    var w: i64 = cb_wide("SHA256");
-    if cb_open_alg(h as * mut u8, w as * mut u8, 0 as * mut u8, CB_HMAC_FLAG) != 0 {
-        p_free(w);
-        p_free(h);
+    // As the Unix twin (crypto_bind_unix.fd): an empty result for a
+    // non-positive count or length. Before, a negative out_len reached
+    // p_malloc and aborted the program, and iters < 1 went to BCrypt.
+    if iters < 1 || out_len < 1 {
         return out;
     }
-    p_free(w);
+    var h: i64 = cb_zeroed(8);
+    var w: i64 = cb_wide("SHA256");
+    // SAFETY: BCryptOpenAlgorithmProvider reads the NUL-terminated UTF-16
+    // name w (cb_wide("SHA256")) and writes one HMAC provider handle into h,
+    // an 8-byte cb_zeroed slot. On failure no handle was made, and w and h,
+    // both allocated just above, are freed once before the return.
+    unsafe {
+        if cb_open_alg(h as * mut u8, w as * mut u8, 0 as * mut u8, CB_HMAC_FLAG) != 0 {
+            p_free(w);
+            p_free(h);
+            return out;
+        }
+    }
+    // SAFETY: w (cb_wide above) was only read by the open call, which has
+    // returned; nothing reads it again.
+    unsafe {
+        p_free(w);
+    }
     var alg: i64 = cb_get(h);
-    p_free(h);
+    // SAFETY: h is the 8-byte cb_zeroed slot; its handle was copied to alg
+    // just above and h is not read again.
+    unsafe {
+        p_free(h);
+    }
     var pb: i64 = cb_buf(password);
     var sb: i64 = cb_buf(salt);
     var ob: i64 = cb_zeroed(out_len);
-    var r: i64 = cb_pbkdf2(alg as * mut u8, pb as * mut u8, password.len(), sb as * mut u8, salt.len(), iters, ob as * mut u8, out_len, 0);
+    var r: i64 = 0;
+    // SAFETY: BCryptDeriveKeyPBKDF2 reads password.len() bytes of pb and
+    // salt.len() bytes of sb (cb_buf copies of exactly those Vecs) and
+    // writes out_len bytes into ob, a cb_zeroed(out_len) block (a negative
+    // out_len never gets here: p_malloc aborts on it); alg is the HMAC
+    // provider opened above.
+    unsafe {
+        r = cb_pbkdf2(alg as * mut u8, pb as * mut u8, password.len(), sb as * mut u8, salt.len(), iters, ob as * mut u8, out_len, 0);
+    }
     if r == 0 {
         out = cb_unbuf(ob, out_len);
     }
-    p_free(pb);
-    p_free(sb);
-    p_free(ob);
-    cb_close_alg(alg as * mut u8, 0);
+    // SAFETY: pb, sb and ob are the blocks made above, each freed once;
+    // the derivation has returned and ob was copied into `out`, so none is
+    // read again. The provider opened above is closed once, last.
+    unsafe {
+        p_free(pb);
+        p_free(sb);
+        p_free(ob);
+        cb_close_alg(alg as * mut u8, 0);
+    }
     return out;
 }
 
@@ -397,14 +583,28 @@ pub fn cb_pbkdf2_derive(@secret password: &Vec, salt: &Vec, iters: i64, out_len:
 fn cb_ecdsa_alg() -> i64 {
     var h: i64 = cb_zeroed(8);
     var w: i64 = cb_wide("ECDSA_P256");
-    if cb_open_alg(h as * mut u8, w as * mut u8, 0 as * mut u8, 0) != 0 {
-        p_free(w);
-        p_free(h);
-        return 0;
+    // SAFETY: BCryptOpenAlgorithmProvider reads the NUL-terminated UTF-16
+    // name w (cb_wide("ECDSA_P256")) and writes one handle into h, an 8-byte
+    // cb_zeroed slot. On failure no handle was made, and w and h, both
+    // allocated just above, are freed once before the return.
+    unsafe {
+        if cb_open_alg(h as * mut u8, w as * mut u8, 0 as * mut u8, 0) != 0 {
+            p_free(w);
+            p_free(h);
+            return 0;
+        }
     }
-    p_free(w);
+    // SAFETY: w (cb_wide above) was only read by the open call, which has
+    // returned; nothing reads it again.
+    unsafe {
+        p_free(w);
+    }
     var alg: i64 = cb_get(h);
-    p_free(h);
+    // SAFETY: h is the 8-byte cb_zeroed slot; its handle was copied to alg
+    // just above and h is not read again.
+    unsafe {
+        p_free(h);
+    }
     return alg;
 }
 
@@ -412,21 +612,45 @@ fn cb_export_blob(key: i64, kind: str) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     var w: i64 = cb_wide(kind);
     var res: i64 = cb_zeroed(8);
-    var r: i64 = cb_export(key as * mut u8, 0 as * mut u8, w as * mut u8, 0 as * mut u8, 0, res as * mut u8, 0);
+    var r: i64 = 0;
+    // SAFETY: with no output buffer (0, length 0) BCryptExportKey only
+    // writes the blob's size, a ULONG, into res (an 8-byte cb_zeroed
+    // block); it reads the UTF-16 blob type w (cb_wide). key is a key
+    // handle the caller made and still holds.
+    unsafe {
+        r = cb_export(key as * mut u8, 0 as * mut u8, w as * mut u8, 0 as * mut u8, 0, res as * mut u8, 0);
+    }
     var n: i64 = cb_get32(res);
     if r != 0 || n <= 0 {
-        p_free(w);
-        p_free(res);
+        // SAFETY: w and res, allocated above, are freed once and the
+        // function returns: neither is used again.
+        unsafe {
+            p_free(w);
+            p_free(res);
+        }
         return out;
     }
     var b: i64 = cb_zeroed(n);
-    r = cb_export(key as * mut u8, 0 as * mut u8, w as * mut u8, b as * mut u8, n, res as * mut u8, 0);
-    p_free(w);
-    p_free(res);
+    // SAFETY: b is a cb_zeroed block of exactly the n bytes BCrypt asked
+    // for, passed as the output length, so the export writes inside it; res
+    // and w as in the sizing call above.
+    unsafe {
+        r = cb_export(key as * mut u8, 0 as * mut u8, w as * mut u8, b as * mut u8, n, res as * mut u8, 0);
+    }
+    // SAFETY: w and res (allocated above) were only used by the two export
+    // calls, which have returned; neither is read again.
+    unsafe {
+        p_free(w);
+        p_free(res);
+    }
     if r == 0 {
         out = cb_unbuf(b, n);
     }
-    p_free(b);
+    // SAFETY: b is the cb_zeroed(n) block above; its bytes were copied into
+    // `out` (or the export failed) and it is not read again.
+    unsafe {
+        p_free(b);
+    }
     return out;
 }
 
@@ -437,20 +661,46 @@ pub fn cb_ecdsa_generate(priv_blob: &mut Vec, pub_blob: &mut Vec) -> i64 {
         return -1;
     }
     var kh: i64 = cb_zeroed(8);
-    var r: i64 = cb_gen_pair(alg as * mut u8, kh as * mut u8, 256, 0);
-    if r == 0 {
-        r = cb_final_pair(cb_get(kh) as * mut u8, 0);
+    var r: i64 = 0;
+    // SAFETY: BCryptGenerateKeyPair writes one key handle into kh, an 8-byte
+    // cb_zeroed slot; BCryptFinalizeKeyPair runs only after it succeeded, on
+    // the handle it stored there. alg is the provider cb_ecdsa_alg opened.
+    unsafe {
+        r = cb_gen_pair(alg as * mut u8, kh as * mut u8, 256, 0);
+        if r == 0 {
+            r = cb_final_pair(cb_get(kh) as * mut u8, 0);
+        }
     }
     var key: i64 = cb_get(kh);
-    p_free(kh);
+    // SAFETY: kh is the 8-byte cb_zeroed slot; its handle was copied to key
+    // just above and kh is not read again.
+    unsafe {
+        p_free(kh);
+    }
     if r != 0 {
-        cb_close_alg(alg as * mut u8, 0);
+        // SAFETY: when BCryptGenerateKeyPair succeeded but
+        // BCryptFinalizeKeyPair failed, key is a live (unfinalized) key
+        // handle: it is destroyed once (before, it leaked; cb_rsa_generate
+        // already did this). When the generation itself failed, kh stayed
+        // zeroed, key is 0 and nothing is destroyed. Then the provider
+        // cb_ecdsa_alg opened is closed once; the function returns right
+        // after.
+        unsafe {
+            if key != 0 {
+                cb_destroy_key(key as * mut u8);
+            }
+            cb_close_alg(alg as * mut u8, 0);
+        }
         return -1;
     }
     var priv: Vec<i64> = cb_export_blob(key, "ECCPRIVATEBLOB");
     var pubb: Vec<i64> = cb_export_blob(key, "ECCPUBLICBLOB");
-    cb_destroy_key(key as * mut u8);
-    cb_close_alg(alg as * mut u8, 0);
+    // SAFETY: the key (generated above) is destroyed once, after both
+    // exports, and then its provider is closed once; neither is used after.
+    unsafe {
+        cb_destroy_key(key as * mut u8);
+        cb_close_alg(alg as * mut u8, 0);
+    }
     if priv.len() == 0 || pubb.len() == 0 {
         return -1;
     }
@@ -475,16 +725,37 @@ fn cb_import_key(blob: &Vec, kind: str) -> i64 {
     var b: i64 = cb_buf(blob);
     var w: i64 = cb_wide(kind);
     var kh: i64 = cb_zeroed(8);
-    var r: i64 = cb_import(alg as * mut u8, 0 as * mut u8, w as * mut u8, kh as * mut u8, b as * mut u8, blob.len(), 0);
-    p_free(b);
-    p_free(w);
-    cb_close_alg(alg as * mut u8, 0);
+    var r: i64 = 0;
+    // SAFETY: BCryptImportKeyPair reads blob.len() bytes of b (the cb_buf
+    // copy of blob) and the UTF-16 blob type w (cb_wide), and writes one key
+    // handle into kh, an 8-byte cb_zeroed slot; alg is the provider
+    // cb_ecdsa_alg opened. BCrypt checks the blob's own header against its
+    // length.
+    unsafe {
+        r = cb_import(alg as * mut u8, 0 as * mut u8, w as * mut u8, kh as * mut u8, b as * mut u8, blob.len(), 0);
+    }
+    // SAFETY: b and w (allocated above) were only read by the import, which
+    // has returned, and are freed once. The provider is closed once; the
+    // imported key is used afterwards but not the provider handle itself.
+    unsafe {
+        p_free(b);
+        p_free(w);
+        cb_close_alg(alg as * mut u8, 0);
+    }
     if r != 0 {
-        p_free(kh);
+        // SAFETY: kh is the 8-byte cb_zeroed slot; the import failed, so it
+        // holds no handle, and the function returns.
+        unsafe {
+            p_free(kh);
+        }
         return 0;
     }
     var key: i64 = cb_get(kh);
-    p_free(kh);
+    // SAFETY: kh is the 8-byte cb_zeroed slot; its handle was copied to key
+    // just above and kh is not read again.
+    unsafe {
+        p_free(kh);
+    }
     return key;
 }
 
@@ -504,14 +775,26 @@ pub fn cb_ecdsa_sign(@secret priv_blob: &Vec, hash: &Vec) -> Vec<i64> {
     var hb: i64 = cb_buf(hash);
     var sig: i64 = cb_zeroed(64);
     var res: i64 = cb_zeroed(8);
-    var r: i64 = cb_sign(key as * mut u8, 0 as * mut u8, hb as * mut u8, 32, sig as * mut u8, 64, res as * mut u8, 0);
+    var r: i64 = 0;
+    // SAFETY: BCryptSignHash reads 32 bytes of hb (cb_buf of hash, whose
+    // length was checked to be 32), writes at most 64 bytes into sig (a
+    // cb_zeroed(64) block, length 64 passed) and a ULONG count into res (8
+    // bytes); key is the key cb_import_key made. No padding info for ECDSA.
+    unsafe {
+        r = cb_sign(key as * mut u8, 0 as * mut u8, hb as * mut u8, 32, sig as * mut u8, 64, res as * mut u8, 0);
+    }
     if r == 0 {
         out = cb_unbuf(sig, cb_get32(res));
     }
-    p_free(hb);
-    p_free(sig);
-    p_free(res);
-    cb_destroy_key(key as * mut u8);
+    // SAFETY: hb, sig and res are the blocks made above, each freed once;
+    // the signature was copied into `out`, so none is read again. The key
+    // (cb_import_key) is destroyed once, last.
+    unsafe {
+        p_free(hb);
+        p_free(sig);
+        p_free(res);
+        cb_destroy_key(key as * mut u8);
+    }
     return out;
 }
 
@@ -526,10 +809,20 @@ pub fn cb_ecdsa_verify(pub_blob: &Vec, hash: &Vec, sig: &Vec) -> bool {
     }
     var hb: i64 = cb_buf(hash);
     var sb: i64 = cb_buf(sig);
-    var r: i64 = cb_verify_sig(key as * mut u8, 0 as * mut u8, hb as * mut u8, 32, sb as * mut u8, 64, 0);
-    p_free(hb);
-    p_free(sb);
-    cb_destroy_key(key as * mut u8);
+    var r: i64 = 0;
+    // SAFETY: BCryptVerifySignature only reads: 32 bytes of hb and 64 of sb,
+    // the cb_buf copies of hash and sig whose lengths were checked above;
+    // key is the key cb_import_key made.
+    unsafe {
+        r = cb_verify_sig(key as * mut u8, 0 as * mut u8, hb as * mut u8, 32, sb as * mut u8, 64, 0);
+    }
+    // SAFETY: hb and sb (cb_buf above) were only read by the verification,
+    // which has returned, and are freed once; the key is destroyed once.
+    unsafe {
+        p_free(hb);
+        p_free(sb);
+        cb_destroy_key(key as * mut u8);
+    }
     return r == 0;
 }
 
@@ -551,14 +844,28 @@ const CB_PAD_PSS: i64 = 8;
 fn cb_rsa_alg() -> i64 {
     var h: i64 = cb_zeroed(8);
     var w: i64 = cb_wide("RSA");
-    if cb_open_alg(h as * mut u8, w as * mut u8, 0 as * mut u8, 0) != 0 {
-        p_free(w);
-        p_free(h);
-        return 0;
+    // SAFETY: BCryptOpenAlgorithmProvider reads the NUL-terminated UTF-16
+    // name w (cb_wide("RSA")) and writes one handle into h, an 8-byte
+    // cb_zeroed slot. On failure no handle was made, and w and h, both
+    // allocated just above, are freed once before the return.
+    unsafe {
+        if cb_open_alg(h as * mut u8, w as * mut u8, 0 as * mut u8, 0) != 0 {
+            p_free(w);
+            p_free(h);
+            return 0;
+        }
     }
-    p_free(w);
+    // SAFETY: w (cb_wide above) was only read by the open call, which has
+    // returned; nothing reads it again.
+    unsafe {
+        p_free(w);
+    }
     var alg: i64 = cb_get(h);
-    p_free(h);
+    // SAFETY: h is the 8-byte cb_zeroed slot; its handle was copied to alg
+    // just above and h is not read again.
+    unsafe {
+        p_free(h);
+    }
     return alg;
 }
 
@@ -579,17 +886,40 @@ fn cb_rsa_import(blob: &Vec, want_private: bool) -> i64 {
     var b: i64 = cb_buf(blob);
     var w: i64 = cb_wide(kind);
     var kh: i64 = cb_zeroed(8);
-    var r: i64 = cb_import(alg as * mut u8, 0 as * mut u8, w as * mut u8, kh as * mut u8, b as * mut u8, blob.len(), 0);
+    var r: i64 = 0;
+    // SAFETY: BCryptImportKeyPair reads blob.len() bytes of b (the cb_buf
+    // copy of blob, whose header and part lengths cbr_blob_ok checked
+    // against that length) and the UTF-16 blob type w, and writes one key
+    // handle into kh, an 8-byte cb_zeroed slot; alg is cb_rsa_alg's provider.
+    unsafe {
+        r = cb_import(alg as * mut u8, 0 as * mut u8, w as * mut u8, kh as * mut u8, b as * mut u8, blob.len(), 0);
+    }
     cb_wipe_free(b, blob.len());
-    p_free(w);
+    // SAFETY: w (cb_wide above) was only read by the import, which has
+    // returned; it is freed once and not read again.
+    unsafe {
+        p_free(w);
+    }
     // the key keeps what it needs of the provider
-    cb_close_alg(alg as * mut u8, 0);
+    // SAFETY: closes, once, the provider cb_rsa_alg opened above; the
+    // provider handle is not used after this.
+    unsafe {
+        cb_close_alg(alg as * mut u8, 0);
+    }
     if r != 0 {
-        p_free(kh);
+        // SAFETY: kh is the 8-byte cb_zeroed slot; the import failed, so it
+        // holds no handle, and the function returns.
+        unsafe {
+            p_free(kh);
+        }
         return 0;
     }
     var key: i64 = cb_get(kh);
-    p_free(kh);
+    // SAFETY: kh is the 8-byte cb_zeroed slot; its handle was copied to key
+    // just above and kh is not read again.
+    unsafe {
+        p_free(kh);
+    }
     return key;
 }
 
@@ -600,12 +930,17 @@ fn cb_wipe_free(p: i64, n: i64) {
         // SAFETY: i < n, inside the block of at least n bytes the caller
         // allocated (cb_buf, cb_zeroed).
         unsafe {
-            var b: *mut u8 = p + i;
+            var b: *mut u8 = (p + i) as *mut u8;
             *b = 0;
         }
         i = i + 1;
     }
-    p_free(p);
+    // SAFETY: private helper; every caller passes a block it allocated with
+    // cb_buf or cb_zeroed and hands it over here, after its last use (the
+    // BCrypt call that read or wrote it has returned): it is freed once.
+    unsafe {
+        p_free(p);
+    }
 }
 
 // A padding-info structure for `pad`: the hash name (UTF-16, `alg_w`, kept
@@ -635,23 +970,42 @@ pub fn cb_rsa_generate(bits: i64, priv_blob: &mut Vec, pub_blob: &mut Vec) -> i6
         return -1;
     }
     var kh: i64 = cb_zeroed(8);
-    var r: i64 = cb_gen_pair(alg as * mut u8, kh as * mut u8, bits, 0);
-    if r == 0 {
-        r = cb_final_pair(cb_get(kh) as * mut u8, 0);
+    var r: i64 = 0;
+    // SAFETY: BCryptGenerateKeyPair writes one key handle into kh, an 8-byte
+    // cb_zeroed slot; BCryptFinalizeKeyPair runs only after it succeeded, on
+    // the handle it stored there. alg is the provider cb_rsa_alg opened.
+    unsafe {
+        r = cb_gen_pair(alg as * mut u8, kh as * mut u8, bits, 0);
+        if r == 0 {
+            r = cb_final_pair(cb_get(kh) as * mut u8, 0);
+        }
     }
     var key: i64 = cb_get(kh);
-    p_free(kh);
+    // SAFETY: kh is the 8-byte cb_zeroed slot; its handle was copied to key
+    // just above and kh is not read again.
+    unsafe {
+        p_free(kh);
+    }
     if r != 0 {
-        if key != 0 {
-            cb_destroy_key(key as * mut u8);
+        // SAFETY: key is 0 (kh was zeroed) unless the generation stored a
+        // handle, which is then destroyed once; the provider is closed once
+        // and the function returns.
+        unsafe {
+            if key != 0 {
+                cb_destroy_key(key as * mut u8);
+            }
+            cb_close_alg(alg as * mut u8, 0);
         }
-        cb_close_alg(alg as * mut u8, 0);
         return -1;
     }
     var priv: Vec<i64> = cb_export_blob(key, "RSAFULLPRIVATEBLOB");
     var pubb: Vec<i64> = cb_export_blob(key, "RSAPUBLICBLOB");
-    cb_destroy_key(key as * mut u8);
-    cb_close_alg(alg as * mut u8, 0);
+    // SAFETY: the key (generated above) is destroyed once, after both
+    // exports, and then its provider is closed once; neither is used after.
+    unsafe {
+        cb_destroy_key(key as * mut u8);
+        cb_close_alg(alg as * mut u8, 0);
+    }
     if priv.len() == 0 || pubb.len() == 0 {
         return -1;
     }
@@ -686,16 +1040,31 @@ fn cb_rsa_sign(priv_blob: &Vec, hash_alg: str, hash: &Vec, pad: i64, salt_len: i
     var hb: i64 = cb_buf(hash);
     var sig: i64 = cb_zeroed(k);
     var res: i64 = cb_zeroed(8);
-    var r: i64 = cb_sign(key as * mut u8, info as * mut u8, hb as * mut u8, hlen, sig as * mut u8, k, res as * mut u8, pad);
+    var r: i64 = 0;
+    // SAFETY: BCryptSignHash reads the padding info (a 24-byte cb_zeroed
+    // block holding the UTF-16 hash name w, alive until after the call, and
+    // the salt length) and hlen bytes of hb (cb_buf of hash, length checked
+    // to be hlen); it writes at most k bytes, the modulus length passed,
+    // into sig (cb_zeroed(k)) and a ULONG count into res (8 bytes). key is
+    // the key cb_rsa_import made.
+    unsafe {
+        r = cb_sign(key as * mut u8, info as * mut u8, hb as * mut u8, hlen, sig as * mut u8, k, res as * mut u8, pad);
+    }
     if r == 0 && cb_get32(res) == k {
         out = cb_unbuf(sig, k);
     }
-    p_free(w);
-    p_free(info);
-    p_free(hb);
-    p_free(sig);
-    p_free(res);
-    cb_destroy_key(key as * mut u8);
+    // SAFETY: w, info, hb, sig and res are the blocks made above, each
+    // freed once; the signature was copied into `out` and BCryptSignHash
+    // has returned, so none is read again. The key (cb_rsa_import) is
+    // destroyed once, last.
+    unsafe {
+        p_free(w);
+        p_free(info);
+        p_free(hb);
+        p_free(sig);
+        p_free(res);
+        cb_destroy_key(key as * mut u8);
+    }
     return out;
 }
 
@@ -717,12 +1086,25 @@ fn cb_rsa_verify(pub_blob: &Vec, hash_alg: str, hash: &Vec, sig: &Vec, pad: i64,
     var info: i64 = cb_rsa_pad_info(pad, w, salt_len, 0, 0);
     var hb: i64 = cb_buf(hash);
     var sb: i64 = cb_buf(sig);
-    var r: i64 = cb_verify_sig(key as * mut u8, info as * mut u8, hb as * mut u8, hlen, sb as * mut u8, k, pad);
-    p_free(w);
-    p_free(info);
-    p_free(hb);
-    p_free(sb);
-    cb_destroy_key(key as * mut u8);
+    var r: i64 = 0;
+    // SAFETY: BCryptVerifySignature only reads: the padding info (24-byte
+    // cb_zeroed block holding the UTF-16 hash name w, alive until after the
+    // call), hlen bytes of hb and k bytes of sb, the cb_buf copies of hash
+    // and sig whose lengths were checked to be hlen and k above. key is the
+    // key cb_rsa_import made.
+    unsafe {
+        r = cb_verify_sig(key as * mut u8, info as * mut u8, hb as * mut u8, hlen, sb as * mut u8, k, pad);
+    }
+    // SAFETY: w, info, hb and sb (made above) were only read by the
+    // verification, which has returned, and are freed once; the key is
+    // destroyed once.
+    unsafe {
+        p_free(w);
+        p_free(info);
+        p_free(hb);
+        p_free(sb);
+        cb_destroy_key(key as * mut u8);
+    }
     return r == 0;
 }
 
@@ -779,17 +1161,35 @@ pub fn cb_rsa_encrypt_oaep(pub_blob: &Vec, hash_alg: str, msg: &Vec, label: &Vec
     var mb: i64 = cb_buf(msg);
     var ct: i64 = cb_zeroed(k);
     var res: i64 = cb_zeroed(8);
-    var r: i64 = cb_encrypt(key as * mut u8, mb as * mut u8, msg.len(), info as * mut u8, 0 as * mut u8, 0, ct as * mut u8, k, res as * mut u8, CB_PAD_OAEP);
+    var r: i64 = 0;
+    // SAFETY: BCryptEncrypt reads msg.len() bytes of mb (cb_buf of msg) and
+    // the OAEP padding info (24-byte cb_zeroed block: the UTF-16 hash name
+    // w and, when non-empty, the label lb with its length, both alive until
+    // after the call); it writes at most k bytes, the modulus length passed,
+    // into ct (cb_zeroed(k)) and a ULONG count into res (8 bytes). key is
+    // the key cb_rsa_import made.
+    unsafe {
+        r = cb_encrypt(key as * mut u8, mb as * mut u8, msg.len(), info as * mut u8, 0 as * mut u8, 0, ct as * mut u8, k, res as * mut u8, CB_PAD_OAEP);
+    }
     if r == 0 && cb_get32(res) == k {
         out = cb_unbuf(ct, k);
     }
-    p_free(w);
-    p_free(lb);
-    p_free(info);
+    // SAFETY: w, lb and info (made above) were only read by BCryptEncrypt,
+    // which has returned; each is freed once and not read again.
+    unsafe {
+        p_free(w);
+        p_free(lb);
+        p_free(info);
+    }
     cb_wipe_free(mb, msg.len());
-    p_free(ct);
-    p_free(res);
-    cb_destroy_key(key as * mut u8);
+    // SAFETY: ct and res are the cb_zeroed blocks above; the ciphertext was
+    // copied into `out`, so neither is read again. The key (cb_rsa_import)
+    // is destroyed once, last.
+    unsafe {
+        p_free(ct);
+        p_free(res);
+        cb_destroy_key(key as * mut u8);
+    }
     return out;
 }
 
@@ -815,7 +1215,16 @@ pub fn cb_rsa_decrypt_oaep(@secret priv_blob: &Vec, hash_alg: str, ct: &Vec, lab
     var ctb: i64 = cb_buf(ct);
     var pt: i64 = cb_zeroed(k);
     var res: i64 = cb_zeroed(8);
-    var r: i64 = cb_decrypt(key as * mut u8, ctb as * mut u8, k, info as * mut u8, 0 as * mut u8, 0, pt as * mut u8, k, res as * mut u8, CB_PAD_OAEP);
+    var r: i64 = 0;
+    // SAFETY: BCryptDecrypt reads k bytes of ctb (cb_buf of ct, whose length
+    // was checked to be k) and the OAEP padding info (24-byte cb_zeroed
+    // block: the UTF-16 hash name w and, when non-empty, the label lb with
+    // its length, both alive until after the call); it writes at most k
+    // bytes into pt (cb_zeroed(k), length k passed) and a ULONG count into
+    // res (8 bytes). key is the key cb_rsa_import made.
+    unsafe {
+        r = cb_decrypt(key as * mut u8, ctb as * mut u8, k, info as * mut u8, 0 as * mut u8, 0, pt as * mut u8, k, res as * mut u8, CB_PAD_OAEP);
+    }
     val n: i64 = cb_get32(res);
     val ok: bool = r == 0 && n >= 0 && n <= k;
     if ok {
@@ -826,12 +1235,21 @@ pub fn cb_rsa_decrypt_oaep(@secret priv_blob: &Vec, hash_alg: str, ct: &Vec, lab
             i = i + 1;
         }
     }
-    p_free(w);
-    p_free(lb);
-    p_free(info);
-    p_free(ctb);
+    // SAFETY: w, lb, info and ctb (made above) were only read by
+    // BCryptDecrypt, which has returned; each is freed once and not read
+    // again.
+    unsafe {
+        p_free(w);
+        p_free(lb);
+        p_free(info);
+        p_free(ctb);
+    }
     cb_wipe_free(pt, k);
-    p_free(res);
-    cb_destroy_key(key as * mut u8);
+    // SAFETY: res is the cb_zeroed(8) block above, read into n already; it
+    // is freed once. The key (cb_rsa_import) is destroyed once, last.
+    unsafe {
+        p_free(res);
+        cb_destroy_key(key as * mut u8);
+    }
     return ok;
 }

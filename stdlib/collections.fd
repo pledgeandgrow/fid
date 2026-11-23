@@ -552,7 +552,7 @@ fn int_hash(val: i64) -> i64 {
 // checked under that module's visibility; private helpers and a private
 // field then fail — keep them pub like the previous public `table`.
 pub fn hs_rd(base: i64, idx: i64) -> i64 {
-    var ptr: *mut i64 = base + idx * 8;
+    var ptr: *mut i64 = (base + idx * 8) as *mut i64;
     var v: i64 = 0;
     // SAFETY: callers keep idx inside the capacity-word block grow()
     // allocated for `base`.
@@ -564,7 +564,7 @@ pub fn hs_rd(base: i64, idx: i64) -> i64 {
 
 // Write one word of a slot array. pub: see hs_rd.
 pub fn hs_wr(base: i64, idx: i64, v: i64) -> void {
-    var ptr: *mut i64 = base + idx * 8;
+    var ptr: *mut i64 = (base + idx * 8) as *mut i64;
     // SAFETY: callers keep idx inside the capacity-word block grow()
     // allocated for `base`.
     unsafe {
@@ -574,7 +574,7 @@ pub fn hs_wr(base: i64, idx: i64, v: i64) -> void {
 
 // Read one word of the 40-byte table block. pub: see hs_rd.
 pub fn hs_twrd(table: i64, word: i64) -> i64 {
-    var ptr: *mut i64 = table + word * 8;
+    var ptr: *mut i64 = (table + word * 8) as *mut i64;
     var v: i64 = 0;
     // SAFETY: word < 5 stays inside the table block new() allocated.
     unsafe {
@@ -585,7 +585,7 @@ pub fn hs_twrd(table: i64, word: i64) -> i64 {
 
 // Write one word of the 40-byte table block. pub: see hs_rd.
 pub fn hs_twwr(table: i64, word: i64, v: i64) -> void {
-    var ptr: *mut i64 = table + word * 8;
+    var ptr: *mut i64 = (table + word * 8) as *mut i64;
     // SAFETY: word < 5 stays inside the table block new() allocated.
     unsafe {
         *ptr = v;
@@ -612,10 +612,14 @@ pub struct HashSet {
 impl HashSet {
     /// Create a new empty hash set.
     pub fn new() -> HashSet {
-        var ptr: i64 = p_malloc(40);
+        var ptr: i64 = 0;
+        // SAFETY: p_malloc only allocates the fresh 40-byte table block;
+        // its five words are written just below before any read.
+        unsafe {
+            ptr = p_malloc(40);
+        }
         var i: i64 = 0;
-        // SAFETY: writes the five words of the 40-byte block p_malloc just
-        // returned.
+        // writes the five words of the 40-byte block p_malloc just returned
         while i < 5 {
             hs_twwr(ptr, i, 0);
             i = i + 1;
@@ -678,8 +682,14 @@ impl HashSet {
             new_capacity = old_capacity * 2;
         }
 
-        var new_keys: i64 = p_malloc(new_capacity * 8);
-        var new_states: i64 = p_malloc(new_capacity * 8);
+        var new_keys: i64 = 0;
+        var new_states: i64 = 0;
+        // SAFETY: p_malloc only allocates two fresh new_capacity-word slot
+        // arrays; every word of both is written in the loop below.
+        unsafe {
+            new_keys = p_malloc(new_capacity * 8);
+            new_states = p_malloc(new_capacity * 8);
+        }
         var i: i64 = 0;
         while i < new_capacity {
             hs_wr(new_keys, i, 0);
@@ -710,10 +720,20 @@ impl HashSet {
 
         // Free the old slot arrays; the table words are rewritten below.
         if old_keys != 0 {
-            p_free(old_keys);
+            // SAFETY: old_keys is the keys array an earlier grow() got from
+            // p_malloc (table word 0); its live keys were copied above and
+            // word 0 is replaced by new_keys below, so nothing reads it again.
+            unsafe {
+                p_free(old_keys);
+            }
         }
         if old_states != 0 {
-            p_free(old_states);
+            // SAFETY: old_states is the states array an earlier grow() got
+            // from p_malloc (table word 1); rehashed above, and word 1 is
+            // replaced by new_states below, so nothing reads it again.
+            unsafe {
+                p_free(old_states);
+            }
         }
         hs_twwr(self.table, 0, new_keys);
         hs_twwr(self.table, 1, new_states);
@@ -811,10 +831,20 @@ impl HashSet {
         var keys: i64 = hs_twrd(self.table, 0);
         var states: i64 = hs_twrd(self.table, 1);
         if keys != 0 {
-            p_free(keys);
+            // SAFETY: keys is table word 0, the p_malloc array of the last
+            // grow(); every copy of the set shares this table, and word 0
+            // and the capacity are zeroed below, so no copy reads it again.
+            unsafe {
+                p_free(keys);
+            }
         }
         if states != 0 {
-            p_free(states);
+            // SAFETY: states is table word 1, the p_malloc array of the last
+            // grow(); zeroed below with the capacity, so no copy of the set
+            // (they share the table) reads it again.
+            unsafe {
+                p_free(states);
+            }
         }
         hs_twwr(self.table, 0, 0);
         hs_twwr(self.table, 1, 0);

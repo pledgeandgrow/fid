@@ -1181,7 +1181,7 @@ Some of the largest costs are in how data is laid out, not in the optimizer.
       and tuples own their elements (bc37241). Still true: a type-parameter
       field holding a struct (`Pair<Cell, i64>` keys) is hashed by address,
       and test_generic_struct_drop exits 1 (not in the tree).
-- [~] RT6. Generics fully monomorphized, so a `Vec<f64>` holds floats as floats (L).
+- [x] RT6. Generics fully monomorphized, so a `Vec<f64>` holds floats as floats (L).
       Nov 22 audit: mostly done — f64 elements stored inline unboxed
       (lower.fd:8938-8945 p_f64_to_bits), element inference from pushes
       (typechecker.fd:13246 TypeChecker_rt6_note_push; test_vec_infer_*
@@ -1235,6 +1235,14 @@ Some of the largest costs are in how data is laid out, not in the optimizer.
       RT8 heap work, and the rest are single miscompiles under triage
       (test_verify_nat_coalesce, test_verify_abi_c_tls sign extension,
       test_std_dsp/apriltag/jose_pk).
+      Nov 23: the remaining Left is fixed — lower.fd now gives a
+      type-parameter field's Vec receiver its real element type
+      (Lowerer_vec_elem_ir_of / Lowerer_rc_vec_elem_ast) and stores a
+      `Vec<generic-struct>` element as the struct, not the result slot.
+      Verified on a fresh fid-dev.exe (built 00:03 from the tree with the
+      fix): tests/bootstrap/test_generic_struct_vec.fd prints its full
+      expected output on `run` and `emit` — no more shared-slot reuse or
+      the "Double free" fid-mec still hits.
 - [x] RT7. Allocator: per-thread caches (release H8), freed memory returned to the
       system (L).
       Done (written Nov 4): per-thread arenas and free lists in the C runtime,
@@ -2632,7 +2640,7 @@ Reach what Rust, Go, Zig and C++ programmers expect on day one.
       receives; `p_co_stack` gives those tasks stacks as deep as main).
       Decided: no preemptive kill; a cancelled task stops at its next
       checkpoint and returns, so its drops and `defer` run (reference 8.2,
-      docs/interp-tasks.md). Tests: test_task_interleave.fd on
+      docs/reference/interp-tasks.md). Tests: test_task_interleave.fd on
       run/ccompile/emit, tests/ctx_switch/c_co_stack.fd.
       Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
       validated — test_task_interleave prints its 11 expected lines
@@ -3911,13 +3919,13 @@ Trust is built by what we do not break.
       private.
 - [~] AD4. Every internal tool that can be in Fides is (M).
       Nov 22 audit: mostly done — 12 tools/*.fd; ported per
-      docs/internal-tools.md: release_notes, release_checksums,
+      docs/reference/internal-tools.md: release_notes, release_checksums,
       macho_check, fuzz_triage, doctest + ark/scribe/veil (+ the installer
       flip, AD1). Precise gaps: doctest.fd differs from doctest.py in
       --emit mode (no "native:" summary line, 2/3 differ), and ~20
       drivers remain (scripts/fuzz/*, scripts/verify/*, enc-oracle,
       tests/harness.rs, verify.sh family).
-      Done (Nov 15): `docs/internal-tools.md` lists every script and tool
+      Done (Nov 15): `docs/reference/internal-tools.md` lists every script and tool
       and what keeps it out of Fides. Ported, with the same output as the
       originals (kept): `tools/release_notes.fd` (scripts/release-notes.py)
       and `tools/release_checksums.fd` (scripts/release-checksums.sh); Nov 16,
@@ -3961,7 +3969,7 @@ Trust is built by what we do not break.
       fixed (RT8's `p_str_alloc_uninit` chain in ch.4, a drifted panic
       line number in ch.6, now an `at line ...` match); `book: 0
       failure(s)`.
-- [x] AD7. A cookbook of common tasks (M). `docs/cookbook.md` — args, files,
+- [x] AD7. A cookbook of common tasks (M). `docs/guides/cookbook.md` — args, files,
       collections, strings, JSON, errors, HTTP server/client, config, tasks,
       timing, crypto, testing; recipes use verified stdlib signatures.
 - [x] AD8. Guides for people arriving from Rust, Go, Zig and C (M).
@@ -3974,7 +3982,7 @@ Trust is built by what we do not break.
       real known-bugs/limitations (debug-print gating, scribe readdir,
       non-ASCII CI check, ark stubs, GlobalAddr on other targets).
 - [x] AD11. A compiler internals guide, so others can contribute (M).
-      `docs/compiler-internals.md` — pipeline, IR shapes, pass list + kill
+      `docs/reference/compiler-internals.md` — pipeline, IR shapes, pass list + kill
       switches, calling conventions, lib-facts format, contributor traps.
 
 **Earning users**

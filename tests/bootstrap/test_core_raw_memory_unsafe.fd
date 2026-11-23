@@ -1,0 +1,57 @@
+// Bugs roadmap BG10: core's raw-memory functions need an `unsafe` block
+// (test_core_raw_memory_fail.fd, test_core_str_free_fail.fd); inside one,
+// or in an @unsafe function, they are accepted and work as before.
+// Expected output:
+// 11 22 33
+// 11 22 0
+// 0 0 0
+// copy
+
+// SAFETY: (@unsafe) p is a live block of at least 8 * (i + 1) bytes.
+@unsafe
+fn word_at(p: i64, i: i64) -> i64 {
+    var wp: *mut i64 = (p + i * 8) as *mut i64;
+    return *wp;
+}
+
+fn main() -> i64 {
+    var a: i64 = 0;
+    var b: i64 = 0;
+    // SAFETY: two fresh 24-byte blocks, freed at the end of main.
+    unsafe {
+        a = p_malloc(24);
+        b = p_malloc(24);
+    }
+    var i: i64 = 0;
+    while i < 3 {
+        // SAFETY: word i < 3 of a's 24 bytes.
+        unsafe {
+            val wp: *mut i64 = (a + i * 8) as *mut i64;
+            *wp = (i + 1) * 11;
+        }
+        i = i + 1;
+    }
+    // SAFETY: a and b hold 3 words (24 bytes) each and do not overlap.
+    unsafe {
+        p_copy_words(b, a, 3);
+        println(int_to_str(word_at(b, 0)) + " " + int_to_str(word_at(b, 1)) + " " + int_to_str(word_at(b, 2)));
+        p_zero_words(b + 16, 1);
+        println(int_to_str(word_at(b, 0)) + " " + int_to_str(word_at(b, 1)) + " " + int_to_str(word_at(b, 2)));
+        p_zero_words(a, 3);
+        p_mem_copy(b, a, 24);
+        println(int_to_str(word_at(b, 0)) + " " + int_to_str(word_at(b, 1)) + " " + int_to_str(word_at(b, 2)));
+    }
+    val r: i64 = p_str_buf(4);
+    // SAFETY: r is the fresh 4-byte string p_str_buf just made; "copy" has
+    // 4 bytes; p_str_adopt takes over r, which nothing else holds.
+    unsafe {
+        p_str_copy_n(r, "copy" as i64, 4);
+        println(p_str_adopt(r));
+    }
+    // SAFETY: a and b are this function's blocks, not used again.
+    unsafe {
+        p_free(a);
+        p_free(b);
+    }
+    return 0;
+}

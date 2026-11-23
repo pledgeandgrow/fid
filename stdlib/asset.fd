@@ -116,7 +116,13 @@ pub fn asset_load_texture(path: str) -> i64 {
     }
 
     // Load via SDL_image
-    var handle = pledge_asset_load_texture(path);
+    var handle: i64 = 0;
+    // SAFETY: the helper reads the NUL-terminated text of path (a Fides
+    // str alive for the call) and returns a new texture handle or 0;
+    // it is given no other memory.
+    unsafe {
+        handle = pledge_asset_load_texture(path);
+    }
     if handle == 0 {
         return -1;
     }
@@ -139,8 +145,16 @@ pub fn asset_load_sound(path: str) -> i64 {
         return idx;
     }
 
-    var handle = pledge_asset_load_sound(path);
-    if handle == 0 {
+    var handle: i64 = 0;
+    // SAFETY: the helper (runtime/pledge_asset.c) reads the NUL-terminated
+    // text of path (a Fides str alive for the call) and returns the
+    // sound's index in pledge_audio's cache (0 or more) or -1; it is given
+    // no other memory.
+    unsafe {
+        handle = pledge_asset_load_sound(path);
+    }
+    // (an index: 0 is the first sound loaded, not a failure)
+    if handle < 0 {
         return -1;
     }
 
@@ -162,7 +176,13 @@ pub fn asset_load_font(path: str, size: f64) -> i64 {
         return idx;
     }
 
-    var handle = pledge_asset_load_font(path, size);
+    var handle: i64 = 0;
+    // SAFETY: the helper reads the NUL-terminated text of path (a Fides
+    // str alive for the call) (size is a value) and returns a new font handle or 0;
+    // it is given no other memory.
+    unsafe {
+        handle = pledge_asset_load_font(path, size);
+    }
     if handle == 0 {
         return -1;
     }
@@ -185,7 +205,13 @@ pub fn asset_load_mesh(path: str) -> i64 {
         return idx;
     }
 
-    var handle = pledge_asset_load_mesh(path);
+    var handle: i64 = 0;
+    // SAFETY: the helper reads the NUL-terminated text of path (a Fides
+    // str alive for the call) and returns a new mesh handle or 0;
+    // it is given no other memory.
+    unsafe {
+        handle = pledge_asset_load_mesh(path);
+    }
     if handle == 0 {
         return -1;
     }
@@ -264,7 +290,13 @@ pub fn asset_release(idx: i64) -> void {
         entry.ref_count = entry.ref_count - 1;
     }
     if entry.ref_count == 0 && entry.loaded {
-        pledge_asset_unload(entry.handle, entry.asset_type);
+        // SAFETY: entry.loaded: entry.handle is the live handle the
+        // matching pledge_asset_load_* returned (0 for a text asset); it is
+        // marked unloaded right after and stored back, so it is unloaded
+        // only once.
+        unsafe {
+            pledge_asset_unload(entry.handle, entry.asset_type);
+        }
         entry.loaded = false;
         g_asset_mgr.total_loaded = g_asset_mgr.total_loaded - 1;
     }
@@ -278,7 +310,13 @@ pub fn asset_unload(idx: i64) -> void {
     }
     var entry = g_asset_mgr.assets.get(idx);
     if entry.loaded {
-        pledge_asset_unload(entry.handle, entry.asset_type);
+        // SAFETY: entry.loaded: entry.handle is the live handle the
+        // matching pledge_asset_load_* returned (0 for a text asset); it is
+        // marked unloaded right after and stored back, so it is unloaded
+        // only once.
+        unsafe {
+            pledge_asset_unload(entry.handle, entry.asset_type);
+        }
         entry.loaded = false;
         entry.ref_count = 0;
         g_asset_mgr.total_loaded = g_asset_mgr.total_loaded - 1;
@@ -295,19 +333,29 @@ pub fn asset_reload(idx: i64) -> bool {
 
     // Unload old
     if entry.loaded {
-        pledge_asset_unload(entry.handle, entry.asset_type);
+        // SAFETY: entry.loaded: entry.handle is the live handle the
+        // matching pledge_asset_load_* returned. Below it is replaced by
+        // the new handle, or, when the load fails, cleared and marked
+        // unloaded, so it is never unloaded a second time.
+        unsafe {
+            pledge_asset_unload(entry.handle, entry.asset_type);
+        }
     }
 
     // Reload
-    var new_handle = 0;
-    if entry.asset_type == ASSET_TEXTURE {
-        new_handle = pledge_asset_load_texture(entry.path);
-    } else if entry.asset_type == ASSET_SOUND {
-        new_handle = pledge_asset_load_sound(entry.path);
-    } else if entry.asset_type == ASSET_FONT {
-        new_handle = pledge_asset_load_font(entry.path, 16.0);
-    } else if entry.asset_type == ASSET_MESH {
-        new_handle = pledge_asset_load_mesh(entry.path);
+    var new_handle: i64 = 0;
+    // SAFETY: each helper reads the NUL-terminated text of entry.path (a
+    // Fides str the entry keeps alive) and returns a new handle or 0.
+    unsafe {
+        if entry.asset_type == ASSET_TEXTURE {
+            new_handle = pledge_asset_load_texture(entry.path);
+        } else if entry.asset_type == ASSET_SOUND {
+            new_handle = pledge_asset_load_sound(entry.path);
+        } else if entry.asset_type == ASSET_FONT {
+            new_handle = pledge_asset_load_font(entry.path, 16.0);
+        } else if entry.asset_type == ASSET_MESH {
+            new_handle = pledge_asset_load_mesh(entry.path);
+        }
     }
 
     if new_handle != 0 {
@@ -315,6 +363,15 @@ pub fn asset_reload(idx: i64) -> bool {
         entry.loaded = true;
         g_asset_mgr.assets.set(idx, entry);
         return true;
+    }
+    // The old handle was unloaded above: do not keep it as loaded, or a
+    // later asset_release/asset_unload would unload it a second time.
+    // (A text asset has no handle, 0, and stays as it was.)
+    if entry.loaded && entry.handle != 0 {
+        entry.handle = 0;
+        entry.loaded = false;
+        g_asset_mgr.total_loaded = g_asset_mgr.total_loaded - 1;
+        g_asset_mgr.assets.set(idx, entry);
     }
     return false;
 }
@@ -326,7 +383,13 @@ pub fn asset_hot_reload() -> i64 {
     while i < g_asset_mgr.assets.len() {
         var entry = g_asset_mgr.assets.get(i);
         if entry.loaded {
-            var mtime = pledge_asset_mtime(entry.path);
+            var mtime: i64 = 0;
+            // SAFETY: the helper reads the NUL-terminated text of
+            // entry.path (a Fides str the entry keeps alive) and returns a
+            // modification time.
+            unsafe {
+                mtime = pledge_asset_mtime(entry.path);
+            }
             if mtime > entry.last_modified {
                 if asset_reload(i) {
                     reloaded = reloaded + 1;

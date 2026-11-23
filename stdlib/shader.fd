@@ -210,19 +210,24 @@ pub fn material_bind(mat: &Material) -> void {
     if !mat.valid {
         return;
     }
-    gl_use_program(mat.program);
+    // SAFETY: glUseProgram, glEnable and glDisable take a program name or
+    // a GLenum constant by value; mat.program is the name
+    // material_create(_custom) got (mat.valid), and no memory is passed.
+    unsafe {
+        gl_use_program(mat.program);
 
-    // Set render state
-    if mat.depth_test {
-        gl_enable(GL_DEPTH_TEST);
-    } else {
-        gl_disable(GL_DEPTH_TEST);
-    }
+        // Set render state
+        if mat.depth_test {
+            gl_enable(GL_DEPTH_TEST);
+        } else {
+            gl_disable(GL_DEPTH_TEST);
+        }
 
-    if mat.cull_mode != CULL_NONE {
-        gl_enable(GL_CULL_FACE);
-    } else {
-        gl_disable(GL_CULL_FACE);
+        if mat.cull_mode != CULL_NONE {
+            gl_enable(GL_CULL_FACE);
+        } else {
+            gl_disable(GL_CULL_FACE);
+        }
     }
 
     // Set uniforms
@@ -234,19 +239,27 @@ pub fn material_bind(mat: &Material) -> void {
             u.location = gl_get_uniform(mat.program, u.name);
         }
         if u.location >= 0 {
-            if u.kind == UNIFORM_FLOAT {
-                gl_uniform_1f(u.location, u.float_val);
-            } else if u.kind == UNIFORM_INT {
-                gl_uniform_1i(u.location, u.int_val);
-            } else if u.kind == UNIFORM_VEC3 {
-                gl_uniform_3f(u.location, u.vec_val.x, u.vec_val.y, u.vec_val.z);
-            } else if u.kind == UNIFORM_VEC4 {
-                gl_uniform_4f(u.location, u.vec_val.x, u.vec_val.y, u.vec_val.z, u.vec_val.w);
-            } else if u.kind == UNIFORM_MAT4 {
-                gl_uniform_matrix_4fv(u.location, 1, 0, 0);
-                // native: pass &mat_val
-            } else if u.kind == UNIFORM_TEXTURE {
-                gl_uniform_1i(u.location, u.texture_unit);
+            if u.kind == UNIFORM_MAT4 {
+                // (before: value = 0, a null pointer GL read 16 floats
+                // from; now the matrix's own 16 floats, shader_set_mat4)
+                shader_set_mat4(u.location, u.mat_val);
+            } else {
+                // SAFETY: the glUniform{1f,1i,3f,4f} calls take a location
+                // (from glGetUniformLocation, >= 0 here) and values only;
+                // a type mismatch is a GL error, not a memory access.
+                unsafe {
+                    if u.kind == UNIFORM_FLOAT {
+                        gl_uniform_1f(u.location, u.float_val);
+                    } else if u.kind == UNIFORM_INT {
+                        gl_uniform_1i(u.location, u.int_val);
+                    } else if u.kind == UNIFORM_VEC3 {
+                        gl_uniform_3f(u.location, u.vec_val.x, u.vec_val.y, u.vec_val.z);
+                    } else if u.kind == UNIFORM_VEC4 {
+                        gl_uniform_4f(u.location, u.vec_val.x, u.vec_val.y, u.vec_val.z, u.vec_val.w);
+                    } else if u.kind == UNIFORM_TEXTURE {
+                        gl_uniform_1i(u.location, u.texture_unit);
+                    }
+                }
             }
         }
         i = i + 1;
@@ -272,7 +285,13 @@ pub fn material_set_depth(mat: &mut Material, test: bool, write: bool) -> void {
 /// Destroy the material (delete shader program).
 pub fn material_destroy(mat: &mut Material) -> void {
     if mat.valid && mat.program != 0 {
-        gl_delete_program(mat.program);
+        // SAFETY: glDeleteProgram takes a GL name by value, not an address:
+        // mat.program is the nonzero program material_create(_custom)
+        // made, zeroed right after; a stale name (a copy of mat destroyed
+        // twice) is ignored or a GL error, not a memory access.
+        unsafe {
+            gl_delete_program(mat.program);
+        }
         mat.program = 0;
         mat.valid = false;
     }
@@ -349,4 +368,106 @@ pub fn material_cache_clear(cache: &mut MaterialCache) -> void {
 /// Get the number of cached materials.
 pub fn material_cache_count(cache: &MaterialCache) -> i64 {
     return cache.materials.len();
+}
+
+// ─── A mat4 uniform as GL reads it ────────────────────────────────────
+
+/// The 32 bits of x rounded to single precision (nearest, ties to even;
+/// infinities, NaN and subnormals as IEEE 754 binary32 has them). The same
+/// conversion as iec104_f32_bits.
+@wrapping
+fn shader_f32_bits(x: f64) -> i64 {
+    val bits: i64 = p_f64_to_bits(x);
+    val sign: i64 = (((bits as u64) >> (63 as u64)) as i64) << 31;
+    val e: i64 = (bits >> 52) & 2047;
+    val m: i64 = bits & 4503599627370495;
+    if e == 2047 {
+        if m == 0 {
+            return sign | 0x7f800000;
+        }
+        return sign | 0x7fc00000 | ((m >> 29) & 4194303);
+    }
+    if e == 0 {
+        return sign;
+    }
+    val ex: i64 = e - 1023;
+    var full: i64 = m | 4503599627370496;
+    var shift: i64 = 29;
+    var biased: i64 = ex + 127;
+    if biased <= 0 {
+        shift = 29 + 1 - biased;
+        biased = 0;
+        if shift > 54 {
+            return sign;
+        }
+    }
+    var mant: i64 = full >> shift;
+    val rem: i64 = full & ((1 << shift) - 1);
+    val half: i64 = 1 << (shift - 1);
+    if rem > half || (rem == half && (mant & 1) == 1) {
+        mant = mant + 1;
+    }
+    if biased == 0 {
+        return sign | mant;
+    }
+    if mant >= 16777216 {
+        mant = mant >> 1;
+        biased = biased + 1;
+    }
+    if biased >= 255 {
+        return sign | 0x7f800000;
+    }
+    return sign | (biased << 23) | (mant & 8388607);
+}
+
+/// Store x as a little-endian GLfloat at byte `i` of the block `buf`.
+fn shader_put_f32(buf: i64, i: i64, x: f64) {
+    val b: i64 = shader_f32_bits(x);
+    var k: i64 = 0;
+    while k < 4 {
+        // SAFETY: shader_set_mat4's only caller passes buf, a 64-byte block
+        // it allocated, and i = 4 * j for j in 0..16, so buf + i + k (k < 4)
+        // is inside it.
+        unsafe {
+            var q: *mut u8 = (buf + i + k) as *mut u8;
+            *q = (b >> (8 * k)) & 255;
+        }
+        k = k + 1;
+    }
+}
+
+/// Set the mat4 uniform at `location` to m: its 16 values rounded to
+/// GLfloats in GL's column-major order (mRC is row R, column C: translate
+/// puts x in m03), passed with transpose = GL_FALSE.
+fn shader_set_mat4(location: i64, m: mat4) {
+    var buf: i64 = 0;
+    // SAFETY: only allocates a fresh 64-byte block (16 GLfloats); p_malloc
+    // panics when out of memory, so buf is never short.
+    unsafe {
+        buf = p_malloc(64);
+    }
+    shader_put_f32(buf, 0, m.m00);
+    shader_put_f32(buf, 4, m.m10);
+    shader_put_f32(buf, 8, m.m20);
+    shader_put_f32(buf, 12, m.m30);
+    shader_put_f32(buf, 16, m.m01);
+    shader_put_f32(buf, 20, m.m11);
+    shader_put_f32(buf, 24, m.m21);
+    shader_put_f32(buf, 28, m.m31);
+    shader_put_f32(buf, 32, m.m02);
+    shader_put_f32(buf, 36, m.m12);
+    shader_put_f32(buf, 40, m.m22);
+    shader_put_f32(buf, 44, m.m32);
+    shader_put_f32(buf, 48, m.m03);
+    shader_put_f32(buf, 52, m.m13);
+    shader_put_f32(buf, 56, m.m23);
+    shader_put_f32(buf, 60, m.m33);
+    // SAFETY: count = 1, so glUniformMatrix4fv reads exactly 16 GLfloats
+    // (64 bytes) from buf, all written above; location is a uniform
+    // location >= 0 (the caller checks). GL copies the values before it
+    // returns, so buf is freed once right after and not used again.
+    unsafe {
+        gl_uniform_matrix_4fv(location, 1, 0, buf);
+        p_free(buf);
+    }
 }

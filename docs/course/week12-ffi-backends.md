@@ -2,8 +2,8 @@
 
 **Reading:** reference §2.10 (`extern "C"`) and §8.5; book chapters 7
 ("Talking to C") and 10 (`docs/book/10-shipping.md`);
-`docs/reference/language-guide.md` §8 (back ends); `docs/cpp-interop.md`;
-`docs/compiler-internals.md`.
+`docs/reference/language-guide.md` §8 (back ends); `docs/guides/cpp-interop.md`;
+`docs/reference/compiler-internals.md`.
 
 **After this week you can:** call a C library from Fid and say which
 safety guarantees stop at the boundary; build the same program for the

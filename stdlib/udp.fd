@@ -90,7 +90,12 @@ const UD_ADDR_MAX: i64 = 128;
 /// A zeroed block of n bytes (0 when the allocation fails); the caller
 /// frees it with p_free.
 fn ud_block(n: i64) -> i64 {
-    val b: i64 = p_malloc(n);
+    var b: i64 = 0;
+    // SAFETY: p_malloc only allocates a fresh n-byte block; it is zeroed
+    // below before the caller reads it.
+    unsafe {
+        b = p_malloc(n);
+    }
     if b == 0 {
         return 0;
     }
@@ -103,7 +108,7 @@ fn ud_block(n: i64) -> i64 {
 }
 
 fn ud_put(buf: i64, off: i64, v: i64) {
-    var p: *mut u8 = buf + off;
+    var p: *mut u8 = (buf + off) as *mut u8;
     // SAFETY: every caller passes an offset inside a block it allocated
     // with ud_block or p_malloc at a size covering it.
     unsafe {
@@ -112,7 +117,7 @@ fn ud_put(buf: i64, off: i64, v: i64) {
 }
 
 fn ud_get(buf: i64, off: i64) -> i64 {
-    var p: *mut u8 = buf + off;
+    var p: *mut u8 = (buf + off) as *mut u8;
     var b: i64 = 0;
     // SAFETY: as ud_put: inside a block the caller allocated.
     unsafe {
@@ -224,11 +229,22 @@ var g_udp_wsa: bool = false;
 fn ud_os_socket(af: i64) -> i64 {
     if !g_udp_wsa {
         val data: i64 = ud_block(512);
-        uw_startup(0x0202, data);
-        p_free(data);
+        // SAFETY: WSAStartup writes one WSADATA (about 400 bytes on x64)
+        // at data, a zeroed 512-byte block of ours (0 when the allocation
+        // failed: Winsock then returns WSAEFAULT and writes nothing); the
+        // block is freed right after and not used again.
+        unsafe {
+            uw_startup(0x0202, data);
+            p_free(data);
+        }
         g_udp_wsa = true;
     }
-    val s: i64 = uw_socket(af, UD_SOCK_DGRAM, UD_IPPROTO_UDP);
+    var s: i64 = 0;
+    // SAFETY: socket() takes three integers and returns a SOCKET or
+    // INVALID_SOCKET; no memory of ours is touched.
+    unsafe {
+        s = uw_socket(af, UD_SOCK_DGRAM, UD_IPPROTO_UDP);
+    }
     if s == -1 || s == 0 {
         return -1;
     }
@@ -236,15 +252,27 @@ fn ud_os_socket(af: i64) -> i64 {
     // datagram would otherwise fail every later recvfrom
     val off: i64 = ud_block(8);
     val done: i64 = ud_block(8);
-    uw_ioctl(s, 0x9800000C, off, 4, 0, 0, done, 0, 0);
-    p_free(off);
-    p_free(done);
+    // SAFETY: WSAIoctl reads 4 bytes at off (a zeroed BOOL FALSE, inside
+    // its 8-byte block), has no output buffer (0, 0), and writes the 4-byte
+    // byte count at done (an 8-byte block); no overlapped call, so it is
+    // finished on return and both blocks are freed and not used again.
+    // A 0 block (allocation failed) only makes it fail with WSAEFAULT.
+    unsafe {
+        uw_ioctl(s, 0x9800000C, off, 4, 0, 0, done, 0, 0);
+        p_free(off);
+        p_free(done);
+    }
     return s;
 }
 
 @cfg(unix)
 fn ud_os_socket(af: i64) -> i64 {
-    val s: i64 = ux_socket(af, UD_SOCK_DGRAM, UD_IPPROTO_UDP) as i64;
+    var s: i64 = 0;
+    // SAFETY: socket() takes three integers and returns a descriptor or
+    // -1; no memory of ours is touched.
+    unsafe {
+        s = ux_socket(af, UD_SOCK_DGRAM, UD_IPPROTO_UDP) as i64;
+    }
     if s < 0 {
         return -1;
     }
@@ -253,20 +281,35 @@ fn ud_os_socket(af: i64) -> i64 {
 
 @cfg(windows)
 fn ud_os_bind(s: i64, sa: i64, len: i64) -> i64 {
-    return uw_bind(s, sa, len) as i64;
+    // SAFETY: bind reads len bytes at sa; its one caller (udp_bind) passes
+    // a 128-byte ud_block and the length ud_write_sockaddr wrote (16 or
+    // 28). A bad socket only gives an error.
+    unsafe {
+        return uw_bind(s, sa, len) as i64;
+    }
 }
 
 @cfg(unix)
 fn ud_os_bind(s: i64, sa: i64, len: i64) -> i64 {
-    return ux_bind(s, sa, len) as i64;
+    // SAFETY: bind reads len bytes at sa; its one caller (udp_bind) passes
+    // a 128-byte ud_block and the length ud_write_sockaddr wrote (16 or
+    // 28). A bad descriptor only gives -1.
+    unsafe {
+        return ux_bind(s, sa, len) as i64;
+    }
 }
 
 @cfg(windows)
 fn ud_os_setopt(s: i64, level: i64, name: i64, value: i64) -> i64 {
     val b: i64 = ud_block(8);
     ud_put32le(b, 0, value);
-    val r: i64 = uw_setsockopt(s, level, name, b, 4) as i64;
-    p_free(b);
+    var r: i64 = 0;
+    // SAFETY: setsockopt reads the 4-byte int at b (inside the 8-byte
+    // block written just above); b is then freed and not used again.
+    unsafe {
+        r = uw_setsockopt(s, level, name, b, 4) as i64;
+        p_free(b);
+    }
     return r;
 }
 
@@ -274,40 +317,75 @@ fn ud_os_setopt(s: i64, level: i64, name: i64, value: i64) -> i64 {
 fn ud_os_setopt(s: i64, level: i64, name: i64, value: i64) -> i64 {
     val b: i64 = ud_block(8);
     ud_put32le(b, 0, value);
-    val r: i64 = ux_setsockopt(s, level, name, b, 4) as i64;
-    p_free(b);
+    var r: i64 = 0;
+    // SAFETY: setsockopt reads the 4-byte int at b (inside the 8-byte
+    // block written just above); b is then freed and not used again.
+    unsafe {
+        r = ux_setsockopt(s, level, name, b, 4) as i64;
+        p_free(b);
+    }
     return r;
 }
 
 @cfg(windows)
 fn ud_os_sendto(s: i64, buf: i64, n: i64, sa: i64, len: i64) -> i64 {
-    return uw_sendto(s, buf, n, 0, sa, len) as i64;
+    // SAFETY: sendto reads n bytes at buf and len bytes at sa; its caller
+    // (udp_send_on) passes a block of max(n, 1) bytes it filled and the
+    // 128-byte sockaddr block with the length ud_write_sockaddr wrote.
+    unsafe {
+        return uw_sendto(s, buf, n, 0, sa, len) as i64;
+    }
 }
 
 @cfg(unix)
 fn ud_os_sendto(s: i64, buf: i64, n: i64, sa: i64, len: i64) -> i64 {
-    return ux_sendto(s, buf, n, 0, sa, len);
+    // SAFETY: sendto reads n bytes at buf and len bytes at sa; its caller
+    // (udp_send_on) passes a block of max(n, 1) bytes it filled and the
+    // 128-byte sockaddr block with the length ud_write_sockaddr wrote.
+    unsafe {
+        return ux_sendto(s, buf, n, 0, sa, len);
+    }
 }
 
 /// recvfrom with a 4-byte length cell `lenp` holding the address room.
 @cfg(windows)
 fn ud_os_recvfrom(s: i64, buf: i64, n: i64, sa: i64, lenp: i64) -> i64 {
-    return uw_recvfrom(s, buf, n, 0, sa, lenp) as i64;
+    // SAFETY: recvfrom writes at most n bytes at buf, at most *lenp bytes
+    // at sa and the 4-byte length at lenp; its caller (udp_recv) passes a
+    // max-byte block for n = max, a 128-byte sa and *lenp = 128.
+    unsafe {
+        return uw_recvfrom(s, buf, n, 0, sa, lenp) as i64;
+    }
 }
 
 @cfg(unix)
 fn ud_os_recvfrom(s: i64, buf: i64, n: i64, sa: i64, lenp: i64) -> i64 {
-    return ux_recvfrom(s, buf, n, 0, sa, lenp);
+    // SAFETY: recvfrom writes at most n bytes at buf, at most *lenp bytes
+    // at sa and the 4-byte socklen_t at lenp; its caller (udp_recv) passes
+    // a max-byte block for n = max, a 128-byte sa and *lenp = 128.
+    unsafe {
+        return ux_recvfrom(s, buf, n, 0, sa, lenp);
+    }
 }
 
 @cfg(windows)
 fn ud_os_getsockname(s: i64, sa: i64, lenp: i64) -> i64 {
-    return uw_getsockname(s, sa, lenp) as i64;
+    // SAFETY: getsockname writes at most *lenp bytes at sa and the length
+    // at lenp; its caller (udp_local_addr) passes a 128-byte sa and an
+    // 8-byte lenp holding 128.
+    unsafe {
+        return uw_getsockname(s, sa, lenp) as i64;
+    }
 }
 
 @cfg(unix)
 fn ud_os_getsockname(s: i64, sa: i64, lenp: i64) -> i64 {
-    return ux_getsockname(s, sa, lenp) as i64;
+    // SAFETY: getsockname writes at most *lenp bytes at sa and the length
+    // at lenp; its caller (udp_local_addr) passes a 128-byte sa and an
+    // 8-byte lenp holding 128.
+    unsafe {
+        return ux_getsockname(s, sa, lenp) as i64;
+    }
 }
 
 /// Whether a datagram (or an error to collect) is waiting, within
@@ -320,9 +398,18 @@ fn ud_os_wait(s: i64, timeout_ms: i64) -> bool {
     ud_put32le(fds, 4, s >> 32);
     ud_put(fds, 8, 0x00);
     ud_put(fds, 9, 0x01);
-    val r: i64 = uw_poll(fds, 1, timeout_ms) as i64;
+    var r: i64 = 0;
+    // SAFETY: WSAPoll reads and writes one 16-byte WSAPOLLFD at fds (the
+    // 16-byte block filled above) and nothing else.
+    unsafe {
+        r = uw_poll(fds, 1, timeout_ms) as i64;
+    }
     val rev: i64 = ud_get(fds, 10) | (ud_get(fds, 11) << 8);
-    p_free(fds);
+    // SAFETY: fds is this call's ud_block (p_malloc) block; revents was
+    // read out of it above and nothing uses it after this.
+    unsafe {
+        p_free(fds);
+    }
     return r > 0 && rev != 0;
 }
 
@@ -368,23 +455,41 @@ fn ud_os_wait(s: i64, timeout_ms: i64) -> bool {
         val tv: i64 = ud_block(16);
         ud_put32le(tv, 0, timeout_ms / 1000);
         ud_put32le(tv, 8, (timeout_ms % 1000) * 1000);
-        ux_setsockopt(s, k.get(0), k.get(1), tv, 16);
-        p_free(tv);
+        // SAFETY: setsockopt reads the 16-byte struct timeval at tv (the
+        // 16-byte block written above); tv is then freed and not reused.
+        unsafe {
+            ux_setsockopt(s, k.get(0), k.get(1), tv, 16);
+            p_free(tv);
+        }
     }
     val one: i64 = ud_block(8);
-    val r: i64 = ux_recvfrom(s, one, 1, flags, 0, 0);
-    p_free(one);
+    var r: i64 = 0;
+    // SAFETY: recvfrom writes at most 1 byte at one (an 8-byte block) and,
+    // with a null address and length, no address; one is then freed and
+    // not used again.
+    unsafe {
+        r = ux_recvfrom(s, one, 1, flags, 0, 0);
+        p_free(one);
+    }
     return r >= 0;
 }
 
 @cfg(windows)
 fn ud_os_close(s: i64) {
-    uw_close(s);
+    // SAFETY: closesocket takes the SOCKET value only; a bad one gives an
+    // error, no memory of ours is touched.
+    unsafe {
+        uw_close(s);
+    }
 }
 
 @cfg(unix)
 fn ud_os_close(s: i64) {
-    ux_close(s);
+    // SAFETY: close takes the descriptor only; a bad one gives -1, no
+    // memory of ours is touched.
+    unsafe {
+        ux_close(s);
+    }
 }
 
 // ─── Addresses ──────────────────────────────────────────────────────────
@@ -899,7 +1004,11 @@ pub fn udp_bind(sock: i64, a: &UdpAddr) -> bool {
     }
     val len: i64 = ud_write_sockaddr(sa, a);
     val r: i64 = ud_os_bind(sock, sa, len);
-    p_free(sa);
+    // SAFETY: sa is this call's ud_block (p_malloc) block; bind has
+    // returned, so nothing reads it after this.
+    unsafe {
+        p_free(sa);
+    }
     return r == 0;
 }
 
@@ -931,8 +1040,12 @@ pub fn udp_local_addr(sock: i64) -> UdpAddr {
     if ud_os_getsockname(sock, sa, lenp) == 0 {
         a = ud_read_sockaddr(sa);
     }
-    p_free(sa);
-    p_free(lenp);
+    // SAFETY: sa and lenp are this call's ud_block (p_malloc) blocks; the
+    // address was copied into a above and neither is used after this.
+    unsafe {
+        p_free(sa);
+        p_free(lenp);
+    }
     return a;
 }
 
@@ -961,7 +1074,11 @@ pub fn udp_send_on(sock: i64, sock_family: i64, data: Vec<i64>, to: &UdpAddr) ->
     if room < 1 {
         room = 1;
     }
-    val buf: i64 = p_malloc(room);
+    var buf: i64 = 0;
+    // SAFETY: p_malloc only allocates a fresh room-byte block, filled below.
+    unsafe {
+        buf = p_malloc(room);
+    }
     val sa: i64 = ud_block(UD_ADDR_MAX);
     if buf == 0 || sa == 0 {
         return -1;
@@ -973,8 +1090,12 @@ pub fn udp_send_on(sock: i64, sock_family: i64, data: Vec<i64>, to: &UdpAddr) ->
     }
     val len: i64 = ud_write_sockaddr(sa, &dest);
     val r: i64 = ud_os_sendto(sock, buf, n, sa, len);
-    p_free(buf);
-    p_free(sa);
+    // SAFETY: buf (p_malloc) and sa (ud_block) are this call's blocks;
+    // sendto has returned, so nothing reads them after this.
+    unsafe {
+        p_free(buf);
+        p_free(sa);
+    }
     if r < 0 {
         return -1;
     }
@@ -1008,7 +1129,11 @@ pub fn udp_recv(sock: i64, max: i64, timeout_ms: i64, from: &mut UdpAddr) -> Vec
     if !udp_wait(sock, timeout_ms) {
         return ud_none();
     }
-    val buf: i64 = p_malloc(max);
+    var buf: i64 = 0;
+    // SAFETY: p_malloc only allocates a fresh max-byte block for recvfrom.
+    unsafe {
+        buf = p_malloc(max);
+    }
     val sa: i64 = ud_block(UD_ADDR_MAX);
     val lenp: i64 = ud_block(8);
     if buf == 0 || sa == 0 || lenp == 0 {
@@ -1034,9 +1159,14 @@ pub fn udp_recv(sock: i64, max: i64, timeout_ms: i64, from: &mut UdpAddr) -> Vec
         from.port = plain.port;
         from.scope = plain.scope;
     }
-    p_free(buf);
-    p_free(sa);
-    p_free(lenp);
+    // SAFETY: buf (p_malloc), sa and lenp (ud_block) are this call's
+    // blocks; the datagram and the sender were copied out above, and none
+    // of them is used after this.
+    unsafe {
+        p_free(buf);
+        p_free(sa);
+        p_free(lenp);
+    }
     return out;
 }
 

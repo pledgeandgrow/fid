@@ -130,95 +130,156 @@ pub const GL_ONE_MINUS_SRC_ALPHA: i64 = 0x0303;
 
 /// Initialize OpenGL state (enable depth testing, etc.)
 pub fn gl_init() -> void {
-    gl_enable(GL_DEPTH_TEST);
-    gl_enable(GL_CULL_FACE);
-    gl_clear_color(0.1, 0.1, 0.2, 1.0);
+    // SAFETY: glEnable and glClearColor take a GLenum constant and four
+    // colour components by value; they read and write no caller memory.
+    unsafe {
+        gl_enable(GL_DEPTH_TEST);
+        gl_enable(GL_CULL_FACE);
+        gl_clear_color(0.1, 0.1, 0.2, 1.0);
+    }
 }
 
 /// Clear the screen.
 pub fn gl_clear_screen() -> void {
-    gl_clear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    // SAFETY: glClear takes a bit mask by value (two GL_*_BUFFER_BIT
+    // constants); it touches only the GL framebuffer, no caller memory.
+    unsafe {
+        gl_clear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    }
 }
 
 /// Set the viewport.
 pub fn gl_set_viewport(w: i64, h: i64) -> void {
-    gl_viewport(0, 0, w, h);
+    // SAFETY: glViewport takes four integers by value; a negative w or h is
+    // reported as GL_INVALID_VALUE, not a memory access.
+    unsafe {
+        gl_viewport(0, 0, w, h);
+    }
 }
 
 /// Check for OpenGL errors. Returns 0 if no error.
 pub fn gl_check_errors() -> i64 {
-    return gl_get_error();
+    // SAFETY: glGetError takes no arguments and only returns the context's
+    // error flag.
+    unsafe {
+        return gl_get_error();
+    }
 }
 
 /// Generate a single buffer object.
 pub fn gl_gen_buffer() -> i64 {
-    var buf: Vec<i64> = Vec::new();
-    buf.push(0);
-    gl_gen_buffers(1, 0);
-    // native: pass &buf[0]
-    return buf.get(0);
+    // glGenBuffers writes one GLuint into the zeroed word of an out block
+    // (it used to be handed a null pointer, so no name ever came back)
+    val out: i64 = gl_out_block(0);
+    // SAFETY: n = 1, so glGenBuffers writes one 4-byte GLuint at out, the
+    // 8-byte block gl_out_block just allocated.
+    unsafe {
+        gl_gen_buffers(1, out);
+    }
+    val name: i64 = gl_out_word(out);
+    gl_free_block(out);
+    return name;
 }
 
 /// Generate a single vertex array object.
 pub fn gl_gen_vertex_array() -> i64 {
-    var arr: Vec<i64> = Vec::new();
-    arr.push(0);
-    gl_gen_vertex_arrays(1, 0);
-    // native: pass &arr[0]
-    return arr.get(0);
+    val out: i64 = gl_out_block(0);
+    // SAFETY: n = 1, so glGenVertexArrays writes one 4-byte GLuint at out,
+    // the 8-byte block gl_out_block just allocated.
+    unsafe {
+        gl_gen_vertex_arrays(1, out);
+    }
+    val name: i64 = gl_out_word(out);
+    gl_free_block(out);
+    return name;
 }
 
 /// Generate a single texture.
 pub fn gl_gen_texture() -> i64 {
-    var tex: Vec<i64> = Vec::new();
-    tex.push(0);
-    gl_gen_textures(1, 0);
-    // native: pass &tex[0]
-    return tex.get(0);
+    val out: i64 = gl_out_block(0);
+    // SAFETY: n = 1, so glGenTextures writes one 4-byte GLuint at out, the
+    // 8-byte block gl_out_block just allocated.
+    unsafe {
+        gl_gen_textures(1, out);
+    }
+    val name: i64 = gl_out_word(out);
+    gl_free_block(out);
+    return name;
 }
 
 /// Delete a single buffer.
 pub fn gl_delete_buffer(buf: i64) -> void {
-    var bufs: Vec<i64> = Vec::new();
-    bufs.push(buf);
-    gl_delete_buffers(1, 0);
+    // a one-element GLuint array: the name in the low 4 bytes of the word
+    // (it used to pass a null pointer, so nothing was deleted)
+    val names: i64 = gl_out_block(buf);
+    // SAFETY: n = 1, so glDeleteBuffers reads one 4-byte GLuint at names,
+    // the 8-byte block gl_out_block just filled; an unknown name is ignored.
+    unsafe {
+        gl_delete_buffers(1, names);
+    }
+    gl_free_block(names);
 }
 
 /// Delete a single vertex array.
 pub fn gl_delete_vertex_array(arr: i64) -> void {
-    var arrs: Vec<i64> = Vec::new();
-    arrs.push(arr);
-    gl_delete_vertex_arrays(1, 0);
+    val names: i64 = gl_out_block(arr);
+    // SAFETY: n = 1, so glDeleteVertexArrays reads one 4-byte GLuint at
+    // names, the 8-byte block gl_out_block just filled.
+    unsafe {
+        gl_delete_vertex_arrays(1, names);
+    }
+    gl_free_block(names);
 }
 
 /// Delete a single texture.
 pub fn gl_delete_texture(tex: i64) -> void {
-    var texs: Vec<i64> = Vec::new();
-    texs.push(tex);
-    gl_delete_textures(1, 0);
+    val names: i64 = gl_out_block(tex);
+    // SAFETY: n = 1, so glDeleteTextures reads one 4-byte GLuint at names,
+    // the 8-byte block gl_out_block just filled.
+    unsafe {
+        gl_delete_textures(1, names);
+    }
+    gl_free_block(names);
 }
 
 /// Draw triangles from currently bound VBO data.
 pub fn gl_draw_triangles(first: i64, count: i64) -> void {
-    gl_draw_arrays(GL_TRIANGLES, first, count);
+    // SAFETY: glDrawArrays takes values only; it reads vertices from the
+    // GL-owned buffers bound to the current VAO, not from caller memory.
+    // Attribute ranges past a buffer's end are the GL's to bound-check.
+    unsafe {
+        gl_draw_arrays(GL_TRIANGLES, first, count);
+    }
 }
 
 /// Draw triangles from index buffer.
 pub fn gl_draw_triangles_indexed(count: i64) -> void {
-    gl_draw_elements(GL_TRIANGLES, count, GL_UNSIGNED_INT, 0);
+    // SAFETY: indices = 0 is an offset into the bound GL_ELEMENT_ARRAY_BUFFER
+    // (GL-owned memory), not a pointer into this process: this wrapper is
+    // for an indexed VAO, whose element buffer the caller bound.
+    unsafe {
+        gl_draw_elements(GL_TRIANGLES, count, GL_UNSIGNED_INT, 0);
+    }
 }
 
 /// Set default texture parameters for 2D textures.
 pub fn gl_set_texture_defaults() -> void {
-    gl_tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    gl_tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    gl_tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
-    gl_tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    // SAFETY: glTexParameteri takes three GLenum values; it changes state
+    // of the bound texture object and touches no caller memory.
+    unsafe {
+        gl_tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        gl_tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        gl_tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+        gl_tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    }
 }
 
 /// Enable alpha blending for transparency.
 pub fn gl_enable_blend() -> void {
-    gl_enable(GL_BLEND);
+    // SAFETY: glEnable takes one GLenum constant by value.
+    unsafe {
+        gl_enable(GL_BLEND);
+    }
     // glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA) — needs FFI
 }
 
@@ -292,10 +353,14 @@ pub const GL_COMPILE_STATUS: i64 = 0x8B81;
 pub const GL_LINK_STATUS: i64 = 0x8B82;
 /// An 8-byte block holding `first`: the address array glShaderSource reads,
 /// or the out-parameter a glGet*iv writes (a GLint in its low 4 bytes, so
-/// start it at 0). Read it with gl_out_word; free it with p_free.
+/// start it at 0). Read it with gl_out_word; free it with gl_free_block.
 fn gl_out_block(first: i64) -> i64 {
-    val blk: i64 = p_malloc(8);
-    var p: *mut i64 = blk;
+    var blk: i64 = 0;
+    // SAFETY: p_malloc(8) only allocates; the block is written next.
+    unsafe {
+        blk = p_malloc(8);
+    }
+    var p: *mut i64 = blk as *mut i64;
     // SAFETY: the 8-byte block p_malloc just returned.
     unsafe {
         *p = first;
@@ -303,9 +368,19 @@ fn gl_out_block(first: i64) -> i64 {
     return blk;
 }
 
+/// Free a block from gl_out_block.
+fn gl_free_block(blk: i64) -> void {
+    // SAFETY: every caller passes a block gl_out_block allocated in the
+    // same function, after its last use (gl_out_word copied the word out
+    // first), and frees it once.
+    unsafe {
+        p_free(blk);
+    }
+}
+
 /// The word in a block from gl_out_block.
 fn gl_out_word(blk: i64) -> i64 {
-    var p: *mut i64 = blk;
+    var p: *mut i64 = blk as *mut i64;
     var v: i64 = 0;
     // SAFETY: an 8-byte block from gl_out_block, not yet freed.
     unsafe {
@@ -316,7 +391,12 @@ fn gl_out_word(blk: i64) -> i64 {
 
 /// Compile a shader from source code. Returns shader ID or 0 on failure.
 pub fn gl_compile_shader_src(shader_type: i64, source: str) -> i64 {
-    var shader = gl_create_shader(shader_type);
+    var shader: i64 = 0;
+    // SAFETY: glCreateShader takes a GLenum by value and returns a name
+    // (0 on a bad type); no memory is passed.
+    unsafe {
+        shader = gl_create_shader(shader_type);
+    }
     if shader == 0 {
         return 0;
     }
@@ -324,19 +404,36 @@ pub fn gl_compile_shader_src(shader_type: i64, source: str) -> i64 {
     // glShaderSource takes an array of string pointers: here one, whose
     // text ends in a NUL, so the array of lengths is null
     val srcs: i64 = gl_out_block(source as i64);
-    gl_shader_source(shader, 1, srcs, 0);
-    p_free(srcs);
-    gl_compile_shader(shader);
+    // SAFETY: count = 1: GL reads one pointer from srcs (the 8-byte block
+    // just filled with source's address) and, with a null length array,
+    // the NUL-terminated text of source, which stays alive for the call;
+    // GL copies the text, so srcs may be freed right after.
+    unsafe {
+        gl_shader_source(shader, 1, srcs, 0);
+    }
+    gl_free_block(srcs);
+    // SAFETY: glCompileShader takes the name glCreateShader returned above.
+    unsafe {
+        gl_compile_shader(shader);
+    }
 
     // Check compile status (a GLint written into a zeroed word)
     val status: i64 = gl_out_block(0);
-    gl_get_shader_iv(shader, GL_COMPILE_STATUS, status);
+    // SAFETY: GL_COMPILE_STATUS writes one 4-byte GLint at status, the
+    // 8-byte block gl_out_block just allocated.
+    unsafe {
+        gl_get_shader_iv(shader, GL_COMPILE_STATUS, status);
+    }
     val compiled: i64 = gl_out_word(status);
-    p_free(status);
+    gl_free_block(status);
 
     if compiled == 0 {
         // Compilation failed
-        gl_delete_shader(shader);
+        // SAFETY: deletes the shader created above, which is not returned
+        // or used again.
+        unsafe {
+            gl_delete_shader(shader);
+        }
         return 0;
     }
 
@@ -353,65 +450,113 @@ pub fn gl_create_program_from_src(vert_src: str, frag_src: str) -> i64 {
 
     var frag = gl_compile_shader_src(GL_FRAGMENT_SHADER, frag_src);
     if frag == 0 {
-        gl_delete_shader(vert);
+        // SAFETY: vert is the shader compiled above, not used again.
+        unsafe {
+            gl_delete_shader(vert);
+        }
         return 0;
     }
 
-    var program = gl_create_program();
+    var program: i64 = 0;
+    // SAFETY: glCreateProgram takes no arguments and returns a name or 0.
+    unsafe {
+        program = gl_create_program();
+    }
     if program == 0 {
-        gl_delete_shader(vert);
-        gl_delete_shader(frag);
+        // SAFETY: vert and frag are the shaders compiled above, not used
+        // again.
+        unsafe {
+            gl_delete_shader(vert);
+            gl_delete_shader(frag);
+        }
         return 0;
     }
 
-    gl_attach_shader(program, vert);
-    gl_attach_shader(program, frag);
-    gl_link_program(program);
+    // SAFETY: program, vert and frag are names the create calls above
+    // returned (all nonzero); only names are passed.
+    unsafe {
+        gl_attach_shader(program, vert);
+        gl_attach_shader(program, frag);
+        gl_link_program(program);
+    }
 
     // Check link status (a GLint written into a zeroed word)
     val status: i64 = gl_out_block(0);
-    gl_get_program_iv(program, GL_LINK_STATUS, status);
+    // SAFETY: GL_LINK_STATUS writes one 4-byte GLint at status, the 8-byte
+    // block gl_out_block just allocated.
+    unsafe {
+        gl_get_program_iv(program, GL_LINK_STATUS, status);
+    }
     val linked: i64 = gl_out_word(status);
-    p_free(status);
+    gl_free_block(status);
 
     if linked == 0 {
         // Linking failed
-        gl_delete_program(program);
-        gl_delete_shader(vert);
-        gl_delete_shader(frag);
+        // SAFETY: program, vert and frag were created above and are not
+        // returned or used again.
+        unsafe {
+            gl_delete_program(program);
+            gl_delete_shader(vert);
+            gl_delete_shader(frag);
+        }
         return 0;
     }
 
     // Shaders can be deleted after linking
-    gl_delete_shader(vert);
-    gl_delete_shader(frag);
+    // SAFETY: the linked program keeps its own reference to the attached
+    // shaders; vert and frag are not used again here.
+    unsafe {
+        gl_delete_shader(vert);
+        gl_delete_shader(frag);
+    }
 
     return program;
 }
 
 /// Set a uniform mat4 value.
+/// `mat` is the address of 16 GLfloats (4 bytes each), column-major.
 pub fn gl_set_uniform_mat4(location: i64, mat: i64) -> void {
-    gl_uniform_matrix_4fv(location, 1, 0, mat);
+    // SAFETY: count = 1: GL reads 64 bytes (16 GLfloats) at mat. This
+    // wrapper cannot check that: mat is a raw address the caller promises
+    // points at 16 floats (see the doc line above).
+    unsafe {
+        gl_uniform_matrix_4fv(location, 1, 0, mat);
+    }
 }
 
 /// Set a uniform float value.
 pub fn gl_set_uniform_f(location: i64, value: f64) -> void {
-    gl_uniform_1f(location, value);
+    // SAFETY: glUniform1f takes a location and a float by value; a bad
+    // location is a GL error, not a memory access.
+    unsafe {
+        gl_uniform_1f(location, value);
+    }
 }
 
 /// Set a uniform int value.
 pub fn gl_set_uniform_i(location: i64, value: i64) -> void {
-    gl_uniform_1i(location, value);
+    // SAFETY: glUniform1i takes a location and an integer by value.
+    unsafe {
+        gl_uniform_1i(location, value);
+    }
 }
 
 /// Get the location of a uniform variable.
 pub fn gl_get_uniform(program: i64, name: str) -> i64 {
-    return gl_get_uniform_location(program, name);
+    // SAFETY: GL reads the NUL-terminated text of name, a Fides str that is
+    // alive for the call, and returns a location (-1 if absent).
+    unsafe {
+        return gl_get_uniform_location(program, name);
+    }
 }
 
 /// Get the location of an attribute variable.
 pub fn gl_get_attrib(program: i64, name: str) -> i64 {
-    return gl_get_attrib_location(program, name);
+    // SAFETY: GL reads the NUL-terminated text of name, a Fides str that is
+    // alive for the call, and returns a location (-1 if absent).
+    unsafe {
+        return gl_get_attrib_location(program, name);
+    }
 }
 
 // ─── Default Shaders ──────────────────────────────────────────────────────

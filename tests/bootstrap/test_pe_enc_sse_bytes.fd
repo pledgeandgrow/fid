@@ -1,0 +1,86 @@
+// BG88-BG92 (docs/roadmap/bugs-roadmap.md): pe_ir's x86-64 encoder
+// (compiler/pe_ir_enc.fd). Fixed there:
+//   BG88 cvttsd2si r64, xmm put r8-r15 in REX.B (the xmm side) instead of
+//        REX.R;
+//   BG89 the SSE encoders (scalar arithmetic, compares, movq, movsd/movss,
+//        cvtsi2sd, movdqu of the callee-saved xmm registers, movapd's
+//        store) emitted no REX.R/REX.B for xmm8-15;
+//   BG90 the AVX VEX prefix (vaddpd/vmulpd) set bit 6 always and dropped
+//        L and pp, and had no 3-byte form;
+//   BG91 setcc, movzx r32, r8 and mov r8, imm8 left out the REX prefix
+//        spl/bpl/sil/dil need (without it, registers 4-7 are ah..bh);
+//   BG92 mov [base], r8 with an rbp/r13 base encoded mod=00 rm=101,
+//        which is [rip + disp32].
+// Each was latent (no current caller passes those registers), so this
+// checks the forms the generator does use: float/int conversions, f64 and
+// f32 arithmetic and compares, comparison results (setcc), byte loads and
+// stores; every backend prints the same.
+//
+// Expected output:
+// 7 -7 3
+// 2.5 -3.75
+// 12.5 0.5
+// true false true
+// 1.5 6
+// 3 255 0 128
+// 10 245
+// true false
+
+fn to_int(x: f64) -> i64 {
+    return x as i64;
+}
+
+fn less(a: f64, b: f64) -> bool {
+    return a < b;
+}
+
+fn main() -> i64 {
+    print(to_int(7.9));
+    print(" ");
+    print(to_int(0.0 - 7.9));
+    print(" ");
+    println(to_int(3.0));
+    val a: f64 = 10.0;
+    val b: f64 = 4.0;
+    print(a / b);
+    print(" ");
+    println(0.0 - 15.0 / b);
+    print(a + b / 2.0 + 0.5);
+    print(" ");
+    println((a - b) / 12.0);
+    print(less(1.0, 2.0));
+    print(" ");
+    print(less(2.0, 1.0));
+    print(" ");
+    println(a >= b);
+    val f: f32 = 3.0 as f32;
+    val g: f32 = 2.0 as f32;
+    val n: i64 = 6;
+    print(f / g);
+    print(" ");
+    println((n as f64) as i64);
+    var bytes: Vec<u8> = Vec::new();
+    bytes.push(3);
+    bytes.push(255);
+    bytes.push(0);
+    bytes.push(128);
+    print(bytes.get(0));
+    print(" ");
+    print(bytes.get(1));
+    print(" ");
+    print(bytes.get(2));
+    print(" ");
+    println(bytes.get(3));
+    bytes.set(2, 10);
+    val s: i64 = bytes.get(2) as i64;
+    val t: i64 = (bytes.get(1) as i64) - s;
+    print(s);
+    print(" ");
+    println(t);
+    val x: i64 = 41;
+    val y: i64 = 42;
+    print(x < y);
+    print(" ");
+    println(x == y);
+    return 0;
+}

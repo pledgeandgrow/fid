@@ -1,0 +1,62 @@
+// BG72 and BG95 (docs/roadmap/bugs-roadmap.md), compiler/cparser.fd (what
+// `fid parse-header` and `@import("x.h")` use), on at_import/ccasts_bg72.h:
+//   - BG72: a cast in a #define constant was dropped, so
+//     `((uint32_t)-1)` became -1; now the value is converted to the type
+//     cast to (cp_cast_value: truncated, sign-extended when signed);
+//   - BG95: wchar_t was u16 and long double f64 everywhere; that is
+//     Windows' ABI only. On Linux and macOS wchar_t is i32 and a function
+//     with a long double is left out (no Fides type is that wide).
+//
+// Expected output:
+// uint32_t cast ok
+// unsigned char cast ok
+// signed char cast ok
+// short cast ok
+// uint16_t cast ok
+// int64_t cast ok
+// no cast ok
+// wchar_t ok
+// long double ok
+// double ok
+
+use core;
+use vec;
+use string;
+use compiler::cparser;
+
+fn check(label: str, out: str, want: str) {
+    if str_contains(out, want) {
+        println(label + " ok");
+    } else {
+        println(label + " MISSING: " + want);
+    }
+}
+
+fn main() -> i64 {
+    val out: str = cparse_header_file("tests/bootstrap/at_import/ccasts_bg72.h", "", "");
+    check("uint32_t cast", out, "pub const BG_ALL_ONES: i64 = 4294967295;");
+    check("unsigned char cast", out, "pub const BG_BYTE: i64 = 255;");
+    check("signed char cast", out, "pub const BG_NEG_CHAR: i64 = -56;");
+    check("short cast", out, "pub const BG_SHORT: i64 = -32768;");
+    check("uint16_t cast", out, "pub const BG_U16: i64 = 4464;");
+    check("int64_t cast", out, "pub const BG_WIDE: i64 = -1;");
+    check("no cast", out, "pub const BG_PLAIN: i64 = -1;");
+    var windows: bool = false;
+    match env_var("OS") {
+        Option::Some(v) => { windows = v == "Windows_NT"; }
+        Option::None => {}
+    }
+    if windows {
+        check("wchar_t", out, "fn bg_wide(c: u16) -> i32;");
+        check("long double", out, "fn bg_ld(x: f64) -> f64;");
+    } else {
+        check("wchar_t", out, "fn bg_wide(c: i32) -> i32;");
+        if str_contains(out, "fn bg_ld(") {
+            println("long double BOUND (it should be left out)");
+        } else {
+            println("long double ok");
+        }
+    }
+    check("double", out, "fn bg_d(x: f64) -> f64;");
+    return 0;
+}

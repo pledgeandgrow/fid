@@ -174,79 +174,139 @@ pub const AUDIO_S16SYS: i64 = 0x8010;
 /// Initialize SDL with the given subsystem flags.
 /// Returns 0 on success, -1 on failure.
 pub fn sdl_init(flags: i64) -> i64 {
-    return sdl_init_raw(flags);
+    // SAFETY: SDL_Init takes a flag word by value and only starts SDL
+    // subsystems; no caller memory is passed.
+    unsafe {
+        return sdl_init_raw(flags);
+    }
 }
 
 /// Shut down SDL and free all resources.
 pub fn sdl_quit() -> void {
-    sdl_quit_raw();
+    // SAFETY: SDL_Quit takes no arguments; it is safe to call when SDL was
+    // never initialised. Windows/renderers created earlier become invalid:
+    // using them afterwards is the caller's error.
+    unsafe {
+        sdl_quit_raw();
+    }
 }
 
 /// Create a window with centered position.
 /// Returns window handle (i64 pointer) or 0 on failure.
 pub fn sdl_create_window(title: str, width: i64, height: i64) -> i64 {
-    return sdl_create_window_raw(title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, width, height, SDL_WINDOW_SHOWN);
+    // SAFETY: SDL reads the NUL-terminated text of title (a Fides str alive
+    // for the call, copied by SDL); the other arguments are values.
+    unsafe {
+        return sdl_create_window_raw(title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, width, height, SDL_WINDOW_SHOWN);
+    }
 }
 
 /// Create a hardware-accelerated renderer with vsync.
 /// Returns renderer handle or 0 on failure.
 pub fn sdl_create_renderer(win: i64) -> i64 {
-    return sdl_create_renderer_raw(win, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_VSYNC);
+    // SAFETY: win must be a handle from sdl_create_window (SDL checks the
+    // window's magic and reports a null one as an error; a destroyed or
+    // made-up handle is the caller's error, not caught here).
+    unsafe {
+        return sdl_create_renderer_raw(win, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_VSYNC);
+    }
 }
 
 /// Destroy a renderer.
 pub fn sdl_destroy_renderer(ren: i64) -> void {
-    sdl_destroy_renderer_raw(ren);
+    // SAFETY: ren must be a handle from sdl_create_renderer, destroyed once
+    // (SDL ignores a null one); the caller must not use it afterwards.
+    unsafe {
+        sdl_destroy_renderer_raw(ren);
+    }
 }
 
 /// Destroy a window.
 pub fn sdl_destroy_window(win: i64) -> void {
-    sdl_destroy_window_raw(win);
+    // SAFETY: win must be a handle from sdl_create_window, destroyed once
+    // (SDL ignores a null one); the caller must not use it afterwards.
+    unsafe {
+        sdl_destroy_window_raw(win);
+    }
 }
 
 /// Clear the screen with the current draw color.
 pub fn sdl_render_clear(ren: i64) -> void {
-    sdl_render_clear_raw(ren);
+    // SAFETY: ren is a renderer handle from sdl_create_renderer; the call
+    // writes only SDL's render target.
+    unsafe {
+        sdl_render_clear_raw(ren);
+    }
 }
 
 /// Present the rendered frame (swap buffers).
 pub fn sdl_render_present(ren: i64) -> void {
-    sdl_render_present_raw(ren);
+    // SAFETY: ren is a renderer handle from sdl_create_renderer; no caller
+    // memory is passed.
+    unsafe {
+        sdl_render_present_raw(ren);
+    }
 }
 
 /// Set the draw color (r, g, b, a — each 0-255).
 pub fn sdl_set_draw_color(ren: i64, r: i64, g: i64, b: i64, a: i64) -> void {
-    sdl_set_draw_color_raw(ren, r, g, b, a);
+    // SAFETY: ren is a renderer handle from sdl_create_renderer; the colour
+    // components are values (the C prototype truncates them to Uint8).
+    unsafe {
+        sdl_set_draw_color_raw(ren, r, g, b, a);
+    }
 }
 
 /// Draw a filled rectangle (pass 0 for rect to fill entire screen).
+/// A nonzero `rect` is the address of an SDL_Rect (four 32-bit ints).
 pub fn sdl_fill_rect(ren: i64, rect: i64) -> void {
-    sdl_fill_rect_raw(ren, rect);
+    // SAFETY: SDL reads 16 bytes (one SDL_Rect) at rect, or nothing for 0.
+    // This wrapper cannot check a nonzero rect: it is a raw address the
+    // caller promises points at an SDL_Rect (see the doc line above).
+    unsafe {
+        sdl_fill_rect_raw(ren, rect);
+    }
 }
 
 /// Draw a line from (x1,y1) to (x2,y2).
 pub fn sdl_draw_line(ren: i64, x1: i64, y1: i64, x2: i64, y2: i64) -> void {
-    sdl_draw_line_raw(ren, x1, y1, x2, y2);
+    // SAFETY: ren is a renderer handle; the coordinates are values.
+    unsafe {
+        sdl_draw_line_raw(ren, x1, y1, x2, y2);
+    }
 }
 
 /// Draw a single point at (x, y).
 pub fn sdl_draw_point(ren: i64, x: i64, y: i64) -> void {
-    sdl_draw_point_raw(ren, x, y);
+    // SAFETY: ren is a renderer handle; the coordinates are values.
+    unsafe {
+        sdl_draw_point_raw(ren, x, y);
+    }
 }
 
 /// Delay (sleep) for the given milliseconds.
 pub fn sdl_delay(ms: i64) -> void {
-    sdl_delay_raw(ms);
+    // SAFETY: SDL_Delay takes a millisecond count by value and only sleeps.
+    unsafe {
+        sdl_delay_raw(ms);
+    }
 }
 
 /// Get ticks (milliseconds since SDL init).
 pub fn sdl_get_ticks() -> i64 {
-    return sdl_get_ticks_raw();
+    // SAFETY: SDL_GetTicks takes no arguments and returns a counter.
+    unsafe {
+        return sdl_get_ticks_raw();
+    }
 }
 
 /// Get the last SDL error message.
 pub fn sdl_get_error() -> str {
-    return sdl_get_error_raw();
+    // SAFETY: SDL_GetError takes no arguments and returns SDL's own
+    // NUL-terminated message buffer (never null; "" when there is none).
+    unsafe {
+        return sdl_get_error_raw();
+    }
 }
 
 // ─── Input (Keyboard + Mouse) ────────────────────────────────────────────
@@ -310,15 +370,101 @@ pub fn sdl_poll_events(state: &mut SdlInputState) -> void {
     //   2. Sets quit_requested if SDL_QUIT received
     //   3. Calls SDL_GetKeyboardState and copies 512 bytes to keys array
     //   4. Calls SDL_GetMouseState for mouse x/y/buttons
-    pledge_sdl_poll_events(state);
+    //
+    // The helper (runtime/pledge_input.c) works on a C FidesInputState of
+    // 11 words: {keys_data, keys_len, keys_cap, prev_keys_data,
+    // prev_keys_len, prev_keys_cap, mouse_x, mouse_y, mouse_buttons,
+    // prev_mouse_buttons, quit_requested}. SdlInputState is not that layout
+    // (each Vec field is one handle word, 7 words in all), so handing it
+    // `state` made the helper write 512 words into the keys Vec's header
+    // and past the end of the struct. The C layout is built in a scratch
+    // block instead, and the results are copied back.
+    val n: i64 = 512;
+    var cst: i64 = 0;
+    var cur: i64 = 0;
+    var prev: i64 = 0;
+    // SAFETY: p_malloc only allocates: the 88-byte FidesInputState and its
+    // two 512-word key arrays, all filled below before the helper reads them.
+    unsafe {
+        cst = p_malloc(88);
+        cur = p_malloc(n * 8);
+        prev = p_malloc(n * 8);
+    }
+    i = 0;
+    while i < n {
+        sdl_word_put(cur, i, state.keys.get(i));
+        sdl_word_put(prev, i, state.prev_keys.get(i));
+        i = i + 1;
+    }
+    sdl_word_put(cst, 0, cur);
+    sdl_word_put(cst, 1, n);
+    sdl_word_put(cst, 2, n);
+    sdl_word_put(cst, 3, prev);
+    sdl_word_put(cst, 4, n);
+    sdl_word_put(cst, 5, n);
+    sdl_word_put(cst, 6, state.mouse_x);
+    sdl_word_put(cst, 7, state.mouse_y);
+    sdl_word_put(cst, 8, state.mouse_buttons);
+    sdl_word_put(cst, 9, state.prev_mouse_buttons);
+    var quit: i64 = 0;
+    if state.quit_requested {
+        quit = 1;
+    }
+    sdl_word_put(cst, 10, quit);
+    // SAFETY: cst is the 88-byte FidesInputState just filled: keys_data and
+    // prev_keys_data point at the two 512-word arrays allocated above with
+    // len = cap = 512, and the helper writes at most 512 words into each
+    // (it checks len >= 512) and the 11 words of cst itself.
+    unsafe {
+        pledge_sdl_poll_events(cst);
+    }
+    i = 0;
+    while i < n {
+        state.keys.set(i, sdl_word_at(cur, i));
+        i = i + 1;
+    }
+    state.mouse_x = sdl_word_at(cst, 6);
+    state.mouse_y = sdl_word_at(cst, 7);
+    state.mouse_buttons = sdl_word_at(cst, 8);
+    state.prev_mouse_buttons = sdl_word_at(cst, 9);
+    state.quit_requested = sdl_word_at(cst, 10) != 0;
+    // SAFETY: the three blocks p_malloc returned above, each freed once;
+    // every result was copied out of them first.
+    unsafe {
+        p_free(cur);
+        p_free(prev);
+        p_free(cst);
+    }
 }
 
-// Native runtime helper: polls SDL events and fills SdlInputState.
+/// Store v in word `index` of a scratch block of sdl_poll_events.
+fn sdl_word_put(blk: i64, index: i64, v: i64) -> void {
+    var p: *mut i64 = (blk + index * 8) as *mut i64;
+    // SAFETY: only sdl_poll_events calls this, with one of its p_malloc
+    // blocks and an index below that block's word count (11 or 512).
+    unsafe {
+        *p = v;
+    }
+}
+
+/// Word `index` of a scratch block of sdl_poll_events.
+fn sdl_word_at(blk: i64, index: i64) -> i64 {
+    var p: *mut i64 = (blk + index * 8) as *mut i64;
+    var v: i64 = 0;
+    // SAFETY: only sdl_poll_events calls this, with one of its p_malloc
+    // blocks (not yet freed) and an index below its word count.
+    unsafe {
+        v = *p;
+    }
+    return v;
+}
+
+// Native runtime helper: polls SDL events and fills a FidesInputState.
 // In the interpreter, this is a no-op.
 // In native builds, this calls SDL_PollEvent, SDL_GetKeyboardState, SDL_GetMouseState.
 // SAFETY: pledge_sdl.h is the runtime's own header, checked by the C
-// compiler; `state` is the address of an SdlInputState the caller owns, which
-// the helper fills field by field.
+// compiler; `state` is the address of a C FidesInputState (11 words, see
+// sdl_poll_events) whose key arrays hold at least 512 words.
 extern "C" include "pledge_sdl.h" link "" {
     fn pledge_sdl_poll_events(state: i64) -> void;
 }
@@ -379,18 +525,33 @@ pub fn sdl_quit_requested(state: &SdlInputState) -> bool {
 /// Load an image file (PNG, JPG, BMP) as a texture.
 /// Returns texture handle or 0 on failure.
 pub fn sdl_load_texture(ren: i64, path: str) -> i64 {
-    var surf: i64 = img_load_raw(path);
+    var surf: i64 = 0;
+    // SAFETY: IMG_Load reads the NUL-terminated text of path (a Fides str
+    // alive for the call) and returns a new surface or 0.
+    unsafe {
+        surf = img_load_raw(path);
+    }
     if surf == 0 {
         return 0;
     }
-    var tex: i64 = sdl_texture_from_surface(ren, surf);
-    sdl_free_surface(surf);
+    var tex: i64 = 0;
+    // SAFETY: surf is the nonzero surface IMG_Load just returned; the
+    // texture copies its pixels, so the surface is freed once right after
+    // and not used again. ren is the caller's renderer handle.
+    unsafe {
+        tex = sdl_texture_from_surface(ren, surf);
+        sdl_free_surface(surf);
+    }
     return tex;
 }
 
 /// Destroy a texture.
 pub fn sdl_destroy_texture(tex: i64) -> void {
-    sdl_destroy_texture_raw(tex);
+    // SAFETY: tex must be a handle from sdl_load_texture, destroyed once
+    // (SDL reports a null one as an error); not used afterwards.
+    unsafe {
+        sdl_destroy_texture_raw(tex);
+    }
 }
 
 /// Draw a texture at position (x, y) with width w and height h.
@@ -398,7 +559,12 @@ pub fn sdl_destroy_texture(tex: i64) -> void {
 pub fn sdl_draw_texture(ren: i64, tex: i64, x: i64, y: i64, w: i64, h: i64) -> void {
     // The SDL_RenderCopy takes SDL_Rect pointers for src and dst.
     // We use a native helper that builds the rect and calls SDL_RenderCopy.
-    pledge_sdl_draw_texture(ren, tex, x, y, w, h);
+    // SAFETY: the helper (runtime/pledge_sdl.c) returns at once for a null
+    // ren or tex, builds the SDL_Rect on its own stack, and passes the
+    // caller's renderer and texture handles to SDL_RenderCopy.
+    unsafe {
+        pledge_sdl_draw_texture(ren, tex, x, y, w, h);
+    }
 }
 
 // Native helper: draws a texture at the given position.
@@ -413,52 +579,92 @@ extern "C" include "pledge_sdl.h" link "" {
 /// Initialize SDL_mixer audio (44100 Hz, 16-bit, stereo, 1024 chunk).
 /// Returns 0 on success, -1 on failure.
 pub fn sdl_audio_init() -> i64 {
-    return mix_open(44100, AUDIO_S16SYS, 2, 1024);
+    // SAFETY: Mix_OpenAudio takes four values (rate, format, channels,
+    // chunk size) and opens the audio device; no caller memory is passed.
+    unsafe {
+        return mix_open(44100, AUDIO_S16SYS, 2, 1024);
+    }
 }
 
 /// Shut down SDL_mixer.
 pub fn sdl_audio_shutdown() -> void {
-    mix_close();
+    // SAFETY: Mix_CloseAudio takes no arguments; with no open device it
+    // does nothing.
+    unsafe {
+        mix_close();
+    }
 }
 
 /// Load a WAV file. Returns chunk handle or 0 on failure.
 pub fn sdl_audio_load(path: str) -> i64 {
-    return mix_load_wav_raw(path);
+    // SAFETY: SDL_mixer reads the NUL-terminated text of path (a Fides str
+    // alive for the call) and returns a new chunk or 0.
+    unsafe {
+        return mix_load_wav_raw(path);
+    }
 }
 
 /// Play a sound on a channel. Returns the channel used, or -1 on failure.
 /// Pass -1 for channel to use any free channel.
 /// Pass 0 for loops to play once, -1 for infinite looping.
 pub fn sdl_audio_play(channel: i64, chunk: i64, loops: i64) -> i64 {
-    return mix_play(channel, chunk, loops);
+    // SAFETY: chunk must be a live handle from sdl_audio_load (SDL_mixer
+    // reports a null one as an error); channel and loops are values, and a
+    // bad channel number is reported as -1.
+    unsafe {
+        return mix_play(channel, chunk, loops);
+    }
 }
 
 /// Stop playback on a channel. Pass -1 for all channels.
 pub fn sdl_audio_stop(channel: i64) -> void {
-    mix_halt(channel);
+    // SAFETY: Mix_HaltChannel takes a channel number by value (-1: all).
+    unsafe {
+        mix_halt(channel);
+    }
 }
 
 /// Set volume for a channel (0-128). Pass -1 for all channels.
 pub fn sdl_audio_volume(channel: i64, volume: i64) -> void {
-    mix_volume(channel, volume);
+    // SAFETY: Mix_Volume takes two values; SDL_mixer clamps the volume and
+    // ignores a channel number out of range.
+    unsafe {
+        mix_volume(channel, volume);
+    }
 }
 
 /// Free a loaded sound chunk.
 pub fn sdl_audio_free(chunk: i64) -> void {
-    mix_free_chunk(chunk);
+    // SAFETY: chunk must be a handle from sdl_audio_load, freed once
+    // (SDL_mixer ignores a null one and halts channels still playing it);
+    // the caller must not use it afterwards.
+    unsafe {
+        mix_free_chunk(chunk);
+    }
 }
 
 /// Check if a channel is currently playing.
 pub fn sdl_audio_playing(channel: i64) -> bool {
-    return mix_playing(channel) != 0;
+    var playing: i64 = 0;
+    // SAFETY: Mix_Playing takes a channel number by value (-1: count all).
+    unsafe {
+        playing = mix_playing(channel);
+    }
+    return playing != 0;
 }
 
 /// Pause a channel.
 pub fn sdl_audio_pause(channel: i64) -> void {
-    mix_pause(channel);
+    // SAFETY: Mix_Pause takes a channel number by value (-1: all).
+    unsafe {
+        mix_pause(channel);
+    }
 }
 
 /// Resume a paused channel.
 pub fn sdl_audio_resume(channel: i64) -> void {
-    mix_resume(channel);
+    // SAFETY: Mix_Resume takes a channel number by value (-1: all).
+    unsafe {
+        mix_resume(channel);
+    }
 }

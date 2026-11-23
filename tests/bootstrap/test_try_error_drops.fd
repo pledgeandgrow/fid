@@ -1,0 +1,75 @@
+// Bugs roadmap BG65: the error path of `?` dropped the function's values
+// only when the Result owned something (it is copied for the caller
+// first); a Result of plain values (Result<i64, i64>) left every string
+// and Vec of the function allocated, and @persist variables were not
+// saved there as at a `return`. They are dropped and saved now (with
+// `fid run --leaks` every block is freed: scripts/leak-check.sh).
+// Expected output:
+// err -2
+// err -1
+// item0 item0!
+// ok 1
+// item1 item1!
+// ok 3
+// item2 item2!
+// ok 5
+// 3 errors
+fn parse_pos(n: i64) -> Result<i64, i64> {
+    if n < 0 {
+        return Result::Err(n);
+    }
+    return Result::Ok(n * 2);
+}
+
+fn work(n: i64) -> Result<i64, i64> {
+    var s: str = "item" + int_to_str(n);
+    var v: Vec<str> = Vec::new();
+    v.push(s + "!");
+    val d: i64 = parse_pos(n)?;
+    println(s + " " + v.get(0));
+    return Result::Ok(d + v.len());
+}
+
+fn opt_pos(n: i64) -> Option<i64> {
+    if n < 0 {
+        return Option::None;
+    }
+    return Option::Some(n);
+}
+
+fn count_neg(n: i64) -> Option<i64> {
+    var w: Vec<i64> = Vec::new();
+    w.push(n);
+    var t: str = "t" + int_to_str(n);
+    val k: i64 = opt_pos(n)?;
+    return Option::Some(k + w.len() + str_len(t));
+}
+
+fn main() -> i64 {
+    var i: i64 = -2;
+    while i < 3 {
+        match work(i) {
+            Result::Ok(x) => {
+                println("ok " + int_to_str(x));
+            }
+            Result::Err(e) => {
+                println("err " + int_to_str(e));
+            }
+        }
+        i = i + 1;
+    }
+    var errs: i64 = 0;
+    var j: i64 = -3;
+    while j < 1 {
+        match count_neg(j) {
+            Option::Some(_) => {
+            }
+            Option::None => {
+                errs = errs + 1;
+            }
+        }
+        j = j + 1;
+    }
+    println(int_to_str(errs) + " errors");
+    return 0;
+}

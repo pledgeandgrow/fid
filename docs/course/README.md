@@ -162,7 +162,7 @@ python3 tests/course/check_labs.py --structure-only                    # links a
   closures in week 2's second lecture), and keep the rest.
 - **Lengthening to 14 weeks.** Split week 13: concurrency alone, then a
   week of project work with a lecture on the compiler's architecture
-  (`docs/compiler-internals.md`, `docs/reference/architecture.md`).
+  (`docs/reference/compiler-internals.md`, `docs/reference/architecture.md`).
 
 ## Further reading
 

@@ -572,7 +572,13 @@ pub fn smallstr_len(s: SmallStr) -> i64 {
 
 /// Convert a SmallStr to a regular heap string.
 pub fn smallstr_to_str(s: SmallStr) -> str {
-    return s.ptr as str;
+    // SAFETY: s.ptr is a counted string from p_string_from
+    // (smallstr_from_str), so it carries the string header a str needs; the
+    // return takes an owner of its own (proposal 0004: a returned value
+    // that is not a temporary is counted again), the SmallStr keeps its own.
+    unsafe {
+        return s.ptr as str;
+    }
 }
 
 /// Check if a SmallStr is stored inline (no heap allocation).
@@ -741,7 +747,13 @@ pub fn rope_byte_at(r: Rope, idx: i64) -> i64 {
 /// This is O(log n) for balanced ropes.
 pub fn rope_substring(r: Rope, start: i64, end: i64) -> Rope {
     var s: str = rope_to_str(r);
-    var sub: str = p_string_substring(s, start, end) as str;
+    var sub: str = "";
+    // SAFETY: p_string_substring returns a new counted string (AGENTS.md
+    // Known Bugs 25: every runtime string producer does) whose one owner is
+    // handed to `sub` here.
+    unsafe {
+        sub = p_string_substring(s, start, end) as str;
+    }
     return rope_new(sub);
 }
 

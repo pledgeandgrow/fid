@@ -33,7 +33,14 @@ extern "C" include "<stdio.h>" {
 
 /// Get an environment variable value. Returns "" if not set.
 pub fn os_getenv(name: str) -> str {
-    var value = pledge_getenv(name);
+    var value: str = "";
+    // SAFETY: getenv only reads the NUL-terminated string name and returns a
+    // pointer into the environment, or NULL (str_len reads it as 0); os
+    // never changes the environment, so value stays valid unless the
+    // program calls setenv/putenv itself (in an unsafe block of its own).
+    unsafe {
+        value = pledge_getenv(name);
+    }
     // getenv returns NULL for an unset variable; hand back a real empty string
     if str_len(value) == 0 {
         return "";
@@ -50,7 +57,14 @@ pub fn os_getenv(name: str) -> str {
 ///   assert(os_argc() >= 1);
 ///   assert(str_len(os_name()) > 0);
 pub fn os_getenv_or(name: str, default: str) -> str {
-    var value = pledge_getenv(name);
+    var value: str = "";
+    // SAFETY: getenv only reads the NUL-terminated string name and returns a
+    // pointer into the environment, or NULL (str_len reads it as 0); os
+    // never changes the environment, so value stays valid unless the
+    // program calls setenv/putenv itself (in an unsafe block of its own).
+    unsafe {
+        value = pledge_getenv(name);
+    }
     if str_len(value) == 0 {
         return default;
     }
@@ -59,7 +73,11 @@ pub fn os_getenv_or(name: str, default: str) -> str {
 
 /// Check if an environment variable is set.
 pub fn os_hasenv(name: str) -> bool {
-    return str_len(pledge_getenv(name)) > 0;
+    // SAFETY: getenv only reads the NUL-terminated Fides string name; the
+    // pointer it returns (or NULL, length 0) is only measured, right away.
+    unsafe {
+        return str_len(pledge_getenv(name)) > 0;
+    }
 }
 
 // ─── Command-line arguments ─────────────────────────────────────────────
@@ -97,22 +115,41 @@ pub fn os_args() -> Vec<str> {
 
 /// Exit the process with a status code.
 pub fn os_exit(code: i64) -> void {
-    pledge_exit(code);
+    // SAFETY: exit takes only the integer status code; it runs the C
+    // library's atexit handlers, flushes stdio and does not return, so no
+    // Fides code runs on afterwards.
+    unsafe {
+        pledge_exit(code);
+    }
 }
 
 /// Exit with success (code 0).
 pub fn os_exit_success() -> void {
-    pledge_exit(0);
+    // SAFETY: exit takes only the integer status 0; it runs the C
+    // library's atexit handlers, flushes stdio and does not return, so no
+    // Fides code runs on afterwards.
+    unsafe {
+        pledge_exit(0);
+    }
 }
 
 /// Exit with failure (code 1).
 pub fn os_exit_failure() -> void {
-    pledge_exit(1);
+    // SAFETY: exit takes only the integer status 1; it runs the C
+    // library's atexit handlers, flushes stdio and does not return, so no
+    // Fides code runs on afterwards.
+    unsafe {
+        pledge_exit(1);
+    }
 }
 
 /// Execute a system command. Returns the exit status.
 pub fn os_system(cmd: str) -> i64 {
-    return pledge_system(cmd);
+    // SAFETY: system only reads the NUL-terminated Fides string cmd and
+    // waits for the shell it starts; it writes no memory of ours.
+    unsafe {
+        return pledge_system(cmd);
+    }
 }
 
 // ─── System information ─────────────────────────────────────────────────
@@ -149,12 +186,33 @@ pub fn os_name() -> str {
 /// Get the user's home directory.
 @cfg(windows)
 pub fn os_home_dir() -> str {
-    var home = pledge_getenv("USERPROFILE");
+    var home: str = "";
+    // SAFETY: getenv only reads the literal "USERPROFILE" and returns a
+    // pointer into the environment, or NULL (str_len reads it as 0); os
+    // never changes the environment, so home stays valid unless the
+    // program calls setenv/putenv itself (in an unsafe block of its own).
+    unsafe {
+        home = pledge_getenv("USERPROFILE");
+    }
     if str_len(home) > 0 {
         return home;
     }
-    var drive = pledge_getenv("HOMEDRIVE");
-    var path = pledge_getenv("HOMEPATH");
+    var drive: str = "";
+    // SAFETY: getenv only reads the literal "HOMEDRIVE" and returns a
+    // pointer into the environment, or NULL (str_len reads it as 0); os
+    // never changes the environment, so drive stays valid unless the
+    // program calls setenv/putenv itself (in an unsafe block of its own).
+    unsafe {
+        drive = pledge_getenv("HOMEDRIVE");
+    }
+    var path: str = "";
+    // SAFETY: getenv only reads the literal "HOMEPATH" and returns a
+    // pointer into the environment, or NULL (str_len reads it as 0); os
+    // never changes the environment, so path stays valid unless the
+    // program calls setenv/putenv itself (in an unsafe block of its own).
+    unsafe {
+        path = pledge_getenv("HOMEPATH");
+    }
     if str_len(drive) > 0 && str_len(path) > 0 {
         return drive + path;
     }
@@ -163,7 +221,14 @@ pub fn os_home_dir() -> str {
 
 @cfg(unix)
 pub fn os_home_dir() -> str {
-    var home = pledge_getenv("HOME");
+    var home: str = "";
+    // SAFETY: getenv only reads the literal "HOME" and returns a
+    // pointer into the environment, or NULL (str_len reads it as 0); os
+    // never changes the environment, so home stays valid unless the
+    // program calls setenv/putenv itself (in an unsafe block of its own).
+    unsafe {
+        home = pledge_getenv("HOME");
+    }
     if str_len(home) > 0 {
         return home;
     }
@@ -173,7 +238,14 @@ pub fn os_home_dir() -> str {
 /// Get the current working directory (from PWD env var).
 /// No getcwd builtin exists yet; PWD is set by shells on POSIX hosts.
 pub fn os_cwd() -> str {
-    var pwd = pledge_getenv("PWD");
+    var pwd: str = "";
+    // SAFETY: getenv only reads the literal "PWD" and returns a
+    // pointer into the environment, or NULL (str_len reads it as 0); os
+    // never changes the environment, so pwd stays valid unless the
+    // program calls setenv/putenv itself (in an unsafe block of its own).
+    unsafe {
+        pwd = pledge_getenv("PWD");
+    }
     if str_len(pwd) > 0 {
         return pwd;
     }
@@ -183,7 +255,14 @@ pub fn os_cwd() -> str {
 /// Get the user name.
 @cfg(windows)
 pub fn os_user() -> str {
-    var user = pledge_getenv("USERNAME");
+    var user: str = "";
+    // SAFETY: getenv only reads the literal "USERNAME" and returns a
+    // pointer into the environment, or NULL (str_len reads it as 0); os
+    // never changes the environment, so user stays valid unless the
+    // program calls setenv/putenv itself (in an unsafe block of its own).
+    unsafe {
+        user = pledge_getenv("USERNAME");
+    }
     if str_len(user) > 0 {
         return user;
     }
@@ -192,11 +271,25 @@ pub fn os_user() -> str {
 
 @cfg(unix)
 pub fn os_user() -> str {
-    var user = pledge_getenv("USER");
+    var user: str = "";
+    // SAFETY: getenv only reads the literal "USER" and returns a
+    // pointer into the environment, or NULL (str_len reads it as 0); os
+    // never changes the environment, so user stays valid unless the
+    // program calls setenv/putenv itself (in an unsafe block of its own).
+    unsafe {
+        user = pledge_getenv("USER");
+    }
     if str_len(user) > 0 {
         return user;
     }
-    var logname = pledge_getenv("LOGNAME");
+    var logname: str = "";
+    // SAFETY: getenv only reads the literal "LOGNAME" and returns a
+    // pointer into the environment, or NULL (str_len reads it as 0); os
+    // never changes the environment, so logname stays valid unless the
+    // program calls setenv/putenv itself (in an unsafe block of its own).
+    unsafe {
+        logname = pledge_getenv("LOGNAME");
+    }
     if str_len(logname) > 0 {
         return logname;
     }
@@ -205,11 +298,24 @@ pub fn os_user() -> str {
 
 /// Get the hostname (env-var best-effort; no gethostname builtin yet).
 pub fn os_hostname() -> str {
-    var host = pledge_getenv("HOSTNAME");
+    var host: str = "";
+    // SAFETY: getenv only reads the literal "HOSTNAME" and returns a
+    // pointer into the environment, or NULL (str_len reads it as 0); os
+    // never changes the environment, so host stays valid unless the
+    // program calls setenv/putenv itself (in an unsafe block of its own).
+    unsafe {
+        host = pledge_getenv("HOSTNAME");
+    }
     if str_len(host) > 0 {
         return host;
     }
-    host = pledge_getenv("COMPUTERNAME");
+    // SAFETY: getenv only reads the literal "COMPUTERNAME" and returns a
+    // pointer into the environment, or NULL (str_len reads it as 0); os
+    // never changes the environment, so host stays valid unless the
+    // program calls setenv/putenv itself (in an unsafe block of its own).
+    unsafe {
+        host = pledge_getenv("COMPUTERNAME");
+    }
     if str_len(host) > 0 {
         return host;
     }
@@ -219,7 +325,14 @@ pub fn os_hostname() -> str {
 /// Get the user's shell.
 @cfg(windows)
 pub fn os_shell() -> str {
-    var shell = pledge_getenv("COMSPEC");
+    var shell: str = "";
+    // SAFETY: getenv only reads the literal "COMSPEC" and returns a
+    // pointer into the environment, or NULL (str_len reads it as 0); os
+    // never changes the environment, so shell stays valid unless the
+    // program calls setenv/putenv itself (in an unsafe block of its own).
+    unsafe {
+        shell = pledge_getenv("COMSPEC");
+    }
     if str_len(shell) > 0 {
         return shell;
     }
@@ -228,7 +341,14 @@ pub fn os_shell() -> str {
 
 @cfg(unix)
 pub fn os_shell() -> str {
-    var shell = pledge_getenv("SHELL");
+    var shell: str = "";
+    // SAFETY: getenv only reads the literal "SHELL" and returns a
+    // pointer into the environment, or NULL (str_len reads it as 0); os
+    // never changes the environment, so shell stays valid unless the
+    // program calls setenv/putenv itself (in an unsafe block of its own).
+    unsafe {
+        shell = pledge_getenv("SHELL");
+    }
     if str_len(shell) > 0 {
         return shell;
     }
@@ -237,7 +357,14 @@ pub fn os_shell() -> str {
 
 /// Get the terminal (from TERM env var).
 pub fn os_term() -> str {
-    var term = pledge_getenv("TERM");
+    var term: str = "";
+    // SAFETY: getenv only reads the literal "TERM" and returns a
+    // pointer into the environment, or NULL (str_len reads it as 0); os
+    // never changes the environment, so term stays valid unless the
+    // program calls setenv/putenv itself (in an unsafe block of its own).
+    unsafe {
+        term = pledge_getenv("TERM");
+    }
     if str_len(term) > 0 {
         return term;
     }
@@ -246,7 +373,14 @@ pub fn os_term() -> str {
 
 /// Get the PATH environment variable as a Vec of paths.
 pub fn os_path() -> Vec<str> {
-    var path = pledge_getenv("PATH");
+    var path: str = "";
+    // SAFETY: getenv only reads the literal "PATH" and returns a
+    // pointer into the environment, or NULL (str_len reads it as 0); os
+    // never changes the environment, so path stays valid unless the
+    // program calls setenv/putenv itself (in an unsafe block of its own).
+    unsafe {
+        path = pledge_getenv("PATH");
+    }
     if str_len(path) == 0 {
         return Vec::new();
     }
@@ -258,15 +392,35 @@ pub fn os_path() -> Vec<str> {
 /// Get the system temporary directory.
 @cfg(windows)
 pub fn os_tmp_dir() -> str {
-    var tmp = pledge_getenv("TEMP");
+    var tmp: str = "";
+    // SAFETY: getenv only reads the literal "TEMP" and returns a
+    // pointer into the environment, or NULL (str_len reads it as 0); os
+    // never changes the environment, so tmp stays valid unless the
+    // program calls setenv/putenv itself (in an unsafe block of its own).
+    unsafe {
+        tmp = pledge_getenv("TEMP");
+    }
     if str_len(tmp) > 0 {
         return tmp;
     }
-    tmp = pledge_getenv("TMP");
+    // SAFETY: getenv only reads the literal "TMP" and returns a
+    // pointer into the environment, or NULL (str_len reads it as 0); os
+    // never changes the environment, so tmp stays valid unless the
+    // program calls setenv/putenv itself (in an unsafe block of its own).
+    unsafe {
+        tmp = pledge_getenv("TMP");
+    }
     if str_len(tmp) > 0 {
         return tmp;
     }
-    var profile = pledge_getenv("USERPROFILE");
+    var profile: str = "";
+    // SAFETY: getenv only reads the literal "USERPROFILE" and returns a
+    // pointer into the environment, or NULL (str_len reads it as 0); os
+    // never changes the environment, so profile stays valid unless the
+    // program calls setenv/putenv itself (in an unsafe block of its own).
+    unsafe {
+        profile = pledge_getenv("USERPROFILE");
+    }
     if str_len(profile) > 0 {
         return profile + "\\AppData\\Local\\Temp";
     }
@@ -275,7 +429,14 @@ pub fn os_tmp_dir() -> str {
 
 @cfg(unix)
 pub fn os_tmp_dir() -> str {
-    var tmpdir = pledge_getenv("TMPDIR");
+    var tmpdir: str = "";
+    // SAFETY: getenv only reads the literal "TMPDIR" and returns a
+    // pointer into the environment, or NULL (str_len reads it as 0); os
+    // never changes the environment, so tmpdir stays valid unless the
+    // program calls setenv/putenv itself (in an unsafe block of its own).
+    unsafe {
+        tmpdir = pledge_getenv("TMPDIR");
+    }
     if str_len(tmpdir) > 0 {
         return tmpdir;
     }
@@ -311,7 +472,14 @@ pub fn os_path_list_sep() -> str {
 
 @cfg(wasi)
 pub fn os_home_dir() -> str {
-    var home = pledge_getenv("HOME");
+    var home: str = "";
+    // SAFETY: getenv only reads the literal "HOME" and returns a
+    // pointer into the environment, or NULL (str_len reads it as 0); os
+    // never changes the environment, so home stays valid unless the
+    // program calls setenv/putenv itself (in an unsafe block of its own).
+    unsafe {
+        home = pledge_getenv("HOME");
+    }
     if str_len(home) > 0 {
         return home;
     }
@@ -320,7 +488,14 @@ pub fn os_home_dir() -> str {
 
 @cfg(wasi)
 pub fn os_user() -> str {
-    var user = pledge_getenv("USER");
+    var user: str = "";
+    // SAFETY: getenv only reads the literal "USER" and returns a
+    // pointer into the environment, or NULL (str_len reads it as 0); os
+    // never changes the environment, so user stays valid unless the
+    // program calls setenv/putenv itself (in an unsafe block of its own).
+    unsafe {
+        user = pledge_getenv("USER");
+    }
     if str_len(user) > 0 {
         return user;
     }
@@ -334,7 +509,14 @@ pub fn os_shell() -> str {
 
 @cfg(wasi)
 pub fn os_tmp_dir() -> str {
-    var tmpdir = pledge_getenv("TMPDIR");
+    var tmpdir: str = "";
+    // SAFETY: getenv only reads the literal "TMPDIR" and returns a
+    // pointer into the environment, or NULL (str_len reads it as 0); os
+    // never changes the environment, so tmpdir stays valid unless the
+    // program calls setenv/putenv itself (in an unsafe block of its own).
+    unsafe {
+        tmpdir = pledge_getenv("TMPDIR");
+    }
     if str_len(tmpdir) > 0 {
         return tmpdir;
     }

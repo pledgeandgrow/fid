@@ -1538,10 +1538,8 @@ repo. `@cpu_local` is only in `compiler/pe.fd`, not in `src/pe.rs`.
   — `peir_is_interrupt` in `compiler/pe_ir.fd`: interrupt handlers save every register and return with `iretq`; `@interrupt(N)` handlers run under QEMU (release G1).
 - [x] Multiboot2 header generation for `--boot` mode
   — `fid emit --bare`/`--boot` write a Multiboot 1+2 kernel that QEMU `-kernel` and GRUB load (release G1, `scripts/bare-qemu-test.sh`).
-- [~] Real hardware testing (QEMU ARM64, QEMU RISC-V, real UEFI firmware)
-  Nov 22: QEMU ARM64/RISC-V/x86-64 and OVMF UEFI all work (release F8/G1);
-  real boards and real UEFI firmware need hardware CI runners (competitive PL3/PL5).
-  — QEMU ARM64 and RISC-V done (release F8), x86-64 bare images under qemu-system-x86_64 (release G1). UEFI images (above) boot under OVMF in QEMU (`tests/uefi/run.sh`). Left: real boards (competitive PL3, PL5) and real UEFI firmware (not tried).
+- [>] Real hardware testing (QEMU ARM64, QEMU RISC-V, real UEFI firmware): moved to end-roadmap.md (Nov 22).
+
 - [-] `@cpu_local` port to Rust reference (`src/pe.rs`) for parity
   — obsolete: `src/` is frozen (competitive ST1). Note: `@cpu_local` lives only in `compiler/pe.fd`, whose tables nothing fills any more (AGENTS.md); pe_ir does not generate it. Leftover if per-CPU data is wanted: `@cpu_local` in pe_ir.
 
@@ -7799,7 +7797,7 @@ Fides's effect system is the foundation — effect handlers can replace async/aw
 - [>] Write a REST API server using only stdlib (http + json + crypto + fs)
   — `examples/http_server.fd`, `examples/http2_server.fd`; competitive Track SL acceptance ("a real web service needs no package outside the stdlib").
 - [x] Write a CLI tool using only stdlib (env + process + fs + io)
-  — `stdlib/args.fd`, `fs.fd`, `process.fd`; the `docs/cookbook.md` recipes (args, files, processes; competitive AD7). Tools of our own in Fides: competitive AD4.
+  — `stdlib/args.fd`, `fs.fd`, `process.fd`; the `docs/guides/cookbook.md` recipes (args, files, processes; competitive AD7). Tools of our own in Fides: competitive AD4.
 - [x] `fidesc test` runs `#[test]` functions — `fid test <file.fd>` runs `fn test_*()` (above).
 - [-] One canonical implementation per domain (no fragmentation) — a principle, not a task.
 
@@ -7945,10 +7943,10 @@ Fides's effect system is the foundation — effect handlers can replace async/aw
 - [-] **Not built:** This is new
 
 ##### L6D — C-to-Fides Transpiler
-- [x] Auto-translate C code to Fides (best effort, manual review needed): tools/c2fd.fd (`c2fd input.c > output.fd`, docs/c2fd.md). A construct it cannot translate faithfully gets a `// TODO(c2fd):` beside its closest translation. tests/c2fd/check.sh: 10 programs, among them four musl libc functions (atoi, strcmp, strncmp, rand; MIT), give the same output as C under fid run and fid ccompile; gaps.c holds the cases that need manual edits.
+- [x] Auto-translate C code to Fides (best effort, manual review needed): tools/c2fd.fd (`c2fd input.c > output.fd`, docs/reference/c2fd.md). A construct it cannot translate faithfully gets a `// TODO(c2fd):` beside its closest translation. tests/c2fd/check.sh: 10 programs, among them four musl libc functions (atoi, strcmp, strncmp, rand; MIT), give the same output as C under fid run and fid ccompile; gaps.c holds the cases that need manual edits.
 - [x] Handle functions, structs, enums, typedefs, basic control flow. Also unions (as structs, with a TODO), globals, static locals, macros (constants become const, others are expanded), #if/#ifdef, every statement but goto (a TODO), every operator, casts, sizeof, initializer lists, side effects inside expressions.
 - [x] Map C patterns to Fides idioms. Arrays and malloc'd arrays become Vec, char* becomes str (a written buffer becomes a byte Vec), pointer parameters become &mut T or &mut Vec<T>, counting for loops become ranges, printf becomes f-strings, FILE* reading becomes a reader. Linked structures keep raw pointers in @unsafe functions. Not done: regions, pointer arithmetic into arrays.
-  Nov 21 check (fid built from the self-hosted stage 0 at 86cc919): validated — tools/c2fd.fd turns pointer arithmetic into arrays into indexes (cur_elem, decide_local_cur) and writes regions: `tests/c2fd/check.sh` gives all 13 rows 'same' as their goldens, every program but gaps MATCH under fid run and ccompile (cursors and regions included), cursors.fd and regions.fd have no TODO(c2fd), and regions.fd and bubble_sort.fd have `region r_..` blocks. Known limits: docs/c2fd.md.
+  Nov 21 check (fid built from the self-hosted stage 0 at 86cc919): validated — tools/c2fd.fd turns pointer arithmetic into arrays into indexes (cur_elem, decide_local_cur) and writes regions: `tests/c2fd/check.sh` gives all 13 rows 'same' as their goldens, every program but gaps MATCH under fid run and ccompile (cursors and regions included), cursors.fd and regions.fd have no TODO(c2fd), and regions.fd and bubble_sort.fd have `region r_..` blocks. Known limits: docs/reference/c2fd.md.
 - [x] Output readable Fides code: C comments, names, blank lines and structure are kept, and only the helpers a file uses are appended.
 - [-] **Overlaps with:** Existing roadmap Phase 7C (Migration Tools)
 - [-] **Not built:** This is new
@@ -8329,9 +8327,9 @@ Fides's effect system is the foundation — effect handlers can replace async/aw
 - [-] **Not built:** This is new
 
 ##### L10C — Examples Library
-- [x] Real-world code samples: CLI tools, web servers, embedded firmware, data processing — `examples/` (http_server, http2_server, json_parser, mini_compiler, riscv_blink, rpi_led_blink, sdl_window, neural_network...), `docs/cookbook.md`; built in CI: release N11.
+- [x] Real-world code samples: CLI tools, web servers, embedded firmware, data processing — `examples/` (http_server, http2_server, json_parser, mini_compiler, riscv_blink, rpi_led_blink, sdl_window, neural_network...), `docs/guides/cookbook.md`; built in CI: release N11.
 - [>] Each example demonstrates a Fides differentiator (regions, effects, capabilities, comptime) — release N11 (five example projects in CI).
-- [x] "Fides by Example" — like "Go by Example" — `docs/cookbook.md` (competitive AD7).
+- [x] "Fides by Example" — like "Go by Example" — `docs/guides/cookbook.md` (competitive AD7).
 - [-] **Overlaps with:** Existing roadmap Phase 7D
 - [-] **Not built:** This is new
 
@@ -8360,7 +8358,7 @@ Fides's effect system is the foundation — effect handlers can replace async/aw
 ##### L10F — Community
 - [>] Community forum and Discord/Matrix chat — moved to external-roadmap.md (Nov 21).
 - [x] GitHub Discussions for Q&A
-- [x] Contributing guide (how to contribute to compiler, stdlib, docs) — `CONTRIBUTING.md`, `docs/compiler-internals.md` (competitive AD11).
+- [x] Contributing guide (how to contribute to compiler, stdlib, docs) — `CONTRIBUTING.md`, `docs/reference/compiler-internals.md` (competitive AD11).
 - [x] Code of conduct — `CODE_OF_CONDUCT.md`.
 - [-] **Overlaps with:** Existing roadmap Phase 7D
 - [-] **Not built:** This is new

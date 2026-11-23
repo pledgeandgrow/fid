@@ -1,7 +1,7 @@
 # image_writer.fd — one writer of executable and object files
 
 > **New doc 2026-11-21.** Read from the source; the status is the Nov 21
-> check of llvm-roadmap TG13. Design: docs/image-writer.md.
+> check of llvm-roadmap TG13. Design: docs/reference/image-writer.md.
 
 - **Path:** `compiler/image_writer.fd`
 - **LOC:** 968 (2026-11-21). In git since Nov 19 (49fb2b9).

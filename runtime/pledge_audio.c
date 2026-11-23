@@ -9,6 +9,10 @@
 // Alternative (no SDL2): use ALSA directly (libasound2-dev).
 // The SDL2_mixer path is recommended for cross-platform compatibility.
 
+// its own header first: the C compiler checks each definition against
+// the declaration Fides binds to (pledge_input_init was int here and
+// long long there, unnoticed while this file did not include it)
+#include "pledge_audio.h"
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_mixer.h>
 #include <string.h>

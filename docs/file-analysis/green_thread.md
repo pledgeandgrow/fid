@@ -5,7 +5,7 @@
   Nov 21: imported by interp.fd and compiler.fd. The yield-twice finding
   is still open (known-bugs 2g.20). The interpreter's tasks (`task_go`,
   `spawn`, channels) interleave since LG11 through interp.fd's own
-  scheduler (docs/interp-tasks.md), not through this module.
+  scheduler (docs/reference/interp-tasks.md), not through this module.
 - **Role:** thread records and scheduler bookkeeping (`GreenThread`,
   `GreenThreadScheduler`) for the interpreter's `p_gt_*` builtins. It does
   not run anything itself: the interpreter resolves the function by name

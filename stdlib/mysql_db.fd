@@ -164,14 +164,23 @@ pub fn mysql_co_send(sock: i64, bytes: Vec<i64>) -> i64 {
     if n == 0 {
         return 0;
     }
-    var mem: i64 = p_malloc(n + 8);
+    var mem: i64 = 0;
+    // SAFETY: a fresh block of n + 8 bytes: the loop below writes the n
+    // bytes into it.
+    unsafe {
+        mem = p_malloc(n + 8);
+    }
     var i: i64 = 0;
     while i < n {
         p_volatile_store8(mem + i, bytes.get(i));
         i = i + 1;
     }
     val sent: i64 = p_co_send(sock, mem, n);
-    p_free(mem);
+    // SAFETY: the block above; p_co_send has returned and keeps no pointer
+    // to it.
+    unsafe {
+        p_free(mem);
+    }
     return sent;
 }
 
@@ -182,14 +191,22 @@ pub fn mysql_co_recv(sock: i64, max: i64) -> Vec<i64> {
     if max <= 0 {
         return out;
     }
-    var mem: i64 = p_malloc(max + 8);
+    var mem: i64 = 0;
+    // SAFETY: max > 0 (checked above): a fresh block of max + 8 bytes, of
+    // which p_co_recv is told to write at most max.
+    unsafe {
+        mem = p_malloc(max + 8);
+    }
     val n: i64 = p_co_recv(sock, mem, max, MJ_TIMEOUT_MS);
     var k: i64 = 0;
     while k < n {
         out.push(p_volatile_load8(mem + k) & 255);
         k = k + 1;
     }
-    p_free(mem);
+    // SAFETY: the block above; its n received bytes were copied into out.
+    unsafe {
+        p_free(mem);
+    }
     return out;
 }
 

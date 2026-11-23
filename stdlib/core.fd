@@ -2287,8 +2287,10 @@ pub fn Str_drop(s: i64) {
     if s == 0 {
         return;
     }
-    // no header before an unaligned pointer (see p_str_hdr_len)
+    // no header before an unaligned pointer (see p_str_hdr_len): not a str
+    // (string header by construction, p_str_no_header)
     if (s & 7) != 0 {
+        p_str_no_header(s);
         return;
     }
     var mp: *mut i64 = s - 16;
@@ -2305,7 +2307,8 @@ pub fn Str_drop(s: i64) {
         w = *mp;
         l = *lp;
     }
-    if !p_str_len_word(l) {
+    if !p_str_has_header(w, l) {
+        p_str_no_header(s);
         return;
     }
     if w == P_STR_DEAD {
@@ -2338,8 +2341,10 @@ pub fn Str_dup(s: i64) -> i64 {
     if s == 0 {
         return s;
     }
-    // no header before an unaligned pointer (see p_str_hdr_len)
+    // no header before an unaligned pointer (see p_str_hdr_len): not a str
+    // (string header by construction, p_str_no_header)
     if (s & 7) != 0 {
+        p_str_no_header(s);
         return s;
     }
     var mp: *mut i64 = s - 16;
@@ -2352,7 +2357,8 @@ pub fn Str_dup(s: i64) -> i64 {
         w = *mp;
         l = *lp;
     }
-    if !p_str_len_word(l) {
+    if !p_str_has_header(w, l) {
+        p_str_no_header(s);
         return s;
     }
     if w == P_STR_DEAD {
@@ -6377,6 +6383,12 @@ pub fn Int_to_str_into(buf: i64, cap: i64, x: i64) -> str {
     var end: i64 = buf + cap - 1;
     var p: i64 = end - 1;
     var v: i64 = x;
+    // kept <= 0 (as the doc above says; INT64_MIN has no positive twin): a
+    // positive x was not negated, so v % 10 was positive and each digit
+    // came out as 48 - d (42 printed ",.")
+    if v > 0 {
+        v = 0 - v;
+    }
     while true {
         var d: i64 = 0 - (v % 10);
         var dp: *mut u8 = p;
@@ -6405,6 +6417,26 @@ pub fn Int_to_str_into(buf: i64, cap: i64, x: i64) -> str {
         *np = 0;
     }
     var n: i64 = end - p - 1;
+    // The digits (and their NUL) were rendered at the area's end, from p + 1;
+    // a str's header is the 16 bytes right before it, so they move down to
+    // buf + 16 (8-aligned, just after the header written below). Before, the
+    // header was at buf but the string returned was p + 1: nothing a str
+    // needs was in front of it, and core's strict Str_dup/Str_drop (string
+    // header by construction) stopped on it (test_fstring_int).
+    var r: i64 = buf + 16;
+    var k: i64 = 0;
+    while k <= n {
+        var from: *mut u8 = p + 1 + k;
+        var to: *mut u8 = r + k;
+        // SAFETY: k <= n: p + 1 + k <= end, inside the area; r + k <=
+        // buf + 16 + 20 < buf + cap (cap >= 40, n <= 20). The copy runs
+        // upward and r <= p + 1 (the digits start at least 19 bytes past
+        // buf), so a byte is read before anything overwrites it.
+        unsafe {
+            *to = *from;
+        }
+        k = k + 1;
+    }
     var hp: *mut i64 = buf;
     var lp: *mut i64 = buf + 8;
     // SAFETY: the two header words at the start of the area (cap >= 40).
@@ -6412,7 +6444,7 @@ pub fn Int_to_str_into(buf: i64, cap: i64, x: i64) -> str {
         *hp = P_STR_STATIC;
         *lp = n;
     }
-    return p + 1;
+    return r;
 }
 
 /// `bool_to_str` built in a caller's stack area `buf` of `cap` bytes (LF13,
@@ -6625,6 +6657,35 @@ pub fn p_str_free(s: i64) {
 // is not taken for a header: freeing s - 16 then hit "Invalid free".
 fn p_str_len_word(w: i64) -> bool {
     return w >= 0 && w < 0x10000000000;
+}
+
+// String header by construction (Nov 22). Every str a program holds carries
+// the 16-byte header [w][len] in front of it: a literal (P_STR_MAGIC,
+// P_STR_STATIC), a counted heap string (P_STR_RC + count, with the
+// P_STR_ROOM / P_STR_RC_MAX bits) or one freed (P_STR_DEAD). The ways a
+// header-less pointer could become a str are closed: a C function's str
+// result is copied by p_str_from_ptr (the lowering), `x as str` of a number
+// or a pointer needs `unsafe` (the type checker), and every runtime string
+// producer returns a counted string (AGENTS.md Known Bugs 25). So Str_drop
+// and Str_dup no longer guess: a str without that header is a broken
+// invariant and stops the program, instead of being left alone (a leak) or,
+// when the bytes in front of it happened to look like a count, freed or
+// counted (a corruption: Known Bugs 21). P_STR_STRICT = false restores the
+// old leniency while hunting a producer that still makes plain strings.
+const P_STR_STRICT: bool = true;
+
+/// Whether [w][l], the two words in front of a str, are a string header:
+/// w of the P_STR_RC family (counted, literal or freed) and l a length.
+fn p_str_has_header(w: i64, l: i64) -> bool {
+    var d: i64 = w - P_STR_RC;
+    return d >= 0 && d < 0x100000000 && p_str_len_word(l);
+}
+
+/// A str without a string header reached Str_drop or Str_dup.
+fn p_str_no_header(s: i64) {
+    if P_STR_STRICT {
+        p_panic("a str without a string header (a C string or a raw word made a str without p_str_from_ptr; `as str` needs unsafe)");
+    }
 }
 
 // str_copy_n: copy n bytes from src to dst. Both are i64 addresses.

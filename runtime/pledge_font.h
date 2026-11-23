@@ -7,12 +7,13 @@
 #define PLEDGE_FONT_H
 
 // Load a TTF/OTF font from a file path at the given pixel size.
-// Writes font info to out_font (a Fides Font struct pointer).
-// Returns 0 on success, -1 on failure.
+// Returns the font's handle (a PledgeFont*, as a positive integer) on
+// success, -1 on failure; pledge_font_free gives it back. out_font is not
+// used.
 long long pledge_font_load(char* path, double pixel_size, void* out_font);
 
 // Load a TTF/OTF font from raw bytes in memory.
-// Returns 0 on success, -1 on failure.
+// Returns the font's handle as pledge_font_load does, -1 on failure.
 long long pledge_font_load_mem(void* data, long long data_len,
                                  double pixel_size, void* out_font);
 

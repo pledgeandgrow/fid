@@ -339,6 +339,9 @@ pub struct BorrowChecker {
     // Phase 4: When true, &mut borrows are collected as "reserved" instead
     // of immediately activated.
     pub in_reservation_phase: bool,
+    // BG13: set while the `&`/`&mut` being recorded reaches into a Vec's
+    // buffer (`&v[i]`, `&s.v[i]`, `&v[i].x`).
+    pub ref_into_elem: bool,
 
     // Phase 6: NLL. Maps each variable name to the last statement index.
     // dead_at[i]: borrowers to release once stmt_index reaches i. Lets
@@ -426,7 +429,7 @@ pub fn BorrowChecker_new(mode: BorrowckMode) -> BorrowChecker {
     var scope_stack: Vec<StringVec> = Vec::new();
     scope_stack.push(scope);
     return BorrowChecker {
-        shared_borrows: Vec::new(), mut_borrow: Vec::new(), borrow_of: Vec::new(), scope_stack: scope_stack, unsafe_depth: 0, current_func: OptStr::None, temp_counter: 0, stmt_line: 0, temp_checkpoints: Vec::new(), reserved_mut_borrows: Vec::new(), in_reservation_phase: false, dead_at: Vec::new(), last_use: Vec::new(), last_use_index: HashMap_new(), sb_ix: HashMap_new(), mb_ix: HashMap_new(), bo_ix: HashMap_new(), sb_pfx: HashMap_new(), mb_pfx: HashMap_new(), iterating: Vec::new(), skip_bodies: 0, stmt_index: 0, errors: Vec::new(), warnings: Vec::new(), mode: mode, par_lt: false, lt_ties: Vec::new(), lt_self_mut: Vec::new(), mh_to: Vec::new(), mh_from: Vec::new(), alias_seen: false, ref_vars: HashMap_new(),
+        shared_borrows: Vec::new(), mut_borrow: Vec::new(), borrow_of: Vec::new(), scope_stack: scope_stack, unsafe_depth: 0, current_func: OptStr::None, temp_counter: 0, stmt_line: 0, temp_checkpoints: Vec::new(), reserved_mut_borrows: Vec::new(), in_reservation_phase: false, ref_into_elem: false, dead_at: Vec::new(), last_use: Vec::new(), last_use_index: HashMap_new(), sb_ix: HashMap_new(), mb_ix: HashMap_new(), bo_ix: HashMap_new(), sb_pfx: HashMap_new(), mb_pfx: HashMap_new(), iterating: Vec::new(), skip_bodies: 0, stmt_index: 0, errors: Vec::new(), warnings: Vec::new(), mode: mode, par_lt: false, lt_ties: Vec::new(), lt_self_mut: Vec::new(), mh_to: Vec::new(), mh_from: Vec::new(), alias_seen: false, ref_vars: HashMap_new(),
     };
 }
 
@@ -1665,6 +1668,54 @@ fn collect_var_uses_expr(self: &mut BorrowChecker, expr: Expr, idx: i64) -> void
         Expr::NamedArg(name, e) => {
             collect_var_uses_expr(self, bc_box_expr_unbox(e), idx);
         }
+        // BG12: a borrower read only under a cast, `is`, a tuple, a pipe, a
+        // closure, comptime or asm had no last use, so bc_never_read
+        // released its borrow where it was made. A closure's body reads
+        // what it captures.
+        Expr::IsCheck(e, _) => {
+            collect_var_uses_expr(self, bc_box_expr_unbox(e), idx);
+        }
+        Expr::TupleLit(elems) => {
+            var t: i64 = 0;
+            while t < elems.len() {
+                collect_var_uses_expr(self, elems.get(t), idx);
+                t = t + 1;
+            }
+        }
+        Expr::Closure(_, body, _) => {
+            var cb: i64 = 0;
+            while cb < body.len() {
+                collect_var_uses_stmt(self, body.get(cb), idx);
+                cb = cb + 1;
+            }
+        }
+        Expr::Cast(e, _) => {
+            collect_var_uses_expr(self, bc_box_expr_unbox(e), idx);
+        }
+        Expr::Asm(_, ops) => {
+            var o: i64 = 0;
+            while o < ops.len() {
+                collect_var_uses_expr(self, ops.get(o).expr, idx);
+                o = o + 1;
+            }
+        }
+        Expr::Comptime(e) => {
+            collect_var_uses_expr(self, bc_box_expr_unbox(e), idx);
+        }
+        Expr::ComptimeBlock(body) => {
+            var kb: i64 = 0;
+            while kb < body.len() {
+                collect_var_uses_stmt(self, body.get(kb), idx);
+                kb = kb + 1;
+            }
+        }
+        Expr::PipeForward(l, r) => {
+            collect_var_uses_expr(self, bc_box_expr_unbox(l), idx);
+            collect_var_uses_expr(self, bc_box_expr_unbox(r), idx);
+        }
+        Expr::QuantCast(e, _) => {
+            collect_var_uses_expr(self, bc_box_expr_unbox(e), idx);
+        }
         _ => {
         }
     }
@@ -2329,6 +2380,19 @@ fn create_borrow(self: &mut BorrowChecker, borrowed_path: str, borrower: str, is
             violation(self, line, "cannot create &" + borrowed_path + ": a mutable borrow is already active on it or a related path" + holder_note(self, borrowed_path, 1));
             return;
         }
+        // BG13: ... except a `&mut` reserved by an argument of this same
+        // call when the shared one points into the Vec's buffer:
+        // `g(&mut v, &v[0])` hands g a reference the callee's push can
+        // leave dangling (the shared temporary was released before
+        // activation, so activation saw no conflict). `g(&mut a, &a)` and
+        // `g(&mut s, &s.x)` stay two-phase borrows (CM2, test_borrowck.fd
+        // Phase 4): they point at the variable, which the callee's writes
+        // keep valid. A shared use that ends first (`v.push(v.len())`,
+        // `f(&mut v, h(&v))`) stays valid too.
+        if self.in_reservation_phase && self.ref_into_elem && str_starts_with(borrower, "__tmp_ref_") && bc_reserved_in_this_call(self, borrowed_path) {
+            violation(self, line, "cannot create &" + borrowed_path + "[..]: a mutable borrow of the Vec is reserved by another argument of this call, and a resize there would leave this reference dangling" + holder_note(self, borrowed_path, 1));
+            return;
+        }
         shared_borrows_add_borrower(self, borrowed_path, borrower);
     }
     borrow_of_add(self, borrower, borrowed_path, is_mut, line);
@@ -2344,6 +2408,68 @@ fn create_borrow(self: &mut BorrowChecker, borrowed_path: str, borrower: str, is
     }
 }
 
+/// BG13: the index N of a temporary borrower `__tmp_ref_N`, or -1.
+fn bc_temp_index(name: str) -> i64 {
+    if !str_starts_with(name, "__tmp_ref_") {
+        return -1;
+    }
+    var n: i64 = str_len(name);
+    if n <= 10 {
+        return -1;
+    }
+    var v: i64 = 0;
+    var k: i64 = 10;
+    while k < n {
+        var c: i64 = str_byte_at(name, k);
+        if c < 48 || c > 57 {
+            return -1;
+        }
+        v = v * 10 + (c - 48);
+        k = k + 1;
+    }
+    return v;
+}
+
+/// BG13: whether `e` (the inside of a `&`) reads through an index, so the
+/// reference points into a Vec's buffer: `v[i]`, `s.v[i]`, `v[i].x`.
+fn bc_expr_through_index(e: Expr) -> bool {
+    match e {
+        Expr::Index(_, _) => {
+            return true;
+        }
+        Expr::FieldAccess(x, _) => {
+            return bc_expr_through_index(bc_box_expr_unbox(x));
+        }
+        _ => {
+        }
+    }
+    return false;
+}
+
+/// BG13: whether a `&mut` of `path`, or of what `path` is a field of, is
+/// reserved by a temporary of the innermost call being checked (made since
+/// its checkpoint, the top of temp_checkpoints): `g(&mut a, &a)`,
+/// `g(&mut s, &s.x)`. Not yet a `&mut` of a field of `path` (`g(&mut
+/// s.x, &s)`): compiler/comptime_eval.fd passes `&mut prog.funcs, ..,
+/// &prog` to one call five times, so rejecting it waits for those calls.
+fn bc_reserved_in_this_call(self: &BorrowChecker, path: str) -> bool {
+    if self.temp_checkpoints.len() == 0 {
+        return false;
+    }
+    var cp: i64 = self.temp_checkpoints.get(self.temp_checkpoints.len() - 1);
+    var i: i64 = 0;
+    while i < self.reserved_mut_borrows.len() {
+        var r: ReservedMutBorrow = self.reserved_mut_borrows.get(i);
+        if r.path == path || str_starts_with(path, r.path + ".") {
+            if bc_temp_index(r.borrower) >= cp {
+                return true;
+            }
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
 /// OW5: a named borrower (not a temporary, a closure capture or `r#k`)
 /// that no statement of the function reads.
 fn bc_never_read(self: &BorrowChecker, borrower: str) -> bool {
@@ -2351,6 +2477,135 @@ fn bc_never_read(self: &BorrowChecker, borrower: str) -> bool {
         return false;
     }
     return last_use_get(self, borrower) < 0;
+}
+
+// --- BG15: loop bodies -----------------------------------------------------
+// A loop body checked once does not see a borrow made late in an iteration
+// at the top of the next one (`v.push(i); print(*e); e = &v[0];`). After the
+// first pass, a borrow the body gave to a variable declared outside it that
+// is still held and that the next iteration reads before setting it again
+// (or the `while` condition reads) is carried: the body is checked a second
+// time from that state, its repeated messages dropped. A loop that leaves no
+// such borrow (most loops) is checked once.
+
+/// BG15: one pass over a loop body, in a scope of its own (with the `for`
+/// loop's variable declared in it when `loop_var` is not "").
+fn bc_loop_body_pass(self: &mut BorrowChecker, loop_var: str, body: Vec<Stmt>) -> void {
+    push_scope(self);
+    if loop_var != "" {
+        declare_var(self, loop_var);
+    }
+    var b: i64 = 0;
+    while b < body.len() {
+        check_stmt(self, body.get(b));
+        b = b + 1;
+    }
+    pop_scope(self);
+}
+
+/// BG15: whether `body` reads `name` before a statement of its own (not
+/// one nested in a branch) sets it again; an over-approximation of the
+/// identifiers read (esc_idents_stmts).
+fn bc_reads_before_set(body: Vec<Stmt>, name: str) -> bool {
+    var i: i64 = 0;
+    while i < body.len() {
+        var s: Stmt = body.get(i);
+        var one: Vec<Stmt> = Vec::new();
+        one.push(s);
+        var used: Vec<str> = Vec::new();
+        esc_idents_stmts(one, &mut used);
+        if bc_vec_contains_str(used, name) {
+            return true;
+        }
+        match s {
+            Stmt::Assign(target, op, _, _) => {
+                if target == name {
+                    match op {
+                        AssignOp::Assign => {
+                            return false;
+                        }
+                        _ => {
+                            return true;
+                        }
+                    }
+                }
+            }
+            Stmt::Let(lname, _, _, _, _, _, _) => {
+                if lname == name {
+                    return false;
+                }
+            }
+            _ => {
+            }
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// BG15: whether the loop body left a carried borrow (made since borrow_of
+/// had `start` entries, still held, read again by the next iteration: by
+/// `cond_reads` or by the body before it is set). When it did, the other
+/// borrows the body left are released for the second pass (it makes them
+/// again), so only a carried one can conflict there.
+fn bc_loop_carried(self: &mut BorrowChecker, start: i64, cond_reads: Vec<str>, body: Vec<Stmt>) -> bool {
+    var carried: bool = false;
+    var others: Vec<str> = Vec::new();
+    var i: i64 = start;
+    while i < self.borrow_of.len() {
+        var b: str = self.borrow_of.get(i).borrower;
+        if b != "" {
+            // `r#k` (LG3) is a further borrow of `r`
+            var base: str = b;
+            var hk: i64 = str_find(b, "#");
+            if hk > 0 {
+                base = str_slice(b, 0, hk);
+            }
+            if bc_vec_contains_str(cond_reads, base) || bc_reads_before_set(body, base) {
+                carried = true;
+            } else if hk < 0 {
+                others.push(b);
+            }
+        }
+        i = i + 1;
+    }
+    if carried {
+        var j: i64 = 0;
+        while j < others.len() {
+            release_borrow_by(self, others.get(j));
+            j = j + 1;
+        }
+    }
+    return carried;
+}
+
+/// BG15: drop the messages from index `e0` (errors) and `w0` (warnings) on
+/// that repeat an earlier one (the second pass over a loop body).
+fn bc_drop_repeats(self: &mut BorrowChecker, e0: i64, w0: i64) -> void {
+    if self.errors.len() > e0 {
+        var kept: Vec<str> = Vec::new();
+        var i: i64 = 0;
+        while i < self.errors.len() {
+            var m: str = self.errors.get(i);
+            if i < e0 || !bc_vec_contains_str(kept, m) {
+                kept.push(m);
+            }
+            i = i + 1;
+        }
+        self.errors = kept;
+    }
+    if self.warnings.len() > w0 {
+        var kept_w: Vec<str> = Vec::new();
+        var k: i64 = 0;
+        while k < self.warnings.len() {
+            var w: str = self.warnings.get(k);
+            if k < w0 || !bc_vec_contains_str(kept_w, w) {
+                kept_w.push(w);
+            }
+            k = k + 1;
+        }
+        self.warnings = kept_w;
+    }
 }
 
 // Phase 4: Activate all reserved &mut borrows. Called after all call
@@ -2463,12 +2718,29 @@ fn check_stmt(self: &mut BorrowChecker, stmt: Stmt) -> void {
             // If the initializer is itself a borrow, record it.
             maybe_record_borrow_from_expr(self, name, expr, line);
         }
-        Stmt::LetTuple(names, expr, _) => {
+        Stmt::LetTuple(names, expr, tline) => {
             check_expr(self, expr);
             var n: i64 = 0;
             while n < names.len() {
                 declare_var(self, names.get(n));
                 n = n + 1;
+            }
+            // BG79: `val (r, k) = (&mut x, 1)`: r borrows x (it recorded
+            // no borrow at all)
+            match expr {
+                Expr::TupleLit(telems) => {
+                    if telems.len() == names.len() && self.unsafe_depth == 0 {
+                        var ti: i64 = 0;
+                        while ti < names.len() {
+                            if bc_record_ref_borrow(self, names.get(ti), telems.get(ti), tline) {
+                                HashMap_insert(self.ref_vars, names.get(ti), 1);
+                            }
+                            ti = ti + 1;
+                        }
+                    }
+                }
+                _ => {
+                }
             }
         }
         Stmt::LetUninit(name, _, _, _) => {
@@ -2562,13 +2834,21 @@ fn check_stmt(self: &mut BorrowChecker, stmt: Stmt) -> void {
         }
         Stmt::While(cond, body, _) => {
             check_expr(self, cond);
-            push_scope(self);
-            var b: i64 = 0;
-            while b < body.len() {
-                check_stmt(self, body.get(b));
-                b = b + 1;
+            // BG15: a second pass when the body carries a borrow into the
+            // next iteration (the condition is evaluated again first)
+            var w_start: i64 = self.borrow_of.len();
+            bc_loop_body_pass(self, "", body);
+            var cond_stmts: Vec<Stmt> = Vec::new();
+            cond_stmts.push(Stmt::Expr(cond, 0));
+            var cond_reads: Vec<str> = Vec::new();
+            esc_idents_stmts(cond_stmts, &mut cond_reads);
+            if bc_loop_carried(self, w_start, cond_reads, body) {
+                var w_e0: i64 = self.errors.len();
+                var w_w0: i64 = self.warnings.len();
+                check_expr(self, cond);
+                bc_loop_body_pass(self, "", body);
+                bc_drop_repeats(self, w_e0, w_w0);
             }
-            pop_scope(self);
         }
         Stmt::For(loop_var, iterator, body, _) => {
             // `for x in &v`: the reference the iterator makes holds while the
@@ -2576,50 +2856,51 @@ fn check_stmt(self: &mut BorrowChecker, stmt: Stmt) -> void {
             // a later `&mut v` was rejected: test_for_borrowed_vec)
             var for_checkpoint: i64 = self.temp_counter;
             check_expr(self, iterator);
-            push_scope(self);
-            declare_var(self, loop_var);
             // `for x in v` / `for x in v.iter()`: v is read by the loop
+            // BG14: `for x in s.items` / `s.items.iter()` too: the path of
+            // the field (bc_field_path), not only a variable
             var iter_var: str = "";
             match iterator {
-                Expr::Ident(iv) => {
-                    iter_var = iv;
-                }
                 Expr::MethodCall(irecv, im, _) => {
                     if im == "iter" || im == "keys" || im == "values" {
-                        match bc_box_expr_unbox(irecv) {
-                            Expr::Ident(iv2) => {
-                                iter_var = iv2;
-                            }
-                            _ => {
-                            }
-                        }
+                        iter_var = bc_field_path(bc_box_expr_unbox(irecv));
                     }
                 }
                 _ => {
+                    iter_var = bc_field_path(iterator);
                 }
             }
             if iter_var != "" {
                 self.iterating.push(iter_var);
             }
-            var b: i64 = 0;
-            while b < body.len() {
-                check_stmt(self, body.get(b));
-                b = b + 1;
+            // BG15: the loop variable is declared in the body's scope; a
+            // second pass when the body carries a borrow into the next
+            // iteration
+            var f_start: i64 = self.borrow_of.len();
+            bc_loop_body_pass(self, loop_var, body);
+            var no_reads: Vec<str> = Vec::new();
+            if bc_loop_carried(self, f_start, no_reads, body) {
+                var f_e0: i64 = self.errors.len();
+                var f_w0: i64 = self.warnings.len();
+                bc_loop_body_pass(self, loop_var, body);
+                bc_drop_repeats(self, f_e0, f_w0);
             }
             if iter_var != "" {
                 self.iterating.pop();
             }
-            pop_scope(self);
             release_temps_since(self, for_checkpoint);
         }
         Stmt::Loop(body, _) => {
-            push_scope(self);
-            var b: i64 = 0;
-            while b < body.len() {
-                check_stmt(self, body.get(b));
-                b = b + 1;
+            // BG15: as While, with no condition
+            var l_start: i64 = self.borrow_of.len();
+            bc_loop_body_pass(self, "", body);
+            var l_no_reads: Vec<str> = Vec::new();
+            if bc_loop_carried(self, l_start, l_no_reads, body) {
+                var l_e0: i64 = self.errors.len();
+                var l_w0: i64 = self.warnings.len();
+                bc_loop_body_pass(self, "", body);
+                bc_drop_repeats(self, l_e0, l_w0);
             }
-            pop_scope(self);
         }
         Stmt::Break(opt_e, _) => {
             match opt_e {
@@ -2866,12 +3147,15 @@ fn check_expr(self: &mut BorrowChecker, expr: Expr) -> void {
             // them on their own lines; the call's borrows keep the call's
             // line (bugs 42/53: "line 0")
             var call_line: i64 = self.stmt_line;
+            // BG13: this call's temporaries are those made since checkpoint
+            self.temp_checkpoints.push(checkpoint);
             var a: i64 = 0;
             while a < args.len() {
                 check_expr(self, args.get(a));
                 self.stmt_line = call_line;
                 a = a + 1;
             }
+            self.temp_checkpoints.pop();
             self.in_reservation_phase = prev_reservation;
             // 1. Release temp shared borrows only (reserved &mut temps stay).
             release_shared_temps_since(self, checkpoint);
@@ -2954,15 +3238,14 @@ fn check_expr(self: &mut BorrowChecker, expr: Expr) -> void {
             // Phase 4: The receiver mutation check is deferred to after
             // argument evaluation (reservation phase).
             var receiver_path: OptStr = OptStr::None;
-            match receiver {
-                Expr::Ident(name) => {
-                    // LG3: a user method taking `&self` or `self` by value
-                    // only reads its receiver too (bc_user_read_method)
-                    if !bc_read_method(method) && !bc_user_read_method(method) {
-                        receiver_path = OptStr::Some(name);
-                    }
-                }
-                _ => {
+            // BG14: a field path too (`s.items.push(2)` changes s.items),
+            // not only a variable (bc_field_path, as FieldAssign)
+            var rpath: str = bc_field_path(receiver);
+            if rpath != "" {
+                // LG3: a user method taking `&self` or `self` by value
+                // only reads its receiver too (bc_user_read_method)
+                if !bc_read_method(method) && !bc_user_read_method(method) {
+                    receiver_path = OptStr::Some(rpath);
                 }
             }
             // Phase 4: Evaluate receiver + args in reservation mode.
@@ -2970,6 +3253,8 @@ fn check_expr(self: &mut BorrowChecker, expr: Expr) -> void {
             var prev_reservation: bool = self.in_reservation_phase;
             self.in_reservation_phase = true;
             var mcall_line: i64 = self.stmt_line;
+            // BG13: this call's temporaries are those made since checkpoint
+            self.temp_checkpoints.push(checkpoint);
             check_expr(self, bc_box_expr_unbox(receiver));
             self.stmt_line = mcall_line;
             var a: i64 = 0;
@@ -2978,6 +3263,7 @@ fn check_expr(self: &mut BorrowChecker, expr: Expr) -> void {
                 self.stmt_line = mcall_line;
                 a = a + 1;
             }
+            self.temp_checkpoints.pop();
             self.in_reservation_phase = prev_reservation;
             // 1. Release temp shared borrows only.
             release_shared_temps_since(self, checkpoint);
@@ -2989,6 +3275,13 @@ fn check_expr(self: &mut BorrowChecker, expr: Expr) -> void {
             match receiver_path {
                 OptStr::Some(name) => {
                     check_mutation(self, name, self.stmt_line);
+                    // BG14: `s.items.push(2)` while `&s` lives: a borrow
+                    // of what the field belongs to (as FieldAssign)
+                    if has_shared_borrow_on_prefix(self, name) {
+                        violation(self, self.stmt_line, "cannot mutate " + name + ": shared borrow(s) are active on it or a related path" + holder_note(self, name, 0));
+                    } else if has_mut_borrow_on_prefix(self, name) {
+                        violation(self, self.stmt_line, "cannot mutate " + name + ": a mutable borrow is active on it or a related path" + holder_note(self, name, 1));
+                    }
                 }
                 OptStr::None => {
                 }
@@ -3004,6 +3297,35 @@ fn check_expr(self: &mut BorrowChecker, expr: Expr) -> void {
         Expr::Index(array, index) => {
             check_expr(self, bc_box_expr_unbox(array));
             check_expr(self, bc_box_expr_unbox(index));
+        }
+        // BG79: a tuple's elements were not looked into (`(&mut x, &x)`
+        // was accepted). The references they make end with the tuple
+        // (outside a call, whose own end releases them), or, bound by
+        // `val t = (..)` / `val (a, b) = (..)`, are that variable's
+        // borrows (maybe_record_borrow_from_expr, check_stmt LetTuple).
+        Expr::TupleLit(elems) => {
+            var tcp: i64 = self.temp_counter;
+            var te: i64 = 0;
+            while te < elems.len() {
+                check_expr(self, elems.get(te));
+                te = te + 1;
+            }
+            if !self.in_reservation_phase {
+                release_temps_since(self, tcp);
+            }
+        }
+        // BG79: `x is T` and a comptime block were not looked into
+        Expr::IsCheck(ie, _) => {
+            check_expr(self, bc_box_expr_unbox(ie));
+        }
+        Expr::ComptimeBlock(cbody) => {
+            push_scope(self);
+            var cb: i64 = 0;
+            while cb < cbody.len() {
+                check_stmt(self, cbody.get(cb));
+                cb = cb + 1;
+            }
+            pop_scope(self);
         }
         Expr::FString(parts) => {
             var p: i64 = 0;
@@ -3079,7 +3401,10 @@ fn check_expr(self: &mut BorrowChecker, expr: Expr) -> void {
                         if self.in_reservation_phase {
                             ref_path = bc_elem_path(bc_box_expr_unbox(inner), path);
                         }
+                        var prev_elem: bool = self.ref_into_elem;
+                        self.ref_into_elem = bc_expr_through_index(bc_box_expr_unbox(inner));
                         create_temp_borrow(self, ref_path, is_mut, self.stmt_line);
+                        self.ref_into_elem = prev_elem;
                     }
                     OptStr::None => {
                     }
@@ -3251,6 +3576,17 @@ fn maybe_record_borrow_from_expr(self: &mut BorrowChecker, name: str, expr: Expr
             // its fields are given (check_expr released their temporaries)
             bc_record_struct_borrow(self, name, sname, fields, line);
         }
+        Expr::TupleLit(telems) => {
+            // BG79: `val t = (&mut x, 1)`: t borrows x as long as it lives
+            // (check_expr released the tuple's temporaries)
+            if self.unsafe_depth == 0 && !self.in_reservation_phase {
+                var ti: i64 = 0;
+                while ti < telems.len() {
+                    bc_record_ref_borrow(self, name, telems.get(ti), line);
+                    ti = ti + 1;
+                }
+            }
+        }
         Expr::Ident(src) => {
             // LG3: `val w = v` where v holds borrows (a reference, or a
             // struct holding one): w borrows the same; a `&mut` moves to w
@@ -3264,6 +3600,26 @@ fn maybe_record_borrow_from_expr(self: &mut BorrowChecker, name: str, expr: Expr
         _ => {
         }
     }
+}
+
+/// BG79: when `e` is a reference to a variable or field path, `name`
+/// borrows it (a tuple element bound by a `val`); whether it was one.
+fn bc_record_ref_borrow(self: &mut BorrowChecker, name: str, e: Expr, line: i64) -> bool {
+    match e {
+        Expr::Ref(inner, is_mut) => {
+            match extract_field_path(bc_box_expr_unbox(inner)) {
+                OptStr::Some(path) => {
+                    create_borrow(self, path, name, is_mut, line);
+                    return true;
+                }
+                OptStr::None => {
+                }
+            }
+        }
+        _ => {
+        }
+    }
+    return false;
 }
 
 // --- pattern_bindings -----------------------------------------------------

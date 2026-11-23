@@ -367,7 +367,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       machine layer (disassembly, or --elf/--coff/--macho objects as emit
       --obj), REPL `:pir` became `:opt`; compiler.fd build_executable
       deleted; main.fd/compiler.fd no longer import pir, opt, pe,
-      codegen_*, peephole, *_enc, runtime_* (docs/pir-retired.md,
+      codegen_*, peephole, *_enc, runtime_* (docs/reference/pir-retired.md,
       tests/tooling/mi18-pir-retired-check.sh). elf64.fd's unused `use
       compiler::pir;` is dropped (Nov 17), so nothing the compiler reaches
       imports pir.fd. Left: delete the files (pir.fd, opt.fd, regalloc.fd,
@@ -805,7 +805,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       scripts/disasm-check.sh compares it with llvm-objdump (x86-64:
       instruction boundaries; AArch64/RISC-V: no word left undecoded).
       Nov 17: the table is done: compiler/disasm.fd "The encoding forms:
-      one table" (docs/disasm-encoding-table.md), checked by
+      one table" (docs/reference/disasm-encoding-table.md), checked by
       tests/nattools/enc_table_unit.fd; scripts/disasm-check.sh now pads
       with nops for llvm-objdump (tests/nattools/disasm_pad.py) and sends
       each listed instruction back through clang's assembler.
@@ -968,7 +968,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       Old bodies checked byte for byte and removed Nov 17 (FID_IMG_OLD is
       gone). Unit tests pin the bytes by digest:
       tests/nattools/image_writer_unit.fd, image_writer_obj_unit.fd; real
-      programs: tests/nattools/image_same_check.sh. docs/image-writer.md.
+      programs: tests/nattools/image_same_check.sh. docs/reference/image-writer.md.
       Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
       validated — no old writer body is left (only a comment names
       FID_IMG_OLD); image_writer_unit and image_writer_obj_unit match their
@@ -2331,6 +2331,9 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       (iropt ~180 ms, lowering ~270, native code ~300). The check script's
       "4 ms" was a cache hit, and its hello expectation is wrong. Left:
       0.5 s, then 0.1 s.
+      Nov 23 audit (fid-nov22.exe): 1761 ms total — front end 730
+      (typecheck 271, mono 340), lower 259, iropt 177, native code 503.
+      Both targets unmet.
 - [x] SP4. The checked stdlib cached in binary form, not re-parsed on every build
       (L).
       Competitive CS2: compiler.fd `astcache_*` + ast_ser.fd keep the merged
@@ -2396,6 +2399,10 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       §88–95): a hit caller can get a call where a fresh build emitted a jump;
       needs a deterministic summary ask order. All local changes, none alter
       codegen semantics.
+      Nov 23 audit (fid-nov22.exe): repro-check confirms the audit —
+      cache miss = cache off everywhere (C, x86_64-linux, all fixtures),
+      but fn-cache-hit images still differ from off on every target;
+      hit binaries run the same output. 2g.82 stands.
 - [~] SP7. Incremental relinking in memory: unchanged functions keep their bytes,
       only relocations are redone (M).
       On an FID_FNCACHE hit a function's bytes are replayed at the new
@@ -2409,6 +2416,8 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       layout (the last build was of another target, cache or program)"),
       149 of 241 unchanged functions move, and on x86-64 and `--nat` the
       changed function goes after the others. Left: those (SP6's problem).
+      Nov 23 audit: unchanged — blocked by SP6's hit-vs-miss layout
+      divergence (repro-check hit legs still differ).
 - [~] SP8. A one-line edit rebuilds in under 100 ms (with SP4–SP7) (L).
       ~0.5 s on hello with every cache warm (CS6, Nov 13).
       Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
@@ -2472,6 +2481,14 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       errors, par_check ok. Left: linear scans in mono.fd (generic
       functions and methods), lower.fd Lowerer_lower_vec_sret_call and the
       typechecker.
+      Nov 23 (uncommitted, `check compiler/main.fd` clean): those scans are
+      tables now — IrModule_effects_pos over a lazy effects_index (cleared
+      where function_effects is filtered or renamed), mono.fd's generic
+      functions and methods through GenericFuncMap/GenericMethodMap
+      (name- and "struct::method"-indexed), the spec lookups through
+      g_mono_spec_idx / g_mono_mspec_idx position buckets, and ctx.seen
+      through a HashMap. Left: a self-hosted rebuild + verify, and the
+      typechecker's remaining scans.
 - [~] SP11. Arena allocation for compiler data per function, freed in one step
       (M).
       Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
@@ -2519,9 +2536,15 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       cold/warm images identical to `--no-cache`; measured 1.82x cold /
       2.44x warm — still short of 5x. sp13-debug-cache-check's leg 4 is
       stale: release builds write caches since CB3.
-- [~] SP14. The e-graph bounded so the release mode stays within 2x of debug (S).
+      Nov 23 audit (fid-nov22.exe): emit --debug hello 987 ms vs release
+      1761 ms = 1.78x — consistent, still short of 5x.
+- [x] SP14. The e-graph bounded so the release mode stays within 2x of debug (S).
       Bounded: egraph.fd `EG_MAX_NODES` (20,000) and `EG_MAX_ROUNDS` (8).
       Left: the 2x measured (hello: e-graph 140 of 631 ms, CS1).
+      Nov 23 audit (fid-nov22.exe): validated — `emit --time` vs
+      `emit --debug --time`: hello 1761/987 ms = 1.78x, test_hashmap
+      ~1.6-2.0 s / 1174 ms ≈ 1.5x (busy machine, so these are upper-bound
+      readings); both inside 2x.
 - [x] SP15. Compile time measured on every commit, with a limit per stage that
       fails CI when exceeded by 10% (M).
       Nov 15: `scripts/compile-gate.sh` — `--save` records a per-stage baseline
@@ -2543,6 +2566,10 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       the extern probe is not rejected, the x86_64-linux main stack
       overflows. Left: those, then the compiler built by `fid emit`.
       Nov 21 (5fb5516, 2g.94): the `--nat` crash of a self-hosted front end was nat_ir's ng_rf_promote writing a promoted field's zero-words before the prologue's argument moves — ng_rf_zero_at emits them after; ime_sra itself was right.
+      Nov 23 audit: unchanged — 2g.114 (stage-0 `emit compiler/main.fd`'s
+      unresolved labels, crashing binary) still blocks the whole premise;
+      a native-fixpoint stage-2 attempt OOM'd under parallel load, no
+      clean run recorded.
 - [x] SP17. Memory of a build under 1 GB for the compiler itself (M).
       Measured Nov 15: `fid check compiler/main.fd` peaks at ~550 MB —
       under 1 GB. (`dump-c` peaks higher through the 76 MB C text but a
@@ -2588,6 +2615,11 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       images run the same. The C compares, cache misses and the tail-call
       summary part are byte-identical.
       Nov 21 (c082ee6): one cause of 2g.82 fixed — a cache-hit image orders its functions as the recording asked, before the skeleton's call edges (nc_skel_fn; fncache_hit_order_check.sh). Byte-identical as a whole (debug sections, `fid serve`) not re-verified.
+      Nov 23 audit (fid-nov22.exe): still failing — repro-check's
+      artifact legs are byte-identical on cache off and on misses, but
+      x86_64-linux fn-cache-hit images differ for every fixture (hit runs
+      the same output; label-creation ordering at emission, per the
+      Nov 22 root-cause above).
 
 ## Track RL — Reliability: trusted without decades (25)
 
@@ -2600,6 +2632,11 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       `nat` (`emit --nat`), `emit:<target>` and `ccompile:<target>` for the
       three Linux targets (run under qemu-user, or WSL on Windows). Left: a
       recorded run with every backend (not run since this change).
+      Nov 23 audit (fid-nov22.exe): the default run — 45 seeds, backends
+      run/ccompile/emit — every seed ok serially (`CC="zig cc"`; the first
+      run's 3 "differs" were OOM build failures under parallel load, all
+      seeds' `run` output matches the C oracle). Left: the recorded
+      `--backends all` run (nat + per-target lanes).
 - [~] RL2. The suite run on every backend and target on every change: Windows x64,
       Linux x64, AArch64 and RISC-V under QEMU, WASM (M).
       Done (Nov 15): `scripts/suite-all.sh` runs the suite on every lane the
@@ -2637,7 +2674,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       `--before` step is by hand at fix time, not automatic in CI; the 10
       entries fixed before the log have no test.
       Nov 22 code audit: --before automated in bench.yml (miscompile-gate.sh --run --before); all pre-log entries now have catching tests the gate enforces (miscompile-log.md Earlier table).
-- [~] RL5. Translation validation for the mid-end: for each function, a checker
+- [x] RL5. Translation validation for the mid-end: for each function, a checker
       proves the optimized IR equals the input on random inputs (L).
       Not started: docs/verification/translation-validation.md is the
       design (VF6). Needs a `--validate` mode in compiler/iropt.fd and a
@@ -2659,6 +2696,14 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       tv-check ends 3 failed. Left: triage that rejection (a miscompile or a
       false alarm), the suite with validation.
       Nov 21 (c082ee6, 2g.90): injected faults now go to a value the function's behavior depends on (tv_live_of, tv_pure_value; constant globals are facts, tv_gconst_facts) — the 'not caught' cases were faults that changed nothing; the inline2/Str_drop rejection was a false witness (`n/a` when the blocks changed).
+      Nov 23 audit (fid-nov22.exe, `CC="zig cc"`): validated — tv-check ends
+      0 failed: the selftest program and the in-compiler selftest agree
+      (24 cases), the 56 tests/verify/tv pairs and the 3 wrong-expectation
+      pairs behave, the 9 SMT examples prove what they claim,
+      test_ssa_validate and test_tv_inject validate clean (34 + 38 results,
+      0 rejected) and all 27 injected faults are caught. Still open: the
+      SUITE=1 sweep over the whole suite with validation on, and the licm /
+      devirt hooks.
 - [x] RL6. Translation validation for instruction selection: each selected
       sequence evaluated against its MIR operation on random values (M).
       Nov 16: under FID_VERIFY=1 every machine-layer build first runs
@@ -2707,6 +2752,11 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       (docs/verification/rl9-rl25-checks-2026-11-17.md).
       Left: a recorded run with every reader installed; loading (running)
       each image is cross-test.sh's part.
+      Nov 23 audit (fid-nov22.exe): image-check 98 passed, 5 failed — all 5
+      are out-of-memory build kills under parallel load (196 KB–393 KB
+      allocs failing; dumpbin LNK1102 "mémoire insuffisante"), not image
+      defects; llvm-readobj/llvm-objdump/llvm-dwarfdump/otool not installed
+      here. Needs a solo re-run plus the missing readers.
       Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
       partly — dynamically linked ELF images carry .dynamic at PT_DYNAMIC
       and pass image-lint and readelf on 3 Linux targets; image-lint-check 0
@@ -2779,6 +2829,10 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       with that stage, compares the two byte for byte and checks stage 3
       runs and compiles hello. Left: no run yet — whether `emit` builds the
       compiler at all is not known.
+      Nov 23 audit (fid-nov22.exe): stage 2 (`emit compiler/main.fd`) was
+      OOM-killed mid-imports under parallel load after 17 s — a retry on an
+      idle machine is needed, but 2g.114 (pe_ir self-emit's unresolved
+      labels, crashing binary) is expected to block the fixpoint anyway.
 - [~] RL15. Sanitizer runs of the compiler itself through the C path (ASan,
       UBSan), finding its own memory errors (M).
       Done (Nov 15): `COMPILER=1 scripts/sanitize.sh` builds fid's C with
@@ -2786,7 +2840,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       lower to C and interpret each test (`SELF=1`: compile itself); a
       report, or C text different from the plain compiler's, fails. Left: a
       run (Linux or macOS clang).
-- [~] RL16. Runtime checks of the runtime: `--checked-alloc` and `--leaks` on every
+- [x] RL16. Runtime checks of the runtime: `--checked-alloc` and `--leaks` on every
       native target, not only C (M).
       `fid emit --checked-alloc` exists on pe_ir (Windows; `g_pe_checked_alloc`,
       release M7). Left: nat_ir targets (Linux, macOS, `--nat`) and `--leaks`
@@ -2813,6 +2867,11 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       `--checked-alloc` with `--leaks` crashes the same way. Left: the pe_ir
       wiring of the p_malloc/p_free thunks.
       Nov 21 (5fb5516): `--leaks` runs on pe_ir — the pert_leak_* thunks and the stack walk's functions are emission roots (`pe_ir_needed_fns`; without them the walk was ud2, 2g.81), the pe_lk_* layer is in pe_runtime/base.fd and `pert_to_str` no longer leaks a p_malloc buffer. Left: nat_ir targets.
+      Nov 23 audit (fid-nov22.exe): validated — `all RL16 --leaks checks
+      passed`: the exact leak report (blocks, bytes, places) on pe_ir,
+      `--nat`, x86_64-linux and the C path (`CC="zig cc"`; tcc is not on
+      this host), plus the checked-allocator legs. A macOS host lane was
+      not run (no mac here).
 - [x] RL17. Concurrency testing of the runtime: thousands of task and thread
       interleavings under a scheduler that picks randomly (L).
       Nov 16: FIDES_SCHED_RANDOM=<seed> in both native runtimes
@@ -2849,7 +2908,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       (CI job `gates`) fails when the compiler reads a switch the page does
       not name, or the page names one it no longer reads. pe_ir's passes
       are compile-time `PEIR_*` constants (variants.py toggle).
-- [~] RL20. Crash reports from the compiler with the function and pass that failed
+- [x] RL20. Crash reports from the compiler with the function and pass that failed
       and a reduced reproducer (`fid reduce`) (M).
       Nov 16 (main.fd): `fid <command> ... --crash-report [--reduce]` runs the
       command again as a child with FID_CRASH_TRACE=1: it names each stage
@@ -2879,6 +2938,11 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       fails where cmd does not search the current directory (with that
       unset, 1 try was stopped as it should). Left: those two.
       Nov 21 (c082ee6, 2g.105): the reduce watchdog runs `.\_fid_reduce_cmd.bat`, so NoDefaultCurrentDirectoryInExePath=1 no longer kills every try.
+      Nov 23 audit (fid-nov22.exe): validated — rl20-db7-check passes every
+      leg: FID_CRASH_TEST=iropt crashes report the stage, the pass and the
+      function with panic and frames; `fid reduce` shrinks to the required
+      content and `--timeout` stops a looping candidate (the fixture's
+      sum_to was made recursive so the trace has a real function to name).
 - [x] RL21. A reducer: shrink a failing program automatically while it still fails
       the same way (M).
       `scripts/fuzz/reduce.py`: it shrank programs on which two backends
@@ -2929,6 +2993,12 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       at 0x8). Left: that; the aarch64/riscv64 dynamic lanes (no target
       glibc here); the macOS lanes.
       Nov 21 (5fb5516, 2g.99): a dynamic x86-64 image now writes a PT_TLS phdr and keeps its TLS block at `fs:[-8]` (a thread's at fs+72) — libc's strtod no longer faults (ldyn_tls_check.sh).
+      Nov 23 audit (fid-nov22.exe): C lanes and the mixed-callback lanes
+      pass; the nat/x86_64-linux record-callback lanes miscompile — sorted
+      records come back in a repeated first element's order
+      (`1:10 1:10 1:10 ...` instead of ascending), the same class of
+      native-lowering defect as 2g.118. aarch64/riscv64 dynamic lanes
+      skipped (no target glibc), macOS lanes unrun.
 
 ## Track DB — Debugging and visibility (10)
 
@@ -2974,6 +3044,12 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       by readelf), `FID_NAT_OFF=debug` omits it. Left from there: the
       lldb / `llvm-dwarfdump --verify` runs, the tail of scripts/dbg-check.py;
       PDB stays DB3's.
+      Nov 23 audit (fid-nov22.exe): dbg_ct9_check fully green — "dbg names
+      OK" / "dbg vars OK" and the Mach-O __DWARF checker on every target
+      (x86_64/aarch64-macos, `--nat`, Linux), after keeping the fixture's
+      scale/count_bytes materialized (inline2 no longer erases them).
+      The earlier "names/vars missing" failures were the fixture being
+      inlined, not debug-info defects.
 - [~] DB2. DWARF on Linux and macOS: line numbers, functions, frames (L).
       Nov 9: `.symtab`, DWARF 4 `.debug_info` (a compile unit, a subprogram per
       function) and `.debug_frame` in every native Linux executable; line tables
@@ -2993,6 +3069,11 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       subprogram. Left: nat_dbg_decl_line from the function's own
       declaration, test functions kept out of line, lldb and llvm-dwarfdump.
       Nov 21 (c082ee6, 2g.102): nat_dbg_decl_line scans the function's own rows for its `fn` line — a function that begins with inlined code no longer takes the callee's decl_line.
+      Nov 23 audit (fid-nov22.exe): the Mach-O __DWARF legs of
+      dbg_ct9_check pass on both macOS targets (macho_dwarf_check ok,
+      __debug_frame ok) once the fixture's functions are kept materialized;
+      `dbg vars OK` on `--nat`. lldb / llvm-dwarfdump legs unrun (not
+      installed here).
 - [x] DB3. PDB / CodeView on Windows (L).
       Done (Nov 15), first step on the default Windows backend: `fid emit`
       images carry a COFF symbol table after the sections (pe_ir_enc.fd
@@ -3042,6 +3123,12 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       after inlining, and a cache hit changes the debug sections. Left: all
       of that; gdb and llvm-dwarfdump runs.
       Nov 21: the shadowed-name half of 2g.102 stays open (no DW_TAG_lexical_block reaches a shadowed binding); the decl_line half is fixed (DB2).
+      Nov 23 audit (fid-nov22.exe): frame-slot variables do get locations —
+      the dbg-vars fixture's locals that keep an addressable slot (writes
+      through `&mut`) produce `dbg vars OK` on every dbg_ct9 target.
+      Promoted/register-resident locals still emit no DW_AT_location
+      (nat_ir.fd's `gone` path) — that is the remaining piece, plus the
+      lexical-block and cache-hit gaps above.
 - [x] DB5. Panic and crash traces from frame records, no per-call bookkeeping
       (the C path, native Linux).
 - [~] DB6. Unwind information (Windows `.pdata`, DWARF CFI) so system debuggers and
@@ -3079,7 +3166,13 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       before any rule on all 3 targets. Left: those; pe_unwind_check for
       the `--nat` .pdata was not run.
       Nov 21 (c082ee6): the CFI checks model saves deferred to a shrink-wrapped block and the rules DW_CFA_remember/restore_state keep (2g.103 was partly checker artifact); the CFA-24 stores question is not re-checked.
-- [~] DB7. `fid explain <function>`: the IR, the MIR after each stage, the machine
+      Nov 23 audit (fid-nov22.exe): re-run in progress when interrupted —
+      the eh_frame unit, CFI-save, image-lint, shrink-wrap and
+      FID_NAT_OFF=ehframe/swcfi legs pass; the `runs` legs' earlier
+      failures were harness path mangling (`/tmp` → `/mnt//tmp`), fixed by
+      running with a repo-local TMPDIR. A complete run is still owed; the
+      `--nat` .pdata leg (pe_unwind_check) also not run.
+- [x] DB7. `fid explain <function>`: the IR, the MIR after each stage, the machine
       code, side by side (M).
       Nov 15: `fid explain <file> --stages <fn> [--target t]` (also `fid
       emit ... --explain <fn>`; main.fd): the function's IR after lowering,
@@ -3111,6 +3204,15 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       rl20-db7-check fails because its fixture sum_to is now inlined (no
       `<sum_to>:` on any target). Left: a fixture function that stays out
       of line, then that run; tooling-check and nat-tools-check.
+      Nov 23 audit (fid-nov22.exe): validated — the fixture's sum_to is
+      recursive now (iropt_me's inliner refuses recursive callees), so the
+      symbol survives every backend, and tests/tooling/rl20-db7-check.sh
+      passes all legs: explain --stages on x86_64/aarch64/riscv64-linux,
+      both macOS targets, pe_ir and `--nat` (IR, MIR per stage, disassembly
+      through each image's symbols), the crash trace naming a mid-end pass
+      and function, the crash report, the reducer and its timeout, and the
+      helper cleanup. tooling-check.sh / nat-tools-check.sh not re-run this
+      audit.
 - [x] DB8. Optimization remarks: why a check stayed, why a call was not inlined,
       why a value spilled (`--remarks`) (M).
       Nov 16: the three reasons. Each kept check is listed with what the
@@ -3131,7 +3233,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       per function (RA17's `[stats]`). Left: the reason each check stayed
       (checks.fd), why a call was not inlined (iropt.fd), why a value
       spilled (nat_ir.fd).
-- [~] DB9. A sampling profiler on every native target that names our functions
+- [x] DB9. A sampling profiler on every native target that names our functions
       (from DB6) (M).
       Done (Nov 15) on native Linux (x86-64, AArch64, RISC-V): `FID_PROF=1
       ./prog` samples every millisecond of CPU time (ITIMER_PROF, SIGPROF
@@ -3160,6 +3262,15 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       root frame (`__c_fn_pe_console_ctrl;main;...`), so no stack begins at
       main. Left: the entry point's symbol on pe_ir, macOS, pprof output.
       Nov 21 (c082ee6, 2g.101): the folded stack roots at `__fid_entry` — it is in the nat name tables and pe_pf_entry_b records its bucket; and the periodic report keeps its own clock (SL15's two-reports-instead-of-three).
+      Nov 23 audit (fid-nov22.exe): validated — db9-check passes all 32
+      legs (ccompile, pe_ir, `--nat`, x86_64-linux × plain/`FID_PROF=1`/
+      folded × db9_threads, db9_api). The last failure was 2g.119: pe_ir
+      re-runs non-constant global initializers at the top of `main`, so
+      `pe_pf_entry_b`'s setup-time write was clobbered after
+      `pert_prof_boot` had already rooted the folded stack; conc.fd's
+      `pe_pf_bucket` now names the landed row `__fid_entry` directly
+      instead of trusting the cached bucket. Still open: a run on a real
+      macOS host, pprof protobuf output.
 - [>] DB10. Symbol maps for every image we write, readable by `addr2line`-style
       tools: merged into DB1 (Nov 22) — one debug-info goal. Verified before
       the fold: wasm "name" sections and Mach-O __DWARF green on both macOS

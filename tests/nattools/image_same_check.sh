@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# TG13 (docs/roadmap/llvm-roadmap.md, docs/image-writer.md): every image
+# TG13 (docs/roadmap/llvm-roadmap.md, docs/reference/image-writer.md): every image
 # writer goes through compiler/image_writer.fd. Until Nov 17 this script
 # compared each format with its old body (FID_IMG_OLD=1); the old bodies
 # are gone now (the unit tests tests/nattools/image_writer_unit.fd and

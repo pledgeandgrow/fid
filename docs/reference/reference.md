@@ -1102,7 +1102,7 @@ run. A task that reaches no checkpoint runs to its end. No backend has a
 mid-way kill: it would skip the drops of what the task owns, and nothing
 unwinds. `fid run` interleaves tasks as the C and native runtimes do,
 switching at yields, sleeps, awaits, joins and channel receives
-(docs/interp-tasks.md, `test_task_interleave.fd`).
+(docs/reference/interp-tasks.md, `test_task_interleave.fd`).
 
 ### 8.3 What is freed automatically
 

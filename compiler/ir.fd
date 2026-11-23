@@ -2560,6 +2560,9 @@ pub struct IrModule {
     pub str_index: i64,
     pub extern_functions: Vec<StringVecIrType>,
     pub function_effects: Vec<StringEffectSetEntry>,
+    // SP10: name -> position in function_effects + 1; filled lazily by
+    // IrModule_effects_pos
+    pub effects_index: i64,
     pub extern_decls: Vec<ExternDecl>,
     // Functions passed to C: each gets an adapter C can call
     pub c_callbacks: Vec<str>,
@@ -2703,7 +2706,7 @@ pub enum OptGlobalLookup {
 
 pub fn IrModule_new() -> IrModule {
     return IrModule {
-        functions: Vec::new(), fn_index: HashMap_new(), struct_layouts: Vec::new(), struct_index: HashMap_new(), string_constants: Vec::new(), str_index: HashMap_new(), extern_functions: Vec::new(), function_effects: Vec::new(), extern_decls: Vec::new(), c_callbacks: Vec::new(), trait_methods: Vec::new(), trait_impls: Vec::new(), linear_structs: Vec::new(), globals: Vec::new(), global_index: HashMap_new(),
+        functions: Vec::new(), fn_index: HashMap_new(), struct_layouts: Vec::new(), struct_index: HashMap_new(), string_constants: Vec::new(), str_index: HashMap_new(), extern_functions: Vec::new(), function_effects: Vec::new(), effects_index: HashMap_new(), extern_decls: Vec::new(), c_callbacks: Vec::new(), trait_methods: Vec::new(), trait_impls: Vec::new(), linear_structs: Vec::new(), globals: Vec::new(), global_index: HashMap_new(),
     };
 }
 
@@ -2901,6 +2904,39 @@ pub fn IrModule_fn_pos(self: &IrModule, name: str) -> i64 {
         i = i + 1;
     }
     var at2: i64 = HashMap_get(self.fn_index, name);
+    return at2 - 1;
+}
+
+/// SP10: the position of `name` in `self.function_effects`, or -1, through
+/// `effects_index` — the same lazy index IrModule_fn_pos keeps for
+/// `functions` (entries pushed since the last lookup are indexed first, the
+/// first entry of a name wins). A stale entry is rebuilt as there.
+pub fn IrModule_effects_pos(self: &IrModule, name: str) -> i64 {
+    var i: i64 = HashMap_len(self.effects_index);
+    while i < self.function_effects.len() {
+        var key: str = self.function_effects.get(i).name;
+        if HashMap_get(self.effects_index, key) == 0 {
+            HashMap_insert(self.effects_index, key, i + 1);
+        }
+        i = i + 1;
+    }
+    var at: i64 = HashMap_get(self.effects_index, name);
+    if at == 0 {
+        return 0 - 1;
+    }
+    if at <= self.function_effects.len() && self.function_effects.get(at - 1).name == name {
+        return at - 1;
+    }
+    HashMap_clear(self.effects_index);
+    i = 0;
+    while i < self.function_effects.len() {
+        var key2: str = self.function_effects.get(i).name;
+        if HashMap_get(self.effects_index, key2) == 0 {
+            HashMap_insert(self.effects_index, key2, i + 1);
+        }
+        i = i + 1;
+    }
+    var at2: i64 = HashMap_get(self.effects_index, name);
     return at2 - 1;
 }
 

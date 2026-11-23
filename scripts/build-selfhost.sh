@@ -24,6 +24,14 @@ if [ -z "$STAGE0" ]; then
   for cand in "release/stage0/fid.exe" "release/stage0/fid"; do
     [ -x "$cand" ] && STAGE0="$cand" && break
   done
+  # No pinned binary yet: fetch this host's (CI). A fidesc fallback cannot
+  # self-compile the tree (2g.79); FID_STAGE0_FETCH=0 opts out.
+  if [ -z "$STAGE0" ] && [ "${FID_STAGE0_FETCH:-1}" != 0 ]; then
+    ./scripts/stage0-fetch.sh || true
+    for cand in "release/stage0/fid.exe" "release/stage0/fid"; do
+      [ -x "$cand" ] && STAGE0="$cand" && break
+    done
+  fi
   STAGE0="${STAGE0:-./target/release/fidesc}"
 fi
 mkdir -p "$OUT"

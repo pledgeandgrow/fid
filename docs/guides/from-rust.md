@@ -100,4 +100,4 @@ Spawned-task arguments must be `@send`-safe — same idea as `Send`.
   read end to end. If you find yourself fighting the escape check, the
   intended answer is usually an index or an owned `Vec`, not a lifetime.
 - The compiler is younger — hit a rough edge, check
-  `docs/reference/known-bugs.md` and `docs/compiler-internals.md`.
+  `docs/reference/known-bugs.md` and `docs/reference/compiler-internals.md`.

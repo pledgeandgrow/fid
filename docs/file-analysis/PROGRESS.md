@@ -21,7 +21,7 @@ one; that pass's record follows the template below.
 > page's line count is of Nov 21, and each page has a dated note on what
 > changed since Nov 9: fixes (known-bugs 2g.1-2g.78), the new open bugs of
 > the Nov 21 check (2g.79-2g.113) and the retirement of the PIR path
-> (MI18, Nov 17; docs/pir-retired.md), which made pir, opt, regalloc,
+> (MI18, Nov 17; docs/reference/pir-retired.md), which made pir, opt, regalloc,
 > peephole, codegen_x64/arm64/riscv, coff, macho, pe, the PIR runtimes and
 > assemblers unreachable. The findings below each note were not all
 > re-checked; their line numbers are of the day the page was written. The

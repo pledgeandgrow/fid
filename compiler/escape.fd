@@ -104,6 +104,11 @@ pub struct EscapeChecker {
     pub param_tys: Vec<Vec<str>>,
     // esc_ret_noref(ret_ty) per function: a call of it returns no reference
     pub ret_noref: Vec<bool>,
+    // BG16: a method of a type that can hold references (esc_holder_type)
+    // whose declared result is or holds a type parameter of the method or
+    // of its impl (`Option_unwrap -> T`): before monomorphization T may be
+    // a reference the receiver holds
+    pub ret_tparam: Vec<bool>,
 }
 
 // --- Root sets ------------------------------------------------------------
@@ -331,6 +336,61 @@ fn esc_any_ref(ts: Vec<Type>) -> bool {
     return false;
 }
 
+/// BG16: a type whose value can hold references without being one:
+/// Option, Result (tuples have no methods) and the structs with lifetime
+/// parameters. Any other type cannot (rule 2), so its methods' type
+/// parameters are never references.
+fn esc_holder_type(name: str) -> bool {
+    return esc_is_transparent(name) || esc_is_lt_struct(name);
+}
+
+/// BG16: whether `t` is or holds one of the type parameters `fps` (the
+/// function's) or `ips` (its impl's). Escape runs before monomorphization,
+/// so such a result (`Option<T>::unwrap -> T`) may be a reference.
+fn esc_type_has_tparam(t: Type, fps: Vec<str>, ips: Vec<str>) -> bool {
+    match t {
+        Type::Named(n) => {
+            return str_vec_contains(fps, n) || str_vec_contains(ips, n);
+        }
+        Type::Generic(gn, args) => {
+            if str_vec_contains(fps, gn) || str_vec_contains(ips, gn) {
+                return true;
+            }
+            var i: i64 = 0;
+            while i < args.len() {
+                if esc_type_has_tparam(args.get(i), fps, ips) {
+                    return true;
+                }
+                i = i + 1;
+            }
+            return false;
+        }
+        Type::Tuple(args) => {
+            var j: i64 = 0;
+            while j < args.len() {
+                if esc_type_has_tparam(args.get(j), fps, ips) {
+                    return true;
+                }
+                j = j + 1;
+            }
+            return false;
+        }
+        Type::Ref(e, _) => {
+            return esc_type_has_tparam(box_type_unbox(e), fps, ips);
+        }
+        Type::Array(e, _) => {
+            return esc_type_has_tparam(box_type_unbox(e), fps, ips);
+        }
+        Type::ArrayConst(e, _) => {
+            return esc_type_has_tparam(box_type_unbox(e), fps, ips);
+        }
+        _ => {
+            return false;
+        }
+    }
+    return false;
+}
+
 fn esc_all_digits(s: str) -> bool {
     var i: i64 = 0;
     while i < str_len(s) {
@@ -360,12 +420,17 @@ pub fn EscapeChecker_new(program: Program) -> EscapeChecker {
     // LG3: first, so the facts below see which types hold references
     esc_collect_lt_structs(program);
     var all: Vec<EscFunc> = Vec::new();
+    // BG16: per entry of `all`, whether it is a method of a type that can
+    // hold references whose result is or holds a type parameter
+    var ret_tparam: Vec<bool> = Vec::new();
     var i: i64 = 0;
     while i < program.funcs.len() {
         var f: Func = program.funcs.get(i);
         all.push(EscFunc {
             key: f.name, skey: "fn:" + f.name, func: f
         });
+        // a free function is never a method of a type holding references
+        ret_tparam.push(false);
         i = i + 1;
     }
     var ii: i64 = 0;
@@ -377,6 +442,7 @@ pub fn EscapeChecker_new(program: Program) -> EscapeChecker {
             all.push(EscFunc {
                 key: imp.struct_name + "_" + m.name, skey: "impl:" + imp.struct_name + ":" + m.name, func: m
             });
+            ret_tparam.push(esc_holder_type(imp.struct_name) && esc_type_has_tparam(m.ret_ty, m.type_params, imp.type_params));
             mi = mi + 1;
         }
         ii = ii + 1;
@@ -390,6 +456,7 @@ pub fn EscapeChecker_new(program: Program) -> EscapeChecker {
             all.push(EscFunc {
                 key: timp.type_name + "_" + tm.name, skey: "trait:" + timp.type_name + ":" + tm.name, func: tm
             });
+            ret_tparam.push(esc_holder_type(timp.type_name) && esc_type_has_tparam(tm.ret_ty, tm.type_params, timp.type_params));
             tmi = tmi + 1;
         }
         ti = ti + 1;
@@ -476,7 +543,7 @@ pub fn EscapeChecker_new(program: Program) -> EscapeChecker {
         fk = fk + 1;
     }
     var c: EscapeChecker = EscapeChecker {
-        ret_noref: Vec::new(), param_names: param_names, param_rt: param_rt, par: false, param_tys: Vec::new(), ret_has_ref: ret_has_ref, ret_is_ref: ret_is_ref, param_has_ref: param_has_ref, has_decl_flows: has_decl_flows, decl_flows: decl_flows, all: all, func_index: func_index, method_index: method_index, method_keys: method_keys, globals: globals, summary_index: HashMap_new(), summaries: Vec::new(), scopes: Vec::new(), func_name: "", flows: Vec::new(), loop_depths: Vec::new(), closure_base: 0, unsafe_depth: 0, line: 0, report: false, errors: Vec::new(), type_names: type_names,
+        ret_noref: Vec::new(), ret_tparam: ret_tparam, param_names: param_names, param_rt: param_rt, par: false, param_tys: Vec::new(), ret_has_ref: ret_has_ref, ret_is_ref: ret_is_ref, param_has_ref: param_has_ref, has_decl_flows: has_decl_flows, decl_flows: decl_flows, all: all, func_index: func_index, method_index: method_index, method_keys: method_keys, globals: globals, summary_index: HashMap_new(), summaries: Vec::new(), scopes: Vec::new(), func_name: "", flows: Vec::new(), loop_depths: Vec::new(), closure_base: 0, unsafe_depth: 0, line: 0, report: false, errors: Vec::new(), type_names: type_names,
     };
     var rk: i64 = 0;
     while rk < c.all.len() {
@@ -1903,9 +1970,22 @@ fn esc_method_call(self: &mut EscapeChecker, receiver: Expr, method: str, args: 
         j = j + 1;
     }
     var out: Vec<EscRoot> = Vec::new();
+    // BG16: a receiver that holds references without being one (an
+    // `Option<&T>`, a tuple): a method whose declared result is or holds a
+    // type parameter (`unwrap -> T`) may hand them back, and a builtin
+    // method with no body here may too; its roots flow to the result
+    // (conservative). A reference receiver points to something that holds
+    // no reference (rule 2), so it is left to the summaries.
+    var recv_holds: bool = recv.len() > 0 && !esc_is_reference(self, receiver);
+    if recv_holds && keys.len() == 0 {
+        out = esc_union(out, recv);
+    }
     var k: i64 = 0;
     while k < keys.len() {
         var key: str = keys.get(k);
+        if recv_holds && self.ret_tparam.get(HashMap_get(self.func_index, key) - 1) {
+            out = esc_union(out, recv);
+        }
         if self.ret_has_ref.get(HashMap_get(self.func_index, key) - 1) {
             var flows: Vec<i64> = esc_summary(self, key);
             var fi: i64 = 0;
@@ -2423,7 +2503,7 @@ fn esc_par_copy(c: EscapeChecker, tys: Vec<Vec<str>>) -> EscapeChecker {
     var no_loops: Vec<i64> = Vec::new();
     var no_errors: Vec<str> = Vec::new();
     return EscapeChecker {
-        all: no_all, func_index: c.func_index, method_index: c.method_index, method_keys: par_own_strss(c.method_keys), globals: c.globals, summary_index: c.summary_index, summaries: par_own_i64ss(c.summaries), scopes: no_scopes, func_name: "", flows: no_flows, loop_depths: no_loops, closure_base: 0, unsafe_depth: 0, line: 0, report: true, errors: no_errors, type_names: c.type_names, ret_has_ref: par_own_bools(c.ret_has_ref), ret_is_ref: par_own_bools(c.ret_is_ref), param_has_ref: par_own_boolss(c.param_has_ref), has_decl_flows: par_own_bools(c.has_decl_flows), decl_flows: par_own_i64ss(c.decl_flows), param_names: par_own_strss(c.param_names), param_rt: par_own_boolss(c.param_rt), par: true, param_tys: par_own_strss(tys), ret_noref: par_own_bools(c.ret_noref),
+        all: no_all, func_index: c.func_index, method_index: c.method_index, method_keys: par_own_strss(c.method_keys), globals: c.globals, summary_index: c.summary_index, summaries: par_own_i64ss(c.summaries), scopes: no_scopes, func_name: "", flows: no_flows, loop_depths: no_loops, closure_base: 0, unsafe_depth: 0, line: 0, report: true, errors: no_errors, type_names: c.type_names, ret_has_ref: par_own_bools(c.ret_has_ref), ret_is_ref: par_own_bools(c.ret_is_ref), param_has_ref: par_own_boolss(c.param_has_ref), has_decl_flows: par_own_bools(c.has_decl_flows), decl_flows: par_own_i64ss(c.decl_flows), param_names: par_own_strss(c.param_names), param_rt: par_own_boolss(c.param_rt), par: true, param_tys: par_own_strss(tys), ret_noref: par_own_bools(c.ret_noref), ret_tparam: par_own_bools(c.ret_tparam),
     };
 }
 

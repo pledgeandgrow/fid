@@ -102,36 +102,24 @@ and `AGENTS.md` first when working on the compiler.
 | [verification/README.md](docs/verification/README.md) | Verification tools (fuzzers, soak, chaos, interleavings), formal semantics, memory-safety core, translation validation, the miscompile log. |
 | [stdlib/README.md](docs/stdlib/README.md) | Standard library module docs. |
 
-### Single-topic notes (docs/*.md)
+### Single-topic notes
 | File | Description |
 |------|-------------|
 | [benchmarks.md](docs/benchmarks.md) | What is measured, how to reproduce it, every result, losses included (BM10, AD13). |
-| [c2fd.md](docs/c2fd.md) | `tools/c2fd.fd`: best-effort C99 to Fid translation. |
-| [compiler-crash-reports.md](docs/compiler-crash-reports.md) | `--crash-report`, `fid reduce` and `fid explain --stages` (RL20, DB7). |
-| [compiler-identity.md](docs/compiler-identity.md) | What names a build of `fid`: version, build hash, cache key. |
-| [compiler-internals.md](docs/compiler-internals.md) | A map of `compiler/*.fd` for contributors. |
-| [cookbook.md](docs/cookbook.md) | Short recipes: files, JSON, HTTP, tasks. |
-| [cpp-interop.md](docs/cpp-interop.md) | Calling C++ from Fid (`@import("lib.hpp")`, LG16). |
-| [disasm-encoding-table.md](docs/disasm-encoding-table.md) | One table of encoding forms for `fid disasm` and the encoders (TG5). |
-| [fuzzing.md](docs/fuzzing.md) | Fuzz targets (`fn fuzz_*`) and `fid fuzz` / `fid test --fuzz`. |
-| [host-build.md](docs/host-build.md) | `fid build` with no `--target` on Linux and macOS (CB4). |
-| [image-writer.md](docs/image-writer.md) | One writer of ELF, PE/COFF and Mach-O files (TG13). |
-| [import-cache.md](docs/import-cache.md) | The import cache of the front end (CB1). |
-| [inc-instances.md](docs/inc-instances.md) | Where `ccompile --inc` puts generic instances and per-type helpers. |
-| [inc-ir-units.md](docs/inc-ir-units.md) | C per IR unit in `ccompile --inc` (inc-roadmap B1, B2). |
-| [inc-seed-store.md](docs/inc-seed-store.md) | The seeded store and globals in per-module builds. |
-| [incremental-check.md](docs/incremental-check.md) | Incremental checks in `fid serve` (CB2). |
-| [internal-tools.md](docs/internal-tools.md) | The project's own tools and what each is written in (AD4). |
-| [interp-tasks.md](docs/interp-tasks.md) | Tasks in `fid run`: interleaving and cancellation (LG11). |
-| [mi20-prim-interface.md](docs/mi20-prim-interface.md) | The `nat_*` machine-code primitives every native backend defines (MI20). |
-| [pact-capabilities.md](docs/pact-capabilities.md) | Capabilities `ark.toml` grants each pact, checked in every build (CD1). |
-| [pe-ir-cache-and-cpu.md](docs/pe-ir-cache-and-cpu.md) | pe_ir's per-function cache and `--cpu`. |
-| [pir-retired.md](docs/pir-retired.md) | Why and how the PIR path was retired (MI18). |
-| [sp8-edit-rebuild.md](docs/sp8-edit-rebuild.md) | A one-line edit rebuilt by a warm `fid serve` (SP8). |
-| [stdlib-agent-bugs.md](docs/stdlib-agent-bugs.md) | Compiler bugs found while writing the new stdlib modules (Nov 17). |
-| [stdlib-backend-matrix.md](docs/stdlib-backend-matrix.md) | The standard library on every backend (`tests/stdlib_backends.sh`, CD2). |
-| [stdlib-depth-audit.md](docs/stdlib-depth-audit.md) | Stdlib depth audit of all 403 modules (Nov 18, read-only snapshot). |
-| [vec.md](docs/vec.md) | An old `scribe` page of `stdlib/vec.fd`, out of date; the current one is `docs/stdlib/vec.md`. |
+| [reference/c2fd.md](docs/reference/c2fd.md) | `tools/c2fd.fd`: best-effort C99 to Fid translation. |
+| [reference/compiler-crash-reports.md](docs/reference/compiler-crash-reports.md) | `--crash-report`, `fid reduce` and `fid explain --stages` (RL20, DB7). |
+| [reference/compiler-identity.md](docs/reference/compiler-identity.md) | What names a build of `fid`: version, build hash, cache key. |
+| [reference/compiler-internals.md](docs/reference/compiler-internals.md) | A map of `compiler/*.fd` for contributors. |
+| [guides/cookbook.md](docs/guides/cookbook.md) | Short recipes: files, JSON, HTTP, tasks. |
+| [guides/cpp-interop.md](docs/guides/cpp-interop.md) | Calling C++ from Fid (`@import("lib.hpp")`, LG16). |
+| [reference/disasm-encoding-table.md](docs/reference/disasm-encoding-table.md) | One table of encoding forms for `fid disasm` and the encoders (TG5). |
+| [guides/fuzzing.md](docs/guides/fuzzing.md) | Fuzz targets (`fn fuzz_*`) and `fid fuzz` / `fid test --fuzz`. |
+| [guides/host-build.md](docs/guides/host-build.md) | `fid build` with no `--target` on Linux and macOS (CB4). |
+| [reference/image-writer.md](docs/reference/image-writer.md) | One writer of ELF, PE/COFF and Mach-O files (TG13). |
+| [reference/internal-tools.md](docs/reference/internal-tools.md) | The project's own tools and what each is written in (AD4). |
+| [reference/interp-tasks.md](docs/reference/interp-tasks.md) | Tasks in `fid run`: interleaving and cancellation (LG11). |
+| [reference/pact-capabilities.md](docs/reference/pact-capabilities.md) | Capabilities `ark.toml` grants each pact, checked in every build (CD1). |
+| [reference/pir-retired.md](docs/reference/pir-retired.md) | Why and how the PIR path was retired (MI18). |
 | [website.md](docs/website.md) | The project website, `tools/site.fd` (AD2). |
 
 ### Other

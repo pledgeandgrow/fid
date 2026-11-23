@@ -648,6 +648,7 @@ fn cached_parse(parse_cache: &mut Vec<PathProgram>, token_cache: &mut Vec<PathTo
     imp_acc_push(take_qualified_calls());
     var tf0: i64 = turbofish_all().len();
     var sec0: bool = parser_saw_secret();
+    var spl0: bool = parser_saw_splice();
     var parser: Parser = Parser_with_names(toks, struct_names, enum_names);
     var result: ParseResultProgram = parser.parse();
     match result {
@@ -665,6 +666,13 @@ fn cached_parse(parse_cache: &mut Vec<PathProgram>, token_cache: &mut Vec<PathTo
                 var keep: bool = turbofish_all().len() == tf0;
                 if keep && (sec0 || parser_saw_secret()) {
                     keep = !imp_has_word(&sc, "secret") && !imp_has_word(&sc, "sensitive");
+                }
+                // BG35: nor one that saw a `comptime splice` (g_saw_splice,
+                // which tells process_gen to expand splices; a hit could
+                // not set it, and the module's splices were left as they
+                // were on the second build)
+                if keep && (spl0 || parser_saw_splice()) {
+                    keep = !imp_has_word(&sc, "splice");
                 }
                 if keep && !g_imp_broken {
                     imp_save(path, imp_k, imp_import_names(prog), mine, prog);
@@ -692,8 +700,8 @@ fn cached_parse(parse_cache: &mut Vec<PathProgram>, token_cache: &mut Vec<PathTo
 // name, and the compiler's hash. The parser's globals a parse changes are
 // put back on a hit: the import set (a parse of `use <name>;`), the
 // `module::name` calls (g_imp_qcalls, read by cc_qualify_shadowed_imports).
-// A parse that numbered turbofish calls, saw @secret/@sensitive or an
-// @import is never kept. The parser's import set is never cleared, so the
+// A parse that numbered turbofish calls, saw @secret/@sensitive, a
+// `comptime splice` (BG35) or an @import is never kept. The parser's import set is never cleared, so the
 // cache is used only by the first build of a process (one-shot commands;
 // `fid serve`, `fid fix` and the LSP have the modcache). FID_IMPCACHE=off
 // turns it off, for comparing output with and without it.
@@ -2826,6 +2834,12 @@ pub fn build_program_no_std_borrowck(source: str, source_path: OptStr, borrowck_
                 program = merge_programs(program, imported_modules.get(mi));
                 mi = mi + 1;
             }
+            // BG34: the imported modules' layer/model/component/system/
+            // state_machine/on declarations, which merge_programs keeps now,
+            // desugared as the user's were above (the user's are gone by
+            // now; a function's query statements are desugared once)
+            desugar_layers_models(&mut program);
+            desugar_phase8b(&mut program);
             // L8E: variadic calls packed, as the main build does
             program = mono_desugar_variadics(program);
 
@@ -5621,10 +5635,28 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
     return ResultProgram::Err(c_vec1("unreachable"));
 }
 
+/// BG70: the in-memory IR cache's key for `source` at `source_path`: its
+/// hash with what else the lowering's result depends on (cb2_config: the
+/// borrow-check mode, the @cfg target, --debug, the features ark turned on,
+/// the edition, the merged runtime, fuzz coverage). `fid serve` builds for
+/// many targets and modes in one process: a hit keyed on the text alone
+/// handed the C generator a program lowered for another one. Computed
+/// before the lowering, for the lookup and the store alike.
+fn ir_cache_key(source: str, source_path: str, borrowck_mode: str) -> i64 {
+    val base_dir: str = c_path_dirname(source_path);
+    // the features as the lowering will read them (it sets g_cfg_features)
+    val saved_features: str = g_cfg_features;
+    g_cfg_features = cfg_ark_features(base_dir);
+    val cfg: i64 = cb2_config(0, borrowck_mode, base_dir);
+    g_cfg_features = saved_features;
+    return hash_str(int_to_str(hash_source(source)) + "|" + int_to_str(cfg));
+}
+
 /// Compile source to C code.
 pub fn ccompile_source_with_path(source: str, source_path: str, borrowck_mode: str) -> ResultStr {
     // Check incremental cache -- skip full pipeline if source is unchanged
-    var src_hash: i64 = hash_source(source);
+    // (and nothing else the lowering reads changed: BG70)
+    var src_hash: i64 = ir_cache_key(source, source_path, borrowck_mode);
     match global_cache_get(source_path, src_hash) {
         OptIrModule::Some(cached_module) => {
             p_eprint_str("[ccompile] Cache HIT -- skipping parse/typecheck/lower/optimize\n");
@@ -9146,6 +9178,85 @@ pub fn merge_programs(stdlib: Program, user: Program) -> Program {
         }
         i = i + 1;
     }
+    // BG34: the declarations desugared after the merge (desugar_layers_models,
+    // desugar_phase8b: layer, model, component, system, state_machine, on);
+    // an imported module's were dropped here, so `use shapes;` with a
+    // `component` in shapes.fd had no such struct. The user's win on a
+    // name (an event's handler: on its event).
+    var user_decls: i64 = HashMap_new();
+    i = 0;
+    while i < user.layers.len() {
+        HashMap_insert(user_decls, "layer " + user.layers.get(i).name, 1);
+        i = i + 1;
+    }
+    i = 0;
+    while i < user.models.len() {
+        HashMap_insert(user_decls, "model " + user.models.get(i).name, 1);
+        i = i + 1;
+    }
+    i = 0;
+    while i < user.components.len() {
+        HashMap_insert(user_decls, "component " + user.components.get(i).name, 1);
+        i = i + 1;
+    }
+    i = 0;
+    while i < user.systems.len() {
+        HashMap_insert(user_decls, "system " + user.systems.get(i).name, 1);
+        i = i + 1;
+    }
+    i = 0;
+    while i < user.state_machines.len() {
+        HashMap_insert(user_decls, "state_machine " + user.state_machines.get(i).name, 1);
+        i = i + 1;
+    }
+    i = 0;
+    while i < user.event_handlers.len() {
+        HashMap_insert(user_decls, "on " + user.event_handlers.get(i).event_name, 1);
+        i = i + 1;
+    }
+    i = 0;
+    while i < stdlib.layers.len() {
+        if HashMap_get(user_decls, "layer " + stdlib.layers.get(i).name) == 0 {
+            merged.layers.push(stdlib.layers.get(i));
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < stdlib.models.len() {
+        if HashMap_get(user_decls, "model " + stdlib.models.get(i).name) == 0 {
+            merged.models.push(stdlib.models.get(i));
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < stdlib.components.len() {
+        if HashMap_get(user_decls, "component " + stdlib.components.get(i).name) == 0 {
+            merged.components.push(stdlib.components.get(i));
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < stdlib.systems.len() {
+        if HashMap_get(user_decls, "system " + stdlib.systems.get(i).name) == 0 {
+            merged.systems.push(stdlib.systems.get(i));
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < stdlib.state_machines.len() {
+        if HashMap_get(user_decls, "state_machine " + stdlib.state_machines.get(i).name) == 0 {
+            merged.state_machines.push(stdlib.state_machines.get(i));
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < stdlib.event_handlers.len() {
+        if HashMap_get(user_decls, "on " + stdlib.event_handlers.get(i).event_name) == 0 {
+            merged.event_handlers.push(stdlib.event_handlers.get(i));
+        }
+        i = i + 1;
+    }
+    HashMap_drop(user_decls);
 
     HashMap_drop(user_funcs);
     HashMap_drop(user_structs);
@@ -9224,9 +9335,13 @@ fn cfg_os_cond(name: str, is_linux: bool, is_windows: bool, is_macos: bool) -> i
 }
 
 fn cfg_features_file(path: str, acc: str) -> str {
+    // BG51: an input of the build (its stamp): `ark install` writing the
+    // file, or changing the features in it, builds again
     if !c_file_exists(path) {
+        inc_record_absent(path);
         return acc;
     }
+    inc_record_file(path);
     var out: str = acc;
     val lines: Vec<str> = c_str_lines(c_file_read(path));
     var i: i64 = 0;
@@ -10121,6 +10236,8 @@ fn cc_manifest_edition(base_dir: str) -> i64 {
     if str_len(root) == 0 {
         return 0;
     }
+    // BG51: an input of the build (its stamp): a changed edition builds again
+    inc_record_file(c_path_join(root, "ark.toml"));
     var text: str = c_file_read(c_path_join(root, "ark.toml"));
     var lines: Vec<str> = c_str_lines(text);
     var section: str = "";
@@ -11119,6 +11236,7 @@ pub fn strip_ungranted_caps(module: &mut IrModule, granted_caps: Vec<str>) {
     module.functions = new_functions;
     HashMap_clear(module.fn_index);
     module.function_effects = new_function_effects;
+    HashMap_clear(module.effects_index);
 }
 
 /// Helper: remove the first element from a Vec and return the rest.
@@ -13598,6 +13716,7 @@ fn incu_canon_own_names(module: &mut IrModule) {
             ei = ei + 1;
         }
         HashMap_clear(module.fn_index);
+        HashMap_clear(module.effects_index);
     }
     HashMap_drop(names);
     HashMap_drop(ren);
@@ -13949,7 +14068,8 @@ fn incu_copy_instances(module: &IrModule, unames: Vec<str>, units: &mut Vec<i64>
 pub fn ccompile_inc_prepare(source: str, source_path: str, borrowck_mode: str, build_key: i64) -> ResultStr {
     incu_reset();
     set_c_unit_marks(true);
-    var src_hash: i64 = hash_source(source);
+    // BG70: keyed on the settings too (ir_cache_key)
+    var src_hash: i64 = ir_cache_key(source, source_path, borrowck_mode);
     var module: IrModule = IrModule_new();
     var have_module: bool = false;
     match global_cache_get(source_path, src_hash) {
@@ -14420,6 +14540,7 @@ pub fn ccompile_inc_prepare(source: str, source_path: str, borrowck_mode: str, b
         HashMap_drop(lm.struct_index);
         HashMap_drop(lm.str_index);
         HashMap_drop(lm.global_index);
+        HashMap_drop(lm.effects_index);
         var role: str = " unit";
         if is_owner {
             role = " owner";

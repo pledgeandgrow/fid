@@ -399,6 +399,16 @@ pub fn PeirEnc_rex_sse(self: &mut PeirEnc, dst: i64, src: i64) -> void {
     }
 }
 
+/// BG89: the REX prefix of an SSE instruction whose ModRM.reg register is
+/// `reg` and ModRM.rm register is `rm` (xmm or general registers, numbered
+/// 0-15): 0100WR0B, left out when W, R and B are all 0. It goes after the
+/// mandatory 66/F2/F3 prefix, right before 0F.
+pub fn PeirEnc_rex_sse_rm(self: &mut PeirEnc, w: bool, reg: i64, rm: i64) -> void {
+    if w || reg >= 8 || rm >= 8 {
+        PeirEnc_rex(self, w, reg >= 8, false, rm >= 8);
+    }
+}
+
 /// ModR/M byte for XMM reg-to-reg: 11 | dst_code | src_code
 pub fn PeirEnc_modrm_xmm(self: &mut PeirEnc, dst: i64, src: i64) -> void {
     var modrm: i64 = 0xC0 | ((dst & 7) << 3) | (src & 7);
@@ -488,7 +498,9 @@ pub fn PeirEnc_addpd_mem_rbp(self: &mut PeirEnc, dst: i64, disp: i64) -> void {
 pub fn PeirEnc_movapd_mem_rbp(self: &mut PeirEnc, disp: i64, src: i64) -> void {
     self.code.push(0x66);
     if xmm_high(src) {
-        var rex: i64 = 0x40 | 0x01;
+        // BG89: 66 0F 29 /r has the xmm register in ModRM.reg: REX.R (44),
+        // not REX.B (41, which extended rbp to r13)
+        var rex: i64 = 0x40 | 0x04;
         self.code.push(rex);
     }
     self.code.push(0x0F);
@@ -525,38 +537,41 @@ pub fn PeirEnc_movapd_rbp_reg(self: &mut PeirEnc, dst: i64, disp: i64) -> void {
 // VEX prefix encoding: C5 or C4 prefix + opcode + ModR/M
 // For simplicity, we use 2-byte VEX (C5) when possible.
 
-/// Emit 2-byte VEX prefix for AVX instruction
-/// v_dst = destination XMM, v_src = source XMM (second operand)
-pub fn PeirEnc_vex2(self: &mut PeirEnc, dst: i64, src: i64, opcode_len: i64) -> void {
-    // C5 [R.vvvv:1=L'.0 | R:1=~R | V:4=~vvvv]
-    // For 2-byte VEX: implied 0F leading opcode byte
-    var r_bit: i64 = 1;
-    if xmm_high(dst) {
-        r_bit = 0;
+/// The VEX prefix of an instruction in map 0F (BG90: the old one set bit 6
+/// always, dropped L and pp, and had no 3-byte form). `reg` is ModRM.reg,
+/// `v` the vvvv register, `rm` ModRM.rm (0-15 each), `l` VEX.L (1 = 256
+/// bits), `pp` the implied prefix (0 none, 1 66, 2 F3, 3 F2); W is 0.
+/// When rm is 0-7 it is the 2-byte form C5 [~R ~vvvv L pp]; otherwise the
+/// 3-byte form C4 [~R ~X ~B 00001] [W=0 ~vvvv L pp] (B extends rm).
+pub fn PeirEnc_vex2(self: &mut PeirEnc, reg: i64, v: i64, rm: i64, l: i64, pp: i64) -> void {
+    var nr: i64 = (((reg >> 3) & 1) ^ 1) << 7;
+    var tail: i64 = (((v & 15) ^ 15) << 3) | ((l & 1) << 2) | (pp & 3);
+    if rm < 8 {
+        self.code.push(0xC5);
+        self.code.push(nr | tail);
+    } else {
+        // ~X = 1 (no index), ~B = 0 (rm is 8-15), map 0F = 00001
+        self.code.push(0xC4);
+        self.code.push(nr | 0x40 | 0x01);
+        self.code.push(tail);
     }
-    // inverted
-    var vvvv: i64 = (~(src & 0x0F)) & 0x0F;
-    // inverted
-    var vex_byte: i64 = 0xC0 | (r_bit << 7) | (vvvv << 3);
-    self.code.push(0xC5);
-    self.code.push(vex_byte);
 }
 
-/// vaddpd xmm_dst, xmm_src1, xmm_src2 — AVX packed double add
-/// Encoding: C5 [vex] 58 ModR/M
+/// vaddpd ymm_dst, ymm_src1, ymm_src2 — AVX packed double add (f64x4):
+/// VEX.256.66.0F.WIG 58 /r, ModRM.reg = dst, vvvv = src1, ModRM.rm = src2.
+/// `vaddpd ymm0, ymm1, ymm2` = C5 F5 58 C2.
 pub fn PeirEnc_vaddpd_rr(self: &mut PeirEnc, dst: i64, src1: i64, src2: i64) -> void {
-    PeirEnc_vex2(self, dst, src1, 1);
+    PeirEnc_vex2(self, dst, src1, src2, 1, 1);
     self.code.push(0x58);
-    // ModR/M: 11 | dst | src2
+    // ModR/M: 11 | dst | src2 (the high bits are in the VEX prefix)
     var modrm: i64 = 0xC0 | ((dst & 7) << 3) | (src2 & 7);
     self.code.push(modrm);
-    // If src2 is high, we need REX.B via VEX.X bit — but 2-byte VEX doesn't
-    // have X. For simplicity, only support src2 in 0-7 when using 2-byte VEX.
 }
 
-/// vmulpd xmm_dst, xmm_src1, xmm_src2 — AVX packed double multiply
+/// vmulpd ymm_dst, ymm_src1, ymm_src2 — AVX packed double multiply:
+/// VEX.256.66.0F.WIG 59 /r. `vmulpd ymm0, ymm1, ymm2` = C5 F5 59 C2.
 pub fn PeirEnc_vmulpd_rr(self: &mut PeirEnc, dst: i64, src1: i64, src2: i64) -> void {
-    PeirEnc_vex2(self, dst, src1, 1);
+    PeirEnc_vex2(self, dst, src1, src2, 1, 1);
     self.code.push(0x59);
     var modrm: i64 = 0xC0 | ((dst & 7) << 3) | (src2 & 7);
     self.code.push(modrm);
@@ -685,26 +700,30 @@ pub fn peir_is_xmm_slot(disp: i64) -> bool {
     return disp >= PEIR_XMM_SLOT;
 }
 
-/// movq r64, xmm
+/// movq r64, xmm: 66 REX.W 0F 7E /r, ModRM.reg = xmm (REX.R for
+/// xmm8-15, BG89), ModRM.rm = r64 (REX.B for r8-r15)
 pub fn PeirEnc_movq_r64_xmm(self: &mut PeirEnc, r: i64, xmm: i64) -> void {
     self.code.push(0x66);
-    PeirEnc_rex(self, true, false, false, reg_ext(r));
+    PeirEnc_rex(self, true, xmm_high(xmm), false, reg_ext(r));
     self.code.push(0x0F);
     self.code.push(0x7E);
     PeirEnc_modrm(self, 3, xmm, peir_reg_code(r));
 }
 
-/// movdqu [rbp + disp], xmm (a callee-saved xmm register, all 128 bits)
+/// movdqu [rbp + disp], xmm (a callee-saved xmm register, all 128 bits):
+/// F3 [REX.R for xmm8-15, BG89] 0F 7F /r
 pub fn PeirEnc_movdqu_mem_rbp_xmm(self: &mut PeirEnc, disp: i64, xmm: i64) -> void {
     self.code.push(0xF3);
+    PeirEnc_rex_sse_rm(self, false, xmm, 0);
     self.code.push(0x0F);
     self.code.push(0x7F);
     PeirEnc_emit_mem_rbp(self, xmm & 7, disp);
 }
 
-/// movdqu xmm, [rbp + disp]
+/// movdqu xmm, [rbp + disp]: F3 [REX.R for xmm8-15, BG89] 0F 6F /r
 pub fn PeirEnc_movdqu_xmm_mem_rbp(self: &mut PeirEnc, xmm: i64, disp: i64) -> void {
     self.code.push(0xF3);
+    PeirEnc_rex_sse_rm(self, false, xmm, 0);
     self.code.push(0x0F);
     self.code.push(0x6F);
     PeirEnc_emit_mem_rbp(self, xmm & 7, disp);
@@ -1270,8 +1289,9 @@ pub fn PeirEnc_cqo(self: &mut PeirEnc) -> void {
 
 /// movzx r32, r/m8 (zero-extend byte to dword)
 pub fn PeirEnc_movzx_r32_r8(self: &mut PeirEnc, dst: i64, src: i64) -> void {
-    var need_rex: bool = reg_ext(dst) || reg_ext(src) || peir_reg_code(src) == 4;
-    // RSP/SP needs REX
+    // BG91: without a REX prefix byte registers 4-7 are ah/ch/dh/bh, so
+    // spl/bpl/sil/dil (rsp, rbp, rsi, rdi) need one (40), not only spl
+    var need_rex: bool = reg_ext(dst) || reg_ext(src) || peir_reg_code(src) >= 4;
     if need_rex {
         PeirEnc_rex(self, false, reg_ext(dst), false, reg_ext(src));
     }
@@ -1315,8 +1335,10 @@ pub fn PeirEnc_movsx_r64_r16(self: &mut PeirEnc, dst: i64, src: i64) -> void {
 
 /// setcc r/m8 — set byte on condition
 pub fn PeirEnc_setcc_r(self: &mut PeirEnc, cc: i64, r: i64) -> void {
-    if reg_ext(r) {
-        PeirEnc_rex(self, false, false, false, true);
+    // BG91: [REX] 0F 90+cc /0; registers 4-7 need a REX prefix (40) to be
+    // spl/bpl/sil/dil instead of ah/ch/dh/bh. `setl sil` = 40 0F 9C C6.
+    if reg_ext(r) || peir_reg_code(r) >= 4 {
+        PeirEnc_rex(self, false, false, false, reg_ext(r));
     }
     self.code.push(0x0F);
     self.code.push((0x90 + cc) & 0xFF);
@@ -1377,8 +1399,10 @@ pub fn PeirEnc_add_r_i8(self: &mut PeirEnc, r: i64, val: i64) -> void {
 
 /// mov r8, imm8 (for byte stores)
 pub fn PeirEnc_mov_r8_imm(self: &mut PeirEnc, r: i64, val: i64) -> void {
-    if reg_ext(r) {
-        PeirEnc_rex(self, false, false, false, true);
+    // BG91: [REX] B0+r ib; registers 4-7 need a REX prefix (40) to be
+    // spl/bpl/sil/dil instead of ah/ch/dh/bh. `mov sil, 1` = 40 B6 01.
+    if reg_ext(r) || peir_reg_code(r) >= 4 {
+        PeirEnc_rex(self, false, false, false, reg_ext(r));
     }
     self.code.push((0xB0 + peir_reg_code(r)) & 0xFF);
     self.code.push(val & 0xFF);
@@ -1438,6 +1462,11 @@ pub fn PeirEnc_mov_mem_reg8(self: &mut PeirEnc, base: i64, src: i64) -> void {
         PeirEnc_modrm(self, 0, peir_reg_code(src), 4);
         self.code.push(0x24);
         // SIB: scale=0, index=none, base=RSP/R12
+    } else if (peir_reg_code(base) & 7) == 5 {
+        // BG92: RBP or R13: mod=00 rm=101 is [rip + disp32], so use mod=01
+        // with disp8 = 0 (`mov [rbp], al` = 88 45 00)
+        PeirEnc_modrm(self, 1, peir_reg_code(src), 5);
+        self.code.push(0);
     } else {
         PeirEnc_modrm(self, 0, peir_reg_code(src), peir_reg_code(base));
     }
@@ -1802,8 +1831,9 @@ pub fn PeirEnc_movsd_xmm_mem_rbp(self: &mut PeirEnc, xmm: i64, disp: i64) -> voi
         PeirEnc_movq_xmm_r64(self, xmm, peir_value_reg(disp - PEIR_REG_SLOT));
         return;
     }
+    // F2 REX.W 0F 10 /r (W is ignored; REX.R for xmm8-15, BG89)
     self.code.push(0xF2);
-    PeirEnc_rex_w(self);
+    PeirEnc_rex(self, true, xmm_high(xmm), false, false);
     self.code.push(0x0F);
     self.code.push(0x10);
     PeirEnc_emit_mem_rbp(self, xmm, disp);
@@ -1822,8 +1852,9 @@ pub fn PeirEnc_movsd_mem_rbp_xmm(self: &mut PeirEnc, disp: i64, xmm: i64) -> voi
         PeirEnc_movq_r64_xmm(self, peir_value_reg(disp - PEIR_REG_SLOT), xmm);
         return;
     }
+    // F2 REX.W 0F 11 /r (W is ignored; REX.R for xmm8-15, BG89)
     self.code.push(0xF2);
-    PeirEnc_rex_w(self);
+    PeirEnc_rex(self, true, xmm_high(xmm), false, false);
     self.code.push(0x0F);
     self.code.push(0x11);
     PeirEnc_emit_mem_rbp(self, xmm, disp);
@@ -1831,8 +1862,9 @@ pub fn PeirEnc_movsd_mem_rbp_xmm(self: &mut PeirEnc, disp: i64, xmm: i64) -> voi
 
 /// movss xmm, [rbp + disp]
 pub fn PeirEnc_movss_xmm_mem_rbp(self: &mut PeirEnc, xmm: i64, disp: i64) -> void {
+    // F3 REX.W 0F 10 /r (W is ignored; REX.R for xmm8-15, BG89)
     self.code.push(0xF3);
-    PeirEnc_rex_w(self);
+    PeirEnc_rex(self, true, xmm_high(xmm), false, false);
     self.code.push(0x0F);
     self.code.push(0x10);
     PeirEnc_emit_mem_rbp(self, xmm, disp);
@@ -1840,8 +1872,9 @@ pub fn PeirEnc_movss_xmm_mem_rbp(self: &mut PeirEnc, xmm: i64, disp: i64) -> voi
 
 /// movss [rbp + disp], xmm
 pub fn PeirEnc_movss_mem_rbp_xmm(self: &mut PeirEnc, disp: i64, xmm: i64) -> void {
+    // F3 REX.W 0F 11 /r (W is ignored; REX.R for xmm8-15, BG89)
     self.code.push(0xF3);
-    PeirEnc_rex_w(self);
+    PeirEnc_rex(self, true, xmm_high(xmm), false, false);
     self.code.push(0x0F);
     self.code.push(0x11);
     PeirEnc_emit_mem_rbp(self, xmm, disp);
@@ -1850,6 +1883,7 @@ pub fn PeirEnc_movss_mem_rbp_xmm(self: &mut PeirEnc, disp: i64, xmm: i64) -> voi
 /// addsd xmm0, xmm1
 pub fn PeirEnc_addsd(self: &mut PeirEnc, dst: i64, src: i64) -> void {
     self.code.push(0xF2);
+    PeirEnc_rex_sse(self, dst, src);
     self.code.push(0x0F);
     self.code.push(0x58);
     PeirEnc_modrm(self, 3, dst, src);
@@ -1858,6 +1892,7 @@ pub fn PeirEnc_addsd(self: &mut PeirEnc, dst: i64, src: i64) -> void {
 /// subsd xmm0, xmm1
 pub fn PeirEnc_subsd(self: &mut PeirEnc, dst: i64, src: i64) -> void {
     self.code.push(0xF2);
+    PeirEnc_rex_sse(self, dst, src);
     self.code.push(0x0F);
     self.code.push(0x5C);
     PeirEnc_modrm(self, 3, dst, src);
@@ -1866,6 +1901,7 @@ pub fn PeirEnc_subsd(self: &mut PeirEnc, dst: i64, src: i64) -> void {
 /// mulsd xmm0, xmm1
 pub fn PeirEnc_mulsd(self: &mut PeirEnc, dst: i64, src: i64) -> void {
     self.code.push(0xF2);
+    PeirEnc_rex_sse(self, dst, src);
     self.code.push(0x0F);
     self.code.push(0x59);
     PeirEnc_modrm(self, 3, dst, src);
@@ -1874,6 +1910,7 @@ pub fn PeirEnc_mulsd(self: &mut PeirEnc, dst: i64, src: i64) -> void {
 /// divsd xmm0, xmm1
 pub fn PeirEnc_divsd(self: &mut PeirEnc, dst: i64, src: i64) -> void {
     self.code.push(0xF2);
+    PeirEnc_rex_sse(self, dst, src);
     self.code.push(0x0F);
     self.code.push(0x5E);
     PeirEnc_modrm(self, 3, dst, src);
@@ -1881,7 +1918,9 @@ pub fn PeirEnc_divsd(self: &mut PeirEnc, dst: i64, src: i64) -> void {
 
 /// xorpd xmm, [rbp + disp]
 pub fn PeirEnc_xorpd_xmm_mem_rbp(self: &mut PeirEnc, xmm: i64, disp: i64) -> void {
+    // 66 [REX.R for xmm8-15, BG89] 0F 57 /r
     self.code.push(0x66);
+    PeirEnc_rex_sse_rm(self, false, xmm, 0);
     self.code.push(0x0F);
     self.code.push(0x57);
     PeirEnc_emit_mem_rbp(self, xmm, disp);
@@ -1890,15 +1929,17 @@ pub fn PeirEnc_xorpd_xmm_mem_rbp(self: &mut PeirEnc, xmm: i64, disp: i64) -> voi
 /// xorpd xmm, xmm (register-to-register)
 pub fn PeirEnc_xorpd_xmm_xmm(self: &mut PeirEnc, dst: i64, src: i64) -> void {
     self.code.push(0x66);
+    PeirEnc_rex_sse(self, dst, src);
     self.code.push(0x0F);
     self.code.push(0x57);
     PeirEnc_modrm(self, 3, dst, src);
 }
 
-/// movq xmm, r64 (move 64-bit GPR to XMM)
+/// movq xmm, r64 (move 64-bit GPR to XMM): 66 REX.W 0F 6E /r, ModRM.reg
+/// = xmm (REX.R for xmm8-15, BG89), ModRM.rm = r64 (REX.B)
 pub fn PeirEnc_movq_xmm_r64(self: &mut PeirEnc, xmm: i64, r: i64) -> void {
     self.code.push(0x66);
-    PeirEnc_rex(self, true, false, false, reg_ext(r));
+    PeirEnc_rex(self, true, xmm_high(xmm), false, reg_ext(r));
     self.code.push(0x0F);
     self.code.push(0x6E);
     PeirEnc_modrm(self, 3, xmm, peir_reg_code(r));
@@ -1907,6 +1948,7 @@ pub fn PeirEnc_movq_xmm_r64(self: &mut PeirEnc, xmm: i64, r: i64) -> void {
 /// ucomisd xmm0, xmm1
 pub fn PeirEnc_ucomisd(self: &mut PeirEnc, dst: i64, src: i64) -> void {
     self.code.push(0x66);
+    PeirEnc_rex_sse(self, dst, src);
     self.code.push(0x0F);
     self.code.push(0x2E);
     PeirEnc_modrm(self, 3, dst, src);
@@ -1916,24 +1958,29 @@ pub fn PeirEnc_ucomisd(self: &mut PeirEnc, dst: i64, src: i64) -> void {
 pub fn PeirEnc_ucomiss(self: &mut PeirEnc, dst: i64, src: i64) -> void {
     // 0F 2E, no prefix (F3 0F 2E is no instruction: an f32 comparison
     // stopped with "Illegal instruction")
+    PeirEnc_rex_sse(self, dst, src);
     self.code.push(0x0F);
     self.code.push(0x2E);
     PeirEnc_modrm(self, 3, dst, src);
 }
 
-/// cvtsi2sd xmm, r64
+/// cvtsi2sd xmm, r64: F2 REX.W 0F 2A /r, ModRM.reg = xmm (REX.R, BG89),
+/// ModRM.rm = r64 (REX.B)
 pub fn PeirEnc_cvtsi2sd_r64(self: &mut PeirEnc, xmm: i64, r: i64) -> void {
     self.code.push(0xF2);
-    PeirEnc_rex(self, true, false, false, reg_ext(r));
+    PeirEnc_rex(self, true, xmm_high(xmm), false, reg_ext(r));
     self.code.push(0x0F);
     self.code.push(0x2A);
     PeirEnc_modrm(self, 3, xmm, peir_reg_code(r));
 }
 
-/// cvttsd2si r64, xmm
+/// cvttsd2si r64, xmm: F2 REX.W 0F 2C /r, ModRM.reg = r64 (REX.R),
+/// ModRM.rm = xmm (REX.B). BG88: r8-r15 set REX.B, which named xmm8-15
+/// and left the result in the low register. `cvttsd2si rax, xmm0` =
+/// F2 48 0F 2C C0; `cvttsd2si r9, xmm0` = F2 4C 0F 2C C8.
 pub fn PeirEnc_cvttsd2si_r64(self: &mut PeirEnc, r: i64, xmm: i64) -> void {
     self.code.push(0xF2);
-    PeirEnc_rex(self, true, false, false, reg_ext(r));
+    PeirEnc_rex(self, true, reg_ext(r), false, xmm_high(xmm));
     self.code.push(0x0F);
     self.code.push(0x2C);
     PeirEnc_modrm(self, 3, peir_reg_code(r), xmm);
@@ -1942,6 +1989,7 @@ pub fn PeirEnc_cvttsd2si_r64(self: &mut PeirEnc, r: i64, xmm: i64) -> void {
 /// addss xmm0, xmm1
 pub fn PeirEnc_addss(self: &mut PeirEnc, dst: i64, src: i64) -> void {
     self.code.push(0xF3);
+    PeirEnc_rex_sse(self, dst, src);
     self.code.push(0x0F);
     self.code.push(0x58);
     PeirEnc_modrm(self, 3, dst, src);
@@ -1950,6 +1998,7 @@ pub fn PeirEnc_addss(self: &mut PeirEnc, dst: i64, src: i64) -> void {
 /// subss xmm0, xmm1
 pub fn PeirEnc_subss(self: &mut PeirEnc, dst: i64, src: i64) -> void {
     self.code.push(0xF3);
+    PeirEnc_rex_sse(self, dst, src);
     self.code.push(0x0F);
     self.code.push(0x5C);
     PeirEnc_modrm(self, 3, dst, src);
@@ -1958,6 +2007,7 @@ pub fn PeirEnc_subss(self: &mut PeirEnc, dst: i64, src: i64) -> void {
 /// mulss xmm0, xmm1
 pub fn PeirEnc_mulss(self: &mut PeirEnc, dst: i64, src: i64) -> void {
     self.code.push(0xF3);
+    PeirEnc_rex_sse(self, dst, src);
     self.code.push(0x0F);
     self.code.push(0x59);
     PeirEnc_modrm(self, 3, dst, src);
@@ -1966,6 +2016,7 @@ pub fn PeirEnc_mulss(self: &mut PeirEnc, dst: i64, src: i64) -> void {
 /// divss xmm0, xmm1
 pub fn PeirEnc_divss(self: &mut PeirEnc, dst: i64, src: i64) -> void {
     self.code.push(0xF3);
+    PeirEnc_rex_sse(self, dst, src);
     self.code.push(0x0F);
     self.code.push(0x5E);
     PeirEnc_modrm(self, 3, dst, src);
@@ -2760,7 +2811,7 @@ pub const PE_SUBSYSTEM_EFI_APPLICATION: i64 = 10;
 pub fn pe_build_efi(flat: Vec, code_size: i64, abs: Vec<i64>) -> Vec<i64> {
     // TG13: a layout over image_writer (pe_build_efi_img; the old body,
     // checked byte for byte against it on Nov 17, is gone:
-    // docs/image-writer.md)
+    // docs/reference/image-writer.md)
     return pe_build_efi_img(flat, code_size, abs);
 }
 
@@ -2822,7 +2873,7 @@ fn pe_build_efi_img(flat: Vec, code_size: i64, abs: Vec<i64>) -> Vec<i64> {
 /// block of padding only: the image still says it can be relocated.
 pub fn pe_efi_relocs(abs: Vec<i64>) -> Vec<i64> {
     // TG13: the blocks from image_writer (the old body, checked byte for
-    // byte against it on Nov 17, is gone: docs/image-writer.md)
+    // byte against it on Nov 17, is gone: docs/reference/image-writer.md)
     var at: Vec<i64> = Vec::new();
     var a: i64 = 0;
     while a < abs.len() {
@@ -2836,7 +2887,7 @@ pub fn pe_efi_relocs(abs: Vec<i64>) -> Vec<i64> {
 pub fn pe_build_file(text: Vec<i64>, rdata: Vec<i64>, entry_point_rva: i64, import_dir_rva: i64, iat_rva: i64, iat_size: i64, rdata_rva: i64) -> Vec<i64> {
     // TG13: a layout over image_writer (pe_build_file_img; the old body,
     // checked byte for byte against it on Nov 17, is gone:
-    // docs/image-writer.md)
+    // docs/reference/image-writer.md)
     return pe_build_file_img(&text, &rdata, entry_point_rva, import_dir_rva, iat_rva, iat_size, rdata_rva);
 }
 
@@ -2921,7 +2972,7 @@ pub fn pe_append_coff_symbols_pre(image: &mut Vec<i64>, pre: Vec<str>, names: Ve
     }
     // TG13: the records and string table from image_writer (global
     // functions of section 1, .text; the old body, checked byte for byte
-    // against it on Nov 17, is gone: docs/image-writer.md)
+    // against it on Nov 17, is gone: docs/reference/image-writer.md)
     var none: Vec<i64> = Vec::new();
     var syms: Vec<ImgSym> = img_func_syms(&names, &offs, &none, 0, 1, IMG_GLOBAL);
     img_coff_symbols(image, &pre, &syms, PE_COFF_SYMTAB_PTR_AT, PE_COFF_NSYMS_AT);
@@ -3191,7 +3242,7 @@ fn pe_put_debug_section(out: &mut Vec<i64>, k: i64, name_off: i64, data: Vec<i64
     var hn: str = "/" + int_to_str(name_off);
     // TG13: the header from image_writer (its relocation and line number
     // fields were zero already; the old body, checked byte for byte
-    // against it on Nov 17, is gone: docs/image-writer.md);
+    // against it on Nov 17, is gone: docs/reference/image-writer.md);
     // INITIALIZED_DATA | MEM_DISCARDABLE | MEM_READ
     img_pe_section_at(out, h, hn, data.len(), rva, raw, pos, 0x42000040);
     img_append(out, &data);

@@ -845,23 +845,8 @@ ARM64 where the system runs there; RISC-V and WASM pass the suite.
       backend; a failed check, like any panic, calls the program's
       `@panic_handler` with the message, else prints `panic: <message>` to
       COM1, then halts. `@wrapping` wraps (test_bare_panic_handler).
-- [~] G4. `fides-os` builds with the released compiler, in its own CI (M).
-      Nov 15: fides-os builds with `fid` (`emit --boot --load 0x1000000`):
-      minimal.fd prints "Hello from Fides OS!" and the shell kernel reaches
-      its prompt under QEMU. Its CI (fides-os .github/workflows/build.yml)
-      builds fid from pledgeandgrow/fid and boots both; done when it has run
-      green there. GRUB from an ISO, user mode, disk and network are not
-      tested.
-      Nov 22: the released `release/fid.exe` emitted the current shell kernel
-      (439,736 bytes); QEMU booted it and printed `Fides OS v0.1` and the
-      shell prompt. The public `pledgeandgrow/fides-os` repository currently
-      has no GitHub Actions workflows, so the required own-CI run is absent;
-      this used the current worktree with uncommitted kernel edits, not a
-      clean checkout. Leave partly.
+- [>] G4. `fides-os` builds with the released compiler, in its own CI (M).: moved to end-roadmap.md (Nov 22 — final-gate work, do when the code stops moving).
 
-**Acceptance:** a kernel boots and prints under QEMU, from a clean checkout.
-
-## Track H — Concurrency
 
 - [x] H1. `spawn` really runs concurrently on the Windows C path: it runs
       synchronously there today, and differs from native (M).
@@ -937,19 +922,8 @@ Depends on B, C, H5 and J.
       Bodies are text: a zero byte ends them. `http_serve_scoped` keeps memory
       flat, on the promise that a handler keeps no request string.
 - [x] I5. `examples/http_server` runs on a native build (S).
-- [~] I6. A sample service survives a 24-hour load test (M). A short run:
-      160,000 requests stay at 5.2 MB with `http_serve_scoped`. The harness
-      exists: `scripts/verify/soak.py` (--duration 86400) samples memory and
-      heartbeats of `tests/verify/soak_service.fd`, an in-process request
-      loop (no socket). Nov 16-17: `scripts/verify/soak_http.py` soaks the
-      service over real sockets (docs/verification/soak-http.md); its
-      per-request leak on kept-alive connections is fixed
-      (docs/verification/soak-http-leak.md), and a 30-minute socket soak
-      passed flat: 10.1 million requests, 0 failed, 6.0 MB, slope -0.04
-      MB/hour. Nov 22 audit: the recorded `build/soak-http-24h/` result
-      directory is absent, so there is no 24-hour result to verify. Left:
-      a 24-hour run and a rerun with the release compiler of this tree.
-      Keep partial.
+- [>] I6. A sample service survives a 24-hour load test (M). A short run: moved to end-roadmap.md (Nov 22 — final-gate work, do when the code stops moving).
+
 - [x] I7. TLS 1.3 on Windows: Schannel needs its newer credentials structure
       (SCH_CRED + TLS_PARAMETERS); the SP_PROT_TLS1_3 bit in SCHANNEL_CRED
       fails the handshake (S). Done: `tls_client13`/`tls_connect13`/
@@ -1427,41 +1401,8 @@ project with packages and editor help. Checked Nov 1:
       and refuses the installer when one fails (`FIDES_RUST_TOOLS=1` ships
       the Rust ones instead); release.yml then runs `ark.exe version` and
       `scribe.exe` on a file. fidesc.exe stays the Rust compiler.
-- [~] N9. Source-level debugging of native Windows builds: line tables a standard
-      debugger can read (L).
-      Done: `fidesc emit -g` writes DWARF v4 sections (`.debug_line` etc.) into
-      the PE with per-instruction line tables; `ccompile -g` annotates generated
-      C with `#line` to `.fd` sources. Left: same emission in the self-hosted
-      `fid` (compiler/*.fd), variable DIEs, verify with gdb/lldb/VS debugger.
-      Checked Nov 15: `fid` writes `.debug_line` (DWARF 4) on the three Linux
-      targets (compiler/nat_enc.fd nat_debug_line; competitive TL5). For
-      Windows, still left in the backend's files: CodeView/PDB or DWARF from
-      pe_ir, `#line` in compiler/codegen_c.fd's C, variable locations.
-      Nov 16 (not run yet): pe_ir writes DWARF 4 (.debug_abbrev,
-      .debug_info, .debug_line) into the PE of `fid emit --debug`/`-g`
-      for the input file's functions: gdb and lldb on Windows read it
-      (llvm DB3; scripts/pe-dwarf-check.py). Left: a PDB for the Visual
-      Studio debugger and WinDbg, variable locations (llvm DB4), checking
-      it in gdb/lldb on a Windows host.
-      Nov 16: `fid ccompile -g` writes `#line` to the .fd source and builds
-      with -g (competitive TL5), so gdb/lldb on a C build shows .fd lines;
-      a panic also prints the failing frame's values (complaint CE8). Left:
-      pe_ir's CodeView/PDB, variable locations, a check with a debugger.
-      Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
-      partly — pe_dbg_vars_check.sh: 9 passed, 3 failed. --debug builds
-      are right (DWARF decoded, pe-dwarf-check, a scripted debugger run
-      reads 25 of 25 values, with steps and function breakpoints), and -g
-      output and its pe-dwarf-check pass; objdump in WSL reads the
-      sections with no warning (the script's own objdump step fails on a
-      Git Bash path). Left: -g (optimized) shows wrong values for main's
-      locals (total = 0, want 45), and inlined functions' lines have no
-      rows; with FID_PE_DEBUG_RA=1 parameters show as optimized out; no
-      gdb/lldb session (not installed).
-      Nov 21 (c082ee6, 2g.104): `emit -g` reads only the instructions in a function's blocks (peir_dbg_live) — an inst the optimizer detached showed stale slots for main's locals; FID_PE_DEBUG_RA=1 keeps parameters in their slots.
-      Nov 21 evening: the PDB leftover is covered — compiler/pdb.fd writes
-      a PDB for `emit -g` on the pe_ir and --nat paths (llvm DB3, marked
-      done today). Variable locations in optimized builds and a real
-      gdb/lldb/WinDbg session stay open.
+- [>] N9. Source-level debugging of native Windows builds: moved to end-roadmap.md (Nov 22 — final-gate work, do when the code stops moving).
+
 - [x] N10. `docs/stdlib/` is generated by `scribe` and published with each release
       (M).
       Nov 22: validated — examples/http_server.fd, json_parser.fd,

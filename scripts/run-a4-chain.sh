@@ -11,9 +11,9 @@ say() { echo "[$(date +%H:%M:%S)] $*" >> "$LOG"; }
 
 # 1. wait for the running verify.sh (its log stops growing + verify-exit line)
 say "waiting for verify.sh --save"
-while ! grep -q "verify-exit=" /tmp/verify_save.log 2>/dev/null; do sleep 30; done
-say "verify.sh done: $(grep 'verify-exit=' /tmp/verify_save.log)"
-grep -E "passed|failed|PASS|FAIL|results saved|baseline" /tmp/verify_save.log | tail -8 >> "$LOG"
+while ! grep -q "verify-exit=" /tmp/verify_save2.log 2>/dev/null; do sleep 30; done
+say "verify.sh done: $(grep 'verify-exit=' /tmp/verify_save2.log)"
+grep -E "passed|failed|PASS|FAIL|results saved|baseline" /tmp/verify_save2.log | tail -8 >> "$LOG"
 
 # 2. CB4 (the window is quiet now)
 say "CB4: emit the compiler as a Linux ELF"

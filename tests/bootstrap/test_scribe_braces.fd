@@ -1,0 +1,82 @@
+// BG104, BG105: scribe (fid doc) documents the methods of an impl that
+// span several lines (it counted a method's own `{` before testing for
+// depth 1, so only one-line methods were found), and counts only the
+// braces that are code: a `{` in a string, a `}` in a comment or a char
+// literal, and a brace in a block comment over two lines no longer swallow
+// the items after the impl. An enum's header line is no variant.
+// Expected output:
+// items 3
+// impl Brace 1
+// methods 2 open close
+// doc The opening brace.
+// function after 14 After the impl.
+// enum Mark 17
+// variants 2 Open Close
+// braces {} {}{} {} { {}{
+use core;
+use compiler::scribe;
+
+fn main() -> i64 {
+    var src: str = "impl Brace {\n";
+    src = src + "    /// The opening brace.\n";
+    src = src + "    pub fn open(self: Brace) -> str {\n";
+    src = src + "        return \"{\";\n";
+    src = src + "    }\n";
+    src = src + "    pub fn close(self: Brace) -> i64 {\n";
+    src = src + "        // a } in a comment\n";
+    src = src + "        /* a { in a block\n";
+    src = src + "           comment */\n";
+    src = src + "        return '}';\n";
+    src = src + "    }\n";
+    src = src + "}\n";
+    src = src + "/// After the impl.\n";
+    src = src + "pub fn after() -> i64 {\n";
+    src = src + "    return 1;\n";
+    src = src + "}\n";
+    src = src + "pub enum Mark {\n";
+    src = src + "    Open,\n";
+    src = src + "    Close,\n";
+    src = src + "}\n";
+    var items: Vec<DocItem> = extract_docs(src);
+    println("items " + int_to_str(items.len()));
+    var k: i64 = 0;
+    while k < items.len() {
+        val it: DocItem = items.get(k);
+        if it.kind == "impl" {
+            println("impl " + it.name + " " + int_to_str(it.line));
+            var ms: str = "methods " + int_to_str(it.methods.len());
+            var m: i64 = 0;
+            while m < it.methods.len() {
+                ms = ms + " " + it.methods.get(m).name;
+                m = m + 1;
+            }
+            println(ms);
+            if it.methods.len() > 0 {
+                println("doc " + it.methods.get(0).doc);
+            }
+        } else if it.kind == "enum" {
+            println("enum " + it.name + " " + int_to_str(it.line));
+            var vs: str = "variants " + int_to_str(it.variants.len());
+            var v: i64 = 0;
+            while v < it.variants.len() {
+                vs = vs + " " + it.variants.get(v).a;
+                v = v + 1;
+            }
+            println(vs);
+        } else {
+            println(it.kind + " " + it.name + " " + int_to_str(it.line) + " " + it.doc);
+        }
+        k = k + 1;
+    }
+    // the code braces of single lines: a string, a char literal, an
+    // f-string's interpolation, a raw string, a lifetime
+    var probe: Vec<str> = Vec::new();
+    probe.push("fn f() { return \"}\"; }");
+    probe.push("if c == '{' { x = '\\''; } else { y = f\"{a}\"; }");
+    probe.push("val r = r#\"{\"#; fn g<'a>(p: &'a i64) { }");
+    probe.push("struct S { // }");
+    probe.push("    { x: '}' }  { /* } */");
+    val cb: Vec<str> = scribe_code_braces(probe);
+    println("braces " + cb.get(0) + " " + cb.get(1) + " " + cb.get(2) + " " + cb.get(3) + " " + cb.get(4));
+    return 0;
+}

@@ -1,0 +1,40 @@
+// BG7 (docs/roadmap/bugs-roadmap.md): an index read `v[i]` and a for-in
+// element of a Vec<f32> on the C path. The element word holds the single's
+// f64 bits (the OP21 layout: cast_arg stores an f32 through a double), but
+// compiler/codegen_c.fd cg_vec_get_word read the word's low 32 bits as a
+// float, which are the double's low mantissa bits: `println(v[0])` after
+// `v.push(1.5 as f32)` printed 0. It now reads the word as a double and
+// narrows it, as the call path does. Every backend prints the same.
+//
+// Expected output:
+// 1.5
+// 2.25
+// -3.5
+// 1.5
+// 2.25
+// -3.5
+// 0.25
+// 3
+fn main() -> i64 {
+    var v: Vec<f32> = Vec::new();
+    v.push(1.5 as f32);
+    v.push(2.25 as f32);
+    v.push((0.0 - 3.5) as f32);
+    // the bug's trigger: an index read printed as it is
+    println(v[0]);
+    // an index read through a variable index (checked)
+    var i: i64 = 1;
+    val y: f32 = v[i];
+    println(float_to_str(y as f64));
+    i = 2;
+    println(float_to_str(v[i] as f64));
+    // for-in elements, and arithmetic on them
+    var sum: f32 = 0.0 as f32;
+    for x in v {
+        println(float_to_str(x as f64));
+        sum = sum + x;
+    }
+    println(float_to_str(sum as f64));
+    println(int_to_str(v.len()));
+    return 0;
+}

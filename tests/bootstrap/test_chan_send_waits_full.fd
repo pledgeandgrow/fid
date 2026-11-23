@@ -1,0 +1,42 @@
+// BG74 (docs/roadmap/bugs-roadmap.md): a send to a full channel waits until
+// there is room or the channel is closed. The interpreter ignored the
+// capacity: every send went through at once, so the producer below sent
+// all 3 values into a channel of one place. Now its second send waits; main
+// closes the channel, which ends that wait with false, and the third send
+// fails too: one value was sent, and it is still there to be received.
+// C path and interpreter only: the native runtimes have their own channels.
+//@ env: FIDES_WORKERS=1
+//@ backends: run,ccompile
+//
+// Expected output:
+// 1
+// 1
+// closed
+use channel;
+use task;
+
+async fn producer(ch: i64, n: i64) -> Future<i64> {
+    var sent: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        if channel_send(ch, i + 1) {
+            sent = sent + 1;
+        }
+        i = i + 1;
+    }
+    return sent;
+}
+
+fn main() -> i64 {
+    val ch = channel_create(1);
+    val p = producer(ch, 3);
+    // the producer runs meanwhile: its first send fills the channel
+    task_sleep(50);
+    channel_close(ch);
+    println(await p);
+    println(channel_recv(ch));
+    if channel_recv(ch) == CHAN_CLOSED() {
+        println("closed");
+    }
+    return 0;
+}

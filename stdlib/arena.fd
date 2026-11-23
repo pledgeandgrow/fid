@@ -52,7 +52,11 @@ pub fn arena_new() -> i64 {
 pub fn arena_alloc(_arena_mark: i64, size: i64) -> i64 {
     // The arena_mark is saved for later restore; allocation uses p_malloc
     // which in the C codegen uses the arena bump allocator.
-    return p_malloc(size);
+    // SAFETY: p_malloc only allocates a fresh size-byte block and returns
+    // its address as a plain i64; nothing is read or written through it.
+    unsafe {
+        return p_malloc(size);
+    }
 }
 
 /// Save the current arena position. Returns a mark that can be passed
@@ -94,12 +98,17 @@ pub fn arena_free(arena_mark: i64) -> void {
 /// Create a new region. Returns a handle to use with region_alloc and
 /// region_free.
 pub fn region_new() -> i64 {
-    var h: i64 = p_malloc(16);
+    var h: i64 = 0;
+    // SAFETY: p_malloc only allocates the fresh 16-byte header, which is
+    // written below before any read.
+    unsafe {
+        h = p_malloc(16);
+    }
     if h == 0 {
         p_panic("out of memory");
     }
-    var p0: *mut i64 = h;
-    var p1: *mut i64 = h + 8;
+    var p0: *mut i64 = h as *mut i64;
+    var p1: *mut i64 = (h + 8) as *mut i64;
     // SAFETY: h is a live 16-byte block just allocated above.
     unsafe {
         *p0 = 0;
@@ -114,14 +123,19 @@ pub fn region_alloc(region: i64, size: i64) -> i64 {
     if region == 0 {
         p_panic("region_alloc on a null region");
     }
-    var node: i64 = p_malloc(size + 16);
+    var node: i64 = 0;
+    // SAFETY: p_malloc only allocates the fresh size + 16-byte node; its
+    // two link words are written below before any read.
+    unsafe {
+        node = p_malloc(size + 16);
+    }
     if node == 0 {
         p_panic("out of memory");
     }
-    var headp: *mut i64 = region;
-    var countp: *mut i64 = region + 8;
-    var nextp: *mut i64 = node;
-    var sizep: *mut i64 = node + 8;
+    var headp: *mut i64 = region as *mut i64;
+    var countp: *mut i64 = (region + 8) as *mut i64;
+    var nextp: *mut i64 = node as *mut i64;
+    var sizep: *mut i64 = (node + 8) as *mut i64;
     // SAFETY: `region` is a live region header ({head, count}); `node` is
     // a live size+16 block whose first two words are the list link.
     unsafe {
@@ -136,7 +150,11 @@ pub fn region_alloc(region: i64, size: i64) -> i64 {
 /// Allocate `size` zeroed bytes within a region.
 pub fn region_alloc_zeroed(region: i64, size: i64) -> i64 {
     var p: i64 = region_alloc(region, size);
-    p_memset(p, 0, size);
+    // SAFETY: p is the payload of the node region_alloc just made: size
+    // bytes after its 16-byte link, all inside that size + 16-byte block.
+    unsafe {
+        p_memset(p, 0, size);
+    }
     return p;
 }
 
@@ -147,7 +165,7 @@ pub fn region_free(region: i64) -> void {
     if region == 0 {
         return;
     }
-    var headp: *mut i64 = region;
+    var headp: *mut i64 = region as *mut i64;
     var node: i64 = 0;
     // SAFETY: `region` is a live header; every node it points to was
     // allocated by region_alloc (16-byte link + payload).
@@ -155,16 +173,26 @@ pub fn region_free(region: i64) -> void {
         node = *headp;
     }
     while node != 0 {
-        var np: *mut i64 = node;
+        var np: *mut i64 = node as *mut i64;
         var next: i64 = 0;
         // SAFETY: node is a live list node; read its link before freeing.
         unsafe {
             next = *np;
         }
-        p_free(node);
+        // SAFETY: node is a block region_alloc got from p_malloc and linked
+        // into this region; its link was read into next above, and the walk
+        // never comes back to it.
+        unsafe {
+            p_free(node);
+        }
         node = next;
     }
-    p_free(region);
+    // SAFETY: region is the 16-byte header region_new got from p_malloc;
+    // its list was freed above and the handle is dead after this call
+    // (a caller that uses or frees it again is not caught: M10 report).
+    unsafe {
+        p_free(region);
+    }
 }
 
 /// Free a single allocation within a region: unlinks its node and frees
@@ -174,8 +202,8 @@ pub fn region_free_one(region: i64, ptr: i64) -> void {
     if region == 0 || ptr == 0 {
         return;
     }
-    var headp: *mut i64 = region;
-    var countp: *mut i64 = region + 8;
+    var headp: *mut i64 = region as *mut i64;
+    var countp: *mut i64 = (region + 8) as *mut i64;
     var prev: i64 = 0;
     var node: i64 = 0;
     // SAFETY: `region` is a live header; walk its node list.
@@ -183,14 +211,14 @@ pub fn region_free_one(region: i64, ptr: i64) -> void {
         node = *headp;
     }
     while node != 0 {
-        var np: *mut i64 = node;
+        var np: *mut i64 = node as *mut i64;
         var next: i64 = 0;
         // SAFETY: node is a live list node.
         unsafe {
             next = *np;
         }
         if node + 16 == ptr {
-            var prevp: *mut i64 = prev;
+            var prevp: *mut i64 = prev as *mut i64;
             // SAFETY: unlink `node`: head case writes the header, else the
             // previous node's next word — both live.
             unsafe {
@@ -201,7 +229,12 @@ pub fn region_free_one(region: i64, ptr: i64) -> void {
                 }
                 * countp = *countp - 1;
             }
-            p_free(node);
+            // SAFETY: node is a p_malloc block of region_alloc's, found on
+            // this region's list (its payload is ptr) and just unlinked, so
+            // region_free will not free it again.
+            unsafe {
+                p_free(node);
+            }
             return;
         }
         prev = node;
@@ -294,7 +327,7 @@ pub fn region_count(region: i64) -> i64 {
     if region == 0 {
         return 0;
     }
-    var countp: *mut i64 = region + 8;
+    var countp: *mut i64 = (region + 8) as *mut i64;
     var n: i64 = 0;
     // SAFETY: `region` is a live header; word 1 is the live count.
     unsafe {
@@ -351,7 +384,11 @@ pub fn frame_begin(fa: &mut FrameArena) -> void {
 /// Must be called between frame_begin and frame_end.
 pub fn frame_alloc(fa: &mut FrameArena, size: i64) -> i64 {
     fa.alloc_count = fa.alloc_count + 1;
-    return p_malloc(size);
+    // SAFETY: p_malloc only allocates a fresh size-byte block and returns
+    // its address as a plain i64; nothing is read or written through it.
+    unsafe {
+        return p_malloc(size);
+    }
 }
 
 /// End the current frame. Frees all memory allocated since frame_begin.
@@ -404,7 +441,11 @@ pub fn http_request_arena_new() -> http_request_arena {
 /// Allocate `size` bytes within an HTTP request arena.
 /// The memory is freed when http_request_arena_free is called.
 pub fn http_request_alloc(_arena: http_request_arena, size: i64) -> i64 {
-    return p_malloc(size);
+    // SAFETY: p_malloc only allocates a fresh size-byte block and returns
+    // its address as a plain i64; nothing is read or written through it.
+    unsafe {
+        return p_malloc(size);
+    }
 }
 
 /// Free an HTTP request arena. All allocations made via http_request_alloc

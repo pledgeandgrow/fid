@@ -724,9 +724,47 @@ pub fn peir_counted_loop(f: &IrFunction, head: i64, n: i64, succs: Vec<Vec<i64>>
             return;
         }
     }
+    // The blocks that can run after the increment, in the same iteration
+    var after: Vec<i64> = peir_zeros(n);
+    work = Vec::new();
+    var first: Vec<i64> = succs.get(store_block);
+    i = 0;
+    while i < first.len() {
+        work.push(first.get(i));
+        i = i + 1;
+    }
+    while work.len() > 0 {
+        var b: i64 = work.pop();
+        if b != head && after.get(b) == 0 {
+            after.set(b, 1);
+            var ss: Vec<i64> = succs.get(b);
+            i = 0;
+            while i < ss.len() {
+                work.push(ss.get(i));
+                i = i + 1;
+            }
+        }
+    }
+    // BG4 (Nov 22): the step's overflow check was dropped even when the
+    // step sits in an inner loop (`while i < n { while j < 5 { i = i + 1;
+    // .. } }`): it then runs many times per test of `i < right`, so i < right
+    // says nothing about the second `i + 1`. Only a step that cannot run
+    // again before control is back at the header (as peir_counted_down
+    // requires: no path from the step back to its own block that avoids the
+    // header) is covered by the test. The bounds checks below need no such
+    // guard: a read after the step (in an `after` block, or later in the
+    // step's block) is never treated as checked.
+    var step_once: bool = after.get(store_block) == 0;
+    // The bounds below take i >= start_min (i only grows). A step that can
+    // run several times per test has its check kept now, so i cannot wrap,
+    // except where arithmetic wraps (@wrapping, BG5): there nothing is
+    // proved
+    if !step_once && peir_fn_wraps(f) {
+        return;
+    }
     // i + 1 cannot overflow when i < right; i + c (c > 1) only once right is
     // known to be at most a Vec's length (below)
-    if step_c == 1 {
+    if step_c == 1 && step_once {
         out.set(value, out.get(value) | 1);
     }
     // Bounds: `right` is v.len(), or a local set once, before the loop, to
@@ -826,29 +864,8 @@ pub fn peir_counted_loop(f: &IrFunction, head: i64, n: i64, succs: Vec<Vec<i64>>
     }
     // ME25: i < right <= v.len() (a length is below 2^60) and c <= 2^20:
     // i + c fits
-    if step_c > 1 {
+    if step_c > 1 && step_once {
         out.set(value, out.get(value) | 1);
-    }
-    // The blocks that can run after the increment, in the same iteration
-    var after: Vec<i64> = peir_zeros(n);
-    work = Vec::new();
-    var first: Vec<i64> = succs.get(store_block);
-    i = 0;
-    while i < first.len() {
-        work.push(first.get(i));
-        i = i + 1;
-    }
-    while work.len() > 0 {
-        var b: i64 = work.pop();
-        if b != head && after.get(b) == 0 {
-            after.set(b, 1);
-            var ss: Vec<i64> = succs.get(b);
-            i = 0;
-            while i < ss.len() {
-                work.push(ss.get(i));
-                i = i + 1;
-            }
-        }
     }
     b2 = 0;
     while b2 < n {
@@ -2086,9 +2103,15 @@ pub fn peir_guard_ops(f: &IrFunction, n: i64, succs: Vec<Vec<i64>>, preds: Vec<V
                                     if (name == "Vec_set" || name == "p_vec_set") && args.len() >= 3 {
                                         at = args.len() - 3;
                                     }
-                                    var idx_ok: bool = args.get(at + 1) == idx_val;
-                                    if !idx_ok && slot >= 0 {
-                                        idx_ok = peir_load_of(f, args.get(at + 1), slot);
+                                    // BG83: args.get(at + 1) only for a Vec_get/
+                                    // Vec_set (at >= 0): any other call with no
+                                    // arguments made args.get(0) panic
+                                    var idx_ok: bool = false;
+                                    if at >= 0 {
+                                        idx_ok = args.get(at + 1) == idx_val;
+                                        if !idx_ok && slot >= 0 {
+                                            idx_ok = peir_load_of(f, args.get(at + 1), slot);
+                                        }
                                     }
                                     if at >= 0 && idx_ok && peir_same_vec(f, args.get(at), vec_val, dvec, facts) && (out.get(args.get(at + 1)) & 2) != 0 {
                                         out.set(id, out.get(id) | 1);
@@ -2751,6 +2774,25 @@ fn peir_range_why(what: str) {
 
 fn peir_join_stored(f: &IrFunction, preds: &Vec<Vec<i64>>, b: i64, q: i64, slot: i64, vid: i64, def_b: &Vec<i64>, st_ptr: &Vec<i64>, st_blk: &Vec<i64>) -> bool {
     var nb: i64 = f.blocks.len();
+    // BG3 (Nov 22): the walk below stops at b (w == b) without looking at
+    // b's own stores, so a join block that stores the local itself (`loop {
+    // n = n * 3; if n < 0 { .. } }`, the multiply and store in the header)
+    // kept the entry fact (n = 1) across the back edge, although the back
+    // edge carries the value b stored: `n * 3` lost its overflow check. A
+    // store of the slot (or the value's definition) in b counts as one on
+    // the way round.
+    if slot >= 0 {
+        var bi: i64 = 0;
+        while bi < st_ptr.len() {
+            if st_blk.get(bi) == b && st_ptr.get(bi) == slot {
+                return true;
+            }
+            bi = bi + 1;
+        }
+    }
+    if vid >= 0 && vid < def_b.len() && def_b.get(vid) == b {
+        return true;
+    }
     var seen: Vec<i64> = peir_zeros(nb);
     var work: Vec<i64> = Vec::new();
     work.push(q);
@@ -3021,8 +3063,21 @@ fn peir_join_fact(f: &IrFunction, r: &mut PeirRanges, index: &Vec<i64>, ps: Vec<
 /// One scan of the function in layout order; `final` marks the results.
 /// With `joins` (LF8/LF9, FID_IROPT_OFF=rangejoin turns it off), a branch
 /// that gives no fact keeps the one before it, and facts meet at joins.
+/// BG5 (Nov 22): does f's integer arithmetic wrap instead of panicking on
+/// overflow? `@wrapping` functions, and the functions pe_ir and nat_ir
+/// compile without overflow checks (the Fides runtime's `pert_`/`pe_`/...,
+/// their cur_wrapping). The range rules that lean on "the operation was
+/// checked, so it did not overflow" must not apply there.
+fn peir_fn_wraps(f: &IrFunction) -> bool {
+    return f.is_wrapping || is_pe_runtime_fn(f.name);
+}
+
 fn peir_range_scan(f: &IrFunction, r: &mut PeirRanges, single_pred: &Vec<i64>, preds: &Vec<Vec<i64>>, joins: bool, index: &Vec<i64>, out: &mut Vec<i64>, final: bool, dom: &mut PeirDomFacts, lf: &PeirBackFacts) {
     var nv: i64 = r.lo.len();
+    // BG5: in a function whose arithmetic wraps, an Add/Mul that may
+    // overflow gives no bound at all (the one-sided rules below assumed a
+    // checked operation: an overflowing one would have panicked)
+    var wraps: bool = peir_fn_wraps(f);
     var tr: Vec<i64> = Vec::new();
     // OP24: entry facts are this scan's own
     var dn: Vec<i64> = Vec::new();
@@ -3373,8 +3428,9 @@ fn peir_range_scan(f: &IrFunction, r: &mut PeirRanges, single_pred: &Vec<i64>, p
                                                 out.set(id, out.get(id) | 1);
                                             }
                                             peir_rng_put(r, id, t1.get(0), t2.get(0));
-                                        } else if okl && ll2 > PEIR_I64_MIN && rl > PEIR_I64_MIN {
+                                        } else if !wraps && okl && ll2 > PEIR_I64_MIN && rl > PEIR_I64_MIN {
                                             // may overflow upward: still checked, the lower bound holds
+                                            // (BG5: not when it wraps: a wrapped sum is below t1)
                                             peir_rng_put(r, id, t1.get(0), PEIR_I64_MAX);
                                         }
                                     }
@@ -3422,8 +3478,9 @@ fn peir_range_scan(f: &IrFunction, r: &mut PeirRanges, single_pred: &Vec<i64>, p
                                                 mx = c4;
                                             }
                                             peir_rng_put(r, id, mn, mx);
-                                        } else if ll2 >= 0 && rl >= 0 && peir_mul_fits(ll2, rl) {
+                                        } else if !wraps && ll2 >= 0 && rl >= 0 && peir_mul_fits(ll2, rl) {
                                             // both >= 0: the product is at least lo * lo (checked)
+                                            // (BG5: not when it wraps)
                                             peir_rng_put(r, id, ll2 * rl, PEIR_I64_MAX);
                                         }
                                     }
@@ -3642,6 +3699,11 @@ fn peir_plain_load_slot(f: &IrFunction, r: &PeirRanges, x: i64) -> i64 {
 /// when the branch is taken): p. Otherwise -1.
 fn peir_square_local(f: &IrFunction, r: &PeirRanges, v: i64, cond: i64) -> i64 {
     var px: i64 = 0 - 1;
+    // BG5 (Nov 22): `p * p < n` bounds |p| only because the multiply was
+    // checked; a wrapped square says nothing about p
+    if peir_fn_wraps(f) {
+        return px;
+    }
     var x: i64 = 0 - 1;
     var y: i64 = 0 - 1;
     match peir_inst_of(f, v) {
@@ -4526,6 +4588,11 @@ pub fn peir_range_ops(f: &IrFunction, nvals: i64, out: &mut Vec<i64>) {
     // Rounds: value ranges from the locals' bounds, the locals' bounds from
     // the values they are stored
     var dummy: Vec<i64> = peir_zeros(nvals);
+    // BG5 (Nov 22): `p = p + c` with c >= 0 never lowers p (and `p - c`
+    // never raises it) only when the step is checked; in a function whose
+    // arithmetic wraps it can, so such a store counts as any other (the
+    // hull of the values stored, which the scan bounds soundly there)
+    var wraps: bool = peir_fn_wraps(f);
     var round: i64 = 0;
     while round < 3 {
         // fresh value intervals each round
@@ -4568,7 +4635,7 @@ pub fn peir_range_ops(f: &IrFunction, nvals: i64, out: &mut Vec<i64>) {
                             _ => {
                             }
                         }
-                        if from_self {
+                        if from_self && !wraps {
                             match sop {
                                 BinOp::Add => {
                                     self_step = true;
@@ -6836,4 +6903,356 @@ pub fn iro_named_off(env: str, name: str) -> bool {
         return false;
     }
     return str_contains("," + off + ",", "," + name + ",");
+}
+
+// ===========================================================================
+
+// (Moved here from compiler/pe_ir.fd on Nov 22 so that the machine layer,
+// which does not import pe_ir, runs the same IR-level check: before, nat_ir
+// rejected every conditional branch in a @constant_time function, public loop
+// counters included, while pe_ir rejected only branches on secrets.)
+// J7: @constant_time on the default Windows backend (and --bare / --elf)
+// ===========================================================================
+//
+// The source-level check (TypeChecker_verify_constant_time) works on names
+// in the AST. This one runs on the IR this backend turns into machine code,
+// after lowering and the mid-end, and follows values through memory and
+// calls, so it also sees what the source check cannot: a secret that
+// reaches a loop bound through an `&mut` out-parameter, a field of a local
+// struct, or a global. nat_ir.fd's ng_ct_check is its machine-layer
+// counterpart for `--nat` and the Linux targets.
+//
+// Secret: every parameter (the IR does not keep @public), and every value
+// computed from a secret: arithmetic, comparisons, conversions, addresses,
+// a load from memory a secret was stored into (per alloca or global, flow-
+// insensitive), and the result of a call one of whose arguments is secret,
+// except a length query (`len`, `*_len`, `*_length`: lengths are public,
+// as in the source check). A call that is given a secret also makes the memory behind
+// every pointer it is given secret (it may store the secret there).
+//
+// Rejected in a @constant_time function:
+//   a conditional branch on a secret value (a jcc in this backend's code)
+//   integer division or remainder of a secret (idiv/div: variable latency),
+//     except a signed division by a constant >= 2, which this backend turns
+//     into a multiplication (PeirGen_gen_div_const)
+//   float division of a secret (divsd: variable latency)
+//   an indirect call (closure, function value, dyn method)
+// Not rejected: overflow, bounds and narrowing checks. Their jump is taken
+// only on a run that ends in a panic, so a run that completes executes the
+// same instructions whatever the secret is. Memory addresses are not
+// checked here either (a pointer to a secret buffer is not secret itself);
+// the source check rejects indexing by a secret.
+// FID_PE_CT_OFF=1 turns this check off (to compare, or around a false
+// positive: please report one).
+
+/// The alloca or global that pointer `v` is derived from (through field and
+/// element addresses and bit casts): its instruction id, or -1.
+fn peir_ct_root(func: &IrFunction, v: i64) -> i64 {
+    var cur: i64 = v;
+    var steps: i64 = 0;
+    while steps < 64 {
+        match peir_inst_of(func, cur) {
+            Inst::Alloca(_, _) => {
+                return cur;
+            }
+            Inst::GlobalAddr(_, _) => {
+                return cur;
+            }
+            Inst::GetFieldPtr(p, _, _) => {
+                cur = p;
+            }
+            Inst::GetElemPtr(p, _, _) => {
+                cur = p;
+            }
+            Inst::BitCast(p, _, _) => {
+                cur = p;
+            }
+            _ => {
+                return -1;
+            }
+        }
+        steps = steps + 1;
+    }
+    return -1;
+}
+
+/// The key of the memory `p` points into ("a:<alloca id>", "g:<global>"),
+/// or "" when it is not a local or a global.
+fn peir_ct_mem_key(func: &IrFunction, p: i64) -> str {
+    var root: i64 = peir_ct_root(func, p);
+    if root < 0 {
+        return "";
+    }
+    match peir_inst_of(func, root) {
+        Inst::GlobalAddr(gname, _) => {
+            return "g:" + gname;
+        }
+        _ => {
+        }
+    }
+    return "a:" + int_to_str(root);
+}
+
+/// Does `p` point into memory a secret was stored into?
+fn peir_ct_mem_secret(func: &IrFunction, mem: i64, p: i64) -> bool {
+    var key: str = peir_ct_mem_key(func, p);
+    if key == "" {
+        return false;
+    }
+    return HashMap_contains(mem, key);
+}
+
+/// Mark the memory `p` points into as holding a secret; true when it was
+/// not marked before.
+fn peir_ct_mem_mark(func: &IrFunction, mem: i64, p: i64) -> bool {
+    var key: str = peir_ct_mem_key(func, p);
+    if key == "" || HashMap_contains(mem, key) {
+        return false;
+    }
+    HashMap_insert(mem, key, 1);
+    return true;
+}
+
+fn peir_ct_sec(secret: &Vec<i64>, v: i64) -> bool {
+    return v >= 0 && v < secret.len() && secret.get(v) != 0;
+}
+
+/// Is any of `args` secret, or a pointer to memory holding a secret?
+fn peir_ct_args_secret(func: &IrFunction, secret: &Vec<i64>, mem: i64, args: Vec<i64>) -> bool {
+    var i: i64 = 0;
+    while i < args.len() {
+        var a: i64 = args.get(i);
+        if peir_ct_sec(secret, a) || peir_ct_mem_secret(func, mem, a) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// A call given a secret may store it behind any pointer it is given.
+fn peir_ct_args_mark(func: &IrFunction, mem: i64, args: Vec<i64>) -> bool {
+    var changed: bool = false;
+    var i: i64 = 0;
+    while i < args.len() {
+        if peir_ct_mem_mark(func, mem, args.get(i)) {
+            changed = true;
+        }
+        i = i + 1;
+    }
+    return changed;
+}
+
+/// A length query: its result is public (TypeChecker's ct_secret rule;
+/// a str's `.len()` lowers to p_str_length).
+fn peir_ct_is_len(name: str) -> bool {
+    return name == "len" || str_ends_with(name, "_len") || str_ends_with(name, "_length");
+}
+
+fn peir_ct_unsigned(ty: IrType) -> bool {
+    return ir_type_eq(ty, IrType::U8) || ir_type_eq(ty, IrType::U16) || ir_type_eq(ty, IrType::U32) || ir_type_eq(ty, IrType::U64);
+}
+
+/// " (line N)" for value `id` when the lowering recorded its source line.
+fn peir_ct_line(func: &IrFunction, id: i64) -> str {
+    match IrFunction_get_meta(func, id) {
+        OptValueMeta::Some(m) => {
+            match m.source_line {
+                OptU64::Some(v) => {
+                    if v > 0 {
+                        return " (line " + int_to_str(v as i64) + ")";
+                    }
+                }
+                OptU64::None => {
+                }
+            }
+        }
+        OptValueMeta::None => {
+        }
+    }
+    return "";
+}
+
+
+/// The violations of @constant_time function `func` (named `name`), one
+/// message each; empty when it is clean. See the section comment above.
+pub fn peir_ct_check(func: &IrFunction, name: str) -> Vec<str> {
+    var errs: Vec<str> = Vec::new();
+    var nvals: i64 = func.value_metas.len() + func.insts.len() + func.params.len() + 16;
+    if func.next_value + 1 > nvals {
+        nvals = func.next_value + 1;
+    }
+    var secret: Vec<i64> = peir_zeros(nvals);
+    var mem: i64 = HashMap_new();
+    var pi: i64 = 0;
+    while pi < func.params.len() {
+        var pid: i64 = func.params.get(pi).id;
+        if pid >= 0 && pid < nvals {
+            secret.set(pid, 1);
+        }
+        pi = pi + 1;
+    }
+    // The instructions of the function's blocks, in layout order
+    var ids: Vec<i64> = Vec::new();
+    var bi: i64 = 0;
+    while bi < func.blocks.len() {
+        var blk: BasicBlock = func.blocks.get(bi);
+        var k: i64 = 0;
+        while k < blk.instructions.len() {
+            ids.push(blk.instructions.get(k));
+            k = k + 1;
+        }
+        bi = bi + 1;
+    }
+    // Propagate to a fixpoint: secrets only grow, so each round that
+    // changes something marks at least one more value or memory root.
+    var changed: bool = true;
+    var rounds: i64 = 0;
+    while changed && rounds < nvals + 2 {
+        changed = false;
+        rounds = rounds + 1;
+        var ii: i64 = 0;
+        while ii < ids.len() {
+            var id: i64 = ids.get(ii);
+            var t: bool = false;
+            match peir_inst_of(func, id) {
+                Inst::BinOp(_, l, r, _) => {
+                    t = peir_ct_sec(&secret, l) || peir_ct_sec(&secret, r);
+                }
+                Inst::UnaryOp(_, x, _) => {
+                    t = peir_ct_sec(&secret, x);
+                }
+                Inst::BitCast(x, _, _) => {
+                    t = peir_ct_sec(&secret, x);
+                }
+                Inst::IntExtend(x, _, _) => {
+                    t = peir_ct_sec(&secret, x);
+                }
+                Inst::IntTrunc(x, _, _) => {
+                    t = peir_ct_sec(&secret, x);
+                }
+                Inst::IntToFloat(x, _, _) => {
+                    t = peir_ct_sec(&secret, x);
+                }
+                Inst::FloatToInt(x, _, _) => {
+                    t = peir_ct_sec(&secret, x);
+                }
+                Inst::GetFieldPtr(p, _, _) => {
+                    t = peir_ct_sec(&secret, p);
+                }
+                Inst::GetElemPtr(p, ix, _) => {
+                    t = peir_ct_sec(&secret, p) || peir_ct_sec(&secret, ix);
+                }
+                Inst::Load(p, _) => {
+                    t = peir_ct_sec(&secret, p) || peir_ct_mem_secret(func, mem, p);
+                }
+                Inst::Store(sptr, sval, _) => {
+                    if peir_ct_sec(&secret, sval) || peir_ct_mem_secret(func, mem, sval) {
+                        if peir_ct_mem_mark(func, mem, sptr) {
+                            changed = true;
+                        }
+                    }
+                }
+                Inst::StructCopy(cdst, csrc, _) => {
+                    if peir_ct_sec(&secret, csrc) || peir_ct_mem_secret(func, mem, csrc) {
+                        if peir_ct_mem_mark(func, mem, cdst) {
+                            changed = true;
+                        }
+                    }
+                }
+                Inst::Call(callee, cargs, _, _) => {
+                    var any: bool = peir_ct_args_secret(func, &secret, mem, cargs);
+                    if any {
+                        if !peir_ct_is_len(callee) {
+                            t = true;
+                        }
+                        if peir_ct_args_mark(func, mem, cargs) {
+                            changed = true;
+                        }
+                    }
+                }
+                Inst::CallPtr(fptr, pargs, _, _, _) => {
+                    var pany: bool = peir_ct_sec(&secret, fptr) || peir_ct_args_secret(func, &secret, mem, pargs);
+                    if pany {
+                        t = true;
+                        if peir_ct_args_mark(func, mem, pargs) {
+                            changed = true;
+                        }
+                    }
+                }
+                Inst::DynCall(_, _, dargs, _, _) => {
+                    if peir_ct_args_secret(func, &secret, mem, dargs) {
+                        t = true;
+                        if peir_ct_args_mark(func, mem, dargs) {
+                            changed = true;
+                        }
+                    }
+                }
+                _ => {
+                }
+            }
+            if t && id >= 0 && id < nvals && secret.get(id) == 0 {
+                secret.set(id, 1);
+                changed = true;
+            }
+            ii = ii + 1;
+        }
+    }
+    // What the code would do with the secrets
+    var ci: i64 = 0;
+    while ci < ids.len() {
+        var cid: i64 = ids.get(ci);
+        var what: str = "";
+        match peir_inst_of(func, cid) {
+            Inst::Branch(cond, _, _) => {
+                if peir_ct_sec(&secret, cond) {
+                    what = "conditional branch on secret data";
+                }
+            }
+            Inst::BinOp(op, l, r, ty) => {
+                var is_div: bool = false;
+                match op {
+                    BinOp::Div => {
+                        is_div = true;
+                    }
+                    BinOp::Mod => {
+                        is_div = true;
+                    }
+                    _ => {
+                    }
+                }
+                if is_div && (peir_ct_sec(&secret, l) || peir_ct_sec(&secret, r)) {
+                    if ir_type_is_float(ty) {
+                        what = "float division of secret data (variable latency)";
+                    } else {
+                        // A signed division by a constant >= 2 is a multiply
+                        var by_const: bool = false;
+                        match peir_inst_of(func, r) {
+                            Inst::ConstInt(d, _) => {
+                                by_const = d >= 2 && !peir_ct_unsigned(ty);
+                            }
+                            _ => {
+                            }
+                        }
+                        if !by_const {
+                            what = "integer division of secret data (variable latency)";
+                        }
+                    }
+                }
+            }
+            Inst::CallPtr(_, _, _, _, _) => {
+                what = "indirect call (closure or function value)";
+            }
+            Inst::DynCall(_, _, _, _, _) => {
+                what = "indirect call (dyn method)";
+            }
+            _ => {
+            }
+        }
+        if what != "" {
+            errs.push("@constant_time function '" + name + "': " + what + peir_ct_line(func, cid));
+        }
+        ci = ci + 1;
+    }
+    return errs;
 }

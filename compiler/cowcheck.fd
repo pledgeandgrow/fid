@@ -707,6 +707,30 @@ fn cow_uses_opt_stmts(o: OptStmts, name: str) -> i64 {
     return 0;
 }
 
+/// BG29: the uses of `name` in a match arm's guard (none without one).
+fn cow_uses_guard(g: OptBoxExpr, name: str) -> i64 {
+    match g {
+        OptBoxExpr::Some(ge) => {
+            return cow_uses_expr(box_expr_unbox(ge), name);
+        }
+        OptBoxExpr::None => {
+        }
+    }
+    return 0;
+}
+
+/// BG29: cow_names_expr of a match arm's guard (false without one).
+fn cow_names_guard(g: OptBoxExpr, out: &mut Vec<str>) -> bool {
+    match g {
+        OptBoxExpr::Some(ge) => {
+            return cow_names_expr(box_expr_unbox(ge), out);
+        }
+        OptBoxExpr::None => {
+        }
+    }
+    return false;
+}
+
 fn cow_loop(n: i64) -> i64 {
     if n > 0 {
         return COW_MANY;
@@ -807,6 +831,9 @@ pub fn cow_uses_stmt(s: Stmt, name: str) -> i64 {
             var n: i64 = cow_uses_expr(me, name);
             var a: i64 = 0;
             while a < arms.len() {
+                // BG29: a guard reads too (a move on what looked like the
+                // last use before the match freed what the guard read)
+                n = cow_add(n, cow_uses_guard(arms.get(a).guard, name));
                 n = cow_add(n, cow_uses_stmts(arms.get(a).body, name));
                 a = a + 1;
             }
@@ -914,6 +941,8 @@ pub fn cow_uses_expr(e: Expr, name: str) -> i64 {
             var n2: i64 = cow_uses_expr(box_expr_unbox(me), name);
             var ai: i64 = 0;
             while ai < arms.len() {
+                // BG29: the guard too
+                n2 = cow_add(n2, cow_uses_guard(arms.get(ai).guard, name));
                 n2 = cow_add(n2, cow_uses_stmts(arms.get(ai).body, name));
                 ai = ai + 1;
             }
@@ -1090,6 +1119,10 @@ pub fn cow_names_stmt(s: Stmt, out: &mut Vec<str>) -> bool {
             var all: bool = cow_names_expr(me, out);
             var a: i64 = 0;
             while a < arms.len() {
+                // BG29: the guard too (as cow_uses_stmt)
+                if cow_names_guard(arms.get(a).guard, out) {
+                    all = true;
+                }
                 if cow_names_stmts(arms.get(a).body, out) {
                     all = true;
                 }
@@ -1255,6 +1288,10 @@ pub fn cow_names_expr(e: Expr, out: &mut Vec<str>) -> bool {
             var all2: bool = cow_names_expr(box_expr_unbox(me), out);
             var ai: i64 = 0;
             while ai < arms.len() {
+                // BG29: the guard too (as cow_uses_expr)
+                if cow_names_guard(arms.get(ai).guard, out) {
+                    all2 = true;
+                }
                 if cow_names_stmts(arms.get(ai).body, out) {
                     all2 = true;
                 }

@@ -258,19 +258,50 @@ fn pe_spawn_os(entry: i64, arg: i64, ctid: i64) -> i64 {
 // args, [10] done, [11] result, [12] the kernel's ctid word, [13] the
 // thread's block (its stack, freed at the join).
 
-var pert_thread_blocks: i64 = 0;
-var pert_task_results: i64 = 0;
-var pert_thread_joined: i64 = 0;
+// BG110: the table is chunked, as the C runtime's future table (BG9): a
+// directory of PE_THR_DIR chunks of PE_THR_CHUNK entries, a chunk allocated
+// when an index in it is first handed out and never moved (a reader keeps
+// an entry's address). An entry is three words: the start block, the result
+// once joined, whether it was. It was three fixed tables of 256 entries:
+// the 257th thread could not start (its future was -1).
+
+const PE_THR_CHUNK: i64 = 256;
+const PE_THR_DIR: i64 = 4096;
+
+var pert_thread_dir: i64 = 0;
 var pert_thread_ctr: i64 = 0;  // *i64: threads started
 var pert_executor_count: i64 = 0;
 
 fn pe_thread_tables() {
-    if pert_thread_blocks == 0 {
+    if pert_thread_dir == 0 {
         pe_mt_on();
-        pert_thread_blocks = pe_zeroed(256);
-        pert_task_results = pe_zeroed(256);
-        pert_thread_joined = pe_zeroed(256);
+        pert_thread_dir = pe_zeroed(PE_THR_DIR);
         pert_thread_ctr = pe_zeroed(1);
+    }
+}
+
+/// The address of entry idx's three words, 0 while its chunk is not there
+/// yet (an index another thread is still handing out).
+fn pe_thr_slot(idx: i64) -> i64 {
+    if pert_thread_dir == 0 || idx < 0 || idx >= PE_THR_CHUNK * PE_THR_DIR {
+        return 0;
+    }
+    var ch: i64 = nat_atomic_load(pert_thread_dir + (idx / PE_THR_CHUNK) * 8);
+    if ch == 0 {
+        return 0;
+    }
+    return ch + (idx % PE_THR_CHUNK) * 24;
+}
+
+/// Make the chunk of entry idx (the first thread to need it allocates it;
+/// one that loses the race frees its copy).
+fn pe_thr_make(idx: i64) {
+    var at: i64 = pert_thread_dir + (idx / PE_THR_CHUNK) * 8;
+    if nat_atomic_load(at) == 0 {
+        var ch: i64 = pe_zeroed(PE_THR_CHUNK * 3);
+        if nat_atomic_cas(at, 0, ch) == 0 {
+            pert_free(ch);
+        }
     }
 }
 
@@ -279,8 +310,8 @@ fn pe_thread_count() -> i64 {
         return 0;
     }
     var n: i64 = nat_atomic_load(pert_thread_ctr);
-    if n > 256 {
-        n = 256;
+    if n > PE_THR_CHUNK * PE_THR_DIR {
+        n = PE_THR_CHUNK * PE_THR_DIR;
     }
     return n;
 }
@@ -297,9 +328,10 @@ pub fn pert_thread_spawn_v(name: str, nargs: i64, argv: i64) -> i64 {
     }
     pe_thread_tables();
     var idx: i64 = nat_atomic_add(pert_thread_ctr, 1);
-    if idx >= 256 {
+    if idx >= PE_THR_CHUNK * PE_THR_DIR {
         return 0 - 1;
     }
+    pe_thr_make(idx);
     var block: i64 = pe_zeroed(14);
     pe_st(block, fn_addr);
     pe_st(block + 8, nargs);
@@ -309,7 +341,7 @@ pub fn pert_thread_spawn_v(name: str, nargs: i64, argv: i64) -> i64 {
         i = i + 1;
     }
     var tid: i64 = pe_spawn_os(pe_fn_lookup("pe_thread_main"), block, block + 96);
-    nat_atomic_store(pert_thread_blocks + idx * 8, block);
+    nat_atomic_store(pe_thr_slot(idx), block);
     if tid < 0 {
         // Could not start: run it here
         pe_thread_body(block);
@@ -360,10 +392,17 @@ fn pe_task_index(f: i64) -> i64 {
 }
 
 fn pe_thread_block(idx: i64) -> i64 {
-    var b: i64 = nat_atomic_load(pert_thread_blocks + idx * 8);
+    var s: i64 = pe_thr_slot(idx);
+    var b: i64 = 0;
+    if s != 0 {
+        b = nat_atomic_load(s);
+    }
     while b == 0 {
         pe_relax();
-        b = nat_atomic_load(pert_thread_blocks + idx * 8);
+        s = pe_thr_slot(idx);
+        if s != 0 {
+            b = nat_atomic_load(s);
+        }
     }
     return b;
 }
@@ -373,7 +412,8 @@ fn pe_task_done(idx: i64) -> bool {
 }
 
 fn pe_unjoined(idx: i64) -> bool {
-    return pe_ld(pert_thread_joined + idx * 8) == 0;
+    var s: i64 = pe_thr_slot(idx);
+    return s == 0 || pe_ld(s + 16) == 0;
 }
 
 /// Wait for thread idx (once): its result. Its stack is freed once the
@@ -390,8 +430,9 @@ fn pe_join(idx: i64) -> i64 {
             }
             w = nat_atomic_load(block + 96) & 4294967295;
         }
-        pe_st(pert_task_results + idx * 8, pe_ld(block + 88));
-        pe_st(pert_thread_joined + idx * 8, 1);
+        // (the entry exists: pe_thread_block found its block)
+        pe_st(pe_thr_slot(idx) + 8, pe_ld(block + 88));
+        pe_st(pe_thr_slot(idx) + 16, 1);
         var t: i64 = pe_ld(block + 104);
         if t != 0 {
             pe_sys(PE_SYS_MUNMAP, pe_ld(t + 40), pe_ld(t + 48), 0);
@@ -399,7 +440,7 @@ fn pe_join(idx: i64) -> i64 {
             pe_st(block + 104, 0);
         }
     }
-    return pe_ld(pert_task_results + idx * 8);
+    return pe_ld(pe_thr_slot(idx) + 8);
 }
 
 // ─── Tasks: green threads, M:N ──────────────────────────────────────────
@@ -1872,7 +1913,7 @@ pub fn pert_executor_cancel(exec: i64) -> i64 {
             var was_done: bool = pe_task_done(i);
             pe_join(i);
             if !was_done {
-                pe_st(pert_task_results + i * 8, 0);
+                pe_st(pe_thr_slot(i) + 8, 0);
                 count = count + 1;
             }
         }

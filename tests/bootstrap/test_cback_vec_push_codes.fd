@@ -1,0 +1,69 @@
+// BG40 (docs/roadmap/bugs-roadmap.md): the C runtime's p_vec_push,
+// p_vec_set and p_vec_insert stored 8-byte words whatever the Vec's
+// element code (a heap overflow on a Vec<u8>, whose buffer holds a byte per
+// element) and took a shared buffer's negative capacity for a full one
+// (data another Vec still holds was freed). Now (compiler/codegen_c.fd
+// p_vec_push) they grow and store through __p_vec_grow/__p_vec_st, as
+// core's Vec does: a shared buffer is owned (copied) before the write.
+//@ backends: ccompile
+//
+// Expected output:
+// bytes: 300 sum 33586
+// set and insert: 301 5 0 42 2
+// shared: 3 3
+// after push: 3 4
+// a: 1 2 3
+// b: 1 2 3 4
+// c: 9 2 3
+// d: 7 1 2 3
+// a still: 1 2 3
+
+fn show(name: str, v: &Vec<i64>) {
+    var s: str = name + ":";
+    var i: i64 = 0;
+    while i < v.len() {
+        s = s + " " + int_to_str(v[i]);
+        i = i + 1;
+    }
+    println(s);
+}
+
+fn main() -> i64 {
+    // a Vec of bytes grown past several buffers by the runtime's push
+    var bs: Vec<u8> = Vec::new();
+    var i: i64 = 0;
+    while i < 300 {
+        p_vec_push(bs, (i % 256) as u8);
+        i = i + 1;
+    }
+    var sum: i64 = 0;
+    var j: i64 = 0;
+    while j < bs.len() {
+        sum = sum + (bs[j] as i64);
+        j = j + 1;
+    }
+    println("bytes: " + int_to_str(bs.len()) + " sum " + int_to_str(sum));
+    p_vec_set(bs, 1, 42 as u8);
+    p_vec_insert(bs, 0, 5 as u8);
+    println("set and insert: " + int_to_str(bs.len()) + " " + int_to_str(bs[0] as i64) + " " + int_to_str(bs[1] as i64) + " " + int_to_str(bs[2] as i64) + " " + int_to_str(bs[3] as i64));
+
+    // Vecs sharing one buffer: a write through the runtime copies it first
+    var a: Vec<i64> = Vec::new();
+    a.push(1);
+    a.push(2);
+    a.push(3);
+    var b: Vec<i64> = a;
+    println("shared: " + int_to_str(a.len()) + " " + int_to_str(b.len()));
+    p_vec_push(b, 4);
+    println("after push: " + int_to_str(a.len()) + " " + int_to_str(b.len()));
+    var c: Vec<i64> = a;
+    p_vec_set(c, 0, 9);
+    var d: Vec<i64> = a;
+    p_vec_insert(d, 0, 7);
+    show("a", &a);
+    show("b", &b);
+    show("c", &c);
+    show("d", &d);
+    show("a still", &a);
+    return 0;
+}

@@ -4,7 +4,7 @@
 - **LOC:** 14,130 (2026-11-21; 7,456 on 2026-11-09, 3,967 on 2026-10-22). `src/interp.rs`: 6,358.
 - **Nov 21:** it also imports `compiler::pgo` (`run --profile`, `--trace`).
   Changed since the audit below: tasks interleave (LG11, the "Interleaved
-  tasks" section of interp.fd and docs/interp-tasks.md), so finding 9 and
+  tasks" section of interp.fd and docs/reference/interp-tasks.md), so finding 9 and
   the "Interleaving tasks" item no longer hold; the debug hook records
   coverage (`Interpreter_set_debug_hook`, used by veil.fd), so finding 12
   no longer holds; an empty file reads as `Some("")` (2g.42, Nov 16).

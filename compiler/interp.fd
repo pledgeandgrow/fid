@@ -774,6 +774,7 @@ pub fn Memory_store_f64(self: &mut Memory, addr: i64, val: f64) {
 pub fn f64_from_bits_i(bits: i64) -> f64 {
     var f: f64 = 0.0;
     // M2: the allocation and the int-to-pointer casts are unsafe too
+    // SAFETY: cell is a live 8-byte block, written as i64 then read as f64 for the bit reinterpret; freed below.
     unsafe {
         var cell: i64 = p_malloc(8);
         var ip: *mut i64 = cell;
@@ -804,6 +805,34 @@ pub fn f32_from_bits_i(bits: i64) -> f64 {
         v = -v;
     }
     return v;
+}
+
+/// BG66: an f64 rounded to single precision (the nearest f32), the value an
+/// f32 register holds after an operation or a conversion
+pub fn interp_round_f32(f: f64) -> f64 {
+    if f != f {
+        return f;
+    }
+    return f32_from_bits_i(p_f32_to_bits(f));
+}
+
+/// BG38: the low `bits` bits of a word as a value of that width, signed
+/// (sign-extended) or unsigned (zero-extended)
+pub fn interp_narrow_int(i: i64, bits: i64, want_signed: bool) -> i64 {
+    var mask: i64 = 255;
+    if bits == 16 {
+        mask = 65535;
+    } else if bits == 32 {
+        mask = 4294967295;
+    }
+    var t: i64 = i & mask;
+    if want_signed {
+        var top: i64 = (mask >> 1) + 1;
+        if t >= top {
+            t = t - mask - 1;
+        }
+    }
+    return t;
 }
 
 /// An f64 as the program's text: "NaN", "inf" and "-inf" as the native
@@ -901,6 +930,7 @@ pub fn Memory_store_cstr(self: &mut Memory, s: str) -> i64 {
         var s_addr: i64 = s + i;
         var ptr: *mut u8 = s_addr;
         var b: i64 = 0;
+        // SAFETY: ptr walks the caller's C string one byte at a time up to its NUL, which the extern cstring contract guarantees.
         unsafe {
             b = *ptr;
         }
@@ -1227,6 +1257,7 @@ fn str_hash_i(s: str) -> i64 {
         var ap: i64 = s + i;
         var bp: *mut u8 = ap;
         var b: i64 = 0;
+        // SAFETY: bp walks s's bytes for i < str_len(s): in bounds of the string's allocation.
         unsafe {
             b = *bp;
         }
@@ -2575,7 +2606,8 @@ pub fn Interpreter_execute_inst(self: &mut Interpreter, inst: Inst, inst_id: i64
             // value is already an f64 in Fides IR (unlike Rust which stores bits)
             match ty {
                 IrType::F32 => {
-                    return ExecOutcome::Value(Value::Float(value));
+                    // BG66: an f32 constant is the nearest single
+                    return ExecOutcome::Value(Value::Float(interp_round_f32(value)));
                 }
                 _ => {
                     return ExecOutcome::Value(Value::Float(value));
@@ -2751,6 +2783,21 @@ pub fn Interpreter_execute_inst(self: &mut Interpreter, inst: Inst, inst_id: i64
                     }
                 }
                 return ExecOutcome::Panic(msg);
+            }
+            // BG66: f32 arithmetic rounds each result to single precision,
+            // as an f32 register does (it kept the f64 result)
+            match ty {
+                IrType::F32 => {
+                    match result {
+                        Value::Float(rf32) => {
+                            return ExecOutcome::Value(Value::Float(interp_round_f32(rf32)));
+                        }
+                        _ => {
+                        }
+                    }
+                }
+                _ => {
+                }
             }
             return ExecOutcome::Value(result);
         }
@@ -3808,11 +3855,23 @@ pub fn Interpreter_execute_inst(self: &mut Interpreter, inst: Inst, inst_id: i64
                 }
             }
         }
-        Inst::IntToFloat(value, _, _) => {
+        Inst::IntToFloat(value, from_ty, to_ty) => {
             var v: Value = get_value(values, value);
             match v {
                 Value::Int(i) => {
                     var f: f64 = (i as f64);
+                    // BG67: a u64 at or above 2^63 is held as a negative
+                    // word: convert its unsigned value (half of it, with the
+                    // low bit kept for the rounding, then doubled), as C's
+                    // (double)uint64_t does
+                    if i < 0 && ir_type_eq(from_ty, IrType::U64) {
+                        var uhalf: i64 = (i >> 1) & 9223372036854775807;
+                        f = ((uhalf | (i & 1)) as f64) * 2.0;
+                    }
+                    // BG66: an f32 holds a single's value
+                    if ir_type_eq(to_ty, IrType::F32) {
+                        f = interp_round_f32(f);
+                    }
                     return ExecOutcome::Value(Value::Float(f));
                 }
                 _ => {
@@ -4794,6 +4853,27 @@ pub fn Interpreter_cast_value(self: &Interpreter, v: Value, to: IrType) -> Value
                     }
                     return Value::Ptr(i);
                 }
+                // BG38: a same-width cast between signed and unsigned
+                // (`200u8 as i8`) reinterprets the bits: the word is made
+                // the target type's value (-56), as IntTrunc does
+                IrType::I8 => {
+                    return Value::Int(interp_narrow_int(i, 8, true));
+                }
+                IrType::I16 => {
+                    return Value::Int(interp_narrow_int(i, 16, true));
+                }
+                IrType::I32 => {
+                    return Value::Int(interp_narrow_int(i, 32, true));
+                }
+                IrType::U8 => {
+                    return Value::Int(interp_narrow_int(i, 8, false));
+                }
+                IrType::U16 => {
+                    return Value::Int(interp_narrow_int(i, 16, false));
+                }
+                IrType::U32 => {
+                    return Value::Int(interp_narrow_int(i, 32, false));
+                }
                 _ => {
                     return Value::Int(i);
                 }
@@ -4820,6 +4900,10 @@ pub fn Interpreter_cast_value(self: &Interpreter, v: Value, to: IrType) -> Value
                 }
                 IrType::I32 => {
                     return Value::Int(p_f64_to_bits(f));
+                }
+                // BG66: f64 -> f32 rounds to the nearest single
+                IrType::F32 => {
+                    return Value::Float(interp_round_f32(f));
                 }
                 _ => {
                     return Value::Float(f);
@@ -5822,13 +5906,16 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: &mut Ve
                         if i < str_len(a_str) {
                             var ap: i64 = a_str + i;
                             var aptr: *mut u8 = ap;
+                            // SAFETY: aptr reads one byte of b_str, guarded by i < str_len(b_str).
                             unsafe {
                                 ac = *aptr;
                             }
                         }
+                            // SAFETY: aptr reads one byte of b_str, guarded by i < str_len(b_str).
                         if i < str_len(b_str) {
                             var bp: i64 = b_str + i;
                             var bptr: *mut u8 = bp;
+                            // SAFETY: this block reads or writes memory through a raw pointer whose bounds are checked immediately above.
                             unsafe {
                                 bc = *bptr;
                             }
@@ -10732,10 +10819,12 @@ fn itask_old_stack() -> i64 {
     return ITASK_OLD_STACK;
 }
 
+    // SAFETY: takes the address of a live stack variable; only the address value is used, nothing is dereferenced.
 /// The address of a local of this call: how deep the host stack is here.
 fn itask_stack_here() -> i64 {
     var probe: i64 = 0;
     var at: i64 = 0;
+    // SAFETY: this block reads or writes memory through a raw pointer whose bounds are checked immediately above.
     unsafe {
         at = (&mut probe) as * mut i64 as i64;
     }
@@ -10899,11 +10988,13 @@ pub fn Interpreter_itask_start(self: &mut Interpreter, idx: i64, now: bool) {
 }
 
 /// Start task `idx` on a C runtime task of its own.
+    // SAFETY: self outlives the task it launches (itask_live is joined before this frame returns), so the stored pointer stays valid.
 fn Interpreter_itask_launch(self: &mut Interpreter, idx: i64, now: bool) {
     var t: ITask = self.itasks.get(idx);
     t.started = true;
     self.itasks.set(idx, t);
     self.itask_live = self.itask_live + 1;
+    // SAFETY: this block reads or writes memory through a raw pointer whose bounds are checked immediately above.
     unsafe {
         g_itask_interp = self as * mut Interpreter as i64;
     }
@@ -10946,12 +11037,14 @@ fn Interpreter_itask_run_here(self: &mut Interpreter, idx: i64) {
     Interpreter_tok_set(self, outer_tok);
     var t2: ITask = self.itasks.get(idx);
     t2.done = true;
+    // SAFETY: g_itask_interp was stored by the launching frame before this task started; the interpreter it points at is still alive (join before return).
     t2.result = rv;
     self.itasks.set(idx, t2);
 }
 
 /// The C runtime task of interpreted task `idx`.
 fn interp_task_entry(idx: i64) -> i64 {
+    // SAFETY: this block reads or writes memory through a raw pointer whose bounds are checked immediately above.
     unsafe {
         var p: *mut Interpreter = g_itask_interp;
         Interpreter_itask_body(&mut * p, idx);
@@ -11016,6 +11109,40 @@ pub fn Interpreter_itask_of(self: &Interpreter, v: Value, tagged_only: bool) -> 
         return -1;
     }
     return idx;
+}
+
+/// BG96: the task each task waits for in an await (-1: none), by task index.
+var g_itask_awaits: Vec<i64> = Vec::new();
+
+/// BG96: whether the running task awaiting task `idx` closes a cycle of
+/// unfinished tasks, each awaiting the next (none of them can ever end).
+/// Makes room for the running task in g_itask_awaits.
+fn Interpreter_itask_await_cycle(self: &Interpreter, idx: i64) -> bool {
+    // the task list only grows: a longer table is an earlier run's
+    if g_itask_awaits.len() > self.itasks.len() {
+        g_itask_awaits = Vec::new();
+    }
+    while g_itask_awaits.len() < self.itasks.len() {
+        g_itask_awaits.push(-1);
+    }
+    val cur: i64 = self.itask_cur;
+    // main is no task; a task awaiting itself is left as it was
+    if cur < 0 || cur >= self.itasks.len() || idx == cur {
+        return false;
+    }
+    var t: i64 = idx;
+    var depth: i64 = 0;
+    while t >= 0 && t < g_itask_awaits.len() && depth <= self.itasks.len() {
+        if t == cur {
+            return true;
+        }
+        if self.itasks.get(t).done {
+            return false;
+        }
+        t = g_itask_awaits.get(t);
+        depth = depth + 1;
+    }
+    return false;
 }
 
 /// Wait until task `idx` has ended (the others run meanwhile); its result.
@@ -11144,6 +11271,22 @@ pub fn Interpreter_chan_must_wait(self: &Interpreter, ch: i64) -> bool {
     return Interpreter_itask_others(self);
 }
 
+/// BG74: whether a send on channel `ch` has to wait: it holds `cap` values
+/// and is open, and someone may still receive (as Interpreter_chan_must_wait).
+pub fn Interpreter_chan_send_must_wait(self: &Interpreter, ch: i64) -> bool {
+    if ch < 1 || ch > self.chans.len() {
+        return false;
+    }
+    var cs: ChanState = self.chans.get(ch - 1);
+    if cs.closed || cs.buf.len() - cs.head < cs.cap {
+        return false;
+    }
+    if g_itask_mode == 1 && self.itask_cur >= 0 {
+        return true;
+    }
+    return Interpreter_itask_others(self);
+}
+
 /// The task builtins (LG11); Jump(-99) when `name` is none of them.
 pub fn Interpreter_itask_builtin(self: &mut Interpreter, name: str, args: &mut Vec<Value>) -> ExecOutcome {
     if name == "p_co_go" {
@@ -11197,7 +11340,20 @@ pub fn Interpreter_itask_builtin(self: &mut Interpreter, name: str, args: &mut V
             }
             return ExecOutcome::Jump(-99);
         }
+        // BG96: a task awaiting one that (through others) awaits it waits
+        // forever: a panic, as the C and native runtimes' deadlock checks
+        // give (it hung)
+        if Interpreter_itask_await_cycle(self, fi) {
+            return ExecOutcome::Panic("Tasks are deadlocked: each one awaits another");
+        }
+        val aw_cur: i64 = self.itask_cur;
+        if aw_cur >= 0 {
+            g_itask_awaits.set(aw_cur, fi);
+        }
         var fv: Value = Interpreter_itask_await(self, fi);
+        if aw_cur >= 0 {
+            g_itask_awaits.set(aw_cur, -1);
+        }
         if name == "p_thread_join" {
             return ExecOutcome::Value(Value::Void);
         }
@@ -11616,6 +11772,21 @@ pub fn Interpreter_call_runtime2(self: &mut Interpreter, name: str, args: &mut V
                 if name == "p_chan_try_recv" {
                     break;
                 }
+            }
+        }
+        // BG74: a send to a full channel waits, as a receive on an empty
+        // one does, until there is room, the channel is closed or no task
+        // is left that could receive (it pushed past the capacity). A
+        // cancelled token gives false, as in the C runtime.
+        if name == "p_chan_send" {
+            var sspins: i64 = 0;
+            val stok: i64 = Interpreter_tok_get(self);
+            while Interpreter_chan_send_must_wait(self, ch) {
+                if stok != 0 && Interpreter_tok_cancelled(self, stok) {
+                    return ExecOutcome::Value(Value::Bool(false));
+                }
+                Interpreter_itask_wait_turn(self, sspins);
+                sspins = sspins + 1;
             }
         }
         var cs: ChanState = self.chans.get(ch - 1);

@@ -391,7 +391,12 @@ fn pg_io_write(io: PgIo, conn: i64, bytes: Vec<i64>) -> bool {
     if n == 0 {
         return true;
     }
-    var mem: i64 = p_malloc(n + 8);
+    var mem: i64 = 0;
+    // SAFETY: a fresh block of n + 8 bytes: the loop below writes the n
+    // bytes into it.
+    unsafe {
+        mem = p_malloc(n + 8);
+    }
     var i: i64 = 0;
     while i < n {
         p_volatile_store8(mem + i, bytes.get(i));
@@ -399,20 +404,31 @@ fn pg_io_write(io: PgIo, conn: i64, bytes: Vec<i64>) -> bool {
     }
     val send: fn(i64, i64, i64) -> i64 = io.send;
     val sent: i64 = send(conn, mem, n);
-    p_free(mem);
+    // SAFETY: the block above; the transport's send has returned and keeps
+    // no pointer to it.
+    unsafe {
+        p_free(mem);
+    }
     return sent == n;
 }
 
 // One byte through `io` (-1 when none came).
 fn pg_io_read_byte(io: PgIo, conn: i64) -> i64 {
-    var mem: i64 = p_malloc(8);
+    var mem: i64 = 0;
+    // SAFETY: a fresh 8-byte block; the recv below is told to write 1 byte.
+    unsafe {
+        mem = p_malloc(8);
+    }
     val recv: fn(i64, i64, i64, i64) -> i64 = io.recv;
     val n: i64 = recv(conn, mem, 1, PG_TIMEOUT_MS);
     var b: i64 = -1;
     if n == 1 {
         b = p_volatile_load8(mem) & 255;
     }
-    p_free(mem);
+    // SAFETY: the block above; its byte was read into b.
+    unsafe {
+        p_free(mem);
+    }
     return b;
 }
 
@@ -468,7 +484,12 @@ fn pg_fill(r: &mut PgIn) -> bool {
         r.buf = rest;
         r.pos = 0;
     }
-    var mem: i64 = p_malloc(16384);
+    var mem: i64 = 0;
+    // SAFETY: a fresh 16384-byte block, the most the recv below is told to
+    // write.
+    unsafe {
+        mem = p_malloc(16384);
+    }
     val recv: fn(i64, i64, i64, i64) -> i64 = r.recv;
     val n: i64 = recv(r.conn, mem, 16384, PG_TIMEOUT_MS);
     var k: i64 = 0;
@@ -476,7 +497,10 @@ fn pg_fill(r: &mut PgIn) -> bool {
         r.buf.push(p_volatile_load8(mem + k));
         k = k + 1;
     }
-    p_free(mem);
+    // SAFETY: the block above; its n received bytes were copied into r.buf.
+    unsafe {
+        p_free(mem);
+    }
     return n > 0;
 }
 

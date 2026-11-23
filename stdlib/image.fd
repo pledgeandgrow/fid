@@ -449,17 +449,23 @@ fn image_load_file(path: str, jpg: bool, channels: i64) -> Image {
         return image_create(0, 0, channels);
     }
     var result: i64 = 0;
-    if jpg {
-        result = pledge_image_load_jpg(path, out, out + 8, out + 16, 0);
-    } else {
-        result = pledge_image_load_png(path, out, out + 8, out + 16, 0);
+    // SAFETY: the helper reads the NUL-terminated text of path (a Fides str
+    // alive for the call) and writes one 8-byte word at each of out,
+    // out + 8 and out + 16, the three words of the 24-byte block above;
+    // out_data = 0 is never touched (runtime/pledge_image.c).
+    unsafe {
+        if jpg {
+            result = pledge_image_load_jpg(path, out, out + 8, out + 16, 0);
+        } else {
+            result = pledge_image_load_png(path, out, out + 8, out + 16, 0);
+        }
     }
     var w: i64 = 0;
     var h: i64 = 0;
     var c: i64 = 0;
-    var pw: *mut i64 = out;
-    var ph: *mut i64 = out + 8;
-    var pc: *mut i64 = out + 16;
+    var pw: *mut i64 = out as *mut i64;
+    var ph: *mut i64 = (out + 8) as *mut i64;
+    var pc: *mut i64 = (out + 16) as *mut i64;
     // SAFETY: words 0, 1 and 2 of the 24-byte block above, then its free.
     unsafe {
         w = *pw;
@@ -649,7 +655,11 @@ pub fn image_to_texture(ren: i64, img: &Image) -> i64 {
     if img.width == 0 || img.height == 0 {
         return 0;
     }
-    return pledge_image_to_texture(ren, img.width, img.height, img.channels, 0);
+    // SAFETY: data = 0: runtime/pledge_image.c returns 0 at once for a null
+    // data pointer, before it looks at ren, so no memory is read or written.
+    unsafe {
+        return pledge_image_to_texture(ren, img.width, img.height, img.channels, 0);
+    }
 }
 
 // ─── Image Manipulation ──────────────────────────────────────────────────

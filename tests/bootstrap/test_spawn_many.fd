@@ -1,0 +1,76 @@
+// BG9 (docs/roadmap/bugs-roadmap.md): the C runtime's table of thread
+// futures. It was three static arrays of 256 (p_thread_handles,
+// p_task_results, p_task_done_flags) filled by `p_thread_handle_count++`
+// with no bound, no reuse and no lock: the 257th spawn wrote past them, and
+// two threads spawning at once could take one index. Now
+// (compiler/codegen_c.fd "BG9: the future table") the slots are in chunks
+// allocated as needed and an index is taken under a lock.
+//   - the bug's trigger: 300 spawn/await one after another;
+//   - 300 spawns alive at once in a spawn scope, joined at its end;
+//   - 4 threads that each spawn and await 100 threads at the same time;
+//   - a future awaited twice gives its result twice.
+// The native runtimes' tables are chunked too since BG110
+// (test_native_spawn_many.fd runs this on every backend).
+//@ backends: run,ccompile
+//
+// Expected output:
+// 300 spawns: 89700
+// scope of 300: 44850
+// 4 x 100 nested: 39600
+// twice: 14 14
+
+fn work(i: i64) -> i64 {
+    return i * 2;
+}
+
+fn add_to(total: i64, n: i64) -> i64 {
+    p_atomic_add(total, n);
+    return n;
+}
+
+/// Spawns and awaits `n` threads, one after another.
+fn fan(n: i64) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        val h = spawn work(i);
+        s = s + (await h);
+        i = i + 1;
+    }
+    return s;
+}
+
+fn main() -> i64 {
+    var sum: i64 = 0;
+    var i: i64 = 0;
+    while i < 300 {
+        val h = spawn work(i);
+        sum = sum + (await h);
+        i = i + 1;
+    }
+    println("300 spawns: " + int_to_str(sum));
+
+    val total = p_shared_alloc(8);
+    p_atomic_store(total, 0);
+    spawn scope {
+        var j: i64 = 0;
+        while j < 300 {
+            spawn add_to(total, j);
+            j = j + 1;
+        }
+    }
+    println("scope of 300: " + int_to_str(p_atomic_load(total)));
+
+    val f1 = spawn fan(100);
+    val f2 = spawn fan(100);
+    val f3 = spawn fan(100);
+    val f4 = spawn fan(100);
+    val nested = (await f1) + (await f2) + (await f3) + (await f4);
+    println("4 x 100 nested: " + int_to_str(nested));
+
+    val t = spawn work(7);
+    val r1 = await t;
+    val r2 = await t;
+    println("twice: " + int_to_str(r1) + " " + int_to_str(r2));
+    return 0;
+}

@@ -383,6 +383,7 @@ impl Lexer {
                 }
                 var s: str = str_slice_len(self.source, self.src_len, start_pos, self.pos);
                 var val: i64 = str_parse_hex(str_slice(s, 2, str_len(s)));
+                self.check_int_fits(str_slice(s, 2, str_len(s)), 16, s, line, col);
                 return token_new(TokenKind::IntLit(val), line, col);
             }
             if next == 98 || next == 66 {
@@ -396,6 +397,7 @@ impl Lexer {
                 }
                 var s: str = str_slice_len(self.source, self.src_len, start_pos, self.pos);
                 var val: i64 = parse_radix(str_slice(s, 2, str_len(s)), 2);
+                self.check_int_fits(str_slice(s, 2, str_len(s)), 2, s, line, col);
                 return token_new(TokenKind::IntLit(val), line, col);
             }
             if next == 111 || next == 79 {
@@ -409,6 +411,7 @@ impl Lexer {
                 }
                 var s: str = str_slice_len(self.source, self.src_len, start_pos, self.pos);
                 var val: i64 = parse_radix(str_slice(s, 2, str_len(s)), 8);
+                self.check_int_fits(str_slice(s, 2, str_len(s)), 8, s, line, col);
                 return token_new(TokenKind::IntLit(val), line, col);
             }
         }  // Decimal integer part (with optional '_' separators)
@@ -470,7 +473,17 @@ impl Lexer {
         var raw: str = str_slice_len(self.source, self.src_len, start_pos, self.pos);
         var s: str = str_filter_underscores(raw);
         var val: i64 = lex_parse_int(s);
+        self.check_int_fits(s, 10, raw, line, col);
         return token_new(TokenKind::IntLit(val), line, col);
+    }
+
+    /// BG61: an integer literal of 2^64 or more is an error (it wrapped
+    /// silently: 18446744073709551616 was 0). `digits` are the literal's
+    /// digits in `radix` without its prefix or `_`, `text` as written.
+    fn check_int_fits(self: &mut Lexer, digits: str, radix: i64, text: str, line: i64, col: i64) {
+        if lex_int_too_big(digits, radix) {
+            self.errors.push(lex_error(line, col, "integer literal " + text + " does not fit in 64 bits\n    Fix: no integer type holds 2^64 or more (u64::MAX is 18446744073709551615); for a bigger number use a float such as 1.0e20, or a big-integer type"));
+        }
     }
 
     /// Remove underscore separators from a numeric string (e.g. "1_000" -> "1000")
@@ -1438,6 +1451,45 @@ pub fn repeat_char(ch: i64, count: i64) -> str {
 
 pub fn lex_error(line: i64, col: i64, msg: str) -> str {
     return "Error:" + int_to_str(line) + ":" + int_to_str(col) + ": " + msg;
+}
+
+/// BG61: whether the digits `d` of an integer literal in `radix` (2, 8, 10
+/// or 16; no prefix, no `_`) name 2^64 or more, which no integer type holds.
+fn lex_int_too_big(d: str, radix: i64) -> bool {
+    var n: i64 = str_len(d);
+    var i: i64 = 0;
+    while i < n && str_byte_at(d, i) == 48 {
+        i = i + 1;
+    }
+    var sig: i64 = n - i;
+    if radix == 16 {
+        return sig > 16;
+    }
+    if radix == 2 {
+        return sig > 64;
+    }
+    if radix == 8 {
+        // u64::MAX is 0o1777777777777777777777 (22 digits)
+        if sig != 22 {
+            return sig > 22;
+        }
+        return str_byte_at(d, i) > 49;
+    }
+    // u64::MAX is 18446744073709551615 (20 digits)
+    if sig != 20 {
+        return sig > 20;
+    }
+    val umax: str = "18446744073709551615";
+    var k: i64 = 0;
+    while k < 20 {
+        val a: i64 = str_byte_at(d, i + k);
+        val b: i64 = str_byte_at(umax, k);
+        if a != b {
+            return a > b;
+        }
+        k = k + 1;
+    }
+    return false;
 }
 
 /// The value of a decimal literal. One above i64::MAX is a u64: it keeps its

@@ -21,7 +21,7 @@ the input and both outputs if you can. See
 ## Contributing
 
 - `good first issue` label on the issue tracker — kept current.
-- Read `AGENTS.md` and `docs/compiler-internals.md` before touching
+- Read `AGENTS.md` and `docs/reference/compiler-internals.md` before touching
   `compiler/*.fd`.
 - The bar: `RELEASE=1 ./scripts/bootstrap.sh` fixpoint must stay green;
   interpreter/`emit`/`ccompile` must agree on the test suite.

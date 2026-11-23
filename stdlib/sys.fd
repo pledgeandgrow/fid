@@ -56,13 +56,18 @@ pub const _SC_AVPHYS_PAGES: i64 = 86;
 // A zeroed block of n bytes (0 when the allocation fails); freed by the
 // caller with p_free.
 fn sx_block(n: i64) -> i64 {
-    val b: i64 = p_malloc(n);
+    var b: i64 = 0;
+    // SAFETY: p_malloc only allocates a fresh n-byte block; it is zeroed
+    // below before anything reads it.
+    unsafe {
+        b = p_malloc(n);
+    }
     if b == 0 {
         return 0;
     }
     var i: i64 = 0;
     while i < n {
-        var p: *mut u8 = b + i;
+        var p: *mut u8 = (b + i) as *mut u8;
         // SAFETY: i < n, inside the block just allocated.
         unsafe {
             *p = 0 as u8;
@@ -77,7 +82,7 @@ fn sx_get(buf: i64, off: i64, n: i64) -> i64 {
     var v: i64 = 0;
     var i: i64 = 0;
     while i < n {
-        var p: *mut u8 = buf + off + i;
+        var p: *mut u8 = (buf + off + i) as *mut u8;
         var b: i64 = 0;
         // SAFETY: every caller reads inside a block from sx_block.
         unsafe {
@@ -96,9 +101,17 @@ fn sx_sysinfo_field(off: i64) -> i64 {
     if b == 0 {
         return -1;
     }
-    sw_sysinfo(b);
+    // SAFETY: GetSystemInfo writes one SYSTEM_INFO (48 bytes) at b, the
+    // zeroed 64-byte block sx_block just returned (b != 0 checked above).
+    unsafe {
+        sw_sysinfo(b);
+    }
     val v: i64 = sx_get(b, off, 4);
-    p_free(b);
+    // SAFETY: b is the sx_block (p_malloc) block of this call; v was read
+    // out of it above and nothing uses b after this.
+    unsafe {
+        p_free(b);
+    }
     return v;
 }
 
@@ -110,16 +123,27 @@ fn sx_memory_field(off: i64) -> i64 {
     if b == 0 {
         return -1;
     }
-    var p: *mut u8 = b;
+    var p: *mut u8 = b as *mut u8;
     // SAFETY: the first byte of the 72-byte block (dwLength = 64).
     unsafe {
         *p = 64 as u8;
     }
     var v: i64 = -1;
-    if sw_memstatus(b) != 0 {
+    var ok: i32 = 0;
+    // SAFETY: GlobalMemoryStatusEx reads dwLength (64, set above) and fills
+    // one 64-byte MEMORYSTATUSEX at b, inside the 72-byte zeroed block from
+    // sx_block (b != 0 checked above).
+    unsafe {
+        ok = sw_memstatus(b);
+    }
+    if ok != 0 {
         v = sx_get(b, off, 8);
     }
-    p_free(b);
+    // SAFETY: b is this call's sx_block (p_malloc) block; the value was
+    // copied into v above and nothing uses b after this.
+    unsafe {
+        p_free(b);
+    }
     return v;
 }
 
@@ -153,7 +177,11 @@ fn sx_pagesize() -> i64 {
 
 @cfg(windows)
 fn sx_getpid() -> i64 {
-    return sw_getpid() & 0xFFFFFFFF;
+    // SAFETY: GetCurrentProcessId takes no arguments and only returns the
+    // calling process's id; no memory of ours is touched.
+    unsafe {
+        return sw_getpid() & 0xFFFFFFFF;
+    }
 }
 
 @cfg(windows)
@@ -173,32 +201,51 @@ fn sx_getgid() -> i64 {
 
 @cfg(linux)
 fn sx_sysconf(name: i64) -> i64 {
-    return pledge_sysconf(name);
+    // SAFETY: sysconf takes an integer name and returns an integer (-1 for
+    // an unknown name); it reads and writes no memory of ours.
+    unsafe {
+        return pledge_sysconf(name);
+    }
 }
 
 @cfg(linux)
 fn sx_pagesize() -> i64 {
-    return pledge_getpagesize();
+    // SAFETY: getpagesize takes no arguments and returns an integer.
+    unsafe {
+        return pledge_getpagesize();
+    }
 }
 
 @cfg(linux)
 fn sx_getpid() -> i64 {
-    return pledge_getpid();
+    // SAFETY: getpid takes no arguments, cannot fail, returns an integer.
+    unsafe {
+        return pledge_getpid();
+    }
 }
 
 @cfg(linux)
 fn sx_getppid() -> i64 {
-    return pledge_getppid();
+    // SAFETY: getppid takes no arguments, cannot fail, returns an integer.
+    unsafe {
+        return pledge_getppid();
+    }
 }
 
 @cfg(linux)
 fn sx_getuid() -> i64 {
-    return pledge_getuid();
+    // SAFETY: getuid takes no arguments, cannot fail, returns an integer.
+    unsafe {
+        return pledge_getuid();
+    }
 }
 
 @cfg(linux)
 fn sx_getgid() -> i64 {
-    return pledge_getgid();
+    // SAFETY: getgid takes no arguments, cannot fail, returns an integer.
+    unsafe {
+        return pledge_getgid();
+    }
 }
 
 // macOS numbers its _SC_ names differently (<unistd.h> of Darwin) and has
@@ -220,32 +267,51 @@ fn sx_sysconf(name: i64) -> i64 {
     if m < 0 {
         return -1;
     }
-    return pledge_sysconf(m);
+    // SAFETY: sysconf takes an integer name (a Darwin _SC_ number here) and
+    // returns an integer; it reads and writes no memory of ours.
+    unsafe {
+        return pledge_sysconf(m);
+    }
 }
 
 @cfg(macos)
 fn sx_pagesize() -> i64 {
-    return pledge_getpagesize();
+    // SAFETY: getpagesize takes no arguments and returns an integer.
+    unsafe {
+        return pledge_getpagesize();
+    }
 }
 
 @cfg(macos)
 fn sx_getpid() -> i64 {
-    return pledge_getpid();
+    // SAFETY: getpid takes no arguments, cannot fail, returns an integer.
+    unsafe {
+        return pledge_getpid();
+    }
 }
 
 @cfg(macos)
 fn sx_getppid() -> i64 {
-    return pledge_getppid();
+    // SAFETY: getppid takes no arguments, cannot fail, returns an integer.
+    unsafe {
+        return pledge_getppid();
+    }
 }
 
 @cfg(macos)
 fn sx_getuid() -> i64 {
-    return pledge_getuid();
+    // SAFETY: getuid takes no arguments, cannot fail, returns an integer.
+    unsafe {
+        return pledge_getuid();
+    }
 }
 
 @cfg(macos)
 fn sx_getgid() -> i64 {
-    return pledge_getgid();
+    // SAFETY: getgid takes no arguments, cannot fail, returns an integer.
+    unsafe {
+        return pledge_getgid();
+    }
 }
 // ─── CPU / Architecture ─────────────────────────────────────────────────
 

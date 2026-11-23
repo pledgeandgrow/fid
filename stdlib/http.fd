@@ -196,7 +196,13 @@ fn hs_free(s: str) {
         // Not p_free(s): request strings are counted (p_str_buf), so their
         // block starts 16 bytes back. p_str_free covers counted strings,
         // literals, and plain blocks alike.
-        p_str_free(s as i64);
+        // SAFETY: private helper; its one caller, http_request_free, hands
+        // it the strings of a request whose handler kept none of them (that
+        // function's contract), each freed once; p_str_free leaves a
+        // literal alone.
+        unsafe {
+            p_str_free(s as i64);
+        }
     }
 }
 
@@ -352,7 +358,7 @@ pub fn status_text(code: i64) -> str {
 // its size, the bytes in it, the first byte not yet consumed.
 
 fn hc_get(c: i64, i: i64) -> i64 {
-    var p: *mut i64 = c + i * 8;
+    var p: *mut i64 = (c + i * 8) as *mut i64;
     var v: i64 = 0;
     // SAFETY: private helper; c is a 6-word connection block from
     // p_malloc(48) and i is one of its word indexes (0..5).
@@ -363,7 +369,7 @@ fn hc_get(c: i64, i: i64) -> i64 {
 }
 
 fn hc_set(c: i64, i: i64, v: i64) {
-    var p: *mut i64 = c + i * 8;
+    var p: *mut i64 = (c + i * 8) as *mut i64;
     // SAFETY: private helper; as hc_get, word i (0..5) of a connection block.
     unsafe {
         *p = v;
@@ -371,7 +377,7 @@ fn hc_set(c: i64, i: i64, v: i64) {
 }
 
 fn hc_byte(addr: i64) -> i64 {
-    var p: *mut u8 = addr;
+    var p: *mut u8 = addr as *mut u8;
     var v: i64 = 0;
     // SAFETY: private helper; callers read buf + i with i below the bytes in
     // the connection's read buffer (the scan loops stop at hc_get(c, 4)).
@@ -382,7 +388,7 @@ fn hc_byte(addr: i64) -> i64 {
 }
 
 fn hc_set_byte(addr: i64, v: i64) {
-    var p: *mut u8 = addr;
+    var p: *mut u8 = addr as *mut u8;
     // SAFETY: private helper; callers write inside a block they allocated,
     // below its length.
     unsafe {
@@ -391,7 +397,14 @@ fn hc_set_byte(addr: i64, v: i64) {
 }
 
 fn hc_copy(dst: i64, src: i64, n: i64) {
-    hc_memmove(dst as * u8, src as * u8, n);
+    // SAFETY: private helper; memmove reads n bytes at src and writes n at
+    // dst, overlap allowed. Callers move the unread bytes to the front of a
+    // connection's read buffer (len - pos of its len), copy its len bytes
+    // into the buffer twice its size (hc_fill), or copy n bytes the buffer
+    // holds into a fresh n-byte string (hc_text: n <= the unread bytes).
+    unsafe {
+        hc_memmove(dst as * u8, src as * u8, n);
+    }
 }
 
 fn hc_no_tls_recv(tls: i64, buf: i64, n: i64, timeout_ms: i64) -> i64 {
@@ -425,10 +438,19 @@ pub fn http_set_tls(recv: fn(i64, i64, i64, i64) -> i64, send: fn(i64, i64, i64)
 
 /// A connection on a connected socket, with a TLS session or 0.
 pub fn http_conn_new(fd: i64, tls: i64) -> i64 {
-    val c: i64 = p_malloc(48);
+    var c: i64 = 0;
+    // SAFETY: a fresh 48-byte block, the connection's 6 words (all set
+    // below); http_conn_close frees it.
+    unsafe {
+        c = p_malloc(48);
+    }
     hc_set(c, 0, fd);
     hc_set(c, 1, tls);
-    hc_set(c, 2, p_malloc(8192));
+    // SAFETY: a fresh 8192-byte read buffer, its size kept in word 3; the
+    // connection owns it (hc_fill replaces it, http_conn_close frees it).
+    unsafe {
+        hc_set(c, 2, p_malloc(8192));
+    }
     hc_set(c, 3, 8192);
     hc_set(c, 4, 0);
     hc_set(c, 5, 0);
@@ -441,8 +463,12 @@ pub fn http_conn_close(c: i64) {
         close(hc_get(c, 1));
     }
     p_socket_close(hc_get(c, 0));
-    p_free(hc_get(c, 2));
-    p_free(c);
+    // SAFETY: the connection's read buffer and its block (http_conn_new,
+    // or hc_fill's bigger buffer); the caller drops the connection here.
+    unsafe {
+        p_free(hc_get(c, 2));
+        p_free(c);
+    }
 }
 
 /// More bytes into the buffer. Returns how many; 0 at end of input, below 0 on
@@ -459,9 +485,18 @@ fn hc_fill(c: i64, timeout_ms: i64) -> i64 {
         hc_set(c, 5, 0);
     }
     if len + 1 >= cap {
-        val bigger: i64 = p_malloc(cap * 2);
+        var bigger: i64 = 0;
+        // SAFETY: a fresh buffer of cap * 2 bytes, which takes the len < cap
+        // bytes of the old one; the connection keeps it in word 2 below.
+        unsafe {
+            bigger = p_malloc(cap * 2);
+        }
         hc_copy(bigger, buf, len);
-        p_free(buf);
+        // SAFETY: the old read buffer, copied above; word 2 is pointed to
+        // the new one right after, and nothing else holds the old address.
+        unsafe {
+            p_free(buf);
+        }
         buf = bigger;
         cap = cap * 2;
         hc_set(c, 2, buf);
@@ -490,7 +525,11 @@ fn hc_text(addr: i64, n: i64) -> str {
     // p_str_adopt hands the one owner over (VF16): `copy as str` is not a
     // temporary, so returning it took a second owner and every request
     // body (hc_take) stayed allocated after its request was dropped
-    return p_str_adopt(copy);
+    // SAFETY: copy is this call's counted string from p_str_buf, held by
+    // nothing else: its one owner goes to the result.
+    unsafe {
+        return p_str_adopt(copy);
+    }
 }
 
 /// The offset of the next "\r\n" from `from`, past the first unread byte, or -1.
@@ -692,7 +731,11 @@ fn http_scoped_dispatch(req: HttpRequest) -> str {
     // As a raw word it has the one owner the handler gave it; p_str_adopt
     // hands that over (and stays right once such calls are temporaries:
     // `as i64` then claims the temporary).
-    return p_str_adopt(h(sreq) as i64);
+    // SAFETY: the word is the handler's fresh response, whose one owner
+    // nothing else holds (above): adopted once.
+    unsafe {
+        return p_str_adopt(h(sreq) as i64);
+    }
 }
 
 // Shared server state (CO8): [0] shutdown flag, [8] live-connection count,
@@ -741,7 +784,11 @@ pub fn http_health_handler(req: HttpRequest) -> str {
     }
     val h: fn(HttpRequest) -> str = http_user_handler;
     // one owner for the handler's response (VF16, as http_scoped_dispatch)
-    return p_str_adopt(h(req) as i64);
+    // SAFETY: the word is the handler's fresh response, held by nothing
+    // else (as in http_scoped_dispatch): adopted once.
+    unsafe {
+        return p_str_adopt(h(req) as i64);
+    }
 }
 
 /// Serve one connection until it closes. The TLS handshake is here, so a client
@@ -785,7 +832,11 @@ pub fn http_conn_task(c: i64) -> i64 {
             val handler: fn(HttpRequest) -> str = http_handler;
             // one owner for the handler's response (VF16, as
             // http_scoped_dispatch)
-            response = p_str_adopt(handler(req) as i64);
+            // SAFETY: the word is the handler's fresh response, held by
+            // nothing else (as in http_scoped_dispatch): adopted once.
+            unsafe {
+                response = p_str_adopt(handler(req) as i64);
+            }
         }
         val sent: bool = http_conn_write(c, response);
         if span >= 0 {
@@ -939,7 +990,11 @@ pub fn http_request_arena_new() -> http_request_arena {
 /// Allocate `size` bytes within an HTTP request arena.
 /// The memory is freed when http_request_arena_free is called.
 pub fn http_request_alloc(arena: http_request_arena, size: i64) -> i64 {
-    return p_malloc(size);
+    // SAFETY: a fresh block of `size` bytes, handed to the caller as an
+    // address; reading or writing it is the caller's own `unsafe`.
+    unsafe {
+        return p_malloc(size);
+    }
 }
 
 /// Free an HTTP request arena. All allocations made via http_request_alloc
@@ -1013,7 +1068,11 @@ pub fn router_dispatch(router: Router, method: str, path: str) -> str {
         if str_equal(route.method, method) && str_equal(route.path, path) {
             val handler = route.handler;
             // one owner for the handler's response (VF16)
-            return p_str_adopt(handler(path) as i64);
+            // SAFETY: the word is the handler's fresh response, held by
+            // nothing else (as in http_scoped_dispatch): adopted once.
+            unsafe {
+                return p_str_adopt(handler(path) as i64);
+            }
         }
         i = i + 1;
     }
@@ -1031,7 +1090,11 @@ pub fn router_dispatch_request(router: Router, request: str) -> str {
         if str_equal(route.method, method) && str_equal(route.path, path) {
             val handler = route.handler;
             // one owner for the handler's response (VF16)
-            return p_str_adopt(handler(request) as i64);
+            // SAFETY: the word is the handler's fresh response, held by
+            // nothing else (as in http_scoped_dispatch): adopted once.
+            unsafe {
+                return p_str_adopt(handler(request) as i64);
+            }
         }
         i = i + 1;
     }

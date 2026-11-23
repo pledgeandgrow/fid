@@ -10,6 +10,10 @@
 //   wget https://raw.githubusercontent.com/nothings/stb/master/stb_truetype.h
 
 #define STB_TRUETYPE_IMPLEMENTATION
+// its own header first: the C compiler checks each definition against
+// the declaration Fides binds to (pledge_input_init was int here and
+// long long there, unnoticed while this file did not include it)
+#include "pledge_font.h"
 #include "stb_truetype.h"
 #include <stdio.h>
 #include <stdlib.h>

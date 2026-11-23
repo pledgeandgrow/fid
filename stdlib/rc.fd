@@ -81,7 +81,14 @@ pub fn rc_count(r: Rc) -> i64 {
 pub fn rc_drop(r: Rc) -> void {
     var old: i64 = p_atomic_sub(r.count_addr, 1);
     if old <= 1 {
-        p_free(r.count_addr);
+        // SAFETY: count_addr is the 8-byte counter rc_new got from
+        // p_shared_alloc (p_free hands such blocks to the block allocator);
+        // the count just reached 0, so this was the last Rc sharing it and
+        // nothing reads the counter again, provided every copy of the Rc
+        // came from rc_new/rc_clone and is dropped once.
+        unsafe {
+            p_free(r.count_addr);
+        }
     }
 }
 
@@ -124,6 +131,12 @@ pub fn arc_count(a: Arc) -> i64 {
 pub fn arc_drop(a: Arc) -> void {
     var old: i64 = p_atomic_sub(a.count_addr, 1);
     if old <= 1 {
-        p_free(a.count_addr);
+        // SAFETY: count_addr is the 8-byte counter arc_new got from
+        // p_shared_alloc; the atomic decrement returned 1, so no other Arc
+        // (on any thread) holds it any more and nothing reads it again,
+        // provided every copy came from arc_new/arc_clone and is dropped once.
+        unsafe {
+            p_free(a.count_addr);
+        }
     }
 }

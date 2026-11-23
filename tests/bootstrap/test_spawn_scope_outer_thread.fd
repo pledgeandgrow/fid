@@ -1,0 +1,55 @@
+// BG45 (docs/roadmap/bugs-roadmap.md): the end of a `spawn scope { }` (the
+// C runtime's p_executor_run_all) joined every thread of the program not
+// joined yet, not only those its body started. A thread started before the
+// scope, which waits for something that happens after the scope, made the
+// scope wait forever. Now (compiler/codegen_c.fd p_executor_new, BG45) an
+// executor is the first future-table slot after it, and run_all, cancel
+// and poll_all reach only the threads started from then on.
+// (The double join of p_thread_join is gone since BG9: a slot is joined
+// once, its result kept.)
+// C path only: `fid run` runs a thread to its end when it is spawned.
+//@ backends: ccompile
+//
+// Expected output:
+// scope: 11
+// background: 7
+// nested: 3
+
+fn waiter(flag: i64) -> i64 {
+    while p_atomic_load(flag) == 0 {
+        p_atomic_add(flag, 0);
+    }
+    return 7;
+}
+
+fn add_to(total: i64, n: i64) -> i64 {
+    p_atomic_add(total, n);
+    return n;
+}
+
+fn main() -> i64 {
+    val flag = p_shared_alloc(8);
+    p_atomic_store(flag, 0);
+    // started before the scope: it ends only once the flag is set below
+    val bg = spawn waiter(flag);
+    val total = p_shared_alloc(8);
+    p_atomic_store(total, 0);
+    spawn scope {
+        spawn add_to(total, 5);
+        spawn add_to(total, 6);
+    }
+    println("scope: " + int_to_str(p_atomic_load(total)));
+    p_atomic_store(flag, 1);
+    println("background: " + int_to_str(await bg));
+    // a scope inside a scope: the outer one still waits for the inner's
+    val n2 = p_shared_alloc(8);
+    p_atomic_store(n2, 0);
+    spawn scope {
+        spawn add_to(n2, 1);
+        spawn scope {
+            spawn add_to(n2, 2);
+        }
+    }
+    println("nested: " + int_to_str(p_atomic_load(n2)));
+    return 0;
+}
