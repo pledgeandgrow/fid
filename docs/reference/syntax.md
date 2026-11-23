@@ -185,9 +185,9 @@ f"Point: ({p.x}, {p.y})"            // field access
 f"Length: {nums.len()}"             // method call
 ```
 
-There are no format specifiers: the parser reads one expression from the
-braces and ignores the tokens after it (`{x:#x}` is `{x}`). There is no escape
-for a literal brace (`{{` is not one).
+There are no format specifiers: the braces hold one expression, and text
+after it is a parse error (`{x:#x}`, `{x:.2}`; until Nov 23 it was dropped).
+There is no escape for a literal brace (`{{` is not one).
 
 ---
 

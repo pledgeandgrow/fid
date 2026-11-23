@@ -131,12 +131,15 @@ character (`read_char_lit`): `val c: i64 = 'A';` gives 65. Escapes: `\n` `\t`
 - Format strings `f"…{expr}…"`: text outside braces takes the same escapes as a
   plain string. Each `{…}` (braces may nest) is lexed and parsed again as an
   expression (`parser.fd:parse_fstring_parts`). The result has type `str`.
-  There is no escape for a literal brace, and there are no format specifiers:
-  the parser reads one expression from the braces and ignores any tokens after
-  it (`{x:#x}` is `{x}`). Each expression is type-checked; it may be text, a
-  number, a bool or a `Vec` — a struct (or a reference to one) is an error,
-  since it has no text form (`TypeChecker_check_fstring_part`;
-  `test_frontend_fstring.fd`, `test_frontend_fstring_struct_fail.fd`).
+  The braces hold one expression and nothing else: there are no format
+  specifiers, and text after the expression is a parse error
+  (`text follows the expression in an f-string`: `f"{x:.2}"`, `f"{n:5}"`,
+  `f"{x:#x}"`; until Nov 23 it was dropped without a word and `f"{x:.2}"`
+  printed `3.14159`). There is no escape for a literal brace. Each expression
+  is type-checked; it may be text, a number, a bool or a `Vec` — a struct (or
+  a reference to one) is an error, since it has no text form
+  (`TypeChecker_check_fstring_part`; `test_frontend_fstring.fd`,
+  `test_frontend_fstring_struct_fail.fd`).
 - There are no byte-string literals (`b"…"`).
 
 ### 1.9 Operators and punctuation
@@ -522,7 +525,12 @@ where another is declared. It accepts:
 - `!` and `_` on either side; `dyn T` and associated types on either side; a
   type parameter of the current function on either side;
 - `Name` against `Name<…>` (a generic used without arguments), and any two
-  instances of `Vec`, `HashMap`, `Rc` or `Arc`;
+  instances of `Vec`, `HashMap`, `Rc` or `Arc` of which at least one names no
+  type arguments (`Vec`, or `HashMap<str, i64>`, the type of `HashMap::new()`
+  where no declared type says otherwise). Two instances that name different
+  type arguments are not compatible (`Vec<str>` is not a `Vec<i64>`;
+  `tc_collection_instances_compatible`. Until Nov 23 any two were, and a
+  `Vec<str>` passed as a `Vec<i64>` had its strings read as numbers);
 - integer to any integer (whether the value fits is a separate check, §3.4),
   and integer to float;
 - tuples element by element;
@@ -559,9 +567,12 @@ may treat `str` as an integer.
 
   An expression with a literal operand (`x & 0xFF`) is exempt. Imported modules
   are not checked.
-- The check applies to `val`/`var` declarations and to `x = e`. Plain
-  assignment `x = e` checks nothing else: assigning a `bool` to an `i64`
-  variable is accepted (`TypeChecker_check_stmt_inner`, `Stmt::Assign`).
+- The check applies to `val`/`var` declarations and to `x = e`. A plain
+  assignment `x = e` (to a local, a parameter or a global) also checks that
+  `e` has the variable's type, as a declaration does
+  (`TypeChecker_check_assign_type`): assigning a `bool` to an `i64` variable,
+  or a number to a `str` one, is `cannot assign … to variable …` (until Nov
+  23 nothing but a literal's fit was checked).
 
 ### 3.5 Integer arithmetic at run time
 
@@ -688,9 +699,16 @@ Consequences:
 
 ### 4.6 Casts
 
-`e as T` has type `T`; the type checker accepts any pair of types. It converts
-between numeric types, between integers and raw pointers, between `str` and
-`i64`, and from a concrete type to `dyn Trait`. `e ~> T` is a quantisation cast
+`e as T` has type `T`. It converts between numeric types, between integers
+and raw pointers, between `str` and `i64`, and from a concrete type to
+`dyn Trait`. Every other pair is accepted too, except a cast that makes a
+reference (`128 as &i64`, `p as &T`), a `str` (`5 as str`) or a struct, an
+enum, a collection, a tuple or an array (`7 as Vec<i64>`) out of a word that
+is not one: outside `unsafe` each is `Safety error: casting … to … needs an
+`unsafe` block` (`TypeChecker_check_cast`, `TypeChecker_check_str_cast`;
+until Nov 23 any pair was accepted). Making a raw pointer from an integer
+with a cast (`n as *mut i64`) stays allowed in safe code: a raw pointer
+cannot be read or written without `unsafe`. `e ~> T` is a quantisation cast
 (`QuantCast`).
 
 Numeric casts (decided Nov 17, docs/verification/semantics-2.md §5, §10,
@@ -925,9 +943,14 @@ guard  = "guard" expr "=>" (block | statement)
 
 `defer { stmts }` (braces are required). The deferred blocks of a function run
 when it returns, last registered first (`lower.fd:Lowerer_emit_defers`;
-`test_defer.fd`). They run at function exit, not block exit. The compiler
-attaches them by position: every `return` lowered after a `defer` statement
-runs it, also when the `defer` was in a branch that did not execute.
+`test_defer.fd`). They run at function exit, not block exit. A deferred block
+runs only if its `defer` statement executed, and once however many times the
+statement ran (in a loop, also in the copies a loop unrolled at compile time
+makes of it): each statement has a flag set when it runs. A `return` that
+executes before the `defer` statement (ahead of it in the same block) does
+not run it. (Until Nov 23 the blocks were attached by position: one in a
+branch that did not execute ran too, and one in a loop ran once per
+unrolled copy.)
 
 ### 5.6 Blocks with a meaning
 
@@ -965,9 +988,13 @@ binding = name [":" type-name]
   `match x { 1 => f(), _ => g(), }` is a parse error.
 - Integer patterns are non-negative literals: `-1 =>` is a parse error
   (`invalid pattern 'Minus'`). `a..=b` and `a..b` match ranges.
-- A bare name binds the value and matches anything. This includes a unit
-  variant written without its enum: in `match o { None => { … } … }`, `None` is
-  a new variable and the arm always matches. Write `Option::None`.
+- A bare name binds the value and matches anything, unless it is a unit
+  variant of the scrutinee's enum: `None =>` on an `Option` is
+  `Option::None =>`, as `Some(x)` is, and binds nothing
+  (`TypeChecker_bare_pattern_is_unit_variant`,
+  `Lowerer_bare_pattern_is_unit_variant`; `s6_bare_unit_variant.fd`,
+  `s6_bare_unit_variant_first_arm.fd`. Until Nov 23 the name bound a variable
+  and the arm matched every value, so the arms after it could not run).
 - `Variant(x, y)` without the enum name works when the variant can be resolved
   from the scrutinee's type or is unique (`TypeChecker_resolve_pattern_enum`).
 - Bindings are names (`_` allowed), optionally with a type name
@@ -1656,7 +1683,12 @@ as words for now: `tests/verify/bugs/d22_hashmap_str_keys_order.fd`,
 miscompile-log D22.)
 
 `Box::new(x)` gives `Box<T>`; `*b` gives the `T`. `Rc::new` and `Arc::new` give
-`Rc<T>`/`Arc<T>` with `clone`, `drop`, `get`, `count`.
+`Rc<T>`/`Arc<T>` with `clone`, `drop`, `get`, `count` (`Rc::new(41)` is an
+`Rc<i64>`, as a literal is an `i64`). An `Rc<T>` or an `Arc<T>` holds a
+number or a bool, as one word (the address of a block `[count, value]`);
+`Rc::new` of anything else is an error (a struct, a string or a collection
+needs a counted cell that owns what it holds, known-bugs OW4). Nothing drops
+a handle by itself: `drop` does, once per copy.
 
 ### 13.4 Strings
 
@@ -1689,8 +1721,6 @@ and `effects/test_effect_ho_instantiation.fd` is accepted by both.
 - `docs/reference/syntax.md:157`: the suffix literal `42i64` does not lex as
   one literal; there are no literal suffixes (§1.5).
 - `docs/reference/syntax.md:164`: `b"bytes"` byte strings do not exist (§1.8).
-- `docs/reference/syntax.md:182-184`: f-string format specifiers (`{x:.2}`,
-  `{x:#x}`) are ignored and `{{` is not an escape (§1.8).
 - `docs/reference/syntax.md:194-198`: `isize`, `usize` and `char` are not
   types (§3.1).
 - `docs/reference/syntax.md:217`: `vec![…]` does not parse.

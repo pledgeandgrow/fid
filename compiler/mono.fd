@@ -5541,6 +5541,23 @@ pub fn infer_expr_type(expr: Expr, func: Func) -> Type {
                         if (gn == "Option" || gn == "Result") && (method == "map" || method == "map_err" || method == "and_then" || method == "or" || method == "or_else" || method == "filter") {
                             return rt;
                         }
+                        // core's `ok`/`err` give an Option of that payload;
+                        // `context`/`with_context` a Result whose error is a str
+                        if gn == "Result" && gargs.len() > 1 && (method == "ok" || method == "err") {
+                            var mo: Vec<Type> = Vec::new();
+                            if method == "err" {
+                                mo.push(gargs.get(1));
+                            } else {
+                                mo.push(gargs.get(0));
+                            }
+                            return Type::Generic("Option", mo);
+                        }
+                        if (gn == "Result" || gn == "Option") && (method == "context" || method == "with_context") {
+                            var mc: Vec<Type> = Vec::new();
+                            mc.push(gargs.get(0));
+                            mc.push(Type::Str);
+                            return Type::Generic("Result", mc);
+                        }
                         if gn == "Vec" && (method == "get" || method == "pop" || method == "first" || method == "last") {
                             return gargs.get(0);
                         }
@@ -5550,6 +5567,26 @@ pub fn infer_expr_type(expr: Expr, func: Func) -> Type {
                 }
             }
             return rt;
+        }
+        // `try { stmts; expr }` is a Result<T, i64>, T the type of its last
+        // expression statement (reference §4.9), as the lowering types it
+        Expr::TryBlock(mtb) => {
+            var mt_last: Expr = Expr::IntLit(0);
+            var mt_i: i64 = 0;
+            while mt_i < mtb.len() {
+                match mtb.get(mt_i) {
+                    Stmt::Expr(mte, _) => {
+                        mt_last = mte;
+                    }
+                    _ => {
+                    }
+                }
+                mt_i = mt_i + 1;
+            }
+            var mt_args: Vec<Type> = Vec::new();
+            mt_args.push(infer_expr_type(mt_last, func));
+            mt_args.push(Type::I64);
+            return Type::Generic("Result", mt_args);
         }
         _ => {
             return Type::I64;

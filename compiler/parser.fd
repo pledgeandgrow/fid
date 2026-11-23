@@ -7873,7 +7873,7 @@ impl Parser {
         match k {
             TokenKind::FString(s: str) => {
                 self.advance();
-                return self.parse_fstring_parts(s);
+                return self.parse_fstring_parts(s, tok.line, tok.col);
             }
             _ => {
             }
@@ -9149,7 +9149,10 @@ impl Parser {
         return ParseResultAttribute::Ok(__ret_Attribute);
     }
 
-    fn parse_fstring_parts(self: &mut Parser, raw: str) -> ParseResultExpr {
+    /// The parts of an f-string: text, and each `{ ... }` as one expression
+    /// (reference §1.8). `line` and `col` are the literal's own: an error in a
+    /// part names the f-string.
+    fn parse_fstring_parts(self: &mut Parser, raw: str, line: i64, col: i64) -> ParseResultExpr {
         var parts: Vec<FStringPart> = Vec::new();
         var current: str = "";
         var i: i64 = 0;
@@ -9192,6 +9195,13 @@ impl Parser {
                 var sub_parser: Parser = Parser::new(sub_tokens);
                 match sub_parser.parse_expr() {
                     ParseResultExpr::Ok(e) => {
+                        // The braces hold one expression and nothing else:
+                        // there are no format specifiers. What followed the
+                        // expression was dropped without a word (`f"{x:.2}"`
+                        // printed 3.14159), so it is an error
+                        if !sub_parser.is_at_end() {
+                            return ParseResultExpr::Err("Parse error at " + int_to_str(line) + ":" + int_to_str(col) + ": text follows the expression in an f-string: `{" + expr_src + "}`.\n    Fix: the braces of an f-string hold one expression and there are no format specifiers (`:.2`, `:5`, `#x`); compute the text in the expression, for example `u64_to_str(x)`.");
+                        }
                         parts.push(FStringPart::Expr(e));
                     }
                     ParseResultExpr::Err(e) => {

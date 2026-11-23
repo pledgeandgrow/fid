@@ -386,6 +386,23 @@ pub fn TryContext_new(error_block: i64, error_result_slot: i64) -> TryContext {
     };
 }
 
+// A `defer` statement of the function being lowered (reference §5.5): its
+// block, the entry-block slot that says whether the statement ran (1) or not
+// (0), and its line (the copies a loop unrolled at compile time makes of a
+// statement have the same one, and are the same statement). flag -1 and line
+// -1: the block always runs (the audit exit log).
+pub struct DeferEntry {
+    pub body: Vec<Stmt>,
+    pub flag: i64,
+    pub line: i64,
+}
+
+pub fn DeferEntry_new(body: Vec<Stmt>, flag: i64, line: i64) -> DeferEntry {
+    return DeferEntry {
+        body: body, flag: flag, line: line,
+    };
+}
+
 // Closure capture: (name, env_field_index, type)
 pub struct ClosureCapture {
     pub name: str,
@@ -703,7 +720,7 @@ pub struct Lowerer {
     // lookup (Lowerer_extern_at); "#" holds how many entries it covers + 1
     pub extern_index: i64,
     pub impl_methods: Vec<StringStringFuncEntry>,
-    pub defer_stack: Vec<Vec<Stmt>>,
+    pub defer_stack: Vec<DeferEntry>,
     pub current_captures: Vec<ClosureCapture>,
     pub try_stack: Vec<TryContext>,
     pub effect_handler_stack: Vec<Vec<EffectHandler>>,
@@ -1046,6 +1063,40 @@ fn Lowerer_pattern_variant_index(self: & Lowerer, enum_name: str, variant: str) 
         }
     }
     return 0;
+}
+
+/// A bare name in a match arm that is a unit variant of the scrutinee's enum
+/// (`None =>` on an `Option`) is that variant, as `Some(x)` is (reference
+/// §6): the type checker binds no variable for it
+/// (TypeChecker_bare_pattern_is_unit_variant). Before, the lowering bound the
+/// name to the scrutinee, so the arm matched every value and the arms after
+/// it could not run.
+pub fn Lowerer_bare_pattern_is_unit_variant(self: & Lowerer, scrut_expr: Expr, name: str) -> bool {
+    var pen: str = Lowerer_scrutinee_pattern_enum(self, Lowerer_rc_expr_type(self, scrut_expr), name);
+    if str_len(pen) == 0 {
+        return false;
+    }
+    match Lowerer_lookup_enum(self, pen) {
+        OptEnumDef::Some(bdef) => {
+            var vi: i64 = 0;
+            while vi < bdef.variants.len() {
+                if bdef.variants.get(vi).name == name {
+                    match bdef.variants.get(vi).data {
+                        OptParams::Some(bps) => {
+                            return bps.len() == 0;
+                        }
+                        OptParams::None => {
+                            return true;
+                        }
+                    }
+                }
+                vi = vi + 1;
+            }
+        }
+        OptEnumDef::None => {
+        }
+    }
+    return false;
 }
 
 /// IR types for the values bound by an enum-variant pattern.
@@ -2538,6 +2589,17 @@ pub fn Lowerer_lower_type(self: & Lowerer, ty: Type) -> IrType {
     // owned `str` is: the type checker keeps it from outliving its owner
     if lw_is_borrowed_str(resolved) {
         return lw_ptr_u8();
+    }
+    // An `Rc<T>` or an `Arc<T>` is the address of its block [count, value]:
+    // a word (Lowerer_lower_rc_new)
+    match resolved {
+        Type::Generic(rcn, _) => {
+            if rcn == "Rc" || rcn == "Arc" {
+                return IrType::I64;
+            }
+        }
+        _ => {
+        }
     }
     // A generic enum (Option<f64>) is laid out as the enum itself: its type
     // arguments only say what its payloads hold
@@ -6365,7 +6427,7 @@ fn Lowerer_lower_func_uncached(self: & mut Lowerer, func: Func) {
     // BG28: Lowerer_lower_func_body empties the defer stack and the AST
     // parameter types; the enclosing function's own come back after it
     // (a closure dropped the `defer`s of the function that made it)
-    var saved_defers: Vec<Vec<Stmt>> = self.defer_stack;
+    var saved_defers: Vec<DeferEntry> = self.defer_stack;
     var saved_param_types: Vec<StringTypeEntry> = self.current_func_param_types;
     self.cur_body = func.body;
     self.cur_has_defer = lw_has_defer(func.body);
@@ -6676,7 +6738,7 @@ fn Lowerer_lower_func_body(self: & mut Lowerer, func: Func) {
     var empty_var_ast_types: Vec<StringTypeEntry> = Vec::new();
     self.var_ast_types = empty_var_ast_types;
     Lowerer_ix_reset_tables(self);
-    var empty_defer_stack: Vec<Vec<Stmt>> = Vec::new();
+    var empty_defer_stack: Vec<DeferEntry> = Vec::new();
     self.defer_stack = empty_defer_stack;
     var empty_param_types: Vec<StringTypeEntry> = Vec::new();
     self.current_func_param_types = empty_param_types;
@@ -6848,7 +6910,7 @@ fn Lowerer_lower_func_body(self: & mut Lowerer, func: Func) {
         var exit_args: Vec<Expr> = Vec::new();
         exit_args.push(Expr::StringLit("[AUDIT] exit " + func.name + "\n"));
         exit_stmts.push(Stmt::Expr(Expr::Call("print", exit_args), 0));
-        self.defer_stack.push(exit_stmts);
+        self.defer_stack.push(DeferEntry_new(exit_stmts, - 1, - 1));
     }
 
     if func.name == "main" {
@@ -9262,6 +9324,15 @@ fn Lowerer_lower_let_stmt(self: & mut Lowerer, name: str, ty: OptType, expr: Exp
     if lval < 0 {
         lval = Lowerer_lower_let_value_typed(self, ty, expr, plain_copy);
     }
+    // An integer initialiser of a float variable is the number (`val f: f64 = 3`,
+    // `val f: f64 = n`): Lowerer_int_to_float_value
+    match ty {
+        OptType::Some(i2f_t) => {
+            lval = Lowerer_int_to_float_value(self, lval, Lowerer_lower_type(self, Lowerer_resolve_self_in_type(self, i2f_t)));
+        }
+        OptType::None => {
+        }
+    }
     // Ownership (proposal 0004): the variable keeps its value
     var own_ty: Type = Type::Infer;
     if self.own_on && !borrow_copy {
@@ -11117,6 +11188,7 @@ fn Lowerer_lower_stmt_inner(self: & mut Lowerer, stmt: Stmt) {
                                 gty = lw_rc_handle_of_ir(ir_ty);
                             }
                             var val: i64 = Lowerer_lower_owned(self, expr, gty);
+                            val = Lowerer_int_to_float_value(self, val, ir_ty);
                             var gold: i64 = - 1;
                             if Lowerer_rc_kind(self, gty) != RC_NONE {
                                 gold = Lowerer_emit_inst(self, Inst::Load(addr, ir_ty));
@@ -11230,6 +11302,15 @@ fn Lowerer_lower_stmt_inner(self: & mut Lowerer, stmt: Stmt) {
                                 rv = Lowerer_rc_tuple_ptr(self, rv, avty);
                             }
                             var val_ty: IrType = Lowerer_get_value_type(self, rv);
+                            // An integer assigned to a float variable is the
+                            // number (`f = 3`): as in a declaration
+                            match Lowerer_lookup_alloca_type(self, alloca) {
+                                OptIrType::Some(i2f_at) => {
+                                    rv = Lowerer_int_to_float_value(self, rv, i2f_at);
+                                }
+                                OptIrType::None => {
+                                }
+                            }
                             match val_ty {
                                 IrType::Ptr(inner) => {
                                     var inner_ty: IrType = box_ir_type_unbox(inner);
@@ -11476,8 +11557,30 @@ fn Lowerer_lower_stmt_inner(self: & mut Lowerer, stmt: Stmt) {
                 Lowerer_emit_terminator(self, Inst::Jump(ctx.continue_target));
             }
         }
-        Stmt::Defer(body, _line) => {
-            self.defer_stack.push(body);
+        Stmt::Defer(body, line) => {
+            // The statement ran: its block is one this function runs at its
+            // exit (reference §5.5). Its flag is a slot of the entry block,
+            // set by each execution of the statement, so a statement in a
+            // loop runs its block once. The copies a loop unrolled at compile
+            // time makes of the statement have its line: the same statement,
+            // the same flag. (Before, the block was registered whatever the
+            // control flow: one in a branch that did not run ran too.)
+            var flag: i64 = 0;
+            var di: i64 = self.defer_stack.len() - 1;
+            while di >= 0 {
+                var entry: DeferEntry = self.defer_stack.get(di);
+                if entry.line == line && entry.flag >= 0 {
+                    flag = entry.flag;
+                    break;
+                }
+                di = di - 1;
+            }
+            if flag == 0 {
+                flag = Lowerer_rc_new_slot(self, IrType::I64, Type::I64);
+                self.defer_stack.push(DeferEntry_new(body, flag, line));
+            }
+            var one: i64 = Lowerer_emit_inst(self, Inst::ConstInt(1, IrType::I64));
+            Lowerer_emit_inst(self, Inst::Store(flag, one, OptIrType::None));
         }
         Stmt::Match(expr, arms, _line) => {
             Lowerer_lower_match(self, expr, arms);
@@ -12327,6 +12430,61 @@ fn lw_enum_lit_variant(e: Expr) -> str {
     return "";
 }
 
+/// `Rc::new(x)` / `Arc::new(x)` (reference §13.3): core's Rc_new / Arc_new
+/// make the block [count, x] and give its address, the handle an `Rc<T>` is.
+/// The block holds x's word: a float or a pointer as its bits.
+fn Lowerer_lower_rc_new(self: & mut Lowerer, name: str, arg_expr: Expr) -> i64 {
+    var val: i64 = Lowerer_lower_expr(self, arg_expr);
+    var val_ty: IrType = Lowerer_get_value_type(self, val);
+    var as_word: bool = ir_type_is_float(val_ty);
+    match val_ty {
+        IrType::Ptr(_) => {
+            as_word = true;
+        }
+        _ => {
+        }
+    }
+    if as_word {
+        val = Lowerer_lower_cast(self, val, val_ty, IrType::I64);
+    }
+    var env: i64 = Lowerer_emit_inst(self, Inst::ConstInt(0, IrType::I64));
+    var cargs: Vec<i64> = Vec::new();
+    cargs.push(env);
+    cargs.push(val);
+    return Lowerer_emit_inst(self, Inst::Call(name + "_new", cargs, IrType::I64, EffectSet_new()));
+}
+
+/// `r.clone()`, `r.get()`, `r.count()` and `r.drop()` on an `Rc<T>` or an
+/// `Arc<T>`: core's Rc_<method> / Arc_<method>. `get` gives T's word back as
+/// its own type (a float's bits, a pointer's address).
+fn Lowerer_lower_rc_method(self: & mut Lowerer, name: str, receiver: Expr, method: str, targs: Vec<Type>) -> i64 {
+    var h: i64 = Lowerer_lower_expr(self, receiver);
+    var env: i64 = Lowerer_emit_inst(self, Inst::ConstInt(0, IrType::I64));
+    var cargs: Vec<i64> = Vec::new();
+    cargs.push(env);
+    cargs.push(h);
+    var res_ty: IrType = IrType::I64;
+    if method == "drop" {
+        res_ty = IrType::Void;
+    }
+    var res: i64 = Lowerer_emit_inst(self, Inst::Call(name + "_" + method, cargs, res_ty, EffectSet_new()));
+    if method == "get" && targs.len() == 1 {
+        var t_ir: IrType = Lowerer_lower_type(self, targs.get(0));
+        var from_word: bool = ir_type_is_float(t_ir);
+        match t_ir {
+            IrType::Ptr(_) => {
+                from_word = true;
+            }
+            _ => {
+            }
+        }
+        if from_word {
+            res = Lowerer_lower_cast(self, res, IrType::I64, t_ir);
+        }
+    }
+    return res;
+}
+
 pub fn Lowerer_lower_method_call(self: & mut Lowerer, receiver: Box<Expr>, method: str, args: Vec<Expr>) -> i64 {
     // `v.get(i).items.push(x)`: the changing method owns its own receiver
     // (Vec_push calls vec_own); the Vecs it is reached through, here
@@ -12358,6 +12516,9 @@ pub fn Lowerer_lower_method_call(self: & mut Lowerer, receiver: Box<Expr>, metho
             if name == "Box" && method == "new" {
                 return Lowerer_lower_box_new(self, args.get(0));
             }
+            if (name == "Rc" || name == "Arc") && method == "new" && args.len() == 1 {
+                return Lowerer_lower_rc_new(self, name, args.get(0));
+            }
             // Struct associated function call: mangle as StructName_method
             if Lowerer_is_struct(self, name) {
                 return Lowerer_lower_assoc_call(self, name, method, args);
@@ -12372,6 +12533,22 @@ pub fn Lowerer_lower_method_call(self: & mut Lowerer, receiver: Box<Expr>, metho
             }
         }
         _ => {
+        }
+    }
+
+    // `r.clone()`, `r.get()`, `r.count()` and `r.drop()` on an `Rc<T>` or an
+    // `Arc<T>` (reference §13.3) run core's Rc_<method> / Arc_<method> on the
+    // handle. Before, nothing lowered them: the call went to a function that
+    // does not exist (`Unknown function 'Rc_clone'`)
+    if method == "clone" || method == "get" || method == "count" || method == "drop" {
+        match Lowerer_resolve_type(self, Lowerer_infer_expr_ast_type(self, lw_box_expr_unbox(receiver))) {
+            Type::Generic(rcn, rcg) => {
+                if rcn == "Rc" || rcn == "Arc" {
+                    return Lowerer_lower_rc_method(self, rcn, lw_box_expr_unbox(receiver), method, rcg);
+                }
+            }
+            _ => {
+            }
         }
     }
 
@@ -12622,6 +12799,20 @@ pub fn Lowerer_lower_method_call(self: & mut Lowerer, receiver: Box<Expr>, metho
     // the receiver (stdlib-agent-bugs 8: v.extend(r) with r: &Vec<i64>
     // passed the address of r's slot and appended nothing)
     var core_coll: bool = str_starts_with(mangled_name, "Vec_") || str_starts_with(mangled_name, "HashMap_") || str_starts_with(mangled_name, "String_");
+    // An integer passed where the parameter is a float is the number
+    // (`p.move_by(5)`): Lowerer_int_to_float_value, as a call makes it
+    var i2f_at: i64 = HashMap_get(self.func_info_at, mangled_name);
+    if i2f_at != 0 {
+        var i2f_ps: Vec<Type> = self.func_param_asts.get(i2f_at - 1);
+        var i2f_off: i64 = i2f_ps.len() - args.len();
+        if i2f_off == 1 || i2f_off == 0 {
+            var i2f_i: i64 = 0;
+            while i2f_i < arg_vals.len() && i2f_i + i2f_off < i2f_ps.len() {
+                arg_vals.set(i2f_i, Lowerer_int_to_float_value(self, arg_vals.get(i2f_i), Lowerer_lower_type(self, i2f_ps.get(i2f_i + i2f_off))));
+                i2f_i = i2f_i + 1;
+            }
+        }
+    }
     ai = 0;
     while ai < arg_vals.len() {
         if core_coll {
@@ -14881,6 +15072,15 @@ fn Lowerer_vec_field_mask(self: & Lowerer, name: str, base: i64) -> i64 {
 /// the value (as src/lower.rs lower_expr_for_param).
 fn Lowerer_lower_arg_for_param(self: & mut Lowerer, arg: Expr, callee: str, i: i64) -> i64 {
     var val: i64 = Lowerer_lower_expr(self, arg);
+    // An integer passed where the parameter is a float is the number
+    // (`half(5)`): Lowerer_int_to_float_value, as a declaration makes it
+    var i2f_at: i64 = HashMap_get(self.func_info_at, callee);
+    if i2f_at != 0 {
+        var i2f_ps: Vec<Type> = self.func_param_asts.get(i2f_at - 1);
+        if i < i2f_ps.len() {
+            val = Lowerer_int_to_float_value(self, val, Lowerer_lower_type(self, i2f_ps.get(i)));
+        }
+    }
     var aname: str = "";
     match arg {
         Expr::Ident(n) => {
@@ -16097,7 +16297,19 @@ fn Lowerer_lower_match_expr(self: & mut Lowerer, e: Box<Expr>, arms0: Vec<MatchA
         var saved_var_ast_types_len: i64 = self.var_ast_types.len();
         var saved_locals_len: i64 = self.current_func.locals.len();
 
-        match arm.pattern {
+        // `None =>` on an Option is the variant (reference §6): lowered as
+        // `Option::None =>` when it is one of the scrutinee's enum
+        var pat: Pattern = arm.pattern;
+        match pat {
+            Pattern::Ident(pn) => {
+                if Lowerer_bare_pattern_is_unit_variant(self, lw_box_expr_unbox(e), pn) {
+                    pat = Pattern::EnumVariant("", pn, Vec::new());
+                }
+            }
+            _ => {
+            }
+        }
+        match pat {
             Pattern::Wildcard => {
                 Lowerer_emit_terminator(self, Inst::Jump(arm_block));
             }
@@ -16584,9 +16796,14 @@ fn Lowerer_lower_try_block_expr(self: & mut Lowerer, stmts: Vec<Stmt>) -> i64 {
 
     self.try_stack.pop();
 
+    // T of the Result (reference §4.9): the type of the block's last expression
+    var ok_ty: Type = Lowerer_try_value_type(self, stmts);
     var ok_val: i64 = 0;
     if has_last {
-        ok_val = last_val;
+        // The Result keeps the value as its `T`: it is owned as a `let` would
+        // own it (proposal 0004), so a string made in the block is the
+        // Result's, as the value of an `if` is the `val`'s
+        ok_val = Lowerer_rc_own_value(self, last_val, ok_ty);
     } else {
         ok_val = Lowerer_emit_inst(self, Inst::ConstInt(0, IrType::I64));
     }
@@ -16610,7 +16827,31 @@ fn Lowerer_lower_try_block_expr(self: & mut Lowerer, stmts: Vec<Stmt>) -> i64 {
     Lowerer_emit_terminator(self, Inst::Jump(cont_block));
 
     Lowerer_set_current_block(self, cont_block);
+    // The Result itself is a temporary of Result<T, i64> (one with a string
+    // payload owns the string): a `val` takes it over, as the value of an `if`
+    var tr_args: Vec<Type> = Vec::new();
+    tr_args.push(ok_ty);
+    tr_args.push(Type::I64);
+    Lowerer_rc_temp(self, result_slot, Type::Generic("Result", tr_args));
     return result_slot;
+}
+
+/// T of `try { stmts; expr }`: the type of its last expression statement, as
+/// the type checker takes it (reference §4.9); i64 when the block has none.
+fn Lowerer_try_value_type(self: & Lowerer, stmts: Vec<Stmt>) -> Type {
+    var last: Expr = Expr::IntLit(0);
+    var si: i64 = 0;
+    while si < stmts.len() {
+        match stmts.get(si) {
+            Stmt::Expr(e, _) => {
+                last = e;
+            }
+            _ => {
+            }
+        }
+        si = si + 1;
+    }
+    return Lowerer_enum_arg_ast_type(self, last);
 }
 
 // Closures being lowered right now, one inside another (the depth of the
@@ -16990,6 +17231,24 @@ fn lw_rc_param_index(t: Type, params: Vec<str>) -> i64 {
 }
 
 
+/// Whether a value of IR type `ty` shown as text goes through core's
+/// u64_to_str, as `print` shows a u64 (Lowerer_emit_print): the runtimes'
+/// p_to_str is signed. False when u64_to_str is not in the program (a build
+/// without the core library).
+fn Lowerer_u64_text(self: & mut Lowerer, ty: IrType) -> bool {
+    if !ir_type_eq(ty, IrType::U64) {
+        return false;
+    }
+    match Lowerer_lookup_func_ret_type(self, "u64_to_str") {
+        OptType::Some(_) => {
+            return true;
+        }
+        OptType::None => {
+            return false;
+        }
+    }
+}
+
 fn Lowerer_lower_fstring_expr(self: & mut Lowerer, parts: Vec<FStringPart>) -> i64 {
     var result: i64 = Lowerer_emit_inst(self, Inst::ConstStr(""));
     var i: i64 = 0;
@@ -17030,6 +17289,15 @@ fn Lowerer_lower_fstring_expr(self: & mut Lowerer, parts: Vec<FStringPart>) -> i
                         vec_args.push(dummy_env);
                         vec_args.push(e_val);
                         str_val = Lowerer_emit_inst(self, Inst::Call("Vec_to_str", vec_args, lw_ptr_u8(), EffectSet_new()));
+                    } else if Lowerer_u64_text(self, e_ty) {
+                        // reference §3.5: a u64 is unsigned for printing, as
+                        // `print` shows it. f"{a}" of 18446744073709551614 came
+                        // out as -2: every runtime's p_to_str is signed
+                        var conv_env: i64 = Lowerer_emit_inst(self, Inst::ConstInt(0, IrType::I64));
+                        var conv_args: Vec<i64> = Vec::new();
+                        conv_args.push(conv_env);
+                        conv_args.push(e_val);
+                        str_val = Lowerer_emit_inst(self, Inst::Call("u64_to_str", conv_args, lw_ptr_u8(), EffectSet_new()));
                     } else {
                         var conv_args: Vec<i64> = Vec::new();
                         conv_args.push(e_val);
@@ -18538,18 +18806,12 @@ pub fn Lowerer_lower_expr(self: & mut Lowerer, expr: Expr) -> i64 {
                     }
                     return Lowerer_emit_inst(self, Inst::Call(callee, call_args, ret_ty, EffectSet_new()));
                 }
-                Expr::MethodCall(receiver, method, args) => {
-                    // a |> obj.method(args) - obj.method(a, args...)
-                    // left becomes the first arg, receiver stays the receiver
-                    var new_args: Vec<Expr> = Vec::new();
-                    new_args.push(lw_box_expr_unbox(left));
-                    var ai: i64 = 0;
-                    while ai < args.len() {
-                        new_args.push(args.get(ai));
-                        ai = ai + 1;
-                    }
-                    var new_call: Expr = Expr::MethodCall(receiver, method, new_args);
-                    return Lowerer_lower_expr(self, new_call);
+                Expr::MethodCall(_, method, args) => {
+                    // a |> obj.method(args) - a.method(args)  (reference §4.8):
+                    // the piped value is the receiver, as the type checker
+                    // reads the form. Before, the lowering kept `obj` as the
+                    // receiver and added `a` as a first argument
+                    return Lowerer_lower_expr(self, Expr::MethodCall(left, method, args));
                 }
                 Expr::Ident(name) => {
                     // x |> f  -  f(x)
@@ -20136,7 +20398,19 @@ pub fn Lowerer_lower_match(self: & mut Lowerer, expr: Expr, arms: Vec<MatchArm>)
         var saved_var_ast_types_len: i64 = self.var_ast_types.len();
         var saved_locals_len: i64 = self.current_func.locals.len();
 
-        match arm.pattern {
+        // `None =>` on an Option is the variant (reference §6): lowered as
+        // `Option::None =>` when it is one of the scrutinee's enum
+        var pat: Pattern = arm.pattern;
+        match pat {
+            Pattern::Ident(pn) => {
+                if Lowerer_bare_pattern_is_unit_variant(self, expr, pn) {
+                    pat = Pattern::EnumVariant("", pn, Vec::new());
+                }
+            }
+            _ => {
+            }
+        }
+        match pat {
             Pattern::Wildcard => {
                 Lowerer_emit_terminator(self, Inst::Jump(arm_block));
             }
@@ -21680,6 +21954,23 @@ pub fn Lowerer_coerce_return(self: & mut Lowerer, val: i64) -> i64 {
     return val;
 }
 
+/// `val` as a value of the float type `want` when it is an integer: the
+/// conversion written out (reference §3.3: an integer becomes a float). It is
+/// made where a value enters a float slot or parameter: a declaration, an
+/// assignment, a call. The C backend converted it by its own assignment and
+/// the interpreter did not; the native backend read the integer's bits as the
+/// float (`val f: f64 = n` printed 0.000..., `half(5)` got 0.0).
+pub fn Lowerer_int_to_float_value(self: & mut Lowerer, val: i64, want: IrType) -> i64 {
+    if !ir_type_is_float(want) {
+        return val;
+    }
+    var vt: IrType = Lowerer_get_value_type(self, val);
+    if !ir_type_is_int(vt) {
+        return val;
+    }
+    return Lowerer_lower_cast(self, val, vt, want);
+}
+
 /// 2^n as a float (exact for 0 <= n <= 1023).
 fn lw_f2i_pow2(n: i64) -> f64 {
     var r: f64 = 1.0;
@@ -22031,11 +22322,29 @@ pub fn f32_to_bits(f: f64) -> i64 {
 }
 
 pub fn Lowerer_emit_defers(self: & mut Lowerer) {
-    // Emit defer blocks in reverse order (LIFO)
+    // Emit defer blocks in reverse order (LIFO). One whose statement may not
+    // have run (it is in a branch or a loop of this function) runs only if it
+    // did: its flag says so (reference §5.5). An exit lowered before the
+    // statement (a `return` ahead of it in the same block) has none to run.
     var i: i64 = self.defer_stack.len() - 1;
     while i >= 0 {
-        var stmts: Vec<Stmt> = self.defer_stack.get(i);
-        Lowerer_lower_stmts(self, stmts);
+        var entry: DeferEntry = self.defer_stack.get(i);
+        if entry.flag < 0 {
+            Lowerer_lower_stmts(self, entry.body);
+        } else {
+            var flag_val: i64 = Lowerer_emit_inst(self, Inst::Load(entry.flag, IrType::I64));
+            var zero: i64 = Lowerer_emit_inst(self, Inst::ConstInt(0, IrType::I64));
+            var ran: i64 = Lowerer_emit_inst(self, Inst::BinOp(BinOp::Neq, flag_val, zero, IrType::Bool));
+            var run_block: i64 = Lowerer_new_block(self);
+            var after_block: i64 = Lowerer_new_block(self);
+            Lowerer_emit_terminator(self, Inst::Branch(ran, run_block, after_block));
+            Lowerer_set_current_block(self, run_block);
+            Lowerer_lower_stmts(self, entry.body);
+            if !Lowerer_current_block_has_terminator(self) {
+                Lowerer_emit_terminator(self, Inst::Jump(after_block));
+            }
+            Lowerer_set_current_block(self, after_block);
+        }
         i = i - 1;
     }
 }
@@ -22425,6 +22734,18 @@ pub fn Lowerer_infer_expr_ast_type(self: & Lowerer, expr: Expr) -> Type {
         }
         // What `unwrap` or `get` returns: the type argument of the receiver
         Expr::MethodCall(recv, m, _) => {
+            // `Rc::new(x)` and `Arc::new(x)` give an `Rc<T>` / `Arc<T>`
+            match lw_box_expr_unbox(recv) {
+                Expr::Ident(rn) => {
+                    if (rn == "Rc" || rn == "Arc") && m == "new" {
+                        var ra: Vec<Type> = Vec::new();
+                        ra.push(Type::I64);
+                        return Type::Generic(rn, ra);
+                    }
+                }
+                _ => {
+                }
+            }
             match Lowerer_infer_expr_ast_type(self, lw_box_expr_unbox(recv)) {
                 Type::Generic(gn, gargs) => {
                     if gargs.len() > 0 {
@@ -22434,6 +22755,23 @@ pub fn Lowerer_infer_expr_ast_type(self: & Lowerer, expr: Expr) -> Type {
                         // core's map/and_then/... keep the receiver's type
                         if (gn == "Option" || gn == "Result") && (m == "map" || m == "map_err" || m == "and_then" || m == "or" || m == "or_else" || m == "filter") {
                             return Type::Generic(gn, gargs);
+                        }
+                        // core's `ok`/`err` give an Option of that payload;
+                        // `context`/`with_context` a Result whose error is a str
+                        if gn == "Result" && gargs.len() > 1 && (m == "ok" || m == "err") {
+                            var oargs: Vec<Type> = Vec::new();
+                            if m == "err" {
+                                oargs.push(gargs.get(1));
+                            } else {
+                                oargs.push(gargs.get(0));
+                            }
+                            return Type::Generic("Option", oargs);
+                        }
+                        if (gn == "Result" || gn == "Option") && (m == "context" || m == "with_context") {
+                            var cargs: Vec<Type> = Vec::new();
+                            cargs.push(gargs.get(0));
+                            cargs.push(Type::Str);
+                            return Type::Generic("Result", cargs);
                         }
                         if gn == "Vec" && (m == "get" || m == "pop" || m == "first" || m == "last") {
                             return gargs.get(0);
@@ -22476,6 +22814,15 @@ pub fn Lowerer_infer_expr_ast_type(self: & Lowerer, expr: Expr) -> Type {
                     return Type::Func(clpts, Box::new(Lowerer_infer_closure_ret_ty(self, clbody)));
                 }
             }
+        }
+        // `try { stmts; expr }` is a Result<T, i64>, T the type of its last
+        // expression statement (reference §4.9). Before, it was typed i64:
+        // `try { "a" + "b" }` gave `unwrap()` a string's address as a number
+        Expr::TryBlock(tbs) => {
+            var targs: Vec<Type> = Vec::new();
+            targs.push(Lowerer_try_value_type(self, tbs));
+            targs.push(Type::I64);
+            return Type::Generic("Result", targs);
         }
         _ => {
             return Type::I64;

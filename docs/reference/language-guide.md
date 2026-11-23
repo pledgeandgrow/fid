@@ -1006,9 +1006,9 @@ fn work() -> i64 {
 - Error propagation from `?`
 - Function epilogue
 
-They run at function exit, not block exit. Every `return` lowered after a
-`defer` statement runs it, also when the `defer` was in a branch that did not
-execute.
+They run at function exit, not block exit. A deferred block runs only if its
+`defer` statement executed, and once however many times it ran; a `return`
+ahead of the statement in the same block does not run it (reference §5.5).
 
 ### 6.5 Match
 

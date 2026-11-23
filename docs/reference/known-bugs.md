@@ -12,7 +12,26 @@
 > and the RFC 8439/5869 vectors. Also fixed `aead_mac` interleaving the
 > aad/ct length blocks (stdlib/tls_crypto.fd).
 >
-> Last updated: Nov 21, 2026 (§2g: rows 2g.80–2g.113 from the check of
+> Nov 23 (a whole-language analysis; changelog "Type checker holes, silent
+> traps and backend gaps"): the type checker accepted `s = 42` into a `str`
+> (an assignment checked only a literal's fit), any two `Vec`/`HashMap`
+> instances (`Vec<str>` as `Vec<i64>`: addresses printed, words freed as
+> strings), and any cast (`128 as &i64`, `5 as str`, `7 as Vec<i64>` outside
+> `unsafe`); a bare `None =>` arm bound a catch-all; text after an f-string's
+> expression was dropped; a `defer` ran from a branch that did not execute;
+> the interpreter wrote a number with the value's width, not the slot's, and
+> read an integer's bits as a float (so did the native backend);
+> `try { "a" + "b" }` and `ok()`/`err()`/`context()` were typed i64;
+> `x |> o.m(a)` lowered as `o.m(x, a)`; `f"{u64}"` was signed; `Rc`/`Arc` had
+> no lowering; `Vec`'s closure methods needed `use vec;` and a closure with
+> no `return` of a value (`fn(x: i64) { print(x); }`) ended in `abort()` on
+> the C backend. Each has a rejection or output test in tests/conformance.
+> Do not bring an "accepts any pair" rule back. The new assignment check
+> also caught `ce_layout_lowerer` (comptime_eval.fd) assigning a
+> `Vec<EnumDef>` to the lowerer's `(name, EnumDef)` table: fixed there.
+>
+> Last updated: Nov 23, 2026 (the paragraph above). Earlier Nov 21, 2026
+> (§2g: rows 2g.80–2g.113 from the check of
 > 224 goals on a self-hosted stage 0; rows fixed by Nov 19 marked so.
 > Later Nov 21 (debcee9 + 5fb5516 + c082ee6): 2g.80, .81, .84-.90, .93-.96,
 > .98-.102, .104-.111, .113 fixed; 2g.82, .102 (shadowed names), .103 and

@@ -1,5 +1,47 @@
 # Fides Language Changelog
 
+## Type checker holes, silent traps and backend gaps (Nov 23, 2026)
+
+Found by a whole-language analysis; each has a conformance test in
+`tests/conformance` (a rejection test for each hole). Checked on one-stage
+builds of the modified tree (interpreter, native and C backends, the leak
+gate); the 3-stage fixpoint was not redone.
+
+- **Type checker.** A plain assignment checks the assigned value's type, as
+  a declaration does (`var s: str = "a"; s = 42;` was accepted). Two
+  instances of `Vec`, `HashMap`, `Rc` or `Arc` that name different type
+  arguments are different types (before, any two were compatible: a
+  `Vec<str>` passed as a `Vec<i64>` printed addresses and freed words as
+  strings). A cast that makes a reference, a `str` or a struct, enum,
+  collection, tuple or array out of a word needs `unsafe` (`128 as &i64`,
+  `5 as str`, `7 as Vec<i64>`); an integer to a raw pointer with a cast stays
+  allowed. An assignment to a by-value `Vec`, `HashMap` or struct parameter
+  is rejected. `Box::new(41)` is a `Box<i64>`. `Rc::new` and `Arc::new` give
+  `Rc<T>`/`Arc<T>` for a number or a bool (block `[count, value]`) with
+  `clone`, `get`, `count`, `drop`; of anything else they are an error that
+  says so (a counted cell that owns what it holds is OW4, not written).
+- **Traps.** A bare `None =>` arm is the variant, as `Some(x)` is (before, it
+  bound a variable and matched every value). Text after an f-string's
+  expression (`f"{x:.2}"`) is a parse error instead of being dropped. A
+  `defer` runs only if its statement executed, and once (also for the copies
+  a loop unrolled at compile time makes of it). `x |> o.m(a)` is `x.m(a)`,
+  as the reference says (the lowering emitted `o.m(x, a)`).
+- **The backends agree.** An integer stored into a float slot or passed to a
+  float parameter is converted on every backend (the interpreter read the
+  integer's bits; so did the native backend). The interpreter writes a
+  number with its slot's width (an `i8` of -5 widened to an `i64` read 251).
+  `f"{u64}"` is unsigned. `try { "a" + "b" }` is a `Result<str, i64>`, and
+  `ok()`, `err()`, `context()` and `with_context()` have their types. A
+  `Vec<str>` prints as text and `contains` compares text. `Vec`'s `map`,
+  `filter`, `for_each`, `fold`, `any`, `all`, `find` and `position` are in
+  core (no `use vec;`). The C backend calls a function that returns a word
+  where `-> void` is expected: a closure with no `return` of a value is
+  typed `i64`, and `v.for_each(fn(x: i64) { print(x); })` ended in `abort()`
+  there.
+- **In the compiler itself**, the assignment check found
+  `comptime_eval.fd`'s layout helper assigning a `Vec<EnumDef>` to the
+  lowerer's `(name, EnumDef)` table; fixed.
+
 ## Release tracks D and F/G (Nov 15, 2026)
 
 Uncommitted at the time of writing; checked on one-stage builds (the -O2

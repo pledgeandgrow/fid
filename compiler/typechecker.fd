@@ -14544,8 +14544,16 @@ fn TypeChecker_check_str_cast(self: &mut TypeChecker, e: Expr, src: Type, dst: T
     }
     match dst {
         Type::Str => {
-            if tc_cast_makes_raw_str(src) {
-                TypeChecker_require_unsafe(self, "casting " + type_to_str(src) + " to str");
+            if tc_cast_makes_raw_str(self, src) {
+                var src_text: str = type_to_str(src);
+                match e {
+                    Expr::IntLit(_) => {
+                        src_text = "an integer";
+                    }
+                    _ => {
+                    }
+                }
+                TypeChecker_require_unsafe(self, "casting " + src_text + " to str");
             }
         }
         _ => {
@@ -14553,25 +14561,128 @@ fn TypeChecker_check_str_cast(self: &mut TypeChecker, e: Expr, src: Type, dst: T
     }
 }
 
-/// Whether `x as str` with x of type `src` makes a str out of a raw word: an
-/// integer or a raw pointer. A str (or a borrowed one), an unknown type and
-/// an error type do not.
-fn tc_cast_makes_raw_str(src: Type) -> bool {
+/// Whether `x as str` with x of type `src` makes a str out of a raw word: a
+/// number (an integer of any width, a float: a literal is typed by its size,
+/// so `5 as str` has src i8) or a raw pointer. A str (or a borrowed one), an
+/// unknown type and an error type do not.
+fn tc_cast_makes_raw_str(self: &TypeChecker, src: Type) -> bool {
+    if TypeChecker_is_integer(self, src) || TypeChecker_is_float(self, src) {
+        return true;
+    }
     match src {
-        Type::I64 => {
-            return true;
-        }
-        Type::I32 => {
-            return true;
-        }
-        Type::U64 => {
-            return true;
-        }
-        Type::U32 => {
-            return true;
-        }
         Type::RawPtr(_, _) => {
             return true;
+        }
+        _ => {
+        }
+    }
+    return false;
+}
+
+/// `x as T` between types that have no conversion (reference §4.6). What the
+/// cast makes from a word is then read without `unsafe` as what it is not: a
+/// reference (`128 as &i64`, `p as &T`: `*r` of a reference is not checked),
+/// a str (TypeChecker_check_str_cast), or a struct, an enum, a collection, a
+/// tuple, an array or a tensor (`7 as Vec<i64>`: a push writes through the
+/// word). Each needs `unsafe`, as making a pointer from an integer without a
+/// cast does (types_compatible). What stays allowed in safe code: the numeric
+/// conversions; str, a reference or a pointer to an integer; a reference to a
+/// raw pointer; an integer to a raw pointer (it cannot be read or written
+/// without `unsafe`); any value to `dyn`; a struct, enum, collection, tuple,
+/// array or function to an integer (its handle); a cast to the value's own
+/// type. What is not known yet (inferred, a type parameter, `!`) is not
+/// checked: the compiler's own modules and the trusted base are not either
+/// (tc_module_needs_unsafe).
+fn TypeChecker_check_cast(self: &mut TypeChecker, e: Expr, src: Type, dst: Type) {
+    if !tc_module_needs_unsafe(self.current_module) || self.unsafe_depth > 0 {
+        return;
+    }
+    if tc_cast_type_unknown(src) || tc_cast_type_unknown(dst) {
+        return;
+    }
+    // A literal is typed by its size (`5` is an i8): the message says what
+    // the value is
+    var src_text: str = type_to_str(src);
+    match e {
+        Expr::IntLit(_) => {
+            src_text = "an integer";
+        }
+        _ => {
+        }
+    }
+    // A reference made from anything that is not one
+    match dst {
+        Type::Ref(_, _) => {
+            match src {
+                Type::Ref(_, _) => {
+                    return;
+                }
+                _ => {
+                    TypeChecker_require_unsafe(self, "casting " + src_text + " to " + type_to_str(dst));
+                    return;
+                }
+            }
+        }
+        _ => {
+        }
+    }
+    // A struct, enum, collection, tuple, array or tensor made from a value
+    // that is not already one of its own type
+    if tc_cast_dst_is_value(self, dst) && !TypeChecker_types_compatible(self, dst, src) {
+        TypeChecker_require_unsafe(self, "casting " + src_text + " to " + type_to_str(dst));
+    }
+}
+
+/// A type the cast rule cannot reason about yet.
+fn tc_cast_type_unknown(t: Type) -> bool {
+    match t {
+        Type::Infer => {
+            return true;
+        }
+        Type::Never => {
+            return true;
+        }
+        Type::Void => {
+            return true;
+        }
+        Type::Assoc(_, _, _, _) => {
+            return true;
+        }
+        Type::Dyn(_) => {
+            return true;
+        }
+        _ => {
+        }
+    }
+    return false;
+}
+
+/// What is held as a value of its own (not a word that converts): a struct, an
+/// enum, a generic instance (Vec, HashMap, Box, Rc, Arc, Option, Result, a
+/// user's), a tuple, an array, a shaped tensor. A type parameter is not: a
+/// cast to one says nothing until the function is instantiated.
+fn tc_cast_dst_is_value(self: &TypeChecker, t: Type) -> bool {
+    match t {
+        Type::Generic(_, _) => {
+            return true;
+        }
+        Type::Tuple(_) => {
+            return true;
+        }
+        Type::Array(_, _) => {
+            return true;
+        }
+        Type::ArrayConst(_, _) => {
+            return true;
+        }
+        Type::ShapedTensor(_, _) => {
+            return true;
+        }
+        Type::Named(n) => {
+            if tc_str_vec_contains(self.current_type_params, n) {
+                return false;
+            }
+            return TypeChecker_shares_repr(self, t);
         }
         _ => {
         }
@@ -14709,6 +14820,72 @@ fn tc_comptime_fold(e: Expr) -> Expr {
 
 /// src/typechecker.rs check_value_fits: a value given to an integer type
 /// must fit it.
+/// Whether an `Rc<T>` or an `Arc<T>` can hold a `T` today: a number or a
+/// bool, as one word (lower.fd Lowerer_lower_rc_new). A type not known yet
+/// (inferred, a type parameter, `!`) is not decided here.
+fn TypeChecker_rc_holds(self: &TypeChecker, t: Type) -> bool {
+    if tc_int_bits(t) > 0 {
+        return true;
+    }
+    match t {
+        Type::F32 => {
+            return true;
+        }
+        Type::F64 => {
+            return true;
+        }
+        Type::Bool => {
+            return true;
+        }
+        Type::Infer => {
+            return true;
+        }
+        Type::Never => {
+            return true;
+        }
+        Type::Assoc(_, _, _, _) => {
+            return true;
+        }
+        Type::Dyn(_) => {
+            return true;
+        }
+        Type::Named(n) => {
+            return tc_str_vec_contains(self.current_type_params, n);
+        }
+        _ => {
+        }
+    }
+    return false;
+}
+
+/// `x = e` (reference §3.4): e has x's type, as a declaration's initialiser
+/// has the declared type. Before, an assignment checked only that an integer
+/// literal fit, so `var s: str = "a"; s = 42;` was accepted and failed at run
+/// time. The runtime layer keeps its handle pairs, as a declaration does.
+fn TypeChecker_check_assign_type(self: &mut TypeChecker, declared: Type, actual: Type, name: str, line: i64) {
+    if TypeChecker_types_compatible(self, declared, actual) {
+        return;
+    }
+    if TypeChecker_is_integer(self, declared) && TypeChecker_is_integer(self, actual) {
+        return;
+    }
+    // `x = b` with b a Box<T> and x a T that is held as the address of its
+    // data (a struct or an enum): the Box is that address, as `*b` reads it
+    match actual {
+        Type::Generic(ban, bargs) => {
+            if ban == "Box" && bargs.len() == 1 && TypeChecker_shares_repr(self, TypeChecker_resolve_type(self, declared)) && TypeChecker_types_compatible(self, declared, bargs.get(0)) {
+                return;
+            }
+        }
+        _ => {
+        }
+    }
+    if is_runtime_layer(self.current_module) && is_handle_int_pair(declared, actual) {
+        return;
+    }
+    self.errors.push("Type error (line " + int_to_str(line) + "): cannot assign " + type_to_str(actual) + " to variable '" + name + "' of type " + type_to_str(declared) + "." + "\n    Expected: " + type_to_str(declared) + "\n    Found:    " + type_to_str(actual) + "\n    Fix: change the type annotation or the expression.");
+}
+
 fn TypeChecker_check_value_fits(self: &mut TypeChecker, declared0: Type, actual0: Type, expr: Expr, line: i64) {
     var declared: Type = TypeChecker_resolve_type(self, declared0);
     var bits: i64 = tc_int_bits(declared);
@@ -14869,6 +15046,39 @@ fn tc_const_args_differ(a: Type, b: Type) -> bool {
     return false;
 }
 
+/// Two instances of one of Vec, HashMap, Rc and Arc (reference §3.3): the same
+/// type when each pair of type arguments is (by types_compatible). A side that
+/// names no arguments is a type that does not name them (`Vec`), and
+/// `HashMap<str, i64>` is what `HashMap::new()` is typed where no declared type
+/// says otherwise: each stands for any instance of its type. Two other
+/// instances with different arguments are different types. Before, any two
+/// instances were compatible, so a `Vec<str>` passed as a `Vec<i64>`
+/// type-checked and its words were read as integers.
+fn tc_collection_instances_compatible(self: &TypeChecker, name: str, a: Vec<Type>, b: Vec<Type>) -> bool {
+    if a.len() == 0 || b.len() == 0 {
+        return true;
+    }
+    if name == "HashMap" && b.len() == 2 && tc_is_default_hashmap_args(b) {
+        return true;
+    }
+    if a.len() != b.len() {
+        return false;
+    }
+    var i: i64 = 0;
+    while i < a.len() {
+        if !TypeChecker_types_compatible(self, a.get(i), b.get(i)) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// `<str, i64>`: the type arguments of `HashMap::new()` with no declared type.
+fn tc_is_default_hashmap_args(args: Vec<Type>) -> bool {
+    return type_eq(args.get(0), Type::Str) && type_eq(args.get(1), Type::I64);
+}
+
 pub fn TypeChecker_types_compatible(self: &TypeChecker, declared: Type, actual: Type) -> bool {
     var decl: Type = TypeChecker_resolve_type(self, declared);
     var act: Type = TypeChecker_resolve_type(self, actual);
@@ -14970,16 +15180,16 @@ pub fn TypeChecker_types_compatible(self: &TypeChecker, declared: Type, actual: 
         _ => {
         }
     }
-    // Vec<T> and HashMap<K,V> are opaque -- any two instantiations compatible
+    // Two instances of Vec, HashMap, Rc or Arc are the same type only when
+    // their type arguments are: a `Vec<str>` read as a `Vec<i64>` printed
+    // addresses and freed words as strings. What names no arguments stands
+    // for any instance (tc_collection_instances_compatible).
     match decl {
-        Type::Generic(dn, _) => {
+        Type::Generic(dn, dargs) => {
             match act {
-                Type::Generic(an, _) => {
-                    if (dn == "Vec" && an == "Vec") || (dn == "HashMap" && an == "HashMap") {
-                        return true;
-                    }
-                    if (dn == "Rc" && an == "Rc") || (dn == "Arc" && an == "Arc") {
-                        return true;
+                Type::Generic(an, aargs) => {
+                    if (dn == "Vec" && an == "Vec") || (dn == "HashMap" && an == "HashMap") || (dn == "Rc" && an == "Rc") || (dn == "Arc" && an == "Arc") {
+                        return tc_collection_instances_compatible(self, dn, dargs, aargs);
                     }
                 }
                 _ => {
@@ -19474,6 +19684,9 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
             self.uninit_vars = tc_uninit_join(uninit_after_then, tc_stmts_diverge(then_block), self.uninit_vars.clone(), else_leaves);
         }
         Stmt::Assign(target, cl10_aop, expr, line) => {
+            // An assignment to a by-value Vec, HashMap or struct parameter
+            // changes it as an index or a field assignment does (reference §5.3)
+            TypeChecker_check_param_change(self, target);
             // CL10: `x += e` on a struct is `x = x + e` (its operator method,
             // or a unit's dimension rule): the result must fit x
             var assigned_ty: Type = TypeChecker_check_expr(self, TypeChecker_compound_struct_expr(self, target, cl10_aop, expr));
@@ -19483,6 +19696,7 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
             match TypeChecker_lookup(self, target) {
                 OptType::Some(target_ty) => {
                     TypeChecker_check_value_fits(self, target_ty, assigned_ty, expr, line);
+                    TypeChecker_check_assign_type(self, target_ty, assigned_ty, target, line);
                 }
                 OptType::None => {
                     // txn { } rolls back the function's local variables
@@ -19508,6 +19722,14 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
                             }
                             OptType::None => {
                             }
+                        }
+                    }
+                    // A global's value has its declared type, as a local's has
+                    match TypeChecker_lookup_global_cache(self, target) {
+                        OptType::Some(asg_gty) => {
+                            TypeChecker_check_assign_type(self, asg_gty, assigned_ty, target, line);
+                        }
+                        OptType::None => {
                         }
                     }
                 }
@@ -19893,7 +20115,11 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
                 // Bind pattern variables
                 match arm.pattern {
                     Pattern::Ident(name) => {
-                        TypeChecker_declare(self, name, match_ty);
+                        // `None =>` on an Option is the variant, as `Some(x)`
+                        // is (reference §6): it binds nothing
+                        if !TypeChecker_bare_pattern_is_unit_variant(self, match_ty, name) {
+                            TypeChecker_declare(self, name, match_ty);
+                        }
                     }
                     Pattern::EnumVariant(enum_name, variant, bindings) => {
                         TypeChecker_check_enum_pattern(self, match_ty, enum_name, variant, bindings);
@@ -21895,6 +22121,7 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
             }
             // (out of line: this function's C is at zig cc's size limit)
             TypeChecker_check_str_cast(self, box_expr_unbox(e), cast_src, cast_dst);
+            TypeChecker_check_cast(self, box_expr_unbox(e), cast_src, cast_dst);
             return cast_dst;
         }
         Expr::Asm(_, operands) => {
@@ -22137,13 +22364,14 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
 // --- check_method_call ---------------------------------------------------
 
 // 2g.66: `map`, `filter`, `for_each`, `fold`, `any`, `all`, `find` and
-// `position` on a Vec are not builtins: stdlib/vec.fd's `impl Vec` defines
-// them. Without `use vec;` they type-checked, then `fid run` panicked with
-// "Unknown function 'Vec_map'" (and the C compiler stopped on an undeclared
-// `Vec_map`). They pass every element and result as a 64-bit word in an
-// integer register, so an element or a function result that is a float, a
-// struct or an enum is not carried either. Reports the error and returns
-// false when the call cannot run.
+// `position` on a Vec are not builtins: core's `impl Vec` defines them (the
+// prelude, reference §13.3; they were stdlib/vec.fd's, and a call without
+// `use vec;` type-checked, then `fid run` panicked with "Unknown function
+// 'Vec_map'"). stdlib/vec.fd's `impl Vec` defines the other names below, so
+// those need `use vec;`. They all pass every element and result as a 64-bit
+// word in an integer register, so an element or a function result that is a
+// float, a struct or an enum is not carried either. Reports the error and
+// returns false when the call cannot run.
 fn TypeChecker_vec_lib_method_ok(self: &mut TypeChecker, method: str, elem_ty: Type, arg_types: Vec<Type>) -> bool {
     var lib: bool = method == "map" || method == "filter" || method == "for_each" || method == "fold" || method == "any" || method == "all" || method == "find" || method == "position" || method == "find_opt" || method == "position_opt" || method == "take" || method == "skip" || method == "zip" || method == "enumerate" || method == "flat_map" || method == "chunk" || method == "window" || method == "dedup" || method == "sort_by" || method == "contains_val";
     if !lib {
@@ -22383,28 +22611,37 @@ pub fn TypeChecker_check_method_call(self: &mut TypeChecker, receiver: Expr, met
             if self.region_budgets.len() > 0 && str_len(name) > 0 && str_byte_at(name, 0) >= 65 && str_byte_at(name, 0) <= 90 && !TypeChecker_is_local_var(self, name) {
                 TypeChecker_budget_call(self, name + "_" + method, args);
             }
-            if name == "Box" && method == "new" {
+            if (name == "Box" || name == "Rc" || name == "Arc") && method == "new" {
                 if args.len() > 0 {
-                    var arg_ty: Type = TypeChecker_check_expr(self, args.get(0));
+                    // The declared element type says what the argument is
+                    // (`val b: Box<i64> = Box::new(41)`); a literal that
+                    // names no type is an i64 (reference §7.2)
+                    var bn_hint: Type = Type::Never;
+                    match hint {
+                        Type::Generic(bhn, bhargs) => {
+                            if bhn == name && bhargs.len() == 1 {
+                                bn_hint = bhargs.get(0);
+                            }
+                        }
+                        _ => {
+                        }
+                    }
+                    var arg_ty: Type = TypeChecker_check_expr_with_hint(self, args.get(0), bn_hint);
+                    // ... the rule is for a call that names no type: a
+                    // declared `Box<i8>` keeps its literal an i8
+                    if type_eq(bn_hint, Type::Never) && tc_int_bits(arg_ty) > 0 && tc_int_bits(arg_ty) < 64 && tc_is_constant_expr(args.get(0)) {
+                        arg_ty = Type::I64;
+                    }
                     var box_args: Vec<Type> = Vec::new();
                     box_args.push(arg_ty);
-                    return Type::Generic("Box", box_args);
-                }
-            }
-            if name == "Rc" && method == "new" {
-                if args.len() > 0 {
-                    var arg_ty: Type = TypeChecker_check_expr(self, args.get(0));
-                    var rc_args: Vec<Type> = Vec::new();
-                    rc_args.push(arg_ty);
-                    return Type::Generic("Rc", rc_args);
-                }
-            }
-            if name == "Arc" && method == "new" {
-                if args.len() > 0 {
-                    var arg_ty: Type = TypeChecker_check_expr(self, args.get(0));
-                    var arc_args: Vec<Type> = Vec::new();
-                    arc_args.push(arg_ty);
-                    return Type::Generic("Arc", arc_args);
+                    // An Rc or an Arc holds a number or a bool, as one word.
+                    // Anything else needs a counted cell that owns what it
+                    // holds (known-bugs OW4): before, `Rc::new` of a struct
+                    // lowered to another function and did not build
+                    if (name == "Rc" || name == "Arc") && !TypeChecker_rc_holds(self, arg_ty) {
+                        self.errors.push("Type error (line " + int_to_str(self.current_line) + "): " + name + "<T> holds a number or a bool, as one word: not a " + type_to_str(arg_ty) + ".\n    Fix: hold an integer, or share the value with the rc module of the standard library (`use rc;`, `rc_new`).");
+                    }
+                    return Type::Generic(name, box_args);
                 }
             }
             if name == "Vec" && method == "new" {
@@ -23370,6 +23607,48 @@ pub fn TypeChecker_check_method_call(self: &mut TypeChecker, receiver: Expr, met
         }
     }
     return Type::Never;
+}
+
+// A bare name in a match arm that is a unit variant of the scrutinee's enum
+// (`None =>` on an `Option`) is that variant, as `Some(x)` is (reference
+// §6; the exhaustiveness check reads it so, known-bugs 2g.7). Before, the
+// binding declared it a variable that matched every value: with `None =>`
+// written first, the arms after it could never run, and nothing said so.
+// Any other bare name binds the value. What is not an enum of the program
+// (a type parameter, an unknown type) decides nothing here.
+pub fn TypeChecker_bare_pattern_is_unit_variant(self: &TypeChecker, match_ty: Type, name: str) -> bool {
+    var ename: str = "";
+    match match_ty {
+        Type::Named(n) => {
+            ename = n;
+        }
+        Type::Generic(n, _) => {
+            ename = n;
+        }
+        _ => {
+            return false;
+        }
+    }
+    ename = TypeChecker_resolve_struct_name(self, ename);
+    if str_len(ename) == 0 {
+        return false;
+    }
+    var ei: i64 = 0;
+    while ei < self.enum_variants.len() {
+        if self.enum_variants.get(ei).key == ename {
+            var variants: Vec<EnumVariantEntry> = self.enum_variants.get(ei).val;
+            var vi: i64 = 0;
+            while vi < variants.len() {
+                if variants.get(vi).name == name {
+                    return variants.get(vi).payload_types.len() == 0;
+                }
+                vi = vi + 1;
+            }
+            return false;
+        }
+        ei = ei + 1;
+    }
+    return false;
 }
 
 // --- resolve_pattern_enum -------------------------------------------------
@@ -26118,7 +26397,11 @@ fn TypeChecker_check_match_value(self: &mut TypeChecker, expr: Expr, arms: Vec<M
         TypeChecker_push_scope(self);
         match arm.pattern {
             Pattern::Ident(name) => {
-                TypeChecker_declare(self, name, match_ty);
+                // `None =>` on an Option is the variant, as `Some(x)` is
+                // (reference §6): it binds nothing
+                if !TypeChecker_bare_pattern_is_unit_variant(self, match_ty, name) {
+                    TypeChecker_declare(self, name, match_ty);
+                }
             }
             Pattern::EnumVariant(enum_name, variant, bindings) => {
                 TypeChecker_check_enum_pattern(self, match_ty, enum_name, variant, bindings);

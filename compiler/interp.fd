@@ -835,6 +835,15 @@ pub fn interp_narrow_int(i: i64, bits: i64, want_signed: bool) -> i64 {
     return t;
 }
 
+/// A number slot type (a local's, a parameter's, a field's): an integer, a
+/// float or a bool.
+pub fn interp_scalar_ty(t: IrType) -> bool {
+    if ir_type_is_int(t) || ir_type_is_float(t) {
+        return true;
+    }
+    return ir_type_eq(t, IrType::Bool);
+}
+
 /// An f64 as the program's text: "NaN", "inf" and "-inf" as the native
 /// runtimes print them (stdlib/pe_runtime/base.fd), any other value as
 /// float_to_str. The C runtime's formatting divided an infinity by 10
@@ -2212,6 +2221,20 @@ pub fn Interpreter_run_function(self: &mut Interpreter, func: IrFunction, args: 
                     }
                 }
             }
+            // An integer passed where an f64 or f32 parameter is declared is
+            // the number (`half(5)`), as the compiled backends convert it
+            Value::Int(piv) => {
+                match param.ty {
+                    IrType::F64 => {
+                        pval = Value::Float(piv as f64);
+                    }
+                    IrType::F32 => {
+                        pval = Value::Float(interp_round_f32(piv as f64));
+                    }
+                    _ => {
+                    }
+                }
+            }
             _ => {
             }
         }
@@ -3129,6 +3152,13 @@ pub fn Interpreter_execute_inst(self: &mut Interpreter, inst: Inst, inst_id: i64
             }
             if is_deref_store && has_pointee {
                 sty = pointee_ty;
+            } else if has_pointee && interp_scalar_ty(pointee_ty) {
+                // A number slot is written as its own type, as an assignment
+                // in C converts to the destination. Before, the write took
+                // the value's width: an i8 of -5 widened to an i64 read 251
+                // (one byte written into an 8-byte slot), and an i64 stored
+                // into an i8 slot wrote over 7 bytes past it
+                sty = pointee_ty;
             }
             if is_opaque {
                 // Opaque-typed slots always use the side table (and byte
@@ -3204,6 +3234,14 @@ pub fn Interpreter_execute_inst(self: &mut Interpreter, inst: Inst, inst_id: i64
                         }
                         IrType::U32 => {
                             Memory_store_i32(&mut self.memory, addr, iv);
+                        }
+                        // An integer written to a float slot is the number
+                        // (`val x: f64 = 3`), as the compiled backends read it
+                        IrType::F64 => {
+                            Memory_store_f64(&mut self.memory, addr, iv as f64);
+                        }
+                        IrType::F32 => {
+                            Memory_store_f32(&mut self.memory, addr, iv as f64);
                         }
                         _ => {
                             Memory_store_i64(&mut self.memory, addr, iv);

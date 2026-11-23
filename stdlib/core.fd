@@ -1124,6 +1124,133 @@ pub fn Box_drop_t(b: i64, tid: i64) {
     p_free(b - 8);
 }
 
+// Rc<T> and Arc<T> (reference §13.3; lower.fd Lowerer_lower_rc_new): the
+// handle is the address of a block [count, value] that holds T's word. An Rc
+// counts plainly (its copies stay on one thread); an Arc counts with atomic
+// operations, so its copies may be shared between threads. Nothing drops a
+// handle by itself: `drop` does, once per copy (`clone` makes one).
+
+/// `Rc::new(x)`: the block [1, x], and its address.
+pub fn Rc_new(val: i64) -> i64 {
+    var h: i64 = p_malloc(16);
+    var pc: *mut i64 = h as * mut i64;
+    var pv: *mut i64 = (h + 8) as * mut i64;
+    // SAFETY: the two words of the block p_malloc just returned.
+    unsafe {
+        *pc = 1;
+        *pv = val;
+    }
+    return h;
+}
+
+/// One more owner of the block; the same handle.
+pub fn Rc_clone(h: i64) -> i64 {
+    if h != 0 {
+        var pc: *mut i64 = h as * mut i64;
+        // SAFETY: h is a block Rc_new made, or 0.
+        unsafe {
+            *pc = *pc + 1;
+        }
+    }
+    return h;
+}
+
+/// The word the block holds.
+pub fn Rc_get(h: i64) -> i64 {
+    var out: i64 = 0;
+    if h != 0 {
+        var pv: *mut i64 = (h + 8) as * mut i64;
+        // SAFETY: h is a block Rc_new made.
+        unsafe {
+            out = *pv;
+        }
+    }
+    return out;
+}
+
+/// How many handles share the block (0 for no handle).
+pub fn Rc_count(h: i64) -> i64 {
+    if h == 0 {
+        return 0;
+    }
+    var pc: *mut i64 = h as * mut i64;
+    var n: i64 = 0;
+    // SAFETY: h is a block Rc_new made.
+    unsafe {
+        n = *pc;
+    }
+    return n;
+}
+
+/// One owner fewer; the last one frees the block.
+pub fn Rc_drop(h: i64) {
+    if h == 0 {
+        return;
+    }
+    var pc: *mut i64 = h as * mut i64;
+    var n: i64 = 0;
+    // SAFETY: h is a block Rc_new made.
+    unsafe {
+        *pc = *pc - 1;
+        n = *pc;
+    }
+    if n <= 0 {
+        // SAFETY: the count reached 0: no handle shares the block now, and
+        // p_malloc made it.
+        unsafe {
+            p_free(h);
+        }
+    }
+}
+
+/// `Arc::new(x)`: the block [1, x], and its address.
+pub fn Arc_new(val: i64) -> i64 {
+    var h: i64 = p_malloc(16);
+    p_atomic_store(h, 1);
+    var pv: *mut i64 = (h + 8) as * mut i64;
+    // SAFETY: the second word of the block p_malloc just returned.
+    unsafe {
+        *pv = val;
+    }
+    return h;
+}
+
+/// One more owner of the block, counted atomically; the same handle.
+pub fn Arc_clone(h: i64) -> i64 {
+    if h != 0 {
+        p_atomic_add(h, 1);
+    }
+    return h;
+}
+
+/// The word the block holds.
+pub fn Arc_get(h: i64) -> i64 {
+    return Rc_get(h);
+}
+
+/// How many handles share the block, read atomically (0 for no handle).
+pub fn Arc_count(h: i64) -> i64 {
+    if h == 0 {
+        return 0;
+    }
+    return p_atomic_load(h);
+}
+
+/// One owner fewer, counted atomically; the last one frees the block.
+pub fn Arc_drop(h: i64) {
+    if h == 0 {
+        return;
+    }
+    var old: i64 = p_atomic_sub(h, 1);
+    if old <= 1 {
+        // SAFETY: the atomic count reached 0: no handle shares the block
+        // now, and p_malloc made it.
+        unsafe {
+            p_free(h);
+        }
+    }
+}
+
 // Structs in a Vec's buffer (release D15): element code 16 + words - 1
 // (vec_esz), elements reached by address (vec_ld gives it, vec_st copies
 // one in). The lowering puts a struct into a Vec through Vec_push_mem,
@@ -2942,6 +3069,10 @@ pub fn Vec_capacity(v: i64) -> i64 {
 }
 
 pub fn Vec_contains(v: i64, value: i64) -> bool {
+    // A Vec that owns its elements as strings compares their text: two equal
+    // strings are not one address (before, a literal compared equal to
+    // itself only where the backend gives both the same address)
+    var strs: bool = vec_tid(v) == P_TID_STR;
     if vec_code(v) != 0 {
         var cn: i64 = Vec_len(v);
         var ci: i64 = 0;
@@ -2977,7 +3108,7 @@ pub fn Vec_contains(v: i64, value: i64) -> bool {
         unsafe {
             elem = *ptr;
         }
-        if elem == value {
+        if elem == value || (strs && p_str_equal(elem, value)) {
             return true;
         }
         i = i + 1;
@@ -3427,7 +3558,10 @@ pub fn Vec_to_str(v: i64) -> str {
         data = *data_ptr_ptr;
     }
 
-    // Build string: "[1, 2, 3]"
+    // Build string: "[1, 2, 3]". The element type says how each is shown: a
+    // string as its text, a Vec as its list (before, each was shown as its
+    // address); anything else as a number.
+    var vtid: i64 = vec_tid(v);
     var result: str = "[";
     var i: i64 = 0;
     while i < len {
@@ -3441,7 +3575,13 @@ pub fn Vec_to_str(v: i64) -> str {
         unsafe {
             elem = *ptr;
         }
-        result = result + p_to_str(elem);
+        if vtid == P_TID_STR && elem != 0 {
+            result = p_str_concat(result, elem);
+        } else if vtid == P_TID_VEC && elem != 0 {
+            result = result + Vec_to_str(elem);
+        } else {
+            result = result + p_to_str(elem);
+        }
         i = i + 1;
     }
     result = result + "]";
@@ -6124,8 +6264,13 @@ pub fn HashMap_to_str(m: i64) -> str {
         var value: i64 = HashMap_get(m, key);
         result = p_str_concat(result, key);
         result = result + ": ";
-        // Value is an i64 — format as number
-        result = result + p_to_str(value);
+        // A value the map owns as a string is shown as text (before, every
+        // value was shown as a number)
+        if hm_vtid(m) == P_TID_STR && value != 0 {
+            result = p_str_concat(result, value);
+        } else {
+            result = result + p_to_str(value);
+        }
         i = i + 1;
     }
     result = result + "}";
@@ -7197,6 +7342,127 @@ pub fn String_bytes(s: i64) -> i64 {
 pub struct StringBuilder {
     handle: i64,
     len: i64,
+}
+
+/// The closure methods of Vec that reference §13.3 names (map, filter,
+/// for_each, fold, any, all, find, position), in the prelude so they exist
+/// without `use vec;` (the rest of them are stdlib/vec.fd's). Each element
+/// and each result travels as one 64-bit word: an integer, a bool, a
+/// string's address, a handle.
+impl Vec {
+    // Map: apply a function to each element, return new Vec of results
+    // Usage: value doubled = v.map(double);
+    //        value squares = v.map(fn(x: i64) { x * x });
+    pub fn map(self: Vec<i64>, f: fn(i64) -> i64) -> Vec<i64> {
+        var result: Vec<i64> = Vec::new();
+        var i: i64 = 0;
+        var n: i64 = self.len();
+        while i < n {
+            var x: i64 = self.get(i);
+            var y: i64 = f(x);
+            result.push(y);
+            i = i + 1;
+        }
+        return result;
+    }
+
+    // Filter: keep only elements where predicate returns true
+    // Usage: value evens = v.filter(fn(x: i64) { x % 2 == 0 });
+    pub fn filter(self: Vec<i64>, pred: fn(i64) -> bool) -> Vec<i64> {
+        var result: Vec<i64> = Vec::new();
+        var i: i64 = 0;
+        var n: i64 = self.len();
+        while i < n {
+            var x: i64 = self.get(i);
+            if pred(x) {
+                result.push(x);
+            }
+            i = i + 1;
+        }
+        return result;
+    }
+
+    // For each: apply a function to each element (side effects only)
+    // Usage: v.for_each(fn(x: i64) { print(x); });
+    pub fn for_each(self: Vec<i64>, f: fn(i64) -> void) -> void {
+        var i: i64 = 0;
+        var n: i64 = self.len();
+        while i < n {
+            var x: i64 = self.get(i);
+            f(x);
+            i = i + 1;
+        }
+    }
+
+    // Fold/reduce: accumulate a result by applying f to each element
+    // Usage: value sum = v.fold(0, fn(acc: i64, x: i64) { acc + x });
+    pub fn fold(self: Vec<i64>, init: i64, f: fn(i64, i64) -> i64) -> i64 {
+        var acc: i64 = init;
+        var i: i64 = 0;
+        var n: i64 = self.len();
+        while i < n {
+            var x: i64 = self.get(i);
+            acc = f(acc, x);
+            i = i + 1;
+        }
+        return acc;
+    }
+
+    // Any: returns true if any element satisfies the predicate
+    pub fn any(self: Vec<i64>, pred: fn(i64) -> bool) -> bool {
+        var i: i64 = 0;
+        var n: i64 = self.len();
+        while i < n {
+            var x: i64 = self.get(i);
+            if pred(x) {
+                return true;
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    // All: returns true if all elements satisfy the predicate
+    pub fn all(self: Vec<i64>, pred: fn(i64) -> bool) -> bool {
+        var i: i64 = 0;
+        var n: i64 = self.len();
+        while i < n {
+            var x: i64 = self.get(i);
+            if !pred(x) {
+                return false;
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    // Find: returns the first element satisfying the predicate, or -1
+    pub fn find(self: Vec<i64>, pred: fn(i64) -> bool) -> i64 {
+        var i: i64 = 0;
+        var n: i64 = self.len();
+        while i < n {
+            var x: i64 = self.get(i);
+            if pred(x) {
+                return x;
+            }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    // Index of first element satisfying predicate, or -1
+    pub fn position(self: Vec<i64>, pred: fn(i64) -> bool) -> i64 {
+        var i: i64 = 0;
+        var n: i64 = self.len();
+        while i < n {
+            var x: i64 = self.get(i);
+            if pred(x) {
+                return i;
+            }
+            i = i + 1;
+        }
+        return -1;
+    }
 }
 
 impl StringBuilder {
