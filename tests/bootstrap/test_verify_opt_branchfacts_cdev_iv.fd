@@ -1,0 +1,122 @@
+// VF5, three passes of compiler/iropt.fd that had no fail-if-wrong test of
+// their own: branchfacts (the outcome of a branch's condition as a fact in
+// the blocks an edge leads to), closuredevirt (a CallPtr whose closure
+// environment is provably one function made a direct call) and more iv
+// (induction variables) cases beside test_verify_opt_dse_sccp_iv. Each
+// case prints a value a wrong pass changes:
+//   branchfacts  a comparison's truth on the true edge only — the fact must
+//                not hold on the other edge, and for floats `!(a < b)`
+//                does NOT give `a >= b` (a NaN makes both false)
+//   closuredevirt  a closure kept in a variable and called later must run
+//                its own body with its own captured values, not another's
+//   iv           a counter's value after a strided loop, an address made
+//                from the counter inside it, and a doubly nested loop's
+//                counts
+//
+// Expected output:
+// 12 121
+// 123 3
+// 1607
+// 3612 3 3
+// 129
+
+fn facts(x: i64) -> i64 {
+    var r: i64 = 0;
+    if x > 10 {
+        // the true edge holds x > 10: a read of x <= 10 here is wrong
+        if x <= 10 {
+            r = r + 100;
+        }
+        r = r + 1;
+    } else {
+        // the false edge holds !(x > 10): x > 10 cannot be true here
+        if x > 10 {
+            r = r + 1000;
+        }
+        r = r + 2;
+    }
+    if x == 7 {
+        // x == 7 is a fact in this arm
+        if x != 7 {
+            r = r + 10000;
+        }
+        r = r + 10;
+    }
+    return r;
+}
+
+fn nan_cmp(a: f64) -> i64 {
+    // `!(a < 1.0)` must not become `a >= 1.0`: when a is NaN every ordered
+    // comparison is false, so the else arm runs but a >= 1.0 stays false
+    if a < 1.0 {
+        return 1;
+    }
+    if a >= 1.0 {
+        return 2;
+    }
+    return 3;
+}
+
+fn apply(v: i64, f: fn(i64) -> i64) -> i64 {
+    return f(v);
+}
+
+fn kept_closures() -> i64 {
+    // two closures kept in variables: each call must reach its own body
+    val add_ten: fn(i64) -> i64 = fn(x: i64) -> i64 { return x + 10; };
+    val times_two: fn(i64) -> i64 = fn(x: i64) -> i64 { return x * 2; };
+    val one: i64 = apply(5, add_ten);
+    val two: i64 = apply(5, times_two);
+    // a third one, made in an if arm and called after the join: its env
+    // holds the arm's capture, not the other arm's
+    var pick: fn(i64) -> i64 = add_ten;
+    val flag: bool = one > two;
+    if flag {
+        pick = fn(x: i64) -> i64 { return x - 1; };
+    }
+    return one * 100 + two * 10 + pick(8);
+}
+
+fn strided(n: i64) -> i64 {
+    // the counter's value after the loop: i = 0,3,6,9 — ends past n
+    var i: i64 = 0;
+    var s: i64 = 0;
+    while i < n {
+        s = s + i * 2;
+        i = i + 3;
+    }
+    return s * 100 + i;
+}
+
+fn nested(a: i64, b: i64) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < a {
+        var j: i64 = i;
+        while j < b {
+            s = s + i * 10 + j;
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return s;
+}
+
+fn main() -> i64 {
+    // branchfacts: facts(20) takes the true edge (0+1=1), facts(5) the
+    // false one (0+2=2); facts(7) adds 10 for the == arm (12)
+    println(int_to_str(facts(20) * 10 + facts(5)) + " " + int_to_str(facts(7) * 10 + facts(20)));
+    // NaN: nan_cmp must answer 3 for a NaN, not 2 (123 = 1*100+2*10+3)
+    val z: f64 = 0.0;
+    val nan: f64 = z / z;
+    println(int_to_str(nan_cmp(0.5) * 100 + nan_cmp(5.0) * 10 + nan_cmp(nan)) + " " + int_to_str(nan_cmp(nan)));
+    // closuredevirt: 15*100 + 10*10 + 7 = 1607
+    println(kept_closures());
+    // iv: strided(10) visits i = 0,3,6,9 (s = 36) and ends at 12 -> 3612;
+    // strided(2) visits 0 (s = 0) and ends at 3 -> 3; strided(1) the same
+    println(int_to_str(strided(10)) + " " + int_to_str(strided(2)) + " " + int_to_str(strided(1)));
+    // nested(3,5): i=0 gives 0+1+2+3+4 = 10, i=1 gives 11+12+13+14 = 50,
+    // i=2 gives 22+23+24 = 69 -> 129
+    println(nested(3, 5));
+    return 0;
+}

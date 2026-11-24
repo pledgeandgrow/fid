@@ -1,0 +1,71 @@
+// Bugs roadmap BG148: the C runtime's p_mutex_lock was a bare pthread
+// mutex, which belongs to a thread, not to a task. Tasks of one thread
+// that hold it across task_sleep both entered it on Windows (a
+// CRITICAL_SECTION is recursive: the section interleaved, the total came
+// out 5) and the second deadlocked on Linux. Now (compiler/codegen_c.fd
+// __p_mutex_t) the lock is a flag with its holder under a short internal
+// mutex: a task that finds it held gives its turn until it is free.
+//   - three async fn holders, each 5 x lock / load / sleep / store / unlock;
+//   - the same with task_go tasks and task_run.
+// One worker (one cooperative scheduler per thread);
+// test_mutex_tasks_mn.fd runs it with four. C only: the interpreter's
+// mutex does not exclude its tasks either (prints 5) and the native
+// Windows build of task_go holders hangs with one worker.
+//@ env: FIDES_WORKERS=1
+//@ backends: ccompile
+//
+// Expected output:
+// 6
+// 15
+// 15
+use task;
+
+var M: i64 = 0;
+var TOTAL: i64 = 0;
+
+async fn holder(m: i64, total: i64, id: i64) -> Future<i64> {
+    var i: i64 = 0;
+    while i < 5 {
+        p_mutex_lock(m);
+        val v = p_atomic_load(total);
+        task_sleep(2);
+        p_atomic_store(total, v + 1);
+        p_mutex_unlock(m);
+        i = i + 1;
+    }
+    return id;
+}
+
+fn go_holder(id: i64) -> i64 {
+    var i: i64 = 0;
+    while i < 5 {
+        p_mutex_lock(M);
+        val v = p_atomic_load(TOTAL);
+        task_sleep(2);
+        p_atomic_store(TOTAL, v + 1);
+        p_mutex_unlock(M);
+        i = i + 1;
+    }
+    return id;
+}
+
+fn main() -> i64 {
+    val m = p_mutex_init();
+    val total = p_shared_alloc(8);
+    p_atomic_store(total, 0);
+    val a = holder(m, total, 1);
+    val b = holder(m, total, 2);
+    val c = holder(m, total, 3);
+    println(await a + await b + await c);
+    println(p_atomic_load(total));
+
+    M = p_mutex_init();
+    TOTAL = p_shared_alloc(8);
+    p_atomic_store(TOTAL, 0);
+    task_go("go_holder", 1);
+    task_go("go_holder", 2);
+    task_go("go_holder", 3);
+    task_run();
+    println(p_atomic_load(TOTAL));
+    return 0;
+}

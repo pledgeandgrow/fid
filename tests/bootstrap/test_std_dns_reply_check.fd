@@ -1,0 +1,127 @@
+// BG147 / BG221 (Nov 24): stdlib/dns accepts only the reply to the query it
+// sent, with no network: crafted replies fed to dns_parse_reply and
+// dns_parse_records. Rejected: a wrong ID, QR=0 (a query), NXDOMAIN, no
+// question, another question name or type, an answer about another name;
+// accepted: the right reply (name in other case, CNAME chain followed, an
+// answer outside the chain and one of another type left out). The random
+// query ID, a fully qualified name's trailing dot, and a label over 63
+// bytes (rejected, not cut) in dns_build_query.
+//
+// Expected output:
+// ids differ: true
+// fqdn: 29 bytes, ends 0 0 1 0 1
+// long label: 0 bytes
+// empty label: 0 bytes
+// good: 2 records 93.184.216.34 1.2.3.4
+// good upper case: 2
+// wrong id: 0
+// qr=0: 0
+// nxdomain: 0
+// no question: 0
+// other name: 0
+// other type: 0
+// spoof (review packet): 0
+// records only, foreign owner: 0
+use dns;
+use vec;
+use string;
+
+fn push_hex(v: &mut Vec<i64>, h: str) {
+    var i: i64 = 0;
+    while i + 1 < str_len(h) {
+        v.push(hexval(str_byte_at(h, i)) * 16 + hexval(str_byte_at(h, i + 1)));
+        i = i + 2;
+    }
+}
+
+fn hexval(c: i64) -> i64 {
+    if c >= 48 && c <= 57 { return c - 48; }
+    return c - 97 + 10;
+}
+
+fn to_buf(v: &Vec<i64>) -> i64 {
+    var buf: i64 = 0;
+    unsafe {
+        buf = p_malloc(v.len() + 1);
+        var i: i64 = 0;
+        while i < v.len() {
+            p_volatile_store8(buf + i, v.get(i));
+            i = i + 1;
+        }
+    }
+    return buf;
+}
+
+// The A answers dns_parse_reply finds in the reply `hex` to query 0x1234
+// for `name`, qtype A.
+fn reply_count(hex: str, name: str, qtype: i64) -> i64 {
+    var p: Vec<i64> = Vec::new();
+    push_hex(&mut p, hex);
+    val buf: i64 = to_buf(&p);
+    val recs: Vec<DnsRecord> = dns_parse_reply(buf, p.len(), 0x1234, name, qtype);
+    unsafe { p_free(buf); }
+    return recs.len();
+}
+
+fn main() -> i64 {
+    // a random ID per query: 16 queries never all share one ID
+    val q0: Vec<i64> = dns_build_query("example.com", 1);
+    var differ: bool = false;
+    var t: i64 = 0;
+    while t < 16 {
+        val q1: Vec<i64> = dns_build_query("example.com", 1);
+        if q1.get(0) != q0.get(0) || q1.get(1) != q0.get(1) { differ = true; }
+        t = t + 1;
+    }
+    println("ids differ: " + bool_to_str(differ));
+    val fq: Vec<i64> = dns_build_query("example.com.", 1);
+    println("fqdn: " + int_to_str(fq.len()) + " bytes, ends " + int_to_str(fq.get(24)) + " " + int_to_str(fq.get(25))
+        + " " + int_to_str(fq.get(26)) + " " + int_to_str(fq.get(27)) + " " + int_to_str(fq.get(28)));
+    var long: str = "";
+    var k: i64 = 0;
+    while k < 64 { long = long + "x"; k = k + 1; }
+    println("long label: " + int_to_str(dns_build_query(long + ".io", 1).len()) + " bytes");
+    println("empty label: " + int_to_str(dns_build_query("a..io", 1).len()) + " bytes");
+
+    // header id 1234, flags 8180 (response, RD, RA, NOERROR), 1 question
+    val qsec: str = "076578616d706c6503636f6d0000010001";
+    // CNAME example.com -> www.example.com, A www 93.184.216.34,
+    // A evil.com 6.6.6.6 (not in the chain), AAAA example.com, A example.com 1.2.3.4
+    val ans: str = "c00c0005000100000e10000603777777c00c"
+        + "c0290001000100000e1000045db8d822"
+        + "046576696c03636f6d000001000100000e10000406060606"
+        + "c00c001c000100000e1000102606280002200001024818932" + "5c81946"
+        + "c00c0001000100000e10000401020304";
+    var good: Vec<i64> = Vec::new();
+    push_hex(&mut good, "123481800001000500000000" + qsec + ans);
+    val gbuf: i64 = to_buf(&good);
+    val recs: Vec<DnsRecord> = dns_parse_reply(gbuf, good.len(), 0x1234, "example.com", 1);
+    var line: str = "good: " + int_to_str(recs.len()) + " records";
+    var i: i64 = 0;
+    while i < recs.len() {
+        line = line + " " + recs.get(i).addr;
+        i = i + 1;
+    }
+    println(line);
+    unsafe { p_free(gbuf); }
+    println("good upper case: " + int_to_str(reply_count("123481800001000500000000" + qsec + ans, "EXAMPLE.com.", 1)));
+    println("wrong id: " + int_to_str(reply_count("123581800001000500000000" + qsec + ans, "example.com", 1)));
+    println("qr=0: " + int_to_str(reply_count("123401800001000500000000" + qsec + ans, "example.com", 1)));
+    println("nxdomain: " + int_to_str(reply_count("123481830001000500000000" + qsec + ans, "example.com", 1)));
+    println("no question: " + int_to_str(reply_count("123481800000000100000000" + "076578616d706c6503636f6d00000100010000003c00040a000001", "example.com", 1)));
+    println("other name: " + int_to_str(reply_count("123481800001000100000000" + "046576696c03636f6d0000010001" + "c00c0001000100000e10000406060606", "example.com", 1)));
+    println("other type: " + int_to_str(reply_count("123481800001000500000000" + "076578616d706c6503636f6d00001c0001" + ans, "example.com", 1)));
+    // the review's packet: id 0x1234, QR=0, NXDOMAIN, no question, `evil A 6.6.6.6`
+    var sp: Vec<i64> = Vec::new();
+    push_hex(&mut sp, "123400030000000100000000" + "046576696c00" + "00010001" + "0000003c" + "0004" + "06060606");
+    val sbuf: i64 = to_buf(&sp);
+    println("spoof (review packet): " + int_to_str(dns_parse_response(sbuf, sp.len()).len()));
+    unsafe { p_free(sbuf); }
+    // dns_parse_records alone: a response whose only answer is about another name
+    var fo: Vec<i64> = Vec::new();
+    push_hex(&mut fo, "123481800001000100000000" + qsec + "046576696c03636f6d000001000100000e10000406060606");
+    val fbuf: i64 = to_buf(&fo);
+    println("records only, foreign owner: " + int_to_str(dns_parse_records(fbuf, fo.len()).len()));
+    unsafe { p_free(fbuf); }
+    return 0;
+}

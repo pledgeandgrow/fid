@@ -13,7 +13,7 @@ FID=${FID:-release/fid.exe}
 P=tests/projects/co9_crash/crash.fd
 # relative paths: Git Bash would rewrite a /tmp path given to a Windows
 # program, and the program then names another spelling of it
-D=$(mktemp -d ./_co9_check.XXXXXX)
+D=$(mktemp -d ./tests/_co9_check.XXXXXX)
 D=${D#./}
 trap 'rm -rf "$D"' EXIT
 R="$D/r.txt"

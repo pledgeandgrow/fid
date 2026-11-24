@@ -548,6 +548,48 @@ fn wf_bits(g: &mut WasmGen, is32: bool) {
     }
 }
 
+/// BG137: push value `id` as an f32 (is32) or an f64, converted from its
+/// own float type when that is the other width (f32.demote_f64 /
+/// f64.promote_f32); a value whose type is not a float is taken as an
+/// f32 when `dflt32`
+fn wget_fx(g: &mut WasmGen, func: &IrFunction, id: i64, is32: bool, dflt32: bool) {
+    var t: IrType = wg_meta_ty(func, id);
+    var own32: bool = dflt32;
+    if ir_type_eq(t, IrType::F64) {
+        own32 = false;
+    } else if ir_type_eq(t, IrType::F32) {
+        own32 = true;
+    }
+    wget_f(g, id, own32);
+    if is32 && !own32 {
+        w(g, 0xB6);
+    } else if !is32 && own32 {
+        w(g, 0xBB);
+    }
+}
+
+/// BG137: push value `id` as the bits an f32 place holds: an f64 value
+/// (lowering leaves `0.1` an f64 ConstFloat where the target is f32)
+/// demoted, any other as it is. Its low 4 bytes were stored before.
+fn wget_f32bits(g: &mut WasmGen, func: &IrFunction, id: i64) {
+    if ir_type_eq(wg_meta_ty(func, id), IrType::F64) {
+        wget_f(g, id, false);
+        w(g, 0xB6);
+        wf_bits(g, true);
+        return;
+    }
+    wget(g, id);
+}
+
+/// BG137: a float operation mixing f32 and f64 among its operand types and
+/// its float type: computed in f64 (C's usual arithmetic conversions, as
+/// nat_ir's ng_float_mixed), an f32 result narrowed.
+fn wg_float_mixed(lty: IrType, rty: IrType, fty: IrType) -> bool {
+    var has32: bool = ir_type_eq(lty, IrType::F32) || ir_type_eq(rty, IrType::F32) || ir_type_eq(fty, IrType::F32);
+    var has64: bool = ir_type_eq(lty, IrType::F64) || ir_type_eq(rty, IrType::F64) || ir_type_eq(fty, IrType::F64);
+    return has32 && has64;
+}
+
 // ─── Names: functions, types, strings, globals ─────────────────────────
 
 /// Parameter count of primitive `name` (written here in WASM), -1 if none.
@@ -772,15 +814,26 @@ fn wg_data_align(g: &mut WasmGen) {
     }
 }
 
-/// The address of string constant `s` (its bytes and a NUL, 8-aligned)
+/// The address of string constant `s` (its bytes and a NUL, 8-aligned).
+/// BG167: [P_STR_STATIC][len] in front of the bytes, as nat_ir, pe_ir and
+/// the C string table lay a literal out (AGENTS.md Known Bug 25): core's
+/// strict Str_drop/Str_dup panic on a str without a string header, and the
+/// length comes from the literal (a zero byte inside it is kept)
 fn wg_str(g: &mut WasmGen, s: str) -> i64 {
     if HashMap_contains(g.str_addr, s) {
         return HashMap_get(g.str_addr, s);
     }
     wg_data_align(g);
-    var a: i64 = WG_DATA_BASE + g.data.len();
-    HashMap_insert(g.str_addr, s, a);
     var n: i64 = str_len(s);
+    var hi: i64 = 0;
+    while hi < 16 {
+        g.data.push(0);
+        hi = hi + 1;
+    }
+    var a: i64 = WG_DATA_BASE + g.data.len();
+    wg_data_word(g, a - 16, 0x4649444553545202);
+    wg_data_word(g, a - 8, n);
+    HashMap_insert(g.str_addr, s, a);
     var i: i64 = 0;
     while i < n {
         g.data.push(str_byte_at(s, i) & 0xFF);
@@ -1315,6 +1368,10 @@ fn wg_is_process_call(g: &WasmGen, name: str) -> bool {
     return false;
 }
 
+/// BG137: wg_f32_arg_mask of the call wg_gen_call is generating (set and
+/// cleared around it by wg_gen_inst)
+var g_wg_f32_args: i64 = 0;
+
 fn wg_gen_call(g: &mut WasmGen, id: i64, call_name: str, args: Vec<i64>, func: &IrFunction) {
     // An f64 lives in its local as its bits: these copy the word
     if (call_name == "p_f64_to_bits" || call_name == "p_f64_from_bits") && args.len() == 1 {
@@ -1479,9 +1536,93 @@ fn wg_gen_call(g: &mut WasmGen, id: i64, call_name: str, args: Vec<i64>, func: &
         wi64(g, 0);
         n = n + 1;
     }
-    wg_push_srcs(g, &args);
+    if g_wg_f32_args != 0 {
+        // BG137: args[k] demoted when bit k is set
+        var ak: i64 = 0;
+        while ak < args.len() {
+            if ak < 63 && ((g_wg_f32_args >> ak) & 1) != 0 {
+                wget_f32bits(g, func, args.get(ak));
+            } else {
+                wget(g, args.get(ak));
+            }
+            ak = ak + 1;
+        }
+    } else {
+        wg_push_srcs(g, &args);
+    }
     wg_call_named(g, resolved, n);
     wset(g, id);
+}
+
+/// BG137: the arguments of `Call(call_name, args)` (bit k: args[k]) that
+/// are f64 values the callee takes as f32: an f32 parameter of a program
+/// function, the element of Vec_push / Vec_set / Vec_insert on a Vec<f32>
+/// (nat_ir's ng_f32_arg_mask). Zero when there is none.
+fn wg_f32_arg_mask(func: &IrFunction, module: &IrModule, call_name: str, args: Vec<i64>) -> i64 {
+    var na: i64 = args.len();
+    var any: bool = false;
+    var k: i64 = 0;
+    while k < na && k < 63 {
+        if ir_type_eq(wg_meta_ty(func, args.get(k)), IrType::F64) {
+            any = true;
+        }
+        k = k + 1;
+    }
+    if !any {
+        return 0;
+    }
+    var mask: i64 = 0;
+    var vec_ix: i64 = 0 - 1;
+    if (call_name == "Vec_push" || call_name == "p_vec_push") && na >= 2 {
+        vec_ix = na - 2;
+    }
+    if (call_name == "Vec_set" || call_name == "Vec_insert" || call_name == "p_vec_set" || call_name == "p_vec_insert") && na >= 3 {
+        vec_ix = na - 3;
+    }
+    if vec_ix >= 0 {
+        if wg_vec_f32_typed(func, args.get(vec_ix)) && ir_type_eq(wg_meta_ty(func, args.get(na - 1)), IrType::F64) && na - 1 < 63 {
+            mask = 1 << (na - 1);
+        }
+        return mask;
+    }
+    var pos: i64 = IrModule_fn_pos(module, call_name);
+    if pos < 0 {
+        return 0;
+    }
+    var params: Vec<ValueIdType> = module.functions.get(pos).func.params;
+    if params.len() != na {
+        return 0;
+    }
+    k = 0;
+    while k < na && k < 63 {
+        if ir_type_eq(params.get(k).ty, IrType::F32) && ir_type_eq(wg_meta_ty(func, args.get(k)), IrType::F64) {
+            mask = mask | (1 << k);
+        }
+        k = k + 1;
+    }
+    return mask;
+}
+
+/// BG137: value v's static type is Vec<f32> (or a pointer to one).
+fn wg_vec_f32_typed(func: &IrFunction, v: i64) -> bool {
+    var t: IrType = wg_meta_ty(func, v);
+    match t {
+        IrType::Ptr(inner) => {
+            t = box_ir_type_unbox(inner);
+        }
+        _ => {
+        }
+    }
+    match t {
+        IrType::Generic(n, targs) => {
+            if n == "Vec" && targs.len() == 1 {
+                return ir_type_eq(targs.get(0), IrType::F32);
+            }
+        }
+        _ => {
+        }
+    }
+    return false;
 }
 
 // ─── Integer arithmetic (nat_ir's meaning) ─────────────────────────────
@@ -1695,6 +1836,15 @@ fn wg_gen_binop(g: &mut WasmGen, id: i64, op: BinOp, left: i64, right: i64, ty: 
     }
     if is_float {
         var is32: bool = ir_type_eq(float_ty, IrType::F32);
+        // BG137: f32 with f64 (`a * 2.0`, a: f32: the literal is an f64)
+        // in f64, the f32 result narrowed (f32 operations read the f64's
+        // low 32 bits: 0)
+        var mixed: bool = wg_float_mixed(lty, rty, float_ty);
+        var narrow_res: bool = false;
+        if mixed {
+            narrow_res = is32;
+            is32 = false;
+        }
         var arith: i64 = 0;
         var cc: i64 = 0 - 1;
         match op {
@@ -1737,10 +1887,20 @@ fn wg_gen_binop(g: &mut WasmGen, id: i64, op: BinOp, left: i64, right: i64, ty: 
                 // while a / b's integer part is exact (2g.13; it gave 0).
                 // A zero b or an infinite a gives NaN, as fmod does; an
                 // infinite b gives NaN where fmod gives a.
-                wget(g, left);
-                wlset(g, g.t0);
-                wget(g, right);
-                wlset(g, g.t1);
+                if mixed {
+                    // BG137: both as f64 bits
+                    wget_fx(g, func, left, false, narrow_res);
+                    wf_bits(g, false);
+                    wlset(g, g.t0);
+                    wget_fx(g, func, right, false, narrow_res);
+                    wf_bits(g, false);
+                    wlset(g, g.t1);
+                } else {
+                    wget(g, left);
+                    wlset(g, g.t0);
+                    wget(g, right);
+                    wlset(g, g.t1);
+                }
                 wlget_f(g, g.t0, is32);
                 wlget_f(g, g.t0, is32);
                 wlget_f(g, g.t1, is32);
@@ -1761,7 +1921,12 @@ fn wg_gen_binop(g: &mut WasmGen, id: i64, op: BinOp, left: i64, right: i64, ty: 
                     w(g, 0xA1);
                 }
                 // f.mul, f.sub
-                wf_bits(g, is32);
+                if narrow_res {
+                    w(g, 0xB6);
+                    wf_bits(g, true);
+                } else {
+                    wf_bits(g, is32);
+                }
                 wset(g, id);
                 return;
             }
@@ -1773,15 +1938,26 @@ fn wg_gen_binop(g: &mut WasmGen, id: i64, op: BinOp, left: i64, right: i64, ty: 
             wset(g, id);
             return;
         }
-        wget_f(g, left, is32);
-        wget_f(g, right, is32);
+        if mixed {
+            wget_fx(g, func, left, false, narrow_res);
+            wget_fx(g, func, right, false, narrow_res);
+        } else {
+            wget_f(g, left, is32);
+            wget_f(g, right, is32);
+        }
         if arith != 0 {
             if is32 {
                 w(g, arith - 14);
             } else {
                 w(g, arith);
             }
-            wf_bits(g, is32);
+            if narrow_res {
+                // f32.demote_f64
+                w(g, 0xB6);
+                wf_bits(g, true);
+            } else {
+                wf_bits(g, is32);
+            }
         } else {
             wg_fcmp(g, cc, is32);
         }
@@ -2128,7 +2304,13 @@ fn wg_gen_inst(g: &mut WasmGen, id: i64, inst: Inst, last: bool, func: &IrFuncti
                 w(g, 0);
             } else {
                 wget_addr(g, ptr);
-                wget(g, value);
+                if ir_type_eq(store_ty, IrType::F32) {
+                    // BG137: an f64 into an f32 place converted, as C's
+                    // `*(float*)p = d`
+                    wget_f32bits(g, func, value);
+                } else {
+                    wget(g, value);
+                }
                 wstore(g, sz, 0);
             }
         }
@@ -2244,7 +2426,12 @@ fn wg_gen_inst(g: &mut WasmGen, id: i64, inst: Inst, last: bool, func: &IrFuncti
         Inst::Return(ret) => {
             match ret {
                 OptValueId::Some(v) => {
-                    wget(g, v);
+                    if ir_type_eq(func.ret_ty, IrType::F32) {
+                        // BG137: `return 2.5;` from an f32 function
+                        wget_f32bits(g, func, v);
+                    } else {
+                        wget(g, v);
+                    }
                 }
                 OptValueId::None => {
                     wi64(g, 0);
@@ -2257,7 +2444,11 @@ fn wg_gen_inst(g: &mut WasmGen, id: i64, inst: Inst, last: bool, func: &IrFuncti
             w(g, 0x00);
         }
         Inst::Call(call_name, args, _, _) => {
+            // BG137: f64 arguments of f32 parameters and Vec<f32> elements
+            // demoted as they are passed (wg_gen_call)
+            g_wg_f32_args = wg_f32_arg_mask(func, module, call_name, args);
             wg_gen_call(g, id, call_name, args, func);
+            g_wg_f32_args = 0;
         }
         Inst::CallPtr(fn_ptr, args, cp_ret, _, _) => {
             // A closure: its environment, whose word 0 is the function. A
@@ -2371,6 +2562,38 @@ fn wg_gen_inst(g: &mut WasmGen, id: i64, inst: Inst, last: bool, func: &IrFuncti
                 wf_bits(g, true);
             } else {
                 wget(g, value);
+                if ir_type_is_int(from) && ir_type_is_int(to) && ir_type_size(to) < 8 {
+                    // BG168: a same-width cast between signed and unsigned
+                    // (`65535 as u16 as i16`) re-extends the word for the
+                    // new type, as pe_ir's peir_norm_narrow does (BG38): a
+                    // signed one sign-extended (i64.extend8/16/32_s), an
+                    // unsigned one zero-extended (i64.and with the mask)
+                    match to {
+                        IrType::I8 => {
+                            w(g, 0xC2);
+                        }
+                        IrType::I16 => {
+                            w(g, 0xC3);
+                        }
+                        IrType::I32 => {
+                            w(g, 0xC4);
+                        }
+                        IrType::U8 => {
+                            wi64(g, 0xFF);
+                            w(g, 0x83);
+                        }
+                        IrType::U16 => {
+                            wi64(g, 0xFFFF);
+                            w(g, 0x83);
+                        }
+                        IrType::U32 => {
+                            wi64(g, 0xFFFFFFFF);
+                            w(g, 0x83);
+                        }
+                        _ => {
+                        }
+                    }
+                }
             }
             wset(g, id);
         }
@@ -2423,13 +2646,23 @@ fn wg_gen_inst(g: &mut WasmGen, id: i64, inst: Inst, last: bool, func: &IrFuncti
             }
             wset(g, id);
         }
-        Inst::IntToFloat(value, _, to) => {
+        Inst::IntToFloat(value, i2f_from, to) => {
+            // BG136: a u64 source converts unsigned (f32/f64.convert_i64_u)
+            var i2f_u: bool = ir_type_eq(i2f_from, IrType::U64);
             wget(g, value);
             if ir_type_eq(to, IrType::F32) {
-                w(g, 0xB4);
+                if i2f_u {
+                    w(g, 0xB5);
+                } else {
+                    w(g, 0xB4);
+                }
                 wf_bits(g, true);
             } else {
-                w(g, 0xB9);
+                if i2f_u {
+                    w(g, 0xBA);
+                } else {
+                    w(g, 0xB9);
+                }
                 wf_bits(g, false);
             }
             wset(g, id);

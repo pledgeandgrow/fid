@@ -628,23 +628,128 @@ fn hc_hex(s: str) -> i64 {
     return n;
 }
 
-/// A chunked body, or "" when it breaks off or passes the limit.
-fn hc_chunked(c: i64, timeout_ms: i64) -> str {
+/// Wait until a whole line is in the buffer; false when the input ends, an
+/// error or a timeout comes first, or the line passes HTTP_MAX_HEAD
+/// (hc_line gives "" for those and for an empty line alike).
+fn hc_wait_line(c: i64, timeout_ms: i64) -> bool {
+    while hc_find_line(c, 0) < 0 {
+        if hc_get(c, 4) - hc_get(c, 5) > HTTP_MAX_HEAD || hc_fill(c, timeout_ms) <= 0 {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn hc_is_hex(b: i64) -> bool {
+    return (b >= 48 && b <= 57) || (b >= 97 && b <= 102) || (b >= 65 && b <= 70);
+}
+
+/// The size on a chunk-size line (RFC 9112 §7.1: hex digits, then
+/// extensions after `;`), -1 when the line does not start with one.
+fn hc_chunk_size(line: str) -> i64 {
+    val n: i64 = str_len(line);
+    var i: i64 = 0;
+    while i < n && hc_is_hex(str_byte_at(line, i)) {
+        i = i + 1;
+    }
+    if i == 0 {
+        return -1;
+    }
+    if i < n {
+        val b: i64 = str_byte_at(line, i);
+        if b != 59 && b != 32 && b != 9 {
+            return -1;
+        }
+    }
+    return hc_hex(line);
+}
+
+/// A body read off a connection; `ok` is false when the message is broken.
+struct HcBody {
+    ok: bool,
+    body: str,
+}
+
+/// A chunked body. Not `ok` when it breaks off (end of input, an error or a
+/// timeout before the last chunk and the empty line: BG214), when a size
+/// line is not a hex number or chunk data is not followed by CRLF (BG177),
+/// or when it passes the limit.
+fn hc_chunked(c: i64, timeout_ms: i64) -> HcBody {
     var body: str = "";
     while true {
-        val size: i64 = hc_hex(hc_line(c, timeout_ms));
+        if !hc_wait_line(c, timeout_ms) {
+            return HcBody {
+                ok: false, body: ""
+            };
+        }
+        val size: i64 = hc_chunk_size(hc_line(c, timeout_ms));
+        if size < 0 || str_len(body) + size > HTTP_MAX_BODY {
+            return HcBody {
+                ok: false, body: ""
+            };
+        }
         if size == 0 {
             break;
         }
-        if size < 0 || str_len(body) + size > HTTP_MAX_BODY {
-            return "";
+        val part: str = hc_take(c, size, timeout_ms);
+        if str_len(part) != size || hc_take(c, 2, timeout_ms) != "\r\n" {
+            return HcBody {
+                ok: false, body: ""
+            };
         }
-        body = body + hc_take(c, size, timeout_ms);
-        hc_line(c, timeout_ms);
+        body = body + part;
     }  // Trailers, then the empty line
-    while hc_line(c, timeout_ms) != "" {
+    while true {
+        if !hc_wait_line(c, timeout_ms) {
+            return HcBody {
+                ok: false, body: ""
+            };
+        }
+        if hc_line(c, timeout_ms) == "" {
+            break;
+        }
     }
-    return body;
+    return HcBody {
+        ok: true, body: body
+    };
+}
+
+/// The value of a Content-Length header: -1 unless it is one or more digits
+/// and nothing else (a sign, a space, a list), HTTP_MAX_BODY + 1 when it is
+/// larger than HTTP_MAX_BODY, however many digits (BG176: str_parse_int
+/// panicked on 20 of them; RFC 9112 §6.3).
+fn hs_content_length(s: str) -> i64 {
+    val n: i64 = str_len(s);
+    if n == 0 {
+        return -1;
+    }
+    var v: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        val b: i64 = str_byte_at(s, i);
+        if b < 48 || b > 57 {
+            return -1;
+        }
+        if v <= HTTP_MAX_BODY {
+            v = v * 10 + (b - 48);
+        }
+        i = i + 1;
+    }
+    if v > HTTP_MAX_BODY {
+        return HTTP_MAX_BODY + 1;
+    }
+    return v;
+}
+
+/// Mark a message that cannot be read: `method` "" (the connection is
+/// closed), `target` the status to answer a request with ("" for none).
+fn http_fail(msg: &mut HttpRequest, status: i64) {
+    msg.method = "";
+    msg.target = "";
+    if status > 0 {
+        msg.target = int_to_str(status);
+    }
+    msg.body = "";
 }
 
 /// A response body that runs until the connection closes.
@@ -656,8 +761,12 @@ fn hc_to_end(c: i64, timeout_ms: i64) -> str {
 }
 
 /// Read a head and its body off the connection. `method` is "" at the end of the
-/// input, on a timeout, or when the message is too large. A response with no
-/// length reads to the end when `to_end` is set.
+/// input, on a timeout, when the message is too large, when a request's body
+/// breaks off, or when its framing is not valid (RFC 9112 §6: differing
+/// Content-Length headers, a Content-Length that is not a number, a
+/// Transfer-Encoding other than one `chunked`, both in a request, a broken
+/// chunk); `target` is then the status to answer with (400, 413) or "". A
+/// response with no length reads to the end when `to_end` is set.
 pub fn http_read_message(c: i64, timeout_ms: i64, to_end: bool) -> HttpRequest {
     var at: i64 = hc_find_head(c);
     while at < 0 {
@@ -671,17 +780,70 @@ pub fn http_read_message(c: i64, timeout_ms: i64, to_end: bool) -> HttpRequest {
     // `head` is dropped by its variable (proposal 0004); freeing it here as
     // well left the drop reading a freed header (VF16)
     var msg: HttpRequest = http_parse_head(head);
-    val len: str = http_header(msg, "content-length");
-    if hs_same(http_header(msg, "transfer-encoding"), "chunked") {
-        msg.body = hc_chunked(c, timeout_ms);
-    } else if len != "" {
-        val n: i64 = str_parse_int(len);
+    if msg.method == "" {
+        return msg;
+    }
+    // BG177: the framing headers, all of them (http_header gives the first
+    // only, so a second Content-Length went unseen and the rest of the body
+    // was read as the next request)
+    val request: bool = !str_starts_with(msg.method, "HTTP/");
+    var len: str = "";
+    var lens: i64 = 0;
+    var tes: i64 = 0;
+    var chunked: bool = false;
+    var bad: bool = false;
+    var hi: i64 = 0;
+    while hi < msg.names.len() {
+        if hs_same(msg.names.get(hi), "content-length") {
+            if lens > 0 && msg.vals.get(hi) != len {
+                bad = true;
+            }
+            len = msg.vals.get(hi);
+            lens = lens + 1;
+        } else if hs_same(msg.names.get(hi), "transfer-encoding") {
+            chunked = hs_same(msg.vals.get(hi), "chunked");
+            tes = tes + 1;
+        }
+        hi = hi + 1;
+    }
+    // A coding other than `chunked` alone cannot be framed here (RFC 9112
+    // §6.1: a request with one gets 400); a request with both headers is
+    // refused too (§6.3: a sender must not send both)
+    if tes > 1 || (tes == 1 && !chunked) || (request && tes > 0 && lens > 0) {
+        bad = true;
+    }
+    if bad {
+        http_fail(&mut msg, 400);
+        return msg;
+    }
+    if tes == 1 {
+        val b: HcBody = hc_chunked(c, timeout_ms);
+        if !b.ok {
+            // BG214: a broken or cut-off body is no request; a response
+            // keeps its head with an empty body, as before
+            if request {
+                http_fail(&mut msg, 400);
+                return msg;
+            }
+        }
+        msg.body = b.body;
+    } else if lens > 0 {
+        val n: i64 = hs_content_length(len);
+        if n < 0 {
+            http_fail(&mut msg, 400);
+            return msg;
+        }
         if n > HTTP_MAX_BODY {
-            msg.method = "";
+            http_fail(&mut msg, 413);
             return msg;
         }
         if n > 0 {
             msg.body = hc_take(c, n, timeout_ms);
+            // BG214: hc_take gives "" when the input ends first
+            if request && str_len(msg.body) != n {
+                http_fail(&mut msg, 0);
+                return msg;
+            }
         }
     } else if to_end {
         msg.body = hc_to_end(c, timeout_ms);
@@ -818,6 +980,12 @@ pub fn http_conn_task(c: i64) -> i64 {
         }
         val req: HttpRequest = http_read_message(c, idle, false);
         if req.method == "" {
+            // BG177: a request whose framing is broken or too large is
+            // answered (400, 413) before the connection closes
+            if req.target != "" {
+                val code: i64 = str_parse_int(req.target);
+                http_conn_write(c, build_response_headers(code, "text/plain", "Connection: close\r\n", status_text(code) + "\n"));
+            }
             break;
         }
         val keep: bool = http_keep_alive(req);

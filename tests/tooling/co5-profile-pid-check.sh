@@ -12,7 +12,7 @@ FID=${FID:-release/fid.exe}
 P=tests/projects/co5_service/service.fd
 # relative paths: Git Bash would rewrite a /tmp path given to a Windows
 # program
-D=$(mktemp -d ./_co5_check.XXXXXX)
+D=$(mktemp -d ./tests/_co5_check.XXXXXX)
 D=${D#./}
 SVC=""
 OTHER=""

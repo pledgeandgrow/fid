@@ -42,7 +42,7 @@ left=$(grep -ln '0\.8\.0-unstable' compiler/*.fd 2>/dev/null)
 if [ -z "$left" ]; then ok "no 0.8.0-unstable literal in compiler/"; else bad "0.8.0-unstable still in: $left"; fi
 
 # --- scripts/build-info.sh on a copy ------------------------------------------
-D=$(mktemp -d ./_n12_check.XXXXXX)
+D=$(mktemp -d ./tests/_n12_check.XXXXXX)
 D=${D#./}
 trap 'rm -rf "$D"' EXIT
 mkdir -p "$D/compiler"

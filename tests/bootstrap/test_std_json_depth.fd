@@ -1,0 +1,37 @@
+// Bugs roadmap BG178: stdlib/json.fd's validator (j_scan_val_n,
+// j_scan_arr_n, j_scan_obj_n, under json_is_valid and every *_safe
+// accessor) recursed with no depth limit: 16 million `[` (a body
+// HTTP_MAX_BODY allows) overflowed the C stack, and about 333 already hit
+// the interpreter's 1000-frame limit. Arrays and objects nested deeper than
+// JSON_MAX_DEPTH (512, as json_index) are now malformed, and a level costs
+// one frame, so the limit is reached first under `fid run` too.
+//
+// Expected output:
+// 512 arr true
+// 513 arr false
+// 512 obj true
+// 513 obj false
+// mixed true
+// bad false
+// deep type error
+// deep valid false
+// ok type array
+// index 513 false
+use json;
+
+fn nest(open: str, close: str, k: i64) -> str {
+    return str_repeat(open, k) + str_repeat(close, k);
+}
+
+fn main() {
+    println("512 arr " + bool_to_str(json_is_valid(nest("[", "]", 512))));
+    println("513 arr " + bool_to_str(json_is_valid(nest("[", "]", 513))));
+    println("512 obj " + bool_to_str(json_is_valid(str_repeat("{\"a\":", 511) + "{}" + str_repeat("}", 511))));
+    println("513 obj " + bool_to_str(json_is_valid(str_repeat("{\"a\": ", 512) + "{ }" + str_repeat("}", 512))));
+    println("mixed " + bool_to_str(json_is_valid("{\"a\": [1, {\"b\": [true, null, \"x\"]}, -2.5e3], \"c\": {}}")));
+    println("bad " + bool_to_str(json_is_valid("[1, {\"b\": ]}")));
+    println("deep type " + json_type_safe(str_repeat("[", 100000)));
+    println("deep valid " + bool_to_str(json_is_valid(str_repeat("[{\"k\":", 50000))));
+    println("ok type " + json_type_safe(nest("[", "]", 400)));
+    println("index 513 " + bool_to_str(json_index(nest("[", "]", 513)).ok));
+}

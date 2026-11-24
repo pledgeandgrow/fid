@@ -20,17 +20,54 @@ use string;
 use net;
 // ─── Packet construction ────────────────────────────────────────────────
 
-// Query id — monotonic-ish per process (random is fine for matching).
+// BG147 (Nov 24): a fresh random query ID per query, from the operating
+// system's random source (was the constant 24817: any reply carrying it
+// was taken as the answer, so a spoofed one needed no guessing).
 fn dns_qid() -> i64 {
-    return 24817;
+    return p_os_random_u64() & 65535;
 }
 
-/// Build a DNS query packet for `hostname` (A record by default).
+/// Build a DNS query packet for `hostname` (A record by default), with a
+/// random query ID (bytes 0 and 1 of the packet).
 /// qtype: 1=A, 28=AAAA, 5=CNAME, 15=MX, 16=TXT.
-/// Returns a Vec<i64> of bytes.
+/// Returns a Vec<i64> of bytes; empty when `hostname` is not a valid name.
 pub fn dns_build_query(hostname: str, qtype: i64) -> Vec {
+    return dns_build_query_id(hostname, qtype, dns_qid());
+}
+
+/// `hostname` as the reply names it: lower case, without the trailing dot
+/// of a fully qualified name.
+fn dns_norm_name(hostname: str) -> str {
+    var name: str = hostname;
+    if str_ends_with(name, ".") {
+        name = str_slice(name, 0, str_len(name) - 1);
+    }
+    return str_to_lower(name);
+}
+
+/// dns_build_query with the query ID `id` (0..65535) given. BG221 (Nov 24):
+/// a fully qualified name's trailing dot ends the name (it was sent as an
+/// empty label, which ended the name early and shifted QTYPE/QCLASS); an
+/// empty label, a label over 63 bytes or a name over 253 bytes gives an
+/// empty Vec (a long label was cut to 63 bytes: another name was asked).
+pub fn dns_build_query_id(hostname: str, qtype: i64, id: i64) -> Vec {
     var q: Vec = Vec::new();
-    var id: i64 = dns_qid();
+    var name: str = hostname;
+    if str_ends_with(name, ".") {
+        name = str_slice(name, 0, str_len(name) - 1);
+    }
+    if str_len(name) == 0 || str_len(name) > 253 {
+        return q;
+    }
+    var labels: Vec = str_split(name, ".");
+    var li: i64 = 0;
+    while li < labels.len() {
+        var ll: i64 = str_len(labels.get(li));
+        if ll == 0 || ll > 63 {
+            return q;
+        }
+        li = li + 1;
+    }
     q.push((id >> 8) & 255);
     q.push(id & 255);
     // ID
@@ -49,14 +86,10 @@ pub fn dns_build_query(hostname: str, qtype: i64) -> Vec {
     q.push(0);
     q.push(0);
     // ARCOUNT
-    // QNAME: labels
-    var labels: Vec = str_split(hostname, ".");
+    // QNAME: labels (checked above: 1..63 bytes each)
     var i: i64 = 0;
     while i < labels.len() {
         var lab: str = labels.get(i);
-        if str_len(lab) > 63 {
-            lab = str_slice(lab, 0, 63);
-        }
         q.push(str_len(lab));
         var k: i64 = 0;
         while k < str_len(lab) {
@@ -185,50 +218,183 @@ pub struct DnsRecord {
     pub addr: str,
 }
 
+/// The name at `off` of the `len`-byte packet at `buf` as text: labels
+/// joined by ".", ASCII letters in lower case, compression pointers
+/// followed (at most 16). "" when it is malformed: a read past `len`, a
+/// pointer loop, a reserved label type, a label holding a "." or NUL byte,
+/// or more than 255 bytes (and for the root name, which no query asks).
+fn dns_read_name(buf: i64, off: i64, len: i64) -> str {
+    var bytes: Vec<i64> = Vec::new();
+    var i: i64 = off;
+    var hops: i64 = 0;
+    var total: i64 = 0;
+    while true {
+        if i < 0 || i >= len {
+            return "";
+        }
+        var l: i64 = p_volatile_load8(buf + i);
+        if l == 0 {
+            break;
+        }
+        if (l & 192) == 192 {
+            if i + 1 >= len || hops >= 16 {
+                return "";
+            }
+            hops = hops + 1;
+            i = ((l & 63) << 8) | p_volatile_load8(buf + i + 1);
+            continue;
+        }
+        if (l & 192) != 0 || i + 1 + l > len {
+            return "";
+        }
+        total = total + l + 1;
+        if total > 255 {
+            return "";
+        }
+        if bytes.len() > 0 {
+            bytes.push(46);
+        }
+        var k: i64 = 0;
+        while k < l {
+            var c: i64 = p_volatile_load8(buf + i + 1 + k);
+            if c == 46 || c == 0 {
+                return "";
+            }
+            if c >= 65 && c <= 90 {
+                c = c + 32;
+            }
+            bytes.push(c);
+            k = k + 1;
+        }
+        i = i + 1 + l;
+    }
+    return str_from_bytes(bytes);
+}
+
+fn dns_name_in(names: &Vec<str>, name: str) -> bool {
+    var i: i64 = 0;
+    while i < names.len() {
+        if str_equal(names.get(i), name) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
 /// The A and AAAA answers of a raw response (`len` bytes at `buf`). Every
 /// read is checked against `len`: a truncated packet gives the answers
 /// before the cut.
+///
+/// BG147 (Nov 24): only a response is read: QR set, a standard query
+/// (opcode 0), RCODE 0 (NXDOMAIN or any other error: no answers) and one
+/// question. An answer counts only when its class is IN and its owner is
+/// the question's name or a name a CNAME answer before it led to (the
+/// first datagram from anyone, with any owner, was the answer). The query
+/// ID and the question are checked against the query sent by
+/// dns_parse_reply, which dns_query_records uses.
 pub fn dns_parse_records(buf: i64, len: i64) -> Vec<DnsRecord> {
     var out: Vec<DnsRecord> = Vec::new();
     if len < 12 {
         return out;
     }
+    var flags: i64 = rd_u16(buf, 2);
+    if (flags & 32768) == 0 || ((flags >> 11) & 15) != 0 || (flags & 15) != 0 {
+        return out;
+    }
     var qd: i64 = rd_u16(buf, 4);
     var an: i64 = rd_u16(buf, 6);
-    var off: i64 = 12;
-    var i: i64 = 0;
-    while i < qd {
-        off = dns_skip_name_in(buf, off, len);
-        if off < 0 || off + 4 > len {
-            return out;
-        }
-        off = off + 4;
-        // QTYPE + QCLASS
-        i = i + 1;
+    if qd != 1 {
+        return out;
     }
-    i = 0;
+    var qname: str = dns_read_name(buf, 12, len);
+    if str_len(qname) == 0 {
+        return out;
+    }
+    // the names the answers may be about: the question's, then CNAME targets
+    var chain: Vec<str> = Vec::new();
+    chain.push(qname);
+    var off: i64 = dns_skip_name_in(buf, 12, len);
+    if off < 0 || off + 4 > len {
+        return out;
+    }
+    off = off + 4;
+    // QTYPE + QCLASS
+    var i: i64 = 0;
     while i < an && off < len {
+        var owner: str = dns_read_name(buf, off, len);
         off = dns_skip_name_in(buf, off, len);
         if off < 0 || off + 10 > len {
             break;
         }
         var rtype: i64 = rd_u16(buf, off);
+        var rclass: i64 = rd_u16(buf, off + 2);
         var ttl: i64 = rd_u32(buf, off + 4);
         var rdlen: i64 = rd_u16(buf, off + 8);
         var rdata: i64 = off + 10;
         if rdata + rdlen > len {
             break;
         }
-        if rtype == 1 && rdlen == 4 {
-            out.push(DnsRecord {
-                rtype: 1, ttl: ttl, addr: dns_parse_u32_addr(buf, rdata)
-            });
-        } else if rtype == 28 && rdlen == 16 {
-            out.push(DnsRecord {
-                rtype: 28, ttl: ttl, addr: dns_parse_v6_addr(buf, rdata)
-            });
+        if rclass == 1 && str_len(owner) > 0 && dns_name_in(&chain, owner) {
+            if rtype == 1 && rdlen == 4 {
+                out.push(DnsRecord {
+                    rtype: 1, ttl: ttl, addr: dns_parse_u32_addr(buf, rdata)
+                });
+            } else if rtype == 28 && rdlen == 16 {
+                out.push(DnsRecord {
+                    rtype: 28, ttl: ttl, addr: dns_parse_v6_addr(buf, rdata)
+                });
+            } else if rtype == 5 && dns_skip_name_in(buf, rdata, rdata + rdlen) == rdata + rdlen {
+                var target: str = dns_read_name(buf, rdata, len);
+                if str_len(target) > 0 && !dns_name_in(&chain, target) && chain.len() < 16 {
+                    chain.push(target);
+                }
+            }
         }
         off = rdata + rdlen;
+        i = i + 1;
+    }
+    return out;
+}
+
+/// BG147: is the `len`-byte packet at `buf` the reply to the query with ID
+/// `id` for `hostname` and `qtype`? Its ID, QR bit (a response), opcode
+/// (standard query) and its one question (name, ignoring case and a
+/// trailing dot; type; class IN) must match. RCODE is not looked at: a
+/// matching NXDOMAIN is the answer (with no records).
+pub fn dns_reply_matches(buf: i64, len: i64, id: i64, hostname: str, qtype: i64) -> bool {
+    if len < 12 || rd_u16(buf, 0) != (id & 65535) {
+        return false;
+    }
+    var flags: i64 = rd_u16(buf, 2);
+    if (flags & 32768) == 0 || ((flags >> 11) & 15) != 0 || rd_u16(buf, 4) != 1 {
+        return false;
+    }
+    var qname: str = dns_read_name(buf, 12, len);
+    if str_len(qname) == 0 || !str_equal(qname, dns_norm_name(hostname)) {
+        return false;
+    }
+    var off: i64 = dns_skip_name_in(buf, 12, len);
+    if off < 0 || off + 4 > len {
+        return false;
+    }
+    return rd_u16(buf, off) == qtype && rd_u16(buf, off + 2) == 1;
+}
+
+/// The answers of type `qtype` in the reply to the query with ID `id` for
+/// `hostname` (dns_build_query_id): none when the packet is not that reply
+/// (dns_reply_matches) or carries an error (dns_parse_records).
+pub fn dns_parse_reply(buf: i64, len: i64, id: i64, hostname: str, qtype: i64) -> Vec<DnsRecord> {
+    var out: Vec<DnsRecord> = Vec::new();
+    if !dns_reply_matches(buf, len, id, hostname, qtype) {
+        return out;
+    }
+    var recs: Vec<DnsRecord> = dns_parse_records(buf, len);
+    var i: i64 = 0;
+    while i < recs.len() {
+        if recs.get(i).rtype == qtype {
+            out.push(recs.get(i));
+        }
         i = i + 1;
     }
     return out;
@@ -347,13 +513,18 @@ pub fn dns_query(hostname: str, qtype: i64, server: str, port: i64, timeout_ms: 
 /// The answers to a query, with their TTLs (empty on failure or timeout).
 pub fn dns_query_records(hostname: str, qtype: i64, server: str, port: i64, timeout_ms: i64) -> Vec<DnsRecord> {
     var out: Vec<DnsRecord> = Vec::new();
+    // BG147: a random ID per query; a name that cannot be sent asks nothing
+    var qid: i64 = dns_qid();
+    var pkt: Vec = dns_build_query_id(hostname, qtype, qid);
+    if pkt.len() == 0 {
+        return out;
+    }
     var sock: i64 = net_socket_create();
     if sock < 0 {
         return out;
     }
     net_set_recv_timeout(sock, timeout_ms);
     var addr: NetAddr = net_addr_create(server, port);
-    var pkt: Vec = dns_build_query(hostname, qtype);
     var n: i64 = pkt.len();
     var buf: i64 = 0;
     // SAFETY: a fresh n-byte block: the loop below writes the n bytes of
@@ -381,15 +552,36 @@ pub fn dns_query_records(hostname: str, qtype: i64, server: str, port: i64, time
         return out;
     }
     var rbuf: i64 = 0;
-    var got: i64 = 0;
-    // SAFETY: rbuf is a fresh 4096-byte block, so net_recv_from's promise
-    // holds: it writes at most the 4096 bytes it is told.
+    // SAFETY: a fresh 4096-byte block for the replies read below.
     unsafe {
         rbuf = p_malloc(4096);
-        got = net_recv_from(sock, rbuf, 4096, &mut addr);
     }
-    if got > 0 {
-        out = dns_parse_records(rbuf, got);
+    // BG147: a datagram is the answer only when it comes from the server
+    // asked (when the runtime reports the sender: port -1 is "not
+    // reported") and is the reply to this query (dns_reply_matches); any
+    // other is dropped and the next one read, up to 8, each within the
+    // timeout.
+    var from: NetAddr = NetAddr {
+        ip: 0, port: -1, raw: 0
+    };
+    var tries: i64 = 0;
+    while tries < 8 {
+        var got: i64 = 0;
+        from.port = -1;
+        // SAFETY: rbuf is the 4096-byte block above, so net_recv_from's
+        // promise holds: it writes at most the 4096 bytes it is told.
+        unsafe {
+            got = net_recv_from(sock, rbuf, 4096, &mut from);
+        }
+        if got <= 0 {
+            break;
+        }
+        var from_ok: bool = from.port == -1 || (from.ip == addr.ip && from.port == port);
+        if from_ok && dns_reply_matches(rbuf, got, qid, hostname, qtype) {
+            out = dns_parse_reply(rbuf, got, qid, hostname, qtype);
+            break;
+        }
+        tries = tries + 1;
     }
     // SAFETY: the reply and query blocks of this function; the records
     // parsed from the reply are copies (DnsRecord values), so nothing

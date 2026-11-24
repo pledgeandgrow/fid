@@ -24,7 +24,7 @@ FID=${FID:-release/fid.exe}
 N=${N:-300}
 BACKENDS=${BACKENDS:-"ccompile emit"}
 export CC=${CC:-zig cc}
-D=$(mktemp -d ./_sched_random.XXXXXX)
+D=$(mktemp -d ./tests/_sched_random.XXXXXX)
 D=${D#./}
 trap 'rm -rf "$D"' EXIT
 fail=0

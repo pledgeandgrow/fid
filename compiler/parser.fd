@@ -5507,6 +5507,23 @@ impl Parser {
                 }
             }
         }
+        // An optional `as alias` (a `use` in a body does nothing, as the
+        // top-level one does once its module is already imported)
+        if self.match_tok(TokenKind::As) {
+            match self.expect_ident() {
+                ParseResultStr::Ok(_) => {
+                }
+                ParseResultStr::Err(e) => {
+                    return ParseResultStmt::Err(e);
+                }
+            }
+        }
+        // A version pin is as wrong here as at top level (reference §2.9)
+        if self.check(TokenKind::Eq) {
+            var vtok: Token = self.peek_token();
+            return ParseResultStmt::Err("Parse error at " + int_to_str(vtok.line) + ":" + int_to_str(vtok.col) + ": a `use` does not take a version pin: `use m = \"1.0\"` is not an import\n    Fix: remove the `= \"...\"`; the path alone says which module.");
+        }
+        self.match_tok(TokenKind::Semicolon);
         return ParseResultStmt::Ok(Stmt::Use(path, items, line));
     }
 
@@ -8854,19 +8871,12 @@ impl Parser {
                 }
             }
         }
-        // Check for version pin: = "0.1.0"
+        // A version pin (`use m = "1.0"`) is a parse error (reference §2.9):
+        // the import is the one the path names.
         var version: OptStr = OptStr::None;
-        if self.match_tok(TokenKind::Eq) {
+        if self.check(TokenKind::Eq) {
             var vtok: Token = self.peek_token();
-            match vtok.kind {
-                TokenKind::StringLit(s: str) => {
-                    self.advance();
-                    version = OptStr::Some(s);
-                }
-                _ => {
-                    return ParseResultImportDef::Err("Parse error at " + int_to_str(vtok.line) + ":" + int_to_str(vtok.col) + ": expected version string but got '" + token_kind_to_str(vtok.kind) + "'\n    Fix: write the version in quotes after `=`, as in = \"0.1.0\"");
-                }
-            }
+            return ParseResultImportDef::Err("Parse error at " + int_to_str(vtok.line) + ":" + int_to_str(vtok.col) + ": a `use` does not take a version pin: `use m = \"1.0\"` is not an import\n    Fix: remove the `= \"...\"`; the path alone says which module.");
         }
         self.match_tok(TokenKind::Semicolon);
         var import_result: ImportDef = ImportDef_new_full(path, items, capabilities, version, alias, false, is_glob);
@@ -9189,20 +9199,68 @@ impl Parser {
                         i = i + 1;
                     }
                 }
+                // A ':' at brace depth 0 (not a `::` path, not inside
+                // brackets or a nested string) splits the expression from a
+                // format specifier (`{x:.2}`, `{n:5}`, `{x:#x}`, §1.8)
+                var spec_at: i64 = -1;
+                var sd: i64 = 0;
+                var sj: i64 = 0;
+                var sin: bool = false;
+                var es_len: i64 = str_len(expr_src);
+                while sj < es_len {
+                    var sc: i64 = str_byte_at(expr_src, sj);
+                    if sin {
+                        if sc == 92 {
+                            sj = sj + 1;
+                        } else if sc == 34 {
+                            sin = false;
+                        }
+                    } else if sc == 34 {
+                        sin = true;
+                    } else if sc == 123 || sc == 91 || sc == 40 {
+                        sd = sd + 1;
+                    } else if sc == 125 || sc == 93 || sc == 41 {
+                        sd = sd - 1;
+                    } else if sc == 58 && sd == 0 {
+                        var sprev: i64 = 0;
+                        var snext: i64 = 0;
+                        if sj > 0 {
+                            sprev = str_byte_at(expr_src, sj - 1);
+                        }
+                        if sj + 1 < es_len {
+                            snext = str_byte_at(expr_src, sj + 1);
+                        }
+                        if sprev != 58 && snext != 58 {
+                            spec_at = sj;
+                            break;
+                        }
+                    }
+                    sj = sj + 1;
+                }
+                var spec: str = "";
+                var parse_src: str = expr_src;
+                if spec_at >= 0 {
+                    spec = str_slice(expr_src, spec_at + 1, es_len);
+                    parse_src = str_slice(expr_src, 0, spec_at);
+                    spec = str_trim(spec);
+                }
                 // Re-lex and parse the expression
-                var sub_lexer: Lexer = Lexer::new(expr_src);
+                var sub_lexer: Lexer = Lexer::new(parse_src);
                 var sub_tokens: Vec<Token> = sub_lexer.tokenize();
                 var sub_parser: Parser = Parser::new(sub_tokens);
                 match sub_parser.parse_expr() {
                     ParseResultExpr::Ok(e) => {
-                        // The braces hold one expression and nothing else:
-                        // there are no format specifiers. What followed the
-                        // expression was dropped without a word (`f"{x:.2}"`
-                        // printed 3.14159), so it is an error
                         if !sub_parser.is_at_end() {
-                            return ParseResultExpr::Err("Parse error at " + int_to_str(line) + ":" + int_to_str(col) + ": text follows the expression in an f-string: `{" + expr_src + "}`.\n    Fix: the braces of an f-string hold one expression and there are no format specifiers (`:.2`, `:5`, `#x`); compute the text in the expression, for example `u64_to_str(x)`.");
+                            return ParseResultExpr::Err("Parse error at " + int_to_str(line) + ":" + int_to_str(col) + ": text follows the expression in an f-string: `{" + expr_src + "}`.\n    Fix: the braces of an f-string hold one expression, then an optional `:` and a format spec (`:.2`, `:5`, `#x`).");
                         }
-                        parts.push(FStringPart::Expr(e));
+                        if str_len(spec) > 0 {
+                            var fmt_args: Vec<Expr> = Vec::new();
+                            fmt_args.push(e);
+                            fmt_args.push(Expr::StringLit(spec));
+                            parts.push(FStringPart::Expr(Expr::Call("__fstr_fmt", fmt_args)));
+                        } else {
+                            parts.push(FStringPart::Expr(e));
+                        }
                     }
                     ParseResultExpr::Err(e) => {
                         return ParseResultExpr::Err(e);

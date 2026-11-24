@@ -1,0 +1,86 @@
+// Bugs roadmap BG179: core Vec_sort compares a Vec's words as i64, which
+// runs negative doubles backwards ([-1.5, -2.5, 1.0, -0.5] sorted to -0.5
+// -1.5 -2.5 1). Nothing in a Vec's header says its words are doubles, so
+// core now has Vec_sort_f64 (IEEE 754 totalOrder, -0.0 before 0.0, but
+// every NaN last whatever its sign: 0.0 / 0.0 sets the sign on x86-64);
+// this test calls it on the Vec's word. Routing `.sort()` on a
+// Vec<f64> to it is the lowering's part (not done here).
+//
+// Expected output:
+// -2.5 -1.5 -0.5 1
+// -1000000 -2.5 -1 0 0 0.25 3 1000000
+// -0 first true
+// 0 second true
+// nan last true
+// inf before nan true
+// one 7.5
+// ints 1 2 3
+
+fn tf(b: bool) -> str {
+    if b {
+        return "true";
+    }
+    return "false";
+}
+
+fn show(v: Vec<f64>) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    while i < v.len() {
+        if i > 0 {
+            out = out + " ";
+        }
+        out = out + float_to_str(v.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn main() {
+    var a: Vec<f64> = Vec::new();
+    a.push(-1.5);
+    a.push(-2.5);
+    a.push(1.0);
+    a.push(-0.5);
+    Vec_sort_f64(a as i64);
+    println(show(a));
+
+    var b: Vec<f64> = Vec::new();
+    b.push(3.0);
+    b.push(-1.0);
+    b.push(0.25);
+    b.push(-1000000.0);
+    b.push(0.0);
+    b.push(1000000.0);
+    b.push(-2.5);
+    b.push(0.0);
+    Vec_sort_f64(b as i64);
+    println(show(b));
+
+    val zero: f64 = 0.0;
+    var c: Vec<f64> = Vec::new();
+    c.push(zero / zero);
+    c.push(1.0 / zero);
+    c.push(0.0);
+    c.push(-0.0);
+    c.push(-5.0);
+    Vec_sort_f64(c as i64);
+    println("-0 first " + tf(p_f64_to_bits(c.get(1)) == p_f64_to_bits(-0.0)));
+    println("0 second " + tf(p_f64_to_bits(c.get(2)) == 0));
+    val last: f64 = c.get(4);
+    println("nan last " + tf(last != last));
+    println("inf before nan " + tf(c.get(3) > 1000000.0));
+
+    var d: Vec<f64> = Vec::new();
+    d.push(7.5);
+    Vec_sort_f64(d as i64);
+    println("one " + float_to_str(d.get(0)));
+
+    // Vec_sort on integers is unchanged
+    var e: Vec<i64> = Vec::new();
+    e.push(3);
+    e.push(1);
+    e.push(2);
+    e.sort();
+    println("ints " + int_to_str(e.get(0)) + " " + int_to_str(e.get(1)) + " " + int_to_str(e.get(2)));
+}

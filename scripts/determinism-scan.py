@@ -17,7 +17,7 @@ Two scans, each reporting every site with its enclosing function:
            and string literals. `for x in <map>` needs types: the C scan
            finds it.
   c        a generated C file of the compiler (`fid dump-c compiler/main.fd`,
-           or release/fid-dev.c of a build): every call of those functions,
+           or build/selfhost/fid-dev.c of a build): every call of those functions,
            with the function it is in. Higher-order dispatch by name
            (`strcmp(_fn_name, "HashMap_keys")` then the call) is a function
            value of that name, not a walk the compiler makes, and is skipped.

@@ -222,16 +222,19 @@ struct BitR {
     byte: i64,
     // next byte index
     bit: i64,  // bit position within current byte (0-7)
+    // a bit was read past the end of the data (the stream is truncated)
+    over: bool,
 }
 
 fn br_new(data: Vec, start: i64) -> BitR {
     return BitR {
-        data: data, byte: start, bit: 0
+        data: data, byte: start, bit: 0, over: false
     };
 }
 
 fn br_bit(r: &mut BitR) -> i64 {
     if r.byte >= r.data.len() {
+        r.over = true;
         return 0;
     }
     var b: i64 = (r.data.get(r.byte) >> r.bit) & 1;
@@ -258,10 +261,6 @@ fn br_align(r: &mut BitR) -> void {
         r.bit = 0;
         r.byte = r.byte + 1;
     }
-}
-
-fn br_eof(r: BitR) -> bool {
-    return r.byte >= r.data.len();
 }
 
 // ─── Huffman (puff-style canonical decode) ──────────────────────────────
@@ -559,7 +558,9 @@ fn z_fixed() -> TwoLens {
 fn z_block(r: &mut BitR, out: &mut Vec, lh: Huff, dh: Huff, lb: Vec, le: Vec, db: Vec, de: Vec, max_out: i64) -> bool {
     while true {
         var sym: i64 = huff_decode(r, lh);
-        if sym < 0 {
+        // past the end the reader gives zeros: without this check a
+        // truncated stream decodes them as data up to max_out (BG190)
+        if sym < 0 || r.over {
             return false;
         }
         if sym < 256 {
@@ -668,11 +669,16 @@ fn z_dynamic(r: &mut BitR) -> TwoLens {
     return res;
 }
 
-/// Inflate a raw DEFLATE stream starting at byte `start` of `data`.
-/// `max_out` caps the output size (decompression-bomb guard); pass a
-/// generous limit like 268435456 (256MB). Returns Vec<i64> of bytes
-/// (empty on error).
-pub fn inflate_from(data: Vec, start: i64, max_out: i64) -> Vec {
+// The result of z_inflate: `ok` false on any error (truncated or corrupt
+// stream, output over max_out); `end` is the byte after the final block,
+// where a zlib or gzip trailer starts.
+struct ZInf {
+    out: Vec,
+    ok: bool,
+    end: i64,
+}
+
+fn z_inflate(data: Vec, start: i64, max_out: i64) -> ZInf {
     var out: Vec = Vec::new();
     var r: BitR = br_new(data, start);
     var lb: Vec = z_len_base();
@@ -680,22 +686,28 @@ pub fn inflate_from(data: Vec, start: i64, max_out: i64) -> Vec {
     var db: Vec = z_dist_base();
     var de: Vec = z_dist_extra();
     var last: i64 = 0;
-    while last == 0 {
+    var ok: bool = true;
+    while last == 0 && ok {
         last = br_bit(&mut r);
         var btype: i64 = br_bits(&mut r, 2);
-        if btype == 0 {
+        if r.over {
+            ok = false;
+        } else if btype == 0 {
             br_align(&mut r);
             if r.byte + 4 > r.data.len() {
+                ok = false;
                 break;
             }
             var len: i64 = r.data.get(r.byte) | (r.data.get(r.byte + 1) << 8);
             var nlen: i64 = r.data.get(r.byte + 2) | (r.data.get(r.byte + 3) << 8);
             r.byte = r.byte + 4;
-            if ((len ^ 65535) & 65535) != nlen {
+            if ((len ^ 65535) & 65535) != nlen || len > r.data.len() - r.byte || out.len() + len > max_out {
+                // a bad LEN/NLEN pair, a block cut short, or over the cap
+                ok = false;
                 break;
             }
             var i: i64 = 0;
-            while i < len && r.byte < r.data.len() {
+            while i < len {
                 out.push(r.data.get(r.byte));
                 r.byte = r.byte + 1;
                 i = i + 1;
@@ -704,27 +716,40 @@ pub fn inflate_from(data: Vec, start: i64, max_out: i64) -> Vec {
             var fx: TwoLens = z_fixed();
             var lh: Huff = huff_build(fx.lit, 288);
             var dh: Huff = huff_build(fx.dist, 32);
-            if !z_block(&mut r, &mut out, lh, dh, lb, le, db, de, max_out) {
-                break;
-            }
+            ok = z_block(&mut r, &mut out, lh, dh, lb, le, db, de, max_out);
         } else if btype == 2 {
             var dyn2: TwoLens = z_dynamic(&mut r);
-            if dyn2.lit.len() == 0 {
+            if dyn2.lit.len() == 0 || r.over {
+                ok = false;
                 break;
             }
             var lh2: Huff = huff_build(dyn2.lit, dyn2.lit.len());
             var dh2: Huff = huff_build(dyn2.dist, dyn2.dist.len());
-            if !z_block(&mut r, &mut out, lh2, dh2, lb, le, db, de, max_out) {
-                break;
-            }
+            ok = z_block(&mut r, &mut out, lh2, dh2, lb, le, db, de, max_out);
         } else {
-            break;
+            ok = false;
         }
-        if br_eof(r) {
-            break;
+        if r.over {
+            ok = false;
         }
     }
-    return out;
+    br_align(&mut r);
+    if !ok {
+        // the doc's promise: nothing on error, never the partial output
+        out = Vec::new();
+    }
+    return ZInf {
+        out: out, ok: ok, end: r.byte
+    };
+}
+
+/// Inflate a raw DEFLATE stream starting at byte `start` of `data`.
+/// `max_out` caps the output size (decompression-bomb guard); pass a
+/// generous limit like 268435456 (256MB). Returns Vec<i64> of bytes
+/// (empty on error: a truncated or corrupt stream, or more than
+/// `max_out` bytes of output).
+pub fn inflate_from(data: Vec, start: i64, max_out: i64) -> Vec {
+    return z_inflate(data, start, max_out).out;
 }
 
 /// Inflate a raw DEFLATE stream (whole Vec).
@@ -732,9 +757,15 @@ pub fn inflate(data: Vec) -> Vec {
     return inflate_from(data, 0, 268435456);
 }
 
+// A little-endian 32-bit word at data[p..p+4] (the caller checks the bounds).
+fn z_u32_le(data: Vec, p: i64) -> i64 {
+    return data.get(p) | (data.get(p + 1) << 8) | (data.get(p + 2) << 16) | (data.get(p + 3) << 24);
+}
+
 // ─── zlib / gzip decompressors ──────────────────────────────────────────
 
-/// Decompress a zlib stream (validates header, skips optional dict id).
+/// Decompress a zlib stream (validates header, skips optional dict id,
+/// checks the Adler-32). Empty on any error.
 pub fn zlib_decompress(data: Vec) -> Vec {
     if data.len() < 6 {
         return Vec::new();
@@ -752,12 +783,21 @@ pub fn zlib_decompress(data: Vec) -> Vec {
         start = 6;
     }
     // FDICT: skip 4-byte dict id
-    var out: Vec = inflate_from(data, start, 268435456);
-    // adler32 check is advisory — return data regardless
-    return out;
+    var z: ZInf = z_inflate(data, start, 268435456);
+    // the Adler-32 of the output follows, big-endian: a mismatch is an
+    // error (BG222)
+    if !z.ok || z.end + 4 > data.len() {
+        return Vec::new();
+    }
+    val want: i64 = (data.get(z.end) << 24) | (data.get(z.end + 1) << 16) | (data.get(z.end + 2) << 8) | data.get(z.end + 3);
+    if adler32_bytes(z.out) != want {
+        return Vec::new();
+    }
+    return z.out;
 }
 
-/// Decompress a gzip member (parses header incl. FNAME/FCOMMENT/FEXTRA).
+/// Decompress a gzip member (parses header incl. FNAME/FCOMMENT/FEXTRA,
+/// checks the CRC-32 and ISIZE trailer). Empty on any error.
 pub fn gzip_decompress(data: Vec) -> Vec {
     if data.len() < 18 {
         return Vec::new();
@@ -796,7 +836,16 @@ pub fn gzip_decompress(data: Vec) -> Vec {
     if pos >= data.len() {
         return Vec::new();
     }
-    return inflate_from(data, pos, 268435456);
+    var z: ZInf = z_inflate(data, pos, 268435456);
+    // the trailer: CRC-32 of the output, then its size mod 2^32, both
+    // little-endian; a mismatch is an error (BG222)
+    if !z.ok || z.end + 8 > data.len() {
+        return Vec::new();
+    }
+    if crc32_bytes(z.out) != z_u32_le(data, z.end) || (z.out.len() & 0xFFFFFFFF) != z_u32_le(data, z.end + 4) {
+        return Vec::new();
+    }
+    return z.out;
 }
 
 // ─── String conveniences ────────────────────────────────────────────────

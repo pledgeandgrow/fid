@@ -1,0 +1,99 @@
+// Bugs roadmap BG193: stdlib/protobuf.fd `pb_read_bytes` / `pb_skip` tested
+// `r.pos + n > r.end`, which overflows for a LEN varint near 2^63, so the
+// bounds check itself panicked ("Integer overflow on addition") on
+// untrusted input. They now compare `n > r.end - r.pos`: a huge, negative or
+// too long length turns `ok` false.
+//
+// Expected output:
+// skip 2^63-1: false
+// read 2^63-1: false 0
+// skip negative: false
+// read negative: false 0
+// skip one too long: false
+// read one too long: false 0
+// read exact: true 61 62
+// skip exact then next: true false true
+use protobuf;
+use vec;
+
+fn len_field(len_bytes: Vec<i64>, payload: i64) -> Vec<i64> {
+    var b: Vec<i64> = Vec::new();
+    b.push(10);
+    var i: i64 = 0;
+    while i < len_bytes.len() {
+        b.push(len_bytes.get(i));
+        i = i + 1;
+    }
+    i = 0;
+    while i < payload {
+        b.push(97 + i);
+        i = i + 1;
+    }
+    return b;
+}
+
+fn huge() -> Vec<i64> {
+    // 2^63 - 1 as a varint
+    var v: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 8 {
+        v.push(255);
+        i = i + 1;
+    }
+    v.push(127);
+    return v;
+}
+
+fn negative() -> Vec<i64> {
+    // -1 as a varint (ten bytes)
+    var v: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 9 {
+        v.push(255);
+        i = i + 1;
+    }
+    v.push(1);
+    return v;
+}
+
+fn one(n: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    v.push(n);
+    return v;
+}
+
+fn skip_case(label: str, b: Vec<i64>) {
+    var r: PbReader = pb_reader_new(b);
+    if pb_next(&mut r) {
+        pb_skip(&mut r);
+    }
+    println(label + ": " + f"{r.ok}");
+}
+
+fn read_case(label: str, b: Vec<i64>) {
+    var r: PbReader = pb_reader_new(b);
+    var got: Vec<i64> = Vec::new();
+    if pb_next(&mut r) {
+        got = pb_read_bytes(&mut r);
+    }
+    if got.len() == 0 {
+        println(label + ": " + f"{r.ok}" + " 0");
+    } else {
+        println(label + ": " + f"{r.ok} " + pb_hex(got));
+    }
+}
+
+fn main() -> i64 {
+    skip_case("skip 2^63-1", len_field(huge(), 3));
+    read_case("read 2^63-1", len_field(huge(), 3));
+    skip_case("skip negative", len_field(negative(), 3));
+    read_case("read negative", len_field(negative(), 3));
+    skip_case("skip one too long", len_field(one(4), 3));
+    read_case("read one too long", len_field(one(4), 3));
+    read_case("read exact", len_field(one(2), 2));
+    var r: PbReader = pb_reader_new(len_field(one(3), 3));
+    val first: bool = pb_next(&mut r);
+    pb_skip(&mut r);
+    println(f"skip exact then next: {first} {pb_next(&mut r)} {r.ok}");
+    return 0;
+}

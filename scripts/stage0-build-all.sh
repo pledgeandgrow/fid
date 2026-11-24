@@ -3,9 +3,10 @@
 # from one generated C file (fid_wrapped.c, the 256MB-stack wrapped dump-c).
 # Usage: ./scripts/stage0-build-all.sh [max-parallel-targets] (default 2;
 # the unit objects are checkpointed, so a restart resumes where it stopped).
+# Generated C, objects, and cross-built seeds stay under ignored build/.
 set -u
 cd "$(dirname "$0")/.."
-S=release/stage0
+S=build/stage0
 N="${1:-2}"
 mk() {  # mk <zig-triple> <out> <extra-libs>
   local t="$1" out="$2" libs="${3:-}"

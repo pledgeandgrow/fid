@@ -1,0 +1,106 @@
+// Bugs roadmap BG194: in native Windows executables (pe_runtime) a channel
+// receive or send that had to wait inside a green task slept the whole OS
+// thread (SleepConditionVariableSRW) instead of suspending the task. An
+// `async fn` starts on its caller's thread, so a receive in it stopped
+// `main` before main could send: the program hung every time. Two `task_go`
+// tasks on one channel hung with one worker (FIDES_WORKERS=1). A task now
+// waits parked on the channel and the change that lets it go on queues it.
+//
+// Expected output:
+// started
+// in waiter
+// waiter got 7
+// 7
+// consumer 55
+// pair done
+// 16000
+
+use channel;
+use task;
+
+var CH: i64 = 0;
+var OUT: i64 = 0;
+
+async fn waiter(ch: i64) -> Future<i64> {
+    println("in waiter");
+    val v = channel_recv(ch);
+    println("waiter got " + int_to_str(v));
+    return v;
+}
+
+fn consumer(n: i64) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        s = s + channel_recv(CH);
+        i = i + 1;
+    }
+    println("consumer " + int_to_str(s));
+    return s;
+}
+
+fn producer(n: i64) -> i64 {
+    var i: i64 = 0;
+    while i < n {
+        channel_send(CH, i + 1);
+        i = i + 1;
+    }
+    return n;
+}
+
+fn sender(id: i64) -> i64 {
+    var i: i64 = 0;
+    while i < 2000 {
+        channel_send(CH, 1);
+        if i % 97 == 0 {
+            task_yield();
+        }
+        i = i + 1;
+    }
+    return id;
+}
+
+fn receiver(id: i64) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < 4000 {
+        s = s + channel_recv(CH);
+        i = i + 1;
+    }
+    p_atomic_add(OUT, s);
+    return s;
+}
+
+fn main() -> i64 {
+    // an async fn that waits for a value main sends after the call
+    val ch = channel_create(1);
+    println("started");
+    val f = waiter(ch);
+    channel_send(ch, 7);
+    println(await f);
+
+    // a consumer and a producer task on one small channel
+    CH = channel_create(2);
+    val a = task_go("consumer", 10);
+    val b = task_go("producer", 10);
+    task_run();
+    println("pair done");
+
+    // many senders and receivers, each waiting often
+    CH = channel_create(4);
+    OUT = p_shared_alloc(8);
+    p_atomic_store(OUT, 0);
+    var k: i64 = 0;
+    while k < 4 {
+        val r = task_go("receiver", k);
+        k = k + 1;
+    }
+    k = 0;
+    while k < 8 {
+        val s = task_go("sender", k);
+        k = k + 1;
+    }
+    task_run();
+    println(p_atomic_load(OUT));
+    return 0;
+}

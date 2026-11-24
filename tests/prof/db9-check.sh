@@ -26,7 +26,7 @@
 # Exit 0 when every check passes.
 FID=${FID:-release/fid.exe}
 export CC=${CC:-zig cc}
-D=$(mktemp -d ./_db9_check.XXXXXX)
+D=$(mktemp -d ./tests/_db9_check.XXXXXX)
 D=${D#./}
 trap 'rm -rf "$D"' EXIT
 fail=0

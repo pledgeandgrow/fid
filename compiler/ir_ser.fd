@@ -1161,6 +1161,13 @@ pub fn iw_irfunc(b: &mut AwBuf, f: IrFunction) {
     iw_bool(b, f.is_constant_time);
     iw_bool(b, f.has_secret);
     iw_vec_i64(b, f.secret_values);
+    // DB4 (ver 4): the never-truncated binding record
+    aw_i64(b, f.dbg_locals.len());
+    i = 0;
+    while i < f.dbg_locals.len() {
+        iw_strvid(b, f.dbg_locals.get(i));
+        i = i + 1;
+    }
 }
 
 /// Deserialize an IrFunction; r.ok is false on any truncation/desync.
@@ -1244,6 +1251,13 @@ pub fn ir_irfunc(r: &mut ArBuf) -> IrFunction {
     f.is_constant_time = ir_bool(r);
     f.has_secret = ir_bool(r);
     f.secret_values = ir_vec_i64(r);
+    // DB4 (ver 4): the never-truncated binding record
+    n = ar_i64(r);
+    i = 0;
+    while i < n && r.ok {
+        f.dbg_locals.push(ir_strvid(r));
+        i = i + 1;
+    }
     return f;
 }
 
@@ -1504,8 +1518,8 @@ pub fn irc_begin(program: Program, pruned: bool) {
     var salt: i64 = ar_i64(&mut r);
     var count: i64 = ar_i64(&mut r);
     // ver 2 (SP13): byte buffers one byte per byte (iw_bytes); ver 3:
-    // a check word after each entry
-    if magic != 5062211 || ver != 3 || salt != g_irc_salt {
+    // a check word after each entry; ver 4 (DB4): IrFunction.dbg_locals
+    if magic != 5062211 || ver != 4 || salt != g_irc_salt {
         return;
     }
     var i: i64 = 0;
@@ -1636,7 +1650,7 @@ pub fn irc_finish() {
     }
     var b: AwBuf = awbuf_new();
     aw_i64(&mut b, 5062211);
-    aw_i64(&mut b, 3);
+    aw_i64(&mut b, 4);
     aw_i64(&mut b, g_irc_salt);
     aw_i64(&mut b, g_irc_new.len());
     var i: i64 = 0;
@@ -2224,6 +2238,7 @@ pub fn mec_fn_hash(f: IrFunction) -> i64 {
     }
     h = mec_mix(mec_mix(mec_mix(h, mec_b(f.internal_conv)), mec_b(f.is_constant_time)), mec_b(f.has_secret));
     h = mh_vec(h, f.secret_values);
+    h = mh_strvids(h, f.dbg_locals);
     return h;
 }
 
@@ -2932,7 +2947,7 @@ pub fn mec_finish() {
 
 pub const MEC_IROPT: i64 = 3;
 const IMC_MAGIC: i64 = 0x31434D49;
-const IMC_VERSION: i64 = 1;
+const IMC_VERSION: i64 = 2;
 const IMC_MAX_ENTRIES: i64 = 20000;
 const IMC_MAX_BYTES: i64 = 64000000;
 /// A function whose bytes are longer than this is not recorded.

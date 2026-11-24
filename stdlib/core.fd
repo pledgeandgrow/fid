@@ -1251,6 +1251,134 @@ pub fn Arc_drop(h: i64) {
     }
 }
 
+// A payload that is not one word (OW4, reference §13.3): the lowering calls
+// Rc_new_t / Arc_new_t with the value's address, its size in words and the
+// type id of what it holds — the block is [count, tid, payload ...]. A
+// struct or enum is copied in full; a handle (str, Vec, HashMap, Box) is
+// kept as its word, the block one owner of it. `clone` and `count` are the
+// plain functions above: the count stays the block's first word.
+
+/// `Rc::new(x)` of a payload `tid` describes: the block [1, tid, x's words].
+pub fn Rc_new_t(p: i64, words: i64, tid: i64) -> i64 {
+    var h: i64 = p_malloc(16 + words * 8);
+    var pc: *mut i64 = h as * mut i64;
+    var pt: *mut i64 = (h + 8) as * mut i64;
+    // SAFETY: the header words of the block p_malloc just returned.
+    unsafe {
+        *pc = 1;
+        *pt = tid;
+    }
+    p_copy_words(h + 16, p, words);
+    return h;
+}
+
+/// The address of the payload a tagged block holds (a struct or enum's).
+pub fn Rc_get_p(h: i64) -> i64 {
+    if h == 0 {
+        return 0;
+    }
+    return h + 16;
+}
+
+/// The handle a tagged block holds, one more owner of it for the caller.
+pub fn Rc_get_t(h: i64) -> i64 {
+    if h == 0 {
+        return 0;
+    }
+    var tid: i64 = 0;
+    var w: i64 = 0;
+    // SAFETY: h is a block Rc_new_t made: [count, tid, word].
+    unsafe {
+        tid = *((h + 8) as * mut i64);
+        w = *((h + 16) as * mut i64);
+    }
+    return vec_elem_dup(tid, w);
+}
+
+/// One owner fewer of a tagged block; the last one drops the payload as its
+/// `tid` says (a handle's word, a struct or enum held inline), then frees.
+pub fn Rc_drop_t(h: i64) {
+    if h == 0 {
+        return;
+    }
+    var pc: *mut i64 = h as * mut i64;
+    var n: i64 = 0;
+    // SAFETY: h is a block Rc_new_t made.
+    unsafe {
+        *pc = *pc - 1;
+        n = *pc;
+    }
+    if n <= 0 {
+        var tid: i64 = 0;
+        var w: i64 = 0;
+        // SAFETY: the header words of the block whose count reached 0.
+        unsafe {
+            tid = *((h + 8) as * mut i64);
+            w = *((h + 16) as * mut i64);
+        }
+        if tid == P_TID_STR || tid == P_TID_VEC || tid == P_TID_MAP || tid >= P_TID_BOX {
+            vec_elem_drop(tid, w);
+        } else if tid >= 16 {
+            __p_mem_drop(tid, h + 16);
+        }
+        // SAFETY: the count reached 0: p_malloc made the block.
+        unsafe {
+            p_free(h);
+        }
+    }
+}
+
+/// `Arc::new(x)` of a payload `tid` describes: the block [1, tid, x's words],
+/// its count atomic.
+pub fn Arc_new_t(p: i64, words: i64, tid: i64) -> i64 {
+    var h: i64 = p_malloc(16 + words * 8);
+    p_atomic_store(h, 1);
+    var pt: *mut i64 = (h + 8) as * mut i64;
+    // SAFETY: the tid word of the block p_malloc just returned.
+    unsafe {
+        *pt = tid;
+    }
+    p_copy_words(h + 16, p, words);
+    return h;
+}
+
+/// The address of the payload a tagged block holds (a struct or enum's).
+pub fn Arc_get_p(h: i64) -> i64 {
+    return Rc_get_p(h);
+}
+
+/// The handle a tagged block holds, one more owner of it for the caller.
+pub fn Arc_get_t(h: i64) -> i64 {
+    return Rc_get_t(h);
+}
+
+/// One owner fewer of a tagged block, counted atomically; the last one drops
+/// the payload as its `tid` says, then frees the block.
+pub fn Arc_drop_t(h: i64) {
+    if h == 0 {
+        return;
+    }
+    var old: i64 = p_atomic_sub(h, 1);
+    if old <= 1 {
+        var tid: i64 = 0;
+        var w: i64 = 0;
+        // SAFETY: the header words of the block whose count reached 0.
+        unsafe {
+            tid = *((h + 8) as * mut i64);
+            w = *((h + 16) as * mut i64);
+        }
+        if tid == P_TID_STR || tid == P_TID_VEC || tid == P_TID_MAP || tid >= P_TID_BOX {
+            vec_elem_drop(tid, w);
+        } else if tid >= 16 {
+            __p_mem_drop(tid, h + 16);
+        }
+        // SAFETY: the atomic count reached 0: p_malloc made the block.
+        unsafe {
+            p_free(h);
+        }
+    }
+}
+
 // Structs in a Vec's buffer (release D15): element code 16 + words - 1
 // (vec_esz), elements reached by address (vec_ld gives it, vec_st copies
 // one in). The lowering puts a struct into a Vec through Vec_push_mem,
@@ -3229,6 +3357,20 @@ pub fn vec_raw_reverse(v: i64) {
         var rn: i64 = Vec_len(v);
         var rd: i64 = vec_sz_hdr(v, 0);
         var ri: i64 = 0;
+        // a struct's "value" is its address: swapping through it copies the
+        // bytes just written back over the other slot — swap through a copy
+        if rcode >= 16 {
+            var resz: i64 = vec_esz(rcode);
+            var rtmp: i64 = p_malloc_uninit(resz);
+            while ri < rn / 2 {
+                vec_copy_bytes(rtmp, vec_ld(rd, ri, rcode), resz);
+                vec_st(rd, ri, rcode, vec_ld(rd, rn - 1 - ri, rcode));
+                vec_st(rd, rn - 1 - ri, rcode, rtmp);
+                ri = ri + 1;
+            }
+            p_free(rtmp);
+            return;
+        }
         while ri < rn / 2 {
             var lo: i64 = vec_ld(rd, ri, rcode);
             vec_st(rd, ri, rcode, vec_ld(rd, rn - 1 - ri, rcode));
@@ -3589,7 +3731,7 @@ pub fn Vec_to_str(v: i64) -> str {
 }
 
 /// Sort ascending (elements compared as i64), in place: heapsort,
-/// O(n log n) time and no extra memory.
+/// O(n log n) time and no extra memory. Doubles: Vec_sort_f64 (BG179).
 pub fn Vec_sort(v: i64) {
     vec_own(v);
     vec_raw_sort(v);
@@ -3721,6 +3863,79 @@ fn vec_sift_down_str(data: i64, root: i64, n: i64) {
                 child = child + 1;
             }
             if p_str_compare(vec_slot(data, r), vec_slot(data, child)) >= 0 {
+                done = true;
+            } else {
+                vec_swap_slots(data, r, child);
+                r = child;
+            }
+        }
+    }
+}
+
+/// BG179: sort a `Vec<f64>` ascending as numbers, in place (heapsort, as
+/// Vec_sort). Vec_sort compares the raw words as i64, which runs negative
+/// doubles backwards; nothing in a Vec's header says its words are doubles,
+/// so the caller (the lowering of `.sort()` on a `Vec<f64>`) picks this one.
+/// The order is IEEE 754 totalOrder (-0.0 before 0.0) except that every NaN
+/// goes last, whatever its sign bit (0.0 / 0.0 sets it on x86-64, not on
+/// AArch64).
+pub fn Vec_sort_f64(v: i64) {
+    vec_own(v);
+    if vec_code(v) != 0 {
+        // not one word per element: no doubles in it
+        vec_raw_sort(v);
+        return;
+    }
+    var len_ptr: *mut i64 = v + 8;
+    var data_ptr_ptr: *mut i64 = v;
+    var len: i64 = 0;
+    var data: i64 = 0;
+    // SAFETY: header words 0 and 1 of the Vec v (vec_own above).
+    unsafe {
+        len = *len_ptr;
+        data = *data_ptr_ptr;
+    }
+    if len <= 1 {
+        return;
+    }
+    var start: i64 = len / 2 - 1;
+    while start >= 0 {
+        vec_sift_down_f64(data, start, len);
+        start = start - 1;
+    }
+    var end: i64 = len - 1;
+    while end > 0 {
+        vec_swap_slots(data, 0, end);
+        vec_sift_down_f64(data, 0, end);
+        end = end - 1;
+    }
+}
+
+/// The bits of a double as an i64 in the doubles' order (totalOrder): a
+/// negative double's 63 low bits are flipped, a positive one's kept; a NaN
+/// is the largest key.
+fn vec_f64_key(x: i64) -> i64 {
+    if (x & 0x7FFFFFFFFFFFFFFF) > 0x7FF0000000000000 {
+        return 0x7FFFFFFFFFFFFFFF;
+    }
+    if x < 0 {
+        return x ^ 0x7FFFFFFFFFFFFFFF;
+    }
+    return x;
+}
+
+fn vec_sift_down_f64(data: i64, root: i64, n: i64) {
+    var r: i64 = root;
+    var done: bool = false;
+    while !done {
+        var child: i64 = 2 * r + 1;
+        if child >= n {
+            done = true;
+        } else {
+            if child + 1 < n && vec_f64_key(vec_slot(data, child)) < vec_f64_key(vec_slot(data, child + 1)) {
+                child = child + 1;
+            }
+            if vec_f64_key(vec_slot(data, r)) >= vec_f64_key(vec_slot(data, child)) {
                 done = true;
             } else {
                 vec_swap_slots(data, r, child);
@@ -7229,14 +7444,28 @@ pub fn String_parse_int(s: i64) -> i64 {
             ptr = addr;
             b = *ptr;
         }  // Parse digits
+        // BG175: the value is built negative, where i64::MIN fits, and each
+        // step is checked before it is taken: a value outside i64 (any
+        // number of digits) returns 0, the documented failure, instead of
+        // panicking on the checked multiply
         while b >= 48 && b <= 57 {
-            result = result * 10 + (b - 48);
+            val d: i64 = b - 48;
+            if result < -922337203685477580 || (result == -922337203685477580 && d > 8) {
+                return 0;
+            }
+            result = result * 10 - d;
             addr = addr + 1;
             ptr = addr;
             b = *ptr;
         }
     }
-    return result * sign;
+    if sign < 0 {
+        return result;
+    }
+    if result == -9223372036854775807 - 1 {
+        return 0;
+    }
+    return 0 - result;
 }
 
 // The byte at `idx` as a one-byte string ("" when out of range).
@@ -8165,6 +8394,291 @@ pub fn str_parse_float(s: str) -> f64 {
 /// Convert a byte value to a single-character string.
 pub fn byte_to_str(b: i64) -> str {
     return p_char_to_str(b);
+}
+
+// f"{v:spec}" (reference §1.8): the spec is the raw text after the ':' —
+// [fill][<|>|^][#][0][+][width][.precision][x|X|b|o]. The fstr_fmt_* are
+// emitted by the lowerer for a `{e:spec}` part (lower.fd
+// Lowerer_lower_fstr_fmt); they are not a user-facing API.
+
+fn __fstr_flag(spec: str, c: i64) -> bool {
+    var i: i64 = 0;
+    while i < str_len(spec) {
+        if str_byte_at(spec, i) == c {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// The digits at i, as a number (i is past them on return — callers rescan).
+fn __fstr_num_at(spec: str, i: i64) -> i64 {
+    var n: i64 = 0;
+    while i < str_len(spec) {
+        var c: i64 = str_byte_at(spec, i);
+        if c < 48 || c > 57 {
+            break;
+        }
+        n = n * 10 + (c - 48);
+        i = i + 1;
+    }
+    return n;
+}
+
+/// The index of the first digit before any '.', or -1 (the width run; a
+/// leading '0' of it is the zero-pad flag).
+fn __fstr_width0(spec: str) -> i64 {
+    var i: i64 = 0;
+    while i < str_len(spec) {
+        var c: i64 = str_byte_at(spec, i);
+        if c == 46 {
+            return -1;
+        }
+        if c >= 48 && c <= 57 {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn __fstr_zero(spec: str) -> bool {
+    var w0: i64 = __fstr_width0(spec);
+    if w0 < 0 || w0 + 1 >= str_len(spec) {
+        return false;
+    }
+    var c1: i64 = str_byte_at(spec, w0 + 1);
+    return str_byte_at(spec, w0) == 48 && c1 >= 48 && c1 <= 57;
+}
+
+/// The digits after the '.', or -1 when there is none (`{x:.}` counts 0).
+fn __fstr_prec(spec: str) -> i64 {
+    var i: i64 = 0;
+    while i < str_len(spec) {
+        if str_byte_at(spec, i) == 46 {
+            return __fstr_num_at(spec, i + 1);
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// The conversion letter of the spec: 'x', 'X', 'b' or 'o', else 0.
+fn __fstr_conv(spec: str) -> i64 {
+    var conv: i64 = 0;
+    var i: i64 = 0;
+    while i < str_len(spec) {
+        var c: i64 = str_byte_at(spec, i);
+        if c == 120 || c == 88 || c == 98 || c == 111 {
+            conv = c;
+        }
+        i = i + 1;
+    }
+    return conv;
+}
+
+/// mag in the given base, a-f or A-F as `upper` says.
+fn __fstr_radix(mag: u64, base: u64, upper: bool) -> str {
+    var bytes: Vec<i64> = Vec::new();
+    var x: u64 = mag;
+    if x == 0 {
+        bytes.push(48);
+    }
+    while x > 0 {
+        var d: u64 = x % base;
+        var lo: i64 = 87;
+        if upper {
+            lo = 55;
+        }
+        var c: i64 = lo + (d as i64);
+        if d < 10 {
+            c = 48 + (d as i64);
+        }
+        bytes.push(c);
+        x = x / base;
+    }
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = bytes.len() - 1;
+    while i >= 0 {
+        out.push(bytes.get(i));
+        i = i - 1;
+    }
+    return str_from_bytes(out);
+}
+
+/// '0' padding goes after the sign and the `0x`-style prefix, as `-0042`.
+fn __fstr_pad_zero(s: str, n: i64) -> str {
+    var pos: i64 = 0;
+    if str_len(s) > 0 {
+        var c0: i64 = str_byte_at(s, 0);
+        if c0 == 45 || c0 == 43 {
+            pos = 1;
+        }
+    }
+    if pos + 1 < str_len(s) {
+        var c1: i64 = str_byte_at(s, pos);
+        var c2: i64 = str_byte_at(s, pos + 1);
+        if c1 == 48 && (c2 == 120 || c2 == 88 || c2 == 98 || c2 == 111) {
+            pos = pos + 2;
+        }
+    }
+    return str_slice(s, 0, pos) + str_repeat("0", n) + str_slice(s, pos, str_len(s));
+}
+
+/// Pad s to the spec's width: '<' left, '>' right, '^' centered, else the
+/// type's default (numbers right, text left). allow_zero is a number's
+/// `0` flag.
+fn __fstr_pad(s: str, spec: str, def_align: i64, allow_zero: bool) -> str {
+    var width: i64 = 0;
+    var w0: i64 = __fstr_width0(spec);
+    if w0 >= 0 {
+        width = __fstr_num_at(spec, w0);
+    }
+    var pad_n: i64 = width - str_len(s);
+    if pad_n <= 0 {
+        return s;
+    }
+    var align: i64 = def_align;
+    if __fstr_flag(spec, 60) {
+        align = 60;
+    }
+    if __fstr_flag(spec, 62) {
+        align = 62;
+    }
+    if __fstr_flag(spec, 94) {
+        align = 94;
+    }
+    if allow_zero && align == 62 && __fstr_zero(spec) {
+        return __fstr_pad_zero(s, pad_n);
+    }
+    if align == 60 {
+        return s + str_repeat(" ", pad_n);
+    }
+    if align == 94 {
+        var l: i64 = pad_n / 2;
+        return str_repeat(" ", l) + s + str_repeat(" ", pad_n - l);
+    }
+    return str_repeat(" ", pad_n) + s;
+}
+
+/// The alternate-form `#` prefix of the conversion, "" for none.
+fn __fstr_alt(conv: i64, spec: str) -> str {
+    if __fstr_flag(spec, 35) == false {
+        return "";
+    }
+    if conv == 120 {
+        return "0x";
+    }
+    if conv == 88 {
+        return "0X";
+    }
+    if conv == 98 {
+        return "0b";
+    }
+    if conv == 111 {
+        return "0o";
+    }
+    return "";
+}
+
+pub fn fstr_fmt_i64(v: i64, spec: str) -> str {
+    var conv: i64 = __fstr_conv(spec);
+    var neg: bool = v < 0;
+    var mag: i64 = v;
+    if neg {
+        mag = 0 - v;
+    }
+    var s: str = int_to_str(mag);
+    if conv == 120 || conv == 88 {
+        s = __fstr_radix(mag as u64, 16, conv == 88);
+    } else if conv == 98 {
+        s = __fstr_radix(mag as u64, 2, false);
+    } else if conv == 111 {
+        s = __fstr_radix(mag as u64, 8, false);
+    }
+    var pre: str = __fstr_alt(conv, spec);
+    if neg {
+        pre = "-" + pre;
+    } else if __fstr_flag(spec, 43) {
+        pre = "+" + pre;
+    }
+    return __fstr_pad(pre + s, spec, 62, true);
+}
+
+pub fn fstr_fmt_u64(v: u64, spec: str) -> str {
+    var conv: i64 = __fstr_conv(spec);
+    var s: str = u64_to_str(v);
+    if conv == 120 || conv == 88 {
+        s = __fstr_radix(v, 16, conv == 88);
+    } else if conv == 98 {
+        s = __fstr_radix(v, 2, false);
+    } else if conv == 111 {
+        s = __fstr_radix(v, 8, false);
+    }
+    var pre: str = __fstr_alt(conv, spec);
+    if __fstr_flag(spec, 43) {
+        pre = "+" + pre;
+    }
+    return __fstr_pad(pre + s, spec, 62, true);
+}
+
+pub fn fstr_fmt_f64(v: f64, spec: str) -> str {
+    var s: str = "";
+    var prec: i64 = __fstr_prec(spec);
+    if prec < 0 {
+        s = float_to_str(v);
+    } else {
+        if prec > 18 {
+            prec = 18;
+        }
+        var neg: bool = v < 0.0;
+        var av: f64 = v;
+        if neg {
+            av = 0.0 - v;
+        }
+        var scale: f64 = 1.0;
+        var ip10: i64 = 1;
+        var pi: i64 = 0;
+        while pi < prec {
+            scale = scale * 10.0;
+            ip10 = ip10 * 10;
+            pi = pi + 1;
+        }
+        var w: i64 = ((av * scale) + 0.5) as i64;
+        var ipart: i64 = w / ip10;
+        var frac: i64 = w - (ipart * ip10);
+        s = int_to_str(ipart);
+        if prec > 0 {
+            var fs: str = int_to_str(frac);
+            s = s + "." + str_repeat("0", prec - str_len(fs)) + fs;
+        }
+        if neg {
+            s = "-" + s;
+        }
+    }
+    if str_len(s) > 0 && str_byte_at(s, 0) != 45 && __fstr_flag(spec, 43) {
+        s = "+" + s;
+    }
+    return __fstr_pad(s, spec, 62, true);
+}
+
+pub fn fstr_fmt_bool(b: bool, spec: str) -> str {
+    var s: str = "false";
+    if b {
+        s = "true";
+    }
+    return __fstr_pad(s, spec, 62, false);
+}
+
+/// A str: `.n` truncates to n bytes, the rest is padding.
+pub fn fstr_fmt_str(s: str, spec: str) -> str {
+    var t: str = s;
+    var prec: i64 = __fstr_prec(spec);
+    if prec >= 0 && str_len(t) > prec {
+        t = str_slice(t, 0, prec);
+    }
+    return __fstr_pad(t, spec, 60, false);
 }
 
 /// OP15: a hint that the code calling it is the unlikely side (Rust's

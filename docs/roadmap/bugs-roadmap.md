@@ -24,12 +24,17 @@ latent (no current caller) or minor.
 Counts at the review: 17 critical, 38 high, 34 medium, 17 low (106 open
 entries), plus one found and fixed during the review (BG100).
 
-Status Nov 23 (after the Nov 22-23 fix batches, built and run on run, C,
-emit, nat and the tooling checks): 125 entries, 103 done `[x]`, 8 partly
-done `[~]` (BG35, BG40, BG45, BG46, BG60, BG61, BG75, BG110: each names
-what is left), 14 open. Open from the review: BG62 and BG63 (language work,
-BG122), BG85 (mono.fd), BG108 (ssa.fd, critical). Open and found while
-fixing: BG115-BG124.
+Status Nov 24 (after the Nov 22-24 fix batches, built and run on run, C,
+emit, nat and the tooling checks): 127 entries, 127 done `[x]`, 0 open.
+The Nov 24 batch closed the last of the review list: BG85, BG108 (in
+ssa.fd `ssa_materialize`), BG115, BG116 (already consistent), BG121,
+BG123, and BG126 (fixed-array returns routed through sret) — and the
+last three partly-done marks: BG40's remaining `p_vec_clone` and
+`p_vec_zeroize` element-code gaps, BG45 and BG46.
+
+Nov 24 review: 114 new entries, BG128-BG241 (22 critical, 51 high, 29
+medium, 12 low), all open; see "Found by the Nov 24 whole-repo review"
+below.
 
 Status markers as in the other roadmaps: `[ ]` open, `[~]` partly done,
 `[x]` done.
@@ -299,14 +304,16 @@ Status markers as in the other roadmaps: `[ ]` open, `[~]` partly done,
       Fixed Nov 22-23 (compiler.fd `merge_programs` keeps the declarations);
       test test_import_component_decls (with decl_lib/shapes.fd) pass on run,
       C and emit.
-- [~] BG35. **The import cache (CB1) drops `comptime splice` from imported
+- [x] BG35. **The import cache (CB1) drops `comptime splice` from imported
       modules on a hit.** compiler.fd:659-671 (`cached_parse`): `g_saw_splice`
       is never set from a cached AST. Trigger: the second build of a program
       importing a module that uses `comptime splice`. Confidence: high.
       Partly fixed Nov 22-23 (compiler.fd `cached_parse`: a module that saw a
       `comptime splice` is never kept in the import cache);
-      tests/tooling/impcache-splice-check.sh passes. Left: the merged AST
-      cache (BG123).
+      tests/tooling/impcache-splice-check.sh passes. Fixed Nov 24
+      (compiler.fd `astcache_save`: the merged AST artifact is not written
+      when a library source — core or a runtime file — mentions `splice`,
+      so a decoded merged AST can never replay a splice silently).
 - [x] BG36. **A reused cached artifact is not executable on Linux/macOS.**
       compiler/inc.fd:1233; main.fd:5360-5363 (no chmod). Trigger: `fid run x.fd
       --leaks` twice: "Permission denied". Confidence: high.
@@ -331,18 +338,28 @@ Status markers as in the other roadmaps: `[ ]` open, `[~]` partly done,
       client disconnects). codegen_c.fd:16533-16540 (`write`, no MSG_NOSIGNAL).
       Confidence: high.
       Fixed Nov 22-23 (codegen_c.fd: no SIGPIPE from `p_socket_write`); test
-      test_socket_write_closed_peer pass on run, C and emit.
-- [~] BG40. **C runtime `p_vec_push/set/insert` ignore element codes and shared
+      test_socket_write_closed_peer pass on C (a ccompile-only test).
+- [x] BG40. **C runtime `p_vec_push/set/insert` ignore element codes and shared
       buffers** (heap overflow on `Vec<u8>`, abort on a shared Vec).
       codegen_c.fd:11620-11644, 16288-16293. Confidence: medium-high.
       Partly fixed Nov 22-23 (codegen_c.fd: push, set and insert go through
       the element code and the share box as core's Vec does); test
-      test_cback_vec_push_codes pass on run, C and emit. Left: remove,
-      reverse, sort, pop and truncate (BG120).
+      test_cback_vec_push_codes pass on C (a ccompile-only test). Fixed Nov 24
+      (codegen_c.fd: `p_vec_pop`, `p_vec_remove`, `p_vec_reverse`,
+      `p_vec_sort` and `p_vec_truncate` delegate to core's Vec functions —
+      element size and shared-buffer ownership handled there — and
+      core.fd `vec_raw_reverse` swaps a struct element through a copy, as
+      its address is not its value); test test_cback_vec_ops_codes pass on C (a ccompile-only test). Also Nov 24: `p_vec_clone` keeps the element
+      code and type id (a coded Vec cloned to word slots — an inline
+      struct's element address stored raw, pointing into the original's
+      buffer) and `p_vec_zeroize` sizes the element as `__p_sens_esz`
+      does — an inline-struct code (>= 16) wiped `cap * code` bytes,
+      past the buffer's end. A `@zeroize Vec<P>` test with a second Vec
+      after it prints 365/done on C — the trailing buffer intact.
 - [x] BG41. **C runtime `p_read_line` splits lines longer than 4095 bytes.**
       codegen_c.fd:12688-12696. Confidence: high.
       Fixed Nov 22-23 (codegen_c.fd: `p_read_line` reads a whole line); test
-      test_read_line_long pass on run, C and emit.
+      test_read_line_long pass on C (a ccompile-only test).
 - [x] BG42. **SCCP folds a same-width BitCast without normalising**, so a later
       IntExtend is wrong. compiler/iropt.fd:4649-4666. Trigger: `(x as i32) as
       i64` of `u32::MAX` gives 4294967295, not -1 (emit). Confidence: high.
@@ -364,19 +381,26 @@ Status markers as in the other roadmaps: `[ ]` open, `[~]` partly done,
       function compiled, no complaint; the x86-64 images run under WSL). The
       check builds both versions from one path: the cache salt covers the
       input file's name.
-- [~] BG45. **Spawn scopes join detached threads; `p_thread_join` leaves the
+- [x] BG45. **Spawn scopes join detached threads; `p_thread_join` leaves the
       handle so it is joined twice** (UB; use after free on Windows).
       codegen_c.fd:15681-15691, 15668, 15900-15907. Confidence: high.
       Partly fixed Nov 22-23 (codegen_c.fd: a scope joins only the threads it
       started, `p_thread_join` clears the handle, `p_co_detach` lets a thread
-      future go); test test_spawn_scope_outer_thread pass on run, C and emit.
-      Left: the lowering half (BG119).
-- [~] BG46. **Awaiting the same future twice gives two owners of one result**
+      future go); test test_spawn_scope_outer_thread pass on C (a ccompile-only test).
+      Fixed Nov 24 (lower.fd: `spawn detached f()` calls `p_co_detach` for a
+      thread's future too; pe_runtime/conc.fd and linux_runtime/conc.fd
+      `pert_co_detach` take a thread future, and their executor scans join
+      only threads the scope started); test
+      test_spawn_scope_detached_thread pass on C and emit.
+- [x] BG46. **Awaiting the same future twice gives two owners of one result**
       (double free). lower.fd `Expr::Await` (~18248); codegen_c.fd:13524.
       Confidence: medium-high.
       Partly fixed Nov 22-23 (lower.fd: a future awaited more than once gives
       each await an owner of its own); test test_await_twice_owners pass on
-      run, C and emit. Left: a single await inside a loop (BG123).
+      run, C and emit. Fixed Nov 24 (lower.fd: the await counter walks loop
+      bodies at a depth — one `await x` in a loop's body or condition
+      counts as awaited again); test test_await_loop_owners pass on run, C
+      and emit.
 - [x] BG47. **Comptime rejects valid `u64` literals** in any function holding a
       comptime expression. comptime_eval.fd:460-463 (`ct_check_int_fit`).
       Trigger: `val m: u64 = 18446744073709551615; val k = comptime 2 + 3;`.
@@ -457,25 +481,45 @@ Status markers as in the other roadmaps: `[ ]` open, `[~]` partly done,
       typechecker.fd:5450-5463, 6491-6512. Confidence: high.
       Fixed Nov 22-23 (typechecker.fd: recursion through methods found); test
       test_no_recursion_method_fail pass on run, C and emit.
-- [~] BG60. **Comparisons are not type-checked** (beyond str vs number), and
+- [x] BG60. **Comparisons are not type-checked** (beyond str vs number), and
       `1 < x < 10` parses as `(1 < x) < 10`, always true. typechecker.fd:20049-20077;
       parser.fd:6944. Confidence: high.
       Partly fixed Nov 22-23 (typechecker.fd `TypeChecker_check_comparison`:
       chained comparisons, ordering bools, a bool with a str, and two
       different structs or enums are errors); tests test_cmp_chain_fail,
-      test_cmp_user_types_fail, test_cmp_ok pass on run, C and emit. Left:
-      numbers of different types (`i64 < f64`, `u8 == i64`) are still
-      accepted; the runtime layer and compiler/ modules are exempt.
-- [~] BG61. **An integer literal of 2^64 or more wraps silently; one above
+      test_cmp_user_types_fail, test_cmp_ok pass on run, C and emit. Fixed
+      Nov 24 (check_comparison: two numbers of different types — `i64 <
+      f64`, `u8 == i64` — are an error, as is a literal that cannot fit the
+      other side's int type; a literal that can adapt is still fine);
+      tests test_cmp_numeric_fail, test_cmp_int_float_fail and
+      test_cmp_ok pass on run, C and emit. The runtime layer and
+      compiler/ modules are exempt.
+- [x] BG61. **An integer literal of 2^64 or more wraps silently; one above
       i64::MAX fits an `i64`.** compiler/lexer.fd:1445-1455;
       typechecker.fd:14506. Confidence: high.
       Partly fixed Nov 22-23 (lexer.fd `lex_int_too_big`: a literal of 2^64 or
       more is an error); test test_int_literal_too_big_fail pass on run, C and
-      emit. Left: a literal that does not fit its declared type (BG117).
-- [ ] BG62. **Comptime arithmetic treats `u64` as signed.**
+      emit. Fixed Nov 24 (typechecker.fd `TypeChecker_check_value_fits` runs
+      where a declared type meets a literal and only a literal slipped
+      through: call arguments, `return`, struct-literal fields, enum
+      payloads and const initializers); tests test_literal_arg_fail,
+      test_literal_return_fail, test_literal_field_fail,
+      test_literal_const_fail and test_literal_enum_fail pass on run, C
+      and emit.
+- [x] BG62. **Comptime arithmetic treats `u64` as signed.**
       comptime_eval.fd:5111-5203. Confidence: medium.
-- [ ] BG63. **Inline `asm!` does not need `unsafe`.** typechecker.fd:21494-21518.
+      Fixed Nov 24 (comptime_eval.fd: a `val x: u64` inside comptime keeps
+      an unsigned tag — `ct_untag_type`/`ct_int_untag` — so shifts,
+      division and comparisons run on the bits unsigned and `~` masks to
+      the declared width; `ct_check_int_fit` takes bits already inside an
+      unsigned width); test test_comptime_u64 pass on run, C and emit.
+- [x] BG63. **Inline `asm!` does not need `unsafe`.** typechecker.fd:21494-21518.
       Confidence: high.
+      Fixed Nov 24 (typechecker.fd: `asm!` outside an `unsafe { }` block or
+      an `@unsafe` function is E097; the in-tree asm tests, the bare-metal
+      examples and scripts/pe-win/asm_process.fd carry `@unsafe` now;
+      reference.md §4.4/§8.5 document it); test test_asm_unsafe_fail is
+      rejected on run; the wrapped tests pass on run.
 - [x] BG64. **lockcheck never sees `p_mutex_lock`, and its call-graph pass
       propagates almost nothing.** lockcheck.fd:75-77, 446-466. Confidence: high.
       Fixed Nov 22-23 (lockcheck.fd: `p_mutex_lock` is a lock, and the
@@ -499,11 +543,11 @@ Status markers as in the other roadmaps: `[ ]` open, `[~]` partly done,
 - [x] BG68. **`p_dir_list` can overflow its buffer if the directory changes
       between its two passes.** codegen_c.fd:13336-13384. Confidence: high.
       Fixed Nov 22-23 (codegen_c.fd `p_dir_list` bounds its second pass); test
-      test_file_write_nul pass on run, C and emit.
+      test_file_write_nul pass on C (a ccompile-only test).
 - [x] BG69. **`p_process_run` is not thread-safe and truncates long commands.**
       codegen_c.fd:12781-12811. Confidence: high.
       Fixed Nov 22-23 (codegen_c.fd `p_process_run`: thread-safe, no command
-      length limit); test test_process_run_threads pass on run, C and emit.
+      length limit); test test_process_run_threads pass on C (a ccompile-only test).
 - [x] BG70. **`fid serve` shares the in-memory IR cache across targets, @cfg and
       borrow modes.** compiler.fd:5628-5645, 13957; inc.fd:680-690. Confidence:
       medium.
@@ -524,23 +568,24 @@ Status markers as in the other roadmaps: `[ ]` open, `[~]` partly done,
       unrelated thread.** codegen_c.fd:13524-13535; lower.fd:18357-18359,
       15252-15254. Confidence: high.
       Fixed Nov 22-23 (codegen_c.fd, lower.fd: a thread future is tagged, not
-      told apart by sign); test test_future_negative_value pass on run, C and
-      emit.
+      told apart by sign); test test_future_negative_value pass on C (a ccompile-only test).
 - [x] BG74. **Interpreter channels ignore their capacity; a send never waits.**
       interp.fd:11589-11641. Confidence: high.
       Fixed Nov 22-23 (interp.fd: a send waits on a full channel); test
-      test_chan_send_waits_full pass on run, C and emit.
-- [~] BG75. **Closures and `dyn Trait` values count as `@send`.**
+      test_chan_send_waits_full pass on run and C (not run on emit).
+- [x] BG75. **Closures and `dyn Trait` values count as `@send`.**
       typechecker.fd:18348, 18196. Confidence: medium.
       Partly fixed Nov 22-23 (typechecker.fd: a `dyn Trait` is not @send, and
       a closure literal given to a spawned call has its captures checked);
-      test test_spawn_closure_capture_fail pass on run, C and emit. Left: a
-      closure held in a variable (a `fn` type) still counts as @send.
+      test test_spawn_closure_capture_fail pass on run, C and emit. Fixed
+      Nov 24 (typechecker.fd `is_send_type`: a `fn` type is not @send — the
+      value may be a closure whose captured state two threads would
+      share); test test_spawn_fn_var_fail pass on run, C and emit.
 - [x] BG76. **On one worker, `task_run()` from inside a task runs a nested
       scheduler pass over the same list.** codegen_c.fd:15297-15306,
       14216-14238. Confidence: medium.
       Fixed Nov 22-23 (codegen_c.fd: `task_run()` inside a task starts no
-      nested pass); test test_task_run_in_task pass on run, C and emit.
+      nested pass); test test_task_run_in_task pass on C (a ccompile-only test).
 - [x] BG77. **@secret: an early `return`/`break` under a secret branch leaks
       through control flow.** secrecy.fd:752-764, 783, 733. Confidence: high.
       Fixed Nov 22-23 (secrecy.fd: an early return or break under a secret
@@ -566,8 +611,7 @@ Status markers as in the other roadmaps: `[ ]` open, `[~]` partly done,
       `p_file_write` hides write errors.** codegen_c.fd:12657-12680.
       Confidence: high.
       Fixed Nov 22-23 (codegen_c.fd: `p_file_write`/`p_file_append` write the
-      whole length and report errors); test test_file_write_nul pass on run, C
-      and emit.
+      whole length and report errors); test test_file_write_nul pass on C (a ccompile-only test).
 - [x] BG82. **A by-value struct parameter reassigned in the body leaks the
       new value.** lower.fd:6650-6702, 11136-11153. Confidence: medium.
       Fixed Nov 22-23 (lower.fd: the reassigned parameter's new value is
@@ -611,9 +655,15 @@ Status markers as in the other roadmaps: `[ ]` open, `[~]` partly done,
       Fixed Nov 22-23 (comptime_eval.fd: a range ending at i64::MAX unrolled
       without overflow); test test_comptime_unroll_i64_max pass on run, C and
       emit.
-- [ ] BG85. **mono name mangling can give two instantiations one name**
+- [x] BG85. **mono name mangling can give two instantiations one name**
       (array size dropped; tuples not delimited). compiler/mono.fd:452-466.
       Confidence: medium.
+      Fixed Nov 24 (mono.fd `mangle_type`: `[T; N]` keeps its N, and the
+      tuple and ArrayConst parts are joined with their count — `tup2_a_b` —
+      so `i64_i64` and `i64i64` can no longer collide; single-arg
+      `pick__i64`/`Vec__i64` shapes unchanged). The `sz<T>` probe then
+      surfaced a separate generic-array return-code bug (a single `[i64;3]`
+      instantiation comes back zeroed on run): filed as BG126.
 - [x] BG86. **Function-cache instruction hash runs list fields together**
       (Asm outs/ins, Generic args). nat_ir.fd:36919-36932, 36640-36648.
       Confidence: high (collision), low (in practice).
@@ -663,11 +713,11 @@ Status markers as in the other roadmaps: `[ ]` open, `[~]` partly done,
 - [x] BG96. **Interpreter: two tasks awaiting each other hang where compiled
       code panics.** interp.fd:11034-11049. Confidence: medium.
       Fixed Nov 22-23 (interp.fd: a cycle of awaiting tasks panics); test
-      test_task_await_cycle_fail pass on run, C and emit.
+      test_task_await_cycle_fail pass on run and C (not run on emit).
 - [x] BG97. **`p_json_parse`/`p_json_dump` turn nested objects into invalid
       JSON.** codegen_c.fd:17700-17706. Confidence: high.
       Fixed Nov 22-23 (codegen_c.fd: nested objects kept valid); test
-      test_cback_json_nested pass on run, C and emit.
+      test_cback_json_nested pass on C (a ccompile-only test).
 - [x] BG98. **@secret: `panic`, `assert` and `exit` are not sinks.**
       secrecy.fd:131. Confidence: high.
       Fixed Nov 22-23 (secrecy.fd: `panic`, `assert` and `exit` are sinks);
@@ -685,7 +735,7 @@ Status markers as in the other roadmaps: `[ ]` open, `[~]` partly done,
 
 ## Found while fixing the criticals (Nov 22)
 
-- [ ] BG108. **Critical. The mid-end SSA round trip miscompiles a loop that
+- [x] BG108. **Critical. The mid-end SSA round trip miscompiles a loop that
       rotates its variables** (pe_ir and nat; C and `run` are right).
       compiler/ssa.fd `ssa_round_trip`: the phis it builds are right
       (FID_SSA_DUMP), but the function after it is not: translation
@@ -700,6 +750,11 @@ Status markers as in the other roadmaps: `[ ]` open, `[~]` partly done,
       test_std_ssh, test_std_x509, test_stdlib_secret_keys, ...): the
       compression loop rotates a..e. The Nov 18 fid and release/fid.exe do
       the same, so it predates this work. Confidence: high (reproduced).
+      Fixed Nov 24 (ssa.fd `ssa_materialize` copies a phi's reads through
+      temporaries before the writes — a swap between two phis no longer
+      reads the new value): the trigger program prints `112 6 101 102` on
+      emit, `fid emit --validate` reports 0 rejections on it and on
+      test_hmac_sha512, and test_hmac_sha512 passes on emit.
 - [x] BG109. **pe_ir: `println` of an f32 and an f32 stored into a Vec word
       lost the value** (`movq rcx, xmm0` / `movq rax, xmm0` encoded as
       `66 48 0F D6`, which is `movq xmm, xmm`). compiler/pe_ir.fd
@@ -710,13 +765,15 @@ Status markers as in the other roadmaps: `[ ]` open, `[~]` partly done,
       test_vec_f32_index.fd on emit.
       Built and checked Nov 23: test_vec_f32_index passes on run, C, emit and
       nat.
-- [~] BG110. **The native runtimes still cap threads at 256** (the C
+- [x] BG110. **The native runtimes still cap threads at 256** (the C
       runtime's table is chunked since BG9; pe_runtime/linux_runtime keep a
       fixed table). Confidence: medium (from the BG9 fix's notes).
       Partly fixed Nov 22-23 (stdlib/pe_runtime/conc.fd and
       linux_runtime/conc.fd: the thread table is chunked as the C runtime's);
       tests test_native_spawn_many, test_spawn_many pass on run, C, emit and
-      nat. Left: the pe_ir runtime may join a thread twice (BG123).
+      nat. Fixed Nov 24 (both `pe_join`s claim the join by compare-and-swap
+      on the slot's state word — a second caller waits for the result the
+      first stores instead of joining the thread again).
 - [x] BG111. **Field assignment on a generic struct instance was rejected
       by the type checker** (`h.v = s` with `h: H<str>`: "cannot assign
       field 'v' on the generic type parameter H<str>", CE9's message for a
@@ -747,7 +804,7 @@ Status markers as in the other roadmaps: `[ ]` open, `[~]` partly done,
 
 ## Found while fixing the rest (Nov 23)
 
-- [ ] BG115. **High. A bare `Some(v)` / `None` pattern is accepted and binds
+- [x] BG115. **High. A bare `Some(v)` / `None` pattern is accepted and binds
       `v` as i64.** reference.md §(enums) says a bare `Some(5)` is an
       undefined function, but as a match pattern `Some(v)` matches the
       Option's tag and `v` gets type i64 whatever the payload is: with
@@ -756,46 +813,94 @@ Status markers as in the other roadmaps: `[ ]` open, `[~]` partly done,
       pattern resolves to `Option::Some` with the payload's type, or it is
       an error. Seen in three new tests (test_cparser_casts,
       test_read_line_long: rewritten to `Option::Some`). Confidence: high.
-- [ ] BG116. **`s.len()` on a `str` is accepted by `fid run` and rejected
+      Fixed Nov 24 (typechecker.fd `pattern_binding_types` resolves the
+      enum through `resolve_pattern_enum`, so a bare `Some(v)` on an
+      `Option<str>` scrutinee finds Option, and the generic-arg lookup uses
+      the resolved name, not the pattern's empty one): `v` binds `str`,
+      `v == "x"` typechecks, `int_to_str(v)` is rejected.
+- [x] BG116. **`s.len()` on a `str` is accepted by `fid run` and rejected
       by `ccompile` and `emit`** ("cannot call method 'len' on type str").
       One program, two answers from the checker depending on the path;
       `str_len(s)` works on all. Trigger: test_pe_str_join_n before its
       Nov 23 rewrite. Confidence: high.
-- [ ] BG117. **BG61's type-checker half**: the lexer rejects a literal over
+      Already fixed when re-checked Nov 24: `s.len()` on a `str` is rejected
+      on run, ccompile and emit alike ("cannot call method 'len' on type
+      str"); `str_len` works on all. No divergence left.
+- [x] BG117. **BG61's type-checker half**: the lexer rejects a literal over
       64 bits now (test_int_literal_too_big_fail), but a literal that fits
       in 64 bits and not in its declared type (`val b: u8 = 300;`) is not
       checked yet.
-- [ ] BG118. **The lock-order check runs only in `fid check`**, not in
+      Fixed Nov 24 with BG61 (see its note): `check_value_fits` runs at
+      every position a declared type takes a literal.
+- [x] BG118. **The lock-order check runs only in `fid check`**, not in
       `run`/`ccompile`/`emit`, so test_lockcheck_cycle_fail can never
       fail to compile on those paths. compiler/lockcheck.fd.
-- [ ] BG119. **BG45's lowering half**: `Lowerer_lower_spawn_detached`
+      Fixed Nov 24 (main.fd `cmd_build` runs `c_lockcheck_errors` after
+      lowering on every build path); test_lockcheck_cycle_fail fails to
+      compile on run, C and emit.
+- [x] BG119. **BG45's lowering half**: `Lowerer_lower_spawn_detached`
       detaches green tasks only, so `spawn detached f()` on a thread inside
       a scope is still joined at the scope's end. The C runtime's
       `p_co_detach` accepts a thread future now; pe_ir's and nat_ir's do
       not, so lower.fd cannot call it for threads yet.
-- [ ] BG120. **BG40 leftovers**: the C runtime's `p_vec_remove`,
+      Fixed Nov 24 with BG45 (see its note): `pert_co_detach` takes a
+      thread future in both native runtimes, and lower.fd emits the call
+      for any spawned call.
+- [x] BG120. **BG40 leftovers**: the C runtime's `p_vec_remove`,
       `reverse`, `sort`, `pop` and `truncate` still ignore element codes and
       shared buffers (push/set/insert were fixed).
-- [ ] BG121. **cparser maps `long` / `unsigned long` to i32/u32 on every
+      Fixed Nov 24 with BG40 (see its note): all five delegate to core's
+      Vec functions; `vec_raw_reverse`'s struct swap is fixed too, and the
+      interpreter's `p_vec_reverse`/`insert`/`remove`/`contains`/`first`/
+      `last`/`extend`/`to_str`/`sort` had the same raw-word bug —
+      `p_vec_reverse` on a `Vec<u8>` wrote 8-byte words into a byte buffer
+      and corrupted the heap, and the mutating `p_vec_*` calls skipped
+      `vec_own` so `var b = a; p_vec_reverse(b)` reversed `a`'s buffer too
+      (interp.fd: all go through `interp_vec_ld`/`st`/`esz` and
+      `interp_vec_own`, the share-box check core's `vec_own` does; a struct
+      element is copied out before a remove's shift).
+- [x] BG121. **cparser maps `long` / `unsigned long` to i32/u32 on every
       target**: wrong on 64-bit Linux and macOS (LP64). The C++ path
       (`cpx_base_of`) maps `long double` to double: values cross the shim
       right, a `long double*` does not.
-- [ ] BG122. **BG63 / BG62 need language work**: BG63 (asm outside
+      Fixed Nov 24 (cparser.fd `cp_resolve`: `long`/`unsigned long` are
+      i32/u32 only when `cp_on_windows()`, i64/u64 under LP64;
+      `cpx_base_of` maps `long double` to `ldouble` off-Windows like the C
+      path, and a `ldouble` pointer/ref is rejected while a by-value one
+      stays `double`); `fid parse-header` on a `long`/`long double*`
+      header emits i32 with the LLP64 note on Windows.
+- [x] BG122. **BG63 / BG62 need language work**: BG63 (asm outside
       `unsafe`) needs about 12 asm tests wrapped in `unsafe` and the docs
       changed with it; BG62 needs typed comptime values.
-- [ ] BG123. **Small leftovers from the Nov 22 batch**: lsp.fd keeps
+      Fixed Nov 24 with BG62 and BG63 (see their entries): the asm tests
+      carry `@unsafe` and the reference documents it; comptime values
+      carry a type tag (`ct_untag_type`).
+- [x] BG123. **Small leftovers from the Nov 22 batch**: lsp.fd keeps
       `var program`, which would let the BG20 exemption for the compiler
-      go; BG35's merged AST cache is not covered; bindings in an
-      `inline for` body leak into the enclosing scope; `fid fmt` prints
-      `impl<T>` as `impl < T >`; BG46 is fixed for repeated awaits but not
-      for a single await inside a loop; BG60 and BG75 are partly done (see
-      their notes); BG110's pe_ir runtime may join a thread twice.
-- [ ] BG124. **`fid fmt --check` reports a CRLF file as unformatted.** On a
+      go; bindings in an `inline for` body leak into the enclosing scope.
+      (BG35's merged AST cache, BG46's await-in-a-loop, BG60/BG75's
+      leftover checks, BG110's pe_ir double-join and `fid fmt`'s
+      `impl < T >` were done Nov 24 — see their entries.)
+      Fixed Nov 24: lsp.fd's six `var program: Program;` sites initialize
+      with `program_new()` and the `compiler` module no longer keeps the
+      BG20 unassigned-var exemption (typechecker.fd); an `inline for`'s
+      per-iteration body is wrapped in `if true { ... }` so its `val`s
+      stay scoped to the iteration (substitute.fd) — `for i` bindings and
+      body temporaries no longer leak, and assignments to outer `var`s
+      still work; `fid fmt`'s `impl < T >` is under BG124.
+- [x] BG124. **`fid fmt --check` reports a CRLF file as unformatted.** On a
       Windows checkout (`core.autocrlf=true`) scripts/fmt-check.sh fails
       373 of 468 files that are formatted; the formatter writes LF, and the
       check compares bytes. Also: `fid fmt <file>` rewrites the file in
       place with no `--check`, which a probe redirecting its output
       (`fid fmt f.fd > out`) does not expect.
+      Fixed Nov 24 (main.fd `cmd_fmt`: the comparison strips `\r`, so a
+      CRLF checkout is not a formatting difference; plain `fid fmt` prints
+      to stdout and `-w`/`--write` rewrites the file; fmt.fd
+      `generic_closes` takes `impl`'s type-parameter list as always a
+      generic — no more `impl < T >`; fmt-check.sh uses `-w` for the
+      in-place checks and stdout for the fixture diffs); a formatted CRLF
+      file passes `fmt --check` and an unformatted one fails it.
 - [x] BG125. **An `if` or `match` used as a value took its type from one
       branch.** lower.fd `Lowerer_infer_match_type` used the first
       expression statement of any arm, so `PR::Ok(u) => { change(&mut u);
@@ -807,6 +912,1017 @@ Status markers as in the other roadmaps: `[ ]` open, `[~]` partly done,
       the other branch's type) and each branch value is extended to the
       slot's type (`Lowerer_branch_value_to`). Both are older than the
       Nov 22 batch (the Nov 22 compiler printed 44 too).
+
+- [x] BG126. **A function returning a fixed-size array returned a pointer
+      into its own dead stack frame.** Not generic-specific: `fn idc(a:
+      [i64;3]) -> [i64;3] { return a; }` printed `0 20 30` on `run` (the
+      interpreter frees and reuses frame allocas), garbage on `emit`, and
+      crashed `ccompile` ("Invalid memory access at 0x8") — codegen_c's
+      `is_aggregate_ret` already treated `IrType::Array` as an
+      out-parameter return, so the caller pushed an sret argument the
+      callee never expected. Fixed Nov 24: arrays joined the existing
+      sret convention (lower.fd — `is_struct_ret` accepts `IrType::Array`,
+      `emit_sret_copy` emits one `StructCopy` of elem*count bytes, and
+      every call site — named, method, assoc, CallPtr, async, spawn
+      adapter, pipe-forward and `await` — allocates or heap-blocks the
+      buffer); interp CallPtr, nat_ir `ng_is_struct_ty`/`ng_callptr_sret`
+      and codegen_c `StructCopy` sizing learned the same. The same test
+      passes on run, C and emit (`idc([10,20,30])` → `10 20 30`,
+      `mkc()` → `7 8 9`; generic `id<T>` over `[T;3]`/`[T;4]` too);
+      struct and tuple sret unchanged.
+
+- [x] BG127. **`fid run` corrupted its simulated heap instead of
+      panicking at the interpreter's memory limit.** `Memory_alloc_in`
+      returns 0 when the 127 MB `INTERP_MEM_LIMIT` is used up, but of the
+      ~30 `Memory_alloc` callers only `p_malloc` and the alloca path
+      check it: `Memory_store_cstr` wrote the string header at block 0
+      and reported the string's bytes at address 16 (and vec, map and
+      struct allocs did the same elsewhere). test_alloc_thread_heaps hits
+      it — ~32 MB of interned strings a call (cstr blocks are never
+      reused), so the heap was gone by call four, the vec's elements were
+      the word 16, and `Str_drop`/`Str_dup` dereferenced `16 - 16 = 0`:
+      "Invalid memory access (null or dangling pointer)". ccompile and
+      emit pass the test; the failure is run-only and older than the
+      Nov 23 fid. Fixed Nov 24: `Memory` gains `oom_hit`, set by
+      `Memory_alloc_in`'s two exhausted-heap returns and checked after
+      every instruction in `Interpreter_run_function` (as `lim_hit_want`
+      is), so the program stops with "Out of memory: the interpreter
+      holds at most 133169152 bytes" — the panic p_malloc's OOM already
+      raised — instead of running on a fabricated address;
+      `Memory_store_cstr` returns 0 on a failed block instead of writing
+      a header at address 0.
+
+## Found by the Nov 24 whole-repo review
+
+Found on Nov 24 by fifteen review passes over the compiler, the three
+runtimes and the standard library (two rounds; each pass checked its
+findings against this file, known-bugs.md §2g and docs/file-analysis/),
+with the self-hosted compiler built that day (release/fid-dev.exe). Unlike
+the Nov 22 review, nearly every entry was confirmed by running a program:
+"Confirmed Nov 24" names how; "Read only" marks the few that were not.
+Probe programs are not in the repo. Line numbers move: the function
+names are the reference.
+
+### Critical
+
+- [ ] BG128. **The payload of a generic enum constructor is never
+      type-checked.** typechecker.fd `TypeChecker_check_expr` `Expr::EnumLit`
+      returns `Named(enum)` without its type arguments, and
+      `TypeChecker_check_enum_constructor` skips a payload that mentions a
+      type parameter ("checked after monomorphization"; nothing does). So
+      `Option::Some(x)`, `Result::Ok/Err(x)` and a user `W::V(x)` accept any
+      payload. Trigger: `fn h() -> Result<i64, str> { return Result::Ok("no");
+      }`, then `v + 1` on the Ok value: `check` passes, `run` prints 4113, C
+      prints an address; `val o: Option<str> = Option::Some(5)` panics "a str
+      without a string header". Also through a variable, a user `enum W<T>`,
+      an argument and `Vec<Option<str>>.push`. Confirmed Nov 24 (run, C).
+      Confidence: high.
+- [ ] BG129. **A match pattern may name a different enum than the scrutinee.**
+      `TypeChecker_check_enum_pattern` / `TypeChecker_resolve_pattern_enum`
+      use the enum the pattern names and never compare it with the scrutinee's
+      type: `B::P(s)` against an `A` value matches on the tag number and binds
+      `s` with B's payload type. Trigger: `enum A { X(i64), Y } enum B {
+      P(str), Q }`, `match A::X(5) { B::P(s) => { println(s); } _ => {} }`:
+      accepted; `run` prints an empty line, C panics "Invalid memory access at
+      0x5". A literal pattern of the wrong type (`match n_i64 { "a" => ..}`)
+      is accepted too and never matches. Confirmed Nov 24. Confidence: high.
+- [ ] BG130. **`@crashfree`, `@no-panic`, `@no-alloc`, `@no-recursion`,
+      `@conserve` and `@gas` do not look inside f-strings or enum literals.**
+      typechecker.fd `scan_expr_for_calls` (used by `check_safety_body`,
+      `verify_safety_annotations`, `gas_total`, `tc_conserve_calls`) has no
+      arm for `FString`, `EnumLit`, `NamedArg`, `Await`, `Spawn`, `Yield` or
+      `IsCheck`; `scan_expr_for_division` and the panic-risk scan miss
+      `EnumLit` and `FString`. Triggers, all accepted: `@crashfree fn cf(n:
+      i64) -> str { return f"v={boom(n)}"; }` (panics), `return Option::Some(a
+      / b);` (division by zero), `f"{v[b]}"` (out of bounds), `@no-recursion`
+      recursing inside an f-string, `@no-alloc` returning `f"value {n}"`.
+      Confirmed Nov 24 (run). Confidence: high.
+- [ ] BG131. **A `Vec` of `Option<T>` or `Result<T, E>` stores the address of
+      a reused stack slot.** lower.fd, the Vec-method argument path before
+      `Lowerer_vec_mem_size`: `Lowerer_generic_inst_struct_ir` gives a layout
+      only for the program's generic structs and returns `I64` for a built-in
+      generic enum, so the push lowers to `Vec_push` of the enum literal's
+      alloca address instead of `Vec_push_mem` (C: `Vec_push(env, vec,
+      (int64_t)v10)` with `v10 = alloca(16)`). Every push stores the same
+      slot, and the drop frees words never allocated. Trigger: `var w:
+      Vec<Option<i64>>`, push `Option::Some(i * 10)` for i in 0..3, sum the
+      Some values: want 30; `run` prints 60 then "Panic: Double free", C 60
+      then "Invalid free", emit 30 then "Invalid free". `Vec<Option<str>>` and
+      `Vec<Result<..>>` the same; release/fid.exe of Nov 23 too; no test uses
+      these types. Confirmed Nov 24. Confidence: high.
+- [ ] BG132. **Range analysis keeps a value fact across a join reached by a
+      forward edge laid out later (an early `break`), so an overflow check is
+      dropped.** checks.fd `peir_join_set` treats every predecessor not yet
+      scanned as a loop back edge and keeps a value fact when
+      `peir_join_stored` finds no redefinition walking back; a parameter has
+      no definition in any block, so the fact always survives, though the
+      `break` path never carries it. Trigger: `fn f(x: i64, y: i64) -> i64 {
+      var k: i64 = 0; while x < 10 { if k == y { break; } k = k + 1; } return
+      x - 10; }` with `f(i64::MIN, 0)`: `run` panics on the subtraction, the C
+      build prints 9223372036854775798 (`fid explain`: "removed sub overflow
+      check (range analysis)"). Native emit kept the check in this case. Fix
+      direction: drop the fact when that predecessor is not dominated by the
+      join. Confirmed Nov 24 (dump-c + zig cc). Confidence: high.
+- [ ] BG133. **`spawn` of a function with an `f64` parameter or result gives
+      wrong values on C.** codegen_c.fd: `p_thread_spawn(name, n, v1, v2)`
+      passes a `double` into the variadic arguments (`fn_param_types` of
+      `p_thread_spawn` covers only its first two parameters, so `cast_arg`
+      never bit-casts it); the runtime reads every argument with `va_arg(ap,
+      int64_t)`, calls the target through `int64_t (*)(void*, int64_t, ...)`
+      and takes the result from rax where an f64 function returns in xmm0.
+      Trigger: `fn work(x: f64, n: i64) -> i64 { return (x * 2.0) as i64 + n;
+      }`, `await spawn work(2.5, 1)` prints 1 (want 6); `await spawn
+      workf(1.5)` returning `x * 3.0` prints 0.000…0695 (want 4.5). Confirmed
+      Nov 24. Confidence: high.
+- [ ] BG134. **pe_ir: an f32 operation with an f64 constant operand panics the
+      compiler, or (allocator off) computes 0.** pe_ir.fd
+      `PeirGen_gen_float_binop`, `is_f32` path: lowering emits `BinOp(..,
+      F32)` with an f64 `ConstFloat` operand (`z * 4.0`, `acc + 0.5`, `w <
+      0.5`); pe_ir loads both with `movss` and never converts the f64 one.
+      With the constant in an xmm register `PeirEnc_emit_mem_rbp` panics
+      "pe_ir: a register value used as memory"; with `FID_PE_OFF=ra` the low
+      32 bits of the double (0.0) are used. Trigger: `var z: f32 = 1.25; val
+      r: f32 = z * 4.0; println(r as f64);` (run 5).
+      tests/bootstrap/test_isel_f32_mixed.fd fails to emit. nat_ir has
+      `ng_float_mixed`. Confirmed Nov 24. Confidence: high.
+- [ ] BG135. **pe_ir: a struct result from a call through a function value is
+      garbage.** pe_ir.fd `PeirGen_gen_inst` `Inst::CallPtr`: lowering puts
+      the out-pointer at `args[0]`, before `__env`, but CallPtr always loads
+      the env into rcx and shifts every argument up one, so the callee gets
+      the env as its sret pointer and vice versa (nat_ir `ng_callptr_sret`, C
+      and wasm were fixed). Trigger: `fn mk(x: i64, y: i64) -> P`, `fn pick(k:
+      i64) -> fn(i64, i64) -> P { return mk; }`, `val q: P = pick(0)(12,
+      13);`: emit prints 0 / 5368828464, run and C 12 / 13; from a `Vec<fn(..)
+      -> P>` 0 0. tests/bootstrap/test_isel_fnval_sret.fd fails on emit.
+      Confirmed Nov 24. Confidence: high.
+- [ ] BG136. **u64 to f64/f32 is converted as signed on the machine layer and
+      on wasm (BG67 fixed only interp and pe_ir).** nat_ir.fd
+      `Inst::IntToFloat(value, _, to)` drops the source type and
+      `ng_i2f`/`ng_i2f_fr` always emit `cvtsi2sd`/`scvtf`/`fcvt.d.l` (AArch64
+      needs `ucvtf`, RISC-V `fcvt.d.lu`); wasm.fd `Inst::IntToFloat` always
+      emits `f64.convert_i64_s` (0xB9) / `f32.convert_i64_s` (0xB4) instead of
+      0xBA/0xB5. Trigger: `fn conv(a: u64) -> f64 { return a as f64; }`,
+      `conv(18446744073709551615)`: run 18446744073709551616, x86_64-linux /
+      `--nat` / wasm -1; `as f32` wrong too. Confirmed Nov 24. Confidence:
+      high.
+- [ ] BG137. **`fid wasm` does not narrow f64 values used as f32.** wasm.fd
+      `Inst::Store` writes the low 4 bytes of an f64 `ConstFloat` into an
+      `*f32` slot, and f64 arguments to f32 parameters and f64 operands of f32
+      arithmetic are not demoted either (nat_ir has `ng_store_f64_to_f32`, C
+      `*(float*)p = d`). Trigger: `val ff: f32 = 0.1; println(ff); val a: f32
+      = 1.5; val b: f32 = a * 2.0; println(b); println(b > a);`: run and C
+      `0.10000000149011612`, `3`, `true`; wasm
+      `-0.0000000000000000000000158…`, `0`, `false`; `half(3.0)` gives NaN.
+      Confirmed Nov 24. Confidence: high.
+- [ ] BG138. **Escape check: a closure can return a reference to its own
+      captured variable.** escape.fd `esc_closure` checks the closure as its
+      own function where `&a` of a captured local does not count as local, and
+      `esc_call` gives the call of a closure value no roots, so the caller may
+      return or keep it. Trigger: `var a: i64 = 41; val f = fn() -> &i64 =>
+      &a; println(int_to_str(*f()));`: `check` passes, `run` prints 0 (want 41
+      or a rejection); returned from `mk()` and read after another call it
+      prints 5400. Confirmed Nov 24. Confidence: high.
+- [ ] BG139. **Borrow check: a reborrow through a shared reference does not
+      keep the original borrowed.** borrowck.fd
+      `maybe_record_borrow_from_expr` / `extract_field_path`: `val r = &w[0]`
+      with `w = &v` records a borrow of `w`, not `v`, so the borrow of `v`
+      ends at `w`'s last use and `v.push` is allowed while `r` points into the
+      old buffer. Trigger: `val w: &Vec<i64> = &v; val r: &i64 = &w[0];`, push
+      100000 times, `println(int_to_str(*r))`: passes `check`, run and emit
+      print 0 (want 111). Confirmed Nov 24. Confidence: high.
+- [ ] BG140. **Borrow check: a read inside `defer` counts at the `defer`
+      statement, not at the scope's end.** borrowck.fd last-use computation
+      walks a `Stmt::Defer` body where it appears, so the borrow ends at the
+      `defer` line and later mutations are allowed; the deferred read then
+      runs on freed memory. Trigger: `val r = &v[0]; defer {
+      println(int_to_str(*r)); }`, then push 100000 times: passes `check`, run
+      and emit print 0 (want 111). Confirmed Nov 24. Confidence: high.
+- [ ] BG141. **Borrow check: a borrow made inside an `if`/block/`match`
+      initializer is not kept.** `val r = if c { &v[0] } else { &v[1] };` and
+      `val r = { &v[0] };` pass `check`, and after `v` grows `run`/emit print
+      0. docs/file-analysis/borrowck.md lists "a borrow nested in an
+      initializer is not promoted" as LOW and says the borrow is kept to the
+      scope's end; it is in fact unsound. Confirmed Nov 24 (if and block
+      forms; match form passes check, not run with reallocation). Confidence:
+      high.
+- [ ] BG142. **Public consts and globals of the same name in two modules are
+      merged into one.** compiler.fd `merge_programs` merges consts and
+      globals by bare name (the later wins) and `cc_find_module_conflicts`
+      checks only structs. Trigger: `ma.fd` `pub const K: i64 = 1; pub fn a()
+      -> i64 { return K; }`, `mb.fd` the same with `K = 2` and `b`, main
+      prints `ma::a()` and `mb::b()`: run, build and C print `2 2` (want `1
+      2`); with `pub var COUNT` of 100 and 200 incremented by each module,
+      `201 202` (want `101 201`): one shared counter. Confirmed Nov 24.
+      Confidence: high.
+- [ ] BG143. **Type aliases of the same name in two modules: one silently
+      replaces the other; same-named enums give misleading errors.**
+      compiler.fd `merge_programs` (type alias and enum loops) and
+      `cc_find_module_conflicts` (neither covered). Trigger: `ma.fd` `pub type
+      Num = i64; pub fn a() -> Num { val n: Num = 7; return n / 2; }`, `mb.fd`
+      `pub type Num = f64; ...`: run and build print `3.5` for `ma::a()` (want
+      3): ma's integer division became float division. Two `pub enum Kind`
+      with different variants give "enum 'Kind' has no variant 'X'" instead of
+      a duplicate-definition error. Confirmed Nov 24. Confidence: high.
+- [ ] BG144. **Trait impl methods are named `Type_method` whatever the trait,
+      so same-named methods collide.** lower.fd `Lowerer_lower_program`
+      registers and lowers an impl method as `ti.type_name + "_" +
+      method.name`: two traits with a method of the same name on one type
+      become one function (the last lowered wins), and so does an inherent
+      `impl S { fn show }` beside `impl Show for S`; nothing reports it.
+      Trigger: `cap A { fn m(self) -> i64; } cap B { fn m(self, k: i64) ->
+      str; }`, both implemented for `S`: `(s as dyn A).m()` prints "b" under
+      `run` (with the same signature in both traits it returns B's value:
+      `a.m()` and `b.m()` both give 2), and C fails (`S_m` defined once,
+      called with both signatures); an inherent `show() -> i64` beside the
+      trait's prints "trait" (run, C). Confirmed Nov 24. Confidence: high.
+- [ ] BG145. **A field written through `&mut` to a generic-struct instance is
+      silently not stored.** lower.fd `Lowerer_lower_stmt_inner`,
+      `Stmt::FieldAssign`, takes the struct name only from `Ptr(Struct)` or
+      `Struct`; a `&mut Slot<T>` lowers to `Ptr(Generic Slot<..>)`, the name
+      stays "" and the store is skipped with no error (the IR of
+      `Slot__put__f64` is a bare `Return`). Trigger: `fn put2(s: &mut
+      Slot<i64>, x: i64) { s.v = x; s.n = s.n + 1; }` changes nothing; a
+      generic `impl<T> Slot<T> { fn put(self: &mut Slot<T>, x: T) }` the same:
+      run, C and emit print the old values. Confirmed Nov 24. Confidence:
+      high.
+- [ ] BG146. **`x is Variant` checks nothing and takes the variant's index
+      from any enum.** typechecker.fd `Expr::IsCheck` only checks the operand
+      and returns `bool`; lower.fd `Expr::IsCheck` searches every enum for the
+      variant name and the last match wins. Triggers: with `enum Light { Red,
+      Green }` and `enum Flag { Green, Red }`, `Light::Red is Red` is false
+      (run, C, emit); with a user `enum Reply { Err(str), Ok(i64) }`,
+      `Reply::Ok(3) is Ok` is false; `e is Zzz` (no such variant) is true; `5
+      is A` on an i64 loads a tag from address 5. Confirmed Nov 24.
+      Confidence: high.
+- [ ] BG147. **The DNS client accepts any reply as the answer.**
+      stdlib/dns.fd: the query ID is the constant 24817 (`dns_qid`), and
+      `dns_query_records` / `dns_parse_records` never compare the reply's ID,
+      QR bit, RCODE, question section or answer owner names, nor the sender
+      address `net_recv_from` returns. The first UDP datagram from anyone
+      becomes the A/AAAA answer and goes into `DnsCache` (spoofing, cache
+      poisoning). Trigger: a reply with ID 0x1234, QR=0, RCODE=3 (NXDOMAIN),
+      no question and one answer `evil A 6.6.6.6`: `answers: 1`, `6.6.6.6`
+      (want rejected). Confirmed Nov 24 (run). Confidence: high.
+- [ ] BG148. **C runtime `p_mutex_lock` does not exclude green tasks from each
+      other (Windows) and deadlocks them (Linux).** codegen_c.fd
+      `p_mutex_lock` with the Windows shim `typedef CRITICAL_SECTION
+      pthread_mutex_t`: a CRITICAL_SECTION is recursive, so two tasks on one
+      thread both enter it and the locked section interleaves across
+      `task_sleep`; the default Linux pthread mutex is not recursive, so the
+      second task on the thread deadlocks. Trigger: three `task_go("holder")`
+      tasks each doing 5 x `p_mutex_lock(M); v = load; task_sleep(2); store v
+      + 1; p_mutex_unlock(M)`: C on Windows prints 5 at FIDES_WORKERS=1 (want
+      15); three `async fn` holders print 5 at w1 and 13 at w4; `--target
+      x86_64-linux` hangs at w1. Native Linux prints 15. Confirmed Nov 24.
+      Confidence: high.
+- [ ] BG149. **An assignment to a captured variable inside a closure is
+      dropped, right-hand side included.** lower.fd `Lowerer_lower_stmt`,
+      `Stmt::Assign`, `OptValueId::None` arm: a captured name is neither an
+      alloca nor a local of the closure, and that arm neither stores nor
+      evaluates the expression, while reads keep coming from the environment;
+      `check` accepts it. Trigger: `var count = 10; val f = fn(x: i64) -> i64
+      { count = side(); count += x; return count; }; f(1)`: run, C and emit
+      print 10 and never call `side()` (want 6 with a by-value copy, and the
+      call made); `count = count + x; return count` returns 10. Confirmed Nov
+      24. Confidence: high.
+
+### High
+
+- [ ] BG150. **`/=` and `%=` are invisible to `@no-panic`/`@crashfree` and
+      `@constant_time`.** typechecker.fd `scan_stmt_for_division` reads only
+      the right-hand side of `Stmt::Assign`/`IndexAssign`/`FieldAssign`, never
+      the `AssignOp`; the secret-division check of `verify_constant_time` has
+      the same gap. Trigger: `@no-panic fn np(a: i64, b: i64) -> i64 { var x =
+      a; x /= b; return x; }` is accepted and panics "Division by zero"; `%=`
+      gives "Modulo by zero"; `@constant_time` accepts `x /= k` and rejects `x
+      = x / k`. Confirmed Nov 24. Confidence: high.
+- [ ] BG151. **A call through a local or struct-field function value adds no
+      effects, so `!{}` and `@deterministic` are bypassed.** typechecker.fd
+      `TypeChecker_scan_expr_for_effects`, `Expr::Call`, looks the callee up
+      by name only; a local `f` has no entry, and taking `noisy` as a value
+      adds nothing (`TypeChecker_passed_fn_effects` covers only arguments of
+      higher-order calls; reference §9.1 says other function values get every
+      effect). Trigger: `fn noisy() -> i64 { println("io"); return 1; }`, `fn
+      p() -> i64 !{} { val f = noisy; return f(); }`: accepted, prints "io";
+      same through `val g = s.f; g(3)` and under `@deterministic`. Confirmed
+      Nov 24. Confidence: high.
+- [ ] BG152. **`@no-indirect` (SR-5) and `@no-recursion` are bypassed by a
+      local function value.** typechecker.fd `check_safety_body` flags only
+      calls to names in `fn_params`; a call to a local such as `f` is neither
+      a parameter nor a known function and is skipped. Triggers: `@no-indirect
+      fn ni(n: i64) -> i64 { val f = inc; return f(n); }`, `@safety-critical`
+      calling `val g = s.f; g(n)`, `@no-recursion fn r(n: i64) -> i64 { val f
+      = r; ... return f(n - 1); }`: all accepted (`@bounded-stack` does reject
+      the local value). Confirmed Nov 24. Confidence: high.
+- [ ] BG153. **An argument typed as a bare type parameter in a generic impl
+      method is never checked.** typechecker.fd
+      `TypeChecker_check_method_args` skips a parameter when
+      `!is_single_upper_name(raw)` fails, testing the unsubstituted type, so
+      any `x: T` is skipped although its substituted type is known. Trigger:
+      `struct Cell<T> { v: T }` with `fn put(self: &mut Cell<T>, x: T)`, `var
+      c: Cell<i64> = ..; c.put("oops")`: accepted, run and C print 2;
+      `Option<i64>.unwrap_or("d")` and `Result<i64, str>.unwrap_or("q")` are
+      accepted and mono instantiates `Option__unwrap_or__str`, which panics "a
+      str without a string header". Confirmed Nov 24. Confidence: high.
+- [ ] BG154. **HashMap method arguments are never checked; Vec `insert`,
+      `contains` and the `get` index are not either.** typechecker.fd
+      `TypeChecker_check_method_call`: the HashMap branch returns result types
+      for `insert`/`get`/`contains`/`get_or`/`remove` without comparing
+      arguments with the key and value types or counting them; the Vec branch
+      checks the stored element only for `push`/`set`. Triggers: `HashMap<str,
+      i64>.insert("a", "b")`, `HashMap<i64, i64>.insert("a", 2)` accepted and
+      run; `m.insert(5, "x")` on a `HashMap<str, i64>` panics at run time;
+      `Vec<str>.insert(0, 12345)` then `get` panics "a str without a string
+      header" (run, C); `Vec<i64>.contains("abc")` and `v.get("x")` accepted.
+      Confirmed Nov 24. Confidence: high.
+- [ ] BG155. **An expression-bodied closure's declared return type is not
+      compared with its body.** typechecker.fd `TypeChecker_check_expr`,
+      `Expr::Closure`: the body's type is used only to infer, then overwritten
+      by the declared type; only explicit `return` statements are checked.
+      Trigger: `val f = fn(x: i64) -> str => x; println(f(3));`: accepted,
+      `run` panics "a str without a string header" in `__closure_N`. Confirmed
+      Nov 24. Confidence: high.
+- [ ] BG156. **`!b` on a bool and `await` of a `Future<bool>` are typed `i64`
+      in the IR.** lower.fd gives the `UnaryOp::Not` result and the bool
+      `p_future_poll` result type i64, so C's `Inst::Print` emits
+      `p_print_int`: `val b: bool = idi(3) < 1; println(!b);` prints `true`
+      under `run` and `1` on C; `!(x < 1.0)` the same; `println(await spawn
+      wb(false))` prints `1`. Confirmed Nov 24 (run vs C). Confidence: high.
+- [ ] BG157. **An `f32` inside an f-string prints as an integer bit pattern.**
+      lower.fd `Lowerer_lower_fstring_expr` sends only `IrType::F64` parts to
+      `p_float_to_str`; an F32 part goes to `p_to_str`. Trigger: `val ff: f32
+      = 1.25; println(f"{ff}");` prints `4608308318706860032` on run and C and
+      `0` on wasm; want `1.25`. Confirmed Nov 24. Confidence: high.
+- [ ] BG158. **`peir_range_refine` refines a local from a load made before a
+      store to it in the branch condition.** checks.fd `peir_range_refine`,
+      the `Inst::Load(p3, _)` arm records the edge fact on local p without
+      checking that p is not stored between that load and the branch
+      (`peir_square_local` has that check). Trigger: `if x < (if reset { x =
+      100; ten } else { ten }) { if x >= 0 { r = x * 100000000000000000; } }`
+      with `g(3, true)`: `run` panics on the multiplication, C prints
+      -8446744073709551616. Confirmed Nov 24 (dump-c + zig cc). Confidence:
+      high.
+- [ ] BG159. **`spawn` with more than 8 arguments silently drops the extras on
+      C.** codegen_c.fd `p_thread_spawn`/`p_executor_spawn` store `i <
+      num_args && i < 8`, and `__p_thread_run`'s default case calls with 8
+      arguments, with no compile error. Trigger: `await spawn
+      w8(1,2,3,4,5,6,7,8,9)` with `w8` returning `a+…+h + i*100`: run 936, C
+      36. Confirmed Nov 24. Confidence: high.
+- [ ] BG160. **C runtime `p_http_parse_request` overflows the heap on a long
+      path and reads past the end without a CRLF.** codegen_c.fd
+      `p_http_parse_request__raw`: `pos += snprintf(result + pos, cap - pos,
+      ...)` adds what snprintf would have written, so a path over ~970 bytes
+      pushes `pos` past the 1024-byte `cap` and `cap - pos` wraps; with no
+      `\r\n`, `p = line_end + 2` steps past the NUL. Triggers: `"GET /" + 1000
+      x "a" + " HTTP/1.1\r\n\r\nhello"` (ASan: heap-buffer-overflow WRITE),
+      `"GET / HTTP/1.1"` (global-buffer-overflow READ); with a Host header the
+      truncated result makes `p_json_get` over-read. Peer-controlled input.
+      Confirmed Nov 24 (gcc -fsanitize=address on the generated C under WSL).
+      Confidence: high.
+- [ ] BG161. **C runtime `p_json_pretty` overflows the heap on nested JSON.**
+      codegen_c.fd `p_json_pretty__raw`: the buffer is `strlen*4 + 64` bytes;
+      the `{ [ } ] , :` branches write a newline plus `indent*2` spaces with
+      no capacity check, and indentation grows with the square of the depth.
+      Trigger: `{"a": ...}` nested 60 deep around `1`: the Windows build exits
+      127; ASan: heap-buffer-overflow WRITE past a 1508-byte block. Confirmed
+      Nov 24. Confidence: high.
+- [ ] BG162. **C runtime `p_json_parse`/`p_json_dump` lose string-ness and
+      break on escaped quotes.** codegen_c.fd `_json_dump_obj` decides quoting
+      from what the value looks like (digits, `-`, `true`/`false`/`null`
+      written bare), and the `p_json_parse__raw` scanners end a string at the
+      first `"` with no escape handling. Triggers:
+      `{"zip":"02134","flag":"true"}` dumps as `{"flag":true,...,"zip":02134}`
+      (invalid JSON, a string turned boolean); `{"q":"say \"hi\" now","z":1}`
+      dumps as `{" now":1,"q":"say \"}`. BG97 fixed nesting only. Confirmed
+      Nov 24 (run vs C). Confidence: high.
+- [ ] BG163. **Native runtime `p_json_parse`/`p_json_dump` still break nested
+      values.** stdlib/pe_runtime/data.fd `pert_json_parse` (a flat scan): an
+      object or array value is copied as a number up to the next `, } ]` or
+      space, the scan continues inside it and lifts inner keys to the top
+      level, and strings end at the first `"`. data.fd is merged into nat_ir
+      builds too. Triggers: `{"list": [1, 2, 3], "k": -4}` dumps as
+      `{"k":-4,"list":"[1"}` on emit; `{"o": {"p": 2}}` as `{":":"","o":"{"}`.
+      BG97 fixed only codegen_c (its test is `//@ backends: ccompile`).
+      Confirmed Nov 24. Confidence: high.
+- [ ] BG164. **pe_ir: a function with more than 8 interpolated strings and a
+      bool interpolation panics "a str without a string header".** After
+      `LOWER_STACK_STR_MAX` (8) LF13 stack strings, later f-strings fall back
+      to heap builtins; with a bool part the program panics on emit. Trigger:
+      `println(f"p = ({x}, {x})"); val ok: bool = x == 1; println(f"a={ok}
+      c"); println(f"b {x}");`: emit prints two lines then panics; run, C and
+      `--nat` print three. Persists with every FID_PE_OFF switch and
+      FID_IROPT_OFF=all; tests/bootstrap/test_frontend_fstring.fd fails the
+      same way on emit. Suspected: pe_ir_stubs.fd `PeirGen_gen_to_str_bool`
+      returns a headerless `p_malloc` "true"/"false". Confirmed Nov 24 (cause
+      not pinned). Confidence: high (bug), medium (cause).
+- [ ] BG165. **nat_ir: an f64 value reaching an f32 parameter, return value or
+      `Vec<f32>` element becomes 0.** Lowering leaves a float literal
+      `ConstFloat ... f64` where the target is f32 (`fn mk() -> f32 { return
+      2.5; }`); nat_ir narrows only in `Inst::Store` (`ng_store_f64_to_f32`)
+      and `p_f32_to_bits`, not at call arguments, `Return` or the
+      `Vec_push/set/insert` and index-store calls, so the low 32 bits of the
+      double are used. Triggers: `fn takes(x: f32) -> f64 { return x as f64;
+      }` with `takes(1.5)`, `mk()`, `v.push(1.5)`, `w.set(0, 3.5)`,
+      `w.insert(0, 4.5)`, `w[1] = 5.5` on a `Vec<f32>`: run 1.5 … 5.5,
+      x86_64-linux and `--nat` 0 each (`1.5 as f32` is right). Existing tests
+      always write `as f32`. Confirmed Nov 24. Confidence: high.
+- [ ] BG166. **nat_ir hands Fides functions to C as callbacks with its own
+      convention.** A Fides function's address goes to C unchanged with no
+      SysV entry adapter, but inside the layer floats travel in integer
+      registers and stack arguments have the layer's layout;
+      docs/reference/argument-registers.md says the layer never hands Fides
+      functions to C. Trigger (x86_64-linux, dynamic link): C `double
+      cb(double (*f)(double, int64_t), double x) { return f(x, 3) + f(x, 4);
+      }`, Fides `fn mycb(x: f64, n: i64) -> f64 { return x * (n as f64); }`,
+      `cb(mycb, 2.5)` prints 5 (want 17.5); C calling an 8-integer-argument
+      Fides function gets garbage in arguments 7 and 8. Pointer/int callbacks
+      of up to 6 arguments work (why qsort passes). `--nat` Windows untested.
+      Confirmed Nov 24. Confidence: high.
+- [ ] BG167. **`fid wasm`: string literals have no string header, so dropping
+      or copying one panics.** wasm.fd `wg_str` writes the bytes and a NUL
+      into the data segment with no `[P_STR_STATIC][len]` words, and core's
+      strict `Str_drop`/`Str_dup` (`P_STR_STRICT`) panic on a headerless
+      string as soon as ownership drops a literal-valued temporary or owner.
+      Trigger: `fn f(n: i64) -> str { return "abc"; }` with `println(f(1));
+      println(str_repeat("ab", 3));`: wasm prints `abc` then "Panic: a str
+      without a string header"; a struct with a literal field panics at scope
+      end. Confirmed Nov 24 (node scripts/wasm-run.mjs). Confidence: high.
+- [ ] BG168. **`fid wasm` keeps the unsigned bits on a same-width
+      unsigned-to-signed cast (BG38 fixed interp and pe_ir only).** wasm.fd
+      `Inst::BitCast`, integer branch, just loads the value: a zero-extended
+      `u16`/`u8` becomes `i16`/`i8` with no `i64.extend16_s`/`extend8_s`.
+      Trigger: `val g: u16 = 65535; println(g as i16); val q: u8 = 250;
+      println(q as i8);`: run and C -1, -6; wasm 65535, 250. Confirmed Nov 24.
+      Confidence: high.
+- [ ] BG169. **`fid build-x86` panics on every program.** compiler.fd
+      `build_x86_linux` → `emit_object_file` → elf64.fd
+      `ElfEmitter_encode_mov` (and `parse_dollar_imm`) call `str_parse_int` on
+      the `$imm` text; core's `String_parse_int` overflows on the decimal
+      i64::MIN the x86.fd backend writes (see the `String_parse_int` entry).
+      Trigger: `fid build-x86 h.fd -o h` on `fn main() -> i64 { return 3; }`:
+      "Panic: Integer overflow on addition" in `String_parse_int ←
+      ElfEmitter_encode_mov`. known-bugs 2g.16 says only "untested". Confirmed
+      Nov 24. Confidence: high (crash), medium (which immediate).
+- [ ] BG170. **@secret: the right operand of `&&`/`||` is not checked under
+      the secret condition.** secrecy.fd `sec_expr`, `Expr::Binary`, only
+      unions labels and pushes no pc for the right operand, which runs only
+      depending on the secret left side (the `if`-expression form is
+      rejected). Trigger: `fn noisy() -> bool { println("hi"); return true;
+      }`, `fn check(@secret pin: i64) { val b = pin == 1234 && noisy(); }`:
+      passes `check`, prints "hi" only when the pin matches. Confirmed Nov 24.
+      Confidence: high.
+- [ ] BG171. **@secret: pipe-forward into a helper skips the helper's
+      summary.** secrecy.fd `sec_expr`, `Expr::PipeForward`, unions labels
+      instead of applying the call summary as `sec_call` does. Trigger: `fn
+      show(x: i64) { println(int_to_str(x)); }`, `fn check(@secret pin: i64) {
+      pin |> show; }`: passes `check`, `run` prints the secret; `show(pin)` is
+      rejected. Confirmed Nov 24. Confidence: high.
+- [ ] BG172. **@secret: `p_system` is not an output sink.** secrecy.fd
+      `sec_is_output_sink` lacks `p_system` (and, by reading, `p_exec`,
+      `p_setenv`, `p_serial_write`, `p_log_user`, `p_db_exec`). Trigger: `fn
+      check(@secret pin: i64) { p_system("echo " + int_to_str(pin)); }`:
+      passes `check`, `run` prints 4242. Confirmed Nov 24 for `p_system`.
+      Confidence: high.
+- [ ] BG173. **Private consts and globals of the same name in two modules give
+      a false visibility error.** Same root as the merge entry above: only one
+      of the two survives, still marked with its module, and the other
+      module's code then fails `typechecker.fd`'s visibility check. Triggers:
+      private `const K` in `ma` and `mb`, each used by its own module:
+      "Visibility error: 'K' is private to module 'ma' (not accessible from
+      'mb')"; private `var COUNT` the same; the main file's own `const LIMIT =
+      5` beside a module's private `LIMIT` is rejected too. Valid programs
+      rejected. Confirmed Nov 24. Confidence: high.
+- [ ] BG174. **`fid fmt` joins newline-separated statements onto one line, and
+      `-w` can write a program that means something else.** fmt.fd printer
+      loop breaks lines only after `; { }` and some commas, and `fmt_tokenize`
+      keeps newlines only as blank-line markers, so a block of semicolon-free
+      statements (reference §1.10: semicolons are optional) prints on one
+      line; `fmt_same_tokens` does not see newlines, but the parser does
+      (parser.fd: a `(` on the next line starts a statement). Trigger: `val z
+      = id(4)` with `(z)` on the next line: runs; after `fid fmt a.fd -w` it
+      becomes `val z = id(4)(z)` and fails ("undefined variable 'z'").
+      reference.md's own semicolon-free example formats to one line; LSP
+      formatting returns the same. Confirmed Nov 24. Confidence: high.
+- [ ] BG175. **core `String_parse_int` (`str_parse_int`) panics on i64::MIN
+      and on long digit strings.** stdlib/core.fd builds the positive
+      magnitude with checked arithmetic and no digit limit, so
+      `"-9223372036854775808"` and any value over 19 digits overflow and
+      panic, where its doc says it returns 0 on failure. It is the root of the
+      `build-x86` crash and of the HTTP Content-Length crash (separate
+      entries); four reviewers hit it independently. Confirmed Nov 24 (run,
+      C). Confidence: high.
+- [ ] BG176. **HTTP server: one Content-Length header crashes the process.**
+      stdlib/http.fd `http_read_message` hands the raw Content-Length to
+      `str_parse_int`, which panics on a long value (`url_port_of` guards
+      against exactly this, VF15). Trigger: a request with `Content-Length:
+      99999999999999999999`: "Panic: Integer overflow on multiplication" in
+      `String_parse_int ← http_read_message`, exit 1: any client can stop the
+      server. Confirmed Nov 24 (ccompile, a fake recv hook). Confidence: high.
+- [ ] BG177. **HTTP message framing is not validated, so requests can be
+      smuggled.** stdlib/http.fd `http_read_message`, `hc_chunked`,
+      `http_header`: duplicate Content-Length headers (the first wins), a
+      Transfer-Encoding other than exactly `chunked` (`gzip, chunked` falls
+      back to Content-Length; RFC 9112 requires a 400 and closing), a negative
+      Content-Length (read as 0), and a chunk not followed by CRLF are all
+      accepted, and the leftover body is read as the next request on the
+      keep-alive connection. Triggers: `Content-Length: 0` + `Content-Length:
+      27` with body `GET /smuggled ...` gives two requests; `Content-Length:
+      -5` the same; `3\r\nabcGARBAGE\r\n0\r\n\r\n` accepted as `abc`. The risk
+      is behind a proxy that frames differently. Confirmed Nov 24 (ccompile).
+      Confidence: high.
+- [ ] BG178. **JSON: the validator recurses with no depth limit, so the
+      never-panicking API panics.** stdlib/json.fd
+      `j_scan_val_n`/`j_scan_arr_n`/`j_scan_obj_n`, under `json_is_valid` and
+      every `*_safe` accessor (`json_index` has `JSON_MAX_DEPTH`; this path
+      does not). Trigger: `json_type_safe(str_repeat("[", 16000000))` (a size
+      `HTTP_MAX_BODY` allows): "Panic: Stack overflow" on C; about 333 nested
+      `[` already hit the recursion limit under `run`. Want false / "error".
+      Confirmed Nov 24. Confidence: high.
+- [ ] BG179. **`Vec<f64>.sort()` orders negative numbers backwards.**
+      stdlib/core.fd `Vec_sort` / `vec_raw_sort` compare the raw i64 bit
+      patterns, which reverses the order of negative doubles (2g.57 is the
+      `str` case). Trigger: `[-1.5, -2.5, 1.0, -0.5].sort()` gives `-0.5 -1.5
+      -2.5 1` (want `-2.5 -1.5 -0.5 1`), run and C. Confirmed Nov 24.
+      Confidence: high.
+- [ ] BG180. **f-string float precision gives wrong digits for large values,
+      and fill characters are ignored.** stdlib/core.fd `fstr_fmt_f64`,
+      `__fstr_pad`, `__fstr_width0` (uncommitted work in the tree on Nov 24):
+      `((av * scale) + 0.5) as i64` saturates once `av * 10^prec` passes
+      ~9.2e18 and prints the saturated value; the `[fill]` of reference §1.8
+      is never read; a `0` fill is taken as the width's start. Triggers:
+      `f"{1e17:.2}"` gives `92233720368547758.07`, `f"{10.0:.18}"`
+      `9.223372036854775807`, `f"{7:*>5}"` `    7` (want `****7`),
+      `f"{7:0>5}"` `7` (want `00007`). By reading, `fstr_fmt_i64` computes `0
+      - v` (overflow on i64::MIN). Confirmed Nov 24 (run, C). Confidence:
+      high.
+- [ ] BG181. **`==` compares raw words for `Option`/generic enums, tuples,
+      arrays and Vec fields.** lower.fd `Expr::Binary` Eq/Neq:
+      `vec_eq_fn_for(Lowerer_infer_expr_ast_type(..))` does not see a field
+      access, `__eq_<Enum>` exists only for non-generic enums, and tuples and
+      arrays reach a plain `BinOp`; the type checker accepts all of them.
+      Triggers, each false on run, C and emit: `Option::Some(3) ==
+      Option::Some(3)`, `(1, "a") == (1, "a")`, `[1, 2] == [1, 2]`, `p.v ==
+      q.v` with equal Vecs (locals `a == b` are true), an `Option` field
+      inside a struct `==`; so `@derive(PartialEq)` on a struct with a Vec
+      field returns false for equal values. Confirmed Nov 24. Confidence:
+      high.
+- [ ] BG182. **`?.` is typed `i64` unless the receiver is a bare struct.**
+      typechecker.fd `Expr::OptionalFieldAccess` looks up only `Type::Named`;
+      an `Option<P>` (Generic) falls through to `return Type::I64`, even for a
+      field that does not exist. Trigger: `a: Option<P>`, `val f: f64 = a?.f`
+      prints 4612811918334230528 on run and 2 on C; `a?.s` (a str) gives an
+      address; `a?.zzz` is accepted and gives 0. Confirmed Nov 24. Confidence:
+      high.
+- [ ] BG183. **`dyn` of a generic impl fails at run time.** With `impl<T> Show
+      for Slot<T>`, `Slot<i64> as dyn Show` then `.show()`: run panics
+      "DynCall: no method 'show' on type 'Slot'", the C build exits 127, emit
+      gives "Illegal instruction". lower.fd `Expr::Cast` / `Type::Dyn` builds
+      `MakeDyn` with the bare name `Slot`, while mono names the methods
+      `Slot__show__i64`. Confirmed Nov 24. Confidence: high.
+- [ ] BG184. **A trait method returning a struct, called through `dyn`,
+      crashes.** lower.fd `DynCall` lowering passes no result pointer for a
+      struct return. Trigger: `cap Corner { fn corner(self) -> V2; }`, `(q as
+      dyn Corner).corner()`: run reports "Invalid memory access" in
+      `Sq_corner`, C exits 3, emit panics. Confirmed Nov 24. Confidence: high.
+- [ ] BG185. **A struct literal built in a generic method stores the address
+      of the by-value `self`.** In `impl<T> Slot<T> { fn wrap(self) ->
+      Slot<Slot<T>> { return Slot { v: self, n: 42 }; } }` the generated C
+      stores the parameter's pointer into `v` (`*(int64_t*)v4 = (int64_t)v2;`)
+      instead of the heap copy a literal elsewhere makes (BG6's path).
+      Trigger: `a.wrap().get()` gives `{v: 7, n: 7}` instead of `{7, 3}` on
+      run and C; the same literal built in `main` reads right. Related to the
+      `Vec<Option<T>>` stack-slot entry, a different site. Confirmed Nov 24.
+      Confidence: high (result), medium (path).
+- [ ] BG186. **`@linear` values are duplicated or lost through expressions and
+      discarded results.** typechecker.fd `TypeChecker_consume_linear_in_expr`
+      has no arm for enum literals, f-strings, if/match expressions and
+      similar forms. Triggers: `val o = Option::Some(t); use_tok(t);` then
+      using the payload too is accepted (used twice);
+      `println(f"{use_tok(t)}"); use_tok(t);` accepted; a bare
+      `Option::Some(t)` is reported "never consumed"; a linear result thrown
+      away (`mk();`, `id(t);`) accepted; shadowing `val t = Tok{..}; val t =
+      Tok{..};` drops the first silently. Confirmed Nov 24. Confidence: high.
+- [ ] BG187. **`@linear` branches are merged only for an `if` statement.**
+      Only `Stmt::If` in `TypeChecker_check_stmt_inner` saves and intersects
+      `consumed_vars`; `match` arms just accumulate. Unsafe programs accepted:
+      consuming in one `match` arm (lost on the other), a `return` inside an
+      arm unchecked, a match expression with one consuming arm, and `if c {
+      use_tok(t); } use_tok(t);` (consumed twice; reference §8.7's rule allows
+      it). Valid programs rejected: consuming in every match arm, an
+      if-expression consuming in both branches. Confirmed Nov 24. Confidence:
+      high.
+- [ ] BG188. **Every enum counts as `@send`, whatever its payload.**
+      typechecker.fd `TypeChecker_is_send_type` returns true for any enum, and
+      an enum literal is typed plain `Option`, so it takes that branch too
+      (reference §10.1 lists "enums" with no condition). Accepted by `check`:
+      `spawn work(Msg::H(h))` with `h` holding a `*mut i64`; an enum payload
+      holding `fn(i64) -> i64` (BG75's closure check bypassed); `spawn
+      work(Option::Some(h))`. Confirmed Nov 24. Confidence: high.
+- [ ] BG189. **PostgreSQL SCRAM: AuthenticationOk is accepted before the
+      server proves it knows the password.** stdlib/postgres.fd
+      `pg_startup_step` returns 0 on `code == 0` in every state, so a server
+      that asked for SCRAM-SHA-256 can skip SASLContinue/SASLFinal and
+      `pg_scram_verify_server` never runs: mutual authentication is defeated
+      (libpq refuses this). Trigger: messages R(10, "SCRAM-SHA-256"), R(0), Z:
+      steps return `0 0 1`, `c.ok = true`. Confirmed Nov 24. Confidence: high.
+- [ ] BG190. **inflate: a truncated stream decompresses into junk up to the
+      output cap, and errors return partial output.** stdlib/compress.fd
+      `br_bit` returns 0 past the end and `z_block` never checks for end of
+      input, so with a dynamic table whose all-zero code is a literal, a
+      stream cut after its header decodes literals until `max_out`; every
+      failure path returns the partial output (the doc says empty on error);
+      hitting the bomb guard returns `max_out + 1` bytes as data. Trigger: 13
+      bytes `5,192,33,9,0,0,0,0,32,255,175,22,0` (zlib gives 9 bytes, not
+      finished): `inflate_from(d, 0, 100000)` returns 100001 bytes; through
+      `gzip_decompress`/`inflate` the cap is 268M elements (~2 GB of
+      `Vec<i64>`); a truncated stored block `1,10,0,245,255,'A','B'` returns 2
+      bytes with no error. Confirmed Nov 24. Confidence: high.
+- [ ] BG191. **INI: a value containing a newline injects keys and sections on
+      reload.** stdlib/ini.fd `ini_needs_quotes` / `ini_serialize` wrap a
+      value containing ` ` in quotes, but `ini_parse` splits lines first, so
+      the quotes protect nothing, and `ini_get` returns the first match, so an
+      injected key shadows the real one. Trigger: `ini_set(doc, "user",
+      "name", "bob role = admin ")`, `ini_set(doc, "user", "role", "guest")`,
+      serialize, parse: `role` reads `admin`. Also lost on a round trip: a
+      value `"quoted"` comes back unquoted, a leading tab is dropped.
+      Confirmed Nov 24. Confidence: high.
+- [ ] BG192. **Redis RESP decoder: a hostile reply panics the process, and
+      attribute chains bypass the depth limit.** stdlib/redis.fd
+      `rs_parse_int`'s guard `v > 922337203685477580` lets `…580 * 10 + 8`
+      through, `rs_item`'s MAP/ATTR `n * 2` is unchecked, and an attribute
+      recurses at the same depth so `RESP_MAX_DEPTH` never applies. Triggers:
+      `:9223372036854775808  ` and the valid `:-9223372036854775808` panic
+      "Integer overflow on addition"; `%5000000000000000000  ` panics on
+      multiplication (run, C); 2000 x `|0  ` exceeds the interpreter's
+      recursion limit. Confirmed Nov 24. Confidence: high.
+- [ ] BG193. **protobuf: a length varint near 2^63 panics the reader.**
+      stdlib/protobuf.fd `pb_read_bytes` / `pb_skip` (not `@wrapping`) test
+      `r.pos + n > r.end`, which overflows for a huge `n`, so the bounds check
+      itself traps on an untrusted LEN field. Trigger: bytes `0A FF FF FF FF
+      FF FF FF FF 7F`, then `pb_next` + `pb_skip`: "Panic: Integer overflow on
+      addition: 10 + 9223372036854775807" (want `ok = false`). Confirmed Nov
+      24 (run). Confidence: high.
+- [ ] BG194. **pe_runtime: a channel send or receive inside a green task
+      blocks the whole OS thread.** stdlib/pe_runtime/conc.fd `pert_chan_recv`
+      / `pert_chan_send`: a full or empty channel calls `pe_k_cond_wait`
+      (`SleepConditionVariableSRW`), which sleeps the worker thread instead of
+      suspending the task; an `async fn` starts on its caller's thread, so a
+      receive in it blocks `main` and the sender never runs. linux_runtime
+      (`pe_chan_wait` → `pe_co_leave`) and C (BG8) suspend the task. Trigger:
+      `async fn waiter(ch) -> Future<i64> { return channel_recv(ch); }`, `val
+      f = waiter(ch); channel_send(ch, 7); println(await f);`: run,
+      x86_64-linux and C print 7, pe_ir hangs every time; two `task_go` tasks
+      on one channel hang at FIDES_WORKERS=1. Confirmed Nov 24. Confidence:
+      high.
+- [ ] BG195. **pe_runtime: a mutex held across a task suspension deadlocks the
+      worker.** stdlib/pe_runtime/conc.fd `pert_mutex_lock` is an SRW lock
+      taken by the OS thread: task A locks on worker W and sleeps, task B on W
+      blocks W itself in `AcquireSRWLockExclusive`, and A is woken onto a
+      queue no free worker serves. linux_runtime's `pert_mutex_lock` relaxes
+      so that a task holding it across a yield can release it. Trigger: the
+      three-holder probe of the C runtime mutex entry: pe_ir hangs at
+      FIDES_WORKERS=1 and 2, prints 15 at 4; native Linux 15 at 1 and 4.
+      Confirmed Nov 24. Confidence: high.
+- [ ] BG196. **Both native runtimes: `spawn scope` waits for every green task
+      in the program.** pe_runtime/conc.fd `pert_executor_run_all` waits for
+      `pert_live > 0` and linux_runtime/conc.fd's calls `pe_co_drain()`: BG45
+      limited the thread half to the scope's own threads, but the task half
+      still waits for all live tasks, including ones started before the scope,
+      unrelated ones, and the calling task when the scope is inside one. C
+      joins only the scope's (reference §10.4). Triggers: `async fn outer(n) {
+      spawn scope { val t = spawn work(n); r = await t; } return r + 1; }`
+      awaited from main: run and C print 41, pe_ir and x86_64-linux hang; an
+      async watcher polling a flag set after the scope: native prints 42 then
+      hangs. Confirmed Nov 24. Confidence: high.
+- [ ] BG197. **Effect handlers: the continuation loses writes and `return`,
+      and `do` in a loop hangs.** lower.fd
+      `Lowerer_lower_do_with_continuation` / `Lowerer_create_continuation`
+      turn the rest of the `handle` block into a by-value closure (reference
+      §9.4 says `cont` is the rest of the block), so the captured-assignment
+      entry drops writes in it and a `return` in it only leaves the `__cont_N`
+      closure. Triggers: `do E.tick(1); count = 3; println(count)` prints
+      `count=0` (run, C, emit); `do E.op(1); return 5;` with a resuming
+      handler makes `f()` return 7; `while i < 3 { do E.op(i); i = i + 1; }`
+      with a resuming handler never ends. Confirmed Nov 24. Confidence: high.
+- [ ] BG198. **A `defer` body is resolved in the scope of each exit.**
+      lower.fd `Lowerer_emit_defers` / `Stmt::Defer` keep only the AST and
+      lower it again at every return or function end, so names resolve to
+      whatever is in scope there: a variable of the block holding the `defer`
+      has already been dropped, and a shadowing variable around the `return`
+      is picked up. Triggers: `if k > 0 { var v = Vec::new(); v.push(k); defer
+      { println(v.len()) } } return 0;`: run "Vec index out of bounds", C and
+      emit "Invalid memory access"; with a str it prints empty; `var x = 1;
+      defer { println(x) }; if true { val x = 99; return 0; }` prints 99 on
+      every backend (want 1). Confirmed Nov 24. Confidence: high.
+- [ ] BG199. **A `return` out of `spawn scope { }` skips the join.** lower.fd
+      `Stmt::SpawnScope` emits `p_executor_run_all` only at the body's
+      fall-through end, so a `return`, `break` or `?` inside the scope leaves
+      with its tasks still running (reference §10.4, CA6: no task is left
+      behind) and leaks the executor. Trigger: two tasks that
+      `task_sleep(300)` then `p_atomic_add(total, n)`, spawned in a scope,
+      then `if early { return 5; }`: C and emit see `total` 0 on the early
+      return (want 3). Confirmed Nov 24. Confidence: high.
+- [ ] BG200. **`await` does not restore f32, narrow signed integer or non-call
+      future results.** lower.fd `Expr::Await` converts back only `Ptr`, `F64`
+      and `Struct` results, and finds the future's type only when the operand
+      is a call, method call or identifier; anything else gets the raw word of
+      `p_future_poll` (the `Future<bool>` case is the `!b` entry). Triggers:
+      `await r(10)` on a `Future<f32>` (10/4) prints 0 on run and 2 on C (want
+      2.5); `(await fa) as i64` on a `Future<i32>` of -15 prints 4294967281 on
+      C; `total + await fs.get(i)` over a `Vec<Future<f64>>` and `await (if c
+      { a } else { b })` print bit patterns on every backend; `await
+      ws2.get(0)` on a `Future<str>` leaks the string. Confirmed Nov 24.
+      Confidence: high.
+
+### Medium
+
+- [ ] BG201. **Bitwise and shift operators are accepted on floats.**
+      typechecker.fd `Expr::Binary` arithmetic path: two numeric operands give
+      `F64` with no integer requirement for `& | ^ << >>` (and `<<=`).
+      Trigger: `var f: f64 = 1.5; val g = f & 2.0; println(g);` passes
+      `check`, `run` prints 0 and `ccompile` fails ("C compilation failed":
+      `&` on doubles); `f <<= 2` panics "Arithmetic error (float, int)" under
+      `run`. reference.md §4.2's wording covers these operators too and needs
+      the same correction. Confirmed Nov 24. Confidence: high.
+- [ ] BG202. **`<` and `>` on two `str` values are accepted, and the backends
+      disagree.** The type checker accepts an ordering of two strings, which
+      reference.md §4.2 does not define (only `==`). `fid run` panics
+      "Arithmetic error (str, str)"; C compares the addresses (`"abc" < "abd"`
+      true, `"b" > "abc"` false). Either reject it or define it as a byte
+      comparison everywhere. Confirmed Nov 24. Confidence: high.
+- [ ] BG203. **`Option::Some(x)` built from a `for x in v` loop variable leaks
+      its payload.** lower.fd `Lowerer_lower_for` (Vec branch) /
+      `Lowerer_lower_for_vec` record no AST type for the loop variable, so
+      `Lowerer_enum_lit_ast_type` types the literal `Option<i64>` (owns
+      nothing) and never registers it as a temporary, while the payload still
+      gets a `Str_dup`. Trigger: `for x in v { total = total +
+      show(Option::Some(x)); }` over a `Vec<str>`: `run --leaks` reports one
+      string per iteration never freed; `return Option::Some(x)` in the loop
+      leaks one. A `while` loop with `v.get(i)` frees everything. Confirmed
+      Nov 24. Confidence: high.
+- [ ] BG204. **Every C runtime `p_json_parse` leaks its tree.** codegen_c.fd
+      `p_json_parse__raw` returns `_json_dump_obj(j)` and frees neither `j`,
+      its key/value arrays nor the `strdup`'d entries (libc blocks, invisible
+      to `--leaks`); `p_json_dump`, `get` and `pretty` re-parse, so each leaks
+      too. Evidence: LeakSanitizer, 1000 rounds of
+      `p_json_dump(p_json_parse(...))`: 515,536 bytes in 15,001 allocations;
+      also 999 counted strings from `p_str_alloc_c`, probably the parse result
+      typed as a JSON handle and never dropped (lowering). Confirmed Nov 24.
+      Confidence: high.
+- [ ] BG205. **C runtime `p_socket_poll` uses `select`/`FD_SET` without
+      checking the fd against `FD_SETSIZE`.** codegen_c.fd `p_socket_poll`,
+      POSIX branch: on Linux an fd of 1024 or more writes past the stack
+      `fd_set`, so a server holding more than 1024 descriptors corrupts its
+      stack on each poll (stdlib/async.fd readiness, the runtime's own
+      nonblocking write loops). Fix direction: `poll()`, as the WASI branch
+      does. Read only (an fd of 1500 landed in the neighbouring set, no ASan
+      report). Confidence: high.
+- [ ] BG206. **Linux runtime `pert_str_to_float` is not correctly rounded.**
+      stdlib/linux_runtime/base.fd: up to 18 digits are packed into an i64, a
+      mantissa over 2^53 is rounded by `mant as f64` and again by the
+      power-of-ten multiply or divide, and exponents over 22 loop on `* 10.0`,
+      rounding each step. About 10% of printed doubles do not read back
+      natively: 200 of 2000 `str_parse_float(float_to_str(x)) != x` on
+      x86_64-linux and `--nat` (0 under `run`), e.g. "1.7976931348623157e308"
+      reads 1.7976931348623145e308. Confirmed Nov 24. Confidence: high.
+- [ ] BG207. **`--nat` Windows console input: a lone CR read is reported as
+      end of input.** stdlib/linux_runtime/win.fd `pe_win_read` strips CR
+      bytes on a console handle and returns the count left; `pert_read_line`
+      reads one byte per call, so the CR of "abc\r\n" comes back as a 0-byte
+      read, read_line sets the EOF flag after the first line, and the next
+      call returns an empty line. Read only (needs a real console).
+      Confidence: medium.
+- [ ] BG208. **disasm: `vzeroupper` (VEX `C5 F8 77`) swallows the next
+      instruction.** disasm.fd, VEX branch of the x86 decoder: with no table
+      row, the length assumes a ModRM byte follows, which `0F 77` does not
+      have. Evidence: `test_simd_native.fd` built `--target x86_64-linux --cpu
+      x86-64-v3` disassembles `c5 f8 77 4d 39` as `.byte 0xc5 (vex)` and loses
+      `cmp r12, r14`; with nop padding it swallowed 5 bytes. Affects `fid
+      disasm`, `explain` and the disasm checks. Confirmed Nov 24. Confidence:
+      high.
+- [ ] BG209. **F-string: an escaped brace becomes an interpolation.** lexer.fd
+      `read_fstring` decodes `\xHH`/`\u{..}` outside braces into the raw text,
+      and parser.fd `parse_fstring_parts` then takes that `{` as a part start.
+      Trigger: `val a = 42; println("\x7Ba\x7D"); println(f"brace \x7Ba\x7D
+      end");` prints `{a}` then `brace 42 end` (same with `\u{7b}`): the only
+      way to write a literal brace silently changes meaning. Confirmed Nov 24.
+      Confidence: high.
+- [ ] BG210. **F-string: sub-lexer errors are dropped, and `:` or `}` inside a
+      char literal is mis-split.** parser.fd `parse_fstring_parts` never reads
+      `sub_lexer.tokenize()` errors and its `:` scan tracks `"` but not `'`;
+      lexer.fd `read_fstring` counts braces without skipping char literals.
+      Triggers: `f"{c == ':'}"` with `c = 58` prints `false`; `f"{c == '}'}"`
+      prints `false'}`; `f"{a + '}"` prints 7 (want an error); `f"{"\q"}"` is
+      accepted though a plain string rejects `\q`. Confirmed Nov 24.
+      Confidence: high.
+- [ ] BG211. **F-string: a `}` or `{` inside a string literal within the
+      braces breaks lexing.** lexer.fd `read_fstring`'s brace loop (and
+      `parse_fstring_parts`) does not skip nested string literals. Trigger:
+      `println(f"{str_len("a}c")}");` gives "unterminated string" on a later
+      line; `"a{c"` gives "unterminated f-string": a valid program is
+      rejected. BG101 fixed only fmt.fd. Confirmed Nov 24. Confidence: high.
+- [ ] BG212. **Comptime does not evaluate float/int casts, so arithmetic on
+      them fails.** comptime_eval.fd `evaluate_with_env`, `Expr::Cast`: a cast
+      of a non-int value returns `Cast(v, ty)` unchanged and an int-to-f64
+      cast stays a `Cast` node. Triggers: `comptime fn avg(a: i64, b: i64) ->
+      f64 { return (a + b) as f64 / 2.0; }` with `comptime avg(3, 4)` ("cannot
+      evaluate binop on non-literal"), `comptime (-(7.9 as i64))` ("cannot
+      negate non-number"); reference §4.11 makes both fatal. Confirmed Nov 24.
+      Confidence: high.
+- [ ] BG213. **C header parser evaluates unsigned macro arithmetic as
+      signed.** cparser.fd `CpEval`/`CpExpr` drop the `u`/`U` suffix and
+      unsigned operands: `#define UDIV (-1u / 2)` gives 0 (C: 2147483647),
+      `UNEG (-1u)` -1 (C: 4294967295), `MASK (~0u)` -1 (C: 4294967295). Also
+      dropped with no note: `COND (A > 5 ? 1 : 2)`, `CMP (3 < 2)`, `0b1010`
+      literals. Confirmed Nov 24 (`fid parse-header`). Confidence: high.
+- [ ] BG214. **HTTP: a cut-off body is passed to the handler as a complete
+      request.** stdlib/http.fd `hc_take`, `hc_chunked`, `http_read_message`:
+      when input ends or times out mid-body, `hc_take` returns "" but `method`
+      stays set, and `hc_line` returning "" is parsed as a 0-size chunk, so
+      the handler runs with an empty body (the comments say a broken message
+      gives `method` ""). Triggers: `POST /a ... Content-Length:
+      10\r\n\r\nhel` then EOF; `Transfer-Encoding: chunked\r\n\r\n5\r\nhel`
+      then EOF: both give `[POST /a] body=<>`. Confirmed Nov 24. Confidence:
+      high.
+- [ ] BG215. **UTF-8 decoders accept overlong, surrogate and out-of-range
+      sequences.** stdlib/encoding.fd `utf8_decode` skips the checks
+      `utf8_valid_bytes` does (its doc promises U+FFFD), and stdlib/unicode.fd
+      `uni_to_codepoints` accepts any `C0`–`DF` lead byte, so a byte-level
+      `../` filter can be bypassed and normalising produces the real `../`.
+      Triggers: `E0 80 AF` decodes to 47 (`/`), `ED A0 80` to a surrogate, `F4
+      90 80 80` to 1114112; `uni_lower`/`uni_nfc` of `.. C0 AF x` return
+      `../x` while `utf8_valid` says false. Confirmed Nov 24 (run).
+      Confidence: high.
+- [ ] BG216. **`tls_crypto::x25519` gets RFC 7748's second test vector
+      wrong.** stdlib/tls_crypto.fd `x25519` does not mask bit 255 of u before
+      `mod p` (RFC 7748 §5), and its swap is a secret-dependent `if`;
+      stdlib/x25519.fd (used by QUIC) is right, but this one stays public in
+      the module tls13, tls_record and quic import. Trigger: §5.2 vector 2
+      gives `d5f33573…` (want `95cbde94…`); vector 1 is right. Confirmed Nov
+      24 (ccompile). Confidence: high.
+- [ ] BG217. **decimal: a negative scale prints the wrong value.**
+      stdlib/decimal.fd `dec_round` and `dec_div` accept and keep a negative
+      scale, and `dec_to_str` prints the mantissa for any scale <= 0 without
+      multiplying by 10^-scale. Triggers: `dec_round(dec_parse("1234"), -2,
+      DEC_HALF_UP)` prints 12 (want 1200); `dec_div(1000, 3, -1, DEC_HALF_UP)`
+      prints 33 (want 330). Confirmed Nov 24. Confidence: high.
+- [ ] BG218. **Two `impl Show for P` in one file are accepted; the later one
+      wins.** The CL7 conflict check (compiler.fd) compares only modules.
+      Confirmed Nov 24. Confidence: high.
+- [ ] BG219. **A generic function with a bound taken as a value skips the
+      bound and fails at run time.** `val f = need; f(5)` with `fn need<T:
+      A>(x: T)` is accepted and panics "CallPtr: null function value" (C exits
+      127). Confirmed Nov 24. Confidence: high.
+- [ ] BG220. **A generic struct whose fields are all `@send` is rejected by
+      `spawn`.** typechecker.fd `TypeChecker_is_send_type`, Generic arm,
+      allows only built-in types, so `spawn work(w)` with `w: Wrap<i64>` is
+      rejected. A valid program rejected. Confirmed Nov 24. Confidence: high.
+- [ ] BG221. **`dns_build_query` mis-encodes a fully qualified name and long
+      labels.** stdlib/dns.fd: `dns_build_query("example.com.", 1)` emits an
+      empty label for the trailing dot, so the name ends early and the
+      following bytes read as QTYPE=0, QCLASS=256 plus a stray byte; a label
+      over 63 bytes is silently truncated, so a different name is queried.
+      Confirmed Nov 24. Confidence: high.
+- [ ] BG222. **gzip and zlib integrity checks are skipped.**
+      stdlib/compress.fd `gzip_decompress` never checks CRC32 or ISIZE and
+      `zlib_decompress` ignores Adler-32 ("advisory"), so with the
+      partial-output behaviour above a corrupted archive decompresses
+      "successfully". Read only (plus the stored-block probe). Confidence:
+      high.
+- [ ] BG223. **url: `url_resolve` builds broken or lossy URLs, and the path is
+      decoded too early.** stdlib/url.fd `url_resolve` rebuilds the authority
+      from `base.host` without brackets or userinfo, and `url_parse`
+      percent-decodes the path (`u.path = url_decode(rest)`), so `%2F` becomes
+      a real `/` that `url_to_str` cannot restore. Triggers:
+      `http://[::1]:8080/a/b` + `c` gives `http://::1:8080/a/c`;
+      `http://user:pw@a.com/b/c` + `d` gives `http://a.com/b/d` (RFC 3986
+      §5.2.2 keeps the authority); `http://h/a%2Fb/c` round-trips to
+      `http://h/a/b/c`; `..%2F..%2Fetc%2Fpasswd` parses to
+      `/files/../../etc/passwd`; `//g` gives `http://g/`. Confirmed Nov 24.
+      Confidence: high.
+- [ ] BG224. **xml and toml have no nesting limit, so deep input overflows the
+      stack.** stdlib/xml.fd `x_children`/`x_ns_open` and stdlib/toml.fd
+      `tp_value`/`tp_array` have no depth counter (the json validator entry is
+      the same class). Triggers: `<a>` x 400k (~1.2 MB) gives "Panic: Stack
+      overflow" on C; toml `x = [` x 1M the same; both hit the recursion limit
+      at depth 1000 under `run`. yaml flow `[` was inconclusive. Confirmed Nov
+      24. Confidence: high.
+- [ ] BG225. **The interpreter's mutex does not exclude between tasks
+      either.** `fid run` prints 5 (want 15) for the same three-holder probe
+      as the C runtime mutex entry: a task holding `p_mutex_lock` across
+      `task_sleep` lets the others in. Confirmed Nov 24. Confidence: high.
+- [ ] BG226. **Both native runtimes hang on an await cycle, and pe_runtime's
+      deadlock detector cannot fire for it.** pe_runtime/conc.fd
+      `pert_poller_main` counts every task blocked on a join as a waiter, and
+      `looks_dead` needs `waiters == 0`, so "Tasks are deadlocked: each one
+      awaits another" is unreachable for exactly that case; linux's
+      `pe_co_await` has no detector.
+      tests/bootstrap/test_task_await_cycle_fail.fd (`//@ backends:
+      run,ccompile`) prints "before" and hangs on pe_ir and x86_64-linux,
+      where run and C panic (BG96's behaviour). Confirmed Nov 24. Confidence:
+      high.
+- [ ] BG227. **pe_runtime: after a task leaves blocked, its worker may finish
+      it a second time.** stdlib/pe_runtime/conc.fd `pert_worker_main` (and
+      `pert_co_async_v` after `pe_co_enter`) reads `t + 80` after the swap; by
+      then the poller may have requeued the task and another worker run it to
+      completion and called `pe_co_finish_task` (the code's comment says it
+      "may already be running again on another worker"). A second finish
+      decrements `pert_live` twice (scopes and `task_run` return early), frees
+      the context twice and puts its stack in the cache twice (two later tasks
+      share one stack); for a detached task it reads freed memory. C parks
+      only after the switch. Read only: 20 x 5000 `task_go` with
+      `task_sleep(0)` at 16 workers did not reproduce it. Confidence: medium
+      (mechanism).
+- [ ] BG228. **Every owned argument of an async-task call leaks.** lower.fd,
+      the call path for names in `self.async_tasks`: the caller gives the task
+      an owner of each str, Vec or map argument (`Lowerer_rc_dup` /
+      `Lowerer_rc_own_value`), but parameters are borrowed, so the task body
+      never drops them, and a handed-over temporary is no longer dropped by
+      the caller; the heap copy of a struct argument in adapted tasks has no
+      free either (read only). Trigger: `fn start() -> Future<str> { val s =
+      "hello" + int_to_str(42); return word(s); }` with a yielding `async fn
+      word(s: str)`: output right, `--leaks` reports the string and Vec blocks
+      never freed. `spawn f(s, v)` on threads is clean. Confirmed Nov 24.
+      Confidence: high.
+- [ ] BG229. **Interpreter: each `txn` keeps a full copy of interpreter
+      memory.** interp.fd `Inst::TxnBegin` pushes
+      `Memory_clone(&self.memory)`, which the lowering never uses (it rolls
+      back itself, `Lowerer_txn_abort`), and memory still grows by about one
+      copy per txn entered, even after `TxnEnd`; `break`/`continue`/`return`
+      out of a txn skip `TxnEnd`. Trigger: a 20,000-element Vec, then `while i
+      < N { txn { n = n + 1; } }`: peak 43 MB without txn, 228 MB at N=30,
+      2,277 MB at N=300 under `fid run`; C is unaffected. Confirmed Nov 24.
+      Confidence: high (growth).
+
+### Low
+
+- [ ] BG230. **`opt ?? <new value>` leaks the default when the result is
+      kept.** lower.fd `Expr::Coalesce` in `Lowerer_lower_expr`: on the None
+      path the default is claimed, but the merged result is a plain load, so
+      `val r = ...` duplicates it and the default's owner is never dropped
+      (the comment says it is "left to leak rather than drop a borrowed Some
+      value"). Trigger: `val r2 = get(false) ?? ("d" + int_to_str(9));`: `run
+      --leaks` reports 1 block never freed. Confirmed Nov 24. Confidence:
+      high.
+- [ ] BG231. **C runtime `p_read_stdin(-1)` writes into a 0-byte block.**
+      codegen_c.fd `p_read_stdin__raw` calls `malloc(n + 1)` = `malloc(0)`,
+      skips the read loop and writes `buf[0] = 0`; other negative `n` are
+      caught only through the NULL return. Read only. Confidence: medium.
+- [ ] BG232. **disasm has no row for several instructions the encoders emit.**
+      disasm.fd encoding table: x86 `blsmsk`/`blsi` (TG7; only `blsr` has a
+      row); AArch64 pre/post-indexed `ldr`/`str` (TG8, e.g. `f8008528`), FP
+      `ldr/str d`, `ldp/stp d8, d9`, `bic v.16b`, `dup v.2d, v.d[i]`, `mov d,
+      v.d[i]`; RISC-V `vsll.vi`, `vmseq.vi`, `vmerge.vim`, `vslidedown.vi`,
+      `vfmv.f.s`, `vfmv.v.f` (TG11). They print as `.byte`/`.word` (length
+      kept). docs/file-analysis/disasm.md says each encoder has a row.
+      Confirmed Nov 24. Confidence: high.
+- [ ] BG233. **disasm one-byte forms ignore the 0x66 operand-size prefix and
+      REX.B.** disasm.fd one-byte opcode cases: `66 B8 34 12` decodes as `mov
+      eax, 0x90901234` (imm32, wrong length; want `mov ax, 0x1234`), `66 99`
+      as `cdq` (want `cwd`), `49 90` as `nop` (want `xchg r8, rax`), `F3 90`
+      as `nop` (want `pause`). The compiler does not emit these; `disasm
+      --raw` and `asm!` output can contain them. Confirmed Nov 24. Confidence:
+      high.
+- [ ] BG234. **The ELF `.text` section header spans code, data and the RW
+      segment.** nat_enc.fd `nat_elf_debug_sections` writes one `.text` header
+      flagged WAX over the whole image even after nat_elf_img splits it into
+      R-E and RW PT_LOADs, so `readelf -l` maps `.text` to no segment and
+      `objdump -d` disassembles data as code. Tooling only. Confirmed Nov 24.
+      Confidence: high.
+- [ ] BG235. **Lock order: locks taken inside a closure body are not
+      checked.** lockcheck.fd `lockcheck_module` and the type checker's
+      `lo_summary` add no edges for a call through a closure value. Trigger:
+      `main` takes `a` then `b`, a closure `f` takes `b` then `a`, `f()`
+      called: `check` passes; the same code as a named or spawned function is
+      rejected. A real deadlock only when the closure runs on another thread.
+      Confirmed Nov 24. Confidence: high.
+- [ ] BG236. **mono: function-type mangling is ambiguous.** mono.fd
+      `mangle_type`, `Type::Func`: `"fn_" + params + "_" + ret` with no count,
+      so `fn(fn(i64) -> f64, i64) -> i64` and `fn(fn(i64, f64) -> i64) -> i64`
+      both become `id__fn_fn_i64_f64_i64_i64` (one instance for two `T`). No
+      wrong output today (every function value is one word); BG85 gave tuples
+      and arrays a count but not `Func`. Confirmed Nov 24 (dump-ir).
+      Confidence: high.
+- [ ] BG237. **`fid fmt --check file.fd` (flag before the file) reads the flag
+      as the file name** ("could not read file: --check", exit 1); `fid fmt
+      file.fd --check` works. Confirmed Nov 24. Confidence: high.
+- [ ] BG238. **`Money_print` writes negative amounts wrong.** stdlib/money.fd:
+      `Money_new(-5)` prints `$0.0-5` and `-105` prints `$-1.0-5` (want
+      `-$0.05`, `-$1.05`). Confirmed Nov 24. Confidence: high.
+- [ ] BG239. **`hkdf_expand` does not reject a length over 255 * 32.**
+      stdlib/tls_crypto.fd `hkdf_expand`: the counter byte reaches 256 and the
+      output stops following RFC 5869, where it should be an error. Read only.
+      Confidence: high.
+- [ ] BG240. **A cycle of type aliases overflows the checker's stack.** `type
+      A = B; type B = A;` recurses in `TypeChecker_resolve_type` until a stack
+      overflow instead of an error. Confirmed Nov 24. Confidence: high.
+- [ ] BG241. **`select` drops a received value equal to its "not ready"
+      sentinel.** lower.fd `Lowerer_lower_select_stmt` uses the in-band value
+      -9223372036854775807 for "nothing ready"; a received value equal to it
+      has already been taken from the channel and is treated as nothing.
+      Trigger: send -9223372036854775807, then 5: the first `select` prints
+      "nothing ready" on run and C and the value is gone. Confirmed Nov 24.
+      Confidence: high.
 
 ## Found and fixed while reviewing (Nov 22)
 

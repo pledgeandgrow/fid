@@ -285,6 +285,11 @@ pub struct Memory {
     pub lim_sizes: I64Table,
     pub lim_hit_used: i64,
     pub lim_hit_want: i64,
+    // INTERP_MEM_LIMIT is used up: Memory_alloc_in returned 0, which a
+    // caller that does not check it hands back as a fake address (a
+    // string's bytes at 16). The instruction may still finish;
+    // Interpreter_run_function stops the program once it does.
+    pub oom_hit: i64,
 }
 
 /// Size classes of Memory blocks: 8-byte steps up to 4096 bytes (classes
@@ -403,6 +408,45 @@ fn interp_vec_st(mem: &mut Memory, data: i64, i: i64, word: i64, x: i64) {
     }
 }
 
+/// A Vec whose cap word is negative shares its buffer through the share
+/// box at `-cap - 1` ({owners, cap}, core `vec_own`). The core functions a
+/// `b.set(i)`/`b.reverse()` lowers to run it first; the `p_vec_*` builtins
+/// write the buffer directly, so they must take the copy themselves or a
+/// write through one owner lands in every owner's view.
+fn interp_vec_own(mem: &mut Memory, vec_addr: i64) {
+    var cap: i64 = Memory_load_i64(mem, vec_addr + 16);
+    if cap >= 0 {
+        return;
+    }
+    var bx: i64 = 0 - cap - 1;
+    var owners: i64 = Memory_load_i64(mem, bx);
+    var bcap: i64 = Memory_load_i64(mem, bx + 8);
+    if owners <= 1 {
+        Memory_store_i64(mem, vec_addr + 16, bcap);
+        return;
+    }
+    Memory_store_i64(mem, bx, owners - 1);
+    var len: i64 = Memory_load_i64(mem, vec_addr + 8);
+    var data: i64 = Memory_load_i64(mem, vec_addr);
+    var word: i64 = Memory_load_i64(mem, vec_addr + 24);
+    var esz: i64 = interp_vec_esz(word);
+    var ncap: i64 = bcap;
+    if ncap < len {
+        ncap = len;
+    }
+    if ncap < 8 {
+        ncap = 8;
+    }
+    var nd: i64 = Memory_alloc(mem, ncap * esz);
+    var k: i64 = 0;
+    while k < len * esz {
+        Memory_store_byte(mem, nd + k, Memory_load_byte(mem, data + k));
+        k = k + 1;
+    }
+    Memory_store_i64(mem, vec_addr, nd);
+    Memory_store_i64(mem, vec_addr + 16, ncap);
+}
+
 /// 2g.60: is a value of IR type `ty` (known when `has`) an address?
 fn interp_ty_is_ptr(has: bool, ty: IrType) -> bool {
     if !has {
@@ -449,7 +493,7 @@ pub fn Memory_new() -> Memory {
         hi = hi + 1;
     }
     return Memory {
-        data: data, next_alloc: 0x1000, blocks: I64Table_new(), free_heads: heads, cstr_cache: I64Table_new(), lim_max: 0, lim_used: 0, lim_sizes: I64Table_new(), lim_hit_used: 0, lim_hit_want: 0
+        data: data, next_alloc: 0x1000, blocks: I64Table_new(), free_heads: heads, cstr_cache: I64Table_new(), lim_max: 0, lim_used: 0, lim_sizes: I64Table_new(), lim_hit_used: 0, lim_hit_want: 0, oom_hit: 0
     };
 }
 
@@ -519,6 +563,7 @@ fn Memory_alloc_in(self: &mut Memory, size: i64, counted: bool) -> i64 {
         return self.next_alloc;
     }
     if size > INTERP_MEM_LIMIT {
+        self.oom_hit = 1;
         return 0;
     }
     var cls: i64 = interp_mem_class(size);
@@ -548,6 +593,7 @@ fn Memory_alloc_in(self: &mut Memory, size: i64, counted: bool) -> i64 {
         addr = 0x500000;
     }
     if addr + csize > INTERP_MEM_LIMIT {
+        self.oom_hit = 1;
         return 0;
     }
     I64Table_set(&mut self.blocks, addr, Value::Int(csize));
@@ -927,6 +973,11 @@ pub fn Memory_store_cstr(self: &mut Memory, s: str) -> i64 {
         return cached;
     }
     var block: i64 = Memory_alloc(self, slen + 17);
+    if block == 0 {
+        // INTERP_MEM_LIMIT is used up (oom_hit): 0 here, not a block whose
+        // bytes address (16) a later drop would read as a pointer
+        return 0;
+    }
     Memory_store_i64(self, block, 0x4649444553545201);
     Memory_store_i64(self, block + 8, slen);
     var addr: i64 = block + 16;
@@ -1333,7 +1384,7 @@ pub fn StrTable_set(t: &mut StrTable, key: str, val: i64) {
 
 fn Memory_clone(m: &Memory) -> Memory {
     return Memory {
-        data: m.data.clone(), next_alloc: m.next_alloc, blocks: I64Table_clone(&m.blocks), free_heads: m.free_heads.clone(), cstr_cache: I64Table_clone(&m.cstr_cache), lim_max: m.lim_max, lim_used: m.lim_used, lim_sizes: I64Table_clone(&m.lim_sizes), lim_hit_used: m.lim_hit_used, lim_hit_want: m.lim_hit_want
+        data: m.data.clone(), next_alloc: m.next_alloc, blocks: I64Table_clone(&m.blocks), free_heads: m.free_heads.clone(), cstr_cache: I64Table_clone(&m.cstr_cache), lim_max: m.lim_max, lim_used: m.lim_used, lim_sizes: I64Table_clone(&m.lim_sizes), lim_hit_used: m.lim_hit_used, lim_hit_want: m.lim_hit_want, oom_hit: m.oom_hit
     };
 }
 
@@ -2366,6 +2417,19 @@ pub fn Interpreter_run_function(self: &mut Interpreter, func: IrFunction, args: 
                     // past FID_MEM_LIMIT (Memory_lim_take)
                     if self.memory.lim_hit_want != 0 {
                         Interpreter_lim_mem_over(self);
+                    }
+                    // INTERP_MEM_LIMIT is used up (oom_hit): the
+                    // instruction's allocation returned 0, which an
+                    // unchecked caller may have taken for an address.
+                    // Stopping here is the panic p_malloc's OOM raises.
+                    if self.memory.oom_hit != 0 {
+                        match outcome {
+                            ExecOutcome::Panic(_) => {
+                            }
+                            _ => {
+                                outcome = ExecOutcome::Panic("Out of memory: the interpreter holds at most " + int_to_str(INTERP_MEM_LIMIT) + " bytes");
+                            }
+                        }
                     }
                     match outcome {
                         ExecOutcome::Continue => {
@@ -3693,6 +3757,10 @@ pub fn Interpreter_execute_inst(self: &mut Interpreter, inst: Inst, inst_id: i64
                 IrType::Struct(_) => {
                     sret_call = arg_vals2.len() > 0;
                 }
+                // an array result is sret too (lower.fd, BG126)
+                IrType::Array(_, _) => {
+                    sret_call = arg_vals2.len() > 0;
+                }
                 _ => {
                 }
             }
@@ -3735,7 +3803,7 @@ pub fn Interpreter_execute_inst(self: &mut Interpreter, inst: Inst, inst_id: i64
             }
         }
 
-        Inst::MakeDyn(value, type_name, _) => {
+        Inst::MakeDyn(value, type_name, md_trait) => {
             var data_ptr: i64 = 0;
             match get_value(values, value) {
                 Value::Ptr(p) => {
@@ -3749,8 +3817,16 @@ pub fn Interpreter_execute_inst(self: &mut Interpreter, inst: Inst, inst_id: i64
                 }
             }
             // Rust's Value::Dyn(type, data_ptr): the data pointer, with its
-            // concrete type in the dyn side table
-            I64Table_set(&mut self.dyn_types, data_ptr, Value::Str(type_name));
+            // concrete type in the dyn side table. BG144: the type's plain
+            // name (a qualified impl's dyn values say `Type__Trait`): one
+            // value cast to two traits (`s as dyn A`, `s as dyn B`) shares
+            // this entry, so DynCall picks the method by its own trait
+            var md_plain: str = type_name;
+            var md_sfx: str = "__" + md_trait;
+            if str_len(md_trait) > 0 && str_len(type_name) > str_len(md_sfx) && str_ends_with(type_name, md_sfx) {
+                md_plain = str_slice(type_name, 0, str_len(type_name) - str_len(md_sfx));
+            }
+            I64Table_set(&mut self.dyn_types, data_ptr, Value::Str(md_plain));
             return ExecOutcome::Value(Value::Ptr(data_ptr));
         }
 
@@ -3803,6 +3879,18 @@ pub fn Interpreter_execute_inst(self: &mut Interpreter, inst: Inst, inst_id: i64
                 return ExecOutcome::Panic("DynCall: receiver is not a trait object (" + trait_name + "::" + method + ")");
             }
             var mangled: str = type_name + "_" + method;
+            // BG144: a qualified impl's method is `Type__Trait_method`;
+            // the plain name is the first definer's (lower.fd lw_tq_prefix)
+            if str_len(trait_name) > 0 {
+                var tq_mangled: str = type_name + "__" + trait_name + "_" + method;
+                match Interpreter_get_function(self, tq_mangled) {
+                    OptIrFunction::Some(_) => {
+                        mangled = tq_mangled;
+                    }
+                    OptIrFunction::None => {
+                    }
+                }
+            }
             match Interpreter_get_function(self, mangled) {
                 OptIrFunction::Some(callee3) => {
                     if callee3.params.len() > arg_vals3.len() {
@@ -6010,6 +6098,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: &mut Ve
         if args.len() >= 2 {
             match args.get(0) {
                 Value::Int(vec_addr) => {
+                    interp_vec_own(&mut self.memory, vec_addr);
                     var elem: i64 = Interpreter_value_word(self, args.get(1));
                     // Read current len and cap
                     var len: i64 = Memory_load_i64(&self.memory, vec_addr + 8);
@@ -6077,6 +6166,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: &mut Ve
                 Value::Int(vec_addr) => {
                     match args.get(1) {
                         Value::Int(idx) => {
+                            interp_vec_own(&mut self.memory, vec_addr);
                             var elem2: i64 = Interpreter_value_word(self, args.get(2));
                             var len2: i64 = Memory_load_i64(&self.memory, vec_addr + 8);
                             if idx < 0 || idx >= len2 {
@@ -7584,13 +7674,14 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: &mut Ve
                 Value::Int(vec_addr) => {
                     var vlen: i64 = Memory_load_i64(&self.memory, vec_addr + 8);
                     var vdata: i64 = Memory_load_i64(&self.memory, vec_addr);
+                    var word: i64 = Memory_load_i64(&self.memory, vec_addr + 24);
                     var out: str = "[";
                     var vi: i64 = 0;
                     while vi < vlen {
                         if vi > 0 {
                             out = out + ", ";
                         }
-                        var elem: i64 = Memory_load_i64(&self.memory, vdata + vi * 8);
+                        var elem: i64 = interp_vec_ld(&self.memory, vdata, vi, word);
                         out = out + int_to_str(elem);
                         vi = vi + 1;
                     }
@@ -7620,9 +7711,12 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: &mut Ve
                                 _ => {
                                 }
                             }
+                            interp_vec_own(&mut self.memory, vec_addr);
                             var vlen: i64 = Memory_load_i64(&self.memory, vec_addr + 8);
                             var vcap: i64 = Memory_load_i64(&self.memory, vec_addr + 16);
                             var vdata: i64 = Memory_load_i64(&self.memory, vec_addr);
+                            var word: i64 = Memory_load_i64(&self.memory, vec_addr + 24);
+                            var esz: i64 = interp_vec_esz(word);
                             if idx < 0 || idx > vlen {
                                 return ExecOutcome::Panic("Vec insert out of bounds");
                             }
@@ -7632,11 +7726,11 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: &mut Ve
                                 if vcap > 0 {
                                     new_cap = vcap * 2;
                                 }
-                                var new_data: i64 = Memory_alloc(&mut self.memory, new_cap * 8);
+                                var new_data: i64 = Memory_alloc(&mut self.memory, new_cap * esz);
                                 var ci: i64 = 0;
                                 while ci < vlen {
-                                    var v: i64 = Memory_load_i64(&self.memory, vdata + ci * 8);
-                                    Memory_store_i64(&mut self.memory, new_data + ci * 8, v);
+                                    var v: i64 = interp_vec_ld(&self.memory, vdata, ci, word);
+                                    interp_vec_st(&mut self.memory, new_data, ci, word, v);
                                     ci = ci + 1;
                                 }
                                 vdata = new_data;
@@ -7647,12 +7741,12 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: &mut Ve
                             // Shift elements right from idx to vlen-1
                             var si: i64 = vlen;
                             while si > idx {
-                                var v: i64 = Memory_load_i64(&self.memory, vdata + (si - 1) * 8);
-                                Memory_store_i64(&mut self.memory, vdata + si * 8, v);
+                                var v: i64 = interp_vec_ld(&self.memory, vdata, si - 1, word);
+                                interp_vec_st(&mut self.memory, vdata, si, word, v);
                                 si = si - 1;
                             }
                             // Insert element
-                            Memory_store_i64(&mut self.memory, vdata + idx * 8, elem);
+                            interp_vec_st(&mut self.memory, vdata, idx, word, elem);
                             vlen = vlen + 1;
                             Memory_store_i64(&mut self.memory, vec_addr + 8, vlen);
                             return ExecOutcome::Value(Value::Void);
@@ -7673,17 +7767,31 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: &mut Ve
                 Value::Int(vec_addr) => {
                     match args.get(1) {
                         Value::Int(idx) => {
+                            interp_vec_own(&mut self.memory, vec_addr);
                             var vlen: i64 = Memory_load_i64(&self.memory, vec_addr + 8);
                             var vdata: i64 = Memory_load_i64(&self.memory, vec_addr);
+                            var word: i64 = Memory_load_i64(&self.memory, vec_addr + 24);
                             if idx < 0 || idx >= vlen {
                                 return ExecOutcome::Panic("Vec remove out of bounds");
                             }
-                            var elem: i64 = Memory_load_i64(&self.memory, vdata + idx * 8);
+                            var elem: i64 = interp_vec_ld(&self.memory, vdata, idx, word);
+                            // A struct's value is its slot's address: the
+                            // shift below overwrites it — copy the bytes out.
+                            if interp_vec_decode(word) >= 16 {
+                                var esz: i64 = interp_vec_esz(word);
+                                var cp: i64 = Memory_alloc(&mut self.memory, esz);
+                                var ck: i64 = 0;
+                                while ck < esz {
+                                    Memory_store_byte(&mut self.memory, cp + ck, Memory_load_byte(&self.memory, elem + ck));
+                                    ck = ck + 1;
+                                }
+                                elem = cp;
+                            }
                             // Shift elements left from idx+1 to vlen-1
                             var si: i64 = idx;
                             while si < vlen - 1 {
-                                var v: i64 = Memory_load_i64(&self.memory, vdata + (si + 1) * 8);
-                                Memory_store_i64(&mut self.memory, vdata + si * 8, v);
+                                var v: i64 = interp_vec_ld(&self.memory, vdata, si + 1, word);
+                                interp_vec_st(&mut self.memory, vdata, si, word, v);
                                 si = si + 1;
                             }
                             vlen = vlen - 1;
@@ -7717,9 +7825,10 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: &mut Ve
                     }
                     var vlen: i64 = Memory_load_i64(&self.memory, vec_addr + 8);
                     var vdata: i64 = Memory_load_i64(&self.memory, vec_addr);
+                    var word: i64 = Memory_load_i64(&self.memory, vec_addr + 24);
                     var ci: i64 = 0;
                     while ci < vlen {
-                        var elem: i64 = Memory_load_i64(&self.memory, vdata + ci * 8);
+                        var elem: i64 = interp_vec_ld(&self.memory, vdata, ci, word);
                         if elem == target {
                             return ExecOutcome::Value(Value::Bool(true));
                         }
@@ -7737,15 +7846,25 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: &mut Ve
         if args.len() >= 1 {
             match args.get(0) {
                 Value::Int(vec_addr) => {
+                    interp_vec_own(&mut self.memory, vec_addr);
                     var vlen: i64 = Memory_load_i64(&self.memory, vec_addr + 8);
                     var vdata: i64 = Memory_load_i64(&self.memory, vec_addr);
+                    // Element code decides the slot size (a Vec<u8> packs a
+                    // byte per element; a struct spans words) — swap bytes.
+                    var word: i64 = Memory_load_i64(&self.memory, vec_addr + 24);
+                    var esz: i64 = interp_vec_esz(word);
                     var lo: i64 = 0;
                     var hi: i64 = vlen - 1;
                     while lo < hi {
-                        var tmp1: i64 = Memory_load_i64(&self.memory, vdata + lo * 8);
-                        var tmp2: i64 = Memory_load_i64(&self.memory, vdata + hi * 8);
-                        Memory_store_i64(&mut self.memory, vdata + lo * 8, tmp2);
-                        Memory_store_i64(&mut self.memory, vdata + hi * 8, tmp1);
+                        var la: i64 = vdata + lo * esz;
+                        var hb: i64 = vdata + hi * esz;
+                        var kb: i64 = 0;
+                        while kb < esz {
+                            var tb: i64 = Memory_load_byte(&self.memory, la + kb);
+                            Memory_store_byte(&mut self.memory, la + kb, Memory_load_byte(&self.memory, hb + kb));
+                            Memory_store_byte(&mut self.memory, hb + kb, tb);
+                            kb = kb + 1;
+                        }
                         lo = lo + 1;
                         hi = hi - 1;
                     }
@@ -7766,7 +7885,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: &mut Ve
                         return ExecOutcome::Panic("Vec first() on empty vec");
                     }
                     var vdata: i64 = Memory_load_i64(&self.memory, vec_addr);
-                    var elem: i64 = Memory_load_i64(&self.memory, vdata);
+                    var elem: i64 = interp_vec_ld(&self.memory, vdata, 0, Memory_load_i64(&self.memory, vec_addr + 24));
                     return ExecOutcome::Value(Value::Int(elem));
                 }
                 _ => {
@@ -7784,7 +7903,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: &mut Ve
                         return ExecOutcome::Panic("Vec last() on empty vec");
                     }
                     var vdata: i64 = Memory_load_i64(&self.memory, vec_addr);
-                    var elem: i64 = Memory_load_i64(&self.memory, vdata + (vlen - 1) * 8);
+                    var elem: i64 = interp_vec_ld(&self.memory, vdata, vlen - 1, Memory_load_i64(&self.memory, vec_addr + 24));
                     return ExecOutcome::Value(Value::Int(elem));
                 }
                 _ => {
@@ -7799,11 +7918,14 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: &mut Ve
                 Value::Int(dst_addr) => {
                     match args.get(1) {
                         Value::Int(src_addr) => {
+                            interp_vec_own(&mut self.memory, dst_addr);
                             var dst_len: i64 = Memory_load_i64(&self.memory, dst_addr + 8);
                             var dst_cap: i64 = Memory_load_i64(&self.memory, dst_addr + 16);
                             var dst_data: i64 = Memory_load_i64(&self.memory, dst_addr);
                             var src_len: i64 = Memory_load_i64(&self.memory, src_addr + 8);
                             var src_data: i64 = Memory_load_i64(&self.memory, src_addr);
+                            var word: i64 = Memory_load_i64(&self.memory, dst_addr + 24);
+                            var esz: i64 = interp_vec_esz(word);
                             // Grow dst if needed
                             var needed: i64 = dst_len + src_len;
                             if needed > dst_cap {
@@ -7817,11 +7939,11 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: &mut Ve
                                 if new_cap < needed {
                                     new_cap = needed;
                                 }
-                                var new_data: i64 = Memory_alloc(&mut self.memory, new_cap * 8);
+                                var new_data: i64 = Memory_alloc(&mut self.memory, new_cap * esz);
                                 var ci: i64 = 0;
                                 while ci < dst_len {
-                                    var v: i64 = Memory_load_i64(&self.memory, dst_data + ci * 8);
-                                    Memory_store_i64(&mut self.memory, new_data + ci * 8, v);
+                                    var v: i64 = interp_vec_ld(&self.memory, dst_data, ci, word);
+                                    interp_vec_st(&mut self.memory, new_data, ci, word, v);
                                     ci = ci + 1;
                                 }
                                 dst_data = new_data;
@@ -7832,8 +7954,8 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: &mut Ve
                             // Copy elements from src to dst
                             var si: i64 = 0;
                             while si < src_len {
-                                var v: i64 = Memory_load_i64(&self.memory, src_data + si * 8);
-                                Memory_store_i64(&mut self.memory, dst_data + (dst_len + si) * 8, v);
+                                var v: i64 = interp_vec_ld(&self.memory, src_data, si, word);
+                                interp_vec_st(&mut self.memory, dst_data, dst_len + si, word, v);
                                 si = si + 1;
                             }
                             dst_len = dst_len + src_len;
@@ -7876,18 +7998,29 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: &mut Ve
         if args.len() >= 1 {
             match args.get(0) {
                 Value::Int(vec_addr) => {
+                    interp_vec_own(&mut self.memory, vec_addr);
                     var vlen: i64 = Memory_load_i64(&self.memory, vec_addr + 8);
                     var vdata: i64 = Memory_load_i64(&self.memory, vec_addr);
-                    // Simple bubble sort (ascending) on raw i64 elements
+                    var word: i64 = Memory_load_i64(&self.memory, vec_addr + 24);
+                    var esz: i64 = interp_vec_esz(word);
+                    // Simple bubble sort (ascending), element at its code's
+                    // size (a Vec<u8> compares bytes, not words)
                     var i: i64 = 0;
                     while i < vlen - 1 {
                         var j: i64 = 0;
                         while j < vlen - 1 - i {
-                            var a: i64 = Memory_load_i64(&self.memory, vdata + j * 8);
-                            var b: i64 = Memory_load_i64(&self.memory, vdata + (j + 1) * 8);
+                            var a: i64 = interp_vec_ld(&self.memory, vdata, j, word);
+                            var b: i64 = interp_vec_ld(&self.memory, vdata, j + 1, word);
                             if a > b {
-                                Memory_store_i64(&mut self.memory, vdata + j * 8, b);
-                                Memory_store_i64(&mut self.memory, vdata + (j + 1) * 8, a);
+                                var ka: i64 = vdata + j * esz;
+                                var kb2: i64 = vdata + (j + 1) * esz;
+                                var k: i64 = 0;
+                                while k < esz {
+                                    var t: i64 = Memory_load_byte(&self.memory, ka + k);
+                                    Memory_store_byte(&mut self.memory, ka + k, Memory_load_byte(&self.memory, kb2 + k));
+                                    Memory_store_byte(&mut self.memory, kb2 + k, t);
+                                    k = k + 1;
+                                }
                             }
                             j = j + 1;
                         }
@@ -8123,8 +8256,17 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: &mut Ve
             // runtimes give (core read_file: None); an empty file is "",
             // which is a Str and not 0 (known-bugs 2g.42: a Str compares
             // equal to 0 when empty, so "" made read_file None)
-            var fread: str = p_file_read(fpath);
-            if (fread as i64) == 0 {
+            var fread: str = "";
+            var fread__ok: bool = false;
+            match read_file(fpath) {
+                Option::Some(fread__t) => {
+                    fread = fread__t;
+                    fread__ok = true;
+                }
+                Option::None => {
+                }
+            }
+            if !fread__ok {
                 return ExecOutcome::Value(Value::Int(0));
             }
             if str_len(fread) == 0 {

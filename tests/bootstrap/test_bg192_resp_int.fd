@@ -1,0 +1,65 @@
+// Bugs roadmap BG192: the stdlib/redis.fd RESP decoder panicked on hostile
+// replies: `rs_parse_int`'s guard let ...580 * 10 + 8 through (and the valid
+// i64 minimum overflowed too), a map's `n * 2` was unchecked, and an
+// attribute recursed at its own depth so a chain of them bypassed
+// RESP_MAX_DEPTH. Integers now parse through the negative range, counts
+// over RESP_MAX_COUNT are a bad length, and each attribute counts one level.
+//
+// Expected output:
+// max: true 9223372036854775807
+// min: true -9223372036854775808
+// over max: false bad integer at byte 22
+// under min: false bad integer at byte 23
+// 21 digits: false bad integer at byte 24
+// zero: true 0
+// map huge: false bad length at byte 22
+// array huge: false bad length at byte 13
+// map 1: true 1
+// attr chain 2000: false nested too deep
+// attr chain 10: true 1
+// attr: true 7 has attrs true
+use redis;
+use string;
+
+fn bytes(s: str) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < str_len(s) {
+        out.push(str_byte_at(s, i));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn int_case(label: str, input: str) {
+    val d: RespDoc = resp_decode(bytes(input));
+    if d.ok {
+        println(label + ": true " + int_to_str(d.num.get(d.root)));
+    } else {
+        println(label + ": false " + d.error);
+    }
+}
+
+fn main() -> i64 {
+    int_case("max", ":9223372036854775807\r\n");
+    int_case("min", ":-9223372036854775808\r\n");
+    int_case("over max", ":9223372036854775808\r\n");
+    int_case("under min", ":-9223372036854775809\r\n");
+    int_case("21 digits", ":-92233720368547758080\r\n");
+    int_case("zero", ":-0\r\n");
+
+    val m: RespDoc = resp_decode(bytes("%5000000000000000000\r\n"));
+    println(f"map huge: {m.ok} {m.error}");
+    val a: RespDoc = resp_decode(bytes("*4294967296\r\n"));
+    println(f"array huge: {a.ok} {a.error}");
+    val m1: RespDoc = resp_decode(bytes("%1\r\n+k\r\n:1\r\n"));
+    println(f"map 1: {m1.ok} {m1.nkids.get(m1.root) / 2}");
+
+    val deep: RespDoc = resp_decode(bytes(str_repeat("|0\r\n", 2000) + ":1\r\n"));
+    println(f"attr chain 2000: {deep.ok} " + str_slice(deep.error, 0, 15));
+    val ten: RespDoc = resp_decode(bytes(str_repeat("|0\r\n", 10) + ":1\r\n"));
+    println(f"attr chain 10: {ten.ok} {ten.num.get(ten.root)}");
+    val at: RespDoc = resp_decode(bytes("|1\r\n+ttl\r\n:3600\r\n:7\r\n"));
+    println(f"attr: {at.ok} {at.num.get(at.root)} has attrs {at.attrs.get(at.root) >= 0}");
+    return 0;
+}

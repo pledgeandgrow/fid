@@ -1,0 +1,50 @@
+// Bugs roadmap BG136: a u64 at or above 2^63 converted to f64 or f32 is its
+// unsigned value on the machine layer (nat_ir: x86-64 halves it keeping the
+// low bit, converts and doubles; AArch64 ucvtf; RISC-V fcvt.d.lu) and in
+// `fid wasm` (f64/f32.convert_i64_u). Both read the word as signed: u64::MAX
+// became -1. The value goes through a parameter, so no constant is folded.
+// 2^63 + 1025 checks the kept low bit: dropped, the halved value rounds to
+// even and the result is 2^63, not 2^63 + 2048.
+//
+// Expected output:
+// 16777216
+// 8388608
+// 2048
+// 0
+// -1024
+// 12345
+// 16777216
+// 8388608
+// 1000
+// 16777216
+// 2048
+// 42
+fn conv(a: u64) -> f64 {
+    return a as f64;
+}
+
+fn conv32(a: u64) -> f32 {
+    return a as f32;
+}
+
+fn main() -> i64 {
+    val two40: f64 = 1099511627776.0;
+    val two63: f64 = 9223372036854775808.0;
+    println(int_to_str((conv(18446744073709551615) / two40) as i64));
+    println(int_to_str((conv(9223372036854775808) / two40) as i64));
+    println(int_to_str((conv(9223372036854776833) - two63) as i64));
+    println(int_to_str((conv(9223372036854775808) - two63) as i64));
+    println(int_to_str((conv(9223372036854774784) - two63) as i64));
+    println(int_to_str(conv(12345) as i64));
+    println(int_to_str(((conv32(18446744073709551615) as f64) / two40) as i64));
+    println(int_to_str(((conv32(9223372036854775808) as f64) / two40) as i64));
+    println(int_to_str((conv32(1000) as f64) as i64));
+    val big: u64 = 18446744073709551615;
+    println(int_to_str(((big as f64) / two40) as i64));
+    val vs: Vec<u64> = Vec::new();
+    vs.push(18446744073709549568);
+    vs.push(42);
+    println(int_to_str((two63 * 2.0 - (vs[0] as f64)) as i64));
+    println(int_to_str((vs[1] as f64) as i64));
+    return 0;
+}

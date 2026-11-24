@@ -18,7 +18,7 @@ PY=${PYTHON:-python3}
 command -v "$PY" > /dev/null 2>&1 || PY=python
 P=tests/projects/tl5_lines/main.fd
 # relative paths: Git Bash would rewrite a /tmp path given to a Windows program
-D=$(mktemp -d ./_tl5_check.XXXXXX)
+D=$(mktemp -d ./tests/_tl5_check.XXXXXX)
 D=${D#./}
 trap 'rm -rf "$D"' EXIT
 fail=0

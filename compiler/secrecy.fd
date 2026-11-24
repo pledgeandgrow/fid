@@ -142,7 +142,13 @@ fn sec_none() -> Vec<i64> {
 }
 
 fn sec_is_output_sink(name: str) -> bool {
-    return name == "print" || name == "println" || name == "eprint" || name == "eprintln" || name == "p_print_int" || name == "p_print_str" || name == "p_print_float" || name == "p_print_bool" || name == "p_print_newline" || name == "p_eprint_str" || name == "p_print_vec" || name == "p_socket_send" || name == "p_socket_send_str" || name == "p_http_send_response" || name == "p_file_write" || name == "p_file_append" || name == "p_file_write_bin" || name == "p_file_write_vec" || name == "write_file" || name == "append_file" || str_starts_with(name, "p_write") || str_starts_with(name, "p_fs_write") || str_starts_with(name, "p_socket_write") || str_starts_with(name, "p_net_send") || str_starts_with(name, "p_net_write") || name == "log_info" || name == "log_warn" || name == "log_error" || name == "log_debug" || name == "p_chan_send" || sec_is_exit_sink(name);
+    return name == "print" || name == "println" || name == "eprint" || name == "eprintln" || name == "p_print_int" || name == "p_print_str" || name == "p_print_float" || name == "p_print_bool" || name == "p_print_newline" || name == "p_eprint_str" || name == "p_print_vec" || name == "p_socket_send" || name == "p_socket_send_str" || name == "p_http_send_response" || name == "p_file_write" || name == "p_file_append" || name == "p_file_write_bin" || name == "p_file_write_vec" || name == "write_file" || name == "append_file" || str_starts_with(name, "p_write") || str_starts_with(name, "p_fs_write") || str_starts_with(name, "p_socket_write") || str_starts_with(name, "p_net_send") || str_starts_with(name, "p_net_write") || name == "log_info" || name == "log_warn" || name == "log_error" || name == "log_debug" || name == "p_chan_send" || sec_is_command_sink(name) || sec_is_exit_sink(name);
+}
+
+/// BG172: a command line, an environment variable, a serial port and a
+/// database statement leave the program too.
+fn sec_is_command_sink(name: str) -> bool {
+    return name == "p_system" || name == "p_process_run" || name == "p_spawn_process" || name == "p_exec" || name == "p_setenv" || name == "p_serial_write" || name == "p_db_exec";
 }
 
 /// BG98: a panic, a failed assertion and an exit end the program where
@@ -991,12 +997,70 @@ fn sec_expr2(self: &mut SecrecyChecker, a: Box<Expr>, b: Box<Expr>) -> Vec<i64> 
     return sec_union(l, sec_expr(self, box_expr_deref(b)));
 }
 
+fn sec_is_short_circuit(op: BinOp) -> bool {
+    match op {
+        BinOp::And => {
+            return true;
+        }
+        BinOp::Or => {
+            return true;
+        }
+        _ => {
+        }
+    }
+    return false;
+}
+
+/// BG171: `a |> f`, `a |> f(args)`, `a |> obj.m` and `a |> obj.m(args)` are
+/// the calls the lowering makes of them (`f(a)`, `f(a, args)`, `obj.m(a)`,
+/// `a.m(args)`), checked as those calls with the callee's summary.
+fn sec_pipe(self: &mut SecrecyChecker, left: Expr, right: Expr) -> Vec<i64> {
+    match right {
+        Expr::Call(callee, args) => {
+            var pargs: Vec<Expr> = Vec::new();
+            pargs.push(left);
+            var i: i64 = 0;
+            while i < args.len() {
+                pargs.push(args.get(i));
+                i = i + 1;
+            }
+            return sec_call(self, callee, pargs);
+        }
+        Expr::MethodCall(_, method, args) => {
+            return sec_method_call(self, left, method, args);
+        }
+        Expr::Ident(name) => {
+            var one: Vec<Expr> = Vec::new();
+            one.push(left);
+            return sec_call(self, name, one);
+        }
+        Expr::FieldAccess(receiver, field) => {
+            var one: Vec<Expr> = Vec::new();
+            one.push(left);
+            return sec_method_call(self, box_expr_deref(receiver), field, one);
+        }
+        _ => {
+        }
+    }
+    var ll: Vec<i64> = sec_expr(self, left);
+    return sec_union(ll, sec_expr(self, right));
+}
+
 fn sec_expr(self: &mut SecrecyChecker, e: Expr) -> Vec<i64> {
     match e {
         Expr::Ident(n) => {
             return sec_var(self, n);
         }
-        Expr::Binary(_, l, r) => {
+        Expr::Binary(op, l, r) => {
+            // BG170: the right operand of `&&`/`||` runs only depending on
+            // the left one, as an if's branch does on its condition
+            if sec_is_short_circuit(op) {
+                var sc: Vec<i64> = sec_expr(self, box_expr_deref(l));
+                sec_push_pc(self, sc);
+                var sr: Vec<i64> = sec_expr(self, box_expr_deref(r));
+                sec_pop_pc(self);
+                return sec_union(sc, sr);
+            }
             return sec_expr2(self, l, r);
         }
         Expr::StrConcat(l, r) => {
@@ -1009,7 +1073,7 @@ fn sec_expr(self: &mut SecrecyChecker, e: Expr) -> Vec<i64> {
             return sec_expr2(self, l, r);
         }
         Expr::PipeForward(l, r) => {
-            return sec_expr2(self, l, r);
+            return sec_pipe(self, box_expr_deref(l), box_expr_deref(r));
         }
         Expr::Index(l, r) => {
             return sec_expr2(self, l, r);

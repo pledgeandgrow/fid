@@ -548,14 +548,14 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       ra1_pe_ra_off_check on 117 programs gives 114 same, 0 differ (1
       out-of-memory build). Left: deleting pe_ir's allocator, which waits
       for MI17 and the Windows default.
-- [~] RA2. Liveness on MIR from use lists, live ranges as lists of segments with
+- [x] RA2. Liveness on MIR from use lists, live ranges as lists of segments with
       holes, not hulls (M).
       Done (Nov 17): liveness from use lists (`ng_use_liveness`;
       `FID_NAT_OFF=uselive`: the fixed point, compared under `FID_VERIFY=1`),
       live ranges as exact segment lists (`ng_class_segs`) used by the linear
       scan (`ng_seg_scan`), the greedy allocator and the second chance
-      (`FID_NAT_OFF=holes`, `segscan`); the float class and RA7's hints are
-      still on hulls.
+      (`FID_NAT_OFF=holes`, `segscan`); float allocation and RA7 hints were
+      still hull-based at the Nov 21 check.
       Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
       partly — liveness from use lists (ng_use_liveness) gives the same
       allocation (`FID_NAT_OFF=uselive`); machine_segs_check passes on
@@ -564,21 +564,11 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       (argument register 6; fine with `FID_NAT_OFF=argfree`), and the
       reload comparison shows 0 vs 0. Left: that failure (RA3/RA7), a
       measured gain, floats and RA7's hints on segments.
-      Nov 22 float plan (moderate, well-scoped): ng_float_assign
-      (nat_ir.fd:18001) is a hull-based scan — it takes no segs parameter at
-      all; segments already exist for float vregs (ng_class_segs computes
-      them for every vreg, and :15205–15222 removes float ranges from the
-      integer scan by setting lo = −1, keeping only the start in `flo`).
-      Work: pass segs + class into ng_float_assign, replace hull expiry and
-      interference with ng_seg_free / ng_seg_hits, and replace its
-      call-crossing test with a per-segment legality check against the FLOAT
-      pools (ng_float_pool, ng_float_callee_pool, mask ng_float_mask) — not
-      ng_reg_ok + the integer IPRA masks. Float spills currently have no
-      second chance at all (ng_alloc_holes runs before ng_float_assign);
-      add a float holes round after it. RA7/RA3 keep treating float argument
-      registers separately (they already take rcls). FID_VERIFY's checker
-      must validate float assignments per segment, not per hull. Extend
-      tests/nattools/seg_unit.fd — it covers the integer scan only.
+      Nov 24: `ng_float_assign_segs` now checks exact float segments, including
+      call crossings and weighted eviction; `ng_arg_hints` uses segment
+      legality and overlap too. `machine_segs_check.sh` and
+      `machine_fregs_check.sh` pass with FID_VERIFY=1 on x86-64, AArch64,
+      RISC-V, and --nat Windows; the use-list/fixed-point allocations agree.
 - [x] RA3. All registers, caller-saved included: a value live across a call goes
       to a callee-saved register or is split around the call (L).
       Caller-saved registers for ranges no clobbering call crosses (AArch64
@@ -593,17 +583,19 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       that (the assignment or the checker).
       Nov 21: 2g.88 fixed — the checker now allows a range to end at a self-copy of the argument register into the range's value (ng_arg_fit_end); the argument-register passes stay on.
       Nov 22 code audit: ng_arg_fit_end (nat_ir.fd:13997) is the 2g.88 checker fix; ng_arg_free at 14258; argreg_dead_def_check.sh + argreg_dead_def_unit.fd exist.
-- [~] RA4. Live-range splitting at calls and at loop boundaries, with spill code
+- [x] RA4. Live-range splitting at calls and at loop boundaries, with spill code
       placed outside loops (L).
       Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
       partly — the splitting (ng_mir_alloc_split, ng_split_check) works
-      where the checker allows it: split_unit 24/24, test_machine_split and
-      _split_float right, the split mutation rejected on 4 targets, wide
-      reloads 512 -> 506 (x86-64), 222 -> 209, 258 -> 241; 69 test_machine
-      programs agree with split off and on. Left: split_alloc_unit rejects 1
-      x64 program, the splitall builds fail the argument-register check on
-      x86-64, RISC-V and Windows, the suite spill numbers.
-      Nov 21: 2g.88 fixed (see RA3); the FID_NAT_ON=splitall rejections were the same checker miss.
+      where the checker allowed it: split_unit 24/24, test_machine_split and
+      _split_float right, split mutation rejected on 4 targets. Nov 21:
+      2g.88 fixed (see RA3); the FID_NAT_ON=splitall rejections were the same
+      checker miss.
+      Nov 24: machine_split_check.sh passes on x86-64, AArch64, RISC-V and
+      --nat Windows. `split_alloc_unit.fd` matches expected output, splitprune
+      preserves it, and split mutation rejects 66 random cases with 0
+      unnoticed differences. AArch64 `wide` has equal estimated cost before
+      and after splitting, so the split is pruned; reloads do not grow.
 - [x] RA5. Spill weights from loop depth and use counts (M).
       Nov 9: `ng_spill_weights`: each use or definition 8^(loop depth), the
       loops from back edges in the MIR; with no register free the cheapest
@@ -617,7 +609,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       the copy left a move to itself; the checker validates it
       (`FID_NAT_OFF=coalesce`).
       Nov 22 code audit: coalescing behind ng_on("coalesce") (nat_ir.fd:14981) + livecoal round; the self-move wart handled by RA7 hints (13677) and ng_fold_ext_state (8982). No Left line, nothing remaining.
-- [~] RA7. Register hints: arguments, results and call operands prefer the
+- [x] RA7. Register hints: arguments, results and call operands prefer the
       registers they must end in (M).
       (Nov 15: only vreg-to-vreg move hints exist; the argument and result
       registers are outside the allocation pool, `ng_pool_caller`, so they
@@ -631,6 +623,12 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       Windows (5 of 69 test_machine programs, with RA3's fill); the full
       suite.
       Nov 21: 2g.88 fixed (see RA3) — hint- and fill-built assignments pass the allocation checker again (argreg_dead_def_check.sh).
+      Nov 24: argument hints now test segment legality and interference.
+      machine_ra7_check.sh passes with FID_VERIFY=1 on x86-64 Linux,
+      AArch64, RISC-V and --nat Windows; moves fall 8236 -> 5279,
+      8311 -> 5456, 8383 -> 5520, 11808 -> 7533, and the mutation is
+      rejected on every target. The fixture reader stops at the blank line
+      after expected output.
 - [x] RA8. Rematerialization of constants, addresses of globals and frame slots
       instead of spills (M).
       Nov 9: constants: a vreg defined once by MO_LI is never stored, a spilled
@@ -660,7 +658,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       needs pairs (each value is one 64-bit register), so there is no
       pair class: NatTarget.pairs is false everywhere. Tests:
       test_machine_fregs.fd, machine_fregs_check.sh, ra18_float_bench.sh.
-- [~] RA11. Parallel moves at block edges solved with cycle breaking through one
+- [x] RA11. Parallel moves at block edges solved with cycle breaking through one
       scratch register (M).
       (Nov 15: there are no block-edge moves yet: a range keeps one register
       or slot everywhere, so this comes with splitting, RA4.)
@@ -672,12 +670,11 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       cycle, so no scratch register is taken; tests/nattools/par_moves_unit.fd,
       split_alloc_unit.fd, machine_split_check.sh.
       Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
-      partly — nat_par_moves serves the splitter and is checked:
-      par_moves_unit 9/9, the checker rejects the split mutation on all 4
-      targets. But the FID_VERIFY=1 splitall builds fail on x86-64, RISC-V
-      and Windows (the argument-register check, not a move cycle), and
-      split_alloc_unit rejects 1 x64 program. Left: those, so the suite
-      validates RA4.
+      partly — nat_par_moves serves the splitter and is checked; remaining
+      split-suite issues were the RA4/argument-register failures.
+      Nov 24: par_moves_unit passes, machine_split_check.sh passes on all
+      four targets, and split_alloc_unit verifies the resulting edge
+      allocations and rejects the split mutation.
 - [x] RA12. Callee-saved registers saved only on paths that use them (shrink
       wrapping) (M).
       Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
@@ -692,7 +689,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       registers two at a time (`a64_stp`/`a64_ldp` in nat_enc.fd, the same
       slots; `FID_NAT_OFF=pairs`: one at a time); test_machine_remat.fd. The
       two forms are not yet in scripts/enc-oracle.py.
-- [~] RA14. A fast mode for debug builds: one pass, local allocation, under 10% of
+- [x] RA14. A fast mode for debug builds: one pass, local allocation, under 10% of
       compile time (M).
       Done (Nov 15): `FID_NAT_FAST=1` (or `g_nat_fast`, for main.fd to set):
       `ng_mir_alloc` skips the liveness fixed point, coalescing and spill
@@ -702,16 +699,16 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       `--fast`) sets `g_nat_fast` with the mid-end on, `--debug` without it
       (SP13); also on `fid emit-ir`. The function cache's key now holds the
       allocator mode (it replayed code of the other allocator before);
-      tests/bootstrap/test_driver_fast_alloc.fd. Left: measuring it against
-      the 10% target.
+      tests/bootstrap/test_driver_fast_alloc.fd.
       Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
-      failed — the check found this not done: in debug mode the allocation
-      is 11–13% of the build, not under 10% (test_compiler_sized 11.2%,
-      test_machine_probe 12.4%, compiler/main.fd 13.1%; `--fast-alloc` with
-      the mid-end is 6.1–9.5%). The main.fd default and fast-alloc rows
-      panic in iro_sccp (integer overflow on subtraction). Left: a faster
-      fast path, that panic, a run on a quiet machine.
+      failed at the time: the default debug path's allocation was 11–13%
+      of the build; `--fast-alloc` with the mid-end was 6.1–9.5%. The
+      main.fd default and fast-alloc rows then hit the iro_sccp overflow.
       Nov 21 (5fb5516): the FID_NAT_* switches are read once per image (ng_env_cache_load, g_ng_env_ok) instead of per move (copy hints) and per call (IPRA) — a large share of a debug build's allocation time. The SCCP panic the check hit (2g.89) is also fixed (SP11).
+      Nov 24 measured with ra14_fast_alloc_time.sh --self --runs 1:
+      both fast modes are below 10% for all six programs. compiler/main.fd:
+      1602/119153 ms (1.3%) with --fast-alloc and 1424/42590 ms (3.3%)
+      with --debug; default allocation was 48678/191738 ms (25.4%).
 - [x] RA15. An allocation checker: replay the allocated code symbolically and
       prove every use reads the value it should (regalloc2's checker) (L).
       Nov 8: `ng_mir_check`, an independent exact liveness walk; it found a real
@@ -749,7 +746,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       AArch64 (0.89) keeps them. A per-function cost model can bring them
       back; the fcallee tests and the mutation are unaffected (the pool is
       empty, ranges spill).
-- [~] RA19. A value used only as a branch condition stays in flags where the
+- [x] RA19. A value used only as a branch condition stays in flags where the
       target has them (M).
       Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
       partly — test_machine_brflags and _brflags2 are right, and with
@@ -757,8 +754,12 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       cases lose their SETCCs. In a default build both check scripts fail
       (the functions are inlined); ext_if, xb_ext and xb keep theirs; the
       x86-64/`--nat` FID_VERIFY builds of brflags2 hit the argument-register
-      check. Left: those, `while a && b` heads, `&&` with a call, RISC-V
-      without Zicond.
+      check.
+      Nov 24: machine_ra19_more_check.sh passes on x86-64, AArch64, RISC-V
+      and --nat Windows. The comparison disables `brfuse` plus its subrules
+      and compares the pre-fusion peephole MIR with the fused MIR:
+      xb_not/xb_nval/xb_nn each go 3 -> 1 SETCC; ext_if goes 3 -> 2 and
+      xb_ext 3 -> 1. FID_VERIFY output checks and the mutation pass.
 - [x] RA20. The allocator honours IPRA clobber sets (Track WP) at each call (M).
       Calls only clobber what their callee was found to clobber (WP4).
 

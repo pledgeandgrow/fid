@@ -141,6 +141,7 @@ pub fn tv_snapshot(f: &IrFunction) -> IrFunction {
     nf.current_block_idx = f.current_block_idx;
     nf.entry = f.entry;
     nf.locals = f.locals.clone();
+    nf.dbg_locals = f.dbg_locals.clone();
     nf.persist_vars = f.persist_vars.clone();
     nf.drop_locals = f.drop_locals.clone();
     nf.zeroize_locals = f.zeroize_locals.clone();
@@ -163,6 +164,7 @@ fn tv_restore(f: &mut IrFunction, s: &IrFunction) {
     f.current_block_idx = s.current_block_idx;
     f.entry = s.entry;
     f.locals = s.locals;
+    f.dbg_locals = s.dbg_locals;
     f.persist_vars = s.persist_vars;
     f.drop_locals = s.drop_locals;
     f.zeroize_locals = s.zeroize_locals;
@@ -407,6 +409,39 @@ fn tv_is_float(t: IrType) -> bool {
             return false;
         }
     }
+}
+
+/// The types the inliner counts as scalar (iropt.fd iro_is_scalar):
+/// numbers, bool and pointers.
+fn tv_is_scalar(t: IrType) -> bool {
+    match t {
+        IrType::Ptr(_) => {
+            return true;
+        }
+        _ => {
+        }
+    }
+    return ir_type_is_scalar(t);
+}
+
+/// The type the inliner sees for a value (iropt.fd iro_value_ty): its
+/// recorded type, a parameter's declared type, else I64.
+fn tv_value_ty(f: &IrFunction, id: i64) -> IrType {
+    match IrFunction_get_meta(f, id) {
+        OptValueMeta::Some(m) => {
+            return m.ty;
+        }
+        OptValueMeta::None => {
+        }
+    }
+    var pi: i64 = 0;
+    while pi < f.params.len() {
+        if f.params.get(pi).id == id {
+            return f.params.get(pi).ty;
+        }
+        pi = pi + 1;
+    }
+    return IrType::I64;
 }
 
 /// `v` as a value of type `t`: the low bits, sign-extended for a signed
@@ -948,6 +983,7 @@ fn tv_eval(f: &IrFunction, sh: &TvShape, args: &Vec<i64>, limit: i64) -> TvOut {
     var trace: i64 = 7;
     var ncalls: i64 = 0;
     var steps: i64 = 0;
+    var last: i64 = -1;
     var b: i64 = 0;
     var done: bool = false;
     while !done {
@@ -956,6 +992,7 @@ fn tv_eval(f: &IrFunction, sh: &TvShape, args: &Vec<i64>, limit: i64) -> TvOut {
         var nxt: i64 = -1;
         while k < ids.len() && nxt < 0 && !done {
             var id: i64 = ids.get(k);
+            last = id;
             steps = steps + 1;
             if steps > limit {
                 out.kind = 4;
@@ -1110,6 +1147,9 @@ fn tv_eval(f: &IrFunction, sh: &TvShape, args: &Vec<i64>, limit: i64) -> TvOut {
     }
     out.trace = trace;
     out.steps = steps;
+    if tv_trace_on() && out.kind != 0 {
+        p_eprint_str("tv eval " + f.name + ": kind " + int_to_str(out.kind) + " at block " + int_to_str(f.blocks.get(b).id) + " inst %" + int_to_str(last) + " after " + int_to_str(steps) + " steps\n");
+    }
     return out;
 }
 
@@ -1546,12 +1586,41 @@ fn tv_quiet_between(pre: &IrFunction, cx: &TvCtx, b: i64, a: i64, p: i64) -> boo
     return true;
 }
 
+var g_tv_trace: i64 = 0;
+
+fn tv_trace_on() -> bool {
+    if g_tv_trace == 0 {
+        var ev: str = p_getenv("FID_TV_TRACE");
+        g_tv_trace = 1;
+        if str_len(ev) > 0 && ev != "0" {
+            g_tv_trace = 2;
+        }
+    }
+    return g_tv_trace == 2;
+}
+
+/// FID_TV_TRACE: the leaf pair a check could not prove (debug aid).
+fn tv_ne(why: str, a: i64, b: i64) -> bool {
+    if tv_trace_on() {
+        p_eprint_str("  tv-trace: %" + int_to_str(a) + " vs %" + int_to_str(b) + ": " + why + "\n");
+    }
+    return false;
+}
+
+/// FID_TV_TRACE: which structural check failed (debug aid).
+fn tv_fail(why: str) -> bool {
+    if tv_trace_on() {
+        p_eprint_str("  tv-trace: " + why + "\n");
+    }
+    return false;
+}
+
 /// Does value `b` after the pass equal value `a` before it?
 fn tv_val_eq(pre: &IrFunction, post: &IrFunction, cx: &mut TvCtx, a: i64, b: i64, d: i64) -> bool {
     cx.budget = cx.budget - 1;
     if cx.budget < 0 {
         // out of comparisons: only an unchanged name passes
-        return a == b;
+        return a == b || tv_ne("out of comparisons", a, b);
     }
     var ka: TvK = tv_constk(pre, a, 0);
     if ka.kind != 2 {
@@ -1582,25 +1651,46 @@ fn tv_val_eq(pre: &IrFunction, post: &IrFunction, cx: &mut TvCtx, a: i64, b: i64
     }
     if !ha || !hb {
         // parameters: the same one
-        return !ha && !hb && a == b;
+        return (!ha && !hb && a == b) || tv_ne("one side has no instruction", a, b);
     }
     var ia: Inst = peir_inst_of(pre, a);
     var ib: Inst = peir_inst_of(post, b);
     if tv_shape(ia) != tv_shape(ib) {
-        return false;
+        return tv_ne("different shapes", a, b);
+    }
+    match ia {
+        Inst::Load(lp, _) => {
+            if a != b {
+                // a second load of the same pointer, first in their block
+                // with nothing between that writes what they read: a proof
+                // that makes no recursion, so it stands past the depth the
+                // operand comparisons stop at (gvn folds a copy of a load it
+                // numbers the same into the first one)
+                var pb: Vec<i64> = Vec::new();
+                peir_inst_operands(ib, &mut pb);
+                if pb.len() == 1 && pb.get(0) == lp && tv_quiet_between(pre, cx, b, a, lp) {
+                    if a >= 0 && a < cx.rep.len() {
+                        cx.rep.set(a, b + 1);
+                    }
+                    return true;
+                }
+            }
+        }
+        _ => {
+        }
     }
     if d >= TV_DEPTH {
-        return a == b;
+        return a == b || tv_ne("deeper than the comparisons go", a, b);
     }
     var cl: i64 = tv_class(pre, &cx.plain_a, ia);
     if cl == 2 {
         // the result of a call or an effect is only itself
-        return a == b;
+        return a == b || tv_ne("a call or effect is only itself", a, b);
     }
     match ia {
         Inst::Load(lp, _) => {
             if a != b && !tv_quiet_between(pre, cx, b, a, lp) {
-                return false;
+                return tv_ne("the loads have a write between", a, b);
             }
         }
         _ => {
@@ -1611,7 +1701,7 @@ fn tv_val_eq(pre: &IrFunction, post: &IrFunction, cx: &mut TvCtx, a: i64, b: i64
     var ob: Vec<i64> = Vec::new();
     peir_inst_operands(ib, &mut ob);
     if oa.len() != ob.len() {
-        return false;
+        return tv_ne("different operand counts", a, b);
     }
     var i: i64 = 0;
     while i < oa.len() {
@@ -1774,11 +1864,28 @@ pub fn tv_structural(pname: str, pre: &IrFunction, post: &IrFunction) -> str {
     var cx: TvCtx = TvCtx {
         pname: pname, plain_a: sa.plain, plain_b: sb.plain, blk_a: blk_a, pos_a: pos_a, cfg_a: iro_cfg(pre), budget: TV_BUDGET, rep: peir_zeros(nva)
     };
+    // ssa removes the stores of the locals it promotes; a local it freed of
+    // an escaping use can become plain only by the pass, so a store of it
+    // that survives was an effect before and still counts in post
+    var plain_bk: Vec<i64> = cx.plain_b;
+    if pname == "ssa" {
+        var pm: Vec<i64> = Vec::new();
+        var mi: i64 = 0;
+        while mi < cx.plain_b.len() {
+            if mi < nva {
+                pm.push(cx.plain_a.get(mi));
+            } else {
+                pm.push(cx.plain_b.get(mi));
+            }
+            mi = mi + 1;
+        }
+        plain_bk = pm;
+    }
     // 1. what has an effect stays, in its order, on equal operands
     bi = 0;
     while bi < pre.blocks.len() {
         var la: Vec<i64> = tv_kept(pre, &cx.plain_a, pre.blocks.get(bi).instructions, pname);
-        var lb: Vec<i64> = tv_kept(post, &cx.plain_b, post.blocks.get(bi).instructions, pname);
+        var lb: Vec<i64> = tv_kept(post, &plain_bk, post.blocks.get(bi).instructions, pname);
         var bid: str = int_to_str(pre.blocks.get(bi).id);
         if la.len() != lb.len() {
             return "an instruction with an effect was added or removed in block " + bid;
@@ -2066,6 +2173,40 @@ fn tv_loop_writes(f: &IrFunction, plain: &Vec<i64>, body: &Vec<i64>, lens: bool)
     return false;
 }
 
+/// May a call in loop `body` of `f` resize a Vec? The pass's own measure
+/// (iropt.fd iro_licm_loop): any call not known to keep lengths
+/// (Vec_get/set/len and the p_ forms), or an indirect one. Stores cannot:
+/// a Vec's length field is private to the runtime calls that change it.
+fn tv_loop_resizes(f: &IrFunction, body: &Vec<i64>) -> bool {
+    var b: i64 = 0;
+    while b < f.blocks.len() && b < body.len() {
+        if body.get(b) == 1 {
+            var ids: Vec<i64> = f.blocks.get(b).instructions;
+            var k: i64 = 0;
+            while k < ids.len() {
+                match peir_inst_of(f, ids.get(k)) {
+                    Inst::Call(cn, _, _, _) => {
+                        if !(cn == "Vec_get" || cn == "Vec_set" || cn == "Vec_len" || cn == "p_vec_get" || cn == "p_vec_set" || cn == "p_vec_len") {
+                            return true;
+                        }
+                    }
+                    Inst::CallPtr(_, _, _, _, _) => {
+                        return true;
+                    }
+                    Inst::DynCall(_, _, _, _, _) => {
+                        return true;
+                    }
+                    _ => {
+                    }
+                }
+                k = k + 1;
+            }
+        }
+        b = b + 1;
+    }
+    return false;
+}
+
 /// Is block index `p` the one way into the loop headed by block index `h`
 /// (whose blocks `body` flags), ending in a jump to it?
 fn tv_enters(f: &IrFunction, cfg: &IroCfg, body: &Vec<i64>, h: i64, p: i64) -> bool {
@@ -2187,7 +2328,15 @@ fn tv_licm_move(pre: &IrFunction, post: &IrFunction, cfg: &IroCfg, loops: &IroLo
         if x >= 0 && x < pa.blk.len() && pa.blk.get(x) >= 0 {
             var xa: i64 = pa.blk.get(x);
             if xa < body.len() && body.get(xa) == 1 {
-                if pb.blk.get(x) != to || pb.pos.get(x) >= pb.pos.get(v) {
+                // it had to come out of the loop too: into `to` ahead of `v`,
+                // or further — a block that dominates `to` (nested loops can
+                // hoist the operand another level, iro_licm_loop rounds)
+                var xb: i64 = pb.blk.get(x);
+                if xb == to {
+                    if pb.pos.get(x) >= pb.pos.get(v) {
+                        return "reads %" + int_to_str(x) + ", which the loop computes";
+                    }
+                } else if xb < 0 || !iro_dominates(cfg, xb, to) {
                     return "reads %" + int_to_str(x) + ", which the loop computes";
                 }
             }
@@ -2210,7 +2359,7 @@ fn tv_licm_move(pre: &IrFunction, post: &IrFunction, cfg: &IroCfg, loops: &IroLo
         }
         Inst::Call(cn, _, _, ce) => {
             if cn == "Vec_len" || cn == "p_vec_len" {
-                if tv_loop_writes(pre, plain, &body, true) {
+                if tv_loop_resizes(pre, &body) {
                     return "is `len` of a Vec the loop may resize";
                 }
                 return "";
@@ -3231,6 +3380,7 @@ fn tv_copy(f: IrFunction) -> IrFunction {
     nf.inst_at = s.inst_at;
     nf.effects = s.effects;
     nf.locals = s.locals;
+    nf.dbg_locals = s.dbg_locals;
     nf.persist_vars = s.persist_vars;
     nf.drop_locals = s.drop_locals;
     nf.zeroize_locals = s.zeroize_locals;
@@ -4289,8 +4439,8 @@ fn tv_inline_copy(w: &TvWorld, g: str, caller: &IrFunction, post: &IrFunction, a
         return "inlines " + g + " with " + int_to_str(args.len()) + " arguments for " + int_to_str(c.params.len()) + " parameters";
     }
     var body: Vec<i64> = c.blocks.get(0).instructions;
-    if body.len() != run.len() + 1 {
-        return "is not a copy of " + g + " (" + int_to_str(run.len()) + " instructions for its " + int_to_str(body.len() - 1) + ")";
+    if body.len() == 0 {
+        return "inlines " + g + ", whose block is empty";
     }
     var rv: i64 = -1;
     match peir_inst_of(&c, body.get(body.len() - 1)) {
@@ -4309,21 +4459,50 @@ fn tv_inline_copy(w: &TvWorld, g: str, caller: &IrFunction, post: &IrFunction, a
     if rv < 0 {
         return "inlines " + g + ", which does not end returning a value";
     }
-    // the callee's values -> the caller's (+ 1)
+    // the callee's values -> the caller's (+ 1). Where the call's argument
+    // and the parameter differ in type (same width only) the inliner puts
+    // a BitCast of the argument into the parameter, one instruction before
+    // the body's copy for each such parameter, in parameter order (BG43,
+    // iropt.fd iro_inline_function).
     var map: Vec<i64> = peir_zeros(c.next_value + 1);
+    var lead: i64 = 0;
     var p: i64 = 0;
     while p < c.params.len() {
         var pid: i64 = c.params.get(p).id;
         if pid >= 0 && pid < map.len() {
-            map.set(pid, args.get(p) + 1);
+            var argp: i64 = args.get(p);
+            var pty: IrType = c.params.get(p).ty;
+            var aty: IrType = tv_value_ty(caller, argp);
+            if tv_is_scalar(pty) && tv_is_scalar(aty) && !ir_type_eq(aty, pty) && ir_type_size(aty) == ir_type_size(pty) {
+                if lead >= run.len() {
+                    return "is not a copy of " + g + " (its parameter " + int_to_str(p) + " misses a BitCast)";
+                }
+                match peir_inst_of(post, run.get(lead)) {
+                    Inst::BitCast(bx, baty, bpty) => {
+                        if bx != argp || !ir_type_eq(baty, aty) || !ir_type_eq(bpty, pty) {
+                            return "is not a copy of " + g + " (a BitCast for its parameter " + int_to_str(p) + " differs)";
+                        }
+                    }
+                    _ => {
+                        return "is not a copy of " + g + " (its parameter " + int_to_str(p) + " misses a BitCast)";
+                    }
+                }
+                map.set(pid, run.get(lead) + 1);
+                lead = lead + 1;
+            } else {
+                map.set(pid, argp + 1);
+            }
         }
         p = p + 1;
     }
+    if body.len() != run.len() - lead + 1 {
+        return "is not a copy of " + g + " (" + int_to_str(run.len() - lead) + " instructions for its " + int_to_str(body.len() - 1) + ")";
+    }
     var q: i64 = 0;
-    while q < run.len() {
+    while q < body.len() - 1 {
         var cid: i64 = body.get(q);
         var ci: Inst = peir_inst_of(&c, cid);
-        var ni: Inst = peir_inst_of(post, run.get(q));
+        var ni: Inst = peir_inst_of(post, run.get(q + lead));
         if tv_shape(ci) != tv_shape(ni) {
             return "is not a copy of " + g + " (its instruction " + int_to_str(q) + " differs)";
         }
@@ -4342,7 +4521,7 @@ fn tv_inline_copy(w: &TvWorld, g: str, caller: &IrFunction, post: &IrFunction, a
             o = o + 1;
         }
         if cid >= 0 && cid < map.len() {
-            map.set(cid, run.get(q) + 1);
+            map.set(cid, run.get(q + lead) + 1);
         }
         q = q + 1;
     }
@@ -4444,21 +4623,21 @@ fn tv_spec_clone_at(f: &IrFunction, g: &IrFunction, j: i64, v: i64) -> bool {
     var g0: Vec<i64> = g.blocks.get(0).instructions;
     var f0: Vec<i64> = f.blocks.get(0).instructions;
     if g0.len() != f0.len() + 1 {
-        return false;
+        return tv_fail("spec_at 1");
     }
     var nid: i64 = g0.get(0);
     var n: i64 = tv_nvals(f, g);
     if nid < 0 || nid >= n {
-        return false;
+        return tv_fail("spec_at 2");
     }
     var pf: TvPos = tv_pos_of(f, n);
     if pf.blk.get(nid) != -1 {
-        return false;
+        return tv_fail("spec_at 3");
     }
     var pi: i64 = 0;
     while pi < f.params.len() {
         if f.params.get(pi).id == nid {
-            return false;
+            return tv_fail("spec_at 4");
         }
         pi = pi + 1;
     }
@@ -4468,12 +4647,12 @@ fn tv_spec_clone_at(f: &IrFunction, g: &IrFunction, j: i64, v: i64) -> bool {
         Inst::ConstBool(_) => {
         }
         _ => {
-            return false;
+            return tv_fail("spec_at 5");
         }
     }
     var kn: TvK = tv_constk(g, nid, 0);
     if kn.kind != 0 || tv_narrow(kn.v, pty) != tv_narrow(v, pty) {
-        return false;
+        return tv_fail("spec_at 6");
     }
     var bi: i64 = 0;
     while bi < f.blocks.len() {
@@ -4484,25 +4663,25 @@ fn tv_spec_clone_at(f: &IrFunction, g: &IrFunction, j: i64, v: i64) -> bool {
             off = 1;
         }
         if f.blocks.get(bi).id != g.blocks.get(bi).id || gb.len() != fa.len() + off {
-            return false;
+            return tv_fail("spec_at 7");
         }
         var k: i64 = 0;
         while k < fa.len() {
             var x: i64 = fa.get(k);
             if gb.get(k + off) != x {
-                return false;
+                return tv_fail("spec_at 8");
             }
             var xa: Inst = peir_inst_of(f, x);
             var xb: Inst = peir_inst_of(g, x);
             if tv_shape(xa) != tv_shape(xb) {
-                return false;
+                return tv_fail("spec_at 9");
             }
             var oa: Vec<i64> = Vec::new();
             peir_inst_operands(xa, &mut oa);
             var ob: Vec<i64> = Vec::new();
             peir_inst_operands(xb, &mut ob);
             if oa.len() != ob.len() {
-                return false;
+                return tv_fail("spec_at 10");
             }
             var o: i64 = 0;
             while o < oa.len() {
@@ -4511,7 +4690,7 @@ fn tv_spec_clone_at(f: &IrFunction, g: &IrFunction, j: i64, v: i64) -> bool {
                     want = nid;
                 }
                 if ob.get(o) != want {
-                    return false;
+                    return tv_fail("spec_at 11");
                 }
                 o = o + 1;
             }
@@ -4583,6 +4762,11 @@ fn tv_spec_witness(wa: &TvWorld, wb: &TvWorld, pre: &IrFunction, post: &IrFuncti
                                     var cf: IrFunction = wa.fns.get(x);
                                     var cg: IrFunction = wb.fns.get(y);
                                     good = tv_spec_clone(&cf, &cg, pre, &a1);
+                                    if !good {
+                                        good = tv_fail("spec: clone check failed for " + n2);
+                                    }
+                                } else {
+                                    good = tv_fail("spec: not a fresh clone call to " + n2);
                                 }
                             }
                             _ => {

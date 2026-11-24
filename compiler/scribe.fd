@@ -1207,7 +1207,7 @@ pub fn scribe_page_name(module_name: str) -> str {
 
 /// The .fd files under `dir` (recursively; not in hidden directories or
 /// ark_modules/), appended to `out`.
-fn scribe_collect(dir: str, out: &mut Vec<str>) {
+pub fn scribe_collect(dir: str, out: &mut Vec<str>) {
     var listing: str = p_dir_list(dir);
     if str_len(listing) == 0 {
         return;
@@ -1491,6 +1491,140 @@ fn scribe_example_end(lines: Vec<str>, i: i64) -> i64 {
     return end;
 }
 
+/// A `/// Example:` block `fid doctest` runs. `module_name` is what the
+/// generated program's `use` imports; `native` marks an
+/// `Example (native only):` block (skipped without --emit).
+pub struct DocExample {
+    pub module_name: str,
+    pub native: bool,
+    pub code: str,
+}
+
+pub fn DocExample_new(module_name: str, native: bool, code: str) -> DocExample {
+    return DocExample {
+        module_name: module_name, native: native, code: code
+    };
+}
+
+/// The `/// Example:` blocks of `source` (scripts/doctest.py's convention):
+/// a doc line `Example:` or `Example (native only):`, then the doc lines
+/// after it that start `///` followed by two spaces or more. `fallback_mod`
+/// is what `use` imports when the file declares no `module`.
+pub fn scribe_doctests(source: str, fallback_mod: str) -> Vec<DocExample> {
+    var out: Vec<DocExample> = Vec::new();
+    var lines: Vec<str> = str_split(source, "\n");
+    var module_name: str = fallback_mod;
+    var i: i64 = 0;
+    while i < lines.len() {
+        var t: str = str_trim(lines.get(i));
+        if str_starts_with(t, "module ") {
+            var mn: str = str_trim(str_slice(t, 7, str_len(t)));
+            if str_ends_with(mn, ";") {
+                mn = str_slice(mn, 0, str_len(mn) - 1);
+            }
+            module_name = str_trim(mn);
+            i = i + 1;
+            continue;
+        }
+        var kind: i64 = -1;
+        if str_starts_with(t, "///") {
+            var rest: str = str_trim(str_slice(t, 3, str_len(t)));
+            if rest == "Example:" {
+                kind = 0;
+            } else if rest == "Example (native only):" {
+                kind = 1;
+            }
+        }
+        if kind < 0 {
+            i = i + 1;
+            continue;
+        }
+        var code: str = "";
+        var first: bool = true;
+        var j: i64 = i + 1;
+        while j < lines.len() {
+            var cl: str = str_trim_start(lines.get(j));
+            if !str_starts_with(cl, "///") {
+                break;
+            }
+            var after: str = str_slice(cl, 3, str_len(cl));
+            var code_line: str = str_trim_start(after);
+            if str_len(after) - str_len(code_line) < 2 {
+                break;
+            }
+            if !first {
+                code = code + "\n";
+            }
+            code = code + code_line;
+            first = false;
+            j = j + 1;
+        }
+        if str_len(code) > 0 {
+            out.push(DocExample_new(module_name, kind == 1, code));
+        }
+        i = j;
+    }
+    return out;
+}
+
+/// The standalone program a doc example builds to (doctest.py's
+/// build_prog): `use <module_name>;`, the example's own `use` lines
+/// hoisted, the rest inside `fn main` (unless it declares one).
+pub fn scribe_doctest_program(module_name: str, code: str) -> str {
+    var uses: Vec<str> = Vec::new();
+    var body: Vec<str> = Vec::new();
+    var lines: Vec<str> = str_split(code, "\n");
+    var i: i64 = 0;
+    while i < lines.len() {
+        var l: str = lines.get(i);
+        var t: str = str_trim(l);
+        if str_starts_with(t, "use ") && str_ends_with(t, ";") {
+            uses.push(t);
+        } else {
+            body.push(l);
+        }
+        i = i + 1;
+    }
+    var head: str = "use " + module_name + ";\n";
+    i = 0;
+    while i < uses.len() {
+        head = head + uses.get(i) + "\n";
+        i = i + 1;
+    }
+    var has_main: bool = false;
+    var has_return: bool = false;
+    i = 0;
+    while i < body.len() {
+        var bt: str = str_trim(body.get(i));
+        if str_starts_with(bt, "fn main") {
+            has_main = true;
+        }
+        if str_contains(bt, "return") {
+            has_return = true;
+        }
+        i = i + 1;
+    }
+    var prog: str = head + "\n";
+    if has_main {
+        i = 0;
+        while i < body.len() {
+            prog = prog + body.get(i) + "\n";
+            i = i + 1;
+        }
+        return prog;
+    }
+    var inner: str = "";
+    i = 0;
+    while i < body.len() {
+        inner = inner + "    " + body.get(i) + "\n";
+        i = i + 1;
+    }
+    if !has_return {
+        inner = inner + "    return 0;\n";
+    }
+    return prog + "fn main() -> i64 {\n" + inner + "}\n";
+}
+
 /// A doc comment as HTML: its lines joined with <br>, and each example
 /// (doctest.py's convention) as a code block with a note that
 /// scripts/doctest.py runs it.
@@ -1556,7 +1690,7 @@ pub fn scribe_doc_md(doc: str) -> str {
 }
 
 /// The directory part of `path` ("." for none).
-fn scribe_dir_of(path: str) -> str {
+pub fn scribe_dir_of(path: str) -> str {
     var p: str = str_replace(path, "\\", "/");
     var slash: i64 = str_rfind_char(p, 47);
     if slash < 0 {

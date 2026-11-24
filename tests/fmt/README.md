@@ -37,3 +37,12 @@ under `fid run`.
   `'\u{1F600}'` are one char literal each; a block comment after `/` gets
   a space before it (`10 //* two */ 2` was a line comment, which the token
   check refused). Both files print `k and v`, `5`, `65`, `128512`, `5`.
+- `semicolons` (BG174): a statement written with no `;` keeps its own
+  line when the line ends where a statement can end (a name, a literal,
+  `)`, `]`, `?`) and the next starts one (a name, a literal, `(`, `!`,
+  `@`). The printer broke lines only after `; { }`, so reference.md
+  §1.10's own example printed on one line and `val z = id(4)` with `(z)`
+  on the next line became the call `id(4)(z)` (the parser reads a `(` on
+  the next line as a new statement). A line that ends in an operator or
+  a next line that starts with one is still joined (`w = w` / `- 1`,
+  `x == 1` / `&& z == 4`). Both files print `1both` and `4 4 5`.

@@ -53,8 +53,7 @@ for f in tests/fmt/*_in.fd; do
   [ -f "$f" ] || continue
   name=$(basename "$f" _in.fd)
   want="tests/fmt/$name.fd"
-  cp "$f" "$WORK/fx_$name.fd"
-  if ! "$FID" fmt "$WORK/fx_$name.fd" > "$WORK/fx_$name.log" 2>&1; then
+  if ! "$FID" fmt "$f" > "$WORK/fx_$name.fd" 2> "$WORK/fx_$name.log"; then
     echo "  FAIL  $f: fid fmt failed: $(tr -d '\r' < "$WORK/fx_$name.log" | head -1)"
     fail=1
     continue
@@ -112,7 +111,7 @@ if [ "$LIMIT" -gt 0 ]; then
     # the copy sits beside nothing: a program importing a sibling file is
     # recognised by its run failing, and skipped
     cp "$f" "$WORK/$name.fd"
-    if ! "$FID" fmt "$WORK/$name.fd" > "$WORK/$name.fmt.log" 2>&1; then
+    if ! "$FID" fmt -w "$WORK/$name.fd" > "$WORK/$name.fmt.log" 2>&1; then
       echo "  FAIL  $f: fid fmt failed: $(tr -d '\r' < "$WORK/$name.fmt.log" | head -1)"
       fail=1
       continue

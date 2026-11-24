@@ -3,7 +3,7 @@
 // JSON values (p_json_*), HTTP request/response text (p_http_*) and the
 // in-memory key-value database (p_db_mem_*), as the C backend
 // (src/codegen_c.rs) implements them: a JSON value is its text, parsing
-// produces a flat canonical object with sorted keys, and the database keeps
+// produces its canonical text (keys sorted, as `fid run`), and the database keeps
 // its keys in insertion order. See base.fd for how the runtime works.
 //
 // Private helpers are ped_* (all runtime files share one namespace).
@@ -246,112 +246,481 @@ fn ped_sb_finish(sb: i64) -> str {
 
 // ─── JSON ───────────────────────────────────────────────────────────────
 
-/// The index after skipping up to n bytes (never past the terminator).
-fn ped_skip(base: i64, i: i64, n: i64) -> i64 {
-    var j: i64 = i;
-    var k: i64 = 0;
-    while k < n && pe_byte_at(base, j) != 0 {
-        j = j + 1;
-        k = k + 1;
-    }
-    return j;
-}
-
 fn ped_is_digit(c: i64) -> bool {
     return c >= 48 && c <= 57;
 }
 
-/// Flat scan of "key": value pairs, re-dumped as a canonical object.
-pub fn pert_json_parse(s: str) -> str {
-    var base: i64 = pe_str_addr(s);
-    if base == 0 {
-        return ped_copy(0, 0);
+// BG163: a JSON text is read by recursive descent, as compiler/json.fd
+// reads it for `fid run` (a flat scan cut a nested object or array at its
+// first `,`, lifted its keys to the top level and ended a string at its
+// first `"`), and each value is written out canonically as it is read:
+// an object's members sorted by key (a later duplicate wins), a string
+// unescaped then escaped again (BG162: it stays a string), a number as
+// `fid run` prints it, nested values whole. Text that is not JSON panics,
+// as under `fid run`. The parser's state q is a block of four words: the
+// text's address, its length, the position, the error (0 or a message).
+
+fn ped_sb_free(sb: i64) {
+    if sb != 0 {
+        p_free(ped_ld(sb));
+        p_free(sb);
     }
-    var keys: i64 = ped_list_new();
-    var vals: i64 = ped_list_new();
-    var i: i64 = 0;
-    var c: i64 = pe_byte_at(base, 0);
-    while c != 0 {
-        // Skip whitespace and structural characters
-        while c != 0 && c != 34 && c != 45 && !ped_is_digit(c) && c != 116 && c != 102 && c != 110 {
-            i = i + 1;
-            c = pe_byte_at(base, i);
-        }
-        if c != 0 {
-            if c == 34 && i > 0 && pe_byte_at(base, i - 1) != 58 {
-                // A key: a string, then up to the colon
-                i = i + 1;
-                var ks: i64 = i;
-                while pe_byte_at(base, i) != 0 && pe_byte_at(base, i) != 34 {
-                    i = i + 1;
-                }
-                var klen: i64 = i - ks;
-                if pe_byte_at(base, i) != 0 {
-                    i = i + 1;
-                }
-                while pe_byte_at(base, i) != 0 && pe_byte_at(base, i) != 58 {
-                    i = i + 1;
-                }
-                if pe_byte_at(base, i) != 0 {
-                    i = i + 1;
-                }
-                while pe_byte_at(base, i) == 32 || pe_byte_at(base, i) == 9 {
-                    i = i + 1;
-                }
-                var key: i64 = ped_copy_raw(base + ks, klen);
-                var b: i64 = pe_byte_at(base, i);
-                if b == 34 {
-                    i = i + 1;
-                    var vs: i64 = i;
-                    while pe_byte_at(base, i) != 0 && pe_byte_at(base, i) != 34 {
-                        i = i + 1;
-                    }
-                    var vlen: i64 = i - vs;
-                    if pe_byte_at(base, i) != 0 {
-                        i = i + 1;
-                    }
-                    ped_list_push(keys, key);
-                    ped_list_push(vals, ped_copy_raw(base + vs, vlen));
-                } else if b == 116 {
-                    ped_list_push(keys, key);
-                    ped_list_push(vals, pe_str_addr("true"));
-                    i = ped_skip(base, i, 4);
-                } else if b == 102 {
-                    ped_list_push(keys, key);
-                    ped_list_push(vals, pe_str_addr("false"));
-                    i = ped_skip(base, i, 5);
-                } else if b == 110 {
-                    ped_list_push(keys, key);
-                    ped_list_push(vals, pe_str_addr("null"));
-                    i = ped_skip(base, i, 4);
-                } else {
-                    var ns: i64 = i;
-                    var d: i64 = pe_byte_at(base, i);
-                    while d != 0 && d != 44 && d != 125 && d != 93 && d != 32 {
-                        i = i + 1;
-                        d = pe_byte_at(base, i);
-                    }
-                    ped_list_push(keys, key);
-                    ped_list_push(vals, ped_copy_raw(base + ns, i - ns));
-                }
-            } else {
-                i = i + 1;
-            }
-            c = pe_byte_at(base, i);
-        }
-    }
-    return ped_dump_obj(keys, vals);
 }
 
-/// {"k":v,...} with keys sorted (stable); numbers, booleans and null bare.
-fn ped_dump_obj(keys: i64, vals: i64) -> str {
+/// The builder's text as a str; the builder is freed.
+fn ped_sb_take(sb: i64) -> str {
+    var r: str = ped_sb_finish(sb);
+    ped_sb_free(sb);
+    return r;
+}
+
+fn ped_jq_new(base: i64) -> i64 {
+    var q: i64 = p_malloc(32);
+    ped_st(q, base);
+    ped_st(q + 8, ped_len(base));
+    ped_st(q + 16, 0);
+    ped_st(q + 24, 0);
+    return q;
+}
+
+fn ped_jq_left(q: i64) -> i64 {
+    return ped_ld(q + 8) - ped_ld(q + 16);
+}
+
+/// The byte at the position (0 at the end).
+fn ped_jq_byte(q: i64) -> i64 {
+    if ped_jq_left(q) <= 0 {
+        return 0;
+    }
+    return pe_byte_at(ped_ld(q), ped_ld(q + 16));
+}
+
+fn ped_jq_adv(q: i64, n: i64) {
+    ped_st(q + 16, ped_ld(q + 16) + n);
+}
+
+/// Records the first error (msg: a literal's address); 0, for `return`.
+fn ped_jq_fail(q: i64, msg: i64) -> i64 {
+    if ped_ld(q + 24) == 0 {
+        ped_st(q + 24, msg);
+    }
+    return 0;
+}
+
+fn ped_jq_ws(q: i64) {
+    var c: i64 = ped_jq_byte(q);
+    while ped_jq_left(q) > 0 && (c == 32 || c == 9 || c == 10 || c == 13) {
+        ped_jq_adv(q, 1);
+        c = ped_jq_byte(q);
+    }
+}
+
+/// The text w (a literal) is next: it is skipped.
+fn ped_jq_word(q: i64, w: str) -> bool {
+    var wa: i64 = pe_str_addr(w);
+    var n: i64 = ped_len(wa);
+    if ped_jq_left(q) < n || !ped_eq_n(ped_ld(q) + ped_ld(q + 16), wa, n) {
+        return false;
+    }
+    ped_jq_adv(q, n);
+    return true;
+}
+
+fn ped_hex_val(c: i64) -> i64 {
+    if c >= 48 && c <= 57 {
+        return c - 48;
+    }
+    if c >= 65 && c <= 70 {
+        return c - 55;
+    }
+    if c >= 97 && c <= 102 {
+        return c - 87;
+    }
+    return -1;
+}
+
+fn ped_hex_digit(v: i64) -> i64 {
+    if v < 10 {
+        return 48 + v;
+    }
+    return 87 + v;
+}
+
+/// The bytes of the string at the position (its opening quote), escapes
+/// read, as a builder; 0 when it is not a JSON string.
+fn ped_jq_str(q: i64) -> i64 {
+    var base: i64 = ped_ld(q);
+    var len: i64 = ped_ld(q + 8);
+    var i: i64 = ped_ld(q + 16) + 1;
+    var out: i64 = ped_sb_new();
+    while i < len {
+        var c: i64 = pe_byte_at(base, i);
+        i = i + 1;
+        if c == 34 {
+            ped_st(q + 16, i);
+            return out;
+        }
+        if c != 92 {
+            ped_sb_byte(out, c);
+        } else {
+            if i >= len {
+                ped_sb_free(out);
+                return ped_jq_fail(q, pe_str_addr("Unterminated escape sequence"));
+            }
+            var x: i64 = pe_byte_at(base, i);
+            i = i + 1;
+            if x == 34 || x == 92 || x == 47 {
+                ped_sb_byte(out, x);
+            } else if x == 110 {
+                ped_sb_byte(out, 10);
+            } else if x == 114 {
+                ped_sb_byte(out, 13);
+            } else if x == 116 {
+                ped_sb_byte(out, 9);
+            } else if x == 98 {
+                ped_sb_byte(out, 8);
+            } else if x == 102 {
+                ped_sb_byte(out, 12);
+            } else if x == 117 {
+                if len - i < 4 {
+                    ped_sb_free(out);
+                    return ped_jq_fail(q, pe_str_addr("Invalid unicode escape"));
+                }
+                var code: i64 = 0;
+                var k: i64 = 0;
+                while k < 4 {
+                    var h: i64 = ped_hex_val(pe_byte_at(base, i + k));
+                    if h < 0 {
+                        ped_sb_free(out);
+                        return ped_jq_fail(q, pe_str_addr("Invalid unicode escape"));
+                    }
+                    code = code * 16 + h;
+                    k = k + 1;
+                }
+                i = i + 4;
+                if code < 128 {
+                    ped_sb_byte(out, code);
+                } else if code < 2048 {
+                    ped_sb_byte(out, 192 | (code >> 6));
+                    ped_sb_byte(out, 128 | (code & 63));
+                } else {
+                    ped_sb_byte(out, 224 | (code >> 12));
+                    ped_sb_byte(out, 128 | ((code >> 6) & 63));
+                    ped_sb_byte(out, 128 | (code & 63));
+                }
+            } else {
+                ped_sb_free(out);
+                return ped_jq_fail(q, pe_str_addr("Invalid escape character"));
+            }
+        }
+    }
+    ped_sb_free(out);
+    return ped_jq_fail(q, pe_str_addr("Unterminated string"));
+}
+
+/// n bytes at addr as a JSON string literal (quotes, escapes).
+fn ped_json_quote(sb: i64, addr: i64, n: i64) {
+    ped_sb_byte(sb, 34);
+    var i: i64 = 0;
+    while i < n {
+        var c: i64 = pe_byte_at(addr, i);
+        if c == 34 || c == 92 {
+            ped_sb_byte(sb, 92);
+            ped_sb_byte(sb, c);
+        } else if c == 10 {
+            ped_sb_byte(sb, 92);
+            ped_sb_byte(sb, 110);
+        } else if c == 13 {
+            ped_sb_byte(sb, 92);
+            ped_sb_byte(sb, 114);
+        } else if c == 9 {
+            ped_sb_byte(sb, 92);
+            ped_sb_byte(sb, 116);
+        } else if c == 8 {
+            ped_sb_byte(sb, 92);
+            ped_sb_byte(sb, 98);
+        } else if c == 12 {
+            ped_sb_byte(sb, 92);
+            ped_sb_byte(sb, 102);
+        } else if c < 32 {
+            ped_sb_byte(sb, 92);
+            ped_sb_byte(sb, 117);
+            ped_sb_byte(sb, 48);
+            ped_sb_byte(sb, 48);
+            ped_sb_byte(sb, ped_hex_digit(c >> 4));
+            ped_sb_byte(sb, ped_hex_digit(c & 15));
+        } else {
+            ped_sb_byte(sb, c);
+        }
+        i = i + 1;
+    }
+    ped_sb_byte(sb, 34);
+}
+
+/// The number at the position, as compiler/json.fd format_number prints
+/// it: an integer below 10^15 as one, anything else as `fid run` prints
+/// a float.
+fn ped_jv_num(q: i64) -> i64 {
+    var base: i64 = ped_ld(q);
+    var len: i64 = ped_ld(q + 8);
+    var st: i64 = ped_ld(q + 16);
+    var i: i64 = st;
+    if i < len && pe_byte_at(base, i) == 45 {
+        i = i + 1;
+    }
+    while i < len && ped_is_digit(pe_byte_at(base, i)) {
+        i = i + 1;
+    }
+    if i < len && pe_byte_at(base, i) == 46 {
+        i = i + 1;
+        while i < len && ped_is_digit(pe_byte_at(base, i)) {
+            i = i + 1;
+        }
+    }
+    if i < len && (pe_byte_at(base, i) == 101 || pe_byte_at(base, i) == 69) {
+        i = i + 1;
+        if i < len && (pe_byte_at(base, i) == 43 || pe_byte_at(base, i) == 45) {
+            i = i + 1;
+        }
+        while i < len && ped_is_digit(pe_byte_at(base, i)) {
+            i = i + 1;
+        }
+    }
+    ped_st(q + 16, i);
+    var text: str = ped_copy(base + st, i - st);
+    var d: f64 = pert_str_to_float(text);
+    var out: i64 = ped_sb_new();
+    if d > -1000000000000000.0 && d < 1000000000000000.0 {
+        var iv: i64 = d as i64;
+        if (iv as f64) == d {
+            ped_sb_int(out, iv);
+            return out;
+        }
+    }
+    var f: str = pert_to_str_float(d);
+    ped_sb_text(out, pe_str_addr(f));
+    return out;
+}
+
+/// Appends a member's or element's text (and frees its builder).
+fn ped_sb_take_into(sb: i64, part: i64) {
+    ped_sb_range(sb, ped_ld(part), ped_ld(part + 8));
+    ped_sb_free(part);
+}
+
+/// The canonical text of the value at the position, as a builder, written
+/// for indentation level ind when pretty; 0 (and q's error) when it is not
+/// JSON.
+fn ped_jv(q: i64, depth: i64, pretty: bool, ind: i64) -> i64 {
+    ped_jq_ws(q);
+    if ped_jq_left(q) <= 0 {
+        return ped_jq_fail(q, pe_str_addr("Unexpected end of input"));
+    }
+    if depth > 1000 {
+        return ped_jq_fail(q, pe_str_addr("nested too deeply"));
+    }
+    var c: i64 = ped_jq_byte(q);
+    var out: i64 = 0;
+    if c == 110 {
+        if !ped_jq_word(q, "null") {
+            return ped_jq_fail(q, pe_str_addr("Invalid null literal"));
+        }
+        out = ped_sb_new();
+        ped_sb_text(out, pe_str_addr("null"));
+        return out;
+    }
+    if c == 116 || c == 102 {
+        out = ped_sb_new();
+        if ped_jq_word(q, "true") {
+            ped_sb_text(out, pe_str_addr("true"));
+            return out;
+        }
+        if ped_jq_word(q, "false") {
+            ped_sb_text(out, pe_str_addr("false"));
+            return out;
+        }
+        ped_sb_free(out);
+        return ped_jq_fail(q, pe_str_addr("Invalid boolean literal"));
+    }
+    if c == 34 {
+        var s: i64 = ped_jq_str(q);
+        if s == 0 {
+            return 0;
+        }
+        out = ped_sb_new();
+        ped_json_quote(out, ped_ld(s), ped_ld(s + 8));
+        ped_sb_free(s);
+        return out;
+    }
+    if c == 45 || ped_is_digit(c) {
+        return ped_jv_num(q);
+    }
+    if c == 91 {
+        return ped_jv_arr(q, depth, pretty, ind);
+    }
+    if c == 123 {
+        var keys: i64 = ped_list_new();
+        var vals: i64 = ped_list_new();
+        if !ped_jv_members(q, depth, pretty, ind, keys, vals) {
+            ped_jv_lists_free(keys, vals);
+            return 0;
+        }
+        out = ped_jv_obj_text(keys, vals, pretty, ind);
+        ped_jv_lists_free(keys, vals);
+        return out;
+    }
+    return ped_jq_fail(q, pe_str_addr("Unexpected character"));
+}
+
+fn ped_jv_arr(q: i64, depth: i64, pretty: bool, ind: i64) -> i64 {
+    ped_jq_adv(q, 1);
+    ped_jq_ws(q);
+    var out: i64 = ped_sb_new();
+    if ped_jq_left(q) > 0 && ped_jq_byte(q) == 93 {
+        ped_jq_adv(q, 1);
+        ped_sb_text(out, pe_str_addr("[]"));
+        return out;
+    }
+    ped_sb_byte(out, 91);
+    var first: bool = true;
+    while true {
+        var it: i64 = ped_jv(q, depth + 1, pretty, ind + 1);
+        if it == 0 {
+            ped_sb_free(out);
+            return 0;
+        }
+        if !first {
+            ped_sb_byte(out, 44);
+        }
+        first = false;
+        if pretty {
+            ped_sb_byte(out, 10);
+            ped_sb_spaces(out, (ind + 1) * 2);
+        }
+        ped_sb_take_into(out, it);
+        ped_jq_ws(q);
+        if ped_jq_left(q) <= 0 {
+            ped_sb_free(out);
+            return ped_jq_fail(q, pe_str_addr("Unterminated array"));
+        }
+        var d: i64 = ped_jq_byte(q);
+        ped_jq_adv(q, 1);
+        if d == 93 {
+            if pretty {
+                ped_sb_byte(out, 10);
+                ped_sb_spaces(out, ind * 2);
+            }
+            ped_sb_byte(out, 93);
+            return out;
+        }
+        if d != 44 {
+            ped_sb_free(out);
+            return ped_jq_fail(q, pe_str_addr("Expected ',' or ']'"));
+        }
+    }
+    return 0;
+}
+
+/// The members of the object at the position (its `{`): each key (a
+/// builder of its bytes) into keys, its value's text (a builder) into
+/// vals; false when it is not JSON.
+fn ped_jv_members(q: i64, depth: i64, pretty: bool, ind: i64, keys: i64, vals: i64) -> bool {
+    ped_jq_adv(q, 1);
+    ped_jq_ws(q);
+    if ped_jq_left(q) > 0 && ped_jq_byte(q) == 125 {
+        ped_jq_adv(q, 1);
+        return true;
+    }
+    while true {
+        ped_jq_ws(q);
+        if ped_jq_left(q) <= 0 || ped_jq_byte(q) != 34 {
+            ped_jq_fail(q, pe_str_addr("Expected string key in object"));
+            return false;
+        }
+        var k: i64 = ped_jq_str(q);
+        if k == 0 {
+            return false;
+        }
+        ped_jq_ws(q);
+        if ped_jq_left(q) <= 0 || ped_jq_byte(q) != 58 {
+            ped_sb_free(k);
+            ped_jq_fail(q, pe_str_addr("Expected ':' after key in object"));
+            return false;
+        }
+        ped_jq_adv(q, 1);
+        var v: i64 = ped_jv(q, depth + 1, pretty, ind + 1);
+        if v == 0 {
+            ped_sb_free(k);
+            return false;
+        }
+        ped_list_push(keys, k);
+        ped_list_push(vals, v);
+        ped_jq_ws(q);
+        if ped_jq_left(q) <= 0 {
+            ped_jq_fail(q, pe_str_addr("Unterminated object"));
+            return false;
+        }
+        var d: i64 = ped_jq_byte(q);
+        ped_jq_adv(q, 1);
+        if d == 125 {
+            return true;
+        }
+        if d != 44 {
+            ped_jq_fail(q, pe_str_addr("Expected ',' or '}'"));
+            return false;
+        }
+    }
+    return false;
+}
+
+fn ped_jv_lists_free(keys: i64, vals: i64) {
+    var i: i64 = 0;
+    while i < ped_list_len(keys) {
+        ped_sb_free(ped_list_get(keys, i));
+        i = i + 1;
+    }
+    i = 0;
+    while i < ped_list_len(vals) {
+        ped_sb_free(ped_list_get(vals, i));
+        i = i + 1;
+    }
+    p_free(ped_ld(keys));
+    p_free(keys);
+    p_free(ped_ld(vals));
+    p_free(vals);
+}
+
+/// Compares two keys (builders) byte by byte, a prefix first.
+fn ped_key_cmp(a: i64, b: i64) -> i64 {
+    var al: i64 = ped_ld(a + 8);
+    var bl: i64 = ped_ld(b + 8);
+    var i: i64 = 0;
+    while i < al && i < bl {
+        var x: i64 = pe_byte_at(ped_ld(a), i);
+        var y: i64 = pe_byte_at(ped_ld(b), i);
+        if x != y {
+            return x - y;
+        }
+        i = i + 1;
+    }
+    return al - bl;
+}
+
+/// An object's text from its members, sorted by key (stable, so of equal
+/// keys the last one read is the last in its run: that one is written).
+fn ped_jv_obj_text(keys: i64, vals: i64, pretty: bool, ind: i64) -> i64 {
+    var out: i64 = ped_sb_new();
     var n: i64 = ped_list_len(keys);
+    if n == 0 {
+        ped_sb_text(out, pe_str_addr("{}"));
+        return out;
+    }
     var i: i64 = 1;
     while i < n {
         var k: i64 = ped_list_get(keys, i);
         var v: i64 = ped_list_get(vals, i);
         var j: i64 = i - 1;
-        while j >= 0 && ped_cmp(ped_list_get(keys, j), k) > 0 {
+        while j >= 0 && ped_key_cmp(ped_list_get(keys, j), k) > 0 {
             ped_list_set(keys, j + 1, ped_list_get(keys, j));
             ped_list_set(vals, j + 1, ped_list_get(vals, j));
             j = j - 1;
@@ -360,31 +729,74 @@ fn ped_dump_obj(keys: i64, vals: i64) -> str {
         ped_list_set(vals, j + 1, v);
         i = i + 1;
     }
-    var sb: i64 = ped_sb_new();
-    ped_sb_byte(sb, 123);
+    ped_sb_byte(out, 123);
+    var first: bool = true;
     i = 0;
     while i < n {
-        if i > 0 {
-            ped_sb_byte(sb, 44);
-        }
-        ped_sb_byte(sb, 34);
-        ped_sb_text(sb, ped_list_get(keys, i));
-        ped_sb_byte(sb, 34);
-        ped_sb_byte(sb, 58);
-        var val: i64 = ped_list_get(vals, i);
-        var c0: i64 = pe_byte_at(val, 0);
-        var bare: bool = ped_is_digit(c0) || c0 == 45 || ped_eq(val, pe_str_addr("true")) || ped_eq(val, pe_str_addr("false")) || ped_eq(val, pe_str_addr("null"));
-        if bare {
-            ped_sb_text(sb, val);
-        } else {
-            ped_sb_byte(sb, 34);
-            ped_sb_text(sb, val);
-            ped_sb_byte(sb, 34);
+        var key: i64 = ped_list_get(keys, i);
+        var later: bool = i + 1 < n && ped_key_cmp(key, ped_list_get(keys, i + 1)) == 0;
+        if !later {
+            if !first {
+                ped_sb_byte(out, 44);
+            }
+            first = false;
+            if pretty {
+                ped_sb_byte(out, 10);
+                ped_sb_spaces(out, (ind + 1) * 2);
+            }
+            ped_json_quote(out, ped_ld(key), ped_ld(key + 8));
+            ped_sb_byte(out, 58);
+            if pretty {
+                ped_sb_byte(out, 32);
+            }
+            var val: i64 = ped_list_get(vals, i);
+            ped_sb_range(out, ped_ld(val), ped_ld(val + 8));
         }
         i = i + 1;
     }
-    ped_sb_byte(sb, 125);
-    return ped_sb_finish(sb);
+    if pretty {
+        ped_sb_byte(out, 10);
+        ped_sb_spaces(out, ind * 2);
+    }
+    ped_sb_byte(out, 125);
+    return out;
+}
+
+/// Panics `who: <reason>` with q's error (q is freed).
+fn ped_jq_panic(q: i64, who: str) {
+    var msg: i64 = ped_ld(q + 24);
+    p_free(q);
+    if msg == 0 {
+        msg = pe_str_addr("invalid JSON");
+    }
+    p_panic(p_str_concat(who, p_str_concat(": ", p_str_from_ptr(msg))));
+}
+
+/// The canonical text of the JSON text s (pretty: 2-space indentation).
+fn ped_json_canon(s: str, pretty: bool, who: str) -> str {
+    var base: i64 = pe_str_addr(s);
+    if base == 0 {
+        return ped_copy(0, 0);
+    }
+    var q: i64 = ped_jq_new(base);
+    var v: i64 = ped_jv(q, 0, pretty, 0);
+    if v != 0 {
+        ped_jq_ws(q);
+        if ped_jq_left(q) > 0 {
+            ped_sb_free(v);
+            v = ped_jq_fail(q, pe_str_addr("Unexpected trailing characters"));
+        }
+    }
+    if v == 0 {
+        ped_jq_panic(q, who);
+        return ped_copy(0, 0);
+    }
+    p_free(q);
+    return ped_sb_take(v);
+}
+
+pub fn pert_json_parse(s: str) -> str {
+    return ped_json_canon(s, false, "json_parse");
 }
 
 pub fn pert_json_dump(j: str) -> str {
@@ -397,48 +809,7 @@ pub fn pert_json_dump_pretty(j: str) -> str {
 
 /// The canonical form, one member per line, 2-space indentation.
 pub fn pert_json_pretty(j: str) -> str {
-    var base: i64 = pe_str_addr(pert_json_parse(j));
-    var sb: i64 = ped_sb_new();
-    var indent: i64 = 0;
-    var in_str: bool = false;
-    var i: i64 = 0;
-    var c: i64 = pe_byte_at(base, 0);
-    while c != 0 {
-        if c == 34 && (i == 0 || pe_byte_at(base, i - 1) != 92) {
-            in_str = !in_str;
-        }
-        var done: bool = false;
-        if !in_str {
-            if c == 123 || c == 91 {
-                ped_sb_byte(sb, c);
-                ped_sb_byte(sb, 10);
-                indent = indent + 1;
-                ped_sb_spaces(sb, indent * 2);
-                done = true;
-            } else if c == 125 || c == 93 {
-                ped_sb_byte(sb, 10);
-                indent = indent - 1;
-                ped_sb_spaces(sb, indent * 2);
-                ped_sb_byte(sb, c);
-                done = true;
-            } else if c == 44 {
-                ped_sb_byte(sb, c);
-                ped_sb_byte(sb, 10);
-                ped_sb_spaces(sb, indent * 2);
-                done = true;
-            } else if c == 58 {
-                ped_sb_byte(sb, c);
-                ped_sb_byte(sb, 32);
-                done = true;
-            }
-        }
-        if !done {
-            ped_sb_byte(sb, c);
-        }
-        i = i + 1;
-        c = pe_byte_at(base, i);
-    }
-    return ped_sb_finish(sb);
+    return ped_json_canon(j, true, "json_pretty");
 }
 
 /// A string as a JSON string literal: quotes, \" \\ and \n escaped.
@@ -496,102 +867,49 @@ pub fn pert_json_type(j: str) -> str {
     return "number";
 }
 
-/// The index of the closing quote of a string whose body starts at i
-/// (backslash escapes skipped); the terminator's index if unterminated.
-fn ped_str_end(base: i64, i: i64) -> i64 {
-    var e: i64 = i;
-    var c: i64 = pe_byte_at(base, e);
-    while c != 0 && c != 34 {
-        if c == 92 && pe_byte_at(base, e + 1) != 0 {
-            e = e + 2;
-        } else {
-            e = e + 1;
-        }
-        c = pe_byte_at(base, e);
-    }
-    return e;
-}
-
-/// The value of the first "key": in the text (strings keep their quotes,
-/// objects and arrays are canonicalized), "null" if there is none.
+/// The value of `key` in the top-level object, as `fid run` gives it (a
+/// string quoted and escaped, nested values canonical, a later duplicate
+/// winning), "null" if there is none; panics when j is not a JSON object.
 pub fn pert_json_get(j: str, key: str) -> str {
     var base: i64 = pe_str_addr(j);
     var kaddr: i64 = pe_str_addr(key);
     if base == 0 || kaddr == 0 {
         return ped_copy(pe_str_addr("null"), 4);
     }
-    var klen: i64 = ped_len(kaddr);
-    var i: i64 = 0;
-    while pe_byte_at(base, i) != 0 {
-        if pe_byte_at(base, i) == 34 {
-            var ks: i64 = i + 1;
-            var ke: i64 = ped_str_end(base, ks);
-            if pe_byte_at(base, ke) == 34 && ke - ks == klen && ped_eq_n(base + ks, kaddr, klen) {
-                var c: i64 = ke + 1;
-                while pe_byte_at(base, c) == 32 || pe_byte_at(base, c) == 9 {
-                    c = c + 1;
-                }
-                if pe_byte_at(base, c) == 58 {
-                    c = c + 1;
-                    while pe_byte_at(base, c) == 32 || pe_byte_at(base, c) == 9 {
-                        c = c + 1;
-                    }
-                    var b: i64 = pe_byte_at(base, c);
-                    if b == 34 {
-                        var send: i64 = ped_str_end(base, c + 1);
-                        return ped_copy(base + c, ped_text_span(base, c, send + 1));
-                    }
-                    if b == 123 || b == 91 {
-                        var closer: i64 = 93;
-                        if b == 123 {
-                            closer = 125;
-                        }
-                        var depth: i64 = 1;
-                        var e: i64 = c + 1;
-                        var stop: bool = false;
-                        while !stop && pe_byte_at(base, e) != 0 && depth > 0 {
-                            var d: i64 = pe_byte_at(base, e);
-                            if d == 34 {
-                                var se: i64 = ped_str_end(base, e + 1);
-                                e = se;
-                                if pe_byte_at(base, se) != 34 {
-                                    stop = true;
-                                } else {
-                                    e = e + 1;
-                                }
-                            } else {
-                                if d == b {
-                                    depth = depth + 1;
-                                }
-                                if d == closer {
-                                    depth = depth - 1;
-                                }
-                                if depth > 0 {
-                                    e = e + 1;
-                                }
-                            }
-                        }
-                        var sub: str = ped_copy(base + c, ped_text_span(base, c, e + 1));
-                        return pert_json_parse(sub);
-                    }
-                    var e2: i64 = c;
-                    var d2: i64 = pe_byte_at(base, e2);
-                    while d2 != 0 && d2 != 44 && d2 != 125 && d2 != 93 && d2 != 32 && d2 != 10 {
-                        e2 = e2 + 1;
-                        d2 = pe_byte_at(base, e2);
-                    }
-                    return ped_copy(base + c, e2 - c);
-                }
-            }
-            if pe_byte_at(base, ke) == 0 {
-                return ped_copy(pe_str_addr("null"), 4);
-            }
-            i = ke + 1;
-        } else {
-            i = i + 1;
-        }
+    var q: i64 = ped_jq_new(base);
+    var keys: i64 = ped_list_new();
+    var vals: i64 = ped_list_new();
+    ped_jq_ws(q);
+    var ok: bool = ped_jq_left(q) > 0 && ped_jq_byte(q) == 123 && ped_jv_members(q, 0, false, 0, keys, vals);
+    if ok {
+        ped_jq_ws(q);
+        ok = ped_jq_left(q) <= 0;
     }
-    return ped_copy(pe_str_addr("null"), 4);
+    p_free(q);
+    if !ok {
+        ped_jv_lists_free(keys, vals);
+        p_panic("json_get: not an object");
+        return ped_copy(pe_str_addr("null"), 4);
+    }
+    var klen: i64 = ped_len(kaddr);
+    var at: i64 = -1;
+    var i: i64 = 0;
+    while i < ped_list_len(keys) {
+        var k: i64 = ped_list_get(keys, i);
+        if ped_ld(k + 8) == klen && ped_eq_n(ped_ld(k), kaddr, klen) {
+            at = i;
+        }
+        i = i + 1;
+    }
+    var r: str = "null";
+    if at >= 0 {
+        var v: i64 = ped_list_get(vals, at);
+        r = ped_copy(ped_ld(v), ped_ld(v + 8));
+    } else {
+        r = ped_copy(pe_str_addr("null"), 4);
+    }
+    ped_jv_lists_free(keys, vals);
+    return r;
 }
 
 /// The length of [from, to) clipped to the text (stops at the terminator).

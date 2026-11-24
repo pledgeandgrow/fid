@@ -1,0 +1,79 @@
+// BG120 (docs/roadmap/bugs-roadmap.md): the C runtime's p_vec_remove,
+// p_vec_reverse, p_vec_sort, p_vec_pop and p_vec_truncate moved and read
+// raw 8-byte slots whatever the Vec's element code — a Vec<u8> holds a
+// byte per element, so a remove shifted the wrong bytes and a sort
+// ordered the wrong words — and they wrote a shared buffer other Vecs
+// still read. They delegate to core's Vec functions now
+// (compiler/codegen_c.fd): the element code decides the slot size and a
+// shared buffer is owned (copied) before the write. A struct element is
+// two words: vec_raw_reverse swaps it through a copy (core.fd).
+//@ backends: ccompile
+//
+// Expected output:
+// bytes: 1 5 2 4 6
+// popped: 6
+// reversed: 4 2 5 1
+// removed: 5 | 4 2 1
+// sorted: 1 2 4
+// truncated: 1 2
+// a: 1 2 3 | b: 3 2 1
+// a still: 1 2 3
+// structs: 3 2 1
+
+struct Pt { x: i64, y: i64 }
+
+fn show_u8(name: str, v: &Vec<u8>) {
+    var s: str = name + ":";
+    var i: i64 = 0;
+    while i < v.len() {
+        s = s + " " + int_to_str(v.get(i) as i64);
+        i = i + 1;
+    }
+    println(s);
+}
+
+fn main() -> i64 {
+    // a Vec of bytes: each element is one byte, not a word
+    var bs: Vec<u8> = Vec::new();
+    p_vec_push(bs, 1 as u8);
+    p_vec_push(bs, 5 as u8);
+    p_vec_push(bs, 2 as u8);
+    p_vec_push(bs, 4 as u8);
+    p_vec_push(bs, 6 as u8);
+    show_u8("bytes", &bs);
+    println("popped: " + int_to_str(p_vec_pop(bs)));
+    p_vec_reverse(bs);
+    show_u8("reversed", &bs);
+    println("removed: " + int_to_str(p_vec_remove(bs, 2)) + " | " + int_to_str(bs[0] as i64) + " " + int_to_str(bs[1] as i64) + " " + int_to_str(bs[2] as i64));
+    p_vec_sort(bs);
+    show_u8("sorted", &bs);
+    p_vec_truncate(bs, 2);
+    show_u8("truncated", &bs);
+
+    // a shared buffer stays the other owners': reverse of b leaves a's
+    // elements alone
+    var a: Vec<i64> = Vec::new();
+    a.push(1);
+    a.push(2);
+    a.push(3);
+    var b: Vec<i64> = a;
+    p_vec_reverse(b);
+    println("a: " + int_to_str(a[0]) + " " + int_to_str(a[1]) + " " + int_to_str(a[2]) + " | b: " + int_to_str(b[0]) + " " + int_to_str(b[1]) + " " + int_to_str(b[2]));
+    println("a still: " + int_to_str(a[0]) + " " + int_to_str(a[1]) + " " + int_to_str(a[2]));
+
+    // a Vec of structs: each element is two words in the buffer
+    var ps: Vec<Pt> = Vec::new();
+    ps.push(Pt { x: 1, y: 10 });
+    ps.push(Pt { x: 2, y: 20 });
+    ps.push(Pt { x: 3, y: 30 });
+    p_vec_reverse(ps);
+    var s: str = "structs:";
+    var i: i64 = 0;
+    while i < ps.len() {
+        var pr: Pt = ps[i];
+        s = s + " " + int_to_str(pr.x);
+        i = i + 1;
+    }
+    println(s);
+    return 0;
+}

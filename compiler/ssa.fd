@@ -387,6 +387,10 @@ pub struct SsaState {
     pub kill: Vec<i64>,
     // per candidate: 1 when it must stay in memory
     pub bad: Vec<i64>,
+    // DB4: per candidate, the resolved value of its first store in the
+    // dominator renaming (-1 none): what a promoted alloca's debug binding
+    // points at once the alloca is gone
+    pub first_val: Vec<i64>,
 }
 
 /// The scalar allocas of `f` that can become values (step 1).
@@ -702,7 +706,11 @@ fn ssa_rename_block(f: & IrFunction, cfg: & IroCfg, st: & mut SsaState, stacks: 
             Inst::Store(p, sv, _) => {
                 if p >= 0 && p < st.nv && st.cidx.get(p) >= 0 && id >= 0 && id < st.nv {
                     var c2: i64 = st.cidx.get(p);
-                    ssa_push(stacks, plog, c2, ssa_resolve(& st.repl, sv));
+                    var rsv: i64 = ssa_resolve(& st.repl, sv);
+                    ssa_push(stacks, plog, c2, rsv);
+                    if st.first_val.get(c2) == - 1 {
+                        st.first_val.set(c2, rsv);
+                    }
                     st.kill.set(id, 1);
                 }
             }
@@ -922,7 +930,7 @@ fn ssa_state(f: & IrFunction, cfg: & IroCfg, ok: & Vec<i64>, df: Vec<Vec<i64>>, 
     }
     var bad: Vec<i64> = peir_zeros(cands.len());
     return SsaState {
-        nv: nv, cands: cands, cidx: cidx, df: df, kids: kids, ph_block: Vec::new(), ph_cand: Vec::new(), ph_in: Vec::new(), ph_at: at, ph_gone: Vec::new(), ph_live: Vec::new(), repl: peir_zeros(nv), kill: peir_zeros(nv), bad: bad
+        nv: nv, cands: cands, cidx: cidx, df: df, kids: kids, ph_block: Vec::new(), ph_cand: Vec::new(), ph_in: Vec::new(), ph_at: at, ph_gone: Vec::new(), ph_live: Vec::new(), repl: peir_zeros(nv), kill: peir_zeros(nv), bad: bad, first_val: ssa_fill(cands.len(), - 1)
     };
 }
 
@@ -1669,12 +1677,30 @@ fn ssa_materialize(f: & mut IrFunction, cfg: & IroCfg, st: & SsaState, exits: & 
         while b3 < nb {
             var ops4: Vec<i64> = Vec::new();
             var bids3: Vec<i64> = f.blocks.get(b3).instructions;
+            var tails3: Vec<i64> = tails.get(b3);
             var out3: Vec<i64> = Vec::new();
             var any3: bool = false;
+            // the position the first tail store lands: loads one needs read
+            // the slot's value as the edge is taken, before any tail store
+            // writes it (a swap between two phis; the validator's runs and
+            // the suite's swap loops both showed this)
+            var tpos: i64 = -1;
             var w4: i64 = 0;
             while w4 < bids3.len() {
+                var y3: i64 = bids3.get(w4);
+                var is_tail: bool = false;
+                var t4: i64 = 0;
+                while t4 < tails3.len() {
+                    if tails3.get(t4) == y3 {
+                        is_tail = true;
+                    }
+                    t4 = t4 + 1;
+                }
+                if is_tail && tpos < 0 {
+                    tpos = out3.len();
+                }
                 ops4.clear();
-                peir_inst_operands(peir_inst_of(f, bids3.get(w4)), & mut ops4);
+                peir_inst_operands(peir_inst_of(f, y3), & mut ops4);
                 var hit: i64 = 0 - 1;
                 var o3: i64 = 0;
                 while o3 < ops4.len() && hit < 0 {
@@ -1690,12 +1716,16 @@ fn ssa_materialize(f: & mut IrFunction, cfg: & IroCfg, st: & SsaState, exits: & 
                     var ld3: i64 = ssa_detached(f, Inst::Load(slot.get(k4), ty3));
                     var m3: Vec<i64> = peir_zeros(f.next_value + 1);
                     m3.set(hit, ld3 + 1);
-                    out3.push(ld3);
-                    out3.push(bids3.get(w4));
-                    IrFunction_set_inst(f, bids3.get(w4), ssa_remap(peir_inst_of(f, bids3.get(w4)), & m3));
+                    if tpos >= 0 {
+                        out3.insert(tpos, ld3);
+                    } else {
+                        out3.push(ld3);
+                    }
+                    out3.push(y3);
+                    IrFunction_set_inst(f, y3, ssa_remap(peir_inst_of(f, y3), & m3));
                     any3 = true;
                 } else {
-                    out3.push(bids3.get(w4));
+                    out3.push(y3);
                 }
                 w4 = w4 + 1;
             }
@@ -1707,6 +1737,61 @@ fn ssa_materialize(f: & mut IrFunction, cfg: & IroCfg, st: & SsaState, exits: & 
             b3 = b3 + 1;
         }
     }
+    // DB4: a name bound to a promoted alloca would keep pointing at it
+    // though nothing reads or writes it now — no location, no scope lines.
+    // Point it at what stands for the variable instead. A name bound more
+    // than once needs real lines for its lexical scope: its first store's
+    // value (the declaration's initializer). A name bound once wants the
+    // truest location: a live phi's slot when its stores merge, which is
+    // where the variable lives now.
+    var namecount: i64 = HashMap_new();
+    var dl: i64 = 0;
+    while dl < f.dbg_locals.len() {
+        var en0: StringValueId = f.dbg_locals.get(dl);
+        var cnt: i64 = 0;
+        if HashMap_contains(namecount, en0.name) {
+            cnt = HashMap_get(namecount, en0.name);
+        }
+        HashMap_insert(namecount, en0.name, cnt + 1);
+        dl = dl + 1;
+    }
+    dl = 0;
+    while dl < f.dbg_locals.len() {
+        var ent: StringValueId = f.dbg_locals.get(dl);
+        var aid: i64 = ent.id;
+        if aid >= 0 && aid < st.cidx.len() && st.cidx.get(aid) >= 0 {
+            var cc: i64 = st.cidx.get(aid);
+            var nid: i64 = - 1;
+            var multi: bool = HashMap_get(namecount, ent.name) > 1;
+            if multi {
+                var fv: i64 = st.first_val.get(cc);
+                if fv >= 0 {
+                    nid = ssa_final(st, & vreal, fv);
+                }
+            }
+            if nid < 0 {
+                var pk: i64 = 0;
+                while pk < np {
+                    if st.ph_cand.get(pk) == cc && st.ph_live.get(pk) == 1 && st.ph_gone.get(pk) == 0 && slot.get(pk) >= 0 {
+                        nid = slot.get(pk);
+                        pk = np;
+                    }
+                    pk = pk + 1;
+                }
+            }
+            if nid < 0 && !multi {
+                var fv2: i64 = st.first_val.get(cc);
+                if fv2 >= 0 {
+                    nid = ssa_final(st, & vreal, fv2);
+                }
+            }
+            if nid >= 0 {
+                f.dbg_locals.set(dl, StringValueId_new(ent.name, nid));
+            }
+        }
+        dl = dl + 1;
+    }
+    HashMap_drop(namecount);
 }
 
 // --- Cleanup: values nothing reads ---------------------------------------------

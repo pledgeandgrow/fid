@@ -1,13 +1,15 @@
 #!/bin/bash
-# build-selfhost.sh — build the self-hosted Fides compiler into release/.
+# build-selfhost.sh — build the self-hosted Fides compiler.
 #
-# Output (OUT, default `release`):
+# Build workspace (OUT, default `build/selfhost`):
 #   $OUT/fid-dev.c    — generated C source (fidesc dump-c compiler/main.fd)
-#   $OUT/fid-dev.exe  — compiled binary (with 256MB-stack wrapper)
+#   $OUT/fid-dev.exe  — temporary compiled binary (with 256MB-stack wrapper)
+# The default build publishes only fid-dev(.exe) into release/. Set
+# KEEP_BUILD_OUTPUTS=1 to retain the generated C, logs, and temporary binary.
 #
 # Usage:
 #   ./scripts/build-selfhost.sh            # dump-c + compile
-#   OUT=/tmp/fid-dev-next ./scripts/build-selfhost.sh  # isolated output
+#   OUT=/tmp/fid-dev-next ./scripts/build-selfhost.sh  # custom workspace
 #   STAGE0=./build/bootstrap/fides-c3 ./scripts/build-selfhost.sh   # self-compile
 #
 # C compiler: $CC if set, else the first of tcc, gcc, clang, `zig cc`.
@@ -16,7 +18,11 @@
 # (optimizing it whole needs >16GB RAM with clang).
 set -u
 cd "$(dirname "$0")/.." || exit 1
-OUT="${OUT:-release}"
+PUBLISH_DEV=0
+if [ -z "${OUT:-}" ]; then
+  OUT=build/selfhost
+  PUBLISH_DEV=1
+fi
 # As scripts/bootstrap.sh: prefer the pinned self-hosted stage 0 (which has
 # `split-c` and builds 8 units at -O2) over a cold fidesc start.
 STAGE0="${STAGE0:-}"
@@ -169,5 +175,15 @@ esac
 if [ "$built" = 0 ] && ! "${CC_CMD[@]}" "${CFLAGS[@]}" "$OUT/fid-dev_wrapped.c" -o "$OUT/$OUT_EXE" "${LIBS[@]}" >> "$OUT/fid-dev.cc.log" 2>&1; then
   echo "C compile failed:"; grep -E "error" "$OUT/fid-dev.cc.log" | head -20; exit 1
 fi
-rm -f "$OUT/fid-dev_wrapped.c"
-echo "OK: $OUT/$OUT_EXE"
+if [ "$PUBLISH_DEV" = 1 ]; then
+  mkdir -p release
+  cp "$OUT/$OUT_EXE" "release/$OUT_EXE"
+  if [ "${KEEP_BUILD_OUTPUTS:-0}" != 1 ]; then
+    rm -f "$OUT/fid-dev.c" "$OUT/fid-dev_wrapped.c"
+    rm -f "$OUT/fid-dev.log" "$OUT/fid-dev.cc.log"
+    rm -f "$OUT/fid-dev.pdb" "$OUT/$OUT_EXE"
+  fi
+  echo "OK: release/$OUT_EXE"
+else
+  echo "OK: $OUT/$OUT_EXE"
+fi

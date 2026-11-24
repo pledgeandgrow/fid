@@ -1,0 +1,39 @@
+// Expected to fail at run time (BG226, docs/roadmap/bugs-roadmap.md): three
+// tasks await each other in a ring (a awaits b, b awaits c, c awaits a), so
+// none can ever finish. Both native runtimes hung: pe_runtime's deadlock
+// detector counted every task waiting for another task as a waiter, so it
+// never fired, and linux_runtime's await had no check. Now pe_runtime's
+// detector reports it once nothing else can run, and linux_runtime's await
+// that closes the ring panics, as the C runtime does for BG96: "Tasks are
+// deadlocked: each one awaits another" (exit code 1). "not reached" is
+// never printed.
+use task;
+
+var g_a: i64 = 0;
+var g_b: i64 = 0;
+var g_c: i64 = 0;
+
+fn a(x: i64) -> i64 {
+    task_sleep(20);
+    return p_future_poll(g_b | (32677 << 48));
+}
+
+fn b(x: i64) -> i64 {
+    task_sleep(30);
+    return p_future_poll(g_c | (32677 << 48));
+}
+
+fn c(x: i64) -> i64 {
+    task_sleep(40);
+    return p_future_poll(g_a | (32677 << 48));
+}
+
+fn main() -> i64 {
+    print("before\n");
+    g_a = task_go("a", 0);
+    g_b = task_go("b", 0);
+    g_c = task_go("c", 0);
+    task_run();
+    println("not reached");
+    return 0;
+}

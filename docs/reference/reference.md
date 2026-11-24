@@ -131,15 +131,16 @@ character (`read_char_lit`): `val c: i64 = 'A';` gives 65. Escapes: `\n` `\t`
 - Format strings `f"…{expr}…"`: text outside braces takes the same escapes as a
   plain string. Each `{…}` (braces may nest) is lexed and parsed again as an
   expression (`parser.fd:parse_fstring_parts`). The result has type `str`.
-  The braces hold one expression and nothing else: there are no format
-  specifiers, and text after the expression is a parse error
-  (`text follows the expression in an f-string`: `f"{x:.2}"`, `f"{n:5}"`,
-  `f"{x:#x}"`; until Nov 23 it was dropped without a word and `f"{x:.2}"`
-  printed `3.14159`). There is no escape for a literal brace. Each expression
-  is type-checked; it may be text, a number, a bool or a `Vec` — a struct (or
-  a reference to one) is an error, since it has no text form
+  There is no escape for a literal brace. Each expression is type-checked; it
+  may be text, a number, a bool or a `Vec` — a struct (or a reference to one)
+  is an error, since it has no text form
   (`TypeChecker_check_fstring_part`; `test_frontend_fstring.fd`,
-  `test_frontend_fstring_struct_fail.fd`).
+  `test_frontend_fstring_struct_fail.fd`). After the expression a `:` at
+  brace depth introduces a format specifier — `[fill][<|>|^][#][0][+]
+  [width][.precision][x|X|b|o]` — so `f"{x:.2}"` prints `1.50` for `x = 1.5`,
+  `f"{n:5}"` pads `7` to `"    7"`, and `f"{x:#x}"` prints `0xff`
+  (`lower.fd:Lowerer_lower_fstr_fmt`, core's `fstr_fmt_*`). `:` inside
+  brackets or a `::` path stays part of the expression.
 - There are no byte-string literals (`b"…"`).
 
 ### 1.9 Operators and punctuation
@@ -675,7 +676,9 @@ Consequences:
   below.
 - `asm!("template", in("reg") expr, out("reg") expr, clobber("reg"))`: inline
   assembly. The value is `i64` with an `out` operand, otherwise `void`. The C
-  backend emits it as a comment; the native Windows backend encodes it.
+  backend emits it as a comment; the native Windows backend encodes it. In the
+  program's own module it needs an `unsafe { }` block or an `@unsafe` function
+  (§8.5).
 
 ### 4.4 Field access, methods, indexing
 
@@ -1241,7 +1244,8 @@ need an `unsafe { }` block or an `@unsafe` function
 - calling an `extern "C"` function whose name does not start with `p_`;
 - calling an `@unsafe` function, method or associated function
   (``calling the @unsafe function f() needs an `unsafe` block``;
-  `test_unsafe_call_user_fail.fd`).
+  `test_unsafe_call_user_fail.fd`);
+- inline assembly `asm!(...)` (`test_asm_unsafe_fail.fd`).
 
 The rules hold in the program (also when it declares `module x;`) and in the
 modules it imports from outside the standard library; the stdlib and the
@@ -1684,11 +1688,11 @@ miscompile-log D22.)
 
 `Box::new(x)` gives `Box<T>`; `*b` gives the `T`. `Rc::new` and `Arc::new` give
 `Rc<T>`/`Arc<T>` with `clone`, `drop`, `get`, `count` (`Rc::new(41)` is an
-`Rc<i64>`, as a literal is an `i64`). An `Rc<T>` or an `Arc<T>` holds a
-number or a bool, as one word (the address of a block `[count, value]`);
-`Rc::new` of anything else is an error (a struct, a string or a collection
-needs a counted cell that owns what it holds, known-bugs OW4). Nothing drops
-a handle by itself: `drop` does, once per copy.
+`Rc<i64>`, as a literal is an `i64`). A number or a bool goes into a
+one-word block `[count, value]`; anything else (a string, a `Vec`, a
+struct, an enum) goes into a tagged block `[count, tid, payload]` whose
+last `drop` frees what the payload owns (the tid is core's `__p_mem_drop`
+type id). Nothing drops a handle by itself: `drop` does, once per copy.
 
 ### 13.4 Strings
 

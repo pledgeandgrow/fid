@@ -134,7 +134,7 @@ reference.md is right. Counts: [selfhost.md → Numbers](selfhost.md#numbers).*
 | `fidesc wasm <file> -o <out.wasm>` | ✅ | WebAssembly backend |
 | `fidesc gpu <file>` | ✅ | SPIR-V GPU backend |
 | `fidesc parse-header <file.h>` | ✅ | Parse C header → generate Fides FFI bindings |
-| `fidesc watch <file>` | ⚠️ | Rebuilds and reruns on save, reports changed functions; no in-process swap. `fid watch` runs `bench` |
+| `fidesc watch <file>` | ⚠️ | Rebuilds and reruns on save, reports changed functions; no in-process swap. `fid watch <file> [cmd]` re-runs a fid command on content change |
 | `fidesc link <files...>` | ✅ | Link multiple object files |
 | `fidesc lsp` | ✅ | Language Server Protocol server (JSON-RPC over stdio, diagnostics, no external deps) |
 | `fidesc lint <file>` | ✅ | Lint checks (unused functions, unused imports) |

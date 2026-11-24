@@ -1,0 +1,69 @@
+// Bugs roadmap BG166: the machine layer (compiler/nat_ir.fd) handed a
+// program function to C as a bare address, but C calls it with the
+// platform's convention while the layer takes `__env` first, floats as
+// their bits in general registers and (x86-64) arguments 4 and up on the
+// stack: `cbk_d(mycb, 2.5)` printed 5 (want 17.5), the seventh and eighth
+// arguments of an eight-integer callback were garbage. A call of a C
+// function the dynamic linker binds now passes the function's entry adapter
+// (ng_cbx_label, ng_gen_cbx_adapters: System V, Win64, AAPCS64, lp64d),
+// which moves C's arguments into the layer's convention and the result
+// back. The library is tests/nattools/machine_c_callback.c; run by
+// tests/nattools/machine_c_callback_check.sh (x86_64-linux, aarch64-linux,
+// riscv64-linux; `fid run` has no FFI for it). The C path prints the same.
+//@ backends: ccompile
+// Expected output:
+// 17.5
+// 87654321
+// 962
+// -39804.25
+// -14
+// 609
+
+extern "C" link "cbk" {
+    fn cbk_d(f: fn(f64, i64) -> f64, x: f64) -> f64;
+    fn cbk_i8(f: fn(i64, i64, i64, i64, i64, i64, i64, i64) -> i64) -> i64;
+    fn cbk_mix(f: fn(i64, f64, i64, f64, i64, f64, i64, f64, i64, f64, i64, f64, i64, f64, f64, f64, f64) -> f64) -> f64;
+    fn cbk_n(f: fn(f32, i8, u16, i32, u8, f64) -> f32, a: f32) -> f32;
+    fn cbk_w(f: fn(i32) -> i32, x: i32) -> i32;
+    fn cbk_late(a: i64, b: i64, c: i64, d: i64, e: i64, f: fn(i64, i64) -> i64) -> i64;
+}
+
+fn mycb(x: f64, n: i64) -> f64 {
+    return x * (n as f64);
+}
+
+fn my8(a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64, h: i64) -> i64 {
+    return a + 10 * b + 100 * c + 1000 * d + 10000 * e + 100000 * f + 1000000 * g + 10000000 * h;
+}
+
+fn mixf(a: i64, x: f64, b: i64, y: f64, c: i64, z: f64, d: i64, w: f64, e: i64, v: f64, f: i64, u: f64, g: i64, t: f64, s: f64, r: f64, q: f64) -> f64 {
+    var sum: f64 = (a as f64) + 2.0 * x + 3.0 * (b as f64) + 4.0 * y;
+    sum = sum + 5.0 * (c as f64) + 6.0 * z + 7.0 * (d as f64) + 8.0 * w;
+    sum = sum + 9.0 * (e as f64) + 10.0 * v + 11.0 * (f as f64) + 12.0 * u;
+    sum = sum + 13.0 * (g as f64) + 14.0 * t + 15.0 * s + 16.0 * r + 17.0 * q;
+    return sum;
+}
+
+fn nf(a: f32, b: i8, c: u16, d: i32, e: u8, g: f64) -> f32 {
+    val sum: f64 = (a as f64) + 2.0 * (b as f64) + (c as f64) + (d as f64) + (e as f64) + g;
+    return sum as f32;
+}
+
+fn negw(x: i32) -> i32 {
+    return x - (10 as i32);
+}
+
+fn sub2(x: i64, y: i64) -> i64 {
+    return x * 100 + y;
+}
+
+@unsafe
+fn main() -> i64 {
+    println(cbk_d(mycb, 2.5));
+    println(cbk_i8(my8));
+    println(cbk_mix(mixf));
+    println(cbk_n(nf, 1.5 as f32) as f64);
+    println(cbk_w(negw, 3 as i32) as i64);
+    println(cbk_late(1, 2, 3, 4, 5, sub2));
+    return 0;
+}

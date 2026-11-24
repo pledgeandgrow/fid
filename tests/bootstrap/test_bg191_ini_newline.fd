@@ -1,0 +1,77 @@
+// Bugs roadmap BG191: stdlib/ini.fd `ini_serialize` wrapped a value holding
+// a newline in quotes, but `ini_parse` splits lines first, so the value's
+// second line became a key of its own (and `ini_get` returns the first
+// match: an injected key shadowed the real one). Quoted values now escape
+// \ " LF CR (\\ \" \n \r) and the parser undoes them inside double quotes;
+// values that start with a quote or with/end in a tab are quoted too, so
+// `"quoted"` and a leading tab survive a round trip. Hand-written files
+// keep their meaning for other backslashes and for 'single quotes'.
+//
+// Expected output:
+// [user]
+// name = "bob\nrole = admin\n"
+// role = guest
+// role=guest keys=2
+// same
+// same
+// same
+// same
+// same
+// same
+// same
+// same
+// same
+// same
+// same
+// same
+// C:\temp
+// x\ny
+// plain\n
+// say "hi"
+// v ; comment kept out
+use ini;
+
+fn rt(v: str) {
+    var doc: Vec<IniEntry> = Vec::new();
+    ini_set(&mut doc, "s", "k", v);
+    ini_set(&mut doc, "s", "after", "1");
+    val back: Vec<IniEntry> = ini_parse(ini_serialize(doc));
+    if ini_get(back, "s", "k") == v && ini_get(back, "s", "after") == "1" && ini_keys(back, "s").len() == 2 {
+        println("same");
+    } else {
+        println("LOST [" + v + "] -> [" + ini_get(back, "s", "k") + "]");
+    }
+}
+
+fn main() -> i64 {
+    // the roadmap's trigger
+    var doc: Vec<IniEntry> = Vec::new();
+    ini_set(&mut doc, "user", "name", "bob\nrole = admin\n");
+    ini_set(&mut doc, "user", "role", "guest");
+    val text: str = ini_serialize(doc);
+    print(str_slice(text, 1, str_len(text)));
+    val back: Vec<IniEntry> = ini_parse(text);
+    println("role=" + ini_get(back, "user", "role") + " keys=" + int_to_str(ini_keys(back, "user").len()));
+
+    rt("\"quoted\"");
+    rt("'single'");
+    rt("\ttabbed");
+    rt("trail\t");
+    rt("line1\nline2");
+    rt("cr\r\n[evil]\nx = 1");
+    rt("x = y");
+    rt("a\\b");
+    rt("C:\\new\\dir ;x");
+    rt("x\" ;y");
+    rt("\\");
+    rt("caf\u{e9} = \u{e9}t\u{e9}");
+
+    // hand-written values
+    val d: Vec<IniEntry> = ini_parse("a = \"C:\\temp\"\nb = 'x\\ny'\nc = plain\\n\nq = \"say \\\"hi\\\"\" ; note\nr = \"v ; comment kept out\"\n");
+    println(ini_get(d, "", "a"));
+    println(ini_get(d, "", "b"));
+    println(ini_get(d, "", "c"));
+    println(ini_get(d, "", "q"));
+    println(ini_get(d, "", "r"));
+    return 0;
+}

@@ -129,6 +129,46 @@ def line_rows(b):
     return rows
 
 
+def line_files(b):
+    """The file_names table of each unit of .debug_line, in unit order:
+    files[unit][index - 1] is the name file index `index` (from 1) means."""
+    out = []
+    p = 0
+    while p + 4 <= len(b):
+        ulen = struct.unpack_from("<I", b, p)[0]
+        end = p + 4 + ulen
+        ver = struct.unpack_from("<H", b, p + 4)[0]
+        hlen = struct.unpack_from("<I", b, p + 6)[0]
+        q = p + 10
+        if ver >= 5:
+            # v5's header order differs; our images are v2-4
+            out.append([])
+            p = end
+            continue
+        q += 1  # min instruction length
+        if ver >= 4:
+            q += 1
+        q += 2  # default_is_stmt, line_base
+        q += 1  # line_range
+        op_base = b[q]
+        q += 1
+        q += op_base - 1
+        while b[q] != 0:  # include_directories
+            q = b.index(0, q) + 1
+        q += 1
+        files = []
+        while b[q] != 0:
+            e2 = b.index(0, q)
+            files.append(b[q:e2].decode("utf-8", "replace"))
+            q = e2 + 1
+            _, q = dv.uleb(b, q)
+            _, q = dv.uleb(b, q)
+            _, q = dv.uleb(b, q)
+        out.append(files)
+        p = end
+    return out
+
+
 def cfi_entries(b):
     """The FDEs of .debug_frame: (start, end, CIE initial instructions,
     FDE instructions, code alignment, data alignment)."""

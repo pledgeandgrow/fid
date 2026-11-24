@@ -16,14 +16,23 @@
 // hold a `name`, and `// dbg-in marker name depth` how many blocks deep the
 // innermost binding of `name` is at the marker (dbg_scopes_check.py).
 // gdb: `break test_machine_dbg_scopes.fd:<line>`, `info locals`, `print x`.
+// `total` starts from a parameter so `total = total + x` keeps its line in
+// the optimized build (a constant 0 folds the statement away, marker and
+// all), and `twice` is called twice so inline2's once-called rule keeps a
+// body for its subprogram.
 // Expected output:
 // 56
-// 18
+// 52
 // 61
 
-fn shadow(n: i64) -> i64 {
+fn shadow(n: i64, t0: i64) -> i64 {
+    if n > 1000000 {
+        // panic keeps the mid-end's inline2 off (ime_panic_frame), like
+        // test_machine_dbg_vars.fd: shadow keeps a body and its subprogram
+        panic("huge");
+    }
     var x: i64 = n + 1;
-    var total: i64 = 0;
+    var total: i64 = t0;
     if n > 2 {
         var x: i64 = n * 10;
         total = total + x; // @inner
@@ -74,7 +83,7 @@ fn twice(k: i64) -> i64 {
 // dbg-in second e 1
 
 fn main() {
-    println(shadow(5));
-    println(twice(3));
-    println(shadow(5) + 5);
+    println(shadow(5, 0));
+    println(twice(3) + twice(4));
+    println(shadow(5, 0) + 5);
 }

@@ -115,13 +115,24 @@ def main():
         if m and not ln.lstrip().startswith("//"):
             markers[m.group(1)] = i + 1
     rows = dr.line_rows(dv.section(data, ".debug_line") or b"")
+    # a marker's rows are the test file's: the same line number in a
+    # runtime or stdlib file (a row inside pe_ld was seen at line 59) must
+    # not take the address. The file index is per line-program unit; our
+    # images carry one, so the basename of `src` names it.
+    want_fil = None
+    files = dr.line_files(dv.section(data, ".debug_line") or b"")
+    base = os.path.basename(src)
+    for ft in files:
+        if base in ft:
+            want_fil = ft.index(base) + 1
+            break
     for ln in text:
         m = re.match(r"\s*//\s*dbg-in\s+(\w+)\s+(\w+)\s+(\d+)\s*$", ln)
         if not m:
             continue
         mk, vname, want = m.group(1), m.group(2), int(m.group(3))
         line = markers.get(mk)
-        addrs = sorted(a for a, f, l, end in rows if not end and l == line)
+        addrs = sorted(a for a, f, l, end in rows if not end and l == line and (want_fil is None or f == want_fil))
         if not addrs:
             fails.append("@%s: line %s has no row" % (mk, line))
             continue

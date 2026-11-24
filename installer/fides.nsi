@@ -134,11 +134,11 @@ Section "Fides Compiler (required)" SecCore
   File "..\release\fid.exe"
 
   ; The Rust bootstrap compiler (fidesc.exe), plus the companion tools.
-  ; Stage them in release\ first (build-installer.sh / build-installer.yml do).
-  File "..\release\fidesc.exe"
-  File "..\release\ark.exe"
-  File "..\release\scribe.exe"
-  File "..\release\veil.exe"
+  ; build-installer.sh stages these under build\installer\tools\.
+  File "..\build\installer\tools\fidesc.exe"
+  File "..\build\installer\tools\ark.exe"
+  File "..\build\installer\tools\scribe.exe"
+  File "..\build\installer\tools\veil.exe"
 
   ; License file
   File "license.txt"

@@ -5155,7 +5155,10 @@ fn cg_emit_registrations(self: &mut CCodeGen, module: IrModule) {
         var entry: IrFunctionEntry = module.functions.get(f);
         if entry.name != "main" && !is_internal_function(entry.name) && cg_named_by_program(self, entry.name) {
             var c_name: str = sanitize_c_name(self, entry.name);
-            if cg_wasi_thunk_ok(entry.func) {
+            if cg_thunk_native(entry.func) {
+                // BG133: the thunk on every target (floats, narrow results)
+                wln(self, "    p_thread_register(\"" + entry.name + "\", (int64_t(*)())__p_wt_" + c_name + ");");
+            } else if cg_wasi_thunk_ok(entry.func) {
                 // F9: on wasm32 the thunk of cg_emit_wasi_thunks, whose type
                 // is the one the runtime calls it with
                 wln(self, "#ifdef __wasi__");
@@ -5169,6 +5172,93 @@ fn cg_emit_registrations(self: &mut CCodeGen, module: IrModule) {
         }
         f = f + 1;
     }
+}
+
+/// BG133: argument `base` (of type `arg_ty`) of a call by name
+/// (p_thread_spawn, p_executor_spawn, p_co_async) as the word the runtime
+/// reads with va_arg(int64_t), by the type of parameter `pidx` of the
+/// function named by value `name_id` (the argument's own type when the name
+/// is not a constant: an f64 literal passed to an f32 parameter is still
+/// f64): an f64/f32 as its bits, a bool or narrow integer widened; any
+/// other type keeps `cast`.
+fn cg_spawn_word_arg(self: &CCodeGen, func: IrFunction, name_id: i64, pidx: i64, cast: str, base: str, arg_ty: IrType) -> str {
+    var ty: IrType = arg_ty;
+    match IrFunction_get_inst(&func, name_id) {
+        OptInst::Some(inst) => {
+            match inst {
+                Inst::ConstStr(callee) => {
+                    match fn_param_types_get(self, callee) {
+                        OptVecIrType::Some(pts) => {
+                            if pidx >= 1 && pidx < pts.len() {
+                                ty = pts.get(pidx);
+                            }
+                        }
+                        OptVecIrType::None => {
+                        }
+                    }
+                }
+                _ => {
+                }
+            }
+        }
+        OptInst::None => {
+        }
+    }
+    match ty {
+        IrType::F64 => {
+            return "((union { double d; int64_t i; }){ .d = (double)(" + base + ") }).i";
+        }
+        IrType::F32 => {
+            return "(int64_t)((union { float f; int32_t i; }){ .f = (float)(" + base + ") }).i";
+        }
+        IrType::Bool => {
+            return "(int64_t)" + base;
+        }
+        IrType::I8 => {
+            return "(int64_t)" + base;
+        }
+        IrType::I16 => {
+            return "(int64_t)" + base;
+        }
+        IrType::I32 => {
+            return "(int64_t)" + base;
+        }
+        IrType::U8 => {
+            return "(int64_t)" + base;
+        }
+        IrType::U16 => {
+            return "(int64_t)" + base;
+        }
+        IrType::U32 => {
+            return "(int64_t)" + base;
+        }
+        _ => {
+            return cast;
+        }
+    }
+}
+
+/// BG133: whether the runtime calls function `func` through its thunk
+/// (cg_emit_wasi_thunks) on every target, not only on wasm32. The runtime
+/// calls a function it looks up by name as int64_t (*)(void*, int64_t, ...)
+/// and takes its result from the integer register: an f64/f32 parameter
+/// would be read from a float register (the word holds its bits), an f64/f32
+/// result is in a float register, and a bool or narrow integer result leaves
+/// the register's upper bits unset. The thunk converts both ways.
+fn cg_thunk_native(func: IrFunction) -> bool {
+    if !cg_wasi_thunk_ok(func) {
+        return false;
+    }
+    var p: i64 = 1;
+    while p < func.params.len() {
+        var pc: str = c_type(func.params.get(p).ty);
+        if pc == "double" || pc == "float" {
+            return true;
+        }
+        p = p + 1;
+    }
+    var rc: str = c_ret_type(func.ret_ty);
+    return rc == "double" || rc == "float" || rc == "bool" || rc == "int32_t" || rc == "int16_t" || rc == "int8_t" || rc == "uint32_t" || rc == "uint16_t" || rc == "uint8_t";
 }
 
 /// F9: whether function `func` gets a thunk on wasm32 (cg_emit_wasi_thunks):
@@ -5203,12 +5293,27 @@ fn cg_wasi_thunk_ok(func: IrFunction) -> bool {
 /// gets a thunk of exactly that type that converts the words (an f64 is
 /// its bits) and the result back to a word; the registrations
 /// (cg_emit_registrations) name the thunk there.
+/// BG133: pass 0 writes, for every target, the thunks of the functions
+/// cg_thunk_native picks; pass 1 the others, under __wasi__ only.
 fn cg_emit_wasi_thunks(self: &mut CCodeGen, module: IrModule) {
-    wln(self, "#ifdef __wasi__");
+    var pass: i64 = 0;
+    while pass < 2 {
+        if pass == 1 {
+            wln(self, "#ifdef __wasi__");
+        }
+        cg_emit_thunks_pass(self, module, pass == 0);
+        if pass == 1 {
+            wln(self, "#endif");
+        }
+        pass = pass + 1;
+    }
+}
+
+fn cg_emit_thunks_pass(self: &mut CCodeGen, module: IrModule, native: bool) {
     var f: i64 = 0;
     while f < module.functions.len() {
         var entry: IrFunctionEntry = module.functions.get(f);
-        if entry.name != "main" && !is_internal_function(entry.name) && cg_named_by_program(self, entry.name) && cg_wasi_thunk_ok(entry.func) {
+        if entry.name != "main" && !is_internal_function(entry.name) && cg_named_by_program(self, entry.name) && cg_wasi_thunk_ok(entry.func) && cg_thunk_native(entry.func) == native {
             var c_name: str = sanitize_c_name(self, entry.name);
             var params: str = "void* e";
             var args: str = "";
@@ -5265,7 +5370,6 @@ fn cg_emit_wasi_thunks(self: &mut CCodeGen, module: IrModule) {
         }
         f = f + 1;
     }
-    wln(self, "#endif");
 }
 
 // --- CI7: library builds; CI6: the embedding API -----------------------------
@@ -7682,6 +7786,17 @@ fn gen_inst(self: &mut CCodeGen, inst: Inst, id: i64, func: IrFunction) -> void 
                             if is_varargs && is_ptr_type(arg_ty) {
                                 cast = "(int64_t)" + base;
                             }
+                            // BG133: the runtime reads each argument as a
+                            // word (va_arg int64_t): a float goes as its bits
+                            // (the function's thunk, cg_thunk_native, turns
+                            // them back), a bool or narrow integer widened
+                            if is_varargs {
+                                var prefix: i64 = 2;
+                                if fname == "p_executor_spawn" {
+                                    prefix = 3;
+                                }
+                                cast = cg_spawn_word_arg(self, func, args.get(prefix - 2), i - prefix + 1, cast, base, arg_ty);
+                            }
                         }
                     }
                     OptVecIrType::None => {
@@ -8248,6 +8363,10 @@ fn gen_inst(self: &mut CCodeGen, inst: Inst, id: i64, func: IrFunction) -> void 
                         }
                         si = si + 1;
                     }
+                }
+                // an array sret copy is elem*count bytes (ir_type_size)
+                IrType::Array(_, _) => {
+                    size = ir_type_size(ty);
                 }
                 _ => {
                 }
@@ -11680,10 +11799,12 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "int64_t p_vec_len(PVec* v) { return v ? v->len : 0; }");
     wln(self, "bool p_vec_is_empty(PVec* v) { return v ? v->len == 0 : true; }");
     wln(self, "void p_vec_clear(PVec* v) { if (v) v->len = 0; }");
+    // BG120: pop goes through core's Vec_pop — a raw 8-byte slot store/read
+    // drops an element taken at its size and, for a shared buffer, the
+    // extra owner the caller gets (vec_sz_pop / vec_elem_dup there)
     wln(self, "int64_t p_vec_pop(PVec* v) {");
     wln(self, "    if (!v || v->len == 0) return 0;");
-    wln(self, "    v->len--;");
-    wln(self, "    return P_VSLOT(v, v->len);");
+    wln(self, "    return Vec_pop(0, (int64_t)(intptr_t)v);");
     wln(self, "}");
     wln(self, "");
     // Map runtime (simple linear probe)
@@ -15329,6 +15450,8 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    return (int64_t)c;");
     wln(self, "}");
     wln(self, "int64_t p_co_async(const char* name, int64_t nargs, ...) {");
+    // BG133: a 9th argument was dropped (the function read garbage)
+    wln(self, "    if (nargs > 8) p_panic(\"task: a function started by name takes at most 8 arguments\");");
     wln(self, "    int64_t args[8] = {0};");
     wln(self, "    va_list ap;");
     wln(self, "    va_start(ap, nargs);");
@@ -15888,6 +16011,8 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "        if (strcmp(p_thread_entries[i].name, func_name) == 0) { fn = p_thread_entries[i].fn; break; }");
     wln(self, "    }");
     wln(self, "    if (!fn) return -1;");
+    // BG133: a 9th argument was dropped (the function read garbage)
+    wln(self, "    if (num_args > 8) p_panic(\"spawn: a function started by name takes at most 8 arguments\");");
     wln(self, "    p_thread_arg_t* ta = (p_thread_arg_t*)malloc(sizeof(p_thread_arg_t));");
     wln(self, "    ta->fn = fn; ta->nargs = num_args; ta->caps = __p_caps;");
     wln(self, "    va_list ap; va_start(ap, num_args);");
@@ -16113,6 +16238,8 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "        }");
     wln(self, "    }");
     wln(self, "    if (!fn) return -1;");
+    // BG133: a 9th argument was dropped (the function read garbage)
+    wln(self, "    if (num_args > 8) p_panic(\"spawn: a function started by name takes at most 8 arguments\");");
     wln(self, "    p_thread_arg_t* ta = (p_thread_arg_t*)malloc(sizeof(p_thread_arg_t));");
     wln(self, "    ta->fn = fn;");
     wln(self, "    ta->caps = __p_caps;");
@@ -16165,15 +16292,63 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    (*rc)--;");
     wln(self, "    if (*rc <= 0) { free((void*)(intptr_t)rc_addr); }");
     wln(self, "}");
-    // Mutex - use pthread_mutex_t allocated on heap
+    // BG148: a mutex green tasks share (was a bare pthread mutex: two tasks
+    // of one thread both entered a Windows CRITICAL_SECTION, which is
+    // recursive, and the second deadlocked a Linux one)
+    wln(self, "/* BG148: a pthread mutex belongs to a thread, not to a task: two tasks of");
+    wln(self, "   one thread both entered a Windows CRITICAL_SECTION (recursive), the");
+    wln(self, "   second deadlocked a Linux mutex, and under M:N a task could unlock it");
+    wln(self, "   from another worker. So the lock is a flag kept under a short internal");
+    wln(self, "   mutex, with its holder (owner: the task, or the thread off a task). A");
+    wln(self, "   task that finds it held gives its turn (yields, then 1 ms naps) until it");
+    wln(self, "   is free; code off a task runs this thread's tasks meanwhile");
+    wln(self, "   (__p_chan_coop_wait) or sleeps on the condition variable, which an");
+    wln(self, "   unlock wakes. Any holder may unlock it (sync.fd's read lock is released");
+    wln(self, "   by the last reader). */");
+    wln(self, "typedef struct { pthread_mutex_t mx; pthread_cond_t cv; void* owner; int held; int tw; } __p_mutex_t;");
+    wln(self, "static int __p_chan_coop_wait(pthread_mutex_t* mx, int64_t* spins);");
+    wln(self, "static P_MN_NOINLINE void* __p_mutex_me(void) { void* c = (void*)__p_co_cur; return c ? c : (void*)&__p_co_cur; }");
     wln(self, "int64_t p_mutex_init(void) {");
-    wln(self, "    pthread_mutex_t* m = (pthread_mutex_t*)malloc(sizeof(pthread_mutex_t));");
-    wln(self, "    pthread_mutex_init(m, NULL);");
+    wln(self, "    __p_mutex_t* m = (__p_mutex_t*)calloc(1, sizeof(__p_mutex_t));");
+    wln(self, "    if (!m) p_panic(\"p_mutex_init: out of memory\");");
+    wln(self, "    pthread_mutex_init(&m->mx, NULL);");
+    wln(self, "    pthread_cond_init(&m->cv, NULL);");
     wln(self, "    return (int64_t)(intptr_t)m;");
     wln(self, "}");
     // RL17: a random point before the lock; none while one is held
-    wln(self, "void p_mutex_lock(int64_t m) { __p_rnd_point(); pthread_mutex_lock((pthread_mutex_t*)(intptr_t)m); __p_rnd_held++; }");
-    wln(self, "void p_mutex_unlock(int64_t m) { if (__p_rnd_held > 0) __p_rnd_held--; pthread_mutex_unlock((pthread_mutex_t*)(intptr_t)m); }");
+    wln(self, "void p_mutex_lock(int64_t h) {");
+    wln(self, "    __p_mutex_t* m = (__p_mutex_t*)(intptr_t)h;");
+    wln(self, "    __p_rnd_point();");
+    wln(self, "    pthread_mutex_lock(&m->mx);");
+    wln(self, "    int64_t spins = 0;");
+    wln(self, "    while (m->held) {");
+    wln(self, "#ifdef P_MN");
+    wln(self, "        if (__p_mn_on() && __p_co_self()) {");
+    wln(self, "            pthread_mutex_unlock(&m->mx);");
+    wln(self, "            if (spins < 64) { spins++; p_co_yield(); } else __p_co_nap(1);");
+    wln(self, "            pthread_mutex_lock(&m->mx);");
+    wln(self, "            continue;");
+    wln(self, "        }");
+    wln(self, "#endif");
+    wln(self, "        if (__p_chan_coop_wait(&m->mx, &spins)) continue;");
+    wln(self, "        m->tw++;");
+    wln(self, "        pthread_cond_wait(&m->cv, &m->mx);");
+    wln(self, "        m->tw--;");
+    wln(self, "    }");
+    wln(self, "    m->held = 1;");
+    wln(self, "    m->owner = __p_mutex_me();");
+    wln(self, "    pthread_mutex_unlock(&m->mx);");
+    wln(self, "    __p_rnd_held++;");
+    wln(self, "}");
+    wln(self, "void p_mutex_unlock(int64_t h) {");
+    wln(self, "    __p_mutex_t* m = (__p_mutex_t*)(intptr_t)h;");
+    wln(self, "    if (__p_rnd_held > 0) __p_rnd_held--;");
+    wln(self, "    pthread_mutex_lock(&m->mx);");
+    wln(self, "    m->held = 0;");
+    wln(self, "    m->owner = NULL;");
+    wln(self, "    if (m->tw > 0) pthread_cond_broadcast(&m->cv);");
+    wln(self, "    pthread_mutex_unlock(&m->mx);");
+    wln(self, "}");
     // --- Thread-local storage (pthread keys) ---
     wln(self, "int64_t p_tls_create(void) { pthread_key_t key; pthread_key_create(&key, NULL); return (int64_t)key; }");
     wln(self, "int64_t p_tls_get(int64_t key) { return (int64_t)(intptr_t)pthread_getspecific((pthread_key_t)key); }");
@@ -16555,6 +16730,11 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "int64_t p_vec_capacity(PVec* v) { return v ? v->cap : 0; }");
     wln(self, "PVec* p_vec_clone(PVec* v) {");
     wln(self, "    PVec* c = p_vec_new();");
+    wln(self, "    if (!v) return c;");
+    // BG40: the clone keeps the element code and type id, so its pushes
+    // store at the element size — a coded Vec (u8 or an inline struct,
+    // whose P_VEC_AT is the element's address) does not become word slots
+    wln(self, "    c->code = v->code; c->tid = v->tid;");
     wln(self, "    for (int64_t i = 0; i < v->len; i++) p_vec_push(c, P_VEC_AT(v, i));");
     wln(self, "    return c;");
     wln(self, "}");
@@ -16584,22 +16764,17 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    else P_VSLOT(v, idx) = (int64_t)(intptr_t)val;");
     wln(self, "    v->len++;");
     wln(self, "}");
+    // BG120: remove/reverse/sort/truncate go through core's Vec functions —
+    // the raw 8-byte slots below moved and compared elements at whatever
+    // size the Vec stores them, and wrote a shared buffer other Vecs read
+    // (core's vec_own copies it first)
     wln(self, "void* p_vec_remove(PVec* v, int64_t idx) {");
-    wln(self, "    if (idx < 0 || idx >= v->len) return NULL;");
-    wln(self, "    void* val = (void*)(intptr_t)P_VSLOT(v, idx);");
-    wln(self, "    memmove(&P_VSLOT(v, idx), &P_VSLOT(v, idx+1), (size_t)(v->len - idx - 1) * 8);");
-    wln(self, "    v->len--;");
-    wln(self, "    return val;");
+    wln(self, "    if (!v || idx < 0 || idx >= v->len) return NULL;");
+    wln(self, "    return (void*)(intptr_t)Vec_remove(0, (int64_t)(intptr_t)v, idx);");
     wln(self, "}");
-    wln(self, "void p_vec_reverse(PVec* v) {");
-    wln(self, "    for (int64_t i = 0, j = v->len - 1; i < j; i++, j--) { int64_t t = P_VSLOT(v, i); P_VSLOT(v, i) = P_VSLOT(v, j); P_VSLOT(v, j) = t; }");
-    wln(self, "}");
-    wln(self, "void p_vec_sort(PVec* v) {");
-    wln(self, "    for (int64_t i = 0; i < v->len; i++)");
-    wln(self, "        for (int64_t j = i+1; j < v->len; j++)");
-    wln(self, "            if (P_VSLOT(v, i) > P_VSLOT(v, j)) { int64_t t = P_VSLOT(v, i); P_VSLOT(v, i) = P_VSLOT(v, j); P_VSLOT(v, j) = t; }");
-    wln(self, "}");
-    wln(self, "void p_vec_truncate(PVec* v, int64_t len) { if (len < v->len) v->len = len; }");
+    wln(self, "void p_vec_reverse(PVec* v) { if (v) Vec_reverse(0, (int64_t)(intptr_t)v); }");
+    wln(self, "void p_vec_sort(PVec* v) { if (v) Vec_sort(0, (int64_t)(intptr_t)v); }");
+    wln(self, "void p_vec_truncate(PVec* v, int64_t len) { if (v) Vec_truncate(0, (int64_t)(intptr_t)v, len); }");
     wln(self, "");
     // Additional map functions
     wln(self, "PMap* p_map_clone(PMap* m) {");
@@ -17120,7 +17295,9 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    if (!pv || !pv->data) return;");
     wln(self, "    volatile char* p = (volatile char*)pv->data;");
     wln(self, "    int64_t pc = P_VEC_CODE((const int64_t*)pv);");
-    wln(self, "    int64_t esz = pc == 0 ? 8 : (pc < 0 ? -pc : pc);");
+    // BG40: an inline-struct code (>= 16) is (code - 15) * 8 bytes, as
+    // __p_sens_esz — pc alone wiped past the buffer's end
+    wln(self, "    int64_t esz = pc == 0 ? 8 : (pc < 0 ? -pc : (pc >= 16 ? (pc - 15) * 8 : pc));");
     wln(self, "    for (int64_t i = 0; i < pv->cap * esz; i++) p[i] = 0;");
     wln(self, "    p_sensitive_unmark(pv);");
     wln(self, "}");
@@ -17963,107 +18140,282 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "");
     wln(self, "// JSON builtins - simple key-value store");
     wln(self, "typedef struct { char** keys; char** vals; int64_t len; int64_t cap; int64_t is_array; } PJson;");
-    wln(self, "static char* _json_dump_obj(PJson* pj); // forward decl");
     wln(self, "void _json_append(PJson* j, const char* key, const char* val) {");
     wln(self, "    if (j->len >= j->cap) { j->cap = j->cap == 0 ? 8 : j->cap * 2; j->keys = (char**)realloc(j->keys, j->cap * sizeof(char*)); j->vals = (char**)realloc(j->vals, j->cap * sizeof(char*)); }");
     wln(self, "    j->keys[j->len] = key ? strdup(key) : strdup(\"\"); j->vals[j->len] = val ? strdup(val) : strdup(\"\"); j->len++;");
     wln(self, "}");
-    // BG97: a value that is an object or an array was read as a number up
-    // to the next `,`/`}`/space (`{"a":{"b":1}}` gave `{"a":"{\"b\":","b":1}`,
-    // not JSON). It is taken whole now: an object canonicalized as the
-    // outer one is, an array as it is written less its blanks; both are
-    // kept behind a mark byte (\x01) that the dump writes without quotes.
-    wln(self, "/* the end of the object or array at p: past its closing bracket (strings and");
-    wln(self, "   their escapes skipped) */");
-    wln(self, "static const char* _json_skip_nested(const char* p) {");
-    wln(self, "    int64_t depth = 0;");
-    wln(self, "    while (*p) {");
-    wln(self, "        char c = *p;");
-    wln(self, "        if (c == '\"') { p++; while (*p && *p != '\"') { if (*p == '\\\\' && p[1]) p++; p++; } if (*p) p++; continue; }");
-    wln(self, "        if (c == '{' || c == '[') depth++;");
-    wln(self, "        else if (c == '}' || c == ']') { depth--; if (depth <= 0) return p + 1; }");
-    wln(self, "        p++;");
+    wln(self, "/* BG162/BG204: JSON text is read into a tree of values by recursive descent,");
+    wln(self, "   as compiler/json.fd does for `fid run`, written out from the tree and the");
+    wln(self, "   tree freed: a string stays a string (the string 02134 is not a number),");
+    wln(self, "   escapes are read and written again, numbers print as `fid run` prints");
+    wln(self, "   them. BG161: every write goes through _jb_put, which grows the buffer.");
+    wln(self, "   Text that is not JSON panics, as it does under run. */");
+    wln(self, "typedef struct PJv { int t; char* s; size_t sl; struct PJv** a; char** k; size_t* kl; int64_t n; int64_t cap; } PJv;");
+    wln(self, "enum { PJV_NULL, PJV_TRUE, PJV_FALSE, PJV_NUM, PJV_STR, PJV_ARR, PJV_OBJ };");
+    wln(self, "typedef struct { char* b; size_t n; size_t cap; } PJb;");
+    wln(self, "static void _jb_put(PJb* b, const char* s, size_t n) {");
+    wln(self, "    if (b->n + n + 1 > b->cap) {");
+    wln(self, "        size_t c = b->cap ? b->cap : 64;");
+    wln(self, "        while (b->n + n + 1 > c) c *= 2;");
+    wln(self, "        char* nb = (char*)realloc(b->b, c);");
+    wln(self, "        if (!nb) p_panic(\"json: out of memory\");");
+    wln(self, "        b->b = nb; b->cap = c;");
     wln(self, "    }");
-    wln(self, "    return p;");
+    wln(self, "    if (n) memcpy(b->b + b->n, s, n);");
+    wln(self, "    b->n += n; b->b[b->n] = 0;");
     wln(self, "}");
-    wln(self, "/* the mark byte, then the text [a, b) less the blanks outside strings */");
-    wln(self, "static char* _json_raw_compact(const char* a, const char* b) {");
-    wln(self, "    char* r = (char*)malloc((size_t)(b - a) + 2); size_t n = 0; int in_s = 0;");
-    wln(self, "    r[n++] = '\\x01';");
-    wln(self, "    for (const char* q = a; q < b; q++) {");
-    wln(self, "        char c = *q;");
-    wln(self, "        if (in_s) { r[n++] = c; if (c == '\\\\' && q + 1 < b) { r[n++] = *++q; continue; } if (c == '\"') in_s = 0; continue; }");
-    wln(self, "        if (c == '\"') in_s = 1;");
-    wln(self, "        if (c == ' ' || c == '\\t' || c == '\\n' || c == '\\r') continue;");
-    wln(self, "        r[n++] = c;");
+    wln(self, "static void _jb_ch(PJb* b, char c) { _jb_put(b, &c, 1); }");
+    wln(self, "static void _jb_indent(PJb* b, int64_t n) { for (int64_t i = 0; i < n; i++) _jb_put(b, \"  \", 2); }");
+    wln(self, "static char* _jb_take(PJb* b) { if (!b->b) _jb_put(b, \"\", 0); return b->b; }");
+    wln(self, "/* the n bytes at s escaped for a JSON string; http: the escapes of the");
+    wln(self, "   interpreter's json_escape_body (backspace and form feed as u00XX) */");
+    wln(self, "static void _jb_esc(PJb* b, const char* s, size_t n, int http) {");
+    wln(self, "    static const char hx[] = \"0123456789abcdef\";");
+    wln(self, "    for (size_t i = 0; i < n; i++) {");
+    wln(self, "        unsigned char c = (unsigned char)s[i];");
+    wln(self, "        if (c == '\"') _jb_put(b, \"\\\\\\\"\", 2);");
+    wln(self, "        else if (c == '\\\\') _jb_put(b, \"\\\\\\\\\", 2);");
+    wln(self, "        else if (c == '\\n') _jb_put(b, \"\\\\n\", 2);");
+    wln(self, "        else if (c == '\\r') _jb_put(b, \"\\\\r\", 2);");
+    wln(self, "        else if (c == '\\t') _jb_put(b, \"\\\\t\", 2);");
+    wln(self, "        else if (c == 8 && !http) _jb_put(b, \"\\\\b\", 2);");
+    wln(self, "        else if (c == 12 && !http) _jb_put(b, \"\\\\f\", 2);");
+    wln(self, "        else if (c < 32) { char u[6] = { '\\\\', 'u', '0', '0', hx[c >> 4], hx[c & 15] }; _jb_put(b, u, 6); }");
+    wln(self, "        else _jb_ch(b, (char)c);");
     wln(self, "    }");
-    wln(self, "    r[n] = 0;");
-    wln(self, "    return r;");
+    wln(self, "}");
+    wln(self, "static PJv* _jv_new(int t) {");
+    wln(self, "    PJv* v = (PJv*)calloc(1, sizeof(PJv));");
+    wln(self, "    if (!v) p_panic(\"json: out of memory\");");
+    wln(self, "    v->t = t; return v;");
+    wln(self, "}");
+    wln(self, "static void _jv_free(PJv* v) {");
+    wln(self, "    if (!v) return;");
+    wln(self, "    for (int64_t i = 0; i < v->n; i++) { _jv_free(v->a[i]); if (v->k) free(v->k[i]); }");
+    wln(self, "    free(v->a); free(v->k); free(v->kl); free(v->s); free(v);");
+    wln(self, "}");
+    wln(self, "static void _jv_push(PJv* v, PJv* item, char* key, size_t kl) {");
+    wln(self, "    if (v->n >= v->cap) {");
+    wln(self, "        v->cap = v->cap ? v->cap * 2 : 8;");
+    wln(self, "        v->a = (PJv**)realloc(v->a, (size_t)v->cap * sizeof(PJv*));");
+    wln(self, "        if (v->t == PJV_OBJ) { v->k = (char**)realloc(v->k, (size_t)v->cap * sizeof(char*)); v->kl = (size_t*)realloc(v->kl, (size_t)v->cap * sizeof(size_t)); }");
+    wln(self, "        if (!v->a || (v->t == PJV_OBJ && (!v->k || !v->kl))) p_panic(\"json: out of memory\");");
+    wln(self, "    }");
+    wln(self, "    v->a[v->n] = item;");
+    wln(self, "    if (v->t == PJV_OBJ) { v->k[v->n] = key; v->kl[v->n] = kl; }");
+    wln(self, "    v->n++;");
+    wln(self, "}");
+    wln(self, "/* the parser: every scan stops at e (the text's end) */");
+    wln(self, "typedef struct { const char* s; const char* p; const char* e; int bad; char err[112]; } PJp;");
+    wln(self, "static void _jp_ws(PJp* q) { while (q->p < q->e && (*q->p == ' ' || *q->p == '\\t' || *q->p == '\\n' || *q->p == '\\r')) q->p++; }");
+    wln(self, "static PJv* _jp_fail(PJp* q, const char* m) { if (!q->bad) { q->bad = 1; snprintf(q->err, sizeof q->err, \"%s\", m); } return NULL; }");
+    wln(self, "static PJv* _jp_unexp(PJp* q, const char* what) {");
+    wln(self, "    char m[112]; snprintf(m, sizeof m, \"%s'%c' at position %lld\", what, *q->p, (long long)(q->p - q->s));");
+    wln(self, "    return _jp_fail(q, m);");
+    wln(self, "}");
+    wln(self, "static int _jp_hex(char c) {");
+    wln(self, "    if (c >= '0' && c <= '9') return c - '0';");
+    wln(self, "    if (c >= 'A' && c <= 'F') return c - 'A' + 10;");
+    wln(self, "    if (c >= 'a' && c <= 'f') return c - 'a' + 10;");
+    wln(self, "    return -1;");
+    wln(self, "}");
+    wln(self, "/* the string at q->p (its opening quote) into out, its escapes read */");
+    wln(self, "static int _jp_str(PJp* q, PJb* out) {");
+    wln(self, "    q->p++;");
+    wln(self, "    _jb_put(out, \"\", 0);");
+    wln(self, "    while (q->p < q->e) {");
+    wln(self, "        char c = *q->p++;");
+    wln(self, "        if (c == '\"') return 1;");
+    wln(self, "        if (c != '\\\\') { _jb_ch(out, c); continue; }");
+    wln(self, "        if (q->p >= q->e) { _jp_fail(q, \"Unterminated escape sequence\"); return 0; }");
+    wln(self, "        char x = *q->p++;");
+    wln(self, "        if (x == '\"' || x == '\\\\' || x == '/') _jb_ch(out, x);");
+    wln(self, "        else if (x == 'n') _jb_ch(out, '\\n');");
+    wln(self, "        else if (x == 'r') _jb_ch(out, '\\r');");
+    wln(self, "        else if (x == 't') _jb_ch(out, '\\t');");
+    wln(self, "        else if (x == 'b') _jb_ch(out, 8);");
+    wln(self, "        else if (x == 'f') _jb_ch(out, 12);");
+    wln(self, "        else if (x == 'u') {");
+    wln(self, "            int code = 0;");
+    wln(self, "            if (q->e - q->p < 4) { _jp_fail(q, \"Invalid unicode escape\"); return 0; }");
+    wln(self, "            for (int i = 0; i < 4; i++) { int d = _jp_hex(q->p[i]); if (d < 0) { _jp_fail(q, \"Invalid unicode escape\"); return 0; } code = code * 16 + d; }");
+    wln(self, "            q->p += 4;");
+    wln(self, "            if (code < 128) _jb_ch(out, (char)code);");
+    wln(self, "            else if (code < 2048) { _jb_ch(out, (char)(192 | (code >> 6))); _jb_ch(out, (char)(128 | (code & 63))); }");
+    wln(self, "            else { _jb_ch(out, (char)(224 | (code >> 12))); _jb_ch(out, (char)(128 | ((code >> 6) & 63))); _jb_ch(out, (char)(128 | (code & 63))); }");
+    wln(self, "        } else {");
+    wln(self, "            char m[40]; snprintf(m, sizeof m, \"Invalid escape character '%c'\", x);");
+    wln(self, "            _jp_fail(q, m); return 0;");
+    wln(self, "        }");
+    wln(self, "    }");
+    wln(self, "    _jp_fail(q, \"Unterminated string\"); return 0;");
+    wln(self, "}");
+    wln(self, "#define PJ_MAX_DEPTH 1000");
+    wln(self, "static PJv* _jp_val(PJp* q, int depth) {");
+    wln(self, "    _jp_ws(q);");
+    wln(self, "    if (q->p >= q->e) return _jp_fail(q, \"Unexpected end of input\");");
+    wln(self, "    if (depth > PJ_MAX_DEPTH) return _jp_fail(q, \"nested too deeply\");");
+    wln(self, "    char c = *q->p;");
+    wln(self, "    size_t left = (size_t)(q->e - q->p);");
+    wln(self, "    if (c == 'n') {");
+    wln(self, "        if (left >= 4 && memcmp(q->p, \"null\", 4) == 0) { q->p += 4; return _jv_new(PJV_NULL); }");
+    wln(self, "        return _jp_fail(q, \"Invalid null literal\");");
+    wln(self, "    }");
+    wln(self, "    if (c == 't' || c == 'f') {");
+    wln(self, "        if (left >= 4 && memcmp(q->p, \"true\", 4) == 0) { q->p += 4; return _jv_new(PJV_TRUE); }");
+    wln(self, "        if (left >= 5 && memcmp(q->p, \"false\", 5) == 0) { q->p += 5; return _jv_new(PJV_FALSE); }");
+    wln(self, "        return _jp_fail(q, \"Invalid boolean literal\");");
+    wln(self, "    }");
+    wln(self, "    if (c == '\"') {");
+    wln(self, "        PJb sb = {0};");
+    wln(self, "        if (!_jp_str(q, &sb)) { free(sb.b); return NULL; }");
+    wln(self, "        PJv* v = _jv_new(PJV_STR); v->s = _jb_take(&sb); v->sl = sb.n;");
+    wln(self, "        return v;");
+    wln(self, "    }");
+    wln(self, "    if (c == '-' || (c >= '0' && c <= '9')) {");
+    wln(self, "        const char* st = q->p;");
+    wln(self, "        if (*q->p == '-') q->p++;");
+    wln(self, "        while (q->p < q->e && *q->p >= '0' && *q->p <= '9') q->p++;");
+    wln(self, "        if (q->p < q->e && *q->p == '.') { q->p++; while (q->p < q->e && *q->p >= '0' && *q->p <= '9') q->p++; }");
+    wln(self, "        if (q->p < q->e && (*q->p == 'e' || *q->p == 'E')) {");
+    wln(self, "            q->p++;");
+    wln(self, "            if (q->p < q->e && (*q->p == '+' || *q->p == '-')) q->p++;");
+    wln(self, "            while (q->p < q->e && *q->p >= '0' && *q->p <= '9') q->p++;");
+    wln(self, "        }");
+    wln(self, "        PJb nb = {0}; _jb_put(&nb, st, (size_t)(q->p - st));");
+    wln(self, "        PJv* v = _jv_new(PJV_NUM); v->s = _jb_take(&nb); v->sl = nb.n;");
+    wln(self, "        return v;");
+    wln(self, "    }");
+    wln(self, "    if (c == '[') {");
+    wln(self, "        PJv* v = _jv_new(PJV_ARR);");
+    wln(self, "        q->p++; _jp_ws(q);");
+    wln(self, "        if (q->p < q->e && *q->p == ']') { q->p++; return v; }");
+    wln(self, "        for (;;) {");
+    wln(self, "            PJv* it = _jp_val(q, depth + 1);");
+    wln(self, "            if (!it) { _jv_free(v); return NULL; }");
+    wln(self, "            _jv_push(v, it, NULL, 0);");
+    wln(self, "            _jp_ws(q);");
+    wln(self, "            if (q->p >= q->e) { _jv_free(v); return _jp_fail(q, \"Unterminated array\"); }");
+    wln(self, "            if (*q->p == ',') { q->p++; continue; }");
+    wln(self, "            if (*q->p == ']') { q->p++; return v; }");
+    wln(self, "            _jv_free(v); return _jp_unexp(q, \"Expected ',' or ']' but got \");");
+    wln(self, "        }");
+    wln(self, "    }");
+    wln(self, "    if (c == '{') {");
+    wln(self, "        PJv* v = _jv_new(PJV_OBJ);");
+    wln(self, "        q->p++; _jp_ws(q);");
+    wln(self, "        if (q->p < q->e && *q->p == '}') { q->p++; return v; }");
+    wln(self, "        for (;;) {");
+    wln(self, "            _jp_ws(q);");
+    wln(self, "            if (q->p >= q->e || *q->p != '\"') { _jv_free(v); return _jp_fail(q, \"Expected string key in object\"); }");
+    wln(self, "            PJb kb = {0};");
+    wln(self, "            if (!_jp_str(q, &kb)) { free(kb.b); _jv_free(v); return NULL; }");
+    wln(self, "            _jp_ws(q);");
+    wln(self, "            if (q->p >= q->e || *q->p != ':') { free(kb.b); _jv_free(v); return _jp_fail(q, \"Expected ':' after key in object\"); }");
+    wln(self, "            q->p++;");
+    wln(self, "            PJv* it = _jp_val(q, depth + 1);");
+    wln(self, "            if (!it) { free(kb.b); _jv_free(v); return NULL; }");
+    wln(self, "            _jv_push(v, it, _jb_take(&kb), kb.n);");
+    wln(self, "            _jp_ws(q);");
+    wln(self, "            if (q->p >= q->e) { _jv_free(v); return _jp_fail(q, \"Unterminated object\"); }");
+    wln(self, "            if (*q->p == ',') { q->p++; continue; }");
+    wln(self, "            if (*q->p == '}') { q->p++; return v; }");
+    wln(self, "            _jv_free(v); return _jp_unexp(q, \"Expected ',' or '}' but got \");");
+    wln(self, "        }");
+    wln(self, "    }");
+    wln(self, "    return _jp_unexp(q, \"Unexpected character \");");
+    wln(self, "}");
+    wln(self, "/* the whole text s as one value (NULL and q->err when it is not JSON) */");
+    wln(self, "static PJv* _jv_parse(const char* s, PJp* q) {");
+    wln(self, "    memset(q, 0, sizeof *q);");
+    wln(self, "    q->s = s; q->p = s; q->e = s + strlen(s);");
+    wln(self, "    _jp_ws(q);");
+    wln(self, "    PJv* v = _jp_val(q, 0);");
+    wln(self, "    if (!v) return NULL;");
+    wln(self, "    _jp_ws(q);");
+    wln(self, "    if (q->p < q->e) {");
+    wln(self, "        char m[80]; snprintf(m, sizeof m, \"Unexpected trailing characters at position %lld\", (long long)(q->p - q->s));");
+    wln(self, "        _jv_free(v); return _jp_fail(q, m);");
+    wln(self, "    }");
+    wln(self, "    return v;");
+    wln(self, "}");
+    wln(self, "static PJv* _jv_parse_or_panic(const char* s, const char* who) {");
+    wln(self, "    PJp q;");
+    wln(self, "    PJv* v = _jv_parse(s, &q);");
+    wln(self, "    if (!v) { char m[160]; snprintf(m, sizeof m, \"%s: %s\", who, q.err); p_panic(m); }");
+    wln(self, "    return v;");
+    wln(self, "}");
+    wln(self, "/* a number as compiler/json.fd format_number prints it */");
+    wln(self, "static void _jv_num(PJb* b, const char* s) {");
+    wln(self, "    double d = strtod(s, NULL);");
+    wln(self, "    if (d > -1e15 && d < 1e15 && d == (double)(int64_t)d) {");
+    wln(self, "        char t[32]; int l = snprintf(t, sizeof t, \"%lld\", (long long)(int64_t)d);");
+    wln(self, "        _jb_put(b, t, (size_t)l); return;");
+    wln(self, "    }");
+    wln(self, "    char* f = p_to_str_float(d);");
+    wln(self, "    _jb_put(b, f, strlen(f)); p_str_free_c(f);");
+    wln(self, "}");
+    wln(self, "typedef struct { const char* k; size_t kl; int64_t i; } PJk;");
+    wln(self, "static int _jk_cmp(const void* x, const void* y) {");
+    wln(self, "    const PJk* a = (const PJk*)x; const PJk* b = (const PJk*)y;");
+    wln(self, "    size_t m = a->kl < b->kl ? a->kl : b->kl;");
+    wln(self, "    int c = m ? memcmp(a->k, b->k, m) : 0;");
+    wln(self, "    if (c) return c;");
+    wln(self, "    if (a->kl != b->kl) return a->kl < b->kl ? -1 : 1;");
+    wln(self, "    return a->i < b->i ? -1 : (a->i > b->i ? 1 : 0);");
+    wln(self, "}");
+    wln(self, "/* v as JSON text: an object's members sorted by key, a later duplicate key");
+    wln(self, "   winning; pretty: 2-space indentation, `fid run`'s p_json_pretty */");
+    wln(self, "static void _jv_dump(PJb* b, const PJv* v, int pretty, int64_t ind) {");
+    wln(self, "    if (v->t == PJV_NULL) { _jb_put(b, \"null\", 4); return; }");
+    wln(self, "    if (v->t == PJV_TRUE) { _jb_put(b, \"true\", 4); return; }");
+    wln(self, "    if (v->t == PJV_FALSE) { _jb_put(b, \"false\", 5); return; }");
+    wln(self, "    if (v->t == PJV_NUM) { _jv_num(b, v->s); return; }");
+    wln(self, "    if (v->t == PJV_STR) { _jb_ch(b, '\"'); _jb_esc(b, v->s, v->sl, 0); _jb_ch(b, '\"'); return; }");
+    wln(self, "    if (v->n == 0) { _jb_put(b, v->t == PJV_ARR ? \"[]\" : \"{}\", 2); return; }");
+    wln(self, "    if (v->t == PJV_ARR) {");
+    wln(self, "        _jb_ch(b, '[');");
+    wln(self, "        for (int64_t i = 0; i < v->n; i++) {");
+    wln(self, "            if (i > 0) _jb_ch(b, ',');");
+    wln(self, "            if (pretty) { _jb_ch(b, '\\n'); _jb_indent(b, ind + 1); }");
+    wln(self, "            _jv_dump(b, v->a[i], pretty, ind + 1);");
+    wln(self, "        }");
+    wln(self, "        if (pretty) { _jb_ch(b, '\\n'); _jb_indent(b, ind); }");
+    wln(self, "        _jb_ch(b, ']');");
+    wln(self, "        return;");
+    wln(self, "    }");
+    wln(self, "    PJk* ks = (PJk*)malloc((size_t)v->n * sizeof(PJk));");
+    wln(self, "    if (!ks) p_panic(\"json: out of memory\");");
+    wln(self, "    for (int64_t i = 0; i < v->n; i++) { ks[i].k = v->k[i]; ks[i].kl = v->kl[i]; ks[i].i = i; }");
+    wln(self, "    qsort(ks, (size_t)v->n, sizeof(PJk), _jk_cmp);");
+    wln(self, "    _jb_ch(b, '{');");
+    wln(self, "    int first = 1;");
+    wln(self, "    for (int64_t i = 0; i < v->n; i++) {");
+    wln(self, "        if (i + 1 < v->n && ks[i].kl == ks[i + 1].kl && (ks[i].kl == 0 || memcmp(ks[i].k, ks[i + 1].k, ks[i].kl) == 0)) continue;");
+    wln(self, "        if (!first) _jb_ch(b, ',');");
+    wln(self, "        first = 0;");
+    wln(self, "        if (pretty) { _jb_ch(b, '\\n'); _jb_indent(b, ind + 1); }");
+    wln(self, "        _jb_ch(b, '\"'); _jb_esc(b, ks[i].k, ks[i].kl, 0); _jb_ch(b, '\"'); _jb_ch(b, ':');");
+    wln(self, "        if (pretty) _jb_ch(b, ' ');");
+    wln(self, "        _jv_dump(b, v->a[ks[i].i], pretty, ind + 1);");
+    wln(self, "    }");
+    wln(self, "    if (pretty) { _jb_ch(b, '\\n'); _jb_indent(b, ind); }");
+    wln(self, "    _jb_ch(b, '}');");
+    wln(self, "    free(ks);");
+    wln(self, "}");
+    wln(self, "static char* _jv_text(const char* s, int pretty, const char* who) {");
+    wln(self, "    PJv* v = _jv_parse_or_panic(s, who);");
+    wln(self, "    if (!v) return strdup(\"null\");");
+    wln(self, "    PJb b = {0};");
+    wln(self, "    _jv_dump(&b, v, pretty, 0);");
+    wln(self, "    _jv_free(v);");
+    wln(self, "    return _jb_take(&b);");
     wln(self, "}");
     wln(self, "static char* p_json_parse__raw(const char* s);");
     wln(self, "char* p_json_parse(const char* s) { return p_str_own_libc_c(p_json_parse__raw(s)); }");
     wln(self, "static char* p_json_parse__raw(const char* s) {");
     wln(self, "    if (!s) return strdup(\"\");");
-    wln(self, "    // Simple JSON parser: extracts string and number values");
-    wln(self, "    PJson* j = (PJson*)p_json_new_object();");
-    wln(self, "    const char* p = s;");
-    wln(self, "    while (*p) {");
-    wln(self, "        // Skip whitespace and structural chars");
-    wln(self, "        while (*p && *p != '\"' && *p != '-' && (*p < '0' || *p > '9') && *p != 't' && *p != 'f' && *p != 'n') p++;");
-    wln(self, "        if (!*p) break;");
-    wln(self, "        // Try to parse a key (string followed by colon)");
-    wln(self, "        if (*p == '\"' && p > s && p[-1] != ':') {");
-    wln(self, "            p++; const char* kstart = p;");
-    wln(self, "            while (*p && *p != '\"') p++;");
-    wln(self, "            size_t klen = p - kstart;");
-    wln(self, "            if (*p) p++;");
-    wln(self, "            // Skip whitespace and colon");
-    wln(self, "            while (*p && *p != ':') p++;");
-    wln(self, "            if (*p) p++;");
-    wln(self, "            while (*p == ' ' || *p == '\\t' || *p == '\\n' || *p == '\\r') p++;");
-    wln(self, "            // Parse value");
-    wln(self, "            char* key = (char*)malloc(klen+1); memcpy(key, kstart, klen); key[klen] = 0;");
-    wln(self, "            if (*p == '{' || *p == '[') {");
-    // BG97: a nested object or array, whole
-    wln(self, "                const char* vstart = p;");
-    wln(self, "                p = _json_skip_nested(p);");
-    wln(self, "                char* val;");
-    wln(self, "                if (*vstart == '{') {");
-    wln(self, "                    size_t sl = (size_t)(p - vstart);");
-    wln(self, "                    char* sub = (char*)malloc(sl + 1); memcpy(sub, vstart, sl); sub[sl] = 0;");
-    wln(self, "                    char* canon = p_json_parse__raw(sub); free(sub);");
-    wln(self, "                    size_t cl = strlen(canon);");
-    wln(self, "                    val = (char*)malloc(cl + 2); val[0] = '\\x01'; memcpy(val + 1, canon, cl + 1); free(canon);");
-    wln(self, "                } else {");
-    wln(self, "                    val = _json_raw_compact(vstart, p);");
-    wln(self, "                }");
-    wln(self, "                _json_append(j, key, val); free(key); free(val);");
-    wln(self, "            } else if (*p == '\"') {");
-    wln(self, "                p++; const char* vstart = p;");
-    wln(self, "                while (*p && *p != '\"') p++;");
-    wln(self, "                size_t vlen = p - vstart;");
-    wln(self, "                if (*p) p++;");
-    wln(self, "                char* val = (char*)malloc(vlen+1); memcpy(val, vstart, vlen); val[vlen] = 0;");
-    wln(self, "                _json_append(j, key, val); free(key); free(val);");
-    wln(self, "            } else if (*p == 't') {");
-    wln(self, "                _json_append(j, key, \"true\"); free(key); p += 4;");
-    wln(self, "            } else if (*p == 'f') {");
-    wln(self, "                _json_append(j, key, \"false\"); free(key); p += 5;");
-    wln(self, "            } else if (*p == 'n') {");
-    wln(self, "                _json_append(j, key, \"null\"); free(key); p += 4;");
-    wln(self, "            } else {");
-    wln(self, "                const char* vstart = p;");
-    wln(self, "                while (*p && *p != ',' && *p != '}' && *p != ']' && *p != ' ') p++;");
-    wln(self, "                size_t vlen = p - vstart;");
-    wln(self, "                char* val = (char*)malloc(vlen+1); memcpy(val, vstart, vlen); val[vlen] = 0;");
-    wln(self, "                _json_append(j, key, val); free(key); free(val);");
-    wln(self, "            }");
-    wln(self, "        } else {");
-    wln(self, "            p++;");
-    wln(self, "        }");
-    wln(self, "    }");
-    wln(self, "    char* result = _json_dump_obj(j);");
-    wln(self, "    return result;");
+    wln(self, "    return _jv_text(s, 0, \"json_parse\");");
     wln(self, "}");
     wln(self, "void* p_json_new_object(void) {");
     wln(self, "    PJson* j = (PJson*)malloc(sizeof(PJson));");
@@ -18080,39 +18432,6 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "void p_json_append(void* j, const char* val) { _json_append((PJson*)j, NULL, val); }");
     wln(self, "void p_json_append_int(void* j, int64_t val) { char buf[32]; snprintf(buf,sizeof(buf),\"%lld\",(long long)val); _json_append((PJson*)j, NULL, buf); }");
     wln(self, "void p_json_append_float(void* j, double val) { char buf[32]; snprintf(buf,sizeof(buf),\"%g\",val); _json_append((PJson*)j, NULL, buf); }");
-    wln(self, "// Internal: dump PJson object to string (sorted keys, no quotes on numbers/bools)");
-    wln(self, "static char* _json_dump_obj(PJson* pj) {");
-    wln(self, "    if (!pj) return strdup(\"{}\");");
-    wln(self, "    // Sort keys (simple insertion sort) for objects");
-    wln(self, "    if (!pj->is_array) {");
-    wln(self, "        for (int64_t i = 1; i < pj->len; i++) {");
-    wln(self, "            char* k = pj->keys[i]; char* v = pj->vals[i];");
-    wln(self, "            int64_t j = i - 1;");
-    wln(self, "            while (j >= 0 && strcmp(pj->keys[j], k) > 0) { pj->keys[j+1] = pj->keys[j]; pj->vals[j+1] = pj->vals[j]; j--; }");
-    wln(self, "            pj->keys[j+1] = k; pj->vals[j+1] = v;");
-    wln(self, "        }");
-    wln(self, "    }");
-    wln(self, "    size_t cap = 64; char* result = (char*)malloc(cap); size_t pos = 0;");
-    wln(self, "    result[pos++] = pj->is_array ? '[' : '{';");
-    wln(self, "    for (int64_t i = 0; i < pj->len; i++) {");
-    wln(self, "        if (i > 0) { if (pos+1>=cap){cap*=2;result=(char*)realloc(result,cap);} result[pos++]=','; }");
-    wln(self, "        if (!pj->is_array) { size_t kl=strlen(pj->keys[i]); if (pos+kl+4>=cap){cap=(cap+kl)*2;result=(char*)realloc(result,cap);} result[pos++]='\"'; memcpy(result+pos,pj->keys[i],kl); pos+=kl; result[pos++]='\"'; result[pos++]=':'; }");
-    wln(self, "        // Don't quote numbers, booleans, null");
-    wln(self, "        const char* v = pj->vals[i];");
-    // BG97: a nested object or array (behind its mark) as it is
-    wln(self, "        if (*v == '\\x01') { size_t rl = strlen(v + 1); if (pos+rl+3>=cap){cap=(cap+rl)*2;result=(char*)realloc(result,cap);} memcpy(result+pos,v+1,rl); pos+=rl; continue; }");
-    wln(self, "        bool is_numeric = (*v >= '0' && *v <= '9') || *v == '-';");
-    wln(self, "        bool is_bool = strcmp(v, \"true\") == 0 || strcmp(v, \"false\") == 0;");
-    wln(self, "        bool is_null = strcmp(v, \"null\") == 0;");
-    wln(self, "        bool need_quotes = !is_numeric && !is_bool && !is_null;");
-    wln(self, "        size_t vl=strlen(v); if (pos+vl+3>=cap){cap=(cap+vl)*2;result=(char*)realloc(result,cap);}");
-    wln(self, "        if (need_quotes) { result[pos++]='\"'; memcpy(result+pos,v,vl); pos+=vl; result[pos++]='\"'; }");
-    wln(self, "        else { memcpy(result+pos,v,vl); pos+=vl; }");
-    wln(self, "    }");
-    wln(self, "    if (pos+2>=cap){cap+=2;result=(char*)realloc(result,cap);}");
-    wln(self, "    result[pos++] = pj->is_array ? ']' : '}'; result[pos] = 0;");
-    wln(self, "    return result;");
-    wln(self, "}");
     wln(self, "// User-facing: parse JSON string and re-dump in canonical form");
     wln(self, "static char* p_json_dump__raw(void* j);");
     wln(self, "char* p_json_dump(void* j) { return p_str_own_c(p_json_dump__raw(j)); }");
@@ -18123,40 +18442,9 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "static char* p_json_pretty__raw(void* j);");
     wln(self, "char* p_json_pretty(void* j) { return p_str_own_libc_c(p_json_pretty__raw(j)); }");
     wln(self, "static char* p_json_pretty__raw(void* j) {");
-    wln(self, "    // Pretty-print with 2-space indentation (canonicalize first)");
-    wln(self, "    char* canonical = p_json_parse((const char*)j);");
-    wln(self, "    const char* s = canonical;");
-    wln(self, "    if (!s) return strdup(\"\");");
-    wln(self, "    size_t cap = strlen(s) * 4 + 64; char* result = (char*)malloc(cap); size_t pos = 0;");
-    wln(self, "    int indent = 0; bool in_str = false;");
-    wln(self, "    while (*s) {");
-    wln(self, "        if (*s == '\"' && (s == (const char*)j || s[-1] != '\\\\')) in_str = !in_str;");
-    wln(self, "        if (!in_str) {");
-    wln(self, "            if (*s == '{' || *s == '[') {");
-    wln(self, "                result[pos++] = *s++; result[pos++] = '\\n';");
-    wln(self, "                indent++;");
-    wln(self, "                for (int i = 0; i < indent*2; i++) result[pos++] = ' ';");
-    wln(self, "                continue;");
-    wln(self, "            }");
-    wln(self, "            if (*s == '}' || *s == ']') {");
-    wln(self, "                result[pos++] = '\\n'; indent--;");
-    wln(self, "                for (int i = 0; i < indent*2; i++) result[pos++] = ' ';");
-    wln(self, "                result[pos++] = *s++;");
-    wln(self, "                continue;");
-    wln(self, "            }");
-    wln(self, "            if (*s == ',') {");
-    wln(self, "                result[pos++] = *s++; result[pos++] = '\\n';");
-    wln(self, "                for (int i = 0; i < indent*2; i++) result[pos++] = ' ';");
-    wln(self, "                continue;");
-    wln(self, "            }");
-    wln(self, "            if (*s == ':') { result[pos++] = *s++; result[pos++] = ' '; continue; }");
-    wln(self, "        }");
-    wln(self, "        if (pos >= cap-1) { cap *= 2; result = (char*)realloc(result, cap); }");
-    wln(self, "        result[pos++] = *s++;");
-    wln(self, "    }");
-    wln(self, "    result[pos] = 0;");
-    wln(self, "    p_str_free_c(canonical);");
-    wln(self, "    return result;");
+    wln(self, "    // BG161: written from the tree, the buffer grown as it fills");
+    wln(self, "    if (!j) return strdup(\"\");");
+    wln(self, "    return _jv_text((const char*)j, 1, \"json_pretty\");");
     wln(self, "}");
     wln(self, "static char* p_json_string__raw(void* j);");
     wln(self, "char* p_json_string(void* j) { return p_str_own_libc_c(p_json_string__raw(j)); }");
@@ -18189,55 +18477,20 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "static char* p_json_get__raw(void* j, const char* key);");
     wln(self, "char* p_json_get(void* j, const char* key) { return p_str_own_libc_c(p_json_get__raw(j, key)); }");
     wln(self, "static char* p_json_get__raw(void* j, const char* key) {");
+    wln(self, "    // BG162: the member of the top-level object, as `fid run` finds it (a");
+    wln(self, "    // string comes back quoted and escaped, a later duplicate key wins)");
     wln(self, "    const char* s = (const char*)j;");
     wln(self, "    if (!s || !key) return strdup(\"null\");");
+    wln(self, "    PJp q;");
+    wln(self, "    PJv* v = _jv_parse(s, &q);");
+    wln(self, "    if (!v || v->t != PJV_OBJ) { _jv_free(v); p_panic(\"json_get: not an object\"); return strdup(\"null\"); }");
     wln(self, "    size_t klen = strlen(key);");
-    wln(self, "    const char* p = s;");
-    wln(self, "    while (*p) {");
-    wln(self, "        if (*p == '\"') {");
-    wln(self, "            const char* ks = p + 1;");
-    wln(self, "            const char* ke = ks;");
-    wln(self, "            while (*ke && *ke != '\"') { if (*ke == '\\\\' && ke[1]) ke += 2; else ke++; }");
-    wln(self, "            if (*ke == '\"' && (size_t)(ke - ks) == klen && strncmp(ks, key, klen) == 0) {");
-    wln(self, "                const char* c = ke + 1;");
-    wln(self, "                while (*c == ' ' || *c == '\\t') c++;");
-    wln(self, "                if (*c == ':') {");
-    wln(self, "                    c++;");
-    wln(self, "                    while (*c == ' ' || *c == '\\t') c++;");
-    wln(self, "                    if (*c == '\"') {");
-    wln(self, "                        const char* end = c + 1;");
-    wln(self, "                        while (*end) { if (*end == '\\\\' && end[1]) end += 2; else if (*end == '\"') break; else end++; }");
-    wln(self, "                        size_t len = end - c + 1;");
-    wln(self, "                        char* result = (char*)malloc(len+1); memcpy(result, c, len); result[len] = 0;");
-    wln(self, "                        return result;");
-    wln(self, "                    }");
-    wln(self, "                    if (*c == '{' || *c == '[') {");
-    wln(self, "                        char open = *c; char close = open == '{' ? '}' : ']';");
-    wln(self, "                        int depth = 1; const char* end = c + 1;");
-    wln(self, "                        while (*end && depth > 0) {");
-    wln(self, "                            if (*end == '\"') { const char* se = end + 1; while (*se) { if (*se == '\\\\' && se[1]) se += 2; else if (*se == '\"') { end = se; break; } else se++; } if (*se != '\"') { end = se; break; } end++; continue; }");
-    wln(self, "                            if (*end == open) depth++;");
-    wln(self, "                            if (*end == close) depth--;");
-    wln(self, "                            if (depth > 0) end++;");
-    wln(self, "                        }");
-    wln(self, "                        size_t len = end - c + 1;");
-    wln(self, "                        char* result = (char*)malloc(len+1); memcpy(result, c, len); result[len] = 0;");
-    // every return of the raw function is the C library's (p_str_own_libc_c)
-    wln(self, "                        char* canonical = p_json_parse(result); free(result);");
-    wln(self, "                        char* cr = strdup(canonical ? canonical : \"null\"); p_str_free_c(canonical);");
-    wln(self, "                        return cr;");
-    wln(self, "                    }");
-    wln(self, "                    const char* end = c;");
-    wln(self, "                    while (*end && *end != ',' && *end != '}' && *end != ']' && *end != ' ' && *end != '\\n') end++;");
-    wln(self, "                    size_t len = end - c;");
-    wln(self, "                    char* result = (char*)malloc(len+1); memcpy(result, c, len); result[len] = 0;");
-    wln(self, "                    return result;");
-    wln(self, "                }");
-    wln(self, "            }");
-    wln(self, "            p = ke + 1;");
-    wln(self, "        } else { p++; }");
-    wln(self, "    }");
-    wln(self, "    return strdup(\"null\");");
+    wln(self, "    int64_t at = -1;");
+    wln(self, "    for (int64_t i = 0; i < v->n; i++) if (v->kl[i] == klen && memcmp(v->k[i], key, klen) == 0) at = i;");
+    wln(self, "    PJb b = {0};");
+    wln(self, "    if (at < 0) _jb_put(&b, \"null\", 4); else _jv_dump(&b, v->a[at], 0, 0);");
+    wln(self, "    _jv_free(v);");
+    wln(self, "    return _jb_take(&b);");
     wln(self, "}");
     // VF14: p_json_get's text is a counted string of the block allocator,
     // not the C library's (free() of it corrupted the C heap)
@@ -18338,69 +18591,79 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    snprintf(resp, blen+256, \"HTTP/1.1 %lld %s\\r\\nContent-Length: %zu\\r\\n\\r\\n%s\", (long long)status, p_http_reason(status), blen, body);");
     wln(self, "    return resp;");
     wln(self, "}");
+    wln(self, "/* BG160: the request is read as the interpreter reads it (p_http_parse_request");
+    wln(self, "   in compiler/interp.fd); every scan stops at the text's end and the result");
+    wln(self, "   grows as it is written (a long path overflowed a 1024-byte buffer, a");
+    wln(self, "   request line without CRLF was read past its NUL); its texts are escaped,");
+    wln(self, "   so the result is always JSON */");
+    wln(self, "static const char* _jh_find(const char* from, const char* e, const char* pat, size_t pl) {");
+    wln(self, "    for (const char* p = from; p + pl <= e; p++) if (memcmp(p, pat, pl) == 0) return p;");
+    wln(self, "    return NULL;");
+    wln(self, "}");
+    wln(self, "static int _jh_blank(char c) { return c == ' ' || c == '\\t' || c == '\\n' || c == '\\r'; }");
     wln(self, "static char* p_http_parse_request__raw(const char* request);");
     wln(self, "char* p_http_parse_request(const char* request) { return p_str_own_libc_c(p_http_parse_request__raw(request)); }");
     wln(self, "static char* p_http_parse_request__raw(const char* request) {");
     wln(self, "    if (!request) return strdup(\"{}\");");
-    wln(self, "    // Parse request line: METHOD PATH HTTP/VERSION");
-    wln(self, "    const char* p = request;");
-    wln(self, "    const char* line_end = strstr(p, \"\\r\\n\");");
-    wln(self, "    if (!line_end) line_end = p + strlen(p);");
-    wln(self, "    // Extract method");
-    wln(self, "    const char* sp1 = strchr(p, ' ');");
-    wln(self, "    char method[16] = {0};");
-    wln(self, "    if (sp1 && sp1 < line_end) { size_t ml = sp1 - p; if (ml > 15) ml = 15; memcpy(method, p, ml); }");
-    wln(self, "    // Extract path");
-    wln(self, "    const char* path_start = sp1 ? sp1 + 1 : p;");
-    wln(self, "    const char* sp2 = strchr(path_start, ' ');");
-    wln(self, "    char path[1024] = {0};");
-    wln(self, "    if (sp2 && sp2 < line_end) { size_t pl = sp2 - path_start; if (pl > 1023) pl = 1023; memcpy(path, path_start, pl); }");
-    wln(self, "    // Extract version");
-    wln(self, "    const char* ver_start = sp2 ? sp2 + 1 : p;");
-    wln(self, "    char version[16] = {0};");
-    wln(self, "    if (ver_start < line_end) { size_t vl = line_end - ver_start; if (vl > 15) vl = 15; memcpy(version, ver_start, vl); }");
-    wln(self, "    // Strip HTTP/ prefix");
-    wln(self, "    const char* v = version;");
-    wln(self, "    if (strncmp(v, \"HTTP/\", 5) == 0) v += 5;");
-    wln(self, "    // Parse headers until empty line");
-    wln(self, "    p = line_end + 2; // skip \\r\\n");
-    wln(self, "    size_t cap = 1024; char* result = (char*)malloc(cap); size_t pos = 0;");
-    wln(self, "    pos += snprintf(result+pos, cap-pos, \"{\\\"method\\\":\\\"%s\\\",\\\"path\\\":\\\"%s\\\",\\\"version\\\":\\\"%s\\\",\\\"headers\\\":{\", method, path, v);");
-    wln(self, "    int first_hdr = 1;");
-    wln(self, "    while (*p) {");
-    wln(self, "        const char* next_line = strstr(p, \"\\r\\n\");");
-    wln(self, "        if (!next_line) break;");
-    wln(self, "        if (next_line == p) { p += 2; break; } // empty line = end of headers");
-    wln(self, "        // Find colon");
-    wln(self, "        const char* colon = strchr(p, ':');");
-    wln(self, "        if (colon && colon < next_line) {");
-    wln(self, "            size_t kl = colon - p;");
-    wln(self, "            const char* val_start = colon + 1;");
-    wln(self, "            while (*val_start == ' ') val_start++;");
-    wln(self, "            size_t vl = next_line - val_start;");
-    wln(self, "            if (!first_hdr) pos += snprintf(result+pos, cap-pos, \",\");");
+    wln(self, "    const char* s = request;");
+    wln(self, "    const char* e = s + strlen(s);");
+    wln(self, "    // Request line: METHOD PATH HTTP/VERSION");
+    wln(self, "    const char* le = _jh_find(s, e, \"\\r\\n\", 2);");
+    wln(self, "    const char* rl_end = le ? le : e;");
+    wln(self, "    const char* pos = le ? le + 2 : e;");
+    wln(self, "    const char* m = s; size_t ml = (size_t)(rl_end - s);");
+    wln(self, "    const char* path = \"/\"; size_t pl = 1;");
+    wln(self, "    const char* vf = \"HTTP/1.1\"; size_t vfl = 8;");
+    wln(self, "    const char* sp1 = (const char*)memchr(s, ' ', (size_t)(rl_end - s));");
+    wln(self, "    if (sp1) {");
+    wln(self, "        ml = (size_t)(sp1 - s);");
+    wln(self, "        const char* sp2 = (const char*)memchr(sp1 + 1, ' ', (size_t)(rl_end - (sp1 + 1)));");
+    wln(self, "        path = sp1 + 1;");
+    wln(self, "        if (!sp2) pl = (size_t)(rl_end - path);");
+    wln(self, "        else { pl = (size_t)(sp2 - path); vf = sp2 + 1; vfl = (size_t)(rl_end - vf); }");
+    wln(self, "    }");
+    wln(self, "    const char* ver = \"1.1\"; size_t vl = 3;");
+    wln(self, "    if (vfl >= 5 && memcmp(vf, \"HTTP/\", 5) == 0) { ver = vf + 5; vl = vfl - 5; }");
+    wln(self, "    PJb b = {0};");
+    wln(self, "    _jb_put(&b, \"{\\\"method\\\":\\\"\", 11); _jb_esc(&b, m, ml, 1);");
+    wln(self, "    _jb_put(&b, \"\\\",\\\"path\\\":\\\"\", 10); _jb_esc(&b, path, pl, 1);");
+    wln(self, "    _jb_put(&b, \"\\\",\\\"version\\\":\\\"\", 13); _jb_esc(&b, ver, vl, 1);");
+    wln(self, "    _jb_put(&b, \"\\\",\\\"headers\\\":{\", 13);");
+    wln(self, "    // Headers until the empty line");
+    wln(self, "    int first_hdr = 1, saw_blank = 0;");
+    wln(self, "    while (le && pos <= e) {");
+    wln(self, "        const char* nle = _jh_find(pos, e, \"\\r\\n\", 2);");
+    wln(self, "        const char* lend = nle ? nle : e;");
+    wln(self, "        if (lend == pos) { saw_blank = 1; break; }");
+    wln(self, "        const char* colon = (const char*)memchr(pos, ':', (size_t)(lend - pos));");
+    wln(self, "        if (colon) {");
+    wln(self, "            const char* ka = pos; const char* kb = colon;");
+    wln(self, "            const char* va = colon + 1; const char* vb = lend;");
+    wln(self, "            while (ka < kb && _jh_blank(*ka)) ka++;");
+    wln(self, "            while (kb > ka && _jh_blank(kb[-1])) kb--;");
+    wln(self, "            while (va < vb && _jh_blank(*va)) va++;");
+    wln(self, "            while (vb > va && _jh_blank(vb[-1])) vb--;");
+    wln(self, "            if (!first_hdr) _jb_ch(&b, ',');");
     wln(self, "            first_hdr = 0;");
-    wln(self, "            if (pos + kl + vl + 10 >= cap) { cap = (cap + kl + vl) * 2; result = (char*)realloc(result, cap); }");
-    wln(self, "            result[pos++] = '\"'; memcpy(result+pos, p, kl); pos += kl; result[pos++] = '\"'; result[pos++] = ':'; result[pos++] = '\"'; memcpy(result+pos, val_start, vl); pos += vl; result[pos++] = '\"';");
+    wln(self, "            _jb_ch(&b, '\"'); _jb_esc(&b, ka, (size_t)(kb - ka), 1);");
+    wln(self, "            _jb_put(&b, \"\\\":\\\"\", 3); _jb_esc(&b, va, (size_t)(vb - va), 1); _jb_ch(&b, '\"');");
     wln(self, "        }");
-    wln(self, "        p = next_line + 2;");
+    wln(self, "        if (!nle) break;");
+    wln(self, "        pos = nle + 2;");
     wln(self, "    }");
-    wln(self, "    pos += snprintf(result+pos, cap-pos, \"},\\\"body\\\":\\\"\");");
-    wln(self, "    // Extract body (everything after the empty line) and escape for JSON");
-    wln(self, "    if (*p) {");
-    wln(self, "        while (*p) {");
-    wln(self, "            if (pos >= cap-2) { cap *= 2; result = (char*)realloc(result, cap); }");
-    wln(self, "            if (*p == '\"') { result[pos++] = '\\\\'; result[pos++] = '\"'; }");
-    wln(self, "            else if (*p == '\\\\') { result[pos++] = '\\\\'; result[pos++] = '\\\\'; }");
-    wln(self, "            else if (*p == '\\n') { result[pos++] = '\\\\'; result[pos++] = 'n'; }");
-    wln(self, "            else if (*p == '\\r') { result[pos++] = '\\\\'; result[pos++] = 'r'; }");
-    wln(self, "            else if (*p == '\\t') { result[pos++] = '\\\\'; result[pos++] = 't'; }");
-    wln(self, "            else result[pos++] = *p;");
-    wln(self, "            p++;");
+    wln(self, "    _jb_put(&b, \"},\\\"body\\\":\\\"\", 10);");
+    wln(self, "    // Body: after the first empty line, up to the next one");
+    wln(self, "    if (saw_blank) {");
+    wln(self, "        const char* bb = _jh_find(s, e, \"\\r\\n\\r\\n\", 4);");
+    wln(self, "        if (bb) {");
+    wln(self, "            const char* bs = bb + 4;");
+    wln(self, "            const char* be = _jh_find(bs, e, \"\\r\\n\\r\\n\", 4);");
+    wln(self, "            if (!be) be = e;");
+    wln(self, "            _jb_esc(&b, bs, (size_t)(be - bs), 1);");
     wln(self, "        }");
     wln(self, "    }");
-    wln(self, "    pos += snprintf(result+pos, cap-pos, \"\\\"}\");");
-    wln(self, "    return result;");
+    wln(self, "    _jb_put(&b, \"\\\"}\", 2);");
+    wln(self, "    return _jb_take(&b);");
     wln(self, "}");
     wln(self, "");
     wln(self, "// --- DB builtins (Phase 5D) ---");

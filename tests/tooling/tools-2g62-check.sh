@@ -44,7 +44,7 @@ skip() { echo "  skip  $1"; }
 
 echo "== fmt"
 cp tests/fmt/prefix_in.fd "$W/p.fd"
-if "$FID" fmt "$W/p.fd" > "$W/fmt.log" 2>&1; then
+if "$FID" fmt -w "$W/p.fd" > "$W/fmt.log" 2>&1; then
   if [ "$(tr -d '\r' < "$W/p.fd")" = "$(tr -d '\r' < tests/fmt/prefix.fd)" ]; then
     ok "tests/fmt/prefix_in.fd formats to tests/fmt/prefix.fd"
   else
@@ -70,10 +70,10 @@ else
   bad "annotation/blank line/fn not kept apart"
 fi
 printf 'fn main() {\n    var i: i64 = 0;\n    while i < 2 { i = i + 1; } while i < 4 { i = i + 1; }\n    println(int_to_str(i));\n}\n' > "$W/w.fd"
-"$FID" fmt "$W/w.fd" > /dev/null 2>&1
+"$FID" fmt -w "$W/w.fd" > /dev/null 2>&1
 if tr -d '\r' < "$W/w.fd" | grep -q '} while'; then bad "'} while' kept on one line"; else ok "a while after } starts its own line"; fi
 printf '@pure\nfn one() -> i64 { return 1; }\n@cfg(target = "linux")\n@inline\npub fn two() -> i64 { return 2; }\nfn main() { println(int_to_str(one())); }\n' > "$W/a.fd"
-"$FID" fmt "$W/a.fd" > /dev/null 2>&1
+"$FID" fmt -w "$W/a.fd" > /dev/null 2>&1
 if tr -d '\r' < "$W/a.fd" | grep -q -x '@pure' && tr -d '\r' < "$W/a.fd" | grep -q -x 'fn one() -> i64 {' && tr -d '\r' < "$W/a.fd" | grep -q -x '@inline' && tr -d '\r' < "$W/a.fd" | grep -q -x 'pub fn two() -> i64 {'; then
   ok "an annotation keeps its own line (@pure / fn, @cfg(..) / @inline / pub fn)"
 else

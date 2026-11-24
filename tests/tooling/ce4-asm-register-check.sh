@@ -35,6 +35,7 @@ has() {
 }
 
 cat > "$TMP/in_xmm.fd" <<'EOF'
+@unsafe
 fn main() -> i64 {
     val x: i64 = 1;
     asm!("nop", in("xmm0") x);
@@ -42,6 +43,7 @@ fn main() -> i64 {
 }
 EOF
 cat > "$TMP/out_st0.fd" <<'EOF'
+@unsafe
 fn main() -> i64 {
     var x: i64 = 1;
     val y: i64 = asm!("nop", out("st0") x);
@@ -49,6 +51,7 @@ fn main() -> i64 {
 }
 EOF
 cat > "$TMP/good.fd" <<'EOF'
+@unsafe
 fn main() -> i64 {
     var x: i64 = 1;
     val y: i64 = asm!("mov rax, rcx", in("rcx") x, out("rax") x);

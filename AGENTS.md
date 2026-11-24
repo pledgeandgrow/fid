@@ -4,7 +4,7 @@
 > Fides compiler safely. Read this before making changes.
 >
 > **Fides is self-hosted and independent.** The primary compiler is in
-> `compiler/*.fd` (80 modules, ~367K lines). The Rust source in `src/*.rs`
+> `compiler/*.fd` (65 modules, ~348K lines). The Rust source in `src/*.rs`
 > (57 files, ~114K lines) is the bootstrap reference, frozen: it builds
 > stage 1 when `compiler/*.fd` changes and runs the test harness. The
 > language is what `fid` accepts: docs/reference/reference.md.
@@ -33,12 +33,12 @@ RELEASE=1 CC="zig cc" ./scripts/bootstrap.sh
 .\release\fid.exe ccompile tests/bootstrap/hello.fd -o hello.exe  # needs a C compiler
 
 # Single stage (development; not fixpoint-checked):
-# release/fid-dev.c (generated C) + release/fid-dev(.exe)
+# temporary C in build/selfhost/ + release/fid-dev(.exe)
 ./scripts/build-selfhost.sh          # stage-0 dump-c + C compile → release/fid-dev.exe
 #   (8 units at -O2 when STAGE0 has `fid split-c`, else one unit at -O0;
 #    on a memory-tight machine SPLIT=16 JOBS=2: one 123MB unit at -O0
 #    needs >16GB and LLVM dies, so the split must succeed; JOBS=4 x -O2
-#    units does not fit under ~5GB free. Nov 21 gate log: release/gate-nov21*.log)
+#    units does not fit under ~5GB free. Nov 21 gate log: build/release-archive/gate-nov21*.log)
 #    STAGE0=release/fid.exe for the fast path: fid at -O2 runs ~17x faster;
 #    STAGE0 defaults to release/stage0/fid.exe — pinned Nov 21 to a
 #    self-hosted 1.0.0+dev, hash in scripts/stage0.sha256 — else fidesc,
@@ -224,10 +224,13 @@ FID=release/fid.exe JOBS=4 bash scripts/cross-test.sh aarch64-linux
 # Parse a C header and generate Fides FFI bindings
 ./target/release/fidesc parse-header <header.h>
 
-# Debug a Fides program (interactive debugger; fidesc only: fid has no
-# debug/autopsy command, compiler/debugger.fd is not wired. `fid replay
-# <trace>` replays its own traces, written by `fid run <file.fd> --record`)
+# Debug a Fides program (interactive debugger). `fid debug <file.fd>` is
+# wired (main.fd cmd_debug -> debugger.fd Debugger_run); `fid replay
+# <trace>` replays its own traces, written by `fid run <file.fd> --record`.
+# `autopsy` remains fidesc-only: fid has no autopsy command and
+# compiler/native_debugger.fd is imported by nothing.
 ./target/release/fidesc debug <file.fd>
+.\release\fid.exe debug <file.fd>
 
 # Replay a recorded execution trace
 ./target/release/fidesc replay <trace.fdtrace>
@@ -287,13 +290,25 @@ FID=release/fid.exe JOBS=4 bash scripts/cross-test.sh aarch64-linux
 
 ```
 SELF-HOSTED COMPILER (primary source):
-  compiler/*.fd:  80 modules, 367,384 lines (Nov 21 evening) — THE COMPILER. 56 are reached
-                  from main.fd; 24 are imported by nothing that main.fd
-                  reaches (the whole retired PIR path — pir, opt, regalloc,
-                  peephole, codegen_x64/arm64/riscv, pe, arm64_enc,
-                  riscv_enc, runtime_linux/arm64/riscv, coff, macho,
-                  codegen — plus autograd, debugger, diag, embedded,
-                  flat_ast, hotreload, native_debugger, runtime)
+  compiler/*.fd:  65 modules, 348,330 lines (Nov 24) — THE COMPILER. 58 are reached
+                  from main.fd and all are called (export prefixes differ
+                  from file names: irverify→ir_verify, iropt_me→ime_*,
+                  csplit→cs_*, nat_ir→nat_*/ng_*, scribe→process_directory,
+                  build_info→fid_*, cowcheck→cow_*, debugger→Debugger_*).
+                  The retired PIR files were deleted outright since Nov 21.
+                  7 are imported by nothing: autograd (intentional no-op
+                  shim; real autodiff is the interp.fd tape), runtime
+                  (superseded by stdlib/linux_runtime, merged at emit),
+                  flat_ast (deliberately unwired — compiler.fd:6140; its
+                  int_to_hex would hide string's), diag (used by
+                  tests/selfhost/test_diag.fd + test_sl_debug.fd),
+                  embedded, hotreload, native_debugger (last three: Rust
+                  features whose fid commands are not wired — no autopsy
+                  command exists; main.fd:9938 keeps a dangling
+                  cmd_native_debug comment). `fid watch <file> [cmd]` IS
+                  wired (cmd_watch: polls the file's contents, re-runs
+                  `fid <cmd>` on change). debugger.fd IS wired:
+                  `fid debug` -> Debugger_new/Debugger_run.
   New modules     since the Nov 9 audit (each has a file-analysis page now):
                   ssa (mid-end SSA: mem2reg, dead phis, loop exit values),
                   mir (the machine IR of the machine layer), tv
@@ -308,7 +323,7 @@ SELF-HOSTED COMPILER (primary source):
                   558d0bc temps port): a 3-stage bootstrap from the pinned
                   release/stage0/fid.exe reached stage 3 — `FIXPOINT OK:
                   stage 2 and stage 3 emit identical C` (123,338,942 bytes
-                  both), RELEASE OK with smoke test; release/gate-nov21-c.log.
+                  both), RELEASE OK with smoke test; build/release-archive/gate-nov21-c.log.
                   All three stages fell back to one -O2-OOM'd unit at -O0
                   (~15 min each): the split -O2 build does not fit in ~4GB
                   free even at SPLIT=16 JOBS=2. Before: Nov 8, and NOT
@@ -342,7 +357,7 @@ SELF-HOSTED COMPILER (primary source):
                   SPLIT=1 or tcc: one unit at -O0).
 
 RUST BOOTSTRAP (reference + test harness):
-  src/*.rs:       57 files, 114,319 lines — bootstrap reference (frozen;
+  src/*.rs:       57 files, 114,423 lines — bootstrap reference (frozen;
                   Nov 21: the CB8 ownership port in lower.rs/codegen_c.rs)
   Used when:      compiler/*.fd changes (builds stage 1); runs `fidesc test`
   Suite (Nov 2):  interp 339/339, C 343/343, PE 345/345, expected-fail 89/89
@@ -370,19 +385,20 @@ WINDOWS INSTALLER (fides.nsi's default VERSION is 0.8.0):
                  v0.8.1-unstable (Nov 21, on origin)
 
 TESTS:
-  tests/bootstrap/:  1,763 .fd — 1,693 at top level (458 expected-fail),
-                     70 in subdirs: at_import, baseline, capability,
-                     diag_dup, diagnostics, effects, golden, nattools,
-                     race_lib, regions, safety, spec_lib, trait_conflict
-  tests/conformance/: 1,598 .fd, one per rule of reference.md §1–§13
+  tests/bootstrap/:  2,037 .fd — 1,962 at top level (597 expected-fail),
+                     75 in subdirs: at_import, baseline, capability,
+                     decl_lib, diag_dup, diagnostics, effects, golden,
+                     nattools, race_lib, regions, safety, same_name_lib,
+                     spec_lib, trait_conflict
+  tests/conformance/: 1,617 .fd, one per rule of reference.md §1–§13
                      (`//! error:` = rejected); _modules/ + known-gaps.txt
-  tests/selfhost/:  48 .fd files (verify-selfhost.sh)
+  tests/selfhost/:  46 .fd files (verify-selfhost.sh)
   tests/leaks/:     11 programs + .expected (scripts/leak-check.sh)
-  tests/nattools/:  72 .fd + machine-layer check scripts
+  tests/nattools/:  75 .fd + machine-layer check scripts
   tests/projects/:  52 .fd — whole-program fixtures (cli, service, game,
                     embed, library, workspace, ...)
   tests/verify/:    50 .fd — bug reproductions, soak/interleave, tv pairs
-  tests/tooling/:   14 .fd + 132 .sh (124 *-check.sh) — per-feature tool checks
+  tests/tooling/:   14 .fd + 142 .sh (134 *-check.sh) — per-feature tool checks
                     (crash reports, LSP probes, caches, repl, docs, serve)
   tests/ also:      ark, book, c2fd, cancel, cascade, checked_alloc,
                     course, ct, ctx_switch, db, determinism, fmt, fuzz,
@@ -391,7 +407,7 @@ TESTS:
   Baseline:         tests/bootstrap/baseline/test_results.txt
 
 STDLIB:
-  stdlib/*.fd:    403 modules, 278,462 lines (259,299 before the formatter repair, a1bede6) — core/collections, text and
+  stdlib/*.fd:    414 modules, 312,544 lines (403 on Nov 21; 259,299 before the formatter repair, a1bede6) — core/collections, text and
                   data formats, the HTTP/2/3+QUIC and TLS 1.3 stacks,
                   databases (postgres/mysql/mongodb/redis/sqlite),
                   crypto incl. post-quantum (pqc, hpke, jose), wireguard,
@@ -409,9 +425,9 @@ STDLIB:
                   bpe, safetensors); mobile/desktop interop (jni, objc,
                   swift, android_ndk, webview); finance (money, banking,
                   quant, decimal)
-  Runtimes:       stdlib/pe_runtime/ (4 files, 11,048 lines: native
+  Runtimes:       stdlib/pe_runtime/ (4 files, 12,228 lines: native
                   Windows, pe_ir) and stdlib/linux_runtime/ (7 files,
-                  15,687 lines: nat_ir's Linux targets and --nat Windows;
+                  17,152 lines: nat_ir's Linux targets and --nat Windows;
                   darwin.fd for native macOS, wasi.fd for `fid wasm`).
                   kernel/uefi moved to the fides-os project
 
@@ -546,7 +562,7 @@ Binaries:     4 (fidesc, ark, scribe, veil) + the self-hosted fid
   into commits f9c55d8/087609a by mistake; it is now in `.gitignore`. Agents
   build in their scratch folder (`CARGO_TARGET_DIR`), not in the repository.
 - `release/` — Self-hosted compiler output: `fid.exe` (from the release
-  bootstrap) and `fid-dev.exe` + `fid-dev.c` (a single stage from
+  bootstrap) and `fid-dev.exe` (a single stage from
   build-selfhost.sh) — gitignored
 - `compiler/` — Self-hosted compiler source (80 `.fd` modules) — THE PRIMARY COMPILER
 
@@ -566,7 +582,7 @@ touching them.
 |------|------|-----|
 | `src/regalloc.rs` | **CRITICAL** | Linear scan allocator (~1,500 lines). F-1A: constant rematerialization (`Location::Remat`). F-1D: effect-aware register allocation — calls to pure functions (in `L3Module.pure_functions`) only clobber RAX, not all caller-saved registers. I-2D: calls to `@no-alloc` functions (in `L3Module.no_alloc_functions`) also only clobber RAX. `@medical` functions included in no-alloc set. S-17: deterministic interval sorting (secondary key: vreg ID) to prevent non-deterministic codegen from HashMap iteration order. Any change here affects EVERY function. |
 | `src/peephole.rs` | **CRITICAL** | 9 passes, always on in `build`. A wrong transform silently corrupts all output. |
-| `src/elf64.rs` | **HIGH** | ELF64 header bytes, section layout, relocations (R_X86_64_PC32/PLT32/64). Off-by-one = corrupt binary. Self-hosted port in `compiler/elf64.fd` (2,423 LOC and 85% parity when ported; 3,554 lines on Nov 21) includes full x86-64 instruction encoder, assembly parser, and ELF builder. |
+| `src/elf64.rs` | **HIGH** | ELF64 header bytes, section layout, relocations (R_X86_64_PC32/PLT32/64). Off-by-one = corrupt binary. Self-hosted port in `compiler/elf64.fd` (2,423 LOC and 85% parity when ported; 3,629 lines on Nov 24) includes full x86-64 instruction encoder, assembly parser, and ELF builder. |
 | `src/pe.rs` | **HIGH** | PE header bytes, import table (kernel32.dll + msvcrt.dll: every name in `IMPORTS`/`MSVCRT_IMPORTS` must be a real export, or no program starts), section layout. Off-by-one = corrupt .exe. Machine-code stubs must not keep a value in a volatile register (rcx, rdx, r8–r11) across a call (HeapFree clobbers them). |
 | `stdlib/linux_runtime/*.fd` | **MEDIUM** | The runtime of the machine layer (compiler/nat_ir.fd): Linux system calls (base, conc, math, sys) and `win.fd` for `--nat` Windows over kernel32/ws2_32. Merged into every nat_ir build. |
 | `compiler/nat_ir.fd`, `compiler/nat_enc.fd` | **HIGH** | Machine IR, register allocator and encoders of the Linux targets and `--nat`. Checks: `FID_VERIFY=1`, `scripts/enc-oracle.py`, `scripts/pass-matrix.sh`. |
@@ -584,7 +600,7 @@ touching them.
 | `src/comptime.rs` | **LOW** | Comptime evaluation engine. Evaluates `comptime <expr>`, `comptime { block }`, `comptime reflect_op(T)`, `comptime gen { block }` at compile time. I-5A: Aggressive comptime evaluation — auto-evaluates calls to `comptime fn` functions with all-literal args (no explicit `comptime` wrapper needed). I-5D: Comptime loop unrolling — unrolls `for` loops with literal bounds (≤16 iterations, ≤16 body stmts) at AST level. Also eliminates dead `if` branches with literal conditions. |
 | `src/runtime_linux.rs` | **HIGH** | Hand-encoded x86-64 machine code (raw bytes). No assembler — every byte is manual. |
 | `src/linker.rs` | **MEDIUM** | Relocation resolution. Wrong offset = crash or silent corruption. |
-| `src/interp.rs` | **MEDIUM** | The reference oracle (~6,950 lines). If this is wrong, all backends "match" but produce wrong results. `p_vec_new` uses `vec_side_table` to separate raw struct fields from `Value::Vec`. `run_function` auto-detects missing `__env` param and inserts dummy. Self-hosted port in `compiler/interp.fd` (7,456 lines on Nov 9; 14,130 on Nov 21) ran every test program `fidesc run` did (Oct 27); it cannot run FFI other than a few libc calls or `sysconf`; tasks interleave (LG11, docs/reference/interp-tasks.md). |
+| `src/interp.rs` | **MEDIUM** | The reference oracle (~6,950 lines). If this is wrong, all backends "match" but produce wrong results. `p_vec_new` uses `vec_side_table` to separate raw struct fields from `Value::Vec`. `run_function` auto-detects missing `__env` param and inserts dummy. Self-hosted port in `compiler/interp.fd` (7,456 lines on Nov 9; 14,992 on Nov 24) ran every test program `fidesc run` did (Oct 27); it cannot run FFI other than a few libc calls or `sysconf`; tasks interleave (LG11, docs/reference/interp-tasks.md). |
 
 ## LOWER-RISK FILES
 
@@ -600,7 +616,7 @@ touching them.
 | `src/compiler.rs` | LOW | Pipeline orchestration — changes are visible. Phase 12: `enrich_errors()` post-processes errors with source context + error codes. |
 | `src/diag.rs` | LOW | Diagnostic system — structured error/warning/note/help with error codes, source context, color. Zero external deps. |
 | `src/lsp.rs` | LOW | LSP server — JSON-RPC over stdio, no external deps. |
-| `stdlib/*.fd` | LOW | Fides source — errors surface as test failures. 403 modules (~259K lines): core/collections, text/data formats, HTTP/2/3+QUIC, TLS 1.3, databases, post-quantum crypto, industrial and energy protocols, automotive/robotics, kernel drivers and embedded peripherals, games/graphics, media, ML, mobile/desktop interop, finance — grouped list in `AGENTS.md` → Current Baseline → STDLIB and in `INDEX.md`. Runtimes in `stdlib/pe_runtime/` and `stdlib/linux_runtime/` (incl. `darwin.fd`, `wasi.fd`). (kernel.fd + uefi.fd moved to the fides-os project.) |
+| `stdlib/*.fd` | LOW | Fides source — errors surface as test failures. 414 modules (~313K lines): core/collections, text/data formats, HTTP/2/3+QUIC, TLS 1.3, databases, post-quantum crypto, industrial and energy protocols, automotive/robotics, kernel drivers and embedded peripherals, games/graphics, media, ML, mobile/desktop interop, finance — grouped list in `AGENTS.md` → Current Baseline → STDLIB and in `INDEX.md`. Runtimes in `stdlib/pe_runtime/` and `stdlib/linux_runtime/` (incl. `darwin.fd`, `wasi.fd`). (kernel.fd + uefi.fd moved to the fides-os project.) |
 
 ## Known Bugs (Do Not Re-Introduce)
 
@@ -628,8 +644,8 @@ touching them.
      (MI18): `--native` is now the machine layer (nat_ir) on every target,
      the default `x86-64` being `x86_64-linux`; a target it has no code for
      is an error. `fid emit` (pe_ir on Windows, nat_ir for Linux targets) is
-     the working native path. compiler/pe.fd is reached by nothing:
-     `emit --boot` builds the bootable image through pe_ir, as `--bare`
+     the working native path. compiler/pe.fd was deleted with the retired
+     PIR path; `emit --boot` builds the bootable image through pe_ir, as `--bare`
      does (`PEIR_BARE_BOOT`).
    Fixed Oct 25–27 (docs/reference/known-bugs.md §2e): block jumps ended
    functions, byte loads read side-table strings, builtins shadowed core
@@ -640,7 +656,7 @@ touching them.
    not linked.
 
 2. **Nondeterministic self-hosted typecheck/borrowck**: regenerating
-   `release/fid-dev.c` from identical `compiler/*.fd` input can fail with
+   `build/selfhost/fid-dev.c` from identical `compiler/*.fd` input can fail with
    *different* errors per run (e.g. `Vec<i64>` vs `Vec<Vec<EscVar>>`
    assignment, or a reference-escape error) or succeed. HashMap iteration
    order in the self-hosted typechecker/inference is the suspected source.

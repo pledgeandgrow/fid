@@ -1,0 +1,101 @@
+// Bugs roadmap BG189: stdlib/postgres.fd `pg_startup_step` took
+// AuthenticationOk in every state, so a server that asked for SCRAM-SHA-256
+// could skip SASLContinue/SASLFinal and `pg_scram_verify_server` never ran
+// (no mutual authentication). Once SCRAM started, AuthenticationOk now
+// counts only after SASLFinal carried the right server signature, as in
+// libpq; a SASLContinue out of turn, a SASLFinal before it, and another
+// method asked for in the middle of SCRAM are errors too. Trust, cleartext
+// and md5 logins are unchanged.
+//
+// Expected output:
+// skip: 0 -1 ok=false
+// SCRAM: the server said AuthenticationOk without proving it knows the password
+// final first: 0 -1
+// SCRAM: the server's signature is wrong
+// continue first: -1
+// SCRAM: unexpected SASLContinue
+// downgrade: 0 -1
+// SCRAM: the server asked for authentication method 3 in the middle of SCRAM-SHA-256
+// trust: 0 1 ok=true auth=trust
+// password: 0 0 1 ok=true auth=password
+// md5: 0 0 1 ok=true auth=md5
+use postgres;
+
+fn auth(code: i64, extra: str) -> PgMsg {
+    var b: Vec<i64> = Vec::new();
+    b.push(0);
+    b.push(0);
+    b.push(0);
+    b.push(code);
+    var i: i64 = 0;
+    while i < str_len(extra) {
+        b.push(str_byte_at(extra, i));
+        i = i + 1;
+    }
+    return PgMsg { tag: 82, body: b };
+}
+
+fn ready() -> PgMsg {
+    var z: Vec<i64> = Vec::new();
+    z.push(73);
+    return PgMsg { tag: 90, body: z };
+}
+
+fn sasl() -> PgMsg {
+    return auth(10, "SCRAM-SHA-256\u{0}\u{0}");
+}
+
+fn main() -> i64 {
+    // R(10) then R(0) at once: the proof was skipped
+    var c: PgConn = pg_conn_new(-1, "alice", "secret");
+    var s: PgScram = pg_scram_new("", "secret", pg_scram_nonce());
+    val a1: i64 = pg_startup_step(&mut c, &mut s, sasl());
+    val a2: i64 = pg_startup_step(&mut c, &mut s, auth(0, ""));
+    println(f"skip: {a1} {a2} ok={c.ok}");
+    println(c.error);
+
+    // SASLFinal with no SASLContinue before it: nothing to check against
+    var c2: PgConn = pg_conn_new(-1, "alice", "secret");
+    var s2: PgScram = pg_scram_new("", "secret", pg_scram_nonce());
+    val b1: i64 = pg_startup_step(&mut c2, &mut s2, sasl());
+    val b2: i64 = pg_startup_step(&mut c2, &mut s2, auth(12, "v=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="));
+    println(f"final first: {b1} {b2}");
+    println(c2.error);
+
+    // SASLContinue without AuthenticationSASL
+    var c3: PgConn = pg_conn_new(-1, "alice", "secret");
+    var s3: PgScram = pg_scram_new("", "secret", "abc");
+    val d1: i64 = pg_startup_step(&mut c3, &mut s3, auth(11, "r=abcdef,s=QSXCR+Q6sek8bf92,i=4096"));
+    println(f"continue first: {d1}");
+    println(c3.error);
+
+    // cleartext password asked for in the middle of SCRAM
+    var c4: PgConn = pg_conn_new(-1, "alice", "secret");
+    var s4: PgScram = pg_scram_new("", "secret", pg_scram_nonce());
+    val e1: i64 = pg_startup_step(&mut c4, &mut s4, sasl());
+    val e2: i64 = pg_startup_step(&mut c4, &mut s4, auth(3, ""));
+    println(f"downgrade: {e1} {e2}");
+    println(c4.error);
+
+    // the other methods still log in
+    var c5: PgConn = pg_conn_new(-1, "alice", "secret");
+    var s5: PgScram = pg_scram_new("", "secret", "x");
+    val f1: i64 = pg_startup_step(&mut c5, &mut s5, auth(0, ""));
+    val f2: i64 = pg_startup_step(&mut c5, &mut s5, ready());
+    println(f"trust: {f1} {f2} ok={c5.ok} auth={c5.auth}");
+
+    var c6: PgConn = pg_conn_new(-1, "alice", "secret");
+    var s6: PgScram = pg_scram_new("", "secret", "x");
+    val g1: i64 = pg_startup_step(&mut c6, &mut s6, auth(3, ""));
+    val g2: i64 = pg_startup_step(&mut c6, &mut s6, auth(0, ""));
+    val g3: i64 = pg_startup_step(&mut c6, &mut s6, ready());
+    println(f"password: {g1} {g2} {g3} ok={c6.ok} auth={c6.auth}");
+
+    var c7: PgConn = pg_conn_new(-1, "alice", "secret");
+    var s7: PgScram = pg_scram_new("", "secret", "x");
+    val h1: i64 = pg_startup_step(&mut c7, &mut s7, auth(5, "salt"));
+    val h2: i64 = pg_startup_step(&mut c7, &mut s7, auth(0, ""));
+    val h3: i64 = pg_startup_step(&mut c7, &mut s7, ready());
+    println(f"md5: {h1} {h2} {h3} ok={c7.ok} auth={c7.auth}");
+    return 0;
+}

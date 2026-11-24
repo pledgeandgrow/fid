@@ -1,0 +1,69 @@
+// Bugs roadmap BG133: `spawn` of a function with an f64 parameter or an
+// f64 result gave wrong values on C. The runtime reads each argument of a
+// call by name as a word (va_arg int64_t) and calls the function as
+// int64_t (*)(void*, int64_t, ...): a double went raw into the variadic
+// arguments, the function read it from a float register, and an f64 result
+// was taken from rax. Now (compiler/codegen_c.fd cg_spawn_word_arg,
+// cg_thunk_native) a float argument goes as its bits, by the parameter's
+// type, and such a function is registered through a thunk that converts
+// the words and the result (also a bool or i32 result, whose register's
+// upper bits were unset: -205 came back as 4294967091).
+//
+// Expected output:
+// 6
+// 4.5
+// 928
+// -205
+// true
+// 8.75
+// 11
+
+fn work(x: f64, n: i64) -> i64 {
+    return (x * 2.0) as i64 + n;
+}
+
+fn workf(x: f64) -> f64 {
+    return x * 3.0;
+}
+
+fn w8(a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64, h: i64) -> i64 {
+    return a + b + c + d + e + f + g + h * 100;
+}
+
+fn wi32(a: i32, b: u8) -> i32 {
+    return a - (b as i32);
+}
+
+fn wb(a: bool) -> bool {
+    return !a;
+}
+
+fn mix(a: i64, x: f64, b: i64, y: f64) -> f64 {
+    return (a as f64) + x + (b as f64) * y;
+}
+
+fn mixi(a: f64, b: i64, c: f64) -> i64 {
+    return (a + c) as i64 + b;
+}
+
+fn main() -> i64 {
+    val t = spawn work(2.5, 1);
+    println(int_to_str(await t));
+    val t2 = spawn workf(1.5);
+    println(float_to_str(await t2));
+    val t3 = spawn w8(1, 2, 3, 4, 5, 6, 7, 9);
+    println(int_to_str(await t3));
+    val t4 = spawn wi32(-5, 200);
+    println(int_to_str((await t4) as i64));
+    val t5 = spawn wb(false);
+    if await t5 {
+        println("true");
+    } else {
+        println("false");
+    }
+    val t6 = spawn mix(1, 0.25, 3, 2.5);
+    println(float_to_str(await t6));
+    val t7 = spawn mixi(1.5, 7, 2.75);
+    println(int_to_str(await t7));
+    return 0;
+}

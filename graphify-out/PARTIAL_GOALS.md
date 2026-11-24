@@ -1,0 +1,136 @@
+# Partial goals still marked `[~]`
+
+Count: 131
+Generated from `docs/roadmap/*.md`; this is the explicit partial checklist, not a reconstruction of the Nov 21 121-goal tally.
+
+- `docs\roadmap\competitive-roadmap.md:91` — **## Track BM — Measure honestly** — BM2. Install Go and a real Clang and GCC beside `zig cc`; pin every version (S).
+- `docs\roadmap\competitive-roadmap.md:97` — **## Track BM — Measure honestly** — BM3. The Benchmarks Game set: n-body, spectral-norm, mandelbrot,
+- `docs\roadmap\competitive-roadmap.md:119` — **## Track BM — Measure honestly** — BM5. Service benchmarks in the TechEmpower style: plaintext, JSON, database,
+- `docs\roadmap\competitive-roadmap.md:135` — **## Track BM — Measure honestly** — BM6. Compile-speed benchmarks: hello world, 10k, 100k and 1M lines, clean and
+- `docs\roadmap\competitive-roadmap.md:145` — **## Track BM — Measure honestly** — BM7. Size and memory benchmarks: binary size, peak memory, startup time (S).
+- `docs\roadmap\competitive-roadmap.md:150` — **## Track BM — Measure honestly** — BM8. Runs on Windows and Linux, on a quiet machine, several runs, with spread
+- `docs\roadmap\competitive-roadmap.md:476` — **## Track BM — Measure honestly** — OP15. Block layout for hot paths, using likely branches (M). Native: no jump to
+- `docs\roadmap\competitive-roadmap.md:1706` — **## Track CS — Compile speed** — CS1. `emit` of hello world under 0.5 s (release D9), then under 0.1 s (L).
+- `docs\roadmap\competitive-roadmap.md:1815` — **## Track CS — Compile speed** — CS3. Borrow checking linear in program size (release D8) (M). On the
+- `docs\roadmap\competitive-roadmap.md:1847` — **## Track CS — Compile speed** — CS4. Self-compile under 60 s (release), then under 10 s (L). Nov 9: 74 s
+- `docs\roadmap\competitive-roadmap.md:1905` — **## Track CS — Compile speed** — CS5. Parallel front end and code generation on all cores (L).
+- `docs\roadmap\competitive-roadmap.md:1944` — **## Track CS — Compile speed** — CS6. Incremental native builds per function, under 100 ms for a one-line
+- `docs\roadmap\competitive-roadmap.md:2034` — **## Track VF — Verification, in place of years** — VF1. A random program generator in the spirit of Csmith: all three backends
+- `docs\roadmap\competitive-roadmap.md:2052` — **## Track VF — Verification, in place of years** — VF2. Random programs compared with an equivalent C program, built by Clang and
+- `docs\roadmap\competitive-roadmap.md:2076` — **## Track VF — Verification, in place of years** — VF3. Coverage-guided fuzzing of the lexer, parser, typechecker and every
+- `docs\roadmap\competitive-roadmap.md:2094` — **## Track VF — Verification, in place of years** — VF4. Run every optimizer pass on and off over the whole suite: output must not
+- `docs\roadmap\competitive-roadmap.md:2121` — **## Track VF — Verification, in place of years** — VF5. Each optimization has a test that fails if the pass is wrong (M).
+- `docs\roadmap\competitive-roadmap.md:2141` — **## Track VF — Verification, in place of years** — VF6. Translation validation: a checker proves each optimized function matches
+- `docs\roadmap\competitive-roadmap.md:2172` — **## Track VF — Verification, in place of years** — VF7. Mutation testing of the compiler: a broken pass must fail a test (L).
+- `docs\roadmap\competitive-roadmap.md:2189` — **## Track VF — Verification, in place of years** — VF8. Line and branch coverage of `compiler/*.fd` over 90%, reported in CI (L).
+- `docs\roadmap\competitive-roadmap.md:2211` — **## Track VF — Verification, in place of years** — VF9. A written formal semantics of the core language (XL).
+- `docs\roadmap\competitive-roadmap.md:2225` — **## Track VF — Verification, in place of years** — VF10. A conformance suite of a thousand-plus tests, one per sentence of the
+- `docs\roadmap\competitive-roadmap.md:2243` — **## Track VF — Verification, in place of years** — VF11. A proof of the memory-safety claim on a small core calculus (XL).
+- `docs\roadmap\competitive-roadmap.md:2257` — **## Track VF — Verification, in place of years** — VF12. Reproducible builds: the same input gives the same binary on any machine
+- `docs\roadmap\competitive-roadmap.md:2308` — **## Track VF — Verification, in place of years** — VF14. AddressSanitizer, UBSan and ThreadSanitizer through the C path, in CI
+- `docs\roadmap\competitive-roadmap.md:2327` — **## Track VF — Verification, in place of years** — VF15. Fuzz every stdlib parser: JSON, regex, HTTP, TLS records, TOML, XML, CSV
+- `docs\roadmap\competitive-roadmap.md:2344` — **## Track VF — Verification, in place of years** — VF17. Chaos tests: dropped connections, full disks, out of memory, clock jumps
+- `docs\roadmap\competitive-roadmap.md:2367` — **## Track VF — Verification, in place of years** — VF18. Sharded tests on thousands of task and thread interleavings (L).
+- `docs\roadmap\competitive-roadmap.md:2423` — **## Track LG — Language depth** — LG3. Lifetimes the borrow checker can prove across functions, without
+- `docs\roadmap\competitive-roadmap.md:2469` — **## Track LG — Language depth** — LG4. Traits: bounds checked, associated types, default methods, trait objects
+- `docs\roadmap\competitive-roadmap.md:2775` — **## Track LG — Language depth** — LG16. C++ interop for the common cases (XL).
+- `docs\roadmap\competitive-roadmap.md:2867` — **## Track SL — Standard library depth** — SL2. HTTP/3 and QUIC (XL).
+- `docs\roadmap\competitive-roadmap.md:2894` — **## Track SL — Standard library depth** — SL4. TLS 1.3 on every platform (release I7) (M).
+- `docs\roadmap\competitive-roadmap.md:2957` — **## Track SL — Standard library depth** — SL6. JSON at simdjson-class speed (L).
+- `docs\roadmap\competitive-roadmap.md:3256` — **## Track SL — Standard library depth** — SL17. Files, paths and processes complete on every platform (M).
+- `docs\roadmap\competitive-roadmap.md:3279` — **## Track SL — Standard library depth** — SL18. Crypto through reviewed libraries, the set of release J5 (L).
+- `docs\roadmap\competitive-roadmap.md:3363` — **## Track TL — Tooling** — TL2. Error messages as good as Rust's, each with a suggested fix, and a test
+- `docs\roadmap\competitive-roadmap.md:3435` — **## Track TL — Tooling** — TL4. LSP complete: references, rename, formatting, signature help, inlay
+- `docs\roadmap\competitive-roadmap.md:3462` — **## Track TL — Tooling** — TL5. Debugger support with line tables on every platform (release N9) (L).
+- `docs\roadmap\competitive-roadmap.md:3512` — **## Track TL — Tooling** — TL6. Cross-compilation out of the box: `fid build --target linux-arm64` from
+- `docs\roadmap\competitive-roadmap.md:3565` — **## Track TL — Tooling** — TL10. Editor support beyond VS Code: Neovim, JetBrains, Zed (M).
+- `docs\roadmap\competitive-roadmap.md:3624` — **## Track PL — Platforms** — PL2. Tier 1: Windows x64, Linux x64, macOS ARM64, Linux ARM64 (release F4–F8)
+- `docs\roadmap\competitive-roadmap.md:3656` — **## Track PL — Platforms** — PL3. Tier 2: Windows ARM64, macOS x64, FreeBSD, RISC-V (L).
+- `docs\roadmap\competitive-roadmap.md:3670` — **## Track PL — Platforms** — PL4. WebAssembly with WASI (release F9) (L).
+- `docs\roadmap\competitive-roadmap.md:3716` — **## Track PL — Platforms** — PL5. Freestanding and embedded: Cortex-M, RISC-V boards, with no OS (release G)
+- `docs\roadmap\competitive-roadmap.md:3750` — **## Track PL — Platforms** — PL6. Android and iOS (XL).
+- `docs\roadmap\competitive-roadmap.md:3762` — **## Track PL — Platforms** — PL7. Native backends for ELF and Mach-O, sharing one encoder (L).
+- `docs\roadmap\competitive-roadmap.md:3843` — **## Track ST — Stability and process** — AD1. `ark`, `scribe` and `veil` written in Fides (release N8) (L). The
+- `docs\roadmap\competitive-roadmap.md:3894` — **## Track ST — Stability and process** — AD3. `fides-os` as a standing test of bare-metal work (release G4) (M).
+- `docs\roadmap\competitive-roadmap.md:3920` — **## Track ST — Stability and process** — AD4. Every internal tool that can be in Fides is (M).
+- `docs\roadmap\complaint-roadmap.md:50` — **## Track CB — Building and compiling** — CB2. **"I wait for the whole build to see one type error"** (Rust, C++).
+- `docs\roadmap\complaint-roadmap.md:64` — **## Track CB — Building and compiling** — CB3. **"Incremental builds are not incremental"** (C++, Rust). A one-line
+- `docs\roadmap\complaint-roadmap.md:79` — **## Track CB — Building and compiling** — CB4. **"CMake, Makefiles, build.rs: a second language just to build"** (C,
+- `docs\roadmap\complaint-roadmap.md:99` — **## Track CB — Building and compiling** — CB5. **"Cross-compiling needs a toolchain per target"** (C, C++, Rust).
+- `docs\roadmap\complaint-roadmap.md:333` — **## Track CE — Errors and diagnostics** — CE8. **"A crash report without the values that caused it"** (most). A panic
+- `docs\roadmap\complaint-roadmap.md:979` — **## Track CO — Observability and production** — CO2. **"Tracing needs code changes everywhere"** (all). Spans for every
+- `docs\roadmap\complaint-roadmap.md:997` — **## Track CO — Observability and production** — CO5. **"Profiling production needs another tool"** (most). `fid profile`
+- `docs\roadmap\complaint-roadmap.md:1091` — **## Track CI — Interop and platforms** — CI4. **"Windows is a second-class platform"** (many Unix-first languages).
+- `docs\roadmap\end-roadmap.md:16` — **## From competitive-roadmap.md** — ST4. A release every six weeks, on a date, whatever is ready (M).
+- `docs\roadmap\end-roadmap.md:24` — **## From competitive-roadmap.md** — ST5. Long-term support releases with security fixes (M).
+- `docs\roadmap\end-roadmap.md:30` — **## From competitive-roadmap.md** — ST6. Before each release, build every known public Fides project, as Rust's
+- `docs\roadmap\end-roadmap.md:48` — **## From competitive-roadmap.md** — ST10. Signed checksums for every download (S).
+- `docs\roadmap\end-roadmap.md:74` — **## Track AD — Real use** — BM9. CI fails on a slowdown over 5%, per benchmark (release D7, tighter) (M).
+- `docs\roadmap\end-roadmap.md:84` — **## Track AD — Real use** — BM10. A public page of results over time, losses included (M).
+- `docs\roadmap\end-roadmap.md:101` — **## Track OP — Optimizer** — AD13. Publish the benchmarks (BM10), and invite corrections (S).
+- `docs\roadmap\end-roadmap.md:109` — **## Track OP — Optimizer** — SL19. Every public function documented with an example that runs in CI (L).
+- `docs\roadmap\end-roadmap.md:133` — **## Track OP — Optimizer** — VF16. Week-long soak tests of a service under load, with flat memory (release
+- `docs\roadmap\end-roadmap.md:157` — **## From release-roadmap.md** — G4. `fides-os` builds with the released compiler, in its own CI (M).
+- `docs\roadmap\end-roadmap.md:175` — **## Track H — Concurrency** — I6. A sample service survives a 24-hour load test (M). A short run:
+- `docs\roadmap\end-roadmap.md:189` — **## Track H — Concurrency** — N9. Source-level debugging of native Windows builds: line tables a standard
+- `docs\roadmap\end-roadmap.md:227` — **## From roadmap.md** — Real hardware testing (QEMU ARM64, QEMU RISC-V, real UEFI firmware)
+- `docs\roadmap\inc-roadmap.md:295` — **## Phase B — Per-module compilation units (prerequisite for fine-grained)** — B5. Backend split: C codegen and PE codegen emit one object per
+- `docs\roadmap\inc-roadmap.md:396` — **### Per-module acceptance** — B8. Output equality verified
+- `docs\roadmap\llvm-roadmap.md:175` — **## Track MI — One machine layer (30)** — MI5. One lowering IR -> MIR for every language rule now written twice in
+- `docs\roadmap\llvm-roadmap.md:234` — **## Track MI — One machine layer (30)** — MI9. Struct values as several MIR values when small (scalar replacement at
+- `docs\roadmap\llvm-roadmap.md:271` — **## Track MI — One machine layer (30)** — MI14. Port Windows x64 to MIR, keeping every optimization `pe_ir.fd` has
+- `docs\roadmap\llvm-roadmap.md:322` — **## Track MI — One machine layer (30)** — MI16. A macOS AArch64 target: the AArch64 selection and a Mach-O writer
+- `docs\roadmap\llvm-roadmap.md:338` — **## Track MI — One machine layer (30)** — MI17. Retire `pe_ir.fd`'s and `nat_ir.fd`'s own lowerings once their MIR
+- `docs\roadmap\llvm-roadmap.md:540` — **## Track RA — One register allocator (20)** — RA1. Today: `nat_ir.fd` allocates callee-saved registers over live-range
+- `docs\roadmap\llvm-roadmap.md:640` — **## Track RA — One register allocator (20)** — RA9. Second-chance or backtracking allocation in the style of regalloc2 /
+- `docs\roadmap\llvm-roadmap.md:798` — **## Track TG — Thin targets: selection and encoders (20)** — TG5. A disassembler for our own output (`fid disasm`), table-driven from the
+- `docs\roadmap\llvm-roadmap.md:914` — **## Track TG — Thin targets: selection and encoders (20)** — TG11. SIMD as MIR vector operations: SSE2/AVX2, NEON, RVV, for the `simd`
+- `docs\roadmap\llvm-roadmap.md:925` — **## Track TG — Thin targets: selection and encoders (20)** — TG12. Object files (COFF, ELF, Mach-O) from the same writer as executables,
+- `docs\roadmap\llvm-roadmap.md:1014` — **## Track TG — Thin targets: selection and encoders (20)** — TG16. A WASM target on MIR: structured control flow from MIR's CFG
+- `docs\roadmap\llvm-roadmap.md:1095` — **## Track ME — SSA and a rules mid-end (30)** — ME2. Dominator tree and loop tree shared by every pass (`iro_cfg`,
+- `docs\roadmap\llvm-roadmap.md:1116` — **## Track ME — SSA and a rules mid-end (30)** — ME3. mem2reg: locals whose address never escapes become SSA values with
+- `docs\roadmap\llvm-roadmap.md:1299` — **## Track ME — SSA and a rules mid-end (30)** — ME20. Inlining with a cost model across modules (iropt inlines one-block
+- `docs\roadmap\llvm-roadmap.md:1313` — **## Track ME — SSA and a rules mid-end (30)** — ME21. Inlining decisions from the call graph bottom-up, with sizes known
+- `docs\roadmap\llvm-roadmap.md:1484` — **## Track ME — SSA and a rules mid-end (30)** — ME28. Switch lowering: ranges, bit tests, jump tables chosen in the mid-end
+- `docs\roadmap\llvm-roadmap.md:1556` — **## Track WP — The whole program (20)** — WP6. Custom conventions for internal functions: arguments in the registers
+- `docs\roadmap\llvm-roadmap.md:1582` — **## Track WP — The whole program (20)** — WP7. `__env` dropped from functions that never read it, at every call (S).
+- `docs\roadmap\llvm-roadmap.md:1702` — **## Track WP — The whole program (20)** — WP14. Function specialization: a hot function cloned for a constant argument
+- `docs\roadmap\llvm-roadmap.md:1961` — **## Track LF — The language's guarantees as optimizer facts (25)** — LF8. Integer range analysis drops checks whose operands cannot overflow
+- `docs\roadmap\llvm-roadmap.md:2001` — **## Track LF — The language's guarantees as optimizer facts (25)** — LF10. Ranges through function boundaries for internal functions (WP13) (M).
+- `docs\roadmap\llvm-roadmap.md:2021` — **## Track LF — The language's guarantees as optimizer facts (25)** — LF11. Check hoisting: one check before a loop instead of one per iteration,
+- `docs\roadmap\llvm-roadmap.md:2042` — **## Track LF — The language's guarantees as optimizer facts (25)** — LF13. Escape analysis: a `Vec`, `str` or struct that never leaves its function
+- `docs\roadmap\llvm-roadmap.md:2111` — **## Track LF — The language's guarantees as optimizer facts (25)** — LF14. Scalar replacement of a non-escaping `Vec` of known small length (M).
+- `docs\roadmap\llvm-roadmap.md:2167` — **## Track LF — The language's guarantees as optimizer facts (25)** — LF16. Copy-on-write checks removed where a value has one owner provably (M).
+- `docs\roadmap\llvm-roadmap.md:2202` — **## Track LF — The language's guarantees as optimizer facts (25)** — LF20. `@secret` values never spilled to memory unencrypted where a register
+- `docs\roadmap\llvm-roadmap.md:2239` — **## Track LF — The language's guarantees as optimizer facts (25)** — LF21. Regions freed in one step instead of object by object (release C6) (M).
+- `docs\roadmap\llvm-roadmap.md:2322` — **## Track SP — Compile speed (20)** — SP3. `fid emit` of hello world under 0.5 s, then under 0.1 s (release D9):
+- `docs\roadmap\llvm-roadmap.md:2361` — **## Track SP — Compile speed (20)** — SP6. A per-function code cache: key = hash of the function's IR, the target,
+- `docs\roadmap\llvm-roadmap.md:2407` — **## Track SP — Compile speed (20)** — SP7. Incremental relinking in memory: unchanged functions keep their bytes,
+- `docs\roadmap\llvm-roadmap.md:2422` — **## Track SP — Compile speed (20)** — SP8. A one-line edit rebuilds in under 100 ms (with SP4–SP7) (L).
+- `docs\roadmap\llvm-roadmap.md:2439` — **## Track SP — Compile speed (20)** — SP9. Front end in parallel per module where modules do not depend on each
+- `docs\roadmap\llvm-roadmap.md:2470` — **## Track SP — Compile speed (20)** — SP10. No linear scans anywhere in the compiler: every lookup by name or id is
+- `docs\roadmap\llvm-roadmap.md:2493` — **## Track SP — Compile speed (20)** — SP11. Arena allocation for compiler data per function, freed in one step
+- `docs\roadmap\llvm-roadmap.md:2503` — **## Track SP — Compile speed (20)** — SP12. Self-compile under 60 s, then under 10 s (M, then L).
+- `docs\roadmap\llvm-roadmap.md:2513` — **## Track SP — Compile speed (20)** — SP13. A debug mode with no mid-end and the fast allocator (RA14): 5x faster
+- `docs\roadmap\llvm-roadmap.md:2560` — **## Track SP — Compile speed (20)** — SP16. The compiler itself built by our own backend and fast (bootstrap with
+- `docs\roadmap\llvm-roadmap.md:2604` — **## Track SP — Compile speed (20)** — SP20. Builds are reproducible byte for byte with the cache on and off (S).
+- `docs\roadmap\llvm-roadmap.md:2627` — **## Track RL — Reliability: trusted without decades (25)** — RL1. Differential testing against LLVM: random programs (release VF1/VF2)
+- `docs\roadmap\llvm-roadmap.md:2641` — **## Track RL — Reliability: trusted without decades (25)** — RL2. The suite run on every backend and target on every change: Windows x64,
+- `docs\roadmap\llvm-roadmap.md:2651` — **## Track RL — Reliability: trusted without decades (25)** — RL3. A pass on/off matrix: the suite with each mid-end pass and each rule
+- `docs\roadmap\llvm-roadmap.md:2741` — **## Track RL — Reliability: trusted without decades (25)** — RL9. Image files checked by the system tools: `llvm-readobj`, `dumpbin`,
+- `docs\roadmap\llvm-roadmap.md:2802` — **## Track RL — Reliability: trusted without decades (25)** — RL11. Mutation testing of the backend: a deliberately broken rule or pass
+- `docs\roadmap\llvm-roadmap.md:2811` — **## Track RL — Reliability: trusted without decades (25)** — RL12. Line and branch coverage of `compiler/mir*.fd` and every target over
+- `docs\roadmap\llvm-roadmap.md:2819` — **## Track RL — Reliability: trusted without decades (25)** — RL13. Deterministic output: no hash-map order reaches code generation; the
+- `docs\roadmap\llvm-roadmap.md:2826` — **## Track RL — Reliability: trusted without decades (25)** — RL14. The fixpoint built by our own backend: stage 2 == stage 3 through
+- `docs\roadmap\llvm-roadmap.md:2837` — **## Track RL — Reliability: trusted without decades (25)** — RL15. Sanitizer runs of the compiler itself through the C path (ASan,
+- `docs\roadmap\llvm-roadmap.md:2954` — **## Track RL — Reliability: trusted without decades (25)** — RL22. Two independent paths kept on purpose: our backend and the C path. A
+- `docs\roadmap\llvm-roadmap.md:2969` — **## Track RL — Reliability: trusted without decades (25)** — RL25. Every target's ABI tested against C: calls into C and callbacks from C
+- `docs\roadmap\llvm-roadmap.md:3006` — **## Track DB — Debugging and visibility (10)** — DB1. Line tables from the IR to MIR to bytes: every instruction knows its
+- `docs\roadmap\llvm-roadmap.md:3054` — **## Track DB — Debugging and visibility (10)** — DB2. DWARF on Linux and macOS: line numbers, functions, frames (L).
+- `docs\roadmap\llvm-roadmap.md:3111` — **## Track DB — Debugging and visibility (10)** — DB4. Locations of variables at `-O0`-like debug builds, in registers and
+- `docs\roadmap\llvm-roadmap.md:3135` — **## Track DB — Debugging and visibility (10)** — DB6. Unwind information (Windows `.pdata`, DWARF CFI) so system debuggers and
+- `docs\roadmap\release-roadmap.md:116` — **## Track A — Release foundations** — A4. The suite runs on the self-hosted compiler too, not only `fidesc` (M).
+- `docs\roadmap\release-roadmap.md:155` — **## Track A — Release foundations** — A11. `verify-selfhost.sh` baseline restored (S). Saved at 36/47 on all three
+- `docs\roadmap\release-roadmap.md:363` — **## Track D — Native performance** — D9. `emit` of hello world under 0.5 s: stop re-checking the stdlib on each
+- `docs\roadmap\roadmap.md:724` — **#### Planned** — Serverless — `@serverless`, cold-start optimization
+- `docs\roadmap\roadmap.md:8340` — **#### Milestones** — Embeddable (like Rust Playground)

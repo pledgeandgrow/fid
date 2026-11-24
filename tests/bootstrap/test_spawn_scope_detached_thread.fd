@@ -1,0 +1,32 @@
+// BG119 (docs/roadmap/bugs-roadmap.md): `spawn detached f()` of a plain
+// function (an OS thread, not a green task) inside a `spawn scope { }`
+// was joined at the scope's end anyway — the lowering emitted p_co_detach
+// for a green task only, and the native runtimes' p_co_detach took no
+// thread future. Now the thread's future word goes to p_co_detach and the
+// scope's join skips it, as the C runtime's does. If the scope joined
+// `slow` here it would wait forever — the flag is set after the scope.
+// `emit` covers the pe_ir runtime's executor scan the same way.
+//@ backends: ccompile,emit
+//
+// Expected output:
+// scope done
+// later: 1
+
+fn slow(flag: i64) -> i64 {
+    while p_atomic_load(flag) == 0 {
+        p_atomic_add(flag, 0);
+    }
+    return 1;
+}
+
+fn main() -> i64 {
+    val flag = p_shared_alloc(8);
+    p_atomic_store(flag, 0);
+    spawn scope {
+        spawn detached slow(flag);
+    }
+    println("scope done");
+    p_atomic_store(flag, 1);
+    println("later: 1");
+    return 0;
+}

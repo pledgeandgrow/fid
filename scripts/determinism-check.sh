@@ -13,7 +13,7 @@
 #              be listed with its reason in scripts/determinism-allow.txt.
 #   2. c       the same scan over the C of the compiler, which also sees a
 #              `for k in map` (lowered to HashMap_keys) with the function it
-#              is in: COMPILER_C=<file> (e.g. release/fid-dev.c of the
+#              is in: COMPILER_C=<file> (e.g. build/selfhost/fid-dev.c of the
 #              build), or SELF=1 to write it with `$FID dump-c
 #              compiler/main.fd` twice, which also compares the two C texts.
 #              Without either the step is skipped (and said so).

@@ -20,7 +20,7 @@
 FID=${FID:-release/fid.exe}
 export CC=${CC:-zig cc}
 P=tests/projects/interp_io
-D=$(mktemp -d ./_interp_io.XXXXXX)
+D=$(mktemp -d ./tests/_interp_io.XXXXXX)
 D=${D#./}
 trap 'rm -rf "$D"' EXIT
 fail=0

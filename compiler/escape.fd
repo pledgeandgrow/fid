@@ -1158,7 +1158,22 @@ fn esc_check_return(self: &mut EscapeChecker, roots: Vec<EscRoot>) {
             if self.closure_base == 0 {
                 what = "'" + self.func_name + "'";
             }
-            esc_error(self, what + " returns a reference to local '" + r.name + "', which is freed when it returns");
+            // BG138: `&a` of a variable the closure captures (esc_place)
+            var captured: bool = false;
+            if self.closure_base > 0 && r.depth == self.closure_base + 1 {
+                match esc_lookup(self, r.name) {
+                    OptEscVar::Some(cv) => {
+                        captured = cv.depth <= self.closure_base;
+                    }
+                    OptEscVar::None => {
+                    }
+                }
+            }
+            if captured {
+                esc_error(self, "a closure returns a reference to '" + r.name + "', its own copy of a captured variable, which is freed when it returns");
+            } else {
+                esc_error(self, what + " returns a reference to local '" + r.name + "', which is freed when it returns");
+            }
         }
         i = i + 1;
     }
@@ -1823,6 +1838,13 @@ fn esc_place(self: &mut EscapeChecker, e: Expr) -> Vec<EscRoot> {
         Expr::Ident(name) => {
             match esc_lookup(self, name) {
                 OptEscVar::Some(v) => {
+                    // BG138: inside a closure, a variable of an enclosing
+                    // scope is the closure's own copy (captures are by
+                    // value): `&a` points into the closure's frame, a local
+                    // of its outermost block, not at the enclosing `a`
+                    if self.closure_base > 0 && v.depth <= self.closure_base {
+                        return esc_one(esc_local(name, self.closure_base + 1));
+                    }
                     return esc_one(esc_local(name, v.depth));
                 }
                 OptEscVar::None => {

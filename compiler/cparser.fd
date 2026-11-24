@@ -20,7 +20,7 @@
 //   T** and any deeper pointer      *i64
 //   other pointers, function ptrs   i64 (an address)
 //   enums                           i32
-//   C `long`                        i32 (the Windows x64 ABI)
+//   C `long`                        i32 on Windows, i64 on LP64
 //   other integers keep their width, in parameters and results alike
 //   (int i32, unsigned u32, short i16, long long i64, size_t u64)
 //   a struct by value, va_list, `...`  not expressible yet: skipped
@@ -1737,10 +1737,19 @@ fn cp_resolve(st: &CHeaderState, base: str, ptr: i64, depth: i64) -> str {
         prim = "u16";
     }
     if base == "long" {
-        prim = "i32";
+        // BG121: 32 bits in Windows' ABI, 64 in LP64 (Linux, macOS)
+        if cp_on_windows() {
+            prim = "i32";
+        } else {
+            prim = "i64";
+        }
     }
     if base == "ulong" {
-        prim = "u32";
+        if cp_on_windows() {
+            prim = "u32";
+        } else {
+            prim = "u64";
+        }
     }
     if base == "llong" {
         prim = "i64";
@@ -2495,7 +2504,7 @@ fn cp_render_with(st: &mut CHeaderState, path: str, link: str, module_name: str,
         out.append_str(" and the " + int_to_str(st.included.len() - 1) + " headers it includes");
     }
     out.append_str(".\n// Regenerate rather than edit. Pointers other than char* are addresses\n");
-    out.append_str("// (i64), char* is str, C `long` is 32 bits (Windows x64).\n");
+    out.append_str("// (i64), char* is str, C `long` is 32 bits on Windows, 64 on LP64.\n");
     if module_name != "" {
         out.append_str("\nmodule " + module_name + ";\n");
     }
@@ -2953,7 +2962,13 @@ fn cpx_base_of(w: Vec<str>, wk: Vec<i64>, a: i64, b: i64) -> str {
         return "llong";
     }
     if longs == 1 && word == "double" {
-        return "double";
+        // BG121: as the C path — `long double` is a double only in
+        // Windows' ABI; elsewhere a value crosses as a double but a
+        // pointer to one is not expressible
+        if cp_on_windows() {
+            return "double";
+        }
+        return "ldouble";
     }
     if longs == 1 {
         if unsigned {
@@ -3145,6 +3160,15 @@ fn cpx_type(st: &mut CHeaderState, t: Vec<str>, k: Vec<i64>, a: i64, b: i64) -> 
     var base: str = cpx_base_of(words, wk, w0, words.len());
     if base == "?" {
         return cpx_ty_bad("a type this parser does not know (" + full + ")");
+    }
+    if base == "ldouble" {
+        // BG121: a long double crosses as a double by value; a pointer or
+        // reference to one aliases the wrong width — not expressible
+        if ptr == 0 && refs == 0 {
+            base = "double";
+        } else {
+            return cpx_ty_bad("a pointer or reference to long double");
+        }
     }
     if refs == 1 {
         var rf: str = cp_resolve(st, base, 0, 0);

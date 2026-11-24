@@ -417,30 +417,52 @@ fn pe_unjoined(idx: i64) -> bool {
 }
 
 /// Wait for thread idx (once): its result. Its stack is freed once the
-/// kernel has cleared its ctid word (the thread is gone).
+/// kernel has cleared its ctid word (the thread is gone). The joined flag
+/// is the state — 0 unjoined, -1 a join in progress, 1 joined — claimed
+/// by compare-and-swap so two callers cannot join it twice (BG110).
 fn pe_join(idx: i64) -> i64 {
-    if pe_unjoined(idx) {
-        var block: i64 = pe_thread_block(idx);
-        var w: i64 = nat_atomic_load(block + 96) & 4294967295;
-        while w != 0 {
-            if pe_co_self() != 0 || pe_q_any() {
-                pe_relax();
+    var s: i64 = pe_thr_slot(idx);
+    while s == 0 {
+        // the index is out but its slot is still being made: wait, as
+        // pe_thread_block does for the block word
+        pe_relax();
+        s = pe_thr_slot(idx);
+    }
+    var st: i64 = pe_ld(s + 16);
+    while st != 1 {
+        if st == 0 {
+            if nat_atomic_cas(s + 16, 0, 0 - 1) != 0 {
+                var block: i64 = pe_thread_block(idx);
+                var w: i64 = nat_atomic_load(block + 96) & 4294967295;
+                while w != 0 {
+                    if pe_co_self() != 0 || pe_q_any() {
+                        pe_relax();
+                    } else {
+                        pe_futex_wait(block + 96, w, 0 - 1, false);
+                    }
+                    w = nat_atomic_load(block + 96) & 4294967295;
+                }
+                // (the entry exists: pe_thread_block found its block)
+                pe_st(s + 8, pe_ld(block + 88));
+                var t: i64 = pe_ld(block + 104);
+                if t != 0 {
+                    pe_sys(PE_SYS_MUNMAP, pe_ld(t + 40), pe_ld(t + 48), 0);
+                    pert_free(t);
+                    pe_st(block + 104, 0);
+                }
+                nat_atomic_store(s + 16, 1);
+                st = 1;
             } else {
-                pe_futex_wait(block + 96, w, 0 - 1, false);
+                st = pe_ld(s + 16);
             }
-            w = nat_atomic_load(block + 96) & 4294967295;
-        }
-        // (the entry exists: pe_thread_block found its block)
-        pe_st(pe_thr_slot(idx) + 8, pe_ld(block + 88));
-        pe_st(pe_thr_slot(idx) + 16, 1);
-        var t: i64 = pe_ld(block + 104);
-        if t != 0 {
-            pe_sys(PE_SYS_MUNMAP, pe_ld(t + 40), pe_ld(t + 48), 0);
-            pert_free(t);
-            pe_st(block + 104, 0);
+        } else {
+            // -1: another caller joins it now; wait for the result it
+            // stores in s + 8 before returning it
+            pe_relax();
+            st = pe_ld(s + 16);
         }
     }
-    return pe_ld(pe_thr_slot(idx) + 8);
+    return pe_ld(s + 8);
 }
 
 // ─── Tasks: green threads, M:N ──────────────────────────────────────────
@@ -455,7 +477,9 @@ fn pe_join(idx: i64) -> i64 {
 // function's name, [26] the task awaiting it (set while it waits), [27] the
 // name of the task that started it (1: started off a task on a thread, 0:
 // by main); (CA7/CA8) [28] its token slot ("Token slot" below); (CA9) [29]
-// the task that entered it, while it runs inside that task's turn.
+// the task that entered it, while it runs inside that task's turn; (BG196)
+// [30] the `spawn scope` record it counts in (0: none), [31] its innermost
+// open scope ("The tasks of a spawn scope" below).
 // A future of a task is its block with the tag 0x7FA5 in the top 16 bits.
 // Run queues (competitive RT10, as pe_runtime/conc.fd): each worker owns a
 // lock-free ring (below, "Worker rings") of tasks ready to run; the global
@@ -476,6 +500,7 @@ var pe_co_live: i64 = 0;  // *i64: unfinished tasks
 var pe_co_total: i64 = 0;  // *i64: tasks there have been
 var pe_workers: i64 = 0;  // *i64: 0 none, 1 starting or started
 var pe_lq: i64 = 0;  // the worker rings: [0] how many, then PE_LQ_REC bytes each
+var pe_co_dead: i64 = 0;  // *i64: 1 once a cycle of awaits panicked (BG226)
 
 /// The scheduler's words, once (the first task comes from one thread at
 /// a time: pe_co_new_block's caller has none running yet).
@@ -488,6 +513,7 @@ fn pe_co_init() {
         pe_co_live = pe_zeroed(1);
         pe_co_total = pe_zeroed(1);
         pe_workers = pe_zeroed(1);
+        pe_co_dead = pe_zeroed(1);
         pe_q_lock = pe_zeroed(1);
         pe_ep_lock = pe_zeroed(1);
         pe_ep_n = pe_zeroed(1);
@@ -948,7 +974,7 @@ fn pe_co_new_block(name: str, nargs: i64, argv: i64) -> i64 {
         pert_panic("task: no such function" as i64);
     }
     pe_co_init();
-    var block: i64 = pe_zeroed(30);
+    var block: i64 = pe_zeroed(32);
     pe_st(block, fn_addr);
     pe_st(block + 8, nargs);
     // CA9: its name and who started it, for a panic's task chain
@@ -958,6 +984,13 @@ fn pe_co_new_block(name: str, nargs: i64, argv: i64) -> i64 {
         pe_st(block + 216, pe_ld(starter + 200));
     } else if pe_ld(pe_tls() + 16) != 0 {
         pe_st(block + 216, 1);
+    }
+    // BG196: started inside an open `spawn scope` of its starter: the
+    // scope's end waits for it (counted before it can run, or finish)
+    var scope: i64 = pe_scope_cur();
+    if scope != 0 {
+        nat_atomic_add(scope, 1);
+        pe_st(block + 240, scope);
     }
     var a: i64 = 0;
     while a < nargs && a < 8 {
@@ -1017,6 +1050,12 @@ fn pe_co_leave() {
 
 fn pe_co_finish(t: i64) {
     pe_sys(PE_SYS_MUNMAP, pe_ld(t + 120), PE_TASK_STACK + PE_GUARD, 0);
+    // BG196: one task less for the scope it was started in (before the
+    // wake below, which its end waits for)
+    var scope: i64 = pe_ld(t + 240);
+    if scope != 0 {
+        nat_atomic_add(scope, 0 - 1);
+    }
     nat_atomic_store(t + 120, 0);
     nat_atomic_add(pe_co_live, 0 - 1);
     nat_atomic_add(pe_done_seq, 1);
@@ -1152,6 +1191,33 @@ fn pe_is_co_future(f: i64) -> bool {
     return ((f >> 48) & 0xFFFF) == 0x7FA5;
 }
 
+/// BG226: whether task `me` awaiting task `c` closes a cycle of awaits (the
+/// C runtime's BG96 check): the chain of tasks awaiting me (each one's
+/// [26], set while it waits) reaches c, so none of them can ever finish. A
+/// finished task ends the chain (its [26] is stale).
+fn pe_co_await_cycle(me: i64, c: i64) -> bool {
+    if c == me {
+        return true;
+    }
+    var w: i64 = me;
+    var steps: i64 = 0;
+    while steps < 1024 {
+        var a: i64 = pe_ld(w + 208);
+        if a == 0 || nat_atomic_load(a + 80) != 0 {
+            return false;
+        }
+        if a == c {
+            return true;
+        }
+        if a == me {
+            return false;
+        }
+        w = a;
+        steps = steps + 1;
+    }
+    return false;
+}
+
 fn pe_co_await(f: i64) -> i64 {
     var c: i64 = f & 0xFFFFFFFFFFFF;
     // CA9: the task awaiting it, for a panic's task chain
@@ -1162,6 +1228,13 @@ fn pe_co_await(f: i64) -> i64 {
     // CA7: with a token in the slot, give up (0) once it is cancelled
     var tok: i64 = pert_task_token();
     while nat_atomic_load(c + 80) == 0 {
+        // BG226: two tasks that await each other hung; the await that
+        // closes the cycle panics, as in the C runtime (looked at on each
+        // wake: the other one's mark may not be seen at once)
+        // (one panic: another task of the cycle that sees it waits on)
+        if me != 0 && pe_co_await_cycle(me, c) && nat_atomic_cas(pe_co_dead, 0, 1) != 0 {
+            pert_panic("Tasks are deadlocked: each one awaits another" as i64);
+        }
         if tok != 0 && pe_tok_cancelled(tok) {
             if me != 0 && pe_ld(c + 208) == me {
                 pe_st(c + 208, 0);
@@ -1230,6 +1303,20 @@ fn pe_co_sleep_plain(ms: i64) -> i64 {
 }
 
 pub fn pert_co_detach(t: i64) {
+    // BG119: a thread future is -(index + 1): let its slot read joined —
+    // a scope's scan (pe_unjoined) skips it and nobody waits for it; the
+    // OS thread ends on its own, its stack reaped as an unjoined one's is
+    if t < 0 {
+        var idx: i64 = pe_task_index(t);
+        if idx >= 0 {
+            var ds: i64 = pe_thr_slot(idx);
+            if ds != 0 && nat_atomic_cas(ds + 16, 0, 0 - 1) != 0 {
+                pe_st(ds + 8, 0);
+                nat_atomic_store(ds + 16, 1);
+            }
+        }
+        return;
+    }
     var b: i64 = t & 0xFFFFFFFFFFFF;
     nat_atomic_store(b + 160, 1);
     // Already finished and its stack gone: nobody frees it but us
@@ -1765,13 +1852,19 @@ pub fn pe_co_print_chain(fd: i64) {
     pe_write_all(fd, "task chain: " as i64, 12);
     var depth: i64 = 0;
     var more: bool = true;
+    var first: i64 = c;
     while more {
         pe_co_put_name(fd, pe_ld(c + 200));
         var next: i64 = pe_ld(c + 208);
         if next == 0 {
             next = pe_ld(c + 232);
         }
-        if next != 0 && depth < 64 {
+        if next == first {
+            // BG226: a cycle of awaits ends where it began
+            pe_write_all(fd, " <- " as i64, 4);
+            pe_co_put_name(fd, pe_ld(first + 200));
+            more = false;
+        } else if next != 0 && depth < 64 {
             pe_write_all(fd, " <- " as i64, 4);
             c = next;
             depth = depth + 1;
@@ -1853,9 +1946,81 @@ pub fn pert_task_poll_nonblocking(f: i64) -> i64 {
 }
 
 pub fn pert_executor_new() -> i64 {
-    var e: i64 = pert_executor_count;
-    pert_executor_count = e + 1;
-    return e;
+    // The index the first not-yet-spawned thread will take: the scans below
+    // join the threads started after this executor, as the C runtime's
+    // p_executor_new does (BG45 — a scope joins only the threads it
+    // started, and never a detached one)
+    var exec: i64 = pe_thread_count();
+    // BG196: and the green tasks started inside it (below)
+    pe_scope_open(exec);
+    return exec;
+}
+
+// ─── The tasks of a `spawn scope` (BG196) ──────────────────────────────
+// p_executor_new opens a scope record on the running context (a task's
+// [31], else word 0 of the thread's TLS table, which no key names): [0] how
+// many tasks started inside it are unfinished, [8] the scope it was opened
+// in, [16] the executor (to close the right one). A task started while a
+// scope is open counts in it ([30]); the scope's end (p_executor_run_all)
+// waits for those only, as the C runtime's __p_ft_scan joins only the
+// scope's threads. It waited for every live task (pe_co_drain): for tasks
+// started before the scope or elsewhere, and for the task the scope is in,
+// which never ends while it waits.
+
+/// The innermost open scope of the running context, 0 if none.
+fn pe_scope_cur() -> i64 {
+    var c: i64 = pe_co_self();
+    if c != 0 {
+        return pe_ld(c + 248);
+    }
+    return pe_ld(pe_tls_table());
+}
+
+fn pe_scope_set(rec: i64) {
+    var c: i64 = pe_co_self();
+    if c != 0 {
+        pe_st(c + 248, rec);
+    } else {
+        pe_st(pe_tls_table(), rec);
+    }
+}
+
+fn pe_scope_open(exec: i64) {
+    var rec: i64 = pe_zeroed(3);
+    pe_st(rec + 8, pe_scope_cur());
+    pe_st(rec + 16, exec);
+    pe_scope_set(rec);
+}
+
+/// Close the innermost open scope of executor `exec`: wait until the tasks
+/// started inside it have finished; how many there were still running. 0
+/// when the running context has no such scope.
+fn pe_scope_close(exec: i64) -> i64 {
+    var prev: i64 = 0;
+    var rec: i64 = pe_scope_cur();
+    while rec != 0 && pe_ld(rec + 16) != exec {
+        prev = rec;
+        rec = pe_ld(rec + 8);
+    }
+    if rec == 0 {
+        return 0;
+    }
+    if prev == 0 {
+        pe_scope_set(pe_ld(rec + 8));
+    } else {
+        pe_st(prev + 8, pe_ld(rec + 8));
+    }
+    var running: i64 = nat_atomic_load(rec);
+    while nat_atomic_load(rec) > 0 {
+        var seen: i64 = nat_atomic_load(pe_done_seq);
+        if nat_atomic_load(rec) == 0 {
+            break;
+        }
+        // a task gives its turn; a thread runs queued tasks or sleeps
+        pe_wait_word(pe_done_seq, seen, 10);
+    }
+    pert_free(rec);
+    return running;
 }
 
 pub fn pert_executor_block_on(exec: i64, f: i64) -> i64 {
@@ -1863,11 +2028,14 @@ pub fn pert_executor_block_on(exec: i64, f: i64) -> i64 {
 }
 
 /// Join every thread and task still running; the number joined. `spawn
-/// scope { }` exits through here.
+/// scope { }` exits through here (BG196: the tasks started inside it).
 pub fn pert_executor_run_all(exec: i64) -> i64 {
     var count: i64 = 0;
     var n: i64 = pe_thread_count();
-    var i: i64 = 0;
+    var i: i64 = exec;
+    if i < 0 {
+        i = 0;
+    }
     while i < n {
         if pe_unjoined(i) {
             pe_join(i);
@@ -1875,19 +2043,17 @@ pub fn pert_executor_run_all(exec: i64) -> i64 {
         }
         i = i + 1;
     }
-    var joined: i64 = 0;
-    if pe_co_live != 0 {
-        joined = nat_atomic_load(pe_co_live);
-    }
-    pe_co_drain();
-    return count + joined;
+    return count + pe_scope_close(exec);
 }
 
 /// Join the finished threads; the number still running.
 pub fn pert_executor_poll_all(exec: i64) -> i64 {
     var pending: i64 = 0;
     var n: i64 = pe_thread_count();
-    var i: i64 = 0;
+    var i: i64 = exec;
+    if i < 0 {
+        i = 0;
+    }
     while i < n {
         if pe_unjoined(i) {
             if pe_task_done(i) {
@@ -1907,7 +2073,10 @@ pub fn pert_executor_poll_all(exec: i64) -> i64 {
 pub fn pert_executor_cancel(exec: i64) -> i64 {
     var count: i64 = 0;
     var n: i64 = pe_thread_count();
-    var i: i64 = 0;
+    var i: i64 = exec;
+    if i < 0 {
+        i = 0;
+    }
     while i < n {
         if pe_unjoined(i) {
             var was_done: bool = pe_task_done(i);

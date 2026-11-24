@@ -1,0 +1,70 @@
+// Bugs roadmap BG185: a struct literal of a generic struct whose
+// type-parameter field is given a struct (`Slot { v: self, n: 42 }` in a
+// generic method, `Slot { v: a, n: 42 }` of a local) stored the address of
+// that value when the instance owns nothing (lower.fd
+// Lowerer_lower_struct_lit_expr made the heap copy only for an owning
+// instance). Returned from the function, the field pointed into its dead
+// frame: `w3.get()` read 0 0 on run and garbage on C. The value is copied
+// to the heap as for an owning instance.
+//
+// Expected output:
+// 3
+// 7
+// 3
+// 55
+// 9
+// 3
+// 42
+// 11
+// 4
+
+struct Slot<T> {
+    v: T,
+    n: i64,
+}
+
+impl<T> Slot<T> {
+    fn get(self) -> T {
+        return self.v;
+    }
+    fn wrap(self) -> Slot<Slot<T>> {
+        return Slot { v: self, n: 42 };
+    }
+}
+
+fn mkw(x: i64) -> Slot<Slot<i64>> {
+    val a: Slot<i64> = Slot { v: x, n: 3 };
+    return a.wrap();
+}
+
+fn mkl(x: i64) -> Slot<Slot<i64>> {
+    val a: Slot<i64> = Slot { v: x, n: 4 };
+    return Slot { v: a, n: 1 };
+}
+
+// writes over the stack the dead frames used
+fn smash(k: i64) -> i64 {
+    var s: [i64; 8] = [k, k, k, k, k, k, k, k];
+    return s[3];
+}
+
+fn main() -> i64 {
+    val a: Slot<i64> = Slot { v: 7, n: 3 };
+    val w: Slot<Slot<i64>> = a.wrap();
+    println(w.v.n);
+    val g = w.get();
+    println(g.v);
+    println(g.n);
+    val w3: Slot<Slot<i64>> = mkw(9);
+    println(smash(55));
+    val g3 = w3.get();
+    println(g3.v);
+    println(g3.n);
+    println(w3.n);
+    val w4: Slot<Slot<i64>> = mkl(11);
+    val z: i64 = smash(66);
+    val g4 = w4.get();
+    println(g4.v + z - 66);
+    println(w4.v.n);
+    return 0;
+}

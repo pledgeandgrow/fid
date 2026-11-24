@@ -63,6 +63,8 @@ pub const RESP_PUSH: i64 = 62;  // '>'
 pub const RESP_MAX_DEPTH: i64 = 64;
 /// Largest bulk string accepted (Redis' own proto-max-bulk-len default).
 pub const RESP_MAX_BULK: i64 = 536870912;
+/// Largest element count of an aggregate (hiredis' limit, 2^32 - 1).
+pub const RESP_MAX_COUNT: i64 = 4294967295;
 
 // ─── Encoding ─────────────────────────────────────────────────────────────
 
@@ -328,6 +330,8 @@ fn rs_parse_int(s: str, ok: &mut bool) -> i64 {
             return 0;
         }
     }
+    // Accumulated as a negative number, so i64's minimum parses and nothing
+    // past it can overflow: v * 10 - digit stays >= -2^63 by the check.
     var v: i64 = 0;
     while i < n {
         val c: i64 = str_byte_at(s, i);
@@ -335,17 +339,22 @@ fn rs_parse_int(s: str, ok: &mut bool) -> i64 {
             *ok = false;
             return 0;
         }
-        if v > 922337203685477580 {
+        if v < 0 - 922337203685477580 || (v == 0 - 922337203685477580 && c - 48 > 8) {
             *ok = false;
             return 0;
         }
-        v = v * 10 + (c - 48);
+        v = v * 10 - (c - 48);
         i = i + 1;
     }
     if neg {
-        return 0 - v;
+        return v;
     }
-    return v;
+    if v < 0 - 9223372036854775807 {
+        // 2^63 has no positive i64
+        *ok = false;
+        return 0;
+    }
+    return 0 - v;
 }
 
 fn rs_len_line(r: &mut RsReader) -> i64 {
@@ -355,7 +364,8 @@ fn rs_len_line(r: &mut RsReader) -> i64 {
     }
     var good: bool = true;
     val n: i64 = rs_parse_int(line, &mut good);
-    if !good || n < 0 - 1 {
+    // RESP_MAX_COUNT also keeps a map's 2 * n from overflowing
+    if !good || n < 0 - 1 || n > RESP_MAX_COUNT {
         rs_fail(r, "bad length");
         return 0;
     }
@@ -416,7 +426,8 @@ fn rs_item(d: &mut RespDoc, r: &mut RsReader, depth: i64) -> i64 {
             return 0 - 1;
         }
         rs_set_kids(d, an, ids);
-        val target: i64 = rs_item(d, r, depth);
+        // one level deeper: a chain of attributes counts towards the limit
+        val target: i64 = rs_item(d, r, depth + 1);
         if r.ok {
             d.attrs.set(target, an);
         }

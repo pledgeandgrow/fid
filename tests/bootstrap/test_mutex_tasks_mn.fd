@@ -1,0 +1,95 @@
+// Bugs roadmap BG148, with four workers (M:N tasks): see
+// test_mutex_tasks.fd. A task holding the mutex across task_sleep may go on
+// on another worker; the pthread mutex it held could then be unlocked from
+// a thread that did not lock it, and tasks of one worker both entered it
+// (13 of 15 on Windows). Also OS threads (spawn) and main contending for
+// one mutex, a task_sleep inside the section now and then: a thread off a
+// task sleeps on the mutex's condition variable until an unlock wakes it.
+// C only, as test_mutex_tasks.fd.
+//@ env: FIDES_WORKERS=4
+//@ backends: ccompile
+//
+// Expected output:
+// 6
+// 15
+// 15
+// 1600
+// 1600
+use task;
+
+var M: i64 = 0;
+var TOTAL: i64 = 0;
+var TM: i64 = 0;
+var TT: i64 = 0;
+
+async fn holder(m: i64, total: i64, id: i64) -> Future<i64> {
+    var i: i64 = 0;
+    while i < 5 {
+        p_mutex_lock(m);
+        val v = p_atomic_load(total);
+        task_sleep(2);
+        p_atomic_store(total, v + 1);
+        p_mutex_unlock(m);
+        i = i + 1;
+    }
+    return id;
+}
+
+fn go_holder(id: i64) -> i64 {
+    var i: i64 = 0;
+    while i < 5 {
+        p_mutex_lock(M);
+        val v = p_atomic_load(TOTAL);
+        task_sleep(2);
+        p_atomic_store(TOTAL, v + 1);
+        p_mutex_unlock(M);
+        i = i + 1;
+    }
+    return id;
+}
+
+fn bump(n: i64) -> i64 {
+    var i: i64 = 0;
+    while i < n {
+        p_mutex_lock(TM);
+        val v = p_atomic_load(TT);
+        if i % 50 == 0 {
+            task_sleep(1);
+        }
+        p_atomic_store(TT, v + 1);
+        p_mutex_unlock(TM);
+        i = i + 1;
+    }
+    return n;
+}
+
+fn main() -> i64 {
+    val m = p_mutex_init();
+    val total = p_shared_alloc(8);
+    p_atomic_store(total, 0);
+    val a = holder(m, total, 1);
+    val b = holder(m, total, 2);
+    val c = holder(m, total, 3);
+    println(await a + await b + await c);
+    println(p_atomic_load(total));
+
+    M = p_mutex_init();
+    TOTAL = p_shared_alloc(8);
+    p_atomic_store(TOTAL, 0);
+    task_go("go_holder", 1);
+    task_go("go_holder", 2);
+    task_go("go_holder", 3);
+    task_run();
+    println(p_atomic_load(TOTAL));
+
+    TM = p_mutex_init();
+    TT = p_shared_alloc(8);
+    p_atomic_store(TT, 0);
+    val t1 = spawn bump(400);
+    val t2 = spawn bump(400);
+    val t3 = spawn bump(400);
+    val d = bump(400);
+    println(await t1 + await t2 + await t3 + d);
+    println(p_atomic_load(TT));
+    return 0;
+}

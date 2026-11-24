@@ -2762,8 +2762,17 @@ pub fn build_program_no_std_borrowck(source: str, source_path: OptStr, borrowck_
                         p_eprint_str("[build] No-std: loading import: ");
                         p_eprint_str(found_path);
                         p_eprint_str("\n");
-                        var module_source: str = p_file_read(found_path);
-                        if (module_source as i64) == 0 {
+                        var module_source: str = "";
+                        var module_source__ok: bool = false;
+                        match read_file(found_path) {
+                            Option::Some(module_source__t) => {
+                                module_source = module_source__t;
+                                module_source__ok = true;
+                            }
+                            Option::None => {
+                            }
+                        }
+                        if !module_source__ok {
                             p_eprint_str("[build] Warning: could not read: ");
                             p_eprint_str(found_path);
                             p_eprint_str("\n");
@@ -3180,8 +3189,17 @@ pub fn get_cached_stdlib() -> OptProgram {
         return g_stdlib_cache;
     }
     // Parse stdlib/core.fd
-    var stdlib_raw: str = p_file_read(c_path_join(stdlib_dir(), "core.fd"));
-    if (stdlib_raw as i64) == 0 {
+    var stdlib_raw: str = "";
+    var stdlib_raw__ok: bool = false;
+    match read_file(c_path_join(stdlib_dir(), "core.fd")) {
+        Option::Some(stdlib_raw__t) => {
+            stdlib_raw = stdlib_raw__t;
+            stdlib_raw__ok = true;
+        }
+        Option::None => {
+        }
+    }
+    if !stdlib_raw__ok {
         return OptProgram::None;
     }
     g_stdlib_hash = hash_source(stdlib_raw);
@@ -3209,6 +3227,7 @@ var g_astcache_hit: bool = false;
 var g_astcache_lib_hash: i64 = 0;
 var g_astcache_rt_files: Vec<str> = Vec::new();
 var g_astcache_rt_raws: Vec<str> = Vec::new();
+var g_astcache_core_raw: str = "";
 fn astcache_path(lib_hash: i64) -> str {
     var over: str = env_or_empty("FID_ASTCACHE");
     if str_len(over) > 0 {
@@ -4430,7 +4449,20 @@ fn astcache_save(lib_hash: i64, core_p: Program, merged_p: Program, same: bool) 
         aw_str(&mut b, lib_pairs.get(lpi));
         lpi = lpi + 1;
     }
-    p_file_write_vec(astcache_path(lib_hash), b.bytes);
+    // BG35/BG123: a `comptime splice` in a library source expands at parse;
+    // the merged Program an artifact decodes replays that expansion with no
+    // record of it — keep it out of the cache, as an imported module's is
+    var lscan: ImpScan = imp_scan(g_astcache_core_raw);
+    var lkeep: bool = !imp_has_word(&lscan, "splice");
+    var lri: i64 = 0;
+    while lkeep && lri < g_astcache_rt_raws.len() {
+        var lrs: ImpScan = imp_scan(g_astcache_rt_raws.get(lri));
+        lkeep = !imp_has_word(&lrs, "splice");
+        lri = lri + 1;
+    }
+    if lkeep {
+        p_file_write_vec(astcache_path(lib_hash), b.bytes);
+    }
 }
 
 // Load stdlib: reads core + the runtime files once (the lib_hash fold needs
@@ -4465,10 +4497,20 @@ fn astcache_load() -> OptProgram {
             }
         }
     }
-    var core_raw: str = p_file_read(c_path_join(stdlib_dir(), "core.fd"));
-    if (core_raw as i64) == 0 {
+    var core_raw: str = "";
+    var core_raw__ok: bool = false;
+    match read_file(c_path_join(stdlib_dir(), "core.fd")) {
+        Option::Some(core_raw__t) => {
+            core_raw = core_raw__t;
+            core_raw__ok = true;
+        }
+        Option::None => {
+        }
+    }
+    if !core_raw__ok {
         return OptProgram::None;
     }
+    g_astcache_core_raw = core_raw;
     g_stdlib_hash = hash_source(core_raw);
     var lib_hash: i64 = g_stdlib_hash;
     g_astcache_rt_files = rt_files;
@@ -4477,8 +4519,17 @@ fn astcache_load() -> OptProgram {
     while rti < rt_files.len() {
         var rt_path: str = pe_runtime_path(rt_files.get(rti));
         inc_record_file(rt_path);
-        var rt_raw: str = p_file_read(rt_path);
-        if (rt_raw as i64) == 0 {
+        var rt_raw: str = "";
+        var rt_raw__ok: bool = false;
+        match read_file(rt_path) {
+            Option::Some(rt_raw__t) => {
+                rt_raw = rt_raw__t;
+                rt_raw__ok = true;
+            }
+            Option::None => {
+            }
+        }
+        if !rt_raw__ok {
             p_eprint_str("[build] PE runtime source not found: " + rt_path + "\n");
             return OptProgram::None;
         }
@@ -5164,6 +5215,21 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                     // A user function named like a function of one imported
                     // module: each side keeps its own (module__name).
                     cc_qualify_shadowed_imports(&mut imported_modules, imported_module_names, &mut user, stdlib);
+                    // BG142/BG143/BG173: likewise a const, global or type
+                    // alias of one name in two modules (or the program and
+                    // a module): each keeps its own (module__name)
+                    var vr_user_module: str = "main";
+                    match user.module {
+                        OptStr::Some(vrum) => {
+                            vr_user_module = vrum;
+                        }
+                        OptStr::None => {
+                        }
+                    }
+                    var vr_errors: Vec<str> = cc_qualify_shadowed_values(&mut imported_modules, imported_module_names, &mut user, vr_user_module, stdlib);
+                    if vr_errors.len() > 0 {
+                        return ResultProgram::Err(vr_errors);
+                    }
                     t_t = time_mark("merge: shadowed imports", t_t);
 
                     // `cap Sub: Super`: Sub carries Super's methods.
@@ -5261,6 +5327,19 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                     g_cfg_features = cfg_ark_features(base_dir);
                     ct_sync_target();
                     apply_cfg_filter(&mut program);
+                    // CF26/CF27: the type checker registers the modules the
+                    // merge took — it must see the filter too, or a call of
+                    // a @cfg-removed function passes checking, and a struct
+                    // a @cfg picked is the one removed
+                    apply_cfg_filter(&mut stdlib);
+                    var cfgmi: i64 = 0;
+                    while cfgmi < imported_modules.len() {
+                        var cfg_prog: Program = imported_modules.get(cfgmi);
+                        apply_cfg_filter(&mut cfg_prog);
+                        imported_modules.set(cfgmi, cfg_prog);
+                        cfgmi = cfgmi + 1;
+                    }
+                    apply_cfg_filter(&mut user);
 
                     // Phase 7.7: Process @derive annotations
                     process_derive(&mut program);
@@ -8334,6 +8413,21 @@ fn lint_perf_expr(e: Expr, fname: str, depth: i64, site: i64, str_names: Vec<str
     }
 }
 
+// CA4/BG118: the lock-order check every build path runs, not only
+// `fid check` — a cycle is a compile error ("error: <desc>"), and
+// FID_LOCKCHECK=off disables it as in cmd_check.
+pub fn c_lockcheck_errors(module: &IrModule) -> Vec<str> {
+    var errs: Vec<str> = Vec::new();
+    if env_or_empty("FID_LOCKCHECK") == "off" {
+        return errs;
+    }
+    var lcr: LockCheckResult = lockcheck_module(module);
+    if lcr.cycle {
+        errs.push("error: " + lcr.cycle_desc);
+    }
+    return errs;
+}
+
 /// Lower source to an IR module.
 pub fn lower_to_ir_module(source: str) -> ResultIrModule {
     var result: ResultProgram = build_program(source);
@@ -8376,6 +8470,10 @@ pub fn lower_to_ir_module_with_path(source: str, source_path: str, borrowck_mode
             // inc-roadmap B1: one IrModule per source module, linked back
             if str_len(env_or_empty("FID_IR_UNITS")) > 0 {
                 module = c_ir_units(module);
+            }
+            var lc_errs: Vec<str> = c_lockcheck_errors(&module);
+            if lc_errs.len() > 0 {
+                return ResultIrModule::Err(lc_errs);
             }
             time_mark("lower", t_lw);
             return ResultIrModule::Ok(module);
@@ -8898,6 +8996,9 @@ fn cc_find_module_conflicts(stdlib: Program, imported: Vec<Program>, names: Vec<
     var struct_ix: i64 = HashMap_new();
     var struct_mods_of: Vec<Vec<str>> = Vec::new();
     var struct_shapes_of: Vec<Vec<str>> = Vec::new();
+    var enum_ix: i64 = HashMap_new();
+    var enum_mods_of: Vec<Vec<str>> = Vec::new();
+    var enum_shapes_of: Vec<Vec<str>> = Vec::new();
     var core_structs: i64 = HashMap_new();
     var c0: i64 = 0;
     while c0 < stdlib.structs.len() {
@@ -8997,11 +9098,72 @@ fn cc_find_module_conflicts(stdlib: Program, imported: Vec<Program>, names: Vec<
             }
             si = si + 1;
         }
+        // BG143: two enums of one name merge into one (the later wins), so
+        // the other module's variants were "no variant" errors. The same
+        // variants (the Opt* enums several compiler modules declare) are
+        // one enum, as structs of the same fields are.
+        var ei: i64 = 0;
+        while ei < prog.enums.len() {
+            var en: EnumDef = prog.enums.get(ei);
+            var eshape: str = cc_enum_shape(en);
+            var eix: i64 = HashMap_get(enum_ix, en.name);
+            if eix > 0 {
+                var emods: Vec<str> = enum_mods_of.get(eix - 1);
+                var eshapes: Vec<str> = enum_shapes_of.get(eix - 1);
+                var ek: i64 = 0;
+                while ek < emods.len() {
+                    if emods.get(ek) != module && eshapes.get(ek) != eshape {
+                        errors.push("Duplicate definition: enum '" + en.name + "' is defined differently in module '" + emods.get(ek) + "' and module '" + module + "'\n    Fix: rename one of them, or define the enum once in a module both `use`");
+                    }
+                    ek = ek + 1;
+                }
+                emods.push(module);
+                eshapes.push(eshape);
+                enum_mods_of.set(eix - 1, emods);
+                enum_shapes_of.set(eix - 1, eshapes);
+            } else {
+                var enm: Vec<str> = Vec::new();
+                enm.push(module);
+                enum_mods_of.push(enm);
+                var ensh: Vec<str> = Vec::new();
+                ensh.push(eshape);
+                enum_shapes_of.push(ensh);
+                HashMap_insert(enum_ix, en.name, enum_mods_of.len());
+            }
+            ei = ei + 1;
+        }
         mi = mi + 1;
     }
     HashMap_drop(func_ix);
     HashMap_drop(struct_ix);
+    HashMap_drop(enum_ix);
     HashMap_drop(core_structs);
+}
+
+/// An enum's type parameters, variants and payload types, as text.
+fn cc_enum_shape(e: EnumDef) -> str {
+    var s: str = int_to_str(e.type_params.len()) + ":";
+    var vi: i64 = 0;
+    while vi < e.variants.len() {
+        var v: EnumVariant = e.variants.get(vi);
+        s = s + v.name;
+        match v.data {
+            OptParams::Some(vps) => {
+                s = s + "(";
+                var pi: i64 = 0;
+                while pi < vps.len() {
+                    s = s + type_to_str(vps.get(pi).ty) + ",";
+                    pi = pi + 1;
+                }
+                s = s + ")";
+            }
+            OptParams::None => {
+            }
+        }
+        s = s + ";";
+        vi = vi + 1;
+    }
+    return s;
 }
 
 fn cc_find_duplicate_funcs(prog: Program, module: str, errors: &mut Vec<str>) {
@@ -9983,21 +10145,23 @@ pub fn process_derive(program: &mut Program) {
 
                     if arg == "Debug" {
                         var func_name: str = str_concat(s.name, "_debug_str");
-                        var field_list: str = "";
+                        // "S(f0: <v0>, f1: <v1>)" — each field's value, as
+                        // Serialize turns a field into JSON text
+                        var debug_expr: Expr = Expr::StringLit(s.name + "(");
                         var f: i64 = 0;
                         while f < s.fields.len() {
                             if f > 0 {
-                                field_list = str_concat(field_list, ", ");
+                                debug_expr = cc_add(debug_expr, Expr::StringLit(", "));
                             }
-                            field_list = str_concat(field_list, s.fields.get(f).name);
-                            field_list = str_concat(field_list, ": ?");
+                            debug_expr = cc_add(debug_expr, Expr::StringLit(s.fields.get(f).name + ": "));
+                            debug_expr = cc_add(debug_expr, cc_debug_field(s.fields.get(f).name, s.fields.get(f).ty));
                             f = f + 1;
                         }
-                        var debug_str: str = str_concat(str_concat(s.name, "("), str_concat(field_list, ")"));
+                        debug_expr = cc_add(debug_expr, Expr::StringLit(")"));
                         var params: Vec<Param> = Vec::new();
                         params.push(Param_new("self", Type::Named(s.name), false));
                         var body: Vec<Stmt> = Vec::new();
-                        body.push(Stmt::Return(OptBoxExpr::Some(Box::new(Expr::StringLit(debug_str))), 0));
+                        body.push(Stmt::Return(OptBoxExpr::Some(Box::new(debug_expr)), 0));
                         generated.push(Func_new_full(func_name, params, Type::Str, body, true));
                     }
 
@@ -11451,6 +11615,59 @@ fn cc_serialize_field(name: str, ty: Type) -> Expr {
     return Expr::Call("int_to_str", args);
 }
 
+/// @derive(Debug): the text of field `name` — a str in quotes (as in JSON),
+/// a number or bool as digits, another struct by its own S_debug_str
+fn cc_debug_field(name: str, ty: Type) -> Expr {
+    var field: Expr = Expr::FieldAccess(Box::new(Expr::Ident("self")), name);
+    var args: Vec<Expr> = Vec::new();
+    match ty {
+        Type::F32 => {
+            args.push(Expr::Cast(Box::new(field), Type::F64));
+            return Expr::Call("p_float_to_str", args);
+        }
+        Type::F64 => {
+            args.push(Expr::Cast(Box::new(field), Type::F64));
+            return Expr::Call("p_float_to_str", args);
+        }
+        Type::Bool => {
+            args.push(field);
+            return Expr::Call("p_bool_to_str", args);
+        }
+        Type::Str => {
+            args.push(field);
+            return Expr::Call("p_json_string", args);
+        }
+        Type::Named(n) => {
+            args.push(field);
+            if n == "str" {
+                return Expr::Call("p_json_string", args);
+            }
+            return Expr::Call(n + "_debug_str", args);
+        }
+        Type::I8 => {
+        }
+        Type::I16 => {
+        }
+        Type::I32 => {
+        }
+        Type::I64 => {
+        }
+        Type::U8 => {
+        }
+        Type::U16 => {
+        }
+        Type::U32 => {
+        }
+        Type::U64 => {
+        }
+        _ => {
+            return Expr::StringLit("?");
+        }
+    }
+    args.push(Expr::Cast(Box::new(field), Type::I64));
+    return Expr::Call("int_to_str", args);
+}
+
 fn cc_qualify_shadowed_imports(imported: &mut Vec<Program>, names: Vec<str>, user: &mut Program, core: Program) {
     // name -> 1 + index of the one module defining it, or -1 for several
     var definer: i64 = HashMap_new();
@@ -11559,7 +11776,10 @@ fn cc_qualify_shadowed_imports(imported: &mut Vec<Program>, names: Vec<str>, use
         }
         mi = 0;
         while mi < imported.len() {
-            if names.get(mi) == path || path_last(names.get(mi)) == path {
+            // `path` is the import path an alias maps to (a::b::c); a module
+            // is registered under its declared name (`c`): compare the last
+            // segment of each
+            if names.get(mi) == path || path_last(names.get(mi)) == path || path_last(names.get(mi)) == path_last(path) {
                 var target: str = fname;
                 var hit: bool = HashMap_get(fsets.get(mi), fname) != 0;
                 match rename_get(own.get(mi), fname) {
@@ -11655,6 +11875,1417 @@ fn cc_rename_extend(map: &mut Vec<RenameEntry>, more: Vec<RenameEntry>) {
         map.push(more.get(i));
         i = i + 1;
     }
+}
+
+// ---------------------------------------------------------------------------
+// BG142 / BG143 / BG173: consts, globals and type aliases of one name in two
+// modules (or in the program and a module, or in core and a module). The
+// merge keeps items by bare name, so one module's `K` (or `type Num`) used to
+// replace the other's for every module, and a private one then failed the
+// other module's visibility check. Each module keeps its own now: before
+// the merge a module's copy is renamed `module__K` and that module's own
+// references follow it (cc_qualify_shadowed_values). The program's own copy
+// keeps its name, as with functions (cc_qualify_shadowed_imports); core is
+// not renamed. Public consts written as the same literal value of the same
+// type (`SDL_QUIT` in sdl.fd and sdl2_h.fd, 0x100 and 256) and public
+// aliases of the same plain type are one item: they are left as they were.
+// Nothing is walked or renamed when no name is defined twice.
+//
+// A module that uses a name it does not define reaches the one module that
+// defines it publicly; when several do, the one it imports. When that is
+// still several, the use is an "Ambiguous name" error, and `ma::K` (a
+// value) or `ma::Num` (a type) names the module's copy.
+// ---------------------------------------------------------------------------
+
+// Names bound by locals, parameters and type parameters in the scope being
+// walked (only names the walk renames are kept: g_vr_watch)
+var g_vr_shadow: Vec<str> = Vec::new();
+var g_vr_watch: i64 = 0;
+// value name -> 1 + index into g_vr_vto ("" = ambiguous, g_vr_vdesc says why)
+var g_vr_vmap: i64 = 0;
+var g_vr_vto: Vec<str> = Vec::new();
+var g_vr_vdesc: Vec<str> = Vec::new();
+// renamed names that are globals: a call through one (a fn-typed global)
+var g_vr_gmap: i64 = 0;
+// type alias name -> 1 + index into g_vr_tto
+var g_vr_tmap: i64 = 0;
+var g_vr_tto: Vec<str> = Vec::new();
+var g_vr_tdesc: Vec<str> = Vec::new();
+// "seg::K" (seg: an import's name in the module walked) -> 1 + index into
+// g_vr_qto; types in g_vr_qtmap / g_vr_qtto
+var g_vr_qmap: i64 = 0;
+var g_vr_qto: Vec<str> = Vec::new();
+var g_vr_qtmap: i64 = 0;
+var g_vr_qtto: Vec<str> = Vec::new();
+var g_vr_module: str = "";
+var g_vr_errors: Vec<str> = Vec::new();
+var g_vr_reported: i64 = 0;
+
+fn cc_vr_qual(module: str, n: str) -> str {
+    return str_replace(module, "::", "__") + "__" + n;
+}
+
+fn cc_vr_import_matches(modname: str, path: str) -> bool {
+    return modname == path || path_last(modname) == path || path_last(modname) == path_last(path);
+}
+
+fn cc_vr_imports(imports: Vec<ImportDef>, modname: str) -> bool {
+    var i: i64 = 0;
+    while i < imports.len() {
+        if cc_vr_import_matches(modname, imports.get(i).path) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn cc_vr_shadowed(n: str) -> bool {
+    var i: i64 = g_vr_shadow.len() - 1;
+    while i >= 0 {
+        if g_vr_shadow.get(i) == n {
+            return true;
+        }
+        i = i - 1;
+    }
+    return false;
+}
+
+fn cc_vr_bind(n: str) {
+    if HashMap_get(g_vr_watch, n) != 0 {
+        g_vr_shadow.push(n);
+    }
+}
+
+fn cc_vr_bind_all(ns: Vec<str>) {
+    var i: i64 = 0;
+    while i < ns.len() {
+        cc_vr_bind(ns.get(i));
+        i = i + 1;
+    }
+}
+
+fn cc_vr_restore(mark: i64) {
+    while g_vr_shadow.len() > mark {
+        g_vr_shadow.pop();
+    }
+}
+
+fn cc_vr_ambiguous(what: str, n: str, desc: str) {
+    var key: str = g_vr_module + " " + what + " " + n;
+    if HashMap_get(g_vr_reported, key) != 0 {
+        return;
+    }
+    HashMap_insert(g_vr_reported, key, 1);
+    g_vr_errors.push("Ambiguous name: " + what + " '" + n + "' used in module '" + g_vr_module + "' is defined in " + desc + "\n    Fix: write the module before it (`module::" + n + "`), or rename one of them");
+}
+
+/// A value name as the module walked sees it.
+fn cc_vr_value(n: str) -> str {
+    var ix: i64 = HashMap_get(g_vr_vmap, n);
+    if ix == 0 {
+        return n;
+    }
+    if cc_vr_shadowed(n) {
+        return n;
+    }
+    var to: str = g_vr_vto.get(ix - 1);
+    if str_len(to) == 0 {
+        cc_vr_ambiguous("value", n, g_vr_vdesc.get(ix - 1));
+        return n;
+    }
+    return to;
+}
+
+fn cc_vr_type(t: Type) -> Type {
+    match t {
+        Type::Named(tn) => {
+            var ix: i64 = HashMap_get(g_vr_tmap, tn);
+            if ix == 0 || cc_vr_shadowed(tn) {
+                return t;
+            }
+            var to: str = g_vr_tto.get(ix - 1);
+            if str_len(to) == 0 {
+                cc_vr_ambiguous("type", tn, g_vr_tdesc.get(ix - 1));
+                return t;
+            }
+            return Type::Named(to);
+        }
+        Type::Array(ta, tsize) => {
+            return Type::Array(Box::new(cc_vr_type(box_type_unbox(ta))), tsize);
+        }
+        Type::ArrayConst(tac, tcp) => {
+            // `[T; N]` with a const N
+            return Type::ArrayConst(Box::new(cc_vr_type(box_type_unbox(tac))), cc_vr_value(tcp));
+        }
+        Type::Ref(tr, trm) => {
+            return Type::Ref(Box::new(cc_vr_type(box_type_unbox(tr))), trm);
+        }
+        Type::RawPtr(tp, tpm) => {
+            return Type::RawPtr(Box::new(cc_vr_type(box_type_unbox(tp))), tpm);
+        }
+        Type::Generic(tgn, tgargs) => {
+            return Type::Generic(tgn, cc_vr_types(tgargs));
+        }
+        Type::Tuple(tts) => {
+            return Type::Tuple(cc_vr_types(tts));
+        }
+        Type::Func(tfps, tfret) => {
+            return Type::Func(cc_vr_types(tfps), Box::new(cc_vr_type(box_type_unbox(tfret))));
+        }
+        Type::Assoc(tseg, ttrait, tassoc, targs) => {
+            // `ma::Num`: module ma's alias
+            if ttrait == "" && targs.len() == 0 && !cc_vr_shadowed(tseg) {
+                var qix: i64 = HashMap_get(g_vr_qtmap, tseg + "::" + tassoc);
+                if qix > 0 {
+                    return Type::Named(g_vr_qtto.get(qix - 1));
+                }
+            }
+            return t;
+        }
+        Type::ShapedTensor(tse, tsd) => {
+            return Type::ShapedTensor(Box::new(cc_vr_type(box_type_unbox(tse))), tsd);
+        }
+        _ => {
+        }
+    }
+    return t;
+}
+
+fn cc_vr_types(ts: Vec<Type>) -> Vec<Type> {
+    var out: Vec<Type> = Vec::new();
+    var i: i64 = 0;
+    while i < ts.len() {
+        out.push(cc_vr_type(ts.get(i)));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn cc_vr_opt_type(o: OptType) -> OptType {
+    match o {
+        OptType::Some(ot) => {
+            return OptType::Some(cc_vr_type(ot));
+        }
+        OptType::None => {
+        }
+    }
+    return OptType::None;
+}
+
+/// Parameter types and defaults (the names are bound by the caller)
+fn cc_vr_params(ps: Vec<Param>) -> Vec<Param> {
+    var out: Vec<Param> = Vec::new();
+    var i: i64 = 0;
+    while i < ps.len() {
+        var p: Param = ps.get(i);
+        p.ty = cc_vr_type(p.ty);
+        if p.has_default {
+            p.default_expr = cc_vr_expr(p.default_expr);
+        }
+        out.push(p);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn cc_vr_bind_params(ps: Vec<Param>) {
+    var i: i64 = 0;
+    while i < ps.len() {
+        cc_vr_bind(ps.get(i).name);
+        i = i + 1;
+    }
+}
+
+fn cc_vr_box(b: Box<Expr>) -> Box<Expr> {
+    return Box::new(cc_vr_expr(box_expr_unbox(b)));
+}
+
+fn cc_vr_opt_box(o: OptBoxExpr) -> OptBoxExpr {
+    match o {
+        OptBoxExpr::Some(ob) => {
+            return OptBoxExpr::Some(cc_vr_box(ob));
+        }
+        OptBoxExpr::None => {
+        }
+    }
+    return OptBoxExpr::None;
+}
+
+fn cc_vr_exprs(es: Vec<Expr>) -> Vec<Expr> {
+    var out: Vec<Expr> = Vec::new();
+    var i: i64 = 0;
+    while i < es.len() {
+        out.push(cc_vr_expr(es.get(i)));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn cc_vr_opt_stmts(o: OptStmts) -> OptStmts {
+    match o {
+        OptStmts::Some(os) => {
+            return OptStmts::Some(cc_vr_stmts(os));
+        }
+        OptStmts::None => {
+        }
+    }
+    return OptStmts::None;
+}
+
+fn cc_vr_bind_pattern(p: Pattern) {
+    match p {
+        Pattern::Ident(pn) => {
+            cc_vr_bind(pn);
+        }
+        Pattern::EnumVariant(_, _, pbs) => {
+            var i: i64 = 0;
+            while i < pbs.len() {
+                cc_vr_bind(pbs.get(i).name);
+                i = i + 1;
+            }
+        }
+        _ => {
+        }
+    }
+}
+
+fn cc_vr_arms(arms: Vec<MatchArm>) -> Vec<MatchArm> {
+    var out: Vec<MatchArm> = Vec::new();
+    var i: i64 = 0;
+    while i < arms.len() {
+        var arm: MatchArm = arms.get(i);
+        var mark: i64 = g_vr_shadow.len();
+        cc_vr_bind_pattern(arm.pattern);
+        arm.guard = cc_vr_opt_box(arm.guard);
+        arm.body = cc_vr_stmts(arm.body);
+        cc_vr_restore(mark);
+        out.push(arm);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn cc_vr_expr(e: Expr) -> Expr {
+    match e {
+        Expr::Ident(en) => {
+            return Expr::Ident(cc_vr_value(en));
+        }
+        Expr::Binary(ebop, ebl, ebr) => {
+            return Expr::Binary(ebop, cc_vr_box(ebl), cc_vr_box(ebr));
+        }
+        Expr::Unary(euop, eux) => {
+            return Expr::Unary(euop, cc_vr_box(eux));
+        }
+        Expr::Call(ecallee, ecargs) => {
+            var callee2: str = ecallee;
+            if HashMap_get(g_vr_gmap, ecallee) != 0 {
+                callee2 = cc_vr_value(ecallee);
+            }
+            return Expr::Call(callee2, cc_vr_exprs(ecargs));
+        }
+        Expr::MethodCall(emrecv, emname, emargs) => {
+            // `ma::K` (a value of module ma) parses as a method call with
+            // no arguments on the name `ma`
+            if emargs.len() == 0 {
+                match box_expr_unbox(emrecv) {
+                    Expr::Ident(eseg) => {
+                        var qix: i64 = HashMap_get(g_vr_qmap, eseg + "::" + emname);
+                        if qix > 0 && !cc_vr_shadowed(eseg) {
+                            return Expr::Ident(g_vr_qto.get(qix - 1));
+                        }
+                    }
+                    _ => {
+                    }
+                }
+            }
+            return Expr::MethodCall(cc_vr_box(emrecv), emname, cc_vr_exprs(emargs));
+        }
+        Expr::FieldAccess(efx, efname) => {
+            return Expr::FieldAccess(cc_vr_box(efx), efname);
+        }
+        Expr::OptionalFieldAccess(eofx, eofname) => {
+            return Expr::OptionalFieldAccess(cc_vr_box(eofx), eofname);
+        }
+        Expr::StructLit(esname, esfields, esspread) => {
+            var nf: Vec<FieldInit> = Vec::new();
+            var fi: i64 = 0;
+            while fi < esfields.len() {
+                var f: FieldInit = esfields.get(fi);
+                f.value = cc_vr_expr(f.value);
+                nf.push(f);
+                fi = fi + 1;
+            }
+            return Expr::StructLit(esname, nf, cc_vr_opt_box(esspread));
+        }
+        Expr::If(eicond, eithen, eielse) => {
+            return Expr::If(cc_vr_box(eicond), cc_vr_stmts(eithen), cc_vr_opt_stmts(eielse));
+        }
+        Expr::Range(ersa, erse, erinc) => {
+            return Expr::Range(cc_vr_box(ersa), cc_vr_box(erse), erinc);
+        }
+        Expr::Block(ebstmts) => {
+            return Expr::Block(cc_vr_stmts(ebstmts));
+        }
+        Expr::ArrayLit(eaty, eaelems) => {
+            return Expr::ArrayLit(Box::new(cc_vr_type(box_type_unbox(eaty))), cc_vr_exprs(eaelems));
+        }
+        Expr::Index(eixa, eixi) => {
+            return Expr::Index(cc_vr_box(eixa), cc_vr_box(eixi));
+        }
+        Expr::FString(efparts) => {
+            var np: Vec<FStringPart> = Vec::new();
+            var pi: i64 = 0;
+            while pi < efparts.len() {
+                match efparts.get(pi) {
+                    FStringPart::Literal(efls) => {
+                        np.push(FStringPart::Literal(efls));
+                    }
+                    FStringPart::Expr(efpe) => {
+                        np.push(FStringPart::Expr(cc_vr_expr(efpe)));
+                    }
+                }
+                pi = pi + 1;
+            }
+            return Expr::FString(np);
+        }
+        Expr::Match(emscrut, emarms) => {
+            return Expr::Match(cc_vr_box(emscrut), cc_vr_arms(emarms));
+        }
+        Expr::EnumLit(eename, eevariant, eeargs) => {
+            return Expr::EnumLit(eename, eevariant, cc_vr_exprs(eeargs));
+        }
+        Expr::Ref(erx, ermut) => {
+            return Expr::Ref(cc_vr_box(erx), ermut);
+        }
+        Expr::Deref(edx) => {
+            return Expr::Deref(cc_vr_box(edx));
+        }
+        Expr::StrConcat(escl, escr) => {
+            return Expr::StrConcat(cc_vr_box(escl), cc_vr_box(escr));
+        }
+        Expr::Try(etx) => {
+            return Expr::Try(cc_vr_box(etx));
+        }
+        Expr::Coalesce(ecol, ecor) => {
+            return Expr::Coalesce(cc_vr_box(ecol), cc_vr_box(ecor));
+        }
+        Expr::IsCheck(eicx, eictn) => {
+            return Expr::IsCheck(cc_vr_box(eicx), eictn);
+        }
+        Expr::TryBlock(etbstmts) => {
+            return Expr::TryBlock(cc_vr_stmts(etbstmts));
+        }
+        Expr::TupleLit(etlelems) => {
+            return Expr::TupleLit(cc_vr_exprs(etlelems));
+        }
+        Expr::Closure(eclparams, eclbody, eclret) => {
+            var cps: Vec<Param> = cc_vr_params(eclparams);
+            var cret: OptType = cc_vr_opt_type(eclret);
+            var mark: i64 = g_vr_shadow.len();
+            cc_vr_bind_params(eclparams);
+            var cbody: Vec<Stmt> = cc_vr_stmts(eclbody);
+            cc_vr_restore(mark);
+            return Expr::Closure(cps, cbody, cret);
+        }
+        Expr::Cast(ecax, ecaty) => {
+            return Expr::Cast(cc_vr_box(ecax), cc_vr_type(ecaty));
+        }
+        Expr::Asm(easmt, easmops) => {
+            var no: Vec<AsmOperand> = Vec::new();
+            var oi: i64 = 0;
+            while oi < easmops.len() {
+                var o: AsmOperand = easmops.get(oi);
+                o.expr = cc_vr_expr(o.expr);
+                no.push(o);
+                oi = oi + 1;
+            }
+            return Expr::Asm(easmt, no);
+        }
+        Expr::Comptime(ectx) => {
+            return Expr::Comptime(cc_vr_box(ectx));
+        }
+        Expr::ComptimeBlock(ectbstmts) => {
+            return Expr::ComptimeBlock(cc_vr_stmts(ectbstmts));
+        }
+        Expr::ComptimeReflect(ecrop, ecrty) => {
+            return Expr::ComptimeReflect(ecrop, cc_vr_type(ecrty));
+        }
+        Expr::PipeForward(epfl, epfr) => {
+            return Expr::PipeForward(cc_vr_box(epfl), cc_vr_box(epfr));
+        }
+        Expr::QuantCast(eqcx, eqcty) => {
+            return Expr::QuantCast(cc_vr_box(eqcx), cc_vr_type(eqcty));
+        }
+        Expr::Await(eawx) => {
+            return Expr::Await(cc_vr_box(eawx));
+        }
+        Expr::Spawn(espx) => {
+            return Expr::Spawn(cc_vr_box(espx));
+        }
+        Expr::Yield(eyx) => {
+            return Expr::Yield(cc_vr_box(eyx));
+        }
+        Expr::NamedArg(enaname, enax) => {
+            return Expr::NamedArg(enaname, cc_vr_box(enax));
+        }
+        _ => {
+        }
+    }
+    return e;
+}
+
+/// A block: a `val`/`var` hides a renamed name for the statements after it.
+fn cc_vr_stmts(stmts: Vec<Stmt>) -> Vec<Stmt> {
+    var mark: i64 = g_vr_shadow.len();
+    var out: Vec<Stmt> = Vec::new();
+    var i: i64 = 0;
+    while i < stmts.len() {
+        var s2: Stmt = cc_vr_stmt(stmts.get(i));
+        match s2 {
+            Stmt::Let(sbname, _, _, _, _, _, _) => {
+                cc_vr_bind(sbname);
+            }
+            Stmt::LetTuple(sbnames, _, _) => {
+                cc_vr_bind_all(sbnames);
+            }
+            Stmt::LetUninit(sbuname, _, _, _) => {
+                cc_vr_bind(sbuname);
+            }
+            _ => {
+            }
+        }
+        out.push(s2);
+        i = i + 1;
+    }
+    cc_vr_restore(mark);
+    return out;
+}
+
+fn cc_vr_stmt(s: Stmt) -> Stmt {
+    match s {
+        Stmt::Let(slname, slty, slexpr, slmut, slpersist, slann, slline) => {
+            return Stmt::Let(slname, cc_vr_opt_type(slty), cc_vr_expr(slexpr), slmut, slpersist, slann, slline);
+        }
+        Stmt::LetTuple(sltnames, sltexpr, sltline) => {
+            return Stmt::LetTuple(sltnames, cc_vr_expr(sltexpr), sltline);
+        }
+        Stmt::LetUninit(sluname, sluty, sluann, sluline) => {
+            return Stmt::LetUninit(sluname, cc_vr_type(sluty), sluann, sluline);
+        }
+        Stmt::Assign(saname, saop, saexpr, saline) => {
+            return Stmt::Assign(cc_vr_value(saname), saop, cc_vr_expr(saexpr), saline);
+        }
+        Stmt::IndexAssign(siname, siindex, siop, siexpr, siline) => {
+            return Stmt::IndexAssign(cc_vr_value(siname), cc_vr_expr(siindex), siop, cc_vr_expr(siexpr), siline);
+        }
+        Stmt::DerefAssign(sdptr, sdop, sdexpr, sdline) => {
+            return Stmt::DerefAssign(cc_vr_expr(sdptr), sdop, cc_vr_expr(sdexpr), sdline);
+        }
+        Stmt::FieldAssign(sfobj, sffield, sfop, sfexpr, sfline) => {
+            return Stmt::FieldAssign(cc_vr_expr(sfobj), sffield, sfop, cc_vr_expr(sfexpr), sfline);
+        }
+        Stmt::Expr(sex, sexline) => {
+            return Stmt::Expr(cc_vr_expr(sex), sexline);
+        }
+        Stmt::Return(sret, sretline) => {
+            return Stmt::Return(cc_vr_opt_box(sret), sretline);
+        }
+        Stmt::If(sicond, sithen, sielse, siline2) => {
+            return Stmt::If(cc_vr_expr(sicond), cc_vr_stmts(sithen), cc_vr_opt_stmts(sielse), siline2);
+        }
+        Stmt::While(swcond, swbody, swline) => {
+            return Stmt::While(cc_vr_expr(swcond), cc_vr_stmts(swbody), swline);
+        }
+        Stmt::For(sfvar, sfiter, sfbody, sforline) => {
+            var it2: Expr = cc_vr_expr(sfiter);
+            var mark: i64 = g_vr_shadow.len();
+            cc_vr_bind(sfvar);
+            var body2: Vec<Stmt> = cc_vr_stmts(sfbody);
+            cc_vr_restore(mark);
+            return Stmt::For(sfvar, it2, body2, sforline);
+        }
+        Stmt::Loop(slbody, slline2) => {
+            return Stmt::Loop(cc_vr_stmts(slbody), slline2);
+        }
+        Stmt::Break(sbopt, sbline) => {
+            return Stmt::Break(cc_vr_opt_box(sbopt), sbline);
+        }
+        Stmt::Defer(sdbody, sdline2) => {
+            return Stmt::Defer(cc_vr_stmts(sdbody), sdline2);
+        }
+        Stmt::Match(smscrut, smarms, smline) => {
+            return Stmt::Match(cc_vr_expr(smscrut), cc_vr_arms(smarms), smline);
+        }
+        Stmt::Handle(shbody, shhandlers, shline) => {
+            var nh: Vec<EffectHandler> = Vec::new();
+            var hi: i64 = 0;
+            while hi < shhandlers.len() {
+                var h: EffectHandler = shhandlers.get(hi);
+                var mark: i64 = g_vr_shadow.len();
+                cc_vr_bind_all(h.params);
+                h.body = cc_vr_stmts(h.body);
+                cc_vr_restore(mark);
+                nh.push(h);
+                hi = hi + 1;
+            }
+            return Stmt::Handle(cc_vr_stmts(shbody), nh, shline);
+        }
+        Stmt::Do(sdoeff, sdoop, sdoargs, sdoline) => {
+            return Stmt::Do(sdoeff, sdoop, cc_vr_exprs(sdoargs), sdoline);
+        }
+        Stmt::RegionBlock(srname, sra, srb, src, srd, srbody, srline) => {
+            return Stmt::RegionBlock(srname, sra, srb, src, srd, cc_vr_stmts(srbody), srline);
+        }
+        Stmt::Sandbox(ssbody, ssline) => {
+            return Stmt::Sandbox(cc_vr_stmts(ssbody), ssline);
+        }
+        Stmt::Unsafe(subody, suline) => {
+            return Stmt::Unsafe(cc_vr_stmts(subody), suline);
+        }
+        Stmt::Txn(stbody, stline) => {
+            return Stmt::Txn(cc_vr_stmts(stbody), stline);
+        }
+        Stmt::ComptimeGen(scgbody, scgline) => {
+            return Stmt::ComptimeGen(cc_vr_stmts(scgbody), scgline);
+        }
+        Stmt::GradBlock(sgvar, sgbody, sgline) => {
+            return Stmt::GradBlock(sgvar, cc_vr_stmts(sgbody), sgline);
+        }
+        Stmt::Backward(sbwx, sbwline) => {
+            return Stmt::Backward(cc_vr_expr(sbwx), sbwline);
+        }
+        Stmt::Query(sqcomps, sqbody, sqline) => {
+            var qmark: i64 = g_vr_shadow.len();
+            cc_vr_bind_all(sqcomps);
+            var qbody: Vec<Stmt> = cc_vr_stmts(sqbody);
+            cc_vr_restore(qmark);
+            return Stmt::Query(sqcomps, qbody, sqline);
+        }
+        Stmt::Select(sscases, ssdefault, ssline2) => {
+            var nc: Vec<SelectCase> = Vec::new();
+            var ci: i64 = 0;
+            while ci < sscases.len() {
+                var c: SelectCase = sscases.get(ci);
+                c.channel = cc_vr_expr(c.channel);
+                var mark: i64 = g_vr_shadow.len();
+                cc_vr_bind(c.var_name);
+                c.body = cc_vr_stmts(c.body);
+                cc_vr_restore(mark);
+                nc.push(c);
+                ci = ci + 1;
+            }
+            return Stmt::Select(nc, cc_vr_opt_stmts(ssdefault), ssline2);
+        }
+        Stmt::Parallel(spbranches, spline) => {
+            var nb: Vec<Vec<Stmt>> = Vec::new();
+            var bi: i64 = 0;
+            while bi < spbranches.len() {
+                nb.push(cc_vr_stmts(spbranches.get(bi)));
+                bi = bi + 1;
+            }
+            return Stmt::Parallel(nb, spline);
+        }
+        Stmt::Resume(srsk, srsv, srsline) => {
+            return Stmt::Resume(cc_vr_expr(srsk), cc_vr_expr(srsv), srsline);
+        }
+        Stmt::SpawnScope(sspbody, sspline) => {
+            return Stmt::SpawnScope(cc_vr_stmts(sspbody), sspline);
+        }
+        _ => {
+        }
+    }
+    return s;
+}
+
+fn cc_vr_func(f: Func) -> Func {
+    var g: Func = f;
+    var mark: i64 = g_vr_shadow.len();
+    cc_vr_bind_all(g.type_params);
+    var cpi: i64 = 0;
+    while cpi < g.const_params.len() {
+        cc_vr_bind(g.const_params.get(cpi).a);
+        cpi = cpi + 1;
+    }
+    g.params = cc_vr_params(g.params);
+    g.ret_ty = cc_vr_type(g.ret_ty);
+    cc_vr_bind_params(g.params);
+    g.body = cc_vr_stmts(g.body);
+    g.preconditions = cc_vr_exprs(g.preconditions);
+    g.postconditions = cc_vr_exprs(g.postconditions);
+    cc_vr_restore(mark);
+    return g;
+}
+
+fn cc_vr_funcs(fs: Vec<Func>) -> Vec<Func> {
+    var out: Vec<Func> = Vec::new();
+    var i: i64 = 0;
+    while i < fs.len() {
+        out.push(cc_vr_func(fs.get(i)));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// The definition's own name: renamed when the module's copy is.
+fn cc_vr_def_name(n: str, map: i64, tos: Vec<str>) -> str {
+    var ix: i64 = HashMap_get(map, n);
+    if ix > 0 {
+        var to: str = tos.get(ix - 1);
+        if str_len(to) > 0 {
+            return to;
+        }
+    }
+    return n;
+}
+
+/// `prog` with the renames of g_vr_* applied. `own_defs`: rename the
+/// definitions too (an imported module; the program keeps its names).
+fn cc_vr_program(prog: &mut Program, own_defs: bool) {
+    prog.funcs = cc_vr_funcs(prog.funcs);
+    var impls: Vec<ImplDef> = Vec::new();
+    var i: i64 = 0;
+    while i < prog.impls.len() {
+        var im: ImplDef = prog.impls.get(i);
+        var mark: i64 = g_vr_shadow.len();
+        cc_vr_bind_all(im.type_params);
+        im.methods = cc_vr_funcs(im.methods);
+        cc_vr_restore(mark);
+        impls.push(im);
+        i = i + 1;
+    }
+    prog.impls = impls;
+    var tis: Vec<TraitImpl> = Vec::new();
+    i = 0;
+    while i < prog.trait_impls.len() {
+        var ti: TraitImpl = prog.trait_impls.get(i);
+        var mark2: i64 = g_vr_shadow.len();
+        cc_vr_bind_all(ti.type_params);
+        ti.methods = cc_vr_funcs(ti.methods);
+        cc_vr_restore(mark2);
+        tis.push(ti);
+        i = i + 1;
+    }
+    prog.trait_impls = tis;
+    var trs: Vec<TraitDef> = Vec::new();
+    i = 0;
+    while i < prog.traits.len() {
+        var tr: TraitDef = prog.traits.get(i);
+        var tms: Vec<TraitMethod> = Vec::new();
+        var mi: i64 = 0;
+        while mi < tr.methods.len() {
+            var tm: TraitMethod = tr.methods.get(mi);
+            var mark3: i64 = g_vr_shadow.len();
+            cc_vr_bind_all(tm.type_params);
+            tm.params = cc_vr_params(tm.params);
+            tm.ret_ty = cc_vr_type(tm.ret_ty);
+            match tm.default_body {
+                OptStmts::Some(tdb) => {
+                    cc_vr_bind_params(tm.params);
+                    tm.default_body = OptStmts::Some(cc_vr_stmts(tdb));
+                }
+                OptStmts::None => {
+                }
+            }
+            cc_vr_restore(mark3);
+            tms.push(tm);
+            mi = mi + 1;
+        }
+        tr.methods = tms;
+        trs.push(tr);
+        i = i + 1;
+    }
+    prog.traits = trs;
+    var cs: Vec<ConstDef> = Vec::new();
+    i = 0;
+    while i < prog.consts.len() {
+        var c: ConstDef = prog.consts.get(i);
+        if own_defs {
+            c.name = cc_vr_def_name(c.name, g_vr_vmap, g_vr_vto);
+        }
+        c.ty = cc_vr_type(c.ty);
+        c.expr = cc_vr_expr(c.expr);
+        cs.push(c);
+        i = i + 1;
+    }
+    prog.consts = cs;
+    var gs: Vec<GlobalVar> = Vec::new();
+    i = 0;
+    while i < prog.globals.len() {
+        var gv: GlobalVar = prog.globals.get(i);
+        if own_defs {
+            gv.name = cc_vr_def_name(gv.name, g_vr_vmap, g_vr_vto);
+        }
+        gv.ty = cc_vr_type(gv.ty);
+        gv.init = cc_vr_expr(gv.init);
+        gs.push(gv);
+        i = i + 1;
+    }
+    prog.globals = gs;
+    var tas: Vec<TypeAlias> = Vec::new();
+    i = 0;
+    while i < prog.type_aliases.len() {
+        var ta: TypeAlias = prog.type_aliases.get(i);
+        if own_defs {
+            ta.name = cc_vr_def_name(ta.name, g_vr_tmap, g_vr_tto);
+        }
+        ta.alias_for = cc_vr_type(ta.alias_for);
+        tas.push(ta);
+        i = i + 1;
+    }
+    prog.type_aliases = tas;
+    var sts: Vec<StructDef> = Vec::new();
+    i = 0;
+    while i < prog.structs.len() {
+        var sd: StructDef = prog.structs.get(i);
+        var mark4: i64 = g_vr_shadow.len();
+        cc_vr_bind_all(sd.type_params);
+        sd.fields = cc_vr_params(sd.fields);
+        cc_vr_restore(mark4);
+        sts.push(sd);
+        i = i + 1;
+    }
+    prog.structs = sts;
+    var ens: Vec<EnumDef> = Vec::new();
+    i = 0;
+    while i < prog.enums.len() {
+        var ed: EnumDef = prog.enums.get(i);
+        var mark5: i64 = g_vr_shadow.len();
+        cc_vr_bind_all(ed.type_params);
+        var vs: Vec<EnumVariant> = Vec::new();
+        var vi: i64 = 0;
+        while vi < ed.variants.len() {
+            var ev: EnumVariant = ed.variants.get(vi);
+            match ev.data {
+                OptParams::Some(evps) => {
+                    ev.data = OptParams::Some(cc_vr_params(evps));
+                }
+                OptParams::None => {
+                }
+            }
+            vs.push(ev);
+            vi = vi + 1;
+        }
+        cc_vr_restore(mark5);
+        ed.variants = vs;
+        ens.push(ed);
+        i = i + 1;
+    }
+    prog.enums = ens;
+    var exs: Vec<ExternDecl> = Vec::new();
+    i = 0;
+    while i < prog.extern_decls.len() {
+        var ex: ExternDecl = prog.extern_decls.get(i);
+        ex.params = cc_vr_params(ex.params);
+        ex.ret_ty = cc_vr_type(ex.ret_ty);
+        exs.push(ex);
+        i = i + 1;
+    }
+    prog.extern_decls = exs;
+    var lys: Vec<LayerDef> = Vec::new();
+    i = 0;
+    while i < prog.layers.len() {
+        var ly: LayerDef = prog.layers.get(i);
+        ly.fields = cc_vr_params(ly.fields);
+        ly.forward = cc_vr_func(ly.forward);
+        lys.push(ly);
+        i = i + 1;
+    }
+    prog.layers = lys;
+    var mds: Vec<ModelDef> = Vec::new();
+    i = 0;
+    while i < prog.models.len() {
+        var md: ModelDef = prog.models.get(i);
+        md.forward = cc_vr_func(md.forward);
+        mds.push(md);
+        i = i + 1;
+    }
+    prog.models = mds;
+    var sys: Vec<SystemDef> = Vec::new();
+    i = 0;
+    while i < prog.systems.len() {
+        var sy: SystemDef = prog.systems.get(i);
+        var mark6: i64 = g_vr_shadow.len();
+        sy.params = cc_vr_params(sy.params);
+        cc_vr_bind_params(sy.params);
+        sy.body = cc_vr_stmts(sy.body);
+        cc_vr_restore(mark6);
+        sys.push(sy);
+        i = i + 1;
+    }
+    prog.systems = sys;
+    var ehs: Vec<EventHandlerDef> = Vec::new();
+    i = 0;
+    while i < prog.event_handlers.len() {
+        var eh: EventHandlerDef = prog.event_handlers.get(i);
+        var mark7: i64 = g_vr_shadow.len();
+        eh.params = cc_vr_params(eh.params);
+        cc_vr_bind_params(eh.params);
+        eh.body = cc_vr_stmts(eh.body);
+        cc_vr_restore(mark7);
+        ehs.push(eh);
+        i = i + 1;
+    }
+    prog.event_handlers = ehs;
+}
+
+/// A const whose value is a literal (or arithmetic on literals): two such
+/// consts of the same text and type are one value.
+fn cc_vr_literal(e: Expr) -> bool {
+    match e {
+        Expr::IntLit(_) => {
+            return true;
+        }
+        Expr::FloatLit(_) => {
+            return true;
+        }
+        Expr::StringLit(_) => {
+            return true;
+        }
+        Expr::BoolLit(_) => {
+            return true;
+        }
+        Expr::Unary(_, lux) => {
+            return cc_vr_literal(box_expr_unbox(lux));
+        }
+        Expr::Binary(_, lbl, lbr) => {
+            return cc_vr_literal(box_expr_unbox(lbl)) && cc_vr_literal(box_expr_unbox(lbr));
+        }
+        Expr::Cast(lcx, _) => {
+            return cc_vr_literal(box_expr_unbox(lcx));
+        }
+        _ => {
+        }
+    }
+    return false;
+}
+
+/// "" when the const cannot be compared with another of its name.
+fn cc_vr_const_key(c: ConstDef) -> str {
+    if !cc_vr_literal(c.expr) {
+        return "";
+    }
+    var lines: Vec<str> = Vec::new();
+    rast_expr(c.expr, 0, &mut lines);
+    var k: str = type_to_str(c.ty);
+    var i: i64 = 0;
+    while i < lines.len() {
+        k = k + "|" + lines.get(i);
+        i = i + 1;
+    }
+    return k;
+}
+
+/// A type that names no struct, enum or alias (two aliases of it agree).
+fn cc_vr_plain_type(t: Type) -> bool {
+    match t {
+        Type::Named(_) => {
+            return false;
+        }
+        Type::Assoc(_, _, _, _) => {
+            return false;
+        }
+        Type::Dyn(_) => {
+            return false;
+        }
+        Type::ArrayConst(_, _) => {
+            return false;
+        }
+        Type::ShapedTensor(_, _) => {
+            return false;
+        }
+        Type::Array(pta, _) => {
+            return cc_vr_plain_type(box_type_unbox(pta));
+        }
+        Type::Ref(ptr, _) => {
+            return cc_vr_plain_type(box_type_unbox(ptr));
+        }
+        Type::RawPtr(ptp, _) => {
+            return cc_vr_plain_type(box_type_unbox(ptp));
+        }
+        Type::Generic(_, ptgs) => {
+            return cc_vr_plain_types(ptgs);
+        }
+        Type::Tuple(ptts) => {
+            return cc_vr_plain_types(ptts);
+        }
+        Type::Func(ptfps, ptfret) => {
+            return cc_vr_plain_types(ptfps) && cc_vr_plain_type(box_type_unbox(ptfret));
+        }
+        _ => {
+        }
+    }
+    return true;
+}
+
+fn cc_vr_plain_types(ts: Vec<Type>) -> bool {
+    var i: i64 = 0;
+    while i < ts.len() {
+        if !cc_vr_plain_type(ts.get(i)) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// One definition of `name` by program `p` (-1 core, 0.. imported modules,
+/// n the program) into the tables of one namespace.
+fn cc_vr_note(ix: i64, order: &mut Vec<str>, progs_of: &mut Vec<Vec<i64>>, keys_of: &mut Vec<Vec<str>>, pubs_of: &mut Vec<Vec<bool>>, name: str, p: i64, key: str, is_pub: bool) {
+    var at: i64 = HashMap_get(ix, name);
+    if at == 0 {
+        var pl: Vec<i64> = Vec::new();
+        pl.push(p);
+        var kl: Vec<str> = Vec::new();
+        kl.push(key);
+        var bl: Vec<bool> = Vec::new();
+        bl.push(is_pub);
+        order.push(name);
+        progs_of.push(pl);
+        keys_of.push(kl);
+        pubs_of.push(bl);
+        HashMap_insert(ix, name, progs_of.len());
+        return;
+    }
+    var pl2: Vec<i64> = progs_of.get(at - 1);
+    var kl2: Vec<str> = keys_of.get(at - 1);
+    var bl2: Vec<bool> = pubs_of.get(at - 1);
+    if pl2.get(pl2.len() - 1) == p {
+        // twice in one program: not one value to compare
+        kl2.set(kl2.len() - 1, "");
+    } else {
+        pl2.push(p);
+        kl2.push(key);
+        bl2.push(is_pub);
+    }
+    progs_of.set(at - 1, pl2);
+    keys_of.set(at - 1, kl2);
+    pubs_of.set(at - 1, bl2);
+}
+
+/// Whether the imported modules' copies of a name must be renamed: it is
+/// defined at least twice, once in an imported module, and not everywhere
+/// as the same public value. (A private copy is renamed even when equal:
+/// the type checker knows one module per name, so two private copies
+/// failed each other's visibility check, BG173.)
+fn cc_vr_must_rename(pl: Vec<i64>, kl: Vec<str>, bl: Vec<bool>, n_imported: i64) -> bool {
+    if pl.len() < 2 {
+        return false;
+    }
+    var has_mod: bool = false;
+    var private_mod: bool = false;
+    var i: i64 = 0;
+    while i < pl.len() {
+        if pl.get(i) >= 0 && pl.get(i) < n_imported {
+            has_mod = true;
+            if !bl.get(i) {
+                private_mod = true;
+            }
+        }
+        i = i + 1;
+    }
+    if !has_mod {
+        return false;
+    }
+    if private_mod || str_len(kl.get(0)) == 0 {
+        return true;
+    }
+    i = 1;
+    while i < kl.len() {
+        if kl.get(i) != kl.get(0) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn cc_vr_vec_has(v: Vec<i64>, x: i64) -> bool {
+    var i: i64 = 0;
+    while i < v.len() {
+        if v.get(i) == x {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn cc_vr_desc(mods: Vec<i64>, names: Vec<str>) -> str {
+    var d: str = "";
+    var i: i64 = 0;
+    while i < mods.len() {
+        if i > 0 {
+            if i == mods.len() - 1 {
+                d = d + " and ";
+            } else {
+                d = d + ", ";
+            }
+        }
+        d = d + "module '" + names.get(mods.get(i)) + "'";
+        i = i + 1;
+    }
+    return d;
+}
+
+/// What program `p` (that does not define `name`) means by the bare name:
+/// the renamed copy it reaches, "" when ambiguous (`desc` filled), or
+/// `name` itself (core's copy).
+fn cc_vr_resolve(pl: Vec<i64>, bl: Vec<bool>, name: str, imports: Vec<ImportDef>, names: Vec<str>, n_imported: i64, desc: &mut Vec<str>) -> str {
+    var mods: Vec<i64> = Vec::new();
+    var pubm: Vec<i64> = Vec::new();
+    var has_core: bool = false;
+    var i: i64 = 0;
+    while i < pl.len() {
+        var q: i64 = pl.get(i);
+        if q < 0 {
+            has_core = true;
+        } else if q < n_imported {
+            mods.push(q);
+            if bl.get(i) {
+                pubm.push(q);
+            }
+        }
+        i = i + 1;
+    }
+    var base: Vec<i64> = pubm;
+    if !has_core && pubm.len() == 0 {
+        base = mods;
+    }
+    if !has_core && base.len() == 1 {
+        return cc_vr_qual(names.get(base.get(0)), name);
+    }
+    var direct: Vec<i64> = Vec::new();
+    i = 0;
+    while i < base.len() {
+        if cc_vr_imports(imports, names.get(base.get(i))) {
+            direct.push(base.get(i));
+        }
+        i = i + 1;
+    }
+    if direct.len() == 1 {
+        return cc_vr_qual(names.get(direct.get(0)), name);
+    }
+    if has_core && direct.len() == 0 {
+        // core's copy, which keeps its name
+        return name;
+    }
+    if direct.len() > 0 {
+        desc.push(cc_vr_desc(direct, names));
+    } else {
+        desc.push(cc_vr_desc(base, names));
+    }
+    return "";
+}
+
+/// The consts, globals and type aliases of program `p` into the tables.
+fn cc_vr_collect(consts: Vec<ConstDef>, globals: Vec<GlobalVar>, aliases: Vec<TypeAlias>, p: i64, vix: i64, vorder: &mut Vec<str>, vprogs: &mut Vec<Vec<i64>>, vkeys: &mut Vec<Vec<str>>, vpubs: &mut Vec<Vec<bool>>, tix: i64, torder: &mut Vec<str>, tprogs: &mut Vec<Vec<i64>>, tkeys: &mut Vec<Vec<str>>, tpubs: &mut Vec<Vec<bool>>, globals_set: i64) {
+    var ci: i64 = 0;
+    while ci < consts.len() {
+        var c: ConstDef = consts.get(ci);
+        cc_vr_note(vix, vorder, vprogs, vkeys, vpubs, c.name, p, cc_vr_const_key(c), c.is_pub);
+        ci = ci + 1;
+    }
+    var gi: i64 = 0;
+    while gi < globals.len() {
+        var gv: GlobalVar = globals.get(gi);
+        // two globals are two variables, whatever they start as
+        cc_vr_note(vix, vorder, vprogs, vkeys, vpubs, gv.name, p, "", gv.is_pub);
+        HashMap_insert(globals_set, gv.name, 1);
+        gi = gi + 1;
+    }
+    var ai: i64 = 0;
+    while ai < aliases.len() {
+        var ta: TypeAlias = aliases.get(ai);
+        var tkey: str = "";
+        if cc_vr_plain_type(ta.alias_for) {
+            tkey = type_to_str(ta.alias_for);
+        }
+        cc_vr_note(tix, torder, tprogs, tkeys, tpubs, ta.name, p, tkey, ta.is_pub);
+        ai = ai + 1;
+    }
+}
+
+/// BG142/BG143/BG173 (see above). Returns the "Ambiguous name" errors.
+fn cc_qualify_shadowed_values(imported: &mut Vec<Program>, names: Vec<str>, user: &mut Program, user_name: str, core: Program) -> Vec<str> {
+    var no_errors: Vec<str> = Vec::new();
+    var n: i64 = imported.len();
+    // values (consts and globals share one namespace) and type aliases
+    var vix: i64 = HashMap_new();
+    var vorder: Vec<str> = Vec::new();
+    var vprogs: Vec<Vec<i64>> = Vec::new();
+    var vkeys: Vec<Vec<str>> = Vec::new();
+    var vpubs: Vec<Vec<bool>> = Vec::new();
+    var tix: i64 = HashMap_new();
+    var torder: Vec<str> = Vec::new();
+    var tprogs: Vec<Vec<i64>> = Vec::new();
+    var tkeys: Vec<Vec<str>> = Vec::new();
+    var tpubs: Vec<Vec<bool>> = Vec::new();
+    var globals_set: i64 = HashMap_new();
+    cc_vr_collect(core.consts, core.globals, core.type_aliases, 0 - 1, vix, &mut vorder, &mut vprogs, &mut vkeys, &mut vpubs, tix, &mut torder, &mut tprogs, &mut tkeys, &mut tpubs, globals_set);
+    var cmi: i64 = 0;
+    while cmi < n {
+        var cprog: Program = imported.get(cmi);
+        cc_vr_collect(cprog.consts, cprog.globals, cprog.type_aliases, cmi, vix, &mut vorder, &mut vprogs, &mut vkeys, &mut vpubs, tix, &mut torder, &mut tprogs, &mut tkeys, &mut tpubs, globals_set);
+        cmi = cmi + 1;
+    }
+    cc_vr_collect(user.consts, user.globals, user.type_aliases, n, vix, &mut vorder, &mut vprogs, &mut vkeys, &mut vpubs, tix, &mut torder, &mut tprogs, &mut tkeys, &mut tpubs, globals_set);
+    var p: i64 = 0;
+    // the renamed names, and which modules have a renamed item
+    var vren: Vec<i64> = Vec::new();
+    var vren_set: i64 = HashMap_new();
+    var tren: Vec<i64> = Vec::new();
+    var tren_set: i64 = HashMap_new();
+    var mod_renamed: Vec<bool> = Vec::new();
+    var mi: i64 = 0;
+    while mi < n {
+        mod_renamed.push(false);
+        mi = mi + 1;
+    }
+    var j: i64 = 0;
+    while j < vorder.len() {
+        if cc_vr_must_rename(vprogs.get(j), vkeys.get(j), vpubs.get(j), n) {
+            vren.push(j);
+            HashMap_insert(vren_set, vorder.get(j), 1);
+            var pl: Vec<i64> = vprogs.get(j);
+            var k: i64 = 0;
+            while k < pl.len() {
+                if pl.get(k) >= 0 && pl.get(k) < n {
+                    mod_renamed.set(pl.get(k), true);
+                }
+                k = k + 1;
+            }
+        }
+        j = j + 1;
+    }
+    j = 0;
+    while j < torder.len() {
+        if cc_vr_must_rename(tprogs.get(j), tkeys.get(j), tpubs.get(j), n) {
+            tren.push(j);
+            HashMap_insert(tren_set, torder.get(j), 1);
+            var tpl: Vec<i64> = tprogs.get(j);
+            var tk: i64 = 0;
+            while tk < tpl.len() {
+                if tpl.get(tk) >= 0 && tpl.get(tk) < n {
+                    mod_renamed.set(tpl.get(tk), true);
+                }
+                tk = tk + 1;
+            }
+        }
+        j = j + 1;
+    }
+    if vren.len() == 0 && tren.len() == 0 {
+        HashMap_drop(vix);
+        HashMap_drop(tix);
+        HashMap_drop(globals_set);
+        HashMap_drop(vren_set);
+        HashMap_drop(tren_set);
+        return no_errors;
+    }
+    // Each module's value and alias names as written: the walk below renames
+    // a module's own definitions (K -> ma__K) before later programs build
+    // their `ma::K` keys from them
+    var orig_vnames: Vec<Vec<str>> = Vec::new();
+    var orig_tnames: Vec<Vec<str>> = Vec::new();
+    var oi: i64 = 0;
+    while oi < n {
+        var oprog: Program = imported.get(oi);
+        var ovn: Vec<str> = Vec::new();
+        var oc: i64 = 0;
+        while oc < oprog.consts.len() {
+            ovn.push(oprog.consts.get(oc).name);
+            oc = oc + 1;
+        }
+        oc = 0;
+        while oc < oprog.globals.len() {
+            ovn.push(oprog.globals.get(oc).name);
+            oc = oc + 1;
+        }
+        var otn: Vec<str> = Vec::new();
+        oc = 0;
+        while oc < oprog.type_aliases.len() {
+            otn.push(oprog.type_aliases.get(oc).name);
+            oc = oc + 1;
+        }
+        orig_vnames.push(ovn);
+        orig_tnames.push(otn);
+        oi = oi + 1;
+    }
+    g_vr_errors = Vec::new();
+    g_vr_reported = HashMap_new();
+    p = 0;
+    while p <= n {
+        var imports: Vec<ImportDef> = user.imports;
+        g_vr_module = user_name;
+        if p < n {
+            imports = imported.get(p).imports;
+            g_vr_module = names.get(p);
+        }
+        g_vr_vmap = HashMap_new();
+        g_vr_vto = Vec::new();
+        g_vr_vdesc = Vec::new();
+        g_vr_gmap = HashMap_new();
+        g_vr_tmap = HashMap_new();
+        g_vr_tto = Vec::new();
+        g_vr_tdesc = Vec::new();
+        g_vr_qmap = HashMap_new();
+        g_vr_qto = Vec::new();
+        g_vr_qtmap = HashMap_new();
+        g_vr_qtto = Vec::new();
+        g_vr_watch = HashMap_new();
+        g_vr_shadow = Vec::new();
+        var entries: i64 = 0;
+        var r: i64 = 0;
+        while r < vren.len() {
+            var vname: str = vorder.get(vren.get(r));
+            var vpl: Vec<i64> = vprogs.get(vren.get(r));
+            var to: str = "";
+            var desc: Vec<str> = Vec::new();
+            var add: bool = true;
+            if cc_vr_vec_has(vpl, p) {
+                if p < n {
+                    to = cc_vr_qual(names.get(p), vname);
+                } else {
+                    // the program's own copy keeps its name
+                    add = false;
+                }
+            } else {
+                to = cc_vr_resolve(vpl, vpubs.get(vren.get(r)), vname, imports, names, n, &mut desc);
+                if to == vname {
+                    add = false;
+                }
+            }
+            if add {
+                g_vr_vto.push(to);
+                if desc.len() > 0 {
+                    g_vr_vdesc.push(desc.get(0));
+                } else {
+                    g_vr_vdesc.push("");
+                }
+                HashMap_insert(g_vr_vmap, vname, g_vr_vto.len());
+                HashMap_insert(g_vr_watch, vname, 1);
+                if HashMap_get(globals_set, vname) != 0 {
+                    HashMap_insert(g_vr_gmap, vname, 1);
+                }
+                entries = entries + 1;
+            }
+            r = r + 1;
+        }
+        r = 0;
+        while r < tren.len() {
+            var tname: str = torder.get(tren.get(r));
+            var tpl2: Vec<i64> = tprogs.get(tren.get(r));
+            var tto: str = "";
+            var tdesc: Vec<str> = Vec::new();
+            var tadd: bool = true;
+            if cc_vr_vec_has(tpl2, p) {
+                if p < n {
+                    tto = cc_vr_qual(names.get(p), tname);
+                } else {
+                    tadd = false;
+                }
+            } else {
+                tto = cc_vr_resolve(tpl2, tpubs.get(tren.get(r)), tname, imports, names, n, &mut tdesc);
+                if tto == tname {
+                    tadd = false;
+                }
+            }
+            if tadd {
+                g_vr_tto.push(tto);
+                if tdesc.len() > 0 {
+                    g_vr_tdesc.push(tdesc.get(0));
+                } else {
+                    g_vr_tdesc.push("");
+                }
+                HashMap_insert(g_vr_tmap, tname, g_vr_tto.len());
+                HashMap_insert(g_vr_watch, tname, 1);
+                entries = entries + 1;
+            }
+            r = r + 1;
+        }
+        // `seg::K` / `seg::Num` for the modules this one imports
+        var reaches_renamed: bool = false;
+        var ii: i64 = 0;
+        while ii < imports.len() {
+            var imp: ImportDef = imports.get(ii);
+            var seg: str = path_last(imp.path);
+            match imp.alias {
+                OptStr::Some(ial) => {
+                    seg = ial;
+                }
+                OptStr::None => {
+                }
+            }
+            var q: i64 = 0;
+            while q < n {
+                if q != p && cc_vr_import_matches(names.get(q), imp.path) {
+                    if mod_renamed.get(q) {
+                        reaches_renamed = true;
+                    }
+                    HashMap_insert(g_vr_watch, seg, 1);
+                    // the names as written (module q may be walked already)
+                    var qvn: Vec<str> = orig_vnames.get(q);
+                    var qc: i64 = 0;
+                    while qc < qvn.len() {
+                        var qcn: str = qvn.get(qc);
+                        var qto: str = qcn;
+                        if HashMap_get(vren_set, qcn) != 0 {
+                            qto = cc_vr_qual(names.get(q), qcn);
+                        }
+                        g_vr_qto.push(qto);
+                        HashMap_insert(g_vr_qmap, seg + "::" + qcn, g_vr_qto.len());
+                        qc = qc + 1;
+                    }
+                    var qtn: Vec<str> = orig_tnames.get(q);
+                    var qa: i64 = 0;
+                    while qa < qtn.len() {
+                        var qan: str = qtn.get(qa);
+                        var qato: str = qan;
+                        if HashMap_get(tren_set, qan) != 0 {
+                            qato = cc_vr_qual(names.get(q), qan);
+                        }
+                        g_vr_qtto.push(qato);
+                        HashMap_insert(g_vr_qtmap, seg + "::" + qan, g_vr_qtto.len());
+                        qa = qa + 1;
+                    }
+                }
+                q = q + 1;
+            }
+            ii = ii + 1;
+        }
+        if entries > 0 || reaches_renamed {
+            if p < n {
+                var wprog: Program = imported.get(p);
+                cc_vr_program(&mut wprog, true);
+                imported.set(p, wprog);
+            } else {
+                cc_vr_program(user, false);
+            }
+        }
+        HashMap_drop(g_vr_vmap);
+        HashMap_drop(g_vr_gmap);
+        HashMap_drop(g_vr_tmap);
+        HashMap_drop(g_vr_qmap);
+        HashMap_drop(g_vr_qtmap);
+        HashMap_drop(g_vr_watch);
+        g_vr_vmap = 0;
+        g_vr_gmap = 0;
+        g_vr_tmap = 0;
+        g_vr_qmap = 0;
+        g_vr_qtmap = 0;
+        g_vr_watch = 0;
+        p = p + 1;
+    }
+    HashMap_drop(g_vr_reported);
+    g_vr_reported = 0;
+    HashMap_drop(vix);
+    HashMap_drop(tix);
+    HashMap_drop(globals_set);
+    HashMap_drop(vren_set);
+    HashMap_drop(tren_set);
+    var errs: Vec<str> = g_vr_errors;
+    g_vr_errors = Vec::new();
+    return errs;
 }
 
 fn cc_push_traits(defs: &mut Vec<TraitDef>, p: Program) {
@@ -11822,8 +13453,17 @@ pub fn c_vec2_str(a: str, b: str) -> Vec<str> {
 
 /// Read a file as a string. Returns empty string on failure.
 pub fn c_file_read(path: str) -> str {
-    var content = p_file_read(path);
-    if (content as i64) == 0 {
+    var content: str = "";
+    var content__ok: bool = false;
+    match read_file(path) {
+        Option::Some(content__t) => {
+            content = content__t;
+            content__ok = true;
+        }
+        Option::None => {
+        }
+    }
+    if !content__ok {
         return "";
     }
     return content;

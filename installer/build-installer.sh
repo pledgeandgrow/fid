@@ -26,6 +26,12 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 VERSION="${FIDES_VERSION:-$(sed -n 's/^ *!define VERSION "\(.*\)"/\1/p' "$SCRIPT_DIR/fides.nsi" | head -1)}"
 
 cd "$ROOT_DIR"
+TOOLS_DIR="build/installer/tools"
+mkdir -p "$TOOLS_DIR"
+clean_tool_sidecars() {
+    local tool="$1"
+    rm -f "$TOOLS_DIR/$tool.c" "$TOOLS_DIR/$tool.exe.fides-stamp" "$TOOLS_DIR/$tool.pdb"
+}
 
 echo "=== Fides Installer Build ==="
 echo ""
@@ -75,7 +81,8 @@ echo "[check] Companion tools (ark, scribe, veil, fidesc)..."
 # `zig cc` when zig is on PATH; fid finds one itself otherwise).
 # FIDES_RUST_TOOLS=1 ships the Rust builds from target/release instead
 # (the frozen bootstrap's, as before Nov 16). fidesc.exe is the Rust
-# compiler and still comes from the Cargo build.
+# compiler and still comes from the Cargo build. All four executables are
+# staged under build/installer/tools/, not release/.
 if [ -z "${CC:-}" ] && command -v zig &> /dev/null; then
     export CC="zig cc"
 fi
@@ -85,7 +92,8 @@ for tool in ark scribe veil; do
             echo "ERROR: target/release/$tool.exe not found (run: cargo build --release)."
             exit 1
         fi
-        cp "target/release/$tool.exe" "release/$tool.exe"
+        cp "target/release/$tool.exe" "$TOOLS_DIR/$tool.exe"
+        clean_tool_sidecars "$tool"
         echo "  $tool.exe: the Rust build (FIDES_RUST_TOOLS=1)"
         continue
     fi
@@ -98,31 +106,32 @@ for tool in ark scribe veil; do
         *)
             # fid.exe does not run on this host: take tools built by it on
             # Windows (newer than fid.exe), or refuse
-            if [ -f "release/$tool.exe" ] && [ "release/$tool.exe" -nt "release/fid.exe" ]; then
-                echo "  $tool.exe: the existing release/$tool.exe (newer than fid.exe; built on Windows)"
+            if [ -f "$TOOLS_DIR/$tool.exe" ] && [ "$TOOLS_DIR/$tool.exe" -nt "release/fid.exe" ]; then
+                echo "  $tool.exe: the existing $TOOLS_DIR/$tool.exe (newer than fid.exe; built on Windows)"
                 continue
             fi
-            echo "ERROR: release/$tool.exe must be built by release/fid.exe, which does not run on"
+            echo "ERROR: $TOOLS_DIR/$tool.exe must be built by release/fid.exe, which does not run on"
             echo "  this host: build the installer on Windows, or set FIDES_RUST_TOOLS=1."
             exit 1
             ;;
     esac
-    rm -f "release/$tool.exe"
+    rm -f "$TOOLS_DIR/$tool.exe"
     mkdir -p build/installer
-    if ! ./release/fid.exe ccompile "tools/$tool.fd" -o "release/$tool.exe" > "build/installer/$tool.log" 2>&1 \
-        || [ ! -f "release/$tool.exe" ]; then
+    if ! ./release/fid.exe ccompile "tools/$tool.fd" -o "$TOOLS_DIR/$tool.exe" > "build/installer/$tool.log" 2>&1 \
+        || [ ! -f "$TOOLS_DIR/$tool.exe" ]; then
         echo "ERROR: release/fid.exe ccompile tools/$tool.fd failed (build/installer/$tool.log):"
         tail -n 20 "build/installer/$tool.log"
         echo "  (FIDES_RUST_TOOLS=1 ships the Rust $tool.exe instead)"
         exit 1
     fi
-    echo "  $tool.exe: built from tools/$tool.fd ($(ls -lh "release/$tool.exe" | awk '{print $5}'))"
+    echo "  $tool.exe: built from tools/$tool.fd ($(ls -lh "$TOOLS_DIR/$tool.exe" | awk '{print $5}'))"
+    clean_tool_sidecars "$tool"
 done
-if [ ! -f "release/fidesc.exe" ]; then
+if [ ! -f "$TOOLS_DIR/fidesc.exe" ]; then
     if [ -f "target/release/fidesc.exe" ]; then
-        cp "target/release/fidesc.exe" "release/fidesc.exe"
+        cp "target/release/fidesc.exe" "$TOOLS_DIR/fidesc.exe"
     else
-        echo "ERROR: release/fidesc.exe not found (run: cargo build --release)."
+        echo "ERROR: $TOOLS_DIR/fidesc.exe not found (run: cargo build --release)."
         exit 1
     fi
 fi

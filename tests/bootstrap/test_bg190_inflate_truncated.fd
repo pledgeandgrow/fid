@@ -1,0 +1,111 @@
+// Bugs roadmap BG190 and BG222: stdlib/compress.fd inflate read zeros past
+// the end of its input (`br_bit`) and `z_block` never noticed, so a stream
+// cut after a dynamic header decoded junk literals up to `max_out`; every
+// failure returned the partial output, and the bomb guard returned
+// `max_out + 1` bytes as data. gzip_decompress never checked CRC-32/ISIZE
+// and zlib_decompress ignored Adler-32 (BG222). Now a truncated or corrupt
+// stream, output over the cap, a non-final last block and a wrong
+// checksum or size all give the empty result the doc promises.
+//
+// Expected output:
+// cut dynamic: 0
+// cut stored: 0
+// non-final then end: 0
+// whole: 600
+// prefixes that decode: 0
+// cap 999: 0
+// cap 1000: 1000
+// gzip: 600
+// gzip crc flipped: 0
+// gzip isize flipped: 0
+// gzip trailer cut: 0
+// gzip stored: hello, gzip
+// zlib: 600
+// zlib adler flipped: 0
+// zlib trailer cut: 0
+// zlib stored: hello, zlib
+use compress;
+
+fn text() -> Vec<i64> {
+    var t: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 600 {
+        t.push(97 + ((i * 7 + i / 13) % 11));
+        i = i + 1;
+    }
+    return t;
+}
+
+fn prefix(d: Vec<i64>, n: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        out.push(d.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn flipped(d: Vec<i64>, at: i64) -> Vec<i64> {
+    var out: Vec<i64> = prefix(d, d.len());
+    out.set(at, out.get(at) ^ 1);
+    return out;
+}
+
+fn from_list(xs: str) -> Vec<i64> {
+    var d: Vec<i64> = Vec::new();
+    val parts: Vec<str> = str_split(xs, ",");
+    var i: i64 = 0;
+    while i < parts.len() {
+        d.push(str_parse_int(parts.get(i)));
+        i = i + 1;
+    }
+    return d;
+}
+
+fn main() -> i64 {
+    // the roadmap's trigger: a dynamic block cut after its header
+    val cut: Vec<i64> = from_list("5,192,33,9,0,0,0,0,32,255,175,22,0");
+    println("cut dynamic: " + int_to_str(inflate_from(cut, 0, 100000).len()));
+    // a stored block of 10 bytes with only 2 there
+    println("cut stored: " + int_to_str(inflate(from_list("1,10,0,245,255,65,66")).len()));
+    // a whole stored block "A" that is not the final one, then the end
+    println("non-final then end: " + int_to_str(inflate(from_list("0,1,0,254,255,65")).len()));
+
+    val t: Vec<i64> = text();
+    val z: Vec<i64> = deflate_compress(t, 6);
+    println("whole: " + int_to_str(inflate(z).len()));
+    var decoded: i64 = 0;
+    var n: i64 = 1;
+    while n < z.len() {
+        if inflate(prefix(z, n)).len() > 0 {
+            decoded = decoded + 1;
+        }
+        n = n + 1;
+    }
+    println("prefixes that decode: " + int_to_str(decoded));
+
+    var a: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 1000 {
+        a.push(97);
+        i = i + 1;
+    }
+    val za: Vec<i64> = deflate_compress(a, 6);
+    println("cap 999: " + int_to_str(inflate_from(za, 0, 999).len()));
+    println("cap 1000: " + int_to_str(inflate_from(za, 0, 1000).len()));
+
+    val g: Vec<i64> = gzip_compress_level(t, 6);
+    println("gzip: " + int_to_str(gzip_decompress(g).len()));
+    println("gzip crc flipped: " + int_to_str(gzip_decompress(flipped(g, g.len() - 8)).len()));
+    println("gzip isize flipped: " + int_to_str(gzip_decompress(flipped(g, g.len() - 4)).len()));
+    println("gzip trailer cut: " + int_to_str(gzip_decompress(prefix(g, g.len() - 1)).len()));
+    println("gzip stored: " + gzip_decompress_str(gzip_compress("hello, gzip")));
+
+    val zl: Vec<i64> = zlib_compress_level(t, 6);
+    println("zlib: " + int_to_str(zlib_decompress(zl).len()));
+    println("zlib adler flipped: " + int_to_str(zlib_decompress(flipped(zl, zl.len() - 1)).len()));
+    println("zlib trailer cut: " + int_to_str(zlib_decompress(prefix(zl, zl.len() - 1)).len()));
+    println("zlib stored: " + zlib_decompress_str(zlib_compress("hello, zlib")));
+    return 0;
+}

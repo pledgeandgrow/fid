@@ -417,9 +417,10 @@ pub fn pert_thread_main(block: i64) -> i64 {
         pert_alloc_thread_end();
     }
     nat_atomic_store(block + 80, 1);
-    // A task runs on its own stack: it ends by giving control back for good
+    // A task runs on its own stack: it ends by giving control back for good,
+    // saying it finished (2, BG227: whoever resumes reads that, not [10])
     if pe_load(block + 96) != 0 {
-        pe_co_leave();
+        pe_co_leave_as(2);
     }
     return result;
 }
@@ -431,7 +432,7 @@ pub fn pert_thread_main(block: i64) -> i64 {
 // busy: 1 while it runs or is still saving its registers (pe_ctx_swap clears
 // it once on the new stack, so a context woken on another thread is resumed
 // only after that), [3] why the task that last switched to it left: 1 still
-// runnable (a yield), 0 blocked or finished. The task says so itself: its
+// runnable (a yield), 0 blocked, 2 finished (BG227). The task says so itself: its
 // state word can already be changed by a wake on another thread. A
 // task stack is laid out as Windows lays out a thread's: 1 MB reserved, the
 // top 16 KB committed, a guard page under them; the switch carries the TEB's
@@ -558,7 +559,9 @@ fn pe_ctx_free(ctx: i64) {
 // completion port; [28] that poll (RT11); [30] its token slot (CA7/CA8,
 // "Token slot" below); (CA9) [31] its function's name, [32] the name of the
 // task that started it (0: started off a task), [33] the task awaiting it
-// (set while it waits).
+// (set while it waits); [34] the next task of the list it is parked on (a
+// channel's or a mutex's, "Parked tasks" below), [35] the `spawn scope`
+// record it counts in (0: none, BG196), [36] its innermost open scope.
 // [24] exists because two threads can requeue a task: its worker when it
 // yields runnable, the poller/pool when its wait ends. A yielded task leaves
 // with [24] = 0 and only its worker requeues it; a blocked task leaves with
@@ -604,6 +607,7 @@ var pert_idle: i64 = 0;  // *i64 — workers parked on wq
 var pert_nworkers: i64 = 0;
 var pert_started: i64 = 0;  // *i64 — CAS-guarded one-time init
 var pert_co_deadlocked: i64 = 0;
+var pert_parked: i64 = 0;  // *i64 — tasks parked on a channel, mutex or scope
 
 // Wait registries (RT12). A task blocked on fd / join / pool sits in a
 // FIFO intrusive list (head→tail = registration order, matching the old
@@ -1211,7 +1215,7 @@ fn pe_co_new_block(name: str, nargs: i64, argv: i64) -> i64 {
         p_panic("task: no such function");
     }
     pe_co_ensure();
-    var block: i64 = pe_zeroed(34);
+    var block: i64 = pe_zeroed(37);
     pe_store(block, fn_addr);
     pe_store(block + 8, nargs);
     // CA9: its name and the task that started it, for a panic's task chain
@@ -1219,6 +1223,13 @@ fn pe_co_new_block(name: str, nargs: i64, argv: i64) -> i64 {
     var starter: i64 = pe_co_cur();
     if starter != 0 {
         pe_store(block + 256, pe_load(starter + 248));
+    }
+    // BG196: started inside an open `spawn scope` of its starter: the
+    // scope's end waits for it (counted before it can run, or finish)
+    var scope: i64 = pe_scope_cur();
+    if scope != 0 {
+        nat_atomic_add(scope, 1);
+        pe_store(block + 280, scope);
     }
     var a: i64 = 0;
     while a < nargs && a < 8 {
@@ -1307,6 +1318,7 @@ fn pe_co_ensure() {
     pert_live = pe_zeroed(1);
     pert_offq = pe_zeroed(1);
     pert_idle = pe_zeroed(1);
+    pert_parked = pe_zeroed(1);
 
     // Logical CPU count: SYSTEM_INFO.dwNumberOfProcessors at offset 32.
     var info: i64 = pe_zeroed(6);
@@ -1429,6 +1441,156 @@ fn pe_co_enter(block: i64) -> i64 {
     pe_ctx_resume(from, pe_load(block + 104));
     pe_k_tls_set(pert_tls_cur, prev);
     return pe_load(from + 24);
+}
+
+// ─── Parked tasks (BG194, BG195, BG196) ──────────────────
+// A task that must wait for a channel, a mutex or the end of a scope does
+// not sleep its OS thread (a worker, or the thread an `async fn` started on,
+// would stop running every other task): it joins a FIFO list of the object,
+// [0] head and [8] tail linked through each block's [34], under the object's
+// lock, lets the lock go and leaves blocked. A change takes tasks off the
+// list under the same lock and queues them, so none is missed; a task queued
+// before it has finished leaving is resumed only once it has (pe_ctx_claim).
+// A woken task looks again, and parks again if it still has to wait.
+
+/// Park the running task `cur` on list `lst` of the object whose SRW lock
+/// `lock` is held; the lock is held again on return.
+fn pe_park(cur: i64, lock: i64, lst: i64) {
+    pe_store(cur + 272, 0);
+    var tail: i64 = pe_load(lst + 8);
+    if tail != 0 {
+        pe_store(tail + 272, cur);
+    } else {
+        pe_store(lst, cur);
+    }
+    pe_store(lst + 8, cur);
+    nat_atomic_add(pert_parked, 1);
+    pe_k_unlock(lock);
+    pe_co_leave();
+    nat_atomic_add(pert_parked, 0 - 1);
+    pe_k_lock(lock);
+}
+
+/// Queue the first task of list `lst` (its object's lock held), if any.
+fn pe_park_wake_one(lst: i64) {
+    var t: i64 = pe_load(lst);
+    if t != 0 {
+        var nx: i64 = pe_load(t + 272);
+        pe_store(lst, nx);
+        if nx == 0 {
+            pe_store(lst + 8, 0);
+        }
+        pe_store(t + 272, 0);
+        pe_wq_push(t);
+    }
+}
+
+/// Queue every task of list `lst` (its object's lock held).
+fn pe_park_wake_all(lst: i64) {
+    var t: i64 = pe_load(lst);
+    pe_store(lst, 0);
+    pe_store(lst + 8, 0);
+    while t != 0 {
+        // (read before the push: the task can run, and park again, at once)
+        var nx: i64 = pe_load(t + 272);
+        pe_store(t + 272, 0);
+        pe_wq_push(t);
+        t = nx;
+    }
+}
+
+// ─── The tasks of a `spawn scope` (BG196) ────────────────
+// p_executor_new opens a scope record on the running context (a task's
+// [36], else a TLS slot of the thread): [0] how many tasks started inside
+// it are unfinished, [8] the scope it was opened in, [16] the tasks waiting
+// for its end (a parked list), [32] the executor (to close the right one).
+// A task started while a scope is open counts in it ([35]); the scope's end
+// (p_executor_run_all) waits for those only, as the C runtime's
+// __p_ft_scan joins only the scope's threads: not for tasks started before
+// it or elsewhere, nor for the task the scope is in.
+
+var pert_tls_scope: i64 = 0;  // TLS slot + 1: the open scope outside tasks
+
+fn pe_scope_key() -> i64 {
+    if pert_tls_scope == 0 {
+        var init_lock: i64 = pe_k_create_mutex(0, 0, "fid_co_scope_init");
+        if init_lock != 0 {
+            pe_k_wait(init_lock, pe_infinite());
+        }
+        if pert_tls_scope == 0 {
+            var k: i64 = pe_k_tls_alloc() as i64;
+            pert_tls_scope = k + 1;
+        }
+        if init_lock != 0 {
+            pe_k_release_mutex(init_lock);
+            pe_k_close_handle(init_lock);
+        }
+    }
+    return pert_tls_scope - 1;
+}
+
+/// The innermost open scope of the running context, 0 if none.
+fn pe_scope_cur() -> i64 {
+    var c: i64 = pe_co_cur();
+    if c != 0 {
+        return pe_load(c + 288);
+    }
+    if pert_tls_scope == 0 {
+        return 0;
+    }
+    return pe_k_tls_get(pert_tls_scope - 1);
+}
+
+fn pe_scope_set(rec: i64) {
+    var c: i64 = pe_co_cur();
+    if c != 0 {
+        pe_store(c + 288, rec);
+    } else {
+        pe_k_tls_set(pe_scope_key(), rec);
+    }
+}
+
+/// Open a scope for executor `exec` on the running context.
+fn pe_scope_open(exec: i64) {
+    var rec: i64 = pe_zeroed(5);
+    pe_store(rec + 8, pe_scope_cur());
+    pe_store(rec + 32, exec);
+    pe_scope_set(rec);
+}
+
+/// Close the innermost open scope of executor `exec`: wait until the tasks
+/// started inside it have finished (a task waits parked); how many there
+/// were still running. 0 when the running context has no such scope.
+fn pe_scope_close(exec: i64) -> i64 {
+    var prev: i64 = 0;
+    var rec: i64 = pe_scope_cur();
+    while rec != 0 && pe_load(rec + 32) != exec {
+        prev = rec;
+        rec = pe_load(rec + 8);
+    }
+    if rec == 0 {
+        return 0;
+    }
+    if prev == 0 {
+        pe_scope_set(pe_load(rec + 8));
+    } else {
+        pe_store(prev + 8, pe_load(rec + 8));
+    }
+    var running: i64 = nat_atomic_load(rec);
+    if running > 0 {
+        var cur: i64 = pe_co_cur();
+        pe_k_lock(pert_done);
+        while nat_atomic_load(rec) > 0 {
+            if cur != 0 {
+                pe_park(cur, pert_done, rec + 16);
+            } else {
+                pe_k_cond_wait(pert_done + 8, pert_done, 50, 0);
+            }
+        }
+        pe_k_unlock(pert_done);
+    }
+    p_free(rec);
+    return running;
 }
 
 // ─── Wait registry: tasks blocked on fd / join / pool ─────
@@ -1627,8 +1789,13 @@ fn pe_co_finish_task(block: i64) {
     }
     pe_k_unlock(pert_reg);
     pe_ctx_free(pe_load(block + 104));
+    var scope: i64 = pe_load(block + 280);
     pe_k_lock(pert_done);
     nat_atomic_add(pert_live, 0 - 1);
+    // BG196: the last task of a scope wakes the task waiting for its end
+    if scope != 0 && nat_atomic_add(scope, 0 - 1) == 1 {
+        pe_park_wake_all(scope + 16);
+    }
     pe_k_cond_broadcast(pert_done + 8);
     pe_k_unlock(pert_done);
     if pe_load(block + 160) != 0 {
@@ -1649,11 +1816,15 @@ pub fn pert_worker_main(id: i64) -> i64 {
         pe_k_tls_set(pert_tls_cur, t);
         pe_ctx_resume(sched, pe_load(t + 104));
         pe_k_tls_set(pert_tls_cur, 0);
-        // The task that left: t, or one t's yields handed the worker to
+        // The task that left: t, or one t's yields handed the worker to.
+        // BG227: how it left is the word it wrote here (2 finished, 1
+        // runnable, 0 blocked), not its block: a blocked task may already
+        // run, or have finished, on another worker
         t = pe_load(sched + 32);
-        if pe_load(t + 80) != 0 {
+        var why: i64 = pe_load(sched + 24);
+        if why == 2 {
             pe_co_finish_task(t);
-        } else if pe_load(sched + 24) != 0 {
+        } else if why != 0 {
             // It yielded: requeue it. A blocked one is the poller/pool's to
             // wake, and may already be running again on another worker.
             pe_wq_push_yielded(t, id);
@@ -1699,9 +1870,10 @@ pub fn pert_poller_main(id: i64) -> i64 {
                 pe_store(c + 192, 2);
                 pe_wq_push(c);
             } else {
-                if awaits != 0 {
-                    waiters = waiters + 1;
-                }
+                // BG226: a task waiting for another task is not a waiter:
+                // only what the chain of awaits ends in (a socket, a timer,
+                // a pool job, a parked or running task) can wake it, and a
+                // chain that ends in itself is the deadlock to report
                 if pe_load(c + 128) >= 0 {
                     pe_store(fds + n * 16, pe_load(c + 128));
                     if pe_load(c + 136) != 0 {
@@ -1721,7 +1893,9 @@ pub fn pert_poller_main(id: i64) -> i64 {
         }
         // Soonest deadline is the heap top; armed timers count as waiters.
         first = pe_timer_peek();
-        waiters = waiters + pert_timer_n + pert_afd_n;
+        // Tasks parked on a channel, a mutex or a scope's end wait for
+        // code that may run outside tasks (BG194, BG195, BG196)
+        waiters = waiters + pert_timer_n + pert_afd_n + nat_atomic_load(pert_parked);
         var live_n: i64 = nat_atomic_load(pert_live);
         var idle_n: i64 = nat_atomic_load(pert_idle);
         var queue_empty: bool = pert_wq_head == 0 && pe_lq_total() == 0;
@@ -2116,7 +2290,8 @@ pub fn pert_co_spawn_v(name: str, nargs: i64, argv: i64) -> i64 {
 pub fn pert_co_async_v(name: str, nargs: i64, argv: i64) -> i64 {
     var block: i64 = pe_co_new_block(name, nargs, argv);
     var runnable: i64 = pe_co_enter(block);
-    if pe_load(block + 80) != 0 {
+    // BG227: 2 finished (its block may be running again elsewhere if not)
+    if runnable == 2 {
         pe_co_finish_task(block);
     } else if runnable != 0 {
         // It yielded: queue it. A blocked one is the poller/pool's to wake.
@@ -2640,6 +2815,31 @@ pub fn pert_co_send(fd: i64, buf: i64, n: i64) -> i64 {
 }
 
 pub fn pert_co_detach(t: i64) {
+    // BG119: a thread future is -(index + 1): claim its join, drop the
+    // result and let the OS thread end on its own. A scope's scan (the
+    // executor's pe_thr_handle test) then skips it, as does a later join.
+    if t < 0 {
+        var idx: i64 = pe_task_index(t);
+        if idx >= 0 {
+            var ds: i64 = pe_thr_slot(idx);
+            if ds != 0 {
+                var dh: i64 = nat_atomic_load(ds);
+                while dh != 0 {
+                    if dh == 0 - 1 {
+                        // a join is under way: its caller owns the thread
+                        return;
+                    }
+                    if nat_atomic_cas(ds, dh, 0) {
+                        pe_k_close_handle(dh);
+                        pe_store(ds + 16, 0);
+                        return;
+                    }
+                    dh = nat_atomic_load(ds);
+                }
+            }
+        }
+        return;
+    }
     // Never free here: a finished-but-unreaped block is still in the task
     // registry the poller scans. pe_co_finish_task frees it after removal —
     // the handle is dead to the caller either way.
@@ -2670,21 +2870,31 @@ fn pe_task_done(idx: i64) -> bool {
     return nat_atomic_load(pe_load(pe_thr_slot(idx) + 8) + 80) != 0;
 }
 
-/// Join thread idx (once) and return its result.
+/// Join thread idx (once) and return its result. The handle word is the
+/// state: >0 a live handle, -1 a join in progress, 0 joined — claimed by
+/// compare-and-swap so two callers cannot join it twice (BG110).
 fn pe_join(idx: i64) -> i64 {
-    var handle: i64 = pe_thr_handle(idx);
-    if handle != 0 {
-        var s: i64 = pe_thr_slot(idx);
-        pe_k_wait(handle, pe_infinite());
-        pe_k_close_handle(handle);
-        pe_store(s + 16, pe_load(pe_load(s + 8) + 88));
-        nat_atomic_store(s, 0);
-    }
-    var s2: i64 = pe_thr_slot(idx);
-    if s2 == 0 {
+    var s: i64 = pe_thr_slot(idx);
+    if s == 0 {
         return 0;
     }
-    return pe_load(s2 + 16);
+    var handle: i64 = nat_atomic_load(s);
+    while handle != 0 {
+        if handle == 0 - 1 {
+            // another caller joins it now: wait for the result it stores
+            pe_k_sleep(0);
+            handle = nat_atomic_load(s);
+        } else if nat_atomic_cas(s, handle, 0 - 1) {
+            pe_k_wait(handle, pe_infinite());
+            pe_k_close_handle(handle);
+            pe_store(s + 16, pe_load(pe_load(s + 8) + 88));
+            nat_atomic_store(s, 0);
+            handle = 0;
+        } else {
+            handle = nat_atomic_load(s);
+        }
+    }
+    return pe_load(s + 16);
 }
 
 pub fn pert_future_ready(value: i64) -> i64 {
@@ -2744,9 +2954,15 @@ pub fn pert_task_poll_nonblocking(f: i64) -> i64 {
 }
 
 pub fn pert_executor_new() -> i64 {
-    var e: i64 = pert_executor_count;
-    pert_executor_count = e + 1;
-    return e;
+    // The index the first not-yet-spawned thread will take: the scans below
+    // join the threads started after this executor, as the C runtime's
+    // p_executor_new does (BG45 — a scope joins only the threads it
+    // started, and never a detached one)
+    var exec: i64 = pe_thread_count();
+    // BG196: and the green tasks started inside it ("The tasks of a spawn
+    // scope")
+    pe_scope_open(exec);
+    return exec;
 }
 
 pub fn pert_executor_block_on(exec: i64, f: i64) -> i64 {
@@ -2755,10 +2971,14 @@ pub fn pert_executor_block_on(exec: i64, f: i64) -> i64 {
 
 /// Join every task still running — OS threads and green tasks alike; the
 /// number joined. `spawn scope { }` exits through here, so a scope waits for
-/// both kinds of work it started.
+/// both kinds of work it started (BG196: the green tasks started inside it,
+/// not every live one).
 pub fn pert_executor_run_all(exec: i64) -> i64 {
     var count: i64 = 0;
-    var i: i64 = 0;
+    var i: i64 = exec;
+    if i < 0 {
+        i = 0;
+    }
     var n: i64 = pe_thread_count();
     while i < n {
         if pe_thr_handle(i) != 0 {
@@ -2767,22 +2987,17 @@ pub fn pert_executor_run_all(exec: i64) -> i64 {
         }
         i = i + 1;
     }
-    if pert_live != 0 {
-        var joined: i64 = nat_atomic_load(pert_live);
-        pe_k_lock(pert_done);
-        while nat_atomic_load(pert_live) > 0 {
-            pe_k_cond_wait(pert_done + 8, pert_done, 50, 0);
-        }
-        pe_k_unlock(pert_done);
-        count = count + joined;
-    }
+    count = count + pe_scope_close(exec);
     return count;
 }
 
 /// Join the finished tasks; the number still running.
 pub fn pert_executor_poll_all(exec: i64) -> i64 {
     var pending: i64 = 0;
-    var i: i64 = 0;
+    var i: i64 = exec;
+    if i < 0 {
+        i = 0;
+    }
     var n: i64 = pe_thread_count();
     while i < n {
         if pe_thr_handle(i) != 0 {
@@ -2802,7 +3017,10 @@ pub fn pert_executor_poll_all(exec: i64) -> i64 {
 /// (0), and return how many were cancelled.
 pub fn pert_executor_cancel(exec: i64) -> i64 {
     var count: i64 = 0;
-    var i: i64 = 0;
+    var i: i64 = exec;
+    if i < 0 {
+        i = 0;
+    }
     var n: i64 = pe_thread_count();
     while i < n {
         if pe_thr_handle(i) != 0 {
@@ -2854,20 +3072,42 @@ pub fn pert_atomic_cas(addr: i64, expected: i64, new_value: i64) -> bool {
     return nat_atomic_cas(addr, expected, new_value);
 }
 
-/// A mutex: an SRW lock (not recursive, released by its owner, as a
-/// default pthread mutex).
+/// A mutex (not recursive, as a default pthread mutex): [0] an SRW lock
+/// held only to look and change, [1] the condition variable threads wait
+/// on, [2] 1 while held, [3..5) the tasks parked on it. BG195: it was the
+/// SRW lock itself, held by the OS thread: a task holding it across a
+/// suspension blocked the next task of its worker inside
+/// AcquireSRWLockExclusive, and with it the worker. A task waits parked, so
+/// the holder can run on and release it, from any worker.
 pub fn pert_mutex_init() -> i64 {
-    var m: i64 = pe_zeroed(1);
+    var m: i64 = pe_zeroed(5);
     pe_k_lock_init(m);
+    pe_k_cond_init(m + 8);
     return m;
 }
 
 pub fn pert_mutex_lock(m: i64) {
     pe_rnd_jitter();
     pe_k_lock(m);
+    while pe_load(m + 16) != 0 {
+        var cur: i64 = pe_co_cur();
+        if cur != 0 {
+            pe_park(cur, m, m + 24);
+        } else {
+            pe_k_cond_wait(m + 8, m, pe_infinite(), 0);
+        }
+    }
+    pe_store(m + 16, 1);
+    pe_k_unlock(m);
 }
 
 pub fn pert_mutex_unlock(m: i64) {
+    pe_k_lock(m);
+    pe_store(m + 16, 0);
+    // one waiter of each kind: the one that loses the race waits again,
+    // and the winner's unlock wakes the next
+    pe_park_wake_one(m + 24);
+    pe_k_cond_signal(m + 8);
     pe_k_unlock(m);
     pe_rnd_jitter();
 }
@@ -2886,19 +3126,30 @@ pub fn pert_tls_set(key: i64, value: i64) {
 
 // ─── Channels ───────────────────────────────────────────────────────────
 // [0] lock, [1] not_empty, [2] not_full, [3] head (next read), [4] tail
-// (next write), [5] count, [6] capacity, [7] closed, [8..] buffer.
+// (next write), [5] count, [6] capacity, [7] closed, [8..] buffer, then two
+// lists of parked tasks: receivers, senders (pe_chan_parked, BG194).
 
 pub fn pert_chan_create(capacity: i64) -> i64 {
     var cap: i64 = capacity;
     if cap < 1 {
         cap = 1;
     }
-    var ch: i64 = pe_zeroed(8 + cap);
+    // (+ the two lists of parked tasks after the buffer, BG194)
+    var ch: i64 = pe_zeroed(12 + cap);
     pe_k_lock_init(ch);
     pe_k_cond_init(ch + 8);
     pe_k_cond_init(ch + 16);
     pe_store(ch + 48, cap);
     return ch;
+}
+
+/// BG194: the tasks parked on `ch` for a value; for room the list after it.
+/// A task waits parked, not on the condition variables, which would sleep
+/// its OS thread: an `async fn` that receives would stop the thread that
+/// called it before that thread sends, and a worker would stop running the
+/// task that sends.
+fn pe_chan_parked(ch: i64) -> i64 {
+    return ch + 64 + pe_load(ch + 48) * 8;
 }
 
 /// Block until there is room or the channel is closed; false if closed.
@@ -2919,8 +3170,13 @@ pub fn pert_chan_send(ch: i64, value: i64) -> bool {
         pe_co_sleep_plain(1);
         pe_k_lock(ch);
     }
+    var cur: i64 = pe_co_cur();
     while pe_load(ch + 40) == pe_load(ch + 48) && pe_load(ch + 56) == 0 {
-        pe_k_cond_wait(ch + 16, ch, pe_infinite(), 0);
+        if cur != 0 {
+            pe_park(cur, ch, pe_chan_parked(ch) + 16);
+        } else {
+            pe_k_cond_wait(ch + 16, ch, pe_infinite(), 0);
+        }
     }
     if pe_load(ch + 56) != 0 {
         pe_k_unlock(ch);
@@ -2931,6 +3187,8 @@ pub fn pert_chan_send(ch: i64, value: i64) -> bool {
     pe_store(ch + 32, (tail + 1) % pe_load(ch + 48));
     pe_store(ch + 40, pe_load(ch + 40) + 1);
     pe_k_cond_signal(ch + 8);
+    // one value: one receiver (one that finds it taken parks again)
+    pe_park_wake_one(pe_chan_parked(ch));
     pe_k_unlock(ch);
     return true;
 }
@@ -2942,6 +3200,7 @@ fn pe_chan_take(ch: i64) -> i64 {
     pe_store(ch + 24, (head + 1) % pe_load(ch + 48));
     pe_store(ch + 40, pe_load(ch + 40) - 1);
     pe_k_cond_signal(ch + 16);
+    pe_park_wake_one(pe_chan_parked(ch) + 16);
     return value;
 }
 
@@ -2963,8 +3222,13 @@ pub fn pert_chan_recv(ch: i64) -> i64 {
         pe_co_sleep_plain(1);
         pe_k_lock(ch);
     }
+    var cur: i64 = pe_co_cur();
     while pe_load(ch + 40) == 0 && pe_load(ch + 56) == 0 {
-        pe_k_cond_wait(ch + 8, ch, pe_infinite(), 0);
+        if cur != 0 {
+            pe_park(cur, ch, pe_chan_parked(ch));
+        } else {
+            pe_k_cond_wait(ch + 8, ch, pe_infinite(), 0);
+        }
     }
     if pe_load(ch + 40) == 0 {
         pe_k_unlock(ch);
@@ -3002,6 +3266,8 @@ pub fn pert_chan_close(ch: i64) {
     pe_store(ch + 56, 1);
     pe_k_cond_broadcast(ch + 8);
     pe_k_cond_broadcast(ch + 16);
+    pe_park_wake_all(pe_chan_parked(ch));
+    pe_park_wake_all(pe_chan_parked(ch) + 16);
     pe_k_unlock(ch);
 }
 

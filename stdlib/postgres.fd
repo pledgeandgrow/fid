@@ -1004,6 +1004,8 @@ pub struct PgScram {
     pub client_first_bare: str,
     /// ServerSignature we expect in the server's final message
     pub server_sig: Vec<i64>,
+    /// True once the server's final message carried that signature
+    pub verified: bool,
     pub ok: bool,
     pub error: str,
 }
@@ -1012,7 +1014,7 @@ pub struct PgScram {
 /// and ignores the SCRAM one: `user` is "" there.
 pub fn pg_scram_new(user: str, password: str, cnonce: str) -> PgScram {
     return PgScram {
-        user: user, password: password, cnonce: cnonce, client_first_bare: "", server_sig: Vec::new(), ok: true, error: "",
+        user: user, password: password, cnonce: cnonce, client_first_bare: "", server_sig: Vec::new(), verified: false, ok: true, error: "",
     };
 }
 
@@ -1204,8 +1206,16 @@ pub fn pg_startup_step(c: &mut PgConn, s: &mut PgScram, m: PgMsg) -> i64 {
     if m.tag == PG_AUTH {
         val code: i64 = pg_i32(m.body, 0);
         if code == 0 {
-            // AuthenticationOk
+            // AuthenticationOk. Once SCRAM-SHA-256 started it counts only
+            // after SASLFinal proved the server knows the password (as
+            // libpq): otherwise any server could skip the proof (BG189).
+            if str_equal(c.auth, "SCRAM-SHA-256") && !s.verified {
+                return pg_fail(c, "SCRAM: the server said AuthenticationOk without proving it knows the password");
+            }
             return 0;
+        }
+        if str_equal(c.auth, "SCRAM-SHA-256") && code != 11 && code != 12 {
+            return pg_fail(c, "SCRAM: the server asked for authentication method " + int_to_str(code) + " in the middle of SCRAM-SHA-256");
         }
         if code == 3 {
             c.auth = "password";
@@ -1243,7 +1253,11 @@ pub fn pg_startup_step(c: &mut PgConn, s: &mut PgScram, m: PgMsg) -> i64 {
             return 0;
         }
         if code == 11 {
-            // AuthenticationSASLContinue: the server-first-message
+            // AuthenticationSASLContinue: the server-first-message, once,
+            // after our client-first-message
+            if str_len(s.client_first_bare) == 0 || s.server_sig.len() != 0 {
+                return pg_fail(c, "SCRAM: unexpected SASLContinue");
+            }
             val fin: str = pg_scram_client_final(s, pg_text(m.body, 4, m.body.len()));
             if !s.ok {
                 return pg_fail(c, s.error);
@@ -1256,6 +1270,7 @@ pub fn pg_startup_step(c: &mut PgConn, s: &mut PgScram, m: PgMsg) -> i64 {
             if !pg_scram_verify_server(s, pg_text(m.body, 4, m.body.len())) {
                 return pg_fail(c, "SCRAM: the server's signature is wrong");
             }
+            s.verified = true;
             return 0;
         }
         return pg_fail(c, "unsupported authentication method " + int_to_str(code) + " (Kerberos, GSSAPI and SSPI are not supported)");

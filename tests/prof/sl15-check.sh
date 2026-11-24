@@ -24,7 +24,7 @@
 FID=${FID:-release/fid.exe}
 T=tests/bootstrap/test_prof_sampling.fd
 SVC=tests/prof/sl15_service.fd
-D=$(mktemp -d ./_sl15_check.XXXXXX)
+D=$(mktemp -d ./tests/_sl15_check.XXXXXX)
 D=${D#./}
 BG=""
 cleanup() {

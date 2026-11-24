@@ -257,6 +257,13 @@ fn ct_box_type_unbox(b: Box<Type>) -> Type {
 
 /// The type of a computed element: what its literal is.
 fn ct_lit_type(e: Expr) -> Type {
+    match ct_untag_type(e) {
+        OptType::Some(uty) => {
+            return uty;
+        }
+        OptType::None => {
+        }
+    }
     match e {
         Expr::IntLit(_) => {
             return Type::I64;
@@ -415,12 +422,23 @@ fn ct_at(line: i64) -> str {
 /// to what comptime computed.
 fn ct_check_int_fit(ty: Type, expr: &Expr, name: str, errs: &mut Vec<str>) {
     var v: i64 = 0;
-    match expr {
-        Expr::IntLit(n) => {
-            v = n;
+    var v_unsigned: bool = false;
+    match ct_untag_type(*expr) {
+        OptType::Some(uty) => {
+            // A value tagged unsigned (BG62): its bits already sit inside that
+            // width — it fits an unsigned target of the same or a wider one
+            v = ct_int_untag(*expr);
+            v_unsigned = true;
         }
-        _ => {
-            return;
+        OptType::None => {
+            match expr {
+                Expr::IntLit(n) => {
+                    v = n;
+                }
+                _ => {
+                    return;
+                }
+            }
         }
     }
     var lo: i64 = 0;
@@ -465,6 +483,27 @@ fn ct_check_int_fit(ty: Type, expr: &Expr, name: str, errs: &mut Vec<str>) {
         _ => {
             return;
         }
+    }
+    if v_unsigned {
+        // The bits are already inside an unsigned width: they fit iff the
+        // target's range, read unsigned, holds them. u64 holds any bits.
+        var uv: u64 = v as u64;
+        var ok: bool = true;
+        match ty {
+            Type::U64 => {
+            }
+            Type::U128 => {
+            }
+            _ => {
+                ok = uv <= (hi as u64);
+            }
+        }
+        if !ok {
+            var umsg: str = "comptime value " + u64_to_str(uv) + " does not fit in " + tname + " ('" + name + "')";
+            errs.push(umsg);
+            ct_fatal_push(umsg);
+        }
+        return;
     }
     if v < lo || v > hi {
         var msg: str = "comptime value " + int_to_str(v) + " does not fit in " + tname + " ('" + name + "')";
@@ -1447,6 +1486,13 @@ fn ct_is_int(e: Expr) -> bool {
         _ => {
         }
     }
+    match ct_untag_type(e) {
+        OptType::Some(_) => {
+            return true;
+        }
+        OptType::None => {
+        }
+    }
     return false;
 }
 
@@ -1470,6 +1516,191 @@ fn ct_int(e: Expr) -> i64 {
         }
     }
     return 0;
+}
+
+/// `ct_int` through an unsigned tag: the bits the tagged value holds.
+fn ct_int_untag(e: Expr) -> i64 {
+    match ct_untag_type(e) {
+        OptType::Some(_) => {
+            return ct_int(ct_untag(e));
+        }
+        OptType::None => {
+        }
+    }
+    return ct_int(e);
+}
+
+// --- Typed comptime values (BG62) ------------------------------------------
+// An unsigned value a comptime declaration gives a name to is held as
+// `Expr::Cast(IntLit(bits), <unsigned type>)`: the untyped evaluator keeps
+// the declared type in the value, so `m >> 1`, `m / 3`, `m > 0` on
+// `val m: u64 = MAX` evaluate unsigned, the way every backend runs them.
+
+/// Whether `t` is an unsigned integer type a comptime value can be tagged
+/// with (u128's value is the low 64 bits — all a comptime IntLit holds).
+fn ct_unsigned_ty(t: Type) -> bool {
+    match t {
+        Type::U8 => {
+            return true;
+        }
+        Type::U16 => {
+            return true;
+        }
+        Type::U32 => {
+            return true;
+        }
+        Type::U64 => {
+            return true;
+        }
+        Type::U128 => {
+            return true;
+        }
+        _ => {
+        }
+    }
+    return false;
+}
+
+/// Whether `t` is a signed integer type (`x as iN` sign-extends).
+fn ct_signed_ty(t: Type) -> bool {
+    match t {
+        Type::I8 => {
+            return true;
+        }
+        Type::I16 => {
+            return true;
+        }
+        Type::I32 => {
+            return true;
+        }
+        Type::I64 => {
+            return true;
+        }
+        Type::I128 => {
+            return true;
+        }
+        _ => {
+        }
+    }
+    return false;
+}
+
+/// The bit width `t` stores in a comptime IntLit (wider types store their
+/// low 64).
+fn ct_int_width(t: Type) -> i64 {
+    match t {
+        Type::U8 => {
+            return 8;
+        }
+        Type::I8 => {
+            return 8;
+        }
+        Type::U16 => {
+            return 16;
+        }
+        Type::I16 => {
+            return 16;
+        }
+        Type::U32 => {
+            return 32;
+        }
+        Type::I32 => {
+            return 32;
+        }
+        _ => {
+        }
+    }
+    return 64;
+}
+
+/// The value mask of width `w` (64's is -1: all bits set).
+fn ct_width_mask(w: i64) -> i64 {
+    if w >= 64 {
+        return -1;
+    }
+    return (1 << w) - 1;
+}
+
+/// `e`'s unsigned type when `e` is a tagged unsigned literal.
+fn ct_untag_type(e: Expr) -> OptType {
+    match e {
+        Expr::Cast(ib, ty) => {
+            if ct_unsigned_ty(ty) {
+                match ct_box_expr_unbox(ib) {
+                    Expr::IntLit(_) => {
+                        return OptType::Some(ty);
+                    }
+                    _ => {
+                    }
+                }
+            }
+        }
+        _ => {
+        }
+    }
+    return OptType::None;
+}
+
+/// `e` with a value tag removed: the IntLit a tagged unsigned value wraps,
+/// `e` itself otherwise.
+fn ct_untag(e: Expr) -> Expr {
+    match e {
+        Expr::Cast(ib, ty) => {
+            if ct_unsigned_ty(ty) {
+                var inner: Expr = ct_box_expr_unbox(ib);
+                match inner {
+                    Expr::IntLit(_) => {
+                        return inner;
+                    }
+                    _ => {
+                    }
+                }
+            }
+        }
+        _ => {
+        }
+    }
+    return e;
+}
+
+/// `v` tagged with unsigned type `ty` (masked to its width). A FloatLit,
+/// StringLit or a cast it cannot read is returned unchanged.
+fn ct_tag(v: Expr, ty: Type) -> Expr {
+    var bits: i64 = 0;
+    var have: bool = false;
+    match v {
+        Expr::IntLit(n) => {
+            bits = n;
+            have = true;
+        }
+        _ => {
+        }
+    }
+    match ct_untag_type(v) {
+        OptType::Some(_) => {
+            bits = ct_int(ct_untag(v));
+            have = true;
+        }
+        OptType::None => {
+        }
+    }
+    if !have {
+        return v;
+    }
+    var w: i64 = ct_int_width(ty);
+    return Expr::Cast(Box::new(Expr::IntLit(bits & ct_width_mask(w))), ty);
+}
+
+/// `bits` narrowed to signed width `w` and sign-extended back to i64.
+fn ct_sext(bits: i64, w: i64) -> i64 {
+    if w >= 64 {
+        return bits;
+    }
+    var m: i64 = bits & ct_width_mask(w);
+    if (m & (1 << (w - 1))) != 0 {
+        m = m - (1 << w);
+    }
+    return m;
 }
 
 /// Whether `a` are literals of the kinds `sig` spells: `s` a string, `i` an
@@ -3793,6 +4024,18 @@ fn ct_const_value(idx: i64, original: &Program) -> ResultExpr {
     var ie: Expr = original.consts.get(idx).expr;
     val cres: ResultExpr = evaluate(&ie, original);
     g_ct_call_depth = g_ct_call_depth - 1;
+    // A const declared unsigned tags its value, the way a `val x: u64`
+    // in a comptime block does (BG62)
+    match cres {
+        ResultExpr::Ok(cv) => {
+            var cty: Type = original.consts.get(idx).ty;
+            if ct_unsigned_ty(cty) {
+                return ResultExpr::Ok(ct_tag(cv, cty));
+            }
+        }
+        ResultExpr::Err(_) => {
+        }
+    }
     return cres;
 }
 
@@ -3807,6 +4050,10 @@ pub fn evaluate(expr: &Expr, original: &Program) -> ResultExpr {
         Expr::MethodCall(_, _, _) => {
             var empty_env: ComptimeEnv = ComptimeEnv_new();
             return evaluate_with_env(expr, &empty_env, original);
+        }
+        Expr::Cast(_, _) => {
+            var cenv: ComptimeEnv = ComptimeEnv_new();
+            return evaluate_with_env(expr, &cenv, original);
         }
         Expr::Ident(name) => {
             var ci: i64 = ct_find_const(original, name);
@@ -4121,14 +4368,26 @@ fn evaluate_block_rt(stmts: Vec<Stmt>, original: &Program, env: &mut ComptimeEnv
         }
         g_ct_line = ct_stmt_line(stmt);
         match stmt {
-            Stmt::Let(name, _, expr, _, _, _, _) => {
+            Stmt::Let(name, lty, expr, _, _, _, _) => {
                 var vr: ResultExpr = evaluate_with_env(expr, &local_env, original);
                 match vr {
                     ResultExpr::Err(msg) => {
                         return ResultExpr::Err(msg);
                     }
                     ResultExpr::Ok(v) => {
-                        ComptimeEnv_declare(&mut local_env, name, v, n_outer);
+                        // BG62: a declared unsigned type tags the value so the
+                        // arithmetic on it stays unsigned
+                        var sv: Expr = v;
+                        match lty {
+                            OptType::Some(dty) => {
+                                if ct_unsigned_ty(dty) {
+                                    sv = ct_tag(v, dty);
+                                }
+                            }
+                            OptType::None => {
+                            }
+                        }
+                        ComptimeEnv_declare(&mut local_env, name, sv, n_outer);
                     }
                 }
             }
@@ -4153,9 +4412,13 @@ fn evaluate_block_rt(stmts: Vec<Stmt>, original: &Program, env: &mut ComptimeEnv
                     }
                 }
             }
-            Stmt::LetUninit(uname, _, _, _) => {
+            Stmt::LetUninit(uname, udty, _, _) => {
                 // declared here, so an assignment in an inner block reaches it
-                ComptimeEnv_declare(&mut local_env, uname, Expr::IntLit(0), n_outer);
+                var uv: Expr = Expr::IntLit(0);
+                if ct_unsigned_ty(udty) {
+                    uv = Expr::Cast(Box::new(Expr::IntLit(0)), udty);
+                }
+                ComptimeEnv_declare(&mut local_env, uname, uv, n_outer);
             }
             Stmt::Expr(e, _) => {
                 result = Expr::IntLit(0);
@@ -4191,7 +4454,7 @@ fn evaluate_block_rt(stmts: Vec<Stmt>, original: &Program, env: &mut ComptimeEnv
                                                     et = ct_lit_type(vals.get(0));
                                                     handled = true;
                                                 } else if pm == "set" && vals.len() == 2 {
-                                                    match vals.get(0) {
+                                                    match ct_untag(vals.get(0)) {
                                                         Expr::IntLit(si2) => {
                                                             if si2 < 0 || si2 >= tel.len() {
                                                                 return ResultExpr::Err("comptime Vec index " + int_to_str(si2) + " out of bounds");
@@ -4370,9 +4633,9 @@ fn evaluate_block_rt(stmts: Vec<Stmt>, original: &Program, env: &mut ComptimeEnv
                                                 return ResultExpr::Err(msg);
                                             }
                                             ResultExpr::Ok(e) => {
-                                                match s {
+                                                match ct_untag(s) {
                                                     Expr::IntLit(a) => {
-                                                        match e {
+                                                        match ct_untag(e) {
                                                             Expr::IntLit(b) => {
                                                                 var i: i64 = a;
                                                                 while i < b {
@@ -4628,7 +4891,7 @@ fn evaluate_with_env(expr: &Expr, env: &ComptimeEnv, original: &Program) -> Resu
                             var gi: Expr = margs.get(0);
                             match evaluate_with_env(&gi, env, original) {
                                 ResultExpr::Ok(iv) => {
-                                    match iv {
+                                    match ct_untag(iv) {
                                         Expr::IntLit(ix) => {
                                             if ix >= 0 && ix < els.len() {
                                                 return ResultExpr::Ok(els.get(ix));
@@ -4913,7 +5176,7 @@ fn evaluate_with_env(expr: &Expr, env: &ComptimeEnv, original: &Program) -> Resu
                         ResultExpr::Ok(iv) => {
                             match av {
                                 Expr::ArrayLit(_, elements) => {
-                                    match iv {
+                                    match ct_untag(iv) {
                                         Expr::IntLit(ix) => {
                                             if ix >= 0 && ix < elements.len() {
                                                 return ResultExpr::Ok(elements.get(ix));
@@ -4952,6 +5215,20 @@ fn evaluate_with_env(expr: &Expr, env: &ComptimeEnv, original: &Program) -> Resu
                         var vr: ResultExpr = evaluate_with_env(&e, env, original);
                         match vr {
                             ResultExpr::Ok(v) => {
+                                var is_uv: bool = false;
+                                match ct_untag_type(v) {
+                                    OptType::Some(_) => {
+                                        var uv2: u64 = ct_int_untag(v) as u64;
+                                        result = result + u64_to_str(uv2);
+                                        is_uv = true;
+                                    }
+                                    OptType::None => {
+                                    }
+                                }
+                                if is_uv {
+                                    pi = pi + 1;
+                                    continue;
+                                }
                                 match v {
                                     Expr::IntLit(n) => {
                                         result = result + int_to_str(n);
@@ -4984,6 +5261,47 @@ fn evaluate_with_env(expr: &Expr, env: &ComptimeEnv, original: &Program) -> Resu
             }
             return ResultExpr::Ok(Expr::StringLit(result));
         }
+        Expr::Cast(ic, cty) => {
+            // `x as T` on a comptime integer: unsigned targets tag the value,
+            // signed ones narrow it (BG62)
+            var ice: Expr = ct_box_expr_unbox(ic);
+            var cr: ResultExpr = evaluate_with_env(&ice, env, original);
+            match cr {
+                ResultExpr::Err(msg) => {
+                    return ResultExpr::Err(msg);
+                }
+                ResultExpr::Ok(cv) => {
+                    var iv: i64 = 0;
+                    var is_int: bool = false;
+                    match cv {
+                        Expr::IntLit(n) => {
+                            iv = n;
+                            is_int = true;
+                        }
+                        _ => {
+                            match ct_untag_type(cv) {
+                                OptType::Some(_) => {
+                                    iv = ct_int_untag(cv);
+                                    is_int = true;
+                                }
+                                OptType::None => {
+                                }
+                            }
+                        }
+                    }
+                    if !is_int {
+                        return ResultExpr::Ok(Expr::Cast(Box::new(cv), cty));
+                    }
+                    if ct_unsigned_ty(cty) {
+                        return ResultExpr::Ok(ct_tag(Expr::IntLit(iv), cty));
+                    }
+                    if ct_signed_ty(cty) {
+                        return ResultExpr::Ok(Expr::IntLit(ct_sext(iv, ct_int_width(cty))));
+                    }
+                    return ResultExpr::Ok(Expr::Cast(Box::new(Expr::IntLit(iv)), cty));
+                }
+            }
+        }
         _ => {
             return evaluate(expr, original);
         }
@@ -5011,6 +5329,16 @@ fn ct_memo_key(func: Func, args: &Vec<Expr>) -> str {
         match args.get(i) {
             Expr::IntLit(n) => {
                 k = k + "i" + int_to_str(n);
+            }
+            Expr::Cast(_, _) => {
+                match ct_untag_type(args.get(i)) {
+                    OptType::Some(t2) => {
+                        k = k + "u" + int_to_str(ct_int_width(t2)) + ":" + u64_to_str(ct_int_untag(args.get(i)) as u64);
+                    }
+                    OptType::None => {
+                        return "";
+                    }
+                }
             }
             Expr::BoolLit(b) => {
                 if b {
@@ -5147,7 +5475,13 @@ fn call_comptime_func(func: Func, args: Vec<Expr>, original: &Program) -> Result
     var env: ComptimeEnv = ComptimeEnv_new();
     var i: i64 = 0;
     while i < args.len() {
-        ComptimeEnv_set(&mut env, func.params.get(i).name, args.get(i));
+        // A parameter declared unsigned tags the argument's value (BG62)
+        var pv: Expr = args.get(i);
+        var pty: Type = func.params.get(i).ty;
+        if ct_unsigned_ty(pty) {
+            pv = ct_tag(pv, pty);
+        }
+        ComptimeEnv_set(&mut env, func.params.get(i).name, pv);
         i = i + 1;
     }
     // The body runs in the block evaluator, with all its statements (let,
@@ -5315,9 +5649,147 @@ fn ct_shift_amount(b: i64) -> ResultExpr {
     return ResultExpr::Ok(Expr::IntLit(0));
 }
 
+/// `l op r` where one side is a tagged unsigned value: the operation
+/// unsigned at the tag's width, its result tagged again (BG62).
+/// @wrapping: the unsigned arithmetic is meant to wrap at 64 bits so the
+/// width checks below can see what the machine would have produced.
+@wrapping
+fn ct_eval_uint_binop(op: BinOp, a: i64, b: i64, ty: Type) -> ResultExpr {
+    var ua: u64 = a as u64;
+    var ub: u64 = b as u64;
+    var w: i64 = ct_int_width(ty);
+    var mask: i64 = ct_width_mask(w);
+    var um: u64 = mask as u64;
+    var ur: u64 = 0;
+    match op {
+        BinOp::Add => {
+            ur = (ua + ub) & um;
+            if ur < ua || ur > um {
+                return ct_ovf(u64_to_str(ua) + " + " + u64_to_str(ub));
+            }
+            return ResultExpr::Ok(Expr::Cast(Box::new(Expr::IntLit(ur as i64)), ty));
+        }
+        BinOp::Sub => {
+            if ua < ub {
+                return ct_ovf(u64_to_str(ua) + " - " + u64_to_str(ub));
+            }
+            return ResultExpr::Ok(Expr::Cast(Box::new(Expr::IntLit(((ua - ub) & um) as i64)), ty));
+        }
+        BinOp::Mul => {
+            ur = (ua * ub) & um;
+            if ua != 0 && (ur / ua) != (ub & um) {
+                return ct_ovf(u64_to_str(ua) + " * " + u64_to_str(ub));
+            }
+            return ResultExpr::Ok(Expr::Cast(Box::new(Expr::IntLit(ur as i64)), ty));
+        }
+        BinOp::Div => {
+            if ub == 0 {
+                return ResultExpr::Err("division by zero in comptime");
+            }
+            return ResultExpr::Ok(Expr::Cast(Box::new(Expr::IntLit(((ua / ub) & um) as i64)), ty));
+        }
+        BinOp::Mod => {
+            if ub == 0 {
+                return ResultExpr::Err("modulo by zero in comptime");
+            }
+            return ResultExpr::Ok(Expr::Cast(Box::new(Expr::IntLit(((ua % ub) & um) as i64)), ty));
+        }
+        BinOp::Eq => {
+            return ResultExpr::Ok(Expr::BoolLit(a == b));
+        }
+        BinOp::Neq => {
+            return ResultExpr::Ok(Expr::BoolLit(a != b));
+        }
+        BinOp::Lt => {
+            return ResultExpr::Ok(Expr::BoolLit((ua & um) < (ub & um)));
+        }
+        BinOp::LtEq => {
+            return ResultExpr::Ok(Expr::BoolLit((ua & um) <= (ub & um)));
+        }
+        BinOp::Gt => {
+            return ResultExpr::Ok(Expr::BoolLit((ua & um) > (ub & um)));
+        }
+        BinOp::GtEq => {
+            return ResultExpr::Ok(Expr::BoolLit((ua & um) >= (ub & um)));
+        }
+        BinOp::And => {
+            return ResultExpr::Ok(Expr::BoolLit(a != 0 && b != 0));
+        }
+        BinOp::Or => {
+            return ResultExpr::Ok(Expr::BoolLit(a != 0 || b != 0));
+        }
+        BinOp::BitAnd => {
+            return ResultExpr::Ok(Expr::Cast(Box::new(Expr::IntLit(((ua & ub) & um) as i64)), ty));
+        }
+        BinOp::BitOr => {
+            return ResultExpr::Ok(Expr::Cast(Box::new(Expr::IntLit(((ua | ub) & um) as i64)), ty));
+        }
+        BinOp::BitXor => {
+            return ResultExpr::Ok(Expr::Cast(Box::new(Expr::IntLit(((ua ^ ub) & um) as i64)), ty));
+        }
+        BinOp::Shl => {
+            match ct_shift_amount(b) {
+                ResultExpr::Err(sm) => {
+                    return ResultExpr::Err(sm);
+                }
+                ResultExpr::Ok(_) => {
+                }
+            }
+            var shraw: u64 = ua << (ub & 63);
+            if (shraw >> (ub & 63)) != ua || shraw > um {
+                return ct_ovf(u64_to_str(ua) + " << " + int_to_str(b) + " (bits shifted out)");
+            }
+            ur = shraw & um;
+            return ResultExpr::Ok(Expr::Cast(Box::new(Expr::IntLit(ur as i64)), ty));
+        }
+        BinOp::Shr => {
+            match ct_shift_amount(b) {
+                ResultExpr::Err(sm) => {
+                    return ResultExpr::Err(sm);
+                }
+                ResultExpr::Ok(_) => {
+                }
+            }
+            ur = (ua & um) >> (ub & 63);
+            return ResultExpr::Ok(Expr::Cast(Box::new(Expr::IntLit(ur as i64)), ty));
+        }
+    }
+    return ResultExpr::Err("unreachable");
+}
+
 fn eval_binop(op: BinOp, l: Expr, r: Expr) -> ResultExpr {
     if !ct_fuel_left() {
         return ct_out_of_fuel();
+    }
+    // A tagged unsigned operand makes the whole operation unsigned (BG62)
+    var uty: OptType = ct_untag_type(l);
+    match uty {
+        OptType::Some(_) => {
+        }
+        OptType::None => {
+            uty = ct_untag_type(r);
+        }
+    }
+    match uty {
+        OptType::Some(t) => {
+            var l2: Expr = ct_untag(l);
+            var r2: Expr = ct_untag(r);
+            match l2 {
+                Expr::IntLit(ua) => {
+                    match r2 {
+                        Expr::IntLit(ub) => {
+                            return ct_eval_uint_binop(op, ua, ub, t);
+                        }
+                        _ => {
+                        }
+                    }
+                }
+                _ => {
+                }
+            }
+        }
+        OptType::None => {
+        }
     }
     match l {
         Expr::IntLit(a) => {
@@ -5516,6 +5988,31 @@ fn eval_binop(op: BinOp, l: Expr, r: Expr) -> ResultExpr {
 }
 
 fn eval_unaryop(op: UnaryOp, v: Expr) -> ResultExpr {
+    // A tagged unsigned value keeps its type through `!`/`-` (BG62): `!` masks
+    // to the width, `-` is a type error (unsigned has no negatives).
+    match ct_untag_type(v) {
+        OptType::Some(ty) => {
+            var n: i64 = ct_int_untag(v);
+            match op {
+                UnaryOp::BitNot => {
+                    var w: i64 = ct_int_width(ty);
+                    var rb: i64 = (-1 ^ n) & ct_width_mask(w);
+                    return ResultExpr::Ok(Expr::Cast(Box::new(Expr::IntLit(rb)), ty));
+                }
+                UnaryOp::Neg => {
+                    return ResultExpr::Err("cannot negate an unsigned comptime value");
+                }
+                UnaryOp::Not => {
+                    if n != 0 {
+                        return ResultExpr::Ok(Expr::IntLit(0));
+                    }
+                    return ResultExpr::Ok(Expr::IntLit(1));
+                }
+            }
+        }
+        OptType::None => {
+        }
+    }
     match op {
         UnaryOp::Neg => {
             match v {
@@ -6135,14 +6632,12 @@ fn ec_unroll_inline(out: &mut Vec<Stmt>, fvar: str, range_e: Expr, body: Vec<Stm
                     return;
                 }
                 // A fresh copy per iteration, `fvar` replaced everywhere it
-                // is not declared again (BG27)
+                // is not declared again (BG27). `if true` gives the copy
+                // its own scope: the body's lets belong to their iteration,
+                // not the enclosing block (BG123).
                 var iter: Vec<Stmt> = replace_ident_in_stmts(body, fvar, Expr::IntLit(a + k));
                 var expanded: Vec<Stmt> = ec_stmts(iter, original, errs);
-                var ei2: i64 = 0;
-                while ei2 < expanded.len() {
-                    out.push(expanded.get(ei2));
-                    ei2 = ei2 + 1;
-                }
+                out.push(Stmt::If(Expr::BoolLit(true), expanded, OptStmts::None, line));
                 k = k + 1;
             }
         }

@@ -1,0 +1,71 @@
+// Bugs roadmap BG199: `spawn scope { }` joined its tasks only at the end of
+// its body (lower.fd Stmt::SpawnScope), so a `return` or `break` out of it
+// left with the tasks still running (reference §10.4, CA6: no task is left
+// behind): `total` was read as 0. Every exit that leaves the scope joins
+// first (Lowerer_ss_join_exits).
+//
+// (The task works a while first, so that without the join the caller reads
+// `total` before it is added to; it does not sleep: the interpreter's
+// p_executor_run_all does not wait for a sleeping task.)
+//
+// Expected output:
+// 5
+// 3
+// 0
+// 3
+// 1
+// 2
+
+fn work(total: i64, n: i64) -> i64 {
+    var acc: i64 = 0;
+    var k: i64 = 0;
+    while k < 200000 {
+        acc = (acc + k * 7) % 1000003;
+        k = k + 1;
+    }
+    if acc < 0 {
+        return 0;
+    }
+    p_atomic_add(total, n);
+    return n;
+}
+
+fn f(total: i64, early: bool) -> i64 {
+    spawn scope {
+        spawn work(total, 1);
+        spawn work(total, 2);
+        if early {
+            return 5;
+        }
+    }
+    return 0;
+}
+
+fn g(total: i64) -> i64 {
+    var i: i64 = 0;
+    while i < 3 {
+        spawn scope {
+            spawn work(total, 1);
+            if i == 1 {
+                break;
+            }
+        }
+        i = i + 1;
+    }
+    return i;
+}
+
+fn main() {
+    val t1 = p_shared_alloc(8);
+    p_atomic_store(t1, 0);
+    println(f(t1, true));
+    println(p_atomic_load(t1));
+    val t2 = p_shared_alloc(8);
+    p_atomic_store(t2, 0);
+    println(f(t2, false));
+    println(p_atomic_load(t2));
+    val t3 = p_shared_alloc(8);
+    p_atomic_store(t3, 0);
+    println(g(t3));
+    println(p_atomic_load(t3));
+}

@@ -40,7 +40,7 @@
 # Environment:
 #   FID          the Windows compiler that writes the C (default release/fid.exe)
 #   FIDC         use this C of the compiler instead of running `$FID dump-c`
-#                (e.g. release/fid-dev.c of the final build; LINUX_C still
+#                (e.g. build/selfhost/fid-dev.c of a retained build; LINUX_C still
 #                applies)
 #   WSL_DISTRO   WSL distribution (default: WSL's default)
 #   WSL_CC       C compiler inside WSL (default: clang when installed, else gcc)

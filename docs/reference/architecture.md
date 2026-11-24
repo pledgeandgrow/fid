@@ -161,7 +161,7 @@ External linkers (ld, lld, link.exe) are separate processes that:
 #### 12. Hot Reload — ⚠️
 - `src/hotreload.rs` + `fidesc watch`
 - Function-level change detection via L2 IR hashing
-- Rebuilds and reruns the program on save; functions are not swapped in the running process. `fid watch` runs `bench`
+- Rebuilds and reruns the program on save; functions are not swapped in the running process. `fid watch <file> [cmd]` polls the file's contents and re-runs `fid <cmd>` (default `run`) on change
 
 #### 13. C Header FFI — ✅
 - `src/cparser.rs` + `fidesc parse-header <file.h>`
@@ -645,7 +645,7 @@ PIR Level 3 → Register Allocator → Instruction Selector → Peephole → Bin
 - Compiles to an ELF64 executable and runs it as a child process (Linux)
 - Function-level change detection via L2 IR hashing: reports which functions changed
 - Recompiles the whole program and restarts it; no in-process swap yet
-- `fid watch` is not implemented (it runs `bench`)
+- `fid watch <file.fd> [<command>] [--interval <ms>]` re-runs the command when the file's contents change (content polling, ~500 ms)
 
 ---
 

@@ -1,0 +1,81 @@
+// Bugs roadmap BG200: `await` gave an f32, a narrow signed integer, or the
+// result of an operand that is not a call or a variable (an element
+// `fs.get(i)`, an if) the raw word of the future (lower.fd Expr::Await):
+// 2.5 came back as 0 or 2, an i32 -15 as 4294967281, and the f64 sums and
+// the if printed bit patterns; the string of `await ws.get(0)` leaked. The
+// future's type is found for any operand (Lowerer_await_fut_type), an f32
+// result travels as an f64's bits, and a narrow integer is cut to its type.
+//
+// Expected output:
+// 3.5
+// 3.5
+// w1
+// -7
+// -15
+// 255
+// 2.5
+// 25
+
+use task;
+
+async fn half(x: i64) -> Future<f64> {
+    task_yield();
+    return (x as f64) / 2.0;
+}
+
+async fn word(x: i64) -> Future<str> {
+    task_yield();
+    return "w" + int_to_str(x);
+}
+
+async fn neg(x: i32) -> Future<i32> {
+    task_yield();
+    return x - 10;
+}
+
+async fn small(x: u8) -> Future<u8> {
+    task_yield();
+    return x + 1;
+}
+
+async fn quarter(x: i64) -> Future<f32> {
+    task_yield();
+    val h: f32 = (x as f32) / 4.0;
+    return h;
+}
+
+async fn tenfold(x: f32) -> Future<i64> {
+    task_yield();
+    return (x * 10.0) as i64;
+}
+
+fn main() -> i64 {
+    var fs: Vec<Future<f64>> = Vec::new();
+    fs.push(half(3));
+    fs.push(half(4));
+    var total: f64 = 0.0;
+    var i: i64 = 0;
+    while i < fs.len() {
+        total = total + await fs.get(i);
+        i = i + 1;
+    }
+    println(total);
+    val a = half(7);
+    val b = half(9);
+    val c: f64 = await (if total > 1.0 { a } else { b });
+    println(c);
+    var ws: Vec<Future<str>> = Vec::new();
+    ws.push(word(1));
+    val s: str = await ws.get(0);
+    println(s);
+    val n: i32 = await neg(3);
+    println(int_to_str(n as i64));
+    val fa = neg(- 5);
+    println(int_to_str((await fa) as i64));
+    val u: u8 = await small(254);
+    println(int_to_str(u as i64));
+    val q: f32 = await quarter(10);
+    println(q as f64);
+    println(int_to_str(await tenfold(2.5)));
+    return 0;
+}

@@ -1,0 +1,50 @@
+// Bugs roadmap BG160: the C runtime's p_http_parse_request
+// (codegen_c.fd p_http_parse_request__raw) wrote a path of ~1000 bytes past
+// its 1024-byte buffer (`pos += snprintf(...)` went past `cap`), and a
+// request line with no CRLF made it read past the text's NUL. It reads
+// the request as the interpreter does now, every scan bounded by the
+// text's end, the result grown as it is written and its texts escaped (so
+// it is always JSON: a `"` in the path once broke it).
+// Not on emit yet: the native runtime's pert_http_parse_request
+// (stdlib/pe_runtime/data.fd) does not escape the path, trims no header
+// value and reads the body to the end.
+//@ backends: run,ccompile
+//
+// Expected output:
+// "/x"
+// "a"
+// "body"
+// 1003
+// "hello"
+// {"body":"","headers":{},"method":"GET","path":"/","version":"1.1"}
+// {"body":"","headers":{},"method":"GET","path":"/","version":"1.1"}
+// {"body":"","headers":{"Host":"h"},"method":"POST","path":"/q\"x\\y","version":"2"}
+// {"body":"a\"b\nc","headers":{"Content-Type":"text/plain","X-Y":"1"},"method":"PUT","path":"/p","version":"1.0"}
+// {"body":"","headers":{},"method":"BREW","path":"/","version":"1.1"}
+
+fn main() -> i64 {
+    val r1 = p_http_parse_request("GET /x HTTP/1.1\r\nHost: a\r\n\r\nbody");
+    println(p_json_dump(p_json_get(r1, "path")));
+    println(p_json_dump(p_json_get(p_json_get(r1, "headers"), "Host")));
+    println(p_json_dump(p_json_get(r1, "body")));
+    // a path of 1001 bytes
+    var path: str = "/";
+    var i: i64 = 0;
+    while i < 1000 {
+        path = path + "a";
+        i = i + 1;
+    }
+    val r2 = p_http_parse_request("GET " + path + " HTTP/1.1\r\nHost: example\r\n\r\nhello");
+    println(int_to_str(str_len(p_json_dump(p_json_get(r2, "path")))));
+    println(p_json_dump(p_json_get(r2, "body")));
+    // no CRLF at all; no headers
+    println(p_json_dump(p_http_parse_request("GET / HTTP/1.1")));
+    println(p_json_dump(p_http_parse_request("GET " + "/" + " HTTP/1.1\r\n\r\n")));
+    // a quote and a backslash in the path are escaped
+    println(p_json_dump(p_http_parse_request("POST /q\"x\\y HTTP/2\r\nHost: h\r\n\r\n")));
+    // header names and values trimmed; the body up to the next empty line
+    println(p_json_dump(p_http_parse_request("PUT /p HTTP/1.0\r\nContent-Type:  text/plain \r\nX-Y:1\r\n\r\na\"b\nc\r\n\r\nrest")));
+    // a request line of one word
+    println(p_json_dump(p_http_parse_request("BREW")));
+    return 0;
+}

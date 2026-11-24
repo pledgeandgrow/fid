@@ -1,0 +1,88 @@
+// Bugs roadmap BG195: in native Windows executables (pe_runtime) a mutex
+// was an SRW lock held by the OS thread. A task that held it across a
+// suspension (task_sleep, a yield) let the next task of its worker block
+// that worker inside AcquireSRWLockExclusive, and the sleeper was woken onto
+// a queue no free worker served: the program hung at FIDES_WORKERS=1 and 2.
+// A task now waits for the mutex parked; the holder runs on and releases it
+// from whichever worker it is on. Threads and tasks share one mutex too.
+//
+// The interpreter's and the C runtime's mutexes do not exclude tasks yet
+// (BG225, BG148: they print 5 and less than 33000): native only.
+//@ backends: emit
+//
+// Expected output:
+// 15
+// 33000
+
+use task;
+
+var M: i64 = 0;
+var TOTAL: i64 = 0;
+
+fn holder(id: i64) -> i64 {
+    var i: i64 = 0;
+    while i < 5 {
+        p_mutex_lock(M);
+        val v = p_atomic_load(TOTAL);
+        task_sleep(2);
+        p_atomic_store(TOTAL, v + 1);
+        p_mutex_unlock(M);
+        i = i + 1;
+    }
+    return id;
+}
+
+fn busy(id: i64) -> i64 {
+    var i: i64 = 0;
+    while i < 3000 {
+        p_mutex_lock(M);
+        val v = p_atomic_load(TOTAL);
+        if i % 50 == 0 {
+            task_yield();
+        }
+        p_atomic_store(TOTAL, v + 1);
+        p_mutex_unlock(M);
+        i = i + 1;
+    }
+    return id;
+}
+
+fn thr(id: i64) -> i64 {
+    var i: i64 = 0;
+    while i < 3000 {
+        p_mutex_lock(M);
+        val v = p_atomic_load(TOTAL);
+        p_atomic_store(TOTAL, v + 1);
+        p_mutex_unlock(M);
+        i = i + 1;
+    }
+    return id;
+}
+
+fn main() -> i64 {
+    M = p_mutex_init();
+    TOTAL = p_shared_alloc(8);
+    p_atomic_store(TOTAL, 0);
+    // three holders, each sleeping with the mutex held
+    val a = task_go("holder", 1);
+    val b = task_go("holder", 2);
+    val c = task_go("holder", 3);
+    task_run();
+    println(p_atomic_load(TOTAL));
+
+    // eight tasks that yield with it held, two threads and main
+    p_atomic_store(TOTAL, 0);
+    var k: i64 = 0;
+    while k < 8 {
+        val t = task_go("busy", k);
+        k = k + 1;
+    }
+    val t1 = p_thread_spawn("thr", 1, 1);
+    val t2 = p_thread_spawn("thr", 1, 2);
+    thr(0);
+    task_run();
+    p_future_poll(t1);
+    p_future_poll(t2);
+    println(p_atomic_load(TOTAL));
+    return 0;
+}

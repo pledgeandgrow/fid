@@ -5,8 +5,8 @@
 #   scripts/release-checksums.sh [file ...]
 #
 # Without arguments it checksums the installer(s) in installer/ and the
-# shipped binaries in release/ (fid.exe, fidesc.exe, ark.exe, scribe.exe,
-# veil.exe) that exist. Writes SHA256SUMS.txt at the repository root (file
+# shipped binaries in release/ and build/installer/tools/ that exist.
+# Writes SHA256SUMS.txt at the repository root (file
 # names without directories) and prints it.
 #
 # Users check a download with:
@@ -19,8 +19,9 @@ cd "$ROOT"
 
 files=("$@")
 if [ ${#files[@]} -eq 0 ]; then
-    for f in installer/Fid-Setup-*.exe installer/Fides-Setup-*.exe release/fid.exe release/fidesc.exe \
-             release/ark.exe release/scribe.exe release/veil.exe; do
+    for f in installer/Fid-Setup-*.exe installer/Fides-Setup-*.exe release/fid.exe \
+             build/installer/tools/fidesc.exe build/installer/tools/ark.exe \
+             build/installer/tools/scribe.exe build/installer/tools/veil.exe; do
         [ -f "$f" ] && files+=("$f")
     done
 fi

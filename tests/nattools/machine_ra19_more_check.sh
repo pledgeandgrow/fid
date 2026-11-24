@@ -2,18 +2,17 @@
 # RA19 (docs/roadmap/llvm-roadmap.md), the cases added on Nov 17: `!` across
 # blocks and in the compare's block, in place or not, and EXT in a branch's
 # chain (compiler/nat_ir.fd ng_fuse_branches, ng_fuse_xblock; switches
-# FID_NAT_OFF=brnot, brext, brxblock), plus the spill measurement of
+# FID_NAT_OFF=brfuse, brnot, brext, brxblock), plus the spill measurement of
 # ng_fuse_xblock's longer ranges. Run after the compiler is built:
 #   bash tests/nattools/machine_ra19_more_check.sh [fid]   (default release/fid.exe)
 #
 # 1. tests/bootstrap/test_machine_brflags2.fd built with FID_VERIFY=1 and
-#    FID_NAT_DUMP for x86_64-linux, aarch64-linux, riscv64-linux (and
-#    --nat on Windows), with the rules on and with
-#    FID_NAT_OFF=brnot,brext,brxblock. Passing: the output is the file's
-#    expected block in both builds wherever the image runs; in the
-#    `[mir] <fn> after branch fusion` listing, xb_not, xb_nval and xb_nn
-#    have fewer SETCC with the rules on than off on every target; ext_if
-#    and xb_ext have no more.
+#    FID_NAT_DUMP=<one exact function> for x86_64-linux, aarch64-linux,
+#    riscv64-linux (and --nat on Windows), with fusion on and with
+#    FID_NAT_OFF=brfuse,brnot,brext,brxblock. The off count is taken from
+#    "the peephole" (before fusion), since the full brfuse switch suppresses
+#    the "after branch fusion" dump. xb_not, xb_nval and xb_nn must have
+#    fewer SETCC after fusion; ext_if and xb_ext must not have more.
 # 2. FID_NAT_MUTATE=brnot,brxblock (the branch tests the wrong way, on
 #    purpose): the output differs wherever the image runs.
 # 3. tests/bootstrap/test_machine_brflags.fd (the earlier RA19 cases) still
@@ -104,24 +103,34 @@ TARGETS="x86_64-linux aarch64-linux riscv64-linux"
 T=tests/bootstrap/test_machine_brflags2.fd
 T1=tests/bootstrap/test_machine_brflags.fd
 WANT="$(expected "$T")"
-OFF="brnot,brext,brxblock"
-FNS="xb_not,xb_nval,xb_nn,ext_if,xb_ext"
+OFF="brfuse,brnot,brext,brxblock"
 
 for tgt in $TARGETS; do
     ext=""; [ "$tgt" = nat ] && ext=".exe"
     on="$OUT/bf2-$tgt-on$ext"; off="$OUT/bf2-$tgt-off$ext"; mu="$OUT/bf2-$tgt-mut$ext"
-    if ! build "$on" "$T" "$tgt" FID_VERIFY=1 "FID_NAT_DUMP=$FNS"; then bad "$tgt builds: $(tail -3 "$on.log")"; continue; fi
-    if ! build "$off" "$T" "$tgt" FID_VERIFY=1 "FID_NAT_DUMP=$FNS" "FID_NAT_OFF=$OFF"; then bad "$tgt builds with $OFF off"; continue; fi
+    if ! build "$on" "$T" "$tgt" FID_VERIFY=1 FID_IROPT_OFF=inline,inline2 FID_NAT_DUMP=xb_not; then bad "$tgt builds: $(tail -3 "$on.log")"; continue; fi
+    if ! build "$off" "$T" "$tgt" FID_VERIFY=1 FID_IROPT_OFF=inline,inline2 FID_NAT_DUMP=xb_not "FID_NAT_OFF=$OFF"; then bad "$tgt builds with $OFF off"; continue; fi
     ok "$tgt builds (FID_VERIFY=1, rules on and off)"
-    for fn in xb_not xb_nval xb_nn; do
-        a=$(count_op "$on.log" "$fn" "branch fusion" setcc)
-        b=$(count_op "$off.log" "$fn" "branch fusion" setcc)
-        if [ "$a" -lt "$b" ]; then ok "$tgt: $fn has $a SETCC after branch fusion ($b with $OFF off)"; else bad "$tgt: $fn has $a SETCC after branch fusion ($b with $OFF off)"; fi
-    done
-    for fn in ext_if xb_ext; do
-        a=$(count_op "$on.log" "$fn" "branch fusion" setcc)
-        b=$(count_op "$off.log" "$fn" "branch fusion" setcc)
-        if [ "$a" -le "$b" ]; then ok "$tgt: $fn has $a SETCC ($b off)"; else bad "$tgt: $fn has more SETCC with the rules on ($a > $b)"; fi
+    for fn in xb_not xb_nval xb_nn ext_if xb_ext; do
+        on_log="$on.log"
+        off_log="$off.log"
+        if [ "$fn" != xb_not ]; then
+            on_fn="$OUT/bf2-$tgt-$fn-on$ext"
+            off_fn="$OUT/bf2-$tgt-$fn-off$ext"
+            if ! build "$on_fn" "$T" "$tgt" FID_VERIFY=1 FID_IROPT_OFF=inline,inline2 "FID_NAT_DUMP=$fn"; then bad "$tgt builds $fn with branch fusion"; continue; fi
+            if ! build "$off_fn" "$T" "$tgt" FID_VERIFY=1 FID_IROPT_OFF=inline,inline2 "FID_NAT_DUMP=$fn" "FID_NAT_OFF=$OFF"; then bad "$tgt builds $fn with $OFF off"; continue; fi
+            on_log="$on_fn.log"
+            off_log="$off_fn.log"
+        fi
+        a=$(count_op "$on_log" "$fn" "branch fusion" setcc)
+        b=$(count_op "$off_log" "$fn" "the peephole" setcc)
+        if [ "$fn" = ext_if ] || [ "$fn" = xb_ext ]; then
+            if [ "$a" -le "$b" ]; then ok "$tgt: $fn has $a SETCC ($b before fusion)"; else bad "$tgt: $fn has more SETCC with fusion on ($a > $b)"; fi
+        elif [ "$a" -lt "$b" ]; then
+            ok "$tgt: $fn has $a SETCC after branch fusion ($b before fusion)"
+        else
+            bad "$tgt: $fn has $a SETCC after branch fusion ($b before fusion)"
+        fi
     done
     got=$(run_img "$on" "$tgt"); rc=$?
     if [ $rc -eq 2 ]; then
@@ -130,14 +139,14 @@ for tgt in $TARGETS; do
         if [ "$got" = "$WANT" ]; then ok "$tgt: expected output"; else bad "$tgt: output differs"; diff <(echo "$WANT") <(echo "$got") | head -6; fi
         got=$(run_img "$off" "$tgt")
         if [ "$got" = "$WANT" ]; then ok "$tgt: expected output (rules off)"; else bad "$tgt: output differs (rules off)"; fi
-        if build "$mu" "$T" "$tgt" FID_NAT_MUTATE=brnot,brxblock; then
+        if build "$mu" "$T" "$tgt" FID_IROPT_OFF=inline,inline2 FID_NAT_MUTATE=brnot,brxblock; then
             got=$(run_img "$mu" "$tgt")
             if [ "$got" != "$WANT" ]; then ok "$tgt: the mutation changes the output"; else bad "$tgt: FID_NAT_MUTATE=brnot,brxblock prints the expected output"; fi
         else
             bad "$tgt builds with the mutation"
         fi
         old="$OUT/bf1-$tgt$ext"
-        if build "$old" "$T1" "$tgt" FID_VERIFY=1; then
+        if build "$old" "$T1" "$tgt" FID_VERIFY=1 FID_IROPT_OFF=inline,inline2; then
             got=$(run_img "$old" "$tgt")
             if [ "$got" = "$(expected "$T1")" ]; then ok "$tgt: test_machine_brflags.fd still passes"; else bad "$tgt: test_machine_brflags.fd output differs"; fi
         else

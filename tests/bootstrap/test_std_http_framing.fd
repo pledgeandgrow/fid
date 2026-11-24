@@ -1,0 +1,112 @@
+// Bugs roadmap BG176, BG177, BG214: stdlib/http.fd http_read_message over a
+// fake TLS hook that feeds a fixed string. A Content-Length of 20 digits
+// panicked in str_parse_int (BG176); a second, different Content-Length, a
+// Transfer-Encoding other than `chunked`, a negative Content-Length and chunk
+// data not followed by CRLF were accepted, and the leftover body was read as
+// the next request (BG177); a body cut off by the end of the input was
+// handed over as a complete request with an empty body (BG214). Each now
+// fails the message: `method` "", `target` the status the server answers
+// with (400; 413 for a number past HTTP_MAX_BODY, however many digits), or
+// "" when the input just ended.
+// Not on run: the interpreter has no memmove FFI, which http.fd uses.
+//@ backends: ccompile,emit
+//
+// Expected output:
+// -- dup CL
+// [ 400] body=<>
+// -- same dup CL
+// [POST /a] body=<abc>
+// [ ] body=<>
+// -- TE gzip, chunked
+// [ 400] body=<>
+// -- TE + CL
+// [ 400] body=<>
+// -- truncated chunked
+// [ 400] body=<>
+// -- truncated CL
+// [ ] body=<>
+// -- chunk no CRLF after data
+// [ 400] body=<>
+// -- chunked no final CRLF
+// [ 400] body=<>
+// -- negative CL
+// [ 400] body=<>
+// -- plus CL
+// [ 400] body=<>
+// -- huge CL
+// [ 413] body=<>
+// -- too large
+// [ 413] body=<>
+// -- CL keep-alive
+// [POST /a] body=<hello>
+// [GET /b] body=<>
+// [ ] body=<>
+// -- chunked, extension, trailer
+// [POST /a] body=<abcde>
+// [GET /c] body=<>
+// [ ] body=<>
+use http;
+
+var feed: str = "";
+var fpos: i64 = 0;
+
+fn frecv(tls: i64, buf: i64, n: i64, t: i64) -> i64 {
+    var k: i64 = 0;
+    while k < n && fpos < str_len(feed) {
+        var p: *mut u8 = (buf + k) as *mut u8;
+        // SAFETY: k < n, the room hc_fill offers at buf.
+        unsafe {
+            *p = str_byte_at(feed, fpos) as u8;
+        }
+        k = k + 1;
+        fpos = fpos + 1;
+    }
+    return k;
+}
+
+fn fsend(tls: i64, buf: i64, n: i64) -> i64 {
+    return n;
+}
+
+fn fclose(tls: i64) -> i64 {
+    return 0;
+}
+
+fn facc(fd: i64) -> i64 {
+    return 1;
+}
+
+fn show(name: str, raw: str) {
+    println("-- " + name);
+    feed = raw;
+    fpos = 0;
+    val c: i64 = http_conn_new(-1, 1);
+    var i: i64 = 0;
+    while i < 3 {
+        val m: HttpRequest = http_read_message(c, 100, false);
+        println("[" + m.method + " " + m.target + "] body=<" + m.body + ">");
+        if m.method == "" {
+            i = 9;
+        }
+        i = i + 1;
+    }
+    http_conn_close(c);
+}
+
+fn main() {
+    http_set_tls(frecv, fsend, fclose, facc);
+    show("dup CL", "POST /a HTTP/1.1\r\nContent-Length: 0\r\nContent-Length: 27\r\n\r\nGET /smuggled HTTP/1.1\r\n\r\n");
+    show("same dup CL", "POST /a HTTP/1.1\r\nContent-Length: 3\r\ncontent-length: 3\r\n\r\nabc");
+    show("TE gzip, chunked", "POST /a HTTP/1.1\r\nTransfer-Encoding: gzip, chunked\r\nContent-Length: 4\r\n\r\n1e\r\nGET /x HTTP/1.1\r\nX: y\r\n\r\n\r\n0\r\n\r\n");
+    show("TE + CL", "POST /a HTTP/1.1\r\nTransfer-Encoding: chunked\r\nContent-Length: 3\r\n\r\n0\r\n\r\n");
+    show("truncated chunked", "POST /a HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhel");
+    show("truncated CL", "POST /a HTTP/1.1\r\nContent-Length: 10\r\n\r\nhel");
+    show("chunk no CRLF after data", "POST /a HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabcGARBAGE\r\n0\r\n\r\n");
+    show("chunked no final CRLF", "POST /a HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n");
+    show("negative CL", "POST /a HTTP/1.1\r\nContent-Length: -5\r\n\r\nGET /neg HTTP/1.1\r\n\r\n");
+    show("plus CL", "POST /a HTTP/1.1\r\nContent-Length: +5\r\n\r\nhello");
+    show("huge CL", "POST /a HTTP/1.1\r\nContent-Length: 99999999999999999999\r\n\r\nx");
+    show("too large", "POST /a HTTP/1.1\r\nContent-Length: 16777217\r\n\r\n");
+    show("CL keep-alive", "POST /a HTTP/1.1\r\nContent-Length: 5\r\n\r\nhelloGET /b HTTP/1.1\r\n\r\n");
+    show("chunked, extension, trailer", "POST /a HTTP/1.1\r\nTransfer-Encoding: Chunked\r\n\r\n3;x=1\r\nabc\r\n2\r\nde\r\n0\r\nX-T: 1\r\n\r\nGET /c HTTP/1.1\r\n\r\n");
+}

@@ -885,6 +885,14 @@ fn bc_tie_one(self: &mut BorrowChecker, name: str, e: Expr, count: i64, line: i6
                     c = bc_pass_on(self, name, iv, c, line);
                 }
                 _ => {
+                    // BG139: `f(&w[0])` with `w = &v`: what w borrows too
+                    match extract_field_path(ie) {
+                        OptStr::Some(rpath) => {
+                            c = bc_reborrow_through(self, name, rpath, c, line);
+                        }
+                        OptStr::None => {
+                        }
+                    }
                 }
             }
         }
@@ -1220,7 +1228,19 @@ fn compute_last_use(self: &mut BorrowChecker, body: Vec<Stmt>) -> void {
     var i: i64 = 0;
     while i < body.len() {
         var stmt: Stmt = body.get(i);
-        collect_var_uses_stmt(self, stmt, i);
+        // BG140: a `defer` body runs when the function's scope ends (on
+        // every exit), so what it reads is used at the last statement, not
+        // where the `defer` is written. A `defer` in an inner block runs
+        // at that block's end, inside this same top-level statement.
+        var use_at: i64 = i;
+        match stmt {
+            Stmt::Defer(_, _) => {
+                use_at = body.len() - 1;
+            }
+            _ => {
+            }
+        }
+        collect_var_uses_stmt(self, stmt, use_at);
         i = i + 1;
     }
 }
@@ -1726,7 +1746,12 @@ fn collect_var_uses_expr(self: &mut BorrowChecker, expr: Expr, idx: i64) -> void
 // Set the last-use index for a variable. If it already exists, update it.
 fn last_use_set(self: &mut BorrowChecker, name: str, idx: i64) -> void {
     if HashMap_contains(self.last_use_index, name) {
-        self.last_use.get(HashMap_get(self.last_use_index, name) - 1).val = idx;
+        // BG140: the latest use wins; a `defer` body's reads (at the last
+        // statement) come before the statements after the `defer`
+        var at: i64 = HashMap_get(self.last_use_index, name) - 1;
+        if idx > self.last_use.get(at).val {
+            self.last_use.get(at).val = idx;
+        }
         return;
     }
     self.last_use.push(StringI64Entry_new(name, idx));
@@ -3556,6 +3581,11 @@ fn maybe_record_borrow_from_expr(self: &mut BorrowChecker, name: str, expr: Expr
                         // Now create the named borrow.
                         create_borrow(self, path, name, is_mut, line);
                         HashMap_insert(self.ref_vars, name, 1);
+                        // BG139: through a reference variable (`&w[0]`,
+                        // `w = &v`) it borrows what w borrows too
+                        if !bc_never_read(self, name) {
+                            bc_reborrow_through(self, name, path, 1, line);
+                        }
                     }
                     OptStr::None => {
                     }
@@ -3575,6 +3605,18 @@ fn maybe_record_borrow_from_expr(self: &mut BorrowChecker, name: str, expr: Expr
             // LG3: a struct with lifetime parameters holds the references
             // its fields are given (check_expr released their temporaries)
             bc_record_struct_borrow(self, name, sname, fields, line);
+        }
+        // BG141: `val r = if c { &v[0] } else { &v[1] }`, `{ &v[0] }`, a
+        // `match` whose arms give references: r borrows what each branch's
+        // value does (the branches' temporaries ended with their blocks)
+        Expr::If(_, _, _) => {
+            bc_record_branch_borrows(self, name, expr, line);
+        }
+        Expr::Block(_) => {
+            bc_record_branch_borrows(self, name, expr, line);
+        }
+        Expr::Match(_, _) => {
+            bc_record_branch_borrows(self, name, expr, line);
         }
         Expr::TupleLit(telems) => {
             // BG79: `val t = (&mut x, 1)`: t borrows x as long as it lives
@@ -3620,6 +3662,161 @@ fn bc_record_ref_borrow(self: &mut BorrowChecker, name: str, e: Expr, line: i64)
         }
     }
     return false;
+}
+
+/// BG139: `name` borrows `path` (`w[0]`, `w.f`, `w`), and the variable the
+/// path starts at is a reference (`val w = &v`): the place is behind that
+/// reference, so `name` also borrows what `w` borrows (its own borrow and
+/// its further ones, `w#k`: transitively), from borrow number `count` on.
+/// Returns the next borrow number.
+fn bc_reborrow_through(self: &mut BorrowChecker, name: str, path: str, count: i64, line: i64) -> i64 {
+    var root: str = path;
+    var dot: i64 = str_find(path, ".");
+    if dot > 0 {
+        root = str_slice(path, 0, dot);
+    }
+    if root == name || HashMap_get(self.ref_vars, root) == 0 {
+        return count;
+    }
+    return bc_pass_on(self, name, root, count, line);
+}
+
+/// BG141: the expressions an `if`/block/`match` value can come from: the
+/// last statement of each branch when it is an expression, looking into
+/// nested branches.
+fn bc_tail_exprs(stmts: Vec<Stmt>, out: &mut Vec<Expr>) -> void {
+    if stmts.len() == 0 {
+        return;
+    }
+    match stmts.get(stmts.len() - 1) {
+        Stmt::Expr(e, _) => {
+            bc_tail_expr(e, out);
+        }
+        Stmt::If(_, then_b, else_b, _) => {
+            bc_tail_exprs(then_b, out);
+            match else_b {
+                OptStmts::Some(eb) => {
+                    bc_tail_exprs(eb, out);
+                }
+                OptStmts::None => {
+                }
+            }
+        }
+        Stmt::Match(_, arms, _) => {
+            var a: i64 = 0;
+            while a < arms.len() {
+                bc_tail_exprs(arms.get(a).body, out);
+                a = a + 1;
+            }
+        }
+        _ => {
+        }
+    }
+}
+
+fn bc_tail_expr(e: Expr, out: &mut Vec<Expr>) -> void {
+    match e {
+        Expr::If(_, then_b, else_b) => {
+            bc_tail_exprs(then_b, out);
+            match else_b {
+                OptStmts::Some(eb) => {
+                    bc_tail_exprs(eb, out);
+                }
+                OptStmts::None => {
+                }
+            }
+        }
+        Expr::Block(stmts) => {
+            bc_tail_exprs(stmts, out);
+        }
+        Expr::Match(_, arms) => {
+            var a: i64 = 0;
+            while a < arms.len() {
+                bc_tail_exprs(arms.get(a).body, out);
+                a = a + 1;
+            }
+        }
+        _ => {
+            out.push(e);
+        }
+    }
+}
+
+/// BG141: `val name = if c { &v[0] } else { &w }` (or a block, a `match`):
+/// check_expr made each branch's `&` a temporary of the branch's block,
+/// released when the block ended, so `name` borrowed nothing. It borrows
+/// every path a branch value refers to (once each; a `&mut` in any branch
+/// makes it mutable), what a reference variable on that path borrows
+/// (BG139), and what a variable given as a branch value holds (as `val
+/// name = w`). A borrower never read gets none (OW5).
+fn bc_record_branch_borrows(self: &mut BorrowChecker, name: str, e: Expr, line: i64) -> void {
+    if self.unsafe_depth > 0 || bc_never_read(self, name) {
+        return;
+    }
+    var tails: Vec<Expr> = Vec::new();
+    bc_tail_expr(e, &mut tails);
+    var paths: Vec<str> = Vec::new();
+    var muts: Vec<bool> = Vec::new();
+    var holders: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < tails.len() {
+        match tails.get(i) {
+            Expr::Ref(inner, m) => {
+                match extract_field_path(bc_box_expr_unbox(inner)) {
+                    OptStr::Some(p) => {
+                        var k: i64 = 0;
+                        var found: i64 = -1;
+                        while k < paths.len() {
+                            if paths.get(k) == p {
+                                found = k;
+                            }
+                            k = k + 1;
+                        }
+                        if found < 0 {
+                            paths.push(p);
+                            muts.push(m);
+                        } else if m {
+                            muts.set(found, true);
+                        }
+                    }
+                    OptStr::None => {
+                    }
+                }
+            }
+            Expr::Ident(src) => {
+                if src != name && !bc_vec_contains_str(holders, src) {
+                    holders.push(src);
+                }
+            }
+            _ => {
+            }
+        }
+        i = i + 1;
+    }
+    var count: i64 = 0;
+    var j: i64 = 0;
+    while j < paths.len() {
+        bc_tie_borrow(self, name, paths.get(j), muts.get(j), count, line);
+        count = count + 1;
+        count = bc_reborrow_through(self, name, paths.get(j), count, line);
+        j = j + 1;
+    }
+    var h: i64 = 0;
+    while h < holders.len() {
+        count = bc_pass_on(self, name, holders.get(h), count, line);
+        h = h + 1;
+    }
+    if paths.len() > 0 {
+        HashMap_insert(self.ref_vars, name, 1);
+    } else {
+        var hr: i64 = 0;
+        while hr < holders.len() {
+            if HashMap_get(self.ref_vars, holders.get(hr)) > 0 && count > 0 {
+                HashMap_insert(self.ref_vars, name, 1);
+            }
+            hr = hr + 1;
+        }
+    }
 }
 
 // --- pattern_bindings -----------------------------------------------------

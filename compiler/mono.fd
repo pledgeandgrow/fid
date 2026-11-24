@@ -449,17 +449,22 @@ pub fn mangle_type(ty: Type) -> str {
             }
             return "rawptr_" + mut_str + "_" + mangle_type(box_type_deref(inner));
         }
-        Type::Array(elem, _) => {
-            return "arr_" + mangle_type(box_type_deref(elem));
+        Type::Array(elem, size) => {
+            // The size is part of the type: [u8; 4] and [u8; 8] differ
+            return "arr_" + mangle_type(box_type_deref(elem)) + "_" + int_to_str(size);
         }
         Type::ArrayConst(elem, size_param) => {
-            return "arrc_" + mangle_type(box_type_deref(elem)) + "_" + size_param;
+            // <elem len>_<elem>_<param>: elem and param may both hold '_'
+            var em: str = mangle_type(box_type_deref(elem));
+            return "arrc_" + int_to_str(str_len(em)) + "_" + em + "_" + size_param;
         }
         Type::Tuple(types) => {
             var parts: Vec<str> = Vec::new();
             var i: i64 = 0;
             while i < types.len() {
-                parts.push(mangle_type(types.get(i)));
+                var p: str = mangle_type(types.get(i));
+                // <len>_<part>: (a_b, c) and (a, b_c) cannot give one name
+                parts.push(int_to_str(str_len(p)) + "_" + p);
                 i = i + 1;
             }
             return "tup_" + str_join(parts, "_");
@@ -4662,6 +4667,31 @@ pub fn instantiate(gen_func: Func, subst: Vec<SubstEntry>, mangled_name: str, ct
     temp_func.has_effect_annotation = gen_func.has_effect_annotation;
     temp_func.is_interrupt = gen_func.is_interrupt;
     temp_func.annotations = gen_func.annotations;
+    // BG144: each bound with the type its parameter is instantiated with
+    // (`__trait_bound` [type, trait]): a call of the bound's method on that
+    // type takes the trait's where the type has another method of the name
+    // (lower.fd lw_tq_resolve)
+    var tbi: i64 = 0;
+    while tbi < gen_func.type_param_bounds.len() {
+        val tbp: StrPair = gen_func.type_param_bounds.get(tbi);
+        match subst_get(subst, tbp.a) {
+            OptType::Some(tbt) => {
+                match tbt {
+                    Type::Named(tbn) => {
+                        var tba: Vec<str> = Vec::new();
+                        tba.push(tbn);
+                        tba.push(tbp.b);
+                        temp_func.annotations.push(Annotation_new("__trait_bound", tba));
+                    }
+                    _ => {
+                    }
+                }
+            }
+            OptType::None => {
+            }
+        }
+        tbi = tbi + 1;
+    }
     temp_func.preconditions = gen_func.preconditions;
     temp_func.postconditions = gen_func.postconditions;
     temp_func.is_async = gen_func.is_async;

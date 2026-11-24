@@ -30,7 +30,7 @@ note() { echo "     $1"; }
 EXE=""
 WIN=0
 case "$(uname -s 2>/dev/null)" in MINGW*|MSYS*|CYGWIN*) EXE=".exe"; WIN=1 ;; esac
-D=$(mktemp -d ./_d9_check.XXXXXX)
+D=$(mktemp -d ./tests/_d9_check.XXXXXX)
 D=${D#./}
 trap 'rm -rf "$D"' EXIT
 now_ms() { echo $(( $(date +%s%N) / 1000000 )); }

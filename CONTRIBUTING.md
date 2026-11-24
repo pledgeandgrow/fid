@@ -61,6 +61,10 @@ A change is checked when the programs it affects give the same output on
 every back end it touches (`run`, `ccompile`, `emit`). Add a test for every
 fix and feature: `tests/bootstrap/test_<feature>.fd`, or `_fail.fd` for a
 program the compiler must reject (its first line is `// expect-error: <message>`).
+Tests run from the repository root. Put test-program outputs under `tests/`;
+the shared `build/` tree is for harness/build products. Use the system temp
+directory when appropriate, and never leave ad hoc artifacts in the project
+root.
 
 A miscompile (the compiler accepts a program and its output is wrong) is
 fixed only with a test that fails without the fix. Add or update its row in

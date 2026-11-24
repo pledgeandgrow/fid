@@ -1,0 +1,64 @@
+// BG138-BG141: patterns the borrow and escape checks keep accepting after
+// those fixes: a reference variable, and a reference taken through one,
+// read for the last time before the Vec changes; `if`/block/`match`
+// initializers that give no reference, and one that gives a reference read
+// before the change; a `defer` reading the Vec itself (no borrow); closures
+// passing a captured variable's reference to a call, or returning their
+// reference parameter.
+// Expected output:
+// 5
+// 6
+// 4
+// 5
+// 5
+// 41
+// 41
+// 7
+fn get(p: &i64) -> i64 {
+    return *p;
+}
+
+fn main() -> i64 {
+    var v: Vec<i64> = Vec::new();
+    v.push(5);
+    // BG139: a reference variable read for the last time before the push
+    val w: &Vec<i64> = &v;
+    println(int_to_str(w[0]));
+    v.push(6);
+    // BG139: a reborrow through one, also read before the push
+    val w2: &Vec<i64> = &v;
+    val r: &i64 = &w2[1];
+    println(int_to_str(*r));
+    v.push(7);
+    // BG141: initializers that give no reference
+    val n: i64 = {
+        val t: i64 = 3;
+        t + 1
+    };
+    println(int_to_str(n));
+    val m: i64 = if n > 2 { v[0] } else { v[1] };
+    v.push(m);
+    val k: i64 = match n {
+        4 => v.len(),
+        _ => 0,
+    };
+    v.push(k);
+    println(int_to_str(v.len()));
+    // BG141: a reference from an `if` initializer, read before the push
+    val q: &i64 = if n > 2 { &v[0] } else { &v[1] };
+    println(int_to_str(*q));
+    v.push(8);
+    // BG140: a deferred read of the Vec itself, not of a reference
+    defer {
+        println(int_to_str(v.len()));
+    }
+    v.push(9);
+    // BG138: a closure passing a captured variable's reference to a call,
+    // and one returning its reference parameter
+    var a: i64 = 41;
+    val g = fn() -> i64 => get(&a);
+    println(int_to_str(g()));
+    val id = fn(x: &i64) -> &i64 => x;
+    println(int_to_str(*id(&a)));
+    return 0;
+}

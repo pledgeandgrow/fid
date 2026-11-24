@@ -1,0 +1,56 @@
+// Bugs roadmap BG196: in both native runtimes the end of a `spawn scope { }`
+// (p_executor_run_all) waited for every unfinished green task of the
+// program (pe_runtime `pert_live > 0`, linux_runtime `pe_co_drain()`), not
+// only for those started inside the scope. A scope inside an `async fn`
+// waited for that task itself, which never ends while it waits; a scope
+// after an async watcher that waits for a flag set after the scope waited
+// for the watcher. Both hung natively; `fid run` and C gave the results
+// below. Now a scope counts the tasks started inside it and waits for those
+// only, as the C runtime joins only the scope's threads.
+//
+// Expected output:
+// 41
+// 42
+// scope done
+// 7
+
+use task;
+
+fn work(n: i64) -> i64 {
+    n * 2
+}
+
+async fn outer(n: i64) -> Future<i64> {
+    var r: i64 = 0;
+    spawn scope {
+        val t = spawn work(n);
+        r = await t;
+    }
+    return r + 1;
+}
+
+async fn watcher(flag: i64) -> Future<i64> {
+    while p_atomic_load(flag) == 0 {
+        task_sleep(1);
+    }
+    return 7;
+}
+
+fn main() -> i64 {
+    // a scope inside a task
+    val f = outer(20);
+    println(await f);
+
+    // a task started before the scope that waits for after it
+    val flag = p_shared_alloc(8);
+    p_atomic_store(flag, 0);
+    val w = watcher(flag);
+    spawn scope {
+        val t = spawn work(21);
+        println(await t);
+    }
+    println("scope done");
+    p_atomic_store(flag, 1);
+    println(await w);
+    return 0;
+}

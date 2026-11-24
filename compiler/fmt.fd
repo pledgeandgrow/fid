@@ -290,6 +290,14 @@ fn is_single_punct(b: i64) -> bool {
 
 /// Tokenize Fides source into formatter tokens (preserving comments & strings).
 pub fn fmt_tokenize(src: str) -> Vec<FTok> {
+    var starts: Vec<i64> = Vec::new();
+    return fmt_tokenize_lines(src, &mut starts);
+}
+
+/// `fmt_tokenize`, also listing in `line_starts` the index of each token
+/// that began a line in the source (BG174: the printer keeps the line
+/// break of a statement written with no `;`).
+fn fmt_tokenize_lines(src: str, line_starts: &mut Vec<i64>) -> Vec<FTok> {
     var tokens: Vec<FTok> = Vec::new();
     var len: i64 = str_len(src);
     var i: i64 = 0;
@@ -322,6 +330,9 @@ pub fn fmt_tokenize(src: str) -> Vec<FTok> {
             // its own line; one with no marker is a trailing comment of the
             // code before it on the same line, and stays there
             tokens.push(FTok::BlankLines(0));
+        }
+        if after_newline {
+            line_starts.push(tokens.len());
         }
         saw_newline = false;
 
@@ -1164,8 +1175,9 @@ fn fmt_generic_open_before(tokens: Vec<FTok>, gt: i64) -> i64 {
 /// `,` `:` `::` `&` `*` `->`, brackets and parentheses (a `;` only inside
 /// `[T; N]`), and is then not followed by a name or a literal. `a < b`,
 /// `a < b && c > d` and `f(a < b)` are comparisons; `Vec<Vec<i64>>` is a
-/// generic.
-fn generic_closes(tokens: Vec<FTok>, idx: i64) -> bool {
+/// generic. `name_after_ok` skips the trailing-name veto: after `impl` a
+/// `<...>` is always a type-parameter list (`impl<T> Wrap`).
+fn generic_closes(tokens: Vec<FTok>, idx: i64, name_after_ok: bool) -> bool {
     var depth: i64 = 1;
     var brackets: i64 = 0;
     var parens: i64 = 0;
@@ -1217,6 +1229,9 @@ fn generic_closes(tokens: Vec<FTok>, idx: i64) -> bool {
                         return false;
                     }
                     if closed {
+                        if name_after_ok {
+                            return true;
+                        }
                         match next_significant(tokens, i + 1) {
                             FTok::Word(_) => {
                                 return false;
@@ -1259,16 +1274,21 @@ fn is_generic_open(tokens: Vec<FTok>, idx: i64) -> bool {
             if is_type_word(p) {
                 return false;
             }
+            // `impl<T> Wrap<T>`: after the impl keyword a `<` can only be
+            // the impl's own type-parameter list, never a comparison
+            if p == "impl" {
+                return generic_closes(tokens, idx, true);
+            }
             match nxt {
                 FTok::Word(_) => {
-                    return generic_closes(tokens, idx);
+                    return generic_closes(tokens, idx, false);
                 }
                 FTok::Punct(gp) => {
                     if gp == ">" {
                         return true;
                     }
                     if gp == "(" || gp == "[" || gp == "&" || gp == "*" {
-                        return generic_closes(tokens, idx);
+                        return generic_closes(tokens, idx, false);
                     }
                     return false;
                 }
@@ -1787,11 +1807,85 @@ fn fmt_trailing_comment_next(tokens: Vec<FTok>, idx: i64) -> bool {
     return false;
 }
 
+/// BG174: a keyword after which the statement goes on (`return`, `val`,
+/// `if`, `as`, ...): a line ending in it does not end a statement.
+fn fmt_word_continues(w: str) -> bool {
+    return w == "return" || w == "val" || w == "var" || w == "let" || w == "mut" || w == "pub" || w == "if" || w == "else" || w == "while" || w == "for" || w == "in" || w == "match" || w == "fn" || w == "as" || w == "is" || w == "struct" || w == "enum" || w == "impl" || w == "trait" || w == "use" || w == "module" || w == "const" || w == "type" || w == "unsafe" || w == "async" || w == "move" || w == "dyn" || w == "ref" || w == "where" || w == "loop" || w == "spawn" || w == "comptime" || w == "defer" || w == "extern" || w == "static" || w == "catch" || w == "and" || w == "or" || w == "not";
+}
+
+/// BG174: whether a statement can end with the token before `idx` (a name
+/// or literal, `)`, `]`, `?`) and the token at `idx` can start the next one
+/// (a name, a literal, `(`, `!`, `@`). When the source put a line break
+/// there with no `;`, the printer keeps it: joined, `val z = id(4)` and
+/// `(z)` on the next line would become the call `id(4)(z)` (the parser
+/// reads a `(` on the next line as a new statement).
+fn fmt_statement_break(tokens: Vec<FTok>, idx: i64) -> bool {
+    var ends: bool = false;
+    match prev_significant_at(tokens, idx) {
+        FTok::Word(w) => {
+            ends = !fmt_word_continues(w);
+        }
+        FTok::Number(_) => {
+            ends = true;
+        }
+        FTok::Str(_) => {
+            ends = true;
+        }
+        FTok::FStr(_) => {
+            ends = true;
+        }
+        FTok::Punct(p) => {
+            ends = p == ")" || p == "]" || p == "?";
+        }
+        _ => {
+        }
+    }
+    if !ends {
+        return false;
+    }
+    match tokens.get(idx) {
+        FTok::Word(w) => {
+            // not a word that goes on with the expression before it
+            return !(w == "as" || w == "is" || w == "in" || w == "else" || w == "catch" || w == "where" || w == "and" || w == "or");
+        }
+        FTok::Number(_) => {
+            return true;
+        }
+        FTok::Str(_) => {
+            return true;
+        }
+        FTok::FStr(_) => {
+            return true;
+        }
+        FTok::Punct(p) => {
+            return p == "(" || p == "!" || p == "@";
+        }
+        _ => {
+        }
+    }
+    return false;
+}
+
 // --- Printer ----------------------------------------------------------
 
 /// Format Fides source code. Returns the formatted string.
 pub fn format_source(src: str) -> str {
-    var tokens: Vec<FTok> = fmt_tokenize(src);
+    var line_starts: Vec<i64> = Vec::new();
+    var tokens: Vec<FTok> = fmt_tokenize_lines(src, &mut line_starts);
+    // BG174: which tokens began a line in the source
+    var nl_before: Vec<bool> = Vec::new();
+    var nb: i64 = 0;
+    while nb < tokens.len() {
+        nl_before.push(false);
+        nb = nb + 1;
+    }
+    nb = 0;
+    while nb < line_starts.len() {
+        if line_starts.get(nb) < nl_before.len() {
+            nl_before.set(line_starts.get(nb), true);
+        }
+        nb = nb + 1;
+    }
     var sb: StringBuilder = StringBuilder::new();
     var indent: i64 = 0;
     var at_line_start: bool = true;
@@ -2087,6 +2181,20 @@ pub fn format_source(src: str) -> str {
             sb.append_str("\n");
             at_line_start = true;
             need_space_before = false;
+        }
+
+        // BG174: a statement that the source ended with a line break and no
+        // `;` keeps its line (semicolons are optional, reference §1.10)
+        if !at_line_start && generic_depth == 0 && nl_before.get(idx) && fmt_statement_break(tokens, idx) {
+            var open_base3: i64 = 0;
+            if brace_paren.len() > 0 {
+                open_base3 = brace_paren.get(brace_paren.len() - 1);
+            }
+            if paren_depth <= open_base3 {
+                sb.append_str("\n");
+                at_line_start = true;
+                need_space_before = false;
+            }
         }
 
         // Flush blanks. When the current line is still open (after `@pure`,

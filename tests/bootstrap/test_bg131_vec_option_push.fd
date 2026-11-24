@@ -1,0 +1,130 @@
+// Bugs roadmap BG131: a Vec of Option<T> or Result<T, E> stored the address
+// of the enum literal's stack slot (lower.fd Lowerer_generic_inst_struct_ir
+// gave a layout only to the program's generic structs): every push stored
+// the same slot, the sum read the last value three times and the drop freed
+// words never allocated ("Double free" / "Invalid free"). A built-in
+// generic enum's instance is stored as its layout (Vec_push_mem,
+// Vec_set_mem), as a generic struct's is.
+//
+// Expected output:
+// 3
+// 30
+// 0
+// 10
+// 20
+// none
+// 30
+// a1 b2
+// 2
+// ok 1
+// err e1
+// 7
+// 4
+
+fn fill(w: &mut Vec<Option<i64>>, n: i64) {
+    var i: i64 = 0;
+    while i < n {
+        w.push(Option::Some(i * 10));
+        i = i + 1;
+    }
+    w.push(Option::None);
+}
+
+fn main() {
+    // push, then get
+    var w: Vec<Option<i64>> = Vec::new();
+    var i: i64 = 0;
+    while i < 3 {
+        w.push(Option::Some(i * 10));
+        i = i + 1;
+    }
+    println(int_to_str(w.len()));
+    var s: i64 = 0;
+    var j: i64 = 0;
+    while j < 3 {
+        val o = w.get(j);
+        match o {
+            Option::Some(x) => {
+                s = s + x;
+            }
+            Option::None => {
+            }
+        }
+        j = j + 1;
+    }
+    println(int_to_str(s));
+
+    // through a &mut parameter, read by a for loop
+    var w2: Vec<Option<i64>> = Vec::new();
+    fill(&mut w2, 3);
+    var s2: i64 = 0;
+    for o2 in w2 {
+        match o2 {
+            Option::Some(x2) => {
+                s2 = s2 + x2;
+                println(int_to_str(x2));
+            }
+            Option::None => {
+                println("none");
+            }
+        }
+    }
+    println(int_to_str(s2));
+
+    // owned payloads
+    var ws: Vec<Option<str>> = Vec::new();
+    ws.push(Option::Some("a" + int_to_str(1)));
+    ws.push(Option::Some("b" + int_to_str(2)));
+    var line: str = "";
+    for os in ws {
+        match os {
+            Option::Some(t) => {
+                if line != "" {
+                    line = line + " ";
+                }
+                line = line + t;
+            }
+            Option::None => {
+            }
+        }
+    }
+    println(line);
+
+    var wr: Vec<Result<i64, str>> = Vec::new();
+    wr.push(Result::Ok(1));
+    wr.push(Result::Err("e" + int_to_str(1)));
+    println(int_to_str(wr.len()));
+    for r in wr {
+        match r {
+            Result::Ok(v) => {
+                println("ok " + int_to_str(v));
+            }
+            Result::Err(e) => {
+                println("err " + e);
+            }
+        }
+    }
+
+    // set and index assignment
+    var wset: Vec<Option<i64>> = Vec::new();
+    wset.push(Option::None);
+    wset.push(Option::None);
+    wset.set(0, Option::Some(7));
+    wset[1] = Option::Some(4);
+    match wset.get(0) {
+        Option::Some(a) => {
+            println(int_to_str(a));
+        }
+        Option::None => {
+            println("none");
+        }
+    }
+    match wset.get(1) {
+        Option::Some(b) => {
+            println(int_to_str(b));
+        }
+        Option::None => {
+            println("none");
+        }
+    }
+}

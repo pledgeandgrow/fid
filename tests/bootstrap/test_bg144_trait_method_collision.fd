@@ -1,0 +1,142 @@
+// Bugs roadmap BG144: trait impl methods were named `Type_method` whatever
+// the trait, so two traits' methods of one name on a type, or an inherent
+// method beside a trait's, became one function (the last lowered won; C
+// failed when the signatures differed). The plain name stays the first
+// definer's (the inherent method, else the first trait impl); a trait impl
+// with a taken name has its methods named `Type__Trait_method`, its dyn
+// values carry that prefix, and a call through a generic bound takes the
+// bound trait's method (lower.fd Lowerer_tq_setup, lw_tq_resolve; mono.fd
+// instantiate records the bounds), as `self.k()` in a qualified impl takes
+// its own trait's.
+//
+// Expected output:
+// 1
+// 2
+// 1
+// 2
+// 8
+// c2:5
+// c2:5
+// 8
+// 5
+// trait 5
+// trait 5
+
+cap A {
+    fn m(self) -> i64;
+}
+
+cap B {
+    fn m(self) -> i64;
+}
+
+struct S {
+    x: i64,
+}
+
+impl A for S {
+    fn m(self) -> i64 {
+        return 1;
+    }
+}
+
+impl B for S {
+    fn m(self) -> i64 {
+        return 2;
+    }
+}
+
+cap C1 {
+    fn k(self) -> i64;
+    fn twice(self) -> i64;
+}
+
+cap C2 {
+    fn k(self, d: i64) -> str;
+}
+
+struct T {
+    y: i64,
+}
+
+impl C2 for T {
+    fn k(self, d: i64) -> str {
+        return "c2:" + int_to_str(self.y + d);
+    }
+}
+
+impl C1 for T {
+    fn k(self) -> i64 {
+        return self.y;
+    }
+
+    fn twice(self) -> i64 {
+        return self.k() * 2;
+    }
+}
+
+cap Show {
+    fn show(self) -> str;
+}
+
+struct P {
+    v: i64,
+}
+
+impl P {
+    fn show(self) -> i64 {
+        return self.v;
+    }
+}
+
+impl Show for P {
+    fn show(self) -> str {
+        return "trait " + int_to_str(self.v);
+    }
+}
+
+fn via_a<X: A>(t: X) -> i64 {
+    return t.m();
+}
+
+fn via_b<X: B>(t: X) -> i64 {
+    return t.m();
+}
+
+fn via_c2<X: C2>(t: X) -> str {
+    return t.k(1);
+}
+
+fn via_show<X: Show>(t: X) -> str {
+    return t.show();
+}
+
+fn main() {
+    val s = S {
+        x: 0
+    };
+    val a = s as dyn A;
+    val b = s as dyn B;
+    println(a.m());
+    println(b.m());
+    println(via_a(s));
+    println(via_b(s));
+
+    val t = T {
+        y: 4
+    };
+    println(t.twice());
+    val c2 = t as dyn C2;
+    println(c2.k(1));
+    println(via_c2(t));
+    val c1 = t as dyn C1;
+    println(c1.twice());
+
+    val p = P {
+        v: 5
+    };
+    println(p.show());
+    println(via_show(p));
+    val d = p as dyn Show;
+    println(d.show());
+}

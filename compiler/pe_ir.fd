@@ -534,6 +534,42 @@ fn peir_pun_f32_i64(enc: & mut PeirEnc, voff: i64, dst: i64) {
     PeirEnc_mov_mem_rbp_reg(enc, dst, PEIR_RAX);
 }
 
+/// BG134: xmm `x` (0 or 1) = the operand at frame offset `off` of type `t`
+/// as an f64. An f32 (in its frame slot: an f32 never gets a register in
+/// pe_ir) is movss xmm, [rbp + off]; cvtss2sd xmm, xmm (F3 0F 5A C0 for
+/// xmm0, F3 0F 5A C9 for xmm1); anything else is read by movsd_xmm_mem_rbp,
+/// which also takes a value in a general or an xmm register.
+fn peir_ld_as_f64(e: &mut PeirEnc, x: i64, off: i64, t: IrType) -> void {
+    if ir_type_eq(t, IrType::F32) {
+        PeirEnc_movss_xmm_mem_rbp(e, x, off);
+        PeirEnc_emit_u8(e, 0xF3);
+        PeirEnc_emit_u8(e, 0x0F);
+        PeirEnc_emit_u8(e, 0x5A);
+        PeirEnc_emit_u8(e, 0xC0 + x * 9);
+        return;
+    }
+    PeirEnc_movsd_xmm_mem_rbp(e, x, off);
+}
+
+/// BG137/BG165: the float type operand `value` really has, for an
+/// instruction that says `said`. iropt's inliners map an f32 parameter to
+/// its f64 argument (`takes(1.5)`, `sum3(1.5, 3, 5.0)`) and make the call a
+/// move of the f64 result (`return 2.5;` from an f32 function), with no
+/// conversion between the two float widths, so `x as f64` of that
+/// parameter is a BitCast(f32 -> f64) of an f64 (movss read the low half of
+/// its bits, or panicked on one in a register) and the move a BitCast(f32
+/// -> f32) of an f64. Any other pair keeps `said`.
+fn peir_float_src_ty(func: &IrFunction, value: i64, said: IrType) -> IrType {
+    var actual: IrType = peir_operand_ty(func, value);
+    if ir_type_eq(said, IrType::F32) && ir_type_eq(actual, IrType::F64) {
+        return actual;
+    }
+    if ir_type_eq(said, IrType::F64) && ir_type_eq(actual, IrType::F32) {
+        return actual;
+    }
+    return said;
+}
+
 fn peir_cvt_float(e: &mut PeirEnc, to_f64: bool) -> void {
     if to_f64 {
         PeirEnc_emit_u8(e, 0xF3);
@@ -4520,9 +4556,9 @@ pub fn PeirGen_gen_inst(self: &mut PeirGen, id: i64, inst: Inst, next_cond: i64,
                 }
             }
             if ir_type_is_float(ty) {
-                PeirGen_gen_float_binop(self, op, loff, roff, dst, ty);
+                PeirGen_gen_float_binop(self, op, loff, roff, dst, ty, operand_ty, right_ty);
             } else if ir_type_is_float(operand_ty) {
-                PeirGen_gen_float_binop(self, op, loff, roff, dst, operand_ty);
+                PeirGen_gen_float_binop(self, op, loff, roff, dst, operand_ty, operand_ty, right_ty);
             } else {
                 var lconst: OptU64 = OptU64::None;
                 var rconst: OptU64 = OptU64::None;
@@ -4768,6 +4804,19 @@ pub fn PeirGen_gen_inst(self: &mut PeirGen, id: i64, inst: Inst, next_cond: i64,
                 }
                 _ => {
                     var sz: i64 = IrModule_type_size(module, store_ty);
+                    // BG134: an f64 value stored into an f32 place (lowering
+                    // stores the f64 constant of `var y: f32 = 3.75`, a
+                    // struct field's, as it is) is converted, as C's
+                    // `*(float*)p = d` and nat_ir's ng_store_f64_to_f32: movq
+                    // xmm0, rcx (66 48 0F 6E C1); cvtsd2ss xmm0, xmm0 (F2 0F
+                    // 5A C0); movd ecx, xmm0 (66 0F 7E C1). The low 32 bits
+                    // of the f64 pattern were stored: 0.0.
+                    if sz == 4 && ir_type_eq(store_ty, IrType::F32) && ir_type_eq(peir_operand_ty(func, value), IrType::F64) {
+                        PeirEnc_movq_xmm_r64(&mut self.enc, 0, PEIR_RCX);
+                        peir_cvt_float(&mut self.enc, false);
+                        peir_emit2(&mut self.enc, 0x66, 0x0F);
+                        peir_emit2(&mut self.enc, 0x7E, 0xC1);
+                    }
                     if sz == 1 {
                         PeirEnc_mov_mem_reg8(&mut self.enc, PEIR_RAX, PEIR_RCX);
                     } else if sz == 2 {
@@ -5249,13 +5298,28 @@ pub fn PeirGen_gen_inst(self: &mut PeirGen, id: i64, inst: Inst, next_cond: i64,
             var call_space: i64 = (32 + stack_args * 8 + 15) & ~15;
 
             PeirEnc_sub_rsp_i32(&mut self.enc, call_space);
-            // First arg (rcx) = env_ptr
-            PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RCX, fpoff);
+            // BG135: a struct, enum or array result (lower.fd: the
+            // CallPtr's result type is a Struct / Array and args[0] the
+            // pointer the callee writes it to) passes that pointer first
+            // (rcx) and the env second (rdx), as a direct call and as
+            // nat_ir's ng_callptr_sret and codegen_c's sret_call do; the
+            // rest from position 2. The env went to rcx and every argument
+            // one up, so the callee wrote its result into the env.
+            var cp_sret: bool = peir_callptr_sret(cp_ret_ty, args);
+            // First arg (rcx) = env_ptr (rdx after the result pointer)
+            if cp_sret {
+                PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RDX, fpoff);
+            } else {
+                PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RCX, fpoff);
+            }
 
             var i: i64 = 0;
             while i < args.len() {
                 var aoff: i64 = PeStackFrame_offset(frame, args.get(i));
                 var arg_idx: i64 = i + 1;
+                if cp_sret && i == 0 {
+                    arg_idx = 0;
+                }
                 if arg_idx < 4 {
                     PeirEnc_mov_reg_mem_rbp(&mut self.enc, arg_regs.get(arg_idx), aoff);
                 } else {
@@ -5400,9 +5464,16 @@ pub fn PeirGen_gen_inst(self: &mut PeirGen, id: i64, inst: Inst, next_cond: i64,
             }
         }
 
-        Inst::FloatToInt(value, from, _) => {
+        Inst::FloatToInt(value, fti_said, _) => {
             var voff: i64 = PeStackFrame_offset(frame, value);
-            if ir_type_eq(from, IrType::F32) {
+            // BG137/BG165: an inlined f32 parameter may be an f64, which
+            // is rounded to the f32 it stands for (cvtsd2ss; cvtss2sd)
+            var from: IrType = peir_float_src_ty(func, value, fti_said);
+            if ir_type_eq(fti_said, IrType::F32) && ir_type_eq(from, IrType::F64) {
+                PeirEnc_movsd_xmm_mem_rbp(&mut self.enc, 0, voff);
+                peir_cvt_float(&mut self.enc, false);
+                peir_cvt_float(&mut self.enc, true);
+            } else if ir_type_eq(from, IrType::F32) {
                 // OP17: the f32 widened first (cvttsd2si read its bits as
                 // an f64's)
                 PeirEnc_movss_xmm_mem_rbp(&mut self.enc, 0, voff);
@@ -5535,9 +5606,33 @@ pub fn PeirGen_gen_inst(self: &mut PeirGen, id: i64, inst: Inst, next_cond: i64,
             PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, PEIR_RAX);
         }
 
-        Inst::BitCast(value, bc_from, bc_to) => {
+        Inst::BitCast(value, bc_said, bc_to) => {
             var voff: i64 = PeStackFrame_offset(frame, value);
-            if ir_type_eq(bc_from, IrType::F32) && ir_type_eq(bc_to, IrType::F64) {
+            // BG137/BG165: an inlined f32 parameter or result may be an f64
+            var bc_from: IrType = peir_float_src_ty(func, value, bc_said);
+            var bc_round: bool = ir_type_eq(bc_said, IrType::F32) && ir_type_eq(bc_from, IrType::F64);
+            if bc_round && (ir_type_eq(bc_to, IrType::F64) || ir_type_eq(bc_to, IrType::F32) || ir_type_is_int(bc_to)) {
+                // the f64 is the f32 it stands for (C converts an argument
+                // to the parameter's float): rounded to an f32 first
+                // (cvtsd2ss; movsd also reads a value in a register)
+                PeirEnc_movsd_xmm_mem_rbp(&mut self.enc, 0, voff);
+                peir_cvt_float(&mut self.enc, false);
+                if ir_type_eq(bc_to, IrType::F32) {
+                    peir_store_f32_xmm0(&mut self.enc, dst);
+                } else {
+                    peir_cvt_float(&mut self.enc, true);
+                    if ir_type_eq(bc_to, IrType::F64) {
+                        PeirEnc_movsd_mem_rbp_xmm(&mut self.enc, dst, 0);
+                    } else {
+                        // the Vec<f32> boundary word: the single's f64 bits
+                        // (movq rax, xmm0, as peir_pun_f32_i64)
+                        peir_emit2(&mut self.enc, 0x66, 0x48);
+                        peir_emit2(&mut self.enc, 0x0F, 0x7E);
+                        PeirEnc_emit_u8(&mut self.enc, 0xC0);
+                        PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, PEIR_RAX);
+                    }
+                }
+            } else if ir_type_eq(bc_from, IrType::F32) && ir_type_eq(bc_to, IrType::F64) {
                 // OP17 / known-bugs 2g.13: `x as f64` of an f32 converts
                 // (as run, the C path and nat_ir do; it kept the bits)
                 PeirEnc_movss_xmm_mem_rbp(&mut self.enc, 0, voff);
@@ -5588,14 +5683,26 @@ pub fn PeirGen_gen_inst(self: &mut PeirGen, id: i64, inst: Inst, next_cond: i64,
                 // first (peir_pun_f32_i64), the same boundary as the Vec
                 // element path
                 var pr_f32: bool = false;
+                var pr_round: bool = false;
                 match ty {
                     IrType::F32 => {
-                        pr_f32 = true;
+                        // BG137/BG165: an inlined f32 parameter may be an
+                        // f64: rounded to the f32 it stands for, widened
+                        pr_round = ir_type_eq(peir_operand_ty(func, value), IrType::F64);
+                        pr_f32 = !pr_round;
                     }
                     _ => {
                     }
                 }
-                if pr_f32 {
+                if pr_round {
+                    // movsd xmm0, value; cvtsd2ss; cvtss2sd; movq rcx, xmm0
+                    PeirEnc_movsd_xmm_mem_rbp(&mut self.enc, 0, voff);
+                    peir_cvt_float(&mut self.enc, false);
+                    peir_cvt_float(&mut self.enc, true);
+                    peir_emit2(&mut self.enc, 0x66, 0x48);
+                    peir_emit2(&mut self.enc, 0x0F, 0x7E);
+                    PeirEnc_emit_u8(&mut self.enc, 0xC1);
+                } else if pr_f32 {
                     // movss xmm0, [rbp+off]; cvtss2sd; movq rcx, xmm0
                     // (BG7: 66 REX.W 0F 7E C1; 0F D6 C1 is movq xmm1,
                     // xmm0 and left rcx unset: println of an f32 printed 0)
@@ -5766,6 +5873,23 @@ pub fn peir_recyclable(v: i64, def_block: Vec<i64>, n_use_blocks: Vec<i64>, a_us
     }
     if nub == 1 {
         return a_use_block.get(v) == db;
+    }
+    return false;
+}
+
+/// BG135: a CallPtr whose result is a struct, enum or array (lower.fd
+/// Lowerer_lower_call_expr_resolved: args[0] is the pointer the callee
+/// writes it to, passed before the env); nat_ir's ng_callptr_sret.
+fn peir_callptr_sret(ret: IrType, args: Vec<i64>) -> bool {
+    match ret {
+        IrType::Struct(_) => {
+            return args.len() > 0;
+        }
+        IrType::Array(_, _) => {
+            return args.len() > 0;
+        }
+        _ => {
+        }
     }
     return false;
 }
@@ -7111,14 +7235,29 @@ pub fn PeirGen_gen_arith_panics(self: &mut PeirGen) -> void {
 }
 
 /// Generate float binary operation.
-pub fn PeirGen_gen_float_binop(self: &mut PeirGen, op: BinOp, loff: i64, roff: i64, dst: i64, ty: IrType) -> void {
+pub fn PeirGen_gen_float_binop(self: &mut PeirGen, op: BinOp, loff: i64, roff: i64, dst: i64, ty: IrType, lty: IrType, rty: IrType) -> void {
     var is_f32: bool = ir_type_eq(ty, IrType::F32);
+    // BG134: an f32 with an f64 among the operand types (lty, rty) and the
+    // float type (ty: the result's, or the left operand's for a compare):
+    // `z * 4.0`, `acc + 0.5`, `w < 0.5` of an f32 (the literal is an f64
+    // ConstFloat). Computed in f64, as C's usual arithmetic conversions and
+    // nat_ir (ng_float_mixed) do: an f32 operand is widened (movss;
+    // cvtss2sd), an f64 one read where it is (a slot, a general register
+    // or an xmm register: movsd_xmm_mem_rbp), and an f32 arithmetic result
+    // narrowed (cvtsd2ss). The f64 was read with movss (its low 32 bits:
+    // 0.0), or panicked "a register value used as memory" from an xmm slot.
+    var mixed: bool = (ir_type_eq(lty, IrType::F32) || ir_type_eq(rty, IrType::F32) || is_f32) && (ir_type_eq(lty, IrType::F64) || ir_type_eq(rty, IrType::F64) || ir_type_eq(ty, IrType::F64));
+    var narrow: bool = false;
+    if mixed {
+        narrow = is_f32 && !pe_binop_is_cmp(op);
+        is_f32 = false;
+    }
     // OP17: an f64 operation reads an operand held in an xmm register
     // (xmm2..xmm7, peir_ra_xmm: no REX) where it is, and computes into the
     // result's register when it has one (movsd to or from an xmm slot is a
     // register move or nothing). The result's register is used only when
     // it is not the right operand's (or both operands are the same value).
-    if !is_f32 && pe_binop_is_arith(op) {
+    if !mixed && !is_f32 && pe_binop_is_arith(op) {
         var rs: i64 = 1;
         if peir_is_xmm_slot(roff) {
             rs = roff - PEIR_XMM_SLOT;
@@ -7151,7 +7290,11 @@ pub fn PeirGen_gen_float_binop(self: &mut PeirGen, op: BinOp, loff: i64, roff: i
     // where they are (lx, rx); everything else goes through xmm0 / xmm1
     var lx: i64 = 0;
     var rx: i64 = 1;
-    if is_f32 {
+    if mixed {
+        // BG134: both as f64 in xmm0 / xmm1
+        peir_ld_as_f64(&mut self.enc, 0, loff, lty);
+        peir_ld_as_f64(&mut self.enc, 1, roff, rty);
+    } else if is_f32 {
         PeirEnc_movss_xmm_mem_rbp(&mut self.enc, 0, loff);
         PeirEnc_movss_xmm_mem_rbp(&mut self.enc, 1, roff);
     } else if pe_binop_is_cmp(op) {
@@ -7201,6 +7344,10 @@ pub fn PeirGen_gen_float_binop(self: &mut PeirGen, op: BinOp, loff: i64, roff: i
             }
         }
         if is_f32 {
+            PeirEnc_movss_mem_rbp_xmm(&mut self.enc, dst, 0);
+        } else if narrow {
+            // BG134: cvtsd2ss xmm0, xmm0 (F2 0F 5A C0); movss [dst], xmm0
+            peir_cvt_float(&mut self.enc, false);
             PeirEnc_movss_mem_rbp_xmm(&mut self.enc, dst, 0);
         } else {
             PeirEnc_movsd_mem_rbp_xmm(&mut self.enc, dst, 0);
@@ -7266,7 +7413,7 @@ pub fn PeirGen_gen_float_binop(self: &mut PeirGen, op: BinOp, loff: i64, roff: i
     } else {
         match op {
             BinOp::Mod => {
-                PeirGen_gen_float_rem(self, dst, is_f32);
+                PeirGen_gen_float_rem(self, dst, is_f32, narrow);
             }
             _ => {
             }
@@ -7282,7 +7429,9 @@ pub fn PeirGen_gen_float_binop(self: &mut PeirGen, op: BinOp, loff: i64, roff: i
 /// partial; no call, so no register the allocator holds a value in is
 /// clobbered (only rax, as the comparisons above, and x87 state, left
 /// empty). 16 bytes below rsp move the values between SSE and x87.
-fn PeirGen_gen_float_rem(self: &mut PeirGen, dst: i64, is_f32: bool) -> void {
+/// `narrow` (BG134, mixed f32/f64 operands): the f64 remainder is stored
+/// as an f32 (cvtsd2ss xmm0, xmm0 first).
+fn PeirGen_gen_float_rem(self: &mut PeirGen, dst: i64, is_f32: bool, narrow: bool) -> void {
     PeirEnc_sub_rsp_i32(&mut self.enc, 16);
     var b: Vec<i64> = Vec::new();
     // fld b, then fld a: st0 = a, st1 = b
@@ -7360,6 +7509,9 @@ fn PeirGen_gen_float_rem(self: &mut PeirGen, dst: i64, is_f32: bool) -> void {
     PeirEnc_emit_bytes(&mut self.enc, b);
     PeirEnc_add_rsp_i32(&mut self.enc, 16);
     if is_f32 {
+        PeirEnc_movss_mem_rbp_xmm(&mut self.enc, dst, 0);
+    } else if narrow {
+        peir_cvt_float(&mut self.enc, false);
         PeirEnc_movss_mem_rbp_xmm(&mut self.enc, dst, 0);
     } else {
         PeirEnc_movsd_mem_rbp_xmm(&mut self.enc, dst, 0);

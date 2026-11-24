@@ -2,7 +2,10 @@
 //
 // INI file parsing and serialization in pure Fides.
 // Supports [sections], key = value pairs, ; and # comments,
-// quoted values, and keys in a global (section-less) scope.
+// quoted values, and keys in a global (section-less) scope. In a
+// "double-quoted" value \\ \" \n \r are escapes (ini_serialize writes them,
+// so any value round-trips); other backslashes and 'single-quoted' values
+// are literal.
 //
 // Usage:
 //   use ini;
@@ -30,12 +33,54 @@ fn ini_is_space(c: i64) -> bool {
     return c == 32 || c == 9;
 }
 
+// Inside "double quotes": \\ \" \n \r are escapes (what ini_serialize
+// writes, so a value holding a newline stays one line); any other
+// backslash is kept as written. 'single quotes' are literal.
+fn ini_unescape(s: str) -> str {
+    var n: i64 = str_len(s);
+    if !str_contains(s, "\\") {
+        return s;
+    }
+    var out: str = "";
+    var start: i64 = 0;
+    var i: i64 = 0;
+    while i + 1 < n {
+        if str_byte_at(s, i) == 92 {
+            var c: i64 = str_byte_at(s, i + 1);
+            var rep: str = "";
+            var known: bool = true;
+            if c == 92 {
+                rep = "\\";
+            } else if c == 34 {
+                rep = "\"";
+            } else if c == 110 {
+                rep = "\n";
+            } else if c == 114 {
+                rep = "\r";
+            } else {
+                known = false;
+            }
+            if known {
+                out = out + str_slice(s, start, i) + rep;
+                i = i + 2;
+                start = i;
+                continue;
+            }
+        }
+        i = i + 1;
+    }
+    return out + str_slice(s, start, n);
+}
+
 fn ini_strip_quotes(s: str) -> str {
     var n: i64 = str_len(s);
     if n >= 2 {
         var a: i64 = str_byte_at(s, 0);
         var b: i64 = str_byte_at(s, n - 1);
-        if (a == 34 && b == 34) || (a == 39 && b == 39) {
+        if a == 34 && b == 34 {
+            return ini_unescape(str_slice(s, 1, n - 1));
+        }
+        if a == 39 && b == 39 {
             return str_slice(s, 1, n - 1);
         }
     }
@@ -52,7 +97,10 @@ fn ini_strip_comment(s: str) -> str {
     while i < n {
         var c: i64 = str_byte_at(s, i);
         if in_q {
-            if c == qc {
+            if qc == 34 && c == 92 {
+                // an escape inside "...": the next byte does not close it
+                i = i + 1;
+            } else if c == qc {
                 in_q = false;
             }
         } else {
@@ -253,10 +301,41 @@ fn ini_needs_quotes(v: str) -> bool {
     if str_len(v) == 0 {
         return false;
     }
-    if str_byte_at(v, 0) == 32 || str_byte_at(v, str_len(v) - 1) == 32 {
+    var a: i64 = str_byte_at(v, 0);
+    var z: i64 = str_byte_at(v, str_len(v) - 1);
+    // whitespace that str_trim would drop, and quotes ini_strip_quotes would
+    if ini_is_space(a) || ini_is_space(z) || a == 34 || a == 39 {
         return true;
     }
-    return str_contains(v, ";") || str_contains(v, "#") || str_contains(v, "\n") || str_contains(v, "=");
+    return str_contains(v, ";") || str_contains(v, "#") || str_contains(v, "\n") || str_contains(v, "\r") || str_contains(v, "=");
+}
+
+// The value in double quotes with \ " LF CR escaped: a newline in a value
+// can no longer start a key or a section on the next parse (BG191).
+fn ini_quote(v: str) -> str {
+    var out: str = "\"";
+    var start: i64 = 0;
+    var i: i64 = 0;
+    var n: i64 = str_len(v);
+    while i < n {
+        var c: i64 = str_byte_at(v, i);
+        var rep: str = "";
+        if c == 92 {
+            rep = "\\\\";
+        } else if c == 34 {
+            rep = "\\\"";
+        } else if c == 10 {
+            rep = "\\n";
+        } else if c == 13 {
+            rep = "\\r";
+        }
+        if str_len(rep) > 0 {
+            out = out + str_slice(v, start, i) + rep;
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return out + str_slice(v, start, n) + "\"";
 }
 
 /// Serialize back to INI text. Global keys come first; entries keep the
@@ -270,7 +349,7 @@ pub fn ini_serialize(doc: Vec<IniEntry>) -> str {
         if str_len(e.section) == 0 {
             var v: str = e.value;
             if ini_needs_quotes(v) {
-                v = "\"" + v + "\"";
+                v = ini_quote(v);
             }
             out = out + e.key + " = " + v + "\n";
         }
@@ -286,7 +365,7 @@ pub fn ini_serialize(doc: Vec<IniEntry>) -> str {
             if ini_eq_key(e2.section, secs.get(s)) {
                 var v2: str = e2.value;
                 if ini_needs_quotes(v2) {
-                    v2 = "\"" + v2 + "\"";
+                    v2 = ini_quote(v2);
                 }
                 out = out + e2.key + " = " + v2 + "\n";
             }

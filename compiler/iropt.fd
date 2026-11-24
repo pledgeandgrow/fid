@@ -5852,6 +5852,65 @@ fn iro_promote(f: &mut IrFunction) -> bool {
                 }
                 changed = true;
             }
+            // DB4: when every load of `a` was replaced its alloca keeps no
+            // reader or writer; a name bound to it would show no location
+            // or scope. A name bound more than once wants its first store's
+            // value (the declaration's line and uses: its lexical scope);
+            // a name bound once wants the value reaching its first load —
+            // what the variable holds where it is read (live: the map's
+            // M24 chain already resolved it).
+            if found && f.dbg_locals.len() > 0 {
+                var all_dead: bool = true;
+                var fv2: i64 = -1;
+                var lv2: i64 = -1;
+                var rj2: i64 = 0;
+                while rj2 < cfg.rpo.len() {
+                    var bj2: i64 = cfg.rpo.get(rj2);
+                    var ea4: Vec<i64> = ev_a.get(bj2);
+                    var ek4: Vec<i64> = ev_k.get(bj2);
+                    var ev4: Vec<i64> = ev_v.get(bj2);
+                    var k6: i64 = 0;
+                    while k6 < ea4.len() {
+                        if ea4.get(k6) == a {
+                            if ek4.get(k6) == 0 {
+                                if deadl.get(ev4.get(k6)) == 0 {
+                                    all_dead = false;
+                                } else if lv2 < 0 {
+                                    lv2 = map.get(ev4.get(k6)) - 1;
+                                }
+                            } else if fv2 < 0 {
+                                fv2 = iro_store_val(f, ev4.get(k6));
+                            }
+                        }
+                        k6 = k6 + 1;
+                    }
+                    rj2 = rj2 + 1;
+                }
+                if all_dead {
+                    var dli: i64 = 0;
+                    while dli < f.dbg_locals.len() {
+                        var ent2: StringValueId = f.dbg_locals.get(dli);
+                        if ent2.id == a {
+                            var ncnt: i64 = 0;
+                            var dli2: i64 = 0;
+                            while dli2 < f.dbg_locals.len() {
+                                if f.dbg_locals.get(dli2).name == ent2.name {
+                                    ncnt = ncnt + 1;
+                                }
+                                dli2 = dli2 + 1;
+                            }
+                            var nid2: i64 = fv2;
+                            if ncnt <= 1 && lv2 >= 0 {
+                                nid2 = lv2;
+                            }
+                            if nid2 >= 0 {
+                                f.dbg_locals.set(dli, StringValueId_new(ent2.name, nid2));
+                            }
+                        }
+                        dli = dli + 1;
+                    }
+                }
+            }
             var rl: i64 = 0;
             while rl < touched.len() {
                 var tl: i64 = touched.get(rl);
@@ -8090,6 +8149,7 @@ fn iro_clone_function(f: IrFunction, newname: str) -> IrFunction {
     }
     nf.blocks = nbl;
     nf.locals = f.locals.clone();
+    nf.dbg_locals = f.dbg_locals.clone();
     nf.persist_vars = f.persist_vars.clone();
     nf.drop_locals = f.drop_locals.clone();
     nf.zeroize_locals = f.zeroize_locals.clone();
@@ -11237,9 +11297,11 @@ fn iro_vec_sroa_one(f: &mut IrFunction, h: i64) -> bool {
     if h < 0 || h >= nv {
         return false;
     }
-    // 1: the slot h is stored in (-1: none) and h's block
+    // 1: the slot h is stored in (-1: none), h's block and the block of the
+    // store that gives the slot h
     var slot: i64 = -1;
     var hb: i64 = -1;
+    var hsb: i64 = -1;
     var b1: i64 = 0;
     while b1 < f.blocks.len() {
         var ids1: Vec<i64> = f.blocks.get(b1).instructions;
@@ -11257,6 +11319,7 @@ fn iro_vec_sroa_one(f: &mut IrFunction, h: i64) -> bool {
                             return false;
                         }
                         slot = sp1;
+                        hsb = b1;
                     }
                 }
                 _ => {
@@ -11270,15 +11333,35 @@ fn iro_vec_sroa_one(f: &mut IrFunction, h: i64) -> bool {
         return false;
     }
     // 2: the handles, h (1) and the loads of its slot (2); the slot is only
-    // loaded, and stored h or a zero. zero_blocks holds the blocks that
-    // clear the slot (the ownership lowering's `v = null` after the drop):
-    // a load of the slot in a block hb dominates holds h there when no
+    // loaded, and stored h or a zero. zero_blocks holds the blocks whose
+    // stores can clear the slot while the Vec lives (the ownership
+    // lowering's `v = null` after the drop): in hsb one after the store of
+    // h, in another block one hsb can reach. A store that cannot run while
+    // the Vec lives — the rc slot's zero-init, which the prologue emits in
+    // the entry block before the Vec exists — is not a clearing store.
+    // A load of the slot in a block hsb dominates holds h there when no
     // clearing block can reach it on any path (reads in dominated blocks,
     // LF14 Nov 22).
     var kind: Vec<i64> = peir_zeros(nv);
     kind.set(h, 1);
     var zero_blocks: Vec<i64> = Vec::new();
+    var late_zero: Vec<i64> = Vec::new();
+    var hstore_at: i64 = -1;
     if slot >= 0 {
+        var hids: Vec<i64> = f.blocks.get(hsb).instructions;
+        var hk: i64 = 0;
+        while hk < hids.len() {
+            match peir_inst_of(f, hids.get(hk)) {
+                Inst::Store(hsp, hsv, _) => {
+                    if hsp == slot && hsv == h && hstore_at < 0 {
+                        hstore_at = hk;
+                    }
+                }
+                _ => {
+                }
+            }
+            hk = hk + 1;
+        }
         var b2: i64 = 0;
         while b2 < f.blocks.len() {
             var ids2: Vec<i64> = f.blocks.get(b2).instructions;
@@ -11294,7 +11377,13 @@ fn iro_vec_sroa_one(f: &mut IrFunction, h: i64) -> bool {
                     }
                     Inst::Store(sp2, sv2, _) => {
                         if sp2 == slot && sv2 != h {
-                            zero_blocks.push(b2);
+                            if b2 == hsb {
+                                if hstore_at < 0 || k2 > hstore_at {
+                                    zero_blocks.push(b2);
+                                }
+                            } else {
+                                late_zero.push(b2);
+                            }
                         }
                     }
                     _ => {
@@ -11310,7 +11399,15 @@ fn iro_vec_sroa_one(f: &mut IrFunction, h: i64) -> bool {
         }
     }
     var cfg: IroCfg = iro_cfg(f);
-    // 3: every use of a handle, in block order. In h's block a load of the
+    var zi: i64 = 0;
+    while zi < late_zero.len() {
+        var zb2: i64 = late_zero.get(zi);
+        if iro_vs_reaches(&cfg, hsb, zb2, false) {
+            zero_blocks.push(zb2);
+        }
+        zi = zi + 1;
+    }
+    // 3: every use of a handle, in block order. In hsb a load of the
     // slot after the store of h (and no zero since) holds this run's h (3).
     var act: Vec<i64> = peir_zeros(nv);
     var at: Vec<i64> = peir_zeros(nv);
@@ -11329,7 +11426,7 @@ fn iro_vec_sroa_one(f: &mut IrFunction, h: i64) -> bool {
         while k3 < ids3.len() {
             var iid3: i64 = ids3.get(k3);
             var inst3: Inst = peir_inst_of(f, iid3);
-            if b3 == hb && slot >= 0 {
+            if b3 == hsb && slot >= 0 {
                 match inst3 {
                     Inst::Store(sp3, sv3, _) => {
                         if sp3 == slot {
@@ -11373,16 +11470,16 @@ fn iro_vec_sroa_one(f: &mut IrFunction, h: i64) -> bool {
                     return false;
                 }
                 if w <= 4 {
-                    // a push, get, set or len: in h's block, on h itself or
+                    // a push, get, set or len: in hsb, on h itself or
                     // on a load that holds it. A get, set or len may also
-                    // read a load of the slot in a block hb dominates, when
+                    // read a load of the slot in a block hsb dominates, when
                     // no block that clears the slot can reach the read on
                     // any path (and a same-block clearing store not yet
-                    // passed): every push is in hb, which the domination
+                    // passed): every push is in hsb, which the domination
                     // makes run first (LF14, Nov 22).
                     var hv: i64 = iro_vs_arg(inst3, 1);
-                    var hv_holds: bool = b3 == hb && hv >= 0 && hv < nv && (kind.get(hv) == 1 || kind.get(hv) == 3);
-                    if !hv_holds && b3 != hb && w >= 2 && w <= 4 && hv >= 0 && hv < nv && kind.get(hv) == 2 && blk_ok && !cleared_yet && iro_dominates(&cfg, hb, b3) {
+                    var hv_holds: bool = b3 == hsb && hv >= 0 && hv < nv && (kind.get(hv) == 1 || kind.get(hv) == 3);
+                    if !hv_holds && b3 != hsb && w >= 2 && w <= 4 && hv >= 0 && hv < nv && kind.get(hv) == 2 && blk_ok && !cleared_yet && iro_dominates(&cfg, hsb, b3) {
                         hv_holds = true;
                     }
                     if !hv_holds {

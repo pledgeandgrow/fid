@@ -1,0 +1,139 @@
+// Bugs roadmap BG197: in a handler, `cont` is the rest of the handle block
+// after the `do` (reference §9.4). It was a closure over copies of the
+// variables (lower.fd Lowerer_create_continuation): a write in it was lost
+// after the handle (count stayed 0), a `return` in it only left the
+// closure (f returned 7), and a `do` in a loop whose handler resumes never
+// ended (the loop's `i = i + 1` ran on a copy). A handler that only resumes
+// now runs the rest in place (Lowerer_hx_resume_inline): the same
+// variables, a return that returns, a break that leaves the loop. The
+// handler's parameter does not hide a variable of the block of the same
+// name, the handler goes on after its resume, and a handler of a `do` in
+// the rest that does not resume goes back to it (as the closure returned).
+//
+// Expected output:
+// in cont count=1
+// after count=1
+// c2=5 count=3
+// 5
+// i=3 total=3
+// handler v=1
+// v=10
+// after resume
+// note 1
+// rejected 2
+// back in note
+// done 2
+// 42
+
+fn f() -> i64 {
+    handle {
+        do E.op(1);
+        return 5;
+    } with {
+        E.op(v) => {
+            resume(cont, 0);
+        }
+    }
+    return 7;
+}
+
+fn tail(x: i64) -> i64 {
+    handle {
+        do Log.note(x);
+        x * 2
+    } with {
+        Log.note(v) => {
+            resume(cont, 0);
+        }
+    }
+}
+
+fn main() {
+    var count: i64 = 0;
+    handle {
+        do E.tick(1);
+        count = count + 1;
+        println("in cont count=" + int_to_str(count));
+    } with {
+        E.tick(v) => {
+            resume(cont, 0);
+        }
+    }
+    println("after count=" + int_to_str(count));
+
+    var count2: i64 = 0;
+    handle {
+        do E.tick(1);
+        var c2: i64 = count2 + 5;
+        count2 = 3;
+        println("c2=" + int_to_str(c2) + " count=" + int_to_str(count2));
+    } with {
+        E.tick(v) => {
+            resume(cont, 0);
+        }
+    }
+
+    println(int_to_str(f()));
+
+    var i: i64 = 0;
+    var total: i64 = 0;
+    handle {
+        while i < 3 {
+            do E.op(i);
+            i = i + 1;
+        }
+    } with {
+        E.op(v) => {
+            total = total + v;
+            resume(cont, 0);
+        }
+    }
+    println("i=" + int_to_str(i) + " total=" + int_to_str(total));
+
+    var v: i64 = 10;
+    handle {
+        do E.op(1);
+        println("v=" + int_to_str(v));
+    } with {
+        E.op(v) => {
+            println("handler v=" + int_to_str(v));
+            resume(cont, 0);
+            println("after resume");
+        }
+    }
+
+    handle {
+        do Log.note(1);
+        if true {
+            do Check.reject(2);
+        }
+        println("not printed");
+    } with {
+        Log.note(n) => {
+            println("note " + int_to_str(n));
+            resume(cont, 0);
+            println("back in note");
+        },
+        Check.reject(b) => {
+            println("rejected " + int_to_str(b));
+        }
+    }
+
+    var k: i64 = 0;
+    handle {
+        while true {
+            do E.op(k);
+            k = k + 1;
+            if k == 2 {
+                break;
+            }
+        }
+    } with {
+        E.op(w) => {
+            resume(cont, 0);
+        }
+    }
+    println("done " + int_to_str(k));
+
+    println(int_to_str(tail(21)));
+}

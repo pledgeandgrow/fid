@@ -8,8 +8,8 @@
 # tests/bootstrap/test_machine_split.fd is built with FID_VERIFY=1 (MIR
 # verifier, allocation checker, split checker) and --stats four ways:
 #   on        the default: some function must report "[split] ...: N
-#             pieces" (N > 0); on aarch64 `wide` must say "kept" (its
-#             call-free loop gets caller-saved registers x8-x11); the
+#             pieces" (N > 0); on aarch64 `wide` must either be kept or
+#             be pruned when its estimated cost does not improve; the
 #             reloads `[stats]` counts for `wide` must not grow against off
 #   off       FID_NAT_OFF=split: no [split] line
 #   all       FID_NAT_ON=splitall: every integer value split, always kept
@@ -18,8 +18,10 @@
 #             split" message
 # Each image that builds is run where this host can (WSL / qemu-user for
 # Linux, Windows directly) and must print the file's expected output.
-# Then tests/nattools/split_unit.fd is built through C (`fid ccompile`,
-# CC or zig cc; `fid run` without one) and must print its expected lines.
+# Then tests/nattools/split_unit.fd and split_alloc_unit.fd are built through
+# C (`fid ccompile`, CC or zig cc; `fid run` for split_unit without one) and
+# must print their expected lines. split_alloc_unit also checks splitprune
+# soundness and rejects split mutations.
 # FILES="a.fd b.fd" builds other programs with FID_VERIFY=1 and
 # FID_NAT_ON=splitall too and compares their output with `fid run` where
 # the image runs (FILES="$(ls tests/bootstrap/test_*.fd | grep -v _fail)"
@@ -121,7 +123,14 @@ for t in x86_64-linux aarch64-linux riscv64-linux windows; do
             # and the split is rightly not kept; tests/nattools/
             # split_alloc_unit.fd shows the same on hand-made `wide`)
             if [ "$t" = aarch64-linux ]; then
-                if grep -q '^\[split\] wide: .*, kept$' "$on"; then ok "$t on: the split of wide is kept"; else bad "$t on: the split of wide is not kept ($(grep '^\[split\] wide' "$on" | head -1))"; fi
+                wide_line=$(grep '^\[split\] wide' "$on" | head -1)
+                if echo "$wide_line" | grep -q ', kept$'; then
+                    ok "$t on: the split of wide is kept"
+                elif echo "$wide_line" | sed -n 's/.*cost \([0-9]*\) -> \([0-9]*\), not kept$/\1 \2/p' | awk '$2 <= $1 { good = 1 } END { exit !good }'; then
+                    ok "$t on: the split of wide is pruned because its estimated cost does not improve"
+                else
+                    bad "$t on: the split of wide is not kept profitably ($wide_line)"
+                fi
             else
                 echo "info $t on: $(grep '^\[split\] wide' "$on" | head -1)"
             fi

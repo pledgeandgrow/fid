@@ -15,6 +15,7 @@ module compiler::main;
 use core;
 use vec;
 use string;
+use process;
 use compiler::ast;
 use compiler::token;
 use compiler::lexer;
@@ -329,7 +330,7 @@ pub fn main() -> i64 {
         return cmd_wasm(n, start, g_borrowck);
     }
     if command == "watch" {
-        return cmd_bench(n, start);
+        return cmd_watch(n, start);
     }
     if command == "lsp" {
         return lsp_run();
@@ -339,6 +340,9 @@ pub fn main() -> i64 {
     }
     if command == "veil" {
         return cmd_veil(n, start);
+    }
+    if command == "doctest" {
+        return cmd_doctest(n, start);
     }
     if command == "inspect" {
         return cmd_inspect(n, start);
@@ -1141,15 +1145,19 @@ fn cmd_opt(n: i64, start: i64) -> i64 {
 // --- fmt -----------------------------------------------------------------
 fn cmd_fmt(n: i64, start: i64) -> i64 {
     if start + 2 > n {
-        p_eprint_str("Usage: fid fmt <file.fd> [--check]\n");
+        p_eprint_str("Usage: fid fmt <file.fd> [--check] [-w|--write]\n");
         return 1;
     }
     var input: str = p_argv(start + 1);
     var check_mode: bool = false;
+    var write_mode: bool = false;
     var ai: i64 = start + 2;
     while ai < n {
         if p_argv(ai) == "--check" {
             check_mode = true;
+        }
+        if p_argv(ai) == "-w" || p_argv(ai) == "--write" {
+            write_mode = true;
         }
         ai = ai + 1;
     }
@@ -1170,8 +1178,11 @@ fn cmd_fmt(n: i64, start: i64) -> i64 {
 ");
         return 1;
     }
+    // The formatter writes LF; a checkout's CRLF line endings are not a
+    // formatting difference (BG124)
+    var same: bool = formatted == str_replace(source, "\r", "");
     if check_mode {
-        if formatted == source {
+        if same {
             p_eprint_str(input);
             p_eprint_str(": already formatted\n");
             return 0;
@@ -1180,9 +1191,10 @@ fn cmd_fmt(n: i64, start: i64) -> i64 {
             p_eprint_str(": would reformat\n");
             return 1;
         }
-    } else {
+    }
+    if write_mode {
         p_file_write(input, formatted);
-        if formatted == source {
+        if same {
             p_eprint_str(input);
             p_eprint_str(": already formatted\n");
         } else {
@@ -1191,7 +1203,9 @@ fn cmd_fmt(n: i64, start: i64) -> i64 {
         }
         return 0;
     }
-    return 1;
+    // No -w: the formatted source to stdout; the file is not touched
+    print(formatted);
+    return 0;
 }
 
 // --- run -----------------------------------------------------------------
@@ -2636,6 +2650,12 @@ fn cmd_test(n: i64, start: i64) -> i64 {
     if start + 2 <= n && str_ends_with(p_argv(start + 1), ".fd") {
         return cmd_test_file(n, start, false);
     }
+    // --coverage covers one file's tests (cmd_test_file's CT8); without a
+    // file it would mean the suite, which it cannot merge
+    if argv_has(n, "--coverage") {
+        p_eprint_str("fid test --coverage covers one file's tests: fid test <file.fd> --coverage\n");
+        return 1;
+    }
     // --fail: run only expected-fail tests (failing = correct)
     var fail_only: bool = has_flag(n, start, "--fail");
 
@@ -2643,11 +2663,11 @@ fn cmd_test(n: i64, start: i64) -> i64 {
 
     // Use ls/dir command to list .fd files, redirect to temp file
     if is_posix_host() {
-        p_system("ls tests/bootstrap/*.fd > _fides_test_list.txt 2>/dev/null");
+        p_system("ls tests/bootstrap/*.fd > tests/_fides_test_list.txt 2>/dev/null");
     } else {
-        p_system("dir /b tests\\bootstrap\\*.fd > _fides_test_list.txt 2>nul");
+        p_system("dir /b tests\\bootstrap\\*.fd > tests\\_fides_test_list.txt 2>nul");
     }
-    var listing: str = c_file_read("_fides_test_list.txt");
+    var listing: str = c_file_read("tests/_fides_test_list.txt");
     if str_len(listing) == 0 {
         if fail_only {
             p_eprint_str("No expected-fail tests found in tests/bootstrap/\n");
@@ -2858,11 +2878,11 @@ fn cmd_test(n: i64, start: i64) -> i64 {
         var result: ResultStr = ccompile_source_with_path(source, test_path, "on");
         match result {
             ResultStr::Ok(c_code) => {
-                var c_file: str = "_fides_test_tmp.c";
+                var c_file: str = "tests/_fides_test_tmp.c";
                 p_file_write(c_file, c_code);
-                var exe_name: str = "_fides_test_tmp.exe";
+                var exe_name: str = "tests/_fides_test_tmp.exe";
                 if is_posix_host() {
-                    exe_name = "_fides_test_tmp";
+                    exe_name = "tests/_fides_test_tmp";
                 }
                 var cc: str = env_or_empty("CC");
                 if str_len(cc) == 0 {
@@ -2953,11 +2973,11 @@ fn cmd_test(n: i64, start: i64) -> i64 {
 
     // Clean up
     if is_posix_host() {
-        p_system("rm -f _fides_test_list.txt _fides_test_tmp.c _fides_test_tmp");
+        p_system("rm -f tests/_fides_test_list.txt tests/_fides_test_tmp.c tests/_fides_test_tmp");
     } else {
-        p_system("del _fides_test_list.txt");
-        p_system("del _fides_test_tmp.c");
-        p_system("del _fides_test_tmp.exe");
+        p_system("del tests\\_fides_test_list.txt");
+        p_system("del tests\\_fides_test_tmp.c");
+        p_system("del tests\\_fides_test_tmp.exe");
     }
 
     p_eprint_str("\n=== Results ===\n");
@@ -3105,6 +3125,67 @@ fn bench_ms(us: i64) -> str {
         frac = "0" + frac;
     }
     return int_to_str(us / 1000) + "." + frac + " ms";
+}
+
+// --- watch ---------------------------------------------------------------
+/// `fid watch <file.fd> [<command>] [--interval <ms>] [-- <args>]`:
+/// `fid <command> <file.fd> <args>` on start and again each time the file's
+/// contents change (content-polling; the runtime has no mtime builtin).
+fn cmd_watch(n: i64, start: i64) -> i64 {
+    if start + 2 > n {
+        p_eprint_str("Usage: fid watch <file.fd> [<command>] [--interval <ms>] [-- <args>]\n");
+        p_eprint_str("  `fid <command> <file.fd> <args>` on start and each time the file changes.\n");
+        p_eprint_str("  <command>: run (default), check, build, emit, ccompile, test, lint, fmt, fix, veil\n");
+        return 1;
+    }
+    var input: str = p_argv(start + 1);
+    var wcmd: str = "run";
+    var extra: str = "";
+    var seen_dd: bool = false;
+    var got_cmd: bool = false;
+    var wi: i64 = start + 2;
+    while wi < n {
+        var a: str = p_argv(wi);
+        if a == "--" {
+            seen_dd = true;
+        } else if seen_dd {
+            extra = extra + " " + shell_word(a);
+        } else if a == "--interval" {
+            wi = wi + 1;
+        } else if !str_starts_with(a, "-") && !got_cmd {
+            wcmd = a;
+            got_cmd = true;
+        }
+        wi = wi + 1;
+    }
+    var known: bool = wcmd == "run" || wcmd == "check" || wcmd == "build" || wcmd == "emit" || wcmd == "ccompile" || wcmd == "test" || wcmd == "lint" || wcmd == "fmt" || wcmd == "fix" || wcmd == "veil";
+    if !known {
+        p_eprint_str("fid watch: '" + wcmd + "' is not a command to re-run (run, check, build, emit, ccompile, test, lint, fmt, fix, veil)\n");
+        return 1;
+    }
+    var interval: i64 = get_flag_int(n, start, "--interval", 500);
+    if interval < 50 {
+        interval = 50;
+    }
+    var last: str = c_file_read(input);
+    if str_len(last) == 0 {
+        p_eprint_str("fid watch: " + input + " is empty or missing; waiting for it (Ctrl-C to stop)\n");
+    } else {
+        p_eprint_str("fid watch: " + input + " -- `fid " + wcmd + "` again on change, every " + int_to_str(interval) + " ms (Ctrl-C to stop)\n");
+    }
+    var run_cmd: str = self_command() + " " + wcmd + " " + shell_word(input) + extra;
+    project_run(run_cmd);
+    while true {
+        p_co_sleep(interval);
+        var now: str = c_file_read(input);
+        if str_len(now) == 0 || now == last {
+            continue;
+        }
+        last = now;
+        p_eprint_str("\nfid watch: " + input + " changed -- `fid " + wcmd + "`\n");
+        project_run(run_cmd);
+    }
+    return 0;
 }
 
 // --- profile -------------------------------------------------------------
@@ -8181,6 +8262,17 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
                 var nat_mod: IrModule = lower(nprogram);
                 g_lower_keep = 0;
                 t_run = time_mark("lower", t_run);
+                var nat_lc_errs: Vec<str> = c_lockcheck_errors(&nat_mod);
+                if nat_lc_errs.len() > 0 {
+                    print("Compilation errors:\n");
+                    var nlci: i64 = 0;
+                    while nlci < nat_lc_errs.len() {
+                        print(nat_lc_errs.get(nlci));
+                        print("\n");
+                        nlci = nlci + 1;
+                    }
+                    return 1;
+                }
                 if str_len(explain_fn) > 0 {
                     explain_stage(&nat_mod, explain_fn, "after lowering");
                 }
@@ -8487,6 +8579,17 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
             g_lower_keep = 0;
             t_run = time_mark("lower", t_run);
             p_eprint_str("[prof] lower: " + int_to_str(p_clock_now_ms() - t_lw) + "ms\n");
+            var lc_errs: Vec<str> = c_lockcheck_errors(&ir_mod);
+            if lc_errs.len() > 0 {
+                print("Compilation errors:\n");
+                var lcei: i64 = 0;
+                while lcei < lc_errs.len() {
+                    print(lc_errs.get(lcei));
+                    print("\n");
+                    lcei = lcei + 1;
+                }
+                return 1;
+            }
 
             // Windows default: direct IR -> PE machine code (pe_ir backend)
             if windows_pe {
@@ -9711,9 +9814,13 @@ fn print_usage() {
     p_eprint_str("  fid dump-c   <file.fd>                Show generated C source\n");
     p_eprint_str("  fid split-c  <in.c> <prefix> <n>      Split generated C into n units + a header\n");
     p_eprint_str("  fid opt      <file.fd> [--fn <name>]  Show the IR after the IR optimizer (iropt)\n");
-    p_eprint_str("  fid fmt      <file.fd> [--check]      Format source code\n");
+    p_eprint_str("  fid fmt      <file.fd> [--check] [-w] Format source code\n");
     p_eprint_str("  fid test                             Run all tests in tests/bootstrap/\n");
     p_eprint_str("  fid test     <file.fd>               Run its fn test_*() (one process each), time fn bench_*()\n");
+    p_eprint_str("  fid test     <file.fd> --coverage    The tests' coverage through veil (report: coverage/)\n");
+    p_eprint_str("  fid watch    <file.fd> [<command>] [--interval <ms>] [-- <args>]\n");
+    p_eprint_str("                                           `fid <command> <file.fd> <args>` again on change\n");
+    p_eprint_str("  fid doctest  <file.fd|dir> [--emit]  Run the /// Example: blocks as tests\n");
     p_eprint_str("  fid bench    <file.fd> [-n <count>]   Benchmark: run N times\n");
     p_eprint_str("  fid fuzz     <file.fd> [--seeds <n>]  Run its fn fuzz_*(data: Vec<u8>) on n inputs (1000)\n");
     p_eprint_str("  fid debug    <file.fd>               Interactive IR debugger (break, step, print)\n");
@@ -9794,6 +9901,184 @@ fn cmd_veil(n: i64, start: i64) -> i64 {
     print(message);
     print("\n");
     return 0;
+}
+
+// --- cmd_doctest ---------------------------------------------------------
+// Run the `/// Example:` blocks of a file (or every .fd under a directory)
+// as programs -- scripts/doctest.py's job inside fid. `fid run` by
+// default; --emit also runs `Example (native only):` blocks (own backend
+// first, the C route when it cannot build the example; --emit-only forbids
+// the C route). --native-only runs the native blocks alone.
+fn cmd_doctest(n: i64, start: i64) -> i64 {
+    if start + 2 > n {
+        p_eprint_str("Usage: fid doctest <file.fd|dir> [--emit] [--emit-only] [--native-only] [-v]\n");
+        p_eprint_str("  Runs each `/// Example:` block as a program: `use <module>;`, the\n");
+        p_eprint_str("  block's own `use` lines hoisted, the rest inside `fn main`.\n");
+        return 1;
+    }
+    var input: str = p_argv(start + 1);
+    var emit_only: bool = has_flag(n, start, "--emit-only");
+    var want_emit: bool = emit_only || has_flag(n, start, "--emit");
+    var native_only: bool = has_flag(n, start, "--native-only");
+    var verbose: bool = has_flag(n, start, "-v") || has_flag(n, start, "--verbose");
+    var files: Vec<str> = Vec::new();
+    if p_is_dir(input) != 0 {
+        scribe_collect(input, &mut files);
+    } else {
+        files.push(input);
+    }
+    var n_doc: i64 = 0;
+    var n_run: i64 = 0;
+    var n_fail: i64 = 0;
+    var n_skip: i64 = 0;
+    var fails: Vec<str> = Vec::new();
+    var fi: i64 = 0;
+    while fi < files.len() {
+        var path: str = files.get(fi);
+        fi = fi + 1;
+        // a program a previous doctest run left behind is not a source file
+        if str_find(path, "_fides_doctest_") >= 0 {
+            continue;
+        }
+        var source: str = c_file_read(path);
+        var base: str = str_replace(path, "\\", "/");
+        var bslash: i64 = str_rfind_char(base, 47);
+        if bslash >= 0 {
+            base = str_slice(base, bslash + 1, str_len(base));
+        }
+        if str_ends_with(base, ".fd") {
+            base = str_slice(base, 0, str_len(base) - 3);
+        }
+        var examples: Vec<DocExample> = scribe_doctests(source, base);
+        var dir: str = scribe_dir_of(path);
+        var k: i64 = 0;
+        while k < examples.len() {
+            var ex: DocExample = examples.get(k);
+            n_doc = n_doc + 1;
+            if ex.native && !want_emit {
+                n_skip = n_skip + 1;
+                k = k + 1;
+                continue;
+            }
+            if native_only && !ex.native {
+                k = k + 1;
+                continue;
+            }
+            var prog: str = dir + "/_fides_doctest_" + int_to_str(fi) + "_" + int_to_str(k) + ".fd";
+            p_file_write(prog, scribe_doctest_program(ex.module_name, ex.code));
+            n_run = n_run + 1;
+            var why: str = "";
+            if ex.native {
+                why = doctest_native(prog, emit_only);
+            } else {
+                var runv: Vec<str> = Vec::new();
+                runv.push(p_argv(0));
+                runv.push("run");
+                runv.push(prog);
+                var r: ChildResult = process_run_argv(runv, Vec::new(), "", 60000);
+                if r.timed_out {
+                    why = "timeout";
+                } else if !r.started {
+                    why = "did not start";
+                } else if r.code != 0 {
+                    why = first_error_line(r.errors + "\n" + r.output);
+                }
+            }
+            if str_len(why) > 0 {
+                n_fail = n_fail + 1;
+                fails.push(path + " #" + int_to_str(k) + "  " + why);
+            } else if verbose {
+                print("ok  " + path + " #" + int_to_str(k) + "\n");
+            }
+            p_file_delete(prog);
+            k = k + 1;
+        }
+    }
+    print("doctest: " + int_to_str(n_doc) + " examples | " + int_to_str(n_run) + " run | " + int_to_str(n_fail) + " failed | " + int_to_str(n_skip) + " skipped(native)\n");
+    var fi2: i64 = 0;
+    while fi2 < fails.len() {
+        print("  FAIL " + fails.get(fi2) + "\n");
+        fi2 = fi2 + 1;
+    }
+    if n_fail > 0 {
+        return 1;
+    }
+    return 0;
+}
+
+/// The first line of command `output` that says what failed (not [stage]
+/// progress, and naming an error), else its first line, or "".
+fn first_error_line(output: str) -> str {
+    var lines: Vec<str> = str_split(output, "\n");
+    var first: str = "";
+    var i: i64 = 0;
+    while i < lines.len() {
+        var l: str = str_trim(lines.get(i));
+        if str_len(l) == 0 {
+            i = i + 1;
+            continue;
+        }
+        if str_len(first) == 0 {
+            first = l;
+        }
+        if !str_starts_with(l, "[") && !str_ends_with(l, ":") {
+            var low: str = str_to_lower(l);
+            if str_contains(low, "error") || str_contains(low, "panic") || str_contains(low, "assert") || str_contains(low, "fail") || str_contains(low, "undefined") {
+                return l;
+            }
+        }
+        i = i + 1;
+    }
+    return first;
+}
+
+/// Build and run `prog` natively for `Example (native only):` (doctest.py's
+/// run_native): `fid emit` for the host target, `fid ccompile` when the own
+/// backend cannot build it and `emit_only` is false. "" when it ran clean,
+/// else why not.
+fn doctest_native(prog: str, emit_only: bool) -> str {
+    var exe: str = str_slice(prog, 0, str_len(prog) - 3);
+    if !is_posix_host() {
+        exe = exe + ".exe";
+    }
+    var bv: Vec<str> = Vec::new();
+    bv.push(p_argv(0));
+    bv.push("emit");
+    bv.push(prog);
+    if is_posix_host() {
+        bv.push("--target");
+        bv.push(host_native_target());
+    }
+    bv.push("-o");
+    bv.push(exe);
+    var b: ChildResult = process_run_argv(bv, Vec::new(), "", 300000);
+    if (b.timed_out || !b.started || b.code != 0 || p_file_exists(exe) == 0) && !emit_only {
+        // the own backend lacks some runtime functions: the C route
+        var cv: Vec<str> = Vec::new();
+        cv.push(p_argv(0));
+        cv.push("ccompile");
+        cv.push(prog);
+        cv.push("-o");
+        cv.push(exe);
+        b = process_run_argv(cv, Vec::new(), "", 300000);
+    }
+    if b.timed_out || !b.started || b.code != 0 || p_file_exists(exe) == 0 {
+        if b.timed_out {
+            return "build timeout";
+        }
+        return "build: " + first_error_line(b.errors + "\n" + b.output);
+    }
+    var rv: Vec<str> = Vec::new();
+    rv.push(exe);
+    var r: ChildResult = process_run_argv(rv, Vec::new(), "", 60000);
+    p_file_delete(exe);
+    if r.timed_out {
+        return "timeout";
+    }
+    if !r.started || r.code != 0 {
+        return "exit " + int_to_str(r.code) + ": " + first_error_line(r.errors + "\n" + r.output);
+    }
+    return "";
 }
 
 // --- cmd_inspect (CO9) ---------------------------------------------------

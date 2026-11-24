@@ -2699,7 +2699,7 @@ fn peir_sf_edge(f: &IrFunction, r: &mut PeirRanges, index: &Vec<i64>, q: i64, b:
                 r.ref_v = 0 - 1;
                 r.ref_loc = 0 - 1;
                 r.ref_live = false;
-                peir_range_refine(f, r, cond, taken == 1);
+                peir_range_refine(f, r, cond, taken == 1, q);
                 if r.ref_lo <= r.ref_hi {
                     if r.ref_v >= 0 {
                         out.push(1);
@@ -2831,6 +2831,26 @@ fn peir_join_stored(f: &IrFunction, preds: &Vec<Vec<i64>>, b: i64, q: i64, slot:
     return false;
 }
 
+/// BG132: does block `a` dominate block `x` (block indexes; `idom` the
+/// shared CFG's immediate dominators, the entry its own, -1 unreachable)?
+/// An unreachable block, or a walk past the bound, answers false.
+fn peir_idom_dominates(idom: &Vec<i64>, a: i64, x: i64) -> bool {
+    var y: i64 = x;
+    var steps: i64 = 0;
+    while y >= 0 && y < idom.len() && steps <= idom.len() {
+        if y == a {
+            return true;
+        }
+        var ny: i64 = idom.get(y);
+        if ny == y {
+            return false;
+        }
+        y = ny;
+        steps = steps + 1;
+    }
+    return false;
+}
+
 /// LF8: join block b (ways in `ps`) starts with each fact every way in
 /// carries (what held at the predecessor's end, or its branch's fact on
 /// that edge), as the hull of their intervals. Every predecessor must have
@@ -2860,6 +2880,16 @@ fn peir_join_set(f: &IrFunction, r: &mut PeirRanges, dom: &mut PeirDomFacts, ind
     var st: Vec<i64> = Vec::new();
     var en: Vec<i64> = Vec::new();
     var backs: Vec<i64> = Vec::new();
+    // BG132 (Nov 24): a predecessor laid out after b is not always a back
+    // edge: an early `break` block inside a loop, jumping to the block
+    // after it, is a forward edge scanned later. The walk of
+    // peir_join_stored proves nothing for it (a parameter is defined in no
+    // block), so `while x < 10 { if k == y { break; } .. } return x - 10`
+    // kept `x >= 10` at the exit, which the break never carries, and the
+    // subtraction lost its overflow check. Only a predecessor b dominates
+    // is a back edge; any other unscanned one empties the join, as before
+    // OP24.
+    var fwd: bool = false;
     var q: i64 = 0;
     while q < ps.len() {
         var qb: i64 = ps.get(q);
@@ -2869,9 +2899,12 @@ fn peir_join_set(f: &IrFunction, r: &mut PeirRanges, dom: &mut PeirDomFacts, ind
                 st.push(all.len());
                 peir_sf_edge(f, r, index, qb, b, true, xs, x_s0, x_sn, x_done, &mut all);
                 en.push(all.len());
-            } else if qb >= 0 {
-                // not scanned yet: a back edge, judged per fact below
+            } else if qb >= 0 && peir_idom_dominates(&dom.idom, b, qb) {
+                // not scanned yet and b dominates it: a back edge, judged
+                // per fact below
                 backs.push(qb);
+            } else if qb >= 0 {
+                fwd = true;
             }
         }
         q = q + 1;
@@ -2881,7 +2914,7 @@ fn peir_join_set(f: &IrFunction, r: &mut PeirRanges, dom: &mut PeirDomFacts, ind
     r.ref_lo = keep_lo;
     r.ref_hi = keep_hi;
     r.ref_live = keep_live;
-    if st.len() < 1 {
+    if st.len() < 1 || fwd {
         return;
     }
     var t: Vec<i64> = Vec::new();
@@ -2974,7 +3007,7 @@ fn peir_edge_fact(f: &IrFunction, r: &mut PeirRanges, index: &Vec<i64>, pb: i64,
                 }
             }
             if taken >= 0 {
-                peir_range_refine(f, r, cond, taken == 1);
+                peir_range_refine(f, r, cond, taken == 1, pb);
             }
             // a branch that says nothing about a range keeps what held
             // before it
@@ -3535,7 +3568,7 @@ fn peir_range_scan(f: &IrFunction, r: &mut PeirRanges, single_pred: &Vec<i64>, p
 }
 
 /// The fact a branch on `cond` gives in the block it leads to.
-fn peir_range_refine(f: &IrFunction, r: &mut PeirRanges, cond: i64, taken: bool) {
+fn peir_range_refine(f: &IrFunction, r: &mut PeirRanges, cond: i64, taken: bool, pb: i64) {
     // CS4: matched in place; a missing instruction gives no fact
     var cpos: i64 = peir_inst_pos(f, cond);
     if cpos < 0 {
@@ -3649,7 +3682,13 @@ fn peir_range_refine(f: &IrFunction, r: &mut PeirRanges, cond: i64, taken: bool)
             r.ref_hi = nh;
             match peir_inst_of(f, v) {
                 Inst::Load(p3, _) => {
-                    if p3 >= 0 && p3 < r.plain.len() && r.plain.get(p3) == 1 {
+                    // BG158 (Nov 24): the fact is on the local only while it
+                    // still holds what was loaded: the load in the branching
+                    // block pb, no store to p3 after it (`x < (if reset { x
+                    // = 100; ten } else { ten })` loads x before the store
+                    // and branches after it). Otherwise the fact is on the
+                    // loaded value (below).
+                    if p3 >= 0 && p3 < r.plain.len() && r.plain.get(p3) == 1 && peir_load_holds_at_end(f, pb, v, p3) {
                         r.ref_loc = p3;
                         r.ref_live = true;
                         return;
@@ -3691,6 +3730,36 @@ fn peir_plain_load_slot(f: &IrFunction, r: &PeirRanges, x: i64) -> i64 {
         }
     }
     return 0 - 1;
+}
+
+/// BG158: block `pb` (a block index) computes the load `v` of local `p`
+/// and stores nothing to p after it, so p still holds what `v` read when
+/// pb ends (where its branch is).
+fn peir_load_holds_at_end(f: &IrFunction, pb: i64, v: i64, p: i64) -> bool {
+    if pb < 0 || pb >= f.blocks.len() {
+        return false;
+    }
+    var ids: Vec<i64> = f.blocks.get(pb).instructions;
+    var seen: bool = false;
+    var k: i64 = 0;
+    while k < ids.len() {
+        var id: i64 = ids.get(k);
+        if id == v {
+            seen = true;
+        } else if seen {
+            match peir_inst_of(f, id) {
+                Inst::Store(sp, _, _) => {
+                    if sp == p {
+                        return false;
+                    }
+                }
+                _ => {
+                }
+            }
+        }
+        k = k + 1;
+    }
+    return seen;
 }
 
 /// OP24: when `v` is `x * y`, x and y loads of the same plain local p, and

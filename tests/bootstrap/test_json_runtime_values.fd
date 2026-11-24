@@ -1,0 +1,103 @@
+// Bugs roadmap BG161, BG162, BG163, BG204: the C and native runtimes'
+// p_json_parse/dump/pretty/get now read the text into values by recursive
+// descent, as the interpreter does (compiler/json.fd), and write it out
+// from them (codegen_c.fd _jv_*, stdlib/pe_runtime/data.fd ped_jv_*).
+// BG162: a string that looks like a number or a boolean ("02134", "true")
+// was written bare, and a string ended at its first `"` (`\"` not read).
+// BG163: the native runtime's flat scan cut a nested object or array at
+// its first `,` and lifted its keys to the top level. BG161: C's
+// p_json_pretty wrote indentation past its buffer on deep nesting.
+// BG204: C's parse tree was never freed (the loop below ran 1000 parses).
+//
+// Expected output:
+// {"flag":"true","n":"null","neg":"-5","zip":"02134"}
+// {"q":"say \"hi\" now","z":1}
+// {"a":1500,"b":0,"c":0.1,"d":100000000000000000000,"e":3.14159,"f":1234567890123456,"g":-2.5,"h":0.0000001}
+// {"arr":["x",{"a":[true,false,null],"b":2},[]],"e":{},"u":"éA\n\t/\\"}
+// {"k":-4,"list":[1,2,3]}
+// {"o":{"p":2}}
+// {"msg":"x:y","t":2}
+// {"k":2}
+// {"ctl":"\u0001x"}
+// [1,"two",[3]]
+// "just"
+// 42
+// {
+//   "arr": [
+//     "x",
+//     {
+//       "a": [
+//         true,
+//         false,
+//         null
+//       ],
+//       "b": 2
+//     },
+//     []
+//   ],
+//   "e": {},
+//   "s": "a,b:{c}"
+// }
+// {"a":"q","z":1}
+// "a\"b"
+// 1
+// null
+// [4,5]
+// 361
+// 7741
+// 1623
+// done 29
+
+fn main() -> i64 {
+    // BG162: strings stay strings, escapes are read and written
+    println(p_json_dump(p_json_parse("{\"zip\": \"02134\", \"flag\": \"true\", \"n\": \"null\", \"neg\": \"-5\"}")));
+    println(p_json_dump(p_json_parse("{\"q\": \"say \\\"hi\\\" now\", \"z\": 1}")));
+    println(p_json_dump(p_json_parse("{\"a\": 1.5e3, \"b\": -0, \"c\": 0.1, \"d\": 1e20, \"e\": 3.14159, \"f\": 1234567890123456, \"g\": -2.5, \"h\": 1e-7}")));
+    println(p_json_dump(p_json_parse("{\"u\": \"\\u00e9\\u0041\\n\\t\\/\\\\\", \"arr\": [\"x\", {\"b\": 2, \"a\": [true, false, null]}, []], \"e\": {}}")));
+    // BG163: nested values whole
+    println(p_json_dump(p_json_parse("{\"list\": [1, 2, 3], \"k\": -4}")));
+    println(p_json_dump(p_json_parse("{\"o\": {\"p\": 2}}")));
+    println(p_json_dump(p_json_parse("{\"msg\": \"x:y\", \"t\": 2}")));
+    // a later duplicate key wins; control bytes as \u00XX
+    println(p_json_dump("{\"k\": 1, \"k\": 2}"));
+    println(p_json_dump("{\"ctl\": \"\\u0001x\"}"));
+    // any value at the top level
+    println(p_json_dump("[1, \"two\", [3]]"));
+    println(p_json_dump("\"just\""));
+    println(p_json_dump("42"));
+    println(p_json_pretty(p_json_parse("{\"arr\": [\"x\", {\"b\": 2, \"a\": [true, false, null]}, []], \"e\": {}, \"s\": \"a,b:{c}\"}")));
+    // p_json_get: a member of the top-level object (a Json value: dumped)
+    println(p_json_dump(p_json_get("{\"s\": \"a\\\"b\", \"n\": 1, \"o\": {\"z\": 1, \"a\": \"q\"}}", "o")));
+    println(p_json_dump(p_json_get("{\"s\": \"a\\\"b\", \"n\": 1}", "s")));
+    println(p_json_dump(p_json_get("{\"s\": \"a\\\"b\", \"n\": 1}", "n")));
+    println(p_json_dump(p_json_get("{\"o\": {\"n\": 1}}", "n")));
+    println(p_json_dump(p_json_get("{\"n\": 1, \"m\": [4, 5]}", "m")));
+    // BG161: deep nesting pretty-printed
+    var s: str = "1";
+    var i: i64 = 0;
+    while i < 60 {
+        s = "{\"a\":" + s + "}";
+        i = i + 1;
+    }
+    println(int_to_str(str_len(s)));
+    println(int_to_str(str_len(p_json_pretty(p_json_parse(s)))));
+    var t: str = "[]";
+    i = 0;
+    while i < 200 {
+        t = t + ",[]";
+        i = i + 1;
+    }
+    println(int_to_str(str_len(p_json_pretty(p_json_parse("{\"k\":[" + t + "]}")))));
+    // BG204: parse trees freed (1000 rounds)
+    var total: i64 = 0;
+    i = 0;
+    while i < 1000 {
+        val d: str = p_json_dump(p_json_parse("{\"name\": \"value\", \"k\": 12345678}"));
+        if i == 0 {
+            total = str_len(d);
+        }
+        i = i + 1;
+    }
+    println("done " + int_to_str(total));
+    return 0;
+}

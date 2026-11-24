@@ -2308,6 +2308,11 @@ pub struct IrFunction {
     pub current_block_idx: i64,
     pub entry: i64,
     pub locals: Vec<StringValueId>,
+    // DB4: every binding IrFunction_bind_local ever made, in order (locals
+    // is truncated when a nested scope closes, so a shadowed name bound
+    // inside an if/match block leaves it; the debug info still needs the
+    // binding — its DWARF lexical scope is what keeps it out of sight)
+    pub dbg_locals: Vec<StringValueId>,
     pub is_interrupt: bool,
     pub interrupt_vector: i64,
     // F29: @interrupt(N) — IDT vector number (-1 = none)
@@ -2359,7 +2364,7 @@ pub fn ValueIdInst_new(id: i64, inst: Inst) -> ValueIdInst {
 
 pub fn IrFunction_new(name: str, ret_ty: IrType) -> IrFunction {
     var func: IrFunction = IrFunction {
-        name: name, params: Vec::new(), ret_ty: ret_ty, blocks: Vec::new(), value_metas: Vec::new(), insts: Vec::new(), inst_at: Vec::new(), effects: EffectSet_new(), next_value: 0, next_block: 0, current_block_idx: 0, entry: 0, locals: Vec::new(), is_interrupt: false, interrupt_vector: -1, persist_vars: Vec::new(), drop_locals: Vec::new(), is_wrapping: false, is_deterministic: false, is_crashfree: false, gas_limit: OptU64::None, is_no_alloc: false, is_medical: false, is_kernel: false, internal_conv: false, workgroup_size: Vec::new(), is_simd: false, zeroize_locals: Vec::new(), is_constant_time: false, has_secret: false, secret_values: Vec::new(),
+        name: name, params: Vec::new(), ret_ty: ret_ty, blocks: Vec::new(), value_metas: Vec::new(), insts: Vec::new(), inst_at: Vec::new(), effects: EffectSet_new(), next_value: 0, next_block: 0, current_block_idx: 0, entry: 0, locals: Vec::new(), dbg_locals: Vec::new(), is_interrupt: false, interrupt_vector: -1, persist_vars: Vec::new(), drop_locals: Vec::new(), is_wrapping: false, is_deterministic: false, is_crashfree: false, gas_limit: OptU64::None, is_no_alloc: false, is_medical: false, is_kernel: false, internal_conv: false, workgroup_size: Vec::new(), is_simd: false, zeroize_locals: Vec::new(), is_constant_time: false, has_secret: false, secret_values: Vec::new(),
     };
     func.workgroup_size.push(1);
     func.workgroup_size.push(1);
@@ -2434,6 +2439,8 @@ pub fn IrFunction_add_block_param(self: &mut IrFunction, block: i64, ty: IrType)
 
 pub fn IrFunction_bind_local(self: &mut IrFunction, name: str, value: i64) {
     self.locals.push(StringValueId_new(name, value));
+    // DB4: the debug side keeps it past the scope's end
+    self.dbg_locals.push(StringValueId_new(name, value));
 }
 
 pub fn IrFunction_lookup_local(self: &IrFunction, name: str) -> OptValueId {

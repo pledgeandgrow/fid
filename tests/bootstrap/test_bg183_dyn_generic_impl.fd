@@ -1,0 +1,58 @@
+// Bugs roadmap BG183: `dyn` of a generic impl failed at run time. With
+// `impl<T> Show for Slot<T>`, `Slot<i64> as dyn Show` built its dyn value
+// with the bare name `Slot` (lower.fd Expr::Cast to Type::Dyn), while mono
+// names the instance's methods `Slot__show__i64`: run panicked "DynCall: no
+// method 'show' on type 'Slot'", the C build exited 127, emit gave "Illegal
+// instruction". Each instance gets forwarders `Slot__i64_show` (and so on)
+// that every backend's dispatch finds (Lowerer_dyn_generic_name).
+//
+// Expected output:
+// 5
+// hello
+// 2.5
+// 6
+// 5
+// hello
+// 2.5
+// 1 2 3
+// 6
+
+cap Show {
+    fn show(self) -> str;
+    fn tag(self) -> i64;
+}
+
+struct Slot<T> {
+    v: T,
+    tag: i64,
+}
+
+impl<T> Show for Slot<T> {
+    fn show(self) -> str {
+        return f"{self.v}";
+    }
+    fn tag(self) -> i64 {
+        return self.tag;
+    }
+}
+
+fn main() -> i64 {
+    val a: Slot<i64> = Slot { v: 5, tag: 1 };
+    val b: Slot<str> = Slot { v: "hello", tag: 2 };
+    val c: Slot<f64> = Slot { v: 2.5, tag: 3 };
+    println(a.show());
+    println(b.show());
+    println(c.show());
+    // (mono makes an instance's method when it is called on the type: the
+    // dyn calls below need these)
+    println(a.tag() + b.tag() + c.tag());
+    val da = a as dyn Show;
+    val db = b as dyn Show;
+    val dc = c as dyn Show;
+    println(da.show());
+    println(db.show());
+    println(dc.show());
+    println(f"{da.tag()} {db.tag()} {dc.tag()}");
+    println(da.tag() + db.tag() + dc.tag());
+    return 0;
+}

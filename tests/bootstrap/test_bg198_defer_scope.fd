@@ -1,0 +1,112 @@
+// Bugs roadmap BG198: a deferred block runs at function exit (reference
+// §5.5), but its names were resolved at each exit (lower.fd
+// Lowerer_emit_defers lowered the block again there): a variable of the
+// block holding the `defer` had been dropped by then (a freed string or Vec
+// was read), and a variable of the same name around the `return` was read
+// instead (99 for 1). The block now reads the variables in scope at its
+// `defer` statement (Lowerer_defer_capture): one dropped before the
+// function ends keeps its value for the block, and an assignment after
+// the `defer` is what the block sees.
+//
+// Expected output:
+// in block
+// after block
+// deferred: abc5
+// inner 99
+// x=1
+// in block
+// after block
+// deferred len: 2 first 5
+// defer t2
+// 2
+// s=ab
+// outer-inner
+// done
+
+fn f1(k: i64) -> i64 {
+    if k > 0 {
+        val s: str = "abc" + int_to_str(k);
+        defer {
+            println("deferred: " + s);
+        }
+        println("in block");
+    }
+    println("after block");
+    return 0;
+}
+
+fn f2() -> i64 {
+    var x: i64 = 1;
+    defer {
+        println("x=" + int_to_str(x));
+    }
+    if true {
+        val x: i64 = 99;
+        println("inner " + int_to_str(x));
+        return 0;
+    }
+    return 1;
+}
+
+fn f3(k: i64) -> i64 {
+    if k > 0 {
+        var v: Vec<i64> = Vec::new();
+        v.push(k);
+        v.push(k + 1);
+        defer {
+            println("deferred len: " + int_to_str(v.len()) + " first " + int_to_str(v.get(0)));
+        }
+        println("in block");
+    }
+    println("after block");
+    return 0;
+}
+
+fn f4(n: i64) -> i64 {
+    var i: i64 = 0;
+    while i < n {
+        val t: str = "t" + int_to_str(i);
+        defer {
+            println("defer " + t);
+        }
+        if i == 2 {
+            return i;
+        }
+        i = i + 1;
+    }
+    return - 1;
+}
+
+fn f5() -> i64 {
+    if true {
+        var s: str = "a" + int_to_str(0);
+        defer {
+            println("s=" + s);
+        }
+        s = "a" + "b";
+    }
+    return 0;
+}
+
+fn f6(k: i64) -> i64 {
+    if k > 0 {
+        val o: str = "outer" + "-";
+        if k > 1 {
+            defer {
+                println(o + "inner");
+            }
+        }
+    }
+    return 0;
+}
+
+fn main() -> i64 {
+    f1(5);
+    f2();
+    f3(5);
+    println(int_to_str(f4(5)));
+    f5();
+    f6(2);
+    println("done");
+    return 0;
+}

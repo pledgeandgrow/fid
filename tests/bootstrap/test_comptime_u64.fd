@@ -1,0 +1,72 @@
+// BG62: comptime arithmetic on values declared unsigned stays unsigned.
+// Before the fix every comptime IntLit was i64, so `m > 0` on the raw
+// bits of 2^63 read them signed and gave the wrong answer.
+//
+// Expected output:
+// m ok
+// half ok
+// div ok
+// cmp ok
+// shl ok
+// sum ok
+// wrap ok
+
+fn ok(name: str, b: bool) {
+    if b {
+        print(name + " ok\n");
+    } else {
+        print(name + " WRONG\n");
+    }
+}
+
+fn main() {
+    val m: u64 = comptime {
+        val x: u64 = 18446744073709551615;
+        x
+    };
+    ok("m", m == 18446744073709551615);
+
+    // logical shift right: the sign bit is a data bit
+    val h: u64 = comptime {
+        val x: u64 = 18446744073709551615;
+        x >> 1
+    };
+    ok("half", h == 9223372036854775807);
+
+    // unsigned division of a value whose bits read negative signed
+    val d: u64 = comptime {
+        val x: u64 = 18446744073709551615;
+        x / 3
+    };
+    ok("div", d == 6148914691236517205);
+
+    // unsigned comparisons order above i64::MAX (the branch the if takes
+    // is what the comparison decided)
+    val c: i64 = comptime {
+        val x: u64 = 18446744073709551615;
+        if x > 0 && x >= 9223372036854775808 { 1 } else { 0 }
+    };
+    ok("cmp", c == 1);
+
+    val s: u64 = comptime {
+        val x: u64 = 1;
+        x << 63
+    };
+    ok("shl", s == 9223372036854775808);
+
+    // a `comptime fn` parameter declared unsigned keeps it unsigned too
+    val t: u64 = comptime {
+        val a: u64 = 18000000000000000000;
+        a - 17000000000000000000
+    };
+    ok("sum", t == 1000000000000000000);
+
+    // ~ masks to the declared width: ~200u8 is 55, not 2^64-201
+    val n: u64 = comptime {
+        val x: u8 = 200;
+        ~x
+    };
+    ok("wrap", n == 55);
+
+    return 0;
+}

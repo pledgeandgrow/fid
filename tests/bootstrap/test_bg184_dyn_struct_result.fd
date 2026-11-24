@@ -1,0 +1,102 @@
+// Bugs roadmap BG184: a trait method returning a struct, called through
+// `dyn`, crashed: lower.fd's DynCall passed no result pointer, and every
+// backend's dispatch calls `<Type>_<method>(env, receiver, args..)`, so the
+// method wrote its result through the receiver (run: "Invalid memory
+// access" in Sq_corner, C exit 3, emit a panic). The call now goes to a
+// wrapper `<Type>_<method>__dsret` that gives the method a heap block and
+// returns it (Lowerer_dyn_sret_wrapper); the struct is copied out.
+//
+// Expected output:
+// 3
+// 3
+// 7
+// 3 7
+// 9
+// 5 6
+// sq3 1
+// 4 5
+// 20
+// 6 7
+// re4 2
+
+struct V2 {
+    x: i64,
+    y: i64,
+}
+
+struct L {
+    s: str,
+    n: i64,
+}
+
+cap Corner {
+    fn corner(self) -> V2;
+    fn area(self) -> i64;
+    fn grown(self, k: i64) -> V2;
+    fn label(self) -> L;
+}
+
+struct Sq {
+    s: i64,
+}
+
+struct Re {
+    w: i64,
+    h: i64,
+}
+
+impl Corner for Sq {
+    fn corner(self) -> V2 {
+        return V2 { x: self.s, y: 7 };
+    }
+    fn area(self) -> i64 {
+        return self.s * self.s;
+    }
+    fn grown(self, k: i64) -> V2 {
+        return V2 { x: self.s + k, y: self.s * k };
+    }
+    fn label(self) -> L {
+        return L { s: "sq" + int_to_str(self.s), n: 1 };
+    }
+}
+
+impl Corner for Re {
+    fn corner(self) -> V2 {
+        return V2 { x: self.w, y: self.h };
+    }
+    fn area(self) -> i64 {
+        return self.w * self.h;
+    }
+    fn grown(self, k: i64) -> V2 {
+        return V2 { x: self.w + k, y: self.h + k };
+    }
+    fn label(self) -> L {
+        return L { s: "re" + int_to_str(self.w), n: 2 };
+    }
+}
+
+fn main() -> i64 {
+    val q = Sq { s: 3 };
+    val c0 = q.corner();
+    println(c0.x);
+    val d = q as dyn Corner;
+    val c = d.corner();
+    println(c.x);
+    println(c.y);
+    var v: Vec<dyn Corner> = Vec::new();
+    v.push(Sq { s: 3 } as dyn Corner);
+    v.push(Re { w: 4, h: 5 } as dyn Corner);
+    var i: i64 = 0;
+    while i < v.len() {
+        val e = v.get(i);
+        val k = e.corner();
+        println(f"{k.x} {k.y}");
+        println(e.area());
+        val g = e.grown(2);
+        println(f"{g.x} {g.y}");
+        val l = e.label();
+        println(f"{l.s} {l.n}");
+        i = i + 1;
+    }
+    return 0;
+}
