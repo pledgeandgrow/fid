@@ -1,0 +1,2971 @@
+// tools/variants.fd — optimizer passes switched off one at a time (VF4) and
+// broken on purpose (VF7): the Fides port of scripts/verify/variants.py
+// (roadmap AD4). Same commands, options and defaults, the same lines on
+// stdout, the same <out>/<cmd>-report.txt and --resume file, the same exit
+// status:
+//
+//   fid ccompile tools/variants.fd -o variants.exe
+//   variants.exe toggle --fid <base fid> --tree <snapshot> [--tests 'tests/bootstrap/*.fd'] \
+//       [-j 4] [--out build/variants] [--only name,...] [--backends emit,nat,ccompile]
+//   variants.exe mutate --fid <base fid> --tree <snapshot> [...]
+//   variants.exe list | check [--tree <snapshot>]
+//
+// Built only (`fid ccompile`): it calls getcwd and the runtime's
+// fid_proc_spawn_io (a child with its stdin closed), which `fid run` (the
+// interpreter) cannot.
+//
+// toggle: every pass off in turn (the table below, plus every run-time
+// switch the tree's compiler reads: iro_pass_on -> FID_IROPT_OFF on emit
+// and nat, ng_on/ru_on/eg_on -> FID_NAT_OFF on nat); each test's output
+// must not change. mutate: each mutant is a compiler with one deliberate
+// bug; some test must notice. A constant switch or a mutant is built with
+// scripts/verify/build-variant.sh (bash), once, into <out>/fid-<name>.exe.
+// For each variant and test, the test is compiled by the base and the
+// variant compiler; when the two executables differ both run (stdin
+// closed) and their exit status and output are compared; a mismatch is run
+// again, and two runs of one binary that disagree make the test flaky.
+// --prune-stats, --prune-check, --resume, --sample, --no-fail-tests,
+// --build-only as in the script (see its docstring). Exit status: 0 when
+// every toggle left every output alone and every mutant was killed, 1 when
+// one did not, 2 when a variant did not build.
+//
+// -j tests run at once: the tool runs itself once per test and backend
+// (`--va-item <job file>`, hidden), each such child doing the script's
+// steps for its test in order; the results are put together in the
+// script's order. The script's lock around a second compile attempt is a
+// directory, <out>/work/.retry-lock, made and removed by the children.
+//
+// Run from the repository root (the script finds the root from its own
+// path: here it is the current directory). Differences from the script:
+// --gen (programs of scripts/fuzz/gen_vs_c.py and gen_programs.py) is not
+// ported: an error, exit 2; the TOGGLES and MUTANTS tables are copies of
+// the script's (`list` and `check` show a drift at once); argparse's usage
+// and help texts are the ones it prints on an 80-column terminal; ints and
+// floats are read in their plain forms; a test's output is decoded as UTF-8
+// with each bad sequence as U+FFFD, as the script decodes it, and "bytes"
+// in the report counts characters, as there; a child a signal killed has
+// exit code 128+n (Python: -n) and on Windows a crash is the unsigned code
+// Python prints (3221225477); a --resume line missing "variant", "test" or
+// "backend" is skipped (the script stops with a KeyError); every file is
+// written with "\n" line ends (Python on Windows writes "\r\n" in the
+// report and the results file, and on stdout).
+
+use core;
+use args;
+use crypto;
+use fs;
+use io;
+use md5;
+use process;
+use task;
+
+extern "C" {
+    fn getcwd(buf: i64, n: i64) -> i64;
+    fn fid_proc_spawn_io(argv: i64, env: i64, dir: i64, out: i64, io: i64) -> i64;
+}
+
+// ─── Text ───
+
+fn va_ws(c: i64) -> bool {
+    return (c >= 9 && c <= 13) || (c >= 28 && c <= 32);
+}
+
+fn va_digit(c: i64) -> bool {
+    return c >= 48 && c <= 57;
+}
+
+fn va_skip_ws(s: str, i: i64) -> i64 {
+    var k: i64 = i;
+    while k < str_len(s) && va_ws(str_byte_at(s, k)) { k = k + 1; }
+    return k;
+}
+
+fn va_at(s: str, i: i64, w: str) -> bool {
+    if i < 0 || i + str_len(w) > str_len(s) { return false; }
+    return str_slice(s, i, i + str_len(w)) == w;
+}
+
+/// Python's str.strip() (ASCII whitespace).
+fn va_strip(s: str) -> str {
+    var a: i64 = 0;
+    var b: i64 = str_len(s);
+    while a < b && va_ws(str_byte_at(s, a)) { a = a + 1; }
+    while b > a && va_ws(str_byte_at(s, b - 1)) { b = b - 1; }
+    return str_slice(s, a, b);
+}
+
+/// s.split(sep) (keeps empty pieces).
+fn va_split(s: str, sep: str) -> Vec<str> {
+    var r: Vec<str> = Vec::new();
+    val n: i64 = str_len(s);
+    val m: i64 = str_len(sep);
+    var start: i64 = 0;
+    var i: i64 = 0;
+    while i + m <= n {
+        if str_slice(s, i, i + m) == sep {
+            r.push(str_slice(s, start, i));
+            i = i + m;
+            start = i;
+        } else {
+            i = i + 1;
+        }
+    }
+    r.push(str_slice(s, start, n));
+    return r;
+}
+
+/// A file's text as Python's text mode gives it ("\r\n" and "\r" as "\n"),
+/// or None.
+fn va_read_text(path: str) -> Option<str> {
+    match read_file(path) {
+        Option::Some(t) => {
+            if str_contains(t, "\r") {
+                return Option::Some(str_replace(str_replace(t, "\r\n", "\n"), "\r", "\n"));
+            }
+            return Option::Some(t);
+        }
+        Option::None => { }
+    }
+    return Option::None;
+}
+
+fn va_lt(a: str, b: str) -> bool {
+    val n: i64 = str_len(a);
+    val m: i64 = str_len(b);
+    var i: i64 = 0;
+    while i < n && i < m {
+        val x: i64 = str_byte_at(a, i);
+        val y: i64 = str_byte_at(b, i);
+        if x != y { return x < y; }
+        i = i + 1;
+    }
+    return n < m;
+}
+
+/// sorted() of strings (code point order is byte order for UTF-8).
+fn va_sort(v: &mut Vec<str>) {
+    // a merge sort: some lists hold thousands of names
+    val n: i64 = v.len();
+    if n < 2 { return; }
+    var a: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        a.push(v.get(i));
+        i = i + 1;
+    }
+    var b: Vec<str> = Vec::new();
+    i = 0;
+    while i < n {
+        b.push("");
+        i = i + 1;
+    }
+    var width: i64 = 1;
+    while width < n {
+        var lo: i64 = 0;
+        while lo < n {
+            var mid: i64 = lo + width;
+            if mid > n { mid = n; }
+            var hi: i64 = lo + 2 * width;
+            if hi > n { hi = n; }
+            var x: i64 = lo;
+            var y: i64 = mid;
+            var k: i64 = lo;
+            while k < hi {
+                if x < mid && (y >= hi || !va_lt(a.get(y), a.get(x))) {
+                    b.set(k, a.get(x));
+                    x = x + 1;
+                } else {
+                    b.set(k, a.get(y));
+                    y = y + 1;
+                }
+                k = k + 1;
+            }
+            lo = hi;
+        }
+        var t: Vec<str> = a;
+        a = b;
+        b = t;
+        width = width * 2;
+    }
+    i = 0;
+    while i < n {
+        v.set(i, a.get(i));
+        i = i + 1;
+    }
+}
+
+fn va_has(v: Vec<str>, s: str) -> bool {
+    var i: i64 = 0;
+    while i < v.len() {
+        if v.get(i) == s { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// f"{s:<w}" (left-aligned) and f"{s:>w}" (right-aligned).
+fn va_ljust(s: str, w: i64) -> str {
+    var r: str = s;
+    var n: i64 = str_len(s);
+    while n < w {
+        r = r + " ";
+        n = n + 1;
+    }
+    return r;
+}
+
+/// f"{d:.{prec}f}" for prec 0..2, exactly as Python rounds (the binary
+/// value, ties to even).
+fn va_fixed(d: f64, prec: i64) -> str {
+    if d != d { return "nan"; }
+    var neg: bool = false;
+    var x: f64 = d;
+    if x < 0.0 {
+        neg = true;
+        x = 0.0 - x;
+    }
+    if x > 1.0e15 {
+        return float_to_str(d);
+    }
+    val bits: i64 = p_f64_to_bits(x);
+    val e: i64 = (bits >> 52) & 2047;
+    var m: i64 = bits & 4503599627370495;
+    var exp: i64 = -1074;
+    if e != 0 {
+        m = m | 4503599627370496;
+        exp = e - 1075;
+    }
+    var scale: i64 = 1;
+    var k: i64 = 0;
+    while k < prec {
+        scale = scale * 10;
+        k = k + 1;
+    }
+    val num: i64 = m * scale;
+    var q: i64 = 0;
+    if exp >= 0 {
+        q = num << exp;
+    } else {
+        val s: i64 = 0 - exp;
+        if s <= 61 {
+            q = num >> s;
+            val r: i64 = num - (q << s);
+            val half: i64 = 1 << (s - 1);
+            if r > half || (r == half && (q & 1) == 1) { q = q + 1; }
+        }
+    }
+    var out: str = int_to_str(q / scale);
+    if prec > 0 {
+        var frac: str = int_to_str(q % scale);
+        while str_len(frac) < prec { frac = "0" + frac; }
+        out = out + "." + frac;
+    }
+    if neg { out = "-" + out; }
+    return out;
+}
+
+// ─── Python's repr() of a str (for argparse's messages and list reprs) ───
+
+fn va_hex(c: i64, width: i64) -> str {
+    val digits: str = "0123456789abcdef";
+    var s: str = "";
+    var k: i64 = width - 1;
+    while k >= 0 {
+        s = s + char_to_str(str_byte_at(digits, (c >> (4 * k)) & 15));
+        k = k - 1;
+    }
+    return s;
+}
+
+fn va_repr(s: str) -> str {
+    var q: str = "'";
+    if str_contains(s, "'") && !str_contains(s, "\"") { q = "\""; }
+    var out: str = q;
+    var i: i64 = 0;
+    while i < str_len(s) {
+        val c: i64 = str_byte_at(s, i);
+        i = i + 1;
+        if char_to_str(c) == q || c == 92 {
+            out = out + "\\" + char_to_str(c);
+        } else if c == 9 {
+            out = out + "\\t";
+        } else if c == 10 {
+            out = out + "\\n";
+        } else if c == 13 {
+            out = out + "\\r";
+        } else if c < 32 || c == 127 {
+            out = out + "\\x" + va_hex(c, 2);
+        } else {
+            out = out + char_to_str(c);
+        }
+    }
+    return out + q;
+}
+
+// ─── Paths ───
+
+fn va_win() -> bool {
+    return process_is_windows();
+}
+
+fn va_is_sep(c: i64) -> bool {
+    return c == 47 || (c == 92 && va_win());
+}
+
+fn va_sep() -> str {
+    if va_win() { return "\\"; }
+    return "/";
+}
+
+var va_cwd_cache: str = "";
+
+/// os.getcwd()
+fn va_cwd() -> str {
+    if str_len(va_cwd_cache) > 0 { return va_cwd_cache; }
+    var buf: i64 = 0;
+    // SAFETY: a fresh 4096-byte buffer; getcwd writes at most that many
+    // bytes, NUL included, and the result is copied out before it is freed.
+    unsafe {
+        buf = p_malloc(4096);
+        if buf != 0 {
+            if getcwd(buf, 4096) != 0 {
+                va_cwd_cache = p_str_from_ptr(buf);
+            }
+            p_free(buf);
+        }
+    }
+    if str_len(va_cwd_cache) == 0 { va_cwd_cache = "."; }
+    return va_cwd_cache;
+}
+
+/// The drive ("C:") of a Windows path, "" for none.
+fn va_drive(p: str) -> str {
+    if va_win() && str_len(p) >= 2 && str_byte_at(p, 1) == 58 { return str_slice(p, 0, 2); }
+    return "";
+}
+
+fn va_isabs(p: str) -> bool {
+    val d: str = va_drive(p);
+    val rest: str = str_slice(p, str_len(d), str_len(p));
+    return str_len(rest) > 0 && va_is_sep(str_byte_at(rest, 0));
+}
+
+/// os.path.join(a, b)
+fn va_join(a: str, b: str) -> str {
+    if str_len(a) == 0 { return b; }
+    if va_isabs(b) { return b; }
+    if va_is_sep(str_byte_at(a, str_len(a) - 1)) { return a + b; }
+    return a + va_sep() + b;
+}
+
+/// os.path.normpath
+fn va_normpath(p: str) -> str {
+    val d: str = va_drive(p);
+    var rest: str = str_slice(p, str_len(d), str_len(p));
+    if va_win() { rest = str_replace(rest, "/", "\\"); }
+    val abs: bool = str_len(rest) > 0 && va_is_sep(str_byte_at(rest, 0));
+    val parts: Vec<str> = va_split(rest, va_sep());
+    var out: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < parts.len() {
+        val c: str = parts.get(i);
+        i = i + 1;
+        if str_len(c) == 0 || c == "." { continue; }
+        if c == ".." {
+            if out.len() > 0 && out.get(out.len() - 1) != ".." {
+                out.remove(out.len() - 1);
+                continue;
+            }
+            if abs { continue; }
+        }
+        out.push(c);
+    }
+    var s: str = "";
+    i = 0;
+    while i < out.len() {
+        if i > 0 { s = s + va_sep(); }
+        s = s + out.get(i);
+        i = i + 1;
+    }
+    if abs { s = va_sep() + s; }
+    s = d + s;
+    if str_len(s) == 0 { return "."; }
+    return s;
+}
+
+fn va_abspath(p: str) -> str {
+    if va_isabs(p) { return va_normpath(p); }
+    return va_normpath(va_join(va_cwd(), p));
+}
+
+/// os.path.relpath(p) (from the current directory)
+fn va_relpath(p: str) -> str {
+    val a: str = va_abspath(p);
+    val b: str = va_abspath(".");
+    var ka: str = a;
+    var kb: str = b;
+    if va_win() {
+        ka = str_to_lower(a);
+        kb = str_to_lower(b);
+    }
+    if va_drive(ka) != va_drive(kb) { return a; }
+    val pa: Vec<str> = va_split(str_slice(a, str_len(va_drive(a)), str_len(a)), va_sep());
+    val pb: Vec<str> = va_split(str_slice(b, str_len(va_drive(b)), str_len(b)), va_sep());
+    val la: Vec<str> = va_split(str_slice(ka, str_len(va_drive(ka)), str_len(ka)), va_sep());
+    val lb: Vec<str> = va_split(str_slice(kb, str_len(va_drive(kb)), str_len(kb)), va_sep());
+    // drop the empty piece of the root
+    var xa: Vec<str> = Vec::new();
+    var xla: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < pa.len() {
+        if str_len(pa.get(i)) > 0 {
+            xa.push(pa.get(i));
+            xla.push(la.get(i));
+        }
+        i = i + 1;
+    }
+    var xlb: Vec<str> = Vec::new();
+    i = 0;
+    while i < pb.len() {
+        if str_len(pb.get(i)) > 0 { xlb.push(lb.get(i)); }
+        i = i + 1;
+    }
+    var common: i64 = 0;
+    while common < xla.len() && common < xlb.len() && xla.get(common) == xlb.get(common) { common = common + 1; }
+    var parts: Vec<str> = Vec::new();
+    i = common;
+    while i < xlb.len() {
+        parts.push("..");
+        i = i + 1;
+    }
+    i = common;
+    while i < xa.len() {
+        parts.push(xa.get(i));
+        i = i + 1;
+    }
+    if parts.len() == 0 { return "."; }
+    var s: str = "";
+    i = 0;
+    while i < parts.len() {
+        if i > 0 { s = s + va_sep(); }
+        s = s + parts.get(i);
+        i = i + 1;
+    }
+    return s;
+}
+
+fn va_slashes(p: str) -> str {
+    return str_replace(p, "\\", "/");
+}
+
+/// os.makedirs(p, exist_ok=True)
+fn va_makedirs(p: str) -> bool {
+    if str_len(p) == 0 || fs_is_dir(p) { return true; }
+    var k: i64 = str_len(p) - 1;
+    while k >= 0 && va_is_sep(str_byte_at(p, k)) { k = k - 1; }
+    while k >= 0 && !va_is_sep(str_byte_at(p, k)) { k = k - 1; }
+    if k > 0 {
+        val parent: str = str_slice(p, 0, k);
+        if !(str_len(parent) == 2 && str_len(va_drive(parent)) == 2) {
+            va_makedirs(parent);
+        }
+    }
+    fs_mkdir(p);
+    return fs_is_dir(p);
+}
+
+// ─── glob ───
+
+fn va_magic(s: str) -> bool {
+    return str_contains(s, "*") || str_contains(s, "?") || str_contains(s, "[");
+}
+
+/// fnmatch of one name (case folded on Windows, as glob does there).
+fn va_fnmatch(name: str, pat: str) -> bool {
+    if va_win() { return va_fnmatch_at(str_to_lower(name), 0, str_to_lower(pat), 0); }
+    return va_fnmatch_at(name, 0, pat, 0);
+}
+
+fn va_fnmatch_at(s: str, i: i64, p: str, j: i64) -> bool {
+    if j >= str_len(p) { return i >= str_len(s); }
+    val c: i64 = str_byte_at(p, j);
+    if c == 42 {
+        var k: i64 = i;
+        while k <= str_len(s) {
+            if va_fnmatch_at(s, k, p, j + 1) { return true; }
+            k = k + 1;
+        }
+        return false;
+    }
+    if i >= str_len(s) { return false; }
+    val ch: i64 = str_byte_at(s, i);
+    if c == 63 { return va_fnmatch_at(s, i + 1, p, j + 1); }
+    if c == 91 {
+        // [seq], [!seq]; a "]" right after the opening one is literal
+        var k2: i64 = j + 1;
+        var neg: bool = false;
+        if k2 < str_len(p) && str_byte_at(p, k2) == 33 {
+            neg = true;
+            k2 = k2 + 1;
+        }
+        var start: i64 = k2;
+        if k2 < str_len(p) && str_byte_at(p, k2) == 93 { k2 = k2 + 1; }
+        while k2 < str_len(p) && str_byte_at(p, k2) != 93 { k2 = k2 + 1; }
+        if k2 >= str_len(p) {
+            // no closing "]": a literal "["
+            return ch == 91 && va_fnmatch_at(s, i + 1, p, j + 1);
+        }
+        var hit: bool = false;
+        var q: i64 = start;
+        while q < k2 {
+            val a: i64 = str_byte_at(p, q);
+            if q + 2 < k2 && str_byte_at(p, q + 1) == 45 {
+                if ch >= a && ch <= str_byte_at(p, q + 2) { hit = true; }
+                q = q + 3;
+            } else {
+                if ch == a { hit = true; }
+                q = q + 1;
+            }
+        }
+        if hit == neg { return false; }
+        return va_fnmatch_at(s, i + 1, p, k2 + 1);
+    }
+    if ch != c { return false; }
+    return va_fnmatch_at(s, i + 1, p, j + 1);
+}
+
+/// glob.glob(pattern), in no particular order.
+fn va_glob(pattern: str) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    if str_len(pattern) == 0 { return out; }
+    if !va_magic(pattern) {
+        if fs_exists(pattern) || fs_is_dir(pattern) { out.push(pattern); }
+        return out;
+    }
+    var k: i64 = str_len(pattern) - 1;
+    while k >= 0 && !va_is_sep(str_byte_at(pattern, k)) { k = k - 1; }
+    var dir: str = str_slice(pattern, 0, k + 1);
+    val base: str = str_slice(pattern, k + 1, str_len(pattern));
+    // the directory part without its trailing separators (but a root)
+    var dend: i64 = str_len(dir);
+    while dend > 1 && va_is_sep(str_byte_at(dir, dend - 1)) && !(dend == 3 && str_len(va_drive(dir)) == 2) { dend = dend - 1; }
+    dir = str_slice(dir, 0, dend);
+    var dirs: Vec<str> = Vec::new();
+    if str_len(dir) == 0 {
+        dirs.push("");
+    } else if va_magic(dir) {
+        val ds: Vec<str> = va_glob(dir);
+        var i: i64 = 0;
+        while i < ds.len() {
+            if fs_is_dir(ds.get(i)) { dirs.push(ds.get(i)); }
+            i = i + 1;
+        }
+    } else {
+        dirs.push(dir);
+    }
+    var d: i64 = 0;
+    while d < dirs.len() {
+        val dd: str = dirs.get(d);
+        d = d + 1;
+        if !va_magic(base) {
+            val p: str = va_join(dd, base);
+            if str_len(base) == 0 {
+                if fs_is_dir(dd) { out.push(p); }
+            } else if fs_exists(p) || fs_is_dir(p) {
+                out.push(p);
+            }
+            continue;
+        }
+        var ld: str = dd;
+        if str_len(ld) == 0 { ld = "."; }
+        if !fs_is_dir(ld) { continue; }
+        val names: Vec<str> = fs_list_dir(ld);
+        var i2: i64 = 0;
+        while i2 < names.len() {
+            val nm: str = names.get(i2);
+            i2 = i2 + 1;
+            if nm == "." || nm == ".." || str_len(nm) == 0 { continue; }
+            if str_starts_with(nm, ".") && !str_starts_with(base, ".") { continue; }
+            if va_fnmatch(nm, base) { out.push(va_join(dd, nm)); }
+        }
+    }
+    return out;
+}
+
+// ─── argparse ───
+
+struct VaOpt {
+    long: str,
+    short: str,
+    takes: bool,
+    kind: i64,
+}
+
+const VA_STR: i64 = 0;
+const VA_INT: i64 = 1;
+const VA_FLOAT: i64 = 2;
+const VA_FLAG: i64 = 3;
+const VA_HELP: i64 = 4;
+
+fn va_opt(long: str, short: str, kind: i64) -> VaOpt {
+    return VaOpt { long: long, short: short, takes: kind == VA_STR || kind == VA_INT || kind == VA_FLOAT, kind: kind };
+}
+
+/// argparse's look of a negative number: -\d+ or -\d*\.\d+
+fn va_negnum(a: str) -> bool {
+    if str_len(a) < 2 || str_byte_at(a, 0) != 45 { return false; }
+    var i: i64 = 1;
+    var dig: i64 = 0;
+    while i < str_len(a) && va_digit(str_byte_at(a, i)) {
+        i = i + 1;
+        dig = dig + 1;
+    }
+    if i == str_len(a) { return dig > 0; }
+    if str_byte_at(a, i) != 46 { return false; }
+    i = i + 1;
+    var frac: i64 = 0;
+    while i < str_len(a) && va_digit(str_byte_at(a, i)) {
+        i = i + 1;
+        frac = frac + 1;
+    }
+    return i == str_len(a) && frac > 0;
+}
+
+/// int(s) as Python reads it (whitespace, a sign, ASCII digits).
+fn va_is_int(s: str) -> bool {
+    val t: str = va_strip(s);
+    var i: i64 = 0;
+    if i < str_len(t) && (str_byte_at(t, i) == 43 || str_byte_at(t, i) == 45) { i = i + 1; }
+    if i >= str_len(t) { return false; }
+    while i < str_len(t) {
+        if !va_digit(str_byte_at(t, i)) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn va_int(s: str) -> i64 {
+    val t: str = va_strip(s);
+    if str_starts_with(t, "+") { return str_parse_int(str_slice(t, 1, str_len(t))); }
+    return str_parse_int(t);
+}
+
+/// float(s): a decimal with an optional exponent, inf, infinity or nan.
+fn va_is_float(s: str) -> bool {
+    val t: str = str_to_lower(va_strip(s));
+    var i: i64 = 0;
+    if i < str_len(t) && (str_byte_at(t, i) == 43 || str_byte_at(t, i) == 45) { i = i + 1; }
+    val rest: str = str_slice(t, i, str_len(t));
+    if rest == "inf" || rest == "infinity" || rest == "nan" { return true; }
+    var digs: i64 = 0;
+    while i < str_len(t) && va_digit(str_byte_at(t, i)) {
+        i = i + 1;
+        digs = digs + 1;
+    }
+    if i < str_len(t) && str_byte_at(t, i) == 46 {
+        i = i + 1;
+        while i < str_len(t) && va_digit(str_byte_at(t, i)) {
+            i = i + 1;
+            digs = digs + 1;
+        }
+    }
+    if digs == 0 { return false; }
+    if i < str_len(t) && str_byte_at(t, i) == 101 {
+        i = i + 1;
+        if i < str_len(t) && (str_byte_at(t, i) == 43 || str_byte_at(t, i) == 45) { i = i + 1; }
+        var ed: i64 = 0;
+        while i < str_len(t) && va_digit(str_byte_at(t, i)) {
+            i = i + 1;
+            ed = ed + 1;
+        }
+        if ed == 0 { return false; }
+    }
+    return i == str_len(t);
+}
+
+fn va_float(s: str) -> f64 {
+    val t: str = str_to_lower(va_strip(s));
+    if str_contains(t, "inf") {
+        if str_starts_with(t, "-") { return 0.0 - 1.0e308 * 10.0; }
+        return 1.0e308 * 10.0;
+    }
+    if str_contains(t, "nan") {
+        val z: f64 = 0.0;
+        return z / z;
+    }
+    return str_parse_float(t);
+}
+
+/// -1 none, -2 ambiguous (msg set), else the option's index.
+fn va_find_opt(opts: Vec<VaOpt>, a: str, msg: &mut str, explicit: &mut str, has_explicit: &mut bool) -> i64 {
+    *has_explicit = false;
+    *explicit = "";
+    var i: i64 = 0;
+    while i < opts.len() {
+        if opts.get(i).long == a || (str_len(opts.get(i).short) > 0 && opts.get(i).short == a) { return i; }
+        i = i + 1;
+    }
+    if str_len(a) < 2 || str_byte_at(a, 0) != 45 { return -1; }
+    val eq: i64 = str_find(a, "=");
+    if eq > 0 {
+        val name: str = str_slice(a, 0, eq);
+        i = 0;
+        while i < opts.len() {
+            if opts.get(i).long == name || (str_len(opts.get(i).short) > 0 && opts.get(i).short == name) {
+                *explicit = str_slice(a, eq + 1, str_len(a));
+                *has_explicit = true;
+                return i;
+            }
+            i = i + 1;
+        }
+    }
+    if str_starts_with(a, "--") {
+        var prefix: str = a;
+        if eq > 0 { prefix = str_slice(a, 0, eq); }
+        var hits: Vec<i64> = Vec::new();
+        i = 0;
+        while i < opts.len() {
+            if str_starts_with(opts.get(i).long, prefix) { hits.push(i); }
+            i = i + 1;
+        }
+        if hits.len() > 1 {
+            var names: str = "";
+            var k: i64 = 0;
+            while k < hits.len() {
+                if k > 0 { names = names + ", "; }
+                names = names + opts.get(hits.get(k)).long;
+                k = k + 1;
+            }
+            *msg = "ambiguous option: " + a + " could match " + names;
+            return -2;
+        }
+        if hits.len() == 1 {
+            if eq > 0 {
+                *explicit = str_slice(a, eq + 1, str_len(a));
+                *has_explicit = true;
+            }
+            return hits.get(0);
+        }
+        return -1;
+    }
+    // a short option with its value glued on (-j4)
+    val two: str = str_slice(a, 0, 2);
+    i = 0;
+    while i < opts.len() {
+        if str_len(opts.get(i).short) > 0 && opts.get(i).short == two {
+            *explicit = str_slice(a, 2, str_len(a));
+            *has_explicit = true;
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// ─── The command line ───
+
+fn va_usage() -> str {
+    var u: str = "usage: variants.py [-h] [--fid FID] [--tree TREE] [--tests TESTS] [--gen GEN]\n";
+    u = u + "                   [--sample SAMPLE] [--out OUT] [--only ONLY]\n";
+    u = u + "                   [--backends BACKENDS] [--prune-stats]\n";
+    u = u + "                   [--prune-check PRUNE_CHECK] [--resume] [--no-fail-tests]\n";
+    u = u + "                   [--build-only] [-j J]\n";
+    u = u + "                   {toggle,mutate,list,check}\n";
+    return u;
+}
+
+fn va_help() -> str {
+    var h: str = va_usage() + "\npositional arguments:\n  {toggle,mutate,list,check}\n\noptions:\n";
+    h = h + "  -h, --help            show this help message and exit\n";
+    h = h + "  --fid FID\n";
+    h = h + "  --tree TREE\n";
+    h = h + "  --tests TESTS\n";
+    h = h + "  --gen GEN\n";
+    h = h + "  --sample SAMPLE       a random sample of this many --tests files\n";
+    h = h + "  --out OUT\n";
+    h = h + "  --only ONLY           variant names, comma-separated; shell patterns too\n";
+    h = h + "                        ('iropt-*', 'peir-*')\n";
+    h = h + "  --backends BACKENDS   only these backends of each variant (emit, nat,\n";
+    h = h + "                        ccompile)\n";
+    h = h + "  --prune-stats         skip a FID_IROPT_OFF variant's build where the base's\n";
+    h = h + "                        FID_IROPT_STATS says the pass changed no function\n";
+    h = h + "                        (checked on --prune-check of them)\n";
+    h = h + "  --prune-check PRUNE_CHECK\n";
+    h = h + "  --resume              keep each result in <out>/<cmd>-results.jsonl and skip\n";
+    h = h + "                        the ones already there (same base compiler): a long\n";
+    h = h + "                        run in several sittings\n";
+    h = h + "  --no-fail-tests       leave out *_fail.fd (rejected by both compilers:\n";
+    h = h + "                        nothing to compare)\n";
+    h = h + "  --build-only\n";
+    h = h + "  -j J\n";
+    return h;
+}
+
+fn va_ap_error(msg: str) -> i64 {
+    io_eprint(va_usage());
+    io_eprintln("variants.py: error: " + msg);
+    return 2;
+}
+
+struct VaArgs {
+    vals: Vec<str>,
+    given: Vec<bool>,
+    code: i64,
+    cmd: str,
+}
+
+fn va_parse(argv: Vec<str>, opts: Vec<VaOpt>) -> VaArgs {
+    var vals: Vec<str> = Vec::new();
+    var given: Vec<bool> = Vec::new();
+    var i: i64 = 0;
+    while i < opts.len() {
+        vals.push("");
+        given.push(false);
+        i = i + 1;
+    }
+    var kinds: Vec<i64> = Vec::new();
+    var idx: Vec<i64> = Vec::new();
+    var expl: Vec<str> = Vec::new();
+    var hexp: Vec<bool> = Vec::new();
+    var dashdash: bool = false;
+    i = 0;
+    while i < argv.len() {
+        val a: str = argv.get(i);
+        i = i + 1;
+        var msg: str = "";
+        var ex: str = "";
+        var he: bool = false;
+        if dashdash || a == "-" || !str_starts_with(a, "-") {
+            kinds.push(0);
+            idx.push(-1);
+            expl.push("");
+            hexp.push(false);
+            continue;
+        }
+        if a == "--" {
+            dashdash = true;
+            kinds.push(2);
+            idx.push(-1);
+            expl.push("");
+            hexp.push(false);
+            continue;
+        }
+        val f: i64 = va_find_opt(opts, a, &mut msg, &mut ex, &mut he);
+        if f == -2 {
+            return VaArgs { vals: vals, given: given, code: va_ap_error(msg), cmd: "" };
+        }
+        if f < 0 && (va_negnum(a) || str_contains(a, " ")) {
+            kinds.push(0);
+        } else {
+            kinds.push(1);
+        }
+        idx.push(f);
+        expl.push(ex);
+        hexp.push(he);
+    }
+    var extras: Vec<str> = Vec::new();
+    var cmd: str = "";
+    var have_cmd: bool = false;
+    i = 0;
+    while i < argv.len() {
+        val a2: str = argv.get(i);
+        val kd: i64 = kinds.get(i);
+        val f2: i64 = idx.get(i);
+        i = i + 1;
+        if kd == 2 { continue; }
+        if kd == 0 {
+            if !have_cmd {
+                if a2 != "toggle" && a2 != "mutate" && a2 != "list" && a2 != "check" {
+                    return VaArgs { vals: vals, given: given, cmd: "",
+                        code: va_ap_error("argument cmd: invalid choice: " + va_repr(a2) + " (choose from toggle, mutate, list, check)") };
+                }
+                cmd = a2;
+                have_cmd = true;
+            } else {
+                extras.push(a2);
+            }
+            continue;
+        }
+        if f2 < 0 {
+            extras.push(a2);
+            continue;
+        }
+        val o: VaOpt = opts.get(f2);
+        var name: str = o.long;
+        if str_len(o.long) == 0 { name = o.short; } else if str_len(o.short) > 0 { name = o.short + "/" + o.long; }
+        if o.kind == VA_HELP {
+            io_print(va_help());
+            return VaArgs { vals: vals, given: given, code: 0, cmd: "" };
+        }
+        if !o.takes {
+            if hexp.get(i - 1) {
+                return VaArgs { vals: vals, given: given, cmd: "",
+                    code: va_ap_error("argument " + name + ": ignored explicit argument " + va_repr(expl.get(i - 1))) };
+            }
+            given.set(f2, true);
+            vals.set(f2, "1");
+            continue;
+        }
+        var v: str = "";
+        if hexp.get(i - 1) {
+            v = expl.get(i - 1);
+        } else {
+            if i >= argv.len() || kinds.get(i) != 0 {
+                return VaArgs { vals: vals, given: given, code: va_ap_error("argument " + name + ": expected one argument"), cmd: "" };
+            }
+            v = argv.get(i);
+            i = i + 1;
+        }
+        if o.kind == VA_INT && !va_is_int(v) {
+            return VaArgs { vals: vals, given: given, code: va_ap_error("argument " + name + ": invalid int value: " + va_repr(v)), cmd: "" };
+        }
+        if o.kind == VA_FLOAT && !va_is_float(v) {
+            return VaArgs { vals: vals, given: given, code: va_ap_error("argument " + name + ": invalid float value: " + va_repr(v)), cmd: "" };
+        }
+        given.set(f2, true);
+        vals.set(f2, v);
+    }
+    if !have_cmd {
+        return VaArgs { vals: vals, given: given, code: va_ap_error("the following arguments are required: cmd"), cmd: "" };
+    }
+    if extras.len() > 0 {
+        var s: str = "";
+        var k: i64 = 0;
+        while k < extras.len() {
+            if k > 0 { s = s + " "; }
+            s = s + extras.get(k);
+            k = k + 1;
+        }
+        return VaArgs { vals: vals, given: given, code: va_ap_error("unrecognized arguments: " + s), cmd: "" };
+    }
+    return VaArgs { vals: vals, given: given, code: -1, cmd: cmd };
+}
+
+fn va_opts() -> Vec<VaOpt> {
+    var o: Vec<VaOpt> = Vec::new();
+    o.push(va_opt("--fid", "", VA_STR));             // 0
+    o.push(va_opt("--tree", "", VA_STR));            // 1
+    o.push(va_opt("--tests", "", VA_STR));           // 2
+    o.push(va_opt("--gen", "", VA_INT));             // 3
+    o.push(va_opt("--sample", "", VA_INT));          // 4
+    o.push(va_opt("--out", "", VA_STR));             // 5
+    o.push(va_opt("--only", "", VA_STR));            // 6
+    o.push(va_opt("--backends", "", VA_STR));        // 7
+    o.push(va_opt("--prune-stats", "", VA_FLAG));    // 8
+    o.push(va_opt("--prune-check", "", VA_FLOAT));   // 9
+    o.push(va_opt("--resume", "", VA_FLAG));         // 10
+    o.push(va_opt("--no-fail-tests", "", VA_FLAG));  // 11
+    o.push(va_opt("--build-only", "", VA_FLAG));     // 12
+    o.push(va_opt("", "-j", VA_INT));                // 13
+    o.push(va_opt("--help", "-h", VA_HELP));         // 14
+    return o;
+}
+
+fn va_val(a: &VaArgs, i: i64, def: str) -> str {
+    if a.given.get(i) { return a.vals.get(i); }
+    return def;
+}
+
+// ─── The variants ───
+
+/// One toggle or mutant: kind "env" (how: a FID_IROPT_OFF pass, or
+/// "VAR=value") or "const" (an edit of `file`: `from` -> `to`).
+struct VaVariant {
+    name: str,
+    kind: str,
+    how: str,
+    file: str,
+    from: str,
+    to: str,
+    backends: Vec<str>,
+}
+
+fn va_b1(a: str) -> Vec<str> {
+    var v: Vec<str> = Vec::new();
+    v.push(a);
+    return v;
+}
+
+fn va_b2(a: str, b: str) -> Vec<str> {
+    var v: Vec<str> = Vec::new();
+    v.push(a);
+    v.push(b);
+    return v;
+}
+
+fn va_env(name: str, how: str, b: Vec<str>) -> VaVariant {
+    return VaVariant { name: name, kind: "env", how: how, file: "", from: "", to: "", backends: b };
+}
+
+fn va_const(name: str, file: str, from: str, to: str, b: Vec<str>) -> VaVariant {
+    return VaVariant { name: name, kind: "const", how: "", file: file, from: from, to: to, backends: b };
+}
+
+/// Python's repr() of a list of str: ['emit', 'nat']
+fn va_list_repr(v: Vec<str>) -> str {
+    var s: str = "[";
+    var i: i64 = 0;
+    while i < v.len() {
+        if i > 0 { s = s + ", "; }
+        s = s + va_repr(v.get(i));
+        i = i + 1;
+    }
+    return s + "]";
+}
+
+fn va_comma(v: Vec<str>) -> str {
+    var s: str = "";
+    var i: i64 = 0;
+    while i < v.len() {
+        if i > 0 { s = s + ","; }
+        s = s + v.get(i);
+        i = i + 1;
+    }
+    return s;
+}
+
+/// re.findall(fn + r'\("([a-z0-9_]+)"\)', src)
+fn va_findall(src: str, fname: str, out: &mut Vec<str>) {
+    val pre: str = fname + "(\"";
+    var i: i64 = str_find(src, pre);
+    while i >= 0 {
+        val a: i64 = i + str_len(pre);
+        var k: i64 = a;
+        while k < str_len(src) {
+            val c: i64 = str_byte_at(src, k);
+            if !((c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 95) { break; }
+            k = k + 1;
+        }
+        var next: i64 = i + 1;
+        if k > a && va_at(src, k, "\")") {
+            out.push(str_slice(src, a, k));
+            next = k + 2;
+        }
+        val rest: i64 = str_find(str_slice(src, next, str_len(src)), pre);
+        if rest < 0 {
+            i = -1;
+        } else {
+            i = next + rest;
+        }
+    }
+}
+
+fn va_uniq_sorted(v: Vec<str>) -> Vec<str> {
+    var seen: HashMap<str, i64> = HashMap::new();
+    var out: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < v.len() {
+        if !seen.contains(v.get(i)) {
+            seen.insert(v.get(i), 1);
+            out.push(v.get(i));
+        }
+        i = i + 1;
+    }
+    va_sort(&mut out);
+    return out;
+}
+
+/// switches_of: the run-time switches the tree's compiler reads.
+fn va_switches_of(tree: str) -> Vec<VaVariant> {
+    var files: Vec<str> = va_glob(va_join(va_join(tree, "compiler"), "*.fd"));
+    va_sort(&mut files);
+    var sb: StringBuilder = StringBuilder::new();
+    var i: i64 = 0;
+    while i < files.len() {
+        match va_read_text(files.get(i)) {
+            Option::Some(t) => { sb.append_str(t); }
+            Option::None => { }
+        }
+        i = i + 1;
+    }
+    val src: str = sb.to_str();
+    // IME_DEFAULT_ON: the mid-end passes on by default
+    var default_on: Vec<str> = Vec::new();
+    val dpre: str = "const IME_DEFAULT_ON: str = \"";
+    var dk: i64 = str_find(src, dpre);
+    while dk >= 0 {
+        val a: i64 = dk + str_len(dpre);
+        var e: i64 = a;
+        while e < str_len(src) {
+            val c: i64 = str_byte_at(src, e);
+            if !((c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 95 || c == 44) { break; }
+            e = e + 1;
+        }
+        if e < str_len(src) && str_byte_at(src, e) == 34 {
+            val parts: Vec<str> = va_split(str_slice(src, a, e), ",");
+            var p: i64 = 0;
+            while p < parts.len() {
+                if str_len(parts.get(p)) > 0 { default_on.push(parts.get(p)); }
+                p = p + 1;
+            }
+            break;
+        }
+        val rest: i64 = str_find(str_slice(src, dk + 1, str_len(src)), dpre);
+        if rest < 0 { dk = -1; } else { dk = dk + 1 + rest; }
+    }
+    var don: HashMap<str, i64> = HashMap::new();
+    i = 0;
+    while i < default_on.len() {
+        don.insert(default_on.get(i), 1);
+        i = i + 1;
+    }
+    // a pass_on switch is opt-in (left out) only when every line that
+    // reads it also asks ime_on for passes none of which is on by default
+    var active: HashMap<str, i64> = HashMap::new();
+    val lines: Vec<str> = va_split(src, "\n");
+    i = 0;
+    while i < lines.len() {
+        val line: str = lines.get(i);
+        i = i + 1;
+        if !str_contains(line, "iro_pass_on(\"") { continue; }
+        var gates: Vec<str> = Vec::new();
+        va_findall(line, "ime_on", &mut gates);
+        if gates.len() > 0 {
+            var any: bool = false;
+            var g: i64 = 0;
+            while g < gates.len() {
+                if don.contains(gates.get(g)) { any = true; }
+                g = g + 1;
+            }
+            if !any { continue; }
+        }
+        var ps: Vec<str> = Vec::new();
+        va_findall(line, "iro_pass_on", &mut ps);
+        var k: i64 = 0;
+        while k < ps.len() {
+            active.insert(ps.get(k), 1);
+            k = k + 1;
+        }
+    }
+    var all_pass: Vec<str> = Vec::new();
+    va_findall(src, "iro_pass_on", &mut all_pass);
+    var names: Vec<str> = Vec::new();
+    i = 0;
+    while i < all_pass.len() {
+        if active.contains(all_pass.get(i)) { names.push(all_pass.get(i)); }
+        i = i + 1;
+    }
+    i = 0;
+    while i < default_on.len() {
+        names.push(default_on.get(i));
+        i = i + 1;
+    }
+    val pass_names: Vec<str> = va_uniq_sorted(names);
+    var out: Vec<VaVariant> = Vec::new();
+    i = 0;
+    while i < pass_names.len() {
+        out.push(va_env("iropt-" + pass_names.get(i), pass_names.get(i), va_b2("emit", "nat")));
+        i = i + 1;
+    }
+    var nat: Vec<str> = Vec::new();
+    va_findall(src, "ng_on", &mut nat);
+    va_findall(src, "ru_on", &mut nat);
+    va_findall(src, "eg_on", &mut nat);
+    val nat_names: Vec<str> = va_uniq_sorted(nat);
+    i = 0;
+    while i < nat_names.len() {
+        out.push(va_env("nat-" + nat_names.get(i), "FID_NAT_OFF=" + nat_names.get(i), va_b1("nat")));
+        i = i + 1;
+    }
+    return out;
+}
+
+// ─── random.Random(1).sample (Mersenne Twister, as CPython) ───
+
+var va_mt: Vec<i64> = Vec::new();
+var va_mti: i64 = 625;
+
+fn va_mt_init(s: i64) {
+    va_mt = Vec::new();
+    va_mt.push(s & 4294967295);
+    var i: i64 = 1;
+    while i < 624 {
+        val p: i64 = va_mt.get(i - 1);
+        va_mt.push((1812433253 * (p ^ (p >> 30)) + i) & 4294967295);
+        i = i + 1;
+    }
+    va_mti = 624;
+}
+
+/// seed(n) for a non-negative n below 2^32: init_by_array([n])
+fn va_mt_seed(n: i64) {
+    va_mt_init(19650218);
+    var i: i64 = 1;
+    var k: i64 = 624;
+    while k > 0 {
+        val p: i64 = va_mt.get(i - 1);
+        va_mt.set(i, ((va_mt.get(i) ^ ((p ^ (p >> 30)) * 1664525)) + n) & 4294967295);
+        i = i + 1;
+        if i >= 624 {
+            va_mt.set(0, va_mt.get(623));
+            i = 1;
+        }
+        k = k - 1;
+    }
+    k = 623;
+    while k > 0 {
+        val p2: i64 = va_mt.get(i - 1);
+        va_mt.set(i, ((va_mt.get(i) ^ ((p2 ^ (p2 >> 30)) * 1566083941)) - i) & 4294967295);
+        i = i + 1;
+        if i >= 624 {
+            va_mt.set(0, va_mt.get(623));
+            i = 1;
+        }
+        k = k - 1;
+    }
+    va_mt.set(0, 2147483648);
+    va_mti = 624;
+}
+
+fn va_mt_next() -> i64 {
+    if va_mti >= 624 {
+        var kk: i64 = 0;
+        while kk < 623 {
+            val y: i64 = (va_mt.get(kk) & 2147483648) | (va_mt.get(kk + 1) & 2147483647);
+            var mag: i64 = 0;
+            if (y & 1) == 1 { mag = 2567483615; }
+            var src: i64 = kk + 397;
+            if src >= 624 { src = src - 624; }
+            va_mt.set(kk, va_mt.get(src) ^ (y >> 1) ^ mag);
+            kk = kk + 1;
+        }
+        val y2: i64 = (va_mt.get(623) & 2147483648) | (va_mt.get(0) & 2147483647);
+        var mag2: i64 = 0;
+        if (y2 & 1) == 1 { mag2 = 2567483615; }
+        va_mt.set(623, va_mt.get(396) ^ (y2 >> 1) ^ mag2);
+        va_mti = 0;
+    }
+    var y3: i64 = va_mt.get(va_mti);
+    va_mti = va_mti + 1;
+    y3 = y3 ^ (y3 >> 11);
+    y3 = y3 ^ ((y3 << 7) & 2636928640);
+    y3 = y3 ^ ((y3 << 15) & 4022730752);
+    y3 = y3 ^ (y3 >> 18);
+    return y3 & 4294967295;
+}
+
+fn va_randbelow(n: i64) -> i64 {
+    var k: i64 = 0;
+    var m: i64 = n;
+    while m > 0 {
+        k = k + 1;
+        m = m >> 1;
+    }
+    var r: i64 = va_mt_next() >> (32 - k);
+    while r >= n { r = va_mt_next() >> (32 - k); }
+    return r;
+}
+
+/// The indexes random.Random(1).sample(range(n), k) picks.
+fn va_sample(n: i64, k: i64) -> Vec<i64> {
+    va_mt_seed(1);
+    var result: Vec<i64> = Vec::new();
+    var setsize: i64 = 21;
+    if k > 5 {
+        var p: i64 = 1;
+        while p <= 3 * k { p = p * 4; }
+        setsize = setsize + p;
+    }
+    if n <= setsize {
+        var pool: Vec<i64> = Vec::new();
+        var i: i64 = 0;
+        while i < n {
+            pool.push(i);
+            i = i + 1;
+        }
+        i = 0;
+        while i < k {
+            val j: i64 = va_randbelow(n - i);
+            result.push(pool.get(j));
+            pool.set(j, pool.get(n - i - 1));
+            i = i + 1;
+        }
+        return result;
+    }
+    var selected: HashMap<str, i64> = HashMap::new();
+    var i2: i64 = 0;
+    while i2 < k {
+        var j2: i64 = va_randbelow(n);
+        while selected.contains(int_to_str(j2)) { j2 = va_randbelow(n); }
+        selected.insert(int_to_str(j2), 1);
+        result.push(j2);
+        i2 = i2 + 1;
+    }
+    return result;
+}
+
+// ─── JSON (json.dumps / json.loads of the --resume lines) ───
+
+fn va_json_str(s: str) -> str {
+    var out: StringBuilder = StringBuilder::new();
+    out.append_str("\"");
+    val b: Vec<i64> = str_bytes(s);
+    var i: i64 = 0;
+    while i < b.len() {
+        val c: i64 = b.get(i);
+        if c == 34 {
+            out.append_str("\\\"");
+            i = i + 1;
+        } else if c == 92 {
+            out.append_str("\\\\");
+            i = i + 1;
+        } else if c == 10 {
+            out.append_str("\\n");
+            i = i + 1;
+        } else if c == 13 {
+            out.append_str("\\r");
+            i = i + 1;
+        } else if c == 9 {
+            out.append_str("\\t");
+            i = i + 1;
+        } else if c == 8 {
+            out.append_str("\\b");
+            i = i + 1;
+        } else if c == 12 {
+            out.append_str("\\f");
+            i = i + 1;
+        } else if c < 32 {
+            out.append_str("\\u" + va_hex(c, 4));
+            i = i + 1;
+        } else if c < 128 {
+            out.append_char(c);
+            i = i + 1;
+        } else {
+            // a UTF-8 sequence: its code point as \uXXXX (a pair above FFFF)
+            var cp: i64 = 65533;
+            var len: i64 = 1;
+            if c >= 192 && c < 224 && i + 1 < b.len() {
+                cp = ((c & 31) << 6) | (b.get(i + 1) & 63);
+                len = 2;
+            } else if c >= 224 && c < 240 && i + 2 < b.len() {
+                cp = ((c & 15) << 12) | ((b.get(i + 1) & 63) << 6) | (b.get(i + 2) & 63);
+                len = 3;
+            } else if c >= 240 && i + 3 < b.len() {
+                cp = ((c & 7) << 18) | ((b.get(i + 1) & 63) << 12) | ((b.get(i + 2) & 63) << 6) | (b.get(i + 3) & 63);
+                len = 4;
+            }
+            if cp >= 65536 {
+                val v: i64 = cp - 65536;
+                out.append_str("\\u" + va_hex(55296 + (v >> 10), 4) + "\\u" + va_hex(56320 + (v & 1023), 4));
+            } else {
+                out.append_str("\\u" + va_hex(cp, 4));
+            }
+            i = i + len;
+        }
+    }
+    out.append_str("\"");
+    return out.to_str();
+}
+
+/// A flat JSON object: its keys, and each value's kind (0 string, 1 true,
+/// 2 false, 3 null, 4 number or other) and text.
+struct VaJson {
+    keys: Vec<str>,
+    kinds: Vec<i64>,
+    vals: Vec<str>,
+}
+
+fn va_utf8(cp: i64) -> str {
+    var b: Vec<i64> = Vec::new();
+    if cp < 128 {
+        b.push(cp);
+    } else if cp < 2048 {
+        b.push(192 | (cp >> 6));
+        b.push(128 | (cp & 63));
+    } else if cp < 65536 {
+        b.push(224 | (cp >> 12));
+        b.push(128 | ((cp >> 6) & 63));
+        b.push(128 | (cp & 63));
+    } else {
+        b.push(240 | (cp >> 18));
+        b.push(128 | ((cp >> 12) & 63));
+        b.push(128 | ((cp >> 6) & 63));
+        b.push(128 | (cp & 63));
+    }
+    return str_from_bytes(b);
+}
+
+/// A JSON string at s[i] (a quote): its text; `end` the index after it,
+/// -1 when it is not one.
+fn va_json_read_str(s: str, i: i64, end: &mut i64) -> str {
+    *end = -1;
+    if i >= str_len(s) || str_byte_at(s, i) != 34 { return ""; }
+    var out: StringBuilder = StringBuilder::new();
+    var k: i64 = i + 1;
+    while k < str_len(s) {
+        val c: i64 = str_byte_at(s, k);
+        if c == 34 {
+            *end = k + 1;
+            return out.to_str();
+        }
+        if c == 92 {
+            if k + 1 >= str_len(s) { return ""; }
+            val e: i64 = str_byte_at(s, k + 1);
+            if e == 110 {
+                out.append_str("\n");
+            } else if e == 116 {
+                out.append_str("\t");
+            } else if e == 114 {
+                out.append_str("\r");
+            } else if e == 98 {
+                out.append_char(8);
+            } else if e == 102 {
+                out.append_char(12);
+            } else if e == 117 {
+                if k + 6 > str_len(s) { return ""; }
+                var cp: i64 = str_parse_hex(str_slice(s, k + 2, k + 6));
+                k = k + 6;
+                if cp >= 55296 && cp < 56320 && va_at(s, k, "\\u") && k + 6 <= str_len(s) {
+                    val lo: i64 = str_parse_hex(str_slice(s, k + 2, k + 6));
+                    if lo >= 56320 && lo < 57344 {
+                        cp = 65536 + ((cp - 55296) << 10) + (lo - 56320);
+                        k = k + 6;
+                    }
+                }
+                out.append_str(va_utf8(cp));
+                continue;
+            } else {
+                out.append_char(e);
+            }
+            k = k + 2;
+            continue;
+        }
+        if c < 32 { return ""; }
+        out.append_char(c);
+        k = k + 1;
+    }
+    return "";
+}
+
+fn va_json_parse(line: str, ok: &mut bool) -> VaJson {
+    var j: VaJson = VaJson { keys: Vec::new(), kinds: Vec::new(), vals: Vec::new() };
+    *ok = false;
+    val s: str = va_strip(line);
+    if str_len(s) < 2 || str_byte_at(s, 0) != 123 { return j; }
+    var i: i64 = va_skip_ws(s, 1);
+    if i < str_len(s) && str_byte_at(s, i) == 125 {
+        *ok = va_skip_ws(s, i + 1) == str_len(s);
+        return j;
+    }
+    while i < str_len(s) {
+        var end: i64 = -1;
+        val key: str = va_json_read_str(s, i, &mut end);
+        if end < 0 { return j; }
+        i = va_skip_ws(s, end);
+        if i >= str_len(s) || str_byte_at(s, i) != 58 { return j; }
+        i = va_skip_ws(s, i + 1);
+        if i >= str_len(s) { return j; }
+        var kind: i64 = 4;
+        var val_: str = "";
+        if str_byte_at(s, i) == 34 {
+            val_ = va_json_read_str(s, i, &mut end);
+            if end < 0 { return j; }
+            kind = 0;
+            i = end;
+        } else if va_at(s, i, "true") {
+            kind = 1;
+            i = i + 4;
+        } else if va_at(s, i, "false") {
+            kind = 2;
+            i = i + 5;
+        } else if va_at(s, i, "null") {
+            kind = 3;
+            i = i + 4;
+        } else {
+            val st: i64 = i;
+            while i < str_len(s) && (va_digit(str_byte_at(s, i)) || str_byte_at(s, i) == 45 || str_byte_at(s, i) == 46
+                    || str_byte_at(s, i) == 43 || str_byte_at(s, i) == 101 || str_byte_at(s, i) == 69) {
+                i = i + 1;
+            }
+            if i == st { return j; }
+            val_ = str_slice(s, st, i);
+        }
+        // a key given twice keeps its last value, in its first place
+        var at: i64 = -1;
+        var q: i64 = 0;
+        while q < j.keys.len() {
+            if j.keys.get(q) == key { at = q; }
+            q = q + 1;
+        }
+        if at >= 0 {
+            j.kinds.set(at, kind);
+            j.vals.set(at, val_);
+        } else {
+            j.keys.push(key);
+            j.kinds.push(kind);
+            j.vals.push(val_);
+        }
+        i = va_skip_ws(s, i);
+        if i >= str_len(s) { return j; }
+        if str_byte_at(s, i) == 125 {
+            *ok = va_skip_ws(s, i + 1) == str_len(s);
+            return j;
+        }
+        if str_byte_at(s, i) != 44 { return j; }
+        i = va_skip_ws(s, i + 1);
+    }
+    return j;
+}
+
+fn va_json_find(j: &VaJson, key: str) -> i64 {
+    var i: i64 = 0;
+    while i < j.keys.len() {
+        if j.keys.get(i) == key { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// Python's truth of a JSON value.
+fn va_json_truthy(j: &VaJson, at: i64) -> bool {
+    if at < 0 { return false; }
+    val k: i64 = j.kinds.get(at);
+    if k == 0 { return str_len(j.vals.get(at)) > 0; }
+    if k == 1 { return true; }
+    if k == 4 { return str_parse_float(j.vals.get(at)) != 0.0; }
+    return false;
+}
+
+// ─── Running programs ───
+
+var va_scratch: str = "";
+var va_run_ctr: i64 = 0;
+
+/// The text Python's bytes.decode("utf-8", "replace") gives, as UTF-8 (a
+/// NUL as C0 80, which a str can hold).
+fn va_decode(b: Vec<i64>) -> str {
+    var out: Vec<i64> = Vec::new();
+    val n: i64 = b.len();
+    var i: i64 = 0;
+    while i < n {
+        val c: i64 = b.get(i);
+        if c == 0 {
+            out.push(192);
+            out.push(128);
+            i = i + 1;
+            continue;
+        }
+        if c < 128 {
+            out.push(c);
+            i = i + 1;
+            continue;
+        }
+        var need: i64 = 0;
+        var lo: i64 = 128;
+        var hi: i64 = 191;
+        if c >= 194 && c <= 223 {
+            need = 1;
+        } else if c >= 224 && c <= 239 {
+            need = 2;
+            if c == 224 { lo = 160; }
+            if c == 237 { hi = 159; }
+        } else if c >= 240 && c <= 244 {
+            need = 3;
+            if c == 240 { lo = 144; }
+            if c == 244 { hi = 143; }
+        } else {
+            out.push(239);
+            out.push(191);
+            out.push(189);
+            i = i + 1;
+            continue;
+        }
+        var j: i64 = 1;
+        var ok: bool = true;
+        while j <= need {
+            if i + j >= n {
+                ok = false;
+                break;
+            }
+            val d: i64 = b.get(i + j);
+            var l: i64 = 128;
+            var h: i64 = 191;
+            if j == 1 {
+                l = lo;
+                h = hi;
+            }
+            if d < l || d > h {
+                ok = false;
+                break;
+            }
+            j = j + 1;
+        }
+        if ok {
+            var k: i64 = 0;
+            while k <= need {
+                out.push(b.get(i + k));
+                k = k + 1;
+            }
+            i = i + need + 1;
+        } else {
+            out.push(239);
+            out.push(191);
+            out.push(189);
+            i = i + j;
+        }
+    }
+    return str_from_bytes(out);
+}
+
+/// len() of text va_decode made: its code points.
+fn va_chars(s: str) -> i64 {
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while i < str_len(s) {
+        if (str_byte_at(s, i) & 192) != 128 { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+
+/// What run() gives: the exit status ("timeout" when it took too long),
+/// stdout ("\r\n" as "\n") and stderr, both decoded.
+struct VaRun {
+    rc: str,
+    out: str,
+    err: str,
+}
+
+fn va_join_list(v: Vec<str>) -> str {
+    val sep: str = char_to_str(31);
+    var s: str = "";
+    var i: i64 = 0;
+    while i < v.len() {
+        if i > 0 { s = s + sep; }
+        s = s + v.get(i);
+        i = i + 1;
+    }
+    return s;
+}
+
+/// run(cmd, env, timeout): stdin closed, stdout and stderr captured; `env`
+/// is "NAME=value" entries added to our environment.
+fn va_run(cmd: Vec<str>, env: Vec<str>, timeout_s: i64) -> VaRun {
+    va_run_ctr = va_run_ctr + 1;
+    val base: str = va_join(va_scratch, ".run-" + int_to_str(p_getpid()) + "-" + int_to_str(va_run_ctr));
+    val outp: str = base + ".out";
+    val errp: str = base + ".err";
+    val a: str = va_join_list(cmd);
+    val e: str = va_join_list(env);
+    val f: str = outp + char_to_str(31) + errp;
+    val d: str = "";
+    var h: i64 = 0;
+    if cmd.len() > 0 && str_len(cmd.get(0)) > 0 {
+        // SAFETY: a, e, d and f are NUL-terminated strings held by locals
+        // until the call returns; the runtime copies what the child needs.
+        // io 1: the child's stdin is a pipe, closed at once (end of input).
+        unsafe {
+            h = fid_proc_spawn_io(a as i64, e as i64, d as i64, f as i64, 1);
+        }
+    }
+    if h == 0 {
+        if fs_exists(outp) { fs_delete(outp); }
+        if fs_exists(errp) { fs_delete(errp); }
+        return VaRun { rc: "127", out: "", err: "cannot start " + cmd.get(0) };
+    }
+    process_close_stdin(h);
+    var rc: str = "";
+    match process_wait(h, timeout_s * 1000) {
+        Option::Some(c) => {
+            var code: i64 = c;
+            if code < 0 && va_win() { code = code + 4294967296; }
+            rc = int_to_str(code);
+        }
+        Option::None => {
+            process_kill(h);
+            process_wait(h, 10000);
+            rc = "timeout";
+        }
+    }
+    process_release(h);
+    var out: str = "";
+    var err: str = "";
+    if rc != "timeout" {
+        out = str_replace(va_decode(fs_read_bytes(outp)), "\r\n", "\n");
+        err = va_decode(fs_read_bytes(errp));
+    }
+    if fs_exists(outp) { fs_delete(outp); }
+    if fs_exists(errp) { fs_delete(errp); }
+    return VaRun { rc: rc, out: out, err: err };
+}
+
+fn va_run1(exe: str, timeout_s: i64) -> VaRun {
+    var c: Vec<str> = Vec::new();
+    c.push(exe);
+    return va_run(c, Vec::new(), timeout_s);
+}
+
+var va_host: str = "";
+
+/// sys.platform.startswith("linux")
+fn va_linux() -> bool {
+    if str_len(va_host) == 0 {
+        va_host = "other";
+        if va_win() {
+            va_host = "win";
+        } else {
+            var un: Vec<str> = Vec::new();
+            un.push("uname");
+            un.push("-s");
+            if va_strip(process_run_argv(un, Vec::new(), "", 10000).output) == "Linux" { va_host = "linux"; }
+        }
+    }
+    return va_host == "linux";
+}
+
+fn va_build_cmd(fid: str, backend: str, test: str, exe: str) -> Vec<str> {
+    var c: Vec<str> = Vec::new();
+    c.push(fid);
+    if backend == "nat" {
+        // the machine layer: --nat on Windows, the Linux x86-64 target here
+        c.push("emit");
+        c.push(test);
+        if va_win() {
+            c.push("--nat");
+        } else {
+            c.push("--target");
+            c.push("x86_64-linux");
+        }
+        c.push("-o");
+        c.push(exe);
+        return c;
+    }
+    if backend == "emit" && va_linux() {
+        c.push("emit");
+        c.push(test);
+        c.push("--target");
+        c.push("x86_64-linux");
+        c.push("-o");
+        c.push(exe);
+        return c;
+    }
+    c.push(backend);
+    c.push(test);
+    c.push("-o");
+    c.push(exe);
+    return c;
+}
+
+/// The script's RETRY_LOCK: one second attempt at a time, across the
+/// children (a directory is made only once).
+fn va_lock(dir: str) {
+    val t0: i64 = p_clock_now_ms();
+    while !fs_mkdir(dir) {
+        if p_clock_now_ms() - t0 > 900000 {
+            // left by a child that was stopped: take it over
+            fs_rmdir(dir);
+        }
+        task_sleep(50);
+    }
+}
+
+fn va_unlock(dir: str) {
+    fs_rmdir(dir);
+}
+
+/// compile_and_run: built (the compiler exited 0 and wrote the
+/// executable), and the compiler's own output (stdout then stderr).
+fn va_compile(fid: str, env: Vec<str>, backend: str, test: str, exe: str, work: str, text: &mut str) -> bool {
+    if fs_exists(exe) { fs_delete(exe); }
+    var r: VaRun = va_run(va_build_cmd(fid, backend, test, exe), env, 300);
+    if r.rc != "0" || !fs_exists(exe) {
+        // once more on its own: under load the C compiler's shared cache, or
+        // memory, fails now and then
+        val lk: str = va_join(work, ".retry-lock");
+        va_lock(lk);
+        r = va_run(va_build_cmd(fid, backend, test, exe), env, 300);
+        va_unlock(lk);
+    }
+    *text = r.out + r.err;
+    return r.rc == "0" && fs_exists(exe);
+}
+
+/// iropt_stats: {counter: total} over every `iropt: fold N, ... functions
+/// changed` line; seen false when there is none.
+struct VaStats {
+    seen: bool,
+    names: Vec<str>,
+    counts: Vec<i64>,
+}
+
+fn va_stats_add(st: &mut VaStats, name: str, n: i64) {
+    var i: i64 = 0;
+    while i < st.names.len() {
+        if st.names.get(i) == name {
+            st.counts.set(i, st.counts.get(i) + n);
+            return;
+        }
+        i = i + 1;
+    }
+    st.names.push(name);
+    st.counts.push(n);
+}
+
+fn va_isdigit(s: str) -> bool {
+    if str_len(s) == 0 { return false; }
+    var i: i64 = 0;
+    while i < str_len(s) {
+        if !va_digit(str_byte_at(s, i)) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn va_iropt_stats(text: str) -> VaStats {
+    var st: VaStats = VaStats { seen: false, names: Vec::new(), counts: Vec::new() };
+    val pre: str = "iropt: fold ";
+    val tail: str = " functions changed";
+    var i: i64 = 0;
+    while i < str_len(text) {
+        val rest: i64 = str_find(str_slice(text, i, str_len(text)), pre);
+        if rest < 0 { break; }
+        val at: i64 = i + rest;
+        val g: i64 = at + 7;
+        var k: i64 = g + 5;
+        while k < str_len(text) && va_digit(str_byte_at(text, k)) { k = k + 1; }
+        if k == g + 5 || !va_at(text, k, ", ") {
+            i = at + 1;
+            continue;
+        }
+        // the first " functions changed" on the same line
+        var q: i64 = k + 2;
+        var found: i64 = -1;
+        while q < str_len(text) && str_byte_at(text, q) != 10 {
+            if va_at(text, q, tail) {
+                found = q;
+                break;
+            }
+            q = q + 1;
+        }
+        if found < 0 {
+            i = at + 1;
+            continue;
+        }
+        st.seen = true;
+        val parts: Vec<str> = va_split(str_slice(text, g, found), ", ");
+        var p: i64 = 0;
+        while p < parts.len() {
+            val part: str = parts.get(p);
+            p = p + 1;
+            val sp: i64 = str_rfind(part, " ");
+            var name: str = "";
+            var num: str = part;
+            if sp >= 0 {
+                name = str_slice(part, 0, sp);
+                num = str_slice(part, sp + 1, str_len(part));
+            }
+            if va_isdigit(num) { va_stats_add(&mut st, name, str_parse_int(num)); }
+        }
+        i = found + str_len(tail);
+    }
+    return st;
+}
+
+/// STAT_OF: a FID_IROPT_OFF switch -> its counter, "" for none.
+fn va_stat_of(how: str) -> str {
+    if how == "closuredevirt" { return "cdevirt"; }
+    if how == "version" { return "versioned loops"; }
+    if how == "fold" || how == "branchfacts" || how == "sccp" || how == "promote" || how == "devirt" || how == "gconst"
+            || how == "dse" || how == "dce" || how == "tailcall" || how == "gvn" || how == "licm" || how == "iv"
+            || how == "spec" || how == "hofspec" {
+        return how;
+    }
+    return "";
+}
+
+// ─── Environments ───
+
+/// "NAME=value" entries to add to the environment, each name once.
+struct VaEnv {
+    keys: Vec<str>,
+    vals: Vec<str>,
+}
+
+fn va_env_new() -> VaEnv {
+    return VaEnv { keys: Vec::new(), vals: Vec::new() };
+}
+
+fn va_env_set(e: &mut VaEnv, k: str, v: str) {
+    var i: i64 = 0;
+    while i < e.keys.len() {
+        if e.keys.get(i) == k {
+            e.vals.set(i, v);
+            return;
+        }
+        i = i + 1;
+    }
+    e.keys.push(k);
+    e.vals.push(v);
+}
+
+/// The value the child would see: ours, unless set here.
+fn va_env_get(e: &VaEnv, k: str) -> str {
+    var i: i64 = 0;
+    while i < e.keys.len() {
+        if e.keys.get(i) == k { return e.vals.get(i); }
+        i = i + 1;
+    }
+    match env_var(k) {
+        Option::Some(v) => { return v; }
+        Option::None => { }
+    }
+    return "";
+}
+
+fn va_env_list(e: &VaEnv) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < e.keys.len() {
+        out.push(e.keys.get(i) + "=" + e.vals.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// test_env: the `//@ env: NAME=value` lines of a test file.
+fn va_test_env(path: str) -> VaEnv {
+    var env: VaEnv = va_env_new();
+    var text: str = "";
+    match va_read_text(path) {
+        Option::Some(t) => { text = t; }
+        Option::None => { return env; }
+    }
+    val lines: Vec<str> = va_split(text, "\n");
+    var i: i64 = 0;
+    while i < lines.len() {
+        val s: str = va_strip(lines.get(i));
+        i = i + 1;
+        if !str_starts_with(s, "//@ env:") { continue; }
+        val rest: str = va_strip(str_slice(s, 8, str_len(s)));
+        val eq: i64 = str_find(rest, "=");
+        var k: str = rest;
+        var v: str = "";
+        if eq >= 0 {
+            k = str_slice(rest, 0, eq);
+            v = str_slice(rest, eq + 1, str_len(rest));
+        }
+        if str_len(va_strip(k)) > 0 { va_env_set(&mut env, va_strip(k), va_strip(v)); }
+    }
+    return env;
+}
+
+fn va_list_var(k: str) -> bool {
+    return k == "FID_IROPT_OFF" || k == "FID_IROPT_ON" || k == "FID_NAT_OFF" || k == "FID_NAT_ON" || k == "FID_NAT_MUTATE";
+}
+
+/// merge_env: base with the test's variables set; a comma-list switch both
+/// name gets both lists.
+fn va_merge_env(base: &VaEnv, extra: &VaEnv) -> VaEnv {
+    var env: VaEnv = va_env_new();
+    var i: i64 = 0;
+    while i < base.keys.len() {
+        va_env_set(&mut env, base.keys.get(i), base.vals.get(i));
+        i = i + 1;
+    }
+    i = 0;
+    while i < extra.keys.len() {
+        val k: str = extra.keys.get(i);
+        val v: str = extra.vals.get(i);
+        i = i + 1;
+        val cur: str = va_env_get(&env, k);
+        if va_list_var(k) && str_len(cur) > 0 {
+            va_env_set(&mut env, k, cur + "," + v);
+        } else {
+            va_env_set(&mut env, k, v);
+        }
+    }
+    return env;
+}
+
+// ─── One test on one backend (the script's `one`, run as a child) ───
+
+fn va_hex8(s: str) -> i64 {
+    return str_parse_hex(str_slice(md5_hex(md5_str(s)), 0, 8));
+}
+
+fn va_md5_10(s: str) -> str {
+    return str_slice(md5_hex(md5_str(s)), 0, 10);
+}
+
+fn va_files_same(a: str, b: str) -> bool {
+    val x: Vec<i64> = fs_read_bytes(a);
+    val y: Vec<i64> = fs_read_bytes(b);
+    if x.len() != y.len() { return false; }
+    var i: i64 = 0;
+    while i < x.len() {
+        if x.get(i) != y.get(i) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// run_twice_differs: two runs of one binary disagree.
+fn va_twice_differs(exe: str) -> bool {
+    val a: VaRun = va_run1(exe, 60);
+    val b: VaRun = va_run1(exe, 60);
+    return a.rc != b.rc || a.out != b.out;
+}
+
+fn va_line(lines: Vec<str>, i: i64) -> str {
+    if i < lines.len() { return lines.get(i); }
+    return "";
+}
+
+/// The child: the job file's lines are test, backend, name, env switch
+/// ("" none), variant compiler, base compiler, work dir, counter ("" none),
+/// prune (0/1), prune-check share, base known (0/1), the test's name in the
+/// results, the result file.
+fn va_item(job: str) -> i64 {
+    var jt: str = "";
+    match read_file(job) {
+        Option::Some(t) => { jt = t; }
+        Option::None => {
+            io_eprintln("variants: no job file " + job);
+            return 1;
+        }
+    }
+    val jl: Vec<str> = va_split(jt, "\n");
+    val t: str = va_line(jl, 0);
+    val b: str = va_line(jl, 1);
+    val name: str = va_line(jl, 2);
+    val env_var_: str = va_line(jl, 3);
+    val var_fid: str = va_line(jl, 4);
+    val base_fid: str = va_line(jl, 5);
+    val work: str = va_line(jl, 6);
+    val stat: str = va_line(jl, 7);
+    val prune: bool = va_line(jl, 8) == "1";
+    val prune_check: f64 = va_float(va_line(jl, 9));
+    val base_known: bool = va_line(jl, 10) == "1";
+    val rk1: str = va_line(jl, 11);
+    val result: str = va_line(jl, 12);
+    va_scratch = work;
+    var key: str = env_var_;
+    if str_len(key) == 0 { key = var_fid; }
+    val tag: str = va_md5_10(t + b + key);
+    val bt: str = va_md5_10(t + b);
+    val e1: str = va_join(work, bt + "-base.exe");
+    val e2: str = va_join(work, tag + "-var.exe");
+    val info: str = va_join(work, bt + "-base.info");
+    val runf: str = va_join(work, bt + "-base.run");
+    // the environments: the base's (FID_IROPT_STATS=1 when pruning) and the
+    // variant's (its switch), each with the test's own //@ env: lines
+    var benv: VaEnv = va_env_new();
+    if prune { va_env_set(&mut benv, "FID_IROPT_STATS", "1"); }
+    var venv: VaEnv = va_env_new();
+    if str_len(env_var_) > 0 {
+        val eq: i64 = str_find(env_var_, "=");
+        if eq >= 0 {
+            va_env_set(&mut venv, str_slice(env_var_, 0, eq), str_slice(env_var_, eq + 1, str_len(env_var_)));
+        } else {
+            va_env_set(&mut venv, "FID_IROPT_OFF", env_var_);
+        }
+    }
+    val tenv: VaEnv = va_test_env(t);
+    val benv_t: VaEnv = va_merge_env(&benv, &tenv);
+    val venv_t: VaEnv = va_merge_env(&venv, &tenv);
+    // the base build of a test is the same for every variant: once per run
+    var have: bool = base_known && fs_exists(info);
+    var h1_built: bool = false;
+    var r1_rc: str = "";
+    var r1_out: str = "";
+    var pst: VaStats = VaStats { seen: false, names: Vec::new(), counts: Vec::new() };
+    if have {
+        var it: str = "";
+        match read_file(info) {
+            Option::Some(x) => { it = x; }
+            Option::None => { }
+        }
+        val il: Vec<str> = va_split(it, "\n");
+        h1_built = va_line(il, 0) == "built";
+        r1_rc = va_line(il, 1);
+        pst.seen = va_line(il, 2) == "stats";
+        var q: i64 = 3;
+        while q < il.len() {
+            val tab: i64 = str_find(il.get(q), "\t");
+            if tab >= 0 {
+                pst.names.push(str_slice(il.get(q), 0, tab));
+                pst.counts.push(str_parse_int(str_slice(il.get(q), tab + 1, str_len(il.get(q)))));
+            }
+            q = q + 1;
+        }
+        match read_file(runf) {
+            Option::Some(x2) => { r1_out = x2; }
+            Option::None => { }
+        }
+        if h1_built && !fs_exists(e1) { have = false; }
+    }
+    if !have {
+        var text: str = "";
+        h1_built = va_compile(base_fid, va_env_list(&benv_t), b, t, e1, work, &mut text);
+        r1_rc = "";
+        r1_out = "";
+        if h1_built {
+            val r: VaRun = va_run1(e1, 60);
+            r1_rc = r.rc;
+            r1_out = r.out;
+        }
+        pst = va_iropt_stats(text);
+        var it2: str = "no-build\n";
+        if h1_built { it2 = "built\n"; }
+        it2 = it2 + r1_rc + "\n";
+        if pst.seen { it2 = it2 + "stats\n"; } else { it2 = it2 + "none\n"; }
+        var q2: i64 = 0;
+        while q2 < pst.names.len() {
+            it2 = it2 + pst.names.get(q2) + "\t" + int_to_str(pst.counts.get(q2)) + "\n";
+            q2 = q2 + 1;
+        }
+        fs_write_text(info, it2);
+        fs_write_text(runf, r1_out);
+    }
+    var kind: str = "built";
+    var pruned_n: i64 = 0;
+    var checked_n: i64 = 0;
+    var stat_count: i64 = -1;
+    if str_len(stat) > 0 && pst.seen {
+        var q3: i64 = 0;
+        while q3 < pst.names.len() {
+            if pst.names.get(q3) == stat { stat_count = pst.counts.get(q3); }
+            q3 = q3 + 1;
+        }
+    }
+    val pruned: bool = str_len(stat) > 0 && h1_built && pst.seen && stat_count == 0;
+    if pruned {
+        // the pass changed no function here: the variant's binary is the
+        // base's; a share is built anyway to check that claim
+        val pick: f64 = (va_hex8(rk1 + b + name) as f64) / 4294967295.0;
+        if pick >= prune_check {
+            fs_write_text(result, "changed=0\nkind=pruned\nwhy=\npruned=1\nchecked=0\n");
+            return 0;
+        }
+        checked_n = 1;
+        kind = "prune-checked";
+    }
+    var vtext: str = "";
+    val h2_built: bool = va_compile(var_fid, va_env_list(&venv_t), b, t, e2, work, &mut vtext);
+    var why: str = "";
+    var changed: bool = false;
+    if !h1_built || !h2_built {
+        if h1_built != h2_built {
+            why = "builds with one compiler only";
+            changed = true;
+        }
+    } else if !va_files_same(e1, e2) {
+        changed = true;
+        if kind == "prune-checked" { kind = "prune-wrong"; }
+        val r2: VaRun = va_run1(e2, 60);
+        if r1_rc != r2.rc || r1_out != r2.out {
+            if va_twice_differs(e2) || va_twice_differs(e1) {
+                kind = "flaky";
+            } else {
+                // the base's recorded run against a fresh one of each
+                val r1b: VaRun = va_run1(e1, 60);
+                if r1b.rc != r1_rc || r1b.out != r1_out {
+                    kind = "flaky";
+                } else {
+                    why = "exit " + r1_rc + " vs " + r2.rc + "; output " + int_to_str(va_chars(r1_out)) + " vs "
+                        + int_to_str(va_chars(r2.out)) + " bytes";
+                }
+            }
+        }
+    }
+    var gone: Vec<str> = Vec::new();
+    gone.push(e2);
+    gone.push(str_slice(e2, 0, str_len(e2) - 4) + ".pdb");
+    gone.push(str_slice(e1, 0, str_len(e1) - 4) + ".pdb");
+    var g: i64 = 0;
+    while g < gone.len() {
+        if fs_exists(gone.get(g)) { fs_delete(gone.get(g)); }
+        g = g + 1;
+    }
+    var ch: str = "0";
+    if changed { ch = "1"; }
+    fs_write_text(result, "changed=" + ch + "\nkind=" + kind + "\nwhy=" + why + "\npruned=" + int_to_str(pruned_n)
+        + "\nchecked=" + int_to_str(checked_n) + "\n");
+    return 0;
+}
+
+// ─── The parent ───
+
+/// The run-wide state of compare (the script's Opts and BASE).
+struct VaState {
+    prune: bool,
+    prune_check_s: str,
+    results: str,
+    done_keys: HashMap<str, i64>,
+    done_changed: Vec<bool>,
+    done_why: Vec<str>,
+    done_kind: Vec<str>,
+    pruned: i64,
+    prune_checked: i64,
+    resumed: i64,
+    base_known: HashMap<str, i64>,
+    self_cmd: Vec<str>,
+    jobs: i64,
+    child_env: Vec<str>,
+}
+
+/// record(): one result into the --resume file.
+fn va_record(results: str, variant: str, test: str, backend: str, changed: bool, why: str, kind: str) {
+    if str_len(results) == 0 { return; }
+    var c: str = "false";
+    if changed { c = "true"; }
+    var w: str = "null";
+    if str_len(why) > 0 { w = va_json_str(why); }
+    fs_append_text(results, "{\"variant\": " + va_json_str(variant) + ", \"test\": " + va_json_str(test) + ", \"backend\": "
+        + va_json_str(backend) + ", \"changed\": " + c + ", \"why\": " + w + ", \"kind\": " + va_json_str(kind) + "}\n");
+}
+
+fn va_rkey(variant: str, test: str, backend: str) -> str {
+    return variant + char_to_str(31) + test + char_to_str(31) + backend;
+}
+
+/// load_results: the earlier results made with this same base compiler;
+/// false when the file was made with another one.
+fn va_load_results(st: &mut VaState, path: str, fid_sha: str) -> bool {
+    if !fs_exists(path) { return true; }
+    var text: str = "";
+    match va_read_text(path) {
+        Option::Some(t) => { text = t; }
+        Option::None => { }
+    }
+    val lines: Vec<str> = va_split(text, "\n");
+    var ok: bool = false;
+    val head: VaJson = va_json_parse(va_line(lines, 0), &mut ok);
+    val hs: i64 = va_json_find(&head, "fid_sha");
+    if !ok || hs < 0 || head.kinds.get(hs) != 0 || head.vals.get(hs) != fid_sha {
+        println("resume: " + path + " was made with another compiler; starting again");
+        return false;
+    }
+    var i: i64 = 1;
+    while i < lines.len() {
+        var ok2: bool = false;
+        val d: VaJson = va_json_parse(lines.get(i), &mut ok2);
+        i = i + 1;
+        if !ok2 { continue; }  // a line cut short by an interrupted run
+        val kv: i64 = va_json_find(&d, "variant");
+        val kt: i64 = va_json_find(&d, "test");
+        val kb: i64 = va_json_find(&d, "backend");
+        if kv < 0 || kt < 0 || kb < 0 { continue; }
+        val k: str = va_rkey(d.vals.get(kv), d.vals.get(kt), d.vals.get(kb));
+        val kw: i64 = va_json_find(&d, "why");
+        val kk: i64 = va_json_find(&d, "kind");
+        var why: str = "";
+        if va_json_truthy(&d, kw) { why = d.vals.get(kw); }
+        var kind: str = "";
+        if kk >= 0 { kind = d.vals.get(kk); }
+        val changed: bool = va_json_truthy(&d, va_json_find(&d, "changed"));
+        if st.done_keys.contains(k) {
+            val at: i64 = st.done_keys.get(k);
+            st.done_changed.set(at, changed);
+            st.done_why.set(at, why);
+            st.done_kind.set(at, kind);
+        } else {
+            st.done_keys.insert(k, st.done_changed.len());
+            st.done_changed.push(changed);
+            st.done_why.push(why);
+            st.done_kind.push(kind);
+        }
+    }
+    return true;
+}
+
+/// What compare() found for one variant.
+struct VaCmp {
+    changed: i64,
+    diff_t: Vec<str>,
+    diff_b: Vec<str>,
+    diff_why: Vec<str>,
+    total: i64,
+    flaky_t: Vec<str>,
+    flaky_b: Vec<str>,
+    prune_wrong: i64,
+}
+
+fn va_compare(st: &mut VaState, base_fid: str, var_fid: str, env_var_: str, backends: Vec<str>, tests: Vec<str>, out: str,
+        name: str) -> VaCmp {
+    val work: str = va_join(out, "work");
+    va_makedirs(work);
+    // no child is running: a lock left by a stopped run goes
+    if fs_is_dir(va_join(work, ".retry-lock")) { fs_rmdir(va_join(work, ".retry-lock")); }
+    var stat: str = "";
+    if st.prune && str_len(env_var_) > 0 && !str_contains(env_var_, "=") { stat = va_stat_of(env_var_); }
+    var jt: Vec<str> = Vec::new();
+    var jb: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < tests.len() {
+        var k: i64 = 0;
+        while k < backends.len() {
+            jt.push(tests.get(i));
+            jb.push(backends.get(k));
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    val n: i64 = jt.len();
+    var state: Vec<i64> = Vec::new();   // 0 waiting, 1 running, 2 ended
+    var handles: Vec<i64> = Vec::new();
+    var r_changed: Vec<bool> = Vec::new();
+    var r_why: Vec<str> = Vec::new();
+    var r_kind: Vec<str> = Vec::new();
+    var resfile: Vec<str> = Vec::new();
+    var logfile: Vec<str> = Vec::new();
+    i = 0;
+    while i < n {
+        state.push(0);
+        handles.push(0);
+        r_changed.push(false);
+        r_why.push("");
+        r_kind.push("");
+        resfile.push("");
+        logfile.push("");
+        i = i + 1;
+    }
+    var c: VaCmp = VaCmp { changed: 0, diff_t: Vec::new(), diff_b: Vec::new(), diff_why: Vec::new(), total: n,
+        flaky_t: Vec::new(), flaky_b: Vec::new(), prune_wrong: 0 };
+    var next: i64 = 0;
+    var running: i64 = 0;
+    var finished: i64 = 0;
+    while finished < n {
+        while running < st.jobs && next < n {
+            val t: str = jt.get(next);
+            val b: str = jb.get(next);
+            val rk1: str = va_slashes(va_relpath(t));
+            val key: str = va_rkey(name, rk1, b);
+            if st.done_keys.contains(key) {
+                val at: i64 = st.done_keys.get(key);
+                st.resumed = st.resumed + 1;
+                if st.done_kind.get(at) == "pruned" { st.pruned = st.pruned + 1; }
+                r_changed.set(next, st.done_changed.get(at));
+                r_why.set(next, st.done_why.get(at));
+                r_kind.set(next, st.done_kind.get(at));
+                state.set(next, 2);
+                next = next + 1;
+                continue;
+            }
+            val tb: str = t + char_to_str(31) + b;
+            var known: str = "0";
+            if st.base_known.contains(tb) { known = "1"; }
+            val stem: str = va_join(work, "item-" + int_to_str(p_getpid()) + "-" + va_md5_10(name + tb));
+            val job: str = stem + ".job";
+            val res: str = stem + ".res";
+            if fs_exists(res) { fs_delete(res); }
+            fs_write_text(job, t + "\n" + b + "\n" + name + "\n" + env_var_ + "\n" + var_fid + "\n" + base_fid + "\n" + work + "\n"
+                + stat + "\n" + va_bool01(st.prune) + "\n" + st.prune_check_s + "\n" + known + "\n" + rk1 + "\n" + res + "\n");
+            var argv: Vec<str> = Vec::new();
+            var a: i64 = 0;
+            while a < st.self_cmd.len() {
+                argv.push(st.self_cmd.get(a));
+                a = a + 1;
+            }
+            argv.push("--va-item");
+            argv.push(job);
+            resfile.set(next, res);
+            logfile.set(next, stem + ".log");
+            val h: i64 = process_spawn_to(argv, st.child_env, "", stem + ".log");
+            handles.set(next, h);
+            if h == 0 {
+                state.set(next, 3);
+            } else {
+                state.set(next, 1);
+                running = running + 1;
+            }
+            next = next + 1;
+        }
+        var moved: bool = false;
+        var r: i64 = finished;
+        while r < next {
+            if state.get(r) == 1 {
+                match process_wait(handles.get(r), 0) {
+                    Option::Some(_) => {
+                        process_release(handles.get(r));
+                        state.set(r, 3);
+                        running = running - 1;
+                        moved = true;
+                    }
+                    Option::None => { }
+                }
+            }
+            if state.get(r) == 3 {
+                // a child's result
+                var rt: str = "";
+                match read_file(resfile.get(r)) {
+                    Option::Some(x) => { rt = x; }
+                    Option::None => { }
+                }
+                if str_len(rt) == 0 {
+                    io_eprintln("variants: the run of " + jt.get(r) + " (" + jb.get(r) + ") gave no result; its log:");
+                    match read_file(logfile.get(r)) {
+                        Option::Some(lg) => { io_eprintln(lg); }
+                        Option::None => { }
+                    }
+                    process_exit(3);
+                }
+                val rl: Vec<str> = va_split(rt, "\n");
+                val changed: bool = va_line(rl, 0) == "changed=1";
+                val kind: str = str_slice(va_line(rl, 1), 5, str_len(va_line(rl, 1)));
+                val why: str = str_slice(va_line(rl, 2), 4, str_len(va_line(rl, 2)));
+                if va_line(rl, 3) == "pruned=1" { st.pruned = st.pruned + 1; }
+                if va_line(rl, 4) == "checked=1" { st.prune_checked = st.prune_checked + 1; }
+                r_changed.set(r, changed);
+                r_why.set(r, why);
+                r_kind.set(r, kind);
+                va_record(st.results, name, va_slashes(va_relpath(jt.get(r))), jb.get(r), changed, why, kind);
+                st.base_known.insert(jt.get(r) + char_to_str(31) + jb.get(r), 1);
+                fs_delete(resfile.get(r));
+                if fs_exists(logfile.get(r)) { fs_delete(logfile.get(r)); }
+                val stem2: str = str_slice(resfile.get(r), 0, str_len(resfile.get(r)) - 4);
+                if fs_exists(stem2 + ".job") { fs_delete(stem2 + ".job"); }
+                state.set(r, 2);
+                moved = true;
+            }
+            r = r + 1;
+        }
+        while finished < next && state.get(finished) == 2 {
+            finished = finished + 1;
+            moved = true;
+        }
+        if !moved {
+            var w: i64 = finished;
+            while w < next && state.get(w) != 1 { w = w + 1; }
+            if w < next { process_wait(handles.get(w), 20); }
+        }
+    }
+    i = 0;
+    while i < n {
+        if r_changed.get(i) { c.changed = c.changed + 1; }
+        if str_len(r_why.get(i)) > 0 {
+            c.diff_t.push(jt.get(i));
+            c.diff_b.push(jb.get(i));
+            c.diff_why.push(r_why.get(i));
+        }
+        if r_kind.get(i) == "flaky" {
+            c.flaky_t.push(jt.get(i));
+            c.flaky_b.push(jb.get(i));
+        }
+        if r_kind.get(i) == "prune-wrong" { c.prune_wrong = c.prune_wrong + 1; }
+        i = i + 1;
+    }
+    return c;
+}
+
+fn va_bool01(b: bool) -> str {
+    if b { return "1"; }
+    return "0";
+}
+
+/// The script's BASH: BASH_EXE, else Git's bash on Windows, else bash.
+fn va_bash() -> str {
+    match env_var("BASH_EXE") {
+        Option::Some(b) => {
+            if str_len(b) > 0 { return b; }
+        }
+        Option::None => { }
+    }
+    if va_win() {
+        if fs_exists("C:\\Program Files\\Git\\bin\\bash.exe") { return "C:\\Program Files\\Git\\bin\\bash.exe"; }
+        if fs_exists("C:\\Program Files\\Git\\usr\\bin\\bash.exe") { return "C:\\Program Files\\Git\\usr\\bin\\bash.exe"; }
+    }
+    return "bash";
+}
+
+/// The last n characters of text.
+fn va_last_chars(s: str, n: i64) -> str {
+    var k: i64 = str_len(s);
+    var count: i64 = 0;
+    while k > 0 && count < n {
+        k = k - 1;
+        if (str_byte_at(s, k) & 192) != 128 { count = count + 1; }
+    }
+    return str_slice(s, k, str_len(s));
+}
+
+/// build(): <out>/fid-<name>.exe, built from the tree (with one edit) by
+/// scripts/verify/build-variant.sh unless it is there already; "" when the
+/// build failed.
+fn va_build(tree: str, name: str, v: &VaVariant, has_edit: bool, fid: str, out: str, child_env: Vec<str>) -> str {
+    val exe: str = va_join(out, "fid-" + name + ".exe");
+    if fs_exists(exe) { return exe; }
+    var cmd: Vec<str> = Vec::new();
+    cmd.push(va_bash());
+    cmd.push(va_slashes(va_join(va_join(va_join(va_cwd(), "scripts"), "verify"), "build-variant.sh")));
+    cmd.push(va_slashes(tree));
+    cmd.push(va_slashes(exe));
+    if has_edit { cmd.push(v.file + ":" + v.from + "=>" + v.to); }
+    var env: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < child_env.len() {
+        env.push(child_env.get(i));
+        i = i + 1;
+    }
+    env.push("FID=" + va_slashes(fid));
+    println("building " + name + " ...");
+    io_flush();
+    val r: VaRun = va_run(cmd, env, 3600);
+    if r.rc != "0" || !fs_exists(exe) {
+        println("  build of " + name + " failed: " + va_last_chars(r.out + r.err, 600));
+        return "";
+    }
+    return exe;
+}
+
+/// str.count(sub): non-overlapping occurrences.
+fn va_count(s: str, sub: str) -> i64 {
+    if str_len(sub) == 0 { return str_len(s) + 1; }
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while true {
+        val k: i64 = str_find(str_slice(s, i, str_len(s)), sub);
+        if k < 0 { break; }
+        n = n + 1;
+        i = i + k + str_len(sub);
+    }
+    return n;
+}
+
+/// fnmatch.fnmatchcase
+fn va_fnmatchcase(name: str, pat: str) -> bool {
+    return va_fnmatch_at(name, 0, pat, 0);
+}
+
+fn va_fmt_pct0(x: f64) -> str {
+    return va_fixed(x * 100.0, 0) + "%";
+}
+
+fn main() -> i64 {
+    val all: Vec<str> = args_all();
+    var first: i64 = 1;
+    var self_cmd: Vec<str> = Vec::new();
+    self_cmd.push(all.get(0));
+    if all.len() >= 3 && all.get(1) == "run" && str_ends_with(all.get(2), ".fd") {
+        first = 3;
+        self_cmd.push("run");
+        self_cmd.push(all.get(2));
+    }
+    if all.len() > first + 1 && all.get(first) == "--va-item" { return va_item(all.get(first + 1)); }
+    var argv: Vec<str> = Vec::new();
+    var i: i64 = first;
+    while i < all.len() {
+        argv.push(all.get(i));
+        i = i + 1;
+    }
+    val a: VaArgs = va_parse(argv, va_opts());
+    if a.code >= 0 { return a.code; }
+    val cmd: str = a.cmd;
+    val fid_arg: str = va_val(&a, 0, va_join("release", "fid.exe"));
+    val tree_arg: str = va_val(&a, 1, ".");
+    val tests_s: str = va_val(&a, 2, "tests/bootstrap/*.fd");
+    var gen: i64 = 0;
+    if a.given.get(3) { gen = va_int(a.vals.get(3)); }
+    var sample: i64 = 0;
+    if a.given.get(4) { sample = va_int(a.vals.get(4)); }
+    val out_arg: str = va_val(&a, 5, va_join("build", "variants"));
+    val only_s: str = va_val(&a, 6, "");
+    val backends_s: str = va_val(&a, 7, "");
+    val prune_stats: bool = a.given.get(8);
+    val prune_check_s: str = va_val(&a, 9, "0.05");
+    val resume: bool = a.given.get(10);
+    val no_fail: bool = a.given.get(11);
+    val build_only: bool = a.given.get(12);
+    var jobs: i64 = 4;
+    if a.given.get(13) { jobs = va_int(a.vals.get(13)); }
+    var toggles: Vec<VaVariant> = va_toggles();
+    val mutants: Vec<VaVariant> = va_mutants();
+    if cmd == "check" {
+        // no build: every mutant's and constant toggle's edit must match its
+        // file exactly once in --tree
+        var edits: Vec<VaVariant> = Vec::new();
+        i = 0;
+        while i < mutants.len() {
+            edits.push(mutants.get(i));
+            i = i + 1;
+        }
+        i = 0;
+        while i < toggles.len() {
+            if toggles.get(i).kind == "const" { edits.push(toggles.get(i)); }
+            i = i + 1;
+        }
+        var bad: i64 = 0;
+        i = 0;
+        while i < edits.len() {
+            val e: VaVariant = edits.get(i);
+            i = i + 1;
+            val p: str = va_join(tree_arg, e.file);
+            var cnt: i64 = -1;
+            match read_file(p) {
+                Option::Some(t) => { cnt = va_count(t, e.from); }
+                Option::None => { }
+            }
+            val ok: bool = cnt == 1;
+            var line: str = va_ljust("STALE", 6);
+            if ok { line = va_ljust("ok", 6); }
+            line = line + " " + va_ljust(e.name, 28) + " " + e.file;
+            if !ok { line = line + " (matches " + int_to_str(cnt) + " times)"; }
+            if !ok { bad = bad + 1; }
+            println(line);
+        }
+        println(int_to_str(edits.len()) + " edits, " + int_to_str(bad) + " stale");
+        if bad > 0 { return 1; }
+        return 0;
+    }
+    if cmd == "toggle" || cmd == "list" {
+        var known: HashMap<str, i64> = HashMap::new();
+        i = 0;
+        while i < toggles.len() {
+            if toggles.get(i).kind == "env" { known.insert(toggles.get(i).how, 1); }
+            i = i + 1;
+        }
+        val sw: Vec<VaVariant> = va_switches_of(va_abspath(tree_arg));
+        i = 0;
+        while i < sw.len() {
+            if !known.contains(sw.get(i).how) { toggles.push(sw.get(i)); }
+            i = i + 1;
+        }
+    }
+    if cmd == "list" {
+        i = 0;
+        while i < toggles.len() {
+            val t: VaVariant = toggles.get(i);
+            println("toggle " + va_ljust(t.name, 18) + " " + va_ljust(t.kind, 5) + " " + va_list_repr(t.backends));
+            i = i + 1;
+        }
+        i = 0;
+        while i < mutants.len() {
+            val m: VaVariant = mutants.get(i);
+            println("mutant " + va_ljust(m.name, 18) + " " + m.file + " " + va_list_repr(m.backends));
+            i = i + 1;
+        }
+        return 0;
+    }
+    // every child gets these, as the script sets them in its environment
+    var child_env: Vec<str> = Vec::new();
+    match env_var("CC") {
+        Option::Some(_) => { }
+        Option::None => { child_env.push("CC=zig cc"); }
+    }
+    child_env.push("FIDES_NO_CACHE=1");
+    val out: str = va_abspath(out_arg);
+    va_makedirs(out);
+    va_scratch = out;
+    var fid: str = va_abspath(fid_arg);
+    val tree: str = va_abspath(tree_arg);
+    var tests: Vec<str> = Vec::new();
+    val globs: Vec<str> = va_split(tests_s, ",");
+    i = 0;
+    while i < globs.len() {
+        var found: Vec<str> = va_glob(globs.get(i));
+        va_sort(&mut found);
+        var k: i64 = 0;
+        while k < found.len() {
+            tests.push(found.get(k));
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    if no_fail {
+        var kept: Vec<str> = Vec::new();
+        i = 0;
+        while i < tests.len() {
+            if !str_ends_with(tests.get(i), "_fail.fd") { kept.push(tests.get(i)); }
+            i = i + 1;
+        }
+        tests = kept;
+    }
+    if sample != 0 && tests.len() > sample {
+        if sample < 0 {
+            io_eprintln("ValueError: Sample larger than population or is negative");
+            return 1;
+        }
+        val picks: Vec<i64> = va_sample(tests.len(), sample);
+        var chosen: Vec<str> = Vec::new();
+        i = 0;
+        while i < picks.len() {
+            chosen.push(tests.get(picks.get(i)));
+            i = i + 1;
+        }
+        va_sort(&mut chosen);
+        tests = chosen;
+    }
+    if gen != 0 {
+        io_eprintln("variants: --gen needs the fuzzers' program generators (scripts/fuzz/gen_vs_c.py, gen_programs.py), which have no Fides port yet");
+        return 2;
+    }
+    var only: Vec<str> = Vec::new();
+    val op: Vec<str> = va_split(only_s, ",");
+    i = 0;
+    while i < op.len() {
+        if str_len(op.get(i)) > 0 { only.push(op.get(i)); }
+        i = i + 1;
+    }
+    var items: Vec<VaVariant> = Vec::new();
+    var src: Vec<VaVariant> = mutants;
+    if cmd == "toggle" { src = toggles; }
+    i = 0;
+    while i < src.len() {
+        val v: VaVariant = src.get(i);
+        i = i + 1;
+        var picked: bool = only.len() == 0;
+        var k2: i64 = 0;
+        while !picked && k2 < only.len() {
+            if va_fnmatchcase(v.name, only.get(k2)) { picked = true; }
+            k2 = k2 + 1;
+        }
+        if !picked { continue; }
+        if str_len(backends_s) > 0 {
+            val want: Vec<str> = va_split(backends_s, ",");
+            var nb: Vec<str> = Vec::new();
+            var q: i64 = 0;
+            while q < v.backends.len() {
+                if va_has(want, v.backends.get(q)) { nb.push(v.backends.get(q)); }
+                q = q + 1;
+            }
+            if nb.len() == 0 { continue; }
+            items.push(VaVariant { name: v.name, kind: v.kind, how: v.how, file: v.file, from: v.from, to: v.to, backends: nb });
+        } else {
+            items.push(v);
+        }
+    }
+    if items.len() == 0 {
+        var msg: str = "no variant matches --only " + va_repr(only_s);
+        if str_len(backends_s) > 0 { msg = msg + " on " + backends_s; }
+        io_eprintln(msg);
+        return 1;
+    }
+    // build every variant that needs it first (one at a time: memory)
+    var exes: Vec<str> = Vec::new();
+    var base: str = fid;
+    var any_const: bool = false;
+    i = 0;
+    while i < items.len() {
+        if items.get(i).kind == "const" { any_const = true; }
+        i = i + 1;
+    }
+    val none: VaVariant = va_env("", "", Vec::new());
+    if any_const {
+        base = va_build(tree, "base", &none, false, fid, out, child_env);
+        if str_len(base) == 0 {
+            io_eprintln("could not build the base compiler from the tree");
+            return 1;
+        }
+    }
+    i = 0;
+    while i < items.len() {
+        val v2: VaVariant = items.get(i);
+        if v2.kind == "env" {
+            exes.push(base);
+        } else {
+            exes.push(va_build(tree, v2.name, &v2, true, fid, out, child_env));
+        }
+        i = i + 1;
+    }
+    if build_only { return 0; }
+    fid = base;
+    if jobs < 1 {
+        io_eprintln("ValueError: max_workers must be greater than 0");
+        return 1;
+    }
+    var st: VaState = VaState { prune: prune_stats && cmd == "toggle", prune_check_s: prune_check_s, results: "",
+        done_keys: HashMap::new(), done_changed: Vec::new(), done_why: Vec::new(), done_kind: Vec::new(),
+        pruned: 0, prune_checked: 0, resumed: 0, base_known: HashMap::new(), self_cmd: self_cmd, jobs: jobs,
+        child_env: child_env };
+    if resume {
+        st.results = va_join(out, cmd + "-results.jsonl");
+        val fsha: str = crypto_sha256_hex(crypto_sha256_bytes(fs_read_bytes(fid)));
+        val rpath: str = st.results;
+        val same: bool = va_load_results(&mut st, rpath, fsha);
+        if !same || !fs_exists(st.results) {
+            fs_write_text(st.results, "{\"fid\": " + va_json_str(fid) + ", \"fid_sha\": " + va_json_str(fsha) + "}\n");
+            st.done_keys = HashMap::new();
+            st.done_changed = Vec::new();
+            st.done_why = Vec::new();
+            st.done_kind = Vec::new();
+        }
+        println("resume: " + int_to_str(st.done_changed.len()) + " results already in " + st.results);
+    }
+    val report: str = va_join(out, cmd + "-report.txt");
+    var head: str = "# " + cmd + ": " + int_to_str(tests.len()) + " tests, base " + fid;
+    if st.prune { head = head + ", pruned on FID_IROPT_STATS (checked on " + va_fmt_pct0(va_float(prune_check_s)) + ")"; }
+    fs_write_text(report, head + "\n");
+    var bad: i64 = 0;
+    i = 0;
+    while i < items.len() {
+        val v3: VaVariant = items.get(i);
+        val exe: str = exes.get(i);
+        i = i + 1;
+        if str_len(exe) == 0 {
+            val line: str = va_ljust(v3.name, 18) + " " + va_ljust("BUILD FAILED", 12) + " (" + va_comma(v3.backends) + ")";
+            println(line);
+            fs_append_text(report, line + "\n");
+            if bad < 2 { bad = 2; }
+            continue;
+        }
+        val p0: i64 = st.pruned;
+        var how: str = "";
+        if v3.kind == "env" { how = v3.how; }
+        val c: VaCmp = va_compare(&mut st, fid, exe, how, v3.backends, tests, out, v3.name);
+        var verdict: str = "";
+        if cmd == "toggle" {
+            if c.diff_t.len() == 0 { verdict = "ok"; } else { verdict = int_to_str(c.diff_t.len()) + " DIFFER"; }
+        } else {
+            if c.diff_t.len() > 0 { verdict = "killed"; } else { verdict = "SURVIVED"; }
+        }
+        if verdict != "ok" && verdict != "killed" && bad == 0 { bad = 1; }
+        if c.prune_wrong > 0 && bad == 0 { bad = 1; }
+        var extra: str = "";
+        if st.pruned > p0 { extra = extra + ", " + int_to_str(st.pruned - p0) + " pruned"; }
+        if c.flaky_t.len() > 0 { extra = extra + ", " + int_to_str(c.flaky_t.len()) + " flaky"; }
+        if c.prune_wrong > 0 { extra = extra + ", PRUNE WRONG " + int_to_str(c.prune_wrong) + " (counter 0, binary changed)"; }
+        val line2: str = va_ljust(v3.name, 18) + " " + va_ljust(verdict, 12) + " binaries changed in " + int_to_str(c.changed) + "/"
+            + int_to_str(c.total) + " (" + va_comma(v3.backends) + extra + ")";
+        println(line2);
+        var rep: str = line2 + "\n";
+        var k3: i64 = 0;
+        while k3 < c.diff_t.len() && k3 < 30 {
+            val dl: str = "    " + c.diff_b.get(k3) + " " + va_relpath(c.diff_t.get(k3)) + ": " + c.diff_why.get(k3);
+            rep = rep + dl + "\n";
+            println(dl);
+            k3 = k3 + 1;
+        }
+        k3 = 0;
+        while k3 < c.flaky_t.len() && k3 < 10 {
+            rep = rep + "    flaky " + c.flaky_b.get(k3) + " " + va_relpath(c.flaky_t.get(k3)) + ": two runs of one binary differ\n";
+            k3 = k3 + 1;
+        }
+        fs_append_text(report, rep);
+    }
+    fs_append_text(report, "# pruned " + int_to_str(st.pruned) + ", prune-checked " + int_to_str(st.prune_checked) + ", resumed "
+        + int_to_str(st.resumed) + "\n");
+    println("report: " + report);
+    return bad;
+}
+
+// ─── The tables (copied from scripts/verify/variants.py by hand-checked
+// generation; `variants list` and `variants check` show a drift) ───
+
+/// TOGGLES: (name, kind, how, backends)
+fn va_toggles() -> Vec<VaVariant> {
+    var t: Vec<VaVariant> = Vec::new();
+    t.push(va_env("iropt-inline", "inline", va_b1("emit")));
+    t.push(va_env("iropt-fold", "fold", va_b1("emit")));
+    t.push(va_env("iropt-dce", "dce", va_b1("emit")));
+    t.push(va_env("iropt-tailcall", "tailcall", va_b1("emit")));
+    t.push(va_env("iropt-gvn", "gvn", va_b1("emit")));
+    t.push(va_env("iropt-licm", "licm", va_b1("emit")));
+    t.push(va_const("peir-global-ra", "compiler/pe_ir.fd", "const PEIR_GLOBAL_RA: bool = true;",
+        "const PEIR_GLOBAL_RA: bool = false;", va_b1("emit")));
+    t.push(va_const("peir-coalesce", "compiler/pe_ir.fd", "const PEIR_COALESCE: bool = true;",
+        "const PEIR_COALESCE: bool = false;", va_b1("emit")));
+    t.push(va_const("peir-volatile-ra", "compiler/pe_ir.fd", "const PEIR_VOLATILE_RA: bool = true;",
+        "const PEIR_VOLATILE_RA: bool = false;", va_b1("emit")));
+    t.push(va_const("peir-xmm-ra", "compiler/pe_ir.fd", "const PEIR_XMM_RA: bool = true;",
+        "const PEIR_XMM_RA: bool = false;", va_b1("emit")));
+    t.push(va_const("peir-rotate", "compiler/pe_ir.fd", "const PEIR_ROTATE: bool = true;",
+        "const PEIR_ROTATE: bool = false;", va_b1("emit")));
+    t.push(va_const("ranges", "compiler/checks.fd", "const PEIR_RANGES: bool = true;",
+        "const PEIR_RANGES: bool = false;", va_b2("emit", "ccompile")));
+    return t;
+}
+
+/// MUTANTS: deliberate bugs, one per pass (VF7). Each edit must match exactly once.
+fn va_mutants() -> Vec<VaVariant> {
+    var m: Vec<VaVariant> = Vec::new();
+    m.push(va_const("fold-lt-as-le", "compiler/iropt.fd",
+        "return OptInst::Some(Inst::ConstBool(a < c));",
+        "return OptInst::Some(Inst::ConstBool(a <= c));", va_b1("emit")));
+    m.push(va_const("fold-sub-swapped", "compiler/iropt.fd",
+        "return OptInst::Some(Inst::ConstInt(a - c, t));",
+        "return OptInst::Some(Inst::ConstInt(c - a, t));", va_b1("emit")));
+    m.push(va_const("gvn-ignores-rhs", "compiler/iropt.fd",
+        "return \"B\" + iro_binop_code(op) + \"|\" + int_to_str(a) + \"|\" + int_to_str(b) + \"|\" + ir_type_to_str(t);",
+        "return \"B\" + iro_binop_code(op) + \"|\" + int_to_str(a) + \"|\" + ir_type_to_str(t);", va_b1("emit")));
+    m.push(va_const("dce-all-pure", "compiler/iropt.fd",
+        "        Inst::BitCast(_, _, _) => {\n            return true;\n        }\n        _ => {\n            return false;\n        }",
+        "        Inst::BitCast(_, _, _) => {\n            return true;\n        }\n        Inst::Call(_, _, _, _) => {\n            return true;\n        }\n        _ => {\n            return false;\n        }", va_b1("emit")));
+    m.push(va_const("inline-max-huge", "compiler/iropt.fd",
+        "const IRO_INLINE_MAX: i64 = 16;",
+        "const IRO_INLINE_MAX: i64 = 0;", va_b1("emit")));
+    m.push(va_const("ranges-len-bigger", "compiler/checks.fd",
+        "peir_rng_put(r, id, 0, 281474976710656);",
+        "peir_rng_put(r, id, 1, 281474976710656);", va_b2("emit", "ccompile")));
+    m.push(va_const("ipcp-first-constant-wins", "compiler/iropt.fd",
+        "} else if old != cval + 2 {",
+        "} else if old != cval + 2 && false {", va_b1("emit")));
+    m.push(va_const("gconst-stored-folded", "compiler/iropt.fd",
+        "bad.set(o, 1);\n                                cval.set(cand.get(o) - 1, 0 - 1);",
+        "bad.set(o, 0);", va_b1("emit")));
+    m.push(va_const("promote-join-first-store", "compiler/iropt.fd",
+        "} else if m != s {",
+        "} else if m != s && false {", va_b1("emit")));
+    m.push(va_const("facts-join-assumed", "compiler/iropt.fd",
+        "var sole: bool = ps.len() == 1 && ps.get(0) == b;",
+        "var sole: bool = ps.len() >= 1;", va_b1("emit")));
+    m.push(va_const("facts-float-negated", "compiler/iropt.fd",
+        "if cmask != 0 && iop_is_cmp(iop) && (truth || !fcmp) {",
+        "if cmask != 0 && iop_is_cmp(iop) && (truth || true) {", va_b1("emit")));
+    m.push(va_const("rules-sub-zero-left", "compiler/rules.fd",
+        "v.push(ru(\"x - 0 = x\", RU_SUB, RS_RIGHT, 0, RR_OTHER, 0));",
+        "v.push(ru(\"x - 0 = x\", RU_SUB, RS_LEFT, 0, RR_OTHER, 0));", va_b1("nat")));
+    m.push(va_const("rules-lt-self-true", "compiler/rules.fd",
+        "v.push(ru(\"x < x\", RU_LT, RS_SAME, 0, RR_FALSE, 0));",
+        "v.push(ru(\"x < x\", RU_LT, RS_SAME, 0, RR_TRUE, 0));", va_b1("nat")));
+    m.push(va_const("enc-x64-disp8-128", "compiler/nat_enc.fd",
+        "return v >= 0 - 128 && v <= 127;",
+        "return v >= 0 - 128 && v <= 128;", va_b1("nat")));
+    m.push(va_const("enc-x64-cqo-nop", "compiler/nat_enc.fd",
+        "NatEnc_byte(e, 0x99);",
+        "NatEnc_byte(e, 0x90);", va_b1("nat")));
+    m.push(va_const("ra-calls-clobber-nothing", "compiler/nat_ir.fd",
+        "return ng_label_mask(g, m.i0);",
+        "return 0;", va_b1("nat")));
+    m.push(va_const("iv-sub-as-add", "compiler/iropt.fd",
+        "                    cid = b;\n                    sgn = - 1;",
+        "                    cid = b;\n                    sgn = 1;", va_b1("emit")));
+    m.push(va_const("sccp-add-zero-is-zero", "compiler/iropt.fd",
+        "    if binop_eq(op, BinOp::Add) {\n        if b == 0 {\n            r = a;",
+        "    if binop_eq(op, BinOp::Add) {\n        if b == 0 {\n            r = b;", va_b1("emit")));
+    m.push(va_const("dse-load-not-a-read", "compiler/iropt.fd",
+        "HashMap_remove(pending, int_to_str(p2));",
+        "HashMap_remove(pending, int_to_str(p2 + 1000000007));", va_b1("emit")));
+    m.push(va_const("licm-stores-unseen", "compiler/iropt.fd",
+        "stored.set(p, 1);",
+        "stored.set(p, 0);", va_b1("emit")));
+    m.push(va_const("tailcall-args-reversed", "compiler/iropt.fd",
+        "var st: i64 = iro_detached(f, Inst::Store(slots.get(ai), cargs2.get(ai), OptIrType::None));",
+        "var st: i64 = iro_detached(f, Inst::Store(slots.get(cargs2.len() - 1 - ai), cargs2.get(ai), OptIrType::None));", va_b1("emit")));
+    m.push(va_const("lower-for-range-inclusive", "compiler/lower.fd",
+        "            var cmp_op: BinOp = BinOp::Lt;",
+        "            var cmp_op: BinOp = BinOp::LtEq;", va_b2("emit", "ccompile")));
+    m.push(va_const("c-wrapping-sub-swapped", "compiler/codegen_c.fd",
+        "wln(self, \"    \" + dst + \" = (\" + t + \")(\" + u64l + \" - \" + u64r + \");\");",
+        "wln(self, \"    \" + dst + \" = (\" + t + \")(\" + u64r + \" - \" + u64l + \");\");", va_b1("ccompile")));
+    m.push(va_const("c-ge-as-gt", "compiler/codegen_c.fd",
+        "BinOp::GtEq => {\n            return \">=\";",
+        "BinOp::GtEq => {\n            return \">\";", va_b1("ccompile")));
+    m.push(va_const("promote-addr-escapes", "compiler/nat_ir.fd",
+        "                if u >= 0 && u < n {\n                    cand.set(u, 0);",
+        "                if u >= 0 && u < n && false {\n                    cand.set(u, 0);", va_b1("nat")));
+    m.push(va_const("promote-no-narrow", "compiler/nat_ir.fd",
+        "            cand.set(i, 1 + kind);",
+        "            cand.set(i, 1);", va_b1("nat")));
+    m.push(va_const("coalesce-source-redefined", "compiler/nat_ir.fd",
+        "                    if ddefs.len() == 1 && ddefs.get(0) == k && !ng_any_in(sdefs, lo.get(cd), hi.get(cd), 0 - 1) {",
+        "                    if ddefs.len() == 1 && ddefs.get(0) == k {", va_b1("nat")));
+    m.push(va_const("remat-value-off-by-one", "compiler/nat_ir.fd",
+        "                    remat_val.set(rr, rm.i0);",
+        "                    remat_val.set(rr, rm.i0 + 1);", va_b1("nat")));
+    m.push(va_const("remat-multi-def", "compiler/nat_ir.fd",
+        "            var ok2: bool = rdefs.get(rr2) == 1 && ng_remat_is(remat.get(rr2));",
+        "            var ok2: bool = rdefs.get(rr2) >= 1 && ng_remat_is(remat.get(rr2));", va_b1("nat")));
+    m.push(va_const("brfuse-beqz-not-inverted", "compiler/nat_ir.fd",
+        "            if b0.op == MO_BEQZ {\n                cc = ng_cc_inverse(cc);\n            }\n            if cand_gap.get(c) > 0 && ng_mutant(\"brgap\") {",
+        "            if b0.op == MO_BEQZ && false {\n                cc = ng_cc_inverse(cc);\n            }\n            if cand_gap.get(c) > 0 && ng_mutant(\"brgap\") {", va_b1("nat")));
+    m.push(va_const("brfuse-live-ignored", "compiler/nat_ir.fd",
+        "        if !live {\n            var setcc: MInst = mir.get(cand_pos.get(cand_at.get(c + 1) - 1));",
+        "        if true {\n            var setcc: MInst = mir.get(cand_pos.get(cand_at.get(c + 1) - 1));", va_b1("nat")));
+    m.push(va_const("addshl-shift-off-by-one", "compiler/nat_ir.fd",
+        "        ng_addshl(g, g.t2, g.t2, g.t1, 3);",
+        "        ng_addshl(g, g.t2, g.t2, g.t1, 2);", va_b1("nat")));
+    m.push(va_const("egraph-ge-as-gt", "compiler/egraph.fd",
+        "    } else if op == EB_GE {\n        if a >= b {\n            r = 1;",
+        "    } else if op == EB_GE {\n        if a > b {\n            r = 1;", va_b1("nat")));
+    return m;
+}

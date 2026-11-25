@@ -1,0 +1,261 @@
+// tools/sanitize.fd — the test programs through the C backend under the
+// sanitizers: the Fides port of scripts/sanitize.sh (roadmap AD4, release
+// M8). Same arguments, the same environment (FID, CC, SAN, OUT, LIMIT,
+// COMPILER, SELF, ASAN_OPTIONS, UBSAN_OPTIONS, TSAN_OPTIONS), the same
+// files in $OUT and the same output and exit status:
+//
+//   fid ccompile tools/sanitize.fd -o sanitize.exe
+//   FID=release/fid CC=clang sanitize.exe [test ...]
+//   SAN=undefined sanitize.exe
+//   fid run tools/sanitize.fd [test ...]
+//
+// Run it from the repository root. Each tests/bootstrap/test_*.fd that is
+// not an expected-fail test is built with `fid ccompile` and
+// FIDES_CFLAGS="-fsanitize=$SAN ..." and run (LIMIT seconds, no input);
+// its output must match `fid run` and the sanitizers must stay quiet (see
+// the script's header for how a difference is told apart, SAN=thread and
+// COMPILER=1). The C compiler and its sanitizer runtimes stay external, and
+// so does scripts/verify/build-variant.sh, which COMPILER=1 runs to build
+// the sanitized compiler.
+//
+// Differences: a run's output is read from a file, where the script's
+// `$(...)` would also drop NUL bytes; every child's stdin is at its end.
+
+use core;
+use fs;
+use io;
+use process;
+use target_test_lib;
+
+/// Did the sanitizers report anything in `path`?
+fn sz_hit(path: str) -> bool {
+    val t: str = tt_read(path);
+    return str_contains(t, "ERROR: AddressSanitizer") || str_contains(t, "runtime error:") || str_contains(t, "ERROR: LeakSanitizer") || str_contains(t, "WARNING: ThreadSanitizer") || str_contains(t, "ERROR: ThreadSanitizer");
+}
+
+/// `[ -x path ]` (on Windows also path.exe, as Git Bash finds it).
+fn sz_is_x(p: str) -> bool {
+    if fs_exists(p) && !fs_is_dir(p) { return true; }
+    return process_is_windows() && fs_exists(p + ".exe");
+}
+
+var sz_limit: i64 = 0;
+
+/// `$(run_quiet argv 2> err)`: what it printed on stdout, without its
+/// trailing newlines.
+fn sz_capture(argv: Vec<str>, env: Vec<str>, err: str, tmp: str) -> str {
+    tt_run(argv, env, tmp, err, sz_limit);
+    val s: str = tt_chomp(tt_read(tmp));
+    fs_delete(tmp);
+    return s;
+}
+
+fn sz_v3(a: str, b: str, c: str) -> Vec<str> {
+    var v: Vec<str> = Vec::new();
+    v.push(a);
+    v.push(b);
+    v.push(c);
+    return v;
+}
+
+fn sz_v1(a: str) -> Vec<str> {
+    var v: Vec<str> = Vec::new();
+    v.push(a);
+    return v;
+}
+
+fn sz_skip_name(name: str) -> bool {
+    return name == "test_sqlite" || str_starts_with(name, "test_gpu") || str_starts_with(name, "test_sdl");
+}
+
+fn main() -> i64 {
+    val args: Vec<str> = tt_args();
+    var fid: str = tt_env_or("FID", "release/fid");
+    if !sz_is_x(fid) { fid = "release/fid.exe"; }
+    val cc: str = tt_env_or("CC", "clang");
+    val san: str = tt_env_or("SAN", "address,undefined");
+    var out: str = tt_env("OUT");
+    if str_len(out) == 0 { out = tt_env_or("TMPDIR", "/tmp") + "/fid-sanitize"; }
+    tt_mkdir_p(out);
+    val csan: str = "," + san + ",";
+    if str_contains(csan, ",thread,") && (str_contains(csan, ",address,") || str_contains(csan, ",memory,")) {
+        println("sanitize: ThreadSanitizer cannot be combined with ASan/MSan (SAN=" + san + ")");
+        return 2;
+    }
+    var recover: str = "";
+    if str_contains(csan, ",undefined,") { recover = "-fno-sanitize-recover=undefined"; }
+    val cflags: str = "-fsanitize=" + san + " " + recover + " -fno-omit-frame-pointer -g";
+    var env: Vec<str> = Vec::new();
+    env.push("CC=" + cc);
+    env.push("FIDES_CFLAGS=" + cflags);
+    env.push("FIDES_NO_CACHE=1");
+    env.push("ASAN_OPTIONS=" + tt_env_or("ASAN_OPTIONS", "detect_leaks=0:abort_on_error=0:halt_on_error=1"));
+    env.push("UBSAN_OPTIONS=" + tt_env_or("UBSAN_OPTIONS", "print_stacktrace=1:halt_on_error=1"));
+    env.push("TSAN_OPTIONS=" + tt_env_or("TSAN_OPTIONS", "halt_on_error=1:second_deadlock_stack=1"));
+
+    var tests: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    if args.len() > 0 {
+        while i < args.len() {
+            var t: str = args.get(i);
+            i = i + 1;
+            if str_ends_with(t, ".fd") { t = str_slice(t, 0, str_len(t) - 3); }
+            tests.push("tests/bootstrap/" + t + ".fd");
+        }
+    } else if str_contains(san, "thread") {
+        val ts: Vec<str> = str_split("real_threads test_threads test_tasks test_tasks_10k test_spawn_scope test_spawn_deep_copy test_spawn_vec_copy test_channel test_channels_select test_chan_send_copy test_parallel test_parallel_branches test_parallel_concurrent test_lib_atomic test_async test_async_executor test_async_threads test_async_interleave test_async_io test_async_state test_async_suspend test_async_float_struct", " ");
+        while i < ts.len() {
+            val p: str = "tests/bootstrap/" + ts.get(i) + ".fd";
+            i = i + 1;
+            if fs_exists(p) && !fs_is_dir(p) { tests.push(p); }
+        }
+    } else {
+        tests = tt_glob("tests/bootstrap", "test_", ".fd");
+    }
+
+    var pass: i64 = 0;
+    var fail: i64 = 0;
+    var skip: i64 = 0;
+    var nondet: i64 = 0;
+    var failed: Vec<str> = Vec::new();
+    sz_limit = str_parse_int(tt_env_or("LIMIT", "300"));
+    if !tt_which("timeout") && !tt_which("gtimeout") { sz_limit = 0; }
+    val tmp: str = out + "/.sanitize-" + int_to_str(p_getpid()) + ".out";
+
+    if tt_env_set("COMPILER") {
+        var sanfid: str = out + "/fid-san";
+        println("building the compiler with -fsanitize=" + san + " into " + sanfid + " ...");
+        var benv: Vec<str> = Vec::new();
+        var e: i64 = 0;
+        while e < env.len() {
+            benv.push(env.get(e));
+            e = e + 1;
+        }
+        benv.push("EXTRA_CFLAGS=" + cflags);
+        benv.push("FID=" + fid);
+        var bv: Vec<str> = sz_v3("bash", "scripts/verify/build-variant.sh", ".");
+        bv.push(sanfid);
+        if tt_run(bv, benv, "", "", 0) != 0 {
+            println("sanitize: could not build the sanitized compiler");
+            return 1;
+        }
+        if !(fs_exists(sanfid) && !fs_is_dir(sanfid)) { sanfid = sanfid + ".exe"; }
+        i = 0;
+        while i < tests.len() {
+            val f: str = tests.get(i);
+            i = i + 1;
+            val name: str = tt_base(f);
+            if sz_skip_name(name) {
+                skip = skip + 1;
+                continue;
+            }
+            var bad: str = "";
+            val steps: Vec<str> = sz_v3("check", "dump-c", "run");
+            var s: i64 = 0;
+            while s < steps.len() {
+                val step: str = steps.get(s);
+                s = s + 1;
+                val log: str = out + "/" + name + ".fid-" + step + ".san";
+                tt_run(sz_v3(sanfid, step, f), env, out + "/" + name + ".fid-" + step + ".out", log, 900);
+                if sz_hit(log) {
+                    bad = bad + " " + step + "(sanitizer: " + log + ")";
+                    continue;
+                }
+                if step == "dump-c" {
+                    tt_run(sz_v3(fid, step, f), env, out + "/" + name + ".ref-" + step + ".out", tt_null(), 900);
+                    if tt_read(out + "/" + name + ".fid-" + step + ".out") != tt_read(out + "/" + name + ".ref-" + step + ".out") {
+                        bad = bad + " " + step + "(differs from " + fid + ")";
+                    }
+                }
+            }
+            if str_len(bad) > 0 {
+                fail = fail + 1;
+                failed.push(name + ":" + bad);
+            } else {
+                pass = pass + 1;
+            }
+        }
+        if tt_env_set("SELF") {
+            tt_run(sz_v3(sanfid, "dump-c", "compiler/main.fd"), env, out + "/self.c", out + "/self.san", 7200);
+            if sz_hit(out + "/self.san") {
+                fail = fail + 1;
+                failed.push("compiler/main.fd (sanitizer: " + out + "/self.san)");
+            } else {
+                pass = pass + 1;
+            }
+        }
+        println("sanitize compiler (" + san + "): " + int_to_str(pass) + " clean, " + int_to_str(fail) + " failed, " + int_to_str(skip) + " skipped");
+        i = 0;
+        while i < failed.len() {
+            println("  FAIL " + failed.get(i));
+            i = i + 1;
+        }
+        if fail == 0 { return 0; }
+        return 1;
+    }
+
+    // a build without the sanitizers
+    var penv: Vec<str> = Vec::new();
+    i = 0;
+    while i < env.len() {
+        if !str_starts_with(env.get(i), "FIDES_CFLAGS=") { penv.push(env.get(i)); }
+        i = i + 1;
+    }
+    penv.push("FIDES_CFLAGS=");
+    i = 0;
+    while i < tests.len() {
+        val f: str = tests.get(i);
+        i = i + 1;
+        val name: str = tt_base(f);
+        if str_ends_with(name, "_fail") || sz_skip_name(name) {
+            skip = skip + 1;
+            continue;
+        }
+        val want: str = sz_capture(sz_v3(fid, "run", f), env, tt_null(), tmp);
+        val exe: str = out + "/" + name;
+        var bc: Vec<str> = sz_v3(fid, "ccompile", f);
+        bc.push("-o");
+        bc.push(exe);
+        if tt_run(bc, env, out + "/" + name + ".build", "", 0) != 0 {
+            skip = skip + 1;
+            continue;
+        }
+        val got: str = sz_capture(sz_v1(exe), env, out + "/" + name + ".san", tmp);
+        if sz_hit(out + "/" + name + ".san") {
+            fail = fail + 1;
+            failed.push(name + " (sanitizer: " + out + "/" + name + ".san)");
+        } else if got != want {
+            val want2: str = sz_capture(sz_v3(fid, "run", f), env, tt_null(), tmp);
+            if want2 != want {
+                nondet = nondet + 1;
+                pass = pass + 1;
+                continue;
+            }
+            var plain: str = "";
+            var pc: Vec<str> = sz_v3(fid, "ccompile", f);
+            pc.push("-o");
+            pc.push(exe + ".plain");
+            if tt_run(pc, penv, tt_null(), "", 0) == 0 {
+                plain = sz_capture(sz_v1(exe + ".plain"), env, tt_null(), tmp);
+            }
+            fail = fail + 1;
+            if plain == got {
+                failed.push(name + " (output differs from fid run, also built without sanitizers)");
+            } else {
+                failed.push(name + " (output differs from fid run only under the sanitizers)");
+            }
+        } else {
+            pass = pass + 1;
+        }
+    }
+    var summary: str = "sanitize (" + san + "): " + int_to_str(pass) + " clean, " + int_to_str(fail) + " failed, " + int_to_str(skip) + " skipped (" + int_to_str(nondet) + " of the clean ones print different things each run: sanitizer reports only)\n";
+    i = 0;
+    while i < failed.len() {
+        summary = summary + "  FAIL " + failed.get(i) + "\n";
+        i = i + 1;
+    }
+    print(summary);
+    fs_write_text(out + "/summary.san", summary);
+    if fail == 0 { return 0; }
+    return 1;
+}

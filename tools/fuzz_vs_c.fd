@@ -1,0 +1,2181 @@
+// tools/fuzz_vs_c.fd — random Fides programs, each with an equivalent C
+// program (roadmap VF2): the Fides port of scripts/fuzz/gen_vs_c.py
+// (roadmap AD4). Same arguments, the same pair of programs for a seed (the
+// numbers are drawn from tools/py_random.fd, Python's own generator), the
+// same output, kept files, log and exit status:
+//
+//   fid ccompile tools/fuzz_vs_c.fd -o fuzz_vs_c.exe
+//   fuzz_vs_c.exe [-n 100] [--seed 1] [--fid release/fid.exe]
+//                 [--backends run,ccompile,emit | all] [--cc clang,gcc]
+//                 [--keep build/fuzz-c] [--avoid all|none|<list>]
+//                 [--ext] [--ext2] [--jobs N] [--log FILE]
+//   fuzz_vs_c.exe --print <seed>      # show one pair
+//
+// The script's header (scripts/fuzz/gen_vs_c.py) says what the programs
+// use, which backends there are and how the C oracle is built (zig cc at
+// -O0 and -O2; gcc in WSL on Windows, the host's elsewhere).
+//
+// Differences from the script: --jobs N runs N copies of this tool at
+// once, one seed each (the script runs N threads); in both the seeds are
+// reported in the order they finish. A child's output is read as UTF-8.
+// A bad option value is "fuzz_vs_c: ..." with exit status 2 (argparse
+// prints its usage); an option is not taken from an abbreviation.
+
+use core;
+use fs;
+use io;
+use process;
+use py_random;
+use fuzz_lib;
+
+// ─── Types and precedence ───
+
+fn types() -> Vec<str> {
+    var v: Vec<str> = Vec::new();
+    v.push("i8");
+    v.push("i16");
+    v.push("i32");
+    v.push("i64");
+    v.push("u8");
+    v.push("u16");
+    v.push("u32");
+    v.push("u64");
+    return v;
+}
+
+fn is_type(t: str) -> bool {
+    val ts: Vec<str> = types();
+    return fl_contains(&ts, t);
+}
+
+fn bits(t: str) -> i64 {
+    return fl_int(str_slice(t, 1, str_len(t)), 64);
+}
+
+fn cty(t: str) -> str {
+    if str_byte_at(t, 0) == 105 { return "int" + int_to_str(bits(t)) + "_t"; }
+    return "uint" + int_to_str(bits(t)) + "_t";
+}
+
+/// CTY.get(t, t)
+fn cty_or(t: str) -> str {
+    if is_type(t) { return cty(t); }
+    return t;
+}
+
+fn signed(t: str) -> bool {
+    return str_byte_at(t, 0) == 105;
+}
+
+fn prec(op: str) -> i64 {
+    if op == "||" { return 4; }
+    if op == "|" { return 5; }
+    if op == "^" { return 6; }
+    if op == "&" { return 7; }
+    if op == "<<" || op == ">>" { return 8; }
+    if op == "&&" { return 9; }
+    if op == "==" || op == "!=" { return 10; }
+    if op == "<" || op == ">" || op == "<=" || op == ">=" { return 11; }
+    if op == "+" || op == "-" { return 12; }
+    return 13;
+}
+
+fn unary() -> i64 { return 14; }
+fn postfix() -> i64 { return 15; }
+fn atom() -> i64 { return 16; }
+
+/// An expression: Fides text with its precedence, and C text.
+pub struct E {
+    pub fd: str,
+    pub prec: i64,
+    pub c: str,
+    pub lit: bool,
+}
+
+fn mk(fd: str, p: i64, c: str) -> E {
+    return E { fd: fd, prec: p, c: c, lit: false };
+}
+
+fn wrap(e: &E, need: i64) -> str {
+    if e.prec >= need { return e.fd; }
+    return "(" + e.fd + ")";
+}
+
+fn known() -> Vec<str> {
+    var v: Vec<str> = Vec::new();
+    v.push("same-width-cast");
+    v.push("nested-if-value");
+    v.push("println-u64");
+    v.push("bitnot-narrow");
+    v.push("for-continue");
+    v.push("self-assign");
+    v.push("for-match-break");
+    return v;
+}
+
+// ─── The generator (class Gen, class Scope) ───
+
+/// Scopes are frames in the generator: a frame's parent, what it took
+/// from it (vec, ext) and whether it is inside a match on en; the
+/// variables of all frames in the order they were added, each with its
+/// frame (Scope.all_vars: the chain's frames, root first).
+pub struct Gen {
+    pub r: PyRng,
+    pub st_name: Vec<str>,
+    pub st_fn: Vec<Vec<str>>,
+    pub st_ft: Vec<Vec<str>>,
+    pub h_name: Vec<str>,
+    pub h_pn: Vec<Vec<str>>,
+    pub h_pt: Vec<Vec<str>>,
+    pub h_ret: Vec<str>,
+    pub wrapping: bool,
+    pub counter: i64,
+    pub ext: bool,
+    pub ext2: bool,
+    pub avoid: Vec<str>,
+    pub fr_parent: Vec<i64>,
+    pub fr_vec: Vec<i64>,
+    pub fr_ext: Vec<i64>,
+    pub fr_lock: Vec<i64>,
+    pub v_fr: Vec<i64>,
+    pub v_name: Vec<str>,
+    pub v_ty: Vec<str>,
+    pub v_mut: Vec<i64>,
+    pub s_fr: Vec<i64>,
+    pub s_name: Vec<str>,
+    pub s_st: Vec<str>,
+    pub s_mut: Vec<i64>,
+}
+
+fn gen_new(seed: i64, ext: bool, ext2: bool, avoid: &Vec<str>) -> Gen {
+    var av: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < avoid.len() {
+        av.push(avoid.get(i));
+        i = i + 1;
+    }
+    return Gen {
+        r: py_rng(seed), st_name: Vec::new(), st_fn: Vec::new(), st_ft: Vec::new(),
+        h_name: Vec::new(), h_pn: Vec::new(), h_pt: Vec::new(), h_ret: Vec::new(),
+        wrapping: false, counter: 0, ext: ext || ext2, ext2: ext2, avoid: av,
+        fr_parent: Vec::new(), fr_vec: Vec::new(), fr_ext: Vec::new(), fr_lock: Vec::new(),
+        v_fr: Vec::new(), v_name: Vec::new(), v_ty: Vec::new(), v_mut: Vec::new(),
+        s_fr: Vec::new(), s_name: Vec::new(), s_st: Vec::new(), s_mut: Vec::new()
+    };
+}
+
+fn rnd(g: &mut Gen) -> f64 {
+    return py_random(&mut g.r);
+}
+
+fn randint(g: &mut Gen, a: i64, b: i64) -> i64 {
+    return py_randint(&mut g.r, a, b);
+}
+
+fn below(g: &mut Gen, n: i64) -> i64 {
+    return py_below(&mut g.r, n);
+}
+
+fn choice(g: &mut Gen, v: &Vec<str>) -> str {
+    return v.get(py_below(&mut g.r, v.len()));
+}
+
+fn avoiding(g: &Gen, name: str) -> bool {
+    return fl_contains(&g.avoid, name);
+}
+
+fn fresh(g: &mut Gen, p: str) -> str {
+    g.counter = g.counter + 1;
+    return p + int_to_str(g.counter);
+}
+
+fn cast_ok(g: &Gen, u: str, t: str) -> bool {
+    if !avoiding(g, "same-width-cast") { return true; }
+    return u == t || bits(u) != bits(t) || bits(t) == 64;
+}
+
+/// Scope(): a root frame.
+fn sc_root(g: &mut Gen) -> i64 {
+    g.fr_parent.push(-1);
+    g.fr_vec.push(0);
+    g.fr_ext.push(0);
+    g.fr_lock.push(0);
+    return g.fr_parent.len() - 1;
+}
+
+/// sc.child()
+fn sc_child(g: &mut Gen, sc: i64) -> i64 {
+    g.fr_parent.push(sc);
+    g.fr_vec.push(g.fr_vec.get(sc));
+    g.fr_ext.push(g.fr_ext.get(sc));
+    g.fr_lock.push(0);
+    return g.fr_parent.len() - 1;
+}
+
+fn sc_add(g: &mut Gen, sc: i64, n: str, t: str, m: bool) {
+    g.v_fr.push(sc);
+    g.v_name.push(n);
+    g.v_ty.push(t);
+    if m { g.v_mut.push(1); } else { g.v_mut.push(0); }
+}
+
+fn sc_add_struct(g: &mut Gen, sc: i64, n: str, s: str, m: bool) {
+    g.s_fr.push(sc);
+    g.s_name.push(n);
+    g.s_st.push(s);
+    if m { g.s_mut.push(1); } else { g.s_mut.push(0); }
+}
+
+fn sc_chain(g: &Gen, sc: i64) -> Vec<i64> {
+    var rev: Vec<i64> = Vec::new();
+    var f: i64 = sc;
+    while f >= 0 {
+        rev.push(f);
+        f = g.fr_parent.get(f);
+    }
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = rev.len() - 1;
+    while i >= 0 {
+        out.push(rev.get(i));
+        i = i - 1;
+    }
+    return out;
+}
+
+/// Pairs of names and types (or struct names).
+pub struct NT {
+    pub n: Vec<str>,
+    pub t: Vec<str>,
+}
+
+/// sc.ints() (mutable_only: sc.mutable_ints())
+fn sc_ints(g: &Gen, sc: i64, mutable_only: bool) -> NT {
+    var out: NT = NT { n: Vec::new(), t: Vec::new() };
+    val ch: Vec<i64> = sc_chain(g, sc);
+    var c: i64 = 0;
+    while c < ch.len() {
+        val f: i64 = ch.get(c);
+        var i: i64 = 0;
+        while i < g.v_fr.len() {
+            if g.v_fr.get(i) == f && (!mutable_only || g.v_mut.get(i) == 1) {
+                out.n.push(g.v_name.get(i));
+                out.t.push(g.v_ty.get(i));
+            }
+            i = i + 1;
+        }
+        c = c + 1;
+    }
+    return out;
+}
+
+/// sc.structs()
+fn sc_structs(g: &Gen, sc: i64) -> NT {
+    var out: NT = NT { n: Vec::new(), t: Vec::new() };
+    val ch: Vec<i64> = sc_chain(g, sc);
+    var c: i64 = 0;
+    while c < ch.len() {
+        val f: i64 = ch.get(c);
+        var i: i64 = 0;
+        while i < g.s_fr.len() {
+            if g.s_fr.get(i) == f {
+                out.n.push(g.s_name.get(i));
+                out.t.push(g.s_st.get(i));
+            }
+            i = i + 1;
+        }
+        c = c + 1;
+    }
+    return out;
+}
+
+fn sc_is_mutable(g: &Gen, sc: i64, n: str) -> bool {
+    val ch: Vec<i64> = sc_chain(g, sc);
+    var c: i64 = 0;
+    while c < ch.len() {
+        val f: i64 = ch.get(c);
+        var i: i64 = 0;
+        while i < g.s_fr.len() {
+            if g.s_fr.get(i) == f && g.s_name.get(i) == n && g.s_mut.get(i) == 1 { return true; }
+            i = i + 1;
+        }
+        c = c + 1;
+    }
+    return false;
+}
+
+fn sc_has_vec(g: &Gen, sc: i64) -> bool {
+    return g.fr_vec.get(sc) == 1;
+}
+
+fn sc_en_locked(g: &Gen, sc: i64) -> bool {
+    var f: i64 = sc;
+    while f >= 0 {
+        if g.fr_lock.get(f) == 1 { return true; }
+        f = g.fr_parent.get(f);
+    }
+    return false;
+}
+
+fn struct_index(g: &Gen, sname: str) -> i64 {
+    return fl_index(&g.st_name, sname);
+}
+
+// ─── Expressions ───
+
+fn lit(g: &mut Gen, t: str) -> E {
+    var vs: Vec<str> = Vec::new();
+    vs.push("0");
+    vs.push("1");
+    vs.push("2");
+    vs.push("3");
+    vs.push("5");
+    vs.push("7");
+    vs.push("9");
+    vs.push("15");
+    vs.push("16");
+    vs.push("31");
+    vs.push("63");
+    vs.push("64");
+    vs.push("100");
+    vs.push("127");
+    val v: str = choice(g, &vs);
+    return E { fd: v, prec: atom(), c: "((" + cty(t) + ")" + v + ")", lit: true };
+}
+
+fn leaf(g: &mut Gen, t: str, sc: i64) -> E {
+    val ints: NT = sc_ints(g, sc, false);
+    var vs: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < ints.n.len() {
+        if ints.t.get(i) == t { vs.push(ints.n.get(i)); }
+        i = i + 1;
+    }
+    var fs: Vec<str> = Vec::new();
+    val ss: NT = sc_structs(g, sc);
+    i = 0;
+    while i < ss.n.len() {
+        val si: i64 = struct_index(g, ss.t.get(i));
+        if si >= 0 {
+            val fnm: Vec<str> = g.st_fn.get(si);
+            val fty: Vec<str> = g.st_ft.get(si);
+            var j: i64 = 0;
+            while j < fnm.len() {
+                if fty.get(j) == t { fs.push(ss.n.get(i) + "." + fnm.get(j)); }
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+    val k: f64 = rnd(g);
+    if vs.len() > 0 && k < 0.55 {
+        val v: str = choice(g, &vs);
+        return mk(v, atom(), v);
+    }
+    if fs.len() > 0 && k < 0.7 {
+        val sf: str = choice(g, &fs);
+        return mk(sf, postfix(), sf);
+    }
+    if t == "i64" && sc_has_vec(g, sc) && k < 0.75 {
+        return mk("xs.len()", postfix(), "vlen(&xs)");
+    }
+    var on: Vec<str> = Vec::new();
+    i = 0;
+    while i < ints.n.len() {
+        if cast_ok(g, ints.t.get(i), t) { on.push(ints.n.get(i)); }
+        i = i + 1;
+    }
+    if on.len() > 0 && k < 0.85 {
+        val v2: str = choice(g, &on);
+        return mk(v2 + " as " + t, postfix(), "((" + cty(t) + ")" + v2 + ")");
+    }
+    return lit(g, t);
+}
+
+fn helpers_with(g: &Gen, t: str) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < g.h_ret.len() {
+        if g.h_ret.get(i) == t { out.push(i); }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn expr(g: &mut Gen, t: str, sc: i64, d: i64) -> E {
+    if d <= 0 || rnd(g) < 0.25 {
+        return leaf(g, t, sc);
+    }
+    val k: f64 = rnd(g);
+    if k < 0.45 {
+        return binop(g, t, sc, d);
+    }
+    if k < 0.55 {
+        var us: Vec<str> = Vec::new();
+        val ts: Vec<str> = types();
+        var i: i64 = 0;
+        while i < ts.len() {
+            if cast_ok(g, ts.get(i), t) { us.push(ts.get(i)); }
+            i = i + 1;
+        }
+        val u: str = choice(g, &us);
+        var a: E = expr(g, u, sc, d - 1);
+        if a.lit {
+            a = mk("(" + a.fd + " as " + u + ")", atom(), a.c);
+        }
+        return mk(wrap(&a, postfix()) + " as " + t, postfix(), "((" + cty(t) + ")(" + a.c + "))");
+    }
+    if k < 0.62 {
+        val a2: E = expr(g, t, sc, d - 1);
+        if a2.lit { return a2; }
+        if signed(t) && rnd(g) < 0.5 {
+            var fname: str = "neg_" + t;
+            if g.wrapping { fname = "wneg_" + t; }
+            return mk("-" + wrap(&a2, unary()), unary(), fname + "(" + a2.c + ")");
+        }
+        if avoiding(g, "bitnot-narrow") && !signed(t) && bits(t) < 64 {
+            val mask: i64 = (1 << bits(t)) - 1;
+            return mk("(~" + wrap(&a2, unary()) + " & (" + int_to_str(mask) + " as " + t + "))", atom(), "((" + cty(t) + ")~(" + a2.c + "))");
+        }
+        return mk("~" + wrap(&a2, unary()), unary(), "((" + cty(t) + ")~(" + a2.c + "))");
+    }
+    val hs: Vec<i64> = helpers_with(g, t);
+    if k < 0.70 && hs.len() > 0 {
+        val h: i64 = hs.get(below(g, hs.len()));
+        val pn: Vec<str> = g.h_pn.get(h);
+        val pt: Vec<str> = g.h_pt.get(h);
+        var args: Vec<str> = Vec::new();
+        var cargs: Vec<str> = Vec::new();
+        var i2: i64 = 0;
+        while i2 < pn.len() {
+            val ptype: str = pt.get(i2);
+            if is_type(ptype) {
+                val a3: E = expr(g, ptype, sc, d - 1);
+                args.push(a3.fd);
+                cargs.push(a3.c);
+            } else {
+                val ss: NT = sc_structs(g, sc);
+                var cands: Vec<str> = Vec::new();
+                var j: i64 = 0;
+                while j < ss.n.len() {
+                    if ss.t.get(j) == ptype { cands.push(ss.n.get(j)); }
+                    j = j + 1;
+                }
+                if cands.len() == 0 {
+                    return leaf(g, t, sc);
+                }
+                val s: str = choice(g, &cands);
+                args.push(s);
+                cargs.push(s);
+            }
+            i2 = i2 + 1;
+        }
+        val hn: str = g.h_name.get(h);
+        return mk(hn + "(" + fl_join_lines(&args, ", ") + ")", postfix(), hn + "(" + fl_join_lines(&cargs, ", ") + ")");
+    }
+    if k < 0.76 && t == "i64" && sc_has_vec(g, sc) {
+        var ix: E = expr(g, "i64", sc, d - 1);
+        if rnd(g) < 0.9 {
+            ix = mk("(" + wrap(&ix, prec("&") + 1) + " & 3)", atom(), "((" + ix.c + ") & 3)");
+        }
+        if rnd(g) < 0.5 {
+            return mk("xs.get(" + ix.fd + ")", postfix(), "vget(&xs, " + ix.c + ")");
+        }
+        return mk("xs[" + ix.fd + "]", postfix(), "vget(&xs, " + ix.c + ")");
+    }
+    if k < 0.84 {
+        val c: E = cond(g, sc, d - 1);
+        var a4: E = expr(g, t, sc, d - 1);
+        var b4: E = expr(g, t, sc, d - 1);
+        if a4.lit { a4 = mk("(" + a4.fd + " as " + t + ")", atom(), a4.c); }
+        if b4.lit { b4 = mk("(" + b4.fd + " as " + t + ")", atom(), b4.c); }
+        if avoiding(g, "nested-if-value") {
+            a4 = mk(wrap(&a4, 1), atom(), a4.c);
+            b4 = mk(wrap(&b4, 1), atom(), b4.c);
+        }
+        return mk("if " + c.fd + " { " + a4.fd + " } else { " + b4.fd + " }", 0, "((" + c.c + ") ? (" + a4.c + ") : (" + b4.c + "))");
+    }
+    return binop(g, t, sc, d);
+}
+
+fn binop(g: &mut Gen, t: str, sc: i64, d: i64) -> E {
+    var ops: Vec<str> = Vec::new();
+    ops.push("+");
+    ops.push("-");
+    ops.push("*");
+    ops.push("/");
+    ops.push("%");
+    ops.push("&");
+    ops.push("|");
+    ops.push("^");
+    ops.push("<<");
+    ops.push(">>");
+    ops.push("+");
+    ops.push("*");
+    ops.push("-");
+    val op: str = choice(g, &ops);
+    var a: E = expr(g, t, sc, d - 1);
+    var b: E = expr(g, t, sc, d - 1);
+    if a.lit && b.lit {
+        a = mk("(" + a.fd + " as " + t + ")", atom(), a.c);
+    }
+    val nb: i64 = bits(t);
+    var c: str = "";
+    if op == "<<" || op == ">>" {
+        val m: str = int_to_str(nb - 1);
+        b = mk("(" + wrap(&b, prec("&") + 1) + " & " + m + ")", atom(), "((" + cty(t) + ")((" + b.c + ") & " + m + "))");
+        var sfx: str = "shr";
+        if op == "<<" { sfx = "shl"; }
+        c = sfx + "_" + t + "(" + a.c + ", " + b.c + ")";
+    } else if (op == "/" || op == "%") && (g.wrapping || rnd(g) < 0.85) {
+        b = mk("((" + wrap(&b, prec("&") + 1) + " & 15) | 1)", atom(), "((" + cty(t) + ")(((" + b.c + ") & 15) | 1))");
+        var name: str = "rem";
+        if op == "/" { name = "div"; }
+        c = name + "_" + t + "(" + a.c + ", " + b.c + ")";
+    } else {
+        var name2: str = op_name(op);
+        if g.wrapping && (name2 == "add" || name2 == "sub" || name2 == "mul") { name2 = "w" + name2; }
+        c = name2 + "_" + t + "(" + a.c + ", " + b.c + ")";
+    }
+    val p: i64 = prec(op);
+    return mk(wrap(&a, p) + " " + op + " " + wrap(&b, p + 1), p, c);
+}
+
+fn op_name(op: str) -> str {
+    if op == "+" { return "add"; }
+    if op == "-" { return "sub"; }
+    if op == "*" { return "mul"; }
+    if op == "/" { return "div"; }
+    if op == "%" { return "rem"; }
+    if op == "&" { return "and"; }
+    if op == "|" { return "or"; }
+    return "xor";
+}
+
+fn cmp_ops() -> Vec<str> {
+    var v: Vec<str> = Vec::new();
+    v.push("<");
+    v.push(">");
+    v.push("<=");
+    v.push(">=");
+    v.push("==");
+    v.push("!=");
+    return v;
+}
+
+fn cond(g: &mut Gen, sc: i64, d: i64) -> E {
+    val k: f64 = rnd(g);
+    if d > 0 && k < 0.2 {
+        val a: E = cond(g, sc, d - 1);
+        val b: E = cond(g, sc, d - 1);
+        val op: str = choice(g, &fl_v2("&&", "||"));
+        val p: i64 = prec(op);
+        return mk(wrap(&a, p) + " " + op + " " + wrap(&b, p + 1), p, "((" + a.c + ") " + op + " (" + b.c + "))");
+    }
+    if d > 0 && k < 0.27 {
+        val a2: E = cond(g, sc, d - 1);
+        return mk("!" + wrap(&a2, unary()), unary(), "(!(" + a2.c + "))");
+    }
+    if k < 0.33 && g.st_name.len() > 0 && sc_structs(g, sc).n.len() >= 2 {
+        val ss: NT = sc_structs(g, sc);
+        val i1: i64 = below(g, ss.n.len());
+        val s1: str = ss.n.get(i1);
+        val n1: str = ss.t.get(i1);
+        var same: Vec<str> = Vec::new();
+        var j: i64 = 0;
+        while j < ss.n.len() {
+            if ss.t.get(j) == n1 && ss.n.get(j) != s1 { same.push(ss.n.get(j)); }
+            j = j + 1;
+        }
+        if same.len() > 0 {
+            val s2: str = choice(g, &same);
+            val op2: str = choice(g, &fl_v2("==", "!="));
+            val fnm: Vec<str> = g.st_fn.get(struct_index(g, n1));
+            var parts: Vec<str> = Vec::new();
+            var f: i64 = 0;
+            while f < fnm.len() {
+                parts.push("(" + s1 + "." + fnm.get(f) + " == " + s2 + "." + fnm.get(f) + ")");
+                f = f + 1;
+            }
+            val eq: str = fl_join_lines(&parts, " && ");
+            var c: str = "(!(" + eq + "))";
+            if op2 == "==" { c = "(" + eq + ")"; }
+            return mk(s1 + " " + op2 + " " + s2, prec(op2), c);
+        }
+    }
+    val ts: Vec<str> = types();
+    val t: str = choice(g, &ts);
+    var dd: i64 = d - 1;
+    if dd < 0 { dd = 0; }
+    var a3: E = expr(g, t, sc, dd);
+    val b3: E = expr(g, t, sc, dd);
+    if a3.lit && b3.lit { a3 = mk("(" + a3.fd + " as " + t + ")", atom(), a3.c); }
+    val ops: Vec<str> = cmp_ops();
+    val op3: str = choice(g, &ops);
+    val p3: i64 = prec(op3);
+    return mk(wrap(&a3, p3 + 1) + " " + op3 + " " + wrap(&b3, p3 + 1), p3, "((" + a3.c + ") " + op3 + " (" + b3.c + "))");
+}
+
+/// The Fides and C lines of a statement list.
+pub struct FC {
+    pub fd: Vec<str>,
+    pub c: Vec<str>,
+}
+
+fn fc_new() -> FC {
+    return FC { fd: Vec::new(), c: Vec::new() };
+}
+
+fn add_all(v: &mut Vec<str>, more: &Vec<str>) {
+    var i: i64 = 0;
+    while i < more.len() {
+        v.push(more.get(i));
+        i = i + 1;
+    }
+}
+
+fn fc_add(out: &mut FC, more: &FC) {
+    add_all(&mut out.fd, &more.fd);
+    add_all(&mut out.c, &more.c);
+}
+
+fn print_stmt(g: &Gen, n: str, t: str, pad: str, out: &mut FC) {
+    if t == "u64" && avoiding(g, "println-u64") {
+        out.fd.push(pad + "print(" + n + "); print(\"\\n\");");
+    } else {
+        out.fd.push(pad + "println(" + n + ");");
+    }
+    if signed(t) {
+        out.c.push(pad + "printf(\"%lld\\n\", (long long)" + n + ");");
+    } else {
+        out.c.push(pad + "printf(\"%llu\\n\", (unsigned long long)" + n + ");");
+    }
+}
+
+fn pad_of(ind: i64) -> str {
+    var p: str = "";
+    var i: i64 = 0;
+    while i < ind {
+        p = p + "    ";
+        i = i + 1;
+    }
+    return p;
+}
+
+fn any_line_has(v: &Vec<str>, s: str) -> bool {
+    var i: i64 = 0;
+    while i < v.len() {
+        if str_contains(v.get(i), s) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn any_line_starts(v: &Vec<str>, s: str) -> bool {
+    var i: i64 = 0;
+    while i < v.len() {
+        if str_starts_with(str_trim_start(v.get(i)), s) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn block(g: &mut Gen, sc: i64, depth: i64, ind: i64, nstmts: i64, in_loop: bool) -> FC {
+    var out: FC = fc_new();
+    val pad: str = pad_of(ind);
+    var it: i64 = 0;
+    while it < nstmts {
+        it = it + 1;
+        if g.ext && g.fr_ext.get(sc) == 1 && rnd(g) < 0.2 {
+            val ex: FC = ext_stmt(g, sc, depth, ind, in_loop);
+            fc_add(&mut out, &ex);
+            continue;
+        }
+        val k: f64 = rnd(g);
+        val ints: NT = sc_ints(g, sc, false);
+        if k < 0.22 || ints.n.len() == 0 {
+            val ts: Vec<str> = types();
+            val t: str = choice(g, &ts);
+            val e: E = expr(g, t, sc, 3);
+            val n: str = fresh(g, "v");
+            var kw: str = "val";
+            if rnd(g) < 0.8 { kw = "var"; }
+            out.fd.push(pad + kw + " " + n + ": " + t + " = " + e.fd + ";");
+            out.c.push(pad + cty(t) + " " + n + " = " + e.c + ";");
+            sc_add(g, sc, n, t, kw == "var");
+        } else if k < 0.40 {
+            val vs: NT = sc_ints(g, sc, true);
+            if vs.n.len() == 0 { continue; }
+            val vi: i64 = below(g, vs.n.len());
+            val n2: str = vs.n.get(vi);
+            val t2: str = vs.t.get(vi);
+            val e2: E = expr(g, t2, sc, 3);
+            if rnd(g) < 0.3 {
+                var ops: Vec<str> = Vec::new();
+                ops.push("+");
+                ops.push("-");
+                ops.push("*");
+                ops.push("&");
+                ops.push("|");
+                ops.push("^");
+                val op: str = choice(g, &ops);
+                var name: str = op_name(op);
+                if g.wrapping && (name == "add" || name == "sub" || name == "mul") { name = "w" + name; }
+                out.fd.push(pad + n2 + " " + op + "= " + e2.fd + ";");
+                out.c.push(pad + n2 + " = " + name + "_" + t2 + "(" + n2 + ", " + e2.c + ");");
+            } else if e2.fd == n2 && avoiding(g, "self-assign") {
+                // M14: `n = n;` is left out
+            } else {
+                out.fd.push(pad + n2 + " = " + e2.fd + ";");
+                out.c.push(pad + n2 + " = " + e2.c + ";");
+            }
+        } else if k < 0.50 {
+            val pi: i64 = below(g, ints.n.len());
+            print_stmt(g, ints.n.get(pi), ints.t.get(pi), pad, &mut out);
+        } else if k < 0.60 && depth > 0 {
+            val cnd: E = cond(g, sc, 2);
+            val c1s: i64 = sc_child(g, sc);
+            val n1: i64 = randint(g, 1, 3);
+            val b1: FC = block(g, c1s, depth - 1, ind + 1, n1, in_loop);
+            val c2s: i64 = sc_child(g, sc);
+            val n2b: i64 = randint(g, 1, 3);
+            val b2: FC = block(g, c2s, depth - 1, ind + 1, n2b, in_loop);
+            out.fd.push(pad + "if " + cnd.fd + " {");
+            add_all(&mut out.fd, &b1.fd);
+            out.fd.push(pad + "} else {");
+            add_all(&mut out.fd, &b2.fd);
+            out.fd.push(pad + "}");
+            out.c.push(pad + "if (" + cnd.c + ") {");
+            add_all(&mut out.c, &b1.c);
+            out.c.push(pad + "} else {");
+            add_all(&mut out.c, &b2.c);
+            out.c.push(pad + "}");
+        } else if k < 0.68 && depth > 0 {
+            val i: str = fresh(g, "k");
+            val nn: str = int_to_str(randint(g, 1, 6));
+            val inner: i64 = sc_child(g, sc);
+            sc_add(g, inner, i, "i64", false);
+            val nb: i64 = randint(g, 1, 4);
+            val b3: FC = block(g, inner, depth - 1, ind + 1, nb, true);
+            var as_for: bool = rnd(g) < 0.5;
+            if as_for && avoiding(g, "for-continue") && any_line_has(&b3.fd, "continue;") { as_for = false; }
+            if as_for && avoiding(g, "for-match-break") && any_line_has(&b3.fd, "break;") && any_line_starts(&b3.fd, "match ") { as_for = false; }
+            if as_for {
+                out.fd.push(pad + "for " + i + " in 0.." + nn + " {");
+                add_all(&mut out.fd, &b3.fd);
+                out.fd.push(pad + "}");
+                out.c.push(pad + "for (int64_t " + i + " = 0; " + i + " < " + nn + "; " + i + "++) {");
+                add_all(&mut out.c, &b3.c);
+                out.c.push(pad + "}");
+            } else {
+                out.fd.push(pad + "var " + i + ": i64 = 0;");
+                out.fd.push(pad + "while " + i + " < " + nn + " {");
+                out.fd.push(pad + "    " + i + " = " + i + " + 1;");
+                add_all(&mut out.fd, &b3.fd);
+                out.fd.push(pad + "}");
+                out.c.push(pad + "int64_t " + i + " = 0;");
+                out.c.push(pad + "while (" + i + " < " + nn + ") {");
+                out.c.push(pad + "    " + i + " = " + i + " + 1;");
+                add_all(&mut out.c, &b3.c);
+                out.c.push(pad + "}");
+            }
+        } else if k < 0.72 && in_loop {
+            val cnd2: E = cond(g, sc, 1);
+            val w: str = choice(g, &fl_v2("break", "continue"));
+            out.fd.push(pad + "if " + cnd2.fd + " { " + w + "; }");
+            out.c.push(pad + "if (" + cnd2.c + ") { " + w + "; }");
+        } else if k < 0.78 && depth > 0 {
+            val ts2: Vec<str> = types();
+            val t3: str = choice(g, &ts2);
+            val e3: E = expr(g, t3, sc, 2);
+            var head: str = e3.fd;
+            if e3.prec < atom() { head = wrap(&e3, postfix()); }
+            out.fd.push(pad + "match " + head + " {");
+            val tmp: str = fresh(g, "m");
+            out.c.push(pad + "{ " + cty(t3) + " " + tmp + " = " + e3.c + ";");
+            var pats: Vec<str> = Vec::new();
+            var tests: Vec<str> = Vec::new();
+            var used: Vec<i64> = Vec::new();
+            val na: i64 = randint(g, 1, 3);
+            var ai: i64 = 0;
+            while ai < na {
+                ai = ai + 1;
+                val lo: i64 = randint(g, 0, 9);
+                if has_i(&used, lo) { continue; }
+                if rnd(g) < 0.4 {
+                    val hi: i64 = lo + randint(g, 1, 5);
+                    var clash: bool = false;
+                    var u: i64 = 0;
+                    while u < used.len() {
+                        if lo <= used.get(u) && used.get(u) <= hi { clash = true; }
+                        u = u + 1;
+                    }
+                    if clash { continue; }
+                    var x: i64 = lo;
+                    while x <= hi {
+                        if !has_i(&used, x) { used.push(x); }
+                        x = x + 1;
+                    }
+                    pats.push(int_to_str(lo) + "..=" + int_to_str(hi));
+                    tests.push("(" + tmp + " >= " + int_to_str(lo) + " && " + tmp + " <= " + int_to_str(hi) + ")");
+                } else {
+                    used.push(lo);
+                    pats.push(int_to_str(lo));
+                    tests.push("(" + tmp + " == " + int_to_str(lo) + ")");
+                }
+            }
+            var first: bool = true;
+            var pi2: i64 = 0;
+            while pi2 < pats.len() {
+                val cs: i64 = sc_child(g, sc);
+                val nbm: i64 = randint(g, 1, 2);
+                val bm: FC = block(g, cs, depth - 1, ind + 1, nbm, in_loop);
+                out.fd.push(pad + "    " + pats.get(pi2) + " => {");
+                var l: i64 = 0;
+                while l < bm.fd.len() {
+                    out.fd.push("    " + bm.fd.get(l));
+                    l = l + 1;
+                }
+                out.fd.push(pad + "    }");
+                if first {
+                    out.c.push(pad + "  if " + tests.get(pi2) + " {");
+                } else {
+                    out.c.push(pad + "  else if " + tests.get(pi2) + " {");
+                }
+                add_all(&mut out.c, &bm.c);
+                out.c.push(pad + "  }");
+                first = false;
+                pi2 = pi2 + 1;
+            }
+            val cd: i64 = sc_child(g, sc);
+            val nbd: i64 = randint(g, 1, 2);
+            val bd: FC = block(g, cd, depth - 1, ind + 1, nbd, in_loop);
+            out.fd.push(pad + "    _ => {");
+            var l2: i64 = 0;
+            while l2 < bd.fd.len() {
+                out.fd.push("    " + bd.fd.get(l2));
+                l2 = l2 + 1;
+            }
+            out.fd.push(pad + "    }");
+            out.fd.push(pad + "}");
+            if first {
+                out.c.push(pad + "  {");
+            } else {
+                out.c.push(pad + "  else {");
+            }
+            add_all(&mut out.c, &bd.c);
+            out.c.push(pad + "  }");
+            out.c.push(pad + "}");
+        } else if k < 0.84 && g.st_name.len() > 0 {
+            val si: i64 = below(g, g.st_name.len());
+            val sname: str = g.st_name.get(si);
+            val ss: NT = sc_structs(g, sc);
+            var existing: Vec<str> = Vec::new();
+            var j: i64 = 0;
+            while j < ss.n.len() {
+                if ss.t.get(j) == sname { existing.push(ss.n.get(j)); }
+                j = j + 1;
+            }
+            val n4: str = fresh(g, "s");
+            if existing.len() > 0 && rnd(g) < 0.5 {
+                val src: str = choice(g, &existing);
+                out.fd.push(pad + "var " + n4 + ": " + sname + " = " + src + ";");
+                out.c.push(pad + sname + " " + n4 + " = " + src + ";");
+            } else {
+                val fnm: Vec<str> = g.st_fn.get(si);
+                val fty: Vec<str> = g.st_ft.get(si);
+                var fdp: Vec<str> = Vec::new();
+                var cp: Vec<str> = Vec::new();
+                var f: i64 = 0;
+                while f < fnm.len() {
+                    val ef: E = expr(g, fty.get(f), sc, 2);
+                    fdp.push(fnm.get(f) + ": " + ef.fd);
+                    cp.push(ef.c);
+                    f = f + 1;
+                }
+                out.fd.push(pad + "var " + n4 + ": " + sname + " = " + sname + " { " + fl_join_lines(&fdp, ", ") + " };");
+                out.c.push(pad + sname + " " + n4 + " = { " + fl_join_lines(&cp, ", ") + " };");
+            }
+            sc_add_struct(g, sc, n4, sname, true);
+        } else if k < 0.90 && sc_structs(g, sc).n.len() > 0 {
+            val ss2: NT = sc_structs(g, sc);
+            val sj: i64 = below(g, ss2.n.len());
+            val s: str = ss2.n.get(sj);
+            val sname2: str = ss2.t.get(sj);
+            if !sc_is_mutable(g, sc, s) { continue; }
+            val si2: i64 = struct_index(g, sname2);
+            val fnm2: Vec<str> = g.st_fn.get(si2);
+            val fty2: Vec<str> = g.st_ft.get(si2);
+            val fi: i64 = below(g, fnm2.len());
+            val e5: E = expr(g, fty2.get(fi), sc, 2);
+            out.fd.push(pad + s + "." + fnm2.get(fi) + " = " + e5.fd + ";");
+            out.c.push(pad + s + "." + fnm2.get(fi) + " = " + e5.c + ";");
+        } else if k < 0.95 && sc_has_vec(g, sc) {
+            val e6: E = expr(g, "i64", sc, 2);
+            out.fd.push(pad + "xs.push(" + e6.fd + ");");
+            out.c.push(pad + "vpush(&xs, " + e6.c + ");");
+        } else {
+            val ints2: NT = sc_ints(g, sc, false);
+            val pj: i64 = below(g, ints2.n.len());
+            print_stmt(g, ints2.n.get(pj), ints2.t.get(pj), pad, &mut out);
+        }
+    }
+    return out;
+}
+
+fn has_i(v: &Vec<i64>, x: i64) -> bool {
+    var i: i64 = 0;
+    while i < v.len() {
+        if v.get(i) == x { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+// ─── --ext: f64, str and enum Sh (main only) ───
+
+fn flits() -> Vec<str> {
+    var v: Vec<str> = Vec::new();
+    v.push("0.5");
+    v.push("0.25");
+    v.push("1.5");
+    v.push("3.0");
+    v.push("0.1");
+    v.push("10.0");
+    v.push("2.75");
+    v.push("0.001");
+    return v;
+}
+
+/// (Fides text, C text) of a float expression, as two items.
+fn fexpr(g: &mut Gen, sc: i64, d: i64) -> Vec<str> {
+    if d <= 0 || rnd(g) < 0.3 {
+        val k: f64 = rnd(g);
+        if k < 0.4 {
+            val v: str = choice(g, &fl_v2("fa", "fb"));
+            return fl_v2(v, v);
+        }
+        val ints: NT = sc_ints(g, sc, false);
+        var ivs: Vec<str> = Vec::new();
+        var i: i64 = 0;
+        while i < ints.n.len() {
+            if signed(ints.t.get(i)) { ivs.push(ints.n.get(i)); }
+            i = i + 1;
+        }
+        if ivs.len() > 0 && k < 0.7 {
+            val v2: str = choice(g, &ivs);
+            return fl_v2("(" + v2 + " as f64)", "((double)" + v2 + ")");
+        }
+        val fls: Vec<str> = flits();
+        val l: str = choice(g, &fls);
+        return fl_v2(l, l);
+    }
+    var ops: Vec<str> = Vec::new();
+    ops.push("+");
+    ops.push("-");
+    ops.push("*");
+    ops.push("/");
+    val op: str = choice(g, &ops);
+    val a: Vec<str> = fexpr(g, sc, d - 1);
+    if op == "/" {
+        val fls2: Vec<str> = flits();
+        val l2: str = choice(g, &fls2);
+        return fl_v2("(" + a.get(0) + " / " + l2 + ")", "fdiv(" + a.get(1) + ", " + l2 + ")");
+    }
+    val b: Vec<str> = fexpr(g, sc, d - 1);
+    var name: str = "fmul";
+    if op == "+" { name = "fadd"; }
+    if op == "-" { name = "fsub"; }
+    return fl_v2("(" + a.get(0) + " " + op + " " + b.get(0) + ")", name + "(" + a.get(1) + ", " + b.get(1) + ")");
+}
+
+fn fc1(fd: str, c: str) -> FC {
+    var o: FC = fc_new();
+    o.fd.push(fd);
+    o.c.push(c);
+    return o;
+}
+
+fn fc2(fd1: str, fd2: str, c1: str, c2: str) -> FC {
+    var o: FC = fc_new();
+    o.fd.push(fd1);
+    o.fd.push(fd2);
+    o.c.push(c1);
+    o.c.push(c2);
+    return o;
+}
+
+fn ext_stmt(g: &mut Gen, sc: i64, depth: i64, ind: i64, in_loop: bool) -> FC {
+    val pad: str = pad_of(ind);
+    if g.ext2 && rnd(g) < 0.4 {
+        return ext2_stmt(g, sc, depth, ind, in_loop);
+    }
+    val k: f64 = rnd(g);
+    if k < 0.25 {
+        val v: str = choice(g, &fl_v2("fa", "fb"));
+        val e: Vec<str> = fexpr(g, sc, 2);
+        var o: FC = fc_new();
+        o.fd.push(pad + v + " = " + e.get(0) + ";");
+        o.fd.push(pad + "if " + v + " > 1000000.0 { " + v + " = 1000000.0; }");
+        o.fd.push(pad + "if " + v + " < -1000000.0 { " + v + " = -1000000.0; }");
+        o.c.push(pad + v + " = " + e.get(1) + ";");
+        o.c.push(pad + "if (" + v + " > 1000000.0) " + v + " = 1000000.0;");
+        o.c.push(pad + "if (" + v + " < -1000000.0) " + v + " = -1000000.0;");
+        return o;
+    }
+    if k < 0.35 {
+        val v2: str = choice(g, &fl_v2("fa", "fb"));
+        return fc1(pad + "xs.push((" + v2 + " * 1000.0) as i64);", pad + "vpush(&xs, (int64_t)fmul(" + v2 + ", 1000.0));");
+    }
+    if k < 0.45 && depth > 0 {
+        val a: Vec<str> = fexpr(g, sc, 1);
+        val b: Vec<str> = fexpr(g, sc, 1);
+        val ops: Vec<str> = cmp_ops();
+        val op: str = choice(g, &ops);
+        val cs: i64 = sc_child(g, sc);
+        val nb: i64 = randint(g, 1, 2);
+        val b1: FC = block(g, cs, depth - 1, ind + 1, nb, in_loop);
+        var o2: FC = fc_new();
+        o2.fd.push(pad + "if " + a.get(0) + " " + op + " " + b.get(0) + " {");
+        add_all(&mut o2.fd, &b1.fd);
+        o2.fd.push(pad + "}");
+        o2.c.push(pad + "if (" + a.get(1) + " " + op + " " + b.get(1) + ") {");
+        add_all(&mut o2.c, &b1.c);
+        o2.c.push(pad + "}");
+        return o2;
+    }
+    val reset_fd: str = pad + "if str_len(st) > 40 { st = \"\"; }";
+    val reset_c: str = pad + "if (st.n > 40) st.n = 0;";
+    if k < 0.57 {
+        val e2: E = expr(g, "i64", sc, 2);
+        return fc2(pad + "st = st + int_to_str(" + e2.fd + ");", reset_fd, pad + "sapp_int(&st, " + e2.c + ");", reset_c);
+    }
+    if k < 0.64 {
+        var lits: Vec<str> = Vec::new();
+        lits.push("ab");
+        lits.push("x");
+        lits.push("-");
+        lits.push("Fid");
+        lits.push(" ");
+        val l: str = choice(g, &lits);
+        return fc2(pad + "st = st + \"" + l + "\";", reset_fd, pad + "sapp(&st, \"" + l + "\");", reset_c);
+    }
+    if k < 0.70 {
+        return fc1(pad + "println(st);", pad + "printf(\"%.*s\\n\", (int)st.n, st.b);");
+    }
+    if k < 0.75 {
+        return fc1(pad + "xs.push(str_len(st));", pad + "vpush(&xs, st.n);");
+    }
+    if k < 0.87 && !sc_en_locked(g, sc) {
+        val kk: f64 = rnd(g);
+        if kk < 0.4 {
+            val e3: E = expr(g, "i64", sc, 2);
+            return fc1(pad + "en = Sh::One(" + e3.fd + ");", pad + "{ int64_t t1_ = " + e3.c + "; en = (Sh){0, t1_, 0}; }");
+        }
+        if kk < 0.8 {
+            val e4: E = expr(g, "i64", sc, 2);
+            val e5: E = expr(g, "i32", sc, 2);
+            return fc1(pad + "en = Sh::Two(" + e4.fd + ", " + e5.fd + ");", pad + "{ int64_t t1_ = " + e4.c + "; int32_t t2_ = " + e5.c + "; en = (Sh){1, t1_, t2_}; }");
+        }
+        return fc1(pad + "en = Sh::Zero;", pad + "en = (Sh){2, 0, 0};");
+    }
+    if depth <= 0 {
+        return fc1(pad + "xs.push(str_len(st));", pad + "vpush(&xs, st.n);");
+    }
+    // take en apart; its arms do not write en (they read its payload)
+    val x: str = fresh(g, "x");
+    val y: str = fresh(g, "y");
+    val s1: i64 = sc_child(g, sc);
+    g.fr_lock.set(s1, 1);
+    sc_add(g, s1, x, "i64", false);
+    val n1: i64 = randint(g, 1, 2);
+    val f1: FC = block(g, s1, depth - 1, ind + 2, n1, in_loop);
+    val s2: i64 = sc_child(g, sc);
+    g.fr_lock.set(s2, 1);
+    sc_add(g, s2, x, "i64", false);
+    sc_add(g, s2, y, "i32", false);
+    val n2: i64 = randint(g, 1, 2);
+    val f2: FC = block(g, s2, depth - 1, ind + 2, n2, in_loop);
+    val s3: i64 = sc_child(g, sc);
+    g.fr_lock.set(s3, 1);
+    val n3: i64 = randint(g, 1, 2);
+    val f3: FC = block(g, s3, depth - 1, ind + 2, n3, in_loop);
+    val p2: str = pad + "        ";
+    var o3: FC = fc_new();
+    o3.fd.push(pad + "match en {");
+    o3.fd.push(pad + "    Sh::One(" + x + ") => {");
+    o3.fd.push(p2 + "xs.push(" + x + ");");
+    add_all(&mut o3.fd, &f1.fd);
+    o3.fd.push(pad + "    }");
+    o3.fd.push(pad + "    Sh::Two(" + x + ", " + y + ") => {");
+    o3.fd.push(p2 + "xs.push(" + x + " + (" + y + " as i64));");
+    add_all(&mut o3.fd, &f2.fd);
+    o3.fd.push(pad + "    }");
+    o3.fd.push(pad + "    Sh::Zero => {");
+    add_all(&mut o3.fd, &f3.fd);
+    o3.fd.push(pad + "    }");
+    o3.fd.push(pad + "}");
+    o3.c.push(pad + "if (en.tag == 0) {");
+    o3.c.push(p2 + "int64_t " + x + " = en.a;");
+    o3.c.push(p2 + "vpush(&xs, " + x + ");");
+    add_all(&mut o3.c, &f1.c);
+    o3.c.push(pad + "} else if (en.tag == 1) {");
+    o3.c.push(p2 + "int64_t " + x + " = en.a; int32_t " + y + " = en.b;");
+    o3.c.push(p2 + "vpush(&xs, add_i64(" + x + ", (int64_t)" + y + "));");
+    add_all(&mut o3.c, &f2.c);
+    o3.c.push(pad + "} else {");
+    add_all(&mut o3.c, &f3.c);
+    o3.c.push(pad + "}");
+    return o3;
+}
+
+// ─── --ext2: fixed-precision floats, more of str, a `_` arm ───
+
+/// One str_slice bound: (Fides, C).
+fn bound(g: &mut Gen, sc: i64, mask: str) -> Vec<str> {
+    if rnd(g) < 0.3 {
+        val n: str = int_to_str(randint(g, 0, 9));
+        return fl_v2(n, n);
+    }
+    val e: E = expr(g, "i64", sc, 2);
+    if rnd(g) < 0.2 {
+        return fl_v2(e.fd, e.c);
+    }
+    return fl_v2("(" + wrap(&e, prec("&") + 1) + " & " + mask + ")", "((" + e.c + ") & " + mask + ")");
+}
+
+fn ext2_stmt(g: &mut Gen, sc: i64, depth: i64, ind: i64, in_loop: bool) -> FC {
+    val pad: str = pad_of(ind);
+    val k: f64 = rnd(g);
+    val reset_fd: str = pad + "if str_len(st) > 40 { st = \"\"; }";
+    val reset_c: str = pad + "if (st.n > 40) st.n = 0;";
+    if k < 0.22 {
+        var ffd: Vec<str> = Vec::new();
+        var fc: Vec<str> = Vec::new();
+        ffd.push("fa");
+        fc.push("fa");
+        ffd.push("fb");
+        fc.push("fb");
+        ffd.push("fa + fb");
+        fc.push("fadd(fa, fb)");
+        ffd.push("fa - fb");
+        fc.push("fsub(fa, fb)");
+        ffd.push("(fa * fb) / 1000000.0");
+        fc.push("fdiv(fmul(fa, fb), 1000000.0)");
+        val ints: NT = sc_ints(g, sc, false);
+        var small: Vec<str> = Vec::new();
+        var i: i64 = 0;
+        while i < ints.n.len() {
+            val t: str = ints.t.get(i);
+            if t == "i8" || t == "i16" || t == "i32" { small.push(ints.n.get(i)); }
+            i = i + 1;
+        }
+        var f: str = "";
+        var cf: str = "";
+        if small.len() > 0 && rnd(g) < 0.4 {
+            val v: str = choice(g, &small);
+            f = "(" + v + " as f64) / 7.0";
+            cf = "fdiv((double)" + v + ", 7.0)";
+        } else {
+            val fi: i64 = below(g, ffd.len());
+            f = ffd.get(fi);
+            cf = fc.get(fi);
+        }
+        return fc1(pad + "println(ffix(" + f + "));", pad + "pfix(" + cf + ");");
+    }
+    if k < 0.40 {
+        val a: Vec<str> = bound(g, sc, "15");
+        val b: Vec<str> = bound(g, sc, "31");
+        return fc1(pad + "st = str_slice(st, " + a.get(0) + ", " + b.get(0) + ");", pad + "{ int64_t a_ = " + a.get(1) + "; int64_t b_ = " + b.get(1) + "; sslice(&st, a_, b_); }");
+    }
+    if k < 0.52 {
+        val e: E = expr(g, "i64", sc, 2);
+        var o: FC = fc_new();
+        o.fd.push(pad + "if str_len(st) > 0 {");
+        o.fd.push(pad + "    xs.push(str_byte_at(st, (" + wrap(&e, prec("&") + 1) + " & 1023) % str_len(st)));");
+        o.fd.push(pad + "}");
+        o.c.push(pad + "if (st.n > 0) { int64_t i_ = ((" + e.c + ") & 1023) % st.n; vpush(&xs, (int64_t)(unsigned char)st.b[i_]); }");
+        return o;
+    }
+    if k < 0.64 {
+        var lits: Vec<str> = Vec::new();
+        lits.push("");
+        lits.push("ab");
+        lits.push("x");
+        lits.push("-");
+        lits.push("Fid");
+        lits.push("0");
+        val l: str = choice(g, &lits);
+        val ln: str = int_to_str(str_len(l));
+        return fc1(pad + "if st == \"" + l + "\" { xs.push(1); } else { xs.push(2); }", pad + "if (st.n == " + ln + " && memcmp(st.b, \"" + l + "\", " + ln + ") == 0) vpush(&xs, 1); else vpush(&xs, 2);");
+    }
+    if k < 0.80 {
+        val ints2: NT = sc_ints(g, sc, false);
+        var vs: Vec<str> = Vec::new();
+        var j: i64 = 0;
+        while j < ints2.n.len() {
+            if ints2.t.get(j) != "u64" { vs.push(ints2.n.get(j)); }
+            j = j + 1;
+        }
+        if vs.len() == 0 {
+            return fc2(pad + "st = st + \"<>\";", reset_fd, pad + "sapp(&st, \"<>\");", reset_c);
+        }
+        val v2: str = choice(g, &vs);
+        return fc2(pad + "st = f\"{st}<{" + v2 + "}>\";", reset_fd, pad + "sapp(&st, \"<\"); sapp_int(&st, (int64_t)" + v2 + "); sapp(&st, \">\");", reset_c);
+    }
+    if depth <= 0 || sc_en_locked(g, sc) {
+        return fc1(pad + "xs.push(str_len(st));", pad + "vpush(&xs, st.n);");
+    }
+    val x: str = fresh(g, "x");
+    val y: str = fresh(g, "y");
+    val s1: i64 = sc_child(g, sc);
+    g.fr_lock.set(s1, 1);
+    sc_add(g, s1, x, "i64", false);
+    sc_add(g, s1, y, "i32", false);
+    val n1: i64 = randint(g, 1, 2);
+    val f1: FC = block(g, s1, depth - 1, ind + 2, n1, in_loop);
+    val s2: i64 = sc_child(g, sc);
+    g.fr_lock.set(s2, 1);
+    val n2: i64 = randint(g, 1, 2);
+    val f2: FC = block(g, s2, depth - 1, ind + 2, n2, in_loop);
+    val p2: str = pad + "        ";
+    var o2: FC = fc_new();
+    o2.fd.push(pad + "match en {");
+    o2.fd.push(pad + "    Sh::Two(" + x + ", " + y + ") => {");
+    o2.fd.push(p2 + "xs.push(" + x + " - (" + y + " as i64));");
+    add_all(&mut o2.fd, &f1.fd);
+    o2.fd.push(pad + "    }");
+    o2.fd.push(pad + "    _ => {");
+    add_all(&mut o2.fd, &f2.fd);
+    o2.fd.push(pad + "    }");
+    o2.fd.push(pad + "}");
+    o2.c.push(pad + "if (en.tag == 1) {");
+    o2.c.push(p2 + "int64_t " + x + " = en.a; int32_t " + y + " = en.b;");
+    o2.c.push(p2 + "vpush(&xs, sub_i64(" + x + ", (int64_t)" + y + "));");
+    add_all(&mut o2.c, &f1.c);
+    o2.c.push(pad + "} else {");
+    add_all(&mut o2.c, &f2.c);
+    o2.c.push(pad + "}");
+    return o2;
+}
+
+fn ext2_decl_fd(v: &mut Vec<str>) {
+    v.push("fn ffix(x: f64) -> str {");
+    v.push("    val neg: bool = x < 0.0;");
+    v.push("    var a: f64 = x;");
+    v.push("    if neg { a = 0.0 - x; }");
+    v.push("    val m: i64 = (a * 1000.0 + 0.5) as i64;");
+    v.push("    val f: i64 = m % 1000;");
+    v.push("    var s: str = int_to_str(m / 1000) + \".\";");
+    v.push("    if f < 100 { s = s + \"0\"; }");
+    v.push("    if f < 10 { s = s + \"0\"; }");
+    v.push("    s = s + int_to_str(f);");
+    v.push("    if neg && m != 0 { s = \"-\" + s; }");
+    v.push("    return s;");
+    v.push("}");
+    v.push("");
+}
+
+// ─── Items ───
+
+/// The pair of programs: [Fides, C].
+fn program(g: &mut Gen) -> Vec<str> {
+    var fd: Vec<str> = Vec::new();
+    var c: Vec<str> = Vec::new();
+    val ts: Vec<str> = types();
+    val ns: i64 = randint(g, 0, 2);
+    var si: i64 = 0;
+    while si < ns {
+        val name: str = "S" + int_to_str(si);
+        val nf: i64 = randint(g, 1, 3);
+        var fnm: Vec<str> = Vec::new();
+        var fty: Vec<str> = Vec::new();
+        var j: i64 = 0;
+        while j < nf {
+            fnm.push("f" + int_to_str(j));
+            fty.push(choice(g, &ts));
+            j = j + 1;
+        }
+        g.st_name.push(name);
+        g.st_fn.push(fnm);
+        g.st_ft.push(fty);
+        fd.push("struct " + name + " {");
+        var cl: str = "typedef struct { ";
+        j = 0;
+        while j < nf {
+            fd.push("    " + fnm.get(j) + ": " + fty.get(j) + ",");
+            if j > 0 { cl = cl + " "; }
+            cl = cl + cty(fty.get(j)) + " " + fnm.get(j) + ";";
+            j = j + 1;
+        }
+        fd.push("}");
+        fd.push("");
+        c.push(cl + " } " + name + ";");
+        si = si + 1;
+    }
+    val nh: i64 = randint(g, 0, 4);
+    var hi: i64 = 0;
+    while hi < nh {
+        val hname: str = "h" + int_to_str(hi);
+        val np: i64 = randint(g, 1, 3);
+        var pn: Vec<str> = Vec::new();
+        var pt: Vec<str> = Vec::new();
+        var j2: i64 = 0;
+        while j2 < np {
+            pn.push("p" + int_to_str(j2));
+            pt.push(choice(g, &ts));
+            j2 = j2 + 1;
+        }
+        if g.st_name.len() > 0 && rnd(g) < 0.3 {
+            pn.push("q");
+            val sn: Vec<str> = copy_strs(&g.st_name);
+            pt.push(choice(g, &sn));
+        }
+        val ret: str = choice(g, &ts);
+        g.wrapping = rnd(g) < 0.3;
+        val sc: i64 = sc_root(g);
+        var p: i64 = 0;
+        while p < pn.len() {
+            if is_type(pt.get(p)) {
+                sc_add(g, sc, pn.get(p), pt.get(p), false);
+            } else {
+                sc_add_struct(g, sc, pn.get(p), pt.get(p), false);
+            }
+            p = p + 1;
+        }
+        val nst: i64 = randint(g, 1, 5);
+        val body: FC = block(g, sc, 2, 1, nst, false);
+        val e: E = expr(g, ret, sc, 3);
+        var ps: Vec<str> = Vec::new();
+        var cps: Vec<str> = Vec::new();
+        p = 0;
+        while p < pn.len() {
+            ps.push(pn.get(p) + ": " + pt.get(p));
+            cps.push(cty_or(pt.get(p)) + " " + pn.get(p));
+            p = p + 1;
+        }
+        if g.wrapping { fd.push("@wrapping"); }
+        fd.push("fn " + hname + "(" + fl_join_lines(&ps, ", ") + ") -> " + ret + " {");
+        // helpers do not print: their calls may sit anywhere in an expression
+        var l: i64 = 0;
+        while l < body.fd.len() {
+            if !str_contains(body.fd.get(l), "print") { fd.push(body.fd.get(l)); }
+            l = l + 1;
+        }
+        fd.push("    return " + e.fd + ";");
+        fd.push("}");
+        fd.push("");
+        c.push("static " + cty(ret) + " " + hname + "(" + fl_join_lines(&cps, ", ") + ") {");
+        l = 0;
+        while l < body.c.len() {
+            if !str_contains(body.c.get(l), "printf") { c.push(body.c.get(l)); }
+            l = l + 1;
+        }
+        c.push("    return " + e.c + ";");
+        c.push("}");
+        g.h_name.push(hname);
+        g.h_pn.push(pn);
+        g.h_pt.push(pt);
+        g.h_ret.push(ret);
+        g.wrapping = false;
+        hi = hi + 1;
+    }
+    val msc: i64 = sc_root(g);
+    g.fr_vec.set(msc, 1);
+    if g.ext { g.fr_ext.set(msc, 1); }
+    val nm: i64 = randint(g, 4, 12);
+    val mb: FC = block(g, msc, 3, 1, nm, false);
+    var head: Vec<str> = Vec::new();
+    if g.ext {
+        head.push("enum Sh {");
+        head.push("    One(i64),");
+        head.push("    Two(i64, i32),");
+        head.push("    Zero,");
+        head.push("}");
+        head.push("");
+        if g.ext2 { ext2_decl_fd(&mut head); }
+    }
+    add_all(&mut head, &fd);
+    fd = head;
+    fd.push("fn main() -> i64 {");
+    fd.push("    var xs: Vec<i64> = Vec::new();");
+    var k: i64 = 0;
+    while k < 4 {
+        fd.push("    xs.push(" + int_to_str(k * 7 + 1) + ");");
+        k = k + 1;
+    }
+    if g.ext {
+        fd.push("    var fa: f64 = 0.5;");
+        fd.push("    var fb: f64 = 2.0;");
+        fd.push("    var st: str = \"\";");
+        fd.push("    var en: Sh = Sh::Zero;");
+    }
+    add_all(&mut fd, &mb.fd);
+    if g.ext {
+        fd.push("    println((fa * 1000.0) as i64);");
+        fd.push("    println((fb * 1000.0) as i64);");
+        fd.push("    println(st);");
+        fd.push("    match en {");
+        fd.push("        Sh::One(ex) => { println(1); println(ex); }");
+        fd.push("        Sh::Two(ex, ey) => { println(2); println(ex); println(ey); }");
+        fd.push("        Sh::Zero => { println(0); }");
+        fd.push("    }");
+    }
+    if g.ext2 {
+        fd.push("    println(ffix(fa));");
+        fd.push("    println(ffix(fb));");
+        fd.push("    println(str_len(st));");
+    }
+    fd.push("    println(xs.len());");
+    fd.push("    return 0;");
+    fd.push("}");
+    c.push("int main(void) {");
+    c.push("    Vec xs = {0, 0, 0};");
+    k = 0;
+    while k < 4 {
+        c.push("    vpush(&xs, " + int_to_str(k * 7 + 1) + ");");
+        k = k + 1;
+    }
+    if g.ext {
+        c.push("    double fa = 0.5; double fb = 2.0;");
+        c.push("    Str st; st.n = 0;");
+        c.push("    Sh en = {2, 0, 0};");
+    }
+    add_all(&mut c, &mb.c);
+    if g.ext {
+        c.push("    printf(\"%lld\\n\", (long long)(int64_t)fmul(fa, 1000.0));");
+        c.push("    printf(\"%lld\\n\", (long long)(int64_t)fmul(fb, 1000.0));");
+        c.push("    printf(\"%.*s\\n\", (int)st.n, st.b);");
+        c.push("    if (en.tag == 0) printf(\"1\\n%lld\\n\", (long long)en.a);");
+        c.push("    else if (en.tag == 1) printf(\"2\\n%lld\\n%d\\n\", (long long)en.a, (int)en.b);");
+        c.push("    else printf(\"0\\n\");");
+    }
+    if g.ext2 {
+        c.push("    pfix(fa);");
+        c.push("    pfix(fb);");
+        c.push("    printf(\"%lld\\n\", (long long)st.n);");
+    }
+    c.push("    printf(\"%lld\\n\", (long long)xs.len);");
+    c.push("    return 0;");
+    c.push("}");
+    var res: Vec<str> = Vec::new();
+    res.push(fl_join_lines(&fd, "\n") + "\n");
+    res.push(c_prelude(g) + fl_join_lines(&c, "\n") + "\n");
+    return res;
+}
+
+fn copy_strs(v: &Vec<str>) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    add_all(&mut out, v);
+    return out;
+}
+
+fn c_prelude(g: &Gen) -> str {
+    var out: Vec<str> = Vec::new();
+    out.push("#include <stdio.h>");
+    out.push("#include <stdint.h>");
+    out.push("#include <stdlib.h>");
+    out.push("");
+    out.push("static void panic(void) { fflush(stdout); exit(1); }");
+    out.push("typedef struct { int64_t* d; int64_t len, cap; } Vec;");
+    out.push("static void vpush(Vec* v, int64_t x) { if (v->len == v->cap) { v->cap = v->cap ? 2 * v->cap : 8; v->d = realloc(v->d, v->cap * sizeof(int64_t)); } v->d[v->len++] = x; }");
+    out.push("static int64_t vget(Vec* v, int64_t i) { if (i < 0 || i >= v->len) panic(); return v->d[i]; }");
+    out.push("static int64_t vlen(Vec* v) { return v->len; }");
+    if g.ext {
+        out.push("#pragma STDC FP_CONTRACT OFF");
+        out.push("#include <string.h>");
+        out.push("typedef struct { int64_t tag; int64_t a; int32_t b; } Sh;");
+        out.push("typedef struct { char b[256]; int64_t n; } Str;");
+        out.push("static void sapp(Str* s, const char* t) { size_t k = strlen(t); memcpy(s->b + s->n, t, k); s->n += (int64_t)k; }");
+        out.push("static void sapp_int(Str* s, int64_t v) { char t[32]; snprintf(t, sizeof t, \"%lld\", (long long)v); sapp(s, t); }");
+        out.push("static __attribute__((noinline)) double fadd(double a, double b) { return a + b; }");
+        out.push("static __attribute__((noinline)) double fsub(double a, double b) { return a - b; }");
+        out.push("static __attribute__((noinline)) double fmul(double a, double b) { return a * b; }");
+        out.push("static __attribute__((noinline)) double fdiv(double a, double b) { return a / b; }");
+    }
+    if g.ext2 {
+        out.push("static void sslice(Str* s, int64_t a, int64_t b) { if (a < 0) a = 0; if (b > s->n) b = s->n; if (a >= b) { s->n = 0; return; } memmove(s->b, s->b + a, (size_t)(b - a)); s->n = b - a; }");
+        out.push("static void pfix(double x) { int neg = x < 0.0; double a = neg ? fsub(0.0, x) : x; int64_t m = (int64_t)fadd(fmul(a, 1000.0), 0.5); printf(\"%s%lld.%03lld\\n\", (neg && m != 0) ? \"-\" : \"\", (long long)(m / 1000), (long long)(m % 1000)); }");
+    }
+    val ts: Vec<str> = types();
+    var i: i64 = 0;
+    while i < ts.len() {
+        val t: str = ts.get(i);
+        val ct: str = cty(t);
+        val ut: str = "uint64_t";
+        val mn: str = "INT" + int_to_str(bits(t)) + "_MIN";
+        out.push("static inline " + ct + " add_" + t + "(" + ct + " a, " + ct + " b) { " + ct + " r; if (__builtin_add_overflow(a, b, &r)) panic(); return r; }");
+        out.push("static inline " + ct + " sub_" + t + "(" + ct + " a, " + ct + " b) { " + ct + " r; if (__builtin_sub_overflow(a, b, &r)) panic(); return r; }");
+        out.push("static inline " + ct + " mul_" + t + "(" + ct + " a, " + ct + " b) { " + ct + " r; if (__builtin_mul_overflow(a, b, &r)) panic(); return r; }");
+        out.push("static inline " + ct + " wadd_" + t + "(" + ct + " a, " + ct + " b) { return (" + ct + ")((" + ut + ")a + (" + ut + ")b); }");
+        out.push("static inline " + ct + " wsub_" + t + "(" + ct + " a, " + ct + " b) { return (" + ct + ")((" + ut + ")a - (" + ut + ")b); }");
+        out.push("static inline " + ct + " wmul_" + t + "(" + ct + " a, " + ct + " b) { return (" + ct + ")((" + ut + ")a * (" + ut + ")b); }");
+        out.push("static inline " + ct + " and_" + t + "(" + ct + " a, " + ct + " b) { return (" + ct + ")(a & b); }");
+        out.push("static inline " + ct + " or_" + t + "(" + ct + " a, " + ct + " b) { return (" + ct + ")(a | b); }");
+        out.push("static inline " + ct + " xor_" + t + "(" + ct + " a, " + ct + " b) { return (" + ct + ")(a ^ b); }");
+        out.push("static inline " + ct + " shl_" + t + "(" + ct + " a, " + ct + " s) { return (" + ct + ")((" + ut + ")a << s); }");
+        out.push("static inline " + ct + " shr_" + t + "(" + ct + " a, " + ct + " s) { return (" + ct + ")(a >> s); }");
+        if signed(t) {
+            out.push("static inline " + ct + " div_" + t + "(" + ct + " a, " + ct + " b) { if (b == 0 || (a == " + mn + " && b == -1)) panic(); return (" + ct + ")(a / b); }");
+            out.push("static inline " + ct + " rem_" + t + "(" + ct + " a, " + ct + " b) { if (b == 0 || (a == " + mn + " && b == -1)) panic(); return (" + ct + ")(a % b); }");
+            out.push("static inline " + ct + " neg_" + t + "(" + ct + " a) { if (a == " + mn + ") panic(); return (" + ct + ")(-a); }");
+            out.push("static inline " + ct + " wneg_" + t + "(" + ct + " a) { return (" + ct + ")(0 - (" + ut + ")a); }");
+        } else {
+            out.push("static inline " + ct + " div_" + t + "(" + ct + " a, " + ct + " b) { if (b == 0) panic(); return (" + ct + ")(a / b); }");
+            out.push("static inline " + ct + " rem_" + t + "(" + ct + " a, " + ct + " b) { if (b == 0) panic(); return (" + ct + ")(a % b); }");
+        }
+        i = i + 1;
+    }
+    return fl_join_lines(&out, "\n") + "\n\n";
+}
+
+pub fn pair(seed: i64, ext: bool, ext2: bool, avoid: &Vec<str>) -> Vec<str> {
+    var g: Gen = gen_new(seed, ext, ext2, avoid);
+    return program(&mut g);
+}
+
+// ─── Running ───
+
+/// run(): (status, stdout without "\r", stderr); status "timeout" when
+/// it ran out of time.
+pub struct R3 {
+    pub rc: str,
+    pub out: str,
+    pub err: str,
+}
+
+fn run3(cmd: &Vec<str>, secs: i64) -> R3 {
+    val p: FlRun = fl_run(cmd, "", secs);
+    if p.timed_out { return R3 { rc: "timeout", out: "", err: "" }; }
+    if !p.started { return R3 { rc: "-1", out: "", err: "could not start " + cmd.get(0) }; }
+    return R3 { rc: int_to_str(p.code), out: fl_no_cr(fl_as_text(p.out)), err: fl_as_text(p.err) };
+}
+
+/// shutil.which(name)
+fn which(name: str) -> bool {
+    var sep: str = ":";
+    if fl_win() { sep = ";"; }
+    val dirs: Vec<str> = str_split(fl_env("PATH"), sep);
+    var i: i64 = 0;
+    while i < dirs.len() {
+        val d: str = dirs.get(i);
+        i = i + 1;
+        if str_len(d) == 0 { continue; }
+        val p: str = d + "/" + name;
+        if fl_win() {
+            if fs_is_file(p + ".exe") || fs_is_file(p + ".com") || fs_is_file(p + ".bat") || fs_is_file(p + ".cmd") { return true; }
+            if fs_is_file(p) && str_contains(name, ".") { return true; }
+        } else if fs_is_file(p) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn wsl_path(p: str) -> str {
+    val a: str = str_replace(fl_abspath(p), "\\", "/");
+    return "/mnt/" + str_to_lower(str_slice(a, 0, 1)) + str_slice(a, 2, str_len(a));
+}
+
+fn rm_quiet(p: str) {
+    fl_remove(p);
+}
+
+/// The C oracle, built and run with each C compiler: keys and results.
+pub struct CRes {
+    pub keys: Vec<str>,
+    pub rc: Vec<str>,
+    pub out: Vec<str>,
+}
+
+fn c_results(csrc: str, work: str, seed: str, ccs: &Vec<str>) -> CRes {
+    val path: str = fl_join(work, seed + ".c");
+    fl_write(path, csrc);
+    var res: CRes = CRes { keys: Vec::new(), rc: Vec::new(), out: Vec::new() };
+    var ci: i64 = 0;
+    while ci < ccs.len() {
+        val cc: str = ccs.get(ci);
+        ci = ci + 1;
+        var oi: i64 = 0;
+        while oi < 2 {
+            var opt: str = "-O0";
+            if oi == 1 { opt = "-O2"; }
+            oi = oi + 1;
+            val key: str = cc + opt;
+            if cc == "clang" {
+                val exe: str = fl_join(work, seed + "-c" + opt + ".exe");
+                var b: R3 = R3 { rc: "", out: "", err: "" };
+                var tries: i64 = 0;
+                while tries < 3 {
+                    var cmd: Vec<str> = fl_v5("zig", "cc", opt, "-w", "-fno-sanitize=all");
+                    cmd.push(path);
+                    cmd.push("-o");
+                    cmd.push(exe);
+                    b = run3(&cmd, 300);
+                    tries = tries + 1;
+                    if b.rc == "0" { break; }
+                }
+                if b.rc != "0" {
+                    cres_set(&mut res, key, "cc-failed", fl_head_cps(b.err, 2000));
+                    continue;
+                }
+                val r: R3 = run3(&fl_v1(exe), 60);
+                cres_set(&mut res, key, r.rc, r.out);
+                // os.remove(exe), then the .pdb (both in one try)
+                if fs_exists(exe) {
+                    fl_remove(exe);
+                    rm_quiet(str_replace(exe, ".exe", ".pdb"));
+                }
+            } else if cc == "gcc" && !fl_win() && which("gcc") {
+                val exe2: str = fl_join(work, seed + "-g" + opt);
+                var gcmd: Vec<str> = fl_v5("gcc", opt, "-w", path, "-o");
+                gcmd.push(exe2);
+                val b2: R3 = run3(&gcmd, 300);
+                if b2.rc != "0" {
+                    cres_set(&mut res, key, "cc-failed", fl_head_cps(b2.err, 2000));
+                    continue;
+                }
+                val r2: R3 = run3(&fl_v1(exe2), 60);
+                cres_set(&mut res, key, r2.rc, r2.out);
+                fl_remove(exe2);
+            } else if cc == "gcc" {
+                val exe3: str = wsl_path(fl_join(work, seed + "-g" + opt));
+                var distro: str = fl_env("WSL_DISTRO");
+                if str_len(distro) == 0 { distro = "kali-linux"; }
+                var wcmd: Vec<str> = fl_v5("wsl", "-d", distro, "-e", "sh");
+                wcmd.push("-c");
+                wcmd.push("gcc " + opt + " -w '" + wsl_path(path) + "' -o '" + exe3 + "' && '" + exe3 + "'; s=$?; rm -f '" + exe3 + "'; exit $s");
+                val r3: R3 = run3(&wcmd, 120);
+                cres_set(&mut res, key, r3.rc, r3.out);
+            }
+        }
+    }
+    return res;
+}
+
+/// res[key] = (rc, out): a key given again keeps its place.
+fn cres_set(res: &mut CRes, key: str, rc: str, out: str) {
+    val at: i64 = fl_index(&res.keys, key);
+    if at >= 0 {
+        res.rc.set(at, rc);
+        res.out.set(at, out);
+        return;
+    }
+    res.keys.push(key);
+    res.rc.push(rc);
+    res.out.push(out);
+}
+
+/// repr() of a status: an int as it is, a word quoted.
+fn rc_repr(rc: str) -> str {
+    if fl_is_int(rc) { return rc; }
+    return fl_repr(rc);
+}
+
+/// repr() of the dict of C results.
+fn cres_repr(res: &CRes) -> str {
+    var parts: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < res.keys.len() {
+        parts.push(fl_repr(res.keys.get(i)) + ": (" + rc_repr(res.rc.get(i)) + ", " + fl_repr(res.out.get(i)) + ")");
+        i = i + 1;
+    }
+    return "{" + fl_join_lines(&parts, ", ") + "}";
+}
+
+fn qemu_of(target: str) -> str {
+    if target == "aarch64-linux" { return "qemu-aarch64"; }
+    if target == "riscv64-linux" { return "qemu-riscv64"; }
+    if target == "x86_64-linux" { return ""; }
+    return "?";
+}
+
+fn qemu_targets() -> Vec<str> {
+    return fl_v3("aarch64-linux", "riscv64-linux", "x86_64-linux");
+}
+
+var host_machine: str = "";
+
+fn machine() -> str {
+    if str_len(host_machine) > 0 { return host_machine; }
+    val r: R3 = run3(&fl_v2("uname", "-m"), 10);
+    host_machine = str_to_lower(str_trim(r.out));
+    if str_len(host_machine) == 0 { host_machine = "?"; }
+    return host_machine;
+}
+
+var host_sys: str = "";
+
+fn sysname() -> str {
+    if str_len(host_sys) > 0 { return host_sys; }
+    val r: R3 = run3(&fl_v2("uname", "-s"), 10);
+    host_sys = str_trim(r.out);
+    if str_len(host_sys) == 0 { host_sys = "?"; }
+    return host_sys;
+}
+
+/// The command prefix that runs a static Linux binary of `target` here
+/// (as items, then "1" when paths must be WSL paths, else "0"); an empty
+/// list when it cannot run.
+fn linux_runner(target: str) -> Vec<str> {
+    val q: str = qemu_of(target);
+    var out: Vec<str> = Vec::new();
+    if q == "?" { return out; }
+    if fl_win() {
+        if !which("wsl") { return out; }
+        out.push("wsl");
+        if str_len(fl_env("WSL_DISTRO")) > 0 {
+            out.push("-d");
+            out.push(fl_env("WSL_DISTRO"));
+        }
+        out.push("-e");
+        if str_len(q) > 0 { out.push(q); }
+        out.push("1");
+        return out;
+    }
+    val m: str = machine();
+    var host: str = "";
+    if m == "x86_64" || m == "amd64" { host = "x86_64-linux"; }
+    if m == "aarch64" || m == "arm64" { host = "aarch64-linux"; }
+    if m == "riscv64" { host = "riscv64-linux"; }
+    if sysname() == "Linux" && host == target {
+        out.push("0");
+        return out;
+    }
+    if str_len(q) > 0 && which(q) {
+        out.push(q);
+        out.push("0");
+        return out;
+    }
+    return out;
+}
+
+/// (build command, run command) of backend `b`; empty when this host
+/// cannot run it.
+pub struct Cmds {
+    pub ok: bool,
+    pub build: Vec<str>,
+    pub run: Vec<str>,
+}
+
+fn no_cmds() -> Cmds {
+    return Cmds { ok: false, build: Vec::new(), run: Vec::new() };
+}
+
+fn backend_cmd(fid: str, b: str, src: str, exe: str) -> Cmds {
+    var kind: str = b;
+    var target: str = "";
+    val colon: i64 = str_find(b, ":");
+    if colon >= 0 {
+        kind = str_slice(b, 0, colon);
+        target = str_slice(b, colon + 1, str_len(b));
+    }
+    if kind == "ccompile-O2" {
+        var bc: Vec<str> = fl_v5(fid, "ccompile", src, "--cc-opt", "2");
+        bc.push("-o");
+        bc.push(exe);
+        return Cmds { ok: true, build: bc, run: fl_v1(exe) };
+    }
+    if kind == "nat" {
+        if !fl_win() { return no_cmds(); }
+        var nc: Vec<str> = fl_v5(fid, "emit", src, "--nat", "-o");
+        nc.push(exe);
+        return Cmds { ok: true, build: nc, run: fl_v1(exe) };
+    }
+    if (kind == "emit" || kind == "ccompile") && str_len(target) > 0 {
+        val r: Vec<str> = linux_runner(target);
+        if r.len() == 0 { return no_cmds(); }
+        val wsl: bool = r.get(r.len() - 1) == "1";
+        var pre: Vec<str> = Vec::new();
+        var i: i64 = 0;
+        while i + 1 < r.len() {
+            pre.push(r.get(i));
+            i = i + 1;
+        }
+        var build: Vec<str> = fl_v5(fid, kind, src, "--target", target);
+        if kind == "ccompile" {
+            build.push("--cc-opt");
+            build.push("0");
+        }
+        build.push("-o");
+        build.push(exe);
+        if wsl { pre.push(wsl_path(exe)); } else { pre.push(exe); }
+        return Cmds { ok: true, build: build, run: pre };
+    }
+    var dc: Vec<str> = fl_v3(fid, kind, src);
+    dc.push("-o");
+    dc.push(exe);
+    return Cmds { ok: true, build: dc, run: fl_v1(exe) };
+}
+
+fn all_backends() -> Vec<str> {
+    var bs: Vec<str> = Vec::new();
+    bs.push("run");
+    bs.push("ccompile");
+    bs.push("ccompile-O2");
+    bs.push("emit");
+    if fl_win() { bs.push("nat"); }
+    val qs: Vec<str> = qemu_targets();
+    var i: i64 = 0;
+    while i < qs.len() {
+        if linux_runner(qs.get(i)).len() > 0 {
+            bs.push("emit:" + qs.get(i));
+            bs.push("ccompile:" + qs.get(i));
+        }
+        i = i + 1;
+    }
+    return bs;
+}
+
+fn fides_results(fid: str, src: str, work: str, seed: str, backends: &Vec<str>, names: &mut Vec<str>) -> Vec<R3> {
+    var res: Vec<R3> = Vec::new();
+    var i: i64 = 0;
+    while i < backends.len() {
+        val b: str = backends.get(i);
+        i = i + 1;
+        val exe: str = fl_join(work, seed + "-" + str_replace(b, ":", "-") + ".exe");
+        if b == "run" {
+            names.push(b);
+            res.push(run3(&fl_v3(fid, "run", src), 120));
+            continue;
+        }
+        val cmds: Cmds = backend_cmd(fid, b, src, exe);
+        if !cmds.ok { continue; }
+        names.push(b);
+        val bt: R3 = run3(&cmds.build, 300);
+        if bt.rc != "0" || !fl_exists(exe) {
+            res.push(R3 { rc: "build-failed", out: "", err: fl_tail_cps(bt.out + bt.err, 3000) });
+            continue;
+        }
+        res.push(run3(&cmds.run, 60));
+        fl_remove(exe);
+        fl_remove(str_replace(exe, ".exe", ".pdb"));
+    }
+    // GEN_VS_C_MUTATE=<backend> adds a line to that backend's output
+    val m: str = fl_env("GEN_VS_C_MUTATE");
+    val at: i64 = fl_index(names, m);
+    if at >= 0 && res.get(at).rc != "build-failed" {
+        val r: R3 = res.get(at);
+        res.set(at, R3 { rc: r.rc, out: r.out + "mutated\n", err: r.err });
+    }
+    return res;
+}
+
+pub struct Opts {
+    pub fid: str,
+    pub keep: str,
+    pub ext: bool,
+    pub ext2: bool,
+    pub avoid: Vec<str>,
+    pub ccs: Vec<str>,
+    pub backends: Vec<str>,
+}
+
+/// (verdict, message, backends that differ) of one seed, as three items.
+fn check(o: &Opts, seed: i64) -> Vec<str> {
+    val ss: str = int_to_str(seed);
+    val pr: Vec<str> = pair(seed, o.ext, o.ext2, &o.avoid);
+    val src: str = fl_join(o.keep, ss + ".fd");
+    fl_write(src, pr.get(0));
+    val cres: CRes = c_results(pr.get(1), o.keep, ss, &o.ccs);
+    var distinct: bool = false;
+    var failed: bool = false;
+    var i: i64 = 0;
+    while i < cres.keys.len() {
+        if cres.rc.get(i) == "cc-failed" { failed = true; }
+        if cres.rc.get(i) != cres.rc.get(0) || cres.out.get(i) != cres.out.get(0) { distinct = true; }
+        i = i + 1;
+    }
+    if cres.keys.len() == 0 || distinct || failed {
+        return fl_v3("oracle", "seed " + ss + ": C oracle disagrees with itself: " + cres_repr(&cres), "");
+    }
+    val want_rc: str = cres.rc.get(0);
+    val want_out: str = cres.out.get(0);
+    var names: Vec<str> = Vec::new();
+    val fres: Vec<R3> = fides_results(o.fid, src, o.keep, ss, &o.backends, &mut names);
+    var bad: Vec<str> = Vec::new();
+    i = 0;
+    while i < fres.len() {
+        val r: R3 = fres.get(i);
+        if r.rc != want_rc || r.out != want_out { bad.push(names.get(i)); }
+        i = i + 1;
+    }
+    if bad.len() == 0 {
+        fl_remove(src);
+        fl_remove(fl_join(o.keep, ss + ".c"));
+        var what: str = "exit " + want_rc;
+        if want_rc == "1" { what = "panic"; }
+        return fl_v3("ok", "seed " + ss + ": ok (" + what + ", " + int_to_str(fl_count_nl(want_out)) + " lines)", "");
+    }
+    fl_write_textmode(fl_join(o.keep, ss + ".want"), "exit: " + want_rc + "\n" + want_out);
+    i = 0;
+    while i < fres.len() {
+        val r2: R3 = fres.get(i);
+        fl_write_textmode(fl_join(o.keep, ss + "." + str_replace(names.get(i), ":", "-") + ".out"), "exit: " + r2.rc + "\n" + r2.out + "\n--- stderr ---\n" + fl_tail_cps(r2.err, 3000));
+        i = i + 1;
+    }
+    val bl: str = fl_join_lines(&bad, ",");
+    return fl_v3("differs", "seed " + ss + ": differs from C on " + bl + " -> " + src, bl);
+}
+
+fn int_opt(av: &Vec<str>, name: str, def: i64) -> i64 {
+    val s: str = fl_opt(av, name, int_to_str(def));
+    val v: i64 = fl_int(s, -987654321);
+    if v == -987654321 {
+        io_eprintln("fuzz_vs_c: argument " + name + ": invalid int value: '" + s + "'");
+        process_exit(2);
+    }
+    return v;
+}
+
+fn py_bool(b: bool) -> str {
+    if b { return "True"; }
+    return "False";
+}
+
+/// The command that runs this tool again (for --jobs): the program, and
+/// `run <file.fd>` when the interpreter runs it.
+fn self_argv() -> Vec<str> {
+    val all: Vec<str> = args_all();
+    var out: Vec<str> = Vec::new();
+    out.push(all.get(0));
+    if all.len() >= 3 && all.get(1) == "run" && str_ends_with(all.get(2), ".fd") {
+        out.push("run");
+        out.push(all.get(2));
+    }
+    return out;
+}
+
+fn main() -> i64 {
+    val av: Vec<str> = fl_args();
+    var dfid: str = "fid";
+    if fl_win() { dfid = "fid.exe"; }
+    val n: i64 = int_opt(&av, "-n", 50);
+    val seed: i64 = int_opt(&av, "--seed", 1);
+    val fid: str = fl_opt(&av, "--fid", fl_join("release", dfid));
+    val bs: str = fl_opt(&av, "--backends", "run,ccompile,emit");
+    val cc: str = fl_opt(&av, "--cc", "clang,gcc");
+    val keep: str = fl_opt(&av, "--keep", fl_join("build", "fuzz-c"));
+    val pseed: str = fl_opt(&av, "--print", "");
+    val avoid_s: str = fl_opt(&av, "--avoid", "all");
+    val ext: bool = fl_flag(&av, "--ext");
+    val ext2: bool = fl_flag(&av, "--ext2");
+    val jobs: i64 = int_opt(&av, "--jobs", 1);
+    val log: str = fl_opt(&av, "--log", "");
+    val one: str = fl_opt(&av, "--_one", "");
+    var avoid: Vec<str> = Vec::new();
+    if avoid_s == "all" {
+        avoid = known();
+    } else if avoid_s != "none" {
+        val parts: Vec<str> = str_split(avoid_s, ",");
+        var i: i64 = 0;
+        while i < parts.len() {
+            if str_len(parts.get(i)) > 0 { avoid.push(parts.get(i)); }
+            i = i + 1;
+        }
+    }
+    fl_setdefault_env("CC", "zig cc");
+    fl_setdefault_env("FIDES_NO_CACHE", "1");
+    if str_len(pseed) > 0 {
+        val ps: i64 = fl_int(pseed, -987654321);
+        if ps == -987654321 {
+            io_eprintln("fuzz_vs_c: argument --print: invalid int value: '" + pseed + "'");
+            return 2;
+        }
+        val pr: Vec<str> = pair(ps, ext || ext2, ext2, &avoid);
+        print(pr.get(0) + "\n");
+        print("// ---- C ----\n");
+        print(pr.get(1) + "\n");
+        return 0;
+    }
+    var ccs: Vec<str> = Vec::new();
+    val cparts: Vec<str> = str_split(cc, ",");
+    var ci: i64 = 0;
+    while ci < cparts.len() {
+        if str_len(cparts.get(ci)) > 0 { ccs.push(cparts.get(ci)); }
+        ci = ci + 1;
+    }
+    // gcc: WSL's on Windows, the host's elsewhere
+    if fl_contains(&ccs, "gcc") {
+        var have: bool = false;
+        if fl_win() { have = which("wsl"); } else { have = which("gcc"); }
+        if !have {
+            var kept: Vec<str> = Vec::new();
+            var removed: bool = false;
+            var k: i64 = 0;
+            while k < ccs.len() {
+                if ccs.get(k) == "gcc" && !removed { removed = true; } else { kept.push(ccs.get(k)); }
+                k = k + 1;
+            }
+            ccs = kept;
+        }
+    }
+    var backends: Vec<str> = Vec::new();
+    if bs == "all" {
+        backends = all_backends();
+    } else {
+        val bp: Vec<str> = str_split(bs, ",");
+        var bi: i64 = 0;
+        while bi < bp.len() {
+            if str_len(bp.get(bi)) > 0 { backends.push(bp.get(bi)); }
+            bi = bi + 1;
+        }
+    }
+    var usable: Vec<str> = Vec::new();
+    var bj: i64 = 0;
+    while bj < backends.len() {
+        val b: str = backends.get(bj);
+        if b == "run" || backend_cmd(fid, b, "x.fd", "x.exe").ok {
+            usable.push(b);
+        } else if str_len(one) == 0 {
+            fl_print("backend " + b + ": cannot run on this host (no WSL, qemu-user or --nat here): left out");
+        }
+        bj = bj + 1;
+    }
+    backends = usable;
+    var o: Opts = Opts { fid: fid, keep: keep, ext: ext || ext2, ext2: ext2, avoid: avoid, ccs: ccs, backends: backends };
+    if str_len(one) > 0 {
+        // --jobs: one seed for the parent, its record on one line
+        val r: Vec<str> = check(&o, fl_int(one, 0));
+        print(r.get(0) + "\t" + r.get(2) + "\t" + r.get(1) + "\n");
+        return 0;
+    }
+    fl_print("backends: " + fl_join_lines(&o.backends, ","));
+    fl_mkdirs(keep);
+    var fails: i64 = 0;
+    var oracle_bad: i64 = 0;
+    var per: Vec<i64> = Vec::new();
+    var bk: i64 = 0;
+    while bk < o.backends.len() {
+        per.push(0);
+        bk = bk + 1;
+    }
+    if str_len(log) > 0 {
+        fl_append_textmode(log, "# gen_vs_c seeds " + int_to_str(seed) + ".." + int_to_str(seed + n - 1) + " fid=" + fid + " backends=" + fl_join_lines(&o.backends, ",") + " cc=" + fl_join_lines(&o.ccs, ",") + " ext=" + py_bool(ext) + " ext2=" + py_bool(ext2) + " avoid=" + avoid_s + "\n");
+    }
+    var recs_v: Vec<str> = Vec::new();
+    var recs_m: Vec<str> = Vec::new();
+    var recs_b: Vec<str> = Vec::new();
+    var recs_s: Vec<i64> = Vec::new();
+    if jobs <= 1 {
+        var s: i64 = seed;
+        while s < seed + n {
+            val r: Vec<str> = check(&o, s);
+            record(&o, log, s, r.get(0), r.get(1), r.get(2), &mut fails, &mut oracle_bad, &mut per);
+            s = s + 1;
+        }
+    } else {
+        // N copies of this tool, one seed each; recorded as they finish
+        var handles: Vec<i64> = Vec::new();
+        var hseed: Vec<i64> = Vec::new();
+        var hout: Vec<str> = Vec::new();
+        var next: i64 = seed;
+        var tick: i64 = 0;
+        while next < seed + n || handles.len() > 0 {
+            while handles.len() < jobs && next < seed + n {
+                var argv: Vec<str> = self_argv();
+                var a: i64 = 0;
+                while a < av.len() {
+                    argv.push(av.get(a));
+                    a = a + 1;
+                }
+                argv.push("--_one");
+                argv.push(int_to_str(next));
+                tick = tick + 1;
+                val outp: str = fl_join(keep, ".job-" + int_to_str(p_getpid()) + "-" + int_to_str(next) + ".txt");
+                val h: i64 = process_spawn_to(argv, Vec::new(), "", outp);
+                handles.push(h);
+                hseed.push(next);
+                hout.push(outp);
+                next = next + 1;
+            }
+            var done: i64 = -1;
+            var w: i64 = 0;
+            while w < handles.len() && done < 0 {
+                match process_wait(handles.get(w), 0) {
+                    Option::Some(_c) => { done = w; }
+                    Option::None => { }
+                }
+                w = w + 1;
+            }
+            if done < 0 {
+                match process_wait(handles.get(0), 50) {
+                    Option::Some(_c2) => { done = 0; }
+                    Option::None => { }
+                }
+            }
+            if done >= 0 {
+                process_release(handles.get(done));
+                val text: str = fl_text(fl_read(hout.get(done)));
+                fl_remove(hout.get(done));
+                val sd: i64 = hseed.get(done);
+                // the record is the child's last line
+                val ls: Vec<str> = fl_lines(text);
+                var line: str = "";
+                var li: i64 = ls.len() - 1;
+                while li >= 0 && str_len(line) == 0 {
+                    line = ls.get(li);
+                    li = li - 1;
+                }
+                val t1: i64 = str_find(line, "\t");
+                var verdict: str = "oracle";
+                var badl: str = "";
+                var msg: str = "seed " + int_to_str(sd) + ": the job printed no result: " + text;
+                if t1 >= 0 {
+                    val rest: str = str_slice(line, t1 + 1, str_len(line));
+                    val t2: i64 = str_find(rest, "\t");
+                    if t2 >= 0 {
+                        verdict = str_slice(line, 0, t1);
+                        badl = str_slice(rest, 0, t2);
+                        msg = str_slice(rest, t2 + 1, str_len(rest));
+                    }
+                }
+                record(&o, log, sd, verdict, msg, badl, &mut fails, &mut oracle_bad, &mut per);
+                var nh: Vec<i64> = Vec::new();
+                var ns: Vec<i64> = Vec::new();
+                var no: Vec<str> = Vec::new();
+                var q: i64 = 0;
+                while q < handles.len() {
+                    if q != done {
+                        nh.push(handles.get(q));
+                        ns.push(hseed.get(q));
+                        no.push(hout.get(q));
+                    }
+                    q = q + 1;
+                }
+                handles = nh;
+                hseed = ns;
+                hout = no;
+            }
+        }
+    }
+    var by: Vec<str> = Vec::new();
+    var pb: i64 = 0;
+    while pb < o.backends.len() {
+        by.push(o.backends.get(pb) + " " + int_to_str(per.get(pb)));
+        pb = pb + 1;
+    }
+    val summary: str = int_to_str(n) + " programs: " + int_to_str(fails) + " differ from C, " + int_to_str(oracle_bad) + " with a C oracle that disagrees with itself (by backend: " + fl_join_lines(&by, ", ") + ")";
+    fl_print(summary);
+    if str_len(log) > 0 { fl_append_textmode(log, "# " + summary + "\n"); }
+    if fails > 0 { return 1; }
+    return 0;
+}
+
+fn record(o: &Opts, log: str, seed: i64, verdict: str, msg: str, bad: str, fails: &mut i64, oracle_bad: &mut i64, per: &mut Vec<i64>) {
+    fl_print(msg);
+    if verdict == "oracle" {
+        *oracle_bad = *oracle_bad + 1;
+    } else if verdict == "differs" {
+        *fails = *fails + 1;
+        val bl: Vec<str> = str_split(bad, ",");
+        var i: i64 = 0;
+        while i < bl.len() {
+            val at: i64 = fl_index(&o.backends, bl.get(i));
+            if at >= 0 { per.set(at, per.get(at) + 1); }
+            i = i + 1;
+        }
+    }
+    if str_len(log) > 0 {
+        fl_append_textmode(log, int_to_str(seed) + " " + verdict + " " + bad + "\n");
+    }
+}

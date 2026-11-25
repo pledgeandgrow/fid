@@ -1,0 +1,896 @@
+// tools/fuzz_lib.fd — what the ported fuzz drivers share (tools/fuzz_gen.fd,
+// fuzz_vs_c.fd, fuzz_frontend.fd, fuzz_parsers.fd, reduce.fd,
+// fuzz_nightly.fd: the Fides ports of scripts/fuzz/*.py and nightly.sh,
+// roadmap AD4).
+//
+// Paths as Python's os.path writes them (a backslash between parts on
+// Windows), children run as subprocess.run runs them (no shell, a time
+// limit, stdout and stderr apart, Python's return code: unsigned on
+// Windows), text as Python reads it (UTF-8 with U+FFFD for a bad
+// sequence, "\r\n" and "\r" as "\n" in text mode) and Python's repr() of
+// a str. Code points are kept in Vec<i64> where the scripts index a str by
+// character; U+0000 travels inside a str as the bytes C0 80 (a str does
+// not hold a NUL on every backend) and fl_write_cps writes it back as 0.
+
+module fuzz_lib;
+
+use core;
+use args;
+use fs;
+use io;
+use process;
+
+extern "C" {
+    fn getcwd(buf: i64, n: i64) -> i64;
+}
+
+// ─── The command line and the environment ───
+
+/// The arguments after the program (`fid run tools/x.fd a b` passes "run"
+/// and the path first: those are left out).
+pub fn fl_args() -> Vec<str> {
+    val all: Vec<str> = args_all();
+    var first: i64 = 1;
+    if all.len() >= 3 && all.get(1) == "run" && str_ends_with(all.get(2), ".fd") { first = 3; }
+    var out: Vec<str> = Vec::new();
+    var i: i64 = first;
+    while i < all.len() {
+        out.push(all.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// os.environ.get(name, "")
+pub fn fl_env(name: str) -> str {
+    match env_var(name) {
+        Option::Some(v) => { return v; }
+        Option::None => { }
+    }
+    return "";
+}
+
+pub fn fl_env_has(name: str) -> bool {
+    match env_var(name) {
+        Option::Some(_v) => { return true; }
+        Option::None => { }
+    }
+    return false;
+}
+
+/// argparse's value of option `name` ("--name v", "--name=v", and for a
+/// one-letter option "-nV"); `def` when it is not given. The last one
+/// given wins, as in argparse.
+pub fn fl_opt(av: &Vec<str>, name: str, def: str) -> str {
+    var v: str = def;
+    var i: i64 = 0;
+    while i < av.len() {
+        val a: str = av.get(i);
+        if a == name && i + 1 < av.len() {
+            v = av.get(i + 1);
+            i = i + 2;
+            continue;
+        }
+        if str_starts_with(a, name + "=") {
+            v = str_slice(a, str_len(name) + 1, str_len(a));
+        } else if str_len(name) == 2 && !str_starts_with(a, "--") && str_starts_with(a, name) && str_len(a) > 2 {
+            v = str_slice(a, 2, str_len(a));
+        }
+        i = i + 1;
+    }
+    return v;
+}
+
+/// Is flag `name` on the command line?
+pub fn fl_flag(av: &Vec<str>, name: str) -> bool {
+    var i: i64 = 0;
+    while i < av.len() {
+        if av.get(i) == name { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// The arguments that are not options: `with_value` lists the options
+/// that take a value (their value is skipped too).
+pub fn fl_positionals(av: &Vec<str>, with_value: &Vec<str>) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < av.len() {
+        val a: str = av.get(i);
+        if str_starts_with(a, "-") && str_len(a) > 1 {
+            var k: i64 = 0;
+            var takes: bool = false;
+            while k < with_value.len() {
+                if a == with_value.get(k) { takes = true; }
+                k = k + 1;
+            }
+            if takes { i = i + 1; }
+        } else {
+            out.push(a);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// int(s) for the decimal (optionally signed, blank-padded) text argparse
+/// takes; `def` when it is not a number.
+pub fn fl_int(s: str, def: i64) -> i64 {
+    val t: str = str_trim(s);
+    if str_len(t) == 0 { return def; }
+    var i: i64 = 0;
+    var neg: bool = false;
+    if str_byte_at(t, 0) == 45 || str_byte_at(t, 0) == 43 {
+        neg = str_byte_at(t, 0) == 45;
+        i = 1;
+    }
+    if i >= str_len(t) { return def; }
+    var v: i64 = 0;
+    while i < str_len(t) {
+        val c: i64 = str_byte_at(t, i);
+        if c == 95 { i = i + 1; continue; }
+        if c < 48 || c > 57 { return def; }
+        v = v * 10 + (c - 48);
+        i = i + 1;
+    }
+    if neg { return 0 - v; }
+    return v;
+}
+
+pub fn fl_is_int(s: str) -> bool {
+    return fl_int(s, -7777777) != -7777777 || str_trim(s) == "-7777777";
+}
+
+// ─── Paths (os.path) ───
+
+pub fn fl_win() -> bool {
+    return process_is_windows();
+}
+
+pub fn fl_sep() -> str {
+    if fl_win() { return "\\"; }
+    return "/";
+}
+
+fn fl_is_sep(c: i64) -> bool {
+    return c == 47 || (fl_win() && c == 92);
+}
+
+fn fl_drive(p: str) -> str {
+    if fl_win() && str_len(p) >= 2 && str_byte_at(p, 1) == 58 { return str_slice(p, 0, 2); }
+    return "";
+}
+
+pub fn fl_isabs(p: str) -> bool {
+    val d: str = fl_drive(p);
+    val rest: str = str_slice(p, str_len(d), str_len(p));
+    return str_len(rest) > 0 && fl_is_sep(str_byte_at(rest, 0));
+}
+
+/// os.path.join(a, b)
+pub fn fl_join(a: str, b: str) -> str {
+    if str_len(a) == 0 { return b; }
+    if fl_isabs(b) { return b; }
+    if fl_is_sep(str_byte_at(a, str_len(a) - 1)) { return a + b; }
+    return a + fl_sep() + b;
+}
+
+var fl_cwd_cache: str = "";
+
+/// os.getcwd()
+pub fn fl_cwd() -> str {
+    if str_len(fl_cwd_cache) > 0 { return fl_cwd_cache; }
+    var buf: i64 = 0;
+    // SAFETY: a fresh 4096-byte buffer; getcwd writes at most that many
+    // bytes, NUL included, and the result is copied out before it is freed.
+    unsafe {
+        buf = p_malloc(4096);
+        if buf != 0 {
+            if getcwd(buf, 4096) != 0 {
+                fl_cwd_cache = p_str_from_ptr(buf);
+            }
+            p_free(buf);
+        }
+    }
+    if str_len(fl_cwd_cache) == 0 { fl_cwd_cache = "."; }
+    return fl_cwd_cache;
+}
+
+fn fl_split(s: str, sep: str) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var start: i64 = 0;
+    var i: i64 = 0;
+    val n: i64 = str_len(s);
+    val m: i64 = str_len(sep);
+    while i + m <= n {
+        if str_slice(s, i, i + m) == sep {
+            out.push(str_slice(s, start, i));
+            i = i + m;
+            start = i;
+        } else {
+            i = i + 1;
+        }
+    }
+    out.push(str_slice(s, start, n));
+    return out;
+}
+
+/// os.path.normpath
+pub fn fl_normpath(p: str) -> str {
+    val d: str = fl_drive(p);
+    var rest: str = str_slice(p, str_len(d), str_len(p));
+    if fl_win() { rest = str_replace(rest, "/", "\\"); }
+    val abs: bool = str_len(rest) > 0 && fl_is_sep(str_byte_at(rest, 0));
+    val parts: Vec<str> = fl_split(rest, fl_sep());
+    var out: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < parts.len() {
+        val c: str = parts.get(i);
+        i = i + 1;
+        if str_len(c) == 0 || c == "." { continue; }
+        if c == ".." {
+            if out.len() > 0 && out.get(out.len() - 1) != ".." {
+                out.remove(out.len() - 1);
+                continue;
+            }
+            if abs { continue; }
+        }
+        out.push(c);
+    }
+    var s: str = "";
+    i = 0;
+    while i < out.len() {
+        if i > 0 { s = s + fl_sep(); }
+        s = s + out.get(i);
+        i = i + 1;
+    }
+    if abs { s = fl_sep() + s; }
+    s = d + s;
+    if str_len(s) == 0 { return "."; }
+    return s;
+}
+
+/// os.path.abspath
+pub fn fl_abspath(p: str) -> str {
+    if fl_isabs(p) { return fl_normpath(p); }
+    return fl_normpath(fl_join(fl_cwd(), p));
+}
+
+/// os.path.splitext(p)[0]
+pub fn fl_stem(p: str) -> str {
+    var i: i64 = str_len(p) - 1;
+    while i >= 0 {
+        val c: i64 = str_byte_at(p, i);
+        if fl_is_sep(c) { return p; }
+        if c == 46 {
+            // a leading dot of the name is not an extension
+            var j: i64 = i - 1;
+            while j >= 0 && str_byte_at(p, j) == 46 { j = j - 1; }
+            if j < 0 || fl_is_sep(str_byte_at(p, j)) { return p; }
+            return str_slice(p, 0, i);
+        }
+        i = i - 1;
+    }
+    return p;
+}
+
+/// os.path.basename
+pub fn fl_basename(p: str) -> str {
+    var i: i64 = str_len(p) - 1;
+    while i >= 0 {
+        if fl_is_sep(str_byte_at(p, i)) { return str_slice(p, i + 1, str_len(p)); }
+        i = i - 1;
+    }
+    return p;
+}
+
+pub fn fl_exists(p: str) -> bool {
+    return fs_exists(p);
+}
+
+/// os.remove (no error when it is not there)
+pub fn fl_remove(p: str) {
+    if fs_exists(p) { fs_delete(p); }
+}
+
+/// os.makedirs(p, exist_ok=True). Not fs_mkdir_all: it tries to make
+/// "C:" of "C:/x/y" and gives up (fs_is_dir("C:") is false).
+pub fn fl_mkdirs(p: str) {
+    if str_len(p) == 0 || fs_is_dir(p) { return; }
+    val d: str = fl_drive(p);
+    var rest: str = str_slice(p, str_len(d), str_len(p));
+    if fl_win() { rest = str_replace(rest, "\\", "/"); }
+    var cur: str = d;
+    if str_len(rest) > 0 && str_byte_at(rest, 0) == 47 { cur = cur + "/"; }
+    val parts: Vec<str> = fl_split(rest, "/");
+    var i: i64 = 0;
+    while i < parts.len() {
+        val seg: str = parts.get(i);
+        i = i + 1;
+        if str_len(seg) == 0 { continue; }
+        if str_len(cur) > 0 && str_byte_at(cur, str_len(cur) - 1) != 47 && cur != d { cur = cur + "/"; }
+        cur = cur + seg;
+        if !fs_is_dir(cur) { p_mkdir(cur); }
+    }
+}
+
+/// os.replace(a, b)
+pub fn fl_replace(a: str, b: str) {
+    fl_remove(b);
+    fs_rename(a, b);
+}
+
+// ─── Files ───
+
+/// Write `text` (UTF-8, "\n" kept: Python's newline="\n").
+pub fn fl_write(path: str, text: str) {
+    fs_write_bytes(path, fl_nul_back(str_bytes(text)));
+}
+
+/// Bytes with each C0 80 turned back into 0.
+fn fl_nul_back(b: Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < b.len() {
+        if b.get(i) == 192 && i + 1 < b.len() && b.get(i + 1) == 128 {
+            out.push(0);
+            i = i + 2;
+        } else {
+            out.push(b.get(i));
+            i = i + 1;
+        }
+    }
+    return out;
+}
+
+/// Python's open(path, "w") with text-mode newlines: "\n" is "\r\n" on
+/// Windows.
+pub fn fl_write_textmode(path: str, text: str) {
+    if fl_win() {
+        fl_write(path, str_replace(text, "\n", "\r\n"));
+    } else {
+        fl_write(path, text);
+    }
+}
+
+/// Append `text` in text mode.
+pub fn fl_append_textmode(path: str, text: str) {
+    var t: str = text;
+    if fl_win() { t = str_replace(text, "\n", "\r\n"); }
+    var old: Vec<i64> = Vec::new();
+    if fs_exists(path) { old = fs_read_bytes(path); }
+    val add: Vec<i64> = fl_nul_back(str_bytes(t));
+    var i: i64 = 0;
+    while i < add.len() {
+        old.push(add.get(i));
+        i = i + 1;
+    }
+    fs_write_bytes(path, old);
+}
+
+/// The raw bytes of a file as a str (C0 80 for a 0 byte); "" when none.
+pub fn fl_read(path: str) -> str {
+    if !fs_exists(path) { return ""; }
+    return fl_bytes_str(fs_read_bytes(path));
+}
+
+/// Bytes as a str, each 0 as C0 80.
+pub fn fl_bytes_str(b: Vec<i64>) -> str {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < b.len() {
+        val c: i64 = b.get(i);
+        if c == 0 {
+            out.push(192);
+            out.push(128);
+        } else {
+            out.push(c);
+        }
+        i = i + 1;
+    }
+    return str_from_bytes(out);
+}
+
+// ─── Text as Python sees it ───
+
+/// bytes.decode("utf-8", "replace"): code points, each invalid sequence
+/// (its maximal valid prefix) as U+FFFD.
+pub fn fl_decode(b: Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    val n: i64 = b.len();
+    var i: i64 = 0;
+    while i < n {
+        val c: i64 = b.get(i);
+        if c < 128 {
+            out.push(c);
+            i = i + 1;
+            continue;
+        }
+        var need: i64 = 0;
+        var cp: i64 = 0;
+        var lo: i64 = 128;
+        var hi: i64 = 191;
+        if c >= 194 && c <= 223 {
+            need = 1;
+            cp = c & 31;
+        } else if c >= 224 && c <= 239 {
+            need = 2;
+            cp = c & 15;
+            if c == 224 { lo = 160; }
+            if c == 237 { hi = 159; }
+        } else if c >= 240 && c <= 244 {
+            need = 3;
+            cp = c & 7;
+            if c == 240 { lo = 144; }
+            if c == 244 { hi = 143; }
+        } else {
+            out.push(65533);
+            i = i + 1;
+            continue;
+        }
+        var j: i64 = 1;
+        var ok: bool = true;
+        while j <= need {
+            if i + j >= n {
+                ok = false;
+                break;
+            }
+            val d: i64 = b.get(i + j);
+            var l: i64 = 128;
+            var h: i64 = 191;
+            if j == 1 {
+                l = lo;
+                h = hi;
+            }
+            if d < l || d > h {
+                ok = false;
+                break;
+            }
+            cp = (cp << 6) | (d & 63);
+            j = j + 1;
+        }
+        if ok {
+            out.push(cp);
+            i = i + need + 1;
+        } else {
+            out.push(65533);
+            i = i + j;
+        }
+    }
+    return out;
+}
+
+/// Code points [from, to) as UTF-8 text (U+0000 as C0 80; a lone
+/// surrogate as its three bytes, which "surrogatepass" writes too).
+pub fn fl_encode(cps: &Vec<i64>, from: i64, to: i64) -> str {
+    var b: Vec<i64> = Vec::new();
+    var i: i64 = from;
+    while i < to {
+        val c: i64 = cps.get(i);
+        if c == 0 {
+            b.push(192);
+            b.push(128);
+        } else if c < 128 {
+            b.push(c);
+        } else if c < 2048 {
+            b.push(192 | (c >> 6));
+            b.push(128 | (c & 63));
+        } else if c < 65536 {
+            b.push(224 | (c >> 12));
+            b.push(128 | ((c >> 6) & 63));
+            b.push(128 | (c & 63));
+        } else {
+            b.push(240 | (c >> 18));
+            b.push(128 | ((c >> 12) & 63));
+            b.push(128 | ((c >> 6) & 63));
+            b.push(128 | (c & 63));
+        }
+        i = i + 1;
+    }
+    return str_from_bytes(b);
+}
+
+pub fn fl_encode_all(cps: &Vec<i64>) -> str {
+    return fl_encode(cps, 0, cps.len());
+}
+
+/// The code points of text made by fl_encode (or of valid UTF-8).
+pub fn fl_cps(s: str) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    val n: i64 = str_len(s);
+    var i: i64 = 0;
+    while i < n {
+        val c: i64 = str_byte_at(s, i);
+        if c < 128 {
+            out.push(c);
+            i = i + 1;
+        } else if c < 224 {
+            out.push(((c & 31) << 6) | (str_byte_at(s, i + 1) & 63));
+            i = i + 2;
+        } else if c < 240 {
+            out.push(((c & 15) << 12) | ((str_byte_at(s, i + 1) & 63) << 6) | (str_byte_at(s, i + 2) & 63));
+            i = i + 3;
+        } else {
+            out.push(((c & 7) << 18) | ((str_byte_at(s, i + 1) & 63) << 12) | ((str_byte_at(s, i + 2) & 63) << 6) | (str_byte_at(s, i + 3) & 63));
+            i = i + 4;
+        }
+    }
+    return out;
+}
+
+/// Bytes decoded as Python's errors="replace" does, as a str.
+pub fn fl_decode_str(raw: str) -> str {
+    val cps: Vec<i64> = fl_decode(fl_nul_back(str_bytes(raw)));
+    return fl_encode_all(&cps);
+}
+
+/// Text mode's newlines: "\r\n" and "\r" are "\n".
+pub fn fl_text(s: str) -> str {
+    return str_replace(str_replace(s, "\r\n", "\n"), "\r", "\n");
+}
+
+/// s.replace("\r", "")
+pub fn fl_no_cr(s: str) -> str {
+    return str_replace(s, "\r", "");
+}
+
+/// s.split("\n") (keeps empty pieces).
+pub fn fl_lines(s: str) -> Vec<str> {
+    return fl_split(s, "\n");
+}
+
+/// "\n".join(v)
+pub fn fl_join_lines(v: &Vec<str>, sep: str) -> str {
+    var b: StringBuilder = StringBuilder::new();
+    var i: i64 = 0;
+    while i < v.len() {
+        if i > 0 { b.append_str(sep); }
+        b.append_str(v.get(i));
+        i = i + 1;
+    }
+    return b.to_str();
+}
+
+/// The number of times "\n" is in s.
+pub fn fl_count_nl(s: str) -> i64 {
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while i < str_len(s) {
+        if str_byte_at(s, i) == 10 { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+
+/// The last `n` bytes of s (Python's s[-n:] on ASCII text).
+pub fn fl_tail(s: str, n: i64) -> str {
+    if str_len(s) <= n { return s; }
+    return str_slice(s, str_len(s) - n, str_len(s));
+}
+
+/// s[-n:] by code point.
+pub fn fl_tail_cps(s: str, n: i64) -> str {
+    val cps: Vec<i64> = fl_cps(s);
+    if cps.len() <= n { return s; }
+    return fl_encode(&cps, cps.len() - n, cps.len());
+}
+
+/// s[:n] by code point.
+pub fn fl_head_cps(s: str, n: i64) -> str {
+    val cps: Vec<i64> = fl_cps(s);
+    if cps.len() <= n { return s; }
+    return fl_encode(&cps, 0, n);
+}
+
+/// Not printable for Python's repr(): Cc, Cf, Zs (but space), Zl, Zp, Co,
+/// as far as Latin-1 and the common ranges go.
+fn fl_unprintable(c: i64) -> bool {
+    if c < 32 || (c >= 127 && c <= 160) || c == 173 { return true; }
+    if c == 5760 || (c >= 8192 && c <= 8207) || (c >= 8232 && c <= 8239) || c == 8287 { return true; }
+    if (c >= 8288 && c <= 8303) || c == 12288 || c == 65279 || (c >= 65529 && c <= 65531) { return true; }
+    if (c >= 1536 && c <= 1541) || c == 1564 || c == 1757 || c == 1807 || c == 6158 { return true; }
+    if (c >= 57344 && c <= 63743) || (c >= 55296 && c <= 57343) { return true; }
+    return false;
+}
+
+pub fn fl_hex(c: i64, width: i64) -> str {
+    val digits: str = "0123456789abcdef";
+    var b: Vec<i64> = Vec::new();
+    var k: i64 = width - 1;
+    while k >= 0 {
+        b.push(str_byte_at(digits, (c >> (4 * k)) & 15));
+        k = k - 1;
+    }
+    return str_from_bytes(b);
+}
+
+/// Python's hex(n) for n >= 0.
+pub fn fl_hex0x(n: i64) -> str {
+    if n == 0 { return "0x0"; }
+    var w: i64 = 0;
+    var v: i64 = n;
+    while v > 0 {
+        w = w + 1;
+        v = v >> 4;
+    }
+    return "0x" + fl_hex(n, w);
+}
+
+/// Python's repr() of a str.
+pub fn fl_repr(s: str) -> str {
+    val cps: Vec<i64> = fl_cps(s);
+    var q: i64 = 39;
+    if str_contains(s, "'") && !str_contains(s, "\"") { q = 34; }
+    var out: Vec<i64> = Vec::new();
+    out.push(q);
+    var i: i64 = 0;
+    while i < cps.len() {
+        val c: i64 = cps.get(i);
+        i = i + 1;
+        if c == q || c == 92 {
+            out.push(92);
+            out.push(c);
+            continue;
+        }
+        var esc: str = "";
+        if c == 9 {
+            esc = "\\t";
+        } else if c == 10 {
+            esc = "\\n";
+        } else if c == 13 {
+            esc = "\\r";
+        } else if fl_unprintable(c) {
+            if c < 256 {
+                esc = "\\x" + fl_hex(c, 2);
+            } else if c < 65536 {
+                esc = "\\u" + fl_hex(c, 4);
+            } else {
+                esc = "\\U" + fl_hex(c, 8);
+            }
+        }
+        if str_len(esc) > 0 {
+            var k: i64 = 0;
+            while k < str_len(esc) {
+                out.push(str_byte_at(esc, k));
+                k = k + 1;
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out.push(q);
+    return fl_encode_all(&out);
+}
+
+/// Byte order (Python's code point order for UTF-8 text).
+pub fn fl_lt(a: str, b: str) -> bool {
+    val n: i64 = str_len(a);
+    val m: i64 = str_len(b);
+    var i: i64 = 0;
+    while i < n && i < m {
+        val x: i64 = str_byte_at(a, i);
+        val y: i64 = str_byte_at(b, i);
+        if x != y { return x < y; }
+        i = i + 1;
+    }
+    return n < m;
+}
+
+/// sorted() of strings.
+pub fn fl_sort(v: &mut Vec<str>) {
+    var i: i64 = 1;
+    while i < v.len() {
+        val x: str = v.get(i);
+        var j: i64 = i - 1;
+        while j >= 0 && fl_lt(x, v.get(j)) {
+            v.set(j + 1, v.get(j));
+            j = j - 1;
+        }
+        v.set(j + 1, x);
+        i = i + 1;
+    }
+}
+
+pub fn fl_contains(v: &Vec<str>, s: str) -> bool {
+    var i: i64 = 0;
+    while i < v.len() {
+        if v.get(i) == s { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+pub fn fl_index(v: &Vec<str>, s: str) -> i64 {
+    var i: i64 = 0;
+    while i < v.len() {
+        if v.get(i) == s { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+pub fn fl_print(s: str) {
+    print(s + "\n");
+}
+
+// ─── Running programs ───
+
+/// The program's slashes as backslashes on Windows (CreateProcess does
+/// not take "release/fid.exe" as Python's subprocess does), a bare name
+/// that names a file here as ./name.
+pub fn fl_prog(p: str) -> str {
+    var q: str = p;
+    if fl_win() { q = str_replace(q, "/", "\\"); }
+    return q;
+}
+
+/// What subprocess's returncode is for exit code `c` (unsigned on
+/// Windows, -n for a signal elsewhere; process_wait gives 128 + n).
+pub fn fl_code(c: i64) -> i64 {
+    if fl_win() {
+        if c < 0 { return c + 4294967296; }
+        return c;
+    }
+    return c;
+}
+
+pub struct FlRun {
+    pub started: bool,
+    pub timed_out: bool,
+    pub code: i64,
+    pub out: str,
+    pub err: str,
+}
+
+var fl_tmp_ctr: i64 = 0;
+
+// "K=V" lines every child gets (os.environ.setdefault in the scripts)
+var fl_extra_env: str = "";
+
+/// os.environ.setdefault(name, value): children get name=value unless
+/// it is set already.
+pub fn fl_setdefault_env(name: str, value: str) {
+    if fl_env_has(name) { return; }
+    fl_extra_env = fl_extra_env + name + "=" + value + char_to_str(10);
+}
+
+fn fl_tmp_dir() -> str {
+    var names: Vec<str> = Vec::new();
+    names.push("TMPDIR");
+    names.push("TEMP");
+    names.push("TMP");
+    var i: i64 = 0;
+    while i < names.len() {
+        val v: str = fl_env(names.get(i));
+        if str_len(v) > 0 { return v; }
+        i = i + 1;
+    }
+    if fl_win() { return "."; }
+    return "/tmp";
+}
+
+fn fl_argv_prog(argv: &Vec<str>) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < argv.len() {
+        if i == 0 { out.push(fl_prog(argv.get(0))); } else { out.push(argv.get(i)); }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Run `argv` (no shell) in `dir` ("" for ours) with `env` ("K=V") added,
+/// for at most `secs` seconds (0: no limit). On a timeout the child is
+/// killed, on Windows with its whole tree (taskkill /F /T, as the scripts'
+/// _run does). Raw bytes in out and err (0 as C0 80).
+pub fn fl_run_env(argv: &Vec<str>, env: &Vec<str>, dir: str, secs: i64) -> FlRun {
+    var ms: i64 = -1;
+    if secs > 0 { ms = secs * 1000; }
+    return fl_run_env_ms(argv, env, dir, ms);
+}
+
+/// fl_run_env with the limit in milliseconds (negative: none; 0: the
+/// child is stopped at once unless it has ended, as subprocess's
+/// timeout=0).
+pub fn fl_run_env_ms(argv: &Vec<str>, env: &Vec<str>, dir: str, limit_ms: i64) -> FlRun {
+    fl_tmp_ctr = fl_tmp_ctr + 1;
+    val base: str = fl_join(fl_tmp_dir(), ".fides_fuzz_" + int_to_str(p_getpid()) + "_" + int_to_str(p_clock_now_us()) + "_" + int_to_str(fl_tmp_ctr));
+    val op: str = base + ".out";
+    val ep: str = base + ".err";
+    var e2: Vec<str> = Vec::new();
+    var k: i64 = 0;
+    while k < env.len() {
+        e2.push(env.get(k));
+        k = k + 1;
+    }
+    val extra: Vec<str> = fl_lines(fl_extra_env);
+    k = 0;
+    while k < extra.len() {
+        if str_len(extra.get(k)) > 0 { e2.push(extra.get(k)); }
+        k = k + 1;
+    }
+    val h: i64 = process_spawn_files(fl_argv_prog(argv), e2, dir, op, ep);
+    if h == 0 {
+        fl_remove(op);
+        fl_remove(ep);
+        return FlRun { started: false, timed_out: false, code: -1, out: "", err: "" };
+    }
+    var code: i64 = -1;
+    var timed: bool = false;
+    match process_wait(h, limit_ms) {
+        Option::Some(c) => { code = c; }
+        Option::None => {
+            timed = true;
+            if fl_win() {
+                var tk: Vec<str> = Vec::new();
+                tk.push("taskkill");
+                tk.push("/F");
+                tk.push("/T");
+                tk.push("/PID");
+                tk.push(int_to_str(process_child_pid(h)));
+                val r: ChildResult = process_run_argv(tk, Vec::new(), "", 30000);
+            }
+            process_kill(h);
+            match process_wait(h, 10000) {
+                Option::Some(c2) => { code = c2; }
+                Option::None => { }
+            }
+        }
+    }
+    process_release(h);
+    val out: str = fl_read(op);
+    val err: str = fl_read(ep);
+    fl_remove(op);
+    fl_remove(ep);
+    return FlRun { started: true, timed_out: timed, code: fl_code(code), out: out, err: err };
+}
+
+pub fn fl_run(argv: &Vec<str>, dir: str, secs: i64) -> FlRun {
+    val none: Vec<str> = Vec::new();
+    return fl_run_env(argv, &none, dir, secs);
+}
+
+/// A child's output as `text=True, errors="replace"` reads it: decoded
+/// (UTF-8 here; Python uses the locale's code page on Windows, which the
+/// ASCII of these programs' output does not tell apart), newlines
+/// translated.
+pub fn fl_as_text(raw: str) -> str {
+    return fl_text(fl_decode_str(raw));
+}
+
+// ─── Small Vec builders ───
+
+pub fn fl_v1(a: str) -> Vec<str> {
+    var v: Vec<str> = Vec::new();
+    v.push(a);
+    return v;
+}
+
+pub fn fl_v2(a: str, b: str) -> Vec<str> {
+    var v: Vec<str> = fl_v1(a);
+    v.push(b);
+    return v;
+}
+
+pub fn fl_v3(a: str, b: str, c: str) -> Vec<str> {
+    var v: Vec<str> = fl_v2(a, b);
+    v.push(c);
+    return v;
+}
+
+pub fn fl_v5(a: str, b: str, c: str, d: str, e: str) -> Vec<str> {
+    var v: Vec<str> = fl_v3(a, b, c);
+    v.push(d);
+    v.push(e);
+    return v;
+}
+
+/// Is c a word character of Python's re (ASCII part)?
+pub fn fl_word(c: i64) -> bool {
+    return (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95;
+}
+
+pub fn fl_digit(c: i64) -> bool {
+    return c >= 48 && c <= 57;
+}

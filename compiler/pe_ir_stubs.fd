@@ -4399,8 +4399,9 @@ fn PeirGen_gen_checked_malloc(self: &mut PeirGen) -> void {
     PeirEnc_call_rip(&mut self.enc, PeirGen_iat_off(self, pe_import_slot("VirtualAlloc")));
     PeirEnc_add_rsp_i32(&mut self.enc, 32);
     PeirEnc_test_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
-    PeirEnc_jcc_label(&mut self.enc, 0x4, out);
-    // jz: out of memory, NULL
+    var cfail: i64 = PeirEnc_alloc_label(&mut self.enc);
+    PeirEnc_jcc_label(&mut self.enc, 0x4, cfail);
+    // jz: out of memory, a panic (PeirGen_gen_oom_panic)
     // VirtualProtect(base + span - 4096, 4096, PAGE_NOACCESS, &old)
     PeirEnc_sub_rsp_i32(&mut self.enc, 48);
     PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_RSP, 40, PEIR_RAX);
@@ -4441,6 +4442,12 @@ fn PeirGen_gen_checked_malloc(self: &mut PeirGen) -> void {
     PeirEnc_pop(&mut self.enc, PEIR_R12);
     PeirEnc_pop(&mut self.enc, PEIR_RBP);
     PeirEnc_ret(&mut self.enc);
+    // VirtualAlloc failed: the size asked for (r14) in the panic
+    var coom: i64 = PeirEnc_alloc_label(&mut self.enc);
+    PeirEnc_place_label(&mut self.enc, cfail);
+    PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_R14);
+    PeirEnc_jmp_label(&mut self.enc, coom);
+    PeirGen_gen_oom_panic(self, coom);
 }
 
 /// The --checked-alloc fault reports (format strings for msvcrt _snprintf).
@@ -4978,6 +4985,7 @@ fn PeirGen_gen_malloc_body(self: &mut PeirGen, zero: bool) -> void {
     var oom: i64 = PeirEnc_alloc_label(&mut self.enc);
     var large: i64 = PeirEnc_alloc_label(&mut self.enc);
     var lout: i64 = PeirEnc_alloc_label(&mut self.enc);
+    var lfail: i64 = PeirEnc_alloc_label(&mut self.enc);
 
     // --- r8 = class, r11 = its block bytes: from the tables up to
     // PEIR_SMALL_MAX bytes (a negative size is a huge unsigned one: the
@@ -5127,26 +5135,27 @@ fn PeirGen_gen_malloc_body(self: &mut PeirGen, zero: bool) -> void {
     PeirEnc_test_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
     PeirEnc_jcc_label(&mut self.enc, 0x5, bump);
     // jnz: bump again, in the new chunk
-    PeirEnc_place_label(&mut self.enc, oom);
-    // no memory: NULL (the caller crashes on use, as before)
-    PeirEnc_xor_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
-    PeirEnc_ret(&mut self.enc);
+    // no memory (rcx = the size asked for): a panic that says so, not a
+    // NULL the caller dereferences somewhere else
+    PeirGen_gen_oom_panic(self, oom);
 
     // --- RT7: pert_alloc_recommit(env 0, list array, payload, block
     // bytes) commits its pages again and zeroes the rest (both kinds);
-    // 0: no memory
+    // 0: no memory. The size is kept for the out-of-memory panic.
     PeirEnc_place_label(&mut self.enc, recommit);
     PeirEnc_push(&mut self.enc, PEIR_RBP);
     PeirEnc_mov_rr(&mut self.enc, PEIR_RBP, PEIR_RSP);
     PeirEnc_push(&mut self.enc, PEIR_RAX);
-    PeirEnc_sub_rsp_i32(&mut self.enc, 40);
+    PeirEnc_push(&mut self.enc, PEIR_RCX);
+    PeirEnc_sub_rsp_i32(&mut self.enc, 32);
     PeirEnc_mov_rr(&mut self.enc, PEIR_RDX, PEIR_R9);
     PeirEnc_mov_rr(&mut self.enc, PEIR_R8, PEIR_RAX);
     PeirEnc_mov_rr(&mut self.enc, PEIR_R9, PEIR_R11);
     PeirEnc_xor_rr(&mut self.enc, PEIR_RCX, PEIR_RCX);
     PeirGen_call_runtime(self, "pert_alloc_recommit");
-    PeirEnc_add_rsp_i32(&mut self.enc, 40);
+    PeirEnc_add_rsp_i32(&mut self.enc, 32);
     PeirEnc_test_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
+    PeirEnc_pop(&mut self.enc, PEIR_RCX);
     PeirEnc_pop(&mut self.enc, PEIR_RAX);
     PeirEnc_pop(&mut self.enc, PEIR_RBP);
     PeirEnc_jcc_label(&mut self.enc, 0x4, oom);
@@ -5230,8 +5239,8 @@ fn PeirGen_gen_malloc_body(self: &mut PeirGen, zero: bool) -> void {
     PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_R8, PEIR_RBP, -8);
     PeirEnc_call_rip(&mut self.enc, PeirGen_iat_off(self, PIAT_HEAP_ALLOC));
     PeirEnc_test_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
-    PeirEnc_jcc_label(&mut self.enc, 0x4, lout);
-    // jz
+    PeirEnc_jcc_label(&mut self.enc, 0x4, lfail);
+    // jz: the system heap refused it
     PeirEnc_mov_imm64(&mut self.enc, PEIR_R8, PEIR_BLOCK_MAGIC | PEIR_CLASS_LARGE);
     PeirEnc_mov_ptr_reg(&mut self.enc, PEIR_RAX, PEIR_R8);
     pe_emit4(&mut self.enc, 0x48, 0x83, 0xC0, 0x08);
@@ -5240,6 +5249,75 @@ fn PeirGen_gen_malloc_body(self: &mut PeirGen, zero: bool) -> void {
     PeirEnc_mov_rr(&mut self.enc, PEIR_RSP, PEIR_RBP);
     PeirEnc_pop(&mut self.enc, PEIR_RBP);
     PeirEnc_ret(&mut self.enc);
+    // HeapAlloc failed: rcx = the size asked for ([rbp - 8] holds it plus
+    // the header), then the out-of-memory panic
+    PeirEnc_place_label(&mut self.enc, lfail);
+    PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_RCX, PEIR_RBP, -8);
+    PeirEnc_lea_base_disp(&mut self.enc, PEIR_RCX, PEIR_RCX, -8);
+    PeirEnc_jmp_label(&mut self.enc, oom);
+}
+
+/// The allocator's out-of-memory panic at `label`, entered by a jump with
+/// rcx = the bytes asked for, from any stack depth (it never returns):
+/// "out of memory (<n> bytes requested)" through p_panic (exit code 1).
+/// The message is built on the stack, backwards from its end: no string in
+/// .rdata, no allocation. Before, p_malloc returned NULL and the caller
+/// faulted later at some other place ("Invalid memory access").
+fn PeirGen_gen_oom_panic(self: &mut PeirGen, label: i64) -> void {
+    var pos: i64 = PeirEnc_alloc_label(&mut self.enc);
+    var dloop: i64 = PeirEnc_alloc_label(&mut self.enc);
+    var nosign: i64 = PeirEnc_alloc_label(&mut self.enc);
+    PeirEnc_place_label(&mut self.enc, label);
+    pe_emit4(&mut self.enc, 0x48, 0x83, 0xE4, 0xF0);
+    // and rsp, -16: [rsp, rsp + 32) shadow space, the message below rsp + 120
+    PeirEnc_sub_rsp_i32(&mut self.enc, 128);
+    PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_RCX);
+    // " bytes requested)" and its NUL at rsp + 96
+    PeirEnc_mov_imm64(&mut self.enc, PEIR_R8, 0x7220736574796220);
+    PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_RSP, 96, PEIR_R8);
+    PeirEnc_mov_imm64(&mut self.enc, PEIR_R8, 0x6465747365757165);
+    PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_RSP, 104, PEIR_R8);
+    PeirEnc_mov_imm64(&mut self.enc, PEIR_R8, 0x29);
+    PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_RSP, 112, PEIR_R8);
+    // r10 = where the digits end; r9 = 1 for a negative size
+    PeirEnc_lea_base_disp(&mut self.enc, PEIR_R10, PEIR_RSP, 96);
+    PeirEnc_xor_self(&mut self.enc, PEIR_R9);
+    PeirEnc_test_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
+    PeirEnc_jcc_label(&mut self.enc, 0x9, pos);
+    // jns
+    PeirEnc_neg_r(&mut self.enc, PEIR_RAX);
+    PeirEnc_inc_r(&mut self.enc, PEIR_R9);
+    PeirEnc_place_label(&mut self.enc, pos);
+    PeirEnc_mov_imm64(&mut self.enc, PEIR_R11, 10);
+    // the digits, last first (unsigned division: -MIN is MIN)
+    PeirEnc_place_label(&mut self.enc, dloop);
+    pe_emit2(&mut self.enc, 0x31, 0xD2);
+    // xor edx, edx
+    pe_emit3(&mut self.enc, 0x49, 0xF7, 0xF3);
+    // div r11
+    pe_emit3(&mut self.enc, 0x80, 0xC2, 0x30);
+    // add dl, '0'
+    PeirEnc_dec_r(&mut self.enc, PEIR_R10);
+    pe_emit3(&mut self.enc, 0x41, 0x88, 0x12);
+    // mov [r10], dl
+    PeirEnc_test_rr(&mut self.enc, PEIR_RAX, PEIR_RAX);
+    PeirEnc_jcc_label(&mut self.enc, 0x5, dloop);
+    // jnz
+    PeirEnc_test_rr(&mut self.enc, PEIR_R9, PEIR_R9);
+    PeirEnc_jcc_label(&mut self.enc, 0x4, nosign);
+    // jz
+    PeirEnc_dec_r(&mut self.enc, PEIR_R10);
+    pe_emit4(&mut self.enc, 0x41, 0xC6, 0x02, 0x2D);
+    // mov byte [r10], '-'
+    PeirEnc_place_label(&mut self.enc, nosign);
+    // "out of memory (" in front: "memory (" at r10 - 8, "out of m" at r10 - 15
+    PeirEnc_mov_imm64(&mut self.enc, PEIR_R8, 0x282079726F6D656D);
+    PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_R10, -8, PEIR_R8);
+    PeirEnc_mov_imm64(&mut self.enc, PEIR_R8, 0x6D20666F2074756F);
+    PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_R10, -15, PEIR_R8);
+    PeirEnc_lea_base_disp(&mut self.enc, PEIR_RCX, PEIR_R10, -15);
+    PeirEnc_call_label(&mut self.enc, HashMap_get(self.func_labels, "p_panic"));
+    PeirEnc_ud2(&mut self.enc);
 }
 
 /// RT8: __p_malloc_uninit(rcx = size) -> rax, what core's p_malloc_uninit
@@ -8447,10 +8525,53 @@ pub fn PeirGen_gen_file_write(self: &mut PeirGen) -> void {
     PeirEnc_pop(&mut self.enc, PEIR_RBP);
     PeirEnc_ret(&mut self.enc);
     PeirEnc_place_label(&mut self.enc, fw_ok);
-    // strlen(content) into r8
+    // r8 = the content's length. BG81: a headered string's counted length,
+    // zero bytes included (stdlib/pe_runtime/base.fd pe_hdr_len's tests:
+    // 8-aligned, a length word in [0, 2^40) at s - 8, at s - 16 the
+    // literal magic, the static header or P_STR_RC + a count in 1..2^30
+    // with the append bit clear), as the C runtime's p_slen; else strlen
     PeirEnc_xor_self(&mut self.enc, PEIR_R8);
     var fw_len: i64 = PeirEnc_alloc_label(&mut self.enc);
     var fw_len_done: i64 = PeirEnc_alloc_label(&mut self.enc);
+    var fw_hdr: i64 = PeirEnc_alloc_label(&mut self.enc);
+    PeirEnc_test_rr(&mut self.enc, PEIR_R13, PEIR_R13);
+    PeirEnc_jcc_label(&mut self.enc, 0x4, fw_len_done);
+    // jz: no content, no bytes
+    PeirEnc_mov_rr(&mut self.enc, PEIR_RAX, PEIR_R13);
+    pe_emit4(&mut self.enc, 0x48, 0x83, 0xE0, 0x07);
+    // and rax, 7
+    PeirEnc_jcc_label(&mut self.enc, 0x5, fw_len);
+    // jnz: not 8-aligned
+    PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_RAX, PEIR_R13, -8);
+    PeirEnc_mov_imm64(&mut self.enc, PEIR_RCX, 0x10000000000);
+    PeirEnc_cmp_rr(&mut self.enc, PEIR_RAX, PEIR_RCX);
+    PeirEnc_jcc_label(&mut self.enc, 0x3, fw_len);
+    // jae (unsigned: a negative length too)
+    PeirEnc_mov_reg_mem_disp(&mut self.enc, PEIR_RDX, PEIR_R13, -16);
+    PeirEnc_mov_imm64(&mut self.enc, PEIR_RCX, 0x4649444553545201);
+    PeirEnc_cmp_rr(&mut self.enc, PEIR_RDX, PEIR_RCX);
+    PeirEnc_jcc_label(&mut self.enc, 0x4, fw_hdr);
+    PeirEnc_mov_imm64(&mut self.enc, PEIR_RCX, 0x4649444553545202);
+    PeirEnc_cmp_rr(&mut self.enc, PEIR_RDX, PEIR_RCX);
+    PeirEnc_jcc_label(&mut self.enc, 0x4, fw_hdr);
+    PeirEnc_mov_imm64(&mut self.enc, PEIR_RCX, 0x4649444500000000);
+    PeirEnc_sub_rr(&mut self.enc, PEIR_RDX, PEIR_RCX);
+    PeirEnc_mov_imm64(&mut self.enc, PEIR_RCX, 0x100000000);
+    PeirEnc_cmp_rr(&mut self.enc, PEIR_RDX, PEIR_RCX);
+    PeirEnc_jcc_label(&mut self.enc, 0x3, fw_len);
+    // jae: not P_STR_RC + a 32-bit count
+    PeirEnc_mov_imm64(&mut self.enc, PEIR_RCX, 0x40000000);
+    PeirEnc_test_rr(&mut self.enc, PEIR_RDX, PEIR_RCX);
+    PeirEnc_jcc_label(&mut self.enc, 0x5, fw_len);
+    // jnz: the append bit
+    PeirEnc_mov_imm64(&mut self.enc, PEIR_RCX, 0x3FFFFFFF);
+    PeirEnc_test_rr(&mut self.enc, PEIR_RDX, PEIR_RCX);
+    PeirEnc_jcc_label(&mut self.enc, 0x4, fw_len);
+    // jz: no owner
+    PeirEnc_place_label(&mut self.enc, fw_hdr);
+    PeirEnc_mov_rr(&mut self.enc, PEIR_R8, PEIR_RAX);
+    PeirEnc_jmp_label(&mut self.enc, fw_len_done);
+    // no header: up to the NUL
     PeirEnc_place_label(&mut self.enc, fw_len);
     PeirEnc_cmp_mem_idx_imm8(&mut self.enc, PEIR_R13, PEIR_R8, 0);
     PeirEnc_jcc_label(&mut self.enc, 0x4, fw_len_done);

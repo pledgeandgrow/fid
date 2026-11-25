@@ -204,12 +204,33 @@ fn pe_null_str() -> i64 {
 var pe_heap_chunk: i64 = 4194304;
 
 fn pe_mmap(n: i64) -> i64 {
+    return pe_mmap_for(n, n);
+}
+
+/// pe_mmap of n bytes for a block of `want` bytes: a mapping the system
+/// refuses stops the program with "out of memory (<want> bytes requested)"
+/// (pe_oom), never a failed address handed on.
+fn pe_mmap_for(n: i64, want: i64) -> i64 {
     var a: i64 = nat_syscall(PE_SYS_MMAP, 0, n, 3, 34, 0 - 1, 0);  // RW, PRIVATE|ANONYMOUS
-    if a < 0 && a > 0 - 4096 {
-        pe_write_all(2, "Panic: out of memory\n" as i64, 21);
-        pe_sys(PE_SYS_EXIT_GROUP, 1, 0, 0);
+    if a == 0 || (a < 0 && a > 0 - 4096) {
+        pe_oom(want);
     }
     return a;
+}
+
+/// Out of memory: "Panic: out of memory (<n> bytes requested)", the trace,
+/// exit code 1. Allocates nothing (before pe_rt_init has its buffer: the
+/// message without the number).
+fn pe_oom(n: i64) {
+    if pe_sigbuf == 0 {
+        pe_write_all(2, "Panic: out of memory\n" as i64, 21);
+    } else {
+        pe_fd_str(2, "Panic: out of memory (" as i64);
+        pe_fd_int(2, n);
+        pe_fd_str(2, " bytes requested)\n" as i64);
+        pe_trace_from(nat_frame_fp());
+    }
+    pe_sys(PE_SYS_EXIT_GROUP, 1, 0, 0);
 }
 
 // ─── RT8: per-thread heaps ──────────────────────────────────────────────
@@ -476,7 +497,7 @@ fn pe_chunk_new(h: i64, n: i64) -> i64 {
         size = n + PE_CHUNK_SKIP;
     }
     pe_carve_tail(h);
-    val c: i64 = pe_mmap(size);
+    val c: i64 = pe_mmap_for(size, n);
     pe_glock();
     val old: i64 = pe_ld(h + PE_H_BASE);
     if old != 0 {
@@ -796,7 +817,7 @@ fn pe_large_alloc(n: i64, zero: bool) -> i64 {
         if lrt_lim_mem != 0 {
             pe_lim_take_mt(total);
         }
-        big = pe_mmap(total);
+        big = pe_mmap_for(total, n);
         pe_st(big, total);
     }
     pe_st(big + 8, pe_magic() + PE_LARGE);
@@ -4930,23 +4951,11 @@ fn pe_write_file(path: i64, data: i64, n: i64, flags: i64) -> i64 {
     return 0;
 }
 
-// p_file_write/p_file_append are text builtins: the content stops at its
-// first zero byte, as C's fputs and pe_ir's stub (test_binary_io); a string
-// literal can hold one since RT2. p_file_write_bin writes every byte.
-fn pe_text_len(s: i64) -> i64 {
-    if s == 0 {
-        return 0;
-    }
-    val m: i64 = pe_len(s);
-    var n: i64 = 0;
-    while n < m && pe_ldb(s + n) != 0 {
-        n = n + 1;
-    }
-    return n;
-}
-
+// BG81: p_file_write/p_file_append write the string's full counted length
+// (pe_len: its header's), zero bytes included, as the C runtime and pe_ir
+// do; a string without a header up to its NUL.
 pub fn pert_file_write(path: i64, content: i64) -> i64 {
-    return pe_write_file(path, content, pe_text_len(content), 577);  // WRONLY|CREAT|TRUNC
+    return pe_write_file(path, content, pe_len(content), 577);  // WRONLY|CREAT|TRUNC
 }
 
 pub fn pert_file_write_bin(path: i64, data: i64, n: i64) -> i64 {
@@ -4957,7 +4966,7 @@ pub fn pert_file_write_bin(path: i64, data: i64, n: i64) -> i64 {
 }
 
 pub fn pert_file_append(path: i64, content: i64) -> i64 {
-    return pe_write_file(path, content, pe_text_len(content), 1089);  // WRONLY|CREAT|APPEND
+    return pe_write_file(path, content, pe_len(content), 1089);  // WRONLY|CREAT|APPEND
 }
 
 pub fn pert_file_exists(path: i64) -> bool {

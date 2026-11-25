@@ -1,0 +1,124 @@
+// A stand-in for the counter compiler in tests/tools/coverage/check.sh:
+// built with coverage counters (dump-c with FID_C_LINE_MARKS=1, then
+// tools/cov_instrument.fd), it takes `fid`'s command line
+// (<mode> <test> [-o <exe>] ...) and goes down different paths for each
+// mode and each kind of test file, so the coverage of a run depends on
+// the modes and tests given, as it does with the real compiler.
+//
+// Each run lasts a little over a second: the counters' file in FID_COV_DIR
+// is named after rand() seeded from time(0), clock() and an address (see
+// tools/cov_instrument.fd), so two runs started within the same second on
+// Windows, where the address is the same in every run, write the same file
+// and one bitmap is lost. Started a second apart, one at a time (-j 1),
+// every run keeps its own. FAKE_FID_QUICK=1: no wait (for runs whose
+// bitmaps are all the same, where a lost one changes nothing).
+use core;
+use args;
+use io;
+use task;
+
+fn count_lines(text: str) -> i64 {
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while i < str_len(text) {
+        if str_byte_at(text, i) == 10 {
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+fn check_text(text: str) -> i64 {
+    if str_contains(text, "fn main") {
+        return 0;
+    }
+    return 1;
+}
+
+fn run_text(text: str) -> i64 {
+    val n: i64 = count_lines(text);
+    if n > 5 {
+        println("long program");
+        return 0;
+    }
+    println("short program");
+    return 0;
+}
+
+fn emit_text(text: str, target: str) -> i64 {
+    if str_len(target) > 0 {
+        if target == "aarch64-linux" {
+            return 0;
+        }
+        return 2;
+    }
+    if str_contains(text, "loop") {
+        return 0;
+    }
+    return 0;
+}
+
+fn tool_text(cmd: str, text: str) -> i64 {
+    if cmd == "fmt" {
+        return check_text(text);
+    }
+    if cmd == "lint" {
+        return 0;
+    }
+    return 3;
+}
+
+fn never_called(x: i64) -> i64 {
+    if x > 0 {
+        return x;
+    }
+    return 0 - x;
+}
+
+fn main() -> i64 {
+    val code: i64 = dispatch();
+    match env_var("FAKE_FID_QUICK") {
+        Option::Some(_) => {
+        }
+        Option::None => {
+            task_sleep(1001);
+        }
+    }
+    return code;
+}
+
+fn dispatch() -> i64 {
+    val av: Vec<str> = args_all();
+    if av.len() < 3 {
+        return 2;
+    }
+    val mode: str = av.get(1);
+    var text: str = "";
+    match read_file(av.get(2)) {
+        Option::Some(t) => {
+            text = t;
+        }
+        Option::None => {
+            return 1;
+        }
+    }
+    var target: str = "";
+    var i: i64 = 3;
+    while i + 1 < av.len() {
+        if av.get(i) == "--target" {
+            target = av.get(i + 1);
+        }
+        i = i + 1;
+    }
+    if mode == "check" {
+        return check_text(text);
+    }
+    if mode == "run" {
+        return run_text(text);
+    }
+    if mode == "emit" || mode == "ccompile" {
+        return emit_text(text, target);
+    }
+    return tool_text(mode, text);
+}

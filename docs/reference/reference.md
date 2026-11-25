@@ -123,9 +123,9 @@ character (`read_char_lit`): `val c: i64 = 'A';` gives 65. Escapes: `\n` `\t`
 - `"…"`: escapes `\n` `\t` `\r` `\\` `\"` `\0` `\xHH` `\u{H…}`. Any other escape
   (including `\'`) is a lex error. `\0`, `\x00` and `\u{0}` are a zero byte
   of the string, and the rest of the literal is kept: a string carries its
-  length, so `str_len("ab\0cd")` is 5. A builtin that hands the string to the
-  system as text (`p_file_write`, `p_file_append`) stops at the zero byte;
-  `p_file_write_bin` and the byte functions do not.
+  length, so `str_len("ab\0cd")` is 5. `p_file_write` and `p_file_append`
+  write the string's full length, zero bytes included, on every backend
+  (BG81), as `p_file_write_bin` and the byte functions do.
 - Raw strings `r"…"` and `r#"…"#` (any number of `#`) take their content
   literally; the closing delimiter is `"` followed by the same number of `#`.
 - Format strings `f"…{expr}…"`: text outside braces takes the same escapes as a

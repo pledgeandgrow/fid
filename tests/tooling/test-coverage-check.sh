@@ -13,7 +13,7 @@ code=$?
 has() {
     if grep -qF -- "$2" "$OUT"; then echo "ok   $1"; else echo "FAIL $1: no line with: $2"; fail=1; fi
 }
-has "the coverage report" "veil -- Coverage Report"
+has "the coverage report" "veil — Coverage Report"
 has "line coverage" "Lines:"
 has "function coverage of the suite" "sign"
 has "the suite's summary after the report" "2 passed, 1 failed"
@@ -23,7 +23,7 @@ if grep -qiE "double free|invalid free|segmentation|access violation" "$OUT"; th
 # command line: before, the harness read `veil` as the test to run and ran
 # none), up to the panicking one, whose panic veil reports
 has "the coverage run reached the panic" "panic: division by zero"
-if grep -qE "^test_sign +[1-9][0-9]* +[1-9][0-9]* +100\.0% OK" "$OUT"; then echo "ok   test_sign covered"; else echo "FAIL test_sign not covered (the harness ran no test)"; fail=1; fi
+if grep -qE "^test_sign +[1-9][0-9]* +[1-9][0-9]* +100\.0% ✓" "$OUT"; then echo "ok   test_sign covered"; else echo "FAIL test_sign not covered (the harness ran no test)"; fail=1; fi
 # branch coverage (veil.fd vl_cover_module -> Interpreter_branch_report)
 has "the branch summary" "Branches:"
 has "the list of ways never taken" "Branches never taken:"

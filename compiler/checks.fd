@@ -529,6 +529,137 @@ fn peir_rotated_test(f: &IrFunction, head: i64, body: Vec<i64>, preds: Vec<Vec<i
     return canon;
 }
 
+/// A nonnegative increment whose type or constant value bounds it, pushed
+/// as [lo, hi]. Deliberately shallow: the counted-loop accumulator proof
+/// uses only facts local to the instruction, never assumptions.
+fn peir_nonneg_addend(f: &IrFunction, v: i64, out: &mut Vec<i64>) -> bool {
+    out.clear();
+    match peir_inst_of(f, v) {
+        Inst::ConstInt(c, _) => {
+            if c >= 0 {
+                out.push(c);
+                out.push(c);
+                return true;
+            }
+        }
+        Inst::IntExtend(_, from, _) => {
+            if peir_type_range(from, out) && out.get(0) >= 0 {
+                return true;
+            }
+        }
+        Inst::IntTrunc(_, _, to) => {
+            if peir_type_range(to, out) && out.get(0) >= 0 {
+                return true;
+            }
+        }
+        _ => {
+        }
+    }
+    out.clear();
+    return false;
+}
+
+/// Can block `blk` be reached again after leaving it without first passing
+/// through the loop header? If so a store in it may run several times in
+/// one counted-loop iteration.
+fn peir_store_once(succs: Vec<Vec<i64>>, head: i64, blk: i64, n: i64) -> bool {
+    if blk == head {
+        return false;
+    }
+    var seen: Vec<i64> = peir_zeros(n);
+    var work: Vec<i64> = Vec::new();
+    var first: Vec<i64> = succs.get(blk);
+    var i: i64 = 0;
+    while i < first.len() {
+        work.push(first.get(i));
+        i = i + 1;
+    }
+    while work.len() > 0 {
+        var b: i64 = work.pop();
+        if b == blk {
+            return false;
+        }
+        if b != head && b >= 0 && b < n && seen.get(b) == 0 {
+            seen.set(b, 1);
+            var ss: Vec<i64> = succs.get(b);
+            i = 0;
+            while i < ss.len() {
+                work.push(ss.get(i));
+                i = i + 1;
+            }
+        }
+    }
+    return true;
+}
+
+/// Can control flow reach block `target` from block `start`?
+fn peir_can_reach(succs: Vec<Vec<i64>>, start: i64, target: i64, n: i64) -> bool {
+    if start == target {
+        return true;
+    }
+    var seen: Vec<i64> = peir_zeros(n);
+    var work: Vec<i64> = Vec::new();
+    work.push(start);
+    while work.len() > 0 {
+        var b: i64 = work.pop();
+        if b >= 0 && b < n && seen.get(b) == 0 {
+            if b == target {
+                return true;
+            }
+            seen.set(b, 1);
+            var ss: Vec<i64> = succs.get(b);
+            var i: i64 = 0;
+            while i < ss.len() {
+                work.push(ss.get(i));
+                i = i + 1;
+            }
+        }
+    }
+    return false;
+}
+
+/// Does every exit from the counted loop reach its header again only after
+/// block `reset`? Then a store there is the accumulator's value on every
+/// entry, including entries under an outer loop.
+fn peir_reset_covers(succs: Vec<Vec<i64>>, body: Vec<i64>, head: i64, reset: i64, n: i64) -> bool {
+    var b: i64 = 0;
+    while b < n {
+        if body.get(b) != 0 {
+            var ss: Vec<i64> = succs.get(b);
+            var i: i64 = 0;
+            while i < ss.len() {
+                var s: i64 = ss.get(i);
+                if s >= 0 && s < n && body.get(s) == 0 {
+                    var seen: Vec<i64> = peir_zeros(n);
+                    var work: Vec<i64> = Vec::new();
+                    work.push(s);
+                    while work.len() > 0 {
+                        var x: i64 = work.pop();
+                        if x == reset {
+                            continue;
+                        }
+                        if x == head {
+                            return false;
+                        }
+                        if x >= 0 && x < n && seen.get(x) == 0 {
+                            seen.set(x, 1);
+                            var xs: Vec<i64> = succs.get(x);
+                            var xi: i64 = 0;
+                            while xi < xs.len() {
+                                work.push(xs.get(xi));
+                                xi = xi + 1;
+                            }
+                        }
+                    }
+                }
+                i = i + 1;
+            }
+        }
+        b = b + 1;
+    }
+    return true;
+}
+
 /// `lbody`: the loop's blocks (flags per block index), the shared loop
 /// tree's body of the loop headed by `head` (iro_loop_body, ME2).
 pub fn peir_counted_loop(f: &IrFunction, head: i64, n: i64, succs: Vec<Vec<i64>>, preds: Vec<Vec<i64>>, lbody: Vec<i64>, index: Vec<i64>, facts: PeirLoopFacts, out: &mut Vec<i64>) {
@@ -866,6 +997,101 @@ pub fn peir_counted_loop(f: &IrFunction, head: i64, n: i64, succs: Vec<Vec<i64>>
     // i + c fits
     if step_c > 1 && step_once {
         out.set(value, out.get(value) | 1);
+    }
+    // A nonnegative accumulator stepped at most once per counted-loop
+    // iteration cannot overflow when its worst growth over v.len() iterations
+    // stays in i64. This is intentionally narrower than a relational domain:
+    // every outside store must be a nonnegative constant, the loop may contain
+    // just one store to the slot, and that store must be acc = acc + inc with
+    // inc's own nonnegative type/constant bound. Loop versioning's guard is
+    // what ties right to a Vec length for the sieve's counting loop; the
+    // unversioned fallback keeps its check.
+    var len_cap: i64 = 281474976710656;
+    var acfg: IroCfg = iro_cfg(f);
+    var ai: i64 = 0;
+    while ai < facts.st_ptr.len() {
+        if body.get(facts.st_block.get(ai)) != 0 {
+            var aslot: i64 = facts.st_ptr.get(ai);
+            if aslot != slot && aslot >= 0 && aslot < facts.plain.len() && facts.plain.get(aslot) != 0 {
+                var ain: i64 = 0;
+                var abad: bool = false;
+                var areset: bool = false;
+                var avalue: i64 = 0 - 1;
+                var ablock: i64 = 0 - 1;
+                var astart: i64 = 0;
+                var aj: i64 = 0;
+                while aj < facts.st_ptr.len() {
+                    if facts.st_ptr.get(aj) == aslot {
+                        var asb: i64 = facts.st_block.get(aj);
+                        if body.get(asb) != 0 {
+                            ain = ain + 1;
+                            avalue = facts.st_value.get(aj);
+                            ablock = asb;
+                        } else if peir_can_reach(succs, asb, head, n) {
+                            match peir_inst_of(f, facts.st_value.get(aj)) {
+                                Inst::ConstInt(ac, _) => {
+                                    if ac < 0 {
+                                        abad = true;
+                                    } else {
+                                        if ac > astart {
+                                            astart = ac;
+                                        }
+                                        if iro_dominates(&acfg, asb, head) && peir_reset_covers(succs, body, head, asb, n) {
+                                            areset = true;
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    abad = true;
+                                }
+                            }
+                        }
+                    }
+                    aj = aj + 1;
+                }
+                if !abad && ain == 1 && areset && avalue >= 0 {
+                    var ainc: i64 = 0 - 1;
+                    var aok: bool = false;
+                    match peir_inst_of(f, avalue) {
+                        Inst::BinOp(aop, ax, ay, aty) => {
+                            match aop {
+                                BinOp::Add => {
+                                    match aty {
+                                        IrType::I64 => {
+                                            if peir_load_of(f, ax, aslot) {
+                                                ainc = ay;
+                                                aok = true;
+                                            } else if peir_load_of(f, ay, aslot) {
+                                                ainc = ax;
+                                                aok = true;
+                                            }
+                                        }
+                                        _ => {
+                                        }
+                                    }
+                                }
+                                _ => {
+                                }
+                            }
+                        }
+                        _ => {
+                        }
+                    }
+                    if aok {
+                        var arng: Vec<i64> = Vec::new();
+                        if peir_nonneg_addend(f, ainc, &mut arng) && arng.get(0) >= 0 {
+                            var room: i64 = PEIR_I64_MAX - astart;
+                            if room >= 0 && arng.get(1) <= room / len_cap {
+                                if (ablock == head && rotated) || peir_store_once(succs, head, ablock, n) {
+                                    out.set(avalue, out.get(avalue) | 1);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        ai = ai + 1;
     }
     b2 = 0;
     while b2 < n {
@@ -3093,7 +3319,8 @@ fn peir_join_fact(f: &IrFunction, r: &mut PeirRanges, index: &Vec<i64>, ps: Vec<
     }
 }
 
-/// One scan of the function in layout order; `final` marks the results.
+/// One scan of the function in scan_order (the CFG's reverse postorder,
+/// then unreachable blocks); `final` marks the results.
 /// With `joins` (LF8/LF9, FID_IROPT_OFF=rangejoin turns it off), a branch
 /// that gives no fact keeps the one before it, and facts meet at joins.
 /// BG5 (Nov 22): does f's integer arithmetic wrap instead of panicking on
@@ -3105,7 +3332,7 @@ fn peir_fn_wraps(f: &IrFunction) -> bool {
     return f.is_wrapping || is_pe_runtime_fn(f.name);
 }
 
-fn peir_range_scan(f: &IrFunction, r: &mut PeirRanges, single_pred: &Vec<i64>, preds: &Vec<Vec<i64>>, joins: bool, index: &Vec<i64>, out: &mut Vec<i64>, final: bool, dom: &mut PeirDomFacts, lf: &PeirBackFacts) {
+fn peir_range_scan(f: &IrFunction, r: &mut PeirRanges, single_pred: &Vec<i64>, preds: &Vec<Vec<i64>>, joins: bool, index: &Vec<i64>, scan_order: &Vec<i64>, out: &mut Vec<i64>, final: bool, dom: &mut PeirDomFacts, lf: &PeirBackFacts) {
     var nv: i64 = r.lo.len();
     // BG5: in a function whose arithmetic wraps, an Add/Mul that may
     // overflow gives no bound at all (the one-sided rules below assumed a
@@ -3170,8 +3397,9 @@ fn peir_range_scan(f: &IrFunction, r: &mut PeirRanges, single_pred: &Vec<i64>, p
     r.sf_loc.clear();
     r.sf_lo.clear();
     r.sf_hi.clear();
-    var b: i64 = 0;
-    while b < f.blocks.len() {
+    var ob: i64 = 0;
+    while ob < scan_order.len() {
+        var b: i64 = scan_order.get(ob);
         // The branch into this block, when it is the only way in
         r.ref_v = -1;
         r.ref_loc = -1;
@@ -3189,6 +3417,18 @@ fn peir_range_scan(f: &IrFunction, r: &mut PeirRanges, single_pred: &Vec<i64>, p
             // LF8: and everything else that held at pb's end
             if r.sf_on {
                 peir_sf_inherit(f, r, dom, index, pb, b, &xs, &x_s0, &x_sn, &x_done);
+                // the edge's own fact into the set too: ref_* alone does
+                // not survive this block's scan into its end facts, so a
+                // join downstream never saw a branch's refinement — only
+                // stores joined (hull's `i >= 0` then `i <= 1000` did not)
+                if r.ref_lo <= r.ref_hi {
+                    if r.ref_v >= 0 {
+                        peir_sf_apply(f, r, dom, b, 1, r.ref_v, r.ref_lo, r.ref_hi);
+                    }
+                    if r.ref_loc >= 0 && r.ref_live {
+                        peir_sf_apply(f, r, dom, b, 0, r.ref_loc, r.ref_lo, r.ref_hi);
+                    }
+                }
             }
         } else if joins && b > 0 && b < preds.len() {
             peir_join_fact(f, r, index, preds.get(b), b, &x_v, &x_loc, &x_lo, &x_hi, &x_live, &x_done);
@@ -3342,7 +3582,14 @@ fn peir_range_scan(f: &IrFunction, r: &mut PeirRanges, single_pred: &Vec<i64>, p
                             // fails): from here on n is at most the bytes of
                             // memory, the bound lengths have above
                         if dom.on && (name == "Vec_filled_typed" || name == "Vec_init_filled") && cargs.len() >= 2 {
-                            var fnv: i64 = cargs.get(1);
+                            var narg: i64 = 1;
+                            if name == "Vec_init_filled" {
+                                narg = 2;
+                            }
+                            var fnv: i64 = 0 - 1;
+                            if cargs.len() > narg {
+                                fnv = cargs.get(narg);
+                            }
                             if fnv >= 0 && fnv < nv {
                                 var fhi: i64 = 281474976710656;
                                 var flo: i64 = peir_rng_get_lo(r, fnv);
@@ -3553,7 +3800,7 @@ fn peir_range_scan(f: &IrFunction, r: &mut PeirRanges, single_pred: &Vec<i64>, p
             x_sn.set(b, peir_xs_save(r, &mut xs));
         }
         x_done.set(b, 1);
-        b = b + 1;
+        ob = ob + 1;
     }
     r.ref_v = -1;
     r.ref_loc = -1;
@@ -4641,6 +4888,26 @@ pub fn peir_range_ops(f: &IrFunction, nvals: i64, out: &mut Vec<i64>) {
         b = b + 1;
     }
     var joins: bool = !iro_named_off(p_getenv("FID_IROPT_OFF"), "rangejoin");
+    // Scan in reverse postorder: a join can be laid out before the bodies
+    // that enter it (hull's merge is), and layout order is not control-flow
+    // order. Unreachable blocks go last, where they cannot supply facts to
+    // reachable code.
+    var scan_order: Vec<i64> = Vec::new();
+    var in_order: Vec<i64> = peir_zeros(n);
+    var so: i64 = 0;
+    while so < jcfg.rpo.len() {
+        var sob: i64 = jcfg.rpo.get(so);
+        scan_order.push(sob);
+        in_order.set(sob, 1);
+        so = so + 1;
+    }
+    var ub: i64 = 0;
+    while ub < n {
+        if in_order.get(ub) == 0 {
+            scan_order.push(ub);
+        }
+        ub = ub + 1;
+    }
     // LF8: the range set: several facts per block (FID_IROPT_OFF=rangeset)
     r.sf_on = joins && !iro_named_off(p_getenv("FID_IROPT_OFF"), "rangeset");
     if r.sf_on {
@@ -4673,7 +4940,7 @@ pub fn peir_range_ops(f: &IrFunction, nvals: i64, out: &mut Vec<i64>) {
         }
         // LF10: the parameters' ranges from every call (when known)
         peir_prm_seed(f, &mut r);
-        peir_range_scan(f, &mut r, &single, &jpreds, joins, &index, &mut dummy, false, &mut dom, &lf_none);
+        peir_range_scan(f, &mut r, &single, &jpreds, joins, &index, &scan_order, &mut dummy, false, &mut dom, &lf_none);
         var newlo: Vec<i64> = Vec::new();
         var newhi: Vec<i64> = Vec::new();
         var has: Vec<i64> = peir_zeros(nvals);
@@ -4803,7 +5070,7 @@ pub fn peir_range_ops(f: &IrFunction, nvals: i64, out: &mut Vec<i64>) {
                 i = i + 1;
             }
             peir_prm_seed(f, &mut r);
-            peir_range_scan(f, &mut r, &single, &jpreds, joins, &index, &mut dummy, false, &mut dom, &lf);
+            peir_range_scan(f, &mut r, &single, &jpreds, joins, &index, &scan_order, &mut dummy, false, &mut dom, &lf);
             var lfpick: bool = !lf.multi || lfit < 4;
             lfgo = peir_lf_update(f, &r, &single, &jpreds, &mut lf, lfpick, false);
             lfit = lfit + 1;
@@ -4817,7 +5084,7 @@ pub fn peir_range_ops(f: &IrFunction, nvals: i64, out: &mut Vec<i64>) {
                 i = i + 1;
             }
             peir_prm_seed(f, &mut r);
-            peir_range_scan(f, &mut r, &single, &jpreds, joins, &index, &mut dummy, false, &mut dom, &lf);
+            peir_range_scan(f, &mut r, &single, &jpreds, joins, &index, &scan_order, &mut dummy, false, &mut dom, &lf);
             lfgo = peir_lf_update(f, &r, &single, &jpreds, &mut lf, false, true);
             lffz = lffz + 1;
         }
@@ -4832,7 +5099,7 @@ pub fn peir_range_ops(f: &IrFunction, nvals: i64, out: &mut Vec<i64>) {
         i = i + 1;
     }
     peir_prm_seed(f, &mut r);
-    peir_range_scan(f, &mut r, &single, &jpreds, joins, &index, out, true, &mut dom, &lf);
+    peir_range_scan(f, &mut r, &single, &jpreds, joins, &index, &scan_order, out, true, &mut dom, &lf);
     // DB8: explain_checks reads the ranges to say why a check stayed
     if g_peir_keep_ranges {
         g_peir_kept_lo = r.lo;

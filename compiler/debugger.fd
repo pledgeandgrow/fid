@@ -1,44 +1,35 @@
 // debugger.fd -- Built-in interactive debugger for Fides
 // Ported from src/debugger.rs.
 //
-// Provides an interactive debugger that runs the interpreter step-by-step
-// with breakpoints, variable inspection, stack traces, and more.
-// No external tools (gdb/lldb) required.
-//
-// Commands (mirrors the Rust reference):
-//   break <func>[:<line>]  -- set a breakpoint
-//   break                  -- list breakpoints
-//   delete <n>             -- delete breakpoint n
-//   run                    -- run until breakpoint or program end
-//   step                   -- step one instruction (into calls)
-//   next                   -- step one instruction (over calls -- same as step for now)
-//   continue               -- continue execution
-//   print <var>            -- print a variable's value
-//   print                  -- print all variables in scope
-//   backtrace              -- show call stack
-//   info locals            -- show all local variables
-//   info functions         -- list all functions
-//   info breakpoints       -- list breakpoints
-//   list                   -- show source around current position
-//   ir                     -- show IR for current function
-//   effects                -- show active effects for current function
-//   watch <var>            -- watch a variable (print on change)
-//   record                 -- start recording execution trace
-//   replay <file>          -- replay a recorded trace
-//   quit                   -- exit debugger
-//
-// Note: The self-hosted interpreter (compiler/interp.fd) currently has a
-// simplified debug hook (no-op). Full interactive stepping requires the
-// interpreter to call back into the debugger on each instruction. This
-// module provides the structural debugger state, value formatting, source
-// listing, breakpoint management, and command parsing/dispatch. The
-// interactive run loop is wired through compiler/main.fd's `debug` command
-// using the available Interpreter API.
+// `fid debug <file.fd>` (main.fd cmd_debug): an interactive source-level
+// debugger over the self-hosted interpreter, no gdb/lldb needed. Commands
+// are read from standard input, one per line (an empty line repeats the
+// last one); the end of the input quits:
+//   break <func> | <line> | <func>:<line> | <file>.fd:<line>   (b)
+//   break / info breakpoints   list them;  delete [<n>]  (d)
+//   run (r) / continue (c)     run to a breakpoint or the end
+//   start                      run, stop at main's first line
+//   step (s)                   to the next source line, into calls
+//   next (n)                   to the next line of this function or a caller
+//   finish (fin)               until this function returns (prints its value)
+//   print <var> (p) / print    a variable / every variable of the frame
+//   info locals | args | functions | watches
+//   backtrace (bt, where)      the call stack with arguments and lines
+//   list (l) [<func>|<line>]   the source around a place
+//   watch <var> (w)            stop when its value changes
+//   ir / effects               the current function's IR / effects
+//   quit (q)
+// Stepping and breakpoints cover the input file's functions (Debugger_exec_fn
+// runs them); calls into core, the stdlib or the runtime run as one step.
+// tests/tooling/fid-debug-session-check.sh drives a fixed session.
 
 module compiler::debugger;
 use core;
 use vec;
 use string;
+use compiler::ast;
+use compiler::lexer;
+use compiler::parser;
 use compiler::interp;
 use compiler::ir;
 use compiler::compiler;
@@ -72,12 +63,29 @@ pub struct Debugger {
     pub recording: bool,
     pub source_lines: Vec<str>,
     pub source_path: str,
+    // The session (Debugger_run): DBG_RUN / DBG_STEP / DBG_NEXT /
+    // DBG_FINISH and the frame depth a `next` or `finish` was given at
+    pub mode: i64,
+    pub mode_depth: i64,
+    // stop before the next instruction with a line (after a `finish`)
+    pub force_stop: bool,
+    pub quit: bool,
+    // echo each command read (a transcript of piped input: `--echo`)
+    pub echo: bool,
+    // the input file's functions (name -> 1): the ones the session runs
+    pub user_fns: i64,
+    // the session's frames, outermost first: name, current line, arguments
+    pub frame_names: Vec<str>,
+    pub frame_lines: Vec<i64>,
+    pub frame_args: Vec<str>,
+    // an empty line repeats it
+    pub last_cmd: str,
 }
 
 pub fn Debugger_new(source: str, source_path: str) -> Debugger {
     return Debugger {
         breakpoints: Vec::new(), next_bp_id: 1, stepping: true,  // Start in stepping mode
-        step_over: false, step_over_depth: 0, watches: Vec::new(), recording: false, source_lines: str_lines(source), source_path: source_path,
+        step_over: false, step_over_depth: 0, watches: Vec::new(), recording: false, source_lines: str_lines(source), source_path: source_path, mode: 0, mode_depth: 0, force_stop: false, quit: false, echo: false, user_fns: 0, frame_names: Vec::new(), frame_lines: Vec::new(), frame_args: Vec::new(), last_cmd: "",
     };
 }
 
@@ -225,7 +233,7 @@ pub fn Debugger_list_source(self: &Debugger, line: i64, context: i64) -> str {
     var result: str = "";
     var i: i64 = start;
     while i < end {
-        var marker: str = "  ";
+        var marker: str = "   ";
         if i + 1 == line {
             marker = "-> ";
         }
@@ -280,7 +288,7 @@ pub fn format_value(v: Value) -> str {
 // --- Help text ---
 
 pub fn print_debugger_help() -> str {
-    return "Fides Debugger Commands:\n" + "  break <func>[:<line>]  Set a breakpoint\n" + "  break                  List breakpoints\n" + "  delete <n>             Delete breakpoint n\n" + "  run                    Run until breakpoint or program end\n" + "  step                   Step one instruction (into calls)\n" + "  next                   Step one instruction (over calls)\n" + "  continue               Continue execution\n" + "  print <var>            Print a variable's value\n" + "  print                  Print all variables in scope\n" + "  backtrace              Show call stack\n" + "  info locals            Show all local variables\n" + "  info functions         List all functions\n" + "  info breakpoints       List breakpoints\n" + "  list                   Show source around current position\n" + "  ir                     Show IR for current function\n" + "  effects                Show active effects for current function\n" + "  watch <var>            Watch a variable (print on change)\n" + "  record                 Start recording execution trace\n" + "  replay <file>          Replay a recorded trace\n" + "  quit                   Exit debugger\n";
+    return "Fides debugger commands:\n" + "  break <func>|<line>|<func>:<line>  set a breakpoint (b)\n" + "  break, info breakpoints  list breakpoints\n" + "  delete [<n>]             delete breakpoint n (all without n)\n" + "  run, continue            run to a breakpoint or the end (r, c)\n" + "  start                    run and stop at main's first line\n" + "  step                     to the next source line, into calls (s)\n" + "  next                     to the next line, over calls (n)\n" + "  finish                   until the current function returns (fin)\n" + "  print <var>, print       a variable, or every variable (p)\n" + "  info locals|args|functions|watches\n" + "  backtrace                the call stack (bt, where)\n" + "  list [<func>|<line>]     source around the current line (l)\n" + "  watch <var>              stop when the variable changes (w)\n" + "  ir, effects              IR / effects of the current function\n" + "  quit                     end the session (q)\n";
 }
 
 // --- Command parsing ---
@@ -381,10 +389,15 @@ fn str_lines(s: str) -> Vec<str> {
     return result;
 }
 
-fn str_find_char(s: str, ch: i64) -> i64 {
+/// The position of the first byte of `ch` (a one-character string) in
+/// `s`, or -1. (It took the byte as an i64, and every caller passed a
+/// string: the comparison was with the string's address, so no command
+/// with an argument was ever recognized.)
+fn str_find_char(s: str, ch: str) -> i64 {
+    var c: i64 = str_byte_at(ch, 0);
     var i: i64 = 0;
     while i < str_len(s) {
-        if str_byte_at(s, i) == ch {
+        if str_byte_at(s, i) == c {
             return i;
         }
         i = i + 1;
@@ -743,35 +756,1236 @@ pub fn list_functions(module: IrModule) -> str {
 }
 
 // ===========================================================================
-// Debugger_run -- main interactive command loop (src/debugger.rs:251)
+// Debugger_run -- the interactive session (TL5; src/debugger.rs:251)
 // ===========================================================================
 //
-// In the Rust reference, this:
-//   1. Builds the program and lowers to IR
-//   2. Creates an interpreter
-//   3. Sets a debug hook closure
-//   4. Runs the interpreter (which calls the hook on each instruction)
-//   5. In the hook, checks breakpoints and pauses for interactive commands
-//
-// Limitation: The self-hosted interpreter (compiler/interp.fd) has a simplified
-// debug hook (Interpreter_set_debug_hook is a no-op that just sets debug_mode).
-// It does not call back into the debugger on each instruction. Full interactive
-// stepping requires extending the interpreter with a callback mechanism.
-//
-// This function provides the structural entry point: it compiles the source,
-// creates the interpreter, and runs it. Interactive stepping is documented as
-// a future enhancement. The function returns the program exit code.
+// The Rust reference sets a hook the interpreter calls before every
+// instruction. compiler/interp.fd has no such hook, so the session runs
+// the input file's own functions itself (Debugger_exec_fn: the block loop
+// of Interpreter_run_function, each instruction done by
+// Interpreter_execute_inst) and stops before the first instruction of a
+// source line when a step, a `next`, a `finish` or a breakpoint says so.
+// A call of another of the input file's functions is run the same way, so
+// stepping goes into it; anything else (core, the stdlib, the runtime, a
+// closure or trait method called through a pointer) is run by the
+// interpreter at full speed, as one step. Commands come from standard
+// input, one per line (a pipe works: tests/tooling/fid-debug-session-check.sh);
+// the end of the input quits. The session prints to standard output, so a
+// transcript keeps the program's own output in order with it.
 
+pub const DBG_RUN: i64 = 0;  // to a breakpoint or the end
+pub const DBG_STEP: i64 = 1;  // to the next source line, into calls
+pub const DBG_NEXT: i64 = 2;  // to the next line of this frame or a caller
+pub const DBG_FINISH: i64 = 3;  // until this frame returns
+const DBG_QUIT_MSG: str = "__debugger_quit__";
+
+/// The functions the input file defines (methods as `Type_method`): the
+/// ones the session steps through.
+fn dbg_user_functions(source: str) -> i64 {
+    var m: i64 = HashMap_new();
+    var lex: Lexer = Lexer::new(source);
+    var parser: Parser = Parser_new(lex.tokenize());
+    match parser.parse() {
+        ParseResultProgram::Ok(prog) => {
+            var i: i64 = 0;
+            while i < prog.funcs.len() {
+                HashMap_insert(m, prog.funcs.get(i).name, 1);
+                i = i + 1;
+            }
+            i = 0;
+            while i < prog.impls.len() {
+                var imp: ImplDef = prog.impls.get(i);
+                var k: i64 = 0;
+                while k < imp.methods.len() {
+                    HashMap_insert(m, imp.struct_name + "_" + imp.methods.get(k).name, 1);
+                    k = k + 1;
+                }
+                i = i + 1;
+            }
+            i = 0;
+            while i < prog.trait_impls.len() {
+                var ti: TraitImpl = prog.trait_impls.get(i);
+                var t: i64 = 0;
+                while t < ti.methods.len() {
+                    HashMap_insert(m, ti.type_name + "_" + ti.methods.get(t).name, 1);
+                    t = t + 1;
+                }
+                i = i + 1;
+            }
+        }
+        ParseResultProgram::Err(_) => {
+        }
+    }
+    return m;
+}
+
+/// Whether the session steps through `name`: a function of the input file,
+/// or a monomorphized instance of one (`f__T`, `Type__m__T`).
+fn Debugger_is_user_fn(self: &Debugger, name: str) -> bool {
+    if self.user_fns == 0 {
+        return false;
+    }
+    if HashMap_contains(self.user_fns, name) {
+        return true;
+    }
+    var a: i64 = str_find(name, "__");
+    if a <= 0 {
+        return false;
+    }
+    var base: str = str_slice(name, 0, a);
+    var rest: str = str_slice(name, a + 2, str_len(name));
+    var b: i64 = str_find(rest, "__");
+    if b > 0 {
+        if HashMap_contains(self.user_fns, base + "_" + str_slice(rest, 0, b)) {
+            return true;
+        }
+    }
+    return HashMap_contains(self.user_fns, base);
+}
+
+/// The source line of instruction `id` of `func`, or 0.
+fn dbg_inst_line(func: &IrFunction, id: i64) -> i64 {
+    match IrFunction_get_meta(func, id) {
+        OptValueMeta::Some(m) => {
+            match m.source_line {
+                OptU64::Some(l) => {
+                    return l;
+                }
+                OptU64::None => {
+                }
+            }
+        }
+        OptValueMeta::None => {
+        }
+    }
+    return 0;
+}
+
+/// The source text of line `line` (1-based), trimmed of its indentation.
+fn Debugger_line_text(self: &Debugger, line: i64) -> str {
+    if line < 1 || line > self.source_lines.len() {
+        return "";
+    }
+    return str_trim(self.source_lines.get(line - 1));
+}
+
+fn dbg_print(s: str) {
+    print(s);
+}
+
+// --- Values ---------------------------------------------------------------
+
+/// The value of type `ty` held at `addr`, read as the interpreter's Load
+/// reads it.
+fn dbg_load(ip: &mut Interpreter, func: &IrFunction, addr: i64, ty: IrType) -> Value {
+    var tv: Vec<Value> = Vec::new();
+    tv.push(Value::Ptr(addr));
+    match Interpreter_execute_inst(ip, Inst::Load(0, ty), 1, tv, func) {
+        ExecOutcome::Value(v) => {
+            return v;
+        }
+        _ => {
+        }
+    }
+    return Value::Void;
+}
+
+/// The word of a value (an address or a number), or 0.
+fn dbg_word(v: Value) -> i64 {
+    match v {
+        Value::Int(i) => {
+            return i;
+        }
+        Value::Ptr(p) => {
+            return p;
+        }
+        _ => {
+        }
+    }
+    return 0;
+}
+
+/// A value as the session shows it, by its type: a string quoted, a bool
+/// as true/false, a struct as its fields (`{x: 1, y: 2}`, read from the
+/// module's layout at the struct's address).
+fn dbg_value_text(ip: &mut Interpreter, func: &IrFunction, v: Value, ty: IrType, depth: i64) -> str {
+    match v {
+        Value::Void => {
+            return "<no value yet>";
+        }
+        Value::Str(s) => {
+            return "\"" + s + "\"";
+        }
+        _ => {
+        }
+    }
+    match ty {
+        IrType::Ptr(inner) => {
+            match inner {
+                IrType::U8 => {
+                    if dbg_word(v) == 0 {
+                        match v {
+                            Value::Int(_) => {
+                                return "null";
+                            }
+                            Value::Ptr(_) => {
+                                return "null";
+                            }
+                            _ => {
+                            }
+                        }
+                    }
+                    return "\"" + Interpreter_value_to_string(ip, v) + "\"";
+                }
+                _ => {
+                }
+            }
+        }
+        IrType::Bool => {
+            match v {
+                Value::Int(bi) => {
+                    if bi != 0 {
+                        return "true";
+                    }
+                    return "false";
+                }
+                _ => {
+                }
+            }
+        }
+        IrType::Struct(sname) => {
+            var addr: i64 = dbg_word(v);
+            if addr == 0 || depth > 3 {
+                return sname + " @ 0x" + dbg_int_to_hex(addr);
+            }
+            match IrModule_get_struct(&ip.module, sname) {
+                OptStructLayout::Some(layout) => {
+                    var out: str = sname + " {";
+                    var fi: i64 = 0;
+                    while fi < layout.fields.len() {
+                        var f: StringIrTypeOffset = layout.fields.get(fi);
+                        if fi > 0 {
+                            out = out + ",";
+                        }
+                        var fv: Value = Value::Ptr(addr + f.offset);
+                        match f.ty {
+                            IrType::Struct(_) => {
+                            }
+                            _ => {
+                                fv = dbg_load(ip, func, addr + f.offset, f.ty);
+                            }
+                        }
+                        out = out + " " + f.name + ": " + dbg_value_text(ip, func, fv, f.ty, depth + 1);
+                        fi = fi + 1;
+                    }
+                    return out + " }";
+                }
+                OptStructLayout::None => {
+                    return sname + " @ 0x" + dbg_int_to_hex(addr);
+                }
+            }
+        }
+        _ => {
+        }
+    }
+    return Interpreter_display_value(ip, v);
+}
+
+/// The binding of `name` the program is in: of the bindings `func` made of
+/// the name (IrFunction.dbg_locals keeps every one, also those of closed
+/// scopes), the last one that has run. -1 when there is none.
+fn dbg_find_local(func: &IrFunction, values: Vec<Value>, name: str) -> i64 {
+    var list: Vec<StringValueId> = func.dbg_locals;
+    if list.len() == 0 {
+        list = func.locals;
+    }
+    var best: i64 = -1;
+    var i: i64 = 0;
+    while i < list.len() {
+        var l: StringValueId = list.get(i);
+        if l.name == name && l.id >= 0 && l.id < values.len() {
+            match values.get(l.id) {
+                Value::Void => {
+                }
+                _ => {
+                    best = l.id;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return best;
+}
+
+/// The text of the value with id `id` in the frame: a variable's slot (an
+/// alloca) is read; anything else is the value itself.
+fn dbg_local_text(ip: &mut Interpreter, func: &IrFunction, values: Vec<Value>, id: i64) -> str {
+    var v: Value = get_value(values, id);
+    match IrFunction_get_inst(func, id) {
+        OptInst::Some(inst) => {
+            match inst {
+                Inst::Alloca(aty, _) => {
+                    var addr: i64 = dbg_word(v);
+                    if addr == 0 {
+                        return "<no value yet>";
+                    }
+                    match aty {
+                        IrType::Struct(_) => {
+                            return dbg_value_text(ip, func, v, aty, 0);
+                        }
+                        _ => {
+                        }
+                    }
+                    return dbg_value_text(ip, func, dbg_load(ip, func, addr, aty), aty, 0);
+                }
+                _ => {
+                    return dbg_value_text(ip, func, v, inst_result_type(inst), 0);
+                }
+            }
+        }
+        OptInst::None => {
+        }
+    }
+    // a parameter: no instruction, its type is in func.params
+    var pi: i64 = 0;
+    while pi < func.params.len() {
+        var p: ValueIdType = func.params.get(pi);
+        if p.id == id {
+            return dbg_value_text(ip, func, v, p.ty, 0);
+        }
+        pi = pi + 1;
+    }
+    return Interpreter_display_value(ip, v);
+}
+
+/// `name = value` lines for every variable of the frame that has a value
+/// (the hidden `__env` and other compiler names left out), in the order
+/// they were declared.
+fn dbg_locals_text(ip: &mut Interpreter, func: &IrFunction, values: Vec<Value>, params_only: bool) -> str {
+    var list: Vec<StringValueId> = func.dbg_locals;
+    if list.len() == 0 {
+        list = func.locals;
+    }
+    var seen: Vec<str> = Vec::new();
+    var out: str = "";
+    var i: i64 = 0;
+    while i < list.len() {
+        var l: StringValueId = list.get(i);
+        var nm: str = l.name;
+        var skip: bool = str_starts_with(nm, "__") || str_len(nm) == 0;
+        var si: i64 = 0;
+        while !skip && si < seen.len() {
+            if seen.get(si) == nm {
+                skip = true;
+            }
+            si = si + 1;
+        }
+        if !skip && params_only {
+            var is_param: bool = false;
+            var pi: i64 = 0;
+            while pi < func.params.len() {
+                if func.params.get(pi).id == l.id {
+                    is_param = true;
+                }
+                pi = pi + 1;
+            }
+            skip = !is_param;
+        }
+        if !skip {
+            seen.push(nm);
+            var id: i64 = dbg_find_local(func, values, nm);
+            if id >= 0 {
+                out = out + nm + " = " + dbg_local_text(ip, func, values, id) + "\n";
+            }
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// `print <name>`: a variable of the frame, or `v<N>` (an IR value).
+fn dbg_print_text(ip: &mut Interpreter, func: &IrFunction, values: Vec<Value>, name: str) -> str {
+    var id: i64 = dbg_find_local(func, values, name);
+    if id >= 0 {
+        return name + " = " + dbg_local_text(ip, func, values, id) + "\n";
+    }
+    if str_len(name) > 1 && str_byte_at(name, 0) == 118 {
+        var n: i64 = str_to_int(str_slice(name, 1, str_len(name)));
+        if n >= 0 && n < values.len() {
+            match values.get(n) {
+                Value::Void => {
+                }
+                _ => {
+                    return name + " = " + dbg_local_text(ip, func, values, n) + "\n";
+                }
+            }
+        }
+    }
+    return "No symbol \"" + name + "\" in the current frame.\n";
+}
+
+// --- Breakpoints ------------------------------------------------------------
+
+/// The first line >= `line` with code in function `fname` ("": any of the
+/// input file's functions), and that function: (name, line); ("", 0) when
+/// there is none.
+fn Debugger_resolve_line(self: &Debugger, module: &IrModule, fname: str, line: i64) -> (str, i64) {
+    var best_fn: str = "";
+    var best: i64 = 0;
+    var fi: i64 = 0;
+    while fi < module.functions.len() {
+        var entry: IrFunctionEntry = module.functions.get(fi);
+        if (str_len(fname) == 0 && Debugger_is_user_fn(self, entry.name)) || entry.name == fname {
+            var mi: i64 = 0;
+            while mi < entry.func.value_metas.len() {
+                match entry.func.value_metas.get(mi).meta.source_line {
+                    OptU64::Some(l) => {
+                        if l >= line && (best == 0 || l < best) {
+                            best = l;
+                            best_fn = entry.name;
+                        }
+                    }
+                    OptU64::None => {
+                    }
+                }
+                mi = mi + 1;
+            }
+        }
+        fi = fi + 1;
+    }
+    return (best_fn, best);
+}
+
+/// The first source line of function `fname` (0 when it has none).
+fn dbg_first_line(module: &IrModule, fname: str) -> i64 {
+    var fi: i64 = 0;
+    while fi < module.functions.len() {
+        var entry: IrFunctionEntry = module.functions.get(fi);
+        if entry.name == fname {
+            var first: i64 = 0;
+            var bi: i64 = 0;
+            if entry.func.entry >= 0 && entry.func.entry < entry.func.blocks.len() {
+                var blk: BasicBlock = entry.func.blocks.get(entry.func.entry);
+                while bi < blk.instructions.len() {
+                    var l: i64 = dbg_inst_line(&entry.func, blk.instructions.get(bi));
+                    if l > 0 {
+                        return l;
+                    }
+                    bi = bi + 1;
+                }
+            }
+            var mi: i64 = 0;
+            while mi < entry.func.value_metas.len() {
+                match entry.func.value_metas.get(mi).meta.source_line {
+                    OptU64::Some(ml) => {
+                        if ml > 0 && (first == 0 || ml < first) {
+                            first = ml;
+                        }
+                    }
+                    OptU64::None => {
+                    }
+                }
+                mi = mi + 1;
+            }
+            return first;
+        }
+        fi = fi + 1;
+    }
+    return 0;
+}
+
+/// `break <spec>`: `func`, `func:line` or `line` (in the input file).
+fn Debugger_set_break(self: &mut Debugger, module: &IrModule, spec: str) {
+    var colon: i64 = str_find_char(spec, ":");
+    var fname: str = "";
+    var line: i64 = -1;
+    if colon >= 0 {
+        fname = str_slice(spec, 0, colon);
+        line = str_to_int(str_slice(spec, colon + 1, str_len(spec)));
+        // `file.fd:12`: a line of the input file
+        if str_ends_with(fname, ".fd") {
+            fname = "";
+        }
+    } else {
+        var n: i64 = str_to_int(spec);
+        if n > 0 {
+            line = n;
+        } else {
+            fname = spec;
+        }
+    }
+    if line < 0 {
+        // a function
+        var found: bool = false;
+        var fi: i64 = 0;
+        while fi < module.functions.len() {
+            if module.functions.get(fi).name == fname {
+                found = true;
+            }
+            fi = fi + 1;
+        }
+        if !found {
+            dbg_print("Function \"" + fname + "\" not defined.\n");
+            return;
+        }
+        if !Debugger_is_user_fn(self, fname) {
+            dbg_print("Function \"" + fname + "\" is not in " + self.source_path + ": the session stops only in its functions.\n");
+            return;
+        }
+        var id: i64 = Debugger_add_breakpoint(self, fname, -1);
+        dbg_print("Breakpoint " + int_to_str(id) + " at " + fname + ": " + self.source_path + ":" + int_to_str(dbg_first_line(module, fname)) + "\n");
+        return;
+    }
+    if line <= 0 {
+        dbg_print("Bad line number in \"" + spec + "\".\n");
+        return;
+    }
+    var r: (str, i64) = Debugger_resolve_line(self, module, fname, line);
+    var(rf, rl) = r;
+    if rl == 0 {
+        if str_len(fname) > 0 {
+            dbg_print("No code at or after line " + int_to_str(line) + " in " + fname + ".\n");
+        } else {
+            dbg_print("No code at or after line " + int_to_str(line) + " in " + self.source_path + ".\n");
+        }
+        return;
+    }
+    var bid: i64 = Debugger_add_breakpoint(self, rf, rl);
+    var moved: str = "";
+    if rl != line {
+        moved = " (no code at line " + int_to_str(line) + ")";
+    }
+    dbg_print("Breakpoint " + int_to_str(bid) + " at " + rf + ": " + self.source_path + ":" + int_to_str(rl) + moved + "\n");
+}
+
+/// The breakpoint that stops the program at this new line, or -1 (its hit
+/// count is raised).
+fn Debugger_hit_breakpoint(self: &mut Debugger, fname: str, line: i64, entry: bool) -> i64 {
+    var i: i64 = 0;
+    while i < self.breakpoints.len() {
+        var bp: Breakpoint = self.breakpoints.get(i);
+        if bp.func_name == fname && ((bp.line < 0 && entry) || bp.line == line) {
+            bp.hit_count = bp.hit_count + 1;
+            self.breakpoints.set(i, bp);
+            return bp.id;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// --- Stops ------------------------------------------------------------------
+
+/// `#0  square (n = 2) at prog.fd:2` lines, innermost frame first.
+fn Debugger_backtrace(self: &Debugger) -> str {
+    var out: str = "";
+    var i: i64 = self.frame_names.len() - 1;
+    var k: i64 = 0;
+    while i >= 0 {
+        out = out + "#" + int_to_str(k) + "  " + self.frame_names.get(i) + " (" + self.frame_args.get(i) + ") at " + self.source_path + ":" + int_to_str(self.frame_lines.get(i)) + "\n";
+        i = i - 1;
+        k = k + 1;
+    }
+    return out;
+}
+
+/// The location line printed at a stop: `square (n = 2) at prog.fd:2` and
+/// the source line.
+fn Debugger_where_text(self: &Debugger, line: i64) -> str {
+    var top: i64 = self.frame_names.len() - 1;
+    var head: str = "";
+    if top >= 0 {
+        head = self.frame_names.get(top) + " (" + self.frame_args.get(top) + ") at " + self.source_path + ":" + int_to_str(line) + "\n";
+    }
+    return head + int_to_str(line) + "\t" + Debugger_line_text(self, line) + "\n";
+}
+
+/// The watched variables whose value changed since the last look: their
+/// `Watch x: old -> new` lines ("" when none changed).
+fn Debugger_check_watches(self: &mut Debugger, ip: &mut Interpreter, func: &IrFunction, values: Vec<Value>) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    while i < self.watches.len() {
+        var w: (str, str) = self.watches.get(i);
+        var(wn, wold) = w;
+        var id: i64 = dbg_find_local(func, values, wn);
+        if id >= 0 {
+            var now: str = dbg_local_text(ip, func, values, id);
+            if now != wold {
+                if wold == "" {
+                    out = out + "Watch " + wn + ": " + now + "\n";
+                } else {
+                    out = out + "Watch " + wn + ": " + wold + " -> " + now + "\n";
+                }
+                self.watches.set(i, (wn, now));
+            }
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Before the first instruction of a new source line `line` of `func`:
+/// whether the session stops here (and why, printed).
+fn Debugger_should_stop(self: &mut Debugger, ip: &mut Interpreter, func: &IrFunction, values: Vec<Value>, line: i64, entry: bool) -> bool {
+    var depth: i64 = self.frame_names.len();
+    var stop: bool = false;
+    if self.force_stop {
+        stop = true;
+    } else if self.mode == DBG_STEP {
+        stop = true;
+    } else if self.mode == DBG_NEXT {
+        stop = depth <= self.mode_depth;
+    }
+    var bp: i64 = Debugger_hit_breakpoint(self, func.name, line, entry);
+    if bp >= 0 && !stop {
+        dbg_print("\nBreakpoint " + int_to_str(bp) + ", ");
+        stop = true;
+    }
+    if self.watches.len() > 0 {
+        var changed: str = Debugger_check_watches(self, ip, func, values);
+        if str_len(changed) > 0 {
+            dbg_print("\n" + changed);
+            stop = true;
+        }
+    }
+    self.force_stop = false;
+    return stop;
+}
+
+/// The session's prompt at a stop: reads commands until one resumes the
+/// program (step, next, finish, continue) or ends the session (quit, the
+/// end of the input: self.quit).
+fn Debugger_prompt(self: &mut Debugger, ip: &mut Interpreter, func: &IrFunction, values: Vec<Value>, line: i64) {
+    dbg_print(Debugger_where_text(self, line));
+    while true {
+        dbg_print("(fid) ");
+        var cmdline: str = "";
+        match read_line() {
+            Option::Some(l) => {
+                cmdline = str_trim(l);
+            }
+            Option::None => {
+                dbg_print("\n");
+                self.quit = true;
+                return;
+            }
+        }
+        if self.echo {
+            dbg_print(cmdline + "\n");
+        }
+        if str_len(cmdline) == 0 {
+            cmdline = self.last_cmd;
+            if str_len(cmdline) == 0 {
+                continue;
+            }
+        }
+        self.last_cmd = cmdline;
+        var pc: (str, str) = parse_command(cmdline);
+        var(cmd, arg) = pc;
+        if cmd == "step" || cmd == "s" {
+            self.mode = DBG_STEP;
+            return;
+        }
+        if cmd == "next" || cmd == "n" {
+            self.mode = DBG_NEXT;
+            self.mode_depth = self.frame_names.len();
+            return;
+        }
+        if cmd == "finish" || cmd == "fin" {
+            if self.frame_names.len() <= 1 {
+                dbg_print("\"finish\" not meaningful in the outermost frame.\n");
+                continue;
+            }
+            self.mode = DBG_FINISH;
+            self.mode_depth = self.frame_names.len();
+            dbg_print("Run till exit from " + func.name + "\n");
+            return;
+        }
+        if cmd == "continue" || cmd == "c" || cmd == "cont" {
+            self.mode = DBG_RUN;
+            return;
+        }
+        if cmd == "run" || cmd == "r" || cmd == "start" {
+            dbg_print("The program is already running: use continue.\n");
+            continue;
+        }
+        if cmd == "quit" || cmd == "q" || cmd == "exit" || cmd == "kill" {
+            self.quit = true;
+            return;
+        }
+        if !Debugger_common_command(self, &ip.module, cmd, arg) {
+            if cmd == "print" || cmd == "p" {
+                if str_len(arg) == 0 {
+                    var all: str = dbg_locals_text(ip, func, values, false);
+                    if str_len(all) == 0 {
+                        all = "No locals.\n";
+                    }
+                    dbg_print(all);
+                } else {
+                    dbg_print(dbg_print_text(ip, func, values, arg));
+                }
+            } else if cmd == "info" && (arg == "locals" || arg == "args") {
+                var lt: str = dbg_locals_text(ip, func, values, arg == "args");
+                if str_len(lt) == 0 {
+                    if arg == "args" {
+                        lt = "No arguments.\n";
+                    } else {
+                        lt = "No locals.\n";
+                    }
+                }
+                dbg_print(lt);
+            } else if cmd == "backtrace" || cmd == "bt" || cmd == "where" {
+                dbg_print(Debugger_backtrace(self));
+            } else if cmd == "list" || cmd == "l" {
+                if str_len(arg) == 0 {
+                    dbg_print(Debugger_list_source(self, line, 5));
+                } else {
+                    dbg_print(Debugger_list_arg(self, &ip.module, arg));
+                }
+            } else if cmd == "watch" || cmd == "w" {
+                if str_len(arg) == 0 {
+                    dbg_print(Debugger_list_watches(self));
+                } else {
+                    var cur: str = "";
+                    var wid: i64 = dbg_find_local(func, values, arg);
+                    if wid >= 0 {
+                        cur = dbg_local_text(ip, func, values, wid);
+                    }
+                    self.watches.push((arg, cur));
+                    if str_len(cur) > 0 {
+                        dbg_print("Watching " + arg + " (now " + cur + ")\n");
+                    } else {
+                        dbg_print("Watching " + arg + "\n");
+                    }
+                }
+            } else if cmd == "ir" {
+                dbg_print(show_ir(*func));
+            } else if cmd == "effects" {
+                dbg_print(show_effects(*func));
+            } else {
+                dbg_print("Unknown command \"" + cmd + "\". Type \"help\" for the commands.\n");
+            }
+        }
+    }
+}
+
+/// `list <func>` / `list <line>`: the source around it.
+fn Debugger_list_arg(self: &Debugger, module: &IrModule, arg: str) -> str {
+    var n: i64 = str_to_int(arg);
+    if n > 0 {
+        return Debugger_list_source(self, n, 5);
+    }
+    var fl: i64 = dbg_first_line(module, arg);
+    if fl == 0 {
+        return "Function \"" + arg + "\" not defined.\n";
+    }
+    return Debugger_list_source(self, fl, 5);
+}
+
+/// Commands the prompt takes whether or not the program runs: help,
+/// break, delete, info breakpoints / functions / watches. False when `cmd`
+/// is none of them.
+fn Debugger_common_command(self: &mut Debugger, module: &IrModule, cmd: str, arg: str) -> bool {
+    if cmd == "help" || cmd == "h" || cmd == "?" {
+        dbg_print(print_debugger_help());
+        return true;
+    }
+    if cmd == "break" || cmd == "b" {
+        if str_len(arg) == 0 {
+            dbg_print(Debugger_list_breakpoints(self));
+            if self.breakpoints.len() == 0 {
+                dbg_print("\n");
+            }
+        } else {
+            Debugger_set_break(self, module, arg);
+        }
+        return true;
+    }
+    if cmd == "delete" || cmd == "d" {
+        if str_len(arg) == 0 {
+            self.breakpoints = Vec::new();
+            dbg_print("All breakpoints deleted.\n");
+        } else {
+            var id: i64 = str_to_int(arg);
+            if Debugger_delete_breakpoint(self, id) {
+                dbg_print("Breakpoint " + int_to_str(id) + " deleted.\n");
+            } else {
+                dbg_print("No breakpoint number " + arg + ".\n");
+            }
+        }
+        return true;
+    }
+    if cmd == "info" {
+        if arg == "breakpoints" || arg == "break" || arg == "b" {
+            dbg_print(Debugger_list_breakpoints(self));
+            if self.breakpoints.len() == 0 {
+                dbg_print("\n");
+            }
+            return true;
+        }
+        if arg == "functions" {
+            var out: str = "";
+            var fi: i64 = 0;
+            while fi < module.functions.len() {
+                var fname: str = module.functions.get(fi).name;
+                if Debugger_is_user_fn(self, fname) {
+                    out = out + "  " + fname + " (" + self.source_path + ":" + int_to_str(dbg_first_line(module, fname)) + ")\n";
+                }
+                fi = fi + 1;
+            }
+            dbg_print(out);
+            return true;
+        }
+        if arg == "watches" || arg == "watch" {
+            dbg_print(Debugger_list_watches(self));
+            dbg_print("\n");
+            return true;
+        }
+        if arg != "locals" && arg != "args" {
+            dbg_print("Usage: info locals|args|breakpoints|functions|watches\n");
+            return true;
+        }
+    }
+    return false;
+}
+
+// --- Running ----------------------------------------------------------------
+
+/// The pointer operand of a Load or Store, else -1 (interp.fd's
+/// interp_inst_ptr_operand, for the late allocas below).
+fn dbg_inst_ptr_operand(inst: &Inst) -> i64 {
+    match inst {
+        Inst::Store(sp, _, _) => {
+            return sp;
+        }
+        Inst::Load(lp, _) => {
+            return lp;
+        }
+        _ => {
+        }
+    }
+    return -1;
+}
+
+/// Run `func` with `args` as Interpreter_run_function does, stopping where
+/// the session says (Debugger_should_stop) and running the input file's
+/// functions it calls the same way. Keep in step with
+/// Interpreter_run_function (compiler/interp.fd).
+fn Debugger_exec_fn(self: &mut Debugger, ip: &mut Interpreter, func: IrFunction, args: Vec<Value>) -> RunResult {
+    if ip.call_stack.len() >= ip.max_recursion {
+        ip.panic_stack_trace = OptStr::Some(Interpreter_format_call_stack(ip));
+        return RunResult::Panic("Recursion depth limit (" + int_to_str(ip.max_recursion) + ") exceeded in function '" + func.name + "'");
+    }
+    var saved_func_name: str = ip.current_func_name;
+    var saved_wrapping: bool = ip.cur_wrapping;
+    ip.current_func_name = func.name;
+    ip.cur_wrapping = func.is_wrapping;
+    ip.call_stack.push(func.name);
+    var call_line: i64 = 0;
+    match ip.pending_call_site {
+        OptU64::Some(cl) => {
+            call_line = cl;
+        }
+        OptU64::None => {
+        }
+    }
+    ip.pending_call_site = OptU64::None;
+    ip.call_site_lines.push(call_line);
+    var saved_region_depth: i64 = ip.region_stack.len();
+    var frame_mark: i64 = ip.frame_allocas.len();
+
+    var values: Vec<Value> = Vec::new();
+    var vi: i64 = 0;
+    while vi < func.next_value {
+        values.push(Value::Void);
+        vi = vi + 1;
+    }
+    // the hidden closure environment a caller may leave out
+    var effective_args: Vec<Value> = args;
+    if func.params.len() > 0 && args.len() == func.params.len() - 1 {
+        match func.params.get(0).ty {
+            IrType::Ptr(inner) => {
+                match inner {
+                    IrType::U8 => {
+                        effective_args = Vec::new();
+                        effective_args.push(Value::Int(0));
+                        var ai: i64 = 0;
+                        while ai < args.len() {
+                            effective_args.push(args.get(ai));
+                            ai = ai + 1;
+                        }
+                    }
+                    _ => {
+                    }
+                }
+            }
+            _ => {
+            }
+        }
+    }
+    var pi: i64 = 0;
+    while pi < func.params.len() {
+        var param: ValueIdType = func.params.get(pi);
+        var pval: Value = Value::Void;
+        if pi < effective_args.len() {
+            pval = effective_args.get(pi);
+        }
+        match pval {
+            Value::Str(s) => {
+                var word_param: bool = false;
+                var ptr_param: bool = false;
+                match param.ty {
+                    IrType::I64 => {
+                        word_param = true;
+                    }
+                    IrType::U64 => {
+                        word_param = true;
+                    }
+                    IrType::Ptr(_) => {
+                        word_param = true;
+                        ptr_param = true;
+                    }
+                    _ => {
+                    }
+                }
+                if word_param {
+                    var str_addr: i64 = Memory_store_cstr(&mut ip.memory, s);
+                    Interpreter_set_opaque(ip, str_addr, Value::Str(s));
+                    if ptr_param {
+                        pval = Value::Ptr(str_addr);
+                    } else {
+                        pval = Value::Int(str_addr);
+                    }
+                }
+            }
+            Value::Float(pf) => {
+                match param.ty {
+                    IrType::I64 => {
+                        pval = Value::Int(p_f64_to_bits(pf));
+                    }
+                    IrType::U64 => {
+                        pval = Value::Int(p_f64_to_bits(pf));
+                    }
+                    _ => {
+                    }
+                }
+            }
+            Value::Int(piv) => {
+                match param.ty {
+                    IrType::F64 => {
+                        pval = Value::Float(piv as f64);
+                    }
+                    IrType::F32 => {
+                        pval = Value::Float(interp_round_f32(piv as f64));
+                    }
+                    _ => {
+                    }
+                }
+            }
+            _ => {
+            }
+        }
+        if param.id < values.len() {
+            values.set(param.id, pval);
+        }
+        pi = pi + 1;
+    }
+
+    // the frame, for backtrace and the stop lines
+    self.frame_names.push(func.name);
+    self.frame_lines.push(0);
+    self.frame_args.push("");
+    var frame_args: str = dbg_locals_text(ip, &func, values, true);
+    frame_args = str_replace(str_trim(frame_args), "\n", ", ");
+    self.frame_args.set(self.frame_args.len() - 1, frame_args);
+
+    var current_block: i64 = func.entry;
+    var result: RunResult = RunResult::Return(Value::Void);
+    var panic_seen: bool = false;
+    while true {
+        if current_block < 0 || current_block >= func.blocks.len() {
+            result = RunResult::Return(Value::Void);
+            break;
+        }
+        var block: BasicBlock = func.blocks.get(current_block);
+        var next_block: i64 = -1;
+        var done: bool = false;
+        var ii: i64 = 0;
+        while ii < block.instructions.len() {
+            var inst_id: i64 = block.instructions.get(ii);
+            // a new source line: stop here?
+            var line: i64 = dbg_inst_line(&func, inst_id);
+            if line > 0 {
+                var top: i64 = self.frame_lines.len() - 1;
+                var prev: i64 = self.frame_lines.get(top);
+                if line != prev || self.force_stop {
+                    self.frame_lines.set(top, line);
+                    if Debugger_should_stop(self, ip, &func, values, line, prev == 0) {
+                        Debugger_prompt(self, ip, &func, values, line);
+                        if self.quit {
+                            result = RunResult::Panic(DBG_QUIT_MSG);
+                            done = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            match IrFunction_get_inst(&func, inst_id) {
+                OptInst::None => {
+                }
+                OptInst::Some(inst) => {
+                    // 2g.60: an alloca of a block that has not run
+                    var late_ptr: i64 = dbg_inst_ptr_operand(&inst);
+                    if late_ptr >= 0 && late_ptr < values.len() {
+                        match values.get(late_ptr) {
+                            Value::Void => {
+                                match IrFunction_get_inst(&func, late_ptr) {
+                                    OptInst::Some(late_inst) => {
+                                        match late_inst {
+                                            Inst::Alloca(_, _) => {
+                                                match Interpreter_execute_inst(ip, late_inst, late_ptr, values, &func) {
+                                                    ExecOutcome::Value(late_v) => {
+                                                        values.set(late_ptr, late_v);
+                                                    }
+                                                    _ => {
+                                                    }
+                                                }
+                                            }
+                                            _ => {
+                                            }
+                                        }
+                                    }
+                                    OptInst::None => {
+                                    }
+                                }
+                            }
+                            _ => {
+                            }
+                        }
+                    }
+                    var outcome: ExecOutcome = ExecOutcome::Continue;
+                    var handled: bool = false;
+                    // a call of one of the input file's functions: run by
+                    // the session, so it can stop in it
+                    match inst {
+                        Inst::Call(cname, arg_ids, call_ret_ty, _) => {
+                            if Debugger_is_user_fn(self, cname) && !Interpreter_is_runtime_func(ip, cname) {
+                                match Interpreter_get_function(ip, cname) {
+                                    OptIrFunction::Some(callee) => {
+                                        handled = true;
+                                        var arg_vals: Vec<Value> = Vec::new();
+                                        var ai2: i64 = 0;
+                                        while ai2 < arg_ids.len() {
+                                            arg_vals.push(get_value(values, arg_ids.get(ai2)));
+                                            ai2 = ai2 + 1;
+                                        }
+                                        if line > 0 {
+                                            ip.pending_call_site = OptU64::Some(line);
+                                        } else {
+                                            ip.pending_call_site = OptU64::None;
+                                        }
+                                        var depth_before: i64 = self.frame_names.len();
+                                        match Debugger_exec_fn(self, ip, callee, arg_vals) {
+                                            RunResult::Return(rv) => {
+                                                outcome = ExecOutcome::Value(interp_reinterpret_word(rv, call_ret_ty));
+                                                if self.mode == DBG_FINISH && depth_before < self.mode_depth {
+                                                    // `finish` of the callee: stop in this frame now
+                                                    var shown: str = "";
+                                                    match call_ret_ty {
+                                                        IrType::Void => {
+                                                        }
+                                                        _ => {
+                                                            shown = " = " + dbg_value_text(ip, &func, interp_reinterpret_word(rv, call_ret_ty), call_ret_ty, 0);
+                                                        }
+                                                    }
+                                                    dbg_print(cname + " returned" + shown + "\n");
+                                                    self.mode = DBG_STEP;
+                                                    self.force_stop = true;
+                                                }
+                                            }
+                                            RunResult::Panic(pm) => {
+                                                outcome = ExecOutcome::Panic(pm);
+                                                panic_seen = true;
+                                            }
+                                            RunResult::Paused => {
+                                                outcome = ExecOutcome::Continue;
+                                            }
+                                        }
+                                    }
+                                    OptIrFunction::None => {
+                                    }
+                                }
+                            }
+                        }
+                        _ => {
+                        }
+                    }
+                    if !handled {
+                        outcome = Interpreter_execute_inst(ip, inst, inst_id, values, &func);
+                    }
+                    if ip.memory.lim_hit_want != 0 {
+                        Interpreter_lim_mem_over(ip);
+                    }
+                    if ip.memory.oom_hit != 0 {
+                        match outcome {
+                            ExecOutcome::Panic(_) => {
+                            }
+                            _ => {
+                                outcome = ExecOutcome::Panic("Out of memory: the interpreter's memory is used up");
+                            }
+                        }
+                    }
+                    match outcome {
+                        ExecOutcome::Continue => {
+                        }
+                        ExecOutcome::Value(v) => {
+                            if inst_id < values.len() {
+                                values.set(inst_id, v);
+                            }
+                        }
+                        ExecOutcome::Jump(target) => {
+                            next_block = target;
+                            break;
+                        }
+                        ExecOutcome::Return(rv2) => {
+                            result = RunResult::Return(rv2);
+                            done = true;
+                            break;
+                        }
+                        ExecOutcome::Panic(msg) => {
+                            match ip.panic_stack_trace {
+                                OptStr::None => {
+                                    ip.panic_stack_trace = OptStr::Some(Interpreter_format_call_stack(ip));
+                                }
+                                OptStr::Some(_) => {
+                                }
+                            }
+                            if ip.txn_mem_snapshots.len() > 0 {
+                                var snap_mem: Memory = ip.txn_mem_snapshots.get(ip.txn_mem_snapshots.len() - 1);
+                                ip.memory = snap_mem;
+                                ip.txn_mem_snapshots.pop();
+                            }
+                            if ip.txn_opaque_snapshots.len() > 0 {
+                                var snap_opaque: OpaqueSnapshot = ip.txn_opaque_snapshots.get(ip.txn_opaque_snapshots.len() - 1);
+                                ip.opaque_values = snap_opaque.entries;
+                                ip.txn_opaque_snapshots.pop();
+                            }
+                            var pmsg: str = msg;
+                            if pmsg != DBG_QUIT_MSG && !str_contains(pmsg, " at line ") && line > 0 {
+                                pmsg = pmsg + " at line " + int_to_str(line);
+                            }
+                            // the innermost of the file's frames the panic
+                            // passes: stop there, so its variables can be read
+                            if pmsg != DBG_QUIT_MSG && !panic_seen && !self.quit {
+                                dbg_print("\nProgram panicked: " + pmsg + "\n");
+                                Debugger_prompt(self, ip, &func, values, self.frame_lines.get(self.frame_lines.len() - 1));
+                                if self.quit {
+                                    pmsg = DBG_QUIT_MSG;
+                                }
+                            }
+                            result = RunResult::Panic(pmsg);
+                            done = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            ii = ii + 1;
+        }
+        if done {
+            break;
+        }
+        if next_block >= 0 {
+            current_block = next_block;
+        } else {
+            result = RunResult::Return(Value::Void);
+            break;
+        }
+    }
+    while ip.region_stack.len() > saved_region_depth {
+        ip.region_stack.pop();
+    }
+    ip.current_func_name = saved_func_name;
+    ip.cur_wrapping = saved_wrapping;
+    ip.call_stack.pop();
+    ip.call_site_lines.pop();
+    while ip.frame_allocas.len() > frame_mark {
+        var dead_slot: i64 = ip.frame_allocas.pop();
+        Interpreter_free_frame_block(ip, dead_slot);
+    }
+    self.frame_names.pop();
+    self.frame_lines.pop();
+    self.frame_args.pop();
+    return result;
+}
+
+/// The prompt before the program runs: breakpoints, listings and help;
+/// `run` / `continue` starts it, `start` / `step` / `next` starts it and
+/// stops at main's first line. False when the session ends here (quit, the
+/// end of the input).
+fn Debugger_prompt_before_run(self: &mut Debugger, module: &IrModule) -> bool {
+    while true {
+        dbg_print("(fid) ");
+        var cmdline: str = "";
+        match read_line() {
+            Option::Some(l) => {
+                cmdline = str_trim(l);
+            }
+            Option::None => {
+                dbg_print("\n");
+                return false;
+            }
+        }
+        if self.echo {
+            dbg_print(cmdline + "\n");
+        }
+        if str_len(cmdline) == 0 {
+            continue;
+        }
+        self.last_cmd = cmdline;
+        var pc: (str, str) = parse_command(cmdline);
+        var(cmd, arg) = pc;
+        if cmd == "run" || cmd == "r" || cmd == "continue" || cmd == "c" {
+            self.mode = DBG_RUN;
+            return true;
+        }
+        if cmd == "start" || cmd == "step" || cmd == "s" || cmd == "next" || cmd == "n" {
+            self.mode = DBG_STEP;
+            return true;
+        }
+        if cmd == "quit" || cmd == "q" || cmd == "exit" {
+            return false;
+        }
+        if Debugger_common_command(self, module, cmd, arg) {
+            continue;
+        }
+        if cmd == "list" || cmd == "l" {
+            if str_len(arg) == 0 {
+                dbg_print(Debugger_list_arg(self, module, "main"));
+            } else {
+                dbg_print(Debugger_list_arg(self, module, arg));
+            }
+            continue;
+        }
+        if cmd == "print" || cmd == "p" || cmd == "backtrace" || cmd == "bt" || cmd == "where" || cmd == "finish" || cmd == "info" || cmd == "watch" || cmd == "w" {
+            dbg_print("The program is not being run.\n");
+            continue;
+        }
+        dbg_print("Unknown command \"" + cmd + "\". Type \"help\" for the commands.\n");
+    }
+    return false;
+}
+
+/// `fid debug <file.fd>`: build the file, then the session. Returns the
+/// program's exit code (0 when the session was quit, 1 when the build or
+/// the program failed).
 pub fn Debugger_run(self: &mut Debugger, source: str, source_path: str) -> i64 {
-    p_eprint_str("Fides Debugger -- fidesc debug ");
-    p_eprint_str(source_path);
-    p_eprint_str("\n");
-    p_eprint_str("Type 'help' for commands, 'run' to start execution.\n\n");
-
-    // Build the program
-    var program_result: ResultProgram = build_program_with_path(source, OptStr::Some(source_path));
-    match program_result {
-        ResultProgram::Err(errors) => {
+    dbg_print("Fides debugger: " + source_path + "\n");
+    dbg_print("Type \"help\" for the commands, \"run\" to start the program.\n");
+    var module: IrModule = IrModule_new();
+    match lower_to_ir_module_with_path(source, source_path, "on") {
+        ResultIrModule::Err(errors) => {
             var ei: i64 = 0;
             while ei < errors.len() {
                 p_eprint_str(errors.get(ei));
@@ -781,45 +1995,47 @@ pub fn Debugger_run(self: &mut Debugger, source: str, source_path: str) -> i64 {
             p_eprint_str("\nCompilation failed.\n");
             return 1;
         }
-        ResultProgram::Ok(program) => {
-            // Lower to IR
-            var module: IrModule = lower(program);
-
-            // Create interpreter
-            var interp_inst: Interpreter = Interpreter_new(module);
-
-            // Enable debug mode (simplified: no callback hook yet)
-            Interpreter_set_debug_hook(&mut interp_inst);
-
-            // Run the interpreter
-            var result: RunResult = Interpreter_run(&mut interp_inst);
-
-            // Handle result
-            match result {
-                RunResult::Return(v) => {
-                    p_eprint_str("\nProgram returned: ");
-                    p_eprint_str(format_value(v));
-                    p_eprint_str("\n");
-                    match v {
-                        Value::Int(i) => {
-                            return i;
-                        }
-                        _ => {
-                            return 0;
-                        }
-                    }
+        ResultIrModule::Ok(m) => {
+            module = m;
+        }
+    }
+    self.user_fns = dbg_user_functions(source);
+    if !Debugger_prompt_before_run(self, &module) {
+        return 0;
+    }
+    var ip: Interpreter = Interpreter_new(module);
+    interp_lim_setup(&mut ip);
+    var result: RunResult = RunResult::Panic("No main function found");
+    match Interpreter_get_function(&ip, "main") {
+        OptIrFunction::Some(main_fn) => {
+            result = Debugger_exec_fn(self, &mut ip, main_fn, Vec::new());
+        }
+        OptIrFunction::None => {
+        }
+    }
+    match result {
+        RunResult::Return(v) => {
+            var code: i64 = 0;
+            match v {
+                Value::Int(i) => {
+                    code = i;
                 }
-                RunResult::Panic(msg) => {
-                    p_eprint_str("\nProgram panicked: ");
-                    p_eprint_str(msg);
-                    p_eprint_str("\n");
-                    return 1;
-                }
-                RunResult::Paused => {
-                    p_eprint_str("\nExecution paused.\n");
-                    return 0;
+                _ => {
                 }
             }
+            dbg_print("[program exited with code " + int_to_str(code) + "]\n");
+            return code;
+        }
+        RunResult::Panic(msg) => {
+            if msg == DBG_QUIT_MSG {
+                dbg_print("[session ended]\n");
+                return 0;
+            }
+            dbg_print("[program panicked: " + msg + "]\n");
+            return 1;
+        }
+        RunResult::Paused => {
+            return 0;
         }
     }
     return 0;

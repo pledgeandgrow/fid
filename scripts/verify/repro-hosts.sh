@@ -110,7 +110,7 @@ L='$HOME/fid-repro-hosts'
 inwsl "rm -rf $L && mkdir -p $L/tree/scripts $L/tree/tests" || { echo "repro-hosts: WSL does not start"; exit 2; }
 # the tree the Linux side builds from: its own copy, in WSL's file system
 tar -cf "$OUT/tree.tar" stdlib scripts/verify "$@" ${COMPILER:+compiler}
-inwsl "cd $L/tree && tar -xf '$(to_mnt "$OUT/tree.tar")' && cp '$(to_mnt "$FID_LINUX")' $L/fid && chmod +x $L/fid" \
+inwsl "cd $L/tree && tar -xf '$(to_mnt "$OUT/tree.tar")' && find scripts -name '*.sh' -exec sed -i 's/\r\$//' {} + && cp '$(to_mnt "$FID_LINUX")' $L/fid && chmod +x $L/fid" \
   || { echo "repro-hosts: copying into WSL failed"; exit 2; }
 lcc="gcc"
 inwsl "command -v zig > /dev/null" && lcc="zig cc"

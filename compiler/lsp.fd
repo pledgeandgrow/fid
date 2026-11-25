@@ -32,6 +32,7 @@ use compiler::compiler;
 use compiler::comptime_eval;
 use compiler::fmt;
 use compiler::build_info;
+use compiler::parser;
 // --- Document tracking --------------------------------------------------
 
 pub struct DocEntry {
@@ -146,7 +147,7 @@ pub fn lsp_run() -> i64 {
                     var line: i64 = json_get_int(json_get(params, "position"), "line");
                     var character: i64 = json_get_int(json_get(params, "position"), "character");
                     var text: str = doc_get(documents, uri);
-                    var result: Json = handle_completion(text, line, character);
+                    var result: Json = handle_completion(text, uri, line, character);
                     send_response(id, result);
                 } else if method == "textDocument/hover" {
                     var uri: str = json_get_str(json_get(params, "textDocument"), "uri");
@@ -160,7 +161,7 @@ pub fn lsp_run() -> i64 {
                     var line: i64 = json_get_int(json_get(params, "position"), "line");
                     var character: i64 = json_get_int(json_get(params, "position"), "character");
                     var text: str = doc_get(documents, uri);
-                    var result: Json = handle_definition(text, uri, line, character);
+                    var result: Json = handle_definition(text, uri, line, character, documents);
                     send_response(id, result);
                 } else if method == "textDocument/rename" {
                     var uri: str = json_get_str(json_get(params, "textDocument"), "uri");
@@ -198,6 +199,18 @@ pub fn lsp_run() -> i64 {
                     var last_line: i64 = json_get_int(json_get(range, "end"), "line");
                     var text: str = doc_get(documents, uri);
                     send_response(id, handle_inlay_hints(text, uri, first_line, last_line));
+                } else if method == "textDocument/documentSymbol" {
+                    // TL4: the outline: top-level declarations, impl and
+                    // trait blocks with their methods as children
+                    var uri: str = json_get_str(json_get(params, "textDocument"), "uri");
+                    send_response(id, handle_document_symbols(doc_get(documents, uri)));
+                } else if method == "textDocument/diagnostic" {
+                    // TL4: pull diagnostics (diagnosticProvider is announced)
+                    var uri: str = json_get_str(json_get(params, "textDocument"), "uri");
+                    var report: JsonObject = JsonObject::new();
+                    report.insert("kind", Json::Str("full"));
+                    report.insert("items", Json::Arr(diagnostics_json(uri, doc_get(documents, uri))));
+                    send_response(id, Json::Obj(report));
                 } else if method == "textDocument/codeAction" {
                     // TL4: the suggested fixes of the diagnostics in range
                     var uri: str = json_get_str(json_get(params, "textDocument"), "uri");
@@ -342,7 +355,12 @@ fn handle_initialize(id: Json) -> void {
     caps.insert("textDocumentSync", Json::Num(1.0));
     // Full sync
     var diag_provider: JsonObject = JsonObject::new();
+    // DiagnosticOptions' two required fields (a client may reject the
+    // capability without them); the report is per document
+    diag_provider.insert("interFileDependencies", Json::Bool(true));
+    diag_provider.insert("workspaceDiagnostics", Json::Bool(false));
     caps.insert("diagnosticProvider", Json::Obj(diag_provider));
+    caps.insert("documentSymbolProvider", Json::Bool(true));
     var completion_provider: JsonObject = JsonObject::new();
     var trigger_chars: Vec<Json> = Vec::new();
     trigger_chars.push(Json::Str("."));
@@ -404,6 +422,20 @@ fn send_notification(msg: Json) -> void {
 // --- Diagnostics --------------------------------------------------------
 
 fn publish_diagnostics(uri: str, text: str) -> void {
+    var params: JsonObject = JsonObject::new();
+    params.insert("uri", Json::Str(uri));
+    params.insert("diagnostics", Json::Arr(diagnostics_json(uri, text)));
+
+    var notification: JsonObject = JsonObject::new();
+    notification.insert("jsonrpc", Json::Str("2.0"));
+    notification.insert("method", Json::Str("textDocument/publishDiagnostics"));
+    notification.insert("params", Json::Obj(params));
+    send_notification(Json::Obj(notification));
+}
+
+/// The LSP Diagnostic objects of `text` (the document `uri`): pushed by
+/// publish_diagnostics, pulled by textDocument/diagnostic.
+fn diagnostics_json(uri: str, text: str) -> Vec<Json> {
     // Determine source path from URI
     var source_path: OptStr = OptStr::None;
     // BG53: the path decoded (`%3A`, `%20`, ...), as lsp_uri_path gives it:
@@ -437,16 +469,7 @@ fn publish_diagnostics(uri: str, text: str) -> void {
         diag_array.push(Json::Obj(diag_obj));
         i = i + 1;
     }
-
-    var params: JsonObject = JsonObject::new();
-    params.insert("uri", Json::Str(uri));
-    params.insert("diagnostics", Json::Arr(diag_array));
-
-    var notification: JsonObject = JsonObject::new();
-    notification.insert("jsonrpc", Json::Str("2.0"));
-    notification.insert("method", Json::Str("textDocument/publishDiagnostics"));
-    notification.insert("params", Json::Obj(params));
-    send_notification(Json::Obj(notification));
+    return diag_array;
 }
 
 // --- Completion / Hover / Goto-Definition -------------------------------
@@ -612,8 +635,112 @@ fn completion_item(label: str, kind: i64, detail: str) -> Json {
     return Json::Obj(obj);
 }
 
+/// The leading type name of the type text `t`: `&mut Vec<i64>` -> `Vec`.
+fn lsp_type_head(t: str) -> str {
+    var x: str = str_trim(t);
+    if str_starts_with(x, "&") {
+        x = str_trim(str_slice(x, 1, str_len(x)));
+    }
+    if str_starts_with(x, "mut ") {
+        x = str_trim(str_slice(x, 4, str_len(x)));
+    }
+    var k: i64 = 0;
+    while k < str_len(x) && is_ident_char(str_byte_at(x, k)) {
+        k = k + 1;
+    }
+    return str_slice(x, 0, k);
+}
+
+/// TL4: the type name of the value `receiver` before the `.` at (`line`,
+/// `character`): `self` is the type of the enclosing `impl`; a local or
+/// parameter is its declared type, else the struct of `= T { .. }` or
+/// `= T::f(..)`, else the return type of `= f(..)` (`funcs`). "" when not
+/// known (a type name stays as it is).
+fn lsp_receiver_type(lines: Vec<str>, receiver: str, line: i64, character: i64, funcs: Vec<Func>) -> str {
+    if line < 0 || line >= lines.len() {
+        return "";
+    }
+    if receiver == "self" {
+        var li: i64 = line;
+        while li >= 0 {
+            var l: str = lines.get(li);
+            if str_starts_with(l, "impl") && (str_starts_with(l, "impl ") || str_starts_with(l, "impl<")) {
+                var t: str = str_slice(l, 4, str_len(l));
+                var f: i64 = str_find(t, " for ");
+                if f >= 0 {
+                    t = str_slice(t, f + 5, str_len(t));
+                } else if str_starts_with(t, "<") {
+                    // skip the impl's own type parameters `impl<T> X<T>`
+                    var depth: i64 = 0;
+                    var k: i64 = 0;
+                    var done: bool = false;
+                    while k < str_len(t) && !done {
+                        var b: i64 = str_byte_at(t, k);
+                        if b == 60 {
+                            depth = depth + 1;
+                        } else if b == 62 {
+                            depth = depth - 1;
+                            if depth == 0 {
+                                done = true;
+                            }
+                        }
+                        k = k + 1;
+                    }
+                    t = str_slice(t, k, str_len(t));
+                }
+                return lsp_type_head(t);
+            }
+            if li < line && str_len(fix_indent(l)) == 0 && str_len(lsp_decl_name(l)) > 0 {
+                return "";
+            }
+            li = li - 1;
+        }
+        return "";
+    }
+    // the receiver ends right before the dot (spaces allowed)
+    var cl: str = lines.get(line);
+    var rc: i64 = character - 1;
+    if rc > str_len(cl) {
+        rc = str_len(cl);
+    }
+    while rc > 0 && (str_byte_at(cl, rc - 1) == 32 || str_byte_at(cl, rc - 1) == 9) {
+        rc = rc - 1;
+    }
+    var sc: Vec<i64> = lsp_local_scope(lines, receiver, line, rc);
+    if sc.get(0) < 0 {
+        return "";
+    }
+    var dl: str = lines.get(sc.get(3));
+    var after: str = str_trim(str_slice(dl, sc.get(4) + str_len(receiver), str_len(dl)));
+    if str_starts_with(after, ":") {
+        return lsp_type_head(str_slice(after, 1, str_len(after)));
+    }
+    if !str_starts_with(after, "=") {
+        return "";
+    }
+    var init: str = str_trim(str_slice(after, 1, str_len(after)));
+    var head: str = lsp_type_head(init);
+    if str_len(head) == 0 {
+        return "";
+    }
+    var rest: str = str_trim(str_slice(init, str_len(head), str_len(init)));
+    if str_starts_with(rest, "{") || str_starts_with(rest, "::") {
+        return head;
+    }
+    if str_starts_with(rest, "(") {
+        var fi: i64 = 0;
+        while fi < funcs.len() {
+            if funcs.get(fi).name == head {
+                return lsp_type_head(type_to_str(funcs.get(fi).ret_ty));
+            }
+            fi = fi + 1;
+        }
+    }
+    return "";
+}
+
 /// Handle textDocument/completion.
-fn handle_completion(text: str, line: i64, character: i64) -> Json {
+fn handle_completion(text: str, uri: str, line: i64, character: i64) -> Json {
     // Build program to get symbol info
     var result: ResultProgram = build_program_with_path(text, OptStr::None);
     var program: Program = program_new();
@@ -642,18 +769,70 @@ fn handle_completion(text: str, line: i64, character: i64) -> Json {
 
     // Check if we're after a dot (method/field completion)
     var receiver: str = ident_before_dot(text, line, character);
+    if str_len(receiver) > 0 && !has_program {
+        // TL4: the half-typed `x.` itself can leave the file unparsable
+        // (`return self.` before a `}`): the symbols of the file without
+        // the cursor's line
+        var plines: Vec<str> = split_lines(text);
+        var pstarts: Vec<i64> = fix_line_starts(plines);
+        var ptext: str = text;
+        if line >= 0 && line < plines.len() {
+            var pa: i64 = pstarts.get(line);
+            var pb: i64 = pa + str_len(plines.get(line));
+            ptext = str_slice(text, 0, pa) + str_slice(text, pb, str_len(text));
+        }
+        match parse_program_only(ptext) {
+            OptProgram::Some(pp2) => {
+                program = pp2;
+                has_program = true;
+            }
+            OptProgram::None => {
+            }
+        }
+    }
     if str_len(receiver) > 0 {
         if has_program {
+            // TL4: the impls, functions and structs of the imported modules
+            // too, and the receiver's type when it is a value (`p.` with
+            // `p: Pt`, `self.`), not a type name
+            var all_impls: Vec<ImplDef> = Vec::new();
+            var all_funcs: Vec<Func> = Vec::new();
+            var all_structs: Vec<StructDef> = Vec::new();
+            var ci: i64 = 0;
+            while ci < program.impls.len() {
+                all_impls.push(program.impls.get(ci));
+                ci = ci + 1;
+            }
+            ci = 0;
+            while ci < program.funcs.len() {
+                all_funcs.push(program.funcs.get(ci));
+                ci = ci + 1;
+            }
+            ci = 0;
+            while ci < program.structs.len() {
+                all_structs.push(program.structs.get(ci));
+                ci = ci + 1;
+            }
+            ih_imported_funcs(program, uri, &mut all_funcs, &mut all_impls, &mut all_structs);
+            var rtype: str = lsp_receiver_type(split_lines(text), receiver, line, character, all_funcs);
+            if str_len(rtype) > 0 {
+                receiver = rtype;
+            }
             // Return methods from impls matching the receiver type
             var i: i64 = 0;
-            while i < program.impls.len() {
-                var impl_def: ImplDef = program.impls.get(i);
+            while i < all_impls.len() {
+                var impl_def: ImplDef = all_impls.get(i);
                 if impl_def.struct_name == receiver {
                     var j: i64 = 0;
                     while j < impl_def.methods.len() {
                         var m: Func = impl_def.methods.get(j);
-                        var detail: str = "fn " + m.name + "(" + params_to_str(m.params) + ") -> " + type_to_str(m.ret_ty);
-                        items.push(completion_item(m.name, 2, detail));
+                        var mname: str = m.name;
+                        // a method's name may carry its type (`T_m`)
+                        if str_starts_with(mname, receiver + "_") {
+                            mname = str_slice(mname, str_len(receiver) + 1, str_len(mname));
+                        }
+                        var detail: str = "fn " + mname + "(" + params_to_str(m.params) + ") -> " + type_to_str(m.ret_ty);
+                        items.push(completion_item(mname, 2, detail));
                         // 2 = Method
                         j = j + 1;
                     }
@@ -662,8 +841,8 @@ fn handle_completion(text: str, line: i64, character: i64) -> Json {
             }
             // Return struct fields if receiver is a known struct
             i = 0;
-            while i < program.structs.len() {
-                var s: StructDef = program.structs.get(i);
+            while i < all_structs.len() {
+                var s: StructDef = all_structs.get(i);
                 if s.name == receiver {
                     var j: i64 = 0;
                     while j < s.fields.len() {
@@ -908,111 +1087,213 @@ fn handle_hover(text: str, line: i64, character: i64) -> Json {
     return Json::Obj(hover);
 }
 
-/// Handle textDocument/definition.
-fn handle_definition(text: str, uri: str, line: i64, character: i64) -> Json {
+/// Handle textDocument/definition: a local or parameter at its
+/// declaration; a function, method, type, const or trait at its
+/// declaration in the document, else in the workspace file that declares
+/// it (TL4: across files, a module the document imports).
+fn handle_definition(text: str, uri: str, line: i64, character: i64, documents: Vec<DocEntry>) -> Json {
     var word: str = word_at_position(text, line, character);
     if str_len(word) == 0 {
         return Json::Null;
     }
-
-    var result: ResultProgram = build_program_with_path(text, OptStr::None);
-    var program: Program = program_new();
-    var has_program: bool = false;
-    match result {
-        ResultProgram::Ok(p) => {
-            program = p;
-            has_program = true;
-        }
-        ResultProgram::Err(_) => {
-            // A type error elsewhere: the symbols of the parsed program
-            // still answer (they gave nothing while the file had any error)
-            match parse_program_only(text) {
-                OptProgram::Some(pp) => {
-                    program = pp;
-                    has_program = true;
-                }
-                OptProgram::None => {
-                    has_program = false;
-                }
-            }
-        }
+    var lines: Vec<str> = split_lines(text);
+    // a local or parameter in scope at the cursor
+    var sc: Vec<i64> = lsp_local_scope(lines, word, line, character);
+    if sc.get(0) >= 0 {
+        return location_json(uri, sc.get(3), sc.get(4), word);
     }
-
-    if !has_program {
-        return Json::Null;
+    // a declaration of this document (top level first, then a method)
+    var here: Vec<i64> = lsp_decl_loc(lines, word);
+    if here.get(0) >= 0 {
+        return location_json(uri, here.get(0), here.get(1), word);
     }
-
-    // Determine what kind of symbol we're looking for
-    var is_func: bool = false;
-    var is_struct: bool = false;
-    var is_enum: bool = false;
-    var is_const: bool = false;
-    var is_trait: bool = false;
-
-    var i: i64 = 0;
-    while i < program.funcs.len() {
-        if program.funcs.get(i).name == word {
-            is_func = true;
-        }
-        i = i + 1;
-    }
-    i = 0;
-    while i < program.structs.len() {
-        if program.structs.get(i).name == word {
-            is_struct = true;
-        }
-        i = i + 1;
-    }
-    i = 0;
-    while i < program.enums.len() {
-        if program.enums.get(i).name == word {
-            is_enum = true;
-        }
-        i = i + 1;
-    }
-    i = 0;
-    while i < program.consts.len() {
-        if program.consts.get(i).name == word {
-            is_const = true;
-        }
-        i = i + 1;
-    }
-    i = 0;
-    while i < program.traits.len() {
-        if program.traits.get(i).name == word {
-            is_trait = true;
-        }
-        i = i + 1;
-    }
-
-    // Check if it's a method name
-    var is_method: bool = false;
-    i = 0;
-    while i < program.impls.len() {
-        var j: i64 = 0;
-        while j < program.impls.get(i).methods.len() {
-            if program.impls.get(i).methods.get(j).name == word {
-                is_method = true;
-            }
-            j = j + 1;
-        }
-        i = i + 1;
-    }
-
-    if !is_func && !is_struct && !is_enum && !is_const && !is_trait && !is_method {
-        return Json::Null;
-    }
-
-    // Search for the definition in the source text
-    var def_result: OptI64Pair = find_definition(text, word, is_func);
+    // a global `val`/`var` and the other declaration forms find_definition
+    // knows
+    var def_result: OptI64Pair = find_definition(text, word, true);
     match def_result {
         OptI64Pair::Some(def_line, def_col) => {
             return location_json(uri, def_line, def_col, word);
         }
         OptI64Pair::None => {
-            return Json::Null;
         }
     }
+    // TL4: the file of the workspace that declares it (one the document
+    // imports, or a sibling module that imports this one's)
+    var related: Vec<DocEntry> = lsp_related_files(documents, uri, text, word);
+    var pass: i64 = 1;
+    while pass <= 2 {
+        var ri: i64 = 0;
+        while ri < related.len() {
+            var rd: DocEntry = related.get(ri);
+            if lsp_declares(rd.text, word) == pass {
+                var at: Vec<i64> = lsp_decl_loc(split_lines(rd.text), word);
+                if at.get(0) >= 0 {
+                    return location_json(rd.uri, at.get(0), at.get(1), word);
+                }
+            }
+            ri = ri + 1;
+        }
+        pass = pass + 1;
+    }
+    return Json::Null;
+}
+
+/// The (0-based line, column) of the declaration of `name` in `lines`: a
+/// top-level `fn`/`struct`/`enum`/`const`/`trait`/`type`/`cap` first, else
+/// an indented one (a method of an `impl` or `trait`); [-1, -1] when none.
+fn lsp_decl_loc(lines: Vec<str>, name: str) -> Vec<i64> {
+    var r: Vec<i64> = Vec::new();
+    var inner_line: i64 = -1;
+    var inner_col: i64 = -1;
+    var i: i64 = 0;
+    while i < lines.len() {
+        var l: str = lines.get(i);
+        if lsp_decl_name(l) == name {
+            var col: i64 = fix_word_col(l, name);
+            if col >= 0 {
+                if str_len(fix_indent(l)) == 0 {
+                    r.push(i);
+                    r.push(col);
+                    return r;
+                }
+                if inner_line < 0 {
+                    inner_line = i;
+                    inner_col = col;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    r.push(inner_line);
+    r.push(inner_col);
+    return r;
+}
+
+/// TL4: the LSP SymbolKind of the declaration on `l` (lsp_decl_name's
+/// forms); `method` for a `fn` inside an impl or trait.
+fn lsp_symbol_kind(l: str, method: bool) -> i64 {
+    var t: str = str_trim(l);
+    if str_starts_with(t, "pub ") {
+        t = str_trim(str_slice(t, 4, str_len(t)));
+    }
+    if str_starts_with(t, "fn ") {
+        if method {
+            return 6;
+        }
+        return 12;
+    }
+    if str_starts_with(t, "struct ") {
+        return 23;
+    }
+    if str_starts_with(t, "enum ") {
+        return 10;
+    }
+    if str_starts_with(t, "const ") {
+        return 14;
+    }
+    if str_starts_with(t, "trait ") {
+        return 11;
+    }
+    if str_starts_with(t, "type ") {
+        return 26;
+    }
+    return 13;
+}
+
+/// The last line of the declaration starting on line `li` (indented by
+/// `ind`): the first later line with the same indentation that starts with
+/// `}`, or `li` itself when the line opens no block or closes it.
+fn lsp_decl_end(lines: Vec<str>, li: i64, ind: str) -> i64 {
+    var l: str = str_trim_end(lines.get(li));
+    if str_find(l, "{") < 0 || str_ends_with(l, "}") || str_ends_with(l, ";") {
+        return li;
+    }
+    var k: i64 = li + 1;
+    while k < lines.len() {
+        var kl: str = lines.get(k);
+        if fix_indent(kl) == ind && str_starts_with(str_slice(kl, str_len(ind), str_len(kl)), "}") {
+            return k;
+        }
+        k = k + 1;
+    }
+    return lines.len() - 1;
+}
+
+/// One LSP position object.
+fn lsp_pos(line: i64, character: i64) -> Json {
+    var o: JsonObject = JsonObject::new();
+    o.insert("line", Json::Num(line as f64));
+    o.insert("character", Json::Num(character as f64));
+    return Json::Obj(o);
+}
+
+/// One LSP DocumentSymbol: `name` declared at (`li`, `col`), its range the
+/// lines `li`..`end`.
+fn lsp_symbol_json(lines: Vec<str>, name: str, kind: i64, li: i64, end: i64, col: i64, children: Vec<Json>) -> Json {
+    var range: JsonObject = JsonObject::new();
+    range.insert("start", lsp_pos(li, 0));
+    range.insert("end", lsp_pos(end, str_len(lines.get(end))));
+    var c: i64 = col;
+    if c < 0 {
+        c = 0;
+    }
+    var sel: JsonObject = JsonObject::new();
+    sel.insert("start", lsp_pos(li, c));
+    sel.insert("end", lsp_pos(li, c + str_len(name)));
+    var o: JsonObject = JsonObject::new();
+    o.insert("name", Json::Str(name));
+    o.insert("kind", Json::Num(kind as f64));
+    o.insert("range", Json::Obj(range));
+    o.insert("selectionRange", Json::Obj(sel));
+    o.insert("children", Json::Arr(children));
+    return Json::Obj(o);
+}
+
+/// TL4: textDocument/documentSymbol — the declarations at the top level of
+/// `text` (fn, struct, enum, const, trait, type, cap) and each `impl`
+/// block, the functions of an impl or trait as its children.
+fn handle_document_symbols(text: str) -> Json {
+    var out: Vec<Json> = Vec::new();
+    var lines: Vec<str> = split_lines(text);
+    var i: i64 = 0;
+    while i < lines.len() {
+        var l: str = lines.get(i);
+        var t: str = str_trim(l);
+        var is_impl: bool = str_starts_with(t, "impl ") || str_starts_with(t, "impl<");
+        var name: str = lsp_decl_name(l);
+        if str_len(fix_indent(l)) == 0 && (is_impl || str_len(name) > 0) {
+            var end: i64 = lsp_decl_end(lines, i, "");
+            var children: Vec<Json> = Vec::new();
+            if is_impl || lsp_symbol_kind(l, false) == 11 {
+                var k: i64 = i + 1;
+                while k < end {
+                    var kl: str = lines.get(k);
+                    var kn: str = lsp_decl_name(kl);
+                    if str_len(kn) > 0 && lsp_symbol_kind(kl, true) == 6 {
+                        var kend: i64 = lsp_decl_end(lines, k, fix_indent(kl));
+                        var none: Vec<Json> = Vec::new();
+                        children.push(lsp_symbol_json(lines, kn, 6, k, kend, fix_word_col(kl, kn), none));
+                        k = kend + 1;
+                    } else {
+                        k = k + 1;
+                    }
+                }
+            }
+            if is_impl {
+                var iname: str = t;
+                if str_ends_with(iname, "{") {
+                    iname = str_trim(str_slice(iname, 0, str_len(iname) - 1));
+                }
+                out.push(lsp_symbol_json(lines, iname, 5, i, end, 0, children));
+            } else {
+                out.push(lsp_symbol_json(lines, name, lsp_symbol_kind(l, false), i, end, fix_word_col(l, name), children));
+            }
+            i = end + 1;
+        } else {
+            i = i + 1;
+        }
+    }
+    return Json::Arr(out);
 }
 
 /// Handle textDocument/rename.
@@ -3822,7 +4103,14 @@ fn handle_inlay_hints(text: str, uri: str, first_line: i64, last_line: i64) -> J
         table.push(program.funcs.get(fi));
         fi = fi + 1;
     }
-    ih_imported_funcs(program, uri, &mut table);
+    var all_impls: Vec<ImplDef> = Vec::new();
+    var ai: i64 = 0;
+    while ai < program.impls.len() {
+        all_impls.push(program.impls.get(ai));
+        ai = ai + 1;
+    }
+    var imp_structs: Vec<StructDef> = Vec::new();
+    ih_imported_funcs(program, uri, &mut table, &mut all_impls, &mut imp_structs);
     // function name -> index + 1 into table
     var fn_ix: i64 = HashMap_new();
     fi = 0;
@@ -3839,11 +4127,11 @@ fn handle_inlay_hints(text: str, uri: str, first_line: i64, last_line: i64) -> J
     var owners: Vec<str> = Vec::new();
     var meth_ix: i64 = HashMap_new();
     var ii: i64 = 0;
-    while ii < program.impls.len() {
+    while ii < all_impls.len() {
         var mj: i64 = 0;
-        var owner: str = program.impls.get(ii).struct_name;
-        while mj < program.impls.get(ii).methods.len() {
-            var mf: Func = program.impls.get(ii).methods.get(mj);
+        var owner: str = all_impls.get(ii).struct_name;
+        while mj < all_impls.get(ii).methods.len() {
+            var mf: Func = all_impls.get(ii).methods.get(mj);
             var mname: str = mf.name;
             // a method's name may carry its type (`T_m`)
             if str_starts_with(mname, owner + "_") {
@@ -3864,7 +4152,8 @@ fn handle_inlay_hints(text: str, uri: str, first_line: i64, last_line: i64) -> J
         }
         fi = fi + 1;
     }
-    var starts: Vec<i64> = fix_line_starts(split_lines(text));
+    var lines: Vec<str> = split_lines(text);
+    var starts: Vec<i64> = fix_line_starts(lines);
     var n: i64 = str_len(text);
     var prev_word: str = "";
     var i: i64 = 0;
@@ -3894,8 +4183,14 @@ fn handle_inlay_hints(text: str, uri: str, first_line: i64, last_line: i64) -> J
                 idx = HashMap_get(fn_ix, w);
             }
             if idx > 0 {
-                var f: Func = table.get(idx - 1);
-                ih_call_hints(text, starts, paren, f, 0, first_line, last_line, &mut hints);
+                // a local or parameter `w` in scope at the call is the
+                // callee, not the file's `fn w`: no parameter hints of it
+                var cpos: Json = fix_pos_json(starts, i);
+                var wscope: Vec<i64> = lsp_local_scope(lines, w, json_get_int(cpos, "line"), json_get_int(cpos, "character"));
+                if wscope.get(0) < 0 {
+                    var f: Func = table.get(idx - 1);
+                    ih_call_hints(text, starts, paren, f, 0, first_line, last_line, &mut hints);
+                }
             }
             // TL4: a method call `.w(`: the parameters after `self`, when
             // one type has a method of that name
@@ -3917,7 +4212,6 @@ fn handle_inlay_hints(text: str, uri: str, first_line: i64, last_line: i64) -> J
         }
     }
     // TL4: the type of a local declared without one (`var x = f(..);`)
-    var lines: Vec<str> = split_lines(text);
     var enum_names: Vec<str> = Vec::new();
     var ei: i64 = 0;
     while ei < program.enums.len() {
@@ -3933,12 +4227,12 @@ fn handle_inlay_hints(text: str, uri: str, first_line: i64, last_line: i64) -> J
         si = si + 1;
     }
     ii = 0;
-    while ii < program.impls.len() {
-        var iowner: str = program.impls.get(ii).struct_name;
-        var itps: str = str_join(program.impls.get(ii).type_params, ",");
+    while ii < all_impls.len() {
+        var iowner: str = all_impls.get(ii).struct_name;
+        var itps: str = str_join(all_impls.get(ii).type_params, ",");
         var mj2: i64 = 0;
-        while mj2 < program.impls.get(ii).methods.len() {
-            var imf: Func = program.impls.get(ii).methods.get(mj2);
+        while mj2 < all_impls.get(ii).methods.len() {
+            var imf: Func = all_impls.get(ii).methods.get(mj2);
             var imname: str = imf.name;
             if str_starts_with(imname, iowner + "_") {
                 imname = str_slice(imname, str_len(iowner) + 1, str_len(imname));
@@ -4263,9 +4557,10 @@ fn ih_add_method(m: str, owner: str, f: Func, meths: &mut Vec<Func>, owners: &mu
     }
 }
 
-/// The `pub` functions of the modules `program` imports, appended to
-/// `table`: `use a::b;` is `a/b.fd` (or `b.fd`) beside the document `uri`.
-fn ih_imported_funcs(program: Program, uri: str, table: &mut Vec<Func>) {
+/// The `pub` functions, the impls and the structs of the modules `program`
+/// imports, appended to `table`/`impls`/`structs`: `use a::b;` is `a/b.fd`
+/// (or `b.fd`) beside the document `uri`.
+fn ih_imported_funcs(program: Program, uri: str, table: &mut Vec<Func>, impls: &mut Vec<ImplDef>, structs: &mut Vec<StructDef>) {
     var path: str = lsp_uri_path(uri);
     if str_len(path) == 0 {
         return;
@@ -4290,6 +4585,16 @@ fn ih_imported_funcs(program: Program, uri: str, table: &mut Vec<Func>) {
                         if mp.funcs.get(k).is_pub {
                             table.push(mp.funcs.get(k));
                         }
+                        k = k + 1;
+                    }
+                    k = 0;
+                    while k < mp.impls.len() {
+                        impls.push(mp.impls.get(k));
+                        k = k + 1;
+                    }
+                    k = 0;
+                    while k < mp.structs.len() {
+                        structs.push(mp.structs.get(k));
                         k = k + 1;
                     }
                 }
@@ -4431,7 +4736,30 @@ fn ih_expr_type_plain(e: Expr, table: Vec<Func>, fn_ix: i64, enum_names: Vec<str
             return "";
         }
         Expr::Call(cn, cargs) => {
-            var at: i64 = HashMap_get(fn_ix, cn);
+            // `f::<#k>(args)`: a turbofish call of `f`, its type arguments
+            // the parser recorded under `k` (they bind f's type parameters)
+            var lname: str = cn;
+            var bn: Vec<str> = Vec::new();
+            var bv: Vec<str> = Vec::new();
+            var tfm: i64 = str_find(cn, "::<#");
+            var targs: Vec<Type> = Vec::new();
+            if tfm >= 0 {
+                lname = str_slice(cn, 0, tfm);
+                var kn: i64 = 0;
+                var ki: i64 = tfm + 4;
+                var kd: bool = true;
+                while kd && ki < str_len(cn) {
+                    var kb: i64 = str_byte_at(cn, ki);
+                    if kb >= 48 && kb <= 57 {
+                        kn = kn * 10 + kb - 48;
+                        ki = ki + 1;
+                    } else {
+                        kd = false;
+                    }
+                }
+                targs = turbofish_types(kn);
+            }
+            var at: i64 = HashMap_get(fn_ix, lname);
             if at > 0 {
                 var f: Func = table.get(at - 1);
                 match f.ret_ty {
@@ -4442,11 +4770,16 @@ fn ih_expr_type_plain(e: Expr, table: Vec<Func>, fn_ix: i64, enum_names: Vec<str
                     }
                 }
                 // TL4: a generic function's return type, its type
-                // parameters inferred from the arguments
-                var no_n: Vec<str> = Vec::new();
-                var no_v: Vec<str> = Vec::new();
+                // parameters bound by a turbofish or inferred from the
+                // arguments
+                var ti: i64 = 0;
+                while ti < targs.len() && ti < f.type_params.len() {
+                    bn.push(f.type_params.get(ti));
+                    bv.push(type_to_str(targs.get(ti)));
+                    ti = ti + 1;
+                }
                 var no_tps: Vec<str> = Vec::new();
-                return ih_ret_type(f, cargs, 0, no_n, no_v, no_tps, ctx, env_n, env_t);
+                return ih_ret_type(f, cargs, 0, bn, bv, no_tps, ctx, env_n, env_t);
             }
             return "";
         }

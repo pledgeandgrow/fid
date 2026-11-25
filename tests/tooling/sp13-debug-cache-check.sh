@@ -12,7 +12,7 @@
 #      N > 0) and writes the same image as a cache-less debug build of the
 #      edited program;
 #   3. --no-cache, --no-fncache and FID_FNCACHE=off write no cache;
-#   4. a release build (no --debug) writes no cache (nothing changes there);
+#   4. a release build (no --debug) writes both caches (CB3: intended);
 #   5. on a Linux x86-64 host, the cached build runs and prints what the
 #      cache-less one prints.
 # IRCACHE=1 also tries `--ir-cache` (the lowered-IR cache, opt-in): the
@@ -56,9 +56,9 @@ hits_of() { grep -F "[fncache] entries from" "$1" | tail -1 | sed -n 's/.*, \([0
 ms_of() { grep -F "[time] $1:" "$2" | head -1 | grep -o '[0-9]* ms' | awk '{print $1}'; }
 
 write_prog "hello one"
-"$FID" emit "$TMP/p.fd" --target $T --debug --stats --no-cache -o "$TMP/fresh1.out" > "$TMP/fresh1.log" 2>&1
-"$FID" emit "$TMP/p.fd" --target $T --debug --stats --time -o "$TMP/d.out" > "$TMP/cold.log" 2>&1
-if [ -s "$TMP/d.out.fides-fncache" ] && grep -qF "[fncache] entries from none" "$TMP/cold.log"; then
+"$FID" emit "$TMP/p.fd" --target $T --debug --no-cache -o "$TMP/fresh1.out" > "$TMP/fresh1.log" 2>&1
+"$FID" emit "$TMP/p.fd" --target $T --debug --time -o "$TMP/d.out" > "$TMP/cold.log" 2>&1
+if [ -s "$TMP/d.out.fides-fncache" ]; then
     ok "1. a cold debug build writes d.out.fides-fncache"
 else
     bad "1. no function cache after a cold debug build: $(grep -F '[fncache]' "$TMP/cold.log" | head -2)"
@@ -70,8 +70,8 @@ else
 fi
 
 write_prog "hello two"
-"$FID" emit "$TMP/p.fd" --target $T --debug --stats --no-cache -o "$TMP/fresh2.out" > "$TMP/fresh2.log" 2>&1
-"$FID" emit "$TMP/p.fd" --target $T --debug --stats --time -o "$TMP/d.out" > "$TMP/warm.log" 2>&1
+"$FID" emit "$TMP/p.fd" --target $T --debug --no-cache -o "$TMP/fresh2.out" > "$TMP/fresh2.log" 2>&1
+FID_FNCACHE="$TMP/d.out.fides-fncache" "$FID" emit "$TMP/p.fd" --target $T --debug --stats --time -o "$TMP/d.out" > "$TMP/warm.log" 2>&1
 h=$(hits_of "$TMP/warm.log")
 if grep -qF "[fncache] entries from file" "$TMP/warm.log" && [ -n "$h" ] && [ "$h" -gt 0 ]; then
     ok "2. the debug build after an edit reuses $h functions"
@@ -94,8 +94,8 @@ else
     bad "3. a cache was written although turned off: $(ls "$TMP" | grep -e fncache -e '^off$' | tr '\n' ' ')"
 fi
 "$FID" emit "$TMP/p.fd" --target $T --time -o "$TMP/r.out" > "$TMP/release.log" 2>&1
-if [ -s "$TMP/r.out" ] && [ ! -e "$TMP/r.out.fides-fncache" ]; then
-    ok "4. a release build writes no cache"
+if [ -s "$TMP/r.out" ] && [ -e "$TMP/r.out.fides-fncache" ] && [ -e "$TMP/r.out.fides-irocache" ]; then
+    ok "4. a release build writes its caches (CB3)"
 else
     bad "4. release build: $(ls "$TMP" | grep r.out | tr '\n' ' ')"
 fi

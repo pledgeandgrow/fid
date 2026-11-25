@@ -1,0 +1,695 @@
+// tools/target_test_lib.fd — what the target test runners share
+// (tools/cross_test.fd, tools/wasm_test.fd, tools/bare_qemu_test.fd,
+// tools/sanitize.fd: the Fides ports of scripts/cross-test.sh,
+// wasm-test.sh, bare-qemu-test.sh and sanitize.sh, roadmap AD4).
+//
+// Running a program as the scripts' `timeout N cmd < /dev/null > out 2> err`
+// does: no shell, stdin at its end (a pipe closed at once), stdout and
+// stderr to files (or together), a time limit after which the child is
+// killed and the status is 124 (GNU timeout's), a program that cannot
+// start 127. The status is what bash's $? shows: on Windows Git Bash
+// (MSYS) maps an NTSTATUS exit code 0xC0000005 to 139 (SIGSEGV),
+// 0xC000001D to 132 (SIGILL), 0xC000013A to 130 (SIGINT), any other code
+// with both top bits set to 127, and the rest to its low byte; elsewhere a
+// child killed by signal n is 128 + n, as process_wait gives it.
+// tt_pool runs a list of such commands n at a time (JOBS).
+//
+// Text helpers do what the scripts' grep, sed and awk lines do on these
+// files: lines split at "\n", `$(cat f)` drops the trailing newlines, the
+// `// Expected output:` blocks of the tests.
+
+use core;
+use args;
+use fs;
+use io;
+use process;
+
+// SAFETY: the C runtime's child functions (compiler/codegen_c.fd
+// __p_child_spawn; the native runtimes have them too): a list or path goes
+// as the address of a NUL-terminated str that lives until the call
+// returns; the runtime copies what it keeps.
+extern "C" {
+    fn fid_proc_spawn_io(argv: i64, env: i64, dir: i64, out: i64, io: i64) -> i64;
+    fn fid_proc_close_in(h: i64) -> i64;
+}
+
+// ─── The environment ───
+
+/// `${NAME:-}`: the variable, or "" when it is unset.
+pub fn tt_env(name: str) -> str {
+    match env_var(name) {
+        Option::Some(v) => { return v; }
+        Option::None => { }
+    }
+    return "";
+}
+
+/// `${NAME:-def}`: the variable, or `def` when it is unset or empty.
+pub fn tt_env_or(name: str, def: str) -> str {
+    val v: str = tt_env(name);
+    if str_len(v) == 0 { return def; }
+    return v;
+}
+
+/// `[ -n "${NAME:-}" ]`: is the variable set to something?
+pub fn tt_env_set(name: str) -> bool {
+    return str_len(tt_env(name)) > 0;
+}
+
+/// The arguments after the program (`fid run tools/x.fd a b` passes "run"
+/// and the path first: those are left out).
+pub fn tt_args() -> Vec<str> {
+    val all: Vec<str> = args_all();
+    var first: i64 = 1;
+    if all.len() >= 3 && all.get(1) == "run" && str_ends_with(all.get(2), ".fd") { first = 3; }
+    var out: Vec<str> = Vec::new();
+    var i: i64 = first;
+    while i < all.len() {
+        out.push(all.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Is `name` a program on PATH (`command -v name`)? A name with a slash is
+/// looked for as it is.
+pub fn tt_which(name: str) -> bool {
+    if str_len(name) == 0 { return false; }
+    val win: bool = process_is_windows();
+    if str_contains(name, "/") || str_contains(name, "\\") {
+        return fs_exists(name) || (win && fs_exists(name + ".exe"));
+    }
+    var sep: str = ":";
+    if win { sep = ";"; }
+    val dirs: Vec<str> = str_split(tt_env("PATH"), sep);
+    var i: i64 = 0;
+    while i < dirs.len() {
+        val d: str = dirs.get(i);
+        i = i + 1;
+        if str_len(d) == 0 { continue; }
+        val p: str = d + "/" + name;
+        if fs_exists(p) && !fs_is_dir(p) { return true; }
+        if win {
+            if fs_exists(p + ".exe") || fs_exists(p + ".cmd") || fs_exists(p + ".bat") { return true; }
+        }
+    }
+    return false;
+}
+
+/// The output of `uname <flag>` without its newline ("" when there is no
+/// uname).
+pub fn tt_uname(flag: str) -> str {
+    var argv: Vec<str> = Vec::new();
+    argv.push("uname");
+    argv.push(flag);
+    val r: ChildResult = process_run_argv(argv, Vec::new(), "", 10000);
+    if !r.started || r.code != 0 { return ""; }
+    return tt_chomp(r.output);
+}
+
+/// What the scripts' `case "$(uname -s)"` makes of this host: windows,
+/// macos, freebsd or linux (anything else).
+pub fn tt_host() -> str {
+    if process_is_windows() { return "windows"; }
+    val s: str = tt_uname("-s");
+    if s == "Darwin" { return "macos"; }
+    if s == "FreeBSD" { return "freebsd"; }
+    if str_starts_with(s, "MINGW") || str_starts_with(s, "MSYS") || str_starts_with(s, "CYGWIN") { return "windows"; }
+    return "linux";
+}
+
+// ─── Running programs ───
+
+fn tt_join31(list: Vec<str>) -> str {
+    val sep: str = char_to_str(31);
+    var s: str = "";
+    var i: i64 = 0;
+    while i < list.len() {
+        if i > 0 { s = s + sep; }
+        s = s + list.get(i);
+        i = i + 1;
+    }
+    return s;
+}
+
+/// argv with the program's slashes turned into backslashes on Windows
+/// (CreateProcess does not take "release/fid.exe").
+fn tt_prog_argv(argv: Vec<str>) -> Vec<str> {
+    if !process_is_windows() || argv.len() == 0 { return argv; }
+    var out: Vec<str> = Vec::new();
+    out.push(str_replace(argv.get(0), "/", "\\"));
+    var i: i64 = 1;
+    while i < argv.len() {
+        out.push(argv.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// The null device as a file to write to.
+pub fn tt_null() -> str {
+    if process_is_windows() { return "NUL"; }
+    return "/dev/null";
+}
+
+/// Start `argv` with `env` added: stdout to `out` ("" ours), stderr to
+/// `err` ("" with stdout), stdin a pipe that gets `input` and is then
+/// closed. 0 when it could not start.
+pub fn tt_spawn(argv: Vec<str>, env: Vec<str>, out: str, err: str, input: str) -> i64 {
+    val av: Vec<str> = tt_prog_argv(argv);
+    if av.len() == 0 { return 0; }
+    if str_len(av.get(0)) == 0 { return 0; }
+    val a: str = tt_join31(av);
+    val e: str = tt_join31(env);
+    var files: Vec<str> = Vec::new();
+    files.push(out);
+    if str_len(err) > 0 { files.push(err); }
+    val f: str = tt_join31(files);
+    val dir: str = "";
+    var h: i64 = 0;
+    // SAFETY: a, e, dir and f are NUL-terminated strings held by locals
+    // until the call returns; io 1 asks for a stdin pipe only.
+    unsafe {
+        h = fid_proc_spawn_io(a as i64, e as i64, dir as i64, f as i64, 1);
+    }
+    if h == 0 { return 0; }
+    if str_len(input) > 0 {
+        process_write(h, input);
+    }
+    // SAFETY: h is the live handle fid_proc_spawn_io returned.
+    unsafe {
+        fid_proc_close_in(h);
+    }
+    return h;
+}
+
+/// A child's exit code as bash's $? shows it (see the header).
+pub fn tt_status(code: i64) -> i64 {
+    if !process_is_windows() { return code; }
+    var u: i64 = code;
+    if u < 0 { u = u + 4294967296; }
+    if u <= 255 { return u; }
+    if (u & 3221225472) == 3221225472 {
+        if u == 3221225477 { return 139; }
+        if u == 3221225501 { return 132; }
+        if u == 3221225786 { return 130; }
+        return 127;
+    }
+    return u & 255;
+}
+
+/// Wait for `h` at most `secs` seconds (0 or less: no limit); kill it at
+/// the limit. The status as `timeout` gives it (124 at the limit).
+pub fn tt_finish(h: i64, secs: i64) -> i64 {
+    var ms: i64 = -1;
+    if secs > 0 { ms = secs * 1000; }
+    var code: i64 = 124;
+    match process_wait(h, ms) {
+        Option::Some(c) => { code = tt_status(c); }
+        Option::None => {
+            process_kill(h);
+            process_wait(h, 10000);
+            code = 124;
+        }
+    }
+    process_release(h);
+    return code;
+}
+
+/// Make `path` empty, as a shell redirection does before the command runs.
+fn tt_touch(path: str) {
+    if str_len(path) > 0 && path != tt_null() { fs_write_text(path, ""); }
+}
+
+/// `timeout secs argv < /dev/null > out 2> err` (err "": 2>&1; out "":
+/// ours): the status ($?).
+pub fn tt_run(argv: Vec<str>, env: Vec<str>, out: str, err: str, secs: i64) -> i64 {
+    val h: i64 = tt_spawn(argv, env, out, err, "");
+    if h == 0 {
+        tt_touch(out);
+        tt_touch(err);
+        return 127;
+    }
+    return tt_finish(h, secs);
+}
+
+/// argv as one item of a tt_pool list.
+pub fn tt_pack(argv: Vec<str>) -> str {
+    return tt_join31(argv);
+}
+
+/// Run every command of `cmds` (tt_pack'ed), with its out/err files and
+/// time limit, `jobs` at a time; their statuses in the same order.
+pub fn tt_pool(cmds: Vec<str>, env: Vec<str>, outs: Vec<str>, errs: Vec<str>, secs: Vec<i64>, jobs: i64) -> Vec<i64> {
+    val n: i64 = cmds.len();
+    var codes: Vec<i64> = Vec::new();
+    var handles: Vec<i64> = Vec::new();
+    var started: Vec<i64> = Vec::new();   // microseconds
+    var state: Vec<i64> = Vec::new();     // 0 waiting, 1 running, 2 ended
+    var i: i64 = 0;
+    while i < n {
+        codes.push(-1);
+        handles.push(0);
+        started.push(0);
+        state.push(0);
+        i = i + 1;
+    }
+    var j: i64 = jobs;
+    if j < 1 { j = 1; }
+    var next: i64 = 0;
+    var running: i64 = 0;
+    var done: i64 = 0;
+    while done < n {
+        while running < j && next < n {
+            val argv: Vec<str> = str_split(cmds.get(next), char_to_str(31));
+            val h: i64 = tt_spawn(argv, env, outs.get(next), errs.get(next), "");
+            if h == 0 {
+                tt_touch(outs.get(next));
+                tt_touch(errs.get(next));
+                codes.set(next, 127);
+                state.set(next, 2);
+                done = done + 1;
+            } else {
+                handles.set(next, h);
+                started.set(next, p_clock_now_us());
+                state.set(next, 1);
+                running = running + 1;
+            }
+            next = next + 1;
+        }
+        var moved: bool = false;
+        var r: i64 = 0;
+        while r < next {
+            if state.get(r) == 1 {
+                match process_wait(handles.get(r), 0) {
+                    Option::Some(c) => {
+                        codes.set(r, tt_status(c));
+                        state.set(r, 2);
+                        process_release(handles.get(r));
+                        running = running - 1;
+                        done = done + 1;
+                        moved = true;
+                    }
+                    Option::None => {
+                        val lim: i64 = secs.get(r);
+                        if lim > 0 && p_clock_now_us() - started.get(r) > lim * 1000000 {
+                            process_kill(handles.get(r));
+                            process_wait(handles.get(r), 10000);
+                            process_release(handles.get(r));
+                            codes.set(r, 124);
+                            state.set(r, 2);
+                            running = running - 1;
+                            done = done + 1;
+                            moved = true;
+                        }
+                    }
+                }
+            }
+            r = r + 1;
+        }
+        if !moved && done < n {
+            // wait a little on the first one still running
+            var w: i64 = 0;
+            while w < next && state.get(w) != 1 { w = w + 1; }
+            if w < next {
+                match process_wait(handles.get(w), 20) {
+                    Option::Some(c2) => {
+                        codes.set(w, tt_status(c2));
+                        state.set(w, 2);
+                        process_release(handles.get(w));
+                        running = running - 1;
+                        done = done + 1;
+                    }
+                    Option::None => { }
+                }
+            }
+        }
+    }
+    return codes;
+}
+
+// ─── Files and text ───
+
+/// The text of `path`, "" when there is none.
+pub fn tt_read(path: str) -> str {
+    match read_file(path) {
+        Option::Some(t) => { return t; }
+        Option::None => { }
+    }
+    return "";
+}
+
+/// `s` without its trailing newlines (what `$(...)` keeps).
+pub fn tt_chomp(s: str) -> str {
+    var n: i64 = str_len(s);
+    while n > 0 && str_byte_at(s, n - 1) == 10 { n = n - 1; }
+    return str_slice(s, 0, n);
+}
+
+/// `$(cat path 2>/dev/null)`.
+pub fn tt_cat(path: str) -> str {
+    return tt_chomp(tt_read(path));
+}
+
+/// `s` with every "\r" removed (`tr -d '\r'`).
+pub fn tt_no_cr(s: str) -> str {
+    return str_replace(s, "\r", "");
+}
+
+/// The lines of `s` as grep and awk see them: split at "\n", no empty
+/// last line for a final "\n".
+pub fn tt_lines(s: str) -> Vec<str> {
+    var parts: Vec<str> = str_split(s, "\n");
+    if parts.len() > 0 && str_len(parts.get(parts.len() - 1)) == 0 {
+        var out: Vec<str> = Vec::new();
+        var i: i64 = 0;
+        while i + 1 < parts.len() {
+            out.push(parts.get(i));
+            i = i + 1;
+        }
+        return out;
+    }
+    return parts;
+}
+
+/// `s` without one trailing "\r".
+pub fn tt_drop_cr(s: str) -> str {
+    if str_ends_with(s, "\r") { return str_slice(s, 0, str_len(s) - 1); }
+    return s;
+}
+
+/// Leading and trailing blanks (spaces and tabs) removed.
+pub fn tt_trim_blanks(s: str) -> str {
+    var a: i64 = 0;
+    var b: i64 = str_len(s);
+    while a < b && (str_byte_at(s, a) == 32 || str_byte_at(s, a) == 9) { a = a + 1; }
+    while b > a && (str_byte_at(s, b - 1) == 32 || str_byte_at(s, b - 1) == 9) { b = b - 1; }
+    return str_slice(s, a, b);
+}
+
+/// Does any line of the file start with `prefix` (`grep -q '^prefix'`)?
+pub fn tt_has_line_prefix(path: str, prefix: str) -> bool {
+    val lines: Vec<str> = tt_lines(tt_read(path));
+    var i: i64 = 0;
+    while i < lines.len() {
+        if str_starts_with(lines.get(i), prefix) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// The file names in `dir` that start with `prefix` and end with `suffix`,
+/// in byte order (a bash glob in the C locale), each as dir/name.
+pub fn tt_glob(dir: str, prefix: str, suffix: str) -> Vec<str> {
+    var names: Vec<str> = fs_list_dir(dir);
+    var keep: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < names.len() {
+        val nm: str = names.get(i);
+        i = i + 1;
+        if str_len(nm) < str_len(prefix) + str_len(suffix) { continue; }
+        if !str_starts_with(nm, prefix) || !str_ends_with(nm, suffix) { continue; }
+        if fs_is_dir(dir + "/" + nm) { continue; }
+        keep.push(nm);
+    }
+    tt_sort(&mut keep);
+    var out: Vec<str> = Vec::new();
+    i = 0;
+    while i < keep.len() {
+        out.push(dir + "/" + keep.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn tt_lt(a: str, b: str) -> bool {
+    val n: i64 = str_len(a);
+    val m: i64 = str_len(b);
+    var i: i64 = 0;
+    while i < n && i < m {
+        val x: i64 = str_byte_at(a, i);
+        val y: i64 = str_byte_at(b, i);
+        if x != y { return x < y; }
+        i = i + 1;
+    }
+    return n < m;
+}
+
+/// Byte order (insertion sort: the lists are a few thousand names).
+pub fn tt_sort(v: &mut Vec<str>) {
+    var i: i64 = 1;
+    while i < v.len() {
+        val x: str = v.get(i);
+        var j: i64 = i - 1;
+        while j >= 0 && tt_lt(x, v.get(j)) {
+            v.set(j + 1, v.get(j));
+            j = j - 1;
+        }
+        v.set(j + 1, x);
+        i = i + 1;
+    }
+}
+
+/// `basename "$f" .fd`: the last path part, without ".fd" unless that is
+/// all of it.
+pub fn tt_base(f: str) -> str {
+    var s: str = f;
+    while str_len(s) > 1 && str_ends_with(s, "/") { s = str_slice(s, 0, str_len(s) - 1); }
+    var k: i64 = str_len(s) - 1;
+    while k >= 0 && str_byte_at(s, k) != 47 { k = k - 1; }
+    var b: str = str_slice(s, k + 1, str_len(s));
+    if str_ends_with(b, ".fd") && str_len(b) > 3 { b = str_slice(b, 0, str_len(b) - 3); }
+    return b;
+}
+
+/// The first 3 lines of a file hold `word` (`head -3 f | grep -q word`).
+pub fn tt_head3_has(path: str, word: str) -> bool {
+    val lines: Vec<str> = str_split(tt_read(path), "\n");
+    var i: i64 = 0;
+    while i < lines.len() && i < 3 {
+        if str_contains(lines.get(i), word) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// The bash `case` pattern `pat` (*, ?, [...]) matches all of `s`.
+pub fn tt_case_match(s: str, pat: str) -> bool {
+    return tt_cm(s, 0, pat, 0);
+}
+
+fn tt_cm(s: str, i: i64, p: str, j: i64) -> bool {
+    val n: i64 = str_len(s);
+    val m: i64 = str_len(p);
+    if j == m { return i == n; }
+    val c: i64 = str_byte_at(p, j);
+    if c == 42 {
+        var k: i64 = i;
+        while k <= n {
+            if tt_cm(s, k, p, j + 1) { return true; }
+            k = k + 1;
+        }
+        return false;
+    }
+    if i == n { return false; }
+    if c == 63 { return tt_cm(s, i + 1, p, j + 1); }
+    if c == 91 {
+        var k2: i64 = j + 1;
+        var neg: bool = false;
+        if k2 < m && (str_byte_at(p, k2) == 33 || str_byte_at(p, k2) == 94) {
+            neg = true;
+            k2 = k2 + 1;
+        }
+        var hit: bool = false;
+        var first: bool = true;
+        val ch: i64 = str_byte_at(s, i);
+        while k2 < m && (first || str_byte_at(p, k2) != 93) {
+            first = false;
+            val lo: i64 = str_byte_at(p, k2);
+            if k2 + 2 < m && str_byte_at(p, k2 + 1) == 45 && str_byte_at(p, k2 + 2) != 93 {
+                if ch >= lo && ch <= str_byte_at(p, k2 + 2) { hit = true; }
+                k2 = k2 + 3;
+            } else {
+                if ch == lo { hit = true; }
+                k2 = k2 + 1;
+            }
+        }
+        if k2 >= m {
+            // no closing ]: a plain [
+            if str_byte_at(s, i) == 91 { return tt_cm(s, i + 1, p, j + 1); }
+            return false;
+        }
+        if hit == neg { return false; }
+        return tt_cm(s, i + 1, p, k2 + 1);
+    }
+    if c == 92 && j + 1 < m {
+        if str_byte_at(s, i) != str_byte_at(p, j + 1) { return false; }
+        return tt_cm(s, i + 1, p, j + 2);
+    }
+    if str_byte_at(s, i) != c { return false; }
+    return tt_cm(s, i + 1, p, j + 1);
+}
+
+// ─── The tests' own expectations ───
+
+/// The lines after `// Expected output:` (awk in cross-test.sh's block_of
+/// and bare-qemu-test.sh's expected_of): each `// ` stripped (with `trim`
+/// also the blanks around the rest), up to the first line that is not a
+/// comment; `// Expected exit:` lines left out. Each line ends in "\n".
+pub fn tt_block_of(path: str, trim: bool) -> str {
+    val lines: Vec<str> = tt_lines(tt_read(path));
+    var on: bool = false;
+    var out: str = "";
+    var i: i64 = 0;
+    while i < lines.len() {
+        val l: str = tt_drop_cr(lines.get(i));
+        i = i + 1;
+        if str_starts_with(l, "// Expected output:") {
+            on = true;
+            continue;
+        }
+        if !on { continue; }
+        if str_starts_with(l, "// Expected exit:") { continue; }
+        if str_starts_with(l, "//") {
+            var rest: str = str_slice(l, 2, str_len(l));
+            if str_starts_with(rest, " ") { rest = str_slice(rest, 1, str_len(rest)); }
+            if trim { rest = tt_trim_blanks(rest); }
+            out = out + rest + "\n";
+            continue;
+        }
+        break;
+    }
+    return out;
+}
+
+/// The test's `// Expected exit: N` (the first one; "0" when none), as
+/// the digits are written.
+pub fn tt_block_exit_of(path: str) -> str {
+    val lines: Vec<str> = tt_lines(tt_no_cr(tt_read(path)));
+    val p: str = "// Expected exit:";
+    var i: i64 = 0;
+    while i < lines.len() {
+        val l: str = lines.get(i);
+        i = i + 1;
+        if !str_starts_with(l, p) { continue; }
+        var k: i64 = str_len(p);
+        while k < str_len(l) && str_byte_at(l, k) == 32 { k = k + 1; }
+        var e: i64 = k;
+        while e < str_len(l) && str_byte_at(l, e) >= 48 && str_byte_at(l, e) <= 57 { e = e + 1; }
+        if e > k { return str_slice(l, k, e); }
+    }
+    return "0";
+}
+
+/// Do the lines of `actual` match the lines of `expected` (tt_block_of's
+/// text): as many, each equal, or for an expected line ending in "..."
+/// starting with the rest. With `trim` each actual line loses its blanks
+/// first.
+pub fn tt_same_lines(actual: str, expected: str, trim: bool) -> bool {
+    val a: Vec<str> = tt_lines(actual);
+    val e: Vec<str> = tt_lines(expected);
+    if a.len() != e.len() { return false; }
+    var i: i64 = 0;
+    while i < e.len() {
+        var x: str = a.get(i);
+        if trim { x = tt_trim_blanks(x); }
+        val w: str = e.get(i);
+        if str_ends_with(w, "...") {
+            val pre: str = str_slice(w, 0, str_len(w) - 3);
+            if !str_starts_with(x, pre) { return false; }
+        } else if x != w {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn tt_is_hex(c: i64) -> bool {
+    return (c >= 48 && c <= 57) || (c >= 65 && c <= 70) || (c >= 97 && c <= 102);
+}
+
+fn tt_is_digit(c: i64) -> bool {
+    return c >= 48 && c <= 57;
+}
+
+/// `s` without a final " <word><digits>" (" at line 12", " at 0x1f": the
+/// digits must be one or more of what `hex` allows).
+fn tt_drop_tail(s: str, word: str, hex: bool) -> str {
+    var k: i64 = str_len(s);
+    while k > 0 && ((hex && tt_is_hex(str_byte_at(s, k - 1))) || (!hex && tt_is_digit(str_byte_at(s, k - 1)))) { k = k - 1; }
+    if k == str_len(s) { return s; }
+    if k >= str_len(word) && str_slice(s, k - str_len(word), k) == word {
+        return str_slice(s, 0, k - str_len(word));
+    }
+    return s;
+}
+
+/// A panic's message without its details: the first line starting with
+/// "Panic:", "\r"s removed, cut before its next ':', then without a final
+/// " at line N" (and with `hex`, " at 0x<addr>").
+pub fn tt_panic_key(path: str, hex: bool) -> str {
+    val lines: Vec<str> = tt_lines(tt_read(path));
+    var i: i64 = 0;
+    while i < lines.len() {
+        val l: str = lines.get(i);
+        i = i + 1;
+        if !str_starts_with(l, "Panic:") { continue; }
+        var s: str = tt_no_cr(l);
+        val rest: str = str_slice(s, 7, str_len(s));
+        if str_starts_with(s, "Panic: ") {
+            val c: i64 = str_find(rest, ":");
+            if c >= 0 { s = "Panic: " + str_slice(rest, 0, c); }
+        }
+        s = tt_drop_tail(s, " at line ", false);
+        if hex { s = tt_drop_tail(s, " at 0x", true); }
+        return s;
+    }
+    return "";
+}
+
+/// "/c/x/y" for "C:\x\y" or "C:/x/y" (what Git Bash's pwd prints).
+pub fn tt_msys_path(p: str) -> str {
+    val s: str = str_replace(p, "\\", "/");
+    if str_len(s) >= 2 && str_byte_at(s, 1) == 58 {
+        return "/" + str_to_lower(str_slice(s, 0, 1)) + str_slice(s, 2, str_len(s));
+    }
+    return s;
+}
+
+/// The current directory as the script's `$(pwd)` gives it.
+pub fn tt_pwd() -> str {
+    val p: str = tt_env("PWD");
+    if process_is_windows() { return tt_msys_path(p); }
+    return p;
+}
+
+/// Append `line` and "\n" to `path`.
+pub fn tt_append_line(path: str, line: str) {
+    fs_append_text(path, line + "\n");
+}
+
+/// `mkdir -p path` (fs_mkdir_all, but a Windows drive "C:" is not a
+/// directory to make).
+pub fn tt_mkdir_p(path: str) -> bool {
+    if fs_is_dir(path) { return true; }
+    val s: str = str_replace(path, "\\", "/");
+    var start: i64 = 0;
+    var cur: str = "";
+    if str_len(s) >= 2 && str_byte_at(s, 1) == 58 {
+        cur = str_slice(s, 0, 2);
+        start = 2;
+    }
+    val parts: Vec<str> = str_split(str_slice(s, start, str_len(s)), "/");
+    if str_starts_with(str_slice(s, start, str_len(s)), "/") { cur = cur + "/"; }
+    var i: i64 = 0;
+    while i < parts.len() {
+        val seg: str = parts.get(i);
+        i = i + 1;
+        if str_len(seg) == 0 { continue; }
+        if str_len(cur) > 0 && !str_ends_with(cur, "/") { cur = cur + "/"; }
+        cur = cur + seg;
+        if !fs_is_dir(cur) { fs_mkdir(cur); }
+    }
+    return fs_is_dir(path);
+}

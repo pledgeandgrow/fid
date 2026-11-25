@@ -30,11 +30,13 @@ EOF
 code=$?
 if [ $code -eq 0 ]; then echo "ok   fid veil ran"; else echo "FAIL fid veil exit $code"; fail=1; fi
 if grep -qE "^main +[1-9]" "$TMP/out"; then echo "ok   main in the report"; else echo "FAIL main not in the report"; fail=1; fi
-if grep -qE "^Cell__get[_a-z0-9]* +[1-9][0-9]* +[1-9][0-9]* +100\.0% OK" "$TMP/out"; then
+if grep -qE "^Cell__get[_a-z0-9]* +[1-9][0-9]* +[1-9][0-9]* +100\.0% (OK|✓)" "$TMP/out"; then
     echo "ok   the generic method is in the report, covered"
 else
     echo "FAIL the generic method Cell::get is not in the report"; fail=1
 fi
-if grep -qE "^Functions: +2/2 " "$TMP/out"; then echo "ok   2/2 functions"; else echo "FAIL want Functions: 2/2"; fail=1; fi
+# 2 called: main and Cell::get (since AD1 the report lists the whole
+# lowered module, core included, as the Rust veil does: 2/<n>)
+if grep -qE "^Functions: +2/[0-9]+ " "$TMP/out"; then echo "ok   2 functions called"; else echo "FAIL want Functions: 2/<n>"; fail=1; fi
 if [ $fail -ne 0 ]; then tr -d '\r' < "$TMP/out" | head -30; fi
 exit $fail

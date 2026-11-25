@@ -15,8 +15,11 @@
 #     second exits with a failure;
 #  4. the block's fact set (peir_dom_vfact, peir_dom_enter, peir_mul_fits):
 #     test_opt_range_facts.fd's inner_sq, sq_big and filled_scale keep no
-#     check (each keeps one or more with rangedom off), the two fail
-#     variants keep their multiply, and the three programs run as expected.
+#     check (inner_sq/sq_big keep one or more with rangedom and the range
+#     set both off — the range set can prove those nested-branch cases by
+#     itself; filled_scale keeps one or more with rangedom alone off), the
+#     two fail variants keep their multiply, and the three programs run as
+#     expected.
 set -u
 cd "$(dirname "$0")/../.." || exit 1
 FID="${FID:-release/fid.exe}"
@@ -54,8 +57,14 @@ for fn in inner_sq sq_big filled_scale; do
   "$FID" explain $T/test_opt_range_facts.fd $fn > "$OUT/facts_$fn.txt" 2>&1
   FID_IROPT_OFF=rangedom "$FID" explain $T/test_opt_range_facts.fd $fn > "$OUT/facts_off_$fn.txt" 2>&1
   check "facts: $fn keeps no check" test "$(kept "$OUT/facts_$fn.txt" $fn)" = 0
-  check "facts: $fn with rangedom off keeps one or more" test "$(kept "$OUT/facts_off_$fn.txt" $fn)" -ge 1
 done
+# LF8's range set also carries these nested branch refinements, so turning
+# rangedom off alone no longer reintroduces inner_sq/sq_big's checks.
+for fn in inner_sq sq_big; do
+  FID_IROPT_OFF=rangedom,rangeset "$FID" explain $T/test_opt_range_facts.fd $fn > "$OUT/facts_offboth_$fn.txt" 2>&1
+  check "facts: $fn with rangedom+rangeset off keeps one or more" test "$(kept "$OUT/facts_offboth_$fn.txt" $fn)" -ge 1
+done
+check "facts: filled_scale with rangedom off keeps one or more" test "$(kept "$OUT/facts_off_filled_scale.txt" filled_scale)" -ge 1
 "$FID" explain $T/test_opt_range_facts_fail.fd after_join > "$OUT/facts_fail.txt" 2>&1
 check "facts fail variant: mul kept after the join" grep -q "kept mul overflow check" "$OUT/facts_fail.txt"
 "$FID" explain $T/test_opt_range_filled_fail.fd scale > "$OUT/filled_fail.txt" 2>&1

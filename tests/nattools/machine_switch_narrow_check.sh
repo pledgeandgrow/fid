@@ -33,7 +33,10 @@ WANT="$(expected "$SRC")"
 HOST=linux
 case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) HOST=windows ;; esac
 WSL=""
-if [ "$HOST" = windows ] && command -v wsl.exe >/dev/null 2>&1; then WSL="wsl.exe -e"; fi
+# command -v wsl.exe alone is not enough: the launcher stays on PATH when
+# no distribution is installed, and a run then prints WSL's error instead
+# of the program's output. Probe that a command really runs inside WSL.
+if [ "$HOST" = windows ] && command -v wsl.exe >/dev/null 2>&1 && wsl.exe -e true >/dev/null 2>&1; then WSL="wsl.exe -e"; fi
 
 # run_exe <exe name> <target>: the program's output; status 99 when this
 # host cannot run it
@@ -113,7 +116,10 @@ for t in x86_64-linux aarch64-linux riscv64-linux windows; do
         sw=(FID_NAT_DUMP='*')
         [ "$t" = windows ] && exe="$name.exe" && targ=(--nat)
         [ "$mode" = noswitch ] && sw+=(FID_SWITCH=off)
-        if ! env FID_VERIFY=1 "${sw[@]}" "$FID" emit "$SRC" "${targ[@]}" -o "$OUT/$exe" >"$OUT/$name.out" 2>"$OUT/$name.log"; then
+        # FID_IROPT_OFF=inline2: keep the test functions out of the
+        # inliner — the MIR dump is what is checked, and a folded
+        # digit/opcode/small_dense shows no jtab however it was emitted
+        if ! env FID_VERIFY=1 FID_IROPT_OFF=inline2 "${sw[@]}" "$FID" emit "$SRC" "${targ[@]}" -o "$OUT/$exe" >"$OUT/$name.out" 2>"$OUT/$name.log"; then
             bad "$t $mode: emit failed: $(grep -v '^\[' "$OUT/$name.log" | tail -2)"
             continue
         fi

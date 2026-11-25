@@ -202,6 +202,10 @@ else missing hx; fi
 
 echo "--- server side: scripts/tl/lsp_probe.py"
 "$PY" scripts/tl/lsp_probe.py "$FID" || fails=$((fails + 1))
+# TL4: inlay-hint gaps, and completion/hover/definition/symbols/diagnostics
+echo "--- server side: scripts/tl/lsp_tl4_gaps.py, lsp_tl4_features.py"
+"$PY" scripts/tl/lsp_tl4_gaps.py "$FID" || fails=$((fails + 1))
+"$PY" scripts/tl/lsp_tl4_features.py "$FID" || fails=$((fails + 1))
 
 [ $fails = 0 ] && echo "editor-check: ok" || echo "editor-check: FAIL ($fails parts)"
 [ $fails = 0 ]

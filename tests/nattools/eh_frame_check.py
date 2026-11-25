@@ -255,11 +255,15 @@ def readelf_check(path):
     if shutil.which("readelf"):
         cmd = ["readelf", "--debug-dump=frames-interp", path]
     elif os.name == "nt" and shutil.which("wsl.exe"):
-        p = os.path.abspath(path).replace("\\", "/")
-        m = re.match(r"^([A-Za-z]):/(.*)$", p)
-        if m:
-            p = "/mnt/%s/%s" % (m.group(1).lower(), m.group(2))
-        cmd = ["wsl.exe", "-e", "readelf", "--debug-dump=frames-interp", p]
+        # The wsl.exe launcher can exist without any installed distribution;
+        # probe it rather than treating its error text as readelf output.
+        probe = subprocess.run(["wsl.exe", "-e", "true"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if probe.returncode == 0:
+            p = os.path.abspath(path).replace("\\", "/")
+            m = re.match(r"^([A-Za-z]):/(.*)$", p)
+            if m:
+                p = "/mnt/%s/%s" % (m.group(1).lower(), m.group(2))
+            cmd = ["wsl.exe", "-e", "readelf", "--debug-dump=frames-interp", p]
     if cmd is None:
         print("skip readelf: not found")
         return []

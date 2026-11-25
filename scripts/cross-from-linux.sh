@@ -100,7 +100,7 @@ if [ "$HOST" = windows ]; then
 
   # 2. hello: run by the Linux fid, built for Windows by it, run here
   rm -f "$OUT/hello_win.exe"
-  in_wsl "'$WFID' run tests/bootstrap/hello.fd > '$OUT/hello-linux-run.txt' 2>&1; '$WFID' build tests/bootstrap/hello.fd --target windows-x64 -o '$OUT/hello_win.exe' > '$OUT/hello-build.log' 2>&1"
+  in_wsl "'$WFID' run tests/bootstrap/hello.fd > '$OUT/hello-linux-run.txt' 2> '$OUT/hello-linux-run.err'; '$WFID' build tests/bootstrap/hello.fd --target windows-x64 -o '$OUT/hello_win.exe' > '$OUT/hello-build.log' 2>&1"
   got_run=$(tr -d '\r' < "$OUT/hello-linux-run.txt" 2>/dev/null)
   if [ "$got_run" = "$REF" ]; then ok "2a. the Linux fid runs hello.fd in WSL"; else bad "2a. the Linux fid's run prints '$got_run'"; fi
   if [ -s "$OUT/hello_win.exe" ] && [ "$(head -c 2 "$OUT/hello_win.exe")" = "MZ" ]; then

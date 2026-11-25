@@ -87,8 +87,10 @@ run_exe() { # run_exe <target> <exe> <out>: runs a copy of the executable
   local s
   if [ "$1" = host ]; then "$t" > "$3" 2>&1; s=$?; else run_linux "$t" > "$3" 2>&1; s=$?; fi
   # WSL's own messages ("wsl: Failed to start the systemd user session")
-  # come and go between runs: not the program's output
-  [ -n "$WSL_D" ] && [ "$1" != host ] && sed -i '/^wsl: /d' "$3"
+  # come and go between runs: not the program's output. It can also land
+  # spliced into the program's last line without its "wsl: " prefix
+  # ("...big" + "e systemd user session for ..."): truncate that tail.
+  [ -n "$WSL_D" ] && [ "$1" != host ] && sed -i -e '/^wsl: /d' -e 's/[a-z]* systemd user session.*$//' "$3"
   echo "$s"
 }
 

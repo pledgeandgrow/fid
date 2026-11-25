@@ -21,15 +21,17 @@
 //   0  old directory (empty)
 //   1  PDB info: version VC70, signature, age, GUID, the named stream map
 //      ("/names" -> 5) and the feature VC140
-//   2  TPI, 4 IPI: headers only (no type records; functions have type 0,
-//      as assembly procedures do)
+//   2  TPI: the variables' types (DB4, below: LF_STRUCTURE, LF_FIELDLIST,
+//      LF_POINTER; base types are simple types); 4 IPI: header only
+//      (functions have type 0, as assembly procedures do)
 //   3  DBI: one module (the input file) with its section contribution
 //      (.text), the section map, the file info (the module's source files),
 //      an empty EC name table and the optional debug header naming the
 //      section header stream
 //   5  /names: the source file names (string table, hash version 1)
 //   6  the module's symbols: S_OBJNAME, S_COMPILE3, then per function
-//      S_GPROC32 ... S_END; and its C13 lines: DEBUG_S_FILECHKSMS (one
+//      S_GPROC32, its variables and lexical blocks (DB4, below), S_END;
+//      and its C13 lines: DEBUG_S_FILECHKSMS (one
 //      entry per file, no checksum) and a DEBUG_S_LINES subsection per
 //      function, one block per run of rows of the same file
 //   7  globals: S_PROCREF for each function (GSI hash)
@@ -38,6 +40,7 @@
 //      and address map
 //   9  the symbol records of 7 and 8
 //   10 the image's section headers (dbghelp maps section:offset with them)
+//   11 the TPI hash stream, when the TPI has type records (DB4)
 // The formats are those LLVM documents (llvm/docs/PDB) and lld writes.
 //
 // Rows are those the backends already record for DWARF: [code offset,
@@ -807,6 +810,8 @@ pub fn pdb_build(pe: &Vec<i64>, names: &Vec<str>, starts: &Vec<i64>, ends: &Vec<
         nsec = lay.get(1);
         sect = lay.get(3);
     }
+    // DB4: the functions' variables and their types, from the image's DWARF
+    var dlocals: PdbLocals = pdb_dwarf_locals(pe);
     var text_size: i64 = 0;
     var text_chars: i64 = 0x60000020;
     if nsec > 0 {
@@ -899,6 +904,14 @@ pub fn pdb_build(pe: &Vec<i64>, names: &Vec<str>, starts: &Vec<i64>, ends: &Vec<
             // flags
             pdb_cstr(&mut msyms, nm);
             pdb_rec_end(&mut msyms, at);
+            var li: i64 = 0;
+            while li < dlocals.fn_starts.len() {
+                if dlocals.fn_starts.get(li) == st {
+                    var fitems: Vec<PdbVarItem> = dlocals.fn_items.get(li);
+                    pdb_put_items(&mut msyms, at, &fitems);
+                }
+                li = li + 1;
+            }
             var end_at: i64 = pdb_rec_begin(&mut msyms, PDB_S_END);
             pdb_rec_end(&mut msyms, end_at);
             pdb_set_u32(&mut msyms, at + 8, end_at);
@@ -1250,7 +1263,7 @@ pub fn pdb_build(pe: &Vec<i64>, names: &Vec<str>, starts: &Vec<i64>, ends: &Vec<
     var streams: Vec<Vec<i64>> = Vec::new();
     streams.push(Vec::new());
     streams.push(info);
-    streams.push(pdb_tpi_header());
+    streams.push(pdb_tpi_stream(&dlocals.types, dlocals.ntypes, 11));
     streams.push(dbi);
     streams.push(pdb_tpi_header());
     streams.push(names_stream);
@@ -1259,6 +1272,10 @@ pub fn pdb_build(pe: &Vec<i64>, names: &Vec<str>, starts: &Vec<i64>, ends: &Vec<
     streams.push(publics);
     streams.push(recs);
     streams.push(sechdr);
+    // 11: the TPI hash stream (DB4), when there are type records
+    if dlocals.ntypes > 0 {
+        streams.push(pdb_tpi_hash_stream(&dlocals.hashes));
+    }
     return pdb_msf(&streams);
 }
 
@@ -1299,6 +1316,1138 @@ fn pdb_tpi_header() -> Vec<i64> {
         k = k + 1;
     }
     return out;
+}
+
+// --- DB4: the variables, from the image's DWARF -----------------------------
+// A debug build's image already carries DWARF 4 for its functions (pe_ir.fd
+// pe_add_dwarf, nat_enc.fd nat_pe_debug): .debug_info with each function's
+// parameters, variables and lexical blocks, their types and locations,
+// .debug_loc for values that move, .debug_frame for the CFA. pdb_build reads
+// them back here and writes what Visual Studio and WinDbg read instead:
+//   - per function, between S_GPROC32 and its S_END: S_BLOCK32 ... S_END for
+//     each lexical block (DB4's shadowed names), and per variable
+//       S_REGREL32  a slot under the CFA (DW_OP_fbreg; the CFA is the rule
+//                   .debug_frame gives the function's body: rbp + 16 after
+//                   `push rbp; mov rbp, rsp`), or the memory at a register
+//                   (DW_OP_bregN)
+//       S_REGISTER  a register for the whole function (DW_OP_regN)
+//       S_LOCAL + S_DEFRANGE_REGISTER / S_DEFRANGE_REGISTER_REL  a location
+//                   list: one range per entry that is a register or a slot
+//     (a constant, DW_OP_stack_value, and an entry of any other form is left
+//     out: the variable is "optimized away" there, as with no location);
+//     a slot that holds the variable's address (DW_OP_fbreg; DW_OP_deref: a
+//     struct passed by pointer) is typed as a pointer to it;
+//   - the types in the TPI stream: base types as CodeView's simple types
+//     (i64 T_INT8, u8 T_UCHAR, bool T_BOOL08, f64 T_REAL64, ...), str (a
+//     pointer to u8) as char * (T_64PRCHAR), a struct as LF_STRUCTURE with
+//     its LF_FIELDLIST of LF_MEMBERs, other pointers as LF_POINTER.
+// An image without .debug_info (pdb_unit's) gets procedures and lines only,
+// as before. Check: tests/nattools/pe_pdb_locals_check.py (llvm-pdbutil and
+// dbghelp's SymEnumSymbols at a function's address).
+
+const PDB_S_BLOCK32: i64 = 0x1103;
+const PDB_S_REGISTER: i64 = 0x1106;
+const PDB_S_REGREL32: i64 = 0x1111;
+const PDB_S_LOCAL: i64 = 0x113E;
+const PDB_S_DEFRANGE_REGISTER: i64 = 0x1141;
+const PDB_S_DEFRANGE_REGISTER_REL: i64 = 0x1145;
+const PDB_LF_POINTER: i64 = 0x1002;
+const PDB_LF_FIELDLIST: i64 = 0x1203;
+const PDB_LF_STRUCTURE: i64 = 0x1505;
+const PDB_LF_MEMBER: i64 = 0x150D;
+const PDB_T_64PVOID: i64 = 0x0603;
+const PDB_T_64PRCHAR: i64 = 0x0670;
+
+/// One item of a function's variables: kind 0 S_REGREL32 (reg, off), 1
+/// S_REGISTER (reg), 2 S_LOCAL with `ranges` (5 words each: start offset in
+/// .text, length, 0 register / 1 register + offset, register, offset), 10 a
+/// lexical block [lo, lo + len) begins, 11 it ends.
+pub struct PdbVarItem {
+    pub kind: i64,
+    pub name: str,
+    pub ty: i64,
+    pub reg: i64,
+    pub off: i64,
+    pub lo: i64,
+    pub len: i64,
+    pub is_param: bool,
+    pub ranges: Vec<i64>,
+}
+
+/// The variables of the image: per function (by its offset in .text) its
+/// items, and the TPI type records they use (`ntypes` of them, from 0x1000).
+pub struct PdbLocals {
+    pub fn_starts: Vec<i64>,
+    pub fn_items: Vec<Vec<PdbVarItem>>,
+    pub types: Vec<i64>,
+    pub ntypes: i64,
+    // each record's hash (TPI hash stream: dbghelp will not read type
+    // records without one)
+    pub hashes: Vec<i64>,
+}
+
+/// A section of a PE image found by name (a long name `/n` is in the COFF
+/// string table): [file offset, size, RVA], or an empty Vec.
+fn pdb_pe_section(pe: &Vec<i64>, want: str) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var lay: Vec<i64> = pdb_pe_layout(pe);
+    if lay.len() == 0 {
+        return out;
+    }
+    var e: i64 = lay.get(0);
+    var nsec: i64 = lay.get(1);
+    var sect: i64 = lay.get(3);
+    var symptr: i64 = pdb_get_u32(pe, e + 12);
+    var nsyms: i64 = pdb_get_u32(pe, e + 16);
+    var strtab: i64 = 0;
+    if symptr > 0 {
+        strtab = symptr + 18 * nsyms;
+    }
+    var s: i64 = 0;
+    while s < nsec {
+        var h: i64 = sect + 40 * s;
+        var nm: str = "";
+        var k: i64 = 0;
+        while k < 8 && pe.get(h + k) != 0 {
+            nm = nm + char_to_str(pe.get(h + k));
+            k = k + 1;
+        }
+        if str_starts_with(nm, "/") && strtab > 0 {
+            var so: i64 = strtab + str_parse_int(str_slice(nm, 1, str_len(nm)));
+            if so >= strtab && so < pe.len() {
+                nm = pdb_cstr_at(pe, so);
+            }
+        }
+        if nm == want {
+            var vsize: i64 = pdb_get_u32(pe, h + 8);
+            var rawsize: i64 = pdb_get_u32(pe, h + 16);
+            var size: i64 = rawsize;
+            if vsize > 0 && vsize <= rawsize {
+                size = vsize;
+            }
+            out.push(pdb_get_u32(pe, h + 20));
+            out.push(size);
+            out.push(pdb_get_u32(pe, h + 12));
+            return out;
+        }
+        s = s + 1;
+    }
+    return out;
+}
+
+/// The bytes [off, off + size) of `pe`.
+fn pdb_slice(pe: &Vec<i64>, off: i64, size: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < size && off + i < pe.len() {
+        out.push(pe.get(off + i) & 255);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn pdb_get_u64(b: &Vec<i64>, at: i64) -> i64 {
+    return pdb_get_u32(b, at) | (pdb_get_u32(b, at + 4) << 32);
+}
+
+// the reading position of pdb_uleb / pdb_sleb
+var g_pdb_rd: i64 = 0;
+
+fn pdb_uleb(b: &Vec<i64>) -> i64 {
+    var v: i64 = 0;
+    var sh: i64 = 0;
+    while g_pdb_rd < b.len() {
+        var c: i64 = b.get(g_pdb_rd);
+        g_pdb_rd = g_pdb_rd + 1;
+        if sh < 63 {
+            v = v | ((c & 0x7F) << sh);
+        }
+        sh = sh + 7;
+        if c < 0x80 {
+            return v;
+        }
+    }
+    return v;
+}
+
+fn pdb_sleb(b: &Vec<i64>) -> i64 {
+    var v: i64 = 0;
+    var sh: i64 = 0;
+    while g_pdb_rd < b.len() {
+        var c: i64 = b.get(g_pdb_rd);
+        g_pdb_rd = g_pdb_rd + 1;
+        if sh < 63 {
+            v = v | ((c & 0x7F) << sh);
+        }
+        sh = sh + 7;
+        if c < 0x80 {
+            if (c & 0x40) != 0 && sh < 64 {
+                v = v - (1 << sh);
+            }
+            return v;
+        }
+    }
+    return v;
+}
+
+/// The CodeView register of DWARF x86-64 register `r` (0 when none).
+fn pdb_cv_reg(r: i64) -> i64 {
+    if r == 0 {
+        return 328;
+    }
+    // rax
+    if r == 1 {
+        return 331;
+    }
+    // rdx
+    if r == 2 {
+        return 330;
+    }
+    // rcx
+    if r == 3 {
+        return 329;
+    }
+    // rbx
+    if r == 4 {
+        return 332;
+    }
+    // rsi
+    if r == 5 {
+        return 333;
+    }
+    // rdi
+    if r == 6 {
+        return 334;
+    }
+    // rbp
+    if r == 7 {
+        return 335;
+    }
+    // rsp
+    if r >= 8 && r <= 15 {
+        return 336 + (r - 8);
+    }
+    // r8..r15
+    if r >= 17 && r <= 32 {
+        return 154 + (r - 17);
+    }
+    // xmm0..xmm15
+    return 0;
+}
+
+/// The entries of .debug_info: parallel lists (one element per entry).
+pub struct PdbDies {
+    pub off: Vec<i64>,
+    pub tag: Vec<i64>,
+    pub parent: Vec<i64>,
+    pub name: Vec<str>,
+    pub ty: Vec<i64>,
+    pub lo: Vec<i64>,
+    pub hi: Vec<i64>,
+    pub enc: Vec<i64>,
+    pub size: Vec<i64>,
+    pub memloc: Vec<i64>,
+    // location: 0 none, 1 an expression at [loc_at, loc_at + loc_len) of
+    // .debug_info, 2 a list at loc_at of .debug_loc
+    pub loc_kind: Vec<i64>,
+    pub loc_at: Vec<i64>,
+    pub loc_len: Vec<i64>,
+    // the compile unit's base address (DW_AT_low_pc) of each entry
+    pub cu_base: Vec<i64>,
+}
+
+/// Every entry of every unit of .debug_info `info` (abbreviations from
+/// .debug_abbrev `ab`); type references made absolute. The forms are those
+/// the writers use; an unknown form ends the unit.
+fn pdb_read_dies(info: &Vec<i64>, ab: &Vec<i64>) -> PdbDies {
+    var d: PdbDies = PdbDies {
+        off: Vec::new(), tag: Vec::new(), parent: Vec::new(), name: Vec::new(), ty: Vec::new(), lo: Vec::new(), hi: Vec::new(), enc: Vec::new(), size: Vec::new(), memloc: Vec::new(), loc_kind: Vec::new(), loc_at: Vec::new(), loc_len: Vec::new(), cu_base: Vec::new(),
+    };
+    var cu: i64 = 0;
+    while cu + 11 <= info.len() {
+        var unit_len: i64 = pdb_get_u32(info, cu);
+        if unit_len == 0 || unit_len == 0xFFFFFFFF {
+            break;
+        }
+        var unit_end: i64 = cu + 4 + unit_len;
+        var abbr_off: i64 = pdb_get_u32(info, cu + 6);
+        // the unit's abbreviations: code -> position in `ab` after the code
+        var codes: Vec<i64> = Vec::new();
+        var cpos: Vec<i64> = Vec::new();
+        g_pdb_rd = abbr_off;
+        while g_pdb_rd < ab.len() {
+            var code: i64 = pdb_uleb(ab);
+            if code == 0 {
+                break;
+            }
+            codes.push(code);
+            cpos.push(g_pdb_rd);
+            pdb_uleb(ab);
+            g_pdb_rd = g_pdb_rd + 1;
+            while g_pdb_rd < ab.len() {
+                var an: i64 = pdb_uleb(ab);
+                var af: i64 = pdb_uleb(ab);
+                if an == 0 && af == 0 {
+                    break;
+                }
+            }
+        }
+        var stack: Vec<i64> = Vec::new();
+        stack.push(-1);
+        var base: i64 = 0;
+        var p: i64 = cu + 11;
+        var bad: bool = false;
+        while p < unit_end && !bad {
+            var die_off: i64 = p;
+            g_pdb_rd = p;
+            var code2: i64 = pdb_uleb(info);
+            p = g_pdb_rd;
+            if code2 == 0 {
+                stack.pop();
+                if stack.len() == 0 {
+                    break;
+                }
+                continue;
+            }
+            var ci: i64 = 0;
+            var apos: i64 = -1;
+            while ci < codes.len() {
+                if codes.get(ci) == code2 {
+                    apos = cpos.get(ci);
+                }
+                ci = ci + 1;
+            }
+            if apos < 0 {
+                break;
+            }
+            g_pdb_rd = apos;
+            var tag: i64 = pdb_uleb(ab);
+            var children: i64 = ab.get(g_pdb_rd);
+            g_pdb_rd = g_pdb_rd + 1;
+            var a_pos: i64 = g_pdb_rd;
+            var nm: str = "";
+            var ty: i64 = -1;
+            var lo: i64 = 0;
+            var hi: i64 = 0;
+            var hi_abs: bool = false;
+            var enc: i64 = 0;
+            var size: i64 = 0;
+            var memloc: i64 = 0;
+            var lk: i64 = 0;
+            var lat: i64 = 0;
+            var llen: i64 = 0;
+            while true {
+                g_pdb_rd = a_pos;
+                var an2: i64 = pdb_uleb(ab);
+                var af2: i64 = pdb_uleb(ab);
+                a_pos = g_pdb_rd;
+                if an2 == 0 && af2 == 0 {
+                    break;
+                }
+                var v: i64 = 0;
+                var sv: str = "";
+                var ex_at: i64 = 0;
+                var ex_len: i64 = -1;
+                if af2 == 0x08 {
+                    var q: i64 = p;
+                    while q < info.len() && info.get(q) != 0 {
+                        q = q + 1;
+                    }
+                    sv = pdb_cstr_at(info, p);
+                    p = q + 1;
+                } else if af2 == 0x0B || af2 == 0x11 || af2 == 0x0C {
+                    v = info.get(p);
+                    p = p + 1;
+                } else if af2 == 0x05 || af2 == 0x12 {
+                    v = pdb_get_u16(info, p);
+                    p = p + 2;
+                } else if af2 == 0x06 || af2 == 0x13 || af2 == 0x17 || af2 == 0x0E || af2 == 0x10 {
+                    v = pdb_get_u32(info, p);
+                    p = p + 4;
+                } else if af2 == 0x07 || af2 == 0x01 || af2 == 0x14 {
+                    v = pdb_get_u64(info, p);
+                    p = p + 8;
+                } else if af2 == 0x0F {
+                    g_pdb_rd = p;
+                    v = pdb_uleb(info);
+                    p = g_pdb_rd;
+                } else if af2 == 0x0D {
+                    g_pdb_rd = p;
+                    v = pdb_sleb(info);
+                    p = g_pdb_rd;
+                } else if af2 == 0x18 {
+                    g_pdb_rd = p;
+                    var n: i64 = pdb_uleb(info);
+                    ex_at = g_pdb_rd;
+                    ex_len = n;
+                    p = g_pdb_rd + n;
+                } else if af2 == 0x0A {
+                    var n1: i64 = info.get(p);
+                    ex_at = p + 1;
+                    ex_len = n1;
+                    p = p + 1 + n1;
+                } else if af2 == 0x19 {
+                    v = 1;
+                } else {
+                    bad = true;
+                    break;
+                }
+                if an2 == 0x03 {
+                    nm = sv;
+                } else if an2 == 0x49 {
+                    if af2 == 0x10 {
+                        ty = v;
+                    } else {
+                        ty = cu + v;
+                    }
+                } else if an2 == 0x11 {
+                    lo = v;
+                } else if an2 == 0x12 {
+                    hi = v;
+                    hi_abs = af2 == 0x01;
+                } else if an2 == 0x3E {
+                    enc = v;
+                } else if an2 == 0x0B {
+                    size = v;
+                } else if an2 == 0x38 {
+                    memloc = v;
+                } else if an2 == 0x02 {
+                    if ex_len >= 0 {
+                        lk = 1;
+                        lat = ex_at;
+                        llen = ex_len;
+                    } else {
+                        lk = 2;
+                        lat = v;
+                    }
+                }
+            }
+            if bad {
+                break;
+            }
+            if hi_abs && hi >= lo {
+                hi = hi - lo;
+            }
+            if tag == 0x11 {
+                base = lo;
+            }
+            d.off.push(die_off);
+            d.tag.push(tag);
+            d.parent.push(stack.get(stack.len() - 1));
+            d.name.push(nm);
+            d.ty.push(ty);
+            d.lo.push(lo);
+            d.hi.push(hi);
+            d.enc.push(enc);
+            d.size.push(size);
+            d.memloc.push(memloc);
+            d.loc_kind.push(lk);
+            d.loc_at.push(lat);
+            d.loc_len.push(llen);
+            d.cu_base.push(base);
+            if children != 0 {
+                stack.push(d.off.len() - 1);
+            }
+        }
+        cu = unit_end;
+    }
+    return d;
+}
+
+/// The position in `d` of the entry at .debug_info offset `off`, or -1.
+fn pdb_die_at(d: &PdbDies, offs: i64, map: i64) -> i64 {
+    if !HashMap_contains(map, int_to_str(offs)) {
+        return -1;
+    }
+    var v: i64 = HashMap_get(map, int_to_str(offs));
+    return v - 1;
+}
+
+/// The CodeView simple type of a DWARF base type (encoding, size), or 0.
+fn pdb_cv_base(enc: i64, size: i64) -> i64 {
+    if enc == 2 {
+        return 0x0030;
+    }
+    // boolean: T_BOOL08
+    if enc == 4 {
+        if size == 4 {
+            return 0x0040;
+        }
+        return 0x0041;
+    }
+    // float: T_REAL32 / T_REAL64
+    if enc == 6 {
+        return 0x0010;
+    }
+    // signed char: T_CHAR
+    if enc == 8 {
+        return 0x0020;
+    }
+    // unsigned char: T_UCHAR
+    if enc == 5 || enc == 0x0D {
+        if size == 1 {
+            return 0x0068;
+        }
+        if size == 2 {
+            return 0x0072;
+        }
+        if size == 4 {
+            return 0x0074;
+        }
+        return 0x0076;
+    }
+    // signed: T_INT1..T_INT8
+    if size == 1 {
+        return 0x0069;
+    }
+    if size == 2 {
+        return 0x0073;
+    }
+    if size == 4 {
+        return 0x0075;
+    }
+    return 0x0077;
+    // unsigned (and anything else of a size): T_UINT1..T_UINT8
+}
+
+// the TPI records pdb_cv_type makes, and their count; DWARF entry -> type
+// index + 1 (0 while one is being made: a cycle)
+var g_pdb_tpi: Vec<i64> = Vec::new();
+var g_pdb_ntypes: i64 = 0;
+var g_pdb_tpi_hash: Vec<i64> = Vec::new();
+var g_pdb_tymap: i64 = 0;
+
+/// Append a TPI record of `leaf` with `body` (padded to 4 with LF_PAD
+/// bytes); its type index.
+fn pdb_tpi_add(leaf: i64, body: &Vec<i64>) -> i64 {
+    var rec: Vec<i64> = Vec::new();
+    pdb_u16(&mut rec, leaf);
+    pdb_append(&mut rec, body);
+    while (rec.len() + 2) % 4 != 0 {
+        rec.push(0xF0 + (4 - (rec.len() + 2) % 4));
+    }
+    var full: Vec<i64> = Vec::new();
+    pdb_u16(&mut full, rec.len());
+    pdb_append(&mut full, &rec);
+    pdb_append(&mut g_pdb_tpi, &full);
+    // the hash a reader looks the record up by (LLVM TpiHashing): a named
+    // struct by its name, anything else by the record's bytes
+    g_pdb_tpi_hash.push(pdb_jamcrc(&full));
+    var idx: i64 = 0x1000 + g_pdb_ntypes;
+    g_pdb_ntypes = g_pdb_ntypes + 1;
+    return idx;
+}
+
+/// A CodeView numeric leaf (an unsigned value).
+fn pdb_numeric(out: &mut Vec<i64>, v: i64) {
+    if v >= 0 && v < 0x8000 {
+        pdb_u16(out, v);
+    } else {
+        pdb_u16(out, 0x8004);
+        pdb_u32(out, v);
+    }
+}
+
+/// The CodeView type index of DWARF type entry `ti` (a position in `d`):
+/// 0 (no type) when it is unknown.
+fn pdb_cv_type(d: &PdbDies, map: i64, ti: i64) -> i64 {
+    if ti < 0 || ti >= d.tag.len() {
+        return 0;
+    }
+    var key: str = int_to_str(ti);
+    if HashMap_contains(g_pdb_tymap, key) {
+        var known: i64 = HashMap_get(g_pdb_tymap, key);
+        if known == 0 {
+            return PDB_T_64PVOID;
+        }
+        return known - 1;
+    }
+    var tag: i64 = d.tag.get(ti);
+    var r: i64 = 0;
+    if tag == 0x24 {
+        r = pdb_cv_base(d.enc.get(ti), d.size.get(ti));
+    } else if tag == 0x16 || tag == 0x26 || tag == 0x35 {
+        // typedef, const, volatile: what they name
+        HashMap_insert(g_pdb_tymap, key, 0);
+        r = pdb_cv_type(d, map, pdb_die_at(d, d.ty.get(ti), map));
+    } else if tag == 0x0F || tag == 0x10 {
+        // a pointer (or reference)
+        var pt: i64 = pdb_die_at(d, d.ty.get(ti), map);
+        if pt < 0 {
+            r = PDB_T_64PVOID;
+        } else {
+            HashMap_insert(g_pdb_tymap, key, 0);
+            var inner: i64 = pdb_cv_type(d, map, pt);
+            r = pdb_pointer_to(inner);
+        }
+    } else if tag == 0x13 || tag == 0x17 {
+        // a struct (or union): its members first
+        HashMap_insert(g_pdb_tymap, key, 0);
+        var fl: Vec<i64> = Vec::new();
+        var count: i64 = 0;
+        var k: i64 = ti + 1;
+        while k < d.tag.len() && d.parent.get(k) >= ti {
+            if d.parent.get(k) == ti && d.tag.get(k) == 0x0D {
+                var mt: i64 = pdb_cv_type(d, map, pdb_die_at(d, d.ty.get(k), map));
+                pdb_u16(&mut fl, PDB_LF_MEMBER);
+                pdb_u16(&mut fl, 3);
+                // public
+                pdb_u32(&mut fl, mt);
+                pdb_numeric(&mut fl, d.memloc.get(k));
+                pdb_cstr(&mut fl, d.name.get(k));
+                while fl.len() % 4 != 0 {
+                    fl.push(0xF0 + (4 - fl.len() % 4));
+                }
+                count = count + 1;
+            }
+            k = k + 1;
+        }
+        var fli: i64 = pdb_tpi_add(PDB_LF_FIELDLIST, &fl);
+        var st: Vec<i64> = Vec::new();
+        pdb_u16(&mut st, count);
+        pdb_u16(&mut st, 0);
+        // properties
+        pdb_u32(&mut st, fli);
+        pdb_u32(&mut st, 0);
+        // derived from
+        pdb_u32(&mut st, 0);
+        // vshape
+        pdb_numeric(&mut st, d.size.get(ti));
+        var sname: str = d.name.get(ti);
+        if sname == "" {
+            sname = "<anonymous>";
+        }
+        pdb_cstr(&mut st, sname);
+        r = pdb_tpi_add(PDB_LF_STRUCTURE, &st);
+        g_pdb_tpi_hash.set(g_pdb_tpi_hash.len() - 1, pdb_hash_v1(sname));
+    }
+    HashMap_insert(g_pdb_tymap, key, r + 1);
+    return r;
+}
+
+/// The type index of a 64-bit pointer to type `inner`.
+fn pdb_pointer_to(inner: i64) -> i64 {
+    if inner == 0 {
+        return PDB_T_64PVOID;
+    }
+    if inner == 0x0020 || inner == 0x0010 || inner == 0x0068 || inner == 0x0069 {
+        return PDB_T_64PRCHAR;
+    }
+    // str: char *, shown as text
+    if inner < 0x100 {
+        return 0x0600 | inner;
+    }
+    var pb: Vec<i64> = Vec::new();
+    pdb_u32(&mut pb, inner);
+    pdb_u32(&mut pb, 0x0C | (8 << 13));
+    // near 64-bit pointer, 8 bytes
+    return pdb_tpi_add(PDB_LF_POINTER, &pb);
+}
+
+/// The CFA rules of .debug_frame `fr` for code [lo, hi) (VAs): the rule
+/// that covers most of the function, as [DWARF register, offset]; rbp + 16
+/// (`push rbp; mov rbp, rsp`) when no FDE covers `lo`.
+fn pdb_cfa_rule(fr: &Vec<i64>, lo: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    out.push(6);
+    out.push(16);
+    // the CIEs' initial rules and factors: offset -> [code align, data
+    // align, register, offset]
+    var p: i64 = 0;
+    while p + 8 <= fr.len() {
+        var len: i64 = pdb_get_u32(fr, p);
+        if len == 0 || len == 0xFFFFFFFF {
+            break;
+        }
+        var start: i64 = p + 4;
+        var end: i64 = start + len;
+        var id: i64 = pdb_get_u32(fr, start);
+        if id != 0xFFFFFFFF && start + 4 + 16 <= end {
+            var cie: i64 = id;
+            var floc: i64 = pdb_get_u64(fr, start + 4);
+            var frange: i64 = pdb_get_u64(fr, start + 12);
+            if lo >= floc && lo < floc + frange {
+                // the CIE: version, augmentation "", code / data alignment,
+                // return register, initial instructions
+                var clen: i64 = pdb_get_u32(fr, cie);
+                var cend: i64 = cie + 4 + clen;
+                var cver: i64 = fr.get(cie + 8);
+                g_pdb_rd = cie + 9;
+                while g_pdb_rd < cend && fr.get(g_pdb_rd) != 0 {
+                    g_pdb_rd = g_pdb_rd + 1;
+                }
+                g_pdb_rd = g_pdb_rd + 1;
+                // DWARF 4: address and segment selector sizes
+                if cver >= 4 {
+                    g_pdb_rd = g_pdb_rd + 2;
+                }
+                var caf: i64 = pdb_uleb(fr);
+                pdb_sleb(fr);
+                pdb_uleb(fr);
+                var reg: i64 = 7;
+                var off: i64 = 8;
+                // run the CIE's then the FDE's instructions; the rule held
+                // over the longest stretch wins
+                var best_reg: i64 = 7;
+                var best_off: i64 = 8;
+                var best_len: i64 = -1;
+                var pc: i64 = floc;
+                var seg_start: i64 = floc;
+                var pass: i64 = 0;
+                while pass < 2 {
+                    var iend: i64 = cend;
+                    if pass == 1 {
+                        g_pdb_rd = start + 20;
+                        iend = end;
+                    }
+                    while g_pdb_rd < iend {
+                        var op: i64 = fr.get(g_pdb_rd);
+                        g_pdb_rd = g_pdb_rd + 1;
+                        var hi2: i64 = op & 0xC0;
+                        var adv: i64 = -1;
+                        if hi2 == 0x40 {
+                            adv = (op & 0x3F) * caf;
+                        } else if hi2 == 0x80 {
+                            pdb_uleb(fr);
+                        } else if hi2 == 0xC0 {
+                        } else if op == 0x02 {
+                            adv = fr.get(g_pdb_rd) * caf;
+                            g_pdb_rd = g_pdb_rd + 1;
+                        } else if op == 0x03 {
+                            adv = pdb_get_u16(fr, g_pdb_rd) * caf;
+                            g_pdb_rd = g_pdb_rd + 2;
+                        } else if op == 0x04 {
+                            adv = pdb_get_u32(fr, g_pdb_rd) * caf;
+                            g_pdb_rd = g_pdb_rd + 4;
+                        } else if op == 0x0C {
+                            reg = pdb_uleb(fr);
+                            off = pdb_uleb(fr);
+                        } else if op == 0x0D {
+                            reg = pdb_uleb(fr);
+                        } else if op == 0x0E {
+                            off = pdb_uleb(fr);
+                        } else if op == 0x05 || op == 0x10 || op == 0x14 || op == 0x16 {
+                            pdb_uleb(fr);
+                            if op == 0x05 || op == 0x14 {
+                                pdb_uleb(fr);
+                            } else if op == 0x10 || op == 0x16 {
+                                var bl: i64 = pdb_uleb(fr);
+                                g_pdb_rd = g_pdb_rd + bl;
+                            }
+                        } else if op == 0x06 || op == 0x07 || op == 0x08 {
+                            pdb_uleb(fr);
+                        } else if op == 0x09 {
+                            pdb_uleb(fr);
+                            pdb_uleb(fr);
+                        } else if op == 0x0F {
+                            var el: i64 = pdb_uleb(fr);
+                            g_pdb_rd = g_pdb_rd + el;
+                        } else if op == 0x11 || op == 0x12 {
+                            pdb_uleb(fr);
+                            pdb_sleb(fr);
+                        } else if op == 0x13 {
+                            off = pdb_sleb(fr);
+                        } else if op == 0x00 || op == 0x0A || op == 0x0B {
+                        } else {
+                            // an instruction not read here: keep what we have
+                            g_pdb_rd = iend;
+                        }
+                        if adv >= 0 {
+                            if pc + adv - seg_start > best_len {
+                                best_len = pc + adv - seg_start;
+                                best_reg = reg;
+                                best_off = off;
+                            }
+                            pc = pc + adv;
+                            seg_start = pc;
+                        }
+                    }
+                    pass = pass + 1;
+                }
+                if floc + frange - seg_start > best_len {
+                    best_reg = reg;
+                    best_off = off;
+                }
+                out.set(0, best_reg);
+                out.set(1, best_off);
+                return out;
+            }
+        }
+        p = end;
+    }
+    return out;
+}
+
+/// What a location expression [at, at + len) of `b` says, for CodeView:
+/// [0 the memory at register + offset, register, offset, deref?] or [1 a
+/// register, register, 0, 0]; an empty Vec for anything else (a constant,
+/// a value computed on the stack). DW_OP_fbreg is relative to the CFA
+/// `cfa` ([register, offset]).
+fn pdb_loc_expr(b: &Vec<i64>, at: i64, len: i64, cfa: &Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    if len <= 0 {
+        return out;
+    }
+    g_pdb_rd = at;
+    var op: i64 = b.get(g_pdb_rd);
+    g_pdb_rd = g_pdb_rd + 1;
+    var reg: i64 = -1;
+    var off: i64 = 0;
+    var mem: bool = true;
+    if op == 0x91 {
+        off = cfa.get(1) + pdb_sleb(b);
+        reg = cfa.get(0);
+    } else if op >= 0x70 && op <= 0x8F {
+        reg = op - 0x70;
+        off = pdb_sleb(b);
+    } else if op == 0x92 {
+        reg = pdb_uleb(b);
+        off = pdb_sleb(b);
+    } else if op >= 0x50 && op <= 0x6F {
+        reg = op - 0x50;
+        mem = false;
+    } else if op == 0x90 {
+        reg = pdb_uleb(b);
+        mem = false;
+    } else {
+        return out;
+    }
+    var deref: i64 = 0;
+    if g_pdb_rd < at + len {
+        if mem && b.get(g_pdb_rd) == 0x06 && g_pdb_rd + 1 == at + len {
+            deref = 1;
+        } else {
+            return out;
+        }
+    }
+    var cv: i64 = pdb_cv_reg(reg);
+    if cv == 0 {
+        return out;
+    }
+    if mem {
+        out.push(0);
+    } else {
+        out.push(1);
+    }
+    out.push(cv);
+    out.push(off);
+    out.push(deref);
+    return out;
+}
+
+/// The variables of the image `pe` (empty when it has no .debug_info).
+pub fn pdb_dwarf_locals(pe: &Vec<i64>) -> PdbLocals {
+    g_pdb_tpi = Vec::new();
+    g_pdb_ntypes = 0;
+    g_pdb_tpi_hash = Vec::new();
+    g_pdb_tymap = HashMap_new();
+    var res: PdbLocals = PdbLocals {
+        fn_starts: Vec::new(), fn_items: Vec::new(), types: Vec::new(), ntypes: 0, hashes: Vec::new(),
+    };
+    var lay: Vec<i64> = pdb_pe_layout(pe);
+    var si: Vec<i64> = pdb_pe_section(pe, ".debug_info");
+    var sa: Vec<i64> = pdb_pe_section(pe, ".debug_abbrev");
+    if lay.len() == 0 || si.len() == 0 || sa.len() == 0 || lay.get(1) == 0 {
+        return res;
+    }
+    var image_base: i64 = pdb_get_u64(pe, lay.get(2) + 24);
+    var text_rva: i64 = pdb_get_u32(pe, lay.get(3) + 12);
+    var text_va: i64 = image_base + text_rva;
+    var info: Vec<i64> = pdb_slice(pe, si.get(0), si.get(1));
+    var ab: Vec<i64> = pdb_slice(pe, sa.get(0), sa.get(1));
+    var fr: Vec<i64> = Vec::new();
+    var sf: Vec<i64> = pdb_pe_section(pe, ".debug_frame");
+    if sf.len() > 0 {
+        fr = pdb_slice(pe, sf.get(0), sf.get(1));
+    }
+    var dloc: Vec<i64> = Vec::new();
+    var sl: Vec<i64> = pdb_pe_section(pe, ".debug_loc");
+    if sl.len() > 0 {
+        dloc = pdb_slice(pe, sl.get(0), sl.get(1));
+    }
+    var d: PdbDies = pdb_read_dies(&info, &ab);
+    var map: i64 = HashMap_new();
+    var i: i64 = 0;
+    while i < d.off.len() {
+        HashMap_insert(map, int_to_str(d.off.get(i)), i + 1);
+        i = i + 1;
+    }
+    i = 0;
+    while i < d.tag.len() {
+        if d.tag.get(i) == 0x2E && d.lo.get(i) >= text_va && d.hi.get(i) > 0 {
+            var lo: i64 = d.lo.get(i);
+            var hi: i64 = lo + d.hi.get(i);
+            var cfa: Vec<i64> = pdb_cfa_rule(&fr, lo);
+            var items: Vec<PdbVarItem> = Vec::new();
+            pdb_scope_items(&d, map, i, &info, &dloc, &cfa, text_va, lo, hi, &mut items);
+            if items.len() > 0 {
+                res.fn_starts.push(lo - text_va);
+                res.fn_items.push(items);
+            }
+        }
+        i = i + 1;
+    }
+    res.types = g_pdb_tpi;
+    res.ntypes = g_pdb_ntypes;
+    res.hashes = g_pdb_tpi_hash;
+    return res;
+}
+
+/// The items of scope `si` (a function or lexical block) of `d`: its
+/// variables, then its blocks with theirs (as CodeView nests them).
+fn pdb_scope_items(d: &PdbDies, map: i64, si: i64, info: &Vec<i64>, dloc: &Vec<i64>, cfa: &Vec<i64>, text_va: i64, fn_lo: i64, fn_hi: i64, items: &mut Vec<PdbVarItem>) {
+    // the scope's variables: those with one location (S_REGREL32,
+    // S_REGISTER) before those with ranges (S_LOCAL and its S_DEFRANGEs):
+    // dbghelp lists no S_REGREL32 that follows an S_LOCAL of its scope
+    var vars: Vec<PdbVarItem> = Vec::new();
+    var k: i64 = si + 1;
+    while k < d.tag.len() && d.parent.get(k) >= si {
+        if d.parent.get(k) == si {
+            var tag: i64 = d.tag.get(k);
+            if (tag == 0x05 || tag == 0x34) && d.name.get(k) != "" && d.loc_kind.get(k) != 0 {
+                pdb_var_item(d, map, k, info, dloc, cfa, text_va, fn_lo, fn_hi, &mut vars);
+            }
+        }
+        k = k + 1;
+    }
+    var pass: i64 = 0;
+    while pass < 2 {
+        var vi: i64 = 0;
+        while vi < vars.len() {
+            var v: PdbVarItem = vars.get(vi);
+            if (v.kind == 2) == (pass == 1) {
+                items.push(v);
+            }
+            vi = vi + 1;
+        }
+        pass = pass + 1;
+    }
+    k = si + 1;
+    while k < d.tag.len() && d.parent.get(k) >= si {
+        if d.parent.get(k) == si && d.tag.get(k) == 0x0B && d.hi.get(k) > 0 {
+            items.push(PdbVarItem {
+                kind: 10, name: "", ty: 0, reg: 0, off: 0, lo: d.lo.get(k) - text_va, len: d.hi.get(k), is_param: false, ranges: Vec::new(),
+            });
+            pdb_scope_items(d, map, k, info, dloc, cfa, text_va, fn_lo, fn_hi, items);
+            items.push(PdbVarItem {
+                kind: 11, name: "", ty: 0, reg: 0, off: 0, lo: 0, len: 0, is_param: false, ranges: Vec::new(),
+            });
+        }
+        k = k + 1;
+    }
+}
+
+/// The item of variable entry `k`, when its location is one CodeView can
+/// say.
+fn pdb_var_item(d: &PdbDies, map: i64, k: i64, info: &Vec<i64>, dloc: &Vec<i64>, cfa: &Vec<i64>, text_va: i64, fn_lo: i64, fn_hi: i64, items: &mut Vec<PdbVarItem>) {
+    var ty: i64 = pdb_cv_type(d, map, pdb_die_at(d, d.ty.get(k), map));
+    var is_param: bool = d.tag.get(k) == 0x05;
+    if d.loc_kind.get(k) == 1 {
+        var e: Vec<i64> = pdb_loc_expr(info, d.loc_at.get(k), d.loc_len.get(k), cfa);
+        if e.len() == 0 {
+            return;
+        }
+        var vty: i64 = ty;
+        if e.get(3) == 1 {
+            vty = pdb_pointer_to(ty);
+        }
+        var kind: i64 = 0;
+        if e.get(0) == 1 {
+            kind = 1;
+        }
+        items.push(PdbVarItem {
+            kind: kind, name: d.name.get(k), ty: vty, reg: e.get(1), off: e.get(2), lo: 0, len: 0, is_param: is_param, ranges: Vec::new(),
+        });
+        return;
+    }
+    // a location list: [begin, end) pairs relative to the unit's base
+    var ranges: Vec<i64> = Vec::new();
+    var base: i64 = d.cu_base.get(k);
+    var p: i64 = d.loc_at.get(k);
+    var deref_seen: bool = false;
+    while p + 16 <= dloc.len() {
+        var s: i64 = pdb_get_u64(dloc, p);
+        var t: i64 = pdb_get_u64(dloc, p + 8);
+        p = p + 16;
+        if s == 0 && t == 0 {
+            break;
+        }
+        if s == -1 {
+            base = t;
+            continue;
+        }
+        var n: i64 = pdb_get_u16(dloc, p);
+        p = p + 2;
+        var e2: Vec<i64> = pdb_loc_expr(dloc, p, n, cfa);
+        p = p + n;
+        if e2.len() > 0 && e2.get(3) == 0 {
+            var a0: i64 = base + s;
+            var a1: i64 = base + t;
+            // CodeView ranges are at most 0xFFFF bytes: split longer ones
+            while a1 > a0 {
+                var piece: i64 = a1 - a0;
+                if piece > 0xFFFF {
+                    piece = 0xFFFF;
+                }
+                ranges.push(a0 - text_va);
+                ranges.push(piece);
+                ranges.push(1 - e2.get(0));
+                ranges.push(e2.get(1));
+                ranges.push(e2.get(2));
+                a0 = a0 + piece;
+            }
+        } else if e2.len() > 0 {
+            deref_seen = true;
+        }
+    }
+    if ranges.len() == 0 {
+        return;
+    }
+    items.push(PdbVarItem {
+        kind: 2, name: d.name.get(k), ty: ty, reg: 0, off: 0, lo: 0, len: 0, is_param: is_param, ranges: ranges,
+    });
+}
+
+/// Write the items of a function (S_GPROC32 at `proc_at` of `msyms`) into
+/// its symbols: blocks get their parent and end.
+fn pdb_put_items(msyms: &mut Vec<i64>, proc_at: i64, items: &Vec<PdbVarItem>) {
+    var stack: Vec<i64> = Vec::new();
+    stack.push(proc_at);
+    var i: i64 = 0;
+    while i < items.len() {
+        var it: PdbVarItem = items.get(i);
+        if it.kind == 10 {
+            var b: i64 = pdb_rec_begin(msyms, PDB_S_BLOCK32);
+            pdb_u32(msyms, stack.get(stack.len() - 1));
+            // parent
+            pdb_u32(msyms, 0);
+            // end (set at its S_END)
+            pdb_u32(msyms, it.len);
+            pdb_u32(msyms, it.lo);
+            pdb_u16(msyms, 1);
+            pdb_cstr(msyms, "");
+            pdb_rec_end(msyms, b);
+            stack.push(b);
+        } else if it.kind == 11 {
+            if stack.len() > 1 {
+                var e: i64 = pdb_rec_begin(msyms, PDB_S_END);
+                pdb_rec_end(msyms, e);
+                pdb_set_u32(msyms, stack.get(stack.len() - 1) + 8, e);
+                stack.pop();
+            }
+        } else if it.kind == 0 {
+            var r: i64 = pdb_rec_begin(msyms, PDB_S_REGREL32);
+            pdb_u32(msyms, it.off & 0xFFFFFFFF);
+            pdb_u32(msyms, it.ty);
+            pdb_u16(msyms, it.reg);
+            pdb_cstr(msyms, it.name);
+            pdb_rec_end(msyms, r);
+        } else if it.kind == 1 {
+            var r1: i64 = pdb_rec_begin(msyms, PDB_S_REGISTER);
+            pdb_u32(msyms, it.ty);
+            pdb_u16(msyms, it.reg);
+            pdb_cstr(msyms, it.name);
+            pdb_rec_end(msyms, r1);
+        } else if it.kind == 2 {
+            var r2: i64 = pdb_rec_begin(msyms, PDB_S_LOCAL);
+            pdb_u32(msyms, it.ty);
+            if it.is_param {
+                pdb_u16(msyms, 1);
+            } else {
+                pdb_u16(msyms, 0);
+            }
+            pdb_cstr(msyms, it.name);
+            pdb_rec_end(msyms, r2);
+            var q: i64 = 0;
+            while q + 5 <= it.ranges.len() {
+                var rs: i64 = it.ranges.get(q);
+                var rl: i64 = it.ranges.get(q + 1);
+                if it.ranges.get(q + 2) == 0 {
+                    var dr: i64 = pdb_rec_begin(msyms, PDB_S_DEFRANGE_REGISTER);
+                    pdb_u16(msyms, it.ranges.get(q + 3));
+                    pdb_u16(msyms, 0);
+                    pdb_u32(msyms, rs);
+                    pdb_u16(msyms, 1);
+                    pdb_u16(msyms, rl);
+                    pdb_rec_end(msyms, dr);
+                } else {
+                    var dx: i64 = pdb_rec_begin(msyms, PDB_S_DEFRANGE_REGISTER_REL);
+                    pdb_u16(msyms, it.ranges.get(q + 3));
+                    pdb_u16(msyms, 0);
+                    pdb_u32(msyms, it.ranges.get(q + 4) & 0xFFFFFFFF);
+                    pdb_u32(msyms, rs);
+                    pdb_u16(msyms, 1);
+                    pdb_u16(msyms, rl);
+                    pdb_rec_end(msyms, dx);
+                }
+                q = q + 5;
+            }
+        }
+        i = i + 1;
+    }
+    // a block left open (should not happen): close it
+    while stack.len() > 1 {
+        var e2: i64 = pdb_rec_begin(msyms, PDB_S_END);
+        pdb_rec_end(msyms, e2);
+        pdb_set_u32(msyms, stack.get(stack.len() - 1) + 8, e2);
+        stack.pop();
+    }
+}
+
+/// The TPI stream: its header, then `records` (`n` of them); with records,
+/// their hashes are in stream `hash_stream`.
+fn pdb_tpi_stream(records: &Vec<i64>, n: i64, hash_stream: i64) -> Vec<i64> {
+    var out: Vec<i64> = pdb_tpi_header();
+    pdb_set_u32(&mut out, 12, 0x1000 + n);
+    pdb_set_u32(&mut out, 16, records.len());
+    if n > 0 {
+        pdb_set_u16(&mut out, 20, hash_stream);
+        // the hash values, one index offset, no adjusters
+        pdb_set_u32(&mut out, 32, 0);
+        pdb_set_u32(&mut out, 36, 4 * n);
+        pdb_set_u32(&mut out, 40, 4 * n);
+        pdb_set_u32(&mut out, 44, 8);
+        pdb_set_u32(&mut out, 48, 4 * n + 8);
+        pdb_set_u32(&mut out, 52, 0);
+    }
+    pdb_append(&mut out, records);
+    return out;
+}
+
+/// The TPI hash stream of records with `hashes`: each hash modulo the
+/// bucket count (0x3FFFF, pdb_tpi_header), then the index offset of the
+/// first record (type 0x1000 at offset 0).
+fn pdb_tpi_hash_stream(hashes: &Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < hashes.len() {
+        pdb_u32(&mut out, hashes.get(i) % 0x3FFFF);
+        i = i + 1;
+    }
+    pdb_u32(&mut out, 0x1000);
+    pdb_u32(&mut out, 0);
+    return out;
+}
+
+/// JamCRC (CRC-32 without the final inversion) of `b`: LLVM's
+/// hashBufferV8, the hash of a type record that is not a named struct.
+fn pdb_jamcrc(b: &Vec<i64>) -> i64 {
+    var crc: i64 = 0xFFFFFFFF;
+    var i: i64 = 0;
+    while i < b.len() {
+        crc = crc ^ (b.get(i) & 255);
+        var k: i64 = 0;
+        while k < 8 {
+            if (crc & 1) != 0 {
+                crc = (crc >> 1) ^ 0xEDB88320;
+            } else {
+                crc = crc >> 1;
+            }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    return crc & 0xFFFFFFFF;
 }
 
 // --- MSF ----------------------------------------------------------------------

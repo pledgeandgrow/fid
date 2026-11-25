@@ -1,0 +1,2844 @@
+// tools/coverage.fd — block, function and line coverage of compiler/*.fd
+// over a test run (roadmap VF8): the Fides port of
+// scripts/verify/coverage.py (roadmap AD4). Same options and defaults, the
+// same report on stdout and in <out>/report.txt, never-called.txt and
+// uncovered-lines.txt, the same exit status:
+//
+//   fid ccompile tools/coverage.fd -o coverage.exe
+//   coverage.exe --fid build/cov/fid-cov.exe --map build/cov/fid-cov.c.inst.map \
+//       [--modes check,run,ccompile,emit] [-j 4] [--tests 'tests/bootstrap/*.fd'] [--out build/cov]
+//   coverage.exe --map <map> --report-only [--goal 90 --goal-modules all] [--goal-lines 90]
+//   coverage.exe --self-test
+//
+// Built only (`fid ccompile`): it calls getcwd, which `fid run` (the
+// interpreter) cannot.
+//
+// Each test is run once per mode with FID_COV_DIR set; the counter compiler
+// (built through tools/cov_instrument.fd or the script) writes the blocks
+// it reached; they are merged into <out>/merged.cov and mapped back to the
+// module that defines each function (the modules compiler/main.fd reaches
+// through `use`, or every compiler/*.fd with --all-sources, plus
+// stdlib/core.fd and --sources). Modes: check, run, dump-c, ccompile, emit,
+// emit:<target>, nat, cmd:<command>[+<arg>...] ({out}: a scratch file).
+// -j children run at once (stdlib/process.fd process_spawn_files /
+// process_wait), each with at most 600 s. See the script's docstring for
+// the rest (--goal, --goal-lines, --record, --fresh, --limit).
+//
+// Run from the repository root. Differences from the script: --gen (the
+// fuzzers' programs, scripts/fuzz/gen_vs_c.py and gen_programs.py) is not
+// ported — it is an error, exit 2; argparse's usage and help texts are the
+// ones it prints on an 80-column terminal, and abbreviated options are
+// matched as argparse does, but its rarer forms (fromfile prefixes, `-j`
+// glued into other short options) are not; ints and floats are read in
+// their plain forms (no "1_000", no non-ASCII digits); the regular
+// expressions are ASCII (\s, \w, \d); a file's text is read as bytes ("\r\n"
+// and "\r" as "\n"); every file is written with "\n" line ends (Python on
+// Windows writes "\r\n" in report.txt, never-called.txt and
+// uncovered-lines.txt, and on stdout); --record's date comes from
+// PowerShell's Get-Date on Windows and `date` elsewhere (local time, as the
+// script's datetime.now()); a missing map is the last line of the script's
+// traceback, exit 1; `:g` of --goal/--goal-lines is the option's own text
+// normalized (the same as Python's for up to 6 significant digits).
+
+use core;
+use args;
+use fs;
+use io;
+use process;
+
+extern "C" {
+    fn getcwd(buf: i64, n: i64) -> i64;
+}
+
+// ─── Text ───
+
+fn cv_ws(c: i64) -> bool {
+    return (c >= 9 && c <= 13) || (c >= 28 && c <= 32);
+}
+
+fn cv_digit(c: i64) -> bool {
+    return c >= 48 && c <= 57;
+}
+
+fn cv_alpha(c: i64) -> bool {
+    return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95;
+}
+
+fn cv_word(c: i64) -> bool {
+    return cv_alpha(c) || cv_digit(c);
+}
+
+fn cv_skip_ws(s: str, i: i64) -> i64 {
+    var k: i64 = i;
+    while k < str_len(s) && cv_ws(str_byte_at(s, k)) { k = k + 1; }
+    return k;
+}
+
+fn cv_word_end(s: str, i: i64) -> i64 {
+    var k: i64 = i;
+    while k < str_len(s) && cv_word(str_byte_at(s, k)) { k = k + 1; }
+    return k;
+}
+
+fn cv_at(s: str, i: i64, w: str) -> bool {
+    if i < 0 || i + str_len(w) > str_len(s) { return false; }
+    return str_slice(s, i, i + str_len(w)) == w;
+}
+
+/// Python's str.strip() (ASCII whitespace).
+fn cv_strip(s: str) -> str {
+    var a: i64 = 0;
+    var b: i64 = str_len(s);
+    while a < b && cv_ws(str_byte_at(s, a)) { a = a + 1; }
+    while b > a && cv_ws(str_byte_at(s, b - 1)) { b = b - 1; }
+    return str_slice(s, a, b);
+}
+
+/// s.strip(chars)
+fn cv_strip_chars(s: str, chars: str) -> str {
+    var a: i64 = 0;
+    var b: i64 = str_len(s);
+    while a < b && str_contains(chars, char_to_str(str_byte_at(s, a))) { a = a + 1; }
+    while b > a && str_contains(chars, char_to_str(str_byte_at(s, b - 1))) { b = b - 1; }
+    return str_slice(s, a, b);
+}
+
+/// s.split(sep) (keeps empty pieces).
+fn cv_split(s: str, sep: str) -> Vec<str> {
+    var r: Vec<str> = Vec::new();
+    val n: i64 = str_len(s);
+    val m: i64 = str_len(sep);
+    var start: i64 = 0;
+    var i: i64 = 0;
+    while i + m <= n {
+        if str_slice(s, i, i + m) == sep {
+            r.push(str_slice(s, start, i));
+            i = i + m;
+            start = i;
+        } else {
+            i = i + 1;
+        }
+    }
+    r.push(str_slice(s, start, n));
+    return r;
+}
+
+/// s.split() (runs of whitespace, no empty pieces).
+fn cv_fields(s: str) -> Vec<str> {
+    var r: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    val n: i64 = str_len(s);
+    while i < n {
+        while i < n && cv_ws(str_byte_at(s, i)) { i = i + 1; }
+        if i >= n { break; }
+        var j: i64 = i;
+        while j < n && !cv_ws(str_byte_at(s, j)) { j = j + 1; }
+        r.push(str_slice(s, i, j));
+        i = j;
+    }
+    return r;
+}
+
+/// A file's text as Python's text mode gives it ("\r\n" and "\r" as "\n"),
+/// or None.
+fn cv_read_text(path: str) -> Option<str> {
+    match read_file(path) {
+        Option::Some(t) => {
+            if str_contains(t, "\r") {
+                return Option::Some(str_replace(str_replace(t, "\r\n", "\n"), "\r", "\n"));
+            }
+            return Option::Some(t);
+        }
+        Option::None => { }
+    }
+    return Option::None;
+}
+
+/// The lines of text as iterating a file gives them, without their "\n".
+fn cv_lines(t: str) -> Vec<str> {
+    var r: Vec<str> = cv_split(t, "\n");
+    if r.len() > 0 && str_len(r.get(r.len() - 1)) == 0 {
+        r.remove(r.len() - 1);
+    }
+    return r;
+}
+
+fn cv_lt(a: str, b: str) -> bool {
+    val n: i64 = str_len(a);
+    val m: i64 = str_len(b);
+    var i: i64 = 0;
+    while i < n && i < m {
+        val x: i64 = str_byte_at(a, i);
+        val y: i64 = str_byte_at(b, i);
+        if x != y { return x < y; }
+        i = i + 1;
+    }
+    return n < m;
+}
+
+/// sorted() of strings (code point order is byte order for UTF-8).
+fn cv_sort(v: &mut Vec<str>) {
+    // a merge sort: some lists hold thousands of names
+    val n: i64 = v.len();
+    if n < 2 { return; }
+    var a: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        a.push(v.get(i));
+        i = i + 1;
+    }
+    var b: Vec<str> = Vec::new();
+    i = 0;
+    while i < n {
+        b.push("");
+        i = i + 1;
+    }
+    var width: i64 = 1;
+    while width < n {
+        var lo: i64 = 0;
+        while lo < n {
+            var mid: i64 = lo + width;
+            if mid > n { mid = n; }
+            var hi: i64 = lo + 2 * width;
+            if hi > n { hi = n; }
+            var x: i64 = lo;
+            var y: i64 = mid;
+            var k: i64 = lo;
+            while k < hi {
+                if x < mid && (y >= hi || !cv_lt(a.get(y), a.get(x))) {
+                    b.set(k, a.get(x));
+                    x = x + 1;
+                } else {
+                    b.set(k, a.get(y));
+                    y = y + 1;
+                }
+                k = k + 1;
+            }
+            lo = hi;
+        }
+        var t: Vec<str> = a;
+        a = b;
+        b = t;
+        width = width * 2;
+    }
+    i = 0;
+    while i < n {
+        v.set(i, a.get(i));
+        i = i + 1;
+    }
+}
+
+fn cv_sort_ints(v: &mut Vec<i64>) {
+    val n: i64 = v.len();
+    if n < 2 { return; }
+    var a: Vec<i64> = Vec::new();
+    var b: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        a.push(v.get(i));
+        b.push(0);
+        i = i + 1;
+    }
+    var width: i64 = 1;
+    while width < n {
+        var lo: i64 = 0;
+        while lo < n {
+            var mid: i64 = lo + width;
+            if mid > n { mid = n; }
+            var hi: i64 = lo + 2 * width;
+            if hi > n { hi = n; }
+            var x: i64 = lo;
+            var y: i64 = mid;
+            var k: i64 = lo;
+            while k < hi {
+                if x < mid && (y >= hi || a.get(y) >= a.get(x)) {
+                    b.set(k, a.get(x));
+                    x = x + 1;
+                } else {
+                    b.set(k, a.get(y));
+                    y = y + 1;
+                }
+                k = k + 1;
+            }
+            lo = hi;
+        }
+        var t: Vec<i64> = a;
+        a = b;
+        b = t;
+        width = width * 2;
+    }
+    i = 0;
+    while i < n {
+        v.set(i, a.get(i));
+        i = i + 1;
+    }
+}
+
+fn cv_has(v: Vec<str>, s: str) -> bool {
+    var i: i64 = 0;
+    while i < v.len() {
+        if v.get(i) == s { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// f"{s:<w}" (left-aligned) and f"{s:>w}" (right-aligned).
+fn cv_ljust(s: str, w: i64) -> str {
+    var r: str = s;
+    var n: i64 = str_len(s);
+    while n < w {
+        r = r + " ";
+        n = n + 1;
+    }
+    return r;
+}
+
+fn cv_rjust(s: str, w: i64) -> str {
+    var pad: str = "";
+    var n: i64 = str_len(s);
+    while n < w {
+        pad = pad + " ";
+        n = n + 1;
+    }
+    return pad + s;
+}
+
+fn cv_i(n: i64, w: i64) -> str {
+    return cv_rjust(int_to_str(n), w);
+}
+
+fn cv_il(n: i64, w: i64) -> str {
+    return cv_ljust(int_to_str(n), w);
+}
+
+/// f"{d:.{prec}f}" for prec 0..2, exactly as Python rounds (the binary
+/// value, ties to even).
+fn cv_fixed(d: f64, prec: i64) -> str {
+    if d != d { return "nan"; }
+    var neg: bool = false;
+    var x: f64 = d;
+    if x < 0.0 {
+        neg = true;
+        x = 0.0 - x;
+    }
+    if x > 1.0e15 {
+        return float_to_str(d);
+    }
+    val bits: i64 = p_f64_to_bits(x);
+    val e: i64 = (bits >> 52) & 2047;
+    var m: i64 = bits & 4503599627370495;
+    var exp: i64 = -1074;
+    if e != 0 {
+        m = m | 4503599627370496;
+        exp = e - 1075;
+    }
+    var scale: i64 = 1;
+    var k: i64 = 0;
+    while k < prec {
+        scale = scale * 10;
+        k = k + 1;
+    }
+    val num: i64 = m * scale;
+    var q: i64 = 0;
+    if exp >= 0 {
+        q = num << exp;
+    } else {
+        val s: i64 = 0 - exp;
+        if s <= 61 {
+            q = num >> s;
+            val r: i64 = num - (q << s);
+            val half: i64 = 1 << (s - 1);
+            if r > half || (r == half && (q & 1) == 1) { q = q + 1; }
+        }
+    }
+    var out: str = int_to_str(q / scale);
+    if prec > 0 {
+        var frac: str = int_to_str(q % scale);
+        while str_len(frac) < prec { frac = "0" + frac; }
+        out = out + "." + frac;
+    }
+    if neg { out = "-" + out; }
+    return out;
+}
+
+fn cv_f(d: f64, w: i64, prec: i64) -> str {
+    return cv_rjust(cv_fixed(d, prec), w);
+}
+
+fn cv_ratio(a: i64, b: i64) -> f64 {
+    return (a as f64) / (b as f64);
+}
+
+fn cv_max1(n: i64) -> i64 {
+    if n < 1 { return 1; }
+    return n;
+}
+
+/// f"{x:g}" of a float given as text (the option's own text): its digits
+/// to 6 significant ones, then fixed or exponent form, no trailing zeros.
+fn cv_g(text: str) -> str {
+    val t: str = str_to_lower(cv_strip(text));
+    var i: i64 = 0;
+    var sign: str = "";
+    if i < str_len(t) && (str_byte_at(t, i) == 43 || str_byte_at(t, i) == 45) {
+        if str_byte_at(t, i) == 45 { sign = "-"; }
+        i = i + 1;
+    }
+    val rest: str = str_slice(t, i, str_len(t));
+    if rest == "inf" || rest == "infinity" { return sign + "inf"; }
+    if rest == "nan" { return "nan"; }
+    // digits and the exponent of the first one
+    var digits: str = "";
+    var point: i64 = -1;
+    var count: i64 = 0;
+    while i < str_len(t) && (cv_digit(str_byte_at(t, i)) || str_byte_at(t, i) == 46) {
+        if str_byte_at(t, i) == 46 {
+            point = count;
+        } else {
+            digits = digits + char_to_str(str_byte_at(t, i));
+            count = count + 1;
+        }
+        i = i + 1;
+    }
+    if point < 0 { point = count; }
+    var e10: i64 = 0;
+    if i < str_len(t) && str_byte_at(t, i) == 101 {
+        e10 = str_parse_int(str_slice(t, i + 1, str_len(t)));
+    }
+    // drop leading zeros
+    var lead: i64 = 0;
+    while lead < str_len(digits) && str_byte_at(digits, lead) == 48 { lead = lead + 1; }
+    if lead == str_len(digits) { return sign + "0"; }
+    var d: str = str_slice(digits, lead, str_len(digits));
+    var x: i64 = point - lead - 1 + e10;
+    // 6 significant digits, ties to even
+    if str_len(d) > 6 {
+        val tail: str = str_slice(d, 6, str_len(d));
+        var head: Vec<i64> = Vec::new();
+        var k: i64 = 0;
+        while k < 6 {
+            head.push(str_byte_at(d, k) - 48);
+            k = k + 1;
+        }
+        val first: i64 = str_byte_at(tail, 0) - 48;
+        var more: bool = false;
+        k = 1;
+        while k < str_len(tail) {
+            if str_byte_at(tail, k) != 48 { more = true; }
+            k = k + 1;
+        }
+        var up: bool = first > 5 || (first == 5 && (more || (head.get(5) & 1) == 1));
+        if up {
+            var p: i64 = 5;
+            var carry: bool = true;
+            while carry && p >= 0 {
+                val v: i64 = head.get(p) + 1;
+                if v == 10 {
+                    head.set(p, 0);
+                    p = p - 1;
+                } else {
+                    head.set(p, v);
+                    carry = false;
+                }
+            }
+            if carry {
+                head.insert(0, 1);
+                head.remove(6);
+                x = x + 1;
+            }
+        }
+        d = "";
+        k = 0;
+        while k < 6 {
+            d = d + int_to_str(head.get(k));
+            k = k + 1;
+        }
+    }
+    // no trailing zeros
+    var end: i64 = str_len(d);
+    while end > 1 && str_byte_at(d, end - 1) == 48 { end = end - 1; }
+    d = str_slice(d, 0, end);
+    if x >= -4 && x < 6 {
+        if x >= 0 {
+            if str_len(d) <= x + 1 {
+                var z: str = d;
+                while str_len(z) < x + 1 { z = z + "0"; }
+                return sign + z;
+            }
+            return sign + str_slice(d, 0, x + 1) + "." + str_slice(d, x + 1, str_len(d));
+        }
+        var zs: str = "0.";
+        var k2: i64 = -1;
+        while k2 > x {
+            zs = zs + "0";
+            k2 = k2 - 1;
+        }
+        return sign + zs + d;
+    }
+    var mant: str = str_slice(d, 0, 1);
+    if str_len(d) > 1 { mant = mant + "." + str_slice(d, 1, str_len(d)); }
+    var es: str = "+";
+    var ax: i64 = x;
+    if x < 0 {
+        es = "-";
+        ax = 0 - x;
+    }
+    var en: str = int_to_str(ax);
+    if str_len(en) < 2 { en = "0" + en; }
+    return sign + mant + "e" + es + en;
+}
+
+// ─── Python's repr() of a str (for argparse's messages) ───
+
+fn cv_hex(c: i64, width: i64) -> str {
+    val digits: str = "0123456789abcdef";
+    var s: str = "";
+    var k: i64 = width - 1;
+    while k >= 0 {
+        s = s + char_to_str(str_byte_at(digits, (c >> (4 * k)) & 15));
+        k = k - 1;
+    }
+    return s;
+}
+
+fn cv_repr(s: str) -> str {
+    var q: str = "'";
+    if str_contains(s, "'") && !str_contains(s, "\"") { q = "\""; }
+    var out: str = q;
+    var i: i64 = 0;
+    while i < str_len(s) {
+        val c: i64 = str_byte_at(s, i);
+        i = i + 1;
+        if char_to_str(c) == q || c == 92 {
+            out = out + "\\" + char_to_str(c);
+        } else if c == 9 {
+            out = out + "\\t";
+        } else if c == 10 {
+            out = out + "\\n";
+        } else if c == 13 {
+            out = out + "\\r";
+        } else if c < 32 || c == 127 {
+            out = out + "\\x" + cv_hex(c, 2);
+        } else {
+            out = out + char_to_str(c);
+        }
+    }
+    return out + q;
+}
+
+// ─── Paths ───
+
+fn cv_win() -> bool {
+    return process_is_windows();
+}
+
+fn cv_is_sep(c: i64) -> bool {
+    return c == 47 || (c == 92 && cv_win());
+}
+
+fn cv_sep() -> str {
+    if cv_win() { return "\\"; }
+    return "/";
+}
+
+var cv_cwd_cache: str = "";
+
+/// os.getcwd()
+fn cv_cwd() -> str {
+    if str_len(cv_cwd_cache) > 0 { return cv_cwd_cache; }
+    var buf: i64 = 0;
+    // SAFETY: a fresh 4096-byte buffer; getcwd writes at most that many
+    // bytes, NUL included, and the result is copied out before it is freed.
+    unsafe {
+        buf = p_malloc(4096);
+        if buf != 0 {
+            if getcwd(buf, 4096) != 0 {
+                cv_cwd_cache = p_str_from_ptr(buf);
+            }
+            p_free(buf);
+        }
+    }
+    if str_len(cv_cwd_cache) == 0 { cv_cwd_cache = "."; }
+    return cv_cwd_cache;
+}
+
+/// The drive ("C:") of a Windows path, "" for none.
+fn cv_drive(p: str) -> str {
+    if cv_win() && str_len(p) >= 2 && str_byte_at(p, 1) == 58 { return str_slice(p, 0, 2); }
+    return "";
+}
+
+fn cv_isabs(p: str) -> bool {
+    val d: str = cv_drive(p);
+    val rest: str = str_slice(p, str_len(d), str_len(p));
+    return str_len(rest) > 0 && cv_is_sep(str_byte_at(rest, 0));
+}
+
+/// os.path.join(a, b)
+fn cv_join(a: str, b: str) -> str {
+    if str_len(a) == 0 { return b; }
+    if cv_isabs(b) { return b; }
+    if cv_is_sep(str_byte_at(a, str_len(a) - 1)) { return a + b; }
+    return a + cv_sep() + b;
+}
+
+/// os.path.normpath
+fn cv_normpath(p: str) -> str {
+    val d: str = cv_drive(p);
+    var rest: str = str_slice(p, str_len(d), str_len(p));
+    if cv_win() { rest = str_replace(rest, "/", "\\"); }
+    val abs: bool = str_len(rest) > 0 && cv_is_sep(str_byte_at(rest, 0));
+    val parts: Vec<str> = cv_split(rest, cv_sep());
+    var out: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < parts.len() {
+        val c: str = parts.get(i);
+        i = i + 1;
+        if str_len(c) == 0 || c == "." { continue; }
+        if c == ".." {
+            if out.len() > 0 && out.get(out.len() - 1) != ".." {
+                out.remove(out.len() - 1);
+                continue;
+            }
+            if abs { continue; }
+        }
+        out.push(c);
+    }
+    var s: str = "";
+    i = 0;
+    while i < out.len() {
+        if i > 0 { s = s + cv_sep(); }
+        s = s + out.get(i);
+        i = i + 1;
+    }
+    if abs { s = cv_sep() + s; }
+    s = d + s;
+    if str_len(s) == 0 { return "."; }
+    return s;
+}
+
+fn cv_abspath(p: str) -> str {
+    if cv_isabs(p) { return cv_normpath(p); }
+    return cv_normpath(cv_join(cv_cwd(), p));
+}
+
+/// os.path.relpath(p) (from the current directory)
+fn cv_relpath(p: str) -> str {
+    val a: str = cv_abspath(p);
+    val b: str = cv_abspath(".");
+    var ka: str = a;
+    var kb: str = b;
+    if cv_win() {
+        ka = str_to_lower(a);
+        kb = str_to_lower(b);
+    }
+    if cv_drive(ka) != cv_drive(kb) { return a; }
+    val pa: Vec<str> = cv_split(str_slice(a, str_len(cv_drive(a)), str_len(a)), cv_sep());
+    val pb: Vec<str> = cv_split(str_slice(b, str_len(cv_drive(b)), str_len(b)), cv_sep());
+    val la: Vec<str> = cv_split(str_slice(ka, str_len(cv_drive(ka)), str_len(ka)), cv_sep());
+    val lb: Vec<str> = cv_split(str_slice(kb, str_len(cv_drive(kb)), str_len(kb)), cv_sep());
+    // drop the empty piece of the root
+    var xa: Vec<str> = Vec::new();
+    var xla: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < pa.len() {
+        if str_len(pa.get(i)) > 0 {
+            xa.push(pa.get(i));
+            xla.push(la.get(i));
+        }
+        i = i + 1;
+    }
+    var xlb: Vec<str> = Vec::new();
+    i = 0;
+    while i < pb.len() {
+        if str_len(pb.get(i)) > 0 { xlb.push(lb.get(i)); }
+        i = i + 1;
+    }
+    var common: i64 = 0;
+    while common < xla.len() && common < xlb.len() && xla.get(common) == xlb.get(common) { common = common + 1; }
+    var parts: Vec<str> = Vec::new();
+    i = common;
+    while i < xlb.len() {
+        parts.push("..");
+        i = i + 1;
+    }
+    i = common;
+    while i < xa.len() {
+        parts.push(xa.get(i));
+        i = i + 1;
+    }
+    if parts.len() == 0 { return "."; }
+    var s: str = "";
+    i = 0;
+    while i < parts.len() {
+        if i > 0 { s = s + cv_sep(); }
+        s = s + parts.get(i);
+        i = i + 1;
+    }
+    return s;
+}
+
+fn cv_slashes(p: str) -> str {
+    return str_replace(p, "\\", "/");
+}
+
+/// os.makedirs(p, exist_ok=True)
+fn cv_makedirs(p: str) -> bool {
+    if str_len(p) == 0 || fs_is_dir(p) { return true; }
+    var k: i64 = str_len(p) - 1;
+    while k >= 0 && cv_is_sep(str_byte_at(p, k)) { k = k - 1; }
+    while k >= 0 && !cv_is_sep(str_byte_at(p, k)) { k = k - 1; }
+    if k > 0 {
+        val parent: str = str_slice(p, 0, k);
+        if !(str_len(parent) == 2 && str_len(cv_drive(parent)) == 2) {
+            cv_makedirs(parent);
+        }
+    }
+    fs_mkdir(p);
+    return fs_is_dir(p);
+}
+
+/// os.path.basename
+fn cv_basename(p: str) -> str {
+    var i: i64 = str_len(p) - 1;
+    while i >= 0 && !cv_is_sep(str_byte_at(p, i)) { i = i - 1; }
+    return str_slice(p, i + 1, str_len(p));
+}
+
+// ─── glob ───
+
+fn cv_magic(s: str) -> bool {
+    return str_contains(s, "*") || str_contains(s, "?") || str_contains(s, "[");
+}
+
+/// fnmatch of one name (case folded on Windows, as glob does there).
+fn cv_fnmatch(name: str, pat: str) -> bool {
+    if cv_win() { return cv_fnmatch_at(str_to_lower(name), 0, str_to_lower(pat), 0); }
+    return cv_fnmatch_at(name, 0, pat, 0);
+}
+
+fn cv_fnmatch_at(s: str, i: i64, p: str, j: i64) -> bool {
+    if j >= str_len(p) { return i >= str_len(s); }
+    val c: i64 = str_byte_at(p, j);
+    if c == 42 {
+        var k: i64 = i;
+        while k <= str_len(s) {
+            if cv_fnmatch_at(s, k, p, j + 1) { return true; }
+            k = k + 1;
+        }
+        return false;
+    }
+    if i >= str_len(s) { return false; }
+    val ch: i64 = str_byte_at(s, i);
+    if c == 63 { return cv_fnmatch_at(s, i + 1, p, j + 1); }
+    if c == 91 {
+        // [seq], [!seq]; a "]" right after the opening one is literal
+        var k2: i64 = j + 1;
+        var neg: bool = false;
+        if k2 < str_len(p) && str_byte_at(p, k2) == 33 {
+            neg = true;
+            k2 = k2 + 1;
+        }
+        var start: i64 = k2;
+        if k2 < str_len(p) && str_byte_at(p, k2) == 93 { k2 = k2 + 1; }
+        while k2 < str_len(p) && str_byte_at(p, k2) != 93 { k2 = k2 + 1; }
+        if k2 >= str_len(p) {
+            // no closing "]": a literal "["
+            return ch == 91 && cv_fnmatch_at(s, i + 1, p, j + 1);
+        }
+        var hit: bool = false;
+        var q: i64 = start;
+        while q < k2 {
+            val a: i64 = str_byte_at(p, q);
+            if q + 2 < k2 && str_byte_at(p, q + 1) == 45 {
+                if ch >= a && ch <= str_byte_at(p, q + 2) { hit = true; }
+                q = q + 3;
+            } else {
+                if ch == a { hit = true; }
+                q = q + 1;
+            }
+        }
+        if hit == neg { return false; }
+        return cv_fnmatch_at(s, i + 1, p, k2 + 1);
+    }
+    if ch != c { return false; }
+    return cv_fnmatch_at(s, i + 1, p, j + 1);
+}
+
+/// glob.glob(pattern), in no particular order.
+fn cv_glob(pattern: str) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    if str_len(pattern) == 0 { return out; }
+    if !cv_magic(pattern) {
+        if fs_exists(pattern) || fs_is_dir(pattern) { out.push(pattern); }
+        return out;
+    }
+    var k: i64 = str_len(pattern) - 1;
+    while k >= 0 && !cv_is_sep(str_byte_at(pattern, k)) { k = k - 1; }
+    var dir: str = str_slice(pattern, 0, k + 1);
+    val base: str = str_slice(pattern, k + 1, str_len(pattern));
+    // the directory part without its trailing separators (but a root)
+    var dend: i64 = str_len(dir);
+    while dend > 1 && cv_is_sep(str_byte_at(dir, dend - 1)) && !(dend == 3 && str_len(cv_drive(dir)) == 2) { dend = dend - 1; }
+    dir = str_slice(dir, 0, dend);
+    var dirs: Vec<str> = Vec::new();
+    if str_len(dir) == 0 {
+        dirs.push("");
+    } else if cv_magic(dir) {
+        val ds: Vec<str> = cv_glob(dir);
+        var i: i64 = 0;
+        while i < ds.len() {
+            if fs_is_dir(ds.get(i)) { dirs.push(ds.get(i)); }
+            i = i + 1;
+        }
+    } else {
+        dirs.push(dir);
+    }
+    var d: i64 = 0;
+    while d < dirs.len() {
+        val dd: str = dirs.get(d);
+        d = d + 1;
+        if !cv_magic(base) {
+            val p: str = cv_join(dd, base);
+            if str_len(base) == 0 {
+                if fs_is_dir(dd) { out.push(p); }
+            } else if fs_exists(p) || fs_is_dir(p) {
+                out.push(p);
+            }
+            continue;
+        }
+        var ld: str = dd;
+        if str_len(ld) == 0 { ld = "."; }
+        if !fs_is_dir(ld) { continue; }
+        val names: Vec<str> = fs_list_dir(ld);
+        var i2: i64 = 0;
+        while i2 < names.len() {
+            val nm: str = names.get(i2);
+            i2 = i2 + 1;
+            if nm == "." || nm == ".." || str_len(nm) == 0 { continue; }
+            if str_starts_with(nm, ".") && !str_starts_with(base, ".") { continue; }
+            if cv_fnmatch(nm, base) { out.push(cv_join(dd, nm)); }
+        }
+    }
+    return out;
+}
+
+// ─── argparse ───
+
+struct CvOpt {
+    long: str,
+    short: str,
+    takes: bool,
+    kind: i64,
+}
+
+const CV_STR: i64 = 0;
+const CV_INT: i64 = 1;
+const CV_FLOAT: i64 = 2;
+const CV_FLAG: i64 = 3;
+const CV_HELP: i64 = 4;
+
+fn cv_opt(long: str, short: str, kind: i64) -> CvOpt {
+    return CvOpt { long: long, short: short, takes: kind == CV_STR || kind == CV_INT || kind == CV_FLOAT, kind: kind };
+}
+
+fn cv_usage() -> str {
+    var u: str = "usage: coverage.py [-h] [--fid FID] --map MAP [--modes MODES] [--tests TESTS]\n";
+    u = u + "                   [--out OUT] [-j J] [--limit LIMIT] [--report-only]\n";
+    u = u + "                   [--gen GEN] [--goal GOAL] [--goal-modules GOAL_MODULES]\n";
+    u = u + "                   [--goal-lines GOAL_LINES] [--sources SOURCES]\n";
+    u = u + "                   [--record RECORD] [--note NOTE] [--all-sources] [--fresh]\n";
+    return u;
+}
+
+fn cv_help() -> str {
+    var h: str = cv_usage() + "\noptions:\n";
+    h = h + "  -h, --help            show this help message and exit\n";
+    h = h + "  --fid FID             the counter compiler (not needed with --report-only)\n";
+    h = h + "  --map MAP\n";
+    h = h + "  --modes MODES\n";
+    h = h + "  --tests TESTS         glob, or a comma list of globs\n";
+    h = h + "  --out OUT\n";
+    h = h + "  -j J\n";
+    h = h + "  --limit LIMIT\n";
+    h = h + "  --report-only\n";
+    h = h + "  --gen GEN\n";
+    h = h + "  --goal GOAL\n";
+    h = h + "  --goal-modules GOAL_MODULES\n";
+    h = h + "                        comma list, or 'all': every module of the report (VF8:\n";
+    h = h + "                        90% each)\n";
+    h = h + "  --goal-lines GOAL_LINES\n";
+    h = h + "                        line coverage goal of the goal modules (needs line\n";
+    h = h + "                        counters in the map)\n";
+    h = h + "  --sources SOURCES     more .fd files whose functions the map may name (comma\n";
+    h = h + "                        list)\n";
+    h = h + "  --record RECORD       append the dated report to this .md file\n";
+    h = h + "  --note NOTE           the --record entry's heading (what was run)\n";
+    h = h + "  --all-sources         map C names to every compiler/*.fd, not only the\n";
+    h = h + "                        modules main.fd reaches\n";
+    h = h + "  --fresh               start from no coverage: ignore <out>/merged.cov (a\n";
+    h = h + "                        bitmap of an older counter compiler)\n";
+    return h;
+}
+
+/// ap.error(msg): the usage and the message on stderr, exit status 2.
+fn cv_ap_error(msg: str) -> i64 {
+    io_eprint(cv_usage());
+    io_eprintln("coverage.py: error: " + msg);
+    return 2;
+}
+
+/// argparse's look of a negative number: -\d+ or -\d*\.\d+
+fn cv_negnum(a: str) -> bool {
+    if str_len(a) < 2 || str_byte_at(a, 0) != 45 { return false; }
+    var i: i64 = 1;
+    var dig: i64 = 0;
+    while i < str_len(a) && cv_digit(str_byte_at(a, i)) {
+        i = i + 1;
+        dig = dig + 1;
+    }
+    if i == str_len(a) { return dig > 0; }
+    if str_byte_at(a, i) != 46 { return false; }
+    i = i + 1;
+    var frac: i64 = 0;
+    while i < str_len(a) && cv_digit(str_byte_at(a, i)) {
+        i = i + 1;
+        frac = frac + 1;
+    }
+    return i == str_len(a) && frac > 0;
+}
+
+/// int(s) as Python reads it (whitespace, a sign, ASCII digits).
+fn cv_is_int(s: str) -> bool {
+    val t: str = cv_strip(s);
+    var i: i64 = 0;
+    if i < str_len(t) && (str_byte_at(t, i) == 43 || str_byte_at(t, i) == 45) { i = i + 1; }
+    if i >= str_len(t) { return false; }
+    while i < str_len(t) {
+        if !cv_digit(str_byte_at(t, i)) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn cv_int(s: str) -> i64 {
+    val t: str = cv_strip(s);
+    if str_starts_with(t, "+") { return str_parse_int(str_slice(t, 1, str_len(t))); }
+    return str_parse_int(t);
+}
+
+/// float(s): a decimal with an optional exponent, inf, infinity or nan.
+fn cv_is_float(s: str) -> bool {
+    val t: str = str_to_lower(cv_strip(s));
+    var i: i64 = 0;
+    if i < str_len(t) && (str_byte_at(t, i) == 43 || str_byte_at(t, i) == 45) { i = i + 1; }
+    val rest: str = str_slice(t, i, str_len(t));
+    if rest == "inf" || rest == "infinity" || rest == "nan" { return true; }
+    var digs: i64 = 0;
+    while i < str_len(t) && cv_digit(str_byte_at(t, i)) {
+        i = i + 1;
+        digs = digs + 1;
+    }
+    if i < str_len(t) && str_byte_at(t, i) == 46 {
+        i = i + 1;
+        while i < str_len(t) && cv_digit(str_byte_at(t, i)) {
+            i = i + 1;
+            digs = digs + 1;
+        }
+    }
+    if digs == 0 { return false; }
+    if i < str_len(t) && str_byte_at(t, i) == 101 {
+        i = i + 1;
+        if i < str_len(t) && (str_byte_at(t, i) == 43 || str_byte_at(t, i) == 45) { i = i + 1; }
+        var ed: i64 = 0;
+        while i < str_len(t) && cv_digit(str_byte_at(t, i)) {
+            i = i + 1;
+            ed = ed + 1;
+        }
+        if ed == 0 { return false; }
+    }
+    return i == str_len(t);
+}
+
+fn cv_float(s: str) -> f64 {
+    val t: str = str_to_lower(cv_strip(s));
+    if str_contains(t, "inf") {
+        if str_starts_with(t, "-") { return 0.0 - 1.0e308 * 10.0; }
+        return 1.0e308 * 10.0;
+    }
+    if str_contains(t, "nan") {
+        val z: f64 = 0.0;
+        return z / z;
+    }
+    return str_parse_float(t);
+}
+
+/// The parsed command line: each option's value ("" when not given) and
+/// whether it was given; `code` >= 0 when the program is to exit with it.
+struct CvArgs {
+    vals: Vec<str>,
+    given: Vec<bool>,
+    code: i64,
+}
+
+/// -1 none, -2 ambiguous (msg set), else the option's index.
+fn cv_find_opt(opts: Vec<CvOpt>, a: str, msg: &mut str, explicit: &mut str, has_explicit: &mut bool) -> i64 {
+    *has_explicit = false;
+    *explicit = "";
+    var i: i64 = 0;
+    while i < opts.len() {
+        if opts.get(i).long == a || (str_len(opts.get(i).short) > 0 && opts.get(i).short == a) { return i; }
+        i = i + 1;
+    }
+    if str_len(a) < 2 || str_byte_at(a, 0) != 45 { return -1; }
+    val eq: i64 = str_find(a, "=");
+    if eq > 0 {
+        val name: str = str_slice(a, 0, eq);
+        i = 0;
+        while i < opts.len() {
+            if opts.get(i).long == name || (str_len(opts.get(i).short) > 0 && opts.get(i).short == name) {
+                *explicit = str_slice(a, eq + 1, str_len(a));
+                *has_explicit = true;
+                return i;
+            }
+            i = i + 1;
+        }
+    }
+    if str_starts_with(a, "--") {
+        var prefix: str = a;
+        if eq > 0 { prefix = str_slice(a, 0, eq); }
+        var hits: Vec<i64> = Vec::new();
+        i = 0;
+        while i < opts.len() {
+            if str_starts_with(opts.get(i).long, prefix) { hits.push(i); }
+            i = i + 1;
+        }
+        if hits.len() > 1 {
+            var names: str = "";
+            var k: i64 = 0;
+            while k < hits.len() {
+                if k > 0 { names = names + ", "; }
+                names = names + opts.get(hits.get(k)).long;
+                k = k + 1;
+            }
+            *msg = "ambiguous option: " + a + " could match " + names;
+            return -2;
+        }
+        if hits.len() == 1 {
+            if eq > 0 {
+                *explicit = str_slice(a, eq + 1, str_len(a));
+                *has_explicit = true;
+            }
+            return hits.get(0);
+        }
+        return -1;
+    }
+    // a short option with its value glued on (-j4)
+    val two: str = str_slice(a, 0, 2);
+    i = 0;
+    while i < opts.len() {
+        if str_len(opts.get(i).short) > 0 && opts.get(i).short == two {
+            *explicit = str_slice(a, 2, str_len(a));
+            *has_explicit = true;
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn cv_parse(argv: Vec<str>, opts: Vec<CvOpt>) -> CvArgs {
+    var vals: Vec<str> = Vec::new();
+    var given: Vec<bool> = Vec::new();
+    var i: i64 = 0;
+    while i < opts.len() {
+        vals.push("");
+        given.push(false);
+        i = i + 1;
+    }
+    // classify every argument first, as argparse does: O an option, A not
+    var kinds: Vec<i64> = Vec::new();
+    var idx: Vec<i64> = Vec::new();
+    var expl: Vec<str> = Vec::new();
+    var hexp: Vec<bool> = Vec::new();
+    var dashdash: bool = false;
+    i = 0;
+    while i < argv.len() {
+        val a: str = argv.get(i);
+        i = i + 1;
+        var msg: str = "";
+        var ex: str = "";
+        var he: bool = false;
+        if dashdash || a == "-" || !str_starts_with(a, "-") {
+            kinds.push(0);
+            idx.push(-1);
+            expl.push("");
+            hexp.push(false);
+            continue;
+        }
+        if a == "--" {
+            dashdash = true;
+            kinds.push(2);
+            idx.push(-1);
+            expl.push("");
+            hexp.push(false);
+            continue;
+        }
+        val f: i64 = cv_find_opt(opts, a, &mut msg, &mut ex, &mut he);
+        if f == -2 {
+            return CvArgs { vals: vals, given: given, code: cv_ap_error(msg) };
+        }
+        if f < 0 && (cv_negnum(a) || str_contains(a, " ")) {
+            kinds.push(0);
+        } else {
+            kinds.push(1);
+        }
+        idx.push(f);
+        expl.push(ex);
+        hexp.push(he);
+    }
+    var extras: Vec<str> = Vec::new();
+    i = 0;
+    while i < argv.len() {
+        val a2: str = argv.get(i);
+        val kd: i64 = kinds.get(i);
+        val f2: i64 = idx.get(i);
+        i = i + 1;
+        if kd == 2 { continue; }
+        if kd == 0 || f2 < 0 {
+            extras.push(a2);
+            continue;
+        }
+        val o: CvOpt = opts.get(f2);
+        var name: str = o.long;
+        if str_len(o.long) == 0 { name = o.short; } else if str_len(o.short) > 0 { name = o.short + "/" + o.long; }
+        if o.kind == CV_HELP {
+            io_print(cv_help());
+            return CvArgs { vals: vals, given: given, code: 0 };
+        }
+        if !o.takes {
+            if hexp.get(i - 1) {
+                return CvArgs { vals: vals, given: given, code: cv_ap_error("argument " + name + ": ignored explicit argument " + cv_repr(expl.get(i - 1))) };
+            }
+            given.set(f2, true);
+            vals.set(f2, "1");
+            continue;
+        }
+        var v: str = "";
+        if hexp.get(i - 1) {
+            v = expl.get(i - 1);
+        } else {
+            if i >= argv.len() || kinds.get(i) != 0 {
+                return CvArgs { vals: vals, given: given, code: cv_ap_error("argument " + name + ": expected one argument") };
+            }
+            v = argv.get(i);
+            i = i + 1;
+        }
+        if o.kind == CV_INT && !cv_is_int(v) {
+            return CvArgs { vals: vals, given: given, code: cv_ap_error("argument " + name + ": invalid int value: " + cv_repr(v)) };
+        }
+        if o.kind == CV_FLOAT && !cv_is_float(v) {
+            return CvArgs { vals: vals, given: given, code: cv_ap_error("argument " + name + ": invalid float value: " + cv_repr(v)) };
+        }
+        given.set(f2, true);
+        vals.set(f2, v);
+    }
+    // required --map (option 1), then what nobody took
+    if !given.get(1) {
+        return CvArgs { vals: vals, given: given, code: cv_ap_error("the following arguments are required: --map") };
+    }
+    if extras.len() > 0 {
+        var s: str = "";
+        var k: i64 = 0;
+        while k < extras.len() {
+            if k > 0 { s = s + " "; }
+            s = s + extras.get(k);
+            k = k + 1;
+        }
+        return CvArgs { vals: vals, given: given, code: cv_ap_error("unrecognized arguments: " + s) };
+    }
+    return CvArgs { vals: vals, given: given, code: -1 };
+}
+
+// ─── Sources: which module defines each C name ───
+
+/// An ordered map of names (insertion order kept, as Python's dict).
+struct CvNames {
+    keys: Vec<str>,
+    at: HashMap<str, i64>,
+}
+
+fn cv_names_new() -> CvNames {
+    return CvNames { keys: Vec::new(), at: HashMap::new() };
+}
+
+/// The index of `k`, -1 when absent.
+fn cv_names_get(m: &CvNames, k: str) -> i64 {
+    if m.at.contains(k) { return m.at.get(k); }
+    return -1;
+}
+
+/// The index of `k`, added when absent.
+fn cv_names_add(m: &mut CvNames, k: str) -> i64 {
+    if m.at.contains(k) { return m.at.get(k); }
+    val i: i64 = m.keys.len();
+    m.keys.push(k);
+    m.at.insert(k, i);
+    return i;
+}
+
+/// fn_re: ^\s*(?:pub\s+)?(?:async\s+|comptime\s+)?fn\s+([A-Za-z_]\w*) — the
+/// name, "" for no match.
+fn cv_fn_name(c: str) -> str {
+    val i: i64 = cv_skip_ws(c, 0);
+    if cv_at(c, i, "pub") && i + 3 < str_len(c) && cv_ws(str_byte_at(c, i + 3)) {
+        val r: str = cv_fn_rest(c, cv_skip_ws(c, i + 3));
+        if str_len(r) > 0 { return r; }
+    }
+    return cv_fn_rest(c, i);
+}
+
+fn cv_fn_rest(c: str, i: i64) -> str {
+    if cv_at(c, i, "async") && i + 5 < str_len(c) && cv_ws(str_byte_at(c, i + 5)) {
+        val r: str = cv_fn_kw(c, cv_skip_ws(c, i + 5));
+        if str_len(r) > 0 { return r; }
+    }
+    if cv_at(c, i, "comptime") && i + 8 < str_len(c) && cv_ws(str_byte_at(c, i + 8)) {
+        val r2: str = cv_fn_kw(c, cv_skip_ws(c, i + 8));
+        if str_len(r2) > 0 { return r2; }
+    }
+    return cv_fn_kw(c, i);
+}
+
+fn cv_fn_kw(c: str, i: i64) -> str {
+    if !cv_at(c, i, "fn") || i + 2 >= str_len(c) || !cv_ws(str_byte_at(c, i + 2)) { return ""; }
+    val j: i64 = cv_skip_ws(c, i + 2);
+    if j >= str_len(c) || !cv_alpha(str_byte_at(c, j)) { return ""; }
+    return str_slice(c, j, cv_word_end(c, j));
+}
+
+/// impl_re's second group (the type), "" for no match.
+fn cv_impl_name(c: str) -> str {
+    var i: i64 = cv_skip_ws(c, 0);
+    if !cv_at(c, i, "impl") { return ""; }
+    i = cv_skip_ws(c, i + 4);
+    if i < str_len(c) && str_byte_at(c, i) == 60 {
+        var k: i64 = i + 1;
+        while k < str_len(c) && str_byte_at(c, k) != 62 { k = k + 1; }
+        if k < str_len(c) { i = cv_skip_ws(c, k + 1); }
+    }
+    // (?:(\w+)\s+for\s+)?
+    if i < str_len(c) && cv_alpha(str_byte_at(c, i)) {
+        val e: i64 = cv_word_end(c, i);
+        if e < str_len(c) && cv_ws(str_byte_at(c, e)) {
+            val q: i64 = cv_skip_ws(c, e);
+            if cv_at(c, q, "for") && q + 3 < str_len(c) && cv_ws(str_byte_at(c, q + 3)) {
+                val r: i64 = cv_skip_ws(c, q + 3);
+                if r < str_len(c) && cv_alpha(str_byte_at(c, r)) {
+                    return str_slice(c, r, cv_word_end(c, r));
+                }
+            }
+        }
+    }
+    if i < str_len(c) && cv_alpha(str_byte_at(c, i)) { return str_slice(c, i, cv_word_end(c, i)); }
+    return "";
+}
+
+/// ITEM_RE at column 0: (?:pub\s+)?(?:async\s+|comptime\s+)?(fn|impl|...)\b
+fn cv_is_item(c: str) -> bool {
+    if cv_at(c, 0, "pub") && 3 < str_len(c) && cv_ws(str_byte_at(c, 3)) {
+        if cv_item_rest(c, cv_skip_ws(c, 3)) { return true; }
+    }
+    return cv_item_rest(c, 0);
+}
+
+fn cv_item_rest(c: str, i: i64) -> bool {
+    if cv_at(c, i, "async") && i + 5 < str_len(c) && cv_ws(str_byte_at(c, i + 5)) {
+        if cv_item_kw(c, cv_skip_ws(c, i + 5)) { return true; }
+    }
+    if cv_at(c, i, "comptime") && i + 8 < str_len(c) && cv_ws(str_byte_at(c, i + 8)) {
+        if cv_item_kw(c, cv_skip_ws(c, i + 8)) { return true; }
+    }
+    return cv_item_kw(c, i);
+}
+
+fn cv_item_kw(c: str, i: i64) -> bool {
+    var kws: Vec<str> = Vec::new();
+    kws.push("fn");
+    kws.push("impl");
+    kws.push("struct");
+    kws.push("enum");
+    kws.push("const");
+    kws.push("trait");
+    kws.push("type");
+    kws.push("extern");
+    kws.push("import");
+    kws.push("use");
+    var k: i64 = 0;
+    while k < kws.len() {
+        val w: str = kws.get(k);
+        k = k + 1;
+        if cv_at(c, i, w) {
+            val e: i64 = i + str_len(w);
+            if e >= str_len(c) || !cv_word(str_byte_at(c, e)) { return true; }
+        }
+    }
+    return false;
+}
+
+/// line[0].isspace() of the line a file gives (content without its "\n":
+/// an empty content is the "\n" itself).
+fn cv_first_space(c: str) -> bool {
+    return str_len(c) == 0 || cv_ws(str_byte_at(c, 0));
+}
+
+/// The module name of a source path: relpath, "/" separators.
+fn cv_mod_name(p: str) -> str {
+    return cv_slashes(cv_relpath(p));
+}
+
+/// fd_functions: each function's C name -> its module.
+struct CvOwner {
+    names: CvNames,
+    mods: Vec<i64>,
+    modnames: CvNames,
+}
+
+fn cv_fd_functions(paths: Vec<str>) -> CvOwner {
+    var o: CvOwner = CvOwner { names: cv_names_new(), mods: Vec::new(), modnames: cv_names_new() };
+    var pi: i64 = 0;
+    while pi < paths.len() {
+        val p: str = paths.get(pi);
+        pi = pi + 1;
+        val mi: i64 = cv_names_add(&mut o.modnames, cv_mod_name(p));
+        var text: str = "";
+        match cv_read_text(p) {
+            Option::Some(t) => { text = t; }
+            Option::None => {
+                io_eprintln("FileNotFoundError: [Errno 2] No such file or directory: " + cv_repr(p));
+                process_exit(1);
+            }
+        }
+        val lines: Vec<str> = cv_lines(text);
+        var impl: str = "";
+        var k: i64 = 0;
+        while k < lines.len() {
+            val line: str = lines.get(k);
+            k = k + 1;
+            val im: str = cv_impl_name(line);
+            if str_len(im) > 0 && !cv_first_space(line) {
+                impl = im;
+                continue;
+            }
+            val name: str = cv_fn_name(line);
+            if str_len(name) == 0 { continue; }
+            if !cv_first_space(line) { cv_owner_set(&mut o, name, mi); }
+            if str_len(impl) > 0 && (cv_first_space(line) || str_contains(line, "(self")) {
+                cv_owner_set(&mut o, impl + "_" + name, mi);
+            }
+        }
+    }
+    return o;
+}
+
+fn cv_owner_set(o: &mut CvOwner, name: str, mi: i64) {
+    if cv_names_get(&o.names, name) >= 0 { return; }
+    cv_names_add(&mut o.names, name);
+    o.mods.push(mi);
+}
+
+/// fd_line_counts: {C name: (module, lines)} in insertion order.
+struct CvLines {
+    names: CvNames,
+    mods: Vec<i64>,
+    n: Vec<i64>,
+    modnames: CvNames,
+}
+
+fn cv_lines_set(lo: &mut CvLines, name: str, mi: i64, n: i64) {
+    if cv_names_get(&lo.names, name) >= 0 { return; }
+    cv_names_add(&mut lo.names, name);
+    lo.mods.push(mi);
+    lo.n.push(n);
+}
+
+fn cv_fd_line_counts(paths: Vec<str>) -> CvLines {
+    var lo: CvLines = CvLines { names: cv_names_new(), mods: Vec::new(), n: Vec::new(), modnames: cv_names_new() };
+    var pi: i64 = 0;
+    while pi < paths.len() {
+        val p: str = paths.get(pi);
+        pi = pi + 1;
+        val mi: i64 = cv_names_add(&mut lo.modnames, cv_mod_name(p));
+        var text: str = "";
+        match cv_read_text(p) {
+            Option::Some(t) => { text = t; }
+            Option::None => { }
+        }
+        val lines: Vec<str> = cv_lines(text);
+        var impl: str = "";
+        var cur: Vec<str> = Vec::new();
+        var have: bool = false;
+        var n: i64 = 0;
+        var k: i64 = 0;
+        while k < lines.len() {
+            val line: str = lines.get(k);
+            k = k + 1;
+            val s: str = cv_strip(line);
+            val im: str = cv_impl_name(line);
+            if str_len(im) > 0 && !cv_first_space(line) {
+                if have { cv_close(&mut lo, cur, mi, n); }
+                have = false;
+                n = 0;
+                impl = im;
+                continue;
+            }
+            val name: str = cv_fn_name(line);
+            if str_len(name) > 0 {
+                if have { cv_close(&mut lo, cur, mi, n); }
+                cur = Vec::new();
+                have = true;
+                if !cv_first_space(line) { cur.push(name); }
+                if str_len(impl) > 0 && (cv_first_space(line) || str_contains(line, "(self")) {
+                    cur.push(impl + "_" + name);
+                }
+                n = 1;
+                continue;
+            }
+            if (!cv_first_space(line) && (cv_is_item(line) || str_starts_with(line, "@") || str_starts_with(line, "var ")
+                    || str_starts_with(line, "val ") || str_starts_with(line, "pub var ") || str_starts_with(line, "pub val ")))
+                    || str_starts_with(s, "///") {
+                if have { cv_close(&mut lo, cur, mi, n); }
+                have = false;
+                n = 0;
+                continue;
+            }
+            if have && str_len(s) > 0 && !str_starts_with(s, "//") && str_len(cv_strip_chars(s, "{}; ")) > 0 {
+                n = n + 1;
+            }
+        }
+        if have { cv_close(&mut lo, cur, mi, n); }
+    }
+    return lo;
+}
+
+fn cv_close(lo: &mut CvLines, cur: Vec<str>, mi: i64, n: i64) {
+    var i: i64 = 0;
+    while i < cur.len() {
+        cv_lines_set(lo, cur.get(i), mi, n);
+        i = i + 1;
+    }
+}
+
+/// The text without string literals and // comments.
+fn cv_strip_comments_strings(text: str) -> str {
+    var sb: StringBuilder = StringBuilder::new();
+    val n: i64 = str_len(text);
+    var i: i64 = 0;
+    var from: i64 = 0;
+    while i < n {
+        if str_byte_at(text, i) != 34 {
+            i = i + 1;
+            continue;
+        }
+        // "(?:\\.|[^"\\\n])*"
+        var j: i64 = i + 1;
+        var end: i64 = -1;
+        while j < n {
+            val c: i64 = str_byte_at(text, j);
+            if c == 34 {
+                end = j + 1;
+                break;
+            }
+            if c == 92 {
+                if j + 1 < n && str_byte_at(text, j + 1) != 10 {
+                    j = j + 2;
+                    continue;
+                }
+                break;
+            }
+            if c == 10 { break; }
+            j = j + 1;
+        }
+        if end < 0 {
+            i = i + 1;
+            continue;
+        }
+        sb.append_str(str_slice(text, from, i));
+        sb.append_str("\"\"");
+        i = end;
+        from = end;
+    }
+    sb.append_str(str_slice(text, from, n));
+    val t: str = sb.to_str();
+    // //[^\n]*
+    var sb2: StringBuilder = StringBuilder::new();
+    i = 0;
+    from = 0;
+    val m: i64 = str_len(t);
+    while i + 1 < m {
+        if str_byte_at(t, i) == 47 && str_byte_at(t, i + 1) == 47 {
+            sb2.append_str(str_slice(t, from, i));
+            var e: i64 = i;
+            while e < m && str_byte_at(t, e) != 10 { e = e + 1; }
+            i = e;
+            from = e;
+        } else {
+            i = i + 1;
+        }
+    }
+    sb2.append_str(str_slice(t, from, m));
+    return sb2.to_str();
+}
+
+/// The `use` paths of text (USE_RE).
+fn cv_uses(text: str) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    val n: i64 = str_len(text);
+    var i: i64 = 0;
+    while i + 3 <= n {
+        if !cv_at(text, i, "use") || (i > 0 && cv_word(str_byte_at(text, i - 1))) {
+            i = i + 1;
+            continue;
+        }
+        var j: i64 = i + 3;
+        if j >= n || !cv_ws(str_byte_at(text, j)) {
+            i = i + 1;
+            continue;
+        }
+        j = cv_skip_ws(text, j);
+        if j >= n || !cv_alpha(str_byte_at(text, j)) {
+            i = i + 1;
+            continue;
+        }
+        var e: i64 = cv_word_end(text, j);
+        while cv_at(text, e, "::") && e + 2 < n && cv_alpha(str_byte_at(text, e + 2)) {
+            e = cv_word_end(text, e + 2);
+        }
+        val after: i64 = cv_skip_ws(text, e);
+        if after < n && str_byte_at(text, after) == 59 {
+            out.push(str_slice(text, j, e));
+            i = after + 1;
+        } else {
+            i = i + 1;
+        }
+    }
+    return out;
+}
+
+/// reached_sources: the .fd files compiler/main.fd reaches through `use`,
+/// compiler modules first, then the other stdlib ones, then core. `base`
+/// is the directory the paths are relative to ("" for ours).
+fn cv_reached_sources(base: str) -> Vec<str> {
+    var seen: Vec<str> = Vec::new();
+    var seen_at: HashMap<str, i64> = HashMap::new();
+    var todo: Vec<str> = Vec::new();
+    todo.push("compiler/main.fd");
+    while todo.len() > 0 {
+        val p: str = todo.get(todo.len() - 1);
+        todo.remove(todo.len() - 1);
+        if seen_at.contains(p) { continue; }
+        val full: str = cv_join(base, p);
+        if !fs_exists(full) { continue; }
+        seen_at.insert(p, 1);
+        seen.push(p);
+        var text: str = "";
+        match cv_read_text(full) {
+            Option::Some(t) => { text = t; }
+            Option::None => { }
+        }
+        val uses: Vec<str> = cv_uses(cv_strip_comments_strings(text));
+        var k: i64 = 0;
+        while k < uses.len() {
+            val parts: Vec<str> = cv_split(uses.get(k), "::");
+            k = k + 1;
+            if parts.get(0) == "compiler" && parts.len() == 2 {
+                todo.push("compiler/" + parts.get(1) + ".fd");
+            } else if parts.len() == 1 {
+                todo.push("stdlib/" + parts.get(0) + ".fd");
+            }
+        }
+    }
+    var comp: Vec<str> = Vec::new();
+    var std: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < seen.len() {
+        val s: str = seen.get(i);
+        i = i + 1;
+        if str_starts_with(s, "compiler/") {
+            comp.push(s);
+        } else if str_starts_with(s, "stdlib/") && s != "stdlib/core.fd" {
+            std.push(s);
+        }
+    }
+    cv_sort(&mut comp);
+    cv_sort(&mut std);
+    i = 0;
+    while i < std.len() {
+        comp.push(std.get(i));
+        i = i + 1;
+    }
+    comp.push("stdlib/core.fd");
+    return comp;
+}
+
+// ─── The counter map and the figures ───
+
+struct CvMap {
+    ids: Vec<i64>,
+    fns: Vec<str>,
+    kinds: Vec<str>,
+}
+
+/// A name's index in `names`, or that of the name with its last _suffixes
+/// cut (monomorphised copies: Name_T, Name_T_U), or -1.
+fn cv_strip_lookup(names: &CvNames, fname: str) -> i64 {
+    var k: i64 = cv_names_get(names, fname);
+    if k >= 0 { return k; }
+    var base: str = fname;
+    while str_contains(base, "_") {
+        base = str_slice(base, 0, str_rfind(base, "_"));
+        k = cv_names_get(names, base);
+        if k >= 0 { return k; }
+    }
+    return -1;
+}
+
+/// For each entry: its module (index into owner.modnames, -1 unmapped) and
+/// its source function (index into lines_of, -1 none); computed once.
+struct CvIndex {
+    mod_of: Vec<i64>,
+    src_of: Vec<i64>,
+}
+
+fn cv_index(mp: &CvMap, owner: &CvOwner, lo: &CvLines) -> CvIndex {
+    var mo: Vec<i64> = Vec::new();
+    var so: Vec<i64> = Vec::new();
+    var last: str = "";
+    var lm: i64 = -1;
+    var ls: i64 = -1;
+    var have: bool = false;
+    var i: i64 = 0;
+    while i < mp.fns.len() {
+        val f: str = mp.fns.get(i);
+        if !have || f != last {
+            val o: i64 = cv_strip_lookup(&owner.names, f);
+            lm = -1;
+            if o >= 0 { lm = owner.mods.get(o); }
+            ls = cv_strip_lookup(&lo.names, f);
+            last = f;
+            have = true;
+        }
+        mo.push(lm);
+        so.push(ls);
+        i = i + 1;
+    }
+    return CvIndex { mod_of: mo, src_of: so };
+}
+
+fn cv_hit(acc: Vec<i64>, i: i64) -> i64 {
+    if (i >> 3) >= acc.len() { return 0; }
+    return (acc.get(i >> 3) >> (i & 7)) & 1;
+}
+
+fn cv_is_line_kind(k: str) -> bool {
+    return str_starts_with(k, "L");
+}
+
+fn cv_has_line_counters(mp: &CvMap) -> bool {
+    var i: i64 = 0;
+    while i < mp.kinds.len() {
+        if cv_is_line_kind(mp.kinds.get(i)) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// line_report: per module of lines_of (index into lo.modnames): source
+/// lines, lines of functions entered, block-weighted lines.
+struct CvLineRep {
+    n: Vec<i64>,
+    r: Vec<i64>,
+    w: Vec<f64>,
+}
+
+fn cv_line_report(acc: Vec<i64>, mp: &CvMap, ix: &CvIndex, lo: &CvLines) -> CvLineRep {
+    // per C function (first-seen order): source function, blocks, hits, entered
+    var per: CvNames = cv_names_new();
+    var p_src: Vec<i64> = Vec::new();
+    var p_b: Vec<i64> = Vec::new();
+    var p_h: Vec<i64> = Vec::new();
+    var p_e: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < mp.ids.len() {
+        val blk: str = mp.kinds.get(i);
+        val k: i64 = ix.src_of.get(i);
+        if cv_is_line_kind(blk) || k < 0 {
+            i = i + 1;
+            continue;
+        }
+        val fname: str = mp.fns.get(i);
+        var t: i64 = cv_names_get(&per, fname);
+        if t < 0 {
+            t = cv_names_add(&mut per, fname);
+            p_src.push(k);
+            p_b.push(0);
+            p_h.push(0);
+            p_e.push(0);
+        }
+        val h: i64 = cv_hit(acc, mp.ids.get(i));
+        p_b.set(t, p_b.get(t) + 1);
+        p_h.set(t, p_h.get(t) + h);
+        if blk == "entry" { p_e.set(t, h); }
+        i = i + 1;
+    }
+    // best over the copies of each source function
+    var be: Vec<i64> = Vec::new();
+    var br: Vec<f64> = Vec::new();
+    i = 0;
+    while i < lo.names.keys.len() {
+        be.push(0);
+        br.push(0.0);
+        i = i + 1;
+    }
+    i = 0;
+    while i < per.keys.len() {
+        val k2: i64 = p_src.get(i);
+        if p_e.get(i) > be.get(k2) { be.set(k2, p_e.get(i)); }
+        val ratio: f64 = cv_ratio(p_h.get(i), cv_max1(p_b.get(i)));
+        if ratio > br.get(k2) { br.set(k2, ratio); }
+        i = i + 1;
+    }
+    var rep: CvLineRep = CvLineRep { n: Vec::new(), r: Vec::new(), w: Vec::new() };
+    i = 0;
+    while i < lo.modnames.keys.len() {
+        rep.n.push(-1);
+        rep.r.push(0);
+        rep.w.push(0.0);
+        i = i + 1;
+    }
+    i = 0;
+    while i < lo.names.keys.len() {
+        val m: i64 = lo.mods.get(i);
+        val n: i64 = lo.n.get(i);
+        if rep.n.get(m) < 0 { rep.n.set(m, 0); }
+        rep.n.set(m, rep.n.get(m) + n);
+        rep.r.set(m, rep.r.get(m) + n * be.get(i));
+        rep.w.set(m, rep.w.get(m) + (n as f64) * br.get(i));
+        i = i + 1;
+    }
+    return rep;
+}
+
+/// real_lines: per module with a function in the C (index into
+/// owner.modnames): lines reached, lines with a counter, lines with no C,
+/// and (unc_mod, unc_ln) the lines no counter of reached. `present` false
+/// when the map has no line counters.
+struct CvRealLines {
+    present: bool,
+    in_c: Vec<bool>,
+    reached: Vec<i64>,
+    counted: Vec<i64>,
+    absent: Vec<i64>,
+    unc_mod: Vec<i64>,
+    unc_ln: Vec<i64>,
+}
+
+fn cv_rl_empty() -> CvRealLines {
+    return CvRealLines { present: false, in_c: Vec::new(), reached: Vec::new(), counted: Vec::new(), absent: Vec::new(), unc_mod: Vec::new(), unc_ln: Vec::new() };
+}
+
+fn cv_real_lines(acc: Vec<i64>, mp: &CvMap, ix: &CvIndex, owner: &CvOwner, lo: &CvLines) -> CvRealLines {
+    var rl: CvRealLines = cv_rl_empty();
+    if !cv_has_line_counters(mp) { return rl; }
+    rl.present = true;
+    val nm: i64 = owner.modnames.keys.len();
+    var i: i64 = 0;
+    while i < nm {
+        rl.in_c.push(false);
+        rl.reached.push(0);
+        rl.counted.push(0);
+        rl.absent.push(0);
+        i = i + 1;
+    }
+    // (module, line) -> reached, flat
+    var at: HashMap<str, i64> = HashMap::new();
+    var fl_mod: Vec<i64> = Vec::new();
+    var fl_ln: Vec<i64> = Vec::new();
+    var fl_hit: Vec<i64> = Vec::new();
+    var present: Vec<bool> = Vec::new();
+    i = 0;
+    while i < lo.names.keys.len() {
+        present.push(false);
+        i = i + 1;
+    }
+    i = 0;
+    while i < mp.ids.len() {
+        val s: i64 = ix.src_of.get(i);
+        if s >= 0 { present.set(s, true); }
+        val m: i64 = ix.mod_of.get(i);
+        val kind: str = mp.kinds.get(i);
+        if m >= 0 {
+            rl.in_c.set(m, true);
+            if cv_is_line_kind(kind) {
+                val ln: i64 = str_parse_int(str_slice(kind, 1, str_len(kind)));
+                val key: str = int_to_str(m) + ":" + int_to_str(ln);
+                val h: i64 = cv_hit(acc, mp.ids.get(i));
+                if at.contains(key) {
+                    val k: i64 = at.get(key);
+                    fl_hit.set(k, fl_hit.get(k) | h);
+                } else {
+                    at.insert(key, fl_mod.len());
+                    fl_mod.push(m);
+                    fl_ln.push(ln);
+                    fl_hit.push(h);
+                }
+            }
+        }
+        i = i + 1;
+    }
+    // lines of functions with no C, by module name (lines_of's modules
+    // are named as the owner's: both are relpaths of the same sources)
+    i = 0;
+    while i < lo.names.keys.len() {
+        if !present.get(i) {
+            val mname: str = lo.modnames.keys.get(lo.mods.get(i));
+            val om: i64 = cv_names_get(&owner.modnames, mname);
+            if om >= 0 { rl.absent.set(om, rl.absent.get(om) + lo.n.get(i)); }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < fl_mod.len() {
+        val m2: i64 = fl_mod.get(i);
+        rl.counted.set(m2, rl.counted.get(m2) + 1);
+        rl.reached.set(m2, rl.reached.get(m2) + fl_hit.get(i));
+        if fl_hit.get(i) == 0 {
+            rl.unc_mod.push(m2);
+            rl.unc_ln.push(fl_ln.get(i));
+        }
+        i = i + 1;
+    }
+    return rl;
+}
+
+/// The sorted line numbers of module m no counter reached.
+fn cv_uncovered_of(rl: &CvRealLines, m: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < rl.unc_mod.len() {
+        if rl.unc_mod.get(i) == m { out.push(rl.unc_ln.get(i)); }
+        i = i + 1;
+    }
+    cv_sort_ints(&mut out);
+    return out;
+}
+
+/// Module indexes (into owner.modnames) of the in-C modules, sorted by name.
+fn cv_sorted_mods(owner: &CvOwner, keep: Vec<bool>) -> Vec<i64> {
+    var names: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < keep.len() {
+        if keep.get(i) { names.push(owner.modnames.keys.get(i)); }
+        i = i + 1;
+    }
+    cv_sort(&mut names);
+    var out: Vec<i64> = Vec::new();
+    i = 0;
+    while i < names.len() {
+        out.push(cv_names_get(&owner.modnames, names.get(i)));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// below_goal: (module, pct, hit, blocks) of the listed modules under goal.
+struct CvLow {
+    mods: Vec<str>,
+    pct: Vec<f64>,
+    h: Vec<i64>,
+    b: Vec<i64>,
+}
+
+fn cv_below_goal(acc: Vec<i64>, mp: &CvMap, ix: &CvIndex, owner: &CvOwner, goal: f64, modules: Vec<str>) -> CvLow {
+    val nm: i64 = owner.modnames.keys.len();
+    var tb: Vec<i64> = Vec::new();
+    var th: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < nm {
+        tb.push(0);
+        th.push(0);
+        i = i + 1;
+    }
+    var want: Vec<bool> = Vec::new();
+    i = 0;
+    while i < nm {
+        want.push(cv_has(modules, owner.modnames.keys.get(i)));
+        i = i + 1;
+    }
+    i = 0;
+    while i < mp.ids.len() {
+        val m: i64 = ix.mod_of.get(i);
+        if !cv_is_line_kind(mp.kinds.get(i)) && m >= 0 && want.get(m) {
+            tb.set(m, tb.get(m) + 1);
+            th.set(m, th.get(m) + cv_hit(acc, mp.ids.get(i)));
+        }
+        i = i + 1;
+    }
+    var low: CvLow = CvLow { mods: Vec::new(), pct: Vec::new(), h: Vec::new(), b: Vec::new() };
+    i = 0;
+    while i < modules.len() {
+        val mn: str = modules.get(i);
+        i = i + 1;
+        val m2: i64 = cv_names_get(&owner.modnames, mn);
+        var b: i64 = 0;
+        var h: i64 = 0;
+        if m2 >= 0 {
+            b = tb.get(m2);
+            h = th.get(m2);
+        }
+        val pct: f64 = 100.0 * (h as f64) / (cv_max1(b) as f64);
+        if pct < goal {
+            low.mods.push(mn);
+            low.pct.push(pct);
+            low.h.push(h);
+            low.b.push(b);
+        }
+    }
+    return low;
+}
+
+fn cv_below_goal_lines(rl: &CvRealLines, owner: &CvOwner, goal: f64, modules: Vec<str>) -> CvLow {
+    var low: CvLow = CvLow { mods: Vec::new(), pct: Vec::new(), h: Vec::new(), b: Vec::new() };
+    var i: i64 = 0;
+    while i < modules.len() {
+        val mn: str = modules.get(i);
+        i = i + 1;
+        val m: i64 = cv_names_get(&owner.modnames, mn);
+        var h: i64 = 0;
+        var n: i64 = 0;
+        var ab: i64 = 0;
+        if m >= 0 && rl.in_c.get(m) {
+            h = rl.reached.get(m);
+            n = rl.counted.get(m);
+            ab = rl.absent.get(m);
+        }
+        val pct: f64 = 100.0 * (h as f64) / (cv_max1(n + ab) as f64);
+        if pct < goal {
+            low.mods.push(mn);
+            low.pct.push(pct);
+            low.h.push(h);
+            low.b.push(n + ab);
+        }
+    }
+    return low;
+}
+
+/// report(): the text, and report.txt, never-called.txt,
+/// uncovered-lines.txt in `out`.
+fn cv_report(acc: Vec<i64>, mp: &CvMap, ix: &CvIndex, owner: &CvOwner, lo: &CvLines, out: str) -> str {
+    val nm: i64 = owner.modnames.keys.len();
+    var blocks: Vec<i64> = Vec::new();
+    var bhit: Vec<i64> = Vec::new();
+    var fns: Vec<i64> = Vec::new();
+    var fhit: Vec<i64> = Vec::new();
+    var missed: Vec<Vec<str>> = Vec::new();
+    var used: Vec<bool> = Vec::new();
+    var i: i64 = 0;
+    while i < nm {
+        blocks.push(0);
+        bhit.push(0);
+        fns.push(0);
+        fhit.push(0);
+        missed.push(Vec::new());
+        used.push(false);
+        i = i + 1;
+    }
+    var u_seen: bool = false;
+    var u_fns: i64 = 0;
+    i = 0;
+    while i < mp.ids.len() {
+        val blk: str = mp.kinds.get(i);
+        if cv_is_line_kind(blk) {
+            i = i + 1;
+            continue;
+        }
+        val m: i64 = ix.mod_of.get(i);
+        val h: i64 = cv_hit(acc, mp.ids.get(i));
+        if m < 0 {
+            u_seen = true;
+            if blk == "entry" { u_fns = u_fns + 1; }
+            i = i + 1;
+            continue;
+        }
+        used.set(m, true);
+        blocks.set(m, blocks.get(m) + 1);
+        bhit.set(m, bhit.get(m) + h);
+        if blk == "entry" {
+            fns.set(m, fns.get(m) + 1);
+            fhit.set(m, fhit.get(m) + h);
+            if h == 0 {
+                var ms: Vec<str> = missed.get(m);
+                ms.push(mp.fns.get(i));
+                missed.set(m, ms);
+            }
+        }
+        i = i + 1;
+    }
+    val order: Vec<i64> = cv_sorted_mods(owner, used);
+    var lines: Vec<str> = Vec::new();
+    lines.push(cv_ljust("module", 34) + " " + cv_rjust("blocks", 15) + " " + cv_rjust("functions", 15));
+    var tb: i64 = 0;
+    var th: i64 = 0;
+    var tf: i64 = 0;
+    var tfh: i64 = 0;
+    i = 0;
+    while i < order.len() {
+        val m2: i64 = order.get(i);
+        i = i + 1;
+        val name: str = owner.modnames.keys.get(m2);
+        if str_starts_with(name, "(") { continue; }
+        tb = tb + blocks.get(m2);
+        th = th + bhit.get(m2);
+        tf = tf + fns.get(m2);
+        tfh = tfh + fhit.get(m2);
+        lines.push(cv_ljust(name, 34) + " " + cv_i(bhit.get(m2), 6) + "/" + cv_il(blocks.get(m2), 6) + " "
+            + cv_f(cv_ratio(100 * bhit.get(m2), cv_max1(blocks.get(m2))), 5, 1) + "%"
+            + " " + cv_i(fhit.get(m2), 5) + "/" + cv_il(fns.get(m2), 5) + " "
+            + cv_f(cv_ratio(100 * fhit.get(m2), cv_max1(fns.get(m2))), 5, 1) + "%");
+    }
+    lines.push(cv_ljust("TOTAL (compiler/*.fd + core)", 34) + " " + cv_i(th, 6) + "/" + cv_il(tb, 6) + " "
+        + cv_f(cv_ratio(100 * th, cv_max1(tb)), 5, 1) + "%" + " " + cv_i(tfh, 5) + "/" + cv_il(tf, 5) + " "
+        + cv_f(cv_ratio(100 * tfh, cv_max1(tf)), 5, 1) + "%");
+    if u_seen {
+        lines.push("(not counted: " + int_to_str(u_fns) + " C functions with no .fd source: the C runtime, generated helpers)");
+    }
+    val have_lines: bool = lo.names.keys.len() > 0;
+    var rl: CvRealLines = cv_rl_empty();
+    if have_lines { rl = cv_real_lines(acc, mp, ix, owner, lo); }
+    if rl.present {
+        lines.push("");
+        lines.push("Lines (VF8: the statement lines the C marks, each with a counter; 'no C' =");
+        lines.push("source lines of functions never lowered, counted as not run)");
+        lines.push(cv_ljust("module", 34) + " " + cv_rjust("reached", 15) + " " + cv_rjust("with counter", 12) + " " + cv_rjust("no C", 7));
+        val lorder: Vec<i64> = cv_sorted_mods(owner, rl.in_c);
+        var ta: i64 = 0;
+        var tn: i64 = 0;
+        var tab: i64 = 0;
+        var unc: StringBuilder = StringBuilder::new();
+        i = 0;
+        while i < lorder.len() {
+            val m3: i64 = lorder.get(i);
+            i = i + 1;
+            val h3: i64 = rl.reached.get(m3);
+            val n3: i64 = rl.counted.get(m3);
+            val ab3: i64 = rl.absent.get(m3);
+            ta = ta + h3;
+            tn = tn + n3;
+            tab = tab + ab3;
+            lines.push(cv_ljust(owner.modnames.keys.get(m3), 34) + " " + cv_i(h3, 7) + "/" + cv_il(n3 + ab3, 7) + " "
+                + cv_f(cv_ratio(100 * h3, cv_max1(n3 + ab3)), 5, 1) + "% " + cv_i(n3, 6) + " " + cv_i(ab3, 7));
+            val ul: Vec<i64> = cv_uncovered_of(&rl, m3);
+            var k: i64 = 0;
+            while k < ul.len() {
+                unc.append_str(owner.modnames.keys.get(m3) + ":" + int_to_str(ul.get(k)) + "\n");
+                k = k + 1;
+            }
+        }
+        lines.push(cv_ljust("TOTAL", 34) + " " + cv_i(ta, 7) + "/" + cv_il(tn + tab, 7) + " "
+            + cv_f(cv_ratio(100 * ta, cv_max1(tn + tab)), 5, 1) + "% " + cv_i(tn, 6) + " " + cv_i(tab, 7));
+        fs_write_text(cv_join(out, "uncovered-lines.txt"), unc.to_str());
+    } else if have_lines {
+        val lm: CvLineRep = cv_line_report(acc, mp, ix, lo);
+        lines.push("");
+        lines.push("Lines (the C has no line table: 'reached' = the line's function was entered,");
+        lines.push("an upper bound; 'weighted' = its lines x the share of its blocks that ran)");
+        lines.push(cv_ljust("module", 34) + " " + cv_rjust("lines", 7) + " " + cv_rjust("reached", 15) + " " + cv_rjust("weighted", 15));
+        var keep: Vec<bool> = Vec::new();
+        i = 0;
+        while i < lm.n.len() {
+            keep.push(lm.n.get(i) >= 0);
+            i = i + 1;
+        }
+        var lnames: Vec<str> = Vec::new();
+        i = 0;
+        while i < keep.len() {
+            if keep.get(i) { lnames.push(lo.modnames.keys.get(i)); }
+            i = i + 1;
+        }
+        cv_sort(&mut lnames);
+        var ta2: i64 = 0;
+        var tr2: i64 = 0;
+        var tw2: f64 = 0.0;
+        i = 0;
+        while i < lnames.len() {
+            val m4: i64 = cv_names_get(&lo.modnames, lnames.get(i));
+            i = i + 1;
+            val n4: i64 = lm.n.get(m4);
+            val r4: i64 = lm.r.get(m4);
+            val w4: f64 = lm.w.get(m4);
+            ta2 = ta2 + n4;
+            tr2 = tr2 + r4;
+            tw2 = tw2 + w4;
+            lines.push(cv_ljust(lo.modnames.keys.get(m4), 34) + " " + cv_i(n4, 7) + " " + cv_i(r4, 7) + " "
+                + cv_f(cv_ratio(100 * r4, cv_max1(n4)), 5, 1) + "% " + cv_i(w4 as i64, 7) + " "
+                + cv_f(100.0 * w4 / (cv_max1(n4) as f64), 5, 1) + "%");
+        }
+        lines.push(cv_ljust("TOTAL", 34) + " " + cv_i(ta2, 7) + " " + cv_i(tr2, 7) + " "
+            + cv_f(cv_ratio(100 * tr2, cv_max1(ta2)), 5, 1) + "% " + cv_i(tw2 as i64, 7) + " "
+            + cv_f(100.0 * tw2 / (cv_max1(ta2) as f64), 5, 1) + "%");
+    }
+    var sb: StringBuilder = StringBuilder::new();
+    i = 0;
+    while i < lines.len() {
+        sb.append_str(lines.get(i));
+        sb.append_str("\n");
+        i = i + 1;
+    }
+    val text: str = sb.to_str();
+    fs_write_text(cv_join(out, "report.txt"), text);
+    var nc: StringBuilder = StringBuilder::new();
+    i = 0;
+    while i < order.len() {
+        val m5: i64 = order.get(i);
+        i = i + 1;
+        val name5: str = owner.modnames.keys.get(m5);
+        if str_starts_with(name5, "(") { continue; }
+        val ms5: Vec<str> = missed.get(m5);
+        var k5: i64 = 0;
+        while k5 < ms5.len() {
+            nc.append_str(name5 + " " + ms5.get(k5) + "\n");
+            k5 = k5 + 1;
+        }
+    }
+    fs_write_text(cv_join(out, "never-called.txt"), nc.to_str());
+    return text;
+}
+
+// ─── Running the tests ───
+
+var cv_map_err: str = "";
+
+fn cv_load_map(path: str, ok: &mut bool) -> CvMap {
+    var mp: CvMap = CvMap { ids: Vec::new(), fns: Vec::new(), kinds: Vec::new() };
+    *ok = true;
+    var text: str = "";
+    match cv_read_text(path) {
+        Option::Some(t) => { text = t; }
+        Option::None => {
+            *ok = false;
+            return mp;
+        }
+    }
+    val lines: Vec<str> = cv_split(text, "\n");
+    var i: i64 = 0;
+    while i < lines.len() {
+        val parts: Vec<str> = cv_fields(lines.get(i));
+        i = i + 1;
+        if parts.len() == 3 {
+            if !cv_is_int(parts.get(0)) {
+                cv_map_err = "ValueError: invalid literal for int() with base 10: " + cv_repr(parts.get(0));
+                *ok = false;
+                return mp;
+            }
+            mp.ids.push(cv_int(parts.get(0)));
+            mp.fns.push(parts.get(1));
+            mp.kinds.push(parts.get(2));
+        }
+    }
+    return mp;
+}
+
+/// merge(): OR every <covdir>/*.cov into acc.
+fn cv_merge(covdir: str, acc: &mut Vec<i64>) {
+    val files: Vec<str> = cv_glob(cv_join(covdir, "*.cov"));
+    var f: i64 = 0;
+    while f < files.len() {
+        val b: Vec<i64> = fs_read_bytes(files.get(f));
+        f = f + 1;
+        var n: i64 = b.len();
+        if acc.len() < n { n = acc.len(); }
+        var i: i64 = 0;
+        while i < n {
+            if b.get(i) != 0 { acc.set(i, acc.get(i) | b.get(i)); }
+            i = i + 1;
+        }
+    }
+}
+
+fn cv_remove_covs(covdir: str) {
+    val files: Vec<str> = cv_glob(cv_join(covdir, "*.cov"));
+    var f: i64 = 0;
+    while f < files.len() {
+        fs_delete(files.get(f));
+        f = f + 1;
+    }
+}
+
+/// re.sub(r"[^A-Za-z0-9_.-]+", "-", s)
+fn cv_safe(s: str) -> str {
+    var out: str = "";
+    var in_run: bool = false;
+    var i: i64 = 0;
+    while i < str_len(s) {
+        val c: i64 = str_byte_at(s, i);
+        i = i + 1;
+        if cv_word(c) || c == 46 || c == 45 {
+            out = out + char_to_str(c);
+            in_run = false;
+        } else if !in_run {
+            out = out + "-";
+            in_run = true;
+        }
+    }
+    return out;
+}
+
+/// run_one's command and scratch executable.
+fn cv_cmd(fid: str, mode: str, test: str, work: str, exe: &mut str) -> Vec<str> {
+    *exe = cv_join(work, cv_basename(test) + "." + cv_safe(mode) + ".exe");
+    var cmd: Vec<str> = Vec::new();
+    cmd.push(fid);
+    val colon: i64 = str_find(mode, ":");
+    var kind: str = mode;
+    var target: str = "";
+    if colon >= 0 {
+        kind = str_slice(mode, 0, colon);
+        target = str_slice(mode, colon + 1, str_len(mode));
+    }
+    if mode == "run" || mode == "check" || mode == "dump-c" {
+        cmd.push(mode);
+        cmd.push(test);
+    } else if kind == "cmd" {
+        val parts: Vec<str> = cv_split(target, "+");
+        cmd.push(parts.get(0));
+        cmd.push(test);
+        var i: i64 = 1;
+        while i < parts.len() {
+            cmd.push(str_replace(parts.get(i), "{out}", *exe));
+            i = i + 1;
+        }
+    } else if kind == "nat" {
+        cmd.push("emit");
+        cmd.push(test);
+        cmd.push("--nat");
+        cmd.push("-o");
+        cmd.push(*exe);
+    } else if str_len(target) > 0 {
+        cmd.push(kind);
+        cmd.push(test);
+        cmd.push("--target");
+        cmd.push(target);
+        cmd.push("-o");
+        cmd.push(*exe);
+    } else {
+        cmd.push(mode);
+        cmd.push(test);
+        cmd.push("-o");
+        cmd.push(*exe);
+    }
+    return cmd;
+}
+
+fn cv_null() -> str {
+    if cv_win() { return "NUL"; }
+    return "/dev/null";
+}
+
+fn cv_cleanup_exe(exe: str) {
+    if fs_exists(exe) { fs_delete(exe); }
+    val pdb: str = str_replace(exe, ".exe", ".pdb");
+    if fs_exists(pdb) { fs_delete(pdb); }
+}
+
+/// mkdtemp(prefix, dir): a new directory, its absolute path.
+var cv_tmp_ctr: i64 = 0;
+
+fn cv_mkdtemp(dir: str, prefix: str) -> str {
+    var k: i64 = 0;
+    while k < 1000 {
+        cv_tmp_ctr = cv_tmp_ctr + 1;
+        val p: str = cv_abspath(cv_join(dir, prefix + int_to_str(p_getpid()) + "_" + int_to_str(p_clock_now_us() % 1000000) + "_" + int_to_str(cv_tmp_ctr)));
+        if !fs_exists(p) && fs_mkdir(p) { return p; }
+        k = k + 1;
+    }
+    return "";
+}
+
+/// The tests through the counter compiler, `jobs` at a time; acc gets the
+/// blocks they reached (merged every 50 finished runs, as the script does).
+fn cv_run_tests(fid: str, modes: Vec<str>, tests: Vec<str>, covdir: str, work: str, jobs: i64, acc: &mut Vec<i64>) {
+    var env: Vec<str> = Vec::new();
+    env.push("FID_COV_DIR=" + covdir);
+    env.push("FIDES_NO_CACHE=1");
+    match env_var("CC") {
+        Option::Some(_) => { }
+        Option::None => { env.push("CC=zig cc"); }
+    }
+    var jm: Vec<str> = Vec::new();
+    var jt: Vec<str> = Vec::new();
+    var t: i64 = 0;
+    while t < tests.len() {
+        var m: i64 = 0;
+        while m < modes.len() {
+            jm.push(modes.get(m));
+            jt.push(tests.get(t));
+            m = m + 1;
+        }
+        t = t + 1;
+    }
+    val n: i64 = jm.len();
+    var handles: Vec<i64> = Vec::new();
+    var state: Vec<i64> = Vec::new();   // 0 waiting, 1 running, 2 ended
+    var start: Vec<i64> = Vec::new();
+    var exes: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        handles.push(0);
+        state.push(0);
+        start.push(0);
+        exes.push("");
+        i = i + 1;
+    }
+    var next: i64 = 0;
+    var done: i64 = 0;
+    var running: i64 = 0;
+    while done < n {
+        while running < jobs && next < n {
+            var exe: str = "";
+            val cmd: Vec<str> = cv_cmd(fid, jm.get(next), jt.get(next), work, &mut exe);
+            exes.set(next, exe);
+            val h: i64 = process_spawn_files(cmd, env, "", cv_null(), cv_null());
+            handles.set(next, h);
+            start.set(next, p_clock_now_ms());
+            if h == 0 {
+                state.set(next, 2);
+                cv_cleanup_exe(exe);
+            } else {
+                state.set(next, 1);
+                running = running + 1;
+            }
+            next = next + 1;
+        }
+        var moved: bool = false;
+        var r: i64 = done;
+        while r < next {
+            if state.get(r) == 1 {
+                var ended: bool = false;
+                match process_wait(handles.get(r), 0) {
+                    Option::Some(_) => { ended = true; }
+                    Option::None => {
+                        if p_clock_now_ms() - start.get(r) > 600000 {
+                            process_kill(handles.get(r));
+                            process_wait(handles.get(r), 10000);
+                            ended = true;
+                        }
+                    }
+                }
+                if ended {
+                    process_release(handles.get(r));
+                    state.set(r, 2);
+                    running = running - 1;
+                    cv_cleanup_exe(exes.get(r));
+                    moved = true;
+                }
+            }
+            r = r + 1;
+        }
+        while done < next && state.get(done) == 2 {
+            done = done + 1;
+            moved = true;
+            if done % 50 == 0 {
+                println("  " + int_to_str(done) + "/" + int_to_str(n));
+                cv_merge(covdir, acc);
+                cv_remove_covs(covdir);
+            }
+        }
+        if !moved {
+            var w: i64 = done;
+            while w < next && state.get(w) != 1 { w = w + 1; }
+            if w < next { process_wait(handles.get(w), 20); }
+        }
+    }
+}
+
+// ─── --record ───
+
+/// datetime.now() as "%Y-%m-%d %H:%M" (local time, from the system's own
+/// clock tool).
+fn cv_now() -> str {
+    var argv: Vec<str> = Vec::new();
+    if cv_win() {
+        argv.push("powershell");
+        argv.push("-NoProfile");
+        argv.push("-Command");
+        argv.push("Get-Date -Format 'yyyy-MM-dd HH:mm'");
+    } else {
+        argv.push("date");
+        argv.push("+%Y-%m-%d %H:%M");
+    }
+    val r: ChildResult = process_run_argv(argv, Vec::new(), "", 60000);
+    return cv_strip(r.output);
+}
+
+// ─── Self-test ───
+
+var cv_failed: bool = false;
+
+fn cv_check(ok: bool, what: str) {
+    if !ok && !cv_failed {
+        cv_failed = true;
+        io_eprintln("AssertionError: " + what);
+    }
+}
+
+fn cv_temp_root() -> str {
+    var names: Vec<str> = Vec::new();
+    names.push("TMPDIR");
+    names.push("TEMP");
+    names.push("TMP");
+    var i: i64 = 0;
+    while i < names.len() {
+        match env_var(names.get(i)) {
+            Option::Some(s) => {
+                if str_len(s) > 0 { return s; }
+            }
+            Option::None => { }
+        }
+        i = i + 1;
+    }
+    if cv_win() { return "."; }
+    return "/tmp";
+}
+
+fn cv_lines_of_get(lo: &CvLines, name: str, mod: &mut str, n: &mut i64) -> bool {
+    val k: i64 = cv_names_get(&lo.names, name);
+    if k < 0 { return false; }
+    *mod = lo.modnames.keys.get(lo.mods.get(k));
+    *n = lo.n.get(k);
+    return true;
+}
+
+fn cv_map3(ids: Vec<i64>, fns: Vec<str>, kinds: Vec<str>) -> CvMap {
+    return CvMap { ids: ids, fns: fns, kinds: kinds };
+}
+
+fn cv_self_test() -> i64 {
+    val d: str = cv_mkdtemp(cv_temp_root(), "covtest");
+    val p: str = cv_join(d, "m.fd");
+    fs_write_text(p, "/// doc\nfn a(x: i64) -> i64 {\n    var y: i64 = x;\n    // note\n\n    return y;\n}\n\n"
+        + "struct P {\n    v: i64,\n}\n\nimpl P {\n    fn get(self: & P) -> i64 {\n        return self.v;\n    }\n}\n"
+        + "fn b() {\n    println(1);\n    println(2);\n}\n");
+    var paths: Vec<str> = Vec::new();
+    paths.push(p);
+    val lo: CvLines = cv_fd_line_counts(paths);
+    val mod: str = cv_mod_name(p);
+    var gm: str = "";
+    var gn: i64 = 0;
+    cv_check(cv_lines_of_get(&lo, "a", &mut gm, &mut gn) && gm == mod && gn == 3, "line counts: a");
+    cv_check(cv_lines_of_get(&lo, "P_get", &mut gm, &mut gn) && gm == mod && gn == 2, "line counts: P_get");
+    cv_check(cv_lines_of_get(&lo, "b", &mut gm, &mut gn) && gm == mod && gn == 3, "line counts: b");
+    val owner: CvOwner = cv_fd_functions(paths);
+    // a: entered, 2 of 4 blocks; P_get: never entered; b: entered, every block
+    var ids: Vec<i64> = Vec::new();
+    var fns: Vec<str> = Vec::new();
+    var kinds: Vec<str> = Vec::new();
+    ids.push(0); fns.push("a"); kinds.push("entry");
+    ids.push(1); fns.push("a"); kinds.push("bb1");
+    ids.push(2); fns.push("a"); kinds.push("bb2");
+    ids.push(3); fns.push("a"); kinds.push("bb3");
+    ids.push(4); fns.push("P_get"); kinds.push("entry");
+    ids.push(5); fns.push("b"); kinds.push("entry");
+    ids.push(6); fns.push("b"); kinds.push("bb1");
+    val mp: CvMap = cv_map3(ids, fns, kinds);
+    var acc: Vec<i64> = Vec::new();
+    acc.push(99);  // 0b01100011
+    val ix: CvIndex = cv_index(&mp, &owner, &lo);
+    val lr: CvLineRep = cv_line_report(acc, &mp, &ix, &lo);
+    val lmi: i64 = cv_names_get(&lo.modnames, mod);
+    cv_check(lmi >= 0 && lr.n.get(lmi) == 8 && lr.r.get(lmi) == 6, "line_report (n, r)");
+    var wd: f64 = 0.0;
+    if lmi >= 0 { wd = lr.w.get(lmi) - (3.0 * 0.5 + 3.0); }
+    cv_check(wd < 0.000000001 && wd > -0.000000001, "line_report w");
+    cv_check(!cv_real_lines(acc, &mp, &ix, &owner, &lo).present, "real_lines without line counters");
+    // VF8: source-line counters (`L<n>`). a: lines 3 and 6 marked, 3 ran
+    // twice over (two counters), 6 never; b: line 19 ran; P_get has no C, so
+    // its 2 lines count as not run.
+    var ids2: Vec<i64> = Vec::new();
+    var fns2: Vec<str> = Vec::new();
+    var kinds2: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < 7 {
+        ids2.push(mp.ids.get(i));
+        fns2.push(mp.fns.get(i));
+        kinds2.push(mp.kinds.get(i));
+        i = i + 1;
+    }
+    ids2.push(7); fns2.push("a"); kinds2.push("L3");
+    ids2.push(8); fns2.push("a"); kinds2.push("L3");
+    ids2.push(9); fns2.push("a"); kinds2.push("L6");
+    ids2.push(10); fns2.push("b"); kinds2.push("L19");
+    ids2.push(11); fns2.push("b"); kinds2.push("L20");
+    val lmp: CvMap = cv_map3(ids2, fns2, kinds2);
+    var lacc: Vec<i64> = Vec::new();
+    lacc.push(227);  // 0b11100011
+    lacc.push(13);   // 0b00001101
+    val lix: CvIndex = cv_index(&lmp, &owner, &lo);
+    val rl: CvRealLines = cv_real_lines(lacc, &lmp, &lix, &owner, &lo);
+    val om: i64 = cv_names_get(&owner.modnames, mod);
+    cv_check(rl.present && om >= 0 && rl.reached.get(om) == 3 && rl.counted.get(om) == 4 && rl.absent.get(om) == 0, "real_lines");
+    cv_check(om >= 0 && cv_uncovered_of(&rl, om).len() == 1 && cv_uncovered_of(&rl, om).get(0) == 6, "real_lines uncovered");
+    // with P_get dropped from the C, its 2 lines are 'no C'
+    var ids3: Vec<i64> = Vec::new();
+    var fns3: Vec<str> = Vec::new();
+    var kinds3: Vec<str> = Vec::new();
+    i = 0;
+    while i < lmp.ids.len() {
+        if lmp.fns.get(i) != "P_get" {
+            ids3.push(lmp.ids.get(i));
+            fns3.push(lmp.fns.get(i));
+            kinds3.push(lmp.kinds.get(i));
+        }
+        i = i + 1;
+    }
+    val mp3: CvMap = cv_map3(ids3, fns3, kinds3);
+    val ix3: CvIndex = cv_index(&mp3, &owner, &lo);
+    val rl2: CvRealLines = cv_real_lines(lacc, &mp3, &ix3, &owner, &lo);
+    cv_check(om >= 0 && rl2.reached.get(om) == 3 && rl2.counted.get(om) == 4 && rl2.absent.get(om) == 2, "real_lines no C");
+    val lr2: CvLineRep = cv_line_report(lacc, &lmp, &lix, &lo);
+    cv_check(lmi >= 0 && lr2.n.get(lmi) == lr.n.get(lmi) && lr2.r.get(lmi) == lr.r.get(lmi) && lr2.w.get(lmi) == lr.w.get(lmi), "line_report unchanged");
+    var mods1: Vec<str> = Vec::new();
+    mods1.push(mod);
+    val g1: CvLow = cv_below_goal(lacc, &lmp, &lix, &owner, 0.1, mods1);
+    val g2: CvLow = cv_below_goal(acc, &mp, &ix, &owner, 0.1, mods1);
+    var same: bool = g1.mods.len() == g2.mods.len();
+    i = 0;
+    while same && i < g1.mods.len() {
+        if g1.mods.get(i) != g2.mods.get(i) || g1.pct.get(i) != g2.pct.get(i) || g1.h.get(i) != g2.h.get(i) || g1.b.get(i) != g2.b.get(i) { same = false; }
+        i = i + 1;
+    }
+    cv_check(same, "below_goal unchanged");
+    val low: CvLow = cv_below_goal_lines(&rl, &owner, 80.0, mods1);
+    cv_check(low.mods.len() == 1 && low.h.get(0) == 3 && low.b.get(0) == 4, "below_goal_lines 80");
+    cv_check(cv_below_goal_lines(&rl, &owner, 75.0, mods1).mods.len() == 0, "below_goal_lines 75");
+    val rep: str = cv_report(lacc, &lmp, &lix, &owner, &lo, d);
+    cv_check(str_contains(rep, "Lines (VF8"), "report has the line table");
+    var unc: str = "";
+    match read_file(cv_join(d, "uncovered-lines.txt")) {
+        Option::Some(t) => { unc = t; }
+        Option::None => { }
+    }
+    cv_check(unc == mod + ":6\n", "uncovered-lines.txt");
+    // reached_sources: `use` lines only, not ones in comments or strings
+    val t: str = cv_mkdtemp(cv_temp_root(), "covreach");
+    fs_mkdir(cv_join(t, "compiler"));
+    fs_mkdir(cv_join(t, "stdlib"));
+    fs_write_text(cv_join(t, "compiler/main.fd"), "module compiler::main; use core; use compiler::a;\n// use compiler::c;\nfn f() { var s: str = \"use compiler::d;\"; }\n");
+    fs_write_text(cv_join(t, "compiler/a.fd"), "use vec; use compiler::main;\n");
+    fs_write_text(cv_join(t, "compiler/c.fd"), "");
+    fs_write_text(cv_join(t, "compiler/d.fd"), "");
+    fs_write_text(cv_join(t, "stdlib/core.fd"), "");
+    fs_write_text(cv_join(t, "stdlib/vec.fd"), "");
+    val got: Vec<str> = cv_reached_sources(t);
+    cv_check(got.len() == 4 && got.get(0) == "compiler/a.fd" && got.get(1) == "compiler/main.fd" && got.get(2) == "stdlib/vec.fd"
+        && got.get(3) == "stdlib/core.fd", "reached_sources");
+    if cv_failed { return 1; }
+    println("coverage.py self-test: ok");
+    return 0;
+}
+
+// ─── Main ───
+
+fn cv_opts() -> Vec<CvOpt> {
+    var o: Vec<CvOpt> = Vec::new();
+    o.push(cv_opt("--fid", "", CV_STR));            // 0
+    o.push(cv_opt("--map", "", CV_STR));            // 1
+    o.push(cv_opt("--modes", "", CV_STR));          // 2
+    o.push(cv_opt("--tests", "", CV_STR));          // 3
+    o.push(cv_opt("--out", "", CV_STR));            // 4
+    o.push(cv_opt("", "-j", CV_INT));               // 5
+    o.push(cv_opt("--limit", "", CV_INT));          // 6
+    o.push(cv_opt("--report-only", "", CV_FLAG));   // 7
+    o.push(cv_opt("--gen", "", CV_INT));            // 8
+    o.push(cv_opt("--goal", "", CV_FLOAT));         // 9
+    o.push(cv_opt("--goal-modules", "", CV_STR));   // 10
+    o.push(cv_opt("--goal-lines", "", CV_FLOAT));   // 11
+    o.push(cv_opt("--sources", "", CV_STR));        // 12
+    o.push(cv_opt("--record", "", CV_STR));         // 13
+    o.push(cv_opt("--note", "", CV_STR));           // 14
+    o.push(cv_opt("--all-sources", "", CV_FLAG));   // 15
+    o.push(cv_opt("--fresh", "", CV_FLAG));         // 16
+    o.push(cv_opt("--help", "-h", CV_HELP));        // 17
+    return o;
+}
+
+fn cv_val(a: &CvArgs, i: i64, def: str) -> str {
+    if a.given.get(i) { return a.vals.get(i); }
+    return def;
+}
+
+fn cv_list(s: str) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    val parts: Vec<str> = cv_split(s, ",");
+    var i: i64 = 0;
+    while i < parts.len() {
+        if str_len(parts.get(i)) > 0 { out.push(parts.get(i)); }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// sorted({module_of(fn) for every entry} - {None})
+fn cv_all_mods(ix: &CvIndex, owner: &CvOwner) -> Vec<str> {
+    var keep: Vec<bool> = Vec::new();
+    var i: i64 = 0;
+    while i < owner.modnames.keys.len() {
+        keep.push(false);
+        i = i + 1;
+    }
+    i = 0;
+    while i < ix.mod_of.len() {
+        if ix.mod_of.get(i) >= 0 { keep.set(ix.mod_of.get(i), true); }
+        i = i + 1;
+    }
+    val order: Vec<i64> = cv_sorted_mods(owner, keep);
+    var out: Vec<str> = Vec::new();
+    i = 0;
+    while i < order.len() {
+        out.push(owner.modnames.keys.get(order.get(i)));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn main() -> i64 {
+    val all: Vec<str> = args_all();
+    var first: i64 = 1;
+    if all.len() >= 3 && all.get(1) == "run" && str_ends_with(all.get(2), ".fd") { first = 3; }
+    var argv: Vec<str> = Vec::new();
+    var i: i64 = first;
+    while i < all.len() {
+        argv.push(all.get(i));
+        i = i + 1;
+    }
+    if cv_has(argv, "--self-test") { return cv_self_test(); }
+    val a: CvArgs = cv_parse(argv, cv_opts());
+    if a.code >= 0 { return a.code; }
+    val fid: str = cv_val(&a, 0, "");
+    val map_path: str = cv_val(&a, 1, "");
+    val modes_s: str = cv_val(&a, 2, "check,run,ccompile,emit");
+    val tests_s: str = cv_val(&a, 3, "tests/bootstrap/*.fd");
+    val out: str = cv_val(&a, 4, cv_join("build", "cov"));
+    var jobs: i64 = 4;
+    if a.given.get(5) { jobs = cv_int(a.vals.get(5)); }
+    var limit: i64 = 0;
+    if a.given.get(6) { limit = cv_int(a.vals.get(6)); }
+    val report_only: bool = a.given.get(7);
+    var gen: i64 = 0;
+    if a.given.get(8) { gen = cv_int(a.vals.get(8)); }
+    val goal_s: str = cv_val(&a, 9, "0");
+    val goal: f64 = cv_float(goal_s);
+    val goal_modules: str = cv_val(&a, 10, "compiler/nat_ir.fd,compiler/nat_enc.fd,compiler/rules.fd,compiler/egraph.fd");
+    val goal_lines_s: str = cv_val(&a, 11, "0");
+    val goal_lines: f64 = cv_float(goal_lines_s);
+    val sources: str = cv_val(&a, 12, "");
+    val record: str = cv_val(&a, 13, "");
+    val note: str = cv_val(&a, 14, "");
+    val all_sources: bool = a.given.get(15);
+    val fresh: bool = a.given.get(16);
+    if !report_only && str_len(fid) == 0 { return cv_ap_error("--fid is needed unless --report-only"); }
+    cv_makedirs(out);
+    var map_ok: bool = true;
+    val mp: CvMap = cv_load_map(map_path, &mut map_ok);
+    if !map_ok {
+        if str_len(cv_map_err) > 0 {
+            io_eprintln(cv_map_err);
+        } else {
+            io_eprintln("FileNotFoundError: [Errno 2] No such file or directory: " + cv_repr(map_path));
+        }
+        return 1;
+    }
+    if mp.ids.len() == 0 {
+        io_eprintln("empty or missing counter map " + map_path);
+        return 1;
+    }
+    var nbits: i64 = 0;
+    i = 0;
+    while i < mp.ids.len() {
+        if mp.ids.get(i) + 1 > nbits { nbits = mp.ids.get(i) + 1; }
+        i = i + 1;
+    }
+    // the modules main.fd reaches own the C names; --all-sources: every
+    // compiler/*.fd
+    var base: Vec<str> = Vec::new();
+    if fs_exists("compiler/main.fd") && !all_sources {
+        base = cv_reached_sources("");
+    } else {
+        base = cv_glob("compiler/*.fd");
+        cv_sort(&mut base);
+        base.push("stdlib/core.fd");
+    }
+    var srcs: Vec<str> = cv_list(sources);
+    i = 0;
+    while i < base.len() {
+        srcs.push(base.get(i));
+        i = i + 1;
+    }
+    val owner: CvOwner = cv_fd_functions(srcs);
+    val lo: CvLines = cv_fd_line_counts(srcs);
+    val merged_path: str = cv_join(out, "merged.cov");
+    val nbytes: i64 = (nbits + 7) / 8;
+    var acc: Vec<i64> = Vec::new();
+    var have_acc: bool = false;
+    if fs_exists(merged_path) && !fresh {
+        acc = fs_read_bytes(merged_path);
+        have_acc = true;
+        if acc.len() != nbytes {
+            io_eprintln(merged_path + " is " + int_to_str(acc.len()) + " bytes, the map needs " + int_to_str(nbytes)
+                + ": a bitmap of another counter compiler (--fresh starts over)");
+            return 1;
+        }
+    }
+    if !have_acc && report_only {
+        io_eprintln("no " + merged_path + " to report on");
+        return 1;
+    }
+    if !have_acc {
+        acc = Vec::new();
+        i = 0;
+        while i < nbytes {
+            acc.push(0);
+            i = i + 1;
+        }
+    }
+    var ntests: i64 = 0;
+    if !report_only {
+        // a comma list of globs, each file once, sorted
+        var tests: Vec<str> = Vec::new();
+        var seen: HashMap<str, i64> = HashMap::new();
+        val globs: Vec<str> = cv_list(tests_s);
+        i = 0;
+        while i < globs.len() {
+            val found: Vec<str> = cv_glob(globs.get(i));
+            i = i + 1;
+            var k: i64 = 0;
+            while k < found.len() {
+                if !seen.contains(found.get(k)) {
+                    seen.insert(found.get(k), 1);
+                    tests.push(found.get(k));
+                }
+                k = k + 1;
+            }
+        }
+        cv_sort(&mut tests);
+        if limit != 0 {
+            var cut: Vec<str> = Vec::new();
+            var lim: i64 = limit;
+            if lim < 0 { lim = tests.len() + lim; }
+            i = 0;
+            while i < tests.len() && i < lim {
+                cut.push(tests.get(i));
+                i = i + 1;
+            }
+            tests = cut;
+        }
+        if gen != 0 {
+            io_eprintln("coverage: --gen needs the fuzzers' program generators (scripts/fuzz/gen_vs_c.py, gen_programs.py), which have no Fides port yet");
+            return 2;
+        }
+        if jobs < 1 {
+            io_eprintln("ValueError: max_workers must be greater than 0");
+            return 1;
+        }
+        val covdir: str = cv_mkdtemp(out, "fidcov");
+        val work: str = cv_mkdtemp(out, "work");
+        cv_run_tests(fid, cv_split(modes_s, ","), tests, covdir, work, jobs, &mut acc);
+        cv_merge(covdir, &mut acc);
+        cv_remove_covs(covdir);
+        fs_write_bytes(merged_path, acc);
+        ntests = tests.len();
+        println(int_to_str(tests.len()) + " tests x " + modes_s);
+    }
+    val ix: CvIndex = cv_index(&mp, &owner, &lo);
+    val have_lines: bool = cv_has_line_counters(&mp);
+    val text: str = cv_report(acc, &mp, &ix, &owner, &lo, out);
+    println(text);
+    if !have_lines {
+        println("(no source-line counters in the map: build the counter compiler with FID_C_LINE_MARKS=1; the line table is an estimate)");
+    }
+    if str_len(record) > 0 {
+        var have: str = "";
+        match read_file(record) {
+            Option::Some(t) => { have = t; }
+            Option::None => { }
+        }
+        var what: str = "report of an earlier run's bitmap";
+        if !report_only {
+            what = int_to_str(ntests) + " tests x " + modes_s;
+            if gen != 0 { what = what + " (+ " + int_to_str(gen) + " programs of each fuzzer)"; }
+        }
+        if str_len(note) > 0 { what = note; }
+        var entry: str = "";
+        if str_len(have) > 0 && !str_ends_with(have, "\n") { entry = "\n"; }
+        var fid_shown: str = fid;
+        if str_len(fid_shown) == 0 { fid_shown = "(not run)"; }
+        var with: str = "without";
+        if have_lines { with = "with"; }
+        entry = entry + "\n## " + cv_now() + ": " + what + "\n\nCounter compiler: " + fid_shown + ", map " + map_path
+            + " (" + int_to_str(nbits) + " counters, " + with + " source-line counters).\n\n```\n" + text + "```\n";
+        fs_append_text(record, entry);
+        println("recorded in " + record);
+    }
+    var rc: i64 = 0;
+    if goal_lines != 0.0 {
+        var lmods: Vec<str> = Vec::new();
+        if goal_modules == "all" {
+            lmods = cv_all_mods(&ix, &owner);
+        } else {
+            lmods = cv_list(goal_modules);
+        }
+        if !have_lines {
+            println("--goal-lines: the map has no source-line counters (FID_C_LINE_MARKS=1 when building the counter compiler)");
+            rc = 2;
+        } else {
+            val rl: CvRealLines = cv_real_lines(acc, &mp, &ix, &owner, &lo);
+            val lowl: CvLow = cv_below_goal_lines(&rl, &owner, goal_lines, lmods);
+            i = 0;
+            while i < lowl.mods.len() {
+                println("below the " + cv_g(goal_lines_s) + "% line goal: " + lowl.mods.get(i) + " " + cv_fixed(lowl.pct.get(i), 1)
+                    + "% (" + int_to_str(lowl.h.get(i)) + "/" + int_to_str(lowl.b.get(i)) + " lines)");
+                i = i + 1;
+            }
+            if lowl.mods.len() > 0 {
+                rc = 1;
+            } else {
+                println("every goal module at or above " + cv_g(goal_lines_s) + "% of its lines");
+            }
+        }
+    }
+    if goal != 0.0 {
+        var mods: Vec<str> = Vec::new();
+        if goal_modules == "all" {
+            mods = cv_all_mods(&ix, &owner);
+        } else {
+            mods = cv_list(goal_modules);
+        }
+        val low: CvLow = cv_below_goal(acc, &mp, &ix, &owner, goal, mods);
+        i = 0;
+        while i < low.mods.len() {
+            println("below the " + cv_g(goal_s) + "% goal: " + low.mods.get(i) + " " + cv_fixed(low.pct.get(i), 1)
+                + "% (" + int_to_str(low.h.get(i)) + "/" + int_to_str(low.b.get(i)) + " blocks)");
+            i = i + 1;
+        }
+        if low.mods.len() > 0 { return 1; }
+        var joined: str = "";
+        i = 0;
+        while i < mods.len() {
+            if i > 0 { joined = joined + ", "; }
+            joined = joined + mods.get(i);
+            i = i + 1;
+        }
+        println("every goal module at or above " + cv_g(goal_s) + "%: " + joined);
+    }
+    return rc;
+}

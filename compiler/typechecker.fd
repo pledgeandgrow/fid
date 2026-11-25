@@ -1129,6 +1129,8 @@ impl TypeChecker {
         g_tc_spec_seen = 0;
         g_tc_mspecs = Vec::new();
         g_tc_mspec_structs = Vec::new();
+        HashMap_drop(g_tc_mspec_seen);
+        g_tc_mspec_seen = HashMap_new();
         // RT6: nor are the untyped Vecs it typed
         rt6_reset();
         // M2/M10: nor its program's module and @unsafe functions
@@ -1372,7 +1374,7 @@ fn TypeChecker_check_struct_defaults(self: &mut TypeChecker, sname: str, struct_
                 var dty: Type = TypeChecker_check_expr(self, dexpr);
                 var want: Type = TypeChecker_resolve_type(self, struct_fields.get(sfi).ty);
                 if !generic && !TypeChecker_types_compatible(self, want, dty) {
-                    self.errors.push("Type error (line " + int_to_str(self.current_line) + "): the default of field '" + sname + "." + fname + "' is " + type_to_str(dty) + ", the field is " + type_to_str(want) + ".");
+                    self.errors.push("Type error (line " + int_to_str(self.current_line) + "): the default of field '" + sname + "." + fname + "' is " + type_to_str(dty) + ", the field is " + type_to_str(want) + ".\n    Fix: give the default a " + type_to_str(want) + " value, or declare the field as " + type_to_str(dty) + ".");
                 }
             }
         }
@@ -1674,7 +1676,7 @@ fn TypeChecker_check_struct_operator(self: &mut TypeChecker, op: BinOp, sname: s
     var info: MethodInfo = self.methods.get(TypeChecker_methods_at(self, sname)).val.get(mei).val;
     var first: i64 = 1;
     if info.has_self == false || info.param_types.len() != 2 {
-        self.errors.push("Type error (line " + int_to_str(self.current_line) + "): `" + sname + "." + m + "` cannot serve `" + tc_operator_symbol(m) + "`: it must take self and one operand, it takes " + int_to_str(info.param_types.len()) + " parameters");
+        self.errors.push("Type error (line " + int_to_str(self.current_line) + "): `" + sname + "." + m + "` cannot serve `" + tc_operator_symbol(m) + "`: it must take self and one operand, it takes " + int_to_str(info.param_types.len()) + " parameters\n    Fix: give it the form `fn " + m + "(self: " + sname + ", other: " + sname + ") -> " + sname + " { ... }`.");
         return Type::Never;
     }
     if !TypeChecker_types_compatible(self, info.param_types.get(first), rt) {
@@ -1731,7 +1733,7 @@ pub fn tc_struct_dim(name: str) -> i64 {
 fn TypeChecker_check_dimension_struct(self: &mut TypeChecker, sd: StructDef) {
     var err: str = dimension_annotation_error(sd.annotations);
     if str_len(err) > 0 {
-        self.errors.push("Type error: @dimension on struct '" + sd.name + "': " + err + ".");
+        self.errors.push("Type error: @dimension on struct '" + sd.name + "': " + err + ".\n    Fix: write each SI base once with an integer exponent in -8..7, e.g. `@dimension(m = 1, s = -2)` (the bases are m, kg, s, A, K, mol and cd).");
         return;
     }
     if struct_dimension(sd.annotations) == 0 {
@@ -1827,9 +1829,9 @@ fn TypeChecker_check_dim_operator(self: &mut TypeChecker, m: str, lname: str, lt
             return lt;
         }
         if rd != 0 {
-            self.errors.push("Type error (line " + int_to_str(self.current_line) + "): `" + lname + " " + sym + " " + rname + "`: units of different dimensions (" + dim_to_str(tc_struct_dim(lname)) + " and " + dim_to_str(rd) + ") do not add; a unit adds only to itself.");
+            self.errors.push("Type error (line " + int_to_str(self.current_line) + "): `" + lname + " " + sym + " " + rname + "`: units of different dimensions (" + dim_to_str(tc_struct_dim(lname)) + " and " + dim_to_str(rd) + ") do not add; a unit adds only to itself.\n    Fix: add or subtract values of one dimension only; to combine two dimensions, multiply or divide them (`a * b`, `a / b`).");
         } else {
-            self.errors.push("Type error (line " + int_to_str(self.current_line) + "): `" + lname + " " + sym + " " + rtn + "`: a unit adds only to a value of its own unit (" + lname + ").");
+            self.errors.push("Type error (line " + int_to_str(self.current_line) + "): `" + lname + " " + sym + " " + rtn + "`: a unit adds only to a value of its own unit (" + lname + ").\n    Fix: add a " + lname + " (make the number one with " + lname + "'s struct literal), or multiply or divide by the plain number instead.");
         }
         return Type::Never;
     }
@@ -1839,7 +1841,7 @@ fn TypeChecker_check_dim_operator(self: &mut TypeChecker, m: str, lname: str, lt
     if rd != 0 {
         return TypeChecker_dim_result(self, m, lname, tc_struct_dim(lname), rname, rd);
     }
-    self.errors.push("Type error (line " + int_to_str(self.current_line) + "): `" + lname + " " + sym + " " + rtn + "`: a unit multiplies and divides by an f64 or by another unit (a struct marked @dimension), got " + rtn + ".");
+    self.errors.push("Type error (line " + int_to_str(self.current_line) + "): `" + lname + " " + sym + " " + rtn + "`: a unit multiplies and divides by an f64 or by another unit (a struct marked @dimension), got " + rtn + ".\n    Fix: multiply or divide by an f64 (`x as f64` for an integer) or by a value of a @dimension struct.");
     return Type::Never;
 }
 
@@ -1852,7 +1854,7 @@ fn TypeChecker_check_dim_scalar_left(self: &mut TypeChecker, m: str, lt: Type, r
     if m == "div" {
         return TypeChecker_dim_result(self, m, type_to_str(lt), dim_dimensionless(), rname, tc_struct_dim(rname));
     }
-    self.errors.push("Type error (line " + int_to_str(self.current_line) + "): `" + type_to_str(lt) + " " + tc_operator_symbol(m) + " " + rname + "`: a unit adds only to a value of its own unit (" + rname + ").");
+    self.errors.push("Type error (line " + int_to_str(self.current_line) + "): `" + type_to_str(lt) + " " + tc_operator_symbol(m) + " " + rname + "`: a unit adds only to a value of its own unit (" + rname + ").\n    Fix: add a " + rname + " (make the number one with " + rname + "'s struct literal), or multiply or divide by the plain number instead.");
     return Type::Never;
 }
 
@@ -1867,7 +1869,7 @@ fn TypeChecker_dim_result(self: &mut TypeChecker, m: str, lname: str, ld: i64, r
     var text: str = "`" + lname + " " + tc_operator_symbol(m) + " " + rname + "`";
     var d: i64 = dim_combine(ld, rd, sign);
     if d < 0 {
-        self.errors.push("Type error (line " + int_to_str(self.current_line) + "): " + text + ": an exponent of the result leaves -8..7.");
+        self.errors.push("Type error (line " + int_to_str(self.current_line) + "): " + text + ": an exponent of the result leaves -8..7.\n    Fix: reorder the products and quotients so no intermediate unit needs an exponent outside -8..7, or work on the f64 values and wrap the result.");
         return Type::Never;
     }
     if d == dim_dimensionless() {
@@ -1915,7 +1917,7 @@ fn TypeChecker_check_right_struct_operator(self: &mut TypeChecker, op: BinOp, lt
             return TypeChecker_check_dim_scalar_left(self, m, lt, rname, rt);
         }
         val ltn: str = tc_operand_type_str(lexpr, lt);
-        self.errors.push("Type error (line " + int_to_str(self.current_line) + "): `" + ltn + " " + tc_operator_symbol(m) + " " + rname + "`: a unit combines with an f64 or another unit, got " + ltn + ".");
+        self.errors.push("Type error (line " + int_to_str(self.current_line) + "): `" + ltn + " " + tc_operator_symbol(m) + " " + rname + "`: a unit combines with an f64 or another unit, got " + ltn + ".\n    Fix: put an f64 (`x as f64` for an integer) or a value of a @dimension struct on the left of `" + tc_operator_symbol(m) + "`.");
         return Type::Never;
     }
     if TypeChecker_method_find(self, rname, rm) >= 0 {
@@ -1928,7 +1930,7 @@ fn TypeChecker_check_right_struct_operator(self: &mut TypeChecker, op: BinOp, lt
 /// `rname.rm` exists but does not take an operand of type `ltn` (as a
 /// message names it, tc_operand_type_str): the error naming both.
 fn TypeChecker_check_struct_operator_named(self: &mut TypeChecker, rname: str, rm: str, m: str, ltn: str) -> Type {
-    self.errors.push("Type error (line " + int_to_str(self.current_line) + "): `" + ltn + " " + tc_operator_symbol(m) + " " + rname + "`: `" + rname + "." + rm + "` must take self and one operand of type " + ltn + ".");
+    self.errors.push("Type error (line " + int_to_str(self.current_line) + "): `" + ltn + " " + tc_operator_symbol(m) + " " + rname + "`: `" + rname + "." + rm + "` must take self and one operand of type " + ltn + ".\n    Fix: write the left operand as the type `" + rname + "." + rm + "` takes (`2.0 * v` for an f64), or give " + rname + " an `" + rm + "` that takes " + ltn + ".");
     return Type::Never;
 }
 
@@ -2028,6 +2030,9 @@ fn TypeChecker_warn_deprecated(self: &mut TypeChecker, callee: str, msg: str) {
         if str_len(msg) > 0 {
             e = e + ": " + msg;
         }
+        if !str_contains(e, "Fix:") {
+            e = e + "\n    Fix: call what replaces '" + callee + "' (its @deprecated note or documentation names it), or keep this file on edition 2026.";
+        }
         self.errors.push(e);
         return;
     }
@@ -2083,7 +2088,7 @@ fn TypeChecker_check_named_args(self: &mut TypeChecker, callee: str, sig: FuncSi
                         var param: Type = TypeChecker_resolve_type(self, raw_param);
                         var arg: Type = named_tys.get(i);
                         if !TypeChecker_type_contains_param(self, raw_param) && !is_single_upper_name(raw_param) && !TypeChecker_arg_compatible(self, param, arg) {
-                            self.errors.push(where_s + "function '" + callee + "' parameter '" + an + "' expects '" + type_to_str(param) + "', got '" + type_to_str(arg) + "'");
+                            self.errors.push(where_s + "function '" + callee + "' parameter '" + an + "' expects '" + type_to_str(param) + "', got '" + type_to_str(arg) + "'\n    Fix: pass a value of type '" + type_to_str(param) + "' for '" + an + "' (for a number, cast it: `x as " + type_to_str(param) + "`), or change the parameter's type.");
                         }
                     }
                 }
@@ -2100,7 +2105,7 @@ fn TypeChecker_check_named_args(self: &mut TypeChecker, callee: str, sig: FuncSi
         i = i + 1;
     }
     if pos > names.len() {
-        self.errors.push(where_s + "function '" + callee + "' takes " + int_to_str(names.len()) + " parameter(s), the call gives " + int_to_str(pos) + " by position.");
+        self.errors.push(where_s + "function '" + callee + "' takes " + int_to_str(names.len()) + " parameter(s), the call gives " + int_to_str(pos) + " by position.\n    Fix: pass at most " + int_to_str(names.len()) + " arguments by position (the parameters are " + str_join(names, ", ") + "), or drop the extra ones.");
         return;
     }
     var mi: i64 = 0;
@@ -2545,18 +2550,24 @@ pub fn TypeChecker_register_trait_impls(self: &mut TypeChecker, program: Program
 }
 
 pub fn TypeChecker_verify_trait_impls(self: &mut TypeChecker, program: Program) {
+    // SP10: trait definitions by name are a table (one lookup per impl,
+    // not a scan of program.traits; first of a name wins, as the scan did)
+    var tpos: i64 = HashMap_new();
+    var tdi0: i64 = 0;
+    while tdi0 < program.traits.len() {
+        if !HashMap_contains(tpos, program.traits.get(tdi0).name) {
+            HashMap_insert(tpos, program.traits.get(tdi0).name, tdi0 + 1);
+        }
+        tdi0 = tdi0 + 1;
+    }
     var tii: i64 = 0;
     while tii < program.trait_impls.len() {
         var ti: TraitImpl = program.trait_impls.get(tii);
         // Find trait definition
         var trait_def: OptTraitDef = OptTraitDef::None;
-        var tdi: i64 = 0;
-        while tdi < program.traits.len() {
-            if program.traits.get(tdi).name == ti.trait_name {
-                trait_def = OptTraitDef::Some(program.traits.get(tdi));
-                break;
-            }
-            tdi = tdi + 1;
+        var tdat: i64 = HashMap_get(tpos, ti.trait_name);
+        if tdat > 0 {
+            trait_def = OptTraitDef::Some(program.traits.get(tdat - 1));
         }
         match trait_def {
             OptTraitDef::Some(td) => {
@@ -2581,7 +2592,7 @@ pub fn TypeChecker_verify_trait_impls(self: &mut TypeChecker, program: Program) 
                             }
                         }
                         if !has_default {
-                            self.errors.push("Type error: impl " + ti.trait_name + " for " + ti.type_name + " is missing method '" + tm.name + "'");
+                            self.errors.push("Type error: impl " + ti.trait_name + " for " + ti.type_name + " is missing method '" + tm.name + "'\n    Fix: add `fn " + tm.name + "(...)` to `impl " + ti.trait_name + " for " + ti.type_name + "`, with the signature the trait declares.");
                         }
                     }
                     tmi = tmi + 1;
@@ -2620,13 +2631,13 @@ pub fn TypeChecker_verify_trait_impls(self: &mut TypeChecker, program: Program) 
                 while ai2 < td.associated_types.len() {
                     var assoc_name: str = td.associated_types.get(ai2).name;
                     if !tc_str_vec_contains(provided_assoc, assoc_name) {
-                        self.errors.push("Type error: impl " + ti.trait_name + " for " + ti.type_name + " is missing associated type '" + assoc_name + "'");
+                        self.errors.push("Type error: impl " + ti.trait_name + " for " + ti.type_name + " is missing associated type '" + assoc_name + "'\n    Fix: add `type " + assoc_name + " = SomeType;` to `impl " + ti.trait_name + " for " + ti.type_name + "`.");
                     }
                     ai2 = ai2 + 1;
                 }
             }
             OptTraitDef::None => {
-                self.errors.push("Type error: trait '" + ti.trait_name + "' is not defined (in impl for " + ti.type_name + ")");
+                self.errors.push("Type error: trait '" + ti.trait_name + "' is not defined (in impl for " + ti.type_name + ")\n    Fix: define it (`cap " + ti.trait_name + " { fn m(self) -> T; }`), import the module that defines it, or fix the name.");
             }
         }
         tii = tii + 1;
@@ -2804,16 +2815,16 @@ fn TypeChecker_check_impl_sig(self: &mut TypeChecker, ti: TraitImpl, tm: TraitMe
     var where_s: str = "method '" + im.name + "' of impl " + ti.trait_name + " for " + ti.type_name;
     if tm.has_self != (i0 == 1) {
         if tm.has_self {
-            self.errors.push("Type error: " + where_s + " has no self parameter; the trait's method takes self");
+            self.errors.push("Type error: " + where_s + " has no self parameter; the trait's method takes self\n    Fix: make the impl's method take `self` first, as the trait's does.");
         } else {
-            self.errors.push("Type error: " + where_s + " takes self; the trait's method does not");
+            self.errors.push("Type error: " + where_s + " takes self; the trait's method does not\n    Fix: remove `self` from the impl's method, as in the trait (it is then called as `Type::name(...)`).");
         }
         return;
     }
     var tn: i64 = tm.params.len() - t0;
     var inn: i64 = im.params.len() - i0;
     if tn != inn {
-        self.errors.push("Type error: " + where_s + " takes " + int_to_str(inn) + " parameter(s); the trait's method takes " + int_to_str(tn));
+        self.errors.push("Type error: " + where_s + " takes " + int_to_str(inn) + " parameter(s); the trait's method takes " + int_to_str(tn) + "\n    Fix: give the impl's method the trait's " + int_to_str(tn) + " parameter(s), with the same types.");
         return;
     }
     // LG4: a generic method's own type parameters: as many as the trait's,
@@ -2833,7 +2844,7 @@ fn TypeChecker_check_impl_sig(self: &mut TypeChecker, ti: TraitImpl, tm: TraitMe
         }
     }
     if tm.type_params.len() != im.type_params.len() && !lg4_default {
-        self.errors.push("Type error: " + where_s + " has " + int_to_str(im.type_params.len()) + " type parameter(s); the trait's method has " + int_to_str(tm.type_params.len()) + " (fn " + tm.name + tc_lg4_tps_str(tm.type_params) + ")");
+        self.errors.push("Type error: " + where_s + " has " + int_to_str(im.type_params.len()) + " type parameter(s); the trait's method has " + int_to_str(tm.type_params.len()) + " (fn " + tm.name + tc_lg4_tps_str(tm.type_params) + ")\n    Fix: declare the trait's type parameters on the impl's method: `fn " + tm.name + tc_lg4_tps_str(tm.type_params) + "(...)`.");
         return;
     }
     if tm.type_params.len() == im.type_params.len() {
@@ -2873,14 +2884,14 @@ fn TypeChecker_check_impl_sig(self: &mut TypeChecker, ti: TraitImpl, tm: TraitMe
         var ts: str = type_to_str(TypeChecker_resolve_type(self, tc_impl_view_type(tc_subst_type_params(tm.params.get(t0 + k).ty, lg4_from, lg4_to), view)));
         var ist: str = type_to_str(TypeChecker_resolve_type(self, tc_impl_view_type(im.params.get(i0 + k).ty, view)));
         if tc_lg4_ty_concrete(ts, assoc_names, TypeChecker_lg4_declared_short(self, ts, lg4_own, ti.type_params)) && ts != ist {
-            self.errors.push("Type error: " + where_s + ": parameter '" + im.params.get(i0 + k).name + "' is " + ist + "; the trait's method says " + ts);
+            self.errors.push("Type error: " + where_s + ": parameter '" + im.params.get(i0 + k).name + "' is " + ist + "; the trait's method says " + ts + "\n    Fix: declare parameter '" + im.params.get(i0 + k).name + "' as " + ts + ", as the trait does.");
         }
         k = k + 1;
     }
     var tr: str = type_to_str(TypeChecker_resolve_type(self, tc_impl_view_type(tc_subst_type_params(tm.ret_ty, lg4_from, lg4_to), view)));
     var ir: str = type_to_str(TypeChecker_resolve_type(self, tc_impl_view_type(im.ret_ty, view)));
     if tc_lg4_ty_concrete(tr, assoc_names, TypeChecker_lg4_declared_short(self, tr, lg4_own, ti.type_params)) && tr != ir {
-        self.errors.push("Type error: " + where_s + " returns " + ir + "; the trait's method returns " + tr);
+        self.errors.push("Type error: " + where_s + " returns " + ir + "; the trait's method returns " + tr + "\n    Fix: make the impl's method return " + tr + ", as the trait's does.");
     }
     TypeChecker_check_impl_lifetimes(self, where_s, tm, im);
 }
@@ -2948,7 +2959,7 @@ fn TypeChecker_check_impl_lifetimes(self: &mut TypeChecker, where_s: str, tm: Tr
     while k < it.len() {
         var p: i64 = it.get(k);
         if !vec_contains_i64(tt, p) && p < im.params.len() {
-            self.errors.push("Type error: " + where_s + " ties its result to parameter '" + im.params.get(p).name + "', but the trait's method ties it to " + allowed + "; write the trait's lifetimes on the impl's method");
+            self.errors.push("Type error: " + where_s + " ties its result to parameter '" + im.params.get(p).name + "', but the trait's method ties it to " + allowed + "; write the trait's lifetimes on the impl's method\n    Fix: put the trait method's `@lifetime(...)` on the impl's method, or return a borrow of " + allowed + ".");
         }
         k = k + 1;
     }
@@ -3317,7 +3328,7 @@ fn annotation_targets_str(mask: i64) -> str {
 fn check_one_annotation_fd(self: &mut TypeChecker, a: Annotation, target: str, what: str) {
     var mask: i64 = annotation_target_mask(a.name);
     if mask == 0 {
-        self.errors.push("Unknown annotation '@" + a.name + "' on '" + what + "': no compiler pass consumes this name\n    and it will be silently ignored. Check the spelling.");
+        self.errors.push("Unknown annotation '@" + a.name + "' on '" + what + "': no compiler pass consumes this name\n    and it will be silently ignored. Check the spelling.\n    Fix: fix the spelling (docs/reference/reference.md section 11 lists every annotation), or remove it.");
         return;
     }
     var bit: i64 = 0;
@@ -3337,7 +3348,7 @@ fn check_one_annotation_fd(self: &mut TypeChecker, a: Annotation, target: str, w
         bit = 16;
     }
     if bit > 0 && (mask / bit) % 2 == 0 {
-        self.errors.push("Misplaced annotation '@" + a.name + "' on '" + what + "': valid on " + annotation_targets_str(mask) + ", not " + target + ".");
+        self.errors.push("Misplaced annotation '@" + a.name + "' on '" + what + "': valid on " + annotation_targets_str(mask) + ", not " + target + ".\n    Fix: move it to a " + annotation_targets_str(mask) + ", or remove it.");
     }
 }
 
@@ -3872,17 +3883,6 @@ fn TypeChecker_enum_pos(self: &mut TypeChecker, name: str) -> i64 {
     return HashMap_get(self.ename_index, name) - 1;
 }
 
-fn tc_find_func(program: Program, name: str) -> i64 {
-    var i: i64 = 0;
-    while i < program.funcs.len() {
-        if program.funcs.get(i).name == name {
-            return i;
-        }
-        i = i + 1;
-    }
-    return -1;
-}
-
 /// The name the race check knows the function `name` by: a call or spawn
 /// may name it with its module (`nat_ir::f`, `compiler::nat_ir::f`); the
 /// functions of `fpos` (name -> index + 1) are by their plain name.
@@ -3910,7 +3910,7 @@ fn TypeChecker_verify_no_races(self: &mut TypeChecker, program: Program) {
         return;
     }
     // SP10: functions by name and the reached set are tables (first function
-    // of a name wins, as tc_find_func's scan); both were scans per name
+    // of a name wins, as the scan it replaces did); both were scans per name
     var fpos: i64 = HashMap_new();
     var fk: i64 = 0;
     while fk < program.funcs.len() {
@@ -4185,14 +4185,14 @@ fn TypeChecker_check_exhaustive(self: &mut TypeChecker, match_ty: Type, arms: Ve
                 ghint = "
     (an arm with a guard `if ...` covers nothing: add an arm without one, or `_ =>`)";
             }
-            self.errors.push("Type error: non-exhaustive match at line " + int_to_str(line) + " in " + TypeChecker_match_where(self) + " — missing variant(s): " + missing + ghint);
+            self.errors.push("Type error: non-exhaustive match at line " + int_to_str(line) + " in " + TypeChecker_match_where(self) + " — missing variant(s): " + missing + ghint + "\n    Fix: add an arm for each missing variant, or a catch-all `_ => { ... }` arm.");
         }
         return;
     }
     match match_ty {
         Type::Bool => {
             if !has_true || !has_false {
-                self.errors.push("Type error: non-exhaustive match on bool at line " + int_to_str(line) + " in " + TypeChecker_match_where(self));
+                self.errors.push("Type error: non-exhaustive match on bool at line " + int_to_str(line) + " in " + TypeChecker_match_where(self) + "\n    Fix: add both a `true =>` and a `false =>` arm, or a `_ =>` arm.");
             }
         }
         _ => {
@@ -4248,19 +4248,19 @@ fn TypeChecker_check_method_call_rules(self: &mut TypeChecker, caller: str, from
         }
     }
     if tc_has_annotation(from.annotations, "deterministic") && !tc_has_annotation(to.annotations, "deterministic") {
-        self.errors.push("Safety error: @deterministic function '" + caller + "' calls method '" + target + "', which is not @deterministic.");
+        self.errors.push("Safety error: @deterministic function '" + caller + "' calls method '" + target + "', which is not @deterministic.\n    Fix: mark '" + target + "' @deterministic (it must then pass the same checks), or do not call it from '" + caller + "'.");
     }
     if tc_has_annotation(from.annotations, "conserve") && !tc_has_annotation(to.annotations, "conserve") {
-        self.errors.push("Conservation error: function '" + caller + "' is @conserve but calls method '" + target + "', which is not @conserve.");
+        self.errors.push("Conservation error: function '" + caller + "' is @conserve but calls method '" + target + "', which is not @conserve.\n    Fix: mark '" + target + "' @conserve (it must then pass the same checks), or move the call out of '" + caller + "'.");
     }
     if tc_has_annotation(from.annotations, "constant_time") && !tc_has_annotation(to.annotations, "constant_time") {
-        self.errors.push("Safety error: @constant_time function '" + caller + "' calls method '" + target + "', which is not @constant_time.");
+        self.errors.push("Safety error: @constant_time function '" + caller + "' calls method '" + target + "', which is not @constant_time.\n    Fix: mark '" + target + "' @constant_time (it must then pass the same checks), or do not call it from '" + caller + "'.");
     }
     if from.has_effect_annotation {
         var di: i64 = 0;
         while di < to.declared_effects.len() {
             if !tc_str_vec_contains(from.declared_effects, to.declared_effects.get(di)) {
-                self.errors.push("Effect error: function '" + caller + "' calls method '" + target + "', which has effect " + to.declared_effects.get(di) + ", not declared by '" + caller + "'.");
+                self.errors.push("Effect error: function '" + caller + "' calls method '" + target + "', which has effect " + to.declared_effects.get(di) + ", not declared by '" + caller + "'.\n    Fix: declare the effect on '" + caller + "' (`-> T !{" + to.declared_effects.get(di) + "}` in its signature), or do not call '" + target + "' from it.");
             }
             di = di + 1;
         }
@@ -4733,7 +4733,7 @@ pub fn TypeChecker_verify_declared_effects(self: &mut TypeChecker, program: Prog
         while ii < inferred.len() {
             var eff: str = inferred.get(ii);
             if !tc_str_vec_contains(func.declared_effects, eff) {
-                self.errors.push("Effect error: function '" + func.name + "' has inferred effect '!" + eff + "' but only declared effects not including it");
+                self.errors.push("Effect error: function '" + func.name + "' has inferred effect '!" + eff + "' but only declared effects not including it\n    Fix: add " + eff + " to the effects '" + func.name + "' declares (`-> T !{..., " + eff + "}`), or remove what causes it.");
             }
             ii = ii + 1;
         }
@@ -4753,7 +4753,7 @@ pub fn TypeChecker_verify_declared_effects(self: &mut TypeChecker, program: Prog
                 var mk: i64 = 0;
                 while mk < minf.len() {
                     if !tc_str_vec_contains(mf.declared_effects, minf.get(mk)) {
-                        self.errors.push("Effect error: function '" + mlabel + "' has inferred effect '!" + minf.get(mk) + "' but only declared effects not including it");
+                        self.errors.push("Effect error: function '" + mlabel + "' has inferred effect '!" + minf.get(mk) + "' but only declared effects not including it\n    Fix: add " + minf.get(mk) + " to the effects '" + mlabel + "' declares (`-> T !{..., " + minf.get(mk) + "}`), or remove what causes it.");
                     }
                     mk = mk + 1;
                 }
@@ -4941,27 +4941,27 @@ pub fn TypeChecker_verify_conserve(self: &mut TypeChecker, program: Program) {
                 while ei < effects.len() {
                     var eff: str = effects.get(ei);
                     if eff == "IO" || eff == "Net" || eff == "Spawn" || eff == "Diverge" {
-                        self.errors.push("Conservation error: method '" + qname + "' is @conserve but has effect '!" + eff + "'.");
+                        self.errors.push("Conservation error: method '" + qname + "' is @conserve but has effect '!" + eff + "'.\n    Fix: do the '!" + eff + "' work in the caller of '" + qname + "', or remove @conserve.");
                     }
                     ei = ei + 1;
                 }
                 var fp: Vec<str> = tc_conserve_floats(method);
                 if fp.len() > 0 {
-                    self.errors.push("Conservation error: method '" + qname + "' is @conserve but uses floating-point. Found: " + tc_join(fp, ", ") + ".");
+                    self.errors.push("Conservation error: method '" + qname + "' is @conserve but uses floating-point. Found: " + tc_join(fp, ", ") + ".\n    Fix: keep amounts in integer cents (i64) in '" + qname + "', or remove @conserve.");
                 }
                 var called: Vec<str> = tc_conserve_calls(method);
                 var ci: i64 = 0;
                 while ci < called.len() {
                     var c: str = called.get(ci);
                     if tc_is_mint_call(c) {
-                        self.errors.push("Conservation error: method '" + qname + "' is @conserve but calls mint function '" + c + "'.");
+                        self.errors.push("Conservation error: method '" + qname + "' is @conserve but calls mint function '" + c + "'.\n    Fix: call '" + c + "' outside '" + qname + "' (only a mint function may create money), or remove @conserve.");
                     } else if TypeChecker_has_func(self, c) && !tc_vec_contains_str(conserve_funcs, c) {
-                        self.errors.push("Conservation error: method '" + qname + "' is @conserve but calls '" + c + "', which is not @conserve.");
+                        self.errors.push("Conservation error: method '" + qname + "' is @conserve but calls '" + c + "', which is not @conserve.\n    Fix: mark '" + c + "' @conserve (it must then pass the same checks), or move the call out of '" + qname + "'.");
                     }
                     ci = ci + 1;
                 }
                 if tc_conserve_money_lits(method) > 0 {
-                    self.errors.push("Conservation error: method '" + qname + "' is @conserve but builds a 'Money { .. }' literal, which mints money.");
+                    self.errors.push("Conservation error: method '" + qname + "' is @conserve but builds a 'Money { .. }' literal, which mints money.\n    Fix: move money from an existing Money (Money_take(&mut m, cents)) instead of building one, or remove @conserve.");
                 }
             }
             mi = mi + 1;
@@ -5162,7 +5162,7 @@ pub fn TypeChecker_verify_gas(self: &mut TypeChecker, program: Program) {
         var total: i64 = gas_total(lname, names, bodies, &mut visited, &mut cache_names, &mut cache_vals);
         if total > limits.get(li) {
             var own: i64 = gas_own(lname, names, bodies);
-            self.errors.push("Gas error: function '" + lname + "' has @gas(" + int_to_str(limits.get(li)) + ") but total gas cost is " + int_to_str(total) + " (own: " + int_to_str(own) + " + callees: " + int_to_str(total - own) + ").");
+            self.errors.push("Gas error: function '" + lname + "' has @gas(" + int_to_str(limits.get(li)) + ") but total gas cost is " + int_to_str(total) + " (own: " + int_to_str(own) + " + callees: " + int_to_str(total - own) + ").\n    Fix: raise the bound to @gas(" + int_to_str(total) + "), or do less work in '" + lname + "' and the functions it calls.");
         }
         li = li + 1;
     }
@@ -5557,6 +5557,35 @@ pub fn TypeChecker_verify_safety_annotations(self: &mut TypeChecker, program: Pr
         ti = ti + 1;
     }
 
+    // SP10: the per-call lookups inside check_safety_body are tables —
+    // func_pos: name -> func_prim_lists index + 1 (first wins, as the
+    // scan); msuf: every "_"-suffix of a method's qualified name -> its
+    // method_names index + 1, in scan order (the "_"-suffix match a
+    // method-name scan used to do per call).
+    var func_pos: i64 = HashMap_new();
+    var fpi: i64 = 0;
+    while fpi < func_names.len() {
+        if !HashMap_contains(func_pos, func_names.get(fpi)) {
+            HashMap_insert(func_pos, func_names.get(fpi), fpi + 1);
+        }
+        fpi = fpi + 1;
+    }
+    var msuf: i64 = HashMap_new();
+    var mni: i64 = 0;
+    while mni < method_names.len() {
+        var qn: str = method_names.get(mni);
+        var off: i64 = 0;
+        var up: i64 = str_find(str_slice(qn, off, str_len(qn)), "_");
+        while up >= 0 {
+            var m: str = str_slice(qn, off + up + 1, str_len(qn));
+            if !HashMap_contains(msuf, m) {
+                HashMap_insert(msuf, m, mni + 1);
+            }
+            off = off + up + 1;
+            up = str_find(str_slice(qn, off, str_len(qn)), "_");
+        }
+        mni = mni + 1;
+    }
     // Check each function
     var ci: i64 = 0;
     while ci < func_names.len() {
@@ -5565,7 +5594,7 @@ pub fn TypeChecker_verify_safety_annotations(self: &mut TypeChecker, program: Pr
             var fname: str = func_names.get(ci);
             var body: Vec<Stmt> = func_bodies.get(ci);
             var anns: Vec<Annotation> = func_anns.get(ci);
-            var errs: Vec<str> = check_safety_body(fname, body, prims, anns, func_names, func_prim_lists, func_fn_params.get(ci), method_names);
+            var errs: Vec<str> = check_safety_body(fname, body, prims, anns, func_pos, func_prim_lists, func_fn_params.get(ci), method_names, msuf);
             var ei: i64 = 0;
             while ei < errs.len() {
                 self.errors.push(errs.get(ei));
@@ -5623,7 +5652,7 @@ pub fn TypeChecker_verify_safety_annotations(self: &mut TypeChecker, program: Pr
         if tc_vec_contains_str(func_prim_lists.get(bsi), "bounded-stack") {
             var why: str = bounded_stack_violation_fd(func_names.get(bsi), cg_names, cg_calls, cg_offsets, leaves);
             if str_len(why) > 0 {
-                self.errors.push("Safety error (bounded-stack): function '" + func_names.get(bsi) + "' is @bounded-stack but " + why + ".\n    Its stack depth has no bound: every function it can reach must be\n    non-recursive and called directly.");
+                self.errors.push("Safety error (bounded-stack): function '" + func_names.get(bsi) + "' is @bounded-stack but " + why + ".\n    Its stack depth has no bound: every function it can reach must be\n    non-recursive and called directly.\n    Fix: replace the recursion with a loop and call functions by name (not through function values), or remove @bounded-stack.");
             } else {
                 // @bounded-stack(N): the acyclicity check above proved the
                 // reachable call graph is a DAG — now measure the longest
@@ -5650,7 +5679,7 @@ pub fn TypeChecker_verify_safety_annotations(self: &mut TypeChecker, program: Pr
                     var memo_vals: Vec<i64> = Vec::new();
                     var depth: i64 = bs_depth(root_i, cg_names, cg_calls, cg_offsets, index2, leaves, &mut memo_names, &mut memo_vals);
                     if depth > bound {
-                        self.errors.push("Safety error (bounded-stack): function '" + func_names.get(bsi) + "' is @bounded-stack(" + int_to_str(bound) + ") but its deepest static call chain is " + int_to_str(depth) + " frames — it exceeds the declared\n    frame budget. Reduce call depth or raise the bound.");
+                        self.errors.push("Safety error (bounded-stack): function '" + func_names.get(bsi) + "' is @bounded-stack(" + int_to_str(bound) + ") but its deepest static call chain is " + int_to_str(depth) + " frames — it exceeds the declared\n    frame budget. Reduce call depth or raise the bound.\n    Fix: raise the bound to @bounded-stack(" + int_to_str(depth) + "), or flatten the deepest calls.");
                     }
                 }
             }
@@ -6198,21 +6227,6 @@ pub fn safety_fn_params(params: Vec<Param>) -> Vec<str> {
     return out;
 }
 
-/// The user method a ".m" call can name: the first `Type_m` among the
-/// methods of user types, or "" (a builtin method of Vec, HashMap, str,
-/// Option or Result).
-fn safety_resolve_method(m: str, method_names: Vec<str>) -> str {
-    var suffix: str = "_" + m;
-    var i: i64 = 0;
-    while i < method_names.len() {
-        if str_ends_with(method_names.get(i), suffix) {
-            return method_names.get(i);
-        }
-        i = i + 1;
-    }
-    return "";
-}
-
 /// The methods of the builtin Vec, HashMap and str (as the checker's
 /// method dispatch knows them): a `.m()` of one of these names may be on a
 /// builtin value, whatever user type also has a method `m`.
@@ -6221,7 +6235,7 @@ fn safety_builtin_method(m: str) -> bool {
 }
 
 // Check a function body for safety violations
-pub fn check_safety_body(func_name: str, body: Vec<Stmt>, prims: Vec<str>, anns: Vec<Annotation>, all_func_names: Vec<str>, all_func_prims: Vec<StrStack>, fn_params: Vec<str>, method_names: Vec<str>) -> Vec<str> {
+pub fn check_safety_body(func_name: str, body: Vec<Stmt>, prims: Vec<str>, anns: Vec<Annotation>, func_pos: i64, all_func_prims: Vec<StrStack>, fn_params: Vec<str>, method_names: Vec<str>, msuf: i64) -> Vec<str> {
     var errs: Vec<str> = Vec::new();
     var label: str = safety_domain_label(prims);
 
@@ -6287,7 +6301,10 @@ pub fn check_safety_body(func_name: str, body: Vec<Stmt>, prims: Vec<str>, anns:
             // which knows the receiver's type.
             var user_fn: str = "";
             if !safety_builtin_method(m) {
-                user_fn = safety_resolve_method(m, method_names);
+                var msv: i64 = HashMap_get(msuf, m);
+                if msv > 0 {
+                    user_fn = method_names.get(msv - 1);
+                }
             }
             if user_fn == "" {
                 if has_primitive(prims, "no-alloc") && tc_vec_contains_str(alloc_methods, m) {
@@ -6315,7 +6332,7 @@ pub fn check_safety_body(func_name: str, body: Vec<Stmt>, prims: Vec<str>, anns:
         // bound to a plain name that is no function (`val max = MAX`) is
         // no function value.
         var local_at: i64 = -1;
-        if !tc_vec_contains_str(all_func_names, called) && !tc_vec_contains_str(fn_params, called) {
+        if !HashMap_contains(func_pos, called) && !tc_vec_contains_str(fn_params, called) {
             local_at = tc_last_index_of(let_names, called);
         }
         var local_target: str = "";
@@ -6323,7 +6340,7 @@ pub fn check_safety_body(func_name: str, body: Vec<Stmt>, prims: Vec<str>, anns:
         if local_at >= 0 {
             match let_inits.get(local_at) {
                 Expr::Ident(tn) => {
-                    if tn == func_name || tc_vec_contains_str(all_func_names, tn) {
+                    if tn == func_name || HashMap_contains(func_pos, tn) {
                         local_target = tn;
                     } else if !tc_vec_contains_str(fn_params, tn) && tc_last_index_of(let_names, tn) < 0 {
                         local_at = -1;
@@ -6439,14 +6456,10 @@ pub fn check_safety_body(func_name: str, body: Vec<Stmt>, prims: Vec<str>, anns:
         // (with compatible or superset primitives)
         var is_known_func: bool = false;
         var callee_prims: Vec<str> = Vec::new();
-        var fi: i64 = 0;
-        while fi < all_func_names.len() {
-            if all_func_names.get(fi) == called {
-                is_known_func = true;
-                callee_prims = all_func_prims.get(fi);
-                fi = all_func_names.len();
-            }
-            fi = fi + 1;
+        var cpos: i64 = HashMap_get(func_pos, called);
+        if cpos > 0 {
+            is_known_func = true;
+            callee_prims = all_func_prims.get(cpos - 1);
         }
         if !is_known_func {
             // Unknown — might be builtin, skip
@@ -6499,7 +6512,7 @@ pub fn check_safety_body(func_name: str, body: Vec<Stmt>, prims: Vec<str>, anns:
         scan_for_panic_risks(body, wrapping, &mut risk_lines, &mut risk_msgs);
         var rk: i64 = 0;
         while rk < risk_lines.len() {
-            errs.push("Safety error (" + label + ") (line " + int_to_str(risk_lines.get(rk)) + "): function '" + func_name + "' " + risk_msgs.get(rk) + ".\n    Crashfree functions must never panic.");
+            errs.push("Safety error (" + label + ") (line " + int_to_str(risk_lines.get(rk)) + "): function '" + func_name + "' " + risk_msgs.get(rk) + ".\n    Crashfree functions must never panic.\n    Fix: check the case that would panic before the operation (the bounds of an index, a zero divisor; `match` an Option instead of unwrap()), or remove the annotation.");
             rk = rk + 1;
         }
     }
@@ -8133,7 +8146,7 @@ fn TypeChecker_ct_check_one(self: &mut TypeChecker, func: Func, label: str, eff_
     while ei < effects.len() {
         var eff: str = effects.get(ei);
         if eff == "IO" || eff == "Net" || eff == "Spawn" || eff == "Diverge" {
-            self.errors.push("Constant-time error: function '" + label + "' is @constant_time but has effect '!" + eff + "'");
+            self.errors.push("Constant-time error: function '" + label + "' is @constant_time but has effect '!" + eff + "'\n    Fix: do the '!" + eff + "' work in the caller of '" + label + "', or remove @constant_time.");
         }
         ei = ei + 1;
     }
@@ -8152,7 +8165,7 @@ fn TypeChecker_ct_check_one(self: &mut TypeChecker, func: Func, label: str, eff_
             }
         }
         if is_user && !str_vec_contains(ct_names, called) && !str_starts_with(called, "p_") && !str_starts_with(called, "__") {
-            self.errors.push("Security error (constant_time): function '" + label + "' calls '" + called + "', which is not @constant_time.");
+            self.errors.push("Security error (constant_time): function '" + label + "' calls '" + called + "', which is not @constant_time.\n    Fix: mark '" + called + "' @constant_time (it must then pass the same checks), or call it outside '" + label + "'.");
         }
         ki = ki + 1;
     }
@@ -8160,7 +8173,7 @@ fn TypeChecker_ct_check_one(self: &mut TypeChecker, func: Func, label: str, eff_
     ct_scan_early_returns(func.body, &mut ret_lines);
     var ri: i64 = 0;
     while ri < ret_lines.len() {
-        self.errors.push("Security error (constant_time) (line " + int_to_str(ret_lines.get(ri)) + "): function '" + label + "' has an early return.");
+        self.errors.push("Security error (constant_time) (line " + int_to_str(ret_lines.get(ri)) + "): function '" + label + "' has an early return.\n    Fix: keep the result in a variable and return once, at the end; select between values with arithmetic on a 0/1 mask, not with `if`.");
         ri = ri + 1;
     }
     var out_lines: Vec<i64> = Vec::new();
@@ -8168,7 +8181,7 @@ fn TypeChecker_ct_check_one(self: &mut TypeChecker, func: Func, label: str, eff_
     ct_secret_dependence(func, &mut out_lines, &mut out_msgs);
     var oi: i64 = 0;
     while oi < out_lines.len() {
-        self.errors.push("Security error (constant_time) (line " + int_to_str(out_lines.get(oi)) + "): function '" + label + "' " + out_msgs.get(oi) + ".");
+        self.errors.push("Security error (constant_time) (line " + int_to_str(out_lines.get(oi)) + "): function '" + label + "' " + out_msgs.get(oi) + ".\n    Fix: make the operation independent of the secret: select with arithmetic on a 0/1 mask instead of a branch, and index only with public values.");
         oi = oi + 1;
     }
 }
@@ -8977,7 +8990,7 @@ fn TypeChecker_realtime_one(self: &mut TypeChecker, func: Func, label: str) {
     while ei < effects.len() {
         var eff: str = effects.get(ei);
         if eff == "IO" || eff == "Net" || eff == "Spawn" {
-            self.errors.push("Realtime error: function '" + label + "' is @realtime but has effect '!" + eff + "' which may block");
+            self.errors.push("Realtime error: function '" + label + "' is @realtime but has effect '!" + eff + "' which may block\n    Fix: do the blocking '!" + eff + "' work outside '" + label + "' (in a task that is not @realtime), or remove @realtime.");
         }
         ei = ei + 1;
     }
@@ -8988,7 +9001,7 @@ fn TypeChecker_realtime_one(self: &mut TypeChecker, func: Func, label: str) {
     var while_sites: Vec<i64> = Vec::new();
     scan_for_while_loops(func.body, &mut while_sites);
     if while_sites.len() > 0 {
-        self.errors.push("Real-time error: function '" + label + "' contains a 'while' loop. While loops have unbounded iteration counts.");
+        self.errors.push("Real-time error: function '" + label + "' contains a 'while' loop. While loops have unbounded iteration counts.\n    Fix: loop a bounded number of times (`for i in 0..N { ... }`), or remove @realtime.");
     }
     var reported: Vec<str> = Vec::new();
     var ci: i64 = 0;
@@ -8997,9 +9010,9 @@ fn TypeChecker_realtime_one(self: &mut TypeChecker, func: Func, label: str) {
         if !tc_str_vec_contains(reported, c) && (tc_rt_forbidden_call(c) || c == func.name) {
             reported.push(c);
             if c == func.name {
-                self.errors.push("Real-time error: function '" + label + "' calls itself. Recursion has unbounded stack depth.");
+                self.errors.push("Real-time error: function '" + label + "' calls itself. Recursion has unbounded stack depth.\n    Fix: rewrite the recursion as a bounded `for` loop, or remove @realtime.");
             } else {
-                self.errors.push("Real-time error: function '" + label + "' calls '" + c + "'.");
+                self.errors.push("Real-time error: function '" + label + "' calls '" + c + "'.\n    Fix: do that call outside '" + label + "' (before the real-time part starts), or remove @realtime.");
             }
         }
         ci = ci + 1;
@@ -9026,7 +9039,7 @@ pub fn TypeChecker_verify_differentiable(self: &mut TypeChecker, program: Progra
             while ei < effects.len() {
                 var eff: str = effects.get(ei);
                 if eff == "IO" || eff == "Net" || eff == "Spawn" || eff == "Diverge" {
-                    self.errors.push("Differentiability error: function '" + func.name + "' is @differentiable but has effect '!" + eff + "'");
+                    self.errors.push("Differentiability error: function '" + func.name + "' is @differentiable but has effect '!" + eff + "'\n    Fix: do the '!" + eff + "' work in the caller of '" + func.name + "': a differentiable function computes only from its inputs.");
                 }
                 ei = ei + 1;
             }
@@ -9035,47 +9048,10 @@ pub fn TypeChecker_verify_differentiable(self: &mut TypeChecker, program: Progra
     }
 }
 
-/// The body of the function or (unmangled) method `name`, if any.
-fn tc_body_by_name(program: Program, name: str, out: &mut Vec<StmtList>) -> bool {
-    var fi: i64 = 0;
-    while fi < program.funcs.len() {
-        if program.funcs.get(fi).name == name {
-            out.push(program.funcs.get(fi).body);
-            return true;
-        }
-        fi = fi + 1;
-    }
-    var ii: i64 = 0;
-    while ii < program.impls.len() {
-        var imp: ImplDef = program.impls.get(ii);
-        var mi: i64 = 0;
-        while mi < imp.methods.len() {
-            if imp.methods.get(mi).name == name {
-                out.push(imp.methods.get(mi).body);
-                return true;
-            }
-            mi = mi + 1;
-        }
-        ii = ii + 1;
-    }
-    var ti: i64 = 0;
-    while ti < program.trait_impls.len() {
-        var timp: TraitImpl = program.trait_impls.get(ti);
-        var tmi: i64 = 0;
-        while tmi < timp.methods.len() {
-            if timp.methods.get(tmi).name == name {
-                out.push(timp.methods.get(tmi).body);
-                return true;
-            }
-            tmi = tmi + 1;
-        }
-        ti = ti + 1;
-    }
-    return false;
-}
-
 /// Whether `start` reaches dequantize_q8 through calls (src/typechecker.rs).
-fn tc_transitively_calls_dequant(program: Program, start: str) -> bool {
+/// SP10: `idx` is tc_body_index's name -> body index (trait impl methods
+/// are not in it; they keep their scan, on an index miss only).
+fn tc_transitively_calls_dequant(program: Program, idx: i64, start: str) -> bool {
     var visited: Vec<str> = Vec::new();
     var stack: Vec<str> = Vec::new();
     stack.push(start);
@@ -9084,7 +9060,27 @@ fn tc_transitively_calls_dequant(program: Program, start: str) -> bool {
         if !tc_str_vec_contains(visited, cur) {
             visited.push(cur);
             var body: Vec<StmtList> = Vec::new();
-            if tc_body_by_name(program, cur, &mut body) {
+            match tc_find_body_indexed(program, idx, cur) {
+                OptStmtList::Some(s) => {
+                    body.push(s);
+                }
+                OptStmtList::None => {
+                    var tqi: i64 = 0;
+                    while tqi < program.trait_impls.len() && body.len() == 0 {
+                        var tqimp: TraitImpl = program.trait_impls.get(tqi);
+                        var tqmi: i64 = 0;
+                        while tqmi < tqimp.methods.len() {
+                            if tqimp.methods.get(tqmi).name == cur {
+                                body.push(tqimp.methods.get(tqmi).body);
+                                break;
+                            }
+                            tqmi = tqmi + 1;
+                        }
+                        tqi = tqi + 1;
+                    }
+                }
+            }
+            if body.len() > 0 {
                 var calls: Vec<str> = Vec::new();
                 scan_stmts_for_calls(body.get(0), &mut calls);
                 var ci: i64 = 0;
@@ -9105,6 +9101,7 @@ fn tc_transitively_calls_dequant(program: Program, start: str) -> bool {
 pub fn TypeChecker_verify_quantized(self: &mut TypeChecker, program: Program) {
     // @quantized: quantization annotation
     // Rejects IO/Net/Spawn/Diverge effects (same as @differentiable).
+    var bidx: i64 = 0 - 1;
     var fi: i64 = 0;
     while fi < program.funcs.len() {
         var func: Func = program.funcs.get(fi);
@@ -9122,13 +9119,16 @@ pub fn TypeChecker_verify_quantized(self: &mut TypeChecker, program: Program) {
             while ei < effects.len() {
                 var eff: str = effects.get(ei);
                 if eff == "IO" || eff == "Net" || eff == "Spawn" || eff == "Diverge" {
-                    self.errors.push("Quantization error: function '" + func.name + "' is @quantized but has effect '!" + eff + "'");
+                    self.errors.push("Quantization error: function '" + func.name + "' is @quantized but has effect '!" + eff + "'\n    Fix: do the '!" + eff + "' work in the caller of '" + func.name + "', or remove @quantized.");
                 }
                 ei = ei + 1;
             }
             // Dequantizing inside a @quantized function defeats it.
-            if tc_transitively_calls_dequant(program, func.name) {
-                self.errors.push("Quantization error: function '" + func.name + "' is @quantized but (transitively) calls dequantize_q8.");
+            if bidx < 0 {
+                bidx = tc_body_index(program);
+            }
+            if tc_transitively_calls_dequant(program, bidx, func.name) {
+                self.errors.push("Quantization error: function '" + func.name + "' is @quantized but (transitively) calls dequantize_q8.\n    Fix: keep the values quantized (qmatmul and the other q8 operations), and dequantize in the caller of '" + func.name + "'.");
             }
         }
         fi = fi + 1;
@@ -9166,7 +9166,7 @@ pub fn TypeChecker_verify_checkpoint(self: &mut TypeChecker, program: Program) {
             ai = ai + 1;
         }
         if is_checkpoint && !is_differentiable {
-            self.errors.push("Checkpoint error: function '" + func.name + "' is @checkpoint but not @differentiable");
+            self.errors.push("Checkpoint error: function '" + func.name + "' is @checkpoint but not @differentiable\n    Fix: add @differentiable to '" + func.name + "', or remove @checkpoint.");
         }
         // Recompute in the backward pass must give the same values.
         if is_checkpoint && !tc_anns_have(func.annotations, "deterministic") {
@@ -9214,7 +9214,7 @@ pub fn TypeChecker_verify_dp(self: &mut TypeChecker, program: Program) {
         if is_dp {
             // Validate epsilon is positive
             if epsilon <= 0.0 {
-                self.errors.push("Differential privacy error: function '" + func.name + "' has @dp(epsilon=" + float_to_str(epsilon) + ") — epsilon must be positive");
+                self.errors.push("Differential privacy error: function '" + func.name + "' has @dp(epsilon=" + float_to_str(epsilon) + ") — epsilon must be positive\n    Fix: give a positive budget, e.g. `@dp(epsilon=1.0)`.");
             }
             dp_names.push(func.name);
             dp_epsilons.push(epsilon);
@@ -9235,13 +9235,13 @@ pub fn TypeChecker_verify_dp(self: &mut TypeChecker, program: Program) {
             var effects: Vec<str> = TypeChecker_get_func_effects(self, func.name);
             // DP needs noise added to the data/gradients.
             if !str_vec_contains_ref(effects, "Noise") {
-                self.errors.push("Differential privacy error: function '" + func.name + "' is @dp but has no '!Noise' effect.");
+                self.errors.push("Differential privacy error: function '" + func.name + "' is @dp but has no '!Noise' effect.\n    Fix: add noise to the result (p_dp_noise and the `!Noise` effect in the signature), or remove @dp.");
             }
             var ei: i64 = 0;
             while ei < effects.len() {
                 var eff: str = effects.get(ei);
                 if eff == "IO" || eff == "Net" || eff == "Spawn" || eff == "Diverge" {
-                    self.errors.push("DP error: function '" + func.name + "' is @dp but has effect '!" + eff + "'");
+                    self.errors.push("DP error: function '" + func.name + "' is @dp but has effect '!" + eff + "'\n    Fix: do the '!" + eff + "' work in the caller of '" + func.name + "', or remove @dp.");
                 }
                 ei = ei + 1;
             }
@@ -9259,7 +9259,7 @@ pub fn TypeChecker_verify_dp(self: &mut TypeChecker, program: Program) {
         var visited: Vec<str> = Vec::new();
         var total: f64 = dp_compute_total_epsilon(target, dp_names, dp_epsilons, dp_call_names, dp_call_offsets, dp_call_flat, &mut visited);
         if total > declared {
-            self.errors.push("Differential privacy error: function '" + target + "' declares @dp(epsilon=" + float_to_str(declared) + ") but total epsilon across @dp callees is " + float_to_str(total));
+            self.errors.push("Differential privacy error: function '" + target + "' declares @dp(epsilon=" + float_to_str(declared) + ") but total epsilon across @dp callees is " + float_to_str(total) + "\n    Fix: raise the budget to @dp(epsilon=" + float_to_str(total) + "), or call fewer @dp functions from '" + target + "'.");
         }
         nri = nri + 1;
     }
@@ -9389,13 +9389,13 @@ pub fn TypeChecker_verify_shard(self: &mut TypeChecker, program: Program) {
         if is_shard {
             var effects: Vec<str> = TypeChecker_get_func_effects(self, func.name);
             if !str_vec_contains_ref(effects, "Comm") {
-                self.errors.push("Shard error: function '" + func.name + "' is @shard but has no '!Comm' effect.");
+                self.errors.push("Shard error: function '" + func.name + "' is @shard but has no '!Comm' effect.\n    Fix: declare `!Comm` on '" + func.name + "' and exchange the shards through the collective calls, or remove @shard.");
             }
             var ei: i64 = 0;
             while ei < effects.len() {
                 var eff: str = effects.get(ei);
                 if eff == "IO" || eff == "Net" || eff == "Spawn" || eff == "Diverge" {
-                    self.errors.push("Shard error: function '" + func.name + "' is @shard but has effect '!" + eff + "'");
+                    self.errors.push("Shard error: function '" + func.name + "' is @shard but has effect '!" + eff + "'\n    Fix: do the '!" + eff + "' work in the caller of '" + func.name + "', or remove @shard.");
                 }
                 ei = ei + 1;
             }
@@ -9420,7 +9420,7 @@ pub fn TypeChecker_verify_adapter(self: &mut TypeChecker, program: Program) {
         }
         if is_adapter {
             if func.params.len() == 0 {
-                self.errors.push("Adapter error: function '" + func.name + "' is @adapter but has no parameters");
+                self.errors.push("Adapter error: function '" + func.name + "' is @adapter but has no parameters\n    Fix: give '" + func.name + "' the value it adapts as a parameter, or remove @adapter.");
             }
         }
         fi = fi + 1;
@@ -9476,7 +9476,7 @@ pub fn TypeChecker_verify_scoped(self: &mut TypeChecker, program: Program) {
         var fi: i64 = 0;
         while fi < sd.fields.len() {
             if TypeChecker_mentions_scoped(self, sd.fields.get(fi).ty) {
-                self.errors.push("Borrow error: field '" + sd.fields.get(fi).name + "' of struct '" + sd.name + "' holds a @scoped struct, which cannot be kept.");
+                self.errors.push("Borrow error: field '" + sd.fields.get(fi).name + "' of struct '" + sd.name + "' holds a @scoped struct, which cannot be kept.\n    Fix: copy what you need out of the @scoped value (str_clone for its strings) into a plain struct, and keep that.");
             }
             fi = fi + 1;
         }
@@ -9485,7 +9485,7 @@ pub fn TypeChecker_verify_scoped(self: &mut TypeChecker, program: Program) {
     var gi: i64 = 0;
     while gi < program.globals.len() {
         if TypeChecker_mentions_scoped(self, program.globals.get(gi).ty) {
-            self.errors.push("Borrow error: global '" + program.globals.get(gi).name + "' holds a @scoped struct, which cannot be kept.");
+            self.errors.push("Borrow error: global '" + program.globals.get(gi).name + "' holds a @scoped struct, which cannot be kept.\n    Fix: copy what you need out of the @scoped value (str_clone for its strings) into a plain struct, and keep that.");
         }
         gi = gi + 1;
     }
@@ -9493,14 +9493,14 @@ pub fn TypeChecker_verify_scoped(self: &mut TypeChecker, program: Program) {
     while fni < program.funcs.len() {
         var f: Func = program.funcs.get(fni);
         if TypeChecker_mentions_scoped(self, f.ret_ty) {
-            self.errors.push("Borrow error: function '" + f.name + "' returns a @scoped struct, which cannot outlive its scope.");
+            self.errors.push("Borrow error: function '" + f.name + "' returns a @scoped struct, which cannot outlive its scope.\n    Fix: return a plain struct made from it (copy its strings with str_clone).");
         }
         var pi: i64 = 0;
         while pi < f.params.len() {
             match f.params.get(pi).ty {
                 Type::Generic(_, _) => {
                     if TypeChecker_mentions_scoped(self, f.params.get(pi).ty) {
-                        self.errors.push("Borrow error: parameter '" + f.params.get(pi).name + "' of '" + f.name + "' holds @scoped structs in a collection, which cannot be kept.");
+                        self.errors.push("Borrow error: parameter '" + f.params.get(pi).name + "' of '" + f.name + "' holds @scoped structs in a collection, which cannot be kept.\n    Fix: copy what you need into a collection of plain structs (str_clone for the strings).");
                     }
                 }
                 _ => {
@@ -9540,7 +9540,7 @@ pub fn TypeChecker_verify_tainted(self: &mut TypeChecker, program: Program) {
             while ei < effects.len() {
                 var eff: str = effects.get(ei);
                 if eff == "IO" || eff == "Net" {
-                    self.errors.push("Taint error: function '" + func.name + "' is @tainted but has effect '!" + eff + "' which could leak tainted data");
+                    self.errors.push("Taint error: function '" + func.name + "' is @tainted but has effect '!" + eff + "' which could leak tainted data\n    Fix: pass the value through a sanitizer and do the '!" + eff + "' work in the caller of '" + func.name + "', or remove @tainted.");
                 }
                 ei = ei + 1;
             }
@@ -12266,7 +12266,7 @@ pub fn TypeChecker_verify_emit(self: &mut TypeChecker, program: Program) {
         while mi < imp.methods.len() {
             var m: Func = imp.methods.get(mi);
             if tf_has_ann(m.annotations, "event") {
-                self.errors.push("Event error: method '" + imp.struct_name + "." + m.name + "' is an @event.\n    An event is a free function: `@event fn " + m.name + "(...) {}` at module level.");
+                self.errors.push("Event error: method '" + imp.struct_name + "." + m.name + "' is an @event.\n    An event is a free function: `@event fn " + m.name + "(...) {}` at module level.\n    Fix: move it out of the impl: `@event fn " + m.name + "(...) {}`.");
             }
             if tf_has_ann(m.annotations, "contract") {
                 self.errors.push("Contract error: method '" + imp.struct_name + "." + m.name + "' is a @contract.\n    A contract entry point is a free function (its calls are followed by the verifier).\n    Fix: make it a module-level function taking the state as a parameter.");
@@ -12500,7 +12500,7 @@ pub fn TypeChecker_verify_contracts(self: &mut TypeChecker, program: Program) {
                     while qi < pf.preconditions.len() {
                         // 1 = true, 0 = false, -1 = unknown
                         if ct_eval_bool(pf.preconditions.get(qi), bnames, bvals) == 0 {
-                            self.errors.push("Contract error (F10): precondition violated in call to '" + callees.get(ci) + "'. The 'given' contract is not satisfied with the provided arguments.");
+                            self.errors.push("Contract error (F10): precondition violated in call to '" + callees.get(ci) + "'. The 'given' contract is not satisfied with the provided arguments.\n    Fix: pass arguments that satisfy the `given` condition of '" + callees.get(ci) + "', or check them before the call.");
                         }
                         qi = qi + 1;
                     }
@@ -12789,7 +12789,7 @@ pub fn TypeChecker_verify_allocator_params(self: &mut TypeChecker, program: Prog
             if ann.name == "allocator" {
                 // @allocator requires at least one arg (the allocator name or type)
                 if ann.args.len() == 0 {
-                    self.errors.push("Allocator error: function '" + func.name + "' has @allocator but no allocator parameter specified");
+                    self.errors.push("Allocator error: function '" + func.name + "' has @allocator but no allocator parameter specified\n    Fix: name the allocator: `@allocator(arena)` (or the allocator type the function uses).");
                 }
             }
             ai = ai + 1;
@@ -13297,7 +13297,7 @@ fn TypeChecker_check_func_body(self: &mut TypeChecker, func: Func) {
                 }
             }
             if returns_value && func.name != "main" && !stmts_always_leave(func.body) {
-                self.errors.push("Type error: '" + func.name + "' is declared to return " + type_to_str(declared) + " but can reach the end of its body without returning");
+                self.errors.push("Type error: '" + func.name + "' is declared to return " + type_to_str(declared) + " but can reach the end of its body without returning\n    Fix: add a `return` (of a " + type_to_str(declared) + ") at the end of '" + func.name + "', or on every path that reaches it.");
             }
         }
         OptType::None => {
@@ -13581,7 +13581,7 @@ pub fn TypeChecker_pop_scope(self: &mut TypeChecker) {
                 }
             }
             if !lv_done {
-                self.errors.push("Linear type error (line " + int_to_str(lv.line) + "): variable '" + lv.name + "' is linear but was never consumed.");
+                self.errors.push("Linear type error (line " + int_to_str(lv.line) + "): variable '" + lv.name + "' is linear but was never consumed.\n    Fix: consume '" + lv.name + "' before its scope ends: pass it to a function that takes it, or return it.");
             }
             i = i + 1;
         }
@@ -14858,7 +14858,7 @@ pub fn type_eq(a: Type, b: Type) -> bool {
 /// are exempt: see tc_module_needs_unsafe.
 fn TypeChecker_require_unsafe(self: &mut TypeChecker, what: str) {
     if self.unsafe_depth == 0 && tc_module_needs_unsafe(self.current_module) {
-        self.errors.push("Safety error (line " + int_to_str(self.current_line) + "): " + what + " needs an `unsafe` block.");
+        self.errors.push("Safety error (line " + int_to_str(self.current_line) + "): " + what + " needs an `unsafe` block.\n    Fix: wrap it in `unsafe { ... }`, or use a safe Vec/Box instead of raw memory.");
     }
 }
 
@@ -15281,9 +15281,9 @@ fn TypeChecker_check_value_fits(self: &mut TypeChecker, declared0: Type, actual0
     if checked {
         if !fits {
             if ct_fold_named {
-                self.errors.push("Type error (line " + int_to_str(line) + "): the comptime value " + int_to_str(ct_fold_val) + " does not fit in " + type_to_str(declared) + ".");
+                self.errors.push("Type error (line " + int_to_str(line) + "): the comptime value " + int_to_str(ct_fold_val) + " does not fit in " + type_to_str(declared) + ".\n    Fix: give it a wider type (i64), or make the value fit in " + type_to_str(declared) + ".");
             } else {
-                self.errors.push("Type error (line " + int_to_str(line) + "): the literal does not fit in " + type_to_str(declared) + ".");
+                self.errors.push("Type error (line " + int_to_str(line) + "): the literal does not fit in " + type_to_str(declared) + ".\n    Fix: give it a wider type (i64), or use a value that fits in " + type_to_str(declared) + ".");
             }
         }
         return;
@@ -16081,14 +16081,11 @@ fn TypeChecker_check_spec_call(self: &mut TypeChecker, callee: str, tps: Vec<str
 // impls whose type takes the receiver's are compared, as for functions.
 var g_tc_mspecs: Vec<Func> = Vec::new();
 var g_tc_mspec_structs: Vec<str> = Vec::new();
+var g_tc_mspec_seen: i64 = HashMap_new();  // "struct::name" -> 1
 
 fn TypeChecker_note_mspec(self: &mut TypeChecker, imp: ImplDef, m: Func) {
-    var i: i64 = 0;
-    while i < g_tc_mspecs.len() {
-        if g_tc_mspec_structs.get(i) == imp.struct_name && g_tc_mspecs.get(i).name == m.name {
-            return;
-        }
-        i = i + 1;
+    if HashMap_contains(g_tc_mspec_seen, imp.struct_name + "::" + m.name) {
+        return;
     }
     var st: Type = TypeChecker_resolve_type(self, m.params.get(0).ty);
     match st {
@@ -16105,6 +16102,7 @@ fn TypeChecker_note_mspec(self: &mut TypeChecker, imp: ImplDef, m: Func) {
     r.params = ps;
     g_tc_mspecs.push(r);
     g_tc_mspec_structs.push(imp.struct_name);
+    HashMap_insert(g_tc_mspec_seen, imp.struct_name + "::" + m.name, 1);
 }
 
 /// `impl<A> Pair<A, i64>` for a message.
@@ -16469,7 +16467,7 @@ fn TypeChecker_check_generic_call(self: &mut TypeChecker, callee: str, tps: Vec<
         var pt: Type = tc_subst_type_params(params.get(i), names, types);
         var a: Type = arg_types.get(i);
         if !TypeChecker_type_contains_param(self, pt) && !type_eq(a, Type::Infer) && !type_eq(a, Type::Never) && !TypeChecker_arg_compatible(self, pt, a) {
-            self.errors.push("Type error (line " + int_to_str(self.current_line) + in_fn + "): function '" + callee + "' parameter " + int_to_str(i + 1) + " expects '" + type_to_str(pt) + "', got '" + type_to_str(a) + "'");
+            self.errors.push("Type error (line " + int_to_str(self.current_line) + in_fn + "): function '" + callee + "' parameter " + int_to_str(i + 1) + " expects '" + type_to_str(pt) + "', got '" + type_to_str(a) + "'\n    Fix: pass a value of type '" + type_to_str(pt) + "' (for a number, cast it: `x as " + type_to_str(pt) + "`), or change the parameter's type.");
         }
         i = i + 1;
     }
@@ -16673,7 +16671,7 @@ fn TypeChecker_check_shared_change(self: &mut TypeChecker, root: str, place: str
                         if str_len(what) == 0 {
                             what = root;
                         }
-                        self.errors.push("Type error (line " + int_to_str(self.current_line) + "): cannot change '" + what + "' through a shared reference '" + root + ": &" + tn + "' (take '&mut " + tn + "')");
+                        self.errors.push("Type error (line " + int_to_str(self.current_line) + "): cannot change '" + what + "' through a shared reference '" + root + ": &" + tn + "' (take '&mut " + tn + "')\n    Fix: declare the parameter as `" + root + ": &mut " + tn + "` and pass `&mut` at the call.");
                     }
                 }
                 _ => {
@@ -17056,6 +17054,9 @@ pub fn TypeChecker_type_contains_param(self: &TypeChecker, ty: Type) -> bool {
 // --- is_known_enum -------------------------------------------------------
 
 pub fn TypeChecker_is_known_enum(self: &TypeChecker, name: str) -> bool {
+    if self.caches_built {
+        return HashMap_get(self.enum_cache, name) > 0;
+    }
     return tc_str_vec_contains(self.enums, name);
 }
 
@@ -17828,7 +17829,7 @@ fn TypeChecker_sandbox_reject(self: &mut TypeChecker, what: str, effs: Vec<str>)
     if e == "" {
         return;
     }
-    self.errors.push("Sandbox error: '" + what + "' has effect '!" + e + "' -- all capabilities are revoked inside sandbox, including in the functions it calls");
+    self.errors.push("Sandbox error: '" + what + "' has effect '!" + e + "' -- all capabilities are revoked inside sandbox, including in the functions it calls\n    Fix: call '" + what + "' before or after the `sandbox { }` block, and pass its result in.");
 }
 
 /// A call inside sandbox: the builtin's effect (p_file_read is IO, ...),
@@ -17839,11 +17840,11 @@ fn TypeChecker_check_sandbox_call(self: &mut TypeChecker, callee: str, args: Vec
     // C code, run-time loaded code and assembly have effects the checker
     // cannot see: inside sandbox they are rejected, also through a helper.
     if TypeChecker_is_opaque_call(self, callee) {
-        self.errors.push("Sandbox error: '" + callee + "()' runs code outside Fides (C, a loaded library or a system call) whose effects are not known -- all capabilities are revoked inside sandbox");
+        self.errors.push("Sandbox error: '" + callee + "()' runs code outside Fides (C, a loaded library or a system call) whose effects are not known -- all capabilities are revoked inside sandbox\n    Fix: call '" + callee + "' before or after the `sandbox { }` block, and pass its result in.");
         return;
     }
     if HashMap_get(self.ffi_reach_index, callee) != 0 {
-        self.errors.push("Sandbox error: '" + callee + "()' calls C code, a loaded library or inline assembly (directly or through the functions it calls), whose effects are not known -- all capabilities are revoked inside sandbox");
+        self.errors.push("Sandbox error: '" + callee + "()' calls C code, a loaded library or inline assembly (directly or through the functions it calls), whose effects are not known -- all capabilities are revoked inside sandbox\n    Fix: call '" + callee + "' before or after the `sandbox { }` block, and pass its result in.");
         return;
     }
     var effs: Vec<str> = Vec::new();
@@ -17865,7 +17866,7 @@ fn TypeChecker_check_sandbox_call(self: &mut TypeChecker, callee: str, args: Vec
             OptType::Some(t) => {
                 match t {
                     Type::Func(_, _) => {
-                        self.errors.push("Sandbox error: '" + callee + "()' calls a function value whose effects are not known -- all capabilities are revoked inside sandbox");
+                        self.errors.push("Sandbox error: '" + callee + "()' calls a function value whose effects are not known -- all capabilities are revoked inside sandbox\n    Fix: call a named function whose effects are known, or call the value outside the `sandbox { }` block.");
                         return;
                     }
                     _ => {
@@ -17979,7 +17980,7 @@ fn TypeChecker_try_ret_error(self: &TypeChecker) -> str {
                 OptString::None => {
                 }
             }
-            return "Type error: the ? operator returns None or Err from the enclosing function, but " + fname + " returns " + type_to_str(rt) + " (it must return Option or Result; use match, ?? or a try { } block)";
+            return "Type error: the ? operator returns None or Err from the enclosing function, but " + fname + " returns " + type_to_str(rt) + " (it must return Option or Result; use match, ?? or a try { } block)\n    Fix: give the enclosing function an Option or Result return type, or handle the value here with `match` or `??`.";
         }
         OptType::None => {
         }
@@ -18547,7 +18548,7 @@ fn TypeChecker_check_fn_value_args(self: &mut TypeChecker, callee: str, params: 
         if !skip {
             var param: Type = TypeChecker_resolve_type(self, raw);
             if !TypeChecker_arg_compatible(self, param, arg) {
-                self.errors.push("Type error (line " + int_to_str(self.current_line) + "): function value '" + callee + "' parameter " + int_to_str(i + 1) + " expects '" + type_to_str(param) + "', got '" + type_to_str(arg) + "'");
+                self.errors.push("Type error (line " + int_to_str(self.current_line) + "): function value '" + callee + "' parameter " + int_to_str(i + 1) + " expects '" + type_to_str(param) + "', got '" + type_to_str(arg) + "'\n    Fix: pass a value of type '" + type_to_str(param) + "' (for a number, cast it: `x as " + type_to_str(param) + "`).");
             }
         }
         i = i + 1;
@@ -18617,14 +18618,14 @@ fn TypeChecker_check_dl_sym(self: &mut TypeChecker, callee: str, arg_types: Vec<
         opener = "p_dl_load";
     }
     if arg_types.len() != 2 {
-        self.errors.push("Type error (line " + int_to_str(self.current_line) + "): " + callee + " expects 2 args (a library handle and a symbol name), got " + int_to_str(arg_types.len()));
+        self.errors.push("Type error (line " + int_to_str(self.current_line) + "): " + callee + " expects 2 args (a library handle and a symbol name), got " + int_to_str(arg_types.len()) + "\n    Fix: call it as `" + callee + "(lib, \"symbol_name\")`, lib being the handle " + opener + " returned.");
         return Type::I64;
     }
     if !TypeChecker_is_integer(self, arg_types.get(0)) && !TypeChecker_is_reported(self, arg_types.get(0)) {
-        self.errors.push("Type error (line " + int_to_str(self.current_line) + "): " + callee + " parameter 1 expects a library handle (i64 from " + opener + "), got '" + type_to_str(arg_types.get(0)) + "'");
+        self.errors.push("Type error (line " + int_to_str(self.current_line) + "): " + callee + " parameter 1 expects a library handle (i64 from " + opener + "), got '" + type_to_str(arg_types.get(0)) + "'\n    Fix: pass the handle " + opener + " returned (an i64) first.");
     }
     if !tc_is_str(arg_types.get(1)) && !TypeChecker_is_reported(self, arg_types.get(1)) {
-        self.errors.push("Type error (line " + int_to_str(self.current_line) + "): " + callee + " parameter 2 expects the symbol name (str), got '" + type_to_str(arg_types.get(1)) + "'");
+        self.errors.push("Type error (line " + int_to_str(self.current_line) + "): " + callee + " parameter 2 expects the symbol name (str), got '" + type_to_str(arg_types.get(1)) + "'\n    Fix: pass the symbol's name as a str second, e.g. `\"sqlite3_open\"`.");
     }
     match TypeChecker_resolve_type(self, hint) {
         Type::Func(fparams, fret) => {
@@ -18652,7 +18653,7 @@ fn TypeChecker_check_dl_sym(self: &mut TypeChecker, callee: str, arg_types: Vec<
 
 pub fn TypeChecker_check_capability(self: &mut TypeChecker, cap: str, context: str) {
     if self.sandbox_depth > 0 {
-        self.errors.push("Sandbox error: '" + context + "' requires '" + cap + "' capability -- all capabilities are revoked inside sandbox");
+        self.errors.push("Sandbox error: '" + context + "' requires '" + cap + "' capability -- all capabilities are revoked inside sandbox\n    Fix: make the '" + cap + "' call before or after the `sandbox { }` block.");
         match self.current_func_name {
             OptString::Some(fname) => {
                 var ci: i64 = 0;
@@ -18673,7 +18674,7 @@ pub fn TypeChecker_check_capability(self: &mut TypeChecker, cap: str, context: s
         return;
     }
     if self.strict_caps && !tc_str_vec_contains(self.granted_caps, cap) {
-        self.errors.push("Capability error: '" + context + "' requires '" + cap + "' capability (not granted to module '" + self.current_module + "')");
+        self.errors.push("Capability error: '" + context + "' requires '" + cap + "' capability (not granted to module '" + self.current_module + "')\n    Fix: grant it: `use " + self.current_module + " with { " + cap + " }` where the module is imported (or list it in ark.toml's [capabilities]).");
         match self.current_func_name {
             OptString::Some(fname) => {
                 var ci2: i64 = 0;
@@ -18701,7 +18702,7 @@ pub fn TypeChecker_check_visibility(self: &mut TypeChecker, name: str) {
                 // Cross-module access: check if item is pub
                 var is_pub: bool = TypeChecker_get_item_visibility(self, name);
                 if !is_pub {
-                    self.errors.push("Visibility error: '" + name + "' is private to module '" + item_module + "' (not accessible from '" + self.current_module + "')");
+                    self.errors.push("Visibility error: '" + name + "' is private to module '" + item_module + "' (not accessible from '" + self.current_module + "')\n    Fix: mark it `pub` in module '" + item_module + "', or use a public function of that module instead.");
                 }
             }
         }
@@ -19320,7 +19321,7 @@ pub fn TypeChecker_is_sync_type(self: &TypeChecker, ty: Type) -> bool {
 
 pub fn TypeChecker_consume_var(self: &mut TypeChecker, name: str, line: i64) {
     if self.loop_depth > 0 {
-        self.errors.push("Linear type error (line " + int_to_str(line) + "): variable '" + name + "' cannot be consumed inside a loop." + "\n    Linear values can only be used once — consuming them inside a loop\n    would fail on the second iteration. Move the consumption outside" + "\n    the loop, or use a non-linear type.");
+        self.errors.push("Linear type error (line " + int_to_str(line) + "): variable '" + name + "' cannot be consumed inside a loop." + "\n    Linear values can only be used once — consuming them inside a loop\n    would fail on the second iteration. Move the consumption outside" + "\n    the loop, or use a non-linear type.\n    Fix: consume it once, after the loop, or clone its data into a non-linear value for the loop.");
     }
     // A path `a.f` (a linear field moved out): `a` itself, or the path,
     // may not have been moved already; moving `a` after one of its fields
@@ -19917,12 +19918,12 @@ fn TypeChecker_check_index_assign(self: &mut TypeChecker, array: str, target_ty:
     }
     var it: Type = TypeChecker_resolve_type(self, idx_ty);
     if !TypeChecker_is_integer(self, it) && !type_eq(it, Type::Never) {
-        self.errors.push("Type error (line " + int_to_str(line) + "): array index must be an integer, got " + type_to_str(it) + " (in the assignment to '" + array + "[..]').");
+        self.errors.push("Type error (line " + int_to_str(line) + "): array index must be an integer, got " + type_to_str(it) + " (in the assignment to '" + array + "[..]').\n    Fix: index with an integer (`i as i64` for another number type).");
     }
     var et: Type = TypeChecker_resolve_self_type(self, elem);
     var vt: Type = TypeChecker_resolve_self_type(self, val_ty);
     if !TypeChecker_types_compatible(self, et, vt) && !(is_runtime_layer(self.current_module) && is_handle_int_pair(et, vt)) {
-        self.errors.push("Type error (line " + int_to_str(line) + "): cannot assign " + type_to_str(vt) + " to an element of '" + array + "', whose elements are " + type_to_str(et) + ".\n    Expected: " + type_to_str(et) + "\n    Found:    " + type_to_str(vt));
+        self.errors.push("Type error (line " + int_to_str(line) + "): cannot assign " + type_to_str(vt) + " to an element of '" + array + "', whose elements are " + type_to_str(et) + ".\n    Expected: " + type_to_str(et) + "\n    Found:    " + type_to_str(vt) + "\n    Fix: store a " + type_to_str(et) + " (for a number, cast it: `x as " + type_to_str(et) + "`), or declare '" + array + "' with elements of " + type_to_str(vt) + ".");
     }
 }
 
@@ -19939,7 +19940,7 @@ fn TypeChecker_check_deref_value(self: &mut TypeChecker, ptr_expr: Expr, pointee
     if str_len(what) == 0 {
         what = "a value";
     }
-    self.errors.push("Type error (line " + int_to_str(line) + "): cannot assign " + type_to_str(vt) + " to '*" + what + "' of type " + type_to_str(pt) + ".\n    Expected: " + type_to_str(pt) + "\n    Found:    " + type_to_str(vt));
+    self.errors.push("Type error (line " + int_to_str(line) + "): cannot assign " + type_to_str(vt) + " to '*" + what + "' of type " + type_to_str(pt) + ".\n    Expected: " + type_to_str(pt) + "\n    Found:    " + type_to_str(vt) + "\n    Fix: assign a " + type_to_str(pt) + " through the reference (for a number, cast it: `x as " + type_to_str(pt) + "`).");
 }
 
 /// BG2: `*x = v` where x is neither a raw pointer nor a reference (those two
@@ -19968,7 +19969,7 @@ fn TypeChecker_check_deref_other(self: &mut TypeChecker, ptr_expr: Expr, ptr_ty:
             } else {
                 // OW1, as the statement says it for a `&T` not behind an alias
                 var sn: str = type_to_str(box_type_unbox(rin));
-                self.errors.push("Type error (line " + int_to_str(line) + "): cannot change '*" + tc_place_text(ptr_expr) + "' through a shared reference '&" + sn + "' (take '&mut " + sn + "')");
+                self.errors.push("Type error (line " + int_to_str(line) + "): cannot change '*" + tc_place_text(ptr_expr) + "' through a shared reference '&" + sn + "' (take '&mut " + sn + "')\n    Fix: declare it as `&mut " + sn + "` and pass `&mut` at the call.");
             }
             return;
         }
@@ -20127,7 +20128,7 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
             match expr_ty {
                 Type::Tuple(elem_types) => {
                     if names.len() != elem_types.len() {
-                        self.errors.push("Type error (line " + int_to_str(line) + "): tuple destructuring expects " + int_to_str(names.len()) + " names but expression has " + int_to_str(elem_types.len()) + " elements");
+                        self.errors.push("Type error (line " + int_to_str(line) + "): tuple destructuring expects " + int_to_str(names.len()) + " names but expression has " + int_to_str(elem_types.len()) + " elements\n    Fix: write " + int_to_str(elem_types.len()) + " names, e.g. `val (a, b) = ...` for a pair.");
                     }
                     var i: i64 = 0;
                     while i < names.len() && i < elem_types.len() {
@@ -20148,7 +20149,7 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
                     // tuple; the names are declared (as that error's type)
                     // so their uses are not undefined variables
                     if !TypeChecker_is_reported(self, expr_ty) {
-                        self.errors.push("Type error (line " + int_to_str(line) + "): cannot destructure " + type_to_str(expr_ty) + " as a tuple");
+                        self.errors.push("Type error (line " + int_to_str(line) + "): cannot destructure " + type_to_str(expr_ty) + " as a tuple\n    Fix: destructure a tuple value; bind " + type_to_str(expr_ty) + " to one name (`val x = ...`).");
                     }
                     var ni: i64 = 0;
                     while ni < names.len() {
@@ -20217,7 +20218,7 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
             var cond_ty: Type = TypeChecker_check_expr(self, cond);
             TypeChecker_consume_linear_in_expr(self, cond, line);
             if !type_eq(cond_ty, Type::Bool) && !type_eq(cond_ty, Type::I32) && !type_eq(cond_ty, Type::I64) && !TypeChecker_is_reported(self, cond_ty) {
-                self.errors.push("Type error (line " + int_to_str(self.current_line) + "): if condition must be bool, got " + type_to_str(cond_ty));
+                self.errors.push("Type error (line " + int_to_str(self.current_line) + "): if condition must be bool, got " + type_to_str(cond_ty) + "\n    Fix: compare to get a bool, e.g. `if x != 0 { ... }` or `if s != \"\" { ... }`.");
             }
             var consumed_before: Vec<str> = self.consumed_vars.clone();
             var lin_before: Vec<str> = self.consumed_vars.clone();
@@ -20343,7 +20344,7 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
                 OptType::Some(ty) => {
                     // Re-assigning a linear variable: old value must have been consumed
                     if TypeChecker_is_linear_type(self, ty) && !tc_str_vec_contains(self.consumed_vars, target) {
-                        self.errors.push("Linear type error (line " + int_to_str(line) + "): cannot reassign '" + target + "' -- the old value would be silently destroyed");
+                        self.errors.push("Linear type error (line " + int_to_str(line) + "): cannot reassign '" + target + "' -- the old value would be silently destroyed\n    Fix: consume the old value first (pass it to a function that takes it), then assign.");
                     }
                     if TypeChecker_is_linear_type(self, ty) {
                         var ci: i64 = 0;
@@ -20359,10 +20360,10 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
                 OptType::None => {
                     // A constant has no storage to assign to
                     if map_str_type_contains(self.consts, target) {
-                        self.errors.push("Type error (line " + int_to_str(line) + "): cannot assign to constant '" + target + "'");
+                        self.errors.push("Type error (line " + int_to_str(line) + "): cannot assign to constant '" + target + "'\n    Fix: declare it with `var` (not `const`/`val`) to assign it, or assign a new local instead.");
                     }
                     if !map_str_type_contains(self.consts, target) && !map_str_type_contains(self.globals, target) {
-                        self.errors.push("Type error: cannot assign to undefined variable '" + target + "'");
+                        self.errors.push("Type error: cannot assign to undefined variable '" + target + "'\n    Fix: declare it first: `var " + target + " = ...;`.");
                     }
                 }
             }
@@ -20400,7 +20401,7 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
                             }
                         }
                         OptType::None => {
-                            self.errors.push("Type error: cannot index undefined variable '" + array + "'");
+                            self.errors.push("Type error: cannot index undefined variable '" + array + "'\n    Fix: declare it first: `var " + array + ": Vec<T> = Vec::new();`.");
                         }
                     }
                 }
@@ -20422,7 +20423,7 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
                         if str_len(da_what) == 0 {
                             da_what = "a value";
                         }
-                        self.errors.push("Type error (line " + int_to_str(da_line) + "): cannot change '*" + da_what + "' through a shared reference '&" + da_tn + "' (take '&mut " + da_tn + "')");
+                        self.errors.push("Type error (line " + int_to_str(da_line) + "): cannot change '*" + da_what + "' through a shared reference '&" + da_tn + "' (take '&mut " + da_tn + "')\n    Fix: declare it as `&mut " + da_tn + "` and pass `&mut` at the call.");
                         TypeChecker_check_expr(self, expr);
                     } else {
                         var da_val_ty: Type = TypeChecker_check_expr(self, expr);
@@ -20493,11 +20494,11 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
                             TypeChecker_consume_linear_in_expr(self, expr, line);
                             var compatible: bool = type_eq(expr_ty, fty) || type_eq(expr_ty, Type::Never) || (TypeChecker_is_integer(self, expr_ty) && TypeChecker_is_integer(self, fty)) || TypeChecker_types_compatible(self, fty, expr_ty);
                             if !compatible {
-                                self.errors.push("Type error (line " + int_to_str(line) + "): cannot assign " + type_to_str(expr_ty) + " to field '" + field + "' of type " + type_to_str(fty));
+                                self.errors.push("Type error (line " + int_to_str(line) + "): cannot assign " + type_to_str(expr_ty) + " to field '" + field + "' of type " + type_to_str(fty) + "\n    Fix: assign a " + type_to_str(fty) + " (for a number, cast it: `x as " + type_to_str(fty) + "`), or change the field's type.");
                             }
                         }
                         OptType::None => {
-                            self.errors.push("Type error (line " + int_to_str(line) + "): struct '" + name + "' has no field '" + field + "'");
+                            self.errors.push("Type error (line " + int_to_str(line) + "): struct '" + name + "' has no field '" + field + "'\n    Fix: use one of the fields struct '" + name + "' declares, or add `" + field + ": T` to it.");
                             TypeChecker_check_expr(self, expr);
                         }
                     }
@@ -20525,7 +20526,7 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
                         }
                     }
                     if !gknown {
-                        self.errors.push("Type error (line " + int_to_str(line) + "): cannot assign field '" + field + "' on type " + type_to_str(obj_ty));
+                        self.errors.push("Type error (line " + int_to_str(line) + "): cannot assign field '" + field + "' on type " + type_to_str(obj_ty) + "\n    Fix: assign fields of a struct value only; " + type_to_str(obj_ty) + " has none.");
                         TypeChecker_check_expr(self, expr);
                     }
                     if gknown {
@@ -20535,11 +20536,11 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
                             TypeChecker_consume_linear_in_expr(self, expr, line);
                             var gok: bool = type_eq(gexpr_ty, fty) || type_eq(gexpr_ty, Type::Never) || (TypeChecker_is_integer(self, gexpr_ty) && TypeChecker_is_integer(self, fty)) || TypeChecker_types_compatible(self, fty, gexpr_ty);
                             if !gok {
-                                self.errors.push("Type error (line " + int_to_str(line) + "): cannot assign " + type_to_str(gexpr_ty) + " to field '" + field + "' of type " + type_to_str(fty));
+                                self.errors.push("Type error (line " + int_to_str(line) + "): cannot assign " + type_to_str(gexpr_ty) + " to field '" + field + "' of type " + type_to_str(fty) + "\n    Fix: assign a " + type_to_str(fty) + " (for a number, cast it: `x as " + type_to_str(fty) + "`), or change the field's type.");
                             }
                         }
                         OptType::None => {
-                            self.errors.push("Type error (line " + int_to_str(line) + "): struct '" + gsn + "' has no field '" + field + "'");
+                            self.errors.push("Type error (line " + int_to_str(line) + "): struct '" + gsn + "' has no field '" + field + "'\n    Fix: use one of the fields struct '" + gsn + "' declares, or add `" + field + ": T` to it.");
                             TypeChecker_check_expr(self, expr);
                         }
                     }
@@ -20562,7 +20563,7 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
                     if is_generic {
                         self.errors.push("Type error (line " + int_to_str(line) + "): cannot assign field '" + field + "' on the generic type parameter " + type_to_str(obj_ty) + ".\n    When <T> is instantiated with a struct that has this field, the call site reports it (the body is checked per instantiation for field accesses).\n    Fix: constrain the type — a trait with a field, or pass the field's setter as a parameter.");
                     } else {
-                        self.errors.push("Type error (line " + int_to_str(line) + "): cannot assign field '" + field + "' on type " + type_to_str(obj_ty));
+                        self.errors.push("Type error (line " + int_to_str(line) + "): cannot assign field '" + field + "' on type " + type_to_str(obj_ty) + "\n    Fix: assign fields of a struct value only; " + type_to_str(obj_ty) + " has none.");
                     }
                     TypeChecker_check_expr(self, expr);
                 }
@@ -20571,7 +20572,7 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
         Stmt::While(cond, body, _) => {
             var cond_ty: Type = TypeChecker_check_expr(self, cond);
             if !type_eq(cond_ty, Type::Bool) && !type_eq(cond_ty, Type::I32) && !type_eq(cond_ty, Type::I64) && !TypeChecker_is_reported(self, cond_ty) {
-                self.errors.push("Type error: while condition must be bool, got " + type_to_str(cond_ty));
+                self.errors.push("Type error: while condition must be bool, got " + type_to_str(cond_ty) + "\n    Fix: compare to get a bool, e.g. `while i < n { ... }` or `while x != 0 { ... }`.");
             }
             // BG20: the body may run zero times: what it assigns may not be
             var wu_before: Vec<str> = self.uninit_vars.clone();
@@ -20970,7 +20971,7 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
                 }
             }
             if !is_f64 && !is_tensor {
-                self.errors.push("Type error: backward() loss must be F64 or Tensor, got " + type_to_str(loss_ty));
+                self.errors.push("Type error: backward() loss must be F64 or Tensor, got " + type_to_str(loss_ty) + "\n    Fix: call backward() on the f64 or Tensor loss the model computed (sum a Vec into one f64 first).");
             }
         }
         Stmt::Query(_, body, _) => {
@@ -21254,7 +21255,7 @@ fn TypeChecker_check_struct_lit(self: &mut TypeChecker, name: str, fields: Vec<F
                     } else {
                         var spread_ty: Type = TypeChecker_check_expr(self, spread_e);
                         if !TypeChecker_types_compatible(self, Type::Named(real_name), spread_ty) {
-                            self.errors.push("Type error: spread source expected " + real_name + ", got " + type_to_str(spread_ty));
+                            self.errors.push("Type error: spread source expected " + real_name + ", got " + type_to_str(spread_ty) + "\n    Fix: spread a " + real_name + " value (`" + real_name + " { a: 1, ..other }`, other being a " + real_name + "), or `..` alone for the defaults.");
                         }
                     }
                 }
@@ -21290,7 +21291,7 @@ fn TypeChecker_check_struct_lit(self: &mut TypeChecker, name: str, fields: Vec<F
                             want = tc_subst_type_params(want, stps, sargs);
                         }
                         if !tc_type_has_infer(want) && !TypeChecker_types_compatible(self, want, fty) {
-                            self.errors.push("Type error: field '" + fname + "' expected " + type_to_str(want) + ", got " + type_to_str(fty));
+                            self.errors.push("Type error: field '" + fname + "' expected " + type_to_str(want) + ", got " + type_to_str(fty) + "\n    Fix: give field '" + fname + "' a " + type_to_str(want) + " value.");
                         }
                         // BG117: a literal must fit the field's type —
                         // `S { b: 300 }` for `b: u8` narrowed it
@@ -21301,7 +21302,7 @@ fn TypeChecker_check_struct_lit(self: &mut TypeChecker, name: str, fields: Vec<F
                     sfi = sfi + 1;
                 }
                 if !found {
-                    self.errors.push("Type error (line " + int_to_str(self.current_line) + "): struct '" + name + "' has no field '" + fname + "'");
+                    self.errors.push("Type error (line " + int_to_str(self.current_line) + "): struct '" + name + "' has no field '" + fname + "'\n    Fix: use one of the fields struct '" + name + "' declares, or add `" + fname + ": T` to it.");
                 }
                 fi = fi + 1;
             }
@@ -21342,7 +21343,7 @@ fn TypeChecker_check_struct_lit(self: &mut TypeChecker, name: str, fields: Vec<F
     // CE6: once per function, as an undefined name is (a misspelt
     // struct is usually written several times)
     if TypeChecker_first_report(self, "struct " + name) {
-        self.errors.push("Type error (line " + int_to_str(self.current_line) + "): unknown struct '" + name + "'");
+        self.errors.push("Type error (line " + int_to_str(self.current_line) + "): unknown struct '" + name + "'\n    Fix: define it (`struct " + name + " { ... }`), import the module that defines it, or fix the name.");
     }
     return Type::Never;
 }
@@ -21443,7 +21444,7 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
                 }
             }
             if TypeChecker_first_report(self, name) {
-                self.errors.push("Type error (line " + int_to_str(self.current_line) + "): undefined variable '" + name + "'");
+                self.errors.push("Type error (line " + int_to_str(self.current_line) + "): undefined variable '" + name + "'\n    Hint: declare it before it is used (`val " + name + " = ...;`), or check the spelling.");
             }
             return Type::Never;
         }
@@ -21499,23 +21500,26 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
             // the runtime layer and the compiler, where a str is a word
             var is_cmp: bool = is_cmp_op;
             if is_cmp && !is_runtime_layer(self.current_module) && !str_starts_with(self.current_module, "compiler") && ((type_eq(lt_r, Type::Str) && TypeChecker_is_numeric(self, rt_r)) || (type_eq(rt_r, Type::Str) && TypeChecker_is_numeric(self, lt_r))) {
-                self.errors.push("Type error (line " + int_to_str(self.current_line) + "): cannot compare a str with a number (" + type_to_str(lt_r) + " with " + type_to_str(rt_r) + ").\n    `==` on a str compares text, and a str is never null: a builtin that can fail gives an Option (read_file, env_var, arg_at, read_line). To compare with a number, convert one side with `as` or int_to_str.");
-                return Type::Bool;
-            }
-            // BG60: what else a comparison's operands must be (out of line)
-            if is_cmp && TypeChecker_check_comparison(self, op, box_expr_unbox(left), box_expr_unbox(right), lt_r, rt_r) {
+                self.errors.push("Type error (line " + int_to_str(self.current_line) + "): cannot compare a str with a number (" + type_to_str(lt_r) + " with " + type_to_str(rt_r) + ").\n    `==` on a str compares text, and a str is never null: a builtin that can fail gives an Option (read_file, env_var, arg_at, read_line). To compare with a number, convert one side with `as` or int_to_str.\n    Fix: compare two numbers (`s.len() == 0`, `parse_int(s) == n`) or two strings (`s == int_to_str(n)`).");
                 return Type::Bool;
             }
             // CL10: `<` `<=` `>` `>=` on a unit (@dimension) compare its f64
-            // with another value of the same unit (lower.fd does the same)
+            // with another value of the same unit (lower.fd does the same).
+            // TL2: before BG60's check below, whose "cannot compare Len with
+            // Time" would hide the unit's message
+            // (test_frontend_units_compare_fail)
             if is_cmp && !binop_eq(op, BinOp::Eq) && !binop_eq(op, BinOp::Neq) {
                 var cmp_un: str = tc_dim_struct_name(self, lt_r);
                 if str_len(cmp_un) > 0 && tc_struct_dim(cmp_un) != 0 {
                     if !type_eq(rt_r, lt_r) && !type_eq(rt_r, Type::Never) {
-                        self.errors.push("Type error (line " + int_to_str(self.current_line) + "): `" + cmp_un + " " + tc_cmp_symbol(op) + " " + type_to_str(rt_r) + "`: a unit compares only with a value of its own unit (" + cmp_un + ").");
+                        self.errors.push("Type error (line " + int_to_str(self.current_line) + "): `" + cmp_un + " " + tc_cmp_symbol(op) + " " + type_to_str(rt_r) + "`: a unit compares only with a value of its own unit (" + cmp_un + ").\n    Fix: compare with a " + cmp_un + " (make the number one with " + cmp_un + "'s struct literal), or compare the f64 values.");
                     }
                     return Type::Bool;
                 }
+            }
+            // BG60: what else a comparison's operands must be (out of line)
+            if is_cmp && TypeChecker_check_comparison(self, op, box_expr_unbox(left), box_expr_unbox(right), lt_r, rt_r) {
+                return Type::Bool;
             }
             match op {
                 BinOp::Add => {
@@ -21549,13 +21553,13 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
                 BinOp::And => {
                     // CE6: an operand whose error is already reported adds none
                     if (!type_eq(lt_r, Type::Bool) && !TypeChecker_is_reported(self, lt_r)) || (!type_eq(rt_r, Type::Bool) && !TypeChecker_is_reported(self, rt_r)) {
-                        self.errors.push("Type error: logical operators require bool, got " + type_to_str(lt_r) + " and " + type_to_str(rt_r));
+                        self.errors.push("Type error: logical operators require bool, got " + type_to_str(lt_r) + " and " + type_to_str(rt_r) + "\n    Fix: compare to get a bool on each side, e.g. `(x != 0) && (y != 0)`.");
                     }
                     return Type::Bool;
                 }
                 BinOp::Or => {
                     if (!type_eq(lt_r, Type::Bool) && !TypeChecker_is_reported(self, lt_r)) || (!type_eq(rt_r, Type::Bool) && !TypeChecker_is_reported(self, rt_r)) {
-                        self.errors.push("Type error: logical operators require bool, got " + type_to_str(lt_r) + " and " + type_to_str(rt_r));
+                        self.errors.push("Type error: logical operators require bool, got " + type_to_str(lt_r) + " and " + type_to_str(rt_r) + "\n    Fix: compare to get a bool on each side, e.g. `(x != 0) || (y != 0)`.");
                     }
                     return Type::Bool;
                 }
@@ -21585,7 +21589,7 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
                                             return lt_r;
                                         }
                                     } else {
-                                        self.errors.push("Type error: shape mismatch in binary operation. Left operand: " + ln + ", Right operand: " + rn);
+                                        self.errors.push("Type error: shape mismatch in binary operation. Left operand: " + ln + ", Right operand: " + rn + "\n    Fix: make both operands the same element type (convert one, e.g. with a map of `as f64`).");
                                         return Type::Never;
                                     }
                                 }
@@ -21657,7 +21661,7 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
                     if TypeChecker_is_typed_string(self, lt_r) {
                         typed = lt_r;
                     }
-                    self.errors.push("Injection error (F68): cannot use + to concatenate typed string '" + type_to_str(typed) + "'." + "\n    Typed strings prevent injection — use bind/escape methods instead." + "\n    For SQLString: use sql_query() + sql_bind() instead of string +." + "\n    For ShellString: use shell_cmd() + shell_escape() instead of string +.");
+                    self.errors.push("Injection error (F68): cannot use + to concatenate typed string '" + type_to_str(typed) + "'." + "\n    Typed strings prevent injection — use bind/escape methods instead." + "\n    For SQLString: use sql_query() + sql_bind() instead of string +." + "\n    For ShellString: use shell_cmd() + shell_escape() instead of string +.\n    Fix: build the text with the type's own functions (sql_query + sql_bind, shell_cmd + shell_escape), not with +.");
                     return Type::Never;
                 }
             }
@@ -21682,7 +21686,7 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
             // never: an operand whose error is already reported (CE6)
             if !type_eq(lt_r, Type::Never) && !type_eq(rt_r, Type::Never) {
                 // 2g.64: with the line (extract_line_col reads "(line N)")
-                self.errors.push("Type error (line " + int_to_str(self.current_line) + "): arithmetic requires numeric types. Left: " + type_to_str(lt_r) + ", Right: " + type_to_str(rt_r));
+                self.errors.push("Type error (line " + int_to_str(self.current_line) + "): arithmetic requires numeric types. Left: " + type_to_str(lt_r) + ", Right: " + type_to_str(rt_r) + "\n    Fix: use numbers on both sides (cast with `as`, parse a str with parse_int), or `+` two strs to join them.");
             }
             return Type::Never;
         }
@@ -21696,19 +21700,19 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
                         return ty;
                     }
                     if !TypeChecker_is_numeric(self, ty) && !TypeChecker_is_reported(self, ty) {
-                        self.errors.push("Type error: cannot negate " + type_to_str(ty));
+                        self.errors.push("Type error: cannot negate " + type_to_str(ty) + "\n    Fix: negate numbers only (`-(x as i64)` for a value that converts to one); for a bool write `!x`.");
                     }
                     return ty;
                 }
                 UnaryOp::Not => {
                     if !type_eq(ty, Type::Bool) && !TypeChecker_is_reported(self, ty) {
-                        self.errors.push("Type error: cannot logically negate " + type_to_str(ty));
+                        self.errors.push("Type error: cannot logically negate " + type_to_str(ty) + "\n    Fix: use `!` on a bool; for a number write `x == 0`.");
                     }
                     return Type::Bool;
                 }
                 UnaryOp::BitNot => {
                     if !TypeChecker_is_integer(self, ty) && !TypeChecker_is_reported(self, ty) {
-                        self.errors.push("Type error: cannot bitwise negate " + type_to_str(ty) + " (expected integer type)");
+                        self.errors.push("Type error: cannot bitwise negate " + type_to_str(ty) + " (expected integer type)\n    Fix: use the bitwise operators on integers (`x as i64` first).");
                     }
                     return ty;
                 }
@@ -21732,12 +21736,12 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
             // with the block's token installed
             if callee == "__timeout_block" {
                 if args.len() != 1 {
-                    self.errors.push("Type error (line " + int_to_str(self.current_line) + "): timeout takes one value, the time in milliseconds: `timeout(ms) { .. }`");
+                    self.errors.push("Type error (line " + int_to_str(self.current_line) + "): timeout takes one value, the time in milliseconds: `timeout(ms) { .. }`\n    Fix: write `timeout(ms) { ... }` with one integer, the milliseconds.");
                     return Type::Bool;
                 }
                 var tbt: Type = TypeChecker_check_expr(self, args.get(0));
                 if !TypeChecker_is_integer(self, tbt) && !TypeChecker_is_reported(self, tbt) {
-                    self.errors.push("Type error (line " + int_to_str(self.current_line) + "): timeout(ms) takes the time in milliseconds, an integer; got " + type_to_str(tbt));
+                    self.errors.push("Type error (line " + int_to_str(self.current_line) + "): timeout(ms) takes the time in milliseconds, an integer; got " + type_to_str(tbt) + "\n    Fix: pass the milliseconds as an integer, e.g. `timeout(500) { ... }` (`ms as i64` for a float).");
                 }
                 return Type::Bool;
             }
@@ -21746,7 +21750,7 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
             }
             if callee == "__txn_abort" {
                 if self.txn_depth == 0 {
-                    self.errors.push("Transaction error (line " + int_to_str(self.current_line) + "): 'abort;' is only allowed inside txn { }.");
+                    self.errors.push("Transaction error (line " + int_to_str(self.current_line) + "): 'abort;' is only allowed inside txn { }.\n    Fix: put the `abort;` inside a `txn { ... }` block, or use `return` to leave the function.");
                 }
                 return Type::Void;
             }
@@ -21754,14 +21758,14 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
             // every `comptime splice` it reaches; one left here stands where
             // it does not look
             if callee == "__comptime_splice" {
-                self.errors.push("Comptime error (line " + int_to_str(self.current_line) + "): this `comptime splice { }` was not expanded. A splice may stand in the body of a function or method and in a constant's initializer, not inside a closure or a trait's default method.");
+                self.errors.push("Comptime error (line " + int_to_str(self.current_line) + "): this `comptime splice { }` was not expanded. A splice may stand in the body of a function or method and in a constant's initializer, not inside a closure or a trait's default method.\n    Fix: move the `comptime splice { }` into the body of a function or method, or into a constant's initializer.");
                 return Type::Never;
             }
             // f"{e:spec}" (parser): the value and the spec text; the value
             // has the same rule as a plain part — no struct's text form
             if callee == "__fstr_fmt" {
                 if args.len() != 2 {
-                    self.errors.push("Type error (line " + int_to_str(self.current_line) + "): __fstr_fmt takes the value and the spec text.");
+                    self.errors.push("Type error (line " + int_to_str(self.current_line) + "): __fstr_fmt takes the value and the spec text.\n    Fix: write it as an f-string, `f\"{value:spec}\"`; the compiler makes this call.");
                     return Type::Never;
                 }
                 var ft: Type = TypeChecker_check_expr(self, args.get(0));
@@ -21849,9 +21853,9 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
             // capabilities away).
             if callee == "p_sandbox_enter" || callee == "p_sandbox_exit" {
                 if self.sandbox_depth > 0 {
-                    self.errors.push("Capability error (line " + int_to_str(self.current_line) + "): " + callee + "() cannot be called inside sandbox: the sandbox's revocation is managed by the compiler");
+                    self.errors.push("Capability error (line " + int_to_str(self.current_line) + "): " + callee + "() cannot be called inside sandbox: the sandbox's revocation is managed by the compiler\n    Fix: write `sandbox { ... }` and let the compiler enter and leave it.");
                 } else {
-                    self.errors.push("Capability error (line " + int_to_str(self.current_line) + "): " + callee + "() cannot be called directly: `sandbox { }` enters and leaves the run-time sandbox (the compiler emits these calls); use p_cap_revoke to give up a capability");
+                    self.errors.push("Capability error (line " + int_to_str(self.current_line) + "): " + callee + "() cannot be called directly: `sandbox { }` enters and leaves the run-time sandbox (the compiler emits these calls); use p_cap_revoke to give up a capability\n    Fix: write `sandbox { ... }`, or call p_cap_revoke(\"Cap\") to give up one capability.");
                 }
             }
             if self.region_budgets.len() > 0 {
@@ -21920,7 +21924,7 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
                     match TypeChecker_resolve_type(self, local_ty) {
                         Type::Func(lparams, lret) => {
                             if lparams.len() != arg_types.len() {
-                                self.errors.push("Type error: function variable '" + callee + "' expects " + int_to_str(lparams.len()) + " args, got " + int_to_str(arg_types.len()));
+                                self.errors.push("Type error: function variable '" + callee + "' expects " + int_to_str(lparams.len()) + " args, got " + int_to_str(arg_types.len()) + "\n    Fix: call '" + callee + "' with " + int_to_str(lparams.len()) + " argument(s).");
                             }
                             TypeChecker_check_fn_value_args(self, callee, lparams, arg_types);
                             return box_type_unbox(lret);
@@ -21942,7 +21946,7 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
                         // name, which also decides the count
                         TypeChecker_check_named_args(self, callee, sig, args, named_tys);
                     } else if arg_types.len() < sig.min_args || (arg_types.len() > sig.param_types.len() && !tc_is_c_variadic(callee)) {
-                        self.errors.push("Type error (line " + int_to_str(self.current_line) + "): function '" + callee + "' expects " + int_to_str(sig.min_args) + "-" + int_to_str(sig.param_types.len()) + " args, got " + int_to_str(arg_types.len()));
+                        self.errors.push("Type error (line " + int_to_str(self.current_line) + "): function '" + callee + "' expects " + int_to_str(sig.min_args) + "-" + int_to_str(sig.param_types.len()) + " args, got " + int_to_str(arg_types.len()) + "\n    Fix: pass between " + int_to_str(sig.min_args) + " and " + int_to_str(sig.param_types.len()) + " arguments.");
                     }
                     var gi: i64 = 0;
                     while gi < self.func_generic_names.len() {
@@ -21985,7 +21989,7 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
                                 OptString::None => {
                                 }
                             }
-                            self.errors.push("Type error (line " + int_to_str(self.current_line) + in_fn + "): function '" + callee + "' parameter " + int_to_str(pi + 1) + " expects '" + type_to_str(param) + "', got '" + type_to_str(arg) + "'");
+                            self.errors.push("Type error (line " + int_to_str(self.current_line) + in_fn + "): function '" + callee + "' parameter " + int_to_str(pi + 1) + " expects '" + type_to_str(param) + "', got '" + type_to_str(arg) + "'\n    Fix: pass a value of type '" + type_to_str(param) + "' (for a number, cast it: `x as " + type_to_str(param) + "`), or change the parameter's type.");
                         } else if tc_is_str(param) && tc_is_borrowed_str(arg) && !tc_borrow_safe_callee(callee) {
                             // A borrowed string given where an owned one is taken:
                             // the callee could keep it past its owner (M11)
@@ -22041,11 +22045,11 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
             // no function of that name.
             if callee == "gensym" {
                 if g_tc_comptime_depth == 0 {
-                    self.errors.push("Comptime error (line " + int_to_str(self.current_line) + "): gensym() names what compile-time code generates: call it in a `comptime fn`, a `comptime { }` block, or a `comptime gen` / `comptime splice` block.");
+                    self.errors.push("Comptime error (line " + int_to_str(self.current_line) + "): gensym() names what compile-time code generates: call it in a `comptime fn`, a `comptime { }` block, or a `comptime gen` / `comptime splice` block.\n    Fix: call it inside `comptime fn`, `comptime { ... }` or a `comptime gen`/`comptime splice` block.");
                     return Type::Never;
                 }
                 if arg_types.len() != 1 || (!type_eq(arg_types.get(0), Type::Str) && !type_eq(arg_types.get(0), Type::Never)) {
-                    self.errors.push("Type error (line " + int_to_str(self.current_line) + "): gensym takes one argument, the prefix of the name (a str)");
+                    self.errors.push("Type error (line " + int_to_str(self.current_line) + "): gensym takes one argument, the prefix of the name (a str)\n    Fix: pass one str, the prefix: `gensym(\"tmp\")`.");
                     return Type::Never;
                 }
                 return Type::Str;
@@ -22162,9 +22166,9 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
                 // rm-L4B-net-unix: a socket handle, -1 on failure
                 if callee == "p_unix_listen" || callee == "p_unix_connect" {
                     if arg_types.len() != 1 {
-                        self.errors.push("Type error (line " + int_to_str(self.current_line) + "): " + callee + " expects 1 argument (a socket path), got " + int_to_str(arg_types.len()));
+                        self.errors.push("Type error (line " + int_to_str(self.current_line) + "): " + callee + " expects 1 argument (a socket path), got " + int_to_str(arg_types.len()) + "\n    Fix: pass one str, the socket's path: `" + callee + "(\"/tmp/app.sock\")`.");
                     } else if !TypeChecker_types_compatible(self, Type::Str, arg_types.get(0)) {
-                        self.errors.push("Type error (line " + int_to_str(self.current_line) + "): " + callee + " expects a str socket path, got '" + tc_operand_type_str(args.get(0), arg_types.get(0)) + "'");
+                        self.errors.push("Type error (line " + int_to_str(self.current_line) + "): " + callee + " expects a str socket path, got '" + tc_operand_type_str(args.get(0), arg_types.get(0)) + "'\n    Fix: pass the socket's path as a str, e.g. `" + callee + "(\"/tmp/app.sock\")`.");
                     }
                     return Type::I64;
                 }
@@ -22183,7 +22187,7 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
                     match resolved_ty {
                         Type::Func(params, ret) => {
                             if params.len() != arg_types.len() {
-                                self.errors.push("Type error: function variable '" + callee + "' expects " + int_to_str(params.len()) + " args, got " + int_to_str(arg_types.len()));
+                                self.errors.push("Type error: function variable '" + callee + "' expects " + int_to_str(params.len()) + " args, got " + int_to_str(arg_types.len()) + "\n    Fix: call '" + callee + "' with " + int_to_str(params.len()) + " argument(s).");
                             }
                             TypeChecker_check_fn_value_args(self, callee, params, arg_types);
                             return box_type_unbox(ret);
@@ -22222,7 +22226,7 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
                     }
                     self.errors.push("Type error (line " + int_to_str(self.current_line) + "): function '" + callee + "' is ambiguous: it is defined by more than one imported module (" + mods + ").\n    Fix: say which one: " + fixes + ".");
                 } else {
-                    self.errors.push("Type error (line " + int_to_str(self.current_line) + "): undefined function '" + callee + "'");
+                    self.errors.push("Type error (line " + int_to_str(self.current_line) + "): undefined function '" + callee + "'\n    Hint: define it (`fn " + callee + "(...) { ... }`), import the module that has it, or check the spelling.");
                 }
             }
             return Type::Never;
@@ -22288,7 +22292,7 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
                                     }
                                     gfi = gfi + 1;
                                 }
-                                self.errors.push("Type error (line " + int_to_str(self.current_line) + "): struct '" + gsn + "' has no field '" + field + "'");
+                                self.errors.push("Type error (line " + int_to_str(self.current_line) + "): struct '" + gsn + "' has no field '" + field + "'\n    Fix: use one of the fields struct '" + gsn + "' declares, or add `" + field + ": T` to it.");
                                 return Type::Never;
                             }
                             OptVecStructField::None => {
@@ -22324,7 +22328,7 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
                                     if pidx > 0 {
                                         var struct_module: str = self.private_field_modules.get(pidx - 1);
                                         if struct_module != self.current_module {
-                                            self.errors.push("Privacy error: field '" + field + "' of struct '" + name + "' is private. It was defined in module '" + struct_module + "', which is not the current module '" + self.current_module + "'.");
+                                            self.errors.push("Privacy error: field '" + field + "' of struct '" + name + "' is private. It was defined in module '" + struct_module + "', which is not the current module '" + self.current_module + "'.\n    Fix: mark the field `pub` in module '" + struct_module + "', or use a public function of that module to read it.");
                                         }
                                     }
                                     // A string held by a @scoped struct is borrowed: it
@@ -22336,7 +22340,7 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
                                 }
                                 fi = fi + 1;
                             }
-                            self.errors.push("Type error (line " + int_to_str(self.current_line) + "): struct '" + name + "' has no field '" + field + "'");
+                            self.errors.push("Type error (line " + int_to_str(self.current_line) + "): struct '" + name + "' has no field '" + field + "'\n    Fix: use one of the fields struct '" + name + "' declares, or add `" + field + ": T` to it.");
                             si = self.structs.len();
                             // break
                         }
@@ -22345,7 +22349,7 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
                 }
                 _ => {
                     if !TypeChecker_is_reported(self, effective_ty) {
-                        self.errors.push("Type error: cannot access field '" + field + "' on type " + type_to_str(obj_ty));
+                        self.errors.push("Type error: cannot access field '" + field + "' on type " + type_to_str(obj_ty) + "\n    Fix: read fields of a struct value only; " + type_to_str(obj_ty) + " has none (a method call needs parentheses: `x." + field + "()`).");
                     }
                 }
             }
@@ -22400,7 +22404,7 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
             val st_bad: bool = !TypeChecker_is_numeric(self, st) && !TypeChecker_is_reported(self, st);
             val et_bad: bool = !TypeChecker_is_numeric(self, et) && !TypeChecker_is_reported(self, et);
             if st_bad || et_bad {
-                self.errors.push("Type error: range bounds must be numeric, got " + type_to_str(st) + " and " + type_to_str(et));
+                self.errors.push("Type error: range bounds must be numeric, got " + type_to_str(st) + " and " + type_to_str(et) + "\n    Fix: use integer bounds, e.g. `0..n` (`x as i64` for another type).");
             }
             // The loop var takes the wider bound's type: `for i in 0..count`
             // with `count: i64` iterates `i: i64`, not the literal 0's i8.
@@ -22445,7 +22449,7 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
             while i < elements.len() {
                 var et: Type = TypeChecker_check_expr(self, elements.get(i));
                 if !TypeChecker_types_compatible(self, box_type_unbox(elem_type), et) {
-                    self.errors.push("Type error: array element type mismatch, expected " + type_to_str(box_type_unbox(elem_type)) + ", got " + type_to_str(et));
+                    self.errors.push("Type error: array element type mismatch, expected " + type_to_str(box_type_unbox(elem_type)) + ", got " + type_to_str(et) + "\n    Fix: make every element a " + type_to_str(box_type_unbox(elem_type)) + " (cast with `as`), or use separate arrays.");
                 }
                 i = i + 1;
             }
@@ -22474,7 +22478,7 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
             }
             var idx_ty: Type = TypeChecker_check_expr(self, box_expr_unbox(index));
             if !TypeChecker_is_numeric(self, idx_ty) && !TypeChecker_is_reported(self, idx_ty) {
-                self.errors.push("Type error: array index must be numeric, got " + type_to_str(idx_ty));
+                self.errors.push("Type error: array index must be numeric, got " + type_to_str(idx_ty) + "\n    Fix: index with an integer (`i as i64` for another number type).");
             }
             match arr_ty {
                 Type::Array(elem, _) => {
@@ -22498,7 +22502,7 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
                 }
                 _ => {
                     if !TypeChecker_is_reported(self, arr_ty) {
-                        self.errors.push("Type error: cannot index type " + type_to_str(arr_ty));
+                        self.errors.push("Type error: cannot index type " + type_to_str(arr_ty) + "\n    Fix: index a Vec, an array or a String; for a map use .get(key).");
                     }
                 }
             }
@@ -22570,14 +22574,14 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
                     if gname == "Box" && gargs.len() == 1 {
                         return gargs.get(0);
                     }
-                    self.errors.push("Type error (line " + int_to_str(self.current_line) + "): cannot dereference non-reference type " + type_to_str(ty));
+                    self.errors.push("Type error (line " + int_to_str(self.current_line) + "): cannot dereference non-reference type " + type_to_str(ty) + "\n    Fix: dereference only a reference (`&T`/`&mut T`) or a raw pointer; use the value directly.");
                     return Type::Never;
                 }
                 _ => {
                     if !TypeChecker_is_reported(self, ty) {
                         // reference §4.1: `as` is postfix and binds tighter
                         // than prefix `*`, so `*s as f64` is `*(s as f64)`
-                        var deref_hint: str = "";
+                        var deref_hint: str = "\n    Fix: dereference only a reference (`&T`, `&mut T`) or a raw pointer; use the value itself here.";
                         match box_expr_unbox(e) {
                             Expr::Cast(_, _) => {
                                 deref_hint = ".\n    Note: `as` binds tighter than a prefix `*` (reference §4.1): `*s as T` is `*(s as T)`.\n    Fix: write `(*s) as T`.";
@@ -22634,7 +22638,7 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
             if TypeChecker_is_reported(self, ty) {
                 return Type::Never;
             }
-            self.errors.push("Type error: ? operator requires Option<T> or Result<T, E>. Found: " + type_to_str(ty));
+            self.errors.push("Type error: ? operator requires Option<T> or Result<T, E>. Found: " + type_to_str(ty) + "\n    Fix: use `?` on an Option or Result value; for a plain value drop the `?`.");
             return Type::Never;
         }
         Expr::Coalesce(e, default) => {
@@ -22644,7 +22648,7 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
                 Type::Generic(name, args) => {
                     if name == "Option" && args.len() == 1 {
                         if !TypeChecker_types_compatible(self, args.get(0), default_ty) {
-                            self.errors.push("Type error: ?? default value type mismatch");
+                            self.errors.push("Type error: ?? default value type mismatch\n    Fix: give the default after `??` the same type as the Option's value, e.g. `opt ?? 0` for an Option<i64>.");
                         }
                         return args.get(0);
                     }
@@ -22660,7 +22664,7 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
             if TypeChecker_is_reported(self, ty) {
                 return Type::Never;
             }
-            self.errors.push("Type error: ?? operator requires Option<T>. Found: " + type_to_str(ty));
+            self.errors.push("Type error: ?? operator requires Option<T>. Found: " + type_to_str(ty) + "\n    Fix: use `??` on an Option value; for a plain value drop the `?? default`.");
             return Type::Never;
         }
         Expr::TryBlock(body) => {
@@ -22783,7 +22787,7 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
                         }
                     }
                     if cast_named && TypeChecker_is_trait_name(self, dyn_tr) && !TypeChecker_satisfies_bound(self, cast_src, dyn_tr) {
-                        self.errors.push("Type error: " + type_to_str(cast_src) + " does not implement " + dyn_tr + " (in `as dyn " + dyn_tr + "`)");
+                        self.errors.push("Type error: " + type_to_str(cast_src) + " does not implement " + dyn_tr + " (in `as dyn " + dyn_tr + "`)\n    Fix: add `impl " + dyn_tr + " for " + type_to_str(cast_src) + " { ... }`, or cast a type that implements it.");
                     }
                 }
                 _ => {
@@ -22799,7 +22803,7 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
             // dereference — it needs `unsafe`
             TypeChecker_require_unsafe(self, "inline assembly");
             if self.sandbox_depth > 0 {
-                self.errors.push("Sandbox error: inline assembly can do anything the machine can (system calls included) -- all capabilities are revoked inside sandbox");
+                self.errors.push("Sandbox error: inline assembly can do anything the machine can (system calls included) -- all capabilities are revoked inside sandbox\n    Fix: do the assembly before or after the `sandbox { }` block.");
             }
             var has_out: bool = false;
             var i: i64 = 0;
@@ -22997,7 +23001,7 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
             while ci < cap_types.len() {
                 var var_ty: Type = cap_types.get(ci);
                 if !TypeChecker_is_send_type(self, var_ty) {
-                    self.errors.push("Thread safety error: spawn captures variable of type " + type_to_str(var_ty) + " which is not @send. Only @send types can be safely sent across threads.");
+                    self.errors.push("Thread safety error: spawn captures variable of type " + type_to_str(var_ty) + " which is not @send. Only @send types can be safely sent across threads.\n    Fix: capture only @send values (numbers, strings, structs of such), mark the struct @send, or pass a copy as an argument.");
                 }
                 ci = ci + 1;
             }
@@ -23033,6 +23037,77 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
 }
 
 // ---- CHUNK_MARKER_8 ----
+
+// --- TL2: the Fix line of "no method 'm' on T" ----------------------------
+
+/// The edit distance of `a` and `b` (bytes; two rows).
+fn tc_edit_distance(a: str, b: str) -> i64 {
+    var n: i64 = str_len(a);
+    var m: i64 = str_len(b);
+    var prev: Vec<i64> = Vec::new();
+    var j: i64 = 0;
+    while j <= m {
+        prev.push(j);
+        j = j + 1;
+    }
+    var i: i64 = 1;
+    while i <= n {
+        var cur: Vec<i64> = Vec::new();
+        cur.push(i);
+        j = 1;
+        while j <= m {
+            var cost: i64 = 1;
+            if str_byte_at(a, i - 1) == str_byte_at(b, j - 1) {
+                cost = 0;
+            }
+            var best: i64 = prev.get(j) + 1;
+            if cur.get(j - 1) + 1 < best {
+                best = cur.get(j - 1) + 1;
+            }
+            if prev.get(j - 1) + cost < best {
+                best = prev.get(j - 1) + cost;
+            }
+            cur.push(best);
+            j = j + 1;
+        }
+        prev = cur;
+        i = i + 1;
+    }
+    return prev.get(m);
+}
+
+/// "\n    Fix: ..." for a method `method` the type does not have: the closest
+/// of its methods (`cands`, separated by spaces) within an edit distance of
+/// 1 (names up to 4 bytes) or 2, else the list of them.
+fn tc_method_fix(method: str, cands: str) -> str {
+    var limit: i64 = 2;
+    if str_len(method) <= 4 {
+        limit = 1;
+    }
+    var best: str = "";
+    var best_d: i64 = limit + 1;
+    var start: i64 = 0;
+    var k: i64 = 0;
+    var n: i64 = str_len(cands);
+    while k <= n {
+        if k == n || str_byte_at(cands, k) == 32 {
+            if k > start {
+                var w: str = str_slice(cands, start, k);
+                var d: i64 = tc_edit_distance(method, w);
+                if d < best_d {
+                    best_d = d;
+                    best = w;
+                }
+            }
+            start = k + 1;
+        }
+        k = k + 1;
+    }
+    if str_len(best) > 0 {
+        return "\n    Fix: did you mean `" + best + "`?";
+    }
+    return "\n    Fix: call one of its methods (" + str_replace(cands, " ", ", ") + "), or a function that takes the value (`" + method + "(x)`).";
+}
 
 // --- check_method_call ---------------------------------------------------
 
@@ -23161,7 +23236,7 @@ fn TypeChecker_lg4_method_call(self: &mut TypeChecker, owner: str, method: str, 
         var pt: Type = tc_subst_type_params(params.get(i), names, types);
         var a: Type = arg_types.get(i);
         if !TypeChecker_type_contains_param(self, pt) && !type_eq(a, Type::Infer) && !type_eq(a, Type::Never) && !TypeChecker_arg_compatible(self, pt, a) {
-            self.errors.push("Type error (line " + int_to_str(self.current_line) + in_fn + "): method '" + callee + "' parameter " + int_to_str(i + 1) + " expects '" + type_to_str(pt) + "', got '" + type_to_str(a) + "'");
+            self.errors.push("Type error (line " + int_to_str(self.current_line) + in_fn + "): method '" + callee + "' parameter " + int_to_str(i + 1) + " expects '" + type_to_str(pt) + "', got '" + type_to_str(a) + "'\n    Fix: pass a value of type '" + type_to_str(pt) + "' (for a number, cast it: `x as " + type_to_str(pt) + "`), or change the parameter's type.");
         }
         i = i + 1;
     }
@@ -23244,7 +23319,7 @@ fn TypeChecker_check_method_args(self: &mut TypeChecker, what: str, key: str, in
         if min_n < max_n {
             want = int_to_str(min_n) + "-" + int_to_str(max_n);
         }
-        self.errors.push("Type error (line " + int_to_str(self.current_line) + in_fn + "): " + what + " expects " + want + " args, got " + int_to_str(arg_types.len()));
+        self.errors.push("Type error (line " + int_to_str(self.current_line) + in_fn + "): " + what + " expects " + want + " args, got " + int_to_str(arg_types.len()) + "\n    Fix: pass " + want + " argument(s).");
         return;
     }
     if !check_types {
@@ -23259,7 +23334,7 @@ fn TypeChecker_check_method_args(self: &mut TypeChecker, what: str, key: str, in
         // gives it a type (`Cell<i64>.put("oops")`); one left unbound (a
         // method's own `U`) is not
         if !TypeChecker_type_contains_param(self, pt) && !tc_bare_param_unbound(raw, names) && !type_eq(a, Type::Infer) && !type_eq(a, Type::Never) && !TypeChecker_arg_compatible(self, pt, a) && !(is_handle_int_pair(pt, tc_read_through(a)) && TypeChecker_is_runtime_call(self, key)) {
-            self.errors.push("Type error (line " + int_to_str(self.current_line) + in_fn + "): " + what + " parameter " + int_to_str(i + 1) + " expects '" + type_to_str(pt) + "', got '" + type_to_str(a) + "'");
+            self.errors.push("Type error (line " + int_to_str(self.current_line) + in_fn + "): " + what + " parameter " + int_to_str(i + 1) + " expects '" + type_to_str(pt) + "', got '" + type_to_str(a) + "'\n    Fix: pass a value of type '" + type_to_str(pt) + "' (for a number, cast it: `x as " + type_to_str(pt) + "`).");
         }
         i = i + 1;
     }
@@ -23348,7 +23423,7 @@ pub fn TypeChecker_check_method_call(self: &mut TypeChecker, receiver: Expr, met
             if name == "Vec" && method == "filled" && args.len() == 2 {
                 var fn_ty: Type = TypeChecker_check_expr(self, args.get(0));
                 if !TypeChecker_is_integer(self, fn_ty) {
-                    self.errors.push("Type error: Vec::filled takes a length (an integer) first, got " + type_to_str(fn_ty));
+                    self.errors.push("Type error: Vec::filled takes a length (an integer) first, got " + type_to_str(fn_ty) + "\n    Fix: pass the length first and the value second: `Vec::filled(n, 0)`.");
                 }
                 var fe_hint: Type = Type::Infer;
                 match hint {
@@ -23384,7 +23459,7 @@ pub fn TypeChecker_check_method_call(self: &mut TypeChecker, receiver: Expr, met
                     }
                 }
                 if fen != "" && fen != "Vec" && fen != "HashMap" && fen != "String" && (tc_is_struct(self, fen) || TypeChecker_enum_pos(self, fen) >= 0) {
-                    self.errors.push("Type error: Vec::filled makes Vecs of numbers, bools, strings, Vecs or maps; a Vec of " + fen + " is made with push");
+                    self.errors.push("Type error: Vec::filled makes Vecs of numbers, bools, strings, Vecs or maps; a Vec of " + fen + " is made with push\n    Fix: make an empty Vec and push each " + fen + " (`var v: Vec<T> = Vec::new(); v.push(x);`).");
                 }
                 var fargs: Vec<Type> = Vec::new();
                 fargs.push(felem);
@@ -23441,7 +23516,7 @@ pub fn TypeChecker_check_method_call(self: &mut TypeChecker, receiver: Expr, met
                         TypeChecker_check_method_args(self, "associated function '" + name + "::" + method + "'", name + "_" + method, info, 0, args, arg_types, assoc_names, assoc_types, true);
                         return info.ret_ty;
                     }
-                    self.errors.push("Type error: no associated function '" + method + "' on struct '" + name + "'");
+                    self.errors.push("Type error: no associated function '" + method + "' on struct '" + name + "'\n    Fix: define it: `impl " + name + " { fn " + method + "(...) -> " + name + " { ... } }`, or call a method on a value (`x." + method + "()`).");
                     return Type::Never;
                 }
                 si = si + 1;
@@ -23545,9 +23620,9 @@ pub fn TypeChecker_check_method_call(self: &mut TypeChecker, receiver: Expr, met
                             }
                         }
                         if va_pack {
-                            self.errors.push("Type error (line " + int_to_str(self.current_line) + "): a variadic argument expects '" + type_to_str(elem_ty) + "', got '" + type_to_str(arg_types.get(stored)) + "' in '" + self.checking_fn + "'");
+                            self.errors.push("Type error (line " + int_to_str(self.current_line) + "): a variadic argument expects '" + type_to_str(elem_ty) + "', got '" + type_to_str(arg_types.get(stored)) + "' in '" + self.checking_fn + "'\n    Fix: pass '" + type_to_str(elem_ty) + "' values only (cast with `as` for numbers).");
                         } else {
-                            self.errors.push("Type error: cannot store " + type_to_str(arg_types.get(stored)) + " in a Vec<" + type_to_str(elem_ty) + "> (" + method + ") in '" + self.checking_fn + "'");
+                            self.errors.push("Type error: cannot store " + tc_operand_type_str(args.get(stored), arg_types.get(stored)) + " in a Vec<" + type_to_str(elem_ty) + "> (" + method + ") in '" + self.checking_fn + "'\n    Fix: store a " + type_to_str(elem_ty) + " (cast with `as` for a number), or declare the Vec as Vec<" + tc_operand_type_str(args.get(stored), arg_types.get(stored)) + ">.");
                         }
                     }
                 }
@@ -23672,7 +23747,7 @@ pub fn TypeChecker_check_method_call(self: &mut TypeChecker, receiver: Expr, met
                 if method == "contains_val" {
                     return Type::Bool;
                 }
-                self.errors.push("Type error: no method '" + method + "' on Vec");
+                self.errors.push("Type error: no method '" + method + "' on Vec" + tc_method_fix(method, "push pop len get set insert remove clear clone contains is_empty first last extend reverse sort truncate capacity map filter fold for_each any all find position"));
                 return Type::Never;
             }
             if name == "HashMap" {
@@ -23728,7 +23803,7 @@ pub fn TypeChecker_check_method_call(self: &mut TypeChecker, receiver: Expr, met
                 if method == "clone" {
                     return Type::Generic("HashMap", gargs);
                 }
-                self.errors.push("Type error: no method '" + method + "' on HashMap");
+                self.errors.push("Type error: no method '" + method + "' on HashMap" + tc_method_fix(method, "insert get get_or contains_key remove len keys values clear clone is_empty"));
                 return Type::Never;
             }
             if name == "Rc" {
@@ -23748,7 +23823,7 @@ pub fn TypeChecker_check_method_call(self: &mut TypeChecker, receiver: Expr, met
                 if method == "count" {
                     return Type::I64;
                 }
-                self.errors.push("Type error: no method '" + method + "' on Rc");
+                self.errors.push("Type error: no method '" + method + "' on Rc" + tc_method_fix(method, "get clone count drop"));
                 return Type::Never;
             }
             if name == "Arc" {
@@ -23768,7 +23843,7 @@ pub fn TypeChecker_check_method_call(self: &mut TypeChecker, receiver: Expr, met
                 if method == "count" {
                     return Type::I64;
                 }
-                self.errors.push("Type error: no method '" + method + "' on Arc");
+                self.errors.push("Type error: no method '" + method + "' on Arc" + tc_method_fix(method, "get clone count drop"));
                 return Type::Never;
             }
         }
@@ -23830,7 +23905,7 @@ pub fn TypeChecker_check_method_call(self: &mut TypeChecker, receiver: Expr, met
                     split_args.push(Type::Named("String"));
                     return Type::Generic("Vec", split_args);
                 }
-                self.errors.push("Type error: no method '" + method + "' on String");
+                self.errors.push("Type error: no method '" + method + "' on String" + tc_method_fix(method, "len bytes clone contains ends_with starts_with find rfind is_empty parse_int push_str repeat replace split to_lowercase to_uppercase to_string trim"));
                 return Type::Never;
             }
             // Named("Vec") without generic args says nothing about its elements
@@ -23939,7 +24014,7 @@ pub fn TypeChecker_check_method_call(self: &mut TypeChecker, receiver: Expr, met
                 if method == "contains_val" {
                     return Type::Bool;
                 }
-                self.errors.push("Type error: no method '" + method + "' on Vec");
+                self.errors.push("Type error: no method '" + method + "' on Vec" + tc_method_fix(method, "push pop len get set insert remove clear clone contains is_empty first last extend reverse sort truncate capacity map filter fold for_each any all find position"));
                 return Type::Never;
             }
             // Named("HashMap") without generic args -- treat as HashMap<str, i64>
@@ -23981,7 +24056,7 @@ pub fn TypeChecker_check_method_call(self: &mut TypeChecker, receiver: Expr, met
                     values_args.push(val_ty);
                     return Type::Generic("Vec", values_args);
                 }
-                self.errors.push("Type error: no method '" + method + "' on HashMap");
+                self.errors.push("Type error: no method '" + method + "' on HashMap" + tc_method_fix(method, "insert get get_or contains_key remove len keys values clear clone is_empty"));
                 return Type::Never;
             }
         }
@@ -24011,7 +24086,7 @@ pub fn TypeChecker_check_method_call(self: &mut TypeChecker, receiver: Expr, met
                 OptTraitMethodMap::None => {
                 }
             }
-            self.errors.push("Type error: no method '" + method + "' on trait '" + trait_name + "'");
+            self.errors.push("Type error: no method '" + method + "' on trait '" + trait_name + "'\n    Fix: call a method the trait declares, or add `fn " + method + "(self) -> T;` to `cap " + trait_name + "`.");
             return Type::Never;
         }
         _ => {
@@ -24135,7 +24210,7 @@ pub fn TypeChecker_check_method_call(self: &mut TypeChecker, receiver: Expr, met
                 if method == "contains_val" {
                     return Type::Bool;
                 }
-                self.errors.push("Type error: no method '" + method + "' on Vec");
+                self.errors.push("Type error: no method '" + method + "' on Vec" + tc_method_fix(method, "push pop len get set insert remove clear clone contains is_empty first last extend reverse sort truncate capacity map filter fold for_each any all find position"));
                 return Type::Never;
             }
         }
@@ -24158,7 +24233,7 @@ pub fn TypeChecker_check_method_call(self: &mut TypeChecker, receiver: Expr, met
                 TypeChecker_require_unsafe_call(self, struct_name + "_" + method, struct_name + "." + method);
                 if self.sandbox_depth > 0 {
                     if HashMap_get(self.ffi_reach_index, struct_name + "." + method) != 0 {
-                        self.errors.push("Sandbox error: '" + struct_name + "." + method + "()' calls C code, a loaded library or inline assembly (directly or through the functions it calls), whose effects are not known -- all capabilities are revoked inside sandbox");
+                        self.errors.push("Sandbox error: '" + struct_name + "." + method + "()' calls C code, a loaded library or inline assembly (directly or through the functions it calls), whose effects are not known -- all capabilities are revoked inside sandbox\n    Fix: call '" + struct_name + "." + method + "()' before or after the `sandbox { }` block, and pass its result in.");
                     } else {
                         TypeChecker_sandbox_reject(self, struct_name + "." + method + "()", TypeChecker_get_func_effects(self, struct_name + "." + method));
                     }
@@ -24221,7 +24296,7 @@ pub fn TypeChecker_check_method_call(self: &mut TypeChecker, receiver: Expr, met
                     bi = bi + 1;
                 }
             }
-            self.errors.push("Type error: no method '" + method + "' on struct '" + struct_name + "'");
+            self.errors.push("Type error: no method '" + method + "' on struct '" + struct_name + "'\n    Fix: define it: `impl " + struct_name + " { fn " + method + "(self: " + struct_name + ") -> T { ... } }`, or check the spelling.");
         }
         Type::Generic(gen_name, recv_args) => {
             // Generic type: look up methods by base name
@@ -24307,11 +24382,11 @@ pub fn TypeChecker_check_method_call(self: &mut TypeChecker, receiver: Expr, met
                 }
                 return method_map.get(mei).val.ret_ty;
             }
-            self.errors.push("Type error: no method '" + method + "' on generic type '" + gen_name + "'");
+            self.errors.push("Type error: no method '" + method + "' on generic type '" + gen_name + "'\n    Fix: bound the type parameter by a trait that declares it (`<" + gen_name + ": Trait>`), or call a function that takes the value.");
         }
         _ => {
             if !TypeChecker_is_reported(self, recv_ty) {
-                self.errors.push("Type error: cannot call method '" + method + "' on type " + type_to_str(recv_ty));
+                self.errors.push("Type error: cannot call method '" + method + "' on type " + type_to_str(recv_ty) + "\n    Fix: call methods on a struct, Vec, HashMap or str; for " + type_to_str(recv_ty) + " call a function (`" + method + "(x)`).");
             }
         }
     }
@@ -24819,7 +24894,7 @@ pub fn TypeChecker_check_return_type(self: &mut TypeChecker, actual: Type) {
             OptString::None => {
             }
         }
-        self.errors.push("Type error (line " + int_to_str(self.current_line) + "): '" + fname + "' returns " + type_to_str(actual) + " but is declared to return " + type_to_str(declared));
+        self.errors.push("Type error (line " + int_to_str(self.current_line) + "): '" + fname + "' returns " + type_to_str(actual) + " but is declared to return " + type_to_str(declared) + "\n    Fix: return a " + type_to_str(declared) + " (cast with `as` for a number), or declare '" + fname + "' to return " + type_to_str(actual) + ".");
     }
 }
 
@@ -24838,7 +24913,7 @@ pub fn TypeChecker_check_enum_constructor(self: &mut TypeChecker, enum_name: str
                     var payload: Vec<Type> = variants.get(vi).payload_types;
                     var n: i64 = payload.len();
                     if n != n_args {
-                        self.errors.push("Type error (line " + int_to_str(self.current_line) + "): " + key + "::" + variant + " takes " + int_to_str(n) + " value(s), got " + int_to_str(n_args));
+                        self.errors.push("Type error (line " + int_to_str(self.current_line) + "): " + key + "::" + variant + " takes " + int_to_str(n) + " value(s), got " + int_to_str(n_args) + "\n    Fix: pass " + int_to_str(n) + " value(s): `" + key + "::" + variant + "(...)`.");
                         return;
                     }
                     var fi: i64 = 0;
@@ -24859,7 +24934,7 @@ pub fn TypeChecker_check_enum_constructor(self: &mut TypeChecker, enum_name: str
                 }
                 vi = vi + 1;
             }
-            self.errors.push("Type error (line " + int_to_str(self.current_line) + "): enum '" + key + "' has no variant '" + variant + "'");
+            self.errors.push("Type error (line " + int_to_str(self.current_line) + "): enum '" + key + "' has no variant '" + variant + "'\n    Fix: use one of the variants enum '" + key + "' declares, or add `" + variant + "` to it.");
             return;
         }
         ei = ei + 1;
@@ -24947,7 +25022,7 @@ fn TypeChecker_check_enum_lit(self: &mut TypeChecker, enum_name: str, variant: s
                 var got: Type = arg_tys.get(fi);
                 if !TypeChecker_type_contains_param(self, want) && !type_eq(got, Type::Never) && !type_eq(got, Type::Infer) {
                     if !TypeChecker_arg_compatible(self, want, got) && !TypeChecker_is_reported(self, got) {
-                        self.errors.push("Type error (line " + int_to_str(self.current_line) + "): " + key + "::" + variant + " field " + int_to_str(fi + 1) + " expects '" + type_to_str(want) + "', got '" + type_to_str(got) + "' (the expected type is " + type_to_str(hint_ty) + ")");
+                        self.errors.push("Type error (line " + int_to_str(self.current_line) + "): " + key + "::" + variant + " field " + int_to_str(fi + 1) + " expects '" + type_to_str(want) + "', got '" + type_to_str(got) + "' (the expected type is " + type_to_str(hint_ty) + ")\n    Fix: pass a '" + type_to_str(want) + "' (cast with `as` for a number).");
                     } else {
                         TypeChecker_check_value_fits(self, want, got, args.get(fi), self.current_line);
                     }
@@ -25167,7 +25242,7 @@ fn TypeChecker_check_index_arg(self: &mut TypeChecker, what: str, arg_types: Vec
     if type_eq(a, Type::Never) || TypeChecker_is_integer(self, ra) || TypeChecker_type_contains_param(self, ra) || TypeChecker_types_compatible(self, Type::I64, a) {
         return;
     }
-    self.errors.push("Type error (line " + int_to_str(self.current_line) + "): " + what + " index expects an integer, got '" + type_to_str(a) + "' in '" + self.checking_fn + "'");
+    self.errors.push("Type error (line " + int_to_str(self.current_line) + "): " + what + " index expects an integer, got '" + type_to_str(a) + "' in '" + self.checking_fn + "'\n    Fix: index with an integer (`i as i64` for another number type).");
 }
 
 // BG154: whether `receiver` is a map variable declared without a type
@@ -25202,7 +25277,7 @@ fn TypeChecker_check_map_args(self: &mut TypeChecker, method: str, key_ty: Type,
         return;
     }
     if arg_types.len() != want_n {
-        self.errors.push("Type error (line " + int_to_str(self.current_line) + "): HashMap." + method + " expects " + int_to_str(want_n) + " args, got " + int_to_str(arg_types.len()) + " in '" + self.checking_fn + "'");
+        self.errors.push("Type error (line " + int_to_str(self.current_line) + "): HashMap." + method + " expects " + int_to_str(want_n) + " args, got " + int_to_str(arg_types.len()) + " in '" + self.checking_fn + "'\n    Fix: pass " + int_to_str(want_n) + " argument(s) to `." + method + "(...)`.");
         return;
     }
     TypeChecker_check_coll_arg(self, "HashMap." + method, "key", 0, key_ty, arg_types);
@@ -25500,7 +25575,7 @@ fn TypeChecker_c_callback_fix(self: &mut TypeChecker, sig: FuncSig, arg: Expr, a
                             return ".\n    '" + name + "' returns a struct, which the adapter C calls cannot give back.\n    Fix: return the result through a pointer parameter instead.";
                         }
                         OptFuncSig::None => {
-                            return "";
+                            return ".\n    Fix: pass the name of a function the program defines (`fn cb(...) { ... }`).";
                         }
                     }
                 }
@@ -25691,13 +25766,13 @@ pub fn TypeChecker_check_enum_pattern(self: &mut TypeChecker, match_ty: Type, en
                 if variants.get(vi).name == variant {
                     var n_payload: i64 = variants.get(vi).payload_types.len();
                     if bindings.len() > 0 && bindings.len() != n_payload {
-                        self.errors.push("Type error (line " + int_to_str(self.current_line) + "): pattern " + ename + "::" + variant + " binds " + int_to_str(bindings.len()) + " field(s) but the variant has " + int_to_str(n_payload));
+                        self.errors.push("Type error (line " + int_to_str(self.current_line) + "): pattern " + ename + "::" + variant + " binds " + int_to_str(bindings.len()) + " field(s) but the variant has " + int_to_str(n_payload) + "\n    Fix: bind " + int_to_str(n_payload) + " name(s): `" + ename + "::" + variant + "(a, ...)`, `_` for a field you do not need.");
                     }
                     return;
                 }
                 vi = vi + 1;
             }
-            self.errors.push("Type error (line " + int_to_str(self.current_line) + "): enum '" + ename + "' has no variant '" + variant + "'");
+            self.errors.push("Type error (line " + int_to_str(self.current_line) + "): enum '" + ename + "' has no variant '" + variant + "'\n    Fix: use one of the variants enum '" + ename + "' declares, or add `" + variant + "` to it.");
             return;
         }
         ei = ei + 1;
@@ -25793,7 +25868,7 @@ fn TypeChecker_check_is_variant(self: &mut TypeChecker, operand_ty: Type, name: 
                 }
                 vi = vi + 1;
             }
-            self.errors.push("Type error (line " + int_to_str(self.current_line) + "): `is " + name + "`: enum '" + ename + "' has no variant '" + name + "'.");
+            self.errors.push("Type error (line " + int_to_str(self.current_line) + "): `is " + name + "`: enum '" + ename + "' has no variant '" + name + "'.\n    Fix: use one of the variants enum '" + ename + "' declares, or add `" + name + "` to it.");
             return;
         }
         ei = ei + 1;
@@ -27661,7 +27736,7 @@ fn TypeChecker_option_field_type(self: &mut TypeChecker, obj_ty: Type, field: st
                                     }
                                     fi = fi + 1;
                                 }
-                                self.errors.push("Type error (line " + int_to_str(self.current_line) + "): no field '" + field + "' on struct '" + sn + "' (in `?." + field + "` on " + type_to_str(obj_ty) + ")");
+                                self.errors.push("Type error (line " + int_to_str(self.current_line) + "): no field '" + field + "' on struct '" + sn + "' (in `?." + field + "` on " + type_to_str(obj_ty) + ")\n    Fix: use one of the fields struct '" + sn + "' declares, or add `" + field + ": T` to it.");
                                 return Type::Never;
                             }
                             OptVecStructField::None => {
@@ -27929,7 +28004,7 @@ fn TypeChecker_check_branch_types(self: &mut TypeChecker, first: Type, other: Ty
 fn TypeChecker_check_if_value(self: &mut TypeChecker, cond: Expr, then_block: Vec<Stmt>, else_block: OptStmts) -> Type {
     var cond_ty: Type = TypeChecker_resolve_type(self, TypeChecker_check_expr(self, cond));
     if !type_eq(cond_ty, Type::Bool) && !type_eq(cond_ty, Type::I32) && !type_eq(cond_ty, Type::I64) && !type_eq(cond_ty, Type::Infer) && !type_eq(cond_ty, Type::Never) {
-        self.errors.push("Type error (line " + int_to_str(self.current_line) + "): if condition must be bool, got " + type_to_str(cond_ty));
+        self.errors.push("Type error (line " + int_to_str(self.current_line) + "): if condition must be bool, got " + type_to_str(cond_ty) + "\n    Fix: compare to get a bool, e.g. `if x != 0 { ... }`.");
     }
     var uninit_before: Vec<str> = self.uninit_vars.clone();
     // BG187: each branch starts from what was consumed before the if; the
@@ -28123,13 +28198,13 @@ fn TypeChecker_effect_rules_one(self: &mut TypeChecker, func: Func, label: str, 
                 self.errors.push("Determinism error: function '" + label + "' is @deterministic but has effect '!" + eff + "' through a method it calls (directly or through the functions it calls)." + "\n    @deterministic functions must be reproducible — same inputs → same outputs." + "\n    Fix: remove the @deterministic annotation, or the call that produces the '!" + eff + "' effect.");
             }
             if func.has_effect_annotation && !tc_str_vec_contains(func.declared_effects, eff) {
-                self.errors.push("Effect error: function '" + label + "' has inferred effect '!" + eff + "' (through a method it calls) but only declared effects not including it");
+                self.errors.push("Effect error: function '" + label + "' has inferred effect '!" + eff + "' (through a method it calls) but only declared effects not including it\n    Fix: add " + eff + " to the effects '" + label + "' declares (`-> T !{..., " + eff + "}`), or do not call that method.");
             }
             if is_rt && blocks {
-                self.errors.push("Realtime error: function '" + label + "' is @realtime but has effect '!" + eff + "' which may block (through a method it calls)");
+                self.errors.push("Realtime error: function '" + label + "' is @realtime but has effect '!" + eff + "' which may block (through a method it calls)\n    Fix: do the blocking work outside '" + label + "' (in a task that is not @realtime), or remove @realtime.");
             }
             if is_ct && (blocks || eff == "Diverge") {
-                self.errors.push("Constant-time error: function '" + label + "' is @constant_time but has effect '!" + eff + "' (through a method it calls)");
+                self.errors.push("Constant-time error: function '" + label + "' is @constant_time but has effect '!" + eff + "' (through a method it calls)\n    Fix: do the '!" + eff + "' work in the caller of '" + label + "', or remove @constant_time.");
             }
         }
         i = i + 1;
@@ -28383,7 +28458,7 @@ fn TypeChecker_verify_method_recursion(self: &mut TypeChecker, program: Program)
                 self.errors.push("Safety error (no-recursion): function '" + node + "' is @no-recursion but can call itself again through a method call (`x.m(..)`).\n    Recursion through a method has the same unbounded stack depth as direct\n    recursion.\n    Fix: make one function on the cycle iterative, or remove the @no-recursion annotation.");
             }
             if kind2 >= 2 && !TypeChecker_errors_mention(self, "function '" + flat + "' is @bounded-stack") && !TypeChecker_errors_mention(self, "function '" + node + "' is @bounded-stack") {
-                self.errors.push("Safety error (bounded-stack): function '" + node + "' is @bounded-stack but can call itself again through a method call (`x.m(..)`).\n    Its stack depth has no bound: every function it can reach must be\n    non-recursive and called directly.");
+                self.errors.push("Safety error (bounded-stack): function '" + node + "' is @bounded-stack but can call itself again through a method call (`x.m(..)`).\n    Its stack depth has no bound: every function it can reach must be\n    non-recursive and called directly.\n    Fix: replace the recursion with a loop, or remove @bounded-stack.");
             }
         }
         ni = ni + 1;
@@ -28926,18 +29001,18 @@ fn TypeChecker_check_comparison(self: &mut TypeChecker, op: BinOp, left: Expr, r
             }
         }
         if type_eq(lt, Type::Bool) || type_eq(rt, Type::Bool) {
-            self.errors.push("Type error (line " + int_to_str(self.current_line) + "): `" + sym + "` orders numbers and strings, not bools (" + type_to_str(lt) + " with " + type_to_str(rt) + ").");
+            self.errors.push("Type error (line " + int_to_str(self.current_line) + "): `" + sym + "` orders numbers and strings, not bools (" + type_to_str(lt) + " with " + type_to_str(rt) + ").\n    Fix: compare bools with `==` or `!=`; to order them, compare `(a as i64) < (b as i64)`.");
             return true;
         }
     }
     if (type_eq(lt, Type::Bool) && type_eq(rt, Type::Str)) || (type_eq(lt, Type::Str) && type_eq(rt, Type::Bool)) {
-        self.errors.push("Type error (line " + int_to_str(self.current_line) + "): cannot compare " + type_to_str(lt) + " with " + type_to_str(rt) + " (`" + sym + "` takes two values of one type).");
+        self.errors.push("Type error (line " + int_to_str(self.current_line) + "): cannot compare " + type_to_str(lt) + " with " + type_to_str(rt) + " (`" + sym + "` takes two values of one type).\n    Fix: convert one side so both have one type (`x as f64`, int_to_str(n), parse_int(s)).");
         return true;
     }
     var ln: str = tc_cmp_user_type(self, lt);
     var rn: str = tc_cmp_user_type(self, rt);
     if ln != "" && rn != "" && ln != rn {
-        self.errors.push("Type error (line " + int_to_str(self.current_line) + "): cannot compare " + ln + " with " + rn + " (`" + sym + "` takes two values of one type).");
+        self.errors.push("Type error (line " + int_to_str(self.current_line) + "): cannot compare " + ln + " with " + rn + " (`" + sym + "` takes two values of one type).\n    Fix: convert one side so both have one type (`x as f64`, int_to_str(n), parse_int(s)).");
         return true;
     }
     // BG60: numbers of different types — `i64 < f64` orders an int's bits
@@ -28970,7 +29045,7 @@ fn TypeChecker_check_comparison(self: &mut TypeChecker, op: BinOp, left: Expr, r
             bad_lit = true;
         }
         if bad_lit {
-            self.errors.push("Type error (line " + int_to_str(self.current_line) + "): the literal does not fit in " + type_to_str(ltr) + ".");
+            self.errors.push("Type error (line " + int_to_str(self.current_line) + "): the literal does not fit in " + type_to_str(ltr) + ".\n    Fix: use a value that fits in " + type_to_str(ltr) + ", or compare against a wider type (`x as i64`).");
             return true;
         }
     }
@@ -29005,7 +29080,7 @@ fn TypeChecker_check_index_read_other(self: &mut TypeChecker, arr_ty: Type) {
     if !bad {
         return;
     }
-    var hint: str = "";
+    var hint: str = "\n    Fix: read a field (`x.field`) or call a method that returns the element (`x.get(i)`).";
     if n == "HashMap" {
         hint = "\n    Fix: read a map with .get(key) (or .get_or(key, default)).";
     }

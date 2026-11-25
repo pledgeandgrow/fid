@@ -151,6 +151,14 @@ fn pad_str(s: str, width: i64) -> str {
     return result;
 }
 
+fn pad_left(s: str, width: i64) -> str {
+    var result: str = s;
+    while str_len(result) < width {
+        result = " " + result;
+    }
+    return result;
+}
+
 fn pad_int(n: i64, width: i64) -> str {
     var s: str = int_to_str(n);
     while str_len(s) < width {
@@ -160,13 +168,8 @@ fn pad_int(n: i64, width: i64) -> str {
 }
 
 fn float_to_str_1(f: f64) -> str {
-    var whole: i64 = f as i64;
-    var frac: f64 = f - (whole as f64);
-    if frac < 0.0 {
-        frac = -frac;
-    }
-    var frac_int: i64 = (frac * 10.0) as i64;
-    return int_to_str(whole) + "." + int_to_str(frac_int);
+    var scaled: i64 = (f * 10.0 + 0.5) as i64;
+    return int_to_str(scaled / 10) + "." + int_to_str(scaled % 10);
 }
 
 fn vl_str_rfind_char(s: str, ch: i64) -> i64 {
@@ -218,9 +221,11 @@ pub fn CoverageData_mark_instruction_covered(self: &mut CoverageData, func_name:
 }
 
 pub fn CoverageData_compute_func_counts(self: &mut CoverageData) -> void {
+    // By name, as src/veil.rs's BTreeMap lists them (AD1)
+    val names: Vec<str> = pe_sort_strs(self.all_functions);
     var fi: i64 = 0;
-    while fi < self.all_functions.len() {
-        var name: str = self.all_functions.get(fi);
+    while fi < names.len() {
+        var name: str = names.get(fi);
         var total: i64 = 0;
         var covered: i64 = 0;
 
@@ -397,6 +402,43 @@ fn vl_keep_entries(v: Vec<CovLineEntry>, names: i64) -> Vec<CovLineEntry> {
     return out;
 }
 
+fn vl_own_helper(n: str) -> bool {
+    return str_starts_with(n, "__own_drop_") || str_starts_with(n, "__own_dup_");
+}
+
+fn vl_drop_own_names(v: Vec<str>) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < v.len() {
+        if !vl_own_helper(v.get(i)) {
+            out.push(v.get(i));
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn vl_drop_own_entries(v: Vec<CovLineEntry>) -> Vec<CovLineEntry> {
+    var out: Vec<CovLineEntry> = Vec::new();
+    var i: i64 = 0;
+    while i < v.len() {
+        if !vl_own_helper(v.get(i).a) {
+            out.push(v.get(i));
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn vl_drop_own_helpers(data: &mut CoverageData) -> void {
+    data.all_functions = vl_drop_own_names(data.all_functions);
+    data.called_functions = vl_drop_own_names(data.called_functions);
+    data.all_lines = vl_drop_own_entries(data.all_lines);
+    data.covered_lines = vl_drop_own_entries(data.covered_lines);
+    data.all_instructions = vl_drop_own_entries(data.all_instructions);
+    data.covered_instructions = vl_drop_own_entries(data.covered_instructions);
+}
+
 /// What the interpreter ran, into `data`: each instruction (they come
 /// once each), its function, and its source line (once per function and
 /// line). Tables, not the linear mark_* scans: a run covers core too.
@@ -500,16 +542,13 @@ fn vl_cover_module(module: IrModule, source: str) -> CoverageRunResult {
     var trace: OptStr = Interpreter_take_panic_stack_trace(&mut interp);
     vl_record_covered(&mut data, &interp, &interp.module);
 
-    // The report covers the user's own functions: core and the stdlib a
-    // program pulls in would otherwise make up most of it
-    match parse_program_only(source) {
-        OptProgram::Some(up) => {
-            vl_keep_user(&mut data, &up);
-        }
-        OptProgram::None => {
-        }
-    }
+    // The self-hosted lowering emits ownership helpers the Rust lowering
+    // does not report; they are implementation details, not program functions.
+    vl_drop_own_helpers(&mut data);
 
+    // AD1 parity with src/veil.rs: report every lowered function. Filtering
+    // to the user's own functions made the Fides tool report 1/1 where the
+    // Rust tool reports the whole lowered module (core included).
     // 4. Compute per-function line counts
     CoverageData_compute_func_counts(&mut data);
 
@@ -568,6 +607,11 @@ pub fn veil_run(input_path: str, format: str, output_dir: str) -> str {
         va_i = va_i + 1;
     }
     var cov: CoverageRunResult = run_with_coverage(source, input_path);
+    // A program that does not compile has no coverage: the errors alone, no
+    // report written (src/veil.rs returns them as its error, AD1)
+    if str_starts_with(cov.status, "Compilation failed") {
+        return cov.status;
+    }
     var status_line: str = "";
     if cov.status != "ok" {
         status_line = cov.status + "\n";
@@ -594,16 +638,17 @@ pub fn veil_run(input_path: str, format: str, output_dir: str) -> str {
         if p_file_write(path, text) < 0 {
             return status_line + text + "\n\nError: could not write " + path;
         }
-        return status_line + text + "\n\nCoverage report: " + path;
+        // the report ends with its last line's newline: one blank line, as Rust
+        return status_line + text + "\nCoverage report: " + path;
     }
 }
 
 pub fn veil_print_help() -> str {
-    return "veil -- Code coverage tool for Fides\n\n" + "USAGE:\n" + "    veil <file.fd> [--format text|html] [--output <dir>]\n\n" + "OPTIONS:\n" + "    --format <format>   Report format: text (default) or html\n" + "    --output <dir>      Output directory (default: coverage/)\n" + "    --help, -h          Show this help\n\n" + "TRACKS:\n" + "    - Function coverage: which functions were called\n" + "    - Line coverage: which source lines were executed\n" + "    - Instruction coverage: which IR instructions ran\n";
+    return "veil — Code coverage tool for Fides\n\n" + "USAGE:\n" + "    veil <file.fd> [--format text|html] [--output <dir>]\n\n" + "OPTIONS:\n" + "    --format <format>   Report format: text (default) or html\n" + "    --output <dir>      Output directory (default: coverage/)\n" + "    --help, -h          Show this help\n\n" + "TRACKS:\n" + "    - Function coverage: which functions were called\n" + "    - Line coverage: which source lines were executed\n" + "    - Instruction coverage: which IR instructions ran\n";
 }
 
 pub fn generate_text_report(data: &CoverageData, source: str) -> str {
-    var report: str = "veil -- Coverage Report\n";
+    var report: str = "veil — Coverage Report\n";
     report = report + "=======================\n\n";
     report = report + "Summary\n";
     report = report + "-------\n";
@@ -616,7 +661,8 @@ pub fn generate_text_report(data: &CoverageData, source: str) -> str {
 
     report = report + "Per-Function Coverage\n";
     report = report + "---------------------\n";
-    report = report + "Function                        Lines    Covered   Percent\n";
+    // src/veil.rs: "{:<30} {:>10} {:>10} {:>10}", rows "{:<30} {:>10} {:>10} {:>9.1}%"
+    report = report + pad_str("Function", 30) + " " + pad_left("Lines", 10) + " " + pad_left("Covered", 10) + " " + pad_left("Percent", 10) + "\n";
     report = report + "--------------------------------------------------------------\n";
     var fi: i64 = 0;
     while fi < data.func_line_counts.len() {
@@ -630,11 +676,11 @@ pub fn generate_text_report(data: &CoverageData, source: str) -> str {
         }
         var marker: str = "";
         if pct == 100.0 {
-            marker = " OK";
+            marker = " ✓";
         } else if pct == 0.0 {
-            marker = " X";
+            marker = " ✗";
         }
-        report = report + pad_str(name, 30) + "  " + pad_int(total, 6) + "  " + pad_int(covered, 8) + "  " + float_to_str_1(pct) + "%" + marker + "\n";
+        report = report + pad_str(name, 30) + " " + pad_int(total, 10) + " " + pad_int(covered, 10) + " " + pad_left(float_to_str_1(pct), 9) + "%" + marker + "\n";
         fi = fi + 1;
     }
     report = report + "\n";
@@ -685,7 +731,7 @@ pub fn generate_text_report(data: &CoverageData, source: str) -> str {
 pub const COVERAGE_CSS: str = "body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 0; padding: 20px; color: #333; }\nh1 { color: #1a1a2e; }\n.file { color: #888; font-family: monospace; }\n.summary { display: flex; gap: 15px; margin: 20px 0; }\n.card { padding: 15px 25px; border-radius: 8px; text-align: center; min-width: 150px; }\n.card.full { background: #d4edda; border: 1px solid #c3e6cb; }\n.card.partial { background: #fff3cd; border: 1px solid #ffeaa7; }\n.card.low { background: #f8d7da; border: 1px solid #f5c6cb; }\n.card-label { font-size: 13px; color: #666; }\n.card-value { font-size: 28px; font-weight: bold; margin: 5px 0; }\n.card-detail { font-size: 12px; color: #888; }\ntable { border-collapse: collapse; width: 100%; margin: 15px 0; }\nth, td { padding: 8px 12px; text-align: left; border-bottom: 1px solid #eee; }\nth { background: #f5f5f5; }\ntr.full { background: #d4edda; }\ntr.none { background: #f8d7da; }\ntr.partial { background: #fff3cd; }\n.source { background: #f8f8f8; padding: 15px; border-radius: 5px; overflow-x: auto; font-family: 'Fira Code', monospace; font-size: 13px; line-height: 1.6; }\n.line { display: block; }\n.line .lnum { display: inline-block; width: 40px; color: #aaa; text-align: right; padding-right: 10px; user-select: none; }\n.line.covered { background: #e6ffed; }\n.line.uncovered { background: #ffeef0; }\n.line.neutral { background: transparent; }\nfooter { text-align: center; padding: 20px; color: #999; font-size: 13px; }\nfooter a { color: #1a1a2e; }\n";
 pub fn generate_html_report(data: &CoverageData, source: str, filename: str) -> str {
     var html: str = "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n";
-    html = html + "<title>Coverage Report -- " + vl_escape_html(filename) + "</title>\n";
+    html = html + "<title>Coverage Report — " + vl_escape_html(filename) + "</title>\n";
     html = html + "<meta charset=\"utf-8\">\n";
     html = html + "<style>\n" + COVERAGE_CSS + "</style>\n";
     html = html + "</head>\n<body>\n";
@@ -742,7 +788,7 @@ pub fn generate_html_report(data: &CoverageData, source: str, filename: str) -> 
         li = li + 1;
     }
     html = html + "</pre>\n";
-    html = html + "<footer><p>Generated by veil -- Fides coverage tool</p></footer>\n";
+    html = html + "<footer><p>Generated by veil — Fides coverage tool</p></footer>\n";
     html = html + "</body>\n</html>\n";
     return html;
 }

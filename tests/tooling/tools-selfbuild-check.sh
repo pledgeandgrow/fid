@@ -115,8 +115,26 @@ if [[ " $TOOLS " == *" scribe "* ]] && build scribe; then
     rmd=$(ls "$rout"/*.md 2>/dev/null | head -1)
     grep -E '^#{2,3} ' "$md"  | tr -d '\r' > "$WORK/sc-$name.fd.h"
     grep -E '^#{2,3} ' "$rmd" | tr -d '\r' > "$WORK/sc-$name.rs.h"
+    # The frozen Rust scribe still has BG104 (src/scribe.rs parse_impl
+    # counts a line's braces before testing the depth, so a method whose
+    # body spans lines is never documented); the Fides scribe has it fixed.
+    # Extra "### name" headings are accepted when nothing of the Rust
+    # scribe's is missing and each one is a method of an impl block in the
+    # source (an indented "fn name(").
+    extra_ok=0
+    if ! cmp -s "$WORK/sc-$name.fd.h" "$WORK/sc-$name.rs.h"; then
+      diff "$WORK/sc-$name.fd.h" "$WORK/sc-$name.rs.h" | grep -E '^[<>] ' > "$WORK/sc-$name.diff"
+      if ! grep -q '^> ' "$WORK/sc-$name.diff" && ! grep -qv '^< ### ' "$WORK/sc-$name.diff"; then
+        extra_ok=1
+        for m in $(sed 's/^< ### //' "$WORK/sc-$name.diff" | sort -u); do
+          if ! tr -d '\r' < "$src" | grep -qE "^[[:space:]]+(pub )?fn $m[(<]"; then extra_ok=0; fi
+        done
+      fi
+    fi
     if cmp -s "$WORK/sc-$name.fd.h" "$WORK/sc-$name.rs.h"; then
       ok "scribe $src: same $(wc -l < "$WORK/sc-$name.fd.h") sections as the Rust scribe"
+    elif [ $extra_ok -eq 1 ]; then
+      ok "scribe $src: the Rust scribe's $(wc -l < "$WORK/sc-$name.rs.h") sections, plus $(wc -l < "$WORK/sc-$name.diff") impl methods it misses (BG104, fixed in the Fides scribe only)"
     else
       bad "scribe $src: sections differ from the Rust scribe (< fid, > Rust)"
       diff "$WORK/sc-$name.fd.h" "$WORK/sc-$name.rs.h" | head -20 | sed 's/^/        /'
@@ -129,6 +147,14 @@ if [[ " $TOOLS " == *" veil "* ]] && build veil; then
   V="$WORK/veil$EXT"
   check_cli veil "$V"
   RV=$(rust_tool veil)
+  # A program that does not compile: no report, the errors on stderr, exit 1
+  printf 'fn main() -> i64 {\n    val x: i64 = "no";\n    return 0;\n}\n' > "$WORK/bad.fd"
+  "$V" "$WORK/bad.fd" -o "$WORK/vl-bad" > "$WORK/vl-bad.out" 2> "$WORK/vl-bad.err"; code=$?
+  if [ $code -eq 1 ] && grep -q "^error: .*cannot assign str" "$WORK/vl-bad.err" && [ ! -f "$WORK/vl-bad/coverage.txt" ]; then
+    ok "veil on a program that does not compile: exit 1, the error on stderr, no report"
+  else
+    bad "veil on a program that does not compile: exit $code, stderr '$(grep -v '^\[' "$WORK/vl-bad.err" | head -1)'"
+  fi
   for src in tests/bootstrap/hello.fd tests/bootstrap/struct.fd; do
     name=$(basename "$src" .fd)
     out="$WORK/vl-fd-$name"
@@ -146,9 +172,12 @@ if [[ " $TOOLS " == *" veil "* ]] && build veil; then
     if ! "$RV" "$src" --output "$WORK/vl-rs-$name" > "$WORK/vl-$name.rs.out" 2> /dev/null; then
       note "Rust veil failed on $src: comparison skipped"; continue
     fi
-    # The program's own output: everything before the report's title
-    tr -d '\r' < "$WORK/vl-$name.fd.out" | sed -n '/^veil .* Coverage Report$/q;p' | sed '/^$/d' > "$WORK/vl-$name.fd.prog"
-    tr -d '\r' < "$WORK/vl-$name.rs.out" | sed -n '/^veil .* Coverage Report$/q;p' | sed '/^$/d' > "$WORK/vl-$name.rs.prog"
+    # The program's own output: everything before the report's title,
+    # which follows it on the same line when the output ends without a
+    # newline (both veils print what the interpreter collected as it is)
+    prog() { tr -d '\r' < "$1" | sed -n '/veil .* Coverage Report$/{s/veil .* Coverage Report$//;p;q;};p' | sed '/^$/d'; }
+    prog "$WORK/vl-$name.fd.out" > "$WORK/vl-$name.fd.prog"
+    prog "$WORK/vl-$name.rs.out" > "$WORK/vl-$name.rs.prog"
     if cmp -s "$WORK/vl-$name.fd.prog" "$WORK/vl-$name.rs.prog"; then ok "veil $src: the program's output is the Rust veil's";
     else bad "veil $src: the program's output differs from the Rust veil's"; diff "$WORK/vl-$name.fd.prog" "$WORK/vl-$name.rs.prog" | head -10 | sed 's/^/        /'; fi
     ff=$(tr -d '\r' < "$out/coverage.txt" | grep '^Functions:')

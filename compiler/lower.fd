@@ -11986,13 +11986,13 @@ fn Lowerer_lower_stmt_inner(self: & mut Lowerer, stmt: Stmt) {
                             if self.own_on {
                                 gty = lw_rc_handle_of_ir(ir_ty);
                             }
-                            var val: i64 = Lowerer_lower_owned(self, expr, gty);
-                            val = Lowerer_int_to_float_value(self, val, ir_ty);
+                            var v_lw: i64 = Lowerer_lower_owned(self, expr, gty);
+                            v_lw = Lowerer_int_to_float_value(self, v_lw, ir_ty);
                             var gold: i64 = - 1;
                             if Lowerer_rc_kind(self, gty) != RC_NONE {
                                 gold = Lowerer_emit_inst(self, Inst::Load(addr, ir_ty));
                             }
-                            var _s: i64 = Lowerer_emit_inst(self, Inst::Store(addr, val, OptIrType::None));
+                            var _s: i64 = Lowerer_emit_inst(self, Inst::Store(addr, v_lw, OptIrType::None));
                             if gold >= 0 {
                                 Lowerer_rc_drop(self, gold, gty);
                             }
@@ -12206,9 +12206,9 @@ fn Lowerer_lower_stmt_inner(self: & mut Lowerer, stmt: Stmt) {
                     // Not an alloca - try local binding
                     match Lowerer_lookup_local(self, name) {
                         OptValueId::Some(local) => {
-                            var val: i64 = Lowerer_lower_expr(self, expr);
+                            var v_lw: i64 = Lowerer_lower_expr(self, expr);
                             // Direct assignment to local ( SSA - but we support it)
-                            Lowerer_set_value_type(self, local, Lowerer_get_value_type(self, val));
+                            Lowerer_set_value_type(self, local, Lowerer_get_value_type(self, v_lw));
                         }
                         OptValueId::None => {
                         }
@@ -12356,12 +12356,12 @@ fn Lowerer_lower_stmt_inner(self: & mut Lowerer, stmt: Stmt) {
                     if rg_n > 0 {
                         bval = Lowerer_rg_keep_out(self, bval, Lowerer_rc_value_type(self, lw_box_expr_unbox(e), bval));
                     }
-                    var val: i64 = bval;
+                    var v_lw: i64 = bval;
                     if self.loop_stack.len() > 0 {
                         var ctx: LoopContext = self.loop_stack.get(self.loop_stack.len() - 1);
                         match ctx.result_slot {
                             OptValueId::Some(slot) => {
-                                var _s: i64 = Lowerer_emit_inst(self, Inst::Store(slot, val, OptIrType::None));
+                                var _s: i64 = Lowerer_emit_inst(self, Inst::Store(slot, v_lw, OptIrType::None));
                             }
                             OptValueId::None => {
                             }
@@ -12486,12 +12486,12 @@ fn Lowerer_lower_stmt_inner(self: & mut Lowerer, stmt: Stmt) {
                         var _ms: i64 = Lowerer_emit_inst(self, Inst::Store(ptr_val, mval, OptIrType::Some(pointee_ty)));
                         return;
                     }
-                    var val: i64 = Lowerer_lower_owned(self, expr, dty);
+                    var v_lw: i64 = Lowerer_lower_owned(self, expr, dty);
                     var dold: i64 = - 1;
                     if Lowerer_rc_kind(self, dty) != RC_NONE {
                         dold = Lowerer_emit_inst(self, Inst::Load(ptr_val, pointee_ty));
                     }
-                    var _s: i64 = Lowerer_emit_inst(self, Inst::Store(ptr_val, val, OptIrType::Some(pointee_ty)));
+                    var _s: i64 = Lowerer_emit_inst(self, Inst::Store(ptr_val, v_lw, OptIrType::Some(pointee_ty)));
                     if dold >= 0 {
                         Lowerer_rc_drop(self, dold, dty);
                     }
@@ -13355,8 +13355,8 @@ fn Lowerer_lower_rc_new(self: & mut Lowerer, name: str, arg_expr: Expr) -> i64 {
     if tid != 0 {
         return Lowerer_lower_rc_new_t(self, name, arg_expr, arg_ast, tid);
     }
-    var val: i64 = Lowerer_lower_expr(self, arg_expr);
-    var val_ty: IrType = Lowerer_get_value_type(self, val);
+    var v_lw: i64 = Lowerer_lower_expr(self, arg_expr);
+    var val_ty: IrType = Lowerer_get_value_type(self, v_lw);
     var as_word: bool = ir_type_is_float(val_ty);
     match val_ty {
         IrType::Ptr(_) => {
@@ -13366,12 +13366,12 @@ fn Lowerer_lower_rc_new(self: & mut Lowerer, name: str, arg_expr: Expr) -> i64 {
         }
     }
     if as_word {
-        val = Lowerer_lower_cast(self, val, val_ty, IrType::I64);
+        v_lw = Lowerer_lower_cast(self, v_lw, val_ty, IrType::I64);
     }
     var env: i64 = Lowerer_emit_inst(self, Inst::ConstInt(0, IrType::I64));
     var cargs: Vec<i64> = Vec::new();
     cargs.push(env);
-    cargs.push(val);
+    cargs.push(v_lw);
     return Lowerer_emit_inst(self, Inst::Call(name + "_new", cargs, IrType::I64, EffectSet_new()));
 }
 
@@ -16185,14 +16185,14 @@ fn Lowerer_vec_field_mask(self: & Lowerer, name: str, base: i64) -> i64 {
 /// function holding a Vec, HashMap or str and the callee's parameter takes
 /// the value (as src/lower.rs lower_expr_for_param).
 fn Lowerer_lower_arg_for_param(self: & mut Lowerer, arg: Expr, callee: str, i: i64) -> i64 {
-    var val: i64 = Lowerer_lower_expr(self, arg);
+    var v_lw: i64 = Lowerer_lower_expr(self, arg);
     // An integer passed where the parameter is a float is the number
     // (`half(5)`): Lowerer_int_to_float_value, as a declaration makes it
     var i2f_at: i64 = HashMap_get(self.func_info_at, callee);
     if i2f_at != 0 {
         var i2f_ps: Vec<Type> = self.func_param_asts.get(i2f_at - 1);
         if i < i2f_ps.len() {
-            val = Lowerer_int_to_float_value(self, val, Lowerer_lower_type(self, i2f_ps.get(i)));
+            v_lw = Lowerer_int_to_float_value(self, v_lw, Lowerer_lower_type(self, i2f_ps.get(i)));
         }
     }
     var aname: str = "";
@@ -16201,7 +16201,7 @@ fn Lowerer_lower_arg_for_param(self: & mut Lowerer, arg: Expr, callee: str, i: i
             aname = n;
         }
         _ => {
-            return val;
+            return v_lw;
         }
     }
     var inner: Type = Type::I64;
@@ -16209,37 +16209,37 @@ fn Lowerer_lower_arg_for_param(self: & mut Lowerer, arg: Expr, callee: str, i: i
         OptType::Some(pt) => {
             // a `&str` parameter already holds the string (M11)
             if lw_is_borrowed_str(pt) {
-                return val;
+                return v_lw;
             }
             match pt {
                 Type::Ref(rin, _) => {
                     inner = box_type_unbox(rin);
                 }
                 _ => {
-                    return val;
+                    return v_lw;
                 }
             }
         }
         OptType::None => {
-            return val;
+            return v_lw;
         }
     }
     // (a runtime builtin p_* always takes the value)
     var at: i64 = HashMap_get(self.func_info_at, callee);
     if at == 0 && !str_starts_with(callee, "p_") {
-        return val;
+        return v_lw;
     }
     if at != 0 {
         var cparams: Vec<Type> = self.func_param_asts.get(at - 1);
         if i >= cparams.len() {
-            return val;
+            return v_lw;
         }
         match cparams.get(i) {
             Type::Ref(_, _) => {
-                return val;
+                return v_lw;
             }
             Type::RawPtr(_, _) => {
-                return val;
+                return v_lw;
             }
             _ => {
             }
@@ -16260,9 +16260,9 @@ fn Lowerer_lower_arg_for_param(self: & mut Lowerer, arg: Expr, callee: str, i: i
         }
     }
     if !is_handle {
-        return val;
+        return v_lw;
     }
-    return Lowerer_emit_inst(self, Inst::Load(val, Lowerer_lower_type(self, inner)));
+    return Lowerer_emit_inst(self, Inst::Load(v_lw, Lowerer_lower_type(self, inner)));
 }
 
 fn Lowerer_lower_call_expr(self: & mut Lowerer, callee: str, args: Vec<Expr>) -> i64 {
@@ -32814,7 +32814,7 @@ pub fn ir_units_split(module: & IrModule, unit_of: Vec<str>) -> IrLinkTable {
         slot_of.push(s);
         var fname: str = module.functions.get(i).name;
         if HashMap_get(owner, fname) != 0 {
-            errors.push("function '" + fname + "' is defined twice (units " + names.get(HashMap_get(owner, fname) - 1) + " and " + un + ")");
+            errors.push("function '" + fname + "' is defined twice (units " + names.get(HashMap_get(owner, fname) - 1) + " and " + un + ")\n    Fix: rename one of the two definitions, or keep it in one unit and `use` that unit from the other.");
         } else {
             HashMap_insert(owner, fname, s + 1);
         }

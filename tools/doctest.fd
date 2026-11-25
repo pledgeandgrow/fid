@@ -448,15 +448,25 @@ fn dt_code(c: i64) -> i64 {
 }
 
 /// Build `prog` natively and run it: "" when it passed, else the first
-/// line of what went wrong (run_native).
-fn dt_run_native(fid: str, prog: str) -> str {
+/// line of what went wrong (run_native). `route` gets how the binary was
+/// built — the build command ("emit"/"ccompile"), or
+/// "ccompile (emit: <why>)" when the C route did it after emit failed.
+fn dt_run_native(fid: str, prog: str, route: &mut str) -> str {
     var exe: str = str_slice(prog, 0, str_len(prog) - 3);
     if process_is_windows() { exe = exe + ".exe"; }
     val cmd: Vec<str> = dt_native_cmd(fid, prog, exe);
     var b: ChildResult = process_run_argv(cmd, Vec::new(), "", 300000);
     if b.timed_out { return "build timeout"; }
+    *route = cmd.get(1);
+    var alts: Vec<str> = Vec::new();
+    alts.push("error");
+    alts.push("panic");
+    alts.push("fail");
+    alts.push("not available");
+    alts.push("undefined");
     if (b.code != 0 || !fs_exists(exe)) && cmd.get(1) == "emit" {
         // the own backend lacks some runtime functions: the C route
+        var emit_why: str = dt_first_error(dt_msg_lines(b.errors, b.output), alts, true, "no binary");
         var cc: Vec<str> = Vec::new();
         cc.push(fid);
         cc.push("ccompile");
@@ -464,15 +474,12 @@ fn dt_run_native(fid: str, prog: str) -> str {
         cc.push("-o");
         cc.push(exe);
         val c: ChildResult = process_run_argv(cc, Vec::new(), "", 300000);
-        if !c.timed_out && c.code == 0 && fs_exists(exe) { b = c; }
+        if !c.timed_out && c.code == 0 && fs_exists(exe) {
+            b = c;
+            *route = "ccompile (emit: " + emit_why + ")";
+        }
     }
     if b.code != 0 || !fs_exists(exe) {
-        var alts: Vec<str> = Vec::new();
-        alts.push("error");
-        alts.push("panic");
-        alts.push("fail");
-        alts.push("not available");
-        alts.push("undefined");
         return "build: " + dt_first_error(dt_msg_lines(b.errors, b.output), alts, true, "no binary");
     }
     var run: Vec<str> = Vec::new();
@@ -582,6 +589,11 @@ fn main() -> i64 {
     var n_fail: i64 = 0;
     var n_skip: i64 = 0;
     var fails: Vec<str> = Vec::new();
+    // how each native example was built (ROUTES): the program's file and
+    // its route label; a C-route entry's label starts "ccompile (emit"
+    var route_prog: Vec<str> = Vec::new();
+    var route_name: Vec<str> = Vec::new();
+    var last_route: str = "";
     val tmp: str = dt_join(dt_temp_dir(), "fiddoctest" + int_to_str(p_getpid()) + "_" + int_to_str(p_clock_now_us()));
     fs_mkdir(tmp);
     var run_alts: Vec<str> = Vec::new();
@@ -614,13 +626,21 @@ fn main() -> i64 {
             val prog: str = dt_join(tmp, ex.module + "_" + int_to_str(k) + ".fd");
             fs_write_text(prog, dt_program(ex.module, ex.code));
             if ex.native {
-                val why: str = dt_run_native(fid, prog);
+                var route: str = "";
+                val why: str = dt_run_native(fid, prog, &mut route);
+                if str_len(route) > 0 {
+                    route_prog.push(dt_stem(prog) + ".fd");
+                    route_name.push(route);
+                    last_route = route;
+                }
                 n_run = n_run + 1;
                 if str_len(why) > 0 {
                     n_fail = n_fail + 1;
                     fails.push(tag + "  " + why);
                 } else if verbose {
-                    println("ok  " + path + " #" + int_to_str(k) + " (native)");
+                    var vr: str = last_route;
+                    if str_len(vr) == 0 { vr = "?"; }
+                    println("ok  " + path + " #" + int_to_str(k) + " (native, " + vr + ")");
                 }
                 k = k + 1;
                 continue;
@@ -646,6 +666,25 @@ fn main() -> i64 {
     while i < fails.len() {
         println("  FAIL " + fails.get(i));
         i = i + 1;
+    }
+    if route_prog.len() > 0 {
+        var by_c: Vec<i64> = Vec::new();
+        i = 0;
+        while i < route_name.len() {
+            if str_starts_with(route_name.get(i), "ccompile (emit") {
+                by_c.push(i);
+            }
+            i = i + 1;
+        }
+        println("native: " + int_to_str(route_prog.len() - by_c.len()) + " built by "
+            + dt_native_cmd(fid, "x.fd", "x").get(1) + ", " + int_to_str(by_c.len())
+            + " by the C route after emit failed");
+        i = 0;
+        while i < by_c.len() {
+            var ri: i64 = by_c.get(i);
+            println("  C ROUTE " + route_prog.get(ri) + "  " + route_name.get(ri));
+            i = i + 1;
+        }
     }
     if n_fail > 0 { return 1; }
     return 0;

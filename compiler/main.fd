@@ -309,6 +309,9 @@ pub fn main() -> i64 {
     if command == "explain" {
         return cmd_explain(n, start);
     }
+    if command == "explain-error" {
+        return cmd_explain_error(n, start);
+    }
     if command == "test-rules" {
         // fid test-rules [--smt <dir>]: the rules on values; with --smt, an
         // SMT-LIB proof obligation per rule and width as well
@@ -4389,11 +4392,31 @@ fn cmd_lint(n: i64, start: i64) -> i64 {
 // CP3: `fid explain <file.fd>` — for each function, the runtime checks the
 // mid-end proved needless (and which proof removed them) versus the checks
 // the backends still emit.
+/// TL2: `fid explain-error E044` (also `fid explain E044`): the code's
+/// entry of docs/reference/error-codes.md.
+fn cmd_explain_error(n: i64, start: i64) -> i64 {
+    if start + 2 > n {
+        p_eprint_str("Usage: fid explain-error <code>   (e.g. fid explain-error E044)\n");
+        return 1;
+    }
+    val text: str = explain_error_text(p_argv(start + 1));
+    if str_len(text) == 0 {
+        p_eprint_str("fid explain-error: '" + p_argv(start + 1) + "' is no error code fid gives (docs/reference/error-codes.md lists them)\n");
+        return 1;
+    }
+    print(text);
+    return 0;
+}
+
 fn cmd_explain(n: i64, start: i64) -> i64 {
     if start + 2 > n {
         p_eprint_str("Usage: fid explain <file.fd> [--alloc] [<name-substring>]\n");
         p_eprint_str("       fid explain <file.fd> --stages <function> [--target <triple>]\n");
+        p_eprint_str("       fid explain <code>   (an error code, as fid explain-error)\n");
         return 1;
+    }
+    if (str_starts_with(p_argv(start + 1), "E") || str_starts_with(p_argv(start + 1), "e")) && str_len(errcode_normalize(p_argv(start + 1))) > 0 {
+        return cmd_explain_error(n, start);
     }
     // DB7: one function through the native pipeline (cmd_build reads
     // --stages like --explain: the IR after each stage, then the machine
@@ -5612,7 +5635,7 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, _g_timeout: i64) -> i64 {
                     } else if tgt_os == "wasi" {
                         cc_cmd = cc + cc_flags + " -lm -lwasi-emulated-mman -lwasi-emulated-signal -lwasi-emulated-process-clocks -lwasi-emulated-getpid" + extra_libs;
                     } else {
-                        cc_cmd = cc + cc_flags + repro_win_flags(cc, has_flag(n, start, "--debug")) + " -lws2_32" + extra_libs;
+                        cc_cmd = cc + cc_flags + repro_win_flags(cc, has_flag(n, start, "--debug") || has_flag(n, start, "-g")) + " -lws2_32" + extra_libs;
                     }
                 }
             }
@@ -9763,7 +9786,7 @@ fn ccompile_lib(n: i64, start: i64, source: str, input: str, g_borrowck: str, _o
     var libs: str = " -lm";
     if os == "windows" {
         // CB6: a DLL without a time stamp (repro_win_flags)
-        libs = libs + " -lws2_32" + repro_win_flags(cc, has_flag(n, start, "--debug"));
+        libs = libs + " -lws2_32" + repro_win_flags(cc, has_flag(n, start, "--debug") || has_flag(n, start, "-g"));
     } else {
         libs = libs + " -lpthread";
     }
@@ -9850,6 +9873,7 @@ fn print_usage() {
     p_eprint_str("  fid verify   <file.fd>              Verify IR correctness\n");
     p_eprint_str("  fid explain  <file.fd>              Runtime checks the optimizer removed, and why\n");
     p_eprint_str("  fid explain  <file.fd> --stages <fn> [--target <t>]  One function: IR after each stage, machine code\n");
+    p_eprint_str("  fid explain-error <code>           An error code (E044): meaning, example, fix\n");
     p_eprint_str("  fid emit     <file.fd> --remarks     Optimization remarks (checks removed/kept, spills) on stderr\n");
     p_eprint_str("  fid check|emit|ccompile|dump-c <file.fd> --time  Per-stage timing table on stderr\n");
     p_eprint_str("  fid serve                            Long-lived checker: 'check <file.fd>' a line on stdin\n");
@@ -9898,6 +9922,13 @@ fn cmd_veil(n: i64, start: i64) -> i64 {
     var format: str = get_flag_value(n, start, "--format", "text");
     var output_dir: str = get_flag_value(n, start, "--output", "coverage");
     var message: str = veil_run(input, format, output_dir);
+    // a program that does not compile, an unreadable input or a report
+    // that could not be written: the message on stderr, exit 1 (as
+    // tools/veil.fd and the Rust veil)
+    if str_starts_with(message, "Cannot read ") || str_contains(message, "\nError: could not write ") || str_starts_with(message, "Compilation failed") {
+        p_eprint_str(message + "\n");
+        return 1;
+    }
     print(message);
     print("\n");
     return 0;
@@ -10169,9 +10200,10 @@ fn cmd_inspect(n: i64, start: i64) -> i64 {
 // Interactive IR debugger. Runs the interpreter with breakpoints.
 fn cmd_debug(n: i64, start: i64) -> i64 {
     if start + 2 > n {
-        p_eprint_str("Usage: fid debug <file.fd>\n");
-        p_eprint_str("  Interactive debugger with breakpoints, stepping, variable inspection.\n");
-        p_eprint_str("  Commands: break, step, continue, print, backtrace, list, ir, effects, quit\n");
+        p_eprint_str("Usage: fid debug <file.fd> [--echo]\n");
+        p_eprint_str("  Interactive debugger with breakpoints, stepping, variable inspection;\n");
+        p_eprint_str("  commands on standard input, one per line (--echo prints each one read).\n");
+        p_eprint_str("  Commands: break, run, step, next, finish, continue, print, info, backtrace, list, watch, ir, effects, quit\n");
         return 1;
     }
     var path: str = argv_at(start + 1);
@@ -10186,6 +10218,7 @@ fn cmd_debug(n: i64, start: i64) -> i64 {
         }
     }
     var dbg = Debugger_new(source, path);
+    dbg.echo = has_flag(n, start, "--echo");
     return Debugger_run(&mut dbg, source, path);
 }
 // --- cmd_native_debug ----------------------------------------------------

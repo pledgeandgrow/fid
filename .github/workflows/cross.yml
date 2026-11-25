@@ -1,0 +1,141 @@
+# Cross-platform CI for the C backend (release F5, F8, F9).
+#
+# Copied to .github/workflows/ Nov 24 (mold installs included, per this
+# note): the quick checks run from .github/workflows/ci.yml; this lane
+# takes hours on every push/PR to main.
+#
+#   macos     macOS on Apple silicon (macos-14) and Intel (macos-13): fid
+#             bootstraps itself with clang, then runs the suite through C
+#             natively and compares it with the interpreter.
+#   cross     Linux on AArch64 and RISC-V: every test is cross-compiled with
+#             zig cc (static musl) and run under qemu-user.
+#   native    our backend (nat_ir) on Linux x86-64, AArch64 and RISC-V, the
+#             whole suite with FID_VERIFY=1, and the C path on the same
+#             target; the two must agree test by test (scripts/suite-all.sh).
+#   wasm      WebAssembly (WASI preview 1): every test is compiled to .wasm
+#             with zig cc and run under Node's WASI.
+#
+# Locally the same runs are `scripts/cross-test.sh <target>` (see its header).
+
+name: Cross
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-macos
+          - os: macos-13
+            target: x86_64-macos
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    env:
+      CC: clang
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.16.0
+      - name: Build the Rust bootstrap compiler
+        run: cargo build --release
+      - name: Bootstrap fid (3 stages, fixpoint)
+        run: RELEASE=1 ./scripts/bootstrap.sh
+      - name: hello through C
+        run: |
+          ./release/fid ccompile tests/bootstrap/hello.fd -o hello
+          ./hello
+      - name: Suite through C, compared with the interpreter
+        env:
+          CC: zig cc
+        run: FID=release/fid JOBS=3 bash scripts/cross-test.sh ${{ matrix.target }}
+
+  cross:
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64-linux, riscv64-linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.16.0
+      - name: qemu-user and mold
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq qemu-user mold
+      - name: Build fid
+        run: |
+          cargo build --release
+          CC=gcc ./scripts/build-selfhost.sh
+          cp release/fid-dev release/fid
+      - name: Suite on ${{ matrix.target }} (zig cc, qemu-user)
+        env:
+          CC: zig cc
+        run: FID=release/fid JOBS=4 bash scripts/cross-test.sh ${{ matrix.target }}
+
+  native:
+    # Our own backend (compiler/nat_ir.fd) on the three Linux targets, the
+    # whole suite, with the IR verifier and the allocation checker on, and
+    # the C path on the same target compared test by test (RL2, RL22:
+    # scripts/suite-all.sh).
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-linux, aarch64-linux, riscv64-linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.16.0
+      - name: qemu-user and mold
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq qemu-user mold
+      - name: Build fid
+        run: |
+          cargo build --release
+          CC=gcc ./scripts/build-selfhost.sh
+          cp release/fid-dev release/fid
+      - name: Suite, our backend and the C path, on ${{ matrix.target }}
+        env:
+          CC: zig cc
+          FID: release/fid
+          FID_VERIFY: 1
+          JOBS: 4
+          AGREE: 1
+        run: bash scripts/suite-all.sh native:${{ matrix.target }} c:${{ matrix.target }}
+
+  wasm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.16.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: mold (the linker .cargo/config.toml asks for)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq mold
+      - name: Build fid
+        run: |
+          cargo build --release
+          CC=gcc ./scripts/build-selfhost.sh
+          cp release/fid-dev release/fid
+      - name: Suite on wasm32-wasi (zig cc, Node WASI)
+        env:
+          CC: zig cc
+        run: FID=release/fid JOBS=4 bash scripts/cross-test.sh wasm32-wasi

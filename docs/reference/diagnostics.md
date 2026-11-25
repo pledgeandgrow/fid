@@ -8,6 +8,12 @@ plain `error: ...` (E000). Its diagnostics module, compiler/diag.fd, is still
 not wired in (known-bugs 2g.22). Codes marked *fid* below are given only by
 `fid`.
 
+Each code `fid` gives has an entry in [error-codes.md](error-codes.md): its
+meaning, a program that gets it, the fix and the test that checks it;
+`fid explain-error E044` prints the entry. Every `fid` error also carries
+a `Fix:` (or `Hint:`) line and, rendered by `enrich_errors`, a
+`--> file:line:col` place with a caret (TL2).
+
 ## Lexer (E001–E019)
 
 | Code | Meaning | Fix |
@@ -48,12 +54,12 @@ not wired in (known-bugs 2g.22). Codes marked *fid* below are given only by
 | E055 | GPU region violation | GPU-region values can't leave the region or go to CPU memory |
 | E056 | KV-cache region violation | KV-cache values stay inside the `region kv_cache` block |
 | E057 | Misplaced annotation | `@annotation` only valid on the documented target (fn/struct/field) |
-| E058 | Reference escape | References are second-class — don't store or return them |
-| E059 | Secrecy violation | `@secret`/`@sensitive` data cannot reach an output sink |
+| E058 | Reference escape (`fid`: "Reference error", compiler/escape.fd) | References are second-class — don't store or return them |
+| E059 | Secrecy violation (`fid`: "Security error (@secret)" / "(@sensitive)", compiler/secrecy.fd) | `@secret`/`@sensitive` data cannot reach an output sink |
 | E060 | Duplicate definition (*fid*) | Rename one, or import only one module that defines it |
 | E061 | Taint violation (*fid*) | Pass the `@tainted` value through a sanitizer before a sink or a return |
 | E062 | Non-exhaustive match (*fid*) | Add the missing variants or a `_` arm |
-| E078 | Other check (*fid*) | An error of one of the other checks: `Event error`, `Redundancy error`, `Contract error`, `Thread safety error`, `Partition error`, `Transaction error`, `Serverless error`, `Differential privacy error`, `Comptime error`, `Shard error`, `Quantization error`, `Linear type error`, `Checkpoint error`, `Budget error`, `Visibility error`, `Privacy error`, `Unknown annotation`, `Misplaced annotation`, `Differentiability error`, `DP error`, `Adapter error`, `Hermetic error`, `Allocator error`, `KV cache region error`, `Injection error`; the message carries the details and the fix (CE4) |
+| E078 | Other check (*fid*) | An error of one of the other checks: `Event error`, `Redundancy error`, `Contract error`, `Thread safety error`, `Partition error`, `Transaction error`, `Serverless error`, `Differential privacy error`, `Comptime error`, `Shard error`, `Quantization error`, `Linear type error`, `Checkpoint error`, `Budget error`, `Visibility error`, `Privacy error`, `Unknown annotation`, `Misplaced annotation`, `Differentiability error`, `DP error`, `Adapter error`, `Hermetic error`, `Allocator error`, `KV cache region error`, `Injection error`, and inline assembly naming no 64-bit register (`asm! in f: ...`); the message carries the details and the fix (CE4) |
 | E079 | Other type error (*fid*) | The message carries the details |
 
 ## Borrow checker (E080–E089)
@@ -92,5 +98,5 @@ not wired in (known-bugs 2g.22). Codes marked *fid* below are given only by
 | Code | Meaning | Fix |
 |---|---|---|
 | E120 | No `main` function | Add `fn main()` |
-| E999 | Internal compiler error | Report a bug |
+| E999 | Internal compiler error (`fid`: the IR verifier, the C split's units) | Report a bug (`fid reduce` shrinks the program) |
 | E000 | Uncategorized | Message carries the details |

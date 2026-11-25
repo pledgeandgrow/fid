@@ -136,6 +136,13 @@ pub enum ErrCode {
     OtherCheck,
     // CA6: a task never awaited, joined or detached ("Concurrency error")
     UnjoinedTask,
+    // TL2: escape.fd's "Reference error" (E058) and secrecy.fd's
+    // "Security error (@secret|@sensitive)" (E059)
+    ReferenceEscape,
+    SecrecyViolation,
+    // TL2: a check of the compiler's own output failed (ir.fd's verifier,
+    // the C split's units): E999
+    InternalError,
 }
 
 pub fn errcode_to_str(code: ErrCode) -> str {
@@ -241,6 +248,15 @@ pub fn errcode_to_str(code: ErrCode) -> str {
         }
         ErrCode::UnjoinedTask => {
             return "UnjoinedTask";
+        }
+        ErrCode::ReferenceEscape => {
+            return "ReferenceEscape";
+        }
+        ErrCode::SecrecyViolation => {
+            return "SecrecyViolation";
+        }
+        ErrCode::InternalError => {
+            return "InternalError";
         }
     }
     return "Custom";
@@ -351,6 +367,15 @@ pub fn errcode_number(c: ErrCode) -> str {
         }
         ErrCode::UnjoinedTask => {
             return "E084";
+        }
+        ErrCode::ReferenceEscape => {
+            return "E058";
+        }
+        ErrCode::SecrecyViolation => {
+            return "E059";
+        }
+        ErrCode::InternalError => {
+            return "E999";
         }
     }
     return "E000";
@@ -1383,6 +1408,19 @@ fn enrich_note_locations(err: str, file: str) -> str {
     return out + rest;
 }
 
+/// TL2: enrich_errors with the program's path ("<stdin>" when it has none).
+fn enrich_errors_at(errors: Vec<str>, source: str, source_path: OptStr) -> Vec<str> {
+    var file: str = "<stdin>";
+    match source_path {
+        OptStr::Some(p) => {
+            file = p;
+        }
+        OptStr::None => {
+        }
+    }
+    return enrich_errors(errors, source, file);
+}
+
 pub fn enrich_errors(errors: Vec<str>, source: str, file: str) -> Vec<str> {
     var source_lines: Vec<str> = c_str_lines(source);
     var result: Vec<str> = Vec::new();
@@ -1418,6 +1456,19 @@ pub fn enrich_errors(errors: Vec<str>, source: str, file: str) -> Vec<str> {
         var lc: I64Pair = extract_line_col(err);
         var line: i64 = lc.first;
         var col: i64 = lc.second;
+        // TL2: a "(line N)" names no column; an error with no line at all
+        // (one about a whole struct, impl, trait or function) gets the line
+        // of that declaration, found in the source
+        var line_only: bool = line > 0 && err_line_tag(err) == line;
+        var span_len: i64 = 0;
+        if line == 0 {
+            var dl: I64Pair = enrich_decl_line(err, source_lines);
+            if dl.first > 0 {
+                line = dl.first;
+                col = dl.second;
+                span_len = enrich_name_len(source_lines.get(line - 1), col);
+            }
+        }
 
         if line == 0 || line > source_lines.len() {
             result.push(code_head + err);
@@ -1426,7 +1477,16 @@ pub fn enrich_errors(errors: Vec<str>, source: str, file: str) -> Vec<str> {
         }
 
         var source_line: str = source_lines.get(line - 1);
-        var span_len: i64 = estimate_span(err, source_line, col);
+        if line_only {
+            // the caret goes under the first name the message quotes that
+            // the line holds, else under the whole statement
+            var cc: I64Pair = enrich_caret(err, source_line);
+            col = cc.first;
+            span_len = cc.second;
+        }
+        if span_len <= 0 {
+            span_len = estimate_span(err, source_line, col);
+        }
 
         // Build a simple enriched error message with source context
         var rendered: str = render_error_with_source(err, file, line, col, source_line, span_len);
@@ -1577,6 +1637,354 @@ pub fn did_you_mean_suffix(err: str, source: str) -> str {
     return "\n    Fix: did you mean '" + best + "'?";
 }
 
+// --- TL2: a place and a caret for every error -----------------------------
+
+/// The N of an error's "(line N" tag, or 0 when it has none.
+fn err_line_tag(err: str) -> i64 {
+    var at: i64 = str_find(err, "(line ");
+    if at < 0 {
+        return 0;
+    }
+    var k: i64 = at + 6;
+    var v: i64 = 0;
+    while k < str_len(err) && char_is_digit(str_byte_at(err, k)) {
+        v = v * 10 + (str_byte_at(err, k) - 48);
+        k = k + 1;
+    }
+    return v;
+}
+
+/// The first line of an error (its message, without the explanation and
+/// Fix lines under it).
+fn err_first_line(err: str) -> str {
+    var nl: i64 = str_find(err, "\n");
+    if nl < 0 {
+        return err;
+    }
+    return str_slice(err, 0, nl);
+}
+
+/// Is `s` a name, or names joined by `.` (`Vec2.rmul`)?
+fn enrich_is_name(s: str) -> bool {
+    if str_len(s) == 0 {
+        return false;
+    }
+    var k: i64 = 0;
+    while k < str_len(s) {
+        var c: i64 = str_byte_at(s, k);
+        if !(dym_ident_byte(c) || c == 46) {
+            return false;
+        }
+        k = k + 1;
+    }
+    return !char_is_digit(str_byte_at(s, 0));
+}
+
+/// The names an error's first line quotes ('x' or `x`), in order; a dotted
+/// one (`S.m`) also gives its last part.
+fn enrich_quoted_names(first: str) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var n: i64 = str_len(first);
+    var k: i64 = 0;
+    while k < n {
+        var q: i64 = str_byte_at(first, k);
+        if q == 39 || q == 96 {
+            var e: i64 = k + 1;
+            while e < n && str_byte_at(first, e) != q {
+                e = e + 1;
+            }
+            if e >= n {
+                return out;
+            }
+            var w: str = str_slice(first, k + 1, e);
+            if enrich_is_name(w) {
+                out.push(w);
+                var dot: i64 = str_len(w) - 1;
+                while dot > 0 && str_byte_at(w, dot) != 46 {
+                    dot = dot - 1;
+                }
+                if dot > 0 {
+                    out.push(str_slice(w, dot + 1, str_len(w)));
+                }
+                k = e + 1;
+            } else {
+                // an apostrophe ("the trait's"): the next quote may open a name
+                k = k + 1;
+            }
+        } else {
+            k = k + 1;
+        }
+    }
+    return out;
+}
+
+/// The 0-based column of `w` as a whole word in `line`, or -1.
+fn enrich_find_word(line: str, w: str) -> i64 {
+    var wl: i64 = str_len(w);
+    var n: i64 = str_len(line);
+    if wl == 0 {
+        return -1;
+    }
+    var from: i64 = 0;
+    while from + wl <= n {
+        var rest: str = str_slice(line, from, n);
+        var at: i64 = str_find(rest, w);
+        if at < 0 {
+            return -1;
+        }
+        var c0: i64 = from + at;
+        var ok_l: bool = c0 == 0 || !dym_ident_byte(str_byte_at(line, c0 - 1));
+        var ok_r: bool = c0 + wl >= n || !dym_ident_byte(str_byte_at(line, c0 + wl));
+        if ok_l && ok_r {
+            return c0;
+        }
+        from = c0 + 1;
+    }
+    return -1;
+}
+
+/// The caret of an error that names its line but no column: (column,
+/// length) of the first name the message quotes that `line` holds, else of
+/// the whole statement (its first non-blank byte to its end).
+fn enrich_caret(err: str, line: str) -> I64Pair {
+    var first: str = err_first_line(err);
+    var names: Vec<str> = enrich_quoted_names(first);
+    // "in 'f'" names the function the line is in, not what is wrong on it
+    var ctx: str = enrich_after_marker(first, "in '");
+    var pass: i64 = 0;
+    while pass < 2 {
+        var i: i64 = 0;
+        while i < names.len() {
+            if pass == 1 || names.get(i) != ctx {
+                var c: i64 = enrich_find_word(line, names.get(i));
+                if c >= 0 {
+                    return cc_I64Pair_new(c + 1, str_len(names.get(i)));
+                }
+            }
+            i = i + 1;
+        }
+        pass = pass + 1;
+    }
+    var k: i64 = 0;
+    while k < str_len(line) && (str_byte_at(line, k) == 32 || str_byte_at(line, k) == 9) {
+        k = k + 1;
+    }
+    var e: i64 = str_len(line);
+    while e > k && (str_byte_at(line, e - 1) == 32 || str_byte_at(line, e - 1) == 9 || str_byte_at(line, e - 1) == 13) {
+        e = e - 1;
+    }
+    if e <= k {
+        return cc_I64Pair_new(1, 1);
+    }
+    return cc_I64Pair_new(k + 1, e - k);
+}
+
+/// The length of the name at 1-based column `col` of `line` (at least 1).
+fn enrich_name_len(line: str, col: i64) -> i64 {
+    var k: i64 = col - 1;
+    var e: i64 = k;
+    while e < str_len(line) && dym_ident_byte(str_byte_at(line, e)) {
+        e = e + 1;
+    }
+    if e > k {
+        return e - k;
+    }
+    return 1;
+}
+
+/// The line (1-based) and column of the declaration `<kw> <name>` from line
+/// index `from` on (`pub` may come first; `//` lines are skipped), the
+/// column being the name's; (0, 0) when there is none.
+fn enrich_find_decl(lines: Vec<str>, kw: str, name: str, from: i64) -> I64Pair {
+    var head: str = kw + " " + name;
+    var i: i64 = from;
+    while i < lines.len() {
+        var l: str = lines.get(i);
+        var t: str = str_trim(l);
+        if str_starts_with(t, "pub ") {
+            t = str_trim(str_slice(t, 4, str_len(t)));
+        }
+        if str_starts_with(t, head) && !str_starts_with(t, "//") {
+            var after: i64 = str_len(head);
+            if after >= str_len(t) || !dym_ident_byte(str_byte_at(t, after)) {
+                var c: i64 = enrich_find_word(l, name);
+                if c < 0 {
+                    c = 0;
+                }
+                return cc_I64Pair_new(i + 1, c + 1);
+            }
+        }
+        i = i + 1;
+    }
+    return cc_I64Pair_new(0, 0);
+}
+
+/// The quoted name after `marker` in `s` ("function '" -> f), or "".
+fn enrich_after_marker(s: str, marker: str) -> str {
+    var at: i64 = str_find(s, marker);
+    if at < 0 {
+        return "";
+    }
+    var rest: str = str_slice(s, at + str_len(marker), str_len(s));
+    var q: i64 = str_find(rest, "'");
+    if q <= 0 {
+        return "";
+    }
+    var w: str = str_slice(rest, 0, q);
+    if !enrich_is_name(w) {
+        return "";
+    }
+    return w;
+}
+
+/// The last part of a dotted name (`Timer.elapsed` -> elapsed).
+fn enrich_last_part(w: str) -> str {
+    var dot: i64 = str_len(w) - 1;
+    while dot > 0 && str_byte_at(w, dot) != 46 {
+        dot = dot - 1;
+    }
+    if dot > 0 {
+        return str_slice(w, dot + 1, str_len(w));
+    }
+    return w;
+}
+
+/// The declaration of a function, struct, enum or trait named `w`.
+fn enrich_any_decl(lines: Vec<str>, w: str) -> I64Pair {
+    var kws: Vec<str> = Vec::new();
+    kws.push("fn");
+    kws.push("struct");
+    kws.push("enum");
+    kws.push("cap");
+    kws.push("trait");
+    var k: i64 = 0;
+    while k < kws.len() {
+        var d: I64Pair = enrich_find_decl(lines, kws.get(k), enrich_last_part(w), 0);
+        if d.first > 0 {
+            return d;
+        }
+        k = k + 1;
+    }
+    return cc_I64Pair_new(0, 0);
+}
+
+/// TL2: the place of an error that names no line: "at line N", the
+/// `impl A for B` it is about (the method's `fn` in it when the message
+/// names one), or the declaration of the function, struct, enum, trait or
+/// global it names; (0, 0) when the source has none of them (an error about
+/// an imported module or a generated function).
+fn enrich_decl_line(err: str, lines: Vec<str>) -> I64Pair {
+    var first: str = err_first_line(err);
+    // "non-exhaustive match at line 12 in 'f'"
+    var al: i64 = str_find(first, "at line ");
+    if al >= 0 {
+        var k: i64 = al + 8;
+        var v: i64 = 0;
+        while k < str_len(first) && char_is_digit(str_byte_at(first, k)) {
+            v = v * 10 + (str_byte_at(first, k) - 48);
+            k = k + 1;
+        }
+        if v > 0 && v <= lines.len() {
+            return cc_I64Pair_new(v, enrich_caret(err, lines.get(v - 1)).first);
+        }
+    }
+    var method: str = enrich_last_part(enrich_after_marker(first, "method '"));
+    // "impl Show for Pt ...": the impl block, then the method in it
+    var ia: i64 = str_find(first, "impl ");
+    if ia >= 0 {
+        var rest: str = str_slice(first, ia + 5, str_len(first));
+        var fa: i64 = str_find(rest, " for ");
+        if fa > 0 {
+            var tr: str = str_slice(rest, 0, fa);
+            var ty_rest: str = str_slice(rest, fa + 5, str_len(rest));
+            var te: i64 = 0;
+            while te < str_len(ty_rest) && dym_ident_byte(str_byte_at(ty_rest, te)) {
+                te = te + 1;
+            }
+            var tyn: str = str_slice(ty_rest, 0, te);
+            if enrich_is_name(tr) && str_len(tyn) > 0 {
+                var d: I64Pair = enrich_find_decl(lines, "impl " + tr + " for", tyn, 0);
+                if d.first > 0 {
+                    if str_len(method) > 0 {
+                        // the method's `fn` inside this impl block (up to
+                        // its `}` at the start of a line)
+                        var close: i64 = d.first;
+                        while close < lines.len() && !str_starts_with(lines.get(close), "}") {
+                            close = close + 1;
+                        }
+                        var m: I64Pair = enrich_find_decl(lines, "fn", method, d.first);
+                        if m.first > 0 && m.first - 1 <= close {
+                            return m;
+                        }
+                    }
+                    return d;
+                }
+            }
+        }
+    }
+    var fname: str = enrich_after_marker(first, "function '");
+    if str_len(fname) == 0 {
+        fname = method;
+    }
+    if str_len(fname) == 0 {
+        fname = enrich_after_marker(first, "(in '");
+    }
+    if str_len(fname) > 0 {
+        var fd: I64Pair = enrich_find_decl(lines, "fn", enrich_last_part(fname), 0);
+        if fd.first > 0 {
+            return fd;
+        }
+    }
+    var sname: str = enrich_after_marker(first, "struct '");
+    if str_len(sname) > 0 {
+        var sd: I64Pair = enrich_find_decl(lines, "struct", sname, 0);
+        if sd.first > 0 {
+            return sd;
+        }
+    }
+    var ename: str = enrich_after_marker(first, "enum '");
+    if str_len(ename) > 0 {
+        var ed: I64Pair = enrich_find_decl(lines, "enum", ename, 0);
+        if ed.first > 0 {
+            return ed;
+        }
+    }
+    var tname: str = enrich_after_marker(first, "trait '");
+    if str_len(tname) > 0 {
+        var td: I64Pair = enrich_find_decl(lines, "cap", tname, 0);
+        if td.first == 0 {
+            td = enrich_find_decl(lines, "trait", tname, 0);
+        }
+        if td.first > 0 {
+            return td;
+        }
+    }
+    var gname: str = enrich_after_marker(first, "global '");
+    if str_len(gname) > 0 {
+        var gd: I64Pair = enrich_find_decl(lines, "var", gname, 0);
+        if gd.first == 0 {
+            gd = enrich_find_decl(lines, "val", gname, 0);
+        }
+        if gd.first == 0 {
+            gd = enrich_find_decl(lines, "const", gname, 0);
+        }
+        if gd.first > 0 {
+            return gd;
+        }
+    }
+    // any other name it quotes that the program declares
+    var names: Vec<str> = enrich_quoted_names(first);
+    var ni: i64 = 0;
+    while ni < names.len() {
+        var nd: I64Pair = enrich_any_decl(lines, names.get(ni));
+        if nd.first > 0 {
+            return nd;
+        }
+        ni = ni + 1;
+    }
+    return cc_I64Pair_new(0, 0);
+}
+
 /// Render an error with source context (simplified version of diag::error_with_source).
 fn render_error_with_source(msg: str, file: str, line: i64, col: i64, source_line: str, span_len: i64) -> str {
     var result: str = "";
@@ -1684,8 +2092,14 @@ pub fn classify_error(err: str) -> ErrCode {
     if str_starts_with(normalized, "Type error: undefined function") {
         return ErrCode::UndefinedFunction;
     }
-    if str_starts_with(normalized, "Type error: undefined struct") {
+    // TL2: fid says "unknown struct" for a struct literal of no struct
+    if str_starts_with(normalized, "Type error: undefined struct") || str_starts_with(normalized, "Type error: unknown struct") {
         return ErrCode::UndefinedStruct;
+    }
+    // TL2: fid's missing return ("... can reach the end of its body
+    // without returning"); before the argument-count rule below
+    if str_contains(normalized, "can reach the end of its body without returning") {
+        return ErrCode::MissingReturn;
     }
     if str_starts_with(normalized, "Type error: struct") && str_contains(normalized, "has no field") {
         return ErrCode::UndefinedField;
@@ -1749,7 +2163,7 @@ pub fn classify_error(err: str) -> ErrCode {
     if str_starts_with(normalized, "Panic:") {
         return ErrCode::NoMain;
     }
-    if str_starts_with(normalized, "Duplicate definition") || str_contains(normalized, "conflicting implementations") {
+    if str_starts_with(normalized, "Duplicate definition") || str_contains(normalized, "conflicting implementations") || str_starts_with(normalized, "Ambiguous name:") {
         return ErrCode::DuplicateDefinition;
     }
     if str_starts_with(normalized, "Taint error") {
@@ -1773,6 +2187,14 @@ pub fn classify_error(err: str) -> ErrCode {
     if str_starts_with(normalized, "Realtime error") || str_starts_with(normalized, "Real-time error") {
         return ErrCode::RealtimeViolation;
     }
+    // TL2: references kept past their value (escape.fd) and secret or
+    // sensitive data reaching output (secrecy.fd)
+    if str_starts_with(normalized, "Reference error") {
+        return ErrCode::ReferenceEscape;
+    }
+    if str_starts_with(normalized, "Security error (@secret)") || str_starts_with(normalized, "Security error (@sensitive)") {
+        return ErrCode::SecrecyViolation;
+    }
     if str_starts_with(normalized, "Safety error") || str_starts_with(normalized, "Determinism error") {
         return ErrCode::SafetyViolation;
     }
@@ -1783,7 +2205,151 @@ pub fn classify_error(err: str) -> ErrCode {
     if str_starts_with(normalized, "Type error") {
         return ErrCode::OtherTypeError;
     }
+    // TL2: inline assembly naming no 64-bit register (pe_ir.fd)
+    if str_starts_with(normalized, "asm! in ") {
+        return ErrCode::OtherCheck;
+    }
+    // TL2: the IR verifier (ir.fd) and the C split (lower.fd): the
+    // compiler's own output is malformed
+    if str_starts_with(normalized, "function '") && (str_contains(normalized, "' has no blocks") || str_contains(normalized, "': block ") || str_contains(normalized, "' is defined twice (units ")) {
+        return ErrCode::InternalError;
+    }
     return ErrCode::Custom;
+}
+
+// --- TL2: `fid explain-error Exxx` ------------------------------------------
+
+/// "e44", "44" or "E044" -> "E044"; "" when it is no code.
+pub fn errcode_normalize(arg: str) -> str {
+    var a: str = str_trim(arg);
+    if str_starts_with(a, "E") || str_starts_with(a, "e") {
+        a = str_slice(a, 1, str_len(a));
+    }
+    if str_len(a) == 0 || str_len(a) > 3 {
+        return "";
+    }
+    var k: i64 = 0;
+    while k < str_len(a) {
+        if !char_is_digit(str_byte_at(a, k)) {
+            return "";
+        }
+        k = k + 1;
+    }
+    while str_len(a) < 3 {
+        a = "0" + a;
+    }
+    return "E" + a;
+}
+
+/// The class name of an error code `fid` gives ("E044" -> "TypeMismatch"),
+/// or "" when it gives none with that number.
+fn errcode_class_of(code: str) -> str {
+    var all: Vec<ErrCode> = Vec::new();
+    all.push(ErrCode::UndefinedVariable);
+    all.push(ErrCode::UndefinedFunction);
+    all.push(ErrCode::UndefinedStruct);
+    all.push(ErrCode::UndefinedField);
+    all.push(ErrCode::TypeMismatch);
+    all.push(ErrCode::IfConditionNotBool);
+    all.push(ErrCode::ArgCountMismatch);
+    all.push(ErrCode::MissingReturn);
+    all.push(ErrCode::InitBeforeAssign);
+    all.push(ErrCode::NotLinear);
+    all.push(ErrCode::CapabilityDenied);
+    all.push(ErrCode::SandboxViolation);
+    all.push(ErrCode::ConservationViolation);
+    all.push(ErrCode::GasExceeded);
+    all.push(ErrCode::EffectMismatch);
+    all.push(ErrCode::ExpectedToken);
+    all.push(ErrCode::UnexpectedChar);
+    all.push(ErrCode::BorrowConflict);
+    all.push(ErrCode::NoMain);
+    all.push(ErrCode::Custom);
+    all.push(ErrCode::UnterminatedString);
+    all.push(ErrCode::UnterminatedFString);
+    all.push(ErrCode::UnknownEscape);
+    all.push(ErrCode::DuplicateDefinition);
+    all.push(ErrCode::TaintViolation);
+    all.push(ErrCode::NonExhaustiveMatch);
+    all.push(ErrCode::OtherTypeError);
+    all.push(ErrCode::DataRace);
+    all.push(ErrCode::Deadlock);
+    all.push(ErrCode::SafetyViolation);
+    all.push(ErrCode::ConstantTimeViolation);
+    all.push(ErrCode::RealtimeViolation);
+    all.push(ErrCode::OtherCheck);
+    all.push(ErrCode::UnjoinedTask);
+    all.push(ErrCode::ReferenceEscape);
+    all.push(ErrCode::SecrecyViolation);
+    all.push(ErrCode::InternalError);
+    var i: i64 = 0;
+    while i < all.len() {
+        if errcode_number(all.get(i)) == code {
+            return errcode_to_str(all.get(i));
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+/// docs/reference/error-codes.md where it can be found: beside the
+/// standard library (a checkout or FID_HOME), or in the working directory;
+/// "" when it is not there (an install without the docs).
+fn error_codes_doc_path() -> str {
+    var cands: Vec<str> = Vec::new();
+    cands.push(c_path_join(c_path_dirname(stdlib_dir()), "docs/reference/error-codes.md"));
+    var home: str = env_or_empty("FID_HOME");
+    if str_len(home) > 0 {
+        cands.push(c_path_join(home, "docs/reference/error-codes.md"));
+    }
+    cands.push("docs/reference/error-codes.md");
+    cands.push(c_path_join(exe_dir(), "docs/reference/error-codes.md"));
+    var i: i64 = 0;
+    while i < cands.len() {
+        if c_file_exists(cands.get(i)) {
+            return cands.get(i);
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+/// The text `fid explain-error <code>` prints: the code's section of
+/// docs/reference/error-codes.md ("## E044 — ..." up to the next "## "),
+/// else its class and where the entry is; "" when `fid` gives no such code.
+pub fn explain_error_text(arg: str) -> str {
+    val code: str = errcode_normalize(arg);
+    if str_len(code) == 0 {
+        return "";
+    }
+    val cls: str = errcode_class_of(code);
+    var path: str = error_codes_doc_path();
+    if str_len(path) > 0 {
+        var lines: Vec<str> = c_str_lines(c_file_read(path));
+        var out: str = "";
+        var inside: bool = false;
+        var i: i64 = 0;
+        while i < lines.len() {
+            var l: str = lines.get(i);
+            if str_starts_with(l, "## ") {
+                if inside {
+                    break;
+                }
+                inside = str_starts_with(l, "## " + code + " ");
+            }
+            if inside {
+                out = out + l + "\n";
+            }
+            i = i + 1;
+        }
+        if str_len(out) > 0 {
+            return out;
+        }
+    }
+    if str_len(cls) == 0 {
+        return "";
+    }
+    return code + " (" + cls + "): docs/reference/error-codes.md has its meaning, an example and the fix.\n";
 }
 
 // ===========================================================================
@@ -5228,7 +5794,7 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                     }
                     var vr_errors: Vec<str> = cc_qualify_shadowed_values(&mut imported_modules, imported_module_names, &mut user, vr_user_module, stdlib);
                     if vr_errors.len() > 0 {
-                        return ResultProgram::Err(vr_errors);
+                        return ResultProgram::Err(enrich_errors_at(vr_errors, source, source_path));
                     }
                     t_t = time_mark("merge: shadowed imports", t_t);
 
@@ -5249,7 +5815,7 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                     }
                     cc_inherit_supertraits(&mut user, trait_defs, &mut super_errors);
                     if super_errors.len() > 0 {
-                        return ResultProgram::Err(super_errors);
+                        return ResultProgram::Err(enrich_errors_at(super_errors, source, source_path));
                     }
                     t_t = time_mark("merge: supertraits", t_t);
 
@@ -5273,7 +5839,7 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                     cc_find_module_conflicts(stdlib, imported_modules, imported_module_names, user, dup_user_module, &mut dup_errors);
                     cc_find_trait_impl_conflicts(imported_modules, imported_module_names, user, &mut dup_errors);
                     if dup_errors.len() > 0 {
-                        return ResultProgram::Err(dup_errors);
+                        return ResultProgram::Err(enrich_errors_at(dup_errors, source, source_path));
                     }
                     t_t = time_mark("merge: duplicate checks", t_t);
 

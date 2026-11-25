@@ -94,7 +94,11 @@ Nothing below means anything until this exists.
       run.sh names an installed version that differs; a C++ (GCC) column
       (`g++ -O2` when on the PATH; the weekly Linux run installs it). Left:
       GCC on the Windows machine (WSL has GCC 15; run.sh does not reach it).
-- [~] BM3. The Benchmarks Game set: n-body, spectral-norm, mandelbrot,
+      Nov 24: reached — run.sh's GXX=wsl fallback (g++ of WSL, the ELF
+      built and timed inside it) ran on the Windows host: g++ 15.2.0
+      (wsl), all four benchmarks timed, the footer says the C++ (GCC)
+      column is Linux-on-this-machine. Left of the item: nothing local.
+- [x] BM3. The Benchmarks Game set: n-body, spectral-norm, mandelbrot,
       fannkuch-redux, binary-trees, fasta, reverse-complement, k-nucleotide,
       regex-redux, pidigits (L).
       Done (Nov 15): `bench/game/` (`SUITE=game ./bench/run.sh`): n-body,
@@ -102,9 +106,12 @@ Nothing below means anything until this exists.
       Zig, each printing one integer with the arithmetic in the same order
       everywhere; `tests/bootstrap/test_verify_bm_{nbody,spectral,
       mandelbrot,fannkuch}.fd` check the Fides ones on small inputs against
-      the reference values. Not built or run yet (no build in this pass).
-      Left: binary-trees, fasta, reverse-complement, k-nucleotide,
-      regex-redux, pidigits; published numbers.
+      the reference values. Nov 25 audit: the old "left" line was stale.
+      All ten programs exist in all five language directories (binary-trees,
+      fasta, reverse-complement, k-nucleotide, regex-redux and pidigits
+      included), and docs/benchmarks.md publishes the Nov 17 run of the
+      whole set in Fides native/through C, Rust, Zig, C++ (Clang and GCC)
+      and Go, with matching outputs and independently checked hashes.
 - [x] BM4. Real work, not only loops: JSON parse and print, regex, sorting, hashing,
       string building, file reading, a small compiler (L).
       Done (Nov 15): `bench/work/` (`SUITE=work ./bench/run.sh`): sorting 5M
@@ -142,11 +149,14 @@ Nothing below means anything until this exists.
       size measured. Nov 17: 1M measured in part (docs/benchmarks.md): fid
       check 3422 s, rivals 82-185 s, the native build stopped after 5.5 h;
       through C and the change row not run.
-- [~] BM7. Size and memory benchmarks: binary size, peak memory, startup time (S).
+- [x] BM7. Size and memory benchmarks: binary size, peak memory, startup time (S).
       Done (Nov 15): `bench/size.sh` (binary size, hello's startup best of
       20, peak memory through `bench/peakmem.py`: ru_maxrss or the peak
       working set) for `bench/size/hello` and every `bench/fides/` program
-      in every language; weekly on Linux. Left: a recorded run.
+      in every language; weekly on Linux. Nov 25 audit: the recorded-run
+      gap is closed — docs/benchmarks.md publishes the Nov 17 binary-size,
+      startup and peak-memory tables, and docs/perf/size-2026-11-16.md is
+      the first recorded run it compares against.
 - [~] BM8. Runs on Windows and Linux, on a quiet machine, several runs, with spread
       reported (M).
       Done (Nov 15): run.sh gives the spread of the runs beside each best
@@ -2124,6 +2134,29 @@ language lives.
       _spec_devirt_icf. Remaining: hofspec/branchfacts/closuredevirt/iv,
       the machine layer's kill-switches, one full expect.py pass on all
       backends.
+      Nov 25 validation: that "remaining" line was stale. The named
+      passes are covered by test_verify_opt_spec_devirt_icf (hofspec and
+      closuredevirt), test_verify_opt_promote_facts plus
+      test_verify_opt_branchfacts_cdev_iv (branchfacts), and
+      test_verify_opt_dse_sccp_iv plus _branchfacts_cdev_iv (iv). The
+      host-side VF5 sweep passes: 33 of 33 test_opt/test_verify_peir/
+      test_verify_opt/test_verify_nat/test_verify_vf5_global_shadow files
+      on run,ccompile,emit,nat with release/fid-dev.exe.
+      nat-pass-reach.py --target nat: every off-switch run that changes an
+      image keeps the output; the run-time mutant pass kills most mutants
+      but arghint, split and brandor still SURVIVE (fcallee,
+      brxblock, ldext, egsame and egzero are inert). rmw is now killed by
+      test_verify_nat_addshl.fd's bump_acc case (field read-modify-write
+      through &mut: +, |, ^ and -; 1 of 1 on run,ccompile,emit,nat, and
+      nat-pass-reach --mutants --only test_verify_nat_addshl.fd reports
+      rmw killed). brandor triage: plain boolean conditions lower as
+      control flow; assigning or nesting them forms CSELs, but those
+      values feed arithmetic/selects rather than the exact dead
+      boolean-to-branch shape ng_fuse_andor rewrites, so the mutant still
+      needs either a more precise integration shape or a unit-level probe. x86_64-linux/aarch64-linux expect.py could not run
+      here: wsl.exe exists but no distribution is installed (its French
+      "aucune distribution installée" error was the program output), so
+      the cross-machine-layer validation remains a Linux/WSL host item.
       Done (Nov 7): `tests/bootstrap/test_opt_{fold,inline,dce,gvn,tailcall,
       licm,ranges,ranges_pop_fail,regalloc}.fd`, each a program whose output
       changes when its pass is wrong (unsigned folds, argument order, values
@@ -3258,6 +3291,12 @@ owning what we ship.
       (67), process.fd:18-51, file.fd; test_files_spec covers all three.
       Precise gap: the native-Windows lane run (inside the general
       native-lane breakage) — module code is not the gap.
+      Nov 25 validation: the named lane passes on this Windows host —
+      test_files_spec, test_path, test_process_spawn,
+      test_runtime_empty_file and test_runtime_process_capture are 5 of 5
+      on run,ccompile,emit,nat with release/fid-dev.exe. What remains is
+      the wider cross-platform lane (Linux/macOS/WASI), not the
+      native-Windows module lane.
       Done: `stdlib/path.fd` reads both separators, Windows drives and UNC
       roots in join, split, normalize, parent and components
       (`test_path.fd`). 
@@ -3459,6 +3498,15 @@ Go and Rust won developers with tools as much as with languages.
       Left: no type hint on turbofish calls; methods of types from other
       modules are not indexed for hints; a local that shadows a function
       name takes its calls.
+      Nov 24: the three gaps are closed. Turbofish calls resolve —
+      `f::<#k>` names are split at `::<` for the function lookup and the
+      parser-recorded type arguments bind f's type parameters for the
+      return type (ih_expr_type_plain). Methods of types from other
+      modules are indexed — ih_imported_funcs also collects the imported
+      modules' impls (all_impls feeds both the parameter-name and the
+      Type.m tables). A local or parameter that shadows a function name
+      takes its calls — `w(` is hint-checked against lsp_local_scope at
+      the call position first. Probe: scripts/tl/lsp_tl4_gaps.py.
 - [~] TL5. Debugger support with line tables on every platform (release N9) (L).
       Nov 22 evening: `fid debug` is wired — cmd_debug (main.fd) reads
       the file and runs compiler/debugger.fd's Debugger_new/Debugger_run
@@ -3509,6 +3557,11 @@ Go and Rust won developers with tools as much as with languages.
      writes a relative lib/util.fd as util.fd, so __debug_line is 107
      bytes, not 111): the expectation or the path rule must change; lldb
      on a Mac not run; variables (DB4).
+     Nov 24, cleared: nat_dbg_written_path now derives main_dir for a
+     no-directory input by anchoring on an absolute source path, so
+     lib/util.fd is written under lib/ — macho_dwarf_unit passes all 25
+     lines (__debug_line is 111 bytes, `file 2 lib/util.fd`). Left:
+     lldb on a Mac not run; variables (DB4).
 - [~] TL6. Cross-compilation out of the box: `fid build --target linux-arm64` from
       any host, with no extra download (L).
       Done (Nov 15): `--target` is read OS first too (main.fd
@@ -3588,6 +3641,17 @@ Go and Rust won developers with tools as much as with languages.
       generate`, the corpus test and the parse rate have never run and
       src/parser.c does not exist; Zed, Neovim, Emacs and Helix were not
       run (only in CI's editors.yml); editors/zed/src/lib.rs not compiled.
+      Nov 24: both named gaps closed. tree-sitter-cli 0.25.10 on the host:
+      `generate` emits src/parser.c + grammar.json + node-types.json
+      (committed, d55a66da — the rev extension.toml now pins instead of
+      "main"), corpus 5/5, REQUIRE=1 zed-check.sh ok — 2389 of 2450 .fd
+      files parse clean (97%), every query file compiles. Nov 25:
+      the Zed extension crate is updated to zed_extension_api 0.7.0;
+      `cargo check --target wasm32-wasip2` passes locally and the Editors
+      workflow now runs that compile check. editors/README.md no longer
+      claims the grammar is fetched at rev "main" (extension.toml pins
+      the generated-parser commit). Left: Zed/Neovim/Emacs/Helix run only
+      in CI or their respective editors; no local in-editor Zed test.
 - [x] TL11. `fid doc` sites as good as docs.rs and pkg.go.dev (M).
       Done (Nov 15): `fid doc <dir>` (scribe.fd scribe_site; before, a
       directory was rejected as "no directory listing"): a page per module
@@ -3847,6 +3911,28 @@ Trust is built by what we do not break.
       by default (FIDES_RUST_TOOLS=1 opts back). Precise gaps: veil's
       report fidelity and ark's prebuilt-library path (tools-selfbuild-
       check), and no released installer ships them yet.
+      Nov 25 validation: ark's prebuilt-library path is clean —
+      tests/ark/ark-binary.sh passes end to end with release/fid-dev.exe
+      (the linked program calls the library, removal of the library stops
+      it, ark test passes, and the stale/corrupt-library fallbacks work).
+      veil's report-fidelity gaps are fixed in compiler/veil.fd: the em
+      dash/check marks of the Rust report, the whole lowered module
+      rather than user functions only, no self-hosted ownership helpers
+      in the report, and one-decimal rounding. A ccompiled tools/veil.fd
+      matches target/release/veil.exe on hello.fd and struct.fd exactly
+      for the checked report parts (Functions: 1/417 and 2/419, the same
+      417/419 function rows, the same title); --version/--help/no-args
+      and html smoke pass. Nov 25 closeout: the full veil lane of
+      tests/tooling/tools-selfbuild-check.sh passes with release/fid-dev.exe
+      (TOOLS=veil CC="zig cc"): CLI and error behavior, compile-failure
+      behavior with no report, text and HTML reports, hello and struct
+      program output, Functions counts and every function row all match
+      the Rust tool. The sorted Rust-width rows and compile-failure early
+      return are included. Full coverage.txt is not byte-identical: Fides
+      also prints branch coverage, and line/instruction totals still
+      reflect the two lowerings' different line attribution. Left: ship a
+      released installer, and rebuild fid so `fid veil` carries this
+      implementation.
       implementations exist in `compiler/{ark,scribe,veil}.fd` and now have
       standalone `fn main` entries in `tools/`. `ark.exe` builds and runs
       end-to-end (`version`, `list` verified); `scribe.exe` builds and
@@ -3943,6 +4029,17 @@ Trust is built by what we do not break.
       tools/doctest.fd lacks scripts/doctest.py's 'native: ...' summary
       line); only 2 of about 25 drivers are ported; the shipped ark, scribe
       and veil are still Rust; WASI and macOS not run.
+      Nov 24: the check is clean — tools/doctest.fd tracks each native
+      example's build route (emit, or the C-route fallback with emit's
+      error) and prints the 'native: N built by emit, M by the C route
+      after emit failed' summary, '  C ROUTE' lines and the verbose
+      '(native, <route>)' tag, like doctest.py. check.sh: 3 same, 0
+      differ. Nov 25: scripts/verify/cov_instrument.py is ported as
+      tools/cov_instrument.fd and tests/tools/cov_instrument/check.sh
+      passes against Python — plain generated C, line-marked C, #line
+      form, sparse-#line form, --self-test and the missing-argument exit:
+      6 same, 0 differ. Left of the audit: the remaining drivers to port;
+      the shipped ark/scribe/veil are still Rust until a release rebuild.
 - [>] AD5. A real production service of ours, with its incidents written up: moved to external-roadmap.md (Nov 21).
 
 **Being reachable**

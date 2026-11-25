@@ -1,0 +1,507 @@
+// tools/reduce.fd — shrink a failing Fides program while it still fails
+// the same way (fuzz triage; own-backend roadmap RL21): the Fides port of
+// scripts/fuzz/reduce.py (roadmap AD4). Same arguments, same steps, same
+// output and result file:
+//
+//   fid ccompile tools/reduce.fd -o reduce.exe
+//   # two backends disagree (a miscompile)
+//   reduce.exe <in.fd> <out.fd> --bad emit --good ccompile [--fid release/fid.exe] [--match 'overflow']
+//   # one backend fails at the same stage, status and first message
+//   reduce.exe <in.fd> <out.fd> --fails emit [--match 'Invalid memory']
+//   # any command: {} is the candidate file; it must keep its exit status
+//   reduce.exe <in.fd> <out.fd> --cmd "release/fid.exe check {}" --match "panicked"
+//
+// The script's header (scripts/fuzz/reduce.py) says what is removed and
+// what "the same failure" means for each mode. `fid reduce` (built into
+// the compiler, compiler/main.fd cmd_reduce) does the --cmd and --fails
+// modes with a command line of its own (-o, --timeout); this is the
+// script's own interface, --bad/--good included.
+//
+// Differences from the script: --cmd runs through cmd.exe /c (sh -c
+// elsewhere) as the script's shell=True does, but a command holding a
+// double quote goes through a temporary .bat file on Windows (an argument
+// of cmd.exe cannot hold one unescaped); the candidate's folder is a new
+// folder in the temp directory named reduce<pid>_<time> (tempfile.mkdtemp
+// picks a random name); lines are stripped of ASCII and the common
+// Unicode spaces, \d and \s are ASCII. A missing mode is "reduce: error:
+// ..." with exit status 2 (argparse prints its usage first).
+
+use core;
+use fs;
+use io;
+use process;
+use fuzz_lib;
+
+/// What one run gave: ok false for a timeout (or a build that failed, for
+/// --bad/--good's run()); stage "build" or "run".
+pub struct Out {
+    pub ok: bool,
+    pub stage: str,
+    pub rc: str,
+    pub out: str,
+    pub err: str,
+}
+
+fn none_out() -> Out {
+    return Out { ok: false, stage: "", rc: "", out: "", err: "" };
+}
+
+/// bytes.decode("utf-8", "replace")
+fn dec(raw: str) -> str {
+    return fl_decode_str(raw);
+}
+
+/// run() of the script: (exit status, stdout, stderr) of backend `b`, for
+/// --bad/--good; not ok on a timeout or when the build fails.
+fn run_b(fid: str, b: str, path: str, work: str) -> Out {
+    if b == "run" {
+        val p: FlRun = fl_run(&fl_v3(fid, "run", path), "", 120);
+        if p.timed_out { return none_out(); }
+        return Out { ok: true, stage: "run", rc: int_to_str(p.code), out: fl_no_cr(dec(p.out)), err: dec(p.err) };
+    }
+    if b == "checked" {
+        var cc: Vec<str> = fl_v3(fid, "run", fl_abspath(path));
+        cc.push("--checked-alloc");
+        val q: FlRun = fl_run(&cc, work, 300);
+        if q.timed_out { return none_out(); }
+        val ls: Vec<str> = fl_lines(fl_no_cr(dec(q.out)));
+        var keep: StringBuilder = StringBuilder::new();
+        var i: i64 = 0;
+        while i < ls.len() {
+            val l: str = ls.get(i);
+            val last: bool = i == ls.len() - 1;
+            if !str_starts_with(l, "Built native executable:") && !(last && str_len(l) == 0) {
+                keep.append_str(l);
+                if !last { keep.append_str("\n"); }
+            }
+            i = i + 1;
+        }
+        return Out { ok: true, stage: "run", rc: int_to_str(q.code), out: keep.to_str(), err: dec(q.err) };
+    }
+    val exe: str = fl_join(work, "r-" + b + ".exe");
+    fl_remove(exe);
+    var cmd: Vec<str> = Vec::new();
+    if b == "nat" {
+        cmd = fl_v5(fid, "emit", path, "--nat", "-o");
+        cmd.push(exe);
+    } else if b == "ccompile-O2" {
+        cmd = fl_v5(fid, "ccompile", path, "--cc-opt", "2");
+        cmd.push("-o");
+        cmd.push(exe);
+    } else {
+        cmd = fl_v3(fid, b, path);
+        cmd.push("-o");
+        cmd.push(exe);
+    }
+    val p2: FlRun = fl_run(&cmd, "", 300);
+    if p2.timed_out || p2.code != 0 || !fl_exists(exe) { return none_out(); }
+    val r: FlRun = fl_run(&fl_v1(exe), "", 60);
+    if r.timed_out { return none_out(); }
+    return Out { ok: true, stage: "run", rc: int_to_str(r.code), out: fl_no_cr(dec(r.out)), err: dec(r.err) };
+}
+
+/// build_and_run(): (stage, exit status, output) of backend `b` on
+/// `path`; not ok on a timeout.
+fn build_and_run(fid: str, b: str, path: str, work: str) -> Out {
+    var kind: str = b;
+    var target: str = "";
+    val colon: i64 = str_find(b, ":");
+    if colon >= 0 {
+        kind = str_slice(b, 0, colon);
+        target = str_slice(b, colon + 1, str_len(b));
+    }
+    if b == "run" || b == "check" {
+        val p: FlRun = fl_run(&fl_v3(fid, b, path), "", 120);
+        if p.timed_out { return none_out(); }
+        return Out { ok: true, stage: "run", rc: int_to_str(p.code), out: fl_no_cr(dec(p.out + p.err)), err: "" };
+    }
+    val exe: str = fl_join(work, "r-" + str_replace(b, ":", "-") + ".exe");
+    fl_remove(exe);
+    var cmd: Vec<str> = fl_v3(fid, kind, path);
+    if kind == "nat" { cmd = fl_v3(fid, "emit", path); }
+    if str_len(target) > 0 {
+        cmd.push("--target");
+        cmd.push(target);
+    }
+    if kind == "nat" { cmd.push("--nat"); }
+    cmd.push("-o");
+    cmd.push(exe);
+    val p2: FlRun = fl_run(&cmd, "", 300);
+    if p2.timed_out { return none_out(); }
+    val text: str = fl_no_cr(dec(p2.out + p2.err));
+    if p2.code != 0 || !fl_exists(exe) {
+        return Out { ok: true, stage: "build", rc: int_to_str(p2.code), out: text, err: "" };
+    }
+    if str_len(target) > 0 {
+        // another target: built, not run here
+        return Out { ok: true, stage: "run", rc: "0", out: text, err: "" };
+    }
+    val q: FlRun = fl_run(&fl_v1(exe), "", 60);
+    if q.timed_out { return none_out(); }
+    return Out { ok: true, stage: "run", rc: int_to_str(q.code), out: fl_no_cr(dec(q.out + q.err)), err: "" };
+}
+
+fn is_space(c: i64) -> bool {
+    if (c >= 9 && c <= 13) || (c >= 28 && c <= 32) || c == 133 || c == 160 || c == 5760 { return true; }
+    if (c >= 8192 && c <= 8202) || c == 8232 || c == 8233 || c == 8239 || c == 8287 || c == 12288 { return true; }
+    return false;
+}
+
+/// str.strip()
+fn strip(s: str) -> str {
+    val cps: Vec<i64> = fl_cps(s);
+    var a: i64 = 0;
+    var b: i64 = cps.len();
+    while a < b && is_space(cps.get(a)) { a = a + 1; }
+    while b > a && is_space(cps.get(b - 1)) { b = b - 1; }
+    if a == 0 && b == cps.len() { return s; }
+    return fl_encode(&cps, a, b);
+}
+
+fn is_alpha(c: i64) -> bool {
+    return (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+}
+
+fn re_ws(c: i64) -> bool {
+    return c == 32 || (c >= 9 && c <= 13) || c == 28 || c == 29 || c == 30 || c == 31 || c == 133 || c == 160;
+}
+
+/// re.sub(r"[A-Za-z]:[\\/][^\s:]*|/[^\s:]+", "<path>", l)
+fn blur_paths(l: str) -> str {
+    val n: i64 = str_len(l);
+    var b: StringBuilder = StringBuilder::new();
+    var i: i64 = 0;
+    while i < n {
+        val c: i64 = str_byte_at(l, i);
+        if is_alpha(c) && i + 2 < n && str_byte_at(l, i + 1) == 58 && (str_byte_at(l, i + 2) == 92 || str_byte_at(l, i + 2) == 47) {
+            var j: i64 = i + 3;
+            while j < n && !re_ws(str_byte_at(l, j)) && str_byte_at(l, j) != 58 { j = j + 1; }
+            b.append_str("<path>");
+            i = j;
+            continue;
+        }
+        if c == 47 && i + 1 < n && !re_ws(str_byte_at(l, i + 1)) && str_byte_at(l, i + 1) != 58 {
+            var k: i64 = i + 1;
+            while k < n && !re_ws(str_byte_at(l, k)) && str_byte_at(l, k) != 58 { k = k + 1; }
+            b.append_str("<path>");
+            i = k;
+            continue;
+        }
+        b.append_str(str_slice(l, i, i + 1));
+        i = i + 1;
+    }
+    return b.to_str();
+}
+
+/// re.sub(r"\d+", "N", s)
+fn blur_numbers(s: str) -> str {
+    val n: i64 = str_len(s);
+    var b: StringBuilder = StringBuilder::new();
+    var i: i64 = 0;
+    while i < n {
+        if fl_digit(str_byte_at(s, i)) {
+            while i < n && fl_digit(str_byte_at(s, i)) { i = i + 1; }
+            b.append_str("N");
+        } else {
+            b.append_str(str_slice(s, i, i + 1));
+            i = i + 1;
+        }
+    }
+    return b.to_str();
+}
+
+/// The first error or panic line, with numbers and paths blurred.
+fn failure_key(text: str) -> str {
+    val ls: Vec<str> = fl_lines(text);
+    var i: i64 = 0;
+    while i < ls.len() {
+        val l: str = ls.get(i);
+        i = i + 1;
+        if str_contains(l, "Panic") || str_contains(l, "panic") || str_contains(l, "rror") || str_contains(l, "Assertion") || str_contains(l, "Invalid") || str_contains(l, "overflow") || str_contains(l, "Stack") {
+            return fl_head_cps(blur_numbers(strip(blur_paths(l))), 200);
+        }
+    }
+    return "";
+}
+
+/// A failure's signature as Python prints the tuple.
+pub struct Sig {
+    pub text: str,
+    pub timeout: bool,
+    pub rc: str,
+}
+
+fn sig_of(res: &Out) -> Sig {
+    if !res.ok { return Sig { text: "('timeout',)", timeout: true, rc: "" }; }
+    return Sig { text: "(" + fl_repr(res.stage) + ", " + res.rc + ", " + fl_repr(failure_key(res.out)) + ")", timeout: false, rc: res.rc };
+}
+
+/// The indexes [i, j) that can be removed as one statement, as pairs.
+fn units(lines: &Vec<str>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < lines.len() {
+        val l: str = lines.get(i);
+        val s: str = strip(l);
+        if str_len(s) == 0 || str_starts_with(s, "}") || str_starts_with(s, "//") || str_starts_with(s, "fn main") {
+            i = i + 1;
+            continue;
+        }
+        if str_starts_with(s, "return") && str_starts_with(l, "    ") && !str_starts_with(l, "     ") {
+            i = i + 1;
+            continue;
+        }
+        if str_ends_with(s, "{") {
+            var depth: i64 = 0;
+            var j: i64 = i;
+            while j < lines.len() {
+                val t: str = strip(lines.get(j));
+                depth = depth + count_of(t, 123) - count_of(t, 125);
+                j = j + 1;
+                if depth <= 0 && !str_ends_with(strip(lines.get(j - 1)), "{") { break; }
+            }
+            out.push(i);
+            out.push(j);
+        } else {
+            out.push(i);
+            out.push(i + 1);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn count_of(s: str, c: i64) -> i64 {
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while i < str_len(s) {
+        if str_byte_at(s, i) == c { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+
+/// us.sort(key=lambda r: -(r[1] - r[0])): a stable sort, biggest first.
+fn sort_units(us: &Vec<i64>) -> Vec<i64> {
+    val m: i64 = us.len() / 2;
+    var idx: Vec<i64> = Vec::new();
+    var k: i64 = 0;
+    while k < m {
+        idx.push(k);
+        k = k + 1;
+    }
+    var i: i64 = 1;
+    while i < m {
+        val x: i64 = idx.get(i);
+        val lx: i64 = us.get(2 * x + 1) - us.get(2 * x);
+        var j: i64 = i - 1;
+        while j >= 0 && us.get(2 * idx.get(j) + 1) - us.get(2 * idx.get(j)) < lx {
+            idx.set(j + 1, idx.get(j));
+            j = j - 1;
+        }
+        idx.set(j + 1, x);
+        i = i + 1;
+    }
+    var out: Vec<i64> = Vec::new();
+    k = 0;
+    while k < m {
+        out.push(us.get(2 * idx.get(k)));
+        out.push(us.get(2 * idx.get(k) + 1));
+        k = k + 1;
+    }
+    return out;
+}
+
+pub struct St {
+    pub fid: str,
+    pub bad: str,
+    pub good: str,
+    pub fails: str,
+    pub cmd: str,
+    pub match_text: str,
+    pub work: str,
+    pub path: str,
+    pub orig_sig: str,
+    pub orig_bad_rc: str,
+    pub orig_good_rc: str,
+    pub have_orig: bool,
+    pub bat_ctr: i64,
+}
+
+/// The candidate's failure for --fails and --cmd: its signature and text.
+fn outcome(st: &mut St, text: &mut str) -> Sig {
+    if str_len(st.cmd) > 0 {
+        var c: str = st.cmd;
+        if fl_win() {
+            c = str_replace(c, "{}", st.path);
+        } else {
+            c = str_replace(c, "{}", process_quote(st.path));
+        }
+        var argv: Vec<str> = Vec::new();
+        if fl_win() {
+            var comspec: str = fl_env("COMSPEC");
+            if str_len(comspec) == 0 { comspec = "cmd.exe"; }
+            argv.push(comspec);
+            argv.push("/c");
+            if str_contains(c, "\"") {
+                st.bat_ctr = st.bat_ctr + 1;
+                val bat: str = fl_join(st.work, "cmd" + int_to_str(st.bat_ctr) + ".bat");
+                fl_write(bat, "@" + c + "\r\n");
+                argv.push(bat);
+            } else {
+                argv.push(c);
+            }
+        } else {
+            argv.push("/bin/sh");
+            argv.push("-c");
+            argv.push(c);
+        }
+        val p: FlRun = fl_run(&argv, "", 300);
+        if p.timed_out {
+            *text = "";
+            return Sig { text: "('timeout',)", timeout: true, rc: "" };
+        }
+        *text = dec(p.out + p.err);
+        return Sig { text: "('cmd', " + int_to_str(p.code) + ")", timeout: false, rc: int_to_str(p.code) };
+    }
+    val res: Out = build_and_run(st.fid, st.fails, st.path, st.work);
+    *text = res.out;
+    return sig_of(&res);
+}
+
+fn failing(s: &Sig) -> bool {
+    if s.timeout { return false; }
+    return s.rc != "0";
+}
+
+fn write_cand(st: &St, ls: &Vec<str>) {
+    fl_write(st.path, fl_join_lines(ls, "\n"));
+}
+
+/// The bad/good rule of the script's run(): a failed `run` that is a
+/// compile error (not a panic) does not count.
+fn rejected(b: str, r: &Out) -> bool {
+    if !r.ok { return true; }
+    return b == "run" && r.rc != "0" && str_contains(r.err, "rror") && str_len(r.out) == 0 && !str_contains(r.err, "Panic");
+}
+
+fn interesting(st: &mut St, ls: &Vec<str>) -> bool {
+    write_cand(st, ls);
+    if str_len(st.fails) > 0 || str_len(st.cmd) > 0 {
+        var text: str = "";
+        val s: Sig = outcome(st, &mut text);
+        return failing(&s) && s.text == st.orig_sig && (str_len(st.match_text) == 0 || str_contains(text, st.match_text));
+    }
+    val b: Out = run_b(st.fid, st.bad, st.path, st.work);
+    if rejected(st.bad, &b) { return false; }
+    val g: Out = run_b(st.fid, st.good, st.path, st.work);
+    if rejected(st.good, &g) { return false; }
+    if str_len(st.match_text) > 0 && !str_contains(b.err + b.out, st.match_text) { return false; }
+    if st.have_orig && (b.rc != st.orig_bad_rc || g.rc != st.orig_good_rc) { return false; }
+    return b.rc != g.rc || b.out != g.out;
+}
+
+fn interesting_first(st: &mut St, ls: &Vec<str>) -> bool {
+    write_cand(st, ls);
+    if str_len(st.fails) > 0 || str_len(st.cmd) > 0 {
+        var text: str = "";
+        val s: Sig = outcome(st, &mut text);
+        st.orig_sig = s.text;
+        fl_print("the failure to keep: " + s.text);
+        return failing(&s) && (str_len(st.match_text) == 0 || str_contains(text, st.match_text));
+    }
+    val b: Out = run_b(st.fid, st.bad, st.path, st.work);
+    val g: Out = run_b(st.fid, st.good, st.path, st.work);
+    st.have_orig = true;
+    st.orig_bad_rc = b.rc;
+    st.orig_good_rc = g.rc;
+    if !b.ok || !g.ok {
+        // a timeout or a failed build: the script's orig holds None, and
+        // no later candidate's status can equal it
+        st.orig_bad_rc = "<none>";
+        st.orig_good_rc = "<none>";
+        return false;
+    }
+    return b.rc != g.rc || b.out != g.out;
+}
+
+fn main() -> i64 {
+    val av: Vec<str> = fl_args();
+    var with_value: Vec<str> = Vec::new();
+    with_value.push("--bad");
+    with_value.push("--good");
+    with_value.push("--fails");
+    with_value.push("--cmd");
+    with_value.push("--fid");
+    with_value.push("--match");
+    val pos: Vec<str> = fl_positionals(&av, &with_value);
+    if pos.len() < 2 {
+        io_eprintln("usage: reduce.py [-h] [--bad BAD] [--good GOOD] [--fails FAILS] [--cmd CMD] [--fid FID] [--match MATCH] src dst");
+        io_eprintln("reduce.py: error: the following arguments are required: src, dst");
+        return 2;
+    }
+    var st: St = St {
+        fid: fl_opt(&av, "--fid", fl_join("release", "fid.exe")),
+        bad: fl_opt(&av, "--bad", ""), good: fl_opt(&av, "--good", ""),
+        fails: fl_opt(&av, "--fails", ""), cmd: fl_opt(&av, "--cmd", ""),
+        match_text: fl_opt(&av, "--match", ""), work: "", path: "", orig_sig: "",
+        orig_bad_rc: "", orig_good_rc: "", have_orig: false, bat_ctr: 0
+    };
+    if !(str_len(st.fails) > 0 || str_len(st.cmd) > 0 || (str_len(st.bad) > 0 && str_len(st.good) > 0)) {
+        io_eprintln("usage: reduce.py [-h] [--bad BAD] [--good GOOD] [--fails FAILS] [--cmd CMD] [--fid FID] [--match MATCH] src dst");
+        io_eprintln("reduce.py: error: give --bad and --good, or --fails <backend>, or --cmd <command>");
+        return 2;
+    }
+    fl_setdefault_env("CC", "zig cc");
+    fl_setdefault_env("FIDES_NO_CACHE", "1");
+    var tmp: str = fl_env("TMPDIR");
+    if str_len(tmp) == 0 { tmp = fl_env("TEMP"); }
+    if str_len(tmp) == 0 { tmp = fl_env("TMP"); }
+    if str_len(tmp) == 0 {
+        if fl_win() { tmp = "."; } else { tmp = "/tmp"; }
+    }
+    st.work = fl_join(tmp, "reduce" + int_to_str(p_getpid()) + "_" + int_to_str(p_clock_now_us()));
+    fl_mkdirs(st.work);
+    st.path = fl_join(st.work, "cand.fd");
+    val dst: str = pos.get(1);
+    var lines: Vec<str> = fl_lines(fl_text(fl_decode_str(fl_read(pos.get(0)))));
+    if !interesting_first(&mut st, &lines) {
+        fl_print("the input does not show the failure (or the disagreement)");
+        return 0;
+    }
+    var tries: i64 = 0;
+    var changed: bool = true;
+    while changed {
+        changed = false;
+        val us: Vec<i64> = sort_units(&units(&lines));
+        var u: i64 = 0;
+        while u + 1 < us.len() {
+            val i: i64 = us.get(u);
+            val j: i64 = us.get(u + 1);
+            u = u + 2;
+            if j > lines.len() { continue; }
+            var cand: Vec<str> = Vec::new();
+            var k: i64 = 0;
+            while k < lines.len() {
+                if k < i || k >= j { cand.push(lines.get(k)); }
+                k = k + 1;
+            }
+            tries = tries + 1;
+            if interesting(&mut st, &cand) {
+                lines = cand;
+                changed = true;
+                fl_print("  " + int_to_str(lines.len()) + " lines (try " + int_to_str(tries) + ")");
+                break;
+            }
+        }
+    }
+    fl_write(dst, fl_join_lines(&lines, "\n"));
+    var nonblank: i64 = 0;
+    var q: i64 = 0;
+    while q < lines.len() {
+        if str_len(strip(lines.get(q))) > 0 { nonblank = nonblank + 1; }
+        q = q + 1;
+    }
+    fl_print("reduced to " + int_to_str(nonblank) + " lines in " + int_to_str(tries) + " tries -> " + dst);
+    return 0;
+}

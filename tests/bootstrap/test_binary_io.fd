@@ -1,7 +1,8 @@
 // Binary-safe file I/O — regression test for known-bug 3.14 (p_file_write
 // truncated at NUL bytes). Verifies that byte vectors containing 0x00
 // round-trip through file_write_bytes / file_read_bytes, and that
-// p_file_write text semantics stop at the first NUL (matching C fputs).
+// p_file_write writes a string's full counted length, NUL bytes included,
+// on every backend (BG81).
 use core;
 use vec;
 use file;
@@ -34,17 +35,20 @@ fn test_write_read_with_nulls() -> i64 {
     return 1;
 }
 
-fn test_file_write_text_stops_at_nul() -> i64 {
-    // p_file_write is a text builtin: content stops at the first NUL byte
-    // (matches C fputs semantics on both interpreter and C backend).
+fn test_file_write_text_keeps_nul() -> i64 {
+    // BG81: p_file_write writes all 5 bytes, the NUL included, on the
+    // interpreter, C, pe_ir and the machine layer
     val rc = p_file_write("tests/_fides_bin_io_text.tmp", "AB\x00CD");
     if rc != 0 { return 0; }
     val sz = file_size("tests/_fides_bin_io_text.tmp");
-    if sz != 2 { return 0; }
+    if sz != 5 { return 0; }
     val back = file_read_bytes("tests/_fides_bin_io_text.tmp");
-    if back.len() != 2 { return 0; }
+    if back.len() != 5 { return 0; }
     if back.get(0) != 65 { return 0; }
     if back.get(1) != 66 { return 0; }
+    if back.get(2) != 0 { return 0; }
+    if back.get(3) != 67 { return 0; }
+    if back.get(4) != 68 { return 0; }
     val drc = file_delete("tests/_fides_bin_io_text.tmp");
     if drc != 0 { return 0; }
     return 1;
@@ -52,7 +56,7 @@ fn test_file_write_text_stops_at_nul() -> i64 {
 
 fn main() -> i64 {
     if test_write_read_with_nulls() != 1 { println("FAIL: write_read_with_nulls"); return 1; }
-    if test_file_write_text_stops_at_nul() != 1 { println("FAIL: file_write_text_stops_at_nul"); return 1; }
+    if test_file_write_text_keeps_nul() != 1 { println("FAIL: file_write_text_keeps_nul"); return 1; }
     println("All binary I/O tests passed");
     return 0;
 }

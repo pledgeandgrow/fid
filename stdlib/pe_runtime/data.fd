@@ -1105,122 +1105,143 @@ pub fn pert_http_build_response(status: i64, content_type: str, body: str) -> st
     return ped_sb_finish(sb);
 }
 
+/// The index of byte b in [from, to), -1 if it is not there.
+fn ped_find_byte_to(base: i64, from: i64, to: i64, b: i64) -> i64 {
+    var i: i64 = from;
+    while i < to {
+        if pe_byte_at(base, i) == b {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// A byte a header name or value is trimmed of (C _jh_blank).
+fn ped_http_blank(c: i64) -> bool {
+    return c == 32 || c == 9 || c == 10 || c == 13;
+}
+
 /// The request as JSON text:
 /// {"method":..,"path":..,"version":..,"headers":{..},"body":".."}
+/// read as the interpreter (compiler/interp.fd p_http_parse_request) and
+/// the C runtime (p_http_parse_request__raw, BG160) read it: a request line
+/// of one word is the method (path "/", version "1.1"), a version not
+/// "HTTP/x" is "1.1", header names and values are trimmed, the body runs
+/// from the first empty line to the next one (or the end), and every text
+/// is escaped (a `"` in the path gave invalid JSON).
 pub fn pert_http_parse_request(request: str) -> str {
     var base: i64 = pe_str_addr(request);
     if base == 0 {
         return ped_copy(pe_str_addr("{}"), 2);
     }
     var total: i64 = ped_len(base);
-    var le: i64 = ped_find_text(base, 0, pe_str_addr("\r\n"));
-    if le < 0 {
-        le = total;
+    var crlf: i64 = pe_str_addr("\r\n");
+    var le: i64 = ped_find_text(base, 0, crlf);
+    var rl_end: i64 = total;
+    var pos: i64 = total;
+    if le >= 0 {
+        rl_end = le;
+        pos = le + 2;
     }
     // Request line: METHOD PATH HTTP/VERSION
-    var sp1: i64 = ped_find_byte(base, 0, 32);
-    var mlen: i64 = 0;
-    if sp1 >= 0 && sp1 < le {
-        mlen = sp1;
-        if mlen > 15 {
-            mlen = 15;
-        }
-    }
-    var ps: i64 = 0;
+    var ml: i64 = rl_end;
+    var path_a: i64 = pe_str_addr("/");
+    var pl: i64 = 1;
+    var vf_a: i64 = pe_str_addr("HTTP/1.1");
+    var vfl: i64 = 8;
+    var sp1: i64 = ped_find_byte_to(base, 0, rl_end, 32);
     if sp1 >= 0 {
-        ps = sp1 + 1;
-    }
-    var sp2: i64 = ped_find_byte(base, ps, 32);
-    var plen: i64 = 0;
-    if sp2 >= 0 && sp2 < le {
-        plen = sp2 - ps;
-        if plen > 1023 {
-            plen = 1023;
+        ml = sp1;
+        path_a = base + sp1 + 1;
+        var sp2: i64 = ped_find_byte_to(base, sp1 + 1, rl_end, 32);
+        if sp2 < 0 {
+            pl = rl_end - (sp1 + 1);
+        } else {
+            pl = sp2 - (sp1 + 1);
+            vf_a = base + sp2 + 1;
+            vfl = rl_end - (sp2 + 1);
         }
     }
-    var vs: i64 = 0;
-    if sp2 >= 0 {
-        vs = sp2 + 1;
-    }
-    var vlen: i64 = 0;
-    if vs < le {
-        vlen = le - vs;
-        if vlen > 15 {
-            vlen = 15;
-        }
-    }
-    if vlen >= 5 && ped_eq_n(base + vs, pe_str_addr("HTTP/"), 5) {
-        vs = vs + 5;
-        vlen = vlen - 5;
+    var ver_a: i64 = pe_str_addr("1.1");
+    var vl: i64 = 3;
+    if vfl >= 5 && ped_eq_n(vf_a, pe_str_addr("HTTP/"), 5) {
+        ver_a = vf_a + 5;
+        vl = vfl - 5;
     }
     var sb: i64 = ped_sb_new();
-    ped_sb_text(sb, "{\"method\":\"");
-    ped_sb_range(sb, base, mlen);
-    ped_sb_text(sb, "\",\"path\":\"");
-    ped_sb_range(sb, base + ps, plen);
-    ped_sb_text(sb, "\",\"version\":\"");
-    ped_sb_range(sb, base + vs, vlen);
-    ped_sb_text(sb, "\",\"headers\":{");
+    ped_sb_text(sb, "{\"method\":");
+    ped_json_quote(sb, base, ml);
+    ped_sb_text(sb, ",\"path\":");
+    ped_json_quote(sb, path_a, pl);
+    ped_sb_text(sb, ",\"version\":");
+    ped_json_quote(sb, ver_a, vl);
+    ped_sb_text(sb, ",\"headers\":{");
     // Headers, up to the empty line
-    var p: i64 = le + 2;
-    if p > total {
-        p = total;
-    }
     var first: bool = true;
-    var more: bool = true;
-    while more && pe_byte_at(base, p) != 0 {
-        var nl: i64 = ped_find_text(base, p, pe_str_addr("\r\n"));
-        if nl < 0 {
-            more = false;
-        } else if nl == p {
-            p = p + 2;
+    var saw_blank: bool = false;
+    var more: bool = le >= 0;
+    while more && pos <= total {
+        var nle: i64 = ped_find_text(base, pos, crlf);
+        var lend: i64 = total;
+        if nle >= 0 {
+            lend = nle;
+        }
+        if lend == pos {
+            saw_blank = true;
             more = false;
         } else {
-            var colon: i64 = ped_find_byte(base, p, 58);
-            if colon >= 0 && colon < nl {
-                var hv: i64 = colon + 1;
-                while pe_byte_at(base, hv) == 32 {
-                    hv = hv + 1;
+            var colon: i64 = ped_find_byte_to(base, pos, lend, 58);
+            if colon >= 0 {
+                var ka: i64 = pos;
+                var kb: i64 = colon;
+                var va: i64 = colon + 1;
+                var vb: i64 = lend;
+                while ka < kb && ped_http_blank(pe_byte_at(base, ka)) {
+                    ka = ka + 1;
+                }
+                while kb > ka && ped_http_blank(pe_byte_at(base, kb - 1)) {
+                    kb = kb - 1;
+                }
+                while va < vb && ped_http_blank(pe_byte_at(base, va)) {
+                    va = va + 1;
+                }
+                while vb > va && ped_http_blank(pe_byte_at(base, vb - 1)) {
+                    vb = vb - 1;
                 }
                 if !first {
                     ped_sb_byte(sb, 44);
                 }
                 first = false;
-                ped_sb_byte(sb, 34);
-                ped_sb_range(sb, base + p, colon - p);
-                ped_sb_text(sb, "\":\"");
-                ped_sb_range(sb, base + hv, nl - hv);
-                ped_sb_byte(sb, 34);
+                ped_json_quote(sb, base + ka, kb - ka);
+                ped_sb_byte(sb, 58);
+                ped_json_quote(sb, base + va, vb - va);
             }
-            p = nl + 2;
+            if nle < 0 {
+                more = false;
+            } else {
+                pos = nle + 2;
+            }
         }
     }
-    ped_sb_text(sb, "},\"body\":\"");
-    // The body (the rest), escaped
-    var c: i64 = pe_byte_at(base, p);
-    while c != 0 {
-        if c == 34 {
-            ped_sb_byte(sb, 92);
-            ped_sb_byte(sb, 34);
-        } else if c == 92 {
-            ped_sb_byte(sb, 92);
-            ped_sb_byte(sb, 92);
-        } else if c == 10 {
-            ped_sb_byte(sb, 92);
-            ped_sb_byte(sb, 110);
-        } else if c == 13 {
-            ped_sb_byte(sb, 92);
-            ped_sb_byte(sb, 114);
-        } else if c == 9 {
-            ped_sb_byte(sb, 92);
-            ped_sb_byte(sb, 116);
-        } else {
-            ped_sb_byte(sb, c);
+    ped_sb_text(sb, "},\"body\":");
+    // The body: after the first empty line, up to the next one
+    var bs: i64 = 0;
+    var bl: i64 = 0;
+    if saw_blank {
+        var blank2: i64 = pe_str_addr("\r\n\r\n");
+        var bb: i64 = ped_find_text(base, 0, blank2);
+        if bb >= 0 {
+            bs = bb + 4;
+            var be: i64 = ped_find_text(base, bs, blank2);
+            if be < 0 {
+                be = total;
+            }
+            bl = be - bs;
         }
-        p = p + 1;
-        c = pe_byte_at(base, p);
     }
-    ped_sb_text(sb, "\"}");
+    ped_json_quote(sb, base + bs, bl);
+    ped_sb_byte(sb, 125);
     return ped_sb_finish(sb);
 }
 

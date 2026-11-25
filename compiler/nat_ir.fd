@@ -8592,63 +8592,6 @@ fn ng_inst_operands(inst: Inst, out: &mut Vec<i64>) {
     }
 }
 
-/// The blocks control can go to after block `bi` (indexes).
-fn ng_block_succs(func: &IrFunction, bi: i64, bindex: i64, out: &mut Vec<i64>) {
-    out.clear();
-    var block: BasicBlock = func.blocks.get(bi);
-    var n: i64 = block.instructions.len();
-    var ends: bool = false;
-    if n > 0 {
-        match IrFunction_get_inst(func, block.instructions.get(n - 1)) {
-            OptInst::Some(last) => {
-                match last {
-                    Inst::Jump(t) => {
-                        ends = true;
-                        if HashMap_contains(bindex, int_to_str(t)) {
-                            out.push(HashMap_get(bindex, int_to_str(t)));
-                        }
-                    }
-                    Inst::Branch(_, t1, t2) => {
-                        ends = true;
-                        if HashMap_contains(bindex, int_to_str(t1)) {
-                            out.push(HashMap_get(bindex, int_to_str(t1)));
-                        }
-                        if HashMap_contains(bindex, int_to_str(t2)) {
-                            out.push(HashMap_get(bindex, int_to_str(t2)));
-                        }
-                    }
-                    Inst::Switch(_, _, sw_t, sw_d) => {
-                        // ME28: each block the switch may go to
-                        ends = true;
-                        var swb: Vec<i64> = switch_succ_blocks(sw_t, sw_d);
-                        var swi: i64 = 0;
-                        while swi < swb.len() {
-                            if HashMap_contains(bindex, int_to_str(swb.get(swi))) {
-                                out.push(HashMap_get(bindex, int_to_str(swb.get(swi))));
-                            }
-                            swi = swi + 1;
-                        }
-                    }
-                    Inst::Return(_) => {
-                        ends = true;
-                    }
-                    Inst::Unreachable => {
-                        ends = true;
-                    }
-                    _ => {
-                    }
-                }
-            }
-            OptInst::None => {
-            }
-        }
-    }
-    // A block without a terminator runs into the next one
-    if !ends && bi + 1 < func.blocks.len() {
-        out.push(bi + 1);
-    }
-}
-
 fn ng_touch(lo: &mut Vec<i64>, hi: &mut Vec<i64>, v: i64, p: i64) {
     if v < 0 || v >= lo.len() {
         return;
@@ -8814,7 +8757,49 @@ fn ng_regalloc(g: &mut NatGen, func: &IrFunction, nvals: i64) {
             }
             i = i + 1;
         }
-        var succs: Vec<i64> = Vec::new();
+        // Block successors, once: the fixpoint below reads them every
+        // round. Terminator targets through the shared inst_succ_blocks;
+        // an unterminated block still falls through to the next (the IR
+        // verifier rejects those; kept as a guard).
+        var bsuccs: Vec<Vec<i64>> = Vec::new();
+        bi = 0;
+        while bi < nb {
+            var ts: Vec<i64> = Vec::new();
+            var blk2: BasicBlock = func.blocks.get(bi);
+            var n2: i64 = blk2.instructions.len();
+            var ends: bool = false;
+            if n2 > 0 {
+                match IrFunction_get_inst(func, blk2.instructions.get(n2 - 1)) {
+                    OptInst::Some(last) => {
+                        match last {
+                            Inst::Jump(_) => { ends = true; }
+                            Inst::Branch(_, _, _) => { ends = true; }
+                            Inst::Switch(_, _, _, _) => { ends = true; }
+                            Inst::Return(_) => { ends = true; }
+                            Inst::Unreachable => { ends = true; }
+                            _ => {
+                            }
+                        }
+                        var targets: Vec<i64> = inst_succ_blocks(last);
+                        var ti: i64 = 0;
+                        while ti < targets.len() {
+                            var lbl: str = int_to_str(targets.get(ti));
+                            if HashMap_contains(bindex, lbl) {
+                                ts.push(HashMap_get(bindex, lbl));
+                            }
+                            ti = ti + 1;
+                        }
+                    }
+                    OptInst::None => {
+                    }
+                }
+            }
+            if !ends && bi + 1 < nb {
+                ts.push(bi + 1);
+            }
+            bsuccs.push(ts);
+            bi = bi + 1;
+        }
         var changed: bool = true;
         var rounds: i64 = 0;
         while changed && rounds < 1000 {
@@ -8822,7 +8807,7 @@ fn ng_regalloc(g: &mut NatGen, func: &IrFunction, nvals: i64) {
             rounds = rounds + 1;
             bi = nb - 1;
             while bi >= 0 {
-                ng_block_succs(func, bi, bindex, &mut succs);
+                var succs: Vec<i64> = bsuccs.get(bi);
                 var wi: i64 = 0;
                 while wi < words {
                     var o: i64 = 0;
@@ -31421,6 +31406,12 @@ fn ng_gen_inst(g: &mut NatGen, id: i64, inst: Inst, func: &IrFunction, module: &
                 ng_f32bits(g, g.t0, g.t0);
             } else if ir_type_eq(bc_from, IrType::F32) && ir_type_eq(bc_to, IrType::F64) {
                 ng_f32widen(g, g.t0, g.t0);
+            } else if ir_type_is_int(bc_from) && ir_type_is_int(bc_to) && ng_narrow_kind(bc_to) != 0 {
+                // BG38's twin: a same-width cast between signed and
+                // unsigned (`65535 as u16 as i16`) re-extends the word for
+                // the new type, as IntTrunc does (M7) and pe_ir's
+                // peir_norm_narrow: it kept 65535 for an i16 -1
+                ng_ext(g, g.t0, g.t0, ng_narrow_kind(bc_to));
             }
             ng_st_val(g, id, g.t0);
         }

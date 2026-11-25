@@ -1,0 +1,884 @@
+// tools/fuzz_frontend.fd — coverage-guided fuzzing of the lexer, parser
+// and checkers (roadmap VF3): the Fides port of
+// scripts/fuzz/fuzz_frontend.py (roadmap AD4). Same arguments, the same
+// mutants for a seed (the numbers are drawn from tools/py_random.fd,
+// Python's own generator, and a mutant is cut and spliced by code point as
+// the script cuts a str), the same output, findings, corpus files,
+// seen.bin and --summary JSON:
+//
+//   fid ccompile tools/fuzz_frontend.fd -o fuzz_frontend.exe
+//   fuzz_frontend.exe --fid <fid> [--cov-fid <instrumented fid>]
+//       [-n 2000] [--seed 1] [--corpus 'tests/bootstrap/*.fd'] [--out build/fuzz-fe]
+//       [--mode check|ir|emit] [--target x86_64-linux|nat|...] [--timeout 30]
+//       [--keep <dir>] [--summary <file>]
+//
+// The script's header says what counts as a finding and how --cov-fid,
+// --keep and --summary work.
+//
+// Differences from the script: --corpus takes wildcards in its last part
+// only (`dir/*.fd`, as every caller writes it); the token pattern's \d and
+// \S, and strip(), know ASCII and the common Unicode spaces, not all of
+// Unicode's tables; the scratch folder in --out is in<pid>_<time> (the
+// script's tempfile.mkdtemp picks a random name), so a compiler message
+// that names the input file names another folder; the compiler gets our
+// stdin (the script closes it: run this tool with stdin at its end, as
+// tests/tools/fuzz_frontend/check.sh does); "seconds" in --summary is
+// whole seconds by the clock (round() of the script's float).
+
+use core;
+use fs;
+use io;
+use process;
+use py_random;
+use fuzz_lib;
+
+fn tokens() -> Vec<str> {
+    val text: str = "fn val var mut const return if else match struct enum impl pub use module while for in loop break continue defer spawn async await comptime unsafe sandbox region as is true false Vec HashMap Option Result Some None Ok Err i8 i16 i32 i64 u8 u16 u32 u64 f64 bool str void self Self cap dyn try guard select parallel txn handle do resume + - * / % = == != < <= > >= << >> & && | || ^ ! ~ ? ?? ?. -> => . .. ..= :: : ; , ( ) { } [ ] @ # |> @wrapping @no-panic @linear @send @secret 0 1 -1 255 9223372036854775807 0xFF 1.5 \"x\" \"\" 'a' r\"raw\" f\"{x}\" x y z _ main println print";
+    val parts: Vec<str> = str_split(text, " ");
+    var out: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < parts.len() {
+        if str_len(parts.get(i)) > 0 { out.push(parts.get(i)); }
+        i = i + 1;
+    }
+    return out;
+}
+
+// ─── Code point text ───
+
+fn is_space(c: i64) -> bool {
+    if (c >= 9 && c <= 13) || (c >= 28 && c <= 32) || c == 133 || c == 160 || c == 5760 { return true; }
+    if (c >= 8192 && c <= 8202) || c == 8232 || c == 8233 || c == 8239 || c == 8287 || c == 12288 { return true; }
+    return false;
+}
+
+fn is_digit(c: i64) -> bool {
+    return (c >= 48 && c <= 57) || (c >= 1632 && c <= 1641) || (c >= 1776 && c <= 1785) || (c >= 65296 && c <= 65305);
+}
+
+fn is_id0(c: i64) -> bool {
+    return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95;
+}
+
+fn is_id(c: i64) -> bool {
+    return is_id0(c) || (c >= 48 && c <= 57);
+}
+
+fn cps_of(s: str) -> Vec<i64> {
+    return fl_cps(s);
+}
+
+fn sub(v: &Vec<i64>, a: i64, b: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = a;
+    while i < b && i < v.len() {
+        out.push(v.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn cat3(a: &Vec<i64>, b: &Vec<i64>, c: &Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < a.len() {
+        out.push(a.get(i));
+        i = i + 1;
+    }
+    i = 0;
+    while i < b.len() {
+        out.push(b.get(i));
+        i = i + 1;
+    }
+    i = 0;
+    while i < c.len() {
+        out.push(c.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn at_ascii(v: &Vec<i64>, i: i64, w: str) -> bool {
+    if i + str_len(w) > v.len() { return false; }
+    var k: i64 = 0;
+    while k < str_len(w) {
+        if v.get(i + k) != str_byte_at(w, k) { return false; }
+        k = k + 1;
+    }
+    return true;
+}
+
+/// The end of a quoted literal opened at i by `q` ("(?:[^"\\]|\\.)*"), or
+/// -1 when it does not close.
+fn quoted_end(v: &Vec<i64>, i: i64, q: i64) -> i64 {
+    var j: i64 = i + 1;
+    while j < v.len() {
+        val c: i64 = v.get(j);
+        if c == q { return j + 1; }
+        if c == 92 {
+            if j + 1 < v.len() && v.get(j + 1) != 10 {
+                j = j + 2;
+                continue;
+            }
+            return -1;
+        }
+        j = j + 1;
+    }
+    return -1;
+}
+
+/// TOK_RE.finditer(src): the tokens' (start, end) pairs.
+fn tok_spans(v: &Vec<i64>) -> Vec<i64> {
+    var ops: Vec<str> = Vec::new();
+    ops.push("..=");
+    ops.push("??");
+    ops.push("?.");
+    ops.push("->");
+    ops.push("=>");
+    ops.push("::");
+    ops.push("|>");
+    ops.push("<<");
+    ops.push(">>");
+    ops.push("<=");
+    ops.push(">=");
+    ops.push("==");
+    ops.push("!=");
+    ops.push("&&");
+    ops.push("||");
+    var out: Vec<i64> = Vec::new();
+    val n: i64 = v.len();
+    var i: i64 = 0;
+    while i < n {
+        val c: i64 = v.get(i);
+        var e: i64 = -1;
+        if c == 34 || c == 39 { e = quoted_end(v, i, c); }
+        if e < 0 && is_id0(c) {
+            e = i + 1;
+            while e < n && is_id(v.get(e)) { e = e + 1; }
+        }
+        if e < 0 && is_digit(c) {
+            e = i + 1;
+            while e < n && is_digit(v.get(e)) { e = e + 1; }
+            if e + 1 < n && v.get(e) == 46 && is_digit(v.get(e + 1)) {
+                e = e + 2;
+                while e < n && is_digit(v.get(e)) { e = e + 1; }
+            }
+        }
+        if e < 0 {
+            var k: i64 = 0;
+            while k < ops.len() && e < 0 {
+                if at_ascii(v, i, ops.get(k)) { e = i + str_len(ops.get(k)); }
+                k = k + 1;
+            }
+        }
+        if e < 0 && !is_space(c) { e = i + 1; }
+        if e < 0 {
+            i = i + 1;
+            continue;
+        }
+        out.push(i);
+        out.push(e);
+        i = e;
+    }
+    return out;
+}
+
+fn split_nl(v: &Vec<i64>) -> Vec<Vec<i64>> {
+    var out: Vec<Vec<i64>> = Vec::new();
+    var cur: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < v.len() {
+        if v.get(i) == 10 {
+            out.push(cur);
+            cur = Vec::new();
+        } else {
+            cur.push(v.get(i));
+        }
+        i = i + 1;
+    }
+    out.push(cur);
+    return out;
+}
+
+fn join_nl(parts: &Vec<Vec<i64>>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < parts.len() {
+        if i > 0 { out.push(10); }
+        val p: Vec<i64> = parts.get(i);
+        var k: i64 = 0;
+        while k < p.len() {
+            out.push(p.get(k));
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn repeat_cps(s: str, d: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < d {
+        var k: i64 = 0;
+        while k < str_len(s) {
+            out.push(str_byte_at(s, k));
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn mutate(r: &mut PyRng, src0: &Vec<i64>, corpus: &Vec<Vec<i64>>, toks_words: &Vec<str>) -> Vec<i64> {
+    var src: Vec<i64> = sub(src0, 0, src0.len());
+    val k: i64 = py_randint(r, 0, 9);
+    if k <= 3 {
+        var toks: Vec<i64> = tok_spans(&src);
+        if toks.len() == 0 { return src; }
+        val times: i64 = py_randint(r, 1, 4);
+        var t: i64 = 0;
+        while t < times {
+            t = t + 1;
+            val pick: i64 = py_below(r, toks.len() / 2);
+            val s: i64 = toks.get(2 * pick);
+            val e: i64 = toks.get(2 * pick + 1);
+            val op: i64 = py_randint(r, 0, 2);
+            if op == 0 {
+                src = cat3(&sub(&src, 0, s), &Vec::new(), &sub(&src, e, src.len()));
+            } else if op == 1 {
+                val w: Vec<i64> = cps_of(toks_words.get(py_below(r, toks_words.len())));
+                src = cat3(&sub(&src, 0, s), &w, &sub(&src, e, src.len()));
+            } else {
+                var w2: Vec<i64> = Vec::new();
+                w2.push(32);
+                val tw: Vec<i64> = cps_of(toks_words.get(py_below(r, toks_words.len())));
+                var q: i64 = 0;
+                while q < tw.len() {
+                    w2.push(tw.get(q));
+                    q = q + 1;
+                }
+                src = cat3(&sub(&src, 0, e), &w2, &sub(&src, e, src.len()));
+            }
+            toks = tok_spans(&src);
+            if toks.len() == 0 { break; }
+        }
+        return src;
+    }
+    if k <= 5 {
+        val n: i64 = src.len();
+        if n < 2 { return src; }
+        val a: i64 = py_below(r, n);
+        var b: i64 = a + py_randint(r, 1, 64);
+        if b > n { b = n; }
+        if py_random(r) < 0.5 {
+            return cat3(&sub(&src, 0, a), &Vec::new(), &sub(&src, b, n));
+        }
+        return cat3(&sub(&src, 0, b), &sub(&src, a, b), &sub(&src, b, n));
+    }
+    if k == 6 {
+        val other: Vec<i64> = corpus.get(py_below(r, corpus.len()));
+        val ol: Vec<Vec<i64>> = split_nl(&other);
+        val sl: Vec<Vec<i64>> = split_nl(&src);
+        val i: i64 = py_below(r, sl.len() + 1);
+        val j: i64 = py_below(r, ol.len());
+        val m: i64 = py_randint(r, 1, 8);
+        var parts: Vec<Vec<i64>> = Vec::new();
+        var x: i64 = 0;
+        while x < i {
+            parts.push(sl.get(x));
+            x = x + 1;
+        }
+        x = j;
+        while x < j + m && x < ol.len() {
+            parts.push(ol.get(x));
+            x = x + 1;
+        }
+        x = i;
+        while x < sl.len() {
+            parts.push(sl.get(x));
+            x = x + 1;
+        }
+        return join_nl(&parts);
+    }
+    if k == 7 {
+        return sub(&src, 0, py_below(r, src.len() + 1));
+    }
+    if k == 8 {
+        // deep nesting: parsers that recurse must report, not overflow
+        val ds: i64 = py_below(r, 3);
+        var d: i64 = 50;
+        if ds == 1 { d = 500; }
+        if ds == 2 { d = 5000; }
+        val pk: i64 = py_below(r, 5);
+        var open: Vec<i64> = Vec::new();
+        var close: Vec<i64> = Vec::new();
+        if pk == 0 {
+            open = repeat_cps("(", d);
+            close = repeat_cps(")", d);
+        } else if pk == 1 {
+            open = repeat_cps("{", d);
+            close = repeat_cps("}", d);
+        } else if pk == 2 {
+            open = repeat_cps("[", d);
+            close = repeat_cps("]", d);
+        } else if pk == 3 {
+            open = repeat_cps("-", d);
+        } else {
+            open = repeat_cps("!", d);
+        }
+        val i2: i64 = py_below(r, src.len() + 1);
+        open.push(49);
+        val mid: Vec<i64> = cat3(&open, &close, &Vec::new());
+        return cat3(&sub(&src, 0, i2), &mid, &sub(&src, i2, src.len()));
+    }
+    val n2: i64 = src.len();
+    val i3: i64 = py_below(r, n2 + 1);
+    var chars: Vec<i64> = Vec::new();
+    chars.push(0);
+    chars.push(1);
+    chars.push(9);
+    chars.push(10);
+    chars.push(13);
+    chars.push(34);
+    chars.push(39);
+    chars.push(92);
+    chars.push(123);
+    chars.push(125);
+    chars.push(127);
+    chars.push(233);
+    chars.push(8232);
+    var one: Vec<i64> = Vec::new();
+    one.push(chars.get(py_below(r, chars.len())));
+    return cat3(&sub(&src, 0, i3), &one, &sub(&src, i3, n2));
+}
+
+fn crash_marks() -> Vec<str> {
+    var v: Vec<str> = Vec::new();
+    v.push("=== CRASH");
+    v.push("Access violation");
+    v.push("Stack overflow: the recursion");
+    v.push("Panic:");
+    v.push("Segmentation fault");
+    v.push("p_malloc: OOM");
+    return v;
+}
+
+/// m.strip("= :")
+fn strip_marks(m: str) -> str {
+    var a: i64 = 0;
+    var b: i64 = str_len(m);
+    while a < b && (str_byte_at(m, a) == 61 || str_byte_at(m, a) == 32 || str_byte_at(m, a) == 58) { a = a + 1; }
+    while b > a && (str_byte_at(m, b - 1) == 61 || str_byte_at(m, b - 1) == 32 || str_byte_at(m, b - 1) == 58) { b = b - 1; }
+    return str_slice(m, a, b);
+}
+
+/// "" for no finding.
+fn classify(timed_out: bool, rc: i64, out: str) -> str {
+    if timed_out { return "hang"; }
+    if rc < 0 || rc > 255 {
+        if rc > 0 { return "abnormal exit " + fl_hex0x(rc); }
+        return "signal " + int_to_str(rc);
+    }
+    val ms: Vec<str> = crash_marks();
+    var i: i64 = 0;
+    while i < ms.len() {
+        if str_contains(out, ms.get(i)) { return strip_marks(ms.get(i)); }
+        i = i + 1;
+    }
+    return "";
+}
+
+pub struct RunR {
+    pub timed_out: bool,
+    pub rc: i64,
+    pub out: str,
+}
+
+fn run(cmd: &Vec<str>, secs: i64, env: &Vec<str>) -> RunR {
+    val p: FlRun = fl_run_env(cmd, env, "", secs);
+    if p.timed_out { return RunR { timed_out: true, rc: 0, out: "" }; }
+    return RunR { timed_out: false, rc: p.code, out: fl_decode_str(p.out + p.err) };
+}
+
+fn rc_text(r: &RunR) -> str {
+    if r.timed_out { return "timeout"; }
+    return int_to_str(r.rc);
+}
+
+fn mode_cmd(fid: str, mode: str, path: str, target: str, tmp: str) -> Vec<str> {
+    if mode != "emit" { return fl_v3(fid, mode, path); }
+    var cmd: Vec<str> = fl_v3(fid, "emit", path);
+    if target == "nat" {
+        cmd.push("--nat");
+    } else if str_len(target) > 0 {
+        cmd.push("--target");
+        cmd.push(target);
+    }
+    cmd.push("-o");
+    cmd.push(fl_join(tmp, "out.exe"));
+    return cmd;
+}
+
+/// The trace's function names (the script's re.findall over the output).
+fn trace_names(out: str) -> Vec<str> {
+    val v: Vec<i64> = fl_cps(out);
+    val n: i64 = v.len();
+    var names: Vec<str> = Vec::new();
+    var p: i64 = 0;
+    while p < n {
+        var after: i64 = -1;
+        if v.get(p) == 8594 {
+            after = p + 1;
+        } else if v.get(p) == 8627 && at_ascii(&v, p + 1, " called from") {
+            after = p + 13;
+        } else if v.get(p) == 45 && at_ascii(&v, p + 1, "| called from") {
+            after = p + 14;
+        }
+        var got: i64 = -1;
+        if after >= 0 { got = name_after(&v, after, &mut names); }
+        if got < 0 && (p == 0 || v.get(p - 1) == 10) && (v.get(p) == 32 || v.get(p) == 9) {
+            var q: i64 = p;
+            while q < n && (v.get(q) == 32 || v.get(q) == 9) { q = q + 1; }
+            if q < n && v.get(q) == 45 { got = name_after(&v, q + 1, &mut names); }
+        }
+        if got >= 0 {
+            p = got;
+        } else {
+            p = p + 1;
+        }
+    }
+    return names;
+}
+
+/// [ \t]+ then an identifier at i: pushes it and gives the end, or -1.
+fn name_after(v: &Vec<i64>, i: i64, names: &mut Vec<str>) -> i64 {
+    var j: i64 = i;
+    while j < v.len() && (v.get(j) == 32 || v.get(j) == 9) { j = j + 1; }
+    if j == i || j >= v.len() || !is_id0(v.get(j)) { return -1; }
+    var e: i64 = j + 1;
+    while e < v.len() && is_id(v.get(e)) { e = e + 1; }
+    names.push(fl_encode(v, j, e));
+    return e;
+}
+
+fn popcount(b: &Vec<i64>) -> i64 {
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while i < b.len() {
+        var x: i64 = b.get(i);
+        while x > 0 {
+            n = n + (x & 1);
+            x = x >> 1;
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+/// fnmatch: `*`, `?` and `[...]` / `[!...]` (byte-wise).
+fn fnmatch(s: str, i: i64, p: str, j: i64) -> bool {
+    if j >= str_len(p) { return i >= str_len(s); }
+    val c: i64 = str_byte_at(p, j);
+    if c == 42 {
+        var k: i64 = i;
+        while k <= str_len(s) {
+            if fnmatch(s, k, p, j + 1) { return true; }
+            k = k + 1;
+        }
+        return false;
+    }
+    if i >= str_len(s) { return false; }
+    val x: i64 = str_byte_at(s, i);
+    if c == 63 { return fnmatch(s, i + 1, p, j + 1); }
+    if c == 91 {
+        var q: i64 = j + 1;
+        var neg: bool = false;
+        if q < str_len(p) && str_byte_at(p, q) == 33 {
+            neg = true;
+            q = q + 1;
+        }
+        var hit: bool = false;
+        var first: bool = true;
+        while q < str_len(p) && (first || str_byte_at(p, q) != 93) {
+            first = false;
+            val lo: i64 = str_byte_at(p, q);
+            if q + 2 < str_len(p) && str_byte_at(p, q + 1) == 45 && str_byte_at(p, q + 2) != 93 {
+                if x >= lo && x <= str_byte_at(p, q + 2) { hit = true; }
+                q = q + 3;
+            } else {
+                if x == lo { hit = true; }
+                q = q + 1;
+            }
+        }
+        if q >= str_len(p) {
+            // no closing ]: a plain [
+            return x == 91 && fnmatch(s, i + 1, p, j + 1);
+        }
+        if hit == neg { return false; }
+        return fnmatch(s, i + 1, p, q + 1);
+    }
+    if x != c { return false; }
+    return fnmatch(s, i + 1, p, j + 1);
+}
+
+/// Files matching `pattern` (wildcards in its last part), sorted.
+fn glob_files(pattern: str) -> Vec<str> {
+    var cut: i64 = -1;
+    var i: i64 = 0;
+    while i < str_len(pattern) {
+        val c: i64 = str_byte_at(pattern, i);
+        if c == 47 || (fl_win() && c == 92) { cut = i; }
+        i = i + 1;
+    }
+    var dir: str = ".";
+    var pat: str = pattern;
+    var prefix: str = "";
+    if cut >= 0 {
+        dir = str_slice(pattern, 0, cut);
+        if cut == 0 { dir = "/"; }
+        pat = str_slice(pattern, cut + 1, str_len(pattern));
+        prefix = str_slice(pattern, 0, cut + 1);
+    }
+    var out: Vec<str> = Vec::new();
+    if !fs_is_dir(dir) { return out; }
+    var names: Vec<str> = fs_list_dir(dir);
+    fl_sort(&mut names);
+    var k: i64 = 0;
+    while k < names.len() {
+        val nm: str = names.get(k);
+        k = k + 1;
+        if str_starts_with(nm, ".") && !str_starts_with(pat, ".") { continue; }
+        var a: str = nm;
+        var b: str = pat;
+        if fl_win() {
+            a = str_to_lower(nm);
+            b = str_to_lower(pat);
+        }
+        if fnmatch(a, 0, b, 0) {
+            if cut >= 0 {
+                if fl_win() { out.push(prefix + nm); } else { out.push(prefix + nm); }
+            } else {
+                out.push(nm);
+            }
+        }
+    }
+    return out;
+}
+
+/// A text file as open(p, encoding="utf-8", errors=...).read() gives it.
+fn read_text(p: str) -> Vec<i64> {
+    return fl_cps(fl_text(fl_decode_str(fl_read(p))));
+}
+
+fn write_cps(p: str, v: &Vec<i64>) {
+    fl_write(p, fl_encode_all(v));
+}
+
+/// json.dumps of a str (ensure_ascii).
+fn json_str(s: str) -> str {
+    val v: Vec<i64> = fl_cps(s);
+    var b: StringBuilder = StringBuilder::new();
+    b.append_str("\"");
+    var i: i64 = 0;
+    while i < v.len() {
+        val c: i64 = v.get(i);
+        i = i + 1;
+        if c == 34 { b.append_str("\\\""); continue; }
+        if c == 92 { b.append_str("\\\\"); continue; }
+        if c == 10 { b.append_str("\\n"); continue; }
+        if c == 13 { b.append_str("\\r"); continue; }
+        if c == 9 { b.append_str("\\t"); continue; }
+        if c == 8 { b.append_str("\\b"); continue; }
+        if c == 12 { b.append_str("\\f"); continue; }
+        if c < 32 || c > 126 {
+            if c >= 65536 {
+                val u: i64 = c - 65536;
+                b.append_str("\\u" + fl_hex(55296 + (u >> 10), 4) + "\\u" + fl_hex(56320 + (u & 1023), 4));
+            } else {
+                b.append_str("\\u" + fl_hex(c, 4));
+            }
+            continue;
+        }
+        b.append_str(char_to_str(c));
+    }
+    b.append_str("\"");
+    return b.to_str();
+}
+
+fn json_list(v: &Vec<str>) -> str {
+    if v.len() == 0 { return "[]"; }
+    var s: str = "[\n";
+    var i: i64 = 0;
+    while i < v.len() {
+        s = s + "  " + json_str(v.get(i));
+        if i + 1 < v.len() { s = s + ","; }
+        s = s + "\n";
+        i = i + 1;
+    }
+    return s + " ]";
+}
+
+fn py_bool_json(b: bool) -> str {
+    if b { return "true"; }
+    return "false";
+}
+
+fn int_opt(av: &Vec<str>, name: str, def: i64) -> i64 {
+    val s: str = fl_opt(av, name, int_to_str(def));
+    val v: i64 = fl_int(s, -987654321);
+    if v == -987654321 {
+        io_eprintln("fuzz_frontend: argument " + name + ": invalid int value: '" + s + "'");
+        process_exit(2);
+    }
+    return v;
+}
+
+fn main() -> i64 {
+    val av: Vec<str> = fl_args();
+    val fid: str = fl_opt(&av, "--fid", "");
+    if str_len(fid) == 0 {
+        io_eprintln("usage: fuzz_frontend.py [-h] --fid FID [--cov-fid COV_FID] [-n N] [--seed SEED] [--corpus CORPUS] [--out OUT] [--mode MODE] [--target TARGET] [--timeout TIMEOUT] [--keep KEEP] [--summary SUMMARY]");
+        io_eprintln("fuzz_frontend.py: error: the following arguments are required: --fid");
+        return 2;
+    }
+    val cov_fid: str = fl_opt(&av, "--cov-fid", "");
+    val n: i64 = int_opt(&av, "-n", 500);
+    val seed: i64 = int_opt(&av, "--seed", 1);
+    val corpus_pat: str = fl_opt(&av, "--corpus", "tests/bootstrap/*.fd");
+    val out_dir: str = fl_opt(&av, "--out", fl_join("build", "fuzz-fe"));
+    val mode: str = fl_opt(&av, "--mode", "check");
+    val target: str = fl_opt(&av, "--target", "");
+    val timeout: i64 = int_opt(&av, "--timeout", 30);
+    val keep: str = fl_opt(&av, "--keep", "");
+    val summary: str = fl_opt(&av, "--summary", "");
+    fl_mkdirs(out_dir);
+    val started: i64 = p_clock_now_ms();
+    var r: PyRng = py_rng(seed);
+    val words: Vec<str> = tokens();
+    val files: Vec<str> = glob_files(corpus_pat);
+    var corpus: Vec<Vec<i64>> = Vec::new();
+    var fi: i64 = 0;
+    while fi < files.len() {
+        val t: Vec<i64> = read_text(files.get(fi));
+        if t.len() < 20000 { corpus.push(t); }
+        fi = fi + 1;
+    }
+    val seeds: i64 = corpus.len();
+    val tmp: str = fl_join(out_dir, "in" + int_to_str(p_getpid()) + "_" + int_to_str(p_clock_now_us()));
+    fl_mkdirs(tmp);
+    var have_seen: bool = false;
+    var seen: Vec<i64> = Vec::new();
+    val covfile: str = fl_join(tmp, "cov.bin");
+    // findings: keys in the order found, and each one's number (-1: known)
+    var fkeys: Vec<str> = Vec::new();
+    var fnums: Vec<i64> = Vec::new();
+    var grown: i64 = 0;
+    var kept: i64 = 0;
+    var seen_path: str = "";
+    if str_len(keep) > 0 {
+        fl_mkdirs(keep);
+        val kfiles: Vec<str> = glob_files(fl_join(keep, "corpus-*.fd"));
+        var ki: i64 = 0;
+        while ki < kfiles.len() {
+            corpus.push(read_text(kfiles.get(ki)));
+            kept = kept + 1;
+            ki = ki + 1;
+        }
+        seen_path = fl_join(keep, "seen.bin");
+        if fl_exists(seen_path) {
+            seen = fs_read_bytes(seen_path);
+            have_seen = true;
+        }
+    }
+    var blocks_at_start: i64 = 0;
+    if have_seen { blocks_at_start = popcount(&seen); }
+    val ftab: str = fl_join(out_dir, "findings.tsv");
+    var old_keys: Vec<str> = Vec::new();
+    if fl_exists(ftab) {
+        val ls: Vec<str> = fl_lines(fl_text(fl_decode_str(fl_read(ftab))));
+        var li: i64 = 0;
+        while li < ls.len() {
+            // the last piece after the final "\n" is no line
+            if li + 1 < ls.len() || str_len(ls.get(li)) > 0 {
+                val l: str = ls.get(li);
+                val tab: i64 = str_find(l, "\t");
+                if tab >= 0 { old_keys.push(str_slice(l, 0, tab)); } else { old_keys.push(l); }
+            }
+            li = li + 1;
+        }
+    }
+    var next_crash: i64 = glob_files(fl_join(out_dir, "crash-*.fd")).len();
+    var hangs: i64 = 0;
+    var unconfirmed: i64 = 0;
+    val marks: Vec<str> = crash_marks();
+    val no_env: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        val base: Vec<i64> = corpus.get(py_below(&mut r, corpus.len()));
+        var src: Vec<i64> = mutate(&mut r, &base, &corpus, &words);
+        if py_random(&mut r) < 0.3 {
+            src = mutate(&mut r, &src, &corpus, &words);
+        }
+        val path: str = fl_join(tmp, "input.fd");
+        write_cps(path, &src);
+        val cmd: Vec<str> = mode_cmd(fid, mode, path, target, tmp);
+        val res: RunR = run(&cmd, timeout, &no_env);
+        var kind: str = classify(res.timed_out, res.rc, res.out);
+        if str_len(kind) > 0 {
+            // a finding must happen again (an OOM can be the machine's)
+            val res2: RunR = run(&cmd, timeout, &no_env);
+            if str_len(classify(res2.timed_out, res2.rc, res2.out)) == 0 {
+                fl_print("[" + int_to_str(i) + "] not reproducible (" + kind + "), dropped");
+                unconfirmed = unconfirmed + 1;
+                kind = "";
+            }
+        }
+        if kind == "hang" { hangs = hangs + 1; }
+        if str_len(kind) > 0 {
+            // the first line that names the problem is the key
+            var line: str = "";
+            val ols: Vec<str> = fl_lines(res.out);
+            var oi: i64 = 0;
+            var found: bool = false;
+            while oi < ols.len() && !found {
+                var mi: i64 = 0;
+                while mi < marks.len() {
+                    if str_contains(ols.get(oi), marks.get(mi)) { found = true; }
+                    mi = mi + 1;
+                }
+                if found { line = ols.get(oi); }
+                oi = oi + 1;
+            }
+            var key: str = kind + ":" + fl_head_cps(line, 80);
+            if !str_contains(key, "Stack overflow") {
+                val tr: Vec<str> = trace_names(res.out);
+                var t3: Vec<str> = Vec::new();
+                var ti: i64 = 0;
+                while ti < tr.len() && ti < 3 {
+                    t3.push(tr.get(ti));
+                    ti = ti + 1;
+                }
+                key = key + ":" + fl_join_lines(&t3, "/");
+            }
+            key = str_replace(str_replace(key, "\t", " "), "\r", "");
+            if fl_contains(&old_keys, key) && !fl_contains(&fkeys, key) {
+                fkeys.push(key);
+                fnums.push(-1);
+                fl_print("[" + int_to_str(i) + "] known finding: " + key);
+            }
+            if !fl_contains(&fkeys, key) {
+                val num: i64 = next_crash;
+                next_crash = next_crash + 1;
+                fkeys.push(key);
+                fnums.push(num);
+                var tgt: str = "";
+                if str_len(target) > 0 { tgt = ":" + target; }
+                fl_append_textmode(ftab, key + "\tcrash-" + int_to_str(num) + ".fd\t" + mode + tgt + "\tseed " + int_to_str(seed) + " input " + int_to_str(i) + "\n");
+                write_cps(fl_join(out_dir, "crash-" + int_to_str(num) + ".fd"), &src);
+                fl_write_textmode(fl_join(out_dir, "crash-" + int_to_str(num) + ".out"), "exit: " + rc_text(&res) + "\nkind: " + kind + "\n" + fl_tail_cps(res.out, 6000));
+                fl_print("[" + int_to_str(i) + "] new finding " + int_to_str(num) + ": " + key);
+            }
+        }
+        if str_len(cov_fid) > 0 && str_len(kind) == 0 {
+            var env: Vec<str> = Vec::new();
+            env.push("FID_COV_OUT=" + covfile);
+            fl_remove(covfile);
+            val _cr: RunR = run(&mode_cmd(cov_fid, mode, path, target, tmp), timeout, &env);
+            if fl_exists(covfile) {
+                val bits: Vec<i64> = fs_read_bytes(covfile);
+                if have_seen && seen.len() != bits.len() {
+                    fl_print("[" + int_to_str(i) + "] seen.bin has " + int_to_str(seen.len()) + " bytes, the compiler " + int_to_str(bits.len()) + ": reset");
+                    have_seen = false;
+                    blocks_at_start = 0;
+                }
+                if !have_seen {
+                    seen = Vec::new();
+                    var z: i64 = 0;
+                    while z < bits.len() {
+                        seen.push(0);
+                        z = z + 1;
+                    }
+                    have_seen = true;
+                }
+                var newb: i64 = 0;
+                var bi: i64 = 0;
+                while bi < bits.len() && bi < seen.len() {
+                    var x: i64 = bits.get(bi) & (255 - seen.get(bi));
+                    while x > 0 {
+                        newb = newb + (x & 1);
+                        x = x >> 1;
+                    }
+                    bi = bi + 1;
+                }
+                if newb > 0 {
+                    bi = 0;
+                    while bi < bits.len() {
+                        seen.set(bi, seen.get(bi) | bits.get(bi));
+                        bi = bi + 1;
+                    }
+                    // the first input of a fresh run only sets the baseline
+                    if i > 0 || blocks_at_start > 0 {
+                        corpus.push(sub(&src, 0, src.len()));
+                        grown = grown + 1;
+                        var name: str = "corpus-" + int_to_str(grown) + ".fd";
+                        var where_: str = out_dir;
+                        if str_len(keep) > 0 {
+                            name = "corpus-" + mode + target + "-s" + int_to_str(seed) + "-" + int_to_str(i) + ".fd";
+                            where_ = keep;
+                        }
+                        write_cps(fl_join(where_, name), &src);
+                    }
+                }
+            }
+        }
+        if (i + 1) % 50 == 0 {
+            var cov: i64 = 0;
+            if have_seen { cov = popcount(&seen); }
+            if str_len(seen_path) > 0 && have_seen { fs_write_bytes(seen_path, seen); }
+            fl_print("[" + int_to_str(i + 1) + "/" + int_to_str(n) + "] findings " + int_to_str(fkeys.len()) + ", corpus " + int_to_str(seeds) + "+" + int_to_str(kept) + "+" + int_to_str(grown) + ", blocks reached " + int_to_str(cov));
+        }
+        i = i + 1;
+    }
+    if str_len(seen_path) > 0 && have_seen { fs_write_bytes(seen_path, seen); }
+    fl_remove(covfile);
+    fl_remove(fl_join(tmp, "input.fd"));
+    fl_remove(fl_join(tmp, "out.exe"));
+    fs_rmdir_all(tmp);
+    var cov2: i64 = 0;
+    if have_seen { cov2 = popcount(&seen); }
+    var new_f: Vec<str> = Vec::new();
+    var known_f: Vec<str> = Vec::new();
+    var q: i64 = 0;
+    while q < fkeys.len() {
+        if fnums.get(q) >= 0 { new_f.push(fkeys.get(q)); } else { known_f.push(fkeys.get(q)); }
+        q = q + 1;
+    }
+    fl_sort(&mut new_f);
+    fl_sort(&mut known_f);
+    fl_print(int_to_str(n) + " inputs: " + int_to_str(fkeys.len()) + " distinct findings (" + int_to_str(new_f.len()) + " new), corpus " + int_to_str(seeds) + "+" + int_to_str(kept) + "+" + int_to_str(grown) + ", blocks reached " + int_to_str(cov2));
+    if str_len(summary) > 0 {
+        val secs: i64 = (p_clock_now_ms() - started + 500) / 1000;
+        var js: str = "{\n";
+        js = js + " \"mode\": " + json_str(mode) + ",\n";
+        js = js + " \"target\": " + json_str(target) + ",\n";
+        js = js + " \"seed\": " + int_to_str(seed) + ",\n";
+        js = js + " \"inputs\": " + int_to_str(n) + ",\n";
+        js = js + " \"coverage\": " + py_bool_json(str_len(cov_fid) > 0) + ",\n";
+        js = js + " \"seconds\": " + int_to_str(secs) + ",\n";
+        js = js + " \"findings\": " + int_to_str(fkeys.len()) + ",\n";
+        js = js + " \"new_findings\": " + json_list(&new_f) + ",\n";
+        js = js + " \"known_findings\": " + json_list(&known_f) + ",\n";
+        js = js + " \"hangs\": " + int_to_str(hangs) + ",\n";
+        js = js + " \"unconfirmed\": " + int_to_str(unconfirmed) + ",\n";
+        js = js + " \"corpus_seeds\": " + int_to_str(seeds) + ",\n";
+        js = js + " \"corpus_kept\": " + int_to_str(kept) + ",\n";
+        js = js + " \"corpus_grown\": " + int_to_str(grown) + ",\n";
+        js = js + " \"blocks_at_start\": " + int_to_str(blocks_at_start) + ",\n";
+        js = js + " \"blocks_reached\": " + int_to_str(cov2) + "\n";
+        js = js + "}";
+        fl_write_textmode(summary, js);
+    }
+    if fkeys.len() > 0 { return 1; }
+    return 0;
+}

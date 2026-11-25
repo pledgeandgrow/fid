@@ -1888,6 +1888,31 @@ pub fn Interpreter_value_to_string(self: &Interpreter, v: Value) -> str {
 /// RT2: the first `n` bytes at a (pointer) value, zero bytes included: a
 /// string's bytes (at most its length), or `n` bytes of interpreted memory
 /// at an address. Fewer than `n` when the value holds fewer.
+/// BG81: does `s` hold a zero byte within its counted length?
+fn interp_has_nul(s: str) -> bool {
+    var n: i64 = str_len(s);
+    var i: i64 = 0;
+    while i < n {
+        if (str_byte_at(s, i) & 255) == 0 {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// BG81: the bytes of `s`, its whole counted length (p_file_write_vec).
+fn interp_str_byte_vec(s: str) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var n: i64 = str_len(s);
+    var i: i64 = 0;
+    while i < n {
+        out.push(str_byte_at(s, i) & 255);
+        i = i + 1;
+    }
+    return out;
+}
+
 pub fn Interpreter_value_bytes(self: &Interpreter, v: Value, n: i64) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     var addr: i64 = 0;
@@ -8275,12 +8300,37 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: &mut Ve
             return ExecOutcome::Value(Value::Str(fread));
         }
         if name == "p_file_write" {
+            // BG81: the string's full counted length, zero bytes included,
+            // as the C runtime writes it. The host's own p_file_write may
+            // stop at the first zero (a stage 0's runtime): a string with
+            // one goes through p_file_write_vec, which every stage has.
+            if interp_has_nul(farg) {
+                return ExecOutcome::Value(Value::Int(p_file_write_vec(fpath, interp_str_byte_vec(farg))));
+            }
             return ExecOutcome::Value(Value::Int(p_file_write(fpath, farg)));
         }
         if name == "p_file_exists" {
             return ExecOutcome::Value(Value::Bool(p_file_exists(fpath) != 0));
         }
         if name == "p_file_append" {
+            // BG81: every byte, as p_file_write (a string with a zero byte:
+            // the file's bytes and these written back, as p_file_append_vec)
+            if interp_has_nul(farg) {
+                if p_is_dir(fpath) != 0 {
+                    return ExecOutcome::Value(Value::Int(0 - 1));
+                }
+                var app_before: Vec<i64> = Vec::new();
+                if p_file_exists(fpath) != 0 {
+                    app_before = p_file_read_bytes(fpath);
+                }
+                var app_add: Vec<i64> = interp_str_byte_vec(farg);
+                var app_i: i64 = 0;
+                while app_i < app_add.len() {
+                    app_before.push(app_add.get(app_i));
+                    app_i = app_i + 1;
+                }
+                return ExecOutcome::Value(Value::Int(p_file_write_vec(fpath, app_before)));
+            }
             return ExecOutcome::Value(Value::Int(p_file_append(fpath, farg)));
         }
         if name == "p_file_delete" {

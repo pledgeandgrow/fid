@@ -1,0 +1,786 @@
+// tools/cross_test.fd — run the test suite on another target: the Fides
+// port of scripts/cross-test.sh (roadmap AD4). Same arguments, the same
+// environment variables (FID, JOBS, OUT, NATIVE, BUILD_ONLY, COMPARE_ONLY,
+// REUSE, LANE_SKIPS, HOST_ARCH, WSL_DISTRO, WINE, QEMU_LD_PREFIX, CC), the
+// same files in $OUT (<test>.expected, .expected_err, .expected_rc,
+// .build.log, .build_rc, .actual, .stderr, .actual_rc, run-all.sh,
+// results.txt) and the same output and exit status:
+//
+//   fid ccompile tools/cross_test.fd -o cross_test.exe
+//   cross_test.exe <target> [test.fd ...]
+//   fid run tools/cross_test.fd <target> [test.fd ...]
+//
+// Run it from the repository root (the script changes to it itself).
+// Each test's reference is `fid run` (120 s), its build `fid ccompile
+// --target <target> --cc-opt 0 --no-cache` (or with NATIVE=1 `fid emit`,
+// 600 s), JOBS builds at a time after the first one alone; the binaries
+// run 60 s each, through qemu-user, Node (wasm32-wasi), wine (Windows
+// targets on Linux/macOS) or directly, and the outputs, exit codes and
+// panic messages are compared (see the script's header for the rules:
+// lane skips, `// Expected output:` blocks, dynamic loaders under qemu).
+// External programs stay external: zig cc (through fid), qemu, Node,
+// wine, WSL, and scripts/bin-target-check.py (Python) for the loaders.
+//
+// Differences: the port writes the same run-all.sh, but runs its commands
+// itself (one at a time, as bash would) unless the binaries are Linux
+// ones on a Windows host, where `wsl bash run-all.sh` runs it as before;
+// every child's stdin is at its end (the script gives /dev/null only to
+// the runs); bash's own messages about a crashed child ("Segmentation
+// fault") are not printed; $ROOT is $PWD (Git Bash's form on Windows).
+
+use core;
+use fs;
+use io;
+use process;
+use target_test_lib;
+
+fn ct_usage() {
+    println("# cross-test.sh — run the test suite on another target through the C backend");
+    println("# (release F5, F8): every test is built with `fid ccompile --target <target>`");
+    println("# (zig cc cross-compiles from any host) and its output compared with the");
+    println("# interpreter's (`fid run`), the reference.");
+    println("#");
+    println("# Usage:");
+    println("#   scripts/cross-test.sh <target> [test.fd ...]");
+    println("#     target: aarch64-linux | riscv64-linux | x86_64-linux   (built and run)");
+    println("#             x86_64-macos | aarch64-macos                    (built only here;");
+    println("#             run them on a Mac with scripts/cross-run.sh)");
+    println("#             wasm32-wasi                                     (run with Node,");
+    println("#             scripts/wasm-run.mjs)");
+    println("#             aarch64-windows | x86_64-freebsd                (tier 2, PL3:");
+    println("#             built here; run on Windows ARM64 / FreeBSD)");
+    println("#             x86_64-windows | x86_64-windows-pe              (on Windows; TL6:");
+    println("#             from Linux/macOS too, run under wine when installed)");
+    println("#   A target this host cannot run is built only: its results say \"BUILT\"");
+    println("#   for each test that built (BUILD_ONLY=1 forces that on any target).");
+    println("#   FID=<path to fid>   default release/fid.exe (release/fid on Linux)");
+    println("#   JOBS=<n>            parallel builds, default 8");
+    println("#   OUT=<dir>           default build/cross/<target> (-native with NATIVE=1)");
+}
+
+/// The compiler-run reference, the build, both status files.
+struct CtConf {
+    fid: str,
+    target: str,
+    out: str,
+    ext: str,
+    host: str,
+    tos: str,
+    tarch: str,
+    harch: str,
+    native: bool,
+}
+
+fn ct_has_c_import(path: str) -> bool {
+    val lines: Vec<str> = tt_lines(tt_no_cr(tt_read(path)));
+    var i: i64 = 0;
+    while i < lines.len() {
+        val l: str = lines.get(i);
+        i = i + 1;
+        var k: i64 = 0;
+        while k < str_len(l) && (str_byte_at(l, k) == 32 || str_byte_at(l, k) == 9 || str_byte_at(l, k) == 11 || str_byte_at(l, k) == 12 || str_byte_at(l, k) == 13) { k = k + 1; }
+        if str_starts_with(str_slice(l, k, str_len(l)), "use compiler::") { return true; }
+    }
+    return false;
+}
+
+/// skip_re of the script: the tests that need external libraries, hardware
+/// or a bare machine.
+fn ct_skip_re(base: str) -> bool {
+    if !str_ends_with(base, ".fd") { return false; }
+    val s: str = str_slice(base, 0, str_len(base) - 3);
+    if str_starts_with(s, "test_bare") || str_starts_with(s, "test_pe_") || str_starts_with(s, "test_dll_") { return true; }
+    val names: Vec<str> = str_split("test_comptime_basic test_comptime_func test_comptime_reflect test_comptime_serialize test_comptime_gen test_http test_json test_tensor test_autodiff test_kv_cache test_quantization test_checkpoint test_shard test_lora test_simd test_shape test_shape_verify test_wasm test_allocator test_effect_handler test_asm test_asm_pe test_boot test_interrupt test_mmu test_gat test_ffi_header test_dlopen test_game_stdlib test_kernel_serial test_serial_hello test_os_gaps test_phase8b test_vec_math test_sqlite test_parse_header_sqlite test_lib_sdl test_lib_gl test_lib_font test_lib_image test_lib_audio test_lib_audio_mixer test_lib_shader test_lib_mesh test_elf_native", " ");
+    var i: i64 = 0;
+    while i < names.len() {
+        if names.get(i) == s { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// The default list: tests/bootstrap/*.fd as the script selects them.
+fn ct_default_tests() -> Vec<str> {
+    val files: Vec<str> = tt_glob("tests/bootstrap", "", ".fd");
+    var out: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < files.len() {
+        val f: str = files.get(i);
+        i = i + 1;
+        val b: str = str_slice(f, 16, str_len(f));
+        if str_starts_with(b, "test_panic_") && str_ends_with(b, "_fail.fd") && str_len(b) >= 19 {
+            out.push(f);
+            continue;
+        }
+        if str_ends_with(b, "_fail.fd") || str_ends_with(b, "_fail2.fd") { continue; }
+        if ct_skip_re(b) { continue; }
+        if tt_head3_has(f, "expect-error") { continue; }
+        out.push(f);
+    }
+    return out;
+}
+
+/// `read -r a b c` of one line: the first two words and the rest, blanks
+/// around them dropped.
+fn ct_read3(line: str) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    val n: i64 = str_len(line);
+    var w: i64 = 0;
+    while w < 2 {
+        while i < n && (str_byte_at(line, i) == 32 || str_byte_at(line, i) == 9) { i = i + 1; }
+        var j: i64 = i;
+        while j < n && str_byte_at(line, j) != 32 && str_byte_at(line, j) != 9 { j = j + 1; }
+        out.push(str_slice(line, i, j));
+        i = j;
+        w = w + 1;
+    }
+    while i < n && (str_byte_at(line, i) == 32 || str_byte_at(line, i) == 9) { i = i + 1; }
+    out.push(tt_trim_blanks(str_slice(line, i, n)));
+    return out;
+}
+
+/// The test a "<test>|<why>" list names, or "" (and why in `why`).
+fn ct_list_has(names: Vec<str>, b: str) -> bool {
+    var i: i64 = 0;
+    while i < names.len() {
+        if names.get(i) == b { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn ct_list_get(names: Vec<str>, vals: Vec<str>, b: str) -> str {
+    var i: i64 = 0;
+    while i < names.len() {
+        if names.get(i) == b { return vals.get(i); }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn ct_v2(a: str, b: str) -> Vec<str> {
+    var v: Vec<str> = Vec::new();
+    v.push(a);
+    v.push(b);
+    return v;
+}
+
+/// The reference run and the build of one test, as two pool commands.
+fn ct_build_cmds(c: &CtConf, f: str, cmds: &mut Vec<str>, outs: &mut Vec<str>, errs: &mut Vec<str>, secs: &mut Vec<i64>) {
+    val b: str = tt_base(f);
+    var run: Vec<str> = Vec::new();
+    run.push(c.fid);
+    run.push("run");
+    run.push(f);
+    cmds.push(tt_pack(run));
+    outs.push(c.out + "/" + b + ".expected");
+    errs.push(c.out + "/" + b + ".expected_err");
+    secs.push(120);
+    var bc: Vec<str> = Vec::new();
+    bc.push(c.fid);
+    if c.native {
+        bc.push("emit");
+        bc.push(f);
+        var nat: bool = false;
+        var tgt: bool = true;
+        if str_ends_with(c.target, "-windows-pe") {
+            tgt = false;
+            if c.host != "windows" {
+                bc.push("--target");
+                bc.push("x86_64-windows");
+            }
+        } else if str_contains(c.target, "-windows") {
+            nat = true;
+        }
+        if tgt {
+            bc.push("--target");
+            bc.push(c.target);
+        }
+        if nat { bc.push("--nat"); }
+    } else {
+        bc.push("ccompile");
+        bc.push(f);
+        if !(c.host == "macos" && c.tos == "macos" && c.tarch == c.harch) {
+            bc.push("--target");
+            bc.push(c.target);
+        }
+        bc.push("--cc-opt");
+        bc.push("0");
+        bc.push("--no-cache");
+    }
+    bc.push("-o");
+    bc.push(c.out + "/" + b + "." + c.ext);
+    cmds.push(tt_pack(bc));
+    outs.push(c.out + "/" + b + ".build.log");
+    errs.push("");
+    secs.push(600);
+}
+
+/// build_one for `tests`, the first alone, the rest `jobs` at a time.
+fn ct_build(c: &CtConf, tests: Vec<str>, env: Vec<str>, jobs: i64) {
+    val reuse: bool = tt_env("REUSE") == "1";
+    var todo: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < tests.len() {
+        val f: str = tests.get(i);
+        i = i + 1;
+        if reuse && tt_cat(c.out + "/" + tt_base(f) + ".build_rc") == "0" { continue; }
+        todo.push(f);
+    }
+    // the first test's reference then build, alone (zig's first build of a
+    // target's libc must not race)
+    var k: i64 = 0;
+    while k < todo.len() {
+        var cmds: Vec<str> = Vec::new();
+        var outs: Vec<str> = Vec::new();
+        var errs: Vec<str> = Vec::new();
+        var secs: Vec<i64> = Vec::new();
+        var group: Vec<str> = Vec::new();
+        if k == 0 {
+            group.push(todo.get(0));
+            k = 1;
+        } else {
+            while k < todo.len() {
+                group.push(todo.get(k));
+                k = k + 1;
+            }
+        }
+        var g: i64 = 0;
+        while g < group.len() {
+            ct_build_cmds(c, group.get(g), &mut cmds, &mut outs, &mut errs, &mut secs);
+            g = g + 1;
+        }
+        var jn: i64 = jobs;
+        if group.len() == 1 { jn = 1; }
+        // a test's run and build are independent: 2 jobs per test at most
+        val codes: Vec<i64> = tt_pool(cmds, env, outs, errs, secs, jn);
+        g = 0;
+        while g < group.len() {
+            val b: str = tt_base(group.get(g));
+            fs_write_text(c.out + "/" + b + ".expected_rc", int_to_str(codes.get(2 * g)) + "\n");
+            fs_write_text(c.out + "/" + b + ".build_rc", int_to_str(codes.get(2 * g + 1)) + "\n");
+            g = g + 1;
+        }
+    }
+}
+
+/// run_view: a path as the runner sees it (Linux binaries on a Windows
+/// host run in WSL: C:/x/y or /c/x/y is /mnt/c/x/y).
+fn ct_run_view(c: &CtConf, p: str) -> str {
+    if c.host == "windows" && c.tos == "linux" {
+        var s: str = str_replace(p, "\\", "/");
+        if str_len(s) >= 3 && str_byte_at(s, 0) == 47 && str_byte_at(s, 2) == 47 {
+            s = str_slice(s, 1, 2) + ":" + str_slice(s, 2, str_len(s));
+        } else if str_len(s) == 2 && str_byte_at(s, 0) == 47 {
+            s = str_slice(s, 1, 2) + ":";
+        }
+        if str_len(s) >= 2 && str_byte_at(s, 1) == 58 {
+            return "/mnt/" + str_to_lower(str_slice(s, 0, 1)) + str_slice(s, 2, str_len(s));
+        }
+        return s;
+    }
+    return p;
+}
+
+fn ct_is_abs(p: str) -> bool {
+    return str_starts_with(p, "/") || (str_len(p) >= 2 && str_byte_at(p, 1) == 58);
+}
+
+/// The ".." path back from a relative $OUT to the root.
+fn ct_back(out: str) -> str {
+    var s: str = out;
+    while str_ends_with(s, "/") { s = str_slice(s, 0, str_len(s) - 1); }
+    while str_starts_with(s, "./") { s = str_slice(s, 2, str_len(s)); }
+    var r: str = "";
+    var i: i64 = 0;
+    var inword: bool = false;
+    while i < str_len(s) {
+        val ch: i64 = str_byte_at(s, i);
+        if ch == 47 {
+            r = r + "/";
+            inword = false;
+        } else if !inword {
+            r = r + "..";
+            inword = true;
+        }
+        i = i + 1;
+    }
+    return r;
+}
+
+/// The first python 3 on PATH ("" when none).
+fn ct_python() -> str {
+    val names: Vec<str> = ct_v2("python3", "python");
+    var i: i64 = 0;
+    while i < names.len() {
+        val p: str = names.get(i);
+        i = i + 1;
+        if !tt_which(p) { continue; }
+        var argv: Vec<str> = Vec::new();
+        argv.push(p);
+        argv.push("-c");
+        argv.push("import sys; sys.exit(sys.version_info[0] < 3)");
+        if tt_run(argv, Vec::new(), tt_null(), tt_null(), 0) == 0 { return p; }
+    }
+    return "";
+}
+
+fn main() -> i64 {
+    val args: Vec<str> = tt_args();
+    var target: str = "";
+    if args.len() > 0 { target = args.get(0); }
+    if str_len(target) == 0 {
+        ct_usage();
+        return 1;
+    }
+    var given: Vec<str> = Vec::new();
+    var i: i64 = 1;
+    while i < args.len() {
+        given.push(args.get(i));
+        i = i + 1;
+    }
+    val root: str = tt_pwd();
+    val host: str = tt_host();
+    val pa: str = tt_env_or("PROCESSOR_ARCHITEW6432", tt_env("PROCESSOR_ARCHITECTURE"));
+    val um: str = tt_uname("-m");
+    var harch: str = "x86_64";
+    if str_starts_with(pa, "ARM64") || um == "aarch64" || um == "arm64" {
+        harch = "aarch64";
+    } else if um == "riscv64" {
+        harch = "riscv64";
+    }
+    val ha: str = tt_env("HOST_ARCH");
+    if ha == "aarch64" || ha == "arm64" { harch = "aarch64"; }
+    if ha == "x86_64" || ha == "x64" || ha == "amd64" { harch = "x86_64"; }
+    if ha == "riscv64" { harch = "riscv64"; }
+    var fid: str = tt_env("FID");
+    if str_len(fid) == 0 {
+        if host == "windows" { fid = "release/fid.exe"; } else { fid = "release/fid"; }
+    }
+    val jobs_s: str = tt_env_or("JOBS", "8");
+    val jobs: i64 = str_parse_int(jobs_s);
+    val native: bool = tt_env("NATIVE") == "1";
+    var out: str = tt_env_or("OUT", "build/cross/" + target);
+    if native { out = out + "-native"; }
+    var ext: str = "bin";
+    if str_starts_with(target, "wasm") || target == "wasi" {
+        ext = "wasm";
+    } else if str_contains(target, "-windows") {
+        ext = "exe";
+    }
+    tt_mkdir_p(out);
+    val cc: str = tt_env_or("CC", "zig cc");
+
+    var runner: str = "";
+    var tos: str = "";
+    if str_starts_with(target, "aarch64-linux") || str_starts_with(target, "arm64-linux") {
+        runner = "qemu-aarch64";
+        tos = "linux";
+    } else if str_starts_with(target, "riscv64-linux") {
+        runner = "qemu-riscv64";
+        tos = "linux";
+    } else if str_starts_with(target, "x86_64-linux") {
+        tos = "linux";
+    } else if str_starts_with(target, "x86_64-windows") {
+        tos = "windows";
+    } else if str_starts_with(target, "aarch64-windows") || str_starts_with(target, "arm64-windows") {
+        tos = "windows";
+    } else if str_contains(target, "-freebsd") {
+        tos = "freebsd";
+    } else if str_contains(target, "-macos") {
+        tos = "macos";
+    } else if str_starts_with(target, "wasm") || target == "wasi" {
+        runner = "node scripts/wasm-run.mjs";
+        tos = "wasi";
+    } else {
+        println("unknown target: " + target);
+        return 1;
+    }
+    if host == "linux" {
+        val hr: str = harch + "-" + runner;
+        if hr == "aarch64-qemu-aarch64" || hr == "arm64-qemu-aarch64" || hr == "riscv64-qemu-riscv64" { runner = ""; }
+    }
+    var tarch: str = "x86_64";
+    if str_starts_with(target, "aarch64") || str_starts_with(target, "arm64") {
+        tarch = "aarch64";
+    } else if str_starts_with(target, "riscv64") {
+        tarch = "riscv64";
+    } else if str_starts_with(target, "wasm") || target == "wasi" {
+        tarch = "wasm32";
+    }
+    var run_here: bool = true;
+    if tos == "windows" {
+        if !(host == "windows" && (tarch == harch || tarch == "x86_64")) { run_here = false; }
+    } else if tos == "macos" {
+        if host != "macos" {
+            run_here = false;
+        } else if tarch != harch {
+            var ok: bool = false;
+            if tarch == "x86_64" {
+                var ar: Vec<str> = Vec::new();
+                ar.push("/usr/bin/arch");
+                ar.push("-x86_64");
+                ar.push("/usr/bin/true");
+                ok = tt_run(ar, Vec::new(), tt_null(), "", 0) == 0;
+            }
+            if !ok { run_here = false; }
+        }
+    } else if tos == "freebsd" {
+        if !(host == "freebsd" && tarch == harch) { run_here = false; }
+    } else if tos == "linux" {
+        if host != "linux" && host != "windows" { run_here = false; }
+    }
+    var wine: str = "";
+    if tos == "windows" && host != "windows" && tarch == "x86_64" {
+        wine = tt_env("WINE");
+        if str_len(wine) == 0 {
+            if tt_which("wine") { wine = "wine"; } else if tt_which("wine64") { wine = "wine64"; }
+        }
+        if str_len(wine) > 0 {
+            run_here = true;
+            runner = wine;
+        }
+    }
+    if tt_env("BUILD_ONLY") == "1" { run_here = false; }
+
+    // the tests
+    var tests: Vec<str> = given;
+    if given.len() == 0 { tests = ct_default_tests(); }
+    val lane_skips: str = tt_env_or("LANE_SKIPS", "scripts/lane-skips.txt");
+    var ls_names: Vec<str> = Vec::new();
+    var ls_why: Vec<str> = Vec::new();
+    if lane_skips != "/dev/null" && fs_exists(lane_skips) && !fs_is_dir(lane_skips) {
+        // `while read` skips a last line without its newline
+        val parts: Vec<str> = str_split(tt_read(lane_skips), "\n");
+        var li: i64 = 0;
+        while li + 1 < parts.len() {
+            val w: Vec<str> = ct_read3(parts.get(li));
+            li = li + 1;
+            var spat: str = w.get(0);
+            if str_len(spat) == 0 || str_starts_with(spat, "#") { continue; }
+            val stest: str = tt_drop_cr(w.get(1));
+            val swhy: str = tt_drop_cr(w.get(2));
+            var neg: bool = false;
+            if str_starts_with(spat, "!") {
+                neg = true;
+                spat = str_slice(spat, 1, str_len(spat));
+            }
+            val m: bool = tt_case_match(target, spat);
+            if m != neg {
+                ls_names.push(stest);
+                if str_len(swhy) > 0 { ls_why.push(swhy); } else { ls_why.push("skipped on " + target); }
+            }
+        }
+    }
+    if !fs_exists("compiler/main.fd") {
+        var ti: i64 = 0;
+        while ti < tests.len() {
+            val f: str = tests.get(ti);
+            ti = ti + 1;
+            if ct_has_c_import(f) {
+                ls_names.push(tt_base(f));
+                ls_why.push("needs compiler/ in " + root + ": it imports compiler:: modules");
+            }
+        }
+    }
+    val all_tests: Vec<str> = tests;
+    var run_tests: Vec<str> = Vec::new();
+    var lskip: i64 = 0;
+    i = 0;
+    while i < all_tests.len() {
+        val f: str = all_tests.get(i);
+        i = i + 1;
+        if ct_list_has(ls_names, tt_base(f)) { lskip = lskip + 1; } else { run_tests.push(f); }
+    }
+    var line: str = "target " + target + ": " + int_to_str(run_tests.len()) + " tests, " + jobs_s + " builds at a time, output in " + out;
+    if lskip != 0 { line = line + " (" + int_to_str(lskip) + " skipped on this target: " + lane_skips + ")"; }
+    println(line);
+
+    val conf: CtConf = CtConf {
+        fid: fid, target: target, out: out, ext: ext, host: host, tos: tos, tarch: tarch, harch: harch, native: native
+    };
+    // what the script exports to its builds
+    var env: Vec<str> = Vec::new();
+    env.push("CC=" + cc);
+    env.push("FID=" + fid);
+    env.push("TARGET=" + target);
+    env.push("OUT=" + out);
+    env.push("EXT=" + ext);
+    env.push("HOST=" + host);
+    env.push("TOS=" + tos);
+    env.push("TARCH=" + tarch);
+    env.push("HARCH=" + harch);
+    val compare_only: bool = tt_env("COMPARE_ONLY") == "1";
+    if !compare_only && run_tests.len() > 0 {
+        ct_build(&conf, run_tests, env, jobs);
+    }
+
+    // dynamic executables under qemu-user: the loader each one needs
+    var ld_names: Vec<str> = Vec::new();
+    var ld_paths: Vec<str> = Vec::new();
+    if str_starts_with(runner, "qemu-") {
+        val py: str = ct_python();
+        if str_len(py) > 0 {
+            var list: str = "";
+            i = 0;
+            while i < run_tests.len() {
+                val b: str = tt_base(run_tests.get(i));
+                i = i + 1;
+                val bin: str = out + "/" + b + "." + ext;
+                if tt_cat(out + "/" + b + ".build_rc") == "0" && fs_exists(bin) { list = list + bin + "\n"; }
+            }
+            val lout: str = out + "/.loaders.tmp";
+            var pa2: Vec<str> = Vec::new();
+            pa2.push(py);
+            pa2.push("scripts/bin-target-check.py");
+            pa2.push("--loader");
+            pa2.push("-");
+            val h: i64 = tt_spawn(pa2, Vec::new(), lout, tt_null(), list);
+            if h != 0 { tt_finish(h, 0); }
+            val ll: Vec<str> = tt_lines(tt_no_cr(tt_read(lout)));
+            fs_delete(lout);
+            var k: i64 = 0;
+            while k < ll.len() {
+                val fields: Vec<str> = str_split(ll.get(k), "\t");
+                k = k + 1;
+                if fields.len() < 3 || str_len(fields.get(0)) == 0 { continue; }
+                if fields.get(1) != "-" && fields.get(2) == "-" {
+                    var lb: str = fields.get(0);
+                    var sl: i64 = str_len(lb) - 1;
+                    while sl >= 0 && str_byte_at(lb, sl) != 47 { sl = sl - 1; }
+                    lb = str_slice(lb, sl + 1, str_len(lb));
+                    if str_ends_with(lb, "." + ext) { lb = str_slice(lb, 0, str_len(lb) - str_len(ext) - 1); }
+                    ld_names.push(lb);
+                    ld_paths.push(fields.get(1));
+                }
+            }
+        }
+    }
+
+    // run-all.sh
+    val runs: str = out + "/run-all.sh";
+    var outr: str = out;
+    if ct_is_abs(out) { outr = ct_run_view(&conf, out); }
+    var sh: str = "#!/bin/bash\n";
+    if outr == out && !ct_is_abs(out) {
+        sh = sh + "cd \"$(dirname \"$0\")/" + ct_back(out) + "\"\n";
+    } else {
+        sh = sh + "cd \"" + ct_run_view(&conf, root) + "\"\n";
+    }
+    if str_starts_with(runner, "qemu-") {
+        sh = sh + "if [ -z \"${QEMU_LD_PREFIX:-}\" ] && [ -d /usr/" + tarch + "-linux-gnu/lib ]; then export QEMU_LD_PREFIX=/usr/" + tarch + "-linux-gnu; fi\n";
+    }
+    i = 0;
+    while i < run_tests.len() {
+        val b: str = tt_base(run_tests.get(i));
+        i = i + 1;
+        if tt_cat(out + "/" + b + ".build_rc") != "0" { continue; }
+        val runl: str = "timeout 60 " + runner + " \"" + outr + "/" + b + "." + ext + "\" < /dev/null > \"" + outr + "/" + b + ".actual\" 2> \"" + outr + "/" + b + ".stderr\"; echo $? > \"" + outr + "/" + b + ".actual_rc\"";
+        if ct_list_has(ld_names, b) {
+            val li2: str = ct_list_get(ld_names, ld_paths, b);
+            sh = sh + "rm -f \"" + outr + "/" + b + ".noloader\"; if [ -e \"${QEMU_LD_PREFIX:-}" + li2 + "\" ]; then " + runl + "; else echo \"" + li2 + "\" > \"" + outr + "/" + b + ".noloader\"; fi\n";
+        } else {
+            sh = sh + runl + "\n";
+        }
+    }
+    fs_write_text(runs, sh);
+    var chm: Vec<str> = Vec::new();
+    if !process_is_windows() {
+        chm.push("chmod");
+        chm.push("+x");
+        chm.push(runs);
+        tt_run(chm, Vec::new(), "", "", 0);
+    }
+
+    var ran: bool = false;
+    if compare_only {
+        println(target + ": comparing the results run-all.sh left in " + out);
+        ran = true;
+    } else if !run_here {
+        println(target + " binaries built only (this host cannot run them); run " + runs + " on a " + tos + " " + tarch + " machine, then rerun this script there");
+    } else if host == "windows" && tos != "wasi" && tos != "windows" {
+        var wruns: str = "";
+        if ct_is_abs(runs) { wruns = ct_run_view(&conf, runs); } else { wruns = ct_run_view(&conf, root) + "/" + runs; }
+        var wa: Vec<str> = Vec::new();
+        wa.push("wsl");
+        val distro: str = tt_env("WSL_DISTRO");
+        if str_len(distro) > 0 {
+            wa.push("-d");
+            wa.push(distro);
+        }
+        wa.push("bash");
+        wa.push(wruns);
+        var wenv: Vec<str> = Vec::new();
+        var e: i64 = 0;
+        while e < env.len() {
+            wenv.push(env.get(e));
+            e = e + 1;
+        }
+        wenv.push("MSYS_NO_PATHCONV=1");
+        tt_run(wa, wenv, "", "", 0);
+        ran = true;
+    } else {
+        if str_len(wine) > 0 {
+            env.push("WINEDEBUG=" + tt_env_or("WINEDEBUG", "-all"));
+            var wb: Vec<str> = Vec::new();
+            wb.push(wine);
+            wb.push("wineboot");
+            wb.push("--init");
+            tt_run(wb, env, tt_null(), "", 300);
+        }
+        // run-all.sh's commands, one at a time
+        val ldp: str = tt_env("QEMU_LD_PREFIX");
+        var ld_prefix: str = ldp;
+        if str_starts_with(runner, "qemu-") && str_len(ldp) == 0 && fs_is_dir("/usr/" + tarch + "-linux-gnu/lib") {
+            ld_prefix = "/usr/" + tarch + "-linux-gnu";
+            env.push("QEMU_LD_PREFIX=" + ld_prefix);
+        }
+        val rwords: Vec<str> = str_split(runner, " ");
+        i = 0;
+        while i < run_tests.len() {
+            val b: str = tt_base(run_tests.get(i));
+            i = i + 1;
+            if tt_cat(out + "/" + b + ".build_rc") != "0" { continue; }
+            if ct_list_has(ld_names, b) {
+                fs_delete(out + "/" + b + ".noloader");
+                val li3: str = ct_list_get(ld_names, ld_paths, b);
+                if !fs_exists(ld_prefix + li3) {
+                    fs_write_text(out + "/" + b + ".noloader", li3 + "\n");
+                    continue;
+                }
+            }
+            var ra: Vec<str> = Vec::new();
+            var w: i64 = 0;
+            while w < rwords.len() {
+                if str_len(rwords.get(w)) > 0 { ra.push(rwords.get(w)); }
+                w = w + 1;
+            }
+            ra.push(out + "/" + b + "." + ext);
+            val rc: i64 = tt_run(ra, env, out + "/" + b + ".actual", out + "/" + b + ".stderr", 60);
+            fs_write_text(out + "/" + b + ".actual_rc", int_to_str(rc) + "\n");
+        }
+        ran = true;
+    }
+
+    // compare
+    var pass: i64 = 0;
+    var fail: i64 = 0;
+    var berr: i64 = 0;
+    var skip: i64 = 0;
+    var built: i64 = 0;
+    var noload: i64 = 0;
+    val res: str = out + "/results.txt";
+    fs_write_text(res, "");
+    i = 0;
+    while i < ls_names.len() {
+        val sb: str = ls_names.get(i);
+        val swhy2: str = ls_why.get(i);
+        i = i + 1;
+        if str_len(sb) == 0 { continue; }
+        var k2: i64 = 0;
+        while k2 < all_tests.len() {
+            val f: str = all_tests.get(k2);
+            k2 = k2 + 1;
+            if str_ends_with(f, "/" + sb + ".fd") || f == sb + ".fd" {
+                tt_append_line(res, "SKIP  " + sb + " (" + swhy2 + ")");
+                break;
+            }
+        }
+    }
+    i = 0;
+    while i < run_tests.len() {
+        val f: str = run_tests.get(i);
+        i = i + 1;
+        val b: str = tt_base(f);
+        val pre: str = out + "/" + b;
+        val erc: str = tt_cat(pre + ".expected_rc");
+        var byblock: bool = false;
+        var whyblock: str = "fid run cannot call C";
+        if erc == "124" && tt_has_line_prefix(f, "// Expected output:") {
+            byblock = true;
+            whyblock = "fid run timed out";
+        } else if erc == "124" || tt_has_line_prefix(pre + ".expected", "Compilation error") || tt_has_line_prefix(pre + ".expected", "error: ") {
+            tt_append_line(res, "SKIP  " + b + " (fid run gives no reference: rc " + erc + ")");
+            skip = skip + 1;
+            continue;
+        }
+        if !byblock && ct_cannot_call_c(pre + ".expected_err") {
+            if !tt_has_line_prefix(f, "// Expected output:") {
+                tt_append_line(res, "SKIP  " + b + " (fid run cannot call C, and the test has no Expected output)");
+                skip = skip + 1;
+                continue;
+            }
+            byblock = true;
+        }
+        if tt_cat(pre + ".build_rc") != "0" {
+            tt_append_line(res, "BUILD " + b);
+            berr = berr + 1;
+            continue;
+        }
+        if !ran {
+            tt_append_line(res, "BUILT " + b + " (not run here)");
+            built = built + 1;
+            continue;
+        }
+        if ct_list_has(ld_names, b) && fs_exists(pre + ".noloader") {
+            tt_append_line(res, "SKIP  " + b + " (dynamic: needs " + ct_list_get(ld_names, ld_paths, b) + " for " + runner + "; install the target's libc, e.g. libc6-arm64-cross, or set QEMU_LD_PREFIX)");
+            noload = noload + 1;
+            continue;
+        }
+        val arc: str = tt_cat(pre + ".actual_rc");
+        if byblock {
+            val blk: str = tt_block_of(f, true);
+            fs_write_text(pre + ".expected_block", blk);
+            val xrc: str = tt_block_exit_of(f);
+            if arc == xrc && tt_same_lines(tt_no_cr(tt_read(pre + ".actual")), blk, true) {
+                tt_append_line(res, "PASS  " + b);
+                pass = pass + 1;
+            } else {
+                tt_append_line(res, "FAIL  " + b + " (rc " + arc + ", its Expected output: rc " + xrc + "; " + whyblock + ")");
+                fail = fail + 1;
+            }
+            continue;
+        }
+        if arc == erc && tt_panic_key(pre + ".expected_err", true) == tt_panic_key(pre + ".stderr", true) && tt_no_cr(tt_read(pre + ".expected")) == tt_no_cr(tt_read(pre + ".actual")) {
+            tt_append_line(res, "PASS  " + b);
+            pass = pass + 1;
+        } else {
+            tt_append_line(res, "FAIL  " + b + " (rc " + arc + ", interpreter " + erc + ")");
+            fail = fail + 1;
+        }
+    }
+    var sum: str = target + ": " + int_to_str(pass) + " passed, " + int_to_str(fail) + " failed, " + int_to_str(berr) + " did not build, " + int_to_str(skip) + " without reference";
+    if !ran { sum = sum + ", " + int_to_str(built) + " built only (not run here)"; }
+    if lskip != 0 { sum = sum + ", " + int_to_str(lskip) + " skipped on this target"; }
+    if noload != 0 { sum = sum + ", " + int_to_str(noload) + " dynamic not run (no loader for " + runner + ")"; }
+    println(sum);
+    val rl: Vec<str> = tt_lines(tt_read(res));
+    var shown: i64 = 0;
+    i = 0;
+    while i < rl.len() && shown < 50 {
+        val l: str = rl.get(i);
+        i = i + 1;
+        if str_starts_with(l, "PASS") || str_starts_with(l, "BUILT") { continue; }
+        println(l);
+        shown = shown + 1;
+    }
+    if fail == 0 && berr == 0 { return 0; }
+    return 1;
+}
+
+/// The interpreter cannot run a program that calls C (its panic is no
+/// reference).
+fn ct_cannot_call_c(path: str) -> bool {
+    val lines: Vec<str> = tt_lines(tt_read(path));
+    var i: i64 = 0;
+    while i < lines.len() {
+        val l: str = lines.get(i);
+        i = i + 1;
+        val p1: str = "Panic: FFI function ";
+        if str_starts_with(l, p1) && str_contains(str_slice(l, str_len(p1), str_len(l)), " is not available in the interpreter") { return true; }
+        val p2: str = "Panic: a C function pointer ";
+        if str_starts_with(l, p2) && str_contains(str_slice(l, str_len(p2), str_len(l)), " can only be called in a C build") { return true; }
+    }
+    return false;
+}

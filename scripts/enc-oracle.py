@@ -69,6 +69,11 @@ def a64_forms():
         f.append(('a64_ldr_sized(&mut e, %d, %d, %d, 1, false)' % (t, n, i1), 'ldrb w%d, [%s, #%d]' % (t, rn, i1)))
         f.append(('a64_ldr_sized(&mut e, %d, %d, %d, 1, true)' % (t, n, i1), 'ldrsb x%d, [%s, #%d]' % (t, rn, i1)))
         f.append(('a64_str_sized(&mut e, %d, %d, %d, 1)' % (t, n, i1), 'strb w%d, [%s, #%d]' % (t, rn, i1)))
+    # RA13: register pairs of the prologue/epilogue (signed offset, no writeback).
+    for t1, t2, n, imm in [(19, 20, 31, 0 - 16), (0, 1, 2, 0), (9, 10, 31, 504), (28, 29, 16, 0 - 512)]:
+        rn = 'sp' if n == 31 else 'x%d' % n
+        f.append(('a64_stp(&mut e, %d, %d, %d, %d)' % (t1, t2, n, imm), 'stp x%d, x%d, [%s, #%d]' % (t1, t2, rn, imm)))
+        f.append(('a64_ldp(&mut e, %d, %d, %d, %d)' % (t1, t2, n, imm), 'ldp x%d, x%d, [%s, #%d]' % (t1, t2, rn, imm)))
     for d, n, m in [(0, 1, 2), (7, 3, 31)]:
         for op in ['fadd', 'fsub', 'fmul', 'fdiv']:
             f.append(('a64_%s(&mut e, %d, %d, %d)' % (op, d, n, m), '%s d%d, d%d, d%d' % (op, d, n, m)))

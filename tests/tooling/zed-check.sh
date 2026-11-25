@@ -70,16 +70,34 @@ if [ -z "$TS" ]; then
 else
   echo "--- $("$TS" --version)"
   OUT="${OUT:-$ROOT/build/zed-check}"
+  case "$OUT" in /*|[A-Za-z]:*) ;; *) OUT="$ROOT/$OUT" ;; esac
   mkdir -p "$OUT"
-  ( cd editors/tree-sitter-fides && "$TS" generate ) > "$OUT/generate.txt" 2>&1
+  # generate, test and parse in a copy of the grammar: `generate` rewrites
+  # src/ and, with MSVC, compiling the parser leaves parser.obj/.lib/.exp
+  # in the working directory — none of that lands in editors/
+  G="$OUT/grammar"
+  rm -rf "$G"; mkdir -p "$G"
+  cp -r editors/tree-sitter-fides/grammar.js editors/tree-sitter-fides/package.json \
+    editors/tree-sitter-fides/tree-sitter.json editors/tree-sitter-fides/queries \
+    editors/tree-sitter-fides/test "$G"/
+  [ -d editors/tree-sitter-fides/src ] && cp -r editors/tree-sitter-fides/src "$G"/
+  ( cd "$G" && "$TS" generate ) > "$OUT/generate.txt" 2>&1
   if [ $? = 0 ]; then
     echo "ok   tree-sitter generate"
     grep -i "warning" "$OUT/generate.txt" | sed 's/^/    /' | head -5
   else
     echo "FAIL tree-sitter generate"; sed 's/^/    /' "$OUT/generate.txt" | head -40; fails=$((fails + 1))
   fi
-  if [ -s editors/tree-sitter-fides/src/parser.c ]; then
-    if ( cd editors/tree-sitter-fides && "$TS" test ) > "$OUT/test.txt" 2>&1; then
+  # the committed parser (what Zed builds from extension.toml's rev) is the
+  # grammar's: regenerating it changes nothing
+  if diff -r editors/tree-sitter-fides/src "$G/src" > "$OUT/src-diff.txt" 2>&1; then
+    echo "ok   committed src/ is what generate writes"
+  else
+    echo "FAIL committed editors/tree-sitter-fides/src/ is stale: rerun tree-sitter generate and commit it"
+    head -10 "$OUT/src-diff.txt" | sed 's/^/    /'; fails=$((fails + 1))
+  fi
+  if [ -s "$G/src/parser.c" ]; then
+    if ( cd "$G" && "$TS" test ) > "$OUT/test.txt" 2>&1; then
       echo "ok   tree-sitter test (corpus)"
     else
       echo "FAIL tree-sitter test"; sed 's/^/    /' "$OUT/test.txt" | tail -40; fails=$((fails + 1))
@@ -88,7 +106,7 @@ else
     total=0; clean=0; : > "$OUT/errors.txt"
     while read -r f; do
       total=$((total + 1))
-      if ( cd editors/tree-sitter-fides && "$TS" parse --quiet "$ROOT/$f" ) > /dev/null 2>&1; then
+      if ( cd "$G" && "$TS" parse --quiet "$ROOT/$f" ) > /dev/null 2>&1; then
         clean=$((clean + 1))
       else
         echo "$f" >> "$OUT/errors.txt"
@@ -102,7 +120,7 @@ else
       head -10 "$OUT/errors.txt" | sed 's/^/    /'; fails=$((fails + 1))
     fi
     for q in editors/tree-sitter-fides/queries/highlights.scm editors/zed/languages/fides/*.scm; do
-      if ( cd editors/tree-sitter-fides && "$TS" query "$ROOT/$q" "$ROOT/stdlib/json.fd" ) > /dev/null 2> "$OUT/query.txt"; then
+      if ( cd "$G" && "$TS" query "$ROOT/$q" "$ROOT/stdlib/json.fd" ) > /dev/null 2> "$OUT/query.txt"; then
         echo "ok   query $q compiles"
       else
         echo "FAIL query $q"; head -5 "$OUT/query.txt" | sed 's/^/    /'; fails=$((fails + 1))

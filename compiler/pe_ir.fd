@@ -592,6 +592,82 @@ fn peir_store_f32_xmm0(e: &mut PeirEnc, dst: i64) -> void {
     PeirEnc_mov_mem_rbp_reg(e, dst, PEIR_RAX);
 }
 
+/// Nov 25: pe_ir's call convention for an f32. A parameter or
+/// result declared f32 travels as the raw 32 bits in the low half of the
+/// integer register, zeros above: what an f32's frame slot holds, what the
+/// prologue stores and the Return of an f32 loads, and what the C thunks
+/// and callback adapters move to and from xmm (movd). An f32 into anything
+/// else (the integer word of a Vec<f32> element, OP21; an f64; a machine
+/// stub whose signature is unknown, IrType::Void) is widened, its f64 bits;
+/// an f64 into an f32 parameter (BG137/BG165: lowering and iropt leave
+/// `takes(1.5)` an f64) is narrowed to the raw f32. Calls widened every
+/// f32 argument, so a callee that is not inlined read the low half of the
+/// f64's bits (0).
+fn peir_load_call_arg(e: &mut PeirEnc, reg: i64, off: i64, aty: IrType, pty: IrType) -> void {
+    if ir_type_eq(aty, IrType::F32) && !ir_type_eq(pty, IrType::F32) {
+        // movss xmm0, [slot]; cvtss2sd; movq reg, xmm0 (REX.B for r8/r9)
+        PeirEnc_movss_xmm_mem_rbp(e, 0, off);
+        peir_cvt_float(e, true);
+        peir_emit2(e, 0x66, 0x48 | ((reg >> 3) & 1));
+        peir_emit2(e, 0x0F, 0x7E);
+        PeirEnc_emit_u8(e, 0xC0 | (reg & 7));
+        return;
+    }
+    if ir_type_eq(aty, IrType::F64) && ir_type_eq(pty, IrType::F32) {
+        // movsd xmm0, value; cvtsd2ss; movd reg32, xmm0 (zeros above)
+        PeirEnc_movsd_xmm_mem_rbp(e, 0, off);
+        peir_cvt_float(e, false);
+        PeirEnc_emit_u8(e, 0x66);
+        if reg >= 8 {
+            PeirEnc_emit_u8(e, 0x41);
+        }
+        peir_emit2(e, 0x0F, 0x7E);
+        PeirEnc_emit_u8(e, 0xC0 | (reg & 7));
+        return;
+    }
+    PeirEnc_mov_reg_mem_rbp(e, reg, off);
+}
+
+/// The parameter types callee `name` declares (a function of the
+/// module, else an extern's signature); empty when neither is known.
+fn peir_callee_params(module: &IrModule, name: str) -> Vec<IrType> {
+    var out: Vec<IrType> = Vec::new();
+    var pos: i64 = IrModule_fn_pos(module, name);
+    if pos >= 0 {
+        var cf: IrFunction = module.functions.get(pos).func;
+        var i: i64 = 0;
+        while i < cf.params.len() {
+            out.push(cf.params.get(i).ty);
+            i = i + 1;
+        }
+        return out;
+    }
+    var si: i64 = pe_extern_sig_index(module, name);
+    if si >= 0 {
+        var sig: StringVecIrType = module.extern_functions.get(si);
+        var j: i64 = 0;
+        while j < sig.params.len() {
+            out.push(sig.params.get(j));
+            j = j + 1;
+        }
+    }
+    return out;
+}
+
+/// The result type callee `name` declares; IrType::Void when the
+/// callee is not known.
+fn peir_callee_ret(module: &IrModule, name: str) -> IrType {
+    var pos: i64 = IrModule_fn_pos(module, name);
+    if pos >= 0 {
+        return module.functions.get(pos).func.ret_ty;
+    }
+    var si: i64 = pe_extern_sig_index(module, name);
+    if si >= 0 {
+        return module.extern_functions.get(si).ret;
+    }
+    return IrType::Void;
+}
+
 /// The module's function names, sorted (Rust: keys of a sorted map).
 fn pe_module_fn_names(module: &IrModule) -> Vec<str> {
     var v: Vec<str> = Vec::new();
@@ -4970,7 +5046,15 @@ pub fn PeirGen_gen_inst(self: &mut PeirGen, id: i64, inst: Inst, next_cond: i64,
             match ret {
                 OptValueId::Some(v) => {
                     var voff: i64 = PeStackFrame_offset(frame, v);
-                    PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RAX, voff);
+                    // Nov 25: an f32 result is its raw 32 bits
+                    // (peir_load_call_arg); `return 2.5;` from an f32
+                    // function returns an f64 (BG165), narrowed here (a
+                    // result type that is not a float keeps the word)
+                    if ir_type_is_float(func.ret_ty) {
+                        peir_load_call_arg(&mut self.enc, PEIR_RAX, voff, peir_operand_ty(func, v), func.ret_ty);
+                    } else {
+                        PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RAX, voff);
+                    }
                 }
                 OptValueId::None => {
                     PeirEnc_xor_self(&mut self.enc, PEIR_RAX);
@@ -5175,6 +5259,27 @@ pub fn PeirGen_gen_inst(self: &mut PeirGen, id: i64, inst: Inst, next_cond: i64,
             }
             var call_space: i64 = (32 + stack_args * 8 + 15) & ~15;
 
+            // Nov 25 (peir_load_call_arg): an f32 argument or result follows
+            // the type the callee declares, when a float is involved
+            var rty: IrType = peir_operand_ty(func, id);
+            var cv_float: bool = ir_type_eq(rty, IrType::F32);
+            var cfa: i64 = 0;
+            while cfa < args.len() {
+                if ir_type_is_float(peir_operand_ty(func, args.get(cfa))) {
+                    cv_float = true;
+                }
+                cfa = cfa + 1;
+            }
+            var callee_pty: Vec<IrType> = Vec::new();
+            var callee_rty: IrType = IrType::Void;
+            if cv_float {
+                callee_pty = peir_callee_params(module, target_func);
+                if callee_pty.len() != call_args.len() {
+                    callee_pty.clear();
+                }
+                callee_rty = peir_callee_ret(module, target_func);
+            }
+
             // Load args into registers (item 83): a known-constant arg moves
             // in as an immediate instead of a slot load.
             var ri: i64 = 0;
@@ -5187,18 +5292,13 @@ pub fn PeirGen_gen_inst(self: &mut PeirGen, id: i64, inst: Inst, next_cond: i64,
                             // OP21 (Nov 21 evening): an f32 argument into an
                             // integer-word parameter is the Vec<f32> element
                             // boundary — the single widened, its f64 bits in
-                            // the register (REX.B for r8/r9)
-                            var aty4: IrType = peir_operand_ty(func, a);
-                            var ca_f32b: bool = ir_type_eq(aty4, IrType::F32);
-                            if ca_f32b {
-                                PeirEnc_movss_xmm_mem_rbp(&mut self.enc, 0, PeStackFrame_offset(frame, a));
-                                peir_cvt_float(&mut self.enc, true);
-                                peir_emit2(&mut self.enc, 0x66, 0x48 | ((arg_regs.get(ri) >> 3) & 1));
-                                peir_emit2(&mut self.enc, 0x0F, 0x7E);
-                                PeirEnc_emit_u8(&mut self.enc, 0xC0 | (arg_regs.get(ri) & 7));
-                            } else {
-                                PeirEnc_mov_reg_mem_rbp(&mut self.enc, arg_regs.get(ri), PeStackFrame_offset(frame, a));
+                            // the register; into an f32 parameter its raw
+                            // bits (peir_load_call_arg)
+                            var pty4: IrType = IrType::Void;
+                            if ri < callee_pty.len() {
+                                pty4 = callee_pty.get(ri);
                             }
+                            peir_load_call_arg(&mut self.enc, arg_regs.get(ri), PeStackFrame_offset(frame, a), peir_operand_ty(func, a), pty4);
                         }
                     }
                     OptValueId::None => {
@@ -5213,7 +5313,10 @@ pub fn PeirGen_gen_inst(self: &mut PeirGen, id: i64, inst: Inst, next_cond: i64,
             // caller, with its result in rax as ours would be. Only to a
             // Fides function (our convention, rax result) and with every
             // argument in a register (stack arguments would be in our frame).
-            if self.tail_next && self.calls_reserved && call_args.len() <= 4 && pe_ir_strs_contains(self.module_fns, target_func) && HashMap_contains(self.func_labels, target_func) {
+            // (Not when an f32 result needs converting: Vec_get of a
+            // Vec<f32> returns the f64 bits, our caller takes the raw f32.)
+            var tail_f32: bool = ir_type_eq(rty, IrType::F32) && !ir_type_eq(callee_rty, IrType::F32);
+            if self.tail_next && !tail_f32 && self.calls_reserved && call_args.len() <= 4 && pe_ir_strs_contains(self.module_fns, target_func) && HashMap_contains(self.func_labels, target_func) {
                 PeirGen_restore_regs(self);
                 PeirEnc_mov_rr(&mut self.enc, PEIR_RSP, PEIR_RBP);
                 PeirEnc_pop(&mut self.enc, PEIR_RBP);
@@ -5234,7 +5337,11 @@ pub fn PeirGen_gen_inst(self: &mut PeirGen, id: i64, inst: Inst, next_cond: i64,
                         if pe_idmap_has(&frame.const_vals, a2) {
                             PeirEnc_mov_imm(&mut self.enc, PEIR_RAX, pe_idmap_get(&frame.const_vals, a2));
                         } else {
-                            PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RAX, PeStackFrame_offset(frame, a2));
+                            var pty5: IrType = IrType::Void;
+                            if sa < callee_pty.len() {
+                                pty5 = callee_pty.get(sa);
+                            }
+                            peir_load_call_arg(&mut self.enc, PEIR_RAX, PeStackFrame_offset(frame, a2), peir_operand_ty(func, a2), pty5);
                         }
                     }
                     OptValueId::None => {
@@ -5255,9 +5362,13 @@ pub fn PeirGen_gen_inst(self: &mut PeirGen, id: i64, inst: Inst, next_cond: i64,
             }
             // OP21 (Nov 21 evening): a call whose result is an f32 (Vec_get
             // of a Vec<f32>) gets the single's f64 bits in rax — pun them
-            // into the 4-byte slot (an f64 result is its bits already)
-            var rty: IrType = peir_operand_ty(func, id);
-            if ir_type_eq(rty, IrType::F32) {
+            // into the 4-byte slot (an f64 result is its bits already). A
+            // callee declared f32 returns the raw 32 bits (Nov 25,
+            // peir_load_call_arg): kept as they are (mov eax, eax)
+            if ir_type_eq(rty, IrType::F32) && ir_type_eq(callee_rty, IrType::F32) {
+                peir_emit2(&mut self.enc, 0x89, 0xC0);
+                PeirEnc_mov_mem_rbp_reg(&mut self.enc, dst, PEIR_RAX);
+            } else if ir_type_eq(rty, IrType::F32) {
                 peir_emit2(&mut self.enc, 0x66, 0x48);
                 peir_emit2(&mut self.enc, 0x0F, 0x6E);
                 PeirEnc_emit_u8(&mut self.enc, 0xC0);

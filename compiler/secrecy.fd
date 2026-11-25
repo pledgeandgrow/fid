@@ -473,13 +473,13 @@ fn sec_note_output(self: &mut SecrecyChecker) {
 fn sec_sink(self: &mut SecrecyChecker, what: str, data: Vec<i64>, pc: Vec<i64>) {
     sec_note_output(self);
     if sec_has(data, -1) {
-        sec_error(self, "@secret", "a secret value reaches " + what);
+        sec_error(self, "@secret", "a secret value reaches " + what + "\n    Fix: output a value computed without the secret, or put the output in a function marked @declassify (an audited release).");
     } else if sec_has(data, -2) {
-        sec_error(self, "@sensitive", "a sensitive value reaches " + what + "; release it through privacy::release (a consent check) or mark the function @declassify");
+        sec_error(self, "@sensitive", "a sensitive value reaches " + what + "; release it through privacy::release (a consent check) or mark the function @declassify\n    Fix: pass it through privacy's `release(consent, v)` before it reaches " + what + ", or put the output in a function marked @declassify.");
     } else if sec_has(pc, -1) {
-        sec_error(self, "@secret", what + " runs inside a branch or loop that depends on a secret");
+        sec_error(self, "@secret", what + " runs inside a branch or loop that depends on a secret\n    Fix: compute both outcomes and select with arithmetic on a 0/1 mask, or move " + what + " out of the branch.");
     } else if sec_has(pc, -2) {
-        sec_error(self, "@sensitive", what + " runs inside a branch or loop that depends on sensitive data");
+        sec_error(self, "@sensitive", what + " runs inside a branch or loop that depends on sensitive data\n    Fix: move " + what + " out of the branch, or release the condition first (privacy's `release(consent, v)`).");
     }
     var both: Vec<i64> = sec_union(data, pc);
     var i: i64 = 0;
@@ -505,10 +505,10 @@ fn sec_ret(self: &mut SecrecyChecker, l: Vec<i64>) {
             }
         } else if o == -1 {
             if !self.may_return_secret {
-                sec_error(self, "@secret", "returns a secret value; mark the function @secret (callers keep its result secret) or @declassify (an audited release)");
+                sec_error(self, "@secret", "returns a secret value; mark the function @secret (callers keep its result secret) or @declassify (an audited release)\n    Fix: write `@secret fn ...` (callers keep the result secret) or `@declassify fn ...` (an audited release) on it.");
             }
         } else if !self.may_return_sensitive {
-            sec_error(self, "@sensitive", "returns a sensitive value; mark the function @sensitive (callers keep its result sensitive) or @declassify (an audited release)");
+            sec_error(self, "@sensitive", "returns a sensitive value; mark the function @sensitive (callers keep its result sensitive) or @declassify (an audited release)\n    Fix: write `@sensitive fn ...` (callers keep the result sensitive) or `@declassify fn ...` (an audited release) on it.");
         }
         i = i + 1;
     }
@@ -721,9 +721,9 @@ fn sec_store(self: &mut SecrecyChecker, name: str, l: Vec<i64>) {
         var rpi: i64 = sec_ref_param_index(self, name);
         if rpi >= 0 && !self.declassify {
             if sec_has(l, -1) && !self.may_return_secret {
-                sec_error(self, "@secret", "writes a secret value through reference parameter '" + name + "'; mark the function @secret or @declassify");
+                sec_error(self, "@secret", "writes a secret value through reference parameter '" + name + "'; mark the function @secret or @declassify\n    Fix: write `@secret fn ...` or `@declassify fn ...` on it, or do not write the value through '" + name + "'.");
             } else if sec_has(l, -2) && !self.may_return_sensitive {
-                sec_error(self, "@sensitive", "writes a sensitive value through reference parameter '" + name + "'; mark the function @sensitive or @declassify");
+                sec_error(self, "@sensitive", "writes a sensitive value through reference parameter '" + name + "'; mark the function @sensitive or @declassify\n    Fix: write `@sensitive fn ...` or `@declassify fn ...` on it, or do not write the value through '" + name + "'.");
             }
             sec_note_writes(self, rpi, l);
         }
@@ -1288,9 +1288,9 @@ fn sec_apply_summary(self: &mut SecrecyChecker, name: str, slot: i64, summ: SecS
                 pname = pnames.get(i);
             }
             if sec_has(l, -1) {
-                sec_error(self, "@secret", "a secret value is passed to '" + name + "', which outputs its parameter '" + pname + "'");
+                sec_error(self, "@secret", "a secret value is passed to '" + name + "', which outputs its parameter '" + pname + "'\n    Fix: pass a value computed without the secret, or call '" + name + "' from a function marked @declassify.");
             } else if sec_has(l, -2) {
-                sec_error(self, "@sensitive", "a sensitive value is passed to '" + name + "', which outputs its parameter '" + pname + "'");
+                sec_error(self, "@sensitive", "a sensitive value is passed to '" + name + "', which outputs its parameter '" + pname + "'\n    Fix: pass the value through privacy's `release(consent, v)` first, or call '" + name + "' from a function marked @declassify.");
             }
             var oi: i64 = 0;
             while oi < l.len() {
@@ -1305,9 +1305,9 @@ fn sec_apply_summary(self: &mut SecrecyChecker, name: str, slot: i64, summ: SecS
     if summ.outputs {
         sec_note_output(self);
         if sec_has(pc, -1) {
-            sec_error(self, "@secret", "'" + name + "' produces output and is called inside a branch or loop that depends on a secret");
+            sec_error(self, "@secret", "'" + name + "' produces output and is called inside a branch or loop that depends on a secret\n    Fix: call '" + name + "' outside the branch, with an argument that does not reveal the secret.");
         } else if sec_has(pc, -2) {
-            sec_error(self, "@sensitive", "'" + name + "' produces output and is called inside a branch or loop that depends on sensitive data");
+            sec_error(self, "@sensitive", "'" + name + "' produces output and is called inside a branch or loop that depends on sensitive data\n    Fix: call '" + name + "' outside the branch, or release the condition first (privacy's `release(consent, v)`).");
         }
         var pi: i64 = 0;
         while pi < pc.len() {

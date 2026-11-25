@@ -35,9 +35,9 @@ So the three things RT2 asked for already hold with one word:
 - Binary data reaches files and sockets: HTTP bodies are binary (release
   I8), and `p_file_write_bin(path, data, n)` writes `n` bytes, zero bytes
   included, on the interpreter, C, pe_ir and the machine layer
-  (test_file_write_bin). `p_file_write`/`p_file_append` stay text
-  builtins that stop at the first zero byte, as `fputs` does
-  (test_binary_io).
+  (test_file_write_bin). `p_file_write`/`p_file_append` write the
+  string's full counted length, zero bytes included, on every backend
+  (BG81; test_binary_io).
 
 ## Decision: keep the one-word `str`
 

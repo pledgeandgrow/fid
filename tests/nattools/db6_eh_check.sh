@@ -29,7 +29,10 @@ command -v python3 >/dev/null 2>&1 || PY=python
 HOST=linux
 case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) HOST=windows ;; Darwin) HOST=macos ;; esac
 WSL=""
-if [ "$HOST" = windows ] && command -v wsl.exe >/dev/null 2>&1; then WSL="wsl.exe -e"; fi
+# command -v wsl.exe alone is not enough: the launcher stays on PATH when
+# no distribution is installed, and a run then prints WSL's error instead
+# of the program's output. Probe that a command really runs inside WSL.
+if [ "$HOST" = windows ] && command -v wsl.exe >/dev/null 2>&1 && wsl.exe -e true >/dev/null 2>&1; then WSL="wsl.exe -e"; fi
 fails=0
 ok() { echo "ok   $1"; }
 bad() { echo "FAIL $1"; fails=$((fails + 1)); }

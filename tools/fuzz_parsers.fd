@@ -1,0 +1,467 @@
+// tools/fuzz_parsers.fd — fuzz the stdlib parsers (roadmap VF15): the
+// Fides port of scripts/fuzz/fuzz_parsers.py (roadmap AD4). Same
+// arguments, the same inputs for a seed (the numbers are drawn from
+// tools/py_random.fd, Python's own generator, and an input is cut and
+// spliced by code point as the script cuts a str), the same output, kept
+// findings and exit status:
+//
+//   fid ccompile tools/fuzz_parsers.fd -o fuzz_parsers.exe
+//   fuzz_parsers.exe --fid release/fid.exe [-n 2000] [--seed 1]
+//       [--parsers json,regex,http,csv,toml,xml,url,uuid,tls] [--out build/fuzz-parsers]
+//       [--backend ccompile|emit] [--timeout 20]
+//
+// tests/fuzz/parsers.fd is built once (through C by default); each input,
+// a mutant of a seed of its format, is written to <out>/input.txt and the
+// driver runs the parser on it. A finding is any non-zero exit, crash or
+// hang that happens again; one is kept per distinct first line of the
+// error, as <out>/<parser>-<n>.txt with the output beside it. The script's
+// header says more.
+//
+// Differences from the script: the build's output is read as UTF-8 (the
+// script, on Windows, in the console's code page); \d and strip() know
+// ASCII and the common Unicode spaces; the parser driver gets our stdin;
+// a parser name with no seeds is an error message with exit status 2 (the
+// script raises KeyError).
+
+use core;
+use fs;
+use io;
+use process;
+use py_random;
+use fuzz_lib;
+
+fn parser_names() -> Vec<str> {
+    val s: str = "json,regex,http,csv,toml,xml,url,uuid,tls";
+    return str_split(s, ",");
+}
+
+fn hexcps(h: str) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i + 1 < str_len(h) {
+        val a: i64 = hexv(str_byte_at(h, i));
+        if a < 0 {
+            i = i + 1;
+            continue;
+        }
+        out.push(a * 16 + hexv(str_byte_at(h, i + 1)));
+        i = i + 2;
+    }
+    return out;
+}
+
+fn hexv(c: i64) -> i64 {
+    if c >= 48 && c <= 57 { return c - 48; }
+    if c >= 97 && c <= 102 { return c - 87; }
+    if c >= 65 && c <= 70 { return c - 55; }
+    return -1;
+}
+
+fn push_s(v: &mut Vec<Vec<i64>>, s: str) {
+    v.push(fl_cps(s));
+}
+
+/// SEEDS[which], as code points.
+fn seeds_of(which: str) -> Vec<Vec<i64>> {
+    var v: Vec<Vec<i64>> = Vec::new();
+    if which == "json" {
+        push_s(&mut v, "{\"a\": [1, 2.5, -3e2, true, false, null, {\"b\": \"x\\n\\u00e9\"}]}");
+        push_s(&mut v, "[]");
+        push_s(&mut v, "{}");
+        push_s(&mut v, "\"s\"");
+        push_s(&mut v, "[[[[1]]]]");
+        push_s(&mut v, "{\"k\": {\"k\": {\"k\": []}}}");
+        push_s(&mut v, "123");
+        push_s(&mut v, "-0.0");
+        push_s(&mut v, "\"\\ud83d\\ude00\"");
+    } else if which == "regex" {
+        push_s(&mut v, "a*b\naaab");
+        push_s(&mut v, "^(ab|cd)+$\nabcdab");
+        push_s(&mut v, "[a-z0-9_]+@[a-z]+\\.com\nme@x.com");
+        push_s(&mut v, "x?y{2,3}\nyyy");
+        push_s(&mut v, "(a|b)*c\nababc");
+        push_s(&mut v, ".\\d\\w\\s\nx1_ ");
+        push_s(&mut v, "[^abc]\nd");
+        push_s(&mut v, "a{3}\naaa");
+    } else if which == "http" {
+        push_s(&mut v, "GET /index.html?x=1&y=2 HTTP/1.1\r\nHost: example.com\r\nContent-Length: 0\r\n\r\n");
+        push_s(&mut v, "POST /api HTTP/1.1\r\nHost: a\r\nContent-Type: application/json\r\nContent-Length: 7\r\n\r\n{\"a\":1}");
+        push_s(&mut v, "GET / HTTP/1.0\r\n\r\n");
+        push_s(&mut v, "PUT /x HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n");
+    } else if which == "csv" {
+        push_s(&mut v, "a,b,c\n1,2,3\n");
+        push_s(&mut v, "name,\"quoted, field\",\"with \"\"quotes\"\"\"\nx,y,z\n");
+        push_s(&mut v, "\n\n,,\n");
+        push_s(&mut v, "a;b\r\n1;2\r\n");
+        push_s(&mut v, "h1,h2\n\"multi\nline\",2\n");
+    } else if which == "toml" {
+        push_s(&mut v, "title = \"x\"\n[owner]\nname = \"Tom\"\ndob = 1979-05-27T07:32:00Z\n");
+        push_s(&mut v, "[a.b]\nc = [1, 2, 3]\nd = { e = 1, f = \"g\" }\n");
+        push_s(&mut v, "[[arr]]\nx = 1\n[[arr]]\nx = 2\n");
+        push_s(&mut v, "k = \"\"\"multi\nline\"\"\"\nb = true\nf = 3.14\n");
+        push_s(&mut v, "s = 'literal'\nn = -12\n");
+    } else if which == "xml" {
+        push_s(&mut v, "<?xml version=\"1.0\"?><root a=\"1\" b='2'><c>text &amp; more</c><d/><!-- c --></root>");
+        push_s(&mut v, "<a><b><c><d>deep</d></c></b></a>");
+        push_s(&mut v, "<x><![CDATA[raw <stuff>]]></x>");
+        push_s(&mut v, "<e attr=\"&lt;&gt;\"/>");
+    } else if which == "url" {
+        push_s(&mut v, "https://user:pw@example.com:8080/p/a/t/h?query=1&x=%20y#frag");
+        push_s(&mut v, "http://[::1]:80/");
+        push_s(&mut v, "mailto:me@x.com");
+        push_s(&mut v, "file:///c:/x/y");
+        push_s(&mut v, "/relative/path?a=b");
+        push_s(&mut v, "http://h/%zz%4");
+    } else if which == "uuid" {
+        push_s(&mut v, "123e4567-e89b-12d3-a456-426614174000");
+        push_s(&mut v, "00000000-0000-0000-0000-000000000000");
+        push_s(&mut v, "{123E4567-E89B-12D3-A456-426614174000}");
+        push_s(&mut v, "123e4567e89b12d3a456426614174000");
+    } else if which == "tls" {
+        // records: a ClientHello-like handshake record, an alert, a CCS, a
+        // protected record (17 bytes: type + tag), a stream split mid-record
+        v.push(hexcps("16 03 01 00 0b 01 00 00 07 03 03 00 01 02 03 04"));
+        v.push(hexcps("15 03 03 00 02 02 28"));
+        v.push(hexcps("14 03 03 00 01 01 17 03 03 00 11 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00"));
+        v.push(hexcps("16 03 03 00 08 14 00 00 04 61 62 63 64 16 03 03 00"));
+        var rec: Vec<i64> = hexcps("17 03 03 40 00");
+        var k: i64 = 0;
+        while k < 64 {
+            rec.push(120);
+            k = k + 1;
+        }
+        v.push(rec);
+    }
+    return v;
+}
+
+fn interesting() -> Vec<Vec<i64>> {
+    var v: Vec<Vec<i64>> = Vec::new();
+    var nul: Vec<i64> = Vec::new();
+    nul.push(0);
+    v.push(nul);
+    push_s(&mut v, "\\");
+    push_s(&mut v, "\"");
+    push_s(&mut v, "'");
+    push_s(&mut v, "<");
+    push_s(&mut v, ">");
+    push_s(&mut v, "&");
+    push_s(&mut v, "%");
+    push_s(&mut v, "{");
+    push_s(&mut v, "}");
+    push_s(&mut v, "[");
+    push_s(&mut v, "]");
+    push_s(&mut v, "\r");
+    push_s(&mut v, "\n");
+    push_s(&mut v, ",");
+    push_s(&mut v, ";");
+    push_s(&mut v, "=");
+    push_s(&mut v, "-");
+    push_s(&mut v, "+");
+    push_s(&mut v, ".");
+    push_s(&mut v, "e");
+    push_s(&mut v, "999999999999999999999999999999");
+    push_s(&mut v, "\\u");
+    push_s(&mut v, "\\ud800");
+    var ff: Vec<i64> = Vec::new();
+    ff.push(255);
+    v.push(ff);
+    var e9: Vec<i64> = Vec::new();
+    e9.push(233);
+    v.push(e9);
+    push_s(&mut v, "(");
+    push_s(&mut v, ")");
+    push_s(&mut v, "*");
+    push_s(&mut v, "?");
+    push_s(&mut v, "|");
+    push_s(&mut v, "^");
+    push_s(&mut v, "$");
+    push_s(&mut v, "[[");
+    push_s(&mut v, "]]");
+    push_s(&mut v, "<!--");
+    push_s(&mut v, "]]>");
+    push_s(&mut v, "%%");
+    push_s(&mut v, "%0");
+    push_s(&mut v, "::");
+    push_s(&mut v, "//");
+    push_s(&mut v, "#");
+    push_s(&mut v, "@");
+    return v;
+}
+
+fn sub(v: &Vec<i64>, a: i64, b: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = a;
+    var e: i64 = b;
+    if e > v.len() { e = v.len(); }
+    while i < e {
+        out.push(v.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn app(out: &mut Vec<i64>, v: &Vec<i64>) {
+    var i: i64 = 0;
+    while i < v.len() {
+        out.push(v.get(i));
+        i = i + 1;
+    }
+}
+
+fn rep(s: str, d: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < d {
+        var k: i64 = 0;
+        while k < str_len(s) {
+            out.push(str_byte_at(s, k));
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn mutate(r: &mut PyRng, s0: &Vec<i64>, ints: &Vec<Vec<i64>>) -> Vec<i64> {
+    var s: Vec<i64> = sub(s0, 0, s0.len());
+    val times: i64 = py_randint(r, 1, 5);
+    var t: i64 = 0;
+    while t < times {
+        t = t + 1;
+        val n: i64 = s.len();
+        val k: i64 = py_randint(r, 0, 6);
+        val i: i64 = py_below(r, n + 1);
+        var out: Vec<i64> = sub(&s, 0, i);
+        if k == 0 && n > 0 {
+            val cut: i64 = i + py_randint(r, 1, 8);
+            app(&mut out, &sub(&s, cut, n));
+        } else if k == 1 {
+            app(&mut out, &ints.get(py_below(r, ints.len())));
+            app(&mut out, &sub(&s, i, n));
+        } else if k == 2 && n > 0 {
+            var j: i64 = i + py_randint(r, 1, 16);
+            if j > n { j = n; }
+            out = sub(&s, 0, j);
+            val times2: i64 = py_randint(r, 1, 4);
+            val piece: Vec<i64> = sub(&s, i, j);
+            var c: i64 = 0;
+            while c < times2 {
+                app(&mut out, &piece);
+                c = c + 1;
+            }
+            app(&mut out, &sub(&s, j, n));
+        } else if k == 3 {
+            // s[:i]
+        } else if k == 4 {
+            val dk: i64 = py_below(r, 3);
+            var d: i64 = 10;
+            if dk == 1 { d = 100; }
+            if dk == 2 { d = 2000; }
+            val pk: i64 = py_below(r, 5);
+            var o: str = "(";
+            var cl: str = ")";
+            if pk == 0 {
+                o = "[";
+                cl = "]";
+            } else if pk == 1 {
+                o = "{";
+                cl = "}";
+            } else if pk == 2 {
+                o = "<a>";
+                cl = "</a>";
+            } else if pk == 4 {
+                o = "{\"a\":";
+                cl = "}";
+            }
+            app(&mut out, &rep(o, d));
+            app(&mut out, &rep(cl, d));
+            app(&mut out, &sub(&s, i, n));
+        } else if k == 5 && n > 0 {
+            out.push(py_randrange(r, 1, 256));
+            app(&mut out, &sub(&s, i + 1, n));
+        } else {
+            var nums: Vec<str> = Vec::new();
+            nums.push("-1");
+            nums.push("0");
+            nums.push("2147483648");
+            nums.push("9223372036854775808");
+            nums.push("-9223372036854775808");
+            nums.push("1000000000000000000000000000000");
+            app(&mut out, &fl_cps(nums.get(py_below(r, nums.len()))));
+            app(&mut out, &sub(&s, i, n));
+        }
+        s = out;
+    }
+    return s;
+}
+
+/// s.encode("latin-1", "replace"): each code point a byte, "?" past 255.
+fn latin1(v: &Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < v.len() {
+        val c: i64 = v.get(i);
+        if c > 255 { out.push(63); } else { out.push(c); }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn is_space(c: i64) -> bool {
+    if (c >= 9 && c <= 13) || (c >= 28 && c <= 32) || c == 133 || c == 160 || c == 5760 { return true; }
+    if (c >= 8192 && c <= 8202) || c == 8232 || c == 8233 || c == 8239 || c == 8287 || c == 12288 { return true; }
+    return false;
+}
+
+fn strip(s: str) -> str {
+    val cps: Vec<i64> = fl_cps(s);
+    var a: i64 = 0;
+    var b: i64 = cps.len();
+    while a < b && is_space(cps.get(a)) { a = a + 1; }
+    while b > a && is_space(cps.get(b - 1)) { b = b - 1; }
+    return fl_encode(&cps, a, b);
+}
+
+/// re.sub(r"\d+", "N", s)
+fn blur_numbers(s: str) -> str {
+    val n: i64 = str_len(s);
+    var b: StringBuilder = StringBuilder::new();
+    var i: i64 = 0;
+    while i < n {
+        if fl_digit(str_byte_at(s, i)) {
+            while i < n && fl_digit(str_byte_at(s, i)) { i = i + 1; }
+            b.append_str("N");
+        } else {
+            b.append_str(str_slice(s, i, i + 1));
+            i = i + 1;
+        }
+    }
+    return b.to_str();
+}
+
+fn int_opt(av: &Vec<str>, name: str, def: i64) -> i64 {
+    val s: str = fl_opt(av, name, int_to_str(def));
+    val v: i64 = fl_int(s, -987654321);
+    if v == -987654321 {
+        io_eprintln("fuzz_parsers: argument " + name + ": invalid int value: '" + s + "'");
+        process_exit(2);
+    }
+    return v;
+}
+
+fn main() -> i64 {
+    val av: Vec<str> = fl_args();
+    val fid: str = fl_opt(&av, "--fid", fl_join("release", "fid.exe"));
+    val n: i64 = int_opt(&av, "-n", 1000);
+    val seed: i64 = int_opt(&av, "--seed", 1);
+    val plist: str = fl_opt(&av, "--parsers", fl_join_lines(&parser_names(), ","));
+    val out: str = fl_opt(&av, "--out", fl_join("build", "fuzz-parsers"));
+    val backend: str = fl_opt(&av, "--backend", "ccompile");
+    val timeout: i64 = int_opt(&av, "--timeout", 20);
+    fl_setdefault_env("CC", "zig cc");
+    fl_mkdirs(out);
+    val exe: str = fl_abspath(fl_join(out, "parsers.exe"));
+    var bc: Vec<str> = fl_v3(fid, backend, fl_join(fl_join("tests", "fuzz"), "parsers.fd"));
+    bc.push("-o");
+    bc.push(exe);
+    val b: FlRun = fl_run(&bc, "", 0);
+    if b.code != 0 || !fl_exists(exe) {
+        fl_print("could not build tests/fuzz/parsers.fd:\n" + fl_tail_cps(fl_as_text(b.out) + fl_as_text(b.err), 3000));
+        return 2;
+    }
+    var r: PyRng = py_rng(seed);
+    val parsers: Vec<str> = str_split(plist, ",");
+    var all_seeds: Vec<Vec<Vec<i64>>> = Vec::new();
+    var pi: i64 = 0;
+    while pi < parsers.len() {
+        val sv: Vec<Vec<i64>> = seeds_of(parsers.get(pi));
+        if sv.len() == 0 {
+            io_eprintln("fuzz_parsers: no seeds for parser '" + parsers.get(pi) + "'");
+            return 2;
+        }
+        all_seeds.push(sv);
+        pi = pi + 1;
+    }
+    val ints: Vec<Vec<i64>> = interesting();
+    val inp: str = fl_join(out, "input.txt");
+    val no_env: Vec<str> = Vec::new();
+    var fkeys: Vec<str> = Vec::new();
+    var per: Vec<i64> = Vec::new();
+    var pnames: Vec<str> = Vec::new();
+    pi = 0;
+    while pi < parsers.len() {
+        if !fl_contains(&pnames, parsers.get(pi)) {
+            pnames.push(parsers.get(pi));
+            per.push(0);
+        }
+        pi = pi + 1;
+    }
+    var i: i64 = 0;
+    while i < n {
+        val wi: i64 = i % parsers.len();
+        val which: str = parsers.get(wi);
+        val sv2: Vec<Vec<i64>> = all_seeds.get(wi);
+        val base: Vec<i64> = sv2.get(py_below(&mut r, sv2.len()));
+        val s: Vec<i64> = mutate(&mut r, &base, &ints);
+        if which == "tls" {
+            fs_write_bytes(inp, latin1(&s));
+        } else {
+            fl_write(inp, fl_encode_all(&s));
+        }
+        val q: FlRun = fl_run_env_ms(&fl_v3(exe, which, inp), &no_env, "", timeout * 1000);
+        var rc: str = "timeout";
+        var text: str = "";
+        if !q.timed_out {
+            rc = int_to_str(q.code);
+            text = fl_decode_str(q.out + q.err);
+        }
+        val at: i64 = fl_index(&pnames, which);
+        per.set(at, per.get(at) + 1);
+        i = i + 1;
+        if rc == "0" { continue; }
+        // a finding must happen again (an OOM can be the machine's)
+        val q2: FlRun = fl_run_env_ms(&fl_v3(exe, which, inp), &no_env, "", timeout * 1000);
+        if !q2.timed_out && q2.code == 0 {
+            fl_print("[" + int_to_str(i - 1) + "] " + which + ": not reproducible (exit " + rc + "), dropped");
+            continue;
+        }
+        var first: str = "";
+        var found: bool = false;
+        val ls: Vec<str> = fl_lines(text);
+        var li: i64 = 0;
+        while li < ls.len() && !found {
+            val l: str = ls.get(li);
+            if str_contains(l, "Panic") || str_contains(l, "CRASH") || str_contains(l, "overflow") {
+                first = l;
+                found = true;
+            }
+            li = li + 1;
+        }
+        if !found { first = fl_head_cps(text, 80); }
+        first = fl_head_cps(blur_numbers(strip(first)), 100);
+        var what: str = rc;
+        if !q.timed_out { what = "exit " + fl_hex0x(q.code & 4294967295); }
+        val key: str = which + ": " + what + ": " + first;
+        if fl_contains(&fkeys, key) { continue; }
+        val num: i64 = fkeys.len();
+        fkeys.push(key);
+        fl_write(fl_join(out, which + "-" + int_to_str(num) + ".txt"), fl_encode_all(&s));
+        fl_write_textmode(fl_join(out, which + "-" + int_to_str(num) + ".out"), "exit: " + rc + "\n" + fl_tail_cps(text, 4000));
+        fl_print("[" + int_to_str(i - 1) + "] " + key);
+    }
+    var parts: Vec<str> = Vec::new();
+    var k: i64 = 0;
+    while k < pnames.len() {
+        parts.push(pnames.get(k) + " " + int_to_str(per.get(k)));
+        k = k + 1;
+    }
+    fl_print(int_to_str(n) + " inputs (" + fl_join_lines(&parts, ", ") + "): " + int_to_str(fkeys.len()) + " distinct findings");
+    k = 0;
+    while k < fkeys.len() {
+        fl_print("  " + fkeys.get(k));
+        k = k + 1;
+    }
+    if fkeys.len() > 0 { return 1; }
+    return 0;
+}

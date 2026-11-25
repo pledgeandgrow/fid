@@ -1,0 +1,263 @@
+// tools/wasm_test.fd — run tests through the native WebAssembly backend:
+// the Fides port of scripts/wasm-test.sh (roadmap AD4). Same arguments,
+// the same environment (FID, JOBS, OUT, ALL, REUSE), the same files in
+// $OUT and the same output and exit status:
+//
+//   fid ccompile tools/wasm_test.fd -o wasm_test.exe
+//   wasm_test.exe [test.fd ...]
+//   fid run tools/wasm_test.fd [test.fd ...]
+//
+// Run it from the repository root. Each test: `fid run` (120 s) is the
+// reference; `fid wasm <test> -o $OUT/<test>.wasm` (600 s) builds it;
+// `node tests/wasm/validate.mjs` must accept the module (else BUILD);
+// `node scripts/wasm-run.mjs` (60 s) runs it under Node's WASI. Output,
+// exit code and the panic's message are compared. Node stays: it is the
+// WASI host (the two .mjs files are JavaScript).
+//
+// Differences: the steps of the tests run in three rounds (every run and
+// build, then the validations, then the runs under Node), JOBS commands
+// at a time, where the script runs each test's steps in turn, JOBS tests
+// at a time: the same files, other timing; every child's stdin is at its
+// end.
+
+use core;
+use fs;
+use io;
+use process;
+use target_test_lib;
+
+fn wt_skip_re(base: str) -> bool {
+    if !str_ends_with(base, ".fd") { return false; }
+    val s: str = str_slice(base, 0, str_len(base) - 3);
+    if str_starts_with(s, "test_bare") || str_starts_with(s, "test_pe_") || str_starts_with(s, "test_dll_") { return true; }
+    val names: Vec<str> = str_split("test_comptime_basic test_comptime_func test_comptime_reflect test_comptime_serialize test_comptime_gen test_http test_json test_tensor test_autodiff test_kv_cache test_quantization test_checkpoint test_shard test_lora test_simd test_shape test_shape_verify test_wasm test_allocator test_effect_handler test_asm test_asm_pe test_boot test_interrupt test_mmu test_gat test_ffi_header test_dlopen test_game_stdlib test_kernel_serial test_serial_hello test_os_gaps test_phase8b test_vec_math test_sqlite test_parse_header_sqlite test_lib_sdl test_lib_gl test_lib_font test_lib_image test_lib_audio test_lib_audio_mixer test_lib_shader test_lib_mesh test_elf_native", " ");
+    var i: i64 = 0;
+    while i < names.len() {
+        if names.get(i) == s { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// The first line of `text` holding (any case) error, not available,
+/// panic or INVALID, cut to `max` bytes ("" when none).
+fn wt_grep_build(text: str) -> str {
+    val lines: Vec<str> = tt_lines(text);
+    var i: i64 = 0;
+    while i < lines.len() {
+        val l: str = lines.get(i);
+        i = i + 1;
+        val low: str = str_to_lower(l);
+        if str_contains(low, "error") || str_contains(low, "not available") || str_contains(low, "panic") || str_contains(low, "invalid") {
+            if str_len(l) > 160 { return str_slice(l, 0, 160); }
+            return l;
+        }
+    }
+    return "";
+}
+
+fn wt_v3(a: str, b: str, c: str) -> Vec<str> {
+    var v: Vec<str> = Vec::new();
+    v.push(a);
+    v.push(b);
+    v.push(c);
+    return v;
+}
+
+fn main() -> i64 {
+    val args: Vec<str> = tt_args();
+    val host: str = tt_host();
+    var fid: str = tt_env("FID");
+    if str_len(fid) == 0 {
+        if host == "windows" { fid = "release/fid.exe"; } else { fid = "release/fid"; }
+    }
+    val jobs_s: str = tt_env_or("JOBS", "4");
+    val jobs: i64 = str_parse_int(jobs_s);
+    val out: str = tt_env_or("OUT", "build/wasm-native");
+    tt_mkdir_p(out);
+
+    var tests: Vec<str> = Vec::new();
+    if args.len() > 0 {
+        tests = args;
+    } else if tt_env("ALL") == "1" {
+        val files: Vec<str> = tt_glob("tests/bootstrap", "", ".fd");
+        var i: i64 = 0;
+        while i < files.len() {
+            val f: str = files.get(i);
+            i = i + 1;
+            val b: str = str_slice(f, 16, str_len(f));
+            if str_starts_with(b, "test_panic_") && str_ends_with(b, "_fail.fd") && str_len(b) >= 19 {
+                tests.push(f);
+                continue;
+            }
+            if str_ends_with(b, "_fail.fd") || str_ends_with(b, "_fail2.fd") { continue; }
+            if wt_skip_re(b) && !str_starts_with(b, "test_wasm_") { continue; }
+            if tt_head3_has(f, "expect-error") { continue; }
+            tests.push(f);
+        }
+    } else {
+        val ws: Vec<str> = tt_glob("tests/bootstrap", "test_wasm_", ".fd");
+        var i2: i64 = 0;
+        while i2 < ws.len() {
+            tests.push(ws.get(i2));
+            i2 = i2 + 1;
+        }
+        val more: Vec<str> = str_split("test_int_semantics test_panic_overflow_fail test_panic_div_zero_fail test_panic_min_div_fail", " ");
+        i2 = 0;
+        while i2 < more.len() {
+            tests.push("tests/bootstrap/" + more.get(i2) + ".fd");
+            i2 = i2 + 1;
+        }
+    }
+    println("fid wasm: " + int_to_str(tests.len()) + " tests, " + jobs_s + " at a time, output in " + out);
+
+    var env: Vec<str> = Vec::new();
+    env.push("FID=" + fid);
+    env.push("OUT=" + out);
+    val reuse: bool = tt_env("REUSE") == "1";
+    // round 1: the reference run and the build of each test
+    var todo: Vec<str> = Vec::new();
+    var cmds: Vec<str> = Vec::new();
+    var outs: Vec<str> = Vec::new();
+    var errs: Vec<str> = Vec::new();
+    var secs: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < tests.len() {
+        val f: str = tests.get(i);
+        i = i + 1;
+        val b: str = tt_base(f);
+        if reuse && fs_exists(out + "/" + b + ".actual_rc") { continue; }
+        todo.push(f);
+        cmds.push(tt_pack(wt_v3(fid, "run", f)));
+        outs.push(out + "/" + b + ".expected");
+        errs.push(out + "/" + b + ".expected_err");
+        secs.push(120);
+        var bc: Vec<str> = wt_v3(fid, "wasm", f);
+        bc.push("-o");
+        bc.push(out + "/" + b + ".wasm");
+        cmds.push(tt_pack(bc));
+        outs.push(out + "/" + b + ".build.log");
+        errs.push("");
+        secs.push(600);
+    }
+    val c1: Vec<i64> = tt_pool(cmds, env, outs, errs, secs, jobs);
+    // round 2: the engine must validate what built
+    var built: Vec<str> = Vec::new();
+    cmds = Vec::new();
+    outs = Vec::new();
+    errs = Vec::new();
+    secs = Vec::new();
+    i = 0;
+    while i < todo.len() {
+        val b: str = tt_base(todo.get(i));
+        fs_write_text(out + "/" + b + ".expected_rc", int_to_str(c1.get(2 * i)) + "\n");
+        val rc: i64 = c1.get(2 * i + 1);
+        fs_write_text(out + "/" + b + ".build_rc", int_to_str(rc) + "\n");
+        i = i + 1;
+        if rc != 0 { continue; }
+        built.push(b);
+        cmds.push(tt_pack(wt_v3("node", "tests/wasm/validate.mjs", out + "/" + b + ".wasm")));
+        outs.push(out + "/" + b + ".valid.log");
+        errs.push("");
+        secs.push(0);
+    }
+    val c2: Vec<i64> = tt_pool(cmds, env, outs, errs, secs, jobs);
+    // round 3: run what is valid under Node
+    var valid: Vec<str> = Vec::new();
+    cmds = Vec::new();
+    outs = Vec::new();
+    errs = Vec::new();
+    secs = Vec::new();
+    i = 0;
+    while i < built.len() {
+        val b: str = built.get(i);
+        val ok: bool = c2.get(i) == 0;
+        i = i + 1;
+        if !ok {
+            val pre: str = out + "/" + b;
+            fs_write_text(pre + ".build.log", tt_read(pre + ".build.log") + tt_read(pre + ".valid.log"));
+            fs_write_text(pre + ".build_rc", "1\n");
+            continue;
+        }
+        valid.push(b);
+        cmds.push(tt_pack(wt_v3("node", "scripts/wasm-run.mjs", out + "/" + b + ".wasm")));
+        outs.push(out + "/" + b + ".actual");
+        errs.push(out + "/" + b + ".stderr");
+        secs.push(60);
+    }
+    val c3: Vec<i64> = tt_pool(cmds, env, outs, errs, secs, jobs);
+    i = 0;
+    while i < valid.len() {
+        fs_write_text(out + "/" + valid.get(i) + ".actual_rc", int_to_str(c3.get(i)) + "\n");
+        i = i + 1;
+    }
+
+    // compare
+    var pass: i64 = 0;
+    var fail: i64 = 0;
+    var berr: i64 = 0;
+    var skip: i64 = 0;
+    val res: str = out + "/results.txt";
+    fs_write_text(res, "");
+    i = 0;
+    while i < tests.len() {
+        val f: str = tests.get(i);
+        i = i + 1;
+        val b: str = tt_base(f);
+        val pre: str = out + "/" + b;
+        val erc: str = tt_cat(pre + ".expected_rc");
+        if erc == "124" || tt_has_line_prefix(pre + ".expected", "Compilation error") || tt_has_line_prefix(pre + ".expected", "error: ") {
+            tt_append_line(res, "SKIP  " + b + " (fid run gives no reference: rc " + erc + ")");
+            skip = skip + 1;
+            continue;
+        }
+        if str_contains(tt_read(pre + ".expected_err"), "is not available in the interpreter") {
+            tt_append_line(res, "SKIP  " + b + " (fid run cannot run its FFI)");
+            skip = skip + 1;
+            continue;
+        }
+        if tt_cat(pre + ".build_rc") != "0" {
+            tt_append_line(res, "BUILD " + b + ": " + wt_grep_build(tt_read(pre + ".build.log")));
+            berr = berr + 1;
+            continue;
+        }
+        val sl: Vec<str> = tt_lines(tt_read(pre + ".stderr"));
+        var na: str = "";
+        var k: i64 = 0;
+        while k < sl.len() {
+            if str_starts_with(sl.get(k), "Panic: not available in WebAssembly") {
+                na = sl.get(k);
+                break;
+            }
+            k = k + 1;
+        }
+        if str_len(na) > 0 {
+            var e: i64 = str_len(na);
+            if e > 120 { e = 120; }
+            tt_append_line(res, "SKIP  " + b + " (" + str_slice(na, 7, e) + ")");
+            skip = skip + 1;
+            continue;
+        }
+        val arc: str = tt_cat(pre + ".actual_rc");
+        if arc == erc && tt_panic_key(pre + ".expected_err", false) == tt_panic_key(pre + ".stderr", false) && tt_no_cr(tt_read(pre + ".expected")) == tt_no_cr(tt_read(pre + ".actual")) {
+            tt_append_line(res, "PASS  " + b);
+            pass = pass + 1;
+        } else {
+            tt_append_line(res, "FAIL  " + b + " (rc " + arc + ", interpreter " + erc + ")");
+            fail = fail + 1;
+        }
+    }
+    val rl: Vec<str> = tt_lines(tt_read(res));
+    var shown: i64 = 0;
+    i = 0;
+    while i < rl.len() && shown < 60 {
+        val l: str = rl.get(i);
+        i = i + 1;
+        if str_starts_with(l, "PASS") { continue; }
+        println(l);
+        shown = shown + 1;
+    }
+    println("fid wasm: " + int_to_str(pass) + " passed, " + int_to_str(fail) + " failed, " + int_to_str(berr) + " did not build, " + int_to_str(skip) + " skipped (of " + int_to_str(tests.len()) + ")");
+    if fail == 0 && berr == 0 { return 0; }
+    return 1;
+}

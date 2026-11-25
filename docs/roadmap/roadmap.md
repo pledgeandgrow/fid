@@ -96,7 +96,8 @@ The sections below are history. What is true now:
 
 Current plans: `release-roadmap.md`, `competitive-roadmap.md`,
 `complaint-roadmap.md`, `llvm-roadmap.md`, `inc-roadmap.md`, `pe-roadmap.md`,
-`evolution-roadmap.md` (language features from other languages, Nov 24).
+`evolution-roadmap.md` (language features from other languages, Nov 24),
+`target-roadmap.md` (100 goals: every major platform with no toolchain, Nov 24).
 
 **Triage of the open items (Nov 15).** Every `[ ]` in this file was checked
 against the code (`compiler/*.fd`, `stdlib/`, `tests/`) and the newer

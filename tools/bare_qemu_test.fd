@@ -1,0 +1,284 @@
+// tools/bare_qemu_test.fd — the bare-metal tests under QEMU: the Fides
+// port of scripts/bare-qemu-test.sh (roadmap AD4). Same arguments, the
+// same environment (FID, QEMU, OUT, TIMEOUT, BUILD, RUN, VERBOSE), the
+// same files in $OUT and the same output and exit status:
+//
+//   fid ccompile tools/bare_qemu_test.fd -o bare_qemu_test.exe
+//   bare_qemu_test.exe [tests...]
+//   fid run tools/bare_qemu_test.fd [tests...]
+//
+// Run it from the repository root. Each test is built with `fid emit
+// <test> --bare` (a Multiboot kernel) and booted with
+// `qemu-system-x86_64 -kernel <bin> -serial stdio -display none
+// -no-reboot -nic none -m 128 -device isa-debug-exit,iobase=0xf4,iosize=0x01`
+// (TIMEOUT seconds); QEMU's status 2*code+1 is the program's exit code.
+// The serial output and the code are compared with the test's
+// `// Expected output:` block and `// Expected exit: N`, or, for the
+// kernel tests listed below, with what is written here. QEMU stays
+// external, and so does `diff` (the failure report shows `diff
+// <expected> <actual>`, as the script does).
+//
+// Differences: a default $OUT is a new folder "bare-qemu.<pid><time>" in
+// $TMPDIR (else $TEMP, else /tmp), where mktemp makes a random name; QEMU's
+// stdin is at its end (the script gives it /dev/null too).
+
+use core;
+use fs;
+use io;
+use process;
+use target_test_lib;
+
+/// printf '%b': \n, \r, \t and \\ in `s` as the characters.
+fn bq_unescape(s: str) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    while i < str_len(s) {
+        val c: i64 = str_byte_at(s, i);
+        if c == 92 && i + 1 < str_len(s) {
+            val d: i64 = str_byte_at(s, i + 1);
+            if d == 110 {
+                out = out + "\n";
+                i = i + 2;
+                continue;
+            }
+            if d == 114 {
+                out = out + "\r";
+                i = i + 2;
+                continue;
+            }
+            if d == 116 {
+                out = out + "\t";
+                i = i + 2;
+                continue;
+            }
+            if d == 92 {
+                out = out + "\\";
+                i = i + 2;
+                continue;
+            }
+        }
+        out = out + str_slice(s, i, i + 1);
+        i = i + 1;
+    }
+    return out;
+}
+
+/// The last `n` lines of `text` (tail -n), each with `pad` before it.
+fn bq_print_tail(text: str, n: i64, pad: str) {
+    val lines: Vec<str> = tt_lines(text);
+    var i: i64 = lines.len() - n;
+    if i < 0 { i = 0; }
+    while i < lines.len() {
+        println(pad + lines.get(i));
+        i = i + 1;
+    }
+}
+
+/// The first `n` lines of `text` (head -n), each with `pad` before it.
+fn bq_print_head(text: str, n: i64, pad: str) {
+    val lines: Vec<str> = tt_lines(text);
+    var i: i64 = 0;
+    while i < lines.len() && i < n {
+        println(pad + lines.get(i));
+        i = i + 1;
+    }
+}
+
+fn bq_is_exec(p: str) -> bool {
+    return fs_exists(p) && !fs_is_dir(p);
+}
+
+fn main() -> i64 {
+    val args: Vec<str> = tt_args();
+    var fid: str = tt_env("FID");
+    if str_len(fid) == 0 {
+        val c: Vec<str> = str_split("release/fid release/fid.exe release/fid-dev release/fid-dev.exe", " ");
+        var k: i64 = 0;
+        while k < c.len() {
+            if bq_is_exec(c.get(k)) {
+                fid = c.get(k);
+                break;
+            }
+            k = k + 1;
+        }
+    }
+    val qemu: str = tt_env_or("QEMU", "qemu-system-x86_64");
+    val timeout_s: str = tt_env_or("TIMEOUT", "30");
+    val build: bool = tt_env_or("BUILD", "1") == "1";
+    val run: bool = tt_env_or("RUN", "1") == "1";
+    val verbose: bool = tt_env_or("VERBOSE", "0") == "1";
+    var out: str = tt_env("OUT");
+    if str_len(out) == 0 {
+        var tmp: str = tt_env("TMPDIR");
+        if str_len(tmp) == 0 || (process_is_windows() && str_starts_with(tmp, "/")) { tmp = tt_env("TEMP"); }
+        if str_len(tmp) == 0 { tmp = "/tmp"; }
+        out = tmp + "/bare-qemu." + int_to_str(p_getpid()) + int_to_str(p_clock_now_us() % 1000000);
+    }
+    tt_mkdir_p(out);
+    if build && str_len(fid) == 0 {
+        println("error: no fid (set FID)");
+        return 2;
+    }
+    if run && !tt_which(qemu) {
+        println("error: " + qemu + " not found (apt install qemu-system-x86)");
+        return 2;
+    }
+    // kernel tests whose expected output is not in the file: name|exit|lines
+    val kernel: Vec<str> = str_split("test_kernel_serial|0|OK;test_kernel_hello|0|Hello from Fides OS!;test_serial_hello|0|Hello from Fides!\\n\\r;test_bare|0|;test_interrupt|0|", ";");
+    var cands: Vec<str> = Vec::new();
+    if args.len() > 0 {
+        cands = args;
+    } else {
+        val g: Vec<str> = tt_glob("tests/bootstrap", "test_bare_", ".fd");
+        var gi: i64 = 0;
+        while gi < g.len() {
+            cands.push(g.get(gi));
+            gi = gi + 1;
+        }
+        // an unmatched glob stays as written
+        if g.len() == 0 { cands.push("tests/bootstrap/test_bare_*.fd"); }
+        var ki: i64 = 0;
+        while ki < kernel.len() {
+            val kt: str = kernel.get(ki);
+            cands.push("tests/bootstrap/" + str_slice(kt, 0, str_find(kt, "|")) + ".fd");
+            ki = ki + 1;
+        }
+    }
+    var names: Vec<str> = Vec::new();
+    var srcs: Vec<str> = Vec::new();
+    var exps: Vec<str> = Vec::new();
+    var exits: Vec<str> = Vec::new();
+    var ci: i64 = 0;
+    while ci < cands.len() {
+        val src: str = cands.get(ci);
+        ci = ci + 1;
+        val name: str = tt_base(src);
+        val exp: str = out + "/" + name + ".expected";
+        var found: bool = false;
+        var ki2: i64 = 0;
+        while ki2 < kernel.len() {
+            val kt: str = kernel.get(ki2);
+            ki2 = ki2 + 1;
+            val bar: i64 = str_find(kt, "|");
+            if str_slice(kt, 0, bar) != name { continue; }
+            val rest: str = str_slice(kt, bar + 1, str_len(kt));
+            val bar2: i64 = str_find(rest, "|");
+            val text: str = str_slice(rest, bar2 + 1, str_len(rest));
+            var body: str = bq_unescape(text);
+            if str_len(text) > 0 { body = body + "\n"; }
+            fs_write_text(exp, body);
+            names.push(name);
+            srcs.push(src);
+            exps.push(exp);
+            exits.push(str_slice(rest, 0, bar2));
+            found = true;
+        }
+        if !found && tt_has_line_prefix(src, "// Expected output:") {
+            fs_write_text(exp, tt_block_of(src, false));
+            names.push(name);
+            srcs.push(src);
+            exps.push(exp);
+            exits.push(tt_block_exit_of(src));
+        }
+    }
+
+    var pass: i64 = 0;
+    var fail: i64 = 0;
+    var failed: Vec<str> = Vec::new();
+    val secs: i64 = str_parse_int(timeout_s);
+    var i: i64 = 0;
+    while i < names.len() {
+        val name: str = names.get(i);
+        val src: str = srcs.get(i);
+        val exp: str = exps.get(i);
+        val want: str = exits.get(i);
+        i = i + 1;
+        val bin: str = out + "/" + name + ".bin";
+        if build {
+            var bc: Vec<str> = Vec::new();
+            bc.push(fid);
+            bc.push("emit");
+            bc.push(src);
+            bc.push("--bare");
+            bc.push("-o");
+            bc.push(bin);
+            val log: str = out + "/" + name + ".build.log";
+            if tt_run(bc, Vec::new(), log, "", 0) != 0 {
+                println("FAIL " + name + ": build");
+                bq_print_tail(tt_read(log), 5, "    ");
+                fail = fail + 1;
+                failed.push(name);
+                continue;
+            }
+        }
+        if !run {
+            println("built " + name);
+            continue;
+        }
+        if !fs_exists(bin) {
+            println("FAIL " + name + ": no " + bin);
+            fail = fail + 1;
+            failed.push(name);
+            continue;
+        }
+        var qa: Vec<str> = Vec::new();
+        val qw: Vec<str> = str_split("-kernel " + bin + " -serial stdio -display none -no-reboot -nic none -m 128 -device isa-debug-exit,iobase=0xf4,iosize=0x01", " ");
+        qa.push(qemu);
+        var w: i64 = 0;
+        while w < qw.len() {
+            qa.push(qw.get(w));
+            w = w + 1;
+        }
+        val outf: str = out + "/" + name + ".out";
+        val errf: str = out + "/" + name + ".err";
+        val rc: i64 = tt_run(qa, Vec::new(), outf, errf, secs);
+        var why: str = "";
+        var code: str = "-1";
+        if rc == 124 {
+            why = "timeout after " + timeout_s + "s";
+        } else if rc % 2 == 1 {
+            code = int_to_str((rc - 1) / 2);
+        } else {
+            why = "QEMU exited with " + int_to_str(rc) + " (no debug exit: a triple fault resets, or QEMU failed)";
+        }
+        if verbose { bq_print_head(tt_read(outf), 1000000000, "    | "); }
+        if str_len(why) == 0 && code != want {
+            why = "exit code " + code + ", expected " + want;
+        }
+        if str_len(why) == 0 && !tt_same_lines(tt_read(outf), tt_read(exp), false) {
+            why = "output differs";
+        }
+        if str_len(why) == 0 {
+            println("ok   " + name);
+            pass = pass + 1;
+        } else {
+            println("FAIL " + name + ": " + why);
+            if why == "output differs" || !verbose {
+                var da: Vec<str> = Vec::new();
+                da.push("diff");
+                da.push(exp);
+                da.push(outf);
+                val d: ChildResult = process_run_argv(da, Vec::new(), "", 60000);
+                bq_print_head(d.output, 20, "    ");
+                bq_print_head(tt_read(errf), 5, "    qemu: ");
+            }
+            fail = fail + 1;
+            failed.push(name);
+        }
+    }
+    if !run { return 0; }
+    var tail: str = "";
+    if failed.len() > 0 && str_len(failed.get(0)) > 0 {
+        tail = " (";
+        var f: i64 = 0;
+        while f < failed.len() {
+            if f > 0 { tail = tail + " "; }
+            tail = tail + failed.get(f);
+            f = f + 1;
+        }
+        tail = tail + ")";
+    }
+    println("bare-metal under QEMU: " + int_to_str(pass) + " passed, " + int_to_str(fail) + " failed" + tail);
+    if fail == 0 { return 0; }
+    return 1;
+}

@@ -14,7 +14,7 @@ diagnostics `fid fix` can repair). `fid` must be on the `PATH`.
 | Emacs 29+ (eglot) | `emacs/fides.el` | written, not yet tested |
 | Sublime Text (LSP package) | `sublime/LSP-fides.sublime-settings`, `sublime/Fides.sublime-syntax` | written, not yet tested |
 | JetBrains IDEs | see below | not yet tested |
-| Zed | `zed/` (an extension) with the grammar `tree-sitter-fides/` | written, not yet tested in Zed |
+| Zed | `zed/` (an extension) with the grammar `tree-sitter-fides/` | compiled for `wasm32-wasip2` in CI; not yet run inside Zed |
 
 `scripts/tl/editor-check.sh` checks the configs without the editors (and,
 with them installed, runs them headless); `tests/tooling/zed-check.sh`
@@ -49,9 +49,17 @@ tree-sitter generate      # writes src/parser.c
 tree-sitter test          # the corpus in test/corpus/
 ```
 
+The extension crate itself is checked the way Zed loads it:
+
+```
+cd editors/zed
+rustup target add wasm32-wasip2
+cargo check --target wasm32-wasip2
+```
+
 Then in Zed: *Extensions > Install Dev Extension* and pick `editors/zed`
-(Rust must be installed through rustup). `extension.toml` fetches the grammar
-from the repository at `rev = "main"`, so `src/` must be committed there; pin
-`rev` to that commit before publishing the extension. The same grammar and
+(Rust must be installed through rustup). `extension.toml` pins the grammar
+to a commit whose generated `src/parser.c` is committed; re-pin it when the
+grammar changes. The same grammar and
 `tree-sitter-fides/queries/highlights.scm` also serve Neovim
 (nvim-treesitter) and Helix.

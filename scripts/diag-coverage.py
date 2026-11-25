@@ -120,7 +120,8 @@ def classify(text):
     rules = [
         (lambda: n.startswith("Type error: undefined variable"), "UndefinedVariable"),
         (lambda: n.startswith("Type error: undefined function"), "UndefinedFunction"),
-        (lambda: n.startswith("Type error: undefined struct"), "UndefinedStruct"),
+        (lambda: n.startswith("Type error: undefined struct") or n.startswith("Type error: unknown struct"), "UndefinedStruct"),
+        (lambda: "can reach the end of its body without returning" in n, "MissingReturn"),
         (lambda: n.startswith("Type error: struct") and "has no field" in n, "UndefinedField"),
         (lambda: "cannot assign" in n, "TypeMismatch"),
         (lambda: n.startswith("Type error: if condition must be bool"), "IfConditionNotBool"),
@@ -138,7 +139,7 @@ def classify(text):
         (lambda: n.startswith("empty char literal") or n.startswith("unexpected character"), "UnexpectedChar"),
         (lambda: n.startswith("borrow error") or n.startswith("Borrow error"), "BorrowConflict"),
         (lambda: n.startswith("Panic:"), "NoMain"),
-        (lambda: n.startswith("Duplicate definition") or "conflicting implementations" in n, "DuplicateDefinition"),
+        (lambda: n.startswith("Duplicate definition") or "conflicting implementations" in n or n.startswith("Ambiguous name:"), "DuplicateDefinition"),
         (lambda: n.startswith("Taint error"), "TaintViolation"),
         (lambda: "non-exhaustive match" in n, "NonExhaustiveMatch"),
         (lambda: n.startswith("Race error"), "DataRace"),
@@ -146,10 +147,18 @@ def classify(text):
         (lambda: n.startswith("Concurrency error"), "UnjoinedTask"),
         (lambda: n.startswith("Constant-time error") or n.startswith("Security error (constant_time)"), "ConstantTimeViolation"),
         (lambda: n.startswith("Realtime error") or n.startswith("Real-time error"), "RealtimeViolation"),
+        # TL2: escape.fd and secrecy.fd (E058, E059)
+        (lambda: n.startswith("Reference error"), "ReferenceEscape"),
+        (lambda: n.startswith("Security error (@secret)") or n.startswith("Security error (@sensitive)"), "SecrecyViolation"),
         (lambda: n.startswith("Safety error") or n.startswith("Determinism error"), "SafetyViolation"),
         # CE4: the other check classes (compiler.fd ErrCode::OtherCheck, E078)
         (lambda: n.startswith(OTHER_CHECK_PREFIXES), "OtherCheck"),
         (lambda: n.startswith("Type error"), "OtherTypeError"),
+        # TL2: inline assembly (pe_ir.fd), and checks of the compiler's own
+        # output (ir.fd's verifier, the C split's units): E078, E999
+        (lambda: n.startswith("asm! in "), "OtherCheck"),
+        (lambda: n.startswith("function '") and ("' has no blocks" in n or "': block " in n
+                                                 or "' is defined twice (units " in n), "InternalError"),
     ]
     for cond, code in rules:
         if cond():
@@ -173,6 +182,66 @@ def lexer_class(n):
     return "UnexpectedChar"
 
 
+# TL2: helpers that prefix a message with its class (escape.fd, secrecy.fd,
+# borrowck.fd); a call `helper(self, ..., "text" + ...)` is a message
+HELPER = re.compile(r"\b(esc_error|sec_error|violation)\(self\s*,")
+HELPER_CLASS = {
+    "esc_error": "Reference error (line 1): ",
+    "sec_error": "Security error (@secret) (line 1): ",
+    "violation": "borrow error (line 1): ",
+}
+
+
+def odd_quotes(s):
+    """Does s leave a string literal open (an odd number of unescaped `"`)?"""
+    n = 0
+    k = 0
+    while k < len(s):
+        c = s[k]
+        if c == "\\":
+            k += 2
+            continue
+        if c == '"':
+            n += 1
+        k += 1
+    return n % 2 == 1
+
+
+FIX_CALL = re.compile(r"\b\w+_fix\((?:[^()]|\([^()]*\))*\)")
+
+
+def strip_fix_calls(s):
+    """s without the arguments of its *_fix(...) calls (the candidates of
+    `tc_method_fix(method, "push pop ...")` are no part of the message)."""
+    return FIX_CALL.sub("_fix()", s)
+
+
+def fix_elsewhere(lines, i, stmt):
+    """TL2: a Fix line the message gets from outside its own literals:
+      - from a helper named *_fix (`+ tc_method_fix(m, ...)`), which returns
+        a Fix line on every path;
+      - from a local it ends with (`+ hint`, `+ fix`) that a literal with a
+        Fix line is given above it (`var hint: str = "\\n    Fix: ...";`);
+      - in a local it is built in (`var e: str = "Type error ..."`) that is
+        completed with a Fix line below it (`e = e + "\\n    Fix: ..."`)."""
+    if re.search(r"\b\w+_fix\(", stmt):
+        return True
+    for name in re.findall(r"\+\s*([a-z_][a-z0-9_]*)\s*(?=[+);])", stmt):
+        assign = re.compile(r"(?:\b(?:var|val)\s+" + re.escape(name) + r"\s*:\s*str\s*=|^\s*" + re.escape(name) + r"\s*=)(.*)$")
+        for k in range(i - 1, max(-1, i - 40), -1):
+            am = assign.search(lines[k])
+            if am and any(("Fix:" in l or "Hint:" in l) for l in literals(am.group(1))):
+                return True
+    dm = re.match(r"\s*(?:var|val)\s+([a-z_][a-z0-9_]*)\s*:\s*str\s*=", lines[i])
+    if dm:
+        grow = re.compile(r"^\s*" + re.escape(dm.group(1)) + r"\s*=\s*" + re.escape(dm.group(1)) + r"\s*\+(.*)$")
+        for k in range(i + 1, min(len(lines), i + 12)):
+            gm = grow.search(lines[k])
+            if gm and any(("Fix:" in l or "Hint:" in l) for l in literals(gm.group(1))):
+                return True
+    return False
+
+
 def collect_messages():
     msgs = []
     for path in sorted(glob.glob(os.path.join(ROOT, "compiler", "*.fd"))):
@@ -185,23 +254,36 @@ def collect_messages():
             s = line.strip()
             if s.startswith("//"):
                 continue
-            lits = literals(line)
+            lits = literals(strip_fix_calls(line))
             if not lits:
                 continue
             is_push = "errors.push(" in line or "errors_push(" in line
+            # TL2: the checkers that build their messages in a helper
+            # (escape.fd esc_error, secrecy.fd sec_error, borrowck.fd
+            # violation): each call's text is a message of the helper's class
+            helper = HELPER.search(line)
+            if helper and helper.group(1) == "sec_error":
+                lits = lits[1:]  # the first literal is the kind ("@secret")
             starts = any(l.startswith(ERROR_PREFIXES) for l in lits)
-            if not (is_push or starts):
+            if not (is_push or starts or helper):
                 continue
             # a test of an error's text (classify_error, enrich_errors) is
             # not a message
-            if not is_push and re.search(r"\b(str_starts_with|str_contains|str_find|starts_with|contains)\(", line):
+            if not is_push and re.search(r"\b(str_starts_with|str_contains|str_find|starts_with|contains|fix_between)\(", line):
                 continue
             # a message may go on over the next lines ("..." +\n "...")
+            # (TL2: or in a literal that holds a line break, an odd number
+            # of quotes on the line)
             j = i
-            while line.rstrip().endswith("+") and j + 1 < len(lines) and j - i < 6:
+            stmt = line
+            while (line.rstrip().endswith("+") or odd_quotes(stmt)) and j + 1 < len(lines) and j - i < 8:
                 j += 1
                 line = lines[j]
-                lits = lits + literals(line)
+                stmt = stmt + "\n" + line
+            if j > i:
+                lits = literals(strip_fix_calls(stmt))
+                if helper and helper.group(1) == "sec_error":
+                    lits = lits[1:]
             # a message that starts with a local made a few lines above
             # (`var head: str = "Event error: @event '" + func.name + "' ";`
             # then `errors.push(head + "is generic. ...")`): its text too
@@ -217,14 +299,21 @@ def collect_messages():
             pieces = message_pieces(lits)
             if not pieces:
                 continue
+            fix = ("Fix:" in full) or ("Hint:" in full) or fix_elsewhere(lines, i, stmt)
+            # borrowck.fd violation() gives a Fix line to a message that has none
+            if helper and helper.group(1) == "violation":
+                fix = True
+            cls = full
+            if helper:
+                cls = HELPER_CLASS[helper.group(1)] + full
             msgs.append({
                 "where": f"{mod}:{i + 1}",
-                "text": full,
+                "text": cls,
                 "pieces": pieces,
                 "templates": templates_of(lits),
-                "fix": ("Fix:" in full) or ("Hint:" in full),
+                "fix": fix,
                 # lex_error(line, col, msg) prints "Error:L:C: msg"
-                "code": classify(("Error:1:1: " + full) if "lex_error(" in line else full),
+                "code": classify(("Error:1:1: " + full) if "lex_error(" in stmt else cls),
             })
     return msgs
 

@@ -782,7 +782,7 @@ fn esc_check_value_type(self: &mut EscapeChecker, t: Type, what: str) {
                 return;
             }
             if esc_contains_ref(pointee) {
-                esc_error(self, what + " has type '" + type_to_str(t) + "': a reference cannot point to another reference");
+                esc_error(self, what + " has type '" + type_to_str(t) + "': a reference cannot point to another reference\n    Fix: hold the value itself, or one reference to it (`&T`, not a reference to a reference).");
             }
         }
         Type::Generic(name, args) => {
@@ -818,7 +818,7 @@ fn esc_check_value_type(self: &mut EscapeChecker, t: Type, what: str) {
 
 fn esc_check_storage_type(self: &mut EscapeChecker, t: Type, what: str) {
     if esc_contains_ref(t) {
-        esc_error(self, what + " has type '" + type_to_str(t) + "', which stores a reference; references can only be passed to calls, held in locals and returned");
+        esc_error(self, what + " has type '" + type_to_str(t) + "', which stores a reference; references can only be passed to calls, held in locals and returned\n    Fix: keep the value (a copy) instead of the reference, or give the holder a lifetime parameter: `struct S<'a> { r: &'a T }`.");
     }
 }
 
@@ -838,7 +838,7 @@ fn esc_check_decls(self: &mut EscapeChecker, program: Program) {
                 // never a Vec of them or a reference to a reference
                 esc_check_value_type(self, fld.ty, "field '" + s.name + "." + fld.name + "'");
             } else if esc_contains_ref(fld.ty) {
-                esc_error(self, "field '" + s.name + "." + fld.name + "' has type '" + type_to_str(fld.ty) + "', which stores a reference; references can only be passed to calls, held in locals and returned; to hold one, give the struct a lifetime parameter: `struct " + s.name + "<'a> { " + fld.name + ": &'a T }`");
+                esc_error(self, "field '" + s.name + "." + fld.name + "' has type '" + type_to_str(fld.ty) + "', which stores a reference; references can only be passed to calls, held in locals and returned; to hold one, give the struct a lifetime parameter: `struct " + s.name + "<'a> { " + fld.name + ": &'a T }`\n    Fix: write `struct " + s.name + "<'a> { " + fld.name + ": &'a T }`, or hold a copy of the value instead.");
             }
             fi = fi + 1;
         }
@@ -1052,7 +1052,7 @@ fn esc_leave_blocks(self: &mut EscapeChecker, roots: Vec<EscRoot>, depth: i64, w
     while i < roots.len() {
         var r: EscRoot = roots.get(i);
         if !r.is_param && r.depth > depth {
-            esc_error(self, what + " refers to '" + r.name + "', which is freed at the end of its block");
+            esc_error(self, what + " refers to '" + r.name + "', which is freed at the end of its block\n    Fix: declare '" + r.name + "' in the outer block, so it lives as long as the reference, or keep a copy of the value.");
         } else {
             kept.push(r);
         }
@@ -1126,7 +1126,7 @@ fn esc_analyze_func(self: &mut EscapeChecker, key: str, f: Func) {
         while di < self.flows.len() {
             var pidx: i64 = self.flows.get(di);
             if !vec_contains_i64(declared, pidx) && pidx < f.params.len() {
-                esc_error(self, "'" + f.name + "' returns a borrow of parameter '" + f.params.get(pidx).name + "', but its signature ties the result to " + lt_list + "; give '" + f.params.get(pidx).name + "' that lifetime or return a borrow of a parameter that has it");
+                esc_error(self, "'" + f.name + "' returns a borrow of parameter '" + f.params.get(pidx).name + "', but its signature ties the result to " + lt_list + "; give '" + f.params.get(pidx).name + "' that lifetime or return a borrow of a parameter that has it\n    Fix: write the lifetime on '" + f.params.get(pidx).name + "' (`" + f.params.get(pidx).name + ": &'a T`), or return a borrow of a parameter that has it.");
             }
             di = di + 1;
         }
@@ -1170,9 +1170,9 @@ fn esc_check_return(self: &mut EscapeChecker, roots: Vec<EscRoot>) {
                 }
             }
             if captured {
-                esc_error(self, "a closure returns a reference to '" + r.name + "', its own copy of a captured variable, which is freed when it returns");
+                esc_error(self, "a closure returns a reference to '" + r.name + "', its own copy of a captured variable, which is freed when it returns\n    Fix: return the value (a copy) instead of a reference to it.");
             } else {
-                esc_error(self, what + " returns a reference to local '" + r.name + "', which is freed when it returns");
+                esc_error(self, what + " returns a reference to local '" + r.name + "', which is freed when it returns\n    Fix: return the value itself (a copy: `-> T`), or a reference to a parameter.");
             }
         }
         i = i + 1;
@@ -1388,7 +1388,7 @@ fn esc_stmt(self: &mut EscapeChecker, s: Stmt) {
             esc_expr(self, index);
             var ir: Vec<EscRoot> = esc_expr(self, expr);
             if ir.len() > 0 {
-                esc_error(self, "a reference cannot be stored in an element of '" + array + "'");
+                esc_error(self, "a reference cannot be stored in an element of '" + array + "'\n    Fix: store the value (a copy) in the element, not a reference to it.");
             }
         }
         Stmt::FieldAssign(object, field, _, expr, _) => {
@@ -1409,7 +1409,7 @@ fn esc_stmt(self: &mut EscapeChecker, s: Stmt) {
                     // outlive it)
                     esc_assign_to(self, esc_ident_of(object), fr);
                 } else {
-                    esc_error(self, "a reference cannot be stored in field '" + field + "'");
+                    esc_error(self, "a reference cannot be stored in field '" + field + "'\n    Fix: store the value (a copy) in the field, or give the struct a lifetime parameter: `struct S<'a> { f: &'a T }`.");
                 }
             }
         }
@@ -1417,7 +1417,7 @@ fn esc_stmt(self: &mut EscapeChecker, s: Stmt) {
             esc_expr(self, ptr_expr);
             var dr: Vec<EscRoot> = esc_expr(self, expr);
             if dr.len() > 0 {
-                esc_error(self, "a reference cannot be stored through another reference");
+                esc_error(self, "a reference cannot be stored through another reference\n    Fix: store the value through the reference (`*r = v`), not another reference.");
             }
         }
         Stmt::Expr(e, _) => {
@@ -1570,7 +1570,7 @@ fn esc_assign_to(self: &mut EscapeChecker, target: str, r: Vec<EscRoot>) {
         }
         OptEscVar::None => {
             if esc_is_global(self, target) {
-                esc_error(self, "global '" + target + "' cannot hold a reference");
+                esc_error(self, "global '" + target + "' cannot hold a reference\n    Fix: give the global a copy of the value, or pass the reference as a parameter where it is needed.");
             }
             return;
         }
@@ -1580,7 +1580,7 @@ fn esc_assign_to(self: &mut EscapeChecker, target: str, r: Vec<EscRoot>) {
     while i < r.len() {
         var x: EscRoot = r.get(i);
         if !x.is_param && x.depth > target_depth {
-            esc_error(self, "'" + target + "' would outlive '" + x.name + "': '" + x.name + "' is freed at the end of its block while '" + target + "' is still in scope");
+            esc_error(self, "'" + target + "' would outlive '" + x.name + "': '" + x.name + "' is freed at the end of its block while '" + target + "' is still in scope\n    Fix: declare '" + x.name + "' before '" + target + "', in the same or an outer block, or let '" + target + "' hold a copy.");
         } else {
             kept.push(x);
         }
@@ -1708,7 +1708,7 @@ fn esc_expr(self: &mut EscapeChecker, e: Expr) -> Vec<EscRoot> {
                 }
             }
             if sr.len() > 0 {
-                esc_error(self, "a reference cannot be sent to another task");
+                esc_error(self, "a reference cannot be sent to another task\n    Fix: send the value itself (a copy) to the task: `spawn f(v)`, v being a value, not a reference.");
             }
             return esc_none();
         }
@@ -1742,7 +1742,7 @@ fn esc_expr(self: &mut EscapeChecker, e: Expr) -> Vec<EscRoot> {
                     if lt_held {
                         held = esc_union(held, vr);
                     } else {
-                        esc_error(self, "a reference cannot be stored in field '" + name + "." + init.name + "'");
+                        esc_error(self, "a reference cannot be stored in field '" + name + "." + init.name + "'\n    Fix: store a copy of the value in the field, or give the struct a lifetime parameter: `struct " + name + "<'a> { " + init.name + ": &'a T }`.");
                     }
                 }
                 fi = fi + 1;
@@ -1766,7 +1766,7 @@ fn esc_expr(self: &mut EscapeChecker, e: Expr) -> Vec<EscRoot> {
                 return joined;
             }
             if joined.len() > 0 {
-                esc_error(self, "a reference cannot be stored in variant '" + enum_name + "::" + variant + "'");
+                esc_error(self, "a reference cannot be stored in variant '" + enum_name + "::" + variant + "'\n    Fix: store a copy of the value in the variant.");
             }
             return esc_none();
         }
@@ -1778,7 +1778,7 @@ fn esc_expr(self: &mut EscapeChecker, e: Expr) -> Vec<EscRoot> {
             while ai < elements.len() {
                 var er: Vec<EscRoot> = esc_expr(self, elements.get(ai));
                 if er.len() > 0 {
-                    esc_error(self, "a reference cannot be stored in an array");
+                    esc_error(self, "a reference cannot be stored in an array\n    Fix: put copies of the values in the array (or in a Vec).");
                 }
                 ai = ai + 1;
             }
@@ -1931,7 +1931,7 @@ fn esc_call(self: &mut EscapeChecker, callee: str, args: Vec<Expr>) -> Vec<EscRo
                     what = "a closure that captures a reference";
                 }
                 var pname: str = self.param_names.get(slot - 1).get(i);
-                esc_error(self, what + " cannot be passed to parameter '" + pname + "' of '" + callee + "' (type '" + esc_param_ty_str(self, slot, i) + "'), which may keep it; only reference parameters can borrow");
+                esc_error(self, what + " cannot be passed to parameter '" + pname + "' of '" + callee + "' (type '" + esc_param_ty_str(self, slot, i) + "'), which may keep it; only reference parameters can borrow\n    Fix: declare the parameter as a reference (`" + pname + ": &T`), or pass a copy of the value.");
             }
         }
         i = i + 1;
@@ -1986,7 +1986,7 @@ fn esc_method_call(self: &mut EscapeChecker, receiver: Expr, method: str, args: 
                 ki = ki + 1;
             }
             if !borrows && !esc_read_only_method(method) {
-                esc_error(self, "a reference cannot be passed to method '" + method + "', which may keep it");
+                esc_error(self, "a reference cannot be passed to method '" + method + "', which may keep it\n    Fix: pass a copy of the value to '" + method + "'.");
             }
         }
         j = j + 1;

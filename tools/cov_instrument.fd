@@ -1,0 +1,492 @@
+// tools/cov_instrument.fd — add block and line coverage counters to the
+// compiler's generated C (roadmap VF8): the Fides port of
+// scripts/verify/cov_instrument.py (roadmap AD4). Same arguments, same
+// output files, the same summary line:
+//
+//   fid ccompile tools/cov_instrument.fd -o cov_instrument.exe
+//   cov_instrument.exe <in.c> <out.c>
+//   cov_instrument.exe --self-test
+//   fid run tools/cov_instrument.fd <in.c> <out.c>
+//
+// The C that `fid dump-c compiler/main.fd` writes has one C function per
+// Fides function and one label `bbN:` per basic block of the IR. Every
+// function entry and every block label gets `__fcov[ID] = 1;`, so each
+// branch target is counted. Source lines get counters too, in either form
+// the C carries them: a `/*@L<n>*/` mark (FID_C_LINE_MARKS=1) gets one
+// right after it, a `#line <n> "x.fd"` directive (`dump-c -g`) one right
+// before it; a block that starts on the line in effect gets one for that
+// line (see the script's docstring for the whole rule). <out.c>.map gets one
+// line per counter, `ID function kind` (kind `entry`, `bbN` or `L<n>`).
+// The instrumented compiler writes the counters it hit at exit, to
+// $FID_COV_OUT or as <pid>-<n>.cov into $FID_COV_DIR.
+//
+// Differences from the script, none of which the generated C reaches: the
+// regular expressions' \s is ASCII whitespace (with \x1c-\x1f, as Python's)
+// and \d ASCII digits; the map is written with "\n" line ends (Python on
+// Windows writes "\r\n" there, and on stdout); a missing argument or input
+// file is a one-line message, exit 1 (the script: a traceback, exit 1).
+
+use core;
+use args;
+use fs;
+use io;
+
+// ─── Text ───
+
+/// Python's str.isspace() for one byte of ASCII (\t \n \v \f \r, \x1c-\x1f,
+/// space).
+fn ci_ws(c: i64) -> bool {
+    return (c >= 9 && c <= 13) || (c >= 28 && c <= 32);
+}
+
+fn ci_digit(c: i64) -> bool {
+    return c >= 48 && c <= 57;
+}
+
+fn ci_alpha(c: i64) -> bool {
+    return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95;
+}
+
+fn ci_word(c: i64) -> bool {
+    return ci_alpha(c) || ci_digit(c);
+}
+
+/// s.split("\n"): every piece, empty ones included.
+fn ci_split_nl(s: str) -> Vec<str> {
+    var r: Vec<str> = Vec::new();
+    val n: i64 = str_len(s);
+    var start: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        if str_byte_at(s, i) == 10 {
+            r.push(str_slice(s, start, i));
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    r.push(str_slice(s, start, n));
+    return r;
+}
+
+/// x.strip() != "" (ASCII whitespace).
+fn ci_has_text(s: str) -> bool {
+    var i: i64 = 0;
+    while i < str_len(s) {
+        if !ci_ws(str_byte_at(s, i)) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Every byte of s from i on is whitespace.
+fn ci_ws_to_end(s: str, i: i64) -> bool {
+    var k: i64 = i;
+    while k < str_len(s) {
+        if !ci_ws(str_byte_at(s, k)) { return false; }
+        k = k + 1;
+    }
+    return true;
+}
+
+fn ci_skip_ws(s: str, i: i64) -> i64 {
+    var k: i64 = i;
+    while k < str_len(s) && ci_ws(str_byte_at(s, k)) { k = k + 1; }
+    return k;
+}
+
+fn ci_at(s: str, i: i64, w: str) -> bool {
+    if i < 0 || i + str_len(w) > str_len(s) { return false; }
+    return str_slice(s, i, i + str_len(w)) == w;
+}
+
+/// int() of a run of ASCII digits.
+fn ci_int(s: str) -> i64 {
+    var v: i64 = 0;
+    var i: i64 = 0;
+    while i < str_len(s) {
+        v = v * 10 + str_byte_at(s, i) - 48;
+        i = i + 1;
+    }
+    return v;
+}
+
+// ─── The four patterns ───
+
+/// FUNC = ^[A-Za-z_][A-Za-z0-9_ \*]*?\b([A-Za-z_][A-Za-z0-9_]*)\(([^;{}]*)\) \{$
+/// The function's name, "" when the line is not a function head. The name
+/// is the word just before the line's first "(", which needs a space or *
+/// in front of it; the line ends with ") {" and has no ; { } in between.
+fn ci_func(line: str) -> str {
+    val n: i64 = str_len(line);
+    if n < 4 || !ci_alpha(str_byte_at(line, 0)) { return ""; }
+    var k: i64 = 0;
+    while k < n && str_byte_at(line, k) != 40 {
+        val c: i64 = str_byte_at(line, k);
+        if !(ci_word(c) || c == 32 || c == 42) { return ""; }
+        k = k + 1;
+    }
+    if k >= n { return ""; }
+    if str_byte_at(line, n - 1) != 123 || str_byte_at(line, n - 2) != 32 || str_byte_at(line, n - 3) != 41 { return ""; }
+    if n - 3 < k + 1 { return ""; }
+    var m: i64 = k + 1;
+    while m < n - 3 {
+        val c2: i64 = str_byte_at(line, m);
+        if c2 == 59 || c2 == 123 || c2 == 125 { return ""; }
+        m = m + 1;
+    }
+    var j: i64 = k;
+    while j > 0 && ci_word(str_byte_at(line, j - 1)) { j = j - 1; }
+    if j == k || j < 1 || ci_digit(str_byte_at(line, j)) { return ""; }
+    return str_slice(line, j, k);
+}
+
+/// LABEL = ^(\s*)(bb\d+):\s*$ — [indent, label], or empty.
+fn ci_label(line: str) -> Vec<str> {
+    var r: Vec<str> = Vec::new();
+    val i: i64 = ci_skip_ws(line, 0);
+    if !ci_at(line, i, "bb") { return r; }
+    var k: i64 = i + 2;
+    while k < str_len(line) && ci_digit(str_byte_at(line, k)) { k = k + 1; }
+    if k == i + 2 || !ci_at(line, k, ":") { return r; }
+    if !ci_ws_to_end(line, k + 1) { return r; }
+    r.push(str_slice(line, 0, i));
+    r.push(str_slice(line, i, k));
+    return r;
+}
+
+/// MARK = ^(\s*)/\*@L(\d+)\*/\s*$ — [indent, digits], or empty.
+fn ci_mark(line: str) -> Vec<str> {
+    var r: Vec<str> = Vec::new();
+    val i: i64 = ci_skip_ws(line, 0);
+    if !ci_at(line, i, "/*@L") { return r; }
+    var k: i64 = i + 4;
+    while k < str_len(line) && ci_digit(str_byte_at(line, k)) { k = k + 1; }
+    if k == i + 4 || !ci_at(line, k, "*/") { return r; }
+    if !ci_ws_to_end(line, k + 2) { return r; }
+    r.push(str_slice(line, 0, i));
+    r.push(str_slice(line, i + 4, k));
+    return r;
+}
+
+/// HASHLINE = ^#line (\d+) "(.*)"\s*$ — [digits, file], or empty.
+fn ci_hashline(line: str) -> Vec<str> {
+    var r: Vec<str> = Vec::new();
+    if !ci_at(line, 0, "#line ") { return r; }
+    var k: i64 = 6;
+    while k < str_len(line) && ci_digit(str_byte_at(line, k)) { k = k + 1; }
+    if k == 6 || !ci_at(line, k, " \"") { return r; }
+    val open: i64 = k + 1;
+    // the greedy .* ends at the last quote with only whitespace after it
+    var last: i64 = str_len(line) - 1;
+    while last > open && ci_ws(str_byte_at(line, last)) { last = last - 1; }
+    if last <= open || str_byte_at(line, last) != 34 { return r; }
+    r.push(str_slice(line, 6, k));
+    r.push(str_slice(line, open + 1, last));
+    return r;
+}
+
+/// A mark or a `#line` to a .fd file: the next C is that line's.
+fn ci_is_line_start(line: str) -> bool {
+    if ci_mark(line).len() > 0 { return true; }
+    val h: Vec<str> = ci_hashline(line);
+    return h.len() > 0 && str_ends_with(h.get(1), ".fd");
+}
+
+// ─── Instrumenting ───
+
+struct CiResult {
+    out: Vec<str>,
+    mp: Vec<str>,
+    n: i64,
+}
+
+fn ci_instrument(lines: Vec<str>) -> CiResult {
+    var out: Vec<str> = Vec::new();
+    var mp: Vec<str> = Vec::new();
+    var cur: str = "";
+    var have_cur: bool = false;
+    var n: i64 = 0;
+    // the source line the C being read belongs to
+    var in_effect: i64 = 0;
+    var have_effect: bool = false;
+    var k: i64 = 0;
+    while k < lines.len() {
+        val line: str = lines.get(k);
+        k = k + 1;
+        val fname: str = ci_func(line);
+        if str_len(fname) > 0 && !str_starts_with(line, "static inline") && !str_starts_with(line, "typedef") {
+            cur = fname;
+            have_cur = true;
+            have_effect = false;
+            out.push(line);
+            out.push("    __fcov[" + int_to_str(n) + "] = 1;");
+            mp.push(int_to_str(n) + " " + cur + " entry");
+            n = n + 1;
+            continue;
+        }
+        val lab: Vec<str> = ci_label(line);
+        if lab.len() > 0 && have_cur {
+            out.push(line);
+            out.push(lab.get(0) + "  __fcov[" + int_to_str(n) + "] = 1;");
+            mp.push(int_to_str(n) + " " + cur + " " + lab.get(1));
+            n = n + 1;
+            // the block's first C is still the line in effect unless a new
+            // line starts right here
+            var nxt: str = "";
+            var q: i64 = k;
+            while q < k + 3 && q < lines.len() {
+                if ci_has_text(lines.get(q)) {
+                    nxt = lines.get(q);
+                    break;
+                }
+                q = q + 1;
+            }
+            if have_effect && !ci_is_line_start(nxt) {
+                out.push(lab.get(0) + "  __fcov[" + int_to_str(n) + "] = 1;");
+                mp.push(int_to_str(n) + " " + cur + " L" + int_to_str(in_effect));
+                n = n + 1;
+            }
+            continue;
+        }
+        val mk: Vec<str> = ci_mark(line);
+        if mk.len() > 0 && have_cur {
+            val ln: i64 = ci_int(mk.get(1));
+            out.push(line);
+            out.push(mk.get(0) + "__fcov[" + int_to_str(n) + "] = 1;");
+            mp.push(int_to_str(n) + " " + cur + " L" + int_to_str(ln));
+            n = n + 1;
+            // marks start again at every block (codegen_c.fd), so a block
+            // without one has no line: nothing carries over its label
+            have_effect = false;
+            continue;
+        }
+        val hl: Vec<str> = ci_hashline(line);
+        if hl.len() > 0 && have_cur {
+            if str_ends_with(hl.get(1), ".fd") {
+                val ln2: i64 = ci_int(hl.get(0));
+                // before the directive: the C after it keeps its line
+                out.push("    __fcov[" + int_to_str(n) + "] = 1;");
+                mp.push(int_to_str(n) + " " + cur + " L" + int_to_str(ln2));
+                n = n + 1;
+                in_effect = ln2;
+                have_effect = true;
+            } else {
+                have_effect = false;
+            }
+            out.push(line);
+            continue;
+        }
+        if str_starts_with(line, "}") {
+            have_cur = false;
+            cur = "";
+            have_effect = false;
+        }
+        out.push(line);
+    }
+    return CiResult { out: out, mp: mp, n: n };
+}
+
+// ─── Self-test ───
+
+var ci_failed: bool = false;
+
+fn ci_check(ok: bool, what: str) {
+    if !ok && !ci_failed {
+        ci_failed = true;
+        io_eprintln("AssertionError: " + what);
+    }
+}
+
+fn ci_index_of(v: Vec<str>, s: str, from: i64) -> i64 {
+    var i: i64 = from;
+    while i < v.len() {
+        if v.get(i) == s { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn ci_self_test() -> i64 {
+    var src: Vec<str> = Vec::new();
+    src.push("#include <stdio.h>");
+    src.push("int64_t f(int64_t x) {");
+    src.push("    int64_t v1 = 0;");
+    src.push("    /*@L10*/");
+    src.push("    v1 = x + 1;");
+    src.push("    if (v1) goto bb1;");
+    src.push("    else goto bb2;");
+    src.push("  bb1:");
+    src.push("    /*@L11*/");
+    src.push("    return v1;");
+    src.push("  bb2:");
+    src.push("    return 0;");
+    src.push("}");
+    src.push("/*@L99*/");
+    src.push("int64_t g(int64_t x) {");
+    src.push("#line 20 \"compiler/x.fd\"");
+    src.push("    if (x) goto bb1;");
+    src.push("    else goto bb2;");
+    src.push("  bb1:");
+    src.push("#line 21 \"compiler/x.fd\"");
+    src.push("    x = x + 1;");
+    src.push("    goto bb2;");
+    src.push("  bb2:");
+    src.push("    return x;");
+    src.push("#line 900 \"C:/build/out.c\"");
+    src.push("    return 0;");
+    src.push("}");
+    src.push("int main(int argc, char** argv) {");
+    src.push("  bb1:");
+    src.push("    return (int)f(argc) + (int)g(argc);");
+    src.push("}");
+    val r: CiResult = ci_instrument(src);
+    // f (marks): bb2 has no mark, so no line; g (#line): bb2 has no
+    // directive, so its C is still line 21's
+    var want: Vec<str> = Vec::new();
+    want.push("0 f entry");
+    want.push("1 f L10");
+    want.push("2 f bb1");
+    want.push("3 f L11");
+    want.push("4 f bb2");
+    want.push("5 g entry");
+    want.push("6 g L20");
+    want.push("7 g bb1");
+    want.push("8 g L21");
+    want.push("9 g bb2");
+    want.push("10 g L21");
+    want.push("11 main entry");
+    want.push("12 main bb1");
+    var same: bool = r.mp.len() == want.len();
+    var i: i64 = 0;
+    while same && i < want.len() {
+        if r.mp.get(i) != want.get(i) { same = false; }
+        i = i + 1;
+    }
+    ci_check(same, "the map differs");
+    ci_check(r.n == want.len(), int_to_str(r.n));
+    // a counter right after a mark, right before a #line to a .fd file, none
+    // for the #line back to the C file or the mark outside a function
+    val out: Vec<str> = r.out;
+    var a: i64 = ci_index_of(out, "    /*@L10*/", 0);
+    ci_check(a >= 0 && a + 1 < out.len() && out.get(a + 1) == "    __fcov[1] = 1;", "counter after /*@L10*/");
+    a = ci_index_of(out, "#line 20 \"compiler/x.fd\"", 0);
+    ci_check(a >= 1 && out.get(a - 1) == "    __fcov[6] = 1;", "counter before #line 20");
+    a = ci_index_of(out, "#line 900 \"C:/build/out.c\"", 0);
+    ci_check(a >= 1 && out.get(a - 1) == "    return x;", "no counter before #line 900");
+    var marks: i64 = 0;
+    i = 0;
+    while i < out.len() {
+        if out.get(i) == "/*@L99*/" { marks = marks + 1; }
+        i = i + 1;
+    }
+    ci_check(marks == 1, "/*@L99*/ count");
+    // bb1 of g starts a new line: one counter (the block's), then L21's
+    a = ci_index_of(out, "  bb1:", ci_index_of(out, "int64_t g(int64_t x) {", 0));
+    ci_check(a >= 0 && a + 2 < out.len() && out.get(a + 1) == "    __fcov[7] = 1;" && out.get(a + 2) == "    __fcov[8] = 1;", "bb1 of g");
+    if ci_failed { return 1; }
+    println("cov_instrument self-test: ok");
+    return 0;
+}
+
+// ─── Main ───
+
+fn ci_prelude(n: i64) -> str {
+    var m: i64 = n;
+    if m < 1 { m = 1; }
+    val nb: i64 = (m + 7) / 8;
+    var s: str = "\n/* === block and line coverage (scripts/verify/cov_instrument.py) === */\n";
+    s = s + "#include <stdio.h>\n#include <stdlib.h>\n#include <time.h>\n";
+    s = s + "static unsigned char __fcov[" + int_to_str(m) + "];\n";
+    s = s + "static void __fcov_dump(void) {\n";
+    s = s + "    static int done = 0;\n";
+    s = s + "    if (done) return;\n";
+    s = s + "    done = 1;\n";
+    s = s + "    const char* path = getenv(\"FID_COV_OUT\");\n";
+    s = s + "    char buf[1024];\n";
+    s = s + "    if (!path) {\n";
+    s = s + "        const char* dir = getenv(\"FID_COV_DIR\");\n";
+    s = s + "        if (!dir) return;\n";
+    s = s + "        static int seq = 0;\n";
+    s = s + "        snprintf(buf, sizeof buf, \"%s/%ld-%d-%d.cov\", dir, (long)rand(), (int)clock(), seq++);\n";
+    s = s + "        path = buf;\n";
+    s = s + "    }\n";
+    s = s + "    FILE* f = fopen(path, \"wb\");\n";
+    s = s + "    if (!f) return;\n";
+    s = s + "    /* static: the compiler has millions of counters, too many bits for\n";
+    s = s + "       the stack of whichever thread runs the atexit handlers */\n";
+    s = s + "    static unsigned char bits[" + int_to_str(nb) + "];\n";
+    s = s + "    for (int i = 0; i < " + int_to_str(n) + "; i++) if (__fcov[i]) bits[i >> 3] |= (unsigned char)(1u << (i & 7));\n";
+    s = s + "    fwrite(bits, 1, sizeof bits, f);\n";
+    s = s + "    fclose(f);\n";
+    s = s + "}\n";
+    s = s + "__attribute__((constructor)) static void __fcov_init(void) {\n";
+    s = s + "    srand((unsigned)time(0) ^ (unsigned)clock() ^ (unsigned)(size_t)&__fcov_init);\n";
+    s = s + "    atexit(__fcov_dump);\n";
+    s = s + "}\n";
+    return s;
+}
+
+fn main() -> i64 {
+    val all: Vec<str> = args_all();
+    // `fid run tools/cov_instrument.fd ...` passes "run" and the path first
+    var first: i64 = 1;
+    if all.len() >= 3 && all.get(1) == "run" && str_ends_with(all.get(2), ".fd") { first = 3; }
+    var i: i64 = first;
+    while i < all.len() {
+        if all.get(i) == "--self-test" { return ci_self_test(); }
+        i = i + 1;
+    }
+    if all.len() < first + 2 {
+        io_eprintln("usage: cov_instrument <in.c> <out.c> | --self-test");
+        return 1;
+    }
+    val src: str = all.get(first);
+    val dst: str = all.get(first + 1);
+    var text: str = "";
+    match read_file(src) {
+        Option::Some(t) => { text = t; }
+        Option::None => {
+            io_eprintln("cov_instrument: cannot read " + src);
+            return 1;
+        }
+    }
+    val r: CiResult = ci_instrument(ci_split_nl(text));
+    // declarations first: everything above the first function body may use
+    // the counters only after they are declared, so put them at the very top
+    var sb: StringBuilder = StringBuilder::new();
+    sb.append_str(ci_prelude(r.n));
+    i = 0;
+    while i < r.out.len() {
+        if i > 0 { sb.append_str("\n"); }
+        sb.append_str(r.out.get(i));
+        i = i + 1;
+    }
+    if !fs_write_text(dst, sb.to_str()) {
+        io_eprintln("cov_instrument: cannot write " + dst);
+        return 1;
+    }
+    var mb: StringBuilder = StringBuilder::new();
+    var nf: i64 = 0;
+    var nl: i64 = 0;
+    i = 0;
+    while i < r.mp.len() {
+        val e: str = r.mp.get(i);
+        mb.append_str(e);
+        mb.append_str("\n");
+        if str_ends_with(e, " entry") { nf = nf + 1; }
+        val sp: i64 = str_rfind(e, " ");
+        if sp >= 0 && str_byte_at(e, sp + 1) == 76 { nl = nl + 1; }
+        i = i + 1;
+    }
+    if r.mp.len() == 0 { mb.append_str("\n"); }
+    if !fs_write_text(dst + ".map", mb.to_str()) {
+        io_eprintln("cov_instrument: cannot write " + dst + ".map");
+        return 1;
+    }
+    println(int_to_str(r.n) + " counters (" + int_to_str(nf) + " functions, " + int_to_str(r.n - nf - nl)
+        + " blocks, " + int_to_str(nl) + " source lines)");
+    if nl == 0 {
+        println("note: the C has no source lines (FID_C_LINE_MARKS=1 or `-g` writes them): block coverage only");
+    }
+    return 0;
+}
