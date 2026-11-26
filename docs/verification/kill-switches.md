@@ -169,7 +169,9 @@ macOS targets and `--nat` Windows) and by the rule passes it runs
 | `FID_NAT_OFF=tailcall` | sibling calls in tail position as a jump after the epilogue (OP13; off: call, then return) |
 | `FID_NAT_OFF=tailframe` | MI28: tail jumps in a function that takes its frame's address when no such address reaches the call (`ng_tail_fn_ok` / `ng_tail_taint`; off: no tail jumps in such a function, the rule before Nov 17) |
 | `FID_NAT_OFF=retregs` | one- and two-word struct results (Option, Result of a word) in two registers for functions only called directly (ME27/LF24; off: through the hidden result pointer) |
+| `FID_NAT_OFF=cbadapt` | the C-convention entry adapters for program functions an `extern "C"` call may invoke (BG166, `ng_cbx_label`; off: the function's own address, as before) |
 | `FID_NAT_OFF=wipe` | the frame of a function holding a `@secret`/`@sensitive`/`@zeroize` value zeroed at every return (LF20; off: left as it is) |
+| `FID_NAT_OFF=ctir` | the IR-level `@constant_time` check in the native backend (J7, `peir_ct_check`; off: only the machine-level check) |
 | `FID_NAT_OFF=debug` | line tables and debug sections in the image |
 | `FID_NAT_OFF=rules` | the rewrite rules of `rules.fd` (`fid test-rules` checks each on values) |
 | `FID_NAT_OFF=purecse` | equal calls of pure functions merged (`rules.fd`) |
@@ -201,6 +203,7 @@ macOS targets and `--nat` Windows) and by the rule passes it runs
 | `FID_NAT_OFF=memcmp` | x86-64: a load compared with a register or constant as a compare with memory (`ng_fuse_memcmp`) |
 | `FID_NAT_OFF=livecoal` | the allocator's second coalescing round over exact liveness (RA6) |
 | `FID_NAT_OFF=frameslots` | spill slots only for spilled vregs (MI8); off: every IR value has its own frame slot, as before |
+| `FID_NAT_OFF=deadalloca` | frame bytes for an `Alloca` nothing addresses after promotion (MI8, `ng_gen_function`; off: every `Alloca` keeps its bytes) |
 | `FID_NAT_OFF=retfwd` | the result slots of calls returning in two registers kept in vregs (OP12 / LF24, `ng_rf_promote`) |
 | `FID_NAT_OFF=secretregs` | secret values given the highest spill weight, so they stay out of memory (LF20, `ng_secret_weights`) |
 | `FID_NAT_OFF=wiperegs` | with `wipe`: clearing the registers a function holding secrets used (LF20, `ng_wipe_setup`) |
