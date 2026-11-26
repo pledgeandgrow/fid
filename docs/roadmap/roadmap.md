@@ -1039,6 +1039,7 @@ annotation reference.
   tests/limits/check-run.sh 15 of 15 and check-native.sh on pe_ir 5 of 5.
   --nat and x86_64-linux not rechecked in the merged tree (known-bugs
   2g.115).
+  Nov 26 re-check (pinned stage0 fid, current tree): the --nat Windows CPU limit works (cpu_spin with FID_CPU_LIMIT=2 exits 124 with the right message). mem_hog with FID_MEM_LIMIT on --nat panics with a null/dangling memory access instead of exiting 125 (control programs hello/arithmetic run fine on --nat, so it is feature-path specific, but whether the pinned compiler or the merged tree is at fault is unresolved). Still partly.
 - [x] Data race prevention — `@sync`/`@send` DONE (parsed on structs, `is_send_type`/`is_sync_type` enforced at `p_thread_spawn`/`p_chan_send`/`spawn` capture sites in both Rust + self-hosted typecheckers)
 
 ---
@@ -7763,6 +7764,7 @@ Fides's effect system is the foundation — effect handlers can replace async/aw
   cwd, exit codes, argument quoting).
   Leftover (Nov 15): no builder (environment, working directory, pipes); no newer roadmap tracks it.
   Nov 21 check (fid built from the self-hosted stage 0 at 86cc919): partly — a spawn with pipes and `Command::spawn() -> Child` (fid_proc_spawn_io / fid_proc_write / fid_proc_read / fid_proc_close_in): test_process_pipes gives its 11 lines on run, ccompile, pe_ir and x86_64-linux (WSL); test_process_command passes on all 5 paths (--nat included), test_process_spawn on C, pe_ir, --nat and Linux. Left: --nat Windows has no pipes (test_process_pipes prints 'sorted: did not start'; it needs the CreatePipe / SetHandleInformation imports); under `fid run` test_process_spawn once printed 'parallel codes: 0 1 -1' instead of '0 1 2' (1 run in 4: flaky under load).
+  Nov 26 re-check (pinned stage0 fid, current tree): CreatePipe/SetHandleInformation are now imported in stdlib/linux_runtime/win.fd, but test_process_pipes on --nat still fails — now as a hard panic (null/dangling memory access) rather than the clean 'did not start'; test_process_command on --nat panics too ("a str without a string header"). Control programs run fine on --nat. Still partly: the pipe path is wired but broken.
 - [x] `process::exit(code)` — exit current process — `process_exit`, `os_exit` (`stdlib/os.fd`).
 - [x] `env::var(name) -> Option<String>` — get environment variable — core `env_var` (Option), `env_get`.
 - [x] `env::args() -> Vec<String>` — get command line arguments — `args_all`, `os_args`, `arg_at`, flag parsing in `stdlib/args.fd`.
@@ -8019,6 +8021,7 @@ Fides's effect system is the foundation — effect handlers can replace async/aw
   — `fid run --leaks` reports blocks not freed, `--checked-alloc` catches use after free (complaint CM8/CM9). Left: a run-time memory profile (complaint CO5, competitive SL15).
   Nov 17: region usage in the C runtime's `--mem` report (a build with FID_REGION_ARENA=1), and the machine layer's profile (FID_MEM_PROFILE=1 at run time, or `fid emit --mem`: nat_ir.fd g_nat_mem_profile, linux_runtime/base.fd lrt_mem_mode bit 4, pe_mem_report at exit). Left: pe_ir (its machine-code p_malloc / p_free record nothing).
   Nov 21 check (fid built from the self-hosted stage 0 at 86cc919): partly — `tests/memprof/check.sh` passes; check_more.sh's 9 region checks pass (regions by depth, the peak, by function and by line, none without FID_REGION_ARENA), and on --nat and x86_64-linux the totals, the peak, the rows adding up and the off switch are right. Left: check_more.sh fails 'row fill' on --nat and x86_64-linux (the by-function table credits fill's bytes to main), plus its stale dynlib --nat check; pe_ir has no memory profile; native reports have no by-line rows.
+  Nov 26 re-check (pinned stage0 fid, current tree): mem_profile.fd on --nat panics with a null/dangling memory access before any report (control programs fine). pe_ir still records nothing. Still partly.
 - [x] Allocation profiler (which functions allocate, how much)
   — `fid explain <file> --alloc` lists each allocation site and why it is on the heap (complaint CP2). Left: how much each allocates at run time (complaint CO5).  Nov 22: validated — `fid explain --alloc` lists each site with its
   reason ("string copy (heap: dynamic length)").

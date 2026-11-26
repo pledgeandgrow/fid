@@ -755,6 +755,7 @@ compiler.
       Nov 22: `f8_static_prims_check.sh` passed static-link and runtime checks
       for hello, threads and tasks on x86_64, AArch64 and RISC-V under QEMU.
       The current suite-all RISC-V job still fails: both C and native lanes
+      Nov 26: not re-verifiable locally (needs qemu-user/the full suite — CI-scale); the suite-all lanes are red for missing-stage0-asset infrastructure reasons, not target codegen. Still partly.
       report 0 passed and 1,166 did not build. Full-suite acceptance remains open.
 - [x] F9. WASM: globals, struct copies, collections (L).
       Nov 7, through C: `fid ccompile --target wasm32-wasi -o x.wasm` (zig cc,
@@ -810,6 +811,7 @@ compiler.
       the current dev compiler. The current suite-all WASM job fails: the
       full native-WASM set reports 11 did not build, and task-switch checks
       fail. Leave partly pending the full gap set.
+      Nov 26 re-check: p_volatile_load16/store16 still absent from compiler/wasm.fd (no references); the full-suite gap set is unmeasurable locally. Still partly.
 
 **Acceptance:** Windows, Linux and macOS are fully supported at 1.0.0, on x64 and
 ARM64 where the system runs there; RISC-V and WASM pass the suite.
