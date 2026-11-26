@@ -4035,8 +4035,12 @@ pub fn Lowerer_lower_program(self: & mut Lowerer, program_in: Program) -> IrModu
     while i < program.globals.len() {
         var g: GlobalVar = program.globals.get(i);
         var ir_ty: IrType = Lowerer_lower_type(self, g.ty);
-        self.module.globals.push(GlobalEntry_new(g.name, ir_ty, g.init));
-        if !lw_is_const_init(g.init) {
+        // 2g.119: fold what a compile-time constant the initializer is
+        // (`0 - 1` -> -1) so it is written into the program's data, never
+        // assigned at the top of main after the boot hooks.
+        val init: Expr = lw_fold_const_init(g.init);
+        self.module.globals.push(GlobalEntry_new(g.name, ir_ty, init));
+        if !lw_is_const_init(init) {
             self.global_inits.push(g);
         }
         i = i + 1;
@@ -6018,6 +6022,228 @@ fn lw_is_local_use(inst: Inst, op: i64, borrows: LwBorrows, kind: i64) -> bool {
 }
 
 /// `Vec_drop(*shadow)`, appended to `out`.
+/// 2g.119: |v| small enough that a sum, difference or product of two of
+/// them cannot overflow i64 — the interpreter traps overflow where the
+/// compiled target wraps, so wider arithmetic is left to run as written.
+fn lw_fold_small(v: i64) -> bool {
+    return v >= (0 - 4294967296) && v <= 4294967296;
+}
+
+/// 2g.119: fold a constant global initializer to a literal, so every
+/// backend bakes it into the program's data with no runtime assignment.
+/// The assignment otherwise ran at the top of main, after the boot hooks
+/// (pert_limits_boot, pert_prof_boot): a hook read the zero fill where the
+/// initializer was `-1` (`var x: i64 = 0 - 1`, the runtime's "not read
+/// yet" idiom, 119 uses in the tree) and a hook's own write was
+/// overwritten when main started. Arithmetic wraps as the target's; what
+/// the interpreter would trap or the target mask is not folded: a division
+/// or modulo by zero, and shifts of 64 bits or more.
+fn lw_fold_const_init(expr: Expr) -> Expr {
+    match expr {
+        Expr::Unary(op, e) => {
+            val inner: Expr = lw_fold_const_init(box_expr_unbox(e));
+            match inner {
+                Expr::IntLit(v) => {
+                    match op {
+                        UnaryOp::Neg => {
+                            if lw_fold_small(v) {
+                                return Expr::IntLit(0 - v);
+                            }
+                        }
+                        UnaryOp::BitNot => {
+                            return Expr::IntLit((0 - v) - 1);
+                        }
+                        _ => {
+                        }
+                    }
+                }
+                Expr::FloatLit(f) => {
+                    match op {
+                        UnaryOp::Neg => {
+                            return Expr::FloatLit(0.0 - f);
+                        }
+                        _ => {
+                        }
+                    }
+                }
+                Expr::BoolLit(b) => {
+                    match op {
+                        UnaryOp::Not => {
+                            if b {
+                                return Expr::BoolLit(false);
+                            }
+                            return Expr::BoolLit(true);
+                        }
+                        _ => {
+                        }
+                    }
+                }
+                _ => {
+                }
+            }
+            return Expr::Unary(op, Box::new(inner));
+        }
+        Expr::Binary(op, l, r) => {
+            val le: Expr = lw_fold_const_init(box_expr_unbox(l));
+            val re: Expr = lw_fold_const_init(box_expr_unbox(r));
+            match le {
+                Expr::IntLit(lv) => {
+                    match re {
+                        Expr::IntLit(rv) => {
+                            match op {
+                                BinOp::Add => {
+                                    if lw_fold_small(lv) && lw_fold_small(rv) {
+                                        return Expr::IntLit(lv + rv);
+                                    }
+                                }
+                                BinOp::Sub => {
+                                    if lw_fold_small(lv) && lw_fold_small(rv) {
+                                        return Expr::IntLit(lv - rv);
+                                    }
+                                }
+                                BinOp::Mul => {
+                                    if lw_fold_small(lv) && lw_fold_small(rv) {
+                                        return Expr::IntLit(lv * rv);
+                                    }
+                                }
+                                BinOp::Div => {
+                                    if rv != 0 && !(lv == ((0 - 9223372036854775807) - 1) && rv == (0 - 1)) {
+                                        return Expr::IntLit(lv / rv);
+                                    }
+                                }
+                                BinOp::Mod => {
+                                    if rv != 0 && !(lv == ((0 - 9223372036854775807) - 1) && rv == (0 - 1)) {
+                                        return Expr::IntLit(lv % rv);
+                                    }
+                                }
+                                BinOp::BitAnd => {
+                                    return Expr::IntLit(lv & rv);
+                                }
+                                BinOp::BitOr => {
+                                    return Expr::IntLit(lv | rv);
+                                }
+                                BinOp::BitXor => {
+                                    return Expr::IntLit(lv ^ rv);
+                                }
+                                BinOp::Shl => {
+                                    if rv >= 0 && rv < 64 && lw_fold_small(lv) {
+                                        return Expr::IntLit(lv << rv);
+                                    }
+                                }
+                                BinOp::Shr => {
+                                    if rv >= 0 && rv < 64 {
+                                        return Expr::IntLit(lv >> rv);
+                                    }
+                                }
+                                BinOp::Eq => {
+                                    return Expr::BoolLit(lv == rv);
+                                }
+                                BinOp::Neq => {
+                                    return Expr::BoolLit(lv != rv);
+                                }
+                                BinOp::Lt => {
+                                    return Expr::BoolLit(lv < rv);
+                                }
+                                BinOp::Gt => {
+                                    return Expr::BoolLit(lv > rv);
+                                }
+                                BinOp::LtEq => {
+                                    return Expr::BoolLit(lv <= rv);
+                                }
+                                BinOp::GtEq => {
+                                    return Expr::BoolLit(lv >= rv);
+                                }
+                                _ => {
+                                }
+                            }
+                        }
+                        _ => {
+                        }
+                    }
+                }
+                Expr::FloatLit(lf) => {
+                    match re {
+                        Expr::FloatLit(rf) => {
+                            match op {
+                                BinOp::Add => {
+                                    return Expr::FloatLit(lf + rf);
+                                }
+                                BinOp::Sub => {
+                                    return Expr::FloatLit(lf - rf);
+                                }
+                                BinOp::Mul => {
+                                    return Expr::FloatLit(lf * rf);
+                                }
+                                BinOp::Div => {
+                                    return Expr::FloatLit(lf / rf);
+                                }
+                                BinOp::Eq => {
+                                    return Expr::BoolLit(lf == rf);
+                                }
+                                BinOp::Neq => {
+                                    return Expr::BoolLit(lf != rf);
+                                }
+                                BinOp::Lt => {
+                                    return Expr::BoolLit(lf < rf);
+                                }
+                                BinOp::Gt => {
+                                    return Expr::BoolLit(lf > rf);
+                                }
+                                BinOp::LtEq => {
+                                    return Expr::BoolLit(lf <= rf);
+                                }
+                                BinOp::GtEq => {
+                                    return Expr::BoolLit(lf >= rf);
+                                }
+                                _ => {
+                                }
+                            }
+                        }
+                        _ => {
+                        }
+                    }
+                }
+                Expr::BoolLit(lb) => {
+                    match re {
+                        Expr::BoolLit(rb) => {
+                            match op {
+                                BinOp::And => {
+                                    if lb && rb {
+                                        return Expr::BoolLit(true);
+                                    }
+                                    return Expr::BoolLit(false);
+                                }
+                                BinOp::Or => {
+                                    if lb || rb {
+                                        return Expr::BoolLit(true);
+                                    }
+                                    return Expr::BoolLit(false);
+                                }
+                                BinOp::Eq => {
+                                    return Expr::BoolLit(lb == rb);
+                                }
+                                BinOp::Neq => {
+                                    return Expr::BoolLit(lb != rb);
+                                }
+                                _ => {
+                                }
+                            }
+                        }
+                        _ => {
+                        }
+                    }
+                }
+                _ => {
+                }
+            }
+            return Expr::Binary(op, Box::new(le), Box::new(re));
+        }
+        _ => {
+        }
+    }
+    return expr;
+}
+
 /// Whether a global's initializer is written into the program's data.
 fn lw_is_const_init(expr: Expr) -> bool {
     match expr {
