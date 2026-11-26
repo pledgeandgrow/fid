@@ -9582,6 +9582,30 @@ pub fn CCodeGen_generate(self: &mut CCodeGen, module: IrModule) -> str {
         }
         xf = xf + 1;
     }
+    // 2g.121: an extern's declared parameter types rule the casts at its
+    // call sites: a `&mut` argument is a void* in the generated C where the
+    // prototype takes int64_t (stdlib/net.fd's pledge_net_recvfrom), and
+    // without them fn_param_types_get is None, no cast is inserted, and
+    // clang rejects the call (-Wint-conversion). An extern with an aggregate
+    // parameter or result keeps no entry: it is called through the
+    // __c_wrap_ wrapper, whose parameters already are the C types (c_wrapped
+    // is only filled in emit_extern_decls, after this point).
+    var xp: i64 = 0;
+    while xp < module.extern_functions.len() {
+        val xfn: StringVecIrType = module.extern_functions.get(xp);
+        var aggregate: bool = is_aggregate_ret(xfn.ret);
+        var xa: i64 = 0;
+        while xa < xfn.params.len() {
+            if is_aggregate_ret(xfn.params.get(xa)) {
+                aggregate = true;
+            }
+            xa = xa + 1;
+        }
+        if IrModule_fn_pos(&module, xfn.name) < 0 && !aggregate {
+            fn_param_types_set(self, xfn.name, xfn.params);
+        }
+        xp = xp + 1;
+    }
 
     if g_c_profile {
         wln(self, "#define P_PROFILE 1");

@@ -944,6 +944,22 @@ impl CCodeGen {
         for ext in &module.extern_decls {
             self.extern_func_names.insert(ext.pledge_name.clone());
         }
+        // 2g.121: an extern's declared parameter types rule the casts at its
+        // call sites: a `&mut` argument is a void* in the generated C where
+        // the prototype takes int64_t (stdlib/net.fd's pledge_net_recvfrom),
+        // and without them the lookup is empty, no cast is inserted, and
+        // clang rejects the call (-Wint-conversion). An extern with an
+        // aggregate parameter or result keeps no entry: it is called through
+        // the __c_wrap_ wrapper, whose parameters already are the C types.
+        for (name, (params, ret)) in &module.extern_functions {
+            let aggregate = matches!(ret, IrType::Struct(_) | IrType::Array(_, _))
+                || params
+                    .iter()
+                    .any(|t| matches!(t, IrType::Struct(_) | IrType::Array(_, _)));
+            if !module.functions.contains_key(name) && !aggregate {
+                self.fn_param_types.insert(name.clone(), params.clone());
+            }
+        }
         // Runtime functions (not in module.functions) — needed so that
         // call-site argument casting knows their parameter types.
         self.insert_runtime_sigs();
