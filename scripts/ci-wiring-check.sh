@@ -67,7 +67,9 @@ need N1 $W/ci.yml "bash scripts/ark-check.sh ./release/fid-dev"
 need N1 $W/ci.yml "bash scripts/ark-check.sh ./release/fid-dev.exe"
 need A10 installer/build-installer.sh "bash scripts/release-fresh.sh release/fid.exe"
 need N8 installer/build-installer.sh 'ccompile "tools/$tool.fd"'
-for t in ark scribe veil; do need N8 tools/$t.fd "${t}_main()"; done
+for t in ark scribe; do need N8 tools/$t.fd "${t}_main()"; done
+# tools/veil.fd keeps the Rust tool's CLI and calls compiler::veil's run
+need N8 tools/veil.fd "veil_run("
 need N10 $W/release.yml "bash scripts/stdlib-docs.sh --zip"
 need N10 $W/release.yml "dist/fides-stdlib-docs.zip"
 need N10 $W/ci.yml "scripts/stdlib-docs.sh --check"
@@ -146,7 +148,9 @@ need B9 $W/verify-weekly.yml "run: FIXPOINT=1 bash scripts/inc-check.sh"
 need VF2 $W/verify-nightly.yml 'seed.outputs.seed }}" --ext'
 need VF7 $W/ci.yml "run: python3 scripts/verify/variants.py check"
 need VF8 $W/ci.yml "run: python3 scripts/verify/coverage.py --self-test"
-need VF8 $W/verify-weekly.yml "--goal 90 --goal-modules all"
+need VF8 $W/verify-weekly.yml "bash scripts/verify/vf8-run.sh"
+need VF8 scripts/verify/vf8-run.sh 'GOAL="${GOAL:-90}"'
+need VF8 scripts/verify/vf8-run.sh "--goal-modules all"
 for b in game/fides/fasta game/fides/binarytrees work/fides/compiler; do
   [ -f "bench/$b.fd" ] || { echo "MISSING BM3/BM4: bench/$b.fd"; bad=$((bad + 1)); }
 done
