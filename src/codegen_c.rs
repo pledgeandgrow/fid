@@ -20,6 +20,455 @@ macro_rules! wln {
     }};
 }
 
+const FID_PROC_RUNTIME_C: &str = r#####"/* AD4: child processes without the shell (stdlib/process.fd process_spawn,
+   process_wait, process_kill), declared there `extern "C"` with word
+   arguments. argv and env are lists in one string, the items separated by
+   byte 31; an env item KEY=VALUE sets KEY for the child on top of this
+   process's environment, a bare KEY removes it. dir "" keeps ours. out is
+   a list too: the file for the child's stdout, then the one for its stderr
+   (created or emptied); "" (or no second item) for the stdout file, or
+   ours, as the case may be. A handle is a slot of __p_child + 1. Waiting polls
+   (POSIX) or waits on the process (Windows) with a time limit, so a program
+   can keep many children running. Spawn, wait and free from one thread. */
+#if !defined(_WIN32) && !defined(__wasi__)
+#include <signal.h>
+#include <errno.h>
+#include <time.h>
+extern char** environ;
+#endif
+#define P_CHILD_MAX 1024
+typedef struct {
+    int used; int done; int64_t code; int64_t pid;
+    int64_t pin, pout, perr;
+#ifdef _WIN32
+    HANDLE ph;
+#endif
+} PChild;
+static PChild __p_child[P_CHILD_MAX];
+static PChild* __p_child_at(int64_t h) {
+    if (h < 1 || h > P_CHILD_MAX || !__p_child[h - 1].used) return NULL;
+    return &__p_child[h - 1];
+}
+#if !defined(__wasi__)
+/* the items of list s (byte 31 between them) as a NULL-terminated array,
+   array and text in one malloc block; *count gets the number of items */
+static char** __p_child_split(const char* s, int* count) {
+    size_t n = s ? strlen(s) : 0;
+    int k = n > 0 ? 1 : 0;
+    for (size_t i = 0; i < n; i++) if (s[i] == 31) k++;
+    char** v = (char**)malloc(sizeof(char*) * (size_t)(k + 1) + n + 1);
+    if (!v) return NULL;
+    char* buf = (char*)(v + k + 1);
+    if (n > 0) memcpy(buf, s, n);
+    buf[n] = 0;
+    int j = 0;
+    if (n > 0) {
+        v[j++] = buf;
+        for (size_t i = 0; i < n; i++) if (buf[i] == 31) { buf[i] = 0; v[j++] = buf + i + 1; }
+    }
+    v[j] = NULL;
+    if (count) *count = j;
+    return v;
+}
+/* does environment entry e ("KEY=..") have the key of item o ("KEY=.." or
+   "KEY")? Windows keys ignore case */
+static int __p_child_same_key(const char* e, const char* o) {
+    size_t i = 0;
+    while (o[i] && o[i] != '=') {
+        char a = e[i], b = o[i];
+#ifdef _WIN32
+        if (a >= 'a' && a <= 'z') a = (char)(a - 32);
+        if (b >= 'a' && b <= 'z') b = (char)(b - 32);
+#endif
+        if (a == 0 || a != b) return 0;
+        i++;
+    }
+    return e[i] == '=';
+}
+static int __p_child_slot(void) {
+    for (int i = 0; i < P_CHILD_MAX; i++) if (!__p_child[i].used) return i;
+    return -1;
+}
+#endif
+#if defined(_WIN32)
+/* one argument quoted for the C runtime's command-line parser
+   (CommandLineToArgvW's rules), appended at *at */
+static char* __p_child_quote(char* at, const char* a) {
+    int plain = *a != 0;
+    for (const char* q = a; *q; q++) if (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\v' || *q == '"') plain = 0;
+    if (plain) { size_t n = strlen(a); memcpy(at, a, n); return at + n; }
+    *at++ = '"';
+    for (const char* q = a; ; q++) {
+        size_t bs = 0;
+        while (*q == '\\') { bs++; q++; }
+        if (*q == 0) { for (size_t i = 0; i < bs * 2; i++) *at++ = '\\'; break; }
+        if (*q == '"') { for (size_t i = 0; i < bs * 2 + 1; i++) *at++ = '\\'; *at++ = '"'; }
+        else { for (size_t i = 0; i < bs; i++) *at++ = '\\'; *at++ = *q; }
+    }
+    *at++ = '"';
+    return at;
+}
+#endif
+static int64_t __p_child_spawn(int64_t argv_list, int64_t env_list, int64_t dir_w, int64_t out_w, int64_t io) {
+    const char* argl = (const char*)(intptr_t)argv_list;
+    const char* envl = (const char*)(intptr_t)env_list;
+    const char* dir = (const char*)(intptr_t)dir_w;
+    const char* out = (const char*)(intptr_t)out_w;
+    if (!argl || !*argl) return 0;
+#if defined(__wasi__)
+    (void)envl; (void)dir; (void)out; (void)io;
+    p_panic("not available in WebAssembly: processes (process_spawn)");
+    return 0;
+#else
+    int slot = __p_child_slot();
+    if (slot < 0) return 0;
+    int na = 0, ne = 0;
+    char** av = __p_child_split(argl, &na);
+    char** ov = __p_child_split(envl, &ne);
+    int no = 0;
+    char** fv = __p_child_split(out, &no);
+    const char* of = (fv && no > 0 && *fv[0]) ? fv[0] : NULL;
+    const char* ef = (fv && no > 1 && *fv[1]) ? fv[1] : NULL;
+    if (io & 2) of = NULL;
+    if (io & 12) ef = NULL;
+    if (!av || !ov || !fv || na == 0) { free(av); free(ov); free(fv); return 0; }
+    fflush(stdout); fflush(stderr);
+#if defined(_WIN32)
+    size_t len = 1;
+    for (int i = 0; i < na; i++) len += strlen(av[i]) * 2 + 3;
+    char* line = (char*)malloc(len);
+    char* envb = NULL;
+    if (!line) { free(av); free(ov); free(fv); return 0; }
+    char* at = line;
+    for (int i = 0; i < na; i++) { if (i > 0) *at++ = ' '; at = __p_child_quote(at, av[i]); }
+    *at = 0;
+    if (ne > 0) {
+        /* our environment block less the keys the list names, then the list */
+        char* cur = GetEnvironmentStringsA();
+        size_t need = 2;
+        if (cur) for (char* e = cur; *e; e += strlen(e) + 1) need += strlen(e) + 1;
+        for (int i = 0; i < ne; i++) need += strlen(ov[i]) + 1;
+        envb = (char*)malloc(need);
+        if (envb) {
+            char* w = envb;
+            if (cur) for (char* e = cur; *e; e += strlen(e) + 1) {
+                int drop = 0;
+                for (int i = 0; i < ne && !drop; i++) if (*e != '=' && __p_child_same_key(e, ov[i])) drop = 1;
+                if (!drop) { size_t n = strlen(e) + 1; memcpy(w, e, n); w += n; }
+            }
+            for (int i = 0; i < ne; i++) if (strchr(ov[i], '=')) { size_t n = strlen(ov[i]) + 1; memcpy(w, ov[i], n); w += n; }
+            *w++ = 0;
+            if (w == envb + 1) *w++ = 0;
+        }
+        if (cur) FreeEnvironmentStringsA(cur);
+    }
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    memset(&si, 0, sizeof si);
+    memset(&pi, 0, sizeof pi);
+    si.cb = sizeof si;
+    HANDLE fh = INVALID_HANDLE_VALUE, eh = INVALID_HANDLE_VALUE;
+    if (of || ef) {
+        SECURITY_ATTRIBUTES sa;
+        sa.nLength = sizeof sa; sa.lpSecurityDescriptor = NULL; sa.bInheritHandle = TRUE;
+        if (of) fh = CreateFileA(of, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, &sa, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (ef) eh = CreateFileA(ef, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, &sa, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if ((of && fh == INVALID_HANDLE_VALUE) || (ef && eh == INVALID_HANDLE_VALUE)) {
+            if (fh != INVALID_HANDLE_VALUE) CloseHandle(fh);
+            if (eh != INVALID_HANDLE_VALUE) CloseHandle(eh);
+            free(line); free(envb); free(av); free(ov); free(fv);
+            return 0;
+        }
+    }
+    HANDLE pend[3] = { INVALID_HANDLE_VALUE, INVALID_HANDLE_VALUE, INVALID_HANDLE_VALUE };
+    HANDLE cend[3] = { INVALID_HANDLE_VALUE, INVALID_HANDLE_VALUE, INVALID_HANDLE_VALUE };
+    int pipes_ok = 1;
+    for (int k = 0; k < 3 && pipes_ok; k++) {
+        if (!(io & (1 << k))) continue;
+        SECURITY_ATTRIBUTES psa;
+        psa.nLength = sizeof psa; psa.lpSecurityDescriptor = NULL; psa.bInheritHandle = TRUE;
+        HANDLE pr = INVALID_HANDLE_VALUE, pw = INVALID_HANDLE_VALUE;
+        if (!CreatePipe(&pr, &pw, &psa, 0)) { pipes_ok = 0; break; }
+        if (k == 0) { cend[0] = pr; pend[0] = pw; } else { cend[k] = pw; pend[k] = pr; }
+        SetHandleInformation(pend[k], HANDLE_FLAG_INHERIT, 0);
+    }
+    if (!pipes_ok) {
+        for (int k = 0; k < 3; k++) {
+            if (pend[k] != INVALID_HANDLE_VALUE) CloseHandle(pend[k]);
+            if (cend[k] != INVALID_HANDLE_VALUE) CloseHandle(cend[k]);
+        }
+        if (fh != INVALID_HANDLE_VALUE) CloseHandle(fh);
+        if (eh != INVALID_HANDLE_VALUE) CloseHandle(eh);
+        free(line); free(envb); free(av); free(ov); free(fv);
+        return 0;
+    }
+    int handles = (of || ef || (io & 15)) ? 1 : 0;
+    if (handles) {
+        si.dwFlags = STARTF_USESTDHANDLES;
+        si.hStdInput = (io & 1) ? cend[0] : GetStdHandle(STD_INPUT_HANDLE);
+        si.hStdOutput = (io & 2) ? cend[1] : (of ? fh : GetStdHandle(STD_OUTPUT_HANDLE));
+        if (io & 4) si.hStdError = cend[2];
+        else if (io & 8) si.hStdError = si.hStdOutput;
+        else si.hStdError = ef ? eh : (of ? fh : GetStdHandle(STD_ERROR_HANDLE));
+    }
+    BOOL ok = CreateProcessA(NULL, line, NULL, NULL, handles ? TRUE : FALSE, 0, envb, (dir && *dir) ? dir : NULL, &si, &pi);
+    if (fh != INVALID_HANDLE_VALUE) CloseHandle(fh);
+    if (eh != INVALID_HANDLE_VALUE) CloseHandle(eh);
+    for (int k = 0; k < 3; k++) {
+        if (cend[k] != INVALID_HANDLE_VALUE) CloseHandle(cend[k]);
+        if (!ok && pend[k] != INVALID_HANDLE_VALUE) CloseHandle(pend[k]);
+    }
+    free(line); free(envb); free(av); free(ov); free(fv);
+    if (!ok) return 0;
+    CloseHandle(pi.hThread);
+    __p_child[slot].ph = pi.hProcess;
+    __p_child[slot].pid = (int64_t)pi.dwProcessId;
+    __p_child[slot].pin = (int64_t)(intptr_t)pend[0];
+    __p_child[slot].pout = (int64_t)(intptr_t)pend[1];
+    __p_child[slot].perr = (int64_t)(intptr_t)pend[2];
+#else
+    char** ev = NULL;
+    if (ne > 0) {
+        int m = 0;
+        while (environ && environ[m]) m++;
+        ev = (char**)malloc(sizeof(char*) * (size_t)(m + ne + 1));
+        if (!ev) { free(av); free(ov); free(fv); return 0; }
+        int k = 0;
+        for (int i = 0; i < m; i++) {
+            int drop = 0;
+            for (int j = 0; j < ne && !drop; j++) if (__p_child_same_key(environ[i], ov[j])) drop = 1;
+            if (!drop) ev[k++] = environ[i];
+        }
+        for (int j = 0; j < ne; j++) if (strchr(ov[j], '=')) ev[k++] = ov[j];
+        ev[k] = NULL;
+    }
+    int fd = -1, efd = -1;
+    if (of) fd = open(of, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (ef) efd = open(ef, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if ((of && fd < 0) || (ef && efd < 0)) {
+        if (fd >= 0) close(fd);
+        if (efd >= 0) close(efd);
+        free(ev); free(av); free(ov); free(fv);
+        return 0;
+    }
+    int pp[3][2] = { { -1, -1 }, { -1, -1 }, { -1, -1 } };
+    int pipes_ok = 1;
+    for (int k = 0; k < 3 && pipes_ok; k++) {
+        if (!(io & (1 << k))) continue;
+        if (pipe(pp[k]) != 0) { pp[k][0] = -1; pp[k][1] = -1; pipes_ok = 0; break; }
+        fcntl(k == 0 ? pp[k][1] : pp[k][0], F_SETFD, FD_CLOEXEC);
+    }
+    if (!pipes_ok) {
+        for (int k = 0; k < 3; k++) { if (pp[k][0] >= 0) close(pp[k][0]); if (pp[k][1] >= 0) close(pp[k][1]); }
+        if (fd >= 0) close(fd);
+        if (efd >= 0) close(efd);
+        free(ev); free(av); free(ov); free(fv);
+        return 0;
+    }
+    pid_t pid = fork();
+    if (pid == 0) {
+        if (dir && *dir && chdir(dir) != 0) _exit(127);
+        if (pp[0][0] >= 0) dup2(pp[0][0], 0);
+        if (pp[1][1] >= 0) dup2(pp[1][1], 1); else if (fd >= 0) dup2(fd, 1);
+        if (pp[2][1] >= 0) dup2(pp[2][1], 2);
+        else if (io & 8) dup2(1, 2);
+        else if (efd >= 0) dup2(efd, 2); else if (fd >= 0) dup2(fd, 2);
+        for (int k = 0; k < 3; k++) { if (pp[k][0] > 2) close(pp[k][0]); if (pp[k][1] > 2) close(pp[k][1]); }
+        if (fd >= 0) close(fd);
+        if (efd >= 0) close(efd);
+        if (ev) environ = ev;
+        execvp(av[0], av);
+        _exit(127);
+    }
+    if (fd >= 0) close(fd);
+    if (efd >= 0) close(efd);
+    free(ev); free(av); free(ov); free(fv);
+    /* the child's ends (all of them when it did not start) */
+    if (pp[0][0] >= 0) close(pp[0][0]);
+    if (pp[1][1] >= 0) close(pp[1][1]);
+    if (pp[2][1] >= 0) close(pp[2][1]);
+    if (pid < 0) {
+        if (pp[0][1] >= 0) close(pp[0][1]);
+        if (pp[1][0] >= 0) close(pp[1][0]);
+        if (pp[2][0] >= 0) close(pp[2][0]);
+        return 0;
+    }
+    __p_child[slot].pid = (int64_t)pid;
+    __p_child[slot].pin = (int64_t)pp[0][1];
+    __p_child[slot].pout = (int64_t)pp[1][0];
+    __p_child[slot].perr = (int64_t)pp[2][0];
+#endif
+    __p_child[slot].used = 1;
+    __p_child[slot].done = 0;
+    __p_child[slot].code = -1;
+    return (int64_t)slot + 1;
+#endif
+}
+int64_t fid_proc_spawn(int64_t argv_list, int64_t env_list, int64_t dir_w, int64_t out_w) {
+    return __p_child_spawn(argv_list, env_list, dir_w, out_w, 0);
+}
+int64_t fid_proc_spawn_io(int64_t argv_list, int64_t env_list, int64_t dir_w, int64_t out_w, int64_t io) {
+    return __p_child_spawn(argv_list, env_list, dir_w, out_w, io & 15);
+}
+static void __p_child_close_end(int64_t* e) {
+    if (*e == -1) return;
+#if defined(_WIN32)
+    CloseHandle((HANDLE)(intptr_t)*e);
+#elif !defined(__wasi__)
+    close((int)*e);
+#endif
+    *e = -1;
+}
+/* all n bytes at data to the child's stdin pipe: n, or -1 when it has no
+   such pipe or the child closed it (no SIGPIPE: ignored for the write) */
+int64_t fid_proc_write(int64_t h, int64_t data, int64_t n) {
+    PChild* c = __p_child_at(h);
+    if (!c || c->pin == -1 || n < 0 || (n > 0 && !data)) return -1;
+    const char* p = (const char*)(intptr_t)data;
+    int64_t done = 0;
+#if defined(__wasi__)
+    (void)p;
+    return -1;
+#elif defined(_WIN32)
+    while (done < n) {
+        DWORD w = 0;
+        DWORD k = (DWORD)((n - done) > 0x40000000 ? 0x40000000 : (n - done));
+        if (!WriteFile((HANDLE)(intptr_t)c->pin, p + done, k, &w, NULL) || w == 0) return -1;
+        done += (int64_t)w;
+    }
+    return done;
+#else
+    struct sigaction ign, old;
+    memset(&ign, 0, sizeof ign);
+    ign.sa_handler = SIG_IGN;
+    sigaction(SIGPIPE, &ign, &old);
+    while (done < n) {
+        ssize_t w = write((int)c->pin, p + done, (size_t)(n - done));
+        if (w < 0 && errno == EINTR) continue;
+        if (w <= 0) { done = -1; break; }
+        done += (int64_t)w;
+    }
+    sigaction(SIGPIPE, &old, NULL);
+    return done;
+#endif
+}
+/* up to max bytes the child wrote to its stdout (which 1) or stderr (2)
+   pipe, into buf; waits for at least one. 0 once it is closed and empty
+   (the child ended), -1 when there is no such pipe */
+int64_t fid_proc_read(int64_t h, int64_t which, int64_t buf, int64_t max) {
+    PChild* c = __p_child_at(h);
+    if (!c || max <= 0 || !buf) return -1;
+    int64_t e = which == 2 ? c->perr : c->pout;
+    if (e == -1) return -1;
+#if defined(__wasi__)
+    return -1;
+#elif defined(_WIN32)
+    for (;;) {
+        DWORD got = 0;
+        if (!ReadFile((HANDLE)(intptr_t)e, (void*)(intptr_t)buf, (DWORD)(max > 0x40000000 ? 0x40000000 : max), &got, NULL)) {
+            DWORD er = GetLastError();
+            return (er == ERROR_BROKEN_PIPE || er == ERROR_HANDLE_EOF) ? 0 : -1;
+        }
+        if (got > 0) return (int64_t)got;
+    }
+#else
+    for (;;) {
+        ssize_t r = read((int)e, (void*)(intptr_t)buf, (size_t)max);
+        if (r < 0 && errno == EINTR) continue;
+        return r < 0 ? -1 : (int64_t)r;
+    }
+#endif
+}
+/* close this end of the child's stdin pipe: it reads the end of its input */
+int64_t fid_proc_close_in(int64_t h) {
+    PChild* c = __p_child_at(h);
+    if (!c) return -1;
+    __p_child_close_end(&c->pin);
+    return 0;
+}
+/* 1 once the child has ended (its code kept), 0 when it is still running
+   after timeout_ms (< 0: no limit), -1 for a bad handle */
+int64_t fid_proc_wait(int64_t h, int64_t timeout_ms) {
+    PChild* c = __p_child_at(h);
+    if (!c) return -1;
+    if (c->done) return 1;
+#if defined(__wasi__)
+    (void)timeout_ms;
+    return -1;
+#elif defined(_WIN32)
+    DWORD r = WaitForSingleObject(c->ph, timeout_ms < 0 ? INFINITE : (timeout_ms > 0x7ffffffe ? 0x7ffffffe : (DWORD)timeout_ms));
+    if (r == WAIT_TIMEOUT) return 0;
+    if (r != WAIT_OBJECT_0) return -1;
+    DWORD code = 0;
+    if (!GetExitCodeProcess(c->ph, &code)) return -1;
+    c->code = (int64_t)(int32_t)code;
+    c->done = 1;
+    return 1;
+#else
+    struct timespec t0, now;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    long nap = 1;
+    for (;;) {
+        int st = 0;
+        pid_t r = waitpid((pid_t)c->pid, &st, timeout_ms < 0 ? 0 : WNOHANG);
+        if (r == (pid_t)c->pid) {
+            if (WIFEXITED(st)) c->code = (int64_t)WEXITSTATUS(st);
+            else if (WIFSIGNALED(st)) c->code = 128 + (int64_t)WTERMSIG(st);
+            else c->code = -1;
+            c->done = 1;
+            return 1;
+        }
+        if (r < 0) { if (errno == EINTR) continue; return -1; }
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        int64_t ms = (int64_t)(now.tv_sec - t0.tv_sec) * 1000 + (int64_t)(now.tv_nsec - t0.tv_nsec) / 1000000;
+        if (ms >= timeout_ms) return 0;
+        if (nap > timeout_ms - ms) nap = (long)(timeout_ms - ms);
+        struct timespec ts;
+        ts.tv_sec = 0; ts.tv_nsec = nap * 1000000L;
+        nanosleep(&ts, NULL);
+        if (nap < 10) nap++;
+    }
+#endif
+}
+/* its exit code once fid_proc_wait said it ended (killed: 128 + the
+   signal on POSIX, 137 on Windows), else -1 */
+int64_t fid_proc_code(int64_t h) {
+    PChild* c = __p_child_at(h);
+    if (!c || !c->done) return -1;
+    return c->code;
+}
+/* stop it (SIGKILL; TerminateProcess with code 137): 1 when asked, 0 when
+   it had already ended or could not be stopped */
+int64_t fid_proc_kill(int64_t h) {
+    PChild* c = __p_child_at(h);
+    if (!c || c->done) return 0;
+#if defined(__wasi__)
+    return 0;
+#elif defined(_WIN32)
+    return TerminateProcess(c->ph, 137) ? 1 : 0;
+#else
+    return kill((pid_t)c->pid, SIGKILL) == 0 ? 1 : 0;
+#endif
+}
+int64_t fid_proc_pid(int64_t h) {
+    PChild* c = __p_child_at(h);
+    return c ? c->pid : -1;
+}
+/* forget the handle (a child still running keeps running) */
+int64_t fid_proc_free(int64_t h) {
+    PChild* c = __p_child_at(h);
+    if (!c) return -1;
+#ifdef _WIN32
+    CloseHandle(c->ph);
+#endif
+    __p_child_close_end(&c->pin);
+    __p_child_close_end(&c->pout);
+    __p_child_close_end(&c->perr);
+    c->used = 0;
+    return 0;
+}
+"#####;
+
 /// C bodies for core.fd's Vec_new/len/is_empty/get/set/push/pop, with core's
 /// exact semantics: the header is {data, len, cap} (three i64), growth
 /// doubles from 8 through p_malloc, a bad index panics with core's message.
@@ -1501,6 +1950,16 @@ impl CCodeGen {
         wln!(self, "char* p_process_stderr(int64_t h);");
         wln!(self, "int64_t p_process_code(int64_t h);");
         wln!(self, "void p_process_close(int64_t h);");
+        wln!(self, "int64_t fid_proc_spawn(int64_t argv_list, int64_t env_list, int64_t dir_w, int64_t out_w);");
+        wln!(self, "int64_t fid_proc_wait(int64_t h, int64_t timeout_ms);");
+        wln!(self, "int64_t fid_proc_code(int64_t h);");
+        wln!(self, "int64_t fid_proc_kill(int64_t h);");
+        wln!(self, "int64_t fid_proc_pid(int64_t h);");
+        wln!(self, "int64_t fid_proc_free(int64_t h);");
+        wln!(self, "int64_t fid_proc_spawn_io(int64_t argv_list, int64_t env_list, int64_t dir_w, int64_t out_w, int64_t io);");
+        wln!(self, "int64_t fid_proc_write(int64_t h, int64_t data, int64_t n);");
+        wln!(self, "int64_t fid_proc_read(int64_t h, int64_t which, int64_t buf, int64_t max);");
+        wln!(self, "int64_t fid_proc_close_in(int64_t h);");
         wln!(self, "int64_t p_getpid(void);");
         wln!(self, "void p_exit(int64_t code);");
         // Filesystem builtins beyond p_file_*
@@ -3855,6 +4314,7 @@ impl CCodeGen {
         wln!(self, "    free(__p_proc_table[h-1].out); free(__p_proc_table[h-1].err);");
         wln!(self, "    __p_proc_table[h-1].used = 0;");
         wln!(self, "}}");
+        self.out.push_str(FID_PROC_RUNTIME_C);
         wln!(self, "void p_exit(int64_t code) {{ exit((int)code); }}");
         // Filesystem builtins beyond p_file_*
         wln!(self, "int64_t p_mkdir(const char* path) {{");
