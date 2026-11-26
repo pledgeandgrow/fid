@@ -21,8 +21,9 @@ Each program prints one number; a language that prints a different number is
 shown as `WRONG`, not timed. Fides is measured twice: native (`fid emit`, the
 compiler's own Windows backend, no C compiler) and through C (`fid ccompile`,
 `zig cc`). The rivals are built as their users ship them: `rustc -C
-opt-level=3`, `zig build-exe -O ReleaseFast`, `zig c++ -O2` (Clang), `go
-build`. Each rival is written in its own idiom, not translated word for word
+opt-level=3`, `zig build-exe -O ReleaseFast`, `clang++ -O2` (a real Clang
+when one is on the PATH, `zig c++` otherwise), `g++ -O2` when GCC is on the
+PATH, `go build`. Each rival is written in its own idiom, not translated word for word
 (Rust's `vec![true; n]`, C++'s `std::vector<bool>`, Go's `[]bool`, Fides's
 `Vec<u8>`). Zig has no `hashmap` program yet.
 
@@ -53,7 +54,8 @@ FID=release/fid.exe ./bench/run.sh
 the same number, and prints a Markdown table with the toolchain versions. A
 missing toolchain shows as `-`; a run over `LIMIT` seconds (default 120) as
 "over 120 s". It needs Bash (Git Bash on Windows), `zig` 0.16 (for `zig cc`,
-Zig and C++), and `rustc` and `go` for those columns.
+Zig and the C++ fallback), and `rustc`, `clang++`, `g++` and `go` for those
+columns. `bench/versions.txt` pins the versions.
 
 `./bench/check.sh` measures the Fides programs only and fails when one is more
 than `LIMIT_PCT` (default 10) percent slower than `bench/baseline.txt`

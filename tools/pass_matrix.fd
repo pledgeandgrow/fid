@@ -1,0 +1,747 @@
+// tools/pass_matrix.fd — every optimization switch off in turn must give
+// the same results (own-backend roadmap RL3). The Fides port of
+// scripts/pass-matrix.sh (roadmap AD4): the same arguments, environment,
+// files, output and exit status.
+//
+//   fid ccompile tools/pass_matrix.fd -o pass_matrix.exe
+//   pass_matrix.exe <target> [test.fd ...]
+//   SELFTEST=1 pass_matrix.exe          (the comparison checked on made-up runs)
+//
+// Each run is scripts/cross-test.sh (NATIVE=1, OUT=$OUT/<tag>) with one
+// switch set, as in the script; its results.txt is compared test by test
+// with its base run's, and so are the output and exit code of every test
+// that ran in both. The switches: IROPT, NAT, IME (default
+// `scripts/switch-check.sh --list iropt|nat|ime`), EGRAPH (default the
+// names compiler/egraph.fd's eg_rules_off_mask reads), RULES (default the
+// indexes of compiler/rules.fd's ru_rules, when it reads FID_RULES_OFF);
+// OUT (default build/pm/<target>), RESUME=1. The header of the script
+// (printed with no target) has the details. Lists are sorted in byte
+// order (sort and comm in the C locale). Run from the repository root (the
+// script changes to it itself). Exit status: the number of switches whose
+// results differ from their base.
+
+use core;
+use args;
+use fs;
+use io;
+use process;
+
+fn pm_usage() -> Vec<str> {
+    var u: Vec<str> = Vec::new();
+    u.push("# pass-matrix.sh — every optimization switch off in turn must give the same");
+    u.push("# results (own-backend roadmap RL3).");
+    u.push("#");
+    u.push("# Usage: scripts/pass-matrix.sh <target> [test.fd ...]");
+    u.push("#   target: x86_64-linux | aarch64-linux | riscv64-linux | x86_64-windows");
+    u.push("#           (the native backend: scripts/cross-test.sh with NATIVE=1;");
+    u.push("#           x86_64-windows is `emit --nat`)");
+    u.push("#   no test files: the whole suite, as cross-test.sh picks it");
+    u.push("#   FID, JOBS, WSL_DISTRO as for scripts/cross-test.sh");
+    u.push("#   IROPT=\"a b\" NAT=\"a b\" IME=\"a b\": the switches to try. Default: every");
+    u.push("#           switch the compiler's source reads (scripts/switch-check.sh");
+    u.push("#           --list iropt|nat|ime), so a new pass is in the matrix at once.");
+    u.push("#           IME=\"\" skips round 3.");
+    u.push("#   EGRAPH=\"a b\": the e-graph's rule families for round 4 (default: every");
+    u.push("#           name eg_rules_off_mask in compiler/egraph.fd reads; \"\" skips it)");
+    u.push("#   RULES=\"0 1 ..\": the rules of compiler/rules.fd for round 5, by index in");
+    u.push("#           ru_rules (default: all of them, when rules.fd reads");
+    u.push("#           FID_RULES_OFF; \"\" skips it)");
+    u.push("#   OUT=<dir>   default build/pm/<target>");
+    u.push("#   RESUME=1    keep the runs of an earlier, interrupted matrix in the same");
+    u.push("#           OUT (each run's summary is $OUT/<tag>.line): only the missing");
+    u.push("#           ones are run. Use the same FID and tests, or the comparison");
+    u.push("#           mixes compilers.");
+    u.push("#   SELFTEST=1  no compiler, no target: checks the comparison itself on");
+    u.push("#           made-up result folders (tests/tooling/pass-matrix-check.sh)");
+    u.push("#");
+    u.push("# Rounds (docs/verification/kill-switches.md has every switch):");
+    u.push("#   1. each default-on mid-end pass off   FID_IROPT_OFF=<pass>, against all on");
+    u.push("#   2. each backend pass and rule group   FID_NAT_OFF=<name>,   against all on");
+    u.push("#   3. the opt-in mid-end: FID_IROPT_ON=all, then each of its passes off");
+    u.push("#      (FID_IROPT_ON=all FID_IROPT_OFF=<pass>), against FID_IROPT_ON=all;");
+    u.push("#      the FID_IROPT_ON=all run is also compared with all on");
+    u.push("#   4. each rule family of the e-graph     FID_EGRAPH_OFF=<family>, against all on");
+    u.push("#   5. each rewrite rule of rules.fd       FID_RULES_OFF=<index>,  against all on");
+    u.push("#");
+    u.push("# Besides the verdicts, the output and exit code of every test that built in");
+    u.push("# both runs are compared (`<test>.actual`, `.actual_rc` of cross-test.sh): a");
+    u.push("# test failing with and without the switch, but printing something else,");
+    u.push("# differs too (\"output:\" lines).");
+    u.push("#");
+    u.push("# Each run's results.txt (one PASS/FAIL/BUILD/SKIP line per test, the");
+    u.push("# output and exit code compared with the interpreter's) is compared with");
+    u.push("# its base run test by test, not only by its count: a test that passes with");
+    u.push("# the switch and fails without it, and one that fails the other way, are");
+    u.push("# both listed. A summary is in $OUT/matrix.txt.");
+    u.push("#");
+    u.push("# Exit status: the number of switches whose results differ from their base.");
+    return u;
+}
+
+fn pm_env_opt(name: str) -> Option<str> {
+    return env_var(name);
+}
+
+fn pm_env(name: str) -> str {
+    match env_var(name) {
+        Option::Some(s) => { return s; }
+        Option::None => { }
+    }
+    return "";
+}
+
+fn pm_read(path: str) -> str {
+    match read_file(path) {
+        Option::Some(t) => { return t; }
+        Option::None => { }
+    }
+    return "";
+}
+
+fn pm_lines(t: str) -> Vec<str> {
+    var r: Vec<str> = Vec::new();
+    var start: i64 = 0;
+    var i: i64 = 0;
+    val n: i64 = str_len(t);
+    while i < n {
+        if str_byte_at(t, i) == 10 {
+            r.push(str_slice(t, start, i));
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    if start < n { r.push(str_slice(t, start, n)); }
+    return r;
+}
+
+fn pm_lt(a: str, b: str) -> bool {
+    val n: i64 = str_len(a);
+    val m: i64 = str_len(b);
+    var i: i64 = 0;
+    while i < n && i < m {
+        val x: i64 = str_byte_at(a, i);
+        val y: i64 = str_byte_at(b, i);
+        if x != y { return x < y; }
+        i = i + 1;
+    }
+    return n < m;
+}
+
+fn pm_sort(v: &mut Vec<str>) {
+    var i: i64 = 1;
+    while i < v.len() {
+        val x: str = v.get(i);
+        var j: i64 = i - 1;
+        while j >= 0 && pm_lt(x, v.get(j)) {
+            v.set(j + 1, v.get(j));
+            j = j - 1;
+        }
+        v.set(j + 1, x);
+        i = i + 1;
+    }
+}
+
+fn pm_words(s: str) -> Vec<str> {
+    var r: Vec<str> = Vec::new();
+    var cur: str = "";
+    var i: i64 = 0;
+    while i < str_len(s) {
+        val c: i64 = str_byte_at(s, i);
+        if c == 32 || c == 9 || c == 10 || c == 13 {
+            if str_len(cur) > 0 { r.push(cur); }
+            cur = "";
+        } else {
+            cur = cur + char_to_str(c);
+        }
+        i = i + 1;
+    }
+    if str_len(cur) > 0 { r.push(cur); }
+    return r;
+}
+
+fn pm_join(v: Vec<str>, sep: str) -> str {
+    var s: str = "";
+    var i: i64 = 0;
+    while i < v.len() {
+        if i > 0 { s = s + sep; }
+        s = s + v.get(i);
+        i = i + 1;
+    }
+    return s;
+}
+
+fn pm_mkdir_p(p: str) {
+    var q: str = str_replace(p, "\\", "/");
+    val parts: Vec<str> = str_split(q, "/");
+    var cur: str = "";
+    var i: i64 = 0;
+    while i < parts.len() {
+        if i > 0 { cur = cur + "/"; }
+        cur = cur + parts.get(i);
+        if str_len(parts.get(i)) > 0 && !(i == 0 && str_ends_with(parts.get(i), ":")) && !fs_is_dir(cur) { fs_mkdir(cur); }
+        i = i + 1;
+    }
+}
+
+fn pm_rm(dir: str) {
+    val names: Vec<str> = fs_list_dir(dir);
+    var i: i64 = 0;
+    while i < names.len() {
+        val p: str = dir + "/" + names.get(i);
+        if fs_is_dir(p) { pm_rm(p); } else { fs_delete(p); }
+        i = i + 1;
+    }
+    fs_rmdir(dir);
+}
+
+/// printf '%-26s'
+fn pm_pad(s: str) -> str {
+    var r: str = s;
+    while str_len(r) < 26 { r = r + " "; }
+    return r;
+}
+
+/// The bash that runs the scripts: BASH_EXE, else on Windows the first
+/// bash.exe on PATH that is not WSL's (System32, WindowsApps), else Git's;
+/// elsewhere bash.
+fn pm_bash() -> str {
+    val b: str = pm_env("BASH_EXE");
+    if str_len(b) > 0 { return b; }
+    if !process_is_windows() { return "bash"; }
+    val dirs: Vec<str> = str_split(pm_env("PATH"), ";");
+    var i: i64 = 0;
+    while i < dirs.len() {
+        val d: str = dirs.get(i);
+        i = i + 1;
+        val low: str = str_to_lower(d);
+        if str_len(d) == 0 || str_contains(low, "system32") || str_contains(low, "windowsapps") { continue; }
+        if fs_exists(d + "/bash.exe") { return d + "/bash.exe"; }
+    }
+    if fs_exists("C:/Program Files/Git/usr/bin/bash.exe") { return "C:/Program Files/Git/usr/bin/bash.exe"; }
+    if fs_exists("C:/Program Files/Git/bin/bash.exe") { return "C:/Program Files/Git/bin/bash.exe"; }
+    return "bash";
+}
+
+/// The output (stdout and stderr) of argv with `env` added.
+fn pm_capture(argv: Vec<str>, env: Vec<str>) -> str {
+    val log: str = pm_out + "/.pm-child-" + int_to_str(p_getpid()) + ".log";
+    val h: i64 = process_spawn_to(argv, env, "", log);
+    if h == 0 { return ""; }
+    process_wait(h, -1);
+    process_release(h);
+    val t: str = pm_read(log);
+    fs_delete(log);
+    return t;
+}
+
+// ─── The state of a matrix ───
+
+var pm_out: str = "";
+var pm_sum: str = "";
+var pm_target: str = "";
+var pm_tests: Vec<str> = Vec::new();
+var pm_differ: i64 = 0;
+var pm_quiet: bool = false;
+
+/// ... | tee -a "$SUM"
+fn pm_tee(line: str) {
+    if !pm_quiet { println(line); }
+    fs_write_text(pm_sum, pm_read(pm_sum) + line + "\n");
+}
+
+/// The e-graph's rule families: the names eg_rule_named(off, "...") reads,
+/// in order, less "all".
+fn pm_egraph_families() -> str {
+    val t: str = pm_read("compiler/egraph.fd");
+    val pat: str = "eg_rule_named(off, \"";
+    var out: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    val n: i64 = str_len(t);
+    while i < n {
+        val k: i64 = str_find(str_slice(t, i, n), pat);
+        if k < 0 { break; }
+        var j: i64 = i + k + str_len(pat);
+        var e: i64 = j;
+        while e < n {
+            val c: i64 = str_byte_at(t, e);
+            if !((c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 95) { break; }
+            e = e + 1;
+        }
+        if e + 1 < n && str_byte_at(t, e) == 34 && str_byte_at(t, e + 1) == 41 {
+            val name: str = str_slice(t, j, e);
+            if name != "all" { out.push(name); }
+            i = e + 2;
+        } else {
+            i = i + k + 1;
+        }
+    }
+    return pm_join(out, " ");
+}
+
+/// The rules of rules.fd, by index in ru_rules, when it reads FID_RULES_OFF.
+fn pm_rule_indexes() -> str {
+    val t: str = pm_read("compiler/rules.fd");
+    if !str_contains(t, "FID_RULES_OFF") { return ""; }
+    val ls: Vec<str> = pm_lines(t);
+    var n: i64 = 0;
+    var inside: bool = false;
+    var i: i64 = 0;
+    while i < ls.len() {
+        val l: str = ls.get(i);
+        i = i + 1;
+        if !inside {
+            if str_starts_with(l, "pub fn ru_rules()") {
+                inside = true;
+                if str_contains(l, "v.push(ru(") { n = n + 1; }
+            }
+            continue;
+        }
+        if str_contains(l, "v.push(ru(") { n = n + 1; }
+        if str_starts_with(l, "}") { inside = false; }
+    }
+    var out: Vec<str> = Vec::new();
+    var k: i64 = 0;
+    while k < n {
+        out.push(int_to_str(k));
+        k = k + 1;
+    }
+    return pm_join(out, " ");
+}
+
+/// run <tag> [VAR=value ...]: the suite with those variables; the summary
+/// line of cross-test.sh ("" for none), kept in $OUT/<tag>.line.
+fn pm_run(tag: str, vars: Vec<str>, resume: bool) -> str {
+    val linef: str = pm_out + "/" + tag + ".line";
+    if resume && str_len(pm_read(linef)) > 0 && str_len(pm_read(pm_out + "/" + tag + "-native/results.txt")) > 0 {
+        return str_replace(pm_read(linef), "\n", "");
+    }
+    fs_delete(linef);
+    var env: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < vars.len() {
+        env.push(vars.get(i));
+        i = i + 1;
+    }
+    env.push("NATIVE=1");
+    env.push("OUT=" + pm_out + "/" + tag);
+    var argv: Vec<str> = Vec::new();
+    argv.push(pm_bash());
+    argv.push("scripts/cross-test.sh");
+    argv.push(pm_target);
+    i = 0;
+    while i < pm_tests.len() {
+        argv.push(pm_tests.get(i));
+        i = i + 1;
+    }
+    val ls: Vec<str> = pm_lines(pm_capture(argv, env));
+    var last: str = "";
+    var found: bool = false;
+    i = 0;
+    while i < ls.len() {
+        if str_contains(ls.get(i), "passed,") {
+            last = ls.get(i);
+            found = true;
+        }
+        i = i + 1;
+    }
+    if found {
+        fs_write_text(linef, last + "\n");
+    } else {
+        fs_write_text(linef, "");
+    }
+    return last;
+}
+
+fn pm_upper(c: i64) -> bool {
+    return c >= 65 && c <= 90;
+}
+
+/// One line per test, sorted, as `sed -E 's/^([A-Z]+) +([^ ]+).*/\1 \2/'`
+/// leaves it.
+fn pm_results(tag: str) -> Vec<str> {
+    val ls: Vec<str> = pm_lines(pm_read(pm_out + "/" + tag + "-native/results.txt"));
+    var r: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < ls.len() {
+        val l: str = ls.get(i);
+        i = i + 1;
+        var a: i64 = 0;
+        while a < str_len(l) && pm_upper(str_byte_at(l, a)) { a = a + 1; }
+        var b: i64 = a;
+        while b < str_len(l) && str_byte_at(l, b) == 32 { b = b + 1; }
+        var c: i64 = b;
+        while c < str_len(l) && str_byte_at(l, c) != 32 { c = c + 1; }
+        if a > 0 && b > a && c > b {
+            r.push(str_slice(l, 0, a) + " " + str_slice(l, b, c));
+        } else {
+            r.push(l);
+        }
+    }
+    pm_sort(&mut r);
+    return r;
+}
+
+/// The tests with a PASS or FAIL line, sorted, each once.
+fn pm_ran(res: Vec<str>) -> Vec<str> {
+    var r: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < res.len() {
+        val l: str = res.get(i);
+        i = i + 1;
+        if str_starts_with(l, "PASS ") || str_starts_with(l, "FAIL ") {
+            // cut -d' ' -f2
+            val f: Vec<str> = str_split(l, " ");
+            if f.len() >= 2 { r.push(f.get(1)); } else { r.push(""); }
+        }
+    }
+    pm_sort(&mut r);
+    var u: Vec<str> = Vec::new();
+    i = 0;
+    while i < r.len() {
+        if u.len() == 0 || u.get(u.len() - 1) != r.get(i) { u.push(r.get(i)); }
+        i = i + 1;
+    }
+    return u;
+}
+
+fn pm_chomp(s: str) -> str {
+    var e: i64 = str_len(s);
+    while e > 0 && str_byte_at(s, e - 1) == 10 { e = e - 1; }
+    return str_slice(s, 0, e);
+}
+
+/// "output: <test>" for each test that ran in both runs and whose exit code
+/// or standard output differs between them.
+fn pm_outputs(base: str, tag: str) -> Vec<str> {
+    val a: str = pm_out + "/" + base + "-native";
+    val b: str = pm_out + "/" + tag + "-native";
+    val ra: Vec<str> = pm_ran(pm_results(base));
+    val rb: Vec<str> = pm_ran(pm_results(tag));
+    var r: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    var j: i64 = 0;
+    while i < ra.len() && j < rb.len() {
+        val x: str = ra.get(i);
+        val y: str = rb.get(j);
+        if x == y {
+            val rca: str = pm_chomp(str_replace(pm_read(a + "/" + x + ".actual_rc"), "\r", ""));
+            val rcb: str = pm_chomp(str_replace(pm_read(b + "/" + x + ".actual_rc"), "\r", ""));
+            val oa: str = str_replace(pm_read(a + "/" + x + ".actual"), "\r", "");
+            val ob: str = str_replace(pm_read(b + "/" + x + ".actual"), "\r", "");
+            if rca != rcb || oa != ob { r.push("output: " + x); }
+            i = i + 1;
+            j = j + 1;
+        } else if pm_lt(x, y) {
+            i = i + 1;
+        } else {
+            j = j + 1;
+        }
+    }
+    return r;
+}
+
+/// diff <(a) <(b) | grep -E '^[<>]' for two sorted lists: between two lines
+/// both have, what only a has ("< "), then what only b has ("> ").
+fn pm_diff(a: Vec<str>, b: Vec<str>) -> Vec<str> {
+    var r: Vec<str> = Vec::new();
+    var ga: Vec<str> = Vec::new();
+    var gb: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    var j: i64 = 0;
+    while i < a.len() || j < b.len() {
+        var take_a: bool = false;
+        var take_b: bool = false;
+        if i < a.len() && j < b.len() {
+            if a.get(i) == b.get(j) {
+                var k: i64 = 0;
+                while k < ga.len() {
+                    r.push("< " + ga.get(k));
+                    k = k + 1;
+                }
+                k = 0;
+                while k < gb.len() {
+                    r.push("> " + gb.get(k));
+                    k = k + 1;
+                }
+                ga = Vec::new();
+                gb = Vec::new();
+                i = i + 1;
+                j = j + 1;
+                continue;
+            }
+            if pm_lt(a.get(i), b.get(j)) { take_a = true; } else { take_b = true; }
+        } else if i < a.len() {
+            take_a = true;
+        } else {
+            take_b = true;
+        }
+        if take_a {
+            ga.push(a.get(i));
+            i = i + 1;
+        }
+        if take_b {
+            gb.push(b.get(j));
+            j = j + 1;
+        }
+    }
+    var k2: i64 = 0;
+    while k2 < ga.len() {
+        r.push("< " + ga.get(k2));
+        k2 = k2 + 1;
+    }
+    k2 = 0;
+    while k2 < gb.len() {
+        r.push("> " + gb.get(k2));
+        k2 = k2 + 1;
+    }
+    return r;
+}
+
+/// compare <label> <base tag> <tag> <summary line>
+fn pm_compare(label: str, base: str, tag: str, line: str) {
+    var d: Vec<str> = pm_diff(pm_results(base), pm_results(tag));
+    val o: Vec<str> = pm_outputs(base, tag);
+    var i: i64 = 0;
+    while i < o.len() {
+        d.push(o.get(i));
+        i = i + 1;
+    }
+    if pm_results(tag).len() == 0 {
+        pm_tee(pm_pad(label) + " " + line + "   <- no results");
+        pm_differ = pm_differ + 1;
+    } else if d.len() > 0 {
+        pm_tee(pm_pad(label) + " " + line + "   <- differs");
+        i = 0;
+        while i < d.len() && i < 40 {
+            val l: str = d.get(i);
+            i = i + 1;
+            if str_starts_with(l, "< ") {
+                pm_tee("      on:  " + str_slice(l, 2, str_len(l)));
+            } else if str_starts_with(l, "> ") {
+                pm_tee("      off: " + str_slice(l, 2, str_len(l)));
+            } else if str_starts_with(l, "output: ") {
+                pm_tee("      output differs: " + str_slice(l, 8, str_len(l)));
+            } else {
+                pm_tee(l);
+            }
+        }
+        pm_differ = pm_differ + 1;
+    } else {
+        pm_tee(pm_pad(label) + " " + line);
+    }
+}
+
+// ─── SELFTEST=1 ───
+
+/// mk <tag> <results text> then "test", "rc", "output" triples.
+fn pm_mk(tag: str, results: str, triples: Vec<str>) {
+    val d: str = pm_out + "/" + tag + "-native";
+    pm_mkdir_p(d);
+    fs_write_text(d + "/results.txt", results);
+    var i: i64 = 0;
+    while i + 2 < triples.len() {
+        fs_write_text(d + "/" + triples.get(i) + ".actual_rc", triples.get(i + 1) + "\n");
+        fs_write_text(d + "/" + triples.get(i) + ".actual", triples.get(i + 2));
+        i = i + 3;
+    }
+}
+
+fn pm_v(items: str) -> Vec<str> {
+    // "|"-separated, empty items kept
+    return str_split(items, "|");
+}
+
+fn pm_temp_dir() -> str {
+    var names: Vec<str> = Vec::new();
+    names.push("TMPDIR");
+    names.push("TEMP");
+    names.push("TMP");
+    var i: i64 = 0;
+    while i < names.len() {
+        val s: str = pm_env(names.get(i));
+        if str_len(s) > 0 { return s; }
+        i = i + 1;
+    }
+    return "/tmp";
+}
+
+fn pm_selftest() -> i64 {
+    pm_target = "selftest";
+    pm_out = pm_temp_dir() + "/tmp." + int_to_str(p_getpid()) + int_to_str(p_clock_now_us() % 100000);
+    pm_mkdir_p(pm_out);
+    pm_sum = pm_out + "/matrix.txt";
+    fs_write_text(pm_sum, "");
+    val ok3: str = "PASS  a\nPASS  b\nFAIL  c (rc 0, interpreter 0)\n";
+    pm_mk("all", ok3, pm_v("a|0|x\n|b|0|y\n|c|0|1\n"));
+    pm_mk("same", ok3, pm_v("a|0|x\r\n|b|0|y\n|c|0|1\n"));
+    pm_mk("verdict", "PASS  a\nFAIL  b (rc 1, interpreter 0)\nFAIL  c (rc 0, interpreter 0)\n", pm_v("a|0|x\n|b|1||c|0|1\n"));
+    pm_mk("output", ok3, pm_v("a|0|x\n|b|0|y\n|c|0|2\n"));
+    pm_mk("rc", ok3, pm_v("a|0|x\n|b|0|y\n|c|3|1\n"));
+    pm_mk("build", "PASS  a\nBUILD b\nFAIL  c (rc 0, interpreter 0)\n", pm_v("a|0|x\n|c|0|1\n"));
+    var bad: i64 = 0;
+    val cases: Vec<str> = str_split("same:0 verdict:1 output:1 rc:1 build:1 none:1", " ");
+    var i: i64 = 0;
+    while i < cases.len() {
+        val c: str = cases.get(i);
+        i = i + 1;
+        val k: i64 = str_find(c, ":");
+        val t: str = str_slice(c, 0, k);
+        val w: str = str_slice(c, k + 1, str_len(c));
+        pm_differ = 0;
+        pm_quiet = true;
+        pm_compare("selftest " + t + ":", "all", t, "(made up)");
+        pm_quiet = false;
+        if int_to_str(pm_differ) != w {
+            println("pass-matrix selftest: case " + t + " counted " + int_to_str(pm_differ) + " differences, want " + w);
+            bad = bad + 1;
+        }
+    }
+    // the source lists: every family the e-graph reads, with no duplicates
+    val fams: str = pm_egraph_families();
+    var dup: bool = false;
+    val fl: Vec<str> = pm_words(fams);
+    var a: i64 = 0;
+    while a < fl.len() {
+        var b: i64 = a + 1;
+        while b < fl.len() {
+            if fl.get(a) == fl.get(b) { dup = true; }
+            b = b + 1;
+        }
+        a = a + 1;
+    }
+    if str_len(fams) == 0 || dup {
+        println("pass-matrix selftest: no e-graph rule families found in compiler/egraph.fd (" + fams + ")");
+        bad = bad + 1;
+    }
+    // RESUME=1: a run that finished is not run again; without RESUME it is
+    pm_mkdir_p(pm_out + "/res-native");
+    fs_write_text(pm_out + "/res-native/results.txt", "PASS  a\n");
+    fs_write_text(pm_out + "/res.line", "selftest: 1 passed, 0 failed\n");
+    if pm_run("res", Vec::new(), true) != "selftest: 1 passed, 0 failed" {
+        println("pass-matrix selftest: RESUME=1 ran a finished run again");
+        bad = bad + 1;
+    }
+    pm_tests = Vec::new();
+    if str_len(pm_run("res", Vec::new(), false)) > 0 {
+        println("pass-matrix selftest: without RESUME a finished run was not run again");
+        bad = bad + 1;
+    }
+    if bad == 0 {
+        println("pass-matrix selftest: ok (6 cases; e-graph families: " + fams + "; rules.fd rules: " + int_to_str(pm_words(pm_rule_indexes()).len()) + ")");
+    }
+    pm_rm(pm_out);
+    return bad & 255;
+}
+
+/// ${NAME-default}: the variable when it is set (even empty), else the
+/// default the function gives.
+fn pm_list(name: str, which: str) -> str {
+    match env_var(name) {
+        Option::Some(s) => { return s; }
+        Option::None => { }
+    }
+    if which == "egraph" { return pm_egraph_families(); }
+    if which == "rules" { return pm_rule_indexes(); }
+    var argv: Vec<str> = Vec::new();
+    argv.push(pm_bash());
+    argv.push("scripts/switch-check.sh");
+    argv.push("--list");
+    argv.push(which);
+    val h: i64 = process_spawn_files(argv, Vec::new(), "", pm_temp_dir() + "/.pm-list-" + int_to_str(p_getpid()) + ".txt", pm_temp_dir() + "/.pm-list-" + int_to_str(p_getpid()) + ".err");
+    var t: str = "";
+    if h != 0 {
+        process_wait(h, -1);
+        process_release(h);
+        t = pm_read(pm_temp_dir() + "/.pm-list-" + int_to_str(p_getpid()) + ".txt");
+        io_eprint(pm_read(pm_temp_dir() + "/.pm-list-" + int_to_str(p_getpid()) + ".err"));
+    }
+    fs_delete(pm_temp_dir() + "/.pm-list-" + int_to_str(p_getpid()) + ".txt");
+    fs_delete(pm_temp_dir() + "/.pm-list-" + int_to_str(p_getpid()) + ".err");
+    return pm_chomp(t);
+}
+
+fn main() -> i64 {
+    val all: Vec<str> = args_all();
+    var first: i64 = 1;
+    if all.len() >= 3 && all.get(1) == "run" && str_ends_with(all.get(2), ".fd") { first = 3; }
+    if pm_env("SELFTEST") == "1" { return pm_selftest(); }
+    if all.len() <= first || str_len(all.get(first)) == 0 {
+        val u: Vec<str> = pm_usage();
+        var i: i64 = 0;
+        while i < u.len() {
+            println(u.get(i));
+            i = i + 1;
+        }
+        return 1;
+    }
+    pm_target = all.get(first);
+    var k: i64 = first + 1;
+    while k < all.len() {
+        pm_tests.push(all.get(k));
+        k = k + 1;
+    }
+    val iropt: Vec<str> = pm_words(pm_list("IROPT", "iropt"));
+    val nat: Vec<str> = pm_words(pm_list("NAT", "nat"));
+    val ime_s: str = pm_list("IME", "ime");
+    val ime: Vec<str> = pm_words(ime_s);
+    val egraph: Vec<str> = pm_words(pm_list("EGRAPH", "egraph"));
+    val rules: Vec<str> = pm_words(pm_list("RULES", "rules"));
+    pm_out = pm_env("OUT");
+    if str_len(pm_out) == 0 { pm_out = "build/pm/" + pm_target; }
+    pm_mkdir_p(pm_out);
+    pm_sum = pm_out + "/matrix.txt";
+    fs_write_text(pm_sum, "");
+    val resume: bool = pm_env("RESUME") == "1";
+
+    pm_tee("pass matrix on " + pm_target + ": " + int_to_str(pm_tests.len()) + " files given (0: the whole suite)");
+    val line: str = pm_run("all", Vec::new(), resume);
+    pm_tee(pm_pad("all on:") + " " + line);
+    var i2: i64 = 0;
+    while i2 < iropt.len() {
+        val p: str = iropt.get(i2);
+        i2 = i2 + 1;
+        var v: Vec<str> = Vec::new();
+        v.push("FID_IROPT_OFF=" + p);
+        pm_compare("iropt " + p + " off:", "all", "iropt-" + p, pm_run("iropt-" + p, v, resume));
+    }
+    i2 = 0;
+    while i2 < nat.len() {
+        val p2: str = nat.get(i2);
+        i2 = i2 + 1;
+        var v2: Vec<str> = Vec::new();
+        v2.push("FID_NAT_OFF=" + p2);
+        pm_compare("nat " + p2 + " off:", "all", "nat-" + p2, pm_run("nat-" + p2, v2, resume));
+    }
+    if str_len(ime_s) > 0 {
+        var v3: Vec<str> = Vec::new();
+        v3.push("FID_IROPT_ON=all");
+        pm_compare("opt-in all on:", "all", "ime-all", pm_run("ime-all", v3, resume));
+        i2 = 0;
+        while i2 < ime.len() {
+            val p3: str = ime.get(i2);
+            i2 = i2 + 1;
+            var v4: Vec<str> = Vec::new();
+            v4.push("FID_IROPT_ON=all");
+            v4.push("FID_IROPT_OFF=" + p3);
+            pm_compare("opt-in " + p3 + " off:", "ime-all", "ime-" + p3, pm_run("ime-" + p3, v4, resume));
+        }
+    }
+    i2 = 0;
+    while i2 < egraph.len() {
+        val p4: str = egraph.get(i2);
+        i2 = i2 + 1;
+        var v5: Vec<str> = Vec::new();
+        v5.push("FID_EGRAPH_OFF=" + p4);
+        pm_compare("egraph rule " + p4 + " off:", "all", "eg-" + p4, pm_run("eg-" + p4, v5, resume));
+    }
+    i2 = 0;
+    while i2 < rules.len() {
+        val p5: str = rules.get(i2);
+        i2 = i2 + 1;
+        var v6: Vec<str> = Vec::new();
+        v6.push("FID_RULES_OFF=" + p5);
+        pm_compare("rules.fd rule " + p5 + " off:", "all", "rule-" + p5, pm_run("rule-" + p5, v6, resume));
+    }
+    pm_tee("pass matrix on " + pm_target + ": " + int_to_str(pm_differ) + " switches differ from their base (summary: " + pm_sum + ")");
+    return pm_differ & 255;
+}

@@ -1,0 +1,357 @@
+// tools/fuzz_programs.fd — the random programs of
+// scripts/fuzz/gen_programs.py (class Gen, batch_program), for
+// tools/fuzz_gen.fd and tools/fuzz_nightly.fd (roadmap AD4). The numbers
+// are drawn from tools/py_random.fd, Python's own generator, so a seed is
+// the same program as the script's (tests/tools/fuzz_gen/check.sh, GEN=1,
+// compares 802 of them). gen_program(seed, rich) is
+// Gen(random.Random(seed), rich).program(); batch_program(seeds, rich) is
+// the script's batch_program.
+
+module fuzz_programs;
+
+use core;
+use py_random;
+use fuzz_lib;
+
+// ─── The generator (class Gen) ───
+
+pub struct Gen {
+    pub r: PyRng,
+    pub funcs: Vec<str>,
+    pub rich: bool,
+    pub nq: i64,
+}
+
+pub fn gen_new(seed: i64, rich: bool) -> Gen {
+    return Gen { r: py_rng(seed), funcs: Vec::new(), rich: rich, nq: 0 };
+}
+
+fn g_rand(g: &mut Gen) -> f64 {
+    return py_random(&mut g.r);
+}
+
+fn g_randint(g: &mut Gen, a: i64, b: i64) -> i64 {
+    return py_randint(&mut g.r, a, b);
+}
+
+fn g_choice(g: &mut Gen, v: &Vec<str>) -> str {
+    return v.get(py_below(&mut g.r, v.len()));
+}
+
+fn push_all(out: &mut Vec<str>, more: &Vec<str>) {
+    var i: i64 = 0;
+    while i < more.len() {
+        out.push(more.get(i));
+        i = i + 1;
+    }
+}
+
+fn copy_vec(v: &Vec<str>) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    push_all(&mut out, v);
+    return out;
+}
+
+/// One statement on the rich-mode state (p: Pt, s: str, fv: f64).
+fn rich_stmt(g: &mut Gen, local: &Vec<str>, pad: str) -> Vec<str> {
+    val e: str = expr(g, local, 2);
+    val k: i64 = g_randint(g, 0, 6);
+    var out: Vec<str> = Vec::new();
+    if k == 0 {
+        out.push(pad + "p.a = (p.a + " + e + ") % " + "1000003" + ";");
+        return out;
+    }
+    if k == 1 {
+        out.push(pad + "p.b = (p.b * 3 + p.a + " + e + ") % " + "1000003" + ";");
+        return out;
+    }
+    if k == 2 {
+        g.nq = g.nq + 1;
+        val q: str = "q" + int_to_str(g.nq);
+        out.push(pad + "var " + q + ": Pt = p;");
+        out.push(pad + q + ".a = (" + q + ".a + 1) % " + "1000003" + ";");
+        out.push(pad + "acc = (acc + " + q + ".a + p.a) % " + "1000003" + ";");
+        return out;
+    }
+    if k == 3 {
+        // the list is built (and its second item drawn) before choice()
+        var ctors: Vec<str> = Vec::new();
+        ctors.push("Sh::One(" + e + ")");
+        ctors.push("Sh::Two(" + e + ", " + expr(g, local, 1) + ")");
+        ctors.push("Sh::Zero");
+        val ctor: str = g_choice(g, &ctors);
+        out.push(pad + "acc = (acc + sh_val(" + ctor + ")) % " + "1000003" + ";");
+        return out;
+    }
+    if k == 4 {
+        out.push(pad + "s = s + int_to_str(" + e + " % 1000);");
+        out.push(pad + "if str_len(s) > 40 { s = \"\"; }");
+        return out;
+    }
+    if k == 5 {
+        out.push(pad + "acc = (acc + str_len(s) * 7) % " + "1000003" + ";");
+        return out;
+    }
+    out.push(pad + "fv = ((" + e + " % 1000) as f64) * 0.25 + fv * 0.5;");
+    out.push(pad + "acc = (acc + (fv as i64)) % " + "1000003" + ";");
+    return out;
+}
+
+fn expr(g: &mut Gen, vars: &Vec<str>, depth: i64) -> str {
+    if depth <= 0 || g_rand(g) < 0.3 {
+        if vars.len() > 0 && g_rand(g) < 0.7 {
+            return g_choice(g, vars);
+        }
+        return int_to_str(g_randint(g, 0, 999));
+    }
+    val k: i64 = g_randint(g, 0, 6);
+    val a: str = expr(g, vars, depth - 1);
+    val b: str = expr(g, vars, depth - 1);
+    if k == 0 { return "((" + a + " + " + b + ") % " + "1000003" + ")"; }
+    if k == 1 { return "((" + a + " * " + b + ") % " + "1000003" + ")"; }
+    if k == 2 { return "((" + a + " - " + b + " + " + "1000003" + ") % " + "1000003" + ")"; }
+    if k == 3 { return "(" + a + " / (" + b + " % 97 + 1))"; }
+    if k == 4 { return "((" + a + " ^ " + b + ") % " + "1000003" + ")"; }
+    if k == 5 && g.funcs.len() > 0 {
+        val fs: Vec<str> = copy_vec(&g.funcs);
+        val f: str = g_choice(g, &fs);
+        return f + "(" + a + " % 50)";
+    }
+    return "((" + a + " & 1023) + (" + b + " >> 3))";
+}
+
+fn cond(g: &mut Gen, vars: &Vec<str>) -> str {
+    var ops: Vec<str> = Vec::new();
+    ops.push("<");
+    ops.push(">");
+    ops.push("==");
+    ops.push("!=");
+    ops.push("<=");
+    ops.push(">=");
+    val a: str = expr(g, vars, 2);
+    val op: str = g_choice(g, &ops);
+    val b: str = expr(g, vars, 2);
+    return a + " " + op + " " + b;
+}
+
+/// re.match(r"i\d+_\d+$", v): a loop counter.
+fn is_counter(v: str) -> bool {
+    val n: i64 = str_len(v);
+    if n < 4 || str_byte_at(v, 0) != 105 { return false; }
+    var i: i64 = 1;
+    val d0: i64 = i;
+    while i < n && fl_digit(str_byte_at(v, i)) { i = i + 1; }
+    if i == d0 || i >= n || str_byte_at(v, i) != 95 { return false; }
+    i = i + 1;
+    val d1: i64 = i;
+    while i < n && fl_digit(str_byte_at(v, i)) { i = i + 1; }
+    return i > d1 && i == n;
+}
+
+/// The variable an assignment writes: never a loop counter (see the
+/// script's Gen.target).
+fn target(v: str) -> str {
+    if is_counter(v) { return "acc"; }
+    return v;
+}
+
+fn block(g: &mut Gen, vars: &Vec<str>, depth: i64, indent: i64) -> Vec<str> {
+    var pad: str = "";
+    var t: i64 = 0;
+    while t < indent {
+        pad = pad + "    ";
+        t = t + 1;
+    }
+    var out: Vec<str> = Vec::new();
+    var local: Vec<str> = copy_vec(vars);
+    val count: i64 = g_randint(g, 1, 5);
+    var it: i64 = 0;
+    while it < count {
+        it = it + 1;
+        val k: i64 = g_randint(g, 0, 6);
+        if k <= 1 || local.len() == 0 {
+            var name: str = "v" + int_to_str(local.len()) + "_" + int_to_str(indent);
+            while fl_contains(&local, name) { name = name + "x"; }
+            out.push(pad + "var " + name + ": i64 = " + expr(g, &local, 3) + ";");
+            local.push(name);
+        } else if k == 2 {
+            val v: str = target(g_choice(g, &local));
+            out.push(pad + v + " = " + expr(g, &local, 3) + ";");
+        } else if k == 3 && depth > 0 {
+            out.push(pad + "if " + cond(g, &local) + " {");
+            val b1: Vec<str> = block(g, &local, depth - 1, indent + 1);
+            push_all(&mut out, &b1);
+            out.push(pad + "} else {");
+            val b2: Vec<str> = block(g, &local, depth - 1, indent + 1);
+            push_all(&mut out, &b2);
+            out.push(pad + "}");
+        } else if k == 4 && depth > 0 {
+            val i: str = "i" + int_to_str(indent) + "_" + int_to_str(out.len());
+            out.push(pad + "var " + i + ": i64 = 0;");
+            out.push(pad + "while " + i + " < " + int_to_str(g_randint(g, 1, 20)) + " {");
+            var inner: Vec<str> = copy_vec(&local);
+            inner.push(i);
+            val b3: Vec<str> = block(g, &inner, depth - 1, indent + 1);
+            push_all(&mut out, &b3);
+            out.push(pad + "    " + i + " = " + i + " + 1;");
+            out.push(pad + "}");
+        } else if k == 5 {
+            out.push(pad + "xs.push(" + expr(g, &local, 2) + ");");
+        } else if g.rich && g_rand(g) < 0.5 {
+            // rich mode only: the plain programs draw no number here
+            val rs: Vec<str> = rich_stmt(g, &local, pad);
+            push_all(&mut out, &rs);
+        } else {
+            val v2: str = target(g_choice(g, &local));
+            out.push(pad + "if xs.len() > 0 { " + v2 + " = (xs.get(" + expr(g, &local, 1) + " % xs.len()) + " + v2 + ") % " + "1000003" + "; }");
+        }
+    }
+    var last: str = "7";
+    if local.len() > 0 { last = g_choice(g, &local); }
+    out.push(pad + "acc = (acc * 31 + " + last + ") % " + "1000003" + ";");
+    return out;
+}
+
+pub fn rich_decls() -> Vec<str> {
+    var v: Vec<str> = Vec::new();
+    v.push("struct Pt {");
+    v.push("    a: i64,");
+    v.push("    b: i64,");
+    v.push("}");
+    v.push("");
+    v.push("enum Sh {");
+    v.push("    One(i64),");
+    v.push("    Two(i64, i64),");
+    v.push("    Zero,");
+    v.push("}");
+    v.push("");
+    v.push("fn sh_val(v: Sh) -> i64 {");
+    v.push("    match v {");
+    v.push("        One(x) => { return x % " + "1000003" + "; }");
+    v.push("        Two(x, y) => { return (x * 2 + y) % " + "1000003" + "; }");
+    v.push("        Zero => { return 7; }");
+    v.push("    }");
+    v.push("    return 0;");
+    v.push("}");
+    v.push("");
+    return v;
+}
+
+fn rich_locals(v: &mut Vec<str>) {
+    v.push("    var p: Pt = Pt { a: 1, b: 2 };");
+    v.push("    var s: str = \"\";");
+    v.push("    var fv: f64 = 0.0;");
+}
+
+fn rich_fold(v: &mut Vec<str>) {
+    v.push("    p.b = (p.b + acc) % " + "1000003" + ";");
+    v.push("    s = s + \".\";");
+    v.push("    fv = fv + 1.0;");
+    v.push("    acc = (acc + p.a + p.b + str_len(s) + (fv as i64)) % " + "1000003" + ";");
+}
+
+/// The program of the generator's seed (decls=false leaves out the rich
+/// declarations: a batch writes them once).
+fn program(g: &mut Gen, decls: bool) -> str {
+    var lines: Vec<str> = Vec::new();
+    if g.rich && decls { lines = rich_decls(); }
+    val nf: i64 = g_randint(g, 0, 3);
+    var fi: i64 = 0;
+    while fi < nf {
+        val name: str = "f" + int_to_str(fi);
+        var n: Vec<str> = Vec::new();
+        n.push("n");
+        val body: Vec<str> = block(g, &n, 1, 1);
+        lines.push("fn " + name + "(n: i64) -> i64 {");
+        lines.push("    var acc: i64 = n;");
+        lines.push("    var xs: Vec<i64> = Vec::new();");
+        if g.rich { rich_locals(&mut lines); }
+        push_all(&mut lines, &body);
+        if fi > 0 {
+            lines.push("    if n > 0 { acc = (acc + f" + int_to_str(fi - 1) + "(n - 1)) % " + "1000003" + "; }");
+        }
+        if g.rich { rich_fold(&mut lines); }
+        lines.push("    return acc;");
+        lines.push("}");
+        lines.push("");
+        g.funcs.push(name);
+        fi = fi + 1;
+    }
+    lines.push("fn main() -> i64 {");
+    lines.push("    var acc: i64 = 1;");
+    lines.push("    var xs: Vec<i64> = Vec::new();");
+    if g.rich { rich_locals(&mut lines); }
+    val none: Vec<str> = Vec::new();
+    val mb: Vec<str> = block(g, &none, 3, 1);
+    push_all(&mut lines, &mb);
+    if g.rich { rich_fold(&mut lines); }
+    lines.push("    println(acc);");
+    lines.push("    println(xs.len());");
+    if g.rich {
+        lines.push("    println(p.a);");
+        lines.push("    println(p.b);");
+        lines.push("    println(s);");
+        lines.push("    println((fv * 1000.0) as i64);");
+    }
+    lines.push("    return 0;");
+    lines.push("}");
+    return fl_join_lines(&lines, "\n") + "\n";
+}
+
+pub fn gen_program(seed: i64, rich: bool) -> str {
+    var g: Gen = gen_new(seed, rich);
+    return program(&mut g, true);
+}
+
+/// re.sub(r"\bf(\d+)\(", "p<seed>_f\1(", text)
+fn rename_calls(text: str, seed: i64) -> str {
+    var b: StringBuilder = StringBuilder::new();
+    val n: i64 = str_len(text);
+    val pre: str = "p" + int_to_str(seed) + "_f";
+    var i: i64 = 0;
+    var start: i64 = 0;
+    while i < n {
+        if str_byte_at(text, i) == 102 && (i == 0 || !fl_word(str_byte_at(text, i - 1))) {
+            var j: i64 = i + 1;
+            while j < n && fl_digit(str_byte_at(text, j)) { j = j + 1; }
+            if j > i + 1 && j < n && str_byte_at(text, j) == 40 {
+                b.append_str(str_slice(text, start, i));
+                b.append_str(pre + str_slice(text, i + 1, j + 1));
+                i = j + 1;
+                start = i;
+                continue;
+            }
+        }
+        i = i + 1;
+    }
+    b.append_str(str_slice(text, start, n));
+    return b.to_str();
+}
+
+/// The programs of `seeds` as one file (--batch).
+pub fn batch_program(seeds: &Vec<i64>, rich: bool) -> str {
+    var lines: Vec<str> = Vec::new();
+    if rich { lines = rich_decls(); }
+    var calls: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < seeds.len() {
+        val s: i64 = seeds.get(i);
+        val ss: str = int_to_str(s);
+        var g: Gen = gen_new(s, rich);
+        var text: str = rename_calls(program(&mut g, false), s);
+        val k: i64 = str_find(text, "fn main() -> i64 {");
+        if k >= 0 {
+            text = str_slice(text, 0, k) + "fn p" + ss + "_main() -> i64 {" + str_slice(text, k + 18, str_len(text));
+        }
+        lines.push(text);
+        calls.push("    println(\"== seed " + ss + "\");");
+        calls.push("    var r" + ss + ": i64 = p" + ss + "_main();");
+        calls.push("    if r" + ss + " != 0 { println(r" + ss + "); }");
+        i = i + 1;
+    }
+    lines.push("fn main() -> i64 {");
+    push_all(&mut lines, &calls);
+    lines.push("    return 0;");
+    lines.push("}");
+    return fl_join_lines(&lines, "\n") + "\n";
+}

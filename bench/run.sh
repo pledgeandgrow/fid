@@ -17,8 +17,9 @@
 # compiler; CC or zig cc).
 #
 # Rivals are built the way a good programmer of that language would ship
-# them: rustc -C opt-level=3, zig -O ReleaseFast, zig c++ -O2 (Clang),
-# g++ -O2 (GCC, when on the PATH), go build.
+# them: rustc -C opt-level=3, zig -O ReleaseFast, clang++ -O2 (a real Clang
+# when one is on the PATH, zig c++ otherwise), g++ -O2 (GCC, when on the
+# PATH), go build.
 #
 # Each cell is the best of RUNS wall-clock times and the spread of the runs,
 # (slowest - fastest) / fastest (BM8): "0.81 ±3%". A spread over 10% means
@@ -70,6 +71,14 @@ elif [ -n "$X" ] && [ "${GCC_WSL:-1}" != 0 ] && have wsl.exe \
      && MSYS_NO_PATHCONV=1 wsl.exe -e sh -c 'command -v g++' >/dev/null 2>&1; then GXX=wsl
 fi
 
+# Clang (BM2): a real clang++ on the PATH. zig c++ is the fallback, not the
+# preferred column: it is the same Clang front end but not the toolchain a
+# Clang user installs.
+CXXC=""
+if have clang++; then CXXC=native
+elif have zig; then CXXC=zig
+fi
+
 # build <lang> <bench> -> prints the executable path, or nothing
 build() {
   local lang=$1 b=$2 exe="$OUT/${SUITE:+$SUITE-}$2-$1$X" d="$SD"
@@ -81,7 +90,11 @@ build() {
     fides-c) [ -n "${FID:-}" ] && (cd .. && "$FID" ccompile "bench/${d}fides/$b.fd" -o "bench/$exe") >"$log" 2>&1 ;;
     rust)    [ -f "${d}rust/$b.rs" ] && have rustc && rustc -C opt-level=3 -o "$exe" "${d}rust/$b.rs" >"$log" 2>&1 ;;
     zig)     [ -f "${d}zig/$b.zig" ] && have zig && zig build-exe -O ReleaseFast -femit-bin="$exe" "${d}zig/$b.zig" >"$log" 2>&1 ;;
-    cpp)     [ -f "${d}cpp/$b.cpp" ] && have zig && zig c++ -O2 -o "$exe" "${d}cpp/$b.cpp" >"$log" 2>&1 ;;
+    cpp)     [ -f "${d}cpp/$b.cpp" ] && case $CXXC in
+               native) clang++ -O2 -o "$exe" "${d}cpp/$b.cpp" ;;
+               zig) zig c++ -O2 -o "$exe" "${d}cpp/$b.cpp" ;;
+               *) false ;;
+             esac >"$log" 2>&1 ;;
     cpp-gcc) [ -f "${d}cpp/$b.cpp" ] && case $GXX in
                native) g++ -O2 -o "$exe" "${d}cpp/$b.cpp" ;;
                # a Linux ELF: best() times a *.elf inside WSL
@@ -168,7 +181,13 @@ case $GXX in
   native) V_GCC=$(g++ -dumpfullversion 2>/dev/null) ;;
   wsl) V_GCC=$(MSYS_NO_PATHCONV=1 wsl.exe -e g++ -dumpfullversion 2>/dev/null | tr -d '\r') ;;
 esac
-echo "Toolchains: fid=${FID:-none}; rustc ${V_RUST:--}; zig ${V_ZIG:--} (also C++ through zig c++); go ${V_GO:--}; g++ ${V_GCC:--}${GXX:+ ($GXX)}."
+clang_version() { "$@" --version 2>/dev/null | sed -n 's/^clang version \([0-9][0-9.]*\).*/\1/p' | head -1; }
+V_CLANG=""
+case $CXXC in
+  native) V_CLANG=$(clang_version clang++) ;;
+  zig) V_CLANG=$(clang_version zig c++) ;;
+esac
+echo "Toolchains: fid=${FID:-none}; rustc ${V_RUST:--}; zig ${V_ZIG:--}; clang++ ${V_CLANG:--}${CXXC:+ ($CXXC)}; go ${V_GO:--}; g++ ${V_GCC:--}${GXX:+ ($GXX)}."
 [ "$GXX" = wsl ] && echo "C++ (GCC): g++ of WSL, built and timed inside WSL (Linux on this machine); the other columns run on Windows."
 # BM2: the pinned versions (bench/versions.txt: "tool version" lines; a
 # version matches when it starts with the pinned one, so "15" pins any 15.x)
@@ -176,7 +195,7 @@ if [ -f versions.txt ]; then
   while read -r tool want; do
     case "$tool" in ''|\#*) continue ;; esac
     case "$tool" in
-      rustc) got="$V_RUST" ;; zig) got="$V_ZIG" ;; go) got="$V_GO" ;; gcc) got="$V_GCC" ;; *) continue ;;
+      rustc) got="$V_RUST" ;; zig) got="$V_ZIG" ;; clang) got="$V_CLANG" ;; go) got="$V_GO" ;; gcc) got="$V_GCC" ;; *) continue ;;
     esac
     [ -z "$got" ] && continue
     case "$got" in "$want"*) ;; *) echo "Note: $tool is $got, bench/versions.txt pins $want: numbers are not comparable with the published ones." ;; esac

@@ -1,0 +1,369 @@
+// tools/leak_check.fd — the ownership gate (proposal 0004). The Fides port
+// of scripts/leak-check.sh (roadmap AD4): the same arguments, environment,
+// files in the report folder, output and exit status.
+//
+//   fid ccompile tools/leak_check.fd -o leak_check.exe
+//   leak_check.exe [FID] [FILE...]       (default release/fid.exe, tests/leaks/*.fd)
+//   JOBS=4 leak_check.exe release/fid-dev.exe tests/bootstrap/test_x.fd
+//   NATIVE=aarch64-linux RUNNER=qemu-aarch64 leak_check.exe     # RL16
+//
+// Builds each program through C with the leak report (`fid run --leaks`)
+// and fails when its output differs from <name>.expected (beside it; lines
+// compared without a trailing CR) or when the report does not say "every
+// block was freed". NATIVE=<target>: `fid emit --target <target> --leaks`
+// instead, the program run through RUNNER (split at blanks; empty on a
+// host of that target) with stdin at its end. JOBS programs at once
+// (default 1: `fid run --leaks` builds in a fixed temporary file in the
+// current folder, which must be the project root). Each program's
+// <name>.out, .err, (.build, .bin) and .status are kept in the report
+// folder, named on the last line. Exit status 1 when a program fails.
+
+use core;
+use args;
+use fs;
+use io;
+use process;
+
+fn lc_lt(a: str, b: str) -> bool {
+    val n: i64 = str_len(a);
+    val m: i64 = str_len(b);
+    var i: i64 = 0;
+    while i < n && i < m {
+        val x: i64 = str_byte_at(a, i);
+        val y: i64 = str_byte_at(b, i);
+        if x != y { return x < y; }
+        i = i + 1;
+    }
+    return n < m;
+}
+
+fn lc_sort(v: &mut Vec<str>) {
+    var i: i64 = 1;
+    while i < v.len() {
+        val x: str = v.get(i);
+        var j: i64 = i - 1;
+        while j >= 0 && lc_lt(x, v.get(j)) {
+            v.set(j + 1, v.get(j));
+            j = j - 1;
+        }
+        v.set(j + 1, x);
+        i = i + 1;
+    }
+}
+
+fn lc_env(name: str) -> str {
+    match env_var(name) {
+        Option::Some(s) => { return s; }
+        Option::None => { }
+    }
+    return "";
+}
+
+fn lc_temp_dir() -> str {
+    var names: Vec<str> = Vec::new();
+    names.push("TMPDIR");
+    names.push("TEMP");
+    names.push("TMP");
+    var i: i64 = 0;
+    while i < names.len() {
+        val s: str = lc_env(names.get(i));
+        if str_len(s) > 0 { return s; }
+        i = i + 1;
+    }
+    return "/tmp";
+}
+
+/// basename "$f" .fd
+fn lc_name(f: str) -> str {
+    var i: i64 = str_len(f);
+    while i > 0 && str_byte_at(f, i - 1) != 47 && str_byte_at(f, i - 1) != 92 { i = i - 1; }
+    var b: str = str_slice(f, i, str_len(f));
+    if str_ends_with(b, ".fd") && str_len(b) > 3 { b = str_slice(b, 0, str_len(b) - 3); }
+    return b;
+}
+
+/// dirname "$f"
+fn lc_dir(f: str) -> str {
+    var i: i64 = str_len(f);
+    while i > 0 && str_byte_at(f, i - 1) != 47 && str_byte_at(f, i - 1) != 92 { i = i - 1; }
+    if i == 0 { return "."; }
+    var j: i64 = i;
+    while j > 1 && (str_byte_at(f, j - 1) == 47 || str_byte_at(f, j - 1) == 92) { j = j - 1; }
+    return str_slice(f, 0, j);
+}
+
+fn lc_read(path: str) -> str {
+    match read_file(path) {
+        Option::Some(t) => { return t; }
+        Option::None => { }
+    }
+    return "";
+}
+
+/// The lines of a text (the last one counted when it has no newline).
+fn lc_lines(t: str) -> Vec<str> {
+    var r: Vec<str> = Vec::new();
+    var start: i64 = 0;
+    var i: i64 = 0;
+    val n: i64 = str_len(t);
+    while i < n {
+        if str_byte_at(t, i) == 10 {
+            r.push(str_slice(t, start, i));
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    if start < n { r.push(str_slice(t, start, n)); }
+    return r;
+}
+
+/// A text as diff --strip-trailing-cr reads it: lines without a CR at
+/// their end, and whether the last one ends in a newline.
+fn lc_norm(t: str) -> str {
+    var out: str = "";
+    val ls: Vec<str> = lc_lines(t);
+    var i: i64 = 0;
+    while i < ls.len() {
+        var l: str = ls.get(i);
+        if str_ends_with(l, "\r") { l = str_slice(l, 0, str_len(l) - 1); }
+        out = out + l;
+        if i + 1 < ls.len() || str_ends_with(t, "\n") { out = out + "\n"; }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// grep -v -e '^Built native executable' -e '^Reused cached artifact'
+fn lc_filter(t: str) -> str {
+    var out: str = "";
+    val ls: Vec<str> = lc_lines(t);
+    var i: i64 = 0;
+    while i < ls.len() {
+        val l: str = ls.get(i);
+        if !str_starts_with(l, "Built native executable") && !str_starts_with(l, "Reused cached artifact") {
+            out = out + l + "\n";
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// The first line of `t` holding `word`, "" for none.
+fn lc_grep1(t: str, word: str) -> str {
+    val ls: Vec<str> = lc_lines(t);
+    var i: i64 = 0;
+    while i < ls.len() {
+        if str_contains(ls.get(i), word) { return ls.get(i); }
+        i = i + 1;
+    }
+    return "";
+}
+
+/// $(head -c 300 file): at most 300 bytes, trailing newlines dropped.
+fn lc_head300(t: str) -> str {
+    var s: str = t;
+    if str_len(s) > 300 { s = str_slice(s, 0, 300); }
+    while str_len(s) > 0 && str_byte_at(s, str_len(s) - 1) == 10 { s = str_slice(s, 0, str_len(s) - 1); }
+    return s;
+}
+
+fn lc_words(s: str) -> Vec<str> {
+    var r: Vec<str> = Vec::new();
+    var cur: str = "";
+    var i: i64 = 0;
+    while i < str_len(s) {
+        val c: i64 = str_byte_at(s, i);
+        if c == 32 || c == 9 || c == 10 {
+            if str_len(cur) > 0 { r.push(cur); }
+            cur = "";
+        } else {
+            cur = cur + char_to_str(c);
+        }
+        i = i + 1;
+    }
+    if str_len(cur) > 0 { r.push(cur); }
+    return r;
+}
+
+/// The status of a program once its run has ended (check_one's end).
+fn lc_status(f: str, out: str) -> str {
+    val name: str = lc_name(f);
+    val exp: str = lc_dir(f) + "/" + name + ".expected";
+    var status: str = "ok";
+    if fs_exists(exp) {
+        if lc_norm(lc_read(exp)) != lc_norm(lc_read(out + "/" + name + ".out")) { status = "output differs"; }
+    }
+    val err: str = lc_read(out + "/" + name + ".err");
+    if !str_contains(err, "every block was freed") {
+        var why: str = lc_grep1(err, "fid --leaks");
+        if str_len(why) == 0 { why = "no leak report"; }
+        status = status + "; leaks: " + why;
+    }
+    return status;
+}
+
+fn main() -> i64 {
+    val all: Vec<str> = args_all();
+    var first: i64 = 1;
+    if all.len() >= 3 && all.get(1) == "run" && str_ends_with(all.get(2), ".fd") { first = 3; }
+    var fid: str = "release/fid.exe";
+    if all.len() > first { fid = all.get(first); }
+    var files: Vec<str> = Vec::new();
+    var i: i64 = first + 1;
+    while i < all.len() {
+        files.push(all.get(i));
+        i = i + 1;
+    }
+    if files.len() == 0 {
+        var names: Vec<str> = fs_list_dir("tests/leaks");
+        lc_sort(&mut names);
+        i = 0;
+        while i < names.len() {
+            if str_ends_with(names.get(i), ".fd") { files.push("tests/leaks/" + names.get(i)); }
+            i = i + 1;
+        }
+        if files.len() == 0 { files.push("tests/leaks/*.fd"); }
+    }
+    var jobs: i64 = str_parse_int(str_trim(lc_env("JOBS")));
+    if jobs < 1 { jobs = 1; }
+    val native: str = lc_env("NATIVE");
+    val runner: Vec<str> = lc_words(lc_env("RUNNER"));
+    val out: str = lc_temp_dir() + "/tmp." + int_to_str(p_getpid()) + int_to_str(p_clock_now_us() % 100000);
+    fs_mkdir(out);
+
+    // each program: phase 0 waiting, 1 building (NATIVE), 2 running, 3 done
+    val n: i64 = files.len();
+    var phase: Vec<i64> = Vec::new();
+    var handles: Vec<i64> = Vec::new();
+    i = 0;
+    while i < n {
+        phase.push(0);
+        handles.push(0);
+        i = i + 1;
+    }
+    var next: i64 = 0;
+    var running: i64 = 0;
+    var done: i64 = 0;
+    while done < n {
+        // start programs while there is room
+        while running < jobs && next < n {
+            val f: str = files.get(next);
+            val name: str = lc_name(f);
+            var argv: Vec<str> = Vec::new();
+            argv.push(fid);
+            var h: i64 = 0;
+            if str_len(native) > 0 {
+                argv.push("emit");
+                argv.push(f);
+                argv.push("--target");
+                argv.push(native);
+                argv.push("--leaks");
+                argv.push("-o");
+                argv.push(out + "/" + name + ".bin");
+                h = process_spawn_to(argv, Vec::new(), "", out + "/" + name + ".build");
+                phase.set(next, 1);
+            } else {
+                argv.push("run");
+                argv.push(f);
+                argv.push("--leaks");
+                h = process_spawn_files(argv, Vec::new(), "", out + "/" + name + ".raw", out + "/" + name + ".err");
+                phase.set(next, 2);
+            }
+            handles.set(next, h);
+            if h == 0 {
+                // could not start: as a failed build / an empty run
+                if phase.get(next) == 1 {
+                    fs_write_text(out + "/" + name + ".status", "build failed: cannot start " + fid + "\n");
+                } else {
+                    fs_write_text(out + "/" + name + ".out", "");
+                    fs_write_text(out + "/" + name + ".status", lc_status(f, out) + "\n");
+                }
+                phase.set(next, 3);
+                done = done + 1;
+            } else {
+                running = running + 1;
+            }
+            next = next + 1;
+        }
+        // whatever has ended moves on
+        var moved: bool = false;
+        var r: i64 = 0;
+        while r < next {
+            val ph: i64 = phase.get(r);
+            if ph == 1 || ph == 2 {
+                match process_wait(handles.get(r), 0) {
+                    Option::Some(code) => {
+                        process_release(handles.get(r));
+                        moved = true;
+                        val f2: str = files.get(r);
+                        val name2: str = lc_name(f2);
+                        if ph == 1 {
+                            if code != 0 {
+                                fs_write_text(out + "/" + name2 + ".status", "build failed: " + lc_head300(lc_read(out + "/" + name2 + ".build")) + "\n");
+                                phase.set(r, 3);
+                                running = running - 1;
+                                done = done + 1;
+                            } else {
+                                var rv: Vec<str> = Vec::new();
+                                var k: i64 = 0;
+                                while k < runner.len() {
+                                    rv.push(runner.get(k));
+                                    k = k + 1;
+                                }
+                                rv.push(out + "/" + name2 + ".bin");
+                                val h2: i64 = process_spawn_files(rv, Vec::new(), "", out + "/" + name2 + ".out", out + "/" + name2 + ".err");
+                                handles.set(r, h2);
+                                phase.set(r, 2);
+                                if h2 == 0 {
+                                    fs_write_text(out + "/" + name2 + ".status", lc_status(f2, out) + "\n");
+                                    phase.set(r, 3);
+                                    running = running - 1;
+                                    done = done + 1;
+                                }
+                            }
+                        } else {
+                            if str_len(native) == 0 {
+                                val raw: str = out + "/" + name2 + ".raw";
+                                fs_write_text(out + "/" + name2 + ".out", lc_filter(lc_read(raw)));
+                                fs_delete(raw);
+                            }
+                            fs_write_text(out + "/" + name2 + ".status", lc_status(f2, out) + "\n");
+                            phase.set(r, 3);
+                            running = running - 1;
+                            done = done + 1;
+                        }
+                    }
+                    Option::None => { }
+                }
+            }
+            r = r + 1;
+        }
+        if !moved && done < n {
+            // nothing ended: wait a little on the first one still going
+            var w: i64 = 0;
+            while w < next && phase.get(w) != 1 && phase.get(w) != 2 { w = w + 1; }
+            if w < next { process_wait(handles.get(w), 20); }
+        }
+    }
+
+    var fail: i64 = 0;
+    i = 0;
+    while i < n {
+        val name3: str = lc_name(files.get(i));
+        var st: str = "did not run";
+        match read_file(out + "/" + name3 + ".status") {
+            Option::Some(t) => { st = str_replace(t, "\n", ""); }
+            Option::None => { }
+        }
+        if st == "ok" {
+            println("  ok    " + name3);
+        } else {
+            println("  FAIL  " + name3 + ": " + st);
+            fail = fail + 1;
+        }
+        i = i + 1;
+    }
+    println("leak-check: " + int_to_str(n) + " program(s), " + int_to_str(fail) + " failed (reports in " + out + ")");
+    if fail > 0 { return 1; }
+    return 0;
+}

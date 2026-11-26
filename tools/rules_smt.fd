@@ -1,0 +1,218 @@
+// tools/rules_smt.fd — prove the rewrite rules of compiler/rules.fd with an
+// SMT solver (own-backend roadmap ME17). The Fides port of
+// scripts/rules-smt.sh (roadmap AD4): the same arguments, output and exit
+// status; the solver stays external.
+//
+//   fid ccompile tools/rules_smt.fd -o rules_smt.exe
+//   rules_smt.exe [fid] [solver]      (defaults: release/fid.exe, z3)
+//
+// `fid test-rules --smt build/rules-smt` writes one obligation per rule and
+// width, asserting the two sides differ; the solver must answer `unsat`
+// for every one. With no solver command on PATH, z3's Python module
+// (python3, then python: `pip install z3-solver`) is used; with neither,
+// exit 2. Exit status: the number not proved. Run from the repository root
+// (the script changes to it itself).
+
+use core;
+use args;
+use fs;
+use io;
+use process;
+
+fn rs_lt(a: str, b: str) -> bool {
+    val n: i64 = str_len(a);
+    val m: i64 = str_len(b);
+    var i: i64 = 0;
+    while i < n && i < m {
+        val x: i64 = str_byte_at(a, i);
+        val y: i64 = str_byte_at(b, i);
+        if x != y { return x < y; }
+        i = i + 1;
+    }
+    return n < m;
+}
+
+fn rs_sort(v: &mut Vec<str>) {
+    var i: i64 = 1;
+    while i < v.len() {
+        val x: str = v.get(i);
+        var j: i64 = i - 1;
+        while j >= 0 && rs_lt(x, v.get(j)) {
+            v.set(j + 1, v.get(j));
+            j = j - 1;
+        }
+        v.set(j + 1, x);
+        i = i + 1;
+    }
+}
+
+fn rs_env(name: str) -> str {
+    match env_var(name) {
+        Option::Some(s) => { return s; }
+        Option::None => { }
+    }
+    return "";
+}
+
+/// command -v: a path with a slash must exist; a name is looked up on PATH
+/// (with .exe, .cmd, .bat on Windows).
+fn rs_have(cmd: str) -> bool {
+    if str_len(cmd) == 0 { return false; }
+    if str_contains(cmd, "/") || str_contains(cmd, "\\") {
+        return fs_exists(cmd) || fs_exists(cmd + ".exe");
+    }
+    var sep: str = ":";
+    if process_is_windows() { sep = ";"; }
+    val dirs: Vec<str> = str_split(rs_env("PATH"), sep);
+    var exts: Vec<str> = Vec::new();
+    exts.push("");
+    if process_is_windows() {
+        exts.push(".exe");
+        exts.push(".cmd");
+        exts.push(".bat");
+    }
+    var i: i64 = 0;
+    while i < dirs.len() {
+        val d: str = dirs.get(i);
+        i = i + 1;
+        if str_len(d) == 0 { continue; }
+        var k: i64 = 0;
+        while k < exts.len() {
+            val p: str = d + "/" + cmd + exts.get(k);
+            if fs_exists(p) && !fs_is_dir(p) { return true; }
+            k = k + 1;
+        }
+    }
+    return false;
+}
+
+fn rs_run(argv: Vec<str>) -> ChildResult {
+    return process_run_argv(argv, Vec::new(), "", -1);
+}
+
+/// The first line of text, CRs dropped (tr -d '\r' | head -n 1).
+fn rs_first_line(t: str) -> str {
+    val s: str = str_replace(t, "\r", "");
+    val k: i64 = str_find(s, "\n");
+    if k < 0 { return s; }
+    return str_slice(s, 0, k);
+}
+
+fn main() -> i64 {
+    val all: Vec<str> = args_all();
+    var first: i64 = 1;
+    if all.len() >= 3 && all.get(1) == "run" && str_ends_with(all.get(2), ".fd") { first = 3; }
+    var fid: str = "release/fid.exe";
+    if all.len() > first && str_len(all.get(first)) > 0 { fid = all.get(first); }
+    var solver: str = "z3";
+    if all.len() > first + 1 && str_len(all.get(first + 1)) > 0 { solver = all.get(first + 1); }
+    val dir: str = "build/rules-smt";
+    if !fs_is_dir("build") { fs_mkdir("build"); }
+    if !fs_is_dir(dir) { fs_mkdir(dir); }
+
+    var tr: Vec<str> = Vec::new();
+    tr.push(fid);
+    tr.push("test-rules");
+    tr.push("--smt");
+    tr.push(dir);
+    val h: i64 = process_spawn_files(tr, Vec::new(), "", dir + "/.test-rules.out", dir + "/.test-rules.err");
+    var ok: bool = false;
+    if h != 0 {
+        match process_wait(h, -1) {
+            Option::Some(c) => { ok = c == 0; }
+            Option::None => { }
+        }
+        process_release(h);
+        // its stderr reaches ours, as in the script (only stdout is dropped)
+        match read_file(dir + "/.test-rules.err") {
+            Option::Some(t) => { print(t); }
+            Option::None => { }
+        }
+    }
+    fs_delete(dir + "/.test-rules.out");
+    fs_delete(dir + "/.test-rules.err");
+    if !ok {
+        println("fid test-rules failed");
+        return 1;
+    }
+
+    // The z3-solver wheel has the library but no z3 command: fall back to it.
+    var py: str = "";
+    var cands: Vec<str> = Vec::new();
+    cands.push("python3");
+    cands.push("python");
+    var i: i64 = 0;
+    while i < cands.len() && str_len(py) == 0 {
+        val p: str = cands.get(i);
+        i = i + 1;
+        if !rs_have(p) { continue; }
+        var a: Vec<str> = Vec::new();
+        a.push(p);
+        a.push("-c");
+        a.push("import z3");
+        val r: ChildResult = rs_run(a);
+        if r.started && r.code == 0 { py = p; }
+    }
+    var use_py: bool = false;
+    if !rs_have(solver) {
+        if str_len(py) == 0 {
+            println("no " + solver + ": the obligations are in " + dir + " (install z3, e.g. pip install z3-solver)");
+            return 2;
+        }
+        use_py = true;
+    }
+
+    var names: Vec<str> = fs_list_dir(dir);
+    rs_sort(&mut names);
+    var files: Vec<str> = Vec::new();
+    i = 0;
+    while i < names.len() {
+        if str_ends_with(names.get(i), ".smt2") && str_byte_at(names.get(i), 0) != 46 { files.push(dir + "/" + names.get(i)); }
+        i = i + 1;
+    }
+    if files.len() == 0 { files.push(dir + "/*.smt2"); }
+    var bad: i64 = 0;
+    var n: i64 = 0;
+    i = 0;
+    while i < files.len() {
+        val f: str = files.get(i);
+        i = i + 1;
+        n = n + 1;
+        var argv: Vec<str> = Vec::new();
+        if use_py {
+            argv.push(py);
+            argv.push("-c");
+            argv.push("import sys, z3\ns = z3.Solver(); s.from_file(sys.argv[1]); print(s.check())");
+            argv.push(f);
+        } else {
+            argv.push(solver);
+            argv.push(f);
+        }
+        // stdout and stderr together, as 2>&1
+        val log: str = dir + "/.solver.out";
+        val hs: i64 = process_spawn_to(argv, Vec::new(), "", log);
+        var text: str = "rules_smt: " + argv.get(0) + ": command not found";
+        if hs != 0 {
+            process_wait(hs, -1);
+            process_release(hs);
+            text = "";
+            match read_file(log) {
+                Option::Some(t) => { text = t; }
+                Option::None => { }
+            }
+        }
+        fs_delete(log);
+        val res: str = rs_first_line(text);
+        if res != "unsat" {
+            var head: str = "";
+            match read_file(f) {
+                Option::Some(t) => { head = rs_first_line(t); }
+                Option::None => { }
+            }
+            println("NOT PROVED (" + res + "): " + head);
+            bad = bad + 1;
+        }
+    }
+    println(int_to_str(n) + " obligations, " + int_to_str(n - bad) + " proved, " + int_to_str(bad) + " not");
+    return bad & 255;
+}

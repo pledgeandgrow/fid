@@ -1,0 +1,2162 @@
+// tools/chaos.fd — chaos tests: the program must fail cleanly when the
+// world does (VF17): the Fides port of scripts/verify/chaos.py (roadmap
+// AD4). Same options and defaults, the same lines, the same
+// <out>/report.txt, the same exit status:
+//
+//   fid ccompile tools/chaos.fd -o chaos.exe
+//   chaos.exe --fid release/fid.exe [--backends ccompile,emit]
+//       [--linux [--linux-nat] | --clock | --partition] [--strict]
+//       [--faketime LIB] [--linux-out /tmp/fides-chaos] [--out build/chaos]
+//       [--src tests/verify/chaos.fd]
+//
+// Builds tests/verify/chaos.fd once per backend (CC=zig cc unless CC is
+// set) and runs the script's scenarios against it, each judged as there:
+// it passes when the program reports the failure (an error value, or a
+// panic message with a nonzero exit) and ends within its time limit; it
+// fails on a crash, a hang, or output that pretends nothing went wrong.
+// On this host: a server that closes at once, one that resets (SO_LINGER
+// 0), one that sends half a header, one that never answers; stdout closed
+// after one line of a million; a missing file and a directory read as a
+// file; an argument past the last; recursion a hundred million deep.
+// With --linux (WSL on Windows, or Linux itself) the full disk and out of
+// memory scenarios on the x86_64-linux build (and with --linux-nat on emit
+// --target x86_64-linux), and with --linux, --clock or --partition the
+// clock jumps and network partitions of scripts/verify/chaos_linux.py,
+// which stays a Python script run inside WSL or Linux (its RESULT lines
+// are read here). Open findings of docs/verification/miscompile-log.md
+// (the KNOWN table, the script's) print OPEN <id> and fail the run only
+// with --strict.
+//
+// The test servers run as children of this tool (`--ch-serve <kind>`,
+// hidden: it binds 127.0.0.1 on a free port, prints the port, and answers
+// every connection as the kind says until it is killed), where the script
+// runs them in threads. Other differences: report.txt is written with "\n"
+// line ends (Python on Windows writes "\r\n"); a child's output is decoded
+// as UTF-8 where the script decodes a build's output and chaos_linux.py's
+// with the locale's code page (the same for ASCII); a program that cannot
+// be started gives the last line of Python's traceback only, exit 1 as
+// there.
+
+use core;
+use args;
+use fs;
+use io;
+use process;
+use task;
+
+extern "C" {
+    fn getcwd(buf: i64, n: i64) -> i64;
+    fn fid_proc_spawn_io(argv: i64, env: i64, dir: i64, out: i64, io: i64) -> i64;
+}
+
+// SAFETY: Winsock functions, declared by the headers every generated C
+// file includes on Windows (`<stdint.h>` only makes the C backend use the
+// system's prototypes). Integers are passed as i64 and pointers as i64
+// addresses of blocks this file allocated, each at least as long as the
+// length passed with it. Only @cfg(windows) functions call them.
+extern "C" include "<stdint.h>" link "ws2_32" {
+    fn WSAStartup as chw_startup(version: i64, data: i64) -> i32;
+    fn socket as chw_socket(family: i64, kind: i64, proto: i64) -> i64;
+    fn bind as chw_bind(s: i64, addr: i64, len: i64) -> i32;
+    fn listen as chw_listen(s: i64, n: i64) -> i32;
+    fn getsockname as chw_getsockname(s: i64, addr: i64, len: i64) -> i32;
+    fn accept as chw_accept(s: i64, addr: i64, len: i64) -> i64;
+    fn setsockopt as chw_setsockopt(s: i64, level: i64, name: i64, val: i64, len: i64) -> i32;
+    fn recv as chw_recv(s: i64, buf: i64, len: i64, flags: i64) -> i32;
+    fn send as chw_send(s: i64, buf: i64, len: i64, flags: i64) -> i32;
+    fn closesocket as chw_close(s: i64) -> i32;
+}
+
+// SAFETY: the BSD socket API, as the block above: the system's own
+// functions, integers as i64, pointers as addresses of blocks this file
+// allocated. Only @cfg(unix) functions call them.
+extern "C" include "<stdint.h>" link "" {
+    fn socket as chu_socket(family: i64, kind: i64, proto: i64) -> i32;
+    fn bind as chu_bind(s: i64, addr: i64, len: i64) -> i32;
+    fn listen as chu_listen(s: i64, n: i64) -> i32;
+    fn getsockname as chu_getsockname(s: i64, addr: i64, len: i64) -> i32;
+    fn accept as chu_accept(s: i64, addr: i64, len: i64) -> i32;
+    fn setsockopt as chu_setsockopt(s: i64, level: i64, name: i64, val: i64, len: i64) -> i32;
+    fn recv as chu_recv(s: i64, buf: i64, len: i64, flags: i64) -> i64;
+    fn send as chu_send(s: i64, buf: i64, len: i64, flags: i64) -> i64;
+    fn close as chu_close(s: i64) -> i32;
+    fn waitpid as chu_waitpid(pid: i64, status: i64, options: i64) -> i32;
+    fn kill as chu_kill(pid: i64, sig: i64) -> i32;
+}
+
+// SAFETY: kernel32 functions, declared by <windows.h> (as above): a
+// process handle OpenProcess returned, an 8-byte block for the exit code.
+// Only @cfg(windows) functions call them.
+extern "C" include "<stdint.h>" {
+    fn OpenProcess as chw_open_process(access: i64, inherit: i64, pid: i64) -> i64;
+    fn WaitForSingleObject as chw_wait(h: i64, ms: i64) -> i64;
+    fn GetExitCodeProcess as chw_exit_code(h: i64, code: i64) -> i32;
+    fn TerminateProcess as chw_terminate(h: i64, code: i64) -> i32;
+    fn CloseHandle as chw_close_handle(h: i64) -> i32;
+}
+
+const CH_PROG: str = "chaos.py";
+
+fn ch_usage() -> str {
+    var u: str = "usage: chaos.py [-h] [--fid FID] [--backends BACKENDS] [--linux] [--linux-nat]\n";
+    u = u + "                [--clock] [--partition] [--faketime FAKETIME]\n";
+    u = u + "                [--linux-out LINUX_OUT] [--strict] [--out OUT] [--src SRC]\n";
+    return u;
+}
+
+fn ch_help() -> str {
+    var h: str = ch_usage() + "\noptions:\n";
+    h = h + "  -h, --help            show this help message and exit\n";
+    h = h + "  --fid FID\n";
+    h = h + "  --backends BACKENDS\n";
+    h = h + "  --linux               also the Linux scenarios: full disk, out of memory,\n";
+    h = h + "                        clock jumps, partitions\n";
+    h = h + "  --linux-nat           with --linux: full disk and out of memory also on emit\n";
+    h = h + "                        --target x86_64-linux\n";
+    h = h + "  --clock               the clock jumps (Linux or WSL)\n";
+    h = h + "  --partition           the network partitions (Linux or WSL)\n";
+    h = h + "  --faketime FAKETIME   libfaketime.so.1 (a Linux path) for the realtime jumps\n";
+    h = h + "  --linux-out LINUX_OUT\n";
+    h = h + "                        Linux-side build folder\n";
+    h = h + "  --strict              open findings (KNOWN) fail the run too\n";
+    h = h + "  --out OUT\n";
+    h = h + "  --src SRC             the driver (a copy of chaos.fd, to try an older\n";
+    h = h + "                        compiler)\n";
+    return h;
+}
+
+// ─── Text (Python's str methods, ASCII whitespace) ───
+
+fn ch_ws(c: i64) -> bool {
+    return (c >= 9 && c <= 13) || (c >= 28 && c <= 32);
+}
+
+fn ch_digit(c: i64) -> bool {
+    return c >= 48 && c <= 57;
+}
+
+fn ch_skip_ws(s: str, i: i64) -> i64 {
+    var k: i64 = i;
+    while k < str_len(s) && ch_ws(str_byte_at(s, k)) { k = k + 1; }
+    return k;
+}
+
+fn ch_at(s: str, i: i64, w: str) -> bool {
+    if i < 0 || i + str_len(w) > str_len(s) { return false; }
+    return str_slice(s, i, i + str_len(w)) == w;
+}
+
+/// s.strip()
+fn ch_strip(s: str) -> str {
+    var a: i64 = 0;
+    var b: i64 = str_len(s);
+    while a < b && ch_ws(str_byte_at(s, a)) { a = a + 1; }
+    while b > a && ch_ws(str_byte_at(s, b - 1)) { b = b - 1; }
+    return str_slice(s, a, b);
+}
+
+/// s.split(sep) (keeps empty pieces).
+fn ch_split(s: str, sep: str) -> Vec<str> {
+    var r: Vec<str> = Vec::new();
+    val n: i64 = str_len(s);
+    val m: i64 = str_len(sep);
+    var start: i64 = 0;
+    var i: i64 = 0;
+    while i + m <= n {
+        if str_slice(s, i, i + m) == sep {
+            r.push(str_slice(s, start, i));
+            i = i + m;
+            start = i;
+        } else {
+            i = i + 1;
+        }
+    }
+    r.push(str_slice(s, start, n));
+    return r;
+}
+
+/// s.splitlines() (on "\n", "\r\n" and "\r").
+fn ch_splitlines(s: str) -> Vec<str> {
+    var r: Vec<str> = Vec::new();
+    val n: i64 = str_len(s);
+    var start: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        val c: i64 = str_byte_at(s, i);
+        if c == 10 || c == 13 {
+            r.push(str_slice(s, start, i));
+            if c == 13 && i + 1 < n && str_byte_at(s, i + 1) == 10 { i = i + 1; }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    if start < n { r.push(str_slice(s, start, n)); }
+    return r;
+}
+
+/// f"{s:<w}"
+fn ch_ljust(s: str, w: i64) -> str {
+    var r: str = s;
+    var n: i64 = ch_chars(s);
+    while n < w {
+        r = r + " ";
+        n = n + 1;
+    }
+    return r;
+}
+
+/// f"{s:>w}"
+fn ch_rjust(s: str, w: i64) -> str {
+    var r: str = s;
+    var n: i64 = ch_chars(s);
+    while n < w {
+        r = " " + r;
+        n = n + 1;
+    }
+    return r;
+}
+
+/// The code points of UTF-8 text.
+fn ch_chars(s: str) -> i64 {
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while i < str_len(s) {
+        if (str_byte_at(s, i) & 192) != 128 { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+
+/// s[:n] by code points.
+fn ch_head(s: str, n: i64) -> str {
+    var seen: i64 = 0;
+    var i: i64 = 0;
+    while i < str_len(s) {
+        if (str_byte_at(s, i) & 192) != 128 {
+            if seen == n { return str_slice(s, 0, i); }
+            seen = seen + 1;
+        }
+        i = i + 1;
+    }
+    return s;
+}
+
+/// s[-n:] by code points.
+fn ch_tail(s: str, n: i64) -> str {
+    val total: i64 = ch_chars(s);
+    if total <= n { return s; }
+    var skip: i64 = total - n;
+    var i: i64 = 0;
+    while i < str_len(s) {
+        if (str_byte_at(s, i) & 192) != 128 {
+            if skip == 0 { return str_slice(s, i, str_len(s)); }
+            skip = skip - 1;
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn ch_hexw(c: i64, width: i64) -> str {
+    val digits: str = "0123456789abcdef";
+    var s: str = "";
+    var k: i64 = width - 1;
+    while k >= 0 {
+        s = s + char_to_str(str_byte_at(digits, (c >> (4 * k)) & 15));
+        k = k - 1;
+    }
+    return s;
+}
+
+/// hex(v) for v >= 0: "0x" and the digits, no padding.
+fn ch_hex(v: i64) -> str {
+    if v == 0 { return "0x0"; }
+    val digits: str = "0123456789abcdef";
+    var s: str = "";
+    var x: i64 = v;
+    while x > 0 {
+        s = char_to_str(str_byte_at(digits, x & 15)) + s;
+        x = x >> 4;
+    }
+    return "0x" + s;
+}
+
+/// repr() of a str: ASCII control characters, U+007F..U+009F escaped,
+/// the rest as it is.
+fn ch_repr(s: str) -> str {
+    var q: str = "'";
+    if str_contains(s, "'") && !str_contains(s, "\"") { q = "\""; }
+    var out: str = q;
+    var i: i64 = 0;
+    while i < str_len(s) {
+        val c: i64 = str_byte_at(s, i);
+        i = i + 1;
+        if char_to_str(c) == q || c == 92 {
+            out = out + "\\" + char_to_str(c);
+        } else if c == 9 {
+            out = out + "\\t";
+        } else if c == 10 {
+            out = out + "\\n";
+        } else if c == 13 {
+            out = out + "\\r";
+        } else if c < 32 || c == 127 {
+            out = out + "\\x" + ch_hexw(c, 2);
+        } else if c == 192 && i < str_len(s) && str_byte_at(s, i) == 128 {
+            // a NUL the decoder kept as C0 80
+            out = out + "\\x00";
+            i = i + 1;
+        } else if c == 194 && i < str_len(s) && str_byte_at(s, i) >= 128 && str_byte_at(s, i) <= 159 {
+            out = out + "\\x" + ch_hexw(str_byte_at(s, i), 2);
+            i = i + 1;
+        } else {
+            out = out + char_to_str(c);
+        }
+    }
+    return out + q;
+}
+
+/// f"{d:.{prec}f}", rounded as Python rounds (the binary value, ties to
+/// even).
+fn ch_fixed(d: f64, prec: i64) -> str {
+    if d != d { return "nan"; }
+    var neg: bool = false;
+    var x: f64 = d;
+    if x < 0.0 {
+        neg = true;
+        x = 0.0 - x;
+    }
+    if x > 1.0e15 {
+        return float_to_str(d);
+    }
+    val bits: i64 = p_f64_to_bits(x);
+    val e: i64 = (bits >> 52) & 2047;
+    var m: i64 = bits & 4503599627370495;
+    var exp: i64 = -1074;
+    if e != 0 {
+        m = m | 4503599627370496;
+        exp = e - 1075;
+    }
+    var scale: i64 = 1;
+    var k: i64 = 0;
+    while k < prec {
+        scale = scale * 10;
+        k = k + 1;
+    }
+    // m * scale fits while prec <= 2 (m < 2^53)
+    val num: i64 = m * scale;
+    var q: i64 = 0;
+    if exp >= 0 {
+        q = num << exp;
+    } else {
+        val s: i64 = 0 - exp;
+        if s <= 61 {
+            q = num >> s;
+            val r: i64 = num - (q << s);
+            val half: i64 = 1 << (s - 1);
+            if r > half || (r == half && (q & 1) == 1) { q = q + 1; }
+        }
+    }
+    var out: str = int_to_str(q / scale);
+    if prec > 0 {
+        var frac: str = int_to_str(q % scale);
+        while str_len(frac) < prec { frac = "0" + frac; }
+        out = out + "." + frac;
+    }
+    if neg { out = "-" + out; }
+    return out;
+}
+
+/// The text Python's bytes.decode("utf-8", "replace") gives (a NUL as
+/// C0 80, which a str can hold).
+fn ch_decode(b: Vec<i64>) -> str {
+    var out: Vec<i64> = Vec::new();
+    val n: i64 = b.len();
+    var i: i64 = 0;
+    while i < n {
+        val c: i64 = b.get(i);
+        if c == 0 {
+            out.push(192);
+            out.push(128);
+            i = i + 1;
+            continue;
+        }
+        if c < 128 {
+            out.push(c);
+            i = i + 1;
+            continue;
+        }
+        var need: i64 = 0;
+        var lo: i64 = 128;
+        var hi: i64 = 191;
+        if c >= 194 && c <= 223 {
+            need = 1;
+        } else if c >= 224 && c <= 239 {
+            need = 2;
+            if c == 224 { lo = 160; }
+            if c == 237 { hi = 159; }
+        } else if c >= 240 && c <= 244 {
+            need = 3;
+            if c == 240 { lo = 144; }
+            if c == 244 { hi = 143; }
+        } else {
+            out.push(239);
+            out.push(191);
+            out.push(189);
+            i = i + 1;
+            continue;
+        }
+        var j: i64 = 1;
+        var ok: bool = true;
+        while j <= need {
+            if i + j >= n {
+                ok = false;
+                break;
+            }
+            val d: i64 = b.get(i + j);
+            var l: i64 = 128;
+            var h: i64 = 191;
+            if j == 1 {
+                l = lo;
+                h = hi;
+            }
+            if d < l || d > h {
+                ok = false;
+                break;
+            }
+            j = j + 1;
+        }
+        if ok {
+            var k: i64 = 0;
+            while k <= need {
+                out.push(b.get(i + k));
+                k = k + 1;
+            }
+            i = i + need + 1;
+        } else {
+            out.push(239);
+            out.push(191);
+            out.push(189);
+            i = i + j;
+        }
+    }
+    return str_from_bytes(out);
+}
+
+// ─── Paths (os.path on this system) ───
+
+fn ch_win() -> bool {
+    return process_is_windows();
+}
+
+fn ch_is_sep(c: i64) -> bool {
+    return c == 47 || (c == 92 && ch_win());
+}
+
+fn ch_sep() -> str {
+    if ch_win() { return "\\"; }
+    return "/";
+}
+
+var ch_cwd_cache: str = "";
+
+/// os.getcwd()
+fn ch_cwd() -> str {
+    if str_len(ch_cwd_cache) > 0 { return ch_cwd_cache; }
+    var buf: i64 = 0;
+    // SAFETY: a fresh 4096-byte buffer; getcwd writes at most that many
+    // bytes, NUL included, and the result is copied out before it is freed.
+    unsafe {
+        buf = p_malloc(4096);
+        if buf != 0 {
+            if getcwd(buf, 4096) != 0 {
+                ch_cwd_cache = p_str_from_ptr(buf);
+            }
+            p_free(buf);
+        }
+    }
+    if str_len(ch_cwd_cache) == 0 { ch_cwd_cache = "."; }
+    return ch_cwd_cache;
+}
+
+/// The drive ("C:") of a Windows path, "" for none.
+fn ch_drive(p: str) -> str {
+    if ch_win() && str_len(p) >= 2 && str_byte_at(p, 1) == 58 { return str_slice(p, 0, 2); }
+    return "";
+}
+
+fn ch_isabs(p: str) -> bool {
+    val d: str = ch_drive(p);
+    val rest: str = str_slice(p, str_len(d), str_len(p));
+    return str_len(rest) > 0 && ch_is_sep(str_byte_at(rest, 0));
+}
+
+/// os.path.join(a, b)
+fn ch_join(a: str, b: str) -> str {
+    if str_len(a) == 0 { return b; }
+    if ch_isabs(b) { return b; }
+    if ch_is_sep(str_byte_at(a, str_len(a) - 1)) { return a + b; }
+    return a + ch_sep() + b;
+}
+
+/// os.path.normpath
+fn ch_normpath(p: str) -> str {
+    val d: str = ch_drive(p);
+    var rest: str = str_slice(p, str_len(d), str_len(p));
+    if ch_win() { rest = str_replace(rest, "/", "\\"); }
+    val abs: bool = str_len(rest) > 0 && ch_is_sep(str_byte_at(rest, 0));
+    val parts: Vec<str> = ch_split(rest, ch_sep());
+    var out: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < parts.len() {
+        val c: str = parts.get(i);
+        i = i + 1;
+        if str_len(c) == 0 || c == "." { continue; }
+        if c == ".." {
+            if out.len() > 0 && out.get(out.len() - 1) != ".." {
+                out.remove(out.len() - 1);
+                continue;
+            }
+            if abs { continue; }
+        }
+        out.push(c);
+    }
+    var s: str = "";
+    i = 0;
+    while i < out.len() {
+        if i > 0 { s = s + ch_sep(); }
+        s = s + out.get(i);
+        i = i + 1;
+    }
+    if abs { s = ch_sep() + s; }
+    s = d + s;
+    if str_len(s) == 0 { return "."; }
+    return s;
+}
+
+/// os.path.abspath
+fn ch_abspath(p: str) -> str {
+    if ch_isabs(p) { return ch_normpath(p); }
+    return ch_normpath(ch_join(ch_cwd(), p));
+}
+
+/// os.path.basename
+fn ch_basename(p: str) -> str {
+    var i: i64 = str_len(p) - 1;
+    while i >= 0 {
+        if ch_is_sep(str_byte_at(p, i)) { return str_slice(p, i + 1, str_len(p)); }
+        i = i - 1;
+    }
+    if str_len(ch_drive(p)) == 2 { return str_slice(p, 2, str_len(p)); }
+    return p;
+}
+
+/// os.makedirs(p, exist_ok=True)
+fn ch_makedirs(p: str) -> bool {
+    if str_len(p) == 0 || fs_is_dir(p) { return true; }
+    var k: i64 = str_len(p) - 1;
+    while k >= 0 && ch_is_sep(str_byte_at(p, k)) { k = k - 1; }
+    while k >= 0 && !ch_is_sep(str_byte_at(p, k)) { k = k - 1; }
+    if k > 0 {
+        val parent: str = str_slice(p, 0, k);
+        if !(str_len(parent) == 2 && str_len(ch_drive(parent)) == 2) {
+            ch_makedirs(parent);
+        }
+    }
+    fs_mkdir(p);
+    return fs_is_dir(p);
+}
+
+/// os.environ.get(name, "")
+fn ch_env(name: str) -> str {
+    match env_var(name) {
+        Option::Some(v) => { return v; }
+        Option::None => { }
+    }
+    return "";
+}
+
+fn ch_has_env(name: str) -> bool {
+    match env_var(name) {
+        Option::Some(v) => { return true; }
+        Option::None => { }
+    }
+    return false;
+}
+
+// ─── argparse (options only, no positionals) ───
+
+struct ChOpt {
+    long: str,
+    short: str,
+    takes: bool,
+    kind: i64,
+}
+
+const CH_STR: i64 = 0;
+const CH_INT: i64 = 1;
+const CH_FLOAT: i64 = 2;
+const CH_FLAG: i64 = 3;
+const CH_HELP: i64 = 4;
+
+fn ch_opt(long: str, short: str, kind: i64) -> ChOpt {
+    return ChOpt { long: long, short: short, takes: kind == CH_STR || kind == CH_INT || kind == CH_FLOAT, kind: kind };
+}
+
+/// argparse's look of a negative number: -\d+ or -\d*\.\d+
+fn ch_negnum(a: str) -> bool {
+    if str_len(a) < 2 || str_byte_at(a, 0) != 45 { return false; }
+    var i: i64 = 1;
+    var dig: i64 = 0;
+    while i < str_len(a) && ch_digit(str_byte_at(a, i)) {
+        i = i + 1;
+        dig = dig + 1;
+    }
+    if i == str_len(a) { return dig > 0; }
+    if str_byte_at(a, i) != 46 { return false; }
+    i = i + 1;
+    var frac: i64 = 0;
+    while i < str_len(a) && ch_digit(str_byte_at(a, i)) {
+        i = i + 1;
+        frac = frac + 1;
+    }
+    return i == str_len(a) && frac > 0;
+}
+
+/// int(s) as Python reads it (whitespace, a sign, ASCII digits, "_"
+/// between digits).
+fn ch_is_int(s: str) -> bool {
+    val t: str = ch_strip(s);
+    var i: i64 = 0;
+    if i < str_len(t) && (str_byte_at(t, i) == 43 || str_byte_at(t, i) == 45) { i = i + 1; }
+    if i >= str_len(t) { return false; }
+    var prev_digit: bool = false;
+    while i < str_len(t) {
+        val c: i64 = str_byte_at(t, i);
+        if c == 95 {
+            if !prev_digit || i + 1 >= str_len(t) || !ch_digit(str_byte_at(t, i + 1)) { return false; }
+            prev_digit = false;
+        } else if !ch_digit(c) {
+            return false;
+        } else {
+            prev_digit = true;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn ch_int(s: str) -> i64 {
+    var t: str = str_replace(ch_strip(s), "_", "");
+    if str_starts_with(t, "+") { t = str_slice(t, 1, str_len(t)); }
+    return str_parse_int(t);
+}
+
+/// float(s): a decimal with an optional exponent, inf, infinity or nan.
+fn ch_is_float(s: str) -> bool {
+    val t: str = str_to_lower(ch_strip(s));
+    var i: i64 = 0;
+    if i < str_len(t) && (str_byte_at(t, i) == 43 || str_byte_at(t, i) == 45) { i = i + 1; }
+    val rest: str = str_slice(t, i, str_len(t));
+    if rest == "inf" || rest == "infinity" || rest == "nan" { return true; }
+    var digs: i64 = 0;
+    while i < str_len(t) && ch_digit(str_byte_at(t, i)) {
+        i = i + 1;
+        digs = digs + 1;
+    }
+    if i < str_len(t) && str_byte_at(t, i) == 46 {
+        i = i + 1;
+        while i < str_len(t) && ch_digit(str_byte_at(t, i)) {
+            i = i + 1;
+            digs = digs + 1;
+        }
+    }
+    if digs == 0 { return false; }
+    if i < str_len(t) && str_byte_at(t, i) == 101 {
+        i = i + 1;
+        if i < str_len(t) && (str_byte_at(t, i) == 43 || str_byte_at(t, i) == 45) { i = i + 1; }
+        var ed: i64 = 0;
+        while i < str_len(t) && ch_digit(str_byte_at(t, i)) {
+            i = i + 1;
+            ed = ed + 1;
+        }
+        if ed == 0 { return false; }
+    }
+    return i == str_len(t);
+}
+
+fn ch_float(s: str) -> f64 {
+    val t: str = str_to_lower(ch_strip(s));
+    if str_contains(t, "inf") {
+        if str_starts_with(t, "-") { return 0.0 - 1.0e308 * 10.0; }
+        return 1.0e308 * 10.0;
+    }
+    if str_contains(t, "nan") {
+        val z: f64 = 0.0;
+        return z / z;
+    }
+    return str_parse_float(t);
+}
+
+/// -1 none, -2 ambiguous (msg set), else the option's index.
+fn ch_find_opt(opts: Vec<ChOpt>, a: str, msg: &mut str, explicit: &mut str, has_explicit: &mut bool) -> i64 {
+    *has_explicit = false;
+    *explicit = "";
+    var i: i64 = 0;
+    while i < opts.len() {
+        if opts.get(i).long == a || (str_len(opts.get(i).short) > 0 && opts.get(i).short == a) { return i; }
+        i = i + 1;
+    }
+    if str_len(a) < 2 || str_byte_at(a, 0) != 45 { return -1; }
+    val eq: i64 = str_find(a, "=");
+    if eq > 0 {
+        val name: str = str_slice(a, 0, eq);
+        i = 0;
+        while i < opts.len() {
+            if opts.get(i).long == name || (str_len(opts.get(i).short) > 0 && opts.get(i).short == name) {
+                *explicit = str_slice(a, eq + 1, str_len(a));
+                *has_explicit = true;
+                return i;
+            }
+            i = i + 1;
+        }
+    }
+    if str_starts_with(a, "--") {
+        var prefix: str = a;
+        if eq > 0 { prefix = str_slice(a, 0, eq); }
+        var hits: Vec<i64> = Vec::new();
+        i = 0;
+        while i < opts.len() {
+            if str_len(opts.get(i).long) > 0 && str_starts_with(opts.get(i).long, prefix) { hits.push(i); }
+            i = i + 1;
+        }
+        if hits.len() > 1 {
+            var names: str = "";
+            var k: i64 = 0;
+            while k < hits.len() {
+                if k > 0 { names = names + ", "; }
+                names = names + opts.get(hits.get(k)).long;
+                k = k + 1;
+            }
+            *msg = "ambiguous option: " + a + " could match " + names;
+            return -2;
+        }
+        if hits.len() == 1 {
+            if eq > 0 {
+                *explicit = str_slice(a, eq + 1, str_len(a));
+                *has_explicit = true;
+            }
+            return hits.get(0);
+        }
+        return -1;
+    }
+    // a short option with its value glued on (-n4)
+    val two: str = str_slice(a, 0, 2);
+    i = 0;
+    while i < opts.len() {
+        if str_len(opts.get(i).short) > 0 && opts.get(i).short == two && opts.get(i).takes {
+            *explicit = str_slice(a, 2, str_len(a));
+            *has_explicit = true;
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// ap.error(msg): the usage and "<prog>: error: msg" on stderr; 2.
+fn ch_ap_error(msg: str) -> i64 {
+    io_eprint(ch_usage());
+    io_eprintln(CH_PROG + ": error: " + msg);
+    return 2;
+}
+
+struct ChArgs {
+    vals: Vec<str>,
+    given: Vec<bool>,
+    code: i64,
+}
+
+/// ap.parse_args(): code -1 when the options are good (vals/given hold
+/// them), else the exit status (help printed: 0; an error: 2).
+fn ch_parse(argv: Vec<str>, opts: Vec<ChOpt>) -> ChArgs {
+    var vals: Vec<str> = Vec::new();
+    var given: Vec<bool> = Vec::new();
+    var i: i64 = 0;
+    while i < opts.len() {
+        vals.push("");
+        given.push(false);
+        i = i + 1;
+    }
+    var kinds: Vec<i64> = Vec::new();
+    var idx: Vec<i64> = Vec::new();
+    var expl: Vec<str> = Vec::new();
+    var hexp: Vec<bool> = Vec::new();
+    var dashdash: bool = false;
+    i = 0;
+    while i < argv.len() {
+        val a: str = argv.get(i);
+        i = i + 1;
+        var msg: str = "";
+        var ex: str = "";
+        var he: bool = false;
+        if dashdash || a == "-" || !str_starts_with(a, "-") {
+            kinds.push(0);
+            idx.push(-1);
+            expl.push("");
+            hexp.push(false);
+            continue;
+        }
+        if a == "--" {
+            dashdash = true;
+            kinds.push(2);
+            idx.push(-1);
+            expl.push("");
+            hexp.push(false);
+            continue;
+        }
+        val f: i64 = ch_find_opt(opts, a, &mut msg, &mut ex, &mut he);
+        if f == -2 {
+            return ChArgs { vals: vals, given: given, code: ch_ap_error(msg) };
+        }
+        if f < 0 && (ch_negnum(a) || str_contains(a, " ")) {
+            kinds.push(0);
+        } else {
+            kinds.push(1);
+        }
+        idx.push(f);
+        expl.push(ex);
+        hexp.push(he);
+    }
+    var extras: Vec<str> = Vec::new();
+    i = 0;
+    while i < argv.len() {
+        val a2: str = argv.get(i);
+        val kd: i64 = kinds.get(i);
+        val f2: i64 = idx.get(i);
+        i = i + 1;
+        if kd == 2 { continue; }
+        if kd == 0 || f2 < 0 {
+            extras.push(a2);
+            continue;
+        }
+        val o: ChOpt = opts.get(f2);
+        var name: str = o.long;
+        if str_len(o.long) == 0 { name = o.short; } else if str_len(o.short) > 0 { name = o.short + "/" + o.long; }
+        if o.kind == CH_HELP {
+            io_print(ch_help());
+            return ChArgs { vals: vals, given: given, code: 0 };
+        }
+        if !o.takes {
+            if hexp.get(i - 1) {
+                return ChArgs { vals: vals, given: given,
+                    code: ch_ap_error("argument " + name + ": ignored explicit argument " + ch_repr(expl.get(i - 1))) };
+            }
+            given.set(f2, true);
+            vals.set(f2, "1");
+            continue;
+        }
+        var v: str = "";
+        if hexp.get(i - 1) {
+            v = expl.get(i - 1);
+        } else {
+            if i >= argv.len() || kinds.get(i) != 0 {
+                return ChArgs { vals: vals, given: given, code: ch_ap_error("argument " + name + ": expected one argument") };
+            }
+            v = argv.get(i);
+            i = i + 1;
+        }
+        if o.kind == CH_INT && !ch_is_int(v) {
+            return ChArgs { vals: vals, given: given, code: ch_ap_error("argument " + name + ": invalid int value: " + ch_repr(v)) };
+        }
+        if o.kind == CH_FLOAT && !ch_is_float(v) {
+            return ChArgs { vals: vals, given: given, code: ch_ap_error("argument " + name + ": invalid float value: " + ch_repr(v)) };
+        }
+        given.set(f2, true);
+        vals.set(f2, v);
+    }
+    if extras.len() > 0 {
+        var s: str = "";
+        var k: i64 = 0;
+        while k < extras.len() {
+            if k > 0 { s = s + " "; }
+            s = s + extras.get(k);
+            k = k + 1;
+        }
+        return ChArgs { vals: vals, given: given, code: ch_ap_error("unrecognized arguments: " + s) };
+    }
+    return ChArgs { vals: vals, given: given, code: -1 };
+}
+
+fn ch_val(a: &ChArgs, i: i64, def: str) -> str {
+    if a.given.get(i) { return a.vals.get(i); }
+    return def;
+}
+
+fn ch_flag(a: &ChArgs, i: i64) -> bool {
+    return a.given.get(i);
+}
+
+// ─── Running programs ───
+
+fn ch_join_list(v: Vec<str>) -> str {
+    val sep: str = char_to_str(31);
+    var s: str = "";
+    var i: i64 = 0;
+    while i < v.len() {
+        if i > 0 { s = s + sep; }
+        s = s + v.get(i);
+        i = i + 1;
+    }
+    return s;
+}
+
+/// What ch_run gives: the exit status (Python's: a crash on Windows as the
+/// unsigned code), timed_out when it was killed at the time limit,
+/// started false when it could not start; stdout and stderr decoded as
+/// UTF-8 with replacement; the seconds it took.
+struct ChRes {
+    started: bool,
+    timed_out: bool,
+    code: i64,
+    out: str,
+    err: str,
+    secs: f64,
+}
+
+var ch_run_ctr: i64 = 0;
+
+/// When set, ch_run decodes as subprocess.run(..., text=True) does: the
+/// locale's encoding (Windows: the ANSI code page, whose bytes are kept as
+/// they are; elsewhere UTF-8) and universal newlines.
+var ch_locale_mode: bool = false;
+
+/// Text a child wrote, as text=True gives it and print() writes it back:
+/// CR LF and a lone CR as LF; on Windows every other byte as it is
+/// (the code page's characters print as the same bytes) but NUL, which a
+/// str cannot hold (Python prints it); elsewhere UTF-8 with replacement.
+fn ch_locale(b: Vec<i64>) -> str {
+    var nl: Vec<i64> = Vec::new();
+    val n: i64 = b.len();
+    var i: i64 = 0;
+    while i < n {
+        val c: i64 = b.get(i);
+        if c == 13 {
+            nl.push(10);
+            if i + 1 < n && b.get(i + 1) == 10 { i = i + 1; }
+        } else {
+            nl.push(c);
+        }
+        i = i + 1;
+    }
+    return ch_raw(nl);
+}
+
+/// Bytes a child wrote, decoded as the locale's encoding (no newline
+/// translation): see ch_locale.
+fn ch_raw(b: Vec<i64>) -> str {
+    if !ch_win() { return ch_decode(b); }
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < b.len() {
+        if b.get(i) != 0 { out.push(b.get(i)); }
+        i = i + 1;
+    }
+    return str_from_bytes(out);
+}
+
+/// s[-n:] of text ch_locale or ch_raw made (Windows: one byte is one
+/// character of the code page).
+fn ch_ltail(s: str, n: i64) -> str {
+    if !ch_win() { return ch_tail(s, n); }
+    if str_len(s) <= n { return s; }
+    return str_slice(s, str_len(s) - n, str_len(s));
+}
+var ch_tmp: str = "";
+
+fn ch_tmpdir() -> str {
+    if str_len(ch_tmp) > 0 { return ch_tmp; }
+    var t: str = ch_env("TMPDIR");
+    if str_len(t) == 0 { t = ch_env("TEMP"); }
+    if str_len(t) == 0 { t = ch_env("TMP"); }
+    if str_len(t) == 0 {
+        if ch_win() { t = "."; } else { t = "/tmp"; }
+    }
+    ch_tmp = t;
+    return t;
+}
+
+/// A fresh temporary file name (nothing made).
+fn ch_tmpname(tag: str) -> str {
+    ch_run_ctr = ch_run_ctr + 1;
+    return ch_join(ch_tmpdir(), ".fid-" + tag + "-" + int_to_str(p_getpid()) + "-" + int_to_str(ch_run_ctr));
+}
+
+/// A child's exit code as Python's subprocess gives it: on Windows the
+/// unsigned 32-bit value; elsewhere a signal n (128 + n here) as -n when
+/// `signals` (a direct child, not a shell's status).
+fn ch_code(c: i64, signals: bool) -> i64 {
+    var code: i64 = c;
+    if ch_win() {
+        if code < 0 { code = code + 4294967296; }
+    } else if signals && code > 128 && code < 128 + 65 {
+        code = 128 - code;
+    }
+    return code;
+}
+
+/// subprocess.run(cmd, capture_output=True, timeout=...): stdin ours,
+/// stdout and stderr captured; `env` "NAME=value" entries added to ours;
+/// timeout_ms < 0: no limit.
+fn ch_run(cmd: Vec<str>, env: Vec<str>, timeout_ms: i64, signals: bool) -> ChRes {
+    val t0: i64 = p_clock_now_ms();
+    val base: str = ch_tmpname("run");
+    val outp: str = base + ".out";
+    val errp: str = base + ".err";
+    val h: i64 = process_spawn_files(cmd, env, "", outp, errp);
+    if h == 0 {
+        if fs_exists(outp) { fs_delete(outp); }
+        if fs_exists(errp) { fs_delete(errp); }
+        return ChRes { started: false, timed_out: false, code: -1, out: "", err: "", secs: 0.0 };
+    }
+    var timed_out: bool = false;
+    var code: i64 = -1;
+    match process_wait(h, timeout_ms) {
+        Option::Some(c) => {
+            code = ch_code(c, signals);
+        }
+        Option::None => {
+            timed_out = true;
+            process_kill(h);
+            process_wait(h, 10000);
+        }
+    }
+    process_release(h);
+    var out: str = "";
+    var err: str = "";
+    if !timed_out {
+        if ch_locale_mode {
+            out = ch_locale(fs_read_bytes(outp));
+            err = ch_locale(fs_read_bytes(errp));
+        } else {
+            out = ch_decode(fs_read_bytes(outp));
+            err = ch_decode(fs_read_bytes(errp));
+        }
+    }
+    if fs_exists(outp) { fs_delete(outp); }
+    if fs_exists(errp) { fs_delete(errp); }
+    val secs: f64 = ((p_clock_now_ms() - t0) as f64) / 1000.0;
+    return ChRes { started: true, timed_out: timed_out, code: code, out: out, err: err, secs: secs };
+}
+
+// SAFETY: FormatMessageA, declared by <windows.h>, which every generated
+// C file includes on Windows (`<stdint.h>` only makes the C backend use
+// the system's prototype); `buf` is a block of `size` bytes this file
+// allocated. Only the @cfg(windows) ch_winerr calls it.
+extern "C" include "<stdint.h>" {
+    fn FormatMessageA as ch_fmtmsg(flags: i64, src: i64, id: i64, lang: i64, buf: i64, size: i64, args: i64) -> i64;
+}
+
+/// The system's text for Windows error `n`, as Python shows it (trailing
+/// whitespace and dots removed).
+@cfg(windows)
+fn ch_winerr(n: i64) -> str {
+    var msg: str = "";
+    // SAFETY: a fresh 1024-byte block; FormatMessageA writes at most 1023
+    // bytes and a NUL into it (FROM_SYSTEM | IGNORE_INSERTS: no inserts
+    // are read), and the text is copied out before the block is freed.
+    unsafe {
+        val buf: i64 = p_malloc(1024);
+        if buf != 0 {
+            if ch_fmtmsg(4096 | 512, 0, n, 0, buf, 1023, 0) > 0 {
+                msg = p_str_from_ptr(buf);
+            }
+            p_free(buf);
+        }
+    }
+    var e: i64 = str_len(msg);
+    while e > 0 && (ch_ws(str_byte_at(msg, e - 1)) || str_byte_at(msg, e - 1) == 46) { e = e - 1; }
+    return str_slice(msg, 0, e);
+}
+
+@cfg(unix)
+fn ch_winerr(n: i64) -> str {
+    return "";
+}
+
+/// What Python prints for a program it cannot start (the last line of
+/// its traceback).
+fn ch_not_found(prog: str) -> str {
+    if ch_win() { return "FileNotFoundError: [WinError 2] " + ch_winerr(2); }
+    return "FileNotFoundError: [Errno 2] No such file or directory: " + ch_repr(prog);
+}
+
+fn ch_clone_list(v: &Vec<str>) -> Vec<str> {
+    var r: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < v.len() {
+        r.push(v.get(i));
+        i = i + 1;
+    }
+    return r;
+}
+
+/// Python's text mode on a captured stream: "\r\n" as "\n".
+fn ch_text(s: str) -> str {
+    return str_replace(s, "\r\n", "\n");
+}
+
+// ─── Sockets (the test servers) ───
+
+fn ch_block(n: i64) -> i64 {
+    var b: i64 = 0;
+    // SAFETY: p_malloc only allocates a fresh n-byte block; it is zeroed
+    // below before anything reads it.
+    unsafe {
+        b = p_malloc(n);
+    }
+    var i: i64 = 0;
+    while b != 0 && i < n {
+        ch_put(b, i, 0);
+        i = i + 1;
+    }
+    return b;
+}
+
+fn ch_put(buf: i64, off: i64, v: i64) {
+    var p: *mut u8 = (buf + off) as *mut u8;
+    // SAFETY: every caller passes an offset inside a block it allocated
+    // with ch_block at a size covering it.
+    unsafe {
+        *p = (v & 255) as u8;
+    }
+}
+
+fn ch_get(buf: i64, off: i64) -> i64 {
+    var p: *mut u8 = (buf + off) as *mut u8;
+    var b: i64 = 0;
+    // SAFETY: as ch_put: inside a block the caller allocated.
+    unsafe {
+        b = (*p) as i64;
+    }
+    return b & 255;
+}
+
+fn ch_free(b: i64) {
+    // SAFETY: a block ch_block allocated, freed once.
+    unsafe {
+        p_free(b);
+    }
+}
+
+/// sockaddr_in for 127.0.0.1, port 0 (16 bytes; family as on Windows and
+/// Linux, a little-endian u16; macOS has a length byte first).
+fn ch_addr() -> i64 {
+    val sa: i64 = ch_block(16);
+    if ch_len_byte() {
+        ch_put(sa, 0, 16);
+        ch_put(sa, 1, 2);
+    } else {
+        ch_put(sa, 0, 2);
+    }
+    ch_put(sa, 4, 127);
+    ch_put(sa, 7, 1);
+    return sa;
+}
+
+@cfg(windows)
+fn ch_len_byte() -> bool {
+    return false;
+}
+
+@cfg(linux)
+fn ch_len_byte() -> bool {
+    return false;
+}
+
+@cfg(macos)
+fn ch_len_byte() -> bool {
+    return true;
+}
+
+/// A socket listening on 127.0.0.1 at a free port; `port` gets the port.
+@cfg(windows)
+fn ch_listen(port: &mut i64) -> i64 {
+    val wsa: i64 = ch_block(1024);
+    val sa: i64 = ch_addr();
+    val ln: i64 = ch_block(8);
+    ch_put(ln, 0, 16);
+    var s: i64 = -1;
+    // SAFETY: wsa is a 1024-byte block (WSADATA is smaller); sa the
+    // 16-byte sockaddr_in and ln its length, both blocks of this function.
+    unsafe {
+        chw_startup(514, wsa);
+        s = chw_socket(2, 1, 6);
+        if chw_bind(s, sa, 16) != 0 || chw_listen(s, 8) != 0 { s = -1; }
+        if s != -1 { chw_getsockname(s, sa, ln); }
+    }
+    *port = ch_get(sa, 2) * 256 + ch_get(sa, 3);
+    ch_free(wsa);
+    ch_free(sa);
+    ch_free(ln);
+    return s;
+}
+
+@cfg(unix)
+fn ch_listen(port: &mut i64) -> i64 {
+    val sa: i64 = ch_addr();
+    val ln: i64 = ch_block(8);
+    ch_put(ln, 0, 16);
+    var s: i64 = -1;
+    // SAFETY: sa is the 16-byte sockaddr_in and ln its length, both
+    // blocks of this function.
+    unsafe {
+        s = chu_socket(2, 1, 6) as i64;
+        if chu_bind(s, sa, 16) != 0 || chu_listen(s, 8) != 0 { s = -1; }
+        if s != -1 { chu_getsockname(s, sa, ln); }
+    }
+    *port = ch_get(sa, 2) * 256 + ch_get(sa, 3);
+    ch_free(sa);
+    ch_free(ln);
+    return s;
+}
+
+@cfg(windows)
+fn ch_accept(s: i64) -> i64 {
+    // SAFETY: no address is asked for (two null pointers).
+    unsafe {
+        return chw_accept(s, 0, 0);
+    }
+}
+
+@cfg(unix)
+fn ch_accept(s: i64) -> i64 {
+    // SAFETY: no address is asked for (two null pointers).
+    unsafe {
+        return chu_accept(s, 0, 0) as i64;
+    }
+}
+
+@cfg(windows)
+fn ch_sclose(s: i64) {
+    // SAFETY: a socket this process opened, closed once.
+    unsafe {
+        chw_close(s);
+    }
+}
+
+@cfg(unix)
+fn ch_sclose(s: i64) {
+    // SAFETY: a socket this process opened, closed once.
+    unsafe {
+        chu_close(s);
+    }
+}
+
+/// SO_LINGER on, 0 seconds: the close sends a reset.
+@cfg(windows)
+fn ch_linger0(s: i64) {
+    // struct linger is two u_shorts on Windows
+    val b: i64 = ch_block(8);
+    ch_put(b, 0, 1);
+    // SAFETY: setsockopt reads the 4 bytes of b (an 8-byte block).
+    unsafe {
+        chw_setsockopt(s, 65535, 128, b, 4);
+    }
+    ch_free(b);
+}
+
+@cfg(linux)
+fn ch_linger0(s: i64) {
+    val b: i64 = ch_block(8);
+    ch_put(b, 0, 1);
+    // SAFETY: setsockopt reads the 8 bytes of b (two ints).
+    unsafe {
+        chu_setsockopt(s, 1, 13, b, 8);
+    }
+    ch_free(b);
+}
+
+@cfg(macos)
+fn ch_linger0(s: i64) {
+    val b: i64 = ch_block(8);
+    ch_put(b, 0, 1);
+    // SAFETY: setsockopt reads the 8 bytes of b (two ints).
+    unsafe {
+        chu_setsockopt(s, 65535, 128, b, 8);
+    }
+    ch_free(b);
+}
+
+@cfg(windows)
+fn ch_recv(s: i64, buf: i64, n: i64) -> i64 {
+    // SAFETY: buf is a block of at least n bytes.
+    unsafe {
+        return chw_recv(s, buf, n, 0) as i64;
+    }
+}
+
+@cfg(unix)
+fn ch_recv(s: i64, buf: i64, n: i64) -> i64 {
+    // SAFETY: buf is a block of at least n bytes.
+    unsafe {
+        return chu_recv(s, buf, n, 0);
+    }
+}
+
+@cfg(windows)
+fn ch_send(s: i64, text: str) -> i64 {
+    // SAFETY: text is a str of str_len(text) bytes held by the caller.
+    unsafe {
+        return chw_send(s, text as i64, str_len(text), 0) as i64;
+    }
+}
+
+@cfg(unix)
+fn ch_send(s: i64, text: str) -> i64 {
+    // SAFETY: text is a str of str_len(text) bytes held by the caller.
+    // MSG_NOSIGNAL (Linux 0x4000) is not passed: the script's sendall
+    // raises on a closed peer, and the server ignores that.
+    unsafe {
+        return chu_send(s, text as i64, str_len(text), 0);
+    }
+}
+
+/// The hidden `--ch-serve <kind>` mode: the script's server(kind) thread.
+fn ch_serve(kind: str) -> i64 {
+    var port: i64 = 0;
+    val s: i64 = ch_listen(&mut port);
+    if s == -1 {
+        io_eprintln("chaos: cannot listen on 127.0.0.1");
+        return 1;
+    }
+    println(int_to_str(port));
+    io_flush();
+    var held: Vec<i64> = Vec::new();
+    val buf: i64 = ch_block(4096);
+    while true {
+        val c: i64 = ch_accept(s);
+        if c == -1 { break; }
+        if kind == "close" {
+            ch_sclose(c);
+        } else if kind == "reset" {
+            ch_linger0(c);
+            ch_sclose(c);
+        } else if kind == "half" {
+            if ch_recv(c, buf, 4096) >= 0 {
+                ch_send(c, "HTTP/1.1 200 OK\r\nContent-Len");
+            }
+            ch_sclose(c);
+        } else {
+            // silent: never answer, never close
+            held.push(c);
+        }
+    }
+    return 0;
+}
+
+struct ChServer {
+    h: i64,
+    port: i64,
+}
+
+/// server(kind): a child serving `kind`; port -1 when it did not start.
+fn ch_server(kind: str) -> ChServer {
+    var cmd: Vec<str> = Vec::new();
+    cmd.push(ch_self);
+    cmd.push("--ch-serve");
+    cmd.push(kind);
+    val h: i64 = process_spawn_io(cmd, Vec::new(), "", PROC_PIPE_STDOUT);
+    if h == 0 { return ChServer { h: 0, port: -1 }; }
+    var got: str = "";
+    while !str_contains(got, "\n") {
+        match process_read(h, PROC_STDOUT) {
+            Option::Some(t) => { got = got + t; }
+            Option::None => { break; }
+        }
+    }
+    val line: str = ch_strip(got);
+    if !ch_is_int(line) { return ChServer { h: h, port: -1 }; }
+    return ChServer { h: h, port: ch_int(line) };
+}
+
+fn ch_server_stop(sv: &ChServer) {
+    if sv.h == 0 { return; }
+    process_kill(sv.h);
+    process_wait(sv.h, 10000);
+    process_release(sv.h);
+}
+
+var ch_self: str = "";
+
+// ─── Running the driver ───
+
+/// What run() gives: rc ("timeout" or the exit status as Python gives
+/// it), stdout, stderr, seconds.
+struct ChRun {
+    timeout: bool,
+    rc: i64,
+    out: str,
+    err: str,
+    dt: f64,
+}
+
+/// run(cmd, timeout): `signals` when cmd is the driver itself (a signal
+/// is -n as Python reports it), not a shell or wsl giving its status.
+fn ch_go(cmd: Vec<str>, timeout_s: i64, signals: bool) -> ChRun {
+    val r: ChRes = ch_run_cmd(cmd, timeout_s, signals);
+    return ChRun { timeout: r.timed_out, rc: r.code, out: r.out, err: r.err, dt: r.secs };
+}
+
+var ch_env: Vec<str> = Vec::new();
+
+fn ch_run_cmd(cmd: Vec<str>, timeout_s: i64, signals: bool) -> ChRes {
+    val r: ChRes = ch_run(cmd.clone(), ch_clone_list(&ch_env), timeout_s * 1000, signals);
+    if !r.started {
+        io_eprintln(ch_not_found(cmd.get(0)));
+        p_exit(1);
+    }
+    return r;
+}
+
+fn ch_rcs(r: &ChRun) -> str {
+    if r.timeout { return "timeout"; }
+    return int_to_str(r.rc);
+}
+
+/// `rc if isinstance(rc, str) else hex(rc & 0xFFFFFFFF)`
+fn ch_rchex(r: &ChRun) -> str {
+    if r.timeout { return "timeout"; }
+    return ch_hex(r.rc & 4294967295);
+}
+
+// ─── Judging ───
+
+var ch_strict: bool = false;
+var ch_backend: str = "";
+
+/// The open findings (docs/verification/miscompile-log.md, "Runtime
+/// under failure") by scenario name, as the script's KNOWN.
+fn ch_known_of(key: str) -> str {
+    if key == "silent server" { return "C1"; }
+    if key == "partition mid-answer, no timeout" { return "C1"; }
+    if key == "linux full disk (ulimit -f)" { return "C4"; }
+    if key == "linux out of memory (ulimit -v)" { return "C5"; }
+    if key == "connect into a partition, blocking" { return "C7"; }
+    if key == "emit argument past the last" { return "C8"; }
+    val cases: Vec<str> = ch_split("timeout token cosleep", " ");
+    val jumps: Vec<str> = ch_split("realtime +1h|realtime -1h", "|");
+    var i: i64 = 0;
+    while i < cases.len() {
+        var j: i64 = 0;
+        while j < jumps.len() {
+            if key == "clock " + cases.get(i) + " (" + jumps.get(j) + ")" { return "C6"; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+struct ChLine {
+    ok: bool,
+    line: str,
+}
+
+/// report(name, ok, why, dt)
+fn ch_report(name: str, ok: bool, why0: str, dt: f64) -> ChLine {
+    var known: str = ch_known_of(ch_backend + " " + name);
+    if str_len(known) == 0 { known = ch_known_of(name); }
+    var tag: str = "FAIL";
+    if ok {
+        tag = "PASS";
+    } else if str_len(known) > 0 {
+        tag = "OPEN " + known;
+    }
+    var why: str = why0;
+    if ok && str_len(known) > 0 {
+        why = why + " (" + known + " looks fixed: update docs/verification/miscompile-log.md)";
+    }
+    val line: str = ch_ljust(tag, 8) + "  " + ch_ljust(name, 44) + " " + ch_rjust(ch_fixed(dt, 1), 5) + " s  " + why;
+    println(line);
+    io_flush();
+    return ChLine { ok: ok || (str_len(known) > 0 && !ch_strict), line: line };
+}
+
+fn ch_has_crash(s: str) -> bool {
+    return str_contains(s, "Access violation") || str_contains(s, "=== CRASH") || str_contains(s, "Segmentation fault");
+}
+
+/// judge(name, res, expect) with expect's verdict and text already made.
+fn ch_judge(name: str, r: &ChRun, ok0: bool, why0: str) -> ChLine {
+    var crashed: bool = ch_has_crash(r.out + r.err);
+    if !crashed && !r.timeout && (r.rc == 139 || r.rc == 134 || r.rc > 255 || r.rc < 0)
+            && !str_contains(r.err, "Stack overflow") && !str_contains(r.err, "OOM")
+            && !str_contains(str_to_lower(r.err), "out of memory") {
+        crashed = true;
+    }
+    var ok: bool = ok0;
+    var why: str = why0;
+    if r.timeout {
+        ok = false;
+        why = "hung (killed at the time limit)";
+    } else if crashed && !ok {
+        why = "crashed (exit " + ch_rchex(r) + ")";
+    }
+    return ch_report(name, ok, why, r.dt);
+}
+
+fn ch_args(exe: str, a: str, b: str, c: str) -> Vec<str> {
+    var v: Vec<str> = Vec::new();
+    v.push(exe);
+    if str_len(a) > 0 { v.push(a); }
+    if str_len(b) > 0 { v.push(b); }
+    if str_len(c) > 0 { v.push(c); }
+    return v;
+}
+
+/// The "reader goes away" scenario: the driver prints a million lines,
+/// its stdout (a pipe) is closed after the first; it must end within 30 s
+/// without a crash message on stderr.
+fn ch_reader_goes_away(exe: str) -> ChRun {
+    val t0: i64 = p_clock_now_ms();
+    val errp: str = ch_tmpname("reader") + ".err";
+    val argv: str = ch_join_list(ch_args(exe, "print", "1000000", "-"));
+    val envl: str = ch_join_list(ch_clone_list(&ch_env));
+    val files: str = char_to_str(31) + errp;
+    val dir: str = "";
+    var h: i64 = 0;
+    // SAFETY: argv, envl, dir and files are NUL-terminated strings held by
+    // locals until the call returns; the runtime copies what the child
+    // needs. io 2: the child's stdout is a pipe, its stderr the file errp.
+    unsafe {
+        h = fid_proc_spawn_io(argv as i64, envl as i64, dir as i64, files as i64, 2);
+    }
+    if h == 0 {
+        io_eprintln(ch_not_found(exe));
+        p_exit(1);
+    }
+    // p.stdout.readline()
+    var got: str = "";
+    while !str_contains(got, "\n") {
+        match process_read(h, PROC_STDOUT) {
+            Option::Some(t) => { got = got + t; }
+            Option::None => { break; }
+        }
+    }
+    val pid: i64 = process_child_pid(h);
+    var timed_out: bool = false;
+    var code: i64 = 0;
+    // p.stdout.close() (forgetting the child closes its pipe), then
+    // p.wait(30): the child is waited for by its process id
+    val ph: i64 = ch_proc_open(pid);
+    process_release(h);
+    code = ch_proc_wait(ph, pid, 30000, &mut timed_out);
+    var err: str = "";
+    if !timed_out { err = ch_decode(fs_read_bytes(errp)); }
+    if fs_exists(errp) { fs_delete(errp); }
+    val dt: f64 = ((p_clock_now_ms() - t0) as f64) / 1000.0;
+    return ChRun { timeout: timed_out, rc: code, out: "", err: err, dt: dt };
+}
+
+/// A handle that keeps child `pid` waitable after its runtime record is
+/// gone (Windows; 0 elsewhere).
+@cfg(windows)
+fn ch_proc_open(pid: i64) -> i64 {
+    // SAFETY: OpenProcess takes integers: SYNCHRONIZE |
+    // PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE.
+    unsafe {
+        return chw_open_process(1048576 | 4096 | 1, 0, pid);
+    }
+}
+
+@cfg(unix)
+fn ch_proc_open(pid: i64) -> i64 {
+    return 0;
+}
+
+/// p.wait(ms): the exit status (Python's: unsigned on Windows, -n for a
+/// signal), or `timed_out` and the child killed.
+@cfg(windows)
+fn ch_proc_wait(ph: i64, pid: i64, ms: i64, timed_out: &mut bool) -> i64 {
+    *timed_out = false;
+    if ph == 0 { return -1; }
+    var code: i64 = -1;
+    // SAFETY: ph is the handle ch_proc_open returned, closed here once; the
+    // exit code goes into an 8-byte block of this function.
+    unsafe {
+        if chw_wait(ph, ms) != 0 {
+            chw_terminate(ph, 1);
+            chw_wait(ph, 10000);
+            *timed_out = true;
+        }
+        val b: i64 = ch_block(8);
+        if chw_exit_code(ph, b) != 0 {
+            code = ch_get(b, 0) | (ch_get(b, 1) << 8) | (ch_get(b, 2) << 16) | (ch_get(b, 3) << 24);
+        }
+        ch_free(b);
+        chw_close_handle(ph);
+    }
+    return code;
+}
+
+@cfg(unix)
+fn ch_proc_wait(ph: i64, pid: i64, ms: i64, timed_out: &mut bool) -> i64 {
+    *timed_out = false;
+    val st: i64 = ch_block(8);
+    val t0: i64 = p_clock_now_ms();
+    var r: i64 = 0;
+    // SAFETY: waitpid writes the int status into st (an 8-byte block);
+    // kill takes integers.
+    unsafe {
+        r = chu_waitpid(pid, st, 1) as i64;
+        while r == 0 && p_clock_now_ms() - t0 < ms {
+            task_sleep(10);
+            r = chu_waitpid(pid, st, 1) as i64;
+        }
+        if r == 0 {
+            chu_kill(pid, 9);
+            chu_waitpid(pid, st, 0);
+            *timed_out = true;
+        }
+    }
+    val s: i64 = ch_get(st, 0) | (ch_get(st, 1) << 8);
+    ch_free(st);
+    if (s & 127) == 0 { return (s >> 8) & 255; }
+    return 0 - (s & 127);
+}
+
+fn ch_first_line(s: str) -> str {
+    val ls: Vec<str> = ch_splitlines(s);
+    if ls.len() == 0 { return ""; }
+    return ls.get(0);
+}
+
+fn ch_last_line(s: str) -> str {
+    val ls: Vec<str> = ch_splitlines(s);
+    if ls.len() == 0 { return ""; }
+    return ls.get(ls.len() - 1);
+}
+
+fn ch_host_scenarios(exe: str, work: str) -> Vec<ChLine> {
+    var results: Vec<ChLine> = Vec::new();
+    val kinds: Vec<str> = ch_split("close reset half silent", " ");
+    val labels: Vec<str> = ch_split("dropped connection|reset connection|half a response|silent server", "|");
+    var k: i64 = 0;
+    while k < kinds.len() {
+        val kind: str = kinds.get(k);
+        val sv: ChServer = ch_server(kind);
+        val r: ChRun = ch_go(ch_args(exe, "http", int_to_str(sv.port), "/"), 60, true);
+        ch_server_stop(&sv);
+        if kind == "half" {
+            results.push(ch_judge(labels.get(k), &r, !r.timeout && r.rc == 0 && str_contains(r.out, "body"),
+                "ended: " + ch_repr(ch_head(ch_strip(r.out), 60))));
+        } else {
+            var why: str = "status 0 (transport failure) reported";
+            if !str_contains(r.out, "status 0") {
+                why = "exit " + ch_rcs(&r) + ", " + ch_repr(ch_head(ch_strip(r.out), 60)) + " " + ch_repr(ch_head(ch_strip(r.err), 80));
+            }
+            results.push(ch_judge(labels.get(k), &r, !r.timeout && r.rc == 0 && str_contains(r.out, "status 0"), why));
+        }
+        k = k + 1;
+    }
+    // reader goes away
+    val rg: ChRun = ch_reader_goes_away(exe);
+    results.push(ch_judge("reader goes away", &rg, !rg.timeout && !ch_has_crash(rg.err), "ended (exit " + ch_rcs(&rg) + ")"));
+    val missing: str = ch_join(work, "no-such-file.txt");
+    val r1: ChRun = ch_go(ch_args(exe, "read", missing, "-"), 30, true);
+    results.push(ch_judge("missing file", &r1, !r1.timeout && r1.rc == 0 && ch_strip(r1.out) == "none", ch_repr(ch_strip(r1.out))));
+    val r2: ChRun = ch_go(ch_args(exe, "read", work, "-"), 30, true);
+    results.push(ch_judge("directory as a file", &r2, !r2.timeout && r2.rc == 0 && ch_strip(r2.out) == "none",
+        ch_repr(ch_strip(r2.out)) + " exit " + ch_rcs(&r2)));
+    val r3: ChRun = ch_go(ch_args(exe, "print", "2", ""), 30, true);
+    results.push(ch_judge("argument past the last", &r3, !r3.timeout && r3.rc == 0 && str_replace(r3.out, "\r", "") == "line 0\nline 1\n",
+        ch_repr(ch_strip(r3.out)) + " exit " + ch_rcs(&r3) + " " + ch_repr(ch_head(ch_strip(r3.err), 70))));
+    val r4: ChRun = ch_go(ch_args(exe, "deep", "100000000", "-"), 120, true);
+    var first: str = "(no message)";
+    if str_len(ch_strip(r4.err)) > 0 { first = ch_head(ch_first_line(ch_strip(r4.err)), 70); }
+    val e4: str = r4.err;
+    results.push(ch_judge("stack exhaustion", &r4,
+        (r4.timeout || r4.rc != 0) && (str_contains(e4, "Stack overflow") || str_contains(str_to_lower(e4), "stack overflow") || str_contains(e4, "Recursion")),
+        "exit " + ch_rchex(&r4) + ": " + first));
+    return results;
+}
+
+// ─── Linux (WSL on Windows) ───
+
+fn ch_wsl_prefix() -> Vec<str> {
+    var v: Vec<str> = Vec::new();
+    if !ch_win() { return v; }
+    v.push("wsl");
+    v.push("-d");
+    var d: str = "kali-linux";
+    if ch_has_env("WSL_DISTRO") { d = ch_env("WSL_DISTRO"); }
+    v.push(d);
+    v.push("-e");
+    return v;
+}
+
+fn ch_to_wsl(p: str) -> str {
+    if !ch_win() { return p; }
+    val a: str = str_replace(ch_abspath(p), "\\", "/");
+    return "/mnt/" + str_to_lower(str_slice(a, 0, 1)) + str_slice(a, 2, str_len(a));
+}
+
+fn ch_cat(a: Vec<str>, b: Vec<str>) -> Vec<str> {
+    var v: Vec<str> = a.clone();
+    var i: i64 = 0;
+    while i < b.len() {
+        v.push(b.get(i));
+        i = i + 1;
+    }
+    return v;
+}
+
+fn ch_sh(cmd: str) -> Vec<str> {
+    var v: Vec<str> = Vec::new();
+    v.push("sh");
+    v.push("-c");
+    v.push(cmd);
+    return v;
+}
+
+fn ch_oom_panic(err: str) -> bool {
+    val ls: Vec<str> = ch_splitlines(err);
+    var i: i64 = 0;
+    while i < ls.len() {
+        val ln: str = ls.get(i);
+        if str_starts_with(ln, "Panic:") && (str_contains(str_to_lower(ln), "memory") || str_contains(ln, "OOM")) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn ch_linux_scenarios(lexe: str) -> Vec<ChLine> {
+    val pre: Vec<str> = ch_wsl_prefix();
+    var results: Vec<ChLine> = Vec::new();
+    val lx: str = ch_to_wsl(lexe);
+    val tmp: str = "/tmp/fides-chaos-full.bin";
+    // 2048 blocks of 512 bytes is 1 MiB; 200 chunks of 64 KiB do not fit
+    val c1: str = "rm -f " + tmp + "; trap '' XFSZ; ulimit -f 2048; '" + lx + "' write " + tmp + " 200; s=$?; rm -f " + tmp + "; exit $s";
+    val r1: ChRun = ch_go(ch_cat(pre.clone(), ch_sh(c1)), 120, false);
+    var last: str = "";
+    if str_len(ch_strip(r1.out)) > 0 { last = ch_head(ch_last_line(ch_strip(r1.out)), 60); }
+    results.push(ch_judge("full disk (ulimit -f)", &r1, !r1.timeout && r1.rc == 0 && str_contains(r1.out, "write-failed"),
+        ch_repr(last) + " exit " + ch_rcs(&r1) + " " + ch_repr(ch_head(ch_strip(r1.err), 80))));
+    val c2: str = "ulimit -v 400000; '" + lx + "' alloc - -";
+    val r2: ChRun = ch_go(ch_cat(pre.clone(), ch_sh(c2)), 180, false);
+    var msg: str = "(no message)";
+    if str_len(ch_strip(r2.err)) > 0 {
+        val ls: Vec<str> = ch_splitlines(ch_strip(r2.err));
+        var two: str = "";
+        var i: i64 = 0;
+        while i < ls.len() && i < 2 {
+            if i > 0 { two = two + " / "; }
+            two = two + ls.get(i);
+            i = i + 1;
+        }
+        msg = ch_head(two, 110);
+    }
+    results.push(ch_judge("out of memory (ulimit -v)", &r2, !r2.timeout && r2.rc == 1 && ch_oom_panic(r2.err), "exit " + ch_rcs(&r2) + ": " + msg));
+    return results;
+}
+
+// ─── JSON (chaos_linux.py's RESULT lines) ───
+
+/// A JSON string at s[i] (a quote): its text; `end` the index after it,
+/// -1 when it is not one.
+fn ch_json_str(s: str, i: i64, end: &mut i64) -> str {
+    *end = -1;
+    if i >= str_len(s) || str_byte_at(s, i) != 34 { return ""; }
+    var out: str = "";
+    var k: i64 = i + 1;
+    while k < str_len(s) {
+        val c: i64 = str_byte_at(s, k);
+        if c == 34 {
+            *end = k + 1;
+            return out;
+        }
+        if c == 92 {
+            if k + 1 >= str_len(s) { return ""; }
+            val e: i64 = str_byte_at(s, k + 1);
+            if e == 110 {
+                out = out + "\n";
+            } else if e == 116 {
+                out = out + "\t";
+            } else if e == 114 {
+                out = out + "\r";
+            } else if e == 117 && k + 6 <= str_len(s) {
+                var cp: i64 = 0;
+                var q: i64 = k + 2;
+                while q < k + 6 {
+                    val h: i64 = str_byte_at(s, q);
+                    var dv: i64 = 0;
+                    if h >= 48 && h <= 57 { dv = h - 48; } else if h >= 97 && h <= 102 { dv = h - 87; } else if h >= 65 && h <= 70 { dv = h - 55; }
+                    cp = cp * 16 + dv;
+                    q = q + 1;
+                }
+                out = out + ch_utf8(cp);
+                k = k + 6;
+                continue;
+            } else {
+                out = out + char_to_str(e);
+            }
+            k = k + 2;
+            continue;
+        }
+        out = out + char_to_str(c);
+        k = k + 1;
+    }
+    return "";
+}
+
+fn ch_utf8(cp: i64) -> str {
+    var b: Vec<i64> = Vec::new();
+    if cp < 128 {
+        b.push(cp);
+    } else if cp < 2048 {
+        b.push(192 | (cp >> 6));
+        b.push(128 | (cp & 63));
+    } else {
+        b.push(224 | (cp >> 12));
+        b.push(128 | ((cp >> 6) & 63));
+        b.push(128 | (cp & 63));
+    }
+    return str_from_bytes(b);
+}
+
+struct ChResult {
+    good: bool,
+    name: str,
+    ok: bool,
+    why: str,
+    secs: f64,
+}
+
+/// json.loads of {"name": .., "ok": .., "why": .., "secs": ..}
+fn ch_parse_result(line: str) -> ChResult {
+    var r: ChResult = ChResult { good: false, name: "", ok: false, why: "", secs: 0.0 };
+    val s: str = ch_strip(line);
+    if str_len(s) < 2 || str_byte_at(s, 0) != 123 { return r; }
+    var i: i64 = ch_skip_ws(s, 1);
+    var seen: i64 = 0;
+    while i < str_len(s) && str_byte_at(s, i) != 125 {
+        var end: i64 = -1;
+        val key: str = ch_json_str(s, i, &mut end);
+        if end < 0 { return r; }
+        i = ch_skip_ws(s, end);
+        if i >= str_len(s) || str_byte_at(s, i) != 58 { return r; }
+        i = ch_skip_ws(s, i + 1);
+        if i < str_len(s) && str_byte_at(s, i) == 34 {
+            val v: str = ch_json_str(s, i, &mut end);
+            if end < 0 { return r; }
+            if key == "name" { r.name = v; seen = seen | 1; }
+            if key == "why" { r.why = v; seen = seen | 4; }
+            i = end;
+        } else if ch_at(s, i, "true") {
+            if key == "ok" { r.ok = true; seen = seen | 2; }
+            i = i + 4;
+        } else if ch_at(s, i, "false") {
+            if key == "ok" { r.ok = false; seen = seen | 2; }
+            i = i + 5;
+        } else if ch_at(s, i, "null") {
+            i = i + 4;
+        } else {
+            val st: i64 = i;
+            while i < str_len(s) && (ch_digit(str_byte_at(s, i)) || str_byte_at(s, i) == 45 || str_byte_at(s, i) == 46
+                    || str_byte_at(s, i) == 43 || str_byte_at(s, i) == 101 || str_byte_at(s, i) == 69) {
+                i = i + 1;
+            }
+            if i == st { return r; }
+            if key == "secs" { r.secs = ch_float(str_slice(s, st, i)); seen = seen | 8; }
+        }
+        i = ch_skip_ws(s, i);
+        if i < str_len(s) && str_byte_at(s, i) == 44 { i = ch_skip_ws(s, i + 1); }
+    }
+    r.good = seen == 15;
+    return r;
+}
+
+struct ChConf {
+    fid: str,
+    faketime: str,
+    linux_out: str,
+}
+
+fn ch_fail(why: str) -> ChLine {
+    return ChLine { ok: false, line: why };
+}
+
+/// Clock jumps and partitions: scripts/verify/chaos_linux.py (in WSL on
+/// Windows) on the C of chaos.fd, built there by gcc against glibc.
+fn ch_linux_helper(c: &ChConf, work: str, src: str, parts: Vec<str>) -> Vec<ChLine> {
+    var results: Vec<ChLine> = Vec::new();
+    val cfile: str = ch_join(work, "chaos-linux.c");
+    val errp: str = ch_tmpname("dumpc") + ".err";
+    var dc: Vec<str> = Vec::new();
+    dc.push(c.fid);
+    dc.push("dump-c");
+    dc.push(src);
+    val h: i64 = process_spawn_files(dc, ch_clone_list(&ch_env), "", cfile, errp);
+    if h == 0 {
+        io_eprintln(ch_not_found(c.fid));
+        p_exit(1);
+    }
+    var code: i64 = -1;
+    match process_wait(h, -1) {
+        Option::Some(x) => { code = x; }
+        Option::None => { }
+    }
+    process_release(h);
+    val derr: str = ch_decode(fs_read_bytes(errp));
+    if fs_exists(errp) { fs_delete(errp); }
+    if code != 0 || fs_read_bytes(cfile).len() == 0 {
+        println("dump-c failed: " + ch_tail(derr, 800));
+        results.push(ch_fail("linux dump-c failed"));
+        return results;
+    }
+    val pre: Vec<str> = ch_wsl_prefix();
+    val helper: str = ch_to_wsl(ch_join("scripts", ch_join("verify", "chaos_linux.py")));
+    val lout: str = c.linux_out;
+    val exe: str = lout + "/chaos-glibc";
+    var bc: Vec<str> = pre.clone();
+    bc.push("python3");
+    bc.push(helper);
+    bc.push("build");
+    bc.push("--c");
+    bc.push(ch_to_wsl(cfile));
+    bc.push("--out");
+    bc.push(lout);
+    ch_locale_mode = true;
+    val br: ChRun = ch_go(bc, -1, false);
+    ch_locale_mode = false;
+    if br.rc != 0 {
+        println("linux build (gcc) failed: " + ch_ltail(br.out + br.err, 1200));
+        results.push(ch_fail("linux build failed"));
+        return results;
+    }
+    var pi: i64 = 0;
+    while pi < parts.len() {
+        val part: str = parts.get(pi);
+        pi = pi + 1;
+        var cmd: Vec<str> = pre.clone();
+        cmd.push("python3");
+        cmd.push(helper);
+        cmd.push(part);
+        cmd.push("--exe");
+        cmd.push(exe);
+        if part == "clock" {
+            cmd.push("--shim");
+            cmd.push(lout + "/clockjump.so");
+            if str_len(c.faketime) > 0 {
+                cmd.push("--faketime");
+                cmd.push(c.faketime);
+            }
+        }
+        var where_: str = "Linux";
+        if pre.len() > 0 { where_ = "WSL"; }
+        println("== " + part + " (gcc, glibc, " + where_ + ")");
+        io_flush();
+        ch_locale_mode = true;
+        val r: ChRun = ch_go(cmd, 1800, false);
+        ch_locale_mode = false;
+        var out: str = r.out;
+        var err: str = r.err;
+        if r.timeout {
+            out = "";
+            err = "chaos_linux.py ran for more than 30 minutes";
+        }
+        var seen: i64 = 0;
+        val ls: Vec<str> = ch_splitlines(out);
+        var i: i64 = 0;
+        while i < ls.len() {
+            if str_starts_with(ls.get(i), "RESULT ") {
+                val res: ChResult = ch_parse_result(str_slice(ls.get(i), 7, str_len(ls.get(i))));
+                if !res.good {
+                    io_eprintln("json.decoder.JSONDecodeError: a RESULT line is not the JSON chaos_linux.py prints");
+                    p_exit(1);
+                }
+                results.push(ch_report(res.name, res.ok, res.why, res.secs));
+                seen = seen + 1;
+            }
+            i = i + 1;
+        }
+        val es: Vec<str> = ch_splitlines(err);
+        i = 0;
+        while i < es.len() {
+            if str_starts_with(es.get(i), "partition:") { println("   " + es.get(i)); }
+            i = i + 1;
+        }
+        if seen == 0 {
+            println(part + ": no results: " + ch_ltail(err, 1200));
+            results.push(ch_fail(part + ": no results"));
+        }
+    }
+    return results;
+}
+
+/// fid <backend> <src> -o <exe> (and the extra arguments); "" when it
+/// built, else its output's last `keep` characters.
+fn ch_build(cmd: Vec<str>, exe: str, keep: i64, ok: &mut bool) -> str {
+    ch_locale_mode = true;
+    val r: ChRes = ch_run_cmd(cmd, -1, false);
+    ch_locale_mode = false;
+    *ok = r.code == 0 && fs_exists(exe);
+    if *ok { return ""; }
+    return ch_ltail(r.out + r.err, keep);
+}
+
+fn main() -> i64 {
+    var av: Vec<str> = args_all();
+    if av.len() >= 3 && av.get(1) == "--ch-serve" { return ch_serve(av.get(2)); }
+    ch_self = av.get(0);
+    var rest: Vec<str> = Vec::new();
+    var i: i64 = 1;
+    while i < av.len() {
+        rest.push(av.get(i));
+        i = i + 1;
+    }
+    var opts: Vec<ChOpt> = Vec::new();
+    opts.push(ch_opt("--fid", "", CH_STR));          // 0
+    opts.push(ch_opt("--backends", "", CH_STR));     // 1
+    opts.push(ch_opt("--linux", "", CH_FLAG));       // 2
+    opts.push(ch_opt("--linux-nat", "", CH_FLAG));   // 3
+    opts.push(ch_opt("--clock", "", CH_FLAG));       // 4
+    opts.push(ch_opt("--partition", "", CH_FLAG));   // 5
+    opts.push(ch_opt("--faketime", "", CH_STR));     // 6
+    opts.push(ch_opt("--linux-out", "", CH_STR));    // 7
+    opts.push(ch_opt("--strict", "", CH_FLAG));      // 8
+    opts.push(ch_opt("--out", "", CH_STR));          // 9
+    opts.push(ch_opt("--src", "", CH_STR));          // 10
+    opts.push(ch_opt("--help", "-h", CH_HELP));      // 11
+    val a: ChArgs = ch_parse(rest, opts);
+    if a.code >= 0 { return a.code; }
+    val fid: str = ch_val(&a, 0, ch_join("release", "fid.exe"));
+    var backends: str = ch_val(&a, 1, "ccompile,emit");
+    val linux: bool = ch_flag(&a, 2);
+    val linux_nat: bool = ch_flag(&a, 3);
+    val clock: bool = ch_flag(&a, 4);
+    val partition: bool = ch_flag(&a, 5);
+    val conf: ChConf = ChConf { fid: fid, faketime: ch_val(&a, 6, ""), linux_out: ch_val(&a, 7, "/tmp/fides-chaos") };
+    ch_strict = ch_flag(&a, 8);
+    val out: str = ch_val(&a, 9, ch_join("build", "chaos"));
+    val src: str = ch_val(&a, 10, ch_join("tests", ch_join("verify", "chaos.fd")));
+    if !str_starts_with(conf.linux_out, "/") {
+        // Git Bash turns /tmp/x into C:/.../Temp/x: WSL would make that path
+        // inside the current folder
+        return ch_ap_error("--linux-out must be a Linux path, not " + ch_repr(conf.linux_out) + " (Git Bash: MSYS_NO_PATHCONV=1)");
+    }
+    if (clock || partition) && !linux { backends = ""; }
+    if !ch_has_env("CC") { ch_env.push("CC=zig cc"); }
+    ch_makedirs(out);
+    val work: str = ch_abspath(out);
+    var lines: Vec<str> = Vec::new();
+    var allok: bool = true;
+    val bks: Vec<str> = ch_split(backends, ",");
+    var bi: i64 = 0;
+    while bi < bks.len() {
+        val b: str = bks.get(bi);
+        bi = bi + 1;
+        if str_len(b) == 0 { continue; }
+        val exe: str = ch_join(work, "chaos-" + b + ".exe");
+        var bok: bool = false;
+        var bcmd: Vec<str> = Vec::new();
+        bcmd.push(fid);
+        bcmd.push(b);
+        bcmd.push(src);
+        bcmd.push("-o");
+        bcmd.push(exe);
+        val bout: str = ch_build(bcmd, exe, 800, &mut bok);
+        if !bok {
+            println(b + ": build failed: " + bout);
+            allok = false;
+            continue;
+        }
+        println("== " + b + " (host)");
+        ch_backend = b;
+        val rs: Vec<ChLine> = ch_host_scenarios(exe, work);
+        i = 0;
+        while i < rs.len() {
+            if !rs.get(i).ok { allok = false; }
+            lines.push(b + " " + rs.get(i).line);
+            i = i + 1;
+        }
+    }
+    ch_backend = "linux";
+    if linux {
+        val lexe: str = ch_join(work, "chaos-linux");
+        var lok: bool = false;
+        var lcmd: Vec<str> = Vec::new();
+        lcmd.push(fid);
+        lcmd.push("ccompile");
+        lcmd.push(src);
+        lcmd.push("--target");
+        lcmd.push("x86_64-linux");
+        lcmd.push("-o");
+        lcmd.push(lexe);
+        val lout: str = ch_build(lcmd, lexe, 800, &mut lok);
+        if !lok {
+            println("linux build failed: " + lout);
+            allok = false;
+        } else {
+            println("== ccompile --target x86_64-linux");
+            val rs: Vec<ChLine> = ch_linux_scenarios(lexe);
+            i = 0;
+            while i < rs.len() {
+                if !rs.get(i).ok { allok = false; }
+                lines.push("linux " + rs.get(i).line);
+                i = i + 1;
+            }
+        }
+        if linux_nat {
+            // the machine layer's image and stdlib/linux_runtime (no libc)
+            ch_backend = "linux-emit";
+            val nexe: str = ch_join(work, "chaos-linux-nat");
+            var nok: bool = false;
+            var ncmd: Vec<str> = Vec::new();
+            ncmd.push(fid);
+            ncmd.push("emit");
+            ncmd.push(src);
+            ncmd.push("--target");
+            ncmd.push("x86_64-linux");
+            ncmd.push("-o");
+            ncmd.push(nexe);
+            val nout: str = ch_build(ncmd, nexe, 800, &mut nok);
+            if !nok {
+                println("emit --target x86_64-linux failed: " + nout);
+                allok = false;
+            } else {
+                println("== emit --target x86_64-linux");
+                val rs: Vec<ChLine> = ch_linux_scenarios(nexe);
+                i = 0;
+                while i < rs.len() {
+                    if !rs.get(i).ok { allok = false; }
+                    lines.push("linux-emit " + rs.get(i).line);
+                    i = i + 1;
+                }
+            }
+            ch_backend = "linux";
+        }
+    }
+    var parts: Vec<str> = Vec::new();
+    if clock || linux { parts.push("clock"); }
+    if partition || linux { parts.push("partition"); }
+    if parts.len() > 0 {
+        val rs: Vec<ChLine> = ch_linux_helper(&conf, work, src, parts);
+        i = 0;
+        while i < rs.len() {
+            if !rs.get(i).ok { allok = false; }
+            lines.push("linux " + rs.get(i).line);
+            i = i + 1;
+        }
+    }
+    var text: str = "";
+    i = 0;
+    while i < lines.len() {
+        if i > 0 { text = text + "\n"; }
+        text = text + lines.get(i);
+        i = i + 1;
+    }
+    fs_write_text(ch_join(work, "report.txt"), text + "\n");
+    if allok { return 0; }
+    return 1;
+}

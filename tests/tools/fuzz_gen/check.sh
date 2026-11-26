@@ -45,7 +45,7 @@ compare() {   # name, then the arguments both get (--keep is added)
     local name="$1"; shift
     local k="$OUT/keep-$name"
     rm -rf "$k" "$k.py" "$k.fd"
-    timeout 1800 "$PY" scripts/fuzz/gen_programs.py "$@" --fid "$FID" --keep "$k" > "$OUT/$name.py" 2>&1
+    timeout 1800 "$PY" -X utf8 scripts/fuzz/gen_programs.py "$@" --fid "$FID" --keep "$k" > "$OUT/$name.py" 2>&1
     local pc=$?
     mv "$k" "$k.py"
     timeout 1800 "$exe" "$@" --fid "$FID" --keep "$k" > "$OUT/$name.fd" 2>&1
@@ -77,10 +77,12 @@ for s in range(1, 401):
 open(f"{out}/b.fd", "w", newline="\n").write(batch_program([7, 8, 9, 10], False))
 open(f"{out}/br.fd", "w", newline="\n").write(batch_program([7, 8, 9, 10], True))
 PY
-    # the port with a main that writes the same files
-    sed 's/^fn main() -> i64 {/fn gen_main() -> i64 {/' tools/fuzz_gen.fd > "$g/gd.fd"
-    cp tools/py_random.fd tools/fuzz_lib.fd "$g/"
-    cat >> "$g/gd.fd" <<'FD'
+    # a program that writes the same files with tools/fuzz_programs.fd
+    cp tools/py_random.fd tools/fuzz_lib.fd tools/fuzz_programs.fd "$g/"
+    cat > "$g/gd.fd" <<'FD'
+use core;
+use fuzz_lib;
+use fuzz_programs;
 
 fn main() -> i64 {
     val out: str = fl_args().get(0);

@@ -1,0 +1,68 @@
+// A stand-in compiler for tests/tools/compile_gate/check.sh. Its
+// `emit <src> ... -o <exe> ... --time` writes <exe> and prints the lines of
+// $FAKE_TIMES (a file); in a line, `a,b,c` before " ms" is the time of the
+// 1st, 2nd, 3rd... build of that source (counted in $FAKE_DIR), wrapping.
+// A source whose name holds $FAKE_FAIL fails (exit 1, a message).
+use core;
+use args;
+use fs;
+use io;
+fn ff_env(n: str) -> str {
+    match env_var(n) {
+        Option::Some(s) => { return s; }
+        Option::None => { }
+    }
+    return "";
+}
+fn ff_base(p: str) -> str {
+    var i: i64 = str_len(p);
+    while i > 0 && str_byte_at(p, i - 1) != 47 && str_byte_at(p, i - 1) != 92 { i = i - 1; }
+    return str_slice(p, i, str_len(p));
+}
+fn main() -> i64 {
+    val a: Vec<str> = args_all();
+    var src: str = "";
+    var out: str = "";
+    var i: i64 = 1;
+    while i < a.len() {
+        if a.get(i) == "-o" && i + 1 < a.len() { out = a.get(i + 1); }
+        if str_ends_with(a.get(i), ".fd") { src = a.get(i); }
+        i = i + 1;
+    }
+    val fail: str = ff_env("FAKE_FAIL");
+    if str_len(fail) > 0 && str_contains(src, fail) {
+        println("[build] Reading source file: " + src);
+        println("error: fake failure of " + ff_base(src));
+        return 1;
+    }
+    val cnt: str = ff_env("FAKE_DIR") + "/" + ff_base(src) + ".count";
+    var k: i64 = 0;
+    match read_file(cnt) {
+        Option::Some(t) => { k = str_parse_int(str_trim(t)); }
+        Option::None => { }
+    }
+    fs_write_text(cnt, int_to_str(k + 1) + "\n");
+    if str_len(out) > 0 { fs_write_text(out, "fake\n"); }
+    var text: str = "";
+    match read_file(ff_env("FAKE_TIMES")) {
+        Option::Some(t) => { text = t; }
+        Option::None => { }
+    }
+    val lines: Vec<str> = str_split(text, "\n");
+    var j: i64 = 0;
+    while j < lines.len() {
+        val l: str = lines.get(j);
+        j = j + 1;
+        if str_len(l) == 0 { continue; }
+        val e: i64 = str_find(l, " ms");
+        if e < 0 {
+            println(l);
+            continue;
+        }
+        var s: i64 = e;
+        while s > 0 && str_byte_at(l, s - 1) != 32 { s = s - 1; }
+        val choices: Vec<str> = str_split(str_slice(l, s, e), ",");
+        println(str_slice(l, 0, s) + choices.get(k % choices.len()) + str_slice(l, e, str_len(l)));
+    }
+    return 0;
+}

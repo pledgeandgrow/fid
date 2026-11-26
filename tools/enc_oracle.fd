@@ -1,0 +1,1869 @@
+// tools/enc_oracle.fd — our AArch64, RISC-V and x86-64 encoders against
+// clang's assembler (own-backend roadmap TG4, RL8): the Fides port of
+// scripts/enc-oracle.py (roadmap AD4). Same options and defaults, the same
+// files under build/enc-oracle/, the same lines on stdout and stderr, the
+// same exit status:
+//
+//   fid ccompile tools/enc_oracle.fd -o enc_oracle.exe
+//   enc_oracle.exe [--fid release/fid.exe] [--zig zig]
+//
+// Every instruction form compiler/nat_enc.fd emits is encoded with several
+// operand choices by a generated Fides program (build/enc-oracle/oracle.fd,
+// run with `<fid> run`), and the same instructions are assembled by
+// clang's integrated assembler through `<zig> cc -target <arch>-linux-musl
+// -c` (the one tool that stays outside: Fides has no assembler of its
+// own to check against). The words must be equal: AArch64 and RISC-V one
+// 32-bit word each, x86-64 each instruction at a 16-byte boundary padded
+// with nops. Each mismatch is printed, then "<n> forms, <m> mismatches";
+// the exit status is the number of mismatches (at most 125). Run from the
+// repository root (build/enc-oracle is relative to the current directory,
+// and so is `use compiler::nat_enc` in the generated program).
+//
+// The forms are a copy of the script's tables (tests/tools/enc_oracle/
+// check.sh compares the generated program and assembly files of both).
+// Differences from the script: a program that cannot be started (fid or
+// zig) gives the last line of Python's traceback only; exit status 1 as
+// there.
+
+use core;
+use args;
+use fs;
+use io;
+use process;
+
+extern "C" {
+    fn getcwd(buf: i64, n: i64) -> i64;
+}
+
+const EO_PROG: str = "enc-oracle.py";
+
+fn eo_usage() -> str {
+    return "usage: enc-oracle.py [-h] [--fid FID] [--zig ZIG]\n";
+}
+
+fn eo_help() -> str {
+    var h: str = eo_usage() + "\noptions:\n";
+    h = h + "  -h, --help  show this help message and exit\n";
+    h = h + "  --fid FID\n";
+    h = h + "  --zig ZIG\n";
+    return h;
+}
+
+// ─── Text (Python's str methods, ASCII whitespace) ───
+
+fn eo_ws(c: i64) -> bool {
+    return (c >= 9 && c <= 13) || (c >= 28 && c <= 32);
+}
+
+fn eo_digit(c: i64) -> bool {
+    return c >= 48 && c <= 57;
+}
+
+fn eo_skip_ws(s: str, i: i64) -> i64 {
+    var k: i64 = i;
+    while k < str_len(s) && eo_ws(str_byte_at(s, k)) { k = k + 1; }
+    return k;
+}
+
+fn eo_at(s: str, i: i64, w: str) -> bool {
+    if i < 0 || i + str_len(w) > str_len(s) { return false; }
+    return str_slice(s, i, i + str_len(w)) == w;
+}
+
+/// s.strip()
+fn eo_strip(s: str) -> str {
+    var a: i64 = 0;
+    var b: i64 = str_len(s);
+    while a < b && eo_ws(str_byte_at(s, a)) { a = a + 1; }
+    while b > a && eo_ws(str_byte_at(s, b - 1)) { b = b - 1; }
+    return str_slice(s, a, b);
+}
+
+/// s.split(sep) (keeps empty pieces).
+fn eo_split(s: str, sep: str) -> Vec<str> {
+    var r: Vec<str> = Vec::new();
+    val n: i64 = str_len(s);
+    val m: i64 = str_len(sep);
+    var start: i64 = 0;
+    var i: i64 = 0;
+    while i + m <= n {
+        if str_slice(s, i, i + m) == sep {
+            r.push(str_slice(s, start, i));
+            i = i + m;
+            start = i;
+        } else {
+            i = i + 1;
+        }
+    }
+    r.push(str_slice(s, start, n));
+    return r;
+}
+
+/// s.splitlines() (on "\n", "\r\n" and "\r").
+fn eo_splitlines(s: str) -> Vec<str> {
+    var r: Vec<str> = Vec::new();
+    val n: i64 = str_len(s);
+    var start: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        val c: i64 = str_byte_at(s, i);
+        if c == 10 || c == 13 {
+            r.push(str_slice(s, start, i));
+            if c == 13 && i + 1 < n && str_byte_at(s, i + 1) == 10 { i = i + 1; }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    if start < n { r.push(str_slice(s, start, n)); }
+    return r;
+}
+
+/// f"{s:<w}"
+fn eo_ljust(s: str, w: i64) -> str {
+    var r: str = s;
+    var n: i64 = eo_chars(s);
+    while n < w {
+        r = r + " ";
+        n = n + 1;
+    }
+    return r;
+}
+
+/// f"{s:>w}"
+fn eo_rjust(s: str, w: i64) -> str {
+    var r: str = s;
+    var n: i64 = eo_chars(s);
+    while n < w {
+        r = " " + r;
+        n = n + 1;
+    }
+    return r;
+}
+
+/// The code points of UTF-8 text.
+fn eo_chars(s: str) -> i64 {
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while i < str_len(s) {
+        if (str_byte_at(s, i) & 192) != 128 { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+
+/// s[:n] by code points.
+fn eo_head(s: str, n: i64) -> str {
+    var seen: i64 = 0;
+    var i: i64 = 0;
+    while i < str_len(s) {
+        if (str_byte_at(s, i) & 192) != 128 {
+            if seen == n { return str_slice(s, 0, i); }
+            seen = seen + 1;
+        }
+        i = i + 1;
+    }
+    return s;
+}
+
+/// s[-n:] by code points.
+fn eo_tail(s: str, n: i64) -> str {
+    val total: i64 = eo_chars(s);
+    if total <= n { return s; }
+    var skip: i64 = total - n;
+    var i: i64 = 0;
+    while i < str_len(s) {
+        if (str_byte_at(s, i) & 192) != 128 {
+            if skip == 0 { return str_slice(s, i, str_len(s)); }
+            skip = skip - 1;
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn eo_hexw(c: i64, width: i64) -> str {
+    val digits: str = "0123456789abcdef";
+    var s: str = "";
+    var k: i64 = width - 1;
+    while k >= 0 {
+        s = s + char_to_str(str_byte_at(digits, (c >> (4 * k)) & 15));
+        k = k - 1;
+    }
+    return s;
+}
+
+/// hex(v) for v >= 0: "0x" and the digits, no padding.
+fn eo_hex(v: i64) -> str {
+    if v == 0 { return "0x0"; }
+    val digits: str = "0123456789abcdef";
+    var s: str = "";
+    var x: i64 = v;
+    while x > 0 {
+        s = char_to_str(str_byte_at(digits, x & 15)) + s;
+        x = x >> 4;
+    }
+    return "0x" + s;
+}
+
+/// repr() of a str: ASCII control characters, U+007F..U+009F escaped,
+/// the rest as it is.
+fn eo_repr(s: str) -> str {
+    var q: str = "'";
+    if str_contains(s, "'") && !str_contains(s, "\"") { q = "\""; }
+    var out: str = q;
+    var i: i64 = 0;
+    while i < str_len(s) {
+        val c: i64 = str_byte_at(s, i);
+        i = i + 1;
+        if char_to_str(c) == q || c == 92 {
+            out = out + "\\" + char_to_str(c);
+        } else if c == 9 {
+            out = out + "\\t";
+        } else if c == 10 {
+            out = out + "\\n";
+        } else if c == 13 {
+            out = out + "\\r";
+        } else if c < 32 || c == 127 {
+            out = out + "\\x" + eo_hexw(c, 2);
+        } else if c == 192 && i < str_len(s) && str_byte_at(s, i) == 128 {
+            // a NUL the decoder kept as C0 80
+            out = out + "\\x00";
+            i = i + 1;
+        } else if c == 194 && i < str_len(s) && str_byte_at(s, i) >= 128 && str_byte_at(s, i) <= 159 {
+            out = out + "\\x" + eo_hexw(str_byte_at(s, i), 2);
+            i = i + 1;
+        } else {
+            out = out + char_to_str(c);
+        }
+    }
+    return out + q;
+}
+
+/// f"{d:.{prec}f}", rounded as Python rounds (the binary value, ties to
+/// even).
+fn eo_fixed(d: f64, prec: i64) -> str {
+    if d != d { return "nan"; }
+    var neg: bool = false;
+    var x: f64 = d;
+    if x < 0.0 {
+        neg = true;
+        x = 0.0 - x;
+    }
+    if x > 1.0e15 {
+        return float_to_str(d);
+    }
+    val bits: i64 = p_f64_to_bits(x);
+    val e: i64 = (bits >> 52) & 2047;
+    var m: i64 = bits & 4503599627370495;
+    var exp: i64 = -1074;
+    if e != 0 {
+        m = m | 4503599627370496;
+        exp = e - 1075;
+    }
+    var scale: i64 = 1;
+    var k: i64 = 0;
+    while k < prec {
+        scale = scale * 10;
+        k = k + 1;
+    }
+    // m * scale fits while prec <= 2 (m < 2^53)
+    val num: i64 = m * scale;
+    var q: i64 = 0;
+    if exp >= 0 {
+        q = num << exp;
+    } else {
+        val s: i64 = 0 - exp;
+        if s <= 61 {
+            q = num >> s;
+            val r: i64 = num - (q << s);
+            val half: i64 = 1 << (s - 1);
+            if r > half || (r == half && (q & 1) == 1) { q = q + 1; }
+        }
+    }
+    var out: str = int_to_str(q / scale);
+    if prec > 0 {
+        var frac: str = int_to_str(q % scale);
+        while str_len(frac) < prec { frac = "0" + frac; }
+        out = out + "." + frac;
+    }
+    if neg { out = "-" + out; }
+    return out;
+}
+
+/// The text Python's bytes.decode("utf-8", "replace") gives (a NUL as
+/// C0 80, which a str can hold).
+fn eo_decode(b: Vec<i64>) -> str {
+    var out: Vec<i64> = Vec::new();
+    val n: i64 = b.len();
+    var i: i64 = 0;
+    while i < n {
+        val c: i64 = b.get(i);
+        if c == 0 {
+            out.push(192);
+            out.push(128);
+            i = i + 1;
+            continue;
+        }
+        if c < 128 {
+            out.push(c);
+            i = i + 1;
+            continue;
+        }
+        var need: i64 = 0;
+        var lo: i64 = 128;
+        var hi: i64 = 191;
+        if c >= 194 && c <= 223 {
+            need = 1;
+        } else if c >= 224 && c <= 239 {
+            need = 2;
+            if c == 224 { lo = 160; }
+            if c == 237 { hi = 159; }
+        } else if c >= 240 && c <= 244 {
+            need = 3;
+            if c == 240 { lo = 144; }
+            if c == 244 { hi = 143; }
+        } else {
+            out.push(239);
+            out.push(191);
+            out.push(189);
+            i = i + 1;
+            continue;
+        }
+        var j: i64 = 1;
+        var ok: bool = true;
+        while j <= need {
+            if i + j >= n {
+                ok = false;
+                break;
+            }
+            val d: i64 = b.get(i + j);
+            var l: i64 = 128;
+            var h: i64 = 191;
+            if j == 1 {
+                l = lo;
+                h = hi;
+            }
+            if d < l || d > h {
+                ok = false;
+                break;
+            }
+            j = j + 1;
+        }
+        if ok {
+            var k: i64 = 0;
+            while k <= need {
+                out.push(b.get(i + k));
+                k = k + 1;
+            }
+            i = i + need + 1;
+        } else {
+            out.push(239);
+            out.push(191);
+            out.push(189);
+            i = i + j;
+        }
+    }
+    return str_from_bytes(out);
+}
+
+// ─── Paths (os.path on this system) ───
+
+fn eo_win() -> bool {
+    return process_is_windows();
+}
+
+fn eo_is_sep(c: i64) -> bool {
+    return c == 47 || (c == 92 && eo_win());
+}
+
+fn eo_sep() -> str {
+    if eo_win() { return "\\"; }
+    return "/";
+}
+
+var eo_cwd_cache: str = "";
+
+/// os.getcwd()
+fn eo_cwd() -> str {
+    if str_len(eo_cwd_cache) > 0 { return eo_cwd_cache; }
+    var buf: i64 = 0;
+    // SAFETY: a fresh 4096-byte buffer; getcwd writes at most that many
+    // bytes, NUL included, and the result is copied out before it is freed.
+    unsafe {
+        buf = p_malloc(4096);
+        if buf != 0 {
+            if getcwd(buf, 4096) != 0 {
+                eo_cwd_cache = p_str_from_ptr(buf);
+            }
+            p_free(buf);
+        }
+    }
+    if str_len(eo_cwd_cache) == 0 { eo_cwd_cache = "."; }
+    return eo_cwd_cache;
+}
+
+/// The drive ("C:") of a Windows path, "" for none.
+fn eo_drive(p: str) -> str {
+    if eo_win() && str_len(p) >= 2 && str_byte_at(p, 1) == 58 { return str_slice(p, 0, 2); }
+    return "";
+}
+
+fn eo_isabs(p: str) -> bool {
+    val d: str = eo_drive(p);
+    val rest: str = str_slice(p, str_len(d), str_len(p));
+    return str_len(rest) > 0 && eo_is_sep(str_byte_at(rest, 0));
+}
+
+/// os.path.join(a, b)
+fn eo_join(a: str, b: str) -> str {
+    if str_len(a) == 0 { return b; }
+    if eo_isabs(b) { return b; }
+    if eo_is_sep(str_byte_at(a, str_len(a) - 1)) { return a + b; }
+    return a + eo_sep() + b;
+}
+
+/// os.path.normpath
+fn eo_normpath(p: str) -> str {
+    val d: str = eo_drive(p);
+    var rest: str = str_slice(p, str_len(d), str_len(p));
+    if eo_win() { rest = str_replace(rest, "/", "\\"); }
+    val abs: bool = str_len(rest) > 0 && eo_is_sep(str_byte_at(rest, 0));
+    val parts: Vec<str> = eo_split(rest, eo_sep());
+    var out: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < parts.len() {
+        val c: str = parts.get(i);
+        i = i + 1;
+        if str_len(c) == 0 || c == "." { continue; }
+        if c == ".." {
+            if out.len() > 0 && out.get(out.len() - 1) != ".." {
+                out.remove(out.len() - 1);
+                continue;
+            }
+            if abs { continue; }
+        }
+        out.push(c);
+    }
+    var s: str = "";
+    i = 0;
+    while i < out.len() {
+        if i > 0 { s = s + eo_sep(); }
+        s = s + out.get(i);
+        i = i + 1;
+    }
+    if abs { s = eo_sep() + s; }
+    s = d + s;
+    if str_len(s) == 0 { return "."; }
+    return s;
+}
+
+/// os.path.abspath
+fn eo_abspath(p: str) -> str {
+    if eo_isabs(p) { return eo_normpath(p); }
+    return eo_normpath(eo_join(eo_cwd(), p));
+}
+
+/// os.path.basename
+fn eo_basename(p: str) -> str {
+    var i: i64 = str_len(p) - 1;
+    while i >= 0 {
+        if eo_is_sep(str_byte_at(p, i)) { return str_slice(p, i + 1, str_len(p)); }
+        i = i - 1;
+    }
+    if str_len(eo_drive(p)) == 2 { return str_slice(p, 2, str_len(p)); }
+    return p;
+}
+
+/// os.makedirs(p, exist_ok=True)
+fn eo_makedirs(p: str) -> bool {
+    if str_len(p) == 0 || fs_is_dir(p) { return true; }
+    var k: i64 = str_len(p) - 1;
+    while k >= 0 && eo_is_sep(str_byte_at(p, k)) { k = k - 1; }
+    while k >= 0 && !eo_is_sep(str_byte_at(p, k)) { k = k - 1; }
+    if k > 0 {
+        val parent: str = str_slice(p, 0, k);
+        if !(str_len(parent) == 2 && str_len(eo_drive(parent)) == 2) {
+            eo_makedirs(parent);
+        }
+    }
+    fs_mkdir(p);
+    return fs_is_dir(p);
+}
+
+/// os.environ.get(name, "")
+fn eo_env(name: str) -> str {
+    match env_var(name) {
+        Option::Some(v) => { return v; }
+        Option::None => { }
+    }
+    return "";
+}
+
+fn eo_has_env(name: str) -> bool {
+    match env_var(name) {
+        Option::Some(v) => { return true; }
+        Option::None => { }
+    }
+    return false;
+}
+
+// ─── argparse (options only, no positionals) ───
+
+struct EoOpt {
+    long: str,
+    short: str,
+    takes: bool,
+    kind: i64,
+}
+
+const EO_STR: i64 = 0;
+const EO_INT: i64 = 1;
+const EO_FLOAT: i64 = 2;
+const EO_FLAG: i64 = 3;
+const EO_HELP: i64 = 4;
+
+fn eo_opt(long: str, short: str, kind: i64) -> EoOpt {
+    return EoOpt { long: long, short: short, takes: kind == EO_STR || kind == EO_INT || kind == EO_FLOAT, kind: kind };
+}
+
+/// argparse's look of a negative number: -\d+ or -\d*\.\d+
+fn eo_negnum(a: str) -> bool {
+    if str_len(a) < 2 || str_byte_at(a, 0) != 45 { return false; }
+    var i: i64 = 1;
+    var dig: i64 = 0;
+    while i < str_len(a) && eo_digit(str_byte_at(a, i)) {
+        i = i + 1;
+        dig = dig + 1;
+    }
+    if i == str_len(a) { return dig > 0; }
+    if str_byte_at(a, i) != 46 { return false; }
+    i = i + 1;
+    var frac: i64 = 0;
+    while i < str_len(a) && eo_digit(str_byte_at(a, i)) {
+        i = i + 1;
+        frac = frac + 1;
+    }
+    return i == str_len(a) && frac > 0;
+}
+
+/// int(s) as Python reads it (whitespace, a sign, ASCII digits, "_"
+/// between digits).
+fn eo_is_int(s: str) -> bool {
+    val t: str = eo_strip(s);
+    var i: i64 = 0;
+    if i < str_len(t) && (str_byte_at(t, i) == 43 || str_byte_at(t, i) == 45) { i = i + 1; }
+    if i >= str_len(t) { return false; }
+    var prev_digit: bool = false;
+    while i < str_len(t) {
+        val c: i64 = str_byte_at(t, i);
+        if c == 95 {
+            if !prev_digit || i + 1 >= str_len(t) || !eo_digit(str_byte_at(t, i + 1)) { return false; }
+            prev_digit = false;
+        } else if !eo_digit(c) {
+            return false;
+        } else {
+            prev_digit = true;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn eo_int(s: str) -> i64 {
+    var t: str = str_replace(eo_strip(s), "_", "");
+    if str_starts_with(t, "+") { t = str_slice(t, 1, str_len(t)); }
+    return str_parse_int(t);
+}
+
+/// float(s): a decimal with an optional exponent, inf, infinity or nan.
+fn eo_is_float(s: str) -> bool {
+    val t: str = str_to_lower(eo_strip(s));
+    var i: i64 = 0;
+    if i < str_len(t) && (str_byte_at(t, i) == 43 || str_byte_at(t, i) == 45) { i = i + 1; }
+    val rest: str = str_slice(t, i, str_len(t));
+    if rest == "inf" || rest == "infinity" || rest == "nan" { return true; }
+    var digs: i64 = 0;
+    while i < str_len(t) && eo_digit(str_byte_at(t, i)) {
+        i = i + 1;
+        digs = digs + 1;
+    }
+    if i < str_len(t) && str_byte_at(t, i) == 46 {
+        i = i + 1;
+        while i < str_len(t) && eo_digit(str_byte_at(t, i)) {
+            i = i + 1;
+            digs = digs + 1;
+        }
+    }
+    if digs == 0 { return false; }
+    if i < str_len(t) && str_byte_at(t, i) == 101 {
+        i = i + 1;
+        if i < str_len(t) && (str_byte_at(t, i) == 43 || str_byte_at(t, i) == 45) { i = i + 1; }
+        var ed: i64 = 0;
+        while i < str_len(t) && eo_digit(str_byte_at(t, i)) {
+            i = i + 1;
+            ed = ed + 1;
+        }
+        if ed == 0 { return false; }
+    }
+    return i == str_len(t);
+}
+
+fn eo_float(s: str) -> f64 {
+    val t: str = str_to_lower(eo_strip(s));
+    if str_contains(t, "inf") {
+        if str_starts_with(t, "-") { return 0.0 - 1.0e308 * 10.0; }
+        return 1.0e308 * 10.0;
+    }
+    if str_contains(t, "nan") {
+        val z: f64 = 0.0;
+        return z / z;
+    }
+    return str_parse_float(t);
+}
+
+/// -1 none, -2 ambiguous (msg set), else the option's index.
+fn eo_find_opt(opts: Vec<EoOpt>, a: str, msg: &mut str, explicit: &mut str, has_explicit: &mut bool) -> i64 {
+    *has_explicit = false;
+    *explicit = "";
+    var i: i64 = 0;
+    while i < opts.len() {
+        if opts.get(i).long == a || (str_len(opts.get(i).short) > 0 && opts.get(i).short == a) { return i; }
+        i = i + 1;
+    }
+    if str_len(a) < 2 || str_byte_at(a, 0) != 45 { return -1; }
+    val eq: i64 = str_find(a, "=");
+    if eq > 0 {
+        val name: str = str_slice(a, 0, eq);
+        i = 0;
+        while i < opts.len() {
+            if opts.get(i).long == name || (str_len(opts.get(i).short) > 0 && opts.get(i).short == name) {
+                *explicit = str_slice(a, eq + 1, str_len(a));
+                *has_explicit = true;
+                return i;
+            }
+            i = i + 1;
+        }
+    }
+    if str_starts_with(a, "--") {
+        var prefix: str = a;
+        if eq > 0 { prefix = str_slice(a, 0, eq); }
+        var hits: Vec<i64> = Vec::new();
+        i = 0;
+        while i < opts.len() {
+            if str_len(opts.get(i).long) > 0 && str_starts_with(opts.get(i).long, prefix) { hits.push(i); }
+            i = i + 1;
+        }
+        if hits.len() > 1 {
+            var names: str = "";
+            var k: i64 = 0;
+            while k < hits.len() {
+                if k > 0 { names = names + ", "; }
+                names = names + opts.get(hits.get(k)).long;
+                k = k + 1;
+            }
+            *msg = "ambiguous option: " + a + " could match " + names;
+            return -2;
+        }
+        if hits.len() == 1 {
+            if eq > 0 {
+                *explicit = str_slice(a, eq + 1, str_len(a));
+                *has_explicit = true;
+            }
+            return hits.get(0);
+        }
+        return -1;
+    }
+    // a short option with its value glued on (-n4)
+    val two: str = str_slice(a, 0, 2);
+    i = 0;
+    while i < opts.len() {
+        if str_len(opts.get(i).short) > 0 && opts.get(i).short == two && opts.get(i).takes {
+            *explicit = str_slice(a, 2, str_len(a));
+            *has_explicit = true;
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// ap.error(msg): the usage and "<prog>: error: msg" on stderr; 2.
+fn eo_ap_error(msg: str) -> i64 {
+    io_eprint(eo_usage());
+    io_eprintln(EO_PROG + ": error: " + msg);
+    return 2;
+}
+
+struct EoArgs {
+    vals: Vec<str>,
+    given: Vec<bool>,
+    code: i64,
+}
+
+/// ap.parse_args(): code -1 when the options are good (vals/given hold
+/// them), else the exit status (help printed: 0; an error: 2).
+fn eo_parse(argv: Vec<str>, opts: Vec<EoOpt>) -> EoArgs {
+    var vals: Vec<str> = Vec::new();
+    var given: Vec<bool> = Vec::new();
+    var i: i64 = 0;
+    while i < opts.len() {
+        vals.push("");
+        given.push(false);
+        i = i + 1;
+    }
+    var kinds: Vec<i64> = Vec::new();
+    var idx: Vec<i64> = Vec::new();
+    var expl: Vec<str> = Vec::new();
+    var hexp: Vec<bool> = Vec::new();
+    var dashdash: bool = false;
+    i = 0;
+    while i < argv.len() {
+        val a: str = argv.get(i);
+        i = i + 1;
+        var msg: str = "";
+        var ex: str = "";
+        var he: bool = false;
+        if dashdash || a == "-" || !str_starts_with(a, "-") {
+            kinds.push(0);
+            idx.push(-1);
+            expl.push("");
+            hexp.push(false);
+            continue;
+        }
+        if a == "--" {
+            dashdash = true;
+            kinds.push(2);
+            idx.push(-1);
+            expl.push("");
+            hexp.push(false);
+            continue;
+        }
+        val f: i64 = eo_find_opt(opts, a, &mut msg, &mut ex, &mut he);
+        if f == -2 {
+            return EoArgs { vals: vals, given: given, code: eo_ap_error(msg) };
+        }
+        if f < 0 && (eo_negnum(a) || str_contains(a, " ")) {
+            kinds.push(0);
+        } else {
+            kinds.push(1);
+        }
+        idx.push(f);
+        expl.push(ex);
+        hexp.push(he);
+    }
+    var extras: Vec<str> = Vec::new();
+    i = 0;
+    while i < argv.len() {
+        val a2: str = argv.get(i);
+        val kd: i64 = kinds.get(i);
+        val f2: i64 = idx.get(i);
+        i = i + 1;
+        if kd == 2 { continue; }
+        if kd == 0 || f2 < 0 {
+            extras.push(a2);
+            continue;
+        }
+        val o: EoOpt = opts.get(f2);
+        var name: str = o.long;
+        if str_len(o.long) == 0 { name = o.short; } else if str_len(o.short) > 0 { name = o.short + "/" + o.long; }
+        if o.kind == EO_HELP {
+            io_print(eo_help());
+            return EoArgs { vals: vals, given: given, code: 0 };
+        }
+        if !o.takes {
+            if hexp.get(i - 1) {
+                return EoArgs { vals: vals, given: given,
+                    code: eo_ap_error("argument " + name + ": ignored explicit argument " + eo_repr(expl.get(i - 1))) };
+            }
+            given.set(f2, true);
+            vals.set(f2, "1");
+            continue;
+        }
+        var v: str = "";
+        if hexp.get(i - 1) {
+            v = expl.get(i - 1);
+        } else {
+            if i >= argv.len() || kinds.get(i) != 0 {
+                return EoArgs { vals: vals, given: given, code: eo_ap_error("argument " + name + ": expected one argument") };
+            }
+            v = argv.get(i);
+            i = i + 1;
+        }
+        if o.kind == EO_INT && !eo_is_int(v) {
+            return EoArgs { vals: vals, given: given, code: eo_ap_error("argument " + name + ": invalid int value: " + eo_repr(v)) };
+        }
+        if o.kind == EO_FLOAT && !eo_is_float(v) {
+            return EoArgs { vals: vals, given: given, code: eo_ap_error("argument " + name + ": invalid float value: " + eo_repr(v)) };
+        }
+        given.set(f2, true);
+        vals.set(f2, v);
+    }
+    if extras.len() > 0 {
+        var s: str = "";
+        var k: i64 = 0;
+        while k < extras.len() {
+            if k > 0 { s = s + " "; }
+            s = s + extras.get(k);
+            k = k + 1;
+        }
+        return EoArgs { vals: vals, given: given, code: eo_ap_error("unrecognized arguments: " + s) };
+    }
+    return EoArgs { vals: vals, given: given, code: -1 };
+}
+
+fn eo_val(a: &EoArgs, i: i64, def: str) -> str {
+    if a.given.get(i) { return a.vals.get(i); }
+    return def;
+}
+
+fn eo_flag(a: &EoArgs, i: i64) -> bool {
+    return a.given.get(i);
+}
+
+// ─── Running programs ───
+
+fn eo_join_list(v: Vec<str>) -> str {
+    val sep: str = char_to_str(31);
+    var s: str = "";
+    var i: i64 = 0;
+    while i < v.len() {
+        if i > 0 { s = s + sep; }
+        s = s + v.get(i);
+        i = i + 1;
+    }
+    return s;
+}
+
+/// What eo_run gives: the exit status (Python's: a crash on Windows as the
+/// unsigned code), timed_out when it was killed at the time limit,
+/// started false when it could not start; stdout and stderr decoded as
+/// UTF-8 with replacement; the seconds it took.
+struct EoRes {
+    started: bool,
+    timed_out: bool,
+    code: i64,
+    out: str,
+    err: str,
+    secs: f64,
+}
+
+var eo_run_ctr: i64 = 0;
+
+/// When set, eo_run decodes as subprocess.run(..., text=True) does: the
+/// locale's encoding (Windows: the ANSI code page, whose bytes are kept as
+/// they are; elsewhere UTF-8) and universal newlines.
+var eo_locale_mode: bool = false;
+
+/// Text a child wrote, as text=True gives it and print() writes it back:
+/// CR LF and a lone CR as LF; on Windows every other byte as it is
+/// (the code page's characters print as the same bytes) but NUL, which a
+/// str cannot hold (Python prints it); elsewhere UTF-8 with replacement.
+fn eo_locale(b: Vec<i64>) -> str {
+    var nl: Vec<i64> = Vec::new();
+    val n: i64 = b.len();
+    var i: i64 = 0;
+    while i < n {
+        val c: i64 = b.get(i);
+        if c == 13 {
+            nl.push(10);
+            if i + 1 < n && b.get(i + 1) == 10 { i = i + 1; }
+        } else {
+            nl.push(c);
+        }
+        i = i + 1;
+    }
+    return eo_raw(nl);
+}
+
+/// Bytes a child wrote, decoded as the locale's encoding (no newline
+/// translation): see eo_locale.
+fn eo_raw(b: Vec<i64>) -> str {
+    if !eo_win() { return eo_decode(b); }
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < b.len() {
+        if b.get(i) != 0 { out.push(b.get(i)); }
+        i = i + 1;
+    }
+    return str_from_bytes(out);
+}
+
+/// s[-n:] of text eo_locale or eo_raw made (Windows: one byte is one
+/// character of the code page).
+fn eo_ltail(s: str, n: i64) -> str {
+    if !eo_win() { return eo_tail(s, n); }
+    if str_len(s) <= n { return s; }
+    return str_slice(s, str_len(s) - n, str_len(s));
+}
+var eo_tmp: str = "";
+
+fn eo_tmpdir() -> str {
+    if str_len(eo_tmp) > 0 { return eo_tmp; }
+    var t: str = eo_env("TMPDIR");
+    if str_len(t) == 0 { t = eo_env("TEMP"); }
+    if str_len(t) == 0 { t = eo_env("TMP"); }
+    if str_len(t) == 0 {
+        if eo_win() { t = "."; } else { t = "/tmp"; }
+    }
+    eo_tmp = t;
+    return t;
+}
+
+/// A fresh temporary file name (nothing made).
+fn eo_tmpname(tag: str) -> str {
+    eo_run_ctr = eo_run_ctr + 1;
+    return eo_join(eo_tmpdir(), ".fid-" + tag + "-" + int_to_str(p_getpid()) + "-" + int_to_str(eo_run_ctr));
+}
+
+/// A child's exit code as Python's subprocess gives it: on Windows the
+/// unsigned 32-bit value; elsewhere a signal n (128 + n here) as -n when
+/// `signals` (a direct child, not a shell's status).
+fn eo_code(c: i64, signals: bool) -> i64 {
+    var code: i64 = c;
+    if eo_win() {
+        if code < 0 { code = code + 4294967296; }
+    } else if signals && code > 128 && code < 128 + 65 {
+        code = 128 - code;
+    }
+    return code;
+}
+
+/// subprocess.run(cmd, capture_output=True, timeout=...): stdin ours,
+/// stdout and stderr captured; `env` "NAME=value" entries added to ours;
+/// timeout_ms < 0: no limit.
+fn eo_run(cmd: Vec<str>, env: Vec<str>, timeout_ms: i64, signals: bool) -> EoRes {
+    val t0: i64 = p_clock_now_ms();
+    val base: str = eo_tmpname("run");
+    val outp: str = base + ".out";
+    val errp: str = base + ".err";
+    val h: i64 = process_spawn_files(cmd, env, "", outp, errp);
+    if h == 0 {
+        if fs_exists(outp) { fs_delete(outp); }
+        if fs_exists(errp) { fs_delete(errp); }
+        return EoRes { started: false, timed_out: false, code: -1, out: "", err: "", secs: 0.0 };
+    }
+    var timed_out: bool = false;
+    var code: i64 = -1;
+    match process_wait(h, timeout_ms) {
+        Option::Some(c) => {
+            code = eo_code(c, signals);
+        }
+        Option::None => {
+            timed_out = true;
+            process_kill(h);
+            process_wait(h, 10000);
+        }
+    }
+    process_release(h);
+    var out: str = "";
+    var err: str = "";
+    if !timed_out {
+        if eo_locale_mode {
+            out = eo_locale(fs_read_bytes(outp));
+            err = eo_locale(fs_read_bytes(errp));
+        } else {
+            out = eo_decode(fs_read_bytes(outp));
+            err = eo_decode(fs_read_bytes(errp));
+        }
+    }
+    if fs_exists(outp) { fs_delete(outp); }
+    if fs_exists(errp) { fs_delete(errp); }
+    val secs: f64 = ((p_clock_now_ms() - t0) as f64) / 1000.0;
+    return EoRes { started: true, timed_out: timed_out, code: code, out: out, err: err, secs: secs };
+}
+
+// SAFETY: FormatMessageA, declared by <windows.h>, which every generated
+// C file includes on Windows (`<stdint.h>` only makes the C backend use
+// the system's prototype); `buf` is a block of `size` bytes this file
+// allocated. Only the @cfg(windows) eo_winerr calls it.
+extern "C" include "<stdint.h>" {
+    fn FormatMessageA as eo_fmtmsg(flags: i64, src: i64, id: i64, lang: i64, buf: i64, size: i64, args: i64) -> i64;
+}
+
+/// The system's text for Windows error `n`, as Python shows it (trailing
+/// whitespace and dots removed).
+@cfg(windows)
+fn eo_winerr(n: i64) -> str {
+    var msg: str = "";
+    // SAFETY: a fresh 1024-byte block; FormatMessageA writes at most 1023
+    // bytes and a NUL into it (FROM_SYSTEM | IGNORE_INSERTS: no inserts
+    // are read), and the text is copied out before the block is freed.
+    unsafe {
+        val buf: i64 = p_malloc(1024);
+        if buf != 0 {
+            if eo_fmtmsg(4096 | 512, 0, n, 0, buf, 1023, 0) > 0 {
+                msg = p_str_from_ptr(buf);
+            }
+            p_free(buf);
+        }
+    }
+    var e: i64 = str_len(msg);
+    while e > 0 && (eo_ws(str_byte_at(msg, e - 1)) || str_byte_at(msg, e - 1) == 46) { e = e - 1; }
+    return str_slice(msg, 0, e);
+}
+
+@cfg(unix)
+fn eo_winerr(n: i64) -> str {
+    return "";
+}
+
+/// What Python prints for a program it cannot start (the last line of
+/// its traceback).
+fn eo_not_found(prog: str) -> str {
+    if eo_win() { return "FileNotFoundError: [WinError 2] " + eo_winerr(2); }
+    return "FileNotFoundError: [Errno 2] No such file or directory: " + eo_repr(prog);
+}
+
+fn eo_clone_list(v: &Vec<str>) -> Vec<str> {
+    var r: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < v.len() {
+        r.push(v.get(i));
+        i = i + 1;
+    }
+    return r;
+}
+
+/// Python's text mode on a captured stream: "\r\n" as "\n".
+fn eo_text(s: str) -> str {
+    return str_replace(s, "\r\n", "\n");
+}
+
+// ─── The forms (the script's a64_forms, rv_forms, x64_forms) ───
+
+struct EoForms {
+    arch: Vec<str>,
+    call: Vec<str>,
+    asm: Vec<str>,
+}
+
+fn eo_add(f: &mut EoForms, arch: str, call: str, asm: str) {
+    f.arch.push(arch);
+    f.call.push(call);
+    f.asm.push(asm);
+}
+
+fn eo_d(v: i64) -> str {
+    return int_to_str(v);
+}
+
+/// "%+d"
+fn eo_sd(v: i64) -> str {
+    if v >= 0 { return "+" + int_to_str(v); }
+    return int_to_str(v);
+}
+
+fn eo_xr(n: i64) -> str {
+    return "x" + int_to_str(n);
+}
+
+fn eo_sp(n: i64) -> str {
+    if n == 31 { return "sp"; }
+    return eo_xr(n);
+}
+
+fn eo_a64(f: &mut EoForms) {
+    val A: str = "a64";
+    val ccn: str = "eq ne hs lo mi pl hi ls ge lt gt le";
+    val ccv: Vec<i64> = eo_ints("0 1 2 3 4 5 8 9 10 11 12 13");
+    val cc_names: Vec<str> = eo_words(ccn);
+    var rd: Vec<i64> = eo_ints("0 9 19 16");
+    var rn: Vec<i64> = eo_ints("1 10 28 17");
+    var rm: Vec<i64> = eo_ints("2 11 30 5");
+    val ops: Vec<str> = eo_words("add adds sub subs and orr eor mul smulh umulh sdiv udiv lslv lsrv asrv");
+    val asms: Vec<str> = eo_words("add adds sub subs and orr eor mul smulh umulh sdiv udiv lsl lsr asr");
+    var r: i64 = 0;
+    while r < 4 {
+        val d: i64 = rd.get(r);
+        val n: i64 = rn.get(r);
+        val m: i64 = rm.get(r);
+        val dnm: str = eo_d(d) + ", " + eo_d(n) + ", " + eo_d(m);
+        val xdnm: str = eo_xr(d) + ", " + eo_xr(n) + ", " + eo_xr(m);
+        var k: i64 = 0;
+        while k < ops.len() {
+            eo_add(f, A, "a64_" + ops.get(k) + "(&mut e, " + dnm + ")", asms.get(k) + " " + xdnm);
+            k = k + 1;
+        }
+        eo_add(f, A, "a64_msub(&mut e, " + dnm + ", 3)", "msub " + xdnm + ", x3");
+        eo_add(f, A, "a64_mov(&mut e, " + eo_d(d) + ", " + eo_d(n) + ")", "mov " + eo_xr(d) + ", " + eo_xr(n));
+        eo_add(f, A, "a64_mvn(&mut e, " + eo_d(d) + ", " + eo_d(n) + ")", "mvn " + eo_xr(d) + ", " + eo_xr(n));
+        eo_add(f, A, "a64_neg(&mut e, " + eo_d(d) + ", " + eo_d(n) + ")", "neg " + eo_xr(d) + ", " + eo_xr(n));
+        eo_add(f, A, "a64_cmp(&mut e, " + eo_d(n) + ", " + eo_d(m) + ")", "cmp " + eo_xr(n) + ", " + eo_xr(m));
+        val dn: str = eo_d(d) + ", " + eo_d(n);
+        eo_add(f, A, "a64_sxtb(&mut e, " + dn + ")", "sxtb x" + eo_d(d) + ", w" + eo_d(n));
+        eo_add(f, A, "a64_sxth(&mut e, " + dn + ")", "sxth x" + eo_d(d) + ", w" + eo_d(n));
+        eo_add(f, A, "a64_sxtw(&mut e, " + dn + ")", "sxtw x" + eo_d(d) + ", w" + eo_d(n));
+        eo_add(f, A, "a64_uxtb(&mut e, " + dn + ")", "ubfx x" + eo_d(d) + ", x" + eo_d(n) + ", #0, #8");
+        eo_add(f, A, "a64_uxth(&mut e, " + dn + ")", "ubfx x" + eo_d(d) + ", x" + eo_d(n) + ", #0, #16");
+        eo_add(f, A, "a64_uxtw(&mut e, " + dn + ")", "ubfx x" + eo_d(d) + ", x" + eo_d(n) + ", #0, #32");
+        eo_add(f, A, "a64_asr63(&mut e, " + dn + ")", "asr x" + eo_d(d) + ", x" + eo_d(n) + ", #63");
+        k = 0;
+        while k < cc_names.len() {
+            eo_add(f, A, "a64_cset(&mut e, " + eo_d(d) + ", " + eo_d(ccv.get(k)) + ")", "cset x" + eo_d(d) + ", " + cc_names.get(k));
+            k = k + 1;
+        }
+        eo_add(f, A, "a64_blr(&mut e, " + eo_d(n) + ")", "blr x" + eo_d(n));
+        eo_add(f, A, "a64_br(&mut e, " + eo_d(n) + ")", "br x" + eo_d(n));
+        eo_add(f, A, "a64_ldaxr(&mut e, " + dn + ")", "ldaxr x" + eo_d(d) + ", [x" + eo_d(n) + "]");
+        eo_add(f, A, "a64_stlxr(&mut e, 11, " + dn + ")", "stlxr w11, x" + eo_d(d) + ", [x" + eo_d(n) + "]");
+        eo_add(f, A, "a64_ldar(&mut e, " + dn + ")", "ldar x" + eo_d(d) + ", [x" + eo_d(n) + "]");
+        eo_add(f, A, "a64_stlr(&mut e, " + dn + ")", "stlr x" + eo_d(d) + ", [x" + eo_d(n) + "]");
+        r = r + 1;
+    }
+    val id: Vec<i64> = eo_ints("0 9 31 31 5");
+    val inn: Vec<i64> = eo_ints("1 31 31 1 6");
+    val iim: Vec<i64> = eo_ints("0 16 4080 0 4095");
+    r = 0;
+    while r < 5 {
+        val args3: str = eo_d(id.get(r)) + ", " + eo_d(inn.get(r)) + ", " + eo_d(iim.get(r));
+        val ops3: str = eo_sp(id.get(r)) + ", " + eo_sp(inn.get(r)) + ", #" + eo_d(iim.get(r));
+        eo_add(f, A, "a64_add_imm(&mut e, " + args3 + ")", "add " + ops3);
+        eo_add(f, A, "a64_sub_imm(&mut e, " + args3 + ")", "sub " + ops3);
+        r = r + 1;
+    }
+    eo_add(f, A, "a64_add_ext(&mut e, 9, 31, 9)", "add x9, sp, x9");
+    eo_add(f, A, "a64_sub_ext(&mut e, 31, 31, 16)", "sub sp, sp, x16");
+    val lt: Vec<i64> = eo_ints("0 9 19 3");
+    val ln: Vec<i64> = eo_ints("1 31 16 29");
+    val li: Vec<i64> = eo_ints("0 8 4088 64");
+    r = 0;
+    while r < 4 {
+        val t: i64 = lt.get(r);
+        val n2: i64 = ln.get(r);
+        val imm: i64 = li.get(r);
+        val b: str = eo_sp(n2);
+        val tn: str = eo_d(t) + ", " + eo_d(n2) + ", ";
+        eo_add(f, A, "a64_ldr_sized(&mut e, " + tn + eo_d(imm) + ", 8, false)", "ldr x" + eo_d(t) + ", [" + b + ", #" + eo_d(imm) + "]");
+        eo_add(f, A, "a64_str_sized(&mut e, " + tn + eo_d(imm) + ", 8)", "str x" + eo_d(t) + ", [" + b + ", #" + eo_d(imm) + "]");
+        val i4: i64 = (imm / 2) & (0 - 4);
+        eo_add(f, A, "a64_ldr_sized(&mut e, " + tn + eo_d(i4) + ", 4, false)", "ldr w" + eo_d(t) + ", [" + b + ", #" + eo_d(i4) + "]");
+        eo_add(f, A, "a64_ldr_sized(&mut e, " + tn + eo_d(i4) + ", 4, true)", "ldrsw x" + eo_d(t) + ", [" + b + ", #" + eo_d(i4) + "]");
+        eo_add(f, A, "a64_str_sized(&mut e, " + tn + eo_d(i4) + ", 4)", "str w" + eo_d(t) + ", [" + b + ", #" + eo_d(i4) + "]");
+        val i2: i64 = (imm / 4) & (0 - 2);
+        eo_add(f, A, "a64_ldr_sized(&mut e, " + tn + eo_d(i2) + ", 2, false)", "ldrh w" + eo_d(t) + ", [" + b + ", #" + eo_d(i2) + "]");
+        eo_add(f, A, "a64_ldr_sized(&mut e, " + tn + eo_d(i2) + ", 2, true)", "ldrsh x" + eo_d(t) + ", [" + b + ", #" + eo_d(i2) + "]");
+        eo_add(f, A, "a64_str_sized(&mut e, " + tn + eo_d(i2) + ", 2)", "strh w" + eo_d(t) + ", [" + b + ", #" + eo_d(i2) + "]");
+        val i1: i64 = imm / 8;
+        eo_add(f, A, "a64_ldr_sized(&mut e, " + tn + eo_d(i1) + ", 1, false)", "ldrb w" + eo_d(t) + ", [" + b + ", #" + eo_d(i1) + "]");
+        eo_add(f, A, "a64_ldr_sized(&mut e, " + tn + eo_d(i1) + ", 1, true)", "ldrsb x" + eo_d(t) + ", [" + b + ", #" + eo_d(i1) + "]");
+        eo_add(f, A, "a64_str_sized(&mut e, " + tn + eo_d(i1) + ", 1)", "strb w" + eo_d(t) + ", [" + b + ", #" + eo_d(i1) + "]");
+        r = r + 1;
+    }
+    // RA13: register pairs of the prologue/epilogue
+    val p1: Vec<i64> = eo_ints("19 0 9 28");
+    val p2: Vec<i64> = eo_ints("20 1 10 29");
+    val pn: Vec<i64> = eo_ints("31 2 31 16");
+    val pi: Vec<i64> = eo_ints("-16 0 504 -512");
+    r = 0;
+    while r < 4 {
+        val a4: str = eo_d(p1.get(r)) + ", " + eo_d(p2.get(r)) + ", " + eo_d(pn.get(r)) + ", " + eo_d(pi.get(r));
+        val o4: str = "x" + eo_d(p1.get(r)) + ", x" + eo_d(p2.get(r)) + ", [" + eo_sp(pn.get(r)) + ", #" + eo_d(pi.get(r)) + "]";
+        eo_add(f, A, "a64_stp(&mut e, " + a4 + ")", "stp " + o4);
+        eo_add(f, A, "a64_ldp(&mut e, " + a4 + ")", "ldp " + o4);
+        r = r + 1;
+    }
+    val fd_: Vec<i64> = eo_ints("0 7");
+    val fn_: Vec<i64> = eo_ints("1 3");
+    val fm_: Vec<i64> = eo_ints("2 31");
+    val fops: Vec<str> = eo_words("fadd fsub fmul fdiv");
+    val fops2: Vec<str> = eo_words("fsqrt fabs frintm frintp frintz frinta");
+    r = 0;
+    while r < 2 {
+        val d: i64 = fd_.get(r);
+        val n: i64 = fn_.get(r);
+        val m: i64 = fm_.get(r);
+        var k: i64 = 0;
+        while k < fops.len() {
+            eo_add(f, A, "a64_" + fops.get(k) + "(&mut e, " + eo_d(d) + ", " + eo_d(n) + ", " + eo_d(m) + ")",
+                fops.get(k) + " d" + eo_d(d) + ", d" + eo_d(n) + ", d" + eo_d(m));
+            k = k + 1;
+        }
+        eo_add(f, A, "a64_fcmp(&mut e, " + eo_d(n) + ", " + eo_d(m) + ")", "fcmp d" + eo_d(n) + ", d" + eo_d(m));
+        k = 0;
+        while k < fops2.len() {
+            eo_add(f, A, "a64_" + fops2.get(k) + "(&mut e, " + eo_d(d) + ", " + eo_d(n) + ")", fops2.get(k) + " d" + eo_d(d) + ", d" + eo_d(n));
+            k = k + 1;
+        }
+        eo_add(f, A, "a64_fcvt_ds(&mut e, " + eo_d(d) + ", " + eo_d(n) + ")", "fcvt d" + eo_d(d) + ", s" + eo_d(n));
+        eo_add(f, A, "a64_fcvt_sd(&mut e, " + eo_d(d) + ", " + eo_d(n) + ")", "fcvt s" + eo_d(d) + ", d" + eo_d(n));
+        r = r + 1;
+    }
+    val md: Vec<i64> = eo_ints("0 2");
+    val mn: Vec<i64> = eo_ints("9 30");
+    r = 0;
+    while r < 2 {
+        val d: str = eo_d(md.get(r));
+        val n: str = eo_d(mn.get(r));
+        eo_add(f, A, "a64_fmov_dx(&mut e, " + d + ", " + n + ")", "fmov d" + d + ", x" + n);
+        eo_add(f, A, "a64_fmov_xd(&mut e, " + n + ", " + d + ")", "fmov x" + n + ", d" + d);
+        eo_add(f, A, "a64_fmov_sw(&mut e, " + d + ", " + n + ")", "fmov s" + d + ", w" + n);
+        eo_add(f, A, "a64_fmov_ws(&mut e, " + n + ", " + d + ")", "fmov w" + n + ", s" + d);
+        eo_add(f, A, "a64_scvtf(&mut e, " + d + ", " + n + ")", "scvtf d" + d + ", x" + n);
+        eo_add(f, A, "a64_fcvtzs(&mut e, " + n + ", " + d + ")", "fcvtzs x" + n + ", d" + d);
+        r = r + 1;
+    }
+    eo_add(f, A, "a64_ret(&mut e)", "ret");
+    eo_add(f, A, "a64_svc0(&mut e)", "svc #0");
+    eo_add(f, A, "a64_brk(&mut e)", "brk #0");
+    eo_add(f, A, "a64_clrex(&mut e)", "clrex");
+    eo_add(f, A, "a64_dmb(&mut e)", "dmb ish");
+    eo_add(f, A, "a64_cbnz_w_words(&mut e, 11, 0 - 3)", "cbnz w11, .-12");
+    eo_add(f, A, "a64_cbnz_words(&mut e, 4, 7)", "cbnz x4, .+28");
+    eo_add(f, A, "a64_bcond_words(&mut e, 1, 5)", "b.ne .+20");
+    eo_add(f, A, "a64_bcond_words(&mut e, 11, 0 - 2)", "b.lt .-8");
+}
+
+fn eo_rv(f: &mut EoForms) {
+    val R: str = "rv";
+    val rd: Vec<i64> = eo_ints("5 10 28 1");
+    val ra: Vec<i64> = eo_ints("6 11 29 8");
+    val rb: Vec<i64> = eo_ints("7 12 31 9");
+    val ops: Vec<str> = eo_words("add sub sll slt sltu xor srl sra or and mul mulh mulhu div divu rem remu");
+    val iops: Vec<str> = eo_words("addi xori andi sltiu addiw");
+    val imms: Vec<i64> = eo_ints("0 1 -1 2047 -2048");
+    val shs: Vec<i64> = eo_ints("0 1 32 63");
+    val shops: Vec<str> = eo_words("slli srli srai");
+    val mimms: Vec<i64> = eo_ints("0 8 -8 2040");
+    val sizes: Vec<i64> = eo_ints("8 4 2 1");
+    val lnames: Vec<str> = eo_words("ld lw lh lb");
+    val snames: Vec<str> = eo_words("sd sw sh sb");
+    var r: i64 = 0;
+    while r < 4 {
+        val d: str = eo_d(rd.get(r));
+        val a: str = eo_d(ra.get(r));
+        val b: str = eo_d(rb.get(r));
+        var k: i64 = 0;
+        while k < ops.len() {
+            eo_add(f, R, "rv_" + ops.get(k) + "(&mut e, " + d + ", " + a + ", " + b + ")", ops.get(k) + " x" + d + ", x" + a + ", x" + b);
+            k = k + 1;
+        }
+        var q: i64 = 0;
+        while q < imms.len() {
+            val imm: str = eo_d(imms.get(q));
+            k = 0;
+            while k < iops.len() {
+                eo_add(f, R, "rv_" + iops.get(k) + "(&mut e, " + d + ", " + a + ", " + imm + ")", iops.get(k) + " x" + d + ", x" + a + ", " + imm);
+                k = k + 1;
+            }
+            q = q + 1;
+        }
+        q = 0;
+        while q < shs.len() {
+            val sh: str = eo_d(shs.get(q));
+            k = 0;
+            while k < shops.len() {
+                eo_add(f, R, "rv_" + shops.get(k) + "(&mut e, " + d + ", " + a + ", " + sh + ")", shops.get(k) + " x" + d + ", x" + a + ", " + sh);
+                k = k + 1;
+            }
+            q = q + 1;
+        }
+        eo_add(f, R, "rv_mv(&mut e, " + d + ", " + a + ")", "addi x" + d + ", x" + a + ", 0");
+        eo_add(f, R, "rv_lui(&mut e, " + d + ", 74565)", "lui x" + d + ", 74565");
+        eo_add(f, R, "rv_jalr(&mut e, 1, " + a + ", 0)", "jalr x1, 0(x" + a + ")");
+        q = 0;
+        while q < mimms.len() {
+            val imm: str = eo_d(mimms.get(q));
+            k = 0;
+            while k < sizes.len() {
+                val size: i64 = sizes.get(k);
+                val sz: str = eo_d(size);
+                eo_add(f, R, "rv_load(&mut e, " + d + ", " + a + ", " + imm + ", " + sz + ", true)", lnames.get(k) + " x" + d + ", " + imm + "(x" + a + ")");
+                if size < 8 {
+                    eo_add(f, R, "rv_load(&mut e, " + d + ", " + a + ", " + imm + ", " + sz + ", false)",
+                        lnames.get(k) + "u x" + d + ", " + imm + "(x" + a + ")");
+                }
+                eo_add(f, R, "rv_store(&mut e, " + b + ", " + a + ", " + imm + ", " + sz + ")", snames.get(k) + " x" + b + ", " + imm + "(x" + a + ")");
+                k = k + 1;
+            }
+            q = q + 1;
+        }
+        eo_add(f, R, "rv_amoadd_d(&mut e, " + d + ", " + b + ", " + a + ")", "amoadd.d.aqrl x" + d + ", x" + b + ", (x" + a + ")");
+        eo_add(f, R, "rv_lr_d(&mut e, " + d + ", " + a + ")", "lr.d.aqrl x" + d + ", (x" + a + ")");
+        eo_add(f, R, "rv_sc_d(&mut e, " + d + ", " + b + ", " + a + ")", "sc.d.aqrl x" + d + ", x" + b + ", (x" + a + ")");
+        eo_add(f, R, "rv_b_off(&mut e, 0, " + a + ", " + b + ", 12)", "beq x" + a + ", x" + b + ", .+12");
+        eo_add(f, R, "rv_b_off(&mut e, 1, " + a + ", " + b + ", 0 - 12)", "bne x" + a + ", x" + b + ", .-12");
+        r = r + 1;
+    }
+    val fd_: Vec<i64> = eo_ints("0 3");
+    val fa_: Vec<i64> = eo_ints("1 31");
+    val fb_: Vec<i64> = eo_ints("2 7");
+    val fops: Vec<str> = eo_words("fadd_d fsub_d fmul_d fdiv_d fsgnj_d fsgnjx_d");
+    val cops: Vec<str> = eo_words("feq_d flt_d fle_d");
+    val rmn: Vec<str> = eo_words("rtz rdn rup rmm");
+    r = 0;
+    while r < 2 {
+        val d: str = eo_d(fd_.get(r));
+        val a: str = eo_d(fa_.get(r));
+        val b: str = eo_d(fb_.get(r));
+        var k: i64 = 0;
+        while k < fops.len() {
+            eo_add(f, R, "rv_" + fops.get(k) + "(&mut e, " + d + ", " + a + ", " + b + ")",
+                str_replace(fops.get(k), "_", ".") + " f" + d + ", f" + a + ", f" + b);
+            k = k + 1;
+        }
+        k = 0;
+        while k < cops.len() {
+            eo_add(f, R, "rv_" + cops.get(k) + "(&mut e, 10, " + a + ", " + b + ")", str_replace(cops.get(k), "_", ".") + " x10, f" + a + ", f" + b);
+            k = k + 1;
+        }
+        eo_add(f, R, "rv_fsqrt_d(&mut e, " + d + ", " + a + ")", "fsqrt.d f" + d + ", f" + a);
+        eo_add(f, R, "rv_fmv_dx(&mut e, " + d + ", 10)", "fmv.d.x f" + d + ", x10");
+        eo_add(f, R, "rv_fmv_xd(&mut e, 10, " + d + ")", "fmv.x.d x10, f" + d);
+        eo_add(f, R, "rv_fmv_wx(&mut e, " + d + ", 10)", "fmv.w.x f" + d + ", x10");
+        eo_add(f, R, "rv_fmv_xw(&mut e, 10, " + d + ")", "fmv.x.w x10, f" + d);
+        eo_add(f, R, "rv_fcvt_dl(&mut e, " + d + ", 11)", "fcvt.d.l f" + d + ", x11");
+        eo_add(f, R, "rv_fcvt_ld(&mut e, 11, " + d + ")", "fcvt.l.d x11, f" + d + ", rtz");
+        eo_add(f, R, "rv_fcvt_ds(&mut e, " + d + ", " + a + ")", "fcvt.d.s f" + d + ", f" + a);
+        eo_add(f, R, "rv_fcvt_sd(&mut e, " + d + ", " + a + ")", "fcvt.s.d f" + d + ", f" + a);
+        k = 0;
+        while k < 4 {
+            eo_add(f, R, "rv_fcvt_ld_rm(&mut e, 12, " + d + ", " + eo_d(k + 1) + ")", "fcvt.l.d x12, f" + d + ", " + rmn.get(k));
+            k = k + 1;
+        }
+        r = r + 1;
+    }
+    eo_add(f, R, "rv_ret(&mut e)", "ret");
+    eo_add(f, R, "rv_ecall(&mut e)", "ecall");
+    eo_add(f, R, "rv_ebreak(&mut e)", "ebreak");
+    eo_add(f, R, "rv_fence(&mut e)", "fence rw, rw");
+    eo_add(f, R, "rv_jalr(&mut e, 0, 5, 0)", "jalr x0, 0(x5)");
+}
+
+fn eo_x64(f: &mut EoForms) {
+    val X: str = "x64";
+    val R: Vec<str> = eo_words("rax rcx rdx rbx rsp rbp rsi rdi r8 r9 r10 r11 r12 r13 r14 r15");
+    val R32: Vec<str> = eo_words("eax ecx edx ebx esp ebp esi edi r8d r9d r10d r11d r12d r13d r14d r15d");
+    val R16: Vec<str> = eo_words("ax cx dx bx sp bp si di r8w r9w r10w r11w r12w r13w r14w r15w");
+    val R8: Vec<str> = eo_words("al cl dl bl spl bpl sil dil r8b r9b r10b r11b r12b r13b r14b r15b");
+    val pd: Vec<i64> = eo_ints("0 3 15 10 6 8");
+    val ps: Vec<i64> = eo_ints("1 12 7 11 13 5");
+    val alu_codes: Vec<i64> = eo_ints("1 9 33 41 49 57");
+    val alu_names: Vec<str> = eo_words("add or and sub xor cmp");
+    var r: i64 = 0;
+    while r < pd.len() {
+        val d: i64 = pd.get(r);
+        val s: i64 = ps.get(r);
+        val ds: str = eo_d(d) + ", " + eo_d(s);
+        eo_add(f, X, "x64_mov(&mut e, " + ds + ")", "mov " + R.get(d) + ", " + R.get(s));
+        eo_add(f, X, "x64_mov32(&mut e, " + ds + ")", "mov " + R32.get(d) + ", " + R32.get(s));
+        var k: i64 = 0;
+        while k < alu_codes.len() {
+            eo_add(f, X, "x64_alu(&mut e, " + eo_d(alu_codes.get(k)) + ", " + ds + ")", alu_names.get(k) + " " + R.get(d) + ", " + R.get(s));
+            k = k + 1;
+        }
+        eo_add(f, X, "x64_imul(&mut e, " + ds + ")", "imul " + R.get(d) + ", " + R.get(s));
+        eo_add(f, X, "x64_test(&mut e, " + ds + ")", "test " + R.get(d) + ", " + R.get(s));
+        eo_add(f, X, "x64_movx(&mut e, 182, " + ds + ")", "movzx " + R.get(d) + ", " + R8.get(s));
+        eo_add(f, X, "x64_movx(&mut e, 183, " + ds + ")", "movzx " + R.get(d) + ", " + R16.get(s));
+        eo_add(f, X, "x64_movx(&mut e, 190, " + ds + ")", "movsx " + R.get(d) + ", " + R8.get(s));
+        eo_add(f, X, "x64_movx(&mut e, 191, " + ds + ")", "movsx " + R.get(d) + ", " + R16.get(s));
+        eo_add(f, X, "x64_movx(&mut e, 99, " + ds + ")", "movsxd " + R.get(d) + ", " + R32.get(s));
+        r = r + 1;
+    }
+    val rs: Vec<i64> = eo_ints("0 3 7 9 12 15");
+    val f7e: Vec<i64> = eo_ints("2 3 4 5 6 7");
+    val f7n: Vec<str> = eo_words("not neg mul imul div idiv");
+    val she: Vec<i64> = eo_ints("4 5 7");
+    val shn: Vec<str> = eo_words("shl shr sar");
+    val ccs: Vec<i64> = eo_ints("4 5 12 13 14 15 2 7");
+    val ccn: Vec<str> = eo_words("e ne l ge le g b a");
+    r = 0;
+    while r < rs.len() {
+        val x: i64 = rs.get(r);
+        val xs: str = eo_d(x);
+        var k: i64 = 0;
+        while k < f7e.len() {
+            eo_add(f, X, "x64_f7(&mut e, " + eo_d(f7e.get(k)) + ", " + xs + ")", f7n.get(k) + " " + R.get(x));
+            k = k + 1;
+        }
+        k = 0;
+        while k < she.len() {
+            eo_add(f, X, "x64_shift_cl(&mut e, " + eo_d(she.get(k)) + ", " + xs + ")", shn.get(k) + " " + R.get(x) + ", cl");
+            k = k + 1;
+        }
+        eo_add(f, X, "x64_shift_imm(&mut e, 7, " + xs + ", 63)", "sar " + R.get(x) + ", 63");
+        eo_add(f, X, "x64_call_r(&mut e, " + xs + ")", "call " + R.get(x));
+        eo_add(f, X, "x64_jmp_r(&mut e, " + xs + ")", "jmp " + R.get(x));
+        eo_add(f, X, "x64_push(&mut e, " + xs + ")", "push " + R.get(x));
+        eo_add(f, X, "x64_pop(&mut e, " + xs + ")", "pop " + R.get(x));
+        k = 0;
+        while k < ccs.len() {
+            eo_add(f, X, "x64_setcc(&mut e, " + eo_d(ccs.get(k)) + ", " + xs + ")", "set" + ccn.get(k) + " " + R8.get(x));
+            k = k + 1;
+        }
+        // 0, 1, 127, 4294967295, -1, -2147483648, 9223372036854775807, 4294967296
+        eo_add(f, X, "x64_li(&mut e, " + xs + ", 0)", "xor " + R32.get(x) + ", " + R32.get(x));
+        eo_add(f, X, "x64_li(&mut e, " + xs + ", 1)", "mov " + R32.get(x) + ", 1");
+        eo_add(f, X, "x64_li(&mut e, " + xs + ", 127)", "mov " + R32.get(x) + ", 127");
+        eo_add(f, X, "x64_li(&mut e, " + xs + ", 4294967295)", "mov " + R32.get(x) + ", 4294967295");
+        eo_add(f, X, "x64_li(&mut e, " + xs + ", 0 - 1)", "mov " + R.get(x) + ", -1");
+        eo_add(f, X, "x64_li(&mut e, " + xs + ", 0 - 2147483648)", "mov " + R.get(x) + ", -2147483648");
+        eo_add(f, X, "x64_li(&mut e, " + xs + ", 9223372036854775807)", "movabs " + R.get(x) + ", 9223372036854775807");
+        eo_add(f, X, "x64_li(&mut e, " + xs + ", 4294967296)", "movabs " + R.get(x) + ", 4294967296");
+        eo_add(f, X, "x64_add_imm(&mut e, " + xs + ", 8)", "add " + R.get(x) + ", 8");
+        eo_add(f, X, "x64_sub_imm(&mut e, " + xs + ", 1000)", "sub " + R.get(x) + ", 1000");
+        r = r + 1;
+    }
+    val md: Vec<i64> = eo_ints("0 3 12 7 15 9");
+    val mb_: Vec<i64> = eo_ints("4 5 13 4 12 10");
+    val mdisp: Vec<i64> = eo_ints("0 16 0 4096 -8 200");
+    r = 0;
+    while r < md.len() {
+        val d: i64 = md.get(r);
+        val b: i64 = mb_.get(r);
+        val disp: i64 = mdisp.get(r);
+        var mb: str = "[" + R.get(b) + "]";
+        if b == 5 || b == 13 { mb = "[" + R.get(b) + "+0]"; }
+        var m: str = mb;
+        if disp != 0 { m = "[" + R.get(b) + eo_sd(disp) + "]"; }
+        val dbd: str = eo_d(d) + ", " + eo_d(b) + ", " + eo_d(disp);
+        eo_add(f, X, "x64_load(&mut e, " + dbd + ", 8, true)", "mov " + R.get(d) + ", qword ptr " + m);
+        eo_add(f, X, "x64_load(&mut e, " + dbd + ", 4, true)", "movsxd " + R.get(d) + ", dword ptr " + m);
+        eo_add(f, X, "x64_load(&mut e, " + dbd + ", 4, false)", "mov " + R32.get(d) + ", dword ptr " + m);
+        eo_add(f, X, "x64_load(&mut e, " + dbd + ", 2, true)", "movsx " + R.get(d) + ", word ptr " + m);
+        eo_add(f, X, "x64_load(&mut e, " + dbd + ", 2, false)", "movzx " + R.get(d) + ", word ptr " + m);
+        eo_add(f, X, "x64_load(&mut e, " + dbd + ", 1, true)", "movsx " + R.get(d) + ", byte ptr " + m);
+        eo_add(f, X, "x64_load(&mut e, " + dbd + ", 1, false)", "movzx " + R.get(d) + ", byte ptr " + m);
+        eo_add(f, X, "x64_store(&mut e, " + dbd + ", 8)", "mov qword ptr " + m + ", " + R.get(d));
+        eo_add(f, X, "x64_store(&mut e, " + dbd + ", 4)", "mov dword ptr " + m + ", " + R32.get(d));
+        eo_add(f, X, "x64_store(&mut e, " + dbd + ", 2)", "mov word ptr " + m + ", " + R16.get(d));
+        eo_add(f, X, "x64_store(&mut e, " + dbd + ", 1)", "mov byte ptr " + m + ", " + R8.get(d));
+        eo_add(f, X, "x64_lea(&mut e, " + dbd + ")", "lea " + R.get(d) + ", " + m);
+        val bd: str = eo_d(b) + ", " + eo_d(d);
+        eo_add(f, X, "x64_xchg_mem(&mut e, " + bd + ")", "xchg qword ptr " + mb + ", " + R.get(d));
+        eo_add(f, X, "x64_lock_xadd(&mut e, " + bd + ")", "lock xadd qword ptr " + mb + ", " + R.get(d));
+        eo_add(f, X, "x64_lock_cmpxchg(&mut e, " + bd + ")", "lock cmpxchg qword ptr " + mb + ", " + R.get(d));
+        r = r + 1;
+    }
+    val qx: Vec<i64> = eo_ints("0 1 2 9");
+    val qr: Vec<i64> = eo_ints("7 6 12 3");
+    r = 0;
+    while r < qx.len() {
+        val x: i64 = qx.get(r);
+        val g: i64 = qr.get(r);
+        val xg: str = eo_d(x) + ", " + eo_d(g);
+        val gx: str = eo_d(g) + ", " + eo_d(x);
+        eo_add(f, X, "x64_movq_xr(&mut e, " + xg + ", true)", "movq xmm" + eo_d(x) + ", " + R.get(g));
+        eo_add(f, X, "x64_movq_rx(&mut e, " + gx + ", true)", "movq " + R.get(g) + ", xmm" + eo_d(x));
+        eo_add(f, X, "x64_movq_xr(&mut e, " + xg + ", false)", "movd xmm" + eo_d(x) + ", " + R32.get(g));
+        eo_add(f, X, "x64_movq_rx(&mut e, " + gx + ", false)", "movd " + R32.get(g) + ", xmm" + eo_d(x));
+        eo_add(f, X, "x64_cvtsi2sd(&mut e, " + xg + ")", "cvtsi2sd xmm" + eo_d(x) + ", " + R.get(g));
+        eo_add(f, X, "x64_cvttsd2si(&mut e, " + gx + ")", "cvttsd2si " + R.get(g) + ", xmm" + eo_d(x));
+        r = r + 1;
+    }
+    val sa: Vec<i64> = eo_ints("0 2 1");
+    val sb: Vec<i64> = eo_ints("1 3 0");
+    val spre: Vec<i64> = eo_ints("242 242 242 242 242 243 242 102");
+    val sop: Vec<i64> = eo_ints("88 92 89 94 81 90 90 46");
+    val sname: Vec<str> = eo_words("addsd subsd mulsd divsd sqrtsd cvtss2sd cvtsd2ss ucomisd");
+    r = 0;
+    while r < sa.len() {
+        val a: str = eo_d(sa.get(r));
+        val b: str = eo_d(sb.get(r));
+        var k: i64 = 0;
+        while k < sop.len() {
+            eo_add(f, X, "x64_sse(&mut e, " + eo_d(spre.get(k)) + ", " + eo_d(sop.get(k)) + ", " + a + ", " + b + ")",
+                sname.get(k) + " xmm" + a + ", xmm" + b);
+            k = k + 1;
+        }
+        k = 9;
+        while k <= 11 {
+            eo_add(f, X, "x64_roundsd(&mut e, " + a + ", " + b + ", " + eo_d(k) + ")", "roundsd xmm" + a + ", xmm" + b + ", " + eo_d(k));
+            k = k + 1;
+        }
+        r = r + 1;
+    }
+    eo_add(f, X, "x64_cqo(&mut e)", "cqo");
+    eo_add(f, X, "x64_ret(&mut e)", "ret");
+    eo_add(f, X, "x64_ud2(&mut e)", "ud2");
+    eo_add(f, X, "x64_syscall(&mut e)", "syscall");
+    eo_add(f, X, "x64_mfence(&mut e)", "mfence");
+    eo_add(f, X, "x64_vfmadd213sd_012(&mut e)", "vfmadd213sd xmm0, xmm1, xmm2");
+    eo_add(f, X, "x64_load_fs(&mut e, 7, 64)", "mov rdi, qword ptr fs:[64]");
+}
+
+/// The integers of a list written as words ("-8" negative).
+fn eo_ints(s: str) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    val w: Vec<str> = eo_words(s);
+    var i: i64 = 0;
+    while i < w.len() {
+        val t: str = w.get(i);
+        if str_starts_with(t, "-") {
+            out.push(0 - str_parse_int(str_slice(t, 1, str_len(t))));
+        } else {
+            out.push(str_parse_int(t));
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// s.split() of a list written as words.
+fn eo_words(s: str) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    val parts: Vec<str> = eo_split(s, " ");
+    var i: i64 = 0;
+    while i < parts.len() {
+        if str_len(parts.get(i)) > 0 { out.push(parts.get(i)); }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// s.split() (any run of whitespace).
+fn eo_fields(s: str) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    val n: i64 = str_len(s);
+    while i < n {
+        while i < n && eo_ws(str_byte_at(s, i)) { i = i + 1; }
+        val st: i64 = i;
+        while i < n && !eo_ws(str_byte_at(s, i)) { i = i + 1; }
+        if i > st { out.push(str_slice(s, st, i)); }
+    }
+    return out;
+}
+
+fn eo_program_head() -> str {
+    var h: str = "// Generated by scripts/enc-oracle.py: each line is \"arch|word\" for one form.\n";
+    h = h + "use core;\nuse vec;\nuse string;\nuse compiler::nat_enc;\n\n";
+    h = h + "fn hex(v: i64) -> str {\n";
+    h = h + "    var digits: str = \"0123456789abcdef\";\n";
+    h = h + "    var out: str = \"\";\n";
+    h = h + "    var i: i64 = 7;\n";
+    h = h + "    while i >= 0 {\n";
+    h = h + "        var d: i64 = (v >> (i * 4)) & 15;\n";
+    h = h + "        out = out + str_slice(digits, d, d + 1);\n";
+    h = h + "        i = i - 1;\n";
+    h = h + "    }\n";
+    h = h + "    return out;\n";
+    h = h + "}\n\n";
+    h = h + "fn word(e: &NatEnc) -> str {\n";
+    h = h + "    var w: i64 = e.code.get(0) | (e.code.get(1) << 8) | (e.code.get(2) << 16) | (e.code.get(3) << 24);\n";
+    h = h + "    var n: str = int_to_str(e.code.len() / 4);\n";
+    h = h + "    return hex(w) + \" \" + n;\n";
+    h = h + "}\n\n";
+    h = h + "fn bytes(e: &NatEnc) -> str {\n";
+    h = h + "    var out: str = \"\";\n";
+    h = h + "    var i: i64 = 0;\n";
+    h = h + "    while i < e.code.len() {\n";
+    h = h + "        out = out + str_slice(hex(e.code.get(i)), 6, 8);\n";
+    h = h + "        i = i + 1;\n";
+    h = h + "    }\n";
+    h = h + "    return out + \" \" + int_to_str(e.code.len());\n";
+    h = h + "}\n\n";
+    h = h + "fn main() -> i64 {\n";
+    h = h + "    var e: NatEnc = NatEnc_new();\n";
+    return h;
+}
+
+// ─── ELF and numbers ───
+
+fn eo_u(b: &Vec<i64>, off: i64, n: i64) -> i64 {
+    var v: i64 = 0;
+    var k: i64 = n - 1;
+    while k >= 0 {
+        var x: i64 = 0;
+        if off + k < b.len() { x = b.get(off + k); }
+        v = (v << 8) | x;
+        k = k - 1;
+    }
+    return v;
+}
+
+/// elf_text(path): the bytes of the .text section; `ok` false when there
+/// is none (the script stops: "no .text in <path>").
+fn eo_elf_text(path: str, ok: &mut bool) -> Vec<i64> {
+    *ok = false;
+    val data: Vec<i64> = fs_read_bytes(path);
+    var out: Vec<i64> = Vec::new();
+    if data.len() < 64 { return out; }
+    val shoff: i64 = eo_u(&data, 40, 8);
+    val shentsize: i64 = eo_u(&data, 58, 2);
+    val shnum: i64 = eo_u(&data, 60, 2);
+    val shstrndx: i64 = eo_u(&data, 62, 2);
+    val stroff: i64 = eo_u(&data, shoff + shstrndx * shentsize + 24, 8);
+    var i: i64 = 0;
+    while i < shnum {
+        val sh: i64 = shoff + i * shentsize;
+        var at: i64 = stroff + eo_u(&data, sh, 4);
+        var name: str = "";
+        while at < data.len() && data.get(at) != 0 {
+            name = name + char_to_str(data.get(at));
+            at = at + 1;
+        }
+        if name == ".text" {
+            val off: i64 = eo_u(&data, sh + 24, 8);
+            val size: i64 = eo_u(&data, sh + 32, 8);
+            var k: i64 = 0;
+            while k < size && off + k < data.len() {
+                out.push(data.get(off + k));
+                k = k + 1;
+            }
+            *ok = true;
+            return out;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// "%08x" (a negative number: "-" and 7 digits)
+fn eo_x8(v: i64) -> str {
+    if v < 0 { return "-" + eo_hexw(0 - v, 7); }
+    return eo_hexw(v, 8);
+}
+
+fn eo_hexval(c: i64) -> i64 {
+    if c >= 48 && c <= 57 { return c - 48; }
+    if c >= 97 && c <= 102 { return c - 87; }
+    if c >= 65 && c <= 70 { return c - 55; }
+    return -1;
+}
+
+/// int(s, 16)
+fn eo_parse_hex(s: str) -> i64 {
+    var v: i64 = 0;
+    var i: i64 = 0;
+    while i < str_len(s) {
+        v = v * 16 + eo_hexval(str_byte_at(s, i));
+        i = i + 1;
+    }
+    return v;
+}
+
+/// bytes.fromhex(s)
+fn eo_fromhex(s: str) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i + 1 < str_len(s) {
+        out.push(eo_hexval(str_byte_at(s, i)) * 16 + eo_hexval(str_byte_at(s, i + 1)));
+        i = i + 2;
+    }
+    return out;
+}
+
+/// bytes.hex()
+fn eo_tohex(b: &Vec<i64>) -> str {
+    var s: str = "";
+    var i: i64 = 0;
+    while i < b.len() {
+        s = s + eo_hexw(b.get(i), 2);
+        i = i + 1;
+    }
+    return s;
+}
+
+/// The assembler for one architecture: <zig> cc -target <t> -c s -o o.
+/// "" when it worked, else what Python prints before it stops.
+fn eo_assemble(zig: str, target: str, s_path: str, o_path: str, code: &mut i64) -> str {
+    var cmd: Vec<str> = Vec::new();
+    cmd.push(zig);
+    cmd.push("cc");
+    cmd.push("-target");
+    cmd.push(target);
+    cmd.push("-c");
+    cmd.push(s_path);
+    cmd.push("-o");
+    cmd.push(o_path);
+    val r: EoRes = eo_run(cmd, Vec::new(), -1, false);
+    *code = 0;
+    if !r.started {
+        *code = 1;
+        return eo_not_found(zig) + "\n";
+    }
+    if r.code != 0 {
+        *code = 1;
+        return eo_text(r.err) + "the assembler refused " + s_path + "\n";
+    }
+    return "";
+}
+
+fn main() -> i64 {
+    var av: Vec<str> = args_all();
+    var rest: Vec<str> = Vec::new();
+    var i: i64 = 1;
+    while i < av.len() {
+        rest.push(av.get(i));
+        i = i + 1;
+    }
+    var opts: Vec<EoOpt> = Vec::new();
+    opts.push(eo_opt("--fid", "", EO_STR));      // 0
+    opts.push(eo_opt("--zig", "", EO_STR));      // 1
+    opts.push(eo_opt("--help", "-h", EO_HELP));  // 2
+    val a: EoArgs = eo_parse(rest, opts);
+    if a.code >= 0 { return a.code; }
+    var fid_def: str = "release/fid";
+    if eo_win() { fid_def = "release/fid.exe"; }
+    val fid: str = eo_val(&a, 0, fid_def);
+    val zig: str = eo_val(&a, 1, "zig");
+    val out: str = eo_join("build", "enc-oracle");
+    eo_makedirs(out);
+    // every run is subprocess.run(..., text=True)
+    eo_locale_mode = true;
+    var f: EoForms = EoForms { arch: Vec::new(), call: Vec::new(), asm: Vec::new() };
+    eo_a64(&mut f);
+    eo_rv(&mut f);
+    eo_x64(&mut f);
+    var prog: str = eo_program_head();
+    i = 0;
+    while i < f.arch.len() {
+        var fnn: str = "word";
+        if f.arch.get(i) == "x64" { fnn = "bytes"; }
+        prog = prog + "    e = NatEnc_new(); " + f.call.get(i) + "; print(\"" + f.arch.get(i) + "|\" + " + fnn + "(&e) + \"\\n\");\n";
+        i = i + 1;
+    }
+    prog = prog + "    return 0;\n}\n";
+    val src: str = eo_join(out, "oracle.fd");
+    fs_write_text(src, prog);
+    var cmd: Vec<str> = Vec::new();
+    cmd.push(fid);
+    cmd.push("run");
+    cmd.push(src);
+    val r: EoRes = eo_run(cmd, Vec::new(), -1, false);
+    if !r.started {
+        io_eprintln(eo_not_found(fid));
+        return 1;
+    }
+    val so: str = eo_text(r.out);
+    val all: Vec<str> = eo_splitlines(so);
+    var lines: Vec<str> = Vec::new();
+    i = 0;
+    while i < all.len() {
+        if str_contains(all.get(i), "|") { lines.push(all.get(i)); }
+        i = i + 1;
+    }
+    if lines.len() != f.arch.len() {
+        io_eprint(eo_ltail(so, 2000) + eo_ltail(r.err, 2000));
+        io_eprintln("the encoder program printed " + int_to_str(lines.len()) + " of " + int_to_str(f.arch.len()) + " words");
+        return 1;
+    }
+    // per form: the word (a64, rv) or the bytes as hex (x64), and the count
+    var hexs: Vec<str> = Vec::new();
+    var counts: Vec<i64> = Vec::new();
+    i = 0;
+    while i < lines.len() {
+        val parts: Vec<str> = eo_split(lines.get(i), "|");
+        val fl: Vec<str> = eo_fields(parts.get(1));
+        if fl.len() != 2 {
+            io_eprintln("ValueError: not enough values to unpack (expected 2, got " + int_to_str(fl.len()) + ")");
+            return 1;
+        }
+        hexs.push(fl.get(0));
+        counts.push(eo_int(fl.get(1)));
+        i = i + 1;
+    }
+    var bad: i64 = 0;
+    var total: i64 = 0;
+    val archs: Vec<str> = eo_words("a64 rv");
+    val targets: Vec<str> = eo_words("aarch64-linux-musl riscv64-linux-musl");
+    var q: i64 = 0;
+    while q < 2 {
+        val arch: str = archs.get(q);
+        val s_path: str = eo_join(out, arch + ".s");
+        val o_path: str = eo_join(out, arch + ".o");
+        var s: str = ".text\n";
+        if arch == "rv" { s = ".text\n.option norvc\n"; }
+        i = 0;
+        while i < f.arch.len() {
+            if f.arch.get(i) == arch { s = s + f.asm.get(i) + "\n"; }
+            i = i + 1;
+        }
+        fs_write_text(s_path, s);
+        var code: i64 = 0;
+        val msg: str = eo_assemble(zig, targets.get(q), s_path, o_path, &mut code);
+        if code != 0 {
+            io_eprint(msg);
+            return code;
+        }
+        var ok: bool = false;
+        val text: Vec<i64> = eo_elf_text(o_path, &mut ok);
+        if !ok {
+            io_eprintln("no .text in " + o_path);
+            return 1;
+        }
+        var k: i64 = 0;
+        i = 0;
+        while i < f.arch.len() {
+            if f.arch.get(i) == arch {
+                total = total + 1;
+                val w: i64 = eo_parse_hex(hexs.get(i));
+                val nwords: i64 = counts.get(i);
+                var theirs: i64 = -1;
+                if 4 * k + 4 <= text.len() { theirs = eo_u(&text, 4 * k, 4); }
+                if nwords != 1 || theirs != w {
+                    bad = bad + 1;
+                    println("MISMATCH " + eo_ljust(arch, 4) + " " + eo_ljust(f.asm.get(i), 40) + " ours " + eo_x8(w) + " ("
+                        + int_to_str(nwords) + " words)  clang " + eo_x8(theirs) + "   " + f.call.get(i));
+                }
+                k = k + 1;
+            }
+            i = i + 1;
+        }
+        q = q + 1;
+    }
+    // x86-64: each instruction at a 16-byte boundary, nops after it
+    val xs_path: str = eo_join(out, "x64.s");
+    val xo_path: str = eo_join(out, "x64.o");
+    var xs: str = ".intel_syntax noprefix\n.text\n";
+    i = 0;
+    while i < f.arch.len() {
+        if f.arch.get(i) == "x64" { xs = xs + ".p2align 4, 0x90\n" + f.asm.get(i) + "\n"; }
+        i = i + 1;
+    }
+    xs = xs + ".p2align 4, 0x90\n";
+    fs_write_text(xs_path, xs);
+    var xcode: i64 = 0;
+    val xmsg: str = eo_assemble(zig, "x86_64-linux-musl", xs_path, xo_path, &mut xcode);
+    if xcode != 0 {
+        io_eprint(xmsg);
+        return xcode;
+    }
+    var xok: bool = false;
+    val xtext: Vec<i64> = eo_elf_text(xo_path, &mut xok);
+    if !xok {
+        io_eprintln("no .text in " + xo_path);
+        return 1;
+    }
+    var k2: i64 = 0;
+    i = 0;
+    while i < f.arch.len() {
+        if f.arch.get(i) == "x64" {
+            total = total + 1;
+            val ob: Vec<i64> = eo_fromhex(hexs.get(i));
+            var theirs: Vec<i64> = Vec::new();
+            var mine: Vec<i64> = Vec::new();
+            var j: i64 = 0;
+            while j < 16 {
+                if 16 * k2 + j < xtext.len() { theirs.push(xtext.get(16 * k2 + j)); }
+                if j < ob.len() { mine.push(ob.get(j)); } else { mine.push(144); }
+                j = j + 1;
+            }
+            var same: bool = theirs.len() == mine.len();
+            j = 0;
+            while same && j < mine.len() {
+                if theirs.get(j) != mine.get(j) { same = false; }
+                j = j + 1;
+            }
+            if !same {
+                bad = bad + 1;
+                // theirs.rstrip(b'\x90')
+                var cut: Vec<i64> = Vec::new();
+                var end: i64 = theirs.len();
+                while end > 0 && theirs.get(end - 1) == 144 { end = end - 1; }
+                j = 0;
+                while j < end {
+                    cut.push(theirs.get(j));
+                    j = j + 1;
+                }
+                println("MISMATCH x64  " + eo_ljust(f.asm.get(i), 40) + " ours " + eo_tohex(&ob) + "  clang " + eo_tohex(&cut) + "   " + f.call.get(i));
+            }
+            k2 = k2 + 1;
+        }
+        i = i + 1;
+    }
+    println(int_to_str(total) + " forms, " + int_to_str(bad) + " mismatches");
+    if bad > 125 { return 125; }
+    return bad;
+}

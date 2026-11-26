@@ -1,0 +1,288 @@
+// tools/fuzz_nightly.fd — nightly fuzzing (release M9): the Fides port of
+// scripts/fuzz/nightly.sh (roadmap AD4). Same environment variables, the
+// same runs in the same order, the same output and exit status; the
+// Python tools it ran are the Fides ports: tools/fuzz_gen.fd (for
+// scripts/fuzz/gen_programs.py) and tools/fuzz_triage.fd (triage.py).
+//
+//   fid ccompile tools/fuzz_nightly.fd -o fuzz_nightly.exe
+//   FID=release/fid.exe fuzz_nightly.exe            # 300 programs
+//   N=1000 SEED=42 fuzz_nightly.exe
+//   N=3000 BATCH=25 OUT=build/fuzz/long fuzz_nightly.exe   # long run
+//
+// FID (default release/fid, else release/fid.exe), N (300), SEED (the
+// date, YYYYMMDD), OUT (build/fuzz/YYYY-MM-DD), BATCH (1), RETRIES (1),
+// RUN_TIMEOUT (60), CC (zig cc), FUZZ_BACKENDS and NO_NATIVE are read as
+// the script reads them: random programs on every backend of this host
+// (gen_programs, then the same number with --rich under $OUT/rich), what
+// the kept failures have in common (triage), and on Linux and macOS with
+// clang twenty programs under ASan/UBSan.
+//
+// The two tools it runs: FUZZ_GEN and FUZZ_TRIAGE name built ones;
+// otherwise fuzz_gen(.exe) and fuzz_triage(.exe) beside this program, else
+// they are built with `$FID ccompile` into the temp directory first
+// (nothing of that is printed). Run from the repository root (the script
+// cds there itself). SEED and OUT come from `date` when there is one (Git
+// Bash, Unix), else from the clock in UTC.
+
+use core;
+use fs;
+use io;
+use process;
+use fuzz_lib;
+use fuzz_programs;
+
+fn env_or(name: str, def: str) -> str {
+    val v: str = fl_env(name);
+    if str_len(v) == 0 { return def; }
+    return v;
+}
+
+/// `[ -x "$f" ]` (MSYS also finds f.exe)
+fn executable(f: str) -> bool {
+    if fs_is_file(f) { return true; }
+    return fl_win() && fs_is_file(f + ".exe");
+}
+
+fn two(n: i64) -> str {
+    if n < 10 { return "0" + int_to_str(n); }
+    return int_to_str(n);
+}
+
+/// The date as `date +<fmt>` prints it (fmt: %Y%m%d or %Y-%m-%d).
+fn today(fmt: str) -> str {
+    val r: FlRun = fl_run(&fl_v2("date", "+" + fmt), "", 10);
+    if r.started && !r.timed_out && r.code == 0 {
+        val t: str = str_trim(fl_text(r.out));
+        if str_len(t) > 0 { return t; }
+    }
+    // days since 1970-01-01 in UTC, as a civil date
+    val z0: i64 = p_clock_now_ms() / 86400000 + 719468;
+    val era: i64 = z0 / 146097;
+    val doe: i64 = z0 - era * 146097;
+    val yoe: i64 = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    var y: i64 = yoe + era * 400;
+    val doy: i64 = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    val mp: i64 = (5 * doy + 2) / 153;
+    val d: i64 = doy - (153 * mp + 2) / 5 + 1;
+    var m: i64 = mp + 3;
+    if mp >= 10 { m = mp - 9; }
+    if m <= 2 { y = y + 1; }
+    if fmt == "%Y-%m-%d" { return int_to_str(y) + "-" + two(m) + "-" + two(d); }
+    return int_to_str(y) + two(m) + two(d);
+}
+
+fn uname(flag: str) -> str {
+    val r: FlRun = fl_run(&fl_v2("uname", flag), "", 10);
+    if !r.started || r.timed_out { return ""; }
+    return str_trim(fl_text(r.out));
+}
+
+/// Run argv with our stdout and stderr; its exit status.
+fn run_here(argv: &Vec<str>, env: &Vec<str>) -> i64 {
+    var a: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < argv.len() {
+        if i == 0 { a.push(fl_prog(argv.get(0))); } else { a.push(argv.get(i)); }
+        i = i + 1;
+    }
+    var e: Vec<str> = Vec::new();
+    i = 0;
+    while i < env.len() {
+        e.push(env.get(i));
+        i = i + 1;
+    }
+    val h: i64 = process_spawn(a, e, "");
+    if h == 0 {
+        io_eprintln("fuzz_nightly: cannot start " + argv.get(0));
+        return 127;
+    }
+    var code: i64 = 1;
+    match process_wait(h, -1) {
+        Option::Some(c) => { code = c; }
+        Option::None => { }
+    }
+    process_release(h);
+    return code;
+}
+
+fn dir_of(p: str) -> str {
+    var i: i64 = str_len(p) - 1;
+    while i >= 0 {
+        val c: i64 = str_byte_at(p, i);
+        if c == 47 || c == 92 { return str_slice(p, 0, i); }
+        i = i - 1;
+    }
+    return ".";
+}
+
+/// The built tool `name` (fuzz_gen, fuzz_triage): $VAR, beside us, or
+/// built now.
+fn tool(var_name: str, name: str, fid: str) -> str {
+    val given: str = fl_env(var_name);
+    if str_len(given) > 0 { return given; }
+    var ext: str = "";
+    if fl_win() { ext = ".exe"; }
+    val beside: str = fl_join(dir_of(args_all().get(0)), name + ext);
+    if fs_is_file(beside) { return beside; }
+    var tmp: str = fl_env("TMPDIR");
+    if str_len(tmp) == 0 { tmp = fl_env("TEMP"); }
+    if str_len(tmp) == 0 { tmp = "/tmp"; }
+    val dir: str = fl_join(tmp, "fid-fuzz-nightly-" + int_to_str(p_getpid()));
+    fl_mkdirs(dir);
+    val exe: str = fl_join(dir, name + ext);
+    var b: Vec<str> = fl_v3(fid, "ccompile", "tools/" + name + ".fd");
+    b.push("-o");
+    b.push(exe);
+    val r: FlRun = fl_run(&b, "", 0);
+    if r.code != 0 || !fs_is_file(exe) {
+        io_eprintln("fuzz_nightly: could not build tools/" + name + ".fd:");
+        io_eprintln(fl_tail(fl_as_text(r.out + r.err), 2000));
+        process_exit(2);
+    }
+    return exe;
+}
+
+fn has_out_file(d: str) -> bool {
+    if !fs_is_dir(d) { return false; }
+    val names: Vec<str> = fs_list_dir(d);
+    var i: i64 = 0;
+    while i < names.len() {
+        val n: str = names.get(i);
+        if str_ends_with(n, ".out") && !str_starts_with(n, ".") && fs_is_file(fl_join(d, n)) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn which(name: str) -> bool {
+    var sep: str = ":";
+    if fl_win() { sep = ";"; }
+    val dirs: Vec<str> = str_split(fl_env("PATH"), sep);
+    var i: i64 = 0;
+    while i < dirs.len() {
+        val d: str = dirs.get(i);
+        i = i + 1;
+        if str_len(d) == 0 { continue; }
+        if fs_is_file(d + "/" + name) { return true; }
+        if fl_win() && fs_is_file(d + "/" + name + ".exe") { return true; }
+    }
+    return false;
+}
+
+fn main() -> i64 {
+    var fid: str = env_or("FID", "release/fid");
+    if !executable(fid) { fid = "release/fid.exe"; }
+    val n: str = env_or("N", "300");
+    val seed: str = env_or("SEED", today("%Y%m%d"));
+    val out: str = env_or("OUT", "build/fuzz/" + today("%Y-%m-%d"));
+    val batch: str = env_or("BATCH", "1");
+    val retries: str = env_or("RETRIES", "1");
+    val run_timeout: str = env_or("RUN_TIMEOUT", "60");
+    var env: Vec<str> = Vec::new();
+    if str_len(fl_env("CC")) == 0 { env.push("CC=zig cc"); }
+    var backends: str = "run,ccompile,checked";
+    var sys: str = "MINGW";
+    if !fl_win() { sys = uname("-s"); }
+    if str_starts_with(sys, "MINGW") || str_starts_with(sys, "MSYS") || str_starts_with(sys, "CYGWIN") {
+        backends = "run,ccompile,emit,checked";
+    } else if sys == "Linux" {
+        val m: str = uname("-m");
+        if m == "x86_64" { backends = backends + ",emit:x86_64-linux"; }
+        if m == "aarch64" { backends = backends + ",emit:aarch64-linux"; }
+        if str_len(fl_env("NO_NATIVE")) > 0 { backends = "run,ccompile,checked"; }
+    }
+    backends = env_or("FUZZ_BACKENDS", backends);
+    val gen: str = tool("FUZZ_GEN", "fuzz_gen", fid);
+    val triage: str = tool("FUZZ_TRIAGE", "fuzz_triage", fid);
+    var a1: Vec<str> = fl_v5(gen, "-n", n, "--seed", seed);
+    a1.push("--fid");
+    a1.push(fid);
+    a1.push("--backends");
+    a1.push(backends);
+    a1.push("--keep");
+    a1.push(out);
+    a1.push("--batch");
+    a1.push(batch);
+    a1.push("--retries");
+    a1.push(retries);
+    a1.push("--run-timeout");
+    a1.push(run_timeout);
+    var status: i64 = run_here(&a1, &env);
+    // the same number of programs again with structs, enums, strings and
+    // floats (--rich), kept apart so a seed names one program
+    var a2: Vec<str> = fl_v5(gen, "-n", n, "--seed", seed);
+    a2.push("--fid");
+    a2.push(fid);
+    a2.push("--backends");
+    a2.push(backends);
+    a2.push("--keep");
+    a2.push(out + "/rich");
+    a2.push("--rich");
+    a2.push("--batch");
+    a2.push(batch);
+    a2.push("--retries");
+    a2.push(retries);
+    a2.push("--run-timeout");
+    a2.push(run_timeout);
+    if run_here(&a2, &env) != 0 { status = 1; }
+    // what the kept failures have in common (one line per signature)
+    var dirs: Vec<str> = fl_v2(out, out + "/rich");
+    var di: i64 = 0;
+    while di < dirs.len() {
+        if has_out_file(dirs.get(di)) {
+            val _t: i64 = run_here(&fl_v2(triage, dirs.get(di)), &env);
+        }
+        di = di + 1;
+    }
+    // Linux and macOS: a sample of programs under the sanitizers
+    val san_host: bool = !(str_starts_with(sys, "MINGW") || str_starts_with(sys, "MSYS") || str_starts_with(sys, "CYGWIN"));
+    if san_host && which("clang") {
+        val san_dir: str = out + "/sanitize";
+        fl_mkdirs(san_dir);
+        val s0: i64 = fl_int(seed, 0);
+        var s: i64 = s0;
+        while s < s0 + 20 {
+            fl_write(san_dir + "/fuzz_" + int_to_str(s) + ".fd", gen_program(s, false));
+            s = s + 1;
+        }
+        var files: Vec<str> = Vec::new();
+        val names: Vec<str> = fs_list_dir(san_dir);
+        var k: i64 = 0;
+        while k < names.len() {
+            if str_starts_with(names.get(k), "fuzz_") && str_ends_with(names.get(k), ".fd") { files.push(names.get(k)); }
+            k = k + 1;
+        }
+        fl_sort(&mut files);
+        var senv: Vec<str> = Vec::new();
+        senv.push("CC=clang");
+        senv.push("FIDES_NO_CACHE=1");
+        senv.push("FIDES_CFLAGS=-fsanitize=address,undefined -fno-omit-frame-pointer -g");
+        k = 0;
+        while k < files.len() {
+            val f: str = san_dir + "/" + files.get(k);
+            val name: str = str_slice(files.get(k), 0, str_len(files.get(k)) - 3);
+            k = k + 1;
+            var bc: Vec<str> = fl_v3(fid, "ccompile", f);
+            bc.push("-o");
+            bc.push(san_dir + "/" + name);
+            val b: FlRun = fl_run_env(&bc, &senv, "", 0);
+            if b.code != 0 { continue; }
+            val san: str = san_dir + "/" + name + ".san";
+            val h: i64 = process_spawn_files(fl_v1(san_dir + "/" + name), Vec::new(), "", "/dev/null", san);
+            var code: i64 = 1;
+            if h != 0 {
+                match process_wait(h, -1) {
+                    Option::Some(c) => { code = c; }
+                    Option::None => { }
+                }
+                process_release(h);
+            }
+            val text: str = fl_read(san);
+            if code != 0 || str_contains(text, "ERROR: AddressSanitizer") || str_contains(text, "runtime error:") {
+                fl_print("sanitizer finding: " + f + " (" + san + ")");
+                status = 1;
+            }
+        }
+    }
+    return status;
+}

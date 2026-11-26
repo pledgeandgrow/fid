@@ -1,0 +1,339 @@
+// tools/nat_gate.fd — the gate of the own backend (docs/roadmap/
+// llvm-roadmap.md RA16, ME4, ME16, ME17). The Fides port of
+// scripts/nat-gate.sh (roadmap AD4): the same arguments, environment,
+// files, output and exit status.
+//
+//   fid ccompile tools/nat_gate.fd -o nat_gate.exe
+//   nat_gate.exe [targets...]
+//
+// Every native target built with the IR verifier and the
+// register-allocation checker on (FID_VERIFY=1), the rewrite rules on
+// values (`fid test-rules`) and, when z3 is there, proved
+// (scripts/rules-smt.sh). A build the verifier or the checker rejects
+// fails the gate, as does a test whose output or exit code differs from
+// the interpreter's. The targets are built and run by scripts/cross-test.sh
+// (NATIVE=1, OUT=build/nat-gate/<target>), as by the script.
+//   FID=<fid>        the compiler (default release/fid.exe, else release/fid)
+//   ALL=1            the whole suite (default: the subset below)
+//   JOBS=<n>         parallel builds (default 4)
+//   REQUIRE_Z3=1     a missing z3 fails the gate
+//   REQUIRE_LOADER=1 a dynamic executable qemu-user could not load fails it
+// Default targets: x86_64-linux aarch64-linux riscv64-linux, and
+// x86_64-windows (`emit --nat`) on a Windows host. Run from the repository
+// root (the script changes to it itself). Exit status: the number of
+// failing parts.
+
+use core;
+use args;
+use fs;
+use io;
+use process;
+
+fn ng_env(name: str) -> str {
+    match env_var(name) {
+        Option::Some(s) => { return s; }
+        Option::None => { }
+    }
+    return "";
+}
+
+fn ng_read(path: str) -> str {
+    match read_file(path) {
+        Option::Some(t) => { return t; }
+        Option::None => { }
+    }
+    return "";
+}
+
+/// The lines of a text (no empty last line for a final newline).
+fn ng_lines(t: str) -> Vec<str> {
+    var r: Vec<str> = Vec::new();
+    var start: i64 = 0;
+    var i: i64 = 0;
+    val n: i64 = str_len(t);
+    while i < n {
+        if str_byte_at(t, i) == 10 {
+            r.push(str_slice(t, start, i));
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    if start < n { r.push(str_slice(t, start, n)); }
+    return r;
+}
+
+/// tail -n k
+fn ng_tail(t: str, k: i64) -> Vec<str> {
+    val ls: Vec<str> = ng_lines(t);
+    var r: Vec<str> = Vec::new();
+    var i: i64 = ls.len() - k;
+    if i < 0 { i = 0; }
+    while i < ls.len() {
+        r.push(ls.get(i));
+        i = i + 1;
+    }
+    return r;
+}
+
+fn ng_lt(a: str, b: str) -> bool {
+    val n: i64 = str_len(a);
+    val m: i64 = str_len(b);
+    var i: i64 = 0;
+    while i < n && i < m {
+        val x: i64 = str_byte_at(a, i);
+        val y: i64 = str_byte_at(b, i);
+        if x != y { return x < y; }
+        i = i + 1;
+    }
+    return n < m;
+}
+
+fn ng_sort(v: &mut Vec<str>) {
+    var i: i64 = 1;
+    while i < v.len() {
+        val x: str = v.get(i);
+        var j: i64 = i - 1;
+        while j >= 0 && ng_lt(x, v.get(j)) {
+            v.set(j + 1, v.get(j));
+            j = j - 1;
+        }
+        v.set(j + 1, x);
+        i = i + 1;
+    }
+}
+
+fn ng_mkdir_p(p: str) {
+    val parts: Vec<str> = str_split(p, "/");
+    var cur: str = "";
+    var i: i64 = 0;
+    while i < parts.len() {
+        if i > 0 { cur = cur + "/"; }
+        cur = cur + parts.get(i);
+        if str_len(parts.get(i)) > 0 && !fs_is_dir(cur) { fs_mkdir(cur); }
+        i = i + 1;
+    }
+}
+
+/// Run argv with `env` added, stdout and stderr to `log` (or ours for "");
+/// the exit status (127 when it cannot start).
+fn ng_run(argv: Vec<str>, env: Vec<str>, log: str) -> i64 {
+    io_flush();
+    val h: i64 = process_spawn_to(argv, env, "", log);
+    if h == 0 {
+        if str_len(log) > 0 { fs_write_text(log, ""); }
+        return 127;
+    }
+    var code: i64 = 1;
+    match process_wait(h, -1) {
+        Option::Some(c) => { code = c; }
+        Option::None => { }
+    }
+    process_release(h);
+    if process_is_windows() && (code < 0 || code > 255) {
+        var u: i64 = code;
+        if u < 0 { u = u + 4294967296; }
+        code = u & 255;
+    }
+    return code;
+}
+
+/// The lines of `t` that start with one of `heads`.
+fn ng_grep_heads(t: str, heads: Vec<str>) -> Vec<str> {
+    var r: Vec<str> = Vec::new();
+    val ls: Vec<str> = ng_lines(t);
+    var i: i64 = 0;
+    while i < ls.len() {
+        var k: i64 = 0;
+        while k < heads.len() {
+            if str_starts_with(ls.get(i), heads.get(k)) {
+                r.push(ls.get(i));
+                break;
+            }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    return r;
+}
+
+/// The bash that runs the scripts: BASH_EXE, else on Windows the first
+/// bash.exe on PATH that is not WSL's (System32, WindowsApps), else Git's;
+/// elsewhere bash.
+fn ng_bash() -> str {
+    val b: str = ng_env("BASH_EXE");
+    if str_len(b) > 0 { return b; }
+    if !process_is_windows() { return "bash"; }
+    val dirs: Vec<str> = str_split(ng_env("PATH"), ";");
+    var i: i64 = 0;
+    while i < dirs.len() {
+        val d: str = dirs.get(i);
+        i = i + 1;
+        val low: str = str_to_lower(d);
+        if str_len(d) == 0 || str_contains(low, "system32") || str_contains(low, "windowsapps") { continue; }
+        if fs_exists(d + "/bash.exe") { return d + "/bash.exe"; }
+    }
+    if fs_exists("C:/Program Files/Git/usr/bin/bash.exe") { return "C:/Program Files/Git/usr/bin/bash.exe"; }
+    if fs_exists("C:/Program Files/Git/bin/bash.exe") { return "C:/Program Files/Git/bin/bash.exe"; }
+    return "bash";
+}
+
+fn main() -> i64 {
+    val all: Vec<str> = args_all();
+    var first: i64 = 1;
+    if all.len() >= 3 && all.get(1) == "run" && str_ends_with(all.get(2), ".fd") { first = 3; }
+    var fid: str = ng_env("FID");
+    if str_len(fid) == 0 {
+        if fs_exists("release/fid.exe") { fid = "release/fid.exe"; } else { fid = "release/fid"; }
+    }
+    if !fs_is_dir("build") { fs_mkdir("build"); }
+    var jobs: str = ng_env("JOBS");
+    if str_len(jobs) == 0 { jobs = "4"; }
+    var targets: Vec<str> = Vec::new();
+    var i: i64 = first;
+    while i < all.len() {
+        targets.push(all.get(i));
+        i = i + 1;
+    }
+    if targets.len() == 0 {
+        targets.push("x86_64-linux");
+        targets.push("aarch64-linux");
+        targets.push("riscv64-linux");
+        if process_is_windows() { targets.push("x86_64-windows"); }
+    }
+    var subset: Vec<str> = Vec::new();
+    if ng_env("ALL") != "1" {
+        val names: Vec<str> = str_split("test_int_semantics test_checked_arith test_closure test_generics test_hashmap test_match test_float test_tasks test_threads test_fs test_str test_vec_builtins test_str_return test_enum_payload_types test_recursive_box test_struct_reassign test_enum_struct_field2 test_native_enum_payload_param", " ");
+        i = 0;
+        while i < names.len() {
+            val p: str = "tests/bootstrap/" + names.get(i) + ".fd";
+            if fs_exists(p) && !fs_is_dir(p) { subset.push(p); }
+            i = i + 1;
+        }
+    }
+    // every child sees FID (the script exports it)
+    var fid_env: Vec<str> = Vec::new();
+    fid_env.push("FID=" + fid);
+
+    var bad: i64 = 0;
+    println("== rules on values");
+    var tr: Vec<str> = Vec::new();
+    tr.push(fid);
+    tr.push("test-rules");
+    if ng_run(tr, fid_env, "build/nat-gate-rules.log") != 0 {
+        println("FAIL fid test-rules (build/nat-gate-rules.log)");
+        bad = bad + 1;
+    } else {
+        val t1: Vec<str> = ng_tail(ng_read("build/nat-gate-rules.log"), 1);
+        if t1.len() > 0 { println(t1.get(0)); }
+    }
+    println("== rules proved (z3)");
+    var rs: Vec<str> = Vec::new();
+    rs.push(ng_bash());
+    rs.push("scripts/rules-smt.sh");
+    rs.push(fid);
+    val rc: i64 = ng_run(rs, fid_env, "");
+    if rc == 2 {
+        println("(z3 missing: not proved)");
+        if ng_env("REQUIRE_Z3") == "1" { bad = bad + 1; }
+    } else if rc != 0 {
+        bad = bad + 1;
+    }
+
+    i = 0;
+    while i < targets.len() {
+        val tg: str = targets.get(i);
+        i = i + 1;
+        println("== " + tg + " (FID_VERIFY=1)");
+        val out: str = "build/nat-gate/" + tg;
+        val log: str = "build/nat-gate-" + tg + ".log";
+        var ct: Vec<str> = Vec::new();
+        ct.push(ng_bash());
+        ct.push("scripts/cross-test.sh");
+        ct.push(tg);
+        var k: i64 = 0;
+        while k < subset.len() {
+            ct.push(subset.get(k));
+            k = k + 1;
+        }
+        var env: Vec<str> = Vec::new();
+        env.push("FID=" + fid);
+        env.push("FID_VERIFY=1");
+        env.push("NATIVE=1");
+        env.push("OUT=" + out);
+        env.push("JOBS=" + jobs);
+        ng_run(ct, env, log);
+        val logt: str = ng_read(log);
+        val last: Vec<str> = ng_tail(logt, 1);
+        if last.len() > 0 && str_contains(last.get(0), "passed,") {
+            println(last.get(0));
+        } else {
+            val l3: Vec<str> = ng_tail(logt, 3);
+            var q: i64 = 0;
+            while q < l3.len() {
+                println(l3.get(q));
+                q = q + 1;
+            }
+        }
+        val results: str = ng_read(out + "-native/results.txt");
+        var heads: Vec<str> = Vec::new();
+        heads.push("FAIL");
+        heads.push("BUILD");
+        val failing: Vec<str> = ng_grep_heads(results, heads);
+        if failing.len() > 0 {
+            var q2: i64 = 0;
+            while q2 < failing.len() {
+                println(failing.get(q2));
+                q2 = q2 + 1;
+            }
+            bad = bad + 1;
+        }
+        if ng_env("REQUIRE_LOADER") == "1" {
+            var sk: Vec<str> = Vec::new();
+            val ls: Vec<str> = ng_lines(results);
+            var q3: i64 = 0;
+            while q3 < ls.len() {
+                val l: str = ls.get(q3);
+                q3 = q3 + 1;
+                if str_starts_with(l, "SKIP ") && str_contains(str_slice(l, 5, str_len(l)), "(dynamic: needs") { sk.push(l); }
+            }
+            if sk.len() > 0 {
+                var q4: i64 = 0;
+                while q4 < sk.len() {
+                    println(sk.get(q4));
+                    q4 = q4 + 1;
+                }
+                println("REQUIRE_LOADER=1: install the target's C library (libc6-arm64-cross, libc6-riscv64-cross) or set QEMU_LD_PREFIX");
+                bad = bad + 1;
+            }
+        }
+        // builds the verifier or the checker stopped
+        val dir: str = out + "-native";
+        if fs_is_dir(dir) {
+            var names2: Vec<str> = fs_list_dir(dir);
+            ng_sort(&mut names2);
+            var hits: Vec<str> = Vec::new();
+            var q5: i64 = 0;
+            while q5 < names2.len() {
+                val nm: str = names2.get(q5);
+                q5 = q5 + 1;
+                if !str_ends_with(nm, ".build.log") { continue; }
+                val text: str = ng_read(dir + "/" + nm);
+                if str_contains(text, "IR verifier") || str_contains(text, "allocation check failed") { hits.push(dir + "/" + nm); }
+            }
+            if hits.len() > 0 {
+                var q6: i64 = 0;
+                while q6 < hits.len() {
+                    println(hits.get(q6));
+                    q6 = q6 + 1;
+                }
+                bad = bad + 1;
+            }
+        }
+    }
+    if bad == 0 {
+        println("nat-gate: passed");
+    } else {
+        println("nat-gate: " + int_to_str(bad) + " failing parts");
+    }
+    return bad & 255;
+}

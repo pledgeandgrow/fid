@@ -1,0 +1,220 @@
+// tools/stale_cache_test.fd — CB8: the build cache must invalidate on
+// every input change. The Fides port of scripts/stale-cache-test.sh
+// (roadmap AD4): the same argument, environment, output and exit status.
+//
+//   fid ccompile tools/stale_cache_test.fd -o stale_cache_test.exe
+//   stale_cache_test.exe [fid-binary]        (default release/fid.exe)
+//
+// Builds a program that imports a module (`fid ccompile`, CC default
+// "zig cc") in a fresh temporary folder, then changes the module, builds
+// with --no-cache, builds unchanged, and builds with other flags
+// (FIDES_CC_OPT=0): each build must give a program that prints the new
+// answer. A build that fails ends the test with the compiler's exit status
+// and no message, as the script's `set -e` does; the temporary folder is
+// removed at the end. The compiler is found as the script finds it: a
+// relative path from the current folder (an absolute one is used as it
+// is, where the script would fail).
+
+use core;
+use args;
+use fs;
+use io;
+use process;
+
+fn st_env(name: str) -> str {
+    match env_var(name) {
+        Option::Some(s) => { return s; }
+        Option::None => { }
+    }
+    return "";
+}
+
+fn st_temp_dir() -> str {
+    var names: Vec<str> = Vec::new();
+    names.push("TMPDIR");
+    names.push("TEMP");
+    names.push("TMP");
+    var i: i64 = 0;
+    while i < names.len() {
+        val s: str = st_env(names.get(i));
+        if str_len(s) > 0 { return s; }
+        i = i + 1;
+    }
+    return "/tmp";
+}
+
+fn st_absolute(p: str) -> bool {
+    if str_len(p) == 0 { return false; }
+    val c: i64 = str_byte_at(p, 0);
+    if c == 47 || c == 92 { return true; }
+    return str_len(p) >= 2 && str_byte_at(p, 1) == 58;
+}
+
+extern "C" {
+    fn getcwd(buf: i64, n: i64) -> i64;
+}
+
+fn st_cwd() -> str {
+    var cwd: str = "";
+    var buf: i64 = 0;
+    // SAFETY: a fresh 4096-byte buffer; getcwd writes at most that many
+    // bytes, NUL included, and the result is copied out before it is freed.
+    unsafe {
+        buf = p_malloc(4096);
+        if buf != 0 {
+            if getcwd(buf, 4096) != 0 {
+                cwd = p_str_from_ptr(buf);
+            }
+            p_free(buf);
+        }
+    }
+    if str_len(cwd) == 0 { cwd = "."; }
+    return cwd;
+}
+
+/// $(cmd): its output with the trailing newlines dropped.
+fn st_chomp(s: str) -> str {
+    var e: i64 = str_len(s);
+    while e > 0 && str_byte_at(s, e - 1) == 10 { e = e - 1; }
+    return str_slice(s, 0, e);
+}
+
+var st_dir: str = "";
+var st_fid: str = "";
+var st_cc: str = "";
+
+/// One build in the temporary folder: its exit status; its output (stdout
+/// and stderr) in st_out.
+var st_out: str = "";
+fn st_build(extra: str, env_add: str) -> i64 {
+    var argv: Vec<str> = Vec::new();
+    argv.push(st_fid);
+    argv.push("ccompile");
+    argv.push("main.fd");
+    argv.push("-o");
+    argv.push("main.exe");
+    if str_len(extra) > 0 { argv.push(extra); }
+    var env: Vec<str> = Vec::new();
+    env.push("CC=" + st_cc);
+    if str_len(env_add) > 0 { env.push(env_add); }
+    val log: str = st_dir + "/.build.log";
+    val h: i64 = process_spawn_to(argv, env, st_dir, log);
+    if h == 0 {
+        st_out = "";
+        return 127;
+    }
+    var code: i64 = 1;
+    match process_wait(h, -1) {
+        Option::Some(c) => { code = c; }
+        Option::None => { }
+    }
+    process_release(h);
+    st_out = "";
+    match read_file(log) {
+        Option::Some(t) => { st_out = t; }
+        Option::None => { }
+    }
+    fs_delete(log);
+    if code < 0 || code > 255 { code = code & 255; }
+    return code;
+}
+
+/// "$TMP/main.exe", its output as $(run) gives it.
+fn st_run() -> str {
+    var argv: Vec<str> = Vec::new();
+    argv.push(st_dir + "/main.exe");
+    val r: ChildResult = process_run_argv(argv, Vec::new(), "", -1);
+    return st_chomp(r.output);
+}
+
+fn st_rm(dir: str) {
+    val names: Vec<str> = fs_list_dir(dir);
+    var i: i64 = 0;
+    while i < names.len() {
+        val p: str = dir + "/" + names.get(i);
+        if fs_is_dir(p) {
+            st_rm(p);
+        } else {
+            fs_delete(p);
+        }
+        i = i + 1;
+    }
+    fs_rmdir(dir);
+}
+
+fn st_end(code: i64) -> i64 {
+    st_rm(st_dir);
+    return code;
+}
+
+fn main() -> i64 {
+    val all: Vec<str> = args_all();
+    var first: i64 = 1;
+    if all.len() >= 3 && all.get(1) == "run" && str_ends_with(all.get(2), ".fd") { first = 3; }
+    var fid: str = "release/fid.exe";
+    if all.len() > first && str_len(all.get(first)) > 0 { fid = all.get(first); }
+    st_cc = st_env("CC");
+    if str_len(st_cc) == 0 { st_cc = "zig cc"; }
+    if st_absolute(fid) {
+        st_fid = fid;
+    } else {
+        st_fid = st_cwd() + "/" + fid;
+    }
+    st_dir = st_temp_dir() + "/tmp." + int_to_str(p_getpid()) + int_to_str(p_clock_now_us() % 100000);
+    fs_mkdir(st_dir);
+    fs_write_text(st_dir + "/lib.fd", "pub fn answer() -> i64 { return 42; }\n");
+    fs_write_text(st_dir + "/main.fd", "use lib;\nfn main() -> i64 { println(lib::answer()); return 0; }\n");
+
+    var rc: i64 = st_build("", "");
+    if rc != 0 { return st_end(rc); }
+    if !fs_exists(st_dir + "/main.exe") {
+        println("FAIL: initial build");
+        println(st_chomp(st_out));
+        return st_end(1);
+    }
+    if st_run() != "42" {
+        println("FAIL: initial run");
+        return st_end(1);
+    }
+    println("1. initial build ok");
+
+    // 2. source change -> new output
+    fs_write_text(st_dir + "/lib.fd", "pub fn answer() -> i64 { return 43; }\n");
+    rc = st_build("", "");
+    if rc != 0 { return st_end(rc); }
+    if st_run() != "43" {
+        println("FAIL: dep change not picked up");
+        println(st_chomp(st_out));
+        return st_end(1);
+    }
+    println("2. imported-module change invalidates");
+
+    // 3. --no-cache forces a rebuild
+    rc = st_build("--no-cache", "");
+    if rc != 0 { return st_end(rc); }
+    if st_run() != "43" {
+        println("FAIL: --no-cache run");
+        return st_end(1);
+    }
+    println("3. --no-cache ok");
+
+    // 4. a no-change rebuild is allowed to skip (the cache works at all)
+    rc = st_build("", "");
+    if rc != 0 { return st_end(rc); }
+    if str_contains(str_to_lower(st_out), "up to date") {
+        println("4. unchanged build skipped (cache hits)");
+    } else {
+        println("4. unchanged build rebuilt (safe, just slower)");
+    }
+
+    // 5. different flags invalidate
+    rc = st_build("", "FIDES_CC_OPT=0");
+    if rc != 0 { return st_end(rc); }
+    if st_run() != "43" {
+        println("FAIL: flag change run");
+        return st_end(1);
+    }
+    println("5. flag change invalidates");
+    println("stale-cache-test: PASS");
+    return st_end(0);
+}

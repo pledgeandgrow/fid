@@ -1,0 +1,394 @@
+// tools/me_measure.fd — what a mid-end change does (docs/roadmap/
+// llvm-roadmap.md ME30), measured, kept in a file per change. The Fides
+// port of scripts/me-measure.sh (roadmap AD4): the same arguments,
+// environment, file and output.
+//
+//   fid ccompile tools/me_measure.fd -o me_measure.exe
+//   OFF=simplify,branchfold,dse me_measure.exe me12-14-15 release/fid.exe
+//   me_measure.exe gvn release/fid.exe tests/bootstrap/test_gvn*.fd
+//
+// Each program is built natively twice by the same compiler (`fid emit`,
+// FID_IROPT_STATS=1, at most 600 s): once with every iropt pass, once with
+// the passes in $OFF off (FID_IROPT_OFF; default simplify,branchfold,dse).
+// From iropt's report it takes the IR instructions after iropt (the last
+// `instructions A -> B`) and the time iropt took (the last `in N ms`), and
+// the wall time of the build; each built program is run (at most 60 s) and
+// the two runs' output and exit status compared (DIFF when they differ).
+// One line per program and the totals go to docs/perf/mid-end/LABEL.txt
+// (under the current folder: run from the repository root); the totals
+// line is printed. With no files: tests/bootstrap/*.fd less the names
+// holding _fail, sqlite, sdl, socket, http, _ws, bare or bench_ (byte
+// order). An exit status is shown as bash shows it (timeout's 124 at a
+// limit; on Windows 0xC0000005 as 139 and so on).
+
+use core;
+use args;
+use fs;
+use io;
+use process;
+
+// SAFETY: the C library's time functions, declared by <time.h> (the
+// include): `t` is an 8-byte block this file allocated, localtime's
+// result is only handed to strftime, `buf` is a block of `n` bytes.
+extern "C" include "<time.h>" {
+    fn time as mm_time(t: i64) -> i64;
+    fn localtime as mm_localtime(t: i64) -> i64;
+    fn strftime as mm_strftime(buf: i64, n: i64, fmt: str, tm: i64) -> i64;
+}
+
+/// date +%F
+fn mm_date() -> str {
+    var s: str = "";
+    // SAFETY: an 8-byte block for time() to fill and a 64-byte one for
+    // strftime (10 characters and a NUL are written); localtime's static
+    // result is only read by strftime; both blocks are freed here.
+    unsafe {
+        val t: i64 = p_malloc(8);
+        val buf: i64 = p_malloc(64);
+        if t != 0 && buf != 0 {
+            mm_time(t);
+            if mm_strftime(buf, 64, "%Y-%m-%d", mm_localtime(t)) > 0 {
+                s = p_str_from_ptr(buf);
+            }
+        }
+        if t != 0 { p_free(t); }
+        if buf != 0 { p_free(buf); }
+    }
+    return s;
+}
+
+fn mm_env(name: str) -> str {
+    match env_var(name) {
+        Option::Some(s) => { return s; }
+        Option::None => { }
+    }
+    return "";
+}
+
+fn mm_read(path: str) -> str {
+    match read_file(path) {
+        Option::Some(t) => { return t; }
+        Option::None => { }
+    }
+    return "";
+}
+
+fn mm_lt(a: str, b: str) -> bool {
+    val n: i64 = str_len(a);
+    val m: i64 = str_len(b);
+    var i: i64 = 0;
+    while i < n && i < m {
+        val x: i64 = str_byte_at(a, i);
+        val y: i64 = str_byte_at(b, i);
+        if x != y { return x < y; }
+        i = i + 1;
+    }
+    return n < m;
+}
+
+fn mm_sort(v: &mut Vec<str>) {
+    var i: i64 = 1;
+    while i < v.len() {
+        val x: str = v.get(i);
+        var j: i64 = i - 1;
+        while j >= 0 && mm_lt(x, v.get(j)) {
+            v.set(j + 1, v.get(j));
+            j = j - 1;
+        }
+        v.set(j + 1, x);
+        i = i + 1;
+    }
+}
+
+fn mm_basename(p: str) -> str {
+    var i: i64 = str_len(p);
+    while i > 0 && str_byte_at(p, i - 1) != 47 && str_byte_at(p, i - 1) != 92 { i = i - 1; }
+    return str_slice(p, i, str_len(p));
+}
+
+fn mm_digit(c: i64) -> bool {
+    return c >= 48 && c <= 57;
+}
+
+fn mm_temp_dir() -> str {
+    var names: Vec<str> = Vec::new();
+    names.push("TMPDIR");
+    names.push("TEMP");
+    names.push("TMP");
+    var i: i64 = 0;
+    while i < names.len() {
+        val s: str = mm_env(names.get(i));
+        if str_len(s) > 0 { return s; }
+        i = i + 1;
+    }
+    return "/tmp";
+}
+
+/// A child's exit code as bash's $? shows it.
+fn mm_status(code: i64) -> i64 {
+    if !process_is_windows() { return code; }
+    var u: i64 = code;
+    if u < 0 { u = u + 4294967296; }
+    if u <= 255 { return u; }
+    if (u & 3221225472) == 3221225472 {
+        if u == 3221225477 { return 139; }
+        if u == 3221225501 { return 132; }
+        if u == 3221225786 { return 130; }
+        return 127;
+    }
+    return u & 255;
+}
+
+/// `timeout <secs> argv... > log 2>&1`: the status (124 at the limit, 127
+/// when it cannot start).
+fn mm_run(argv: Vec<str>, env: Vec<str>, log: str, secs: i64) -> i64 {
+    val h: i64 = process_spawn_to(argv, env, "", log);
+    if h == 0 {
+        fs_write_text(log, "timeout: failed to run command '" + argv.get(0) + "': No such file or directory\n");
+        return 127;
+    }
+    var code: i64 = 124;
+    match process_wait(h, secs * 1000) {
+        Option::Some(c) => { code = mm_status(c); }
+        Option::None => {
+            process_kill(h);
+            process_wait(h, 10000);
+        }
+    }
+    process_release(h);
+    return code;
+}
+
+/// The words of the last match of `head [0-9]* mid [0-9]*...` in a text,
+/// as grep -o | tail -1 gives it: here either `instructions [0-9]* ->
+/// [0-9]*` (field 4) or `in [0-9]* ms` (field 2). "" for none.
+fn mm_last_instructions(t: str) -> str {
+    var best: str = "";
+    val pat: str = "instructions ";
+    var i: i64 = 0;
+    val n: i64 = str_len(t);
+    while i < n {
+        if str_byte_at(t, i) == 105 && i + 13 <= n && str_slice(t, i, i + 13) == pat {
+            var j: i64 = i + 13;
+            while j < n && mm_digit(str_byte_at(t, j)) { j = j + 1; }
+            if j + 4 <= n && str_slice(t, j, j + 4) == " -> " {
+                var k: i64 = j + 4;
+                while k < n && mm_digit(str_byte_at(t, k)) { k = k + 1; }
+                // awk '{print $4}': the fields of the match
+                val words: Vec<str> = mm_fields(str_slice(t, i, k));
+                best = "";
+                if words.len() >= 4 { best = words.get(3); }
+                i = k;
+                continue;
+            }
+        }
+        i = i + 1;
+    }
+    return best;
+}
+
+fn mm_last_in_ms(t: str) -> str {
+    var best: str = "";
+    var i: i64 = 0;
+    val n: i64 = str_len(t);
+    while i + 3 <= n {
+        if str_slice(t, i, i + 3) == "in " {
+            var j: i64 = i + 3;
+            while j < n && mm_digit(str_byte_at(t, j)) { j = j + 1; }
+            if j + 3 <= n && str_slice(t, j, j + 3) == " ms" {
+                val words: Vec<str> = mm_fields(str_slice(t, i, j + 3));
+                best = "";
+                if words.len() >= 2 { best = words.get(1); }
+                i = j + 3;
+                continue;
+            }
+        }
+        i = i + 1;
+    }
+    return best;
+}
+
+fn mm_fields(s: str) -> Vec<str> {
+    var r: Vec<str> = Vec::new();
+    var cur: str = "";
+    var i: i64 = 0;
+    while i < str_len(s) {
+        val c: i64 = str_byte_at(s, i);
+        if c == 32 || c == 9 {
+            if str_len(cur) > 0 { r.push(cur); }
+            cur = "";
+        } else {
+            cur = cur + char_to_str(c);
+        }
+        i = i + 1;
+    }
+    if str_len(cur) > 0 { r.push(cur); }
+    return r;
+}
+
+fn mm_or_dash(s: str) -> str {
+    if str_len(s) == 0 { return "-"; }
+    return s;
+}
+
+fn mm_num(s: str) -> i64 {
+    if str_len(s) == 0 { return 0; }
+    return str_parse_int(s);
+}
+
+fn mm_mkdir_p(p: str) {
+    val parts: Vec<str> = str_split(p, "/");
+    var cur: str = "";
+    var i: i64 = 0;
+    while i < parts.len() {
+        if i > 0 { cur = cur + "/"; }
+        cur = cur + parts.get(i);
+        if str_len(parts.get(i)) > 0 && !fs_is_dir(cur) { fs_mkdir(cur); }
+        i = i + 1;
+    }
+}
+
+fn mm_rm(dir: str) {
+    val names: Vec<str> = fs_list_dir(dir);
+    var i: i64 = 0;
+    while i < names.len() {
+        val p: str = dir + "/" + names.get(i);
+        if fs_is_dir(p) { mm_rm(p); } else { fs_delete(p); }
+        i = i + 1;
+    }
+    fs_rmdir(dir);
+}
+
+fn main() -> i64 {
+    val all: Vec<str> = args_all();
+    var first: i64 = 1;
+    if all.len() >= 3 && all.get(1) == "run" && str_ends_with(all.get(2), ".fd") { first = 3; }
+    if all.len() <= first || str_len(all.get(first)) == 0 {
+        io_eprintln("scripts/me-measure.sh: line 16: 1: a label for the change");
+        return 1;
+    }
+    val label: str = all.get(first);
+    var fid: str = "release/fid.exe";
+    if all.len() > first + 1 && str_len(all.get(first + 1)) > 0 { fid = all.get(first + 1); }
+    var off: str = mm_env("OFF");
+    match env_var("OFF") {
+        Option::Some(s) => { }
+        Option::None => { off = "simplify,branchfold,dse"; }
+    }
+    var files: Vec<str> = Vec::new();
+    var i: i64 = first + 2;
+    while i < all.len() {
+        files.push(all.get(i));
+        i = i + 1;
+    }
+    if files.len() == 0 {
+        var names: Vec<str> = fs_list_dir("tests/bootstrap");
+        mm_sort(&mut names);
+        var skip: Vec<str> = Vec::new();
+        skip.push("_fail");
+        skip.push("sqlite");
+        skip.push("sdl");
+        skip.push("socket");
+        skip.push("http");
+        skip.push("_ws");
+        skip.push("bare");
+        skip.push("bench_");
+        i = 0;
+        while i < names.len() {
+            val nm: str = names.get(i);
+            i = i + 1;
+            if !str_ends_with(nm, ".fd") || fs_is_dir("tests/bootstrap/" + nm) { continue; }
+            val path: str = "tests/bootstrap/" + nm;
+            var keep: bool = true;
+            var k: i64 = 0;
+            while k < skip.len() {
+                if str_contains(path, skip.get(k)) { keep = false; }
+                k = k + 1;
+            }
+            if keep { files.push(path); }
+        }
+    }
+    mm_mkdir_p("docs/perf/mid-end");
+    val outf: str = "docs/perf/mid-end/" + label + ".txt";
+    val tmp: str = mm_temp_dir() + "/tmp." + int_to_str(p_getpid()) + int_to_str(p_clock_now_us() % 100000);
+    fs_mkdir(tmp);
+    var text: str = "# " + label + ": iropt with every pass vs with " + off + " off (" + mm_date() + ", " + mm_basename(fid) + ")\n";
+    text = text + "# program  instructions(on)  instructions(off)  iropt-ms(on)  iropt-ms(off)  build-ms(on)  build-ms(off)  same-output\n";
+    fs_write_text(outf, text);
+    var ton: i64 = 0;
+    var toff: i64 = 0;
+    var mon: i64 = 0;
+    var moff: i64 = 0;
+    var bon: i64 = 0;
+    var boff: i64 = 0;
+    var ndiff: i64 = 0;
+    var nprog: i64 = 0;
+    i = 0;
+    while i < files.len() {
+        val f: str = files.get(i);
+        i = i + 1;
+        var n: str = mm_basename(f);
+        if str_ends_with(n, ".fd") && str_len(n) > 3 { n = str_slice(n, 0, str_len(n) - 3); }
+        var ms_on: i64 = 0;
+        var ms_off: i64 = 0;
+        var m: i64 = 0;
+        while m < 2 {
+            var mode: str = "on";
+            var envoff: str = "";
+            if m == 1 {
+                mode = "off";
+                envoff = off;
+            }
+            m = m + 1;
+            val exe: str = tmp + "/" + n + "." + mode + ".exe";
+            var argv: Vec<str> = Vec::new();
+            argv.push(fid);
+            argv.push("emit");
+            argv.push(f);
+            argv.push("-o");
+            argv.push(exe);
+            var env: Vec<str> = Vec::new();
+            env.push("FID_IROPT_OFF=" + envoff);
+            env.push("FID_IROPT_STATS=1");
+            val s: i64 = p_clock_now_us();
+            mm_run(argv, env, tmp + "/" + n + "." + mode + ".log", 600);
+            val ms: i64 = (p_clock_now_us() - s) / 1000;
+            if mode == "on" { ms_on = ms; } else { ms_off = ms; }
+            val outp: str = tmp + "/" + n + "." + mode + ".out";
+            if fs_exists(exe) {
+                var rv: Vec<str> = Vec::new();
+                rv.push(exe);
+                val rc: i64 = mm_run(rv, Vec::new(), outp, 60);
+                fs_write_text(outp, mm_read(outp) + "exit " + int_to_str(rc) + "\n");
+            } else {
+                fs_write_text(outp, "no build\n");
+            }
+        }
+        val log_on: str = mm_read(tmp + "/" + n + ".on.log");
+        val log_off: str = mm_read(tmp + "/" + n + ".off.log");
+        val ion: str = mm_last_instructions(log_on);
+        val ioff: str = mm_last_instructions(log_off);
+        val tmon: str = mm_last_in_ms(log_on);
+        val tmoff: str = mm_last_in_ms(log_off);
+        var same: str = "same";
+        if mm_read(tmp + "/" + n + ".on.out") != mm_read(tmp + "/" + n + ".off.out") {
+            same = "DIFF";
+            ndiff = ndiff + 1;
+        }
+        text = text + n + " " + mm_or_dash(ion) + " " + mm_or_dash(ioff) + " " + mm_or_dash(tmon) + " " + mm_or_dash(tmoff) + " " + int_to_str(ms_on) + " " + int_to_str(ms_off) + " " + same + "\n";
+        fs_write_text(outf, text);
+        nprog = nprog + 1;
+        ton = ton + mm_num(ion);
+        toff = toff + mm_num(ioff);
+        mon = mon + mm_num(tmon);
+        moff = moff + mm_num(tmoff);
+        bon = bon + ms_on;
+        boff = boff + ms_off;
+    }
+    val last: str = "# totals over " + int_to_str(nprog) + " programs: instructions " + int_to_str(ton) + " (on) vs " + int_to_str(toff) + " (off); iropt " + int_to_str(mon) + " ms vs " + int_to_str(moff) + " ms; builds " + int_to_str(bon) + " ms vs " + int_to_str(boff) + " ms; " + int_to_str(ndiff) + " with different output";
+    text = text + last + "\n";
+    fs_write_text(outf, text);
+    println(last);
+    mm_rm(tmp);
+    return 0;
+}

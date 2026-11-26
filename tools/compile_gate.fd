@@ -1,0 +1,576 @@
+// tools/compile_gate.fd — the compile-time gates of the own backend
+// (docs/roadmap/llvm-roadmap.md SP15). The Fides port of
+// scripts/compile-gate.sh and bench/compile-check.sh (roadmap AD4): the
+// same arguments, environment, files, output and exit status as each.
+//
+//   fid ccompile tools/compile_gate.fd -o compile_gate.exe
+//   compile_gate.exe [--save]              # scripts/compile-gate.sh
+//   compile_gate.exe --bench [--save]      # bench/compile-check.sh
+//   (built as compile_check.exe it is bench/compile-check.sh without --bench)
+//
+// Both time `fid emit <file> --time`, which prints `[time] <stage>: <ms> ms`
+// per stage, take the best of RUNS (default 3) runs and compare each stage
+// with a baseline; a stage more than LIMIT_PCT (default 10) percent slower
+// fails. Run from the repository root (the scripts change to it, or to
+// bench/, themselves).
+//
+// compile-gate.sh: FID (default release/fid.exe, else release/fid),
+// TARGET (x86_64-linux), MIN_MS (40: smaller stages skipped, `total`
+// always compared), COMPILE_GATE_BASE (scripts/compile-gate.baseline, one
+// `name|stage|ms` per line); programs hello, test_hashmap, test_tasks;
+// the best run by its `[time] total` line; logs in build/compile-gate/.
+// Exit status: the number of stages over the limit; 1 when a build fails.
+//
+// compile-check.sh: FID (default the first of release/stage0/fid,
+// release/fid, release/fid-dev; a relative FID is taken from bench/, as
+// the script does), FILES (relative to bench/; default hello.fd and
+// test_compiler_sized.fd), baseline bench/compile-baseline.txt (`<file>|
+// <stage> <ms>`), executables in bench/out/. Each stage line is read as
+// the script's `read -r stage ms` reads it: the stage is its first word,
+// so a stage of several words keeps its first run's time and bash's
+// complaint ("[: <text>: integer expression expected", with the script's
+// line, on stderr) is printed as bash prints it. Exit status 1 when a stage
+// is slower, 2 with no compiler or no baseline.
+
+use core;
+use args;
+use fs;
+use io;
+use process;
+
+fn cg_env(name: str) -> str {
+    match env_var(name) {
+        Option::Some(s) => { return s; }
+        Option::None => { }
+    }
+    return "";
+}
+
+fn cg_env_int(name: str, dflt: i64) -> i64 {
+    val s: str = str_trim(cg_env(name));
+    if str_len(s) == 0 { return dflt; }
+    return str_parse_int(s);
+}
+
+fn cg_read(path: str) -> str {
+    match read_file(path) {
+        Option::Some(t) => { return t; }
+        Option::None => { }
+    }
+    return "";
+}
+
+/// The lines of a text (the last one counted when it has no newline).
+fn cg_lines(t: str) -> Vec<str> {
+    var r: Vec<str> = Vec::new();
+    var start: i64 = 0;
+    var i: i64 = 0;
+    val n: i64 = str_len(t);
+    while i < n {
+        if str_byte_at(t, i) == 10 {
+            r.push(str_slice(t, start, i));
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    if start < n { r.push(str_slice(t, start, n)); }
+    return r;
+}
+
+fn cg_lt(a: str, b: str) -> bool {
+    val n: i64 = str_len(a);
+    val m: i64 = str_len(b);
+    var i: i64 = 0;
+    while i < n && i < m {
+        val x: i64 = str_byte_at(a, i);
+        val y: i64 = str_byte_at(b, i);
+        if x != y { return x < y; }
+        i = i + 1;
+    }
+    return n < m;
+}
+
+fn cg_sort(v: &mut Vec<str>) {
+    var i: i64 = 1;
+    while i < v.len() {
+        val x: str = v.get(i);
+        var j: i64 = i - 1;
+        while j >= 0 && cg_lt(x, v.get(j)) {
+            v.set(j + 1, v.get(j));
+            j = j - 1;
+        }
+        v.set(j + 1, x);
+        i = i + 1;
+    }
+}
+
+fn cg_basename_fd(p: str) -> str {
+    var i: i64 = str_len(p);
+    while i > 0 && str_byte_at(p, i - 1) != 47 && str_byte_at(p, i - 1) != 92 { i = i - 1; }
+    var b: str = str_slice(p, i, str_len(p));
+    if str_ends_with(b, ".fd") && str_len(b) > 3 { b = str_slice(b, 0, str_len(b) - 3); }
+    return b;
+}
+
+fn cg_basename(p: str) -> str {
+    var i: i64 = str_len(p);
+    while i > 0 && str_byte_at(p, i - 1) != 47 && str_byte_at(p, i - 1) != 92 { i = i - 1; }
+    return str_slice(p, i, str_len(p));
+}
+
+fn cg_digit(c: i64) -> bool {
+    return c >= 48 && c <= 57;
+}
+
+/// A number bash's `[ a -lt b ]` takes: blanks around, a sign, digits.
+fn cg_is_int(s: str) -> bool {
+    var a: i64 = 0;
+    var b: i64 = str_len(s);
+    while a < b && (str_byte_at(s, a) == 32 || str_byte_at(s, a) == 9) { a = a + 1; }
+    while b > a && (str_byte_at(s, b - 1) == 32 || str_byte_at(s, b - 1) == 9) { b = b - 1; }
+    if a < b && (str_byte_at(s, a) == 43 || str_byte_at(s, a) == 45) { a = a + 1; }
+    if a == b { return false; }
+    while a < b {
+        if !cg_digit(str_byte_at(s, a)) { return false; }
+        a = a + 1;
+    }
+    return true;
+}
+
+fn cg_int(s: str) -> i64 {
+    var t: str = str_trim(s);
+    if str_starts_with(t, "+") { t = str_slice(t, 1, str_len(t)); }
+    return str_parse_int(t);
+}
+
+/// Run argv with stdout and stderr to `log`: the exit status (127 when it
+/// cannot start).
+fn cg_run_to(argv: Vec<str>, dir: str, log: str) -> i64 {
+    val h: i64 = process_spawn_to(argv, Vec::new(), dir, log);
+    if h == 0 {
+        fs_write_text(log, "");
+        return 127;
+    }
+    var code: i64 = 1;
+    match process_wait(h, -1) {
+        Option::Some(c) => { code = c; }
+        Option::None => { }
+    }
+    process_release(h);
+    return code;
+}
+
+fn cg_mkdir_p(p: str) {
+    val parts: Vec<str> = str_split(p, "/");
+    var cur: str = "";
+    var i: i64 = 0;
+    while i < parts.len() {
+        if i > 0 { cur = cur + "/"; }
+        cur = cur + parts.get(i);
+        if str_len(parts.get(i)) > 0 && !fs_is_dir(cur) { fs_mkdir(cur); }
+        i = i + 1;
+    }
+}
+
+// ─── scripts/compile-gate.sh ───
+
+/// sed "s/^\[time\] \(.*\): \([0-9]*\) ms/$name|\1|\2/" on one line.
+fn cg_stage_triple(name: str, line: str) -> str {
+    val m: Vec<str> = cg_match_time(line);
+    if m.len() == 0 { return line; }
+    return name + "|" + m.get(0) + "|" + m.get(1) + m.get(2);
+}
+
+/// The match of `^\[time\] \(.*\): \([0-9]*\) ms` in a line (`.*` as long
+/// as it can be): [stage, digits, what follows " ms"], or [] for none.
+fn cg_match_time(line: str) -> Vec<str> {
+    var r: Vec<str> = Vec::new();
+    if !str_starts_with(line, "[time] ") { return r; }
+    val n: i64 = str_len(line);
+    var p: i64 = n - 1;
+    while p >= 7 {
+        if str_byte_at(line, p) == 58 && p + 1 < n && str_byte_at(line, p + 1) == 32 {
+            var q: i64 = p + 2;
+            while q < n && cg_digit(str_byte_at(line, q)) { q = q + 1; }
+            if q + 2 < n && str_byte_at(line, q) == 32 && str_byte_at(line, q + 1) == 109 && str_byte_at(line, q + 2) == 115 {
+                r.push(str_slice(line, 7, p));
+                r.push(str_slice(line, p + 2, q));
+                r.push(str_slice(line, q + 3, n));
+                return r;
+            }
+        }
+        p = p - 1;
+    }
+    return r;
+}
+
+/// The digits of the `[time] total:` lines (grep | sed 's/[^0-9]//g').
+fn cg_total(log: str) -> str {
+    var out: str = "";
+    val ls: Vec<str> = cg_lines(log);
+    var i: i64 = 0;
+    var any: bool = false;
+    while i < ls.len() {
+        val l: str = ls.get(i);
+        i = i + 1;
+        if !str_starts_with(l, "[time] total:") { continue; }
+        if any { out = out + "\n"; }
+        any = true;
+        var k: i64 = 0;
+        while k < str_len(l) {
+            if cg_digit(str_byte_at(l, k)) { out = out + char_to_str(str_byte_at(l, k)); }
+            k = k + 1;
+        }
+    }
+    return out;
+}
+
+fn cg_gate(save: bool) -> i64 {
+    var fid: str = cg_env("FID");
+    if str_len(fid) == 0 {
+        if fs_exists("release/fid.exe") { fid = "release/fid.exe"; } else { fid = "release/fid"; }
+    }
+    var target: str = cg_env("TARGET");
+    if str_len(target) == 0 { target = "x86_64-linux"; }
+    val limit: i64 = cg_env_int("LIMIT_PCT", 10);
+    val runs: i64 = cg_env_int("RUNS", 3);
+    val min_ms: i64 = cg_env_int("MIN_MS", 40);
+    var base_file: str = cg_env("COMPILE_GATE_BASE");
+    if str_len(base_file) == 0 { base_file = "scripts/compile-gate.baseline"; }
+    cg_mkdir_p("build/compile-gate");
+
+    var progs: Vec<str> = Vec::new();
+    progs.push("tests/bootstrap/hello.fd");
+    progs.push("tests/bootstrap/test_hashmap.fd");
+    progs.push("tests/bootstrap/test_tasks.fd");
+    val out: str = "build/compile-gate/run.txt";
+    var run_text: str = "";
+    var i: i64 = 0;
+    while i < progs.len() {
+        val prog: str = progs.get(i);
+        i = i + 1;
+        val name: str = cg_basename_fd(prog);
+        var best: str = "";
+        var r: i64 = 0;
+        while r < runs {
+            val log: str = "build/compile-gate/" + name + "." + int_to_str(r) + ".log";
+            var argv: Vec<str> = Vec::new();
+            argv.push(fid);
+            argv.push("emit");
+            argv.push(prog);
+            argv.push("--target");
+            argv.push(target);
+            argv.push("-o");
+            argv.push("build/compile-gate/" + name);
+            argv.push("--time");
+            if cg_run_to(argv, "", log) != 0 {
+                println("FAIL " + prog + ": emit failed");
+                print(cg_read(log));
+                fs_write_text(out, run_text);
+                return 1;
+            }
+            val total: str = cg_total(cg_read(log));
+            var take: bool = str_len(best) == 0;
+            if !take && str_len(total) > 0 && cg_is_int(total) && cg_is_int(best) && cg_int(total) < cg_int(best) { take = true; }
+            if take {
+                best = total;
+                if str_len(best) == 0 { best = "999999999"; }
+                fs_write_text("build/compile-gate/" + name + ".log", cg_read(log));
+            }
+            r = r + 1;
+        }
+        val ls: Vec<str> = cg_lines(cg_read("build/compile-gate/" + name + ".log"));
+        var k: i64 = 0;
+        while k < ls.len() {
+            if str_starts_with(ls.get(k), "[time]") { run_text = run_text + cg_stage_triple(name, ls.get(k)) + "\n"; }
+            k = k + 1;
+        }
+    }
+    fs_write_text(out, run_text);
+
+    if save || !fs_exists(base_file) {
+        fs_write_text(base_file, run_text);
+        println("compile-gate: baseline saved to " + base_file);
+        return 0;
+    }
+
+    val base_lines: Vec<str> = cg_lines(cg_read(base_file));
+    var bad: i64 = 0;
+    val now: Vec<str> = cg_lines(run_text);
+    i = 0;
+    while i < now.len() {
+        val line: str = now.get(i);
+        i = i + 1;
+        // IFS='|' read -r name stage ms
+        var name2: str = line;
+        var stage: str = "";
+        var ms: str = "";
+        val a: i64 = str_find(line, "|");
+        if a >= 0 {
+            name2 = str_slice(line, 0, a);
+            val rest: str = str_slice(line, a + 1, str_len(line));
+            val b: i64 = str_find(rest, "|");
+            if b >= 0 {
+                stage = str_slice(rest, 0, b);
+                ms = str_slice(rest, b + 1, str_len(rest));
+            } else {
+                stage = rest;
+            }
+        }
+        // awk -F'|' '$1 == n && $2 == s {print $3}' (the first such line)
+        var base: str = "";
+        var found: bool = false;
+        var k2: i64 = 0;
+        while k2 < base_lines.len() && !found {
+            val f: Vec<str> = str_split(base_lines.get(k2), "|");
+            k2 = k2 + 1;
+            if f.len() >= 2 && f.get(0) == name2 && f.get(1) == stage {
+                found = true;
+                if f.len() >= 3 { base = f.get(2); }
+            }
+        }
+        if str_len(base) == 0 {
+            println("note: " + name2 + " " + stage + " not in the baseline (skipped)");
+            continue;
+        }
+        var bv: i64 = cg_int(base);
+        if bv < min_ms && stage != "total" { continue; }
+        if bv == 0 { bv = 1; }
+        val pct: i64 = (cg_int(ms) - bv) * 100 / bv;
+        if pct > limit {
+            println("FAIL " + name2 + " " + stage + ": " + ms + "ms vs " + int_to_str(bv) + "ms baseline (+" + int_to_str(pct) + "%, limit " + int_to_str(limit) + "%)");
+            bad = bad + 1;
+        }
+    }
+    if bad == 0 {
+        println("compile-gate: passed (limit " + int_to_str(limit) + "%)");
+    } else {
+        println("compile-gate: " + int_to_str(bad) + " stages over the limit");
+    }
+    return bad & 255;
+}
+
+// ─── bench/compile-check.sh ───
+
+/// `read -r stage ms` of a line: the first word, then the rest.
+fn cg_read2(line: str) -> Vec<str> {
+    var a: i64 = 0;
+    val n: i64 = str_len(line);
+    while a < n && (str_byte_at(line, a) == 32 || str_byte_at(line, a) == 9) { a = a + 1; }
+    var b: i64 = a;
+    while b < n && str_byte_at(line, b) != 32 && str_byte_at(line, b) != 9 { b = b + 1; }
+    var c: i64 = b;
+    while c < n && (str_byte_at(line, c) == 32 || str_byte_at(line, c) == 9) { c = c + 1; }
+    var e: i64 = n;
+    while e > c && (str_byte_at(line, e - 1) == 32 || str_byte_at(line, e - 1) == 9) { e = e - 1; }
+    var r: Vec<str> = Vec::new();
+    r.push(str_slice(line, a, b));
+    r.push(str_slice(line, c, e));
+    return r;
+}
+
+/// sed -n "s/^\[time\] \(.*\): \([0-9]*\) ms/\1 \2/p" on one line ("" when
+/// it does not match).
+fn cg_stage_pair(line: str) -> str {
+    val m: Vec<str> = cg_match_time(line);
+    if m.len() == 0 { return ""; }
+    return m.get(0) + " " + m.get(1) + m.get(2);
+}
+
+fn cg_bench(save: bool) -> i64 {
+    val runs: i64 = cg_env_int("RUNS", 3);
+    val limit: i64 = cg_env_int("LIMIT_PCT", 10);
+    val base_file: str = "bench/compile-baseline.txt";
+    var x: str = "";
+    if process_is_windows() { x = ".exe"; }
+    var fid: str = cg_env("FID");
+    if str_len(fid) == 0 {
+        var cands: Vec<str> = Vec::new();
+        cands.push("../release/stage0/fid" + x);
+        cands.push("../release/fid" + x);
+        cands.push("../release/fid-dev" + x);
+        var i: i64 = 0;
+        while i < cands.len() {
+            if fs_exists("bench/" + cands.get(i)) {
+                fid = cands.get(i);
+                break;
+            }
+            i = i + 1;
+        }
+    }
+    if str_len(fid) == 0 {
+        println("no fid compiler found (set FID)");
+        return 2;
+    }
+    // relative to bench/, as the script's cd made it
+    var absolute: bool = str_starts_with(fid, "/") || str_starts_with(fid, "\\");
+    if str_len(fid) >= 2 && str_byte_at(fid, 1) == 58 { absolute = true; }
+    if !absolute { fid = "bench/" + fid; }
+    var files_s: str = cg_env("FILES");
+    if str_len(files_s) == 0 { files_s = "../tests/bootstrap/hello.fd ../tests/bootstrap/test_compiler_sized.fd"; }
+    var files: Vec<str> = Vec::new();
+    val words: Vec<str> = str_split(str_replace(str_replace(files_s, "\t", " "), "\n", " "), " ");
+    var w: i64 = 0;
+    while w < words.len() {
+        if str_len(words.get(w)) > 0 { files.push(words.get(w)); }
+        w = w + 1;
+    }
+    cg_mkdir_p("bench/out");
+
+    var keys: Vec<str> = Vec::new();
+    var vals: Vec<str> = Vec::new();
+    var stages: Vec<str> = Vec::new();
+    var f: i64 = 0;
+    while f < files.len() {
+        val src: str = files.get(f);
+        f = f + 1;
+        val b: str = cg_basename(src);
+        var run: i64 = 0;
+        while run < runs {
+            run = run + 1;
+            val exe: str = "out/cc-" + cg_basename_fd(src) + x;
+            fs_delete("bench/" + exe);
+            fs_delete("bench/" + exe + ".fides-stamp");
+            var rel: str = src;
+            if str_starts_with(rel, "../") { rel = str_slice(rel, 3, str_len(rel)); }
+            var argv: Vec<str> = Vec::new();
+            argv.push(fid);
+            argv.push("emit");
+            argv.push(rel);
+            argv.push("-o");
+            argv.push("bench/" + exe);
+            argv.push("--time");
+            val log: str = "bench/out/.compile-check.log";
+            cg_run_to(argv, "", log);
+            val ls: Vec<str> = cg_lines(cg_read(log));
+            fs_delete(log);
+            var k: i64 = 0;
+            while k < ls.len() {
+                val pair: str = cg_stage_pair(ls.get(k));
+                k = k + 1;
+                if str_len(pair) == 0 { continue; }
+                val sm: Vec<str> = cg_read2(pair);
+                val key: str = b + "|" + sm.get(0);
+                val ms: str = sm.get(1);
+                var at: i64 = -1;
+                var q: i64 = 0;
+                while q < keys.len() {
+                    if keys.get(q) == key { at = q; }
+                    q = q + 1;
+                }
+                if at < 0 {
+                    keys.push(key);
+                    vals.push(ms);
+                    continue;
+                }
+                val cur: str = vals.get(at);
+                if str_len(cur) == 0 {
+                    vals.set(at, ms);
+                } else if !cg_is_int(ms) {
+                    io_eprintln("bench/compile-check.sh: line 51: [: " + ms + ": integer expression expected");
+                } else if !cg_is_int(cur) {
+                    io_eprintln("bench/compile-check.sh: line 51: [: " + cur + ": integer expression expected");
+                } else if cg_int(ms) < cg_int(cur) {
+                    vals.set(at, ms);
+                }
+            }
+        }
+        var q2: i64 = 0;
+        while q2 < keys.len() {
+            if str_starts_with(keys.get(q2), b + "|") && !str_contains(str_slice(keys.get(q2), str_len(b) + 1, str_len(keys.get(q2))), "|") {
+                stages.push(keys.get(q2));
+            }
+            q2 = q2 + 1;
+        }
+    }
+    cg_sort(&mut stages);
+    var lines: Vec<str> = Vec::new();
+    var i2: i64 = 0;
+    while i2 < stages.len() {
+        val key2: str = stages.get(i2);
+        i2 = i2 + 1;
+        var v: str = "";
+        var q3: i64 = 0;
+        while q3 < keys.len() {
+            if keys.get(q3) == key2 { v = vals.get(q3); }
+            q3 = q3 + 1;
+        }
+        lines.push(key2 + " " + v);
+    }
+
+    if save {
+        var text: str = "";
+        var j: i64 = 0;
+        while j < lines.len() {
+            text = text + lines.get(j) + "\n";
+            j = j + 1;
+        }
+        if lines.len() == 0 { text = "\n"; }
+        fs_write_text(base_file, text);
+        println("baseline saved to " + base_file + ":");
+        print(text);
+        return 0;
+    }
+    if !fs_exists(base_file) {
+        println("no baseline: run with --save first");
+        return 2;
+    }
+    val base_lines: Vec<str> = cg_lines(cg_read(base_file));
+    var fail: i64 = 0;
+    var j2: i64 = 0;
+    while j2 < lines.len() {
+        val line: str = lines.get(j2);
+        j2 = j2 + 1;
+        // key="${line% *}"; now="${line##* }"
+        var sp: i64 = str_len(line) - 1;
+        while sp >= 0 && str_byte_at(line, sp) != 32 { sp = sp - 1; }
+        var key3: str = line;
+        var now: str = line;
+        if sp >= 0 {
+            key3 = str_slice(line, 0, sp);
+            now = str_slice(line, sp + 1, str_len(line));
+        }
+        // awk -v k="$key" 'index($0, k" ")==1 {print $NF}' (the first)
+        var base_ms: str = "";
+        var k4: i64 = 0;
+        while k4 < base_lines.len() {
+            val bl: str = base_lines.get(k4);
+            k4 = k4 + 1;
+            if str_starts_with(bl, key3 + " ") {
+                val ws: Vec<str> = str_split(str_trim(bl), " ");
+                base_ms = ws.get(ws.len() - 1);
+                break;
+            }
+        }
+        if str_len(base_ms) == 0 {
+            println("  new stage (no baseline): " + key3 + " = " + now + "ms");
+            continue;
+        }
+        var pct: i64 = 0;
+        val bm: i64 = cg_int(base_ms);
+        if bm > 0 { pct = (cg_int(now) - bm) * 100 / bm; }
+        if pct > limit {
+            println("SLOW: " + key3 + " " + base_ms + "ms -> " + now + "ms (+" + int_to_str(pct) + "%)");
+            fail = 1;
+        } else {
+            var sign: str = "+";
+            if pct < 0 { sign = ""; }
+            println("  ok: " + key3 + " " + base_ms + "ms -> " + now + "ms (" + sign + int_to_str(pct) + "%)");
+        }
+    }
+    return fail;
+}
+
+fn main() -> i64 {
+    val all: Vec<str> = args_all();
+    var first: i64 = 1;
+    if all.len() >= 3 && all.get(1) == "run" && str_ends_with(all.get(2), ".fd") { first = 3; }
+    var bench: bool = str_starts_with(cg_basename(all.get(0)), "compile_check") || str_starts_with(cg_basename(all.get(0)), "compile-check");
+    if all.len() > first && all.get(first) == "--bench" {
+        bench = true;
+        first = first + 1;
+    }
+    var save: bool = all.len() > first && all.get(first) == "--save";
+    if bench { return cg_bench(save); }
+    return cg_gate(save);
+}

@@ -1,0 +1,1404 @@
+// tools/expect.fd — run Fides test files on every backend and check what
+// they must do. The Fides port of scripts/verify/expect.py (roadmap AD4):
+// the same command line, the same output lines and the same exit status.
+//
+//   fid ccompile tools/expect.fd -o expect.exe
+//   expect.exe [--fid release/fid.exe] [--backends run,ccompile,emit]
+//              [-j 3] [-q] <file.fd | dir> ...
+//
+// The runner of the conformance suite (tests/conformance/, roadmap VF10)
+// and of the optimization tests (tests/bootstrap/test_opt_*.fd, VF5).
+//
+// Backends: run, ccompile, emit, checked (the C path under
+// --checked-alloc, only for a file that names it in `//@ backends:`), nat
+// (`emit --nat`) and the Linux targets x86_64-linux, aarch64-linux,
+// riscv64-linux (`emit --target`; run in WSL on Windows, the last two under
+// qemu-user).
+//
+// What a file must do comes from comments in it:
+//
+//     //> text          the next line of standard output is `text`
+//     //! panic         the program panics (exit status 1) after the //> lines
+//     //! error: words  rejected at compile time with a message holding
+//                       `words` (checked once, with `fid check`)
+//     //! exit: N       the program exits with status N
+//     //@ backends: run,ccompile    only these backends
+//     //@ env: NAME=value   set for every compile and run of the file
+//
+// and the suite's own form, `// Expected output:` (a block of comment
+// lines, compared trimmed; a line ending in `...` matches by prefix) and
+// `// Expected exit: N`. A file with none of these is checked against
+// tests/bootstrap/golden/<name>.txt when that exists, else only for
+// agreement between the backends; a `_fail.fd` / `_fail2.fd` file, or one
+// whose first three lines say `expect-error`, must fail on every backend.
+// Exit status 0 when every file does what it says on every backend.
+//
+// -j n checks n files at once: each is checked by this tool started again
+// on that one file (a hidden `--ex-one`), the results printed in order.
+// Differences from the script, none of which the suites reach: the
+// script's lock around a compile's second attempt is not kept (the retry
+// runs at once); lines split at "\n"; a glob pattern's `*` and `?` are
+// matched case-sensitively and only in its last component; a program a
+// signal killed is `exit 128+n` (Python: `exit -n`). Built only
+// (`fid ccompile`): the `checked` backend needs getcwd.
+
+use core;
+use args;
+use fs;
+use io;
+use process;
+
+extern "C" {
+    fn getcwd(buf: i64, n: i64) -> i64;
+}
+
+// ─── Text as Python sees it ───
+
+/// The code points of UTF-8 `b`, each invalid sequence as U+FFFD, as
+/// bytes.decode("utf-8", "replace") gives them.
+fn ex_decode(b: Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    val n: i64 = b.len();
+    var i: i64 = 0;
+    while i < n {
+        val c: i64 = b.get(i);
+        if c < 128 {
+            out.push(c);
+            i = i + 1;
+            continue;
+        }
+        var need: i64 = 0;
+        var cp: i64 = 0;
+        var lo: i64 = 128;
+        var hi: i64 = 191;
+        if c >= 194 && c <= 223 {
+            need = 1;
+            cp = c & 31;
+        } else if c >= 224 && c <= 239 {
+            need = 2;
+            cp = c & 15;
+            if c == 224 { lo = 160; }
+            if c == 237 { hi = 159; }
+        } else if c >= 240 && c <= 244 {
+            need = 3;
+            cp = c & 7;
+            if c == 240 { lo = 144; }
+            if c == 244 { hi = 143; }
+        } else {
+            out.push(65533);
+            i = i + 1;
+            continue;
+        }
+        var j: i64 = 1;
+        var ok: bool = true;
+        while j <= need {
+            if i + j >= n {
+                ok = false;
+                break;
+            }
+            val d: i64 = b.get(i + j);
+            var l: i64 = 128;
+            var h: i64 = 191;
+            if j == 1 {
+                l = lo;
+                h = hi;
+            }
+            if d < l || d > h {
+                ok = false;
+                break;
+            }
+            cp = (cp << 6) | (d & 63);
+            j = j + 1;
+        }
+        if ok {
+            out.push(cp);
+            i = i + need + 1;
+        } else {
+            out.push(65533);
+            i = i + j;
+        }
+    }
+    return out;
+}
+
+/// Code points as UTF-8 text.
+fn ex_encode(cps: Vec<i64>, from: i64, to: i64) -> str {
+    var b: Vec<i64> = Vec::new();
+    var i: i64 = from;
+    while i < to {
+        val c: i64 = cps.get(i);
+        if c < 128 {
+            b.push(c);
+        } else if c < 2048 {
+            b.push(192 | (c >> 6));
+            b.push(128 | (c & 63));
+        } else if c < 65536 {
+            b.push(224 | (c >> 12));
+            b.push(128 | ((c >> 6) & 63));
+            b.push(128 | (c & 63));
+        } else {
+            b.push(240 | (c >> 18));
+            b.push(128 | ((c >> 12) & 63));
+            b.push(128 | ((c >> 6) & 63));
+            b.push(128 | (c & 63));
+        }
+        i = i + 1;
+    }
+    return str_from_bytes(b);
+}
+
+/// The code points of (valid) UTF-8 text.
+fn ex_cps(s: str) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    val n: i64 = str_len(s);
+    var i: i64 = 0;
+    while i < n {
+        val c: i64 = str_byte_at(s, i);
+        if c < 128 {
+            out.push(c);
+            i = i + 1;
+        } else if c < 224 {
+            out.push(((c & 31) << 6) | (str_byte_at(s, i + 1) & 63));
+            i = i + 2;
+        } else if c < 240 {
+            out.push(((c & 15) << 12) | ((str_byte_at(s, i + 1) & 63) << 6) | (str_byte_at(s, i + 2) & 63));
+            i = i + 3;
+        } else {
+            out.push(((c & 7) << 18) | ((str_byte_at(s, i + 1) & 63) << 12) | ((str_byte_at(s, i + 2) & 63) << 6) | (str_byte_at(s, i + 3) & 63));
+            i = i + 4;
+        }
+    }
+    return out;
+}
+
+fn ex_bytes(s: str) -> Vec<i64> {
+    var b: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < str_len(s) {
+        b.push(str_byte_at(s, i));
+        i = i + 1;
+    }
+    return b;
+}
+
+/// Child output as the script decodes it: UTF-8 with replacement.
+fn ex_utf8(s: str) -> str {
+    val cps: Vec<i64> = ex_decode(ex_bytes(s));
+    return ex_encode(cps, 0, cps.len());
+}
+
+/// A file as open(p, encoding="utf-8", errors="replace").read() gives it.
+fn ex_read_text(path: str) -> str {
+    val cps: Vec<i64> = ex_decode(fs_read_bytes(path));
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < cps.len() {
+        val c: i64 = cps.get(i);
+        if c == 13 {
+            out.push(10);
+            if i + 1 < cps.len() && cps.get(i + 1) == 10 { i = i + 1; }
+        } else {
+            out.push(c);
+        }
+        i = i + 1;
+    }
+    return ex_encode(out, 0, out.len());
+}
+
+/// Python's str.isspace().
+fn ex_space(c: i64) -> bool {
+    if (c >= 9 && c <= 13) || (c >= 28 && c <= 32) || c == 133 || c == 160 || c == 5760 { return true; }
+    if (c >= 8192 && c <= 8202) || c == 8232 || c == 8233 || c == 8239 || c == 8287 || c == 12288 { return true; }
+    return false;
+}
+
+/// Python's str.strip().
+fn ex_strip(s: str) -> str {
+    var plain: bool = true;
+    var i: i64 = 0;
+    while i < str_len(s) {
+        if str_byte_at(s, i) >= 128 { plain = false; }
+        i = i + 1;
+    }
+    if plain {
+        var a: i64 = 0;
+        var b: i64 = str_len(s);
+        while a < b && ex_space(str_byte_at(s, a)) { a = a + 1; }
+        while b > a && ex_space(str_byte_at(s, b - 1)) { b = b - 1; }
+        return str_slice(s, a, b);
+    }
+    val cps: Vec<i64> = ex_cps(s);
+    var a2: i64 = 0;
+    var b2: i64 = cps.len();
+    while a2 < b2 && ex_space(cps.get(a2)) { a2 = a2 + 1; }
+    while b2 > a2 && ex_space(cps.get(b2 - 1)) { b2 = b2 - 1; }
+    return ex_encode(cps, a2, b2);
+}
+
+/// s.strip(" \t")
+fn ex_strip_blank(s: str) -> str {
+    var a: i64 = 0;
+    var b: i64 = str_len(s);
+    while a < b && (str_byte_at(s, a) == 32 || str_byte_at(s, a) == 9) { a = a + 1; }
+    while b > a && (str_byte_at(s, b - 1) == 32 || str_byte_at(s, b - 1) == 9) { b = b - 1; }
+    return str_slice(s, a, b);
+}
+
+/// s.split("\n"), empty pieces kept.
+fn ex_split_nl(s: str) -> Vec<str> {
+    var r: Vec<str> = Vec::new();
+    var start: i64 = 0;
+    var i: i64 = 0;
+    val n: i64 = str_len(s);
+    while i < n {
+        if str_byte_at(s, i) == 10 {
+            r.push(str_slice(s, start, i));
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    r.push(str_slice(s, start, n));
+    return r;
+}
+
+/// The first three of s.splitlines().
+fn ex_head3(s: str) -> Vec<str> {
+    var r: Vec<str> = Vec::new();
+    var start: i64 = 0;
+    var i: i64 = 0;
+    val n: i64 = str_len(s);
+    while i < n && r.len() < 3 {
+        val c: i64 = str_byte_at(s, i);
+        if c == 10 || c == 13 || c == 11 || c == 12 || (c >= 28 && c <= 30) {
+            r.push(str_slice(s, start, i));
+            if c == 13 && i + 1 < n && str_byte_at(s, i + 1) == 10 { i = i + 1; }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    if r.len() < 3 && start < n { r.push(str_slice(s, start, n)); }
+    return r;
+}
+
+/// The number of characters (code points) of UTF-8 text: len() of a str.
+fn ex_nchars(s: str) -> i64 {
+    var k: i64 = 0;
+    var i: i64 = 0;
+    while i < str_len(s) {
+        val c: i64 = str_byte_at(s, i);
+        if c < 128 || c >= 192 { k = k + 1; }
+        i = i + 1;
+    }
+    return k;
+}
+
+/// s[:n] of a str (characters, not bytes).
+fn ex_prefix_chars(s: str, n: i64) -> str {
+    var k: i64 = 0;
+    var i: i64 = 0;
+    while i < str_len(s) {
+        val c: i64 = str_byte_at(s, i);
+        if c < 128 || c >= 192 {
+            if k == n { return str_slice(s, 0, i); }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    return s;
+}
+
+/// Not printable for Python's repr() (Latin-1 and the common ranges).
+fn ex_unprintable(c: i64) -> bool {
+    if c < 32 || (c >= 127 && c <= 160) || c == 173 { return true; }
+    if c == 5760 || (c >= 8192 && c <= 8207) || (c >= 8232 && c <= 8239) || c == 8287 { return true; }
+    if (c >= 8288 && c <= 8303) || c == 12288 || c == 65279 || (c >= 65529 && c <= 65531) { return true; }
+    if (c >= 1536 && c <= 1541) || c == 1564 || c == 1757 || c == 1807 || c == 6158 { return true; }
+    if (c >= 57344 && c <= 63743) || (c >= 55296 && c <= 57343) { return true; }
+    return false;
+}
+
+fn ex_hex(c: i64, width: i64) -> str {
+    val digits: str = "0123456789abcdef";
+    var b: Vec<i64> = Vec::new();
+    var k: i64 = width - 1;
+    while k >= 0 {
+        b.push(str_byte_at(digits, (c >> (4 * k)) & 15));
+        k = k - 1;
+    }
+    return str_from_bytes(b);
+}
+
+/// Python's repr() of a str.
+fn ex_repr(s: str) -> str {
+    val cps: Vec<i64> = ex_cps(s);
+    var q: i64 = 39;
+    if str_contains(s, "'") && !str_contains(s, "\"") { q = 34; }
+    var out: Vec<i64> = Vec::new();
+    out.push(q);
+    var i: i64 = 0;
+    while i < cps.len() {
+        val c: i64 = cps.get(i);
+        i = i + 1;
+        if c == q || c == 92 {
+            out.push(92);
+            out.push(c);
+            continue;
+        }
+        var esc: str = "";
+        if c == 9 {
+            esc = "\\t";
+        } else if c == 10 {
+            esc = "\\n";
+        } else if c == 13 {
+            esc = "\\r";
+        } else if ex_unprintable(c) {
+            if c < 256 {
+                esc = "\\x" + ex_hex(c, 2);
+            } else if c < 65536 {
+                esc = "\\u" + ex_hex(c, 4);
+            } else {
+                esc = "\\U" + ex_hex(c, 8);
+            }
+        }
+        if str_len(esc) > 0 {
+            var k: i64 = 0;
+            while k < str_len(esc) {
+                out.push(str_byte_at(esc, k));
+                k = k + 1;
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out.push(q);
+    return ex_encode(out, 0, out.len());
+}
+
+fn ex_lt(a: str, b: str) -> bool {
+    val n: i64 = str_len(a);
+    val m: i64 = str_len(b);
+    var i: i64 = 0;
+    while i < n && i < m {
+        val x: i64 = str_byte_at(a, i);
+        val y: i64 = str_byte_at(b, i);
+        if x != y { return x < y; }
+        i = i + 1;
+    }
+    return n < m;
+}
+
+fn ex_sort(v: &mut Vec<str>) {
+    var i: i64 = 1;
+    while i < v.len() {
+        val x: str = v.get(i);
+        var j: i64 = i - 1;
+        while j >= 0 && ex_lt(x, v.get(j)) {
+            v.set(j + 1, v.get(j));
+            j = j - 1;
+        }
+        v.set(j + 1, x);
+        i = i + 1;
+    }
+}
+
+// ─── Paths ───
+
+fn ex_sep() -> str {
+    if process_is_windows() { return "\\"; }
+    return "/";
+}
+
+fn ex_is_sep(c: i64) -> bool {
+    return c == 47 || (c == 92 && process_is_windows());
+}
+
+/// os.path.join(a, b)
+fn ex_join(a: str, b: str) -> str {
+    if str_len(a) == 0 { return b; }
+    if ex_is_sep(str_byte_at(a, str_len(a) - 1)) { return a + b; }
+    return a + ex_sep() + b;
+}
+
+/// os.path.basename
+fn ex_basename(p: str) -> str {
+    var i: i64 = str_len(p);
+    while i > 0 && !ex_is_sep(str_byte_at(p, i - 1)) { i = i - 1; }
+    return str_slice(p, i, str_len(p));
+}
+
+/// os.path.dirname
+fn ex_dirname(p: str) -> str {
+    var i: i64 = str_len(p);
+    while i > 0 && !ex_is_sep(str_byte_at(p, i - 1)) { i = i - 1; }
+    var j: i64 = i;
+    while j > 1 && ex_is_sep(str_byte_at(p, j - 1)) { j = j - 1; }
+    return str_slice(p, 0, j);
+}
+
+var ex_cwd_cache: str = "";
+
+/// os.getcwd()
+fn ex_cwd() -> str {
+    if str_len(ex_cwd_cache) > 0 { return ex_cwd_cache; }
+    var buf: i64 = 0;
+    // SAFETY: a fresh 4096-byte buffer; getcwd writes at most that many
+    // bytes, NUL included, and the result is copied out before it is freed.
+    unsafe {
+        buf = p_malloc(4096);
+        if buf != 0 {
+            if getcwd(buf, 4096) != 0 {
+                ex_cwd_cache = p_str_from_ptr(buf);
+            }
+            p_free(buf);
+        }
+    }
+    if str_len(ex_cwd_cache) == 0 { ex_cwd_cache = "."; }
+    return ex_cwd_cache;
+}
+
+/// os.path.abspath (enough of it: joined to the current directory,
+/// `.` parts dropped, `..` resolved, separators made the system's).
+fn ex_abspath(p: str) -> str {
+    var full: str = p;
+    var absolute: bool = str_len(p) > 0 && ex_is_sep(str_byte_at(p, 0));
+    if process_is_windows() && str_len(p) >= 2 && str_byte_at(p, 1) == 58 { absolute = true; }
+    if !absolute { full = ex_join(ex_cwd(), p); }
+    if process_is_windows() { full = str_replace(full, "/", "\\"); }
+    val sep: str = ex_sep();
+    val parts: Vec<str> = str_split(full, sep);
+    var keep: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < parts.len() {
+        val part: str = parts.get(i);
+        if part == "." || (str_len(part) == 0 && i > 0) {
+            i = i + 1;
+            continue;
+        }
+        if part == ".." {
+            if keep.len() > 1 { keep.pop(); }
+        } else {
+            keep.push(part);
+        }
+        i = i + 1;
+    }
+    var out: str = "";
+    i = 0;
+    while i < keep.len() {
+        if i > 0 { out = out + sep; }
+        out = out + keep.get(i);
+        i = i + 1;
+    }
+    if keep.len() == 1 { out = out + sep; }
+    return out;
+}
+
+/// C:\x\y -> /mnt/c/x/y for a program run in WSL; unchanged elsewhere.
+fn ex_linux_path(p: str) -> str {
+    if !process_is_windows() { return p; }
+    var q: str = str_replace(ex_abspath(p), "\\", "/");
+    if str_len(q) > 1 && str_byte_at(q, 1) == 58 {
+        val d: i64 = str_byte_at(q, 0);
+        var lower: i64 = d;
+        if d >= 65 && d <= 90 { lower = d + 32; }
+        q = "/mnt/" + char_to_str(lower) + str_slice(q, 2, str_len(q));
+    }
+    return q;
+}
+
+/// fnmatch of one name against a pattern with `*` and `?`.
+fn ex_match(name: str, pat: str, i: i64, j: i64) -> bool {
+    if j == str_len(pat) { return i == str_len(name); }
+    val c: i64 = str_byte_at(pat, j);
+    if c == 42 {
+        var k: i64 = i;
+        while k <= str_len(name) {
+            if ex_match(name, pat, k, j + 1) { return true; }
+            k = k + 1;
+        }
+        return false;
+    }
+    if i == str_len(name) { return false; }
+    if c == 63 || c == str_byte_at(name, i) { return ex_match(name, pat, i + 1, j + 1); }
+    return false;
+}
+
+fn ex_magic(s: str) -> bool {
+    return str_contains(s, "*") || str_contains(s, "?") || str_contains(s, "[");
+}
+
+/// glob.glob(os.path.join(dir, "**", "*.fd"), recursive=True), less the
+/// files under a directory named _modules.
+fn ex_walk(dir: str, prefix: str, out: &mut Vec<str>, under_modules: bool) {
+    var names: Vec<str> = fs_list_dir(dir);
+    var i: i64 = 0;
+    while i < names.len() {
+        val name: str = names.get(i);
+        i = i + 1;
+        if str_len(name) == 0 || str_byte_at(name, 0) == 46 { continue; }
+        val path: str = ex_join(prefix, name);
+        val real: str = dir + "/" + name;
+        if fs_is_dir(real) {
+            ex_walk(real, path, out, under_modules || name == "_modules");
+        } else if str_ends_with(name, ".fd") && !under_modules {
+            out.push(path);
+        }
+    }
+}
+
+/// The files of the command line, as the script lists them.
+fn ex_files(p: str) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    if fs_is_dir(p) {
+        // the `_modules` test is on every part of the path, the given part too
+        var in_modules: bool = false;
+        val parts: Vec<str> = str_split(str_replace(p, "\\", "/"), "/");
+        var k: i64 = 0;
+        while k < parts.len() {
+            if parts.get(k) == "_modules" { in_modules = true; }
+            k = k + 1;
+        }
+        ex_walk(p, p, &mut out, in_modules);
+        ex_sort(&mut out);
+        return out;
+    }
+    if !ex_magic(p) {
+        if fs_exists(p) || fs_is_dir(p) { out.push(p); }
+        return out;
+    }
+    val d: str = ex_dirname(p);
+    val pat: str = ex_basename(p);
+    var where: str = d;
+    if str_len(where) == 0 { where = "."; }
+    if !fs_is_dir(where) { return out; }
+    val names: Vec<str> = fs_list_dir(where);
+    var i: i64 = 0;
+    while i < names.len() {
+        val name: str = names.get(i);
+        i = i + 1;
+        if str_byte_at(name, 0) == 46 && str_byte_at(pat, 0) != 46 { continue; }
+        if ex_match(name, pat, 0, 0) { out.push(ex_join(d, name)); }
+    }
+    ex_sort(&mut out);
+    return out;
+}
+
+// ─── What a file must do ───
+
+struct ExSpec {
+    has_out: bool,
+    out: str,
+    panic: bool,
+    has_error: bool,
+    error: str,
+    has_exit: bool,
+    exit: i64,
+    has_backends: bool,
+    backends: Vec<str>,
+    env: Vec<str>,
+    trim: bool,
+    reject: bool,
+}
+
+/// int(s.strip().split()[0])
+fn ex_first_int(s: str) -> i64 {
+    val t: str = ex_strip(s);
+    var e: i64 = 0;
+    while e < str_len(t) && !ex_space(str_byte_at(t, e)) { e = e + 1; }
+    return str_parse_int(str_slice(t, 0, e));
+}
+
+fn ex_env_set(env: &mut Vec<str>, k: str, v: str) {
+    var i: i64 = 0;
+    while i < env.len() {
+        val e: str = env.get(i);
+        if str_starts_with(e, k + "=") {
+            env.set(i, k + "=" + v);
+            return;
+        }
+        i = i + 1;
+    }
+    env.push(k + "=" + v);
+}
+
+fn ex_spec_of(path: str) -> ExSpec {
+    val text: str = ex_read_text(path);
+    var out: Vec<str> = Vec::new();
+    var panic: bool = false;
+    var has_error: bool = false;
+    var error: str = "";
+    var has_exit: bool = false;
+    var exit: i64 = 0;
+    var has_backends: bool = false;
+    var backends: Vec<str> = Vec::new();
+    var env: Vec<str> = Vec::new();
+    var trim: bool = false;
+    val base: str = ex_basename(path);
+    var reject: bool = str_ends_with(base, "_fail.fd") || str_ends_with(base, "_fail2.fd");
+    val head3: Vec<str> = ex_head3(text);
+    var h: i64 = 0;
+    while h < head3.len() {
+        if str_contains(head3.get(h), "expect-error") { reject = true; }
+        h = h + 1;
+    }
+    var in_block: bool = false;
+    var block: Vec<str> = Vec::new();
+    var first_block: Vec<str> = Vec::new();
+    var nblocks: i64 = 0;
+    val lines: Vec<str> = ex_split_nl(text);
+    var li: i64 = 0;
+    while li < lines.len() {
+        val s: str = ex_strip(lines.get(li));
+        li = li + 1;
+        if in_block {
+            if str_starts_with(s, "// Expected exit:") {
+                exit = ex_first_int(str_slice(s, 17, str_len(s)));
+                has_exit = true;
+                continue;
+            }
+            if str_starts_with(s, "//") {
+                if str_starts_with(s, "// ") {
+                    block.push(str_slice(s, 3, str_len(s)));
+                } else {
+                    block.push(str_slice(s, 2, str_len(s)));
+                }
+                continue;
+            }
+            if nblocks == 0 { first_block = block; }
+            nblocks = nblocks + 1;
+            in_block = false;
+        }
+        if s == "// Expected output:" {
+            in_block = true;
+            block = Vec::new();
+            continue;
+        }
+        if str_starts_with(s, "// Expected exit:") {
+            exit = ex_first_int(str_slice(s, 17, str_len(s)));
+            has_exit = true;
+            continue;
+        }
+        if str_starts_with(s, "//@ env:") {
+            val kv: str = ex_strip(str_slice(s, 8, str_len(s)));
+            val eq: i64 = str_find(kv, "=");
+            if eq < 0 {
+                ex_env_set(&mut env, ex_strip(kv), "");
+            } else {
+                ex_env_set(&mut env, ex_strip(str_slice(kv, 0, eq)), ex_strip(str_slice(kv, eq + 1, str_len(kv))));
+            }
+            continue;
+        }
+        if str_starts_with(s, "//>") {
+            val rest: str = str_slice(s, 3, str_len(s));
+            if str_starts_with(rest, " ") {
+                out.push(str_slice(rest, 1, str_len(rest)));
+            } else {
+                out.push(rest);
+            }
+        } else if str_starts_with(s, "//! panic") {
+            panic = true;
+        } else if str_starts_with(s, "//! error:") {
+            error = ex_strip(str_slice(s, 10, str_len(s)));
+            has_error = true;
+        } else if str_starts_with(s, "//! exit:") {
+            exit = str_parse_int(ex_strip(str_slice(s, 9, str_len(s))));
+            has_exit = true;
+        } else if str_starts_with(s, "//@ backends:") {
+            backends = Vec::new();
+            val parts: Vec<str> = str_split(str_slice(s, 13, str_len(s)), ",");
+            var k: i64 = 0;
+            while k < parts.len() {
+                backends.push(ex_strip(parts.get(k)));
+                k = k + 1;
+            }
+            has_backends = true;
+        }
+    }
+    if in_block {
+        if nblocks == 0 { first_block = block; }
+        nblocks = nblocks + 1;
+    }
+    if out.len() == 0 && nblocks > 0 {
+        out = first_block;
+        trim = true;
+    }
+    var has_out: bool = false;
+    var out_text: str = "";
+    if out.len() > 0 || panic || has_exit {
+        has_out = true;
+        var k2: i64 = 0;
+        while k2 < out.len() {
+            out_text = out_text + out.get(k2) + "\n";
+            k2 = k2 + 1;
+        }
+    }
+    if !has_out && !has_error {
+        val g: str = ex_join(ex_join(ex_join("tests", "bootstrap"), "golden"), str_slice(base, 0, str_len(base) - 3) + ".txt");
+        if fs_exists(g) {
+            out_text = str_replace(ex_read_text(g), "\r\n", "\n");
+            has_out = true;
+        }
+    }
+    return ExSpec {
+        has_out: has_out, out: out_text, panic: panic, has_error: has_error, error: error,
+        has_exit: has_exit, exit: exit, has_backends: has_backends, backends: backends,
+        env: env, trim: trim, reject: reject
+    };
+}
+
+// ─── Running ───
+
+/// What a run gave: rc is the exit status as Python prints it, or
+/// "timeout" / "compile-error".
+struct ExRun {
+    rc: str,
+    out: str,
+    err: str,
+}
+
+var ex_base_env: Vec<str> = Vec::new();
+
+fn ex_env_for(env: Vec<str>) -> Vec<str> {
+    var e: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < ex_base_env.len() {
+        e.push(ex_base_env.get(i));
+        i = i + 1;
+    }
+    i = 0;
+    while i < env.len() {
+        e.push(env.get(i));
+        i = i + 1;
+    }
+    return e;
+}
+
+fn ex_code_str(c: i64) -> str {
+    var code: i64 = c;
+    if process_is_windows() && code < 0 { code = code + 4294967296; }
+    return int_to_str(code);
+}
+
+fn ex_run(cmd: Vec<str>, timeout_s: i64, env: Vec<str>, dir: str) -> ExRun {
+    val r: ChildResult = process_run_argv(cmd, ex_env_for(env), dir, timeout_s * 1000);
+    if r.timed_out {
+        return ExRun { rc: "timeout", out: "", err: "" };
+    }
+    if !r.started {
+        // the script stops with FileNotFoundError here; report it as a failure
+        return ExRun { rc: "127", out: "", err: "cannot start " + cmd.get(0) };
+    }
+    return ExRun { rc: ex_code_str(r.code), out: str_replace(ex_utf8(r.output), "\r\n", "\n"), err: ex_utf8(r.errors) };
+}
+
+fn ex_argv(a: str, b: str, c: str) -> Vec<str> {
+    var v: Vec<str> = Vec::new();
+    v.push(a);
+    v.push(b);
+    v.push(c);
+    return v;
+}
+
+fn ex_is_linux_target(b: str) -> bool {
+    return b == "x86_64-linux" || b == "aarch64-linux" || b == "riscv64-linux";
+}
+
+/// The runner of a Linux target's executable ([] for none).
+fn ex_runner(b: str) -> Vec<str> {
+    var r: Vec<str> = Vec::new();
+    if b == "aarch64-linux" { r.push("qemu-aarch64"); }
+    if b == "riscv64-linux" { r.push("qemu-riscv64"); }
+    if process_is_windows() {
+        var w: Vec<str> = Vec::new();
+        w.push("wsl");
+        match env_var("WSL_DISTRO") {
+            Option::Some(d) => {
+                if str_len(d) > 0 {
+                    w.push("-d");
+                    w.push(d);
+                }
+            }
+            Option::None => { }
+        }
+        w.push("--");
+        var i: i64 = 0;
+        while i < r.len() {
+            w.push(r.get(i));
+            i = i + 1;
+        }
+        return w;
+    }
+    return r;
+}
+
+fn ex_on_backend(fid: str, b: str, path: str, work: str, env: Vec<str>) -> ExRun {
+    if b == "run" {
+        return ex_run(ex_argv(fid, "run", path), 300, env, "");
+    }
+    val stem: str = str_slice(ex_basename(path), 0, str_len(ex_basename(path)) - 3);
+    if b == "checked" {
+        val cw: str = ex_join(work, "checked-" + stem);
+        if !fs_is_dir(cw) { fs_mkdir(cw); }
+        var cmd: Vec<str> = ex_argv(fid, "run", ex_abspath(path));
+        cmd.push("--checked-alloc");
+        val r: ExRun = ex_run(cmd, 600, env, cw);
+        if r.rc == "timeout" { return r; }
+        // drop the line naming the executable (splitlines(True): keep ends)
+        var kept: str = "";
+        var start: i64 = 0;
+        var i: i64 = 0;
+        val t: str = r.out;
+        val n: i64 = str_len(t);
+        while i <= n {
+            if i == n || str_byte_at(t, i) == 10 {
+                var e: i64 = i;
+                if i < n { e = i + 1; }
+                if e > start {
+                    val line: str = str_slice(t, start, e);
+                    if !str_starts_with(line, "Built native executable:") { kept = kept + line; }
+                }
+                start = i + 1;
+            }
+            i = i + 1;
+        }
+        return ExRun { rc: r.rc, out: kept, err: r.err };
+    }
+    val exe: str = ex_join(work, stem + "." + b + ".exe");
+    var cmd2: Vec<str> = Vec::new();
+    cmd2.push(fid);
+    cmd2.push(b);
+    cmd2.push(path);
+    var runner: Vec<str> = Vec::new();
+    if b == "nat" {
+        cmd2 = ex_argv(fid, "emit", path);
+        cmd2.push("--nat");
+    } else if ex_is_linux_target(b) {
+        cmd2 = ex_argv(fid, "emit", path);
+        cmd2.push("--target");
+        cmd2.push(b);
+        runner = ex_runner(b);
+    }
+    cmd2.push("-o");
+    cmd2.push(exe);
+    var r2: ExRun = ex_run(cmd2, 300, env, "");
+    if r2.rc != "0" || !fs_exists(exe) {
+        // once more: under load the C compiler's shared cache fails now and then
+        r2 = ex_run(cmd2, 300, env, "");
+    }
+    if r2.rc != "0" || !fs_exists(exe) {
+        return ExRun { rc: "compile-error", out: "", err: r2.out + r2.err };
+    }
+    var rcmd: Vec<str> = Vec::new();
+    var k: i64 = 0;
+    while k < runner.len() {
+        rcmd.push(runner.get(k));
+        k = k + 1;
+    }
+    var limit: i64 = 120;
+    if runner.len() > 0 {
+        rcmd.push(ex_linux_path(exe));
+        limit = 300;
+    } else {
+        rcmd.push(exe);
+    }
+    val res: ExRun = ex_run(rcmd, limit, env, "");
+    if fs_exists(exe) { fs_delete(exe); }
+    val pdb: str = str_slice(exe, 0, str_len(exe) - 4) + ".pdb";
+    if fs_exists(pdb) { fs_delete(pdb); }
+    return res;
+}
+
+/// The line of a compiler's message worth showing.
+fn ex_error_line(text: str) -> str {
+    val all: Vec<str> = ex_split_nl(text);
+    var lines: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < all.len() {
+        val l: str = all.get(i);
+        i = i + 1;
+        val s: str = ex_strip(l);
+        if str_len(s) == 0 { continue; }
+        if str_starts_with(l, "[") || str_starts_with(l, "  -->") || str_starts_with(l, "   |") { continue; }
+        lines.push(s);
+    }
+    var pick: str = "";
+    if lines.len() > 0 { pick = lines.get(lines.len() - 1); }
+    i = 0;
+    while i < lines.len() {
+        if str_contains(lines.get(i), "rror") {
+            pick = lines.get(i);
+            break;
+        }
+        i = i + 1;
+    }
+    return ex_prefix_chars(pick, 160);
+}
+
+fn ex_lines_of(text: str, trim: bool) -> Vec<str> {
+    val l: Vec<str> = ex_split_nl(text);
+    if !trim { return l; }
+    var r: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < l.len() {
+        r.push(ex_strip_blank(l.get(i)));
+        i = i + 1;
+    }
+    return r;
+}
+
+fn ex_same_output(want: str, got: str, trim: bool) -> bool {
+    if want == got { return true; }
+    val wl: Vec<str> = ex_lines_of(want, trim);
+    val gl: Vec<str> = ex_lines_of(got, trim);
+    if wl.len() != gl.len() { return false; }
+    var i: i64 = 0;
+    while i < wl.len() {
+        val w: str = wl.get(i);
+        val g: str = gl.get(i);
+        if w != g {
+            if !(str_ends_with(w, "...") && str_starts_with(g, str_slice(w, 0, str_len(w) - 3))) { return false; }
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn ex_has(v: Vec<str>, s: str) -> bool {
+    var i: i64 = 0;
+    while i < v.len() {
+        if v.get(i) == s { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// The problems of one file (empty: it does what it says).
+fn ex_check_file(fid: str, path: str, backends: Vec<str>, work: str) -> Vec<str> {
+    val want: ExSpec = ex_spec_of(path);
+    var problems: Vec<str> = Vec::new();
+    if want.has_error {
+        val r: ExRun = ex_run(ex_argv(fid, "check", path), 300, want.env, "");
+        val msg: str = r.out + r.err;
+        if r.rc == "0" {
+            problems.push("accepted, but must be rejected");
+        } else if !str_contains(msg, want.error) {
+            problems.push("rejected with another message: " + ex_error_line(msg));
+        }
+        return problems;
+    }
+    var bs: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < backends.len() {
+        val b: str = backends.get(i);
+        if !want.has_backends || want.backends.len() == 0 || ex_has(want.backends, b) { bs.push(b); }
+        i = i + 1;
+    }
+    if want.has_backends && want.backends.len() > 0 && ex_has(want.backends, "checked") && !ex_has(bs, "checked") {
+        bs.push("checked");
+    }
+    var rcs: Vec<str> = Vec::new();
+    var outs: Vec<str> = Vec::new();
+    var errs: Vec<str> = Vec::new();
+    i = 0;
+    while i < bs.len() {
+        val r2: ExRun = ex_on_backend(fid, bs.get(i), path, work, want.env);
+        rcs.push(r2.rc);
+        outs.push(r2.out);
+        errs.push(r2.err);
+        i = i + 1;
+    }
+    var want_rc: str = "0";
+    if want.panic {
+        want_rc = "1";
+    } else if want.has_exit {
+        want_rc = int_to_str(want.exit);
+    }
+    i = 0;
+    while i < bs.len() {
+        val b2: str = bs.get(i);
+        val rc: str = rcs.get(i);
+        val out: str = outs.get(i);
+        val err: str = errs.get(i);
+        i = i + 1;
+        val is_int: bool = rc != "timeout" && rc != "compile-error";
+        if rc == "compile-error" || (b2 == "run" && is_int && rc != "0" && str_contains(err, "rror") && str_len(out) == 0) {
+            if !want.reject {
+                problems.push(b2 + ": does not compile: " + ex_error_line(err));
+            }
+            continue;
+        }
+        if want.has_out {
+            if rc != want_rc {
+                problems.push(b2 + ": exit " + rc + ", expected " + want_rc);
+            }
+            if !ex_same_output(want.out, out, want.trim) {
+                val wl: Vec<str> = ex_lines_of(want.out, want.trim);
+                val gl: Vec<str> = ex_lines_of(out, want.trim);
+                var m: i64 = wl.len();
+                if gl.len() > m { m = gl.len(); }
+                var k: i64 = 0;
+                var found: bool = false;
+                while k < m {
+                    if k >= wl.len() || k >= gl.len() || wl.get(k) != gl.get(k) {
+                        found = true;
+                        break;
+                    }
+                    k = k + 1;
+                }
+                if !found { k = 0; }
+                var ws: str = "'<end>'";
+                if k < wl.len() { ws = ex_repr(wl.get(k)); }
+                var gs: str = "'<end>'";
+                if k < gl.len() { gs = ex_repr(gl.get(k)); }
+                problems.push(b2 + ": output line " + int_to_str(k + 1) + ": expected " + ws + ", got " + gs);
+            }
+        } else if want.reject && rc == "0" {
+            problems.push(b2 + ": succeeded, but must fail");
+        }
+    }
+    if !want.has_out && !want.reject {
+        // the distinct (rc, output) pairs of the backends that compiled
+        var seen: Vec<str> = Vec::new();
+        i = 0;
+        while i < bs.len() {
+            if rcs.get(i) != "compile-error" {
+                val key: str = rcs.get(i) + char_to_str(31) + outs.get(i);
+                if !ex_has(seen, key) { seen.push(key); }
+            }
+            i = i + 1;
+        }
+        if seen.len() > 1 {
+            var msg2: str = "backends disagree: ";
+            i = 0;
+            while i < bs.len() {
+                if i > 0 { msg2 = msg2 + "; "; }
+                msg2 = msg2 + bs.get(i) + ": exit " + rcs.get(i) + ", " + int_to_str(ex_nchars(outs.get(i))) + " bytes";
+                i = i + 1;
+            }
+            problems.push(msg2);
+        }
+    }
+    return problems;
+}
+
+// ─── The command line ───
+
+fn ex_usage() -> str {
+    return "usage: expect.py [-h] [--fid FID] [--backends BACKENDS] [-j J] [-q]\n                 paths [paths ...]\n";
+}
+
+fn ex_arg_error(msg: str) -> i64 {
+    io_eprint(ex_usage());
+    io_eprintln("expect.py: error: " + msg);
+    return 2;
+}
+
+fn ex_help() {
+    print(ex_usage());
+    println("");
+    println("positional arguments:");
+    println("  paths");
+    println("");
+    println("options:");
+    println("  -h, --help           show this help message and exit");
+    println("  --fid FID");
+    println("  --backends BACKENDS");
+    println("  -j J");
+    println("  -q                   print failures only");
+}
+
+fn ex_temp_dir() -> str {
+    var names: Vec<str> = Vec::new();
+    names.push("TMPDIR");
+    names.push("TEMP");
+    names.push("TMP");
+    var i: i64 = 0;
+    while i < names.len() {
+        match env_var(names.get(i)) {
+            Option::Some(s) => {
+                if str_len(s) > 0 { return s; }
+            }
+            Option::None => { }
+        }
+        i = i + 1;
+    }
+    return "/tmp";
+}
+
+fn ex_print_result(path: str, problems: Vec<str>, quiet: bool) -> bool {
+    if problems.len() > 0 {
+        println("FAIL " + path);
+        var i: i64 = 0;
+        while i < problems.len() {
+            println("     " + problems.get(i));
+            i = i + 1;
+        }
+        return true;
+    }
+    if !quiet { println("ok   " + path); }
+    return false;
+}
+
+/// A long option's value: `--name value` or `--name=value`, abbreviations
+/// as argparse takes them.
+fn ex_long(arg: str, names: Vec<str>) -> str {
+    var name: str = arg;
+    val eq: i64 = str_find(arg, "=");
+    if eq >= 0 { name = str_slice(arg, 0, eq); }
+    var hit: str = "";
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while i < names.len() {
+        if names.get(i) == name { return name; }
+        if str_starts_with(names.get(i), name) {
+            hit = names.get(i);
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    if n == 1 { return hit; }
+    if n > 1 { return "?" + name; }
+    return "";
+}
+
+fn main() -> i64 {
+    val all: Vec<str> = args_all();
+    var first: i64 = 1;
+    var self_cmd: Vec<str> = Vec::new();
+    self_cmd.push(all.get(0));
+    if all.len() >= 3 && all.get(1) == "run" && str_ends_with(all.get(2), ".fd") {
+        first = 3;
+        self_cmd.push("run");
+        self_cmd.push(all.get(2));
+    }
+    match env_var("CC") {
+        Option::Some(c) => { }
+        Option::None => { ex_base_env.push("CC=zig cc"); }
+    }
+    match env_var("FIDES_NO_CACHE") {
+        Option::Some(c) => { }
+        Option::None => { ex_base_env.push("FIDES_NO_CACHE=1"); }
+    }
+
+    // one file, for the parent's -j: print its problems, one per line
+    if all.len() > first + 4 && all.get(first) == "--ex-one" {
+        val p1: str = all.get(first + 1);
+        val fid1: str = all.get(first + 2);
+        val bk1: Vec<str> = str_split(all.get(first + 3), ",");
+        val work1: str = all.get(first + 4);
+        val probs: Vec<str> = ex_check_file(fid1, p1, bk1, work1);
+        var k: i64 = 0;
+        while k < probs.len() {
+            println(probs.get(k));
+            k = k + 1;
+        }
+        return 0;
+    }
+
+    var fid: str = ex_join("release", "fid.exe");
+    var backends_s: str = "run,ccompile,emit";
+    var jobs: i64 = 3;
+    var quiet: bool = false;
+    var paths: Vec<str> = Vec::new();
+    var longs: Vec<str> = Vec::new();
+    longs.push("--fid");
+    longs.push("--backends");
+    longs.push("--help");
+    var i: i64 = first;
+    var only_pos: bool = false;
+    while i < all.len() {
+        val a: str = all.get(i);
+        i = i + 1;
+        if only_pos || !str_starts_with(a, "-") || a == "-" {
+            paths.push(a);
+            continue;
+        }
+        if a == "--" {
+            only_pos = true;
+            continue;
+        }
+        if str_starts_with(a, "--") {
+            val name: str = ex_long(a, longs);
+            if str_len(name) == 0 { return ex_arg_error("unrecognized arguments: " + a); }
+            if str_starts_with(name, "?") {
+                var opts: str = "";
+                var k2: i64 = 0;
+                while k2 < longs.len() {
+                    if str_starts_with(longs.get(k2), str_slice(name, 1, str_len(name))) {
+                        if str_len(opts) > 0 { opts = opts + ", "; }
+                        opts = opts + longs.get(k2);
+                    }
+                    k2 = k2 + 1;
+                }
+                return ex_arg_error("ambiguous option: " + str_slice(name, 1, str_len(name)) + " could match " + opts);
+            }
+            if name == "--help" {
+                ex_help();
+                return 0;
+            }
+            var value: str = "";
+            val eq: i64 = str_find(a, "=");
+            if eq >= 0 {
+                value = str_slice(a, eq + 1, str_len(a));
+            } else {
+                if i >= all.len() || (str_starts_with(all.get(i), "-") && all.get(i) != "-") {
+                    return ex_arg_error("argument " + name + ": expected one argument");
+                }
+                value = all.get(i);
+                i = i + 1;
+            }
+            if name == "--fid" { fid = value; }
+            if name == "--backends" { backends_s = value; }
+            continue;
+        }
+        // short options: -h, -q, -j N / -jN
+        if a == "-h" {
+            ex_help();
+            return 0;
+        }
+        if a == "-q" {
+            quiet = true;
+            continue;
+        }
+        if str_starts_with(a, "-j") {
+            var v: str = str_slice(a, 2, str_len(a));
+            if str_starts_with(v, "=") { v = str_slice(v, 1, str_len(v)); }
+            if str_len(v) == 0 {
+                if i >= all.len() || (str_starts_with(all.get(i), "-") && all.get(i) != "-") {
+                    return ex_arg_error("argument -j: expected one argument");
+                }
+                v = all.get(i);
+                i = i + 1;
+            }
+            val t: str = ex_strip(v);
+            var digits: bool = str_len(t) > 0;
+            var d: i64 = 0;
+            if str_starts_with(t, "-") || str_starts_with(t, "+") { d = 1; }
+            if d == str_len(t) { digits = false; }
+            while d < str_len(t) {
+                val c: i64 = str_byte_at(t, d);
+                if c < 48 || c > 57 { digits = false; }
+                d = d + 1;
+            }
+            if !digits { return ex_arg_error("argument -j: invalid int value: " + ex_repr(v)); }
+            jobs = str_parse_int(t);
+            continue;
+        }
+        return ex_arg_error("unrecognized arguments: " + a);
+    }
+    if paths.len() == 0 { return ex_arg_error("the following arguments are required: paths"); }
+
+    var files: Vec<str> = Vec::new();
+    i = 0;
+    while i < paths.len() {
+        val got: Vec<str> = ex_files(paths.get(i));
+        var k3: i64 = 0;
+        while k3 < got.len() {
+            files.push(got.get(k3));
+            k3 = k3 + 1;
+        }
+        i = i + 1;
+    }
+    val work: str = ex_join(ex_temp_dir(), "expect" + int_to_str(p_getpid()) + "_" + int_to_str(p_clock_now_us()));
+    fs_mkdir(work);
+    val backends: Vec<str> = str_split(backends_s, ",");
+    var bad: i64 = 0;
+    val n: i64 = files.len();
+    if jobs <= 1 || n <= 1 {
+        i = 0;
+        while i < n {
+            val probs2: Vec<str> = ex_check_file(fid, files.get(i), backends, work);
+            if ex_print_result(files.get(i), probs2, quiet) { bad = bad + 1; }
+            i = i + 1;
+        }
+    } else {
+        // `jobs` files at once, each in a child; results in file order
+        var handles: Vec<i64> = Vec::new();
+        var state: Vec<i64> = Vec::new();     // 0 waiting, 1 running, 2 ended
+        var logs: Vec<str> = Vec::new();
+        i = 0;
+        while i < n {
+            handles.push(0);
+            state.push(0);
+            logs.push(ex_join(work, "file-" + int_to_str(i) + ".log"));
+            i = i + 1;
+        }
+        var next: i64 = 0;
+        var printed: i64 = 0;
+        var running: i64 = 0;
+        while printed < n {
+            while running < jobs && next < n {
+                var argv: Vec<str> = Vec::new();
+                var k4: i64 = 0;
+                while k4 < self_cmd.len() {
+                    argv.push(self_cmd.get(k4));
+                    k4 = k4 + 1;
+                }
+                argv.push("--ex-one");
+                argv.push(files.get(next));
+                argv.push(fid);
+                argv.push(backends_s);
+                argv.push(work);
+                val h: i64 = process_spawn_files(argv, Vec::new(), "", logs.get(next), ex_join(work, "file-" + int_to_str(next) + ".err"));
+                handles.set(next, h);
+                if h == 0 {
+                    state.set(next, 2);
+                } else {
+                    state.set(next, 1);
+                    running = running + 1;
+                }
+                next = next + 1;
+            }
+            var moved: bool = false;
+            var r: i64 = printed;
+            while r < next {
+                if state.get(r) == 1 {
+                    match process_wait(handles.get(r), 0) {
+                        Option::Some(c) => {
+                            state.set(r, 2);
+                            process_release(handles.get(r));
+                            running = running - 1;
+                            moved = true;
+                        }
+                        Option::None => { }
+                    }
+                }
+                r = r + 1;
+            }
+            while printed < next && state.get(printed) == 2 {
+                var probs3: Vec<str> = Vec::new();
+                match read_file(logs.get(printed)) {
+                    Option::Some(t) => {
+                        val ls: Vec<str> = ex_split_nl(str_replace(t, "\r\n", "\n"));
+                        var k5: i64 = 0;
+                        while k5 < ls.len() {
+                            if str_len(ls.get(k5)) > 0 { probs3.push(ls.get(k5)); }
+                            k5 = k5 + 1;
+                        }
+                    }
+                    Option::None => { }
+                }
+                if handles.get(printed) == 0 { probs3.push("the check did not start"); }
+                if ex_print_result(files.get(printed), probs3, quiet) { bad = bad + 1; }
+                printed = printed + 1;
+                moved = true;
+            }
+            if !moved {
+                var w: i64 = printed;
+                while w < next && state.get(w) != 1 { w = w + 1; }
+                if w < next {
+                    match process_wait(handles.get(w), 20) {
+                        Option::Some(c2) => {
+                            state.set(w, 2);
+                            process_release(handles.get(w));
+                            running = running - 1;
+                        }
+                        Option::None => { }
+                    }
+                }
+            }
+        }
+    }
+    println(int_to_str(n - bad) + " of " + int_to_str(n) + " files pass on " + backends_s);
+    if bad > 0 { return 1; }
+    return 0;
+}

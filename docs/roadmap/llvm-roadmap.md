@@ -687,8 +687,10 @@ week), L (several weeks), XL (months). Each goal names where it lands.
 - [x] RA13. Save and restore with paired instructions (`stp/ldp` on AArch64) (S).
       Nov 15: `ng_prologue`/`ng_epilogue` save and restore the callee-saved
       registers two at a time (`a64_stp`/`a64_ldp` in nat_enc.fd, the same
-      slots; `FID_NAT_OFF=pairs`: one at a time); test_machine_remat.fd. The
-      two forms are not yet in scripts/enc-oracle.py.
+      slots; `FID_NAT_OFF=pairs`: one at a time); test_machine_remat.fd.
+      Nov 25: `a64_stp`/`a64_ldp` pair forms added to scripts/enc-oracle.py;
+      `python scripts/enc-oracle.py --fid release/fid-dev.exe`
+      passes 1200 forms with 0 mismatches.
 - [x] RA14. A fast mode for debug builds: one pass, local allocation, under 10% of
       compile time (M).
       Done (Nov 15): `FID_NAT_FAST=1` (or `g_nat_fast`, for main.fd to set):
@@ -1996,7 +1998,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       peir_loop_index, peir_counted_down): param-range-check 0 failed;
       sum_len_gt, window3, step_down2, for_pairs and the counted-down cases
       lose their bounds checks, keep_odd and the _fail variants keep theirs.
-- [~] LF8. Integer range analysis drops checks whose operands cannot overflow
+- [x] LF8. Integer range analysis drops checks whose operands cannot overflow
       (`checks.fd`, `PEIR_RANGES`); extend it to every loop and branch (L).
       Nov 9: facts carried through jumps into single-entry blocks (`n - 1`
       after `if n < 2 { return }` is unchecked), and a Vec only filled with
@@ -2047,6 +2049,22 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       those slots. The fix shape: at a branch edge, enter the refined
       fact into the predecessor's sf set (not just ref_*), so peir_join_set
       hulls branch facts as it does stores. Not yet implemented.
+      Nov 25 implementation and validation: branch-derived refinement facts
+      now enter the per-edge range sets through peir_sf_apply, the range scan
+      walks reverse postorder, Vec_init_filled's length argument is corrected,
+      and counted loops carry a conservative nonnegative-accumulator proof
+      (one in-loop acc = acc + inc update, constant nonnegative reset,
+      bounded nonnegative inc, at most once per iteration, and worst growth
+      under the 2^48 Vec-length cap in i64). On the final fid-dev:
+      range-set-check, range-loop-check and range-dom-check all pass; sieve
+      keeps exactly one overflow check. Full PASS=rangeset on/off suite:
+      1364 programs, 1332 SAME, 28 SKIP (neither on nor off builds), no
+      BUILD/VERIFY or semantic DIFF. Four raw DIFFs are nondeterministic
+      output or image layout only: bench_stringbuilder timings,
+      test_prof_sampling CPU-sample rows/counts (the same binary differs
+      across repeated runs), test_trace_spans microseconds, and panic code
+      addresses in test_stdlib_repaired; after those inherently variable
+      fields/rows are excluded, their output is identical.
 - [x] LF9. Ranges from conditions: inside `if i < n`, `i < n` is a fact (M).
       Holds in blocks with that branch as their only way in, and through
       jumps from them (`peir_range_refine`); since Nov 15 also through
@@ -3334,6 +3352,19 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       failures were harness path mangling (`/tmp` → `/mnt//tmp`), fixed by
       running with a repo-local TMPDIR. A complete run is still owed; the
       `--nat` .pdata leg (pe_unwind_check) also not run.
+      Nov 25 host check (final fid-dev of the day's tree): the Windows
+      `--nat` `.pdata` leg passes — pe_unwind_check reports 337
+      RUNTIME_FUNCTIONs, each a framed function with the shared UNWIND_INFO.
+      The no-distribution WSL probes in db6_eh_check.sh and eh_frame_check.py
+      are fixed. `bash tests/nattools/db6_eh_check.sh release/fid-dev.exe`
+      gives 38 ok lines and one libgcc skip; the x86_64/aarch64/riscv64
+      .eh_frame structural checks, CFI-save checks, segment/image lints,
+      ehframe-off and shrink-wrap/swcfi legs all pass. readelf, libgcc and
+      target execution remain uncovered on this host (no readelf/gcc or
+      working WSL). scripts/dbg-check.py still fails 9: sum_to and weighted
+      have no subprogram, and the declline-off control reports no line, on
+      all three ELF targets — a debug-info/decl-line failure outside the
+      unwind data itself. DB6 therefore stays partly.
 - [x] DB7. `fid explain <function>`: the IR, the MIR after each stage, the machine
       code, side by side (M).
       Nov 15: `fid explain <file> --stages <fn> [--target t]` (also `fid

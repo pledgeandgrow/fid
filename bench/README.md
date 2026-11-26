@@ -13,7 +13,8 @@ Each program prints one number. A language whose output differs from the
 others is shown as `WRONG`, not timed; a missing toolchain or program as `-`.
 Fides is measured twice: native (`fid emit`) and through C (`fid ccompile`).
 Rivals are built as their users ship them: `rustc -C opt-level=3`,
-`zig -O ReleaseFast`, `zig c++ -O2` (Clang), `go build`.
+`zig -O ReleaseFast`, `clang++ -O2` (a real Clang when one is on the PATH,
+`zig c++` otherwise), `g++ -O2` when GCC is on the PATH, `go build`.
 
 | Program | What it measures |
 |---|---|
@@ -76,7 +77,7 @@ programs).
 | `bash bench/service/run.sh` | BM5 | TechEmpower-style service tests (plaintext, JSON, one row, 20 rows) for Fides, Go and Node, under wrk or `bench/service/load.py`; `serve` / `load` put the client on another machine. See [service/README.md](service/README.md). |
 | `bash bench/mixed.sh` | pe 89 | The mixed workload of pe-roadmap item 89 (`bench/mixed/mixed.fd`: 200k StringBuilder appends, 2M Vec pushes and gets, 100k HashMap inserts and lookups, ten rounds), `fid emit` against `fid ccompile --cc-opt 0`, each part alone too (`MIXED_PHASE`); checksums from `bench/mixed/reference.py`; exits 1 over 2x. First run: [docs/verification/a11-m7-lint-mixed-2026-11-18.md](../docs/verification/a11-m7-lint-mixed-2026-11-18.md) (native 0.27x of C -O0). |
 | `bash bench/alloc/run.sh` | RT8 | `bench/alloc/`: five allocator programs (small, churn, sizes, threads, large: mimalloc-bench's shapes) in C, built with the C library's malloc/calloc, mimalloc's mi_malloc/mi_zalloc and fid's p_malloc (the C runtime of `fid dump-c bench/alloc/c/rt.fd`), and in Fides through ccompile and emit; prints the best time of each and fid over mimalloc. See bench/alloc/README.md. |
-| `bench/versions.txt` | BM2 | The pinned toolchain versions; `run.sh` names any installed version that differs. `run.sh` also has a C++ (GCC) column (`g++ -O2`, when on the PATH; on Windows without one, the g++ of WSL, built and timed inside WSL and marked so under the table; `GCC_WSL=0` turns that off). |
+| `bench/versions.txt` | BM2 | The pinned toolchain versions (rustc, zig, clang, go and gcc); `run.sh` names any installed version that differs. `run.sh` prefers a real `clang++` for the C++ (Clang) column and also has a C++ (GCC) column (`g++ -O2`, when on the PATH; on Windows without one, the g++ of WSL, built and timed inside WSL and marked so under the table; `GCC_WSL=0` turns that off). |
 | `./bench/history.sh <tables.md> "<machine>"` | BM10 | Adds a run's tables, unchanged, to `docs/benchmarks.md` (newest first). |
 
 `run.sh` reports the spread of the runs beside each best time (BM8) and the

@@ -88,7 +88,7 @@ Nothing below means anything until this exists.
       Done (Nov 3): `bench/` with fib, loop, sieve, hashmap in all five
       languages (Zig has no hashmap yet) and `bench/run.sh`: builds each, checks
       every language prints the same number, best of N, markdown table.
-- [~] BM2. Install Go and a real Clang and GCC beside `zig cc`; pin every version (S).
+- [x] BM2. Install Go and a real Clang and GCC beside `zig cc`; pin every version (S).
       Done: Go 1.27.3 (winget); Clang through `zig c++`; run.sh prints the
       versions. Nov 15: `bench/versions.txt` pins rustc, zig, go and gcc, and
       run.sh names an installed version that differs; a C++ (GCC) column
@@ -97,7 +97,16 @@ Nothing below means anything until this exists.
       Nov 24: reached — run.sh's GXX=wsl fallback (g++ of WSL, the ELF
       built and timed inside it) ran on the Windows host: g++ 15.2.0
       (wsl), all four benchmarks timed, the footer says the C++ (GCC)
-      column is Linux-on-this-machine. Left of the item: nothing local.
+      column is Linux-on-this-machine. Nov 25 closeout: the machine now
+      has the real native toolchains. Go 1.27.3 was already installed;
+      WinLibs GCC 15.2.0 is installed through winget and LLVM/Clang
+      21.1.0 is installed as a user-level portable toolchain, both on the
+      user PATH of a new shell. bench/run.sh prefers a real clang++ (zig
+      c++ only as fallback) and native g++ (WSL only as fallback);
+      bench/versions.txt now pins clang beside rustc, zig, go and gcc.
+      Smoke: clang++ and g++ compile and run a C++ hello. Validation:
+      RUNS=1 bench/run.sh fib has every column correct, with clang++
+      21.1.0 (native) and g++ 15.2.0 (native). Left: nothing local.
 - [x] BM3. The Benchmarks Game set: n-body, spectral-norm, mandelbrot,
       fannkuch-redux, binary-trees, fasta, reverse-complement, k-nucleotide,
       regex-redux, pidigits (L).
@@ -3399,7 +3408,7 @@ Go and Rust won developers with tools as much as with languages.
       keeps 100), a failure reproducible with the same count. Checked by
       scripts/tl-check.sh over scripts/tl/fuzz_target.fd (run after the
       next build). Coverage-guided fuzzing of the compiler itself stays VF3.
-- [~] TL2. Error messages as good as Rust's, each with a suggested fix, and a test
+- [x] TL2. Error messages as good as Rust's, each with a suggested fix, and a test
       Nov 22: the ratchet failure fixed — 4 new diag tests cover the
       comptime builtin messages (test_diag_comptime_{reflect,embed,
       compile_error,assert}_fail.fd: each fires exactly its two errors),
@@ -3444,6 +3453,17 @@ Go and Rust won developers with tools as much as with languages.
       world_hermetic_clock are accepted by `check`; errors on structs
       still have no line.
       Nov 21: the nesting test reaches the type checker's 512 limit through an operator chain (2g.112) and four expectations were corrected; diag_reverse_operator_type, frontend_trait_self and world_hermetic_clock are still accepted.
+      Done (Nov 25, checked with a fid built from the 905d756b tree):
+      diag-coverage.py counts 467 error messages, every one with a test, a
+      `Fix:` line and an `Exxx` code (100%; 21 new test_diag_tl2_*_fail
+      tests, Fix lines added in typechecker, borrowck, escape, secrecy,
+      compiler and ir); diag-tests-check.py: 602 of 602 expected-fail tests
+      print what they expect (two stale expectations corrected: the E060
+      code on duplicate definitions, and `fn(x) => ...` closure syntax in
+      test_spawn_closure_capture_fail); the 365 conformance `//! error:`
+      files are rejected on `run`. docs/reference/error-codes.md explains
+      every code with an example and its fix, and `fid explain-error E044`
+      prints it. Messages carry carets where the checker has a column.
 - [x] TL3. `fid fix`: applies suggested fixes, and upgrades code between versions (L).
       Done (Nov 15): `fid fix <file.fd> [--check]` (main.fd cmd_fix, the fix
       engine in lsp.fd fix_suggestions/fix_apply, shared with the editor's
@@ -3471,7 +3491,7 @@ Go and Rust won developers with tools as much as with languages.
       (`for x in v.clone()`, lsp.fd:2263-2275) both exist in
       fix_suggestions (lsp.fd:2915); the edition-stop is by design
       (main.fd:3640-3641). Done.
-- [~] TL4. LSP complete: references, rename, formatting, signature help, inlay
+- [x] TL4. LSP complete: references, rename, formatting, signature help, inlay
       Nov 22 audit: mostly done, close — completion/hover/rename/
       references/signatureHelp/inlayHint/codeAction/formatting all
       dispatch (lsp.fd:144-201, :346-369); rename is scope-aware
@@ -3507,6 +3527,16 @@ Go and Rust won developers with tools as much as with languages.
       Type.m tables). A local or parameter that shadows a function name
       takes its calls — `w(` is hint-checked against lsp_local_scope at
       the call position first. Probe: scripts/tl/lsp_tl4_gaps.py.
+      Nov 25 closeout validation with release/fid-dev.exe: lsp_probe.py
+      17/17, lsp_tl4_gaps.py 5/5, lsp_tl4_features.py 29/29,
+      lsp-scope-check.sh 31/31 and lsp-uri-check.sh 3/3 pass;
+      `fid check compiler/lsp.fd` has no errors. The probes cover the
+      acceptance features plus completion, hover, definition, document
+      symbols and diagnostics. There is no tests/bootstrap LSP .fd lane to
+      run through expect.py: the LSP is a long-running stdin/stdout server,
+      so these probes are its validation lane.
+      Nov 25 again with a fid built from the 905d756b tree: the same four
+      probes pass (29, 5, 17 ok; lsp-scope-check PASS).
 - [~] TL5. Debugger support with line tables on every platform (release N9) (L).
       Nov 22 evening: `fid debug` is wired — cmd_debug (main.fd) reads
       the file and runs compiler/debugger.fd's Debugger_new/Debugger_run
@@ -3562,6 +3592,19 @@ Go and Rust won developers with tools as much as with languages.
      lib/util.fd is written under lib/ — macho_dwarf_unit passes all 25
      lines (__debug_line is 111 bytes, `file 2 lib/util.fd`). Left:
      lldb on a Mac not run; variables (DB4).
+     Nov 25 (fid built from the 905d756b tree): variables done on Windows.
+     `fid emit --debug -g` of test_pe_dbg_vars.fd: 25 of 25 expected values
+     read through the DWARF with 2 steps and 2 function breakpoints
+     (pe_dbg_run_check.py), 22 of 22 read through the PDB alone with
+     dbghelp, as Visual Studio and WinDbg do (pe_pdb_locals_check.py);
+     pe_pdb_check.py --unit passes; `fid debug` runs scripted sessions
+     (`--echo`, fid-debug-session-check.sh: ok); tl5-lines-check.sh ok.
+     Left: lldb on a Mac, which only CI can run (macos-native.yml now has
+     the step, tests/nattools/macos_lldb_check.sh: breakpoint, variables,
+     bt, dwarfdump --verify); `-g` without `--debug` inlines small
+     functions and loses their lines (BG243); C variables are v0..vN in a
+     `ccompile -g` build (BG244); nat_ir location lists are one byte wide
+     (BG245).
 - [~] TL6. Cross-compilation out of the box: `fid build --target linux-arm64` from
       any host, with no extra download (L).
       Done (Nov 15): `--target` is read OS first too (main.fd
@@ -3904,7 +3947,7 @@ Trust is built by what we do not break.
 - [>] ST10. Signed checksums for every download (S).: moved to end-roadmap.md (Nov 22 — final-gate work, do when the code stops moving).
 
 
-- [~] AD1. `ark`, `scribe` and `veil` written in Fides (release N8) (L). The
+- [x] AD1. `ark`, `scribe` and `veil` written in Fides (release N8) (L). The
       Nov 22 audit: mostly done — the "shipped binaries are still Rust"
       gap is closed in code: installer/build-installer.sh (1fee238,
       Nov 22) builds ark/scribe/veil from tools/*.fd via the shipped fid
@@ -3933,6 +3976,14 @@ Trust is built by what we do not break.
       reflect the two lowerings' different line attribution. Left: ship a
       released installer, and rebuild fid so `fid veil` carries this
       implementation.
+      Done (Nov 25, fid rebuilt from the 905d756b tree, so `fid veil` is the
+      new implementation): tools-selfbuild-check.sh passes for ark, scribe
+      and veil, veil compared with target/release/veil.exe (the only
+      differences are the line totals of the two lowerings, as above);
+      `fid veil` on a program that does not compile prints the error and
+      exits 1. installer/build-installer.sh builds the three from tools/*.fd
+      by default; the first released installer to carry them is the next
+      tag (a release step, not code).
       implementations exist in `compiler/{ark,scribe,veil}.fd` and now have
       standalone `fn main` entries in `tools/`. `ark.exe` builds and runs
       end-to-end (`version`, `list` verified); `scribe.exe` builds and
@@ -4040,6 +4091,28 @@ Trust is built by what we do not break.
       form, sparse-#line form, --self-test and the missing-argument exit:
       6 same, 0 differ. Left of the audit: the remaining drivers to port;
       the shipped ark/scribe/veil are still Rust until a release rebuild.
+      Nov 25 evening: 32 more ports, each with a tests/tools/<name>/check.sh
+      that runs the original and the port with the same arguments and
+      compares stdout, exit status and the files written (all pass, built
+      with `fid ccompile`; docs/reference/internal-tools.md has a paragraph
+      per tool). Gate and verify: expect, leak_check, stale_cache_test,
+      rules_smt, compile_gate (+ bench compile-check), me_measure,
+      nat_gate, pass_matrix, variants, coverage, chaos, soak, interleave,
+      enc_oracle, gen_brotli_dict. Fuzzing: fuzz_gen (802 programs
+      byte-identical; tools/py_random.fd is CPython's MT19937, so a seed
+      names the same program), fuzz_vs_c, fuzz_frontend, fuzz_parsers,
+      reduce, fuzz_nightly. Target runners: cross_test, wasm_test,
+      bare_qemu_test, sanitize. Left: tools/fuzz_triage.fd predates
+      triage.py's Nov 19 changes (majority result without a .want, the
+      "environment?" group, M24/M25 hints), so fuzz_nightly's check is 1
+      same, 1 differ; `--gen` in variants and coverage; the lanes this
+      Windows machine cannot run (qemu-user, WSL, QEMU boots, ASan/TSan,
+      the @cfg(unix) code of chaos/soak/interleave); clean-bootstrap,
+      build-variant, repro, verify.sh/verify-selfhost.sh, tests/harness.rs
+      and bench/run.sh, which internal-tools.md lists as not ported and
+      why. Eight tools reach getcwd, local time, sockets or affinity
+      through their own extern "C" blocks (no stdlib call yet), so they
+      build with ccompile, not `fid run`.
 - [>] AD5. A real production service of ours, with its incidents written up: moved to external-roadmap.md (Nov 21).
 
 **Being reachable**

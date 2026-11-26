@@ -1,0 +1,1478 @@
+// tools/soak.fd — a service under load for a long time, with flat memory
+// (VF16): the Fides port of scripts/verify/soak.py (roadmap AD4). Same
+// options and defaults, the same lines, the same <out>/soak-<backend>.csv,
+// the same exit status:
+//
+//   fid ccompile tools/soak.fd -o soak.exe
+//   soak.exe --fid release/fid.exe [--duration 3600] [--backend ccompile|emit]
+//       [--program tests/verify/soak_service.fd] [--sample 10]
+//       [--max-growth-mb-per-hour 1] [--out build/soak]
+//
+// Builds the program once (`<fid> <backend> <program> -o
+// <out>/soak-<backend>.exe`, CC=zig cc unless CC is set), runs it with no
+// request limit (`<exe> 0`), and every --sample seconds records its
+// resident memory (Windows: the working set, K32GetProcessMemoryInfo, as
+// psutil's rss; Linux: /proc/<pid>/statm's resident pages) and its last
+// heartbeat line. At the end the process must still be running and still
+// printing heartbeats (none for more than max(60, 6 * sample) seconds
+// fails), and the least-squares slope of memory over the second half of
+// the run, in MB per hour, must stay under --max-growth-mb-per-hour.
+//
+// The script reads the child's stdout in a thread. Here the child's
+// stdout goes to <out>/soak-<backend>.stdout, read as it grows every 100
+// ms between samples (a heartbeat is seen within 0.1 s of being written,
+// where the thread sees it at once), and its stderr to
+// <out>/soak-<backend>.stderr (the script keeps both in pipes). Other
+// differences: the CSV is written with "\n" line ends (Python on Windows
+// writes "\r\n"); a program that cannot be started gives the last line of
+// Python's traceback only, exit 1 as there; --max-growth-mb-per-hour is
+// printed as written when it has more than 15 significant digits (Python
+// prints repr(float)).
+
+use core;
+use args;
+use fs;
+use io;
+use process;
+use sys;
+use task;
+
+extern "C" {
+    fn getcwd(buf: i64, n: i64) -> i64;
+    fn K32GetProcessMemoryInfo(h: i64, buf: i64, n: i64) -> i32;
+}
+
+// SAFETY: kernel32 functions, declared by <windows.h>, which every
+// generated C file includes on Windows (`<stdint.h>` only makes the C
+// backend use the system's prototypes); only @cfg(windows) functions call
+// them, with a process id and a handle OpenProcess returned.
+extern "C" include "<stdint.h>" {
+    fn OpenProcess as sk_open_process(access: i64, inherit: i64, pid: i64) -> i64;
+    fn CloseHandle as sk_close_handle(h: i64) -> i32;
+}
+
+// SAFETY: the C library's stdio, declared by <stdio.h>, which every
+// generated C file includes: a FILE* is kept as an i64 between calls and
+// only handed back to these functions; `buf` is a block this file
+// allocated, at least `n` bytes long.
+extern "C" include "<stdint.h>" {
+    fn fopen as sk_fopen(path: str, mode: str) -> i64;
+    fn fread as sk_fread(buf: i64, size: i64, n: i64, f: i64) -> i64;
+    fn clearerr as sk_clearerr(f: i64);
+    fn fclose as sk_fclose(f: i64) -> i32;
+}
+
+const SK_PROG: str = "soak.py";
+
+fn sk_usage() -> str {
+    var u: str = "usage: soak.py [-h] [--fid FID] [--duration DURATION] [--backend BACKEND]\n";
+    u = u + "               [--program PROGRAM] [--sample SAMPLE]\n";
+    u = u + "               [--max-growth-mb-per-hour MAX_GROWTH_MB_PER_HOUR] [--out OUT]\n";
+    return u;
+}
+
+fn sk_help() -> str {
+    var h: str = sk_usage() + "\noptions:\n";
+    h = h + "  -h, --help            show this help message and exit\n";
+    h = h + "  --fid FID\n";
+    h = h + "  --duration DURATION\n";
+    h = h + "  --backend BACKEND\n";
+    h = h + "  --program PROGRAM\n";
+    h = h + "  --sample SAMPLE\n";
+    h = h + "  --max-growth-mb-per-hour MAX_GROWTH_MB_PER_HOUR\n";
+    h = h + "  --out OUT\n";
+    return h;
+}
+
+// ─── Text (Python's str methods, ASCII whitespace) ───
+
+fn sk_ws(c: i64) -> bool {
+    return (c >= 9 && c <= 13) || (c >= 28 && c <= 32);
+}
+
+fn sk_digit(c: i64) -> bool {
+    return c >= 48 && c <= 57;
+}
+
+fn sk_skip_ws(s: str, i: i64) -> i64 {
+    var k: i64 = i;
+    while k < str_len(s) && sk_ws(str_byte_at(s, k)) { k = k + 1; }
+    return k;
+}
+
+fn sk_at(s: str, i: i64, w: str) -> bool {
+    if i < 0 || i + str_len(w) > str_len(s) { return false; }
+    return str_slice(s, i, i + str_len(w)) == w;
+}
+
+/// s.strip()
+fn sk_strip(s: str) -> str {
+    var a: i64 = 0;
+    var b: i64 = str_len(s);
+    while a < b && sk_ws(str_byte_at(s, a)) { a = a + 1; }
+    while b > a && sk_ws(str_byte_at(s, b - 1)) { b = b - 1; }
+    return str_slice(s, a, b);
+}
+
+/// s.split(sep) (keeps empty pieces).
+fn sk_split(s: str, sep: str) -> Vec<str> {
+    var r: Vec<str> = Vec::new();
+    val n: i64 = str_len(s);
+    val m: i64 = str_len(sep);
+    var start: i64 = 0;
+    var i: i64 = 0;
+    while i + m <= n {
+        if str_slice(s, i, i + m) == sep {
+            r.push(str_slice(s, start, i));
+            i = i + m;
+            start = i;
+        } else {
+            i = i + 1;
+        }
+    }
+    r.push(str_slice(s, start, n));
+    return r;
+}
+
+/// s.splitlines() (on "\n", "\r\n" and "\r").
+fn sk_splitlines(s: str) -> Vec<str> {
+    var r: Vec<str> = Vec::new();
+    val n: i64 = str_len(s);
+    var start: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        val c: i64 = str_byte_at(s, i);
+        if c == 10 || c == 13 {
+            r.push(str_slice(s, start, i));
+            if c == 13 && i + 1 < n && str_byte_at(s, i + 1) == 10 { i = i + 1; }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    if start < n { r.push(str_slice(s, start, n)); }
+    return r;
+}
+
+/// f"{s:<w}"
+fn sk_ljust(s: str, w: i64) -> str {
+    var r: str = s;
+    var n: i64 = sk_chars(s);
+    while n < w {
+        r = r + " ";
+        n = n + 1;
+    }
+    return r;
+}
+
+/// f"{s:>w}"
+fn sk_rjust(s: str, w: i64) -> str {
+    var r: str = s;
+    var n: i64 = sk_chars(s);
+    while n < w {
+        r = " " + r;
+        n = n + 1;
+    }
+    return r;
+}
+
+/// The code points of UTF-8 text.
+fn sk_chars(s: str) -> i64 {
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while i < str_len(s) {
+        if (str_byte_at(s, i) & 192) != 128 { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+
+/// s[:n] by code points.
+fn sk_head(s: str, n: i64) -> str {
+    var seen: i64 = 0;
+    var i: i64 = 0;
+    while i < str_len(s) {
+        if (str_byte_at(s, i) & 192) != 128 {
+            if seen == n { return str_slice(s, 0, i); }
+            seen = seen + 1;
+        }
+        i = i + 1;
+    }
+    return s;
+}
+
+/// s[-n:] by code points.
+fn sk_tail(s: str, n: i64) -> str {
+    val total: i64 = sk_chars(s);
+    if total <= n { return s; }
+    var skip: i64 = total - n;
+    var i: i64 = 0;
+    while i < str_len(s) {
+        if (str_byte_at(s, i) & 192) != 128 {
+            if skip == 0 { return str_slice(s, i, str_len(s)); }
+            skip = skip - 1;
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn sk_hexw(c: i64, width: i64) -> str {
+    val digits: str = "0123456789abcdef";
+    var s: str = "";
+    var k: i64 = width - 1;
+    while k >= 0 {
+        s = s + char_to_str(str_byte_at(digits, (c >> (4 * k)) & 15));
+        k = k - 1;
+    }
+    return s;
+}
+
+/// hex(v) for v >= 0: "0x" and the digits, no padding.
+fn sk_hex(v: i64) -> str {
+    if v == 0 { return "0x0"; }
+    val digits: str = "0123456789abcdef";
+    var s: str = "";
+    var x: i64 = v;
+    while x > 0 {
+        s = char_to_str(str_byte_at(digits, x & 15)) + s;
+        x = x >> 4;
+    }
+    return "0x" + s;
+}
+
+/// repr() of a str: ASCII control characters, U+007F..U+009F escaped,
+/// the rest as it is.
+fn sk_repr(s: str) -> str {
+    var q: str = "'";
+    if str_contains(s, "'") && !str_contains(s, "\"") { q = "\""; }
+    var out: str = q;
+    var i: i64 = 0;
+    while i < str_len(s) {
+        val c: i64 = str_byte_at(s, i);
+        i = i + 1;
+        if char_to_str(c) == q || c == 92 {
+            out = out + "\\" + char_to_str(c);
+        } else if c == 9 {
+            out = out + "\\t";
+        } else if c == 10 {
+            out = out + "\\n";
+        } else if c == 13 {
+            out = out + "\\r";
+        } else if c < 32 || c == 127 {
+            out = out + "\\x" + sk_hexw(c, 2);
+        } else if c == 192 && i < str_len(s) && str_byte_at(s, i) == 128 {
+            // a NUL the decoder kept as C0 80
+            out = out + "\\x00";
+            i = i + 1;
+        } else if c == 194 && i < str_len(s) && str_byte_at(s, i) >= 128 && str_byte_at(s, i) <= 159 {
+            out = out + "\\x" + sk_hexw(str_byte_at(s, i), 2);
+            i = i + 1;
+        } else {
+            out = out + char_to_str(c);
+        }
+    }
+    return out + q;
+}
+
+/// f"{d:.{prec}f}", rounded as Python rounds (the binary value, ties to
+/// even).
+fn sk_fixed(d: f64, prec: i64) -> str {
+    if d != d { return "nan"; }
+    var neg: bool = false;
+    var x: f64 = d;
+    if x < 0.0 {
+        neg = true;
+        x = 0.0 - x;
+    }
+    if x > 1.0e15 {
+        return float_to_str(d);
+    }
+    val bits: i64 = p_f64_to_bits(x);
+    val e: i64 = (bits >> 52) & 2047;
+    var m: i64 = bits & 4503599627370495;
+    var exp: i64 = -1074;
+    if e != 0 {
+        m = m | 4503599627370496;
+        exp = e - 1075;
+    }
+    var scale: i64 = 1;
+    var k: i64 = 0;
+    while k < prec {
+        scale = scale * 10;
+        k = k + 1;
+    }
+    // m * scale fits while prec <= 2 (m < 2^53)
+    val num: i64 = m * scale;
+    var q: i64 = 0;
+    if exp >= 0 {
+        q = num << exp;
+    } else {
+        val s: i64 = 0 - exp;
+        if s <= 61 {
+            q = num >> s;
+            val r: i64 = num - (q << s);
+            val half: i64 = 1 << (s - 1);
+            if r > half || (r == half && (q & 1) == 1) { q = q + 1; }
+        }
+    }
+    var out: str = int_to_str(q / scale);
+    if prec > 0 {
+        var frac: str = int_to_str(q % scale);
+        while str_len(frac) < prec { frac = "0" + frac; }
+        out = out + "." + frac;
+    }
+    if neg { out = "-" + out; }
+    return out;
+}
+
+/// The text Python's bytes.decode("utf-8", "replace") gives (a NUL as
+/// C0 80, which a str can hold).
+fn sk_decode(b: Vec<i64>) -> str {
+    var out: Vec<i64> = Vec::new();
+    val n: i64 = b.len();
+    var i: i64 = 0;
+    while i < n {
+        val c: i64 = b.get(i);
+        if c == 0 {
+            out.push(192);
+            out.push(128);
+            i = i + 1;
+            continue;
+        }
+        if c < 128 {
+            out.push(c);
+            i = i + 1;
+            continue;
+        }
+        var need: i64 = 0;
+        var lo: i64 = 128;
+        var hi: i64 = 191;
+        if c >= 194 && c <= 223 {
+            need = 1;
+        } else if c >= 224 && c <= 239 {
+            need = 2;
+            if c == 224 { lo = 160; }
+            if c == 237 { hi = 159; }
+        } else if c >= 240 && c <= 244 {
+            need = 3;
+            if c == 240 { lo = 144; }
+            if c == 244 { hi = 143; }
+        } else {
+            out.push(239);
+            out.push(191);
+            out.push(189);
+            i = i + 1;
+            continue;
+        }
+        var j: i64 = 1;
+        var ok: bool = true;
+        while j <= need {
+            if i + j >= n {
+                ok = false;
+                break;
+            }
+            val d: i64 = b.get(i + j);
+            var l: i64 = 128;
+            var h: i64 = 191;
+            if j == 1 {
+                l = lo;
+                h = hi;
+            }
+            if d < l || d > h {
+                ok = false;
+                break;
+            }
+            j = j + 1;
+        }
+        if ok {
+            var k: i64 = 0;
+            while k <= need {
+                out.push(b.get(i + k));
+                k = k + 1;
+            }
+            i = i + need + 1;
+        } else {
+            out.push(239);
+            out.push(191);
+            out.push(189);
+            i = i + j;
+        }
+    }
+    return str_from_bytes(out);
+}
+
+// ─── Paths (os.path on this system) ───
+
+fn sk_win() -> bool {
+    return process_is_windows();
+}
+
+fn sk_is_sep(c: i64) -> bool {
+    return c == 47 || (c == 92 && sk_win());
+}
+
+fn sk_sep() -> str {
+    if sk_win() { return "\\"; }
+    return "/";
+}
+
+var sk_cwd_cache: str = "";
+
+/// os.getcwd()
+fn sk_cwd() -> str {
+    if str_len(sk_cwd_cache) > 0 { return sk_cwd_cache; }
+    var buf: i64 = 0;
+    // SAFETY: a fresh 4096-byte buffer; getcwd writes at most that many
+    // bytes, NUL included, and the result is copied out before it is freed.
+    unsafe {
+        buf = p_malloc(4096);
+        if buf != 0 {
+            if getcwd(buf, 4096) != 0 {
+                sk_cwd_cache = p_str_from_ptr(buf);
+            }
+            p_free(buf);
+        }
+    }
+    if str_len(sk_cwd_cache) == 0 { sk_cwd_cache = "."; }
+    return sk_cwd_cache;
+}
+
+/// The drive ("C:") of a Windows path, "" for none.
+fn sk_drive(p: str) -> str {
+    if sk_win() && str_len(p) >= 2 && str_byte_at(p, 1) == 58 { return str_slice(p, 0, 2); }
+    return "";
+}
+
+fn sk_isabs(p: str) -> bool {
+    val d: str = sk_drive(p);
+    val rest: str = str_slice(p, str_len(d), str_len(p));
+    return str_len(rest) > 0 && sk_is_sep(str_byte_at(rest, 0));
+}
+
+/// os.path.join(a, b)
+fn sk_join(a: str, b: str) -> str {
+    if str_len(a) == 0 { return b; }
+    if sk_isabs(b) { return b; }
+    if sk_is_sep(str_byte_at(a, str_len(a) - 1)) { return a + b; }
+    return a + sk_sep() + b;
+}
+
+/// os.path.normpath
+fn sk_normpath(p: str) -> str {
+    val d: str = sk_drive(p);
+    var rest: str = str_slice(p, str_len(d), str_len(p));
+    if sk_win() { rest = str_replace(rest, "/", "\\"); }
+    val abs: bool = str_len(rest) > 0 && sk_is_sep(str_byte_at(rest, 0));
+    val parts: Vec<str> = sk_split(rest, sk_sep());
+    var out: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < parts.len() {
+        val c: str = parts.get(i);
+        i = i + 1;
+        if str_len(c) == 0 || c == "." { continue; }
+        if c == ".." {
+            if out.len() > 0 && out.get(out.len() - 1) != ".." {
+                out.remove(out.len() - 1);
+                continue;
+            }
+            if abs { continue; }
+        }
+        out.push(c);
+    }
+    var s: str = "";
+    i = 0;
+    while i < out.len() {
+        if i > 0 { s = s + sk_sep(); }
+        s = s + out.get(i);
+        i = i + 1;
+    }
+    if abs { s = sk_sep() + s; }
+    s = d + s;
+    if str_len(s) == 0 { return "."; }
+    return s;
+}
+
+/// os.path.abspath
+fn sk_abspath(p: str) -> str {
+    if sk_isabs(p) { return sk_normpath(p); }
+    return sk_normpath(sk_join(sk_cwd(), p));
+}
+
+/// os.path.basename
+fn sk_basename(p: str) -> str {
+    var i: i64 = str_len(p) - 1;
+    while i >= 0 {
+        if sk_is_sep(str_byte_at(p, i)) { return str_slice(p, i + 1, str_len(p)); }
+        i = i - 1;
+    }
+    if str_len(sk_drive(p)) == 2 { return str_slice(p, 2, str_len(p)); }
+    return p;
+}
+
+/// os.makedirs(p, exist_ok=True)
+fn sk_makedirs(p: str) -> bool {
+    if str_len(p) == 0 || fs_is_dir(p) { return true; }
+    var k: i64 = str_len(p) - 1;
+    while k >= 0 && sk_is_sep(str_byte_at(p, k)) { k = k - 1; }
+    while k >= 0 && !sk_is_sep(str_byte_at(p, k)) { k = k - 1; }
+    if k > 0 {
+        val parent: str = str_slice(p, 0, k);
+        if !(str_len(parent) == 2 && str_len(sk_drive(parent)) == 2) {
+            sk_makedirs(parent);
+        }
+    }
+    fs_mkdir(p);
+    return fs_is_dir(p);
+}
+
+/// os.environ.get(name, "")
+fn sk_env(name: str) -> str {
+    match env_var(name) {
+        Option::Some(v) => { return v; }
+        Option::None => { }
+    }
+    return "";
+}
+
+fn sk_has_env(name: str) -> bool {
+    match env_var(name) {
+        Option::Some(v) => { return true; }
+        Option::None => { }
+    }
+    return false;
+}
+
+// ─── argparse (options only, no positionals) ───
+
+struct SkOpt {
+    long: str,
+    short: str,
+    takes: bool,
+    kind: i64,
+}
+
+const SK_STR: i64 = 0;
+const SK_INT: i64 = 1;
+const SK_FLOAT: i64 = 2;
+const SK_FLAG: i64 = 3;
+const SK_HELP: i64 = 4;
+
+fn sk_opt(long: str, short: str, kind: i64) -> SkOpt {
+    return SkOpt { long: long, short: short, takes: kind == SK_STR || kind == SK_INT || kind == SK_FLOAT, kind: kind };
+}
+
+/// argparse's look of a negative number: -\d+ or -\d*\.\d+
+fn sk_negnum(a: str) -> bool {
+    if str_len(a) < 2 || str_byte_at(a, 0) != 45 { return false; }
+    var i: i64 = 1;
+    var dig: i64 = 0;
+    while i < str_len(a) && sk_digit(str_byte_at(a, i)) {
+        i = i + 1;
+        dig = dig + 1;
+    }
+    if i == str_len(a) { return dig > 0; }
+    if str_byte_at(a, i) != 46 { return false; }
+    i = i + 1;
+    var frac: i64 = 0;
+    while i < str_len(a) && sk_digit(str_byte_at(a, i)) {
+        i = i + 1;
+        frac = frac + 1;
+    }
+    return i == str_len(a) && frac > 0;
+}
+
+/// int(s) as Python reads it (whitespace, a sign, ASCII digits, "_"
+/// between digits).
+fn sk_is_int(s: str) -> bool {
+    val t: str = sk_strip(s);
+    var i: i64 = 0;
+    if i < str_len(t) && (str_byte_at(t, i) == 43 || str_byte_at(t, i) == 45) { i = i + 1; }
+    if i >= str_len(t) { return false; }
+    var prev_digit: bool = false;
+    while i < str_len(t) {
+        val c: i64 = str_byte_at(t, i);
+        if c == 95 {
+            if !prev_digit || i + 1 >= str_len(t) || !sk_digit(str_byte_at(t, i + 1)) { return false; }
+            prev_digit = false;
+        } else if !sk_digit(c) {
+            return false;
+        } else {
+            prev_digit = true;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn sk_int(s: str) -> i64 {
+    var t: str = str_replace(sk_strip(s), "_", "");
+    if str_starts_with(t, "+") { t = str_slice(t, 1, str_len(t)); }
+    return str_parse_int(t);
+}
+
+/// float(s): a decimal with an optional exponent, inf, infinity or nan.
+fn sk_is_float(s: str) -> bool {
+    val t: str = str_to_lower(sk_strip(s));
+    var i: i64 = 0;
+    if i < str_len(t) && (str_byte_at(t, i) == 43 || str_byte_at(t, i) == 45) { i = i + 1; }
+    val rest: str = str_slice(t, i, str_len(t));
+    if rest == "inf" || rest == "infinity" || rest == "nan" { return true; }
+    var digs: i64 = 0;
+    while i < str_len(t) && sk_digit(str_byte_at(t, i)) {
+        i = i + 1;
+        digs = digs + 1;
+    }
+    if i < str_len(t) && str_byte_at(t, i) == 46 {
+        i = i + 1;
+        while i < str_len(t) && sk_digit(str_byte_at(t, i)) {
+            i = i + 1;
+            digs = digs + 1;
+        }
+    }
+    if digs == 0 { return false; }
+    if i < str_len(t) && str_byte_at(t, i) == 101 {
+        i = i + 1;
+        if i < str_len(t) && (str_byte_at(t, i) == 43 || str_byte_at(t, i) == 45) { i = i + 1; }
+        var ed: i64 = 0;
+        while i < str_len(t) && sk_digit(str_byte_at(t, i)) {
+            i = i + 1;
+            ed = ed + 1;
+        }
+        if ed == 0 { return false; }
+    }
+    return i == str_len(t);
+}
+
+fn sk_float(s: str) -> f64 {
+    val t: str = str_to_lower(sk_strip(s));
+    if str_contains(t, "inf") {
+        if str_starts_with(t, "-") { return 0.0 - 1.0e308 * 10.0; }
+        return 1.0e308 * 10.0;
+    }
+    if str_contains(t, "nan") {
+        val z: f64 = 0.0;
+        return z / z;
+    }
+    return str_parse_float(t);
+}
+
+/// -1 none, -2 ambiguous (msg set), else the option's index.
+fn sk_find_opt(opts: Vec<SkOpt>, a: str, msg: &mut str, explicit: &mut str, has_explicit: &mut bool) -> i64 {
+    *has_explicit = false;
+    *explicit = "";
+    var i: i64 = 0;
+    while i < opts.len() {
+        if opts.get(i).long == a || (str_len(opts.get(i).short) > 0 && opts.get(i).short == a) { return i; }
+        i = i + 1;
+    }
+    if str_len(a) < 2 || str_byte_at(a, 0) != 45 { return -1; }
+    val eq: i64 = str_find(a, "=");
+    if eq > 0 {
+        val name: str = str_slice(a, 0, eq);
+        i = 0;
+        while i < opts.len() {
+            if opts.get(i).long == name || (str_len(opts.get(i).short) > 0 && opts.get(i).short == name) {
+                *explicit = str_slice(a, eq + 1, str_len(a));
+                *has_explicit = true;
+                return i;
+            }
+            i = i + 1;
+        }
+    }
+    if str_starts_with(a, "--") {
+        var prefix: str = a;
+        if eq > 0 { prefix = str_slice(a, 0, eq); }
+        var hits: Vec<i64> = Vec::new();
+        i = 0;
+        while i < opts.len() {
+            if str_len(opts.get(i).long) > 0 && str_starts_with(opts.get(i).long, prefix) { hits.push(i); }
+            i = i + 1;
+        }
+        if hits.len() > 1 {
+            var names: str = "";
+            var k: i64 = 0;
+            while k < hits.len() {
+                if k > 0 { names = names + ", "; }
+                names = names + opts.get(hits.get(k)).long;
+                k = k + 1;
+            }
+            *msg = "ambiguous option: " + a + " could match " + names;
+            return -2;
+        }
+        if hits.len() == 1 {
+            if eq > 0 {
+                *explicit = str_slice(a, eq + 1, str_len(a));
+                *has_explicit = true;
+            }
+            return hits.get(0);
+        }
+        return -1;
+    }
+    // a short option with its value glued on (-n4)
+    val two: str = str_slice(a, 0, 2);
+    i = 0;
+    while i < opts.len() {
+        if str_len(opts.get(i).short) > 0 && opts.get(i).short == two && opts.get(i).takes {
+            *explicit = str_slice(a, 2, str_len(a));
+            *has_explicit = true;
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// ap.error(msg): the usage and "<prog>: error: msg" on stderr; 2.
+fn sk_ap_error(msg: str) -> i64 {
+    io_eprint(sk_usage());
+    io_eprintln(SK_PROG + ": error: " + msg);
+    return 2;
+}
+
+struct SkArgs {
+    vals: Vec<str>,
+    given: Vec<bool>,
+    code: i64,
+}
+
+/// ap.parse_args(): code -1 when the options are good (vals/given hold
+/// them), else the exit status (help printed: 0; an error: 2).
+fn sk_parse(argv: Vec<str>, opts: Vec<SkOpt>) -> SkArgs {
+    var vals: Vec<str> = Vec::new();
+    var given: Vec<bool> = Vec::new();
+    var i: i64 = 0;
+    while i < opts.len() {
+        vals.push("");
+        given.push(false);
+        i = i + 1;
+    }
+    var kinds: Vec<i64> = Vec::new();
+    var idx: Vec<i64> = Vec::new();
+    var expl: Vec<str> = Vec::new();
+    var hexp: Vec<bool> = Vec::new();
+    var dashdash: bool = false;
+    i = 0;
+    while i < argv.len() {
+        val a: str = argv.get(i);
+        i = i + 1;
+        var msg: str = "";
+        var ex: str = "";
+        var he: bool = false;
+        if dashdash || a == "-" || !str_starts_with(a, "-") {
+            kinds.push(0);
+            idx.push(-1);
+            expl.push("");
+            hexp.push(false);
+            continue;
+        }
+        if a == "--" {
+            dashdash = true;
+            kinds.push(2);
+            idx.push(-1);
+            expl.push("");
+            hexp.push(false);
+            continue;
+        }
+        val f: i64 = sk_find_opt(opts, a, &mut msg, &mut ex, &mut he);
+        if f == -2 {
+            return SkArgs { vals: vals, given: given, code: sk_ap_error(msg) };
+        }
+        if f < 0 && (sk_negnum(a) || str_contains(a, " ")) {
+            kinds.push(0);
+        } else {
+            kinds.push(1);
+        }
+        idx.push(f);
+        expl.push(ex);
+        hexp.push(he);
+    }
+    var extras: Vec<str> = Vec::new();
+    i = 0;
+    while i < argv.len() {
+        val a2: str = argv.get(i);
+        val kd: i64 = kinds.get(i);
+        val f2: i64 = idx.get(i);
+        i = i + 1;
+        if kd == 2 { continue; }
+        if kd == 0 || f2 < 0 {
+            extras.push(a2);
+            continue;
+        }
+        val o: SkOpt = opts.get(f2);
+        var name: str = o.long;
+        if str_len(o.long) == 0 { name = o.short; } else if str_len(o.short) > 0 { name = o.short + "/" + o.long; }
+        if o.kind == SK_HELP {
+            io_print(sk_help());
+            return SkArgs { vals: vals, given: given, code: 0 };
+        }
+        if !o.takes {
+            if hexp.get(i - 1) {
+                return SkArgs { vals: vals, given: given,
+                    code: sk_ap_error("argument " + name + ": ignored explicit argument " + sk_repr(expl.get(i - 1))) };
+            }
+            given.set(f2, true);
+            vals.set(f2, "1");
+            continue;
+        }
+        var v: str = "";
+        if hexp.get(i - 1) {
+            v = expl.get(i - 1);
+        } else {
+            if i >= argv.len() || kinds.get(i) != 0 {
+                return SkArgs { vals: vals, given: given, code: sk_ap_error("argument " + name + ": expected one argument") };
+            }
+            v = argv.get(i);
+            i = i + 1;
+        }
+        if o.kind == SK_INT && !sk_is_int(v) {
+            return SkArgs { vals: vals, given: given, code: sk_ap_error("argument " + name + ": invalid int value: " + sk_repr(v)) };
+        }
+        if o.kind == SK_FLOAT && !sk_is_float(v) {
+            return SkArgs { vals: vals, given: given, code: sk_ap_error("argument " + name + ": invalid float value: " + sk_repr(v)) };
+        }
+        given.set(f2, true);
+        vals.set(f2, v);
+    }
+    if extras.len() > 0 {
+        var s: str = "";
+        var k: i64 = 0;
+        while k < extras.len() {
+            if k > 0 { s = s + " "; }
+            s = s + extras.get(k);
+            k = k + 1;
+        }
+        return SkArgs { vals: vals, given: given, code: sk_ap_error("unrecognized arguments: " + s) };
+    }
+    return SkArgs { vals: vals, given: given, code: -1 };
+}
+
+fn sk_val(a: &SkArgs, i: i64, def: str) -> str {
+    if a.given.get(i) { return a.vals.get(i); }
+    return def;
+}
+
+fn sk_flag(a: &SkArgs, i: i64) -> bool {
+    return a.given.get(i);
+}
+
+// ─── Running programs ───
+
+fn sk_join_list(v: Vec<str>) -> str {
+    val sep: str = char_to_str(31);
+    var s: str = "";
+    var i: i64 = 0;
+    while i < v.len() {
+        if i > 0 { s = s + sep; }
+        s = s + v.get(i);
+        i = i + 1;
+    }
+    return s;
+}
+
+/// What sk_run gives: the exit status (Python's: a crash on Windows as the
+/// unsigned code), timed_out when it was killed at the time limit,
+/// started false when it could not start; stdout and stderr decoded as
+/// UTF-8 with replacement; the seconds it took.
+struct SkRes {
+    started: bool,
+    timed_out: bool,
+    code: i64,
+    out: str,
+    err: str,
+    secs: f64,
+}
+
+var sk_run_ctr: i64 = 0;
+
+/// When set, sk_run decodes as subprocess.run(..., text=True) does: the
+/// locale's encoding (Windows: the ANSI code page, whose bytes are kept as
+/// they are; elsewhere UTF-8) and universal newlines.
+var sk_locale_mode: bool = false;
+
+/// Text a child wrote, as text=True gives it and print() writes it back:
+/// CR LF and a lone CR as LF; on Windows every other byte as it is
+/// (the code page's characters print as the same bytes) but NUL, which a
+/// str cannot hold (Python prints it); elsewhere UTF-8 with replacement.
+fn sk_locale(b: Vec<i64>) -> str {
+    var nl: Vec<i64> = Vec::new();
+    val n: i64 = b.len();
+    var i: i64 = 0;
+    while i < n {
+        val c: i64 = b.get(i);
+        if c == 13 {
+            nl.push(10);
+            if i + 1 < n && b.get(i + 1) == 10 { i = i + 1; }
+        } else {
+            nl.push(c);
+        }
+        i = i + 1;
+    }
+    return sk_raw(nl);
+}
+
+/// Bytes a child wrote, decoded as the locale's encoding (no newline
+/// translation): see sk_locale.
+fn sk_raw(b: Vec<i64>) -> str {
+    if !sk_win() { return sk_decode(b); }
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < b.len() {
+        if b.get(i) != 0 { out.push(b.get(i)); }
+        i = i + 1;
+    }
+    return str_from_bytes(out);
+}
+
+/// s[-n:] of text sk_locale or sk_raw made (Windows: one byte is one
+/// character of the code page).
+fn sk_ltail(s: str, n: i64) -> str {
+    if !sk_win() { return sk_tail(s, n); }
+    if str_len(s) <= n { return s; }
+    return str_slice(s, str_len(s) - n, str_len(s));
+}
+var sk_tmp: str = "";
+
+fn sk_tmpdir() -> str {
+    if str_len(sk_tmp) > 0 { return sk_tmp; }
+    var t: str = sk_env("TMPDIR");
+    if str_len(t) == 0 { t = sk_env("TEMP"); }
+    if str_len(t) == 0 { t = sk_env("TMP"); }
+    if str_len(t) == 0 {
+        if sk_win() { t = "."; } else { t = "/tmp"; }
+    }
+    sk_tmp = t;
+    return t;
+}
+
+/// A fresh temporary file name (nothing made).
+fn sk_tmpname(tag: str) -> str {
+    sk_run_ctr = sk_run_ctr + 1;
+    return sk_join(sk_tmpdir(), ".fid-" + tag + "-" + int_to_str(p_getpid()) + "-" + int_to_str(sk_run_ctr));
+}
+
+/// A child's exit code as Python's subprocess gives it: on Windows the
+/// unsigned 32-bit value; elsewhere a signal n (128 + n here) as -n when
+/// `signals` (a direct child, not a shell's status).
+fn sk_code(c: i64, signals: bool) -> i64 {
+    var code: i64 = c;
+    if sk_win() {
+        if code < 0 { code = code + 4294967296; }
+    } else if signals && code > 128 && code < 128 + 65 {
+        code = 128 - code;
+    }
+    return code;
+}
+
+/// subprocess.run(cmd, capture_output=True, timeout=...): stdin ours,
+/// stdout and stderr captured; `env` "NAME=value" entries added to ours;
+/// timeout_ms < 0: no limit.
+fn sk_run(cmd: Vec<str>, env: Vec<str>, timeout_ms: i64, signals: bool) -> SkRes {
+    val t0: i64 = p_clock_now_ms();
+    val base: str = sk_tmpname("run");
+    val outp: str = base + ".out";
+    val errp: str = base + ".err";
+    val h: i64 = process_spawn_files(cmd, env, "", outp, errp);
+    if h == 0 {
+        if fs_exists(outp) { fs_delete(outp); }
+        if fs_exists(errp) { fs_delete(errp); }
+        return SkRes { started: false, timed_out: false, code: -1, out: "", err: "", secs: 0.0 };
+    }
+    var timed_out: bool = false;
+    var code: i64 = -1;
+    match process_wait(h, timeout_ms) {
+        Option::Some(c) => {
+            code = sk_code(c, signals);
+        }
+        Option::None => {
+            timed_out = true;
+            process_kill(h);
+            process_wait(h, 10000);
+        }
+    }
+    process_release(h);
+    var out: str = "";
+    var err: str = "";
+    if !timed_out {
+        if sk_locale_mode {
+            out = sk_locale(fs_read_bytes(outp));
+            err = sk_locale(fs_read_bytes(errp));
+        } else {
+            out = sk_decode(fs_read_bytes(outp));
+            err = sk_decode(fs_read_bytes(errp));
+        }
+    }
+    if fs_exists(outp) { fs_delete(outp); }
+    if fs_exists(errp) { fs_delete(errp); }
+    val secs: f64 = ((p_clock_now_ms() - t0) as f64) / 1000.0;
+    return SkRes { started: true, timed_out: timed_out, code: code, out: out, err: err, secs: secs };
+}
+
+// SAFETY: FormatMessageA, declared by <windows.h>, which every generated
+// C file includes on Windows (`<stdint.h>` only makes the C backend use
+// the system's prototype); `buf` is a block of `size` bytes this file
+// allocated. Only the @cfg(windows) sk_winerr calls it.
+extern "C" include "<stdint.h>" {
+    fn FormatMessageA as sk_fmtmsg(flags: i64, src: i64, id: i64, lang: i64, buf: i64, size: i64, args: i64) -> i64;
+}
+
+/// The system's text for Windows error `n`, as Python shows it (trailing
+/// whitespace and dots removed).
+@cfg(windows)
+fn sk_winerr(n: i64) -> str {
+    var msg: str = "";
+    // SAFETY: a fresh 1024-byte block; FormatMessageA writes at most 1023
+    // bytes and a NUL into it (FROM_SYSTEM | IGNORE_INSERTS: no inserts
+    // are read), and the text is copied out before the block is freed.
+    unsafe {
+        val buf: i64 = p_malloc(1024);
+        if buf != 0 {
+            if sk_fmtmsg(4096 | 512, 0, n, 0, buf, 1023, 0) > 0 {
+                msg = p_str_from_ptr(buf);
+            }
+            p_free(buf);
+        }
+    }
+    var e: i64 = str_len(msg);
+    while e > 0 && (sk_ws(str_byte_at(msg, e - 1)) || str_byte_at(msg, e - 1) == 46) { e = e - 1; }
+    return str_slice(msg, 0, e);
+}
+
+@cfg(unix)
+fn sk_winerr(n: i64) -> str {
+    return "";
+}
+
+/// What Python prints for a program it cannot start (the last line of
+/// its traceback).
+fn sk_not_found(prog: str) -> str {
+    if sk_win() { return "FileNotFoundError: [WinError 2] " + sk_winerr(2); }
+    return "FileNotFoundError: [Errno 2] No such file or directory: " + sk_repr(prog);
+}
+
+fn sk_clone_list(v: &Vec<str>) -> Vec<str> {
+    var r: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < v.len() {
+        r.push(v.get(i));
+        i = i + 1;
+    }
+    return r;
+}
+
+/// Python's text mode on a captured stream: "\r\n" as "\n".
+fn sk_text(s: str) -> str {
+    return str_replace(s, "\r\n", "\n");
+}
+
+// ─── The child's memory ───
+
+/// psutil.Process(pid).memory_info().rss in bytes; -1 when the process
+/// cannot be read (psutil.Error: the script stops sampling).
+@cfg(windows)
+fn sk_rss(pid: i64) -> i64 {
+    var ws: i64 = -1;
+    // SAFETY: OpenProcess takes integers; the 80-byte block holds the
+    // 72-byte PROCESS_MEMORY_COUNTERS (cb at 0, WorkingSetSize at 16) that
+    // K32GetProcessMemoryInfo fills; the handle is closed and the block
+    // freed before returning.
+    unsafe {
+        // PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_QUERY_LIMITED_INFORMATION
+        val h: i64 = sk_open_process(1024 | 16 | 4096, 0, pid);
+        if h != 0 {
+            val mi: i64 = p_malloc(80);
+            if mi != 0 {
+                *(mi as *mut i64) = 72;
+                if K32GetProcessMemoryInfo(h, mi, 72) != 0 {
+                    ws = *((mi + 16) as *mut i64);
+                }
+                p_free(mi);
+            }
+            sk_close_handle(h);
+        }
+    }
+    return ws;
+}
+
+@cfg(unix)
+fn sk_rss(pid: i64) -> i64 {
+    match read_file("/proc/" + int_to_str(pid) + "/statm") {
+        Option::Some(t) => {
+            val f: Vec<str> = sk_split(sk_strip(t), " ");
+            if f.len() >= 2 && sk_is_int(f.get(1)) {
+                return sk_int(f.get(1)) * sys_page_size();
+            }
+        }
+        Option::None => { }
+    }
+    return -1;
+}
+
+// ─── The child's stdout, read as it grows ───
+
+struct SkTail {
+    f: i64,
+    pending: str,
+    n: i64,
+    line: str,
+    t: i64,
+}
+
+/// What was added to the file since the last call: each whole line is a
+/// heartbeat (`at_end`: the last piece without a newline too, as a reader
+/// at the end of the stream counts it).
+fn sk_poll(tl: &mut SkTail, path: str, at_end: bool) {
+    if tl.f == 0 {
+        // SAFETY: fopen reads the two NUL-terminated strings; the FILE* it
+        // returns (0 when the file is not there yet) is only given back to
+        // the stdio functions of this file.
+        unsafe {
+            tl.f = sk_fopen(path, "rb");
+        }
+        if tl.f == 0 { return; }
+    }
+    var got: Vec<i64> = Vec::new();
+    // SAFETY: a fresh 65536-byte block; fread writes at most that many
+    // bytes into it; clearerr only resets the FILE's end-of-file mark so
+    // the due call reads what the child wrote since.
+    unsafe {
+        val buf: i64 = p_malloc(65536);
+        if buf != 0 {
+            var n: i64 = sk_fread(buf, 1, 65536, tl.f);
+            while n > 0 {
+                var i: i64 = 0;
+                while i < n {
+                    got.push((*((buf + i) as *mut u8)) as i64);
+                    i = i + 1;
+                }
+                n = sk_fread(buf, 1, 65536, tl.f);
+            }
+            sk_clearerr(tl.f);
+            p_free(buf);
+        }
+    }
+    if got.len() == 0 && !at_end { return; }
+    var text: str = tl.pending + sk_raw(got);
+    var start: i64 = 0;
+    var i: i64 = 0;
+    var seen: bool = false;
+    val now: i64 = p_clock_now_ms();
+    while i < str_len(text) {
+        val c: i64 = str_byte_at(text, i);
+        if c == 10 || c == 13 {
+            // universal newlines: "\r\n" is one end of line (a "\r" at the
+            // end of what has come so far waits for the due piece)
+            if c == 13 && i + 1 >= str_len(text) && !at_end { break; }
+            tl.line = sk_strip(str_slice(text, start, i));
+            tl.n = tl.n + 1;
+            seen = true;
+            if c == 13 && i + 1 < str_len(text) && str_byte_at(text, i + 1) == 10 { i = i + 1; }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    tl.pending = str_slice(text, start, str_len(text));
+    if at_end && str_len(tl.pending) > 0 {
+        tl.line = sk_strip(tl.pending);
+        tl.n = tl.n + 1;
+        seen = true;
+        tl.pending = "";
+    }
+    if seen { tl.t = now; }
+}
+
+fn sk_close(tl: &mut SkTail) {
+    if tl.f != 0 {
+        // SAFETY: the FILE* fopen returned, closed once.
+        unsafe {
+            sk_fclose(tl.f);
+        }
+        tl.f = 0;
+    }
+}
+
+// ─── Numbers ───
+
+/// f"{x:+.2f}"
+fn sk_signed2(x: f64) -> str {
+    val s: str = sk_fixed(x, 2);
+    if str_starts_with(s, "-") { return s; }
+    return "+" + s;
+}
+
+/// repr(float(text)) for text float() accepts: the shortest form, which
+/// for a decimal of at most 15 significant digits is that decimal
+/// normalized (scientific below 1e-4 and from 1e16, as Python).
+fn sk_float_repr(text: str) -> str {
+    var t: str = str_to_lower(sk_strip(text));
+    var neg: bool = false;
+    if str_starts_with(t, "+") { t = str_slice(t, 1, str_len(t)); }
+    if str_starts_with(t, "-") {
+        neg = true;
+        t = str_slice(t, 1, str_len(t));
+    }
+    if t == "inf" || t == "infinity" {
+        if neg { return "-inf"; }
+        return "inf";
+    }
+    if t == "nan" { return "nan"; }
+    var digits: str = "";
+    var exp: i64 = 0;
+    var i: i64 = 0;
+    var dot: bool = false;
+    while i < str_len(t) && (sk_digit(str_byte_at(t, i)) || str_byte_at(t, i) == 46) {
+        if str_byte_at(t, i) == 46 {
+            dot = true;
+        } else {
+            digits = digits + char_to_str(str_byte_at(t, i));
+            if dot { exp = exp - 1; }
+        }
+        i = i + 1;
+    }
+    if i < str_len(t) && str_byte_at(t, i) == 101 {
+        exp = exp + sk_int(str_slice(t, i + 1, str_len(t)));
+    }
+    // digits * 10^exp, without leading and trailing zeros
+    var a: i64 = 0;
+    while a < str_len(digits) && str_byte_at(digits, a) == 48 { a = a + 1; }
+    digits = str_slice(digits, a, str_len(digits));
+    var b: i64 = str_len(digits);
+    while b > 0 && str_byte_at(digits, b - 1) == 48 {
+        b = b - 1;
+        exp = exp + 1;
+    }
+    digits = str_slice(digits, 0, b);
+    var sign: str = "";
+    if neg { sign = "-"; }
+    if str_len(digits) == 0 { return sign + "0.0"; }
+    if str_len(digits) > 15 { return sign + float_to_str(sk_float(t)); }
+    // the decimal exponent of the first digit
+    val e10: i64 = exp + str_len(digits) - 1;
+    if e10 < -4 || e10 >= 16 {
+        var m: str = str_slice(digits, 0, 1);
+        if str_len(digits) > 1 { m = m + "." + str_slice(digits, 1, str_len(digits)); }
+        var es: str = "+";
+        var ev: i64 = e10;
+        if ev < 0 {
+            es = "-";
+            ev = 0 - ev;
+        }
+        var e2: str = int_to_str(ev);
+        if str_len(e2) < 2 { e2 = "0" + e2; }
+        return sign + m + "e" + es + e2;
+    }
+    if exp >= 0 {
+        var s: str = digits;
+        var k: i64 = 0;
+        while k < exp {
+            s = s + "0";
+            k = k + 1;
+        }
+        return sign + s + ".0";
+    }
+    val point: i64 = str_len(digits) + exp;
+    if point > 0 { return sign + str_slice(digits, 0, point) + "." + str_slice(digits, point, str_len(digits)); }
+    var z: str = "";
+    var k2: i64 = 0;
+    while k2 < 0 - point {
+        z = z + "0";
+        k2 = k2 + 1;
+    }
+    return sign + "0." + z + digits;
+}
+
+fn main() -> i64 {
+    var av: Vec<str> = args_all();
+    var rest: Vec<str> = Vec::new();
+    var i: i64 = 1;
+    while i < av.len() {
+        rest.push(av.get(i));
+        i = i + 1;
+    }
+    var opts: Vec<SkOpt> = Vec::new();
+    opts.push(sk_opt("--fid", "", SK_STR));                      // 0
+    opts.push(sk_opt("--duration", "", SK_INT));                 // 1
+    opts.push(sk_opt("--backend", "", SK_STR));                  // 2
+    opts.push(sk_opt("--program", "", SK_STR));                  // 3
+    opts.push(sk_opt("--sample", "", SK_FLOAT));                 // 4
+    opts.push(sk_opt("--max-growth-mb-per-hour", "", SK_FLOAT)); // 5
+    opts.push(sk_opt("--out", "", SK_STR));                      // 6
+    opts.push(sk_opt("--help", "-h", SK_HELP));                  // 7
+    val a: SkArgs = sk_parse(rest, opts);
+    if a.code >= 0 { return a.code; }
+    val fid: str = sk_val(&a, 0, sk_join("release", "fid.exe"));
+    val duration: i64 = sk_int(sk_val(&a, 1, "3600"));
+    val backend: str = sk_val(&a, 2, "ccompile");
+    val program: str = sk_val(&a, 3, sk_join("tests", sk_join("verify", "soak_service.fd")));
+    val sample: f64 = sk_float(sk_val(&a, 4, "10"));
+    val limit_text: str = sk_val(&a, 5, "1.0");
+    val limit: f64 = sk_float(limit_text);
+    val out: str = sk_val(&a, 6, sk_join("build", "soak"));
+    var env: Vec<str> = Vec::new();
+    if !sk_has_env("CC") { env.push("CC=zig cc"); }
+    sk_makedirs(out);
+    val exe: str = sk_abspath(sk_join(out, "soak-" + backend + ".exe"));
+    var bcmd: Vec<str> = Vec::new();
+    bcmd.push(fid);
+    bcmd.push(backend);
+    bcmd.push(program);
+    bcmd.push("-o");
+    bcmd.push(exe);
+    sk_locale_mode = true;
+    val br: SkRes = sk_run(bcmd, sk_clone_list(&env), -1, false);
+    sk_locale_mode = false;
+    if !br.started {
+        io_eprintln(sk_not_found(fid));
+        return 1;
+    }
+    if br.code != 0 || !fs_exists(exe) {
+        io_eprintln("build failed:\n" + sk_ltail(br.out + br.err, 2000));
+        return 1;
+    }
+    val so_path: str = sk_join(out, "soak-" + backend + ".stdout");
+    val se_path: str = sk_join(out, "soak-" + backend + ".stderr");
+    var rcmd: Vec<str> = Vec::new();
+    rcmd.push(exe);
+    rcmd.push("0");
+    val h: i64 = process_spawn_files(rcmd, sk_clone_list(&env), "", so_path, se_path);
+    if h == 0 {
+        io_eprintln(sk_not_found(exe));
+        return 1;
+    }
+    val pid: i64 = process_child_pid(h);
+    var tl: SkTail = SkTail { f: 0, pending: "", n: 0, line: "", t: p_clock_now_ms() };
+    var st: Vec<f64> = Vec::new();
+    var sr: Vec<f64> = Vec::new();
+    val start: i64 = p_clock_now_ms();
+    val csv: str = sk_join(out, "soak-" + backend + ".csv");
+    var csv_text: str = "seconds,rss_mb,heartbeats,last\n";
+    fs_write_text(csv, csv_text);
+    var exit_code: i64 = 0;
+    var ended: bool = false;
+    var due: i64 = start;
+    while p_clock_now_ms() - start < duration * 1000 {
+        // time.sleep(sample), reading the child's stdout meanwhile
+        due = p_clock_now_ms() + ((sample * 1000.0) as i64);
+        while p_clock_now_ms() < due {
+            var step: i64 = due - p_clock_now_ms();
+            if step > 100 { step = 100; }
+            if step > 0 { task_sleep(step); }
+            sk_poll(&mut tl, so_path, false);
+        }
+        match process_wait(h, 0) {
+            Option::Some(c) => {
+                exit_code = sk_code(c, true);
+                ended = true;
+            }
+            Option::None => { }
+        }
+        if ended { break; }
+        val bytes: i64 = sk_rss(pid);
+        if bytes < 0 { break; }
+        val rss: f64 = (bytes as f64) / 1000000.0;
+        val t: f64 = ((p_clock_now_ms() - start) as f64) / 1000.0;
+        st.push(t);
+        sr.push(rss);
+        fs_append_text(csv, sk_fixed(t, 1) + "," + sk_fixed(rss, 2) + "," + int_to_str(tl.n) + "," + tl.line + "\n");
+    }
+    var alive: bool = !ended;
+    if alive {
+        match process_wait(h, 0) {
+            Option::Some(c) => {
+                exit_code = sk_code(c, true);
+                alive = false;
+            }
+            Option::None => { }
+        }
+    }
+    sk_poll(&mut tl, so_path, !alive);
+    val stale: f64 = ((p_clock_now_ms() - tl.t) as f64) / 1000.0;
+    if alive {
+        process_kill(h);
+        process_wait(h, 10000);
+    }
+    process_release(h);
+    sk_close(&mut tl);
+    var err: str = "";
+    if !alive { err = sk_locale(fs_read_bytes(se_path)); }
+    // the second half (the first is warm-up), else all samples
+    var ht: Vec<f64> = Vec::new();
+    var hr: Vec<f64> = Vec::new();
+    i = 0;
+    while i < st.len() {
+        if st.get(i) >= (duration as f64) / 2.0 {
+            ht.push(st.get(i));
+            hr.push(sr.get(i));
+        }
+        i = i + 1;
+    }
+    if ht.len() == 0 {
+        i = 0;
+        while i < st.len() {
+            ht.push(st.get(i));
+            hr.push(sr.get(i));
+            i = i + 1;
+        }
+    }
+    var slope: f64 = 0.0;
+    if ht.len() >= 2 {
+        val n: f64 = ht.len() as f64;
+        var mt: f64 = 0.0;
+        var mr: f64 = 0.0;
+        i = 0;
+        while i < ht.len() {
+            mt = mt + ht.get(i);
+            i = i + 1;
+        }
+        mt = mt / n;
+        i = 0;
+        while i < hr.len() {
+            mr = mr + hr.get(i);
+            i = i + 1;
+        }
+        mr = mr / n;
+        var num: f64 = 0.0;
+        var den: f64 = 0.0;
+        i = 0;
+        while i < ht.len() {
+            num = num + (ht.get(i) - mt) * (hr.get(i) - mr);
+            i = i + 1;
+        }
+        i = 0;
+        while i < ht.len() {
+            den = den + (ht.get(i) - mt) * (ht.get(i) - mt);
+            i = i + 1;
+        }
+        if den == 0.0 { den = 1.0; }
+        slope = num / den * 3600.0;
+    }
+    var peak: f64 = 0.0;
+    i = 0;
+    while i < sr.len() {
+        if i == 0 || sr.get(i) > peak { peak = sr.get(i); }
+        i = i + 1;
+    }
+    var first: f64 = 0.0;
+    if sr.len() > 0 { first = sr.get(0); }
+    val total: f64 = ((p_clock_now_ms() - start) as f64) / 1000.0;
+    println(backend + ": " + sk_fixed(total, 0) + " s, " + int_to_str(tl.n) + " heartbeats (last: " + tl.line + "), memory "
+        + sk_fixed(first, 1) + " MB at first sample, peak " + sk_fixed(peak, 1) + " MB, second-half slope " + sk_signed2(slope) + " MB/hour");
+    var ok: bool = true;
+    var stale_limit: f64 = 6.0 * sample;
+    if stale_limit < 60.0 { stale_limit = 60.0; }
+    if !alive {
+        println("FAIL: the process ended early (exit " + int_to_str(exit_code) + "): " + sk_ltail(err, 500));
+        ok = false;
+    } else if stale > stale_limit {
+        println("FAIL: no heartbeat for " + sk_fixed(stale, 0) + " s");
+        ok = false;
+    }
+    if slope > limit {
+        println("FAIL: memory grows " + sk_fixed(slope, 2) + " MB/hour (limit " + sk_float_repr(limit_text) + ")");
+        ok = false;
+    }
+    var verdict: str = "FAIL";
+    if ok { verdict = "PASS"; }
+    println(verdict + " (samples in " + csv + ")");
+    if ok { return 0; }
+    return 1;
+}
