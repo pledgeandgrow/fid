@@ -2085,6 +2085,9 @@ names are the reference.
       read, read_line sets the EOF flag after the first line, and the next
       call returns an empty line. Read only (needs a real console).
       Confidence: medium.
+      Nov 27 (night): not tried here: stdin is redirected in every
+      check on this machine, so a fix could not be validated against
+      the console it is about (goal-workflow.md row 47).
 - [x] BG208. **disasm: `vzeroupper` (VEX `C5 F8 77`) swallows the next
       instruction.** disasm.fd, VEX branch of the x86 decoder: with no table
       row, the length assumes a ModRM byte follows, which `0F 77` does not
@@ -2585,6 +2588,21 @@ names are the reference.
       main. Found Nov 27 by the same comparison; seen twice. Cause not
       located (the heap does not grow as pe_ir's does, or the program asks
       past its limit). Confidence: high.
+      Nov 27 (night): the cause is located. A task's stack is one
+      mapping of PE_TASK_STACK + PE_GUARD = 327,680 bytes (conc.fd
+      `pe_task_stack_new`), and on Windows the runtime's `mmap` is
+      VirtualAlloc with MEM_COMMIT: each stack is charged in full as it
+      is made. The 100,000 sleepers ask for 32.8 GB of commit at once,
+      and the next stack is refused. Seen with release/fid-v27.exe
+      through `emit --nat`: 5,000, 20,000, 40,000, 55,000 and 70,000
+      tasks run (70,000 is 22.9 GB), 100,000 panics with "327680 bytes
+      requested", the size of one stack. On Linux the same mapping is
+      filled only as it is used. Fix, not written: on Windows reserve a
+      task stack and commit its top part only; the guard handler of
+      win.fd commits a reserved page that faults and still reports the
+      overflow at the guard page. It needs a hook from
+      `pe_task_stack_new` (conc.fd, shared with Linux) and the task
+      tests on the native backend: goal-workflow.md row 46.
 - [ ] BG250. **pe_ir hangs on test_read_line_long.** The program runs
       itself with a file of long lines on its standard input (BG41): the
       pe_ir image printed one line and did not finish in 60 s, twice, and
