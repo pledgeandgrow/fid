@@ -1666,7 +1666,7 @@ names are the reference.
       elements as floats; lower.fd passes the element type for `.sort()`);
       test_std_vec_sort_f64 and test_bg179_vec_sort_f64_method pass on run, C
       and emit (Nov 25).
-- [ ] BG180. **f-string float precision gives wrong digits for large values,
+- [x] BG180. **f-string float precision gives wrong digits for large values,
       and fill characters are ignored.** stdlib/core.fd `fstr_fmt_f64`,
       `__fstr_pad`, `__fstr_width0` (uncommitted work in the tree on Nov 24):
       `((av * scale) + 0.5) as i64` saturates once `av * 10^prec` passes
@@ -1677,6 +1677,22 @@ names are the reference.
       `f"{7:0>5}"` `7` (want `00007`). By reading, `fstr_fmt_i64` computes `0
       - v` (overflow on i64::MIN). Confirmed Nov 24 (run, C). Confidence:
       high.
+      Fixed Nov 27: `fstr_fmt_f64` makes the integer part and the fraction
+      apart (below 2^53 the integer part as an i64 and the fraction scaled;
+      from 2^53 the value is whole and `float_to_str` has its digits), so
+      nothing saturates. `__fstr_pad` reads `[fill][<|>|^]`
+      (`__fstr_body`), and the flags, the width and the conversion letter
+      are read after it, so a fill byte is neither a flag nor the width.
+      `fstr_fmt_i64` takes its magnitude as a u64. Halves still round away
+      from zero (0.125 at two decimals is 0.13). Left: digits past about the
+      16th significant one are not the exact decimal expansion (0.1 at 18
+      decimals prints `0.100000000000000000`). Test
+      test_bg180_fstring_precision_fill (the four triggers, 1e22, the
+      smallest i64 with a spec, a fraction that rounds up to a whole, fill
+      with right, left and center alignment, with a sign, with a
+      conversion, a fill that is `0` or `x`): passes on run, ccompile and
+      emit with the fid-dev of Nov 25; the 59 other f-string programs of
+      tests/bootstrap and tests/conformance pass. Found on the way: BG247.
 - [x] BG181. **`==` compares raw words for `Option`/generic enums, tuples,
       arrays and Vec fields.** lower.fd `Expr::Binary` Eq/Neq:
       `vec_eq_fn_for(Lowerer_infer_expr_ast_type(..))` does not see a field
@@ -2209,8 +2225,8 @@ names are the reference.
       test_std_svd on emit, because the native Windows backend lacks
       p_volatile_load16/p_volatile_store16 (the compiler names them, and the
       test makes no xml or toml call); test_xml_dtd_ns passes on ccompile
-      and emit and does not finish on the interpreter inside the runner's
-      300 s (its entity bomb expands up to 8 MB there). Not looked at: yaml.
+      and emit and did not finish on the interpreter in 900 s (its entity
+      bomb expands up to 8 MB there). Not looked at: yaml.
 - [ ] BG225. **The interpreter's mutex does not exclude between tasks
       either.** `fid run` prints 5 (want 15) for the same three-holder probe
       as the C runtime mutex entry: a task holding `p_mutex_lock` across
@@ -2383,6 +2399,20 @@ names are the reference.
       call path does since the Nov 25 f32 fix (`peir_callee_params`), the
       indirect one has no parameter types to look at. Found Nov 25.
       Confidence: medium.
+
+## Found by the Nov 27 night run (docs/roadmap/goal-workflow.md)
+
+- [ ] BG247. **The default Windows backend's `float_to_str` loses the low
+      digits of a large value.** `println(f"{1e25}")` prints
+      `10000000000000001000000000` through `fid emit`; `fid run`,
+      `ccompile`, `emit --nat` and the exact value of the double give
+      `10000000000000000905969664`. 1e17, 1e20, 1e22 and
+      123456789012345678.0 print right there, so the conversion keeps 17
+      significant digits and writes zeros past them. The conversion is
+      `pert_float_to_str` of stdlib/pe_runtime/base.fd (the machine layer's,
+      in stdlib/linux_runtime/base.fd, is right). Found Nov 27 while fixing
+      BG180, whose test keeps to the values every backend prints right.
+      Confidence: high (seen on run, ccompile, emit and emit --nat).
 
 ## Found and fixed while reviewing (Nov 22)
 

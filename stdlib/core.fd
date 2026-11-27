@@ -8401,8 +8401,29 @@ pub fn byte_to_str(b: i64) -> str {
 // emitted by the lowerer for a `{e:spec}` part (lower.fd
 // Lowerer_lower_fstr_fmt); they are not a user-facing API.
 
+/// Where the spec's flags and width begin: past `[fill][<|>|^]`, an
+/// alignment sign on its own or after one fill byte.
+fn __fstr_body(spec: str) -> i64 {
+    var n: i64 = str_len(spec);
+    if n == 0 {
+        return 0;
+    }
+    var c0: i64 = str_byte_at(spec, 0);
+    if c0 == 60 || c0 == 62 || c0 == 94 {
+        return 1;
+    }
+    if n > 1 {
+        var c1: i64 = str_byte_at(spec, 1);
+        if c1 == 60 || c1 == 62 || c1 == 94 {
+            return 2;
+        }
+    }
+    return 0;
+}
+
+/// Whether flag `c` (#, +) is in the spec. The fill byte is not a flag.
 fn __fstr_flag(spec: str, c: i64) -> bool {
-    var i: i64 = 0;
+    var i: i64 = __fstr_body(spec);
     while i < str_len(spec) {
         if str_byte_at(spec, i) == c {
             return true;
@@ -8429,7 +8450,7 @@ fn __fstr_num_at(spec: str, i: i64) -> i64 {
 /// The index of the first digit before any '.', or -1 (the width run; a
 /// leading '0' of it is the zero-pad flag).
 fn __fstr_width0(spec: str) -> i64 {
-    var i: i64 = 0;
+    var i: i64 = __fstr_body(spec);
     while i < str_len(spec) {
         var c: i64 = str_byte_at(spec, i);
         if c == 46 {
@@ -8464,10 +8485,11 @@ fn __fstr_prec(spec: str) -> i64 {
     return -1;
 }
 
-/// The conversion letter of the spec: 'x', 'X', 'b' or 'o', else 0.
+/// The conversion letter of the spec: 'x', 'X', 'b' or 'o', else 0 (a fill
+/// byte is not one).
 fn __fstr_conv(spec: str) -> i64 {
     var conv: i64 = 0;
-    var i: i64 = 0;
+    var i: i64 = __fstr_body(spec);
     while i < str_len(spec) {
         var c: i64 = str_byte_at(spec, i);
         if c == 120 || c == 88 || c == 98 || c == 111 {
@@ -8527,8 +8549,8 @@ fn __fstr_pad_zero(s: str, n: i64) -> str {
 }
 
 /// Pad s to the spec's width: '<' left, '>' right, '^' centered, else the
-/// type's default (numbers right, text left). allow_zero is a number's
-/// `0` flag.
+/// type's default (numbers right, text left), with the spec's fill byte or
+/// a space. allow_zero is a number's `0` flag.
 fn __fstr_pad(s: str, spec: str, def_align: i64, allow_zero: bool) -> str {
     var width: i64 = 0;
     var w0: i64 = __fstr_width0(spec);
@@ -8540,26 +8562,25 @@ fn __fstr_pad(s: str, spec: str, def_align: i64, allow_zero: bool) -> str {
         return s;
     }
     var align: i64 = def_align;
-    if __fstr_flag(spec, 60) {
-        align = 60;
-    }
-    if __fstr_flag(spec, 62) {
-        align = 62;
-    }
-    if __fstr_flag(spec, 94) {
-        align = 94;
+    var fill: str = " ";
+    var body: i64 = __fstr_body(spec);
+    if body == 1 {
+        align = str_byte_at(spec, 0);
+    } else if body == 2 {
+        fill = str_slice(spec, 0, 1);
+        align = str_byte_at(spec, 1);
     }
     if allow_zero && align == 62 && __fstr_zero(spec) {
         return __fstr_pad_zero(s, pad_n);
     }
     if align == 60 {
-        return s + str_repeat(" ", pad_n);
+        return s + str_repeat(fill, pad_n);
     }
     if align == 94 {
         var l: i64 = pad_n / 2;
-        return str_repeat(" ", l) + s + str_repeat(" ", pad_n - l);
+        return str_repeat(fill, l) + s + str_repeat(fill, pad_n - l);
     }
-    return str_repeat(" ", pad_n) + s;
+    return str_repeat(fill, pad_n) + s;
 }
 
 /// The alternate-form `#` prefix of the conversion, "" for none.
@@ -8585,17 +8606,20 @@ fn __fstr_alt(conv: i64, spec: str) -> str {
 pub fn fstr_fmt_i64(v: i64, spec: str) -> str {
     var conv: i64 = __fstr_conv(spec);
     var neg: bool = v < 0;
-    var mag: i64 = v;
+    // The magnitude as a u64: 0 - v overflows for the smallest i64 (BG180)
+    var mag: u64 = 0;
     if neg {
-        mag = 0 - v;
+        mag = (((0 - (v + 1)) as u64) + 1);
+    } else {
+        mag = v as u64;
     }
-    var s: str = int_to_str(mag);
+    var s: str = u64_to_str(mag);
     if conv == 120 || conv == 88 {
-        s = __fstr_radix(mag as u64, 16, conv == 88);
+        s = __fstr_radix(mag, 16, conv == 88);
     } else if conv == 98 {
-        s = __fstr_radix(mag as u64, 2, false);
+        s = __fstr_radix(mag, 2, false);
     } else if conv == 111 {
-        s = __fstr_radix(mag as u64, 8, false);
+        s = __fstr_radix(mag, 8, false);
     }
     var pre: str = __fstr_alt(conv, spec);
     if neg {
@@ -8637,18 +8661,33 @@ pub fn fstr_fmt_f64(v: f64, spec: str) -> str {
         if neg {
             av = 0.0 - v;
         }
-        var scale: f64 = 1.0;
-        var ip10: i64 = 1;
-        var pi: i64 = 0;
-        while pi < prec {
-            scale = scale * 10.0;
-            ip10 = ip10 * 10;
-            pi = pi + 1;
+        // The integer part and the fraction are made apart: scaled as a
+        // whole, a value past 2^63 / 10^prec saturated (BG180). From 2^53
+        // a double is a whole number and float_to_str has all its digits.
+        var ipart: str = "";
+        var frac: i64 = 0;
+        var two53: f64 = 9007199254740992.0;
+        if av >= two53 {
+            ipart = float_to_str(av);
+        } else {
+            var ip: i64 = av as i64;
+            var scale: f64 = 1.0;
+            var ip10: i64 = 1;
+            var pi: i64 = 0;
+            while pi < prec {
+                scale = scale * 10.0;
+                ip10 = ip10 * 10;
+                pi = pi + 1;
+            }
+            frac = ((av - (ip as f64)) * scale + 0.5) as i64;
+            if frac >= ip10 {
+                // the fraction rounded up to a whole
+                frac = frac - ip10;
+                ip = ip + 1;
+            }
+            ipart = int_to_str(ip);
         }
-        var w: i64 = ((av * scale) + 0.5) as i64;
-        var ipart: i64 = w / ip10;
-        var frac: i64 = w - (ipart * ip10);
-        s = int_to_str(ipart);
+        s = ipart;
         if prec > 0 {
             var fs: str = int_to_str(frac);
             s = s + "." + str_repeat("0", prec - str_len(fs)) + fs;
