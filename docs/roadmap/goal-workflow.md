@@ -80,12 +80,14 @@
 
 ## First: record the background runs
 
-**Since Nov 27 16:40 (the interactive session of the afternoon): five jobs
-of that session run in the background.** Do not start them again; read them.
+**Since Nov 27 17:05 (the interactive session of the afternoon): two jobs
+of that session run in the background, and no more than that: five side by
+side (four legs and the gates) made the machine crawl for a quarter of an
+hour and were stopped.** Do not start the two again; read them.
 
 | Marker | Result | Roadmap entries |
 |---|---|---|
-| `GATES_DONE` at the end of `build/llvm19/progress-long.log` | `ra1.log` (RA1: `ra1_pe_ra_off_check.sh`), `version.log` (LF11: `version-default-check.sh`), `parse_par*.log` and `imports_par*.log` (SP9) | `RA1`, `LF11`, `SP9` |
+| (not running) the gates RA1, LF11 and SP9: once the two jobs below are done, `bash build/llvm19/gates.sh ra1 lf11 sp9` (one job; `GATES_DONE` then ends `build/llvm19/progress.log`) | `ra1.log` (RA1: `ra1_pe_ra_off_check.sh`), `version.log` (LF11: `version-default-check.sh`), `parse_par*.log` and `imports_par*.log` (SP9) | `RA1`, `LF11`, `SP9` |
 | `SUITE_DONE` at the end of each of `build/llvm19/suite-on.log`, `suite-off.log`, `suite-sole.log`, `suite-vec.log` | the whole of tests/bootstrap (2,056 programs) with `release/fid-night.exe` (the -O2 build of 16:19): `on` on emit and `--nat` (WP14 and LF11 as they are by default); `off`, `sole` and `vec` on emit with FID_IROPT_OFF=spec,version, FID_IROPT_ON=soleown, FID_IROPT_ON=vecsroa. `python build/llvm19/suite-diff.py on off sole vec` gives, per leg, the files it fails that `on` does not | `WP14` and `LF11` (`on` against `off`: no file fails with them on that passes with them off), `LF16` (`sole`), `LF14` (`vec`) |
 
 A leg is a pass's evidence only when it fails no file the default leg passes
