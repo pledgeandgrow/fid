@@ -13,6 +13,8 @@
 #   SPLIT_OPT (default -O2)     the level of the first build of every unit
 #   FID_BUILD_TIGHT (auto)      auto: tight when the machine has under 24 GB
 #                               of memory (a hosted runner); 1 or 0 forces it
+#   FID_BUILD_MEM_MB            the memory to assume instead of the machine's
+#                               (16 GB of a hosted runner, to try its path)
 #   FID_HEAVY_KB (default 500)  a unit with one function of more KB of C than
 #                               this is heavy
 #   FID_UNIT_MEM_MB             (tight or not) every compile gets this many MB
@@ -20,21 +22,39 @@
 # Tight mode. LLVM's memory at -O2 grows faster than a function's size, and
 # two heavy units together take a 16 GB hosted runner away ("The hosted
 # runner lost communication with the server", "The runner has received a
-# shutdown signal", exit 143: every workflow that builds fid, from Nov 23 to
-# Nov 27). So there the heavy units are compiled one at a time and every
-# compile gets a memory limit (ulimit -v): a unit over it fails, and the
-# ladder catches it, instead of the runner dying. On Nov 27 the units with a
-# function of 660 KB to 1.4 MB were the ones that failed first under memory
-# pressure; unit 0, the largest file (13.7 MB), has a 4 MB function and is
-# cheap, but counts as heavy: it costs its turn alone, no more.
+# shutdown signal", exit 143: every Linux and macOS workflow that builds
+# fid, from Nov 23 to Nov 27; the Windows runners, which have a page file,
+# built it two at a time). So there the heavy units are compiled one at a
+# time. On Linux every compile also gets a memory limit (ulimit -v): a unit
+# over it fails, and the ladder catches it, instead of the runner dying.
+# macOS and Windows get the order only: the limit is not measured there,
+# and a limit that bites where it should not would turn a good unit into
+# "unbuildable". On Nov 27 the units with a function of 660 KB to 1.4 MB
+# were the ones that failed first under memory pressure; unit 0, the largest
+# file (13.7 MB), has a 4 MB function and is cheap, but counts as heavy: it
+# costs its turn alone, no more.
 # A unit that fails is built again alone at SPLIT_OPT, then at -O1, then at
 # -O0, with the same flags otherwise: the generated C is the same at every
 # level, only the compiler's speed differs.
 
+# The machine's memory in MB, 0 when it cannot be read (never a failure: a
+# reader that is missing only means "not tight")
 units_mem_total_mb() {
+    local v=""
+    v=$(units_mem_raw_mb) || v=""
+    case "$v" in ''|*[!0-9]*) echo 0 ;; *) echo "$v" ;; esac
+    return 0
+}
+
+units_mem_raw_mb() {
     case "$(uname -s)" in
         Linux*) awk '/^MemTotal:/ { print int($2 / 1024); exit }' /proc/meminfo 2>/dev/null ;;
         Darwin*) echo $(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1048576 )) ;;
+        # Git Bash on the Windows runners: the physical memory (the page
+        # file behind it is not what a compile fills first)
+        MINGW*|MSYS*) powershell.exe -NoProfile -NonInteractive -Command \
+            '[int]((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory/1MB)' 2>/dev/null \
+            | tr -d '\r' | head -1 ;;
         *) echo 0 ;;
     esac
 }
@@ -61,7 +81,10 @@ units_largest_fn_kb() {
 # alone would delete it, and a compile with no -O flag is -O0 (the ladder
 # ran at -O0 at every level until Nov 27).
 units_compile_one() {
-    ( if [ "$3" -gt 0 ]; then ulimit -v $(( $3 * 1024 )) 2>/dev/null; fi
+    ( if [ "$3" -gt 0 ]; then
+          # a shell that cannot set the limit says so and compiles without it
+          ulimit -v $(( $3 * 1024 )) 2>/dev/null || echo "      (no memory limit can be set in this shell: unit $1 is compiled without one)"
+      fi
       exec "${CC_CMD[@]}" "${SPLIT_CFLAGS[@]/$SPLIT_OPT/$2}" -c "${UNITS_BASE}_$1.c" -o "${UNITS_BASE}_$1.o" ) >> "$UNITS_LOG" 2>&1
 }
 
@@ -79,8 +102,10 @@ units_compile() {
     UNITS_OBJS=()
     UNITS_RETRIED=()
     SPLIT_OPT="${SPLIT_OPT:--O2}"
-    local total tight=0 heavy_kb=500 cap_heavy=0 cap_light=0 k rc
-    total=$(units_mem_total_mb)
+    local total tight=0 heavy_kb=500 cap_heavy=0 cap_light=0 k rc can_cap=0
+    total="${FID_BUILD_MEM_MB:-$(units_mem_total_mb)}"
+    # the limit per compile where it is measured to work: Linux
+    case "$(uname -s)" in Linux*) can_cap=1 ;; esac
     case "${FID_BUILD_TIGHT:-auto}" in
         auto) if [ "$total" -gt 0 ] && [ "$total" -lt 24000 ]; then tight=1; fi ;;
         1 | yes | true) tight=1 ;;
@@ -90,9 +115,11 @@ units_compile() {
         # the system and the runner agent keep 2.5 GB
         local budget=$(( total - 2500 ))
         if [ "$budget" -lt 1500 ]; then budget=1500; fi
-        cap_heavy=$budget
-        cap_light=$(( budget / JOBS ))
-        if [ "$cap_light" -lt 700 ]; then cap_light=700; fi
+        if [ "$can_cap" = 1 ]; then
+            cap_heavy=$budget
+            cap_light=$(( budget / JOBS ))
+            if [ "$cap_light" -lt 700 ]; then cap_light=700; fi
+        fi
     fi
     if [ -n "${FID_UNIT_MEM_MB:-}" ]; then cap_heavy="$FID_UNIT_MEM_MB"; cap_light="$FID_UNIT_MEM_MB"; fi
     local heavy=()
@@ -102,7 +129,13 @@ units_compile() {
         if [ "$tight" = 1 ] && [ "$(units_largest_fn_kb "${UNITS_BASE}_$k.c")" -ge "$heavy_kb" ]; then heavy+=("$k"); else light+=("$k"); fi
     done
     if [ "$tight" = 1 ]; then
-        echo "      memory: ${total} MB; unit ${heavy[*]:-none} have a function over $heavy_kb KB of C and are compiled alone, with ${cap_heavy} MB each; the others $JOBS at a time, with ${cap_light} MB each (a unit over its limit fails and goes down the ladder)"
+        local limits="no limit per compile on this system"
+        if [ "$cap_heavy" -gt 0 ]; then
+            limits="with ${cap_heavy} MB each; the others $JOBS at a time, with ${cap_light} MB each (a unit over its limit fails and goes down the ladder)"
+        else
+            limits="$limits; the others $JOBS at a time"
+        fi
+        echo "      memory: ${total} MB; unit ${heavy[*]:-none} have a function over $heavy_kb KB of C and are compiled alone, $limits"
     elif [ "$cap_heavy" -gt 0 ]; then
         echo "      memory: every unit is compiled with a limit of ${cap_heavy} MB"
     fi

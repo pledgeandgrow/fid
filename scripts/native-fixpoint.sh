@@ -40,14 +40,17 @@ case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) HOST=windows ;; *) HOST=linux ;; esa
 BACKEND="${BACKEND:-}"
 [ -n "$BACKEND" ] || { [ "$HOST" = windows ] && BACKEND=pe || BACKEND=linux; }
 case "$BACKEND" in
-  pe) EMIT=(emit); EXT=.exe ;;
-  nat) EMIT=(emit --nat); EXT=.exe ;;
+  # fid takes the file first: the flags go after it (BACKEND=nat passed
+  # `emit --nat compiler/main.fd` until Nov 27 and the stage read "--nat"
+  # as the file)
+  pe) EFLAGS=(); EXT=.exe ;;
+  nat) EFLAGS=(--nat); EXT=.exe ;;
   linux)
     case "$(uname -m)" in
       x86_64|amd64) T=x86_64-linux ;; aarch64|arm64) T=aarch64-linux ;; riscv64) T=riscv64-linux ;;
       *) echo "native-fixpoint: no native Linux target for $(uname -m)"; exit 1 ;;
     esac
-    EMIT=(emit --target "$T"); EXT="" ;;
+    EFLAGS=(--target "$T"); EXT="" ;;
   *) echo "native-fixpoint: BACKEND must be pe, nat or linux"; exit 1 ;;
 esac
 OUT="${OUT:-build/native-fixpoint}"
@@ -62,9 +65,9 @@ cp tests/bootstrap/hello.fd "$OUT/tree/hello.fd"
 
 stage() {  # n compiler: build stage n of compiler/main.fd with that compiler
   local n="$1" cc="$2" t0 t1
-  echo "stage $n: ${EMIT[*]} compiler/main.fd with $(basename "$cc")"
+  echo "stage $n: emit compiler/main.fd ${EFLAGS[*]:-} with $(basename "$cc")"
   t0=$(date +%s)
-  ( cd "$OUT/tree" && "$cc" "${EMIT[@]}" compiler/main.fd -o "$OUT/fid$n$EXT" ) > "$OUT/stage$n.log" 2>&1
+  ( cd "$OUT/tree" && "$cc" emit compiler/main.fd ${EFLAGS[@]+"${EFLAGS[@]}"} -o "$OUT/fid$n$EXT" ) > "$OUT/stage$n.log" 2>&1
   local rc=$?
   t1=$(date +%s)
   if [ $rc != 0 ] || [ ! -s "$OUT/fid$n$EXT" ]; then
@@ -118,7 +121,7 @@ fi
 ( cd "$OUT/tree" && "$OUT/fid3$EXT" run hello.fd ) > "$OUT/hello3.txt" 2> "$OUT/hello3.err" || {
   echo "stage 3 does not run hello.fd"; tail -3 "$OUT/hello3.err"; exit 1; }
 tr -d '\r' < "$OUT/hello3.txt" > "$OUT/hello3.tmp" && mv "$OUT/hello3.tmp" "$OUT/hello3.txt"
-( cd "$OUT/tree" && "$OUT/fid3$EXT" "${EMIT[@]}" hello.fd -o "$OUT/hello3$EXT" ) > /dev/null 2>&1 \
+( cd "$OUT/tree" && "$OUT/fid3$EXT" emit hello.fd ${EFLAGS[@]+"${EFLAGS[@]}"} -o "$OUT/hello3$EXT" ) > /dev/null 2>&1 \
   && "$OUT/hello3$EXT" > "$OUT/hello3-native.txt" 2>&1 || {
   echo "stage 3 does not compile hello.fd natively, or it does not run"; exit 1; }
 tr -d '\r' < "$OUT/hello3-native.txt" > "$OUT/hello3-native.tmp" && mv "$OUT/hello3-native.tmp" "$OUT/hello3-native.txt"
