@@ -20360,6 +20360,20 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
             // An assignment to a by-value Vec, HashMap or struct parameter
             // changes it as an index or a field assignment does (reference §5.3)
             TypeChecker_check_param_change(self, target);
+            // BG201: `f <<= 2` or `f &= 1` on a float is the error `f << 2`
+            // is (only the right side is typed below, so the operator rule
+            // of the expression check never sees it)
+            match TypeChecker_lookup(self, target) {
+                OptType::Some(tty) => {
+                    var bop: BinOp = assign_op_binop(cl10_aop);
+                    var tty_r: Type = TypeChecker_resolve_type(self, tty);
+                    if (binop_eq(bop, BinOp::BitAnd) || binop_eq(bop, BinOp::BitOr) || binop_eq(bop, BinOp::BitXor) || binop_eq(bop, BinOp::Shl) || binop_eq(bop, BinOp::Shr)) && (type_eq(tty_r, Type::F64) || type_eq(tty_r, Type::F32)) {
+                        self.errors.push("Type error (line " + int_to_str(self.current_line) + "): `" + tc_bitwise_symbol(bop) + "` takes integers, got " + type_to_str(tty_r) + ".\n    Fix: convert with `as i64` first, or use the arithmetic you meant.");
+                    }
+                }
+                OptType::None => {
+                }
+            }
             // CL10: `x += e` on a struct is `x = x + e` (its operator method,
             // or a unit's dimension rule): the result must fit x
             // BG128: an enum literal assigned takes the variable's type
