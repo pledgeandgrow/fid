@@ -141,7 +141,7 @@ Every message is explained on the [Compiler Errors](https://fid-lang.org/docs/er
 | **Checks that stay on** | Bounds, integer overflow and double frees panic in every build, not only in debug. |
 | **No macros** | `comptime` runs ordinary Fid code at compile time, with reflection over types. |
 | **No LLVM** | `fid emit` encodes machine code and writes Windows and Linux executables itself: no assembler, no linker, no C compiler. |
-| **Self-hosted** | About 357K lines of Fid compile themselves. The 3-stage release bootstrap checks they rebuild to byte-identical output (last reached Nov 21); a self-compile to C takes 44 s. |
+| **Self-hosted** | About 361K lines of Fid compile themselves. The 3-stage release bootstrap checks they rebuild to byte-identical output (last reached Nov 21); a self-compile to C takes 44 s (Nov 27). |
 
 ## Install
 
@@ -156,7 +156,7 @@ RELEASE=1 CC="zig cc" ./scripts/bootstrap.sh   # builds fid in 3 stages and chec
 ./release/fid run tests/bootstrap/hello.fd
 ```
 
-Stage 0 is a pinned self-hosted `fid`: `bootstrap.sh` downloads it from the [`stage0` release](https://github.com/pledgeandgrow/fid/releases/tag/stage0) and checks its hash (`scripts/stage0-fetch.sh`). Binaries are published there for Windows x64, Windows ARM64 and Linux x64. On another host (macOS, Linux ARM64) it falls back to the Rust compiler, and that cold start stops at stage 2: a `fid` built by `fidesc` runs out of memory compiling the whole tree ([known bug](docs/reference/known-bugs.md) 2g.79). There, set `STAGE0` to a self-hosted `fid` built elsewhere.
+Stage 0 is a pinned self-hosted `fid`: `bootstrap.sh` downloads it from the [`stage0` release](https://github.com/pledgeandgrow/fid/releases/tag/stage0) and checks its hash (`scripts/stage0-fetch.sh`). Binaries are published there for Windows x64 and ARM64, Linux x64 and ARM64, and macOS x64 and ARM64. The Linux ARM64 and macOS ones were cross-built and pinned on Nov 27 and have not yet built `fid` in CI. On a host with no pinned binary, it falls back to the Rust compiler, and that cold start stops at stage 2: a `fid` built by `fidesc` runs out of memory compiling the whole tree ([known bug](docs/reference/known-bugs.md) 2g.79). There, set `STAGE0` to a self-hosted `fid` built elsewhere.
 
 **Nothing to install.** The [playground](https://fid-lang.org/playground) runs in your browser.
 
@@ -220,9 +220,9 @@ One front end and one IR, three ways out. The native emitter has its own instruc
 The compiler checks itself as hard as it checks your code:
 
 - **Fixpoint.** Stage 2 and stage 3 of the bootstrap must produce byte-identical output on every release build.
-- **Proved rewrites.** The optimizer's 27 integer rewrite rules and the e-graph's rewrites are proved with z3 at 8, 16, 32 and 64 bits: 253 obligations, all proved (Nov 27).
+- **Proved rewrites.** The optimizer's 27 integer rewrite rules and the e-graph's rewrites are proved with z3 at 8, 16, 32 and 64 bits: 253 obligations, all proved (Nov 25).
 - **Checked encoders.** The instruction encoders are compared with clang's assembler across 1,200 forms, with no mismatch (Nov 25).
-- **Conformance.** 1,617 programs each check one rule of the [language reference](docs/reference/reference.md) (§1–§13).
+- **Conformance.** 1,621 programs each check one rule of the [language reference](docs/reference/reference.md) (§1–§13).
 
 More in [verification](docs/verification/README.md) and the [contributor walkthrough](docs/reference/compiler-walkthrough.md).
 
@@ -252,12 +252,25 @@ Signatures for every module: [API reference](https://fid-lang.org/reference).
 Fid is young and moving fast.
 
 - **Releases:** the newest is the **[v0.8.6-unstable](https://github.com/pledgeandgrow/fid/releases/tag/v0.8.6-unstable)** prerelease (Nov 27). Its `fid.exe` is a one-stage build from a self-hosted `fid` (all 16 C units at -O2), not a 3-stage fixpoint. The first published build, Sep 9, was tagged v1.0.0 and is now listed as 0.7. The stable 1.0 is planned for December; `fid version` reports `1.0.0+dev`.
-- **Generated code is slower than Rust's.** Through C, Fid was fastest on one of four benchmarks and up to 1.6 times slower than the fastest on the others (Nov 15 run, a busy machine); native output is slower still. [Benchmarks, losses included](docs/benchmarks.md).
+- **Generated code is slower than Rust's.** These are the Nov 17 runs on a busy Windows machine, against Rust, Zig, C++ and Go.
+  - **Through C:**
+    - level with the fastest on a small compiler and on JSON (within 15%);
+    - faster than Rust and Go on binary-trees;
+    - 1.2x behind on hashing, 1.5x on regex, 2–4x on string building, 3x on file reading and 5x on sorting;
+    - 11–18x behind on pidigits, where its big integers are slow.
+  - **Natively (`fid emit`):** slower than through C on every program. But the executables are the smallest in the table (40 KB for hello, against 123 KB for Rust), and they start as fast as Zig's.
+  - [Benchmarks, losses included](docs/benchmarks.md).
 - **The package index is just starting.** `ark` installs from a path, a git repository or [the pacts index](https://github.com/pledgeandgrow/pacts) (`fid ark add textkit`, verified on Windows, Linux CI and macOS CI); few pacts are published yet.
 - **The fixpoint was last verified on Nov 21, 2026:** stage 2 and stage 3 were byte-identical on that day's ~361K-line tree. Builds since (Nov 25, Nov 27, v0.8.5/v0.8.6-unstable) are one stage from a self-hosted `fid`; the Nov 25 one passes the leak gate (11 of 11).
-- **The full test suite has been rerun only on the interpreter.** Nov 25, with `fid` as the compiler: 1,897 of 1,983 pass on `run` (82 of the failures fail the same with the earlier compiler, 4 are timeouts). The C and native lanes of the whole suite have not been rerun; features are checked with their own tests on each backend.
-- **CI is red.** `ci.yml` and `tier1.yml` have not had a green run since Nov 21, nor `macos-native.yml`; the checks above were run by hand on a Windows machine.
-- **Open bugs.** Three whole-repo reviews (Nov 22, 24, 27) logged 489 entries in the [bugs roadmap](docs/roadmap/bugs-roadmap.md): 230 are fixed with tests, 27 partly, 232 open — most of them from the latest review and still being worked down.
+- **The full test suite has a pass rate only on the interpreter.** Nov 25, with `fid` as the compiler: 1,897 of 1,983 pass on `run` (82 of the failures fail the same with the earlier compiler, 4 are timeouts).
+  - On Nov 27 the suite was run on `emit` and `--nat` for the first time, to compare optimizer settings. Its log records 604 programs passing and 10 failing with the default settings ([goal workflow](docs/roadmap/goal-workflow.md), L12).
+  - The C lane of the whole suite has not been rerun. Features are checked with their own tests on each backend.
+- **CI is red.**
+  - None of the runs GitHub still has for `ci.yml` (88), `tier1.yml` (89) or `macos-native.yml` (20), going back to Nov 21, has passed.
+  - Most jobs stop while building `fid`, on the stage-0 binaries and the memory of GitHub's runners.
+  - `bare-metal.yml` and `pages.yml` last passed on Nov 22.
+  - The checks above were run by hand on a Windows machine.
+- **Open bugs.** Four whole-repo reviews (Nov 22, Nov 24 and two on Nov 27) logged 489 entries in the [bugs roadmap](docs/roadmap/bugs-roadmap.md): 232 are fixed with tests, 27 partly, 230 open. Most of the open ones come from the Nov 27 reviews and are still being worked down.
 - **Not for safety-critical use.** `fid qualify` produces evidence for review, not a certification.
 
 The details: [status](docs/reference/status.md) · [known bugs](docs/reference/known-bugs.md) · [roadmap](docs/roadmap/roadmap.md).
@@ -280,7 +293,7 @@ The details: [status](docs/reference/status.md) · [known bugs](docs/reference/k
 compiler/    the compiler, in Fid: 65 modules, about 361K lines
 stdlib/      the standard library: 403 modules
 src/         the earlier compiler in Rust, frozen; it builds stage 1 and runs the test harness
-tests/       bootstrap (2,131 programs), conformance (1,617), selfhost (47),
+tests/       bootstrap (2,131 programs), conformance (1,621), selfhost (47),
              plus projects, verify, nattools, tooling and leak checks
 examples/    twelve complete programs
 tools/       ark, scribe, veil and friends, written in Fid
