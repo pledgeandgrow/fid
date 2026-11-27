@@ -1,12 +1,14 @@
-# stage0-native.yml — build the pinned stage-0 seed compilers natively on
-# each platform runner. The generated C is host-specialized (fid dump-c has
-# no --target), so cross-building linux/macOS seeds from one file cannot
-# work; these lanes build the real thing where it runs.
+# stage0-native.yml — build the pinned stage-0 seed compilers for the
+# platforms that have none, by SEEDED CROSS-COMPILATION: ccompile --target
+# re-resolves @cfg for the target OS (compiler/main.fd sets g_cfg_os /
+# g_cfg_arch), so the pinned linux-x64 seed cross-builds correct
+# per-platform binaries — no per-platform runner, no fidesc (whose runtime
+# defects make its binaries unable to compile the tree, verified Nov 27:
+# a fidesc-built fid fails dump-c on macOS and linux-arm64 alike).
 #
 # Manual only: workflow_dispatch. Produces one artifact per platform named
 # after the release asset (fid-linux-arm64, fid-macos-x64, fid-macos-arm64).
-# Before pinning: download the artifact, smoke-test it (version, dump-c of
-# compiler/main.fd byte-identical twice), upload to the `stage0` release,
+# Before pinning: download the artifact, upload to the `stage0` release,
 # then write scripts/<asset>.sha256 with the hash and provenance.
 name: Stage-0 native seeds
 
@@ -19,45 +21,53 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            asset: fid-linux-arm64
-            cross: aarch64-linux
-          - os: macos-13
-            asset: fid-macos-x64
-          - os: macos-15
-            asset: fid-macos-arm64
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 180
+          - asset: fid-linux-arm64
+            target: aarch64-linux
+            emu: qemu
+          - asset: fid-macos-x64
+            target: x86_64-macos
+            emu: none
+          - asset: fid-macos-arm64
+            target: aarch64-macos
+            emu: none
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
     steps:
       - name: Check out with LF line endings (bash reads the scripts)
         run: git config --global core.autocrlf false
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
       - uses: mlugg/setup-zig@v2.2.1
         with:
           version: 0.16.0
-      - name: mold (Linux)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq mold
-      - name: coreutils (macOS)
-        if: runner.os == 'macOS'
-        run: brew install coreutils gnu-sed 2>/dev/null || true
-      - name: Build the Rust bootstrap compiler
-        run: cargo build --release
-      - name: Build fid (one stage, native or seeded cross)
+      - name: qemu for the linux-arm64 smoke test
+        if: matrix.emu == 'qemu'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq qemu-user-static
+      - name: Fetch the pinned linux-x64 seed
         run: |
-          if [ "${{ matrix.cross }}" = "aarch64-linux" ]; then
-            bash scripts/stage0-fetch.sh || true
-            cp release/stage0/fid-linux-x64 build/seed-x64 2>/dev/null || cp release/stage0/fid build/seed-x64
-            chmod +x build/seed-x64
-            ./build/seed-x64 ccompile compiler/main.fd --target aarch64-linux -o release/fid-dev
-          else
-            CC="zig cc" ./scripts/build-selfhost.sh
-          fi
-      - name: Smoke test - the seed job, compiling the tree
+          mkdir -p build release
+          bash scripts/stage0-fetch.sh
+          cp release/stage0/fid-linux-x64 build/seed-x64
+          chmod +x build/seed-x64
+          ./build/seed-x64 version
+      - name: Cross-compile fid for ${{ matrix.target }}
         run: |
-          ./release/fid-dev version || echo "version panics (fidesc-runtime string defect); not fatal for a seed"
-          ./release/fid-dev dump-c compiler/main.fd > build/seed-test.c 2> build/seed-test.err && echo "dump-c: $(wc -c < build/seed-test.c) bytes" || { echo "DUMP-C FAILED - seed not viable"; tail -5 build/seed-test.err; }
+          ./build/seed-x64 ccompile compiler/main.fd --target ${{ matrix.target }} -o release/fid-dev
+      - name: Smoke test (qemu - real execution)
+        if: matrix.emu == 'qemu'
+        run: |
+          qemu-aarch64-static ./release/fid-dev version
+          qemu-aarch64-static ./release/fid-dev ccompile tests/bootstrap/hello.fd -o build/hello-arm64
+          qemu-aarch64-static ./build/hello-arm64 | grep -q . && echo "smoke: hello runs"
+      - name: Smoke test (macOS - format check; execution happens in CI)
+        if: matrix.emu == 'none'
+        run: |
+          magic=$(xxd -p -l 4 release/fid-dev)
+          echo "magic: $magic"
+          # Mach-O 64-bit little-endian: cf fa ed fe
+          [ "$magic" = "cffaedfe" ] || { echo "NOT A MACH-O BINARY"; exit 1; }
+          size=$(stat -c %s release/fid-dev)
+          echo "size: $size"
+          [ "$size" -gt 10000000 ] || { echo "SUSPICIOUSLY SMALL"; exit 1; }
       - name: Stage the asset
         run: cp release/fid-dev "${{ matrix.asset }}"
       - uses: actions/upload-artifact@v4
