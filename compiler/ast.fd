@@ -2717,3 +2717,39 @@ pub fn box_expr_deref(b: Box<Expr>) -> Expr {
     }
     return Expr::IntLit(0);
 }
+
+// --- Constant time: the parameters @public marks (CF32) ----------------------
+// The IR keeps no annotation, and the backends' check of a @constant_time
+// function (checks.fd peir_ct_check) takes every parameter for secret. The
+// type checker puts the parameters @public marks down here, as
+// "<function>#<position>", under the names the IR gives the function; the
+// check asks ct_public_param before it marks a parameter.
+
+pub var g_ct_public_params: Vec<str> = Vec::new();
+
+pub fn ct_public_param_add(name: str, pi: i64) -> void {
+    var key: str = name + "#" + int_to_str(pi);
+    if !str_vec_contains(g_ct_public_params, key) {
+        g_ct_public_params.push(key);
+    }
+}
+
+/// Whether parameter `pi` of the IR function `name` is @public. A generic
+/// function's instances are named `<name>__<types>`: they take the
+/// parameters of their source.
+pub fn ct_public_param(name: str, pi: i64) -> bool {
+    var key: str = name + "#" + int_to_str(pi);
+    if str_vec_contains(g_ct_public_params, key) {
+        return true;
+    }
+    var i: i64 = g_ct_public_params.len() - 1;
+    while i >= 0 {
+        var k: str = g_ct_public_params.get(i);
+        var h: i64 = str_find(k, "#");
+        if h > 0 && str_ends_with(k, "#" + int_to_str(pi)) && str_starts_with(name, str_slice(k, 0, h) + "__") {
+            return true;
+        }
+        i = i - 1;
+    }
+    return false;
+}
