@@ -2532,6 +2532,16 @@ Reach what Rust, Go, Zig and C++ programmers expect on day one.
       lifetime parameters are matched by position, not by name; generic
       structs with lifetimes are not instantiated by lifetime; the Linux
       targets.
+      Nov 27 (night), 08:00: validated with the build of 07:41 (16 units
+      at -O2, release/fid-night.exe): the three rejections (E080), the
+      accepted tests, the compiler's own tree (`check compiler/main.fd`:
+      no errors, 26 s) and LG3's gate: 154 of the 155 test_frontend_
+      lifetime*, tests/conformance/s8_* and test_lg3_* files pass on run,
+      ccompile and emit (s8_2_null_deref_panics fails with the compiler
+      of Nov 25 as well). scripts/check-stdlib.sh: 390 of 403 modules
+      build on their own; the 11 others fail the same with the compiler
+      of Nov 25 (BG254, BG255, BG256; none a borrow error). The read rule
+      is done; left of this entry: the line above.
 - [~] LG4. Traits: bounds checked, associated types, default methods, trait objects
       Nov 22 audit: mostly done — bounds at calls (typechecker.fd:15699,
       :21798), associated types (:2440-2573, :2919-2962), default methods

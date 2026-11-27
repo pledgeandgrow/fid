@@ -125,6 +125,9 @@ the file), `deferred` (cannot be done on this machine), with the reason.
 | 8 | BG180 | f-string float precision wrong for large values; fill ignored | `stdlib/core.fd` (`fstr_fmt_f64`, `__fstr_pad`, `__fstr_width0`) | the entry's triggers; check first whether it still reproduces | done (Nov 27 04:05) |
 | 9 | BG247 | the default Windows backend's `float_to_str` loses the low digits of a large value (found by BG180) | `stdlib/pe_runtime/base.fd` (`pert_float_to_str`; the machine layer's, in `stdlib/linux_runtime/base.fd`, is right) | `f"{1e25}"` prints `10000000000000000905969664` through `emit` | done (Nov 27 04:25) |
 | 9 | BG206 | Linux runtime `pert_str_to_float` is not correctly rounded | `stdlib/linux_runtime/base.fd` | 2000 printed doubles read back; runs here through `emit --nat` | todo (a correct-rounding conversion: the last of this group) |
+| 42 | BG254 | `use transform3d;` is a parse error (transform3d, lidar, pointcloud) | `stdlib/transform3d.fd` 146 | the three modules build on their own (scripts/check-stdlib.sh) | todo |
+| 43 | BG255 | `use quic;` is a `@secret` error in the library (quic, quic_conn, quic_frame, quic_tls, quic_udp, http3, http3_udp) | `stdlib/quic.fd` 359 | the seven modules build on their own; the QUIC and HTTP/3 tests unchanged | todo |
+| 44 | BG256 | `use parallel;` is a thread-safety error on its own | `stdlib/parallel.fd` 138 | the module builds on its own; tests/par/par_check.sh still passes | todo |
 
 ### C. Bugs in compiler files no other session edits — one build per batch
 
@@ -135,7 +138,7 @@ the file), `deferred` (cannot be done on this machine), with the reason.
 | 12 | BG232 | disasm has no row for instructions the encoders emit | `compiler/disasm.fd` | the entry's list (x86 `blsmsk`/`blsi`, AArch64 pre/post-index and FP loads, RISC-V vector) decodes with the right length | todo |
 | 13 | BG212 | comptime does not evaluate float/int casts | `compiler/comptime_eval.fd` (`Expr::Cast`) | `comptime avg(3, 4)` and `comptime (-(7.9 as i64))` evaluate| done (Nov 27 05:47, 4445b05d: its two tests and 321 of 324 related programs; the three fail with the compiler of Nov 25 too) |
 | 14 | BG213 | C header parser evaluates unsigned macro arithmetic as signed | `compiler/cparser.fd` (`CpEval`/`CpExpr`) | `fid parse-header` on a header with `UDIV`, `UNEG`, `MASK`, `COND`, `CMP`, `0b1010`| deferred to a later batch: needs a typed macro evaluator (unsigned 32-bit arithmetic), about fifteen functions |
-| 15 | LG3 | reads are not checked against a live `&mut` | `compiler/borrowck.fd` | `val v = m` while `r = id_mut(&mut m)` is live and used after is a borrow error; `test_frontend_lifetime*.fd` and `tests/conformance/s8_*` still pass| the rule of 7b06ce65 passed its tests but rejected the compiler's own tree (three calls of the form `f(&mut g.e, read(g))`); refined in 21e16421; the build of 06:35 still rejected one place (nat_ir.fd ng_mir_finish: a released borrow was counted as a named one), fixed in 4d7dcd55 with test_lg3_read_after_released_mut; not yet validated by a built compiler: the first build of the next run, then validate-batch3.sh steps 1, 2, 6, 7, 8 |
+| 15 | LG3 | reads are not checked against a live `&mut` | `compiler/borrowck.fd` | `val v = m` while `r = id_mut(&mut m)` is live and used after is a borrow error; `test_frontend_lifetime*.fd` and `tests/conformance/s8_*` still pass| the rule of 7b06ce65 passed its tests but rejected the compiler's own tree (three calls of the form `f(&mut g.e, read(g))`); refined in 21e16421; the build of 06:35 still rejected one place (nat_ir.fd ng_mir_finish: a released borrow was counted as a named one), fixed in 4d7dcd55 with test_lg3_read_after_released_mut; validated with the build of 07:41 (three rejections, the accepted tests, `check compiler/main.fd` clean, 154 of 155 of the lifetime and §8.4 files); the entry stays `[~]` for its other gaps (lifetime parameters by name, generic structs by lifetime, the Linux targets) |
 
 ### D. Verify only — the gate runs on this machine
 
@@ -168,11 +171,11 @@ Take in this order as soon as `git status --porcelain -- <file>` is empty.
 | # | Goal | Files |
 |---|---|---|
 | 26 | DWARF: `DW_AT_decl_file` is 0 for generated functions (the 15 `image-check.sh` failures) | `compiler/nat_ir.fd` (`ng_gen_function`: `g_nat_line_file_ix = 0` for a function without a source file), `compiler/nat_enc.fd` | Status: fixed by another session in e52b278d (Nov 27 02:07): only confirm with release/fid-night.exe through scripts/image-check.sh |
-| 27 | BG201, BG202, BG240, BG242, BG235 | `compiler/typechecker.fd` | Status: BG202, BG240 and BG242 done (Nov 27 night, the build of 06:35; marked in bugs-roadmap.md). BG201: the expression form is validated; the compound form (`f <<= 2`) is corrected in 647b4368 after f148a589 rejected plain float assignments, to validate with the next build (test_bg201_float_shift_assign_fail rejected, a float program with plain assignments passes). BG235 not started |
+| 27 | BG201, BG202, BG240, BG242, BG235 | `compiler/typechecker.fd` | Status: BG201, BG202, BG240 and BG242 done (Nov 27 night; BG201 with the build of 07:41; marked in bugs-roadmap.md). BG235 not started |
 | 28 | BG203, BG228, BG230, BG241 | `compiler/lower.fd` |
 | 29 | BG209, BG210, BG211 | `compiler/lexer.fd`, `compiler/parser.fd` |
-| 30 | BG205, BG231, BG244 | `compiler/codegen_c.fd` | Status: BG231: code in cb8f8b69, the test test_bg231_read_stdin_negative (marker fixed in 5c86e3dd), to validate on ccompile with the next build (validate-batch3.sh step 1); BG205 and BG244 not started |
-| 31 | BG236 | `compiler/mono.fd` | done (Nov 27 night: the unit test tests/nattools/mangle_func_unit.fd passes through `run`, which runs the tree's own mono.fd; test_mono.fd no longer compiles: BG253; through ccompile and emit: validate-batch3.sh step 1 with the next build) |
+| 30 | BG205, BG231, BG244 | `compiler/codegen_c.fd` | Status: BG231 done (Nov 27 night, the build of 07:41, on ccompile); BG205 and BG244 not started |
+| 31 | BG236 | `compiler/mono.fd` | done (Nov 27 night: tests/nattools/mangle_func_unit.fd passes on run, ccompile and emit with the build of 07:41; test_mono.fd no longer compiles: BG253) |
 | 32 | BG234, BG245 | `compiler/nat_enc.fd` |
 | 33 | BG218, BG219 | `compiler/compiler.fd` | done (Nov 27 night, the build of 06:35: test_bg218_duplicate_impl_fail and test_bg219_generic_fn_value_fail rejected, test_bg219_generic_fn_call passes on run, ccompile and emit) |
 | 34 | BG225, BG229 | `compiler/interp.fd` |

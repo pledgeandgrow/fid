@@ -41,10 +41,10 @@ BG204, BG227), 35 open. BG242-BG246, found Nov 25, are open.
 Status Nov 27 (checkbox count at be36317, the v0.8.5-unstable commit):
 BG128-BG241: 80 done `[x]`, 3 partly done `[~]` (BG183, BG204, BG227), 31
 open; BG242-BG246 open. The whole file: 207 `[x]`, 3 `[~]`, 36 `[ ]`.
-Status Nov 27 (night run, 07:25): BG128-BG241: 93 done `[x]`, 3
-partly `[~]` (BG183, BG204, BG227), 18 open; BG242 done, BG243-BG246
-open; BG247 done; BG248-BG253 open. The whole file: 222 `[x]`, 3
-`[~]`, 28 `[ ]`.
+Status Nov 27 (night run, 08:00): BG128-BG241: 95 done `[x]`, 3
+partly `[~]` (BG183, BG204, BG227), 16 open; BG242 done, BG243-BG246
+open; BG247 done; BG248-BG256 open. The whole file: 224 `[x]`, 3
+`[~]`, 29 `[ ]`.
 
 Status markers as in the other roadmaps: `[ ]` open, `[~]` partly done,
 `[x]` done.
@@ -1970,7 +1970,7 @@ names are the reference.
 
 ### Medium
 
-- [ ] BG201. **Bitwise and shift operators are accepted on floats.**
+- [x] BG201. **Bitwise and shift operators are accepted on floats.**
       typechecker.fd `Expr::Binary` arithmetic path: two numeric operands give
       `F64` with no integer requirement for `& | ^ << >>` (and `<<=`).
       Trigger: `var f: f64 = 1.5; val g = f & 2.0; println(g);` passes
@@ -1982,15 +1982,20 @@ names are the reference.
       build of 06:35 (tree 2e3a15e9): test_bg201_float_bitwise_fail is
       rejected ("`&` takes integers, got f64"), test_bg201_int_bitwise and
       tests/conformance/s4_2_bitwise_float_rejected pass on run, ccompile
-      and emit; reference §4.2 says so. The compound form is NOT validated:
-      its first check (f148a589) also rejected a plain `x = ...` on a
-      float, which the build of 07:10 showed on stdlib/core.fd:8662 and
-      30 places of the compiler's own source; 647b4368 makes it look at
-      the five compound operators only (stage-0 check clean; no build was
-      left in that run). Left, with the next build: test_bg201_float_shift_
-      assign_fail rejected, a program with plain float assignments passes
-      and `check compiler/main.fd` is clean (build/verify-nov27/
-      validate-batch3.sh, steps 1, 2, 6).
+      and emit; reference §4.2 says so. The compound form: its first check
+      (f148a589) also rejected a plain `x = ...` on a float, which the
+      build of 07:10 showed on stdlib/core.fd:8662 and 30 places of the
+      compiler's own source; 647b4368 makes it look at the five compound
+      operators only. Validated with the build of 07:41 (16 units at -O2,
+      release/fid-night.exe of 16,785,408 bytes): test_bg201_float_shift_
+      assign_fail is rejected ("`<<` takes integers, got f64"),
+      test_bg201_int_bitwise and tests/conformance/s4_2_bitwise_float_
+      rejected pass on run, ccompile and emit, and `check compiler/main.fd`
+      is clean (no errors, 26 s). 165 of the 169 related programs
+      (conformance s4_2, s2_8, s7; *trait*, *generic*, *alias*) pass; the
+      4 others are helper files (diagnostics/generic_call_site_lib.fd,
+      trait_conflict/shape_*.fd) that fail the same with the compiler of
+      Nov 25.
 - [x] BG202. **`<` and `>` on two `str` values are accepted, and the backends
       disagree.** The type checker accepts an ordering of two strings, which
       reference.md §4.2 does not define (only `==`). `fid run` panics
@@ -2360,16 +2365,17 @@ names are the reference.
       value"). Trigger: `val r2 = get(false) ?? ("d" + int_to_str(9));`: `run
       --leaks` reports 1 block never freed. Confirmed Nov 24. Confidence:
       high.
-- [ ] BG231. **C runtime `p_read_stdin(-1)` writes into a 0-byte block.**
+- [x] BG231. **C runtime `p_read_stdin(-1)` writes into a 0-byte block.**
       codegen_c.fd `p_read_stdin__raw` calls `malloc(n + 1)` = `malloc(0)`,
       skips the read loop and writes `buf[0] = 0`; other negative `n` are
       caught only through the NULL return. Read only. Confidence: medium.
       Nov 27 (night): `p_read_stdin__raw` returns NULL for a negative
-      `n` (cb8f8b69, codegen_c.fd). NOT validated: the test
-      test_bg231_read_stdin_negative (`//@ backends: ccompile`; its
-      marker stood inside the expected block until 5c86e3dd) has not run
-      on ccompile with a built compiler. Left: validate-batch3.sh step 1
-      with the next build.
+      `n` (cb8f8b69, codegen_c.fd). Validated with the build of 07:41
+      (release/fid-night.exe): test_bg231_read_stdin_negative
+      (`//@ backends: ccompile`; its marker stood inside the expected
+      block until 5c86e3dd) passes, and the program compiled once more
+      by hand prints `true` with stdin closed. The interpreter and the
+      native backends are not changed: the entry is about the C runtime.
 - [ ] BG232. **disasm has no row for several instructions the encoders emit.**
       disasm.fd encoding table: x86 `blsmsk`/`blsi` (TG7; only `blsr` has a
       row); AArch64 pre/post-indexed `ldr`/`str` (TG8, e.g. `f8008528`), FP
@@ -2419,8 +2425,8 @@ names are the reference.
       through `fid run` (it runs the tree's own mono.fd) with the
       compilers of Nov 25 and Nov 27. tests/selfhost/test_mono.fd no
       longer compiles for reasons of its own (BG253), so its mangle lines
-      moved there (ac4ae268). Through ccompile and emit: validate-batch3
-      step 1 with the next build.
+      moved there (ac4ae268). With the build of 07:41 that unit test
+      passes on run, ccompile and emit.
 - [x] BG237. **`fid fmt --check file.fd` (flag before the file) reads the flag
       as the file name** ("could not read file: --check", exit 1); `fid fmt
       file.fd --check` works. Confirmed Nov 24. Confidence: high.
@@ -2565,6 +2571,27 @@ names are the reference.
       25 as with that of Nov 27 (night): the monomorphizer's own test
       checks nothing. Found Nov 27 (night) through BG236. Confidence:
       high.
+- [ ] BG254. **`use transform3d;` does not compile: a parse error.**
+      stdlib/transform3d.fd 146:12 (`m00: r.m00,` on the line after
+      `return mat4 {`): "unexpected token 'Colon'". Through it
+      scripts/check-stdlib.sh fails for transform3d, lidar and pointcloud,
+      with the compiler of Nov 25 as with that of Nov 27 (night). Found
+      Nov 27 (night) by that check (390 of 403 modules build on their
+      own). Confidence: high.
+- [ ] BG255. **`use quic;` does not compile: a `@secret` error in the
+      library's own code.** stdlib/quic.fd 359, `quic_updated_keys`: "a
+      secret value is passed to `quic_keys_from_secret`, which outputs
+      its parameter 'aead'". Through it scripts/check-stdlib.sh fails for
+      quic, quic_conn, quic_frame, quic_tls, quic_udp, http3 and
+      http3_udp, with the compiler of Nov 25 as with that of Nov 27
+      (night). Found Nov 27 (night) by that check. Confidence: high
+      (which side is wrong, the library or the check, is not decided).
+- [ ] BG256. **`use parallel;` does not compile on its own: a
+      thread-safety error.** stdlib/parallel.fd 138: "argument 5 of the
+      spawned call has type fn(i64) -> i64, which is not @send". Through
+      it scripts/check-stdlib.sh fails, with the compiler of Nov 25 as
+      with that of Nov 27 (night). Found Nov 27 (night) by that check.
+      Confidence: high.
 
 ## Found and fixed while reviewing (Nov 22)
 
