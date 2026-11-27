@@ -1261,7 +1261,7 @@ expected-fail 89/89) and has not been rerun with the Nov 4–6 compiler.
 ---
 
 
-## 2g.122 — pe_ir's p_file_read returns a buffer p_str_take rejects (the "str without a string header" panic class)
+## 2g.123 — pe_ir's p_file_read returns a buffer p_str_take rejects (the "str without a string header" panic class)
 
 Found Nov 26 triaging the first green Windows CI lane (the lane's pe_ir-only
 failures). Minimal reproduction (build/fio_test.fd shape):
@@ -1288,7 +1288,15 @@ return block+16. The same treatment for any other pe_ir primitive returning
 str-valued memory (process output reads) — grep PeirGen_gen_* for p_malloc
 callers that return the raw block. The nat_ir runtime (linux_runtime) passes
 these tests, so its arrangement is the second reference.
-Status: open.
+Status: fix implemented Nov 27 (unverified in CI): pe_ir_stubs.fd allocates
+size+17, writes the magic/owner word at [block] and the length at [block+8]
+after ReadFile, aims ReadFile at block+16 — the existing return arithmetic
+self-corrects to the counted-string pointer. Verification awaits a fid built
+from the tree (the windows tier1 lane's pe_ir tests are the gate: fio_test
+prints written/read/done, test_stdlib_repaired and test_vec_sized_layout
+pass). NOTE the number: first recorded as 2g.122 in the table below, but
+2g.122 was already taken there by the iropt store-forwarding entry — this
+entry is 2g.123.
 
 ## 2g. Nov 9, 2026 — module audit: open bugs
 
