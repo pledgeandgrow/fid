@@ -174,7 +174,7 @@ Take in this order as soon as `git status --porcelain -- <file>` is empty.
 | 30 | BG205, BG231, BG244 | `compiler/codegen_c.fd` |
 | 31 | BG236 | `compiler/mono.fd` | Status: code in 0fcd0261 (each part of a function type carries its length), to validate with the next build through tests/selfhost/test_mono.fd |
 | 32 | BG234, BG245 | `compiler/nat_enc.fd` |
-| 33 | BG218, BG219 | `compiler/compiler.fd` |
+| 33 | BG218, BG219 | `compiler/compiler.fd` | Status: BG218: code in 9ec4af52 (compiler.fd, the conflict check); BG219: code in f0973224 (typechecker.fd); both to validate with the next build |
 | 34 | BG225, BG229 | `compiler/interp.fd` |
 | 35 | BG237 | `compiler/main.fd` or `compiler/fmt.fd` | Status: code in b03479b8, to validate with the next build through tests/tooling/fmt-flag-order-check.sh |
 | 36 | BG246 | `compiler/pe_ir*.fd` (check whether it is clean) |
@@ -246,3 +246,10 @@ are the commit times.)
   build to release/fid-night.exe started at 04:56. Validate with it: the
   four goals' tests on run, ccompile and emit, the f-string and lifetime
   programs, `check compiler/main.fd`, then scripts/image-check.sh (row 26).
+- 05:20 (the 05:00 automation run, in the session that wrote the workflow;
+  it took over its own lock of 04:53): the second compiler batch is in the
+  tree and the stage-0 compiler checks it after every change: b03479b8
+  (BG201, BG202, BG240, BG237), 0fcd0261 (BG236, a regression test for
+  BG242, which no longer reproduces), 9ec4af52 (BG218), f0973224 (BG219).
+  Build 1 is finishing (two units retried one at a time); build 2 waits for
+  the WebAssembly suite to end.
