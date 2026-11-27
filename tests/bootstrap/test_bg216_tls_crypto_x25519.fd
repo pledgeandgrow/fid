@@ -1,0 +1,55 @@
+// BG216 (docs/roadmap/bugs-roadmap.md): tls_crypto's x25519 gives RFC 7748's
+// vectors. Its own BigInt ladder read bit 255 of the u-coordinate (vector
+// 2's is set), so vector 2 came out wrong; it now runs the constant-time
+// ladder of x25519.fd.
+//
+// Expected output:
+// vector 1 ok
+// vector 2 ok
+// scalar 9, u 9 ok
+// scalar 9, vector 2's u ok
+use encoding;
+use string;
+use tls_crypto;
+
+fn hb(h: str) -> Vec<i64> { return hex_decode_bytes(h); }
+
+fn he(v: Vec) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    while i < v.len() {
+        val b: i64 = v.get(i);
+        if b < 16 { out = out + "0"; }
+        out = out + int_to_hex(b);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn check(label: str, got: str, want: str) {
+    if str_equal(got, want) {
+        println(label + " ok");
+    } else {
+        println(label + " WRONG: got " + got + ", want " + want);
+    }
+}
+
+fn main() -> i64 {
+    val nine = "0900000000000000000000000000000000000000000000000000000000000000";
+    val vec2_u = "e5210f12786811d3f4b7959d0538ae2c31dbe7106fc03c3efc4cd549c715a493";
+    check("vector 1", he(x25519(
+        hb("a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4"),
+        hb("e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c"))),
+        "c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552");
+    check("vector 2", he(x25519(
+        hb("4b66e9d4d1b4673c5ad22691957d6af5c11b6421e0ea01d42ca4169e7918ba0d"),
+        hb(vec2_u))),
+        "95cbde9476e8907d7aade45cb4b873f88b595a68799fa152e6f8f7647aac7957");
+    // bit 255 set in u with other scalars too (checked against an
+    // independent ladder; the first is the iterated vector's first step)
+    check("scalar 9, u 9", he(x25519(hb(nine), hb(nine))),
+        "422c8e7a6227d7bca1350b3e2bb7279f7897b87bb6854b783c60e80311ae3079");
+    check("scalar 9, vector 2's u", he(x25519(hb(nine), hb(vec2_u))),
+        "73640afc47c7cc28815cf433493686df492508a7764bfd7c03587d3b88c23557");
+    return 0;
+}

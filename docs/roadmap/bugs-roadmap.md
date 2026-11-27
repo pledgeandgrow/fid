@@ -38,6 +38,9 @@ Status Nov 25 (the Nov 24 and Nov 25 fixes, run with the Nov 25 fid on
 run, C, emit, and --nat / `fid wasm` where an entry names them): 71 done
 `[x]`, 8 partly done `[~]` (BG159, BG165, BG166, BG182, BG183, BG185,
 BG204, BG227), 35 open. BG242-BG246, found Nov 25, are open.
+Status Nov 27 (checkbox count at be36317, the v0.8.5-unstable commit):
+BG128-BG241: 80 done `[x]`, 3 partly done `[~]` (BG183, BG204, BG227), 31
+open; BG242-BG246 open. The whole file: 207 `[x]`, 3 `[~]`, 36 `[ ]`.
 
 Status markers as in the other roadmaps: `[ ]` open, `[~]` partly done,
 `[x]` done.
@@ -2086,13 +2089,22 @@ names are the reference.
       `uni_lower`/`uni_nfc` of `.. C0 AF x`): passes on run, ccompile and
       emit with the fid-dev of Nov 25; test_encoding, test_lib_unicode,
       test_std_jni and test_std_push unchanged.
-- [ ] BG216. **`tls_crypto::x25519` gets RFC 7748's second test vector
+- [x] BG216. **`tls_crypto::x25519` gets RFC 7748's second test vector
       wrong.** stdlib/tls_crypto.fd `x25519` does not mask bit 255 of u before
       `mod p` (RFC 7748 §5), and its swap is a secret-dependent `if`;
       stdlib/x25519.fd (used by QUIC) is right, but this one stays public in
       the module tls13, tls_record and quic import. Trigger: §5.2 vector 2
       gives `d5f33573…` (want `95cbde94…`); vector 1 is right. Confirmed Nov
       24 (ccompile). Confidence: high.
+      Fixed Nov 27: `tls_crypto::x25519` now calls x25519.fd's
+      `x25519_scalarmult` (constant time in the scalar, bit 255 of u
+      ignored); the module's own BigInt ladder and its six field helpers are
+      gone, and nothing in the tree called the old function. Test
+      test_bg216_tls_crypto_x25519 (RFC 7748 section 5.2 vectors 1 and 2,
+      then the scalar 9 with u = 9 and with vector 2's u, both checked
+      against an independent ladder): passes on run, ccompile and emit with
+      the fid-dev of Nov 25; test_crypto_tls_vectors,
+      test_stdlib_secret_keys and test_stdlib_tls13_schedule unchanged.
 - [x] BG217. **decimal: a negative scale prints the wrong value.**
       stdlib/decimal.fd `dec_round` and `dec_div` accept and keep a negative
       scale, and `dec_to_str` prints the mantissa for any scale <= 0 without

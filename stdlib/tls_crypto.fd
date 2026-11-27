@@ -22,6 +22,7 @@ use vec;
 use string;
 use bigint;
 use crypto;
+use x25519;
 // ─── ChaCha20 ───────────────────────────────────────────────────────────
 
 fn c20_rot(v: i64, n: i64) -> i64 {
@@ -451,120 +452,13 @@ pub fn hkdf_expand_label(secret: Vec, label: str, context: Vec, len: i64) -> Vec
     return hkdf_expand(secret, info, len);
 }
 
-// ─── X25519 (RFC 7748 Montgomery ladder over GF(2^255-19)) ──────────────
-
-fn x_p() -> BigInt {
-    return bigint_sub(bigint_pow(bigint_from_i64(2), 255), bigint_from_i64(19));
-}
-
-fn x_a24() -> BigInt {
-    return bigint_from_i64(121665);
-}
-
-fn x_sub(a: BigInt, b: BigInt) -> BigInt {
-    var d: BigInt = bigint_sub(a, b);
-    var p: BigInt = x_p();
-    var m: BigDiv = bigint_divmod(d, p);
-    if m.r.neg {
-        return bigint_add(m.r, p);
-    }
-    return m.r;
-}
-
-fn x_mul(a: BigInt, b: BigInt) -> BigInt {
-    return bigint_mod(bigint_mul(a, b), x_p());
-}
-
-fn x_add(a: BigInt, b: BigInt) -> BigInt {
-    return bigint_mod(bigint_add(a, b), x_p());
-}
-
-fn x_inv(a: BigInt) -> BigInt {
-    // a^(p-2) mod p
-    var e: BigInt = bigint_sub(x_p(), bigint_from_i64(2));
-    return bigint_modpow(a, e, x_p());
-}
+// ─── X25519 (RFC 7748 §5) ────────────────────────────────────────────────
 
 /// X25519: scalar(32B, clamped internally) × point(32B) → 32B shared.
-/// `scalar` and `point` are little-endian Vec<i64> of 32 bytes.
+/// `scalar` and `point` are little-endian Vec<i64> of 32 bytes. The ladder
+/// is x25519.fd's, constant time in the scalar with bit 255 of the point
+/// ignored; this module's own BigInt ladder read that bit and swapped on
+/// a branch, and got RFC 7748's second vector wrong (BG216).
 pub fn x25519(scalar: Vec, point: Vec) -> Vec {
-    var p: BigInt = x_p();
-    // clamp scalar per RFC 7748
-    var k: Vec = Vec::new();
-    var i: i64 = 0;
-    while i < 32 {
-        k.push(scalar.get(i) & 255);
-        i = i + 1;
-    }
-    k.set(0, k.get(0) & 248);
-    k.set(31, (k.get(31) & 127) | 64);
-    // u-coordinate
-    var u: BigInt = bigint_zero();
-    var mul: BigInt = bigint_one();
-    var b256: BigInt = bigint_from_i64(256);
-    i = 0;
-    while i < 32 {
-        u = bigint_add(u, bigint_mul(mul, bigint_from_i64(point.get(i) & 255)));
-        mul = bigint_mul(mul, b256);
-        i = i + 1;
-    }
-    u = bigint_mod(u, p);
-    // scalar bits (little-endian)
-    var x1: BigInt = u;
-    var x2: BigInt = bigint_one();
-    var z2: BigInt = bigint_zero();
-    var x3: BigInt = u;
-    var z3: BigInt = bigint_one();
-    var swap: i64 = 0;
-    var t: i64 = 254;
-    while t >= 0 {
-        var kbyte: i64 = k.get(t / 8);
-        var kt: i64 = (kbyte >> (t % 8)) & 1;
-        swap = swap ^ kt;
-        if swap == 1 {
-            var tx2: BigInt = x2;
-            x2 = x3;
-            x3 = tx2;
-            var tz2: BigInt = z2;
-            z2 = z3;
-            z3 = tz2;
-        }
-        swap = kt;
-        var a: BigInt = x_add(x2, z2);
-        var aa: BigInt = x_mul(a, a);
-        var b: BigInt = x_sub(x2, z2);
-        var bb: BigInt = x_mul(b, b);
-        var e2: BigInt = x_sub(aa, bb);
-        var c: BigInt = x_add(x3, z3);
-        var d: BigInt = x_sub(x3, z3);
-        var da: BigInt = x_mul(d, a);
-        var cb: BigInt = x_mul(c, b);
-        var dac: BigInt = x_add(da, cb);
-        var dsc: BigInt = x_sub(da, cb);
-        x3 = x_mul(dac, dac);
-        z3 = x_mul(x1, x_mul(dsc, dsc));
-        x2 = x_mul(aa, bb);
-        z2 = x_mul(e2, x_add(aa, x_mul(x_a24(), e2)));
-        t = t - 1;
-    }
-    if swap == 1 {
-        var tx2b: BigInt = x2;
-        x2 = x3;
-        x3 = tx2b;
-        var tz2b: BigInt = z2;
-        z2 = z3;
-        z3 = tz2b;
-    }
-    var result: BigInt = x_mul(x2, x_inv(z2));
-    // serialize little-endian 32 bytes
-    var out: Vec = Vec::new();
-    var b256v: BigInt = bigint_from_i64(256);
-    i = 0;
-    while i < 32 {
-        var dm: BigDiv = bigint_divmod(result, b256v);
-        out.push(dm.r.limbs.get(0));
-        result = dm.q;
-        i = i + 1;
-    }
-    return out;
+    return x25519_scalarmult(scalar, point);
 }
