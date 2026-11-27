@@ -151,7 +151,7 @@ machine is free of the two heavy runs; record the numbers.
 | # | Goal | Gate | Status |
 |---|---|---|---|
 | 16 | VF10 | the conformance suite on every backend: `CC="zig cc" python scripts/verify/expect.py --fid release/fid-v27.exe --backends run,ccompile,emit tests/conformance`, then `python scripts/verify/conf-known.py --log <that output>` | run once (Nov 27 10:48: with release/fid-v27.exe 1,607 of 1,617 pass on run, ccompile, emit; the 15 listed gaps pass and are off the list; CF32 to CF37 filed; four tests of the night's fixes fail with that compiler only and pass with the build of 09:17) |
-| 48 | CF32 to CF37, found by the conformance run of Nov 27 | `@public` taken for secret by the compiled backends' constant-time check; `main` without `return` on emit; two closure captures (by reference; a str printed as an address); `comptime if` in a generic on emit; a null dereference that does not trap on ccompile | `compiler/checks.fd` and `compiler/nat_ir.fd` (CF32), `compiler/pe_ir*.fd`, `compiler/codegen_c.fd`, lowering (CF33 to CF37) | their six conformance tests pass on run, ccompile and emit | todo (docs/verification/vf10-conformance-2026-11-17.md) |
+| 48 | CF32 to CF37, found by the conformance run of Nov 27 | `@public` taken for secret by the compiled backends' constant-time check; `main` without `return` on emit; two closure captures (by reference; a str printed as an address); `comptime if` in a generic on emit; a null dereference that does not trap on ccompile | `compiler/checks.fd` and `compiler/nat_ir.fd` (CF32), `compiler/pe_ir*.fd`, `compiler/codegen_c.fd`, lowering (CF33 to CF37) | their six conformance tests pass on run, ccompile and emit | todo (docs/verification/vf10-conformance-2026-11-17.md). CF32: the native backend is fixed in c437509b (build of 11:30: s11_annotation_on_param passes on run and emit; 38 constant-time tests pass on run, ccompile and emit); the C generator has its own copy of the check, codegen_c.fd `cg_ct_check`, which still marks every parameter: the line checks.fd `peir_ct_check` got, one build; the accept test (a function, a method, a generic function) waits in build/verify-nov27/cf32/ until ccompile passes (with the patch of the change); then the front-end verdicts of build 6 (release/fid-night-prev.exe) against the new build. CF33 to CF37 not started. Another session is in compiler/typechecker.fd (4 hunks of its own), lower.fd, lexer.fd, interp.fd, escape.fd and nat_ir.fd, with tests for BG203, BG225 and BG252 in the tree: row 48's other files, and rows 28 and 34, wait for it |
 | 17 | VF15 | `scripts/fuzz/fuzz_parsers.py` (read its header) | the tls target is run (Nov 27 09:38: 6,600 inputs over two seeds, 0 findings; the other eight parsers 125 each, 0); the entry stays `[~]` for long runs |
 | 18 | AD4 | `tools/doctest.fd` against `scripts/doctest.py` (read the entry) | todo |
 | 19 | TL10 | `tree-sitter generate` for `editors/tree-sitter-fides`, Zed (read the entry) | todo |
@@ -417,4 +417,25 @@ are the commit times.)
   NEXT, IN THIS ORDER: (1) row 48 with row 27 to 36 (compiler bugs, one
   build each; CF32 first: the IR checks keep no @public);
   (2) row 46 (BG249, the runtime only); (3) section D rows 18 to 25;
+  (4) the WebAssembly list of PL4 when the machine is quiet.
+- 11:40, the end of the 10:51 run (49 minutes: stopped to answer the user),
+  one build (11:16 to 11:30, 16 units at -O2, release/fid-night.exe; build
+  6 is release/fid-night-prev.exe). BG249 (row 46): the fix was written and
+  tried for 25 minutes, not validated, nothing kept: what the system does
+  with a stack committed as used is in the entry, the experiment in
+  build/tmp/bg249/. CF32 (row 48): the type checker puts the parameters
+  @public marks down for the check on the IR (c437509b): the native
+  backend accepts them now, the interpreter always did, and 38
+  constant-time tests pass on run, ccompile and emit; the C generator's
+  own copy of the check still marks every parameter. Another session is
+  in compiler/typechecker.fd, lower.fd, lexer.fd, interp.fd, escape.fd
+  and nat_ir.fd, with tests for BG203, BG225 and BG252 uncommitted in the
+  tree: rows 28 and 34 and the rest of 48 wait for it. My one hunk in
+  typechecker.fd was committed alone (git apply --cached of that hunk).
+  NEXT, IN THIS ORDER: (1) CF32's C half: codegen_c.fd `cg_ct_check`
+  seeds its parameters as checks.fd `peir_ct_check` did before c437509b:
+  the same one line, a build, then build/verify-nov27/cf32/
+  test_cf32_public_param.fd on run, ccompile and emit and the front-end
+  verdicts of build 6 against the new build; (2) rows 27, 29 to 31 and
+  32 as the other session leaves them; (3) section D rows 18 to 25;
   (4) the WebAssembly list of PL4 when the machine is quiet.
