@@ -2381,6 +2381,13 @@ language lives.
       (`test_runtime_tls_record.fd`). It is fuzz target `tls` of
       fuzz_parsers.py (binary seeds; `tests/fuzz/parsers.fd`). Left: a run
       of the tls target, long runs.
+      Nov 27 (night): the tls target is run, through C with
+      release/fid-v27.exe: 600 inputs (seed 27) and 6,000 (seed 2811,
+      7 minutes), 0 distinct findings; json, regex, http, csv, toml,
+      xml, url and uuid with seed 2811 (125 each of `-n 1000`): 0
+      (build/verify-nov27/fuzz-tls.log, fuzz-all.log). About 850
+      inputs a minute, so a long run is an hour or more. Left: long
+      runs.
 - [>] VF16. Week-long soak tests of a service under load, with flat memory (release: moved to end-roadmap.md (Nov 22 — final-gate work, do when the code stops moving).
 
 - [~] VF17. Chaos tests: dropped connections, full disks, out of memory, clock jumps

@@ -148,7 +148,7 @@ machine is free of the two heavy runs; record the numbers.
 | # | Goal | Gate | Status |
 |---|---|---|---|
 | 16 | VF10 | the conformance suite on every backend: `CC="zig cc" python scripts/verify/expect.py --fid release/fid-v27.exe --backends run,ccompile,emit tests/conformance`, then `python scripts/verify/conf-known.py --log <that output>` | todo |
-| 17 | VF15 | `scripts/fuzz/fuzz_parsers.py` (read its header) | todo |
+| 17 | VF15 | `scripts/fuzz/fuzz_parsers.py` (read its header) | the tls target is run (Nov 27 09:38: 6,600 inputs over two seeds, 0 findings; the other eight parsers 125 each, 0); the entry stays `[~]` for long runs |
 | 18 | AD4 | `tools/doctest.fd` against `scripts/doctest.py` (read the entry) | todo |
 | 19 | TL10 | `tree-sitter generate` for `editors/tree-sitter-fides`, Zed (read the entry) | todo |
 | 20 | SP13 | the debug mode's timing (read the entry) | todo |
@@ -390,3 +390,8 @@ are the commit times.)
   tasks; (4) rows 27 to 36, one build each: BG235, BG203, BG228, BG230,
   BG241 (lower.fd), BG209 to BG211 (lexer.fd, parser.fd), BG205, BG244
   (codegen_c.fd), BG234, BG245 (nat_enc.fd).
+- 09:42, row 17 (VF15): `python scripts/fuzz/fuzz_parsers.py --fid
+  release/fid-v27.exe --parsers tls -n 6000 --seed 2811`: 0 distinct
+  findings in 7 minutes (600 with seed 27 before: 0); the other eight
+  parsers with `-n 1000` (125 each): 0. About 850 inputs a minute
+  through C. The entry stays `[~]` for its long runs.
