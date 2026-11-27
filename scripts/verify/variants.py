@@ -152,11 +152,11 @@ MUTANTS = [
     # `fid test-rules` and scripts/enc-oracle.py catch the first ones on
     # their own; these ask whether the suite would too.
     ("rules-sub-zero-left", ("compiler/rules.fd",
-                             'v.push(ru("x - 0 = x", RU_SUB, RS_RIGHT, 0, RR_OTHER, 0));',
-                             'v.push(ru("x - 0 = x", RU_SUB, RS_LEFT, 0, RR_OTHER, 0));'), ["nat"]),
+                             'v.push(ru("x - 0 = x", RU_SUB, RS_RIGHT, 0, RR_OTHER, 0, RP_INT | RP_SAME_TY));',
+                             'v.push(ru("x - 0 = x", RU_SUB, RS_LEFT, 0, RR_OTHER, 0, RP_INT | RP_SAME_TY));'), ["nat"]),
     ("rules-lt-self-true", ("compiler/rules.fd",
-                            'v.push(ru("x < x", RU_LT, RS_SAME, 0, RR_FALSE, 0));',
-                            'v.push(ru("x < x", RU_LT, RS_SAME, 0, RR_TRUE, 0));'), ["nat"]),
+                            'v.push(ru("x < x", RU_LT, RS_SAME, 0, RR_FALSE, 0, RP_INT | RP_SAME_TY));',
+                            'v.push(ru("x < x", RU_LT, RS_SAME, 0, RR_TRUE, 0, RP_INT | RP_SAME_TY));'), ["nat"]),
     ("enc-x64-disp8-128", ("compiler/nat_enc.fd",
                            "return v >= 0 - 128 && v <= 127;",
                            "return v >= 0 - 128 && v <= 128;"), ["nat"]),
@@ -172,7 +172,7 @@ MUTANTS = [
     # meant to kill it is named beside it.
     # iv: `L = L - d` is read as `L = L + d` (test_verify_opt_dse_sccp_iv)
     ("iv-sub-as-add", ("compiler/iropt.fd",
-                       "                    cid = b;\n                    sgn = - 1;",
+                       "                    cid = b;\n                    sgn = -1;",
                        "                    cid = b;\n                    sgn = 1;"), ["emit"]),
     # sccp: `a + 0` folds to 0 (test_verify_opt_dse_sccp_iv, test_opt_fold)
     ("sccp-add-zero-is-zero", ("compiler/iropt.fd",
