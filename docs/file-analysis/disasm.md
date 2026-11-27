@@ -27,7 +27,10 @@ Only main.fd imports it.
 ## Checks
 
 - tests/nattools/enc_table_unit.fd: each encoder of nat_enc.fd against its
-  row of the table.
+  row of the table (since Nov 27 also the words nat_ir.fd writes itself:
+  the SIMD&FP loads, stores and pairs).
+- tests/tooling/disasm-forms-check.sh: `fid disasm --raw` on byte sequences
+  no suite program reaches (BG233, BG208, BG232), the bytes llvm-mc's.
 - scripts/disasm-check.sh: a disassembly of the suite's images against
   llvm-objdump (where each instruction starts) and back through clang's
   assembler (each line gives its own bytes again).
@@ -39,6 +42,17 @@ enc_table_unit passes. disasm-check: x86-64 instruction starts agree with
 objdump, the AArch64 and RISC-V round trips are all right, but the x86-64
 round trip fails on 3 tests: `shl rbx, 1` emitted as `C1 /n 1` reassembles
 as `D1 /n`.
+
+Nov 27 (night), BG232 (bugs-roadmap.md): the encoders that had no row have
+one, each listed in enc_table_unit: x86 `blsmsk` and `blsi`; AArch64 the
+pre/post-index loads and stores (24 rows; a signed 9-bit offset field,
+`simm9`), the SIMD&FP `ldr`/`str` d and s and `ldp`/`stp` d, `bic v.16b`,
+`dup v.2d, v.d[i]` and `mov d, v.d[i]`; RISC-V `vsll.vi`, `vmseq.vi`,
+`vmerge.vim`, `vslidedown.vi`, `vfmv.f.s` and `vfmv.v.f` (two 5-bit
+immediate fields, `vimm5` and `vsimm5`). With the build of 09:17:
+disasm-forms-check 30 of 30, disasm-check 18 ok and 0 words undecoded on
+AArch64 in test_machine_fast (8 before), enc_table_unit ok on ccompile and
+emit.
 
 ## Findings
 

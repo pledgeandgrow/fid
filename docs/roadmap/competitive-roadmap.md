@@ -3891,6 +3891,9 @@ Every platform gets a tier, and a tier means CI, not a hope.
       18255c75. Left: run that list on a quiet machine and sort it (the
       interpreter's own bugs, tests in flight, gaps of WebAssembly, gaps
       every backend has), then the gaps it names; threads; the CI lane.
+      Nov 27 (night), the evening's three checks with release/fid-v27.exe:
+      the default WebAssembly set 13 of 13, tests/wasm/task-switch-check.sh
+      3 of 3, tests/wasm/stackify-check.sh 12 of 12.
 - [~] PL5. Freestanding and embedded: Cortex-M, RISC-V boards, with no OS (release G)
       Nov 22 audit: Thumb-2 oracles green (enc-oracle-pl5.py 226 forms,
       op21 662 forms, 0 mismatches), test_thumb_core 23/23, thumb_check
