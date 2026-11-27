@@ -722,13 +722,19 @@ nothing else is left to spill:
 - the float pass (MI25).
 
 The secret values (`ng_secret_ids`) start from the marks the IR carries for
-each value. Today those are the slots of `@zeroize` locals
-(`IrFunction.zeroize_locals`). From these marks the set grows to a fixed
-point over the function:
+each value: the slots of `@zeroize` locals (`IrFunction.zeroize_locals`)
+and the values of `@secret` / `@sensitive` parameters and the slots of such
+locals (`IrFunction.secret_values`, filled by compiler/lower.fd, Nov 18).
+From these marks the set grows to a fixed point over the function:
 - a value loaded from a secret place is secret;
 - a value stored into a secret place is secret;
 - a place a secret is stored into is secret;
 - a value computed from a secret operand is secret.
+
+In the machine IR the set grows once more (`ng_secret_mir`, Nov 27): a
+value an instruction computes from a secret (a two-address sum, an address)
+and the source of a copy of one (the same value under its first name) are
+secret too.
 
 A piece of a split value (RA4) is as secret as the value itself. A
 rematerialized value is left alone, because it is recomputed and never
@@ -736,18 +742,18 @@ stored. Switch: `FID_NAT_OFF=secretregs`. The weights are only used when
 spill weights are on (`weights`); the fast allocator (RA14) does not use
 them.
 
-Not yet marked: `@secret` / `@sensitive` parameters and locals that are not
-`@zeroize`. The IR records that the function holds them
-(`has_secret`), but not which values they are. Marking them needs a value
-list from lowering: `IrFunction.secret_values`, filled by compiler/lower.fd
-for those parameters' values and those locals' slots. `ng_secret_ids` then
-takes those values as seeds too.
-
 ### Checking it
 
 `fid emit <file> --target <t> --stats` prints, for each secret function:
 
     [lf20] <fn>: S secret values, R in registers; each return zeroes W registers
+
+S is the number of secret values the function's machine IR holds (an IR
+value with no machine life, such as a load the mid-end forwarded away, is
+in no register and in no memory and is not counted); R is how many of them
+the allocator kept in a register. In the gate's `pressure` on the -O2
+build of Nov 27, 16:19: 48 of 48 on each of the four targets, 45 with
+`FID_NAT_OFF=secretregs`.
 
 `tests/nattools/machine_lf20_check.sh [fid]` runs
 `tests/bootstrap/test_machine_secret_regs.fd` on x86_64, AArch64, RISC-V
