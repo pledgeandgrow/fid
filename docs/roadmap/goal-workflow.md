@@ -80,6 +80,20 @@
 
 ## First: record the background runs
 
+**Since Nov 27 16:40 (the interactive session of the afternoon): five jobs
+of that session run in the background.** Do not start them again; read them.
+
+| Marker | Result | Roadmap entries |
+|---|---|---|
+| `GATES_DONE` at the end of `build/llvm19/progress-long.log` | `ra1.log` (RA1: `ra1_pe_ra_off_check.sh`), `version.log` (LF11: `version-default-check.sh`), `parse_par*.log` and `imports_par*.log` (SP9) | `RA1`, `LF11`, `SP9` |
+| `SUITE_DONE` at the end of each of `build/llvm19/suite-on.log`, `suite-off.log`, `suite-sole.log`, `suite-vec.log` | the whole of tests/bootstrap (2,056 programs) with `release/fid-night.exe` (the -O2 build of 16:19): `on` on emit and `--nat` (WP14 and LF11 as they are by default); `off`, `sole` and `vec` on emit with FID_IROPT_OFF=spec,version, FID_IROPT_ON=soleown, FID_IROPT_ON=vecsroa. `python build/llvm19/suite-diff.py on off sole vec` gives, per leg, the files it fails that `on` does not | `WP14` and `LF11` (`on` against `off`: no file fails with them on that passes with them off), `LF16` (`sole`), `LF14` (`vec`) |
+
+A leg is a pass's evidence only when it fails no file the default leg passes
+(a pass that turns one verdict is a bug: write it in the entry, file it in
+bugs-roadmap.md, leave the mark). A leg that died (`rc` other than 0 or 1
+with no `files pass` line, a fork failure) is not a result: run that leg
+again (`FID=release/fid-night.exe JOBS=3 bash build/llvm19/suite.sh <name> - ...`).
+
 Started at 01:26 with `release/fid-v27.exe`, output in `build/verify-nov27/`.
 When a marker appears and the entry has no note of it, write the note, then
 set the queue row to `done`.
@@ -126,21 +140,23 @@ holds, with its gate green on a built compiler.
 | # | Goal | Files | Status |
 |---|------|-------|--------|
 | L1 | SP6 | `compiler/nat_ir.fd` (the function cache) | done (Nov 27 day: `machine_fncache_check.sh` all passed, `sp20_fncache_tail_check.sh` 21 ok) |
-| L2 | SP7 | `compiler/nat_ir.fd` (`nl_loop_end`) | running: a kept slot for a function a build inlines away; gate `tests/nattools/relink_check.sh` |
-| L3 | LF20 | `compiler/nat_ir.fd` (`ng_secret_mir`) | running: the secret set follows what selection makes of a secret; gates `machine_lf20_check.sh`, `machine_lf20_param_check.sh` |
-| L4 | LF14 | `compiler/iropt.fd` (`iro_vec_sroa_one`) | running: a read in a dominated block takes any handle; `tests/bootstrap/test_midend_vec_sroa_dom.fd` |
+| L2 | SP7 | `compiler/nat_ir.fd` (`nl_loop_end`) | done (Nov 27 day, ad4dfa83: a kept slot for a function a build inlines away; `relink_check.sh` 21 ok, 0 fail on the -O2 build of 15:52) |
+| L3 | LF20 | `compiler/nat_ir.fd` (`ng_secret_mir`) | done (Nov 27 day, 5c5d0644: `machine_lf20_check.sh` 44 ok, `machine_lf20_param_check.sh` 22 ok; the 38 constant-time tests on run, ccompile, emit and `--nat`, the last under FID_VERIFY=1) |
+| L4 | LF14 | `compiler/iropt.fd` (`iro_vec_sroa_one`) | verified: both tests convert all their Vecs with the pass on (4 and 5), right on pe_ir and `--nat`; the debug line names its function. todo: the suite leg with FID_IROPT_ON=vecsroa |
 | L5 | MI14 | gates only | the gate is green (33 ok; fregs 25 ok); left: the default switch (the loop 2.34x, the sieve 3.56x), the suites with winfregs/splitfloat |
 | L6 | SP16 | gates only | the gate is green (9 ok); left: 2g.114, then the compiler built by `fid emit` |
 | L7 | TG11 | `compiler/iropt.fd` (the vectorizer) | verified: the checker failure is gone; left: the reductions (red6, redk), MIR vector operations |
 | L8 | WP6 | `compiler/nat_ir.fd` (AArch64's pool) | verified: 23 ok, 1 leg (x0-x7 are no pool registers there: MI's grade); the native suite |
-| L9 | SP9 | `compiler/parser.fd`, `lexer.fd`, `compiler.fd` (the other session's) | todo: the four checks and the bench on the new build, then on by default; step 3 (type check in parallel) |
-| L10 | RA1 | `tests/nattools/ra1_pe_ra_off_check.sh` | todo: the gate (137 programs) |
-| L11 | LF11 | `tests/tooling/version-default-check.sh` | todo: the gate, the suite leg |
-| L12 | WP14, LF16 | whole-suite legs | todo: `scripts/verify/expect.py --backends emit,nat` over tests/bootstrap, default and `FID_IROPT_ON=soleown` |
+| L9 | SP9 | `compiler/parser.fd`, `lexer.fd`, `compiler.fd` (the other session's) | running: the four checks and the bench with the -O2 build of 16:19 (the job of 16:36); then: on by default, step 3 (type check in parallel) |
+| L10 | RA1 | `tests/nattools/ra1_pe_ra_off_check.sh` | running: the gate (137 programs, the job of 16:36); left after it: deleting pe_ir's allocator, which waits for MI17 and the Windows default |
+| L11 | LF11 | `tests/tooling/version-default-check.sh` | running: the gate (the job of 16:36) and the suite legs `on` against `off` (the jobs of 16:41) |
+| L12 | WP14, LF16 | whole-suite legs | running: four legs side by side since 16:41 (`on`, `off`, `sole`, `vec`); the first record of a whole-suite run on emit and `--nat` |
 | L13 | MI5, MI17 | `compiler/pe_ir*.fd`, `nat_ir.fd` | waiting: BG248, BG249, BG251 (the other session's), then `tests/nattools/mi5_nat_peir_check.sh` again; the default switch is MI14's |
 | L14 | MI9, TG16, LF13, LF21 | MI9: SRA of local structs (`nat_ir.fd`); TG16: the port onto MIR (the other session builds tg16-fid-v5); LF13: the other producers, `Vec::new()`+push buffers (`lower.fd`); LF21: the region arena in the Linux runtime | waiting on the other session, or multi-week |
 
-Gate scripts, once fixed, are in tests/nattools (a working WSL only: `wsl.exe -e sh -c 'echo wsl-ok'`; a path given to `fid serve` on stdin is a Windows path, `cygpath -m`). The driver of one run: `bash build/llvm19/gates.sh [name ...]` (tg11 wp6 sp16 mi14 fregs lf20 sp6 sp7 ra1 lf11 sp9), its log `build/llvm19/progress.log`.
+Gate scripts, once fixed, are in tests/nattools (a working WSL only: `wsl.exe -e sh -c 'echo wsl-ok'`; a path given to `fid serve` on stdin is a Windows path, `cygpath -m`). The driver of one run: `FID=<fid> bash build/llvm19/gates.sh [name ...]` (tg11 wp6 sp16 mi14 fregs lf20 sp6 sp20 sp7 ct ra1 lf11 sp9), its log `build/llvm19/progress.log`; the whole-suite legs: `bash build/llvm19/suite.sh <name> <list-or-dash> [VAR=value]` (tests/bootstrap on emit and `--nat`).
+
+**The machine's commit limit is the build wall, not free RAM (Nov 27 afternoon):** 44 GB of the 48 GB limit were taken with 8 GB of RAM free, and `zig cc` died at once on the giant units. Check `CommitLimit - CommittedBytes` before a build. `SPLIT_OPT=-O1 JOBS=1` builds every unit when at least 4 GB of commit are free; the six giant units (1, 3, 4, 6, 7, 9) fit at -O0 only. A mixed -O1/-O0 fid validates behaviour, not timings.
 
 ### B. Bugs in the standard library — no build needed
 
@@ -182,7 +198,7 @@ machine is free of the two heavy runs; record the numbers.
 | # | Goal | Gate | Status |
 |---|---|---|---|
 | 16 | VF10 | the conformance suite on every backend: `CC="zig cc" python scripts/verify/expect.py --fid release/fid-v27.exe --backends run,ccompile,emit tests/conformance`, then `python scripts/verify/conf-known.py --log <that output>` | run once (Nov 27 10:48: with release/fid-v27.exe 1,607 of 1,617 pass on run, ccompile, emit; the 15 listed gaps pass and are off the list; CF32 to CF37 filed; four tests of the night's fixes fail with that compiler only and pass with the build of 09:17) |
-| 48 | CF32 to CF37, found by the conformance run of Nov 27 | `@public` taken for secret by the compiled backends' constant-time check; `main` without `return` on emit; two closure captures (by reference; a str printed as an address); `comptime if` in a generic on emit; a null dereference that does not trap on ccompile | `compiler/checks.fd` and `compiler/nat_ir.fd` (CF32), `compiler/pe_ir*.fd`, `compiler/codegen_c.fd`, lowering (CF33 to CF37) | their six conformance tests pass on run, ccompile and emit | todo (docs/verification/vf10-conformance-2026-11-17.md). CF32: the native backend is fixed in c437509b (build of 11:30: s11_annotation_on_param passes on run and emit; 38 constant-time tests pass on run, ccompile and emit); the C generator has its own copy of the check, codegen_c.fd `cg_ct_check`, which still marks every parameter: the line checks.fd `peir_ct_check` got, one build; the accept test (a function, a method, a generic function) waits in build/verify-nov27/cf32/ until ccompile passes (with the patch of the change); then the front-end verdicts of build 6 (release/fid-night-prev.exe) against the new build. CF33 to CF37 not started. Another session is in compiler/typechecker.fd (4 hunks of its own), lower.fd, lexer.fd, interp.fd, escape.fd and nat_ir.fd, with tests for BG203, BG225 and BG252 in the tree: row 48's other files, and rows 28 and 34, wait for it |
+| 48 | CF32 to CF37, found by the conformance run of Nov 27 | `@public` taken for secret by the compiled backends' constant-time check; `main` without `return` on emit; two closure captures (by reference; a str printed as an address); `comptime if` in a generic on emit; a null dereference that does not trap on ccompile | `compiler/checks.fd` and `compiler/nat_ir.fd` (CF32), `compiler/pe_ir*.fd`, `compiler/codegen_c.fd`, lowering (CF33 to CF37) | their six conformance tests pass on run, ccompile and emit | todo (docs/verification/vf10-conformance-2026-11-17.md). CF32: the native backend is fixed in c437509b (build of 11:30: s11_annotation_on_param passes on run and emit; 38 constant-time tests pass on run, ccompile and emit); the C generator has its own copy of the check, codegen_c.fd `cg_ct_check`, which still marks every parameter: the line checks.fd `peir_ct_check` got, one build; the accept test (a function, a method, a generic function) waits in build/verify-nov27/cf32/ until ccompile passes (with the patch of the change); then the front-end verdicts of build 6 (release/fid-night-prev.exe) against the new build. CF33 to CF37 not started. Another session is in compiler/typechecker.fd (4 hunks of its own), lower.fd, lexer.fd, interp.fd, escape.fd and nat_ir.fd, with tests for BG203, BG225 and BG252 in the tree: row 48's other files, and rows 28 and 34, wait for it | Nov 27 (day): CF32 and CF37 done (cc293424): the type checker's marks are read by their index in the source on every backend (the -O2 build of 16:19: s11_annotation_on_param and s8_2_null_deref_panics pass on run, ccompile and emit), taken out of known-gaps.txt. CF33 to CF36 stay with the stopped roadmap. |
 | 17 | VF15 | `scripts/fuzz/fuzz_parsers.py` (read its header) | the tls target is run (Nov 27 09:38: 6,600 inputs over two seeds, 0 findings; the other eight parsers 125 each, 0); the entry stays `[~]` for long runs |
 | 18 | AD4 | `tools/doctest.fd` against `scripts/doctest.py` (read the entry) | todo |
 | 19 | TL10 | `tree-sitter generate` for `editors/tree-sitter-fides`, Zed (read the entry) | todo |
@@ -470,3 +486,20 @@ are the commit times.)
   verdicts of build 6 against the new build; (2) rows 27, 29 to 31 and
   32 as the other session leaves them; (3) section D rows 18 to 25;
   (4) the WebAssembly list of PL4 when the machine is quiet.
+- 12:00 to 16:45, the interactive session on the 19 LLVM goals the user
+  named (help finish, verify, mark). Done and committed, each with its
+  gate green on a built compiler: SP6 (1a6f802f), LF20 (5c5d0644: the
+  3-of-8 was the statistic, ng_secret_mir), SP7 (ad4dfa83: a kept slot
+  for a function a build inlines away). Verified, their gates green, left
+  partly for what the entry names: MI14 (33 ok), SP16 (9 ok), TG11, WP6
+  (23 ok: AArch64's pool has none of x0-x7). Gate defects fixed
+  (f10eb6a1): wsl.exe without a distribution, MI14's `around`, fregs'
+  stubs, the relink path, SP16's probe and its checker. CF32 and CF37
+  closed (cc293424). Two builds failed on the machine's commit limit
+  (44 of 48 GB taken) and one bug of mine in the build script's success
+  path (56492abb); the -O2 builds of 15:52 and 16:19 are installed as
+  release/fid-night.exe (fid-night-prev.exe is the one of 15:52). Still
+  running when this was written: the gates RA1, LF11, SP9 and the four
+  suite legs (above). Left for another session or another day: MI5,
+  MI17 (BG248, BG249, BG251), MI9, TG11's reductions, TG16, WP6's
+  AArch64 pool, LF13, LF21, SP16's 2g.114, MI14's default switch.
