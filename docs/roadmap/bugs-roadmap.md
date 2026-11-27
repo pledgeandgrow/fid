@@ -41,10 +41,10 @@ BG204, BG227), 35 open. BG242-BG246, found Nov 25, are open.
 Status Nov 27 (checkbox count at be36317, the v0.8.5-unstable commit):
 BG128-BG241: 80 done `[x]`, 3 partly done `[~]` (BG183, BG204, BG227), 31
 open; BG242-BG246 open. The whole file: 207 `[x]`, 3 `[~]`, 36 `[ ]`.
-Status Nov 27 (night run, 08:30): BG128-BG241: 95 done `[x]`, 3
-partly `[~]` (BG183, BG204, BG227), 16 open; BG242 done, BG243-BG246
-open; BG247 done; BG248-BG257: BG254 and BG255 done, 8 open. The whole
-file: 226 `[x]`, 3 `[~]`, 28 `[ ]`.
+Status Nov 27 (night run, 09:45): BG128-BG241: 96 done `[x]`, 3
+partly `[~]` (BG183, BG204, BG227), 15 open; BG242 done, BG243-BG246
+open; BG247 done; BG248-BG257: BG254, BG255 and BG257 done, 7 open.
+The whole file: 228 `[x]`, 3 `[~]`, 26 `[ ]`.
 
 Status markers as in the other roadmaps: `[ ]` open, `[~]` partly done,
 `[x]` done.
@@ -2376,7 +2376,7 @@ names are the reference.
       block until 5c86e3dd) passes, and the program compiled once more
       by hand prints `true` with stdin closed. The interpreter and the
       native backends are not changed: the entry is about the C runtime.
-- [ ] BG232. **disasm has no row for several instructions the encoders emit.**
+- [x] BG232. **disasm has no row for several instructions the encoders emit.**
       disasm.fd encoding table: x86 `blsmsk`/`blsi` (TG7; only `blsr` has a
       row); AArch64 pre/post-indexed `ldr`/`str` (TG8, e.g. `f8008528`), FP
       `ldr/str d`, `ldp/stp d8, d9`, `bic v.16b`, `dup v.2d, v.d[i]`, `mov d,
@@ -2384,6 +2384,23 @@ names are the reference.
       `vfmv.f.s`, `vfmv.v.f` (TG11). They print as `.byte`/`.word` (length
       kept). docs/file-analysis/disasm.md says each encoder has a row.
       Confirmed Nov 24. Confidence: high.
+      Nov 27 (night), fixed (48a42687): rows for x86 `blsmsk` and
+      `blsi` (beside `blsr`); the AArch64 pre/post-index `ldr`, `str`,
+      `ldrsw`, `ldrh`, `strh`, `ldrsh`, `ldrb`, `strb`, `ldrsb` (24
+      rows, with a signed 9-bit offset field), the SIMD&FP `ldr`/`str`
+      d and s and `ldp`/`stp` d, `bic v.16b`, `dup v.2d, v.d[i]` and
+      `mov d, v.d[i]`; the RISC-V `vsll.vi`, `vmseq.vi`, `vmerge.vim`,
+      `vslidedown.vi`, `vfmv.f.s`, `vfmv.v.f` (two 5-bit immediate
+      fields). Every byte pattern is llvm-mc's (clang 21) for the text
+      expected. Validated with the build of 09:17 (16 units at -O2,
+      release/fid-night.exe): tests/tooling/disasm-forms-check.sh 30 of
+      30 (23 of them BG232; the build of 08:47 fails 21 of them);
+      tests/nattools/enc_table_unit.fd, which now lists the encoders
+      that had no row and the words nat_ir.fd writes itself: table ok,
+      a64 ok, rv64 ok, x64 ok on ccompile and emit, and with the tree's
+      source; scripts/disasm-check.sh: 18 ok, and test_machine_fast on
+      AArch64 has 0 words undecoded where LLVM decodes 2,957 (8
+      before).
 - [x] BG233. **disasm one-byte forms ignore the 0x66 operand-size prefix and
       REX.B.** disasm.fd one-byte opcode cases: `66 B8 34 12` decodes as `mov
       eax, 0x90901234` (imm32, wrong length; want `mov ax, 0x1234`), `66 99`
@@ -2630,7 +2647,7 @@ names are the reference.
       or another way to hand a task its code. test_parallel and
       test_parallel_concurrent are among the 20 programs the checker
       rejects on every backend through this module.
-- [ ] BG257. **A literal of a struct of another module does not parse
+- [x] BG257. **A literal of a struct of another module does not parse
       while its name begins with a lowercase letter.** `use math;`,
       then in a function `return vec2 { x: 1.0, y: 2.0 };`: "Parse
       error: unexpected token 'Colon'"; the same with the first field
@@ -2646,6 +2663,22 @@ names are the reference.
       let `{ ident :` open a literal after any name (no block starts
       with `ident :`); then the whole suite. math's lowercase structs
       (vec2, vec3, vec4, mat4, quat) are the ones most met.
+      Nov 27 (night), fixed (e1c82060): `pd_field_init_follows` no
+      longer asks for a capital: `{ ident :` after any name opens the
+      literal, as the comment at its call site already said (no block
+      starts with `ident :`). Validated with the build of 08:47 (16
+      units at -O2, release/fid-night.exe): test_bg257_lowercase_
+      struct_lit (math's `vec2` after `return`, on the next line and
+      on the same line, and after `val`; `mat4`; a loop and a condition
+      on a lowercase variable still take a block) passes on run,
+      ccompile and emit; `check compiler/main.fd` is clean (28 s); the
+      front end's verdict on all 3,724 files of tests/bootstrap and
+      tests/conformance is the build of 07:41's, file for file (2,724
+      accepted, 1,000 rejected, 0 differ: build/verify-nov27/
+      verdicts.log, the scripts frontend-verdicts.sh and
+      frontend-verdicts-diff.sh); scripts/check-stdlib.sh with the
+      build of 09:17: 400 compiled, 1 failed. stdlib/transform3d.fd keeps
+      the form BG254 gave it: the compiler of Nov 25 must build it.
 
 ## Found and fixed while reviewing (Nov 22)
 

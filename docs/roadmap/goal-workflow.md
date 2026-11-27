@@ -135,7 +135,7 @@ the file), `deferred` (cannot be done on this machine), with the reason.
 |---|---|---|---|---|---|
 | 10 | BG233 | disasm: one-byte forms ignore the `0x66` prefix and REX.B | `compiler/disasm.fd` | `66 B8 34 12` is `mov ax, 0x1234`, `66 99` `cwd`, `49 90` `xchg r8, rax`, `F3 90` `pause`, each with the right length| done (Nov 27 05:47, 4445b05d: 7 of 7 in tests/tooling/disasm-forms-check.sh with the compiler built from 7b06ce65) |
 | 11 | BG208 | disasm: `vzeroupper` swallows the next instruction | `compiler/disasm.fd` | `c5 f8 77 4d 39` is `vzeroupper` then `cmp r12, r14`| done (Nov 27 05:47, 4445b05d) |
-| 12 | BG232 | disasm has no row for instructions the encoders emit | `compiler/disasm.fd` | the entry's list (x86 `blsmsk`/`blsi`, AArch64 pre/post-index and FP loads, RISC-V vector) decodes with the right length | todo. Reproduced Nov 27 (night): `c4 e2 f8 f3 d1` and `c4 e2 f8 f3 d9` read as `.byte 0xc4 (vex)`. The probe is build/verify-nov27/disasm_rows_probe.fd (it encodes with the tree's encoders and decodes with its disassembler; 38 s through ccompile, 537 s through `fid run`, so compile it); `ef_decode_word` gives an empty text for a word without a row, so read AArch64 and RISC-V words through `disasm_bytes`. Rows to add: x86 `blsmsk`/`blsi` beside `blsr` (ef_vx, the digit 2 and 3), AArch64 pre/post-index `ldr`/`str`, FP `ldr`/`str d`, `ldp`/`stp d`, `bic v.16b`, `dup v.2d`, `mov d, v.d[i]`, RISC-V `vsll.vi`, `vmseq.vi`, `vmerge.vim`, `vslidedown.vi`, `vfmv.f.s`, `vfmv.v.f`; one build |
+| 12 | BG232 | disasm has no row for instructions the encoders emit | `compiler/disasm.fd` | the entry's list (x86 `blsmsk`/`blsi`, AArch64 pre/post-index and FP loads, RISC-V vector) decodes with the right length | done (Nov 27 09:21, 48a42687: disasm-forms-check 30 of 30, enc_table_unit ok, disasm-check 18 ok with 0 undecoded words on AArch64) |
 | 13 | BG212 | comptime does not evaluate float/int casts | `compiler/comptime_eval.fd` (`Expr::Cast`) | `comptime avg(3, 4)` and `comptime (-(7.9 as i64))` evaluate| done (Nov 27 05:47, 4445b05d: its two tests and 321 of 324 related programs; the three fail with the compiler of Nov 25 too) |
 | 14 | BG213 | C header parser evaluates unsigned macro arithmetic as signed | `compiler/cparser.fd` (`CpEval`/`CpExpr`) | `fid parse-header` on a header with `UDIV`, `UNEG`, `MASK`, `COND`, `CMP`, `0b1010`| deferred to a later batch: needs a typed macro evaluator (unsigned 32-bit arithmetic), about fifteen functions |
 | 15 | LG3 | reads are not checked against a live `&mut` | `compiler/borrowck.fd` | `val v = m` while `r = id_mut(&mut m)` is live and used after is a borrow error; `test_frontend_lifetime*.fd` and `tests/conformance/s8_*` still pass| the rule of 7b06ce65 passed its tests but rejected the compiler's own tree (three calls of the form `f(&mut g.e, read(g))`); refined in 21e16421; the build of 06:35 still rejected one place (nat_ir.fd ng_mir_finish: a released borrow was counted as a named one), fixed in 4d7dcd55 with test_lg3_read_after_released_mut; validated with the build of 07:41 (three rejections, the accepted tests, `check compiler/main.fd` clean, 154 of 155 of the lifetime and §8.4 files); the entry stays `[~]` for its other gaps (lifetime parameters by name, generic structs by lifetime, the Linux targets) |
@@ -174,7 +174,7 @@ Take in this order as soon as `git status --porcelain -- <file>` is empty.
 | 27 | BG201, BG202, BG240, BG242, BG235 | `compiler/typechecker.fd` | Status: BG201, BG202, BG240 and BG242 done (Nov 27 night; BG201 with the build of 07:41; marked in bugs-roadmap.md). BG235 not started |
 | 28 | BG203, BG228, BG230, BG241 | `compiler/lower.fd` |
 | 29 | BG209, BG210, BG211, BG257 | `compiler/lexer.fd`, `compiler/parser.fd` |
-|    | (BG257: a literal of a lowercase-named struct of another module; parser.fd `pd_field_init_follows`, compiler.fd:3606) | | Status: found Nov 27 (night) through BG254; one build |
+|    | (BG257: a literal of a lowercase-named struct of another module; parser.fd `pd_field_init_follows`, compiler.fd:3606) | | Status: BG257 done (Nov 27 09:21, e1c82060: the capital is no longer asked for; 3,724 verdicts unchanged); BG209 to BG211 not started |
 | 30 | BG205, BG231, BG244 | `compiler/codegen_c.fd` | Status: BG231 done (Nov 27 night, the build of 07:41, on ccompile); BG205 and BG244 not started |
 | 31 | BG236 | `compiler/mono.fd` | done (Nov 27 night: tests/nattools/mangle_func_unit.fd passes on run, ccompile and emit with the build of 07:41; test_mono.fd no longer compiles: BG253) |
 | 32 | BG234, BG245 | `compiler/nat_enc.fd` |
@@ -360,3 +360,33 @@ are the commit times.)
   0 failed in 33 s (build/verify-nov27/disasm-check-night.log); AArch64
   leaves 8 words undecoded in test_machine_fast where LLVM decodes 2,957:
   the rows of BG232.
+- 09:45, the end of the 08:30 run (75 minutes), two builds. Build 5
+  (08:33 to 08:47, 16 units at -O2) carried BG257: the parser opens a
+  struct literal after a name of any case (e1c82060); validated with
+  test_bg257 on run, ccompile and emit, a clean `check compiler/main.fd`
+  and the front end's verdict on all 3,724 files of tests/bootstrap and
+  tests/conformance, the build of 07:41's file for file (2,724 accepted,
+  1,000 rejected, 0 differ: build/verify-nov27/verdicts.log; the script
+  is build/verify-nov27/frontend-verdicts.sh and -diff.sh: reuse it for
+  every parser or checker change). Build 6 (09:03 to 09:17) carried
+  BG232 (48a42687): rows for the encoders that had none on the three
+  architectures, their bytes llvm-mc's; tests/tooling/disasm-forms-
+  check.sh 30 of 30 (the build of 08:47 fails 21), tests/nattools/
+  enc_table_unit.fd ok on ccompile and emit, scripts/disasm-check.sh
+  18 ok with 0 words undecoded on AArch64 in test_machine_fast (8
+  before). scripts/check-stdlib.sh with the build of 09:17: 400 compiled, 1 failed.
+  PL4 has the evening's three counts. release/fid-night.exe is build 6;
+  release/fid-night-prev.exe is build 5.
+  The fast loop that worked for the disassembler: compile the unit test
+  through `fid ccompile` with the previous build (40 s); it runs the
+  tree's source, so rows are tried without a build. enc_table_unit's
+  own table check caught three slips of mine in the rows (example words
+  with operand bits as row values, the funct3 bits one digit off, a
+  lane bit fixed).
+  NEXT, IN THIS ORDER: (1) section D, rows 16 to 25 (verify only: each
+  entry's last "Left" line, run what fits one run); (2) the WebAssembly
+  list of PL4 when the machine is quiet (154 programs, an hour at
+  least); (3) BG256 only on a decision about function values across
+  tasks; (4) rows 27 to 36, one build each: BG235, BG203, BG228, BG230,
+  BG241 (lower.fd), BG209 to BG211 (lexer.fd, parser.fd), BG205, BG244
+  (codegen_c.fd), BG234, BG245 (nat_enc.fd).
