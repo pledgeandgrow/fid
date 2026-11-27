@@ -1037,6 +1037,21 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       expected lines (2g.96). Left: the reductions (red6, redk) are not
       vectorized, and the vectorizer's loops as MIR vector operations.
       Still partly.
+      Nov 27 (night, 19:10 run): tests/nattools/vectorize_spill_check.sh
+      with the -O2 build of 16:19: 32 ok, 6 fail, 12 skip (no runner here
+      for the Linux images). The gate looked its loops up by function name;
+      the Nov 27 inliner takes small functions whole, so wide, splats and
+      deep sit inside their caller `one`: the gate follows them now
+      (8f7a96af). Then wide, splats and many are vectorized through spill
+      slots on SSE2, AVX2 (wide's vectors are 32 bytes), NEON, RVV and
+      `--nat` Windows; deep stays scalar (more than 16 homes); with
+      FID_NAT_OFF=vzspill and with FID_NAT_OFF=vectorize every loop stays
+      scalar; `fid run` and ccompile print the expected lines. The 6
+      failures are one gap, the reductions red6 and redk: "not vectorized:
+      an instruction the vectorizer does not handle" on the five targets
+      (the Nov 25 compiler prints the same lines). Left: those reductions
+      in the vectorizer (nat_ir.fd, another session's file), then the
+      vectorizer's loops as MIR vector operations.
 - [x] TG12. Object files (COFF, ELF, Mach-O) from the same writer as executables,
       for linking with C (release F4) (M).
       Nov 16, ELF: `fid emit <file> --obj --target <linux> -o x.o` (main.fd
@@ -1777,6 +1792,11 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       entry and again at the call, hints or not. Left: x0-x7 in the pool
       where the generator does not need them (a change of the machine
       layer's design, MI's grade); the native suite. Still partly.
+      Nov 27 (night, 19:10 run): the native suite ran, the whole of
+      tests/bootstrap on `--nat` Windows with the -O2 build of 16:19
+      (WP14's note of the evening): none of its 7 `--nat`-only failures
+      (MI14's entry) is one of argument passing, and wp6_args_check.sh is
+      23 ok. Left: AArch64's pool (the note of the day).
 - [~] WP7. `__env` dropped from functions that never read it, at every call (S).
       `iro_env_trim` (`compiler/iropt.fd`): removes `params[0]` and the
       matching `args[0]` at every direct `Inst::Call`. Address-taken
