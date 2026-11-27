@@ -277,16 +277,20 @@ FID=release/fid.exe JOBS=4 bash scripts/cross-test.sh aarch64-linux
 > Project-wide numbers are kept in docs/reference/selfhost.md → "Numbers"
 > (CURRENT.md was removed on Nov 8); keep the two in step.
 >
-> Nov 27, afternoon (the LLVM roadmap): SP6, LF20 and SP7 are marked done
-> in docs/roadmap/llvm-roadmap.md (163 done, 33 partly), each with its gate
-> green on a one-stage -O2 build of the tree (16:19, all 16 units at -O2,
-> `check compiler/main.fd` clean in 29 s). CF32 and CF37 are closed (four
-> conformance gaps left: CF33 to CF36). The gates of MI14, SP16, TG11 and
-> WP6 are green after their defects were fixed; those goals stay partly
-> done for what their entries name. Each of the 19 partly-done goals whose
-> code sits in files another session edits says in its entry what is
-> exactly left (docs/roadmap/goal-workflow.md, section A, has the queue).
->
+> Nov 27, afternoon and evening (the LLVM roadmap): SP6, LF20, SP7, WP14,
+> LF16, LF14 and LF11 are marked done in docs/roadmap/llvm-roadmap.md (167
+> done, 29 partly), each on a one-stage -O2 build of the tree (16:19, all
+> 16 units at -O2, `check compiler/main.fd` clean in 29 s,
+> `release/fid-night.exe`). The whole of tests/bootstrap (2,056 programs)
+> ran on emit and `--nat` with it: 2,011 pass; no verdict changes with
+> specialization and versioning off, with the sole-owner pass on, or with
+> the Vec scalar-replacement pass on. CF32 and CF37 are closed (four
+> conformance gaps left: CF33 to CF36). The gates of MI14, SP16, TG11,
+> WP6, RA1 and SP9 are green after their defects were fixed; those goals
+> stay partly done for what their entries name. Each of the 19 partly-done
+> goals whose code sits in files another session edits says in its entry
+> what is exactly left (docs/roadmap/goal-workflow.md, section A, has the
+> queue).
 > Nov 27: v0.8.5-unstable is being prepared from be36317 ("0.8.5
 > unstable"). Its fid.exe is a ONE-STAGE build from a self-hosted stage 0,
 > not a 3-stage fixpoint (the last fixpoint is Nov 21, below). The newest
@@ -524,10 +528,12 @@ RECENT IMPROVEMENTS:
                   fwd3 stays: x0-x7 are no pool registers there). Build
                   script: the retry of a failed unit keeps the C flags,
                   SPLIT_OPT picks the first level, the last line is true.
-                  Started at 17:04 and recorded in the goal-workflow run
-                  log when they end: the whole-suite legs for WP14, LF11,
-                  LF16 and LF14 (build/llvm19/suite-*.raw); the gates RA1,
-                  LF11 and SP9 wait for them.
+                  The whole of tests/bootstrap (2,056 programs) ran on
+                  emit and `--nat` with the build of 16:19: 2,011 pass,
+                  and no verdict changes with specialization and
+                  versioning off, with soleown on or with vecsroa on
+                  (WP14, LF11, LF16, LF14 done). SP9's four checks pass
+                  (FID_PAR stays opt-in); RA1's gate 132 same.
   Nov 24–27       (0dcfe61a … be36317; v0.8.5-unstable prepared Nov 27,
                   its fid.exe a one-stage build from a self-hosted stage 0).
                   Checked Nov 25 with a fid built from the 905d756b tree:
