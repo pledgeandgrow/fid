@@ -16668,14 +16668,16 @@ fn ng_alloc_quiet(g: &mut NatGen, rec: &NatFnRec) -> NatAlloc {
 // parameters and slots of such locals (IrFunction.secret_values, Nov 18);
 // what is loaded from one, stored into one,
 // or computed from a secret value (any operand) is secret too, to a fixed
-// point over the function. A piece of a split value (RA4) is as secret as
-// the value. They are noted per function when it is lowered
+// point over the function, and in the machine IR so is what selection
+// makes of them (ng_secret_mir: a computed value, the source of a copy).
+// A piece of a split value (RA4) is as secret
+// as the value. They are noted per function when it is lowered
 // (ng_secret_note: "<name>:<vreg>" -> 1, "<name>" -> how many) and read by
 // the allocator (ng_secret_weights). `FID_NAT_OFF=secretregs`: the weights
 // as they were. Only with spill weights (RA5, `weights`; not the fast
 // allocator of RA14, which has none). `--stats` prints an `[lf20]` line
-// per secret function: its secret values, how many took a register, and
-// the registers each return zeroes (ng_wipe_regs).
+// per secret function: the secret values its machine IR holds, how many
+// took a register, and the registers each return zeroes (ng_wipe_regs).
 var g_ng_sec: i64 = 0;
 
 /// LF20: 1 for each IR value of `func` (ids below n) that holds a secret
@@ -16807,6 +16809,70 @@ fn ng_secret_at(name: str, i: i64) -> bool {
     return HashMap_contains(g_ng_sec, name + ":" + int_to_str(v));
 }
 
+/// LF20: for each vreg of `rec` (index below nv): 0 no secret, 1 a secret
+/// the machine IR never names, 2 a secret it does. The secrets are the IR
+/// values ng_secret_at marks and, as the IR's list stops at its own values,
+/// what selection makes of them: a value an instruction computes from one
+/// (a two-address sum, an address) and the source of a copy of one (the
+/// same value under its first name: `k = key * 31 + 7` is secret as the
+/// stored k, and is that product for two instructions before the copy).
+/// An IR value with no machine life (the alloca of a local, the id of a
+/// store, a load the mid-end forwarded away) is in no register and in no
+/// memory: `--stats` does not count it.
+fn ng_secret_mir(rec: &NatFnRec, nv: i64) -> Vec<i64> {
+    var sec: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < nv {
+        if ng_secret_at(rec.name, i) {
+            sec.push(1);
+        } else {
+            sec.push(0);
+        }
+        i = i + 1;
+    }
+    var changed: bool = true;
+    var round: i64 = 0;
+    while changed && round < 16 {
+        changed = false;
+        round = round + 1;
+        var k: i64 = 0;
+        while k < rec.mir.len() {
+            var m: MInst = rec.mir.get(k);
+            var um: i64 = mi_use_mask(m.op);
+            var from: bool = false;
+            var f: i64 = 0;
+            while f < 3 {
+                var v: i64 = mi_field(m, f);
+                if v >= NG_VBASE && v - NG_VBASE < nv {
+                    var vi: i64 = v - NG_VBASE;
+                    if sec.get(vi) == 1 {
+                        sec.set(vi, 2);
+                    }
+                    if f > 0 && (um & (1 << f)) != 0 && sec.get(vi) != 0 {
+                        from = true;
+                    }
+                }
+                f = f + 1;
+            }
+            if mi_defines(m.op) && m.r0 >= NG_VBASE && m.r0 - NG_VBASE < nv {
+                var di: i64 = m.r0 - NG_VBASE;
+                if from && sec.get(di) == 0 {
+                    sec.set(di, 2);
+                    changed = true;
+                } else if m.op == MO_MOV && sec.get(di) != 0 {
+                    var sv: i64 = mi_field(m, 1);
+                    if sv >= NG_VBASE && sv - NG_VBASE < nv && sec.get(sv - NG_VBASE) == 0 {
+                        sec.set(sv - NG_VBASE, 2);
+                        changed = true;
+                    }
+                }
+            }
+            k = k + 1;
+        }
+    }
+    return sec;
+}
+
 /// LF20: raise the spill weight of each secret value of `rec` (and of its
 /// copy class's representative, which the scan allocates) above every
 /// other weight; a rematerialized value is left alone (it is recomputed,
@@ -16815,11 +16881,12 @@ fn ng_secret_weights(rec: &NatFnRec, nv: i64, crep: &mut Vec<i64>, remat: &Vec<i
     if !rec.secret || weight.len() != nv || !ng_on("secretregs") || !ng_secret_has(rec.name) {
         return 0;
     }
+    var sec: Vec<i64> = ng_secret_mir(rec, nv);
     var big: i64 = 1 << 40;
     var c: i64 = 0;
     var i: i64 = 0;
     while i < nv {
-        if !ng_remat_is(remat.get(i)) && ng_secret_at(rec.name, i) {
+        if !ng_remat_is(remat.get(i)) && sec.get(i) == 2 {
             var r: i64 = ng_find(crep, i);
             weight.set(r, weight.get(r) + big);
             if r != i {
@@ -16833,14 +16900,18 @@ fn ng_secret_weights(rec: &NatFnRec, nv: i64, crep: &mut Vec<i64>, remat: &Vec<i
 }
 
 /// LF20 (`--stats`): `[lf20] <fn>: S secret values, R in registers; each
-/// return zeroes W registers` (mask: the function's clobber mask).
+/// return zeroes W registers` (mask: the function's clobber mask). S is
+/// the number of secret values its machine IR holds (ng_secret_mir), R how
+/// many of them the allocator kept in a register: where a register would
+/// do, none is spilled.
 fn ng_secret_stats(g: &mut NatGen, rec: &NatFnRec, nv: i64, assign: &Vec<i64>, remat: &Vec<i64>, mask: i64) {
     var s: i64 = 0;
     var r: i64 = 0;
     if ng_secret_has(rec.name) {
+        var sec: Vec<i64> = ng_secret_mir(rec, nv);
         var i: i64 = 0;
         while i < nv {
-            if !ng_remat_is(remat.get(i)) && ng_secret_at(rec.name, i) {
+            if sec.get(i) == 2 && !ng_remat_is(remat.get(i)) {
                 s = s + 1;
                 if assign.get(i) >= 0 {
                     r = r + 1;

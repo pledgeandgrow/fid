@@ -2395,7 +2395,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
 - [x] LF19. `@zeroize` stores kept by DSE (a pass may not remove them) (S).
       iropt's `dse` never touches `zeroize_locals` (`iro_backend_reads`;
       its overwritten-store part since Nov 15 through `ime_backend_reads`).
-- [~] LF20. `@secret` values never spilled to memory unencrypted where a register
+- [x] LF20. `@secret` values never spilled to memory unencrypted where a register
       will do, and their spill slots cleared (M).
       Nov 16, pe_ir half (compiler/pe_ir.fd `PeirGen_wipe_frame`, not run
       yet): a function with an `@zeroize` local or `@constant_time` zeroes
@@ -2432,6 +2432,28 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       above every spill choice; machine_lf20_check's 3-of-8 was measured
       on the memory-starved fidesc-built class — re-run it on a
       self-hosted-lineage binary before touching the allocator again.
+      Nov 27 (day): done, on a self-hosted build (a mixed -O1/-O0 one: the
+      machine's commit limit left no room for -O2 that afternoon; the code
+      is what counts). The 3-of-8 was the statistic, not the allocator.
+      FID_NAT_DUMP's final listing showed every value derived from k and s
+      of `pressure` in a register on the four targets, and no load or store
+      touching one but k's own @zeroize slot; with FID_NAT_OFF=secretregs s
+      spills. The five "missing" were IR ids with no machine life (the
+      alloca of a local, the id of a store, a load the mid-end forwarded
+      away). compiler/nat_ir.fd ng_secret_mir: the secret set follows what
+      selection makes of a secret too (a value an instruction computes from
+      one, the source of a copy of one), and the weights and the `[lf20]`
+      line count the secrets the machine IR holds. Gates, with the gate's
+      four defects fixed first (f10eb6a1: a working WSL only, the image
+      compared instead of its size, the zeroings counted by objdump on
+      every target, Windows included): machine_lf20_check.sh 44 ok, 0 fail
+      (`pressure` keeps all 48 secret values in registers on x86_64,
+      AArch64, RISC-V and `--nat`; 10 zeroings of the last float register
+      on each, 0 with the switch off; the expected output on Windows with
+      secretregs off and with wiperegs off) and machine_lf20_param_check.sh
+      22 ok, 0 fail (press_param and press_local keep all 47, assigned 12;
+      44 of 47 with the preference off). Not run here: the three Linux
+      targets' images (no runner); CI's cross lanes have them.
 - [~] LF21. Regions freed in one step instead of object by object (release C6) (M).
       Checked Nov 16: blocked on a design decision (competitive OP29): an
       arena that takes every allocation while a region runs would free
