@@ -127,7 +127,7 @@ case "${CC_CMD[*]}" in *tcc*) ;; *)
     # no message, usually builds by itself); one that still fails, or a
     # failed link, stops the build with exit 1. Before, any failure fell
     # back to one unit at -O0 (a ~17x slower fid) and the script exited 0.
-    objs=(); pids=(); pid_units=(); failed=()
+    objs=(); pids=(); pid_units=(); failed=(); retried=()
     for k in $(seq 0 $((SPLIT - 1))); do
       "${CC_CMD[@]}" "${SPLIT_CFLAGS[@]}" -c "${base}_$k.c" -o "${base}_$k.o" >> "$OUT/fid-dev.cc.log" 2>&1 &
       pids+=($!)
@@ -160,7 +160,6 @@ case "${CC_CMD[*]}" in *tcc*) ;; *)
         # optimization level above -O0 even on a big machine (the stage0
         # cross-build measured this): fall to -O1, then -O0, per unit
         final=()
-        retried=()
         retry_opts=()
         case "$SPLIT_OPT" in -O2) retry_opts=(-O1 -O0) ;; -O1) retry_opts=(-O0) ;; esac
         for fu in "${still[@]}"; do
