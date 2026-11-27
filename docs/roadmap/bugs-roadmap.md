@@ -2032,7 +2032,7 @@ names are the reference.
       read, read_line sets the EOF flag after the first line, and the next
       call returns an empty line. Read only (needs a real console).
       Confidence: medium.
-- [ ] BG208. **disasm: `vzeroupper` (VEX `C5 F8 77`) swallows the next
+- [x] BG208. **disasm: `vzeroupper` (VEX `C5 F8 77`) swallows the next
       instruction.** disasm.fd, VEX branch of the x86 decoder: with no table
       row, the length assumes a ModRM byte follows, which `0F 77` does not
       have. Evidence: `test_simd_native.fd` built `--target x86_64-linux --cpu
@@ -2040,6 +2040,12 @@ names are the reference.
       `cmp r12, r14`; with nop padding it swallowed 5 bytes. Affects `fid
       disasm`, `explain` and the disasm checks. Confirmed Nov 24. Confidence:
       high.
+      Fixed Nov 27 (night): the VEX branch reads 0F 77 itself (`vzeroupper`,
+      `vzeroall` by the L bit), three bytes, before the row lookup that took
+      the next byte for a ModRM. Check tests/tooling/disasm-forms-check.sh
+      (`c5 f8 77 4d 39 f4` is `vzeroupper` then `cmp r12, r14`; `c5 fc 77` is
+      `vzeroall`): fails both with the compiler of Nov 25, passes with the
+      one built from this tree (7b06ce65).
 - [ ] BG209. **F-string: an escaped brace becomes an interpolation.** lexer.fd
       `read_fstring` decodes `\xHH`/`\u{..}` outside braces into the raw text,
       and parser.fd `parse_fstring_parts` then takes that `{` as a part start.
@@ -2061,7 +2067,7 @@ names are the reference.
       `println(f"{str_len("a}c")}");` gives "unterminated string" on a later
       line; `"a{c"` gives "unterminated f-string": a valid program is
       rejected. BG101 fixed only fmt.fd. Confirmed Nov 24. Confidence: high.
-- [ ] BG212. **Comptime does not evaluate float/int casts, so arithmetic on
+- [x] BG212. **Comptime does not evaluate float/int casts, so arithmetic on
       them fails.** comptime_eval.fd `evaluate_with_env`, `Expr::Cast`: a cast
       of a non-int value returns `Cast(v, ty)` unchanged and an int-to-f64
       cast stays a `Cast` node. Triggers: `comptime fn avg(a: i64, b: i64) ->
@@ -2069,6 +2075,19 @@ names are the reference.
       evaluate binop on non-literal"), `comptime (-(7.9 as i64))` ("cannot
       negate non-number"); reference §4.11 makes both fatal. Confirmed Nov 24.
       Confidence: high.
+      Fixed Nov 27 (night): `evaluate_with_env`'s `Expr::Cast` makes an
+      integer to a float a `FloatLit`, and a float to an integer the
+      truncated value (toward zero, as at run time; unsigned targets tag it;
+      a float out of the integer's range is "comptime cast: ... does not fit
+      in ...", as comptime overflow is); a float to a float is itself.
+      Tests test_bg212_comptime_cast (both triggers, 7.9 and -7.9 to i64, a
+      fraction, an unsigned target, a float to a float) and
+      test_bg212_comptime_cast_range_fail: pass on run, ccompile and emit
+      with the compiler built from this tree (7b06ce65); the f-string,
+      lifetime, borrow and comptime programs already in the tree pass with
+      it as with the compiler of Nov 25 (321 of 324; the three fail with
+      both: test_frontend_comptime_if_assign, s4_11_comptime_if_generic and
+      s8_2_null_deref_panics).
 - [ ] BG213. **C header parser evaluates unsigned macro arithmetic as
       signed.** cparser.fd `CpEval`/`CpExpr` drop the `u`/`U` suffix and
       unsigned operands: `#define UDIV (-1u / 2)` gives 0 (C: 2147483647),
@@ -2308,13 +2327,20 @@ names are the reference.
       `vfmv.f.s`, `vfmv.v.f` (TG11). They print as `.byte`/`.word` (length
       kept). docs/file-analysis/disasm.md says each encoder has a row.
       Confirmed Nov 24. Confidence: high.
-- [ ] BG233. **disasm one-byte forms ignore the 0x66 operand-size prefix and
+- [x] BG233. **disasm one-byte forms ignore the 0x66 operand-size prefix and
       REX.B.** disasm.fd one-byte opcode cases: `66 B8 34 12` decodes as `mov
       eax, 0x90901234` (imm32, wrong length; want `mov ax, 0x1234`), `66 99`
       as `cdq` (want `cwd`), `49 90` as `nop` (want `xchg r8, rax`), `F3 90`
       as `nop` (want `pause`). The compiler does not emit these; `disasm
       --raw` and `asm!` output can contain them. Confirmed Nov 24. Confidence:
       high.
+      Fixed Nov 27 (night): the register field of `mov r, imm` and its `z`
+      immediate follow the 0x66 prefix (16-bit, two bytes); `99` is `cwd`
+      under 0x66; `90` is `pause` after F3 and `xchg r8, rax` with REX.B.
+      Check tests/tooling/disasm-forms-check.sh (the four triggers, each
+      with its length, and what they are without the prefix; 7 checks):
+      fails 6 of 7 with the compiler of Nov 25, passes all 7 with the one
+      built from this tree (7b06ce65).
 - [ ] BG234. **The ELF `.text` section header spans code, data and the RW
       segment.** nat_enc.fd `nat_elf_debug_sections` writes one `.text` header
       flagged WAX over the whole image even after nat_elf_img splits it into
