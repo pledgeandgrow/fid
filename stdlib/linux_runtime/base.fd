@@ -3903,24 +3903,161 @@ pub fn pert_str_to_int(s: i64) -> i64 {
     return v;
 }
 
-fn pe_pow10(k: i64) -> f64 {
-    var p: f64 = 1.0;
+// ─── Text as a float, correctly rounded (BG206) ──────────────────────────
+// A big integer as little-endian 32-bit limbs in a Vec<i64>: a limb times a
+// factor below 2^31 and its carry stay inside 63 bits.
+
+/// a *= m (m below 2^31).
+fn pe_s2f_mul_small(a: &mut Vec<i64>, m: i64) -> void {
+    var carry: i64 = 0;
     var i: i64 = 0;
-    while i < k {
-        p = p * 10.0;
+    while i < a.len() {
+        var x: i64 = a.get(i) * m + carry;
+        a.set(i, x & 4294967295);
+        carry = x >> 32;
         i = i + 1;
     }
-    return p;
+    if carry > 0 {
+        a.push(carry);
+    }
 }
 
-/// atof: sign, digits, fraction, exponent. Exact (as strtod) whenever the
-/// digits fit in 53 bits and the power of ten is at most 10^22.
+/// a += v (v below 2^32).
+fn pe_s2f_add_small(a: &mut Vec<i64>, v: i64) -> void {
+    var carry: i64 = v;
+    var i: i64 = 0;
+    while carry > 0 && i < a.len() {
+        var x: i64 = a.get(i) + carry;
+        a.set(i, x & 4294967295);
+        carry = x >> 32;
+        i = i + 1;
+    }
+    if carry > 0 {
+        a.push(carry);
+    }
+}
+
+/// a <<= s (s below 32).
+fn pe_s2f_shl(a: &mut Vec<i64>, s: i64) -> void {
+    var carry: i64 = 0;
+    var i: i64 = 0;
+    while i < a.len() {
+        var x: i64 = (a.get(i) << s) | carry;
+        a.set(i, x & 4294967295);
+        carry = x >> 32;
+        i = i + 1;
+    }
+    if carry > 0 {
+        a.push(carry);
+    }
+}
+
+/// a *= 10^k.
+fn pe_s2f_mul_pow10(a: &mut Vec<i64>, k: i64) -> void {
+    var n9: i64 = k / 9;
+    var i: i64 = 0;
+    while i < n9 {
+        pe_s2f_mul_small(a, 1000000000);
+        i = i + 1;
+    }
+    var r: i64 = k % 9;
+    while r > 0 {
+        pe_s2f_mul_small(a, 10);
+        r = r - 1;
+    }
+}
+
+/// The number of bits of a (0 for zero).
+fn pe_s2f_bits(a: &Vec<i64>) -> i64 {
+    var n: i64 = a.len();
+    if n == 0 {
+        return 0;
+    }
+    var top: i64 = a.get(n - 1);
+    var b: i64 = 0;
+    while top > 0 {
+        top = top >> 1;
+        b = b + 1;
+    }
+    return (n - 1) * 32 + b;
+}
+
+/// Bit j of a, counting from 0.
+fn pe_s2f_bit(a: &Vec<i64>, j: i64) -> i64 {
+    var li: i64 = j / 32;
+    if li >= a.len() {
+        return 0;
+    }
+    return (a.get(li) >> (j % 32)) & 1;
+}
+
+fn pe_s2f_is_zero(a: &Vec<i64>) -> bool {
+    var i: i64 = 0;
+    while i < a.len() {
+        if a.get(i) != 0 {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Whether r is at least d. r may have limbs above d's length: a shift
+/// left can carry one into them before the subtraction below takes it back.
+fn pe_s2f_ge(r: &Vec<i64>, d: &Vec<i64>) -> bool {
+    var i: i64 = r.len() - 1;
+    while i >= d.len() {
+        if r.get(i) != 0 {
+            return true;
+        }
+        i = i - 1;
+    }
+    while i >= 0 {
+        if r.get(i) != d.get(i) {
+            return r.get(i) > d.get(i);
+        }
+        i = i - 1;
+    }
+    return true;
+}
+
+/// r -= d, r being at least d, over the whole length of r.
+fn pe_s2f_sub(r: &mut Vec<i64>, d: &Vec<i64>) -> void {
+    var borrow: i64 = 0;
+    var i: i64 = 0;
+    while i < r.len() {
+        var dv: i64 = 0;
+        if i < d.len() {
+            dv = d.get(i);
+        }
+        var x: i64 = r.get(i) - dv - borrow;
+        if x < 0 {
+            x = x + 4294967296;
+            borrow = 1;
+        } else {
+            borrow = 0;
+        }
+        r.set(i, x);
+        i = i + 1;
+    }
+}
+
+/// atof: sign, digits, fraction, exponent; correctly rounded, as strtod
+/// (BG206). The digits read make an integer D and a power of ten E (the
+/// value is D * 10^E); when E is negative the value is D / 10^-E, and the
+/// leading bits of that quotient come from a division bit by bit. At most
+/// 800 significant digits are read exactly (a midpoint of two doubles has
+/// at most 767); a non-zero digit beyond them only says "a little more",
+/// which cannot turn a rounding around: such an input has over 490 fraction
+/// digits, so the dropped part is under 10^-489, and the smallest gap that
+/// could matter is a unit of the last digit read. inf on overflow, 0 on
+/// underflow, the sign of a zero kept.
 pub fn pert_str_to_float(s: i64) -> f64 {
     if s == 0 {
         return 0.0;
     }
     var i: i64 = 0;
-    while pe_ldb(s + i) == 32 || pe_ldb(s + i) == 9 || pe_ldb(s + i) == 10 {
+    while pe_ldb(s + i) == 32 || pe_ldb(s + i) == 9 || pe_ldb(s + i) == 10 || pe_ldb(s + i) == 13 {
         i = i + 1;
     }
     var neg: bool = false;
@@ -3930,30 +4067,49 @@ pub fn pert_str_to_float(s: i64) -> f64 {
     } else if pe_ldb(s + i) == 43 {
         i = i + 1;
     }
-    var mant: i64 = 0;
-    var digits: i64 = 0;
-    var exp10: i64 = 0;
-    while pe_ldb(s + i) >= 48 && pe_ldb(s + i) <= 57 {
-        if digits < 18 {
-            mant = mant * 10 + (pe_ldb(s + i) - 48);
-            digits = digits + 1;
+    var d: Vec<i64> = Vec::new();
+    d.push(0);
+    var nd: i64 = 0;
+    var e10: i64 = 0;
+    var more: bool = false;
+    var c: i64 = pe_ldb(s + i);
+    while c >= 48 && c <= 57 {
+        if nd == 0 && c == 48 {
+            // a leading zero is no digit
+        } else if nd < 800 {
+            pe_s2f_mul_small(&mut d, 10);
+            pe_s2f_add_small(&mut d, c - 48);
+            nd = nd + 1;
         } else {
-            exp10 = exp10 + 1;
+            e10 = e10 + 1;
+            if c != 48 {
+                more = true;
+            }
         }
         i = i + 1;
+        c = pe_ldb(s + i);
     }
-    if pe_ldb(s + i) == 46 {
+    if c == 46 {
         i = i + 1;
-        while pe_ldb(s + i) >= 48 && pe_ldb(s + i) <= 57 {
-            if digits < 18 {
-                mant = mant * 10 + (pe_ldb(s + i) - 48);
-                digits = digits + 1;
-                exp10 = exp10 - 1;
+        c = pe_ldb(s + i);
+        while c >= 48 && c <= 57 {
+            if nd == 0 && c == 48 {
+                e10 = e10 - 1;
+            } else if nd < 800 {
+                pe_s2f_mul_small(&mut d, 10);
+                pe_s2f_add_small(&mut d, c - 48);
+                nd = nd + 1;
+                e10 = e10 - 1;
+            } else {
+                if c != 48 {
+                    more = true;
+                }
             }
             i = i + 1;
+            c = pe_ldb(s + i);
         }
     }
-    if pe_ldb(s + i) == 101 || pe_ldb(s + i) == 69 {
+    if c == 101 || c == 69 {
         i = i + 1;
         var eneg: bool = false;
         if pe_ldb(s + i) == 45 {
@@ -3964,44 +4120,135 @@ pub fn pert_str_to_float(s: i64) -> f64 {
         }
         var e: i64 = 0;
         while pe_ldb(s + i) >= 48 && pe_ldb(s + i) <= 57 {
-            if e < 10000 {
+            if e < 100000 {
                 e = e * 10 + (pe_ldb(s + i) - 48);
             }
             i = i + 1;
         }
         if eneg {
-            exp10 = exp10 - e;
+            e10 = e10 - e;
         } else {
-            exp10 = exp10 + e;
+            e10 = e10 + e;
         }
     }
-    var v: f64 = mant as f64;
-    if exp10 > 0 {
-        if exp10 <= 22 {
-            v = v * pe_pow10(exp10);
+    var bits: i64 = 0;
+    if nd == 0 {
+        // zero (the sign is put below)
+    } else if nd - 1 + e10 > 308 {
+        bits = 9218868437227405312;
+    } else if nd - 1 + e10 >= -400 {
+        var n: Vec<i64> = d;
+        var den: Vec<i64> = Vec::new();
+        den.push(1);
+        if e10 >= 0 {
+            pe_s2f_mul_pow10(&mut n, e10);
         } else {
-            var k: i64 = 0;
-            while k < exp10 && k < 400 {
-                v = v * 10.0;
-                k = k + 1;
-            }
+            pe_s2f_mul_pow10(&mut den, 0 - e10);
         }
-    } else if exp10 < 0 {
-        var ne: i64 = 0 - exp10;
-        if ne <= 22 {
-            v = v / pe_pow10(ne);
-        } else {
-            var k2: i64 = 0;
-            while k2 < ne && k2 < 400 {
-                v = v / 10.0;
-                k2 = k2 + 1;
+        // 57 quotient bits from the leading one, whose weight is at least
+        // (the bits of n) - (the bits of den): n is shifted to make that so
+        var shifted: i64 = 0;
+        var need: i64 = pe_s2f_bits(&den) + 56 - pe_s2f_bits(&n);
+        while need > 0 {
+            var st: i64 = need;
+            if st > 31 {
+                st = 31;
             }
+            pe_s2f_shl(&mut n, st);
+            shifted = shifted + st;
+            need = need - st;
+        }
+        // The division: bit by bit, the remainder r in the length of den.
+        // q collects the quotient bits (want of them, from the leading one
+        // of weight p1); what comes after is only noted (a 0, a 1 seen).
+        var nl: i64 = den.len();
+        var r: Vec<i64> = Vec::new();
+        var z: i64 = 0;
+        while z < nl {
+            r.push(0);
+            z = z + 1;
+        }
+        var bn: i64 = pe_s2f_bits(&n);
+        var q: i64 = 0;
+        var got: i64 = 0;
+        var p1: i64 = 0;
+        var want: i64 = 57;
+        var t_any0: bool = false;
+        var t_any1: bool = false;
+        var j: i64 = bn - 1;
+        while j >= 0 || got < want {
+            pe_s2f_shl(&mut r, 1);
+            if j >= 0 && pe_s2f_bit(&n, j) == 1 {
+                var low0: i64 = r.get(0) | 1;
+                r.set(0, low0);
+            }
+            var qb: i64 = 0;
+            if pe_s2f_ge(&r, &den) {
+                pe_s2f_sub(&mut r, &den);
+                qb = 1;
+            }
+            if got == 0 {
+                if qb == 1 {
+                    got = 1;
+                    p1 = j - shifted;
+                    q = 1;
+                    if p1 < -1022 {
+                        // below the normals the unit is 2^-1074: the bits
+                        // are kept down to 5 under it
+                        want = p1 + 1080;
+                    }
+                }
+            } else if got < want {
+                q = (q << 1) | qb;
+                got = got + 1;
+            } else {
+                if qb == 1 {
+                    t_any1 = true;
+                } else {
+                    t_any0 = true;
+                }
+                got = got + 1;
+            }
+            j = j - 1;
+        }
+        // what is left of the value: a 1 after the bits kept, a remainder,
+        // or digits not read
+        var rest: bool = t_any1 || !pe_s2f_is_zero(&r) || more;
+        if p1 >= -1022 {
+            // a normal: 53 bits of mantissa, the low 4 of q decide
+            var m: i64 = q >> 4;
+            var low: i64 = q & 15;
+            if low > 8 {
+                m = m + 1;
+            } else if low == 8 && (rest || (m & 1) == 1) {
+                m = m + 1;
+            }
+            if m == 9007199254740992 {
+                m = 4503599627370496;
+                p1 = p1 + 1;
+            }
+            if p1 > 1023 {
+                bits = 9218868437227405312;
+            } else {
+                bits = ((p1 + 1023) << 52) | (m & 4503599627370495);
+            }
+        } else {
+            // a subnormal: an integer number of 2^-1074, the low 5 decide;
+            // 2^52 of them is the least normal
+            var m2: i64 = q >> 5;
+            var extra: i64 = q & 31;
+            if extra > 16 {
+                m2 = m2 + 1;
+            } else if extra == 16 && (rest || (m2 & 1) == 1) {
+                m2 = m2 + 1;
+            }
+            bits = m2;
         }
     }
     if neg {
-        return 0.0 - v;
+        bits = bits - 9223372036854775808;
     }
-    return v;
+    return p_f64_from_bits(bits);
 }
 
 // ─── Floats as text ─────────────────────────────────────────────────────
