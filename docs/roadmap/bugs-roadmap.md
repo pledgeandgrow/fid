@@ -2234,9 +2234,14 @@ names are the reference.
 - [ ] BG237. **`fid fmt --check file.fd` (flag before the file) reads the flag
       as the file name** ("could not read file: --check", exit 1); `fid fmt
       file.fd --check` works. Confirmed Nov 24. Confidence: high.
-- [ ] BG238. **`Money_print` writes negative amounts wrong.** stdlib/money.fd:
+- [x] BG238. **`Money_print` writes negative amounts wrong.** stdlib/money.fd:
       `Money_new(-5)` prints `$0.0-5` and `-105` prints `$-1.0-5` (want
       `-$0.05`, `-$1.05`). Confirmed Nov 24. Confidence: high.
+      Fixed Nov 27: `Money_print` writes the sign once, in front, and prints
+      the absolute dollars and cents (it negates after the split by 100, so
+      the smallest i64 does not overflow). Test test_bg238_money_negative
+      (-5, -105, 0, 1234, 7, the smallest i64): passes on run, ccompile and
+      emit with the fid-dev of Nov 25; the 13 other money tests unchanged.
 - [ ] BG239. **`hkdf_expand` does not reject a length over 255 * 32.**
       stdlib/tls_crypto.fd `hkdf_expand`: the counter byte reaches 256 and the
       output stops following RFC 5869, where it should be an error. Read only.
