@@ -1,5 +1,47 @@
 # Fides Language Changelog
 
+## v0.8.6-unstable, the Nov 27 LLVM-roadmap batch (Nov 27, 2026)
+
+v0.8.6-unstable is prepared from the Nov 27 tree. Its `fid.exe` is a
+one-stage -O2 build from a self-hosted stage 0 (the zig build of 16:19,
+all 16 units at -O2), not a 3-stage fixpoint — the last fixpoint is
+Nov 21. `fid version` prints `fid 1.0.0+dev`. Checked with the same
+build: `check compiler/main.fd` clean in 29 s; the gates named below
+green; the first whole-suite record on `emit` and `--nat`.
+
+- **LLVM roadmap:** SP6 (function cache after an edit: 273/273/274
+  reused), SP7 (incremental relinking: `relink_check.sh` 21 ok on
+  x86-64, AArch64 and `--nat` Windows) and LF20 (`@secret` values in
+  registers: `ng_secret_mir` follows what selection makes of a secret,
+  48/48 in registers on the four targets) are done. CF32 and CF37 are
+  closed (a `@public` parameter of a `@constant_time` function is read
+  by its index in the source on every backend; the C path keeps its
+  null pointer checks). Four conformance gaps left: CF33 to CF36.
+- **Gates fixed and green:** `machine_mi14_check.sh` (33 ok),
+  `machine_fregs_check.sh` (25 ok), `machine_sp16_check.sh` (9 ok),
+  `wp6_args_check.sh` (23 ok). A gate that takes wsl.exe for a working
+  WSL now tests it first (`wsl.exe -e sh -c 'echo wsl-ok'`).
+- **Suite legs on `emit` and `--nat`** (the first record, Nov 27):
+  `on` 604 ok / 10 fail, `off` 1122 ok / 18 fail, `sole` 816 ok / 137
+  fail, `vec` 815 ok / 133 fail (2,056 files each).
+- **Release tooling fixed:** BG284 (`release-fresh.sh` no longer calls
+  every `RELEASE=1` build stale — `compiler/build_info.fd` is out of
+  the source hash) and BG365 (release.yml's Linux archive gets
+  FIDES_VERSION like the Windows installer).
+- **Build script:** a unit that fails is retried with the same flags
+  (the retry had none of them); `SPLIT_OPT` picks the level of the
+  first build; the summary line says what was built. On this machine
+  the commit limit, not free RAM, is the build wall — compare
+  `CommitLimit - CommittedBytes` before a build.
+- **Docs:** a whole-tree accuracy pass (counts, commands, API names,
+  error codes and every migration-record example verified against the
+  compiler); the scribe-generated docs are regrown — `docs/stdlib/`
+  403 module pages (118 before), `docs/compiler/` 65, `docs/tools/`
+  42, `docs/examples/` 12, each with a generated `index.md`.
+  `bugs-roadmap.md` records the Nov 27 whole-repo review (BG258–BG488)
+  and BG489 (`match` on a non-enum scrutinee with an enum pattern
+  passes `fid check` and crashes at runtime).
+
 ## Nov 27, afternoon: SP6, LF20 and SP7 of the LLVM roadmap; CF32 and CF37; the build script (Nov 27, 2026)
 
 Checked with two -O2 builds of the tree (15:52 and 16:19, one stage from
