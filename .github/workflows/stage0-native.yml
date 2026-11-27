@@ -1,0 +1,56 @@
+# stage0-native.yml — build the pinned stage-0 seed compilers natively on
+# each platform runner. The generated C is host-specialized (fid dump-c has
+# no --target), so cross-building linux/macOS seeds from one file cannot
+# work; these lanes build the real thing where it runs.
+#
+# Manual only: workflow_dispatch. Produces one artifact per platform named
+# after the release asset (fid-linux-arm64, fid-macos-x64, fid-macos-arm64).
+# Before pinning: download the artifact, smoke-test it (version, dump-c of
+# compiler/main.fd byte-identical twice), upload to the `stage0` release,
+# then write scripts/<asset>.sha256 with the hash and provenance.
+name: Stage-0 native seeds
+
+on:
+  workflow_dispatch:
+
+jobs:
+  seed:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04-arm
+            asset: fid-linux-arm64
+          - os: macos-13
+            asset: fid-macos-x64
+          - os: macos-15
+            asset: fid-macos-arm64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    steps:
+      - name: Check out with LF line endings (bash reads the scripts)
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mlugg/setup-zig@v2.2.1
+      - name: mold (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq mold
+      - name: coreutils (macOS)
+        if: runner.os == 'macOS'
+        run: brew install coreutils gnu-sed 2>/dev/null || true
+      - name: Build the Rust bootstrap compiler
+        run: cargo build --release
+      - name: Build fid (one stage, native)
+        run: CC="zig cc" ./scripts/build-selfhost.sh
+      - name: Smoke test
+        run: |
+          ./release/fid-dev version
+          ./release/fid-dev run tests/bootstrap/hello.fd 2>/dev/null | head -1
+      - name: Stage the asset
+        run: cp release/fid-dev "${{ matrix.asset }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+          retention-days: 30
