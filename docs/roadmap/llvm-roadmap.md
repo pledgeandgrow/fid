@@ -639,6 +639,21 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       reference, and some of them run minutes there. Left: the gate on the
       -O2 build of 16:19, release/fid-night.exe, then deleting pe_ir's
       allocator (MI17, the Windows default).
+      Nov 27 (day, evening): tests/nattools/ra1_pe_ra_off_check.sh with the
+      -O2 build of 16:19: 137 programs, 132 same, 0 off-fixes, 0 off-only
+      build failures, 4 built neither way
+      (test_frontend_comptime_if_assign, test_machine_selfhost_rt,
+      test_std_regmap, test_std_svd: plain `fid emit` does not build them
+      either way, as in the whole-suite run); the switch takes effect
+      (test_pe_ra_off's image differs; 25.9 MB of images with the
+      allocator, 36.6 MB without). One DIFF in the first pass,
+      test_lowering_async_generic_task: a task program whose lines change
+      order, or mingle, when the machine is loaded (both exit 0; the same
+      three times out of three on its own, with and without the allocator,
+      and it passes in the whole-suite run). The gate now builds and runs
+      such a program once more on its own before it counts it. Left:
+      deleting pe_ir's allocator, which waits for MI17 and the Windows
+      default.
 - [x] RA2. Liveness on MIR from use lists, live ranges as lists of segments with
       holes, not hulls (M).
       Done (Nov 17): liveness from use lists (`ng_use_liveness`;
@@ -2928,6 +2943,25 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       ran out of commit. FID_PAR stays opt-in. Left: those checks on the
       -O2 build of 16:19, release/fid-night.exe, the bench on a quiet
       machine, then on by default; step 3 (the type check in parallel).
+      Nov 27 (day, evening): the four checks pass with the -O2 build of
+      16:19, the first run on a built compiler.
+      tests/par/parse_par_check.sh with and without SELF=1: test_parse_par
+      as expected on ccompile and emit in 1, 2, 4 and 8 threads; the import
+      loop of compiler/main.fd could take all 71 modules ahead, 0 differ, 0
+      parsed again (with wrong names none is taken and 39 would differ);
+      `fid check` of ark, par_escape, http2 and parse_par gives the same
+      messages with FID_PAR=2/4/8, five times with 8, and with the parse
+      ahead off; dump-c identical with FID_PAR=4; FID_PP_VERIFY verifies 12
+      modules, 0 differ; a cold and a warm import cache give the same; with
+      SELF=1, compiler/main.fd checked sequential and with FID_PAR=8.
+      tests/par/imports_par_check.sh with and without SELF=1: ok. Bench
+      (tests/par/parse_par_bench.sh, the parse phase of compiler/main.fd's
+      71 modules, beside the RA1 gate): 1,859 ms on one thread, 890 on 2,
+      546 on 4, 328 on 8, 340 on 16; the loop's own parses 1,568 to 2,081
+      ms. Left: on by default (FID_PAR is read in compiler.fd, lexer.fd,
+      parser.fd, borrowck.fd, escape.fd and secrecy.fd; another session
+      edits lexer.fd, parser.fd and escape.fd today), step 3 (the type
+      check in parallel), the parallel code generation.
 - [x] SP10. No linear scans anywhere in the compiler: every lookup by name or id is
       a table (release CS8) (M).
       Competitive CS8: instructions, functions, strings, structs, methods,

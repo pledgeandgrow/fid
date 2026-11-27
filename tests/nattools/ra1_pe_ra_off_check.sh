@@ -88,6 +88,18 @@ same() {
     && [ "$(panic_key "$OUT/$1.$2.err")" = "$(panic_key "$OUT/$1.$3.err")" ] \
     && cmp -s <(tr -d '\r' < "$OUT/$1.$2.out" 2>/dev/null) <(tr -d '\r' < "$OUT/$1.$3.out" 2>/dev/null)
 }
+# A program whose two outputs differ is built and run once more on its own
+# before it is counted: a task program's lines can change order, or two of
+# its prints mingle, when the machine is loaded and two programs run at a
+# time (test_lowering_async_generic_task, Nov 27: a DIFF beside another
+# job, the same three times out of three on its own)
+for f in "${TESTS[@]}"; do
+  b=$(basename "$f" .fd)
+  if [ "$(cat "$OUT/$b.on.build_rc" 2>/dev/null)" = 0 ] && [ "$(cat "$OUT/$b.off.build_rc" 2>/dev/null)" = 0 ] && ! same "$b" on off; then
+    echo "ra1: $b differs; built and run again on its own"
+    REUSE="" one "$f"
+  fi
+done
 nsame=0; nfix=0; ndiff=0; noff=0; non=0; nnone=0; size_on=0; size_off=0
 : > "$OUT/results.txt"
 for f in "${TESTS[@]}"; do

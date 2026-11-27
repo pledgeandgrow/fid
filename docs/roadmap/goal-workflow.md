@@ -80,23 +80,18 @@
 
 ## First: record the background runs
 
-**Since Nov 27 17:05 (the interactive session of the afternoon): two jobs
-of that session run in the background, and no more than that: five side by
-side (four legs and the gates) made the machine crawl for a quarter of an
-hour and were stopped.** Do not start the two again; read them.
+**Nov 27 afternoon and evening (the interactive session): all its jobs are
+done and recorded.** The whole of tests/bootstrap (2,056 programs) ran with
+`release/fid-night.exe` (the -O2 build of 16:19) four times: `on` (emit and
+`--nat`, the default: WP14 and LF11), `off` (emit, FID_IROPT_OFF=spec,
+version), `sole` (emit, FID_IROPT_ON=soleown: LF16) and `vec` (emit,
+FID_IROPT_ON=vecsroa: LF14); `python build/llvm19/suite-diff.py on off sole
+vec` compares them (logs build/llvm19/suite-<name>.log and .raw). 2,011 of
+2,056 pass on emit and `--nat` together; no verdict changes with any pass
+on or off. The gates RA1, LF11 and SP9 ran after them (`FID=<fid> bash
+build/llvm19/gates.sh ra1 lf11 sp9`, logs build/llvm19/<gate>.log).
 
-| Marker | Result | Roadmap entries |
-|---|---|---|
-| (not running) the gates RA1, LF11 and SP9: once the two jobs below are done, `bash build/llvm19/gates.sh ra1 lf11 sp9` (one job; `GATES_DONE` then ends `build/llvm19/progress.log`) | `ra1.log` (RA1: `ra1_pe_ra_off_check.sh`), `version.log` (LF11: `version-default-check.sh`), `parse_par*.log` and `imports_par*.log` (SP9) | `RA1`, `LF11`, `SP9` |
-| `SUITE_DONE` at the end of each of `build/llvm19/suite-on.log`, `suite-off.log`, `suite-sole.log`, `suite-vec.log` | the whole of tests/bootstrap (2,056 programs) with `release/fid-night.exe` (the -O2 build of 16:19): `on` on emit and `--nat` (WP14 and LF11 as they are by default); `off`, `sole` and `vec` on emit with FID_IROPT_OFF=spec,version, FID_IROPT_ON=soleown, FID_IROPT_ON=vecsroa. `python build/llvm19/suite-diff.py on off sole vec` gives, per leg, the files it fails that `on` does not | `WP14` and `LF11` (`on` against `off`: no file fails with them on that passes with them off), `LF16` (`sole`), `LF14` (`vec`) |
-
-A leg is a pass's evidence only when it fails no file the default leg passes
-(a pass that turns one verdict is a bug: write it in the entry, file it in
-bugs-roadmap.md, leave the mark). A leg that died (`rc` other than 0 or 1
-with no `files pass` line, a fork failure) is not a result: run that leg
-again (`FID=release/fid-night.exe JOBS=3 bash build/llvm19/suite.sh <name> - ...`).
-
-Started at 01:26 with `release/fid-v27.exe`, output in `build/verify-nov27/`.
+Started at 01:26Started at 01:26 with `release/fid-v27.exe`, output in `build/verify-nov27/`.
 When a marker appears and the entry has no note of it, write the note, then
 set the queue row to `done`.
 
@@ -149,10 +144,10 @@ holds, with its gate green on a built compiler.
 | L6 | SP16 | gates only | the gate is green (9 ok); left: 2g.114, then the compiler built by `fid emit` |
 | L7 | TG11 | `compiler/iropt.fd` (the vectorizer) | verified: the checker failure is gone; left: the reductions (red6, redk), MIR vector operations |
 | L8 | WP6 | `compiler/nat_ir.fd` (AArch64's pool) | verified: 23 ok, 1 leg (x0-x7 are no pool registers there: MI's grade); the native suite |
-| L9 | SP9 | `compiler/parser.fd`, `lexer.fd`, `compiler.fd` (the other session's) | running: the four checks and the bench with the -O2 build of 16:19 (the job of 16:36); then: on by default, step 3 (type check in parallel) |
-| L10 | RA1 | `tests/nattools/ra1_pe_ra_off_check.sh` | running: the gate (137 programs, the job of 16:36); left after it: deleting pe_ir's allocator, which waits for MI17 and the Windows default |
-| L11 | LF11 | `tests/tooling/version-default-check.sh` | running: the gate (the job of 16:36); the suite legs `on` against `off` finished ~18:02 (604/10 against 1122/18, run log) |
-| L12 | WP14, LF16 | whole-suite legs | done ~18:02: `on` 604/10, `off` 1122/18, `sole` 816/137, `vec` 815/133 (emit and `--nat`; build/llvm19/suite-*.raw) — the first record of a whole-suite run on emit and `--nat` |
+| L9 | SP9 | `compiler/compiler.fd`, `lexer.fd`, `parser.fd`, `borrowck.fd`, `escape.fd`, `secrecy.fd` (the other session edits three of them) | verified Nov 27 evening: the four checks pass and the bench is in the entry; left: on by default, step 3 (type check in parallel), parallel code generation |
+| L10 | RA1 | `tests/nattools/ra1_pe_ra_off_check.sh` | verified Nov 27 evening: 132 same, 0 differ after the gate's second chance, switch takes effect; left: deleting pe_ir's allocator (waits for MI17 and the Windows default) |
+| L11 | LF11 | `tests/tooling/version-default-check.sh` | done (Nov 27 evening, be77cdf3: the gate 0 failed; the whole suite the same with versioning off) |
+| L12 | WP14, LF16 | whole-suite legs | done (Nov 27 evening, 748df914: the whole of tests/bootstrap on emit and `--nat`, 2,011 of 2,056; no verdict changes with any pass on or off; LF14 the same) |
 | L13 | MI5, MI17 | `compiler/pe_ir*.fd`, `nat_ir.fd` | waiting: BG248, BG249, BG251 (the other session's), then `tests/nattools/mi5_nat_peir_check.sh` again; the default switch is MI14's |
 | L14 | MI9, TG16, LF13, LF21 | MI9: SRA of local structs (`nat_ir.fd`); TG16: the port onto MIR (the other session builds tg16-fid-v5); LF13: the other producers, `Vec::new()`+push buffers (`lower.fd`); LF21: the region arena in the Linux runtime | waiting on the other session, or multi-week |
 
@@ -512,3 +507,19 @@ are the commit times.)
   programs, the job of 16:36) was still running, ra1.log empty; the
   doc-accuracy session recorded this, the gates' verdicts are for the
   queue's owner.
+- 18:00 to 18:55, the end of the afternoon's session. The four suite
+  legs: 2,011 of 2,056 on emit and `--nat`; the same 38 fail in every
+  leg (the suite's own on these backends), 7 more on `--nat` only
+  (MI14's entry); no verdict changes with specialization and versioning
+  off, with soleown on, or with vecsroa on. Marked done: WP14, LF16,
+  LF14 (748df914), LF11 (be77cdf3: version-default-check 0 failed once
+  it stops comparing the code addresses a panic trace prints). SP9's
+  four checks pass and the bench is in its entry (FID_PAR stays
+  opt-in: on by default is read in six modules, three of them another
+  session's today). RA1's gate: 132 same, 0 differ (one task program
+  raced under load; the gate gives such a one a second run on its
+  own). 7 of the 19 named goals are done (SP6, LF20, SP7, WP14, LF16,
+  LF14, LF11); 167 of 196 in the roadmap. An AppData check the user
+  asked for: the compiler's per-build caches in %TEMP% (1.2 GB), the
+  runner's expect* folders (3.8 GB), another agent's scratchpad (8.9
+  GB); no crash dumps; nothing deleted.
