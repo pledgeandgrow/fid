@@ -1,8 +1,10 @@
 // LG3 (docs/roadmap/competitive-roadmap.md): a read is checked against a
 // live mutable borrow, as a mutation is. These stay legal: the borrower's
 // last use is behind, the borrow is in a block that ended, the read is of
-// another field, a shared borrower reads beside the reader, and a method's
-// arguments read its receiver.
+// another field, a shared borrower reads beside the reader, a method's
+// arguments read its receiver, and a call's later arguments read beside a
+// mutable borrow an earlier argument made (the compiler's own source does
+// it: `f(&mut g.e, read(g))`).
 //
 // Expected output:
 // 5
@@ -11,6 +13,29 @@
 // 1 5
 // 18
 // 2
+// 10
+struct E {
+    c: Vec<i64>,
+}
+
+struct G {
+    e: E,
+    n: i64,
+}
+
+fn align(e: &mut E, k: i64) -> i64 {
+    return k + e.c.len();
+}
+
+fn want(g: &G, x: i64) -> i64 {
+    return g.n + x;
+}
+
+fn start(g: &mut G, x: i64) -> i64 {
+    // g is read in later arguments, also after a nested call has finished
+    return align(&mut g.e, want(g, x) + want(g, x));
+}
+
 struct S {
     x: i64,
     y: i64,
@@ -54,5 +79,10 @@ fn main() -> i64 {
     vec.push(1);
     vec.push(vec.len());
     println(vec.len());
+
+    // a call's later arguments read beside a mutable borrow an earlier
+    // argument made
+    var g2 = G { e: E { c: Vec::new() }, n: 4 };
+    println(start(&mut g2, 1));
     return 0;
 }

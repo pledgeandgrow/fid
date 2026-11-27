@@ -2691,11 +2691,34 @@ fn check_mutation(self: &mut BorrowChecker, var: str, line: i64) -> void {
 /// a mutable borrow of it or of a field under it is active, or of a path
 /// above it: the borrow may change it under the reader's eyes. Field-wise:
 /// a mutable borrow of `s.y` does not stop a read of `s.x`. Shared borrows
-/// may coexist with a read.
+/// may coexist with a read. While a call's arguments are evaluated, a
+/// mutable borrow one of its earlier arguments made (a temporary) counts as
+/// a shared one until the call, as for `v.push(v.len())`: `f(&mut g.e,
+/// read(g))`, also once a nested call of those arguments has activated it
+/// (bc_mut_held_by_non_temp). The reference rule of create_borrow lets the
+/// same call through.
 fn check_read(self: &mut BorrowChecker, path: str, line: i64) -> void {
+    if self.in_reservation_phase && !bc_mut_held_by_non_temp(self, path) {
+        return;
+    }
     if HashMap_get(self.mb_pfx, path) > 0 || bc_borrow_on_prefix(self, path, true) {
         violation(self, line, "cannot read " + path + ": a mutable borrow is active on it or its fields" + holder_note(self, path, 1));
     }
+}
+
+/// Whether a mutable borrow that overlaps `path` (of it, of a field under
+/// it or of a path above it) is held by a borrower that is not a temporary
+/// of a call (`__tmp_ref_N`).
+fn bc_mut_held_by_non_temp(self: &BorrowChecker, path: str) -> bool {
+    var i: i64 = self.borrow_of.len() - 1;
+    while i >= 0 {
+        var b: BorrowOfEntry = self.borrow_of.get(i);
+        if b.is_mut && !str_starts_with(b.borrower, "__tmp_ref_") && (b.borrowed == path || str_starts_with(path, b.borrowed + ".") || str_starts_with(b.borrowed, path + ".")) {
+            return true;
+        }
+        i = i - 1;
+    }
+    return false;
 }
 
 // --- Violation reporting --------------------------------------------------
