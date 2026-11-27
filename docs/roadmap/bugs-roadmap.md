@@ -41,10 +41,10 @@ BG204, BG227), 35 open. BG242-BG246, found Nov 25, are open.
 Status Nov 27 (checkbox count at be36317, the v0.8.5-unstable commit):
 BG128-BG241: 80 done `[x]`, 3 partly done `[~]` (BG183, BG204, BG227), 31
 open; BG242-BG246 open. The whole file: 207 `[x]`, 3 `[~]`, 36 `[ ]`.
-Status Nov 27 (night run, 09:45): BG128-BG241: 96 done `[x]`, 3
-partly `[~]` (BG183, BG204, BG227), 15 open; BG242 done, BG243-BG246
+Status Nov 27 (night run, 10:10): BG128-BG241: 97 done `[x]`, 3
+partly `[~]` (BG183, BG204, BG227), 14 open; BG242 done, BG243-BG246
 open; BG247 done; BG248-BG257: BG254, BG255 and BG257 done, 7 open.
-The whole file: 228 `[x]`, 3 `[~]`, 26 `[ ]`.
+The whole file: 229 `[x]`, 3 `[~]`, 25 `[ ]`.
 
 Status markers as in the other roadmaps: `[ ]` open, `[~]` partly done,
 `[x]` done.
@@ -2048,7 +2048,7 @@ names are the reference.
       nonblocking write loops). Fix direction: `poll()`, as the WASI branch
       does. Read only (an fd of 1500 landed in the neighbouring set, no ASan
       report). Confidence: high.
-- [ ] BG206. **Linux runtime `pert_str_to_float` is not correctly rounded.**
+- [x] BG206. **Linux runtime `pert_str_to_float` is not correctly rounded.**
       stdlib/linux_runtime/base.fd: up to 18 digits are packed into an i64, a
       mantissa over 2^53 is rounded by `mant as f64` and again by the
       power-of-ten multiply or divide, and exponents over 22 loop on `* 10.0`,
@@ -2056,6 +2056,28 @@ names are the reference.
       natively: 200 of 2000 `str_parse_float(float_to_str(x)) != x` on
       x86_64-linux and `--nat` (0 under `run`), e.g. "1.7976931348623157e308"
       reads 1.7976931348623145e308. Confirmed Nov 24. Confidence: high.
+      Nov 27 (night), fixed (a88c72b3): `pert_str_to_float` is exact now.
+      The digits make a big integer and a power of ten; the leading 57
+      bits of the quotient come from a division bit by bit, with the
+      remainder and the digits not read; normals and subnormals are
+      rounded to the nearest even; 0 on underflow, inf on overflow, the
+      sign of a zero kept. At most 800 significant digits are read
+      exactly (the most a midpoint of two doubles has is 767); a
+      non-zero digit beyond them only says "a little more", which
+      cannot turn a rounding around (such a text has over 490 fraction
+      digits). Gate, with release/fid-v27.exe through `emit --nat`
+      (tests/nattools/str_to_float_exact_check.sh; its texts and their
+      bits are made by Python's float() with
+      tests/nattools/gen_str_to_float_exact.py): 2,000 random doubles
+      printed and read back, 0 wrong (1,989 wrong with the runtime
+      before, on this machine); 1,107 texts (the ends of the range,
+      zero and its sign, midpoints and one digit either side,
+      subnormals, decimals of 1 to 25 and of 17 digits over the whole
+      exponent range, long integers, texts with over 800 significant
+      digits) all as Python's float() (751 differed before). The 15
+      float, f-string, decimal and JSON tests of tests/bootstrap pass
+      on the native backend. This runtime is the machine layer's:
+      `run`, ccompile and pe_ir do not go through it.
 - [ ] BG207. **`--nat` Windows console input: a lone CR read is reported as
       end of input.** stdlib/linux_runtime/win.fd `pe_win_read` strips CR
       bytes on a console handle and returns the count left; `pert_read_line`
