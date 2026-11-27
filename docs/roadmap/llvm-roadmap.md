@@ -3510,6 +3510,32 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       and could not pass: fixed. Run again from end to end with the fixed
       script at 19:54: the same (252 s, 673 s, exit 0). Left: BACKEND=nat
       on Windows and the three Linux hosts.
+      Nov 27 (night, the 23:10 run): BACKEND=nat on Windows, the tree of
+      23:13, release/fid-night.exe (the zig -O2 build of 16:19) as stage
+      1 (build/llvm19/fix-nat2). The chain's own attempt had not
+      started: the script passed `emit --nat compiler/main.fd`, which
+      fid read as the file (fixed in f7a61a6e). Stage 2, the first
+      compiler built by `emit --nat`: 18,542,650 bytes in 236 s. Stage 3
+      (stage 2 compiling the tree with `emit --nat`): the first run died
+      at 539 s, "out of memory (1073741824 bytes requested)" in
+      Vec_push, from aw_i64, nc_wentry, nc_finish: the writer of the
+      function cache file, whose 77.8 MB are held one word per byte (a
+      1 GiB vector) beside the 5 GB the compile holds, with under 5 GB
+      of commit free on the machine; the second run, 8 GB free, built
+      in 549 s: 18,575,315 bytes. Stage 3 runs hello and builds it with
+      `--nat` and with pe_ir. Stage 2 and stage 3 are not equal: 32,665
+      bytes more, 351 functions of another size (build/llvm19/pecmp.py,
+      through the COFF symbols), and the generated names are numbered
+      apart. Stage 4 (stage 3 compiling the tree): 534 s, and equal to
+      stage 3 byte for byte (8520d855d2e00caf...). So the backend
+      reproduces itself from stage 3 on; what stage 2 and stage 3
+      disagree on is two compilers: stage 1 is the C build of 16:19 and
+      stage 2 is built from the tree of 23:13, another session's edits
+      in it. The entry's own test, stage 2 == stage 3, does not hold
+      here: to say whether it would with a stage 1 of the same source
+      needs a C build of the current tree. The 1 GiB buffer is a cost of
+      the cache writer (compiler/ast_ser.fd AwBuf holds a byte in a
+      word), not of this goal: worth a row of its own. Still partly.
 - [~] RL15. Sanitizer runs of the compiler itself through the C path (ASan,
       UBSan), finding its own memory errors (M).
       Done (Nov 15): `COMPILER=1 scripts/sanitize.sh` builds fid's C with
