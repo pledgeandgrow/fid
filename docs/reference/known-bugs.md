@@ -1260,6 +1260,26 @@ expected-fail 89/89) and has not been rerun with the Nov 4–6 compiler.
 
 ---
 
+
+## 2g.122 — pe_ir's p_file_read returns a buffer p_str_take rejects (the "str without a string header" panic class)
+
+Found Nov 26 triaging the first green Windows CI lane (the lane's pe_ir-only
+failures). Minimal reproduction (build/fio_test.fd shape):
+
+    p_file_write("x.txt", "abc");
+    print(p_str_take(p_file_read("x.txt")));
+
+prints "written" then panics with "a str without a string header" under
+`fid emit` (pe_ir, default Windows); correct under `fid run` and ccompile.
+PeirGen_gen_file_read (compiler/pe_ir_stubs.fd ~8349) allocates with p_malloc
+and returns the data pointer; nothing writes the counted-string header
+p_str_take expects (the C runtime path, which passes, arranges it). The same
+panic class appears in test_vec_sized_layout (pe_ir), test_stdlib_repaired
+(pe_ir diverges after the json_save file write), and in --nat runs of
+test_process_command / mem_profile.fd / mem_hog — likely one shared defect in
+how hand-written native file/string primitives produce str-valued memory.
+Status: open.
+
 ## 2g. Nov 9, 2026 — module audit: open bugs
 
 Found by re-auditing every `compiler/*.fd` module against its
@@ -1389,6 +1409,7 @@ Details and line numbers are in each module's file-analysis doc.
 | 2g.118 | shared native lowering | `crypto_sha256_hex_str("abc")` returns `0e55ec8a…` on `emit` (pe_ir) and `emit --nat` — the same wrong value on both — but the correct `ba7816bf…` on `run` and `ccompile`; stdlib/crypto.fd is pure Fides (i64 ops, no externs, no @cfg), so the miscompile is in code shared by the two native paths or in a native runtime primitive. `FID_IROPT_OFF=all` changes nothing. Also seen: test_std_cookie (hmac), test_std_dtls (prf), test_std_hpke — every hash/HMAC/PRF vector is wrong natively; test_std_dsp harmonics, test_std_apriltag detections, test_std_geolocation point-in-polygon also differ on emit. Possibly the unfound second bug of 2g.115 | seen Nov 22 (emit-lane expect.py run on fid-nov22, the self-hosted stage-0 build of the merged tree) — OPEN |
 | 2g.119 | lower + pe_ir (global inits) | a `var` with a non-constant initializer (`var x: i64 = 0 - 1`, 119 uses in the tree) is zeroed in pe_ir's baked .rdata (pe_ir.fd only folds IntLit/FloatLit/BoolLit/StringLit into data) and its real assignment is emitted at the top of `main` (lower.fd global_inits) — so a value a boot hook (pert_limits_boot, pert_prof_boot) wrote before `main` is overwritten when `main` starts. FID_PROF's `pe_pf_entry_b` held __fid_entry's bucket only until `main` ran: folded stacks printed `__fid_entry;main;…` again (2g.101's fix defeated). Same ordering on every backend that lowers inits into `main` | seen Nov 22 (DB9 folded, pe_ir) — **FIXED** Nov 22: pe_pf_bucket names the row it lands on (`__fid_entry`) instead of trusting a cached bucket, so no profiler state depends on init order (db9-check.sh all 32 legs). The general hazard is **FIXED** Nov 26 (f3d82b06) for constant arithmetic: lower.fd folds a constant initializer to a literal when the global is registered (lw_fold_const_init: `0 - 1` -> -1, arithmetic, bitwise, shifts, comparisons; smallness guards keep interpreter-trapping overflow out, division by zero and wide shifts run as written), so every backend writes it into the program's data with no runtime assignment at all. Verified end to end: dump-c bakes -1LL, pe_ir prints -1/23/63/16/true, dynamic initializers unchanged. What is genuinely not constant (a call) still initializes at the top of main after the boot hooks — that ordering hazard stays for non-constant initializers || 2g.120 | nat_ir (record ABI, callbacks) | `tests/nattools/rl25_abi_lanes_check.sh`: the native (`--nat`, x86_64-linux machine) lanes of test_verify_abi_c_records return the sorted records in a repeated first element (`1:10 1:10 1:10 1:10 1:10` / `4:40 4:40 ...`, want `1:10 2:20 4:40 5:50 9:90` and the reverse) — a record passed to or returned from a C callback is copied wrong on the native backends. The C lanes, pe_ir, the cross C lanes and the mixed-argument lanes pass; aarch64/riscv64 dynamic lanes untested (no target glibc). Same family as 2g.118 (shared native lowering) | seen Nov 23 (RL25, fid-nov22.exe) — OPEN |
 | 2g.121 | dump-c (extern call args) | `pledge_net_recvfrom` call sites are emitted with `void*` arguments where the declared C prototype takes `int64_t` (stdlib/net.fd:49 declares all-i64 params): clang/zig cc reject it under `-Wint-conversion` ("passing 'void *' to parameter of type 'int64_t'"), gcc only warns. Harmless on x86-64 (same register slot) but it breaks the fid-dev self-hosted build under zig cc without `-Wno-int-conversion`; other extern call sites cast properly, so this one likely misses an insert-cast step in the C backend | seen Nov 25 (fid-dev rebuild, unit u_7) — **FIXED** Nov 26 (9fe4ac8c): extern param types were never registered in the C backend, so no call-site cast was ever inserted for an extern; both codegen_c.fd and src/codegen_c.rs now register them (aggregate signatures keep no entry — the __c_wrap_ wrapper already speaks the C types). Verified: the tree's 133MB of generated C compiles clean, the recvfrom call casts to (int64_t) |
+| 2g.122 | iropt (store-to-load forwarding) | `test_lib_game_headless` with inline2 on failed the post-iropt verifier: `main: %1687 uses %460, which is defined nowhere`. `ime_forward` scans blocks in layout order and recorded a copied load's substitution to `%460` before `%460` itself was forwarded to constant `%452`; the one-level chain was never compressed, so the intermediate load was removed while the copied comparison still used it | seen Nov 26 (ME20 inline2 suite) — **FIXED** Nov 26: `ime_forward` now compresses forwarding chains (`ime_forward_final`) and rewrites uses with the final value. Verified with FID_VERIFY=1 on pe_ir and `--nat`; the full inline2 suite has no build or verifier failures |
 
 ## 3. Gotchas
 
