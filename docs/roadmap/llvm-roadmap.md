@@ -187,6 +187,31 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       on every machine-layer target; mi7_call_parity 19 same, 0 differ);
       MI8 (frame layout) is done. What is left of all three is the same
       thing: the pe_ir half, retired under MI17.
+      Nov 27 (night): the whole-suite comparison was run
+      (`tests/nattools/mi5_nat_peir_check.sh` with release/fid-v27.exe, a
+      copy of the fid-dev of Nov 25; 1,331 programs; build/verify-nov27/).
+      The first pass ran beside other sessions' builds and two heavy runs
+      of this one: its 27 "machine-layer only build failures" were "out of
+      memory" and 48 programs were never reached (the shell's fork limit),
+      so every program not "same" was built again on its own, the last 27
+      one at a time. Result: 1,287 print the same on both backends (1,285
+      by the script; test_alloc_owner_return's interpreter run timed out
+      and its two native outputs are identical, test_deref_minimal panics
+      the same way on both and only the message differs); pe_ir is wrong
+      and `--nat` right on 6 (test_asm_pe, test_float_text_long,
+      test_span_double_free, test_stdlib_repaired, test_vec_sized_layout,
+      and test_read_line_long, where pe_ir hangs: BG250); `--nat` is wrong
+      on 6 (the four f32 programs of BG165, in flight; test_fix_fnval_c_ptr:
+      BG248; bench_sleepers: BG249); only pe_ir builds 5 (BG251); only
+      `--nat` builds 4 (pe_ir lacks cbrt, hypot, p_string_from,
+      p_string_substring, p_volatile_load16 and p_volatile_store16);
+      neither builds 21 (16 the checker rejects, among them five @secret
+      errors inside stdlib's quic module and a thread-safety error in
+      stdlib/parallel; four that need p_volatile_load16/store16 on either
+      backend; test_uefi_hello); 2 are another session's unfinished tests
+      (BG183, BG159). The gate (no differ, no machine-layer-only build
+      failure) does not pass: 6 and 5, all real. pe_ir is still the
+      Windows default. Still partly.
 - [x] MI6. Panic paths as cold out-of-line blocks shared per function, each a
       call (so traces name the function), from the one lowering (M).
       Panics are calls to shared stubs on every Linux target, so traces name the
@@ -353,6 +378,11 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       fix): all three now match `run` — the differs were 2g.115, verified
       fixed. The gate is clear; what remains is the full-suite comparison,
       then retiring the lowerings (pe_ir is still the default).
+      Nov 27 (night): the full-suite comparison is done (MI5's note of that
+      day): `--nat` is at least as good as pe_ir everywhere but for BG165
+      (in flight), BG248, BG249 and the five gaps of BG251. Left: those,
+      then retiring the lowerings (pe_ir is still the default). Still
+      partly.
 - [x] MI18. Retire the old PIR path (`pir.fd`, `opt.fd`, `regalloc.fd`,
       `codegen_x64.fd`) and `build --native` with it (S).
       Nov 16: no build reaches PIR any more. `build --native` is the machine

@@ -86,7 +86,7 @@ set the queue row to `done`.
 
 | Marker | Result | Roadmap entry |
 |---|---|---|
-| `MI5_DONE` in `mi5.log` | last line of `mi5.log`; anything not SAME in `mi5/results.txt` | `MI5` and `MI17` in `llvm-roadmap.md` |
+| `MI5_DONE` in `mi5.log` (done 04:07; re-runs in `mi5-rerun`, `mi5-rerun2`) | 1,287 same of 1,331 after re-running the rest on their own | `MI5` and `MI17`: written Nov 27 |
 | `WASM_DONE` in `wasm-all.log` | the `fid wasm:` summary line | `PL4` in `competitive-roadmap.md` |
 | `BENCH_DONE` in `mi14_bench.log` | the `pe_ir ... nat ... nat/pe_ir` lines | `MI14` in `llvm-roadmap.md` |
 
@@ -226,3 +226,13 @@ are the commit times.)
   (`pe_big_integer_text`); `test_bg247_float_to_str_large` passes on run,
   ccompile and emit. Queue B is closed: next the whole-suite
   comparison's result (queue A), then queue C.
+- 05:10: the whole-suite comparison is recorded in MI5 and MI17 (queue
+  A): 1,331 programs, 1,287 the same on both backends after every other
+  one was rebuilt on its own; pe_ir wrong on 6, `--nat` wrong on 6, only
+  pe_ir builds 5, only `--nat` builds 4, neither 21, 2 unfinished tests
+  of another session. Filed: BG248, BG249, BG250, BG251. The debug-info
+  file index (queue F, first row) was fixed by another session in
+  e52b278d: to confirm with the next compiler, not to change. BG213
+  needs a typed macro evaluator (unsigned 32-bit arithmetic) and is
+  moved to a later batch. Next: compiler batch 1 (BG233, BG208, BG212,
+  LG3), one build.

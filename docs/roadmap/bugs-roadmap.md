@@ -2426,6 +2426,31 @@ names are the reference.
       f-string programs of tests/bootstrap pass (test_bg182_optional_float_field
       fails as before: BG182, another session's); the leak gate and the
       checked allocator pass.
+- [ ] BG248. **`--nat` Windows: a call through a function value made from a
+      C function's address returns 0.** test_fix_fnval_c_ptr expects 7, 12
+      and 5 and says so in its header; pe_ir prints it, `emit --nat` prints
+      0 for the first. (The interpreter cannot run the test: native FFI.)
+      Found Nov 27 by the whole-suite comparison of MI5; seen twice. Cause
+      not located. Confidence: high.
+- [ ] BG249. **`--nat` Windows runs out of memory on bench_sleepers** where
+      pe_ir runs it: "Panic: out of memory (327680 bytes requested)" in
+      main. Found Nov 27 by the same comparison; seen twice. Cause not
+      located (the heap does not grow as pe_ir's does, or the program asks
+      past its limit). Confidence: high.
+- [ ] BG250. **pe_ir hangs on test_read_line_long.** The program runs
+      itself with a file of long lines on its standard input (BG41): the
+      pe_ir image printed one line and did not finish in 60 s, twice, and
+      again by hand with stdin closed; the `--nat` image and the
+      interpreter finish. Found Nov 27 by the same comparison. Cause not
+      located. Confidence: high.
+- [ ] BG251. **The machine layer on Windows lacks five things pe_ir has**,
+      so as many suite programs build only through pe_ir: `p_str_join_n`
+      (test_pe_str_join_n), `p_inb`/`p_outb` (test_std_x86_cpu), the C
+      imports `GetSystemInfo` (test_lib_sys) and `pledge_asset_load_mesh`
+      (test_lib_asset), and the bare-metal builtins `p_serial_init`,
+      `p_hlt` (test_kernel_hello): "not available in native Windows
+      executables yet" or "undefined symbol". Found Nov 27 by the same
+      comparison. Confidence: high.
 
 ## Found and fixed while reviewing (Nov 22)
 
