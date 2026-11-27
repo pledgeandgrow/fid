@@ -252,4 +252,8 @@ are the commit times.)
   (BG201, BG202, BG240, BG237), 0fcd0261 (BG236, a regression test for
   BG242, which no longer reproduces), 9ec4af52 (BG218), f0973224 (BG219).
   Build 1 is finishing (two units retried one at a time); build 2 waits for
-  the WebAssembly suite to end.
+  the WebAssembly suite to end. Also in the tree: cb8f8b69 (BG231, the C
+  runtime). The lock stays with this session while build 1 is in flight;
+  it validates batch 1 when the build lands, then builds batch 2.
+  Started and left for a later batch (not small): BG213 (a typed macro
+  evaluator), BG235, BG246, BG205, BG244.
