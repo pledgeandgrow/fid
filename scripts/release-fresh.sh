@@ -26,16 +26,20 @@ STAMP="$EXE.stamp"
 sha() { if command -v sha256sum > /dev/null; then sha256sum | cut -d' ' -f1; else shasum -a 256 | cut -d' ' -f1; fi; }
 source_hash() {
   # every .fd of the compiler and the library (runtimes included), in a fixed
-  # order, each with its name, then the bootstrap script
+  # order, each with its name, then the bootstrap script. Not
+  # compiler/build_info.fd: bootstrap.sh stamps the release values into it,
+  # writes this stamp, and its EXIT trap resets the file, so with it in the
+  # hash every release build read as stale (BG284; build-info.sh's own
+  # source hash leaves it out the same way)
   local files
-  files=$(find compiler stdlib -name '*.fd' | LC_ALL=C sort)
+  files=$(find compiler stdlib -name '*.fd' | LC_ALL=C sort | grep -v '^compiler/build_info\.fd$')
   { printf '%s\n' "$files"; printf '%s\n' "$files" | xargs cat; cat scripts/bootstrap.sh; } | tr -d '\r' | sha
 }
 
 if [ ! -f "$EXE" ]; then echo "release-fresh: no $EXE"; exit 1; fi
 bin=$(sha < "$EXE")
 src=$(source_hash)
-commit="$(git rev-parse --short HEAD 2> /dev/null || echo unknown)$(git diff --quiet HEAD -- compiler stdlib 2> /dev/null || echo '+changes')"
+commit="$(git rev-parse --short HEAD 2> /dev/null || echo unknown)$(git diff --quiet HEAD -- compiler stdlib ':!compiler/build_info.fd' 2> /dev/null || echo '+changes')"
 
 if [ "$MODE" = write ]; then
   {

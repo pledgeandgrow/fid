@@ -131,22 +131,58 @@ fi
 [ "$lanes_rc" = 0 ] || st=1
 
 rej_line="skipped (NO_REJECT=1)"
+# expect_missing <test> <log>: the `// expect-error: <text>` texts of the test
+# its log does not contain, one per line (white space runs compared as one
+# space and the [build]/[prof]/[time] progress lines left out, as
+# scripts/diag-tests-check.py does); nothing when the test names no text
+expect_missing() {
+  awk '
+    function ws(s) { gsub(/[ \t\r\n]+/, " ", s); sub(/^ /, "", s); sub(/ $/, "", s); return s }
+    FNR == NR {
+      if (match($0, /^[ \t]*\/\/[ \t]*expect-error[ \t]*:/)) {
+        e = ws(substr($0, RSTART + RLENGTH)); if (length(e) >= 3) want[++ne] = e
+      }
+      next
+    }
+    !/^\[(build|prof|time)\]/ { out = out " " $0 }
+    END { out = ws(out); for (i = 1; i <= ne; i++) if (index(out, want[i]) == 0) print want[i] }
+  ' "$1" "$2"
+}
 if [ "${NO_REJECT:-}" != 1 ]; then
   : > "$OUT/rejected.txt"
-  n=0; acc=0
+  n=0; acc=0; wrong=0; sane=1
+  # A compiler that cannot run anything refuses every test: check that it
+  # runs hello first, or "N of N refused" is a false pass (the Nov 27
+  # linux-arm64 lane: a fid that built none of the suite refused all 630)
+  if ! timeout 120 "$FID" run tests/bootstrap/hello.fd < /dev/null > "$OUT/reject-hello-sanity.log" 2>&1; then
+    rej_line="not checked: $FID cannot run tests/bootstrap/hello.fd (see reject-hello-sanity.log)"
+    st=1; sane=0
+    REJ_TESTS=()
+  fi
   for f in "${REJ_TESTS[@]+"${REJ_TESTS[@]}"}"; do
     b=$(basename "$f")
     n=$((n + 1))
-    if timeout 120 "$FID" run "$f" < /dev/null > "$OUT/reject-${b%.fd}.log" 2>&1; then
+    log="$OUT/reject-${b%.fd}.log"
+    if timeout 120 "$FID" run "$f" < /dev/null > "$log" 2>&1; then
       echo "ACCEPTED  $b" >> "$OUT/rejected.txt"; acc=$((acc + 1))
     else
-      echo "REJECTED  $b" >> "$OUT/rejected.txt"
+      miss=$(expect_missing "$f" "$log")
+      if [ -n "$miss" ]; then
+        # refused, but not for the reason the test names
+        echo "WRONG     $b (no: $(printf '%s' "$miss" | head -1))" >> "$OUT/rejected.txt"; wrong=$((wrong + 1))
+      else
+        echo "REJECTED  $b" >> "$OUT/rejected.txt"
+      fi
     fi
   done
-  rej_line="$((n - acc)) of $n refused"
-  if [ "$acc" != 0 ]; then
+  if [ "$sane" = 1 ]; then
+    rej_line="$((n - acc - wrong)) of $n refused with the error they expect"
+    [ "$wrong" != 0 ] && rej_line="$rej_line, $wrong refused with another error"
+    [ "$acc" != 0 ] && rej_line="$rej_line, $acc accepted"
+  fi
+  if [ "$acc" != 0 ] || [ "$wrong" != 0 ]; then
     st=1
-    grep '^ACCEPTED' "$OUT/rejected.txt" | sed 's/^/  /'
+    grep '^ACCEPTED\|^WRONG' "$OUT/rejected.txt" | sed 's/^/  /'
   fi
 fi
 echo "expected-fail tests: $rej_line"

@@ -224,6 +224,7 @@ macOS targets and `--nat` Windows) and by the rule passes it runs
 | `FID_NAT_OFF=rvc` | RISC-V 2-byte instructions (TG9/TG19; on by default with every `--cpu` but `rv64g`) |
 | `FID_NAT_OFF=relink` | the function cache (SP7): functions put back in the kept layout; off: the layout is not kept. Since Nov 27 relinking is asked for (`fid serve --relink` or `FID_NAT_ON=relink`): a kept layout is not the image a one-shot build makes (SP8) |
 | `FID_NAT_OFF=ncnarrow` | the function cache (SP6): a hit that no longer fits is given up alone, its callers checked against it in the next attempt (up to 8, each replaying what the earlier ones compiled); off: it and every entry that recorded anything of it are given up, transitively, in at most two attempts |
+| `FID_NAT_OFF=fnalign` | the function cache (SP6): a function with a padded loop head starts on the loop alignment, so its bytes do not depend on where it lands (compiler/nat_ir.fd `ng_fn_start_align`); off: every function on the function alignment, and the cache gives up a hit placed at another phase (`nc_pos16`) |
 
 Note `forward` is two passes: egraph.fd's (`FID_NAT_OFF=forward`) and
 iropt_me.fd's LF6 (`FID_IROPT_OFF=forward`); both are on by default.

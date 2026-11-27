@@ -1823,13 +1823,44 @@ fn ark_cache_key(url: str) -> str {
     return safe + "-" + h + ".git";
 }
 
+/// The spelling of `url` the cache is keyed by. A URL is kept; a repository
+/// on this machine is its path made absolute from the current directory and
+/// normalized (`/` for separators, no `.`/`..` parts or trailing `/`, lower
+/// case on Windows, whose paths ignore case), without asking git. The key
+/// is then the same whether or not the repository is still there: keyed by
+/// git's `--show-toplevel` (ark_abs_url) it was not, and on Windows the
+/// path a pact was added by (C:/Users/RUNNER~1/..., the 8.3 form TEMP uses)
+/// and the one git reports differed, so with the repository gone the
+/// cache's copy was never found (CI: tests/ark/ark-features.sh, CD3 "ark
+/// install with the repository gone").
+fn ark_cache_url(url: str) -> str {
+    if str_contains(url, "://") || str_starts_with(url, "git@") {
+        return url;
+    }
+    var p: str = str_replace(url, "\\", "/");
+    if !ark_is_abs(p) {
+        var cwd: str = ark_cwd();
+        if str_len(cwd) > 0 {
+            p = cwd + "/" + p;
+        }
+    }
+    p = ark_norm_path(p);
+    while str_len(p) > 1 && str_ends_with(p, "/") {
+        p = str_slice(p, 0, str_len(p) - 1);
+    }
+    if ark_is_windows() {
+        p = str_to_lower(p);
+    }
+    return p;
+}
+
 /// Where the cache keeps the repository at `url` ("" without a cache).
 fn ark_cache_path(url: str) -> str {
     var cache: str = ark_cache_dir();
     if str_len(cache) == 0 {
         return "";
     }
-    return cache + "/git/" + ark_cache_key(ark_abs_url(url));
+    return cache + "/git/" + ark_cache_key(ark_cache_url(url));
 }
 
 /// The cache's copy of the repository at `url`, cloned the first time this
