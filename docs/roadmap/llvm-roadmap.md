@@ -3131,7 +3131,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       checked against it, every push and pull request (the checked-in
       baseline stays a local machine's). Measured set: `fid emit --target
       x86_64-linux --time` on hello, test_hashmap, test_tasks.
-- [~] SP16. The compiler itself built by our own backend and fast (bootstrap with
+- [x] SP16. The compiler itself built by our own backend and fast (bootstrap with
       `fid emit` instead of the C path) (L).
       Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
       partly — machine_zero_words_check 0 failures and
@@ -3160,6 +3160,25 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       distribution. What blocks the goal is unchanged: 2g.114 (the compiler
       built by pe_ir panics), then the compiler built by `fid emit`. Still
       partly.
+      Nov 27 (night, 19:10 run): done, on pe_ir. With the -O2 zig build of
+      16:19 (release/fid-night.exe): `fid emit compiler/main.fd` builds the
+      compiler in 287 to 299 s (the C path takes about 14 minutes that day:
+      40 s of dump-c and 16 units through zig cc), and the compiler it
+      makes is the same one: on 41 sampled programs the same verdicts,
+      interpreter output and generated C; `check compiler/main.fd` clean in
+      54 s (the zig build: 29 s); `dump-c compiler/main.fd` in 63 s,
+      byte-identical to the zig build's 139,622,725 bytes.
+      scripts/native-fixpoint.sh (BACKEND=pe), the first run of it ever to
+      finish: stage 2 == stage 3 byte for byte, 28,471,168 bytes, stage 3
+      built by stage 2 in 641 s; stage 3 runs and compiles hello. Run again
+      from end to end with the fixed script at 19:54: the same (252 s, 673
+      s, exit 0). The script's last check compared the interpreter's stderr
+      with the native program's output; it compares the program's output
+      now. machine_sp16_check.sh: 9 ok. Open and recorded as known-bugs
+      2g.114: the self-emit prints six `unresolved label 8577`/`8578`
+      warnings, references to a label that is never placed; the crash they
+      went with on Nov 21 is gone, and nothing run so far executes them.
+      Not on this machine: the machine layer's hosts (RL14).
 - [x] SP17. Memory of a build under 1 GB for the compiler itself (M).
       Measured Nov 15: `fid check compiler/main.fd` peaks at ~550 MB —
       under 1 GB. (`dump-c` peaks higher through the 76 MB C text but a
@@ -3461,6 +3480,15 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       OOM-killed mid-imports under parallel load after 17 s — a retry on an
       idle machine is needed, but 2g.114 (pe_ir self-emit's unresolved
       labels, crashing binary) is expected to block the fixpoint anyway.
+      Nov 27 (night, 19:10 run): the first run of
+      scripts/native-fixpoint.sh that finishes, on pe_ir (Windows): stage 2
+      (`fid emit compiler/main.fd` with the zig -O2 build of 16:19) in 299
+      s, stage 3 (built by stage 2) in 641 s, the two executables equal
+      byte for byte (28,471,168); stage 3 runs hello and compiles it; its
+      last check compared the interpreter's stderr with the native output
+      and could not pass: fixed. Run again from end to end with the fixed
+      script at 19:54: the same (252 s, 673 s, exit 0). Left: BACKEND=nat
+      on Windows and the three Linux hosts.
 - [~] RL15. Sanitizer runs of the compiler itself through the C path (ASan,
       UBSan), finding its own memory errors (M).
       Done (Nov 15): `COMPILER=1 scripts/sanitize.sh` builds fid's C with

@@ -57,10 +57,13 @@ RELEASE=1 CC="zig cc" ./scripts/bootstrap.sh
 #    at -O0 and still exits 0, 2g.86: look for "8 units at -O2" in its
 #    output. SPLIT=1 CC=tcc is the fastest way to *a* fid for a one-shot
 #    smoke test; the -O2 split is worth it when the new fid itself does
-#    heavy compiling. `fid emit compiler/main.fd` is NOT a dev shortcut
-#    yet: Nov 21 it finished in 5m18s (iropt 97s + pe_ir emission 188s)
-#    but the produced binary panicked on `run hello` — unresolved-label
-#    warnings, a live pe_ir miscompile of the tree.)
+#    heavy compiling. `fid emit compiler/main.fd` IS a way to a fid with
+#    no C compiler since Nov 27: about 5 minutes with the -O2 build, and
+#    the binary is the same compiler (scripts/native-fixpoint.sh BACKEND=pe:
+#    stage 2 == stage 3 byte for byte; it compiles 1.9x slower than the
+#    zig -O2 build). Six `[PE] WARNING: unresolved label 8577/8578` lines
+#    remain in that self-emit, references to a label that is never placed:
+#    open as known-bugs 2g.114 (the crash they went with on Nov 21 is gone).)
 
 .\release\fid.exe dump-c compiler/main.fd > c2.c   # self-compile (fixpoint)
 .\release\fid.exe run tests/bootstrap/hello.fd    # interpreter (as fidesc run)
@@ -278,16 +281,19 @@ FID=release/fid.exe JOBS=4 bash scripts/cross-test.sh aarch64-linux
 > (CURRENT.md was removed on Nov 8); keep the two in step.
 >
 > Nov 27, afternoon and evening (the LLVM roadmap): SP6, LF20, SP7, WP14,
-> LF16, LF14 and LF11 are marked done in docs/roadmap/llvm-roadmap.md (167
-> done, 29 partly), each on a one-stage -O2 build of the tree (16:19, all
-> 16 units at -O2, `check compiler/main.fd` clean in 29 s,
-> `release/fid-night.exe`). The whole of tests/bootstrap (2,056 programs)
+> LF16, LF14, LF11 and SP16 are marked done in docs/roadmap/llvm-roadmap.md
+> (168 done, 28 partly), each on a one-stage -O2 build of the tree (16:19,
+> all 16 units at -O2, `check compiler/main.fd` clean in 29 s,
+> `release/fid-night.exe`). SP16: `fid emit` builds the compiler in 5
+> minutes and the native fixpoint holds on pe_ir
+> (scripts/native-fixpoint.sh BACKEND=pe, stage 2 == stage 3; the first
+> run of it to finish). The whole of tests/bootstrap (2,056 programs)
 > ran on emit and `--nat` with it: 2,011 pass; no verdict changes with
 > specialization and versioning off, with the sole-owner pass on, or with
 > the Vec scalar-replacement pass on. CF32 and CF37 are closed (four
-> conformance gaps left: CF33 to CF36). The gates of MI14, SP16, TG11,
-> WP6, RA1 and SP9 are green after their defects were fixed; those goals
-> stay partly done for what their entries name. Each of the 19 partly-done
+> conformance gaps left: CF33 to CF36). The gates of MI14, TG11, WP6, RA1
+> and SP9 are green after their defects were fixed; those goals stay
+> partly done for what their entries name. Each of the 19 partly-done
 > goals whose code sits in files another session edits says in its entry
 > what is exactly left (docs/roadmap/goal-workflow.md, section A, has the
 > queue).

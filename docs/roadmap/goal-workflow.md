@@ -91,7 +91,14 @@ vec` compares them (logs build/llvm19/suite-<name>.log and .raw). 2,011 of
 on or off. The gates RA1, LF11 and SP9 ran after them (`FID=<fid> bash
 build/llvm19/gates.sh ra1 lf11 sp9`, logs build/llvm19/<gate>.log).
 
-Started at 01:26Started at 01:26 with `release/fid-v27.exe`, output in `build/verify-nov27/`.
+**Since Nov 27 20:10 (the 19:10 run): one chain of that run is still running.
+While it runs, start no build and no other whole-suite run.**
+
+| Marker | Result | Roadmap entries |
+|---|---|---|
+| `MI14_LEGS_DONE`, then `CHAIN_DONE`, at the end of `build/llvm19/chain-1910.log` | the whole of tests/bootstrap on `--nat` Windows with `release/fid-night.exe` (the -O2 build of 16:19), three times: `nat` (the default), `natwin` (FID_NAT_OFF=winfregs), `natsplit` (FID_NAT_OFF=splitfloat); `python build/llvm19/suite-diff.py nat natwin natsplit` gives, per leg, the files it fails that the default `--nat` run does not. Then scripts/native-fixpoint.sh with BACKEND=nat (`build/llvm19/fix-nat.log`, `NAT_FIXPOINT_DONE` at its end) | `MI14` (no file fails with a float switch off that the default `--nat` run passes), `RL14` (the `--nat` host) |
+
+Started at 01:26 with `release/fid-v27.exe`, output in `build/verify-nov27/`.
 When a marker appears and the entry has no note of it, write the note, then
 set the queue row to `done`.
 
@@ -139,17 +146,18 @@ holds, with its gate green on a built compiler.
 | L1 | SP6 | `compiler/nat_ir.fd` (the function cache) | done (Nov 27 day: `machine_fncache_check.sh` all passed, `sp20_fncache_tail_check.sh` 21 ok) |
 | L2 | SP7 | `compiler/nat_ir.fd` (`nl_loop_end`) | done (Nov 27 day, ad4dfa83: a kept slot for a function a build inlines away; `relink_check.sh` 21 ok, 0 fail on the -O2 build of 15:52) |
 | L3 | LF20 | `compiler/nat_ir.fd` (`ng_secret_mir`) | done (Nov 27 day, 5c5d0644: `machine_lf20_check.sh` 44 ok, `machine_lf20_param_check.sh` 22 ok; the 38 constant-time tests on run, ccompile, emit and `--nat`, the last under FID_VERIFY=1) |
-| L4 | LF14 | `compiler/iropt.fd` (`iro_vec_sroa_one`) | verified: both tests convert all their Vecs with the pass on (4 and 5), right on pe_ir and `--nat`; the debug line names its function. todo: the suite leg with FID_IROPT_ON=vecsroa |
-| L5 | MI14 | gates only | the gate is green (33 ok; fregs 25 ok); left: the default switch (the loop 2.34x, the sieve 3.56x), the suites with winfregs/splitfloat |
-| L6 | SP16 | gates only | the gate is green (9 ok); left: 2g.114, then the compiler built by `fid emit` |
-| L7 | TG11 | `compiler/iropt.fd` (the vectorizer) | verified: the checker failure is gone; left: the reductions (red6, redk), MIR vector operations |
-| L8 | WP6 | `compiler/nat_ir.fd` (AArch64's pool) | verified: 23 ok, 1 leg (x0-x7 are no pool registers there: MI's grade); the native suite |
+| L4 | LF14 | `compiler/iropt.fd` (`iro_vec_sroa_one`) | done (Nov 27 evening, 748df914: the whole of tests/bootstrap on emit with FID_IROPT_ON=vecsroa is the same as with it off; 5 of the test's 5 Vecs) |
+| L5 | MI14 | `compiler/nat_ir.fd` (another session's file) | gate green (33 ok; fregs 25 ok); 7 `--nat`-only failures of the whole suite are in the entry; running: the suite with FID_NAT_OFF=winfregs and with FID_NAT_OFF=splitfloat on `--nat` (the chain of the 19:10 run, below); left: the default switch (the loop 2.34x, the sieve 3.56x slower on `--nat`) |
+| L6 | SP16 | `compiler/pe_ir*.fd` | done (the 19:10 run: `fid emit` builds the compiler in 5 minutes and it is the same compiler; scripts/native-fixpoint.sh on pe_ir: stage 2 == stage 3; known-bugs 2g.114 keeps the six unresolved labels) |
+| L7 | TG11 | `compiler/nat_ir.fd` (the vectorizer; another session's file) | verified (the 19:10 run): vectorize_spill_check.sh 32 ok; its 6 failures are the reductions red6 and redk; left: those, then MIR vector operations |
+| L8 | WP6 | `compiler/nat_ir.fd` (AArch64's pool) | verified: wp6_args_check.sh 23 ok and the native suite ran; left: x0-x7 in AArch64's pool (a change of the machine layer's design) |
 | L9 | SP9 | `compiler/compiler.fd`, `lexer.fd`, `parser.fd`, `borrowck.fd`, `escape.fd`, `secrecy.fd` (the other session edits three of them) | verified Nov 27 evening: the four checks pass and the bench is in the entry; left: on by default, step 3 (type check in parallel), parallel code generation |
 | L10 | RA1 | `tests/nattools/ra1_pe_ra_off_check.sh` | verified Nov 27 evening: 132 same, 0 differ after the gate's second chance, switch takes effect; left: deleting pe_ir's allocator (waits for MI17 and the Windows default) |
 | L11 | LF11 | `tests/tooling/version-default-check.sh` | done (Nov 27 evening, be77cdf3: the gate 0 failed; the whole suite the same with versioning off) |
 | L12 | WP14, LF16 | whole-suite legs | done (Nov 27 evening, 748df914: the whole of tests/bootstrap on emit and `--nat`, 2,011 of 2,056; no verdict changes with any pass on or off; LF14 the same) |
 | L13 | MI5, MI17 | `compiler/pe_ir*.fd`, `nat_ir.fd` | waiting: BG248, BG249, BG251 (the other session's), then `tests/nattools/mi5_nat_peir_check.sh` again; the default switch is MI14's |
 | L14 | MI9, TG16, LF13, LF21 | MI9: SRA of local structs (`nat_ir.fd`); TG16: the port onto MIR (the other session builds tg16-fid-v5); LF13: the other producers, `Vec::new()`+push buffers (`lower.fd`); LF21: the region arena in the Linux runtime | waiting on the other session, or multi-week |
+| L15 | RL14 (not among the 19; its run is this run's) | `scripts/native-fixpoint.sh` | pe_ir: done (the 19:10 run: stage 2 == stage 3 byte for byte); running: BACKEND=nat (the chain, below); left: the three Linux hosts (not on this machine) |
 
 Gate scripts, once fixed, are in tests/nattools (a working WSL only: `wsl.exe -e sh -c 'echo wsl-ok'`; a path given to `fid serve` on stdin is a Windows path, `cygpath -m`). The driver of one run: `FID=<fid> bash build/llvm19/gates.sh [name ...]` (tg11 wp6 sp16 mi14 fregs lf20 sp6 sp20 sp7 ct ra1 lf11 sp9), its log `build/llvm19/progress.log`; the whole-suite legs: `bash build/llvm19/suite.sh <name> <list-or-dash> [VAR=value]` (tests/bootstrap on emit and `--nat`).
 
@@ -524,3 +532,19 @@ are the commit times.)
   asked for: the compiler's per-build caches in %TEMP% (1.2 GB), the
   runner's expect* folders (3.8 GB), another agent's scratchpad (8.9
   GB); no crash dumps; nothing deleted.
+- 19:10 to 20:25, a scheduled run on the LLVM queue (the lock was
+  free). Under hard rule 2 every goal whose file another session
+  modifies was left alone (nat_ir.fd, iropt.fd, lower.fd, pe_ir.fd,
+  lexer.fd, parser.fd, escape.fd, wasm.fd, win.fd are modified by
+  it; BG248, BG249 and BG251 are still partly). Done with gates only:
+  SP16 — `fid emit` builds the compiler (5 minutes) and it is the
+  same compiler: scripts/native-fixpoint.sh on pe_ir reaches its
+  fixpoint, stage 2 == stage 3 byte for byte, the first run of it to
+  finish (its last check compared the interpreter's stderr: fixed).
+  TG11: vectorize_spill_check.sh follows the loops the inliner takes
+  into their caller: 32 ok, and its 6 failures are the two
+  reductions. WP6: the native suite ran. known-bugs 2g.114: the crash
+  is gone, six unresolved labels stay. RL14 (new row L15): the pe_ir
+  host. 8 of the 19 named goals are done. Left running: the chain
+  (MI14's two float-switch suites on `--nat`, then the `--nat`
+  fixpoint).

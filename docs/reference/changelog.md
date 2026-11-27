@@ -15,10 +15,20 @@ green; the first whole-suite record on `emit` and `--nat`.
   registers: `ng_secret_mir` follows what selection makes of a secret,
   48/48 in registers on the four targets) are done; so are WP14
   (specialization), LF11 (check hoisting), LF16 (the sole-owner pass) and
-  LF14 (the Vec scalar replacement) on the suite legs below. CF32 and CF37
-  are closed (a `@public` parameter of a `@constant_time` function is read
-  by its index in the source on every backend; the C path keeps its null
-  pointer checks). Four conformance gaps left: CF33 to CF36.
+  LF14 (the Vec scalar replacement) on the suite legs below, and SP16: the
+  compiler built by its own backend. CF32 and CF37 are closed (a `@public`
+  parameter of a `@constant_time` function is read by its index in the
+  source on every backend; the C path keeps its null pointer checks).
+  Four conformance gaps left: CF33 to CF36.
+- **The compiler built by `fid emit`:** `fid emit compiler/main.fd`
+  (pe_ir) takes 5 minutes with the -O2 build and the binary is the same
+  compiler: on 41 sampled programs the same verdicts, interpreter output
+  and generated C; scripts/native-fixpoint.sh (BACKEND=pe) reaches its
+  fixpoint, stage 2 == stage 3 byte for byte, the first run of it to
+  finish (its last check compared the interpreter's stderr with the
+  native program's output: fixed). Six unresolved-label warnings remain in
+  that self-emit (known-bugs 2g.114; the crash they went with on Nov 21
+  is gone).
 - **Gates fixed and green:** `machine_mi14_check.sh` (33 ok),
   `machine_fregs_check.sh` (25 ok), `machine_sp16_check.sh` (9 ok),
   `wp6_args_check.sh` (23 ok), `version-default-check.sh` (0 failed: it no

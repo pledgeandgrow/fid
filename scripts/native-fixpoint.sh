@@ -110,12 +110,19 @@ else
   fi
   exit 2
 fi
-# stage 3 runs a program, and compiles one natively that runs
-( cd "$OUT/tree" && "$OUT/fid3$EXT" run hello.fd ) > "$OUT/hello3.txt" 2>&1 || {
-  echo "stage 3 does not run hello.fd"; exit 1; }
+# stage 3 runs a program, and compiles one natively that runs. What is
+# compared is the program's own output: the interpreter's stdout (the
+# compiler's diagnostic lines go to stderr, kept in hello3.err), without
+# CR, against the native program's. Before Nov 27 the interpreter's stderr
+# was compared too, so this check could not pass.
+( cd "$OUT/tree" && "$OUT/fid3$EXT" run hello.fd ) > "$OUT/hello3.txt" 2> "$OUT/hello3.err" || {
+  echo "stage 3 does not run hello.fd"; tail -3 "$OUT/hello3.err"; exit 1; }
+tr -d '\r' < "$OUT/hello3.txt" > "$OUT/hello3.tmp" && mv "$OUT/hello3.tmp" "$OUT/hello3.txt"
 ( cd "$OUT/tree" && "$OUT/fid3$EXT" "${EMIT[@]}" hello.fd -o "$OUT/hello3$EXT" ) > /dev/null 2>&1 \
-  && "$OUT/hello3$EXT" > "$OUT/hello3-native.txt" 2>&1 \
-  && cmp -s "$OUT/hello3.txt" "$OUT/hello3-native.txt" || {
-  echo "stage 3's native hello differs from its interpreted one"; exit 1; }
+  && "$OUT/hello3$EXT" > "$OUT/hello3-native.txt" 2>&1 || {
+  echo "stage 3 does not compile hello.fd natively, or it does not run"; exit 1; }
+tr -d '\r' < "$OUT/hello3-native.txt" > "$OUT/hello3-native.tmp" && mv "$OUT/hello3-native.tmp" "$OUT/hello3-native.txt"
+cmp -s "$OUT/hello3.txt" "$OUT/hello3-native.txt" || {
+  echo "stage 3's native hello differs from its interpreted one"; diff "$OUT/hello3.txt" "$OUT/hello3-native.txt" | head -6; exit 1; }
 echo "stage 3 runs and compiles hello.fd"
 exit 0
