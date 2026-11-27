@@ -8417,18 +8417,22 @@ pub fn PeirGen_gen_file_read(self: &mut PeirGen) -> void {
     // jne
     PeirEnc_xor_self(&mut self.enc, PEIR_R12);
     PeirEnc_place_label(&mut self.enc, fr_size_ok);
-    // r14 = buf = p_malloc(size + 1)
+    // r14 = block = p_malloc(size + 17): the counted-string header (2g.122)
     PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_R12);
-    PeirEnc_inc_r(&mut self.enc, PEIR_RCX);
+    PeirEnc_add_r_i32(&mut self.enc, PEIR_RCX, 17);
     PeirEnc_sub_rsp_i32(&mut self.enc, 32);
     PeirEnc_call_label(&mut self.enc, HashMap_get(self.func_labels, "p_malloc"));
     PeirEnc_add_rsp_i32(&mut self.enc, 32);
     PeirEnc_mov_rr(&mut self.enc, PEIR_R14, PEIR_RAX);
+    // [block] = a count of one owner, as core's p_str_alloc writes it
+    PeirEnc_mov_imm64(&mut self.enc, PEIR_R9, 0x4649444500000001);
+    PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_R14, 0, PEIR_R9);
     // r14 = buf
-    // ReadFile(handle, buf, size, &bytesRead, NULL)
+    // ReadFile(handle, buf + 16, size, &bytesRead, NULL)
     PeirEnc_mov_rr(&mut self.enc, PEIR_RCX, PEIR_R13);
     // handle
     PeirEnc_mov_rr(&mut self.enc, PEIR_RDX, PEIR_R14);
+    PeirEnc_add_r_i32(&mut self.enc, PEIR_RDX, 16);
     // buf
     PeirEnc_mov_rr(&mut self.enc, PEIR_R8, PEIR_R12);
     // size
@@ -8445,9 +8449,11 @@ pub fn PeirGen_gen_file_read(self: &mut PeirGen) -> void {
     PeirEnc_add_rsp_i32(&mut self.enc, 48);
     // bytesRead is at [rbp-32]. Null-terminate at buf[bytesRead]
     PeirEnc_mov_reg_mem_rbp(&mut self.enc, PEIR_RAX, -32);
-    // bytesRead
+    // bytesRead; [block + 8] = the length the header carries
+    PeirEnc_mov_mem_disp_reg(&mut self.enc, PEIR_R14, 8, PEIR_RAX);
+    PeirEnc_add_r_i32(&mut self.enc, PEIR_R14, 16);
     PeirEnc_add_rr(&mut self.enc, PEIR_R14, PEIR_RAX);
-    // r14 = buf + bytesRead
+    // r14 = buf + 16 + bytesRead
     PeirEnc_xor_self(&mut self.enc, PEIR_RDX);
     PeirEnc_mov_mem_reg8_ptr(&mut self.enc, PEIR_R14, PEIR_RDX);
     // null term
