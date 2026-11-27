@@ -1,0 +1,64 @@
+// BG224 (docs/roadmap/bugs-roadmap.md): xml and toml refuse input nested
+// deeper than their limit (128) instead of overflowing the stack. A
+// document at the limit still parses and is destroyed; the large inputs of
+// the entry (400,000 elements, a million brackets) were checked through
+// ccompile: too slow in the interpreter for a suite test.
+//
+// Expected output:
+// xml, 150 unclosed elements, lenient: a
+// xml, 128 deep, strict: true, levels: 128
+// xml, 129 deep, strict: false, error names the limit: true
+// toml, 128 arrays deep, strict: true
+// toml, 129 arrays deep, strict: false, error names the limit: true
+// toml, 140 inline tables deep, strict: false
+// toml, 400 arrays deep, lenient: 1
+use string;
+use toml;
+use xml;
+
+fn rep(s: str, n: i64) -> str {
+    var out = "";
+    var i = 0;
+    while i < n {
+        out = out + s;
+        i = i + 1;
+    }
+    return out;
+}
+
+fn levels(node: XmlNode) -> i64 {
+    var r: XmlNode = node;
+    var k: i64 = 1;
+    while r.children.len() > 0 {
+        r = r.children.get(0);
+        k = k + 1;
+    }
+    return k;
+}
+
+fn main() -> i64 {
+    val limit = "nested deeper than 128";
+
+    var root: XmlNode = xml_parse(rep("<a>", 150));
+    print("xml, 150 unclosed elements, lenient: ");
+    print(root.tag);
+    print("\n");
+
+    var d128: XmlDoc = xml_load(rep("<a>", 128) + rep("</a>", 128));
+    println(f"xml, 128 deep, strict: {d128.ok}, levels: {levels(d128.root)}");
+    var d129: XmlDoc = xml_load(rep("<a>", 129) + rep("</a>", 129));
+    println(f"xml, 129 deep, strict: {d129.ok}, error names the limit: {str_contains(d129.error, limit)}");
+
+    var t128: TomlDoc = toml_load("x = " + rep("[", 128) + rep("]", 128) + "\n");
+    println(f"toml, 128 arrays deep, strict: {t128.ok}");
+    var t129: TomlDoc = toml_load("x = " + rep("[", 129) + rep("]", 129) + "\n");
+    println(f"toml, 129 arrays deep, strict: {t129.ok}, error names the limit: {str_contains(t129.error, limit)}");
+
+    var t140: TomlDoc = toml_load("x = " + rep("{a = ", 140) + "1" + rep("}", 140) + "\n");
+    println(f"toml, 140 inline tables deep, strict: {t140.ok}");
+
+    // the lenient parser keeps the failed key as one "invalid" entry
+    var tl: Vec<TomlEntry> = toml_parse("x = " + rep("[", 400) + "\n");
+    println(f"toml, 400 arrays deep, lenient: {tl.len()}");
+    return 0;
+}

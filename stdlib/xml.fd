@@ -240,6 +240,8 @@ struct XP {
     ok: bool,
     error: str,
     roots: i64,
+    // elements open, for XML_MAX_DEPTH
+    depth: i64,
     seen_doctype: bool,
     // general entities: name, replacement text (internal), kind 0 internal,
     // 1 external parsed (not loaded yet), 2 unparsed, 3 external loaded;
@@ -527,6 +529,13 @@ fn xp_dtd_unread(p: &mut XP) -> bool {
 
 // The most text entity references may expand to in one document.
 const X_EXPAND_MAX: i64 = 8388608;
+
+/// Elements nested deeper than this are an error in a strict parse, and in
+/// a lenient one are kept without their content, instead of overflowing
+/// the stack. 128 and not JSON's 512: a tree of nodes is destroyed
+/// recursively too (about five calls a level), and the interpreter's
+/// recursion limit is 1000.
+pub const XML_MAX_DEPTH: i64 = 128;
 
 // Character data decoded (see xp_decode_in).
 fn xp_decode(p: &mut XP, raw: str, pos: i64) -> str {
@@ -2425,8 +2434,18 @@ fn x_children(p: &mut XP, i: i64, parent: &mut XmlNode, close_tag: str) -> i64 {
                     parent.text = parent.text + xp_decode(p, text_acc, text_pos);
                     text_acc = "";
                 }
+                if !self_close && p.depth >= XML_MAX_DEPTH {
+                    // not descended into: what follows is this level's
+                    // content (a stack overflow before, BG224)
+                    if xp_fail(p, j, "elements nested deeper than " + int_to_str(XML_MAX_DEPTH)) {
+                        return n;
+                    }
+                    self_close = true;
+                }
                 if !self_close {
+                    p.depth = p.depth + 1;
                     k = x_children(p, k, &mut node, tag);
+                    p.depth = p.depth - 1;
                 }
                 x_ns_close(p, nsmark);
                 if p.validate && p.ok {
@@ -2521,7 +2540,7 @@ fn x_newlines(text: str) -> str {
 fn x_run(text: str, strict: bool, opts: XmlOptions, doc: &mut XmlNode) -> XP {
     var s: str = x_newlines(text);
     var p: XP = XP {
-        s: s, n: str_len(s), strict: strict, ok: true, error: "", roots: 0, seen_doctype: false, enames: Vec::new(), evals: Vec::new(), ekind: Vec::new(), esys: Vec::new(), epub: Vec::new(), pnames: Vec::new(), pvals: Vec::new(), pkind: Vec::new(), psys: Vec::new(), ppub: Vec::new(), active: Vec::new(), expanded: 0, ctx: "", dtd_skip: false, ns_check: opts.namespaces && strict, validate: opts.validate && strict, external: opts.external, resolver: opts.resolver, ns_pre: Vec::new(), ns_uri: Vec::new(), dt_name: "", dt_sys: "", dt_pub: "", el_names: Vec::new(), el_kind: Vec::new(), el_cm: Vec::new(), el_mixed: Vec::new(), el_model: Vec::new(), cm_kind: Vec::new(), cm_name: Vec::new(), cm_quant: Vec::new(), cm_first: Vec::new(), cm_count: Vec::new(), cm_list: Vec::new(), cm_out: -1, at_elem: Vec::new(), at_name: Vec::new(), at_type: Vec::new(), at_enum: Vec::new(), at_def: Vec::new(), at_val: Vec::new(), ids: Vec::new(), refs: Vec::new(), ref_pos: Vec::new()
+        s: s, n: str_len(s), strict: strict, ok: true, error: "", roots: 0, depth: 0, seen_doctype: false, enames: Vec::new(), evals: Vec::new(), ekind: Vec::new(), esys: Vec::new(), epub: Vec::new(), pnames: Vec::new(), pvals: Vec::new(), pkind: Vec::new(), psys: Vec::new(), ppub: Vec::new(), active: Vec::new(), expanded: 0, ctx: "", dtd_skip: false, ns_check: opts.namespaces && strict, validate: opts.validate && strict, external: opts.external, resolver: opts.resolver, ns_pre: Vec::new(), ns_uri: Vec::new(), dt_name: "", dt_sys: "", dt_pub: "", el_names: Vec::new(), el_kind: Vec::new(), el_cm: Vec::new(), el_mixed: Vec::new(), el_model: Vec::new(), cm_kind: Vec::new(), cm_name: Vec::new(), cm_quant: Vec::new(), cm_first: Vec::new(), cm_count: Vec::new(), cm_list: Vec::new(), cm_out: -1, at_elem: Vec::new(), at_name: Vec::new(), at_type: Vec::new(), at_enum: Vec::new(), at_def: Vec::new(), at_val: Vec::new(), ids: Vec::new(), refs: Vec::new(), ref_pos: Vec::new()
     };
     var i: i64 = 0;
     if p.n >= 3 && str_byte_at(s, 0) == 239 && str_byte_at(s, 1) == 187 && str_byte_at(s, 2) == 191 {

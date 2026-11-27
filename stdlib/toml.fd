@@ -114,6 +114,8 @@ pub struct TomlDoc {
     pub lenient: bool,
     pub cur: i64,
     pub section: i64,
+    // arrays and inline tables open, for TOML_MAX_DEPTH
+    pub depth: i64,
 }
 
 // node flags
@@ -121,6 +123,12 @@ const TF_HDR: i64 = 1;  // table defined by a [header] (or an [[x]] element)
 const TF_DOT: i64 = 2;  // table made by dotted keys (in section `sect`)
 const TF_FROZEN: i64 = 4;  // inline table or static array: closed
 const TF_AOT: i64 = 8;  // array made by [[x]] headers
+
+/// Arrays and inline tables nested deeper than this are an error in
+/// toml_load, and a skipped line in toml_parse, instead of overflowing the
+/// stack. Lower than JSON_MAX_DEPTH: the parser makes two or three calls a
+/// level under the interpreter's limit of 1000.
+pub const TOML_MAX_DEPTH: i64 = 128;
 
 fn toml_is_digit(c: i64) -> bool {
     return c >= 48 && c <= 57;
@@ -1126,11 +1134,19 @@ fn tp_value(d: &mut TomlDoc, s: str, n: i64, i: i64, parent: i64, key: str) -> i
         tn_new(d, "string", out.get(0), parent, key, 0);
         return j;
     }
-    if c == 91 {
-        return tp_array(d, s, n, i, parent, key);
-    }
-    if c == 123 {
-        return tp_inline(d, s, n, i, parent, key);
+    if c == 91 || c == 123 {
+        if d.depth >= TOML_MAX_DEPTH {
+            return tp_fail(d, i, "value nested deeper than " + int_to_str(TOML_MAX_DEPTH));
+        }
+        d.depth = d.depth + 1;
+        var j: i64 = -1;
+        if c == 91 {
+            j = tp_array(d, s, n, i, parent, key);
+        } else {
+            j = tp_inline(d, s, n, i, parent, key);
+        }
+        d.depth = d.depth - 1;
+        return j;
     }
     if c == 116 || c == 102 {
         var e: i64 = tp_token_end(s, n, i);
@@ -1282,7 +1298,7 @@ fn tp_utf8_bad(s: str) -> i64 {
 
 fn tp_run(text: str, lenient: bool) -> TomlDoc {
     var d: TomlDoc = TomlDoc {
-        ok: true, error: "", kind: Vec::new(), sval: Vec::new(), parent: Vec::new(), key: Vec::new(), flags: Vec::new(), sect: Vec::new(), first: Vec::new(), next: Vec::new(), last: Vec::new(), src: text, lenient: lenient, cur: 0, section: 0
+        ok: true, error: "", kind: Vec::new(), sval: Vec::new(), parent: Vec::new(), key: Vec::new(), flags: Vec::new(), sect: Vec::new(), first: Vec::new(), next: Vec::new(), last: Vec::new(), src: text, lenient: lenient, cur: 0, section: 0, depth: 0
     };
     tn_new(&mut d, "table", "", -1, "", TF_HDR);
     var s: str = text;

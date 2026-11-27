@@ -115,13 +115,13 @@ the file), `deferred` (cannot be done on this machine), with the reason.
 
 | # | Goal | What is wrong | Files | Gate | Status |
 |---|---|---|---|---|---|
-| 1 | BG215 | UTF-8 decoders accept overlong, surrogate and out-of-range sequences | `stdlib/encoding.fd` (`utf8_decode`), `stdlib/unicode.fd` (`uni_to_codepoints`) | the entry's trigger bytes give U+FFFD; `uni_lower`/`uni_nfc` of `.. C0 AF x` keep the bytes | done (Nov 27 02:25) |
-| 2 | BG217 | decimal: a negative scale prints the wrong value | `stdlib/decimal.fd` (`dec_round`, `dec_div`, `dec_to_str`) | `dec_round(dec_parse("1234"), -2, DEC_HALF_UP)` is 1200; `dec_div(1000, 3, -1, DEC_HALF_UP)` is 330 | done (Nov 27 02:40) |
-| 3 | BG238 | `Money_print` writes negative amounts wrong | `stdlib/money.fd` | `Money_new(-5)` prints `-$0.05`, `-105` prints `-$1.05` | done (Nov 27 02:48) |
-| 4 | BG239 | `hkdf_expand` does not reject a length over 255 * 32 | `stdlib/tls_crypto.fd` | a length of 8161 is an error; RFC 5869 vectors still pass | done (Nov 27 03:00) |
-| 5 | BG223 | `url_resolve` builds broken or lossy URLs; path decoded too early | `stdlib/url.fd` | the entry's triggers (IPv6 host, userinfo, `%2F` in the path) | done (Nov 27 02:50; `Url.path` is now the path as written) |
-| 6 | BG216 | `tls_crypto::x25519` gets RFC 7748's second vector wrong | `stdlib/tls_crypto.fd` (`x25519`: mask bit 255 of `u`; a constant-time swap) | RFC 7748 section 5.2 vectors 1 and 2; slow in the interpreter, so through `ccompile` | done (Nov 27 03:20; it now calls x25519.fd's ladder) |
-| 7 | BG224 | `xml` and `toml` have no nesting limit | `stdlib/xml.fd`, `stdlib/toml.fd` | deep input gives an error, not a stack overflow | todo |
+| 1 | BG215 | UTF-8 decoders accept overlong, surrogate and out-of-range sequences | `stdlib/encoding.fd` (`utf8_decode`), `stdlib/unicode.fd` (`uni_to_codepoints`) | the entry's trigger bytes give U+FFFD; `uni_lower`/`uni_nfc` of `.. C0 AF x` keep the bytes | done (Nov 27 02:15) |
+| 2 | BG217 | decimal: a negative scale prints the wrong value | `stdlib/decimal.fd` (`dec_round`, `dec_div`, `dec_to_str`) | `dec_round(dec_parse("1234"), -2, DEC_HALF_UP)` is 1200; `dec_div(1000, 3, -1, DEC_HALF_UP)` is 330 | done (Nov 27 02:20) |
+| 3 | BG238 | `Money_print` writes negative amounts wrong | `stdlib/money.fd` | `Money_new(-5)` prints `-$0.05`, `-105` prints `-$1.05` | done (Nov 27 02:21) |
+| 4 | BG239 | `hkdf_expand` does not reject a length over 255 * 32 | `stdlib/tls_crypto.fd` | a length of 8161 is an error; RFC 5869 vectors still pass | done (Nov 27 02:33) |
+| 5 | BG223 | `url_resolve` builds broken or lossy URLs; path decoded too early | `stdlib/url.fd` | the entry's triggers (IPv6 host, userinfo, `%2F` in the path) | done (Nov 27 02:43; `Url.path` is now the path as written) |
+| 6 | BG216 | `tls_crypto::x25519` gets RFC 7748's second vector wrong | `stdlib/tls_crypto.fd` (`x25519`: mask bit 255 of `u`; a constant-time swap) | RFC 7748 section 5.2 vectors 1 and 2; slow in the interpreter, so through `ccompile` | done (Nov 27 02:57; it now calls x25519.fd's ladder) |
+| 7 | BG224 | `xml` and `toml` have no nesting limit | `stdlib/xml.fd`, `stdlib/toml.fd` | deep input gives an error, not a stack overflow | done (Nov 27 03:55; `XML_MAX_DEPTH`, `TOML_MAX_DEPTH`, both 128) |
 | 8 | BG180 | f-string float precision wrong for large values; fill ignored | `stdlib/core.fd` (`fstr_fmt_f64`, `__fstr_pad`, `__fstr_width0`) | the entry's triggers; check first whether it still reproduces | todo |
 | 9 | BG206 | Linux runtime `pert_str_to_float` is not correctly rounded | `stdlib/linux_runtime/base.fd` | 2000 printed doubles read back; runs here through `emit --nat` | todo (a correct-rounding conversion: the last of this group) |
 
@@ -190,26 +190,30 @@ Take in this order as soon as `git status --porcelain -- <file>` is empty.
 
 ## Run log
 
-One line per run: time, what was done, what is next.
+One line per goal: the time of its commit, what was done. (The first
+version of this log carried times I estimated, ahead of the clock; these
+are the commit times.)
 
-- Nov 27 02:08 (the session that created the workflow): BG215 fixed in
-  `stdlib/encoding.fd` and `stdlib/unicode.fd`; `test_bg215_utf8_strict`
-  passes on run, ccompile and emit. Next: BG217.
-- Nov 27 02:40: BG217 fixed in `stdlib/decimal.fd` (`dec_to_str`,
-  `dec_from_units`); `test_bg217_decimal_negative_scale` passes on run,
-  ccompile and emit. Next: BG238.
-- Nov 27 02:48: BG238 fixed in `stdlib/money.fd` (`Money_print`);
-  `test_bg238_money_negative` passes on run, ccompile and emit. Next: BG239.
-- Nov 27 03:00: BG239 fixed in `stdlib/tls_crypto.fd` (`hkdf_expand`);
-  `test_bg239_hkdf_expand_limit_fail` passes on run, ccompile and emit (the
-  8160-byte limit itself checked once through ccompile). Next: BG223.
-- Nov 27 02:50: BG223 fixed in `stdlib/url.fd` and `stdlib/http_client.fd`
+- Nov 27 02:15, BG215 (`06c69853`): `stdlib/encoding.fd`,
+  `stdlib/unicode.fd`; `test_bg215_utf8_strict` passes on run, ccompile
+  and emit.
+- 02:20, BG217 (`7efca793`): `stdlib/decimal.fd` (`dec_to_str`,
+  `dec_from_units`); `test_bg217_decimal_negative_scale` passes.
+- 02:21, BG238 (`b3a6fd43`): `stdlib/money.fd` (`Money_print`);
+  `test_bg238_money_negative` passes.
+- 02:33, BG239 (`3e07c20f`): `stdlib/tls_crypto.fd` (`hkdf_expand`);
+  `test_bg239_hkdf_expand_limit_fail` passes (the 8160-byte limit itself
+  checked once through ccompile).
+- 02:43, BG223 (`cc9b7d95`): `stdlib/url.fd`, `stdlib/http_client.fd`
   (`Url.path` is the path as written; `url_path_escape`, `url_authority`,
-  `url_ref_path`); `test_bg223_url_path_and_authority` passes on run,
-  ccompile and emit. Another session's commit be363179 ("0.8.5 unstable")
-  took the source and the test from the tree before the test's last
-  expected line was corrected; this commit corrects it and records the
-  goal. Next: BG216.
-- Nov 27 03:20: BG216 fixed in `stdlib/tls_crypto.fd` (`x25519` calls
+  `url_ref_path`); `test_bg223_url_path_and_authority` passes. Another
+  session's commit be363179 ("0.8.5 unstable") took the source and the
+  test from the tree before the test's last expected line was corrected;
+  cc9b7d95 corrects it and records the goal.
+- 02:57, BG216 (`7463e2f3`): `stdlib/tls_crypto.fd` (`x25519` calls
   x25519.fd's `x25519_scalarmult`); `test_bg216_tls_crypto_x25519` passes
-  on run, ccompile and emit (about 100 s on run). Next: BG224.
+  (about 100 s on run).
+- 03:55, BG224: `stdlib/xml.fd`, `stdlib/toml.fd` (`XML_MAX_DEPTH`,
+  `TOML_MAX_DEPTH`, both 128); `test_bg224_xml_toml_depth_limit` passes
+  (59 s on run); the entry's large inputs checked once through ccompile
+  and emit. Next: BG180, then queue C.

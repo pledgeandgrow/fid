@@ -2182,13 +2182,35 @@ names are the reference.
       session's commit of the same tree) with the test's last expected line
       still wrong; the next commit corrects it. Left as it was, the same
       class: userinfo and fragment are still percent-decoded at parse.
-- [ ] BG224. **xml and toml have no nesting limit, so deep input overflows the
+- [x] BG224. **xml and toml have no nesting limit, so deep input overflows the
       stack.** stdlib/xml.fd `x_children`/`x_ns_open` and stdlib/toml.fd
       `tp_value`/`tp_array` have no depth counter (the json validator entry is
       the same class). Triggers: `<a>` x 400k (~1.2 MB) gives "Panic: Stack
       overflow" on C; toml `x = [` x 1M the same; both hit the recursion limit
       at depth 1000 under `run`. yaml flow `[` was inconclusive. Confirmed Nov
       24. Confidence: high.
+      Fixed Nov 27: xml.fd `XML_MAX_DEPTH` and toml.fd `TOML_MAX_DEPTH`, both
+      128, counted in the parser state. XML: past the limit a strict parse
+      fails ("elements nested deeper than 128") and a lenient one keeps the
+      element without its content. TOML: `tp_value` refuses a deeper array or
+      inline table ("value nested deeper than 128"), so toml_load fails and
+      toml_parse skips the line. 128 and not JSON's 512: a tree of nodes is
+      destroyed recursively too, and under `fid run` a tree 150 deep is
+      parsed, copied and destroyed where one 200 deep is not (the recursion
+      limit is 1000). Test test_bg224_xml_toml_depth_limit (128 and 129 deep,
+      150 unclosed elements, inline tables, the lenient parser): passes on
+      run (59 s), ccompile and emit with the fid-dev of Nov 25. The entry's
+      large inputs, once through ccompile and emit, in about a second:
+      400,000 `<a>` parse lenient, a million `[` is refused, and 20,000
+      siblings or array items are not depth. test_lib_xml, test_xml_spec,
+      test_lib_toml, test_toml_spec, test_toml_suite_spec,
+      test_verify_vf15_parsers, test_std_behavior_tree and test_std_openadr
+      unchanged. Two tests near this change fail for other reasons:
+      test_std_svd on emit, because the native Windows backend lacks
+      p_volatile_load16/p_volatile_store16 (the compiler names them, and the
+      test makes no xml or toml call); test_xml_dtd_ns passes on ccompile
+      and emit and does not finish on the interpreter inside the runner's
+      300 s (its entity bomb expands up to 8 MB there). Not looked at: yaml.
 - [ ] BG225. **The interpreter's mutex does not exclude between tasks
       either.** `fid run` prints 5 (want 15) for the same three-holder probe
       as the C runtime mutex entry: a task holding `p_mutex_lock` across
