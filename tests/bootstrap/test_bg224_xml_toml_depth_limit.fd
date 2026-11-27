@@ -1,15 +1,18 @@
 // BG224 (docs/roadmap/bugs-roadmap.md): xml and toml refuse input nested
-// deeper than their limit (128) instead of overflowing the stack. A
-// document at the limit still parses and is destroyed; the large inputs of
-// the entry (400,000 elements, a million brackets) were checked through
-// ccompile: too slow in the interpreter for a suite test.
+// deeper than their limit instead of overflowing the stack. A document at
+// the limit still parses and is destroyed; the limit follows the backend
+// where the stack is small (xml_max_depth: 48 on WebAssembly, where the
+// parser overflows at 64; 128 elsewhere), so this prints what holds on
+// every backend. The large inputs of the entry (400,000 elements, a
+// million brackets) were checked through ccompile: too slow in the
+// interpreter for a suite test.
 //
 // Expected output:
 // xml, 150 unclosed elements, lenient: a
-// xml, 128 deep, strict: true, levels: 128
-// xml, 129 deep, strict: false, error names the limit: true
-// toml, 128 arrays deep, strict: true
-// toml, 129 arrays deep, strict: false, error names the limit: true
+// xml, a document at the limit parses to its depth: true
+// xml, one deeper is refused and names the limit: true
+// toml, a document at the limit parses: true
+// toml, one deeper is refused and names the limit: true
 // toml, 140 inline tables deep, strict: false
 // toml, 400 arrays deep, lenient: 1
 use string;
@@ -37,28 +40,34 @@ fn levels(node: XmlNode) -> i64 {
 }
 
 fn main() -> i64 {
-    val limit = "nested deeper than 128";
-
     var root: XmlNode = xml_parse(rep("<a>", 150));
     print("xml, 150 unclosed elements, lenient: ");
     print(root.tag);
     print("\n");
 
-    var d128: XmlDoc = xml_load(rep("<a>", 128) + rep("</a>", 128));
-    println(f"xml, 128 deep, strict: {d128.ok}, levels: {levels(d128.root)}");
-    var d129: XmlDoc = xml_load(rep("<a>", 129) + rep("</a>", 129));
-    println(f"xml, 129 deep, strict: {d129.ok}, error names the limit: {str_contains(d129.error, limit)}");
+    val xl = xml_max_depth();
+    var d_at: XmlDoc = xml_load(rep("<a>", xl) + rep("</a>", xl));
+    print("xml, a document at the limit parses to its depth: ");
+    println(d_at.ok && levels(d_at.root) == xl);
+    var d_over: XmlDoc = xml_load(rep("<a>", xl + 1) + rep("</a>", xl + 1));
+    print("xml, one deeper is refused and names the limit: ");
+    println(!d_over.ok && str_contains(d_over.error, "nested deeper than " + int_to_str(xl)));
 
-    var t128: TomlDoc = toml_load("x = " + rep("[", 128) + rep("]", 128) + "\n");
-    println(f"toml, 128 arrays deep, strict: {t128.ok}");
-    var t129: TomlDoc = toml_load("x = " + rep("[", 129) + rep("]", 129) + "\n");
-    println(f"toml, 129 arrays deep, strict: {t129.ok}, error names the limit: {str_contains(t129.error, limit)}");
+    val tl = toml_max_depth();
+    var t_at: TomlDoc = toml_load("x = " + rep("[", tl) + rep("]", tl) + "\n");
+    print("toml, a document at the limit parses: ");
+    println(t_at.ok);
+    var t_over: TomlDoc = toml_load("x = " + rep("[", tl + 1) + rep("]", tl + 1) + "\n");
+    print("toml, one deeper is refused and names the limit: ");
+    println(!t_over.ok && str_contains(t_over.error, "nested deeper than " + int_to_str(tl)));
 
     var t140: TomlDoc = toml_load("x = " + rep("{a = ", 140) + "1" + rep("}", 140) + "\n");
-    println(f"toml, 140 inline tables deep, strict: {t140.ok}");
+    print("toml, 140 inline tables deep, strict: ");
+    println(t140.ok);
 
     // the lenient parser keeps the failed key as one "invalid" entry
-    var tl: Vec<TomlEntry> = toml_parse("x = " + rep("[", 400) + "\n");
-    println(f"toml, 400 arrays deep, lenient: {tl.len()}");
+    var tl_entries: Vec<TomlEntry> = toml_parse("x = " + rep("[", 400) + "\n");
+    print("toml, 400 arrays deep, lenient: ");
+    println(tl_entries.len());
     return 0;
 }

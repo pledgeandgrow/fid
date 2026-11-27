@@ -2246,6 +2246,14 @@ names are the reference.
       test makes no xml or toml call); test_xml_dtd_ns passes on ccompile
       and emit and did not finish on the interpreter in 900 s (its entity
       bomb expands up to 8 MB there). Not looked at: yaml.
+      Later on Nov 27 (night): the whole WebAssembly suite showed the
+      test overflowing the stack there before its first line: the XML
+      parser's frames overflow the WebAssembly stack at 64 levels (48
+      parse). The XML limit follows the backend (`xml_max_depth`: 48 on
+      WebAssembly, XML_MAX_DEPTH elsewhere); TOML parses 128 arrays and
+      64 inline tables deep on WebAssembly, so its limit stays
+      (`toml_max_depth`). The test prints what holds on every backend and
+      passes on wasm too (scripts/wasm-test.sh on it: 1 passed).
 - [ ] BG225. **The interpreter's mutex does not exclude between tasks
       either.** `fid run` prints 5 (want 15) for the same three-holder probe
       as the C runtime mutex entry: a task holding `p_mutex_lock` across

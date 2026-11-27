@@ -537,6 +537,16 @@ const X_EXPAND_MAX: i64 = 8388608;
 /// recursion limit is 1000.
 pub const XML_MAX_DEPTH: i64 = 128;
 
+/// The deepest nesting this build accepts: XML_MAX_DEPTH, or 48 on
+/// WebAssembly, where the parser's frames overflow the stack at 64 (a
+/// document at the limit must still parse on every backend).
+pub fn xml_max_depth() -> i64 {
+    comptime if comptime target_os() == "wasi" {
+        return 48;
+    }
+    return XML_MAX_DEPTH;
+}
+
 // Character data decoded (see xp_decode_in).
 fn xp_decode(p: &mut XP, raw: str, pos: i64) -> str {
     return xp_decode_in(p, raw, pos, false);
@@ -2434,10 +2444,10 @@ fn x_children(p: &mut XP, i: i64, parent: &mut XmlNode, close_tag: str) -> i64 {
                     parent.text = parent.text + xp_decode(p, text_acc, text_pos);
                     text_acc = "";
                 }
-                if !self_close && p.depth >= XML_MAX_DEPTH {
+                if !self_close && p.depth >= xml_max_depth() {
                     // not descended into: what follows is this level's
                     // content (a stack overflow before, BG224)
-                    if xp_fail(p, j, "elements nested deeper than " + int_to_str(XML_MAX_DEPTH)) {
+                    if xp_fail(p, j, "elements nested deeper than " + int_to_str(xml_max_depth())) {
                         return n;
                     }
                     self_close = true;
