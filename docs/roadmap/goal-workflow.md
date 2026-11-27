@@ -168,15 +168,15 @@ Take in this order as soon as `git status --porcelain -- <file>` is empty.
 | # | Goal | Files |
 |---|---|---|
 | 26 | DWARF: `DW_AT_decl_file` is 0 for generated functions (the 15 `image-check.sh` failures) | `compiler/nat_ir.fd` (`ng_gen_function`: `g_nat_line_file_ix = 0` for a function without a source file), `compiler/nat_enc.fd` | Status: fixed by another session in e52b278d (Nov 27 02:07): only confirm with release/fid-night.exe through scripts/image-check.sh |
-| 27 | BG201, BG202, BG240, BG242, BG235 | `compiler/typechecker.fd` |
+| 27 | BG201, BG202, BG240, BG242, BG235 | `compiler/typechecker.fd` | Status: BG201, BG202 and BG240: code in b03479b8, to validate with the next build; BG242 does not reproduce with the compiler of Nov 25 (a str for an i64 parameter is rejected), its regression test test_bg242_str_for_int_param_fail is in 0fcd0261, to validate the same way; BG235 not started |
 | 28 | BG203, BG228, BG230, BG241 | `compiler/lower.fd` |
 | 29 | BG209, BG210, BG211 | `compiler/lexer.fd`, `compiler/parser.fd` |
 | 30 | BG205, BG231, BG244 | `compiler/codegen_c.fd` |
-| 31 | BG236 | `compiler/mono.fd` |
+| 31 | BG236 | `compiler/mono.fd` | Status: code in 0fcd0261 (each part of a function type carries its length), to validate with the next build through tests/selfhost/test_mono.fd |
 | 32 | BG234, BG245 | `compiler/nat_enc.fd` |
 | 33 | BG218, BG219 | `compiler/compiler.fd` |
 | 34 | BG225, BG229 | `compiler/interp.fd` |
-| 35 | BG237 | `compiler/main.fd` or `compiler/fmt.fd` |
+| 35 | BG237 | `compiler/main.fd` or `compiler/fmt.fd` | Status: code in b03479b8, to validate with the next build through tests/tooling/fmt-flag-order-check.sh |
 | 36 | BG246 | `compiler/pe_ir*.fd` (check whether it is clean) |
 | 37 | MI9, MI5, MI14, MI17, RA1, TG5, TG11, TG16, WP6, WP14, LF11, LF13, LF14, LF16, LF20, SP16, OP15, CS3, VF3, VF5, TL5 | `nat_ir.fd`, `iropt.fd`, `wasm.fd` and the like; each large, take only after B to D are closed |
 | 38 | BG248 (found by the comparison) | `compiler/nat_ir.fd` | todo: `--nat` Windows: a call through a function value made from a C function's address returns 0 (test_fix_fnval_c_ptr prints 7, 12, 5 through `emit`) |
