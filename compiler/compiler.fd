@@ -9796,7 +9796,12 @@ fn cc_find_trait_impl_conflicts(imported: Vec<Program>, names: Vec<str>, user: P
     var user_pairs: i64 = HashMap_new();
     var ui: i64 = 0;
     while ui < user.trait_impls.len() {
-        HashMap_insert(user_pairs, user.trait_impls.get(ui).trait_name + " for " + user.trait_impls.get(ui).type_name, 1);
+        var ukey: str = user.trait_impls.get(ui).trait_name + " for " + user.trait_impls.get(ui).type_name;
+        // BG218: twice in the program itself, where the later one won
+        if str_len(user.trait_impls.get(ui).trait_name) > 0 && HashMap_get(user_pairs, ukey) != 0 {
+            errors.push("Type error: `impl " + ukey + "` is defined twice in this program.\n    Fix: keep one impl block and move the other's methods into it.");
+        }
+        HashMap_insert(user_pairs, ukey, 1);
         ui = ui + 1;
     }
     // "Trait for Type" -> 1 + index of the module that implements it first
@@ -9813,6 +9818,9 @@ fn cc_find_trait_impl_conflicts(imported: Vec<Program>, names: Vec<str>, user: P
                     HashMap_insert(seen, key, mi + 1);
                 } else if first - 1 != mi {
                     errors.push("Type error: conflicting implementations of `impl " + key + "`: both module '" + names.get(first - 1) + "' and module '" + names.get(mi) + "' define it.\n    Fix: implement `" + key + "` in your own program (it then replaces both), or import only one of the two modules.");
+                } else if str_len(prog.trait_impls.get(ti).trait_name) > 0 {
+                    // BG218: twice in one module
+                    errors.push("Type error: `impl " + key + "` is defined twice in module '" + names.get(mi) + "'.\n    Fix: keep one impl block and move the other's methods into it.");
                 }
             }
             ti = ti + 1;
