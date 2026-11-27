@@ -10,8 +10,9 @@ step runnable. -->
 
 ### Windows (recommended)
 
-1. Download `Fides-Setup-0.8.0.exe` from the
-   [releases page](https://github.com/pledgeandgrow/fid/releases).
+1. Download the newest `Fid-Setup-<version>.exe` (today:
+   [`Fid-Setup-0.8.6.exe`](https://github.com/pledgeandgrow/fid/releases/tag/v0.8.6-unstable))
+   from the [releases page](https://github.com/pledgeandgrow/fid/releases).
 2. Run the installer.
 3. Open a new Command Prompt or PowerShell window.
 4. Verify installation:
@@ -123,7 +124,7 @@ Sum: 6
 
 ## Windows Installer Details
 
-The installer (`Fides-Setup-0.8.0.exe`, 6.6 MB) includes:
+The installer (`Fid-Setup-0.8.6.exe`) includes:
 
 | Component | Description | Optional |
 |-----------|-------------|----------|

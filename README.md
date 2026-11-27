@@ -14,7 +14,7 @@
 
 <p align="center">
   <a href="https://fid-lang.org/playground"><img alt="Try it in your browser" src="https://img.shields.io/badge/try%20it-in%20your%20browser-C2255C?style=for-the-badge"></a>
-  <a href="https://fid-lang.org/docs/install"><img alt="Install" src="https://img.shields.io/badge/install-v0.8.5--unstable-262626?style=for-the-badge"></a>
+  <a href="https://fid-lang.org/docs/install"><img alt="Install" src="https://img.shields.io/badge/install-v0.8.6--unstable-262626?style=for-the-badge"></a>
   <a href="https://fid-lang.org/docs"><img alt="Documentation" src="https://img.shields.io/badge/read-the%20docs-262626?style=for-the-badge"></a>
 </p>
 
@@ -145,7 +145,7 @@ Every message is explained on the [Compiler Errors](https://fid-lang.org/docs/er
 
 ## Install
 
-**Windows.** Download [`Fid-Setup-0.8.5.exe`](https://github.com/pledgeandgrow/fid/releases/tag/v0.8.5-unstable) (older versions on the [releases page](https://github.com/pledgeandgrow/fid/releases)). It puts `fid.exe`, `ark`, `scribe` and `veil` on your PATH with the standard library beside them. The installer is not code-signed yet, so Windows will ask you to confirm. `fid ccompile` needs a C compiler on PATH (`zig cc`, gcc, clang or tcc); `fid run` and `fid emit` need none.
+**Windows.** Download [`Fid-Setup-0.8.6.exe`](https://github.com/pledgeandgrow/fid/releases/tag/v0.8.6-unstable) (older versions on the [releases page](https://github.com/pledgeandgrow/fid/releases)). It puts `fid.exe`, `ark`, `scribe` and `veil` on your PATH with the standard library beside them. The installer is not code-signed yet, so Windows will ask you to confirm. `fid ccompile` needs a C compiler on PATH (`zig cc`, gcc, clang or tcc); `fid run` and `fid emit` need none.
 
 **Linux and macOS, or from source anywhere.** You need git, Rust and a C compiler (`zig cc` 0.16 is the tested one):
 
@@ -251,10 +251,10 @@ Signatures for every module: [API reference](https://fid-lang.org/reference).
 
 Fid is young and moving fast.
 
-- **Releases:** the newest is the **[v0.8.5-unstable](https://github.com/pledgeandgrow/fid/releases/tag/v0.8.5-unstable)** prerelease (Nov 27). Its `fid.exe` is a one-stage build from a self-hosted `fid` (4 of its 8 C units at -O0), not a 3-stage fixpoint. The first published build, Sep 9, was tagged v1.0.0 and is now listed as 0.7. The stable 1.0 is planned for December; `fid version` reports `1.0.0+dev`.
+- **Releases:** the newest is the **[v0.8.6-unstable](https://github.com/pledgeandgrow/fid/releases/tag/v0.8.6-unstable)** prerelease (Nov 27). Its `fid.exe` is a one-stage build from a self-hosted `fid` (all 16 C units at -O2), not a 3-stage fixpoint. The first published build, Sep 9, was tagged v1.0.0 and is now listed as 0.7. The stable 1.0 is planned for December; `fid version` reports `1.0.0+dev`.
 - **Generated code is slower than Rust's.** Through C, Fid was fastest on one of four benchmarks and up to 1.6 times slower than the fastest on the others (Nov 15 run, a busy machine); native output is slower still. [Benchmarks, losses included](docs/benchmarks.md).
 - **The package index is just starting.** `ark` installs from a path, a git repository or [the pacts index](https://github.com/pledgeandgrow/pacts) (`fid ark add textkit`, verified on Windows, Linux CI and macOS CI); few pacts are published yet.
-- **The fixpoint was last verified on Nov 21, 2026:** stage 2 and stage 3 were byte-identical on that day's ~361K-line tree. Builds since (Nov 25, Nov 27, v0.8.5-unstable) are one stage from a self-hosted `fid`; the Nov 25 one passes the leak gate (11 of 11).
+- **The fixpoint was last verified on Nov 21, 2026:** stage 2 and stage 3 were byte-identical on that day's ~361K-line tree. Builds since (Nov 25, Nov 27, v0.8.5/v0.8.6-unstable) are one stage from a self-hosted `fid`; the Nov 25 one passes the leak gate (11 of 11).
 - **The full test suite has been rerun only on the interpreter.** Nov 25, with `fid` as the compiler: 1,897 of 1,983 pass on `run` (82 of the failures fail the same with the earlier compiler, 4 are timeouts). The C and native lanes of the whole suite have not been rerun; features are checked with their own tests on each backend.
 - **CI is red.** `ci.yml` and `tier1.yml` have not had a green run since Nov 21, nor `macos-native.yml`; the checks above were run by hand on a Windows machine.
 - **Open bugs.** Three whole-repo reviews (Nov 22, 24, 27) logged 489 entries in the [bugs roadmap](docs/roadmap/bugs-roadmap.md): 230 are fixed with tests, 27 partly, 232 open — most of them from the latest review and still being worked down.

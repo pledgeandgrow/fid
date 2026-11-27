@@ -12,8 +12,8 @@
 > `fid.exe`. The fixpoint was last reached on Nov 21 (123,338,942 bytes of
 > C, from the pinned self-hosted stage 0; before that Nov 8, 67 MB); later
 > changes were checked on one-stage builds from a self-hosted stage 0
-> (Nov 25, Nov 27). v0.8.5-unstable (Nov 27, be36317) ships such a
-> one-stage build, not a 3-stage fixpoint. A `fid` built by `fidesc` runs
+> (Nov 25, Nov 27). v0.8.5-unstable and v0.8.6-unstable (both Nov 27)
+> ship such one-stage builds, not a 3-stage fixpoint. A `fid` built by `fidesc` runs
 > out of memory self-compiling the current tree (known-bugs 2g.79). `fid`
 > compiles itself to C in 43.5 s when built fully with gcc -O2 (Nov 27; 57 s
 > on Nov 21); `fidesc` took ~45 s (Nov 20).
@@ -169,7 +169,7 @@ OP23's vblk search lowering are the known left items.
 | Roadmap checkboxes (`[x]` / `[~]` / `[ ]`, be36317) | bugs 207/3/36, competitive 113/44/0, complaint 92/8/0, end 0/13/0, evolution 0/0/25, external 0/0/14, inc 29/2/0, llvm 160/36/0, pe 100/0/0, release 138/3/0, roadmap.md 607/2/0, target 0/0/100 |
 | Roadmap goal check (Nov 21, with that fid) | 224 goals: 87 validated, 121 partly, 15 failed, 1 not checkable here; the bugs found are known-bugs.md 2g.80-2g.113 |
 | Self-compile (`dump-c compiler/main.fd`) | Nov 27 (the Nov 27 tree's fid built fully with gcc -O2): 43.5 s total, 44 s wall (typecheck 4.9 s, mono 0.2, lower 11.8, C generation 14.9); the C byte-identical with FID_MONO_FULL=1 and with FID_PAR=4 (llvm-roadmap SP12). Nov 21 (361K lines): 57 s with the compiler built at -O2 in 8 split units (type check 4.8 s, borrow check 0.7, mono 0.6, front end 16.6 in all, lowering 32.9, C 19.3; CS4); `check compiler/main.fd --time` 35 s. Nov 9 (158K lines): 74 s with the compiler built at -O2 in 8 split units (type check 18 s, borrow check 5, mono 5, lowering 24, C 20), 229 s at -O0; Nov 6: ~133 s; `fidesc` (Rust, Nov 20, 361K lines): dump-c ~45 s peaking ~600 MB — the compiler is now ~2.3x larger |
-| Version (`compiler/build_info.fd`) | base `1.0.0` (`fid version` prints `1.0.0+dev` on a dev build); tags: v0.7 (Sep 9, the commit "Fides v1.0.0"), v0.8.0-unstable (Nov 10), v0.8.1-unstable and v0.8.2-unstable (Nov 21), v0.8.3-unstable (Nov 22), v0.8.4-unstable (Nov 23); v0.8.5-unstable prepared Nov 27 (be36317), its fid.exe a one-stage build from a self-hosted stage 0, not a 3-stage fixpoint |
+| Version (`compiler/build_info.fd`) | base `1.0.0` (`fid version` prints `1.0.0+dev` on a dev build); tags: v0.7 (Sep 9, the commit "Fides v1.0.0"), v0.8.0-unstable (Nov 10), v0.8.1-unstable and v0.8.2-unstable (Nov 21), v0.8.3-unstable (Nov 22), v0.8.4-unstable (Nov 23); v0.8.5-unstable and v0.8.6-unstable prepared Nov 27, their fid.exe one-stage builds from a self-hosted stage 0, not a 3-stage fixpoint |
 
 Session 30 (Oct 2026) for comparison: compiler 54 files / 104,439 lines, Rust
 55 / 100,935, stdlib 104 / 30,446, 302 bootstrap tests. Nov 9 for comparison:

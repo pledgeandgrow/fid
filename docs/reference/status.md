@@ -5,13 +5,13 @@
 > here). Counts: [selfhost.md → Numbers](selfhost.md#numbers). Open bugs:
 > [bugs roadmap](../roadmap/bugs-roadmap.md), [known-bugs.md](known-bugs.md).
 
-## Where things stand (Nov 27, 2026 — v0.8.5-unstable, `fid version` reports `1.0.0+dev`)
+## Where things stand (Nov 27, 2026 — v0.8.6-unstable, `fid version` reports `1.0.0+dev`)
 
 **Self-hosting.** The Fides compiler compiles itself. The 3-stage
 fixpoint (stage 2 C == stage 3 C, byte-identical) was last verified
 **Nov 21** on that day's ~361K-line tree, from a pinned self-hosted
 stage 0. Everything since — the Nov 25 build, the Nov 27 build and the
-v0.8.5-unstable `fid.exe` — is a **one-stage build from a self-hosted
+v0.8.6-unstable `fid.exe` — is a **one-stage build from a self-hosted
 fid, not a fixpoint**: faster to produce, but the byte-identical check
 has not been re-run on the current tree. A bootstrap that starts from
 the frozen Rust compiler still cannot finish: a `fidesc`-built `fid`
