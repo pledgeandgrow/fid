@@ -99,7 +99,8 @@ and `AGENTS.md` first when working on the compiler.
 | [file-analysis/](docs/file-analysis/PROGRESS.md) | One doc per `compiler/*.fd` module (64 of 65 — lockcheck lacks a page), rewritten Nov 9, 2026: role, callers, commands that reach it, open problems. |
 | [proposals/](docs/proposals/) | Language proposals: 0001 value semantics, 0002 generics, 0003 memory model and cancellation, 0004 ownership and layout, 0005 region arenas, 0006 the M5 decision (ownership, not copy-on-write). |
 | [verification/README.md](docs/verification/README.md) | Verification tools (fuzzers, soak, chaos, interleavings), formal semantics, memory-safety core, translation validation, the miscompile log. |
-| [stdlib/README.md](docs/stdlib/README.md) | Standard library module docs. |
+| [stdlib/README.md](docs/stdlib/README.md) | Standard library module docs (curated index; [stdlib/index.md](docs/stdlib/index.md) is the generated list of all 414 pages). |
+| [compiler/index.md](docs/compiler/index.md) | Generated API docs for the compiler modules (65 pages, scribe). |
 
 ### Single-topic notes
 | File | Description |
