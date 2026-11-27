@@ -3858,6 +3858,28 @@ Every platform gets a tier, and a tier means CI, not a hope.
       functions with no wasm version with a clear message. Left: the full
       suite through wasm-test.sh (a 40-test sample: 35 pass, and
       test_fix_fnval_struct_ret fails); threads; the CI lane not checked.
+      Nov 27 (night): the whole suite through scripts/wasm-test.sh ALL=1
+      with release/fid-v27.exe (the compiler of Nov 25): 1,315 programs, 4
+      at a time, 04:07 to 06:17, beside a compiler build: `fid wasm: 1116
+      passed, 35 failed, 25 did not build, 139 skipped`. Not a clean count:
+      the run shared the machine with that build, and most of the skips
+      (97) are programs whose interpreter reference did not finish in 300
+      s under that load; the other skips are FFI and processes, which
+      WebAssembly does not have. The 154 worth running again are listed in
+      build/verify-nov27/wasm-rerun-files.txt (35 FAIL, 97 without a
+      reference, the build failures other than those the checker rejects
+      on every backend). Named in the log: failures test_float_rem_exact,
+      test_machine_float_mod, test_interp_f32_narrow,
+      test_machine_tailcall_narrow, test_deref_minimal, test_alloc_oom_panic,
+      test_alloc_thread_heaps, test_bg195_mutex_task_sleep, the FFI
+      programs test_ffi, test_dynlib, test_dl_find, test_dlsym_typed_call
+      (a skip elsewhere), and three in flight in another session (BG182,
+      BG183, BG184); build failures test_asm_c, test_cfg_platforms,
+      test_bg184_dyn_cast_inline and the checker's 20. test_bg224_xml_toml_
+      depth_limit failed there and is fixed for WebAssembly since
+      18255c75. Left: run that list on a quiet machine and sort it (the
+      interpreter's own bugs, tests in flight, gaps of WebAssembly, gaps
+      every backend has), then the gaps it names; threads; the CI lane.
 - [~] PL5. Freestanding and embedded: Cortex-M, RISC-V boards, with no OS (release G)
       Nov 22 audit: Thumb-2 oracles green (enc-oracle-pl5.py 226 forms,
       op21 662 forms, 0 mismatches), test_thumb_core 23/23, thumb_check

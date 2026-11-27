@@ -87,8 +87,8 @@ set the queue row to `done`.
 | Marker | Result | Roadmap entry |
 |---|---|---|
 | `MI5_DONE` in `mi5.log` (done 04:07; re-runs in `mi5-rerun`, `mi5-rerun2`) | 1,287 same of 1,331 after re-running the rest on their own | `MI5` and `MI17`: written Nov 27 |
-| `WASM_DONE` in `wasm-all.log` | the `fid wasm:` summary line | `PL4` in `competitive-roadmap.md` |
-| `BENCH_DONE` in `mi14_bench.log` | the `pe_ir ... nat ... nat/pe_ir` lines | `MI14` in `llvm-roadmap.md` |
+| `WASM_DONE` in `wasm-all.log` (done 06:17) | `fid wasm: 1116 passed, 35 failed, 25 did not build, 139 skipped (of 1315)`, beside a build | `PL4` in `competitive-roadmap.md`: written Nov 27 07:30; the re-run of the 154 listed programs on a quiet machine is left |
+| `BENCH_DONE` in `mi14_bench.log` | the `pe_ir ... nat ... nat/pe_ir` lines | `MI14` in `llvm-roadmap.md`: written Nov 27 (ee0b0830) |
 
 Before counting a `DIFF`, `NATBUILD`, `PEBUILD` or `NOBUILD` line of the
 comparison, build that program again on its own
