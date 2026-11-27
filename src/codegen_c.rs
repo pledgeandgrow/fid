@@ -4073,17 +4073,19 @@ impl CCodeGen {
         wln!(self, "    __p_arena_cur = keep;");
         wln!(self, "}");
         // File I/O builtins
-        wln!(self, "char* p_file_read(const char* path) {{");
+        wln!(self, "static char* p_str_own_c(char* s);");
+        wln!(self, "static char* p_file_read__raw(const char* path) {{");
         wln!(self, "    FILE* f = fopen(path, \"rb\");");
         wln!(self, "    if (!f) return NULL;");
         wln!(self, "    fseek(f, 0, SEEK_END); long sz = ftell(f);");
         wln!(self, "    if (sz < 0) {{ fclose(f); return NULL; }}");
         wln!(self, "    fseek(f, 0, SEEK_SET);");
-        wln!(self, "    char* buf = (char*)malloc((size_t)sz + 1);");
+        wln!(self, "    char* buf = (char*)p_malloc((int64_t)sz + 1);");
         wln!(self, "    if (!buf) {{ fclose(f); return NULL; }}");
         wln!(self, "    size_t rd = fread(buf, 1, (size_t)sz, f); buf[rd] = 0; fclose(f);");
         wln!(self, "    return buf;");
         wln!(self, "}}");
+        wln!(self, "char* p_file_read(const char* path) {{ return p_str_own_c(p_file_read__raw(path)); }}");
         wln!(self, "int64_t p_file_write(const char* path, const char* content) {{");
         wln!(self, "    FILE* f = fopen(path, \"wb\");");
         wln!(self, "    if (!f) return -1;");
