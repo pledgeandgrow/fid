@@ -553,9 +553,11 @@ are the commit times.)
   Linux and macOS runners; fixed in scripts/build-units.sh (one heavy
   unit at a time, a limit per compile on Linux) and in the job
   timeouts, to be seen by the first push. After the build, CI's
-  selfhost job has three red steps left: fmt (30 files that another
-  session modifies are unformatted; the formatter's `as *mut` defect
-  is fixed, with tests/fmt/cast), the lint gate
+  selfhost job has three red steps left: fmt (8 to 16 files that
+  another session modifies are still unformatted, 22:45 measured on
+  their committed copies; the formatter's `as *mut` defect, the one
+  thing wrong in 15 other files, is fixed, with tests/fmt/cast), the
+  lint gate
   (scripts/lint-check.baseline is from Nov 19 and does not know 62
   modules with warnings; vec, math, crypto_bind_unix and parallel do
   not pass `fid check` as files) and the doc examples of hash,
