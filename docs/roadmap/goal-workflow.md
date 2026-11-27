@@ -297,8 +297,9 @@ are the commit times.)
   Also 5c86e3dd (two test fixes) and ac4ae268 (the mangle check as a unit
   test). Marked done on build 2's evidence: BG202, BG218, BG219, BG236,
   BG237, BG240, BG242 (bugs-roadmap.md; BG252 and BG253 filed there).
-  release/fid-night.exe is build 3: it rejects float assignments, so it
-  validates nothing.
+  release/fid-night.exe was build 3, which rejects float assignments: it
+  is renamed release/fid-night-0710-bad.exe (to delete with the user's OK),
+  and there is no release/fid-night.exe until the next build.
   NEXT, IN THIS ORDER: (1) build again (the command above) and copy the
   result to release/fid-night.exe; (2) `STEPS="0 2 6" bash
   build/verify-nov27/validate-batch3.sh`: 11 rejections (among them
