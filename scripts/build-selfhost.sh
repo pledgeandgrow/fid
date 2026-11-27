@@ -102,13 +102,14 @@ EOF
 
 echo "[3/3] ${CC_CMD[*]} -> $OUT/$OUT_EXE"
 # As scripts/bootstrap.sh: when the stage-0 compiler has `fid split-c`, the C
-# is split into SPLIT units (default 8) compiled at -O2, JOBS at a time
-# (default 4), and linked; the compiler is about 3x faster than one unit at
+# is split into SPLIT units (default 16) compiled at -O2, JOBS at a time
+# (default 2: 4 at a time kills a memory-tight runner before the retry logic
+# can help — the step is SIGTERMed whole, exit 143; override JOBS locally), and linked; the compiler is about 3x faster than one unit at
 # -O0 (the Rust bootstrap, tcc or SPLIT=1: one unit at -O0). A unit that
 # fails is retried alone, then the build stops with exit 1 (2g.86).
 # The generated C is the same either way: only the C compiler's work differs.
-SPLIT="${SPLIT:-8}"
-JOBS="${JOBS:-4}"
+SPLIT="${SPLIT:-16}"
+JOBS="${JOBS:-2}"
 SPLIT_CFLAGS=(-O2 -fno-strict-aliasing -fwrapv)
 for f in "${CFLAGS[@]}"; do [ "$f" != "-O0" ] && SPLIT_CFLAGS+=("$f"); done
 built=0
@@ -150,13 +151,31 @@ case "${CC_CMD[*]}" in *tcc*) ;; *)
         [ "$rc" -ne 0 ] && still+=("$k:$rc")
       done
       if [ ${#still[@]} -gt 0 ]; then
+        # the giant typechecker units exceed llvm's memory at any
+        # optimization level above -O0 even on a big machine (the stage0
+        # cross-build measured this): fall to -O1, then -O0, per unit
+        final=()
         for fu in "${still[@]}"; do
-          echo "error: unit ${base}_${fu%%:*}.c failed at -O2 again, alone (exit ${fu##*:})"
+          k="${fu%%:*}"
+          ok=0
+          for opt in -O1 -O0; do
+            echo "      unit ${base}_$k.c retrying at $opt (the giant-unit memory wall)"
+            cflags=("${SPLIT_CFLAGS[@]/$opt}")
+            if "${CC_CMD[@]}" "$opt" -fno-strict-aliasing -fwrapv -fno-sanitize=all -c "${base}_$k.c" -o "${base}_$k.o" >> "$OUT/fid-dev.cc.log" 2>&1; then
+              ok=1; break
+            fi
+          done
+          [ "$ok" -eq 0 ] && final+=("$k")
         done
-        echo "      see $OUT/fid-dev.cc.log; SPLIT=1 builds one unit at -O0 (about 17x slower)"
-        grep -E "error" "$OUT/fid-dev.cc.log" | head -20
-        rm -f "${base}"_*.c "${base}"_*.o "$base.h"
-        exit 1
+        if [ ${#final[@]} -gt 0 ]; then
+          for k in "${final[@]}"; do
+            echo "error: unit ${base}_$k.c unbuildable at -O2/-O1/-O0"
+          done
+          echo "      see $OUT/fid-dev.cc.log; SPLIT=1 builds one unit at -O0 (about 17x slower)"
+          grep -E "error" "$OUT/fid-dev.cc.log" | head -20
+          rm -f "${base}"_*.c "${base}"_*.o "$base.h"
+          exit 1
+        fi
       fi
     fi
     if "${CC_CMD[@]}" "${objs[@]}" -o "$OUT/$OUT_EXE" "${LIBS[@]}" >> "$OUT/fid-dev.cc.log" 2>&1; then
