@@ -1,0 +1,65 @@
+// LG3 (docs/roadmap/competitive-roadmap.md): the read rule does not reject
+// a legal call. A mutable borrow ends with its statement and stays in the
+// checker's table without a borrower: one made by an earlier statement of
+// the block (`na(&mut g.e, 1)` below) holds nothing any more. A temporary
+// of the same call counts as a shared borrow until the call, also once a
+// nested call of its arguments has activated it (`f(g, h(g) > h(g) && k(r))`
+// reads g after the first h(g) ended). Before the fix the second call was
+// rejected: "cannot read g" (compiler/nat_ir.fd ng_mir_finish, its loop
+// over the functions).
+//
+// Expected output:
+// 7
+// 0
+use core;
+use vec;
+
+struct Inner {
+    code: Vec<i64>,
+}
+
+struct Outer {
+    e: Inner,
+    n: i64,
+}
+
+fn set_n(e: &mut Inner, a: i64) -> void {
+    if a == 0 {
+        e.code.push(0);
+    }
+}
+
+fn start(g: &Outer, heads: bool) -> i64 {
+    if heads {
+        return 7;
+    }
+    return 3;
+}
+
+fn align_of(g: &Outer, kind: i64) -> i64 {
+    return g.n + kind;
+}
+
+fn has_heads(r: &i64) -> bool {
+    return r > 0;
+}
+
+fn place(g: &mut Outer, rec: i64, aligned: bool) -> i64 {
+    var out: i64 = 0;
+    if aligned {
+        set_n(&mut g.e, 1);
+    } else {
+        set_n(&mut g.e, 1);
+        var before: i64 = g.e.code.len();
+        set_n(&mut g.e, start(g, align_of(g, 2) > align_of(g, 1) && has_heads(&rec)));
+        out = before;
+    }
+    return out;
+}
+
+fn main() -> i64 {
+    val g = Outer { e: Inner { code: Vec::new() }, n: 5 };
+    println(start(&g, true));
+    println(place(&mut g, 1, false));
+    return 0;
+}
