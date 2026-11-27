@@ -39,7 +39,9 @@ WWANT="$(expected "$WSRC")"
 HOST=linux
 case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) HOST=windows ;; esac
 WSL=""
-if [ "$HOST" = windows ] && command -v wsl.exe >/dev/null 2>&1; then WSL="wsl.exe -e"; fi
+# A working WSL only: wsl.exe is on PATH on every Windows, with no
+# distribution installed too, and then every image "fails" with no output
+if [ "$HOST" = windows ] && command -v wsl.exe >/dev/null 2>&1 && wsl.exe -e sh -c 'echo wsl-ok' 2>/dev/null | grep -q 'wsl-ok'; then WSL="wsl.exe -e"; fi
 
 # run_exe <dir> <exe> <target>: the program's output; status 99 when this
 # host cannot run it
@@ -109,7 +111,11 @@ for t in $TARGETS; do
     nz=$(grep -c '^\[lf20\] .* zeroes [1-9][0-9]* registers' "$OUT/$noregs.log")
     if [ "$nz" -eq 0 ]; then ok "$t: no register wipe with the switch off"; else bad "$t: $nz [lf20] lines still zero registers with FID_NAT_OFF=wiperegs"; fi
     e_on="$OUT/$(exe_of "$on" "$t")"; e_off="$OUT/$(exe_of "$noregs" "$t")"
-    if [ "$(wc -c <"$e_on")" -gt "$(wc -c <"$e_off")" ]; then ok "$t: the wipe adds code"; else bad "$t: image with the wipe is not larger ($(wc -c <"$e_on") vs $(wc -c <"$e_off"))"; fi
+    # The wipe changes the image. Its size need not grow: a fixed-width
+    # instruction set takes a no-op of the same size for a zeroing and a
+    # PE is padded to its file alignment; the zeroings themselves are
+    # counted below, where the image can be read.
+    if ! cmp -s "$e_on" "$e_off"; then ok "$t: the wipe changes the image"; else bad "$t: the image is the same with the wipe off"; fi
     got=$(run_exe "$OUT" "$(exe_of "$on" "$t")" "$t"); st=$?
     if [ "$st" = 99 ]; then
         echo "skip $t: cannot run here (build-only)"
@@ -120,13 +126,16 @@ for t in $TARGETS; do
         got3=$(run_exe "$OUT" "$(exe_of "$noregs" "$t")" "$t")
         if [ "$got3" = "$WANT" ]; then ok "$t: expected output (wiperegs off)"; else bad "$t: output differs (wiperegs off)"; fi
     fi
-    if [ -n "$OBJDUMP" ] && [ "$t" != windows ]; then
+    if [ -n "$OBJDUMP" ]; then
         if "$OBJDUMP" -d "$e_on" >"$OUT/$on.dis" 2>/dev/null && [ -s "$OUT/$on.dis" ]; then
             "$OBJDUMP" -d "$e_off" >"$OUT/$noregs.dis" 2>/dev/null
             case "$t" in
-                x86_64-linux) pat='pxor[[:space:]]+%?xmm15,[[:space:]]*%?xmm15' ;;
+                x86_64-linux|windows) pat='pxor[[:space:]]+%?xmm15,[[:space:]]*%?xmm15' ;;
                 aarch64-linux) pat='fmov[[:space:]]+d31,[[:space:]]*xzr' ;;
-                *) pat='fmv\.d\.x[[:space:]]+(ft11|f31),[[:space:]]*(zero|x0)' ;;
+                # Our RISC-V image does not say it has the D extension, so
+                # llvm-objdump prints fmv.d.x ft31, zero (f2000fd3) as
+                # <unknown>: the word is looked for then
+                *) pat='(fmv\.d\.x[[:space:]]+(ft11|fs3|f31),[[:space:]]*(zero|x0))|f2000fd3[[:space:]]+<unknown>' ;;
             esac
             c_on=$(grep -cE "$pat" "$OUT/$on.dis")
             c_off=$(grep -cE "$pat" "$OUT/$noregs.dis")

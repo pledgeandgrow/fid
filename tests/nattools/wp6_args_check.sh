@@ -38,7 +38,9 @@ WANT="$(expected "$SRC")"
 HOST=linux
 case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) HOST=windows ;; esac
 WSL=""
-if [ "$HOST" = windows ] && command -v wsl.exe >/dev/null 2>&1; then WSL="wsl.exe -e"; fi
+# A working WSL only: wsl.exe is on PATH on every Windows, with no
+# distribution installed too, and then every image "fails" with no output
+if [ "$HOST" = windows ] && command -v wsl.exe >/dev/null 2>&1 && wsl.exe -e sh -c 'echo wsl-ok' 2>/dev/null | grep -q 'wsl-ok'; then WSL="wsl.exe -e"; fi
 
 # run_exe <dir> <exe name> <target>: the program's output (status 99 when
 # this host cannot run it)

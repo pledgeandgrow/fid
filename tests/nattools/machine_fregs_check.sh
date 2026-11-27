@@ -36,7 +36,9 @@ WANT="$(expected "$SRC")"
 HOST=linux
 case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) HOST=windows ;; esac
 WSL=""
-if [ "$HOST" = windows ] && command -v wsl.exe >/dev/null 2>&1; then WSL="wsl.exe -e"; fi
+# A working WSL only: wsl.exe is on PATH on every Windows, with no
+# distribution installed too, and then every image "fails" with no output
+if [ "$HOST" = windows ] && command -v wsl.exe >/dev/null 2>&1 && wsl.exe -e sh -c 'echo wsl-ok' 2>/dev/null | grep -q 'wsl-ok'; then WSL="wsl.exe -e"; fi
 
 # run <dir> <exe name> <target>: prints the program's output (empty and
 # status 99 when this host cannot run it)
@@ -119,10 +121,16 @@ for t in x86_64-linux aarch64-linux riscv64-linux windows; do
 done
 
 # x86-64: SSE arithmetic (addsd/subsd/mulsd/divsd/addss/..) on a pool
-# register with the switch, never without it
+# register with the switch, never without it. Counted from the first
+# function symbol on (the section's own header `<.text>` is none): nat_ir's
+# float primitives (the round stub) come before, with xmm2/xmm3 as scratch
+# whatever the switch says.
 if [ -n "$OBJDUMP" ]; then
-    don=$("$OBJDUMP" -d "$OUT/fregs-x86_64-linux-on" 2>/dev/null | grep -E '(add|sub|mul|div)s[sd][[:space:]].*%xmm([2-9]|1[01])\b' | wc -l)
-    doff=$("$OBJDUMP" -d "$OUT/fregs-x86_64-linux-off" 2>/dev/null | grep -E '(add|sub|mul|div)s[sd][[:space:]].*%xmm([2-9]|1[01])\b' | wc -l)
+    pool_count() {
+        "$OBJDUMP" -d "$1" 2>/dev/null | awk '/^[0-9a-f]+ <[^.][^>]*>:/ { named = 1 } named && /(add|sub|mul|div)s[sd][[:space:]].*%xmm([2-9]|1[01])([^0-9]|$)/ { c++ } END { print c + 0 }'
+    }
+    don=$(pool_count "$OUT/fregs-x86_64-linux-on")
+    doff=$(pool_count "$OUT/fregs-x86_64-linux-off")
     if [ "$don" -gt 0 ] && [ "$doff" -eq 0 ]; then
         ok "x86-64: $don float operations on xmm2..xmm11 with the switch, none without"
     else

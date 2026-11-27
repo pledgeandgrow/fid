@@ -11,9 +11,9 @@
 #    split checker) by default, with FID_NAT_OFF=splitfloat, with
 #    FID_NAT_OFF=split and with FID_NAT_ON=splitall. Every build must
 #    succeed and every image that runs here must print the expected lines.
-#    By default `around` (two floats live across calls, read and written in
-#    a call-free loop; no integer spills) must have a [split] line with
-#    pieces, kept; with FID_NAT_OFF=splitfloat it has none.
+#    By default `between` (floats live across calls) must have a [split]
+#    line with pieces, kept; with FID_NAT_OFF=splitfloat it has none kept
+#    and spills more.
 # 2. Floats in float registers on --nat Windows by default (ng_fregs_on):
 #    the default build reports "[fregs] ...: N float ranges, M in float
 #    registers" with M > 0 summed; FID_NAT_OFF=winfregs reports none.
@@ -47,7 +47,9 @@ expected() { awk '/^\/\/ Expected output:/ { f = 1; next } f && /^\/\/ / { sub(/
 HOST=linux
 case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) HOST=windows ;; esac
 WSL=""
-if [ "$HOST" = windows ] && command -v wsl.exe >/dev/null 2>&1; then WSL="wsl.exe -e"; fi
+# A working WSL only: wsl.exe is on PATH on every Windows, with no
+# distribution installed too, and then every image "fails" with no output
+if [ "$HOST" = windows ] && command -v wsl.exe >/dev/null 2>&1 && wsl.exe -e sh -c 'echo wsl-ok' 2>/dev/null | grep -q 'wsl-ok'; then WSL="wsl.exe -e"; fi
 
 # run_exe <dir> <exe name> <target>: the program's output (status 99 when
 # this host cannot run it)
@@ -130,22 +132,27 @@ for t in x86_64-linux aarch64-linux riscv64-linux windows; do
     on="$OUT/mi14-$t-on$sfx.log"
     nofl="$OUT/mi14-$t-nofloat$sfx.log"
     if [ -f "$on" ] && [ -f "$nofl" ]; then
-        np=$(sed -n 's/^\[split\] around: \([0-9]*\) pieces.*/\1/p' "$on" | head -1)
-        if [ -n "$np" ] && [ "$np" -gt 0 ]; then
-            ok "$t: around's floats split into $np piece(s)"
-            if grep -q '^\[split\] around: .*, kept$' "$on"; then
-                ok "$t: around's split kept ($(sed -n 's/^\[split\] around: .*\(cost [0-9]* -> [0-9]*\).*/\1/p' "$on" | head -1))"
-            else
-                bad "$t: around's split not kept ($(grep '^\[split\] around' "$on" | head -1))"
-            fi
+        # between (floats live across calls): by default its float split is
+        # kept and costs less; with FID_NAT_OFF=splitfloat it is not kept
+        # and between spills more. around (a loop over floats read across
+        # the calls) is no candidate on any target since RA18's
+        # callee-saved float registers: printed, not required.
+        bp=$(sed -n 's/^\[split\] between: \([0-9]*\) pieces.*/\1/p' "$on" | head -1)
+        sp_on=$(sed -n 's/^\[stats\] between: spilled \([0-9]*\),.*/\1/p' "$on" | head -1)
+        sp_off=$(sed -n 's/^\[stats\] between: spilled \([0-9]*\),.*/\1/p' "$nofl" | head -1)
+        if [ -n "$bp" ] && [ "$bp" -gt 0 ] && grep -q '^\[split\] between: .*, kept$' "$on"; then
+            ok "$t: between's floats split into $bp piece(s), kept ($(sed -n 's/^\[split\] between: .*\(cost [0-9]* -> [0-9]*\).*/\1/p' "$on" | head -1))"
         else
-            bad "$t: no [split] line with pieces for around ($(grep '^\[split\]' "$on" | head -3 | tr '\n' ' '))"
+            bad "$t: between's float split is not kept by default ($(grep '^\[split\] between' "$on" | head -1))"
         fi
-        if grep -q '^\[split\] around:' "$nofl"; then
-            bad "$t: FID_NAT_OFF=splitfloat still splits around (no integer spills there)"
+        if grep -q '^\[split\] between: .*, kept$' "$nofl"; then
+            bad "$t: FID_NAT_OFF=splitfloat still keeps between's split"
+        elif [ -n "$sp_on" ] && [ -n "$sp_off" ] && [ "$sp_off" -gt "$sp_on" ]; then
+            ok "$t: FID_NAT_OFF=splitfloat: between not split, $sp_off values spilled (default: $sp_on)"
         else
-            ok "$t: FID_NAT_OFF=splitfloat: around not split"
+            bad "$t: FID_NAT_OFF=splitfloat: between not split but spilled $sp_off (default: $sp_on): the float split changes nothing"
         fi
+        echo "info $t around: $(grep '^\[split\] around' "$on" | head -1)"
         echo "info $t between: $(grep '^\[split\] between' "$on" | head -1)"
         echo "info $t many: $(grep '^\[split\] many' "$on" | head -1)"
     fi

@@ -155,14 +155,20 @@ case "${CC_CMD[*]}" in *tcc*) ;; *)
         # optimization level above -O0 even on a big machine (the stage0
         # cross-build measured this): fall to -O1, then -O0, per unit
         final=()
+        retried=()
         for fu in "${still[@]}"; do
           k="${fu%%:*}"
           ok=0
           for opt in -O1 -O0; do
             echo "      unit ${base}_$k.c retrying at $opt (the giant-unit memory wall)"
+            # the same flags as the first build with the optimization level
+            # (before Nov 27 the retry had neither -w nor the -Wno-*: the
+            # generated C's int-to-pointer conversions were errors then)
             cflags=("${SPLIT_CFLAGS[@]/$opt}")
-            if "${CC_CMD[@]}" "$opt" -fno-strict-aliasing -fwrapv -fno-sanitize=all -c "${base}_$k.c" -o "${base}_$k.o" >> "$OUT/fid-dev.cc.log" 2>&1; then
-              ok=1; break
+            if "${CC_CMD[@]}" "${cflags[@]}" -c "${base}_$k.c" -o "${base}_$k.o" >> "$OUT/fid-dev.cc.log" 2>&1; then
+              ok=1
+              retried+=("$k$opt")
+              break
             fi
           done
           [ "$ok" -eq 0 ] && final+=("$k")
@@ -179,7 +185,11 @@ case "${CC_CMD[*]}" in *tcc*) ;; *)
       fi
     fi
     if "${CC_CMD[@]}" "${objs[@]}" -o "$OUT/$OUT_EXE" "${LIBS[@]}" >> "$OUT/fid-dev.cc.log" 2>&1; then
-      echo "      ($SPLIT units at -O2)"
+      if [ "${#retried[@]}" -gt 0 ]; then
+        echo "      ($SPLIT units: $(( SPLIT - ${#retried[@]} )) at -O2, ${#retried[@]} below it: unit ${retried[*]})"
+      else
+        echo "      ($SPLIT units at -O2)"
+      fi
       built=1
     else
       rc=$?

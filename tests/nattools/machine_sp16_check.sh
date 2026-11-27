@@ -40,9 +40,11 @@ else
     EMIT=(emit --target x86_64-linux); EXT=""
     [ "$(uname -m)" = x86_64 ] || { echo "skip: native images need x86-64 here"; EMIT=(); }
 fi
-# On Windows the Linux image runs too, through WSL (the RLIMIT_STACK path)
+# On Windows the Linux image runs too, through WSL (the RLIMIT_STACK path):
+# only with a working WSL (wsl.exe is on PATH on every Windows, with no
+# distribution installed too)
 LINUX_TOO=0
-if [ "$WIN" = 1 ] && command -v wsl.exe > /dev/null 2>&1; then LINUX_TOO=1; fi
+if [ "$WIN" = 1 ] && command -v wsl.exe > /dev/null 2>&1 && wsl.exe -e sh -c 'echo wsl-ok' 2>/dev/null | grep -q 'wsl-ok'; then LINUX_TOO=1; fi
 
 # 1. static: the builtins
 for layer in "" win mac; do
@@ -53,10 +55,10 @@ for layer in "" win mac; do
         sed -n '/^MISSING/,$p' "$OUT/builtins$layer.txt" | head -20
     fi
 done
-# the extern "C" half must see an unresolvable extern (pledge_net_socket)
+# the extern "C" half must see an unresolvable extern (sp16_no_such_c_function)
 if python3 tests/nattools/selfhost_builtins_check.py --main tests/nattools/selfhost_extern_probe.fd > "$OUT/probe.txt" 2>&1; then
-    bad "builtins check passed the probe that reaches pledge_net_socket"
-elif grep -q "pledge_net_socket" "$OUT/probe.txt"; then
+    bad "builtins check passed the probe that reaches sp16_no_such_c_function"
+elif grep -q "sp16_no_such_c_function" "$OUT/probe.txt"; then
     ok "builtins check rejects an extern \"C\" the machine layer cannot run"
 else
     bad "builtins check probe: $(tail -2 "$OUT/probe.txt")"

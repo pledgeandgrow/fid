@@ -32,6 +32,10 @@
 set -u
 FID="${1:-release/fid.exe}"
 OUT="${TMPDIR:-/tmp}/fid-relink"
+# The paths go to `fid serve` on its stdin, where no shell converts them:
+# on Windows a Git Bash path (/c/..., /tmp/...) is one the compiler cannot
+# read, so the output folder is named the Windows way
+case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) OUT=$(cygpath -m "$OUT") ;; esac
 mkdir -p "$OUT"
 PY=python3
 command -v python3 >/dev/null 2>&1 || PY=python

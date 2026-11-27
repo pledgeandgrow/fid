@@ -20,10 +20,11 @@ names in a second, without building anything.
 It also checks the `extern "C"` functions reachable from main (a call
 graph over the reached modules, as compiler/reach.fd keeps for `emit`):
 each must be the runtime's pert_c_<C name> or a primitive nat_ir emits
-(nat_c_<C name>, nat_syscall, ...); anything else would only be a dynamic
-import of the system's C library (x86-64 Linux), which a `pledge_*` name of
-the C runtime's own headers is not in. Negative case:
-tests/nattools/selfhost_extern_probe.fd (exit 1, pledge_net_socket).
+(nat_c_<C name>, nat_syscall, ...), or a C function the layer's runtime
+imports itself (anything else would only be a dynamic import of the
+system's C library, x86-64 Linux). A definition under an `@cfg` that is
+false for the layer's system is not reached. Negative case:
+tests/nattools/selfhost_extern_probe.fd (exit 1, sp16_no_such_c_function).
 
 Usage: python3 tests/nattools/selfhost_builtins_check.py [--layer win|mac]
   [--root <repo>] [--main compiler/main.fd] [-v]
@@ -218,9 +219,89 @@ def match_brace(s, i):
     return n
 
 
+# @cfg: a definition the layer's system excludes is not reached there
+# (compiler.fd apply_cfg_filter). The OS conditions are evaluated as
+# compiler.fd cfg_os_cond does for the layer; an arch, feature, debug or
+# unknown condition keeps the definition (this check over-approximates).
+OS_OF_LAYER = {"": "linux", "win": "windows", "mac": "macos"}
+OS_NAMES = ("linux", "windows", "macos", "darwin", "freebsd", "wasi", "unix")
+
+
+def cfg_items(text):
+    """The comma-separated conditions of all(...) / any(...)."""
+    out, depth, cur = [], 0, ""
+    for c in text:
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+        if c == "," and depth == 0:
+            out.append(cur)
+            cur = ""
+        else:
+            cur += c
+    if cur.strip():
+        out.append(cur)
+    return out
+
+
+def is_os_cond(c):
+    c = c.strip()
+    if c in OS_NAMES:
+        return True
+    for kw in ("all", "any"):
+        if c.startswith(kw) and c[len(kw):].lstrip().startswith("(") and c.endswith(")"):
+            return all(is_os_cond(x) for x in cfg_items(c[len(kw):].lstrip()[1:-1]))
+    if c.startswith("not") and is_os_cond(c[3:]):
+        return True
+    return False
+
+
+def cfg_holds(cond):
+    """Does one @cfg condition hold for the layer?"""
+    c = cond.strip()
+    if not is_os_cond(c):
+        return True
+    for kw in ("all", "any"):
+        if c.startswith(kw) and c[len(kw):].lstrip().startswith("(") and c.endswith(")"):
+            vals = [cfg_holds(x) for x in cfg_items(c[len(kw):].lstrip()[1:-1])]
+            return all(vals) if kw == "all" else any(vals)
+    if c.startswith("not"):
+        return not cfg_holds(c[3:])
+    if c == "unix":
+        return LAYER in ("", "mac")
+    if c in ("freebsd", "wasi"):
+        return False
+    return OS_OF_LAYER.get(LAYER, "linux") == ("macos" if c == "darwin" else c)
+
+
+def cfg_allows(s, pos):
+    """Do the @cfg lines right above the definition at s[pos] hold for the
+    layer? (The annotation lines above a definition are walked upwards
+    until a line that is no annotation.)"""
+    pre = s[:pos]
+    while True:
+        end = len(pre.rstrip())
+        if end == 0:
+            return True
+        start = pre.rfind("\n", 0, end) + 1
+        line = pre[start:end].strip()
+        if not line.startswith("@"):
+            return True
+        for cm in re.finditer(r"@cfg\s*\(", line):
+            depth, j = 1, cm.end()
+            while j < len(line) and depth > 0:
+                depth += (line[j] == "(") - (line[j] == ")")
+                j += 1
+            if not cfg_holds(line[cm.end():j - 1]):
+                return False
+        pre = pre[:start]
+
+
 bodies = {}        # function name -> list of body texts
 methods = {}       # method short name -> qualified names
 externs = {}       # Fides name -> (C name, module)
+rt_cnames = {}     # a C name the layer's runtime imports itself -> its Fides name there
 for p, s in list(seen.items()) + list(rt_src.items()):
     # extern "C" blocks: no bodies, Fides name -> C name
     ext_spans = []
@@ -231,6 +312,8 @@ for p, s in list(seen.items()) + list(rt_src.items()):
             cname = fm.group(1)
             fname = fm.group(2) or cname
             externs.setdefault(fname, (cname, p))
+            if p in rt_src:
+                rt_cnames.setdefault(cname, fname)
     # impl blocks: which type each method belongs to
     impl_spans = []
     for im in IMPL_RE.finditer(s):
@@ -243,6 +326,8 @@ for p, s in list(seen.items()) + list(rt_src.items()):
         while j < len(s) and s[j] not in "{;":
             j += 1
         if j >= len(s) or s[j] == ";":
+            continue
+        if not cfg_allows(s, fm.start()):
             continue
         body = s[j:match_brace(s, j)]
         name = fm.group(1)
@@ -321,6 +406,11 @@ for fname in sorted(externs):
     elif cname in inline:
         # a primitive of the machine layer itself (nat_syscall, nat_arch, ...)
         ext_ok.append(fname + " -> emitted by nat_ir")
+    elif cname in rt_cnames:
+        # the layer's runtime imports the same C function itself (win.fd's
+        # kernel32 imports, GetProcessTimes among them): the image's import
+        # table has it, so the program's extern binds to it as well
+        ext_ok.append(fname + " -> %s, the runtime's own import of C %s" % (rt_cnames[cname], cname))
     else:
         ext_missing.append((fname, cname, p))
 print("selfhost extern \"C\" (%s): %d functions reachable from main, %d extern \"C\" among them: %d resolve, %d not"
