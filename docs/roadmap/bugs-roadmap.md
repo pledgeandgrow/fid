@@ -2139,7 +2139,7 @@ names are the reference.
       Fixed Nov 24 with BG190 (stdlib/compress.fd: gzip checks CRC-32 and
       ISIZE, zlib Adler-32); test_bg190_inflate_truncated (CRC and ISIZE
       flipped, trailer cut) passes on run, C and emit (Nov 25).
-- [ ] BG223. **url: `url_resolve` builds broken or lossy URLs, and the path is
+- [x] BG223. **url: `url_resolve` builds broken or lossy URLs, and the path is
       decoded too early.** stdlib/url.fd `url_resolve` rebuilds the authority
       from `base.host` without brackets or userinfo, and `url_parse`
       percent-decodes the path (`u.path = url_decode(rest)`), so `%2F` becomes
@@ -2150,6 +2150,26 @@ names are the reference.
       `http://h/a/b/c`; `..%2F..%2Fetc%2Fpasswd` parses to
       `/files/../../etc/passwd`; `//g` gives `http://g/`. Confirmed Nov 24.
       Confidence: high.
+      Fixed Nov 27: `Url.path` is the path as written, percent-encoded
+      (`url_decode` gives the decoded form), as RFC 3986 section 3.3 reads it
+      and as Python, JavaScript and Rust's `url` crate do. `url_path_escape`
+      percent-encodes what a path cannot hold and keeps valid escapes;
+      `url_to_str`, `url_resolve` and http_client.fd's request target use
+      it. `url_resolve` builds the authority of either side with
+      `url_authority` (userinfo, IPv6 brackets, port), and writes the
+      reference's path only when it wrote one, so `//g` gives `http://g`
+      (RFC 3986 section 5.3). Readers of `url_parse`: http_client.fd (its
+      request target is now the path as written) and test_lib_url, whose
+      "parse full" now expects `/a%20b/c`. Test
+      test_bg223_url_path_and_authority (the five triggers, both branches
+      with a userinfo and an IPv6 host, a path set by hand, a lone `%`):
+      passes on run, ccompile and emit with the fid-dev of Nov 25;
+      test_lib_url (RFC 3986 section 5.4 included), test_lib_http_client,
+      test_verify_vf15_parsers and p1_url_port_overflow unchanged. The
+      source reached main inside be363179 ("0.8.5 unstable", another
+      session's commit of the same tree) with the test's last expected line
+      still wrong; the next commit corrects it. Left as it was, the same
+      class: userinfo and fragment are still percent-decoded at parse.
 - [ ] BG224. **xml and toml have no nesting limit, so deep input overflows the
       stack.** stdlib/xml.fd `x_children`/`x_ns_open` and stdlib/toml.fd
       `tp_value`/`tp_array` have no depth counter (the json validator entry is
