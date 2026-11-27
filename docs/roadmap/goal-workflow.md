@@ -111,6 +111,37 @@ Already known from the evening and still to be written into the entries:
 Status is one of `todo`, `running`, `done`, `waiting` (another session has
 the file), `deferred` (cannot be done on this machine), with the reason.
 
+**Nov 27, 11:57: the user stopped the bugs roadmap.** Sections B to G are
+the record of the night and are not worked on any more (rows 26 to 41 name
+another session's files). The queue is the LLVM roadmap since 12:00, at
+the user's word: help that session finish, verify and mark done the goals
+whose code lives in the files it edits. Rule 4 (a goal whose file another
+session edits is skipped) does not hold for them: edit outside its hunks
+and commit only your own (a hunk of a shared file goes in alone, with `git
+apply --cached`). A mark becomes `[x]` only when the entry's own definition
+holds, with its gate green on a built compiler.
+
+### A. The LLVM roadmap (docs/roadmap/llvm-roadmap.md)
+
+| # | Goal | Files | Status |
+|---|------|-------|--------|
+| L1 | SP6 | `compiler/nat_ir.fd` (the function cache) | done (Nov 27 day: `machine_fncache_check.sh` all passed, `sp20_fncache_tail_check.sh` 21 ok) |
+| L2 | SP7 | `compiler/nat_ir.fd` (`nl_loop_end`) | running: a kept slot for a function a build inlines away; gate `tests/nattools/relink_check.sh` |
+| L3 | LF20 | `compiler/nat_ir.fd` (`ng_secret_mir`) | running: the secret set follows what selection makes of a secret; gates `machine_lf20_check.sh`, `machine_lf20_param_check.sh` |
+| L4 | LF14 | `compiler/iropt.fd` (`iro_vec_sroa_one`) | running: a read in a dominated block takes any handle; `tests/bootstrap/test_midend_vec_sroa_dom.fd` |
+| L5 | MI14 | gates only | the gate is green (33 ok; fregs 25 ok); left: the default switch (the loop 2.34x, the sieve 3.56x), the suites with winfregs/splitfloat |
+| L6 | SP16 | gates only | the gate is green (9 ok); left: 2g.114, then the compiler built by `fid emit` |
+| L7 | TG11 | `compiler/iropt.fd` (the vectorizer) | verified: the checker failure is gone; left: the reductions (red6, redk), MIR vector operations |
+| L8 | WP6 | `compiler/nat_ir.fd` (AArch64's pool) | verified: 23 ok, 1 leg (x0-x7 are no pool registers there: MI's grade); the native suite |
+| L9 | SP9 | `compiler/parser.fd`, `lexer.fd`, `compiler.fd` (the other session's) | todo: the four checks and the bench on the new build, then on by default; step 3 (type check in parallel) |
+| L10 | RA1 | `tests/nattools/ra1_pe_ra_off_check.sh` | todo: the gate (137 programs) |
+| L11 | LF11 | `tests/tooling/version-default-check.sh` | todo: the gate, the suite leg |
+| L12 | WP14, LF16 | whole-suite legs | todo: `scripts/verify/expect.py --backends emit,nat` over tests/bootstrap, default and `FID_IROPT_ON=soleown` |
+| L13 | MI5, MI17 | `compiler/pe_ir*.fd`, `nat_ir.fd` | waiting: BG248, BG249, BG251 (the other session's), then `tests/nattools/mi5_nat_peir_check.sh` again; the default switch is MI14's |
+| L14 | MI9, TG16, LF13, LF21 | MI9: SRA of local structs (`nat_ir.fd`); TG16: the port onto MIR (the other session builds tg16-fid-v5); LF13: the other producers, `Vec::new()`+push buffers (`lower.fd`); LF21: the region arena in the Linux runtime | waiting on the other session, or multi-week |
+
+Gate scripts, once fixed, are in tests/nattools (a working WSL only: `wsl.exe -e sh -c 'echo wsl-ok'`; a path given to `fid serve` on stdin is a Windows path, `cygpath -m`). The driver of one run: `bash build/llvm19/gates.sh [name ...]` (tg11 wp6 sp16 mi14 fregs lf20 sp6 sp7 ra1 lf11 sp9), its log `build/llvm19/progress.log`.
+
 ### B. Bugs in the standard library — no build needed
 
 | # | Goal | What is wrong | Files | Gate | Status |
