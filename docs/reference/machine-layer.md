@@ -947,8 +947,15 @@ first check above fails. Every image still runs the same.
   identical-code folding, facts about globals), so it belongs in iropt.fd.
   In debug mode (`--debug`) there is no mid-end, so the edit loop's
   target is measured there.
-- **Relinking.** The image is still laid out again in full. Only the
-  machine code of unchanged functions is replayed (SP7).
+- **Relinking (SP7, done Nov 27).** In a long-lived process that asks for
+  it (`fid serve --relink`, FID_NAT_ON=relink) the next build of a program
+  keeps the last one's layout: an unchanged function is replayed at its
+  offset, a changed one goes back into its slot when it fits, a function a
+  build inlined away keeps its slot for the next one, and only the fixups
+  are resolved again (docs/reference/incremental.md;
+  tests/nattools/relink_check.sh, 21 ok on the -O2 build of Nov 27, 16:19).
+  A one-shot `emit` still lays the image out afresh: that is the image SP8
+  wants.
 
 ---
 

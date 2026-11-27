@@ -14,6 +14,12 @@
 > `release/fid.exe`, which the installer ships as `fid.exe`. It checks
 > more than the Rust compiler (generics, borrows, safety annotations,
 > borrowed strings): see docs/reference/language-guide.md § 10.
+>
+> **On this dev machine the commit limit, not free RAM, is the build wall**
+> (Nov 27: 44 of the 48 GB taken with 8 GB of RAM free; `zig cc` died on
+> the giant units at once). Before a build compare `CommitLimit -
+> CommittedBytes`, not only the free memory; `SPLIT_OPT=-O1 JOBS=1
+> ./scripts/build-selfhost.sh` builds every unit where -O2 does not fit.
 
 ## Build & Test Commands
 
@@ -39,6 +45,11 @@ RELEASE=1 CC="zig cc" ./scripts/bootstrap.sh
 #    on a memory-tight machine SPLIT=16 JOBS=2: one 123MB unit at -O0
 #    needs >16GB and LLVM dies, so the split must succeed; JOBS=4 x -O2
 #    units does not fit under ~5GB free. Nov 21 gate log: build/release-archive/gate-nov21*.log)
+#    SPLIT_OPT=-O1 (or -O0) JOBS=1 when the machine cannot commit what the
+#    giant units take at -O2. A unit that fails is built again alone, then
+#    at -O1 and -O0 with the same flags, and the last line says what was
+#    built ("(16 units at -O2)", or "(16 units: 10 at -O2, 6 below it:
+#    unit 1-O0 ...)"): read it before you time a build.
 #    STAGE0=release/fid.exe for the fast path: fid at -O2 runs ~17x faster;
 #    STAGE0 defaults to release/stage0/fid.exe — pinned Nov 21 to a
 #    self-hosted 1.0.0+dev, hash in scripts/stage0.sha256 — else fidesc,
@@ -266,6 +277,16 @@ FID=release/fid.exe JOBS=4 bash scripts/cross-test.sh aarch64-linux
 > Project-wide numbers are kept in docs/reference/selfhost.md → "Numbers"
 > (CURRENT.md was removed on Nov 8); keep the two in step.
 >
+> Nov 27, afternoon (the LLVM roadmap): SP6, LF20 and SP7 are marked done
+> in docs/roadmap/llvm-roadmap.md (163 done, 33 partly), each with its gate
+> green on a one-stage -O2 build of the tree (16:19, all 16 units at -O2,
+> `check compiler/main.fd` clean in 29 s). CF32 and CF37 are closed (four
+> conformance gaps left: CF33 to CF36). The gates of MI14, SP16, TG11 and
+> WP6 are green after their defects were fixed; those goals stay partly
+> done for what their entries name. Each of the 19 partly-done goals whose
+> code sits in files another session edits says in its entry what is
+> exactly left (docs/roadmap/goal-workflow.md, section A, has the queue).
+>
 > Nov 27: v0.8.5-unstable is being prepared from be36317 ("0.8.5
 > unstable"). Its fid.exe is a ONE-STAGE build from a self-hosted stage 0,
 > not a 3-stage fixpoint (the last fixpoint is Nov 21, below). The newest
@@ -485,6 +506,28 @@ TOOLS (tools/*.fd, 42 .fd files, 40,406 lines, Nov 27; 12 on Nov 22):
                   py_random, fuzz_lib, fuzz_programs, target_test_lib
 
 RECENT IMPROVEMENTS:
+  Nov 27, afternoon (the LLVM roadmap, on two one-stage -O2 builds of the
+                  tree, 15:52 and 16:19): SP6 done (its cache gate and the
+                  tail-summary gate pass). SP7 done: relink_check.sh 21 ok
+                  on x86-64, AArch64 and `--nat` Windows; a function a
+                  build inlines away keeps its slot in the kept layout
+                  (nat_ir.fd nl_loop_end). LF20 done: the "3 of 8 secret
+                  values in registers" was the [lf20] line counting IR
+                  values with no machine life; ng_secret_mir follows what
+                  selection makes of a secret, 48 of 48 in registers on
+                  the four targets, both gates 44 ok and 22 ok. CF32 and
+                  CF37 closed (checks.fd ct_source_param: @public
+                  parameters by their index in the source; the C path
+                  keeps its null pointer checks). Gates fixed and green:
+                  machine_mi14_check 33 ok, machine_fregs_check 25 ok,
+                  machine_sp16_check 9 ok, wp6_args_check 23 ok (AArch64
+                  fwd3 stays: x0-x7 are no pool registers there). Build
+                  script: the retry of a failed unit keeps the C flags,
+                  SPLIT_OPT picks the first level, the last line is true.
+                  Started at 17:04 and recorded in the goal-workflow run
+                  log when they end: the whole-suite legs for WP14, LF11,
+                  LF16 and LF14 (build/llvm19/suite-*.raw); the gates RA1,
+                  LF11 and SP9 wait for them.
   Nov 24–27       (0dcfe61a … be36317; v0.8.5-unstable prepared Nov 27,
                   its fid.exe a one-stage build from a self-hosted stage 0).
                   Checked Nov 25 with a fid built from the 905d756b tree:
@@ -976,6 +1019,29 @@ touching them.
    a function parameter has no instruction, so its type is in
    `func.params`, not `IrFunction_get_meta` (`peir_operand_ty`,
    `ng_meta_ty`).
+
+28. **Gate scripts and `wsl.exe`** (tests/nattools, Nov 27): wsl.exe is on
+   PATH on every Windows, with no distribution installed too, and a gate
+   that takes it for a working WSL reports every Linux image as "output
+   differs". Test it first: `wsl.exe -e sh -c 'echo wsl-ok'`. A path
+   written to `fid serve` on its stdin is converted by no shell: give it
+   `cygpath -m` paths (relink_check.sh).
+
+29. **`scripts/build-selfhost.sh` under `set -u`** (Nov 27): a variable a
+   new line reads must exist on every path (a summary line's list stopped
+   every successful build before the link), and the retry of a failed unit
+   must compile with the same flags as the first build (the retry had
+   neither `-w` nor the `-Wno-*`: int-to-pointer conversions in the
+   generated C were errors). Run the script to its end, the success path
+   included, before committing a change to it.
+
+30. **A CF32 mark is read by the parameter's index in the source**
+   (compiler/checks.fd `ct_source_param`, Nov 27): the IR the C generator
+   checks is as lowered, with the result pointer of a struct-returning
+   function and the environment in front of the source's parameters; the
+   native paths drop the environment (iro_env_trim). An IR check that takes
+   the IR's index for the source's looks one parameter too far on the C
+   path and on the native paths whenever the environment stays.
 
 ## NEVER DO THESE (Hard Rules)
 

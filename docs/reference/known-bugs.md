@@ -45,6 +45,48 @@
 
 ## 1. Fixed Bugs (Do Not Re-Introduce)
 
+### 1.39 Gate scripts took `wsl.exe` on PATH for a working WSL (Nov 27)
+
+**Symptom:** Seven gates (machine_mi14, machine_fregs, machine_lf20,
+machine_lf20_param, wp6_args, machine_sp16, vectorize_spill) reported Linux
+images as "output differs" on a Windows machine that has no WSL
+distribution; relink_check.sh reported every request of `fid serve` as
+"could not read file".
+
+**Root cause:** `if command -v wsl.exe; then WSL="wsl.exe -e"; fi`: wsl.exe
+is on PATH on every Windows and answers with its help text when no
+distribution is installed. relink_check.sh also wrote a Git Bash path
+(`/c/Users/...`) on `fid serve`'s stdin, where no shell converts it.
+
+**Fix:** `wsl.exe -e sh -c 'echo wsl-ok' | grep -q wsl-ok` before the
+runner is used, and `cygpath -m` for a path given to `fid serve` (f10eb6a1).
+
+**Lesson:** a Linux image that prints nothing on Windows is a missing
+runner, not a difference between backends. With that, and with the other
+gate defects of that day fixed, `machine_mi14_check.sh` (33 ok),
+`machine_fregs_check.sh` (25 ok), `machine_sp16_check.sh` (9 ok) and
+`wp6_args_check.sh` (23 ok) run on Windows.
+
+### 1.38 `scripts/build-selfhost.sh`: the retry without its flags, then a line that stopped every success (Nov 27)
+
+**Symptom:** a unit that had failed at -O2 for memory was reported
+"unbuildable at -O2/-O1/-O0" with errors such as "incompatible integer to
+pointer conversion passing 'int64_t' to parameter of type 'HANDLE'". Hours
+later every build stopped before the link with "retried: unbound variable".
+
+**Root cause:** the -O1/-O0 retry computed `cflags` and never used it: it
+compiled with `-O1 -fno-strict-aliasing -fwrapv -fno-sanitize=all` alone,
+without `-w` and the `-Wno-*`, so the generated C's ordinary conversions
+were errors. The summary line added that afternoon read a list that existed
+on the retry path only, under `set -u`.
+
+**Fix:** the retry compiles with `"${cflags[@]}"`; the list is created with
+the others before the loop (f10eb6a1, 56492abb). `SPLIT_OPT` picks the level
+of the first build when -O2 does not fit.
+
+**Lesson:** run a changed build script to its end, the success path
+included, before committing it.
+
 ### 1.37 Accidental `git checkout -- compiler/pe.fd` lost uncommitted work (session 16)
 
 **Symptom:** Running `git checkout -- compiler/pe.fd` to "discard changes"

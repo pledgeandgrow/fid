@@ -129,6 +129,8 @@ callee's summary under a replayed caller).
   RISC-V calls in use under the cache; the default cache file; an edit
   (nat_fncache_edit_a.fd then nat_fncache_edit_b.fd on the same cache
   file: at most 10 functions compiled again, the image the one a build
-  without the cache makes).
+  without the cache makes). Nov 27, on the -O2 build of 16:19: all passed
+  (the edit reuses 273, 273 and 274 functions on x86_64, AArch64 and
+  RISC-V and compiles 2; B on A's cache is B without the cache).
 - `tests/nattools/machine_batch7_check.sh` (SP6/SP20, SP7) and
   `scripts/repro-check.sh` (cache miss / hit = off).

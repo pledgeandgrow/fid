@@ -57,6 +57,14 @@ before lower.fd's `alloca_type` index).
   reused, 275 compiled). 3 checks failed in this run ("mk not given up"; the
   check script's line was turned into a note in be36317).
 - `relink_check`: 4 failures (the serve requests did not all build).
+- Afternoon of the same day, the zig -O2 build of 16:19 of the tree
+  (`release/fid-night.exe`): `machine_fncache_check` all passed and
+  `relink_check` 21 ok, 0 fail. The four relink failures above were the
+  gate's: it gave `fid serve` a Git Bash path on the process's stdin (no
+  shell converts it), which no build could read; fixed with `cygpath -m`.
+  One real case remained after that and is fixed (nat_ir.fd `nl_loop_end`:
+  a function a build inlines away keeps its slot), so an edit now puts
+  every function back, the changed ones included.
 - `sp8-edit-rebuild-check`: PASS (the edited rebuild gives the one-shot
   image); `serve-fncache-check`: PASS. The 100 ms target is not met: release
   1278/2144 ms, debug 628/672 ms.

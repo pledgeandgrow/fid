@@ -88,6 +88,17 @@ cargo build --release
 #  unless KEEP_BUILD_OUTPUTS=1; release/ gets only the binary.
 #  The shipped binary is release/fid(.exe), built by
 #  RELEASE=1 ./scripts/bootstrap.sh.)
+# Options: STAGE0=<exe> (default release/stage0/fid.exe, pinned), OUT=<dir>,
+# SPLIT=<units> (16), JOBS=<at a time> (2), SPLIT_OPT=-O2|-O1|-O0 (the level
+# of the first build of every unit; -O1 or -O0 on a machine that cannot
+# commit the memory the giant units take at -O2), KEEP_BUILD_OUTPUTS=1.
+# A unit that fails is built again alone, then at -O1 and -O0 with the same
+# flags; the last line says what was built ("(16 units at -O2)", or
+# "(16 units: 10 at -O2, 6 below it: unit 1-O0 ...)").
+# Before a build look at the commit limit, not only at free RAM
+# (CommitLimit - CommittedBytes): on Nov 27, 2026, 44 of the 48 GB were
+# taken with 8 GB of RAM free, and zig cc died on the giant units at once
+# (exit 5, no message).
 
 # 3. Multi-stage bootstrap + fixpoint check (optional, slow)
 ./scripts/bootstrap.sh            # builds c1…cN in build/bootstrap/, compares c2.c vs c3.c

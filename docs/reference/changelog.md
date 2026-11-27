@@ -1,5 +1,50 @@
 # Fides Language Changelog
 
+## Nov 27, afternoon: SP6, LF20 and SP7 of the LLVM roadmap; CF32 and CF37; the build script (Nov 27, 2026)
+
+Checked with two -O2 builds of the tree (15:52 and 16:19, one stage from
+the pinned stage 0). The gates named are in tests/nattools.
+
+- **LLVM roadmap, SP6 and SP7:** done. The function cache:
+  `machine_fncache_check.sh` and `sp20_fncache_tail_check.sh` pass.
+  Incremental relinking: `relink_check.sh` passes on x86-64 Linux, AArch64
+  Linux and `--nat` Windows (21 ok). Its last failure was a layout gap: a
+  function one build inlined away lost its slot, so a later build that had
+  it again placed it after the code; `nl_loop_end` keeps the slot now
+  (compiler/nat_ir.fd, docs/reference/incremental.md).
+- **LF20, `@secret` values in registers:** done. The `[lf20]` line counted
+  IR values that have no machine life, which is why "3 of 8 secret values
+  in registers" stayed on every target while every live one was in a
+  register. `ng_secret_mir` (compiler/nat_ir.fd) follows what instruction
+  selection makes of a secret too (a value computed from one, the source of
+  a copy of one), and the line counts the secrets the machine IR holds: 48
+  of 48 in registers in the gate's `pressure` on the four targets, 45 with
+  the preference off. `machine_lf20_check.sh` 44 ok,
+  `machine_lf20_param_check.sh` 22 ok.
+- **Conformance, CF32:** a `@public` parameter of a `@constant_time`
+  function is no longer taken for secret by any backend. The type checker
+  puts the marks down by the parameter's index in the source (c437509b) and
+  checks.fd `ct_source_param` gives the IR checks that index (the lowered
+  IR has the result pointer and the environment in front of the source's
+  parameters; the native paths drop the environment).
+- **Conformance, CF37:** the C path compiles with
+  `-fno-delete-null-pointer-checks`, so a load through null faults as
+  reference §8.2 says.
+- **Gates on Windows:** a working WSL is tested for
+  (`wsl.exe -e sh -c 'echo wsl-ok'`), MI14's gate checks `between`'s split
+  (`around` is no candidate since RA18), fregs counts after the runtime's
+  float primitives, SP16's negative probe declares an extern nothing
+  provides and its checker reads `@cfg`. Green now: `machine_mi14_check.sh`
+  (33 ok), `machine_fregs_check.sh` (25 ok), `machine_sp16_check.sh`
+  (9 ok), `wp6_args_check.sh` (23 ok).
+- **Build script:** a unit that fails at -O2 is retried with the same flags
+  as the first build (the retry had neither `-w` nor the `-Wno-*`),
+  `SPLIT_OPT` picks the level of the first build (`-O2`; `-O1` or `-O0`
+  where the machine cannot commit the memory), and the last line says what
+  was built.
+- **Debug:** iropt's LF14 line (`FID_VSROA_DBG=1`) names its function and
+  the failing terms.
+
 ## v0.8.5-unstable, the Nov 27 batch and compile time (Nov 27, 2026)
 
 v0.8.5-unstable is prepared from be36317 ("0.8.5 unstable"). Its `fid.exe`
