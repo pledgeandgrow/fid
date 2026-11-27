@@ -135,7 +135,7 @@ the file), `deferred` (cannot be done on this machine), with the reason.
 | 12 | BG232 | disasm has no row for instructions the encoders emit | `compiler/disasm.fd` | the entry's list (x86 `blsmsk`/`blsi`, AArch64 pre/post-index and FP loads, RISC-V vector) decodes with the right length | todo |
 | 13 | BG212 | comptime does not evaluate float/int casts | `compiler/comptime_eval.fd` (`Expr::Cast`) | `comptime avg(3, 4)` and `comptime (-(7.9 as i64))` evaluate| done (Nov 27 05:47, 4445b05d: its two tests and 321 of 324 related programs; the three fail with the compiler of Nov 25 too) |
 | 14 | BG213 | C header parser evaluates unsigned macro arithmetic as signed | `compiler/cparser.fd` (`CpEval`/`CpExpr`) | `fid parse-header` on a header with `UDIV`, `UNEG`, `MASK`, `COND`, `CMP`, `0b1010`| deferred to a later batch: needs a typed macro evaluator (unsigned 32-bit arithmetic), about fifteen functions |
-| 15 | LG3 | reads are not checked against a live `&mut` | `compiler/borrowck.fd` | `val v = m` while `r = id_mut(&mut m)` is live and used after is a borrow error; `test_frontend_lifetime*.fd` and `tests/conformance/s8_*` still pass| the rule of 7b06ce65 passed its tests but rejected the compiler's own tree (three calls of the form `f(&mut g.e, read(g))`); refined in 21e16421 (a call's arguments read beside a mutable borrow of an earlier argument); to validate with the next build: the four LG3 tests, `check compiler/main.fd`, scripts/check-stdlib.sh |
+| 15 | LG3 | reads are not checked against a live `&mut` | `compiler/borrowck.fd` | `val v = m` while `r = id_mut(&mut m)` is live and used after is a borrow error; `test_frontend_lifetime*.fd` and `tests/conformance/s8_*` still pass| the rule of 7b06ce65 passed its tests but rejected the compiler's own tree (three calls of the form `f(&mut g.e, read(g))`); refined in 21e16421 and not yet validated: needs the next build (the four LG3 tests, `check compiler/main.fd`, scripts/check-stdlib.sh) |
 
 ### D. Verify only — the gate runs on this machine
 
@@ -257,3 +257,27 @@ are the commit times.)
   it validates batch 1 when the build lands, then builds batch 2.
   Started and left for a later batch (not small): BG213 (a typed macro
   evaluator), BG235, BG246, BG205, BG244.
+- 06:14, the end of this run (74 minutes; three over the 80 at most if the
+  next lines are read first). Done: build 1 (release/fid-night.exe, from
+  7b06ce65: one of its sixteen units at -O0, the rest at -O2) and its
+  validation (build/verify-nov27/validate-batch1.sh): BG233, BG208 and
+  BG212 are marked done (4445b05d); the LG3 rule rejected the compiler's
+  own tree at three calls of the form `f(&mut g.e, read(g))` and is
+  refined in 21e16421, to validate with the next build. The second batch
+  is in the tree and type-checks after every change (the stage-0 compiler):
+  b03479b8, 0fcd0261, 9ec4af52, f0973224, cb8f8b69, 21e16421, 22851471.
+  NEXT, IN THIS ORDER: (1) until build/verify-nov27/mi14_bench.log holds
+  BENCH_DONE, start nothing heavy: the WebAssembly suite (ALL=1, 1,315
+  programs, in build/wasm-native) and then the speed comparison run in the
+  session that wrote this, and the comparison needs a quiet machine; when
+  they end, record them in PL4 and MI14 (the table under "First: record
+  the background runs"); (2) build the tree to release/fid-night.exe (the
+  build command above; a second build is allowed in that run); (3)
+  `NIGHT=release/fid-night.exe bash build/verify-nov27/validate-batch2.sh`
+  and the four LG3 tests, `check compiler/main.fd`,
+  `bash scripts/check-stdlib.sh release/fid-night.exe` (the read rule
+  against every module); (4) scripts/image-check.sh (row 26) and
+  scripts/disasm-check.sh with the new compiler; (5) mark what passed.
+  Build 1's check of the 324 related programs: 321 pass; three fail with
+  the compiler of Nov 25 as well (test_frontend_comptime_if_assign,
+  s4_11_comptime_if_generic, s8_2_null_deref_panics): not this batch's.
