@@ -1,8 +1,10 @@
-# camera — Fides Documentation
+[All modules](index.md)
+
+# camera -- Fides Documentation
 
 ## Contents
 
-- [Camera2D](#camera2d) (struct)
+- [Camera2D](#Camera2D) (struct)
 - [camera2d_create](#camera2d_create) (function)
 - [camera2d_follow](#camera2d_follow) (function)
 - [camera2d_set_bounds](#camera2d_set_bounds) (function)
@@ -14,7 +16,7 @@
 - [camera2d_world_to_screen](#camera2d_world_to_screen) (function)
 - [camera2d_view_offset](#camera2d_view_offset) (function)
 - [camera2d_is_visible](#camera2d_is_visible) (function)
-- [Camera3D](#camera3d) (struct)
+- [Camera3D](#Camera3D) (struct)
 - [camera3d_create](#camera3d_create) (function)
 - [camera3d_update](#camera3d_update) (function)
 - [camera3d_view_matrix](#camera3d_view_matrix) (function)
@@ -26,7 +28,7 @@
 - [camera3d_move_forward](#camera3d_move_forward) (function)
 - [camera3d_move_right](#camera3d_move_right) (function)
 - [camera3d_set_aspect](#camera3d_set_aspect) (function)
-- [Ray3D](#ray3d) (struct)
+- [Ray3D](#Ray3D) (struct)
 - [camera3d_screen_to_ray](#camera3d_screen_to_ray) (function)
 - [camera3d_fps_update](#camera3d_fps_update) (function)
 
@@ -40,32 +42,45 @@ pub struct Camera2D {
 
 | Name | Type |
 |------|------|
-| `x` | `f64,              // center of camera in world space` |
+| `x` | `f64` |
 | `y` | `f64` |
-| `zoom` | `f64,           // scale factor (1.0 = normal)` |
-| `rotation` | `f64,       // rotation in radians` |
-| `viewport_w` | `i64,     // screen width in pixels` |
-| `viewport_h` | `i64,     // screen height in pixels` |
-| `target_x` | `f64,       // follow target` |
+| `zoom` | `f64` |
+| `rotation` | `f64` |
+| `viewport_w` | `i64` |
+| `viewport_h` | `i64` |
+| `target_x` | `f64` |
 | `target_y` | `f64` |
-| `follow_speed` | `f64,   // lerp speed (0 = instant, 1 = slow)` |
-| `shake_x` | `f64,         // current shake offset` |
+| `follow_speed` | `f64` |
+| `shake_x` | `f64` |
 | `shake_y` | `f64` |
-| `shake_amount` | `f64,   // remaining shake intensity` |
-| `shake_decay` | `f64,    // shake decay per second` |
-| `min_x` | `f64,          // bounds (0 = no limit)` |
+| `shake_amount` | `f64` |
+| `shake_decay` | `f64` |
+| `min_x` | `f64` |
 | `min_y` | `f64` |
 | `max_x` | `f64` |
 | `max_y` | `f64` |
 | `has_bounds` | `bool` |
 
-*Defined at line 25*
+*Defined at line 26*
 
 ---
 
 ## camera2d_create
 
 Create a 2D camera centered at (x, y).
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+var c = camera2d_create(800, 600);
+assert(c.zoom == 1.0);
+val w = camera2d_screen_to_world(&c, 400, 300);
+assert(w.x == 0.0);
+assert(w.y == 0.0);
+val corner = camera2d_screen_to_world(&c, 0, 0);
+assert(corner.x == -400.0);
+```
 
 ```fides
 pub fn camera2d_create(viewport_w: i64, viewport_h: i64) -> Camera2D {
@@ -78,7 +93,7 @@ pub fn camera2d_create(viewport_w: i64, viewport_h: i64) -> Camera2D {
 
 **Returns:** `Camera2D`
 
-*Defined at line 67*
+*Defined at line 68*
 
 ---
 
@@ -98,7 +113,7 @@ pub fn camera2d_follow(cam: &mut Camera2D, tx: f64, ty: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 74*
+*Defined at line 75*
 
 ---
 
@@ -120,7 +135,7 @@ pub fn camera2d_set_bounds(cam: &mut Camera2D, min_x: f64, min_y: f64, max_x: f6
 
 **Returns:** `void`
 
-*Defined at line 80*
+*Defined at line 81*
 
 ---
 
@@ -139,7 +154,7 @@ pub fn camera2d_set_zoom(cam: &mut Camera2D, zoom: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 89*
+*Defined at line 90*
 
 ---
 
@@ -160,7 +175,7 @@ pub fn camera2d_zoom_at(cam: &mut Camera2D, world_x: f64, world_y: f64, factor: 
 
 **Returns:** `void`
 
-*Defined at line 98*
+*Defined at line 99*
 
 ---
 
@@ -179,7 +194,7 @@ pub fn camera2d_shake(cam: &mut Camera2D, amount: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 110*
+*Defined at line 111*
 
 ---
 
@@ -198,7 +213,7 @@ pub fn camera2d_update(cam: &mut Camera2D, dt: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 115*
+*Defined at line 116*
 
 ---
 
@@ -218,7 +233,7 @@ pub fn camera2d_screen_to_world(cam: &Camera2D, sx: i64, sy: i64) -> vec2 {
 
 **Returns:** `vec2`
 
-*Defined at line 159*
+*Defined at line 160*
 
 ---
 
@@ -238,7 +253,7 @@ pub fn camera2d_world_to_screen(cam: &Camera2D, wx: f64, wy: f64) -> vec2 {
 
 **Returns:** `vec2`
 
-*Defined at line 166*
+*Defined at line 167*
 
 ---
 
@@ -256,7 +271,7 @@ pub fn camera2d_view_offset(cam: &Camera2D) -> vec2 {
 
 **Returns:** `vec2`
 
-*Defined at line 173*
+*Defined at line 174*
 
 ---
 
@@ -278,7 +293,7 @@ pub fn camera2d_is_visible(cam: &Camera2D, wx: f64, wy: f64, ww: f64, wh: f64) -
 
 **Returns:** `bool`
 
-*Defined at line 180*
+*Defined at line 181*
 
 ---
 
@@ -295,17 +310,17 @@ pub struct Camera3D {
 | `position` | `vec3` |
 | `target` | `vec3` |
 | `up` | `vec3` |
-| `fov` | `f64,            // field of view in radians` |
-| `aspect` | `f64,         // width / height` |
+| `fov` | `f64` |
+| `aspect` | `f64` |
 | `near` | `f64` |
 | `far` | `f64` |
-| `yaw` | `f64,            // horizontal angle` |
-| `pitch` | `f64,          // vertical angle` |
+| `yaw` | `f64` |
+| `pitch` | `f64` |
 | `view_matrix` | `mat4` |
 | `proj_matrix` | `mat4` |
 | `dirty` | `bool` |
 
-*Defined at line 189*
+*Defined at line 190*
 
 ---
 
@@ -328,7 +343,7 @@ pub fn camera3d_create(pos: vec3, target: vec3, fov_deg: f64, aspect: f64, near:
 
 **Returns:** `Camera3D`
 
-*Defined at line 209*
+*Defined at line 210*
 
 ---
 
@@ -346,7 +361,7 @@ pub fn camera3d_update(cam: &mut Camera3D) -> void {
 
 **Returns:** `void`
 
-*Defined at line 216*
+*Defined at line 217*
 
 ---
 
@@ -364,7 +379,7 @@ pub fn camera3d_view_matrix(cam: &Camera3D) -> mat4 {
 
 **Returns:** `mat4`
 
-*Defined at line 223*
+*Defined at line 224*
 
 ---
 
@@ -382,7 +397,7 @@ pub fn camera3d_projection(cam: &Camera3D) -> mat4 {
 
 **Returns:** `mat4`
 
-*Defined at line 228*
+*Defined at line 229*
 
 ---
 
@@ -400,7 +415,7 @@ pub fn camera3d_view_proj(cam: &Camera3D) -> mat4 {
 
 **Returns:** `mat4`
 
-*Defined at line 233*
+*Defined at line 234*
 
 ---
 
@@ -418,7 +433,7 @@ pub fn camera3d_forward(cam: &Camera3D) -> vec3 {
 
 **Returns:** `vec3`
 
-*Defined at line 238*
+*Defined at line 239*
 
 ---
 
@@ -436,7 +451,7 @@ pub fn camera3d_right(cam: &Camera3D) -> vec3 {
 
 **Returns:** `vec3`
 
-*Defined at line 243*
+*Defined at line 244*
 
 ---
 
@@ -456,7 +471,7 @@ pub fn camera3d_orbit(cam: &mut Camera3D, dyaw: f64, dpitch: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 249*
+*Defined at line 250*
 
 ---
 
@@ -475,7 +490,7 @@ pub fn camera3d_move_forward(cam: &mut Camera3D, dist: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 269*
+*Defined at line 270*
 
 ---
 
@@ -494,7 +509,7 @@ pub fn camera3d_move_right(cam: &mut Camera3D, dist: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 277*
+*Defined at line 278*
 
 ---
 
@@ -513,7 +528,7 @@ pub fn camera3d_set_aspect(cam: &mut Camera3D, aspect: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 285*
+*Defined at line 286*
 
 ---
 
@@ -530,7 +545,7 @@ pub struct Ray3D {
 | `origin` | `vec3` |
 | `direction` | `vec3` |
 
-*Defined at line 290*
+*Defined at line 291*
 
 ---
 
@@ -550,7 +565,7 @@ pub fn camera3d_screen_to_ray(cam: &Camera3D, ndc_x: f64, ndc_y: f64) -> Ray3D {
 
 **Returns:** `Ray3D`
 
-*Defined at line 296*
+*Defined at line 297*
 
 ---
 
@@ -568,8 +583,8 @@ pub fn camera3d_fps_update(cam: &mut Camera3D) -> void {
 
 **Returns:** `void`
 
-*Defined at line 316*
+*Defined at line 317*
 
 ---
 
-*Generated by [scribe](https://fides.dev) — Fides documentation generator*
+*Generated by [scribe](https://fides.dev) -- Fides documentation generator*

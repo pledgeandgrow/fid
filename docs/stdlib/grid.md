@@ -1,30 +1,32 @@
-# grid — Fides Documentation
+[All modules](index.md)
+
+# grid -- Fides Documentation
 
 ## Contents
 
-- [LN_XCBR:](#ln_xcbr:) (const)
-- [LN_XSWI:](#ln_xswi:) (const)
-- [LN_MMXU:](#ln_mmxu:) (const)
-- [LN_PTUV:](#ln_ptuv:) (const)
-- [LN_PTOC:](#ln_ptoc:) (const)
-- [LN_PDIS:](#ln_pdis:) (const)
-- [LN_RREC:](#ln_rrec:) (const)
-- [LN_RBRF:](#ln_rbrf:) (const)
-- [LN_CSWI:](#ln_cswi:) (const)
-- [LN_CILO:](#ln_cilo:) (const)
-- [LN_CSWI2:](#ln_cswi2:) (const)
+- [LN_XCBR:](#LN_XCBR:) (const)
+- [LN_XSWI:](#LN_XSWI:) (const)
+- [LN_MMXU:](#LN_MMXU:) (const)
+- [LN_PTUV:](#LN_PTUV:) (const)
+- [LN_PTOC:](#LN_PTOC:) (const)
+- [LN_PDIS:](#LN_PDIS:) (const)
+- [LN_RREC:](#LN_RREC:) (const)
+- [LN_RBRF:](#LN_RBRF:) (const)
+- [LN_CSWI:](#LN_CSWI:) (const)
+- [LN_CILO:](#LN_CILO:) (const)
+- [LN_CSWI2:](#LN_CSWI2:) (const)
 - [iec61850_ln_name](#iec61850_ln_name) (function)
-- [CDC_SPS:](#cdc_sps:) (const)
-- [CDC_DPS:](#cdc_dps:) (const)
-- [CDC_MV:](#cdc_mv:) (const)
-- [CDC_ASG:](#cdc_asg:) (const)
-- [CDC_ING:](#cdc_ing:) (const)
-- [CDC_ENG:](#cdc_eng:) (const)
-- [CDC_SPC:](#cdc_spc:) (const)
-- [CDC_DPC:](#cdc_dpc:) (const)
-- [CDC_INC:](#cdc_inc:) (const)
+- [CDC_SPS:](#CDC_SPS:) (const)
+- [CDC_DPS:](#CDC_DPS:) (const)
+- [CDC_MV:](#CDC_MV:) (const)
+- [CDC_ASG:](#CDC_ASG:) (const)
+- [CDC_ING:](#CDC_ING:) (const)
+- [CDC_ENG:](#CDC_ENG:) (const)
+- [CDC_SPC:](#CDC_SPC:) (const)
+- [CDC_DPC:](#CDC_DPC:) (const)
+- [CDC_INC:](#CDC_INC:) (const)
 - [iec61850_cdc_name](#iec61850_cdc_name) (function)
-- [XCBR](#xcbr) (struct)
+- [XCBR](#XCBR) (struct)
 - [iec61850_xcbr_new](#iec61850_xcbr_new) (function)
 - [iec61850_xcbr_set_pos](#iec61850_xcbr_set_pos) (function)
 - [iec61850_xcbr_pos_name](#iec61850_xcbr_pos_name) (function)
@@ -32,14 +34,14 @@
 - [iec61850_xcbr_is_open](#iec61850_xcbr_is_open) (function)
 - [iec61850_xcbr_set_health](#iec61850_xcbr_set_health) (function)
 - [iec61850_xcbr_health_name](#iec61850_xcbr_health_name) (function)
-- [MMXU](#mmxu) (struct)
+- [MMXU](#MMXU) (struct)
 - [iec61850_mmxu_new](#iec61850_mmxu_new) (function)
 - [iec61850_mmxu_set_voltage](#iec61850_mmxu_set_voltage) (function)
 - [iec61850_mmxu_set_current](#iec61850_mmxu_set_current) (function)
 - [iec61850_mmxu_set_power](#iec61850_mmxu_set_power) (function)
 - [iec61850_mmxu_apparent_power](#iec61850_mmxu_apparent_power) (function)
 - [iec61850_mmxu_total_power](#iec61850_mmxu_total_power) (function)
-- [GOOSEMessage](#goosemessage) (struct)
+- [GOOSEMessage](#GOOSEMessage) (struct)
 - [iec61850_goose_new](#iec61850_goose_new) (function)
 - [iec61850_goose_add_data](#iec61850_goose_add_data) (function)
 - [iec61850_goose_update_data](#iec61850_goose_update_data) (function)
@@ -49,7 +51,7 @@
 - [iec61850_ref](#iec61850_ref) (function)
 - [iec61850_dataset_ref](#iec61850_dataset_ref) (function)
 - [iec61850_control_ref](#iec61850_control_ref) (function)
-- [PTOC](#ptoc) (struct)
+- [PTOC](#PTOC) (struct)
 - [iec61850_ptoc_new](#iec61850_ptoc_new) (function)
 - [iec61850_ptoc_check](#iec61850_ptoc_check) (function)
 - [iec61850_ptoc_set_inverse](#iec61850_ptoc_set_inverse) (function)
@@ -61,7 +63,7 @@
 pub const LN_XCBR: i64 = 0;  // Circuit Breaker
 ```
 
-*Defined at line 24*
+*Defined at line 25*
 
 ---
 
@@ -71,7 +73,7 @@ pub const LN_XCBR: i64 = 0;  // Circuit Breaker
 pub const LN_XSWI: i64 = 1;  // Switch / Disconnector
 ```
 
-*Defined at line 25*
+*Defined at line 26*
 
 ---
 
@@ -81,7 +83,7 @@ pub const LN_XSWI: i64 = 1;  // Switch / Disconnector
 pub const LN_MMXU: i64 = 2;  // Measurement (voltage, current, power)
 ```
 
-*Defined at line 26*
+*Defined at line 27*
 
 ---
 
@@ -91,7 +93,7 @@ pub const LN_MMXU: i64 = 2;  // Measurement (voltage, current, power)
 pub const LN_PTUV: i64 = 3;  // Voltage Time Protection
 ```
 
-*Defined at line 27*
+*Defined at line 28*
 
 ---
 
@@ -101,7 +103,7 @@ pub const LN_PTUV: i64 = 3;  // Voltage Time Protection
 pub const LN_PTOC: i64 = 4;  // Overcurrent Protection
 ```
 
-*Defined at line 28*
+*Defined at line 29*
 
 ---
 
@@ -111,7 +113,7 @@ pub const LN_PTOC: i64 = 4;  // Overcurrent Protection
 pub const LN_PDIS: i64 = 5;  // Distance Protection
 ```
 
-*Defined at line 29*
+*Defined at line 30*
 
 ---
 
@@ -121,7 +123,7 @@ pub const LN_PDIS: i64 = 5;  // Distance Protection
 pub const LN_RREC: i64 = 6;  // Disturbance Recorder
 ```
 
-*Defined at line 30*
+*Defined at line 31*
 
 ---
 
@@ -131,7 +133,7 @@ pub const LN_RREC: i64 = 6;  // Disturbance Recorder
 pub const LN_RBRF: i64 = 7;  // Breaker Failure
 ```
 
-*Defined at line 31*
+*Defined at line 32*
 
 ---
 
@@ -141,7 +143,7 @@ pub const LN_RBRF: i64 = 7;  // Breaker Failure
 pub const LN_CSWI: i64 = 8;  // Control Switch
 ```
 
-*Defined at line 32*
+*Defined at line 33*
 
 ---
 
@@ -151,17 +153,17 @@ pub const LN_CSWI: i64 = 8;  // Control Switch
 pub const LN_CILO: i64 = 9;  // Interlocking
 ```
 
-*Defined at line 33*
+*Defined at line 34*
 
 ---
 
 ## LN_CSWI2:
 
 ```fides
-pub const LN_CSWI2: i64 = 10; // Control Switch (alternate)
+pub const LN_CSWI2: i64 = 10;  // Control Switch (alternate)
 ```
 
-*Defined at line 34*
+*Defined at line 35*
 
 ---
 
@@ -179,97 +181,97 @@ pub fn iec61850_ln_name(ln_type: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 37*
+*Defined at line 38*
 
 ---
 
 ## CDC_SPS:
 
 ```fides
-pub const CDC_SPS: i64  = 0;  // Single Point Status
-```
-
-*Defined at line 76*
-
----
-
-## CDC_DPS:
-
-```fides
-pub const CDC_DPS: i64  = 1;  // Double Point Status
+pub const CDC_SPS: i64 = 0;  // Single Point Status
 ```
 
 *Defined at line 77*
 
 ---
 
-## CDC_MV:
+## CDC_DPS:
 
 ```fides
-pub const CDC_MV: i64   = 2;  // Measured Value
+pub const CDC_DPS: i64 = 1;  // Double Point Status
 ```
 
 *Defined at line 78*
 
 ---
 
-## CDC_ASG:
+## CDC_MV:
 
 ```fides
-pub const CDC_ASG: i64  = 3;  // Analog Setting
+pub const CDC_MV: i64 = 2;  // Measured Value
 ```
 
 *Defined at line 79*
 
 ---
 
-## CDC_ING:
+## CDC_ASG:
 
 ```fides
-pub const CDC_ING: i64  = 4;  // Integer Setting
+pub const CDC_ASG: i64 = 3;  // Analog Setting
 ```
 
 *Defined at line 80*
 
 ---
 
-## CDC_ENG:
+## CDC_ING:
 
 ```fides
-pub const CDC_ENG: i64  = 5;  // Enumerated Setting
+pub const CDC_ING: i64 = 4;  // Integer Setting
 ```
 
 *Defined at line 81*
 
 ---
 
-## CDC_SPC:
+## CDC_ENG:
 
 ```fides
-pub const CDC_SPC: i64  = 6;  // Single Point Controllable
+pub const CDC_ENG: i64 = 5;  // Enumerated Setting
 ```
 
 *Defined at line 82*
 
 ---
 
-## CDC_DPC:
+## CDC_SPC:
 
 ```fides
-pub const CDC_DPC: i64  = 7;  // Double Point Controllable
+pub const CDC_SPC: i64 = 6;  // Single Point Controllable
 ```
 
 *Defined at line 83*
 
 ---
 
-## CDC_INC:
+## CDC_DPC:
 
 ```fides
-pub const CDC_INC: i64  = 8;  // Integer Controllable
+pub const CDC_DPC: i64 = 7;  // Double Point Controllable
 ```
 
 *Defined at line 84*
+
+---
+
+## CDC_INC:
+
+```fides
+pub const CDC_INC: i64 = 8;  // Integer Controllable
+```
+
+*Defined at line 85*
 
 ---
 
@@ -287,7 +289,7 @@ pub fn iec61850_cdc_name(cdc: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 87*
+*Defined at line 88*
 
 ---
 
@@ -305,19 +307,34 @@ pub struct XCBR {
 |------|------|
 | `name` | `str` |
 | `ln_type` | `i64` |
-| `position` | `i64,       // 0=open, 1=closed, 2=invalid` |
-| `health` | `i64,         // 0=ok, 1=warning, 2=alarm` |
-| `capable_of_op` | `bool, // can operate` |
-| `op_cnt` | `i64,         // operation counter` |
+| `position` | `i64` |
+| `health` | `i64` |
+| `capable_of_op` | `bool` |
+| `op_cnt` | `i64` |
 | `rated_current` | `i64,  // amperes` |
 
-*Defined at line 123*
+*Defined at line 124*
 
 ---
 
 ## iec61850_xcbr_new
 
 Create a new circuit breaker.
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+assert_eq(iec61850_ln_name(LN_XCBR), "XCBR");
+var cb = iec61850_xcbr_new("CB1", 630);
+assert_eq(iec61850_xcbr_pos_name(cb), "Open");
+assert(iec61850_xcbr_is_open(cb));
+iec61850_xcbr_set_pos(&mut cb, 1);
+assert(iec61850_xcbr_is_closed(cb));
+assert_eq(iec61850_xcbr_pos_name(cb), "Closed");
+iec61850_xcbr_set_pos(&mut cb, 0);
+assert(cb.op_cnt >= 1);
+```
 
 ```fides
 pub fn iec61850_xcbr_new(name: str, rated_current: i64) -> XCBR {
@@ -330,7 +347,7 @@ pub fn iec61850_xcbr_new(name: str, rated_current: i64) -> XCBR {
 
 **Returns:** `XCBR`
 
-*Defined at line 149*
+*Defined at line 150*
 
 ---
 
@@ -349,7 +366,7 @@ pub fn iec61850_xcbr_set_pos(breaker: &mut XCBR, pos: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 158*
+*Defined at line 159*
 
 ---
 
@@ -367,7 +384,7 @@ pub fn iec61850_xcbr_pos_name(breaker: XCBR) -> str {
 
 **Returns:** `str`
 
-*Defined at line 169*
+*Defined at line 170*
 
 ---
 
@@ -385,7 +402,7 @@ pub fn iec61850_xcbr_is_closed(breaker: XCBR) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 180*
+*Defined at line 181*
 
 ---
 
@@ -403,7 +420,7 @@ pub fn iec61850_xcbr_is_open(breaker: XCBR) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 185*
+*Defined at line 186*
 
 ---
 
@@ -422,7 +439,7 @@ pub fn iec61850_xcbr_set_health(breaker: &mut XCBR, health: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 190*
+*Defined at line 191*
 
 ---
 
@@ -440,7 +457,7 @@ pub fn iec61850_xcbr_health_name(breaker: XCBR) -> str {
 
 **Returns:** `str`
 
-*Defined at line 198*
+*Defined at line 199*
 
 ---
 
@@ -458,18 +475,18 @@ pub struct MMXU {
 |------|------|
 | `name` | `str` |
 | `ln_type` | `i64` |
-| `voltage_a` | `f64,  // phase A voltage (V)` |
-| `voltage_b` | `f64,  // phase B voltage (V)` |
-| `voltage_c` | `f64,  // phase C voltage (V)` |
-| `current_a` | `f64,  // phase A current (A)` |
-| `current_b` | `f64,  // phase B current (A)` |
-| `current_c` | `f64,  // phase C current (A)` |
-| `active_power` | `f64,   // watts` |
-| `reactive_power` | `f64, // VAR` |
-| `power_factor` | `f64,   // 0.0-1.0` |
-| `frequency` | `f64,      // Hz` |
+| `voltage_a` | `f64` |
+| `voltage_b` | `f64` |
+| `voltage_c` | `f64` |
+| `current_a` | `f64` |
+| `current_b` | `f64` |
+| `current_c` | `f64` |
+| `active_power` | `f64` |
+| `reactive_power` | `f64` |
+| `power_factor` | `f64` |
+| `frequency` | `f64,  // Hz` |
 
-*Defined at line 213*
+*Defined at line 214*
 
 ---
 
@@ -487,7 +504,7 @@ pub fn iec61850_mmxu_new(name: str) -> MMXU {
 
 **Returns:** `MMXU`
 
-*Defined at line 238*
+*Defined at line 239*
 
 ---
 
@@ -508,7 +525,7 @@ pub fn iec61850_mmxu_set_voltage(mmxu: &mut MMXU, va: f64, vb: f64, vc: f64) -> 
 
 **Returns:** `void`
 
-*Defined at line 245*
+*Defined at line 246*
 
 ---
 
@@ -529,7 +546,7 @@ pub fn iec61850_mmxu_set_current(mmxu: &mut MMXU, ia: f64, ib: f64, ic: f64) -> 
 
 **Returns:** `void`
 
-*Defined at line 252*
+*Defined at line 253*
 
 ---
 
@@ -550,7 +567,7 @@ pub fn iec61850_mmxu_set_power(mmxu: &mut MMXU, active: f64, reactive: f64, pf: 
 
 **Returns:** `void`
 
-*Defined at line 259*
+*Defined at line 260*
 
 ---
 
@@ -568,7 +585,7 @@ pub fn iec61850_mmxu_apparent_power(mmxu: MMXU) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 266*
+*Defined at line 267*
 
 ---
 
@@ -586,7 +603,7 @@ pub fn iec61850_mmxu_total_power(mmxu: MMXU) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 271*
+*Defined at line 272*
 
 ---
 
@@ -607,9 +624,9 @@ pub struct GOOSEMessage {
 | `seq_num` | `i64` |
 | `time` | `i64` |
 | `st_num` | `i64` |
-| `data` | `Vec<i64>` |
+| `data` | `Vec<i64>,  // dataset values` |
 
-*Defined at line 282*
+*Defined at line 283*
 
 ---
 
@@ -628,7 +645,7 @@ pub fn iec61850_goose_new(app_id: i64, ref: str) -> GOOSEMessage {
 
 **Returns:** `GOOSEMessage`
 
-*Defined at line 296*
+*Defined at line 297*
 
 ---
 
@@ -647,7 +664,7 @@ pub fn iec61850_goose_add_data(msg: &mut GOOSEMessage, value: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 303*
+*Defined at line 304*
 
 ---
 
@@ -667,7 +684,7 @@ pub fn iec61850_goose_update_data(msg: &mut GOOSEMessage, index: i64, value: i64
 
 **Returns:** `void`
 
-*Defined at line 310*
+*Defined at line 311*
 
 ---
 
@@ -686,7 +703,7 @@ pub fn iec61850_goose_get_data(msg: GOOSEMessage, index: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 319*
+*Defined at line 320*
 
 ---
 
@@ -704,7 +721,7 @@ pub fn iec61850_goose_data_count(msg: GOOSEMessage) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 327*
+*Defined at line 328*
 
 ---
 
@@ -722,7 +739,7 @@ pub fn iec61850_goose_serialize(msg: GOOSEMessage) -> Vec<i64> {
 
 **Returns:** `Vec<i64>`
 
-*Defined at line 332*
+*Defined at line 333*
 
 ---
 
@@ -742,7 +759,7 @@ pub fn iec61850_ref(ld: str, ln: str, field: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 370*
+*Defined at line 371*
 
 ---
 
@@ -761,7 +778,7 @@ pub fn iec61850_dataset_ref(ld: str, ds_name: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 375*
+*Defined at line 376*
 
 ---
 
@@ -781,7 +798,7 @@ pub fn iec61850_control_ref(ld: str, ln: str, co_name: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 380*
+*Defined at line 381*
 
 ---
 
@@ -799,13 +816,13 @@ pub struct PTOC {
 |------|------|
 | `name` | `str` |
 | `ln_type` | `i64` |
-| `pickup_current` | `f64,  // A — trip threshold` |
-| `time_delay` | `f64,      // seconds` |
-| `inverse_curve` | `bool,  // true = inverse time, false = definite time` |
-| `tds` | `f64,             // time dial setting (for inverse curves)` |
+| `pickup_current` | `f64` |
+| `time_delay` | `f64` |
+| `inverse_curve` | `bool` |
+| `tds` | `f64` |
 | `tripped` | `bool` |
 
-*Defined at line 387*
+*Defined at line 388*
 
 ---
 
@@ -825,7 +842,7 @@ pub fn iec61850_ptoc_new(name: str, pickup: f64, delay: f64) -> PTOC {
 
 **Returns:** `PTOC`
 
-*Defined at line 402*
+*Defined at line 403*
 
 ---
 
@@ -844,7 +861,7 @@ pub fn iec61850_ptoc_check(ptoc: &mut PTOC, measured_current: f64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 409*
+*Defined at line 410*
 
 ---
 
@@ -863,7 +880,7 @@ pub fn iec61850_ptoc_set_inverse(ptoc: &mut PTOC, tds: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 418*
+*Defined at line 419*
 
 ---
 
@@ -884,8 +901,8 @@ pub fn iec61850_ptoc_trip_time(ptoc: PTOC, measured_current: f64) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 426*
+*Defined at line 427*
 
 ---
 
-*Generated by [scribe](https://fides.dev) — Fides documentation generator*
+*Generated by [scribe](https://fides.dev) -- Fides documentation generator*

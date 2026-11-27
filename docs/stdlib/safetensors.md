@@ -1,0 +1,363 @@
+[All modules](index.md)
+
+# safetensors -- Fides Documentation
+
+## Contents
+
+- [StFile](#StFile) (struct)
+- [st_open](#st_open) (function)
+- [st_names](#st_names) (function)
+- [st_dtype_size](#st_dtype_size) (function)
+- [StTensor](#StTensor) (struct)
+- [st_tensor](#st_tensor) (function)
+- [st_elems](#st_elems) (function)
+- [st_f32bits_f64](#st_f32bits_f64) (function)
+- [st_f32](#st_f32) (function)
+- [st_f16_f32](#st_f16_f32) (function)
+- [st_bf16_f32](#st_bf16_f32) (function)
+- [st_f16](#st_f16) (function)
+- [st_bf16](#st_bf16) (function)
+- [st_f64](#st_f64) (function)
+- [st_int](#st_int) (function)
+- [st_uint](#st_uint) (function)
+- [st_meta](#st_meta) (function)
+
+## StFile
+
+```fides
+pub struct StFile {
+```
+
+**Fields:**
+
+| Name | Type |
+|------|------|
+| `ok` | `bool` |
+| `header` | `str` |
+| `data_off` | `i64` |
+| `names` | `Vec<str>,  // tensor names (excluding __metadata__)` |
+
+*Defined at line 9*
+
+---
+
+## st_open
+
+Parse the file bytes. Returns ok=false on any malformed field.
+
+```fides
+pub fn st_open(b: Vec<i64>) -> StFile {
+```
+
+**Parameters:**
+
+- `b`: `Vec<i64>`
+
+**Returns:** `StFile`
+
+*Defined at line 38*
+
+---
+
+## st_names
+
+Names of all tensors in the file.
+
+```fides
+pub fn st_names(st: StFile) -> Vec<str> {
+```
+
+**Parameters:**
+
+- `st`: `StFile`
+
+**Returns:** `Vec<str>`
+
+*Defined at line 77*
+
+---
+
+## st_dtype_size
+
+Bytes per element for a safetensors dtype string, or 0 if unknown.
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+assert_eq(st_dtype_size("F32"), 4);
+assert_eq(st_dtype_size("BF16"), 2);
+assert_eq(st_dtype_size("??"), 0);
+assert(st_f32bits_f64(0x3F800000) == 1.0);
+assert(st_f32bits_f64(0xC0000000) == -2.0);
+assert(st_f16_f32(0x3C00) == 1.0);
+assert(st_bf16_f32(0x3F80) == 1.0);
+```
+
+```fides
+pub fn st_dtype_size(dt: str) -> i64 {
+```
+
+**Parameters:**
+
+- `dt`: `str`
+
+**Returns:** `i64`
+
+*Defined at line 93*
+
+---
+
+## StTensor
+
+```fides
+pub struct StTensor {
+```
+
+**Fields:**
+
+| Name | Type |
+|------|------|
+| `found` | `bool` |
+| `dtype` | `str` |
+| `shape` | `Vec<i64>` |
+| `data_begin` | `i64` |
+| `data_end` | `i64` |
+
+*Defined at line 118*
+
+---
+
+## st_tensor
+
+Look up a tensor by name; found=false when absent or malformed.
+
+```fides
+pub fn st_tensor(b: Vec<i64>, st: StFile, name: str) -> StTensor {
+```
+
+**Parameters:**
+
+- `b`: `Vec<i64>`
+- `st`: `StFile`
+- `name`: `str`
+
+**Returns:** `StTensor`
+
+*Defined at line 128*
+
+---
+
+## st_elems
+
+Element count implied by the shape.
+
+```fides
+pub fn st_elems(t: StTensor) -> i64 {
+```
+
+**Parameters:**
+
+- `t`: `StTensor`
+
+**Returns:** `i64`
+
+*Defined at line 188*
+
+---
+
+## st_f32bits_f64
+
+Decode IEEE f32 bits to f64 in pure math (the interp has no
+f32-from-bits primitive). sign|exp(8)|man(23), normals/subnormals.
+inf/nan return the largest finite magnitude with sign.
+
+```fides
+pub fn st_f32bits_f64(bits: i64) -> f64 {
+```
+
+**Parameters:**
+
+- `bits`: `i64`
+
+**Returns:** `f64`
+
+*Defined at line 211*
+
+---
+
+## st_f32
+
+f32 element i of a tensor whose dtype is F32.
+
+```fides
+pub fn st_f32(b: Vec<i64>, t: StTensor, i: i64) -> f64 {
+```
+
+**Parameters:**
+
+- `b`: `Vec<i64>`
+- `t`: `StTensor`
+- `i`: `i64`
+
+**Returns:** `f64`
+
+*Defined at line 233*
+
+---
+
+## st_f16_f32
+
+IEEE f16 bits -> f64 value.
+
+```fides
+pub fn st_f16_f32(bits: i64) -> f64 {
+```
+
+**Parameters:**
+
+- `bits`: `i64`
+
+**Returns:** `f64`
+
+*Defined at line 269*
+
+---
+
+## st_bf16_f32
+
+bf16 -> f64: it's just the top half of the f32 word.
+
+```fides
+pub fn st_bf16_f32(bits: i64) -> f64 {
+```
+
+**Parameters:**
+
+- `bits`: `i64`
+
+**Returns:** `f64`
+
+*Defined at line 274*
+
+---
+
+## st_f16
+
+f16 element i.
+
+```fides
+pub fn st_f16(b: Vec<i64>, t: StTensor, i: i64) -> f64 {
+```
+
+**Parameters:**
+
+- `b`: `Vec<i64>`
+- `t`: `StTensor`
+- `i`: `i64`
+
+**Returns:** `f64`
+
+*Defined at line 279*
+
+---
+
+## st_bf16
+
+bf16 element i.
+
+```fides
+pub fn st_bf16(b: Vec<i64>, t: StTensor, i: i64) -> f64 {
+```
+
+**Parameters:**
+
+- `b`: `Vec<i64>`
+- `t`: `StTensor`
+- `i`: `i64`
+
+**Returns:** `f64`
+
+*Defined at line 284*
+
+---
+
+## st_f64
+
+```fides
+pub fn st_f64(b: Vec<i64>, t: StTensor, i: i64) -> f64 {
+```
+
+**Parameters:**
+
+- `b`: `Vec<i64>`
+- `t`: `StTensor`
+- `i`: `i64`
+
+**Returns:** `f64`
+
+*Defined at line 290*
+
+---
+
+## st_int
+
+Integer element i (I8..I64, sign-extended).
+
+```fides
+pub fn st_int(b: Vec<i64>, t: StTensor, i: i64) -> i64 {
+```
+
+**Parameters:**
+
+- `b`: `Vec<i64>`
+- `t`: `StTensor`
+- `i`: `i64`
+
+**Returns:** `i64`
+
+*Defined at line 297*
+
+---
+
+## st_uint
+
+Unsigned element i (U8..U32; U64 truncated to lo32 — document it).
+
+```fides
+pub fn st_uint(b: Vec<i64>, t: StTensor, i: i64) -> i64 {
+```
+
+**Parameters:**
+
+- `b`: `Vec<i64>`
+- `t`: `StTensor`
+- `i`: `i64`
+
+**Returns:** `i64`
+
+*Defined at line 330*
+
+---
+
+## st_meta
+
+__metadata__ object value for key, or "" — metadata stays a JSON
+string the caller interprets.
+
+```fides
+pub fn st_meta(st: StFile, key: str) -> str {
+```
+
+**Parameters:**
+
+- `st`: `StFile`
+- `key`: `str`
+
+**Returns:** `str`
+
+*Defined at line 344*
+
+---
+
+*Generated by [scribe](https://fides.dev) -- Fides documentation generator*

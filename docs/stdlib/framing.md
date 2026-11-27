@@ -1,0 +1,338 @@
+[All modules](index.md)
+
+# framing -- Fides Documentation
+
+## Contents
+
+- [cobs_encode](#cobs_encode) (function)
+- [CobsResult](#CobsResult) (struct)
+- [cobs_decode](#cobs_decode) (function)
+- [cobs_frame](#cobs_frame) (function)
+- [cobs_max_encoded](#cobs_max_encoded) (function)
+- [SLIP_END:](#SLIP_END:) (const)
+- [SLIP_ESC:](#SLIP_ESC:) (const)
+- [SLIP_ESC_END:](#SLIP_ESC_END:) (const)
+- [SLIP_ESC_ESC:](#SLIP_ESC_ESC:) (const)
+- [slip_encode](#slip_encode) (function)
+- [slip_decode](#slip_decode) (function)
+- [CobsStream](#CobsStream) (struct)
+- [cobs_stream_new](#cobs_stream_new) (function)
+- [cobs_stream_feed](#cobs_stream_feed) (function)
+- [cobs_stream_feed_all](#cobs_stream_feed_all) (function)
+- [SlipStream](#SlipStream) (struct)
+- [slip_stream_new](#slip_stream_new) (function)
+- [slip_stream_feed](#slip_stream_feed) (function)
+- [slip_stream_feed_all](#slip_stream_feed_all) (function)
+
+## cobs_encode
+
+```fides
+pub fn cobs_encode(data: Vec<i64>) -> Vec<i64> {
+```
+
+**Parameters:**
+
+- `data`: `Vec<i64>`
+
+**Returns:** `Vec<i64>`
+
+*Defined at line 25*
+
+---
+
+## CobsResult
+
+```fides
+pub struct CobsResult {
+```
+
+**Fields:**
+
+| Name | Type |
+|------|------|
+| `ok` | `bool` |
+| `data` | `Vec<i64>` |
+| `error` | `str` |
+
+*Defined at line 56*
+
+---
+
+## cobs_decode
+
+Decode one COBS frame (without the 0x00 delimiter).
+
+```fides
+pub fn cobs_decode(enc: Vec<i64>) -> CobsResult {
+```
+
+**Parameters:**
+
+- `enc`: `Vec<i64>`
+
+**Returns:** `CobsResult`
+
+*Defined at line 63*
+
+---
+
+## cobs_frame
+
+Encoded frame plus the 0x00 delimiter.
+
+```fides
+pub fn cobs_frame(data: Vec<i64>) -> Vec<i64> {
+```
+
+**Parameters:**
+
+- `data`: `Vec<i64>`
+
+**Returns:** `Vec<i64>`
+
+*Defined at line 101*
+
+---
+
+## cobs_max_encoded
+
+Largest encoded size of `n` data bytes (without the delimiter).
+
+```fides
+pub fn cobs_max_encoded(n: i64) -> i64 {
+```
+
+**Parameters:**
+
+- `n`: `i64`
+
+**Returns:** `i64`
+
+*Defined at line 108*
+
+---
+
+## SLIP_END:
+
+```fides
+pub const SLIP_END: i64 = 0xC0;
+```
+
+*Defined at line 114*
+
+---
+
+## SLIP_ESC:
+
+```fides
+pub const SLIP_ESC: i64 = 0xDB;
+```
+
+*Defined at line 115*
+
+---
+
+## SLIP_ESC_END:
+
+```fides
+pub const SLIP_ESC_END: i64 = 0xDC;
+```
+
+*Defined at line 116*
+
+---
+
+## SLIP_ESC_ESC:
+
+```fides
+pub const SLIP_ESC_ESC: i64 = 0xDD;
+```
+
+*Defined at line 117*
+
+---
+
+## slip_encode
+
+```fides
+pub fn slip_encode(data: Vec<i64>) -> Vec<i64> {
+```
+
+**Parameters:**
+
+- `data`: `Vec<i64>`
+
+**Returns:** `Vec<i64>`
+
+*Defined at line 119*
+
+---
+
+## slip_decode
+
+Decode the bytes of one SLIP frame (END bytes ignored).
+
+```fides
+pub fn slip_decode(enc: Vec<i64>) -> CobsResult {
+```
+
+**Parameters:**
+
+- `enc`: `Vec<i64>`
+
+**Returns:** `CobsResult`
+
+*Defined at line 141*
+
+---
+
+## CobsStream
+
+```fides
+pub struct CobsStream {
+```
+
+**Fields:**
+
+| Name | Type |
+|------|------|
+| `buf` | `Vec<i64>` |
+| `max` | `i64` |
+| `overflow` | `bool` |
+| `frames` | `Vec<Vec<i64>>` |
+| `errors` | `i64` |
+| `last_error` | `str` |
+
+*Defined at line 177*
+
+---
+
+## cobs_stream_new
+
+```fides
+pub fn cobs_stream_new(max_frame: i64) -> CobsStream {
+```
+
+**Parameters:**
+
+- `max_frame`: `i64`
+
+**Returns:** `CobsStream`
+
+*Defined at line 186*
+
+---
+
+## cobs_stream_feed
+
+Feed one byte; true when it completed a frame (in s.frames).
+
+```fides
+pub fn cobs_stream_feed(s: &mut CobsStream, b: i64) -> bool {
+```
+
+**Parameters:**
+
+- `s`: `&mut CobsStream`
+- `b`: `i64`
+
+**Returns:** `bool`
+
+*Defined at line 193*
+
+---
+
+## cobs_stream_feed_all
+
+Feed many bytes; the number of frames completed.
+
+```fides
+pub fn cobs_stream_feed_all(s: &mut CobsStream, bytes: Vec<i64>) -> i64 {
+```
+
+**Parameters:**
+
+- `s`: `&mut CobsStream`
+- `bytes`: `Vec<i64>`
+
+**Returns:** `i64`
+
+*Defined at line 226*
+
+---
+
+## SlipStream
+
+```fides
+pub struct SlipStream {
+```
+
+**Fields:**
+
+| Name | Type |
+|------|------|
+| `buf` | `Vec<i64>` |
+| `max` | `i64` |
+| `esc` | `bool` |
+| `bad` | `bool` |
+| `frames` | `Vec<Vec<i64>>` |
+| `errors` | `i64` |
+| `last_error` | `str` |
+
+*Defined at line 238*
+
+---
+
+## slip_stream_new
+
+```fides
+pub fn slip_stream_new(max_frame: i64) -> SlipStream {
+```
+
+**Parameters:**
+
+- `max_frame`: `i64`
+
+**Returns:** `SlipStream`
+
+*Defined at line 248*
+
+---
+
+## slip_stream_feed
+
+Feed one byte (decoding as it goes); true when a frame completed.
+
+```fides
+pub fn slip_stream_feed(s: &mut SlipStream, b0: i64) -> bool {
+```
+
+**Parameters:**
+
+- `s`: `&mut SlipStream`
+- `b0`: `i64`
+
+**Returns:** `bool`
+
+*Defined at line 255*
+
+---
+
+## slip_stream_feed_all
+
+```fides
+pub fn slip_stream_feed_all(s: &mut SlipStream, bytes: Vec<i64>) -> i64 {
+```
+
+**Parameters:**
+
+- `s`: `&mut SlipStream`
+- `bytes`: `Vec<i64>`
+
+**Returns:** `i64`
+
+*Defined at line 302*
+
+---
+
+*Generated by [scribe](https://fides.dev) -- Fides documentation generator*

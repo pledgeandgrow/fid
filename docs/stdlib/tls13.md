@@ -1,50 +1,339 @@
-# TLS 1.3 in `tls` (Schannel and OpenSSL)
+[All modules](index.md)
 
-Competitive roadmap SL4 / release I7. `use tls` is `stdlib/tls_windows.fd`
-(Schannel) on Windows and `stdlib/tls_unix.fd` (OpenSSL) elsewhere.
+# tls13 -- Fides Documentation
 
-## What a program gets
+## Contents
 
-- `tls_connect`, `tls_client`, `tls_server`: the system's choice of
-  version. On Windows 11 / Server 2022 this now includes TLS 1.3: the
-  credentials go through `SCH_CREDENTIALS` (the legacy `SCHANNEL_CRED`
-  stops at 1.2; a Windows release that does not know `SCH_CREDENTIALS`
-  gets `SCHANNEL_CRED` as before). OpenSSL always offered 1.3.
-- `tls_connect13`, `tls_client13`, `tls_server13`,
-  `tls_connect13_unchecked`: TLS 1.3 only (Schannel:
-  `grbitDisabledProtocols` = every bit but `SP_PROT_TLS1_3`; OpenSSL:
-  `SSL_CTX_set_min_proto_version`).
-- `tls_session_version(s)`: 772 for TLS 1.3, 771 for 1.2, on both.
-- ALPN: `tls_connect_alpn`, `tls_server_alpn`, `tls_session_alpn`
-  (`stdlib/tls_alpn.fd` for the wire format).
-- `tls_server_close(server)`: frees a server. On Windows it also deletes
-  the private key that `tls_server` imported into the user's key store
-  (Schannel cannot use a key held only in memory, so the .pfx is imported
-  as a CNG key, `PKCS12_ALWAYS_CNG_KSP`: TLS 1.3 signs with RSA-PSS, which
-  the legacy CryptoAPI providers cannot do).
-- `tls_library()`: "schannel" or "openssl".
+- [TLS13_HASH_LEN:](#TLS13_HASH_LEN:) (const)
+- [Tls13TrafficKeys](#Tls13TrafficKeys) (struct)
+- [Tls13Schedule](#Tls13Schedule) (struct)
+- [tls13_transcript_hash](#tls13_transcript_hash) (function)
+- [tls13_empty_hash](#tls13_empty_hash) (function)
+- [tls13_derive_secret](#tls13_derive_secret) (function)
+- [tls13_early_secret](#tls13_early_secret) (function)
+- [tls13_binder_key](#tls13_binder_key) (function)
+- [tls13_handshake_secret](#tls13_handshake_secret) (function)
+- [tls13_master_secret](#tls13_master_secret) (function)
+- [tls13_traffic_keys](#tls13_traffic_keys) (function)
+- [tls13_next_traffic_secret](#tls13_next_traffic_secret) (function)
+- [tls13_finished_key](#tls13_finished_key) (function)
+- [tls13_finished_verify_data](#tls13_finished_verify_data) (function)
+- [tls13_finished_check](#tls13_finished_check) (function)
+- [tls13_schedule_handshake](#tls13_schedule_handshake) (function)
+- [tls13_schedule_application](#tls13_schedule_application) (function)
+- [tls13_schedule_resumption](#tls13_schedule_resumption) (function)
 
-## Schannel details fixed for 1.3 (Nov 17)
+## TLS13_HASH_LEN:
 
-- After a TLS 1.3 handshake the server sends NewSessionTicket;
-  `DecryptMessage` returns `SEC_I_RENEGOTIATE` for it. `tls_session_recv`
-  now gives those bytes to `InitializeSecurityContext` (or
-  `AcceptSecurityContext` on a server) and goes on with what is left
-  (`ts_post_handshake`); before, the first read of a 1.3 session failed.
-  The same path serves KeyUpdate and a TLS 1.2 renegotiation.
-- The ALPN choice is read when the handshake ends and kept: a 1.3 client's
-  query answers "none" once it has taken the ticket.
+The hash length of the SHA-256 suites: every secret is this long.
 
-## Checks
+```fides
+pub const TLS13_HASH_LEN: i64 = 32;
+```
 
-- `tests/bootstrap/test_tls13_local.fd` (suite, no network): a built-in
-  self-signed certificate, a `tls_server13` with ALPN, a 1.3-only client
-  and a default client offering "h2"; version 772 and one message each way
-  on both sides. Nov 17: passes with `fid ccompile` and `fid emit` on
-  Windows 11 and with OpenSSL 3.6.2 in WSL; the imported key is deleted.
-- `scripts/verify/tls13_live.fd` (network): `tls_connect` and
-  `tls_connect13` to a public host, a GET over each. Nov 17, github.com and
-  www.cloudflare.com: 772 and an HTTP answer on both connections, Windows
-  (C and native) and Linux.
-- `tests/tls/tls13_server_live.fd`: the same as the suite test with a
-  certificate of your own.
+*Defined at line 40*
+
+---
+
+## Tls13TrafficKeys
+
+A traffic secret's write key and IV (RFC 8446 §7.3).
+
+```fides
+pub struct Tls13TrafficKeys {
+```
+
+**Fields:**
+
+| Name | Type |
+|------|------|
+| `key` | `Vec<i64>` |
+| `iv` | `Vec<i64>` |
+
+*Defined at line 43*
+
+---
+
+## Tls13Schedule
+
+The key schedule of one connection. A field the schedule has not
+reached yet is empty: tls13_schedule_handshake fills `early` to
+`master`, tls13_schedule_application the application secrets and the
+exporter, tls13_schedule_resumption `resumption`.
+
+```fides
+pub struct Tls13Schedule {
+```
+
+**Fields:**
+
+| Name | Type |
+|------|------|
+| `early` | `Vec<i64>` |
+| `handshake` | `Vec<i64>` |
+| `client_hs` | `Vec<i64>` |
+| `server_hs` | `Vec<i64>` |
+| `master` | `Vec<i64>` |
+| `client_ap` | `Vec<i64>` |
+| `server_ap` | `Vec<i64>` |
+| `exporter` | `Vec<i64>` |
+| `resumption` | `Vec<i64>` |
+
+*Defined at line 52*
+
+---
+
+## tls13_transcript_hash
+
+Transcript-Hash (§4.4.1): SHA-256 of the concatenated handshake
+messages (each with its 4-byte header).
+
+```fides
+pub fn tls13_transcript_hash(messages: Vec<i64>) -> Vec<i64> {
+```
+
+**Parameters:**
+
+- `messages`: `Vec<i64>`
+
+**Returns:** `Vec<i64>`
+
+*Defined at line 109*
+
+---
+
+## tls13_empty_hash
+
+The hash of no messages, SHA-256("").
+
+```fides
+pub fn tls13_empty_hash() -> Vec<i64> {
+```
+
+**Returns:** `Vec<i64>`
+
+*Defined at line 114*
+
+---
+
+## tls13_derive_secret
+
+```fides
+pub fn tls13_derive_secret(@secret secret: Vec<i64>, label: str, transcript_hash: Vec<i64>) -> Vec<i64> {
+```
+
+**Parameters:**
+
+- `@secret secret`: `Vec<i64>`
+- `label`: `str`
+- `transcript_hash`: `Vec<i64>`
+
+**Returns:** `Vec<i64>`
+
+*Defined at line 122*
+
+---
+
+## tls13_early_secret
+
+```fides
+pub fn tls13_early_secret(@secret psk: Vec<i64>) -> Vec<i64> {
+```
+
+**Parameters:**
+
+- `@secret psk`: `Vec<i64>`
+
+**Returns:** `Vec<i64>`
+
+*Defined at line 129*
+
+---
+
+## tls13_binder_key
+
+```fides
+pub fn tls13_binder_key(@secret early: Vec<i64>, external: bool) -> Vec<i64> {
+```
+
+**Parameters:**
+
+- `@secret early`: `Vec<i64>`
+- `external`: `bool`
+
+**Returns:** `Vec<i64>`
+
+*Defined at line 140*
+
+---
+
+## tls13_handshake_secret
+
+```fides
+pub fn tls13_handshake_secret(@secret early: Vec<i64>, @secret shared: Vec<i64>) -> Vec<i64> {
+```
+
+**Parameters:**
+
+- `@secret early`: `Vec<i64>`
+- `@secret shared`: `Vec<i64>`
+
+**Returns:** `Vec<i64>`
+
+*Defined at line 150*
+
+---
+
+## tls13_master_secret
+
+```fides
+pub fn tls13_master_secret(@secret handshake: Vec<i64>) -> Vec<i64> {
+```
+
+**Parameters:**
+
+- `@secret handshake`: `Vec<i64>`
+
+**Returns:** `Vec<i64>`
+
+*Defined at line 156*
+
+---
+
+## tls13_traffic_keys
+
+```fides
+pub fn tls13_traffic_keys(@secret secret: Vec<i64>, key_len: i64) -> Tls13TrafficKeys {
+```
+
+**Parameters:**
+
+- `@secret secret`: `Vec<i64>`
+- `key_len`: `i64`
+
+**Returns:** `Tls13TrafficKeys`
+
+*Defined at line 163*
+
+---
+
+## tls13_next_traffic_secret
+
+```fides
+pub fn tls13_next_traffic_secret(@secret secret: Vec<i64>) -> Vec<i64> {
+```
+
+**Parameters:**
+
+- `@secret secret`: `Vec<i64>`
+
+**Returns:** `Vec<i64>`
+
+*Defined at line 172*
+
+---
+
+## tls13_finished_key
+
+```fides
+pub fn tls13_finished_key(@secret base_key: Vec<i64>) -> Vec<i64> {
+```
+
+**Parameters:**
+
+- `@secret base_key`: `Vec<i64>`
+
+**Returns:** `Vec<i64>`
+
+*Defined at line 179*
+
+---
+
+## tls13_finished_verify_data
+
+```fides
+pub fn tls13_finished_verify_data(@secret base_key: Vec<i64>, transcript_hash: Vec<i64>) -> Vec<i64> {
+```
+
+**Parameters:**
+
+- `@secret base_key`: `Vec<i64>`
+- `transcript_hash`: `Vec<i64>`
+
+**Returns:** `Vec<i64>`
+
+*Defined at line 187*
+
+---
+
+## tls13_finished_check
+
+```fides
+pub fn tls13_finished_check(@secret base_key: Vec<i64>, transcript_hash: Vec<i64>, received: Vec<i64>) -> bool {
+```
+
+**Parameters:**
+
+- `@secret base_key`: `Vec<i64>`
+- `transcript_hash`: `Vec<i64>`
+- `received`: `Vec<i64>`
+
+**Returns:** `bool`
+
+*Defined at line 193*
+
+---
+
+## tls13_schedule_handshake
+
+```fides
+pub fn tls13_schedule_handshake(@secret psk: Vec<i64>, @secret shared: Vec<i64>, hello_hash: Vec<i64>) -> Tls13Schedule {
+```
+
+**Parameters:**
+
+- `@secret psk`: `Vec<i64>`
+- `@secret shared`: `Vec<i64>`
+- `hello_hash`: `Vec<i64>`
+
+**Returns:** `Tls13Schedule`
+
+*Defined at line 212*
+
+---
+
+## tls13_schedule_application
+
+```fides
+pub fn tls13_schedule_application(@secret s: Tls13Schedule, finished_hash: Vec<i64>) -> Tls13Schedule {
+```
+
+**Parameters:**
+
+- `@secret s`: `Tls13Schedule`
+- `finished_hash`: `Vec<i64>`
+
+**Returns:** `Tls13Schedule`
+
+*Defined at line 224*
+
+---
+
+## tls13_schedule_resumption
+
+```fides
+pub fn tls13_schedule_resumption(@secret s: Tls13Schedule, client_finished_hash: Vec<i64>) -> Tls13Schedule {
+```
+
+**Parameters:**
+
+- `@secret s`: `Tls13Schedule`
+- `client_finished_hash`: `Vec<i64>`
+
+**Returns:** `Tls13Schedule`
+
+*Defined at line 233*
+
+---
+
+*Generated by [scribe](https://fides.dev) -- Fides documentation generator*

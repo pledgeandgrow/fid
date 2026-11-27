@@ -1,0 +1,381 @@
+[All modules](index.md)
+
+# multiboot -- Fides Documentation
+
+## Contents
+
+- [mb_u32](#mb_u32) (function)
+- [mb_u64](#mb_u64) (function)
+- [MB_TAG_END](#MB_TAG_END) (function)
+- [MB_TAG_CMDLINE](#MB_TAG_CMDLINE) (function)
+- [MB_TAG_BOOTLOADER](#MB_TAG_BOOTLOADER) (function)
+- [MB_TAG_MODULE](#MB_TAG_MODULE) (function)
+- [MB_TAG_MEM_BASIC](#MB_TAG_MEM_BASIC) (function)
+- [MB_TAG_BOOTDEV](#MB_TAG_BOOTDEV) (function)
+- [MB_TAG_MMAP](#MB_TAG_MMAP) (function)
+- [MB_TAG_FRAMEBUFFER](#MB_TAG_FRAMEBUFFER) (function)
+- [mbi_valid](#mbi_valid) (function)
+- [mbi_tag_count](#mbi_tag_count) (function)
+- [mbi_tag](#mbi_tag) (function)
+- [mbi_tag_find](#mbi_tag_find) (function)
+- [mb_str](#mb_str) (function)
+- [E820Entry](#E820Entry) (struct)
+- [mmap_count](#mmap_count) (function)
+- [mmap_entry](#mmap_entry) (function)
+- [mmap_usable](#mmap_usable) (function)
+- [FbInfo](#FbInfo) (struct)
+- [fb_info](#fb_info) (function)
+
+## mb_u32
+
+```fides
+pub fn mb_u32(b: Vec<i64>, o: i64) -> i64 {
+```
+
+**Parameters:**
+
+- `b`: `Vec<i64>`
+- `o`: `i64`
+
+**Returns:** `i64`
+
+*Defined at line 7*
+
+---
+
+## mb_u64
+
+```fides
+pub fn mb_u64(b: Vec<i64>, o: i64) -> i64 {
+```
+
+**Parameters:**
+
+- `b`: `Vec<i64>`
+- `o`: `i64`
+
+**Returns:** `i64`
+
+*Defined at line 11*
+
+---
+
+## MB_TAG_END
+
+```fides
+pub fn MB_TAG_END() -> i64 {
+```
+
+**Returns:** `i64`
+
+*Defined at line 16*
+
+---
+
+## MB_TAG_CMDLINE
+
+```fides
+pub fn MB_TAG_CMDLINE() -> i64 {
+```
+
+**Returns:** `i64`
+
+*Defined at line 19*
+
+---
+
+## MB_TAG_BOOTLOADER
+
+```fides
+pub fn MB_TAG_BOOTLOADER() -> i64 {
+```
+
+**Returns:** `i64`
+
+*Defined at line 22*
+
+---
+
+## MB_TAG_MODULE
+
+```fides
+pub fn MB_TAG_MODULE() -> i64 {
+```
+
+**Returns:** `i64`
+
+*Defined at line 25*
+
+---
+
+## MB_TAG_MEM_BASIC
+
+```fides
+pub fn MB_TAG_MEM_BASIC() -> i64 {
+```
+
+**Returns:** `i64`
+
+*Defined at line 28*
+
+---
+
+## MB_TAG_BOOTDEV
+
+```fides
+pub fn MB_TAG_BOOTDEV() -> i64 {
+```
+
+**Returns:** `i64`
+
+*Defined at line 31*
+
+---
+
+## MB_TAG_MMAP
+
+```fides
+pub fn MB_TAG_MMAP() -> i64 {
+```
+
+**Returns:** `i64`
+
+*Defined at line 34*
+
+---
+
+## MB_TAG_FRAMEBUFFER
+
+```fides
+pub fn MB_TAG_FRAMEBUFFER() -> i64 {
+```
+
+**Returns:** `i64`
+
+*Defined at line 37*
+
+---
+
+## mbi_valid
+
+Valid mbi? (total_size u32 then reserved u32; the byte following the
+tags is always an END tag pair).
+
+```fides
+pub fn mbi_valid(b: Vec<i64>) -> bool {
+```
+
+**Parameters:**
+
+- `b`: `Vec<i64>`
+
+**Returns:** `bool`
+
+*Defined at line 43*
+
+---
+
+## mbi_tag_count
+
+Total tag count (END tag excluded).
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+var b: Vec<i64> = Vec::filled(24, 0);
+b.set(0, 24);
+b.set(8, MB_TAG_CMDLINE()); b.set(12, 8);
+b.set(20, 8);
+assert(mbi_valid(b));
+assert_eq(mb_u32(b, 0), 24);
+assert_eq(mbi_tag_count(b), 1);
+```
+
+```fides
+pub fn mbi_tag_count(b: Vec<i64>) -> i64 {
+```
+
+**Parameters:**
+
+- `b`: `Vec<i64>`
+
+**Returns:** `i64`
+
+*Defined at line 58*
+
+---
+
+## mbi_tag
+
+Offset of tag i's payload (its `type` and `size` fields are the 8
+bytes just before), or -1.
+
+```fides
+pub fn mbi_tag(b: Vec<i64>, i: i64) -> i64 {
+```
+
+**Parameters:**
+
+- `b`: `Vec<i64>`
+- `i`: `i64`
+
+**Returns:** `i64`
+
+*Defined at line 76*
+
+---
+
+## mbi_tag_find
+
+Offset of the first tag of `want` type's payload, or -1.
+
+```fides
+pub fn mbi_tag_find(b: Vec<i64>, want: i64) -> i64 {
+```
+
+**Parameters:**
+
+- `b`: `Vec<i64>`
+- `want`: `i64`
+
+**Returns:** `i64`
+
+*Defined at line 95*
+
+---
+
+## mb_str
+
+NUL-terminated string at payload offset p (cmdline/bootloader tags).
+
+```fides
+pub fn mb_str(b: Vec<i64>, p: i64) -> str {
+```
+
+**Parameters:**
+
+- `b`: `Vec<i64>`
+- `p`: `i64`
+
+**Returns:** `str`
+
+*Defined at line 112*
+
+---
+
+## E820Entry
+
+```fides
+pub struct E820Entry {
+```
+
+**Fields:**
+
+| Name | Type |
+|------|------|
+| `base` | `i64` |
+| `length` | `i64` |
+| `etype` | `i64,  // 1 usable, 2 reserved, 3 ACPI, 4 NVS, 5 bad` |
+
+*Defined at line 128*
+
+---
+
+## mmap_count
+
+Number of e820 entries in the mmap tag payload at p.
+
+```fides
+pub fn mmap_count(b: Vec<i64>, p: i64) -> i64 {
+```
+
+**Parameters:**
+
+- `b`: `Vec<i64>`
+- `p`: `i64`
+
+**Returns:** `i64`
+
+*Defined at line 135*
+
+---
+
+## mmap_entry
+
+e820 entry i: {base u64, length u64, type u32, reserved u32}.
+
+```fides
+pub fn mmap_entry(b: Vec<i64>, p: i64, i: i64) -> E820Entry {
+```
+
+**Parameters:**
+
+- `b`: `Vec<i64>`
+- `p`: `i64`
+- `i`: `i64`
+
+**Returns:** `E820Entry`
+
+*Defined at line 148*
+
+---
+
+## mmap_usable
+
+```fides
+pub fn mmap_usable(b: Vec<i64>, p: i64) -> i64 {
+```
+
+**Parameters:**
+
+- `b`: `Vec<i64>`
+- `p`: `i64`
+
+**Returns:** `i64`
+
+*Defined at line 158*
+
+---
+
+## FbInfo
+
+```fides
+pub struct FbInfo {
+```
+
+**Fields:**
+
+| Name | Type |
+|------|------|
+| `addr` | `i64` |
+| `pitch` | `i64` |
+| `width` | `i64` |
+| `height` | `i64` |
+| `bpp` | `i64` |
+| `fbtype` | `i64` |
+
+*Defined at line 174*
+
+---
+
+## fb_info
+
+Framebuffer tag payload at p.
+
+```fides
+pub fn fb_info(b: Vec<i64>, p: i64) -> FbInfo {
+```
+
+**Parameters:**
+
+- `b`: `Vec<i64>`
+- `p`: `i64`
+
+**Returns:** `FbInfo`
+
+*Defined at line 184*
+
+---
+
+*Generated by [scribe](https://fides.dev) -- Fides documentation generator*

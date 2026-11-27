@@ -1,0 +1,361 @@
+[All modules](index.md)
+
+# mmap -- Fides Documentation
+
+## Contents
+
+- [Mmap](#Mmap) (struct)
+- [mmap_file](#mmap_file) (function)
+- [mmap_file_create](#mmap_file_create) (function)
+- [mmap_anon](#mmap_anon) (function)
+- [mmap_ok](#mmap_ok) (function)
+- [mmap_close](#mmap_close) (function)
+- [mmap_flush](#mmap_flush) (function)
+- [mmap_get](#mmap_get) (function)
+- [mmap_set](#mmap_set) (function)
+- [mmap_read](#mmap_read) (function)
+- [mmap_write](#mmap_write) (function)
+- [mmap_slice](#mmap_slice) (function)
+- [mmap_write_str](#mmap_write_str) (function)
+- [mmap_get_u32](#mmap_get_u32) (function)
+- [mmap_set_u32](#mmap_set_u32) (function)
+- [mmap_get_u64](#mmap_get_u64) (function)
+- [mmap_set_u64](#mmap_set_u64) (function)
+
+## Mmap
+
+A memory mapping. `addr` 0 = invalid/failed.
+
+```fides
+pub struct Mmap {
+```
+
+**Fields:**
+
+| Name | Type |
+|------|------|
+| `addr` | `i64` |
+| `len` | `i64` |
+
+*Defined at line 24*
+
+---
+
+## mmap_file
+
+Map `path` read/write (falls back to read-only if write access is
+denied). Returns Mmap with addr 0 on failure.
+
+```fides
+pub fn mmap_file(path: str) -> Mmap {
+```
+
+**Parameters:**
+
+- `path`: `str`
+
+**Returns:** `Mmap`
+
+*Defined at line 31*
+
+---
+
+## mmap_file_create
+
+Map `path` read/write, creating it with `size` bytes when missing
+or empty (grows the file first so the mapping succeeds).
+
+```fides
+pub fn mmap_file_create(path: str, size: i64) -> Mmap {
+```
+
+**Parameters:**
+
+- `path`: `str`
+- `size`: `i64`
+
+**Returns:** `Mmap`
+
+*Defined at line 40*
+
+---
+
+## mmap_anon
+
+Anonymous private mapping of `len` bytes (zero-initialized).
+
+
+*Example (native only) -- run as a test by `scripts/doctest.py`:*
+
+```fides
+var m = mmap_anon(4096);
+assert(mmap_ok(m));
+assert_eq(mmap_get(m, 10), 0);
+mmap_set(m, 10, 200);
+assert_eq(mmap_get(m, 10), 200);
+mmap_set_u32(m, 0, 0x01020304);
+assert_eq(mmap_get_u32(m, 0), 0x01020304);
+mmap_write_str(m, 100, "hey");
+assert_eq(mmap_slice(m, 100, 3), "hey");
+mmap_close(&mut m);
+assert(!mmap_ok(m));
+```
+
+```fides
+pub fn mmap_anon(len: i64) -> Mmap {
+```
+
+**Parameters:**
+
+- `len`: `i64`
+
+**Returns:** `Mmap`
+
+*Defined at line 72*
+
+---
+
+## mmap_ok
+
+True when the mapping is valid.
+
+```fides
+pub fn mmap_ok(m: Mmap) -> bool {
+```
+
+**Parameters:**
+
+- `m`: `Mmap`
+
+**Returns:** `bool`
+
+*Defined at line 80*
+
+---
+
+## mmap_close
+
+Unmap. The handle is left invalid (addr = 0).
+
+```fides
+pub fn mmap_close(m: &mut Mmap) -> void {
+```
+
+**Parameters:**
+
+- `m`: `&mut Mmap`
+
+**Returns:** `void`
+
+*Defined at line 85*
+
+---
+
+## mmap_flush
+
+Flush modified pages to the file (msync/FlushViewOfFile).
+
+```fides
+pub fn mmap_flush(m: Mmap) -> i64 {
+```
+
+**Parameters:**
+
+- `m`: `Mmap`
+
+**Returns:** `i64`
+
+*Defined at line 94*
+
+---
+
+## mmap_get
+
+Read byte at `off` (0 when out of range).
+
+```fides
+pub fn mmap_get(m: Mmap, off: i64) -> i64 {
+```
+
+**Parameters:**
+
+- `m`: `Mmap`
+- `off`: `i64`
+
+**Returns:** `i64`
+
+*Defined at line 101*
+
+---
+
+## mmap_set
+
+Write byte at `off` (no-op when out of range).
+
+```fides
+pub fn mmap_set(m: Mmap, off: i64, val: i64) -> void {
+```
+
+**Parameters:**
+
+- `m`: `Mmap`
+- `off`: `i64`
+- `val`: `i64`
+
+**Returns:** `void`
+
+*Defined at line 109*
+
+---
+
+## mmap_read
+
+Read `len` bytes at `off` as a Vec.
+
+```fides
+pub fn mmap_read(m: Mmap, off: i64, len: i64) -> Vec {
+```
+
+**Parameters:**
+
+- `m`: `Mmap`
+- `off`: `i64`
+- `len`: `i64`
+
+**Returns:** `Vec`
+
+*Defined at line 117*
+
+---
+
+## mmap_write
+
+Write a Vec of bytes at `off`; returns bytes written.
+
+```fides
+pub fn mmap_write(m: Mmap, off: i64, data: Vec) -> i64 {
+```
+
+**Parameters:**
+
+- `m`: `Mmap`
+- `off`: `i64`
+- `data`: `Vec`
+
+**Returns:** `i64`
+
+*Defined at line 128*
+
+---
+
+## mmap_slice
+
+Read bytes at `off` as a string.
+
+```fides
+pub fn mmap_slice(m: Mmap, off: i64, len: i64) -> str {
+```
+
+**Parameters:**
+
+- `m`: `Mmap`
+- `off`: `i64`
+- `len`: `i64`
+
+**Returns:** `str`
+
+*Defined at line 138*
+
+---
+
+## mmap_write_str
+
+Write a string's bytes at `off`; returns bytes written.
+
+```fides
+pub fn mmap_write_str(m: Mmap, off: i64, s: str) -> i64 {
+```
+
+**Parameters:**
+
+- `m`: `Mmap`
+- `off`: `i64`
+- `s`: `str`
+
+**Returns:** `i64`
+
+*Defined at line 143*
+
+---
+
+## mmap_get_u32
+
+```fides
+pub fn mmap_get_u32(m: Mmap, off: i64) -> i64 {
+```
+
+**Parameters:**
+
+- `m`: `Mmap`
+- `off`: `i64`
+
+**Returns:** `i64`
+
+*Defined at line 154*
+
+---
+
+## mmap_set_u32
+
+```fides
+pub fn mmap_set_u32(m: Mmap, off: i64, v: i64) -> void {
+```
+
+**Parameters:**
+
+- `m`: `Mmap`
+- `off`: `i64`
+- `v`: `i64`
+
+**Returns:** `void`
+
+*Defined at line 158*
+
+---
+
+## mmap_get_u64
+
+```fides
+pub fn mmap_get_u64(m: Mmap, off: i64) -> i64 {
+```
+
+**Parameters:**
+
+- `m`: `Mmap`
+- `off`: `i64`
+
+**Returns:** `i64`
+
+*Defined at line 165*
+
+---
+
+## mmap_set_u64
+
+```fides
+pub fn mmap_set_u64(m: Mmap, off: i64, v: i64) -> void {
+```
+
+**Parameters:**
+
+- `m`: `Mmap`
+- `off`: `i64`
+- `v`: `i64`
+
+**Returns:** `void`
+
+*Defined at line 175*
+
+---
+
+*Generated by [scribe](https://fides.dev) -- Fides documentation generator*

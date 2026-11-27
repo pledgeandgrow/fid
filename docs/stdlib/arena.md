@@ -1,4 +1,6 @@
-# arena — Fides Documentation
+[All modules](index.md)
+
+# arena -- Fides Documentation
 
 ## Contents
 
@@ -9,6 +11,7 @@
 - [arena_free](#arena_free) (function)
 - [region_new](#region_new) (function)
 - [region_alloc](#region_alloc) (function)
+- [region_alloc_zeroed](#region_alloc_zeroed) (function)
 - [region_free](#region_free) (function)
 - [region_free_one](#region_free_one) (function)
 - [with_arena](#with_arena) (function)
@@ -16,6 +19,7 @@
 - [mem_zero](#mem_zero) (function)
 - [mem_set](#mem_set) (function)
 - [arena_used](#arena_used) (function)
+- [arena_used_since](#arena_used_since) (function)
 - [region_count](#region_count) (function)
 - [frame_new](#frame_new) (function)
 - [frame_begin](#frame_begin) (function)
@@ -75,7 +79,7 @@ pub fn arena_save() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 60*
+*Defined at line 64*
 
 ---
 
@@ -95,7 +99,7 @@ pub fn arena_restore(mark: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 67*
+*Defined at line 71*
 
 ---
 
@@ -114,18 +118,21 @@ pub fn arena_free(arena_mark: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 73*
+*Defined at line 77*
 
 ---
 
 ## region_new
 
-Region header — tracks a linked list of allocations.
-Stored as a Vec of pointers for simplicity.
-The region itself is heap-allocated.
-Create a new region. Returns a pointer to the region header.
-Use region_alloc to allocate within the region.
-Use region_free to free all allocations in the region.
+Region header — a 16-byte block {head, count}. Every allocation made
+by region_alloc prepends a 16-byte node {next, size} to the list and
+returns the payload just past it, so region_free only has to walk the
+list and p_free each node — no side table, no Vec.
+
+[header: head -> node -> node -> ...]
+node = { next: i64, size: i64, payload[size] }
+Create a new region. Returns a handle to use with region_alloc and
+region_free.
 
 ```fides
 pub fn region_new() -> i64 {
@@ -133,14 +140,14 @@ pub fn region_new() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 96*
+*Defined at line 100*
 
 ---
 
 ## region_alloc
 
 Allocate `size` bytes within a region. Returns a raw pointer.
-The memory is freed when region_free is called.
+The memory is tracked and freed when region_free is called.
 
 ```fides
 pub fn region_alloc(region: i64, size: i64) -> i64 {
@@ -153,14 +160,34 @@ pub fn region_alloc(region: i64, size: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 113*
+*Defined at line 122*
+
+---
+
+## region_alloc_zeroed
+
+Allocate `size` zeroed bytes within a region.
+
+```fides
+pub fn region_alloc_zeroed(region: i64, size: i64) -> i64 {
+```
+
+**Parameters:**
+
+- `region`: `i64`
+- `size`: `i64`
+
+**Returns:** `i64`
+
+*Defined at line 151*
 
 ---
 
 ## region_free
 
-Free all allocations in a region. O(n) where n is the number of
-allocations, but typically called once at scope exit.
+Free all allocations in a region, then the region header itself.
+O(n) where n is the number of live allocations — typically called once
+at scope exit. Every pointer from this region is invalid afterwards.
 
 ```fides
 pub fn region_free(region: i64) -> void {
@@ -172,15 +199,15 @@ pub fn region_free(region: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 146*
+*Defined at line 164*
 
 ---
 
 ## region_free_one
 
-Free a single allocation within a region.
-This is a no-op for arena-based regions (individual frees aren't supported).
-For linked-list regions, this removes the allocation from the list and frees it.
+Free a single allocation within a region: unlinks its node and frees
+it. Freeing an untracked or null pointer is a no-op — it is NOT freed,
+so a pointer that belongs to another region stays safe.
 
 ```fides
 pub fn region_free_one(region: i64, ptr: i64) -> void {
@@ -193,7 +220,7 @@ pub fn region_free_one(region: i64, ptr: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 173*
+*Defined at line 201*
 
 ---
 
@@ -203,12 +230,16 @@ Run a function with a fresh arena, then free the arena.
 All allocations made within the function via arena_alloc are
 automatically freed when the function returns.
 
-Example:
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
 with_arena(fn() -> i64 {
-var p = arena_alloc(0, 64);
-// ... use p ...
-return 0;
+  var p = arena_alloc(0, 64);
+  // ... use p ...
+  return 0;
 });
+```
 
 ```fides
 pub fn with_arena(f: fn() -> i64) -> i64 {
@@ -220,14 +251,11 @@ pub fn with_arena(f: fn() -> i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 228*
+*Defined at line 261*
 
 ---
 
 ## mem_copy
-
-Copy `n` bytes from `src` to `dst`. Both must be valid pointers.
-Regions: src and dst can be in any region or the heap.
 
 ```fides
 pub fn mem_copy(dst: i64, src: i64, n: i64) -> void {
@@ -241,13 +269,11 @@ pub fn mem_copy(dst: i64, src: i64, n: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 244*
+*Defined at line 277*
 
 ---
 
 ## mem_zero
-
-Fill `n` bytes at `dst` with zero. Useful for initializing allocated memory.
 
 ```fides
 pub fn mem_zero(dst: i64, n: i64) -> void {
@@ -260,13 +286,11 @@ pub fn mem_zero(dst: i64, n: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 262*
+*Defined at line 295*
 
 ---
 
 ## mem_set
-
-Fill `n` bytes at `dst` with byte `val`.
 
 ```fides
 pub fn mem_set(dst: i64, val: i64, n: i64) -> void {
@@ -280,14 +304,14 @@ pub fn mem_set(dst: i64, val: i64, n: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 270*
+*Defined at line 303*
 
 ---
 
 ## arena_used
 
-Get the total number of bytes allocated in the arena.
-This is the current bump pointer offset.
+The current arena bump offset — equal to the total bytes the arena
+has handed out since its last restore (a save mark is that offset).
 
 ```fides
 pub fn arena_used() -> i64 {
@@ -295,14 +319,32 @@ pub fn arena_used() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 278*
+*Defined at line 311*
+
+---
+
+## arena_used_since
+
+Bytes handed out since `mark` was saved (0 when the arena has since
+been restored to or before the mark).
+
+```fides
+pub fn arena_used_since(mark: i64) -> i64 {
+```
+
+**Parameters:**
+
+- `mark`: `i64`
+
+**Returns:** `i64`
+
+*Defined at line 317*
 
 ---
 
 ## region_count
 
-Get the number of allocations in a region.
-For arena-based regions, this is not tracked.
+Get the number of live allocations tracked by a region.
 
 ```fides
 pub fn region_count(region: i64) -> i64 {
@@ -314,7 +356,7 @@ pub fn region_count(region: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 293*
+*Defined at line 326*
 
 ---
 
@@ -329,7 +371,7 @@ pub fn frame_new() -> FrameArena {
 
 **Returns:** `FrameArena`
 
-*Defined at line 335*
+*Defined at line 368*
 
 ---
 
@@ -349,7 +391,7 @@ pub fn frame_begin(fa: &mut FrameArena) -> void {
 
 **Returns:** `void`
 
-*Defined at line 344*
+*Defined at line 377*
 
 ---
 
@@ -370,7 +412,7 @@ pub fn frame_alloc(fa: &mut FrameArena, size: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 352*
+*Defined at line 385*
 
 ---
 
@@ -390,7 +432,7 @@ pub fn frame_end(fa: FrameArena) -> void {
 
 **Returns:** `void`
 
-*Defined at line 360*
+*Defined at line 397*
 
 ---
 
@@ -410,7 +452,7 @@ pub fn frame_free(fa: FrameArena) -> void {
 
 **Returns:** `void`
 
-*Defined at line 367*
+*Defined at line 404*
 
 ---
 
@@ -428,7 +470,7 @@ pub fn frame_alloc_count(fa: FrameArena) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 372*
+*Defined at line 409*
 
 ---
 
@@ -444,7 +486,7 @@ pub fn http_request_arena_new() -> http_request_arena {
 
 **Returns:** `http_request_arena`
 
-*Defined at line 400*
+*Defined at line 437*
 
 ---
 
@@ -464,7 +506,7 @@ pub fn http_request_alloc(_arena: http_request_arena, size: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 406*
+*Defined at line 443*
 
 ---
 
@@ -483,8 +525,8 @@ pub fn http_request_arena_free(arena: http_request_arena) -> void {
 
 **Returns:** `void`
 
-*Defined at line 412*
+*Defined at line 453*
 
 ---
 
-*Generated by [scribe](https://fides.dev) — Fides documentation generator*
+*Generated by [scribe](https://fides.dev) -- Fides documentation generator*

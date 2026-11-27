@@ -1,0 +1,363 @@
+[All modules](index.md)
+
+# ramfs -- Fides Documentation
+
+## Contents
+
+- [RAMFS_MAX_FILE:](#RAMFS_MAX_FILE:) (const)
+- [ramfs_new](#ramfs_new) (function)
+- [ramfs_root](#ramfs_root) (function)
+- [ramfs_lookup](#ramfs_lookup) (function)
+- [ramfs_getattr](#ramfs_getattr) (function)
+- [ramfs_read](#ramfs_read) (function)
+- [ramfs_write](#ramfs_write) (function)
+- [ramfs_truncate](#ramfs_truncate) (function)
+- [ramfs_create](#ramfs_create) (function)
+- [ramfs_mkdir](#ramfs_mkdir) (function)
+- [ramfs_symlink](#ramfs_symlink) (function)
+- [ramfs_readlink](#ramfs_readlink) (function)
+- [ramfs_unlink](#ramfs_unlink) (function)
+- [ramfs_rmdir](#ramfs_rmdir) (function)
+- [ramfs_rename](#ramfs_rename) (function)
+- [ramfs_readdir](#ramfs_readdir) (function)
+- [ramfs_ops](#ramfs_ops) (function)
+- [ramfs_usage](#ramfs_usage) (function)
+- [ramfs_mount](#ramfs_mount) (function)
+
+## RAMFS_MAX_FILE:
+
+Largest file ramfs accepts (EFBIG beyond it).
+
+```fides
+pub const RAMFS_MAX_FILE: i64 = 268435456;
+```
+
+*Defined at line 32*
+
+---
+
+## ramfs_new
+
+A new, empty ramfs instance; the result is its handle (and root inode).
+
+```fides
+pub fn ramfs_new() -> i64 {
+```
+
+**Returns:** `i64`
+
+*Defined at line 159*
+
+---
+
+## ramfs_root
+
+```fides
+pub fn ramfs_root(fs: i64) -> i64 {
+```
+
+**Parameters:**
+
+- `fs`: `i64`
+
+**Returns:** `i64`
+
+*Defined at line 166*
+
+---
+
+## ramfs_lookup
+
+```fides
+pub fn ramfs_lookup(fs: i64, dir: i64, name: str) -> i64 {
+```
+
+**Parameters:**
+
+- `fs`: `i64`
+- `dir`: `i64`
+- `name`: `str`
+
+**Returns:** `i64`
+
+*Defined at line 173*
+
+---
+
+## ramfs_getattr
+
+[err, kind, size, nlink, mode, mtime] (vfs VFS_ST_*).
+
+```fides
+pub fn ramfs_getattr(fs: i64, ino: i64) -> Vec<i64> {
+```
+
+**Parameters:**
+
+- `fs`: `i64`
+- `ino`: `i64`
+
+**Returns:** `Vec<i64>`
+
+*Defined at line 194*
+
+---
+
+## ramfs_read
+
+```fides
+pub fn ramfs_read(fs: i64, ino: i64, off: i64, len: i64) -> Vec<i64> {
+```
+
+**Parameters:**
+
+- `fs`: `i64`
+- `ino`: `i64`
+- `off`: `i64`
+- `len`: `i64`
+
+**Returns:** `Vec<i64>`
+
+*Defined at line 237*
+
+---
+
+## ramfs_write
+
+```fides
+pub fn ramfs_write(fs: i64, ino: i64, off: i64, data: Vec<i64>) -> i64 {
+```
+
+**Parameters:**
+
+- `fs`: `i64`
+- `ino`: `i64`
+- `off`: `i64`
+- `data`: `Vec<i64>`
+
+**Returns:** `i64`
+
+*Defined at line 251*
+
+---
+
+## ramfs_truncate
+
+```fides
+pub fn ramfs_truncate(fs: i64, ino: i64, size: i64) -> i64 {
+```
+
+**Parameters:**
+
+- `fs`: `i64`
+- `ino`: `i64`
+- `size`: `i64`
+
+**Returns:** `i64`
+
+*Defined at line 280*
+
+---
+
+## ramfs_create
+
+```fides
+pub fn ramfs_create(fs: i64, dir: i64, name: str, mode: i64) -> i64 {
+```
+
+**Parameters:**
+
+- `fs`: `i64`
+- `dir`: `i64`
+- `name`: `str`
+- `mode`: `i64`
+
+**Returns:** `i64`
+
+*Defined at line 325*
+
+---
+
+## ramfs_mkdir
+
+```fides
+pub fn ramfs_mkdir(fs: i64, dir: i64, name: str, mode: i64) -> i64 {
+```
+
+**Parameters:**
+
+- `fs`: `i64`
+- `dir`: `i64`
+- `name`: `str`
+- `mode`: `i64`
+
+**Returns:** `i64`
+
+*Defined at line 329*
+
+---
+
+## ramfs_symlink
+
+```fides
+pub fn ramfs_symlink(fs: i64, dir: i64, name: str, target: str) -> i64 {
+```
+
+**Parameters:**
+
+- `fs`: `i64`
+- `dir`: `i64`
+- `name`: `str`
+- `target`: `str`
+
+**Returns:** `i64`
+
+*Defined at line 333*
+
+---
+
+## ramfs_readlink
+
+```fides
+pub fn ramfs_readlink(fs: i64, ino: i64) -> str {
+```
+
+**Parameters:**
+
+- `fs`: `i64`
+- `ino`: `i64`
+
+**Returns:** `str`
+
+*Defined at line 344*
+
+---
+
+## ramfs_unlink
+
+```fides
+pub fn ramfs_unlink(fs: i64, dir: i64, name: str) -> i64 {
+```
+
+**Parameters:**
+
+- `fs`: `i64`
+- `dir`: `i64`
+- `name`: `str`
+
+**Returns:** `i64`
+
+*Defined at line 351*
+
+---
+
+## ramfs_rmdir
+
+```fides
+pub fn ramfs_rmdir(fs: i64, dir: i64, name: str) -> i64 {
+```
+
+**Parameters:**
+
+- `fs`: `i64`
+- `dir`: `i64`
+- `name`: `str`
+
+**Returns:** `i64`
+
+*Defined at line 368*
+
+---
+
+## ramfs_rename
+
+```fides
+pub fn ramfs_rename(fs: i64, odir: i64, oname: str, ndir: i64, nname: str) -> i64 {
+```
+
+**Parameters:**
+
+- `fs`: `i64`
+- `odir`: `i64`
+- `oname`: `str`
+- `ndir`: `i64`
+- `nname`: `str`
+
+**Returns:** `i64`
+
+*Defined at line 406*
+
+---
+
+## ramfs_readdir
+
+Entry `index` of directory `dir`, "" past the end.
+
+```fides
+pub fn ramfs_readdir(fs: i64, dir: i64, index: i64) -> str {
+```
+
+**Parameters:**
+
+- `fs`: `i64`
+- `dir`: `i64`
+- `index`: `i64`
+
+**Returns:** `str`
+
+*Defined at line 457*
+
+---
+
+## ramfs_ops
+
+The operations to mount a ramfs instance with vfs_mount.
+
+```fides
+pub fn ramfs_ops() -> FsOps {
+```
+
+**Returns:** `FsOps`
+
+*Defined at line 469*
+
+---
+
+## ramfs_usage
+
+Inodes and file bytes an instance holds: [inodes, bytes].
+
+```fides
+pub fn ramfs_usage(fs: i64) -> Vec<i64> {
+```
+
+**Parameters:**
+
+- `fs`: `i64`
+
+**Returns:** `Vec<i64>`
+
+*Defined at line 476*
+
+---
+
+## ramfs_mount
+
+A new ramfs mounted on `path` of `v`; returns the instance or -errno.
+
+```fides
+pub fn ramfs_mount(v: &mut Vfs, path: str) -> i64 {
+```
+
+**Parameters:**
+
+- `v`: `&mut Vfs`
+- `path`: `str`
+
+**Returns:** `i64`
+
+*Defined at line 496*
+
+---
+
+*Generated by [scribe](https://fides.dev) -- Fides documentation generator*

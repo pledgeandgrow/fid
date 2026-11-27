@@ -1,8 +1,12 @@
-# http — Fides Documentation
+[All modules](index.md)
+
+# http -- Fides Documentation
 
 ## Contents
 
-- [HttpRequest](#httprequest) (struct)
+- [HttpRequest](#HttpRequest) (struct)
+- [ScopedRequest](#ScopedRequest) (struct)
+- [http_scoped_header](#http_scoped_header) (function)
 - [http_header](#http_header) (function)
 - [http_keep_alive](#http_keep_alive) (function)
 - [http_parse_head](#http_parse_head) (function)
@@ -15,11 +19,17 @@
 - [http_conn_close](#http_conn_close) (function)
 - [http_read_message](#http_read_message) (function)
 - [http_conn_write](#http_conn_write) (function)
+- [http_not_found](#http_not_found) (function)
+- [http_state_init](#http_state_init) (function)
+- [http_stop](#http_stop) (function)
+- [http_set_health](#http_set_health) (function)
+- [http_health_handler](#http_health_handler) (function)
 - [http_conn_task](#http_conn_task) (function)
 - [http_accept_task](#http_accept_task) (function)
 - [http_serve](#http_serve) (function)
 - [http_serve_scoped](#http_serve_scoped) (function)
 - [http_set_scoped](#http_set_scoped) (function)
+- [http_set_handler](#http_set_handler) (function)
 - [http_listen_tasks](#http_listen_tasks) (function)
 - [http_serve_on](#http_serve_on) (function)
 - [handle_request](#handle_request) (function)
@@ -59,7 +69,48 @@ pub struct HttpRequest {
 | `vals` | `Vec<str>` |
 | `body` | `str` |
 
-*Defined at line 41*
+*Defined at line 46*
+
+---
+
+## ScopedRequest
+
+```fides
+pub struct ScopedRequest {
+```
+
+**Fields:**
+
+| Name | Type |
+|------|------|
+| `method` | `str` |
+| `target` | `str` |
+| `path` | `str` |
+| `query` | `str` |
+| `version` | `str` |
+| `body` | `str` |
+| `raw` | `HttpRequest` |
+
+*Defined at line 64*
+
+---
+
+## http_scoped_header
+
+A header of a scoped request, as an owned copy ("" when absent).
+
+```fides
+pub fn http_scoped_header(req: ScopedRequest, name: str) -> str {
+```
+
+**Parameters:**
+
+- `req`: `ScopedRequest`
+- `name`: `str`
+
+**Returns:** `str`
+
+*Defined at line 75*
 
 ---
 
@@ -78,7 +129,7 @@ pub fn http_header(req: HttpRequest, name: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 90*
+*Defined at line 96*
 
 ---
 
@@ -96,7 +147,7 @@ pub fn http_keep_alive(req: HttpRequest) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 102*
+*Defined at line 108*
 
 ---
 
@@ -114,7 +165,7 @@ pub fn http_parse_head(head: str) -> HttpRequest {
 
 **Returns:** `HttpRequest`
 
-*Defined at line 138*
+*Defined at line 144*
 
 ---
 
@@ -133,7 +184,7 @@ pub fn parse_request(raw: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 217*
+*Defined at line 229*
 
 ---
 
@@ -153,7 +204,7 @@ pub fn build_response(status: i64, content_type: str, body: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 237*
+*Defined at line 249*
 
 ---
 
@@ -174,7 +225,7 @@ pub fn build_response_headers(status: i64, content_type: str, headers: str, body
 
 **Returns:** `str`
 
-*Defined at line 242*
+*Defined at line 254*
 
 ---
 
@@ -192,7 +243,7 @@ pub fn status_text(code: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 247*
+*Defined at line 259*
 
 ---
 
@@ -201,7 +252,7 @@ pub fn status_text(code: i64) -> str {
 For module `https`: how to read, write, close and accept a TLS session.
 
 ```fides
-pub fn http_set_tls(recv: fn(i64, i64, i64, i64) -> i64, send: fn(i64, i64, i64) -> i64, close: fn(i64) -> i64,
+pub fn http_set_tls(recv: fn(i64, i64, i64, i64) -> i64, send: fn(i64, i64, i64) -> i64, close: fn(i64) -> i64, accept: fn(i64) -> i64) {
 ```
 
 **Parameters:**
@@ -209,8 +260,9 @@ pub fn http_set_tls(recv: fn(i64, i64, i64, i64) -> i64, send: fn(i64, i64, i64)
 - `recv`: `fn(i64`
 - `send`: `fn(i64`
 - `close`: `fn(i64) -> i64`
+- `accept`: `fn(i64) -> i64`
 
-*Defined at line 410*
+*Defined at line 432*
 
 ---
 
@@ -229,7 +281,7 @@ pub fn http_conn_new(fd: i64, tls: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 418*
+*Defined at line 440*
 
 ---
 
@@ -243,15 +295,19 @@ pub fn http_conn_close(c: i64) {
 
 - `c`: `i64`
 
-*Defined at line 429*
+*Defined at line 460*
 
 ---
 
 ## http_read_message
 
 Read a head and its body off the connection. `method` is "" at the end of the
-input, on a timeout, or when the message is too large. A response with no
-length reads to the end when `to_end` is set.
+input, on a timeout, when the message is too large, when a request's body
+breaks off, or when its framing is not valid (RFC 9112 §6: differing
+Content-Length headers, a Content-Length that is not a number, a
+Transfer-Encoding other than one `chunked`, both in a request, a broken
+chunk); `target` is then the status to answer with (400, 413) or "". A
+response with no length reads to the end when `to_end` is set.
 
 ```fides
 pub fn http_read_message(c: i64, timeout_ms: i64, to_end: bool) -> HttpRequest {
@@ -265,7 +321,7 @@ pub fn http_read_message(c: i64, timeout_ms: i64, to_end: bool) -> HttpRequest {
 
 **Returns:** `HttpRequest`
 
-*Defined at line 613*
+*Defined at line 770*
 
 ---
 
@@ -284,7 +340,83 @@ pub fn http_conn_write(c: i64, data: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 645*
+*Defined at line 855*
+
+---
+
+## http_not_found
+
+```fides
+pub fn http_not_found(req: HttpRequest) -> str {
+```
+
+**Parameters:**
+
+- `req`: `HttpRequest`
+
+**Returns:** `str`
+
+*Defined at line 866*
+
+---
+
+## http_state_init
+
+Allocate and reset the shared server state; called by the serve paths,
+safe to call again.
+
+```fides
+pub fn http_state_init() {
+```
+
+*Defined at line 908*
+
+---
+
+## http_stop
+
+Ask a running server to stop: the accept loop ends within ~200 ms and
+live connections drain. Safe to call from any task.
+
+```fides
+pub fn http_stop() {
+```
+
+*Defined at line 924*
+
+---
+
+## http_set_health
+
+Turn the built-in /health endpoint on (the default) or off.
+
+```fides
+pub fn http_set_health(on: bool) {
+```
+
+**Parameters:**
+
+- `on`: `bool`
+
+*Defined at line 931*
+
+---
+
+## http_health_handler
+
+/health answers itself; everything else goes to the user's handler.
+
+```fides
+pub fn http_health_handler(req: HttpRequest) -> str {
+```
+
+**Parameters:**
+
+- `req`: `HttpRequest`
+
+**Returns:** `str`
+
+*Defined at line 943*
 
 ---
 
@@ -303,13 +435,15 @@ pub fn http_conn_task(c: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 737*
+*Defined at line 958*
 
 ---
 
 ## http_accept_task
 
-Take connections off the listening socket, each its own task.
+Take connections off the listening socket, each its own task. On SIGTERM,
+SIGINT or http_stop() it stops accepting, drains live connections and
+closes the socket (CO8).
 
 ```fides
 pub fn http_accept_task(fd: i64) -> i64 {
@@ -321,7 +455,7 @@ pub fn http_accept_task(fd: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 798*
+*Defined at line 1030*
 
 ---
 
@@ -345,7 +479,7 @@ pub fn http_serve(port: i64, handler: fn(HttpRequest) -> str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 825*
+*Defined at line 1058*
 
 ---
 
@@ -367,7 +501,7 @@ pub fn http_serve_scoped(port: i64, handler: fn(ScopedRequest) -> str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 838*
+*Defined at line 1071*
 
 ---
 
@@ -383,14 +517,33 @@ pub fn http_set_scoped(handler: fn(ScopedRequest) -> str) {
 
 - `handler`: `fn(ScopedRequest) -> str`
 
-*Defined at line 845*
+*Defined at line 1078*
+
+---
+
+## http_set_handler
+
+For servers that take connections themselves and hand some to
+http_conn_task (module `http2_tls`: TLS clients that chose HTTP/1.1 by
+ALPN): the handler those connections run; /health answers itself once
+http_state_init has run.
+
+```fides
+pub fn http_set_handler(handler: fn(HttpRequest) -> str) {
+```
+
+**Parameters:**
+
+- `handler`: `fn(HttpRequest) -> str`
+
+*Defined at line 1087*
 
 ---
 
 ## http_listen_tasks
 
 Serve a listening socket from tasks and return: the caller goes on, and they
-run whenever it waits.
+run whenever it waits. /health answers itself (CO8).
 
 ```fides
 pub fn http_listen_tasks(fd: i64, handler: fn(HttpRequest) -> str) {
@@ -401,14 +554,15 @@ pub fn http_listen_tasks(fd: i64, handler: fn(HttpRequest) -> str) {
 - `fd`: `i64`
 - `handler`: `fn(HttpRequest) -> str`
 
-*Defined at line 861*
+*Defined at line 1094*
 
 ---
 
 ## http_serve_on
 
-Serve a listening socket until the process ends, over TLS if `secure` (module
-`https` has set it up).
+Serve a listening socket until SIGTERM, SIGINT or http_stop() asks for
+shutdown; live connections drain and the socket closes (CO8). Over TLS if
+`secure` (module `https` has set it up).
 
 ```fides
 pub fn http_serve_on(fd: i64, secure: bool, handler: fn(HttpRequest) -> str) {
@@ -420,7 +574,7 @@ pub fn http_serve_on(fd: i64, secure: bool, handler: fn(HttpRequest) -> str) {
 - `secure`: `bool`
 - `handler`: `fn(HttpRequest) -> str`
 
-*Defined at line 872*
+*Defined at line 1105*
 
 ---
 
@@ -438,7 +592,7 @@ pub fn handle_request(req: HttpRequest) -> str {
 
 **Returns:** `str`
 
-*Defined at line 883*
+*Defined at line 1116*
 
 ---
 
@@ -456,7 +610,7 @@ pub fn serve(port: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 888*
+*Defined at line 1121*
 
 ---
 
@@ -472,7 +626,7 @@ pub fn http_request_arena_new() -> http_request_arena {
 
 **Returns:** `http_request_arena`
 
-*Defined at line 921*
+*Defined at line 1154*
 
 ---
 
@@ -492,7 +646,7 @@ pub fn http_request_alloc(arena: http_request_arena, size: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 927*
+*Defined at line 1160*
 
 ---
 
@@ -511,7 +665,7 @@ pub fn http_request_arena_free(arena: http_request_arena) -> void {
 
 **Returns:** `void`
 
-*Defined at line 933*
+*Defined at line 1170*
 
 ---
 
@@ -532,7 +686,7 @@ pub fn http_parse_request_arena(arena: http_request_arena, raw: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 940*
+*Defined at line 1177*
 
 ---
 
@@ -554,7 +708,7 @@ pub fn http_build_response_arena(arena: http_request_arena, status: i64, content
 
 **Returns:** `str`
 
-*Defined at line 950*
+*Defined at line 1187*
 
 ---
 
@@ -568,7 +722,7 @@ pub fn router_new() -> Router {
 
 **Returns:** `Router`
 
-*Defined at line 976*
+*Defined at line 1213*
 
 ---
 
@@ -592,7 +746,7 @@ pub fn router_add(router: &mut Router, method: str, path: str, handler: route_ha
 
 **Returns:** `void`
 
-*Defined at line 986*
+*Defined at line 1223*
 
 ---
 
@@ -613,7 +767,7 @@ pub fn router_dispatch(router: Router, method: str, path: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 995*
+*Defined at line 1232*
 
 ---
 
@@ -633,7 +787,7 @@ pub fn router_dispatch_request(router: Router, request: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 1011*
+*Defined at line 1252*
 
 ---
 
@@ -655,7 +809,7 @@ pub fn apply_middleware(handler: route_handler, mw: middleware) -> route_handler
 
 **Returns:** `route_handler`
 
-*Defined at line 1039*
+*Defined at line 1284*
 
 ---
 
@@ -673,7 +827,7 @@ pub fn logging_middleware(handler: route_handler) -> route_handler {
 
 **Returns:** `route_handler`
 
-*Defined at line 1044*
+*Defined at line 1289*
 
 ---
 
@@ -691,8 +845,8 @@ pub fn cors_middleware(handler: route_handler) -> route_handler {
 
 **Returns:** `route_handler`
 
-*Defined at line 1053*
+*Defined at line 1298*
 
 ---
 
-*Generated by [scribe](https://fides.dev) — Fides documentation generator*
+*Generated by [scribe](https://fides.dev) -- Fides documentation generator*

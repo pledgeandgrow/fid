@@ -1,8 +1,10 @@
-# time — Fides Documentation
+[All modules](index.md)
+
+# time -- Fides Documentation
 
 ## Contents
 
-- [LogicalTime](#logicaltime) (struct)
+- [LogicalTime](#LogicalTime) (struct)
 - [time_from_timestamp](#time_from_timestamp) (function)
 - [time_new](#time_new) (function)
 - [time_from_date](#time_from_date) (function)
@@ -67,7 +69,7 @@ pub fn time_from_timestamp(ts: i64) -> LogicalTime {
 
 **Returns:** `LogicalTime`
 
-*Defined at line 31*
+*Defined at line 32*
 
 ---
 
@@ -88,7 +90,7 @@ pub fn time_new(year: i64, month: i64, day: i64, hour: i64, minute: i64, second:
 
 **Returns:** `LogicalTime`
 
-*Defined at line 46*
+*Defined at line 48*
 
 ---
 
@@ -106,7 +108,7 @@ pub fn time_from_date(year: i64, month: i64, day: i64) -> LogicalTime {
 
 **Returns:** `LogicalTime`
 
-*Defined at line 82*
+*Defined at line 85*
 
 ---
 
@@ -122,7 +124,7 @@ pub fn time_get_year(t: LogicalTime) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 131*
+*Defined at line 137*
 
 ---
 
@@ -138,7 +140,7 @@ pub fn time_get_month(t: LogicalTime) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 141*
+*Defined at line 148*
 
 ---
 
@@ -154,7 +156,7 @@ pub fn time_get_day(t: LogicalTime) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 151*
+*Defined at line 159*
 
 ---
 
@@ -170,7 +172,7 @@ pub fn time_get_hour(t: LogicalTime) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 161*
+*Defined at line 170*
 
 ---
 
@@ -186,7 +188,7 @@ pub fn time_get_minute(t: LogicalTime) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 174*
+*Defined at line 184*
 
 ---
 
@@ -202,7 +204,7 @@ pub fn time_get_second(t: LogicalTime) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 187*
+*Defined at line 198*
 
 ---
 
@@ -218,7 +220,7 @@ pub fn time_get_weekday(t: LogicalTime) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 201*
+*Defined at line 213*
 
 ---
 
@@ -235,7 +237,7 @@ pub fn time_add_seconds(t: LogicalTime, seconds: i64) -> LogicalTime {
 
 **Returns:** `LogicalTime`
 
-*Defined at line 226*
+*Defined at line 239*
 
 ---
 
@@ -252,7 +254,7 @@ pub fn time_sub_seconds(t: LogicalTime, seconds: i64) -> LogicalTime {
 
 **Returns:** `LogicalTime`
 
-*Defined at line 237*
+*Defined at line 251*
 
 ---
 
@@ -269,7 +271,7 @@ pub fn time_add_minutes(t: LogicalTime, minutes: i64) -> LogicalTime {
 
 **Returns:** `LogicalTime`
 
-*Defined at line 247*
+*Defined at line 262*
 
 ---
 
@@ -286,7 +288,7 @@ pub fn time_add_hours(t: LogicalTime, hours: i64) -> LogicalTime {
 
 **Returns:** `LogicalTime`
 
-*Defined at line 257*
+*Defined at line 273*
 
 ---
 
@@ -303,7 +305,7 @@ pub fn time_add_days(t: LogicalTime, days: i64) -> LogicalTime {
 
 **Returns:** `LogicalTime`
 
-*Defined at line 268*
+*Defined at line 285*
 
 ---
 
@@ -320,7 +322,7 @@ pub fn time_diff_seconds(a: LogicalTime, b: LogicalTime) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 280*
+*Defined at line 298*
 
 ---
 
@@ -337,7 +339,7 @@ pub fn time_diff_days(a: LogicalTime, b: LogicalTime) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 290*
+*Defined at line 309*
 
 ---
 
@@ -354,7 +356,7 @@ pub fn time_before(a: LogicalTime, b: LogicalTime) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 300*
+*Defined at line 320*
 
 ---
 
@@ -371,7 +373,7 @@ pub fn time_after(a: LogicalTime, b: LogicalTime) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 308*
+*Defined at line 329*
 
 ---
 
@@ -388,7 +390,7 @@ pub fn time_eq(a: LogicalTime, b: LogicalTime) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 316*
+*Defined at line 338*
 
 ---
 
@@ -405,7 +407,7 @@ pub fn time_before_eq(a: LogicalTime, b: LogicalTime) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 325*
+*Defined at line 348*
 
 ---
 
@@ -421,7 +423,7 @@ pub fn time_to_iso(t: LogicalTime) -> str {
 
 **Returns:** `str`
 
-*Defined at line 361*
+*Defined at line 387*
 
 ---
 
@@ -437,7 +439,7 @@ pub fn time_to_date_string(t: LogicalTime) -> str {
 
 **Returns:** `str`
 
-*Defined at line 388*
+*Defined at line 415*
 
 ---
 
@@ -453,7 +455,7 @@ pub fn is_leap_year(year: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 409*
+*Defined at line 437*
 
 ---
 
@@ -469,7 +471,7 @@ pub fn time_get_day_of_year(t: LogicalTime) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 427*
+*Defined at line 456*
 
 ---
 
@@ -486,7 +488,7 @@ pub fn days_in_month(year: i64, month: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 438*
+*Defined at line 468*
 
 ---
 
@@ -501,7 +503,7 @@ pub fn clock_now_ns() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 491*
+*Defined at line 521*
 
 ---
 
@@ -516,7 +518,7 @@ pub fn clock_now_us() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 498*
+*Defined at line 530*
 
 ---
 
@@ -525,13 +527,23 @@ pub fn clock_now_us() -> i64 {
 Get the current wall-clock time in milliseconds since Unix epoch.
 NOT deterministic — use for profiling only.
 
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+var a = clock_now_ms();
+var b = clock_now_ms();
+assert(a > 0);
+assert(b >= a);
+```
+
 ```fides
 pub fn clock_now_ms() -> i64 {
 ```
 
 **Returns:** `i64`
 
-*Defined at line 511*
+*Defined at line 545*
 
 ---
 
@@ -539,6 +551,15 @@ pub fn clock_now_ms() -> i64 {
 
 Measure elapsed time in nanoseconds between two clock readings.
 Usage: value start = clock_now_ns(); ...work...; value elapsed = clock_elapsed_ns(start);
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+var start = clock_now_ns();
+var e = clock_elapsed_ns(start);
+assert(e >= 0);
+```
 
 ```fides
 pub fn clock_elapsed_ns(start: i64) -> i64 {
@@ -550,7 +571,7 @@ pub fn clock_elapsed_ns(start: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 523*
+*Defined at line 559*
 
 ---
 
@@ -568,7 +589,7 @@ pub fn clock_elapsed_us(start: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 528*
+*Defined at line 564*
 
 ---
 
@@ -586,8 +607,8 @@ pub fn clock_elapsed_ms(start: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 533*
+*Defined at line 569*
 
 ---
 
-*Generated by [scribe](https://fides.dev) — Fides documentation generator*
+*Generated by [scribe](https://fides.dev) -- Fides documentation generator*

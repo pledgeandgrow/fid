@@ -1,4 +1,6 @@
-# encoding — Fides Documentation
+[All modules](index.md)
+
+# encoding -- Fides Documentation
 
 ## Contents
 
@@ -33,9 +35,18 @@
 
 ## enc_bytes_to_str
 
-Bytes -> a `str` holding exactly those bytes (NUL-terminated heap
-buffer). This is the right way to turn decoded bytes into a string;
+Bytes -> a `str` holding exactly those bytes (a counted, NUL-terminated
+heap string). This is the right way to turn decoded bytes into a string;
 `str_from_bytes` re-encodes each element as a codepoint instead.
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+var b: Vec<i64> = Vec::new();
+b.push(104); b.push(105);
+assert_eq(enc_bytes_to_str(b), "hi");
+```
 
 ```fides
 pub fn enc_bytes_to_str(bytes: Vec<i64>) -> str {
@@ -47,13 +58,22 @@ pub fn enc_bytes_to_str(bytes: Vec<i64>) -> str {
 
 **Returns:** `str`
 
-*Defined at line 42*
+*Defined at line 43*
 
 ---
 
 ## enc_str_to_bytes
 
 A `str` -> its raw bytes (same as str_bytes, kept for API symmetry).
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+var b = enc_str_to_bytes("AB");
+assert_eq(b.len(), 2);
+assert_eq(b.get(1), 66);
+```
 
 ```fides
 pub fn enc_str_to_bytes(s: str) -> Vec<i64> {
@@ -65,13 +85,22 @@ pub fn enc_str_to_bytes(s: str) -> Vec<i64> {
 
 **Returns:** `Vec<i64>`
 
-*Defined at line 68*
+*Defined at line 79*
 
 ---
 
 ## b64_encode_bytes
 
 Encode a byte Vec to base64 text (RFC 4648 with '=' padding).
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+var b: Vec<i64> = Vec::new();
+b.push(0); b.push(255);
+assert_eq(b64_encode_bytes(b), "AP8=");
+```
 
 ```fides
 pub fn b64_encode_bytes(bytes: Vec<i64>) -> str {
@@ -83,13 +112,22 @@ pub fn b64_encode_bytes(bytes: Vec<i64>) -> str {
 
 **Returns:** `str`
 
-*Defined at line 84*
+*Defined at line 95*
 
 ---
 
 ## b64_encode
 
 Encode a string's UTF-8 bytes to base64 text.
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+var e = b64_encode("hello");
+println(e);
+assert_eq(e, "aGVsbG8=");
+```
 
 ```fides
 pub fn b64_encode(s: str) -> str {
@@ -101,7 +139,7 @@ pub fn b64_encode(s: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 121*
+*Defined at line 132*
 
 ---
 
@@ -110,6 +148,15 @@ pub fn b64_encode(s: str) -> str {
 Decode base64 text to a byte Vec.
 Whitespace is skipped; '=' ends the stream. Invalid characters make the
 decode stop at the first bad group (lenient, like most libraries).
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+var b = b64_decode_bytes("AP8=");
+assert_eq(b.len(), 2);
+assert_eq(b.get(1), 255);
+```
 
 ```fides
 pub fn b64_decode_bytes(s: str) -> Vec<i64> {
@@ -121,7 +168,7 @@ pub fn b64_decode_bytes(s: str) -> Vec<i64> {
 
 **Returns:** `Vec<i64>`
 
-*Defined at line 162*
+*Defined at line 173*
 
 ---
 
@@ -130,6 +177,14 @@ pub fn b64_decode_bytes(s: str) -> Vec<i64> {
 Decode base64 text to a string. Returns "" when the decoded bytes are
 empty or not valid UTF-8 output is not required — bytes are returned
 verbatim.
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+assert_eq(b64_decode("aGVsbG8="), "hello");
+assert_eq(b64_decode(b64_encode("round trip")), "round trip");
+```
 
 ```fides
 pub fn b64_decode(s: str) -> str {
@@ -141,7 +196,7 @@ pub fn b64_decode(s: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 215*
+*Defined at line 226*
 
 ---
 
@@ -149,6 +204,14 @@ pub fn b64_decode(s: str) -> str {
 
 Check that a string is well-formed base64 (optional whitespace and
 '=' padding allowed).
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+assert(b64_valid("aGVsbG8="));
+assert(!b64_valid("a*b"));
+```
 
 ```fides
 pub fn b64_valid(s: str) -> bool {
@@ -160,13 +223,22 @@ pub fn b64_valid(s: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 225*
+*Defined at line 236*
 
 ---
 
 ## hex_encode_bytes
 
 Encode a byte Vec to lowercase hex text ("0a3f...").
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+var b: Vec<i64> = Vec::new();
+b.push(10); b.push(255);
+assert_eq(hex_encode_bytes(b), "0aff");
+```
 
 ```fides
 pub fn hex_encode_bytes(bytes: Vec<i64>) -> str {
@@ -178,13 +250,22 @@ pub fn hex_encode_bytes(bytes: Vec<i64>) -> str {
 
 **Returns:** `str`
 
-*Defined at line 265*
+*Defined at line 276*
 
 ---
 
 ## hex_encode_bytes_upper
 
 Encode a byte Vec to uppercase hex text ("0A3F...").
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+var b: Vec<i64> = Vec::new();
+b.push(10); b.push(255);
+assert_eq(hex_encode_bytes_upper(b), "0AFF");
+```
 
 ```fides
 pub fn hex_encode_bytes_upper(bytes: Vec<i64>) -> str {
@@ -196,13 +277,20 @@ pub fn hex_encode_bytes_upper(bytes: Vec<i64>) -> str {
 
 **Returns:** `str`
 
-*Defined at line 286*
+*Defined at line 297*
 
 ---
 
 ## hex_encode
 
 Encode a string's bytes to lowercase hex text.
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+assert_eq(hex_encode("Hi"), "4869");
+```
 
 ```fides
 pub fn hex_encode(s: str) -> str {
@@ -214,13 +302,20 @@ pub fn hex_encode(s: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 305*
+*Defined at line 316*
 
 ---
 
 ## hex_encode_upper
 
 Encode a string's bytes to uppercase hex text.
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+assert_eq(hex_encode_upper("\n"), "0A");
+```
 
 ```fides
 pub fn hex_encode_upper(s: str) -> str {
@@ -232,7 +327,7 @@ pub fn hex_encode_upper(s: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 313*
+*Defined at line 324*
 
 ---
 
@@ -240,6 +335,15 @@ pub fn hex_encode_upper(s: str) -> str {
 
 Decode hex text to a byte Vec. Whitespace is skipped. Stops at the
 first invalid character (or an odd trailing half-byte).
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+var b = hex_decode_bytes("de ad");
+assert_eq(b.len(), 2);
+assert_eq(b.get(0), 222);
+```
 
 ```fides
 pub fn hex_decode_bytes(s: str) -> Vec<i64> {
@@ -251,13 +355,20 @@ pub fn hex_decode_bytes(s: str) -> Vec<i64> {
 
 **Returns:** `Vec<i64>`
 
-*Defined at line 341*
+*Defined at line 352*
 
 ---
 
 ## hex_decode
 
 Decode hex text to a string.
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+assert_eq(hex_decode("4869"), "Hi");
+```
 
 ```fides
 pub fn hex_decode(s: str) -> str {
@@ -269,7 +380,7 @@ pub fn hex_decode(s: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 371*
+*Defined at line 382*
 
 ---
 
@@ -277,6 +388,15 @@ pub fn hex_decode(s: str) -> str {
 
 Check that a string is well-formed hex (even number of digits,
 whitespace ignored).
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+assert(hex_valid("00ff"));
+assert(!hex_valid("0f0"));
+assert(!hex_valid("zz"));
+```
 
 ```fides
 pub fn hex_valid(s: str) -> bool {
@@ -288,7 +408,7 @@ pub fn hex_valid(s: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 382*
+*Defined at line 393*
 
 ---
 
@@ -296,6 +416,15 @@ pub fn hex_valid(s: str) -> bool {
 
 Percent-encode a byte Vec: unreserved bytes pass through, everything
 else becomes %XX (uppercase hex).
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+var b: Vec<i64> = Vec::new();
+b.push(97); b.push(32); b.push(47);
+assert_eq(url_encode_bytes(b), "a%20%2F");
+```
 
 ```fides
 pub fn url_encode_bytes(bytes: Vec<i64>) -> str {
@@ -307,7 +436,7 @@ pub fn url_encode_bytes(bytes: Vec<i64>) -> str {
 
 **Returns:** `str`
 
-*Defined at line 428*
+*Defined at line 439*
 
 ---
 
@@ -315,6 +444,15 @@ pub fn url_encode_bytes(bytes: Vec<i64>) -> str {
 
 Percent-encode a string for use in a URL component
 (space becomes %20).
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+var e = url_encode("a b&c=d");
+println(e);
+assert_eq(e, "a%20b%26c%3Dd");
+```
 
 ```fides
 pub fn url_encode(s: str) -> str {
@@ -326,13 +464,20 @@ pub fn url_encode(s: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 455*
+*Defined at line 466*
 
 ---
 
 ## url_encode_component
 
 Percent-encode a string for use in a URL component (alias).
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+assert_eq(url_encode_component("x/y"), "x%2Fy");
+```
 
 ```fides
 pub fn url_encode_component(s: str) -> str {
@@ -344,7 +489,7 @@ pub fn url_encode_component(s: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 463*
+*Defined at line 474*
 
 ---
 
@@ -352,6 +497,13 @@ pub fn url_encode_component(s: str) -> str {
 
 Percent-encode with HTML-form rules: like url_encode but a space
 becomes '+'.
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+assert_eq(url_encode_form("a b"), "a+b");
+```
 
 ```fides
 pub fn url_encode_form(s: str) -> str {
@@ -363,7 +515,7 @@ pub fn url_encode_form(s: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 472*
+*Defined at line 483*
 
 ---
 
@@ -371,6 +523,16 @@ pub fn url_encode_form(s: str) -> str {
 
 Decode percent-encoded text to a byte Vec.
 "%XX" -> byte XX, "+" stays "+", a malformed '%' is passed through.
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+var b = url_decode_bytes("%41+");
+assert_eq(b.len(), 2);
+assert_eq(b.get(0), 65);
+assert_eq(b.get(1), 43);
+```
 
 ```fides
 pub fn url_decode_bytes(s: str) -> Vec<i64> {
@@ -382,7 +544,7 @@ pub fn url_decode_bytes(s: str) -> Vec<i64> {
 
 **Returns:** `Vec<i64>`
 
-*Defined at line 503*
+*Defined at line 514*
 
 ---
 
@@ -390,6 +552,13 @@ pub fn url_decode_bytes(s: str) -> Vec<i64> {
 
 Decode percent-encoded text to a string. '+' is NOT translated
 (use url_decode_form for query strings).
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+assert_eq(url_decode("a%20b+c"), "a b+c");
+```
 
 ```fides
 pub fn url_decode(s: str) -> str {
@@ -401,13 +570,20 @@ pub fn url_decode(s: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 538*
+*Defined at line 549*
 
 ---
 
 ## url_decode_form
 
 Decode a form/query-encoded string: "%XX" -> byte, '+' -> space.
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+assert_eq(url_decode_form("a+b%21"), "a b!");
+```
 
 ```fides
 pub fn url_decode_form(s: str) -> str {
@@ -419,7 +595,7 @@ pub fn url_decode_form(s: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 546*
+*Defined at line 557*
 
 ---
 
@@ -427,6 +603,18 @@ pub fn url_decode_form(s: str) -> str {
 
 Check that a byte Vec is valid UTF-8 (no overlongs, no surrogates,
 no out-of-range codepoints, truncated sequences rejected).
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+var ok: Vec<i64> = Vec::new();
+ok.push(195); ok.push(169);
+assert(utf8_valid_bytes(ok));
+var bad: Vec<i64> = Vec::new();
+bad.push(195);
+assert(!utf8_valid_bytes(bad));
+```
 
 ```fides
 pub fn utf8_valid_bytes(bytes: Vec<i64>) -> bool {
@@ -438,13 +626,21 @@ pub fn utf8_valid_bytes(bytes: Vec<i64>) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 586*
+*Defined at line 637*
 
 ---
 
 ## utf8_valid
 
 Check that a string's bytes are valid UTF-8.
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+assert(utf8_valid("caf" + utf8_encode(233)));
+assert(utf8_valid("plain ascii"));
+```
 
 ```fides
 pub fn utf8_valid(s: str) -> bool {
@@ -456,7 +652,7 @@ pub fn utf8_valid(s: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 649*
+*Defined at line 666*
 
 ---
 
@@ -464,6 +660,16 @@ pub fn utf8_valid(s: str) -> bool {
 
 Decode a string to a Vec of Unicode codepoints (i64).
 Invalid sequences decode as U+FFFD (65533) and consume one byte.
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+var cps = utf8_decode(utf8_encode(233) + "!");
+assert_eq(cps.len(), 2);
+assert_eq(cps.get(0), 233);
+assert_eq(cps.get(1), 33);
+```
 
 ```fides
 pub fn utf8_decode(s: str) -> Vec<i64> {
@@ -475,7 +681,7 @@ pub fn utf8_decode(s: str) -> Vec<i64> {
 
 **Returns:** `Vec<i64>`
 
-*Defined at line 661*
+*Defined at line 678*
 
 ---
 
@@ -483,6 +689,15 @@ pub fn utf8_decode(s: str) -> Vec<i64> {
 
 Count the number of UTF-8 codepoints (characters) in a string.
 Invalid bytes each count as one (replacement) character.
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+var s = "a" + utf8_encode(8364) + "b";
+assert_eq(str_len(s), 5);
+assert_eq(utf8_len(s), 3);
+```
 
 ```fides
 pub fn utf8_len(s: str) -> i64 {
@@ -494,7 +709,7 @@ pub fn utf8_len(s: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 718*
+*Defined at line 721*
 
 ---
 
@@ -502,6 +717,14 @@ pub fn utf8_len(s: str) -> i64 {
 
 Encode one Unicode codepoint as its UTF-8 string.
 Codepoints above U+10FFFF and surrogates encode as U+FFFD.
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+assert_eq(str_len(utf8_encode(8364)), 3);
+assert_eq(utf8_encode(65), "A");
+```
 
 ```fides
 pub fn utf8_encode(cp: i64) -> str {
@@ -513,7 +736,7 @@ pub fn utf8_encode(cp: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 745*
+*Defined at line 748*
 
 ---
 
@@ -521,6 +744,16 @@ pub fn utf8_encode(cp: i64) -> str {
 
 Raw UTF-8 bytes of one codepoint as a Vec<i64> (for byte pipelines).
 Codepoints above U+10FFFF and surrogates encode as U+FFFD.
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+var b = utf8_encode_bytes(233);
+assert_eq(b.len(), 2);
+assert_eq(b.get(0), 195);
+assert_eq(b.get(1), 169);
+```
 
 ```fides
 pub fn utf8_encode_bytes(cp: i64) -> Vec<i64> {
@@ -532,13 +765,22 @@ pub fn utf8_encode_bytes(cp: i64) -> Vec<i64> {
 
 **Returns:** `Vec<i64>`
 
-*Defined at line 764*
+*Defined at line 767*
 
 ---
 
 ## utf8_encode_all
 
 Encode a Vec of codepoints as a UTF-8 string.
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+var cps: Vec<i64> = Vec::new();
+cps.push(72); cps.push(105);
+assert_eq(utf8_encode_all(cps), "Hi");
+```
 
 ```fides
 pub fn utf8_encode_all(cps: Vec<i64>) -> str {
@@ -550,8 +792,8 @@ pub fn utf8_encode_all(cps: Vec<i64>) -> str {
 
 **Returns:** `str`
 
-*Defined at line 794*
+*Defined at line 797*
 
 ---
 
-*Generated by [scribe](https://fides.dev) — Fides documentation generator*
+*Generated by [scribe](https://fides.dev) -- Fides documentation generator*

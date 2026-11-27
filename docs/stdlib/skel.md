@@ -1,24 +1,26 @@
-# skel — Fides Documentation
+[All modules](index.md)
+
+# skel -- Fides Documentation
 
 ## Contents
 
-- [Bone](#bone) (struct)
-- [Skeleton](#skeleton) (struct)
+- [Bone](#Bone) (struct)
+- [Skeleton](#Skeleton) (struct)
 - [skel_create](#skel_create) (function)
 - [skel_add_bone](#skel_add_bone) (function)
 - [skel_find_bone](#skel_find_bone) (function)
 - [skel_compute_globals](#skel_compute_globals) (function)
 - [skel_finalize](#skel_finalize) (function)
 - [skel_bone_count](#skel_bone_count) (function)
-- [Keyframe](#keyframe) (struct)
-- [AnimationTrack](#animationtrack) (struct)
-- [Animation](#animation) (struct)
+- [Keyframe](#Keyframe) (struct)
+- [AnimationTrack](#AnimationTrack) (struct)
+- [Animation](#Animation) (struct)
 - [skel_create_animation](#skel_create_animation) (function)
 - [skel_set_keyframe](#skel_set_keyframe) (function)
 - [skel_sample_animation](#skel_sample_animation) (function)
 - [skel_compute_pose](#skel_compute_pose) (function)
-- [VertexWeight](#vertexweight) (struct)
-- [Skin](#skin) (struct)
+- [VertexWeight](#VertexWeight) (struct)
+- [Skin](#Skin) (struct)
 - [skel_create_skin](#skel_create_skin) (function)
 - [skel_set_vertex_weight](#skel_set_vertex_weight) (function)
 - [skel_skin_vertex](#skel_skin_vertex) (function)
@@ -36,16 +38,16 @@ pub struct Bone {
 | Name | Type |
 |------|------|
 | `name` | `str` |
-| `parent` | `i64,         // parent bone index (-1 = root)` |
-| `local_pos` | `vec3,     // local position relative to parent` |
-| `local_rot` | `quat,     // local rotation relative to parent` |
-| `local_scale` | `vec3,   // local scale` |
-| `global_pos` | `vec3,    // computed global position` |
-| `global_rot` | `quat,    // computed global rotation` |
-| `global_scale` | `vec3,  // computed global scale` |
-| `offset_matrix` | `mat4, // inverse bind pose matrix` |
+| `parent` | `i64` |
+| `local_pos` | `vec3` |
+| `local_rot` | `quat` |
+| `local_scale` | `vec3` |
+| `global_pos` | `vec3` |
+| `global_rot` | `quat` |
+| `global_scale` | `vec3` |
+| `offset_matrix` | `mat4,  // inverse bind pose matrix` |
 
-*Defined at line 31*
+*Defined at line 32*
 
 ---
 
@@ -62,11 +64,29 @@ pub struct Skeleton {
 | `bones` | `Vec<Bone>` |
 | `finalized` | `bool` |
 
-*Defined at line 50*
+*Defined at line 51*
 
 ---
 
 ## skel_create
+
+An empty skeleton.
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+use math;
+var s = skel_create();
+val root = skel_add_bone(&mut s, -1, "root", vec3(0.0, 1.0, 0.0), quat(1.0, 0.0, 0.0, 0.0));
+val arm = skel_add_bone(&mut s, root, "arm", vec3(1.0, 0.0, 0.0), quat(1.0, 0.0, 0.0, 0.0));
+assert_eq(skel_bone_count(&s), 2);
+assert_eq(skel_find_bone(&s, "arm"), arm);
+assert_eq(skel_find_bone(&s, "leg"), -1);
+skel_compute_globals(&mut s);
+assert(s.bones.get(arm).global_pos.x == 1.0);
+assert(s.bones.get(arm).global_pos.y == 1.0);
+```
 
 ```fides
 pub fn skel_create() -> Skeleton {
@@ -74,7 +94,7 @@ pub fn skel_create() -> Skeleton {
 
 **Returns:** `Skeleton`
 
-*Defined at line 68*
+*Defined at line 69*
 
 ---
 
@@ -96,7 +116,7 @@ pub fn skel_add_bone(skel: &mut Skeleton, parent: i64, name: str, pos: vec3, rot
 
 **Returns:** `i64`
 
-*Defined at line 75*
+*Defined at line 76*
 
 ---
 
@@ -115,7 +135,7 @@ pub fn skel_find_bone(skel: &Skeleton, name: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 84*
+*Defined at line 85*
 
 ---
 
@@ -133,7 +153,7 @@ pub fn skel_compute_globals(skel: &mut Skeleton) -> void {
 
 **Returns:** `void`
 
-*Defined at line 96*
+*Defined at line 97*
 
 ---
 
@@ -151,7 +171,7 @@ pub fn skel_finalize(skel: &mut Skeleton) -> void {
 
 **Returns:** `void`
 
-*Defined at line 120*
+*Defined at line 121*
 
 ---
 
@@ -169,7 +189,7 @@ pub fn skel_bone_count(skel: &Skeleton) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 138*
+*Defined at line 139*
 
 ---
 
@@ -183,12 +203,12 @@ pub struct Keyframe {
 
 | Name | Type |
 |------|------|
-| `time` | `f64,            // timestamp in seconds` |
+| `time` | `f64` |
 | `translation` | `vec3` |
 | `rotation` | `quat` |
 | `scale` | `vec3` |
 
-*Defined at line 144*
+*Defined at line 145*
 
 ---
 
@@ -204,7 +224,7 @@ pub struct AnimationTrack {
 |------|------|
 | `keyframes` | `Vec<Keyframe>` |
 
-*Defined at line 152*
+*Defined at line 153*
 
 ---
 
@@ -220,11 +240,11 @@ pub struct Animation {
 |------|------|
 | `name` | `str` |
 | `bone_count` | `i64` |
-| `tracks` | `Vec<AnimationTrack>,  // one track per bone` |
+| `tracks` | `Vec<AnimationTrack>` |
 | `duration` | `f64` |
 | `looping` | `bool` |
 
-*Defined at line 156*
+*Defined at line 157*
 
 ---
 
@@ -243,7 +263,7 @@ pub fn skel_create_animation(name: str, bone_count: i64) -> Animation {
 
 **Returns:** `Animation`
 
-*Defined at line 166*
+*Defined at line 167*
 
 ---
 
@@ -266,7 +286,7 @@ pub fn skel_set_keyframe(anim: &mut Animation, bone_idx: i64, time: f64, pos: ve
 
 **Returns:** `void`
 
-*Defined at line 181*
+*Defined at line 182*
 
 ---
 
@@ -286,7 +306,7 @@ pub fn skel_sample_animation(anim: &Animation, time: f64) -> Vec<Keyframe> {
 
 **Returns:** `Vec<Keyframe>`
 
-*Defined at line 218*
+*Defined at line 219*
 
 ---
 
@@ -307,7 +327,7 @@ pub fn skel_compute_pose(skel: &mut Skeleton, anim: &Animation, time: f64) -> vo
 
 **Returns:** `void`
 
-*Defined at line 280*
+*Defined at line 281*
 
 ---
 
@@ -321,10 +341,10 @@ pub struct VertexWeight {
 
 | Name | Type |
 |------|------|
-| `bone_indices` | `Vec<i64>,   // up to 4 bone indices` |
-| `bone_weights` | `Vec<f64>,   // up to 4 bone weights (sum to 1.0)` |
+| `bone_indices` | `Vec<i64>` |
+| `bone_weights` | `Vec<f64>,  // up to 4 bone weights (sum to 1.0)` |
 
-*Defined at line 302*
+*Defined at line 303*
 
 ---
 
@@ -341,7 +361,7 @@ pub struct Skin {
 | `weights` | `Vec<VertexWeight>` |
 | `bone_count` | `i64` |
 
-*Defined at line 308*
+*Defined at line 309*
 
 ---
 
@@ -358,7 +378,7 @@ pub fn skel_create_skin(vertex_count: i64, bone_count: i64) -> Skin {
 
 **Returns:** `Skin`
 
-*Defined at line 313*
+*Defined at line 314*
 
 ---
 
@@ -385,7 +405,7 @@ pub fn skel_set_vertex_weight(skin: &mut Skin, vertex_idx: i64, b0: i64, b1: i64
 
 **Returns:** `void`
 
-*Defined at line 335*
+*Defined at line 336*
 
 ---
 
@@ -406,7 +426,7 @@ pub fn skel_skin_vertex(skin: &Skin, skel: &Skeleton, vertex_idx: i64, pos: vec3
 
 **Returns:** `vec3`
 
-*Defined at line 352*
+*Defined at line 353*
 
 ---
 
@@ -426,7 +446,7 @@ pub fn skel_blend_samples(a: Vec<Keyframe>, b: Vec<Keyframe>, weight: f64) -> Ve
 
 **Returns:** `Vec<Keyframe>`
 
-*Defined at line 379*
+*Defined at line 380*
 
 ---
 
@@ -449,8 +469,8 @@ pub fn skel_blend_poses(skel: &mut Skeleton, anim_a: &Animation, anim_b: &Animat
 
 **Returns:** `void`
 
-*Defined at line 394*
+*Defined at line 395*
 
 ---
 
-*Generated by [scribe](https://fides.dev) — Fides documentation generator*
+*Generated by [scribe](https://fides.dev) -- Fides documentation generator*

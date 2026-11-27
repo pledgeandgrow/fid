@@ -1,57 +1,273 @@
-# RSA through the system library (`crypto_bind`, `crypto_bind_rsa`)
+[All modules](index.md)
 
-Competitive roadmap SL18 / release J5. RSA is done by the operating
-system's reviewed library, not by Fides code: BCrypt (CNG) on Windows
-(`stdlib/crypto_bind.fd`), libcrypto (OpenSSL 1.1.1 or 3.x, EVP_PKEY) on
-Linux and macOS (`stdlib/crypto_bind_unix.fd`). `use crypto_bind` picks the
-module of the target. Both take keys in the same format and give the same
-answers.
+# crypto_bind_rsa -- Fides Documentation
 
-## Keys
+## Contents
 
-A key is a byte `Vec` in BCrypt's blob format, on every system
-(`stdlib/crypto_bind_rsa.fd`, plain Fides):
+- [CBR_PUBLIC:](#CBR_PUBLIC:) (const)
+- [CBR_PRIVATE:](#CBR_PRIVATE:) (const)
+- [CBR_FULL:](#CBR_FULL:) (const)
+- [cbr_strip](#cbr_strip) (function)
+- [cbr_pad](#cbr_pad) (function)
+- [cbr_hash_len](#cbr_hash_len) (function)
+- [cbr_u32](#cbr_u32) (function)
+- [cb_rsa_public_blob](#cb_rsa_public_blob) (function)
+- [cb_rsa_private_blob](#cb_rsa_private_blob) (function)
+- [cbr_blob_ok](#cbr_blob_ok) (function)
+- [cb_rsa_modulus_len](#cb_rsa_modulus_len) (function)
+- [cb_rsa_bits](#cb_rsa_bits) (function)
+- [cbr_blob_part](#cbr_blob_part) (function)
+- [cb_rsa_public_of](#cb_rsa_public_of) (function)
 
-| Function | |
-|---|---|
-| `cb_rsa_public_blob(&n, &e)` | public blob ("RSA1") from big-endian n and e |
-| `cb_rsa_private_blob(&n, &e, &d, &p, &q, &dp, &dq, &qi)` | full private blob ("RSA3"); a secret |
-| `cb_rsa_public_of(&blob)` | the public blob of any key blob |
-| `cb_rsa_bits(&blob)`, `cb_rsa_modulus_len(&blob)` | key size in bits, in bytes |
-| `cbr_blob_part(&blob, k)` | part k: 0 e, 1 n, 2 p, 3 q, 4 dp, 5 dq, 6 qi, 7 d |
-| `cb_rsa_generate(bits, &mut priv, &mut pub)` | a new key (e = 65537); 0 on success |
-
-## Operations
-
-Hash names are `"SHA1"`, `"SHA256"`, `"SHA384"`, `"SHA512"`; the functions
-take the digest, not the message. MGF1 uses the same hash. A signature or
-ciphertext must be exactly as long as the modulus.
+## CBR_PUBLIC:
 
 ```fides
-use crypto_bind; use crypto_bind_rsa; use crypto;
-
-val h = crypto_sha256("message");
-val sig = cb_rsa_sign_pkcs1(& priv, "SHA256", & h);          // RSASSA-PKCS1-v1_5
-val ok = cb_rsa_verify_pkcs1(& pub, "SHA256", & h, & sig);
-val pss = cb_rsa_sign_pss(& priv, "SHA256", & h, 32);         // RSASSA-PSS, salt 32
-val ok2 = cb_rsa_verify_pss(& pub, "SHA256", & h, & pss, 32);
-val ct = cb_rsa_encrypt_oaep(& pub, "SHA256", & msg, & label); // RSAES-OAEP
-var out: Vec<i64> = Vec::new();
-if cb_rsa_decrypt_oaep(& priv, "SHA256", & ct, & label, & mut out) { ... }
+pub const CBR_PUBLIC: i64 = 826364754;
 ```
 
-Signing and decryption take the private blob as `@secret` and return an
-audited release (`@declassify`), as the other crypto_bind functions do.
+*Defined at line 27*
 
-## Tests
+---
 
-`tests/bootstrap/test_crypto_bind_rsa.fd` (C and native builds; `fid run`
-cannot call the libraries): Project Wycheproof vectors for PKCS#1 v1.5
-verify (52), PSS verify (53) and OAEP decrypt (37, with labels), valid and
-invalid; deterministic PKCS#1 v1.5 signatures with the Wycheproof OAEP key
-checked against an independent computation; PSS and OAEP round trips; a
-generated 2048-bit key. Nov 17: the same output, byte for byte, through
-BCrypt (Windows 11, `fid ccompile`) and OpenSSL 3.6.2 (WSL).
+## CBR_PRIVATE:
 
-`scripts/verify/crypto_bind_unix_check.fd` checks the rest of the OpenSSL
-twin (AES-GCM, PBKDF2, ECDSA P-256 and its blobs).
+```fides
+pub const CBR_PRIVATE: i64 = 843141970;
+```
+
+*Defined at line 28*
+
+---
+
+## CBR_FULL:
+
+```fides
+pub const CBR_FULL: i64 = 859919186;
+```
+
+*Defined at line 29*
+
+---
+
+## cbr_strip
+
+The bytes of a big-endian number without its leading zeros.
+
+```fides
+pub fn cbr_strip(v: &Vec) -> Vec<i64> {
+```
+
+**Parameters:**
+
+- `v`: `&Vec`
+
+**Returns:** `Vec<i64>`
+
+*Defined at line 33*
+
+---
+
+## cbr_pad
+
+A big-endian number as exactly `n` bytes (zeros in front); empty when it
+does not fit.
+
+```fides
+pub fn cbr_pad(v: &Vec, n: i64) -> Vec<i64> {
+```
+
+**Parameters:**
+
+- `v`: `&Vec`
+- `n`: `i64`
+
+**Returns:** `Vec<i64>`
+
+*Defined at line 48*
+
+---
+
+## cbr_hash_len
+
+The digest length of a hash name ("SHA256": 32), 0 for an unknown one.
+
+```fides
+pub fn cbr_hash_len(alg: str) -> i64 {
+```
+
+**Parameters:**
+
+- `alg`: `str`
+
+**Returns:** `i64`
+
+*Defined at line 68*
+
+---
+
+## cbr_u32
+
+The u32 at `at` (little-endian), or -1 past the end.
+
+```fides
+pub fn cbr_u32(v: &Vec, at: i64) -> i64 {
+```
+
+**Parameters:**
+
+- `v`: `&Vec`
+- `at`: `i64`
+
+**Returns:** `i64`
+
+*Defined at line 92*
+
+---
+
+## cb_rsa_public_blob
+
+The public blob ("RSA1") of the modulus `n` and exponent `e` (big-endian
+bytes; leading zeros are dropped). Empty when either is zero.
+
+```fides
+pub fn cb_rsa_public_blob(n: &Vec, e: &Vec) -> Vec<i64> {
+```
+
+**Parameters:**
+
+- `n`: `&Vec`
+- `e`: `&Vec`
+
+**Returns:** `Vec<i64>`
+
+*Defined at line 124*
+
+---
+
+## cb_rsa_private_blob
+
+The full private blob ("RSA3") of a key given by its parts (big-endian
+bytes, as PKCS#1 RSAPrivateKey and JWK name them: n, e, d, p, q,
+dp = d mod (p-1), dq = d mod (q-1), qi = q^-1 mod p). Empty when a part
+is missing or too long. The result holds the private key: treat it as a
+secret.
+
+```fides
+pub fn cb_rsa_private_blob(n: &Vec, e: &Vec, d: &Vec, p: &Vec, q: &Vec, dp: &Vec, dq: &Vec, qi: &Vec) -> Vec<i64> {
+```
+
+**Parameters:**
+
+- `n`: `&Vec`
+- `e`: `&Vec`
+- `d`: `&Vec`
+- `p`: `&Vec`
+- `q`: `&Vec`
+- `dp`: `&Vec`
+- `dq`: `&Vec`
+- `qi`: `&Vec`
+
+**Returns:** `Vec<i64>`
+
+*Defined at line 147*
+
+---
+
+## cbr_blob_ok
+
+True when `blob` is a well-formed RSA blob: a public one ("RSA1") or a
+full private one ("RSA3") when `want_private` (a private one is also a
+public key).
+
+```fides
+pub fn cbr_blob_ok(blob: &Vec, want_private: bool) -> bool {
+```
+
+**Parameters:**
+
+- `blob`: `&Vec`
+- `want_private`: `bool`
+
+**Returns:** `bool`
+
+*Defined at line 209*
+
+---
+
+## cb_rsa_modulus_len
+
+The modulus length in bytes (the length of every signature and
+ciphertext of the key), 0 for a malformed blob.
+
+```fides
+pub fn cb_rsa_modulus_len(blob: &Vec) -> i64 {
+```
+
+**Parameters:**
+
+- `blob`: `&Vec`
+
+**Returns:** `i64`
+
+*Defined at line 223*
+
+---
+
+## cb_rsa_bits
+
+The key size in bits (2048 ...), 0 for a malformed blob.
+
+```fides
+pub fn cb_rsa_bits(blob: &Vec) -> i64 {
+```
+
+**Parameters:**
+
+- `blob`: `&Vec`
+
+**Returns:** `i64`
+
+*Defined at line 231*
+
+---
+
+## cbr_blob_part
+
+Part `k` of a blob, big-endian: 0 e, 1 n, 2 p, 3 q, 4 dp, 5 dq, 6 qi,
+7 d (a public blob has only e and n). Empty when the blob lacks it.
+
+```fides
+pub fn cbr_blob_part(blob: &Vec, k: i64) -> Vec<i64> {
+```
+
+**Parameters:**
+
+- `blob`: `&Vec`
+- `k`: `i64`
+
+**Returns:** `Vec<i64>`
+
+*Defined at line 240*
+
+---
+
+## cb_rsa_public_of
+
+The public blob of a key blob (public or private); empty for a
+malformed one.
+
+```fides
+pub fn cb_rsa_public_of(blob: &Vec) -> Vec<i64> {
+```
+
+**Parameters:**
+
+- `blob`: `&Vec`
+
+**Returns:** `Vec<i64>`
+
+*Defined at line 283*
+
+---
+
+*Generated by [scribe](https://fides.dev) -- Fides documentation generator*

@@ -1,9 +1,11 @@
-# audio — Fides Documentation
+[All modules](index.md)
+
+# audio -- Fides Documentation
 
 ## Contents
 
-- [AUDIO_NO_CHANNEL:](#audio_no_channel:) (const)
-- [AUDIO_MAX_CHANNELS:](#audio_max_channels:) (const)
+- [AUDIO_NO_CHANNEL:](#AUDIO_NO_CHANNEL:) (const)
+- [AUDIO_MAX_CHANNELS:](#AUDIO_MAX_CHANNELS:) (const)
 - [audio_init](#audio_init) (function)
 - [audio_shutdown](#audio_shutdown) (function)
 - [audio_load](#audio_load) (function)
@@ -18,7 +20,12 @@
 - [audio_set_pan](#audio_set_pan) (function)
 - [audio_is_playing](#audio_is_playing) (function)
 - [audio_master_volume](#audio_master_volume) (function)
-- [AudioState](#audiostate) (struct)
+- [AudioBuffer](#AudioBuffer) (struct)
+- [audio_wav_decode](#audio_wav_decode) (function)
+- [audio_load_wav](#audio_load_wav) (function)
+- [audio_wav_encode](#audio_wav_encode) (function)
+- [audio_save_wav](#audio_save_wav) (function)
+- [AudioState](#AudioState) (struct)
 - [audio_state_create](#audio_state_create) (function)
 - [audio_state_set_volume](#audio_state_set_volume) (function)
 - [audio_state_toggle_mute](#audio_state_toggle_mute) (function)
@@ -43,7 +50,7 @@ pub const AUDIO_NO_CHANNEL: i64 = -1;
 pub const AUDIO_MAX_CHANNELS: i64 = 32;
 ```
 
-*Defined at line 25*
+*Defined at line 26*
 
 ---
 
@@ -57,7 +64,7 @@ pub fn audio_init() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 55*
+*Defined at line 56*
 
 ---
 
@@ -71,7 +78,7 @@ pub fn audio_shutdown() -> void {
 
 **Returns:** `void`
 
-*Defined at line 60*
+*Defined at line 65*
 
 ---
 
@@ -89,7 +96,7 @@ pub fn audio_load(path: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 67*
+*Defined at line 76*
 
 ---
 
@@ -108,7 +115,7 @@ pub fn audio_play(sound: i64, volume: f64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 74*
+*Defined at line 88*
 
 ---
 
@@ -126,7 +133,7 @@ pub fn audio_play_full(sound: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 79*
+*Defined at line 97*
 
 ---
 
@@ -144,7 +151,7 @@ pub fn audio_stop(channel: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 84*
+*Defined at line 106*
 
 ---
 
@@ -158,7 +165,7 @@ pub fn audio_stop_all() -> void {
 
 **Returns:** `void`
 
-*Defined at line 89*
+*Defined at line 116*
 
 ---
 
@@ -176,7 +183,7 @@ pub fn audio_pause(channel: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 94*
+*Defined at line 125*
 
 ---
 
@@ -194,7 +201,7 @@ pub fn audio_resume(channel: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 99*
+*Defined at line 135*
 
 ---
 
@@ -213,7 +220,7 @@ pub fn audio_set_volume(channel: i64, volume: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 106*
+*Defined at line 147*
 
 ---
 
@@ -232,7 +239,7 @@ pub fn audio_set_loop(channel: i64, looping: bool) -> void {
 
 **Returns:** `void`
 
-*Defined at line 111*
+*Defined at line 157*
 
 ---
 
@@ -251,7 +258,7 @@ pub fn audio_set_pan(channel: i64, pan: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 120*
+*Defined at line 171*
 
 ---
 
@@ -269,7 +276,7 @@ pub fn audio_is_playing(channel: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 125*
+*Defined at line 181*
 
 ---
 
@@ -287,7 +294,100 @@ pub fn audio_master_volume(volume: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 132*
+*Defined at line 195*
+
+---
+
+## AudioBuffer
+
+```fides
+pub struct AudioBuffer {
+```
+
+**Fields:**
+
+| Name | Type |
+|------|------|
+| `sample_rate` | `i64` |
+| `channels` | `i64` |
+| `bits` | `i64` |
+| `data` | `Vec<i64>,  // interleaved samples (i16 range for 16-bit, 0-255 for 8-bit)` |
+
+*Defined at line 210*
+
+---
+
+## audio_wav_decode
+
+Decode a WAV byte stream. `sample_rate` is 0 on failure.
+
+```fides
+pub fn audio_wav_decode(d: Vec<i64>) -> AudioBuffer {
+```
+
+**Parameters:**
+
+- `d`: `Vec<i64>`
+
+**Returns:** `AudioBuffer`
+
+*Defined at line 231*
+
+---
+
+## audio_load_wav
+
+Load and decode a WAV file. `sample_rate` is 0 on failure.
+
+```fides
+pub fn audio_load_wav(path: str) -> AudioBuffer {
+```
+
+**Parameters:**
+
+- `path`: `str`
+
+**Returns:** `AudioBuffer`
+
+*Defined at line 302*
+
+---
+
+## audio_wav_encode
+
+Encode an AudioBuffer as a 16-bit PCM WAV byte stream.
+8-bit buffers are widened to 16 bits.
+
+```fides
+pub fn audio_wav_encode(buf: &AudioBuffer) -> Vec<i64> {
+```
+
+**Parameters:**
+
+- `buf`: `&AudioBuffer`
+
+**Returns:** `Vec<i64>`
+
+*Defined at line 308*
+
+---
+
+## audio_save_wav
+
+Save an AudioBuffer as a 16-bit PCM WAV file.
+
+```fides
+pub fn audio_save_wav(buf: &AudioBuffer, path: str) -> i64 {
+```
+
+**Parameters:**
+
+- `buf`: `&AudioBuffer`
+- `path`: `str`
+
+**Returns:** `i64`
+
+*Defined at line 369*
 
 ---
 
@@ -303,10 +403,10 @@ pub struct AudioState {
 |------|------|
 | `master_vol` | `f64` |
 | `muted` | `bool` |
-| `music_channel` | `i64,  // dedicated music channel` |
-| `sfx_channels` | `Vec<i64>, // active SFX channels` |
+| `music_channel` | `i64` |
+| `sfx_channels` | `Vec<i64>,  // active SFX channels` |
 
-*Defined at line 296*
+*Defined at line 379*
 
 ---
 
@@ -314,13 +414,24 @@ pub struct AudioState {
 
 Create an audio state tracker.
 
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+val st = audio_state_create();
+assert(!st.muted);
+assert(st.master_vol == 1.0);
+assert_eq(st.music_channel, AUDIO_NO_CHANNEL);
+assert_eq(st.sfx_channels.len(), 0);
+```
+
 ```fides
 pub fn audio_state_create() -> AudioState {
 ```
 
 **Returns:** `AudioState`
 
-*Defined at line 312*
+*Defined at line 395*
 
 ---
 
@@ -339,7 +450,7 @@ pub fn audio_state_set_volume(state: &mut AudioState, vol: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 319*
+*Defined at line 402*
 
 ---
 
@@ -357,7 +468,7 @@ pub fn audio_state_toggle_mute(state: &mut AudioState) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 327*
+*Defined at line 410*
 
 ---
 
@@ -376,7 +487,7 @@ pub fn audio_state_play_music(state: &mut AudioState, sound: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 338*
+*Defined at line 421*
 
 ---
 
@@ -394,7 +505,7 @@ pub fn audio_state_stop_music(state: &mut AudioState) -> void {
 
 **Returns:** `void`
 
-*Defined at line 347*
+*Defined at line 430*
 
 ---
 
@@ -414,7 +525,7 @@ pub fn audio_state_play_sfx(state: &mut AudioState, sound: i64, volume: f64) -> 
 
 **Returns:** `i64`
 
-*Defined at line 355*
+*Defined at line 438*
 
 ---
 
@@ -432,8 +543,8 @@ pub fn audio_state_cleanup_sfx(state: &mut AudioState) -> void {
 
 **Returns:** `void`
 
-*Defined at line 364*
+*Defined at line 447*
 
 ---
 
-*Generated by [scribe](https://fides.dev) — Fides documentation generator*
+*Generated by [scribe](https://fides.dev) -- Fides documentation generator*

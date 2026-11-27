@@ -1,23 +1,27 @@
-# ota — Fides Documentation
+[All modules](index.md)
+
+# ota -- Fides Documentation
 
 ## Contents
 
-- [OTA_STATE_IDLE:](#ota_state_idle:) (const)
-- [OTA_STATE_DOWNLOADING:](#ota_state_downloading:) (const)
-- [OTA_STATE_VERIFYING:](#ota_state_verifying:) (const)
-- [OTA_STATE_APPLYING:](#ota_state_applying:) (const)
-- [OTA_STATE_COMMITTED:](#ota_state_committed:) (const)
-- [OTA_STATE_ROLLBACK:](#ota_state_rollback:) (const)
-- [OTA_STATE_FAILED:](#ota_state_failed:) (const)
+- [ota_hash_hex](#ota_hash_hex) (function)
+- [OTA_STATE_IDLE:](#OTA_STATE_IDLE:) (const)
+- [OTA_STATE_DOWNLOADING:](#OTA_STATE_DOWNLOADING:) (const)
+- [OTA_STATE_VERIFYING:](#OTA_STATE_VERIFYING:) (const)
+- [OTA_STATE_APPLYING:](#OTA_STATE_APPLYING:) (const)
+- [OTA_STATE_COMMITTED:](#OTA_STATE_COMMITTED:) (const)
+- [OTA_STATE_ROLLBACK:](#OTA_STATE_ROLLBACK:) (const)
+- [OTA_STATE_FAILED:](#OTA_STATE_FAILED:) (const)
 - [ota_state_name](#ota_state_name) (function)
-- [OTAManifest](#otamanifest) (struct)
+- [OTAManifest](#OTAManifest) (struct)
 - [ota_manifest_new](#ota_manifest_new) (function)
 - [ota_manifest_set_version](#ota_manifest_set_version) (function)
 - [ota_manifest_set_signature](#ota_manifest_set_signature) (function)
 - [ota_manifest_set_description](#ota_manifest_set_description) (function)
+- [ota_verify_payload](#ota_verify_payload) (function)
 - [ota_verify_manifest](#ota_verify_manifest) (function)
 - [ota_check_compatibility](#ota_check_compatibility) (function)
-- [OTASession](#otasession) (struct)
+- [OTASession](#OTASession) (struct)
 - [ota_session_new](#ota_session_new) (function)
 - [ota_session_start_download](#ota_session_start_download) (function)
 - [ota_session_download_progress](#ota_session_download_progress) (function)
@@ -30,18 +34,34 @@
 - [ota_session_can_retry](#ota_session_can_retry) (function)
 - [ota_session_retry](#ota_session_retry) (function)
 - [ota_session_state_name](#ota_session_state_name) (function)
-- [DiffEntry](#diffentry) (struct)
+- [DiffEntry](#DiffEntry) (struct)
 - [ota_binary_diff](#ota_binary_diff) (function)
 - [ota_diff_size](#ota_diff_size) (function)
 - [ota_diff_region_count](#ota_diff_region_count) (function)
 
+## ota_hash_hex
+
+```fides
+pub fn ota_hash_hex(data: Vec<i64>) -> str {
+```
+
+**Parameters:**
+
+- `data`: `Vec<i64>`
+
+**Returns:** `str`
+
+*Defined at line 37*
+
+---
+
 ## OTA_STATE_IDLE:
 
 ```fides
-pub const OTA_STATE_IDLE: i64        = 0;
+pub const OTA_STATE_IDLE: i64 = 0;
 ```
 
-*Defined at line 54*
+*Defined at line 56*
 
 ---
 
@@ -51,57 +71,57 @@ pub const OTA_STATE_IDLE: i64        = 0;
 pub const OTA_STATE_DOWNLOADING: i64 = 1;
 ```
 
-*Defined at line 54*
+*Defined at line 57*
 
 ---
 
 ## OTA_STATE_VERIFYING:
 
 ```fides
-pub const OTA_STATE_VERIFYING: i64   = 2;
+pub const OTA_STATE_VERIFYING: i64 = 2;
 ```
 
-*Defined at line 54*
+*Defined at line 58*
 
 ---
 
 ## OTA_STATE_APPLYING:
 
 ```fides
-pub const OTA_STATE_APPLYING: i64    = 3;
+pub const OTA_STATE_APPLYING: i64 = 3;
 ```
 
-*Defined at line 54*
+*Defined at line 59*
 
 ---
 
 ## OTA_STATE_COMMITTED:
 
 ```fides
-pub const OTA_STATE_COMMITTED: i64   = 4;
+pub const OTA_STATE_COMMITTED: i64 = 4;
 ```
 
-*Defined at line 54*
+*Defined at line 60*
 
 ---
 
 ## OTA_STATE_ROLLBACK:
 
 ```fides
-pub const OTA_STATE_ROLLBACK: i64    = 5;
+pub const OTA_STATE_ROLLBACK: i64 = 5;
 ```
 
-*Defined at line 54*
+*Defined at line 61*
 
 ---
 
 ## OTA_STATE_FAILED:
 
 ```fides
-pub const OTA_STATE_FAILED: i64      = 6;
+pub const OTA_STATE_FAILED: i64 = 6;
 ```
 
-*Defined at line 54*
+*Defined at line 62*
 
 ---
 
@@ -119,7 +139,7 @@ pub fn ota_state_name(state: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 56*
+*Defined at line 64*
 
 ---
 
@@ -137,21 +157,32 @@ pub struct OTAManifest {
 |------|------|
 | `version` | `str` |
 | `filename` | `str` |
-| `size` | `i64,             // in bytes` |
-| `checksum` | `str,         // "sha256:hexstring"` |
-| `signature` | `str,        // hex signature (empty if unsigned)` |
-| `min_version` | `str,      // minimum current version required` |
-| `max_version` | `str,      // maximum current version allowed` |
-| `timestamp` | `i64,        // manifest creation time` |
+| `size` | `i64` |
+| `checksum` | `str` |
+| `signature` | `str` |
+| `min_version` | `str` |
+| `max_version` | `str` |
+| `timestamp` | `i64` |
 | `description` | `str` |
 
-*Defined at line 88*
+*Defined at line 96*
 
 ---
 
 ## ota_manifest_new
 
 Create a new OTA manifest.
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+var m = ota_manifest_new("fw.bin", 5, "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824");
+assert(ota_verify_manifest(m));
+assert(ota_verify_payload(m, "hello"));
+assert(!ota_verify_payload(m, "hellO"));
+assert(!ota_verify_manifest(ota_manifest_new("fw.bin", 5, "md5:x")));
+```
 
 ```fides
 pub fn ota_manifest_new(filename: str, size: i64, checksum: str) -> OTAManifest {
@@ -165,7 +196,7 @@ pub fn ota_manifest_new(filename: str, size: i64, checksum: str) -> OTAManifest 
 
 **Returns:** `OTAManifest`
 
-*Defined at line 114*
+*Defined at line 122*
 
 ---
 
@@ -184,7 +215,9 @@ pub fn ota_manifest_set_version(manifest: &mut OTAManifest, version: str, min_ve
 - `min_ver`: `str`
 - `max_ver`: `str`
 
-*Defined at line 121*
+**Returns:** `void`
+
+*Defined at line 129*
 
 ---
 
@@ -203,7 +236,7 @@ pub fn ota_manifest_set_signature(manifest: &mut OTAManifest, signature: str) ->
 
 **Returns:** `void`
 
-*Defined at line 128*
+*Defined at line 136*
 
 ---
 
@@ -222,13 +255,36 @@ pub fn ota_manifest_set_description(manifest: &mut OTAManifest, desc: str) -> vo
 
 **Returns:** `void`
 
-*Defined at line 133*
+*Defined at line 141*
+
+---
+
+## ota_verify_payload
+
+Does the update match its manifest: the size, and the SHA-256 of its bytes?
+This is integrity only: a manifest proves who made it only if it is signed.
+
+```fides
+pub fn ota_verify_payload(manifest: OTAManifest, payload: str) -> bool {
+```
+
+**Parameters:**
+
+- `manifest`: `OTAManifest`
+- `payload`: `str`
+
+**Returns:** `bool`
+
+*Defined at line 147*
 
 ---
 
 ## ota_verify_manifest
 
-Verify manifest fields are valid.
+Are the manifest's fields well formed? This only looks at the manifest: it
+says nothing about the update itself, which is ota_verify_payload's work.
+The checksum must be "sha256:" + 64 lowercase hex digits — anything
+shorter is a truncated or foreign hash, not a SHA-256.
 
 ```fides
 pub fn ota_verify_manifest(manifest: OTAManifest) -> bool {
@@ -240,7 +296,7 @@ pub fn ota_verify_manifest(manifest: OTAManifest) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 150*
+*Defined at line 158*
 
 ---
 
@@ -259,7 +315,7 @@ pub fn ota_check_compatibility(manifest: OTAManifest, current_version: str) -> b
 
 **Returns:** `bool`
 
-*Defined at line 182*
+*Defined at line 190*
 
 ---
 
@@ -283,7 +339,7 @@ pub struct OTASession {
 | `retry_count` | `i64` |
 | `max_retries` | `i64` |
 
-*Defined at line 201*
+*Defined at line 209*
 
 ---
 
@@ -301,7 +357,7 @@ pub fn ota_session_new(manifest: OTAManifest) -> OTASession {
 
 **Returns:** `OTASession`
 
-*Defined at line 212*
+*Defined at line 220*
 
 ---
 
@@ -319,7 +375,7 @@ pub fn ota_session_start_download(session: &mut OTASession) -> void {
 
 **Returns:** `void`
 
-*Defined at line 219*
+*Defined at line 227*
 
 ---
 
@@ -338,7 +394,7 @@ pub fn ota_session_download_progress(session: &mut OTASession, bytes: i64) -> vo
 
 **Returns:** `void`
 
-*Defined at line 225*
+*Defined at line 233*
 
 ---
 
@@ -356,7 +412,7 @@ pub fn ota_session_download_percent(session: OTASession) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 233*
+*Defined at line 241*
 
 ---
 
@@ -377,7 +433,7 @@ pub fn ota_session_verify(session: &mut OTASession, binary_data: Vec<i64>) -> bo
 
 **Returns:** `bool`
 
-*Defined at line 243*
+*Defined at line 251*
 
 ---
 
@@ -395,7 +451,7 @@ pub fn ota_session_apply(session: &mut OTASession) -> void {
 
 **Returns:** `void`
 
-*Defined at line 264*
+*Defined at line 272*
 
 ---
 
@@ -413,7 +469,7 @@ pub fn ota_session_commit(session: &mut OTASession) -> void {
 
 **Returns:** `void`
 
-*Defined at line 269*
+*Defined at line 277*
 
 ---
 
@@ -431,7 +487,7 @@ pub fn ota_session_rollback(session: &mut OTASession) -> void {
 
 **Returns:** `void`
 
-*Defined at line 274*
+*Defined at line 282*
 
 ---
 
@@ -450,7 +506,7 @@ pub fn ota_session_fail(session: &mut OTASession, error_msg: str) -> void {
 
 **Returns:** `void`
 
-*Defined at line 279*
+*Defined at line 287*
 
 ---
 
@@ -468,7 +524,7 @@ pub fn ota_session_can_retry(session: OTASession) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 285*
+*Defined at line 293*
 
 ---
 
@@ -486,7 +542,7 @@ pub fn ota_session_retry(session: &mut OTASession) -> void {
 
 **Returns:** `void`
 
-*Defined at line 290*
+*Defined at line 298*
 
 ---
 
@@ -504,7 +560,7 @@ pub fn ota_session_state_name(session: OTASession) -> str {
 
 **Returns:** `str`
 
-*Defined at line 299*
+*Defined at line 307*
 
 ---
 
@@ -524,7 +580,7 @@ pub struct DiffEntry {
 | `length` | `i64` |
 | `data` | `Vec<i64>` |
 
-*Defined at line 310*
+*Defined at line 318*
 
 ---
 
@@ -544,7 +600,7 @@ pub fn ota_binary_diff(old_data: Vec<i64>, new_data: Vec<i64>) -> Vec<i64> {
 
 **Returns:** `Vec<i64>`
 
-*Defined at line 318*
+*Defined at line 326*
 
 ---
 
@@ -562,7 +618,7 @@ pub fn ota_diff_size(diff: Vec<i64>) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 357*
+*Defined at line 365*
 
 ---
 
@@ -580,8 +636,8 @@ pub fn ota_diff_region_count(diff: Vec<i64>) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 368*
+*Defined at line 376*
 
 ---
 
-*Generated by [scribe](https://fides.dev) — Fides documentation generator*
+*Generated by [scribe](https://fides.dev) -- Fides documentation generator*

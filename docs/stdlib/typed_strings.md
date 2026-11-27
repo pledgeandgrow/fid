@@ -1,28 +1,30 @@
-# typed_strings — Fides Documentation
+[All modules](index.md)
+
+# typed_strings -- Fides Documentation
 
 ## Contents
 
-- [SQLString](#sqlstring) (struct)
-- [SQLString](#sqlstring) (impl)
+- [SQLString](#SQLString) (struct)
+- [SQLString](#SQLString) (impl)
 - [sql_query](#sql_query) (function)
 - [sql_literal](#sql_literal) (function)
 - [sql_escape](#sql_escape) (function)
 - [sql_bind](#sql_bind) (function)
 - [sql_bind_int](#sql_bind_int) (function)
-- [ShellString](#shellstring) (struct)
-- [ShellString](#shellstring) (impl)
+- [ShellString](#ShellString) (struct)
+- [ShellString](#ShellString) (impl)
 - [shell_cmd](#shell_cmd) (function)
 - [shell_escape](#shell_escape) (function)
-- [HTMLString](#htmlstring) (struct)
-- [HTMLString](#htmlstring) (impl)
+- [HTMLString](#HTMLString) (struct)
+- [HTMLString](#HTMLString) (impl)
 - [html_literal](#html_literal) (function)
 - [html_escape](#html_escape) (function)
 - [html_attr_escape](#html_attr_escape) (function)
-- [JSONString](#jsonstring) (struct)
-- [JSONString](#jsonstring) (impl)
+- [JSONString](#JSONString) (struct)
+- [JSONString](#JSONString) (impl)
 - [json_escape](#json_escape) (function)
-- [PathString](#pathstring) (struct)
-- [PathString](#pathstring) (impl)
+- [PathString](#PathString) (struct)
+- [PathString](#PathString) (impl)
 - [path_safe](#path_safe) (function)
 - [path_literal](#path_literal) (function)
 
@@ -51,7 +53,36 @@ pub struct SQLString {
 impl SQLString {
 ```
 
-*Defined at line 37*
+**Methods:**
+
+### literal
+
+Create a SQLString from a literal query (no user input).
+Use this for static queries: `SQLString::literal("SELECT * FROM users")`
+
+```fides
+pub fn literal(sql: str) -> SQLString {
+```
+
+### raw
+
+Get the raw string value. Use with caution — only for passing to
+database drivers that handle parameterization.
+
+```fides
+pub fn raw(self: SQLString) -> str {
+```
+
+### is_safe
+
+Check if the SQL string contains potentially dangerous characters.
+This is a heuristic — not a complete security check.
+
+```fides
+pub fn is_safe(self: SQLString) -> bool {
+```
+
+*Defined at line 41*
 
 ---
 
@@ -59,6 +90,16 @@ impl SQLString {
 
 Create a SQLString from a literal query string.
 This is the safe constructor — only use with static query text.
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+val q = sql_bind(sql_query("SELECT * FROM t WHERE name = '?'"), "O'Brien");
+assert_eq(q.raw(), "SELECT * FROM t WHERE name = 'O''Brien'");
+assert_eq(sql_bind_int(sql_query("LIMIT ?"), 10).raw(), "LIMIT 10");
+assert_eq(sql_escape("it's").raw(), "it''s");
+```
 
 ```fides
 pub fn sql_query(sql: str) -> SQLString {
@@ -114,9 +155,13 @@ pub fn sql_escape(input: str) -> SQLString {
 
 ## sql_bind
 
-Bind a parameter into a SQL query. Replaces the first `?` placeholder
-with the string-escaped value. Returns a new SQLString.
-This is the safe way to include user input in SQL queries.
+Bind a string parameter into a SQL query. Replaces the FIRST `?`
+placeholder (further `?`s stay for later binds — str_replace would
+have bound them all to this one value). The value is single-quote
+escaped; a `?` sitting inside a quoted literal (the recommended
+`WHERE x = '?'` form) gets the escaped text, a bare `?` gets the
+escaped text wrapped in quotes — either way the parameter can never
+break out into query syntax.
 
 ```fides
 pub fn sql_bind(query: SQLString, param: str) -> SQLString {
@@ -135,7 +180,8 @@ pub fn sql_bind(query: SQLString, param: str) -> SQLString {
 
 ## sql_bind_int
 
-Bind an integer parameter into a SQL query.
+Bind an integer parameter into a SQL query. Replaces the first `?`
+placeholder; integers need no quoting.
 
 ```fides
 pub fn sql_bind_int(query: SQLString, param: i64) -> SQLString {
@@ -177,7 +223,33 @@ pub struct ShellString {
 impl ShellString {
 ```
 
-*Defined at line 180*
+**Methods:**
+
+### literal
+
+Create a ShellString from a literal command (no user input).
+
+```fides
+pub fn literal(cmd: str) -> ShellString {
+```
+
+### raw
+
+Get the raw string value.
+
+```fides
+pub fn raw(self: ShellString) -> str {
+```
+
+### is_safe
+
+Check if the shell string contains potentially dangerous characters.
+
+```fides
+pub fn is_safe(self: ShellString) -> bool {
+```
+
+*Defined at line 184*
 
 ---
 
@@ -243,7 +315,25 @@ pub struct HTMLString {
 impl HTMLString {
 ```
 
-*Defined at line 256*
+**Methods:**
+
+### literal
+
+Create an HTMLString from literal HTML (no user input).
+
+```fides
+pub fn literal(html: str) -> HTMLString {
+```
+
+### raw
+
+Get the raw string value.
+
+```fides
+pub fn raw(self: HTMLString) -> str {
+```
+
+*Defined at line 260*
 
 ---
 
@@ -327,7 +417,17 @@ pub struct JSONString {
 impl JSONString {
 ```
 
-*Defined at line 310*
+**Methods:**
+
+### raw
+
+Get the raw string value.
+
+```fides
+pub fn raw(self: JSONString) -> str {
+```
+
+*Defined at line 314*
 
 ---
 
@@ -375,7 +475,25 @@ pub struct PathString {
 impl PathString {
 ```
 
-*Defined at line 338*
+**Methods:**
+
+### raw
+
+Get the raw string value.
+
+```fides
+pub fn raw(self: PathString) -> str {
+```
+
+### is_safe
+
+Check if the path is safe (no directory traversal).
+
+```fides
+pub fn is_safe(self: PathString) -> bool {
+```
+
+*Defined at line 342*
 
 ---
 
@@ -416,4 +534,4 @@ pub fn path_literal(path: str) -> PathString {
 
 ---
 
-*Generated by [scribe](https://fides.dev) — Fides documentation generator*
+*Generated by [scribe](https://fides.dev) -- Fides documentation generator*

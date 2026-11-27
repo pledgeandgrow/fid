@@ -1,13 +1,15 @@
-# sys — Fides Documentation
+[All modules](index.md)
+
+# sys -- Fides Documentation
 
 ## Contents
 
-- [_SC_PAGESIZE:](#_sc_pagesize:) (const)
-- [_SC_CLK_TCK:](#_sc_clk_tck:) (const)
-- [_SC_NPROCESSORS_ONLN:](#_sc_nprocessors_onln:) (const)
-- [_SC_NPROCESSORS_CONF:](#_sc_nprocessors_conf:) (const)
-- [_SC_PHYS_PAGES:](#_sc_phys_pages:) (const)
-- [_SC_AVPHYS_PAGES:](#_sc_avphys_pages:) (const)
+- [_SC_PAGESIZE:](#_SC_PAGESIZE:) (const)
+- [_SC_CLK_TCK:](#_SC_CLK_TCK:) (const)
+- [_SC_NPROCESSORS_ONLN:](#_SC_NPROCESSORS_ONLN:) (const)
+- [_SC_NPROCESSORS_CONF:](#_SC_NPROCESSORS_CONF:) (const)
+- [_SC_PHYS_PAGES:](#_SC_PHYS_PAGES:) (const)
+- [_SC_AVPHYS_PAGES:](#_SC_AVPHYS_PAGES:) (const)
 - [sys_arch](#sys_arch) (function)
 - [sys_cpu_count](#sys_cpu_count) (function)
 - [sys_cpu_count_conf](#sys_cpu_count_conf) (function)
@@ -29,7 +31,7 @@
 - [sys_is_32bit](#sys_is_32bit) (function)
 - [sys_is_little_endian](#sys_is_little_endian) (function)
 - [sys_is_big_endian](#sys_is_big_endian) (function)
-- [SystemInfo](#systeminfo) (struct)
+- [SystemInfo](#SystemInfo) (struct)
 - [sys_info](#sys_info) (function)
 - [sys_info_string](#sys_info_string) (function)
 
@@ -39,7 +41,7 @@
 pub const _SC_PAGESIZE: i64 = 30;
 ```
 
-*Defined at line 43*
+*Defined at line 44*
 
 ---
 
@@ -49,7 +51,7 @@ pub const _SC_PAGESIZE: i64 = 30;
 pub const _SC_CLK_TCK: i64 = 2;
 ```
 
-*Defined at line 43*
+*Defined at line 45*
 
 ---
 
@@ -59,7 +61,7 @@ pub const _SC_CLK_TCK: i64 = 2;
 pub const _SC_NPROCESSORS_ONLN: i64 = 84;
 ```
 
-*Defined at line 43*
+*Defined at line 46*
 
 ---
 
@@ -69,7 +71,7 @@ pub const _SC_NPROCESSORS_ONLN: i64 = 84;
 pub const _SC_NPROCESSORS_CONF: i64 = 83;
 ```
 
-*Defined at line 43*
+*Defined at line 47*
 
 ---
 
@@ -79,7 +81,7 @@ pub const _SC_NPROCESSORS_CONF: i64 = 83;
 pub const _SC_PHYS_PAGES: i64 = 85;
 ```
 
-*Defined at line 43*
+*Defined at line 48*
 
 ---
 
@@ -89,13 +91,15 @@ pub const _SC_PHYS_PAGES: i64 = 85;
 pub const _SC_AVPHYS_PAGES: i64 = 86;
 ```
 
-*Defined at line 43*
+*Defined at line 49*
 
 ---
 
 ## sys_arch
 
-Get the CPU architecture (best-effort).
+Get the CPU architecture. @cfg resolves it for the build target
+(x86_64 on the host; aarch64/riscv64/wasm32 on cross targets);
+PLEDGE_ARCH overrides.
 
 ```fides
 pub fn sys_arch() -> str {
@@ -103,7 +107,7 @@ pub fn sys_arch() -> str {
 
 **Returns:** `str`
 
-*Defined at line 249*
+*Defined at line 321*
 
 ---
 
@@ -111,13 +115,23 @@ pub fn sys_arch() -> str {
 
 Get the number of processors currently online.
 
+
+*Example (native only) -- run as a test by `scripts/doctest.py`:*
+
+```fides
+assert(sys_cpu_count() >= 1);
+assert(sys_page_size() >= 4096);
+assert(sys_pid() > 0);
+assert(str_len(sys_arch()) > 0);
+```
+
 ```fides
 pub fn sys_cpu_count() -> i64 {
 ```
 
 **Returns:** `i64`
 
-*Defined at line 286*
+*Defined at line 358*
 
 ---
 
@@ -131,7 +145,7 @@ pub fn sys_cpu_count_conf() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 295*
+*Defined at line 367*
 
 ---
 
@@ -145,7 +159,7 @@ pub fn sys_page_size() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 306*
+*Defined at line 378*
 
 ---
 
@@ -159,7 +173,7 @@ pub fn sys_total_memory() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 315*
+*Defined at line 387*
 
 ---
 
@@ -173,7 +187,7 @@ pub fn sys_available_memory() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 325*
+*Defined at line 397*
 
 ---
 
@@ -187,7 +201,7 @@ pub fn sys_total_memory_kb() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 335*
+*Defined at line 407*
 
 ---
 
@@ -201,7 +215,7 @@ pub fn sys_total_memory_mb() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 340*
+*Defined at line 412*
 
 ---
 
@@ -215,7 +229,7 @@ pub fn sys_total_memory_gb() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 345*
+*Defined at line 417*
 
 ---
 
@@ -229,13 +243,13 @@ pub fn sys_pid() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 352*
+*Defined at line 424*
 
 ---
 
 ## sys_ppid
 
-Get the parent process ID.
+Get the parent process ID (0 on Windows).
 
 ```fides
 pub fn sys_ppid() -> i64 {
@@ -243,13 +257,13 @@ pub fn sys_ppid() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 357*
+*Defined at line 429*
 
 ---
 
 ## sys_uid
 
-Get the user ID.
+Get the user ID (0 on Windows, which has none).
 
 ```fides
 pub fn sys_uid() -> i64 {
@@ -257,13 +271,13 @@ pub fn sys_uid() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 362*
+*Defined at line 434*
 
 ---
 
 ## sys_gid
 
-Get the group ID.
+Get the group ID (0 on Windows, which has none).
 
 ```fides
 pub fn sys_gid() -> i64 {
@@ -271,7 +285,7 @@ pub fn sys_gid() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 367*
+*Defined at line 439*
 
 ---
 
@@ -285,7 +299,7 @@ pub fn sys_clk_tck() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 374*
+*Defined at line 446*
 
 ---
 
@@ -299,7 +313,7 @@ pub fn sys_is_linux() -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 385*
+*Defined at line 457*
 
 ---
 
@@ -313,7 +327,7 @@ pub fn sys_is_macos() -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 390*
+*Defined at line 462*
 
 ---
 
@@ -327,7 +341,7 @@ pub fn sys_is_windows() -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 396*
+*Defined at line 468*
 
 ---
 
@@ -341,7 +355,7 @@ pub fn sys_is_64bit() -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 402*
+*Defined at line 474*
 
 ---
 
@@ -355,13 +369,15 @@ pub fn sys_is_32bit() -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 407*
+*Defined at line 479*
 
 ---
 
 ## sys_is_little_endian
 
-Check if the system is little-endian.
+Check if the system is little-endian. Every architecture fid can
+target (x86_64, aarch64, riscv64, wasm32) is little-endian, so this
+is true on all of them; kept as a function for forward compatibility.
 
 ```fides
 pub fn sys_is_little_endian() -> bool {
@@ -369,7 +385,7 @@ pub fn sys_is_little_endian() -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 416*
+*Defined at line 488*
 
 ---
 
@@ -383,7 +399,7 @@ pub fn sys_is_big_endian() -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 434*
+*Defined at line 506*
 
 ---
 
@@ -407,7 +423,7 @@ pub struct SystemInfo {
 | `pid` | `i64` |
 | `uid` | `i64` |
 
-*Defined at line 441*
+*Defined at line 513*
 
 ---
 
@@ -421,7 +437,7 @@ pub fn sys_info() -> SystemInfo {
 
 **Returns:** `SystemInfo`
 
-*Defined at line 452*
+*Defined at line 524*
 
 ---
 
@@ -439,8 +455,8 @@ pub fn sys_info_string(info: SystemInfo) -> str {
 
 **Returns:** `str`
 
-*Defined at line 459*
+*Defined at line 531*
 
 ---
 
-*Generated by [scribe](https://fides.dev) — Fides documentation generator*
+*Generated by [scribe](https://fides.dev) -- Fides documentation generator*

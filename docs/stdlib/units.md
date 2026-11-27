@@ -1,23 +1,25 @@
-# units — Fides Documentation
+[All modules](index.md)
+
+# units -- Fides Documentation
 
 ## Contents
 
-- [Meters](#meters) (struct)
-- [Kilograms](#kilograms) (struct)
-- [Seconds](#seconds) (struct)
-- [Kelvin](#kelvin) (struct)
-- [Amperes](#amperes) (struct)
-- [Moles](#moles) (struct)
-- [Candelas](#candelas) (struct)
-- [MetersPerSecond](#meterspersecond) (struct)
-- [MetersPerSecond2](#meterspersecond2) (struct)
-- [Newtons](#newtons) (struct)
-- [Joules](#joules) (struct)
-- [Watts](#watts) (struct)
-- [Pascals](#pascals) (struct)
-- [Hertz](#hertz) (struct)
-- [SquareMeters](#squaremeters) (struct)
-- [CubicMeters](#cubicmeters) (struct)
+- [Meters](#Meters) (struct)
+- [Kilograms](#Kilograms) (struct)
+- [Seconds](#Seconds) (struct)
+- [Kelvin](#Kelvin) (struct)
+- [Amperes](#Amperes) (struct)
+- [Moles](#Moles) (struct)
+- [Candelas](#Candelas) (struct)
+- [MetersPerSecond](#MetersPerSecond) (struct)
+- [MetersPerSecond2](#MetersPerSecond2) (struct)
+- [Newtons](#Newtons) (struct)
+- [Joules](#Joules) (struct)
+- [Watts](#Watts) (struct)
+- [Pascals](#Pascals) (struct)
+- [Hertz](#Hertz) (struct)
+- [SquareMeters](#SquareMeters) (struct)
+- [CubicMeters](#CubicMeters) (struct)
 - [meters](#meters) (function)
 - [kilograms](#kilograms) (function)
 - [seconds](#seconds) (function)
@@ -80,24 +82,82 @@
 - [joules_sub](#joules_sub) (function)
 - [watts_add](#watts_add) (function)
 - [watts_sub](#watts_sub) (function)
-- [SPEED_OF_LIGHT:](#speed_of_light:) (const)
-- [G_GRAVITATIONAL:](#g_gravitational:) (const)
-- [G_EARTH:](#g_earth:) (const)
-- [AVOGADRO:](#avogadro:) (const)
-- [BOLTZMANN:](#boltzmann:) (const)
-- [PLANCK:](#planck:) (const)
-- [ELEMENTARY_CHARGE:](#elementary_charge:) (const)
-- [GAS_CONSTANT:](#gas_constant:) (const)
-- [ATM_PRESSURE:](#atm_pressure:) (const)
-- [ABSOLUTE_ZERO_C:](#absolute_zero_c:) (const)
+- [kelvin_add](#kelvin_add) (function)
+- [kelvin_sub](#kelvin_sub) (function)
+- [amperes_add](#amperes_add) (function)
+- [amperes_sub](#amperes_sub) (function)
+- [moles_add](#moles_add) (function)
+- [moles_sub](#moles_sub) (function)
+- [candelas_add](#candelas_add) (function)
+- [candelas_sub](#candelas_sub) (function)
+- [mps_add](#mps_add) (function)
+- [mps_sub](#mps_sub) (function)
+- [mps2_add](#mps2_add) (function)
+- [mps2_sub](#mps2_sub) (function)
+- [pascals_add](#pascals_add) (function)
+- [pascals_sub](#pascals_sub) (function)
+- [hertz_add](#hertz_add) (function)
+- [hertz_sub](#hertz_sub) (function)
+- [m2_add](#m2_add) (function)
+- [m2_sub](#m2_sub) (function)
+- [m3_add](#m3_add) (function)
+- [m3_sub](#m3_sub) (function)
+- [meters_scale](#meters_scale) (function)
+- [meters_lt](#meters_lt) (function)
+- [meters_ratio](#meters_ratio) (function)
+- [seconds_scale](#seconds_scale) (function)
+- [seconds_lt](#seconds_lt) (function)
+- [seconds_ratio](#seconds_ratio) (function)
+- [kg_scale](#kg_scale) (function)
+- [kg_lt](#kg_lt) (function)
+- [kg_ratio](#kg_ratio) (function)
+- [newtons_scale](#newtons_scale) (function)
+- [newtons_lt](#newtons_lt) (function)
+- [newtons_ratio](#newtons_ratio) (function)
+- [joules_scale](#joules_scale) (function)
+- [joules_lt](#joules_lt) (function)
+- [joules_ratio](#joules_ratio) (function)
+- [watts_scale](#watts_scale) (function)
+- [watts_lt](#watts_lt) (function)
+- [watts_ratio](#watts_ratio) (function)
+- [travel](#travel) (function)
+- [travel_time](#travel_time) (function)
+- [mass_from_force](#mass_from_force) (function)
+- [SPEED_OF_LIGHT:](#SPEED_OF_LIGHT:) (const)
+- [G_GRAVITATIONAL:](#G_GRAVITATIONAL:) (const)
+- [G_EARTH:](#G_EARTH:) (const)
+- [AVOGADRO:](#AVOGADRO:) (const)
+- [BOLTZMANN:](#BOLTZMANN:) (const)
+- [PLANCK:](#PLANCK:) (const)
+- [ELEMENTARY_CHARGE:](#ELEMENTARY_CHARGE:) (const)
+- [GAS_CONSTANT:](#GAS_CONSTANT:) (const)
+- [ATM_PRESSURE:](#ATM_PRESSURE:) (const)
+- [ABSOLUTE_ZERO_C:](#ABSOLUTE_ZERO_C:) (const)
+- [Meters](#Meters) (impl)
+- [Seconds](#Seconds) (impl)
+- [Kilograms](#Kilograms) (impl)
+- [Newtons](#Newtons) (impl)
+- [Joules](#Joules) (impl)
+- [Watts](#Watts) (impl)
+- [Kelvin](#Kelvin) (impl)
+- [Amperes](#Amperes) (impl)
+- [Moles](#Moles) (impl)
+- [Candelas](#Candelas) (impl)
+- [MetersPerSecond](#MetersPerSecond) (impl)
+- [Pascals](#Pascals) (impl)
+- [Hertz](#Hertz) (impl)
 
 ## Meters
 
-Length in meters.
-
 ```fides
-pub struct Meters { pub value: f64 }
+pub struct Meters {
 ```
+
+**Fields:**
+
+| Name | Type |
+|------|------|
+| `value` | `f64` |
 
 *Defined at line 26*
 
@@ -105,11 +165,15 @@ pub struct Meters { pub value: f64 }
 
 ## Kilograms
 
-Mass in kilograms.
-
 ```fides
-pub struct Kilograms { pub value: f64 }
+pub struct Kilograms {
 ```
+
+**Fields:**
+
+| Name | Type |
+|------|------|
+| `value` | `f64` |
 
 *Defined at line 31*
 
@@ -117,11 +181,15 @@ pub struct Kilograms { pub value: f64 }
 
 ## Seconds
 
-Time in seconds.
-
 ```fides
-pub struct Seconds { pub value: f64 }
+pub struct Seconds {
 ```
+
+**Fields:**
+
+| Name | Type |
+|------|------|
+| `value` | `f64` |
 
 *Defined at line 36*
 
@@ -129,11 +197,15 @@ pub struct Seconds { pub value: f64 }
 
 ## Kelvin
 
-Temperature in Kelvin.
-
 ```fides
-pub struct Kelvin { pub value: f64 }
+pub struct Kelvin {
 ```
+
+**Fields:**
+
+| Name | Type |
+|------|------|
+| `value` | `f64` |
 
 *Defined at line 41*
 
@@ -141,11 +213,15 @@ pub struct Kelvin { pub value: f64 }
 
 ## Amperes
 
-Electric current in amperes.
-
 ```fides
-pub struct Amperes { pub value: f64 }
+pub struct Amperes {
 ```
+
+**Fields:**
+
+| Name | Type |
+|------|------|
+| `value` | `f64` |
 
 *Defined at line 46*
 
@@ -153,11 +229,15 @@ pub struct Amperes { pub value: f64 }
 
 ## Moles
 
-Amount of substance in moles.
-
 ```fides
-pub struct Moles { pub value: f64 }
+pub struct Moles {
 ```
+
+**Fields:**
+
+| Name | Type |
+|------|------|
+| `value` | `f64` |
 
 *Defined at line 51*
 
@@ -165,11 +245,15 @@ pub struct Moles { pub value: f64 }
 
 ## Candelas
 
-Luminous intensity in candelas.
-
 ```fides
-pub struct Candelas { pub value: f64 }
+pub struct Candelas {
 ```
+
+**Fields:**
+
+| Name | Type |
+|------|------|
+| `value` | `f64` |
 
 *Defined at line 56*
 
@@ -177,11 +261,15 @@ pub struct Candelas { pub value: f64 }
 
 ## MetersPerSecond
 
-Velocity in meters per second.
-
 ```fides
-pub struct MetersPerSecond { pub value: f64 }
+pub struct MetersPerSecond {
 ```
+
+**Fields:**
+
+| Name | Type |
+|------|------|
+| `value` | `f64` |
 
 *Defined at line 64*
 
@@ -189,11 +277,15 @@ pub struct MetersPerSecond { pub value: f64 }
 
 ## MetersPerSecond2
 
-Acceleration in meters per second squared.
-
 ```fides
-pub struct MetersPerSecond2 { pub value: f64 }
+pub struct MetersPerSecond2 {
 ```
+
+**Fields:**
+
+| Name | Type |
+|------|------|
+| `value` | `f64` |
 
 *Defined at line 69*
 
@@ -201,11 +293,15 @@ pub struct MetersPerSecond2 { pub value: f64 }
 
 ## Newtons
 
-Force in newtons (kg·m/s²).
-
 ```fides
-pub struct Newtons { pub value: f64 }
+pub struct Newtons {
 ```
+
+**Fields:**
+
+| Name | Type |
+|------|------|
+| `value` | `f64` |
 
 *Defined at line 74*
 
@@ -213,11 +309,15 @@ pub struct Newtons { pub value: f64 }
 
 ## Joules
 
-Energy in joules (N·m).
-
 ```fides
-pub struct Joules { pub value: f64 }
+pub struct Joules {
 ```
+
+**Fields:**
+
+| Name | Type |
+|------|------|
+| `value` | `f64` |
 
 *Defined at line 79*
 
@@ -225,11 +325,15 @@ pub struct Joules { pub value: f64 }
 
 ## Watts
 
-Power in watts (J/s).
-
 ```fides
-pub struct Watts { pub value: f64 }
+pub struct Watts {
 ```
+
+**Fields:**
+
+| Name | Type |
+|------|------|
+| `value` | `f64` |
 
 *Defined at line 84*
 
@@ -237,11 +341,15 @@ pub struct Watts { pub value: f64 }
 
 ## Pascals
 
-Pressure in pascals (N/m²).
-
 ```fides
-pub struct Pascals { pub value: f64 }
+pub struct Pascals {
 ```
+
+**Fields:**
+
+| Name | Type |
+|------|------|
+| `value` | `f64` |
 
 *Defined at line 89*
 
@@ -249,11 +357,15 @@ pub struct Pascals { pub value: f64 }
 
 ## Hertz
 
-Frequency in hertz (1/s).
-
 ```fides
-pub struct Hertz { pub value: f64 }
+pub struct Hertz {
 ```
+
+**Fields:**
+
+| Name | Type |
+|------|------|
+| `value` | `f64` |
 
 *Defined at line 94*
 
@@ -261,11 +373,15 @@ pub struct Hertz { pub value: f64 }
 
 ## SquareMeters
 
-Area in square meters.
-
 ```fides
-pub struct SquareMeters { pub value: f64 }
+pub struct SquareMeters {
 ```
+
+**Fields:**
+
+| Name | Type |
+|------|------|
+| `value` | `f64` |
 
 *Defined at line 99*
 
@@ -273,11 +389,15 @@ pub struct SquareMeters { pub value: f64 }
 
 ## CubicMeters
 
-Volume in cubic meters.
-
 ```fides
-pub struct CubicMeters { pub value: f64 }
+pub struct CubicMeters {
 ```
+
+**Fields:**
+
+| Name | Type |
+|------|------|
+| `value` | `f64` |
 
 *Defined at line 104*
 
@@ -285,8 +405,22 @@ pub struct CubicMeters { pub value: f64 }
 
 ## meters
 
+A length in meters.
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
 ```fides
-pub fn meters(v: f64) -> Meters { return Meters { value: v }; }
+val v: MetersPerSecond = velocity(meters(100.0), seconds(10.0));
+assert(v.value == 10.0);
+assert(travel(v, seconds(25.0)).value == 250.0);
+assert(travel_time(meters(250.0), v).value == 25.0);
+assert(meters_add(meters(1.0), meters(2.0)).value == 3.0);
+assert(kelvin_add(kelvin(273.0), kelvin(27.0)).value == 300.0);
+```
+
+```fides
+pub fn meters(v: f64) -> Meters {
 ```
 
 **Parameters:**
@@ -302,7 +436,7 @@ pub fn meters(v: f64) -> Meters { return Meters { value: v }; }
 ## kilograms
 
 ```fides
-pub fn kilograms(v: f64) -> Kilograms { return Kilograms { value: v }; }
+pub fn kilograms(v: f64) -> Kilograms {
 ```
 
 **Parameters:**
@@ -318,7 +452,7 @@ pub fn kilograms(v: f64) -> Kilograms { return Kilograms { value: v }; }
 ## seconds
 
 ```fides
-pub fn seconds(v: f64) -> Seconds { return Seconds { value: v }; }
+pub fn seconds(v: f64) -> Seconds {
 ```
 
 **Parameters:**
@@ -334,7 +468,7 @@ pub fn seconds(v: f64) -> Seconds { return Seconds { value: v }; }
 ## kelvin
 
 ```fides
-pub fn kelvin(v: f64) -> Kelvin { return Kelvin { value: v }; }
+pub fn kelvin(v: f64) -> Kelvin {
 ```
 
 **Parameters:**
@@ -350,7 +484,7 @@ pub fn kelvin(v: f64) -> Kelvin { return Kelvin { value: v }; }
 ## amperes
 
 ```fides
-pub fn amperes(v: f64) -> Amperes { return Amperes { value: v }; }
+pub fn amperes(v: f64) -> Amperes {
 ```
 
 **Parameters:**
@@ -366,7 +500,7 @@ pub fn amperes(v: f64) -> Amperes { return Amperes { value: v }; }
 ## moles
 
 ```fides
-pub fn moles(v: f64) -> Moles { return Moles { value: v }; }
+pub fn moles(v: f64) -> Moles {
 ```
 
 **Parameters:**
@@ -382,7 +516,7 @@ pub fn moles(v: f64) -> Moles { return Moles { value: v }; }
 ## candelas
 
 ```fides
-pub fn candelas(v: f64) -> Candelas { return Candelas { value: v }; }
+pub fn candelas(v: f64) -> Candelas {
 ```
 
 **Parameters:**
@@ -398,7 +532,7 @@ pub fn candelas(v: f64) -> Candelas { return Candelas { value: v }; }
 ## meters_per_second
 
 ```fides
-pub fn meters_per_second(v: f64) -> MetersPerSecond { return MetersPerSecond { value: v }; }
+pub fn meters_per_second(v: f64) -> MetersPerSecond {
 ```
 
 **Parameters:**
@@ -414,7 +548,7 @@ pub fn meters_per_second(v: f64) -> MetersPerSecond { return MetersPerSecond { v
 ## meters_per_second2
 
 ```fides
-pub fn meters_per_second2(v: f64) -> MetersPerSecond2 { return MetersPerSecond2 { value: v }; }
+pub fn meters_per_second2(v: f64) -> MetersPerSecond2 {
 ```
 
 **Parameters:**
@@ -430,7 +564,7 @@ pub fn meters_per_second2(v: f64) -> MetersPerSecond2 { return MetersPerSecond2 
 ## newtons
 
 ```fides
-pub fn newtons(v: f64) -> Newtons { return Newtons { value: v }; }
+pub fn newtons(v: f64) -> Newtons {
 ```
 
 **Parameters:**
@@ -446,7 +580,7 @@ pub fn newtons(v: f64) -> Newtons { return Newtons { value: v }; }
 ## joules
 
 ```fides
-pub fn joules(v: f64) -> Joules { return Joules { value: v }; }
+pub fn joules(v: f64) -> Joules {
 ```
 
 **Parameters:**
@@ -462,7 +596,7 @@ pub fn joules(v: f64) -> Joules { return Joules { value: v }; }
 ## watts
 
 ```fides
-pub fn watts(v: f64) -> Watts { return Watts { value: v }; }
+pub fn watts(v: f64) -> Watts {
 ```
 
 **Parameters:**
@@ -478,7 +612,7 @@ pub fn watts(v: f64) -> Watts { return Watts { value: v }; }
 ## pascals
 
 ```fides
-pub fn pascals(v: f64) -> Pascals { return Pascals { value: v }; }
+pub fn pascals(v: f64) -> Pascals {
 ```
 
 **Parameters:**
@@ -494,7 +628,7 @@ pub fn pascals(v: f64) -> Pascals { return Pascals { value: v }; }
 ## hertz
 
 ```fides
-pub fn hertz(v: f64) -> Hertz { return Hertz { value: v }; }
+pub fn hertz(v: f64) -> Hertz {
 ```
 
 **Parameters:**
@@ -510,7 +644,7 @@ pub fn hertz(v: f64) -> Hertz { return Hertz { value: v }; }
 ## square_meters
 
 ```fides
-pub fn square_meters(v: f64) -> SquareMeters { return SquareMeters { value: v }; }
+pub fn square_meters(v: f64) -> SquareMeters {
 ```
 
 **Parameters:**
@@ -526,7 +660,7 @@ pub fn square_meters(v: f64) -> SquareMeters { return SquareMeters { value: v };
 ## cubic_meters
 
 ```fides
-pub fn cubic_meters(v: f64) -> CubicMeters { return CubicMeters { value: v }; }
+pub fn cubic_meters(v: f64) -> CubicMeters {
 ```
 
 **Parameters:**
@@ -544,7 +678,7 @@ pub fn cubic_meters(v: f64) -> CubicMeters { return CubicMeters { value: v }; }
 Convert kilometers to meters.
 
 ```fides
-pub fn km_to_m(km: f64) -> Meters { return meters(km * 1000.0); }
+pub fn km_to_m(km: f64) -> Meters {
 ```
 
 **Parameters:**
@@ -562,7 +696,7 @@ pub fn km_to_m(km: f64) -> Meters { return meters(km * 1000.0); }
 Convert meters to kilometers.
 
 ```fides
-pub fn m_to_km(m: Meters) -> f64 { return m.value / 1000.0; }
+pub fn m_to_km(m: Meters) -> f64 {
 ```
 
 **Parameters:**
@@ -580,7 +714,7 @@ pub fn m_to_km(m: Meters) -> f64 { return m.value / 1000.0; }
 Convert centimeters to meters.
 
 ```fides
-pub fn cm_to_m(cm: f64) -> Meters { return meters(cm / 100.0); }
+pub fn cm_to_m(cm: f64) -> Meters {
 ```
 
 **Parameters:**
@@ -598,7 +732,7 @@ pub fn cm_to_m(cm: f64) -> Meters { return meters(cm / 100.0); }
 Convert meters to centimeters.
 
 ```fides
-pub fn m_to_cm(m: Meters) -> f64 { return m.value * 100.0; }
+pub fn m_to_cm(m: Meters) -> f64 {
 ```
 
 **Parameters:**
@@ -616,7 +750,7 @@ pub fn m_to_cm(m: Meters) -> f64 { return m.value * 100.0; }
 Convert millimeters to meters.
 
 ```fides
-pub fn mm_to_m(mm: f64) -> Meters { return meters(mm / 1000.0); }
+pub fn mm_to_m(mm: f64) -> Meters {
 ```
 
 **Parameters:**
@@ -634,7 +768,7 @@ pub fn mm_to_m(mm: f64) -> Meters { return meters(mm / 1000.0); }
 Convert meters to millimeters.
 
 ```fides
-pub fn m_to_mm(m: Meters) -> f64 { return m.value * 1000.0; }
+pub fn m_to_mm(m: Meters) -> f64 {
 ```
 
 **Parameters:**
@@ -652,7 +786,7 @@ pub fn m_to_mm(m: Meters) -> f64 { return m.value * 1000.0; }
 Convert miles to meters.
 
 ```fides
-pub fn miles_to_m(miles: f64) -> Meters { return meters(miles * 1609.344); }
+pub fn miles_to_m(miles: f64) -> Meters {
 ```
 
 **Parameters:**
@@ -670,7 +804,7 @@ pub fn miles_to_m(miles: f64) -> Meters { return meters(miles * 1609.344); }
 Convert meters to miles.
 
 ```fides
-pub fn m_to_miles(m: Meters) -> f64 { return m.value / 1609.344; }
+pub fn m_to_miles(m: Meters) -> f64 {
 ```
 
 **Parameters:**
@@ -688,7 +822,7 @@ pub fn m_to_miles(m: Meters) -> f64 { return m.value / 1609.344; }
 Convert feet to meters.
 
 ```fides
-pub fn feet_to_m(ft: f64) -> Meters { return meters(ft * 0.3048); }
+pub fn feet_to_m(ft: f64) -> Meters {
 ```
 
 **Parameters:**
@@ -706,7 +840,7 @@ pub fn feet_to_m(ft: f64) -> Meters { return meters(ft * 0.3048); }
 Convert meters to feet.
 
 ```fides
-pub fn m_to_feet(m: Meters) -> f64 { return m.value / 0.3048; }
+pub fn m_to_feet(m: Meters) -> f64 {
 ```
 
 **Parameters:**
@@ -724,7 +858,7 @@ pub fn m_to_feet(m: Meters) -> f64 { return m.value / 0.3048; }
 Convert inches to meters.
 
 ```fides
-pub fn inches_to_m(inch: f64) -> Meters { return meters(inch * 0.0254); }
+pub fn inches_to_m(inch: f64) -> Meters {
 ```
 
 **Parameters:**
@@ -742,7 +876,7 @@ pub fn inches_to_m(inch: f64) -> Meters { return meters(inch * 0.0254); }
 Convert meters to inches.
 
 ```fides
-pub fn m_to_inches(m: Meters) -> f64 { return m.value / 0.0254; }
+pub fn m_to_inches(m: Meters) -> f64 {
 ```
 
 **Parameters:**
@@ -760,7 +894,7 @@ pub fn m_to_inches(m: Meters) -> f64 { return m.value / 0.0254; }
 Convert grams to kilograms.
 
 ```fides
-pub fn g_to_kg(g: f64) -> Kilograms { return kilograms(g / 1000.0); }
+pub fn g_to_kg(g: f64) -> Kilograms {
 ```
 
 **Parameters:**
@@ -778,7 +912,7 @@ pub fn g_to_kg(g: f64) -> Kilograms { return kilograms(g / 1000.0); }
 Convert kilograms to grams.
 
 ```fides
-pub fn kg_to_g(kg: Kilograms) -> f64 { return kg.value * 1000.0; }
+pub fn kg_to_g(kg: Kilograms) -> f64 {
 ```
 
 **Parameters:**
@@ -796,7 +930,7 @@ pub fn kg_to_g(kg: Kilograms) -> f64 { return kg.value * 1000.0; }
 Convert pounds to kilograms.
 
 ```fides
-pub fn lb_to_kg(lb: f64) -> Kilograms { return kilograms(lb * 0.453592); }
+pub fn lb_to_kg(lb: f64) -> Kilograms {
 ```
 
 **Parameters:**
@@ -814,7 +948,7 @@ pub fn lb_to_kg(lb: f64) -> Kilograms { return kilograms(lb * 0.453592); }
 Convert kilograms to pounds.
 
 ```fides
-pub fn kg_to_lb(kg: Kilograms) -> f64 { return kg.value / 0.453592; }
+pub fn kg_to_lb(kg: Kilograms) -> f64 {
 ```
 
 **Parameters:**
@@ -832,7 +966,7 @@ pub fn kg_to_lb(kg: Kilograms) -> f64 { return kg.value / 0.453592; }
 Convert Celsius to Kelvin.
 
 ```fides
-pub fn celsius_to_kelvin(c: f64) -> Kelvin { return kelvin(c + 273.15); }
+pub fn celsius_to_kelvin(c: f64) -> Kelvin {
 ```
 
 **Parameters:**
@@ -850,7 +984,7 @@ pub fn celsius_to_kelvin(c: f64) -> Kelvin { return kelvin(c + 273.15); }
 Convert Kelvin to Celsius.
 
 ```fides
-pub fn kelvin_to_celsius(k: Kelvin) -> f64 { return k.value - 273.15; }
+pub fn kelvin_to_celsius(k: Kelvin) -> f64 {
 ```
 
 **Parameters:**
@@ -868,7 +1002,7 @@ pub fn kelvin_to_celsius(k: Kelvin) -> f64 { return k.value - 273.15; }
 Convert Fahrenheit to Kelvin.
 
 ```fides
-pub fn fahrenheit_to_kelvin(f: f64) -> Kelvin { return kelvin((f - 32.0) * 5.0 / 9.0 + 273.15); }
+pub fn fahrenheit_to_kelvin(f: f64) -> Kelvin {
 ```
 
 **Parameters:**
@@ -886,7 +1020,7 @@ pub fn fahrenheit_to_kelvin(f: f64) -> Kelvin { return kelvin((f - 32.0) * 5.0 /
 Convert Kelvin to Fahrenheit.
 
 ```fides
-pub fn kelvin_to_fahrenheit(k: Kelvin) -> f64 { return (k.value - 273.15) * 9.0 / 5.0 + 32.0; }
+pub fn kelvin_to_fahrenheit(k: Kelvin) -> f64 {
 ```
 
 **Parameters:**
@@ -904,7 +1038,7 @@ pub fn kelvin_to_fahrenheit(k: Kelvin) -> f64 { return (k.value - 273.15) * 9.0 
 Convert minutes to seconds.
 
 ```fides
-pub fn minutes_to_s(min: f64) -> Seconds { return seconds(min * 60.0); }
+pub fn minutes_to_s(min: f64) -> Seconds {
 ```
 
 **Parameters:**
@@ -922,7 +1056,7 @@ pub fn minutes_to_s(min: f64) -> Seconds { return seconds(min * 60.0); }
 Convert hours to seconds.
 
 ```fides
-pub fn hours_to_s(h: f64) -> Seconds { return seconds(h * 3600.0); }
+pub fn hours_to_s(h: f64) -> Seconds {
 ```
 
 **Parameters:**
@@ -940,7 +1074,7 @@ pub fn hours_to_s(h: f64) -> Seconds { return seconds(h * 3600.0); }
 Convert days to seconds.
 
 ```fides
-pub fn days_to_s(d: f64) -> Seconds { return seconds(d * 86400.0); }
+pub fn days_to_s(d: f64) -> Seconds {
 ```
 
 **Parameters:**
@@ -958,7 +1092,7 @@ pub fn days_to_s(d: f64) -> Seconds { return seconds(d * 86400.0); }
 Convert seconds to minutes.
 
 ```fides
-pub fn s_to_minutes(s: Seconds) -> f64 { return s.value / 60.0; }
+pub fn s_to_minutes(s: Seconds) -> f64 {
 ```
 
 **Parameters:**
@@ -976,7 +1110,7 @@ pub fn s_to_minutes(s: Seconds) -> f64 { return s.value / 60.0; }
 Convert seconds to hours.
 
 ```fides
-pub fn s_to_hours(s: Seconds) -> f64 { return s.value / 3600.0; }
+pub fn s_to_hours(s: Seconds) -> f64 {
 ```
 
 **Parameters:**
@@ -1163,7 +1297,7 @@ pub fn volume(length: Meters, width: Meters, height: Meters) -> CubicMeters {
 ## meters_add
 
 ```fides
-pub fn meters_add(a: Meters, b: Meters) -> Meters { return meters(a.value + b.value); }
+pub fn meters_add(a: Meters, b: Meters) -> Meters {
 ```
 
 **Parameters:**
@@ -1180,7 +1314,7 @@ pub fn meters_add(a: Meters, b: Meters) -> Meters { return meters(a.value + b.va
 ## meters_sub
 
 ```fides
-pub fn meters_sub(a: Meters, b: Meters) -> Meters { return meters(a.value - b.value); }
+pub fn meters_sub(a: Meters, b: Meters) -> Meters {
 ```
 
 **Parameters:**
@@ -1197,7 +1331,7 @@ pub fn meters_sub(a: Meters, b: Meters) -> Meters { return meters(a.value - b.va
 ## seconds_add
 
 ```fides
-pub fn seconds_add(a: Seconds, b: Seconds) -> Seconds { return seconds(a.value + b.value); }
+pub fn seconds_add(a: Seconds, b: Seconds) -> Seconds {
 ```
 
 **Parameters:**
@@ -1214,7 +1348,7 @@ pub fn seconds_add(a: Seconds, b: Seconds) -> Seconds { return seconds(a.value +
 ## seconds_sub
 
 ```fides
-pub fn seconds_sub(a: Seconds, b: Seconds) -> Seconds { return seconds(a.value - b.value); }
+pub fn seconds_sub(a: Seconds, b: Seconds) -> Seconds {
 ```
 
 **Parameters:**
@@ -1231,7 +1365,7 @@ pub fn seconds_sub(a: Seconds, b: Seconds) -> Seconds { return seconds(a.value -
 ## kg_add
 
 ```fides
-pub fn kg_add(a: Kilograms, b: Kilograms) -> Kilograms { return kilograms(a.value + b.value); }
+pub fn kg_add(a: Kilograms, b: Kilograms) -> Kilograms {
 ```
 
 **Parameters:**
@@ -1248,7 +1382,7 @@ pub fn kg_add(a: Kilograms, b: Kilograms) -> Kilograms { return kilograms(a.valu
 ## kg_sub
 
 ```fides
-pub fn kg_sub(a: Kilograms, b: Kilograms) -> Kilograms { return kilograms(a.value - b.value); }
+pub fn kg_sub(a: Kilograms, b: Kilograms) -> Kilograms {
 ```
 
 **Parameters:**
@@ -1265,7 +1399,7 @@ pub fn kg_sub(a: Kilograms, b: Kilograms) -> Kilograms { return kilograms(a.valu
 ## newtons_add
 
 ```fides
-pub fn newtons_add(a: Newtons, b: Newtons) -> Newtons { return newtons(a.value + b.value); }
+pub fn newtons_add(a: Newtons, b: Newtons) -> Newtons {
 ```
 
 **Parameters:**
@@ -1282,7 +1416,7 @@ pub fn newtons_add(a: Newtons, b: Newtons) -> Newtons { return newtons(a.value +
 ## newtons_sub
 
 ```fides
-pub fn newtons_sub(a: Newtons, b: Newtons) -> Newtons { return newtons(a.value - b.value); }
+pub fn newtons_sub(a: Newtons, b: Newtons) -> Newtons {
 ```
 
 **Parameters:**
@@ -1299,7 +1433,7 @@ pub fn newtons_sub(a: Newtons, b: Newtons) -> Newtons { return newtons(a.value -
 ## joules_add
 
 ```fides
-pub fn joules_add(a: Joules, b: Joules) -> Joules { return joules(a.value + b.value); }
+pub fn joules_add(a: Joules, b: Joules) -> Joules {
 ```
 
 **Parameters:**
@@ -1316,7 +1450,7 @@ pub fn joules_add(a: Joules, b: Joules) -> Joules { return joules(a.value + b.va
 ## joules_sub
 
 ```fides
-pub fn joules_sub(a: Joules, b: Joules) -> Joules { return joules(a.value - b.value); }
+pub fn joules_sub(a: Joules, b: Joules) -> Joules {
 ```
 
 **Parameters:**
@@ -1333,7 +1467,7 @@ pub fn joules_sub(a: Joules, b: Joules) -> Joules { return joules(a.value - b.va
 ## watts_add
 
 ```fides
-pub fn watts_add(a: Watts, b: Watts) -> Watts { return watts(a.value + b.value); }
+pub fn watts_add(a: Watts, b: Watts) -> Watts {
 ```
 
 **Parameters:**
@@ -1350,7 +1484,7 @@ pub fn watts_add(a: Watts, b: Watts) -> Watts { return watts(a.value + b.value);
 ## watts_sub
 
 ```fides
-pub fn watts_sub(a: Watts, b: Watts) -> Watts { return watts(a.value - b.value); }
+pub fn watts_sub(a: Watts, b: Watts) -> Watts {
 ```
 
 **Parameters:**
@@ -1361,6 +1495,709 @@ pub fn watts_sub(a: Watts, b: Watts) -> Watts { return watts(a.value - b.value);
 **Returns:** `Watts`
 
 *Defined at line 412*
+
+---
+
+## kelvin_add
+
+```fides
+pub fn kelvin_add(a: Kelvin, b: Kelvin) -> Kelvin {
+```
+
+**Parameters:**
+
+- `a`: `Kelvin`
+- `b`: `Kelvin`
+
+**Returns:** `Kelvin`
+
+*Defined at line 417*
+
+---
+
+## kelvin_sub
+
+```fides
+pub fn kelvin_sub(a: Kelvin, b: Kelvin) -> Kelvin {
+```
+
+**Parameters:**
+
+- `a`: `Kelvin`
+- `b`: `Kelvin`
+
+**Returns:** `Kelvin`
+
+*Defined at line 420*
+
+---
+
+## amperes_add
+
+```fides
+pub fn amperes_add(a: Amperes, b: Amperes) -> Amperes {
+```
+
+**Parameters:**
+
+- `a`: `Amperes`
+- `b`: `Amperes`
+
+**Returns:** `Amperes`
+
+*Defined at line 423*
+
+---
+
+## amperes_sub
+
+```fides
+pub fn amperes_sub(a: Amperes, b: Amperes) -> Amperes {
+```
+
+**Parameters:**
+
+- `a`: `Amperes`
+- `b`: `Amperes`
+
+**Returns:** `Amperes`
+
+*Defined at line 426*
+
+---
+
+## moles_add
+
+```fides
+pub fn moles_add(a: Moles, b: Moles) -> Moles {
+```
+
+**Parameters:**
+
+- `a`: `Moles`
+- `b`: `Moles`
+
+**Returns:** `Moles`
+
+*Defined at line 429*
+
+---
+
+## moles_sub
+
+```fides
+pub fn moles_sub(a: Moles, b: Moles) -> Moles {
+```
+
+**Parameters:**
+
+- `a`: `Moles`
+- `b`: `Moles`
+
+**Returns:** `Moles`
+
+*Defined at line 432*
+
+---
+
+## candelas_add
+
+```fides
+pub fn candelas_add(a: Candelas, b: Candelas) -> Candelas {
+```
+
+**Parameters:**
+
+- `a`: `Candelas`
+- `b`: `Candelas`
+
+**Returns:** `Candelas`
+
+*Defined at line 435*
+
+---
+
+## candelas_sub
+
+```fides
+pub fn candelas_sub(a: Candelas, b: Candelas) -> Candelas {
+```
+
+**Parameters:**
+
+- `a`: `Candelas`
+- `b`: `Candelas`
+
+**Returns:** `Candelas`
+
+*Defined at line 438*
+
+---
+
+## mps_add
+
+```fides
+pub fn mps_add(a: MetersPerSecond, b: MetersPerSecond) -> MetersPerSecond {
+```
+
+**Parameters:**
+
+- `a`: `MetersPerSecond`
+- `b`: `MetersPerSecond`
+
+**Returns:** `MetersPerSecond`
+
+*Defined at line 441*
+
+---
+
+## mps_sub
+
+```fides
+pub fn mps_sub(a: MetersPerSecond, b: MetersPerSecond) -> MetersPerSecond {
+```
+
+**Parameters:**
+
+- `a`: `MetersPerSecond`
+- `b`: `MetersPerSecond`
+
+**Returns:** `MetersPerSecond`
+
+*Defined at line 444*
+
+---
+
+## mps2_add
+
+```fides
+pub fn mps2_add(a: MetersPerSecond2, b: MetersPerSecond2) -> MetersPerSecond2 {
+```
+
+**Parameters:**
+
+- `a`: `MetersPerSecond2`
+- `b`: `MetersPerSecond2`
+
+**Returns:** `MetersPerSecond2`
+
+*Defined at line 447*
+
+---
+
+## mps2_sub
+
+```fides
+pub fn mps2_sub(a: MetersPerSecond2, b: MetersPerSecond2) -> MetersPerSecond2 {
+```
+
+**Parameters:**
+
+- `a`: `MetersPerSecond2`
+- `b`: `MetersPerSecond2`
+
+**Returns:** `MetersPerSecond2`
+
+*Defined at line 450*
+
+---
+
+## pascals_add
+
+```fides
+pub fn pascals_add(a: Pascals, b: Pascals) -> Pascals {
+```
+
+**Parameters:**
+
+- `a`: `Pascals`
+- `b`: `Pascals`
+
+**Returns:** `Pascals`
+
+*Defined at line 453*
+
+---
+
+## pascals_sub
+
+```fides
+pub fn pascals_sub(a: Pascals, b: Pascals) -> Pascals {
+```
+
+**Parameters:**
+
+- `a`: `Pascals`
+- `b`: `Pascals`
+
+**Returns:** `Pascals`
+
+*Defined at line 456*
+
+---
+
+## hertz_add
+
+```fides
+pub fn hertz_add(a: Hertz, b: Hertz) -> Hertz {
+```
+
+**Parameters:**
+
+- `a`: `Hertz`
+- `b`: `Hertz`
+
+**Returns:** `Hertz`
+
+*Defined at line 459*
+
+---
+
+## hertz_sub
+
+```fides
+pub fn hertz_sub(a: Hertz, b: Hertz) -> Hertz {
+```
+
+**Parameters:**
+
+- `a`: `Hertz`
+- `b`: `Hertz`
+
+**Returns:** `Hertz`
+
+*Defined at line 462*
+
+---
+
+## m2_add
+
+```fides
+pub fn m2_add(a: SquareMeters, b: SquareMeters) -> SquareMeters {
+```
+
+**Parameters:**
+
+- `a`: `SquareMeters`
+- `b`: `SquareMeters`
+
+**Returns:** `SquareMeters`
+
+*Defined at line 465*
+
+---
+
+## m2_sub
+
+```fides
+pub fn m2_sub(a: SquareMeters, b: SquareMeters) -> SquareMeters {
+```
+
+**Parameters:**
+
+- `a`: `SquareMeters`
+- `b`: `SquareMeters`
+
+**Returns:** `SquareMeters`
+
+*Defined at line 468*
+
+---
+
+## m3_add
+
+```fides
+pub fn m3_add(a: CubicMeters, b: CubicMeters) -> CubicMeters {
+```
+
+**Parameters:**
+
+- `a`: `CubicMeters`
+- `b`: `CubicMeters`
+
+**Returns:** `CubicMeters`
+
+*Defined at line 471*
+
+---
+
+## m3_sub
+
+```fides
+pub fn m3_sub(a: CubicMeters, b: CubicMeters) -> CubicMeters {
+```
+
+**Parameters:**
+
+- `a`: `CubicMeters`
+- `b`: `CubicMeters`
+
+**Returns:** `CubicMeters`
+
+*Defined at line 474*
+
+---
+
+## meters_scale
+
+```fides
+pub fn meters_scale(a: Meters, k: f64) -> Meters {
+```
+
+**Parameters:**
+
+- `a`: `Meters`
+- `k`: `f64`
+
+**Returns:** `Meters`
+
+*Defined at line 482*
+
+---
+
+## meters_lt
+
+```fides
+pub fn meters_lt(a: Meters, b: Meters) -> bool {
+```
+
+**Parameters:**
+
+- `a`: `Meters`
+- `b`: `Meters`
+
+**Returns:** `bool`
+
+*Defined at line 485*
+
+---
+
+## meters_ratio
+
+```fides
+pub fn meters_ratio(a: Meters, b: Meters) -> f64 {
+```
+
+**Parameters:**
+
+- `a`: `Meters`
+- `b`: `Meters`
+
+**Returns:** `f64`
+
+*Defined at line 488*
+
+---
+
+## seconds_scale
+
+```fides
+pub fn seconds_scale(a: Seconds, k: f64) -> Seconds {
+```
+
+**Parameters:**
+
+- `a`: `Seconds`
+- `k`: `f64`
+
+**Returns:** `Seconds`
+
+*Defined at line 491*
+
+---
+
+## seconds_lt
+
+```fides
+pub fn seconds_lt(a: Seconds, b: Seconds) -> bool {
+```
+
+**Parameters:**
+
+- `a`: `Seconds`
+- `b`: `Seconds`
+
+**Returns:** `bool`
+
+*Defined at line 494*
+
+---
+
+## seconds_ratio
+
+```fides
+pub fn seconds_ratio(a: Seconds, b: Seconds) -> f64 {
+```
+
+**Parameters:**
+
+- `a`: `Seconds`
+- `b`: `Seconds`
+
+**Returns:** `f64`
+
+*Defined at line 497*
+
+---
+
+## kg_scale
+
+```fides
+pub fn kg_scale(a: Kilograms, k: f64) -> Kilograms {
+```
+
+**Parameters:**
+
+- `a`: `Kilograms`
+- `k`: `f64`
+
+**Returns:** `Kilograms`
+
+*Defined at line 500*
+
+---
+
+## kg_lt
+
+```fides
+pub fn kg_lt(a: Kilograms, b: Kilograms) -> bool {
+```
+
+**Parameters:**
+
+- `a`: `Kilograms`
+- `b`: `Kilograms`
+
+**Returns:** `bool`
+
+*Defined at line 503*
+
+---
+
+## kg_ratio
+
+```fides
+pub fn kg_ratio(a: Kilograms, b: Kilograms) -> f64 {
+```
+
+**Parameters:**
+
+- `a`: `Kilograms`
+- `b`: `Kilograms`
+
+**Returns:** `f64`
+
+*Defined at line 506*
+
+---
+
+## newtons_scale
+
+```fides
+pub fn newtons_scale(a: Newtons, k: f64) -> Newtons {
+```
+
+**Parameters:**
+
+- `a`: `Newtons`
+- `k`: `f64`
+
+**Returns:** `Newtons`
+
+*Defined at line 509*
+
+---
+
+## newtons_lt
+
+```fides
+pub fn newtons_lt(a: Newtons, b: Newtons) -> bool {
+```
+
+**Parameters:**
+
+- `a`: `Newtons`
+- `b`: `Newtons`
+
+**Returns:** `bool`
+
+*Defined at line 512*
+
+---
+
+## newtons_ratio
+
+```fides
+pub fn newtons_ratio(a: Newtons, b: Newtons) -> f64 {
+```
+
+**Parameters:**
+
+- `a`: `Newtons`
+- `b`: `Newtons`
+
+**Returns:** `f64`
+
+*Defined at line 515*
+
+---
+
+## joules_scale
+
+```fides
+pub fn joules_scale(a: Joules, k: f64) -> Joules {
+```
+
+**Parameters:**
+
+- `a`: `Joules`
+- `k`: `f64`
+
+**Returns:** `Joules`
+
+*Defined at line 518*
+
+---
+
+## joules_lt
+
+```fides
+pub fn joules_lt(a: Joules, b: Joules) -> bool {
+```
+
+**Parameters:**
+
+- `a`: `Joules`
+- `b`: `Joules`
+
+**Returns:** `bool`
+
+*Defined at line 521*
+
+---
+
+## joules_ratio
+
+```fides
+pub fn joules_ratio(a: Joules, b: Joules) -> f64 {
+```
+
+**Parameters:**
+
+- `a`: `Joules`
+- `b`: `Joules`
+
+**Returns:** `f64`
+
+*Defined at line 524*
+
+---
+
+## watts_scale
+
+```fides
+pub fn watts_scale(a: Watts, k: f64) -> Watts {
+```
+
+**Parameters:**
+
+- `a`: `Watts`
+- `k`: `f64`
+
+**Returns:** `Watts`
+
+*Defined at line 527*
+
+---
+
+## watts_lt
+
+```fides
+pub fn watts_lt(a: Watts, b: Watts) -> bool {
+```
+
+**Parameters:**
+
+- `a`: `Watts`
+- `b`: `Watts`
+
+**Returns:** `bool`
+
+*Defined at line 530*
+
+---
+
+## watts_ratio
+
+```fides
+pub fn watts_ratio(a: Watts, b: Watts) -> f64 {
+```
+
+**Parameters:**
+
+- `a`: `Watts`
+- `b`: `Watts`
+
+**Returns:** `f64`
+
+*Defined at line 533*
+
+---
+
+## travel
+
+Distance covered at speed `v` for time `t` (d = v t).
+
+```fides
+pub fn travel(v: MetersPerSecond, t: Seconds) -> Meters {
+```
+
+**Parameters:**
+
+- `v`: `MetersPerSecond`
+- `t`: `Seconds`
+
+**Returns:** `Meters`
+
+*Defined at line 540*
+
+---
+
+## travel_time
+
+Time to cover distance `d` at speed `v` (t = d / v).
+
+```fides
+pub fn travel_time(d: Meters, v: MetersPerSecond) -> Seconds {
+```
+
+**Parameters:**
+
+- `d`: `Meters`
+- `v`: `MetersPerSecond`
+
+**Returns:** `Seconds`
+
+*Defined at line 545*
+
+---
+
+## mass_from_force
+
+Mass that force `f` gives acceleration `a` (m = F / a).
+
+```fides
+pub fn mass_from_force(f: Newtons, a: MetersPerSecond2) -> Kilograms {
+```
+
+**Parameters:**
+
+- `f`: `Newtons`
+- `a`: `MetersPerSecond2`
+
+**Returns:** `Kilograms`
+
+*Defined at line 550*
 
 ---
 
@@ -1484,4 +2321,388 @@ pub const ABSOLUTE_ZERO_C: f64 = -273.15;
 
 ---
 
-*Generated by [scribe](https://fides.dev) — Fides documentation generator*
+## Meters
+
+```fides
+impl Meters {
+```
+
+**Methods:**
+
+### add
+
+```fides
+pub fn add(self: Meters, other: Meters) -> Meters {
+```
+
+### sub
+
+```fides
+pub fn sub(self: Meters, other: Meters) -> Meters {
+```
+
+### mul
+
+```fides
+pub fn mul(self: Meters, k: f64) -> Meters {
+```
+
+### div
+
+```fides
+pub fn div(self: Meters, k: f64) -> Meters {
+```
+
+*Defined at line 581*
+
+---
+
+## Seconds
+
+```fides
+impl Seconds {
+```
+
+**Methods:**
+
+### add
+
+```fides
+pub fn add(self: Seconds, other: Seconds) -> Seconds {
+```
+
+### sub
+
+```fides
+pub fn sub(self: Seconds, other: Seconds) -> Seconds {
+```
+
+### mul
+
+```fides
+pub fn mul(self: Seconds, k: f64) -> Seconds {
+```
+
+### div
+
+```fides
+pub fn div(self: Seconds, k: f64) -> Seconds {
+```
+
+*Defined at line 596*
+
+---
+
+## Kilograms
+
+```fides
+impl Kilograms {
+```
+
+**Methods:**
+
+### add
+
+```fides
+pub fn add(self: Kilograms, other: Kilograms) -> Kilograms {
+```
+
+### sub
+
+```fides
+pub fn sub(self: Kilograms, other: Kilograms) -> Kilograms {
+```
+
+### mul
+
+```fides
+pub fn mul(self: Kilograms, k: f64) -> Kilograms {
+```
+
+### div
+
+```fides
+pub fn div(self: Kilograms, k: f64) -> Kilograms {
+```
+
+*Defined at line 611*
+
+---
+
+## Newtons
+
+```fides
+impl Newtons {
+```
+
+**Methods:**
+
+### add
+
+```fides
+pub fn add(self: Newtons, other: Newtons) -> Newtons {
+```
+
+### sub
+
+```fides
+pub fn sub(self: Newtons, other: Newtons) -> Newtons {
+```
+
+### mul
+
+```fides
+pub fn mul(self: Newtons, k: f64) -> Newtons {
+```
+
+### div
+
+```fides
+pub fn div(self: Newtons, k: f64) -> Newtons {
+```
+
+*Defined at line 626*
+
+---
+
+## Joules
+
+```fides
+impl Joules {
+```
+
+**Methods:**
+
+### add
+
+```fides
+pub fn add(self: Joules, other: Joules) -> Joules {
+```
+
+### sub
+
+```fides
+pub fn sub(self: Joules, other: Joules) -> Joules {
+```
+
+### mul
+
+```fides
+pub fn mul(self: Joules, k: f64) -> Joules {
+```
+
+### div
+
+```fides
+pub fn div(self: Joules, k: f64) -> Joules {
+```
+
+*Defined at line 641*
+
+---
+
+## Watts
+
+```fides
+impl Watts {
+```
+
+**Methods:**
+
+### add
+
+```fides
+pub fn add(self: Watts, other: Watts) -> Watts {
+```
+
+### sub
+
+```fides
+pub fn sub(self: Watts, other: Watts) -> Watts {
+```
+
+### mul
+
+```fides
+pub fn mul(self: Watts, k: f64) -> Watts {
+```
+
+### div
+
+```fides
+pub fn div(self: Watts, k: f64) -> Watts {
+```
+
+*Defined at line 656*
+
+---
+
+## Kelvin
+
+```fides
+impl Kelvin {
+```
+
+**Methods:**
+
+### add
+
+```fides
+pub fn add(self: Kelvin, other: Kelvin) -> Kelvin {
+```
+
+### sub
+
+```fides
+pub fn sub(self: Kelvin, other: Kelvin) -> Kelvin {
+```
+
+*Defined at line 671*
+
+---
+
+## Amperes
+
+```fides
+impl Amperes {
+```
+
+**Methods:**
+
+### add
+
+```fides
+pub fn add(self: Amperes, other: Amperes) -> Amperes {
+```
+
+### sub
+
+```fides
+pub fn sub(self: Amperes, other: Amperes) -> Amperes {
+```
+
+*Defined at line 680*
+
+---
+
+## Moles
+
+```fides
+impl Moles {
+```
+
+**Methods:**
+
+### add
+
+```fides
+pub fn add(self: Moles, other: Moles) -> Moles {
+```
+
+### sub
+
+```fides
+pub fn sub(self: Moles, other: Moles) -> Moles {
+```
+
+*Defined at line 689*
+
+---
+
+## Candelas
+
+```fides
+impl Candelas {
+```
+
+**Methods:**
+
+### add
+
+```fides
+pub fn add(self: Candelas, other: Candelas) -> Candelas {
+```
+
+### sub
+
+```fides
+pub fn sub(self: Candelas, other: Candelas) -> Candelas {
+```
+
+*Defined at line 698*
+
+---
+
+## MetersPerSecond
+
+```fides
+impl MetersPerSecond {
+```
+
+**Methods:**
+
+### add
+
+```fides
+pub fn add(self: MetersPerSecond, other: MetersPerSecond) -> MetersPerSecond {
+```
+
+### sub
+
+```fides
+pub fn sub(self: MetersPerSecond, other: MetersPerSecond) -> MetersPerSecond {
+```
+
+*Defined at line 707*
+
+---
+
+## Pascals
+
+```fides
+impl Pascals {
+```
+
+**Methods:**
+
+### add
+
+```fides
+pub fn add(self: Pascals, other: Pascals) -> Pascals {
+```
+
+### sub
+
+```fides
+pub fn sub(self: Pascals, other: Pascals) -> Pascals {
+```
+
+*Defined at line 716*
+
+---
+
+## Hertz
+
+```fides
+impl Hertz {
+```
+
+**Methods:**
+
+### add
+
+```fides
+pub fn add(self: Hertz, other: Hertz) -> Hertz {
+```
+
+### sub
+
+```fides
+pub fn sub(self: Hertz, other: Hertz) -> Hertz {
+```
+
+*Defined at line 725*
+
+---
+
+*Generated by [scribe](https://fides.dev) -- Fides documentation generator*

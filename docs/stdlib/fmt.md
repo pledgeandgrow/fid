@@ -1,4 +1,6 @@
-# fmt — Fides Documentation
+[All modules](index.md)
+
+# fmt -- Fides Documentation
 
 ## Contents
 
@@ -30,6 +32,13 @@
 
 Format an i64 as a decimal string.
 
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+assert_eq(fmt_int(-42), "-42");
+```
+
 ```fides
 pub fn fmt_int(n: i64) -> str {
 ```
@@ -40,13 +49,20 @@ pub fn fmt_int(n: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 21*
+*Defined at line 22*
 
 ---
 
 ## fmt_int_width
 
 Format an i64 with a minimum width, padded with spaces on the left.
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+assert_eq(fmt_int_width(42, 5), "   42");
+```
 
 ```fides
 pub fn fmt_int_width(n: i64, width: i64) -> str {
@@ -59,13 +75,20 @@ pub fn fmt_int_width(n: i64, width: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 29*
+*Defined at line 30*
 
 ---
 
 ## fmt_int_zero_pad
 
 Format an i64 with a minimum width, zero-padded on the left.
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+assert_eq(fmt_int_zero_pad(42, 5), "00042");
+```
 
 ```fides
 pub fn fmt_int_zero_pad(n: i64, width: i64) -> str {
@@ -78,13 +101,21 @@ pub fn fmt_int_zero_pad(n: i64, width: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 38*
+*Defined at line 39*
 
 ---
 
 ## fmt_int_signed
 
 Format an i64 as a signed string with a '+' for positive numbers.
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+assert_eq(fmt_int_signed(5), "+5");
+assert_eq(fmt_int_signed(-5), "-5");
+```
 
 ```fides
 pub fn fmt_int_signed(n: i64) -> str {
@@ -96,13 +127,20 @@ pub fn fmt_int_signed(n: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 48*
+*Defined at line 49*
 
 ---
 
 ## fmt_hex
 
 Format an i64 as a hex string (lowercase).
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+assert_eq(fmt_hex(48879), "beef");
+```
 
 ```fides
 pub fn fmt_hex(n: i64) -> str {
@@ -114,13 +152,20 @@ pub fn fmt_hex(n: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 59*
+*Defined at line 60*
 
 ---
 
 ## fmt_hex_prefix
 
 Format an i64 as a hex string with "0x" prefix.
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+assert_eq(fmt_hex_prefix(255), "0xff");
+```
 
 ```fides
 pub fn fmt_hex_prefix(n: i64) -> str {
@@ -132,13 +177,20 @@ pub fn fmt_hex_prefix(n: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 67*
+*Defined at line 68*
 
 ---
 
 ## fmt_hex_width
 
 Format an i64 as a hex string with minimum width (zero-padded).
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+assert_eq(fmt_hex_width(10, 4), "000a");
+```
 
 ```fides
 pub fn fmt_hex_width(n: i64, width: i64) -> str {
@@ -151,13 +203,20 @@ pub fn fmt_hex_width(n: i64, width: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 75*
+*Defined at line 76*
 
 ---
 
 ## fmt_bin
 
 Format an i64 as a binary string.
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+assert_eq(fmt_bin(10), "1010");
+```
 
 ```fides
 pub fn fmt_bin(n: i64) -> str {
@@ -169,13 +228,20 @@ pub fn fmt_bin(n: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 83*
+*Defined at line 84*
 
 ---
 
 ## fmt_bin_prefix
 
 Format an i64 as a binary string with "0b" prefix.
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+assert_eq(fmt_bin_prefix(3), "0b11");
+```
 
 ```fides
 pub fn fmt_bin_prefix(n: i64) -> str {
@@ -187,13 +253,21 @@ pub fn fmt_bin_prefix(n: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 91*
+*Defined at line 92*
 
 ---
 
 ## fmt_octal
 
 Format an i64 as an octal string.
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+assert_eq(fmt_octal(8), "10");
+assert_eq(fmt_octal(511), "777");
+```
 
 ```fides
 pub fn fmt_octal(n: i64) -> str {
@@ -205,7 +279,7 @@ pub fn fmt_octal(n: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 100*
+*Defined at line 101*
 
 ---
 
@@ -213,6 +287,16 @@ pub fn fmt_octal(n: i64) -> str {
 
 Format an f64 with a specified number of decimal places.
 fmt_float(3.14159, 2) → "3.14"
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+var s = fmt_float(3.14159, 2);
+println(s);
+assert_eq(s, "3.14");
+assert_eq(fmt_float(-1.5, 1), "-1.5");
+```
 
 ```fides
 pub fn fmt_float(f: f64, decimals: i64) -> str {
@@ -225,13 +309,20 @@ pub fn fmt_float(f: f64, decimals: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 129*
+*Defined at line 130*
 
 ---
 
 ## fmt_float_default
 
 Format an f64 with default 2 decimal places.
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+assert_eq(fmt_float_default(2.5), "2.50");
+```
 
 ```fides
 pub fn fmt_float_default(f: f64) -> str {
@@ -243,7 +334,7 @@ pub fn fmt_float_default(f: f64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 154*
+*Defined at line 155*
 
 ---
 
@@ -251,6 +342,13 @@ pub fn fmt_float_default(f: f64) -> str {
 
 Format an f64 as a percentage with specified decimals.
 fmt_percent(0.875, 1) → "87.5%"
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+assert_eq(fmt_percent(0.875, 1), "87.5%");
+```
 
 ```fides
 pub fn fmt_percent(f: f64, decimals: i64) -> str {
@@ -263,13 +361,20 @@ pub fn fmt_percent(f: f64, decimals: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 163*
+*Defined at line 164*
 
 ---
 
 ## fmt_bool
 
 Format a bool as "true" or "false".
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+assert_eq(fmt_bool(true), "true");
+```
 
 ```fides
 pub fn fmt_bool(b: bool) -> str {
@@ -281,13 +386,20 @@ pub fn fmt_bool(b: bool) -> str {
 
 **Returns:** `str`
 
-*Defined at line 173*
+*Defined at line 174*
 
 ---
 
 ## fmt_yes_no
 
 Format a bool as "yes" or "no".
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+assert_eq(fmt_yes_no(false), "no");
+```
 
 ```fides
 pub fn fmt_yes_no(b: bool) -> str {
@@ -299,13 +411,20 @@ pub fn fmt_yes_no(b: bool) -> str {
 
 **Returns:** `str`
 
-*Defined at line 181*
+*Defined at line 182*
 
 ---
 
 ## fmt_pad_left
 
-Pad a string to a minimum width, left-aligned (pad right with spaces).
+Pad a string to a minimum width with spaces on the left (right-aligned).
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+assert_eq(fmt_pad_left("ab", 4), "  ab");
+```
 
 ```fides
 pub fn fmt_pad_left(s: str, width: i64) -> str {
@@ -318,13 +437,20 @@ pub fn fmt_pad_left(s: str, width: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 194*
+*Defined at line 195*
 
 ---
 
 ## fmt_pad_right
 
 Pad a string to a minimum width, left-aligned (pad right with spaces).
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+assert_eq(fmt_pad_right("ab", 4), "ab  ");
+```
 
 ```fides
 pub fn fmt_pad_right(s: str, width: i64) -> str {
@@ -337,13 +463,20 @@ pub fn fmt_pad_right(s: str, width: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 202*
+*Defined at line 203*
 
 ---
 
 ## fmt_pad_center
 
 Pad a string to a minimum width, centered.
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+assert_eq(fmt_pad_center("ab", 6), "  ab  ");
+```
 
 ```fides
 pub fn fmt_pad_center(s: str, width: i64) -> str {
@@ -356,7 +489,7 @@ pub fn fmt_pad_center(s: str, width: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 210*
+*Defined at line 211*
 
 ---
 
@@ -364,6 +497,15 @@ pub fn fmt_pad_center(s: str, width: i64) -> str {
 
 Format an i64 with thousands separators (commas).
 fmt_commas(1234567) → "1,234,567"
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+assert_eq(fmt_commas(1234567), "1,234,567");
+assert_eq(fmt_commas(-1000), "-1,000");
+assert_eq(fmt_commas(999), "999");
+```
 
 ```fides
 pub fn fmt_commas(n: i64) -> str {
@@ -375,7 +517,7 @@ pub fn fmt_commas(n: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 223*
+*Defined at line 224*
 
 ---
 
@@ -384,6 +526,15 @@ pub fn fmt_commas(n: i64) -> str {
 Format a byte count as a human-readable size.
 fmt_bytes(1536) → "1.5 KB"
 fmt_bytes(1048576) → "1.0 MB"
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+assert_eq(fmt_bytes(1536), "1.5 KB");
+assert_eq(fmt_bytes(1048576), "1.0 MB");
+assert_eq(fmt_bytes(500), "500.0 B");
+```
 
 ```fides
 pub fn fmt_bytes(bytes: i64) -> str {
@@ -395,7 +546,7 @@ pub fn fmt_bytes(bytes: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 265*
+*Defined at line 267*
 
 ---
 
@@ -403,6 +554,15 @@ pub fn fmt_bytes(bytes: i64) -> str {
 
 Format a Vec of strings as a row in a table (pipe-separated).
 fmt_row(["Name", "Age", "City"]) → "| Name | Age | City |"
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+var cols: Vec<str> = Vec::new();
+cols.push("Name"); cols.push("Age");
+assert_eq(fmt_row(cols), "| Name | Age |");
+```
 
 ```fides
 pub fn fmt_row(cols: Vec<str>) -> str {
@@ -414,7 +574,7 @@ pub fn fmt_row(cols: Vec<str>) -> str {
 
 **Returns:** `str`
 
-*Defined at line 291*
+*Defined at line 293*
 
 ---
 
@@ -423,6 +583,15 @@ pub fn fmt_row(cols: Vec<str>) -> str {
 Format a separator line for a table with N columns of given widths.
 Each column gets its width plus 2 dashes (the cell padding of fmt_row):
 fmt_separator([3, 1]) → "+-----+---+"
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+var w: Vec<i64> = Vec::new();
+w.push(3); w.push(1);
+assert_eq(fmt_separator(w), "+-----+---+");
+```
 
 ```fides
 pub fn fmt_separator(widths: Vec<i64>) -> str {
@@ -434,7 +603,7 @@ pub fn fmt_separator(widths: Vec<i64>) -> str {
 
 **Returns:** `str`
 
-*Defined at line 311*
+*Defined at line 313*
 
 ---
 
@@ -442,6 +611,19 @@ pub fn fmt_separator(widths: Vec<i64>) -> str {
 
 Format a table row with specific column widths (cells right-aligned,
 padded on the left by fmt_pad_left).
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+var cols: Vec<str> = Vec::new();
+cols.push("a"); cols.push("bb");
+var w: Vec<i64> = Vec::new();
+w.push(3); w.push(3);
+var row = fmt_row_widths(cols, w);
+println(row);
+assert_eq(row, "|   a |  bb |");
+```
 
 ```fides
 pub fn fmt_row_widths(cols: Vec<str>, widths: Vec<i64>) -> str {
@@ -454,8 +636,8 @@ pub fn fmt_row_widths(cols: Vec<str>, widths: Vec<i64>) -> str {
 
 **Returns:** `str`
 
-*Defined at line 333*
+*Defined at line 335*
 
 ---
 
-*Generated by [scribe](https://fides.dev) — Fides documentation generator*
+*Generated by [scribe](https://fides.dev) -- Fides documentation generator*

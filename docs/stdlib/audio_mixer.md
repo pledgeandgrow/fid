@@ -1,15 +1,17 @@
-# audio_mixer — Fides Documentation
+[All modules](index.md)
+
+# audio_mixer -- Fides Documentation
 
 ## Contents
 
-- [GROUP_MASTER:](#group_master:) (const)
-- [GROUP_SFX:](#group_sfx:) (const)
-- [GROUP_MUSIC:](#group_music:) (const)
-- [GROUP_VOICE:](#group_voice:) (const)
-- [GROUP_AMBIENT:](#group_ambient:) (const)
-- [GROUP_COUNT:](#group_count:) (const)
-- [SoundEntry](#soundentry) (struct)
-- [AudioMixer](#audiomixer) (struct)
+- [GROUP_MASTER:](#GROUP_MASTER:) (const)
+- [GROUP_SFX:](#GROUP_SFX:) (const)
+- [GROUP_MUSIC:](#GROUP_MUSIC:) (const)
+- [GROUP_VOICE:](#GROUP_VOICE:) (const)
+- [GROUP_AMBIENT:](#GROUP_AMBIENT:) (const)
+- [GROUP_COUNT:](#GROUP_COUNT:) (const)
+- [SoundEntry](#SoundEntry) (struct)
+- [AudioMixer](#AudioMixer) (struct)
 - [audio_mixer_init](#audio_mixer_init) (function)
 - [audio_mixer_load](#audio_mixer_load) (function)
 - [audio_mixer_load_group](#audio_mixer_load_group) (function)
@@ -40,7 +42,7 @@
 pub const GROUP_MASTER: i64 = 0;
 ```
 
-*Defined at line 26*
+*Defined at line 28*
 
 ---
 
@@ -50,7 +52,7 @@ pub const GROUP_MASTER: i64 = 0;
 pub const GROUP_SFX: i64 = 1;
 ```
 
-*Defined at line 26*
+*Defined at line 29*
 
 ---
 
@@ -60,7 +62,7 @@ pub const GROUP_SFX: i64 = 1;
 pub const GROUP_MUSIC: i64 = 2;
 ```
 
-*Defined at line 26*
+*Defined at line 30*
 
 ---
 
@@ -70,7 +72,7 @@ pub const GROUP_MUSIC: i64 = 2;
 pub const GROUP_VOICE: i64 = 3;
 ```
 
-*Defined at line 26*
+*Defined at line 31*
 
 ---
 
@@ -80,7 +82,7 @@ pub const GROUP_VOICE: i64 = 3;
 pub const GROUP_AMBIENT: i64 = 4;
 ```
 
-*Defined at line 26*
+*Defined at line 32*
 
 ---
 
@@ -90,7 +92,7 @@ pub const GROUP_AMBIENT: i64 = 4;
 pub const GROUP_COUNT: i64 = 5;
 ```
 
-*Defined at line 26*
+*Defined at line 33*
 
 ---
 
@@ -105,12 +107,12 @@ pub struct SoundEntry {
 | Name | Type |
 |------|------|
 | `name` | `str` |
-| `handle` | `i64,        // SDL_mixer chunk handle` |
+| `handle` | `i64` |
 | `group` | `i64` |
 | `default_volume` | `f64` |
 | `loaded` | `bool` |
 
-*Defined at line 29*
+*Defined at line 36*
 
 ---
 
@@ -125,17 +127,17 @@ pub struct AudioMixer {
 | Name | Type |
 |------|------|
 | `sounds` | `Vec<SoundEntry>` |
-| `group_volumes` | `Vec<f64>,   // per-group volume (0..1)` |
+| `group_volumes` | `Vec<f64>` |
 | `master_volume` | `f64` |
 | `listener_x` | `f64` |
 | `listener_y` | `f64` |
 | `listener_z` | `f64` |
-| `max_distance` | `f64,        // distance at which sound is inaudible` |
-| `ref_distance` | `f64,        // distance at which sound is at full volume` |
-| `rolloff` | `f64,             // attenuation curve (1.0 = linear)` |
+| `max_distance` | `f64` |
+| `ref_distance` | `f64` |
+| `rolloff` | `f64` |
 | `initialized` | `bool` |
 
-*Defined at line 38*
+*Defined at line 45*
 
 ---
 
@@ -149,13 +151,23 @@ pub fn audio_mixer_init() -> void {
 
 **Returns:** `void`
 
-*Defined at line 59*
+*Defined at line 66*
 
 ---
 
 ## audio_mixer_load
 
 Load a sound file into the cache. Returns the sound index or -1 on failure.
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+assert_eq(audio_mixer_load("a.wav"), -1);
+assert_eq(audio_mixer_sound_count(), 0);
+assert_eq(audio_mixer_play(-1), -1);
+assert(GROUP_COUNT > GROUP_MUSIC);
+```
 
 ```fides
 pub fn audio_mixer_load(name: str) -> i64 {
@@ -167,7 +179,7 @@ pub fn audio_mixer_load(name: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 77*
+*Defined at line 84*
 
 ---
 
@@ -186,7 +198,7 @@ pub fn audio_mixer_load_group(name: str, group: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 105*
+*Defined at line 112*
 
 ---
 
@@ -204,7 +216,7 @@ pub fn audio_mixer_play(sound_idx: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 116*
+*Defined at line 123*
 
 ---
 
@@ -223,7 +235,7 @@ pub fn audio_mixer_play_volume(sound_idx: i64, volume: f64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 132*
+*Defined at line 139*
 
 ---
 
@@ -244,7 +256,7 @@ pub fn audio_mixer_play_3d(sound_idx: i64, sx: f64, sy: f64, sz: f64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 148*
+*Defined at line 155*
 
 ---
 
@@ -264,7 +276,7 @@ pub fn audio_mixer_play_2d(sound_idx: i64, sx: f64, sy: f64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 172*
+*Defined at line 179*
 
 ---
 
@@ -282,7 +294,7 @@ pub fn audio_mixer_distance_attenuation(distance: f64) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 177*
+*Defined at line 184*
 
 ---
 
@@ -300,7 +312,7 @@ pub fn audio_mixer_set_master_volume(vol: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 206*
+*Defined at line 213*
 
 ---
 
@@ -319,7 +331,7 @@ pub fn audio_mixer_set_group_volume(group: i64, vol: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 217*
+*Defined at line 224*
 
 ---
 
@@ -333,7 +345,7 @@ pub fn audio_mixer_master_volume() -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 231*
+*Defined at line 238*
 
 ---
 
@@ -351,7 +363,7 @@ pub fn audio_mixer_group_volume(group: i64) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 236*
+*Defined at line 243*
 
 ---
 
@@ -371,7 +383,7 @@ pub fn audio_mixer_set_listener(x: f64, y: f64, z: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 244*
+*Defined at line 251*
 
 ---
 
@@ -391,7 +403,7 @@ pub fn audio_mixer_set_3d_params(ref_dist: f64, max_dist: f64, rolloff: f64) -> 
 
 **Returns:** `void`
 
-*Defined at line 251*
+*Defined at line 258*
 
 ---
 
@@ -409,7 +421,7 @@ pub fn audio_mixer_stop_group(_group: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 258*
+*Defined at line 265*
 
 ---
 
@@ -423,7 +435,7 @@ pub fn audio_mixer_stop_all() -> void {
 
 **Returns:** `void`
 
-*Defined at line 265*
+*Defined at line 272*
 
 ---
 
@@ -437,7 +449,7 @@ pub fn audio_mixer_pause_all() -> void {
 
 **Returns:** `void`
 
-*Defined at line 270*
+*Defined at line 277*
 
 ---
 
@@ -451,7 +463,7 @@ pub fn audio_mixer_resume_all() -> void {
 
 **Returns:** `void`
 
-*Defined at line 275*
+*Defined at line 282*
 
 ---
 
@@ -469,7 +481,7 @@ pub fn audio_mixer_unload(sound_idx: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 280*
+*Defined at line 287*
 
 ---
 
@@ -483,7 +495,7 @@ pub fn audio_mixer_unload_all() -> void {
 
 **Returns:** `void`
 
-*Defined at line 293*
+*Defined at line 300*
 
 ---
 
@@ -497,7 +509,7 @@ pub fn audio_mixer_sound_count() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 303*
+*Defined at line 310*
 
 ---
 
@@ -515,7 +527,7 @@ pub fn audio_mixer_is_loaded(sound_idx: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 308*
+*Defined at line 315*
 
 ---
 
@@ -529,8 +541,8 @@ pub fn audio_mixer_shutdown() -> void {
 
 **Returns:** `void`
 
-*Defined at line 316*
+*Defined at line 323*
 
 ---
 
-*Generated by [scribe](https://fides.dev) — Fides documentation generator*
+*Generated by [scribe](https://fides.dev) -- Fides documentation generator*

@@ -1,15 +1,17 @@
-# replay — Fides Documentation
+[All modules](index.md)
+
+# replay -- Fides Documentation
 
 ## Contents
 
-- [ReplayFrame](#replayframe) (struct)
-- [ReplayHeader](#replayheader) (struct)
-- [Replay](#replay) (struct)
-- [REPLAY_IDLE:](#replay_idle:) (const)
-- [REPLAY_RECORDING:](#replay_recording:) (const)
-- [REPLAY_PLAYING:](#replay_playing:) (const)
-- [REPLAY_MAGIC:](#replay_magic:) (const)
-- [REPLAY_VERSION:](#replay_version:) (const)
+- [ReplayFrame](#ReplayFrame) (struct)
+- [ReplayHeader](#ReplayHeader) (struct)
+- [Replay](#Replay) (struct)
+- [REPLAY_IDLE:](#REPLAY_IDLE:) (const)
+- [REPLAY_RECORDING:](#REPLAY_RECORDING:) (const)
+- [REPLAY_PLAYING:](#REPLAY_PLAYING:) (const)
+- [REPLAY_MAGIC:](#REPLAY_MAGIC:) (const)
+- [REPLAY_VERSION:](#REPLAY_VERSION:) (const)
 - [replay_create](#replay_create) (function)
 - [replay_start_recording](#replay_start_recording) (function)
 - [replay_record_frame](#replay_record_frame) (function)
@@ -54,7 +56,7 @@ pub struct ReplayFrame {
 | `dt_ms` | `i64` |
 | `seed` | `i64` |
 
-*Defined at line 23*
+*Defined at line 24*
 
 ---
 
@@ -76,7 +78,7 @@ pub struct ReplayHeader {
 | `game_version` | `str` |
 | `recorded_at` | `i64` |
 
-*Defined at line 37*
+*Defined at line 38*
 
 ---
 
@@ -108,7 +110,7 @@ pub struct Replay {
 | `read_pos` | `i64` |
 | `read_data` | `Vec<i64>` |
 
-*Defined at line 47*
+*Defined at line 48*
 
 ---
 
@@ -118,7 +120,7 @@ pub struct Replay {
 pub const REPLAY_IDLE: i64 = 0;
 ```
 
-*Defined at line 67*
+*Defined at line 68*
 
 ---
 
@@ -128,7 +130,7 @@ pub const REPLAY_IDLE: i64 = 0;
 pub const REPLAY_RECORDING: i64 = 1;
 ```
 
-*Defined at line 67*
+*Defined at line 69*
 
 ---
 
@@ -138,7 +140,7 @@ pub const REPLAY_RECORDING: i64 = 1;
 pub const REPLAY_PLAYING: i64 = 2;
 ```
 
-*Defined at line 67*
+*Defined at line 70*
 
 ---
 
@@ -148,7 +150,7 @@ pub const REPLAY_PLAYING: i64 = 2;
 pub const REPLAY_MAGIC: i64 = 0x46505244;
 ```
 
-*Defined at line 67*
+*Defined at line 71*
 
 ---
 
@@ -158,7 +160,7 @@ pub const REPLAY_MAGIC: i64 = 0x46505244;
 pub const REPLAY_VERSION: i64 = 1;
 ```
 
-*Defined at line 67*
+*Defined at line 72*
 
 ---
 
@@ -166,13 +168,35 @@ pub const REPLAY_VERSION: i64 = 1;
 
 Create a new replay state.
 
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+var rp = replay_create();
+assert_eq(replay_mode(&rp), REPLAY_IDLE);
+replay_start_recording(&mut rp, 42, "game", "1.0");
+var keys: Vec<i64> = Vec::new();
+keys.push(32);
+replay_record_frame(&mut rp, keys, 10, 20, 1, 16, 42);
+replay_record_frame(&mut rp, Vec::new(), 11, 21, 0, 16, 43);
+replay_stop_recording(&mut rp);
+assert_eq(replay_frame_count(&rp), 2);
+replay_start_playback(&mut rp);
+assert_eq(replay_mode(&rp), REPLAY_PLAYING);
+val f = replay_get_frame(&rp);
+assert_eq(f.key0, 32);
+assert_eq(f.mouse_x, 10);
+replay_next_frame(&mut rp);
+assert_eq(replay_get_frame(&rp).mouse_y, 21);
+```
+
 ```fides
 pub fn replay_create() -> Replay {
 ```
 
 **Returns:** `Replay`
 
-*Defined at line 87*
+*Defined at line 92*
 
 ---
 
@@ -193,7 +217,7 @@ pub fn replay_start_recording(rp: &mut Replay, seed: i64, game_name: str, game_v
 
 **Returns:** `void`
 
-*Defined at line 96*
+*Defined at line 101*
 
 ---
 
@@ -217,7 +241,7 @@ pub fn replay_record_frame(rp: &mut Replay, keys: Vec<i64>, mouse_x: i64, mouse_
 
 **Returns:** `void`
 
-*Defined at line 116*
+*Defined at line 121*
 
 ---
 
@@ -235,7 +259,7 @@ pub fn replay_stop_recording(rp: &mut Replay) -> void {
 
 **Returns:** `void`
 
-*Defined at line 156*
+*Defined at line 161*
 
 ---
 
@@ -253,7 +277,7 @@ pub fn replay_start_playback(rp: &mut Replay) -> void {
 
 **Returns:** `void`
 
-*Defined at line 161*
+*Defined at line 166*
 
 ---
 
@@ -267,7 +291,7 @@ pub fn replay_make_frame() -> ReplayFrame {
 
 **Returns:** `ReplayFrame`
 
-*Defined at line 170*
+*Defined at line 175*
 
 ---
 
@@ -286,7 +310,7 @@ pub fn replay_get_frame_into(rp: &Replay, out: &mut ReplayFrame) -> void {
 
 **Returns:** `void`
 
-*Defined at line 177*
+*Defined at line 182*
 
 ---
 
@@ -304,7 +328,7 @@ pub fn replay_get_frame(rp: &Replay) -> ReplayFrame {
 
 **Returns:** `ReplayFrame`
 
-*Defined at line 220*
+*Defined at line 225*
 
 ---
 
@@ -322,7 +346,7 @@ pub fn replay_next_frame(rp: &mut Replay) -> void {
 
 **Returns:** `void`
 
-*Defined at line 229*
+*Defined at line 234*
 
 ---
 
@@ -340,7 +364,7 @@ pub fn replay_is_finished(rp: &Replay) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 240*
+*Defined at line 245*
 
 ---
 
@@ -358,7 +382,7 @@ pub fn replay_stop_playback(rp: &mut Replay) -> void {
 
 **Returns:** `void`
 
-*Defined at line 245*
+*Defined at line 250*
 
 ---
 
@@ -376,7 +400,7 @@ pub fn replay_mode(rp: &Replay) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 250*
+*Defined at line 255*
 
 ---
 
@@ -394,7 +418,7 @@ pub fn replay_frame_count(rp: &Replay) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 255*
+*Defined at line 260*
 
 ---
 
@@ -412,7 +436,7 @@ pub fn replay_current_frame_idx(rp: &Replay) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 260*
+*Defined at line 265*
 
 ---
 
@@ -430,7 +454,7 @@ pub fn replay_start_seed(rp: &Replay) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 265*
+*Defined at line 270*
 
 ---
 
@@ -448,7 +472,7 @@ pub fn replay_progress(rp: &Replay) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 270*
+*Defined at line 275*
 
 ---
 
@@ -467,7 +491,7 @@ pub fn replay_seek(rp: &mut Replay, frame: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 278*
+*Defined at line 283*
 
 ---
 
@@ -486,7 +510,7 @@ pub fn replay_set_max_frames(rp: &mut Replay, max: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 291*
+*Defined at line 296*
 
 ---
 
@@ -505,7 +529,7 @@ pub fn replay_save(rp: &Replay, path: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 296*
+*Defined at line 301*
 
 ---
 
@@ -524,7 +548,7 @@ pub fn replay_load(rp: &mut Replay, path: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 323*
+*Defined at line 328*
 
 ---
 
@@ -542,8 +566,8 @@ pub fn replay_clear(rp: &mut Replay) -> void {
 
 **Returns:** `void`
 
-*Defined at line 397*
+*Defined at line 402*
 
 ---
 
-*Generated by [scribe](https://fides.dev) — Fides documentation generator*
+*Generated by [scribe](https://fides.dev) -- Fides documentation generator*

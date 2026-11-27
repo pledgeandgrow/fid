@@ -1,0 +1,416 @@
+# Modules
+
+- [aarch64_sys](aarch64_sys.md) (140 items) -- Fides AArch64 system architecture helpers, pure Fides.
+- [acme](acme.md) (43 items) -- Fides ACME client (RFC 8555): the directory (§7.1.1), nonces
+- [acpi](acpi.md) (19 items) -- ACPI table parsing — RSDP discovery, SDT headers, MADT and MCFG.
+- [adc](adc.md) (35 items) -- Fides ADC: raw codes to volts, oversampling, filters, calibration, IIO
+- [aes_gcm](aes_gcm.md) (7 items) -- Fides AES (FIPS 197) and AES-GCM (NIST SP 800-38D), pure Fides
+- [ahci](ahci.md) (123 items) -- ahci: the Serial ATA AHCI 1.3.1 host controller interface.
+- [alloc](alloc.md) (4 items) -- Fides Allocator standard library — Phase 10A
+- [android_ndk](android_ndk.md) (133 items) -- Fides Android NDK bindings and a native-activity event loop
+- [animation2d](animation2d.md) (19 items) -- Fides 2D Animation standard library
+- [apic](apic.md) (97 items) -- x86 interrupt controllers: Local APIC (xAPIC MMIO and x2APIC MSRs) and
+- [app_lifecycle](app_lifecycle.md) (49 items) -- Fides application lifecycle: one model for Android and iOS
+- [apriltag](apriltag.md) (15 items) -- Fides AprilTag detection (robotics / perception)
+- [arena](arena.md) (26 items) -- Fides Arena/Region Allocator standard library — Phase 15
+- [argon2](argon2.md) (10 items) -- Fides Argon2 (RFC 9106): the memory-hard password hash in its three
+- [args](args.md) (26 items) -- Fides Command-Line Arguments standard library
+- [arinc](arinc.md) (80 items) -- Fides ARINC 653 standard library
+- [asn1](asn1.md) (69 items) -- Fides ASN.1: a DER encoder and a DER/BER decoder (ITU-T X.690).
+- [asset](asset.md) (29 items) -- Fides Asset Manager standard library
+- [async](async.md) (12 items) -- Fides Async standard library
+- [atomic](atomic.md) (5 items) -- Fides atomics with memory orders (proposal 0003,
+- [audio](audio.md) (29 items) -- Fides Audio standard library — Phase 8D (S7)
+- [audio_mixer](audio_mixer.md) (31 items) -- Fides Audio Mixer standard library
+- [audit_log](audit_log.md) (12 items) -- Fides tamper-evident audit log: a hash chain of records, each hash
+- [background](background.md) (39 items) -- Fides background work: task descriptions, constraints, backoff,
+- [banking](banking.md) (30 items) -- Fides Banking standard library — Phase 7.5B
+- [banking_batch](banking_batch.md) (20 items) -- Fides banking batch processing (roadmap Phase 9: batch + COBOL interop).
+- [behavior_tree](behavior_tree.md) (64 items) -- Fides behavior trees (robotics / AI)
+- [bigint](bigint.md) (26 items) -- Fides BigInt standard library
+- [biometrics](biometrics.md) (56 items) -- Fides biometric authentication: one flow for BiometricPrompt and
+- [bitfield](bitfield.md) (63 items) -- stdlib/bitfield.fd — Bitfield / register type helpers
+- [bits](bits.md) (24 items) -- Fides Bit manipulation standard library
+- [bitset](bitset.md) (27 items) -- Fides BitSet standard library
+- [blake3](blake3.md) (8 items) -- Fides BLAKE3 (the BLAKE3 specification, 2020), pure Fides: the hash,
+- [ble](ble.md) (140 items) -- Fides Bluetooth Low Energy: advertising data, UUIDs, ATT, GATT, L2CAP, HCI
+- [bms](bms.md) (31 items) -- Fides battery management: cell models, state of charge, health, balancing
+- [bootloader](bootloader.md) (30 items) -- Fides A/B bootloader logic, pure Fides.
+- [bpe](bpe.md) (6 items) -- Byte-pair encoding (BPE) tokenizer — GPT-2 style. Loads a vocab
+- [brotli](brotli.md) (8 items) -- Fides Brotli standard library
+- [brotli_dict](brotli_dict.md) (3 items) -- The brotli static dictionary (RFC 7932 Appendix A), as data.
+- [bsdiff](bsdiff.md) (9 items) -- Fides bsdiff: binary diff and patch for small over-the-air updates
+- [buffer](buffer.md) (5 items) -- Fides Byte Buffer standard library
+- [bvh](bvh.md) (25 items) -- Fides BVH: bounding volume hierarchy over axis-aligned boxes, with
+- [cache](cache.md) (28 items) -- Fides caches: LRU, LFU and TTL, with capacity limits and stats
+- [calendar](calendar.md) (61 items) -- Fides calendars: arithmetic on days, beyond the proleptic Gregorian
+- [camera](camera.md) (27 items) -- Fides Camera standard library
+- [can](can.md) (116 items) -- Fides CAN Bus standard library
+- [cbor](cbor.md) (63 items) -- Fides CBOR (RFC 8949): Concise Binary Object Representation
+- [chacha20poly1305](chacha20poly1305.md) (12 items) -- Fides ChaCha20-Poly1305 (RFC 8439) and XChaCha20-Poly1305
+- [channel](channel.md) (7 items) -- Fides Channels — bounded MPSC (multi-producer single-consumer) queues
+- [chunk](chunk.md) (33 items) -- Fides Chunk standard library
+- [clinical](clinical.md) (20 items) -- Fides Clinical Calculations standard library
+- [coap](coap.md) (112 items) -- Fides CoAP (RFC 7252) with block-wise transfer (RFC 7959) and Observe (RFC 7641)
+- [cobol](cobol.md) (28 items) -- Fides COBOL interop: copybook records, packed and zoned decimal.
+- [collections](collections.md) (18 items) -- Fides Collections standard library
+- [collision_broad](collision_broad.md) (17 items) -- Fides Broad-Phase Collision standard library
+- [complex](complex.md) (29 items) -- Fides Complex standard library
+- [compress](compress.md) (18 items) -- Fides Compression standard library
+- [config](config.md) (15 items) -- Fides Config standard library
+- [cookie](cookie.md) (28 items) -- Fides HTTP cookies: Cookie / Set-Cookie (RFC 6265), signed values and a
+- [core](core.md) (272 items) -- Pledge core standard library — Phase 2
+- [cortex_m](cortex_m.md) (114 items) -- Fides Cortex-M system peripherals (ARMv7-M), pure Fides over a bus seam.
+- [crc](crc.md) (28 items) -- Fides CRC: table-driven cyclic redundancy checks of width 8 to 32 bits,
+- [crdt](crdt.md) (58 items) -- Fides CRDTs for offline sync
+- [crypto](crypto.md) (90 items) -- Fides Cryptography standard library
+- [crypto_bind](crypto_bind.md) (13 items) -- Fides crypto through the operating system — BCrypt (CNG) on Windows.
+- [crypto_bind_rsa](crypto_bind_rsa.md) (14 items) -- RSA keys for crypto_bind (BCrypt on Windows, libcrypto on Linux and
+- [crypto_bind](crypto_bind_unix.md) (13 items) -- Fides crypto through the system's libcrypto (OpenSSL EVP) on Linux and
+- [css](css.md) (29 items) -- Fides CSS tokenizer and parser, pure Fides
+- [csv](csv.md) (25 items) -- Fides CSV standard library
+- [d3d12](d3d12.md) (208 items) -- Fides Direct3D 12: bindings to d3d12.dll / dxgi.dll, COM method calls
+- [data](data.md) (14 items) -- Fides Data Science Library — Phase 15.3
+- [datetime](datetime.md) (48 items) -- Fides Datetime standard library
+- [db](db.md) (20 items) -- Pledge database driver framework — Phase 5D.4
+- [dds](dds.md) (78 items) -- Fides RTPS / DDS wire protocol (robotics middleware)
+- [decimal](decimal.md) (26 items) -- Fides Decimal standard library (competitive SL16)
+- [deep_link](deep_link.md) (19 items) -- Fides deep links: routing, universal links / app links files, intent filters
+- [derive_json](derive_json.md) (13 items) -- derive_json.fd -- the JSON readers behind @derive(Deserialize) (complaint
+- [dhcp](dhcp.md) (64 items) -- DHCPv4 (RFC 2131 / RFC 2132): message codec with options, the client
+- [dialogue](dialogue.md) (38 items) -- Fides dialogue standard library
+- [diff](diff.md) (7 items) -- Fides Diff standard library
+- [dlms](dlms.md) (50 items) -- Fides DLMS/COSEM standard library
+- [dma](dma.md) (63 items) -- Fides DMA building blocks, pure Fides.
+- [dnp3](dnp3.md) (73 items) -- Fides DNP3 (IEEE 1815) standard library
+- [dns](dns.md) (24 items) -- Fides DNS standard library
+- [dp](dp.md) (3 items) -- Differential Privacy stdlib — ML12
+- [dsp](dsp.md) (47 items) -- Fides digital signal processing
+- [dtls](dtls.md) (47 items) -- Fides DTLS 1.2 (RFC 6347) client and server for WebRTC: ECDHE-ECDSA
+- [dynlib](dynlib.md) (5 items) -- stdlib/dynlib.fd — load a C shared library at run time (roadmap L6C)
+- [e1000](e1000.md) (122 items) -- Intel 8254x (e1000) gigabit Ethernet driver core: register map, the
+- [ecdsa](ecdsa.md) (29 items) -- Fides elliptic-curve signatures and key agreement on the NIST prime
+- [ecs](ecs.md) (19 items) -- stdlib/ecs.fd — Entity Component System runtime (Phase 8B: F18)
+- [ecu](ecu.md) (30 items) -- Fides ECU (Electronic Control Unit) standard library
+- [ed25519](ed25519.md) (6 items) -- Fides Ed25519 signatures (RFC 8032 §5.1), pure Fides.
+- [editor](editor.md) (36 items) -- Fides Editor standard library
+- [elf](elf.md) (11 items) -- ELF64 object file parser — userspace loaders, debuggers, tools.
+- [elf_loader](elf_loader.md) (80 items) -- elf_loader: loading ELF64 executables and shared objects into a memory
+- [encoding](encoding.md) (28 items) -- Fides Encoding standard library
+- [entropy](entropy.md) (20 items) -- Fides randomness assessment over byte buffers: Shannon entropy, the
+- [env](env.md) (5 items) -- Fides Environment Variable standard library
+- [events](events.md) (10 items) -- stdlib/events.fd — Event system (Phase 8B: F20)
+- [exi](exi.md) (101 items) -- Fides EXI: W3C Efficient XML Interchange 1.0 (Second Edition), the
+- [ext4](ext4.md) (87 items) -- ext4: reading and writing ext2, ext3 and ext4 file systems (the on-disk
+- [fat32](fat32.md) (54 items) -- fat32: the FAT file system (FAT12, FAT16 and FAT32), after Microsoft's
+- [fdt](fdt.md) (14 items) -- Flattened Device Tree (FDT / .dtb) parsing — the boot handoff on
+- [file](file.md) (16 items) -- Fides File I/O standard library
+- [fixed_point](fixed_point.md) (56 items) -- Fides fixed-point arithmetic for MCUs without an FPU, pure Fides.
+- [flash](flash.md) (23 items) -- Fides internal flash model and a log-structured key-value store, pure Fides.
+- [flowfield](flowfield.md) (14 items) -- Fides Flowfield standard library — Phase 8D (S3)
+- [fmt](fmt.md) (23 items) -- Fides Formatting standard library
+- [font](font.md) (15 items) -- Fides Font standard library
+- [forecast](forecast.md) (27 items) -- Fides time-series forecasting
+- [framebuffer](framebuffer.md) (39 items) -- Linear framebuffer graphics and a text console with a built-in 8x16
+- [framing](framing.md) (19 items) -- Fides byte-stream framing: COBS and SLIP, pure Fides.
+- [fs](fs.md) (50 items) -- Fides Filesystem standard library
+- [fuzz](fuzz.md) (31 items) -- Fides fuzzing harness: coverage-guided mutation fuzzing, pure Fides
+- [game](game.md) (26 items) -- Fides Game Engine Framework — Phase 15.5
+- [gameloop](gameloop.md) (12 items) -- Fides Game Loop standard library
+- [gamepad](gamepad.md) (66 items) -- Fides gamepad: game controller support in the style of SDL's
+- [gcode](gcode.md) (22 items) -- Fides G-code library (robotics / CNC / 3D printing)
+- [geolocation](geolocation.md) (40 items) -- Fides geolocation: positions, geodesy, geohash, geofences, filtering
+- [gl](gl.md) (71 items) -- Fides OpenGL standard library
+- [gltf](gltf.md) (17 items) -- gltf.fd — glTF 2.0 asset loading (parse/layout half).
+- [goap](goap.md) (31 items) -- Fides GOAP (goal-oriented action planning) standard library
+- [gpio](gpio.md) (85 items) -- Fides GPIO: pin direction, levels, pulls, edge events with debouncing
+- [graphql](graphql.md) (40 items) -- Fides GraphQL: lexer, parser, schema SDL, executor, pure Fides
+- [grid](grid.md) (52 items) -- Fides IEC 61850 Grid standard library
+- [grpc](grpc.md) (53 items) -- Fides gRPC over HTTP/2: message framing, status and trailers, unary calls
+- [haptics](haptics.md) (44 items) -- Fides haptics: one pattern model, Android waveforms and iOS AHAP
+- [hash](hash.md) (18 items) -- Fides Hash standard library
+- [historian](historian.md) (16 items) -- Fides process historian: tags, exception reporting, swinging-door
+- [hpack](hpack.md) (33 items) -- Fides HPACK standard library
+- [hpet](hpet.md) (59 items) -- HPET (High Precision Event Timer), TSC calibration and the PIT's
+- [hpke](hpke.md) (31 items) -- Fides HPKE (RFC 9180, Hybrid Public Key Encryption) for the suite
+- [html](html.md) (29 items) -- Fides HTML building and parsing, pure Fides
+- [http](http.md) (42 items) -- Fides HTTP standard library
+- [http2](http2.md) (124 items) -- Fides HTTP/2 standard library
+- [http2_tls](http2_tls.md) (10 items) -- Fides HTTP/2 over TLS ("h2", RFC 9113 section 3.2): module `http2` over
+- [http3](http3.md) (65 items) -- Fides HTTP/3 (RFC 9114) over stdlib/quic_conn.fd, pure Fides
+- [http3_udp](http3_udp.md) (11 items) -- Fides HTTP/3 over UDP sockets: a client and a server endpoint
+- [https](https.md) (6 items) -- Fides HTTPS standard library
+- [http_client](http_client.md) (10 items) -- Fides HTTP Client standard library
+- [i18n](i18n.md) (19 items) -- Fides internationalization: message catalogs, CLDR plurals, number and
+- [i2c](i2c.md) (70 items) -- Fides I2C bus: messages, register helpers, 7/10-bit addressing, bus scan
+- [iap](iap.md) (75 items) -- Fides in-app purchases: products, transactions, the purchase state
+- [iec104](iec104.md) (56 items) -- Fides IEC 60870-5-104 standard library
+- [iec61850](iec61850.md) (27 items) -- Fides IEC 61850 standard library
+- [image](image.md) (35 items) -- Fides Image standard library
+- [imap](imap.md) (53 items) -- Fides IMAP4rev1 client (RFC 3501): commands, a response parser, FETCH
+- [imu](imu.md) (26 items) -- Fides IMU processing library (robotics / sensors)
+- [infer](infer.md) (9 items) -- Transformer inference kernels on flat f64 Vecs — what safetensors
+- [ini](ini.md) (11 items) -- Fides INI standard library
+- [initrd](initrd.md) (24 items) -- initrd: "newc" cpio archives, the Linux initramfs format
+- [input](input.md) (142 items) -- Fides Input standard library — Phase 8D (S8)
+- [io](io.md) (36 items) -- Fides IO standard library
+- [ipc](ipc.md) (52 items) -- Kernel IPC in the L4 / seL4 style: synchronous message passing through
+- [iso15118](iso15118.md) (113 items) -- Fides ISO 15118-2 / DIN SPEC 70121 standard library (high-level charging)
+- [iter](iter.md) (38 items) -- Fides Iterator standard library
+- [jni](jni.md) (116 items) -- Fides JNI (Java Native Interface) bridge
+- [jobs](jobs.md) (33 items) -- Fides background jobs: a priority queue of jobs with retries, backoff,
+- [jose](jose.md) (57 items) -- Fides JOSE: JSON Web Signature (RFC 7515, compact serialization), JSON
+- [json](json.md) (59 items) -- Fides JSON standard library
+- [jsonschema](jsonschema.md) (3 items) -- Fides JSON Schema validation (draft 2020-12 core subset), pure Fides
+- [kalman](kalman.md) (16 items) -- Fides Kalman filters (robotics / estimation)
+- [kdf](kdf.md) (17 items) -- Fides key derivation: HMAC over SHA-1, SHA-256 and SHA-512, HKDF
+- [kinematics](kinematics.md) (21 items) -- Fides serial-chain kinematics (robotics)
+- [kv_cache](kv_cache.md) (6 items) -- KV Cache stdlib — ML9
+- [lidar](lidar.md) (18 items) -- Fides 2D laser scans (robotics)
+- [base](base.md) (106 items) -- stdlib/linux_runtime/base.fd — the Fides runtime of native Linux
+- [conc](conc.md) (49 items) -- stdlib/linux_runtime/conc.fd — threads, futures, tasks, atomics,
+- [darwin](darwin.md) (7 items) -- stdlib/linux_runtime/darwin.fd — the Linux runtime on macOS (x86-64 and
+- [math](linux_runtime_math.md) (4 items) -- stdlib/linux_runtime/math.fd — exp, log and pow of native Linux
+- [sys](linux_runtime_sys.md) (140 items) -- stdlib/linux_runtime/sys.fd — files, directories, volatile memory,
+- [wasi](wasi.md) (3 items) -- stdlib/linux_runtime/wasi.fd — the Linux runtime under WASI (release F9)
+- [win](win.md) (10 items) -- stdlib/linux_runtime/win.fd — the Linux runtime on Windows x64
+- [log](log.md) (34 items) -- Fides Logging standard library
+- [log_compact](log_compact.md) (26 items) -- Fides deferred ("compact") logging, pure Fides, in the manner of defmt
+- [lorawan](lorawan.md) (63 items) -- Fides LoRaWAN 1.0.x MAC: join, keys, frames, MIC, encryption, ADR
+- [lp_solver](lp_solver.md) (24 items) -- Fides linear programming: two-phase tableau simplex and branch and bound
+- [lqr](lqr.md) (37 items) -- Fides dense matrices and discrete LQR (robotics / control)
+- [lwm2m](lwm2m.md) (65 items) -- Fides LwM2M (OMA Lightweight M2M 1.0/1.1) client core over stdlib coap
+- [markdown](markdown.md) (5 items) -- Fides Markdown standard library
+- [matchmaking](matchmaking.md) (89 items) -- Fides matchmaking: game lobbies with host migration, Elo and Glicko-2
+- [math](math.md) (42 items) -- Fides Math standard library
+- [matter](matter.md) (102 items) -- Fides Matter: TLV, data model, Interaction Model reads, setup payloads
+- [mavlink](mavlink.md) (45 items) -- Fides MAVLink library (robotics / drones)
+- [md5](md5.md) (3 items) -- Fides MD5 (RFC 1321), pure Fides. LEGACY: MD5 is broken for collision
+- [mdns](mdns.md) (35 items) -- Fides mDNS (RFC 6762) and DNS-SD (RFC 6763) messages
+- [medical](medical.md) (47 items) -- Fides Medical standard library — HL7 and FHIR
+- [memo](memo.md) (1 items) -- stdlib/memo.fd — Memoization helper
+- [mesh](mesh.md) (16 items) -- Fides Mesh standard library
+- [metal](metal.md) (108 items) -- Fides Metal: Apple Metal through the Objective-C runtime, plus helpers
+- [metrics](metrics.md) (18 items) -- metrics.fd - counters, gauges and histograms, exported in the Prometheus
+- [microgrid](microgrid.md) (21 items) -- Fides microgrid dispatch and islanding control
+- [middleware](middleware.md) (45 items) -- Fides HTTP middleware: CORS, compression, logging, request ids, rate
+- [migrate](migrate.md) (17 items) -- Fides schema migrations, pure Fides
+- [mime](mime.md) (12 items) -- Fides MIME standard library
+- [mmap](mmap.md) (17 items) -- Fides Memory Map standard library
+- [modbus](modbus.md) (43 items) -- Fides Modbus: RTU and TCP framing, the PDUs of function codes 1-6, 15,
+- [money](money.md) (12 items) -- Fides Money standard library — Phase 7.5B
+- [mongodb](mongodb.md) (112 items) -- Fides MongoDB client: BSON, OP_MSG and the CRUD commands with cursors
+- [motion](motion.md) (43 items) -- Fides device motion: accelerometer, gyroscope, magnetometer processing
+- [motor](motor.md) (57 items) -- Fides motor control library (robotics / devices)
+- [mp3](mp3.md) (27 items) -- Fides MP3 standard library
+- [mqtt](mqtt.md) (72 items) -- Fides MQTT 3.1.1 and 5.0: packet codec, topic filters, client state machine
+- [multiboot](multiboot.md) (21 items) -- Multiboot2 boot-information parsing — the tag list a Multiboot2
+- [multipart](multipart.md) (23 items) -- Fides multipart bodies: multipart/form-data and multipart/mixed, pure Fides
+- [mysql](mysql.md) (97 items) -- Fides MySQL client protocol (client/server protocol 4.1+)
+- [mysql_db](mysql_db.md) (11 items) -- MySQL results as JSON rows, and a MySQL connection (module mysql) as a
+- [navmesh](navmesh.md) (18 items) -- Fides Navigation Mesh standard library
+- [net](net.md) (66 items) -- Fides Network standard library
+- [netcode](netcode.md) (31 items) -- Fides netcode: rollback netcode for peer-to-peer games, snapshot
+- [nfc](nfc.md) (42 items) -- Fides NFC: NDEF messages and records
+- [nmea](nmea.md) (28 items) -- Fides NMEA 0183: sentence framing, checksums, GGA, RMC, GSA, GSV, VTG
+- [noise](noise.md) (5 items) -- Procedural noise — gradient (Perlin) noise, fBm fractal sums, and
+- [noise_proto](noise_proto.md) (32 items) -- Fides Noise Protocol Framework (revision 34): CipherState,
+- [nvme](nvme.md) (84 items) -- nvme: NVM Express 1.4 controllers (base specification).
+- [oauth2](oauth2.md) (33 items) -- Fides OAuth 2.0 (RFC 6749) and OpenID Connect client side: the
+- [objc](objc.md) (44 items) -- Fides Objective-C runtime bridge (iOS, macOS)
+- [occupancy_grid](occupancy_grid.md) (22 items) -- Fides occupancy grid mapping (robotics)
+- [ocpp](ocpp.md) (49 items) -- Fides OCPP-J standard library (OCPP 1.6 and 2.0.1 JSON over WebSocket)
+- [odometry](odometry.md) (27 items) -- Fides wheel odometry library (robotics)
+- [onewire](onewire.md) (71 items) -- Fides 1-Wire: reset/presence, bit timing, ROM commands, search, DS18B20
+- [opcua](opcua.md) (209 items) -- Fides OPC UA binary encoding (IEC 62541 Part 6), secure channels,
+- [openadr](openadr.md) (30 items) -- Fides OpenADR 2.0b standard library
+- [openapi](openapi.md) (21 items) -- Fides OpenAPI 3.1 documents, pure Fides
+- [os](os.md) (42 items) -- Fides OS standard library
+- [os_sandbox](os_sandbox.md) (98 items) -- Fides sandbox policy data structures and encoders, pure Fides
+- [ota](ota.md) (34 items) -- Fides OTA (Over-The-Air Update) standard library
+- [packet](packet.md) (74 items) -- Fides packet decoding and building, pure Fides
+- [parallel](parallel.md) (10 items) -- Pledge parallel operations — Phase 5C.4
+- [particles](particles.md) (11 items) -- Fides Particle System standard library
+- [particle_filter](particle_filter.md) (27 items) -- Fides particle filter (robotics / estimation)
+- [path](path.md) (18 items) -- Fides Path standard library
+- [pcap](pcap.md) (29 items) -- Fides pcap / pcapng capture files, pure Fides
+- [pci](pci.md) (19 items) -- PCI configuration space decoding. The caller supplies the 256-byte
+- [pem](pem.md) (31 items) -- Fides PEM: the textual armor of RFC 7468 (base64 between
+- [permissions](permissions.md) (48 items) -- Fides runtime permissions model for Android and iOS
+- [base](pe_runtime_base.md) (121 items) -- src/pe_runtime/base.fd — the Fides runtime of native Windows executables
+- [conc](pe_runtime_conc.md) (91 items) -- src/pe_runtime/conc.fd — threads, futures, executors, atomics, mutexes,
+- [data](pe_runtime_data.md) (19 items) -- src/pe_runtime/data.fd — text data formats of native Windows executables
+- [tensor](pe_runtime_tensor.md) (60 items) -- src/pe_runtime/tensor.fd — tensors, autograd, KV caches, quantization,
+- [physics](physics.md) (29 items) -- Fides Physics standard library — Phase 8D (S6)
+- [physics3d](physics3d.md) (24 items) -- Fides 3D Physics standard library
+- [pid](pid.md) (19 items) -- Fides PID controller (robotics / control)
+- [planner](planner.md) (45 items) -- Fides path planning (robotics)
+- [plc](plc.md) (36 items) -- Fides IEC 61131-3 PLC runtime: a Structured Text subset and ladder logic
+- [plot](plot.md) (9 items) -- Fides Plotting standard library — Phase 15.3
+- [pmm](pmm.md) (25 items) -- Physical page-frame management: a bitmap allocator over 4-KiB frames,
+- [pointcloud](pointcloud.md) (18 items) -- Fides point clouds (robotics / 3D perception)
+- [postgres](postgres.md) (69 items) -- Fides PostgreSQL driver: the frontend/backend wire protocol, version 3.0
+- [postgres_db](postgres_db.md) (1 items) -- A PostgreSQL connection (module postgres) as a `Database` (module db), so
+- [postgres_tls](postgres_tls.md) (6 items) -- Fides PostgreSQL over TLS: module `postgres` with its transport seam
+- [power](power.md) (47 items) -- Fides MCU clock tree and low-power mode model, pure Fides.
+- [power_flow](power_flow.md) (34 items) -- Fides AC and DC power flow (load flow)
+- [pqc](pqc.md) (26 items) -- Fides post-quantum KEM and signatures: ML-KEM-768 (FIPS 203, the
+- [privacy](privacy.md) (5 items) -- Stdlib module: privacy
+- [process](process.md) (36 items) -- Fides Process Control standard library
+- [procgen](procgen.md) (41 items) -- Fides procgen: procedural generation for games.
+- [profiler](profiler.md) (33 items) -- Fides Profiler standard library
+- [protobuf](protobuf.md) (33 items) -- Fides Protocol Buffers wire format (competitive SL11)
+- [ps2](ps2.md) (76 items) -- PS/2: the 8042 controller, keyboard command set and scancode sets 1
+- [push](push.md) (40 items) -- Fides push notifications: APNs and FCM
+- [pv_model](pv_model.md) (28 items) -- Fides photovoltaic modelling
+- [pwm](pwm.md) (32 items) -- Fides PWM: period and duty in nanoseconds, polarity, servos, timers
+- [qpack](qpack.md) (20 items) -- Fides QPACK (RFC 9204): field compression for HTTP/3, static table only
+- [qr](qr.md) (42 items) -- Fides QR codes (ISO/IEC 18004): encoder and decoder of module matrices
+- [quant](quant.md) (4 items) -- Quantization stdlib — Phase 5E.1 / ML10
+- [quat](quat.md) (52 items) -- Fides quaternion standard library (robotics)
+- [queue](queue.md) (2 items) -- Fides Queue standard library
+- [quic](quic.md) (47 items) -- Fides QUIC packet protection (RFC 9001 §5, QUIC version 1), pure Fides
+- [quic_conn](quic_conn.md) (61 items) -- Fides QUIC connections (RFC 9000, RFC 9001, RFC 9002), pure Fides
+- [quic_frame](quic_frame.md) (81 items) -- Fides QUIC frames and transport parameters (RFC 9000 §19, §18), pure Fides
+- [quic_tls](quic_tls.md) (43 items) -- Fides TLS 1.3 handshake for QUIC (RFC 9001 §4, RFC 8446), pure Fides
+- [quic_udp](quic_udp.md) (11 items) -- Fides QUIC over UDP sockets: a client and a server endpoint
+- [ramfs](ramfs.md) (19 items) -- ramfs: an in-memory file system implementing every vfs operation
+- [random](random.md) (19 items) -- Fides Random standard library
+- [raycast](raycast.md) (15 items) -- Fides Raycasting standard library
+- [rc](rc.md) (12 items) -- Fides Rc/Arc standard library
+- [redis](redis.md) (79 items) -- Fides Redis client: the RESP2 and RESP3 protocols, pipelining, pub/sub
+- [regex](regex.md) (21 items) -- Fides Regular Expression standard library
+- [regmap](regmap.md) (48 items) -- Fides typed register blocks (regmap), pure Fides.
+- [replay](replay.md) (29 items) -- Fides Replay system standard library
+- [result](result.md) (19 items) -- Fides Result type standard library
+- [ringbuf](ringbuf.md) (24 items) -- Fides lock-free ring buffers, pure Fides on stdlib/atomic.fd.
+- [riscv_csr](riscv_csr.md) (153 items) -- Fides RISC-V machine-level CSRs, PLIC and CLINT, pure Fides.
+- [ros2_msg](ros2_msg.md) (109 items) -- Fides ROS 2 messages and CDR serialization (robotics middleware)
+- [router](router.md) (30 items) -- Fides HTTP router: path patterns, parameters, wildcards, groups, 404/405
+- [rsa](rsa.md) (51 items) -- Fides RSA (RFC 8017, PKCS #1 v2.2) on stdlib/bigint: key parsing
+- [rtc](rtc.md) (53 items) -- Fides real-time clock support, pure Fides.
+- [rtos](rtos.md) (47 items) -- Fides static-allocation RTOS core, pure Fides.
+- [safetensors](safetensors.md) (17 items) -- safetensors loader — the standard weight-file format (HuggingFace).
+- [save_game](save_game.md) (36 items) -- Fides save-game standard library
+- [scada](scada.md) (47 items) -- Fides SCADA standard library — Modbus Protocol
+- [scancode](scancode.md) (11 items) -- PS/2 set-1 scancode decoding — make/break split, shift state, and the
+- [scene](scene.md) (25 items) -- Fides Scene standard library — Phase 8D (S5)
+- [sched](sched.md) (28 items) -- Scheduler policies for a kernel: round robin with time slices, fixed
+- [sdcard](sdcard.md) (26 items) -- Fides SD card over SPI, pure Fides with the SPI byte exchange as seam.
+- [sdl](sdl.md) (112 items) -- Fides SDL2 standard library
+- [sdl2_h](sdl2_h.md) (1415 items) -- Generated by `fid parse-header` from SDL.h and the 60 headers it includes.
+- [secrets](secrets.md) (21 items) -- Fides secret storage: an encrypted file vault, pure Fides crypto
+- [secure_store](secure_store.md) (56 items) -- Fides secure storage: Android Keystore, iOS Keychain, encrypted file
+- [semihosting](semihosting.md) (69 items) -- Fides ARM semihosting, pure Fides with the trap behind a seam.
+- [semver](semver.md) (14 items) -- Fides Semantic Versioning standard library
+- [senml](senml.md) (48 items) -- Fides SenML (RFC 8428): Sensor Measurement Lists in JSON and CBOR
+- [sensor_drivers](sensor_drivers.md) (118 items) -- Fides sensor drivers over I2C / SPI: BME280, MPU6050, VL53L0X, SHT3x,
+- [serialize](serialize.md) (46 items) -- Fides Serialization standard library
+- [set](set.md) (14 items) -- set.fd — HashSet: a set of unique strings backed by HashMap<str, i64>.
+- [sha512](sha512.md) (5 items) -- Fides SHA-512 (FIPS 180-4 §6.4), pure Fides.
+- [shader](shader.md) (44 items) -- Fides Shader standard library
+- [shape](shape.md) (15 items) -- Pledge comptime tensor shape verification — Phase 5C.3
+- [shard](shard.md) (9 items) -- Tensor Parallelism stdlib — ML13
+- [share](share.md) (46 items) -- Fides share sheet: one share request for Android and iOS
+- [sigmatch](sigmatch.md) (13 items) -- Fides signature matching: YARA-like rules over byte buffers, pure Fides
+- [signal](signal.md) (20 items) -- Fides Signal standard library
+- [simd](simd.md) (19 items) -- Pledge SIMD standard library — Phase 5C.2
+- [skel](skel.md) (22 items) -- Fides Skeletal Animation standard library
+- [slab](slab.md) (6 items) -- Slab allocator — fixed-size object allocation without per-object
+- [smp](smp.md) (54 items) -- SMP bring-up on x86: application processor startup (INIT-SIPI-SIPI),
+- [smtp](smtp.md) (32 items) -- Fides SMTP client and RFC 5322 / MIME message builder
+- [sort](sort.md) (17 items) -- Fides Sort standard library
+- [spatial_audio](spatial_audio.md) (39 items) -- Fides spatial audio standard library
+- [spi](spi.md) (71 items) -- Fides SPI: full-duplex transfers, modes 0-3, bits per word, chip select
+- [sprite](sprite.md) (36 items) -- Fides Sprite standard library — Phase 8D (S2)
+- [sqlite](sqlite.md) (5 items) -- SQLite FFI bindings for Fides
+- [sqlite3_h](sqlite3_h.md) (530 items) -- Generated by `fid parse-header` from sqlite3.h.
+- [sql_builder](sql_builder.md) (56 items) -- Fides SQL query builder, pure Fides
+- [srtp](srtp.md) (32 items) -- Fides SRTP and SRTCP (RFC 3711) with the DTLS-SRTP profiles of RFC 5764
+- [sse](sse.md) (13 items) -- Fides Server-Sent Events: encoding and a streaming parser, pure Fides
+- [ssh](ssh.md) (103 items) -- Fides SSH 2.0 transport and its first users: the version exchange and
+- [stack](stack.md) (2 items) -- Fides Stack standard library
+- [state_machine](state_machine.md) (29 items) -- Fides hierarchical state machines (robotics / control)
+- [static_serve](static_serve.md) (16 items) -- Fides static file serving logic, pure Fides
+- [steering](steering.md) (28 items) -- Fides steering standard library
+- [storage](storage.md) (17 items) -- Fides Storage standard library — Merkle Trees and KV Storage
+- [streaming](streaming.md) (17 items) -- Fides Streaming standard library — Phase 8D (S4)
+- [string](string.md) (44 items) -- Fides String utilities standard library
+- [sunspec](sunspec.md) (29 items) -- Fides SunSpec standard library
+- [svd](svd.md) (7 items) -- Fides CMSIS-SVD reader, pure Fides.
+- [swift](swift.md) (33 items) -- Fides SWIFT Message Format standard library
+- [sync](sync.md) (42 items) -- Fides Concurrency standard library
+- [synchrophasor](synchrophasor.md) (53 items) -- Fides synchrophasors: IEEE C37.118.2 frames and phasor estimation
+- [sys](sys.md) (30 items) -- Fides System standard library
+- [syscall_abi](syscall_abi.md) (81 items) -- Linux system call ABI for x86-64, AArch64 and RISC-V 64: numbers,
+- [tar](tar.md) (33 items) -- tar: POSIX ustar archives (IEEE Std 1003.1 "pax" interchange format).
+- [tariff](tariff.md) (30 items) -- Fides electricity tariffs and bill computation
+- [task](task.md) (33 items) -- Fides Tasks standard library
+- [tcpip](tcpip.md) (68 items) -- A small TCP/IP stack independent of any OS: Ethernet, ARP, IPv4 with
+- [template](template.md) (6 items) -- Fides Template Engine — Phase 15.2
+- [tensor](tensor.md) (27 items) -- Pledge Tensor standard library — Phase 5C.1
+- [term](term.md) (59 items) -- Fides Terminal standard library
+- [terrain](terrain.md) (18 items) -- Fides Terrain standard library
+- [test](test.md) (46 items) -- Fides Test utilities standard library
+- [thermal](thermal.md) (34 items) -- Fides building heat transfer and psychrometrics
+- [tiled](tiled.md) (21 items) -- tiled.fd — Tiled map loading (https://www.mapeditor.org).
+- [tilemap](tilemap.md) (31 items) -- Fides Tilemap standard library — Phase 8D (S1)
+- [time](time.md) (33 items) -- Fides LogicalTime standard library — Phase 7.5A (F43)
+- [timeline](timeline.md) (23 items) -- Fides timeline standard library
+- [timeseries](timeseries.md) (28 items) -- Fides time series: ring storage, downsampling, Gorilla compression
+- [tls13](tls13.md) (18 items) -- Fides TLS 1.3 key schedule (RFC 8446 §7.1, §7.3, §4.4.4)
+- [tlsf](tlsf.md) (26 items) -- Fides TLSF allocator (Two-Level Segregated Fit, Masmano et al. 2004), pure Fides.
+- [tls_alpn](tls_alpn.md) (5 items) -- Fides ALPN (RFC 7301): the protocol names a TLS client offers and the
+- [tls_crypto](tls_crypto.md) (9 items) -- Fides TLS cryptography primitives
+- [tls_record](tls_record.md) (31 items) -- Fides TLS 1.3 record layer (RFC 8446 §5)
+- [tls](tls.md) (21 items) -- Fides TLS on Linux and macOS, through OpenSSL (it needs libssl and its
+- [tls](tls_windows.md) (22 items) -- Fides TLS on Windows, through Schannel (the system's TLS). `use tls` picks this
+- [toml](toml.md) (26 items) -- Fides TOML standard library
+- [totp](totp.md) (13 items) -- Fides one-time passwords: HOTP (RFC 4226) and TOTP (RFC 6238) with
+- [touch](touch.md) (31 items) -- Fides Touch Input standard library
+- [trace](trace.md) (12 items) -- Fides tracing standard library (complaint CO2)
+- [trajectory](trajectory.md) (22 items) -- Fides trajectory generation (robotics / motion control)
+- [transform3d](transform3d.md) (31 items) -- Fides 3D rigid transforms and a frame tree (robotics)
+- [tween](tween.md) (62 items) -- Fides tween standard library
+- [typed_strings](typed_strings.md) (23 items) -- Fides Typed Strings standard library — F67
+- [tz](tz.md) (19 items) -- Fides Time Zone standard library (competitive SL8)
+- [uart](uart.md) (17 items) -- 16550 UART register model — the first serial driver every kernel
+- [udp](udp.md) (24 items) -- Fides UDP sockets over IPv4 and IPv6, on every backend
+- [ui](ui.md) (13 items) -- Fides UI standard library
+- [unicode](unicode.md) (20 items) -- Fides Unicode standard library
+- [unicode_data](unicode_data.md) (20 items) -- Generated from Python unicodedata (Unicode 16) — do not hand-edit.
+- [units](units.md) (142 items) -- Fides Units of Measurement standard library
+- [unix_socket](unix_socket.md) (5 items) -- Fides Unix domain sockets (roadmap L4B `UnixStream`): stream sockets
+- [url](url.md) (15 items) -- Fides URL standard library
+- [usb_device](usb_device.md) (58 items) -- Fides USB device stack core: descriptors, chapter-9 requests and CDC-ACM, pure Fides.
+- [usb_hid](usb_hid.md) (65 items) -- USB HID: report descriptor parser, report field extraction, and the
+- [utility_ai](utility_ai.md) (25 items) -- Fides utility AI standard library
+- [uuid](uuid.md) (20 items) -- Fides UUID standard library
+- [vec](vec.md) (17 items) -- Fides Vec standard library
+- [vfs](vfs.md) (102 items) -- vfs: a virtual file system layer, and the block device seam the disk
+- [virtio](virtio.md) (18 items) -- virtio split virtqueue layout and bookkeeping (spec §2.6+).
+- [vision](vision.md) (51 items) -- Fides computer vision library (robotics / perception)
+- [vmm](vmm.md) (62 items) -- Virtual memory: page tables for x86-64 (4-level), AArch64 (stage 1,
+- [volatile](volatile.md) (12 items) -- stdlib/volatile.fd — Volatile<T> wrapper for MMIO
+- [vorbis](vorbis.md) (33 items) -- Fides Ogg + Vorbis standard library
+- [voxel_mesh](voxel_mesh.md) (24 items) -- Fides voxel meshing: turns a voxel chunk into triangle meshes three
+- [vulkan](vulkan.md) (230 items) -- Fides Vulkan: Vulkan 1.3 core bindings plus helpers that need no GPU.
+- [watchdog](watchdog.md) (30 items) -- Fides watchdog timer models, pure Fides.
+- [wav](wav.md) (18 items) -- Fides WAV standard library
+- [webgpu](webgpu.md) (52 items) -- Fides WebGPU: webgpu.h bindings (wgpu-native or Dawn) plus a WGSL helper
+- [webrtc](webrtc.md) (91 items) -- Fides WebRTC: SDP, ICE, STUN, and a peer connection over DTLS-SRTP
+- [webview](webview.md) (30 items) -- Fides web view bridge: JSON-RPC between JavaScript and Fides
+- [wfc](wfc.md) (32 items) -- Fides wave function collapse (Gumin's WFC), simple tiled and overlapping
+- [wind_model](wind_model.md) (25 items) -- Fides wind energy modelling
+- [wireguard](wireguard.md) (50 items) -- Fides WireGuard (the WireGuard paper, Donenfeld 2017, §5-§6, and the
+- [world](world.md) (72 items) -- Fides world substitution for tests (complaint CT1): replace the file
+- [ws](ws.md) (19 items) -- Fides WebSocket standard library
+- [wss](wss.md) (5 items) -- Fides secure WebSocket standard library: wss://, module `ws` over `tls`.
+- [x25519](x25519.md) (29 items) -- Fides X25519 (RFC 7748 §5) and the field arithmetic mod p = 2^255 - 19
+- [x509](x509.md) (49 items) -- Fides X.509: certificate parsing (RFC 5280 §4.1) and path validation
+- [x86_cpu](x86_cpu.md) (95 items) -- Fides x86-64 CPU structures, pure Fides with a port I/O seam.
+- [xhci](xhci.md) (166 items) -- xHCI (USB 3 host controller): register map, TRB formats, producer
+- [xml](xml.md) (25 items) -- Fides XML standard library
+- [yaml](yaml.md) (14 items) -- Fides YAML standard library
+- [zigbee](zigbee.md) (112 items) -- Fides Zigbee: ZCL frames, attribute data types, common clusters, APS
+- [zstd](zstd.md) (13 items) -- Fides Zstandard standard library

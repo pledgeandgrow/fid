@@ -1,19 +1,21 @@
-# swift — Fides Documentation
+[All modules](index.md)
+
+# swift -- Fides Documentation
 
 ## Contents
 
-- [SWIFT_MT103:](#swift_mt103:) (const)
-- [SWIFT_MT202:](#swift_mt202:) (const)
-- [SWIFT_MT900:](#swift_mt900:) (const)
-- [SWIFT_MT910:](#swift_mt910:) (const)
-- [SWIFT_MT940:](#swift_mt940:) (const)
-- [SWIFT_MT942:](#swift_mt942:) (const)
-- [SWIFT_MT199:](#swift_mt199:) (const)
-- [SWIFT_MT299:](#swift_mt299:) (const)
-- [SWIFT_MT300:](#swift_mt300:) (const)
-- [SWIFT_MT320:](#swift_mt320:) (const)
-- [SWIFT_MT700:](#swift_mt700:) (const)
-- [SWIFT_MT760:](#swift_mt760:) (const)
+- [SWIFT_MT103:](#SWIFT_MT103:) (const)
+- [SWIFT_MT202:](#SWIFT_MT202:) (const)
+- [SWIFT_MT900:](#SWIFT_MT900:) (const)
+- [SWIFT_MT910:](#SWIFT_MT910:) (const)
+- [SWIFT_MT940:](#SWIFT_MT940:) (const)
+- [SWIFT_MT942:](#SWIFT_MT942:) (const)
+- [SWIFT_MT199:](#SWIFT_MT199:) (const)
+- [SWIFT_MT299:](#SWIFT_MT299:) (const)
+- [SWIFT_MT300:](#SWIFT_MT300:) (const)
+- [SWIFT_MT320:](#SWIFT_MT320:) (const)
+- [SWIFT_MT700:](#SWIFT_MT700:) (const)
+- [SWIFT_MT760:](#SWIFT_MT760:) (const)
 - [swift_mt_name](#swift_mt_name) (function)
 - [swift_bic_validate](#swift_bic_validate) (function)
 - [swift_bic_bank_code](#swift_bic_bank_code) (function)
@@ -24,7 +26,7 @@
 - [swift_iban_country](#swift_iban_country) (function)
 - [swift_iban_check_digits](#swift_iban_check_digits) (function)
 - [swift_iban_bban](#swift_iban_bban) (function)
-- [MT103](#mt103) (struct)
+- [MT103](#MT103) (struct)
 - [swift_mt103_new](#swift_mt103_new) (function)
 - [swift_mt103_set_ordering](#swift_mt103_set_ordering) (function)
 - [swift_mt103_set_beneficiary](#swift_mt103_set_beneficiary) (function)
@@ -39,7 +41,7 @@
 ## SWIFT_MT103:
 
 ```fides
-pub const SWIFT_MT103: i64  = 103;  // Customer Credit Transfer
+pub const SWIFT_MT103: i64 = 103;  // Customer Credit Transfer
 ```
 
 *Defined at line 25*
@@ -49,7 +51,7 @@ pub const SWIFT_MT103: i64  = 103;  // Customer Credit Transfer
 ## SWIFT_MT202:
 
 ```fides
-pub const SWIFT_MT202: i64  = 202;  // General Financial Institution Transfer
+pub const SWIFT_MT202: i64 = 202;  // General Financial Institution Transfer
 ```
 
 *Defined at line 26*
@@ -59,7 +61,7 @@ pub const SWIFT_MT202: i64  = 202;  // General Financial Institution Transfer
 ## SWIFT_MT900:
 
 ```fides
-pub const SWIFT_MT900: i64  = 900;  // Confirmation of Debit
+pub const SWIFT_MT900: i64 = 900;  // Confirmation of Debit
 ```
 
 *Defined at line 27*
@@ -69,7 +71,7 @@ pub const SWIFT_MT900: i64  = 900;  // Confirmation of Debit
 ## SWIFT_MT910:
 
 ```fides
-pub const SWIFT_MT910: i64  = 910;  // Confirmation of Credit
+pub const SWIFT_MT910: i64 = 910;  // Confirmation of Credit
 ```
 
 *Defined at line 28*
@@ -79,7 +81,7 @@ pub const SWIFT_MT910: i64  = 910;  // Confirmation of Credit
 ## SWIFT_MT940:
 
 ```fides
-pub const SWIFT_MT940: i64  = 940;  // Statement Message
+pub const SWIFT_MT940: i64 = 940;  // Statement Message
 ```
 
 *Defined at line 29*
@@ -89,7 +91,7 @@ pub const SWIFT_MT940: i64  = 940;  // Statement Message
 ## SWIFT_MT942:
 
 ```fides
-pub const SWIFT_MT942: i64  = 942;  // Interim Transaction Report
+pub const SWIFT_MT942: i64 = 942;  // Interim Transaction Report
 ```
 
 *Defined at line 30*
@@ -99,7 +101,7 @@ pub const SWIFT_MT942: i64  = 942;  // Interim Transaction Report
 ## SWIFT_MT199:
 
 ```fides
-pub const SWIFT_MT199: i64  = 199;  // Free Format Message
+pub const SWIFT_MT199: i64 = 199;  // Free Format Message
 ```
 
 *Defined at line 31*
@@ -109,7 +111,7 @@ pub const SWIFT_MT199: i64  = 199;  // Free Format Message
 ## SWIFT_MT299:
 
 ```fides
-pub const SWIFT_MT299: i64  = 299;  // Free Format Message (FIN)
+pub const SWIFT_MT299: i64 = 299;  // Free Format Message (FIN)
 ```
 
 *Defined at line 32*
@@ -119,7 +121,7 @@ pub const SWIFT_MT299: i64  = 299;  // Free Format Message (FIN)
 ## SWIFT_MT300:
 
 ```fides
-pub const SWIFT_MT300: i64  = 300;  // Foreign Exchange Confirmation
+pub const SWIFT_MT300: i64 = 300;  // Foreign Exchange Confirmation
 ```
 
 *Defined at line 33*
@@ -129,7 +131,7 @@ pub const SWIFT_MT300: i64  = 300;  // Foreign Exchange Confirmation
 ## SWIFT_MT320:
 
 ```fides
-pub const SWIFT_MT320: i64  = 320;  // Loan/Deposit Confirmation
+pub const SWIFT_MT320: i64 = 320;  // Loan/Deposit Confirmation
 ```
 
 *Defined at line 34*
@@ -139,7 +141,7 @@ pub const SWIFT_MT320: i64  = 320;  // Loan/Deposit Confirmation
 ## SWIFT_MT700:
 
 ```fides
-pub const SWIFT_MT700: i64  = 700;  // Issue of a Documentary Credit
+pub const SWIFT_MT700: i64 = 700;  // Issue of a Documentary Credit
 ```
 
 *Defined at line 35*
@@ -149,7 +151,7 @@ pub const SWIFT_MT700: i64  = 700;  // Issue of a Documentary Credit
 ## SWIFT_MT760:
 
 ```fides
-pub const SWIFT_MT760: i64  = 760;  // Guarantee
+pub const SWIFT_MT760: i64 = 760;  // Guarantee
 ```
 
 *Defined at line 36*
@@ -177,6 +179,20 @@ pub fn swift_mt_name(mt: i64) -> str {
 ## swift_bic_validate
 
 Validate a BIC code (8 or 11 characters).
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+assert(swift_bic_validate("DEUTDEFF500"));
+assert(!swift_bic_validate("DEUT"));
+assert_eq(swift_bic_bank_code("DEUTDEFF500"), "DEUT");
+assert_eq(swift_bic_country("DEUTDEFF500"), "DE");
+assert_eq(swift_bic_location("DEUTDEFF500"), "FF");
+assert_eq(swift_iban_country("DE89370400440532013000"), "DE");
+assert_eq(swift_iban_check_digits("DE89370400440532013000"), "89");
+assert_eq(swift_iban_bban("DE89370400440532013000"), "370400440532013000");
+```
 
 ```fides
 pub fn swift_bic_validate(bic: str) -> bool {
@@ -352,14 +368,14 @@ pub struct MT103 {
 | `sender_bic` | `str` |
 | `receiver_bic` | `str` |
 | `message_id` | `str` |
-| `amount` | `i64,        // in cents` |
-| `currency` | `str,      // 3-letter ISO 4217` |
+| `amount` | `i64` |
+| `currency` | `str` |
 | `ordering_customer` | `str` |
 | `beneficiary_customer` | `str` |
 | `ordering_institution` | `str` |
 | `beneficiary_institution` | `str` |
 | `remittance_info` | `str` |
-| `value_date` | `str,    // YYMMDD` |
+| `value_date` | `str,  // YYMMDD` |
 
 *Defined at line 222*
 
@@ -370,7 +386,7 @@ pub struct MT103 {
 Create a new MT103 message.
 
 ```fides
-pub fn swift_mt103_new(sender_bic: str, receiver_bic: str, amount_cents: i64,
+pub fn swift_mt103_new(sender_bic: str, receiver_bic: str, amount_cents: i64, currency: str) -> MT103 {
 ```
 
 **Parameters:**
@@ -378,6 +394,9 @@ pub fn swift_mt103_new(sender_bic: str, receiver_bic: str, amount_cents: i64,
 - `sender_bic`: `str`
 - `receiver_bic`: `str`
 - `amount_cents`: `i64`
+- `currency`: `str`
+
+**Returns:** `MT103`
 
 *Defined at line 239*
 
@@ -555,4 +574,4 @@ pub fn swift_extract_field(text: str, tag: str) -> str {
 
 ---
 
-*Generated by [scribe](https://fides.dev) — Fides documentation generator*
+*Generated by [scribe](https://fides.dev) -- Fides documentation generator*

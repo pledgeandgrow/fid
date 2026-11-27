@@ -1,12 +1,14 @@
-# chunk — Fides Documentation
+[All modules](index.md)
+
+# chunk -- Fides Documentation
 
 ## Contents
 
-- [CHUNK_SIZE_X:](#chunk_size_x:) (const)
-- [CHUNK_SIZE_Y:](#chunk_size_y:) (const)
-- [CHUNK_SIZE_Z:](#chunk_size_z:) (const)
-- [Chunk](#chunk) (struct)
-- [ChunkWorld](#chunkworld) (struct)
+- [CHUNK_SIZE_X:](#CHUNK_SIZE_X:) (const)
+- [CHUNK_SIZE_Y:](#CHUNK_SIZE_Y:) (const)
+- [CHUNK_SIZE_Z:](#CHUNK_SIZE_Z:) (const)
+- [Chunk](#Chunk) (struct)
+- [ChunkWorld](#ChunkWorld) (struct)
 - [chunk_world_create](#chunk_world_create) (function)
 - [chunk_create](#chunk_create) (function)
 - [chunk_world_to_chunk_x](#chunk_world_to_chunk_x) (function)
@@ -52,7 +54,7 @@ pub const CHUNK_SIZE_X: i64 = 16;
 pub const CHUNK_SIZE_Y: i64 = 256;
 ```
 
-*Defined at line 22*
+*Defined at line 23*
 
 ---
 
@@ -62,7 +64,7 @@ pub const CHUNK_SIZE_Y: i64 = 256;
 pub const CHUNK_SIZE_Z: i64 = 16;
 ```
 
-*Defined at line 22*
+*Defined at line 24*
 
 ---
 
@@ -76,14 +78,14 @@ pub struct Chunk {
 
 | Name | Type |
 |------|------|
-| `cx` | `i64,           // chunk X coordinate (world_x / CHUNK_SIZE_X)` |
-| `cz` | `i64,           // chunk Z coordinate` |
-| `blocks` | `Vec<i64>,  // CHUNK_SIZE_X * CHUNK_SIZE_Y * CHUNK_SIZE_Z` |
+| `cx` | `i64` |
+| `cz` | `i64` |
+| `blocks` | `Vec<i64>` |
 | `loaded` | `bool` |
-| `dirty` | `bool,        // needs remeshing` |
+| `dirty` | `bool` |
 | `vertex_count` | `i64` |
 
-*Defined at line 23*
+*Defined at line 25*
 
 ---
 
@@ -98,18 +100,32 @@ pub struct ChunkWorld {
 | Name | Type |
 |------|------|
 | `chunks` | `Vec<Chunk>` |
-| `render_distance` | `i64,  // chunks to load around player` |
+| `render_distance` | `i64` |
 | `player_cx` | `i64` |
 | `player_cz` | `i64` |
 | `max_chunks` | `i64` |
 
-*Defined at line 36*
+*Defined at line 38*
 
 ---
 
 ## chunk_world_create
 
 Create a new chunk world.
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+assert_eq(chunk_world_to_chunk_x(-1), -1);
+assert_eq(chunk_world_to_chunk_x(16), 1);
+assert_eq(chunk_world_to_local_x(-1), 15);
+var w = chunk_world_create(2);
+assert_eq(chunk_world_chunk_count(&w), 0);
+assert_eq(chunk_world_get(&w, 0, 5, 0), 0);
+assert(!chunk_world_is_loaded(&w, -1, 0));
+assert_eq(chunk_world_find(&w, 3, 3), -1);
+```
 
 ```fides
 pub fn chunk_world_create(max_chunks: i64) -> ChunkWorld {
@@ -121,7 +137,7 @@ pub fn chunk_world_create(max_chunks: i64) -> ChunkWorld {
 
 **Returns:** `ChunkWorld`
 
-*Defined at line 56*
+*Defined at line 58*
 
 ---
 
@@ -140,7 +156,7 @@ pub fn chunk_create(cx: i64, cz: i64) -> Chunk {
 
 **Returns:** `Chunk`
 
-*Defined at line 63*
+*Defined at line 65*
 
 ---
 
@@ -158,7 +174,7 @@ pub fn chunk_world_to_chunk_x(wx: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 76*
+*Defined at line 78*
 
 ---
 
@@ -174,7 +190,7 @@ pub fn chunk_world_to_chunk_z(wz: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 83*
+*Defined at line 85*
 
 ---
 
@@ -190,7 +206,7 @@ pub fn chunk_world_to_local_x(wx: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 90*
+*Defined at line 92*
 
 ---
 
@@ -206,7 +222,7 @@ pub fn chunk_world_to_local_z(wz: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 98*
+*Defined at line 100*
 
 ---
 
@@ -228,7 +244,7 @@ pub fn chunk_set_block(chunk: &mut Chunk, lx: i64, ly: i64, lz: i64, block_type:
 
 **Returns:** `void`
 
-*Defined at line 112*
+*Defined at line 114*
 
 ---
 
@@ -249,7 +265,7 @@ pub fn chunk_get_block(chunk: &Chunk, lx: i64, ly: i64, lz: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 127*
+*Defined at line 129*
 
 ---
 
@@ -269,7 +285,7 @@ pub fn chunk_world_find(world: &ChunkWorld, cx: i64, cz: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 141*
+*Defined at line 143*
 
 ---
 
@@ -291,7 +307,7 @@ pub fn chunk_world_set(world: &mut ChunkWorld, wx: i64, wy: i64, wz: i64, block_
 
 **Returns:** `void`
 
-*Defined at line 153*
+*Defined at line 155*
 
 ---
 
@@ -312,7 +328,7 @@ pub fn chunk_world_get(world: &ChunkWorld, wx: i64, wy: i64, wz: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 175*
+*Defined at line 177*
 
 ---
 
@@ -332,7 +348,7 @@ pub fn chunk_world_update(world: &mut ChunkWorld, px: i64, pz: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 189*
+*Defined at line 191*
 
 ---
 
@@ -351,7 +367,7 @@ pub fn chunk_world_set_render_distance(world: &mut ChunkWorld, distance: i64) ->
 
 **Returns:** `void`
 
-*Defined at line 235*
+*Defined at line 237*
 
 ---
 
@@ -369,7 +385,7 @@ pub fn chunk_world_chunk_count(world: &ChunkWorld) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 240*
+*Defined at line 242*
 
 ---
 
@@ -389,7 +405,7 @@ pub fn chunk_world_is_loaded(world: &ChunkWorld, cx: i64, cz: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 245*
+*Defined at line 247*
 
 ---
 
@@ -409,7 +425,7 @@ pub fn chunk_world_mark_dirty(world: &mut ChunkWorld, cx: i64, cz: i64) -> void 
 
 **Returns:** `void`
 
-*Defined at line 250*
+*Defined at line 252*
 
 ---
 
@@ -429,7 +445,7 @@ pub fn chunk_world_is_dirty(world: &ChunkWorld, cx: i64, cz: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 261*
+*Defined at line 263*
 
 ---
 
@@ -449,7 +465,7 @@ pub fn chunk_world_clear_dirty(world: &mut ChunkWorld, cx: i64, cz: i64) -> void
 
 **Returns:** `void`
 
-*Defined at line 270*
+*Defined at line 272*
 
 ---
 
@@ -467,7 +483,7 @@ pub fn chunk_block_count(chunk: &Chunk) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 281*
+*Defined at line 283*
 
 ---
 
@@ -487,7 +503,7 @@ pub fn chunk_height_at(chunk: &Chunk, lx: i64, lz: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 294*
+*Defined at line 296*
 
 ---
 
@@ -507,7 +523,7 @@ pub fn chunk_fill_flat(chunk: &mut Chunk, height: i64, block_type: i64) -> void 
 
 **Returns:** `void`
 
-*Defined at line 312*
+*Defined at line 314*
 
 ---
 
@@ -525,7 +541,7 @@ pub fn chunk_clear(chunk: &mut Chunk) -> void {
 
 **Returns:** `void`
 
-*Defined at line 329*
+*Defined at line 331*
 
 ---
 
@@ -543,7 +559,7 @@ pub fn chunk_get_cx(chunk: &Chunk) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 339*
+*Defined at line 341*
 
 ---
 
@@ -561,7 +577,7 @@ pub fn chunk_get_cz(chunk: &Chunk) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 344*
+*Defined at line 346*
 
 ---
 
@@ -579,7 +595,7 @@ pub fn chunk_total_blocks(chunk: &Chunk) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 349*
+*Defined at line 351*
 
 ---
 
@@ -597,7 +613,7 @@ pub fn chunk_world_origin_x(chunk: &Chunk) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 354*
+*Defined at line 356*
 
 ---
 
@@ -613,7 +629,7 @@ pub fn chunk_world_origin_z(chunk: &Chunk) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 358*
+*Defined at line 360*
 
 ---
 
@@ -632,8 +648,8 @@ pub fn chunk_visible_face_count(world: &ChunkWorld, chunk: &Chunk) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 363*
+*Defined at line 365*
 
 ---
 
-*Generated by [scribe](https://fides.dev) — Fides documentation generator*
+*Generated by [scribe](https://fides.dev) -- Fides documentation generator*

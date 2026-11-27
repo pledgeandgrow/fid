@@ -1,12 +1,14 @@
-# editor — Fides Documentation
+[All modules](index.md)
+
+# editor -- Fides Documentation
 
 ## Contents
 
-- [EditorEntity](#editorentity) (struct)
-- [EditorState](#editorstate) (struct)
-- [GIZMO_TRANSLATE:](#gizmo_translate:) (const)
-- [GIZMO_ROTATE:](#gizmo_rotate:) (const)
-- [GIZMO_SCALE:](#gizmo_scale:) (const)
+- [EditorEntity](#EditorEntity) (struct)
+- [EditorState](#EditorState) (struct)
+- [GIZMO_TRANSLATE:](#GIZMO_TRANSLATE:) (const)
+- [GIZMO_ROTATE:](#GIZMO_ROTATE:) (const)
+- [GIZMO_SCALE:](#GIZMO_SCALE:) (const)
 - [editor_create](#editor_create) (function)
 - [editor_init](#editor_init) (function)
 - [editor_add_entity](#editor_add_entity) (function)
@@ -64,7 +66,7 @@ pub struct EditorEntity {
 | `locked` | `bool` |
 | `selected` | `bool` |
 
-*Defined at line 18*
+*Defined at line 19*
 
 ---
 
@@ -95,7 +97,7 @@ pub struct EditorState {
 | `show_gizmo` | `bool` |
 | `max_undo` | `i64` |
 
-*Defined at line 35*
+*Defined at line 36*
 
 ---
 
@@ -105,7 +107,7 @@ pub struct EditorState {
 pub const GIZMO_TRANSLATE: i64 = 0;
 ```
 
-*Defined at line 54*
+*Defined at line 55*
 
 ---
 
@@ -115,7 +117,7 @@ pub const GIZMO_TRANSLATE: i64 = 0;
 pub const GIZMO_ROTATE: i64 = 1;
 ```
 
-*Defined at line 54*
+*Defined at line 56*
 
 ---
 
@@ -125,7 +127,7 @@ pub const GIZMO_ROTATE: i64 = 1;
 pub const GIZMO_SCALE: i64 = 2;
 ```
 
-*Defined at line 54*
+*Defined at line 57*
 
 ---
 
@@ -133,13 +135,30 @@ pub const GIZMO_SCALE: i64 = 2;
 
 Create a new editor state.
 
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+var ed = editor_create();
+editor_add_entity(&mut ed, 7, "crate", 1.0, 0.0, 0.0);
+editor_add_entity(&mut ed, 8, "lamp", 0.0, 2.0, 0.0);
+editor_select(&mut ed, 7);
+assert_eq(editor_get_selected(&ed).name, "crate");
+editor_toggle_snap(&mut ed);
+assert(!ed.snap_enabled);
+editor_move_selected(&mut ed, 1.5, 0.0, 0.0);
+assert(editor_get_selected(&ed).x == 2.5);
+editor_deselect_all(&mut ed);
+assert_eq(ed.selected_id, -1);
+```
+
 ```fides
 pub fn editor_create() -> EditorState {
 ```
 
 **Returns:** `EditorState`
 
-*Defined at line 69*
+*Defined at line 72*
 
 ---
 
@@ -157,7 +176,7 @@ pub fn editor_init(ed: &mut EditorState) -> void {
 
 **Returns:** `void`
 
-*Defined at line 77*
+*Defined at line 80*
 
 ---
 
@@ -180,7 +199,7 @@ pub fn editor_add_entity(ed: &mut EditorState, id: i64, name: str, x: f64, y: f6
 
 **Returns:** `void`
 
-*Defined at line 83*
+*Defined at line 86*
 
 ---
 
@@ -199,7 +218,7 @@ pub fn editor_select(ed: &mut EditorState, id: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 90*
+*Defined at line 93*
 
 ---
 
@@ -217,7 +236,7 @@ pub fn editor_deselect_all(ed: &mut EditorState) -> void {
 
 **Returns:** `void`
 
-*Defined at line 102*
+*Defined at line 105*
 
 ---
 
@@ -235,7 +254,7 @@ pub fn editor_get_selected(ed: &EditorState) -> EditorEntity {
 
 **Returns:** `EditorEntity`
 
-*Defined at line 129*
+*Defined at line 132*
 
 ---
 
@@ -256,7 +275,7 @@ pub fn editor_move_selected(ed: &mut EditorState, dx: f64, dy: f64, dz: f64) -> 
 
 **Returns:** `void`
 
-*Defined at line 140*
+*Defined at line 143*
 
 ---
 
@@ -277,7 +296,7 @@ pub fn editor_rotate_selected(ed: &mut EditorState, dx: f64, dy: f64, dz: f64) -
 
 **Returns:** `void`
 
-*Defined at line 167*
+*Defined at line 170*
 
 ---
 
@@ -298,7 +317,7 @@ pub fn editor_scale_selected(ed: &mut EditorState, dx: f64, dy: f64, dz: f64) ->
 
 **Returns:** `void`
 
-*Defined at line 194*
+*Defined at line 197*
 
 ---
 
@@ -317,7 +336,7 @@ pub fn editor_set_gizmo_mode(ed: &mut EditorState, mode: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 231*
+*Defined at line 234*
 
 ---
 
@@ -335,7 +354,7 @@ pub fn editor_toggle_snap(ed: &mut EditorState) -> void {
 
 **Returns:** `void`
 
-*Defined at line 236*
+*Defined at line 239*
 
 ---
 
@@ -354,7 +373,7 @@ pub fn editor_set_snap_translate(ed: &mut EditorState, val: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 241*
+*Defined at line 244*
 
 ---
 
@@ -373,7 +392,7 @@ pub fn editor_set_snap_rotate(ed: &mut EditorState, val: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 246*
+*Defined at line 249*
 
 ---
 
@@ -392,7 +411,7 @@ pub fn editor_set_snap_scale(ed: &mut EditorState, val: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 251*
+*Defined at line 254*
 
 ---
 
@@ -411,7 +430,7 @@ pub fn editor_set_grid_size(ed: &mut EditorState, size: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 256*
+*Defined at line 259*
 
 ---
 
@@ -429,7 +448,7 @@ pub fn editor_toggle_grid(ed: &mut EditorState) -> void {
 
 **Returns:** `void`
 
-*Defined at line 261*
+*Defined at line 264*
 
 ---
 
@@ -450,7 +469,7 @@ pub fn editor_set_camera(ed: &mut EditorState, x: f64, y: f64, z: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 266*
+*Defined at line 269*
 
 ---
 
@@ -468,7 +487,7 @@ pub fn editor_delete_selected(ed: &mut EditorState) -> void {
 
 **Returns:** `void`
 
-*Defined at line 273*
+*Defined at line 276*
 
 ---
 
@@ -486,7 +505,7 @@ pub fn editor_duplicate_selected(ed: &mut EditorState) -> void {
 
 **Returns:** `void`
 
-*Defined at line 283*
+*Defined at line 286*
 
 ---
 
@@ -505,7 +524,7 @@ pub fn editor_toggle_visibility(ed: &mut EditorState, id: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 296*
+*Defined at line 299*
 
 ---
 
@@ -524,7 +543,7 @@ pub fn editor_toggle_lock(ed: &mut EditorState, id: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 310*
+*Defined at line 313*
 
 ---
 
@@ -542,7 +561,7 @@ pub fn editor_entity_count(ed: &EditorState) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 324*
+*Defined at line 327*
 
 ---
 
@@ -561,7 +580,7 @@ pub fn editor_get_entity(ed: &EditorState, idx: i64) -> EditorEntity {
 
 **Returns:** `EditorEntity`
 
-*Defined at line 329*
+*Defined at line 332*
 
 ---
 
@@ -579,7 +598,7 @@ pub fn editor_selected_id(ed: &EditorState) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 334*
+*Defined at line 337*
 
 ---
 
@@ -597,7 +616,7 @@ pub fn editor_gizmo_mode(ed: &EditorState) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 339*
+*Defined at line 342*
 
 ---
 
@@ -615,7 +634,7 @@ pub fn editor_snap_enabled(ed: &EditorState) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 344*
+*Defined at line 347*
 
 ---
 
@@ -633,7 +652,7 @@ pub fn editor_grid_visible(ed: &EditorState) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 349*
+*Defined at line 352*
 
 ---
 
@@ -652,7 +671,7 @@ pub fn editor_show_inspector(ed: &mut EditorState, show: bool) -> void {
 
 **Returns:** `void`
 
-*Defined at line 354*
+*Defined at line 357*
 
 ---
 
@@ -671,7 +690,7 @@ pub fn editor_show_hierarchy(ed: &mut EditorState, show: bool) -> void {
 
 **Returns:** `void`
 
-*Defined at line 359*
+*Defined at line 362*
 
 ---
 
@@ -689,7 +708,7 @@ pub fn editor_clear(ed: &mut EditorState) -> void {
 
 **Returns:** `void`
 
-*Defined at line 364*
+*Defined at line 367*
 
 ---
 
@@ -708,8 +727,8 @@ pub fn editor_set_max_undo(ed: &mut EditorState, max: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 370*
+*Defined at line 373*
 
 ---
 
-*Generated by [scribe](https://fides.dev) — Fides documentation generator*
+*Generated by [scribe](https://fides.dev) -- Fides documentation generator*

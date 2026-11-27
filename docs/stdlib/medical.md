@@ -1,18 +1,20 @@
-# medical — Fides Documentation
+[All modules](index.md)
+
+# medical -- Fides Documentation
 
 ## Contents
 
-- [HL7_ADT_A01:](#hl7_adt_a01:) (const)
-- [HL7_ADT_A02:](#hl7_adt_a02:) (const)
-- [HL7_ADT_A03:](#hl7_adt_a03:) (const)
-- [HL7_ADT_A04:](#hl7_adt_a04:) (const)
-- [HL7_ADT_A08:](#hl7_adt_a08:) (const)
-- [HL7_ORU_R01:](#hl7_oru_r01:) (const)
-- [HL7_OUL_R22:](#hl7_oul_r22:) (const)
-- [HL7_MDM_T02:](#hl7_mdm_t02:) (const)
+- [HL7_ADT_A01:](#HL7_ADT_A01:) (const)
+- [HL7_ADT_A02:](#HL7_ADT_A02:) (const)
+- [HL7_ADT_A03:](#HL7_ADT_A03:) (const)
+- [HL7_ADT_A04:](#HL7_ADT_A04:) (const)
+- [HL7_ADT_A08:](#HL7_ADT_A08:) (const)
+- [HL7_ORU_R01:](#HL7_ORU_R01:) (const)
+- [HL7_OUL_R22:](#HL7_OUL_R22:) (const)
+- [HL7_MDM_T02:](#HL7_MDM_T02:) (const)
 - [hl7_msg_type_code](#hl7_msg_type_code) (function)
 - [hl7_msg_type_name](#hl7_msg_type_name) (function)
-- [HL7Message](#hl7message) (struct)
+- [HL7Message](#HL7Message) (struct)
 - [hl7_new](#hl7_new) (function)
 - [hl7_set_receiver](#hl7_set_receiver) (function)
 - [hl7_add_segment](#hl7_add_segment) (function)
@@ -27,28 +29,28 @@
 - [hl7_parse](#hl7_parse) (function)
 - [hl7_get_field](#hl7_get_field) (function)
 - [hl7_segment_type](#hl7_segment_type) (function)
-- [FHIR_PATIENT:](#fhir_patient:) (const)
-- [FHIR_OBSERVATION:](#fhir_observation:) (const)
-- [FHIR_CONDITION:](#fhir_condition:) (const)
-- [FHIR_MEDICATION:](#fhir_medication:) (const)
-- [FHIR_ENCOUNTER:](#fhir_encounter:) (const)
-- [FHIR_PRACTITIONER:](#fhir_practitioner:) (const)
+- [FHIR_PATIENT:](#FHIR_PATIENT:) (const)
+- [FHIR_OBSERVATION:](#FHIR_OBSERVATION:) (const)
+- [FHIR_CONDITION:](#FHIR_CONDITION:) (const)
+- [FHIR_MEDICATION:](#FHIR_MEDICATION:) (const)
+- [FHIR_ENCOUNTER:](#FHIR_ENCOUNTER:) (const)
+- [FHIR_PRACTITIONER:](#FHIR_PRACTITIONER:) (const)
 - [fhir_resource_name](#fhir_resource_name) (function)
 - [icd10_validate](#icd10_validate) (function)
-- [LOINC_GLUCOSE:](#loinc_glucose:) (const)
-- [LOINC_HEMOGLOBIN_A1C:](#loinc_hemoglobin_a1c:) (const)
-- [LOINC_CHOLESTEROL:](#loinc_cholesterol:) (const)
-- [LOINC_CREATININE:](#loinc_creatinine:) (const)
-- [LOINC_WBC:](#loinc_wbc:) (const)
-- [LOINC_RBC:](#loinc_rbc:) (const)
-- [LOINC_PLATELETS:](#loinc_platelets:) (const)
-- [LOINC_SODIUM:](#loinc_sodium:) (const)
-- [LOINC_POTASSIUM:](#loinc_potassium:) (const)
-- [LOINC_TEMPERATURE:](#loinc_temperature:) (const)
-- [LOINC_HEART_RATE:](#loinc_heart_rate:) (const)
-- [LOINC_BP_SYSTOLIC:](#loinc_bp_systolic:) (const)
-- [LOINC_BP_DIASTOLIC:](#loinc_bp_diastolic:) (const)
-- [LOINC_SPO2:](#loinc_spo2:) (const)
+- [LOINC_GLUCOSE:](#LOINC_GLUCOSE:) (const)
+- [LOINC_HEMOGLOBIN_A1C:](#LOINC_HEMOGLOBIN_A1C:) (const)
+- [LOINC_CHOLESTEROL:](#LOINC_CHOLESTEROL:) (const)
+- [LOINC_CREATININE:](#LOINC_CREATININE:) (const)
+- [LOINC_WBC:](#LOINC_WBC:) (const)
+- [LOINC_RBC:](#LOINC_RBC:) (const)
+- [LOINC_PLATELETS:](#LOINC_PLATELETS:) (const)
+- [LOINC_SODIUM:](#LOINC_SODIUM:) (const)
+- [LOINC_POTASSIUM:](#LOINC_POTASSIUM:) (const)
+- [LOINC_TEMPERATURE:](#LOINC_TEMPERATURE:) (const)
+- [LOINC_HEART_RATE:](#LOINC_HEART_RATE:) (const)
+- [LOINC_BP_SYSTOLIC:](#LOINC_BP_SYSTOLIC:) (const)
+- [LOINC_BP_DIASTOLIC:](#LOINC_BP_DIASTOLIC:) (const)
+- [LOINC_SPO2:](#LOINC_SPO2:) (const)
 
 ## HL7_ADT_A01:
 
@@ -103,7 +105,7 @@ pub const HL7_ADT_A08: i64 = 8;  // Update patient information
 ## HL7_ORU_R01:
 
 ```fides
-pub const HL7_ORU_R01: i64 = 10; // Observation result
+pub const HL7_ORU_R01: i64 = 10;  // Observation result
 ```
 
 *Defined at line 23*
@@ -113,7 +115,7 @@ pub const HL7_ORU_R01: i64 = 10; // Observation result
 ## HL7_OUL_R22:
 
 ```fides
-pub const HL7_OUL_R22: i64 = 11; // Unsolicited lab observation
+pub const HL7_OUL_R22: i64 = 11;  // Unsolicited lab observation
 ```
 
 *Defined at line 24*
@@ -123,7 +125,7 @@ pub const HL7_OUL_R22: i64 = 11; // Unsolicited lab observation
 ## HL7_MDM_T02:
 
 ```fides
-pub const HL7_MDM_T02: i64 = 12; // Medical document notification
+pub const HL7_MDM_T02: i64 = 12;  // Medical document notification
 ```
 
 *Defined at line 25*
@@ -185,7 +187,7 @@ pub struct HL7Message {
 | `receiving_app` | `str` |
 | `receiving_facility` | `str` |
 | `timestamp` | `str` |
-| `segments` | `Vec<str>` |
+| `segments` | `Vec<str>,  // Vec of segment strings` |
 
 *Defined at line 88*
 
@@ -195,8 +197,21 @@ pub struct HL7Message {
 
 Create a new HL7 message.
 
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
 ```fides
-pub fn hl7_new(msg_type: i64, msg_id: str, sending_app: str,
+var m = hl7_new(HL7_ADT_A01, "MSG1", "HMS", "WARD", "20260101120000");
+assert_eq(hl7_segment_count(m), 0);
+hl7_add_segment(&mut m, hl7_pid_segment("123", "DOE^JANE", "19800101", "F"));
+assert_eq(hl7_segment_count(m), 1);
+assert(str_starts_with(hl7_msh_segment(m), "MSH|^~\\&|HMS|WARD|"));
+assert_eq(hl7_obx_segment(1, "NM", "HR", "72", "bpm"), "OBX|1|NM|HR||72|bpm|||||F");
+assert(hl7_adt_a01("WARD", "123", "DOE^JANE", "19800101", "F").segments.len() >= 3);
+```
+
+```fides
+pub fn hl7_new(msg_type: i64, msg_id: str, sending_app: str, sending_facility: str, timestamp: str) -> HL7Message {
 ```
 
 **Parameters:**
@@ -204,6 +219,10 @@ pub fn hl7_new(msg_type: i64, msg_id: str, sending_app: str,
 - `msg_type`: `i64`
 - `msg_id`: `str`
 - `sending_app`: `str`
+- `sending_facility`: `str`
+- `timestamp`: `str`
+
+**Returns:** `HL7Message`
 
 *Defined at line 110*
 
@@ -289,13 +308,17 @@ pub fn hl7_msh_segment(msg: HL7Message) -> str {
 Build PID (Patient Identification) segment.
 
 ```fides
-pub fn hl7_pid_segment(patient_id: str, patient_name: str,
+pub fn hl7_pid_segment(patient_id: str, patient_name: str, dob: str, gender: str) -> str {
 ```
 
 **Parameters:**
 
 - `patient_id`: `str`
 - `patient_name`: `str`
+- `dob`: `str`
+- `gender`: `str`
+
+**Returns:** `str`
 
 *Defined at line 141*
 
@@ -306,13 +329,16 @@ pub fn hl7_pid_segment(patient_id: str, patient_name: str,
 Build PV1 (Patient Visit) segment.
 
 ```fides
-pub fn hl7_pv1_segment(patient_class: str, assigned_location: str,
+pub fn hl7_pv1_segment(patient_class: str, assigned_location: str, attending_doctor: str) -> str {
 ```
 
 **Parameters:**
 
 - `patient_class`: `str`
 - `assigned_location`: `str`
+- `attending_doctor`: `str`
+
+**Returns:** `str`
 
 *Defined at line 147*
 
@@ -323,7 +349,7 @@ pub fn hl7_pv1_segment(patient_class: str, assigned_location: str,
 Build OBX (Observation Result) segment.
 
 ```fides
-pub fn hl7_obx_segment(set_id: i64, value_type: str, observation_id: str,
+pub fn hl7_obx_segment(set_id: i64, value_type: str, observation_id: str, observation_value: str, units: str) -> str {
 ```
 
 **Parameters:**
@@ -331,6 +357,10 @@ pub fn hl7_obx_segment(set_id: i64, value_type: str, observation_id: str,
 - `set_id`: `i64`
 - `value_type`: `str`
 - `observation_id`: `str`
+- `observation_value`: `str`
+- `units`: `str`
+
+**Returns:** `str`
 
 *Defined at line 153*
 
@@ -341,13 +371,18 @@ pub fn hl7_obx_segment(set_id: i64, value_type: str, observation_id: str,
 Build an ADT^A01 (Admit Patient) message.
 
 ```fides
-pub fn hl7_adt_a01(sending_facility: str, patient_id: str,
+pub fn hl7_adt_a01(sending_facility: str, patient_id: str, patient_name: str, dob: str, gender: str) -> HL7Message {
 ```
 
 **Parameters:**
 
 - `sending_facility`: `str`
 - `patient_id`: `str`
+- `patient_name`: `str`
+- `dob`: `str`
+- `gender`: `str`
+
+**Returns:** `HL7Message`
 
 *Defined at line 161*
 
@@ -449,7 +484,7 @@ pub fn hl7_segment_type(segment: str) -> str {
 ## FHIR_PATIENT:
 
 ```fides
-pub const FHIR_PATIENT: i64    = 0;
+pub const FHIR_PATIENT: i64 = 0;
 ```
 
 *Defined at line 259*
@@ -462,17 +497,17 @@ pub const FHIR_PATIENT: i64    = 0;
 pub const FHIR_OBSERVATION: i64 = 1;
 ```
 
-*Defined at line 259*
+*Defined at line 260*
 
 ---
 
 ## FHIR_CONDITION:
 
 ```fides
-pub const FHIR_CONDITION: i64  = 2;
+pub const FHIR_CONDITION: i64 = 2;
 ```
 
-*Defined at line 259*
+*Defined at line 261*
 
 ---
 
@@ -482,17 +517,17 @@ pub const FHIR_CONDITION: i64  = 2;
 pub const FHIR_MEDICATION: i64 = 3;
 ```
 
-*Defined at line 259*
+*Defined at line 262*
 
 ---
 
 ## FHIR_ENCOUNTER:
 
 ```fides
-pub const FHIR_ENCOUNTER: i64  = 4;
+pub const FHIR_ENCOUNTER: i64 = 4;
 ```
 
-*Defined at line 259*
+*Defined at line 263*
 
 ---
 
@@ -502,7 +537,7 @@ pub const FHIR_ENCOUNTER: i64  = 4;
 pub const FHIR_PRACTITIONER: i64 = 5;
 ```
 
-*Defined at line 259*
+*Defined at line 264*
 
 ---
 
@@ -520,7 +555,7 @@ pub fn fhir_resource_name(resource_type: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 261*
+*Defined at line 266*
 
 ---
 
@@ -538,148 +573,148 @@ pub fn icd10_validate(code: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 286*
+*Defined at line 291*
 
 ---
 
 ## LOINC_GLUCOSE:
 
 ```fides
-pub const LOINC_GLUCOSE: str       = "2339-0";  // Glucose
-```
-
-*Defined at line 327*
-
----
-
-## LOINC_HEMOGLOBIN_A1C:
-
-```fides
-pub const LOINC_HEMOGLOBIN_A1C: str = "4548-4"; // HbA1c
-```
-
-*Defined at line 328*
-
----
-
-## LOINC_CHOLESTEROL:
-
-```fides
-pub const LOINC_CHOLESTEROL: str    = "2093-3";  // Cholesterol
-```
-
-*Defined at line 329*
-
----
-
-## LOINC_CREATININE:
-
-```fides
-pub const LOINC_CREATININE: str     = "2160-0";  // Creatinine
-```
-
-*Defined at line 330*
-
----
-
-## LOINC_WBC:
-
-```fides
-pub const LOINC_WBC: str            = "6690-2";  // White Blood Cell
-```
-
-*Defined at line 331*
-
----
-
-## LOINC_RBC:
-
-```fides
-pub const LOINC_RBC: str            = "789-8";   // Red Blood Cell
+pub const LOINC_GLUCOSE: str = "2339-0";  // Glucose
 ```
 
 *Defined at line 332*
 
 ---
 
-## LOINC_PLATELETS:
+## LOINC_HEMOGLOBIN_A1C:
 
 ```fides
-pub const LOINC_PLATELETS: str      = "777-3";   // Platelets
+pub const LOINC_HEMOGLOBIN_A1C: str = "4548-4";  // HbA1c
 ```
 
 *Defined at line 333*
 
 ---
 
-## LOINC_SODIUM:
+## LOINC_CHOLESTEROL:
 
 ```fides
-pub const LOINC_SODIUM: str         = "2951-2";  // Sodium
+pub const LOINC_CHOLESTEROL: str = "2093-3";  // Cholesterol
 ```
 
 *Defined at line 334*
 
 ---
 
-## LOINC_POTASSIUM:
+## LOINC_CREATININE:
 
 ```fides
-pub const LOINC_POTASSIUM: str      = "2823-3";  // Potassium
+pub const LOINC_CREATININE: str = "2160-0";  // Creatinine
 ```
 
 *Defined at line 335*
 
 ---
 
-## LOINC_TEMPERATURE:
+## LOINC_WBC:
 
 ```fides
-pub const LOINC_TEMPERATURE: str    = "8310-5";  // Body Temperature
+pub const LOINC_WBC: str = "6690-2";  // White Blood Cell
 ```
 
 *Defined at line 336*
 
 ---
 
-## LOINC_HEART_RATE:
+## LOINC_RBC:
 
 ```fides
-pub const LOINC_HEART_RATE: str     = "8867-4";  // Heart Rate
+pub const LOINC_RBC: str = "789-8";  // Red Blood Cell
 ```
 
 *Defined at line 337*
 
 ---
 
-## LOINC_BP_SYSTOLIC:
+## LOINC_PLATELETS:
 
 ```fides
-pub const LOINC_BP_SYSTOLIC: str    = "8480-6";  // BP Systolic
+pub const LOINC_PLATELETS: str = "777-3";  // Platelets
 ```
 
 *Defined at line 338*
 
 ---
 
-## LOINC_BP_DIASTOLIC:
+## LOINC_SODIUM:
 
 ```fides
-pub const LOINC_BP_DIASTOLIC: str   = "8462-4";  // BP Diastolic
+pub const LOINC_SODIUM: str = "2951-2";  // Sodium
 ```
 
 *Defined at line 339*
 
 ---
 
-## LOINC_SPO2:
+## LOINC_POTASSIUM:
 
 ```fides
-pub const LOINC_SPO2: str           = "59408-5"; // Oxygen Saturation
+pub const LOINC_POTASSIUM: str = "2823-3";  // Potassium
 ```
 
 *Defined at line 340*
 
 ---
 
-*Generated by [scribe](https://fides.dev) — Fides documentation generator*
+## LOINC_TEMPERATURE:
+
+```fides
+pub const LOINC_TEMPERATURE: str = "8310-5";  // Body Temperature
+```
+
+*Defined at line 341*
+
+---
+
+## LOINC_HEART_RATE:
+
+```fides
+pub const LOINC_HEART_RATE: str = "8867-4";  // Heart Rate
+```
+
+*Defined at line 342*
+
+---
+
+## LOINC_BP_SYSTOLIC:
+
+```fides
+pub const LOINC_BP_SYSTOLIC: str = "8480-6";  // BP Systolic
+```
+
+*Defined at line 343*
+
+---
+
+## LOINC_BP_DIASTOLIC:
+
+```fides
+pub const LOINC_BP_DIASTOLIC: str = "8462-4";  // BP Diastolic
+```
+
+*Defined at line 344*
+
+---
+
+## LOINC_SPO2:
+
+```fides
+pub const LOINC_SPO2: str = "59408-5";  // Oxygen Saturation
+```
+
+*Defined at line 345*
+
+---
+
+*Generated by [scribe](https://fides.dev) -- Fides documentation generator*

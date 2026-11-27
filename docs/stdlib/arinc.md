@@ -1,34 +1,36 @@
-# arinc — Fides Documentation
+[All modules](index.md)
+
+# arinc -- Fides Documentation
 
 ## Contents
 
-- [ARINC_PARTITION_NORMAL:](#arinc_partition_normal:) (const)
-- [ARINC_PARTITION_IDLE:](#arinc_partition_idle:) (const)
-- [ARINC_PARTITION_COLD_START:](#arinc_partition_cold_start:) (const)
-- [ARINC_PARTITION_WARM_START:](#arinc_partition_warm_start:) (const)
-- [ARINC_PARTITION_STOP:](#arinc_partition_stop:) (const)
+- [ARINC_PARTITION_NORMAL:](#ARINC_PARTITION_NORMAL:) (const)
+- [ARINC_PARTITION_IDLE:](#ARINC_PARTITION_IDLE:) (const)
+- [ARINC_PARTITION_COLD_START:](#ARINC_PARTITION_COLD_START:) (const)
+- [ARINC_PARTITION_WARM_START:](#ARINC_PARTITION_WARM_START:) (const)
+- [ARINC_PARTITION_STOP:](#ARINC_PARTITION_STOP:) (const)
 - [arinc_partition_state_name](#arinc_partition_state_name) (function)
-- [ARINC_PORT_SOURCE:](#arinc_port_source:) (const)
-- [ARINC_PORT_DESTINATION:](#arinc_port_destination:) (const)
-- [ARINC_PORT_FIFO:](#arinc_port_fifo:) (const)
-- [ARINC_PORT_PRIORITY:](#arinc_port_priority:) (const)
-- [ARINC_NO_ERROR:](#arinc_no_error:) (const)
-- [ARINC_NOT_AVAILABLE:](#arinc_not_available:) (const)
-- [ARINC_INVALID_PARAM:](#arinc_invalid_param:) (const)
-- [ARINC_INVALID_CONFIG:](#arinc_invalid_config:) (const)
-- [ARINC_INVALID_MODE:](#arinc_invalid_mode:) (const)
-- [ARINC_INVALID_POINTER:](#arinc_invalid_pointer:) (const)
-- [ARINC_INVALID_SIZE:](#arinc_invalid_size:) (const)
-- [ARINC_TOO_MANY_OBJECTS:](#arinc_too_many_objects:) (const)
-- [ARINC_NOT_AVAILABLE_PART:](#arinc_not_available_part:) (const)
-- [ARINC_NO_ACTION:](#arinc_no_action:) (const)
-- [ARINC_TIME_OUT:](#arinc_time_out:) (const)
-- [ARINC_QUEUE_EMPTY:](#arinc_queue_empty:) (const)
-- [ARINC_QUEUE_FULL:](#arinc_queue_full:) (const)
-- [ARINC_PORT_FULL:](#arinc_port_full:) (const)
-- [ARINC_PORT_EMPTY:](#arinc_port_empty:) (const)
+- [ARINC_PORT_SOURCE:](#ARINC_PORT_SOURCE:) (const)
+- [ARINC_PORT_DESTINATION:](#ARINC_PORT_DESTINATION:) (const)
+- [ARINC_PORT_FIFO:](#ARINC_PORT_FIFO:) (const)
+- [ARINC_PORT_PRIORITY:](#ARINC_PORT_PRIORITY:) (const)
+- [ARINC_NO_ERROR:](#ARINC_NO_ERROR:) (const)
+- [ARINC_NOT_AVAILABLE:](#ARINC_NOT_AVAILABLE:) (const)
+- [ARINC_INVALID_PARAM:](#ARINC_INVALID_PARAM:) (const)
+- [ARINC_INVALID_CONFIG:](#ARINC_INVALID_CONFIG:) (const)
+- [ARINC_INVALID_MODE:](#ARINC_INVALID_MODE:) (const)
+- [ARINC_INVALID_POINTER:](#ARINC_INVALID_POINTER:) (const)
+- [ARINC_INVALID_SIZE:](#ARINC_INVALID_SIZE:) (const)
+- [ARINC_TOO_MANY_OBJECTS:](#ARINC_TOO_MANY_OBJECTS:) (const)
+- [ARINC_NOT_AVAILABLE_PART:](#ARINC_NOT_AVAILABLE_PART:) (const)
+- [ARINC_NO_ACTION:](#ARINC_NO_ACTION:) (const)
+- [ARINC_TIME_OUT:](#ARINC_TIME_OUT:) (const)
+- [ARINC_QUEUE_EMPTY:](#ARINC_QUEUE_EMPTY:) (const)
+- [ARINC_QUEUE_FULL:](#ARINC_QUEUE_FULL:) (const)
+- [ARINC_PORT_FULL:](#ARINC_PORT_FULL:) (const)
+- [ARINC_PORT_EMPTY:](#ARINC_PORT_EMPTY:) (const)
 - [arinc_error_name](#arinc_error_name) (function)
-- [QueuingPort](#queuingport) (struct)
+- [QueuingPort](#QueuingPort) (struct)
 - [arinc_queuing_port_create](#arinc_queuing_port_create) (function)
 - [arinc_queuing_port_send](#arinc_queuing_port_send) (function)
 - [arinc_queuing_port_receive](#arinc_queuing_port_receive) (function)
@@ -36,14 +38,14 @@
 - [arinc_queuing_port_is_empty](#arinc_queuing_port_is_empty) (function)
 - [arinc_queuing_port_is_full](#arinc_queuing_port_is_full) (function)
 - [arinc_queuing_port_name](#arinc_queuing_port_name) (function)
-- [SamplingPort](#samplingport) (struct)
+- [SamplingPort](#SamplingPort) (struct)
 - [arinc_sampling_port_create](#arinc_sampling_port_create) (function)
 - [arinc_sampling_port_write](#arinc_sampling_port_write) (function)
 - [arinc_sampling_port_read](#arinc_sampling_port_read) (function)
 - [arinc_sampling_port_is_valid](#arinc_sampling_port_is_valid) (function)
 - [arinc_sampling_port_invalidate](#arinc_sampling_port_invalidate) (function)
 - [arinc_sampling_port_name](#arinc_sampling_port_name) (function)
-- [PartitionInfo](#partitioninfo) (struct)
+- [PartitionInfo](#PartitionInfo) (struct)
 - [arinc_partition_create](#arinc_partition_create) (function)
 - [arinc_partition_state](#arinc_partition_state) (function)
 - [arinc_partition_set_state](#arinc_partition_set_state) (function)
@@ -51,30 +53,30 @@
 - [arinc_partition_duration](#arinc_partition_duration) (function)
 - [arinc_partition_time_capacity](#arinc_partition_time_capacity) (function)
 - [arinc_partition_name](#arinc_partition_name) (function)
-- [ARINC_HM_LEVEL_MODULE:](#arinc_hm_level_module:) (const)
-- [ARINC_HM_LEVEL_PARTITION:](#arinc_hm_level_partition:) (const)
-- [ARINC_HM_LEVEL_PROCESS:](#arinc_hm_level_process:) (const)
-- [ARINC_HM_ERROR_MEMORY:](#arinc_hm_error_memory:) (const)
-- [ARINC_HM_ERROR_PROGRAM:](#arinc_hm_error_program:) (const)
-- [ARINC_HM_ERROR_TIME:](#arinc_hm_error_time:) (const)
-- [ARINC_HM_ERROR_IO:](#arinc_hm_error_io:) (const)
-- [ARINC_HM_ERROR_POWER:](#arinc_hm_error_power:) (const)
-- [ARINC_HM_ERROR_FREE_RUN:](#arinc_hm_error_free_run:) (const)
-- [ARINC_HM_ERROR_APPLICATION:](#arinc_hm_error_application:) (const)
-- [ARINC_HM_ACTION_IGNORE:](#arinc_hm_action_ignore:) (const)
-- [ARINC_HM_ACTION_PROCESS_RESTART:](#arinc_hm_action_process_restart:) (const)
-- [ARINC_HM_ACTION_PARTITION_RESTART:](#arinc_hm_action_partition_restart:) (const)
-- [ARINC_HM_ACTION_PARTITION_STOP:](#arinc_hm_action_partition_stop:) (const)
-- [ARINC_HM_ACTION_MODULE_RESET:](#arinc_hm_action_module_reset:) (const)
-- [ARINC_HM_ACTION_MODULE_STOP:](#arinc_hm_action_module_stop:) (const)
-- [HealthEvent](#healthevent) (struct)
+- [ARINC_HM_LEVEL_MODULE:](#ARINC_HM_LEVEL_MODULE:) (const)
+- [ARINC_HM_LEVEL_PARTITION:](#ARINC_HM_LEVEL_PARTITION:) (const)
+- [ARINC_HM_LEVEL_PROCESS:](#ARINC_HM_LEVEL_PROCESS:) (const)
+- [ARINC_HM_ERROR_MEMORY:](#ARINC_HM_ERROR_MEMORY:) (const)
+- [ARINC_HM_ERROR_PROGRAM:](#ARINC_HM_ERROR_PROGRAM:) (const)
+- [ARINC_HM_ERROR_TIME:](#ARINC_HM_ERROR_TIME:) (const)
+- [ARINC_HM_ERROR_IO:](#ARINC_HM_ERROR_IO:) (const)
+- [ARINC_HM_ERROR_POWER:](#ARINC_HM_ERROR_POWER:) (const)
+- [ARINC_HM_ERROR_FREE_RUN:](#ARINC_HM_ERROR_FREE_RUN:) (const)
+- [ARINC_HM_ERROR_APPLICATION:](#ARINC_HM_ERROR_APPLICATION:) (const)
+- [ARINC_HM_ACTION_IGNORE:](#ARINC_HM_ACTION_IGNORE:) (const)
+- [ARINC_HM_ACTION_PROCESS_RESTART:](#ARINC_HM_ACTION_PROCESS_RESTART:) (const)
+- [ARINC_HM_ACTION_PARTITION_RESTART:](#ARINC_HM_ACTION_PARTITION_RESTART:) (const)
+- [ARINC_HM_ACTION_PARTITION_STOP:](#ARINC_HM_ACTION_PARTITION_STOP:) (const)
+- [ARINC_HM_ACTION_MODULE_RESET:](#ARINC_HM_ACTION_MODULE_RESET:) (const)
+- [ARINC_HM_ACTION_MODULE_STOP:](#ARINC_HM_ACTION_MODULE_STOP:) (const)
+- [HealthEvent](#HealthEvent) (struct)
 - [arinc_hm_event](#arinc_hm_event) (function)
 - [arinc_hm_level_name](#arinc_hm_level_name) (function)
 - [arinc_hm_error_name](#arinc_hm_error_name) (function)
 - [arinc_hm_action_name](#arinc_hm_action_name) (function)
 - [arinc_hm_event_print](#arinc_hm_event_print) (function)
-- [ScheduleEntry](#scheduleentry) (struct)
-- [CyclicSchedule](#cyclicschedule) (struct)
+- [ScheduleEntry](#ScheduleEntry) (struct)
+- [CyclicSchedule](#CyclicSchedule) (struct)
 - [arinc_schedule_entry](#arinc_schedule_entry) (function)
 - [arinc_cyclic_schedule](#arinc_cyclic_schedule) (function)
 - [arinc_schedule_add_entry](#arinc_schedule_add_entry) (function)
@@ -88,7 +90,7 @@
 Partition states per ARINC 653 specification.
 
 ```fides
-pub const ARINC_PARTITION_NORMAL: i64       = 0;
+pub const ARINC_PARTITION_NORMAL: i64 = 0;
 ```
 
 *Defined at line 31*
@@ -98,40 +100,40 @@ pub const ARINC_PARTITION_NORMAL: i64       = 0;
 ## ARINC_PARTITION_IDLE:
 
 ```fides
-pub const ARINC_PARTITION_IDLE: i64         = 1;
+pub const ARINC_PARTITION_IDLE: i64 = 1;
 ```
 
-*Defined at line 31*
+*Defined at line 32*
 
 ---
 
 ## ARINC_PARTITION_COLD_START:
 
 ```fides
-pub const ARINC_PARTITION_COLD_START: i64   = 2;
+pub const ARINC_PARTITION_COLD_START: i64 = 2;
 ```
 
-*Defined at line 31*
+*Defined at line 33*
 
 ---
 
 ## ARINC_PARTITION_WARM_START:
 
 ```fides
-pub const ARINC_PARTITION_WARM_START: i64   = 3;
+pub const ARINC_PARTITION_WARM_START: i64 = 3;
 ```
 
-*Defined at line 31*
+*Defined at line 34*
 
 ---
 
 ## ARINC_PARTITION_STOP:
 
 ```fides
-pub const ARINC_PARTITION_STOP: i64         = 4;
+pub const ARINC_PARTITION_STOP: i64 = 4;
 ```
 
-*Defined at line 31*
+*Defined at line 35*
 
 ---
 
@@ -149,7 +151,7 @@ pub fn arinc_partition_state_name(state: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 33*
+*Defined at line 37*
 
 ---
 
@@ -158,10 +160,10 @@ pub fn arinc_partition_state_name(state: i64) -> str {
 Port directions
 
 ```fides
-pub const ARINC_PORT_SOURCE: i64      = 0;
+pub const ARINC_PORT_SOURCE: i64 = 0;
 ```
 
-*Defined at line 55*
+*Defined at line 59*
 
 ---
 
@@ -171,7 +173,7 @@ pub const ARINC_PORT_SOURCE: i64      = 0;
 pub const ARINC_PORT_DESTINATION: i64 = 1;
 ```
 
-*Defined at line 55*
+*Defined at line 60*
 
 ---
 
@@ -180,20 +182,20 @@ pub const ARINC_PORT_DESTINATION: i64 = 1;
 Port disciplines (queuing ports)
 
 ```fides
-pub const ARINC_PORT_FIFO: i64        = 0;
+pub const ARINC_PORT_FIFO: i64 = 0;
 ```
 
-*Defined at line 57*
+*Defined at line 62*
 
 ---
 
 ## ARINC_PORT_PRIORITY:
 
 ```fides
-pub const ARINC_PORT_PRIORITY: i64    = 1;
+pub const ARINC_PORT_PRIORITY: i64 = 1;
 ```
 
-*Defined at line 57*
+*Defined at line 63*
 
 ---
 
@@ -202,150 +204,150 @@ pub const ARINC_PORT_PRIORITY: i64    = 1;
 Port status codes
 
 ```fides
-pub const ARINC_NO_ERROR: i64                 = 0;
+pub const ARINC_NO_ERROR: i64 = 0;
 ```
 
-*Defined at line 59*
+*Defined at line 65*
 
 ---
 
 ## ARINC_NOT_AVAILABLE:
 
 ```fides
-pub const ARINC_NOT_AVAILABLE: i64            = 1;
+pub const ARINC_NOT_AVAILABLE: i64 = 1;
 ```
 
-*Defined at line 59*
+*Defined at line 66*
 
 ---
 
 ## ARINC_INVALID_PARAM:
 
 ```fides
-pub const ARINC_INVALID_PARAM: i64            = 2;
+pub const ARINC_INVALID_PARAM: i64 = 2;
 ```
 
-*Defined at line 59*
+*Defined at line 67*
 
 ---
 
 ## ARINC_INVALID_CONFIG:
 
 ```fides
-pub const ARINC_INVALID_CONFIG: i64           = 3;
+pub const ARINC_INVALID_CONFIG: i64 = 3;
 ```
 
-*Defined at line 59*
+*Defined at line 68*
 
 ---
 
 ## ARINC_INVALID_MODE:
 
 ```fides
-pub const ARINC_INVALID_MODE: i64             = 4;
+pub const ARINC_INVALID_MODE: i64 = 4;
 ```
 
-*Defined at line 59*
+*Defined at line 69*
 
 ---
 
 ## ARINC_INVALID_POINTER:
 
 ```fides
-pub const ARINC_INVALID_POINTER: i64          = 5;
+pub const ARINC_INVALID_POINTER: i64 = 5;
 ```
 
-*Defined at line 59*
+*Defined at line 70*
 
 ---
 
 ## ARINC_INVALID_SIZE:
 
 ```fides
-pub const ARINC_INVALID_SIZE: i64             = 6;
+pub const ARINC_INVALID_SIZE: i64 = 6;
 ```
 
-*Defined at line 59*
+*Defined at line 71*
 
 ---
 
 ## ARINC_TOO_MANY_OBJECTS:
 
 ```fides
-pub const ARINC_TOO_MANY_OBJECTS: i64         = 7;
+pub const ARINC_TOO_MANY_OBJECTS: i64 = 7;
 ```
 
-*Defined at line 59*
+*Defined at line 72*
 
 ---
 
 ## ARINC_NOT_AVAILABLE_PART:
 
 ```fides
-pub const ARINC_NOT_AVAILABLE_PART: i64       = 8;
+pub const ARINC_NOT_AVAILABLE_PART: i64 = 8;
 ```
 
-*Defined at line 59*
+*Defined at line 73*
 
 ---
 
 ## ARINC_NO_ACTION:
 
 ```fides
-pub const ARINC_NO_ACTION: i64                = 9;
+pub const ARINC_NO_ACTION: i64 = 9;
 ```
 
-*Defined at line 59*
+*Defined at line 74*
 
 ---
 
 ## ARINC_TIME_OUT:
 
 ```fides
-pub const ARINC_TIME_OUT: i64                 = 10;
+pub const ARINC_TIME_OUT: i64 = 10;
 ```
 
-*Defined at line 59*
+*Defined at line 75*
 
 ---
 
 ## ARINC_QUEUE_EMPTY:
 
 ```fides
-pub const ARINC_QUEUE_EMPTY: i64              = 11;
+pub const ARINC_QUEUE_EMPTY: i64 = 11;
 ```
 
-*Defined at line 59*
+*Defined at line 76*
 
 ---
 
 ## ARINC_QUEUE_FULL:
 
 ```fides
-pub const ARINC_QUEUE_FULL: i64               = 12;
+pub const ARINC_QUEUE_FULL: i64 = 12;
 ```
 
-*Defined at line 59*
+*Defined at line 77*
 
 ---
 
 ## ARINC_PORT_FULL:
 
 ```fides
-pub const ARINC_PORT_FULL: i64                = 13;
+pub const ARINC_PORT_FULL: i64 = 13;
 ```
 
-*Defined at line 59*
+*Defined at line 78*
 
 ---
 
 ## ARINC_PORT_EMPTY:
 
 ```fides
-pub const ARINC_PORT_EMPTY: i64               = 14;
+pub const ARINC_PORT_EMPTY: i64 = 14;
 ```
 
-*Defined at line 59*
+*Defined at line 79*
 
 ---
 
@@ -363,7 +365,7 @@ pub fn arinc_error_name(code: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 61*
+*Defined at line 81*
 
 ---
 
@@ -395,7 +397,7 @@ pub struct QueuingPort {
 | `count` | `i64` |
 | `data_tail` | `i64` |
 
-*Defined at line 125*
+*Defined at line 145*
 
 ---
 
@@ -408,16 +410,37 @@ discipline: ARINC_PORT_FIFO or ARINC_PORT_PRIORITY
 max_message_size: Maximum message size in bytes
 max_nb_message: Maximum number of messages in the queue
 
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
 ```fides
-pub fn arinc_queuing_port_create(name: str, max_nb_message: i64,
+var p = arinc_queuing_port_create("cmd", 2, 8, ARINC_PORT_SOURCE, ARINC_PORT_FIFO);
+assert(arinc_queuing_port_is_empty(p));
+var m: Vec<i64> = Vec::new();
+m.push(7); m.push(9);
+assert_eq(arinc_queuing_port_send(&mut p, m), ARINC_NO_ERROR);
+assert_eq(arinc_queuing_port_send(&mut p, m), ARINC_NO_ERROR);
+assert_eq(arinc_queuing_port_send(&mut p, m), ARINC_PORT_FULL);
+assert(arinc_queuing_port_is_full(p));
+assert_eq(arinc_queuing_port_receive(p).get(1), 9);
+assert_eq(arinc_error_name(ARINC_PORT_FULL), "PORT_FULL");
+```
+
+```fides
+pub fn arinc_queuing_port_create(name: str, max_nb_message: i64, max_message_size: i64, direction: i64, discipline: i64) -> QueuingPort {
 ```
 
 **Parameters:**
 
 - `name`: `str`
 - `max_nb_message`: `i64`
+- `max_message_size`: `i64`
+- `direction`: `i64`
+- `discipline`: `i64`
 
-*Defined at line 156*
+**Returns:** `QueuingPort`
+
+*Defined at line 176*
 
 ---
 
@@ -437,7 +460,7 @@ pub fn arinc_queuing_port_send(port: &mut QueuingPort, message: Vec<i64>) -> i64
 
 **Returns:** `i64`
 
-*Defined at line 164*
+*Defined at line 184*
 
 ---
 
@@ -458,7 +481,7 @@ pub fn arinc_queuing_port_receive(port: QueuingPort) -> Vec<i64> {
 
 **Returns:** `Vec<i64>`
 
-*Defined at line 183*
+*Defined at line 203*
 
 ---
 
@@ -476,7 +499,7 @@ pub fn arinc_queuing_port_count(port: QueuingPort) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 197*
+*Defined at line 217*
 
 ---
 
@@ -494,7 +517,7 @@ pub fn arinc_queuing_port_is_empty(port: QueuingPort) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 202*
+*Defined at line 222*
 
 ---
 
@@ -512,7 +535,7 @@ pub fn arinc_queuing_port_is_full(port: QueuingPort) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 207*
+*Defined at line 227*
 
 ---
 
@@ -530,7 +553,7 @@ pub fn arinc_queuing_port_name(port: QueuingPort) -> str {
 
 **Returns:** `str`
 
-*Defined at line 212*
+*Defined at line 232*
 
 ---
 
@@ -554,7 +577,7 @@ pub struct SamplingPort {
 | `valid` | `bool` |
 | `last_update_time` | `i64` |
 
-*Defined at line 223*
+*Defined at line 243*
 
 ---
 
@@ -564,15 +587,19 @@ Create a sampling port.
 refresh_period: Time in milliseconds after which data is considered stale.
 
 ```fides
-pub fn arinc_sampling_port_create(name: str, max_message_size: i64,
+pub fn arinc_sampling_port_create(name: str, max_message_size: i64, direction: i64, refresh_period: i64) -> SamplingPort {
 ```
 
 **Parameters:**
 
 - `name`: `str`
 - `max_message_size`: `i64`
+- `direction`: `i64`
+- `refresh_period`: `i64`
 
-*Defined at line 235*
+**Returns:** `SamplingPort`
+
+*Defined at line 255*
 
 ---
 
@@ -592,7 +619,7 @@ pub fn arinc_sampling_port_write(port: &mut SamplingPort, message: Vec<i64>, cur
 
 **Returns:** `i64`
 
-*Defined at line 242*
+*Defined at line 262*
 
 ---
 
@@ -612,7 +639,7 @@ pub fn arinc_sampling_port_read(port: SamplingPort) -> Vec<i64> {
 
 **Returns:** `Vec<i64>`
 
-*Defined at line 252*
+*Defined at line 272*
 
 ---
 
@@ -631,7 +658,7 @@ pub fn arinc_sampling_port_is_valid(port: SamplingPort, current_time: i64) -> bo
 
 **Returns:** `bool`
 
-*Defined at line 257*
+*Defined at line 277*
 
 ---
 
@@ -649,7 +676,7 @@ pub fn arinc_sampling_port_invalidate(port: &mut SamplingPort) -> void {
 
 **Returns:** `void`
 
-*Defined at line 263*
+*Defined at line 283*
 
 ---
 
@@ -667,7 +694,7 @@ pub fn arinc_sampling_port_name(port: SamplingPort) -> str {
 
 **Returns:** `str`
 
-*Defined at line 268*
+*Defined at line 288*
 
 ---
 
@@ -685,11 +712,11 @@ pub struct PartitionInfo {
 |------|------|
 | `name` | `str` |
 | `state` | `i64` |
-| `period` | `i64,        // in milliseconds` |
-| `duration` | `i64,      // in milliseconds (time slice per period)` |
-| `time_capacity` | `i64, // WCET budget in milliseconds` |
+| `period` | `i64` |
+| `duration` | `i64` |
+| `time_capacity` | `i64,  // WCET budget in milliseconds` |
 
-*Defined at line 279*
+*Defined at line 299*
 
 ---
 
@@ -698,7 +725,7 @@ pub struct PartitionInfo {
 Create partition info.
 
 ```fides
-pub fn arinc_partition_create(name: str, period: i64, duration: i64,
+pub fn arinc_partition_create(name: str, period: i64, duration: i64, time_capacity: i64) -> PartitionInfo {
 ```
 
 **Parameters:**
@@ -706,8 +733,11 @@ pub fn arinc_partition_create(name: str, period: i64, duration: i64,
 - `name`: `str`
 - `period`: `i64`
 - `duration`: `i64`
+- `time_capacity`: `i64`
 
-*Defined at line 290*
+**Returns:** `PartitionInfo`
+
+*Defined at line 310*
 
 ---
 
@@ -725,7 +755,7 @@ pub fn arinc_partition_state(part: PartitionInfo) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 297*
+*Defined at line 317*
 
 ---
 
@@ -745,7 +775,7 @@ pub fn arinc_partition_set_state(part: &mut PartitionInfo, state: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 303*
+*Defined at line 323*
 
 ---
 
@@ -763,7 +793,7 @@ pub fn arinc_partition_period(part: PartitionInfo) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 308*
+*Defined at line 328*
 
 ---
 
@@ -781,7 +811,7 @@ pub fn arinc_partition_duration(part: PartitionInfo) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 313*
+*Defined at line 333*
 
 ---
 
@@ -799,7 +829,7 @@ pub fn arinc_partition_time_capacity(part: PartitionInfo) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 318*
+*Defined at line 338*
 
 ---
 
@@ -817,7 +847,7 @@ pub fn arinc_partition_name(part: PartitionInfo) -> str {
 
 **Returns:** `str`
 
-*Defined at line 323*
+*Defined at line 343*
 
 ---
 
@@ -826,30 +856,30 @@ pub fn arinc_partition_name(part: PartitionInfo) -> str {
 Health monitoring error levels
 
 ```fides
-pub const ARINC_HM_LEVEL_MODULE: i64     = 0;
+pub const ARINC_HM_LEVEL_MODULE: i64 = 0;
 ```
 
-*Defined at line 343*
+*Defined at line 363*
 
 ---
 
 ## ARINC_HM_LEVEL_PARTITION:
 
 ```fides
-pub const ARINC_HM_LEVEL_PARTITION: i64  = 1;
+pub const ARINC_HM_LEVEL_PARTITION: i64 = 1;
 ```
 
-*Defined at line 343*
+*Defined at line 364*
 
 ---
 
 ## ARINC_HM_LEVEL_PROCESS:
 
 ```fides
-pub const ARINC_HM_LEVEL_PROCESS: i64    = 2;
+pub const ARINC_HM_LEVEL_PROCESS: i64 = 2;
 ```
 
-*Defined at line 343*
+*Defined at line 365*
 
 ---
 
@@ -858,70 +888,70 @@ pub const ARINC_HM_LEVEL_PROCESS: i64    = 2;
 Health monitoring error types
 
 ```fides
-pub const ARINC_HM_ERROR_MEMORY: i64         = 0;
+pub const ARINC_HM_ERROR_MEMORY: i64 = 0;
 ```
 
-*Defined at line 345*
+*Defined at line 367*
 
 ---
 
 ## ARINC_HM_ERROR_PROGRAM:
 
 ```fides
-pub const ARINC_HM_ERROR_PROGRAM: i64        = 1;
+pub const ARINC_HM_ERROR_PROGRAM: i64 = 1;
 ```
 
-*Defined at line 345*
+*Defined at line 368*
 
 ---
 
 ## ARINC_HM_ERROR_TIME:
 
 ```fides
-pub const ARINC_HM_ERROR_TIME: i64           = 2;
+pub const ARINC_HM_ERROR_TIME: i64 = 2;
 ```
 
-*Defined at line 345*
+*Defined at line 369*
 
 ---
 
 ## ARINC_HM_ERROR_IO:
 
 ```fides
-pub const ARINC_HM_ERROR_IO: i64             = 3;
+pub const ARINC_HM_ERROR_IO: i64 = 3;
 ```
 
-*Defined at line 345*
+*Defined at line 370*
 
 ---
 
 ## ARINC_HM_ERROR_POWER:
 
 ```fides
-pub const ARINC_HM_ERROR_POWER: i64          = 4;
+pub const ARINC_HM_ERROR_POWER: i64 = 4;
 ```
 
-*Defined at line 345*
+*Defined at line 371*
 
 ---
 
 ## ARINC_HM_ERROR_FREE_RUN:
 
 ```fides
-pub const ARINC_HM_ERROR_FREE_RUN: i64       = 5;
+pub const ARINC_HM_ERROR_FREE_RUN: i64 = 5;
 ```
 
-*Defined at line 345*
+*Defined at line 372*
 
 ---
 
 ## ARINC_HM_ERROR_APPLICATION:
 
 ```fides
-pub const ARINC_HM_ERROR_APPLICATION: i64    = 6;
+pub const ARINC_HM_ERROR_APPLICATION: i64 = 6;
 ```
 
-*Defined at line 345*
+*Defined at line 373*
 
 ---
 
@@ -930,20 +960,20 @@ pub const ARINC_HM_ERROR_APPLICATION: i64    = 6;
 Health monitoring recovery actions
 
 ```fides
-pub const ARINC_HM_ACTION_IGNORE: i64            = 0;
+pub const ARINC_HM_ACTION_IGNORE: i64 = 0;
 ```
 
-*Defined at line 347*
+*Defined at line 375*
 
 ---
 
 ## ARINC_HM_ACTION_PROCESS_RESTART:
 
 ```fides
-pub const ARINC_HM_ACTION_PROCESS_RESTART: i64   = 1;
+pub const ARINC_HM_ACTION_PROCESS_RESTART: i64 = 1;
 ```
 
-*Defined at line 347*
+*Defined at line 376*
 
 ---
 
@@ -953,37 +983,37 @@ pub const ARINC_HM_ACTION_PROCESS_RESTART: i64   = 1;
 pub const ARINC_HM_ACTION_PARTITION_RESTART: i64 = 2;
 ```
 
-*Defined at line 347*
+*Defined at line 377*
 
 ---
 
 ## ARINC_HM_ACTION_PARTITION_STOP:
 
 ```fides
-pub const ARINC_HM_ACTION_PARTITION_STOP: i64    = 3;
+pub const ARINC_HM_ACTION_PARTITION_STOP: i64 = 3;
 ```
 
-*Defined at line 347*
+*Defined at line 378*
 
 ---
 
 ## ARINC_HM_ACTION_MODULE_RESET:
 
 ```fides
-pub const ARINC_HM_ACTION_MODULE_RESET: i64      = 4;
+pub const ARINC_HM_ACTION_MODULE_RESET: i64 = 4;
 ```
 
-*Defined at line 347*
+*Defined at line 379*
 
 ---
 
 ## ARINC_HM_ACTION_MODULE_STOP:
 
 ```fides
-pub const ARINC_HM_ACTION_MODULE_STOP: i64       = 5;
+pub const ARINC_HM_ACTION_MODULE_STOP: i64 = 5;
 ```
 
-*Defined at line 347*
+*Defined at line 380*
 
 ---
 
@@ -1005,7 +1035,7 @@ pub struct HealthEvent {
 | `partition_name` | `str` |
 | `timestamp` | `i64` |
 
-*Defined at line 349*
+*Defined at line 382*
 
 ---
 
@@ -1014,7 +1044,7 @@ pub struct HealthEvent {
 Create a health monitoring event.
 
 ```fides
-pub fn arinc_hm_event(level: i64, error_type: i64, action: i64,
+pub fn arinc_hm_event(level: i64, error_type: i64, action: i64, partition_name: str, timestamp: i64) -> HealthEvent {
 ```
 
 **Parameters:**
@@ -1022,8 +1052,12 @@ pub fn arinc_hm_event(level: i64, error_type: i64, action: i64,
 - `level`: `i64`
 - `error_type`: `i64`
 - `action`: `i64`
+- `partition_name`: `str`
+- `timestamp`: `i64`
 
-*Defined at line 358*
+**Returns:** `HealthEvent`
+
+*Defined at line 391*
 
 ---
 
@@ -1041,7 +1075,7 @@ pub fn arinc_hm_level_name(level: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 365*
+*Defined at line 398*
 
 ---
 
@@ -1059,7 +1093,7 @@ pub fn arinc_hm_error_name(error_type: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 379*
+*Defined at line 412*
 
 ---
 
@@ -1077,7 +1111,7 @@ pub fn arinc_hm_action_name(action: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 405*
+*Defined at line 438*
 
 ---
 
@@ -1095,7 +1129,7 @@ pub fn arinc_hm_event_print(event: HealthEvent) -> void {
 
 **Returns:** `void`
 
-*Defined at line 428*
+*Defined at line 461*
 
 ---
 
@@ -1112,10 +1146,10 @@ pub struct ScheduleEntry {
 | Name | Type |
 |------|------|
 | `partition_name` | `str` |
-| `start_time` | `i64,    // offset from cycle start (ms)` |
-| `duration` | `i64,      // time slice duration (ms)` |
+| `start_time` | `i64` |
+| `duration` | `i64,  // time slice duration (ms)` |
 
-*Defined at line 449*
+*Defined at line 482*
 
 ---
 
@@ -1135,9 +1169,9 @@ pub struct CyclicSchedule {
 | `partition_names` | `Vec<str>` |
 | `start_times` | `Vec<i64>` |
 | `durations` | `Vec<i64>` |
-| `cycle_length` | `i64` |
+| `cycle_length` | `i64,  // total cycle duration (ms)` |
 
-*Defined at line 458*
+*Defined at line 491*
 
 ---
 
@@ -1146,15 +1180,18 @@ pub struct CyclicSchedule {
 Create a schedule entry (returned for inspection, not stored in Vec).
 
 ```fides
-pub fn arinc_schedule_entry(partition_name: str, start_time: i64,
+pub fn arinc_schedule_entry(partition_name: str, start_time: i64, duration: i64) -> ScheduleEntry {
 ```
 
 **Parameters:**
 
 - `partition_name`: `str`
 - `start_time`: `i64`
+- `duration`: `i64`
 
-*Defined at line 469*
+**Returns:** `ScheduleEntry`
+
+*Defined at line 502*
 
 ---
 
@@ -1172,7 +1209,7 @@ pub fn arinc_cyclic_schedule(cycle_length: i64) -> CyclicSchedule {
 
 **Returns:** `CyclicSchedule`
 
-*Defined at line 476*
+*Defined at line 509*
 
 ---
 
@@ -1191,7 +1228,7 @@ pub fn arinc_schedule_add_entry(schedule: &mut CyclicSchedule, entry: ScheduleEn
 
 **Returns:** `void`
 
-*Defined at line 483*
+*Defined at line 516*
 
 ---
 
@@ -1209,7 +1246,7 @@ pub fn arinc_schedule_count(schedule: CyclicSchedule) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 490*
+*Defined at line 523*
 
 ---
 
@@ -1227,7 +1264,7 @@ pub fn arinc_schedule_cycle_length(schedule: CyclicSchedule) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 495*
+*Defined at line 528*
 
 ---
 
@@ -1247,7 +1284,7 @@ pub fn arinc_schedule_partition_at(schedule: CyclicSchedule, time_offset: i64) -
 
 **Returns:** `str`
 
-*Defined at line 501*
+*Defined at line 534*
 
 ---
 
@@ -1265,8 +1302,8 @@ pub fn arinc_schedule_print(schedule: CyclicSchedule) -> void {
 
 **Returns:** `void`
 
-*Defined at line 515*
+*Defined at line 548*
 
 ---
 
-*Generated by [scribe](https://fides.dev) — Fides documentation generator*
+*Generated by [scribe](https://fides.dev) -- Fides documentation generator*

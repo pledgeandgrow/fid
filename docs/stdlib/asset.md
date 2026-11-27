@@ -1,15 +1,17 @@
-# asset — Fides Documentation
+[All modules](index.md)
+
+# asset -- Fides Documentation
 
 ## Contents
 
-- [ASSET_TEXTURE:](#asset_texture:) (const)
-- [ASSET_SOUND:](#asset_sound:) (const)
-- [ASSET_FONT:](#asset_font:) (const)
-- [ASSET_MESH:](#asset_mesh:) (const)
-- [ASSET_TEXT:](#asset_text:) (const)
-- [ASSET_DATA:](#asset_data:) (const)
-- [AssetEntry](#assetentry) (struct)
-- [AssetManager](#assetmanager) (struct)
+- [ASSET_TEXTURE:](#ASSET_TEXTURE:) (const)
+- [ASSET_SOUND:](#ASSET_SOUND:) (const)
+- [ASSET_FONT:](#ASSET_FONT:) (const)
+- [ASSET_MESH:](#ASSET_MESH:) (const)
+- [ASSET_TEXT:](#ASSET_TEXT:) (const)
+- [ASSET_DATA:](#ASSET_DATA:) (const)
+- [AssetEntry](#AssetEntry) (struct)
+- [AssetManager](#AssetManager) (struct)
 - [asset_init](#asset_init) (function)
 - [asset_set_root](#asset_set_root) (function)
 - [asset_set_auto_reload](#asset_set_auto_reload) (function)
@@ -18,6 +20,7 @@
 - [asset_load_sound](#asset_load_sound) (function)
 - [asset_load_font](#asset_load_font) (function)
 - [asset_load_mesh](#asset_load_mesh) (function)
+- [asset_load_image](#asset_load_image) (function)
 - [asset_load_text](#asset_load_text) (function)
 - [asset_handle](#asset_handle) (function)
 - [asset_type](#asset_type) (function)
@@ -37,7 +40,7 @@
 pub const ASSET_TEXTURE: i64 = 0;
 ```
 
-*Defined at line 29*
+*Defined at line 31*
 
 ---
 
@@ -47,7 +50,7 @@ pub const ASSET_TEXTURE: i64 = 0;
 pub const ASSET_SOUND: i64 = 1;
 ```
 
-*Defined at line 29*
+*Defined at line 32*
 
 ---
 
@@ -57,7 +60,7 @@ pub const ASSET_SOUND: i64 = 1;
 pub const ASSET_FONT: i64 = 2;
 ```
 
-*Defined at line 29*
+*Defined at line 33*
 
 ---
 
@@ -67,7 +70,7 @@ pub const ASSET_FONT: i64 = 2;
 pub const ASSET_MESH: i64 = 3;
 ```
 
-*Defined at line 29*
+*Defined at line 34*
 
 ---
 
@@ -77,7 +80,7 @@ pub const ASSET_MESH: i64 = 3;
 pub const ASSET_TEXT: i64 = 4;
 ```
 
-*Defined at line 29*
+*Defined at line 35*
 
 ---
 
@@ -87,7 +90,7 @@ pub const ASSET_TEXT: i64 = 4;
 pub const ASSET_DATA: i64 = 5;
 ```
 
-*Defined at line 29*
+*Defined at line 36*
 
 ---
 
@@ -103,13 +106,13 @@ pub struct AssetEntry {
 |------|------|
 | `path` | `str` |
 | `asset_type` | `i64` |
-| `handle` | `i64,          // native handle (texture, sound, etc.)` |
+| `handle` | `i64` |
 | `ref_count` | `i64` |
 | `loaded` | `bool` |
-| `last_modified` | `i64,   // file mtime (for hot reload)` |
-| `size` | `i64,             // size in bytes` |
+| `last_modified` | `i64` |
+| `size` | `i64,  // size in bytes` |
 
-*Defined at line 32*
+*Defined at line 39*
 
 ---
 
@@ -124,12 +127,12 @@ pub struct AssetManager {
 | Name | Type |
 |------|------|
 | `assets` | `Vec<AssetEntry>` |
-| `root_path` | `str,        // base path for relative paths` |
-| `auto_reload` | `bool,     // check for file changes each frame` |
+| `root_path` | `str` |
+| `auto_reload` | `bool` |
 | `total_loaded` | `i64` |
-| `total_memory` | `i64,     // estimated memory usage in bytes` |
+| `total_memory` | `i64,  // estimated memory usage in bytes` |
 
-*Defined at line 44*
+*Defined at line 51*
 
 ---
 
@@ -137,13 +140,32 @@ pub struct AssetManager {
 
 Initialize the asset manager.
 
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+use file;
+val p = "fid_doctest_asset.tmp";
+file_write(p, "hello\n");
+asset_init();
+assert_eq(asset_count(), 0);
+assert_eq(asset_load_text("fid_doctest_asset_missing.tmp"), -1);
+val a = asset_load_text(p);
+assert(a >= 0);
+assert_eq(asset_type(a), ASSET_TEXT);
+assert_eq(asset_path(a), p);
+assert_eq(asset_load_text(p), a);
+assert_eq(asset_count(), 1);
+file_delete(p);
+```
+
 ```fides
 pub fn asset_init() -> void {
 ```
 
 **Returns:** `void`
 
-*Defined at line 73*
+*Defined at line 80*
 
 ---
 
@@ -161,7 +183,7 @@ pub fn asset_set_root(path: str) -> void {
 
 **Returns:** `void`
 
-*Defined at line 80*
+*Defined at line 87*
 
 ---
 
@@ -179,7 +201,7 @@ pub fn asset_set_auto_reload(enabled: bool) -> void {
 
 **Returns:** `void`
 
-*Defined at line 85*
+*Defined at line 92*
 
 ---
 
@@ -197,7 +219,7 @@ pub fn asset_find(path: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 90*
+*Defined at line 97*
 
 ---
 
@@ -215,7 +237,7 @@ pub fn asset_load_texture(path: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 102*
+*Defined at line 109*
 
 ---
 
@@ -233,7 +255,7 @@ pub fn asset_load_sound(path: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 126*
+*Defined at line 139*
 
 ---
 
@@ -252,7 +274,7 @@ pub fn asset_load_font(path: str, size: f64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 149*
+*Defined at line 170*
 
 ---
 
@@ -270,7 +292,28 @@ pub fn asset_load_mesh(path: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 172*
+*Defined at line 199*
+
+---
+
+## asset_load_image
+
+Load and decode an image file (PNG or BMP) directly.
+Unlike asset_load_texture (a native-handle seam that returns -1 without
+the SDL runtime), this decodes in pure Fides and returns the pixels.
+`width` is 0 on failure.
+
+```fides
+pub fn asset_load_image(path: str) -> Image {
+```
+
+**Parameters:**
+
+- `path`: `str`
+
+**Returns:** `Image`
+
+*Defined at line 231*
 
 ---
 
@@ -288,7 +331,7 @@ pub fn asset_load_text(path: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 203*
+*Defined at line 236*
 
 ---
 
@@ -306,7 +349,7 @@ pub fn asset_handle(idx: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 227*
+*Defined at line 260*
 
 ---
 
@@ -324,7 +367,7 @@ pub fn asset_type(idx: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 235*
+*Defined at line 268*
 
 ---
 
@@ -342,7 +385,7 @@ pub fn asset_path(idx: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 243*
+*Defined at line 276*
 
 ---
 
@@ -360,7 +403,7 @@ pub fn asset_release(idx: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 251*
+*Defined at line 284*
 
 ---
 
@@ -378,7 +421,7 @@ pub fn asset_unload(idx: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 268*
+*Defined at line 307*
 
 ---
 
@@ -396,7 +439,7 @@ pub fn asset_reload(idx: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 283*
+*Defined at line 328*
 
 ---
 
@@ -410,7 +453,7 @@ pub fn asset_hot_reload() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 316*
+*Defined at line 380*
 
 ---
 
@@ -424,7 +467,7 @@ pub fn asset_count() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 335*
+*Defined at line 405*
 
 ---
 
@@ -438,7 +481,7 @@ pub fn asset_memory_usage() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 340*
+*Defined at line 410*
 
 ---
 
@@ -452,7 +495,7 @@ pub fn asset_unload_all() -> void {
 
 **Returns:** `void`
 
-*Defined at line 345*
+*Defined at line 415*
 
 ---
 
@@ -466,8 +509,8 @@ pub fn asset_shutdown() -> void {
 
 **Returns:** `void`
 
-*Defined at line 355*
+*Defined at line 425*
 
 ---
 
-*Generated by [scribe](https://fides.dev) — Fides documentation generator*
+*Generated by [scribe](https://fides.dev) -- Fides documentation generator*

@@ -1,0 +1,281 @@
+[All modules](index.md)
+
+# crypto_bind -- Fides Documentation
+
+## Contents
+
+- [cb_gcm_encrypt](#cb_gcm_encrypt) (function)
+- [cb_gcm_decrypt](#cb_gcm_decrypt) (function)
+- [cb_pbkdf2_derive](#cb_pbkdf2_derive) (function)
+- [cb_ecdsa_generate](#cb_ecdsa_generate) (function)
+- [cb_ecdsa_sign](#cb_ecdsa_sign) (function)
+- [cb_ecdsa_verify](#cb_ecdsa_verify) (function)
+- [cb_rsa_generate](#cb_rsa_generate) (function)
+- [cb_rsa_sign_pkcs1](#cb_rsa_sign_pkcs1) (function)
+- [cb_rsa_verify_pkcs1](#cb_rsa_verify_pkcs1) (function)
+- [cb_rsa_sign_pss](#cb_rsa_sign_pss) (function)
+- [cb_rsa_verify_pss](#cb_rsa_verify_pss) (function)
+- [cb_rsa_encrypt_oaep](#cb_rsa_encrypt_oaep) (function)
+- [cb_rsa_decrypt_oaep](#cb_rsa_decrypt_oaep) (function)
+
+## cb_gcm_encrypt
+
+```fides
+pub fn cb_gcm_encrypt(@secret key: &Vec, nonce: &Vec, aad: &Vec, pt: &Vec) -> Vec<i64> {
+```
+
+**Parameters:**
+
+- `@secret key`: `&Vec`
+- `nonce`: `&Vec`
+- `aad`: `&Vec`
+- `pt`: `&Vec`
+
+**Returns:** `Vec<i64>`
+
+*Defined at line 373*
+
+---
+
+## cb_gcm_decrypt
+
+```fides
+pub fn cb_gcm_decrypt(@secret key: &Vec, nonce: &Vec, aad: &Vec, ct_tag: &Vec) -> Vec<i64> {
+```
+
+**Parameters:**
+
+- `@secret key`: `&Vec`
+- `nonce`: `&Vec`
+- `aad`: `&Vec`
+- `ct_tag`: `&Vec`
+
+**Returns:** `Vec<i64>`
+
+*Defined at line 448*
+
+---
+
+## cb_pbkdf2_derive
+
+```fides
+pub fn cb_pbkdf2_derive(@secret password: &Vec, salt: &Vec, iters: i64, out_len: i64) -> Vec<i64> {
+```
+
+**Parameters:**
+
+- `@secret password`: `&Vec`
+- `salt`: `&Vec`
+- `iters`: `i64`
+- `out_len`: `i64`
+
+**Returns:** `Vec<i64>`
+
+*Defined at line 520*
+
+---
+
+## cb_ecdsa_generate
+
+Generate a P-256 key pair into priv_blob/pub_blob. 0 on success.
+
+```fides
+pub fn cb_ecdsa_generate(priv_blob: &mut Vec, pub_blob: &mut Vec) -> i64 {
+```
+
+**Parameters:**
+
+- `priv_blob`: `&mut Vec`
+- `pub_blob`: `&mut Vec`
+
+**Returns:** `i64`
+
+*Defined at line 658*
+
+---
+
+## cb_ecdsa_sign
+
+```fides
+pub fn cb_ecdsa_sign(@secret priv_blob: &Vec, hash: &Vec) -> Vec<i64> {
+```
+
+**Parameters:**
+
+- `@secret priv_blob`: `&Vec`
+- `hash`: `&Vec`
+
+**Returns:** `Vec<i64>`
+
+*Defined at line 766*
+
+---
+
+## cb_ecdsa_verify
+
+Verify a 64-byte r||s signature over a 32-byte hash with the public blob.
+
+```fides
+pub fn cb_ecdsa_verify(pub_blob: &Vec, hash: &Vec, sig: &Vec) -> bool {
+```
+
+**Parameters:**
+
+- `pub_blob`: `&Vec`
+- `hash`: `&Vec`
+- `sig`: `&Vec`
+
+**Returns:** `bool`
+
+*Defined at line 802*
+
+---
+
+## cb_rsa_generate
+
+Generate an RSA key of `bits` bits (2048, 3072, 4096; e = 65537) into
+priv_blob (full private) and pub_blob. 0 on success.
+
+```fides
+pub fn cb_rsa_generate(bits: i64, priv_blob: &mut Vec, pub_blob: &mut Vec) -> i64 {
+```
+
+**Parameters:**
+
+- `bits`: `i64`
+- `priv_blob`: `&mut Vec`
+- `pub_blob`: `&mut Vec`
+
+**Returns:** `i64`
+
+*Defined at line 964*
+
+---
+
+## cb_rsa_sign_pkcs1
+
+```fides
+pub fn cb_rsa_sign_pkcs1(@secret priv_blob: &Vec, hash_alg: str, hash: &Vec) -> Vec<i64> {
+```
+
+**Parameters:**
+
+- `@secret priv_blob`: `&Vec`
+- `hash_alg`: `str`
+- `hash`: `&Vec`
+
+**Returns:** `Vec<i64>`
+
+*Defined at line 1117*
+
+---
+
+## cb_rsa_verify_pkcs1
+
+Verify an RSASSA-PKCS1-v1_5 signature over the digest `hash` with a
+public (or private) blob.
+
+```fides
+pub fn cb_rsa_verify_pkcs1(pub_blob: &Vec, hash_alg: str, hash: &Vec, sig: &Vec) -> bool {
+```
+
+**Parameters:**
+
+- `pub_blob`: `&Vec`
+- `hash_alg`: `str`
+- `hash`: `&Vec`
+- `sig`: `&Vec`
+
+**Returns:** `bool`
+
+*Defined at line 1123*
+
+---
+
+## cb_rsa_sign_pss
+
+```fides
+pub fn cb_rsa_sign_pss(@secret priv_blob: &Vec, hash_alg: str, hash: &Vec, salt_len: i64) -> Vec<i64> {
+```
+
+**Parameters:**
+
+- `@secret priv_blob`: `&Vec`
+- `hash_alg`: `str`
+- `hash`: `&Vec`
+- `salt_len`: `i64`
+
+**Returns:** `Vec<i64>`
+
+*Defined at line 1133*
+
+---
+
+## cb_rsa_verify_pss
+
+Verify an RSASSA-PSS signature (MGF1 of the same hash, a salt of exactly
+`salt_len` bytes) over the digest `hash`.
+
+```fides
+pub fn cb_rsa_verify_pss(pub_blob: &Vec, hash_alg: str, hash: &Vec, sig: &Vec, salt_len: i64) -> bool {
+```
+
+**Parameters:**
+
+- `pub_blob`: `&Vec`
+- `hash_alg`: `str`
+- `hash`: `&Vec`
+- `sig`: `&Vec`
+- `salt_len`: `i64`
+
+**Returns:** `bool`
+
+*Defined at line 1139*
+
+---
+
+## cb_rsa_encrypt_oaep
+
+RSAES-OAEP (RFC 8017 7.1) with the hash `hash_alg` for the label and
+MGF1: encrypt `msg` (at most modulus length - 2 * digest - 2 bytes) to
+a public blob. `label` may be empty. The ciphertext (as long as the
+modulus), empty on error.
+
+```fides
+pub fn cb_rsa_encrypt_oaep(pub_blob: &Vec, hash_alg: str, msg: &Vec, label: &Vec) -> Vec<i64> {
+```
+
+**Parameters:**
+
+- `pub_blob`: `&Vec`
+- `hash_alg`: `str`
+- `msg`: `&Vec`
+- `label`: `&Vec`
+
+**Returns:** `Vec<i64>`
+
+*Defined at line 1147*
+
+---
+
+## cb_rsa_decrypt_oaep
+
+```fides
+pub fn cb_rsa_decrypt_oaep(@secret priv_blob: &Vec, hash_alg: str, ct: &Vec, label: &Vec, out: &mut Vec) -> bool {
+```
+
+**Parameters:**
+
+- `@secret priv_blob`: `&Vec`
+- `hash_alg`: `str`
+- `ct`: `&Vec`
+- `label`: `&Vec`
+- `out`: `&mut Vec`
+
+**Returns:** `bool`
+
+*Defined at line 1202*
+
+---
+
+*Generated by [scribe](https://fides.dev) -- Fides documentation generator*

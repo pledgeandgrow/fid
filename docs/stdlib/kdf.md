@@ -1,0 +1,331 @@
+[All modules](index.md)
+
+# kdf -- Fides Documentation
+
+## Contents
+
+- [KDF_SHA1:](#KDF_SHA1:) (const)
+- [KDF_SHA256:](#KDF_SHA256:) (const)
+- [KDF_SHA512:](#KDF_SHA512:) (const)
+- [kdf_sha1](#kdf_sha1) (function)
+- [kdf_hash](#kdf_hash) (function)
+- [kdf_hash_len](#kdf_hash_len) (function)
+- [kdf_block_len](#kdf_block_len) (function)
+- [kdf_hmac](#kdf_hmac) (function)
+- [kdf_hmac_sha1](#kdf_hmac_sha1) (function)
+- [kdf_hmac_sha256](#kdf_hmac_sha256) (function)
+- [kdf_hmac_sha512](#kdf_hmac_sha512) (function)
+- [kdf_hkdf_extract](#kdf_hkdf_extract) (function)
+- [kdf_hkdf_expand](#kdf_hkdf_expand) (function)
+- [kdf_hkdf](#kdf_hkdf) (function)
+- [kdf_pbkdf2](#kdf_pbkdf2) (function)
+- [kdf_salsa20_8](#kdf_salsa20_8) (function)
+- [kdf_scrypt](#kdf_scrypt) (function)
+
+## KDF_SHA1:
+
+```fides
+pub const KDF_SHA1: i64 = 1;
+```
+
+*Defined at line 31*
+
+---
+
+## KDF_SHA256:
+
+```fides
+pub const KDF_SHA256: i64 = 2;
+```
+
+*Defined at line 32*
+
+---
+
+## KDF_SHA512:
+
+```fides
+pub const KDF_SHA512: i64 = 3;
+```
+
+*Defined at line 33*
+
+---
+
+## kdf_sha1
+
+SHA-1 of bytes: the 20-byte digest. Legacy use only (HMAC, OTP).
+
+```fides
+pub fn kdf_sha1(msg: Vec<i64>) -> Vec<i64> {
+```
+
+**Parameters:**
+
+- `msg`: `Vec<i64>`
+
+**Returns:** `Vec<i64>`
+
+*Defined at line 42*
+
+---
+
+## kdf_hash
+
+The digest of `msg` with hash `h` (KDF_SHA1, KDF_SHA256, KDF_SHA512).
+
+```fides
+pub fn kdf_hash(h: i64, msg: Vec<i64>) -> Vec<i64> {
+```
+
+**Parameters:**
+
+- `h`: `i64`
+- `msg`: `Vec<i64>`
+
+**Returns:** `Vec<i64>`
+
+*Defined at line 139*
+
+---
+
+## kdf_hash_len
+
+Digest length in bytes.
+
+```fides
+pub fn kdf_hash_len(h: i64) -> i64 {
+```
+
+**Parameters:**
+
+- `h`: `i64`
+
+**Returns:** `i64`
+
+*Defined at line 150*
+
+---
+
+## kdf_block_len
+
+Block length in bytes (the HMAC key pad size).
+
+```fides
+pub fn kdf_block_len(h: i64) -> i64 {
+```
+
+**Parameters:**
+
+- `h`: `i64`
+
+**Returns:** `i64`
+
+*Defined at line 161*
+
+---
+
+## kdf_hmac
+
+HMAC with hash `h`.
+
+```fides
+pub fn kdf_hmac(h: i64, key: Vec<i64>, msg: Vec<i64>) -> Vec<i64> {
+```
+
+**Parameters:**
+
+- `h`: `i64`
+- `key`: `Vec<i64>`
+- `msg`: `Vec<i64>`
+
+**Returns:** `Vec<i64>`
+
+*Defined at line 169*
+
+---
+
+## kdf_hmac_sha1
+
+HMAC-SHA1 (RFC 2202).
+
+```fides
+pub fn kdf_hmac_sha1(key: Vec<i64>, msg: Vec<i64>) -> Vec<i64> {
+```
+
+**Parameters:**
+
+- `key`: `Vec<i64>`
+- `msg`: `Vec<i64>`
+
+**Returns:** `Vec<i64>`
+
+*Defined at line 211*
+
+---
+
+## kdf_hmac_sha256
+
+HMAC-SHA256 (RFC 4231).
+
+```fides
+pub fn kdf_hmac_sha256(key: Vec<i64>, msg: Vec<i64>) -> Vec<i64> {
+```
+
+**Parameters:**
+
+- `key`: `Vec<i64>`
+- `msg`: `Vec<i64>`
+
+**Returns:** `Vec<i64>`
+
+*Defined at line 216*
+
+---
+
+## kdf_hmac_sha512
+
+HMAC-SHA512 (RFC 4231).
+
+```fides
+pub fn kdf_hmac_sha512(key: Vec<i64>, msg: Vec<i64>) -> Vec<i64> {
+```
+
+**Parameters:**
+
+- `key`: `Vec<i64>`
+- `msg`: `Vec<i64>`
+
+**Returns:** `Vec<i64>`
+
+*Defined at line 221*
+
+---
+
+## kdf_hkdf_extract
+
+HKDF-Extract: PRK = HMAC(salt, IKM). An empty salt is HashLen zeros.
+
+```fides
+pub fn kdf_hkdf_extract(h: i64, salt: Vec<i64>, ikm: Vec<i64>) -> Vec<i64> {
+```
+
+**Parameters:**
+
+- `h`: `i64`
+- `salt`: `Vec<i64>`
+- `ikm`: `Vec<i64>`
+
+**Returns:** `Vec<i64>`
+
+*Defined at line 228*
+
+---
+
+## kdf_hkdf_expand
+
+HKDF-Expand: `len` bytes (at most 255 * HashLen; more gives empty).
+
+```fides
+pub fn kdf_hkdf_expand(h: i64, prk: Vec<i64>, info: Vec<i64>, len: i64) -> Vec<i64> {
+```
+
+**Parameters:**
+
+- `h`: `i64`
+- `prk`: `Vec<i64>`
+- `info`: `Vec<i64>`
+- `len`: `i64`
+
+**Returns:** `Vec<i64>`
+
+*Defined at line 241*
+
+---
+
+## kdf_hkdf
+
+HKDF: Extract then Expand.
+
+```fides
+pub fn kdf_hkdf(h: i64, salt: Vec<i64>, ikm: Vec<i64>, info: Vec<i64>, len: i64) -> Vec<i64> {
+```
+
+**Parameters:**
+
+- `h`: `i64`
+- `salt`: `Vec<i64>`
+- `ikm`: `Vec<i64>`
+- `info`: `Vec<i64>`
+- `len`: `i64`
+
+**Returns:** `Vec<i64>`
+
+*Defined at line 273*
+
+---
+
+## kdf_pbkdf2
+
+PBKDF2 with HMAC over hash `h`: `len` bytes, `iterations` >= 1.
+
+```fides
+pub fn kdf_pbkdf2(h: i64, password: Vec<i64>, salt: Vec<i64>, iterations: i64, len: i64) -> Vec<i64> {
+```
+
+**Parameters:**
+
+- `h`: `i64`
+- `password`: `Vec<i64>`
+- `salt`: `Vec<i64>`
+- `iterations`: `i64`
+- `len`: `i64`
+
+**Returns:** `Vec<i64>`
+
+*Defined at line 280*
+
+---
+
+## kdf_salsa20_8
+
+Salsa20/8 core on 16 words at x[off..off+16], in place (RFC 7914 §3).
+
+```fides
+pub fn kdf_salsa20_8(x: &mut Vec<i64>, off: i64) {
+```
+
+**Parameters:**
+
+- `x`: `&mut Vec<i64>`
+- `off`: `i64`
+
+*Defined at line 322*
+
+---
+
+## kdf_scrypt
+
+scrypt(P, S, N, r, p, dkLen). N must be a power of two above 1; r and
+p at least 1. Returns empty bytes on bad parameters.
+
+```fides
+pub fn kdf_scrypt(password: Vec<i64>, salt: Vec<i64>, n: i64, r: i64, p: i64, len: i64) -> Vec<i64> {
+```
+
+**Parameters:**
+
+- `password`: `Vec<i64>`
+- `salt`: `Vec<i64>`
+- `n`: `i64`
+- `r`: `i64`
+- `p`: `i64`
+- `len`: `i64`
+
+**Returns:** `Vec<i64>`
+
+*Defined at line 460*
+
+---
+
+*Generated by [scribe](https://fides.dev) -- Fides documentation generator*

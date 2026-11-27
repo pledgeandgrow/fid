@@ -1,0 +1,300 @@
+[All modules](index.md)
+
+# yaml -- Fides Documentation
+
+## Contents
+
+- [YamlValue](#YamlValue) (struct)
+- [YamlEntry](#YamlEntry) (struct)
+- [YamlDoc](#YamlDoc) (struct)
+- [yaml_load_all](#yaml_load_all) (function)
+- [yaml_load](#yaml_load) (function)
+- [yaml_parse](#yaml_parse) (function)
+- [yaml_get](#yaml_get) (function)
+- [yaml_has](#yaml_has) (function)
+- [yaml_kind](#yaml_kind) (function)
+- [yaml_get_str](#yaml_get_str) (function)
+- [yaml_get_int](#yaml_get_int) (function)
+- [yaml_get_float](#yaml_get_float) (function)
+- [yaml_get_bool](#yaml_get_bool) (function)
+- [yaml_list_len](#yaml_list_len) (function)
+
+## YamlValue
+
+kind: "str" | "int" | "float" | "bool" | "null" | "map" | "list".
+`sval` holds scalars; maps/lists only mark structure (children are
+other entries under a longer path).
+
+```fides
+pub struct YamlValue {
+```
+
+**Fields:**
+
+| Name | Type |
+|------|------|
+| `kind` | `str` |
+| `sval` | `str` |
+
+*Defined at line 80*
+
+---
+
+## YamlEntry
+
+One entry: dotted path → value. List indexes appear as digits.
+
+```fides
+pub struct YamlEntry {
+```
+
+**Fields:**
+
+| Name | Type |
+|------|------|
+| `path` | `str` |
+| `value` | `YamlValue` |
+
+*Defined at line 86*
+
+---
+
+## YamlDoc
+
+One document: its entries, or ok = false and the error.
+
+```fides
+pub struct YamlDoc {
+```
+
+**Fields:**
+
+| Name | Type |
+|------|------|
+| `ok` | `bool` |
+| `error` | `str` |
+| `entries` | `Vec<YamlEntry>` |
+
+*Defined at line 92*
+
+---
+
+## yaml_load_all
+
+Every document of a YAML stream, strictly (see the module header).
+
+```fides
+pub fn yaml_load_all(text: str) -> Vec<YamlDoc> {
+```
+
+**Parameters:**
+
+- `text`: `str`
+
+**Returns:** `Vec<YamlDoc>`
+
+*Defined at line 1948*
+
+---
+
+## yaml_load
+
+One YAML document, strictly; an empty text gives no entries. A stream
+of more than one document is an error (use yaml_load_all).
+
+```fides
+pub fn yaml_load(text: str) -> YamlDoc {
+```
+
+**Parameters:**
+
+- `text`: `str`
+
+**Returns:** `YamlDoc`
+
+*Defined at line 1954*
+
+---
+
+## yaml_parse
+
+Parse YAML text into Vec<YamlEntry> in document order, leniently (see
+the module header): all documents together, flow collections as text.
+
+```fides
+pub fn yaml_parse(text: str) -> Vec<YamlEntry> {
+```
+
+**Parameters:**
+
+- `text`: `str`
+
+**Returns:** `Vec<YamlEntry>`
+
+*Defined at line 1982*
+
+---
+
+## yaml_get
+
+Value at dotted `path`; kind "missing" when absent.
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+val doc = yaml_parse("name: app\nserver:\n  port: 8080\n  debug: true\nitems:\n  - a\n  - b\n");
+assert_eq(yaml_get_str(doc, "name"), "app");
+assert_eq(yaml_get_int(doc, "server.port", 0), 8080);
+assert(yaml_get_bool(doc, "server.debug", false));
+assert_eq(yaml_list_len(doc, "items"), 2);
+assert(yaml_has(doc, "items"));
+assert(!yaml_has(doc, "nope"));
+assert_eq(yaml_get(doc, "nope").kind, "missing");
+```
+
+```fides
+pub fn yaml_get(doc: Vec<YamlEntry>, path: str) -> YamlValue {
+```
+
+**Parameters:**
+
+- `doc`: `Vec<YamlEntry>`
+- `path`: `str`
+
+**Returns:** `YamlValue`
+
+*Defined at line 2022*
+
+---
+
+## yaml_has
+
+```fides
+pub fn yaml_has(doc: Vec<YamlEntry>, path: str) -> bool {
+```
+
+**Parameters:**
+
+- `doc`: `Vec<YamlEntry>`
+- `path`: `str`
+
+**Returns:** `bool`
+
+*Defined at line 2032*
+
+---
+
+## yaml_kind
+
+```fides
+pub fn yaml_kind(doc: Vec<YamlEntry>, path: str) -> str {
+```
+
+**Parameters:**
+
+- `doc`: `Vec<YamlEntry>`
+- `path`: `str`
+
+**Returns:** `str`
+
+*Defined at line 2036*
+
+---
+
+## yaml_get_str
+
+Scalar string at `path` ("" when absent).
+
+```fides
+pub fn yaml_get_str(doc: Vec<YamlEntry>, path: str) -> str {
+```
+
+**Parameters:**
+
+- `doc`: `Vec<YamlEntry>`
+- `path`: `str`
+
+**Returns:** `str`
+
+*Defined at line 2041*
+
+---
+
+## yaml_get_int
+
+Int at `path` (decimal, 0o octal or 0x hex), `default` when absent or
+not an int.
+
+```fides
+pub fn yaml_get_int(doc: Vec<YamlEntry>, path: str, default: i64) -> i64 {
+```
+
+**Parameters:**
+
+- `doc`: `Vec<YamlEntry>`
+- `path`: `str`
+- `default`: `i64`
+
+**Returns:** `i64`
+
+*Defined at line 2047*
+
+---
+
+## yaml_get_float
+
+```fides
+pub fn yaml_get_float(doc: Vec<YamlEntry>, path: str, default: f64) -> f64 {
+```
+
+**Parameters:**
+
+- `doc`: `Vec<YamlEntry>`
+- `path`: `str`
+- `default`: `f64`
+
+**Returns:** `f64`
+
+*Defined at line 2072*
+
+---
+
+## yaml_get_bool
+
+```fides
+pub fn yaml_get_bool(doc: Vec<YamlEntry>, path: str, default: bool) -> bool {
+```
+
+**Parameters:**
+
+- `doc`: `Vec<YamlEntry>`
+- `path`: `str`
+- `default`: `bool`
+
+**Returns:** `bool`
+
+*Defined at line 2083*
+
+---
+
+## yaml_list_len
+
+Number of items in the list at `path` (0 if not a list).
+
+```fides
+pub fn yaml_list_len(doc: Vec<YamlEntry>, path: str) -> i64 {
+```
+
+**Parameters:**
+
+- `doc`: `Vec<YamlEntry>`
+- `path`: `str`
+
+**Returns:** `i64`
+
+*Defined at line 2092*
+
+---
+
+*Generated by [scribe](https://fides.dev) -- Fides documentation generator*

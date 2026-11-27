@@ -1,116 +1,118 @@
-# input — Fides Documentation
+[All modules](index.md)
+
+# input -- Fides Documentation
 
 ## Contents
 
-- [KEY_UNKNOWN:](#key_unknown:) (const)
-- [KEY_SPACE:](#key_space:) (const)
-- [KEY_APOSTROPHE:](#key_apostrophe:) (const)
-- [KEY_COMMA:](#key_comma:) (const)
-- [KEY_MINUS:](#key_minus:) (const)
-- [KEY_PERIOD:](#key_period:) (const)
-- [KEY_SLASH:](#key_slash:) (const)
-- [KEY_0:](#key_0:) (const)
-- [KEY_1:](#key_1:) (const)
-- [KEY_2:](#key_2:) (const)
-- [KEY_3:](#key_3:) (const)
-- [KEY_4:](#key_4:) (const)
-- [KEY_5:](#key_5:) (const)
-- [KEY_6:](#key_6:) (const)
-- [KEY_7:](#key_7:) (const)
-- [KEY_8:](#key_8:) (const)
-- [KEY_9:](#key_9:) (const)
-- [KEY_SEMICOLON:](#key_semicolon:) (const)
-- [KEY_EQUAL:](#key_equal:) (const)
-- [KEY_A:](#key_a:) (const)
-- [KEY_B:](#key_b:) (const)
-- [KEY_C:](#key_c:) (const)
-- [KEY_D:](#key_d:) (const)
-- [KEY_E:](#key_e:) (const)
-- [KEY_F:](#key_f:) (const)
-- [KEY_G:](#key_g:) (const)
-- [KEY_H:](#key_h:) (const)
-- [KEY_I:](#key_i:) (const)
-- [KEY_J:](#key_j:) (const)
-- [KEY_K:](#key_k:) (const)
-- [KEY_L:](#key_l:) (const)
-- [KEY_M:](#key_m:) (const)
-- [KEY_N:](#key_n:) (const)
-- [KEY_O:](#key_o:) (const)
-- [KEY_P:](#key_p:) (const)
-- [KEY_Q:](#key_q:) (const)
-- [KEY_R:](#key_r:) (const)
-- [KEY_S:](#key_s:) (const)
-- [KEY_T:](#key_t:) (const)
-- [KEY_U:](#key_u:) (const)
-- [KEY_V:](#key_v:) (const)
-- [KEY_W:](#key_w:) (const)
-- [KEY_X:](#key_x:) (const)
-- [KEY_Y:](#key_y:) (const)
-- [KEY_Z:](#key_z:) (const)
-- [KEY_LEFT_BRACKET:](#key_left_bracket:) (const)
-- [KEY_BACKSLASH:](#key_backslash:) (const)
-- [KEY_RIGHT_BRACKET:](#key_right_bracket:) (const)
-- [KEY_BACKTICK:](#key_backtick:) (const)
-- [KEY_ESCAPE:](#key_escape:) (const)
-- [KEY_ENTER:](#key_enter:) (const)
-- [KEY_TAB:](#key_tab:) (const)
-- [KEY_BACKSPACE:](#key_backspace:) (const)
-- [KEY_INSERT:](#key_insert:) (const)
-- [KEY_DELETE:](#key_delete:) (const)
-- [KEY_RIGHT:](#key_right:) (const)
-- [KEY_LEFT:](#key_left:) (const)
-- [KEY_DOWN:](#key_down:) (const)
-- [KEY_UP:](#key_up:) (const)
-- [KEY_PAGE_UP:](#key_page_up:) (const)
-- [KEY_PAGE_DOWN:](#key_page_down:) (const)
-- [KEY_HOME:](#key_home:) (const)
-- [KEY_END:](#key_end:) (const)
-- [KEY_CAPS_LOCK:](#key_caps_lock:) (const)
-- [KEY_SCROLL_LOCK:](#key_scroll_lock:) (const)
-- [KEY_NUM_LOCK:](#key_num_lock:) (const)
-- [KEY_PRINT_SCREEN:](#key_print_screen:) (const)
-- [KEY_PAUSE:](#key_pause:) (const)
-- [KEY_F1:](#key_f1:) (const)
-- [KEY_F2:](#key_f2:) (const)
-- [KEY_F3:](#key_f3:) (const)
-- [KEY_F4:](#key_f4:) (const)
-- [KEY_F5:](#key_f5:) (const)
-- [KEY_F6:](#key_f6:) (const)
-- [KEY_F7:](#key_f7:) (const)
-- [KEY_F8:](#key_f8:) (const)
-- [KEY_F9:](#key_f9:) (const)
-- [KEY_F10:](#key_f10:) (const)
-- [KEY_F11:](#key_f11:) (const)
-- [KEY_F12:](#key_f12:) (const)
-- [KEY_LEFT_SHIFT:](#key_left_shift:) (const)
-- [KEY_LEFT_CONTROL:](#key_left_control:) (const)
-- [KEY_LEFT_ALT:](#key_left_alt:) (const)
-- [KEY_LEFT_SUPER:](#key_left_super:) (const)
-- [KEY_RIGHT_SHIFT:](#key_right_shift:) (const)
-- [KEY_RIGHT_CONTROL:](#key_right_control:) (const)
-- [KEY_RIGHT_ALT:](#key_right_alt:) (const)
-- [KEY_RIGHT_SUPER:](#key_right_super:) (const)
-- [MOUSE_LEFT:](#mouse_left:) (const)
-- [MOUSE_RIGHT:](#mouse_right:) (const)
-- [MOUSE_MIDDLE:](#mouse_middle:) (const)
-- [MOUSE_X1:](#mouse_x1:) (const)
-- [MOUSE_X2:](#mouse_x2:) (const)
-- [GAMEPAD_A:](#gamepad_a:) (const)
-- [GAMEPAD_B:](#gamepad_b:) (const)
-- [GAMEPAD_X:](#gamepad_x:) (const)
-- [GAMEPAD_Y:](#gamepad_y:) (const)
-- [GAMEPAD_LEFT_BUMPER:](#gamepad_left_bumper:) (const)
-- [GAMEPAD_RIGHT_BUMPER:](#gamepad_right_bumper:) (const)
-- [GAMEPAD_BACK:](#gamepad_back:) (const)
-- [GAMEPAD_START:](#gamepad_start:) (const)
-- [GAMEPAD_GUIDE:](#gamepad_guide:) (const)
-- [GAMEPAD_LEFT_THUMB:](#gamepad_left_thumb:) (const)
-- [GAMEPAD_RIGHT_THUMB:](#gamepad_right_thumb:) (const)
-- [GAMEPAD_DPAD_UP:](#gamepad_dpad_up:) (const)
-- [GAMEPAD_DPAD_RIGHT:](#gamepad_dpad_right:) (const)
-- [GAMEPAD_DPAD_DOWN:](#gamepad_dpad_down:) (const)
-- [GAMEPAD_DPAD_LEFT:](#gamepad_dpad_left:) (const)
-- [InputState](#inputstate) (struct)
+- [KEY_UNKNOWN:](#KEY_UNKNOWN:) (const)
+- [KEY_SPACE:](#KEY_SPACE:) (const)
+- [KEY_APOSTROPHE:](#KEY_APOSTROPHE:) (const)
+- [KEY_COMMA:](#KEY_COMMA:) (const)
+- [KEY_MINUS:](#KEY_MINUS:) (const)
+- [KEY_PERIOD:](#KEY_PERIOD:) (const)
+- [KEY_SLASH:](#KEY_SLASH:) (const)
+- [KEY_0:](#KEY_0:) (const)
+- [KEY_1:](#KEY_1:) (const)
+- [KEY_2:](#KEY_2:) (const)
+- [KEY_3:](#KEY_3:) (const)
+- [KEY_4:](#KEY_4:) (const)
+- [KEY_5:](#KEY_5:) (const)
+- [KEY_6:](#KEY_6:) (const)
+- [KEY_7:](#KEY_7:) (const)
+- [KEY_8:](#KEY_8:) (const)
+- [KEY_9:](#KEY_9:) (const)
+- [KEY_SEMICOLON:](#KEY_SEMICOLON:) (const)
+- [KEY_EQUAL:](#KEY_EQUAL:) (const)
+- [KEY_A:](#KEY_A:) (const)
+- [KEY_B:](#KEY_B:) (const)
+- [KEY_C:](#KEY_C:) (const)
+- [KEY_D:](#KEY_D:) (const)
+- [KEY_E:](#KEY_E:) (const)
+- [KEY_F:](#KEY_F:) (const)
+- [KEY_G:](#KEY_G:) (const)
+- [KEY_H:](#KEY_H:) (const)
+- [KEY_I:](#KEY_I:) (const)
+- [KEY_J:](#KEY_J:) (const)
+- [KEY_K:](#KEY_K:) (const)
+- [KEY_L:](#KEY_L:) (const)
+- [KEY_M:](#KEY_M:) (const)
+- [KEY_N:](#KEY_N:) (const)
+- [KEY_O:](#KEY_O:) (const)
+- [KEY_P:](#KEY_P:) (const)
+- [KEY_Q:](#KEY_Q:) (const)
+- [KEY_R:](#KEY_R:) (const)
+- [KEY_S:](#KEY_S:) (const)
+- [KEY_T:](#KEY_T:) (const)
+- [KEY_U:](#KEY_U:) (const)
+- [KEY_V:](#KEY_V:) (const)
+- [KEY_W:](#KEY_W:) (const)
+- [KEY_X:](#KEY_X:) (const)
+- [KEY_Y:](#KEY_Y:) (const)
+- [KEY_Z:](#KEY_Z:) (const)
+- [KEY_LEFT_BRACKET:](#KEY_LEFT_BRACKET:) (const)
+- [KEY_BACKSLASH:](#KEY_BACKSLASH:) (const)
+- [KEY_RIGHT_BRACKET:](#KEY_RIGHT_BRACKET:) (const)
+- [KEY_BACKTICK:](#KEY_BACKTICK:) (const)
+- [KEY_ESCAPE:](#KEY_ESCAPE:) (const)
+- [KEY_ENTER:](#KEY_ENTER:) (const)
+- [KEY_TAB:](#KEY_TAB:) (const)
+- [KEY_BACKSPACE:](#KEY_BACKSPACE:) (const)
+- [KEY_INSERT:](#KEY_INSERT:) (const)
+- [KEY_DELETE:](#KEY_DELETE:) (const)
+- [KEY_RIGHT:](#KEY_RIGHT:) (const)
+- [KEY_LEFT:](#KEY_LEFT:) (const)
+- [KEY_DOWN:](#KEY_DOWN:) (const)
+- [KEY_UP:](#KEY_UP:) (const)
+- [KEY_PAGE_UP:](#KEY_PAGE_UP:) (const)
+- [KEY_PAGE_DOWN:](#KEY_PAGE_DOWN:) (const)
+- [KEY_HOME:](#KEY_HOME:) (const)
+- [KEY_END:](#KEY_END:) (const)
+- [KEY_CAPS_LOCK:](#KEY_CAPS_LOCK:) (const)
+- [KEY_SCROLL_LOCK:](#KEY_SCROLL_LOCK:) (const)
+- [KEY_NUM_LOCK:](#KEY_NUM_LOCK:) (const)
+- [KEY_PRINT_SCREEN:](#KEY_PRINT_SCREEN:) (const)
+- [KEY_PAUSE:](#KEY_PAUSE:) (const)
+- [KEY_F1:](#KEY_F1:) (const)
+- [KEY_F2:](#KEY_F2:) (const)
+- [KEY_F3:](#KEY_F3:) (const)
+- [KEY_F4:](#KEY_F4:) (const)
+- [KEY_F5:](#KEY_F5:) (const)
+- [KEY_F6:](#KEY_F6:) (const)
+- [KEY_F7:](#KEY_F7:) (const)
+- [KEY_F8:](#KEY_F8:) (const)
+- [KEY_F9:](#KEY_F9:) (const)
+- [KEY_F10:](#KEY_F10:) (const)
+- [KEY_F11:](#KEY_F11:) (const)
+- [KEY_F12:](#KEY_F12:) (const)
+- [KEY_LEFT_SHIFT:](#KEY_LEFT_SHIFT:) (const)
+- [KEY_LEFT_CONTROL:](#KEY_LEFT_CONTROL:) (const)
+- [KEY_LEFT_ALT:](#KEY_LEFT_ALT:) (const)
+- [KEY_LEFT_SUPER:](#KEY_LEFT_SUPER:) (const)
+- [KEY_RIGHT_SHIFT:](#KEY_RIGHT_SHIFT:) (const)
+- [KEY_RIGHT_CONTROL:](#KEY_RIGHT_CONTROL:) (const)
+- [KEY_RIGHT_ALT:](#KEY_RIGHT_ALT:) (const)
+- [KEY_RIGHT_SUPER:](#KEY_RIGHT_SUPER:) (const)
+- [MOUSE_LEFT:](#MOUSE_LEFT:) (const)
+- [MOUSE_RIGHT:](#MOUSE_RIGHT:) (const)
+- [MOUSE_MIDDLE:](#MOUSE_MIDDLE:) (const)
+- [MOUSE_X1:](#MOUSE_X1:) (const)
+- [MOUSE_X2:](#MOUSE_X2:) (const)
+- [GAMEPAD_A:](#GAMEPAD_A:) (const)
+- [GAMEPAD_B:](#GAMEPAD_B:) (const)
+- [GAMEPAD_X:](#GAMEPAD_X:) (const)
+- [GAMEPAD_Y:](#GAMEPAD_Y:) (const)
+- [GAMEPAD_LEFT_BUMPER:](#GAMEPAD_LEFT_BUMPER:) (const)
+- [GAMEPAD_RIGHT_BUMPER:](#GAMEPAD_RIGHT_BUMPER:) (const)
+- [GAMEPAD_BACK:](#GAMEPAD_BACK:) (const)
+- [GAMEPAD_START:](#GAMEPAD_START:) (const)
+- [GAMEPAD_GUIDE:](#GAMEPAD_GUIDE:) (const)
+- [GAMEPAD_LEFT_THUMB:](#GAMEPAD_LEFT_THUMB:) (const)
+- [GAMEPAD_RIGHT_THUMB:](#GAMEPAD_RIGHT_THUMB:) (const)
+- [GAMEPAD_DPAD_UP:](#GAMEPAD_DPAD_UP:) (const)
+- [GAMEPAD_DPAD_RIGHT:](#GAMEPAD_DPAD_RIGHT:) (const)
+- [GAMEPAD_DPAD_DOWN:](#GAMEPAD_DPAD_DOWN:) (const)
+- [GAMEPAD_DPAD_LEFT:](#GAMEPAD_DPAD_LEFT:) (const)
+- [InputState](#InputState) (struct)
 - [input_init](#input_init) (function)
 - [input_create](#input_create) (function)
 - [input_update](#input_update) (function)
@@ -161,7 +163,7 @@ pub const KEY_UNKNOWN: i64 = 0;
 pub const KEY_SPACE: i64 = 32;
 ```
 
-*Defined at line 25*
+*Defined at line 26*
 
 ---
 
@@ -171,7 +173,7 @@ pub const KEY_SPACE: i64 = 32;
 pub const KEY_APOSTROPHE: i64 = 39;
 ```
 
-*Defined at line 25*
+*Defined at line 27*
 
 ---
 
@@ -181,7 +183,7 @@ pub const KEY_APOSTROPHE: i64 = 39;
 pub const KEY_COMMA: i64 = 44;
 ```
 
-*Defined at line 25*
+*Defined at line 28*
 
 ---
 
@@ -191,7 +193,7 @@ pub const KEY_COMMA: i64 = 44;
 pub const KEY_MINUS: i64 = 45;
 ```
 
-*Defined at line 25*
+*Defined at line 29*
 
 ---
 
@@ -201,7 +203,7 @@ pub const KEY_MINUS: i64 = 45;
 pub const KEY_PERIOD: i64 = 46;
 ```
 
-*Defined at line 25*
+*Defined at line 30*
 
 ---
 
@@ -211,7 +213,7 @@ pub const KEY_PERIOD: i64 = 46;
 pub const KEY_SLASH: i64 = 47;
 ```
 
-*Defined at line 25*
+*Defined at line 31*
 
 ---
 
@@ -221,7 +223,7 @@ pub const KEY_SLASH: i64 = 47;
 pub const KEY_0: i64 = 48;
 ```
 
-*Defined at line 25*
+*Defined at line 32*
 
 ---
 
@@ -231,7 +233,7 @@ pub const KEY_0: i64 = 48;
 pub const KEY_1: i64 = 49;
 ```
 
-*Defined at line 25*
+*Defined at line 33*
 
 ---
 
@@ -241,7 +243,7 @@ pub const KEY_1: i64 = 49;
 pub const KEY_2: i64 = 50;
 ```
 
-*Defined at line 25*
+*Defined at line 34*
 
 ---
 
@@ -251,7 +253,7 @@ pub const KEY_2: i64 = 50;
 pub const KEY_3: i64 = 51;
 ```
 
-*Defined at line 25*
+*Defined at line 35*
 
 ---
 
@@ -261,7 +263,7 @@ pub const KEY_3: i64 = 51;
 pub const KEY_4: i64 = 52;
 ```
 
-*Defined at line 25*
+*Defined at line 36*
 
 ---
 
@@ -271,7 +273,7 @@ pub const KEY_4: i64 = 52;
 pub const KEY_5: i64 = 53;
 ```
 
-*Defined at line 25*
+*Defined at line 37*
 
 ---
 
@@ -281,7 +283,7 @@ pub const KEY_5: i64 = 53;
 pub const KEY_6: i64 = 54;
 ```
 
-*Defined at line 25*
+*Defined at line 38*
 
 ---
 
@@ -291,7 +293,7 @@ pub const KEY_6: i64 = 54;
 pub const KEY_7: i64 = 55;
 ```
 
-*Defined at line 25*
+*Defined at line 39*
 
 ---
 
@@ -301,7 +303,7 @@ pub const KEY_7: i64 = 55;
 pub const KEY_8: i64 = 56;
 ```
 
-*Defined at line 25*
+*Defined at line 40*
 
 ---
 
@@ -311,7 +313,7 @@ pub const KEY_8: i64 = 56;
 pub const KEY_9: i64 = 57;
 ```
 
-*Defined at line 25*
+*Defined at line 41*
 
 ---
 
@@ -321,7 +323,7 @@ pub const KEY_9: i64 = 57;
 pub const KEY_SEMICOLON: i64 = 59;
 ```
 
-*Defined at line 25*
+*Defined at line 42*
 
 ---
 
@@ -331,7 +333,7 @@ pub const KEY_SEMICOLON: i64 = 59;
 pub const KEY_EQUAL: i64 = 61;
 ```
 
-*Defined at line 25*
+*Defined at line 43*
 
 ---
 
@@ -341,7 +343,7 @@ pub const KEY_EQUAL: i64 = 61;
 pub const KEY_A: i64 = 65;
 ```
 
-*Defined at line 25*
+*Defined at line 44*
 
 ---
 
@@ -351,7 +353,7 @@ pub const KEY_A: i64 = 65;
 pub const KEY_B: i64 = 66;
 ```
 
-*Defined at line 25*
+*Defined at line 45*
 
 ---
 
@@ -361,7 +363,7 @@ pub const KEY_B: i64 = 66;
 pub const KEY_C: i64 = 67;
 ```
 
-*Defined at line 25*
+*Defined at line 46*
 
 ---
 
@@ -371,7 +373,7 @@ pub const KEY_C: i64 = 67;
 pub const KEY_D: i64 = 68;
 ```
 
-*Defined at line 25*
+*Defined at line 47*
 
 ---
 
@@ -381,7 +383,7 @@ pub const KEY_D: i64 = 68;
 pub const KEY_E: i64 = 69;
 ```
 
-*Defined at line 25*
+*Defined at line 48*
 
 ---
 
@@ -391,7 +393,7 @@ pub const KEY_E: i64 = 69;
 pub const KEY_F: i64 = 70;
 ```
 
-*Defined at line 25*
+*Defined at line 49*
 
 ---
 
@@ -401,7 +403,7 @@ pub const KEY_F: i64 = 70;
 pub const KEY_G: i64 = 71;
 ```
 
-*Defined at line 25*
+*Defined at line 50*
 
 ---
 
@@ -411,7 +413,7 @@ pub const KEY_G: i64 = 71;
 pub const KEY_H: i64 = 72;
 ```
 
-*Defined at line 25*
+*Defined at line 51*
 
 ---
 
@@ -421,7 +423,7 @@ pub const KEY_H: i64 = 72;
 pub const KEY_I: i64 = 73;
 ```
 
-*Defined at line 25*
+*Defined at line 52*
 
 ---
 
@@ -431,7 +433,7 @@ pub const KEY_I: i64 = 73;
 pub const KEY_J: i64 = 74;
 ```
 
-*Defined at line 25*
+*Defined at line 53*
 
 ---
 
@@ -441,7 +443,7 @@ pub const KEY_J: i64 = 74;
 pub const KEY_K: i64 = 75;
 ```
 
-*Defined at line 25*
+*Defined at line 54*
 
 ---
 
@@ -451,7 +453,7 @@ pub const KEY_K: i64 = 75;
 pub const KEY_L: i64 = 76;
 ```
 
-*Defined at line 25*
+*Defined at line 55*
 
 ---
 
@@ -461,7 +463,7 @@ pub const KEY_L: i64 = 76;
 pub const KEY_M: i64 = 77;
 ```
 
-*Defined at line 25*
+*Defined at line 56*
 
 ---
 
@@ -471,7 +473,7 @@ pub const KEY_M: i64 = 77;
 pub const KEY_N: i64 = 78;
 ```
 
-*Defined at line 25*
+*Defined at line 57*
 
 ---
 
@@ -481,7 +483,7 @@ pub const KEY_N: i64 = 78;
 pub const KEY_O: i64 = 79;
 ```
 
-*Defined at line 25*
+*Defined at line 58*
 
 ---
 
@@ -491,7 +493,7 @@ pub const KEY_O: i64 = 79;
 pub const KEY_P: i64 = 80;
 ```
 
-*Defined at line 25*
+*Defined at line 59*
 
 ---
 
@@ -501,7 +503,7 @@ pub const KEY_P: i64 = 80;
 pub const KEY_Q: i64 = 81;
 ```
 
-*Defined at line 25*
+*Defined at line 60*
 
 ---
 
@@ -511,7 +513,7 @@ pub const KEY_Q: i64 = 81;
 pub const KEY_R: i64 = 82;
 ```
 
-*Defined at line 25*
+*Defined at line 61*
 
 ---
 
@@ -521,7 +523,7 @@ pub const KEY_R: i64 = 82;
 pub const KEY_S: i64 = 83;
 ```
 
-*Defined at line 25*
+*Defined at line 62*
 
 ---
 
@@ -531,7 +533,7 @@ pub const KEY_S: i64 = 83;
 pub const KEY_T: i64 = 84;
 ```
 
-*Defined at line 25*
+*Defined at line 63*
 
 ---
 
@@ -541,7 +543,7 @@ pub const KEY_T: i64 = 84;
 pub const KEY_U: i64 = 85;
 ```
 
-*Defined at line 25*
+*Defined at line 64*
 
 ---
 
@@ -551,7 +553,7 @@ pub const KEY_U: i64 = 85;
 pub const KEY_V: i64 = 86;
 ```
 
-*Defined at line 25*
+*Defined at line 65*
 
 ---
 
@@ -561,7 +563,7 @@ pub const KEY_V: i64 = 86;
 pub const KEY_W: i64 = 87;
 ```
 
-*Defined at line 25*
+*Defined at line 66*
 
 ---
 
@@ -571,7 +573,7 @@ pub const KEY_W: i64 = 87;
 pub const KEY_X: i64 = 88;
 ```
 
-*Defined at line 25*
+*Defined at line 67*
 
 ---
 
@@ -581,7 +583,7 @@ pub const KEY_X: i64 = 88;
 pub const KEY_Y: i64 = 89;
 ```
 
-*Defined at line 25*
+*Defined at line 68*
 
 ---
 
@@ -591,7 +593,7 @@ pub const KEY_Y: i64 = 89;
 pub const KEY_Z: i64 = 90;
 ```
 
-*Defined at line 25*
+*Defined at line 69*
 
 ---
 
@@ -601,7 +603,7 @@ pub const KEY_Z: i64 = 90;
 pub const KEY_LEFT_BRACKET: i64 = 91;
 ```
 
-*Defined at line 25*
+*Defined at line 70*
 
 ---
 
@@ -611,7 +613,7 @@ pub const KEY_LEFT_BRACKET: i64 = 91;
 pub const KEY_BACKSLASH: i64 = 92;
 ```
 
-*Defined at line 25*
+*Defined at line 71*
 
 ---
 
@@ -621,7 +623,7 @@ pub const KEY_BACKSLASH: i64 = 92;
 pub const KEY_RIGHT_BRACKET: i64 = 93;
 ```
 
-*Defined at line 25*
+*Defined at line 72*
 
 ---
 
@@ -631,7 +633,7 @@ pub const KEY_RIGHT_BRACKET: i64 = 93;
 pub const KEY_BACKTICK: i64 = 96;
 ```
 
-*Defined at line 25*
+*Defined at line 73*
 
 ---
 
@@ -641,7 +643,7 @@ pub const KEY_BACKTICK: i64 = 96;
 pub const KEY_ESCAPE: i64 = 256;
 ```
 
-*Defined at line 25*
+*Defined at line 74*
 
 ---
 
@@ -651,7 +653,7 @@ pub const KEY_ESCAPE: i64 = 256;
 pub const KEY_ENTER: i64 = 257;
 ```
 
-*Defined at line 25*
+*Defined at line 75*
 
 ---
 
@@ -661,7 +663,7 @@ pub const KEY_ENTER: i64 = 257;
 pub const KEY_TAB: i64 = 258;
 ```
 
-*Defined at line 25*
+*Defined at line 76*
 
 ---
 
@@ -671,7 +673,7 @@ pub const KEY_TAB: i64 = 258;
 pub const KEY_BACKSPACE: i64 = 259;
 ```
 
-*Defined at line 25*
+*Defined at line 77*
 
 ---
 
@@ -681,7 +683,7 @@ pub const KEY_BACKSPACE: i64 = 259;
 pub const KEY_INSERT: i64 = 260;
 ```
 
-*Defined at line 25*
+*Defined at line 78*
 
 ---
 
@@ -691,7 +693,7 @@ pub const KEY_INSERT: i64 = 260;
 pub const KEY_DELETE: i64 = 261;
 ```
 
-*Defined at line 25*
+*Defined at line 79*
 
 ---
 
@@ -701,7 +703,7 @@ pub const KEY_DELETE: i64 = 261;
 pub const KEY_RIGHT: i64 = 262;
 ```
 
-*Defined at line 25*
+*Defined at line 80*
 
 ---
 
@@ -711,7 +713,7 @@ pub const KEY_RIGHT: i64 = 262;
 pub const KEY_LEFT: i64 = 263;
 ```
 
-*Defined at line 25*
+*Defined at line 81*
 
 ---
 
@@ -721,7 +723,7 @@ pub const KEY_LEFT: i64 = 263;
 pub const KEY_DOWN: i64 = 264;
 ```
 
-*Defined at line 25*
+*Defined at line 82*
 
 ---
 
@@ -731,7 +733,7 @@ pub const KEY_DOWN: i64 = 264;
 pub const KEY_UP: i64 = 265;
 ```
 
-*Defined at line 25*
+*Defined at line 83*
 
 ---
 
@@ -741,7 +743,7 @@ pub const KEY_UP: i64 = 265;
 pub const KEY_PAGE_UP: i64 = 266;
 ```
 
-*Defined at line 25*
+*Defined at line 84*
 
 ---
 
@@ -751,7 +753,7 @@ pub const KEY_PAGE_UP: i64 = 266;
 pub const KEY_PAGE_DOWN: i64 = 267;
 ```
 
-*Defined at line 25*
+*Defined at line 85*
 
 ---
 
@@ -761,7 +763,7 @@ pub const KEY_PAGE_DOWN: i64 = 267;
 pub const KEY_HOME: i64 = 268;
 ```
 
-*Defined at line 25*
+*Defined at line 86*
 
 ---
 
@@ -771,7 +773,7 @@ pub const KEY_HOME: i64 = 268;
 pub const KEY_END: i64 = 269;
 ```
 
-*Defined at line 25*
+*Defined at line 87*
 
 ---
 
@@ -781,7 +783,7 @@ pub const KEY_END: i64 = 269;
 pub const KEY_CAPS_LOCK: i64 = 280;
 ```
 
-*Defined at line 25*
+*Defined at line 88*
 
 ---
 
@@ -791,7 +793,7 @@ pub const KEY_CAPS_LOCK: i64 = 280;
 pub const KEY_SCROLL_LOCK: i64 = 281;
 ```
 
-*Defined at line 25*
+*Defined at line 89*
 
 ---
 
@@ -801,7 +803,7 @@ pub const KEY_SCROLL_LOCK: i64 = 281;
 pub const KEY_NUM_LOCK: i64 = 282;
 ```
 
-*Defined at line 25*
+*Defined at line 90*
 
 ---
 
@@ -811,7 +813,7 @@ pub const KEY_NUM_LOCK: i64 = 282;
 pub const KEY_PRINT_SCREEN: i64 = 283;
 ```
 
-*Defined at line 25*
+*Defined at line 91*
 
 ---
 
@@ -821,7 +823,7 @@ pub const KEY_PRINT_SCREEN: i64 = 283;
 pub const KEY_PAUSE: i64 = 284;
 ```
 
-*Defined at line 25*
+*Defined at line 92*
 
 ---
 
@@ -831,7 +833,7 @@ pub const KEY_PAUSE: i64 = 284;
 pub const KEY_F1: i64 = 290;
 ```
 
-*Defined at line 25*
+*Defined at line 93*
 
 ---
 
@@ -841,7 +843,7 @@ pub const KEY_F1: i64 = 290;
 pub const KEY_F2: i64 = 291;
 ```
 
-*Defined at line 25*
+*Defined at line 94*
 
 ---
 
@@ -851,7 +853,7 @@ pub const KEY_F2: i64 = 291;
 pub const KEY_F3: i64 = 292;
 ```
 
-*Defined at line 25*
+*Defined at line 95*
 
 ---
 
@@ -861,7 +863,7 @@ pub const KEY_F3: i64 = 292;
 pub const KEY_F4: i64 = 293;
 ```
 
-*Defined at line 25*
+*Defined at line 96*
 
 ---
 
@@ -871,7 +873,7 @@ pub const KEY_F4: i64 = 293;
 pub const KEY_F5: i64 = 294;
 ```
 
-*Defined at line 25*
+*Defined at line 97*
 
 ---
 
@@ -881,7 +883,7 @@ pub const KEY_F5: i64 = 294;
 pub const KEY_F6: i64 = 295;
 ```
 
-*Defined at line 25*
+*Defined at line 98*
 
 ---
 
@@ -891,7 +893,7 @@ pub const KEY_F6: i64 = 295;
 pub const KEY_F7: i64 = 296;
 ```
 
-*Defined at line 25*
+*Defined at line 99*
 
 ---
 
@@ -901,7 +903,7 @@ pub const KEY_F7: i64 = 296;
 pub const KEY_F8: i64 = 297;
 ```
 
-*Defined at line 25*
+*Defined at line 100*
 
 ---
 
@@ -911,7 +913,7 @@ pub const KEY_F8: i64 = 297;
 pub const KEY_F9: i64 = 298;
 ```
 
-*Defined at line 25*
+*Defined at line 101*
 
 ---
 
@@ -921,7 +923,7 @@ pub const KEY_F9: i64 = 298;
 pub const KEY_F10: i64 = 299;
 ```
 
-*Defined at line 25*
+*Defined at line 102*
 
 ---
 
@@ -931,7 +933,7 @@ pub const KEY_F10: i64 = 299;
 pub const KEY_F11: i64 = 300;
 ```
 
-*Defined at line 25*
+*Defined at line 103*
 
 ---
 
@@ -941,7 +943,7 @@ pub const KEY_F11: i64 = 300;
 pub const KEY_F12: i64 = 301;
 ```
 
-*Defined at line 25*
+*Defined at line 104*
 
 ---
 
@@ -951,7 +953,7 @@ pub const KEY_F12: i64 = 301;
 pub const KEY_LEFT_SHIFT: i64 = 340;
 ```
 
-*Defined at line 25*
+*Defined at line 105*
 
 ---
 
@@ -961,7 +963,7 @@ pub const KEY_LEFT_SHIFT: i64 = 340;
 pub const KEY_LEFT_CONTROL: i64 = 341;
 ```
 
-*Defined at line 25*
+*Defined at line 106*
 
 ---
 
@@ -971,7 +973,7 @@ pub const KEY_LEFT_CONTROL: i64 = 341;
 pub const KEY_LEFT_ALT: i64 = 342;
 ```
 
-*Defined at line 25*
+*Defined at line 107*
 
 ---
 
@@ -981,7 +983,7 @@ pub const KEY_LEFT_ALT: i64 = 342;
 pub const KEY_LEFT_SUPER: i64 = 343;
 ```
 
-*Defined at line 25*
+*Defined at line 108*
 
 ---
 
@@ -991,7 +993,7 @@ pub const KEY_LEFT_SUPER: i64 = 343;
 pub const KEY_RIGHT_SHIFT: i64 = 344;
 ```
 
-*Defined at line 25*
+*Defined at line 109*
 
 ---
 
@@ -1001,7 +1003,7 @@ pub const KEY_RIGHT_SHIFT: i64 = 344;
 pub const KEY_RIGHT_CONTROL: i64 = 345;
 ```
 
-*Defined at line 25*
+*Defined at line 110*
 
 ---
 
@@ -1011,7 +1013,7 @@ pub const KEY_RIGHT_CONTROL: i64 = 345;
 pub const KEY_RIGHT_ALT: i64 = 346;
 ```
 
-*Defined at line 25*
+*Defined at line 111*
 
 ---
 
@@ -1021,7 +1023,7 @@ pub const KEY_RIGHT_ALT: i64 = 346;
 pub const KEY_RIGHT_SUPER: i64 = 347;
 ```
 
-*Defined at line 25*
+*Defined at line 112*
 
 ---
 
@@ -1031,7 +1033,7 @@ pub const KEY_RIGHT_SUPER: i64 = 347;
 pub const MOUSE_LEFT: i64 = 0;
 ```
 
-*Defined at line 28*
+*Defined at line 115*
 
 ---
 
@@ -1041,7 +1043,7 @@ pub const MOUSE_LEFT: i64 = 0;
 pub const MOUSE_RIGHT: i64 = 1;
 ```
 
-*Defined at line 28*
+*Defined at line 116*
 
 ---
 
@@ -1051,7 +1053,7 @@ pub const MOUSE_RIGHT: i64 = 1;
 pub const MOUSE_MIDDLE: i64 = 2;
 ```
 
-*Defined at line 28*
+*Defined at line 117*
 
 ---
 
@@ -1061,7 +1063,7 @@ pub const MOUSE_MIDDLE: i64 = 2;
 pub const MOUSE_X1: i64 = 3;
 ```
 
-*Defined at line 28*
+*Defined at line 118*
 
 ---
 
@@ -1071,7 +1073,7 @@ pub const MOUSE_X1: i64 = 3;
 pub const MOUSE_X2: i64 = 4;
 ```
 
-*Defined at line 28*
+*Defined at line 119*
 
 ---
 
@@ -1081,7 +1083,7 @@ pub const MOUSE_X2: i64 = 4;
 pub const GAMEPAD_A: i64 = 0;
 ```
 
-*Defined at line 31*
+*Defined at line 122*
 
 ---
 
@@ -1091,7 +1093,7 @@ pub const GAMEPAD_A: i64 = 0;
 pub const GAMEPAD_B: i64 = 1;
 ```
 
-*Defined at line 31*
+*Defined at line 123*
 
 ---
 
@@ -1101,7 +1103,7 @@ pub const GAMEPAD_B: i64 = 1;
 pub const GAMEPAD_X: i64 = 2;
 ```
 
-*Defined at line 31*
+*Defined at line 124*
 
 ---
 
@@ -1111,7 +1113,7 @@ pub const GAMEPAD_X: i64 = 2;
 pub const GAMEPAD_Y: i64 = 3;
 ```
 
-*Defined at line 31*
+*Defined at line 125*
 
 ---
 
@@ -1121,7 +1123,7 @@ pub const GAMEPAD_Y: i64 = 3;
 pub const GAMEPAD_LEFT_BUMPER: i64 = 4;
 ```
 
-*Defined at line 31*
+*Defined at line 126*
 
 ---
 
@@ -1131,7 +1133,7 @@ pub const GAMEPAD_LEFT_BUMPER: i64 = 4;
 pub const GAMEPAD_RIGHT_BUMPER: i64 = 5;
 ```
 
-*Defined at line 31*
+*Defined at line 127*
 
 ---
 
@@ -1141,7 +1143,7 @@ pub const GAMEPAD_RIGHT_BUMPER: i64 = 5;
 pub const GAMEPAD_BACK: i64 = 6;
 ```
 
-*Defined at line 31*
+*Defined at line 128*
 
 ---
 
@@ -1151,7 +1153,7 @@ pub const GAMEPAD_BACK: i64 = 6;
 pub const GAMEPAD_START: i64 = 7;
 ```
 
-*Defined at line 31*
+*Defined at line 129*
 
 ---
 
@@ -1161,7 +1163,7 @@ pub const GAMEPAD_START: i64 = 7;
 pub const GAMEPAD_GUIDE: i64 = 8;
 ```
 
-*Defined at line 31*
+*Defined at line 130*
 
 ---
 
@@ -1171,7 +1173,7 @@ pub const GAMEPAD_GUIDE: i64 = 8;
 pub const GAMEPAD_LEFT_THUMB: i64 = 9;
 ```
 
-*Defined at line 31*
+*Defined at line 131*
 
 ---
 
@@ -1181,7 +1183,7 @@ pub const GAMEPAD_LEFT_THUMB: i64 = 9;
 pub const GAMEPAD_RIGHT_THUMB: i64 = 10;
 ```
 
-*Defined at line 31*
+*Defined at line 132*
 
 ---
 
@@ -1191,7 +1193,7 @@ pub const GAMEPAD_RIGHT_THUMB: i64 = 10;
 pub const GAMEPAD_DPAD_UP: i64 = 11;
 ```
 
-*Defined at line 31*
+*Defined at line 133*
 
 ---
 
@@ -1201,7 +1203,7 @@ pub const GAMEPAD_DPAD_UP: i64 = 11;
 pub const GAMEPAD_DPAD_RIGHT: i64 = 12;
 ```
 
-*Defined at line 31*
+*Defined at line 134*
 
 ---
 
@@ -1211,7 +1213,7 @@ pub const GAMEPAD_DPAD_RIGHT: i64 = 12;
 pub const GAMEPAD_DPAD_DOWN: i64 = 13;
 ```
 
-*Defined at line 31*
+*Defined at line 135*
 
 ---
 
@@ -1221,7 +1223,7 @@ pub const GAMEPAD_DPAD_DOWN: i64 = 13;
 pub const GAMEPAD_DPAD_LEFT: i64 = 14;
 ```
 
-*Defined at line 31*
+*Defined at line 136*
 
 ---
 
@@ -1235,26 +1237,26 @@ pub struct InputState {
 
 | Name | Type |
 |------|------|
-| `key_current` | `Vec<i64>,    // 512 keys` |
+| `key_current` | `Vec<i64>` |
 | `key_previous` | `Vec<i64>` |
 | `mouse_x` | `i64` |
 | `mouse_y` | `i64` |
 | `mouse_delta_x` | `i64` |
 | `mouse_delta_y` | `i64` |
-| `mouse_current` | `Vec<i64>,  // 5 buttons` |
+| `mouse_current` | `Vec<i64>` |
 | `mouse_previous` | `Vec<i64>` |
-| `mouse_wheel` | `i64,          // scroll wheel delta` |
+| `mouse_wheel` | `i64` |
 | `gamepad_connected` | `bool` |
-| `gamepad_current` | `Vec<i64>,  // 15 buttons` |
+| `gamepad_current` | `Vec<i64>` |
 | `gamepad_previous` | `Vec<i64>` |
-| `gamepad_left_x` | `f64,       // -1.0 to 1.0` |
+| `gamepad_left_x` | `f64` |
 | `gamepad_left_y` | `f64` |
 | `gamepad_right_x` | `f64` |
 | `gamepad_right_y` | `f64` |
-| `gamepad_left_trigger` | `f64,  // 0.0 to 1.0` |
+| `gamepad_left_trigger` | `f64` |
 | `gamepad_right_trigger` | `f64` |
 
-*Defined at line 40*
+*Defined at line 145*
 
 ---
 
@@ -1268,7 +1270,7 @@ pub fn input_init() -> void {
 
 **Returns:** `void`
 
-*Defined at line 87*
+*Defined at line 192*
 
 ---
 
@@ -1276,13 +1278,25 @@ pub fn input_init() -> void {
 
 Create a new input state tracker.
 
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+var s = input_create();
+assert(!input_key_held(s, 4));
+input_set_key(&mut s, 4, true);
+assert(input_key_held(s, 4));
+assert(input_key_pressed(s, 4));
+assert(!input_key_held(s, -1));
+```
+
 ```fides
 pub fn input_create() -> InputState {
 ```
 
 **Returns:** `InputState`
 
-*Defined at line 100*
+*Defined at line 209*
 
 ---
 
@@ -1301,7 +1315,7 @@ pub fn input_update(state: &mut InputState) -> void {
 
 **Returns:** `void`
 
-*Defined at line 137*
+*Defined at line 246*
 
 ---
 
@@ -1320,7 +1334,7 @@ pub fn input_key_held(state: InputState, key: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 173*
+*Defined at line 282*
 
 ---
 
@@ -1339,7 +1353,7 @@ pub fn input_key_pressed(state: InputState, key: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 181*
+*Defined at line 290*
 
 ---
 
@@ -1358,7 +1372,7 @@ pub fn input_key_released(state: InputState, key: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 189*
+*Defined at line 298*
 
 ---
 
@@ -1378,7 +1392,7 @@ pub fn input_set_key(state: &mut InputState, key: i64, held: bool) -> void {
 
 **Returns:** `void`
 
-*Defined at line 197*
+*Defined at line 306*
 
 ---
 
@@ -1396,7 +1410,7 @@ pub fn input_mouse_x(state: InputState) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 211*
+*Defined at line 320*
 
 ---
 
@@ -1414,7 +1428,7 @@ pub fn input_mouse_y(state: InputState) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 216*
+*Defined at line 325*
 
 ---
 
@@ -1432,7 +1446,7 @@ pub fn input_mouse_delta(state: InputState) -> (i64, i64) {
 
 **Returns:** `(i64, i64)`
 
-*Defined at line 221*
+*Defined at line 330*
 
 ---
 
@@ -1450,7 +1464,7 @@ pub fn input_mouse_wheel(state: InputState) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 226*
+*Defined at line 335*
 
 ---
 
@@ -1469,7 +1483,7 @@ pub fn input_mouse_held(state: InputState, button: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 231*
+*Defined at line 340*
 
 ---
 
@@ -1488,7 +1502,7 @@ pub fn input_mouse_pressed(state: InputState, button: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 239*
+*Defined at line 348*
 
 ---
 
@@ -1507,7 +1521,7 @@ pub fn input_mouse_released(state: InputState, button: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 247*
+*Defined at line 356*
 
 ---
 
@@ -1527,7 +1541,7 @@ pub fn input_set_mouse_pos(state: &mut InputState, x: i64, y: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 255*
+*Defined at line 364*
 
 ---
 
@@ -1547,7 +1561,7 @@ pub fn input_set_mouse_button(state: &mut InputState, button: i64, held: bool) -
 
 **Returns:** `void`
 
-*Defined at line 263*
+*Defined at line 372*
 
 ---
 
@@ -1566,7 +1580,7 @@ pub fn input_set_mouse_wheel(state: &mut InputState, delta: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 275*
+*Defined at line 384*
 
 ---
 
@@ -1584,7 +1598,7 @@ pub fn input_gamepad_connected(state: InputState) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 282*
+*Defined at line 391*
 
 ---
 
@@ -1603,7 +1617,7 @@ pub fn input_gamepad_held(state: InputState, button: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 287*
+*Defined at line 396*
 
 ---
 
@@ -1622,7 +1636,7 @@ pub fn input_gamepad_pressed(state: InputState, button: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 295*
+*Defined at line 404*
 
 ---
 
@@ -1640,7 +1654,7 @@ pub fn input_gamepad_left_x(state: InputState) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 303*
+*Defined at line 412*
 
 ---
 
@@ -1658,7 +1672,7 @@ pub fn input_gamepad_left_y(state: InputState) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 308*
+*Defined at line 417*
 
 ---
 
@@ -1676,7 +1690,7 @@ pub fn input_gamepad_right_x(state: InputState) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 313*
+*Defined at line 422*
 
 ---
 
@@ -1694,7 +1708,7 @@ pub fn input_gamepad_right_y(state: InputState) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 318*
+*Defined at line 427*
 
 ---
 
@@ -1712,7 +1726,7 @@ pub fn input_gamepad_left_trigger(state: InputState) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 323*
+*Defined at line 432*
 
 ---
 
@@ -1730,7 +1744,7 @@ pub fn input_gamepad_right_trigger(state: InputState) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 328*
+*Defined at line 437*
 
 ---
 
@@ -1750,7 +1764,7 @@ pub fn input_set_gamepad_button(state: &mut InputState, button: i64, held: bool)
 
 **Returns:** `void`
 
-*Defined at line 333*
+*Defined at line 442*
 
 ---
 
@@ -1774,7 +1788,7 @@ pub fn input_set_gamepad_axes(state: &mut InputState, lx: f64, ly: f64, rx: f64,
 
 **Returns:** `void`
 
-*Defined at line 345*
+*Defined at line 454*
 
 ---
 
@@ -1793,7 +1807,7 @@ pub fn input_set_gamepad_connected(state: &mut InputState, connected: bool) -> v
 
 **Returns:** `void`
 
-*Defined at line 355*
+*Defined at line 464*
 
 ---
 
@@ -1811,7 +1825,7 @@ pub fn input_shift_held(state: InputState) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 362*
+*Defined at line 471*
 
 ---
 
@@ -1829,7 +1843,7 @@ pub fn input_ctrl_held(state: InputState) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 367*
+*Defined at line 476*
 
 ---
 
@@ -1847,7 +1861,7 @@ pub fn input_alt_held(state: InputState) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 372*
+*Defined at line 481*
 
 ---
 
@@ -1866,8 +1880,8 @@ pub fn input_direction(state: InputState) -> (f64, f64) {
 
 **Returns:** `(f64, f64)`
 
-*Defined at line 380*
+*Defined at line 489*
 
 ---
 
-*Generated by [scribe](https://fides.dev) — Fides documentation generator*
+*Generated by [scribe](https://fides.dev) -- Fides documentation generator*

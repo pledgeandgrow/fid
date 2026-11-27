@@ -1,8 +1,10 @@
-# serialize — Fides Documentation
+[All modules](index.md)
+
+# serialize -- Fides Documentation
 
 ## Contents
 
-- [SerializeWriter](#serializewriter) (struct)
+- [SerializeWriter](#SerializeWriter) (struct)
 - [serialize_writer_create](#serialize_writer_create) (function)
 - [serialize_write_u8](#serialize_write_u8) (function)
 - [serialize_write_u16](#serialize_write_u16) (function)
@@ -14,7 +16,7 @@
 - [serialize_save](#serialize_save) (function)
 - [serialize_data](#serialize_data) (function)
 - [serialize_size](#serialize_size) (function)
-- [SerializeReader](#serializereader) (struct)
+- [SerializeReader](#SerializeReader) (struct)
 - [serialize_reader_create](#serialize_reader_create) (function)
 - [serialize_load](#serialize_load) (function)
 - [serialize_read_u8](#serialize_read_u8) (function)
@@ -27,10 +29,11 @@
 - [serialize_reader_remaining](#serialize_reader_remaining) (function)
 - [serialize_reader_eof](#serialize_reader_eof) (function)
 - [serialize_reader_reset](#serialize_reader_reset) (function)
-- [JsonWriter](#jsonwriter) (struct)
+- [JsonWriter](#JsonWriter) (struct)
 - [json_writer_create](#json_writer_create) (function)
 - [json_writer_pretty](#json_writer_pretty) (function)
 - [json_object_begin](#json_object_begin) (function)
+- [json_object_end](#json_object_end) (function)
 - [json_array_begin](#json_array_begin) (function)
 - [json_array_end](#json_array_end) (function)
 - [json_key](#json_key) (function)
@@ -42,7 +45,7 @@
 - [json_comma](#json_comma) (function)
 - [json_result](#json_result) (function)
 - [json_save](#json_save) (function)
-- [JsonValue](#jsonvalue) (struct)
+- [JsonValue](#JsonValue) (struct)
 - [json_parse_int](#json_parse_int) (function)
 - [json_parse_float](#json_parse_float) (function)
 - [json_parse_string](#json_parse_string) (function)
@@ -65,6 +68,27 @@ pub struct SerializeWriter {
 ---
 
 ## serialize_writer_create
+
+An empty byte writer.
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+var w = serialize_writer_create();
+serialize_write_u8(&mut w, 7);
+serialize_write_i32(&mut w, -5);
+serialize_write_u16(&mut w, 513);
+serialize_write_bool(&mut w, true);
+serialize_write_str(&mut w, "hi");
+assert_eq(serialize_size(&w), 14);
+var r = serialize_reader_create(serialize_data(&w));
+assert_eq(serialize_read_u8(&mut r), 7);
+assert_eq(serialize_read_i32(&mut r), -5);
+assert_eq(serialize_read_u16(&mut r), 513);
+assert(serialize_read_bool(&mut r));
+assert_eq(serialize_read_str(&mut r), "hi");
+```
 
 ```fides
 pub fn serialize_writer_create() -> SerializeWriter {
@@ -157,7 +181,7 @@ pub fn serialize_write_bool(w: &mut SerializeWriter, val: bool) -> void {
 
 **Returns:** `void`
 
-*Defined at line 85*
+*Defined at line 90*
 
 ---
 
@@ -174,7 +198,7 @@ pub fn serialize_write_str(w: &mut SerializeWriter, val: str) -> void {
 
 **Returns:** `void`
 
-*Defined at line 93*
+*Defined at line 98*
 
 ---
 
@@ -191,7 +215,7 @@ pub fn serialize_write_bytes(w: &mut SerializeWriter, data: &mut Vec<i64>) -> vo
 
 **Returns:** `void`
 
-*Defined at line 103*
+*Defined at line 108*
 
 ---
 
@@ -210,7 +234,7 @@ pub fn serialize_save(w: &SerializeWriter, path: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 113*
+*Defined at line 118*
 
 ---
 
@@ -228,7 +252,7 @@ pub fn serialize_data(w: &SerializeWriter) -> Vec<i64> {
 
 **Returns:** `Vec<i64>`
 
-*Defined at line 119*
+*Defined at line 131*
 
 ---
 
@@ -246,7 +270,7 @@ pub fn serialize_size(w: &SerializeWriter) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 124*
+*Defined at line 136*
 
 ---
 
@@ -263,7 +287,7 @@ pub struct SerializeReader {
 | `data` | `Vec<i64>` |
 | `pos` | `i64` |
 
-*Defined at line 130*
+*Defined at line 142*
 
 ---
 
@@ -279,7 +303,7 @@ pub fn serialize_reader_create(data: Vec<i64>) -> SerializeReader {
 
 **Returns:** `SerializeReader`
 
-*Defined at line 135*
+*Defined at line 147*
 
 ---
 
@@ -297,7 +321,7 @@ pub fn serialize_load(path: str) -> SerializeReader {
 
 **Returns:** `SerializeReader`
 
-*Defined at line 142*
+*Defined at line 154*
 
 ---
 
@@ -313,7 +337,7 @@ pub fn serialize_read_u8(r: &mut SerializeReader) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 162*
+*Defined at line 185*
 
 ---
 
@@ -329,7 +353,7 @@ pub fn serialize_read_u16(r: &mut SerializeReader) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 171*
+*Defined at line 194*
 
 ---
 
@@ -345,7 +369,7 @@ pub fn serialize_read_i32(r: &mut SerializeReader) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 177*
+*Defined at line 200*
 
 ---
 
@@ -361,7 +385,7 @@ pub fn serialize_read_f64(r: &mut SerializeReader) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 191*
+*Defined at line 214*
 
 ---
 
@@ -377,7 +401,7 @@ pub fn serialize_read_bool(r: &mut SerializeReader) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 201*
+*Defined at line 228*
 
 ---
 
@@ -393,7 +417,7 @@ pub fn serialize_read_str(r: &mut SerializeReader) -> str {
 
 **Returns:** `str`
 
-*Defined at line 205*
+*Defined at line 232*
 
 ---
 
@@ -409,7 +433,7 @@ pub fn serialize_read_bytes(r: &mut SerializeReader) -> Vec<i64> {
 
 **Returns:** `Vec<i64>`
 
-*Defined at line 221*
+*Defined at line 248*
 
 ---
 
@@ -425,7 +449,7 @@ pub fn serialize_reader_remaining(r: &SerializeReader) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 232*
+*Defined at line 259*
 
 ---
 
@@ -441,7 +465,7 @@ pub fn serialize_reader_eof(r: &SerializeReader) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 236*
+*Defined at line 263*
 
 ---
 
@@ -457,7 +481,7 @@ pub fn serialize_reader_reset(r: &mut SerializeReader) -> void {
 
 **Returns:** `void`
 
-*Defined at line 240*
+*Defined at line 267*
 
 ---
 
@@ -475,7 +499,7 @@ pub struct JsonWriter {
 | `indent` | `i64` |
 | `pretty` | `bool` |
 
-*Defined at line 246*
+*Defined at line 273*
 
 ---
 
@@ -487,7 +511,7 @@ pub fn json_writer_create() -> JsonWriter {
 
 **Returns:** `JsonWriter`
 
-*Defined at line 252*
+*Defined at line 279*
 
 ---
 
@@ -499,7 +523,7 @@ pub fn json_writer_pretty() -> JsonWriter {
 
 **Returns:** `JsonWriter`
 
-*Defined at line 258*
+*Defined at line 285*
 
 ---
 
@@ -515,7 +539,23 @@ pub fn json_object_begin(w: &mut JsonWriter) -> void {
 
 **Returns:** `void`
 
-*Defined at line 281*
+*Defined at line 308*
+
+---
+
+## json_object_end
+
+```fides
+pub fn json_object_end(w: &mut JsonWriter) -> void {
+```
+
+**Parameters:**
+
+- `w`: `&mut JsonWriter`
+
+**Returns:** `void`
+
+*Defined at line 313*
 
 ---
 
@@ -531,7 +571,7 @@ pub fn json_array_begin(w: &mut JsonWriter) -> void {
 
 **Returns:** `void`
 
-*Defined at line 291*
+*Defined at line 318*
 
 ---
 
@@ -547,7 +587,7 @@ pub fn json_array_end(w: &mut JsonWriter) -> void {
 
 **Returns:** `void`
 
-*Defined at line 296*
+*Defined at line 323*
 
 ---
 
@@ -564,7 +604,7 @@ pub fn json_key(w: &mut JsonWriter, key: str) -> void {
 
 **Returns:** `void`
 
-*Defined at line 301*
+*Defined at line 328*
 
 ---
 
@@ -581,7 +621,7 @@ pub fn json_write_string(w: &mut JsonWriter, val: str) -> void {
 
 **Returns:** `void`
 
-*Defined at line 308*
+*Defined at line 335*
 
 ---
 
@@ -598,7 +638,7 @@ pub fn json_number(w: &mut JsonWriter, val: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 312*
+*Defined at line 339*
 
 ---
 
@@ -615,7 +655,7 @@ pub fn json_int(w: &mut JsonWriter, val: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 316*
+*Defined at line 343*
 
 ---
 
@@ -632,7 +672,7 @@ pub fn json_write_bool(w: &mut JsonWriter, val: bool) -> void {
 
 **Returns:** `void`
 
-*Defined at line 320*
+*Defined at line 347*
 
 ---
 
@@ -648,7 +688,7 @@ pub fn json_write_null(w: &mut JsonWriter) -> void {
 
 **Returns:** `void`
 
-*Defined at line 328*
+*Defined at line 355*
 
 ---
 
@@ -664,7 +704,7 @@ pub fn json_comma(w: &mut JsonWriter) -> void {
 
 **Returns:** `void`
 
-*Defined at line 332*
+*Defined at line 359*
 
 ---
 
@@ -680,7 +720,7 @@ pub fn json_result(w: &JsonWriter) -> str {
 
 **Returns:** `str`
 
-*Defined at line 336*
+*Defined at line 363*
 
 ---
 
@@ -699,7 +739,7 @@ pub fn json_save(w: &JsonWriter, path: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 341*
+*Defined at line 368*
 
 ---
 
@@ -713,13 +753,13 @@ pub struct JsonValue {
 
 | Name | Type |
 |------|------|
-| `kind` | `i64,     // 0=null, 1=bool, 2=int, 3=float, 4=string, 5=array, 6=object` |
+| `kind` | `i64` |
 | `bool_val` | `bool` |
 | `int_val` | `i64` |
 | `float_val` | `f64` |
 | `str_val` | `str` |
 
-*Defined at line 350*
+*Defined at line 377*
 
 ---
 
@@ -736,7 +776,7 @@ pub fn json_parse_int(source: str, key: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 359*
+*Defined at line 386*
 
 ---
 
@@ -753,7 +793,7 @@ pub fn json_parse_float(source: str, key: str) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 369*
+*Defined at line 396*
 
 ---
 
@@ -770,7 +810,7 @@ pub fn json_parse_string(source: str, key: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 379*
+*Defined at line 406*
 
 ---
 
@@ -787,8 +827,8 @@ pub fn json_parse_bool(source: str, key: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 393*
+*Defined at line 420*
 
 ---
 
-*Generated by [scribe](https://fides.dev) — Fides documentation generator*
+*Generated by [scribe](https://fides.dev) -- Fides documentation generator*

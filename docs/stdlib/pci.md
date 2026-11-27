@@ -1,0 +1,374 @@
+[All modules](index.md)
+
+# pci -- Fides Documentation
+
+## Contents
+
+- [pci_u16](#pci_u16) (function)
+- [pci_u32](#pci_u32) (function)
+- [pci_vendor](#pci_vendor) (function)
+- [pci_device](#pci_device) (function)
+- [pci_command](#pci_command) (function)
+- [pci_status](#pci_status) (function)
+- [pci_revision](#pci_revision) (function)
+- [pci_progif](#pci_progif) (function)
+- [pci_subclass](#pci_subclass) (function)
+- [pci_class](#pci_class) (function)
+- [pci_header_type](#pci_header_type) (function)
+- [pci_multifunction](#pci_multifunction) (function)
+- [pci_present](#pci_present) (function)
+- [PciBar](#PciBar) (struct)
+- [pci_bar](#pci_bar) (function)
+- [pci_bar_size](#pci_bar_size) (function)
+- [pci_caps](#pci_caps) (function)
+- [pci_cap_offset](#pci_cap_offset) (function)
+- [pci_cf8](#pci_cf8) (function)
+
+## pci_u16
+
+```fides
+pub fn pci_u16(c: Vec<i64>, o: i64) -> i64 {
+```
+
+**Parameters:**
+
+- `c`: `Vec<i64>`
+- `o`: `i64`
+
+**Returns:** `i64`
+
+*Defined at line 8*
+
+---
+
+## pci_u32
+
+```fides
+pub fn pci_u32(c: Vec<i64>, o: i64) -> i64 {
+```
+
+**Parameters:**
+
+- `c`: `Vec<i64>`
+- `o`: `i64`
+
+**Returns:** `i64`
+
+*Defined at line 11*
+
+---
+
+## pci_vendor
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+var c: Vec<i64> = Vec::filled(64, 0);
+c.set(0, 0x86); c.set(1, 0x80);
+c.set(2, 0x0E); c.set(3, 0x10);
+c.set(11, 0x02); c.set(10, 0x00);
+c.set(14, 0x80);
+assert_eq(pci_vendor(c), 0x8086);
+assert_eq(pci_device(c), 0x100E);
+assert_eq(pci_class(c), 2);
+assert_eq(pci_header_type(c), 0);
+assert(pci_multifunction(c));
+assert(pci_present(c));
+```
+
+```fides
+pub fn pci_vendor(c: Vec<i64>) -> i64 {
+```
+
+**Parameters:**
+
+- `c`: `Vec<i64>`
+
+**Returns:** `i64`
+
+*Defined at line 28*
+
+---
+
+## pci_device
+
+```fides
+pub fn pci_device(c: Vec<i64>) -> i64 {
+```
+
+**Parameters:**
+
+- `c`: `Vec<i64>`
+
+**Returns:** `i64`
+
+*Defined at line 31*
+
+---
+
+## pci_command
+
+```fides
+pub fn pci_command(c: Vec<i64>) -> i64 {
+```
+
+**Parameters:**
+
+- `c`: `Vec<i64>`
+
+**Returns:** `i64`
+
+*Defined at line 34*
+
+---
+
+## pci_status
+
+```fides
+pub fn pci_status(c: Vec<i64>) -> i64 {
+```
+
+**Parameters:**
+
+- `c`: `Vec<i64>`
+
+**Returns:** `i64`
+
+*Defined at line 37*
+
+---
+
+## pci_revision
+
+```fides
+pub fn pci_revision(c: Vec<i64>) -> i64 {
+```
+
+**Parameters:**
+
+- `c`: `Vec<i64>`
+
+**Returns:** `i64`
+
+*Defined at line 40*
+
+---
+
+## pci_progif
+
+```fides
+pub fn pci_progif(c: Vec<i64>) -> i64 {
+```
+
+**Parameters:**
+
+- `c`: `Vec<i64>`
+
+**Returns:** `i64`
+
+*Defined at line 43*
+
+---
+
+## pci_subclass
+
+```fides
+pub fn pci_subclass(c: Vec<i64>) -> i64 {
+```
+
+**Parameters:**
+
+- `c`: `Vec<i64>`
+
+**Returns:** `i64`
+
+*Defined at line 46*
+
+---
+
+## pci_class
+
+```fides
+pub fn pci_class(c: Vec<i64>) -> i64 {
+```
+
+**Parameters:**
+
+- `c`: `Vec<i64>`
+
+**Returns:** `i64`
+
+*Defined at line 49*
+
+---
+
+## pci_header_type
+
+```fides
+pub fn pci_header_type(c: Vec<i64>) -> i64 {
+```
+
+**Parameters:**
+
+- `c`: `Vec<i64>`
+
+**Returns:** `i64`
+
+*Defined at line 52*
+
+---
+
+## pci_multifunction
+
+```fides
+pub fn pci_multifunction(c: Vec<i64>) -> bool {
+```
+
+**Parameters:**
+
+- `c`: `Vec<i64>`
+
+**Returns:** `bool`
+
+*Defined at line 55*
+
+---
+
+## pci_present
+
+True when the config space is a present device (not all-ones).
+
+```fides
+pub fn pci_present(c: Vec<i64>) -> bool {
+```
+
+**Parameters:**
+
+- `c`: `Vec<i64>`
+
+**Returns:** `bool`
+
+*Defined at line 60*
+
+---
+
+## PciBar
+
+```fides
+pub struct PciBar {
+```
+
+**Fields:**
+
+| Name | Type |
+|------|------|
+| `present` | `bool` |
+| `is_io` | `bool` |
+| `is64` | `bool` |
+| `prefetch` | `bool` |
+| `addr` | `i64` |
+| `hi` | `i64,  // raw next dword for 64-bit BARs` |
+
+*Defined at line 68*
+
+---
+
+## pci_bar
+
+Decode BAR k of a type-0 header. For 64-bit BARs the caller must skip
+the following BAR index — hi carries its dword.
+
+```fides
+pub fn pci_bar(c: Vec<i64>, k: i64) -> PciBar {
+```
+
+**Parameters:**
+
+- `c`: `Vec<i64>`
+- `k`: `i64`
+
+**Returns:** `PciBar`
+
+*Defined at line 82*
+
+---
+
+## pci_bar_size
+
+```fides
+pub fn pci_bar_size(sized: i64, is_io: bool) -> i64 {
+```
+
+**Parameters:**
+
+- `sized`: `i64`
+- `is_io`: `bool`
+
+**Returns:** `i64`
+
+*Defined at line 111*
+
+---
+
+## pci_caps
+
+Capability IDs present in the device, as a Vec of {id, offset} pairs
+encoded id*256+offset.
+
+```fides
+pub fn pci_caps(c: Vec<i64>) -> Vec<i64> {
+```
+
+**Parameters:**
+
+- `c`: `Vec<i64>`
+
+**Returns:** `Vec<i64>`
+
+*Defined at line 132*
+
+---
+
+## pci_cap_offset
+
+Offset of capability `want` in the config space, or -1 (MSI=0x05,
+MSIX=0x11, PCIe=0x10, PM=0x01).
+
+```fides
+pub fn pci_cap_offset(c: Vec<i64>, want: i64) -> i64 {
+```
+
+**Parameters:**
+
+- `c`: `Vec<i64>`
+- `want`: `i64`
+
+**Returns:** `i64`
+
+*Defined at line 149*
+
+---
+
+## pci_cf8
+
+CONFIG_ADDRESS dword for bus/slot/func/offset (offset < 256).
+
+```fides
+pub fn pci_cf8(bus: i64, slot: i64, func: i64, off: i64) -> i64 {
+```
+
+**Parameters:**
+
+- `bus`: `i64`
+- `slot`: `i64`
+- `func`: `i64`
+- `off`: `i64`
+
+**Returns:** `i64`
+
+*Defined at line 165*
+
+---
+
+*Generated by [scribe](https://fides.dev) -- Fides documentation generator*

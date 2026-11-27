@@ -1,15 +1,17 @@
-# touch — Fides Documentation
+[All modules](index.md)
+
+# touch -- Fides Documentation
 
 ## Contents
 
-- [TOUCH_NONE:](#touch_none:) (const)
-- [TOUCH_BEGAN:](#touch_began:) (const)
-- [TOUCH_MOVED:](#touch_moved:) (const)
-- [TOUCH_ENDED:](#touch_ended:) (const)
-- [TOUCH_CANCELLED:](#touch_cancelled:) (const)
-- [MAX_TOUCHES:](#max_touches:) (const)
-- [Touch](#touch) (struct)
-- [TouchState](#touchstate) (struct)
+- [TOUCH_NONE:](#TOUCH_NONE:) (const)
+- [TOUCH_BEGAN:](#TOUCH_BEGAN:) (const)
+- [TOUCH_MOVED:](#TOUCH_MOVED:) (const)
+- [TOUCH_ENDED:](#TOUCH_ENDED:) (const)
+- [TOUCH_CANCELLED:](#TOUCH_CANCELLED:) (const)
+- [MAX_TOUCHES:](#MAX_TOUCHES:) (const)
+- [Touch](#Touch) (struct)
+- [TouchState](#TouchState) (struct)
 - [touch_create](#touch_create) (function)
 - [touch_init](#touch_init) (function)
 - [touch_set_screen_size](#touch_set_screen_size) (function)
@@ -40,7 +42,7 @@
 pub const TOUCH_NONE: i64 = 0;
 ```
 
-*Defined at line 17*
+*Defined at line 18*
 
 ---
 
@@ -50,7 +52,7 @@ pub const TOUCH_NONE: i64 = 0;
 pub const TOUCH_BEGAN: i64 = 1;
 ```
 
-*Defined at line 17*
+*Defined at line 19*
 
 ---
 
@@ -60,7 +62,7 @@ pub const TOUCH_BEGAN: i64 = 1;
 pub const TOUCH_MOVED: i64 = 2;
 ```
 
-*Defined at line 17*
+*Defined at line 20*
 
 ---
 
@@ -70,7 +72,7 @@ pub const TOUCH_MOVED: i64 = 2;
 pub const TOUCH_ENDED: i64 = 3;
 ```
 
-*Defined at line 17*
+*Defined at line 21*
 
 ---
 
@@ -80,7 +82,7 @@ pub const TOUCH_ENDED: i64 = 3;
 pub const TOUCH_CANCELLED: i64 = 4;
 ```
 
-*Defined at line 17*
+*Defined at line 22*
 
 ---
 
@@ -90,7 +92,7 @@ pub const TOUCH_CANCELLED: i64 = 4;
 pub const MAX_TOUCHES: i64 = 10;
 ```
 
-*Defined at line 18*
+*Defined at line 23*
 
 ---
 
@@ -116,7 +118,7 @@ pub struct Touch {
 | `timestamp` | `f64` |
 | `active` | `bool` |
 
-*Defined at line 21*
+*Defined at line 26*
 
 ---
 
@@ -143,7 +145,7 @@ pub struct TouchState {
 | `swipe_active` | `bool` |
 | `swipe_direction` | `i64` |
 
-*Defined at line 35*
+*Defined at line 40*
 
 ---
 
@@ -151,13 +153,29 @@ pub struct TouchState {
 
 Create a new touch state.
 
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+var ts = touch_create();
+assert_eq(touch_count(&ts), 0);
+touch_begin(&mut ts, 5, 0.5, 0.5, 1.0, 100.0);
+assert_eq(touch_count(&ts), 1);
+assert_eq(touch_get(&ts, 0).id, 5);
+touch_end(&mut ts, 5);
+assert(touch_is_tap(&ts));
+assert(touch_tap_position(&ts).x == 0.5);
+touch_update(&mut ts);
+assert_eq(touch_count(&ts), 0);
+```
+
 ```fides
 pub fn touch_create() -> TouchState {
 ```
 
 **Returns:** `TouchState`
 
-*Defined at line 63*
+*Defined at line 68*
 
 ---
 
@@ -175,7 +193,7 @@ pub fn touch_init(ts: &mut TouchState) -> void {
 
 **Returns:** `void`
 
-*Defined at line 78*
+*Defined at line 83*
 
 ---
 
@@ -195,7 +213,7 @@ pub fn touch_set_screen_size(ts: &mut TouchState, w: f64, h: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 93*
+*Defined at line 98*
 
 ---
 
@@ -218,7 +236,7 @@ pub fn touch_begin(ts: &mut TouchState, id: i64, x: f64, y: f64, pressure: f64, 
 
 **Returns:** `void`
 
-*Defined at line 123*
+*Defined at line 128*
 
 ---
 
@@ -240,7 +258,7 @@ pub fn touch_move(ts: &mut TouchState, id: i64, x: f64, y: f64, pressure: f64) -
 
 **Returns:** `void`
 
-*Defined at line 144*
+*Defined at line 149*
 
 ---
 
@@ -259,7 +277,7 @@ pub fn touch_end(ts: &mut TouchState, id: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 160*
+*Defined at line 165*
 
 ---
 
@@ -278,7 +296,7 @@ pub fn touch_cancel(ts: &mut TouchState, id: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 171*
+*Defined at line 176*
 
 ---
 
@@ -296,7 +314,7 @@ pub fn touch_update(ts: &mut TouchState) -> void {
 
 **Returns:** `void`
 
-*Defined at line 182*
+*Defined at line 187*
 
 ---
 
@@ -314,7 +332,7 @@ pub fn touch_count(ts: &TouchState) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 265*
+*Defined at line 270*
 
 ---
 
@@ -333,7 +351,7 @@ pub fn touch_get(ts: &TouchState, idx: i64) -> Touch {
 
 **Returns:** `Touch`
 
-*Defined at line 278*
+*Defined at line 283*
 
 ---
 
@@ -351,7 +369,7 @@ pub fn touch_is_tap(ts: &TouchState) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 296*
+*Defined at line 301*
 
 ---
 
@@ -369,7 +387,7 @@ pub fn touch_tap_position(ts: &TouchState) -> vec2 {
 
 **Returns:** `vec2`
 
-*Defined at line 314*
+*Defined at line 319*
 
 ---
 
@@ -387,7 +405,7 @@ pub fn touch_pinch_active(ts: &TouchState) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 332*
+*Defined at line 337*
 
 ---
 
@@ -405,7 +423,7 @@ pub fn touch_pinch_scale(ts: &TouchState) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 337*
+*Defined at line 342*
 
 ---
 
@@ -423,7 +441,7 @@ pub fn touch_pan_active(ts: &TouchState) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 348*
+*Defined at line 353*
 
 ---
 
@@ -441,7 +459,7 @@ pub fn touch_pan_delta(ts: &TouchState) -> vec2 {
 
 **Returns:** `vec2`
 
-*Defined at line 353*
+*Defined at line 358*
 
 ---
 
@@ -459,7 +477,7 @@ pub fn touch_swipe_active(ts: &TouchState) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 366*
+*Defined at line 371*
 
 ---
 
@@ -477,7 +495,7 @@ pub fn touch_swipe_direction(ts: &TouchState) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 371*
+*Defined at line 376*
 
 ---
 
@@ -495,7 +513,7 @@ pub fn touch_swipe_delta(ts: &TouchState) -> vec2 {
 
 **Returns:** `vec2`
 
-*Defined at line 376*
+*Defined at line 381*
 
 ---
 
@@ -514,7 +532,7 @@ pub fn touch_to_pixels(ts: &TouchState, t: &Touch) -> vec2 {
 
 **Returns:** `vec2`
 
-*Defined at line 389*
+*Defined at line 394*
 
 ---
 
@@ -534,7 +552,7 @@ pub fn touch_set_tap_threshold(ts: &mut TouchState, max_dist: f64, max_duration:
 
 **Returns:** `void`
 
-*Defined at line 394*
+*Defined at line 399*
 
 ---
 
@@ -553,7 +571,7 @@ pub fn touch_set_swipe_threshold(ts: &mut TouchState, min_dist: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 400*
+*Defined at line 405*
 
 ---
 
@@ -571,8 +589,8 @@ pub fn touch_clear(ts: &mut TouchState) -> void {
 
 **Returns:** `void`
 
-*Defined at line 405*
+*Defined at line 410*
 
 ---
 
-*Generated by [scribe](https://fides.dev) — Fides documentation generator*
+*Generated by [scribe](https://fides.dev) -- Fides documentation generator*

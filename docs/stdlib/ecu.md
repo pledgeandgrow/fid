@@ -1,33 +1,35 @@
-# ecu — Fides Documentation
+[All modules](index.md)
+
+# ecu -- Fides Documentation
 
 ## Contents
 
-- [ECU_STATE_INIT:](#ecu_state_init:) (const)
-- [ECU_STATE_RUN:](#ecu_state_run:) (const)
-- [ECU_STATE_SHUTDOWN:](#ecu_state_shutdown:) (const)
-- [ECU_STATE_FAULT:](#ecu_state_fault:) (const)
-- [ECU_STATE_LIMP_HOME:](#ecu_state_limp_home:) (const)
+- [ECU_STATE_INIT:](#ECU_STATE_INIT:) (const)
+- [ECU_STATE_RUN:](#ECU_STATE_RUN:) (const)
+- [ECU_STATE_SHUTDOWN:](#ECU_STATE_SHUTDOWN:) (const)
+- [ECU_STATE_FAULT:](#ECU_STATE_FAULT:) (const)
+- [ECU_STATE_LIMP_HOME:](#ECU_STATE_LIMP_HOME:) (const)
 - [ecu_state_name](#ecu_state_name) (function)
-- [SensorReading](#sensorreading) (struct)
+- [SensorReading](#SensorReading) (struct)
 - [sensor_ok](#sensor_ok) (function)
 - [sensor_fault](#sensor_fault) (function)
 - [sensor_validate](#sensor_validate) (function)
 - [sensor_raw_to_value](#sensor_raw_to_value) (function)
-- [ActuatorCommand](#actuatorcommand) (struct)
+- [ActuatorCommand](#ActuatorCommand) (struct)
 - [actuator_command](#actuator_command) (function)
 - [actuator_rate_limit](#actuator_rate_limit) (function)
-- [PIDController](#pidcontroller) (struct)
+- [PIDController](#PIDController) (struct)
 - [pid_new](#pid_new) (function)
 - [pid_set_limits](#pid_set_limits) (function)
 - [pid_set_integral_limits](#pid_set_integral_limits) (function)
 - [pid_compute](#pid_compute) (function)
 - [pid_reset](#pid_reset) (function)
-- [CalParam](#calparam) (struct)
+- [CalParam](#CalParam) (struct)
 - [cal_param_new](#cal_param_new) (function)
 - [cal_param_set](#cal_param_set) (function)
 - [cal_param_get](#cal_param_get) (function)
 - [cal_param_is_valid](#cal_param_is_valid) (function)
-- [Watchdog](#watchdog) (struct)
+- [Watchdog](#Watchdog) (struct)
 - [watchdog_new](#watchdog_new) (function)
 - [watchdog_kick](#watchdog_kick) (function)
 - [watchdog_check](#watchdog_check) (function)
@@ -36,7 +38,7 @@
 ## ECU_STATE_INIT:
 
 ```fides
-pub const ECU_STATE_INIT: i64     = 0;
+pub const ECU_STATE_INIT: i64 = 0;
 ```
 
 *Defined at line 23*
@@ -46,10 +48,10 @@ pub const ECU_STATE_INIT: i64     = 0;
 ## ECU_STATE_RUN:
 
 ```fides
-pub const ECU_STATE_RUN: i64      = 1;
+pub const ECU_STATE_RUN: i64 = 1;
 ```
 
-*Defined at line 23*
+*Defined at line 24*
 
 ---
 
@@ -59,17 +61,17 @@ pub const ECU_STATE_RUN: i64      = 1;
 pub const ECU_STATE_SHUTDOWN: i64 = 2;
 ```
 
-*Defined at line 23*
+*Defined at line 25*
 
 ---
 
 ## ECU_STATE_FAULT:
 
 ```fides
-pub const ECU_STATE_FAULT: i64    = 3;
+pub const ECU_STATE_FAULT: i64 = 3;
 ```
 
-*Defined at line 23*
+*Defined at line 26*
 
 ---
 
@@ -79,7 +81,7 @@ pub const ECU_STATE_FAULT: i64    = 3;
 pub const ECU_STATE_LIMP_HOME: i64 = 4;
 ```
 
-*Defined at line 23*
+*Defined at line 27*
 
 ---
 
@@ -97,7 +99,7 @@ pub fn ecu_state_name(state: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 25*
+*Defined at line 29*
 
 ---
 
@@ -119,7 +121,7 @@ pub struct SensorReading {
 | `timestamp` | `i64` |
 | `error_code` | `i64` |
 
-*Defined at line 47*
+*Defined at line 51*
 
 ---
 
@@ -139,7 +141,7 @@ pub fn sensor_ok(value: f64, raw: i64, timestamp: i64) -> SensorReading {
 
 **Returns:** `SensorReading`
 
-*Defined at line 56*
+*Defined at line 60*
 
 ---
 
@@ -158,7 +160,7 @@ pub fn sensor_fault(error_code: i64, timestamp: i64) -> SensorReading {
 
 **Returns:** `SensorReading`
 
-*Defined at line 63*
+*Defined at line 67*
 
 ---
 
@@ -178,7 +180,7 @@ pub fn sensor_validate(reading: SensorReading, min_val: f64, max_val: f64) -> Se
 
 **Returns:** `SensorReading`
 
-*Defined at line 70*
+*Defined at line 74*
 
 ---
 
@@ -187,7 +189,7 @@ pub fn sensor_validate(reading: SensorReading, min_val: f64, max_val: f64) -> Se
 Convert raw ADC value to engineering value (linear conversion).
 
 ```fides
-pub fn sensor_raw_to_value(raw: i64, raw_min: i64, raw_max: i64,
+pub fn sensor_raw_to_value(raw: i64, raw_min: i64, raw_max: i64, eng_min: f64, eng_max: f64) -> f64 {
 ```
 
 **Parameters:**
@@ -195,8 +197,12 @@ pub fn sensor_raw_to_value(raw: i64, raw_min: i64, raw_max: i64,
 - `raw`: `i64`
 - `raw_min`: `i64`
 - `raw_max`: `i64`
+- `eng_min`: `f64`
+- `eng_max`: `f64`
 
-*Defined at line 83*
+**Returns:** `f64`
+
+*Defined at line 87*
 
 ---
 
@@ -216,7 +222,7 @@ pub struct ActuatorCommand {
 | `clamped` | `bool` |
 | `limited` | `bool` |
 
-*Defined at line 95*
+*Defined at line 99*
 
 ---
 
@@ -236,7 +242,7 @@ pub fn actuator_command(value: f64, min_val: f64, max_val: f64) -> ActuatorComma
 
 **Returns:** `ActuatorCommand`
 
-*Defined at line 102*
+*Defined at line 106*
 
 ---
 
@@ -257,7 +263,7 @@ pub fn actuator_rate_limit(target: f64, current: f64, max_rate: f64) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 120*
+*Defined at line 124*
 
 ---
 
@@ -283,13 +289,26 @@ pub struct PIDController {
 | `integral_min` | `f64` |
 | `integral_max` | `f64` |
 
-*Defined at line 137*
+*Defined at line 141*
 
 ---
 
 ## pid_new
 
 Create a new PID controller.
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+var p = pid_new(2.0, 0.0, 0.0);
+assert(pid_compute(&mut p, 10.0, 4.0, 1.0) == 12.0);
+pid_set_limits(&mut p, -5.0, 5.0);
+assert(pid_compute(&mut p, 10.0, 4.0, 1.0) == 5.0);
+assert(sensor_raw_to_value(512, 0, 1024, 0.0, 100.0) == 50.0);
+assert(sensor_ok(1.5, 7, 0).is_valid);
+assert(!sensor_fault(3, 0).is_valid);
+```
 
 ```fides
 pub fn pid_new(kp: f64, ki: f64, kd: f64) -> PIDController {
@@ -303,7 +322,7 @@ pub fn pid_new(kp: f64, ki: f64, kd: f64) -> PIDController {
 
 **Returns:** `PIDController`
 
-*Defined at line 159*
+*Defined at line 163*
 
 ---
 
@@ -323,7 +342,7 @@ pub fn pid_set_limits(pid: &mut PIDController, out_min: f64, out_max: f64) -> vo
 
 **Returns:** `void`
 
-*Defined at line 166*
+*Defined at line 170*
 
 ---
 
@@ -343,7 +362,7 @@ pub fn pid_set_integral_limits(pid: &mut PIDController, int_min: f64, int_max: f
 
 **Returns:** `void`
 
-*Defined at line 172*
+*Defined at line 176*
 
 ---
 
@@ -365,7 +384,7 @@ pub fn pid_compute(pid: &mut PIDController, setpoint: f64, measured: f64, dt: f6
 
 **Returns:** `f64`
 
-*Defined at line 180*
+*Defined at line 184*
 
 ---
 
@@ -383,7 +402,7 @@ pub fn pid_reset(pid: &mut PIDController) -> void {
 
 **Returns:** `void`
 
-*Defined at line 209*
+*Defined at line 213*
 
 ---
 
@@ -405,7 +424,7 @@ pub struct CalParam {
 | `max_val` | `f64` |
 | `unit` | `str` |
 
-*Defined at line 220*
+*Defined at line 224*
 
 ---
 
@@ -427,7 +446,7 @@ pub fn cal_param_new(name: str, value: f64, min_val: f64, max_val: f64, unit: st
 
 **Returns:** `CalParam`
 
-*Defined at line 229*
+*Defined at line 233*
 
 ---
 
@@ -446,7 +465,7 @@ pub fn cal_param_set(param: &mut CalParam, value: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 236*
+*Defined at line 240*
 
 ---
 
@@ -464,7 +483,7 @@ pub fn cal_param_get(param: CalParam) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 248*
+*Defined at line 252*
 
 ---
 
@@ -482,7 +501,7 @@ pub fn cal_param_is_valid(param: CalParam) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 253*
+*Defined at line 257*
 
 ---
 
@@ -502,7 +521,7 @@ pub struct Watchdog {
 | `last_kick` | `i64` |
 | `expired` | `bool` |
 
-*Defined at line 263*
+*Defined at line 267*
 
 ---
 
@@ -520,7 +539,7 @@ pub fn watchdog_new(timeout_ms: i64) -> Watchdog {
 
 **Returns:** `Watchdog`
 
-*Defined at line 270*
+*Defined at line 274*
 
 ---
 
@@ -539,7 +558,7 @@ pub fn watchdog_kick(wd: &mut Watchdog, current_time: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 277*
+*Defined at line 281*
 
 ---
 
@@ -558,7 +577,7 @@ pub fn watchdog_check(wd: &mut Watchdog, current_time: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 283*
+*Defined at line 287*
 
 ---
 
@@ -576,8 +595,8 @@ pub fn watchdog_is_expired(wd: Watchdog) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 292*
+*Defined at line 296*
 
 ---
 
-*Generated by [scribe](https://fides.dev) — Fides documentation generator*
+*Generated by [scribe](https://fides.dev) -- Fides documentation generator*

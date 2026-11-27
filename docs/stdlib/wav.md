@@ -1,0 +1,348 @@
+[All modules](index.md)
+
+# wav -- Fides Documentation
+
+## Contents
+
+- [WAV_PCM:](#WAV_PCM:) (const)
+- [WAV_FLOAT:](#WAV_FLOAT:) (const)
+- [WAV_EXTENSIBLE:](#WAV_EXTENSIBLE:) (const)
+- [Wav](#Wav) (struct)
+- [wav_new](#wav_new) (function)
+- [wav_frames](#wav_frames) (function)
+- [wav_sample](#wav_sample) (function)
+- [wav_duration](#wav_duration) (function)
+- [wav_f32_from_bits](#wav_f32_from_bits) (function)
+- [wav_f32_bits](#wav_f32_bits) (function)
+- [wav_decode](#wav_decode) (function)
+- [wav_quantize](#wav_quantize) (function)
+- [wav_encode](#wav_encode) (function)
+- [wav_default_mask](#wav_default_mask) (function)
+- [wav_requantize](#wav_requantize) (function)
+- [wav_to_mono](#wav_to_mono) (function)
+- [wav_to_stereo](#wav_to_stereo) (function)
+- [wav_channel](#wav_channel) (function)
+
+## WAV_PCM:
+
+```fides
+pub const WAV_PCM: i64 = 1;
+```
+
+*Defined at line 28*
+
+---
+
+## WAV_FLOAT:
+
+```fides
+pub const WAV_FLOAT: i64 = 3;
+```
+
+*Defined at line 29*
+
+---
+
+## WAV_EXTENSIBLE:
+
+```fides
+pub const WAV_EXTENSIBLE: i64 = 65534;
+```
+
+*Defined at line 30*
+
+---
+
+## Wav
+
+A decoded (or to-be-encoded) WAV file.
+
+```fides
+pub struct Wav {
+```
+
+**Fields:**
+
+| Name | Type |
+|------|------|
+| `ok` | `bool` |
+| `error` | `str` |
+| `format` | `i64` |
+| `extensible` | `bool` |
+| `channels` | `i64` |
+| `sample_rate` | `i64` |
+| `bits` | `i64` |
+| `valid_bits` | `i64` |
+| `channel_mask` | `i64` |
+| `samples` | `Vec<f64>,  // interleaved, -1..1` |
+
+*Defined at line 33*
+
+---
+
+## wav_new
+
+An empty Wav to fill with samples.
+
+```fides
+pub fn wav_new(channels: i64, sample_rate: i64) -> Wav {
+```
+
+**Parameters:**
+
+- `channels`: `i64`
+- `sample_rate`: `i64`
+
+**Returns:** `Wav`
+
+*Defined at line 51*
+
+---
+
+## wav_frames
+
+Number of frames (samples per channel).
+
+```fides
+pub fn wav_frames(w: &Wav) -> i64 {
+```
+
+**Parameters:**
+
+- `w`: `&Wav`
+
+**Returns:** `i64`
+
+*Defined at line 65*
+
+---
+
+## wav_sample
+
+Sample of channel `ch` in frame `frame`.
+
+```fides
+pub fn wav_sample(w: &Wav, frame: i64, ch: i64) -> f64 {
+```
+
+**Parameters:**
+
+- `w`: `&Wav`
+- `frame`: `i64`
+- `ch`: `i64`
+
+**Returns:** `f64`
+
+*Defined at line 73*
+
+---
+
+## wav_duration
+
+Duration in seconds.
+
+```fides
+pub fn wav_duration(w: &Wav) -> f64 {
+```
+
+**Parameters:**
+
+- `w`: `&Wav`
+
+**Returns:** `f64`
+
+*Defined at line 78*
+
+---
+
+## wav_f32_from_bits
+
+```fides
+pub fn wav_f32_from_bits(bits: i64) -> f64 {
+```
+
+**Parameters:**
+
+- `bits`: `i64`
+
+**Returns:** `f64`
+
+*Defined at line 129*
+
+---
+
+## wav_f32_bits
+
+```fides
+pub fn wav_f32_bits(x: f64) -> i64 {
+```
+
+**Parameters:**
+
+- `x`: `f64`
+
+**Returns:** `i64`
+
+*Defined at line 161*
+
+---
+
+## wav_decode
+
+Decode a WAV file. `ok` false with `error` on anything malformed or
+unsupported.
+
+```fides
+pub fn wav_decode(b: &Vec<i64>) -> Wav {
+```
+
+**Parameters:**
+
+- `b`: `&Vec<i64>`
+
+**Returns:** `Wav`
+
+*Defined at line 213*
+
+---
+
+## wav_quantize
+
+The integer value sample `x` (-1..1) takes at `bits` (8: unsigned):
+x * 2^(bits-1), rounded half away from zero and clipped.
+
+```fides
+pub fn wav_quantize(x: f64, bits: i64) -> i64 {
+```
+
+**Parameters:**
+
+- `x`: `f64`
+- `bits`: `i64`
+
+**Returns:** `i64`
+
+*Defined at line 324*
+
+---
+
+## wav_encode
+
+Encode `w`'s samples as `format` (WAV_PCM or WAV_FLOAT) at `bits` per
+sample. Files with more than 2 channels, or integer PCM of more than 16
+bits, are written as WAVE_FORMAT_EXTENSIBLE (with `w.channel_mask`, or
+the default mask for the channel count), as Microsoft asks and ffmpeg
+does; others as plain PCM, or float with a fact chunk.
+
+```fides
+pub fn wav_encode(w: &Wav, format: i64, bits: i64) -> Vec<i64> {
+```
+
+**Parameters:**
+
+- `w`: `&Wav`
+- `format`: `i64`
+- `bits`: `i64`
+
+**Returns:** `Vec<i64>`
+
+*Defined at line 362*
+
+---
+
+## wav_default_mask
+
+The usual speaker mask for `channels` (mono FC, stereo FL FR, 5.1 =
+FL FR FC LFE BL BR, 7.1 adds SL SR); other counts: the first n bits.
+
+```fides
+pub fn wav_default_mask(channels: i64) -> i64 {
+```
+
+**Parameters:**
+
+- `channels`: `i64`
+
+**Returns:** `i64`
+
+*Defined at line 462*
+
+---
+
+## wav_requantize
+
+A copy of `w` as it would read back after storing at `format`/`bits`
+(requantized), e.g. to preview 8-bit audio.
+
+```fides
+pub fn wav_requantize(w: &Wav, format: i64, bits: i64) -> Wav {
+```
+
+**Parameters:**
+
+- `w`: `&Wav`
+- `format`: `i64`
+- `bits`: `i64`
+
+**Returns:** `Wav`
+
+*Defined at line 488*
+
+---
+
+## wav_to_mono
+
+Average all channels into one.
+
+```fides
+pub fn wav_to_mono(w: &Wav) -> Wav {
+```
+
+**Parameters:**
+
+- `w`: `&Wav`
+
+**Returns:** `Wav`
+
+*Defined at line 493*
+
+---
+
+## wav_to_stereo
+
+Mono to stereo (the channel in both); stereo stays as it is.
+
+```fides
+pub fn wav_to_stereo(w: &Wav) -> Wav {
+```
+
+**Parameters:**
+
+- `w`: `&Wav`
+
+**Returns:** `Wav`
+
+*Defined at line 514*
+
+---
+
+## wav_channel
+
+Channel `ch` alone, as a mono Wav.
+
+```fides
+pub fn wav_channel(w: &Wav, ch: i64) -> Wav {
+```
+
+**Parameters:**
+
+- `w`: `&Wav`
+- `ch`: `i64`
+
+**Returns:** `Wav`
+
+*Defined at line 551*
+
+---
+
+*Generated by [scribe](https://fides.dev) -- Fides documentation generator*

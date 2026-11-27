@@ -1,21 +1,23 @@
-# shader — Fides Documentation
+[All modules](index.md)
+
+# shader -- Fides Documentation
 
 ## Contents
 
-- [UNIFORM_FLOAT:](#uniform_float:) (const)
-- [UNIFORM_INT:](#uniform_int:) (const)
-- [UNIFORM_VEC3:](#uniform_vec3:) (const)
-- [UNIFORM_VEC4:](#uniform_vec4:) (const)
-- [UNIFORM_MAT4:](#uniform_mat4:) (const)
-- [UNIFORM_TEXTURE:](#uniform_texture:) (const)
-- [UniformValue](#uniformvalue) (struct)
-- [Material](#material) (struct)
-- [BLEND_OPAQUE:](#blend_opaque:) (const)
-- [BLEND_ALPHA:](#blend_alpha:) (const)
-- [BLEND_ADDITIVE:](#blend_additive:) (const)
-- [CULL_NONE:](#cull_none:) (const)
-- [CULL_BACK:](#cull_back:) (const)
-- [CULL_FRONT:](#cull_front:) (const)
+- [UNIFORM_FLOAT:](#UNIFORM_FLOAT:) (const)
+- [UNIFORM_INT:](#UNIFORM_INT:) (const)
+- [UNIFORM_VEC3:](#UNIFORM_VEC3:) (const)
+- [UNIFORM_VEC4:](#UNIFORM_VEC4:) (const)
+- [UNIFORM_MAT4:](#UNIFORM_MAT4:) (const)
+- [UNIFORM_TEXTURE:](#UNIFORM_TEXTURE:) (const)
+- [UniformValue](#UniformValue) (struct)
+- [Material](#Material) (struct)
+- [BLEND_OPAQUE:](#BLEND_OPAQUE:) (const)
+- [BLEND_ALPHA:](#BLEND_ALPHA:) (const)
+- [BLEND_ADDITIVE:](#BLEND_ADDITIVE:) (const)
+- [CULL_NONE:](#CULL_NONE:) (const)
+- [CULL_BACK:](#CULL_BACK:) (const)
+- [CULL_FRONT:](#CULL_FRONT:) (const)
 - [material_create](#material_create) (function)
 - [material_create_custom](#material_create_custom) (function)
 - [material_set_float](#material_set_float) (function)
@@ -32,15 +34,15 @@
 - [material_program](#material_program) (function)
 - [material_is_valid](#material_is_valid) (function)
 - [material_uniform_count](#material_uniform_count) (function)
-- [SHADER_UNLIT_VERT:](#shader_unlit_vert:) (const)
-- [SHADER_UNLIT_FRAG:](#shader_unlit_frag:) (const)
-- [SHADER_DIFFUSE_VERT:](#shader_diffuse_vert:) (const)
-- [SHADER_DIFFUSE_FRAG:](#shader_diffuse_frag:) (const)
-- [SHADER_TEXT_VERT:](#shader_text_vert:) (const)
-- [SHADER_TEXT_FRAG:](#shader_text_frag:) (const)
-- [SHADER_POST_VERT:](#shader_post_vert:) (const)
-- [SHADER_POST_FRAG:](#shader_post_frag:) (const)
-- [MaterialCache](#materialcache) (struct)
+- [SHADER_UNLIT_VERT:](#SHADER_UNLIT_VERT:) (const)
+- [SHADER_UNLIT_FRAG:](#SHADER_UNLIT_FRAG:) (const)
+- [SHADER_DIFFUSE_VERT:](#SHADER_DIFFUSE_VERT:) (const)
+- [SHADER_DIFFUSE_FRAG:](#SHADER_DIFFUSE_FRAG:) (const)
+- [SHADER_TEXT_VERT:](#SHADER_TEXT_VERT:) (const)
+- [SHADER_TEXT_FRAG:](#SHADER_TEXT_FRAG:) (const)
+- [SHADER_POST_VERT:](#SHADER_POST_VERT:) (const)
+- [SHADER_POST_FRAG:](#SHADER_POST_FRAG:) (const)
+- [MaterialCache](#MaterialCache) (struct)
 - [material_cache_create](#material_cache_create) (function)
 - [material_cache_get](#material_cache_get) (function)
 - [material_cache_get_idx](#material_cache_get_idx) (function)
@@ -53,7 +55,7 @@
 pub const UNIFORM_FLOAT: i64 = 0;
 ```
 
-*Defined at line 27*
+*Defined at line 29*
 
 ---
 
@@ -63,7 +65,7 @@ pub const UNIFORM_FLOAT: i64 = 0;
 pub const UNIFORM_INT: i64 = 1;
 ```
 
-*Defined at line 27*
+*Defined at line 30*
 
 ---
 
@@ -73,7 +75,7 @@ pub const UNIFORM_INT: i64 = 1;
 pub const UNIFORM_VEC3: i64 = 2;
 ```
 
-*Defined at line 27*
+*Defined at line 31*
 
 ---
 
@@ -83,7 +85,7 @@ pub const UNIFORM_VEC3: i64 = 2;
 pub const UNIFORM_VEC4: i64 = 3;
 ```
 
-*Defined at line 27*
+*Defined at line 32*
 
 ---
 
@@ -93,7 +95,7 @@ pub const UNIFORM_VEC4: i64 = 3;
 pub const UNIFORM_MAT4: i64 = 4;
 ```
 
-*Defined at line 27*
+*Defined at line 33*
 
 ---
 
@@ -103,7 +105,7 @@ pub const UNIFORM_MAT4: i64 = 4;
 pub const UNIFORM_TEXTURE: i64 = 5;
 ```
 
-*Defined at line 27*
+*Defined at line 34*
 
 ---
 
@@ -121,12 +123,12 @@ pub struct UniformValue {
 | `kind` | `i64` |
 | `float_val` | `f64` |
 | `int_val` | `i64` |
-| `vec_val` | `vec4,    // used for vec3 (xyz) and vec4` |
+| `vec_val` | `vec4` |
 | `mat_val` | `mat4` |
 | `texture_unit` | `i64` |
-| `location` | `i64,    // cached uniform location` |
+| `location` | `i64,  // cached uniform location` |
 
-*Defined at line 28*
+*Defined at line 35*
 
 ---
 
@@ -141,15 +143,15 @@ pub struct Material {
 | Name | Type |
 |------|------|
 | `name` | `str` |
-| `program` | `i64,       // GL shader program handle` |
+| `program` | `i64` |
 | `uniforms` | `Vec<UniformValue>` |
-| `blend_mode` | `i64,   // 0 = opaque, 1 = alpha, 2 = additive` |
-| `cull_mode` | `i64,    // 0 = none, 1 = back, 2 = front` |
+| `blend_mode` | `i64` |
+| `cull_mode` | `i64` |
 | `depth_test` | `bool` |
 | `depth_write` | `bool` |
 | `valid` | `bool` |
 
-*Defined at line 40*
+*Defined at line 47*
 
 ---
 
@@ -159,7 +161,7 @@ pub struct Material {
 pub const BLEND_OPAQUE: i64 = 0;
 ```
 
-*Defined at line 54*
+*Defined at line 61*
 
 ---
 
@@ -169,7 +171,7 @@ pub const BLEND_OPAQUE: i64 = 0;
 pub const BLEND_ALPHA: i64 = 1;
 ```
 
-*Defined at line 54*
+*Defined at line 62*
 
 ---
 
@@ -179,7 +181,7 @@ pub const BLEND_ALPHA: i64 = 1;
 pub const BLEND_ADDITIVE: i64 = 2;
 ```
 
-*Defined at line 54*
+*Defined at line 63*
 
 ---
 
@@ -189,7 +191,7 @@ pub const BLEND_ADDITIVE: i64 = 2;
 pub const CULL_NONE: i64 = 0;
 ```
 
-*Defined at line 55*
+*Defined at line 64*
 
 ---
 
@@ -199,7 +201,7 @@ pub const CULL_NONE: i64 = 0;
 pub const CULL_BACK: i64 = 1;
 ```
 
-*Defined at line 55*
+*Defined at line 65*
 
 ---
 
@@ -209,7 +211,7 @@ pub const CULL_BACK: i64 = 1;
 pub const CULL_FRONT: i64 = 2;
 ```
 
-*Defined at line 55*
+*Defined at line 66*
 
 ---
 
@@ -217,6 +219,16 @@ pub const CULL_FRONT: i64 = 2;
 
 Create a material from a shader name.
 Uses built-in shader templates.
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+assert(str_contains(SHADER_UNLIT_VERT, "#version 330 core"));
+assert(str_contains(SHADER_DIFFUSE_FRAG, "void main"));
+assert(BLEND_ALPHA != BLEND_OPAQUE);
+assert_eq(CULL_NONE, 0);
+```
 
 ```fides
 pub fn material_create(shader_name: str) -> Material {
@@ -228,7 +240,7 @@ pub fn material_create(shader_name: str) -> Material {
 
 **Returns:** `Material`
 
-*Defined at line 64*
+*Defined at line 75*
 
 ---
 
@@ -248,7 +260,7 @@ pub fn material_create_custom(name: str, vert_src: str, frag_src: str) -> Materi
 
 **Returns:** `Material`
 
-*Defined at line 94*
+*Defined at line 105*
 
 ---
 
@@ -268,7 +280,7 @@ pub fn material_set_float(mat: &mut Material, name: str, val: f64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 114*
+*Defined at line 125*
 
 ---
 
@@ -288,7 +300,7 @@ pub fn material_set_int(mat: &mut Material, name: str, val: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 128*
+*Defined at line 139*
 
 ---
 
@@ -308,7 +320,7 @@ pub fn material_set_vec3(mat: &mut Material, name: str, val: vec3) -> void {
 
 **Returns:** `void`
 
-*Defined at line 142*
+*Defined at line 153*
 
 ---
 
@@ -328,7 +340,7 @@ pub fn material_set_vec4(mat: &mut Material, name: str, val: vec4) -> void {
 
 **Returns:** `void`
 
-*Defined at line 156*
+*Defined at line 167*
 
 ---
 
@@ -348,7 +360,7 @@ pub fn material_set_mat4(mat: &mut Material, name: str, val: mat4) -> void {
 
 **Returns:** `void`
 
-*Defined at line 170*
+*Defined at line 181*
 
 ---
 
@@ -368,7 +380,7 @@ pub fn material_set_texture(mat: &mut Material, name: str, unit: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 184*
+*Defined at line 195*
 
 ---
 
@@ -386,7 +398,7 @@ pub fn material_bind(mat: &Material) -> void {
 
 **Returns:** `void`
 
-*Defined at line 198*
+*Defined at line 209*
 
 ---
 
@@ -405,7 +417,7 @@ pub fn material_set_blend(mat: &mut Material, mode: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 246*
+*Defined at line 270*
 
 ---
 
@@ -424,7 +436,7 @@ pub fn material_set_cull(mat: &mut Material, mode: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 251*
+*Defined at line 275*
 
 ---
 
@@ -444,7 +456,7 @@ pub fn material_set_depth(mat: &mut Material, test: bool, write: bool) -> void {
 
 **Returns:** `void`
 
-*Defined at line 256*
+*Defined at line 280*
 
 ---
 
@@ -462,7 +474,7 @@ pub fn material_destroy(mat: &mut Material) -> void {
 
 **Returns:** `void`
 
-*Defined at line 262*
+*Defined at line 286*
 
 ---
 
@@ -480,7 +492,7 @@ pub fn material_program(mat: &Material) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 272*
+*Defined at line 302*
 
 ---
 
@@ -498,7 +510,7 @@ pub fn material_is_valid(mat: &Material) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 277*
+*Defined at line 307*
 
 ---
 
@@ -516,7 +528,7 @@ pub fn material_uniform_count(mat: &Material) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 282*
+*Defined at line 312*
 
 ---
 
@@ -526,7 +538,7 @@ pub fn material_uniform_count(mat: &Material) -> i64 {
 pub const SHADER_UNLIT_VERT: str = "#version 330 core\nlayout(location = 0) in vec3 aPos;\nuniform mat4 model;\nuniform mat4 view;\nuniform mat4 projection;\nvoid main() {\n    gl_Position = projection * view * model * vec4(aPos, 1.0);\n}\n";
 ```
 
-*Defined at line 288*
+*Defined at line 318*
 
 ---
 
@@ -536,7 +548,7 @@ pub const SHADER_UNLIT_VERT: str = "#version 330 core\nlayout(location = 0) in v
 pub const SHADER_UNLIT_FRAG: str = "#version 330 core\nuniform vec3 color;\nout vec4 FragColor;\nvoid main() {\n    FragColor = vec4(color, 1.0);\n}\n";
 ```
 
-*Defined at line 289*
+*Defined at line 319*
 
 ---
 
@@ -546,7 +558,7 @@ pub const SHADER_UNLIT_FRAG: str = "#version 330 core\nuniform vec3 color;\nout 
 pub const SHADER_DIFFUSE_VERT: str = "#version 330 core\nlayout(location = 0) in vec3 aPos;\nlayout(location = 1) in vec3 aNormal;\nuniform mat4 model;\nuniform mat4 view;\nuniform mat4 projection;\nout vec3 Normal;\nout vec3 FragPos;\nvoid main() {\n    FragPos = vec3(model * vec4(aPos, 1.0));\n    Normal = mat3(transpose(inverse(model))) * aNormal;\n    gl_Position = projection * view * vec4(FragPos, 1.0);\n}\n";
 ```
 
-*Defined at line 290*
+*Defined at line 320*
 
 ---
 
@@ -556,7 +568,7 @@ pub const SHADER_DIFFUSE_VERT: str = "#version 330 core\nlayout(location = 0) in
 pub const SHADER_DIFFUSE_FRAG: str = "#version 330 core\nin vec3 Normal;\nin vec3 FragPos;\nuniform vec3 lightPos;\nuniform vec3 lightColor;\nuniform vec3 objectColor;\nout vec4 FragColor;\nvoid main() {\n    vec3 ambient = 0.1 * lightColor;\n    vec3 norm = normalize(Normal);\n    vec3 lightDir = normalize(lightPos - FragPos);\n    float diff = max(dot(norm, lightDir), 0.0);\n    vec3 diffuse = diff * lightColor;\n    vec3 result = (ambient + diffuse) * objectColor;\n    FragColor = vec4(result, 1.0);\n}\n";
 ```
 
-*Defined at line 291*
+*Defined at line 321*
 
 ---
 
@@ -566,7 +578,7 @@ pub const SHADER_DIFFUSE_FRAG: str = "#version 330 core\nin vec3 Normal;\nin vec
 pub const SHADER_TEXT_VERT: str = "#version 330 core\nlayout(location = 0) in vec2 aPos;\nlayout(location = 1) in vec2 aTexCoord;\nout vec2 TexCoord;\nuniform mat4 projection;\nvoid main() {\n    gl_Position = projection * vec4(aPos, 0.0, 1.0);\n    TexCoord = aTexCoord;\n}\n";
 ```
 
-*Defined at line 292*
+*Defined at line 322*
 
 ---
 
@@ -576,7 +588,7 @@ pub const SHADER_TEXT_VERT: str = "#version 330 core\nlayout(location = 0) in ve
 pub const SHADER_TEXT_FRAG: str = "#version 330 core\nin vec2 TexCoord;\nout vec4 FragColor;\nuniform sampler2D text;\nuniform vec3 textColor;\nvoid main() {\n    vec4 sampled = vec4(1.0, 1.0, 1.0, texture(text, TexCoord).r);\n    FragColor = vec4(textColor, 1.0) * sampled;\n}\n";
 ```
 
-*Defined at line 293*
+*Defined at line 323*
 
 ---
 
@@ -586,7 +598,7 @@ pub const SHADER_TEXT_FRAG: str = "#version 330 core\nin vec2 TexCoord;\nout vec
 pub const SHADER_POST_VERT: str = "#version 330 core\nlayout(location = 0) in vec2 aPos;\nlayout(location = 1) in vec2 aTexCoord;\nout vec2 TexCoord;\nvoid main() {\n    gl_Position = vec4(aPos, 0.0, 1.0);\n    TexCoord = aTexCoord;\n}\n";
 ```
 
-*Defined at line 294*
+*Defined at line 324*
 
 ---
 
@@ -596,7 +608,7 @@ pub const SHADER_POST_VERT: str = "#version 330 core\nlayout(location = 0) in ve
 pub const SHADER_POST_FRAG: str = "#version 330 core\nin vec2 TexCoord;\nout vec4 FragColor;\nuniform sampler2D screenTexture;\nvoid main() {\n    FragColor = texture(screenTexture, TexCoord);\n}\n";
 ```
 
-*Defined at line 295*
+*Defined at line 325*
 
 ---
 
@@ -613,7 +625,7 @@ pub struct MaterialCache {
 | `materials` | `Vec<Material>` |
 | `names` | `Vec<str>` |
 
-*Defined at line 298*
+*Defined at line 328*
 
 ---
 
@@ -627,7 +639,7 @@ pub fn material_cache_create() -> MaterialCache {
 
 **Returns:** `MaterialCache`
 
-*Defined at line 304*
+*Defined at line 334*
 
 ---
 
@@ -646,7 +658,7 @@ pub fn material_cache_get(cache: &mut MaterialCache, shader_name: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 313*
+*Defined at line 343*
 
 ---
 
@@ -665,7 +677,7 @@ pub fn material_cache_get_idx(cache: &MaterialCache, idx: i64) -> Material {
 
 **Returns:** `Material`
 
-*Defined at line 328*
+*Defined at line 358*
 
 ---
 
@@ -683,7 +695,7 @@ pub fn material_cache_clear(cache: &mut MaterialCache) -> void {
 
 **Returns:** `void`
 
-*Defined at line 333*
+*Defined at line 363*
 
 ---
 
@@ -701,8 +713,8 @@ pub fn material_cache_count(cache: &MaterialCache) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 339*
+*Defined at line 369*
 
 ---
 
-*Generated by [scribe](https://fides.dev) — Fides documentation generator*
+*Generated by [scribe](https://fides.dev) -- Fides documentation generator*

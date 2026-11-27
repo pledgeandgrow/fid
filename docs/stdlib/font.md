@@ -1,9 +1,11 @@
-# font — Fides Documentation
+[All modules](index.md)
+
+# font -- Fides Documentation
 
 ## Contents
 
-- [Font](#font) (struct)
-- [Glyph](#glyph) (struct)
+- [Font](#Font) (struct)
+- [Glyph](#Glyph) (struct)
 - [font_load](#font_load) (function)
 - [font_free](#font_free) (function)
 - [font_get_glyph](#font_get_glyph) (function)
@@ -12,8 +14,9 @@
 - [font_text_height](#font_text_height) (function)
 - [font_render_text](#font_render_text) (function)
 - [font_render_text_colored](#font_render_text_colored) (function)
-- [BITMAP_FONT_WIDTH:](#bitmap_font_width:) (const)
-- [BITMAP_FONT_HEIGHT:](#bitmap_font_height:) (const)
+- [BITMAP_FONT_WIDTH:](#BITMAP_FONT_WIDTH:) (const)
+- [BITMAP_FONT_HEIGHT:](#BITMAP_FONT_HEIGHT:) (const)
+- [font8x8_glyph](#font8x8_glyph) (function)
 - [font_bitmap_char](#font_bitmap_char) (function)
 - [font_bitmap_text](#font_bitmap_text) (function)
 
@@ -27,15 +30,15 @@ pub struct Font {
 
 | Name | Type |
 |------|------|
-| `info` | `i64,          // stbtt_fontinfo (opaque pointer, 0 in interpreter)` |
-| `data` | `Vec<i64>,     // TTF file bytes` |
-| `scale` | `f64,         // pixel height scale` |
-| `ascent` | `f64,        // font ascent (baseline to top)` |
-| `descent` | `f64,       // font descent (baseline to bottom)` |
-| `line_gap` | `f64,      // line gap` |
-| `line_height` | `f64,   // total line height (ascent - descent + line_gap)` |
+| `info` | `i64` |
+| `data` | `Vec<i64>` |
+| `scale` | `f64` |
+| `ascent` | `f64` |
+| `descent` | `f64` |
+| `line_gap` | `f64` |
+| `line_height` | `f64,  // total line height (ascent - descent + line_gap)` |
 
-*Defined at line 25*
+*Defined at line 26*
 
 ---
 
@@ -49,15 +52,15 @@ pub struct Glyph {
 
 | Name | Type |
 |------|------|
-| `codepoint` | `i64,     // Unicode codepoint` |
-| `width` | `i64,         // glyph bitmap width` |
-| `height` | `i64,        // glyph bitmap height` |
-| `xoff` | `i64,           // x offset from cursor to left edge` |
-| `yoff` | `i64,           // y offset from cursor to top edge` |
-| `advance` | `f64,       // cursor advance after this glyph` |
-| `bitmap` | `Vec<i64>,   // grayscale pixels (0-255), width * height` |
+| `codepoint` | `i64` |
+| `width` | `i64` |
+| `height` | `i64` |
+| `xoff` | `i64` |
+| `yoff` | `i64` |
+| `advance` | `f64` |
+| `bitmap` | `Vec<i64>,  // grayscale pixels (0-255), width * height` |
 
-*Defined at line 41*
+*Defined at line 42*
 
 ---
 
@@ -77,7 +80,7 @@ pub fn font_load(path: str, pixel_size: f64) -> Font {
 
 **Returns:** `Font`
 
-*Defined at line 92*
+*Defined at line 95*
 
 ---
 
@@ -95,7 +98,7 @@ pub fn font_free(font: &mut Font) -> void {
 
 **Returns:** `void`
 
-*Defined at line 115*
+*Defined at line 128*
 
 ---
 
@@ -115,7 +118,7 @@ pub fn font_get_glyph(font: &Font, codepoint: i64) -> Glyph {
 
 **Returns:** `Glyph`
 
-*Defined at line 127*
+*Defined at line 146*
 
 ---
 
@@ -135,7 +138,7 @@ pub fn font_kern(font: &Font, ch1: i64, ch2: i64) -> f64 {
 
 **Returns:** `f64`
 
-*Defined at line 157*
+*Defined at line 182*
 
 ---
 
@@ -154,7 +157,7 @@ pub fn font_text_width(font: &Font, text: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 167*
+*Defined at line 196*
 
 ---
 
@@ -173,7 +176,7 @@ pub fn font_text_height(font: &Font, text: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 176*
+*Defined at line 210*
 
 ---
 
@@ -193,7 +196,7 @@ pub fn font_render_text(font: &Font, text: str) -> Image {
 
 **Returns:** `Image`
 
-*Defined at line 193*
+*Defined at line 227*
 
 ---
 
@@ -216,7 +219,7 @@ pub fn font_render_text_colored(font: &Font, text: str, r: i64, g: i64, b: i64, 
 
 **Returns:** `Image`
 
-*Defined at line 264*
+*Defined at line 298*
 
 ---
 
@@ -226,7 +229,7 @@ pub fn font_render_text_colored(font: &Font, text: str, r: i64, g: i64, b: i64, 
 pub const BITMAP_FONT_WIDTH: i64 = 8;
 ```
 
-*Defined at line 295*
+*Defined at line 329*
 
 ---
 
@@ -236,14 +239,46 @@ pub const BITMAP_FONT_WIDTH: i64 = 8;
 pub const BITMAP_FONT_HEIGHT: i64 = 8;
 ```
 
-*Defined at line 295*
+*Defined at line 330*
+
+---
+
+## font8x8_glyph
+
+Render a single character using the built-in 8x8 bitmap font.
+Returns an 8x8 RGBA Image.
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+use image;
+val a = font_bitmap_char(65);
+assert_eq(a.width, BITMAP_FONT_WIDTH);
+assert_eq(a.height, 8);
+assert_eq(image_get_pixel(&a, 2, 0), 0xFFFFFFFF);   // 'A' row 0, x=2 is set
+assert_eq(image_get_pixel(&a, 0, 0), 0xFF000000);   // unset pixel is opaque black
+val t = font_bitmap_text("hi");
+assert_eq(t.width, 16);
+```
+Look up a packed font8x8 glyph (byte r at bits r*8, bit x = column).
+Exposed so renderers can blit glyphs without an Image round trip.
+
+```fides
+pub fn font8x8_glyph(ch: i64) -> i64 {
+```
+
+**Parameters:**
+
+- `ch`: `i64`
+
+**Returns:** `i64`
+
+*Defined at line 347*
 
 ---
 
 ## font_bitmap_char
-
-Render a single character using the built-in 8x8 bitmap font.
-Returns an 8x8 RGBA Image.
 
 ```fides
 pub fn font_bitmap_char(ch: i64) -> Image {
@@ -255,7 +290,7 @@ pub fn font_bitmap_char(ch: i64) -> Image {
 
 **Returns:** `Image`
 
-*Defined at line 413*
+*Defined at line 638*
 
 ---
 
@@ -273,8 +308,8 @@ pub fn font_bitmap_text(text: str) -> Image {
 
 **Returns:** `Image`
 
-*Defined at line 432*
+*Defined at line 657*
 
 ---
 
-*Generated by [scribe](https://fides.dev) — Fides documentation generator*
+*Generated by [scribe](https://fides.dev) -- Fides documentation generator*

@@ -1,36 +1,38 @@
-# banking — Fides Documentation
+[All modules](index.md)
+
+# banking -- Fides Documentation
 
 ## Contents
 
-- [Account](#account) (struct)
-- [Account_open](#account_open) (function)
-- [Account_deposit](#account_deposit) (function)
-- [Account_withdraw](#account_withdraw) (function)
-- [Account_transfer](#account_transfer) (function)
-- [Account_accrue_interest](#account_accrue_interest) (function)
-- [Account_balance_cents](#account_balance_cents) (function)
-- [Account_id](#account_id) (function)
-- [Account_print](#account_print) (function)
-- [ACCOUNT_STATE_ACTIVE:](#account_state_active:) (const)
-- [ACCOUNT_STATE_FROZEN:](#account_state_frozen:) (const)
-- [ACCOUNT_STATE_CLOSED:](#account_state_closed:) (const)
-- [AccountActive](#accountactive) (struct)
-- [AccountFrozen](#accountfrozen) (struct)
-- [AccountClosed](#accountclosed) (struct)
-- [AccountActive_open](#accountactive_open) (function)
-- [AccountActive_deposit](#accountactive_deposit) (function)
-- [AccountActive_withdraw](#accountactive_withdraw) (function)
-- [AccountActive_transfer](#accountactive_transfer) (function)
-- [AccountActive_freeze](#accountactive_freeze) (function)
-- [AccountActive_close](#accountactive_close) (function)
-- [AccountActive_balance_cents](#accountactive_balance_cents) (function)
-- [AccountActive_id](#accountactive_id) (function)
-- [AccountFrozen_unfreeze](#accountfrozen_unfreeze) (function)
-- [AccountFrozen_close](#accountfrozen_close) (function)
-- [AccountFrozen_balance_cents](#accountfrozen_balance_cents) (function)
-- [AccountFrozen_id](#accountfrozen_id) (function)
-- [AccountClosed_balance_cents](#accountclosed_balance_cents) (function)
-- [AccountClosed_id](#accountclosed_id) (function)
+- [Account](#Account) (struct)
+- [Account_open](#Account_open) (function)
+- [Account_deposit](#Account_deposit) (function)
+- [Account_withdraw](#Account_withdraw) (function)
+- [Account_transfer](#Account_transfer) (function)
+- [Account_accrue_interest](#Account_accrue_interest) (function)
+- [Account_balance_cents](#Account_balance_cents) (function)
+- [Account_id](#Account_id) (function)
+- [Account_print](#Account_print) (function)
+- [ACCOUNT_STATE_ACTIVE:](#ACCOUNT_STATE_ACTIVE:) (const)
+- [ACCOUNT_STATE_FROZEN:](#ACCOUNT_STATE_FROZEN:) (const)
+- [ACCOUNT_STATE_CLOSED:](#ACCOUNT_STATE_CLOSED:) (const)
+- [AccountActive](#AccountActive) (struct)
+- [AccountFrozen](#AccountFrozen) (struct)
+- [AccountClosed](#AccountClosed) (struct)
+- [AccountActive_open](#AccountActive_open) (function)
+- [AccountActive_deposit](#AccountActive_deposit) (function)
+- [AccountActive_withdraw](#AccountActive_withdraw) (function)
+- [AccountActive_transfer](#AccountActive_transfer) (function)
+- [AccountActive_freeze](#AccountActive_freeze) (function)
+- [AccountActive_close](#AccountActive_close) (function)
+- [AccountActive_balance_cents](#AccountActive_balance_cents) (function)
+- [AccountActive_id](#AccountActive_id) (function)
+- [AccountFrozen_unfreeze](#AccountFrozen_unfreeze) (function)
+- [AccountFrozen_close](#AccountFrozen_close) (function)
+- [AccountFrozen_balance_cents](#AccountFrozen_balance_cents) (function)
+- [AccountFrozen_id](#AccountFrozen_id) (function)
+- [AccountClosed_balance_cents](#AccountClosed_balance_cents) (function)
+- [AccountClosed_id](#AccountClosed_id) (function)
 - [account_state_name](#account_state_name) (function)
 
 ## Account
@@ -46,7 +48,7 @@ pub struct Account {
 | `id` | `i64` |
 | `balance` | `Money` |
 
-*Defined at line 28*
+*Defined at line 29*
 
 ---
 
@@ -66,7 +68,7 @@ pub fn Account_open(id: i64, initial_cents: i64) -> Account {
 
 **Returns:** `Account`
 
-*Defined at line 37*
+*Defined at line 38*
 
 ---
 
@@ -83,11 +85,18 @@ pub fn Account_deposit(acc: Account, amount: Money) -> Account {
 
 **Returns:** `Account`
 
-*Defined at line 48*
+*Defined at line 50*
 
 ---
 
 ## Account_withdraw
+
+Withdraw money from an account. Consumes the account,
+returns a new account with reduced balance AND the withdrawn cash.
+Conservation: old_balance = new_balance + withdrawn.
+NOT @conserve: it rebuilds balances from cents (Money_from_cents mints).
+A conserving version needs Money_split, blocked by the tuple layout bug
+(compiler/lower.fd names every 2-tuple layout `__tuple_2`).
 
 ```fides
 pub fn Account_withdraw(acc: Account, withdraw_cents: i64) -> (Account, Money) {
@@ -100,11 +109,30 @@ pub fn Account_withdraw(acc: Account, withdraw_cents: i64) -> (Account, Money) {
 
 **Returns:** `(Account, Money)`
 
-*Defined at line 62*
+*Defined at line 64*
 
 ---
 
 ## Account_transfer
+
+Transfer money from one account to another. Consumes both accounts,
+returns both with updated balances.
+Conservation: A loses X, B gains X. Total unchanged.
+NOT @conserve: it rebuilds balances from cents (Money_from_cents mints).
+A conserving version needs Money_split, blocked by the tuple layout bug
+(compiler/lower.fd names every 2-tuple layout `__tuple_2`).
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+use money;
+val a = Account_open(1, 1000);
+val b = Account_open(2, 0);
+val (a2, b2) = Account_transfer(a, b, 300);
+assert_eq(Account_balance_cents(a2), 700);
+assert_eq(Account_balance_cents(b2), 300);
+```
 
 ```fides
 pub fn Account_transfer(from: Account, to: Account, amount_cents: i64) -> (Account, Account) {
@@ -118,7 +146,7 @@ pub fn Account_transfer(from: Account, to: Account, amount_cents: i64) -> (Accou
 
 **Returns:** `(Account, Account)`
 
-*Defined at line 86*
+*Defined at line 88*
 
 ---
 
@@ -135,11 +163,14 @@ pub fn Account_accrue_interest(acc: Account, rate_bps: i64) -> Account {
 
 **Returns:** `Account`
 
-*Defined at line 106*
+*Defined at line 109*
 
 ---
 
 ## Account_balance_cents
+
+Get the account balance in cents. Consumes the account.
+Not @conserve: it consumes the account, so its money leaves the system.
 
 ```fides
 pub fn Account_balance_cents(acc: Account) -> i64 {
@@ -151,11 +182,14 @@ pub fn Account_balance_cents(acc: Account) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 117*
+*Defined at line 120*
 
 ---
 
 ## Account_id
+
+Get the account ID. Consumes the account.
+Not @conserve: it consumes the account, so its money leaves the system.
 
 ```fides
 pub fn Account_id(acc: Account) -> i64 {
@@ -167,7 +201,7 @@ pub fn Account_id(acc: Account) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 123*
+*Defined at line 126*
 
 ---
 
@@ -185,7 +219,7 @@ pub fn Account_print(acc: Account) -> void {
 
 **Returns:** `void`
 
-*Defined at line 128*
+*Defined at line 131*
 
 ---
 
@@ -194,30 +228,30 @@ pub fn Account_print(acc: Account) -> void {
 Account state constants.
 
 ```fides
-pub const ACCOUNT_STATE_ACTIVE: i64  = 0;
+pub const ACCOUNT_STATE_ACTIVE: i64 = 0;
 ```
 
-*Defined at line 162*
+*Defined at line 165*
 
 ---
 
 ## ACCOUNT_STATE_FROZEN:
 
 ```fides
-pub const ACCOUNT_STATE_FROZEN: i64  = 1;
+pub const ACCOUNT_STATE_FROZEN: i64 = 1;
 ```
 
-*Defined at line 162*
+*Defined at line 166*
 
 ---
 
 ## ACCOUNT_STATE_CLOSED:
 
 ```fides
-pub const ACCOUNT_STATE_CLOSED: i64  = 2;
+pub const ACCOUNT_STATE_CLOSED: i64 = 2;
 ```
 
-*Defined at line 162*
+*Defined at line 167*
 
 ---
 
@@ -234,7 +268,7 @@ pub struct AccountActive {
 | `id` | `i64` |
 | `balance` | `Money` |
 
-*Defined at line 164*
+*Defined at line 170*
 
 ---
 
@@ -251,7 +285,7 @@ pub struct AccountFrozen {
 | `id` | `i64` |
 | `balance` | `Money` |
 
-*Defined at line 170*
+*Defined at line 177*
 
 ---
 
@@ -268,7 +302,7 @@ pub struct AccountClosed {
 | `id` | `i64` |
 | `balance` | `Money` |
 
-*Defined at line 176*
+*Defined at line 184*
 
 ---
 
@@ -287,7 +321,7 @@ pub fn AccountActive_open(id: i64, initial_cents: i64) -> AccountActive {
 
 **Returns:** `AccountActive`
 
-*Defined at line 184*
+*Defined at line 192*
 
 ---
 
@@ -304,11 +338,16 @@ pub fn AccountActive_deposit(acc: AccountActive, amount: Money) -> AccountActive
 
 **Returns:** `AccountActive`
 
-*Defined at line 191*
+*Defined at line 200*
 
 ---
 
 ## AccountActive_withdraw
+
+Withdraw money from an active account.
+NOT @conserve: it rebuilds balances from cents (Money_from_cents mints).
+A conserving version needs Money_split, blocked by the tuple layout bug
+(compiler/lower.fd names every 2-tuple layout `__tuple_2`).
 
 ```fides
 pub fn AccountActive_withdraw(acc: AccountActive, withdraw_cents: i64) -> (AccountActive, Money) {
@@ -321,22 +360,30 @@ pub fn AccountActive_withdraw(acc: AccountActive, withdraw_cents: i64) -> (Accou
 
 **Returns:** `(AccountActive, Money)`
 
-*Defined at line 202*
+*Defined at line 211*
 
 ---
 
 ## AccountActive_transfer
 
+Transfer money between two active accounts.
+NOT @conserve: it rebuilds balances from cents (Money_from_cents mints).
+A conserving version needs Money_split, blocked by the tuple layout bug
+(compiler/lower.fd names every 2-tuple layout `__tuple_2`).
+
 ```fides
-pub fn AccountActive_transfer(from: AccountActive, to: AccountActive,
+pub fn AccountActive_transfer(from: AccountActive, to: AccountActive, amount_cents: i64) -> (AccountActive, AccountActive) {
 ```
 
 **Parameters:**
 
 - `from`: `AccountActive`
 - `to`: `AccountActive`
+- `amount_cents`: `i64`
 
-*Defined at line 215*
+**Returns:** `(AccountActive, AccountActive)`
+
+*Defined at line 224*
 
 ---
 
@@ -352,7 +399,7 @@ pub fn AccountActive_freeze(acc: AccountActive) -> AccountFrozen {
 
 **Returns:** `AccountFrozen`
 
-*Defined at line 228*
+*Defined at line 238*
 
 ---
 
@@ -368,11 +415,14 @@ pub fn AccountActive_close(acc: AccountActive) -> AccountClosed {
 
 **Returns:** `AccountClosed`
 
-*Defined at line 235*
+*Defined at line 246*
 
 ---
 
 ## AccountActive_balance_cents
+
+Get balance of an active account.
+Not @conserve: it consumes the account, so its money leaves the system.
 
 ```fides
 pub fn AccountActive_balance_cents(acc: AccountActive) -> i64 {
@@ -384,11 +434,14 @@ pub fn AccountActive_balance_cents(acc: AccountActive) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 243*
+*Defined at line 254*
 
 ---
 
 ## AccountActive_id
+
+Get ID of an active account.
+Not @conserve: it consumes the account, so its money leaves the system.
 
 ```fides
 pub fn AccountActive_id(acc: AccountActive) -> i64 {
@@ -400,7 +453,7 @@ pub fn AccountActive_id(acc: AccountActive) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 249*
+*Defined at line 260*
 
 ---
 
@@ -416,7 +469,7 @@ pub fn AccountFrozen_unfreeze(acc: AccountFrozen) -> AccountActive {
 
 **Returns:** `AccountActive`
 
-*Defined at line 259*
+*Defined at line 271*
 
 ---
 
@@ -432,11 +485,14 @@ pub fn AccountFrozen_close(acc: AccountFrozen) -> AccountClosed {
 
 **Returns:** `AccountClosed`
 
-*Defined at line 266*
+*Defined at line 279*
 
 ---
 
 ## AccountFrozen_balance_cents
+
+Get balance of a frozen account (read-only).
+Not @conserve: it consumes the account, so its money leaves the system.
 
 ```fides
 pub fn AccountFrozen_balance_cents(acc: AccountFrozen) -> i64 {
@@ -448,11 +504,14 @@ pub fn AccountFrozen_balance_cents(acc: AccountFrozen) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 274*
+*Defined at line 287*
 
 ---
 
 ## AccountFrozen_id
+
+Get ID of a frozen account.
+Not @conserve: it consumes the account, so its money leaves the system.
 
 ```fides
 pub fn AccountFrozen_id(acc: AccountFrozen) -> i64 {
@@ -464,11 +523,14 @@ pub fn AccountFrozen_id(acc: AccountFrozen) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 280*
+*Defined at line 293*
 
 ---
 
 ## AccountClosed_balance_cents
+
+Get final balance of a closed account (for audit).
+Not @conserve: it consumes the account, so its money leaves the system.
 
 ```fides
 pub fn AccountClosed_balance_cents(acc: AccountClosed) -> i64 {
@@ -480,11 +542,14 @@ pub fn AccountClosed_balance_cents(acc: AccountClosed) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 291*
+*Defined at line 304*
 
 ---
 
 ## AccountClosed_id
+
+Get ID of a closed account.
+Not @conserve: it consumes the account, so its money leaves the system.
 
 ```fides
 pub fn AccountClosed_id(acc: AccountClosed) -> i64 {
@@ -496,7 +561,7 @@ pub fn AccountClosed_id(acc: AccountClosed) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 297*
+*Defined at line 310*
 
 ---
 
@@ -512,8 +577,8 @@ pub fn account_state_name(state: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 302*
+*Defined at line 316*
 
 ---
 
-*Generated by [scribe](https://fides.dev) — Fides documentation generator*
+*Generated by [scribe](https://fides.dev) -- Fides documentation generator*

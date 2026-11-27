@@ -1,19 +1,21 @@
-# navmesh — Fides Documentation
+[All modules](index.md)
+
+# navmesh -- Fides Documentation
 
 ## Contents
 
-- [NavGrid](#navgrid) (struct)
+- [NavGrid](#NavGrid) (struct)
 - [nav_grid_create](#nav_grid_create) (function)
 - [nav_grid_set_blocked](#nav_grid_set_blocked) (function)
 - [nav_grid_is_blocked](#nav_grid_is_blocked) (function)
 - [nav_grid_index](#nav_grid_index) (function)
 - [nav_grid_unpack](#nav_grid_unpack) (function)
-- [AStarNode](#astarnode) (struct)
+- [AStarNode](#AStarNode) (struct)
 - [nav_grid_find_path](#nav_grid_find_path) (function)
 - [nav_grid_path_length](#nav_grid_path_length) (function)
 - [nav_grid_path_waypoint](#nav_grid_path_waypoint) (function)
-- [NavPoly](#navpoly) (struct)
-- [NavMesh](#navmesh) (struct)
+- [NavPoly](#NavPoly) (struct)
+- [NavMesh](#NavMesh) (struct)
 - [navmesh_create](#navmesh_create) (function)
 - [navmesh_add_polygon](#navmesh_add_polygon) (function)
 - [navmesh_connect](#navmesh_connect) (function)
@@ -33,13 +35,32 @@ pub struct NavGrid {
 |------|------|
 | `width` | `i64` |
 | `height` | `i64` |
-| `cells` | `Vec<bool>,     // true = blocked` |
+| `cells` | `Vec<bool>,  // true = blocked` |
 
-*Defined at line 20*
+*Defined at line 21*
 
 ---
 
 ## nav_grid_create
+
+A width x height grid with every cell free.
+
+
+*Example -- run as a test by `scripts/doctest.py`:*
+
+```fides
+assert_eq(nav_grid_index(3, 7), 30007);
+var g = nav_grid_create(5, 5);
+assert(!nav_grid_is_blocked(&g, 2, 2));
+nav_grid_set_blocked(&mut g, 2, 2, true);
+assert(nav_grid_is_blocked(&g, 2, 2));
+assert(nav_grid_is_blocked(&g, -1, 0));
+val p = nav_grid_find_path(&g, 0, 0, 4, 0);
+assert_eq(p.get(p.len() - 1), nav_grid_index(4, 0));
+assert_eq(nav_grid_path_length(p), p.len());
+nav_grid_set_blocked(&mut g, 4, 4, true);
+assert_eq(nav_grid_find_path(&g, 0, 0, 4, 4).len(), 0);
+```
 
 ```fides
 pub fn nav_grid_create(width: i64, height: i64) -> NavGrid {
@@ -52,7 +73,7 @@ pub fn nav_grid_create(width: i64, height: i64) -> NavGrid {
 
 **Returns:** `NavGrid`
 
-*Defined at line 40*
+*Defined at line 41*
 
 ---
 
@@ -71,7 +92,7 @@ pub fn nav_grid_set_blocked(grid: &mut NavGrid, x: i64, y: i64, blocked: bool) -
 
 **Returns:** `void`
 
-*Defined at line 52*
+*Defined at line 53*
 
 ---
 
@@ -89,7 +110,7 @@ pub fn nav_grid_is_blocked(grid: &NavGrid, x: i64, y: i64) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 59*
+*Defined at line 60*
 
 ---
 
@@ -106,7 +127,7 @@ pub fn nav_grid_index(x: i64, y: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 66*
+*Defined at line 67*
 
 ---
 
@@ -122,7 +143,7 @@ pub fn nav_grid_unpack(idx: i64) -> vec2 {
 
 **Returns:** `vec2`
 
-*Defined at line 71*
+*Defined at line 72*
 
 ---
 
@@ -138,15 +159,15 @@ pub struct AStarNode {
 |------|------|
 | `x` | `i64` |
 | `y` | `i64` |
-| `g` | `f64,    // cost from start` |
-| `h` | `f64,    // heuristic to goal` |
-| `f` | `f64,    // g + h` |
+| `g` | `f64` |
+| `h` | `f64` |
+| `f` | `f64` |
 | `parent_x` | `i64` |
 | `parent_y` | `i64` |
 | `open` | `bool` |
 | `closed` | `bool` |
 
-*Defined at line 76*
+*Defined at line 77*
 
 ---
 
@@ -168,7 +189,7 @@ pub fn nav_grid_find_path(grid: &NavGrid, start_x: i64, start_y: i64, goal_x: i6
 
 **Returns:** `Vec<i64>`
 
-*Defined at line 92*
+*Defined at line 93*
 
 ---
 
@@ -186,7 +207,7 @@ pub fn nav_grid_path_length(path: Vec<i64>) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 249*
+*Defined at line 250*
 
 ---
 
@@ -205,7 +226,7 @@ pub fn nav_grid_path_waypoint(path: Vec<i64>, idx: i64) -> vec2 {
 
 **Returns:** `vec2`
 
-*Defined at line 254*
+*Defined at line 255*
 
 ---
 
@@ -222,9 +243,9 @@ pub struct NavPoly {
 | `id` | `i64` |
 | `center_x` | `f64` |
 | `center_y` | `f64` |
-| `neighbors` | `Vec<i64>,    // adjacent polygon IDs` |
+| `neighbors` | `Vec<i64>,  // adjacent polygon IDs` |
 
-*Defined at line 263*
+*Defined at line 264*
 
 ---
 
@@ -240,7 +261,7 @@ pub struct NavMesh {
 |------|------|
 | `polygons` | `Vec<NavPoly>` |
 
-*Defined at line 270*
+*Defined at line 271*
 
 ---
 
@@ -252,7 +273,7 @@ pub fn navmesh_create() -> NavMesh {
 
 **Returns:** `NavMesh`
 
-*Defined at line 274*
+*Defined at line 275*
 
 ---
 
@@ -272,7 +293,7 @@ pub fn navmesh_add_polygon(mesh: &mut NavMesh, center_x: f64, center_y: f64) -> 
 
 **Returns:** `i64`
 
-*Defined at line 281*
+*Defined at line 282*
 
 ---
 
@@ -292,7 +313,7 @@ pub fn navmesh_connect(mesh: &mut NavMesh, a: i64, b: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 290*
+*Defined at line 291*
 
 ---
 
@@ -312,7 +333,7 @@ pub fn navmesh_find_path(mesh: &NavMesh, start: i64, goal: i64) -> Vec<i64> {
 
 **Returns:** `Vec<i64>`
 
-*Defined at line 306*
+*Defined at line 307*
 
 ---
 
@@ -331,7 +352,7 @@ pub fn navmesh_poly_center(mesh: &NavMesh, id: i64) -> vec2 {
 
 **Returns:** `vec2`
 
-*Defined at line 419*
+*Defined at line 420*
 
 ---
 
@@ -349,8 +370,8 @@ pub fn navmesh_poly_count(mesh: &NavMesh) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 428*
+*Defined at line 429*
 
 ---
 
-*Generated by [scribe](https://fides.dev) — Fides documentation generator*
+*Generated by [scribe](https://fides.dev) -- Fides documentation generator*

@@ -1,0 +1,2983 @@
+[All modules](index.md)
+
+# vulkan -- Fides Documentation
+
+## Contents
+
+- [vk_make_api_version](#vk_make_api_version) (function)
+- [VK_API_VERSION_1_0:](#VK_API_VERSION_1_0:) (const)
+- [VK_API_VERSION_1_1:](#VK_API_VERSION_1_1:) (const)
+- [VK_API_VERSION_1_2:](#VK_API_VERSION_1_2:) (const)
+- [VK_API_VERSION_1_3:](#VK_API_VERSION_1_3:) (const)
+- [vk_version_str](#vk_version_str) (function)
+- [VK_SUCCESS:](#VK_SUCCESS:) (const)
+- [VK_NOT_READY:](#VK_NOT_READY:) (const)
+- [VK_TIMEOUT:](#VK_TIMEOUT:) (const)
+- [VK_INCOMPLETE:](#VK_INCOMPLETE:) (const)
+- [VK_ERROR_OUT_OF_HOST_MEMORY:](#VK_ERROR_OUT_OF_HOST_MEMORY:) (const)
+- [VK_ERROR_OUT_OF_DEVICE_MEMORY:](#VK_ERROR_OUT_OF_DEVICE_MEMORY:) (const)
+- [VK_ERROR_INITIALIZATION_FAILED:](#VK_ERROR_INITIALIZATION_FAILED:) (const)
+- [VK_ERROR_DEVICE_LOST:](#VK_ERROR_DEVICE_LOST:) (const)
+- [VK_ERROR_MEMORY_MAP_FAILED:](#VK_ERROR_MEMORY_MAP_FAILED:) (const)
+- [VK_ERROR_LAYER_NOT_PRESENT:](#VK_ERROR_LAYER_NOT_PRESENT:) (const)
+- [VK_ERROR_EXTENSION_NOT_PRESENT:](#VK_ERROR_EXTENSION_NOT_PRESENT:) (const)
+- [VK_ERROR_FEATURE_NOT_PRESENT:](#VK_ERROR_FEATURE_NOT_PRESENT:) (const)
+- [VK_ERROR_INCOMPATIBLE_DRIVER:](#VK_ERROR_INCOMPATIBLE_DRIVER:) (const)
+- [VK_ERROR_TOO_MANY_OBJECTS:](#VK_ERROR_TOO_MANY_OBJECTS:) (const)
+- [VK_ERROR_FORMAT_NOT_SUPPORTED:](#VK_ERROR_FORMAT_NOT_SUPPORTED:) (const)
+- [VK_ERROR_OUT_OF_DATE_KHR:](#VK_ERROR_OUT_OF_DATE_KHR:) (const)
+- [VK_SUBOPTIMAL_KHR:](#VK_SUBOPTIMAL_KHR:) (const)
+- [vk_result_name](#vk_result_name) (function)
+- [VK_STRUCTURE_TYPE_APPLICATION_INFO:](#VK_STRUCTURE_TYPE_APPLICATION_INFO:) (const)
+- [VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO:](#VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO:) (const)
+- [VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO:](#VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO:) (const)
+- [VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO:](#VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO:) (const)
+- [VK_STRUCTURE_TYPE_SUBMIT_INFO:](#VK_STRUCTURE_TYPE_SUBMIT_INFO:) (const)
+- [VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO:](#VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO:) (const)
+- [VK_STRUCTURE_TYPE_FENCE_CREATE_INFO:](#VK_STRUCTURE_TYPE_FENCE_CREATE_INFO:) (const)
+- [VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO:](#VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO:) (const)
+- [VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO:](#VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO:) (const)
+- [VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO:](#VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO:) (const)
+- [VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO:](#VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO:) (const)
+- [VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO:](#VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO:) (const)
+- [VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO:](#VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO:) (const)
+- [VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO:](#VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO:) (const)
+- [VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO:](#VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO:) (const)
+- [VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO:](#VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO:) (const)
+- [VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO:](#VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO:) (const)
+- [VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO:](#VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO:) (const)
+- [VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET:](#VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET:) (const)
+- [VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO:](#VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO:) (const)
+- [VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO:](#VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO:) (const)
+- [VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO:](#VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO:) (const)
+- [VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER:](#VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER:) (const)
+- [VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER:](#VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER:) (const)
+- [VK_STRUCTURE_TYPE_MEMORY_BARRIER:](#VK_STRUCTURE_TYPE_MEMORY_BARRIER:) (const)
+- [VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES:](#VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES:) (const)
+- [VK_STRUCTURE_TYPE_RENDERING_INFO:](#VK_STRUCTURE_TYPE_RENDERING_INFO:) (const)
+- [VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO:](#VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO:) (const)
+- [VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO:](#VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO:) (const)
+- [VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2:](#VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2:) (const)
+- [VK_STRUCTURE_TYPE_DEPENDENCY_INFO:](#VK_STRUCTURE_TYPE_DEPENDENCY_INFO:) (const)
+- [VK_STRUCTURE_TYPE_SUBMIT_INFO_2:](#VK_STRUCTURE_TYPE_SUBMIT_INFO_2:) (const)
+- [VK_IMAGE_LAYOUT_UNDEFINED:](#VK_IMAGE_LAYOUT_UNDEFINED:) (const)
+- [VK_IMAGE_LAYOUT_GENERAL:](#VK_IMAGE_LAYOUT_GENERAL:) (const)
+- [VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:](#VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:) (const)
+- [VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:](#VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:) (const)
+- [VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL:](#VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL:) (const)
+- [VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:](#VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:) (const)
+- [VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:](#VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:) (const)
+- [VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:](#VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:) (const)
+- [VK_IMAGE_LAYOUT_PREINITIALIZED:](#VK_IMAGE_LAYOUT_PREINITIALIZED:) (const)
+- [VK_IMAGE_LAYOUT_PRESENT_SRC_KHR:](#VK_IMAGE_LAYOUT_PRESENT_SRC_KHR:) (const)
+- [VK_ACCESS_INDIRECT_COMMAND_READ_BIT:](#VK_ACCESS_INDIRECT_COMMAND_READ_BIT:) (const)
+- [VK_ACCESS_INDEX_READ_BIT:](#VK_ACCESS_INDEX_READ_BIT:) (const)
+- [VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT:](#VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT:) (const)
+- [VK_ACCESS_UNIFORM_READ_BIT:](#VK_ACCESS_UNIFORM_READ_BIT:) (const)
+- [VK_ACCESS_INPUT_ATTACHMENT_READ_BIT:](#VK_ACCESS_INPUT_ATTACHMENT_READ_BIT:) (const)
+- [VK_ACCESS_SHADER_READ_BIT:](#VK_ACCESS_SHADER_READ_BIT:) (const)
+- [VK_ACCESS_SHADER_WRITE_BIT:](#VK_ACCESS_SHADER_WRITE_BIT:) (const)
+- [VK_ACCESS_COLOR_ATTACHMENT_READ_BIT:](#VK_ACCESS_COLOR_ATTACHMENT_READ_BIT:) (const)
+- [VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT:](#VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT:) (const)
+- [VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT:](#VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT:) (const)
+- [VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT:](#VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT:) (const)
+- [VK_ACCESS_TRANSFER_READ_BIT:](#VK_ACCESS_TRANSFER_READ_BIT:) (const)
+- [VK_ACCESS_TRANSFER_WRITE_BIT:](#VK_ACCESS_TRANSFER_WRITE_BIT:) (const)
+- [VK_ACCESS_HOST_READ_BIT:](#VK_ACCESS_HOST_READ_BIT:) (const)
+- [VK_ACCESS_HOST_WRITE_BIT:](#VK_ACCESS_HOST_WRITE_BIT:) (const)
+- [VK_ACCESS_MEMORY_READ_BIT:](#VK_ACCESS_MEMORY_READ_BIT:) (const)
+- [VK_ACCESS_MEMORY_WRITE_BIT:](#VK_ACCESS_MEMORY_WRITE_BIT:) (const)
+- [VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT:](#VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT:) (const)
+- [VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT:](#VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT:) (const)
+- [VK_PIPELINE_STAGE_VERTEX_INPUT_BIT:](#VK_PIPELINE_STAGE_VERTEX_INPUT_BIT:) (const)
+- [VK_PIPELINE_STAGE_VERTEX_SHADER_BIT:](#VK_PIPELINE_STAGE_VERTEX_SHADER_BIT:) (const)
+- [VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT:](#VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT:) (const)
+- [VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT:](#VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT:) (const)
+- [VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT:](#VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT:) (const)
+- [VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT:](#VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT:) (const)
+- [VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT:](#VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT:) (const)
+- [VK_PIPELINE_STAGE_TRANSFER_BIT:](#VK_PIPELINE_STAGE_TRANSFER_BIT:) (const)
+- [VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT:](#VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT:) (const)
+- [VK_PIPELINE_STAGE_HOST_BIT:](#VK_PIPELINE_STAGE_HOST_BIT:) (const)
+- [VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT:](#VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT:) (const)
+- [VK_PIPELINE_STAGE_ALL_COMMANDS_BIT:](#VK_PIPELINE_STAGE_ALL_COMMANDS_BIT:) (const)
+- [VK_IMAGE_ASPECT_COLOR_BIT:](#VK_IMAGE_ASPECT_COLOR_BIT:) (const)
+- [VK_IMAGE_ASPECT_DEPTH_BIT:](#VK_IMAGE_ASPECT_DEPTH_BIT:) (const)
+- [VK_IMAGE_ASPECT_STENCIL_BIT:](#VK_IMAGE_ASPECT_STENCIL_BIT:) (const)
+- [VK_IMAGE_TYPE_1D:](#VK_IMAGE_TYPE_1D:) (const)
+- [VK_IMAGE_TYPE_2D:](#VK_IMAGE_TYPE_2D:) (const)
+- [VK_IMAGE_TYPE_3D:](#VK_IMAGE_TYPE_3D:) (const)
+- [VK_IMAGE_TILING_OPTIMAL:](#VK_IMAGE_TILING_OPTIMAL:) (const)
+- [VK_IMAGE_TILING_LINEAR:](#VK_IMAGE_TILING_LINEAR:) (const)
+- [VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT:](#VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT:) (const)
+- [VK_IMAGE_USAGE_TRANSFER_SRC_BIT:](#VK_IMAGE_USAGE_TRANSFER_SRC_BIT:) (const)
+- [VK_IMAGE_USAGE_TRANSFER_DST_BIT:](#VK_IMAGE_USAGE_TRANSFER_DST_BIT:) (const)
+- [VK_IMAGE_USAGE_SAMPLED_BIT:](#VK_IMAGE_USAGE_SAMPLED_BIT:) (const)
+- [VK_IMAGE_USAGE_STORAGE_BIT:](#VK_IMAGE_USAGE_STORAGE_BIT:) (const)
+- [VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT:](#VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT:) (const)
+- [VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT:](#VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT:) (const)
+- [VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT:](#VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT:) (const)
+- [VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT:](#VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT:) (const)
+- [VK_BUFFER_USAGE_TRANSFER_SRC_BIT:](#VK_BUFFER_USAGE_TRANSFER_SRC_BIT:) (const)
+- [VK_BUFFER_USAGE_TRANSFER_DST_BIT:](#VK_BUFFER_USAGE_TRANSFER_DST_BIT:) (const)
+- [VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT:](#VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT:) (const)
+- [VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT:](#VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT:) (const)
+- [VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT:](#VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT:) (const)
+- [VK_BUFFER_USAGE_STORAGE_BUFFER_BIT:](#VK_BUFFER_USAGE_STORAGE_BUFFER_BIT:) (const)
+- [VK_BUFFER_USAGE_INDEX_BUFFER_BIT:](#VK_BUFFER_USAGE_INDEX_BUFFER_BIT:) (const)
+- [VK_BUFFER_USAGE_VERTEX_BUFFER_BIT:](#VK_BUFFER_USAGE_VERTEX_BUFFER_BIT:) (const)
+- [VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT:](#VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT:) (const)
+- [VK_SHARING_MODE_EXCLUSIVE:](#VK_SHARING_MODE_EXCLUSIVE:) (const)
+- [VK_SHARING_MODE_CONCURRENT:](#VK_SHARING_MODE_CONCURRENT:) (const)
+- [VK_QUEUE_FAMILY_IGNORED:](#VK_QUEUE_FAMILY_IGNORED:) (const)
+- [VK_WHOLE_SIZE:](#VK_WHOLE_SIZE:) (const)
+- [VK_SHADER_STAGE_VERTEX_BIT:](#VK_SHADER_STAGE_VERTEX_BIT:) (const)
+- [VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT:](#VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT:) (const)
+- [VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT:](#VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT:) (const)
+- [VK_SHADER_STAGE_GEOMETRY_BIT:](#VK_SHADER_STAGE_GEOMETRY_BIT:) (const)
+- [VK_SHADER_STAGE_FRAGMENT_BIT:](#VK_SHADER_STAGE_FRAGMENT_BIT:) (const)
+- [VK_SHADER_STAGE_COMPUTE_BIT:](#VK_SHADER_STAGE_COMPUTE_BIT:) (const)
+- [VK_SHADER_STAGE_ALL_GRAPHICS:](#VK_SHADER_STAGE_ALL_GRAPHICS:) (const)
+- [VK_DESCRIPTOR_TYPE_SAMPLER:](#VK_DESCRIPTOR_TYPE_SAMPLER:) (const)
+- [VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:](#VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:) (const)
+- [VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:](#VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:) (const)
+- [VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:](#VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:) (const)
+- [VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:](#VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:) (const)
+- [VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:](#VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:) (const)
+- [VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:](#VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:) (const)
+- [VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:](#VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:) (const)
+- [VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:](#VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:) (const)
+- [VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:](#VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:) (const)
+- [VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:](#VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:) (const)
+- [VK_PIPELINE_BIND_POINT_GRAPHICS:](#VK_PIPELINE_BIND_POINT_GRAPHICS:) (const)
+- [VK_PIPELINE_BIND_POINT_COMPUTE:](#VK_PIPELINE_BIND_POINT_COMPUTE:) (const)
+- [VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT:](#VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT:) (const)
+- [VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT:](#VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT:) (const)
+- [VK_MEMORY_PROPERTY_HOST_COHERENT_BIT:](#VK_MEMORY_PROPERTY_HOST_COHERENT_BIT:) (const)
+- [VK_QUEUE_GRAPHICS_BIT:](#VK_QUEUE_GRAPHICS_BIT:) (const)
+- [VK_QUEUE_COMPUTE_BIT:](#VK_QUEUE_COMPUTE_BIT:) (const)
+- [VK_QUEUE_TRANSFER_BIT:](#VK_QUEUE_TRANSFER_BIT:) (const)
+- [VK_FORMAT_UNDEFINED:](#VK_FORMAT_UNDEFINED:) (const)
+- [VK_FORMAT_R8_UNORM:](#VK_FORMAT_R8_UNORM:) (const)
+- [VK_FORMAT_R8G8_UNORM:](#VK_FORMAT_R8G8_UNORM:) (const)
+- [VK_FORMAT_R8G8B8A8_UNORM:](#VK_FORMAT_R8G8B8A8_UNORM:) (const)
+- [VK_FORMAT_R8G8B8A8_SRGB:](#VK_FORMAT_R8G8B8A8_SRGB:) (const)
+- [VK_FORMAT_B8G8R8A8_UNORM:](#VK_FORMAT_B8G8R8A8_UNORM:) (const)
+- [VK_FORMAT_B8G8R8A8_SRGB:](#VK_FORMAT_B8G8R8A8_SRGB:) (const)
+- [VK_FORMAT_A2B10G10R10_UNORM_PACK32:](#VK_FORMAT_A2B10G10R10_UNORM_PACK32:) (const)
+- [VK_FORMAT_R16_SFLOAT:](#VK_FORMAT_R16_SFLOAT:) (const)
+- [VK_FORMAT_R16G16_SFLOAT:](#VK_FORMAT_R16G16_SFLOAT:) (const)
+- [VK_FORMAT_R16G16B16A16_SFLOAT:](#VK_FORMAT_R16G16B16A16_SFLOAT:) (const)
+- [VK_FORMAT_R32_UINT:](#VK_FORMAT_R32_UINT:) (const)
+- [VK_FORMAT_R32_SFLOAT:](#VK_FORMAT_R32_SFLOAT:) (const)
+- [VK_FORMAT_R32G32_SFLOAT:](#VK_FORMAT_R32G32_SFLOAT:) (const)
+- [VK_FORMAT_R32G32B32_SFLOAT:](#VK_FORMAT_R32G32B32_SFLOAT:) (const)
+- [VK_FORMAT_R32G32B32A32_SFLOAT:](#VK_FORMAT_R32G32B32A32_SFLOAT:) (const)
+- [VK_FORMAT_B10G11R11_UFLOAT_PACK32:](#VK_FORMAT_B10G11R11_UFLOAT_PACK32:) (const)
+- [VK_FORMAT_D16_UNORM:](#VK_FORMAT_D16_UNORM:) (const)
+- [VK_FORMAT_X8_D24_UNORM_PACK32:](#VK_FORMAT_X8_D24_UNORM_PACK32:) (const)
+- [VK_FORMAT_D32_SFLOAT:](#VK_FORMAT_D32_SFLOAT:) (const)
+- [VK_FORMAT_S8_UINT:](#VK_FORMAT_S8_UINT:) (const)
+- [VK_FORMAT_D16_UNORM_S8_UINT:](#VK_FORMAT_D16_UNORM_S8_UINT:) (const)
+- [VK_FORMAT_D24_UNORM_S8_UINT:](#VK_FORMAT_D24_UNORM_S8_UINT:) (const)
+- [VK_FORMAT_D32_SFLOAT_S8_UINT:](#VK_FORMAT_D32_SFLOAT_S8_UINT:) (const)
+- [VK_FORMAT_BC1_RGB_UNORM_BLOCK:](#VK_FORMAT_BC1_RGB_UNORM_BLOCK:) (const)
+- [VK_FORMAT_BC3_UNORM_BLOCK:](#VK_FORMAT_BC3_UNORM_BLOCK:) (const)
+- [VK_FORMAT_BC4_UNORM_BLOCK:](#VK_FORMAT_BC4_UNORM_BLOCK:) (const)
+- [VK_FORMAT_BC7_UNORM_BLOCK:](#VK_FORMAT_BC7_UNORM_BLOCK:) (const)
+- [VK_FORMAT_BC7_SRGB_BLOCK:](#VK_FORMAT_BC7_SRGB_BLOCK:) (const)
+- [VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK:](#VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK:) (const)
+- [VK_FORMAT_ASTC_4X4_UNORM_BLOCK:](#VK_FORMAT_ASTC_4X4_UNORM_BLOCK:) (const)
+- [VK_FORMAT_ASTC_8X8_UNORM_BLOCK:](#VK_FORMAT_ASTC_8X8_UNORM_BLOCK:) (const)
+- [VK_FORMAT_ASTC_12X12_SRGB_BLOCK:](#VK_FORMAT_ASTC_12X12_SRGB_BLOCK:) (const)
+- [VkFormatInfo](#VkFormatInfo) (struct)
+- [vk_format_info](#vk_format_info) (function)
+- [vk_format_is_depth_stencil](#vk_format_is_depth_stencil) (function)
+- [vk_mip_levels](#vk_mip_levels) (function)
+- [vk_level_size](#vk_level_size) (function)
+- [vk_image_size](#vk_image_size) (function)
+- [VkLayout](#VkLayout) (struct)
+- [vk_layout](#vk_layout) (function)
+- [vk_offset](#vk_offset) (function)
+- [VkBlob](#VkBlob) (struct)
+- [vk_blob_new](#vk_blob_new) (function)
+- [vk_blob_alloc](#vk_blob_alloc) (function)
+- [vk_blob_struct](#vk_blob_struct) (function)
+- [vk_put](#vk_put) (function)
+- [vk_get](#vk_get) (function)
+- [vk_f32_bits](#vk_f32_bits) (function)
+- [vk_set](#vk_set) (function)
+- [vk_set_f32](#vk_set_f32) (function)
+- [vk_set_ptr](#vk_set_ptr) (function)
+- [vk_read](#vk_read) (function)
+- [vk_read_ptr](#vk_read_ptr) (function)
+- [vk_blob_cstr](#vk_blob_cstr) (function)
+- [vk_blob_read_cstr](#vk_blob_read_cstr) (function)
+- [vk_blob_cstr_array](#vk_blob_cstr_array) (function)
+- [vk_blob_to_mem](#vk_blob_to_mem) (function)
+- [vk_out_new](#vk_out_new) (function)
+- [vk_out_read](#vk_out_read) (function)
+- [vk_instance_create_info](#vk_instance_create_info) (function)
+- [vk_device_create_info](#vk_device_create_info) (function)
+- [vk_buffer_create_info](#vk_buffer_create_info) (function)
+- [VkImageDesc](#VkImageDesc) (struct)
+- [vk_image_desc_2d](#vk_image_desc_2d) (function)
+- [vk_validate_image](#vk_validate_image) (function)
+- [vk_image_create_info](#vk_image_create_info) (function)
+- [vk_validate_buffer](#vk_validate_buffer) (function)
+- [VkBarrierMasks](#VkBarrierMasks) (struct)
+- [vk_transition](#vk_transition) (function)
+- [vk_image_barrier](#vk_image_barrier) (function)
+- [VkDslBuilder](#VkDslBuilder) (struct)
+- [vk_dsl_new](#vk_dsl_new) (function)
+- [vk_dsl_add](#vk_dsl_add) (function)
+- [vk_dsl_validate](#vk_dsl_validate) (function)
+- [vk_dsl_create_info](#vk_dsl_create_info) (function)
+- [vk_dsl_pool_sizes](#vk_dsl_pool_sizes) (function)
+
+## vk_make_api_version
+
+```fides
+pub fn vk_make_api_version(variant: i64, major: i64, minor: i64, patch: i64) -> i64 {
+```
+
+**Parameters:**
+
+- `variant`: `i64`
+- `major`: `i64`
+- `minor`: `i64`
+- `patch`: `i64`
+
+**Returns:** `i64`
+
+*Defined at line 118*
+
+---
+
+## VK_API_VERSION_1_0:
+
+```fides
+pub const VK_API_VERSION_1_0: i64 = 4194304;
+```
+
+*Defined at line 122*
+
+---
+
+## VK_API_VERSION_1_1:
+
+```fides
+pub const VK_API_VERSION_1_1: i64 = 4198400;
+```
+
+*Defined at line 123*
+
+---
+
+## VK_API_VERSION_1_2:
+
+```fides
+pub const VK_API_VERSION_1_2: i64 = 4202496;
+```
+
+*Defined at line 124*
+
+---
+
+## VK_API_VERSION_1_3:
+
+```fides
+pub const VK_API_VERSION_1_3: i64 = 4206592;
+```
+
+*Defined at line 125*
+
+---
+
+## vk_version_str
+
+```fides
+pub fn vk_version_str(v: i64) -> str {
+```
+
+**Parameters:**
+
+- `v`: `i64`
+
+**Returns:** `str`
+
+*Defined at line 127*
+
+---
+
+## VK_SUCCESS:
+
+```fides
+pub const VK_SUCCESS: i64 = 0;
+```
+
+*Defined at line 131*
+
+---
+
+## VK_NOT_READY:
+
+```fides
+pub const VK_NOT_READY: i64 = 1;
+```
+
+*Defined at line 132*
+
+---
+
+## VK_TIMEOUT:
+
+```fides
+pub const VK_TIMEOUT: i64 = 2;
+```
+
+*Defined at line 133*
+
+---
+
+## VK_INCOMPLETE:
+
+```fides
+pub const VK_INCOMPLETE: i64 = 5;
+```
+
+*Defined at line 134*
+
+---
+
+## VK_ERROR_OUT_OF_HOST_MEMORY:
+
+```fides
+pub const VK_ERROR_OUT_OF_HOST_MEMORY: i64 = -1;
+```
+
+*Defined at line 135*
+
+---
+
+## VK_ERROR_OUT_OF_DEVICE_MEMORY:
+
+```fides
+pub const VK_ERROR_OUT_OF_DEVICE_MEMORY: i64 = -2;
+```
+
+*Defined at line 136*
+
+---
+
+## VK_ERROR_INITIALIZATION_FAILED:
+
+```fides
+pub const VK_ERROR_INITIALIZATION_FAILED: i64 = -3;
+```
+
+*Defined at line 137*
+
+---
+
+## VK_ERROR_DEVICE_LOST:
+
+```fides
+pub const VK_ERROR_DEVICE_LOST: i64 = -4;
+```
+
+*Defined at line 138*
+
+---
+
+## VK_ERROR_MEMORY_MAP_FAILED:
+
+```fides
+pub const VK_ERROR_MEMORY_MAP_FAILED: i64 = -5;
+```
+
+*Defined at line 139*
+
+---
+
+## VK_ERROR_LAYER_NOT_PRESENT:
+
+```fides
+pub const VK_ERROR_LAYER_NOT_PRESENT: i64 = -6;
+```
+
+*Defined at line 140*
+
+---
+
+## VK_ERROR_EXTENSION_NOT_PRESENT:
+
+```fides
+pub const VK_ERROR_EXTENSION_NOT_PRESENT: i64 = -7;
+```
+
+*Defined at line 141*
+
+---
+
+## VK_ERROR_FEATURE_NOT_PRESENT:
+
+```fides
+pub const VK_ERROR_FEATURE_NOT_PRESENT: i64 = -8;
+```
+
+*Defined at line 142*
+
+---
+
+## VK_ERROR_INCOMPATIBLE_DRIVER:
+
+```fides
+pub const VK_ERROR_INCOMPATIBLE_DRIVER: i64 = -9;
+```
+
+*Defined at line 143*
+
+---
+
+## VK_ERROR_TOO_MANY_OBJECTS:
+
+```fides
+pub const VK_ERROR_TOO_MANY_OBJECTS: i64 = -10;
+```
+
+*Defined at line 144*
+
+---
+
+## VK_ERROR_FORMAT_NOT_SUPPORTED:
+
+```fides
+pub const VK_ERROR_FORMAT_NOT_SUPPORTED: i64 = -11;
+```
+
+*Defined at line 145*
+
+---
+
+## VK_ERROR_OUT_OF_DATE_KHR:
+
+```fides
+pub const VK_ERROR_OUT_OF_DATE_KHR: i64 = -1000001004;
+```
+
+*Defined at line 146*
+
+---
+
+## VK_SUBOPTIMAL_KHR:
+
+```fides
+pub const VK_SUBOPTIMAL_KHR: i64 = 1000001003;
+```
+
+*Defined at line 147*
+
+---
+
+## vk_result_name
+
+```fides
+pub fn vk_result_name(r: i64) -> str {
+```
+
+**Parameters:**
+
+- `r`: `i64`
+
+**Returns:** `str`
+
+*Defined at line 149*
+
+---
+
+## VK_STRUCTURE_TYPE_APPLICATION_INFO:
+
+```fides
+pub const VK_STRUCTURE_TYPE_APPLICATION_INFO: i64 = 0;
+```
+
+*Defined at line 204*
+
+---
+
+## VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO:
+
+```fides
+pub const VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO: i64 = 1;
+```
+
+*Defined at line 205*
+
+---
+
+## VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO:
+
+```fides
+pub const VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO: i64 = 2;
+```
+
+*Defined at line 206*
+
+---
+
+## VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO:
+
+```fides
+pub const VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO: i64 = 3;
+```
+
+*Defined at line 207*
+
+---
+
+## VK_STRUCTURE_TYPE_SUBMIT_INFO:
+
+```fides
+pub const VK_STRUCTURE_TYPE_SUBMIT_INFO: i64 = 4;
+```
+
+*Defined at line 208*
+
+---
+
+## VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO:
+
+```fides
+pub const VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO: i64 = 5;
+```
+
+*Defined at line 209*
+
+---
+
+## VK_STRUCTURE_TYPE_FENCE_CREATE_INFO:
+
+```fides
+pub const VK_STRUCTURE_TYPE_FENCE_CREATE_INFO: i64 = 8;
+```
+
+*Defined at line 210*
+
+---
+
+## VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO:
+
+```fides
+pub const VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO: i64 = 9;
+```
+
+*Defined at line 211*
+
+---
+
+## VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO:
+
+```fides
+pub const VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO: i64 = 12;
+```
+
+*Defined at line 212*
+
+---
+
+## VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO:
+
+```fides
+pub const VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO: i64 = 14;
+```
+
+*Defined at line 213*
+
+---
+
+## VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO:
+
+```fides
+pub const VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO: i64 = 15;
+```
+
+*Defined at line 214*
+
+---
+
+## VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO:
+
+```fides
+pub const VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO: i64 = 16;
+```
+
+*Defined at line 215*
+
+---
+
+## VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO:
+
+```fides
+pub const VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO: i64 = 18;
+```
+
+*Defined at line 216*
+
+---
+
+## VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO:
+
+```fides
+pub const VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO: i64 = 29;
+```
+
+*Defined at line 217*
+
+---
+
+## VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO:
+
+```fides
+pub const VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO: i64 = 30;
+```
+
+*Defined at line 218*
+
+---
+
+## VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO:
+
+```fides
+pub const VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO: i64 = 32;
+```
+
+*Defined at line 219*
+
+---
+
+## VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO:
+
+```fides
+pub const VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO: i64 = 33;
+```
+
+*Defined at line 220*
+
+---
+
+## VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO:
+
+```fides
+pub const VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO: i64 = 34;
+```
+
+*Defined at line 221*
+
+---
+
+## VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET:
+
+```fides
+pub const VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET: i64 = 35;
+```
+
+*Defined at line 222*
+
+---
+
+## VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO:
+
+```fides
+pub const VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO: i64 = 39;
+```
+
+*Defined at line 223*
+
+---
+
+## VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO:
+
+```fides
+pub const VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO: i64 = 40;
+```
+
+*Defined at line 224*
+
+---
+
+## VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO:
+
+```fides
+pub const VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO: i64 = 42;
+```
+
+*Defined at line 225*
+
+---
+
+## VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER:
+
+```fides
+pub const VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER: i64 = 44;
+```
+
+*Defined at line 226*
+
+---
+
+## VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER:
+
+```fides
+pub const VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER: i64 = 45;
+```
+
+*Defined at line 227*
+
+---
+
+## VK_STRUCTURE_TYPE_MEMORY_BARRIER:
+
+```fides
+pub const VK_STRUCTURE_TYPE_MEMORY_BARRIER: i64 = 46;
+```
+
+*Defined at line 228*
+
+---
+
+## VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES:
+
+```fides
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES: i64 = 53;
+```
+
+*Defined at line 229*
+
+---
+
+## VK_STRUCTURE_TYPE_RENDERING_INFO:
+
+```fides
+pub const VK_STRUCTURE_TYPE_RENDERING_INFO: i64 = 1000044000;
+```
+
+*Defined at line 230*
+
+---
+
+## VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO:
+
+```fides
+pub const VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO: i64 = 1000044001;
+```
+
+*Defined at line 231*
+
+---
+
+## VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO:
+
+```fides
+pub const VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO: i64 = 1000044002;
+```
+
+*Defined at line 232*
+
+---
+
+## VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2:
+
+```fides
+pub const VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2: i64 = 1000314002;
+```
+
+*Defined at line 233*
+
+---
+
+## VK_STRUCTURE_TYPE_DEPENDENCY_INFO:
+
+```fides
+pub const VK_STRUCTURE_TYPE_DEPENDENCY_INFO: i64 = 1000314003;
+```
+
+*Defined at line 234*
+
+---
+
+## VK_STRUCTURE_TYPE_SUBMIT_INFO_2:
+
+```fides
+pub const VK_STRUCTURE_TYPE_SUBMIT_INFO_2: i64 = 1000314004;
+```
+
+*Defined at line 235*
+
+---
+
+## VK_IMAGE_LAYOUT_UNDEFINED:
+
+```fides
+pub const VK_IMAGE_LAYOUT_UNDEFINED: i64 = 0;
+```
+
+*Defined at line 239*
+
+---
+
+## VK_IMAGE_LAYOUT_GENERAL:
+
+```fides
+pub const VK_IMAGE_LAYOUT_GENERAL: i64 = 1;
+```
+
+*Defined at line 240*
+
+---
+
+## VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
+
+```fides
+pub const VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL: i64 = 2;
+```
+
+*Defined at line 241*
+
+---
+
+## VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
+
+```fides
+pub const VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL: i64 = 3;
+```
+
+*Defined at line 242*
+
+---
+
+## VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL:
+
+```fides
+pub const VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL: i64 = 4;
+```
+
+*Defined at line 243*
+
+---
+
+## VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
+
+```fides
+pub const VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL: i64 = 5;
+```
+
+*Defined at line 244*
+
+---
+
+## VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
+
+```fides
+pub const VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL: i64 = 6;
+```
+
+*Defined at line 245*
+
+---
+
+## VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
+
+```fides
+pub const VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL: i64 = 7;
+```
+
+*Defined at line 246*
+
+---
+
+## VK_IMAGE_LAYOUT_PREINITIALIZED:
+
+```fides
+pub const VK_IMAGE_LAYOUT_PREINITIALIZED: i64 = 8;
+```
+
+*Defined at line 247*
+
+---
+
+## VK_IMAGE_LAYOUT_PRESENT_SRC_KHR:
+
+```fides
+pub const VK_IMAGE_LAYOUT_PRESENT_SRC_KHR: i64 = 1000001002;
+```
+
+*Defined at line 248*
+
+---
+
+## VK_ACCESS_INDIRECT_COMMAND_READ_BIT:
+
+```fides
+pub const VK_ACCESS_INDIRECT_COMMAND_READ_BIT: i64 = 0x1;
+```
+
+*Defined at line 250*
+
+---
+
+## VK_ACCESS_INDEX_READ_BIT:
+
+```fides
+pub const VK_ACCESS_INDEX_READ_BIT: i64 = 0x2;
+```
+
+*Defined at line 251*
+
+---
+
+## VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT:
+
+```fides
+pub const VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT: i64 = 0x4;
+```
+
+*Defined at line 252*
+
+---
+
+## VK_ACCESS_UNIFORM_READ_BIT:
+
+```fides
+pub const VK_ACCESS_UNIFORM_READ_BIT: i64 = 0x8;
+```
+
+*Defined at line 253*
+
+---
+
+## VK_ACCESS_INPUT_ATTACHMENT_READ_BIT:
+
+```fides
+pub const VK_ACCESS_INPUT_ATTACHMENT_READ_BIT: i64 = 0x10;
+```
+
+*Defined at line 254*
+
+---
+
+## VK_ACCESS_SHADER_READ_BIT:
+
+```fides
+pub const VK_ACCESS_SHADER_READ_BIT: i64 = 0x20;
+```
+
+*Defined at line 255*
+
+---
+
+## VK_ACCESS_SHADER_WRITE_BIT:
+
+```fides
+pub const VK_ACCESS_SHADER_WRITE_BIT: i64 = 0x40;
+```
+
+*Defined at line 256*
+
+---
+
+## VK_ACCESS_COLOR_ATTACHMENT_READ_BIT:
+
+```fides
+pub const VK_ACCESS_COLOR_ATTACHMENT_READ_BIT: i64 = 0x80;
+```
+
+*Defined at line 257*
+
+---
+
+## VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT:
+
+```fides
+pub const VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT: i64 = 0x100;
+```
+
+*Defined at line 258*
+
+---
+
+## VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT:
+
+```fides
+pub const VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT: i64 = 0x200;
+```
+
+*Defined at line 259*
+
+---
+
+## VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT:
+
+```fides
+pub const VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT: i64 = 0x400;
+```
+
+*Defined at line 260*
+
+---
+
+## VK_ACCESS_TRANSFER_READ_BIT:
+
+```fides
+pub const VK_ACCESS_TRANSFER_READ_BIT: i64 = 0x800;
+```
+
+*Defined at line 261*
+
+---
+
+## VK_ACCESS_TRANSFER_WRITE_BIT:
+
+```fides
+pub const VK_ACCESS_TRANSFER_WRITE_BIT: i64 = 0x1000;
+```
+
+*Defined at line 262*
+
+---
+
+## VK_ACCESS_HOST_READ_BIT:
+
+```fides
+pub const VK_ACCESS_HOST_READ_BIT: i64 = 0x2000;
+```
+
+*Defined at line 263*
+
+---
+
+## VK_ACCESS_HOST_WRITE_BIT:
+
+```fides
+pub const VK_ACCESS_HOST_WRITE_BIT: i64 = 0x4000;
+```
+
+*Defined at line 264*
+
+---
+
+## VK_ACCESS_MEMORY_READ_BIT:
+
+```fides
+pub const VK_ACCESS_MEMORY_READ_BIT: i64 = 0x8000;
+```
+
+*Defined at line 265*
+
+---
+
+## VK_ACCESS_MEMORY_WRITE_BIT:
+
+```fides
+pub const VK_ACCESS_MEMORY_WRITE_BIT: i64 = 0x10000;
+```
+
+*Defined at line 266*
+
+---
+
+## VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT:
+
+```fides
+pub const VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT: i64 = 0x1;
+```
+
+*Defined at line 268*
+
+---
+
+## VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT:
+
+```fides
+pub const VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT: i64 = 0x2;
+```
+
+*Defined at line 269*
+
+---
+
+## VK_PIPELINE_STAGE_VERTEX_INPUT_BIT:
+
+```fides
+pub const VK_PIPELINE_STAGE_VERTEX_INPUT_BIT: i64 = 0x4;
+```
+
+*Defined at line 270*
+
+---
+
+## VK_PIPELINE_STAGE_VERTEX_SHADER_BIT:
+
+```fides
+pub const VK_PIPELINE_STAGE_VERTEX_SHADER_BIT: i64 = 0x8;
+```
+
+*Defined at line 271*
+
+---
+
+## VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT:
+
+```fides
+pub const VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT: i64 = 0x80;
+```
+
+*Defined at line 272*
+
+---
+
+## VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT:
+
+```fides
+pub const VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT: i64 = 0x100;
+```
+
+*Defined at line 273*
+
+---
+
+## VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT:
+
+```fides
+pub const VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT: i64 = 0x200;
+```
+
+*Defined at line 274*
+
+---
+
+## VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT:
+
+```fides
+pub const VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT: i64 = 0x400;
+```
+
+*Defined at line 275*
+
+---
+
+## VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT:
+
+```fides
+pub const VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT: i64 = 0x800;
+```
+
+*Defined at line 276*
+
+---
+
+## VK_PIPELINE_STAGE_TRANSFER_BIT:
+
+```fides
+pub const VK_PIPELINE_STAGE_TRANSFER_BIT: i64 = 0x1000;
+```
+
+*Defined at line 277*
+
+---
+
+## VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT:
+
+```fides
+pub const VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT: i64 = 0x2000;
+```
+
+*Defined at line 278*
+
+---
+
+## VK_PIPELINE_STAGE_HOST_BIT:
+
+```fides
+pub const VK_PIPELINE_STAGE_HOST_BIT: i64 = 0x4000;
+```
+
+*Defined at line 279*
+
+---
+
+## VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT:
+
+```fides
+pub const VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT: i64 = 0x8000;
+```
+
+*Defined at line 280*
+
+---
+
+## VK_PIPELINE_STAGE_ALL_COMMANDS_BIT:
+
+```fides
+pub const VK_PIPELINE_STAGE_ALL_COMMANDS_BIT: i64 = 0x10000;
+```
+
+*Defined at line 281*
+
+---
+
+## VK_IMAGE_ASPECT_COLOR_BIT:
+
+```fides
+pub const VK_IMAGE_ASPECT_COLOR_BIT: i64 = 1;
+```
+
+*Defined at line 283*
+
+---
+
+## VK_IMAGE_ASPECT_DEPTH_BIT:
+
+```fides
+pub const VK_IMAGE_ASPECT_DEPTH_BIT: i64 = 2;
+```
+
+*Defined at line 284*
+
+---
+
+## VK_IMAGE_ASPECT_STENCIL_BIT:
+
+```fides
+pub const VK_IMAGE_ASPECT_STENCIL_BIT: i64 = 4;
+```
+
+*Defined at line 285*
+
+---
+
+## VK_IMAGE_TYPE_1D:
+
+```fides
+pub const VK_IMAGE_TYPE_1D: i64 = 0;
+```
+
+*Defined at line 287*
+
+---
+
+## VK_IMAGE_TYPE_2D:
+
+```fides
+pub const VK_IMAGE_TYPE_2D: i64 = 1;
+```
+
+*Defined at line 288*
+
+---
+
+## VK_IMAGE_TYPE_3D:
+
+```fides
+pub const VK_IMAGE_TYPE_3D: i64 = 2;
+```
+
+*Defined at line 289*
+
+---
+
+## VK_IMAGE_TILING_OPTIMAL:
+
+```fides
+pub const VK_IMAGE_TILING_OPTIMAL: i64 = 0;
+```
+
+*Defined at line 290*
+
+---
+
+## VK_IMAGE_TILING_LINEAR:
+
+```fides
+pub const VK_IMAGE_TILING_LINEAR: i64 = 1;
+```
+
+*Defined at line 291*
+
+---
+
+## VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT:
+
+```fides
+pub const VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT: i64 = 0x10;
+```
+
+*Defined at line 292*
+
+---
+
+## VK_IMAGE_USAGE_TRANSFER_SRC_BIT:
+
+```fides
+pub const VK_IMAGE_USAGE_TRANSFER_SRC_BIT: i64 = 0x1;
+```
+
+*Defined at line 294*
+
+---
+
+## VK_IMAGE_USAGE_TRANSFER_DST_BIT:
+
+```fides
+pub const VK_IMAGE_USAGE_TRANSFER_DST_BIT: i64 = 0x2;
+```
+
+*Defined at line 295*
+
+---
+
+## VK_IMAGE_USAGE_SAMPLED_BIT:
+
+```fides
+pub const VK_IMAGE_USAGE_SAMPLED_BIT: i64 = 0x4;
+```
+
+*Defined at line 296*
+
+---
+
+## VK_IMAGE_USAGE_STORAGE_BIT:
+
+```fides
+pub const VK_IMAGE_USAGE_STORAGE_BIT: i64 = 0x8;
+```
+
+*Defined at line 297*
+
+---
+
+## VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT:
+
+```fides
+pub const VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT: i64 = 0x10;
+```
+
+*Defined at line 298*
+
+---
+
+## VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT:
+
+```fides
+pub const VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT: i64 = 0x20;
+```
+
+*Defined at line 299*
+
+---
+
+## VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT:
+
+```fides
+pub const VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT: i64 = 0x40;
+```
+
+*Defined at line 300*
+
+---
+
+## VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT:
+
+```fides
+pub const VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT: i64 = 0x80;
+```
+
+*Defined at line 301*
+
+---
+
+## VK_BUFFER_USAGE_TRANSFER_SRC_BIT:
+
+```fides
+pub const VK_BUFFER_USAGE_TRANSFER_SRC_BIT: i64 = 0x1;
+```
+
+*Defined at line 303*
+
+---
+
+## VK_BUFFER_USAGE_TRANSFER_DST_BIT:
+
+```fides
+pub const VK_BUFFER_USAGE_TRANSFER_DST_BIT: i64 = 0x2;
+```
+
+*Defined at line 304*
+
+---
+
+## VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT:
+
+```fides
+pub const VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT: i64 = 0x4;
+```
+
+*Defined at line 305*
+
+---
+
+## VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT:
+
+```fides
+pub const VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT: i64 = 0x8;
+```
+
+*Defined at line 306*
+
+---
+
+## VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT:
+
+```fides
+pub const VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT: i64 = 0x10;
+```
+
+*Defined at line 307*
+
+---
+
+## VK_BUFFER_USAGE_STORAGE_BUFFER_BIT:
+
+```fides
+pub const VK_BUFFER_USAGE_STORAGE_BUFFER_BIT: i64 = 0x20;
+```
+
+*Defined at line 308*
+
+---
+
+## VK_BUFFER_USAGE_INDEX_BUFFER_BIT:
+
+```fides
+pub const VK_BUFFER_USAGE_INDEX_BUFFER_BIT: i64 = 0x40;
+```
+
+*Defined at line 309*
+
+---
+
+## VK_BUFFER_USAGE_VERTEX_BUFFER_BIT:
+
+```fides
+pub const VK_BUFFER_USAGE_VERTEX_BUFFER_BIT: i64 = 0x80;
+```
+
+*Defined at line 310*
+
+---
+
+## VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT:
+
+```fides
+pub const VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT: i64 = 0x100;
+```
+
+*Defined at line 311*
+
+---
+
+## VK_SHARING_MODE_EXCLUSIVE:
+
+```fides
+pub const VK_SHARING_MODE_EXCLUSIVE: i64 = 0;
+```
+
+*Defined at line 313*
+
+---
+
+## VK_SHARING_MODE_CONCURRENT:
+
+```fides
+pub const VK_SHARING_MODE_CONCURRENT: i64 = 1;
+```
+
+*Defined at line 314*
+
+---
+
+## VK_QUEUE_FAMILY_IGNORED:
+
+```fides
+pub const VK_QUEUE_FAMILY_IGNORED: i64 = 0xFFFFFFFF;
+```
+
+*Defined at line 315*
+
+---
+
+## VK_WHOLE_SIZE:
+
+```fides
+pub const VK_WHOLE_SIZE: i64 = -1;
+```
+
+*Defined at line 316*
+
+---
+
+## VK_SHADER_STAGE_VERTEX_BIT:
+
+```fides
+pub const VK_SHADER_STAGE_VERTEX_BIT: i64 = 0x1;
+```
+
+*Defined at line 318*
+
+---
+
+## VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT:
+
+```fides
+pub const VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT: i64 = 0x2;
+```
+
+*Defined at line 319*
+
+---
+
+## VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT:
+
+```fides
+pub const VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT: i64 = 0x4;
+```
+
+*Defined at line 320*
+
+---
+
+## VK_SHADER_STAGE_GEOMETRY_BIT:
+
+```fides
+pub const VK_SHADER_STAGE_GEOMETRY_BIT: i64 = 0x8;
+```
+
+*Defined at line 321*
+
+---
+
+## VK_SHADER_STAGE_FRAGMENT_BIT:
+
+```fides
+pub const VK_SHADER_STAGE_FRAGMENT_BIT: i64 = 0x10;
+```
+
+*Defined at line 322*
+
+---
+
+## VK_SHADER_STAGE_COMPUTE_BIT:
+
+```fides
+pub const VK_SHADER_STAGE_COMPUTE_BIT: i64 = 0x20;
+```
+
+*Defined at line 323*
+
+---
+
+## VK_SHADER_STAGE_ALL_GRAPHICS:
+
+```fides
+pub const VK_SHADER_STAGE_ALL_GRAPHICS: i64 = 0x1F;
+```
+
+*Defined at line 324*
+
+---
+
+## VK_DESCRIPTOR_TYPE_SAMPLER:
+
+```fides
+pub const VK_DESCRIPTOR_TYPE_SAMPLER: i64 = 0;
+```
+
+*Defined at line 326*
+
+---
+
+## VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+
+```fides
+pub const VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER: i64 = 1;
+```
+
+*Defined at line 327*
+
+---
+
+## VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+
+```fides
+pub const VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE: i64 = 2;
+```
+
+*Defined at line 328*
+
+---
+
+## VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+
+```fides
+pub const VK_DESCRIPTOR_TYPE_STORAGE_IMAGE: i64 = 3;
+```
+
+*Defined at line 329*
+
+---
+
+## VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+
+```fides
+pub const VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER: i64 = 4;
+```
+
+*Defined at line 330*
+
+---
+
+## VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
+
+```fides
+pub const VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER: i64 = 5;
+```
+
+*Defined at line 331*
+
+---
+
+## VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+
+```fides
+pub const VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER: i64 = 6;
+```
+
+*Defined at line 332*
+
+---
+
+## VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+
+```fides
+pub const VK_DESCRIPTOR_TYPE_STORAGE_BUFFER: i64 = 7;
+```
+
+*Defined at line 333*
+
+---
+
+## VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
+
+```fides
+pub const VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC: i64 = 8;
+```
+
+*Defined at line 334*
+
+---
+
+## VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
+
+```fides
+pub const VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC: i64 = 9;
+```
+
+*Defined at line 335*
+
+---
+
+## VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
+
+```fides
+pub const VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT: i64 = 10;
+```
+
+*Defined at line 336*
+
+---
+
+## VK_PIPELINE_BIND_POINT_GRAPHICS:
+
+```fides
+pub const VK_PIPELINE_BIND_POINT_GRAPHICS: i64 = 0;
+```
+
+*Defined at line 338*
+
+---
+
+## VK_PIPELINE_BIND_POINT_COMPUTE:
+
+```fides
+pub const VK_PIPELINE_BIND_POINT_COMPUTE: i64 = 1;
+```
+
+*Defined at line 339*
+
+---
+
+## VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT:
+
+```fides
+pub const VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT: i64 = 0x1;
+```
+
+*Defined at line 340*
+
+---
+
+## VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT:
+
+```fides
+pub const VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT: i64 = 0x2;
+```
+
+*Defined at line 341*
+
+---
+
+## VK_MEMORY_PROPERTY_HOST_COHERENT_BIT:
+
+```fides
+pub const VK_MEMORY_PROPERTY_HOST_COHERENT_BIT: i64 = 0x4;
+```
+
+*Defined at line 342*
+
+---
+
+## VK_QUEUE_GRAPHICS_BIT:
+
+```fides
+pub const VK_QUEUE_GRAPHICS_BIT: i64 = 0x1;
+```
+
+*Defined at line 343*
+
+---
+
+## VK_QUEUE_COMPUTE_BIT:
+
+```fides
+pub const VK_QUEUE_COMPUTE_BIT: i64 = 0x2;
+```
+
+*Defined at line 344*
+
+---
+
+## VK_QUEUE_TRANSFER_BIT:
+
+```fides
+pub const VK_QUEUE_TRANSFER_BIT: i64 = 0x4;
+```
+
+*Defined at line 345*
+
+---
+
+## VK_FORMAT_UNDEFINED:
+
+```fides
+pub const VK_FORMAT_UNDEFINED: i64 = 0;
+```
+
+*Defined at line 348*
+
+---
+
+## VK_FORMAT_R8_UNORM:
+
+```fides
+pub const VK_FORMAT_R8_UNORM: i64 = 9;
+```
+
+*Defined at line 349*
+
+---
+
+## VK_FORMAT_R8G8_UNORM:
+
+```fides
+pub const VK_FORMAT_R8G8_UNORM: i64 = 16;
+```
+
+*Defined at line 350*
+
+---
+
+## VK_FORMAT_R8G8B8A8_UNORM:
+
+```fides
+pub const VK_FORMAT_R8G8B8A8_UNORM: i64 = 37;
+```
+
+*Defined at line 351*
+
+---
+
+## VK_FORMAT_R8G8B8A8_SRGB:
+
+```fides
+pub const VK_FORMAT_R8G8B8A8_SRGB: i64 = 43;
+```
+
+*Defined at line 352*
+
+---
+
+## VK_FORMAT_B8G8R8A8_UNORM:
+
+```fides
+pub const VK_FORMAT_B8G8R8A8_UNORM: i64 = 44;
+```
+
+*Defined at line 353*
+
+---
+
+## VK_FORMAT_B8G8R8A8_SRGB:
+
+```fides
+pub const VK_FORMAT_B8G8R8A8_SRGB: i64 = 50;
+```
+
+*Defined at line 354*
+
+---
+
+## VK_FORMAT_A2B10G10R10_UNORM_PACK32:
+
+```fides
+pub const VK_FORMAT_A2B10G10R10_UNORM_PACK32: i64 = 64;
+```
+
+*Defined at line 355*
+
+---
+
+## VK_FORMAT_R16_SFLOAT:
+
+```fides
+pub const VK_FORMAT_R16_SFLOAT: i64 = 76;
+```
+
+*Defined at line 356*
+
+---
+
+## VK_FORMAT_R16G16_SFLOAT:
+
+```fides
+pub const VK_FORMAT_R16G16_SFLOAT: i64 = 83;
+```
+
+*Defined at line 357*
+
+---
+
+## VK_FORMAT_R16G16B16A16_SFLOAT:
+
+```fides
+pub const VK_FORMAT_R16G16B16A16_SFLOAT: i64 = 97;
+```
+
+*Defined at line 358*
+
+---
+
+## VK_FORMAT_R32_UINT:
+
+```fides
+pub const VK_FORMAT_R32_UINT: i64 = 98;
+```
+
+*Defined at line 359*
+
+---
+
+## VK_FORMAT_R32_SFLOAT:
+
+```fides
+pub const VK_FORMAT_R32_SFLOAT: i64 = 100;
+```
+
+*Defined at line 360*
+
+---
+
+## VK_FORMAT_R32G32_SFLOAT:
+
+```fides
+pub const VK_FORMAT_R32G32_SFLOAT: i64 = 103;
+```
+
+*Defined at line 361*
+
+---
+
+## VK_FORMAT_R32G32B32_SFLOAT:
+
+```fides
+pub const VK_FORMAT_R32G32B32_SFLOAT: i64 = 106;
+```
+
+*Defined at line 362*
+
+---
+
+## VK_FORMAT_R32G32B32A32_SFLOAT:
+
+```fides
+pub const VK_FORMAT_R32G32B32A32_SFLOAT: i64 = 109;
+```
+
+*Defined at line 363*
+
+---
+
+## VK_FORMAT_B10G11R11_UFLOAT_PACK32:
+
+```fides
+pub const VK_FORMAT_B10G11R11_UFLOAT_PACK32: i64 = 122;
+```
+
+*Defined at line 364*
+
+---
+
+## VK_FORMAT_D16_UNORM:
+
+```fides
+pub const VK_FORMAT_D16_UNORM: i64 = 124;
+```
+
+*Defined at line 365*
+
+---
+
+## VK_FORMAT_X8_D24_UNORM_PACK32:
+
+```fides
+pub const VK_FORMAT_X8_D24_UNORM_PACK32: i64 = 125;
+```
+
+*Defined at line 366*
+
+---
+
+## VK_FORMAT_D32_SFLOAT:
+
+```fides
+pub const VK_FORMAT_D32_SFLOAT: i64 = 126;
+```
+
+*Defined at line 367*
+
+---
+
+## VK_FORMAT_S8_UINT:
+
+```fides
+pub const VK_FORMAT_S8_UINT: i64 = 127;
+```
+
+*Defined at line 368*
+
+---
+
+## VK_FORMAT_D16_UNORM_S8_UINT:
+
+```fides
+pub const VK_FORMAT_D16_UNORM_S8_UINT: i64 = 128;
+```
+
+*Defined at line 369*
+
+---
+
+## VK_FORMAT_D24_UNORM_S8_UINT:
+
+```fides
+pub const VK_FORMAT_D24_UNORM_S8_UINT: i64 = 129;
+```
+
+*Defined at line 370*
+
+---
+
+## VK_FORMAT_D32_SFLOAT_S8_UINT:
+
+```fides
+pub const VK_FORMAT_D32_SFLOAT_S8_UINT: i64 = 130;
+```
+
+*Defined at line 371*
+
+---
+
+## VK_FORMAT_BC1_RGB_UNORM_BLOCK:
+
+```fides
+pub const VK_FORMAT_BC1_RGB_UNORM_BLOCK: i64 = 131;
+```
+
+*Defined at line 372*
+
+---
+
+## VK_FORMAT_BC3_UNORM_BLOCK:
+
+```fides
+pub const VK_FORMAT_BC3_UNORM_BLOCK: i64 = 137;
+```
+
+*Defined at line 373*
+
+---
+
+## VK_FORMAT_BC4_UNORM_BLOCK:
+
+```fides
+pub const VK_FORMAT_BC4_UNORM_BLOCK: i64 = 139;
+```
+
+*Defined at line 374*
+
+---
+
+## VK_FORMAT_BC7_UNORM_BLOCK:
+
+```fides
+pub const VK_FORMAT_BC7_UNORM_BLOCK: i64 = 145;
+```
+
+*Defined at line 375*
+
+---
+
+## VK_FORMAT_BC7_SRGB_BLOCK:
+
+```fides
+pub const VK_FORMAT_BC7_SRGB_BLOCK: i64 = 146;
+```
+
+*Defined at line 376*
+
+---
+
+## VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK:
+
+```fides
+pub const VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK: i64 = 147;
+```
+
+*Defined at line 377*
+
+---
+
+## VK_FORMAT_ASTC_4X4_UNORM_BLOCK:
+
+```fides
+pub const VK_FORMAT_ASTC_4X4_UNORM_BLOCK: i64 = 157;
+```
+
+*Defined at line 378*
+
+---
+
+## VK_FORMAT_ASTC_8X8_UNORM_BLOCK:
+
+```fides
+pub const VK_FORMAT_ASTC_8X8_UNORM_BLOCK: i64 = 171;
+```
+
+*Defined at line 379*
+
+---
+
+## VK_FORMAT_ASTC_12X12_SRGB_BLOCK:
+
+```fides
+pub const VK_FORMAT_ASTC_12X12_SRGB_BLOCK: i64 = 184;
+```
+
+*Defined at line 380*
+
+---
+
+## VkFormatInfo
+
+```fides
+pub struct VkFormatInfo {
+```
+
+**Fields:**
+
+| Name | Type |
+|------|------|
+| `block_bytes` | `i64` |
+| `block_w` | `i64` |
+| `block_h` | `i64` |
+| `aspects` | `i64` |
+| `compressed` | `bool` |
+
+*Defined at line 384*
+
+---
+
+## vk_format_info
+
+Texel block size and aspects of a core format (0..184).
+
+```fides
+pub fn vk_format_info(f: i64) -> VkFormatInfo {
+```
+
+**Parameters:**
+
+- `f`: `i64`
+
+**Returns:** `VkFormatInfo`
+
+*Defined at line 401*
+
+---
+
+## vk_format_is_depth_stencil
+
+```fides
+pub fn vk_format_is_depth_stencil(f: i64) -> bool {
+```
+
+**Parameters:**
+
+- `f`: `i64`
+
+**Returns:** `bool`
+
+*Defined at line 542*
+
+---
+
+## vk_mip_levels
+
+Full mip chain length of an extent: floor(log2(max)) + 1.
+
+```fides
+pub fn vk_mip_levels(w: i64, h: i64, d: i64) -> i64 {
+```
+
+**Parameters:**
+
+- `w`: `i64`
+- `h`: `i64`
+- `d`: `i64`
+
+**Returns:** `i64`
+
+*Defined at line 547*
+
+---
+
+## vk_level_size
+
+Bytes of one mip level (tightly packed blocks).
+
+```fides
+pub fn vk_level_size(f: i64, w: i64, h: i64, d: i64) -> i64 {
+```
+
+**Parameters:**
+
+- `f`: `i64`
+- `w`: `i64`
+- `h`: `i64`
+- `d`: `i64`
+
+**Returns:** `i64`
+
+*Defined at line 564*
+
+---
+
+## vk_image_size
+
+Bytes of an image with `mips` levels and `layers` layers.
+
+```fides
+pub fn vk_image_size(f: i64, w: i64, h: i64, d: i64, mips: i64, layers: i64) -> i64 {
+```
+
+**Parameters:**
+
+- `f`: `i64`
+- `w`: `i64`
+- `h`: `i64`
+- `d`: `i64`
+- `mips`: `i64`
+- `layers`: `i64`
+
+**Returns:** `i64`
+
+*Defined at line 572*
+
+---
+
+## VkLayout
+
+```fides
+pub struct VkLayout {
+```
+
+**Fields:**
+
+| Name | Type |
+|------|------|
+| `name` | `str` |
+| `fields` | `Vec<str>` |
+| `offsets` | `Vec<i64>` |
+| `sizes` | `Vec<i64>` |
+| `size` | `i64` |
+| `align` | `i64` |
+
+*Defined at line 596*
+
+---
+
+## vk_layout
+
+Offsets, sizes and alignment of a known struct (empty `fields` when the
+name is unknown).
+
+```fides
+pub fn vk_layout(name: str) -> VkLayout {
+```
+
+**Parameters:**
+
+- `name`: `str`
+
+**Returns:** `VkLayout`
+
+*Defined at line 656*
+
+---
+
+## vk_offset
+
+Offset of a field (-1 when absent).
+
+```fides
+pub fn vk_offset(l: &VkLayout, field: str) -> i64 {
+```
+
+**Parameters:**
+
+- `l`: `&VkLayout`
+- `field`: `str`
+
+**Returns:** `i64`
+
+*Defined at line 690*
+
+---
+
+## VkBlob
+
+```fides
+pub struct VkBlob {
+```
+
+**Fields:**
+
+| Name | Type |
+|------|------|
+| `bytes` | `Vec<i64>` |
+| `reloc_at` | `Vec<i64>` |
+| `reloc_to` | `Vec<i64>` |
+
+*Defined at line 703*
+
+---
+
+## vk_blob_new
+
+```fides
+pub fn vk_blob_new() -> VkBlob {
+```
+
+**Returns:** `VkBlob`
+
+*Defined at line 710*
+
+---
+
+## vk_blob_alloc
+
+Room for `size` zero bytes at `align`; returns its offset.
+
+```fides
+pub fn vk_blob_alloc(b: &mut VkBlob, size: i64, align: i64) -> i64 {
+```
+
+**Parameters:**
+
+- `b`: `&mut VkBlob`
+- `size`: `i64`
+- `align`: `i64`
+
+**Returns:** `i64`
+
+*Defined at line 717*
+
+---
+
+## vk_blob_struct
+
+Room for one struct of a layout.
+
+```fides
+pub fn vk_blob_struct(b: &mut VkBlob, l: &VkLayout) -> i64 {
+```
+
+**Parameters:**
+
+- `b`: `&mut VkBlob`
+- `l`: `&VkLayout`
+
+**Returns:** `i64`
+
+*Defined at line 731*
+
+---
+
+## vk_put
+
+```fides
+pub fn vk_put(b: &mut VkBlob, off: i64, size: i64, v: i64) {
+```
+
+**Parameters:**
+
+- `b`: `&mut VkBlob`
+- `off`: `i64`
+- `size`: `i64`
+- `v`: `i64`
+
+*Defined at line 735*
+
+---
+
+## vk_get
+
+```fides
+pub fn vk_get(b: &VkBlob, off: i64, size: i64) -> i64 {
+```
+
+**Parameters:**
+
+- `b`: `&VkBlob`
+- `off`: `i64`
+- `size`: `i64`
+
+**Returns:** `i64`
+
+*Defined at line 743*
+
+---
+
+## vk_f32_bits
+
+IEEE single-precision bits of x (round to nearest even; normals,
+zeros, infinities; subnormal results flush to zero).
+
+```fides
+pub fn vk_f32_bits(x: f64) -> i64 {
+```
+
+**Parameters:**
+
+- `x`: `f64`
+
+**Returns:** `i64`
+
+*Defined at line 755*
+
+---
+
+## vk_set
+
+Write a field of a struct at `base` by name; size from the layout.
+
+```fides
+pub fn vk_set(b: &mut VkBlob, base: i64, l: &VkLayout, field: str, v: i64) {
+```
+
+**Parameters:**
+
+- `b`: `&mut VkBlob`
+- `base`: `i64`
+- `l`: `&VkLayout`
+- `field`: `str`
+- `v`: `i64`
+
+*Defined at line 786*
+
+---
+
+## vk_set_f32
+
+```fides
+pub fn vk_set_f32(b: &mut VkBlob, base: i64, l: &VkLayout, field: str, x: f64) {
+```
+
+**Parameters:**
+
+- `b`: `&mut VkBlob`
+- `base`: `i64`
+- `l`: `&VkLayout`
+- `field`: `str`
+- `x`: `f64`
+
+*Defined at line 798*
+
+---
+
+## vk_set_ptr
+
+Make a pointer field point at blob offset `target` (-1 leaves NULL).
+
+```fides
+pub fn vk_set_ptr(b: &mut VkBlob, base: i64, l: &VkLayout, field: str, target: i64) {
+```
+
+**Parameters:**
+
+- `b`: `&mut VkBlob`
+- `base`: `i64`
+- `l`: `&VkLayout`
+- `field`: `str`
+- `target`: `i64`
+
+*Defined at line 803*
+
+---
+
+## vk_read
+
+```fides
+pub fn vk_read(b: &VkBlob, base: i64, l: &VkLayout, field: str) -> i64 {
+```
+
+**Parameters:**
+
+- `b`: `&VkBlob`
+- `base`: `i64`
+- `l`: `&VkLayout`
+- `field`: `str`
+
+**Returns:** `i64`
+
+*Defined at line 812*
+
+---
+
+## vk_read_ptr
+
+Where a pointer field points inside the blob (-1: NULL).
+
+```fides
+pub fn vk_read_ptr(b: &VkBlob, base: i64, l: &VkLayout, field: str) -> i64 {
+```
+
+**Parameters:**
+
+- `b`: `&VkBlob`
+- `base`: `i64`
+- `l`: `&VkLayout`
+- `field`: `str`
+
+**Returns:** `i64`
+
+*Defined at line 824*
+
+---
+
+## vk_blob_cstr
+
+A NUL-terminated string in the blob; returns its offset.
+
+```fides
+pub fn vk_blob_cstr(b: &mut VkBlob, s: str) -> i64 {
+```
+
+**Parameters:**
+
+- `b`: `&mut VkBlob`
+- `s`: `str`
+
+**Returns:** `i64`
+
+*Defined at line 837*
+
+---
+
+## vk_blob_read_cstr
+
+The string at a blob offset (up to its NUL).
+
+```fides
+pub fn vk_blob_read_cstr(b: &VkBlob, off: i64) -> str {
+```
+
+**Parameters:**
+
+- `b`: `&VkBlob`
+- `off`: `i64`
+
+**Returns:** `str`
+
+*Defined at line 849*
+
+---
+
+## vk_blob_cstr_array
+
+An array of pointers to strings (ppEnabledExtensionNames); -1 if empty.
+
+```fides
+pub fn vk_blob_cstr_array(b: &mut VkBlob, names: &Vec<str>) -> i64 {
+```
+
+**Parameters:**
+
+- `b`: `&mut VkBlob`
+- `names`: `&Vec<str>`
+
+**Returns:** `i64`
+
+*Defined at line 860*
+
+---
+
+## vk_blob_to_mem
+
+Copy the blob into fresh C memory with every internal pointer set to
+its real address. Returns the base address; free it with p_free.
+
+```fides
+pub fn vk_blob_to_mem(b: &VkBlob) -> i64 {
+```
+
+**Parameters:**
+
+- `b`: `&VkBlob`
+
+**Returns:** `i64`
+
+*Defined at line 877*
+
+---
+
+## vk_out_new
+
+An 8-byte out-parameter slot (zeroed) for a handle a call writes.
+
+```fides
+pub fn vk_out_new() -> i64 {
+```
+
+**Returns:** `i64`
+
+*Defined at line 904*
+
+---
+
+## vk_out_read
+
+The handle a call wrote to an out slot from vk_out_new.
+
+```fides
+pub fn vk_out_read(slot: i64) -> i64 {
+```
+
+**Parameters:**
+
+- `slot`: `i64`
+
+**Returns:** `i64`
+
+*Defined at line 915*
+
+---
+
+## vk_instance_create_info
+
+VkApplicationInfo + VkInstanceCreateInfo (+ layer and extension name
+arrays) in the blob; returns the create info's offset.
+
+```fides
+pub fn vk_instance_create_info(b: &mut VkBlob, app: str, app_version: i64, engine: str, engine_version: i64, api: i64, layers: Vec<str>, exts: Vec<str>) -> i64 {
+```
+
+**Parameters:**
+
+- `b`: `&mut VkBlob`
+- `app`: `str`
+- `app_version`: `i64`
+- `engine`: `str`
+- `engine_version`: `i64`
+- `api`: `i64`
+- `layers`: `Vec<str>`
+- `exts`: `Vec<str>`
+
+**Returns:** `i64`
+
+*Defined at line 927*
+
+---
+
+## vk_device_create_info
+
+VkDeviceCreateInfo with one queue family (priorities as floats).
+
+```fides
+pub fn vk_device_create_info(b: &mut VkBlob, family: i64, priorities: Vec<f64>, exts: Vec<str>) -> i64 {
+```
+
+**Parameters:**
+
+- `b`: `&mut VkBlob`
+- `family`: `i64`
+- `priorities`: `Vec<f64>`
+- `exts`: `Vec<str>`
+
+**Returns:** `i64`
+
+*Defined at line 948*
+
+---
+
+## vk_buffer_create_info
+
+VkBufferCreateInfo (exclusive sharing).
+
+```fides
+pub fn vk_buffer_create_info(b: &mut VkBlob, size: i64, usage: i64) -> i64 {
+```
+
+**Parameters:**
+
+- `b`: `&mut VkBlob`
+- `size`: `i64`
+- `usage`: `i64`
+
+**Returns:** `i64`
+
+*Defined at line 972*
+
+---
+
+## VkImageDesc
+
+The parameters of a VkImageCreateInfo, for validation and writing.
+
+```fides
+pub struct VkImageDesc {
+```
+
+**Fields:**
+
+| Name | Type |
+|------|------|
+| `flags` | `i64` |
+| `image_type` | `i64` |
+| `format` | `i64` |
+| `width` | `i64` |
+| `height` | `i64` |
+| `depth` | `i64` |
+| `mip_levels` | `i64` |
+| `array_layers` | `i64` |
+| `samples` | `i64` |
+| `tiling` | `i64` |
+| `usage` | `i64` |
+
+*Defined at line 983*
+
+---
+
+## vk_image_desc_2d
+
+```fides
+pub fn vk_image_desc_2d(format: i64, w: i64, h: i64, mips: i64, usage: i64) -> VkImageDesc {
+```
+
+**Parameters:**
+
+- `format`: `i64`
+- `w`: `i64`
+- `h`: `i64`
+- `mips`: `i64`
+- `usage`: `i64`
+
+**Returns:** `VkImageDesc`
+
+*Defined at line 997*
+
+---
+
+## vk_validate_image
+
+Valid-usage problems of an image description (empty when fine): extent
+and type (VUID-VkImageCreateInfo-extent-00944..00946, imageType-00956,
+00957), mip levels (mipLevels-00947, 00958), layers (arrayLayers-00948,
+imageType-00961), samples (samples-parameter, samples-02257), usage
+(usage-requiredbitmask), format (format-00943), cube compatibility
+(flags-08865/08866: 2D, square, 6+ layers), depth formats as color.
+
+```fides
+pub fn vk_validate_image(d: &VkImageDesc) -> Vec<str> {
+```
+
+**Parameters:**
+
+- `d`: `&VkImageDesc`
+
+**Returns:** `Vec<str>`
+
+*Defined at line 1009*
+
+---
+
+## vk_image_create_info
+
+VkImageCreateInfo in the blob (exclusive sharing, UNDEFINED layout).
+
+```fides
+pub fn vk_image_create_info(b: &mut VkBlob, d: &VkImageDesc) -> i64 {
+```
+
+**Parameters:**
+
+- `b`: `&mut VkBlob`
+- `d`: `&VkImageDesc`
+
+**Returns:** `i64`
+
+*Defined at line 1059*
+
+---
+
+## vk_validate_buffer
+
+Problems of buffer parameters (VUID-VkBufferCreateInfo-size-00912,
+usage-requiredbitmask, sharingMode-00914).
+
+```fides
+pub fn vk_validate_buffer(size: i64, usage: i64, sharing: i64, families: &Vec<i64>) -> Vec<str> {
+```
+
+**Parameters:**
+
+- `size`: `i64`
+- `usage`: `i64`
+- `sharing`: `i64`
+- `families`: `&Vec<i64>`
+
+**Returns:** `Vec<str>`
+
+*Defined at line 1080*
+
+---
+
+## VkBarrierMasks
+
+```fides
+pub struct VkBarrierMasks {
+```
+
+**Fields:**
+
+| Name | Type |
+|------|------|
+| `src_access` | `i64` |
+| `dst_access` | `i64` |
+| `src_stage` | `i64` |
+| `dst_stage` | `i64` |
+
+*Defined at line 1096*
+
+---
+
+## vk_transition
+
+The masks of a layout transition barrier: the source side makes the old
+layout's writes available (reads need no access bits), the destination
+side covers every access the new layout allows. `shader_stage` is
+where shader reads happen (fragment or compute stage bit).
+
+```fides
+pub fn vk_transition(old_layout: i64, new_layout: i64, shader_stage: i64) -> VkBarrierMasks {
+```
+
+**Parameters:**
+
+- `old_layout`: `i64`
+- `new_layout`: `i64`
+- `shader_stage`: `i64`
+
+**Returns:** `VkBarrierMasks`
+
+*Defined at line 1170*
+
+---
+
+## vk_image_barrier
+
+A VkImageMemoryBarrier for a transition of all mips and layers.
+
+```fides
+pub fn vk_image_barrier(b: &mut VkBlob, image: i64, format: i64, old_layout: i64, new_layout: i64, mips: i64, layers: i64, shader_stage: i64) -> i64 {
+```
+
+**Parameters:**
+
+- `b`: `&mut VkBlob`
+- `image`: `i64`
+- `format`: `i64`
+- `old_layout`: `i64`
+- `new_layout`: `i64`
+- `mips`: `i64`
+- `layers`: `i64`
+- `shader_stage`: `i64`
+
+**Returns:** `i64`
+
+*Defined at line 1178*
+
+---
+
+## VkDslBuilder
+
+```fides
+pub struct VkDslBuilder {
+```
+
+**Fields:**
+
+| Name | Type |
+|------|------|
+| `binding` | `Vec<i64>` |
+| `dtype` | `Vec<i64>` |
+| `count` | `Vec<i64>` |
+| `stages` | `Vec<i64>` |
+
+*Defined at line 1198*
+
+---
+
+## vk_dsl_new
+
+```fides
+pub fn vk_dsl_new() -> VkDslBuilder {
+```
+
+**Returns:** `VkDslBuilder`
+
+*Defined at line 1205*
+
+---
+
+## vk_dsl_add
+
+```fides
+pub fn vk_dsl_add(d: &mut VkDslBuilder, binding: i64, dtype: i64, count: i64, stages: i64) {
+```
+
+**Parameters:**
+
+- `d`: `&mut VkDslBuilder`
+- `binding`: `i64`
+- `dtype`: `i64`
+- `count`: `i64`
+- `stages`: `i64`
+
+*Defined at line 1211*
+
+---
+
+## vk_dsl_validate
+
+Problems with the bindings: duplicate numbers, unknown types, counts,
+stages, input attachments outside the fragment stage, dynamic buffer
+totals (8 uniform / 4 storage), and per-stage totals above the minimum
+limits every device supports (16 samplers, 16 sampled images, 4 storage
+images, 12 uniform buffers, 4 storage buffers, 4 input attachments; a
+combined image sampler counts as a sampler and a sampled image).
+
+```fides
+pub fn vk_dsl_validate(d: &VkDslBuilder) -> Vec<str> {
+```
+
+**Parameters:**
+
+- `d`: `&VkDslBuilder`
+
+**Returns:** `Vec<str>`
+
+*Defined at line 1247*
+
+---
+
+## vk_dsl_create_info
+
+VkDescriptorSetLayoutCreateInfo and its bindings (sorted by binding
+number) in the blob; returns the create info's offset.
+
+```fides
+pub fn vk_dsl_create_info(d: &VkDslBuilder, b: &mut VkBlob) -> i64 {
+```
+
+**Parameters:**
+
+- `d`: `&VkDslBuilder`
+- `b`: `&mut VkBlob`
+
+**Returns:** `i64`
+
+*Defined at line 1331*
+
+---
+
+## vk_dsl_pool_sizes
+
+Descriptor pool sizes for `sets` copies of a layout: (type, count)
+pairs, one per type used.
+
+```fides
+pub fn vk_dsl_pool_sizes(d: &VkDslBuilder, sets: i64) -> Vec<i64> {
+```
+
+**Parameters:**
+
+- `d`: `&VkDslBuilder`
+- `sets`: `i64`
+
+**Returns:** `Vec<i64>`
+
+*Defined at line 1368*
+
+---
+
+*Generated by [scribe](https://fides.dev) -- Fides documentation generator*
