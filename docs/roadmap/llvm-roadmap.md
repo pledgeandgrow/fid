@@ -388,6 +388,27 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       test_shape (both exit 1, `--nat` prints nothing),
       test_lib_audio_mixer (pe_ir exits 0 with its output, `--nat`
       0xC000041D, an unhandled exception). Logs: build/llvm19/suite-on.raw.
+      Nov 27 (night, 23:10 run): the two legs of the chain of the 19:10
+      run, the whole of tests/bootstrap on `--nat` Windows beside the
+      default leg (release/fid-night.exe, the -O2 build of 16:19).
+      FID_NAT_OFF=winfregs: 2,032 of 2,099 pass and 30 files fail that
+      the default leg passes (2,043 of 2,056). In the leg all 30 "do not
+      compile" and are one range of the list, test_bg396 to
+      test_verify_legacy_print_types (17 test_verify_bm_* among them):
+      a window in which another session edited the tree, it seems. Built
+      again on their own at 23:10, with the same switch: 30 of 30 pass.
+      FID_NAT_OFF=splitfloat: 2,055 of 2,122 pass and 30 fail that the
+      default leg passes; on their own 18 pass (test_std_modbus to
+      test_std_objc, one range of the list again) and 12 are another
+      session's uncommitted expected-fail tests (BG296, 332, 333, 373,
+      417), which fail with the default switch too, 0 of 12: they wait
+      for its fixes and are no result of this goal. So once each is
+      built on its own, no file fails with a float switch off that the
+      default `--nat` run passes; the 37 the default leg fails, both
+      legs fail (python build/llvm19/suite-diff.py nat natwin natsplit;
+      logs build/llvm19/suite-nat*.raw, suite-re-*.raw). Left: the
+      default switch (the loop 2.34x and the sieve 3.56x slower on
+      `--nat`). Still partly.
 - [x] MI15. A Linux x86-64 target on MIR for free once x64 is ported: the ELF
       writer of `nat_enc.fd`, the Linux runtime, x64 selection (M).
       Nov 9: Linux x86-64 on the MIR (`fid emit --target x86_64-linux`): its own
