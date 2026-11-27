@@ -4627,7 +4627,6 @@ fn wm_init(g: &mut WasmGen, sel: &NatGen) {
         var nf: str = sel.named_fns.get(i);
         if wg_has_fn(g, nf) && !HashMap_contains(g.named_seen, nf) {
             HashMap_insert(g.named_seen, nf, 1);
-            wg_table_ref(g, nf);
             g.named_fns.push(nf);
         }
         i = i + 1;
@@ -5337,7 +5336,12 @@ fn m_i1_entries(m: MInst) -> i64 {
 
 fn wm_gen_function(g: &mut WasmGen, name: str, module: &IrModule) {
     var ri: i64 = HashMap_get(g.mir_rec_index, name) - 1;
-    if ri < 0 { w(g, 0x00); return; }
+    if ri < 0 {
+        wu(g, 0);
+        w(g, 0x00);
+        wend(g);
+        return;
+    }
     var rec0: NatFnRec = g.mir_recs.get(ri);
     g.cur_name = name;
     g.b = Vec::new();
@@ -5604,6 +5608,14 @@ pub fn wasm_generate(module: IrModule) -> ResultBytes {
     wb_uleb(&mut code, g.b.len());
     wb_append(&mut code, &g.b);
     nbodies = nbodies + 1;
+    // Named thread/task entries join the worklist only after _start: the
+    // first defined function body and function-section entry must both be
+    // _start's.
+    var nfi: i64 = 0;
+    while nfi < g.named_fns.len() {
+        wg_table_ref(&mut g, g.named_fns.get(nfi));
+        nfi = nfi + 1;
+    }
     // Compile what _start reaches, as calls are met
     var qi: i64 = 0;
     while qi < g.queue.len() {

@@ -15,7 +15,9 @@ use string;
 // ─── URL struct ─────────────────────────────────────────────────────────
 
 /// A parsed absolute or relative URL. Missing parts are "" (port is -1
-/// when not present; userinfo holds "user" or "user:pass").
+/// when not present; userinfo holds "user" or "user:pass"). `path` is the
+/// path as written, percent-encoded: a `%2F` in it is data in a segment,
+/// not a separator (RFC 3986 section 3.3). `url_decode` gives it decoded.
 pub struct Url {
     pub scheme: str,
     pub userinfo: str,
@@ -95,6 +97,33 @@ fn url_encode_keep(s: str, keep: str) -> str {
 ///   assert_eq(url_encode_path("/docs/my file.txt"), "/docs/my%20file.txt");
 pub fn url_encode_path(s: str) -> str {
     return url_encode_keep(s, "/:@!$&'()*+,;=");
+}
+
+/// Percent-encode a path that is already percent-encoded, as a parsed URL
+/// holds it: valid `%XX` escapes stay, as do "/" and the characters a path
+/// may hold; every other byte is encoded (a lone "%" too).
+///
+/// Example:
+///   assert_eq(url_path_escape("/a%2Fb/c d"), "/a%2Fb/c%20d");
+///   assert_eq(url_path_escape("/100%"), "/100%25");
+pub fn url_path_escape(s: str) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    var n: i64 = str_len(s);
+    while i < n {
+        var c: i64 = str_byte_at(s, i);
+        if c == 37 && i + 2 < n && url_unhex(str_byte_at(s, i + 1)) >= 0 && url_unhex(str_byte_at(s, i + 2)) >= 0 {
+            out = out + str_slice(s, i, i + 3);
+            i = i + 3;
+        } else if url_is_unreserved(c) || (c < 128 && str_contains("/:@!$&'()*+,;=", str_slice(s, i, i + 1))) {
+            out = out + str_slice(s, i, i + 1);
+            i = i + 1;
+        } else {
+            out = out + "%" + url_hexdig((c >> 4) & 15) + url_hexdig(c & 15);
+            i = i + 1;
+        }
+    }
+    return out;
 }
 
 fn url_enc_userinfo(s: str) -> str {
@@ -281,7 +310,8 @@ pub fn url_parse(s: str) -> Url {
             }
         }
     }
-    u.path = url_decode(rest);
+    // The path stays as written (see Url)
+    u.path = rest;
     if str_len(u.path) == 0 && str_len(u.host) > 0 {
         u.path = "/";
     }
@@ -308,6 +338,23 @@ fn url_valid_scheme(s: str) -> bool {
     return true;
 }
 
+// "//userinfo@host:port", an IPv6 host in brackets
+fn url_authority(u: Url) -> str {
+    var out: str = "//";
+    if str_len(u.userinfo) > 0 {
+        out = out + url_enc_userinfo(u.userinfo) + "@";
+    }
+    if str_contains(u.host, ":") {
+        out = out + "[" + u.host + "]";
+    } else {
+        out = out + u.host;
+    }
+    if u.port >= 0 {
+        out = out + ":" + int_to_str(u.port);
+    }
+    return out;
+}
+
 /// Serialize a Url struct back to a string (components re-encoded).
 ///
 /// Example:
@@ -320,20 +367,9 @@ pub fn url_to_str(u: Url) -> str {
         out = out + u.scheme + ":";
     }
     if str_len(u.host) > 0 {
-        out = out + "//";
-        if str_len(u.userinfo) > 0 {
-            out = out + url_enc_userinfo(u.userinfo) + "@";
-        }
-        if str_contains(u.host, ":") {
-            out = out + "[" + u.host + "]";
-        } else {
-            out = out + u.host;
-        }
-        if u.port >= 0 {
-            out = out + ":" + int_to_str(u.port);
-        }
+        out = out + url_authority(u);
     }
-    out = out + url_encode_path(u.path);
+    out = out + url_path_escape(u.path);
     if str_len(u.query) > 0 {
         out = out + "?" + u.query;
     }
@@ -446,6 +482,27 @@ pub fn url_query_build(keys: Vec<str>, values: Vec<str>) -> str {
 
 // ─── Path helpers ───────────────────────────────────────────────────────
 
+/// The path a network-path reference ("//authority/path") wrote, or ""
+/// when it wrote none.
+fn url_ref_path(reference: str) -> str {
+    var rest: str = reference;
+    var h: i64 = str_find(rest, "#");
+    if h >= 0 {
+        rest = str_slice(rest, 0, h);
+    }
+    var q: i64 = str_find(rest, "?");
+    if q >= 0 {
+        rest = str_slice(rest, 0, q);
+    }
+    if str_starts_with(rest, "//") {
+        var slash: i64 = str_find(str_slice(rest, 2, str_len(rest)), "/");
+        if slash >= 0 {
+            return str_slice(rest, 2 + slash, str_len(rest));
+        }
+    }
+    return "";
+}
+
 /// Resolve `rel` against `base` (RFC 3986 §5.2, no scheme changes).
 /// Handles absolute paths, relative paths, and dot segments.
 ///
@@ -464,26 +521,21 @@ pub fn url_resolve(base: Url, rel: str) -> str {
         out = base.scheme + ":";
     }
     if str_len(r.host) > 0 {
-        // protocol-relative //host/path
-        if str_len(r.userinfo) > 0 {
-            out = out + "//" + url_enc_userinfo(r.userinfo) + "@";
-        } else {
-            out = out + "//";
+        // protocol-relative //authority/path: the authority is the
+        // reference's, and its path only when it wrote one (RFC 3986
+        // section 5.3: "//g" against "http://a/b/c" gives "http://g")
+        out = out + url_authority(r);
+        var rpath: str = url_ref_path(rel);
+        if str_len(rpath) > 0 {
+            out = out + url_path_escape(url_normalize_path(rpath));
         }
-        out = out + r.host;
-        if r.port >= 0 {
-            out = out + ":" + int_to_str(r.port);
-        }
-        out = out + url_encode_path(url_normalize_path(r.path));
     } else {
+        // the base's authority, userinfo and IPv6 brackets included
         if str_len(base.host) > 0 {
-            out = out + "//" + base.host;
-            if base.port >= 0 {
-                out = out + ":" + int_to_str(base.port);
-            }
+            out = out + url_authority(base);
         }
         if str_starts_with(r.path, "/") {
-            out = out + url_encode_path(url_normalize_path(r.path));
+            out = out + url_path_escape(url_normalize_path(r.path));
         } else if str_len(r.path) > 0 {
             // merge: base dir + rel
             var dir: str = base.path;
@@ -493,9 +545,9 @@ pub fn url_resolve(base: Url, rel: str) -> str {
             } else {
                 dir = "";
             }
-            out = out + url_encode_path(url_normalize_path(dir + r.path));
+            out = out + url_path_escape(url_normalize_path(dir + r.path));
         } else {
-            out = out + url_encode_path(base.path);
+            out = out + url_path_escape(base.path);
             if str_len(r.query) == 0 && str_len(base.query) > 0 {
                 out = out + "?" + base.query;
             }

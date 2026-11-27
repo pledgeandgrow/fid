@@ -168,7 +168,9 @@ for tgt in $TARGETS; do
     again=$(sed -n 's/^\[fncache\] built again without: //p' "$img-b.log" | tail -1)
     case ", $again," in
         *", mk,"*) ok "edit $tgt: mk given up (its name is now in a string): $again" ;;
-        *) bad "edit $tgt: mk not given up (built again without: '${again}')" ;;
+        # Nov 27 (SP6 narrow give-up): mk is replayed when the fresh build
+        # keeps its convention too; the image comparison below decides
+        *) echo "     edit $tgt: mk replayed (built again without: '${again}'); B == B-off below decides" ;;
     esac
     run_check "edit $tgt (B on A's cache)" "$img-b" "$B" "$tgt"
     FID_FNCACHE=off build "$img-b-off" "$B" "$tgt" || { bad "edit $tgt: B builds without the cache"; continue; }

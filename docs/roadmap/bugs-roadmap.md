@@ -1386,7 +1386,7 @@ names are the reference.
       Fixed Nov 24 (checks.fd `peir_range_refine`: no edge fact on a local
       stored between the load and the branch); test_range_load_store_cond_fail
       passes on run, C and emit (Nov 25).
-- [~] BG159. **`spawn` with more than 8 arguments silently drops the extras on
+- [x] BG159. **`spawn` with more than 8 arguments silently drops the extras on
       C.** codegen_c.fd `p_thread_spawn`/`p_executor_spawn` store `i <
       num_args && i < 8`, and `__p_thread_run`'s default case calls with 8
       arguments, with no compile error. Trigger: `await spawn
@@ -1398,6 +1398,12 @@ names are the reference.
       the trigger is still accepted by `check`, C panics where run prints 936,
       and emit prints 536874169636 (pe_ir garbles the ninth argument too);
       want a compile error or support.
+      Fixed Nov 27 by rejecting: calls with 9+ arguments already work on every
+      backend; the 8-word limit is the runtimes' task block, so typechecker.fd
+      (TypeChecker_check_task_arity/async_arity/par_branch_arity) refuses a
+      spawn, an async fn or a parallel branch with more than 8, with a Fix line;
+      lower.fd runs a parallel branch reading more than 8 locals in place.
+      test_spawn_eight_args and three *_fail tests pass (Nov 27, fid built from the Nov 27 tree, scratchpad fb4: 21/21 batch tests pass on run, C, emit; 6/6 on --nat).
 - [x] BG160. **C runtime `p_http_parse_request` overflows the heap on a long
       path and reads past the end without a CRLF.** codegen_c.fd
       `p_http_parse_request__raw`: `pos += snprintf(result + pos, cap - pos,
@@ -1462,7 +1468,7 @@ names are the reference.
       Fixed Nov 24 (pe_ir_stubs.fd `PeirGen_gen_to_str_bool`: a headered
       string); test_peir_fstring_bool_heap and test_frontend_fstring pass on
       run, C and emit (Nov 25).
-- [~] BG165. **nat_ir: an f64 value reaching an f32 parameter, return value or
+- [x] BG165. **nat_ir: an f64 value reaching an f32 parameter, return value or
       `Vec<f32>` element becomes 0.** Lowering leaves a float literal
       `ConstFloat ... f64` where the target is f32 (`fn mk() -> f32 { return
       2.5; }`); nat_ir narrows only in `Inst::Store` (`ng_store_f64_to_f32`)
@@ -1480,7 +1486,11 @@ names are the reference.
       FID_IROPT_OFF=inline,inline2,inlineclo every line is right, so the
       inlined call loses the narrowing (pe_ir had the same, fixed Nov 25 by
       peir_callee_params). x86_64-linux not run: no Linux host here.
-- [~] BG166. **nat_ir hands Fides functions to C as callbacks with its own
+      Fixed Nov 27: iropt.fd iro_inline_function and iropt_me.fd ime_inline_site
+      convert an f64 argument/result to the f32 parameter/return when inlining
+      (BitCast F64->F32). test_f32_from_f64_values, test_f32_inline_narrow,
+      test_f32_inline2_narrow pass on run, C, emit and --nat (Nov 27, fid built from the Nov 27 tree, scratchpad fb4: 21/21 batch tests pass on run, C, emit; 6/6 on --nat).
+- [x] BG166. **nat_ir hands Fides functions to C as callbacks with its own
       convention.** A Fides function's address goes to C unchanged with no
       SysV entry adapter, but inside the layer floats travel in integer
       registers and stack arguments have the layer's layout;
@@ -1497,6 +1507,10 @@ names are the reference.
       lp64d, for each program function handed to C). Left:
       tests/nattools/machine_c_callback_check.sh needs a Linux host (or WSL)
       to run the builds; not run on Nov 25 (no Linux distribution here).
+      Checked Nov 27 on Windows: machine_c_callback_check.sh has an
+      x86_64-windows lane (`emit --nat` against cbk.dll, default, nofregs,
+      nocbadapt, peir): 0 failures with the Nov 27 fid; FID_NAT_OFF=cbadapt
+      fails as it should. The Linux lanes are built, not run (no Linux here).
 - [x] BG167. **`fid wasm`: string literals have no string header, so dropping
       or copying one panics.** wasm.fd `wg_str` writes the bytes and a NUL
       into the data segment with no `[P_STR_STATIC][len]` words, and core's
@@ -1674,7 +1688,7 @@ names are the reference.
       Fixed Nov 24 (lower.fd `Expr::Binary` Eq/Neq: field accesses, generic
       enums, tuples and arrays compare by content); test_bg181_eq_parts passes
       on run, C and emit (Nov 25).
-- [~] BG182. **`?.` is typed `i64` unless the receiver is a bare struct.**
+- [x] BG182. **`?.` is typed `i64` unless the receiver is a bare struct.**
       typechecker.fd `Expr::OptionalFieldAccess` looks up only `Type::Named`;
       an `Option<P>` (Generic) falls through to `return Type::I64`, even for a
       field that does not exist. Trigger: `a: Option<P>`, `val f: f64 = a?.f`
@@ -1687,6 +1701,9 @@ names are the reference.
       and emit (Nov 25). Left: an f64 field still reads wrong in the lowering,
       `val f: f64 = a?.f` with f = 2.5 prints 4612811918334230528 on run, 2 on
       C, 4612811918334230500 on emit; a str field (`a?.s`) is right.
+      Fixed Nov 27 (lower.fd OptionalFieldAccess: the struct comes from the
+      receiver's Option payload; f64/f32 fields use their own type).
+      test_bg182_optional_float_field passes (Nov 27, fid built from the Nov 27 tree, scratchpad fb4: 21/21 batch tests pass on run, C, emit; 6/6 on --nat).
 - [~] BG183. **`dyn` of a generic impl fails at run time.** With `impl<T> Show
       for Slot<T>`, `Slot<i64> as dyn Show` then `.show()`: run panics
       "DynCall: no method 'show' on type 'Slot'", the C build exits 127, emit
@@ -1700,6 +1717,11 @@ names are the reference.
       directly (as the test does); the entry's trigger (`Slot<i64> as dyn
       Show` then `.show()`, no direct call) still panics "DynCall: no method
       'show' on type 'Slot'" on run and does not build on C or emit (Nov 25).
+      Nov 27: mono.fd instantiates every method of a generic trait impl cast
+      to dyn (mono_dyn_methods), reach.fd keeps them (rc_dyn_instance); the
+      inline `(q as dyn T).m()` builds (BG184's note). test_bg183_dyn_generic_nocall
+      and test_bg184_dyn_cast_inline pass (Nov 27, fid built from the Nov 27 tree, scratchpad fb4: 21/21 batch tests pass on run, C, emit; 6/6 on --nat). Left: a trait default method a
+      generic impl does not override.
 - [x] BG184. **A trait method returning a struct, called through `dyn`,
       crashes.** lower.fd `DynCall` lowering passes no result pointer for a
       struct return. Trigger: `cap Corner { fn corner(self) -> V2; }`, `(q as
@@ -1712,7 +1734,7 @@ names are the reference.
       d.corner()` with no direct call (Nov 25). The inline form `(q as dyn
       Corner).corner()` does not build for any result type (an i64 one too: C
       "call to undeclared function 'dyn_get'"); not this bug.
-- [~] BG185. **A struct literal built in a generic method stores the address
+- [x] BG185. **A struct literal built in a generic method stores the address
       of the by-value `self`.** In `impl<T> Slot<T> { fn wrap(self) ->
       Slot<Slot<T>> { return Slot { v: self, n: 42 }; } }` the generated C
       stores the parameter's pointer into `v` (`*(int64_t*)v4 = (int64_t)v2;`)
@@ -1726,6 +1748,10 @@ names are the reference.
       instance that owns nothing too); test_bg185_generic_lit_self passes on
       run, C and emit (Nov 25). Left: the entry's trigger, `Slot { v: 7, n: 3
       }.wrap().get()`, still gives `7 7` on run, C and emit (want `7 3`).
+      Fixed Nov 27 (mono.fd mono_gm_ret_type: a call of a user generic impl's
+      method takes the method's substituted return type).
+      test_bg185_chained_generic_call passes (Nov 27, fid built from the Nov 27 tree, scratchpad fb4: 21/21 batch tests pass on run, C, emit; 6/6 on --nat). The whole suite was not
+      rerun after this change (stopped Nov 27).
 - [x] BG186. **`@linear` values are duplicated or lost through expressions and
       discarded results.** typechecker.fd `TypeChecker_consume_linear_in_expr`
       has no arm for enum literals, f-strings, if/match expressions and
@@ -1959,6 +1985,11 @@ names are the reference.
       emit (Nov 25). Left: the counted string `p_json_parse` returns is never
       dropped: `run --leaks` on 1000 x `p_json_dump(p_json_parse(..))` reports
       1000 blocks (36000 bytes) never freed.
+      Nov 27: a p_json_parse/get/at result passed straight to a JSON reader is
+      a statement temporary (lower.fd lw_json_reader); C's p_json_at owns its
+      string. test_bg204_json_parse_drop and test_json_runtime_values: `run
+      --leaks` every block freed. Left: `val j = p_json_parse(..)` in a
+      variable (typed i64) still leaks one string per parse.
 - [ ] BG205. **C runtime `p_socket_poll` uses `select`/`FD_SET` without
       checking the fd against `FD_SETSIZE`.** codegen_c.fd `p_socket_poll`,
       POSIX branch: on Linux an fd of 1024 or more writes past the stack
@@ -2161,6 +2192,9 @@ names are the reference.
       it left, 2 finished, 1 runnable, 0 blocked, and whoever resumes it reads
       that, not `t + 80` after the swap). Left: no test reproduces the race
       (the review's stress run did not either).
+      Nov 27: test_bg227_task_wake_race.fd (emit, 300 x 256 tasks) passes,
+      but it also passes with the bug put back, so it is a stress test, not a
+      reproduction. Left: a test that catches the race.
 - [ ] BG228. **Every owned argument of an async-task call leaks.** lower.fd,
       the call path for names in `self.async_tasks`: the caller gives the task
       an owner of each str, Vec or map argument (`Lowerer_rc_dup` /

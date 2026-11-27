@@ -2449,6 +2449,14 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       Nov 23 audit (fid-nov22.exe): 1761 ms total — front end 730
       (typecheck 271, mono 340), lower 259, iropt 177, native code 503.
       Both targets unmet.
+      Nov 27 gate (stopped part way; gcc -O2 builds of the Nov 25 and Nov 27 trees,
+      scratchpad fb3/fb4 fidg.exe, measured on the same machine):
+      `emit hello --no-cache`: total 891-1071 ms, wall 1057-1228 ms (before
+      997-1086 / 1322-1405); mono 37 -> 10-13 ms (mono.fd skips bodies it
+      cannot change), native code ~240 -> 170-205 ms; build/emit exit right
+      after the image is written (main.fd g_main_fast_exit, FID_NO_FAST_EXIT=1
+      off). Image identical with FID_MONO_FULL=1. Left: 0.5 s; lowering
+      (280-420 ms) and iropt (~200 ms) are most of it.
 - [x] SP4. The checked stdlib cached in binary form, not re-parsed on every build
       (L).
       Competitive CS2: compiler.fd `astcache_*` + ast_ser.fd keep the merged
@@ -2538,6 +2546,14 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       FID_NAT_OFF=ncnarrow: the transitive give-up). Left: MI28 summaries'
       order dependence; line-relative keys (an inserted line recompiles
       the functions below it in that file).
+      Nov 27 gate (stopped part way; gcc -O2 builds of the Nov 25 and Nov 27 trees,
+      scratchpad fb3/fb4 fidg.exe, measured on the same machine):
+      machine_fncache_check edit leg: B reuses 273/273/274 functions of A's
+      cache and compiles 2 on x86_64/aarch64/riscv64 (was 0 reused), and B on
+      A's cache == B without the cache byte for byte (nc_cfg_salt without the
+      path, function-set checks per function, narrow give-up, loop functions on
+      16). The leg's 'mk given up' line was stale (now a note). Left: MI28
+      tail-call summaries are order-dependent; keys use absolute lines.
 - [~] SP7. Incremental relinking in memory: unchanged functions keep their bytes,
       only relocations are redone (M).
       On an FID_FNCACHE hit a function's bytes are replayed at the new
@@ -2560,6 +2576,12 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       for since: `fid serve --relink` or FID_NAT_ON=relink (a kept layout
       is not the one-shot image SP8 wants); relink_check.sh starts its
       server with --relink.
+      Nov 27 gate (stopped part way; gcc -O2 builds of the Nov 25 and Nov 27 trees,
+      scratchpad fb3/fb4 fidg.exe, measured on the same machine):
+      relinking is opt-in (`fid serve --relink`, FID_NAT_ON=relink). A -> B in
+      one process keeps all 276 common functions in place (fresh: 154 move);
+      relink_check still fails on aarch64 and --nat Windows: one changed
+      function is placed after the others (want 0). Images not run (no Linux).
 - [~] SP8. A one-line edit rebuilds in under 100 ms (with SP4–SP7) (L).
       ~0.5 s on hello with every cache warm (CS6, Nov 13).
       Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
@@ -2590,6 +2612,12 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       (FID_SERVE_IRCACHE=0: off; lowering ~300 -> ~150-190 ms). Left:
       typecheck/mono of the merged runtime per request, lowering and the
       mid-end per request (compiler.fd, mono.fd, iropt.fd).
+      Nov 27 gate (stopped part way; gcc -O2 builds of the Nov 25 and Nov 27 trees,
+      scratchpad fb3/fb4 fidg.exe, measured on the same machine):
+      sp8-edit-rebuild-check PASS: an edited rebuild gives the one-shot image
+      (steps 2-5); serve-fncache-check PASS. Times: release 1278/2144 ms,
+      debug 628/672 ms; under 100 ms is not met (typecheck+mono of the merged
+      runtime and lowering are most of it).
 - [~] SP9. Front end in parallel per module where modules do not depend on each
       other (L).
       Competitive CS5: `FID_PAR=N` splits the borrow check's functions over
@@ -2651,6 +2679,12 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       ccompile and emit (1/2/4/8 threads). Post-build gate:
       tests/par/parse_par_check.sh (SELF=1), timing tests/par/parse_par_bench.sh.
       Left: step 3 (type check bodies in parallel), on by default.
+      Nov 27: parsing ahead of the import loop in parallel (parser.fd scratch
+      in Parser, ParseSide, pp_* in compiler.fd), opt-in with FID_PAR>=2;
+      `dump-c compiler/main.fd` with FID_PAR=4 is byte-identical to sequential
+      (Nov 27 fid). Not run before the stop: parse_par_check.sh,
+      imports_par_check.sh, the FID_PP_VERIFY row, parse_par_bench.sh. Left:
+      those checks, then on by default; type check in parallel (step 3).
 - [x] SP10. No linear scans anywhere in the compiler: every lookup by name or id is
       a table (release CS8) (M).
       Competitive CS8: instructions, functions, strings, structs, methods,
@@ -2728,6 +2762,12 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       super-linear: sp12_scaling.sh 400 fails (N=400 -> 800 takes 3.8–4.6x,
       limit 3.5). `check compiler/main.fd --time` takes 35 s; the dump-c
       self-compile was not timed with this build (memory). Left: under 10 s.
+      Nov 27 gate (stopped part way; gcc -O2 builds of the Nov 25 and Nov 27 trees,
+      scratchpad fb3/fb4 fidg.exe, measured on the same machine):
+      `dump-c compiler/main.fd`: 43.5 s (typecheck 4.9, mono 0.2, lower 11.8,
+      C 14.9 s), under 60 s; sp12_scaling.sh 400: ratio 2.97 (< 3.5, was
+      3.8-4.6; lower.fd alloca_type index). Self C identical with
+      FID_MONO_FULL=1 and with FID_PAR=4. Left: under 10 s.
 - [~] SP13. A debug mode with no mid-end and the fast allocator (RA14): 5x faster
       than release mode (S).
       `fid emit --debug`: no iropt, rules or e-graph (main.fd cmd_build);
@@ -2772,6 +2812,10 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       624 ms cold debug here) is identical in both modes, so even a
       zero-cost backend caps at ~2.3x without front-end caching
       (SP12/CB2's domain). Left: the 5x, blocked on that.
+      Nov 27 gate (stopped part way; gcc -O2 builds of the Nov 25 and Nov 27 trees,
+      scratchpad fb3/fb4 fidg.exe, measured on the same machine):
+      `emit --debug hello`: total 898 -> 767 ms, wall 1250 -> 967 ms; still
+      not 5x release (front end the same in both modes).
 - [x] SP14. The e-graph bounded so the release mode stays within 2x of debug (S).
       Bounded: egraph.fd `EG_MAX_NODES` (20,000) and `EG_MAX_ROUNDS` (8).
       Left: the 2x measured (hello: e-graph 140 of 631 ms, CS1).
@@ -2804,6 +2848,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       unresolved labels, crashing binary) still blocks the whole premise;
       a native-fixpoint stage-2 attempt OOM'd under parallel load, no
       clean run recorded.
+      Nov 27: not re-checked (the gate was stopped before it).
 - [x] SP17. Memory of a build under 1 GB for the compiler itself (M).
       Measured Nov 15: `fid check compiler/main.fd` peaks at ~550 MB —
       under 1 GB. (`dump-c` peaks higher through the 76 MB C text but a
