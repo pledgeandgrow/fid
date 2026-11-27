@@ -118,12 +118,12 @@ both fail it (emit was not checked for each).
 | CF29 | `s13_3_vec_for_each`, `_fold`, `_any_all`, `_position`, `_find`, `_map`, `_filter` | the closure methods of `Vec` (§13.3) are missing: "Unknown function 'Vec_fold'" / undeclared in the C | all |
 | CF30 | `s13_3_vec_of_str` | `contains("a")` on a `Vec<str>` is false (compares addresses) | run |
 | CF31 | `s13_3_map_str_keys_print` | `println` of a `Vec<str>` prints addresses | all |
-| CF32 | `s11_annotation_on_param` | a `@public` parameter of a `@constant_time` function is taken for secret: "conditional branch on secret data" (the IR checks keep no `@public`: checks.fd, nat_ir's ng_ct_check) | ccompile, emit |
+| CF32 | `s11_annotation_on_param` | a `@public` parameter of a `@constant_time` function is taken for secret: "conditional branch on secret data" (the IR checks keep no `@public`: checks.fd, nat_ir's ng_ct_check). Fixed Nov 27 (c437509b, 5c5d0644 and the index fix of that evening): the type checker puts the marks down by the parameter's index in the source, checks.fd `ct_source_param` gives the IR checks that index (the lowered IR has the result pointer and the environment in front; the native paths drop the environment) | ccompile, emit |
 | CF33 | `s2_1_main_needs_no_return` | `main` without a `return` exits 1073872504 | emit |
 | CF34 | `s4_10_capture_by_reference` | a closure capturing by reference: exit 1, no output | emit |
 | CF35 | `s4_10_closure_str` | a `str` a closure captures prints as an address | ccompile, emit |
 | CF36 | `s4_11_comptime_if_generic` | `comptime if` in a generic function prints nothing | emit |
-| CF37 | `s8_2_null_deref_panics` | a null dereference does not trap: exit 0 and a value printed | ccompile |
+| CF37 | `s8_2_null_deref_panics` | a null dereference does not trap: exit 0 and a value printed. Fixed Nov 27: the C path compiles with `-fno-delete-null-pointer-checks` (main.fd `cc_flags`), so a load through null faults as on the other backends | ccompile |
 | — | `s1_4_q4_names_variable`, `_q8_`, `s1_4_kw_handle_field_assign`, `s2_7_top_level_val_rejected` (message), `s4_1_call_result_called`, `_closure_called_inline`, `_vec_element_called` | fixed in the tree (stdlib-agent bugs 13, 36, 9, 38) | — |
 
 K1 (a keyword-named function called in an expression) is fixed: its two

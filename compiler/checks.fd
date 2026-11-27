@@ -7402,6 +7402,47 @@ fn peir_ct_line(func: &IrFunction, id: i64) -> str {
 }
 
 
+/// CF32: the index parameter `pi` of the lowered `func` has in its source
+/// function (-1: none: it is the hidden result pointer of a function that
+/// returns a struct or an array, or the environment). Lowering pushes the
+/// result pointer, then the environment (the local "__env", which the
+/// native paths drop from the functions that never read it, iro_env_trim),
+/// then the source's parameters; the type checker puts @public down by the
+/// source's index. Before Nov 27 the checks took the IR's index for it:
+/// right after the trim, one too far on the C path, which checks the IR
+/// as lowered (the marks of `pick(@public flag, a)` were looked up for
+/// `a`).
+pub fn ct_source_param(func: &IrFunction, pi: i64) -> i64 {
+    var skip: i64 = 0;
+    match func.ret_ty {
+        IrType::Struct(_) => {
+            skip = 1;
+        }
+        IrType::Array(_, _) => {
+            skip = 1;
+        }
+        _ => {
+        }
+    }
+    var env_id: i64 = 0 - 1;
+    var i: i64 = 0;
+    while i < func.locals.len() {
+        if func.locals.get(i).name == "__env" {
+            env_id = func.locals.get(i).id;
+        }
+        i = i + 1;
+    }
+    var k: i64 = 0;
+    while k < func.params.len() && env_id >= 0 {
+        if func.params.get(k).id == env_id {
+            skip = skip + 1;
+            k = func.params.len();
+        }
+        k = k + 1;
+    }
+    return pi - skip;
+}
+
 /// The violations of @constant_time function `func` (named `name`), one
 /// message each; empty when it is clean. See the section comment above.
 pub fn peir_ct_check(func: &IrFunction, name: str) -> Vec<str> {
@@ -7415,8 +7456,9 @@ pub fn peir_ct_check(func: &IrFunction, name: str) -> Vec<str> {
     var pi: i64 = 0;
     while pi < func.params.len() {
         var pid: i64 = func.params.get(pi).id;
-        // CF32: a parameter @public marks is not secret (ct_public_param)
-        if pid >= 0 && pid < nvals && !ct_public_param(name, pi) {
+        // CF32: a parameter @public marks is not secret (ct_public_param,
+        // by the index it has in the source)
+        if pid >= 0 && pid < nvals && !ct_public_param(name, ct_source_param(func, pi)) {
             secret.set(pid, 1);
         }
         pi = pi + 1;
