@@ -141,11 +141,11 @@ Every message is explained on the [Compiler Errors](https://fid-lang.org/docs/er
 | **Checks that stay on** | Bounds, integer overflow and double frees panic in every build, not only in debug. |
 | **No macros** | `comptime` runs ordinary Fid code at compile time, with reflection over types. |
 | **No LLVM** | `fid emit` encodes machine code and writes Windows and Linux executables itself: no assembler, no linker, no C compiler. |
-| **Self-hosted** | About 357K lines of Fid compile themselves to a byte-identical fixpoint, checked by the 3-stage release bootstrap. |
+| **Self-hosted** | About 357K lines of Fid compile themselves. The 3-stage release bootstrap checks they rebuild to byte-identical output (last reached Nov 21); a self-compile to C takes 44 s. |
 
 ## Install
 
-**Windows.** Download `Fid-Setup-<version>.exe` (`Fides-Setup-<version>.exe` up to 0.8.0) from the [releases page](https://github.com/pledgeandgrow/fid/releases). It puts `fid.exe` on your PATH with the standard library beside it. The installer is not code-signed yet, so Windows will ask you to confirm.
+**Windows.** Download [`Fid-Setup-0.8.5.exe`](https://github.com/pledgeandgrow/fid/releases/tag/v0.8.5-unstable) (older versions on the [releases page](https://github.com/pledgeandgrow/fid/releases)). It puts `fid.exe`, `ark`, `scribe` and `veil` on your PATH with the standard library beside them. The installer is not code-signed yet, so Windows will ask you to confirm. `fid ccompile` needs a C compiler on PATH (`zig cc`, gcc, clang or tcc); `fid run` and `fid emit` need none.
 
 **Linux and macOS, or from source anywhere.** You need git, Rust and a C compiler (`zig cc` 0.16 is the tested one):
 
@@ -156,11 +156,11 @@ RELEASE=1 CC="zig cc" ./scripts/bootstrap.sh   # builds fid in 3 stages and chec
 ./release/fid run tests/bootstrap/hello.fd
 ```
 
-A cold start from the Rust compiler currently stops at stage 2: a fid built by `fidesc` runs out of memory compiling the whole tree ([known bug](docs/reference/known-bugs.md) 2g.79). Set `STAGE0` to a recent self-hosted `fid` to start from it instead (one of Nov 18 builds today's tree).
+Stage 0 is a pinned self-hosted `fid`: `bootstrap.sh` downloads it from the [`stage0` release](https://github.com/pledgeandgrow/fid/releases/tag/stage0) and checks its hash (`scripts/stage0-fetch.sh`). Binaries are published there for Windows x64, Windows ARM64 and Linux x64. On another host (macOS, Linux ARM64) it falls back to the Rust compiler, and that cold start stops at stage 2: a `fid` built by `fidesc` runs out of memory compiling the whole tree ([known bug](docs/reference/known-bugs.md) 2g.79). There, set `STAGE0` to a self-hosted `fid` built elsewhere.
 
 **Nothing to install.** The [playground](https://fid-lang.org/playground) runs in your browser.
 
-Editor support for VS Code, Neovim, Helix, Emacs, Sublime and Zed (untested) is in [`editors/`](editors/README.md); `fid lsp` speaks the Language Server Protocol.
+Editor support is in [`editors/`](editors/README.md): configurations for VS Code, Neovim, Helix, Emacs and Sublime, and a Zed extension with a Tree-sitter grammar. `fid lsp` speaks the Language Server Protocol (references, rename, signature help, inlay hints, code actions, formatting), checked by `scripts/tl/lsp_*.py`. The CI job that starts Neovim, Emacs and Helix against it has not passed yet.
 
 ## The toolchain
 
@@ -173,6 +173,7 @@ One binary, `fid`, is the compiler, interpreter, test runner, formatter, linter 
 | `fid ccompile file.fd -o out` | Through C; `--target` cross-compiles with `zig cc` |
 | `fid wasm file.fd` | WebAssembly/WAT, no C compiler |
 | `fid check file.fd` | Type, borrow and effect checks only |
+| `fid explain-error E044` | What an error code means, with an example and the fix |
 | `fid fix file.fd` | Apply the compiler's suggested fixes |
 | `fid test file.fd` | Run every `test_*` function, each in its own process |
 | `fid fuzz file.fd` | Run its `fuzz_*` functions on generated inputs |
@@ -180,6 +181,7 @@ One binary, `fid`, is the compiler, interpreter, test runner, formatter, linter 
 | `fid audit file.fd` | List every `unsafe` block the program reaches |
 | `fid qualify file.fd` | Safety evidence as JSON: rules, their tests, annotated functions |
 | `fid explain file.fd` | Which run-time checks were removed or kept, and why |
+| `fid debug file.fd` | Interactive debugger (breakpoints, stepping, variables) |
 | `fid lsp` | Language server over stdio |
 
 Beside it: `ark` (packages: a path, a git repository, or [the pacts index](https://github.com/pledgeandgrow/pacts) — `fid ark add textkit` installs the first published pact), `scribe` (documentation from `///` comments) and `veil` (coverage). The full list is in the [CLI reference](https://fid-lang.org/docs/cli).
@@ -192,11 +194,11 @@ Beside it: `ark` (packages: a path, a git repository, or [the pacts index](https
 | Linux x64         |     🟢      |    🟢     |         🟡          |
 | Linux ARM64       |     🟡 ¹    |    🟡     |         🟡          |
 | Linux RISC-V      |     🟡 ¹    |    🟡     |         🟡          |
-| macOS x64 + ARM64 |     🟢      |    🟢     |         ⚪          |
+| macOS x64 + ARM64 |     🟡      |    🟡     |         ⚪          |
 | WebAssembly       |             |    🟢     |         🟡          |
 | Bare metal x86-64 |             |           |         🟢 ²        |
 
-¹ Under QEMU in CI. ² Multiboot kernels booted and verified under QEMU in CI. macOS runs the suite on real Apple runners (`macos.yml`); its native Mach-O lane (`macos-native.yml`) waits on the bootstrap fix (CB8).
+¹ Under QEMU in CI. ² Multiboot kernels booted and verified under QEMU in CI (`bare-metal.yml`, last green Nov 22). macOS: Mach-O executables build from any host, and CI runs the suite on Apple runners (the `macos-arm64` lane of `tier1.yml`, and `macos-native.yml` for native executables), but neither has passed yet, so nothing has been confirmed on a Mac.
 
 🟢 supported · 🟡 partly tested · ⚪ experimental. Details and test counts: [platforms](docs/reference/platforms.md).
 
@@ -218,8 +220,8 @@ One front end and one IR, three ways out. The native emitter has its own instruc
 The compiler checks itself as hard as it checks your code:
 
 - **Fixpoint.** Stage 2 and stage 3 of the bootstrap must produce byte-identical output on every release build.
-- **Proved rewrites.** The optimizer's 27 integer rewrite rules are proved with z3 at 8, 16, 32 and 64 bits (108 obligations).
-- **Checked encoders.** The instruction encoders are compared with clang's assembler across 1,181 forms.
+- **Proved rewrites.** The optimizer's 27 integer rewrite rules and the e-graph's rewrites are proved with z3 at 8, 16, 32 and 64 bits: 253 obligations, all proved (Nov 27).
+- **Checked encoders.** The instruction encoders are compared with clang's assembler across 1,200 forms, with no mismatch (Nov 25).
 - **Conformance.** 1,617 programs each check one rule of the [language reference](docs/reference/reference.md) (§1–§13).
 
 More in [verification](docs/verification/README.md) and the [contributor walkthrough](docs/reference/compiler-walkthrough.md).
@@ -249,11 +251,13 @@ Signatures for every module: [API reference](https://fid-lang.org/reference).
 
 Fid is young and moving fast.
 
-- **Releases:** v1.0.0 shipped Sep 9, 2026; the newest tagged build is the **[v0.8.5-unstable](https://github.com/pledgeandgrow/fid/releases/tag/v0.8.5-unstable)** prerelease (Nov 27); its `fid.exe` is a one-stage build from a self-hosted `fid`, not a 3-stage fixpoint. The tree is in 1.0 release preparation — `fid version` reports `1.0.0+dev`.
-- **Generated code is slower than Rust's.** Through C, Fid is fastest on one of four benchmarks and up to 1.6 times slower on the others; native output is slower still. [Benchmarks, losses included](docs/benchmarks.md).
+- **Releases:** the newest is the **[v0.8.5-unstable](https://github.com/pledgeandgrow/fid/releases/tag/v0.8.5-unstable)** prerelease (Nov 27). Its `fid.exe` is a one-stage build from a self-hosted `fid` (4 of its 8 C units at -O0), not a 3-stage fixpoint. The first published build, Sep 9, was tagged v1.0.0 and is now listed as 0.7. The stable 1.0 is planned for December; `fid version` reports `1.0.0+dev`.
+- **Generated code is slower than Rust's.** Through C, Fid was fastest on one of four benchmarks and up to 1.6 times slower than the fastest on the others (Nov 15 run, a busy machine); native output is slower still. [Benchmarks, losses included](docs/benchmarks.md).
 - **The package index is just starting.** `ark` installs from a path, a git repository or [the pacts index](https://github.com/pledgeandgrow/pacts) (`fid ark add textkit`, verified on Windows, Linux CI and macOS CI); few pacts are published yet.
 - **The fixpoint was last verified on Nov 21, 2026:** stage 2 and stage 3 were byte-identical on that day's ~361K-line tree. Builds since (Nov 25, Nov 27, v0.8.5-unstable) are one stage from a self-hosted `fid`; the Nov 25 one passes the leak gate (11 of 11).
 - **The full test suite has been rerun only on the interpreter.** Nov 25, with `fid` as the compiler: 1,897 of 1,983 pass on `run` (82 of the failures fail the same with the earlier compiler, 4 are timeouts). The C and native lanes of the whole suite have not been rerun; features are checked with their own tests on each backend.
+- **CI is red.** `ci.yml` and `tier1.yml` have not had a green run since Nov 21, nor `macos-native.yml`; the checks above were run by hand on a Windows machine.
+- **Open bugs.** A whole-repo review on Nov 24 found 114 bugs: 80 are fixed with tests, 3 partly, 31 open ([bugs roadmap](docs/roadmap/bugs-roadmap.md)).
 - **Not for safety-critical use.** `fid qualify` produces evidence for review, not a certification.
 
 The details: [status](docs/reference/status.md) · [known bugs](docs/reference/known-bugs.md) · [roadmap](docs/roadmap/roadmap.md).
