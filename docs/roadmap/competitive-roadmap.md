@@ -3866,9 +3866,10 @@ Every platform gets a tier, and a tier means CI, not a hope.
       (97) are programs whose interpreter reference did not finish in 300
       s under that load; the other skips are FFI and processes, which
       WebAssembly does not have. The 154 worth running again are listed in
-      build/verify-nov27/wasm-rerun-files.txt (35 FAIL, 97 without a
-      reference, the build failures other than those the checker rejects
-      on every backend). Named in the log: failures test_float_rem_exact,
+      build/verify-nov27/wasm-rerun-files.txt: by the run's per-program
+      files, the 146 whose WebAssembly output or exit code differs from
+      their reference and 8 build failures besides the 19 the checker
+      rejects on every backend. Named in the log: failures test_float_rem_exact,
       test_machine_float_mod, test_interp_f32_narrow,
       test_machine_tailcall_narrow, test_deref_minimal, test_alloc_oom_panic,
       test_alloc_thread_heaps, test_bg195_mutex_task_sleep, the FFI
