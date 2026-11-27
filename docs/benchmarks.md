@@ -68,6 +68,30 @@ its results are not kept in the repository.
 
 ## Results
 
+### Nov 27, 2026 — compile time, Nov 25 tree against Nov 27 tree (busy Windows machine)
+
+Both compilers built fully with gcc -O2 for a fair comparison: "before" is
+the Nov 25 tree, "after" the Nov 27 tree (neither is a 3-stage fixpoint
+build). Runs on a **shared, busy machine** (other sessions' builds were
+running), so compare the two columns with each other. Times in
+milliseconds; details in
+[perf/compile-time-2026-11-27.md](perf/compile-time-2026-11-27.md).
+
+| Measurement | Before (Nov 25 tree) | After (Nov 27 tree) |
+|---|---|---|
+| `emit hello --no-cache --time`, run 1 (cold), total / wall | 1445 / 1813 | 1441 / 1591 |
+| same, run 2 | 1086 / 1405 | 891 / 1057 |
+| same, run 3 | 997 / 1322 | 1071 / 1228 |
+| `emit --debug hello`, total / wall | 898 / 1,250 | 767 / 967 |
+| self `dump-c compiler/main.fd`, total | 57 s (Nov 21 compiler) | 43.5 s (44 s wall) |
+
+In hello, mono went from 33-37 to 10-17 ms and native code from 230-329 to
+170-205 ms. Of the 43.5 s self-compile: typecheck 4.9 s, mono 0.2, lowering
+11.8, C generation 14.9. `sp12_scaling.sh 400` (lowering time from N=400 to
+800): ratio 2.97, under its 3.5 limit (3.8-4.6 before). The 57 s is
+the Nov 21 measurement (compiler at -O2 in 8 split units), not a run of the
+Nov 25 build.
+
 ### Nov 17, 2026 — the Benchmarks Game set (BM3, busy Windows machine)
 
 `SUITE=game RUNS=3 ./bench/run.sh` (`bench/game/`): n-body, spectral-norm,
@@ -441,7 +465,9 @@ were about as slow on this run.
 
 These have no rival measured beside them:
 
-- **Self-compile** (`fid dump-c compiler/main.fd`): 57 s on Nov 21 for
+- **Self-compile** (`fid dump-c compiler/main.fd`): 43.5 s on Nov 27 with
+  the Nov 27 tree's compiler built fully with gcc -O2 (busy machine; the Nov
+  27 entry above). 57 s on Nov 21 for
   the 361K-line compiler, built at -O2 in 8 split units (about 6,300 lines
   a second); `fidesc` (Rust) takes ~45 s on the same tree (Nov 20). Earlier,
   on 158,516 lines (67 MB of C): 74 s on Nov 9 at -O2, 229 s at -O0; ~133 s

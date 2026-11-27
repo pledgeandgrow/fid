@@ -14,7 +14,7 @@
 
 <p align="center">
   <a href="https://fid-lang.org/playground"><img alt="Try it in your browser" src="https://img.shields.io/badge/try%20it-in%20your%20browser-C2255C?style=for-the-badge"></a>
-  <a href="https://fid-lang.org/docs/install"><img alt="Install" src="https://img.shields.io/badge/install-v0.8.4--unstable-262626?style=for-the-badge"></a>
+  <a href="https://fid-lang.org/docs/install"><img alt="Install" src="https://img.shields.io/badge/install-v0.8.5--unstable-262626?style=for-the-badge"></a>
   <a href="https://fid-lang.org/docs"><img alt="Documentation" src="https://img.shields.io/badge/read-the%20docs-262626?style=for-the-badge"></a>
 </p>
 
@@ -141,7 +141,7 @@ Every message is explained on the [Compiler Errors](https://fid-lang.org/docs/er
 | **Checks that stay on** | Bounds, integer overflow and double frees panic in every build, not only in debug. |
 | **No macros** | `comptime` runs ordinary Fid code at compile time, with reflection over types. |
 | **No LLVM** | `fid emit` encodes machine code and writes Windows and Linux executables itself: no assembler, no linker, no C compiler. |
-| **Self-hosted** | About 360K lines of Fid compile themselves to a byte-identical fixpoint, checked on every release build. |
+| **Self-hosted** | About 357K lines of Fid compile themselves to a byte-identical fixpoint, checked by the 3-stage release bootstrap. |
 
 ## Install
 
@@ -220,7 +220,7 @@ The compiler checks itself as hard as it checks your code:
 - **Fixpoint.** Stage 2 and stage 3 of the bootstrap must produce byte-identical output on every release build.
 - **Proved rewrites.** The optimizer's 27 integer rewrite rules are proved with z3 at 8, 16, 32 and 64 bits (108 obligations).
 - **Checked encoders.** The instruction encoders are compared with clang's assembler across 1,181 forms.
-- **Conformance.** 1,596 programs each check one rule of the [language reference](docs/reference/reference.md) (§1–§13).
+- **Conformance.** 1,617 programs each check one rule of the [language reference](docs/reference/reference.md) (§1–§13).
 
 More in [verification](docs/verification/README.md) and the [contributor walkthrough](docs/reference/compiler-walkthrough.md).
 
@@ -249,11 +249,11 @@ Signatures for every module: [API reference](https://fid-lang.org/reference).
 
 Fid is young and moving fast.
 
-- **Releases:** v1.0.0 shipped Sep 9, 2026; the newest tagged build is the **[v0.8.4-unstable](https://github.com/pledgeandgrow/fid/releases/tag/v0.8.4-unstable)** prerelease (Nov 23). The tree is in 1.0 release preparation — `fid version` reports `1.0.0+dev`.
+- **Releases:** v1.0.0 shipped Sep 9, 2026; the newest tagged build is the **[v0.8.5-unstable](https://github.com/pledgeandgrow/fid/releases/tag/v0.8.5-unstable)** prerelease (Nov 27); its `fid.exe` is a one-stage build from a self-hosted `fid`, not a 3-stage fixpoint. The tree is in 1.0 release preparation — `fid version` reports `1.0.0+dev`.
 - **Generated code is slower than Rust's.** Through C, Fid is fastest on one of four benchmarks and up to 1.6 times slower on the others; native output is slower still. [Benchmarks, losses included](docs/benchmarks.md).
 - **The package index is just starting.** `ark` installs from a path, a git repository or [the pacts index](https://github.com/pledgeandgrow/pacts) (`fid ark add textkit`, verified on Windows, Linux CI and macOS CI); few pacts are published yet.
-- **The fixpoint was re-verified on Nov 21, 2026:** stage 2 and stage 3 are byte-identical on the current ~361K-line tree, and the result passes run, emit, ccompile and the leak gate.
-- **The full test suite has not been rerun with the current compiler.** Features are checked with their own tests on each backend, and the suite has grown ~3x since the last full run.
+- **The fixpoint was last verified on Nov 21, 2026:** stage 2 and stage 3 were byte-identical on that day's ~361K-line tree. Builds since (Nov 25, Nov 27, v0.8.5-unstable) are one stage from a self-hosted `fid`; the Nov 25 one passes the leak gate (11 of 11).
+- **The full test suite has been rerun only on the interpreter.** Nov 25, with `fid` as the compiler: 1,897 of 1,983 pass on `run` (82 of the failures fail the same with the earlier compiler, 4 are timeouts). The C and native lanes of the whole suite have not been rerun; features are checked with their own tests on each backend.
 - **Not for safety-critical use.** `fid qualify` produces evidence for review, not a certification.
 
 The details: [status](docs/reference/status.md) · [known bugs](docs/reference/known-bugs.md) · [roadmap](docs/roadmap/roadmap.md).
@@ -273,10 +273,10 @@ The details: [status](docs/reference/status.md) · [known bugs](docs/reference/k
 ## Repository layout
 
 ```
-compiler/    the compiler, in Fid: 80 modules, about 360K lines
+compiler/    the compiler, in Fid: 65 modules, about 357K lines
 stdlib/      the standard library: 403 modules
 src/         the earlier compiler in Rust, frozen; it builds stage 1 and runs the test harness
-tests/       bootstrap (1,753 programs), conformance (1,596), selfhost (57),
+tests/       bootstrap (2,077 programs), conformance (1,617), selfhost (47),
              plus projects, verify, nattools, tooling and leak checks
 examples/    twelve complete programs
 tools/       ark, scribe, veil and friends, written in Fid

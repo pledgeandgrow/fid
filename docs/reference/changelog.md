@@ -1,5 +1,124 @@
 # Fides Language Changelog
 
+## v0.8.5-unstable, the Nov 27 batch and compile time (Nov 27, 2026)
+
+v0.8.5-unstable is prepared from be36317 ("0.8.5 unstable"). Its `fid.exe`
+is a one-stage build from a self-hosted stage 0, not a 3-stage fixpoint (the
+last fixpoint is Nov 21). The batch was checked with the Nov 25 and Nov 27
+trees each built fully with gcc -O2 (before / after); the gate stopped before
+the SP9 checks, the leak gate and the whole suite on 3 backends finished.
+
+- **Fixed** (21/21 bug tests on run, ccompile and emit; 4/4, and 2/2 under
+  `FID_VERIFY=1`, on `--nat`): the inliners convert an f64 argument or result
+  to an f32 parameter or return (iropt.fd `iro_inline_function`, iropt_me.fd
+  `ime_inline_site`; BG165). A spawn, an async fn or a parallel branch with
+  more than 8 arguments is a compile error with a Fix line (the runtimes'
+  task block holds 8 words; BG159). `Slot<i64> as dyn Show` with no direct
+  call builds (mono.fd `mono_dyn_methods`; BG183 still partly), and so does an
+  inline `(q as dyn T).m()` (BG184); a chained call of a generic impl's method
+  takes its substituted return type (BG185); `a?.f` reads f64/f32 fields with
+  their own type (BG182). A `p_json_parse`/`get`/`at` result passed straight
+  to a JSON reader is dropped as a statement temporary (BG204, still partly:
+  one in a variable leaks); `test_bg204_json_parse_drop` and
+  `test_json_runtime_values` free every block. `machine_c_callback_check`:
+  0 failures. Stdlib: both UTF-8 decoders reject invalid input (BG215), a
+  decimal with a negative scale prints its value (BG217), a negative amount
+  prints one minus sign (BG238), `hkdf_expand` refuses a length over 255
+  blocks (BG239).
+- **Compile time:** the native function cache's salt no longer names the
+  input path or the whole function set, so an edit reuses 273/273/274
+  functions on x86_64/aarch64/riscv64 and compiles 2 (was 0 reused, 275
+  compiled; SP6). mono skips the bodies it cannot change (mono 33-37 -> 10-17
+  ms on hello; the image is identical with `FID_MONO_FULL=1`). lower.fd keeps
+  an `alloca_type` index (`sp12_scaling.sh 400`: ratio 2.97, under 3.5, was
+  3.8-4.6). `build`/`emit` exit right after the image is written
+  (`g_main_fast_exit`; `FID_NO_FAST_EXIT=1` turns it off). Under
+  `FID_PAR>=2` the import closure is parsed ahead in parallel (opt-in; `dump-c
+  compiler/main.fd` byte-identical with `FID_PAR=4`). Self `dump-c
+  compiler/main.fd`: 43.5 s (57 s on Nov 21); `emit --debug hello` wall 1,250
+  -> 967 ms. Measurements: docs/perf/compile-time-2026-11-27.md.
+- **Not met:** in the gate run 3 `machine_fncache_check` checks failed ("mk
+  not given up", a stale line be36317 turned into a note), `relink_check`
+  failed 4 (SP7), and SP8's 100 ms edit rebuild was not reached (release
+  1278/2144 ms, debug 628/672 ms; `sp8-edit-rebuild-check` and
+  `serve-fncache-check` pass).
+- **Bootstrap and CI:** `.github/workflows/stage0-native.yml` seeds a native
+  stage 0; the linux-arm64 cross-build starts from the pinned self-hosted
+  fid; the fid-windows-arm64 stage 0 asset is pinned
+  (`scripts/fid-windows-arm64.exe.sha256`); `scripts/build-selfhost.sh`
+  survives memory-tight runners. known-bugs records pe_ir's `p_file_read`
+  buffer that `p_str_take` rejects (the "str without a string header"
+  panics; filed as 2g.122, open, with a fix design).
+
+## Stage 0 compatibility and two known-bugs fixes (Nov 26, 2026)
+
+- **Fixed:** a global's constant initializer (`var x: i64 = 0 - 1`) is folded
+  to a literal when the global is registered, so pe_ir bakes the value
+  instead of zeroing it and assigning it at the top of `main` after the boot
+  hooks ran (lower.fd `lw_fold_const_init`; 2g.119, f3d82b06). Extern call
+  arguments are cast to the declared C prototypes in both C backends (the
+  extern parameter types were never registered; 2g.121, 9fe4ac8c).
+  `ime_forward` compresses store-to-load forwarding chains, so a copied load
+  is no longer removed before its source (the known-bugs table row filed as
+  2g.122; FID_VERIFY=1 on pe_ir and `--nat`).
+- **Stage 0 compatibility:** the bootstrap C backend (`src/codegen_c.rs`)
+  emits the process runtime; `stdlib/asset.fd` and `stdlib/pe_runtime/conc.fd`
+  no longer name locals `handle`, and lower.fd declares `OwnSlot` before the
+  struct literals that use it. CI wiring checks cover the veil and coverage
+  ports; docs/verification/kill-switches.md lists nat_ir's new switches
+  `cbadapt`, `ctir` and `deadalloca`.
+- **Records:** re-checks of five partly validated goals (release and main
+  roadmaps) and the Nov 25 validation and tool ports (bd3dfbf5).
+
+## Diagnostics, LSP, PDB locals and tool ports (Nov 25, 2026)
+
+Checked with a fid built from the 905d756b tree in one stage from a
+self-hosted stage 0 (8 split units, unit 3 at -O0, the rest -O2):
+`check compiler/main.fd` no errors (78.8 s); leak gate 11/11.
+
+- **Whole suite with `fid` as the compiler, on `run`:** 1,897 of 1,983 pass;
+  82 of the 86 failures fail the same with the earlier compiler, the other 4
+  are timeouts (300 s limit) with correct output.
+- **Six bugs fixed:** 12/12 bug tests on run, ccompile and emit; 9/9 f32
+  tests on emit with `FID_IROPT_OFF=inline,inline2,inlineclo`; 3/3 on
+  `--nat`.
+- **Diagnostics (TL2, done):** `scripts/diag-coverage.py` finds 467
+  messages, every one with a test, a Fix line and an error code
+  (docs/reference/error-codes.md, `fid explain-error`); 602/602 expected-fail
+  tests print what they expect (2 stale expectations fixed), 365/365
+  conformance `//! error:` files are rejected.
+- **LSP (TL4, done):** `lsp_tl4_features` 29 ok, `lsp_tl4_gaps` 5 ok,
+  `lsp_probe` 17 ok, `lsp-scope` PASS.
+- **Debugging (TL5):** `emit --debug -g` shows 25/25 values through the
+  DWARF (`pe_dbg_run_check`) and 22/22 through the PDB with dbghelp
+  (`pe_pdb_locals_check`, compiler/pdb.fd); `fid-debug-session-check` and
+  `tl5-lines` ok.
+- **Tools in Fid (AD1 done, AD4):** `tools-selfbuild-check` PASS (veil
+  against the Rust veil: only line totals differ). 25 scripts ported to Fid
+  (15 gate/verify tools, 6 fuzz tools, 4 target runners), plus
+  `tools/cov_instrument.fd` and four helper libraries; each port has a
+  `tests/tools/<name>/check.sh`. `tools/` holds 42 `.fd` files (12 on Nov 22).
+- **Bugs roadmap:** 71 of BG128-BG241 marked done after running their tests;
+  BG242-BG246 found, open. New: docs/roadmap/target-roadmap.md (100 goals, all
+  open at be36317),
+  `.github/workflows/cross.yml`; the tree-sitter grammar's generated parser
+  is committed and the Zed extension pins its revision.
+
+## Bug batch and whole-repo review (Nov 24, 2026)
+
+- **Fix batch** (0dcfe61a; built and run on run, C, emit, nat and the
+  tooling checks): the last entries of the Nov 22 review closed (BG85,
+  BG108, BG115, BG116, BG121, BG123, BG126 — fixed-array returns through
+  sret — and the partly-done BG40, BG45, BG46): 127 of 127 entries done.
+- **Review:** a whole-repo review added 114 entries, BG128-BG241 (22
+  critical, 51 high, 29 medium, 12 low); 77 of them have a fix note dated
+  Nov 24 (some partly). Among them: a spawn with more than 8 arguments panics
+  instead of dropping the extras (BG159, rejected at compile time Nov 27) and
+  each instance of a generic impl gets `dyn` forwarders
+  (`Lowerer_dyn_generic_name`; BG183 partly).
+- **New:** docs/roadmap/evolution-roadmap.md (language features from other
+  languages; 25 goals, all open, at be36317).
+
 ## Type checker holes, silent traps and backend gaps (Nov 23, 2026)
 
 Found by a whole-language analysis; each has a conformance test in

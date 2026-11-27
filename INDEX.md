@@ -4,16 +4,16 @@
 > directory, with a one-line description. Use this to find anything fast.
 >
 > **Fides is self-hosted and released (v1.0.0).** The primary compiler is in `compiler/*.fd`
-> (65 modules, ~348K lines). The Rust source in `src/*.rs` (57 files, ~114K lines) is the
+> (65 modules, ~357K lines). The Rust source in `src/*.rs` (57 files, ~114K lines) is the
 > bootstrap reference implementation, frozen: it builds stage 1 and runs the test harness.
 > The self-hosted compiler is the release compiler (`release/fid.exe`,
 > shipped as `fid.exe`) and defines the language:
 > [docs/reference/reference.md](docs/reference/reference.md).
 >
-> **Stats (Nov 24; exact figures in [selfhost.md → Numbers](docs/reference/selfhost.md#numbers)):** 65 self-hosted `.fd` compiler modules (~348K lines) · 57 `.rs` bootstrap files (~114K lines) ·
-> 414 stdlib modules (~313K lines) · 2,037 `.fd` tests in `tests/bootstrap/` (1,962 top level, 597 expected-fail) + 46 in `tests/selfhost/` + 1,617 in `tests/conformance/` + hundreds more in `tests/{projects,verify,nattools,tooling,...}` · 12 examples · 12 tools in `tools/`.
-> Fixpoint: VERIFIED byte-for-byte (stage 2 == stage 3, 67 MB of C, Nov 8; checked by `RELEASE=1 scripts/bootstrap.sh`; not yet re-verified on the Nov 19 tree). Nov 21: the current tree built in one step from a self-hosted stage 0 (the Nov 18 fid); the result passes run, emit, ccompile and the leak gate. A 3-stage bootstrap that starts cold from `fidesc` stops at stage 2 (out of memory, known-bugs 2g.79).
-> v1.0.0 released Sep 9, 2026 with Windows installer (Fides-Setup-1.0.0.exe, 2.5 MB). v0.8.0-unstable prerelease Nov 10, 2026 (Fides-Setup-0.8.0.exe, 6.6 MB). `fid version` base is now `1.0.0` (`1.0.0+dev` on dev builds).
+> **Stats (Nov 27, be36317; exact figures in [selfhost.md → Numbers](docs/reference/selfhost.md#numbers)):** 65 self-hosted `.fd` compiler modules (~357K lines) · 57 `.rs` bootstrap files (~114K lines) ·
+> 414 stdlib modules (~313K lines) · 2,077 `.fd` tests in `tests/bootstrap/` (2,002 top level, 569 with an `// expect-error` line) + 47 in `tests/selfhost/` + 1,617 in `tests/conformance/` + hundreds more in `tests/{projects,verify,nattools,tooling,...}` · 12 examples · 42 `.fd` files in `tools/`.
+> Fixpoint: VERIFIED byte-for-byte (stage 2 == stage 3, checked by `RELEASE=1 scripts/bootstrap.sh`): Nov 8 (67 MB of C) and Nov 21 (123,338,942 bytes, from the pinned self-hosted stage 0). Since then builds are one stage from a self-hosted stage 0 (Nov 25, Nov 27); the Nov 25 fid passes the leak gate (11/11) and 1,897 of 1,983 suite tests on `run`. A 3-stage bootstrap that starts cold from `fidesc` stops at stage 2 (out of memory, known-bugs 2g.79).
+> v1.0.0 released Sep 9, 2026 with Windows installer (Fides-Setup-1.0.0.exe, 2.5 MB). v0.8.0-unstable prerelease Nov 10, 2026 (Fides-Setup-0.8.0.exe, 6.6 MB); v0.8.1- to v0.8.4-unstable Nov 21–23; v0.8.5-unstable being prepared Nov 27 (be36317), its `fid.exe` a one-stage build from a self-hosted stage 0, not a 3-stage fixpoint. `fid version` base is now `1.0.0` (`1.0.0+dev` on dev builds).
 
 ---
 
@@ -156,10 +156,11 @@ and `AGENTS.md` first when working on the compiler.
 
 ## Self-Hosted Compiler (compiler/) — PRIMARY
 
-> **This is the primary compiler.** 65 Fid modules (~348K lines) that compile
+> **This is the primary compiler.** 65 Fid modules (~357K lines) that compile
 > themselves to byte-identical C across generations (bootstrap fixpoint
-> verified, stage 2 == stage 3 — last verified Nov 8, before the ~2.3x
-> Nov 10–19 growth). The release build
+> verified, stage 2 == stage 3 — last verified Nov 21; the Nov 25 and Nov 27
+> builds, v0.8.5-unstable's included, are one stage from a self-hosted
+> stage 0). The release build
 > (`RELEASE=1 scripts/bootstrap.sh` → `release/fid.exe`) is what the
 > installer ships as `fid.exe`.
 > 64 of the 65 modules have a doc in `docs/file-analysis/<module>.md` (role,
@@ -172,70 +173,70 @@ and `AGENTS.md` first when working on the compiler.
 | File | LOC | Description |
 |------|----:|-------------|
 | **Driver** | | |
-| [main.fd](compiler/main.fd) | 9,939 | `fid` entry point: global flags, command dispatch (`run`, `ccompile`, `emit`/`build`, `check`, `fix`, `fmt`, `lint`, `test`, `fuzz`, `bench`, `lsp`, `serve`, `wasm`, `gpu`, `disasm`, `reduce`, `ir-fuzz`, `split-c`, `test-rules`, `debug`, `replay`, …), C compiler invocation, build cache, `--target` handling |
-| [compiler.fd](compiler/compiler.fd) | 16,223 | Pipeline: core and runtime merge, imports, AST passes, checks, lowering; backend entry points |
-| [inc.fd](compiler/inc.fd) | 1,780 | Build stamps, `.fidcache` artifact store, checked-core stamp, in-memory IR cache |
+| [main.fd](compiler/main.fd) | 10,244 | `fid` entry point: global flags, command dispatch (`run`, `ccompile`, `emit`/`build`, `check`, `fix`, `fmt`, `lint`, `test`, `fuzz`, `bench`, `lsp`, `serve`, `wasm`, `gpu`, `disasm`, `reduce`, `ir-fuzz`, `split-c`, `test-rules`, `debug`, `replay`, …), C compiler invocation, build cache, `--target` handling |
+| [compiler.fd](compiler/compiler.fd) | 17,125 | Pipeline: core and runtime merge, imports, AST passes, checks, lowering; backend entry points |
+| [inc.fd](compiler/inc.fd) | 1,807 | Build stamps, `.fidcache` artifact store, checked-core stamp, in-memory IR cache |
 | [csplit.fd](compiler/csplit.fd) | 594 | `fid split-c`: the compiler's C as a header plus n units (the -O2 release build) |
 | [build_info.fd](compiler/build_info.fd) | 61 | **new.** Version stamp: `fid_version_base` "1.0.0", `fid version` prints `1.0.0+dev` on dev builds, release version written by `scripts/build-info.sh` |
 | **Front end** | | |
 | [token.fd](compiler/token.fd) | 687 | Token kinds, raw-discriminant tags |
-| [lexer.fd](compiler/lexer.fd) | 1,865 | Source → tokens (`5e3` still lexes as `5`, `e3`) |
-| [parser.fd](compiler/parser.fd) | 10,847 | Tokens → AST: f-strings, turbofish, spawn/cancel scopes, `@secret` flag |
+| [lexer.fd](compiler/lexer.fd) | 2,007 | Source → tokens (`5e3` still lexes as `5`, `e3`) |
+| [parser.fd](compiler/parser.fd) | 11,774 | Tokens → AST: f-strings, turbofish, spawn/cancel scopes, `@secret` flag |
 | [ast.fd](compiler/ast.fd) | 2,719 | AST types and shared helpers |
 | [ast_ser.fd](compiler/ast_ser.fd) | 2,729 | **new.** Binary AST codec ("FIDA" + hash): the checked stdlib/runtime artifact in `.fidcache` so later compiles skip lexing/parsing (CS2) |
 | [comptime_eval.fd](compiler/comptime_eval.fd) | 6,805 | `comptime gen` and compile-time substitution |
-| [mono.fd](compiler/mono.fd) | 5,626 | Turbofish resolution and monomorphization (renaming misses calls inside closures, f-strings, `\|>`: 2g.8) |
+| [mono.fd](compiler/mono.fd) | 5,838 | Turbofish resolution and monomorphization (renaming misses calls inside closures, f-strings, `\|>`: 2g.8) |
 | **Checks** | | |
-| [typechecker.fd](compiler/typechecker.fd) | 29,015 | Types, effects, capabilities, safety annotations, generics (bounds, inference), `&str`/`@scoped`, `@linear`, `@send`, sandbox |
+| [typechecker.fd](compiler/typechecker.fd) | 29,181 | Types, effects, capabilities, safety annotations, generics (bounds, inference), `&str`/`@scoped`, `@linear`, `@send`, sandbox |
 | [escape.fd](compiler/escape.fd) | 2,678 | Second-class references: none stored, returned from a local or sent to a task |
 | [secrecy.fd](compiler/secrecy.fd) | 1,570 | `@secret`/`@sensitive` information flow (runs only when a program uses them) |
-| [borrowck.fd](compiler/borrowck.fd) | 4,049 | Borrow checker: NLL, field borrows, `for`-loop invalidation (`--borrowck=warn` prints nothing) |
+| [borrowck.fd](compiler/borrowck.fd) | 4,055 | Borrow checker: NLL, field borrows, `for`-loop invalidation (`--borrowck=warn` prints nothing) |
 | [cowcheck.fd](compiler/cowcheck.fd) | 1,355 | `FIDES_COW_CHECK=1` report; use/change walkers the ownership lowering uses |
 | [lockcheck.fd](compiler/lockcheck.fd) | 740 | Lock-order analysis across the call graph (CA4): a held-lock cycle is a compile-time error; only module without a file-analysis page |
 | **IR and lowering** | | |
-| [lower.fd](compiler/lower.fd) | 32,946 | AST → SSA IR; inserts every ownership dup/drop/move (proposal 0004, `LOWER_*` switches) |
-| [reach.fd](compiler/reach.fd) | 518 | Functions `emit` lowers: what main reaches, core and runtime, names in strings (`FID_LOWER_ALL=1` lowers everything) |
-| [ir.fd](compiler/ir.fd) | 6,055 | IR types and instructions, `fn_index`/`str_index`/`inst_at`, verify, reachability, dead-function removal |
-| [checks.fd](compiler/checks.fd) | 7,327 | Drops proven checks: counted loops, integer ranges, `Vec::filled` bounds (C and native) |
+| [lower.fd](compiler/lower.fd) | 33,449 | AST → SSA IR; inserts every ownership dup/drop/move (proposal 0004, `LOWER_*` switches) |
+| [reach.fd](compiler/reach.fd) | 557 | Functions `emit` lowers: what main reaches, core and runtime, names in strings (`FID_LOWER_ALL=1` lowers everything) |
+| [ir.fd](compiler/ir.fd) | 6,063 | IR types and instructions, `fn_index`/`str_index`/`inst_at`, verify, reachability, dead-function removal |
+| [checks.fd](compiler/checks.fd) | 7,585 | Drops proven checks: counted loops, integer ranges, `Vec::filled` bounds (C and native) |
 | [irverify.fd](compiler/irverify.fd) | 175 | `FID_VERIFY=1`: operands defined, defined before use, dominance, jump targets |
-| [ir_ser.fd](compiler/ir_ser.fd) | 4,803 | **new.** Binary codec for `IrFunction`: the per-function lowered-IR cache (CS4); names re-intern against the live module tables |
+| [ir_ser.fd](compiler/ir_ser.fd) | 4,818 | **new.** Binary codec for `IrFunction`: the per-function lowered-IR cache (CS4); names re-intern against the live module tables |
 | **Mid-end** | | |
-| [iropt.fd](compiler/iropt.fd) | 11,510 | IR optimizer and pass manager: inline, gconst, fold, branchfacts, sccp, promote, devirt, dce, tailcall, gvn, licm (`FID_IROPT_OFF`/`ON`) |
-| [iropt_me.fd](compiler/iropt_me.fd) | 6,670 | Restructuring passes and the alias query; on by default since Nov 16–17 (`IME_DEFAULT_ON`: loops, sra, loadhoist, forward, matchfacts, inline2, unroll, version, ssa, ...), switch, ivsr, rotate and ipcp opt-in (`FID_IROPT_ON`) |
-| [ssa.fd](compiler/ssa.fd) | 1,960 | **new.** SSA form inside the mid-end: mem2reg with merges, dead phis/stores, exit values of counted loops (ME3/ME15/ME23) |
+| [iropt.fd](compiler/iropt.fd) | 11,586 | IR optimizer and pass manager: inline, gconst, fold, branchfacts, sccp, promote, devirt, dce, tailcall, gvn, licm (`FID_IROPT_OFF`/`ON`) |
+| [iropt_me.fd](compiler/iropt_me.fd) | 6,707 | Restructuring passes and the alias query; on by default since Nov 16–17 (`IME_DEFAULT_ON`: loops, sra, loadhoist, forward, matchfacts, inline2, unroll, version, ssa, ...), switch, ivsr, rotate and ipcp opt-in (`FID_IROPT_ON`) |
+| [ssa.fd](compiler/ssa.fd) | 2,023 | **new.** SSA form inside the mid-end: mem2reg with merges, dead phis/stores, exit values of counted loops (ME3/ME15/ME23) |
 | [rules.fd](compiler/rules.fd) | 1,157 | Rewrite rules as data (z3-proved), pure-call merging, `fid test-rules [--smt]` |
 | [egraph.fd](compiler/egraph.fd) | 4,119 | E-graph rewriting and store-to-load forwarding of locals (nat_ir path) |
-| [tv.fd](compiler/tv.fd) | 6,483 | **new.** Translation validation of the mid-end (RL5/VF6): with `--validate`/`FID_VALIDATE=1` the pass manager checks each transform preserves semantics; `.tvp` test pairs in tests/verify/tv/ |
+| [tv.fd](compiler/tv.fd) | 6,486 | **new.** Translation validation of the mid-end (RL5/VF6): with `--validate`/`FID_VALIDATE=1` the pass manager checks each transform preserves semantics; `.tvp` test pairs in tests/verify/tv/ |
 | **Back ends in use** | | |
-| [interp.fd](compiler/interp.fd) | 14,992 | IR interpreter (`fid run`) over a simulated byte memory, ~270 builtins |
-| [codegen_c.fd](compiler/codegen_c.fd) | 19,002 | IR → C99 plus the embedded C runtime (`ccompile`, `dump-c`, `run --leaks`/`--checked-alloc`/`--mem`) |
-| [pe_ir.fd](compiler/pe_ir.fd) | 9,178 | Default Windows backend: IR → x86-64 → PE32+ (`emit`/`build`); also `--bare`, `--boot`, `--uefi` and `--elf` |
+| [interp.fd](compiler/interp.fd) | 15,094 | IR interpreter (`fid run`) over a simulated byte memory, ~270 builtins |
+| [codegen_c.fd](compiler/codegen_c.fd) | 19,031 | IR → C99 plus the embedded C runtime (`ccompile`, `dump-c`, `run --leaks`/`--checked-alloc`/`--mem`) |
+| [pe_ir.fd](compiler/pe_ir.fd) | 9,351 | Default Windows backend: IR → x86-64 → PE32+ (`emit`/`build`); also `--bare`, `--boot`, `--uefi` and `--elf` |
 | [pe_ir_enc.fd](compiler/pe_ir_enc.fd) | 3,418 | x86-64 encoder, imports, `.rdata`, PE writer for pe_ir |
-| [pe_ir_stubs.fd](compiler/pe_ir_stubs.fd) | 10,760 | pe_ir's runtime hookup: stub generators, `pe_runtime_alias`, allocator, bare runtime, `asm!` encoder |
-| [nat_ir.fd](compiler/nat_ir.fd) | 42,918 | Machine layer: MIR selection, linear-scan + greedy allocators, IPRA, live-range splitting, checker; AArch64/RISC-V/x86-64 Linux ELF, macOS Mach-O and `--nat` PE |
-| [nat_enc.fd](compiler/nat_enc.fd) | 13,334 | Machine-layer encoders (A64, RV64, x64, Thumb-2), ELF with `.debug_line`, PE32+, Mach-O (`nat_macho`) |
+| [pe_ir_stubs.fd](compiler/pe_ir_stubs.fd) | 10,887 | pe_ir's runtime hookup: stub generators, `pe_runtime_alias`, allocator, bare runtime, `asm!` encoder |
+| [nat_ir.fd](compiler/nat_ir.fd) | 43,486 | Machine layer: MIR selection, linear-scan + greedy allocators, IPRA, live-range splitting, checker; AArch64/RISC-V/x86-64 Linux ELF, macOS Mach-O and `--nat` PE |
+| [nat_enc.fd](compiler/nat_enc.fd) | 13,392 | Machine-layer encoders (A64, RV64, x64, Thumb-2), ELF with `.debug_line`, PE32+, Mach-O (`nat_macho`) |
 | [nat_thumb.fd](compiler/nat_thumb.fd) | 3,207 | **new.** Cortex-M (ARMv7-M, Thumb-2) code generator over nat_enc's `t2_*`/`t_*` encoders (PL5) |
 | [mir.fd](compiler/mir.fd) | 1,624 | **new.** The machine IR (MIR) nat_ir selects into (Cranelift VCode shape; MI1) |
 | [image_writer.fd](compiler/image_writer.fd) | 981 | **new.** The one writer of executable/object files (TG13): sections, relocations, symbol tables for ELF, PE/COFF and Mach-O |
 | [disasm.fd](compiler/disasm.fd) | 2,656 | **new.** `fid disasm`: disassembler for the machine layer's output on x86-64, AArch64, RV64; reads .fd through emit and exe files directly (TG5) |
-| [pdb.fd](compiler/pdb.fd) | 1,441 | **new.** PDB (MSF 7.00) program databases for Windows images (DB3/N9): `fid emit -g` writes `<out>.pdb` on pe_ir and `--nat` |
+| [pdb.fd](compiler/pdb.fd) | 2,590 | **new.** PDB (MSF 7.00) program databases for Windows images (DB3/N9): `fid emit -g` writes `<out>.pdb` on pe_ir and `--nat` |
 | [pgo.fd](compiler/pgo.fd) | 458 | **new.** Profile-guided optimization (OP30): `fid run --profile out.prof` counts calls; `emit --profile-use` consumes it |
 | [linker.fd](compiler/linker.fd) | 1,083 | Static ELF linker, used by the native `--elf` path (image_writer, nat_enc, pe_ir_enc) |
 | [green_thread.fd](compiler/green_thread.fd) | 201 | Green-thread bookkeeping for the interpreter's `p_gt_*` |
 | [tensor.fd](compiler/tensor.fd) | 834 | Tensor / KV-cache library used by the interpreter |
-| [wasm.fd](compiler/wasm.fd) | 4,538 | IR → WebAssembly (`fid wasm`, `--wat`): valid WASI preview-1 modules, no C compiler; tasks switch stacks; 316/344 suite tests match (Nov 15–18) |
+| [wasm.fd](compiler/wasm.fd) | 5,858 | IR → WebAssembly (`fid wasm`, `--wat`): valid WASI preview-1 modules, no C compiler; tasks switch stacks; 316/344 suite tests match (Nov 15–18) |
 | [gpu.fd](compiler/gpu.fd) | 1,391 | SPIR-V / PTX output (`fid gpu --target spirv\|ptx`) |
 | [elf64.fd](compiler/elf64.fd) | 3,629 | AT&T assembler + ELF `.o` writer (`--elf` path and object output) |
 | [x86.fd](compiler/x86.fd) | 1,892 | IR → stack-machine x86-64 (`build-x86`; MakeDyn/DynCall/TryUnwrap/asm emit a zero return — legacy path) |
 | **Tools** | | |
 | [fmt.fd](compiler/fmt.fd) | 2,416 | `fid fmt` |
-| [lsp.fd](compiler/lsp.fd) | 4,635 | `fid lsp`: JSON-RPC over stdio, diagnostics, completion, hover |
+| [lsp.fd](compiler/lsp.fd) | 4,968 | `fid lsp`: JSON-RPC over stdio, diagnostics, completion, hover |
 | [json.fd](compiler/json.fd) | 736 | JSON parse/dump (lsp, interpreter, `qualify`) |
 | [cparser.fd](compiler/cparser.fd) | 4,397 | `fid parse-header`: C header → FFI bindings (`--link <lib>`) |
-| [scribe.fd](compiler/scribe.fd) | 2,056 | `fid doc`/`fid scribe`: documentation generator |
-| [veil.fd](compiler/veil.fd) | 782 | `fid veil`: coverage |
+| [scribe.fd](compiler/scribe.fd) | 2,190 | `fid doc`/`fid scribe`: documentation generator |
+| [veil.fd](compiler/veil.fd) | 837 | `fid veil`: coverage |
 | [ark.fd](compiler/ark.fd) | 7,178 | `fid ark`: package manager (init, add, install, lock, workspaces) |
-| [debugger.fd](compiler/debugger.fd) | 987 | `fid debug`: interactive IR debugger — breakpoints, stepping, `print` (wired via main's `cmd_debug` → `Debugger_run`) |
+| [debugger.fd](compiler/debugger.fd) | 2,212 | `fid debug`: interactive IR debugger — breakpoints, stepping, `print` (wired via main's `cmd_debug` → `Debugger_run`) |
 | **Retired PIR path — deleted from the tree** | | |
 | pir, opt, regalloc, peephole, codegen_x64/arm64/riscv, coff, macho, pe, arm64_enc, riscv_enc, runtime_linux/arm64/riscv, codegen | | removed since Nov 21; the native path is pe_ir (Windows) and nat_ir (ELF/Mach-O/`--nat`) |
 | **Not reached from main.fd** (all pass `fid check`, Nov 24) | | |
@@ -243,10 +244,10 @@ and `AGENTS.md` first when working on the compiler.
 | [diag.fd](compiler/diag.fd) | 786 | Diagnostics with error codes; used by tests/selfhost, not by `fid` itself |
 | [embedded.fd](compiler/embedded.fd) | 508 | FixedBufferAllocator, HAL generator; PL5 open item |
 | [flat_ast.fd](compiler/flat_ast.fd) | 1,481 | Flat AST dump; deliberately unwired (compiler.fd:6140 — its `int_to_hex` would hide string's) |
-| [hotreload.fd](compiler/hotreload.fd) | 634 | Change snapshots and watcher; `fid watch` is a placeholder that calls `cmd_bench` |
+| [hotreload.fd](compiler/hotreload.fd) | 652 | Change snapshots and watcher; `fid watch` is a placeholder that calls `cmd_bench` |
 | [native_debugger.fd](compiler/native_debugger.fd) | 525 | ptrace skeleton; `autopsy` is fidesc-only |
 | [runtime.fd](compiler/runtime.fd) | 629 | Old plan for `p_*` in Fid; replaced by stdlib/linux_runtime |
-| **Total** | **348,330** | **65 modules** (`wc -l`, Nov 24; 58 reached from `main.fd`). 64 of 65: `docs/file-analysis/<name>.md` (lockcheck missing) |
+| **Total** | **357,310** | **65 modules** (`wc -l`, Nov 27, be36317; 58 reached from `main.fd`, Nov 24). 64 of 65: `docs/file-analysis/<name>.md` (lockcheck missing) |
 
 ---
 
@@ -414,20 +415,20 @@ See `docs/reference/features.md` for which are feature-complete.
 
 ## Tests (tests/)
 
-3,982 `.fd` test files and 278 shell check scripts (Nov 24). Run the
+4,068 `.fd` test files and 310 shell scripts under `tests/` (Nov 27, be36317). Run the
 bootstrap suite with `./target/release/fidesc test` (or `fid test`);
 verify with `./verify.sh` (bootstrap), `./verify-selfhost.sh` (selfhost),
 `scripts/tier1.sh` / `tier2.sh` (CI lanes).
 
 | Directory | Contents |
 |-----------|----------|
-| [bootstrap/](tests/bootstrap/) | The main suite: 1,962 `.fd` at top level (597 `*_fail` expected-fail tests that must be rejected) + 75 in subdirs: `at_import`, `baseline`, `capability`, `decl_lib`, `diag_dup`, `diagnostics`, `effects`, `golden`, `nattools`, `race_lib`, `regions`, `safety`, `same_name_lib`, `spec_lib`, `trait_conflict`. |
+| [bootstrap/](tests/bootstrap/) | The main suite: 2,002 `.fd` at top level (569 with an `// expect-error` line, which must be rejected; 613 named `*_fail.fd`) + 75 in subdirs: `at_import`, `baseline`, `capability`, `decl_lib`, `diag_dup`, `diagnostics`, `effects`, `golden`, `nattools`, `race_lib`, `regions`, `safety`, `same_name_lib`, `spec_lib`, `trait_conflict`. |
 | [conformance/](tests/conformance/) | 1,617 `.fd` — one test per rule of `docs/reference/reference.md` §1–§13; `//! error:` means the compiler must reject it. `_modules/` helpers + `known-gaps.txt`. |
-| [selfhost/](tests/selfhost/) | 46 `.fd` exercising self-hosted components (`verify-selfhost.sh`). |
-| [nattools/](tests/nattools/) | 75 `.fd` + machine-layer check scripts (RA splitting, unwinding, encoders). |
+| [selfhost/](tests/selfhost/) | 47 `.fd` exercising self-hosted components (`verify-selfhost.sh`). |
+| [nattools/](tests/nattools/) | 75 `.fd` + 98 `.sh` machine-layer check scripts (RA splitting, unwinding, encoders). |
 | [projects/](tests/projects/) | 52 `.fd` whole-program fixtures: cli, service, game, embed, library, workspace, dep graphs. |
-| [verify/](tests/verify/) | 50 `.fd` — bug reproductions (`bugs/`), soak/interleave programs, `.tvp` translation-validation pairs. |
-| [tooling/](tests/tooling/) | 14 `.fd` + 134 `*-check.sh` (142 `.sh` in all) — per-feature tool checks (crash reports, LSP probes, caches, repl, docs, `serve`). |
+| [verify/](tests/verify/) | 49 `.fd` — bug reproductions (`bugs/`), soak/interleave programs, `.tvp` translation-validation pairs. |
+| [tooling/](tests/tooling/) | 14 `.fd` + 135 `*-check.sh` (143 `.sh` in all) — per-feature tool checks (crash reports, LSP probes, caches, repl, docs, `serve`). |
 | [leaks/](tests/leaks/) | 11 programs + `.expected` (`scripts/leak-check.sh`: output + "every block was freed"). |
 | [harness.rs](tests/harness.rs) | Rust integration test harness — runs `.fd` tests across backends, holds the skip list (`is_skip_test()`). |
 | other dirs | `ark`, `book`, `c2fd`, `cancel`, `cascade`, `checked_alloc`, `course`, `ct`, `ctx_switch`, `db`, `determinism`, `fmt`, `fuzz`, `limits`, `memprof`, `mono_share`, `net`, `par`, `perf`, `prof`, `rc_cancel`, `sched`, `tls`, `tools`, `tp`, `uefi`, `wasm` — domain-specific checks with their own `check.sh`/`run.sh`. |
@@ -487,23 +488,57 @@ Baseline file: `tests/bootstrap/baseline/test_results.txt`.
 
 ## Tools (tools/)
 
-Standalone tools written in Fid (each builds to its own exe; the
-self-hosted ones ship beside `fid`):
+Standalone tools written in Fid, 42 `.fd` files (Nov 27; 12 on Nov 22). Each
+tool builds to its own exe; four are helper libraries the ports import
+(`fuzz_lib`, `fuzz_programs`, `py_random`, `target_test_lib`). The ports of
+Nov 25 (AD4) each have a `tests/tools/<name>/check.sh` comparing them with
+the script they replace ([internal-tools.md](docs/reference/internal-tools.md)).
+The self-hosted ark, scribe and veil ship beside `fid`:
 
 | File | Description |
 |------|-------------|
 | [ark.fd](tools/ark.fd) | `ark` package manager — self-hosted build (`ark-fd.exe`). |
+| [bare_qemu_test.fd](tools/bare_qemu_test.fd) | Port of `scripts/bare-qemu-test.sh` (Nov 25): bare-metal tests under QEMU. |
 | [c2fd.fd](tools/c2fd.fd) | C → Fid source translator (best effort). |
 | [cas.fd](tools/cas.fd) | Remote cache server for `.fidcache` (inc-roadmap A11). |
+| [chaos.fd](tools/chaos.fd) | Port of `scripts/verify/chaos.py` (Nov 25): children killed, restarted or starved on purpose. |
 | [check_stdlib.fd](tools/check_stdlib.fd) | Imports every stdlib module on its own — the stdlib smoke check. |
+| [compile_gate.fd](tools/compile_gate.fd) | Port of `scripts/compile-gate.sh` and `bench/compile-check.sh` (Nov 25): per-stage compile times against a baseline. |
+| [cov_instrument.fd](tools/cov_instrument.fd) | Port of `scripts/verify/cov_instrument.py` (Nov 25): instruments generated C for coverage. |
+| [coverage.fd](tools/coverage.fd) | Port of `scripts/verify/coverage.py` except `--gen` (Nov 25). |
+| [cross_test.fd](tools/cross_test.fd) | Port of `scripts/cross-test.sh` (Nov 25): builds the suite for a target and compares with `fid run`. |
 | [doctest.fd](tools/doctest.fd) | Extracts `/// Example:` blocks from `.fd` sources and runs them. |
+| [enc_oracle.fd](tools/enc_oracle.fd) | Port of `scripts/enc-oracle.py` (Nov 25): the encoders against clang's assembler. |
+| [expect.fd](tools/expect.fd) | Port of `scripts/verify/expect.py` (Nov 25): every backend on a test file, checked against what it must do. |
+| [fuzz_frontend.fd](tools/fuzz_frontend.fd) | Port of `scripts/fuzz/fuzz_frontend.py` (Nov 25): front-end mutants. |
+| [fuzz_gen.fd](tools/fuzz_gen.fd) | Port of `scripts/fuzz/gen_programs.py` (Nov 25); its generator is `fuzz_programs.fd`. |
+| [fuzz_lib.fd](tools/fuzz_lib.fd) | Helper library of the fuzz drivers (paths, child runs). |
+| [fuzz_nightly.fd](tools/fuzz_nightly.fd) | Port of `scripts/fuzz/nightly.sh` (Nov 25). |
+| [fuzz_parsers.fd](tools/fuzz_parsers.fd) | Port of `scripts/fuzz/fuzz_parsers.py` (Nov 25). |
+| [fuzz_programs.fd](tools/fuzz_programs.fd) | Helper library: the program generator of `gen_programs.py`. |
 | [fuzz_triage.fd](tools/fuzz_triage.fd) | Summarises the failures a fuzz run kept. |
+| [fuzz_vs_c.fd](tools/fuzz_vs_c.fd) | Port of `scripts/fuzz/gen_vs_c.py` (Nov 25): generated programs, Fides against C. |
+| [gen_brotli_dict.fd](tools/gen_brotli_dict.fd) | Port of `scripts/gen-brotli-dict.py` (Nov 25): a binary file as Fides literals. |
+| [interleave.fd](tools/interleave.fd) | Port of `scripts/verify/interleave.py` (Nov 25). |
+| [leak_check.fd](tools/leak_check.fd) | Port of `scripts/leak-check.sh` (Nov 25): `run --leaks` against `.expected`. |
 | [macho_check.fd](tools/macho_check.fd) | Structural check of a 64-bit Mach-O executable. |
+| [me_measure.fd](tools/me_measure.fd) | Port of `scripts/me-measure.sh` (Nov 25). |
+| [nat_gate.fd](tools/nat_gate.fd) | Port of `scripts/nat-gate.sh` (Nov 25): native builds with the checkers on. |
+| [pass_matrix.fd](tools/pass_matrix.fd) | Port of `scripts/pass-matrix.sh` (Nov 25): the suite with each pass off. |
+| [py_random.fd](tools/py_random.fd) | Helper library: Python's `random.Random`, for the fuzz ports. |
+| [reduce.fd](tools/reduce.fd) | Port of `scripts/fuzz/reduce.py` (Nov 25). |
 | [release_checksums.fd](tools/release_checksums.fd) | SHA-256 checksums of release files. |
 | [release_notes.fd](tools/release_notes.fd) | Release notes generated from `docs/reference/changelog.md`. |
+| [rules_smt.fd](tools/rules_smt.fd) | Port of `scripts/rules-smt.sh` (Nov 25): z3 on the files `fid test-rules --smt` writes. |
+| [sanitize.fd](tools/sanitize.fd) | Port of `scripts/sanitize.sh` (Nov 25): the suite under the C compiler's sanitizers. |
 | [scribe.fd](tools/scribe.fd) | `scribe` documentation generator — self-hosted build (`scribe-fd.exe`). |
 | [site.fd](tools/site.fd) | The project website, served by a Fid program (AD2). |
+| [soak.fd](tools/soak.fd) | Port of `scripts/verify/soak.py` (Nov 25). |
+| [stale_cache_test.fd](tools/stale_cache_test.fd) | Port of `scripts/stale-cache-test.sh` (Nov 25): a stale build cache is never reused. |
+| [target_test_lib.fd](tools/target_test_lib.fd) | Helper library of the four target test runners. |
+| [variants.fd](tools/variants.fd) | Port of `scripts/verify/variants.py` except `--gen` (Nov 25): builds with passes off or broken on purpose. |
 | [veil.fd](tools/veil.fd) | `veil` coverage tool (AD1, release N8). |
+| [wasm_test.fd](tools/wasm_test.fd) | Port of `scripts/wasm-test.sh` (Nov 25): the suite through `fid wasm`. |
 
 ---
 

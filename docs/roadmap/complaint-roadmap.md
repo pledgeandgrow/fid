@@ -1246,7 +1246,8 @@ The ten that matter most, in order:
 
 ## Summary
 
-100 goals: 77 done, 23 partly done, 0 not started (Nov 22 checkbox count).
+100 goals: 92 done, 8 partly done, 0 not started (Nov 27 checkbox count, be36317).
+Nov 22 checkbox count: 77 done, 23 partly done, 0 not started.
 Historical snapshot, Nov 21, after a fresh check of 29 goals: 62 done,
 30 partly done, 8 not started; Nov 15: stdlib: CO1 keys
 `@secret` across the crypto modules plus env_secret/config_secret, CM10

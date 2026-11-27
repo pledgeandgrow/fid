@@ -4142,7 +4142,7 @@ Trust is built by what we do not break.
       form, sparse-#line form, --self-test and the missing-argument exit:
       6 same, 0 differ. Left of the audit: the remaining drivers to port;
       the shipped ark/scribe/veil are still Rust until a release rebuild.
-      Nov 25 evening: 32 more ports, each with a tests/tools/<name>/check.sh
+      Nov 25 evening: 25 more ports, each with a tests/tools/<name>/check.sh
       that runs the original and the port with the same arguments and
       compares stdout, exit status and the files written (all pass, built
       with `fid ccompile`; docs/reference/internal-tools.md has a paragraph
