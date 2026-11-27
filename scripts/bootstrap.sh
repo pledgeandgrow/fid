@@ -39,17 +39,31 @@ OUT="${1:-build/bootstrap}"
 STAGES="${2:-3}"
 case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) X=".exe" ;; *) X="" ;; esac
 PINNED="release/stage0/fid$X"
+# The repository's pin for this host (stage0-fetch.sh knows the asset name:
+# scripts/<asset>.sha256, scripts/stage0.sha256 for windows-x64)
+PIN_FILE=$(./scripts/stage0-fetch.sh --pin-file 2>/dev/null) || PIN_FILE="scripts/stage0.sha256"
+[ -f "$PIN_FILE" ] || PIN_FILE="scripts/stage0.sha256"
+sha256_of() {
+  if command -v sha256sum >/dev/null; then sha256sum "$1" | cut -d' ' -f1
+  elif command -v shasum >/dev/null; then shasum -a 256 "$1" | cut -d' ' -f1
+  fi
+}
 if [ -z "${STAGE0:-}" ]; then
   if [ -x "$PINNED" ]; then
     STAGE0="$PINNED"
-    # The pin that applies: stage0-fetch.sh records it next to the binary;
-    # a hand-placed fid.exe falls back to scripts/stage0.sha256.
-    PIN="$PINNED.sha256"; [ -f "$PIN" ] || PIN="scripts/stage0.sha256"
-    if [ -f "$PIN" ] && command -v sha256sum >/dev/null; then
-      want=$(cut -d' ' -f1 "$PIN")
-      have=$(sha256sum "$PINNED" | cut -d' ' -f1)
-      if [ "$want" != "$have" ]; then
-        echo "warning: $PINNED does not match $PIN (pin it again with PIN=1)"
+    # BG359: the binary is checked against the repository's pin, not the
+    # copy stage0-fetch.sh left beside it (that copy always matches): after
+    # a pin update in git the old stage 0 is fetched again, or a warning
+    # says it is stale. (PIN_FILE, not PIN: PIN=1 is the request to pin.)
+    if [ -f "$PIN_FILE" ]; then
+      want=$(cut -d' ' -f1 "$PIN_FILE")
+      have=$(sha256_of "$PINNED")
+      if [ -n "$have" ] && [ "$want" != "$have" ]; then
+        if [ "${FID_STAGE0_FETCH:-1}" != 0 ] && ./scripts/stage0-fetch.sh; then
+          echo "note: $PINNED did not match $PIN_FILE; fetched the pinned stage 0 again"
+        else
+          echo "warning: $PINNED does not match $PIN_FILE (fetch it with scripts/stage0-fetch.sh, or pin it again with PIN=1)"
+        fi
       fi
     fi
   elif [ "${FID_STAGE0_FETCH:-1}" != 0 ] && ./scripts/stage0-fetch.sh; then
@@ -84,6 +98,8 @@ JOBS="${JOBS:-4}"
 # and wrapping signed arithmetic (@wrapping code relies on it)
 SPLIT_CFLAGS=(-O2 -fno-strict-aliasing -fwrapv)
 for f in "${CFLAGS[@]}"; do [ "$f" != "-O0" ] && SPLIT_CFLAGS+=("$f"); done
+SPLIT_OPT=-O2
+. scripts/build-units.sh
 LIBS=()
 EXE=""
 case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) LIBS=(-lws2_32); EXE=".exe" ;; Darwin) LIBS=(-lm -lpthread); CFLAGS+=(-D_XOPEN_SOURCE=600 -D_DARWIN_C_SOURCE) ;; *) LIBS=(-lm -lpthread -ldl); case "${CC_CMD[*]}${CC:-}" in *zig*) LIBS+=(-lunwind) ;; esac ;; esac
@@ -129,22 +145,14 @@ compile_c() {
   : > "$log"
   case "${CC_CMD[*]}" in *tcc*) ;; *)
   if [ "$SPLIT" -gt 1 ] && "$fid" split-c "$c" "$base" "$SPLIT" >> "$log" 2>&1 && [ -f "$base.h" ]; then
-    local objs=() pids=() k ok=1
-    for k in $(seq 0 $((SPLIT - 1))); do
-      "${CC_CMD[@]}" "${SPLIT_CFLAGS[@]}" -c "${base}_$k.c" -o "${base}_$k.o" >> "$log" 2>&1 &
-      pids+=($!)
-      objs+=("${base}_$k.o")
-      if [ ${#pids[@]} -ge "$JOBS" ]; then
-        wait "${pids[0]}" || ok=0
-        pids=("${pids[@]:1}")
-      fi
-    done
-    for pid in "${pids[@]}"; do wait "$pid" || ok=0; done
-    if [ "$ok" = 1 ] && "${CC_CMD[@]}" "${objs[@]}" -o "$exe" "${LIBS[@]}" >> "$log" 2>&1; then
-      echo "  ($SPLIT units at -O2)"
+    # scripts/build-units.sh: the units within the runner's memory (on a
+    # hosted runner the heavy ones alone, every compile with a limit), a
+    # failed one again alone, then at -O1 and -O0
+    if units_compile "$base" "$log" && "${CC_CMD[@]}" "${UNITS_OBJS[@]}" -o "$exe" "${LIBS[@]}" >> "$log" 2>&1; then
+      units_summary
       return 0
     fi
-    echo "  split build failed (see $log); building one unit at -O0"
+  echo "  split build failed (see $log); building one unit at -O0"
   fi ;;
   esac
   "${CC_CMD[@]}" "${CFLAGS[@]}" "$c" -o "$exe" "${LIBS[@]}" >> "$log" 2>&1
@@ -162,11 +170,16 @@ if [ -n "${RELEASE:-}" ]; then
 fi
 
 prev="$STAGE0"
-if [ -n "${NATIVE:-}" ]; then
+  if [ -n "${NATIVE:-}" ]; then
+  # how a stage's compiler ended: "exit 1", or "killed by signal 11" for a death
+  # by signal (bash prints those themselves)
+  ended() { if [ "$1" -gt 128 ]; then echo "killed by signal $(( $1 - 128 ))"; else echo "exit $1"; fi; }
   for n in $(seq 1 "$STAGES"); do
     start=$(date +%s)
-    if ! "$prev" emit compiler/main.fd -o "$OUT/fid-n$n$EXE" > "$OUT/n$n.log" 2>&1; then
-      echo "[stage $n] emit failed:"; grep -iE "error" "$OUT/n$n.log" | head -20; exit 1
+    erc=0
+    "$prev" emit compiler/main.fd -o "$OUT/fid-n$n$EXE" > "$OUT/n$n.log" 2>&1 || erc=$?
+    if [ "$erc" -ne 0 ]; then
+      echo "[stage $n] emit failed ($(ended "$erc")):"; grep -iE "error" "$OUT/n$n.log" | head -20; tail -3 "$OUT/n$n.log" | sed 's/^/    /'; exit 1
     fi
     echo "[stage $n] emit ok in $(( $(date +%s) - start ))s ($(wc -c < "$OUT/fid-n$n$EXE") bytes)"
     prev="$OUT/fid-n$n$EXE"
@@ -180,10 +193,31 @@ if [ -n "${NATIVE:-}" ]; then
   fi
   LAST="$OUT/fid-n$STAGES$EXE"
 else
+# how a stage's compiler ended: "exit 1", or "killed by signal 11" for a death
+# by signal (bash prints those itself, as "Segmentation fault")
+ended() { if [ "$1" -gt 128 ]; then echo "killed by signal $(( $1 - 128 ))"; else echo "exit $1"; fi; }
 for n in $(seq 1 "$STAGES"); do
   start=$(date +%s)
-  if ! "$prev" dump-c compiler/main.fd > "$OUT/c$n.c" 2> "$OUT/c$n.log"; then
-    echo "[stage $n] dump-c failed:"; grep -E "error" "$OUT/c$n.log" | head -20; exit 1
+  drc=0
+  "$prev" dump-c compiler/main.fd > "$OUT/c$n.c" 2> "$OUT/c$n.log" || drc=$?
+  if [ "$drc" -ne 0 ]; then
+    # A death by signal leaves no error line (Nov 27, the Windows release
+    # job: the pinned stage 0 "Segmentation fault" in dump-c): say how it
+    # ended and how far it got, and try such a death once more
+    echo "[stage $n] dump-c failed ($(ended "$drc"))"
+    grep -E "error" "$OUT/c$n.log" | head -20
+    tail -3 "$OUT/c$n.log" | sed 's/^/    /'
+    if [ "$drc" -gt 128 ]; then
+      echo "[stage $n] dump-c once more"
+      drc=0
+      "$prev" dump-c compiler/main.fd > "$OUT/c$n.c" 2> "$OUT/c$n.log" || drc=$?
+    fi
+    if [ "$drc" -ne 0 ]; then
+      echo "[stage $n] dump-c failed ($(ended "$drc"))"
+      grep -E "error" "$OUT/c$n.log" | head -20
+      tail -3 "$OUT/c$n.log" | sed 's/^/    /'
+      exit 1
+    fi
   fi
   echo "[stage $n] dump-c ok in $(( $(date +%s) - start ))s ($(wc -c < "$OUT/c$n.c") bytes)"
   wrap "$OUT/c$n.c" "$OUT/c${n}_wrapped.c"
@@ -209,13 +243,17 @@ fi
 
 # PIN=1: the last stage (it reached the fixpoint) becomes the next stage 0.
 # The binary stays out of git (release/ is ignored); its hash and the commit
-# it was built from are recorded in scripts/stage0.sha256.
+# it was built from are recorded in this host's pin file ($PIN_FILE).
 if [ -n "${PIN:-}" ]; then
   if [ "$STAGES" -lt 3 ]; then echo "PIN needs 3 stages (a checked fixpoint)"; exit 1; fi
   mkdir -p release/stage0
   cp "$LAST" "$PINNED"
-  echo "$(sha256sum "$PINNED" | cut -d' ' -f1)  fid$X  built from $(git rev-parse --short HEAD 2>/dev/null)$(git diff --quiet 2>/dev/null || echo '+changes') on $(date +%F)" > scripts/stage0.sha256
-  echo "PINNED: $PINNED ($(cut -c1-16 scripts/stage0.sha256)...)"
+  # BG359: this host's pin file (scripts/stage0.sha256 on windows-x64), the
+  # one the stage-0 check above and stage0-fetch.sh read; the copy beside
+  # the binary follows it
+  echo "$(sha256_of "$PINNED")  fid$X  built from $(git rev-parse --short HEAD 2>/dev/null)$(git diff --quiet 2>/dev/null || echo '+changes') on $(date +%F)" > "$PIN_FILE"
+  cp "$PIN_FILE" "$PINNED.sha256"
+  echo "PINNED: $PINNED in $PIN_FILE ($(cut -c1-16 "$PIN_FILE")...)"
 fi
 
 # RELEASE=1: the stage-3 compiler (it compiled itself to the fixpoint) is

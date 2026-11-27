@@ -106,7 +106,8 @@ echo "[3/3] ${CC_CMD[*]} -> $OUT/$OUT_EXE"
 # (default 2: 4 at a time kills a memory-tight runner before the retry logic
 # can help — the step is SIGTERMed whole, exit 143; override JOBS locally), and linked; the compiler is about 3x faster than one unit at
 # -O0 (the Rust bootstrap, tcc or SPLIT=1: one unit at -O0). A unit that
-# fails is retried alone, then the build stops with exit 1 (2g.86).
+# fails is built again alone, then at -O1 and -O0 (scripts/build-units.sh);
+# a unit that builds at no level stops with exit 1 (2g.86).
 # The generated C is the same either way: only the C compiler's work differs.
 SPLIT="${SPLIT:-16}"
 JOBS="${JOBS:-2}"
@@ -117,85 +118,25 @@ JOBS="${JOBS:-2}"
 SPLIT_OPT="${SPLIT_OPT:--O2}"
 SPLIT_CFLAGS=("$SPLIT_OPT" -fno-strict-aliasing -fwrapv)
 for f in "${CFLAGS[@]}"; do [ "$f" != "-O0" ] && SPLIT_CFLAGS+=("$f"); done
+# the units of the split C: within the runner's memory, with the ladder
+. scripts/build-units.sh
 built=0
 : > "$OUT/fid-dev.cc.log"
 base="$OUT/fid-dev_wrapped_u"
 case "${CC_CMD[*]}" in *tcc*) ;; *)
   if [ "$SPLIT" -gt 1 ] && "$STAGE0" split-c "$OUT/fid-dev_wrapped.c" "$base" "$SPLIT" >> "$OUT/fid-dev.cc.log" 2>&1 && [ -f "$base.h" ]; then
-    # 2g.86: a unit that fails is named with its exit code and built again
-    # alone (a C compiler killed for memory at JOBS at a time, exit 5 with
-    # no message, usually builds by itself); one that still fails, or a
-    # failed link, stops the build with exit 1. Before, any failure fell
-    # back to one unit at -O0 (a ~17x slower fid) and the script exited 0.
-    objs=(); pids=(); pid_units=(); failed=(); retried=()
-    for k in $(seq 0 $((SPLIT - 1))); do
-      "${CC_CMD[@]}" "${SPLIT_CFLAGS[@]}" -c "${base}_$k.c" -o "${base}_$k.o" >> "$OUT/fid-dev.cc.log" 2>&1 &
-      pids+=($!)
-      pid_units+=("$k")
-      objs+=("${base}_$k.o")
-      if [ ${#pids[@]} -ge "$JOBS" ]; then
-        wait "${pids[0]}"; rc=$?
-        [ "$rc" -ne 0 ] && failed+=("${pid_units[0]}:$rc")
-        pids=("${pids[@]:1}")
-        pid_units=("${pid_units[@]:1}")
-      fi
-    done
-    for i in "${!pids[@]}"; do
-      wait "${pids[$i]}"; rc=$?
-      [ "$rc" -ne 0 ] && failed+=("${pid_units[$i]}:$rc")
-    done
-    if [ ${#failed[@]} -gt 0 ]; then
-      for fu in "${failed[@]}"; do
-        echo "      unit ${base}_${fu%%:*}.c failed at $SPLIT_OPT (exit ${fu##*:})"
-      done
-      echo "      building the failed units again, one at a time"
-      still=()
-      for fu in "${failed[@]}"; do
-        k="${fu%%:*}"
-        "${CC_CMD[@]}" "${SPLIT_CFLAGS[@]}" -c "${base}_$k.c" -o "${base}_$k.o" >> "$OUT/fid-dev.cc.log" 2>&1; rc=$?
-        [ "$rc" -ne 0 ] && still+=("$k:$rc")
-      done
-      if [ ${#still[@]} -gt 0 ]; then
-        # the giant typechecker units exceed llvm's memory at any
-        # optimization level above -O0 even on a big machine (the stage0
-        # cross-build measured this): fall to -O1, then -O0, per unit
-        final=()
-        retry_opts=()
-        case "$SPLIT_OPT" in -O2) retry_opts=(-O1 -O0) ;; -O1) retry_opts=(-O0) ;; esac
-        for fu in "${still[@]}"; do
-          k="${fu%%:*}"
-          ok=0
-          for opt in "${retry_opts[@]}"; do
-            echo "      unit ${base}_$k.c retrying at $opt (the giant-unit memory wall)"
-            # the same flags as the first build with the optimization level
-            # (before Nov 27 the retry had neither -w nor the -Wno-*: the
-            # generated C's int-to-pointer conversions were errors then)
-            cflags=("${SPLIT_CFLAGS[@]/$opt}")
-            if "${CC_CMD[@]}" "${cflags[@]}" -c "${base}_$k.c" -o "${base}_$k.o" >> "$OUT/fid-dev.cc.log" 2>&1; then
-              ok=1
-              retried+=("$k$opt")
-              break
-            fi
-          done
-          [ "$ok" -eq 0 ] && final+=("$k")
-        done
-        if [ ${#final[@]} -gt 0 ]; then
-          for k in "${final[@]}"; do
-            echo "error: unit ${base}_$k.c unbuildable at $SPLIT_OPT and below (no memory to commit: see the commit limit)"
-          done
-          echo "      see $OUT/fid-dev.cc.log; SPLIT=1 builds one unit at -O0 (about 17x slower)"
-          grep -E "error" "$OUT/fid-dev.cc.log" | head -20
-          rm -f "${base}"_*.c "${base}"_*.o "$base.h"
-          exit 1
-        fi
-      fi
+    # scripts/build-units.sh: the units within the runner's memory (on a
+    # hosted runner the heavy ones alone, every compile with a limit), a
+    # failed one again alone, then at -O1 and -O0; a unit that builds at
+    # no level stops the build with exit 1 (2g.86)
+    if ! units_compile "$base" "$OUT/fid-dev.cc.log"; then
+      echo "      see $OUT/fid-dev.cc.log; SPLIT=1 builds one unit at -O0 (about 17x slower)"
+      grep -E "error" "$OUT/fid-dev.cc.log" | head -20
+      rm -f "${base}"_*.c "${base}"_*.o "$base.h"
+      exit 1
     fi
-    if "${CC_CMD[@]}" "${objs[@]}" -o "$OUT/$OUT_EXE" "${LIBS[@]}" >> "$OUT/fid-dev.cc.log" 2>&1; then
-      if [ "${#retried[@]}" -gt 0 ]; then
-        echo "      ($SPLIT units: $(( SPLIT - ${#retried[@]} )) at $SPLIT_OPT, ${#retried[@]} below it: unit ${retried[*]})"
-      else
-        echo "      ($SPLIT units at $SPLIT_OPT)"
-      fi
+    if "${CC_CMD[@]}" "${UNITS_OBJS[@]}" -o "$OUT/$OUT_EXE" "${LIBS[@]}" >> "$OUT/fid-dev.cc.log" 2>&1; then
+      units_summary
       built=1
     else
       rc=$?

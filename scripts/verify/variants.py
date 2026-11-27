@@ -639,7 +639,9 @@ def main():
             p = os.path.join(a.tree, path)
             try:
                 with open(p, encoding="utf-8", newline="") as fh:
-                    cnt = fh.read().count(frm)
+                    # the edits are written with LF: a Windows checkout has
+                    # CRLF (Nov 27: every edit in a CRLF file read "STALE")
+                    cnt = fh.read().replace("\r\n", "\n").count(frm)
             except OSError:
                 cnt = -1
             ok = cnt == 1

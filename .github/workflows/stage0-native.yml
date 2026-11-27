@@ -86,7 +86,10 @@ jobs:
           sed 's/^int main(int argc, char\*\* argv)/int fides_main(int argc, char** argv)/' build/fid-raw.c > build/fid-wrapped.c
           grep -c "^int fides_main" build/fid-wrapped.c
           cat scripts/stackwrap.c >> build/fid-wrapped.c
-          # [3/4] split into 16 units, compile at -O0 (LLVM -O2 kills the runner on the giant units, 2g.86 — no retry can fire when the runner itself dies; the seed is slower but exists)
+          # [3/4] split into 16 units, compile at -O0 (LLVM -O2 kills the runner on the giant units, 2g.86 -- no retry can fire when the runner itself dies; the seed is slower but exists).
+          # The warnings flags are scripts/build-selfhost.sh's: the generated C passes int64_t where the
+          # Windows and macOS headers take pointers (GetProcessTimes, clock_gettime), an error in C23
+          # without -w (Nov 27: "2925 warnings and 1 error generated" in unit 9).
           ./build/seed-x64 split-c build/fid-wrapped.c build/fidu 16
           case "${{ matrix.target }}" in
             aarch64-linux)  TRIP=aarch64-linux-musl;  LIBS="-lm -lpthread -ldl -lunwind" ;;
@@ -98,7 +101,7 @@ jobs:
           : > build/cc.log
           compile_one() {
             u="$1"
-            "$ZIG" cc -target "$TRIP" -O0 -fno-strict-aliasing -fwrapv -fno-sanitize=all -c "$u" -o "${u%.c}.o" 2>> build/cc.log
+            "$ZIG" cc -target "$TRIP" -O0 -fno-strict-aliasing -fwrapv -fno-sanitize=all -w -Wno-int-conversion -Wno-incompatible-pointer-types -Wno-implicit-function-declaration -Wno-return-type -c "$u" -o "${u%.c}.o" 2>> build/cc.log
           }
           export -f compile_one; export ZIG TRIP
           ls build/fidu_*.c | xargs -P 2 -I{} bash -c 'compile_one "$@"' _ {} || { echo "unit compile failed:"; tail -20 build/cc.log; exit 1; }

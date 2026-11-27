@@ -79,6 +79,18 @@ jobs:
           # (scripts/build-info.sh reads it)
           FIDES_VERSION: ${{ steps.version.outputs.version }}
         run: ./scripts/bootstrap.sh
+      - name: The bootstrap's logs (when a stage fails)
+        # the stage compilers' own logs: on Nov 27 the Windows job's stage 0
+        # died by a signal in dump-c and nothing told how far it had got
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bootstrap-logs-${{ runner.os }}-${{ github.run_id }}
+          path: |
+            build/bootstrap/*.log
+            build/bootstrap/*/*.log
+          if-no-files-found: ignore
+          retention-days: 14
       - name: release/fid.exe is this source's release build
         run: |
           bash scripts/release-fresh.sh release/fid.exe
@@ -192,6 +204,18 @@ jobs:
           # N12: release/fid names the release's version, as on Windows
           FIDES_VERSION: ${{ steps.version.outputs.version }}
         run: ./scripts/bootstrap.sh
+      - name: The bootstrap's logs (when a stage fails)
+        # the stage compilers' own logs: on Nov 27 the Windows job's stage 0
+        # died by a signal in dump-c and nothing told how far it had got
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bootstrap-logs-${{ runner.os }}-${{ github.run_id }}
+          path: |
+            build/bootstrap/*.log
+            build/bootstrap/*/*.log
+          if-no-files-found: ignore
+          retention-days: 14
       - name: release/fid is this source's release build
         run: |
           bash scripts/release-fresh.sh release/fid
@@ -204,6 +228,11 @@ jobs:
           cp -r stdlib stage/stdlib
           cp -r runtime stage/runtime
           cp LICENSE stage/LICENSE
+          # BG485: `fid explain-error <code>` prints the code's entry of
+          # docs/reference/error-codes.md (<stdlib>/../docs/reference/);
+          # without it every code gave a line naming a file not shipped
+          mkdir -p stage/docs/reference
+          cp docs/reference/error-codes.md stage/docs/reference/error-codes.md
           tar -czf fid-x86_64-linux.tar.gz -C stage .
           ls -l fid-x86_64-linux.tar.gz
       - name: Unpack into a fresh directory and check it (A10, N12)
@@ -214,6 +243,9 @@ jobs:
           home="$(mktemp -d)"
           tar -xzf fid-x86_64-linux.tar.gz -C "$home"
           bash scripts/install-layout-check.sh --installed "$home/bin"
+          # BG485: explain-error finds its text in the archive, outside a
+          # checkout and without FID_HOME
+          (cd "$(mktemp -d)" && env -u FID_HOME "$home/bin/fid" explain-error E044 | grep -q '^## E044')
           # an update: the archive unpacked over an existing install
           tar -xzf fid-x86_64-linux.tar.gz -C "$home"
           bash scripts/install-layout-check.sh --installed "$home/bin"
