@@ -338,6 +338,25 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       (fib and bench_float faster). Left: the checker failures, speed, the
       suites with winfregs/splitfloat.
       Nov 21: 2g.88 fixed (see RA3) — the checker's rejection of argument-register hints on x86-64 was its own miss.
+      Nov 27 (night): the speed comparison, tests/nattools/mi14_bench.sh
+      with release/fid-v27.exe (a copy of the fid-dev of Nov 25), on a
+      quiet machine (load 14%, 17 GB free): wall-clock ms, best of 3,
+      `--nat` / pe_ir. fib 686 / 666 (0.97); loop 1580 / 3692 (2.34);
+      sieve 260 / 925 (3.56); hashmap 1651 / 1397 (0.85); bench_float
+      640 / 656 (1.02); every output equal. `--nat` is faster on fib and
+      hashmap and slower on the counted loop and the sieve, as on Nov 21
+      (then 6635 / 2274, 1381 / 501, 2340 / 1622: all three slower). With
+      the same compiler: mi7_call_parity.sh 13 same, 0 differ (one re-run
+      after an out of memory under load); machine_mi14_check.sh 25 ok and
+      10 fail, machine_fregs_check.sh 21 ok and 4 fail. Of those 14, 7
+      are the two scripts taking `wsl.exe` on PATH for a working WSL
+      (this machine has no distribution), 1 a disassembly pattern that
+      counts the scratch registers of a runtime `round` routine, and 6
+      one expectation: that the splitter keeps `around` on all four
+      targets, which it declines (cost 13780 -> 13780) while every
+      output is right. Left: the default switch (the loop and the
+      sieve), those three stale expectations, the suites with
+      winfregs/splitfloat. Still partly.
 - [x] MI15. A Linux x86-64 target on MIR for free once x64 is ported: the ELF
       writer of `nat_enc.fd`, the Linux runtime, x64 selection (M).
       Nov 9: Linux x86-64 on the MIR (`fid emit --target x86_64-linux`): its own
