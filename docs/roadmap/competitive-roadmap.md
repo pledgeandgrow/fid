@@ -3774,6 +3774,20 @@ Every platform gets a tier, and a tier means CI, not a hope.
       run under qemu-riscv64 as under `fid run`. Left: running the Windows
       ARM64, FreeBSD and macOS x64 binaries (only their file format was
       checked here; tier2.yml's jobs were not looked at).
+      Nov 27 check (release/fid-v27.exe, a copy of the fid-dev of Nov 25; a
+      smoke run, not the suite: hello, test_closure, test_hashmap,
+      test_float, test_tasks, test_int_semantics through scripts/tier2.sh
+      WITH_NATIVE=1): every program builds on all six lanes —
+      c:aarch64-windows, c:x86_64-macos, c:x86_64-freebsd,
+      c:riscv64-linux, native:riscv64-linux, native:x86_64-macos (the
+      C build of test_tasks for x86_64-freebsd died once inside the
+      parallel run, with no error text, and builds on its own; it passes
+      scripts/bin-target-check.py); 35 built binaries checked, 0 not an
+      executable of their target. No lane ran: this host has no QEMU, no
+      WSL distribution, no ARM64 Windows and no Mac, and tier2.yml still
+      has no green run. Left, unchanged: the whole suite on each lane, a
+      green tier2.yml, and executing the Windows ARM64, FreeBSD, macOS x64
+      and RISC-V binaries. Still partly.
 - [~] PL4. WebAssembly with WASI (release F9) (L).
       Nov 22 audit: wasi_snapshot_preview1-only imports, _start export,
       task switching validated (task-switch-check.sh 3 passed); CI lane
@@ -3854,6 +3868,17 @@ Every platform gets a tier, and a tier means CI, not a hope.
       thumb_check.sh as its own step. Left: RISC-V no-OS boards (no
       emitter for a riscv64 `none` target), and a green bare-metal.yml
       run with the new step.
+      Nov 27 check (no QEMU on this host): enc-oracle-pl5.py 226 forms and
+      enc-oracle-op21.py 662 forms, 0 mismatches (release/fid-v27.exe, a
+      copy of the fid-dev of Nov 25); thumb_check.sh with its default
+      release/fid.exe of Nov 23: 3 passed, 1 failed — the interpreter run
+      of test_thumb_core and the shape of the two thumbv7m-none images of
+      mps2-an385 (test_thumb_core, thumb_exit) pass, and the failure is
+      "qemu-arm is not installed" (the no-OS images were checked, not run;
+      their execution was last verified Nov 22, 11 passed). No riscv
+      `none` target is in compiler/ at 7b32d1e9. Left, unchanged: the QEMU
+      legs here, RISC-V no-OS boards, a green bare-metal.yml run. Still
+      partly.
 - [~] PL6. Android and iOS (XL).
       Nov 22 audit: NOT done, and the entry understates what exists —
       stdlib/jni.fd, objc.fd, android_ndk.fd (+lifecycle/biometrics/
@@ -3866,6 +3891,11 @@ Every platform gets a tier, and a tier means CI, not a hope.
       (unverified on a device). Left: device testing, Android NDK/ABI
       quirks, and iOS entirely (needs the Mach-O backend + Apple syscall
       numbers + code signing).
+      Nov 27 check: unchanged, not done — no android or ios target string
+      exists in compiler/ at 7b32d1e9; what exists is the bridge logic
+      (stdlib/jni.fd, objc.fd, android_ndk.fd) with its interpreter tests
+      (test_std_jni, test_std_objc, test_std_android_ndk). Nothing is
+      linked for or run on a device. Still partly.
 - [~] PL7. Native backends for ELF and Mach-O, sharing one encoder (L).
       Nov 22 audit: the one-encoder claim is real — nat_enc.fd (13,289
       lines) holds nat_elf (:2712), nat_pe (:3501) and nat_macho (:8133,
@@ -3903,6 +3933,27 @@ Every platform gets a tier, and a tier means CI, not a hope.
       macos-native.yml run passes stage 1 (dump-c and C compile on both
       macOS jobs) and stops at stage 2 (the CB8 memory blocker). Left: no
       Mach-O binary has run on a Mac yet; the suite on each commit (PL2).
+      Nov 27 check (release/fid-v27.exe of Nov 25; clang 21 and the LLVM
+      tools are on this host now, so the image readers run for real):
+      scripts/image-check.sh over hello, test_closure, test_hashmap,
+      test_float, test_tasks and test_uefi_hello, every writer (elf, pe,
+      macho, obj, efi, coff) read by the readers installed here (only otool
+      is missing): 211 checks passed, 15 failed — all one defect in the
+      debug information, llvm-dwarfdump on the three Linux ELFs of five
+      programs: "DIE has DW_AT_decl_file with an invalid file index 0".
+      Index 0 is what ng_gen_function records for a function without a
+      source file (nat_ir.fd: g_nat_line_file_ix = 0 when ir_fn_src_file is
+      empty), written as decl_file for the ten generated ownership helpers
+      (__own_dup_N, __own_drop_N, __p_mem_dup/drop, __p_elem_dup/drop); the
+      Mach-O writer shares it (macho_dwarf_check.py on hello built with -g
+      for aarch64-macos: llvm-dwarfdump --verify fails on 10). The Mach-O
+      images are otherwise sound: macho_imports_check.py ok on
+      test_machine_ldyn_targets (atoi, hypot, ldexp bound through
+      libSystem), macho-check.py "well-formed Mach-O executable" for it and
+      for hello -g (page hashes verified). No Mach-O binary has run on a
+      Mac: macos-native.yml failed Nov 23, 24 and 25. Left: that decl_file
+      (index 1, or no attribute, for a generated function), running the
+      Mach-O output on a Mac, the suite on each commit (PL2). Still partly.
 
 **Acceptance:** Tier 1 passes the whole suite on each commit.
 
