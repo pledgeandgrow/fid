@@ -1,0 +1,44 @@
+# Modules
+
+- [ark](ark.md) (0 items)
+- [bare_qemu_test](bare_qemu_test.md) (0 items) -- tools/bare_qemu_test.fd — the bare-metal tests under QEMU: the Fides
+- [c2fd](c2fd.md) (0 items) -- tools/c2fd.fd -- C to Fid source translator (best effort).
+- [cas](cas.md) (0 items) -- tools/cas.fd — remote cache server for `.fidcache` (inc-roadmap A11).
+- [chaos](chaos.md) (0 items) -- tools/chaos.fd — chaos tests: the program must fail cleanly when the
+- [check_stdlib](check_stdlib.md) (0 items) -- tools/check_stdlib.fd — import every stdlib module on its own: a module
+- [compile_gate](compile_gate.md) (0 items) -- tools/compile_gate.fd — the compile-time gates of the own backend
+- [coverage](coverage.md) (0 items) -- tools/coverage.fd — block, function and line coverage of compiler/*.fd
+- [cov_instrument](cov_instrument.md) (0 items) -- tools/cov_instrument.fd — add block and line coverage counters to the
+- [cross_test](cross_test.md) (0 items) -- tools/cross_test.fd — run the test suite on another target: the Fides
+- [doctest](doctest.md) (0 items) -- tools/doctest.fd — extract `/// Example:` blocks from .fd sources and run
+- [enc_oracle](enc_oracle.md) (0 items) -- tools/enc_oracle.fd — our AArch64, RISC-V and x86-64 encoders against
+- [expect](expect.md) (0 items) -- tools/expect.fd — run Fides test files on every backend and check what
+- [fuzz_frontend](fuzz_frontend.md) (1 items) -- tools/fuzz_frontend.fd — coverage-guided fuzzing of the lexer, parser
+- [fuzz_gen](fuzz_gen.md) (2 items) -- tools/fuzz_gen.fd — random Fides programs, run on every backend and
+- [fuzz_lib](fuzz_lib.md) (61 items) -- tools/fuzz_lib.fd — what the ported fuzz drivers share (tools/fuzz_gen.fd,
+- [fuzz_nightly](fuzz_nightly.md) (0 items) -- tools/fuzz_nightly.fd — nightly fuzzing (release M9): the Fides port of
+- [fuzz_parsers](fuzz_parsers.md) (0 items) -- tools/fuzz_parsers.fd — fuzz the stdlib parsers (roadmap VF15): the
+- [fuzz_programs](fuzz_programs.md) (5 items) -- tools/fuzz_programs.fd — the random programs of
+- [fuzz_triage](fuzz_triage.md) (7 items) -- tools/fuzz_triage.fd — summarise the failures a fuzz run kept
+- [fuzz_vs_c](fuzz_vs_c.md) (9 items) -- tools/fuzz_vs_c.fd — random Fides programs, each with an equivalent C
+- [gen_brotli_dict](gen_brotli_dict.md) (0 items) -- tools/gen_brotli_dict.fd — stdlib/brotli_dict.fd from brotli's static
+- [interleave](interleave.md) (0 items) -- tools/interleave.fd — sharded interleaving tests: one program, many
+- [leak_check](leak_check.md) (0 items) -- tools/leak_check.fd — the ownership gate (proposal 0004). The Fides port
+- [macho_check](macho_check.md) (7 items) -- tools/macho_check.fd — structural check of a 64-bit Mach-O executable:
+- [me_measure](me_measure.md) (0 items) -- tools/me_measure.fd — what a mid-end change does (docs/roadmap/
+- [nat_gate](nat_gate.md) (0 items) -- tools/nat_gate.fd — the gate of the own backend (docs/roadmap/
+- [pass_matrix](pass_matrix.md) (0 items) -- tools/pass_matrix.fd — every optimization switch off in turn must give
+- [py_random](py_random.md) (10 items) -- tools/py_random.fd — Python's `random.Random(seed)` in Fides, so the
+- [reduce](reduce.md) (3 items) -- tools/reduce.fd — shrink a failing Fides program while it still fails
+- [release_checksums](release_checksums.md) (2 items) -- tools/release_checksums.fd — SHA-256 checksums of release files, to
+- [release_notes](release_notes.md) (3 items) -- tools/release_notes.fd — release notes from docs/reference/changelog.md
+- [rules_smt](rules_smt.md) (0 items) -- tools/rules_smt.fd — prove the rewrite rules of compiler/rules.fd with an
+- [sanitize](sanitize.md) (0 items) -- tools/sanitize.fd — the test programs through the C backend under the
+- [scribe](scribe.md) (0 items)
+- [site](site.md) (33 items) -- tools/site.fd — the project website, served by a Fides program (AD2).
+- [soak](soak.md) (0 items) -- tools/soak.fd — a service under load for a long time, with flat memory
+- [stale_cache_test](stale_cache_test.md) (0 items) -- tools/stale_cache_test.fd — CB8: the build cache must invalidate on
+- [target_test_lib](target_test_lib.md) (35 items) -- tools/target_test_lib.fd — what the target test runners share
+- [variants](variants.md) (0 items) -- tools/variants.fd — optimizer passes switched off one at a time (VF4) and
+- [veil](veil.md) (0 items) -- tools/veil.fd -- the standalone `veil` coverage tool (AD1, release N8):
+- [wasm_test](wasm_test.md) (0 items) -- tools/wasm_test.fd — run tests through the native WebAssembly backend:
