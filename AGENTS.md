@@ -50,6 +50,16 @@ RELEASE=1 CC="zig cc" ./scripts/bootstrap.sh
 #    at -O1 and -O0 with the same flags, and the last line says what was
 #    built ("(16 units at -O2)", or "(16 units: 10 at -O2, 6 below it:
 #    unit 1-O0 ...)"): read it before you time a build.
+#    scripts/build-units.sh (Nov 27 evening; sourced by this script and by
+#    bootstrap.sh) does that scheduling: under 24 GB of memory (a hosted
+#    runner) the units with a function over 500 KB of C are compiled one at
+#    a time, and on Linux each compile also gets a memory limit, so a unit
+#    over it fails and goes down the ladder instead of the runner dying
+#    ("The runner has received a shutdown signal", exit 143: every Linux
+#    and macOS job that builds fid, Nov 23 to 27). Windows and macOS get
+#    the order only. About 30 minutes a stage on a 16 GB runner.
+#    FID_BUILD_MEM_MB=<MB> assumes that memory (a 16 GB runner's path on a
+#    big machine); FID_HEAVY_KB, FID_UNIT_MEM_MB, FID_BUILD_TIGHT=1|0.
 #    STAGE0=release/fid.exe for the fast path: fid at -O2 runs ~17x faster;
 #    STAGE0 defaults to release/stage0/fid.exe — pinned Nov 21 to a
 #    self-hosted 1.0.0+dev, hash in scripts/stage0.sha256 — else fidesc,
