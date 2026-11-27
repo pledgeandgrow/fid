@@ -3093,6 +3093,12 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       (docs/verification/rl9-rl25-checks-2026-11-17.md).
       Left: a recorded run with every reader installed; loading (running)
       each image is cross-test.sh's part.
+      Nov 27 (night) (release/fid-night.exe, the build of 07:41): every
+      format, `scripts/image-check.sh`: 226 checks passed, 0 failed
+      (build/verify-nov27/image-check-night.log); the one reader not
+      installed is otool (macOS). The 15 failures recorded before
+      (DW_AT_decl_file 0 on generated functions, e52b278d) are gone.
+      Left: loading each image on its target (cross-test.sh), otool.
       Nov 25 (fid-dev of the day's tree): `FORMATS="pe coff efi"
       scripts/image-check.sh` — 33 checks passed, 0 failed: every PE
       image (pe_ir emit + --nat emit), the COFF object and the EFI app

@@ -155,7 +155,7 @@ machine is free of the two heavy runs; record the numbers.
 | 21 | SL17 | files, paths and processes on `run`, `ccompile`, `emit`, `--nat` (read the entry) | todo |
 | 22 | RA9 | the greedy allocator on the suite (read the entry) | todo |
 | 23 | WP7 | `SUITE=1 bash tests/tooling/wp-defaults-check.sh` (heavy) | todo |
-| 24 | RL9 | `FID=<bin> bash scripts/image-check.sh`: 211 pass, 15 fail on the debug-info defect below until it is fixed | waiting (row 30) |
+| 24 | RL9 | `FID=<bin> bash scripts/image-check.sh`: 211 pass, 15 fail on the debug-info defect below until it is fixed | done as far as this machine goes (Nov 27 08:26: 226 of 226 with release/fid-night.exe; RL9 stays `[~]` for loading on the targets and otool) |
 | 25 | TL6, RL25, RL1, RL3, VF2, VF1, VF18, VF6 | a recorded run each; read the entry, run what fits the budget | todo |
 
 ### E. In flight in another session — do not start
@@ -170,7 +170,7 @@ Take in this order as soon as `git status --porcelain -- <file>` is empty.
 
 | # | Goal | Files |
 |---|---|---|
-| 26 | DWARF: `DW_AT_decl_file` is 0 for generated functions (the 15 `image-check.sh` failures) | `compiler/nat_ir.fd` (`ng_gen_function`: `g_nat_line_file_ix = 0` for a function without a source file), `compiler/nat_enc.fd` | Status: fixed by another session in e52b278d (Nov 27 02:07): only confirm with release/fid-night.exe through scripts/image-check.sh |
+| 26 | DWARF: `DW_AT_decl_file` is 0 for generated functions (the 15 `image-check.sh` failures) | `compiler/nat_ir.fd` (`ng_gen_function`: `g_nat_line_file_ix = 0` for a function without a source file), `compiler/nat_enc.fd` | Status: done (the fix is another session's, e52b278d; confirmed Nov 27 08:26 with release/fid-night.exe: scripts/image-check.sh 226 of 226) |
 | 27 | BG201, BG202, BG240, BG242, BG235 | `compiler/typechecker.fd` | Status: BG201, BG202, BG240 and BG242 done (Nov 27 night; BG201 with the build of 07:41; marked in bugs-roadmap.md). BG235 not started |
 | 28 | BG203, BG228, BG230, BG241 | `compiler/lower.fd` |
 | 29 | BG209, BG210, BG211, BG257 | `compiler/lexer.fd`, `compiler/parser.fd` |
@@ -351,3 +351,7 @@ are the commit times.)
   function value; a unit test that imports compiler::disasm and
   compiler::nat_enc takes 537 s through `fid run` and 38 s through
   ccompile.
+- 08:27, rows 24 and 26: `FID=release/fid-night.exe bash
+  scripts/image-check.sh` on every format: 226 checks passed, 0 failed
+  (build/verify-nov27/image-check-night.log); otool is the one reader
+  not installed. RL9 keeps `[~]` for loading on the targets.
