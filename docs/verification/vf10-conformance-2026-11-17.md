@@ -118,6 +118,12 @@ both fail it (emit was not checked for each).
 | CF29 | `s13_3_vec_for_each`, `_fold`, `_any_all`, `_position`, `_find`, `_map`, `_filter` | the closure methods of `Vec` (§13.3) are missing: "Unknown function 'Vec_fold'" / undeclared in the C | all |
 | CF30 | `s13_3_vec_of_str` | `contains("a")` on a `Vec<str>` is false (compares addresses) | run |
 | CF31 | `s13_3_map_str_keys_print` | `println` of a `Vec<str>` prints addresses | all |
+| CF32 | `s11_annotation_on_param` | a `@public` parameter of a `@constant_time` function is taken for secret: "conditional branch on secret data" (the IR checks keep no `@public`: checks.fd, nat_ir's ng_ct_check) | ccompile, emit |
+| CF33 | `s2_1_main_needs_no_return` | `main` without a `return` exits 1073872504 | emit |
+| CF34 | `s4_10_capture_by_reference` | a closure capturing by reference: exit 1, no output | emit |
+| CF35 | `s4_10_closure_str` | a `str` a closure captures prints as an address | ccompile, emit |
+| CF36 | `s4_11_comptime_if_generic` | `comptime if` in a generic function prints nothing | emit |
+| CF37 | `s8_2_null_deref_panics` | a null dereference does not trap: exit 0 and a value printed | ccompile |
 | — | `s1_4_q4_names_variable`, `_q8_`, `s1_4_kw_handle_field_assign`, `s2_7_top_level_val_rejected` (message), `s4_1_call_result_called`, `_closure_called_inline`, `_vec_element_called` | fixed in the tree (stdlib-agent bugs 13, 36, 9, 38) | — |
 
 K1 (a keyword-named function called in an expression) is fixed: its two
@@ -149,3 +155,23 @@ tests follow the compiler and the reference should say:
   (`//@ backends:`).
 - §5.1 says nothing of a field of a `val` struct: the compiler lets it be
   assigned (`s5_1_val_field_assign.fd`, "It does not freeze the value").
+
+## Nov 27 (night): the whole suite on three backends
+
+With release/fid-v27.exe (the compiler of Nov 25) on run, ccompile and
+emit (10:06 to 10:48, `scripts/verify/expect.py`, then
+`scripts/verify/conf-known.py`): 1,607 of 1,617 files pass. The 15 gaps
+listed in tests/conformance/known-gaps.txt all pass and are taken out of
+it: s2_8_alias_vec (CF3), s2_9_alias_qualified_call (CF4),
+s2_9_version_pin_rejected (CF5), s2_9_use_in_body_does_nothing (CF6),
+s3_2_const_param_length (CF8), s8_1_array_copy and
+s8_1_array_pass_by_value (M5), s8_6_budget_vec_new_counted (CF22),
+s8_6_gpu_needs_budget (CF23), s11_no_alloc_concat_rejected,
+s11_derive_debug_str, s12_cfg_debug_removes_item, s12_cfg_all_must_hold,
+s12_cfg_riscv_arch_never (CF26) and s12_cfg_struct (CF27).
+
+Ten failures were not listed. Four are tests of the night's fixes and
+pass with the build of 09:17 (s2_8_alias_cycle_rejected,
+s4_2_bitwise_float_rejected, s4_2_str_order_rejected,
+s8_4_read_while_mut_borrowed_rejected). Six still fail with that build:
+CF32 to CF37 above (build/verify-nov27/vf10/).

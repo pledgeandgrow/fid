@@ -150,7 +150,8 @@ machine is free of the two heavy runs; record the numbers.
 
 | # | Goal | Gate | Status |
 |---|---|---|---|
-| 16 | VF10 | the conformance suite on every backend: `CC="zig cc" python scripts/verify/expect.py --fid release/fid-v27.exe --backends run,ccompile,emit tests/conformance`, then `python scripts/verify/conf-known.py --log <that output>` | todo |
+| 16 | VF10 | the conformance suite on every backend: `CC="zig cc" python scripts/verify/expect.py --fid release/fid-v27.exe --backends run,ccompile,emit tests/conformance`, then `python scripts/verify/conf-known.py --log <that output>` | run once (Nov 27 10:48: with release/fid-v27.exe 1,607 of 1,617 pass on run, ccompile, emit; the 15 listed gaps pass and are off the list; CF32 to CF37 filed; four tests of the night's fixes fail with that compiler only and pass with the build of 09:17) |
+| 48 | CF32 to CF37, found by the conformance run of Nov 27 | `@public` taken for secret by the compiled backends' constant-time check; `main` without `return` on emit; two closure captures (by reference; a str printed as an address); `comptime if` in a generic on emit; a null dereference that does not trap on ccompile | `compiler/checks.fd` and `compiler/nat_ir.fd` (CF32), `compiler/pe_ir*.fd`, `compiler/codegen_c.fd`, lowering (CF33 to CF37) | their six conformance tests pass on run, ccompile and emit | todo (docs/verification/vf10-conformance-2026-11-17.md) |
 | 17 | VF15 | `scripts/fuzz/fuzz_parsers.py` (read its header) | the tls target is run (Nov 27 09:38: 6,600 inputs over two seeds, 0 findings; the other eight parsers 125 each, 0); the entry stays `[~]` for long runs |
 | 18 | AD4 | `tools/doctest.fd` against `scripts/doctest.py` (read the entry) | todo |
 | 19 | TL10 | `tree-sitter generate` for `editors/tree-sitter-fides`, Zed (read the entry) | todo |
@@ -398,3 +399,22 @@ are the commit times.)
   findings in 7 minutes (600 with seed 27 before: 0); the other eight
   parsers with `-n 1000` (125 each): 0. About 850 inputs a minute
   through C. The entry stays `[~]` for its long runs.
+- 10:55, the end of the 09:39 run (76 minutes), no build. BG206 (a88c72b3,
+  marked 19362638): the Linux runtime's pert_str_to_float is exact: a
+  big-integer numerator and denominator and a division bit by bit;
+  tests/nattools/str_to_float_exact_check.sh: 2,000 doubles printed and
+  read back, 0 wrong (1,989 before), 1,107 texts as Python's float()
+  (751 differed before); the 15 float, f-string, decimal and JSON tests
+  pass on the native backend. BG253 (4067c378): tests/selfhost/
+  test_mono.fd passes on run, ccompile and emit. BG249: the cause is
+  located, the fix designed (row 46). BG207 needs a console (row 47,
+  deferred). VF10 (row 16): 1,607 of 1,617; CF32 to CF37 filed (row 48).
+  Trap of the run: a bignum remainder one limb past the denominator's
+  length, compared and subtracted over the denominator's limbs only,
+  made the division run for good; and I typed the repository's path
+  wrong five times in `cd` lines: an absolute path that fails leaves
+  the shell where it was, and the rest of the line runs there.
+  NEXT, IN THIS ORDER: (1) row 48 with row 27 to 36 (compiler bugs, one
+  build each; CF32 first: the IR checks keep no @public);
+  (2) row 46 (BG249, the runtime only); (3) section D rows 18 to 25;
+  (4) the WebAssembly list of PL4 when the machine is quiet.

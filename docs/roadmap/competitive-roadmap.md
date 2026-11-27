@@ -2282,6 +2282,16 @@ language lives.
       docs/verification/miscompile-log.md and vf10-conformance-2026-11-17.md.
       Left: run on every backend with the final compiler; fix the CF
       findings.
+      Nov 27 (night): the whole suite on run, ccompile and emit with
+      release/fid-v27.exe, then scripts/verify/conf-known.py: 1,607 of
+      1,617 pass; the 15 listed gaps pass and are out of
+      tests/conformance/known-gaps.txt. Ten failures were not listed:
+      four are tests of the night's fixes, right with the build of
+      09:17; six are new, CF32 to CF37 (docs/verification/
+      vf10-conformance-2026-11-17.md: `@public` taken for secret by the
+      compiled backends' constant-time check, a `main` without `return`
+      on emit, two closure captures, `comptime if` in a generic, a null
+      dereference on ccompile). Left: those six.
 - [~] VF11. A proof of the memory-safety claim on a small core calculus (XL).
       Nov 22 audit: the entry lags the tree — beyond the pen-and-paper
       calculus there is a machine-checked bounded model (scripts/verify/
