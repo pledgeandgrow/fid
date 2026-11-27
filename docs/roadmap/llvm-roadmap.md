@@ -377,6 +377,17 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       wsl.exe on PATH with no distribution. Left: the default switch (the
       loop 2.34x and the sieve 3.56x slower on `--nat`), the suites with
       winfregs/splitfloat. Still partly.
+      Nov 27 (day, evening): the whole suite on `--nat` Windows beside
+      pe_ir (2,056 programs, the -O2 build of 16:19): 38 fail on both (the
+      suite's own on these backends) and 7 on `--nat` only. Three need
+      bare-metal builtins the machine layer's Windows target lacks
+      (test_mmu, test_boot, test_bare_paging: "not available in native
+      Windows executables") and one a link to p_idt_set_entry
+      (test_os_gaps): BG251. In three the backends disagree and neither is
+      on the bugs roadmap: test_asm_pe (pe_ir exits 1, `--nat` 0),
+      test_shape (both exit 1, `--nat` prints nothing),
+      test_lib_audio_mixer (pe_ir exits 0 with its output, `--nat`
+      0xC000041D, an unhandled exception). Logs: build/llvm19/suite-on.raw.
 - [x] MI15. A Linux x86-64 target on MIR for free once x64 is ported: the ELF
       writer of `nat_enc.fd`, the Linux runtime, x64 selection (M).
       Nov 9: Linux x86-64 on the MIR (`fid emit --target x86_64-linux`): its own
@@ -1877,7 +1888,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       address-taken (`ConstFnRef`), `dyn` targets (`Type_method` reachable via
       DynCall), externs, C callbacks, runtime prefixes. Opt-in (`FID_IROPT_ON`)
       per the earlier miscompile note.
-- [~] WP14. Function specialization: a hot function cloned for a constant argument
+- [x] WP14. Function specialization: a hot function cloned for a constant argument
       (M).
       `iro_specialize` + `iro_clone_function` (`compiler/iropt.fd`): params
       constant at some but not all call sites get a clone per observed
@@ -1919,6 +1930,17 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       running when this was written (17:15); its verdicts are in
       build/llvm19/suite-on.raw and suite-off.raw, and the comparison of
       the two in the run log of docs/roadmap/goal-workflow.md.
+      Nov 27 (day, evening): done. The whole of tests/bootstrap (2,056
+      programs) with the -O2 build of 16:19: 2,011 pass on emit and `--nat`
+      together. With specialization and versioning off
+      (FID_IROPT_OFF=spec,version) on emit 2,018 pass, and no file fails
+      with them on that passes with them off: the 7 the default run fails
+      and that one does not fail on `--nat` only (MI14's note of this
+      evening). The 38 every run fails are the suite's own on these
+      backends (13 do not compile, 8 PE generation errors, the rest output
+      and exit differences: bare-metal and boot programs, tests that need
+      SDL2 or a header). Hotness is in, the clones are on by default, the
+      full suite is run.
 - [x] WP15. Dead function and dead global elimination after optimization, not only
       before (S).
       `iropt_native` calls `IrModule_dead_function_elimination` after the pass
@@ -2341,7 +2363,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       afternoon (BG203, BG228, BG230, BG241). Left as written: the
       data-dependent and unbounded producers, Vec::new()+push buffers, the
       suite legs.
-- [~] LF14. Scalar replacement of a non-escaping `Vec` of known small length (M).
+- [x] LF14. Scalar replacement of a non-escaping `Vec` of known small length (M).
       Nov 16: built and tested (test_midend_vec_sroa.fd, `fid run` and
       `fid emit` with FID_IROPT_ON=vecsroa and without): iropt.fd `iro_vec_sroa` (run by
       `iro_vec_locals` before inlining; opt-in, FID_IROPT_ON=vecsroa). A Vec
@@ -2381,6 +2403,10 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       on emit with FID_IROPT_ON=vecsroa, judged against the default run),
       not finished when this was written (17:15);
       build/llvm19/suite-vec.raw.
+      Nov 27 (day, evening): done. The suite leg with the pass on: with
+      FID_IROPT_ON=vecsroa the whole of tests/bootstrap on emit gives the
+      same 2,018 pass and 38 fail as with every pass off. The pass stays
+      opt-in.
 - [x] LF15. Reference counts removed where ownership is known (proposal 0004): no
       `Vec_share` / drop pairs on values that are moved (M). Moves on last use
       (Nov 7), and in one block: Str and Box count/drop pairs, a Vec or map
@@ -2408,7 +2434,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       through `run` (the check's `--leaks` leg segfaults on the
       fidesc-built binary class, hello included — pre-existing, 2g.79).
       Nov 22 code audit: lw_rc_cancel_pairs runs unconditionally in lowering (lower.fd:4200); the str-copy cancellation is at target (tests/rc_cancel/check.sh). The --leaks residue is the 2g.79 binary-class issue, not this feature.
-- [~] LF16. Copy-on-write checks removed where a value has one owner provably (M).
+- [x] LF16. Copy-on-write checks removed where a value has one owner provably (M).
       Low gain now: the C and native fast paths test the capacity's sign once.
       Nov 16: built and tested (test_midend_sole_owner.fd, `fid emit` with
       FID_IROPT_ON=soleown and without), for the native paths: iropt.fd
@@ -2429,6 +2455,11 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       tests/bootstrap on emit, judged against the default run (a file it
       fails that the default run passes is a bug of the pass). Not finished
       when this was written (17:15); build/llvm19/suite-sole.raw.
+      Nov 27 (day, evening): done. A build (the -O2 build of 16:19) and the
+      suite on and off: with FID_IROPT_ON=soleown the whole of
+      tests/bootstrap on emit gives the same 2,018 pass and 38 fail as with
+      every pass off, and no file fails that the default run passes. The
+      pass stays opt-in, as the entry says it should (low gain).
 - [x] LF17. Drops of values known to be empty or static removed (S). String
       literals, and string variables only ever assigned literals
       (`LOWER_LITERAL_SLOTS`); an empty Vec still frees its header.
