@@ -51,7 +51,25 @@ jobs:
           ./build/seed-x64 version
       - name: Cross-compile fid for ${{ matrix.target }}
         run: |
-          ./build/seed-x64 ccompile compiler/main.fd --target ${{ matrix.target }} -o release/fid-dev
+          # zig shim: the pinned seed emits time.h deep in the runtime, after
+          # user extern calls (fixed in the tree, but the seed is frozen);
+          # linux headers tolerate it, macOS errors. Force-include time.h in
+          # every compile (-c); link commands pass through untouched.
+          mkdir -p build/shim
+          ZIGBIN=$(command -v zig)
+          {
+            echo '#!/bin/bash'
+            echo 'case " $* " in'
+            echo '  *" -c "*) exec ZZ "$@" -include time.h ;;'
+            echo '  *) exec ZZ "$@" ;;'
+            echo 'esac'
+          } > build/shim/zig
+          sed -i "s|ZZ|$ZIGBIN|g" build/shim/zig
+          chmod +x build/shim/zig
+          export PATH="$PWD/build/shim:$PATH"
+          # --inc: one translation unit per module (the pinned seed's
+          # monolith compile of the tree needs >16GB; units do not)
+          ./build/seed-x64 ccompile compiler/main.fd --inc --target ${{ matrix.target }} -o release/fid-dev
       - name: Smoke test (qemu - real execution)
         if: matrix.emu == 'qemu'
         run: |
