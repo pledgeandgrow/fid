@@ -39983,6 +39983,9 @@ fn nc_may_rr(g: &NatGen, m: &IrModule, name: str) -> bool {
 //     head it moves only by a multiple of the loop alignment;
 //   - a function with no slot, or one it outgrew, stays after the reserved
 //     code (its old slot stays zeros, never executed).
+// A function of the kept layout that a build does not place (inlined away,
+// left unreachable) keeps its slot in the layout it stages (nl_loop_end):
+// the next build that has it again puts it back there.
 // Every fixup is registered again and NatEnc_resolve patches them as in a
 // fresh build: only the references are redone, the unchanged functions'
 // bytes stay where they were. The panic-trace table, the symbols, the line
@@ -40471,14 +40474,51 @@ fn nl_loop_end(g: &mut NatGen, par_on: bool) {
         j = j + 1;
     }
     var sord: Vec<i64> = nl_order(&skeys);
+    var pn: Vec<str> = Vec::new();
+    var ps: Vec<i64> = Vec::new();
+    var in_image: i64 = HashMap_new();
     j = 0;
     while j < sord.len() {
         var at: i64 = skeys.get(sord.get(j));
         if at >= pos0 && at < end {
-            names.push(g.placed_fns.get(sord.get(j)));
-            starts.push(at);
+            pn.push(g.placed_fns.get(sord.get(j)));
+            ps.push(at);
         }
         j = j + 1;
+    }
+    j = 0;
+    while j < g.placed_fns.len() {
+        HashMap_insert(in_image, g.placed_fns.get(j), 1);
+        j = j + 1;
+    }
+    // the kept layout's functions this build did not place (it is in
+    // address order too, and inside the reserved code)
+    var absent: Vec<str> = Vec::new();
+    var absent_at: Vec<i64> = Vec::new();
+    if g_nl_use && g_nl_ix != 0 {
+        j = 0;
+        while j < g_nl_names.len() {
+            var kn: str = g_nl_names.get(j);
+            if !HashMap_contains(in_image, kn) {
+                absent.push(kn);
+                absent_at.push(g_nl_starts.get(j));
+            }
+            j = j + 1;
+        }
+    }
+    HashMap_drop(in_image);
+    var a: i64 = 0;
+    var b: i64 = 0;
+    while a < pn.len() || b < absent.len() {
+        if b < absent.len() && (a >= pn.len() || absent_at.get(b) < ps.get(a)) {
+            names.push(absent.get(b));
+            starts.push(absent_at.get(b));
+            b = b + 1;
+        } else {
+            names.push(pn.get(a));
+            starts.push(ps.get(a));
+            a = a + 1;
+        }
     }
     var sizes: Vec<i64> = Vec::new();
     j = 0;

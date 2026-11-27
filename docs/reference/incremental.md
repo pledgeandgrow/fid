@@ -461,7 +461,13 @@ fixups then resolve keeps (`nl_commit`):
   primitives, is that long) and end;
 - per placed function its start and its slot: from its start to the next
   function's start (the last one's to the end of the functions), so the
-  alignment padding and any gap after it belong to it.
+  alignment padding and any gap after it belong to it;
+- the slot of a function of the layout before that this build does not
+  place (an edit's smaller version was inlined away, or nothing reaches it
+  any more): it stays the zeros it left. Before Nov 27 the function in
+  front of it got that room, and a later build that had the function again
+  (the edit undone) had to place it after the code
+  (tests/nattools/relink_check.sh, third build).
 
 ### What the next build does with it
 
@@ -476,6 +482,7 @@ the usual order:
 | a cache hit whose bytes fit its slot | its recorded bytes replayed at its old offset (`nc_replay(g, e, at)`), its fixups registered against that offset |
 | compiled again, fits its slot | emitted after the reserved code as in any build, then moved into its slot (`nl_move`: bytes, the labels placed in it, its fixups, line and frame rows); on x86-64 a function with a padded loop head (MI30) moves only by a multiple of 16, else it stays after the code |
 | no slot (new), or outgrew it | after the reserved code, as in a fresh build; its old slot stays zeros (never executed) |
+| in the layout, not in the image of the build before | its slot is still there: a hit is replayed into it, and one compiled again moves into it when it fits |
 | folded onto identical code | as before: its label points at that code |
 
 Every fixup is then resolved by `NatEnc_resolve` as in a fresh build: a call

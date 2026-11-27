@@ -2333,6 +2333,17 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       tail-read) all convert 0 — one instrumented run (trace the
       rejection point in iro_vec_sroa_one) finishes it. Left: that, the
       build/suite legs.
+      Nov 27 (day): the instrumented run the entry asks for needed no
+      rebuild (FID_VSROA_DBG=1 was there). With the -O2 builds of 11:30 and
+      15:52 the two tests convert what they have: 4 Vecs in the first, all
+      5 in the dominated-reads test (branch, len, set, loop, the same-block
+      sibling); the rejections the debug line shows are stdlib functions'.
+      The line names its function and the failing terms now (iropt.fd).
+      Right with the pass off and on, on pe_ir and `--nat`. Left: a suite
+      run with the pass on (
+      not run on Nov 27 (the suite legs waited for a machine with room for
+      them)
+      ).
 - [x] LF15. Reference counts removed where ownership is known (proposal 0004): no
       `Vec_share` / drop pairs on values that are moved (M). Moves on last use
       (Nov 7), and in one block: Str and Box count/drop pairs, a Vec or map
@@ -2671,7 +2682,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       key needs the replay to rebase the line rows and the panic lines),
       and the order of MI28's summary asks is not fixed (the tail check
       shows no difference).
-- [~] SP7. Incremental relinking in memory: unchanged functions keep their bytes,
+- [x] SP7. Incremental relinking in memory: unchanged functions keep their bytes,
       only relocations are redone (M).
       On an FID_FNCACHE hit a function's bytes are replayed at the new
       offset and its fixups registered again (CS6). Left: in memory across
@@ -2699,6 +2710,26 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       one process keeps all 276 common functions in place (fresh: 154 move);
       relink_check still fails on aarch64 and --nat Windows: one changed
       function is placed after the others (want 0). Images not run (no Linux).
+      Nov 27 (day): done on a built compiler (the -O2 build of 15:52,
+      release/fid-night.exe since). relink_check.sh gave `fid serve` a Git
+      Bash path on its stdin, where no shell converts it, so every request
+      said "could not read file": fixed (cygpath -m). Then the build of
+      11:30 showed one failure on all three targets: the third build (C, A
+      with another string) placed one function after the code. The cause:
+      B's small rl_shrink is inlined away, so B's layout has no slot for
+      it, and C's rl_shrink (A's, compiled again because the key has the
+      lines) found none. compiler/nat_ir.fd nl_loop_end keeps the slot of a
+      function of the kept layout that a build does not place
+      (docs/reference/incremental.md). relink_check.sh:
+      21 ok, 0 fail: edit B puts 274 functions back and compiles 2 into
+      their places, rl_grow after them; C and A again put everything into
+      its places (274 and 3 on x86-64 and AArch64, 342 and 8 on `--nat`
+      Windows); every unchanged function keeps its address (276 common, 0
+      moved; a fresh build moves 154); the Windows images run as fresh
+      builds; FID_NAT_OFF=relink lays out afresh.
+      . Relinking
+      is asked for (`fid serve --relink`, FID_NAT_ON=relink): the one-shot
+      image of SP8 is laid out afresh.
 - [~] SP8. A one-line edit rebuilds in under 100 ms (with SP4–SP7) (L).
       ~0.5 s on hello with every cache warm (CS6, Nov 13).
       Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
