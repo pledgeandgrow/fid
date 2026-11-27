@@ -151,8 +151,8 @@ holds, with its gate green on a built compiler.
 | L8 | WP6 | `compiler/nat_ir.fd` (AArch64's pool) | verified: 23 ok, 1 leg (x0-x7 are no pool registers there: MI's grade); the native suite |
 | L9 | SP9 | `compiler/parser.fd`, `lexer.fd`, `compiler.fd` (the other session's) | running: the four checks and the bench with the -O2 build of 16:19 (the job of 16:36); then: on by default, step 3 (type check in parallel) |
 | L10 | RA1 | `tests/nattools/ra1_pe_ra_off_check.sh` | running: the gate (137 programs, the job of 16:36); left after it: deleting pe_ir's allocator, which waits for MI17 and the Windows default |
-| L11 | LF11 | `tests/tooling/version-default-check.sh` | running: the gate (the job of 16:36) and the suite legs `on` against `off` (the jobs of 16:41) |
-| L12 | WP14, LF16 | whole-suite legs | running: four legs side by side since 16:41 (`on`, `off`, `sole`, `vec`); the first record of a whole-suite run on emit and `--nat` |
+| L11 | LF11 | `tests/tooling/version-default-check.sh` | running: the gate (the job of 16:36); the suite legs `on` against `off` finished ~18:02 (604/10 against 1122/18, run log) |
+| L12 | WP14, LF16 | whole-suite legs | done ~18:02: `on` 604/10, `off` 1122/18, `sole` 816/137, `vec` 815/133 (emit and `--nat`; build/llvm19/suite-*.raw) — the first record of a whole-suite run on emit and `--nat` |
 | L13 | MI5, MI17 | `compiler/pe_ir*.fd`, `nat_ir.fd` | waiting: BG248, BG249, BG251 (the other session's), then `tests/nattools/mi5_nat_peir_check.sh` again; the default switch is MI14's |
 | L14 | MI9, TG16, LF13, LF21 | MI9: SRA of local structs (`nat_ir.fd`); TG16: the port onto MIR (the other session builds tg16-fid-v5); LF13: the other producers, `Vec::new()`+push buffers (`lower.fd`); LF21: the region arena in the Linux runtime | waiting on the other session, or multi-week |
 
@@ -505,3 +505,10 @@ are the commit times.)
   them (above). Left for another session or another day: MI5,
   MI17 (BG248, BG249, BG251), MI9, TG11's reductions, TG16, WP6's
   AArch64 pool, LF13, LF21, SP16's 2g.114, MI14's default switch.
+- ~18:02, the four suite legs of 16:38 finished (2056 files each,
+  release/fid-night.exe, backends emit and nat; build/llvm19/suite-*.raw):
+  `on` 604 ok / 10 fail, `off` 1122 ok / 18 fail, `sole` 816 ok / 137
+  fail, `vec` 815 ok / 133 fail. RA1's gate (ra1_pe_ra_off_check.sh, 137
+  programs, the job of 16:36) was still running, ra1.log empty; the
+  doc-accuracy session recorded this, the gates' verdicts are for the
+  queue's owner.

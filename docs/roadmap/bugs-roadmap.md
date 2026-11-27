@@ -3361,7 +3361,7 @@ the repo. Function names are the reference; line numbers move.
       (0xF000), should be 61444 (0xF004), and `j1939_is_pdu1` says true;
       `j1939_pgn(0x18EA17F9)` (Request to address 0x17) -> 59927 (0xEA17),
       should be 59904 (0xEA00). Confirmed Nov 27 (fid run). Confidence: high.
-- [ ] BG284. **Every `RELEASE=1 scripts/bootstrap.sh` build is reported stale
+- [x] BG284. **Every `RELEASE=1 scripts/bootstrap.sh` build is reported stale
       by release-fresh.sh, so release.yml's check and build-installer.sh
       always refuse it.** scripts/bootstrap.sh (RELEASE block: `bash
       scripts/build-info.sh` + `trap 'bash scripts/build-info.sh --reset'
@@ -3386,6 +3386,11 @@ the repo. Function names are the reference; line numbers move.
       scripts/release-fresh.sh release/fid.exe` -> "release/fid.exe is stale
       ...", exit 1. Confirmed Nov 27 (the script sequence run on a copy of the
       tree; a real 3-stage bootstrap not run). Confidence: high.
+      Fixed Nov 27 (scripts/release-fresh.sh source_hash leaves out
+      compiler/build_info.fd, as build-info.sh's own hash does, and the
+      `+changes` mark ignores it): the same sequence on a copy of the tree
+      now says "is the release build of this source", exit 0, and an edit to
+      stdlib/core.fd still makes it stale, exit 1.
 - [ ] BG285. **`ark install` runs shell commands written into an ark.toml (or
       ark.lock) field: git branch/tag, commit and URL go to p_system
       unescaped.** compiler/ark.fd ark_install_git_at (`cmd + " --branch " +
@@ -4471,7 +4476,7 @@ the repo. Function names are the reference; line numbers move.
       formatted", exit 0, line 2 reindented. Confirmed Nov 27 for the CLI (fb4
       fid.exe); the LSP part Read only (handle_formatting code). Confidence:
       high.
-- [ ] BG365. **release.yml's Linux archive is built without FIDES_VERSION, so
+- [x] BG365. **release.yml's Linux archive is built without FIDES_VERSION, so
       a manual (workflow_dispatch) release names a different version than its
       Windows installer.** .github/workflows/release.yml job `linux`, step
       "Release bootstrap, 3 stages, fixpoint checked (A10)" (env has CC and
@@ -4485,6 +4490,9 @@ the repo. Function names are the reference; line numbers move.
       together by the publish job. Trigger: compare the env blocks of the two
       "Release bootstrap" steps in release.yml (windows: FIDES_VERSION set;
       linux: none). Read only. Confidence: high.
+      Fixed Nov 27 (release.yml: the linux job has the windows job's
+      Version step and passes FIDES_VERSION to bootstrap.sh). Not run: the
+      workflow runs only on a v* tag or a manual dispatch.
 - [ ] BG366. **The installer lets the user untick "Standard Library" (fid then
       cannot build anything) and an update over an older install keeps the
       stdlib modules the new release removed.** installer/fides.nsi Section
