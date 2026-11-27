@@ -355,3 +355,8 @@ are the commit times.)
   scripts/image-check.sh` on every format: 226 checks passed, 0 failed
   (build/verify-nov27/image-check-night.log); otool is the one reader
   not installed. RL9 keeps `[~]` for loading on the targets.
+- 08:29: `FID=release/fid-night.exe bash scripts/disasm-check.sh` (x86-64,
+  AArch64 and RISC-V 64 against llvm-objdump, with the round trip): 18 ok,
+  0 failed in 33 s (build/verify-nov27/disasm-check-night.log); AArch64
+  leaves 8 words undecoded in test_machine_fast where LLVM decodes 2,957:
+  the rows of BG232.
