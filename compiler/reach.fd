@@ -77,6 +77,16 @@ pub fn reach_keep_set(program: Program, core_names: Vec<str>) -> i64 {
         }
         ti = ti + 1;
     }
+    // BG183: the traits' method names (rc_dyn_instance)
+    var tri: i64 = 0;
+    while tri < program.traits.len() {
+        var trm: i64 = 0;
+        while trm < program.traits.get(tri).methods.len() {
+            rc_name(names, "#tm:" + program.traits.get(tri).methods.get(trm).name);
+            trm = trm + 1;
+        }
+        tri = tri + 1;
+    }
     // Globals' and constants' initializers may name functions too
     var gi: i64 = 0;
     while gi < program.globals.len() {
@@ -104,7 +114,7 @@ pub fn reach_keep_set(program: Program, core_names: Vec<str>) -> i64 {
         while fi < program.funcs.len() {
             var f2: Func = program.funcs.get(fi);
             var k2: str = "fn:" + f2.name;
-            if !HashMap_contains(keep, k2) && HashMap_contains(names, f2.name) {
+            if !HashMap_contains(keep, k2) && (HashMap_contains(names, f2.name) || rc_dyn_instance(f2.name, names)) {
                 HashMap_insert(keep, k2, 1);
                 todo.push(0);
                 todo.push(fi);
@@ -146,6 +156,26 @@ fn rc_root(f: Func, in_core: bool) -> bool {
         return true;
     }
     return str_starts_with(n, "p_") || str_starts_with(n, "pe_") || str_starts_with(n, "pert_") || str_starts_with(n, "ped_") || str_starts_with(n, "pet_") || str_starts_with(n, "nat_") || str_starts_with(n, "__");
+}
+
+/// BG183: a generic impl method's instance (`Slot__show__i64`, mono.fd
+/// mangle_method) of a trait method, when the program casts to `dyn`: a
+/// dyn value's forwarders (lower.fd Lowerer_dyn_forwarder, one for every
+/// method of the trait) call it though no body names it.
+fn rc_dyn_instance(n: str, names: i64) -> bool {
+    if !HashMap_contains(names, "#dyn") {
+        return false;
+    }
+    val a: i64 = str_find(n, "__");
+    if a <= 0 {
+        return false;
+    }
+    val rest: str = str_slice(n, a + 2, str_len(n));
+    val b: i64 = str_find(rest, "__");
+    if b <= 0 {
+        return false;
+    }
+    return HashMap_contains(names, "#tm:" + str_slice(rest, 0, b));
 }
 
 fn rc_name(names: i64, n: str) {
@@ -484,7 +514,16 @@ fn rc_collect_expr(expr: Expr, names: i64) {
                 cp = cp + 1;
             }
         }
-        Expr::Cast(e, _) => {
+        Expr::Cast(e, ct) => {
+            // BG183: a cast to `dyn` dispatches to methods no body names
+            // (a generic impl's instances, rc_dyn_instance)
+            match ct {
+                Type::Dyn(_) => {
+                    rc_name(names, "#dyn");
+                }
+                _ => {
+                }
+            }
             rc_collect_expr(box_expr_unbox(e), names);
         }
         Expr::Comptime(e) => {

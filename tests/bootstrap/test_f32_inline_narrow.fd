@@ -1,0 +1,54 @@
+// Bugs roadmap BG165: lowering leaves a float literal an f64 ConstFloat
+// where an f32 parameter or result wants it (`takes(1.5)`, `return 2.5;`
+// from an f32 function). A call that is not inlined narrows it in the
+// backend; an inlined one substituted the f64 for the f32 parameter and
+// moved an f64 result into the f32 call, and the f32 operations of the
+// copied body (`x as f64`, `x * k`) read the double's low 32 bits on the
+// machine layer (`--nat`: 0, and 3 for 9.5). Both inliners (iropt.fd
+// iro_inline_function, iropt_me.fd ime_inline_site) now convert through
+// IR's float BitCast.
+// test_f32_inline2_narrow.fd is this program with inline2 alone.
+//
+// Expected output:
+// 1.5
+// 2.5
+// 0.75
+// 0.375
+// 9.5
+// 6
+// 0.25
+fn takes(x: f32) -> f64 {
+    return x as f64;
+}
+
+fn mk() -> f32 {
+    return 2.5;
+}
+
+fn id(x: f32) -> f32 {
+    return x;
+}
+
+fn eighths() -> f32 {
+    return 0.375;
+}
+
+fn sum3(a: f32, b: i64, c: f32) -> f64 {
+    return (a as f64) + (b as f64) + (c as f64);
+}
+
+fn scale(x: f32, k: f32) -> f32 {
+    return x * k;
+}
+
+fn main() -> i64 {
+    println(takes(1.5));
+    println(mk() as f64);
+    println(id(0.75) as f64);
+    println(eighths() as f64);
+    println(sum3(1.5, 3, 5.0));
+    println(scale(1.5, 4.0) as f64);
+    val v: f32 = id(0.25);
+    println(v);
+    return 0;
+}

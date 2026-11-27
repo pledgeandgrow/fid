@@ -30,6 +30,15 @@ build (the runtime merged into the library, the `@cfg` target, `--debug`,
 `--time`) is put back as a new process has it
 (`compiler.fd serve_reset_build_state`).
 
+Between build requests the server keeps the machine layer's
+per-function code (nat_ir.fd CS6, docs/reference/native-fncache.md) and
+the lowered IR (ir_ser.fd, `FID_SERVE_IRCACHE=0`: not) in memory, so an
+edited program's image is the one a one-shot `fid emit` writes, with only
+what the edit reached compiled again. `fid serve --relink` also puts each
+unchanged function back where the last build placed it (SP7, nat_ir.fd
+`nl_*`; `FID_NAT_ON=relink` does the same): such an image runs the same
+but is not the one-shot build's.
+
 ## On a TCP port: shared with `fid check` and the LSP
 
 ```

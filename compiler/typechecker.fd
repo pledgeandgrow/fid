@@ -3496,6 +3496,7 @@ pub fn TypeChecker_check_annotation_validity(self: &mut TypeChecker, program: Pr
     while i < program.funcs.len() {
         check_fn_annotations_fd(self, program.funcs.get(i));
         check_async_annotations_fd(self, program.funcs.get(i));
+        TypeChecker_check_async_arity(self, program.funcs.get(i));
         i = i + 1;
     }
     i = 0;
@@ -3504,6 +3505,7 @@ pub fn TypeChecker_check_annotation_validity(self: &mut TypeChecker, program: Pr
         var mi: i64 = 0;
         while mi < impl_.methods.len() {
             check_fn_annotations_fd(self, impl_.methods.get(mi));
+            TypeChecker_check_async_arity(self, impl_.methods.get(mi));
             mi = mi + 1;
         }
         i = i + 1;
@@ -3514,6 +3516,7 @@ pub fn TypeChecker_check_annotation_validity(self: &mut TypeChecker, program: Pr
         var tmi: i64 = 0;
         while tmi < ti.methods.len() {
             check_fn_annotations_fd(self, ti.methods.get(tmi));
+            TypeChecker_check_async_arity(self, ti.methods.get(tmi));
             tmi = tmi + 1;
         }
         i = i + 1;
@@ -21026,6 +21029,7 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
                     TypeChecker_check_stmt(self, branch.get(si));
                     si = si + 1;
                 }
+                TypeChecker_check_par_branch_arity(self, branch);
                 TypeChecker_pop_scope(self);
                 g_tc_par_writer = par_saved;
                 bi = bi + 1;
@@ -22956,8 +22960,11 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
         Expr::Spawn(inner) => {
             var inner_ty: Type = TypeChecker_check_expr(self, box_expr_unbox(inner));
             match box_expr_unbox(inner) {
-                Expr::Call(spawned, _) => {
+                Expr::Call(spawned, spawned_args) => {
                     self.thread_entries.push(spawned);
+                    // BG159: a thread or task started by name keeps at most
+                    // 8 arguments in its block, on every compiled backend
+                    TypeChecker_check_task_arity(self, "`spawn " + spawned + "(...)` passes", spawned, spawned_args.len());
                 }
                 _ => {
                 }
@@ -26055,8 +26062,10 @@ pub fn TypeChecker_pattern_binding_types(self: &TypeChecker, match_ty: Type, enu
 // being scanned (parameters, then `var`/`val` as they come), and the method
 // names some impl of the program defines (`x.push(..)` on a value of unknown
 // type is a Vec push unless a user type has a `push` of its own).
-var g_tc_eff_strs: Vec<str> = Vec::new();
-var g_tc_eff_colls: Vec<str> = Vec::new();
+// SP12: sets (HashMaps name -> 1, 0 when empty): a list scanned per
+// identifier made the scan of a long function quadratic
+var g_tc_eff_strs: i64 = 0;
+var g_tc_eff_colls: i64 = 0;
 var g_tc_eff_mnames: i64 = 0;
 // BG151: whether `n` names a function (of the program, core or a builtin).
 fn TypeChecker_tc_is_fn_name(self: &TypeChecker, n: str) -> bool {
@@ -26101,19 +26110,41 @@ fn tc_eff_type_kind(t: Type) -> i64 {
     return 0;
 }
 
-fn tc_eff_note(name: str, kind: i64) {
-    if kind == 1 && !tc_str_vec_contains(g_tc_eff_strs, name) {
-        g_tc_eff_strs.push(name);
+/// SP12: whether set `set` (g_tc_eff_strs / g_tc_eff_colls) holds `name`.
+fn tc_eff_has(set: i64, name: str) -> bool {
+    return set != 0 && HashMap_get(set, name) != 0;
+}
+
+/// SP12: the two sets emptied.
+fn tc_eff_clear_sets() {
+    if g_tc_eff_strs != 0 {
+        HashMap_drop(g_tc_eff_strs);
+        g_tc_eff_strs = 0;
     }
-    if kind == 2 && !tc_str_vec_contains(g_tc_eff_colls, name) {
-        g_tc_eff_colls.push(name);
+    if g_tc_eff_colls != 0 {
+        HashMap_drop(g_tc_eff_colls);
+        g_tc_eff_colls = 0;
+    }
+}
+
+fn tc_eff_note(name: str, kind: i64) {
+    if kind == 1 && !tc_eff_has(g_tc_eff_strs, name) {
+        if g_tc_eff_strs == 0 {
+            g_tc_eff_strs = HashMap_new();
+        }
+        HashMap_insert(g_tc_eff_strs, name, 1);
+    }
+    if kind == 2 && !tc_eff_has(g_tc_eff_colls, name) {
+        if g_tc_eff_colls == 0 {
+            g_tc_eff_colls = HashMap_new();
+        }
+        HashMap_insert(g_tc_eff_colls, name, 1);
     }
 }
 
 // Start scanning a function: its parameters' kinds.
 fn tc_eff_begin(params: Vec<Param>) {
-    g_tc_eff_strs = Vec::new();
-    g_tc_eff_colls = Vec::new();
+    tc_eff_clear_sets();
     g_tc_eff_fvars = Vec::new();
     g_tc_eff_finits = Vec::new();
     var i: i64 = 0;
@@ -26124,8 +26155,7 @@ fn tc_eff_begin(params: Vec<Param>) {
 }
 
 fn tc_eff_end() {
-    g_tc_eff_strs = Vec::new();
-    g_tc_eff_colls = Vec::new();
+    tc_eff_clear_sets();
     g_tc_eff_fvars = Vec::new();
     g_tc_eff_finits = Vec::new();
 }
@@ -26162,10 +26192,10 @@ fn tc_eff_expr_kind(e: Expr) -> i64 {
             return 1;
         }
         Expr::Ident(n) => {
-            if tc_str_vec_contains(g_tc_eff_strs, n) {
+            if tc_eff_has(g_tc_eff_strs, n) {
                 return 1;
             }
-            if tc_str_vec_contains(g_tc_eff_colls, n) {
+            if tc_eff_has(g_tc_eff_colls, n) {
                 return 2;
             }
         }
@@ -26178,7 +26208,7 @@ fn tc_eff_expr_kind(e: Expr) -> i64 {
             var mrecv: Expr = box_expr_unbox(recv);
             match mrecv {
                 Expr::Ident(t) => {
-                    if (t == "Vec" || t == "HashMap") && !tc_str_vec_contains(g_tc_eff_strs, t) && !tc_str_vec_contains(g_tc_eff_colls, t) {
+                    if (t == "Vec" || t == "HashMap") && !tc_eff_has(g_tc_eff_strs, t) && !tc_eff_has(g_tc_eff_colls, t) {
                         return 2;
                     }
                 }
@@ -26210,7 +26240,7 @@ fn tc_eff_expr_kind(e: Expr) -> i64 {
 fn tc_eff_method_allocs(recv: Expr, method: str) -> bool {
     match recv {
         Expr::Ident(t) => {
-            if (t == "Vec" || t == "HashMap" || t == "Box") && !tc_str_vec_contains(g_tc_eff_strs, t) && !tc_str_vec_contains(g_tc_eff_colls, t) {
+            if (t == "Vec" || t == "HashMap" || t == "Box") && !tc_eff_has(g_tc_eff_strs, t) && !tc_eff_has(g_tc_eff_colls, t) {
                 return method == "new" || method == "with_capacity" || method == "filled" || method == "from" || method == "new_sized" || method == "new_typed" || method == "clone";
             }
         }
@@ -26275,7 +26305,7 @@ pub fn TypeChecker_scan_stmt_for_effects(self: &TypeChecker, stmt: Stmt, effects
             // 2g.65: `s += t` on a string builds a new string
             match as_op {
                 AssignOp::AddAssign => {
-                    if tc_str_vec_contains(g_tc_eff_strs, as_name) || tc_eff_expr_kind(expr) == 1 {
+                    if tc_eff_has(g_tc_eff_strs, as_name) || tc_eff_expr_kind(expr) == 1 {
                         tc_eff_add(effects, "Alloc");
                     }
                 }
@@ -28711,6 +28741,67 @@ fn TypeChecker_par_begin(self: &mut TypeChecker, branch: Vec<Stmt>) -> str {
     self.thread_entries.push(name);
     g_tc_par_writer = name;
     return saved;
+}
+
+/// BG159: a function started by name as a thread or a task (`spawn f(..)`,
+/// a call of an async function, a `parallel { }` branch that is one call)
+/// gets its arguments through the task's block, which has room for 8 on
+/// every compiled backend (C `p_thread_spawn`/`p_co_async`, the pe_ir and
+/// machine-layer runtimes' blocks): a ninth was dropped on C (now a panic)
+/// and read from the block's done flag natively (936 printed as
+/// 536874169636). `fid run` took any number, so `check` accepted it.
+const TC_TASK_MAX_ARGS: i64 = 8;
+
+fn TypeChecker_check_task_arity(self: &mut TypeChecker, what: str, callee: str, n: i64) {
+    if n <= TC_TASK_MAX_ARGS {
+        return;
+    }
+    self.errors.push("Type error (line " + int_to_str(self.current_line) + "): " + what + " " + int_to_str(n) + " arguments; a function started as a thread or task takes at most " + int_to_str(TC_TASK_MAX_ARGS) + ".\n    The task's block keeps its arguments, with room for " + int_to_str(TC_TASK_MAX_ARGS) + " on every compiled backend.\n    Fix: pass the values in a struct (one argument), or start a function of at most " + int_to_str(TC_TASK_MAX_ARGS) + " parameters that calls '" + callee + "'.");
+}
+
+/// BG159: an async function runs as a task (p_co_async), so it takes at
+/// most TC_TASK_MAX_ARGS parameters (`self` counted).
+fn TypeChecker_check_async_arity(self: &mut TypeChecker, func: Func) {
+    if !func.is_async || func.params.len() <= TC_TASK_MAX_ARGS {
+        return;
+    }
+    self.errors.push("Type error (line " + int_to_str(func.line) + "): async fn '" + func.name + "' has " + int_to_str(func.params.len()) + " parameters; an async function runs as a task, which takes at most " + int_to_str(TC_TASK_MAX_ARGS) + " arguments.\n    The task's block keeps its arguments, with room for " + int_to_str(TC_TASK_MAX_ARGS) + " on every compiled backend.\n    Fix: take the values in a struct (one parameter), or split '" + func.name + "' so that each async function has at most " + int_to_str(TC_TASK_MAX_ARGS) + " parameters.");
+}
+
+/// BG159: a `parallel { }` branch that is one call (`f(..)` or `x =
+/// f(..)`) runs that function on a thread of its own, started by name.
+fn TypeChecker_check_par_branch_arity(self: &mut TypeChecker, branch: Vec<Stmt>) {
+    if branch.len() != 1 {
+        return;
+    }
+    match branch.get(0) {
+        Stmt::Expr(e, _) => {
+            match e {
+                Expr::Call(pc, pa) => {
+                    TypeChecker_check_task_arity(self, "the `parallel` branch `" + pc + "(...)` passes", pc, pa.len());
+                }
+                _ => {
+                }
+            }
+        }
+        Stmt::Assign(_, aop, rhs, _) => {
+            match aop {
+                AssignOp::Assign => {
+                    match rhs {
+                        Expr::Call(pc2, pa2) => {
+                            TypeChecker_check_task_arity(self, "the `parallel` branch `" + pc2 + "(...)` passes", pc2, pa2.len());
+                        }
+                        _ => {
+                        }
+                    }
+                }
+                _ => {
+                }
+            }
+        }
+        _ => {
+        }
+    }
 }
 
 /// BG75: a closure given to a spawned call (`spawn work(|x| x + n)`)

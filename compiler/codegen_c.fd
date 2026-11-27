@@ -18521,7 +18521,12 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "int64_t p_json_get_int(void* j, const char* key) { char* v = p_json_get(j, key); int64_t r = atoll(v); p_str_free_c(v); return r; }");
     wln(self, "double p_json_get_float(void* j, const char* key) { char* v = p_json_get(j, key); double r = atof(v); p_str_free_c(v); return r; }");
     wln(self, "int64_t p_json_get_bool(void* j, const char* key) { char* v = p_json_get(j, key); int64_t r = strcmp(v, \"true\") == 0; p_str_free_c(v); return r; }");
-    wln(self, "void* p_json_at(void* j, int64_t idx) {");
+    // BG204: a counted string, as p_json_get's (the C library's block was
+    // never freed, and a drop of it would free a block the block allocator
+    // does not own)
+    wln(self, "static char* p_json_at__raw(void* j, int64_t idx);");
+    wln(self, "void* p_json_at(void* j, int64_t idx) { return p_str_own_libc_c(p_json_at__raw(j, idx)); }");
+    wln(self, "static char* p_json_at__raw(void* j, int64_t idx) {");
     wln(self, "    const char* s = (const char*)j;");
     wln(self, "    if (!s || idx < 0) return strdup(\"null\");");
     wln(self, "    // Find array start");

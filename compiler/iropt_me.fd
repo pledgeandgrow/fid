@@ -888,7 +888,14 @@ fn ime_inline_site(f: &mut IrFunction, g: &IrFunction, bi: i64, k: i64, call_id:
                 OptValueMeta::None => {
                 }
             }
-            if ir_type_is_int(pty) && ir_type_is_int(aty) && !ir_type_eq(aty, pty) && ir_type_size(aty) == ir_type_size(pty) {
+            // BG165: an f64 argument for an f32 parameter (lowering leaves
+            // `takes(1.5)` an f64 ConstFloat) goes through the BitCast that
+            // is IR's float conversion (`as f32`): nat_ir read the double's
+            // low 32 bits (0). (The return needs none: its Store to the
+            // f32 result slot narrows.)
+            var int_same: bool = ir_type_is_int(pty) && ir_type_is_int(aty) && ir_type_size(aty) == ir_type_size(pty);
+            var flt_conv: bool = ir_type_is_float(pty) && ir_type_is_float(aty);
+            if (int_same || flt_conv) && !ir_type_eq(aty, pty) {
                 var bcid: i64 = ime_detached(f, Inst::BitCast(arg, aty, pty));
                 var hbc: BasicBlock = f.blocks.get(bi);
                 hbc.instructions.push(bcid);
@@ -6395,6 +6402,24 @@ pub fn ime_hoist_loads(f: &mut IrFunction) -> bool {
 
 // --- LF6: store-to-load forwarding, repeated loads ------------------------------
 
+/// The value `id` finally forwards to in `map` (entries old id -> new id + 1).
+fn ime_forward_final(map: &Vec<i64>, id: i64) -> i64 {
+    var cur: i64 = id;
+    var steps: i64 = 0;
+    while steps < map.len() {
+        if cur < 0 || cur >= map.len() || map.get(cur) == 0 {
+            return cur;
+        }
+        var nx: i64 = map.get(cur) - 1;
+        if nx == cur {
+            return cur;
+        }
+        cur = nx;
+        steps = steps + 1;
+    }
+    return cur;
+}
+
 /// In each block, a load of a place whose value is known (just stored, or
 /// loaded and not written since, per LF4) becomes that value. Only values
 /// of the load's own type are forwarded.
@@ -6499,12 +6524,24 @@ pub fn ime_forward(f: &mut IrFunction) -> bool {
     if !any {
         return false;
     }
+    // Blocks are scanned in layout order, so a load can forward to a value
+    // whose own forwarding is found only in a later block. Compress those
+    // chains before rewriting; otherwise the intermediate load is removed
+    // here while a use rewritten to it remains.
+    var rmap: Vec<i64> = peir_zeros(map.len());
+    var fm: i64 = 0;
+    while fm < map.len() {
+        if map.get(fm) != 0 {
+            rmap.set(fm, ime_forward_final(&map, fm) + 1);
+        }
+        fm = fm + 1;
+    }
     // every use of a forwarded load reads the known value
     var nob: Vec<i64> = peir_zeros(1);
     var i4: i64 = 0;
     while i4 < f.insts.len() {
         var e: ValueIdInst = f.insts.get(i4);
-        e.inst = ime_remap(e.inst, &map, &nob);
+        e.inst = ime_remap(e.inst, &rmap, &nob);
         f.insts.set(i4, e);
         i4 = i4 + 1;
     }

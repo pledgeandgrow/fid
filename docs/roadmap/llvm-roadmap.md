@@ -1130,7 +1130,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       release/fid-dev.exe: FID_VERIFY=1 --nat emits of test_diag,
       test_borrowck, test_ast, test_annotations are byte-identical to
       the pre-change binary (liveness semantics preserved).
-- [~] ME3. mem2reg: locals whose address never escapes become SSA values with
+- [x] ME3. mem2reg: locals whose address never escapes become SSA values with
       block parameters, on the IR every backend reads (L).
       Nov 8–9: scalar locals whose address is only loaded and stored live in
       registers in the backend, and a load becomes the stored value when that
@@ -1171,8 +1171,19 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       its wins). Measured: matmul2x2 is 220 instructions either way —
       the 2% was matrix_mul's main, whose callers inline it; promote's
       win there is the reaching-store replacement ssa's phis now cover.
-      Left: the rest of the
-      NAT=1 file list.
+      Nov 27 check (build/me20-fid-opt/fid-dev.exe): validated - the
+      remaining NAT=1 file list (15 programs) built with FID_VERIFY=1 on
+      both sides, FID_IROPT_ON=ssa,ssaexit against
+      FID_IROPT_OFF=ssa,ssaexit; 15/15 were SAME, with no DIFF, BUILD or
+      VERIFY failure. The pe_ir list was 14/15 SAME in the parallel run;
+      test_mem2reg_promote's off build was a host out-of-memory artifact
+      and passed serially with byte-identical output. ssa-default-check
+      with NAT=1 passes 2/2. The old promote-retired harness's RETIRED
+      expectation is obsolete: promote intentionally runs after ssa now
+      (iro_promote_here returns true), so its nonzero promote counts are
+      not failures. ME3 is complete under the recorded design decision:
+      SSA is a mid-end round trip and backends still read slot form, not
+      block parameters.
 - [x] ME4. An IR verifier after every pass in debug builds: types, dominance,
       terminators, block parameters (M).
       Nov 8: `compiler/irverify.fd` (`FID_VERIFY=1`), after lowering, iropt, the
@@ -1313,7 +1324,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
 - [x] ME19. Saturation limits per function (nodes, iterations), so compile time
       stays linear in practice (S).
       Node and round limits (`EG_MAX_NODES`, `EG_MAX_ROUNDS`).
-- [~] ME20. Inlining with a cost model across modules (iropt inlines one-block
+- [x] ME20. Inlining with a cost model across modules (iropt inlines one-block
       functions of up to 16 instructions today) (L).
       Nov 9: written, opt-in (`FID_IROPT_ON=inline2`), not run on the suite yet: callees of
       several blocks (the block is split at the call; returns store the
@@ -1327,7 +1338,25 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       `--nat` allocation check under FID_VERIFY=1 (only
       `FID_IROPT_OFF=inline2` fixes it). Left: those, the full suite.
       Nov 21: 2g.88 fixed (see RA3) — envtrim and inline2 exposed more cases of the checker miss, not new bugs.
-- [~] ME21. Inlining decisions from the call graph bottom-up, with sizes known
+      Done Nov 27 with `build/me20-fid-opt/fid-dev.exe`: inline2-check and
+      inline2-limits-check pass; inline2-tune.sh exits 0, with the default
+      verdict OK on 18 programs (0 output differences or build failures;
+      instructions 109% of off, iropt time 100%, build time 98%, run time
+      100%, 608 sites; docs/perf/mid-end/me20-inline2-tune.txt).
+      inline2-bench-check is green (4/4 OK; fib 673 vs 665 ms, hashmap 1574
+      vs 1561 ms, loop 1508 vs 1501 ms, sieve 235 vs 236 ms on vs off).
+      test_regex_linear now builds and runs under `--nat` with FID_VERIFY=1
+      with inline2 both on and off, with byte-identical output; the former
+      allocation-check failure does not reproduce. Full suite, after serial
+      retries of host-overload build artifacts: pe_ir 1364 programs, 1322
+      SAME, 27 SKIP (both modes fail for pre-existing errors or unsupported
+      Windows-native builtins), 15 raw DIFF, 0 BUILD/VERIFY; `--nat` 1364
+      programs, 1322 SAME, 37 SKIP, 5 raw DIFF, 0 BUILD/VERIFY. Every raw
+      diff is a millisecond/trace timing, a sampling count or profiler's
+      inlined-frame attribution, or a panic trace's code addresses/frame
+      depth; inline2 legitimately removes inlined call frames. The real
+      verifier bug the suite exposed is fixed as known-bugs 2g.122.
+- [x] ME21. Inlining decisions from the call graph bottom-up, with sizes known
       after the callee is optimized (M).
       Nov 9: written, opt-in (`FID_IROPT_ON=inline2`), not run on the suite yet: post-order over
       the call graph: a callee is inlined into its callers after its own
@@ -1339,6 +1368,14 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       Left: the full suite on and off, the compile-time measurement
       (me-measure.sh), the `--nat` allocation-check failure of
       test_regex_linear with inline2.
+      Done Nov 27 with the same compiler and suite evidence as ME20.
+      inline2-limits-check again prints "resumed scan = rescan" for every
+      program (test_lib_bigint: 92 sites, 12662 -> 11202 instructions,
+      1236 vs 2927 weighings). The final serial me-measure run over the 13
+      ME20 programs has 0 output differences; instructions 56614 on vs
+      51637 off (109.6%), iropt 6780 vs 6667 ms (101.7%), whole builds
+      25408 vs 25054 ms (101.4%) — docs/perf/mid-end/me20-inline2.txt.
+      The `--nat` test_regex_linear allocation-check failure is cleared.
 - [>] ME22. Loop canonical form: preheaders, single latches, dedicated exits:
       folded into ME23/ME25 (Nov 22) — canonical form is their prerequisite,
       not a deliverable of its own. Written, opt-in (`FID_IROPT_ON=loops`,
@@ -2070,7 +2107,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       jumps from them (`peir_range_refine`); since Nov 15 also through
       branches that say nothing about it and after a join all of whose ways
       in keep it (`peir_join_fact`). One fact per block (LF8).
-- [~] LF10. Ranges through function boundaries for internal functions (WP13) (M).
+- [x] LF10. Ranges through function boundaries for internal functions (WP13) (M).
       Nov 16: built and tested (test_midend_range_args.fd and
       test_midend_param_range.fd give their expected output through `fid run` and
       `fid emit` with FID_IROPT_ON=paramrange and without): for a function only direct calls
@@ -2083,13 +2120,18 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       gets the join of the ranges of its returns (`peir_ret_join`,
       `peir_ret_seed` in `peir_range_scan`). Two rounds, the second using
       only what the first proved, so recursion is sound without a fixpoint
-      (a self-call with `n - 1` gives no range). Opt-in: `FID_IROPT_ON=
-      paramrange` (FID_IROPT_OFF=paramrange turns it off,
-      FID_IROPT_OFF=retrange keeps the parameter ranges only). Tests:
+      (a self-call with `n - 1` gives no range). On by default since
+      Nov 25: `FID_IROPT_OFF=paramrange` turns it off and
+      `FID_IROPT_OFF=retrange` keeps the parameter ranges only. Tests:
       test_midend_range_args, test_midend_param_range(_fail),
-      tests/tooling/param-range-check.sh. Left: a build, a suite run with
-      it on, then the default; relational facts (`i < v.len()` of a
-      parameter Vec) are not carried.
+      tests/tooling/param-range-check.sh (now checks the default too).
+      Nov 25 validation: `PASS=paramrange` on/off suite over 1,364
+      programs gave 1,328 SAME, 28 SKIP (build with neither) and 8 raw
+      DIFFs, all nonsemantic (millisecond/microsecond timing rows,
+      profile sample counts, and panic-stack code addresses); no BUILD or
+      VERIFY failures. The rebuilt validation compiler runs the targeted
+      check at 0 failures with default-on. Relational facts (`i <
+      v.len()` of a parameter Vec) are still not carried.
 - [~] LF11. Check hoisting: one check before a loop instead of one per iteration,
       when the loop is versioned (ME25) (M).
       Nov 16: written with ME25, opt-in (`FID_IROPT_ON=version`): the copy's
@@ -2476,6 +2518,26 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       cache miss = cache off everywhere (C, x86_64-linux, all fixtures),
       but fn-cache-hit images still differ from off on every target;
       hit binaries run the same output. 2g.82 stands.
+      Nov 27 (not built yet; baseline with the Nov 25 fid-dev): same-program
+      hit == miss passes on all 3 targets (machine_fncache_check legs 1-4),
+      but the edit leg reused 0 of 275 — the salt named the input file's
+      path ("lines:" + g_nat_lines_file) and the whole function set, so an
+      edit saved under another name, or one reaching one more runtime
+      function, hit nothing. And after an edit a hit image was not a fresh
+      one: x86-64 loop heads are padded for the start modulo 16, so a
+      replayed loop function at another phase kept stale padding
+      (pe_lim_parse 4 bytes short). Changed (nat_ir.fd): salt nc16 says
+      only whether there are line rows; the function set left the salt
+      for per-entry "H"/"I" asks (ng_has_fn, ng_internal; nc_names_hold);
+      source lines in the key (a moved function was replayed with its old
+      line rows and panic lines); a function with a padded loop head starts
+      on 16 (ng_fn_start_align, FID_NAT_OFF=fnalign), entries keep their
+      phase (pos16, format 9); a hit that no longer fits is given up alone,
+      its callers checked against it in the next attempt, up to 8, each
+      replaying what the earlier ones compiled (g_nc_carry;
+      FID_NAT_OFF=ncnarrow: the transitive give-up). Left: MI28 summaries'
+      order dependence; line-relative keys (an inserted line recompiles
+      the functions below it in that file).
 - [~] SP7. Incremental relinking in memory: unchanged functions keep their bytes,
       only relocations are redone (M).
       On an FID_FNCACHE hit a function's bytes are replayed at the new
@@ -2491,6 +2553,13 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       changed function goes after the others. Left: those (SP6's problem).
       Nov 23 audit: unchanged — blocked by SP6's hit-vs-miss layout
       divergence (repro-check hit legs still differ).
+      Nov 27 (not built yet): "never reuses the kept layout" was the salt
+      (SP6: the function set and input path left it); a changed x86-64
+      function with a loop is now emitted at its slot's phase modulo 16
+      (nl_congruent_pad) so it can move into its slot. Relinking is asked
+      for since: `fid serve --relink` or FID_NAT_ON=relink (a kept layout
+      is not the one-shot image SP8 wants); relink_check.sh starts its
+      server with --relink.
 - [~] SP8. A one-line edit rebuilds in under 100 ms (with SP4–SP7) (L).
       ~0.5 s on hello with every cache warm (CS6, Nov 13).
       Nov 21 check (fid built from the self-hosted stage 0 at 86cc919):
@@ -2508,6 +2577,19 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       one-shot emit for the small 3-body fixture. This was on a busy host
       during other builds, so it is diagnostic, not a benchmark result;
       it confirms the 100 ms target is not close.
+      Nov 27 baseline (Nov 25 fid-dev, x86_64-linux, sp8 program, --time):
+      an edited rebuild ~1.1 s, of it typecheck 250, mono 220 (the merged
+      runtime's: `fid run` of the same file takes 45 / 50), lower 300,
+      prune 35, iropt 220, rules+egraph 30, the machine layer 53 (record
+      26); the back end is not where the time goes. The image differed
+      from the one-shot emit because of the kept layout (SP7: off by
+      default now) and stale x86-64 loop padding in hits (SP6: loop
+      functions start on 16); with a size-neutral edit and relinking off
+      the served image was the one-shot one, with the in-memory IR cache
+      on and off. The IR cache is on in `fid serve` by default now
+      (FID_SERVE_IRCACHE=0: off; lowering ~300 -> ~150-190 ms). Left:
+      typecheck/mono of the merged runtime per request, lowering and the
+      mid-end per request (compiler.fd, mono.fd, iropt.fd).
 - [~] SP9. Front end in parallel per module where modules do not depend on each
       other (L).
       Competitive CS5: `FID_PAR=N` splits the borrow check's functions over
@@ -2539,6 +2621,36 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       (3) typecheck = sequential registration then parallel body-checking with
       per-worker memo/spec sets merged deterministically. Parse-level
       parallelism is moderate; typecheck is the hard one.
+      Nov 27 (uncommitted, `check compiler/main.fd` clean; not yet run in a
+      rebuilt fid): steps 1 and 2 done, opt-in with FID_PAR=N. (1) The
+      parser's per-parse scratch (g_pd_impl_selfs, g_pd_timpl_selfs,
+      g_pd_last_*impl_self, g_pd_impl_lts) is in Parser, the B19 decl lists
+      are locals; a parse made by Parser_side keeps everything else it
+      changes (import set and its additions, `module::name` calls, @import
+      headers, turbofish calls and `__pcall_k` locals numbered from 0,
+      @secret / splice flags) in the Parser (ParseSide), applied to the
+      globals by parser_side_apply when the import loop takes it.
+      (g_pd_sequential_vars is never written: nothing to merge.) (2) The
+      closure is parsed ahead in N threads (parser.fd pp_parse_par), each
+      module with the names pp_predict (the import loop run on
+      lexer.fd token_module_scan: uses, struct/enum names, `module` name,
+      import names) expects the loop to know at its first parse — exact
+      prediction instead of levels: no wave barrier, every module at once.
+      cached_parse takes a parse ahead only when pp_valid says the loop's
+      own would be the same (every word of the text the same struct / enum /
+      import name to both: a parse asks about no other name; the numbers
+      fit); otherwise it parses as before, so output is the sequential
+      front end's by construction. Also with a cold import cache
+      (pp_imp_cold). Measured on the current tree with
+      tests/par/parse_ahead_probe.fd (ccompile'd by the Nov 25 fid):
+      compiler/main.fd's 71 modules, all 71 taken, 0 differ; the loop's
+      parses 650-1000 ms one after another vs 170-230 ms for the parse ahead
+      in 8 threads (word scans and name copies included); with no names at
+      all (`bad`) none is taken and 39 would have differed.
+      tests/selfhost/test_parse_par.fd: workers equal this thread on
+      ccompile and emit (1/2/4/8 threads). Post-build gate:
+      tests/par/parse_par_check.sh (SELF=1), timing tests/par/parse_par_bench.sh.
+      Left: step 3 (type check bodies in parallel), on by default.
 - [x] SP10. No linear scans anywhere in the compiler: every lookup by name or id is
       a table (release CS8) (M).
       Competitive CS8: instructions, functions, strings, structs, methods,
@@ -3211,7 +3323,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       fixture-materialization fix as Nov 23: two call sites defeat
       inline2's once-called rule, and lgf_count's panic keeps its frame
       through the mid-end). gdb/qemu execution legs unrun on this host.
-- [~] DB2. DWARF on Linux and macOS: line numbers, functions, frames (L).
+- [x] DB2. DWARF on Linux and macOS: line numbers, functions, frames (L).
       Nov 9: `.symtab`, DWARF 4 `.debug_info` (a compile unit, a subprogram per
       function) and `.debug_frame` in every native Linux executable; line tables
       since Nov 9 (DB1). Nov 15, macOS: `nat_macho` (nat_enc.fd) writes a
@@ -3235,6 +3347,16 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       __debug_frame ok) once the fixture's functions are kept materialized;
       `dbg vars OK` on `--nat`. lldb / llvm-dwarfdump legs unrun (not
       installed here).
+      Nov 25 continuation: done on a -O0 self-hosted validation build —
+      test_nattools_decl_lines keeps its measured functions out of line,
+      and nat_dwarf_build omits declaration attributes for generated
+      subprograms that have no source declaration instead of writing file
+      index 0. `python scripts/dbg-check.py --fid build/db2-fid-gcc/fid-dev.exe`
+      is fully green (all three ELF targets, both Mach-O symbol legs and
+      `--nat` symbols), `dbg_vars_check` passes llvm-dwarfdump --verify,
+      and `FID=build/db2-fid-gcc/fid-dev.exe bash tests/nattools/dbg_ct9_check.sh`
+      is green including Mach-O __DWARF/__debug_frame and `--nat` DWARF.
+      lldb execution remains unrun on this Windows host.
 - [x] DB3. PDB / CodeView on Windows (L).
       Done (Nov 15), first step on the default Windows backend: `fid emit`
       images carry a COFF symbol table after the sections (pe_ir_enc.fd
@@ -3311,7 +3433,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       execution legs unrun on this host.
 - [x] DB5. Panic and crash traces from frame records, no per-call bookkeeping
       (the C path, native Linux).
-- [~] DB6. Unwind information (Windows `.pdata`, DWARF CFI) so system debuggers and
+- [x] DB6. Unwind information (Windows `.pdata`, DWARF CFI) so system debuggers and
       profilers walk our stacks (M).
       `.debug_frame` CFI for our prologues on the three Linux targets.
       Nov 15: the CFI was wrong in two places, now right: a function with no
@@ -3365,6 +3487,12 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       have no subprogram, and the declline-off control reports no line, on
       all three ELF targets — a debug-info/decl-line failure outside the
       unwind data itself. DB6 therefore stays partly.
+      Nov 25 continuation: done on the -O0 validation build after the DB2
+      fixes — `bash tests/nattools/db6_eh_check.sh build/db2-fid-gcc/fid-dev.exe`
+      exits 0 (39 ok lines, one libgcc skip; scripts/dbg-check.py included),
+      and the new build's `--nat` image has 337 valid RUNTIME_FUNCTIONs.
+      readelf, libgcc and target execution remain unrun on this host, but
+      every check available here passes.
 - [x] DB7. `fid explain <function>`: the IR, the MIR after each stage, the machine
       code, side by side (M).
       Nov 15: `fid explain <file> --stages <fn> [--target t]` (also `fid

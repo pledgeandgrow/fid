@@ -44,16 +44,23 @@ uninitialized local) stays in memory. Functions with `TryUnwrap` or `Asm`,
 predecessors are not converted. A function with more than `SSA_MAX_PHIS`
 (20,000) phis is left as it is.
 
-## Status (Nov 21 check, ME3: partly)
+## Status (Nov 27 check, ME3: done)
 
-On by default; ssa-default-check passes; promote-retired-check passes 14 of
-15: `test_matrix_mul` has about 2% more instructions without promote (6,048
-against 5,930 after iropt). Tests: `test_ssa_merge`, `test_ssa_exit_bound`,
+On by default. `ssa-default-check` passes with `NAT=1` (2/2). The remaining
+15-program machine-layer file list passes `PASS=ssa,ssaexit` with
+`FID_VERIFY=1`: 15/15 the same, with no output, build or verifier failure.
+The pe_ir list is clean too; one parallel off-build of
+`test_mem2reg_promote` was a host out-of-memory artifact and passed when
+retried serially. Tests: `test_ssa_merge`, `test_ssa_exit_bound`,
 `test_ssa_exit_loop_tree`, `test_ssa_validate` (tests/bootstrap).
+
+`promote` is not retired: since the Nov 21 evening batch it intentionally
+runs after `ssa` on the slots SSA leaves in memory. Therefore the old
+`promote-retired-check` RETIRED expectation is obsolete; nonzero promote
+counts are not failures.
 
 ## Findings
 
-- **LOW:** the 2% instruction cost above, where `promote` did better.
 - **INFO:** the promoted local's Alloca stays (unused) so `locals` and the
   debug info still name a value that exists.
 

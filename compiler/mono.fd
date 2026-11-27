@@ -240,6 +240,12 @@ pub fn GenericMethodMap_push(map: &mut GenericMethodMap, e: GenericMethodEntry) 
     if HashMap_get(map.index, key) == 0 {
         HashMap_insert(map.index, key, map.entries.len() + 1);
     }
+    // SP3: the method's name alone (mono_gm_has_name; no "T::m" key starts
+    // with "#m:")
+    var nkey: str = "#m:" + e.method_name;
+    if HashMap_get(map.index, nkey) == 0 {
+        HashMap_insert(map.index, nkey, 1);
+    }
     map.entries.push(e);
 }
 
@@ -3598,8 +3604,96 @@ fn mono_share_count(orig: str, canon: str) {
 
 var g_mono_ret_index: i64 = 0;
 var g_mono_ret_types: Vec<Type> = Vec::new();
+// BG183: the generic trait impls, "Trait::Type" and the names of the
+// methods each defines: a cast of an instance to `dyn Trait` instantiates
+// all of them (mono_dyn_methods), not only those called directly
+var g_mono_dyn_keys: Vec<str> = Vec::new();
+// BG185: the generic methods (ctx.generic_methods' index and entries, 0
+// outside monomorphize): infer_expr_type gives a call of one its result
+// type, not its receiver's
+var g_mono_gm_index: i64 = 0;
+var g_mono_gm_entries: Vec<GenericMethodEntry> = Vec::new();
+
+/// BG185: the result type of `recv.method(args)` when `method` is a method
+/// of a user generic impl of `rt`'s struct with no type parameters of its
+/// own (Type::Infer when not: the caller keeps its old answer). Before, a
+/// chained call took the receiver's type: `Slot { v: 7, n: 3 }.wrap().get()`
+/// instantiated `get` for Slot<i64>, not Slot<Slot<i64>>.
+fn mono_gm_ret_type(rt: Type, method: str, args: Vec<Expr>, func: Func) -> Type {
+    if g_mono_gm_index == 0 {
+        return Type::Infer;
+    }
+    var gn: str = "";
+    match rt {
+        Type::Generic(n, gargs) => {
+            if gargs.len() > 0 {
+                gn = n;
+            }
+        }
+        _ => {
+        }
+    }
+    if gn == "" || gn == "Vec" || gn == "HashMap" || gn == "Option" || gn == "Result" || gn == "Box" || gn == "Rc" || gn == "Arc" {
+        return Type::Infer;
+    }
+    val at: i64 = HashMap_get(g_mono_gm_index, gn + "::" + method);
+    if at == 0 || at > g_mono_gm_entries.len() {
+        return Type::Infer;
+    }
+    val gen: GenericMethodEntry = g_mono_gm_entries.get(at - 1);
+    if gen.func.type_params.len() > 0 {
+        return Type::Infer;
+    }
+    match gen.func.ret_ty {
+        Type::Void => {
+            return Type::Infer;
+        }
+        Type::Infer => {
+            return Type::Infer;
+        }
+        _ => {
+        }
+    }
+    if mono_type_mentions(gen.func.ret_ty, "Self") {
+        return Type::Infer;
+    }
+    var arg_types: Vec<Type> = Vec::new();
+    var i: i64 = 0;
+    while i < args.len() {
+        arg_types.push(infer_expr_type(args.get(i), func));
+        i = i + 1;
+    }
+    val sub: Vec<SubstEntry> = method_subst(gen.func, gen.type_params, arg_types, rt);
+    return subst_type(gen.func.ret_ty, sub);
+}
+var g_mono_dyn_ms: Vec<Vec<str>> = Vec::new();
+
+/// BG183: the methods a generic impl of `trait_name` for `type_name`
+/// defines (none when there is no such impl).
+fn mono_dyn_methods(trait_name: str, type_name: str) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    val key: str = trait_name + "::" + type_name;
+    var i: i64 = 0;
+    while i < g_mono_dyn_keys.len() {
+        if g_mono_dyn_keys.get(i) == key {
+            val ms: Vec<str> = g_mono_dyn_ms.get(i);
+            var j: i64 = 0;
+            while j < ms.len() {
+                out.push(ms.get(j));
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return out;
+}
 pub fn monomorphize(program: Program) -> Program {
     g_mn_emit_used = false;
+    // SP3: FID_MONO_FULL=1 rebuilds every body (process_func)
+    var full_env: str = p_getenv("FID_MONO_FULL");
+    if (full_env as i64) != 0 && str_len(full_env) > 0 {
+        g_mono_skip_off = true;
+    }
     mn_defaults_setup(program);
     mono_spec_setup(program);
     mn_gstructs_setup(program);
@@ -3679,9 +3773,21 @@ pub fn monomorphize(program: Program) -> Program {
     }
 
     // Register generic trait impl methods
+    g_mono_dyn_keys = Vec::new();
+    g_mono_dyn_ms = Vec::new();
     i = 0;
     while i < program.trait_impls.len() {
         var ti: TraitImpl = program.trait_impls.get(i);
+        if ti.type_params.len() > 0 {
+            var dms: Vec<str> = Vec::new();
+            var dj: i64 = 0;
+            while dj < ti.methods.len() {
+                dms.push(ti.methods.get(dj).name);
+                dj = dj + 1;
+            }
+            g_mono_dyn_keys.push(ti.trait_name + "::" + ti.type_name);
+            g_mono_dyn_ms.push(dms);
+        }
         var j: i64 = 0;
         while j < ti.methods.len() {
             if ti.type_params.len() > 0 {
@@ -3693,6 +3799,10 @@ pub fn monomorphize(program: Program) -> Program {
         }
         i = i + 1;
     }
+
+    // BG185: infer_expr_type reads the generic methods (mono_gm_ret_type)
+    g_mono_gm_index = ctx.generic_methods.index;
+    g_mono_gm_entries = ctx.generic_methods.entries;
 
     // Process concrete functions -- find calls to generics and instantiate
     var new_funcs: Vec<Func> = Vec::new();
@@ -3807,6 +3917,8 @@ pub fn monomorphize(program: Program) -> Program {
     result.event_handlers = program.event_handlers;
     mn_defaults_done();
     mono_share_done();
+    g_mono_gm_index = 0;
+    g_mono_gm_entries = Vec::new();
     return result;
 }
 
@@ -4222,6 +4334,11 @@ pub fn fixup_generic_calls_expr(expr: Expr, generics: GenericFuncMap, gm: Generi
             }
             var recv_expr: Expr = mn_box_expr_deref(receiver);
             var new_recv: Expr = fixup_generic_calls_expr(recv_expr, generics, gm, current_func);
+            // SP3: no generic method has this name: not one, whatever the
+            // receiver's type (not inferred)
+            if !mono_gm_has_name(gm, method) {
+                return Expr::MethodCall(mn_box_expr_new(new_recv), method, new_args);
+            }
             // A generic impl method: a call to the instantiation for this
             // receiver's type, with the receiver as first argument
             match infer_receiver_struct_name(recv_expr, current_func) {
@@ -4483,10 +4600,19 @@ pub fn process_func(func: Func, ctx: &mut MonoCtx) -> Func {
     var calls_to_instantiate: Vec<GenericCallEntry> = Vec::new();
     var method_calls_to_instantiate: Vec<GenericMethodCallEntry> = Vec::new();
 
+    g_mono_touched = false;
     var i: i64 = 0;
     while i < func.body.len() {
         collect_generic_calls_stmt(func.body.get(i), ctx.generics, ctx.generic_methods, &mut calls_to_instantiate, &mut method_calls_to_instantiate, func);
         i = i + 1;
+    }
+    // SP3: a body that calls no generic, names no generic method, has no
+    // turbofish, variadic or pack call, no `..` struct literal and no match
+    // guard comes out of the fixup and the substitution below as it went
+    // in: keep it (most of core and the runtime; FID_MONO_FULL=1: rebuild)
+    var unchanged: bool = !g_mono_skip_off && !g_mono_touched && calls_to_instantiate.len() == 0 && method_calls_to_instantiate.len() == 0 && g_mono_pack_var == "" && g_mono_pack_aliases.len() == 0;
+    if unchanged {
+        return mono_func_as_processed(func, func.body);
     }
 
     // Instantiate each generic function call
@@ -4582,11 +4708,23 @@ pub fn process_func(func: Func, ctx: &mut MonoCtx) -> Func {
         new_body.push(subst_stmt(fixed_body.get(i), subst_new(), rename_new(), rename_new()));
         i = i + 1;
     }
+    return mono_func_as_processed(func, new_body);
+}
 
+/// SP3: set by collect_generic_calls_* when a body holds something the
+/// fixup or the substitution of process_func may rewrite though nothing
+/// is collected (a turbofish, variadic or pack call, a generic method's
+/// name, a `..` struct literal, a match guard collect does not walk)
+var g_mono_touched: bool = false;
+/// SP3: FID_MONO_FULL=1 (or a test) makes process_func rebuild every body
+var g_mono_skip_off: bool = false;
+
+/// The function process_func makes of `func` with body `body`.
+fn mono_func_as_processed(func: Func, body: Vec<Stmt>) -> Func {
     var result: Func = Func_new(func.name, func.ret_ty);
     result.is_pub = func.is_pub;
     result.params = func.params;
-    result.body = new_body;
+    result.body = body;
     result.is_comptime = false;
     result.declared_effects = func.declared_effects;
     result.has_effect_annotation = func.has_effect_annotation;
@@ -4597,6 +4735,29 @@ pub fn process_func(func: Func, ctx: &mut MonoCtx) -> Func {
     result.is_async = func.is_async;
     result.line = func.line;
     return result;
+}
+
+/// SP3: whether some generic method of `gm` has the name `method` (the
+/// "#m:" keys GenericMethodMap_push adds): a method call of another name
+/// is never a generic method's, whatever its receiver's type.
+fn mono_gm_has_name(gm: GenericMethodMap, method: str) -> bool {
+    return HashMap_get(gm.index, "#m:" + method) != 0;
+}
+
+/// SP3: a match arm's guard is fixed up and substituted but not collected:
+/// a body with one is rebuilt.
+fn mono_touch_guards(arms: Vec<MatchArm>) {
+    var i: i64 = 0;
+    while i < arms.len() {
+        match arms.get(i).guard {
+            OptBoxExpr::Some(_) => {
+                g_mono_touched = true;
+            }
+            OptBoxExpr::None => {
+            }
+        }
+        i = i + 1;
+    }
 }
 
 // --- Instantiate a generic function with a concrete substitution ---------
@@ -4806,6 +4967,7 @@ pub fn collect_generic_calls_stmt_with_hint(stmt: Stmt, generics: GenericFuncMap
         }
         Stmt::Match(e, arms, line) => {
             collect_generic_calls_expr_with_hint(e, generics, generic_methods, calls, method_calls, current_func, OptType::None);
+            mono_touch_guards(arms);
             var i: i64 = 0;
             while i < arms.len() {
                 var j: i64 = 0;
@@ -4961,6 +5123,9 @@ pub fn collect_generic_calls_expr_with_hint(expr: Expr, generics: GenericFuncMap
                     }
                 }
                 calls.push(GenericCallEntry_new(callee, arg_types));
+            } else if g_mono_va_on || str_contains(callee, "::<#") {
+                // SP3: fixup_generic_calls_expr may rename or pack it
+                g_mono_touched = true;
             }
             var i: i64 = 0;
             while i < args.len() {
@@ -5010,21 +5175,26 @@ pub fn collect_generic_calls_expr_with_hint(expr: Expr, generics: GenericFuncMap
         Expr::MethodCall(receiver, method, args) => {
             // Unbox receiver once to avoid codegen issues with repeated box_expr_deref
             var recv_expr: Expr = mn_box_expr_deref(receiver);
-            // Check if this is a call to a generic method
-            var struct_name: OptStr = infer_receiver_struct_name(recv_expr, current_func);
-            match struct_name {
-                OptStr::Some(sn) => {
-                    if generic_methods_contains(generic_methods, sn, method) {
-                        var arg_types: Vec<Type> = Vec::new();
-                        var i: i64 = 0;
-                        while i < args.len() {
-                            arg_types.push(infer_expr_type_with_hint(args.get(i), current_func, expected_ty));
-                            i = i + 1;
+            // Check if this is a call to a generic method (SP3: only a
+            // method name some generic method has can be one: the
+            // receiver's type is not inferred for the others)
+            if mono_gm_has_name(generic_methods, method) {
+                g_mono_touched = true;
+                var struct_name: OptStr = infer_receiver_struct_name(recv_expr, current_func);
+                match struct_name {
+                    OptStr::Some(sn) => {
+                        if generic_methods_contains(generic_methods, sn, method) {
+                            var arg_types: Vec<Type> = Vec::new();
+                            var i: i64 = 0;
+                            while i < args.len() {
+                                arg_types.push(infer_expr_type_with_hint(args.get(i), current_func, expected_ty));
+                                i = i + 1;
+                            }
+                            method_calls.push(GenericMethodCallEntry_new(sn, method, arg_types, infer_expr_type(recv_expr, current_func)));
                         }
-                        method_calls.push(GenericMethodCallEntry_new(sn, method, arg_types, infer_expr_type(recv_expr, current_func)));
                     }
-                }
-                OptStr::None => {
+                    OptStr::None => {
+                    }
                 }
             }
             // Always recurse into receiver and args for nested generic calls
@@ -5058,6 +5228,8 @@ pub fn collect_generic_calls_expr_with_hint(expr: Expr, generics: GenericFuncMap
             }
             match spread {
                 OptBoxExpr::Some(se) => {
+                    // SP3: subst_expr fills a `..`'s defaults
+                    g_mono_touched = true;
                     collect_generic_calls_expr_with_hint(mn_box_expr_deref(se), generics, generic_methods, calls, method_calls, current_func, OptType::None);
                 }
                 OptBoxExpr::None => {
@@ -5066,6 +5238,7 @@ pub fn collect_generic_calls_expr_with_hint(expr: Expr, generics: GenericFuncMap
         }
         Expr::Match(e, arms) => {
             collect_generic_calls_expr_with_hint(mn_box_expr_deref(e), generics, generic_methods, calls, method_calls, current_func, OptType::None);
+            mono_touch_guards(arms);
             var i: i64 = 0;
             while i < arms.len() {
                 var j: i64 = 0;
@@ -5116,7 +5289,36 @@ pub fn collect_generic_calls_expr_with_hint(expr: Expr, generics: GenericFuncMap
             }
         }
         Expr::Cast(inner, target_ty) => {
-            collect_generic_calls_expr_with_hint(mn_box_expr_deref(inner), generics, generic_methods, calls, method_calls, current_func, OptType::None);
+            var cinner: Expr = mn_box_expr_deref(inner);
+            // BG183: `x as dyn Trait` of a generic impl's instance: every
+            // method the impl defines is instantiated for x's type, so the
+            // dyn value's forwarders (lower.fd Lowerer_dyn_generic_name)
+            // have them when none is called directly
+            match target_ty {
+                Type::Dyn(dtrait) => {
+                    match infer_receiver_struct_name(cinner, current_func) {
+                        OptStr::Some(dsn) => {
+                            val dms: Vec<str> = mono_dyn_methods(dtrait, dsn);
+                            if dms.len() > 0 {
+                                val drecv: Type = infer_expr_type(cinner, current_func);
+                                var dk: i64 = 0;
+                                while dk < dms.len() {
+                                    if generic_methods_contains(generic_methods, dsn, dms.get(dk)) {
+                                        var dargs: Vec<Type> = Vec::new();
+                                        method_calls.push(GenericMethodCallEntry_new(dsn, dms.get(dk), dargs, drecv));
+                                    }
+                                    dk = dk + 1;
+                                }
+                            }
+                        }
+                        OptStr::None => {
+                        }
+                    }
+                }
+                _ => {
+                }
+            }
+            collect_generic_calls_expr_with_hint(cinner, generics, generic_methods, calls, method_calls, current_func, OptType::None);
         }
         Expr::Asm(template, operands) => {
             var i: i64 = 0;
@@ -5590,6 +5792,16 @@ pub fn infer_expr_type(expr: Expr, func: Func) -> Type {
                         }
                         if gn == "Vec" && (method == "get" || method == "pop" || method == "first" || method == "last") {
                             return gargs.get(0);
+                        }
+                        // BG185: a user generic impl's method gives its
+                        // result type
+                        val gmr: Type = mono_gm_ret_type(rt, method, args, func);
+                        match gmr {
+                            Type::Infer => {
+                            }
+                            _ => {
+                                return gmr;
+                            }
                         }
                     }
                 }

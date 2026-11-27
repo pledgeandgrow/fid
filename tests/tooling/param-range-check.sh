@@ -35,20 +35,25 @@ check() { # check <label> <command...>: PASS when the command succeeds
 }
 
 FID_IROPT_ON=paramrange "$FID" explain $T/test_midend_param_range.fd > "$OUT/on.txt" 2>&1
+"$FID" explain $T/test_midend_param_range.fd > "$OUT/default.txt" 2>&1
 FID_IROPT_OFF=paramrange "$FID" explain $T/test_midend_param_range.fd > "$OUT/off.txt" 2>&1
 check "explain on: bump 2 removed" grep -q "^fn bump: 2 check(s) removed, 0 kept" "$OUT/on.txt"
+check "explain default: bump 2 removed" grep -q "^fn bump: 2 check(s) removed, 0 kept" "$OUT/default.txt"
 check "explain on: scale kept" grep -q "^fn scale: 0 check(s) removed, 1 kept" "$OUT/on.txt"
 check "explain off: bump 2 kept" grep -q "^fn bump: 0 check(s) removed, 2 kept" "$OUT/off.txt"
 
 FID_IROPT_ON=paramrange "$FID" explain $T/test_midend_param_range_fail.fd bump > "$OUT/fail.txt" 2>&1
 check "explain fail variant: mul kept" grep -q "kept mul overflow check" "$OUT/fail.txt"
 
-rm -f "$OUT/pr.exe" "$OUT/prf.exe"
+rm -f "$OUT/pr.exe" "$OUT/prd.exe" "$OUT/prf.exe"
 FID_IROPT_ON=paramrange "$FID" emit $T/test_midend_param_range.fd -o "$OUT/pr.exe" > "$OUT/pr.log" 2>&1
+"$FID" emit $T/test_midend_param_range.fd -o "$OUT/prd.exe" > "$OUT/prd.log" 2>&1
 FID_IROPT_ON=paramrange "$FID" emit $T/test_midend_param_range_fail.fd -o "$OUT/prf.exe" > "$OUT/prf.log" 2>&1
 sed -n '/^\/\/ Expected output:/,/^$/{s#^// ##p}' $T/test_midend_param_range.fd | sed '/^$/d;/^Expected output:/d' > "$OUT/expected.txt"
 "$OUT/pr.exe" > "$OUT/pr.out" 2>&1
+"$OUT/prd.exe" > "$OUT/prd.out" 2>&1
 check "emit on: output as expected" cmp -s "$OUT/pr.out" "$OUT/expected.txt"
+check "emit default: output as expected" cmp -s "$OUT/prd.out" "$OUT/expected.txt"
 check "emit on: fail variant fails" bash -c "! '$OUT/prf.exe' > '$OUT/prf.out' 2>&1"
 
 "$FID" explain $T/test_counted_loop_down.fd > "$OUT/down.txt" 2>&1

@@ -1,0 +1,48 @@
+// Bugs roadmap BG204: the counted string p_json_parse returns (every
+// runtime's JSON value is its text) was never dropped when it went straight
+// into another JSON function: `run --leaks` on 1000 x
+// `p_json_dump(p_json_parse(..))` reported 1000 blocks never freed. A
+// p_json_parse/get/at result given to a JSON reader is now a temporary of
+// its statement (lower.fd Lowerer_lower_call_expr_resolved,
+// lw_json_fresh_arg); C's p_json_at returns a counted string, as
+// p_json_get does (codegen_c.fd). Leak gate:
+//   fid run tests/bootstrap/test_bg204_json_parse_drop.fd --leaks
+//
+// Expected output:
+// 29
+// "value"
+// 2
+// 3
+// done
+
+fn main() -> i64 {
+    var total: i64 = 0;
+    var i: i64 = 0;
+    while i < 1000 {
+        val d: str = p_json_dump(p_json_parse("{\"name\": \"value\", \"k\": 12345678}"));
+        if i == 0 {
+            total = str_len(d);
+        }
+        i = i + 1;
+    }
+    println(total);
+    i = 0;
+    var last: str = "";
+    while i < 300 {
+        last = p_json_dump(p_json_get(p_json_parse("{\"name\": \"value\"}"), "name"));
+        i = i + 1;
+    }
+    println(last);
+    i = 0;
+    var at: str = "";
+    var n: i64 = 0;
+    while i < 300 {
+        at = p_json_dump(p_json_at(p_json_parse("[1, 2, 3]"), 1));
+        n = p_json_len(p_json_parse("[1, 2, 3]"));
+        i = i + 1;
+    }
+    println(at);
+    println(n);
+    println("done");
+    return 0;
+}

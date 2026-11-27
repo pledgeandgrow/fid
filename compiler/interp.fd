@@ -2293,6 +2293,13 @@ pub fn Interpreter_run_function(self: &mut Interpreter, func: IrFunction, args: 
                     IrType::U64 => {
                         pval = Value::Int(p_f64_to_bits(pf));
                     }
+                    // an f64 (a literal) given to an f32 parameter is the
+                    // nearest single, as the compiled backends pass it
+                    // (`takes(0.1)` printed 0.1 here, 0.10000000149011612
+                    // on C and emit)
+                    IrType::F32 => {
+                        pval = Value::Float(interp_round_f32(pf));
+                    }
                     _ => {
                     }
                 }
@@ -2471,7 +2478,23 @@ pub fn Interpreter_run_function(self: &mut Interpreter, func: IrFunction, args: 
                             break;
                         }
                         ExecOutcome::Return(rv) => {
-                            result = RunResult::Return(rv);
+                            // an f32 function's result is a single (`return
+                            // 0.1;` returned the f64 literal)
+                            var frv: Value = rv;
+                            match func.ret_ty {
+                                IrType::F32 => {
+                                    match rv {
+                                        Value::Float(rf) => {
+                                            frv = Value::Float(interp_round_f32(rf));
+                                        }
+                                        _ => {
+                                        }
+                                    }
+                                }
+                                _ => {
+                                }
+                            }
+                            result = RunResult::Return(frv);
                             done = true;
                             break;
                         }

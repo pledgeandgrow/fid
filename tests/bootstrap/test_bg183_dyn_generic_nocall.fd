@@ -1,0 +1,61 @@
+// Bugs roadmap BG183: `dyn` of a generic impl's instance whose methods are
+// never called directly. mono (compiler/mono.fd) made an instance's method
+// only when it was called on the type, so the dyn value's forwarders
+// (lower.fd Lowerer_dyn_generic_name) had nothing to forward to: run
+// panicked "DynCall: no method 'show' on type 'Slot'", C and emit did not
+// build. A cast to `dyn Trait` now instantiates every method the generic
+// impl defines for the cast value's type (collect_generic_calls_expr_with_hint,
+// Expr::Cast; mono_dyn_methods).
+//
+// Expected output:
+// 5
+// hello
+// 2.5
+// 1 2 3
+// 13
+// 9
+
+cap Show {
+    fn show(self) -> str;
+    fn tag(self) -> i64;
+    fn plus(self, k: i64) -> i64;
+}
+
+struct Slot<T> {
+    v: T,
+    tag: i64,
+}
+
+impl<T> Show for Slot<T> {
+    fn show(self) -> str {
+        return f"{self.v}";
+    }
+    fn tag(self) -> i64 {
+        return self.tag;
+    }
+    fn plus(self, k: i64) -> i64 {
+        return self.tag + k;
+    }
+}
+
+fn as_show<T>(s: Slot<T>) -> dyn Show {
+    return s as dyn Show;
+}
+
+fn main() -> i64 {
+    val a: Slot<i64> = Slot { v: 5, tag: 1 };
+    val b: Slot<str> = Slot { v: "hello", tag: 2 };
+    val c: Slot<f64> = Slot { v: 2.5, tag: 3 };
+    val da = a as dyn Show;
+    val db = b as dyn Show;
+    val dc = c as dyn Show;
+    println(da.show());
+    println(db.show());
+    println(dc.show());
+    println(f"{da.tag()} {db.tag()} {dc.tag()}");
+    println(dc.plus(10));
+    val e: Slot<bool> = Slot { v: true, tag: 4 };
+    val de = as_show(e);
+    println(de.plus(5));
+    return 0;
+}

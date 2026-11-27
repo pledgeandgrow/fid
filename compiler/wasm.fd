@@ -61,6 +61,8 @@ use string;
 use compiler::ir;
 use compiler::ast;
 use compiler::checks;
+use compiler::mir;
+use compiler::nat_ir;
 // WASM value types
 const WT_I32: i64 = 0x7F;
 const WT_I64: i64 = 0x7E;
@@ -188,6 +190,20 @@ pub struct WasmGen {
     pub as_fn: bool,
     pub as_here: bool,
     pub main_rec: i64,
+    // TG16: the MIR target. mir_recs is the selection of nat_ir; the
+    // labels that are not basic-block labels are classified in the parallel
+    // arrays below (0 unknown/block, 1 function, 2 string, 3 global, 4 panic).
+    pub mir_mode: bool,
+    pub mir_recs: Vec<NatFnRec>,
+    pub mir_rec_index: i64,
+    pub mir_label_kind: Vec<i64>,
+    pub mir_label_name: Vec<str>,
+    pub mir_label_text: Vec<str>,
+    pub mir_label_aux: Vec<i64>,
+    pub mir_nvreg: i64,
+    pub t4: i64,
+    pub t5: i64,
+    pub mir_bad: Vec<str>,
     // Control flow (TG16): every function gets the switch loop
     // (FID_WASM_SWITCH=1); functions written structured, with the switch
     // loop for tasks, for an irreducible CFG, because of FID_WASM_SWITCH
@@ -200,7 +216,7 @@ pub struct WasmGen {
 
 fn WasmGen_new() -> WasmGen {
     return WasmGen {
-        all_fns: HashMap_new(), fn_index: HashMap_new(), queue: Vec::new(), def_types: Vec::new(), n_imports: 0, imp_names: Vec::new(), imp_sigs: Vec::new(), imp_index: HashMap_new(), type_keys: Vec::new(), type_index: HashMap_new(), table: Vec::new(), table_index: HashMap_new(), data: Vec::new(), str_addr: HashMap_new(), glob_addr: HashMap_new(), globs: Vec::new(), named_fns: Vec::new(), named_seen: HashMap_new(), dyn_types: Vec::new(), c_names: HashMap_new(), c_list: Vec::new(), unresolved: Vec::new(), unresolved_seen: HashMap_new(), b: Vec::new(), cur_name: "", cur_wrapping: false, unchecked: Vec::new(), local_of: Vec::new(), alloca_off: Vec::new(), frame: 0, va_off: 0 - 1, t0: 0, t1: 0, t2: 0, t3: 0, fp: 0, cur: 0, block_index: HashMap_new(), nblocks: 0, k: 0, extra: 0, cur_inst_line: 0, as_set: HashMap_new(), as_ind: false, as_fn: false, as_here: false, main_rec: 0, cf_switch_only: false, cf_struct: 0, cf_task: 0, cf_irred: 0, cf_forced: 0,
+        all_fns: HashMap_new(), fn_index: HashMap_new(), queue: Vec::new(), def_types: Vec::new(), n_imports: 0, imp_names: Vec::new(), imp_sigs: Vec::new(), imp_index: HashMap_new(), type_keys: Vec::new(), type_index: HashMap_new(), table: Vec::new(), table_index: HashMap_new(), data: Vec::new(), str_addr: HashMap_new(), glob_addr: HashMap_new(), globs: Vec::new(), named_fns: Vec::new(), named_seen: HashMap_new(), dyn_types: Vec::new(), c_names: HashMap_new(), c_list: Vec::new(), unresolved: Vec::new(), unresolved_seen: HashMap_new(), b: Vec::new(), cur_name: "", cur_wrapping: false, unchecked: Vec::new(), local_of: Vec::new(), alloca_off: Vec::new(), frame: 0, va_off: 0 - 1, t0: 0, t1: 0, t2: 0, t3: 0, fp: 0, cur: 0, block_index: HashMap_new(), nblocks: 0, k: 0, extra: 0, cur_inst_line: 0, as_set: HashMap_new(), as_ind: false, as_fn: false, as_here: false, main_rec: 0, mir_mode: false, mir_recs: Vec::new(), mir_rec_index: HashMap_new(), mir_label_kind: Vec::new(), mir_label_name: Vec::new(), mir_label_text: Vec::new(), mir_label_aux: Vec::new(), mir_nvreg: 0, t4: 0, t5: 0, mir_bad: Vec::new(), cf_switch_only: false, cf_struct: 0, cf_task: 0, cf_irred: 0, cf_forced: 0,
     };
 }
 
@@ -782,6 +798,9 @@ fn wg_fn_ref(g: &mut WasmGen, name: str) -> i64 {
     }
     var idx: i64 = g.n_imports + g.def_types.len();
     HashMap_insert(g.fn_index, name, idx);
+    if g.mir_mode && wg_prim_params(name) < 0 {
+        np = WM_ARGS;
+    }
     g.def_types.push(wg_type_n(g, np));
     g.queue.push(name);
     return idx;
@@ -1043,6 +1062,9 @@ fn wg_call_named(g: &mut WasmGen, name: str, pushed: i64) {
         return;
     }
     var np: i64 = wg_nparams(g, name);
+    if g.mir_mode && wg_prim_params(name) < 0 {
+        np = WM_ARGS;
+    }
     var k: i64 = pushed;
     while k > np {
         w(g, 0x1A);
@@ -3139,6 +3161,252 @@ fn wg_cfg_build(func: &IrFunction) -> WgCfg {
     return c;
 }
 
+fn wm_cfg_build(rec: &NatFnRec) -> WgCfg {
+    var mb0: MBlocks = mi_blocks(&rec.mir);
+    var nb: i64 = mb0.start.len();
+    var labmap0: i64 = HashMap_new();
+    var i: i64 = 0;
+    while i < nb {
+        var st0: i64 = mb0.start.get(i);
+        if rec.mir.get(st0).op == MO_PLACE {
+            HashMap_insert(labmap0, int_to_str(rec.mir.get(st0).i0), i + 1);
+        }
+        i = i + 1;
+    }
+    var c: WgCfg = WgCfg {
+        nb: nb, s0: Vec::new(), s1: Vec::new(), tkind: Vec::new(), tpos: Vec::new(), tcond: Vec::new(), rnum: Vec::new(), idom: Vec::new(), loop_head: Vec::new(), merge: Vec::new(), kid_first: Vec::new(), kid_next: Vec::new(), done: Vec::new(), ctx_kind: Vec::new(), ctx_blk: Vec::new(), ok: true,
+    };
+    i = 0;
+    while i < nb {
+        var end0: i64 = mb0.end.get(i);
+        var tm: MInst = rec.mir.get(end0);
+        var kind: i64 = WK_FALL;
+        var pos: i64 = end0 + 1;
+        var sa: i64 = 0 - 1;
+        var sb: i64 = 0 - 1;
+        if tm.op == MO_JMP {
+            kind = WK_JUMP;
+            pos = end0;
+            sa = HashMap_get(labmap0, int_to_str(tm.i0)) - 1;
+            if sa < 0 { c.ok = false; }
+        }
+        if tm.op == MO_BNEZ || tm.op == MO_BEQZ || tm.op == MO_BRCC || tm.op == MO_TBNZ {
+            kind = WK_BRANCH;
+            pos = end0;
+            sa = HashMap_get(labmap0, int_to_str(tm.i0)) - 1;
+            if i + 1 < nb { sb = i + 1; }
+            if sa < 0 || sb < 0 { c.ok = false; }
+        }
+        if tm.op == MO_EPILOGUE || tm.op == MO_TRAP {
+            kind = WK_END;
+            pos = end0;
+        }
+        if tm.op == MO_JTAB || tm.op == MO_JTE {
+            c.ok = false;
+            kind = WK_END;
+            pos = end0;
+        }
+        if kind == WK_FALL {
+            if i + 1 < nb {
+                sa = i + 1;
+            } else {
+                kind = WK_RET0;
+            }
+        }
+        c.s0.push(sa);
+        c.s1.push(sb);
+        c.tkind.push(kind);
+        c.tpos.push(pos);
+        c.tcond.push(end0);
+        c.rnum.push(0 - 1);
+        c.idom.push(0 - 1);
+        c.loop_head.push(0);
+        c.merge.push(0);
+        c.kid_first.push(0 - 1);
+        c.kid_next.push(0 - 1);
+        c.done.push(0);
+        i = i + 1;
+    }
+    if !c.ok || nb == 0 {
+        c.ok = false;
+        return c;
+    }
+    // Postorder from the entry, by an explicit stack (block, next successor)
+    var state: Vec<i64> = Vec::new();
+    i = 0;
+    while i < nb {
+        state.push(0);
+        i = i + 1;
+    }
+    var order: Vec<i64> = Vec::new();
+    var stk: Vec<i64> = Vec::new();
+    var nxt: Vec<i64> = Vec::new();
+    stk.push(0);
+    nxt.push(0);
+    state.set(0, 1);
+    while stk.len() > 0 {
+        var top: i64 = stk.get(stk.len() - 1);
+        var e: i64 = nxt.get(nxt.len() - 1);
+        if e < 2 {
+            nxt.set(nxt.len() - 1, e + 1);
+            var y: i64 = c.s0.get(top);
+            if e == 1 {
+                y = c.s1.get(top);
+            }
+            if y >= 0 && state.get(y) == 0 {
+                state.set(y, 1);
+                stk.push(y);
+                nxt.push(0);
+            }
+        } else {
+            order.push(top);
+            stk.truncate(stk.len() - 1);
+            nxt.truncate(nxt.len() - 1);
+        }
+    }
+    var nr: i64 = order.len();
+    i = 0;
+    while i < nr {
+        c.rnum.set(order.get(i), nr - 1 - i);
+        i = i + 1;
+    }
+    // Predecessors of the reachable blocks, as offsets into one list
+    var poff: Vec<i64> = Vec::new();
+    i = 0;
+    while i <= nb {
+        poff.push(0);
+        i = i + 1;
+    }
+    i = 0;
+    while i < nb {
+        if c.rnum.get(i) >= 0 {
+            if c.s0.get(i) >= 0 {
+                poff.set(c.s0.get(i) + 1, poff.get(c.s0.get(i) + 1) + 1);
+            }
+            if c.s1.get(i) >= 0 {
+                poff.set(c.s1.get(i) + 1, poff.get(c.s1.get(i) + 1) + 1);
+            }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < nb {
+        poff.set(i + 1, poff.get(i + 1) + poff.get(i));
+        i = i + 1;
+    }
+    var plist: Vec<i64> = Vec::new();
+    var fill: Vec<i64> = Vec::new();
+    i = 0;
+    while i < nb {
+        fill.push(poff.get(i));
+        i = i + 1;
+    }
+    i = 0;
+    while i < poff.get(nb) {
+        plist.push(0);
+        i = i + 1;
+    }
+    i = 0;
+    while i < nb {
+        if c.rnum.get(i) >= 0 {
+            var wsi: i64 = 0;
+            while wsi < 2 {
+                var to: i64 = c.s0.get(i);
+                if wsi == 1 {
+                    to = c.s1.get(i);
+                }
+                if to >= 0 {
+                    plist.set(fill.get(to), i);
+                    fill.set(to, fill.get(to) + 1);
+                }
+                wsi = wsi + 1;
+            }
+        }
+        i = i + 1;
+    }
+    // Immediate dominators, over reverse postorder after the entry
+    c.idom.set(0, 0);
+    var changed: bool = true;
+    while changed {
+        changed = false;
+        var oi: i64 = nr - 2;
+        while oi >= 0 {
+            var bb: i64 = order.get(oi);
+            var nd: i64 = 0 - 1;
+            var pi: i64 = poff.get(bb);
+            while pi < poff.get(bb + 1) {
+                var p: i64 = plist.get(pi);
+                if c.idom.get(p) >= 0 {
+                    if nd < 0 {
+                        nd = p;
+                    } else {
+                        nd = wg_cfg_isect(&c, p, nd);
+                    }
+                }
+                pi = pi + 1;
+            }
+            if nd != c.idom.get(bb) {
+                c.idom.set(bb, nd);
+                changed = true;
+            }
+            oi = oi - 1;
+        }
+    }
+    // Back edges (to a block not later in reverse postorder) make loop
+    // headers and must go to a dominator of their source (or the CFG is
+    // irreducible); forward edges count towards merge nodes. An edge is
+    // counted once per successor slot: a Branch with both sides the same
+    // block gives it two.
+    var fwd: Vec<i64> = Vec::new();
+    i = 0;
+    while i < nb {
+        fwd.push(0);
+        i = i + 1;
+    }
+    i = 0;
+    while i < nb {
+        if c.rnum.get(i) >= 0 {
+            var wk: i64 = 0;
+            while wk < 2 {
+                var t: i64 = c.s0.get(i);
+                if wk == 1 {
+                    t = c.s1.get(i);
+                }
+                if t >= 0 {
+                    if c.rnum.get(t) <= c.rnum.get(i) {
+                        c.loop_head.set(t, 1);
+                        var x: i64 = i;
+                        while x != t && x != 0 {
+                            x = c.idom.get(x);
+                        }
+                        if x != t {
+                            c.ok = false;
+                        }
+                    } else {
+                        fwd.set(t, fwd.get(t) + 1);
+                    }
+                }
+                wk = wk + 1;
+            }
+        }
+        i = i + 1;
+    }
+    // Merge children: pushed to the front in increasing reverse postorder,
+    // so each list starts with its latest
+    var ri: i64 = nr - 2;
+    while ri >= 0 {
+        var yb: i64 = order.get(ri);
+        if fwd.get(yb) >= 2 {
+            c.merge.set(yb, 1);
+            var xb: i64 = c.idom.get(yb);
+            c.kid_next.set(yb, c.kid_first.get(xb));
+            c.kid_first.set(xb, yb);
+        }
+        ri = ri - 1;
+    }
+    return c;
+}
+
 /// The nearest common dominator of reachable blocks a and b.
 fn wg_cfg_isect(c: &WgCfg, a: i64, b: i64) -> i64 {
     var x: i64 = a;
@@ -3775,10 +4043,21 @@ fn wg_gen_primitive(g: &mut WasmGen, name: str) {
         wgset(g, 1);
         wi64(g, 0);
         wlget(g, 1);
+        if g.mir_mode {
+            var pad1: i64 = 0;
+            while pad1 < WM_ARGS - 2 {
+                wi64(g, 0);
+                pad1 = pad1 + 1;
+            }
+        }
         wlget(g, 0);
         wwrap(g);
         w(g, 0x11);
-        wu(g, wg_type_n(g, 2));
+        if g.mir_mode {
+            wu(g, wg_type_n(g, WM_ARGS));
+        } else {
+            wu(g, wg_type_n(g, 2));
+        }
         wu(g, 0);
         w(g, 0x1A);
         wgget(g, WG_G_ST);
@@ -3827,10 +4106,21 @@ fn wg_gen_primitive(g: &mut WasmGen, name: str) {
                 wload(g, 8, false, j * 8);
                 j = j + 1;
             }
+            if g.mir_mode {
+                var pad2: i64 = k2 + 1;
+                while pad2 < WM_ARGS {
+                    wi64(g, 0);
+                    pad2 = pad2 + 1;
+                }
+            }
             wlget(g, 0);
             wwrap(g);
             w(g, 0x11);
-            wu(g, wg_type_n(g, k2 + 1));
+            if g.mir_mode {
+                wu(g, wg_type_n(g, WM_ARGS));
+            } else {
+                wu(g, wg_type_n(g, k2 + 1));
+            }
             wu(g, 0);
             w(g, 0x0F);
             wendif(g);
@@ -3973,11 +4263,22 @@ fn wg_gen_start(g: &mut WasmGen, exit_ix: i64) {
     wi64(g, 0);
     wgget(g, WG_G_CUR);
     wload(g, 8, false, 120);
+    if g.mir_mode {
+        var pad0: i64 = 0;
+        while pad0 < WM_ARGS - 2 {
+            wi64(g, 0);
+            pad0 = pad0 + 1;
+        }
+    }
     wgget(g, WG_G_CUR);
     wload(g, 8, false, 112);
     wwrap(g);
     w(g, 0x11);
-    wu(g, wg_type_n(g, 2));
+    if g.mir_mode {
+        wu(g, wg_type_n(g, WM_ARGS));
+    } else {
+        wu(g, wg_type_n(g, 2));
+    }
     wu(g, 0);
     wendif(g);
     wlset(g, 0);
@@ -4230,6 +4531,1002 @@ fn wb_name_section(out: &mut Vec<i64>, names: &Vec<str>) {
     wb_section(out, 0, &contents);
 }
 
+// ─── MIR target (TG16) ------------------------------------------------------
+
+const WM_ARGS: i64 = 11;
+const WM_LK_FN: i64 = 1;
+const WM_LK_STR: i64 = 2;
+const WM_LK_GLOB: i64 = 3;
+const WM_LK_PANIC: i64 = 4;
+
+fn wm_mir_on() -> bool {
+    return p_getenv("FID_WASM_MIR") == "1";
+}
+
+fn wm_arg_phys(i: i64) -> i64 {
+    if i < 8 { return i; }
+    return i + 5;
+}
+
+fn wm_rloc(r: i64) -> i64 {
+    return WM_ARGS + r;
+}
+
+fn wm_rget(g: &mut WasmGen, r: i64) {
+    wlget(g, wm_rloc(r));
+}
+
+fn wm_rset(g: &mut WasmGen, r: i64) {
+    if r == 31 { w(g, 0x1A); } else { wlset(g, wm_rloc(r)); }
+}
+
+fn wm_init(g: &mut WasmGen, sel: &NatGen) {
+    g.mir_mode = true;
+    var i: i64 = 0;
+    while i < sel.recs.len() {
+        g.mir_recs.push(sel.recs.get(i));
+        HashMap_insert(g.mir_rec_index, sel.recs.get(i).name, i + 1);
+        i = i + 1;
+    }
+    var nl: i64 = sel.e.labels.len();
+    i = 0;
+    while i < nl {
+        g.mir_label_kind.push(0);
+        g.mir_label_name.push("");
+        g.mir_label_text.push("");
+        g.mir_label_aux.push(0);
+        i = i + 1;
+    }
+    i = 0;
+    while i < sel.fn_label_names.len() {
+        var nm: str = sel.fn_label_names.get(i);
+        if HashMap_contains(sel.fn_labels, nm) {
+            var l: i64 = HashMap_get(sel.fn_labels, nm);
+            if l >= 0 && l < nl {
+                g.mir_label_kind.set(l, WM_LK_FN);
+                g.mir_label_name.set(l, nm);
+            }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < sel.strs.len() {
+        var st: str = sel.strs.get(i);
+        if HashMap_contains(sel.str_labels, st) {
+            var sl: i64 = HashMap_get(sel.str_labels, st);
+            if sl >= 0 && sl < nl {
+                g.mir_label_kind.set(sl, WM_LK_STR);
+                g.mir_label_text.set(sl, st);
+            }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < sel.globs.len() {
+        var gn: str = sel.globs.get(i);
+        if HashMap_contains(sel.glob_labels, gn) {
+            var gl: i64 = HashMap_get(sel.glob_labels, gn);
+            if gl >= 0 && gl < nl {
+                g.mir_label_kind.set(gl, WM_LK_GLOB);
+                g.mir_label_name.set(gl, gn);
+            }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < sel.panic_labels.len() {
+        var pl: i64 = sel.panic_labels.get(i);
+        if pl >= 0 && pl < nl {
+            g.mir_label_kind.set(pl, WM_LK_PANIC);
+            g.mir_label_aux.set(pl, i);
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < sel.named_fns.len() {
+        var nf: str = sel.named_fns.get(i);
+        if wg_has_fn(g, nf) && !HashMap_contains(g.named_seen, nf) {
+            HashMap_insert(g.named_seen, nf, 1);
+            wg_table_ref(g, nf);
+            g.named_fns.push(nf);
+        }
+        i = i + 1;
+    }
+}
+
+fn wm_label_kind(g: &WasmGen, l: i64) -> i64 {
+    if l >= 0 && l < g.mir_label_kind.len() { return g.mir_label_kind.get(l); }
+    return 0;
+}
+
+fn wm_badop(g: &mut WasmGen, rec: &NatFnRec, op: i64) {
+    var msg: str = rec.name + ": unsupported MIR op " + int_to_str(op);
+    var seen: bool = false;
+    var i: i64 = 0;
+    while i < g.mir_bad.len() {
+        if g.mir_bad.get(i) == msg { seen = true; }
+        i = i + 1;
+    }
+    if !seen { g.mir_bad.push(msg); }
+    w(g, 0x00);
+}
+
+fn wm_cmp_cond(g: &mut WasmGen, a: i64, b: i64, cc: i64) {
+    wm_rget(g, a);
+    wm_rget(g, b);
+    var op: i64 = 0x51;
+    if cc == NCC_NE { op = 0x52; }
+    if cc == NCC_LT { op = 0x53; }
+    if cc == NCC_LTU { op = 0x54; }
+    if cc == NCC_GT { op = 0x55; }
+    if cc == NCC_GTU { op = 0x56; }
+    if cc == NCC_LE { op = 0x57; }
+    if cc == NCC_LEU { op = 0x58; }
+    if cc == NCC_GE { op = 0x59; }
+    if cc == NCC_GEU { op = 0x5A; }
+    w(g, op);
+}
+
+fn wm_push_float(g: &mut WasmGen, r: i64, is32: bool) {
+    wm_rget(g, r);
+    if is32 {
+        wwrap(g);
+        w(g, 0xBE);
+    } else {
+        w(g, 0xBF);
+    }
+}
+
+fn wm_set_float_bits(g: &mut WasmGen, r: i64, is32: bool) {
+    if is32 {
+        w(g, 0xBC);
+        wextu(g);
+    } else {
+        w(g, 0xBD);
+    }
+    wm_rset(g, r);
+}
+
+fn wm_addr(g: &mut WasmGen, label: i64, module: &IrModule) {
+    var k: i64 = wm_label_kind(g, label);
+    if k == WM_LK_FN {
+        wi64(g, wg_table_ref(g, g.mir_label_name.get(label)));
+        return;
+    }
+    if k == WM_LK_STR {
+        wi64(g, wg_str(g, g.mir_label_text.get(label)));
+        return;
+    }
+    if k == WM_LK_GLOB {
+        wi64(g, wg_glob(g, g.mir_label_name.get(label), module));
+        return;
+    }
+    wi64(g, 0);
+}
+
+fn wm_push_args(g: &mut WasmGen, n: i64) {
+    var i: i64 = 0;
+    while i < n {
+        wm_rget(g, wm_arg_phys(i));
+        i = i + 1;
+    }
+}
+
+fn wm_call_import_mir(g: &mut WasmGen, ix: i64) {
+    var sig: str = g.imp_sigs.get(ix);
+    var gt: i64 = str_find(sig, ">");
+    var i: i64 = 0;
+    while i < gt {
+        wm_rget(g, wm_arg_phys(i));
+        if str_byte_at(sig, i) == 105 { wwrap(g); }
+        i = i + 1;
+    }
+    wcall(g, ix);
+    if gt + 1 < str_len(sig) {
+        if str_byte_at(sig, gt + 1) == 105 { wexts(g); }
+    } else {
+        wi64(g, 0);
+    }
+    wm_rset(g, 0);
+}
+
+fn wm_call_mir(g: &mut WasmGen, rec: &NatFnRec, label: i64) {
+    if wm_label_kind(g, label) != WM_LK_FN {
+        wm_badop(g, rec, MO_CALL);
+        wi64(g, 0);
+        wm_rset(g, 0);
+        return;
+    }
+    var name: str = g.mir_label_name.get(label);
+    var np: i64 = wg_prim_params(name);
+    if np >= 0 {
+        wm_push_args(g, np);
+        var pf: i64 = wg_fn_ref(g, name);
+        if pf < 0 { w(g, 0x00); wi64(g, 0); } else { wcall(g, pf); }
+        wm_rset(g, 0);
+        return;
+    }
+    if HashMap_contains(g.c_names, name) {
+        var cname: str = g.c_list.get(HashMap_get(g.c_names, name) - 1);
+        if HashMap_contains(g.imp_index, cname) {
+            wm_call_import_mir(g, HashMap_get(g.imp_index, cname) - 1);
+            return;
+        }
+        var prim: str = "nat_c_" + cname;
+        var pp: i64 = wg_prim_params(prim);
+        if pp >= 0 {
+            wm_push_args(g, pp);
+            var cf: i64 = wg_fn_ref(g, prim);
+            if cf < 0 { w(g, 0x00); wi64(g, 0); } else { wcall(g, cf); }
+            wm_rset(g, 0);
+            return;
+        }
+        if !wg_has_fn(g, wg_resolve(g, name)) {
+            if !HashMap_contains(g.unresolved_seen, "C " + cname) {
+                HashMap_insert(g.unresolved_seen, "C " + cname, 1);
+                p_eprint_str("[wasm] warning: C function " + cname + " (from " + g.cur_name + ") has no WebAssembly version: calling it panics
+");
+            }
+            wg_panic_msg(g, "not available in WebAssembly: C function " + cname + " (build with `fid ccompile --target wasm32-wasi`)");
+            wi64(g, 0);
+            wm_rset(g, 0);
+            return;
+        }
+    }
+    wm_push_args(g, WM_ARGS);
+    var fx: i64 = wg_fn_ref(g, name);
+    if fx < 0 { w(g, 0x00); wi64(g, 0); } else { wcall(g, fx); }
+    wm_rset(g, 0);
+}
+
+fn wm_copy(g: &mut WasmGen, n: i64, dr: i64, sr: i64) {
+    wi64(g, 0);
+    wlset(g, g.t0);
+    w(g, 0x02);
+    w(g, WT_VOID);
+    w(g, 0x03);
+    w(g, WT_VOID);
+    wlget(g, g.t0);
+    wi64(g, n);
+    w(g, 0x5A);
+    w(g, 0x0D);
+    wu(g, 1);
+    wm_rget(g, dr);
+    wlget(g, g.t0);
+    w(g, 0x7C);
+    wwrap(g);
+    wm_rget(g, sr);
+    wlget(g, g.t0);
+    w(g, 0x7C);
+    wload(g, 1, false, 0);
+    wstore(g, 1, 0);
+    wlget(g, g.t0);
+    wi64(g, 1);
+    w(g, 0x7C);
+    wlset(g, g.t0);
+    wbr(g, 0);
+    wend(g);
+    wend(g);
+}
+
+fn wm_binop(g: &mut WasmGen, m: MInst, opcode: i64) {
+    wm_rget(g, m.r1);
+    wm_rget(g, m.r2);
+    w(g, opcode);
+    wm_rset(g, m.r0);
+}
+
+fn wm_mulh(g: &mut WasmGen, m: MInst) {
+    wm_rget(g, m.r1);
+    wi64(g, 4294967295);
+    w(g, 0x83);
+    wlset(g, g.t0);
+    wm_rget(g, m.r2);
+    wi64(g, 4294967295);
+    w(g, 0x83);
+    wlset(g, g.t1);
+    wm_rget(g, m.r1);
+    wi64(g, 32);
+    w(g, 0x88);
+    wlset(g, g.t2);
+    wm_rget(g, m.r2);
+    wi64(g, 32);
+    w(g, 0x88);
+    wlset(g, g.t3);
+    wlget(g, g.t0);
+    wlget(g, g.t1);
+    w(g, 0x7E);
+    wi64(g, 32);
+    w(g, 0x88);
+    wlset(g, g.t4);
+    wlget(g, g.t0);
+    wlget(g, g.t3);
+    w(g, 0x7E);
+    wi64(g, 4294967295);
+    w(g, 0x83);
+    wlget(g, g.t4);
+    w(g, 0x7C);
+    wlset(g, g.t4);
+    wlget(g, g.t2);
+    wlget(g, g.t1);
+    w(g, 0x7E);
+    wi64(g, 4294967295);
+    w(g, 0x83);
+    wlget(g, g.t4);
+    w(g, 0x7C);
+    wlset(g, g.t4);
+    wlget(g, g.t0);
+    wlget(g, g.t3);
+    w(g, 0x7E);
+    wi64(g, 32);
+    w(g, 0x88);
+    wlget(g, g.t2);
+    wlget(g, g.t1);
+    w(g, 0x7E);
+    wi64(g, 32);
+    w(g, 0x88);
+    w(g, 0x7C);
+    wlget(g, g.t2);
+    wlget(g, g.t3);
+    w(g, 0x7E);
+    w(g, 0x7C);
+    wlget(g, g.t4);
+    wi64(g, 32);
+    w(g, 0x88);
+    w(g, 0x7C);
+    wlset(g, g.t5);
+    if m.i0 == 0 {
+        wm_rget(g, m.r1);
+        wi64(g, 63);
+        w(g, 0x87);
+        wm_rget(g, m.r2);
+        w(g, 0x83);
+        wm_rget(g, m.r2);
+        wi64(g, 63);
+        w(g, 0x87);
+        wm_rget(g, m.r1);
+        w(g, 0x83);
+        w(g, 0x7C);
+        wlset(g, g.t4);
+        wlget(g, g.t5);
+        wlget(g, g.t4);
+        w(g, 0x7D);
+        wlset(g, g.t5);
+    }
+    wlget(g, g.t5);
+    wm_rset(g, m.r0);
+}
+
+fn wm_call_may_switch(g: &WasmGen, m: MInst) -> bool {
+    if m.op == MO_CALLR {
+        return g.as_ind;
+    }
+    if m.op != MO_CALL || wm_label_kind(g, m.i0) != WM_LK_FN {
+        return false;
+    }
+    return HashMap_contains(g.as_set, g.mir_label_name.get(m.i0));
+}
+
+fn wm_as_check(g: &mut WasmGen) {
+    wgget(g, WG_G_ST);
+    wwrap(g);
+    wif(g);
+    wi32(g, g.k);
+    wlset(g, g.cur);
+    wbr(g, g.nblocks - g.k + g.extra);
+    wendif(g);
+}
+
+fn wm_emit_inst(g: &mut WasmGen, rec: &NatFnRec, m: MInst, module: &IrModule) {
+    var op: i64 = m.op;
+    if op == MO_PLACE { return; }
+    if op == MO_LINE { g.cur_inst_line = m.i0; return; }
+    if op == MO_PROLOGUE { wm_prologue(g); return; }
+    if op == MO_LI { wi64(g, m.i0); wm_rset(g, m.r0); return; }
+    if op == MO_MOV { wm_rget(g, m.r1); wm_rset(g, m.r0); return; }
+    if op == MO_ADD { wm_binop(g, m, 0x7C); return; }
+    if op == MO_SUB { wm_binop(g, m, 0x7D); return; }
+    if op == MO_MUL { wm_binop(g, m, 0x7E); return; }
+    if op == MO_AND { wm_binop(g, m, 0x83); return; }
+    if op == MO_OR { wm_binop(g, m, 0x84); return; }
+    if op == MO_XOR { wm_binop(g, m, 0x85); return; }
+    if op == MO_SHL { wm_binop(g, m, 0x86); return; }
+    if op == MO_SAR { wm_binop(g, m, 0x87); return; }
+    if op == MO_SHR { wm_binop(g, m, 0x88); return; }
+    if op == MO_DIV {
+        wm_rget(g, m.r1); wm_rget(g, m.r2);
+        if m.i0 != 0 { w(g, 0x80); } else { w(g, 0x7F); }
+        wm_rset(g, m.r0); return;
+    }
+    if op == MO_REM {
+        wm_rget(g, m.r1); wm_rget(g, m.r2);
+        if m.i0 != 0 { w(g, 0x82); } else { w(g, 0x81); }
+        wm_rset(g, m.r0); return;
+    }
+    if op == MO_NEG { wi64(g, 0); wm_rget(g, m.r1); w(g, 0x7D); wm_rset(g, m.r0); return; }
+    if op == MO_NOT { wm_rget(g, m.r1); wi64(g, 0 - 1); w(g, 0x85); wm_rset(g, m.r0); return; }
+    if op == MO_MULH { wm_mulh(g, m); return; }
+    if op == MO_ADDI {
+        wm_rget(g, m.r1); wi64(g, m.i0); w(g, 0x7C); wm_rset(g, m.r0); return;
+    }
+    if op == MO_ANDN {
+        wm_rget(g, m.r1); wi64(g, 0 - 1); w(g, 0x85); wm_rget(g, m.r2); w(g, 0x83); wm_rset(g, m.r0); return;
+    }
+    if op == MO_BLSR {
+        wm_rget(g, m.r1);
+        if m.i0 == 2 {
+            wi64(g, 0); wm_rget(g, m.r1); w(g, 0x7D); w(g, 0x83);
+        } else {
+            wlset(g, g.t0);
+            wm_rget(g, m.r1); wi64(g, 1); w(g, 0x7D);
+            wlget(g, g.t0);
+            if m.i0 == 1 { w(g, 0x85); } else { w(g, 0x83); }
+        }
+        wm_rset(g, m.r0); return;
+    }
+    if op == MO_SHI {
+        wm_rget(g, m.r1); wi64(g, m.i0);
+        if m.i1 == 0 { w(g, 0x86); }
+        if m.i1 == 1 { w(g, 0x87); }
+        if m.i1 == 2 { w(g, 0x88); }
+        wm_rset(g, m.r0); return;
+    }
+    if op == MO_CSEL {
+        wm_rget(g, m.r2);
+        wm_rget(g, m.r0);
+        wm_rget(g, m.r1);
+        wi64(g, 0); w(g, 0x52);
+        w(g, 0x1B);
+        wm_rset(g, m.r0); return;
+    }
+    if op == MO_OPW {
+        wm_rget(g, m.r1); wm_rget(g, m.r2);
+        if m.i0 == 0 { w(g, 0x7C); }
+        if m.i0 == 1 { w(g, 0x7D); }
+        if m.i0 == 2 { w(g, 0x7E); }
+        w(g, 0xC4); wm_rset(g, m.r0); return;
+    }
+    if op == MO_LDX {
+        wm_rget(g, m.r1); wm_rget(g, m.r2); wi64(g, m.i2 >> 1); w(g, 0x86); w(g, 0x7C);
+        wload(g, m.i1, (m.i2 & 1) != 0, m.i0); wm_rset(g, m.r0); return;
+    }
+    if op == MO_STX {
+        wm_rget(g, m.r0); wm_rget(g, m.r2); wi64(g, m.i2 >> 1); w(g, 0x86); w(g, 0x7C); wwrap(g);
+        wm_rget(g, m.r1); wstore(g, m.i1, m.i0); return;
+    }
+    if op == MO_SETCC { wm_cmp_cond(g, m.r1, m.r2, m.i0); wextu(g); wm_rset(g, m.r0); return; }
+    if op == MO_EXT {
+        wm_rget(g, m.r1);
+        if m.i0 == NEXT_SB { w(g, 0xC2); }
+        if m.i0 == NEXT_SH { w(g, 0xC3); }
+        if m.i0 == NEXT_SW { w(g, 0xC4); }
+        if m.i0 == NEXT_ZB { wi64(g, 255); w(g, 0x83); }
+        if m.i0 == NEXT_ZH { wi64(g, 65535); w(g, 0x83); }
+        if m.i0 == NEXT_ZW { wwrap(g); wextu(g); }
+        wm_rset(g, m.r0); return;
+    }
+    if op == MO_ASR63 { wm_rget(g, m.r1); wi64(g, 63); w(g, 0x87); wm_rset(g, m.r0); return; }
+    if op == MO_ADDSHL {
+        wm_rget(g, m.r1); wm_rget(g, m.r2); wi64(g, m.i0); w(g, 0x86); w(g, 0x7C); wm_rset(g, m.r0); return;
+    }
+    if op == MO_SLOTADDR { wlget(g, g.fp); wi64(g, m.i0); w(g, 0x7C); wm_rset(g, m.r0); return; }
+    if op == MO_LDSLOT { wlget(g, g.fp); wload(g, 8, false, m.i0); wm_rset(g, m.r0); return; }
+    if op == MO_STSLOT { wlget(g, g.fp); wwrap(g); wm_rget(g, m.r0); wstore(g, 8, m.i0); return; }
+    if op == MO_LOAD { wm_rget(g, m.r1); wload(g, m.i0, m.i1 != 0, m.i2); wm_rset(g, m.r0); return; }
+    if op == MO_STORE { wm_rget(g, m.r0); wwrap(g); wm_rget(g, m.r1); wstore(g, m.i0, m.i1); return; }
+    if op == MO_ADDR { wm_addr(g, m.i0, module); wm_rset(g, m.r0); return; }
+    if op == MO_CALL {
+        wm_call_mir(g, rec, m.i0);
+        if g.as_fn && wm_call_may_switch(g, m) { wm_as_check(g); }
+        return;
+    }
+    if op == MO_CALLR {
+        wm_push_args(g, WM_ARGS);
+        wm_rget(g, m.r0); wwrap(g);
+        w(g, 0x11); wu(g, wg_type_n(g, WM_ARGS)); wu(g, 0);
+        wm_rset(g, 0);
+        if g.as_fn && wm_call_may_switch(g, m) { wm_as_check(g); }
+        return;
+    }
+    if op == MO_PANICIF {
+        wm_rget(g, m.r0); wi64(g, 0); w(g, 0x52); wif(g); wg_panic(g, m.i0); wendif(g); return;
+    }
+    if op == MO_TRAP { w(g, 0x00); return; }
+    if op == MO_FBIN {
+        wm_push_float(g, m.r1, m.i1 != 0); wm_push_float(g, m.r2, m.i1 != 0);
+        if m.i1 != 0 {
+            if m.i0 == 1 { w(g, 0x92); }
+            if m.i0 == 2 { w(g, 0x93); }
+            if m.i0 == 3 { w(g, 0x94); }
+            if m.i0 == 4 { w(g, 0x95); }
+        } else {
+            if m.i0 == 1 { w(g, 0xA0); }
+            if m.i0 == 2 { w(g, 0xA1); }
+            if m.i0 == 3 { w(g, 0xA2); }
+            if m.i0 == 4 { w(g, 0xA3); }
+        }
+        wm_set_float_bits(g, m.r0, m.i1 != 0); return;
+    }
+    if op == MO_FCMP {
+        wm_push_float(g, m.r1, m.i1 != 0); wm_push_float(g, m.r2, m.i1 != 0);
+        var fop: i64 = 0x61;
+        if m.i1 != 0 {
+            if m.i0 == NCC_EQ { fop = 0x5B; }
+            if m.i0 == NCC_NE { fop = 0x5C; }
+            if m.i0 == NCC_LT { fop = 0x5D; }
+            if m.i0 == NCC_GT { fop = 0x5E; }
+            if m.i0 == NCC_LE { fop = 0x5F; }
+            if m.i0 == NCC_GE { fop = 0x60; }
+        } else {
+            if m.i0 == NCC_EQ { fop = 0x61; }
+            if m.i0 == NCC_NE { fop = 0x62; }
+            if m.i0 == NCC_LT { fop = 0x63; }
+            if m.i0 == NCC_GT { fop = 0x64; }
+            if m.i0 == NCC_LE { fop = 0x65; }
+            if m.i0 == NCC_GE { fop = 0x66; }
+        }
+        w(g, fop); wextu(g); wm_rset(g, m.r0); return;
+    }
+    if op == MO_I2F {
+        wm_rget(g, m.r1);
+        if m.i1 != 0 {
+            if m.i2 != 0 { w(g, 0xB5); } else { w(g, 0xB4); }
+        } else {
+            if m.i2 != 0 { w(g, 0xBA); } else { w(g, 0xB9); }
+        }
+        wm_set_float_bits(g, m.r0, m.i1 != 0); return;
+    }
+    if op == MO_F2I {
+        wm_push_float(g, m.r1, m.i1 != 0); w(g, 0xFC);
+        if m.i1 != 0 { wu(g, 4); } else { wu(g, 6); }
+        wm_rset(g, m.r0); return;
+    }
+    if op == MO_F32BITS {
+        wm_push_float(g, m.r1, false); w(g, 0xB6); wm_set_float_bits(g, m.r0, true); return;
+    }
+    if op == MO_LDIN {
+        wlget(g, g.fp); wi64(g, g.frame); w(g, 0x7C); wload(g, 8, false, m.i0 * 8); wm_rset(g, m.r0); return;
+    }
+    if op == MO_STOUT {
+        wlget(g, g.fp); wwrap(g); wm_rget(g, m.r0); wstore(g, 8, m.i0 * 8); return;
+    }
+    if op == MO_COPY { wm_copy(g, m.i0, m.r0, m.r1); return; }
+    wm_badop(g, rec, op);
+}
+
+fn wm_branch_cond(g: &mut WasmGen, m: MInst) {
+    if m.op == MO_BRCC {
+        wm_cmp_cond(g, m.r0, m.r1, m.i1);
+        return;
+    }
+    if m.op == MO_TBNZ {
+        wm_rget(g, m.r0);
+        wi64(g, m.i1);
+        w(g, 0x88);
+        wi64(g, 1);
+        w(g, 0x83);
+        if m.i2 == 0 {
+            wi64(g, 0);
+            w(g, 0x52);
+        } else {
+            w(g, 0x50);
+        }
+        return;
+    }
+    wm_rget(g, m.r0);
+    if m.op == MO_BNEZ {
+        wi64(g, 0);
+        w(g, 0x52);
+    } else {
+        w(g, 0x50);
+    }
+}
+
+fn wm_st_goto(g: &mut WasmGen, c: &mut WgCfg, s: i64, t: i64, rec: &NatFnRec, module: &IrModule, mb: &MBlocks) {
+    var d: i64 = wg_st_depth(c, s, t);
+    if d >= 0 {
+        wbr(g, d);
+    } else if d == 0 - 1 {
+        wm_st_tree(g, c, t, rec, module, mb);
+    } else {
+        c.ok = false;
+        w(g, 0x00);
+    }
+}
+
+fn wm_st_tree(g: &mut WasmGen, c: &mut WgCfg, x: i64, rec: &NatFnRec, module: &IrModule, mb: &MBlocks) {
+    if !c.ok || c.done.get(x) == 1 {
+        c.ok = false;
+        w(g, 0x00);
+        return;
+    }
+    c.done.set(x, 1);
+    if c.loop_head.get(x) == 1 {
+        w(g, 0x03);
+        w(g, WT_VOID);
+        wg_st_push(c, WS_LOOP, x);
+        wm_st_within(g, c, x, c.kid_first.get(x), rec, module, mb);
+        wend(g);
+        wg_st_pop(c);
+    } else {
+        wm_st_within(g, c, x, c.kid_first.get(x), rec, module, mb);
+    }
+}
+
+fn wm_st_within(g: &mut WasmGen, c: &mut WgCfg, x: i64, y: i64, rec: &NatFnRec, module: &IrModule, mb: &MBlocks) {
+    if !c.ok {
+        return;
+    }
+    if y >= 0 {
+        w(g, 0x02);
+        w(g, WT_VOID);
+        wg_st_push(c, WS_BLOCK, y);
+        wm_st_within(g, c, x, c.kid_next.get(y), rec, module, mb);
+        wend(g);
+        wg_st_pop(c);
+        wm_st_tree(g, c, y, rec, module, mb);
+        return;
+    }
+    wm_st_code(g, c, x, rec, module, mb);
+}
+
+fn wm_st_code(g: &mut WasmGen, c: &mut WgCfg, x: i64, rec: &NatFnRec, module: &IrModule, mb: &MBlocks) {
+    var first: i64 = mb.start.get(x);
+    var pos: i64 = c.tpos.get(x);
+    var ii: i64 = first;
+    while ii < pos {
+        wm_emit_inst(g, rec, rec.mir.get(ii), module);
+        ii = ii + 1;
+    }
+    var kind: i64 = c.tkind.get(x);
+    if kind == WK_FALL || kind == WK_JUMP {
+        wm_st_goto(g, c, x, c.s0.get(x), rec, module, mb);
+        return;
+    }
+    if kind == WK_BRANCH {
+        var tm: MInst = rec.mir.get(pos);
+        var tb: i64 = c.s0.get(x);
+        var eb: i64 = c.s1.get(x);
+        var dt: i64 = wg_st_depth(c, x, tb);
+        var de: i64 = wg_st_depth(c, x, eb);
+        if dt >= 0 {
+            wm_branch_cond(g, tm);
+            w(g, 0x0D);
+            wu(g, dt);
+            wm_st_goto(g, c, x, eb, rec, module, mb);
+        } else if de >= 0 {
+            wm_branch_cond(g, tm);
+            w(g, 0x45);
+            w(g, 0x0D);
+            wu(g, de);
+            wm_st_goto(g, c, x, tb, rec, module, mb);
+        } else {
+            wm_branch_cond(g, tm);
+            w(g, 0x04);
+            w(g, WT_VOID);
+            wg_st_push(c, WS_IF, 0 - 1);
+            wm_st_goto(g, c, x, tb, rec, module, mb);
+            welse(g);
+            wm_st_goto(g, c, x, eb, rec, module, mb);
+            wend(g);
+            wg_st_pop(c);
+        }
+        return;
+    }
+    if kind == WK_END {
+        var em: MInst = rec.mir.get(pos);
+        if em.op == MO_EPILOGUE {
+            wm_epilogue(g);
+        } else {
+            w(g, 0x00);
+        }
+        return;
+    }
+    wi64(g, 0);
+    wm_rset(g, wm_arg_phys(0));
+    wm_epilogue(g);
+}
+
+
+fn wm_prologue(g: &mut WasmGen) {
+    if g.as_fn {
+        wgget(g, WG_G_ST);
+        wi64(g, 2);
+        w(g, 0x51);
+        wif(g);
+        welse(g);
+    }
+    wgget(g, 0);
+    if g.frame > 0 { wi64(g, g.frame); w(g, 0x7D); }
+    wltee(g, g.fp);
+    wgset(g, 0);
+    if g.frame > 0 {
+        wlget(g, g.fp);
+        wgget(g, WG_G_CUR);
+        wload(g, 8, false, 0);
+        w(g, 0x53);
+        wif(g);
+        wi64(g, WG_STACK_TOP);
+        wgset(g, 0);
+        wg_panic_msg(g, "Stack overflow");
+        wendif(g);
+    }
+    if g.as_fn {
+        wendif(g);
+    }
+}
+
+fn wm_epilogue(g: &mut WasmGen) {
+    wm_rget(g, wm_arg_phys(0));
+    if g.frame > 0 {
+        wlget(g, g.fp); wi64(g, g.frame); w(g, 0x7C); wgset(g, 0);
+    }
+    w(g, 0x0F);
+}
+
+fn wm_jump_mir(g: &mut WasmGen, target: i64) {
+    wi32(g, target);
+    wlset(g, g.cur);
+    wbr(g, g.nblocks - 1 - g.k + g.extra);
+}
+
+fn wm_term(g: &mut WasmGen, rec: &NatFnRec, m: MInst, b: i64, nb: i64, labmap: i64, pos: i64) {
+    if m.op == MO_JMP {
+        var t: i64 = HashMap_get(labmap, int_to_str(m.i0)) - 1;
+        if t >= 0 { wm_jump_mir(g, t); } else { w(g, 0x00); }
+        return;
+    }
+    if m.op == MO_BNEZ || m.op == MO_BEQZ || m.op == MO_BRCC || m.op == MO_TBNZ {
+        var tt: i64 = HashMap_get(labmap, int_to_str(m.i0)) - 1;
+        var ff: i64 = b + 1;
+        if ff >= nb || tt < 0 { w(g, 0x00); return; }
+        wi32(g, tt);
+        wi32(g, ff);
+        if m.op == MO_BRCC {
+            wm_cmp_cond(g, m.r0, m.r1, m.i1);
+        } else if m.op == MO_TBNZ {
+            wm_rget(g, m.r0);
+            wi64(g, m.i1);
+            w(g, 0x88);
+            wi64(g, 1);
+            w(g, 0x83);
+            if m.i2 == 0 { wi64(g, 0); w(g, 0x52); } else { w(g, 0x50); }
+        } else {
+            wm_rget(g, m.r0);
+            if m.op == MO_BNEZ { wi64(g, 0); w(g, 0x52); } else { w(g, 0x50); }
+        }
+        w(g, 0x1B);
+        wlset(g, g.cur);
+        wbr(g, g.nblocks - 1 - g.k + g.extra);
+        return;
+    }
+    if m.op == MO_JTAB {
+        var dt: i64 = HashMap_get(labmap, int_to_str(m.i0)) - 1;
+        if dt < 0 { w(g, 0x00); return; }
+        wi32(g, dt);
+        wlset(g, g.cur);
+        var jk: i64 = 0;
+        while jk < m.i1 {
+            var ent: MInst = rec.mir.get(pos + 1 + jk);
+            if ent.op == MO_JTE {
+                var et: i64 = HashMap_get(labmap, int_to_str(ent.i0)) - 1;
+                if et >= 0 {
+                    wm_rget(g, m.r0);
+                    wi64(g, jk);
+                    w(g, 0x51);
+                    wif(g);
+                    wi32(g, et);
+                    wlset(g, g.cur);
+                    wendif(g);
+                }
+            }
+            jk = jk + 1;
+        }
+        wbr(g, g.nblocks - 1 - g.k + g.extra);
+        return;
+    }
+    if m.op == MO_JTE { w(g, 0x00); return; }
+    if m.op == MO_EPILOGUE { wm_epilogue(g); return; }
+    if m.op == MO_TRAP { w(g, 0x00); return; }
+    if b + 1 < nb { wm_jump_mir(g, b + 1); } else { wi64(g, 0); wm_epilogue(g); }
+}
+
+fn m_i1_entries(m: MInst) -> i64 {
+    return m.i1;
+}
+
+fn wm_gen_function(g: &mut WasmGen, name: str, module: &IrModule) {
+    var ri: i64 = HashMap_get(g.mir_rec_index, name) - 1;
+    if ri < 0 { w(g, 0x00); return; }
+    var rec0: NatFnRec = g.mir_recs.get(ri);
+    g.cur_name = name;
+    g.b = Vec::new();
+    g.extra = 0;
+    g.as_here = false;
+    g.as_fn = HashMap_contains(g.as_set, name);
+    var rmir: Vec<MInst> = Vec::new();
+    var ci: i64 = 0;
+    while ci < rec0.mir.len() {
+        rmir.push(rec0.mir.get(ci));
+        ci = ci + 1;
+    }
+    if g.as_fn {
+        ci = 0;
+        while ci < rmir.len() {
+            var cm: MInst = rmir.get(ci);
+            if wm_call_may_switch(g, cm) {
+                rmir.insert(ci, mi_new(MO_PLACE, 0, 0, 0, 500000 + ci, 0, 0));
+                ci = ci + 1;
+            }
+            ci = ci + 1;
+        }
+    }
+    var rec: NatFnRec = NatFnRec {
+        name: rec0.name, mir: rmir, nvreg: rec0.nvreg, base_frame: rec0.base_frame, slots: rec0.slots, is_ct: rec0.is_ct, sret_v: rec0.sret_v, sret_size: rec0.sret_size, secret: rec0.secret
+    };
+    g.frame = (rec.base_frame + 15) & (0 - 16);
+    g.mir_nvreg = rec.nvreg;
+    var base: i64 = WM_ARGS + rec.nvreg;
+    g.fp = base;
+    g.t0 = base + 1;
+    g.t1 = base + 2;
+    g.t2 = base + 3;
+    g.t3 = base + 4;
+    g.t4 = base + 5;
+    g.t5 = base + 6;
+    g.cur = base + 7;
+    wu(g, 2);
+    wu(g, rec.nvreg + 7);
+    w(g, WT_I64);
+    wu(g, 1);
+    w(g, WT_I32);
+    var as_nl: i64 = g.cur;
+    var as_size: i64 = as_nl * 8 + 8;
+    if g.as_fn {
+        wgget(g, WG_G_ST);
+        wi64(g, 2);
+        w(g, 0x51);
+        wif(g);
+        wgget(g, WG_G_PTR);
+        wi64(g, as_size);
+        w(g, 0x7D);
+        wgset(g, WG_G_PTR);
+        var rj: i64 = 0;
+        while rj < as_nl {
+            wgget(g, WG_G_PTR);
+            wload(g, 8, false, rj * 8);
+            wlset(g, rj);
+            rj = rj + 1;
+        }
+        wgget(g, WG_G_PTR);
+        wload(g, 8, false, as_nl * 8);
+        wwrap(g);
+        wlset(g, g.cur);
+        wendif(g);
+        wgget(g, WG_G_ST);
+        wi64(g, 2);
+        w(g, 0x51);
+        wif(g);
+        welse(g);
+    }
+    var ai: i64 = 0;
+    while ai < WM_ARGS {
+        wlget(g, ai);
+        wm_rset(g, wm_arg_phys(ai));
+        ai = ai + 1;
+    }
+    if g.as_fn {
+        wendif(g);
+    }
+    var mb: MBlocks = mi_blocks(&rec.mir);
+    var nb: i64 = mb.start.len();
+    var labmap: i64 = HashMap_new();
+    var bi: i64 = 0;
+    while bi < nb {
+        var st: i64 = mb.start.get(bi);
+        if rec.mir.get(st).op == MO_PLACE {
+            HashMap_insert(labmap, int_to_str(rec.mir.get(st).i0), bi + 1);
+        }
+        bi = bi + 1;
+    }
+    if !g.as_fn && !g.cf_switch_only {
+        var st_mark: i64 = g.b.len();
+        var cfg: WgCfg = wm_cfg_build(&rec);
+        if mi_has_jtab(&rec.mir) {
+            cfg.ok = false;
+        }
+        if cfg.ok {
+            wm_st_tree(g, &mut cfg, 0, &rec, module, &mb);
+        }
+        if cfg.ok {
+            w(g, 0x00);
+            wend(g);
+            g.cf_struct = g.cf_struct + 1;
+            return;
+        }
+        g.b.truncate(st_mark);
+        g.extra = 0;
+        g.cf_irred = g.cf_irred + 1;
+    }
+    if !g.as_fn && g.cf_switch_only {
+        g.cf_forced = g.cf_forced + 1;
+    }
+    if g.as_fn {
+        g.cf_task = g.cf_task + 1;
+        w(g, 0x02);
+        w(g, WT_VOID);
+    }
+    g.nblocks = nb;
+    w(g, 0x03);
+    w(g, WT_VOID);
+    bi = 0;
+    while bi < nb { w(g, 0x02); w(g, WT_VOID); bi = bi + 1; }
+    wlget(g, g.cur);
+    w(g, 0x0E);
+    wu(g, nb);
+    bi = 0;
+    while bi < nb {
+        wu(g, bi);
+        bi = bi + 1;
+    }
+    wu(g, 0);
+    wend(g);
+    g.k = 0;
+    while g.k < nb {
+        var first: i64 = mb.start.get(g.k);
+        var last: i64 = mb.end.get(g.k);
+        var ii: i64 = first;
+        while ii <= last {
+            var mi: MInst = rec.mir.get(ii);
+            var is_term: bool = ii == last && (mi.op == MO_JMP || mi.op == MO_BNEZ || mi.op == MO_BEQZ || mi.op == MO_BRCC || mi.op == MO_TBNZ || mi.op == MO_JTAB || mi.op == MO_JTE || mi.op == MO_EPILOGUE || mi.op == MO_TRAP);
+            if mi.op == MO_JTAB {
+                wm_term(g, &rec, mi, g.k, nb, labmap, ii);
+                ii = ii + m_i1_entries(mi);
+            } else if !is_term && mi.op != MO_JTE { wm_emit_inst(g, &rec, mi, module); }
+            ii = ii + 1;
+        }
+        wm_term(g, &rec, rec.mir.get(last), g.k, nb, labmap, last);
+        wend(g);
+        g.k = g.k + 1;
+    }
+    wi64(g, 0);
+    wm_rset(g, wm_arg_phys(0));
+    wm_epilogue(g);
+    if g.as_fn {
+        wend(g);
+        wgget(g, WG_G_PTR);
+        wi64(g, as_size);
+        w(g, 0x7C);
+        wgget(g, 0);
+        w(g, 0x56);
+        wif(g);
+        wi64(g, 0);
+        wgset(g, WG_G_ST);
+        wg_panic_msg(g, "Stack overflow");
+        wendif(g);
+        var sj: i64 = 0;
+        while sj < as_nl {
+            wgget(g, WG_G_PTR);
+            wwrap(g);
+            wlget(g, sj);
+            wstore(g, 8, sj * 8);
+            sj = sj + 1;
+        }
+        wgget(g, WG_G_PTR);
+        wwrap(g);
+        wlget(g, g.cur);
+        wextu(g);
+        wstore(g, 8, as_nl * 8);
+        wgget(g, WG_G_PTR);
+        wi64(g, as_size);
+        w(g, 0x7C);
+        wgset(g, WG_G_PTR);
+        wi64(g, 0);
+        g.as_fn = false;
+    }
+    wend(g);
+}
+
 // ─── Public entry points ───────────────────────────────────────────────
 
 /// A WASI module from an IR module that has the Linux runtime and its
@@ -4279,6 +5576,10 @@ pub fn wasm_generate(module: IrModule) -> ResultBytes {
     // away, and the running program's context record (its frames are
     // saved from the bottom of the stack up)
     wg_as_analyze(&mut g, &module);
+    if wm_mir_on() {
+        var sel: NatGen = nat_select_mir(&module);
+        wm_init(&mut g, &sel);
+    }
     wg_data_align(&mut g);
     g.main_rec = WG_DATA_BASE + g.data.len();
     var mr: i64 = 0;
@@ -4310,7 +5611,11 @@ pub fn wasm_generate(module: IrModule) -> ResultBytes {
         if wg_has_fn(&g, name) {
             match IrModule_get_function(&module, name) {
                 OptIrFunction::Some(func) => {
-                    wg_gen_function(&mut g, name, &func, &module);
+                    if g.mir_mode {
+                        wm_gen_function(&mut g, name, &module);
+                    } else {
+                        wg_gen_function(&mut g, name, &func, &module);
+                    }
                 }
                 OptIrFunction::None => {
                     g.b = Vec::new();
@@ -4326,6 +5631,9 @@ pub fn wasm_generate(module: IrModule) -> ResultBytes {
         wb_append(&mut code, &g.b);
         nbodies = nbodies + 1;
         qi = qi + 1;
+    }
+    if g.mir_bad.len() > 0 {
+        return ResultBytes::Err(c_vec1("wasm MIR backend: unsupported machine operations: " + str_join(g.mir_bad, ", ")));
     }
     var tabs: Vec<i64> = wg_finish_data(&mut g, &module);
     // The panic trace table and the named-function table may queue no

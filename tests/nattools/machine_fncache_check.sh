@@ -17,11 +17,16 @@
 #     FID_VERIFY) writes X.fides-fncache, and a second such build is the
 #     same bytes; FID_FNCACHE=off and --no-fncache write no file.
 #  5. An edit: tests/nattools/nat_fncache_edit_a.fd fills a cache file and
-#     nat_fncache_edit_b.fd (same functions; pick names "mk" in a string,
-#     inner keeps many values in registers) is built with it. The build
-#     notices what no longer holds ("[fncache] built again without: ..."
-#     names mk, whose result in registers its name now forbids), has hits
-#     still, and prints B's expected lines, as a build without the cache.
+#     nat_fncache_edit_b.fd (another file: same functions, the unchanged
+#     ones on the same lines; pick names "mk" in a string, inner keeps
+#     many values in registers) is built with it. The build notices what
+#     no longer holds ("[fncache] built again without: ..." names mk, whose
+#     result in registers its name now forbids), reuses all but a few
+#     functions (SP6 acceptance: at most EDIT_MAX_COMPILED, default 10,
+#     compiled again: pick, inner, mk, use_mk, outer, main and what their
+#     masks reach; before Nov 27 it reused none: the input file's path was
+#     in the salt), its image is byte for byte the one a build without the
+#     cache makes, and it prints B's expected lines.
 # Images run where they can: x86-64 Linux natively or in WSL, AArch64 /
 # RISC-V when QEMU_A64 / QEMU_RV name a qemu-user (e.g. "qemu-aarch64").
 # Usage: tests/nattools/machine_fncache_check.sh [fid]   Exit 1 on a failure.
@@ -32,7 +37,9 @@ mkdir -p "$OUT"
 PY=python3
 command -v python3 >/dev/null 2>&1 || PY=python
 RUN=""
-if command -v wsl.exe >/dev/null 2>&1; then RUN="wsl.exe -e"; fi
+# (WSL with a Linux distribution: `wsl.exe -e true` fails without one, and
+# every image check would then fail instead of being skipped)
+if command -v wsl.exe >/dev/null 2>&1 && wsl.exe -e true >/dev/null 2>&1; then RUN="wsl.exe -e"; fi
 fails=0
 ok() { echo "ok   $1"; }
 bad() { echo "FAIL $1"; fails=$((fails + 1)); }
@@ -152,7 +159,12 @@ for tgt in $TARGETS; do
     run_check "edit $tgt (A)" "$img-a" "$A" "$tgt"
     FID_FNCACHE="$img.cache" build "$img-b" "$B" "$tgt" --stats || { bad "edit $tgt: B builds with A's cache"; continue; }
     h=$(hits "$img-b.log")
+    nc=$(sed -n 's/^\[fncache\] .*, [0-9]* hits, \([0-9]*\) compiled, .*/\1/p' "$img-b.log" | tail -1)
+    att=$(sed -n 's/^\[fncache\] attempts: //p' "$img-b.log" | tail -1)
+    echo "     edit $tgt: B reuses ${h:-?} functions of A's cache, compiles ${nc:-?} (attempts: ${att:-1})"
     if [ -n "$h" ] && [ "$h" -gt 0 ]; then ok "edit $tgt: B has $h hits from A's cache"; else bad "edit $tgt: B has no hits (${h:-no [fncache] line})"; fi
+    if [ -n "$nc" ] && [ "$nc" -le "${EDIT_MAX_COMPILED:-10}" ]; then ok "edit $tgt: only $nc functions compiled again"
+    else bad "edit $tgt: ${nc:-?} functions compiled again (want at most ${EDIT_MAX_COMPILED:-10})"; fi
     again=$(sed -n 's/^\[fncache\] built again without: //p' "$img-b.log" | tail -1)
     case ", $again," in
         *", mk,"*) ok "edit $tgt: mk given up (its name is now in a string): $again" ;;
@@ -160,6 +172,8 @@ for tgt in $TARGETS; do
     esac
     run_check "edit $tgt (B on A's cache)" "$img-b" "$B" "$tgt"
     FID_FNCACHE=off build "$img-b-off" "$B" "$tgt" || { bad "edit $tgt: B builds without the cache"; continue; }
+    if cmp -s "$img-b" "$img-b-off"; then ok "edit $tgt: B on A's cache == B without the cache"
+    else bad "edit $tgt: B on A's cache differs from B without the cache ($(cmp "$img-b" "$img-b-off" 2>&1 | head -1))"; fi
     run_check "edit $tgt (B without the cache)" "$img-b-off" "$B" "$tgt"
 done
 

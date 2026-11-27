@@ -29,13 +29,26 @@ An entry is used when the file's salt and the function's key match:
 
 - salt (`nc_cfg_salt`, `nc_mod_salt`): the target, `--cpu`, the pass
   switches (FID_NAT_OFF / ON, the mid-end's), `--size`, the fast
-  allocator, line tables, the libfacts file, **the compiler itself**
+  allocator, whether the build has line tables (not the input file's
+  path), the libfacts file, **the compiler itself**
   (`inc_compiler_hash`: another fid emits other bytes) and **the
   `--profile-use` profile** (its block layout), plus the module's struct
-  layouts, globals, externs, trait tables and function names;
-- key (`nc_fn_hash`): the function's IR after `IrFunction_form_switches`.
+  layouts, globals, externs, trait tables and dyn types;
+- key (`nc_key_of`): the function's IR after `IrFunction_form_switches`,
+  its source lines included (`nc_fn_hash`: its line rows and panic-line
+  stubs are its recording's), and whether it gets line rows.
 
-The cache file format is 5 (entries carry their deps, below).
+Since Nov 27 (salt `nc16`) the function set is not in the salt: an edit
+that made the program reach one more runtime function, or one saved
+under another file name, hit nothing. What a function's code takes from
+the set is in its label log: each `ng_has_fn` answer (`H1:f` / `H0:f`)
+and each callee's convention (`ng_internal`, `I1:f` / `I0:f`), checked
+per entry with its refs (`nc_names_hold`). A function an edit moves to
+other lines (one inserted above it) is compiled again; one whose lines
+stay is replayed (making the key line-relative needs the fold keys and
+the debug variables relative too: not done).
+
+The cache file format is 8 (entries carry their deps, below).
 
 ## What a function's code takes for granted (SP6)
 
@@ -69,16 +82,28 @@ What only the recorded program as a whole tells is checked once known:
 - `nc_masks_hold`: a callee compiled again whose mask is not what the
   replayed code was allocated against.
 
-Each gives up the entry and every kept entry that relied on its mask or
-convention (`nc_give_up_callers`); `nat_generate_image` then makes the
-image again without them, at most twice, the third time with no hits.
-`--stats` (with `FID_FNCACHE` set) prints
+Each gives up that entry alone (`nc_give_up_callers`; before Nov 27 it
+gave up, transitively, every kept entry that recorded anything of it,
+so one edited function took its callers up to `main` with it):
+`nat_generate_image` makes the image again without it, and what its
+callers took for granted of it is checked against the function compiled
+again (its convention in `nc_validate`, its mask and escape summary at
+their replay), so a caller is compiled again only when its assumption
+changed, one level per attempt. Each attempt replays what the attempts
+before it compiled (`g_nc_carry`, `nc_carry_keep`): a function is
+compiled once per image. At most 8 attempts, then one with no hits.
+`FID_NAT_OFF=ncnarrow`: the transitive give-up, two attempts.
+`--stats` (with `FID_FNCACHE` set, or in `fid serve`) prints
 
 ```
 [fncache] entries from file, H hits, N compiled, cache written
+[fncache] attempts: 3 (4 functions compiled by an earlier one replayed)
 [fncache] stale (a callee changed): f, g
 [fncache] built again without: mk, use_mk, main
 ```
+
+H counts the functions replayed from the cache only; N those compiled
+in this image, by any attempt.
 
 So struct results in registers (`ng_rr_plan`) and RISC-V short calls are
 on under the cache, as without it. MI28's tail-call summaries too (SP20,
@@ -102,6 +127,8 @@ callee's summary under a replayed caller).
   test_machine_fncache_deps.fd, test_machine_fncache.fd and
   test_repro_fncache.fd on each target; results in registers and short
   RISC-V calls in use under the cache; the default cache file; an edit
-  (nat_fncache_edit_a.fd then nat_fncache_edit_b.fd on the same file).
+  (nat_fncache_edit_a.fd then nat_fncache_edit_b.fd on the same cache
+  file: at most 10 functions compiled again, the image the one a build
+  without the cache makes).
 - `tests/nattools/machine_batch7_check.sh` (SP6/SP20, SP7) and
   `scripts/repro-check.sh` (cache miss / hit = off).

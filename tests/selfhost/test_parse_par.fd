@@ -1,0 +1,270 @@
+// SP9: the pieces of the parallel parse of the import closure
+// (compiler/parser.fd "SP9: modules parsed ahead, in parallel"):
+// pp_parse_par gives, in 1, 2, 4 and 8 threads and run after run, the
+// Program a parse on this thread gives (compared as ast_ser bytes) and the
+// changes it would make besides (ParseSide: import names, `module::name`
+// calls, turbofish calls, `__pcall_k` locals, @secret and splice), with
+// none of the parser's globals touched; parser_side_fits says when its
+// numbers fit; pp_text_words and pp_bits_of give the words of a text and
+// what each is to a parser; token_module_scan reads what the import loop
+// needs from a module's tokens. Run from the repository root (it parses
+// compiler and stdlib files).
+//
+// Expected output:
+// words: fn | f | x | i64 | return | 1 | a | 1_000 | caf\xc3\xa9
+// bits: P=1 E=2 m=4 Q=0
+// scan uses: a::b | core | x::y | a::b
+// scan structs: S | T
+// scan enums: E
+// scan module: m::n
+// scan imports: b | core | z | w | b
+// texts: 7
+// side 0: imports m, calls m::g,m::g, turbofish 1, pcalls 1, secret true, splice true
+// side 1: imports -, calls -, turbofish 0, pcalls 0, secret false, splice false
+// globals untouched: true
+// par 1: same x2
+// par 2: same x2
+// par 4: same x2
+// par 8: same x2
+// fits now: false true
+// failed parse: ok false
+
+use core;
+use vec;
+use string;
+use compiler::token;
+use compiler::ast;
+use compiler::lexer;
+use compiler::parser;
+use compiler::ast_ser;
+
+fn join(v: Vec<str>, sep: str) -> str {
+    if v.len() == 0 {
+        return "-";
+    }
+    var s: str = "";
+    var i: i64 = 0;
+    while i < v.len() {
+        if i > 0 {
+            s = s + sep;
+        }
+        s = s + v.get(i);
+        i = i + 1;
+    }
+    return s;
+}
+
+fn show_word(w: str) -> str {
+    var s: str = "";
+    var i: i64 = 0;
+    while i < str_len(w) {
+        var c: i64 = str_byte_at(w, i) & 255;
+        if c >= 128 {
+            s = s + "\\x" + int_to_hex2(c);
+        } else {
+            s = s + byte_to_str(c);
+        }
+        i = i + 1;
+    }
+    return s;
+}
+
+fn int_to_hex2(c: i64) -> str {
+    var d: str = "0123456789abcdef";
+    return str_slice(d, c / 16, c / 16 + 1) + str_slice(d, c % 16, c % 16 + 1);
+}
+
+fn prog_bytes(p: Program) -> Vec<i64> {
+    var b: AwBuf = awbuf_new();
+    aw_program(&mut b, p);
+    return b.bytes;
+}
+
+fn same_bytes(a: Vec<i64>, b: Vec<i64>) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    var i: i64 = 0;
+    while i < a.len() {
+        if a.get(i) != b.get(i) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn same_strs(a: Vec<str>, b: Vec<str>) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    var i: i64 = 0;
+    while i < a.len() {
+        if a.get(i) != b.get(i) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn read_or_empty(path: str) -> str {
+    match read_file(path) {
+        Option::Some(t) => {
+            return t;
+        }
+        Option::None => {
+            return "";
+        }
+    }
+    return "";
+}
+
+fn lex(text: str) -> Vec<Token> {
+    var lx: Lexer = Lexer::new(text);
+    return lx.tokenize();
+}
+
+fn main() -> i64 {
+    // the words of a text, and what each is to a parser
+    var ws: Vec<str> = pp_text_words("fn f(x: i64) { return 1 + a; } // 1_000 x café");
+    var wl: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < ws.len() {
+        wl.push(show_word(ws.get(i)));
+        i = i + 1;
+    }
+    println("words: " + join(wl, " | "));
+    var bsn: Vec<str> = Vec::new();
+    bsn.push("P");
+    var ben: Vec<str> = Vec::new();
+    ben.push("E");
+    var bin: Vec<str> = Vec::new();
+    bin.push("m");
+    var bp: Parser = Parser_side(lex(""), bsn, ben, bin);
+    println("bits: P=" + int_to_str(pp_bits_of(bp, "P")) + " E=" + int_to_str(pp_bits_of(bp, "E")) + " m=" + int_to_str(pp_bits_of(bp, "m")) + " Q=" + int_to_str(pp_bits_of(bp, "Q")));
+    parser_side_free(&mut bp);
+
+    // what the import loop reads from a module's tokens
+    var msc: ModScan = token_module_scan(lex("module m::n;\nuse a::b;\npub use core;\nstruct S { x: i64 }\n@repr(C) pub struct T { y: i64 }\nenum E { A }\nuse x::y as z;\nfn f() { use q::w; struct Inner { } }\nuse a::b::{c};\n"));
+    println("scan uses: " + join(msc.uses_all, " | "));
+    println("scan structs: " + join(msc.structs, " | "));
+    println("scan enums: " + join(msc.enums, " | "));
+    println("scan module: " + msc.module);
+    println("scan imports: " + join(msc.import_names, " | "));
+
+    // module texts: one with everything a parse changes besides its
+    // Program, one with none of it, real files, one that does not parse
+    var texts: Vec<str> = Vec::new();
+    texts.push("use m;\nstruct P { a: i64 }\nfn id<T>(x: T) -> T { return x; }\nfn mk(n: i64) -> fn(i64) -> i64 { return |y: i64| y + n; }\n@secret\nfn k() -> i64 { return 7; }\nimpl<'a> P { fn get(self: &'a P) -> &'a i64 { return &self.a; } }\nfn main() -> i64 {\n    var p: P = P { a: 1 };\n    var v = Vec::new();\n    v.push(1.5);\n    var s: str = f\"{m::g(2)}\";\n    var t: i64 = comptime splice { return \"1\"; };\n    return id::<i64>(p.a) + mk(1)(2) + m::g(3);\n}\n");
+    texts.push("enum E { A, B(i64) }\nfn h(e: E) -> i64 { match e { E::A => { return 0; } E::B(v) => { return v; } } }\n");
+    texts.push(read_or_empty("compiler/token.fd"));
+    texts.push(read_or_empty("compiler/lexer.fd"));
+    texts.push(read_or_empty("stdlib/vec.fd"));
+    texts.push(read_or_empty("stdlib/string.fd"));
+    texts.push("fn broken( { return 1; }\n");
+    var n: i64 = texts.len();
+    println("texts: " + int_to_str(n));
+    var toks: Vec<Vec<Token>> = Vec::new();
+    i = 0;
+    while i < n {
+        toks.push(lex(texts.get(i)));
+        i = i + 1;
+    }
+    var snames: Vec<str> = Vec::new();
+    snames.push("Token");
+    snames.push("Lexer");
+    var enames: Vec<str> = Vec::new();
+    enames.push("TokenKind");
+
+    // the parse ahead first: the parser's globals must not change
+    var tf_before: i64 = turbofish_all().len();
+    var in_before: i64 = parser_import_names().len();
+    var sn_n: Vec<i64> = Vec::new();
+    var en_n: Vec<i64> = Vec::new();
+    var in_n: Vec<i64> = Vec::new();
+    i = 0;
+    while i < n {
+        sn_n.push(snames.len());
+        en_n.push(enames.len());
+        in_n.push(0);
+        i = i + 1;
+    }
+    var none: Vec<str> = Vec::new();
+    var first: Vec<PreParse> = pp_parse_par(toks, texts, snames, enames, none, sn_n, en_n, in_n, 4);
+    var untouched: bool = turbofish_all().len() == tf_before && parser_import_names().len() == in_before && parser_pcall_count() == 0 && !parser_saw_secret() && !parser_saw_splice() && parser_qualified_calls().len() == 0;
+    var s0: ParseSide = first.get(0).side;
+    println("side 0: imports " + join(s0.import_adds, ",") + ", calls " + join(s0.qcalls, ",") + ", turbofish " + int_to_str(s0.turbofish.len()) + ", pcalls " + int_to_str(s0.pcalls) + ", secret " + bool_to_str(s0.secret) + ", splice " + bool_to_str(s0.splice));
+    var s1: ParseSide = first.get(1).side;
+    println("side 1: imports " + join(s1.import_adds, ",") + ", calls " + join(s1.qcalls, ",") + ", turbofish " + int_to_str(s1.turbofish.len()) + ", pcalls " + int_to_str(s1.pcalls) + ", secret " + bool_to_str(s1.secret) + ", splice " + bool_to_str(s1.splice));
+    println("globals untouched: " + bool_to_str(untouched));
+
+    // the parses here, one after another (the globals count from 0: text 0
+    // is the only one that numbers anything); each text starts from an
+    // empty import set, as the parse ahead did, so text 0's `use m` is
+    // known only to its own parse
+    var seq_bytes: Vec<Vec<i64>> = Vec::new();
+    var seq_ok: Vec<bool> = Vec::new();
+    var seq_calls: Vec<Vec<str>> = Vec::new();
+    i = 0;
+    while i < n {
+        take_qualified_calls();
+        var p: Parser = Parser_with_names(toks.get(i), snames, enames);
+        match p.parse() {
+            ParseResultProgram::Ok(prog) => {
+                seq_bytes.push(prog_bytes(prog));
+                seq_ok.push(true);
+            }
+            ParseResultProgram::Err(_) => {
+                seq_bytes.push(Vec::new());
+                seq_ok.push(false);
+            }
+        }
+        seq_calls.push(take_qualified_calls());
+        i = i + 1;
+    }
+    // what the sequential parse of text 0 changed: as its side says
+    var seq_side_ok: bool = turbofish_all().len() - tf_before == s0.turbofish.len() && parser_pcall_count() == s0.pcalls && parser_saw_secret() == s0.secret && parser_saw_splice() == s0.splice;
+
+    var nws: Vec<i64> = Vec::new();
+    nws.push(1);
+    nws.push(2);
+    nws.push(4);
+    nws.push(8);
+    var wi: i64 = 0;
+    while wi < nws.len() {
+        var all_same: bool = seq_side_ok;
+        var run: i64 = 0;
+        while run < 2 {
+            var got: Vec<PreParse> = pp_parse_par(toks, texts, snames, enames, none, sn_n, en_n, in_n, nws.get(wi));
+            if got.len() != n {
+                all_same = false;
+            }
+            var k: i64 = 0;
+            while all_same && k < n {
+                if got.get(k).ok != seq_ok.get(k) {
+                    all_same = false;
+                } else if seq_ok.get(k) && !same_bytes(prog_bytes(got.get(k).prog), seq_bytes.get(k)) {
+                    all_same = false;
+                } else if seq_ok.get(k) && !same_strs(got.get(k).side.qcalls, seq_calls.get(k)) {
+                    all_same = false;
+                } else if !same_strs(got.get(k).words, first.get(k).words) {
+                    all_same = false;
+                }
+                k = k + 1;
+            }
+            run = run + 1;
+        }
+        if all_same {
+            println("par " + int_to_str(nws.get(wi)) + ": same x2");
+        } else {
+            println("par " + int_to_str(nws.get(wi)) + ": DIFFERENT");
+        }
+        wi = wi + 1;
+    }
+    // the sequential parses numbered a turbofish call and a local: text 0's
+    // numbers from 0 no longer fit; text 1 numbered none
+    println("fits now: " + bool_to_str(parser_side_fits(s0)) + " " + bool_to_str(parser_side_fits(s1)));
+    println("failed parse: ok " + bool_to_str(first.get(n - 1).ok));
+    return 0;
+}

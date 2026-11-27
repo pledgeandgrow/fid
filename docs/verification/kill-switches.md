@@ -222,7 +222,8 @@ macOS targets and `--nat` Windows) and by the rule passes it runs
 | `FID_NAT_OFF=ldyn` | C functions imported through the dynamic linker (TG15: ELF dynamic section, dyld GOT slots, `--nat` Windows IAT) |
 | `FID_NAT_OFF=pie` | a position-independent Linux executable (TG14); wins over `--pie` and `FID_NAT_ON=pie` |
 | `FID_NAT_OFF=rvc` | RISC-V 2-byte instructions (TG9/TG19; on by default with every `--cpu` but `rv64g`) |
-| `FID_NAT_OFF=relink` | the function cache (SP7): functions put back in the kept layout; off: the layout is not kept |
+| `FID_NAT_OFF=relink` | the function cache (SP7): functions put back in the kept layout; off: the layout is not kept. Since Nov 27 relinking is asked for (`fid serve --relink` or `FID_NAT_ON=relink`): a kept layout is not the image a one-shot build makes (SP8) |
+| `FID_NAT_OFF=ncnarrow` | the function cache (SP6): a hit that no longer fits is given up alone, its callers checked against it in the next attempt (up to 8, each replaying what the earlier ones compiled); off: it and every entry that recorded anything of it are given up, transitively, in at most two attempts |
 
 Note `forward` is two passes: egraph.fd's (`FID_NAT_OFF=forward`) and
 iropt_me.fd's LF6 (`FID_IROPT_OFF=forward`); both are on by default.
@@ -346,7 +347,7 @@ not check them (Nov 21):
 | `FID_IROPT_OFF` | `retrange` | a call's result narrowed to the range its callee returns (LF10) |
 | `FID_IROPT_OFF` | `cfgcache` | the cached CFG, dominator and loop trees and use lists (OP3) |
 | `FID_IROPT_OFF` | `readcse`, `egplace` | the same as in `FID_NAT_OFF` (rules.fd, egraph.fd) |
-| `FID_IROPT_ON` | `paramrange` | parameters start at the ranges every call gives them (LF10, opt-in) |
+| `FID_IROPT_OFF` | `paramrange` | parameters start at the ranges every call gives them (LF10) |
 | `FID_NAT_OFF` | `egskel` (`FID_NAT_OFF=egskel`) | the e-graph's side-effect skeleton (ME7, opt-in) |
 | `FID_NAT_OFF` | `declline` | DB2: a function's declaration line is its `fn` line in the debug info (nat_enc.fd); off: the first row's line |
 | `FID_NAT_OFF` | `ehframe` | DB6: `.eh_frame` and `.eh_frame_hdr` in Linux images (nat_enc.fd) |
@@ -388,6 +389,7 @@ Other run-time switches:
 | `FID_CT_FALLBACK=1` | fatal comptime errors: a `comptime` that cannot be evaluated warns and runs when the program does, as before the hardening (reference.md §4.11, `s4_11_fallback_env_runs.fd`) |
 | `FID_CT_FUEL=N` | the comptime fuel budget (100 million steps by default; `<1` means a billion): the total work one evaluation pass may do, so a runaway comptime is an error, never a hang |
 | `FID_LOWER_ALL=1` | `emit` lowering only what `compiler/reach.fd` finds reachable |
+| `FID_PARSE_AHEAD=off` | with `FID_PAR=N`: the parse ahead of the import closure in N threads (SP9, compiler.fd pp_parse_ahead); the closure is still lexed ahead. `FID_PP_VERIFY=1` keeps the parse ahead but has the import loop parse every module itself too, keep its own parse and report each one it would have taken that differs (`[pp] verify:`; the `--time` row counts them) |
 
 ## Switches that need a rebuilt compiler
 

@@ -345,12 +345,12 @@ pub fn iropt_native(module: &mut IrModule) {
         }
         iro_time_note(&mut tp_names, &mut tp_ms, &mut tp_hits, "gconst", timing, tm0);
     }
-    // LF10 (checks.fd peir_note_param_ranges, opt-in: FID_IROPT_ON=
-    // paramrange): an internal function's i64 parameters start at the
-    // range every call gives them, and a call to one returning i64 the
-    // range of its returns (FID_IROPT_OFF=retrange: not these), in the
-    // range analysis of the passes below and of the backend. After the
-    // passes that change signatures
+    // LF10 (checks.fd peir_note_param_ranges, on by default;
+    // FID_IROPT_OFF=paramrange): an internal function's i64 parameters
+    // start at the range every call gives them, and a call to one
+    // returning i64 the range of its returns (FID_IROPT_OFF=retrange: not
+    // these), in the range analysis of the passes below and of the
+    // backend. After the passes that change signatures
     // (envtrim, ipcp, spec); a fact is used only while the parameter list
     // it was found for is unchanged.
     peir_prm_clear();
@@ -1794,10 +1794,16 @@ fn iro_inline_function(module: &IrModule, f: &mut IrFunction) -> bool {
                                                     // parameter's type, so what the body does by
                                                     // its operands' type (unsigned compares,
                                                     // divisions, shifts) stays unsigned
+                                                    // BG165: an f64 argument for an f32 parameter
+                                                    // (lowering leaves `takes(1.5)` an f64
+                                                    // ConstFloat) goes through the BitCast that is
+                                                    // IR's float conversion (`as f32`), so the
+                                                    // body's f32 operations read an f32 (nat_ir
+                                                    // read the double's low 32 bits: 0)
                                                     var arg: i64 = args.get(p);
                                                     var pty: IrType = callee.params.get(p).ty;
                                                     var aty: IrType = iro_value_ty(f, arg);
-                                                    if iro_is_scalar(pty) && iro_is_scalar(aty) && !ir_type_eq(aty, pty) && ir_type_size(aty) == ir_type_size(pty) {
+                                                    if iro_is_scalar(pty) && iro_is_scalar(aty) && !ir_type_eq(aty, pty) && (ir_type_size(aty) == ir_type_size(pty) || (ir_type_is_float(aty) && ir_type_is_float(pty))) {
                                                         var cid0: i64 = iro_detached(f, Inst::BitCast(arg, aty, pty));
                                                         fresh.push(cid0);
                                                         map.set(pid, cid0 + 1);
@@ -1826,8 +1832,18 @@ fn iro_inline_function(module: &IrModule, f: &mut IrFunction) -> bool {
                                                 }
                                                 q = q + 1;
                                             }
-                                            // The call is now a move of the inlined result
-                                            IrFunction_set_inst(f, id, Inst::BitCast(iro_m(map, body.ret), cty, cty));
+                                            // The call is now a move of the inlined result.
+                                            // BG165: an f64 returned from an f32 function
+                                            // (`return 2.5;`) is converted to the call's f32
+                                            // (the Return of a function that is not inlined
+                                            // narrows it in the backend)
+                                            var rv: i64 = iro_m(map, body.ret);
+                                            var rvty: IrType = cty;
+                                            var rvty0: IrType = iro_value_ty(f, rv);
+                                            if ir_type_is_float(rvty0) && ir_type_is_float(cty) {
+                                                rvty = rvty0;
+                                            }
+                                            IrFunction_set_inst(f, id, Inst::BitCast(rv, rvty, cty));
                                             fresh.push(id);
                                             done = true;
                                             changed = true;

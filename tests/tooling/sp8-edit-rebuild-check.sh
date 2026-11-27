@@ -19,9 +19,16 @@
 #   5. the error taken out again (the file as in 3): status 0 and the
 #      image of 3.
 # Prints each request's time (the server's own measure on stderr, `fid
-# serve: emit <file>: <ms> ms, ...`). The SP8 target is under 100 ms for
+# serve: emit <file>: <ms> ms, ...`) and, for the edited rebuilds of 2 and
+# 3, where it went (the request asks for --time; ROWS=0: not): the front
+# end, lowering, the mid-end, the machine layer and, with STATS=1 (the
+# request gets --stats too), how many functions the function cache
+# replayed ("[fncache] ... N hits, M compiled": SP6 wants M to be the
+# edited function and what inlined it). The SP8 target is under 100 ms for
 # the edited rebuilds of 2 and 3; the last line says whether it was met
-# (STRICT_TIME=1: a miss fails the script; correctness always does).
+# (STRICT_TIME=1: a miss fails the script; correctness always does). The
+# server is not started with --relink: an edited image must be the
+# one-shot build's (SP7's kept layout is not; relink_check.sh opts in).
 #   FID=release/fid.exe bash tests/tooling/sp8-edit-rebuild-check.sh
 #   MODE=debug (or release): one mode only.  TARGET_MS=<n>: another target.
 # Run from the repository root.
@@ -154,9 +161,18 @@ for mode in $MODE; do
         fi
         r=$((r + 1))
         out="$TMP/$mode-e$r$EXT"
-        A=$(ask "emit $TMP/prog.fd $TFLAGS $MF -o $out")
+        before=$(wc -l < "$TMP/serve.err")
+        TF=""
+        if [ "${ROWS:-1}" = 1 ]; then TF="--time"; fi
+        # (STATS=1: --stats too, for the function cache's line)
+        if [ "${STATS:-0}" = 1 ]; then TF="$TF --stats"; fi
+        A=$(ask "emit $TMP/prog.fd $TFLAGS $MF $TF -o $out")
         L=$(last_line)
         ms=$(ms_of "$L")
+        if [ -n "$TF" ]; then
+            # where this rebuild's time went (its own lines of the log)
+            tail -n +$((before + 1)) "$TMP/serve.err" | tr -d '\r' | grep -E '^\[time\] (front end|typecheck|mono|lower|prune|iropt|rules|egraph|native code|  nat record|  nat alloc\+emit|write|total):|^\[fncache\] (entries|attempts)|^\[prof\] native:' | sed 's/^/     /'
+        fi
         oneshot "$TMP/$mode-one$r$EXT" $MF
         if [ "$(status_of "$A")" = 0 ] && cmp -s "$out" "$TMP/$mode-one$r$EXT"; then
             ok "$step. one line of $edit edited: $ms ms, the image of the one-shot emit"

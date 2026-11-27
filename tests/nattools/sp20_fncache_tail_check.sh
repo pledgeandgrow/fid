@@ -31,7 +31,7 @@ bad() { echo "FAIL $1"; fails=$((fails + 1)); }
 expected() { sed -n '/^\/\/ Expected output:/,/^[^/]/p' "$1" | sed -n 's|^// \(.*\)|\1|p' | sed '1d'; }
 
 WSL=""
-if command -v wsl.exe >/dev/null 2>&1; then WSL="wsl.exe -e"; fi
+if command -v wsl.exe >/dev/null 2>&1 && wsl.exe -e true >/dev/null 2>&1; then WSL="wsl.exe -e"; fi
 
 runner() {
     case "$1" in

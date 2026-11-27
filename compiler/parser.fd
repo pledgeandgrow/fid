@@ -214,6 +214,9 @@ pub enum OpEntry {
 // The names modules are imported under, for `module::name()`, and each
 // `module::name` called so far
 var g_import_set: i64 = HashMap_new();
+// SP9: the names of g_import_set, in the order they went in (parse_use
+// adds a name only through pd_import_add, which keeps the two in step)
+var g_import_list: Vec<str> = Vec::new();
 var g_qualified_calls: Vec<str> = Vec::new();
 // LG15: the headers imported with @import: import path -> 1, or 3 when
 // marked `trusted` (compiler.fd's import loop reads it)
@@ -283,6 +286,147 @@ pub fn take_qualified_calls() -> Vec<str> {
     return calls;
 }
 
+// --- SP9: parses on worker threads -------------------------------------------
+// A Parser made by Parser_side changes none of the globals above: what its
+// parse adds to them is kept in the Parser (own_side, side_*), read out
+// with parser_side_of, and applied here by parser_side_apply when the
+// import driver uses that parse (compiler.fd pp_take), so the globals end
+// as a parse on this thread would have left them. Turbofish calls and
+// `__pcall_k` locals are numbered from 0 there: parser_side_fits says
+// whether those numbers are the ones a parse here would give.
+
+/// Put `name` in the import set (parse_use does, for `use a::name;`).
+pub fn parser_import_add(name: str) {
+    if HashMap_get(g_import_set, name) == 0 {
+        HashMap_insert(g_import_set, name, 1);
+        g_import_list.push(name);
+    }
+}
+
+/// How many `__pcall_k` locals have been numbered.
+pub fn parser_pcall_count() -> i64 {
+    return g_pd_pcall_n;
+}
+
+/// The `module::name` calls parsed since take_qualified_calls last took
+/// them (still there).
+pub fn parser_qualified_calls() -> Vec<str> {
+    return g_qualified_calls;
+}
+
+/// Whether `name` is in the import set.
+pub fn parser_import_known(name: str) -> bool {
+    return HashMap_get(g_import_set, name) != 0;
+}
+
+/// The names in the import set, in the order they went in.
+pub fn parser_import_names() -> Vec<str> {
+    return g_import_list;
+}
+
+/// What a parse on a worker thread changed besides its Program.
+pub struct ParseSide {
+    // names it added to the import set (none it already had), in order
+    pub import_adds: Vec<str>,
+    // its `module::name` calls, in order
+    pub qcalls: Vec<str>,
+    // the @import headers: path and flags, in order
+    pub at_paths: Vec<str>,
+    pub at_flags: Vec<i64>,
+    // the type arguments of the turbofish calls it numbered from 0
+    pub turbofish: Vec<Type>,
+    // how many `__pcall_k` locals it numbered from 0
+    pub pcalls: i64,
+    pub secret: bool,
+    pub splice: bool,
+}
+
+pub fn ParseSide_empty() -> ParseSide {
+    return ParseSide {
+        import_adds: Vec::new(), qcalls: Vec::new(), at_paths: Vec::new(), at_flags: Vec::new(), turbofish: Vec::new(), pcalls: 0, secret: false, splice: false
+    };
+}
+
+/// A Parser for a worker thread: as Parser_with_names, with `imports` the
+/// import set it starts from (a map of its own), a keyword cache of its own
+/// for the f-strings it lexes, and every change besides its Program kept
+/// in it. parser_side_free frees its maps.
+pub fn Parser_side(tokens: Vec<Token>, struct_names: Vec<str>, enum_names: Vec<str>, imports: Vec<str>) -> Parser {
+    var p: Parser = Parser_with_names(tokens, struct_names, enum_names);
+    p.own_side = true;
+    p.own_kw = HashMap_new();
+    p.side_imports = HashMap_new();
+    var i: i64 = 0;
+    while i < imports.len() {
+        HashMap_insert(p.side_imports, imports.get(i), 1);
+        i = i + 1;
+    }
+    return p;
+}
+
+/// What the parse of `p` (a Parser_side) changed besides its Program.
+pub fn parser_side_of(p: Parser) -> ParseSide {
+    return ParseSide {
+        import_adds: p.side_import_adds, qcalls: p.side_qcalls, at_paths: p.side_at_paths, at_flags: p.side_at_flags, turbofish: p.side_turbofish, pcalls: p.side_pcalls, secret: p.side_secret, splice: p.side_splice
+    };
+}
+
+/// Free the maps of a Parser_side (after parser_side_of).
+pub fn parser_side_free(p: &mut Parser) {
+    if p.own_kw != 0 {
+        HashMap_drop(p.own_kw);
+        p.own_kw = 0;
+    }
+    if p.side_imports != 0 {
+        HashMap_drop(p.side_imports);
+        p.side_imports = 0;
+    }
+}
+
+/// Whether a parse that numbered from 0 gave the numbers a parse here
+/// would: it numbered no turbofish call (no `__pcall_k` local), or none has
+/// been numbered here yet.
+pub fn parser_side_fits(sd: ParseSide) -> bool {
+    if sd.turbofish.len() > 0 && g_turbofish_types.len() > 0 {
+        return false;
+    }
+    if sd.pcalls > 0 && g_pd_pcall_n > 0 {
+        return false;
+    }
+    return true;
+}
+
+/// Leave the globals as the parse `sd` came from would have, run here.
+pub fn parser_side_apply(sd: ParseSide) {
+    var i: i64 = 0;
+    while i < sd.import_adds.len() {
+        parser_import_add(sd.import_adds.get(i));
+        i = i + 1;
+    }
+    i = 0;
+    while i < sd.qcalls.len() {
+        g_qualified_calls.push(sd.qcalls.get(i));
+        i = i + 1;
+    }
+    i = 0;
+    while i < sd.at_paths.len() {
+        HashMap_insert(g_at_imports, sd.at_paths.get(i), sd.at_flags.get(i));
+        i = i + 1;
+    }
+    i = 0;
+    while i < sd.turbofish.len() {
+        g_turbofish_types.push(sd.turbofish.get(i));
+        i = i + 1;
+    }
+    g_pd_pcall_n = g_pd_pcall_n + sd.pcalls;
+    if sd.secret {
+        g_saw_secret = true;
+    }
+    if sd.splice {
+        g_saw_splice = true;
+    }
+}
+
 /// 0008: every var declared Vec<E..> (sequential), across all parse calls —
 /// the lowerer reads this to route their Vec method calls to VecV_*
 pub var g_pd_sequential_vars: Vec<str> = Vec::new();
@@ -315,6 +459,51 @@ pub struct Parser {
     pub p_ct_type_params: Vec<str>,
     // 0008: the last parse_type saw a Vec<E..> (the .. variant marker)
     pub g_sequential_type: bool,
+    // SP9: the scratch of one parse (module globals before, g_pd_*: a parse
+    // on another thread would have shared them). L8H: the self type
+    // parse_impl_or_trait_impl read last (none: the bare name), and the
+    // self type of each impl of the file, at its index (Void: none); the
+    // same for trait impls (their `for` type).
+    pub pd_last_impl_self: Vec<Type>,
+    pub pd_impl_selfs: Vec<Type>,
+    pub pd_last_timpl_self: Vec<Type>,
+    pub pd_timpl_selfs: Vec<Type>,
+    // LG3: the lifetimes `impl<'a> View<'a>` declares, which its methods may
+    // use without declaring them again (parse_func); empty outside an impl
+    pub pd_impl_lts: Vec<str>,
+    // SP9: own_side: a parse on a worker thread (compiler.fd "parsed
+    // ahead"). What a parse changes besides its Program then goes here, not
+    // into the parser's globals (another thread's): the import set it reads
+    // and adds to (side_imports, a HashMap of its own; side_import_adds the
+    // names it added, in order), the `module::name` calls (side_qcalls),
+    // the @import headers, the turbofish calls it numbered from 0
+    // (side_turbofish), the `__pcall_k` locals it numbered from 0
+    // (side_pcalls), whether it saw @secret / a splice. own_kw: the keyword
+    // cache of the f-string lexers (lexer.fd keyword_or_ident_own; 0: the
+    // shared one).
+    pub own_side: bool,
+    pub own_kw: i64,
+    pub side_imports: i64,
+    pub side_import_adds: Vec<str>,
+    pub side_qcalls: Vec<str>,
+    pub side_at_paths: Vec<str>,
+    pub side_at_flags: Vec<i64>,
+    pub side_turbofish: Vec<Type>,
+    pub side_pcalls: i64,
+    pub side_secret: bool,
+    pub side_splice: bool,
+}
+
+/// SP9: a Parser over `tokens` knowing these struct and enum names (sn_set
+/// and en_set: the same names as HashMaps), every other field as a new
+/// parse starts. Parser_new, Parser::new and Parser_with_names all make
+/// theirs here.
+pub fn pd_parser_make(tokens: Vec<Token>, sn: Vec<str>, en: Vec<str>, sn_set: i64, en_set: i64) -> Parser {
+    return Parser {
+        tokens: tokens, pos: 0, struct_names: sn, enum_names: en, struct_name_set: sn_set, enum_name_set: en_set, alias_set: HashMap_new(), errors: Vec::new(), expr_depth: 0, max_expr_depth: 256, nest_depth: 0, nest_hit: false, lt_seen: Vec::new(), p_ct_type_params: Vec::new(), g_sequential_type: false,
+        pd_last_impl_self: Vec::new(), pd_impl_selfs: Vec::new(), pd_last_timpl_self: Vec::new(), pd_timpl_selfs: Vec::new(), pd_impl_lts: Vec::new(),
+        own_side: false, own_kw: 0, side_imports: 0, side_import_adds: Vec::new(), side_qcalls: Vec::new(), side_at_paths: Vec::new(), side_at_flags: Vec::new(), side_turbofish: Vec::new(), side_pcalls: 0, side_secret: false, side_splice: false,
+    };
 }
 
 pub fn Parser_new(tokens: Vec<Token>) -> Parser {
@@ -397,9 +586,7 @@ pub fn Parser_new(tokens: Vec<Token>) -> Parser {
         ei = ei + 1;
     }
 
-    return Parser {
-        tokens: tokens, pos: 0, struct_names: sn, enum_names: en, struct_name_set: sn_set, enum_name_set: en_set, alias_set: HashMap_new(), errors: Vec::new(), expr_depth: 0, max_expr_depth: 256, nest_depth: 0, nest_hit: false, lt_seen: Vec::new(), p_ct_type_params: Vec::new(), g_sequential_type: false,
-    };
+    return pd_parser_make(tokens, sn, en, sn_set, en_set);
 }
 
 impl Parser {
@@ -474,9 +661,7 @@ impl Parser {
             HashMap_insert(en_set, en.get(ei), 1);
             ei = ei + 1;
         }
-        return Parser {
-            tokens: tokens, pos: 0, struct_names: sn, enum_names: en, struct_name_set: sn_set, enum_name_set: en_set, alias_set: HashMap_new(), errors: Vec::new(), expr_depth: 0, max_expr_depth: 256, nest_depth: 0, nest_hit: false, lt_seen: Vec::new(), p_ct_type_params: Vec::new(), g_sequential_type: false,
-        };
+        return pd_parser_make(tokens, sn, en, sn_set, en_set);
     }
     fn peek(self: &Parser) -> TokenKind {
         return self.tokens.get(self.pos).kind;
@@ -626,6 +811,86 @@ impl Parser {
         return false;
     }
 
+    // --- SP9: what a parse changes besides its Program ---------------------
+    // Each goes to the parser's globals, or, for a parse on a worker thread
+    // (own_side), to this Parser's side_* fields: the import driver
+    // (compiler.fd pp_take) applies those to the globals when it uses the
+    // parse, as if the parse had run there.
+
+    /// Whether `name` is a module imported so far (`use` names it).
+    fn pd_import_known(self: &Parser, name: str) -> bool {
+        if self.own_side {
+            return HashMap_get(self.side_imports, name) != 0;
+        }
+        return HashMap_get(g_import_set, name) != 0;
+    }
+
+    fn pd_import_add(self: &mut Parser, name: str) {
+        if self.own_side {
+            if HashMap_get(self.side_imports, name) == 0 {
+                HashMap_insert(self.side_imports, name, 1);
+                self.side_import_adds.push(name);
+            }
+            return;
+        }
+        parser_import_add(name);
+    }
+
+    fn pd_qcall(self: &mut Parser, qcall: str) {
+        if self.own_side {
+            self.side_qcalls.push(qcall);
+            return;
+        }
+        g_qualified_calls.push(qcall);
+    }
+
+    fn pd_note_at_import(self: &mut Parser, path: str, flags: i64) {
+        if self.own_side {
+            self.side_at_paths.push(path);
+            self.side_at_flags.push(flags);
+            return;
+        }
+        HashMap_insert(g_at_imports, path, flags);
+    }
+
+    /// The number of the turbofish call whose type arguments are `t`.
+    fn pd_turbofish(self: &mut Parser, t: Type) -> i64 {
+        if self.own_side {
+            self.side_turbofish.push(t);
+            return self.side_turbofish.len() - 1;
+        }
+        g_turbofish_types.push(t);
+        return g_turbofish_types.len() - 1;
+    }
+
+    /// The number of the next `__pcall_k` local.
+    fn pd_next_pcall(self: &mut Parser) -> i64 {
+        if self.own_side {
+            var sk: i64 = self.side_pcalls;
+            self.side_pcalls = sk + 1;
+            return sk;
+        }
+        var k: i64 = g_pd_pcall_n;
+        g_pd_pcall_n = k + 1;
+        return k;
+    }
+
+    fn pd_saw_secret(self: &mut Parser) {
+        if self.own_side {
+            self.side_secret = true;
+            return;
+        }
+        g_saw_secret = true;
+    }
+
+    fn pd_saw_splice(self: &mut Parser) {
+        if self.own_side {
+            self.side_splice = true;
+            return;
+        }
+        g_saw_splice = true;
+    }
+
     fn read_type_name(self: &mut Parser) -> ParseResultStr {
         var tok: Token = self.peek_token();
         match tok.kind {
@@ -701,8 +966,8 @@ impl Parser {
 
     pub fn parse(self: &mut Parser) -> ParseResultProgram {
         var program: Program = program_new();
-        g_pd_impl_selfs = Vec::new();
-        g_pd_timpl_selfs = Vec::new();
+        self.pd_impl_selfs = Vec::new();
+        self.pd_timpl_selfs = Vec::new();
 
         while !self.is_at_end() {
             // CF1 (reference §1.10): a `;` after an item (`struct P { .. };`,
@@ -736,13 +1001,13 @@ impl Parser {
         // L8H: several definitions of a name, one generic: specializations
         pd_name_specializations(&mut program);
         // ... and methods of a narrower impl that a generic impl also has
-        pd_impl_specializations(&mut program, g_pd_impl_selfs);
+        pd_impl_specializations(&mut program, self.pd_impl_selfs);
         // ... and a trait impl for a narrower type beside a generic one
         // (`impl Show for Wrap<i64>` with `impl<T> Show for Wrap<T>`): it
         // becomes a narrower impl of the struct whose methods specialize
         // the generic trait impl's (after pd_impl_specializations, so its
         // numbers `__spec<k>` follow those)
-        val tspec_errs: Vec<str> = pd_trait_impl_specializations(&mut program, g_pd_timpl_selfs);
+        val tspec_errs: Vec<str> = pd_trait_impl_specializations(&mut program, self.pd_timpl_selfs);
         if tspec_errs.len() > 0 {
             return ParseResultProgram::Err(vec_str_join(tspec_errs, "\n"));
         }
@@ -883,25 +1148,25 @@ impl Parser {
                         program.impls.push(imp.struct_impl);
                         // L8H: its self type, at the same index (Void: the
                         // bare name)
-                        while g_pd_impl_selfs.len() < program.impls.len() - 1 {
-                            g_pd_impl_selfs.push(Type::Void);
+                        while self.pd_impl_selfs.len() < program.impls.len() - 1 {
+                            self.pd_impl_selfs.push(Type::Void);
                         }
-                        if g_pd_last_impl_self.len() > 0 {
-                            g_pd_impl_selfs.push(g_pd_last_impl_self.get(0));
+                        if self.pd_last_impl_self.len() > 0 {
+                            self.pd_impl_selfs.push(self.pd_last_impl_self.get(0));
                         } else {
-                            g_pd_impl_selfs.push(Type::Void);
+                            self.pd_impl_selfs.push(Type::Void);
                         }
                     } else {
                         program.trait_impls.push(imp.trait_impl);
                         // L8H: its `for` type, at the same index (Void: the
                         // bare name)
-                        while g_pd_timpl_selfs.len() < program.trait_impls.len() - 1 {
-                            g_pd_timpl_selfs.push(Type::Void);
+                        while self.pd_timpl_selfs.len() < program.trait_impls.len() - 1 {
+                            self.pd_timpl_selfs.push(Type::Void);
                         }
-                        if g_pd_last_timpl_self.len() > 0 {
-                            g_pd_timpl_selfs.push(g_pd_last_timpl_self.get(0));
+                        if self.pd_last_timpl_self.len() > 0 {
+                            self.pd_timpl_selfs.push(self.pd_last_timpl_self.get(0));
                         } else {
-                            g_pd_timpl_selfs.push(Type::Void);
+                            self.pd_timpl_selfs.push(Type::Void);
                         }
                     }
                     return ParseResultUnit::Ok;
@@ -1833,7 +2098,7 @@ impl Parser {
         // Matrix<T, N>`, or `N: i64`): each method sees N as a constant
         // (its const_params), which mono replaces by the receiver's number
         var impl_consts: Vec<StrPair> = Vec::new();
-        g_pd_impl_lts = Vec::new();
+        self.pd_impl_lts = Vec::new();
         if self.check(TokenKind::Lt) {
             self.advance();
             if !self.check(TokenKind::Gt) {
@@ -1851,7 +2116,7 @@ impl Parser {
                     if impl_lt {
                         match self.peek() {
                             TokenKind::Lifetime(iltn: str) => {
-                                g_pd_impl_lts.push(iltn);
+                                self.pd_impl_lts.push(iltn);
                             }
                             _ => {
                             }
@@ -1913,14 +2178,14 @@ impl Parser {
         // L8H: `impl Slot<i64>` (or `impl<U> Slot<Vec<U>>`) names narrower
         // ones, and its methods may specialize the generic impl's (the type
         // is kept for pd_impl_specializations)
-        g_pd_last_impl_self = Vec::new();
+        self.pd_last_impl_self = Vec::new();
         var tparsed: bool = false;
         if self.check(TokenKind::Lt) {
             val after_name: i64 = self.pos;
             self.pos = after_name - 1;
             match self.parse_type() {
                 ParseResultType::Ok(st) => {
-                    g_pd_last_impl_self.push(st);
+                    self.pd_last_impl_self.push(st);
                     tparsed = true;
                 }
                 ParseResultType::Err(_) => {
@@ -1962,14 +2227,14 @@ impl Parser {
             // parameters, as in `impl<T> Slot<T>` above; L8H: `impl Show for
             // Slot<i64>` names narrower ones (kept for
             // pd_trait_impl_specializations)
-            g_pd_last_timpl_self = Vec::new();
+            self.pd_last_timpl_self = Vec::new();
             var fparsed: bool = false;
             if self.check(TokenKind::Lt) {
                 val after_tname: i64 = self.pos;
                 self.pos = after_tname - 1;
                 match self.parse_type() {
                     ParseResultType::Ok(fst) => {
-                        g_pd_last_timpl_self.push(fst);
+                        self.pd_last_timpl_self.push(fst);
                         fparsed = true;
                     }
                     ParseResultType::Err(_) => {
@@ -2102,7 +2367,7 @@ impl Parser {
             var __iot1: ImplOrTrait = ImplOrTrait {
                 tag: 1, struct_impl: ImplDef_new(""), trait_impl: __ti,
             };
-            g_pd_impl_lts = Vec::new();
+            self.pd_impl_lts = Vec::new();
             return ParseResultImplOrTrait::Ok(__iot1);
         }
 
@@ -2175,7 +2440,7 @@ impl Parser {
         var __iot0: ImplOrTrait = ImplOrTrait {
             tag: 0, struct_impl: __si, trait_impl: TraitImpl_new("", ""),
         };
-        g_pd_impl_lts = Vec::new();
+        self.pd_impl_lts = Vec::new();
         return ParseResultImplOrTrait::Ok(__iot0);
     }
 
@@ -2757,9 +3022,9 @@ impl Parser {
         var ret_lts: Vec<str> = pd_lt_since(self.lt_seen, ret_lt_start);
         // LG3: a method may use the lifetimes its `impl<'a>` declares
         var gil: i64 = 0;
-        while gil < g_pd_impl_lts.len() {
-            if !str_vec_contains(lifetime_params, g_pd_impl_lts.get(gil)) {
-                lifetime_params.push(g_pd_impl_lts.get(gil));
+        while gil < self.pd_impl_lts.len() {
+            if !str_vec_contains(lifetime_params, self.pd_impl_lts.get(gil)) {
+                lifetime_params.push(self.pd_impl_lts.get(gil));
             }
             gil = gil + 1;
         }
@@ -7208,7 +7473,7 @@ impl Parser {
                         ParseResultUnit::Ok => {
                         }
                     }
-                    g_saw_splice = true;
+                    self.pd_saw_splice();
                     var sp_args: Vec<Expr> = Vec::new();
                     sp_args.push(Expr::ComptimeBlock(sp_block));
                     sp_args.push(Expr::IntLit(sp_line));
@@ -7231,7 +7496,7 @@ impl Parser {
                             return ParseResultExpr::Err(e);
                         }
                     }
-                    g_saw_splice = true;
+                    self.pd_saw_splice();
                     var spc_block: Vec<Stmt> = Vec::new();
                     spc_block.push(Stmt::Return(OptBoxExpr::Some(Box::new(spc_call)), spc_line));
                     var spc_args: Vec<Expr> = Vec::new();
@@ -7495,8 +7760,7 @@ impl Parser {
                 // next line starts a statement (semicolons are optional).
                 var pc_line: i64 = self.peek_token().line;
                 self.advance();
-                var pc_name: str = "__pcall_" + int_to_str(g_pd_pcall_n);
-                g_pd_pcall_n = g_pd_pcall_n + 1;
+                var pc_name: str = "__pcall_" + int_to_str(self.pd_next_pcall());
                 var pc_call: Expr = Expr::IntLit(0);
                 match self.parse_call_expr(pc_name) {
                     ParseResultExpr::Ok(ce) => {
@@ -8116,8 +8380,8 @@ impl Parser {
                             return ParseResultExpr::Err(e);
                         }
                     }
-                    g_turbofish_types.push(Type::Generic("", targs));
-                    return ParseResultExpr::Ok(Expr::Call(name + "::<#" + int_to_str(g_turbofish_types.len() - 1) + ">", targ_call_args));
+                    var tf_k: i64 = self.pd_turbofish(Type::Generic("", targs));
+                    return ParseResultExpr::Ok(Expr::Call(name + "::<#" + int_to_str(tf_k) + ">", targ_call_args));
                 }
                 var variant_or_method: str = "";
                 match self.expect_ident() {
@@ -8140,9 +8404,9 @@ impl Parser {
                         }
                     }
                 }
-                if called && !self.is_enum_name(name) && HashMap_get(self.struct_name_set, name) == 0 && HashMap_get(g_import_set, name) != 0 {
+                if called && !self.is_enum_name(name) && HashMap_get(self.struct_name_set, name) == 0 && self.pd_import_known(name) {
                     var qcall: str = name + "::" + variant_or_method;
-                    g_qualified_calls.push(qcall);
+                    self.pd_qcall(qcall);
                     return ParseResultExpr::Ok(Expr::Call(qcall, args));
                 }
                 if self.is_enum_name(name) {
@@ -8747,7 +9011,7 @@ impl Parser {
         if trusted {
             iflags = 3;
         }
-        HashMap_insert(g_at_imports, ipath, iflags);
+        self.pd_note_at_import(ipath, iflags);
         return ParseResultImportDef::Ok(ImportDef_new_full(ipath, Vec::new(), Vec::new(), OptStr::None, OptStr::None, false, false));
     }
 
@@ -8882,10 +9146,10 @@ impl Parser {
         var import_result: ImportDef = ImportDef_new_full(path, items, capabilities, version, alias, false, is_glob);
         match alias {
             OptStr::Some(al) => {
-                HashMap_insert(g_import_set, al, 1);
+                self.pd_import_add(al);
             }
             OptStr::None => {
-                HashMap_insert(g_import_set, path_last(path), 1);
+                self.pd_import_add(path_last(path));
             }
         }
         return ParseResultImportDef::Ok(import_result);
@@ -8973,7 +9237,7 @@ impl Parser {
             }
         }
         if name == "secret" || name == "sensitive" {
-            g_saw_secret = true;
+            self.pd_saw_secret();
         }
         var __ret_Annotation: Annotation = Annotation_new(name, args);
         return ParseResultAnnotation::Ok(__ret_Annotation);
@@ -9246,9 +9510,39 @@ impl Parser {
                 }
                 // Re-lex and parse the expression
                 var sub_lexer: Lexer = Lexer::new(parse_src);
+                // SP9: on a worker thread, a keyword cache of its own
+                // (0, the shared one, otherwise)
+                sub_lexer.own_kw = self.own_kw;
                 var sub_tokens: Vec<Token> = sub_lexer.tokenize();
                 var sub_parser: Parser = Parser::new(sub_tokens);
-                match sub_parser.parse_expr() {
+                // SP9: a parse on a worker thread: the expression's parse
+                // reads and adds to this parse's import set, calls and
+                // numbers (side_*), and hands them back after
+                if self.own_side {
+                    sub_parser.own_side = true;
+                    sub_parser.own_kw = self.own_kw;
+                    sub_parser.side_imports = self.side_imports;
+                    sub_parser.side_import_adds = self.side_import_adds;
+                    sub_parser.side_qcalls = self.side_qcalls;
+                    sub_parser.side_at_paths = self.side_at_paths;
+                    sub_parser.side_at_flags = self.side_at_flags;
+                    sub_parser.side_turbofish = self.side_turbofish;
+                    sub_parser.side_pcalls = self.side_pcalls;
+                    sub_parser.side_secret = self.side_secret;
+                    sub_parser.side_splice = self.side_splice;
+                }
+                var sub_res: ParseResultExpr = sub_parser.parse_expr();
+                if self.own_side {
+                    self.side_import_adds = sub_parser.side_import_adds;
+                    self.side_qcalls = sub_parser.side_qcalls;
+                    self.side_at_paths = sub_parser.side_at_paths;
+                    self.side_at_flags = sub_parser.side_at_flags;
+                    self.side_turbofish = sub_parser.side_turbofish;
+                    self.side_pcalls = sub_parser.side_pcalls;
+                    self.side_secret = sub_parser.side_secret;
+                    self.side_splice = sub_parser.side_splice;
+                }
+                match sub_res {
                     ParseResultExpr::Ok(e) => {
                         if !sub_parser.is_at_end() {
                             return ParseResultExpr::Err("Parse error at " + int_to_str(line) + ":" + int_to_str(col) + ": text follows the expression in an f-string: `{" + expr_src + "}`.\n    Fix: the braces of an f-string hold one expression, then an optional `:` and a format spec (`:.2`, `:5`, `#x`).");
@@ -9293,9 +9587,7 @@ pub fn Parser_with_names(tokens: Vec<Token>, struct_names: Vec<str>, enum_names:
         HashMap_insert(en_set, enum_names.get(ei), 1);
         ei = ei + 1;
     }
-    return Parser {
-        tokens: tokens, pos: 0, struct_names: struct_names, enum_names: enum_names, struct_name_set: sn_set, enum_name_set: en_set, alias_set: HashMap_new(), errors: Vec::new(), expr_depth: 0, max_expr_depth: 256, nest_depth: 0, nest_hit: false, lt_seen: Vec::new(), p_ct_type_params: Vec::new(), g_sequential_type: false,
-    };
+    return pd_parser_make(tokens, struct_names, enum_names, sn_set, en_set);
 }
 
 // Helper: extract Expr from Box<Expr> (Fides has no * deref for Box)
@@ -9732,20 +10024,18 @@ fn pd_infer_vec_lets(stmts: Vec<Stmt>) -> Vec<Stmt> {
                     var j: i64 = i + 1;
                     // B19: a pushed variable declared earlier in this block
                     // gives its type too (pd_arg_type)
-                    g_pd_decl_names = Vec::new();
-                    g_pd_decl_types = Vec::new();
+                    var decl_names: Vec<str> = Vec::new();
+                    var decl_types: Vec<Type> = Vec::new();
                     var dk: i64 = 0;
                     while dk < i {
-                        pd_note_decl(stmts.get(dk));
+                        pd_note_decl(stmts.get(dk), &mut decl_names, &mut decl_types);
                         dk = dk + 1;
                     }
                     while j < stmts.len() && type_eq_infer(et) {
-                        et = pd_push_lit_type(stmts.get(j), name);
-                        pd_note_decl(stmts.get(j));
+                        et = pd_push_lit_type(stmts.get(j), name, decl_names, decl_types);
+                        pd_note_decl(stmts.get(j), &mut decl_names, &mut decl_types);
                         j = j + 1;
                     }
-                    g_pd_decl_names = Vec::new();
-                    g_pd_decl_types = Vec::new();
                     if !type_eq_infer(et) {
                         var targs: Vec<Type> = Vec::new();
                         targs.push(et);
@@ -9826,8 +10116,8 @@ fn pd_lit_type(e: Expr) -> Type {
 
 // B19: the variables declared before the pushes pd_infer_vec_lets looks at
 // (in the same block) whose type is a float, string or bool: name, type
-var g_pd_decl_names: Vec<str> = Vec::new();
-var g_pd_decl_types: Vec<Type> = Vec::new();
+// (decl_names / decl_types, locals of pd_infer_vec_lets: module globals
+// before SP9, which a parse on another thread would have shared)
 
 /// Whether `t` is a type pd_infer_vec_lets gives an untyped Vec from a
 /// pushed variable (an i64 one needs nothing; others are left to the
@@ -9855,7 +10145,7 @@ fn pd_vec_elem_kind(t: Type) -> bool {
 /// Note the variable `st` declares, if any: `val x: bool = ..` (its type)
 /// or `val x = 1.5` (a literal's type). Any other declaration of a name
 /// hides an earlier one (Infer).
-fn pd_note_decl(st: Stmt) {
+fn pd_note_decl(st: Stmt, decl_names: &mut Vec<str>, decl_types: &mut Vec<Type>) {
     match st {
         Stmt::Let(dn, dty, dinit, _, _, _, _) => {
             var t: Type = Type::Infer;
@@ -9870,8 +10160,8 @@ fn pd_note_decl(st: Stmt) {
             if !pd_vec_elem_kind(t) {
                 t = Type::Infer;
             }
-            g_pd_decl_names.push(dn);
-            g_pd_decl_types.push(t);
+            decl_names.push(dn);
+            decl_types.push(t);
         }
         _ => {
         }
@@ -9879,14 +10169,14 @@ fn pd_note_decl(st: Stmt) {
 }
 
 /// The type of a pushed value: a literal's, or that of a variable declared
-/// earlier in the block (g_pd_decl_names); Infer otherwise.
-fn pd_arg_type(e: Expr) -> Type {
+/// earlier in the block (decl_names); Infer otherwise.
+fn pd_arg_type(e: Expr, decl_names: Vec<str>, decl_types: Vec<Type>) -> Type {
     match e {
         Expr::Ident(n) => {
-            var k: i64 = g_pd_decl_names.len() - 1;
+            var k: i64 = decl_names.len() - 1;
             while k >= 0 {
-                if g_pd_decl_names.get(k) == n {
-                    return g_pd_decl_types.get(k);
+                if decl_names.get(k) == n {
+                    return decl_types.get(k);
                 }
                 k = k - 1;
             }
@@ -9900,7 +10190,7 @@ fn pd_arg_type(e: Expr) -> Type {
 
 /// The literal type pushed onto `name` by statement `st` (searching nested
 /// blocks), or Infer.
-fn pd_push_lit_type(st: Stmt, name: str) -> Type {
+fn pd_push_lit_type(st: Stmt, name: str, decl_names: Vec<str>, decl_types: Vec<Type>) -> Type {
     match st {
         Stmt::Expr(e, _) => {
             match e {
@@ -9909,7 +10199,7 @@ fn pd_push_lit_type(st: Stmt, name: str) -> Type {
                         match box_expr_deref(recv) {
                             Expr::Ident(rn) => {
                                 if rn == name {
-                                    return pd_arg_type(args.get(0));
+                                    return pd_arg_type(args.get(0), decl_names, decl_types);
                                 }
                             }
                             _ => {
@@ -9922,26 +10212,26 @@ fn pd_push_lit_type(st: Stmt, name: str) -> Type {
             }
         }
         Stmt::If(_, then_b, else_b, _) => {
-            var t1: Type = pd_push_lit_type_block(then_b, name);
+            var t1: Type = pd_push_lit_type_block(then_b, name, decl_names, decl_types);
             if !type_eq_infer(t1) {
                 return t1;
             }
             match else_b {
                 OptStmts::Some(eb) => {
-                    return pd_push_lit_type_block(eb, name);
+                    return pd_push_lit_type_block(eb, name, decl_names, decl_types);
                 }
                 OptStmts::None => {
                 }
             }
         }
         Stmt::While(_, body, _) => {
-            return pd_push_lit_type_block(body, name);
+            return pd_push_lit_type_block(body, name, decl_names, decl_types);
         }
         Stmt::For(_, _, body, _) => {
-            return pd_push_lit_type_block(body, name);
+            return pd_push_lit_type_block(body, name, decl_names, decl_types);
         }
         Stmt::Loop(body, _) => {
-            return pd_push_lit_type_block(body, name);
+            return pd_push_lit_type_block(body, name, decl_names, decl_types);
         }
         _ => {
         }
@@ -9949,10 +10239,10 @@ fn pd_push_lit_type(st: Stmt, name: str) -> Type {
     return Type::Infer;
 }
 
-fn pd_push_lit_type_block(stmts: Vec<Stmt>, name: str) -> Type {
+fn pd_push_lit_type_block(stmts: Vec<Stmt>, name: str, decl_names: Vec<str>, decl_types: Vec<Type>) -> Type {
     var i: i64 = 0;
     while i < stmts.len() {
-        var t: Type = pd_push_lit_type(stmts.get(i), name);
+        var t: Type = pd_push_lit_type(stmts.get(i), name, decl_names, decl_types);
         if !type_eq_infer(t) {
             return t;
         }
@@ -9963,17 +10253,9 @@ fn pd_push_lit_type_block(stmts: Vec<Stmt>, name: str) -> Type {
 
 // --- L8A / L8H: impls --------------------------------------------------------
 
-/// The self type parse_impl_or_trait_impl read last (none: the bare name),
-/// and the self type of each impl of the file, at its index (Void: none)
-var g_pd_last_impl_self: Vec<Type> = Vec::new();
-var g_pd_impl_selfs: Vec<Type> = Vec::new();
-/// L8H: the same for trait impls: the `for` type parse_impl_or_trait_impl
-/// read last, and that of each trait impl of the file, at its index
-var g_pd_last_timpl_self: Vec<Type> = Vec::new();
-var g_pd_timpl_selfs: Vec<Type> = Vec::new();
-/// LG3: the lifetimes `impl<'a> View<'a>` declares, which its methods may
-/// use without declaring them again (parse_func); empty outside an impl
-var g_pd_impl_lts: Vec<str> = Vec::new();
+// The impl scratch of a parse (g_pd_last_impl_self, g_pd_impl_selfs,
+// g_pd_last_timpl_self, g_pd_timpl_selfs, g_pd_impl_lts) is in Parser
+// (pd_*), SP9.
 
 /// L8A: `impl<T, const N: usize> Matrix<T, N>`: each method takes the
 /// impl's const parameters as its own (`const_params`), so its body reads N
@@ -10844,4 +11126,649 @@ fn pd_check_lifetimes(fname: str, declared: Vec<str>, params: Vec<Param>, ret_lt
 /// to route their Vec method calls to VecV_* (lower.fd copies it).
 pub fn parser_sequential_vars() -> Vec<str> {
     return g_pd_sequential_vars;
+}
+
+// --- SP9: modules parsed ahead, in parallel -----------------------------------
+// The import loop (compiler.fd) parses the modules one at a time, each with
+// the struct, enum and import names of what it parsed before. With FID_PAR=N
+// the modules it lexed ahead are parsed here first, in up to N threads, each
+// knowing the names the loop is predicted to know when it gets to that
+// module (compiler.fd pp_predict). The loop takes such a parse only when its
+// own would be the same (compiler.fd pp_take): a parse asks about no name
+// but the words of its text, so every word must be a struct / enum / import
+// name for both or for neither, and the turbofish and `__pcall_k` numbers
+// must fit (parser_side_fits); the parse's other changes are then applied
+// (parser_side_apply). Otherwise the loop parses the module itself.
+//
+// A worker shares nothing it changes with another thread (owner counts are
+// not atomic: escape.fd "Parallel reporting pass"). It copies the names and
+// the text it reads (pp_own_str), makes its own maps, and parses a module's
+// tokens, which no other thread touches until the last await (the main
+// thread does nothing between the first spawn and the last await). It only
+// reads the globals below, set before the spawns and reset after. Spawn
+// arguments must be @send: a worker gets its number.
+
+/// A module parsed on a worker thread: its Program (ok: the parse
+/// succeeded), what it changed besides (ParseSide), and the distinct words
+/// of its text with, for each, what it was known as when the parse began
+/// (1 a struct, 2 an enum, 4 an import name).
+pub struct PreParse {
+    pub ok: bool,
+    pub prog: Program,
+    pub side: ParseSide,
+    pub words: Vec<str>,
+    pub bits: Vec<i64>,
+}
+
+// module k: its tokens and text, and the names it knows: the first
+// g_pp_sn_n[k] of g_pp_snames, g_pp_en_n[k] of g_pp_enames, g_pp_in_n[k] of
+// g_pp_inames
+pub var g_pp_tokens: Vec<Vec<Token>> = Vec::new();
+pub var g_pp_texts: Vec<str> = Vec::new();
+pub var g_pp_snames: Vec<str> = Vec::new();
+pub var g_pp_enames: Vec<str> = Vec::new();
+pub var g_pp_inames: Vec<str> = Vec::new();
+pub var g_pp_sn_n: Vec<i64> = Vec::new();
+pub var g_pp_en_n: Vec<i64> = Vec::new();
+pub var g_pp_in_n: Vec<i64> = Vec::new();
+// for each worker, the modules it parses, in order
+pub var g_pp_plan: Vec<Vec<i64>> = Vec::new();
+
+/// `s` in a buffer of its own: it shares no owner count with `s`.
+fn pp_own_str(s: str) -> str {
+    return p_str_adopt(p_str_send_copy(s as i64));
+}
+
+fn pp_word_byte(c: i64) -> bool {
+    return (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 95 || c >= 128;
+}
+
+/// Whether `s` is one word as pp_text_words reads them.
+pub fn pp_is_word(s: str) -> bool {
+    var n: i64 = str_len(s);
+    if n == 0 {
+        return false;
+    }
+    var i: i64 = 0;
+    while i < n {
+        if !pp_word_byte(str_byte_at(s, i) & 255) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// The distinct words of `src` (runs of letters, digits, `_` and bytes from
+/// 128 on: in code, comments and strings alike), first occurrence first.
+/// Every name a parse of the text asks about is one of them.
+pub fn pp_text_words(src: str) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var seen: i64 = HashMap_new();
+    var n: i64 = str_len(src);
+    var start: i64 = -1;
+    var i: i64 = 0;
+    while i <= n {
+        var inw: bool = false;
+        if i < n {
+            inw = pp_word_byte(str_byte_at(src, i) & 255);
+        }
+        if inw {
+            if start < 0 {
+                start = i;
+            }
+        } else if start >= 0 {
+            var w: str = str_slice(src, start, i);
+            if !HashMap_contains(seen, w) {
+                HashMap_insert(seen, w, 1);
+                out.push(w);
+            }
+            start = -1;
+        }
+        i = i + 1;
+    }
+    HashMap_drop(seen);
+    return out;
+}
+
+/// What `w` is to the parser `p` (before its parse): 1 a struct name, 2 an
+/// enum name, 4 an import name (or'ed).
+pub fn pp_bits_of(p: Parser, w: str) -> i64 {
+    var b: i64 = 0;
+    if HashMap_get(p.struct_name_set, w) != 0 {
+        b = b | 1;
+    }
+    if HashMap_get(p.enum_name_set, w) != 0 {
+        b = b | 2;
+    }
+    if p.pd_import_known(w) {
+        b = b | 4;
+    }
+    return b;
+}
+
+/// The first `n` of `names` (strings of this thread already).
+fn pp_prefix(names: Vec<str>, n: i64) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < n && i < names.len() {
+        out.push(names.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Parse module `k` of the g_pp_* tables, knowing these names.
+pub fn pp_parse_one(k: i64, sn: Vec<str>, en: Vec<str>, inames: Vec<str>) -> PreParse {
+    var p: Parser = Parser_side(g_pp_tokens.get(k), sn, en, inames);
+    var words: Vec<str> = pp_text_words(pp_own_str(g_pp_texts.get(k)));
+    var bits: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < words.len() {
+        bits.push(pp_bits_of(p, words.get(i)));
+        i = i + 1;
+    }
+    var ok: bool = false;
+    var prog: Program = program_new();
+    match p.parse() {
+        ParseResultProgram::Ok(pr) => {
+            ok = true;
+            prog = pr;
+        }
+        ParseResultProgram::Err(_) => {
+        }
+    }
+    var side: ParseSide = parser_side_of(p);
+    parser_side_free(&mut p);
+    return PreParse {
+        ok: ok, prog: prog, side: side, words: words, bits: bits
+    };
+}
+
+/// A worker of pp_parse_par: the modules of its plan, in the plan's order.
+pub fn pp_parse_worker(w: i64) -> Vec<PreParse> {
+    var out: Vec<PreParse> = Vec::new();
+    var mine: Vec<i64> = Vec::new();
+    var ms: i64 = 0;
+    var me: i64 = 0;
+    var mi: i64 = 0;
+    var j: i64 = 0;
+    while j < g_pp_plan.get(w).len() {
+        var k: i64 = g_pp_plan.get(w).get(j);
+        mine.push(k);
+        if g_pp_sn_n.get(k) > ms {
+            ms = g_pp_sn_n.get(k);
+        }
+        if g_pp_en_n.get(k) > me {
+            me = g_pp_en_n.get(k);
+        }
+        if g_pp_in_n.get(k) > mi {
+            mi = g_pp_in_n.get(k);
+        }
+        j = j + 1;
+    }
+    // the names any of its modules knows, copied once (strings of its own:
+    // the shared lists are only read, an element at a time)
+    var sn: Vec<str> = Vec::new();
+    var en: Vec<str> = Vec::new();
+    var inames: Vec<str> = Vec::new();
+    var c: i64 = 0;
+    while c < ms && c < g_pp_snames.len() {
+        sn.push(pp_own_str(g_pp_snames.get(c)));
+        c = c + 1;
+    }
+    c = 0;
+    while c < me && c < g_pp_enames.len() {
+        en.push(pp_own_str(g_pp_enames.get(c)));
+        c = c + 1;
+    }
+    c = 0;
+    while c < mi && c < g_pp_inames.len() {
+        inames.push(pp_own_str(g_pp_inames.get(c)));
+        c = c + 1;
+    }
+    j = 0;
+    while j < mine.len() {
+        var k2: i64 = mine.get(j);
+        out.push(pp_parse_one(k2, pp_prefix(sn, g_pp_sn_n.get(k2)), pp_prefix(en, g_pp_en_n.get(k2)), pp_prefix(inames, g_pp_in_n.get(k2))));
+        j = j + 1;
+    }
+    return out;
+}
+
+/// Each module of the tables parsed (in module order), in up to `nw`
+/// threads: `toks[k]` the tokens of module k, `texts[k]` its text, and it
+/// knows the first `sn_n[k]` of `snames` as struct names, `en_n[k]` of
+/// `enames` as enum names and `in_n[k]` of `inames` as import names. With
+/// one worker, parsed here one after another (as on a worker: nothing but
+/// the results changes either way).
+pub fn pp_parse_par(toks: Vec<Vec<Token>>, texts: Vec<str>, snames: Vec<str>, enames: Vec<str>, inames: Vec<str>, sn_n: Vec<i64>, en_n: Vec<i64>, in_n: Vec<i64>, nw: i64) -> Vec<PreParse> {
+    var out: Vec<PreParse> = Vec::new();
+    var n: i64 = toks.len();
+    if n == 0 {
+        return out;
+    }
+    g_pp_tokens = toks;
+    g_pp_texts = texts;
+    g_pp_snames = snames;
+    g_pp_enames = enames;
+    g_pp_inames = inames;
+    g_pp_sn_n = sn_n;
+    g_pp_en_n = en_n;
+    g_pp_in_n = in_n;
+    var sizes: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        sizes.push(toks.get(i).len());
+        i = i + 1;
+    }
+    var nb: i64 = nw;
+    if nb < 1 {
+        nb = 1;
+    }
+    var plan: Vec<Vec<i64>> = lex_par_plan(sizes, nb);
+    // where each module's result is: its worker, and its place in that list
+    var res_w: Vec<i64> = Vec::new();
+    var res_k: Vec<i64> = Vec::new();
+    i = 0;
+    while i < n {
+        res_w.push(0);
+        res_k.push(0);
+        i = i + 1;
+    }
+    var w: i64 = 0;
+    while w < plan.len() {
+        var k: i64 = 0;
+        while k < plan.get(w).len() {
+            var t: i64 = plan.get(w).get(k);
+            res_w.set(t, w);
+            res_k.set(t, k);
+            k = k + 1;
+        }
+        w = w + 1;
+    }
+    g_pp_plan = plan;
+    var got: Vec<Vec<PreParse>> = Vec::new();
+    if plan.len() < 2 {
+        got.push(pp_parse_worker(0));
+    } else {
+        var futs: Vec<Future<Vec<PreParse>> > = Vec::new();
+        w = 0;
+        while w < plan.len() {
+            futs.push(spawn pp_parse_worker(w));
+            w = w + 1;
+        }
+        w = 0;
+        while w < futs.len() {
+            var part: Vec<PreParse> = await futs.get(w);
+            got.push(part);
+            w = w + 1;
+        }
+    }
+    g_pp_plan = Vec::new();
+    g_pp_tokens = Vec::new();
+    g_pp_texts = Vec::new();
+    g_pp_snames = Vec::new();
+    g_pp_enames = Vec::new();
+    g_pp_inames = Vec::new();
+    g_pp_sn_n = Vec::new();
+    g_pp_en_n = Vec::new();
+    g_pp_in_n = Vec::new();
+    i = 0;
+    while i < n {
+        out.push(got.get(res_w.get(i)).get(res_k.get(i)));
+        i = i + 1;
+    }
+    return out;
+}
+
+// --- SP9: which parse ahead the import loop takes ------------------------------
+// pp_predict guesses, from what the tokens say (lexer.fd ModScan), the names
+// the import loop (compiler.fd) knows when it first parses each module; the
+// modules are parsed ahead with those (pp_parse_par). pp_begin hands the
+// results to the loop; for each module it parses, pp_valid says whether the
+// parse ahead is the one its own parse would give, with the names it has
+// then, and pp_use takes it (its other changes made as that parse would
+// have made them). A wrong guess costs time, never output.
+
+/// The names pp_predict expects the import loop to know: module i (an
+/// index of the ModGraph) the first sn_n[i] of snames, en_n[i] of enames
+/// and in_n[i] of inames (-1: a module whose file an earlier index has).
+pub struct PpPlan {
+    pub snames: Vec<str>,
+    pub enames: Vec<str>,
+    pub inames: Vec<str>,
+    pub sn_n: Vec<i64>,
+    pub en_n: Vec<i64>,
+    pub in_n: Vec<i64>,
+}
+
+/// Each of `names` not in `set` yet, added to it and to `list`.
+fn pp_add_new(list: &mut Vec<str>, set: i64, names: Vec<str>) {
+    var i: i64 = 0;
+    while i < names.len() {
+        var nm: str = names.get(i);
+        if HashMap_get(set, nm) == 0 {
+            HashMap_insert(set, nm, 1);
+            list.push(nm);
+        }
+        i = i + 1;
+    }
+}
+
+/// compiler.fd's import loop run on what the tokens say instead of on
+/// parses, from the program's imports `user_imports` (paths, in order) and
+/// the names known before it (`struct_names`, `enum_names`, the import
+/// set): the names it knows when it first parses each module of `g`
+/// (cached_parse keeps that first parse, deferred or not). Keep in step
+/// with the loop.
+pub fn pp_predict(user_imports: Vec<str>, g: ModGraph, struct_names: Vec<str>, enum_names: Vec<str>) -> PpPlan {
+    var n: i64 = g.names.len();
+    var pl: PpPlan = PpPlan {
+        snames: Vec::new(), enames: Vec::new(), inames: Vec::new(), sn_n: Vec::new(), en_n: Vec::new(), in_n: Vec::new()
+    };
+    var sset: i64 = HashMap_new();
+    var eset: i64 = HashMap_new();
+    var iset: i64 = HashMap_new();
+    pp_add_new(&mut pl.snames, sset, struct_names);
+    pp_add_new(&mut pl.enames, eset, enum_names);
+    pp_add_new(&mut pl.inames, iset, parser_import_names());
+    var name_ix: i64 = HashMap_new();
+    var file_ix: i64 = HashMap_new();
+    var i: i64 = 0;
+    while i < n {
+        pl.sn_n.push(-1);
+        pl.en_n.push(-1);
+        pl.in_n.push(-1);
+        if HashMap_get(name_ix, g.names.get(i)) == 0 {
+            HashMap_insert(name_ix, g.names.get(i), i + 1);
+        }
+        var f0: str = g.files.get(i);
+        if str_len(f0) > 0 && HashMap_get(file_ix, f0) == 0 {
+            HashMap_insert(file_ix, f0, i + 1);
+        }
+        i = i + 1;
+    }
+    var stack: Vec<str> = Vec::new();
+    var ui: i64 = user_imports.len() - 1;
+    while ui >= 0 {
+        stack.push(user_imports.get(ui));
+        ui = ui - 1;
+    }
+    var deferred: Vec<str> = Vec::new();
+    var loaded: i64 = HashMap_new();
+    var parsed: i64 = HashMap_new();
+    var steps: i64 = 0;
+    while stack.len() > 0 && steps < 1000000 {
+        steps = steps + 1;
+        var ip: str = stack.get(stack.len() - 1);
+        stack.pop();
+        if ip == "core" || HashMap_get(loaded, ip) != 0 {
+            continue;
+        }
+        var gi: i64 = HashMap_get(name_ix, ip) - 1;
+        if gi < 0 {
+            // a module lexing ahead did not find: no guess past it
+            break;
+        }
+        var f: str = g.files.get(gi);
+        if str_len(f) == 0 {
+            // a C header (or no file): what its parse adds is not guessed
+            HashMap_insert(loaded, ip, 1);
+            continue;
+        }
+        var oi: i64 = HashMap_get(file_ix, f) - 1;
+        var sc: ModScan = g.scans.get(oi);
+        if HashMap_get(parsed, f) == 0 {
+            HashMap_insert(parsed, f, 1);
+            pl.sn_n.set(oi, pl.snames.len());
+            pl.en_n.set(oi, pl.enames.len());
+            pl.in_n.set(oi, pl.inames.len());
+            // its `use`s go into the import set as it is parsed
+            pp_add_new(&mut pl.inames, iset, sc.import_names);
+        }
+        pp_add_new(&mut pl.snames, sset, sc.structs);
+        pp_add_new(&mut pl.enames, eset, sc.enums);
+        var unloaded: Vec<str> = Vec::new();
+        var di: i64 = 0;
+        while di < sc.uses_all.len() {
+            var dep: str = sc.uses_all.get(di);
+            if dep != "core" && HashMap_get(loaded, dep) == 0 {
+                unloaded.push(dep);
+            }
+            di = di + 1;
+        }
+        if unloaded.len() > 0 {
+            if str_vec_has(deferred, ip) {
+                continue;
+            }
+            deferred.push(ip);
+            stack.push(ip);
+            di = 0;
+            while di < unloaded.len() {
+                if HashMap_get(loaded, unloaded.get(di)) == 0 {
+                    stack.push(unloaded.get(di));
+                }
+                di = di + 1;
+            }
+            continue;
+        }
+        var mn: str = ip;
+        if str_len(sc.module) > 0 {
+            mn = sc.module;
+        }
+        HashMap_insert(loaded, ip, 1);
+        HashMap_insert(loaded, mn, 1);
+        var dx: i64 = 0;
+        while dx < deferred.len() {
+            if deferred.get(dx) == ip {
+                deferred.remove(dx);
+                break;
+            }
+            dx = dx + 1;
+        }
+        var ti: i64 = 0;
+        while ti < sc.uses_all.len() {
+            if HashMap_get(loaded, sc.uses_all.get(ti)) == 0 {
+                stack.push(sc.uses_all.get(ti));
+            }
+            ti = ti + 1;
+        }
+    }
+    // a module the guess did not reach: all it knows by then
+    i = 0;
+    while i < n {
+        var f1: str = g.files.get(i);
+        if str_len(f1) > 0 && HashMap_get(file_ix, f1) == i + 1 && pl.sn_n.get(i) < 0 {
+            pl.sn_n.set(i, pl.snames.len());
+            pl.en_n.set(i, pl.enames.len());
+            pl.in_n.set(i, pl.inames.len());
+        }
+        i = i + 1;
+    }
+    HashMap_drop(sset);
+    HashMap_drop(eset);
+    HashMap_drop(iset);
+    HashMap_drop(name_ix);
+    HashMap_drop(file_ix);
+    HashMap_drop(loaded);
+    HashMap_drop(parsed);
+    return pl;
+}
+
+// the parses ahead the loop may take: g_ppt_results[k] of file
+// g_ppt_files[k] (g_ppt_index: file -> 1 + k), each asked about once
+var g_ppt_results: Vec<PreParse> = Vec::new();
+var g_ppt_index: i64 = 0;
+var g_ppt_used: Vec<bool> = Vec::new();
+// the loop's struct and enum names as maps: the first g_ppt_sn_n of its
+// struct names, g_ppt_en_n of its enum names (they only grow); the first
+// g_ppt_in_n of the import set's names looked at
+var g_ppt_sn: i64 = 0;
+var g_ppt_en: i64 = 0;
+var g_ppt_sn_n: i64 = 0;
+var g_ppt_en_n: i64 = 0;
+var g_ppt_in_n: i64 = 0;
+// how many names each list had when the parse ahead began (every parse
+// ahead knew those)
+var g_ppt_base_sn: i64 = 0;
+var g_ppt_base_en: i64 = 0;
+var g_ppt_base_in: i64 = 0;
+// a name of more than one word came in after that (a parse may ask about
+// one that is not a word of its text): no parse ahead is taken any more
+var g_ppt_odd: bool = false;
+var g_ppt_hits: i64 = 0;
+var g_ppt_misses: i64 = 0;
+
+/// Hand the loop the parses ahead: `results[k]` that of `files[k]`, begun
+/// with `base_sn` struct names and `base_en` enum names known (the loop's
+/// first ones) and the import set as it is now.
+pub fn pp_begin(results: Vec<PreParse>, files: Vec<str>, base_sn: i64, base_en: i64) {
+    pp_end();
+    g_ppt_results = results;
+    g_ppt_index = HashMap_new();
+    g_ppt_used = Vec::new();
+    var i: i64 = 0;
+    while i < files.len() {
+        if HashMap_get(g_ppt_index, files.get(i)) == 0 {
+            HashMap_insert(g_ppt_index, files.get(i), i + 1);
+        }
+        g_ppt_used.push(false);
+        i = i + 1;
+    }
+    g_ppt_sn = HashMap_new();
+    g_ppt_en = HashMap_new();
+    g_ppt_sn_n = 0;
+    g_ppt_en_n = 0;
+    g_ppt_in_n = 0;
+    g_ppt_base_sn = base_sn;
+    g_ppt_base_en = base_en;
+    g_ppt_base_in = g_import_list.len();
+    g_ppt_odd = false;
+    g_ppt_hits = 0;
+    g_ppt_misses = 0;
+}
+
+/// No parse ahead to take any more; the tables freed.
+pub fn pp_end() {
+    g_ppt_results = Vec::new();
+    g_ppt_used = Vec::new();
+    if g_ppt_index != 0 {
+        HashMap_drop(g_ppt_index);
+        g_ppt_index = 0;
+    }
+    if g_ppt_sn != 0 {
+        HashMap_drop(g_ppt_sn);
+        g_ppt_sn = 0;
+    }
+    if g_ppt_en != 0 {
+        HashMap_drop(g_ppt_en);
+        g_ppt_en = 0;
+    }
+}
+
+/// How many parses ahead there are (0: none to take).
+pub fn pp_count() -> i64 {
+    return g_ppt_results.len();
+}
+
+/// How many the loop took, and how many it parsed itself.
+pub fn pp_hits() -> i64 {
+    return g_ppt_hits;
+}
+
+pub fn pp_misses() -> i64 {
+    return g_ppt_misses;
+}
+
+/// Parse ahead `k` (for FID_PP_VERIFY).
+pub fn pp_result(k: i64) -> PreParse {
+    return g_ppt_results.get(k);
+}
+
+/// Bring the maps of the loop's names up to `struct_names` / `enum_names`
+/// and the import set; a name of more than one word that came in after the
+/// parse ahead began sets g_ppt_odd.
+fn pp_act_update(struct_names: Vec<str>, enum_names: Vec<str>) {
+    while g_ppt_sn_n < struct_names.len() {
+        var sn: str = struct_names.get(g_ppt_sn_n);
+        HashMap_insert(g_ppt_sn, sn, 1);
+        if g_ppt_sn_n >= g_ppt_base_sn && !pp_is_word(sn) {
+            g_ppt_odd = true;
+        }
+        g_ppt_sn_n = g_ppt_sn_n + 1;
+    }
+    while g_ppt_en_n < enum_names.len() {
+        var en: str = enum_names.get(g_ppt_en_n);
+        HashMap_insert(g_ppt_en, en, 1);
+        if g_ppt_en_n >= g_ppt_base_en && !pp_is_word(en) {
+            g_ppt_odd = true;
+        }
+        g_ppt_en_n = g_ppt_en_n + 1;
+    }
+    while g_ppt_in_n < g_import_list.len() {
+        if g_ppt_in_n >= g_ppt_base_in && !pp_is_word(g_import_list.get(g_ppt_in_n)) {
+            g_ppt_odd = true;
+        }
+        g_ppt_in_n = g_ppt_in_n + 1;
+    }
+}
+
+/// The index of the parse ahead of `path` the loop may take in place of
+/// parsing it with these names (Parser_with_names(tokens, struct_names,
+/// enum_names) and the import set as it is now): -1 when there is none or
+/// the loop's parse could differ. Asked once per module (the loop keeps
+/// its first parse).
+pub fn pp_valid(path: str, struct_names: Vec<str>, enum_names: Vec<str>) -> i64 {
+    if g_ppt_results.len() == 0 {
+        return -1;
+    }
+    var k: i64 = HashMap_get(g_ppt_index, path) - 1;
+    if k < 0 || g_ppt_used.get(k) {
+        return -1;
+    }
+    g_ppt_used.set(k, true);
+    if !g_ppt_results.get(k).ok {
+        g_ppt_misses = g_ppt_misses + 1;
+        return -1;
+    }
+    pp_act_update(struct_names, enum_names);
+    if g_ppt_odd {
+        g_ppt_misses = g_ppt_misses + 1;
+        return -1;
+    }
+    var words: Vec<str> = g_ppt_results.get(k).words;
+    var bits: Vec<i64> = g_ppt_results.get(k).bits;
+    var i: i64 = 0;
+    while i < words.len() {
+        var w: str = words.get(i);
+        var b: i64 = 0;
+        if HashMap_get(g_ppt_sn, w) != 0 {
+            b = b | 1;
+        }
+        if HashMap_get(g_ppt_en, w) != 0 {
+            b = b | 2;
+        }
+        if HashMap_get(g_import_set, w) != 0 {
+            b = b | 4;
+        }
+        if b != bits.get(i) {
+            g_ppt_misses = g_ppt_misses + 1;
+            return -1;
+        }
+        i = i + 1;
+    }
+    if !parser_side_fits(g_ppt_results.get(k).side) {
+        g_ppt_misses = g_ppt_misses + 1;
+        return -1;
+    }
+    return k;
+}
+
+/// Take parse ahead `k` (pp_valid said so): its other changes made as the
+/// loop's parse would have made them, and its Program.
+pub fn pp_use(k: i64) -> Program {
+    parser_side_apply(g_ppt_results.get(k).side);
+    g_ppt_hits = g_ppt_hits + 1;
+    return g_ppt_results.get(k).prog;
 }

@@ -4861,7 +4861,8 @@ pub fn nat_dbg_scope_end(path: str, line: i64) -> i64 {
 /// Abbreviations 7 a function with a frame base, declaration and children,
 /// 8 the same with a linkage name, 9 / 10 a parameter / variable with a
 /// location, 11 / 12 without one, 13 a pointer type; CT6 14 / 15 with a
-/// location list; DB4 18 a lexical block.
+/// location list; DB4 18 a lexical block; 19 / 20 a generated function
+/// without a declaration, the second with a linkage name.
 fn nat_dbg_abbrevs_ext(abbrev: &mut Vec<i64>) {
     var code: i64 = 7;
     while code <= 8 {
@@ -4889,6 +4890,29 @@ fn nat_dbg_abbrevs_ext(abbrev: &mut Vec<i64>) {
         abbrev.push(0x3B);
         abbrev.push(0x06);
         // decl_line, data4
+        abbrev.push(0);
+        abbrev.push(0);
+        code = code + 1;
+    }
+    code = 19;
+    while code <= 20 {
+        abbrev.push(code);
+        abbrev.push(0x2E);
+        abbrev.push(0);
+        abbrev.push(0x03);
+        abbrev.push(0x08);
+        if code == 20 {
+            abbrev.push(0x6E);
+            abbrev.push(0x08);
+        }
+        abbrev.push(0x11);
+        abbrev.push(0x01);
+        abbrev.push(0x12);
+        abbrev.push(0x07);
+        abbrev.push(0x3F);
+        abbrev.push(0x19);
+        abbrev.push(0x40);
+        abbrev.push(0x18);
         abbrev.push(0);
         abbrev.push(0);
         code = code + 1;
@@ -5482,14 +5506,36 @@ pub fn nat_dwarf_build(arch: i64, image: Vec<i64>, base: i64, names: Vec<str>, s
             shown = g_nat_dbg_shown.get(i);
         }
         var with_link: bool = str_len(shown) > 0 && shown != names.get(i);
+        var has_decl: bool = false;
+        var dfile: i64 = 0;
+        var dline: i64 = 0;
         if g_nat_dbg_ext {
-            if with_link {
-                info.push(8);
-                nat_put_str(&mut info, shown);
-                nat_put_str(&mut info, names.get(i));
+            while dri + 2 < lrows.len() && lrows.get(dri) < starts.get(i) {
+                dri = dri + 3;
+            }
+            // (2g.102: the first row of the function's own code)
+            var ddecl: Vec<i64> = nat_dbg_decl_of(&mut dsrc, file, &lrows, dri, ends.get(i), names.get(i), shown);
+            dfile = ddecl.get(0);
+            dline = ddecl.get(1);
+            has_decl = dfile > 0 && dline > 0;
+            if has_decl {
+                if with_link {
+                    info.push(8);
+                    nat_put_str(&mut info, shown);
+                    nat_put_str(&mut info, names.get(i));
+                } else {
+                    info.push(7);
+                    nat_put_str(&mut info, names.get(i));
+                }
             } else {
-                info.push(7);
-                nat_put_str(&mut info, names.get(i));
+                if with_link {
+                    info.push(20);
+                    nat_put_str(&mut info, shown);
+                    nat_put_str(&mut info, names.get(i));
+                } else {
+                    info.push(19);
+                    nat_put_str(&mut info, names.get(i));
+                }
             }
         } else if with_link {
             info.push(6);
@@ -5505,16 +5551,11 @@ pub fn nat_dwarf_build(arch: i64, image: Vec<i64>, base: i64, names: Vec<str>, s
             // frame_base: DW_OP_call_frame_cfa
             info.push(1);
             info.push(0x9C);
-            while dri + 2 < lrows.len() && lrows.get(dri) < starts.get(i) {
-                dri = dri + 3;
+            if has_decl {
+                nat_put_u16(&mut info, dfile);
+                nat_put_u32(&mut info, dline);
+                nat_dbg_put_vars(&mut info, i, dbg_vat, starts.get(i) - lo, &mut dloc, lists, base + lo, ends.get(i) - starts.get(i));
             }
-            // (2g.102: the first row of the function's own code)
-            var ddecl: Vec<i64> = nat_dbg_decl_of(&mut dsrc, file, &lrows, dri, ends.get(i), names.get(i), shown);
-            var dfile: i64 = ddecl.get(0);
-            var dline: i64 = ddecl.get(1);
-            nat_put_u16(&mut info, dfile);
-            nat_put_u32(&mut info, dline);
-            nat_dbg_put_vars(&mut info, i, dbg_vat, starts.get(i) - lo, &mut dloc, lists, base + lo, ends.get(i) - starts.get(i));
         }
         i = i + 1;
     }

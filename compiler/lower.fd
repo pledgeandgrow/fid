@@ -721,6 +721,9 @@ pub struct Lowerer {
     /// lw_ix_last): every lookup by name scanned the whole list
     pub alloca_ix: i64,
     pub var_ast_ix: i64,
+    /// SP12: an index of alloca_types (Lowerer_at_ix_add), 0 while the
+    /// table is short or was replaced whole
+    pub alloca_type_ix: i64,
     // The AST type of the value being matched, for the bindings of a generic
     // enum's variants (Option<f64>: Some(v) is an f64)
     pub match_scrutinee_ty: Type,
@@ -878,7 +881,7 @@ pub fn c_vec2_i64(x: i64, y: i64) -> Vec<i64> {
 
 pub fn Lowerer_new() -> Lowerer {
     return Lowerer {
-        module: IrModule_new(), current_func: IrFunction_new("", IrType::Void), has_current_func: false, current_block: 0, loop_stack: Vec::new(), structs: Vec::new(), allocas: Vec::new(), alloca_types: Vec::new(), var_ast_types: Vec::new(), alloca_ix: HashMap_new(), var_ast_ix: HashMap_new(), match_scrutinee_ty: Type::I64, constants: Vec::new(), current_sret: OptValueId::None, enums: Vec::new(), enum_index: HashMap_new(), struct_index: HashMap_new(), impl_index: HashMap_new(), extern_index: HashMap_new(), impl_methods: Vec::new(), defer_stack: Vec::new(), current_captures: Vec::new(), try_stack: Vec::new(), effect_handler_stack: Vec::new(), global_inits: Vec::new(), handle_slot_fn: "", handle_slot: - 1, scope_executor_stack: Vec::new(), current_line: OptU64::None, type_aliases: Vec::new(), current_self_type: OptStringLower::None, region_stack: Vec::new(), gpu_region_stack: Vec::new(), sandbox_depth: 0, func_ret_types: Vec::new(), async_funcs: Vec::new(), async_tasks: Vec::new(), async_adapted: Vec::new(), cur_body: Vec::new(), cur_has_defer: false, no_struct_share: false, rest_of: Vec::new(), rest_from: 0, fr_lists: Vec::new(), fr_idx: Vec::new(), fr_lu: Vec::new(), rest_lv: - 1, fn_externs: Vec::new(), current_func_param_types: Vec::new(), vec_allocas: Vec::new(), linear_structs: Vec::new(), let_hint: OptType::None, func_param_names: Vec::new(), func_defaults: Vec::new(), func_info_at: HashMap_new(), func_param_asts: Vec::new(), continuation_counter: 0, to_toks: Vec::new(), to_loops: Vec::new(), to_trys: Vec::new(), to_base: 0, to_hit: - 1, own_slots: Vec::new(), own_marks: Vec::new(), own_temps: Vec::new(), own_loop_slots: Vec::new(), own_loop_temps: Vec::new(), own_prologue: Vec::new(), txn_stack: Vec::new(), own_on: false, own_ret_ty: Type::Void, own_raw_ret: false, cur_line: 0, own_str_externs: Vec::new(), own_nomove: Vec::new(), own_types: Vec::new(), own_type_index: HashMap_new(), own_kind_cache: HashMap_new(), own_ret_index: HashMap_new(), rg_on: false, rg_fns: Vec::new(), rg_ids: Vec::new(), rg_loop_marks: Vec::new(), rg_keep_out: false,
+        module: IrModule_new(), current_func: IrFunction_new("", IrType::Void), has_current_func: false, current_block: 0, loop_stack: Vec::new(), structs: Vec::new(), allocas: Vec::new(), alloca_types: Vec::new(), var_ast_types: Vec::new(), alloca_ix: HashMap_new(), var_ast_ix: HashMap_new(), alloca_type_ix: 0, match_scrutinee_ty: Type::I64, constants: Vec::new(), current_sret: OptValueId::None, enums: Vec::new(), enum_index: HashMap_new(), struct_index: HashMap_new(), impl_index: HashMap_new(), extern_index: HashMap_new(), impl_methods: Vec::new(), defer_stack: Vec::new(), current_captures: Vec::new(), try_stack: Vec::new(), effect_handler_stack: Vec::new(), global_inits: Vec::new(), handle_slot_fn: "", handle_slot: - 1, scope_executor_stack: Vec::new(), current_line: OptU64::None, type_aliases: Vec::new(), current_self_type: OptStringLower::None, region_stack: Vec::new(), gpu_region_stack: Vec::new(), sandbox_depth: 0, func_ret_types: Vec::new(), async_funcs: Vec::new(), async_tasks: Vec::new(), async_adapted: Vec::new(), cur_body: Vec::new(), cur_has_defer: false, no_struct_share: false, rest_of: Vec::new(), rest_from: 0, fr_lists: Vec::new(), fr_idx: Vec::new(), fr_lu: Vec::new(), rest_lv: - 1, fn_externs: Vec::new(), current_func_param_types: Vec::new(), vec_allocas: Vec::new(), linear_structs: Vec::new(), let_hint: OptType::None, func_param_names: Vec::new(), func_defaults: Vec::new(), func_info_at: HashMap_new(), func_param_asts: Vec::new(), continuation_counter: 0, to_toks: Vec::new(), to_loops: Vec::new(), to_trys: Vec::new(), to_base: 0, to_hit: - 1, own_slots: Vec::new(), own_marks: Vec::new(), own_temps: Vec::new(), own_loop_slots: Vec::new(), own_loop_temps: Vec::new(), own_prologue: Vec::new(), txn_stack: Vec::new(), own_on: false, own_ret_ty: Type::Void, own_raw_ret: false, cur_line: 0, own_str_externs: Vec::new(), own_nomove: Vec::new(), own_types: Vec::new(), own_type_index: HashMap_new(), own_kind_cache: HashMap_new(), own_ret_index: HashMap_new(), rg_on: false, rg_fns: Vec::new(), rg_ids: Vec::new(), rg_loop_marks: Vec::new(), rg_keep_out: false,
     };
 }
 
@@ -1365,6 +1368,16 @@ pub fn Lowerer_lookup_alloca(self: & Lowerer, name: str) -> OptValueId {
 }
 
 pub fn Lowerer_lookup_alloca_type(self: & Lowerer, id: i64) -> OptIrType {
+    // SP12: the first entry of the id from the index (lw_at_ix_first)
+    if self.alloca_type_ix != 0 {
+        val at: i64 = lw_at_ix_first(self.alloca_type_ix, & self.alloca_types, id);
+        if at >= 0 {
+            return OptIrType::Some(self.alloca_types.get(at).val);
+        }
+        if at == - 1 {
+            return OptIrType::None;
+        }
+    }
     var i: i64 = 0;
     while i < self.alloca_types.len() {
         if self.alloca_types.get(i).key == id {
@@ -1715,10 +1728,102 @@ fn Lowerer_ix_reset_tables(self: & mut Lowerer) {
         lw_ix_link(self.var_ast_ix, vn, i, vb);
         i = i + 1;
     }
+    // alloca_types: made again at the next insert into a long table
+    if self.alloca_type_ix != 0 {
+        HashMap_drop(self.alloca_type_ix);
+        self.alloca_type_ix = 0;
+    }
 }
 
 pub fn Lowerer_insert_alloca_type(self: & mut Lowerer, id: i64, ty: IrType) {
     self.alloca_types.push(I64IrTypeEntry_new(id, ty));
+    // SP12: a long function's table is indexed (a lookup scanned it all)
+    if self.alloca_type_ix != 0 {
+        Lowerer_at_ix_add(self, self.alloca_types.len() - 1);
+    } else if self.alloca_types.len() >= g_lw_at_ix_min {
+        self.alloca_type_ix = HashMap_new();
+        var i: i64 = 0;
+        while i < self.alloca_types.len() {
+            Lowerer_at_ix_add(self, i);
+            i = i + 1;
+        }
+    }
+}
+
+// --- SP12: the index of alloca_types ----------------------------------------
+//
+// alloca_types (slot id -> IR type) is a stack like allocas: pushed by
+// Lowerer_insert_alloca_type, cut back with truncate, replaced whole around
+// a function lowered inside another (then Lowerer_ix_reset_tables drops the
+// index), changed in place only with the same id. A lookup wants the FIRST
+// entry of an id. The index holds "#id" -> 1 + the position of the id's
+// newest push and "#id@p" -> 1 + the id's last entry below p when p was
+// pushed (0: none), as lw_ix_link does for names: every entry of the id
+// still in the table is on that chain, newest first, so its lowest entry
+// still there is the first. Positions cut off are skipped (no longer there,
+// or holding another id); a link that does not go down sends the lookup to
+// the scan.
+
+/// Tables shorter than this are scanned (no index; a test may raise it).
+var g_lw_at_ix_min: i64 = 32;
+
+/// Link entry `p` of alloca_types into the index.
+fn Lowerer_at_ix_add(self: & mut Lowerer, p: i64) {
+    val id: i64 = self.alloca_types.get(p).key;
+    val k: str = "#" + int_to_str(id);
+    val below: i64 = lw_at_ix_last_below(self.alloca_type_ix, & self.alloca_types, id, p);
+    HashMap_insert(self.alloca_type_ix, k + "@" + int_to_str(p), below + 1);
+    HashMap_insert(self.alloca_type_ix, k, p + 1);
+}
+
+/// The last entry of `id` in `v` below position `lim` (-1: none).
+fn lw_at_ix_last_below(m: i64, v: & Vec<I64IrTypeEntry>, id: i64, lim: i64) -> i64 {
+    val k: str = "#" + int_to_str(id);
+    var p: i64 = HashMap_get(m, k) - 1;
+    while p >= 0 {
+        if p < lim && p < v.len() && v.get(p).key == id {
+            return p;
+        }
+        val q: i64 = HashMap_get(m, k + "@" + int_to_str(p)) - 1;
+        if q >= p {
+            break;
+        }
+        p = q;
+    }
+    if p < 0 {
+        return - 1;
+    }
+    // a link that does not go down: the scan decides
+    var i: i64 = lim - 1;
+    if i >= v.len() {
+        i = v.len() - 1;
+    }
+    while i >= 0 {
+        if v.get(i).key == id {
+            return i;
+        }
+        i = i - 1;
+    }
+    return - 1;
+}
+
+/// The first entry of `id` in `v` from the index `m` (-1: none), or -2
+/// when the index cannot tell (the scan decides).
+fn lw_at_ix_first(m: i64, v: & Vec<I64IrTypeEntry>, id: i64) -> i64 {
+    val k: str = "#" + int_to_str(id);
+    var p: i64 = HashMap_get(m, k) - 1;
+    var first: i64 = - 1;
+    while p >= 0 {
+        if p < v.len() && v.get(p).key == id {
+            first = p;
+        }
+        val q: i64 = HashMap_get(m, k + "@" + int_to_str(p)) - 1;
+        if q >= p {
+            return - 2;
+        }
+        p = q;
+    }
+    return first;
 }
 
 /// A struct, or a pointer to one (CI3).
@@ -8954,6 +9059,11 @@ fn Lowerer_lift_parallel_branch(self: & mut Lowerer, branch: Vec<Stmt>) -> i64 {
         }
         ci = ci + 1;
     }
+    // every runtime's task block holds 8 argument words: a branch reading
+    // more outer locals runs in place, as an assigning one does
+    if names.len() > 8 {
+        return - 1;
+    }
 
     self.continuation_counter = self.continuation_counter + 1;
     var fname: str = "__par_" + int_to_str(self.continuation_counter);
@@ -13099,15 +13209,19 @@ fn Lowerer_lower_stmt_inner(self: & mut Lowerer, stmt: Stmt) {
                             match e {
                                 Expr::Call(callee, args) => {
                                     // Spawn: p_thread_spawn(func_name, num_args, args...)
-                                    var pvals: Vec<i64> = Vec::new();
-                                    var ai: i64 = 0;
-                                    while ai < args.len() {
-                                        pvals.push(Lowerer_lower_expr(self, args.get(ai)));
-                                        ai = ai + 1;
+                                    // (a task block holds 8 argument words: a
+                                    // call with more runs in place)
+                                    if args.len() <= 8 {
+                                        var pvals: Vec<i64> = Vec::new();
+                                        var ai: i64 = 0;
+                                        while ai < args.len() {
+                                            pvals.push(Lowerer_lower_expr(self, args.get(ai)));
+                                            ai = ai + 1;
+                                        }
+                                        var handle: i64 = Lowerer_spawn_call(self, callee, args, pvals);
+                                        thread_handles.push(handle);
+                                        spawned = true;
                                     }
-                                    var handle: i64 = Lowerer_spawn_call(self, callee, args, pvals);
-                                    thread_handles.push(handle);
-                                    spawned = true;
                                 }
                                 _ => {
                                 }
@@ -13145,7 +13259,7 @@ fn Lowerer_lower_stmt_inner(self: & mut Lowerer, stmt: Stmt) {
                             var par_drop: bool = slot >= 0 && self.own_on && Lowerer_rc_owns_slot(self, slot) && Lowerer_rc_kind(self, Lowerer_rc_var_type(self, target)) == RC_STR;
                             match rhs {
                                 Expr::Call(acallee, aargs) => {
-                                    if plain && slot >= 0 && Lowerer_is_user_func(self, acallee) && !Lowerer_is_async_func(self, acallee) {
+                                    if plain && slot >= 0 && aargs.len() <= 8 && Lowerer_is_user_func(self, acallee) && !Lowerer_is_async_func(self, acallee) {
                                         var avals: Vec<i64> = Vec::new();
                                         var words: bool = true;
                                         var aai: i64 = 0;
@@ -16740,6 +16854,12 @@ fn Lowerer_lower_call_expr_resolved(self: & mut Lowerer, callee: str, args: Vec<
             if self.own_on && lw_rc_consuming_arg(callee, ai) {
                 lav = Lowerer_rc_own_value(self, lav, Lowerer_rc_value_type(self, resolved_args.get(ai), lav));
             }
+            // BG204: a JSON value made for a JSON reader's argument and
+            // used by nothing else (`p_json_dump(p_json_parse(s))`) is a
+            // counted string of the statement, dropped at its end
+            if self.own_on && lw_json_reader(callee) && lw_json_fresh_arg(resolved_args.get(ai)) {
+                Lowerer_rc_temp(self, lav, Type::Str);
+            }
             arg_vals.push(lav);
         }
         ai = ai + 1;
@@ -19448,8 +19568,13 @@ pub fn Lowerer_lower_expr(self: & mut Lowerer, expr: Expr) -> i64 {
                     // forwarders (`Slot__i64`): its methods are mono's
                     // `Slot__show__i64`, and `Slot_show` is no function
                     var gdyn: str = Lowerer_dyn_generic_name(self, lw_rc_strip_ref(Lowerer_resolve_type(self, Lowerer_rc_expr_type(self, lw_box_expr_unbox(e)))), trait_name);
+                    // (typed as its trait, as a `dyn` variable is: a method
+                    // called on the cast itself, `(q as dyn T).m()`, is a
+                    // dynamic call, not a call of `dyn_m`; BG184's note)
                     if str_len(gdyn) > 0 {
-                        return Lowerer_emit_inst(self, Inst::MakeDyn(val, gdyn, trait_name));
+                        var gdv: i64 = Lowerer_emit_inst(self, Inst::MakeDyn(val, gdyn, trait_name));
+                        Lowerer_set_value_type(self, gdv, IrType::Opaque("dyn:" + trait_name));
+                        return gdv;
                     }
                     var src_ir_ty: IrType = Lowerer_get_value_type(self, val);
                     var type_name: str = "Unknown";
@@ -19471,7 +19596,9 @@ pub fn Lowerer_lower_expr(self: & mut Lowerer, expr: Expr) -> i64 {
                     }
                     // BG144: a qualified impl's methods are
                     // `Type__Trait_method`, so its dyn values say `Type__Trait`
-                    return Lowerer_emit_inst(self, Inst::MakeDyn(val, lw_tq_prefix(type_name, trait_name), trait_name));
+                    var dv: i64 = Lowerer_emit_inst(self, Inst::MakeDyn(val, lw_tq_prefix(type_name, trait_name), trait_name));
+                    Lowerer_set_value_type(self, dv, IrType::Opaque("dyn:" + trait_name));
+                    return dv;
                 }
                 // An address cast to a function type is a C function, called
                 // through (stdlib-agent-bugs 45, 50): an env whose word 0 is
@@ -20200,8 +20327,94 @@ pub fn Lowerer_lower_expr(self: & mut Lowerer, expr: Expr) -> i64 {
             // If None (tag 1), return 0.
             var option_ptr: i64 = Lowerer_lower_expr(self, lw_box_expr_unbox(obj));
 
+            // The struct the field is read from: the payload type of the
+            // receiver's Option when it is known (BG182), else the struct
+            // that has a field of this name.
+            var found_struct_name: str = "";
+            match Lowerer_resolve_type(self, Lowerer_rc_expr_type(self, lw_box_expr_unbox(obj))) {
+                Type::Generic(ogn, oargs) => {
+                    if ogn == "Option" && oargs.len() == 1 {
+                        var pn: str = lw_rc_type_name(lw_rc_strip_ref(Lowerer_resolve_type(self, oargs.get(0))));
+                        if pn != "" {
+                            match IrModule_get_struct(& self.module, pn) {
+                                OptStructLayout::Some(pl) => {
+                                    var pfi: i64 = 0;
+                                    while pfi < pl.fields.len() {
+                                        if pl.fields.get(pfi).name == field {
+                                            found_struct_name = pn;
+                                        }
+                                        pfi = pfi + 1;
+                                    }
+                                }
+                                OptStructLayout::None => {
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {
+                }
+            }
+            if str_len(found_struct_name) == 0 {
+                var si: i64 = 0;
+                while si < self.module.struct_layouts.len() {
+                    var layout_name: str = self.module.struct_layouts.get(si).name;
+                    match IrModule_get_struct(& self.module, layout_name) {
+                        OptStructLayout::Some(layout) => {
+                            var fi: i64 = 0;
+                            while fi < layout.fields.len() {
+                                if layout.fields.get(fi).name == field {
+                                    found_struct_name = layout_name;
+                                }
+                                fi = fi + 1;
+                            }
+                        }
+                        OptStructLayout::None => {
+                        }
+                    }
+                    si = si + 1;
+                }
+            }
+            var found_idx: i64 = 0 - 1;
+            var found_ty: IrType = IrType::I64;
+            if str_len(found_struct_name) > 0 {
+                match IrModule_get_struct(& self.module, found_struct_name) {
+                    OptStructLayout::Some(layout) => {
+                        var fi: i64 = 0;
+                        while fi < layout.fields.len() {
+                            if layout.fields.get(fi).name == field {
+                                found_idx = fi;
+                                found_ty = layout.fields.get(fi).ty;
+                            }
+                            fi = fi + 1;
+                        }
+                    }
+                    OptStructLayout::None => {
+                    }
+                }
+            }
+            // The result has the field's type when it is a float (BG182: an
+            // f64 read through an i64 slot gave its bits, or a truncation on
+            // C); every other field stays a word, as before.
+            var res_ty: IrType = IrType::I64;
+            var res_float: bool = false;
+            if found_idx >= 0 {
+                match found_ty {
+                    IrType::F64 => {
+                        res_ty = IrType::F64;
+                        res_float = true;
+                    }
+                    IrType::F32 => {
+                        res_ty = IrType::F32;
+                        res_float = true;
+                    }
+                    _ => {
+                    }
+                }
+            }
+
             // Allocate result slot
-            var result_slot: i64 = Lowerer_emit_inst(self, Inst::Alloca(IrType::I64, Lowerer_current_region(self)));
+            var result_slot: i64 = Lowerer_emit_inst(self, Inst::Alloca(res_ty, Lowerer_current_region(self)));
 
             // Load the tag (field 0)
             var tag_ptr: i64 = Lowerer_emit_inst(self, Inst::GetFieldPtr(option_ptr, 0, IrType::I64));
@@ -20212,6 +20425,10 @@ pub fn Lowerer_lower_expr(self: & mut Lowerer, expr: Expr) -> i64 {
             var merge_block: i64 = Lowerer_new_block(self);
 
             var zero_val: i64 = Lowerer_emit_inst(self, Inst::ConstInt(0, IrType::I64));
+            var res_zero: i64 = zero_val;
+            if res_float {
+                res_zero = Lowerer_emit_inst(self, Inst::ConstFloat(0.0, res_ty));
+            }
             var is_some: i64 = Lowerer_emit_inst(self, Inst::BinOp(BinOp::Eq, tag, zero_val, IrType::Bool));
             Lowerer_emit_terminator(self, Inst::Branch(is_some, some_block, none_block));
 
@@ -20220,50 +20437,15 @@ pub fn Lowerer_lower_expr(self: & mut Lowerer, expr: Expr) -> i64 {
             var val_ptr: i64 = Lowerer_emit_inst(self, Inst::GetFieldPtr(option_ptr, 1, IrType::I64));
             var struct_ptr: i64 = Lowerer_emit_inst(self, Inst::Load(val_ptr, IrType::I64));
 
-            // Search for a struct that has this field
-            var found_struct_name: str = "";
-            var si: i64 = 0;
-            while si < self.module.struct_layouts.len() {
-                var layout_name: str = self.module.struct_layouts.get(si).name;
-                match IrModule_get_struct(& self.module, layout_name) {
-                    OptStructLayout::Some(layout) => {
-                        var fi: i64 = 0;
-                        while fi < layout.fields.len() {
-                            if layout.fields.get(fi).name == field {
-                                found_struct_name = layout_name;
-                            }
-                            fi = fi + 1;
-                        }
+            var field_val: i64 = res_zero;
+            if found_idx >= 0 {
+                var f_ptr: i64 = Lowerer_emit_inst(self, Inst::GetFieldPtr(struct_ptr, found_idx, found_ty));
+                match found_ty {
+                    IrType::Struct(_) => {
+                        field_val = f_ptr;
                     }
-                    OptStructLayout::None => {
-                    }
-                }
-                si = si + 1;
-            }
-
-            var field_val: i64 = Lowerer_emit_inst(self, Inst::ConstInt(0, IrType::I64));
-            if str_len(found_struct_name) > 0 {
-                match IrModule_get_struct(& self.module, found_struct_name) {
-                    OptStructLayout::Some(layout) => {
-                        var fi: i64 = 0;
-                        while fi < layout.fields.len() {
-                            if layout.fields.get(fi).name == field {
-                                var f_idx: i64 = fi;
-                                var f_ty: IrType = layout.fields.get(fi).ty;
-                                var f_ptr: i64 = Lowerer_emit_inst(self, Inst::GetFieldPtr(struct_ptr, f_idx, f_ty));
-                                match f_ty {
-                                    IrType::Struct(_) => {
-                                        field_val = f_ptr;
-                                    }
-                                    _ => {
-                                        field_val = Lowerer_emit_inst(self, Inst::Load(f_ptr, f_ty));
-                                    }
-                                }
-                            }
-                            fi = fi + 1;
-                        }
-                    }
-                    OptStructLayout::None => {
+                    _ => {
+                        field_val = Lowerer_emit_inst(self, Inst::Load(f_ptr, found_ty));
                     }
                 }
             }
@@ -20273,12 +20455,12 @@ pub fn Lowerer_lower_expr(self: & mut Lowerer, expr: Expr) -> i64 {
 
             // None: store 0 to result
             Lowerer_set_current_block(self, none_block);
-            var _s2: i64 = Lowerer_emit_inst(self, Inst::Store(result_slot, zero_val, OptIrType::None));
+            var _s2: i64 = Lowerer_emit_inst(self, Inst::Store(result_slot, res_zero, OptIrType::None));
             Lowerer_emit_terminator(self, Inst::Jump(merge_block));
 
             // Merge: load result
             Lowerer_set_current_block(self, merge_block);
-            return Lowerer_emit_inst(self, Inst::Load(result_slot, IrType::I64));
+            return Lowerer_emit_inst(self, Inst::Load(result_slot, res_ty));
         }
         Expr::ArrayLit(elem_ty, elements) => {
             // Allocate array on stack
@@ -27297,6 +27479,28 @@ fn lw_rc_fresh_builtin(name: str) -> bool {
     }
     return name == "p_str_concat" || name == "p_to_str" || name == "p_to_str_float" || name == "p_float_to_str" || name == "p_to_str_bool" || name == "p_bool_to_str" || name == "p_char_to_str" || name == "p_to_str_vec" || name == "p_vec_to_str" || name == "p_to_str_map" || name == "p_str_join_n" || name == "p_sb_to_str" || name == "p_json_dump" || name == "p_json_pretty" || name == "p_json_string" || name == "p_tensor_to_str" || name == "p_simd_to_str" || name == "p_str_from_ptr" || name == "p_str_take"  // The builtins that can fail give a counted copy, or null
     || name == "p_file_read" || name == "p_read_line" || name == "p_read_stdin" || name == "p_getenv" || name == "p_argv" || name == "p_process_stdout" || name == "p_process_stderr" || name == "p_dir_list";
+}
+
+/// BG204: the runtime's JSON functions that read a JSON value and keep
+/// nothing of it.
+fn lw_json_reader(name: str) -> bool {
+    if !str_starts_with(name, "p_json_") {
+        return false;
+    }
+    return name == "p_json_dump" || name == "p_json_pretty" || name == "p_json_get" || name == "p_json_at" || name == "p_json_type" || name == "p_json_len" || name == "p_json_string" || name == "p_json_get_int" || name == "p_json_get_float" || name == "p_json_get_bool";
+}
+
+/// BG204: a call that makes a new JSON value (every runtime gives a counted
+/// string, as for p_json_dump).
+fn lw_json_fresh_arg(e: Expr) -> bool {
+    match e {
+        Expr::Call(c, _) => {
+            return c == "p_json_parse" || c == "p_json_get" || c == "p_json_at";
+        }
+        _ => {
+        }
+    }
+    return false;
 }
 
 /// core functions that hand back a new Vec or map as an i64 handle.

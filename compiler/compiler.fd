@@ -534,7 +534,14 @@ fn imp_prefetch_lex(user: Program, base_dir: str, ark_root: str, project_root: s
                 if lexed.get(k).errors.len() == 0 {
                     token_cache.push(PathTokens_new(g.files.get(ix), lexed.get(k).tokens));
                 }
-                var ups: Vec<str> = token_use_paths(lexed.get(k).tokens);
+                // SP9: what the tokens say for the parse ahead (pp_predict)
+                var msc: ModScan = token_module_scan(lexed.get(k).tokens);
+                if lexed.get(k).errors.len() == 0 {
+                    g.scans.push(msc);
+                } else {
+                    g.scans.push(ModScan_empty());
+                }
+                var ups: Vec<str> = msc.uses;
                 var u: i64 = 0;
                 while u < ups.len() {
                     var up: str = ups.get(u);
@@ -550,6 +557,9 @@ fn imp_prefetch_lex(user: Program, base_dir: str, ark_root: str, project_root: s
                     u = u + 1;
                 }
             }
+            if k < 0 {
+                g.scans.push(ModScan_empty());
+            }
             g.deps.push(deps);
             ix = ix + 1;
         }
@@ -558,6 +568,235 @@ fn imp_prefetch_lex(user: Program, base_dir: str, ark_root: str, project_root: s
     HashMap_drop(seen);
     HashMap_drop(lexed_files);
     return g;
+}
+
+// --- SP9: the import closure parsed ahead, in parallel -----------------------
+// With FID_PAR=N (2 or more; FID_PARSE_AHEAD=off: not), after
+// imp_prefetch_lex the modules it lexed clean are parsed in up to N threads
+// (parser.fd pp_parse_par), each knowing the struct, enum and import names
+// parser.fd pp_predict expects the import loop below to know when it first
+// parses that module. cached_parse takes such a parse only when its own
+// parse would be the same (parser.fd pp_valid): every word of the module's
+// text is a struct, enum or import name for the loop exactly when it was
+// for the parse ahead (a parse asks about no other name), and the parse
+// numbered no turbofish call or `__pcall_k` local the loop would number
+// otherwise. Its other changes (import set, `module::name` calls, @import
+// headers, numbers, the @secret / splice flags) are then made as the
+// loop's parse would have made them (pp_use, parser_side_apply). Any other
+// module the loop parses itself, as before: the parse order, the Programs
+// and every message stay the same. A wrong guess costs time, never output.
+// FID_PP_VERIFY=1: the loop parses every module itself too, keeps its own
+// parse, and reports on stderr each parse ahead it would have taken that
+// differs from it (`[pp] verify: ...`; the --time row counts them).
+
+var g_pp_verify: bool = false;
+var g_pp_checked: i64 = 0;
+var g_pp_differ: i64 = 0;
+
+/// The index of `path`'s tokens in token_cache (-1: none).
+fn pp_token_at(token_cache: &mut Vec<PathTokens>, path: str) -> i64 {
+    var i: i64 = 0;
+    while i < token_cache.len() {
+        if token_cache.get(i).path == path {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// Parse ahead, in up to `nw` threads, every module of `g` lexed clean
+/// (its tokens in token_cache): the parses cached_parse may take. The
+/// number of modules parsed.
+fn pp_parse_ahead(user: Program, g: ModGraph, struct_names: Vec<str>, enum_names: Vec<str>, nw: i64, content_cache: &mut Vec<PathContent>, token_cache: &mut Vec<PathTokens>) -> i64 {
+    var uimps: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < user.imports.len() {
+        uimps.push(user.imports.get(i).path);
+        i = i + 1;
+    }
+    var pl: PpPlan = pp_predict(uimps, g, struct_names, enum_names);
+    var toks: Vec<Vec<Token>> = Vec::new();
+    var texts: Vec<str> = Vec::new();
+    var files: Vec<str> = Vec::new();
+    var sn_n: Vec<i64> = Vec::new();
+    var en_n: Vec<i64> = Vec::new();
+    var in_n: Vec<i64> = Vec::new();
+    var taken: i64 = HashMap_new();
+    i = 0;
+    while i < g.names.len() {
+        var f: str = g.files.get(i);
+        if str_len(f) > 0 && HashMap_get(taken, f) == 0 && pl.sn_n.get(i) >= 0 {
+            var ti: i64 = pp_token_at(token_cache, f);
+            if ti >= 0 {
+                HashMap_insert(taken, f, 1);
+                toks.push(token_cache.get(ti).tokens);
+                texts.push(cached_file_read(content_cache, f));
+                files.push(f);
+                sn_n.push(pl.sn_n.get(i));
+                en_n.push(pl.en_n.get(i));
+                in_n.push(pl.in_n.get(i));
+            }
+        }
+        i = i + 1;
+    }
+    HashMap_drop(taken);
+    g_pp_verify = env_or_empty("FID_PP_VERIFY") == "1";
+    g_pp_checked = 0;
+    g_pp_differ = 0;
+    var results: Vec<PreParse> = pp_parse_par(toks, texts, pl.snames, pl.enames, pl.inames, sn_n, en_n, in_n, nw);
+    pp_begin(results, files, struct_names.len(), enum_names.len());
+    return files.len();
+}
+
+fn pp_same_bytes(a: Vec<i64>, b: Vec<i64>) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    var i: i64 = 0;
+    while i < a.len() {
+        if a.get(i) != b.get(i) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn pp_same_strs(a: Vec<str>, b: Vec<str>) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    var i: i64 = 0;
+    while i < a.len() {
+        if a.get(i) != b.get(i) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// FID_PP_VERIFY: the loop parsed `path` itself (`res`), with the
+/// parser's counts before that parse `tf0` (turbofish calls), `pc0`
+/// (`__pcall_k` locals), `in0` (import names), `sec0` / `spl0` (flags);
+/// the `module::name` calls it made are still in the parser's list. Does
+/// parse ahead `k`, which pp_valid would have had it take, give the same?
+fn pp_verify(path: str, k: i64, res: ParseResultProgram, tf0: i64, pc0: i64, in0: i64, sec0: bool, spl0: bool) {
+    g_pp_checked = g_pp_checked + 1;
+    var why: str = "";
+    var pre: PreParse = pp_result(k);
+    var sd: ParseSide = pre.side;
+    match res {
+        ParseResultProgram::Ok(prog) => {
+            var ba: AwBuf = awbuf_new();
+            aw_program(&mut ba, prog);
+            var bb: AwBuf = awbuf_new();
+            aw_program(&mut bb, pre.prog);
+            if !pp_same_bytes(ba.bytes, bb.bytes) {
+                why = why + " program";
+            }
+        }
+        ParseResultProgram::Err(_) => {
+            why = why + " parse error";
+        }
+    }
+    if !pp_same_strs(parser_qualified_calls(), sd.qcalls) {
+        why = why + " module::name calls";
+    }
+    var tfa: Vec<Type> = turbofish_all();
+    if tfa.len() - tf0 != sd.turbofish.len() {
+        why = why + " turbofish calls";
+    } else {
+        var ti: i64 = 0;
+        while ti < sd.turbofish.len() {
+            var ta: AwBuf = awbuf_new();
+            aw_type(&mut ta, tfa.get(tf0 + ti));
+            var tb: AwBuf = awbuf_new();
+            aw_type(&mut tb, sd.turbofish.get(ti));
+            if !pp_same_bytes(ta.bytes, tb.bytes) {
+                why = why + " turbofish types";
+                break;
+            }
+            ti = ti + 1;
+        }
+    }
+    if parser_pcall_count() - pc0 != sd.pcalls {
+        why = why + " __pcall locals";
+    }
+    // the names the parse put in the import set: the same set
+    var inames: Vec<str> = parser_import_names();
+    var added: i64 = HashMap_new();
+    var ai: i64 = 0;
+    while ai < sd.import_adds.len() {
+        HashMap_insert(added, sd.import_adds.get(ai), 1);
+        ai = ai + 1;
+    }
+    if inames.len() - in0 != sd.import_adds.len() {
+        why = why + " import names";
+    } else {
+        ai = in0;
+        while ai < inames.len() {
+            if HashMap_get(added, inames.get(ai)) == 0 {
+                why = why + " import names";
+                break;
+            }
+            ai = ai + 1;
+        }
+    }
+    HashMap_drop(added);
+    ai = 0;
+    while ai < sd.at_paths.len() {
+        if at_import_flags(sd.at_paths.get(ai)) != sd.at_flags.get(ai) {
+            why = why + " @import headers";
+            break;
+        }
+        ai = ai + 1;
+    }
+    if (sd.secret && !parser_saw_secret()) || (!sd.secret && !sec0 && parser_saw_secret()) {
+        why = why + " @secret";
+    }
+    if (sd.splice && !parser_saw_splice()) || (!sd.splice && !spl0 && parser_saw_splice()) {
+        why = why + " splice";
+    }
+    if str_len(why) > 0 {
+        g_pp_differ = g_pp_differ + 1;
+        p_eprint_str("[pp] verify: " + path + ": the parse ahead differs:" + why + "\n");
+    }
+}
+
+/// `<n> modules: <h> taken, <m> parsed again` (and the verify counts) for
+/// the --time row; no parse ahead is taken after this.
+fn pp_finish() -> str {
+    var s: str = int_to_str(pp_count()) + " modules: " + int_to_str(pp_hits()) + " taken, " + int_to_str(pp_misses()) + " parsed again";
+    if g_pp_verify {
+        s = s + ", " + int_to_str(g_pp_checked) + " verified, " + int_to_str(g_pp_differ) + " differ";
+    }
+    pp_end();
+    return s;
+}
+
+/// With the import cache on: whether it holds less than half of the
+/// program's own imports (a new compiler, or a first build), so parsing
+/// ahead pays for the lexing ahead it needs.
+fn pp_imp_cold(user: Program, base_dir: str, ark_root: str, project_root: str) -> bool {
+    var with_file: i64 = 0;
+    var cached: i64 = 0;
+    var i: i64 = 0;
+    while i < user.imports.len() {
+        var ip: str = user.imports.get(i).path;
+        if ip != "core" && at_import_flags(ip) == 0 {
+            var f: str = imp_module_file(ip, base_dir, ark_root, project_root);
+            if str_len(f) > 0 {
+                with_file = with_file + 1;
+                if p_file_exists(imp_file(f)) != 0 {
+                    cached = cached + 1;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return with_file > 0 && cached * 2 < with_file;
 }
 
 // CB2 (complaint-roadmap): the imported modules a long-lived process (fid
@@ -674,8 +913,21 @@ fn cached_parse(parse_cache: &mut Vec<PathProgram>, token_cache: &mut Vec<PathTo
     var tf0: i64 = turbofish_all().len();
     var sec0: bool = parser_saw_secret();
     var spl0: bool = parser_saw_splice();
-    var parser: Parser = Parser_with_names(toks, struct_names, enum_names);
-    var result: ParseResultProgram = parser.parse();
+    // SP9: a parse ahead (pp_parse_ahead) when it is the one this parse
+    // would give
+    var result: ParseResultProgram = ParseResultProgram::Err("");
+    var pp_k: i64 = pp_valid(path, struct_names, enum_names);
+    if pp_k >= 0 && !g_pp_verify {
+        result = ParseResultProgram::Ok(pp_use(pp_k));
+    } else {
+        var pc0: i64 = parser_pcall_count();
+        var in0: i64 = parser_import_names().len();
+        var parser: Parser = Parser_with_names(toks, struct_names, enum_names);
+        result = parser.parse();
+        if pp_k >= 0 {
+            pp_verify(path, pp_k, result, tf0, pc0, in0, sec0, spl0);
+        }
+    }
     match result {
         ParseResultProgram::Ok(prog) => {
             parse_cache.push(PathProgram_new(path, prog));
@@ -5417,10 +5669,25 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                         // threads (not with the import or module cache: a hit
                         // neither lexes nor parses)
                         var pf_nw: i64 = esc_par_workers();
-                        if pf_nw >= 2 && !imp_active() && !g_modcache_on {
+                        // SP9: and parses it ahead in N threads (pp_parse_ahead;
+                        // FID_PARSE_AHEAD=off: not), also with the import cache
+                        // on when it holds few of the modules (pp_imp_cold)
+                        var pf_pp: bool = pf_nw >= 2 && env_or_empty("FID_PARSE_AHEAD") != "off";
+                        // nothing parsed ahead for an earlier build is taken
+                        pp_finish();
+                        var pf_cold: bool = false;
+                        if pf_pp && imp_active() && !g_modcache_on {
+                            pf_cold = pp_imp_cold(user, base_dir, ark_root, project_root);
+                        }
+                        if pf_nw >= 2 && (!imp_active() || pf_cold) && !g_modcache_on {
                             var t_pf: i64 = p_clock_now_ms();
                             var pf_graph: ModGraph = imp_prefetch_lex(user, base_dir, ark_root, project_root, pf_nw, &mut content_cache, &mut token_cache);
                             time_row("  imports: lexed ahead, " + modgraph_summary(modgraph_levels(pf_graph.deps)), p_clock_now_ms() - t_pf);
+                            if pf_pp {
+                                var t_pp: i64 = p_clock_now_ms();
+                                var n_pp: i64 = pp_parse_ahead(user, pf_graph, struct_names, enum_names, pf_nw, &mut content_cache, &mut token_cache);
+                                time_row("  imports: parsed ahead, " + int_to_str(n_pp) + " modules in " + int_to_str(pf_nw) + " threads", p_clock_now_ms() - t_pp);
+                            }
                         }
 
                         while imports_to_process.len() > 0 {
@@ -5763,6 +6030,10 @@ pub fn build_program_with_path_borrowck(source: str, source_path: OptStr, borrow
                             }
                             ParseResultProgram::Err(_) => {
                             }
+                        }
+                        // SP9: how many parses ahead the loop took
+                        if pp_count() > 0 {
+                            time_row("  imports: parses ahead used, " + pp_finish(), 0);
                         }
                         // CB1: how many modules came from the import cache
                         var imp_sum: str = impcache_summary();

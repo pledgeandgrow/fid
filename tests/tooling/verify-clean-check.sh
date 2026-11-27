@@ -19,6 +19,9 @@
 #           moves of the incoming arguments and took an argument register
 #           ("defines vN in argument register"), so the natively built
 #           parser crashed in Parser_parse_unary_inner
+#   2g.122  test_lib_game_headless: inline2 exposed a cross-block forwarding
+#           chain in `forward`; the intermediate load was removed while a
+#           copied guard comparison still read it
 #
 # Usage: tests/tooling/verify-clean-check.sh
 #   FID=<compiler>   default release/fid.exe
@@ -46,7 +49,7 @@ build() { # <exe> <file> [emit args...]: FID_VERIFY=1 emit
 }
 clean() { tr -d '\r' | grep -v '^\[build\]\|^\[prof\]'; }
 
-for t in test_unroll_dead_store test_sccp_bitnot_min test_select_case_slots test_ml_full test_verify_semantics_ext; do
+for t in test_unroll_dead_store test_sccp_bitnot_min test_select_case_slots test_ml_full test_verify_semantics_ext test_lib_game_headless; do
   f=tests/bootstrap/$t.fd
   "$FID" run "$f" < /dev/null 2> /dev/null | clean > "$OUT/$t.run"
   rrc=${PIPESTATUS[0]}

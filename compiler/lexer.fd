@@ -1702,7 +1702,59 @@ pub fn lex_texts_par(texts: Vec<str>, nw: i64) -> Vec<LexedText> {
 /// `use a::b::{x, y};` and `use a::b::*;`), in order, each once. A `use` in
 /// a body or an impl is not an import of the module.
 pub fn token_use_paths(toks: Vec<Token>) -> Vec<str> {
+    return token_module_scan(toks).uses;
+}
+
+/// SP9: what the import loop reads from a module's parse, read from its
+/// tokens: the paths of its imports (token_use_paths: uses, each once;
+/// uses_all as written, in order), the names of its structs and enums
+/// (`struct N` / `enum N` outside braces), its `module a::b;` name ("" when
+/// none), and the names its `use`s put in the parser's import set (alias,
+/// else the path's last segment; in bodies too). A guess for the parallel
+/// parse (compiler.fd pp_predict): a wrong one costs time, not output.
+pub struct ModScan {
+    pub uses: Vec<str>,
+    pub uses_all: Vec<str>,
+    pub structs: Vec<str>,
+    pub enums: Vec<str>,
+    pub module: str,
+    pub import_names: Vec<str>,
+}
+
+/// The name a token is as an identifier or word keyword ("" when neither).
+fn tok_word(k: TokenKind) -> str {
+    match k {
+        TokenKind::Ident(s: str) => {
+            return s;
+        }
+        _ => {
+        }
+    }
+    if is_word_keyword(k) {
+        return token_kind_to_str(k);
+    }
+    return "";
+}
+
+/// The last `::` segment of a path.
+fn tok_path_last(path: str) -> str {
+    var at: i64 = str_len(path) - 1;
+    while at > 0 {
+        if str_byte_at(path, at) == 58 && str_byte_at(path, at - 1) == 58 {
+            return str_slice(path, at + 1, str_len(path));
+        }
+        at = at - 1;
+    }
+    return path;
+}
+
+pub fn token_module_scan(toks: Vec<Token>) -> ModScan {
     var out: Vec<str> = Vec::new();
+    var all: Vec<str> = Vec::new();
+    var structs: Vec<str> = Vec::new();
+    var enums: Vec<str> = Vec::new();
+    var inames: Vec<str> = Vec::new();
+    var module: str = "";
     var seen: i64 = HashMap_new();
     var depth: i64 = 0;
     var n: i64 = toks.len();
@@ -1717,6 +1769,66 @@ pub fn token_use_paths(toks: Vec<Token>) -> Vec<str> {
                 depth = depth - 1;
             }
             i = i + 1;
+        } else if depth == 0 && (token_kind_eq(k, TokenKind::Struct) || token_kind_eq(k, TokenKind::Enum)) {
+            if i + 1 < n {
+                match toks.get(i + 1).kind {
+                    TokenKind::Ident(dn: str) => {
+                        if token_kind_eq(k, TokenKind::Struct) {
+                            structs.push(dn);
+                        } else {
+                            enums.push(dn);
+                        }
+                    }
+                    _ => {
+                    }
+                }
+            }
+            i = i + 1;
+        } else if depth == 0 && token_kind_eq(k, TokenKind::Module) && str_len(module) == 0 {
+            var mname: str = "";
+            var mj: i64 = i + 1;
+            while mj < n {
+                var part: str = tok_word(toks.get(mj).kind);
+                if str_len(part) == 0 {
+                    break;
+                }
+                mname = mname + part;
+                mj = mj + 1;
+                if mj < n && token_kind_eq(toks.get(mj).kind, TokenKind::DoubleColon) {
+                    mname = mname + "::";
+                    mj = mj + 1;
+                } else {
+                    break;
+                }
+            }
+            module = mname;
+            i = mj;
+        } else if depth > 0 && token_kind_eq(k, TokenKind::Use) {
+            // a `use` in a body: not an import of the module, but its name
+            // goes into the import set all the same
+            var bpath: str = "";
+            var bj: i64 = i + 1;
+            while bj < n {
+                var bname: str = tok_word(toks.get(bj).kind);
+                if str_len(bname) == 0 {
+                    break;
+                }
+                bpath = bpath + bname;
+                bj = bj + 1;
+                if bj < n && token_kind_eq(toks.get(bj).kind, TokenKind::DoubleColon) {
+                    bpath = bpath + "::";
+                    bj = bj + 1;
+                } else {
+                    break;
+                }
+            }
+            if str_ends_with(bpath, "::") {
+                bpath = str_slice(bpath, 0, str_len(bpath) - 2);
+            }
+            if str_len(bpath) > 0 {
+                inames.push(tok_use_name(toks, bj, bpath));
+            }
+            i = bj;
         } else if depth == 0 && token_kind_eq(k, TokenKind::Use) {
             var path: str = "";
             var j: i64 = i + 1;
@@ -1748,6 +1860,10 @@ pub fn token_use_paths(toks: Vec<Token>) -> Vec<str> {
             if str_ends_with(path, "::") {
                 path = str_slice(path, 0, str_len(path) - 2);
             }
+            if str_len(path) > 0 {
+                all.push(path);
+                inames.push(tok_use_name(toks, j, path));
+            }
             if str_len(path) > 0 && !HashMap_contains(seen, path) {
                 HashMap_insert(seen, path, 1);
                 out.push(path);
@@ -1759,22 +1875,48 @@ pub fn token_use_paths(toks: Vec<Token>) -> Vec<str> {
         }
     }
     HashMap_drop(seen);
-    return out;
+    return ModScan {
+        uses: out, uses_all: all, structs: structs, enums: enums, module: module, import_names: inames
+    };
+}
+
+/// The name `use <path>` puts in the parser's import set: the alias of
+/// `as <alias>` at toks[j], else the path's last segment.
+fn tok_use_name(toks: Vec<Token>, j: i64, path: str) -> str {
+    if j + 1 < toks.len() && token_kind_eq(toks.get(j).kind, TokenKind::As) {
+        match toks.get(j + 1).kind {
+            TokenKind::Ident(al: str) => {
+                return al;
+            }
+            _ => {
+            }
+        }
+    }
+    return tok_path_last(path);
 }
 
 /// SP9: the modules of an import closure, in the order they were found
 /// (breadth first from the program's own imports): each one's import path,
 /// its file ("" when none was found) and the modules it imports (indexes
 /// into names; "core" is left out, as the import loop skips it).
+/// scans[i]: what module i's tokens say (token_module_scan; empty when
+/// its file was not lexed).
 pub struct ModGraph {
     pub names: Vec<str>,
     pub files: Vec<str>,
     pub deps: Vec<Vec<i64>>,
+    pub scans: Vec<ModScan>,
 }
 
 pub fn ModGraph_new() -> ModGraph {
     return ModGraph {
-        names: Vec::new(), files: Vec::new(), deps: Vec::new()
+        names: Vec::new(), files: Vec::new(), deps: Vec::new(), scans: Vec::new()
+    };
+}
+
+pub fn ModScan_empty() -> ModScan {
+    return ModScan {
+        uses: Vec::new(), uses_all: Vec::new(), structs: Vec::new(), enums: Vec::new(), module: "", import_names: Vec::new()
     };
 }
 

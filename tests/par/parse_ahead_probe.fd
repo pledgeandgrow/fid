@@ -1,0 +1,477 @@
+// SP9: how well the parse ahead of an import closure works, without
+// building a compiler: the pieces compiler.fd's import phase uses
+// (lexer.fd token_module_scan / ModGraph, parser.fd pp_predict,
+// pp_parse_par, pp_begin, pp_valid) run on a program's closure, and a copy
+// of the import loop (compiler.fd, "Resolve use imports from disk": header
+// imports, the import cache and the platform module names left out) that
+// parses every module itself, as FID_PP_VERIFY=1 does, and compares.
+//
+//   fid ccompile tests/par/parse_ahead_probe.fd -o probe.exe
+//   probe.exe [file.fd] [threads] [bad]   (default compiler/main.fd, 8)
+//
+// `bad`: the parse ahead is given no names at all (a guess as wrong as it
+// gets): the loop then takes fewer, and still none that differs, while
+// "blind" counts the parses ahead that differ from the loop's (what taking
+// them all would have got wrong).
+// Prints the modules, how many parses ahead the loop could take, how many
+// of those differ from its own parse (must be 0), and for the first few it
+// could not take, the first word that is a different name to the loop
+// than to the parse ahead. `time:` lines (not deterministic): the loop's
+// parses one after another vs the parse ahead in N threads. Run from the
+// repository root.
+
+use core;
+use vec;
+use string;
+use compiler::token;
+use compiler::ast;
+use compiler::lexer;
+use compiler::parser;
+use compiler::ast_ser;
+
+fn read_or_empty(path: str) -> str {
+    match read_file(path) {
+        Option::Some(t) => {
+            return t;
+        }
+        Option::None => {
+            return "";
+        }
+    }
+    return "";
+}
+
+fn dir_of(path: str) -> str {
+    var i: i64 = str_len(path) - 1;
+    while i >= 0 {
+        var c: i64 = str_byte_at(path, i);
+        if c == 47 || c == 92 {
+            return str_slice(path, 0, i);
+        }
+        i = i - 1;
+    }
+    return ".";
+}
+
+/// The file `use <ip>` names, in the import loop's order of candidates
+/// (without the ark pacts and the platform names).
+fn module_file(ip: str, base_dir: str) -> str {
+    var p: str = str_replace(ip, "::", "/");
+    var cands: Vec<str> = Vec::new();
+    cands.push(base_dir + "/" + p + ".fd");
+    cands.push(base_dir + "/" + p + "/mod.fd");
+    cands.push("stdlib/" + p + ".fd");
+    cands.push("stdlib/" + p + "/mod.fd");
+    cands.push(p + ".fd");
+    cands.push(p + "/mod.fd");
+    var i: i64 = 0;
+    while i < cands.len() {
+        if p_file_exists(cands.get(i)) != 0 {
+            return cands.get(i);
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn lex(text: str) -> Vec<Token> {
+    var lx: Lexer = Lexer::new(text);
+    return lx.tokenize();
+}
+
+fn add_names(p: Program, sn: &mut Vec<str>, en: &mut Vec<str>, sset: i64, eset: i64) {
+    var i: i64 = 0;
+    while i < p.structs.len() {
+        if HashMap_get(sset, p.structs.get(i).name as i64) == 0 {
+            HashMap_insert(sset, p.structs.get(i).name as i64, 1);
+            sn.push(p.structs.get(i).name);
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < p.enums.len() {
+        if HashMap_get(eset, p.enums.get(i).name as i64) == 0 {
+            HashMap_insert(eset, p.enums.get(i).name as i64, 1);
+            en.push(p.enums.get(i).name);
+        }
+        i = i + 1;
+    }
+}
+
+fn prog_bytes(p: Program) -> Vec<i64> {
+    var b: AwBuf = awbuf_new();
+    aw_program(&mut b, p);
+    return b.bytes;
+}
+
+fn same_bytes(a: Vec<i64>, b: Vec<i64>) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    var i: i64 = 0;
+    while i < a.len() {
+        if a.get(i) != b.get(i) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn str_vec_index(v: Vec<str>, s: str) -> i64 {
+    var i: i64 = 0;
+    while i < v.len() {
+        if v.get(i) == s {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn main() -> i64 {
+    var entry: str = "compiler/main.fd";
+    var nw: i64 = 8;
+    match arg_at(1) {
+        Option::Some(a) => {
+            entry = a;
+        }
+        Option::None => {
+        }
+    }
+    match arg_at(2) {
+        Option::Some(a2) => {
+            nw = str_parse_int(a2);
+        }
+        Option::None => {
+        }
+    }
+    var bad: bool = false;
+    match arg_at(3) {
+        Option::Some(a3) => {
+            bad = a3 == "bad";
+        }
+        Option::None => {
+        }
+    }
+    // the names known before the import loop: core's, then the program's
+    var sn: Vec<str> = Vec::new();
+    var en: Vec<str> = Vec::new();
+    var sset: i64 = HashMap_new();
+    var eset: i64 = HashMap_new();
+    var nostr: Vec<str> = Vec::new();
+    var cp: Parser = Parser_with_names(lex(read_or_empty("stdlib/core.fd")), nostr, nostr);
+    match cp.parse() {
+        ParseResultProgram::Ok(core_prog) => {
+            var ci: i64 = 0;
+            while ci < core_prog.structs.len() {
+                sn.push(core_prog.structs.get(ci).name);
+                ci = ci + 1;
+            }
+            ci = 0;
+            while ci < core_prog.enums.len() {
+                en.push(core_prog.enums.get(ci).name);
+                ci = ci + 1;
+            }
+        }
+        ParseResultProgram::Err(e) => {
+            println("core does not parse: " + e);
+            return 1;
+        }
+    }
+    var up: Parser = Parser_with_names(lex(read_or_empty(entry)), sn, en);
+    var user: Program = program_new();
+    match up.parse() {
+        ParseResultProgram::Ok(u) => {
+            user = u;
+        }
+        ParseResultProgram::Err(e2) => {
+            println(entry + " does not parse: " + e2);
+            return 1;
+        }
+    }
+    var ui0: i64 = 0;
+    while ui0 < user.structs.len() {
+        sn.push(user.structs.get(ui0).name);
+        ui0 = ui0 + 1;
+    }
+    ui0 = 0;
+    while ui0 < user.enums.len() {
+        en.push(user.enums.get(ui0).name);
+        ui0 = ui0 + 1;
+    }
+    var base_dir: str = dir_of(entry);
+
+    // lexing ahead, breadth first (compiler.fd imp_prefetch_lex)
+    var g: ModGraph = ModGraph_new();
+    var seen: i64 = HashMap_new();
+    var file_tok: i64 = HashMap_new();
+    var all_toks: Vec<Vec<Token>> = Vec::new();
+    var all_texts: Vec<str> = Vec::new();
+    var uimps: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < user.imports.len() {
+        var ip: str = user.imports.get(i).path;
+        uimps.push(ip);
+        if ip != "core" && HashMap_get(seen, ip as i64) == 0 {
+            g.names.push(ip);
+            HashMap_insert(seen, ip as i64, g.names.len());
+        }
+        i = i + 1;
+    }
+    var ix: i64 = 0;
+    while ix < g.names.len() {
+        var f: str = module_file(g.names.get(ix), base_dir);
+        g.files.push(f);
+        var deps: Vec<i64> = Vec::new();
+        if str_len(f) > 0 && HashMap_get(file_tok, f as i64) == 0 {
+            var text: str = read_or_empty(f);
+            var lx: Lexer = Lexer::new(text);
+            var toks: Vec<Token> = lx.tokenize();
+            all_toks.push(toks);
+            all_texts.push(text);
+            HashMap_insert(file_tok, f as i64, all_toks.len());
+            var msc: ModScan = token_module_scan(toks);
+            g.scans.push(msc);
+            var u: i64 = 0;
+            while u < msc.uses.len() {
+                var upth: str = msc.uses.get(u);
+                if upth != "core" {
+                    var n1: i64 = HashMap_get(seen, upth as i64);
+                    if n1 == 0 {
+                        g.names.push(upth);
+                        n1 = g.names.len();
+                        HashMap_insert(seen, upth as i64, n1);
+                    }
+                    deps.push(n1 - 1);
+                }
+                u = u + 1;
+            }
+        } else {
+            g.scans.push(ModScan_empty());
+        }
+        g.deps.push(deps);
+        ix = ix + 1;
+    }
+    println("modules: " + int_to_str(g.names.len()) + " (" + modgraph_summary(modgraph_levels(g.deps)) + ")");
+
+    // the parse ahead (compiler.fd pp_parse_ahead)
+    var t0: i64 = p_clock_now_ms();
+    var pl: PpPlan = pp_predict(uimps, g, sn, en);
+    if bad {
+        var nosn: Vec<str> = Vec::new();
+        pl.snames = nosn;
+        pl.enames = nosn;
+        pl.inames = nosn;
+    }
+    var toks2: Vec<Vec<Token>> = Vec::new();
+    var texts2: Vec<str> = Vec::new();
+    var files2: Vec<str> = Vec::new();
+    var sn_n: Vec<i64> = Vec::new();
+    var en_n: Vec<i64> = Vec::new();
+    var in_n: Vec<i64> = Vec::new();
+    var taken: i64 = HashMap_new();
+    i = 0;
+    while i < g.names.len() {
+        var f2: str = g.files.get(i);
+        if str_len(f2) > 0 && HashMap_get(taken, f2 as i64) == 0 && pl.sn_n.get(i) >= 0 {
+            var at: i64 = HashMap_get(file_tok, f2 as i64) - 1;
+            if at >= 0 {
+                HashMap_insert(taken, f2 as i64, 1);
+                toks2.push(all_toks.get(at));
+                texts2.push(all_texts.get(at));
+                files2.push(f2);
+                sn_n.push(pl.sn_n.get(i));
+                en_n.push(pl.en_n.get(i));
+                in_n.push(pl.in_n.get(i));
+            }
+        }
+        i = i + 1;
+    }
+    var results: Vec<PreParse> = pp_parse_par(toks2, texts2, pl.snames, pl.enames, pl.inames, sn_n, en_n, in_n, nw);
+    var t_par: i64 = p_clock_now_ms() - t0;
+    pp_begin(results, files2, sn.len(), en.len());
+    var ok_ahead: i64 = 0;
+    i = 0;
+    while i < results.len() {
+        if results.get(i).ok {
+            ok_ahead = ok_ahead + 1;
+        }
+        i = i + 1;
+    }
+    println("parsed ahead: " + int_to_str(results.len()) + " (" + int_to_str(ok_ahead) + " parse)");
+
+    // the import loop, parsing each module itself
+    var stack: Vec<str> = Vec::new();
+    var ui: i64 = user.imports.len() - 1;
+    while ui >= 0 {
+        stack.push(user.imports.get(ui).path);
+        ui = ui - 1;
+    }
+    var deferred: Vec<str> = Vec::new();
+    var loaded: i64 = HashMap_new();
+    var pc_files: Vec<str> = Vec::new();
+    var pc_progs: Vec<Program> = Vec::new();
+    var lsset: i64 = HashMap_new();
+    var leset: i64 = HashMap_new();
+    var t_seq: i64 = 0;
+    var n_parsed: i64 = 0;
+    var n_taken: i64 = 0;
+    var n_differ: i64 = 0;
+    var n_not: i64 = 0;
+    var n_blind: i64 = 0;
+    var reasons: Vec<str> = Vec::new();
+    while stack.len() > 0 {
+        var ip2: str = stack.get(stack.len() - 1);
+        stack.pop();
+        if ip2 == "core" || HashMap_get(loaded, ip2 as i64) != 0 {
+            continue;
+        }
+        var fp: str = module_file(ip2, base_dir);
+        if str_len(fp) == 0 {
+            println("unresolved: " + ip2);
+            HashMap_insert(loaded, ip2 as i64, 1);
+            continue;
+        }
+        var prog: Program = program_new();
+        var pci: i64 = str_vec_index(pc_files, fp);
+        if pci >= 0 {
+            prog = pc_progs.get(pci);
+        } else {
+            var ti: i64 = HashMap_get(file_tok, fp as i64) - 1;
+            var mtoks: Vec<Token> = Vec::new();
+            if ti >= 0 {
+                mtoks = all_toks.get(ti);
+            } else {
+                mtoks = lex(read_or_empty(fp));
+            }
+            take_qualified_calls();
+            var k: i64 = pp_valid(fp, sn, en);
+            var tk: i64 = p_clock_now_ms();
+            var mp: Parser = Parser_with_names(mtoks, sn, en);
+            var mres: ParseResultProgram = mp.parse();
+            t_seq = t_seq + (p_clock_now_ms() - tk);
+            n_parsed = n_parsed + 1;
+            match mres {
+                ParseResultProgram::Ok(pr) => {
+                    prog = pr;
+                }
+                ParseResultProgram::Err(pe) => {
+                    println("does not parse: " + fp);
+                    HashMap_insert(loaded, ip2 as i64, 1);
+                    continue;
+                }
+            }
+            var bk: i64 = str_vec_index(files2, fp);
+            if bk >= 0 && pp_result(bk).ok && !same_bytes(prog_bytes(prog), prog_bytes(pp_result(bk).prog)) {
+                n_blind = n_blind + 1;
+            }
+            if k >= 0 {
+                n_taken = n_taken + 1;
+                if !same_bytes(prog_bytes(prog), prog_bytes(pp_result(k).prog)) {
+                    n_differ = n_differ + 1;
+                    println("DIFFERS: " + fp);
+                }
+            } else {
+                n_not = n_not + 1;
+                var kk: i64 = str_vec_index(files2, fp);
+                if kk >= 0 && reasons.len() < 8 {
+                    // the first word that is another name to the loop
+                    var cs: i64 = HashMap_new();
+                    var ce: i64 = HashMap_new();
+                    var q: i64 = 0;
+                    while q < sn.len() {
+                        HashMap_insert(cs, sn.get(q) as i64, 1);
+                        q = q + 1;
+                    }
+                    q = 0;
+                    while q < en.len() {
+                        HashMap_insert(ce, en.get(q) as i64, 1);
+                        q = q + 1;
+                    }
+                    var why: str = "parse ahead failed, or numbers do not fit";
+                    var pre: PreParse = pp_result(kk);
+                    q = 0;
+                    while q < pre.words.len() {
+                        var w: str = pre.words.get(q);
+                        var b: i64 = 0;
+                        if HashMap_get(cs, w as i64) != 0 {
+                            b = b | 1;
+                        }
+                        if HashMap_get(ce, w as i64) != 0 {
+                            b = b | 2;
+                        }
+                        if parser_import_known(w) {
+                            b = b | 4;
+                        }
+                        if b != pre.bits.get(q) {
+                            why = "'" + w + "' is " + int_to_str(b) + " to the loop, " + int_to_str(pre.bits.get(q)) + " ahead";
+                            break;
+                        }
+                        q = q + 1;
+                    }
+                    HashMap_drop(cs);
+                    HashMap_drop(ce);
+                    reasons.push(fp + ": " + why);
+                }
+            }
+            pc_files.push(fp);
+            pc_progs.push(prog);
+        }
+        add_names(prog, &mut sn, &mut en, lsset, leset);
+        var unl: Vec<str> = Vec::new();
+        var di: i64 = 0;
+        while di < prog.imports.len() {
+            var dep: str = prog.imports.get(di).path;
+            if dep != "core" && HashMap_get(loaded, dep as i64) == 0 {
+                unl.push(dep);
+            }
+            di = di + 1;
+        }
+        if unl.len() > 0 {
+            if str_vec_index(deferred, ip2) >= 0 {
+                continue;
+            }
+            deferred.push(ip2);
+            stack.push(ip2);
+            di = 0;
+            while di < unl.len() {
+                if HashMap_get(loaded, unl.get(di) as i64) == 0 {
+                    stack.push(unl.get(di));
+                }
+                di = di + 1;
+            }
+            continue;
+        }
+        var mn: str = ip2;
+        match prog.module {
+            OptStr::Some(m) => {
+                mn = m;
+            }
+            OptStr::None => {
+            }
+        }
+        HashMap_insert(loaded, ip2 as i64, 1);
+        HashMap_insert(loaded, mn as i64, 1);
+        var dx: i64 = str_vec_index(deferred, ip2);
+        if dx >= 0 {
+            deferred.remove(dx);
+        }
+        var tj: i64 = 0;
+        while tj < prog.imports.len() {
+            if HashMap_get(loaded, prog.imports.get(tj).path as i64) == 0 {
+                stack.push(prog.imports.get(tj).path);
+            }
+            tj = tj + 1;
+        }
+    }
+    println("loop parsed: " + int_to_str(n_parsed) + ", could take " + int_to_str(n_taken) + ", differ " + int_to_str(n_differ) + ", parsed again " + int_to_str(n_not) + ", blind " + int_to_str(n_blind));
+    i = 0;
+    while i < reasons.len() {
+        println("  not taken: " + reasons.get(i));
+        i = i + 1;
+    }
+    println("time: the loop's parses " + int_to_str(t_seq) + " ms, the parse ahead in " + int_to_str(nw) + " threads " + int_to_str(t_par) + " ms");
+    pp_end();
+    return 0;
+}

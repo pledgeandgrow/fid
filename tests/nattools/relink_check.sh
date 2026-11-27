@@ -3,8 +3,10 @@
 # incremental relinking in memory (compiler/nat_ir.fd nl_*). One `fid
 # serve` builds tests/bootstrap/test_machine_relink.fd (A), then, from the
 # same path, tests/nattools/relink_edit_b.fd (B), relink_edit_c.fd (C) and
-# A again, each with --stats and FID_VERIFY=1. Run after the compiler is
-# built:
+# A again, each with --stats and FID_VERIFY=1, the server started with
+# --relink (relinking is asked for since Nov 27: an image in the kept
+# layout is not the one-shot build's, which SP8 wants by default). Run
+# after the compiler is built:
 #   bash tests/nattools/relink_check.sh [fid]     (default release/fid.exe)
 # Per target (x86-64 Linux; AArch64 Linux; `--nat` Windows on Windows):
 #  1. the first build lays its code out afresh ("[relink] a fresh layout
@@ -34,7 +36,8 @@ mkdir -p "$OUT"
 PY=python3
 command -v python3 >/dev/null 2>&1 || PY=python
 RUN=""
-if command -v wsl.exe >/dev/null 2>&1; then RUN="wsl.exe -e"; fi
+# (WSL with a Linux distribution: `wsl.exe -e true` fails without one)
+if command -v wsl.exe >/dev/null 2>&1 && wsl.exe -e true >/dev/null 2>&1; then RUN="wsl.exe -e"; fi
 fails=0
 ok() { echo "ok   $1"; }
 bad() { echo "FAIL $1"; fails=$((fails + 1)); }
@@ -101,7 +104,7 @@ session() {
             done
         done
         printf 'quit\n'
-    } | env FID_VERIFY=1 "$@" "$FID" serve >>"$log" 2>&1
+    } | env FID_VERIFY=1 "$@" "$FID" serve --relink >>"$log" 2>&1
 }
 
 # relink_line <log> <n>: the n-th build's "[relink]" verdict

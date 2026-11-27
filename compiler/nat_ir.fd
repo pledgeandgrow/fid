@@ -7964,7 +7964,17 @@ fn ng_copy(g: &mut NatGen, dst: i64, src: i64, size: i64) {
 // ===========================================================================
 
 fn ng_has_fn(g: &NatGen, name: str) -> bool {
-    return HashMap_contains(g.all_fns, name);
+    var has: bool = HashMap_contains(g.all_fns, name);
+    if g_nc_log_on {
+        // SP6: what the recorded code took for granted of the program's
+        // function set (nc_names_hold checks it before a replay)
+        if has {
+            nc_log("H1:" + name);
+        } else {
+            nc_log("H0:" + name);
+        }
+    }
+    return has;
 }
 
 /// The runtime function the Linux signal handlers call: DB9's
@@ -9105,7 +9115,12 @@ fn ng_env_dump() -> str {
 }
 
 /// A backend switch, on unless FID_NAT_OFF names it.
+pub var g_nat_wasm_select: bool = false;
+
 fn ng_on(name: str) -> bool {
+    if g_nat_wasm_select && (name == "vectorize" || name == "vzsimd" || name == "vzunroll") {
+        return false;
+    }
     if g_ng_env_ok {
         return str_len(g_ng_env_off) == 0 || !str_contains(g_ng_env_off, "," + name + ",");
     }
@@ -24661,7 +24676,8 @@ fn ng_par_finish(g: &mut NatGen, st: &mut NatParState) -> str {
             g.n_folded = g.n_folded + 1;
             jbase.push(jbase.get(to));
         } else {
-            NatEnc_align(&mut g.e, ng_code_align(g, NG_ALIGN_FN));
+            // SP6: as the serial loop places it (ng_fn_start_align)
+            NatEnc_align(&mut g.e, ng_fn_start_align(g, ng_code_align(g, NG_ALIGN_LOOP) > ng_code_align(g, NG_ALIGN_FN) && ng_par_loop_heads(&rec)));
             NatEnc_place(&mut g.e, label);
             var base: i64 = g.e.code.len();
             jbase.push(base);
@@ -25044,13 +25060,19 @@ fn ng_mir_finish(g: &mut NatGen) -> str {
                 g.e.labels.set(label2, nl_at);
                 g.e.last_place = nl_at;
             } else {
-                NatEnc_align(&mut g.e, ng_code_align(g, NG_ALIGN_FN));
+                // SP6: where a fresh build starts it (ng_fn_start_align)
+                NatEnc_align(&mut g.e, ng_fn_start_align(g, ent.pos16 >= 0));
                 NatEnc_place(&mut g.e, label2);
             }
             g.placed_fns.push(rec2.name);
             var fbase: i64 = g.e.code.len();
             if nl_at >= 0 {
                 fbase = nl_at;
+            }
+            if ent.pos16 >= 0 && fbase % ng_code_align(g, NG_ALIGN_LOOP) != ent.pos16 {
+                // SP6: its loop heads were padded for another phase: not
+                // the bytes a fresh build emits here (compiled again next)
+                nc_give_up_callers(g, rec2.name);
             }
             var rerr: str = nc_replay(g, &ent, nl_at);
             if rerr != "" {
@@ -25120,7 +25142,16 @@ fn ng_mir_finish(g: &mut NatGen) -> str {
             } else {
                 // SP7: where the code ended before its alignment (nl_move)
                 var nl_pre: i64 = g.e.code.len();
-                NatEnc_align(&mut g.e, ng_code_align(g, NG_ALIGN_FN));
+                // SP6: a function with a padded loop head on the loop
+                // alignment (ng_fn_start_align)
+                NatEnc_align(&mut g.e, ng_fn_start_align(g, ng_code_align(g, NG_ALIGN_LOOP) > ng_code_align(g, NG_ALIGN_FN) && ng_par_loop_heads(&rec2)));
+                // SP7: on x86-64 emitted where its loop heads' padding is
+                // the one its slot of the kept layout wants (the same
+                // offset modulo the loop alignment), so nl_align_kept lets
+                // it move there; before, a function with a loop went after
+                // the others unless it happened to land so (the padding is
+                // dropped by the move, nl_move's pre_al)
+                nl_congruent_pad(g, rec2.name);
                 NatEnc_place(&mut g.e, label);
                 if fold_on {
                     HashMap_insert(folded, key, g.e.code.len());
@@ -25223,7 +25254,17 @@ fn ng_argreg_i(g: &NatGen, i: i64, internal: bool) -> i64 {
 }
 
 fn ng_internal(g: &NatGen, name: str) -> bool {
-    return HashMap_contains(g.internal, name);
+    var ic: bool = HashMap_contains(g.internal, name);
+    if g_nc_log_on {
+        // SP6: a caller's argument moves follow its callee's convention
+        // (nc_names_hold)
+        if ic {
+            nc_log("I1:" + name);
+        } else {
+            nc_log("I0:" + name);
+        }
+    }
+    return ic;
 }
 
 /// ng_load_args under convention `internal`: the first registers are the
@@ -33221,6 +33262,141 @@ pub fn nat_cpu_check(arch: i64, cpu: str) -> str {
 
 /// A static Linux executable for `arch` from an IR module that has the
 /// Linux runtime (stdlib/linux_runtime) merged in.
+
+// --- Selection for the WASM target (TG16) ----------------------------------
+// WASM is a target of the machine layer, but not an executable image of one
+// of the native ISAs. nat_select_mir runs exactly the machine layer's IR ->
+// MIR instruction selection and returns the recorded functions and the label
+// metadata a non-native emitter needs (function, string, global, panic and
+// extern labels in the NatGen). No machine code is encoded and no register
+// allocation or native emission runs.
+fn nat_sel_prelabel(g: &mut NatGen, name: str) {
+    if !HashMap_contains(g.fn_labels, name) {
+        var l: i64 = NatEnc_label(&mut g.e);
+        HashMap_insert(g.fn_labels, name, l);
+        g.fn_label_names.push(name);
+    }
+}
+
+pub fn nat_select_mir(module: &IrModule) -> NatGen {
+    g_nat_wasm_select = true;
+    nat_enc_image_start("");
+    ng_env_cache_load();
+    var g: NatGen = NatGen_new(NAT_A64);
+    g.win = false;
+    g.mac = false;
+    g_nat_ldfwd_n = 0;
+    ng_ret_ext_reset();
+    g_nat_pie = false;
+    g_nat_abs_base = 0;
+    var fi: i64 = 0;
+    while fi < module.functions.len() {
+        HashMap_insert(g.all_fns, module.functions.get(fi).name, 1);
+        if module.functions.get(fi).func.internal_conv {
+            HashMap_insert(g.internal, module.functions.get(fi).name, 1);
+        }
+        fi = fi + 1;
+    }
+    g.fact_path = p_getenv("FID_LIBFACTS");
+    ng_libfacts_load(&mut g);
+    ng_collect_dyn_types(&mut g, module);
+    var ei: i64 = 0;
+    while ei < module.extern_decls.len() {
+        var ext: ExternDecl = module.extern_decls.get(ei);
+        if !HashMap_contains(g.c_names, ext.pledge_name) {
+            g.c_list.push(ext.c_name);
+            HashMap_insert(g.c_names, ext.pledge_name, g.c_list.len());
+            g.ld.c_libs.push("");
+            var nfix: i64 = 0 - 1;
+            if ext.params.len() > 0 && ext.params.get(ext.params.len() - 1).is_variadic {
+                nfix = ext.params.len() - 1;
+            }
+            g.ld.c_fixed.push(nfix);
+        }
+        ei = ei + 1;
+    }
+    g.fn_table_label = NatEnc_label(&mut g.e);
+    g.names_label = NatEnc_label(&mut g.e);
+    g.code_end_label = NatEnc_label(&mut g.e);
+    var pi: i64 = 0;
+    while pi < nat_panic_messages().len() {
+        g.panic_labels.push(NatEnc_label(&mut g.e));
+        pi = pi + 1;
+    }
+    g.start_sp_label = NatEnc_label(&mut g.e);
+    // The primitives are labels in the selection, so calls to them are
+    // ordinary MO_CALLs. The WASM emitter gives those labels their WASI
+    // meanings; no native primitive bytes are encoded here.
+    var prims: Vec<str> = nat_prim_interface();
+    var pri: i64 = 0;
+    while pri < prims.len() {
+        nat_sel_prelabel(&mut g, prims.get(pri));
+        pri = pri + 1;
+    }
+    nat_sel_prelabel(&mut g, "nat_wasm_grow");
+    nat_sel_prelabel(&mut g, "nat_wasm_size");
+    nat_sel_prelabel(&mut g, "nat_wasm_zero");
+    nat_sel_prelabel(&mut g, "nat_c_sqrt");
+    nat_sel_prelabel(&mut g, "nat_c_fabs");
+    nat_sel_prelabel(&mut g, "nat_c_floor");
+    nat_sel_prelabel(&mut g, "nat_c_ceil");
+    nat_sel_prelabel(&mut g, "nat_c_trunc");
+    nat_sel_prelabel(&mut g, "nat_c_round");
+    // extern "C" declarations are labels too. Pre-labelling the pledge name
+    // keeps instruction selection away from the native dynamic-linker stubs:
+    // the WASM emitter resolves the label to the import (or reports the
+    // unavailable extern) itself.
+    ei = 0;
+    while ei < module.extern_decls.len() {
+        nat_sel_prelabel(&mut g, module.extern_decls.get(ei).pledge_name);
+        ei = ei + 1;
+    }
+    g_ng_fcs_block = ng_fcs_tasks(module);
+    g_ng_cfp_on = ng_cfp_scan(module);
+    g_ng_cfp_sigs = Vec::new();
+    g_ng_cfp_labels = Vec::new();
+    ng_cbx_begin(module);
+    // Compile what main reaches, as calls are met. This is the same worklist
+    // discipline as the native images, but every recorded function is left at
+    // the post-selection NatFnRec stage.
+    if pe_module_has_fn(module, "main") {
+        ng_fn_label(&mut g, "main");
+    }
+    if pe_module_has_fn(module, "pe_rt_init") {
+        ng_fn_label(&mut g, "pe_rt_init");
+    }
+    var gni: i64 = 0;
+    while gni < module.globals.len() {
+        match module.globals.get(gni).init {
+            Expr::StringLit(gns) => {
+                if str_len(gns) > 0 {
+                    ng_named_fn(&mut g, gns);
+                }
+            }
+            _ => {
+            }
+        }
+        gni = gni + 1;
+    }
+    var qi: i64 = 0;
+    while qi < g.queue.len() {
+        var name: str = g.queue.get(qi);
+        match IrModule_get_function(module, name) {
+            OptIrFunction::Some(func0) => {
+                var func: IrFunction = func0;
+                if ir_switch_on() {
+                    IrFunction_form_switches(&mut func);
+                }
+                ng_gen_function(&mut g, name, &func, module);
+            }
+            OptIrFunction::None => {
+            }
+        }
+        qi = qi + 1;
+    }
+    return g;
+}
+
 pub fn nat_generate_elf(module: IrModule, arch: i64) -> ResultBytes {
     // PL5: Cortex-M (compiler/nat_thumb.fd): a board image or, for
     // thumbv7m-linux, a 32-bit ARM Linux executable
@@ -33288,14 +33464,33 @@ pub fn nat_generate_macho_universal(x64_module: IrModule, a64_module: IrModule) 
 /// SP6: an image with the function cache (CS6) is made again, without the
 /// hits a first attempt found not to fit this program (g_nc_retry: a struct
 /// result in registers whose function's address is now taken, a short
-/// RISC-V call whose callee is out of reach); a third attempt has no hits
-/// at all, so it never asks for another.
+/// RISC-V call whose callee is out of reach, a callee compiled again with
+/// another mask); the last attempt has no hits at all, so it never asks for
+/// another. SP6: a hit is given up alone (nc_give_up_callers), so a
+/// function whose callee changed is compiled again while its own callers
+/// are checked against it in the next attempt: up to NC_ATTEMPTS attempts,
+/// each replaying what the attempts before it compiled (g_nc_carry, a
+/// function compiled once is not compiled again), so an attempt costs the
+/// replays and the few functions given up. FID_NAT_OFF=ncnarrow: two
+/// attempts, nothing carried (the transitive give-up).
+const NC_ATTEMPTS: i64 = 8;
 fn nat_generate_image(module: IrModule, arch: i64, win: bool, mac: bool) -> ResultBytes {
     g_nc_deny = 0;
     g_nc_deny_all = false;
     g_nc_retried = Vec::new();
+    // SP6: the keys of one module's functions, the same in every attempt
+    g_nc_cur_key = 0;
+    g_nc_carry = Vec::new();
+    g_nc_carry_last = Vec::new();
+    g_nc_carry_salt = 0;
+    g_nc_attempt = 1;
+    var narrow: bool = ng_on("ncnarrow");
+    var cap: i64 = 2;
+    if narrow {
+        cap = NC_ATTEMPTS;
+    }
     var attempt: i64 = 0;
-    while attempt < 2 {
+    while attempt < cap {
         var r: ResultBytes = nat_generate_image1(module, arch, win, mac);
         if !nc_is_retry(r) {
             return r;
@@ -33309,7 +33504,21 @@ fn nat_generate_image(module: IrModule, arch: i64, win: bool, mac: bool) -> Resu
             g_nc_retried.push(g_nc_retry.get(i));
             i = i + 1;
         }
+        if narrow {
+            // what this attempt compiled again may be replayed by the next
+            // (a name gone without before, compiled here: its new entry)
+            var ci: i64 = 0;
+            while ci < g_nc_carry_last.len() {
+                if HashMap_contains(g_nc_deny, g_nc_carry_last.get(ci)) {
+                    HashMap_insert(g_nc_deny, g_nc_carry_last.get(ci), 0);
+                }
+                ci = ci + 1;
+            }
+        } else {
+            g_nc_carry = Vec::new();
+        }
         attempt = attempt + 1;
+        g_nc_attempt = g_nc_attempt + 1;
     }
     g_nc_deny_all = true;
     return nat_generate_image1(module, arch, win, mac);
@@ -33520,6 +33729,10 @@ fn nat_generate_image1(module: IrModule, arch: i64, win: bool, mac: bool) -> Res
     if NG_MIR && (ng_on("mir") || ng_x64(&g)) {
         var merr: str = ng_mir_finish(&mut g);
         if merr != "" {
+            if merr == NC_RETRY {
+                // SP6: what this attempt compiled goes to the next one
+                nc_carry_keep(&g);
+            }
             return ResultBytes::Err(c_vec1(merr));
         }
         nc_finish(&mut g);
@@ -37678,6 +37891,12 @@ pub struct NcEntry {
     // (and nothing after it), else the name of each function it calls in
     // order ("?" for a call of a label that is not a function's)
     pub entry_run: Vec<str>,
+    // SP6: x86-64: where in the loop alignment (MI30) its recording started
+    // (its start modulo 16) when it pads a loop head, -1 when it pads none
+    // (its bytes are the same at any start). Placed so (ng_fn_start_align)
+    // and checked at the replay: padding made for another phase is not
+    // what a fresh build emits.
+    pub pos16: i64,
 }
 
 // --- content hash ---------------------------------------------------------
@@ -38133,6 +38352,19 @@ fn nc_fn_hash(f: &IrFunction) -> i64 {
     while v < f.value_metas.len() {
         var vm: ValueIdMeta = f.value_metas.get(v);
         h = nc_hregion(nc_hty(nc_h(h, vm.id), vm.meta.ty), vm.meta.region);
+        // SP6: its source line: the line rows and the panic-line stubs
+        // ("which:line", ng_panic_label) a replay brings back are the
+        // recording's. Without it a function an edit above it moved down
+        // was replayed with the old lines: an image unlike a fresh build's,
+        // and a panic that named the wrong line.
+        match vm.meta.source_line {
+            OptU64::Some(ln) => {
+                h = nc_h(h, ln as i64);
+            }
+            OptU64::None => {
+                h = nc_h(h, 0 - 1);
+            }
+        }
         v = v + 1;
     }
     var j: i64 = 0;
@@ -38245,7 +38477,9 @@ fn nc_cfg_salt(g: &NatGen) -> i64 {
     // nc15: secret functions zero their scratch registers at each return
     // and make no sibling-call jumps; their secret values spill last
     // (LF20), Nov 17
-    var s: str = "nc15;" + int_to_str(g.arch) + ";" + g_nat_cpu + ";" + env_or_empty("FID_NAT_ON") + ";" + int_to_str(g_nat_pie_req) + ";";
+    // nc16: source lines and line rows in the key, the function set per
+    // entry (nc_names_hold) instead of in the salt, Nov 27
+    var s: str = "nc16;" + int_to_str(g.arch) + ";" + g_nat_cpu + ";" + env_or_empty("FID_NAT_ON") + ";" + int_to_str(g_nat_pie_req) + ";";
     if g.win {
         s = s + "w;";
     }
@@ -38277,10 +38511,16 @@ fn nc_cfg_salt(g: &NatGen) -> i64 {
     }
     s = s + env_or_empty("FID_NAT_MUTATE") + ";";
     // CS6/SP20: line rows (MO_LINE) can change a function's bytes, and an
-    // entry carries the rows of the build that made it
-    // (the input file, not its list of function names: nc_mod_salt
-    // already covers the name set)
-    s = s + "lines:" + g_nat_lines_file + ";";
+    // entry carries the rows of the build that made it. SP6: whether the
+    // build has line rows, not the input file's path: an entry's rows are
+    // written against its function's file of this build at the replay
+    // (nc_replay), its source lines are in its key (nc_fn_hash) and whether
+    // it gets rows too (nc_key_of). With the path here, an edit saved under
+    // another name (machine_fncache_check's nat_fncache_edit_b.fd) hit
+    // nothing: 0 of 275.
+    if str_len(g_nat_lines_file) > 0 {
+        s = s + "lines;";
+    }
     s = s + env_or_empty("FID_NAT_OFF") + ";" + env_or_empty("FID_NAT_LINES") + ";" + env_or_empty("FID_IROPT_OFF") + ";" + env_or_empty("FID_IROPT_ON") + ";" + env_or_empty("FID_RULES_ON") + ";" + env_or_empty("FID_RULES_OFF") + ";" + env_or_empty("FID_EGRAPH_OFF") + ";" + env_or_empty("FID_NAT_DEBUG") + ";" + env_or_empty("FID_VERIFY") + ";";
     var lp: str = env_or_empty("FID_LIBFACTS");
     if str_len(lp) > 0 {
@@ -38380,13 +38620,19 @@ fn nc_mod_salt(g: &NatGen, m: &IrModule) -> i64 {
         h = nc_hs(h, m.linear_structs.get(ls));
         ls = ls + 1;
     }
-    var fi: i64 = 0;
-    while fi < m.functions.len() {
-        h = nc_hs(h, m.functions.get(fi).name);
-        if m.functions.get(fi).func.internal_conv {
-            h = nc_h(h, 1);
-        }
-        fi = fi + 1;
+    // SP6: not the function set any more: an edit that makes the program
+    // reach one more runtime function (rl_grow's loop in relink_edit_b.fd)
+    // changed the salt, so nothing hit and `fid serve` never kept its
+    // layout ("the last build was of another target, cache or program").
+    // What a function's code takes from the set (is a callee the program's,
+    // does it take the internal convention) is in its entry's label log
+    // (ng_has_fn's "H" asks, ng_internal's "I" asks) and checked per entry
+    // (nc_names_hold). The dyn types' order is baked into code as ids
+    // (ng_dyn_id), so it stays here.
+    var di: i64 = 0;
+    while di < g.dyn_types.len() {
+        h = nc_hs(h, g.dyn_types.get(di));
+        di = di + 1;
     }
     return h;
 }
@@ -38512,6 +38758,19 @@ fn nc_hit_at(g: &NatGen, name: str) -> i64 {
     return 0;
 }
 
+/// SP6: function f's content key in this build: its IR (nc_fn_hash, its
+/// source lines included) and whether it gets line rows here (as
+/// ng_gen_function decides: its MO_LINE marks are in its MIR then, and its
+/// entry carries rows).
+fn nc_key_of(g: &NatGen, f: &IrFunction) -> i64 {
+    var rows: bool = ng_dbg_lines_ok(g) && ng_on("debug") && (HashMap_contains(g.line_fns, f.name) || (str_len(g_nat_lines_file) > 0 && str_len(ir_fn_src_file(f.name)) > 0));
+    var lw: i64 = 3;
+    if rows {
+        lw = 5;
+    }
+    return nc_h(nc_fn_hash(f), lw);
+}
+
 /// Key the function under and return its cache entry index + 1 on a hit
 /// (same content key), 0 on a miss. The key is recorded either way — the
 /// emit path uses it for the entry it captures. SP6: a hit is an entry
@@ -38528,7 +38787,7 @@ fn nc_lookup(g: &mut NatGen, f: &IrFunction, m: &IrModule) -> i64 {
     if g_nc_cur_key != 0 && HashMap_contains(g_nc_cur_key, f.name) {
         key = HashMap_get(g_nc_cur_key, f.name);
     } else {
-        key = nc_fn_hash(f);
+        key = nc_key_of(g, f);
     }
     HashMap_insert(g.nc_key, f.name, key);
     if HashMap_contains(g_nc_valid, f.name) {
@@ -38583,7 +38842,7 @@ fn nc_capture(g: &mut NatGen, rec: &NatFnRec, base: i64, fstart: i64, fold_key: 
     // here or the hit image orders the functions differently
     var pm: Vec<str> = nc_pm_of(rec.name);
     var e: NcEntry = NcEntry {
-        name: rec.name, key: HashMap_get(g.nc_key, rec.name), mir_len: str_parse_int(pm.get(2)), n_traps: str_parse_int(pm.get(0)), n_calls: str_parse_int(pm.get(1)), mask: HashMap_get(g.fn_mask, rec.name), bytes: Vec::new(), fixes: Vec::new(), edges: Vec::new(), refs: Vec::new(), fold_key: fold_key, regs: nc_log_of(rec.name), lrows: Vec::new(), cfi: Vec::new(), dvars: "", deps: Vec::new(), dep_masks: Vec::new(), dep_rr: Vec::new(), rr_self: nc_rr_of(g, rec.name), addrs: nc_addrs_of(rec.name), ft_self: 0, dep_ft: Vec::new(), entry_run: Vec::new(),
+        name: rec.name, key: HashMap_get(g.nc_key, rec.name), mir_len: str_parse_int(pm.get(2)), n_traps: str_parse_int(pm.get(0)), n_calls: str_parse_int(pm.get(1)), mask: HashMap_get(g.fn_mask, rec.name), bytes: Vec::new(), fixes: Vec::new(), edges: Vec::new(), refs: Vec::new(), fold_key: fold_key, regs: nc_log_of(rec.name), lrows: Vec::new(), cfi: Vec::new(), dvars: "", deps: Vec::new(), dep_masks: Vec::new(), dep_rr: Vec::new(), rr_self: nc_rr_of(g, rec.name), addrs: nc_addrs_of(rec.name), ft_self: 0, dep_ft: Vec::new(), entry_run: Vec::new(), pos16: nc_pos16(g, rec, base),
     };
     var end: i64 = g.e.code.len();
     g_nc_reemit.push(rec.name);
@@ -38676,6 +38935,42 @@ fn nc_capture(g: &mut NatGen, rec: &NatFnRec, base: i64, fstart: i64, fold_key: 
         g.nc_new.push(e);
     }
     return ok;
+}
+
+/// SP6: the loop-alignment phase of a function emitted at `base` (an
+/// entry's pos16): base modulo the loop alignment when the target pads loop
+/// heads beyond the function alignment (x86-64 but --size) and `rec` has a
+/// padded head (ng_par_loop_heads, as the emission decides), else -1.
+fn nc_pos16(g: &NatGen, rec: &NatFnRec, base: i64) -> i64 {
+    var la: i64 = ng_code_align(g, NG_ALIGN_LOOP);
+    if la <= ng_code_align(g, NG_ALIGN_FN) {
+        return 0 - 1;
+    }
+    if !ng_par_loop_heads(rec) {
+        return 0 - 1;
+    }
+    return base % la;
+}
+
+/// SP6: where a function starts (the alignment before its label): on a
+/// target that pads loop heads beyond the function alignment (x86-64 but
+/// --size), a function with a padded head starts on the loop alignment, so
+/// its padding, so its bytes, are the same wherever it lands. Before, they
+/// depended on its start modulo 16: an edit that changed a function's size
+/// by other than a multiple of 16 made every later function with a loop
+/// differ from its cached bytes (a hit image after an edit was not a fresh
+/// build's: pe_lim_parse 4 bytes shorter). FID_NAT_OFF=fnalign: the
+/// function alignment for all (the cache then gives up such a hit placed
+/// at another phase, nc_pos16).
+fn ng_fn_start_align(g: &NatGen, heads: bool) -> i64 {
+    var fa: i64 = ng_code_align(g, NG_ALIGN_FN);
+    if heads && ng_on("fnalign") {
+        var la: i64 = ng_code_align(g, NG_ALIGN_LOOP);
+        if la > fa {
+            return la;
+        }
+    }
+    return fa;
 }
 
 /// SP6: the size of `name`'s struct result in registers in this build
@@ -39042,6 +39337,8 @@ fn nc_wentry(b: &mut AwBuf, e: NcEntry) {
         aw_i64(b, e.dep_ft.get(fi));
         fi = fi + 1;
     }
+    // (9: its loop-alignment phase, SP6)
+    aw_i64(b, e.pos16);
 }
 
 fn nc_rentry(r: &mut ArBuf) -> NcEntry {
@@ -39107,12 +39404,13 @@ fn nc_rentry(r: &mut ArBuf) -> NcEntry {
         dep_ft.push(ar_i64(r));
         fti = fti + 1;
     }
+    var pos16: i64 = ar_i64(r);
     // (a damaged entry whose lists disagree is read as not usable)
     if dep_masks.len() != deps.len() || dep_ft.len() != deps.len() {
         r.ok = false;
     }
     return NcEntry {
-        name: name, key: key, mir_len: mir_len, n_traps: n_traps, n_calls: n_calls, mask: mask, bytes: bytes, fixes: fixes, edges: edges, refs: refs, fold_key: fold, regs: regs, lrows: lrows, cfi: cfi, dvars: dvars, deps: deps, dep_masks: dep_masks, dep_rr: dep_rr, rr_self: rr_self, addrs: addrs, ft_self: ft_self, dep_ft: dep_ft, entry_run: entry_run,
+        name: name, key: key, mir_len: mir_len, n_traps: n_traps, n_calls: n_calls, mask: mask, bytes: bytes, fixes: fixes, edges: edges, refs: refs, fold_key: fold, regs: regs, lrows: lrows, cfi: cfi, dvars: dvars, deps: deps, dep_masks: dep_masks, dep_rr: dep_rr, rr_self: rr_self, addrs: addrs, ft_self: ft_self, dep_ft: dep_ft, entry_run: entry_run, pos16: pos16,
     };
 }
 
@@ -39125,7 +39423,7 @@ fn nc_load(g: &mut NatGen) {
     if ar_i64(&mut r) != 4473415 {
         return;
     }
-    if ar_i64(&mut r) != 8 {
+    if ar_i64(&mut r) != 9 {
         return;
     }
     if ar_i64(&mut r) != g.nc_salt {
@@ -39169,10 +39467,11 @@ fn nc_finish(g: &mut NatGen) {
     var j: i64 = 0;
     if write {
         aw_i64(&mut b, 4473415);
-        aw_i64(&mut b, 8);
+        aw_i64(&mut b, 9);
         // (3: entries carry their label log, SP6; 4: their debug rows, CS6;
         // 5: their deps, result convention and addresses taken, SP6; 6:
-        // their escape summaries, SP20; 7: their entry runs, CS6 part 3)
+        // their escape summaries, SP20; 7: their entry runs, CS6 part 3;
+        // 9: their loop-alignment phase, SP6)
         aw_i64(&mut b, g.nc_salt);
         aw_i64(&mut b, g.nc_new.len() + g.nc_hit_names.len());
         while i < g.nc_hit_names.len() {
@@ -39198,6 +39497,21 @@ fn nc_finish(g: &mut NatGen) {
         keep.push(g.nc_new.get(j));
         j = j + 1;
     }
+    // SP6: "hits" are the functions replayed from the cache; one an earlier
+    // attempt at this image compiled (g_nc_carry) counts as compiled, and
+    // as re-emitted (CB3)
+    var n_cached: i64 = 0;
+    var carried: Vec<str> = Vec::new();
+    var hi: i64 = 0;
+    while hi < g.nc_hit_names.len() {
+        if HashMap_get(g.nc_hit, g.nc_hit_names.get(hi)) <= g_nc_n_base {
+            n_cached = n_cached + 1;
+        } else {
+            carried.push(g.nc_hit_names.get(hi));
+            g_nc_reemit.push(g.nc_hit_names.get(hi));
+        }
+        hi = hi + 1;
+    }
     if g_nat_stats {
         var src: str = "none";
         if g_nc_src == 1 {
@@ -39211,7 +39525,10 @@ fn nc_finish(g: &mut NatGen) {
         } else if g.nc_path == NC_MEM {
             wr = "in memory";
         }
-        p_eprint_str("[fncache] entries from " + src + ", " + int_to_str(g.nc_hit_names.len()) + " hits, " + int_to_str(g.nc_new.len()) + " compiled, cache " + wr + "\n");
+        p_eprint_str("[fncache] entries from " + src + ", " + int_to_str(n_cached) + " hits, " + int_to_str(g.nc_new.len() + carried.len()) + " compiled, cache " + wr + "\n");
+        if g_nc_attempt > 1 {
+            p_eprint_str("[fncache] attempts: " + int_to_str(g_nc_attempt) + " (" + int_to_str(carried.len()) + " functions compiled by an earlier one replayed)\n");
+        }
         // CB3: which functions went through allocation and emission again
         if g_nc_reemit.len() > 0 {
             p_eprint_str("[fncache] re-emitted: " + str_join(g_nc_reemit, ", ") + "\n");
@@ -39226,6 +39543,9 @@ fn nc_finish(g: &mut NatGen) {
             p_eprint_str("[fncache] built again without: " + str_join(g_nc_retried, ", ") + "\n");
         }
     }
+    // SP6: the attempts' entries are in this image's now
+    g_nc_carry = Vec::new();
+    g_nc_carry_last = Vec::new();
     g_nc_mem = keep;
     g_nc_mem_path = g.nc_path;
     g_nc_mem_salt = g.nc_salt;
@@ -39280,7 +39600,7 @@ fn nc_start(g: &mut NatGen, m: &IrModule) {
     nl_reset();
     g_nc_src = 0;
     g_nc_valid = 0;
-    g_nc_cur_key = 0;
+    // (g_nc_cur_key: made once per image, nat_generate_image)
     g_nc_stale = Vec::new();
     g_nc_retry = Vec::new();
     g_nc_addrs = 0;
@@ -39309,14 +39629,52 @@ fn nc_start(g: &mut NatGen, m: &IrModule) {
             i = i + 1;
         }
         g_nc_src = 2;
-        return;
-    }
-    if path != NC_MEM {
+    } else if path != NC_MEM {
         if p_file_exists(path) {
             nc_load(g);
             g_nc_src = 1;
         }
     }
+    // SP6: then what the earlier attempts at this image compiled (the
+    // later entry of a name is the one used: nc_ix)
+    g_nc_n_base = g.nc_old.len();
+    if g_nc_carry.len() > 0 && g_nc_carry_salt == g.nc_salt {
+        var ci: i64 = 0;
+        while ci < g_nc_carry.len() {
+            var ce: NcEntry = g_nc_carry.get(ci);
+            g.nc_old.push(ce);
+            HashMap_insert(g.nc_ix, ce.name, g.nc_old.len());
+            ci = ci + 1;
+        }
+    }
+}
+
+// SP6: the entries the attempts at one image compiled before the last one
+// (nat_generate_image), with the salt they were made under, and the names
+// the latest attempt compiled; how many of this attempt's entries came
+// from the cache (the rest: g_nc_carry); this attempt's number.
+var g_nc_carry: Vec<NcEntry> = Vec::new();
+var g_nc_carry_salt: i64 = 0;
+var g_nc_carry_last: Vec<str> = Vec::new();
+var g_nc_n_base: i64 = 0;
+var g_nc_attempt: i64 = 1;
+
+/// SP6: an attempt asks for another (NC_RETRY): what it compiled is
+/// replayed by the next one where it still holds (nc_validate checks it as
+/// any entry), so a function is compiled once, not once per attempt.
+fn nc_carry_keep(g: &NatGen) {
+    g_nc_carry_last = Vec::new();
+    if !g.nc_on {
+        return;
+    }
+    var i: i64 = 0;
+    while i < g.nc_new.len() {
+        var e: NcEntry = g.nc_new.get(i);
+        g_nc_carry.push(e);
+        g_nc_carry_last.push(e.name);
+        i = i + 1;
+    }
+    g_nc_carry_salt = g.nc_salt;
 }
 
 // ---------------------------------------------------------------------------
@@ -39444,12 +39802,14 @@ fn nc_denied(name: str) -> bool {
     if g_nc_deny_all {
         return true;
     }
-    return g_nc_deny != 0 && HashMap_contains(g_nc_deny, name);
+    // (0: gone without once, then compiled again by a later attempt, whose
+    // entry may be replayed: nat_generate_image)
+    return g_nc_deny != 0 && HashMap_contains(g_nc_deny, name) && HashMap_get(g_nc_deny, name) == 1;
 }
 
 /// This build's content key of function `name`, as the driver's loop keys
 /// it (after IrFunction_form_switches); 0 when the program has none.
-fn nc_cur_key(m: &IrModule, name: str) -> i64 {
+fn nc_cur_key(g: &NatGen, m: &IrModule, name: str) -> i64 {
     if g_nc_cur_key == 0 {
         g_nc_cur_key = HashMap_new();
     }
@@ -39463,7 +39823,7 @@ fn nc_cur_key(m: &IrModule, name: str) -> i64 {
             if ir_switch_on() {
                 IrFunction_form_switches(&mut f);
             }
-            k = nc_fn_hash(&f);
+            k = nc_key_of(g, &f);
         }
         OptIrFunction::None => {
         }
@@ -39577,6 +39937,10 @@ var g_nl_bk_lr1: Vec<i64> = Vec::new();
 var g_nl_bk_cf0: Vec<i64> = Vec::new();
 var g_nl_bk_cf1: Vec<i64> = Vec::new();
 
+/// SP7/SP8: the driver asks for relinking (`fid serve --relink`); else only
+/// FID_NAT_ON=relink does (nl_unfit).
+pub var g_nat_relink: bool = false;
+
 /// SP7: a build starts with no layout decided (nc_start).
 fn nl_reset() {
     g_nl_use = false;
@@ -39604,6 +39968,13 @@ fn nl_unfit(g: &NatGen, par_on: bool) -> str {
     }
     if !ng_on("relink") {
         return "FID_NAT_OFF=relink";
+    }
+    // SP8: an image laid out in the kept layout is not the one a one-shot
+    // build makes (a function the edit grew goes after the others, one it
+    // shrank leaves padding), so relinking is asked for: `fid serve
+    // --relink` (g_nat_relink) or FID_NAT_ON=relink
+    if !g_nat_relink && !ng_opt_in("relink") {
+        return "relinking not asked for (fid serve --relink, FID_NAT_ON=relink)";
     }
     if !ng_x64(g) && !ng_a64(g) {
         return "RISC-V places calls by distance";
@@ -39689,6 +40060,29 @@ fn nl_slot(name: str, size: i64) -> i64 {
         return 0 - 1;
     }
     return g_nl_starts.get(ix);
+}
+
+/// SP7: before a function compiled again is emitted (after the reserved
+/// code) on x86-64: zeros until the code's end has its slot's offset modulo
+/// the loop alignment (MI30), so its loop heads are padded as they will be
+/// in the slot. Nothing when it has no free slot or on another target.
+fn nl_congruent_pad(g: &mut NatGen, name: str) {
+    if !g_nl_use || !ng_x64(g) {
+        return;
+    }
+    if !HashMap_contains(g_nl_ix, name) || HashMap_contains(g_nl_taken, name) {
+        return;
+    }
+    var la: i64 = ng_code_align(g, NG_ALIGN_LOOP);
+    if la <= ng_code_align(g, NG_ALIGN_FN) {
+        return;
+    }
+    var at: i64 = g_nl_starts.get(HashMap_get(g_nl_ix, name) - 1);
+    var guard: i64 = 0;
+    while (g.e.code.len() - at) % la != 0 && guard < la {
+        NatEnc_byte(&mut g.e, 0);
+        guard = guard + 1;
+    }
 }
 
 /// SP7: a function of `size` bytes was placed: back in its slot (`how` 1,
@@ -40068,6 +40462,9 @@ fn nc_lib_mask_is(g: &NatGen, name: str, mk: i64) -> bool {
 /// Do entry e's deps still hold against the entries kept so far
 /// (g_nc_valid) and the functions compiled again?
 fn nc_deps_ok(g: &NatGen, m: &IrModule, e: &NcEntry) -> bool {
+    if !nc_names_hold(g, e) {
+        return false;
+    }
     var i: i64 = 0;
     while i < e.deps.len() {
         var d: str = e.deps.get(i);
@@ -40110,6 +40507,48 @@ fn nc_deps_ok(g: &NatGen, m: &IrModule, e: &NcEntry) -> bool {
     return true;
 }
 
+/// SP6: does what entry e's recording asked of the program's function set
+/// still hold (its log's "H1:f" / "H0:f": f is / is not a function of the
+/// program, ng_has_fn; "I1:f" / "I0:f": f does / does not take the internal
+/// convention, ng_internal), and is every function it refers to still one
+/// (of the program, or a primitive this build has a label for)? The salt
+/// no longer names the function set (nc_mod_salt), so this is what keeps a
+/// call made to a function the program no longer has, or one compiled for
+/// a callee that has since appeared, from being replayed.
+fn nc_names_hold(g: &NatGen, e: &NcEntry) -> bool {
+    var i: i64 = 0;
+    while i < e.regs.len() {
+        var s: str = e.regs.get(i);
+        if str_len(s) > 3 && str_byte_at(s, 2) == 58 {
+            var c0: i64 = str_byte_at(s, 0);
+            var c1: i64 = str_byte_at(s, 1);
+            if c0 == 72 || c0 == 73 {
+                // 'H' / 'I', then '1' / '0'
+                var nm: str = str_slice(s, 3, str_len(s));
+                var now: bool = false;
+                if c0 == 72 {
+                    now = HashMap_contains(g.all_fns, nm);
+                } else {
+                    now = HashMap_contains(g.internal, nm);
+                }
+                if (now && c1 != 49) || (!now && c1 == 49) {
+                    return false;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    var d: i64 = 0;
+    while d < e.deps.len() {
+        var dn: str = e.deps.get(d);
+        if !HashMap_contains(g.all_fns, dn) && !HashMap_contains(g.fn_labels, dn) && !HashMap_contains(g.lib_mask, dn) {
+            return false;
+        }
+        d = d + 1;
+    }
+    return true;
+}
+
 /// SP6: the entries this build may replay (g_nc_valid): the ones with this
 /// build's key, not gone without (g_nc_deny), whose deps hold; the ones
 /// dropped for a dep go to g_nc_stale.
@@ -40120,7 +40559,7 @@ fn nc_validate(g: &NatGen, m: &IrModule) {
     while i < g.nc_old.len() {
         var nm: str = g.nc_old.get(i).name;
         if HashMap_get(g.nc_ix, nm) == i + 1 && !nc_denied(nm) && HashMap_contains(g.all_fns, nm) {
-            if nc_cur_key(m, nm) == g.nc_old.get(i).key {
+            if nc_cur_key(g, m, nm) == g.nc_old.get(i).key {
                 HashMap_insert(g_nc_valid, nm, i + 1);
                 cand.push(i);
             }
@@ -40175,10 +40614,22 @@ fn nc_give_up(name: str) {
     g_nc_retry.push(name);
 }
 
-/// SP6: give up hit `name` and every kept entry that took its mask or its
-/// result convention for granted, transitively (compiled again, each may
-/// end up with another mask): the next attempt then has none of them.
+/// SP6: give up hit `name`: the next attempt compiles it again. What its
+/// callers took for granted of it is checked there against the function
+/// compiled again (nc_validate: its result convention; nc_masks_hold and
+/// nc_ft_hold at their replay: its mask and its escape summary), so only a
+/// caller whose assumption really changed is compiled again, one level per
+/// attempt (nat_generate_image keeps what each attempt compiled for the
+/// next). Before (FID_NAT_OFF=ncnarrow), every kept entry that recorded
+/// anything of it was given up with it, transitively: one edited function
+/// whose clobber mask changed took all its callers up to main, and the
+/// program's other callers of those, with it, whether or not their own
+/// masks changed (the Nov 22 audit).
 fn nc_give_up_callers(g: &NatGen, name: str) {
+    if ng_on("ncnarrow") {
+        nc_give_up(name);
+        return;
+    }
     var seen: i64 = HashMap_new();
     var work: Vec<str> = Vec::new();
     work.push(name);
