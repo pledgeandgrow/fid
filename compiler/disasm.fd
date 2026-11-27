@@ -571,6 +571,7 @@ const EFF_COND0: i64 = 40;
 const EFF_TBR: i64 = 41;
 const EFF_IMM16D: i64 = 42;
 const EFF_RSC: i64 = 43;
+const EFF_SIMM9: i64 = 44;
 // RISC-V:
 const EFF_RD: i64 = 50;
 const EFF_RS1: i64 = 51;
@@ -594,6 +595,11 @@ const EFF_VTYPE: i64 = 68;
 const EFF_AQRL: i64 = 69;
 const EFF_FSAME: i64 = 70;
 const EFF_RMD: i64 = 71;
+// BG232: the 5-bit immediate of a vector instruction (bits 19:15, where
+// vs1 otherwise is), unsigned (vsll.vi, vslidedown.vi) and signed (vmseq.vi,
+// vmerge.vim)
+const EFF_VIMM5: i64 = 72;
+const EFF_VSIMM5: i64 = 73;
 // x86-64 (ModRM operands, immediates):
 const EFF_R: i64 = 80;
 const EFF_R8: i64 = 81;
@@ -630,7 +636,7 @@ const EFF_XV: i64 = 111;
 
 /// A template field's code, 0 when `name` is not a field.
 fn ef_field_code(name: str) -> i64 {
-    var names: Vec<str> = str_split("xd,xds,wd,xn,xns,wn,xm,wm,xa,dd,dn,dm,da,sd,sn,imm12,sh12,shift,cond,ncond,immr,imms,lsl6,imm16,hw,b26,b19,b14,tbit,adrp,adr,uoff,simm7,xt2,qd,vd,vn,vm,idx1,cond0,tbr,imm16d,rsc", ",");
+    var names: Vec<str> = str_split("xd,xds,wd,xn,xns,wn,xm,wm,xa,dd,dn,dm,da,sd,sn,imm12,sh12,shift,cond,ncond,immr,imms,lsl6,imm16,hw,b26,b19,b14,tbit,adrp,adr,uoff,simm7,xt2,qd,vd,vn,vm,idx1,cond0,tbr,imm16d,rsc,simm9", ",");
     var i: i64 = 0;
     while i < names.len() {
         if names.get(i) == name {
@@ -638,7 +644,7 @@ fn ef_field_code(name: str) -> i64 {
         }
         i = i + 1;
     }
-    var rnames: Vec<str> = str_split("rd,rs1,rs2,fd,fs1,fs2,fs3,immi,immst,shamt6,shamt5,boff,joff,uimm20,rm,rvd,rvs1,rvs2,vtype,aqrl,fsame,rmd", ",");
+    var rnames: Vec<str> = str_split("rd,rs1,rs2,fd,fs1,fs2,fs3,immi,immst,shamt6,shamt5,boff,joff,uimm20,rm,rvd,rvs1,rvs2,vtype,aqrl,fsame,rmd,vimm5,vsimm5", ",");
     i = 0;
     while i < rnames.len() {
         if rnames.get(i) == name {
@@ -887,6 +893,38 @@ fn ef_init_a64() {
     ef_w(a, EFW_A64_LDP, 0xFFC00000, "ldp {xd}, {xt2}, [{xns}, #{simm7}]");
     ef_w(a, EFW_A64_STP_PRE, 0xFFC00000, "stp {xd}, {xt2}, [{xns}, #{simm7}]!");
     ef_w(a, EFW_A64_LDP_PRE, 0xFFC00000, "ldp {xd}, {xt2}, [{xns}, #{simm7}]!");
+    // BG232: one register with writeback (TG8: a64_ldr_wb / a64_str_wb): the
+    // unsigned-offset opcode with bit 24 clear, imm9 at bits 20:12, and bits
+    // 11:10 = 01 (the base steps after the access) or 11 (before it, `!`)
+    ef_w(a, 0xF8400400, 0xFFE00C00, "ldr {xd}, [{xns}], #{simm9}");
+    ef_w(a, 0xF8400C00, 0xFFE00C00, "ldr {xd}, [{xns}, #{simm9}]!");
+    ef_w(a, 0xF8000400, 0xFFE00C00, "str {xd}, [{xns}], #{simm9}");
+    ef_w(a, 0xF8000C00, 0xFFE00C00, "str {xd}, [{xns}, #{simm9}]!");
+    ef_w(a, 0xB8400400, 0xFFE00C00, "ldr {wd}, [{xns}], #{simm9}");
+    ef_w(a, 0xB8400C00, 0xFFE00C00, "ldr {wd}, [{xns}, #{simm9}]!");
+    ef_w(a, 0xB8000400, 0xFFE00C00, "str {wd}, [{xns}], #{simm9}");
+    ef_w(a, 0xB8000C00, 0xFFE00C00, "str {wd}, [{xns}, #{simm9}]!");
+    ef_w(a, 0xB8800400, 0xFFE00C00, "ldrsw {xd}, [{xns}], #{simm9}");
+    ef_w(a, 0xB8800C00, 0xFFE00C00, "ldrsw {xd}, [{xns}, #{simm9}]!");
+    ef_w(a, 0x78400400, 0xFFE00C00, "ldrh {wd}, [{xns}], #{simm9}");
+    ef_w(a, 0x78400C00, 0xFFE00C00, "ldrh {wd}, [{xns}, #{simm9}]!");
+    ef_w(a, 0x78000400, 0xFFE00C00, "strh {wd}, [{xns}], #{simm9}");
+    ef_w(a, 0x78000C00, 0xFFE00C00, "strh {wd}, [{xns}, #{simm9}]!");
+    ef_w(a, 0x78800400, 0xFFE00C00, "ldrsh {xd}, [{xns}], #{simm9}");
+    ef_w(a, 0x78800C00, 0xFFE00C00, "ldrsh {xd}, [{xns}, #{simm9}]!");
+    ef_w(a, 0x38400400, 0xFFE00C00, "ldrb {wd}, [{xns}], #{simm9}");
+    ef_w(a, 0x38400C00, 0xFFE00C00, "ldrb {wd}, [{xns}, #{simm9}]!");
+    ef_w(a, 0x38000400, 0xFFE00C00, "strb {wd}, [{xns}], #{simm9}");
+    ef_w(a, 0x38000C00, 0xFFE00C00, "strb {wd}, [{xns}, #{simm9}]!");
+    ef_w(a, 0x38800400, 0xFFE00C00, "ldrsb {xd}, [{xns}], #{simm9}");
+    ef_w(a, 0x38800C00, 0xFFE00C00, "ldrsb {xd}, [{xns}, #{simm9}]!");
+    // BG232: SIMD&FP loads, stores and pairs (nat_ir.fd ng_fload, ng_a64_fpair)
+    ef_w(a, 0xFD400000, 0xFFC00000, "ldr {dd}, [{xns}{uoff}]");
+    ef_w(a, 0xFD000000, 0xFFC00000, "str {dd}, [{xns}{uoff}]");
+    ef_w(a, 0xBD400000, 0xFFC00000, "ldr {sd}, [{xns}{uoff}]");
+    ef_w(a, 0xBD000000, 0xFFC00000, "str {sd}, [{xns}{uoff}]");
+    ef_w(a, 0x6D400000, 0xFFC00000, "ldp {dd}, {da}, [{xns}, #{simm7}]");
+    ef_w(a, 0x6D000000, 0xFFC00000, "stp {dd}, {da}, [{xns}, #{simm7}]");
     // Exclusive and acquire/release
     ef_w(a, EFW_A64_LDAXR, 0xFFFFFC00, "ldaxr {xd}, [{xns}]");
     ef_w(a, EFW_A64_STLXR, 0xFFE0FC00, "stlxr {wm}, {xd}, [{xns}]");
@@ -928,6 +966,11 @@ fn ef_init_a64() {
     ef_w(a, 0x6E60DC00, 0xFFE0FC00, "fmul {vd}.2d, {vn}.2d, {vm}.2d");
     ef_w(a, 0x6E60FC00, 0xFFE0FC00, "fdiv {vd}.2d, {vn}.2d, {vm}.2d");
     ef_w(a, 0x4E080C00, 0xFFFFFC00, "dup {vd}.2d, {xn}");
+    // BG232: a64_bic_16b; a64_dup_elem_2d (lane index: bit 20) and its
+    // scalar form a64_dup_d_elem (`mov d0, v1.d[1]`)
+    ef_w(a, 0x4E601C00, 0xFFE0FC00, "bic {vd}.16b, {vn}.16b, {vm}.16b");
+    ef_w(a, 0x4E080400, 0xFFEFFC00, "dup {vd}.2d, {vn}.d[{idx1}]");
+    ef_w(a, 0x5E080400, 0xFFEFFC00, "mov {dd}, {vn}.d[{idx1}]");
     ef_w(a, 0x5EF1B800, 0xFFFFFC00, "addp {dd}, {vn}.2d");
     ef_w(a, 0x4E083C00, 0xFFEFFC00, "mov {xd}, {vn}.d[{idx1}]");
     ef_w(a, 0x4E081C00, 0xFFEFFC00, "mov {vd}.d[{idx1}], {xn}");
@@ -1079,6 +1122,14 @@ fn ef_init_rv() {
     ef_w(r, 0x2E000057, 0xFE00707F, "vxor.vv {rvd}, {rvs2}, {rvs1}");
     ef_w(r, 0x02001057, 0xFE00707F, "vfadd.vv {rvd}, {rvs2}, {rvs1}");
     ef_w(r, 0x0A001057, 0xFE00707F, "vfsub.vv {rvd}, {rvs2}, {rvs1}");
+    // BG232: the vector forms nat_enc.fd emits (TG11, K10): OPIVI with a
+    // 5-bit immediate in place of vs1, and the two float moves
+    ef_w(r, 0x96003057, 0xFE00707F, "vsll.vi {rvd}, {rvs2}, {vimm5}");
+    ef_w(r, 0x62003057, 0xFE00707F, "vmseq.vi {rvd}, {rvs2}, {vsimm5}");
+    ef_w(r, 0x5C003057, 0xFE00707F, "vmerge.vim {rvd}, {rvs2}, {vsimm5}, v0");
+    ef_w(r, 0x3E003057, 0xFE00707F, "vslidedown.vi {rvd}, {rvs2}, {vimm5}");
+    ef_w(r, 0x42001057, 0xFE0FF07F, "vfmv.f.s {fd}, {rvs2}");
+    ef_w(r, 0x5E005057, 0xFFF0707F, "vfmv.v.f {rvd}, {fs1}");
     ef_w(r, 0x92001057, 0xFE00707F, "vfmul.vv {rvd}, {rvs2}, {rvs1}");
     ef_w(r, 0x82001057, 0xFE00707F, "vfdiv.vv {rvd}, {rvs2}, {rvs1}");
     ef_w(r, 0x02002057, 0xFE00707F, "vredsum.vs {rvd}, {rvs2}, {rvs1}");
@@ -1221,6 +1272,9 @@ fn ef_init_x64() {
     ef_vx(0, 2, 0xF7, -1, -1, "bextr {r64}, {rm64}, {gv}");
     ef_vx(0, 2, 0xF2, -1, -1, "andn {r64}, {gv}, {rm64}");
     ef_vx(0, 2, 0xF3, 1, -1, "blsr {gv}, {rm64}");
+    // BG232: the other two of BMI1 x64_blsmsk and x64_blsi emit
+    ef_vx(0, 2, 0xF3, 2, -1, "blsmsk {gv}, {rm64}");
+    ef_vx(0, 2, 0xF3, 3, -1, "blsi {gv}, {rm64}");
     ef_vx(0x66, 2, 0xA9, -1, 1, "vfmadd213sd {x}, {xv}, {xrm}");
     ef_vx(0x66, 2, 0x59, -1, 0, "vpbroadcastq {v}, {xrm}");
     ef_vx(0xF3, 1, 0x6F, -1, -1, "vmovdqu {v}, {vrm}");
@@ -1361,6 +1415,10 @@ fn ef_put(code: i64, v: i64) -> i64 {
         // a byte offset, a multiple of 8
         return ((v >> 3) & 0x7F) << 15;
     }
+    if code == EFF_SIMM9 {
+        // a byte offset (a negative one keeps its low 9 bits)
+        return (v & 0x1FF) << 12;
+    }
     if code == EFF_IDX1 {
         return (v & 1) << 20;
     }
@@ -1381,6 +1439,9 @@ fn ef_put(code: i64, v: i64) -> i64 {
     }
     if code == EFF_IMMI {
         return (v & 0xFFF) << 20;
+    }
+    if code == EFF_VIMM5 || code == EFF_VSIMM5 {
+        return (v & 31) << 15;
     }
     if code == EFF_IMMST {
         return (((v >> 5) & 0x7F) << 25) | ((v & 0x1F) << 7);
@@ -1678,6 +1739,9 @@ fn ef_field_text(code: i64, w: i64, pc: i64) -> str {
     if code == EFF_SIMM7 {
         return int_to_str(dsm_sext((w >> 15) & 0x7F, 7) * 8);
     }
+    if code == EFF_SIMM9 {
+        return int_to_str(dsm_sext((w >> 12) & 0x1FF, 9));
+    }
     // RISC-V
     var rd: i64 = (w >> 7) & 31;
     var rs1: i64 = (w >> 15) & 31;
@@ -1714,6 +1778,12 @@ fn ef_field_text(code: i64, w: i64, pc: i64) -> str {
     }
     if code == EFF_IMMI {
         return int_to_str(dsm_sext(w >> 20, 12));
+    }
+    if code == EFF_VIMM5 {
+        return int_to_str((w >> 15) & 31);
+    }
+    if code == EFF_VSIMM5 {
+        return int_to_str(dsm_sext((w >> 15) & 31, 5));
     }
     if code == EFF_IMMST {
         return int_to_str(dsm_sext((((w >> 25) & 0x7F) << 5) | rd, 12));

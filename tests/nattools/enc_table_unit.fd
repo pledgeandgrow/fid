@@ -71,6 +71,16 @@ fn a64(e: & NatEnc, tmpl: str, a: i64, b: i64, c: i64, d: i64, want: str) {
     chk_w(DSM_A64, last_word(e), tmpl, a, b, c, d, want);
 }
 
+/// A form no encoder writes (nat_ir.fd lays its word itself): the word,
+/// llvm-mc's for the text, and what it decodes to.
+fn fixed_a64(w: i64, want: str) {
+    g_checks = g_checks + 1;
+    var text: str = dsm_a64(w, 0x1000);
+    if text != want {
+        tfail("TEXT 0x" + hex_of(w) + " decodes to `" + text + "`, not `" + want + "`");
+    }
+}
+
 fn rv(e: & NatEnc, tmpl: str, a: i64, b: i64, c: i64, d: i64, want: str) {
     chk_w(DSM_RV64, last_word(e), tmpl, a, b, c, d, want);
 }
@@ -350,6 +360,31 @@ fn check_a64() {
     a64(& e, "mov {vd}.d[{idx1}], {xn}", 1, 0, 2, 0, "mov v1.d[0], x2");
     a64_fcmeq_zero_2d(& mut e, 1, 2);
     a64(& e, "fcmeq {vd}.2d, {vn}.2d, #0.0", 1, 2, 0, 0, "fcmeq v1.2d, v2.2d, #0.0");
+    // BG232: the encoders that had no row
+    a64_ldr_wb(& mut e, 0, 1, 8, 8, false, false);
+    a64(& e, "ldr {xd}, [{xns}], #{simm9}", 0, 1, 8, 0, "ldr x0, [x1], #8");
+    a64_ldr_wb(& mut e, 0, 1, 8, 8, false, true);
+    a64(& e, "ldr {xd}, [{xns}, #{simm9}]!", 0, 1, 8, 0, "ldr x0, [x1, #8]!");
+    a64_str_wb(& mut e, 8, 9, 8, 8, false);
+    a64(& e, "str {xd}, [{xns}], #{simm9}", 8, 9, 8, 0, "str x8, [x9], #8");
+    a64_str_wb(& mut e, 0, 1, 0 - 2, 2, true);
+    a64(& e, "strh {wd}, [{xns}, #{simm9}]!", 0, 1, 0 - 2, 0, "strh w0, [x1, #-2]!");
+    a64_ldr_wb(& mut e, 0, 1, 0 - 4, 1, true, false);
+    a64(& e, "ldrsb {xd}, [{xns}], #{simm9}", 0, 1, 0 - 4, 0, "ldrsb x0, [x1], #-4");
+    a64_bic_16b(& mut e, 0, 1, 2);
+    a64(& e, "bic {vd}.16b, {vn}.16b, {vm}.16b", 0, 1, 2, 0, "bic v0.16b, v1.16b, v2.16b");
+    a64_dup_elem_2d(& mut e, 0, 1, 1);
+    a64(& e, "dup {vd}.2d, {vn}.d[{idx1}]", 0, 1, 1, 0, "dup v0.2d, v1.d[1]");
+    a64_dup_d_elem(& mut e, 0, 1, 1);
+    a64(& e, "mov {dd}, {vn}.d[{idx1}]", 0, 1, 1, 0, "mov d0, v1.d[1]");
+    // BG232: the SIMD&FP loads, stores and pairs nat_ir.fd writes itself
+    // (ng_fload, ng_a64_fpair), as the words llvm-mc makes of their text
+    fixed_a64(0xF8008528, "str x8, [x9], #8");
+    fixed_a64(0xFD400420, "ldr d0, [x1, #8]");
+    fixed_a64(0xFD000820, "str d0, [x1, #16]");
+    fixed_a64(0xBD400420, "ldr s0, [x1, #4]");
+    fixed_a64(0x6D0127E8, "stp d8, d9, [sp, #16]");
+    fixed_a64(0x6D4127E8, "ldp d8, d9, [sp, #16]");
 }
 
 fn check_rv() {
@@ -522,6 +557,19 @@ fn check_rv() {
     rv(& e, "vmv.x.s {rd}, {rvs2}", 10, 2, 0, 0, "vmv.x.s a0, v2");
     rv_vmv_v_x(& mut e, 1, 10);
     rv(& e, "vmv.v.x {rvd}, {rs1}", 1, 10, 0, 0, "vmv.v.x v1, a0");
+    // BG232: the vector forms that had no row
+    rv_vsll_vi(& mut e, 1, 2, 3);
+    rv(& e, "vsll.vi {rvd}, {rvs2}, {vimm5}", 1, 2, 3, 0, "vsll.vi v1, v2, 3");
+    rv_vmseq_vi(& mut e, 1, 2, 0);
+    rv(& e, "vmseq.vi {rvd}, {rvs2}, {vsimm5}", 1, 2, 0, 0, "vmseq.vi v1, v2, 0");
+    rv_vmerge_vim(& mut e, 1, 2, 5);
+    rv(& e, "vmerge.vim {rvd}, {rvs2}, {vsimm5}, v0", 1, 2, 5, 0, "vmerge.vim v1, v2, 5, v0");
+    rv_vslidedown_vi(& mut e, 1, 2, 1);
+    rv(& e, "vslidedown.vi {rvd}, {rvs2}, {vimm5}", 1, 2, 1, 0, "vslidedown.vi v1, v2, 1");
+    rv_vfmv_f_s(& mut e, 1, 2);
+    rv(& e, "vfmv.f.s {fd}, {rvs2}", 1, 2, 0, 0, "vfmv.f.s f1, v2");
+    rv_vfmv_v_f(& mut e, 1, 2);
+    rv(& e, "vfmv.v.f {rvd}, {fs1}", 1, 2, 0, 0, "vfmv.v.f v1, f2");
 }
 
 fn check_x64() {
@@ -664,6 +712,13 @@ fn check_x64() {
     at = e.code.len();
     x64_blsr(& mut e, 0, 1);
     x64(& e, at, "blsr {gv}, {rm64}", 0, 1, 0, true, false, no_imm(), "blsr rax, rcx");
+    // BG232: the other two of BMI1
+    at = e.code.len();
+    x64_blsmsk(& mut e, 0, 1);
+    x64(& e, at, "blsmsk {gv}, {rm64}", 0, 1, 0, true, false, no_imm(), "blsmsk rax, rcx");
+    at = e.code.len();
+    x64_blsi(& mut e, 0, 1);
+    x64(& e, at, "blsi {gv}, {rm64}", 0, 1, 0, true, false, no_imm(), "blsi rax, rcx");
     at = e.code.len();
     x64_vfmadd213sd_012(& mut e);
     x64(& e, at, "vfmadd213sd {x}, {xv}, {xrm}", 0, 2, 1, true, false, no_imm(), "vfmadd213sd xmm0, xmm1, xmm2");
