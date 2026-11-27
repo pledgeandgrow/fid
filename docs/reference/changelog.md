@@ -13,17 +13,27 @@ green; the first whole-suite record on `emit` and `--nat`.
   reused), SP7 (incremental relinking: `relink_check.sh` 21 ok on
   x86-64, AArch64 and `--nat` Windows) and LF20 (`@secret` values in
   registers: `ng_secret_mir` follows what selection makes of a secret,
-  48/48 in registers on the four targets) are done. CF32 and CF37 are
-  closed (a `@public` parameter of a `@constant_time` function is read
-  by its index in the source on every backend; the C path keeps its
-  null pointer checks). Four conformance gaps left: CF33 to CF36.
+  48/48 in registers on the four targets) are done; so are WP14
+  (specialization), LF11 (check hoisting), LF16 (the sole-owner pass) and
+  LF14 (the Vec scalar replacement) on the suite legs below. CF32 and CF37
+  are closed (a `@public` parameter of a `@constant_time` function is read
+  by its index in the source on every backend; the C path keeps its null
+  pointer checks). Four conformance gaps left: CF33 to CF36.
 - **Gates fixed and green:** `machine_mi14_check.sh` (33 ok),
   `machine_fregs_check.sh` (25 ok), `machine_sp16_check.sh` (9 ok),
-  `wp6_args_check.sh` (23 ok). A gate that takes wsl.exe for a working
-  WSL now tests it first (`wsl.exe -e sh -c 'echo wsl-ok'`).
-- **Suite legs on `emit` and `--nat`** (the first record, Nov 27):
-  `on` 604 ok / 10 fail, `off` 1122 ok / 18 fail, `sole` 816 ok / 137
-  fail, `vec` 815 ok / 133 fail (2,056 files each).
+  `wp6_args_check.sh` (23 ok), `version-default-check.sh` (0 failed: it no
+  longer compares the code addresses a panic trace prints),
+  `ra1_pe_ra_off_check.sh` (132 same of 137: a program whose two outputs
+  differ gets a second run on its own), SP9's `parse_par_check.sh` and
+  `imports_par_check.sh`, each with and without `SELF=1`. A gate that
+  takes wsl.exe for a working WSL now tests it first (`wsl.exe -e sh -c
+  'echo wsl-ok'`).
+- **Suite legs on `emit` and `--nat`** (the first record, Nov 27, finished
+  18:12): `on` 2,011 ok / 45 fail (emit and `--nat`), and on emit alone
+  `off` (FID_IROPT_OFF=spec,version), `sole` (FID_IROPT_ON=soleown) and
+  `vec` (FID_IROPT_ON=vecsroa) 2,018 ok / 38 fail each (2,056 files each).
+  No verdict changes with any pass on or off. The 38 are the suite's own
+  on these backends; 7 more fail on `--nat` only (llvm-roadmap MI14).
 - **Release tooling fixed:** BG284 (`release-fresh.sh` no longer calls
   every `RELEASE=1` build stale — `compiler/build_info.fd` is out of
   the source hash) and BG365 (release.yml's Linux archive gets
