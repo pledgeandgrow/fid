@@ -41,7 +41,13 @@ jobs:
           version: 0.16.0
       - name: qemu for the linux-arm64 smoke test
         if: matrix.emu == 'qemu'
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq qemu-user-static
+        # ubuntu-26.04: qemu-user-static is a virtual name qemu-user-binfmt
+        # provides, and the emulators lost the -static suffix
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-user-binfmt || sudo apt-get install -y -qq qemu-user-static || sudo apt-get install -y -qq qemu-user
+          QA=$(command -v qemu-aarch64-static || command -v qemu-aarch64) || { echo "no qemu-aarch64"; exit 1; }
+          echo "QA=$QA" >> "$GITHUB_ENV"
       - name: Fetch the pinned linux-x64 seed
         run: |
           mkdir -p build release
@@ -73,9 +79,9 @@ jobs:
       - name: Smoke test (qemu - real execution)
         if: matrix.emu == 'qemu'
         run: |
-          qemu-aarch64-static ./release/fid-dev version
-          qemu-aarch64-static ./release/fid-dev ccompile tests/bootstrap/hello.fd -o build/hello-arm64
-          qemu-aarch64-static ./build/hello-arm64 | grep -q . && echo "smoke: hello runs"
+          "$QA" ./release/fid-dev version
+          "$QA" ./release/fid-dev ccompile tests/bootstrap/hello.fd -o build/hello-arm64
+          "$QA" ./build/hello-arm64 | grep -q . && echo "smoke: hello runs"
       - name: Smoke test (macOS - format check; execution happens in CI)
         if: matrix.emu == 'none'
         run: |
