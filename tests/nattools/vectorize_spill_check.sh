@@ -27,7 +27,9 @@ T=tests/bootstrap/test_vectorize_spill.fd
 TAKEN="wide splats red6 redk many"
 SLOTADDR="wide red6"
 RUN=""
-if command -v wsl.exe >/dev/null 2>&1; then RUN="wsl.exe -e"; fi
+# A working WSL only: wsl.exe is on PATH on every Windows, with no
+# distribution installed too, and then every image "fails" with no output
+if command -v wsl.exe >/dev/null 2>&1 && wsl.exe -e sh -c 'echo wsl-ok' 2>/dev/null | grep -q 'wsl-ok'; then RUN="wsl.exe -e"; fi
 WIN=0
 case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) WIN=1 ;; esac
 fails=0

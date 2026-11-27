@@ -110,7 +110,12 @@ echo "[3/3] ${CC_CMD[*]} -> $OUT/$OUT_EXE"
 # The generated C is the same either way: only the C compiler's work differs.
 SPLIT="${SPLIT:-16}"
 JOBS="${JOBS:-2}"
-SPLIT_CFLAGS=(-O2 -fno-strict-aliasing -fwrapv)
+# SPLIT_OPT: the optimization level of the first build of every unit (-O2).
+# SPLIT_OPT=-O1 or -O0 when the machine cannot commit the memory the giant
+# units take at -O2 (Nov 27: 44 GB of a 48 GB commit limit taken by other
+# programs, the units died at once, exit 5): the generated C is the same.
+SPLIT_OPT="${SPLIT_OPT:--O2}"
+SPLIT_CFLAGS=("$SPLIT_OPT" -fno-strict-aliasing -fwrapv)
 for f in "${CFLAGS[@]}"; do [ "$f" != "-O0" ] && SPLIT_CFLAGS+=("$f"); done
 built=0
 : > "$OUT/fid-dev.cc.log"
@@ -141,7 +146,7 @@ case "${CC_CMD[*]}" in *tcc*) ;; *)
     done
     if [ ${#failed[@]} -gt 0 ]; then
       for fu in "${failed[@]}"; do
-        echo "      unit ${base}_${fu%%:*}.c failed at -O2 (exit ${fu##*:})"
+        echo "      unit ${base}_${fu%%:*}.c failed at $SPLIT_OPT (exit ${fu##*:})"
       done
       echo "      building the failed units again, one at a time"
       still=()
@@ -156,10 +161,12 @@ case "${CC_CMD[*]}" in *tcc*) ;; *)
         # cross-build measured this): fall to -O1, then -O0, per unit
         final=()
         retried=()
+        retry_opts=()
+        case "$SPLIT_OPT" in -O2) retry_opts=(-O1 -O0) ;; -O1) retry_opts=(-O0) ;; esac
         for fu in "${still[@]}"; do
           k="${fu%%:*}"
           ok=0
-          for opt in -O1 -O0; do
+          for opt in "${retry_opts[@]}"; do
             echo "      unit ${base}_$k.c retrying at $opt (the giant-unit memory wall)"
             # the same flags as the first build with the optimization level
             # (before Nov 27 the retry had neither -w nor the -Wno-*: the
@@ -175,7 +182,7 @@ case "${CC_CMD[*]}" in *tcc*) ;; *)
         done
         if [ ${#final[@]} -gt 0 ]; then
           for k in "${final[@]}"; do
-            echo "error: unit ${base}_$k.c unbuildable at -O2/-O1/-O0"
+            echo "error: unit ${base}_$k.c unbuildable at $SPLIT_OPT and below (no memory to commit: see the commit limit)"
           done
           echo "      see $OUT/fid-dev.cc.log; SPLIT=1 builds one unit at -O0 (about 17x slower)"
           grep -E "error" "$OUT/fid-dev.cc.log" | head -20
@@ -186,9 +193,9 @@ case "${CC_CMD[*]}" in *tcc*) ;; *)
     fi
     if "${CC_CMD[@]}" "${objs[@]}" -o "$OUT/$OUT_EXE" "${LIBS[@]}" >> "$OUT/fid-dev.cc.log" 2>&1; then
       if [ "${#retried[@]}" -gt 0 ]; then
-        echo "      ($SPLIT units: $(( SPLIT - ${#retried[@]} )) at -O2, ${#retried[@]} below it: unit ${retried[*]})"
+        echo "      ($SPLIT units: $(( SPLIT - ${#retried[@]} )) at $SPLIT_OPT, ${#retried[@]} below it: unit ${retried[*]})"
       else
-        echo "      ($SPLIT units at -O2)"
+        echo "      ($SPLIT units at $SPLIT_OPT)"
       fi
       built=1
     else
