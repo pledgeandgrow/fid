@@ -130,12 +130,12 @@ the file), `deferred` (cannot be done on this machine), with the reason.
 
 | # | Goal | What is wrong | Files | Gate | Status |
 |---|---|---|---|---|---|
-| 10 | BG233 | disasm: one-byte forms ignore the `0x66` prefix and REX.B | `compiler/disasm.fd` | `66 B8 34 12` is `mov ax, 0x1234`, `66 99` `cwd`, `49 90` `xchg r8, rax`, `F3 90` `pause`, each with the right length | todo |
-| 11 | BG208 | disasm: `vzeroupper` swallows the next instruction | `compiler/disasm.fd` | `c5 f8 77 4d 39` is `vzeroupper` then `cmp r12, r14` | todo |
+| 10 | BG233 | disasm: one-byte forms ignore the `0x66` prefix and REX.B | `compiler/disasm.fd` | `66 B8 34 12` is `mov ax, 0x1234`, `66 99` `cwd`, `49 90` `xchg r8, rax`, `F3 90` `pause`, each with the right length| code in 7b06ce65 (Nov 27 04:54); to validate with release/fid-night.exe |
+| 11 | BG208 | disasm: `vzeroupper` swallows the next instruction | `compiler/disasm.fd` | `c5 f8 77 4d 39` is `vzeroupper` then `cmp r12, r14`| code in 7b06ce65; to validate with release/fid-night.exe |
 | 12 | BG232 | disasm has no row for instructions the encoders emit | `compiler/disasm.fd` | the entry's list (x86 `blsmsk`/`blsi`, AArch64 pre/post-index and FP loads, RISC-V vector) decodes with the right length | todo |
-| 13 | BG212 | comptime does not evaluate float/int casts | `compiler/comptime_eval.fd` (`Expr::Cast`) | `comptime avg(3, 4)` and `comptime (-(7.9 as i64))` evaluate | todo |
-| 14 | BG213 | C header parser evaluates unsigned macro arithmetic as signed | `compiler/cparser.fd` (`CpEval`/`CpExpr`) | `fid parse-header` on a header with `UDIV`, `UNEG`, `MASK`, `COND`, `CMP`, `0b1010` | todo |
-| 15 | LG3 | reads are not checked against a live `&mut` | `compiler/borrowck.fd` | `val v = m` while `r = id_mut(&mut m)` is live and used after is a borrow error; `test_frontend_lifetime*.fd` and `tests/conformance/s8_*` still pass | todo |
+| 13 | BG212 | comptime does not evaluate float/int casts | `compiler/comptime_eval.fd` (`Expr::Cast`) | `comptime avg(3, 4)` and `comptime (-(7.9 as i64))` evaluate| code in 7b06ce65; to validate with release/fid-night.exe |
+| 14 | BG213 | C header parser evaluates unsigned macro arithmetic as signed | `compiler/cparser.fd` (`CpEval`/`CpExpr`) | `fid parse-header` on a header with `UDIV`, `UNEG`, `MASK`, `COND`, `CMP`, `0b1010`| deferred to a later batch: needs a typed macro evaluator (unsigned 32-bit arithmetic), about fifteen functions |
+| 15 | LG3 | reads are not checked against a live `&mut` | `compiler/borrowck.fd` | `val v = m` while `r = id_mut(&mut m)` is live and used after is a borrow error; `test_frontend_lifetime*.fd` and `tests/conformance/s8_*` still pass| code in 7b06ce65 (reference 8.4 rule 4); to validate with release/fid-night.exe, and the compiler's own tree must still check |
 
 ### D. Verify only — the gate runs on this machine
 
@@ -167,7 +167,7 @@ Take in this order as soon as `git status --porcelain -- <file>` is empty.
 
 | # | Goal | Files |
 |---|---|---|
-| 26 | DWARF: `DW_AT_decl_file` is 0 for generated functions (the 15 `image-check.sh` failures) | `compiler/nat_ir.fd` (`ng_gen_function`: `g_nat_line_file_ix = 0` for a function without a source file), `compiler/nat_enc.fd` |
+| 26 | DWARF: `DW_AT_decl_file` is 0 for generated functions (the 15 `image-check.sh` failures) | `compiler/nat_ir.fd` (`ng_gen_function`: `g_nat_line_file_ix = 0` for a function without a source file), `compiler/nat_enc.fd` | Status: fixed by another session in e52b278d (Nov 27 02:07): only confirm with release/fid-night.exe through scripts/image-check.sh |
 | 27 | BG201, BG202, BG240, BG242, BG235 | `compiler/typechecker.fd` |
 | 28 | BG203, BG228, BG230, BG241 | `compiler/lower.fd` |
 | 29 | BG209, BG210, BG211 | `compiler/lexer.fd`, `compiler/parser.fd` |
@@ -179,6 +179,10 @@ Take in this order as soon as `git status --porcelain -- <file>` is empty.
 | 35 | BG237 | `compiler/main.fd` or `compiler/fmt.fd` |
 | 36 | BG246 | `compiler/pe_ir*.fd` (check whether it is clean) |
 | 37 | MI9, MI5, MI14, MI17, RA1, TG5, TG11, TG16, WP6, WP14, LF11, LF13, LF14, LF16, LF20, SP16, OP15, CS3, VF3, VF5, TL5 | `nat_ir.fd`, `iropt.fd`, `wasm.fd` and the like; each large, take only after B to D are closed |
+| 38 | BG248 (found by the comparison) | `compiler/nat_ir.fd` | todo: `--nat` Windows: a call through a function value made from a C function's address returns 0 (test_fix_fnval_c_ptr prints 7, 12, 5 through `emit`) |
+| 39 | BG249 | `compiler/nat_ir.fd`, `stdlib/linux_runtime/win.fd` | todo: `--nat` Windows runs out of memory on bench_sleepers |
+| 40 | BG250 | `compiler/pe_ir*.fd`, `stdlib/pe_runtime/` | todo: pe_ir hangs on test_read_line_long (a child with redirected stdin) |
+| 41 | BG251 | `compiler/nat_ir.fd`, `stdlib/linux_runtime/win.fd` | todo: the machine layer on Windows lacks `p_str_join_n`, `p_inb`/`p_outb`, two C imports and the bare-metal builtins |
 
 ### G. Not on this machine — mark deferred with the reason
 
@@ -236,3 +240,9 @@ are the commit times.)
   needs a typed macro evaluator (unsigned 32-bit arithmetic) and is
   moved to a later batch. Next: compiler batch 1 (BG233, BG208, BG212,
   LG3), one build.
+- 04:54: the first compiler batch is in the tree (7b06ce65: BG233, BG208,
+  BG212, LG3, with tests/tooling/disasm-forms-check.sh and a rule 4 in
+  reference 8.4); the stage-0 compiler checks the whole tree (18 s). The
+  build to release/fid-night.exe started at 04:56. Validate with it: the
+  four goals' tests on run, ccompile and emit, the f-string and lifetime
+  programs, `check compiler/main.fd`, then scripts/image-check.sh (row 26).
