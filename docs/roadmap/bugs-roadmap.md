@@ -41,10 +41,10 @@ BG204, BG227), 35 open. BG242-BG246, found Nov 25, are open.
 Status Nov 27 (checkbox count at be36317, the v0.8.5-unstable commit):
 BG128-BG241: 80 done `[x]`, 3 partly done `[~]` (BG183, BG204, BG227), 31
 open; BG242-BG246 open. The whole file: 207 `[x]`, 3 `[~]`, 36 `[ ]`.
-Status Nov 27 (night run, 08:00): BG128-BG241: 95 done `[x]`, 3
+Status Nov 27 (night run, 08:30): BG128-BG241: 95 done `[x]`, 3
 partly `[~]` (BG183, BG204, BG227), 16 open; BG242 done, BG243-BG246
-open; BG247 done; BG248-BG256 open. The whole file: 224 `[x]`, 3
-`[~]`, 29 `[ ]`.
+open; BG247 done; BG248-BG257: BG254 and BG255 done, 8 open. The whole
+file: 226 `[x]`, 3 `[~]`, 28 `[ ]`.
 
 Status markers as in the other roadmaps: `[ ]` open, `[~]` partly done,
 `[x]` done.
@@ -2571,14 +2571,23 @@ names are the reference.
       25 as with that of Nov 27 (night): the monomorphizer's own test
       checks nothing. Found Nov 27 (night) through BG236. Confidence:
       high.
-- [ ] BG254. **`use transform3d;` does not compile: a parse error.**
+- [x] BG254. **`use transform3d;` does not compile: a parse error.**
       stdlib/transform3d.fd 146:12 (`m00: r.m00,` on the line after
       `return mat4 {`): "unexpected token 'Colon'". Through it
       scripts/check-stdlib.sh fails for transform3d, lidar and pointcloud,
       with the compiler of Nov 25 as with that of Nov 27 (night). Found
       Nov 27 (night) by that check (390 of 403 modules build on their
       own). Confidence: high.
-- [ ] BG255. **`use quic;` does not compile: a `@secret` error in the
+      Nov 27 (night), fixed in the library (1ae02075): the cause is the
+      parser's, BG257 (a literal of a struct of another module parses
+      only while its name begins with a capital, and math's is `mat4`).
+      tf3_to_mat4 starts from mat4::identity() and sets its fields.
+      transform3d, lidar and pointcloud build on their own with the
+      compiler of Nov 25 and with that of 07:41. Test
+      test_bg254_transform3d (the three modules, the identity and a
+      translation, and back): passes on run, ccompile and emit with
+      both compilers.
+- [x] BG255. **`use quic;` does not compile: a `@secret` error in the
       library's own code.** stdlib/quic.fd 359, `quic_updated_keys`: "a
       secret value is passed to `quic_keys_from_secret`, which outputs
       its parameter 'aead'". Through it scripts/check-stdlib.sh fails for
@@ -2586,12 +2595,57 @@ names are the reference.
       http3_udp, with the compiler of Nov 25 as with that of Nov 27
       (night). Found Nov 27 (night) by that check. Confidence: high
       (which side is wrong, the library or the check, is not decided).
+      Nov 27 (night), fixed in the library (dbb3347c, aea3663b): the
+      library was wrong. The AEAD id is public, but it was read out of
+      `old`, which is secret as a whole, and so reached
+      `quic_keys_from_secret`'s `aead`, a parameter the callee's
+      conditions depend on (the checker counts that as an output).
+      `quic_updated_keys` takes the id apart, as a third parameter; its
+      three call sites in quic_conn.fd pass quic_tls_suite_aead(c.tls.
+      suite), and test_stdlib_quic_protect's RFC 9001 A.5 sample calls
+      it so. quic, quic_conn, quic_frame, quic_tls, quic_udp, http3 and
+      http3_udp build on their own with the compiler of Nov 25 and with
+      that of 07:41. The five QUIC and HTTP/3 tests (test_stdlib_quic_
+      conn, _frames, _more, _protect and test_stdlib_http3) pass on
+      ccompile and emit with both; none compiled before. New test
+      test_bg255_quic_key_update (the header-protection key kept, key
+      and IV from the next secret): passes on run, ccompile and emit
+      with both.
 - [ ] BG256. **`use parallel;` does not compile on its own: a
       thread-safety error.** stdlib/parallel.fd 138: "argument 5 of the
       spawned call has type fn(i64) -> i64, which is not @send". Through
       it scripts/check-stdlib.sh fails, with the compiler of Nov 25 as
       with that of Nov 27 (night). Found Nov 27 (night) by that check.
       Confidence: high.
+      Nov 27 (night): not fixed; it needs a decision about the language.
+      A function value is not @send, as a spawn argument and as a
+      variable the spawn expression uses ("spawn captures variable of
+      type fn(i64) -> i64 which is not @send"). The cast `f as i64`
+      gives no address to call (4194304 in `fid run`), and `fw as
+      fn(i64) -> i64` is the C function pointer of `fid ccompile`:
+      called, it is "Invalid memory access" on every compiled backend.
+      So the workers cannot be given `f`: par_map, par_for_each,
+      par_reduce and par_sum_by need a function value without captures
+      to be sendable (a type or an annotation the checker can prove),
+      or another way to hand a task its code. test_parallel and
+      test_parallel_concurrent are among the 20 programs the checker
+      rejects on every backend through this module.
+- [ ] BG257. **A literal of a struct of another module does not parse
+      while its name begins with a lowercase letter.** `use math;`,
+      then in a function `return vec2 { x: 1.0, y: 2.0 };`: "Parse
+      error: unexpected token 'Colon'"; the same with the first field
+      on the next line, and with `val v = vec2 { .. }`. A capitalised
+      name (`S { .. }`, `Transform3 { .. }`) parses. Cause: parser.fd
+      `pd_field_init_follows` accepts `{ ident :` only after a capital
+      (parser.fd:8337 and 8904), and a module is parsed without the
+      struct names of its imports (compiler.fd:3606, empty names; the
+      main file is given core's only, compiler.fd:5464). Found Nov 27
+      (night) through BG254; the compiler of Nov 25 behaves the same.
+      Confidence: high. Fix directions: give a module's parser the
+      struct names of its imports (a token scan of their sources), or
+      let `{ ident :` open a literal after any name (no block starts
+      with `ident :`); then the whole suite. math's lowercase structs
+      (vec2, vec3, vec4, mat4, quat) are the ones most met.
 
 ## Found and fixed while reviewing (Nov 22)
 

@@ -125,9 +125,9 @@ the file), `deferred` (cannot be done on this machine), with the reason.
 | 8 | BG180 | f-string float precision wrong for large values; fill ignored | `stdlib/core.fd` (`fstr_fmt_f64`, `__fstr_pad`, `__fstr_width0`) | the entry's triggers; check first whether it still reproduces | done (Nov 27 04:05) |
 | 9 | BG247 | the default Windows backend's `float_to_str` loses the low digits of a large value (found by BG180) | `stdlib/pe_runtime/base.fd` (`pert_float_to_str`; the machine layer's, in `stdlib/linux_runtime/base.fd`, is right) | `f"{1e25}"` prints `10000000000000000905969664` through `emit` | done (Nov 27 04:25) |
 | 9 | BG206 | Linux runtime `pert_str_to_float` is not correctly rounded | `stdlib/linux_runtime/base.fd` | 2000 printed doubles read back; runs here through `emit --nat` | todo (a correct-rounding conversion: the last of this group) |
-| 42 | BG254 | `use transform3d;` is a parse error (transform3d, lidar, pointcloud) | `stdlib/transform3d.fd` 146 | the three modules build on their own (scripts/check-stdlib.sh) | todo |
-| 43 | BG255 | `use quic;` is a `@secret` error in the library (quic, quic_conn, quic_frame, quic_tls, quic_udp, http3, http3_udp) | `stdlib/quic.fd` 359 | the seven modules build on their own; the QUIC and HTTP/3 tests unchanged | todo |
-| 44 | BG256 | `use parallel;` is a thread-safety error on its own | `stdlib/parallel.fd` 138 | the module builds on its own; tests/par/par_check.sh still passes | todo |
+| 42 | BG254 | `use transform3d;` is a parse error (transform3d, lidar, pointcloud) | `stdlib/transform3d.fd` 146 | the three modules build on their own (scripts/check-stdlib.sh) | done (Nov 27 08:05, 1ae02075; the parser's part is BG257, row 29) |
+| 43 | BG255 | `use quic;` is a `@secret` error in the library (quic, quic_conn, quic_frame, quic_tls, quic_udp, http3, http3_udp) | `stdlib/quic.fd` 359 | the seven modules build on their own; the QUIC and HTTP/3 tests unchanged | done (Nov 27 08:11, dbb3347c and aea3663b: the 7 modules; the 5 tests pass on ccompile and emit with both compilers) |
+| 44 | BG256 | `use parallel;` is a thread-safety error on its own | `stdlib/parallel.fd` 138 | the module builds on its own; tests/par/par_check.sh still passes | waiting on a design decision: a function value cannot reach a spawned task as an argument, as a used variable, or through a cast (the entry's note of Nov 27) |
 
 ### C. Bugs in compiler files no other session edits — one build per batch
 
@@ -135,7 +135,7 @@ the file), `deferred` (cannot be done on this machine), with the reason.
 |---|---|---|---|---|---|
 | 10 | BG233 | disasm: one-byte forms ignore the `0x66` prefix and REX.B | `compiler/disasm.fd` | `66 B8 34 12` is `mov ax, 0x1234`, `66 99` `cwd`, `49 90` `xchg r8, rax`, `F3 90` `pause`, each with the right length| done (Nov 27 05:47, 4445b05d: 7 of 7 in tests/tooling/disasm-forms-check.sh with the compiler built from 7b06ce65) |
 | 11 | BG208 | disasm: `vzeroupper` swallows the next instruction | `compiler/disasm.fd` | `c5 f8 77 4d 39` is `vzeroupper` then `cmp r12, r14`| done (Nov 27 05:47, 4445b05d) |
-| 12 | BG232 | disasm has no row for instructions the encoders emit | `compiler/disasm.fd` | the entry's list (x86 `blsmsk`/`blsi`, AArch64 pre/post-index and FP loads, RISC-V vector) decodes with the right length | todo |
+| 12 | BG232 | disasm has no row for instructions the encoders emit | `compiler/disasm.fd` | the entry's list (x86 `blsmsk`/`blsi`, AArch64 pre/post-index and FP loads, RISC-V vector) decodes with the right length | todo. Reproduced Nov 27 (night): `c4 e2 f8 f3 d1` and `c4 e2 f8 f3 d9` read as `.byte 0xc4 (vex)`. The probe is build/verify-nov27/disasm_rows_probe.fd (it encodes with the tree's encoders and decodes with its disassembler; 38 s through ccompile, 537 s through `fid run`, so compile it); `ef_decode_word` gives an empty text for a word without a row, so read AArch64 and RISC-V words through `disasm_bytes`. Rows to add: x86 `blsmsk`/`blsi` beside `blsr` (ef_vx, the digit 2 and 3), AArch64 pre/post-index `ldr`/`str`, FP `ldr`/`str d`, `ldp`/`stp d`, `bic v.16b`, `dup v.2d`, `mov d, v.d[i]`, RISC-V `vsll.vi`, `vmseq.vi`, `vmerge.vim`, `vslidedown.vi`, `vfmv.f.s`, `vfmv.v.f`; one build |
 | 13 | BG212 | comptime does not evaluate float/int casts | `compiler/comptime_eval.fd` (`Expr::Cast`) | `comptime avg(3, 4)` and `comptime (-(7.9 as i64))` evaluate| done (Nov 27 05:47, 4445b05d: its two tests and 321 of 324 related programs; the three fail with the compiler of Nov 25 too) |
 | 14 | BG213 | C header parser evaluates unsigned macro arithmetic as signed | `compiler/cparser.fd` (`CpEval`/`CpExpr`) | `fid parse-header` on a header with `UDIV`, `UNEG`, `MASK`, `COND`, `CMP`, `0b1010`| deferred to a later batch: needs a typed macro evaluator (unsigned 32-bit arithmetic), about fifteen functions |
 | 15 | LG3 | reads are not checked against a live `&mut` | `compiler/borrowck.fd` | `val v = m` while `r = id_mut(&mut m)` is live and used after is a borrow error; `test_frontend_lifetime*.fd` and `tests/conformance/s8_*` still pass| the rule of 7b06ce65 passed its tests but rejected the compiler's own tree (three calls of the form `f(&mut g.e, read(g))`); refined in 21e16421; the build of 06:35 still rejected one place (nat_ir.fd ng_mir_finish: a released borrow was counted as a named one), fixed in 4d7dcd55 with test_lg3_read_after_released_mut; validated with the build of 07:41 (three rejections, the accepted tests, `check compiler/main.fd` clean, 154 of 155 of the lifetime and §8.4 files); the entry stays `[~]` for its other gaps (lifetime parameters by name, generic structs by lifetime, the Linux targets) |
@@ -173,7 +173,8 @@ Take in this order as soon as `git status --porcelain -- <file>` is empty.
 | 26 | DWARF: `DW_AT_decl_file` is 0 for generated functions (the 15 `image-check.sh` failures) | `compiler/nat_ir.fd` (`ng_gen_function`: `g_nat_line_file_ix = 0` for a function without a source file), `compiler/nat_enc.fd` | Status: fixed by another session in e52b278d (Nov 27 02:07): only confirm with release/fid-night.exe through scripts/image-check.sh |
 | 27 | BG201, BG202, BG240, BG242, BG235 | `compiler/typechecker.fd` | Status: BG201, BG202, BG240 and BG242 done (Nov 27 night; BG201 with the build of 07:41; marked in bugs-roadmap.md). BG235 not started |
 | 28 | BG203, BG228, BG230, BG241 | `compiler/lower.fd` |
-| 29 | BG209, BG210, BG211 | `compiler/lexer.fd`, `compiler/parser.fd` |
+| 29 | BG209, BG210, BG211, BG257 | `compiler/lexer.fd`, `compiler/parser.fd` |
+|    | (BG257: a literal of a lowercase-named struct of another module; parser.fd `pd_field_init_follows`, compiler.fd:3606) | | Status: found Nov 27 (night) through BG254; one build |
 | 30 | BG205, BG231, BG244 | `compiler/codegen_c.fd` | Status: BG231 done (Nov 27 night, the build of 07:41, on ccompile); BG205 and BG244 not started |
 | 31 | BG236 | `compiler/mono.fd` | done (Nov 27 night: tests/nattools/mangle_func_unit.fd passes on run, ccompile and emit with the build of 07:41; test_mono.fd no longer compiles: BG253) |
 | 32 | BG234, BG245 | `compiler/nat_enc.fd` |
@@ -317,3 +318,36 @@ are the commit times.)
   Lesson of the run: the stage-0 check proves that the tree type-checks,
   not that new code is right; a compiler change committed before its build
   must say so in its commit, and the next build comes first.
+- 08:30, the end of the 07:25 run (65 minutes), one build (07:26 to 07:41,
+  16 units at -O2, release/fid-night.exe of 16,785,408 bytes). Validated
+  with it and marked (45537169): BG201 (the compound form is rejected and
+  the plain float assignments are accepted again: `check compiler/main.fd`
+  is clean, 26 s), BG231 (ccompile), BG236 (its unit test on run,
+  ccompile and emit), and LG3's read rule (11 rejections; its gate 154 of
+  155; the entry stays `[~]` for its other gaps). PL4 has its note of the
+  whole WebAssembly run (14f37bfd, 7d381a77): 1,116 of 1,315 pass, beside
+  a build; the 154 to run again are listed. The standard-library check
+  (scripts/check-stdlib.sh) then named three defects, all older than
+  tonight's compiler changes: BG254 (transform3d, lidar, pointcloud: fixed
+  in the library, 1ae02075; the parser's part is BG257), BG255 (the QUIC
+  key update: fixed, dbb3347c and aea3663b; the 5 QUIC and HTTP/3 tests
+  pass on ccompile and emit, and none compiled before), BG256 (parallel:
+  NOT fixed, a function value cannot reach a spawned task; it needs a
+  decision about the language). scripts/check-stdlib.sh with
+  release/fid-v27.exe: 400 of 401 modules build on their own (390 before);
+  parallel is the one left.
+  NEXT, IN THIS ORDER: (1) BG232 (row 12: the probe through ccompile) and
+  BG257 (row 29: parser.fd `pd_field_init_follows`, or the struct names of
+  a module's imports in compiler.fd): one build for both; (2) row 26
+  (scripts/image-check.sh with release/fid-night.exe), then rows 16 to 25
+  of section D; (3) the WebAssembly list of PL4 when the machine is quiet
+  (154 programs; an hour at least); (4) BG256 only once function values
+  across tasks are decided.
+  Traps of this run: `( ... ) &` after `cd .. && VAR=.. &&` runs only its
+  first group with them (three steps wrote to /run-N.log and were run
+  again); scripts/check-stdlib.sh says its count on its last line (a
+  summary made of the last matching lines showed 2 of 11 failures);
+  `x as fn(..)` is the C function pointer of `fid ccompile`, not a Fides
+  function value; a unit test that imports compiler::disasm and
+  compiler::nat_enc takes 537 s through `fid run` and 38 s through
+  ccompile.
