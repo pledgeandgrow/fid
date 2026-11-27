@@ -257,7 +257,7 @@ Fid is young and moving fast.
 - **The fixpoint was last verified on Nov 21, 2026:** stage 2 and stage 3 were byte-identical on that day's ~361K-line tree. Builds since (Nov 25, Nov 27, v0.8.5-unstable) are one stage from a self-hosted `fid`; the Nov 25 one passes the leak gate (11 of 11).
 - **The full test suite has been rerun only on the interpreter.** Nov 25, with `fid` as the compiler: 1,897 of 1,983 pass on `run` (82 of the failures fail the same with the earlier compiler, 4 are timeouts). The C and native lanes of the whole suite have not been rerun; features are checked with their own tests on each backend.
 - **CI is red.** `ci.yml` and `tier1.yml` have not had a green run since Nov 21, nor `macos-native.yml`; the checks above were run by hand on a Windows machine.
-- **Open bugs.** A whole-repo review on Nov 24 found 114 bugs: 80 are fixed with tests, 3 partly, 31 open ([bugs roadmap](docs/roadmap/bugs-roadmap.md)).
+- **Open bugs.** Three whole-repo reviews (Nov 22, 24, 27) logged 489 entries in the [bugs roadmap](docs/roadmap/bugs-roadmap.md): 230 are fixed with tests, 27 partly, 232 open — most of them from the latest review and still being worked down.
 - **Not for safety-critical use.** `fid qualify` produces evidence for review, not a certification.
 
 The details: [status](docs/reference/status.md) · [known bugs](docs/reference/known-bugs.md) · [roadmap](docs/roadmap/roadmap.md).
@@ -277,10 +277,10 @@ The details: [status](docs/reference/status.md) · [known bugs](docs/reference/k
 ## Repository layout
 
 ```
-compiler/    the compiler, in Fid: 65 modules, about 357K lines
+compiler/    the compiler, in Fid: 65 modules, about 361K lines
 stdlib/      the standard library: 403 modules
 src/         the earlier compiler in Rust, frozen; it builds stage 1 and runs the test harness
-tests/       bootstrap (2,077 programs), conformance (1,617), selfhost (47),
+tests/       bootstrap (2,131 programs), conformance (1,617), selfhost (47),
              plus projects, verify, nattools, tooling and leak checks
 examples/    twelve complete programs
 tools/       ark, scribe, veil and friends, written in Fid

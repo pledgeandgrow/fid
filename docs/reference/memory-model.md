@@ -20,10 +20,15 @@ is checked today (`fid`):
 - Shared memory between threads is meant to be `p_shared_alloc` blocks used
   through atomics, or data behind a mutex.
 
-Not checked: `Vec`, `HashMap` and `str` are handles, so a `Vec` passed to a
-spawned call is shared with the caller, and writes to it from both threads are
-not detected. Copy-on-write (proposal 0001) would make it the thread's own
-copy; it is written behind `LOWER_COW` and switched off.
+Spawn arguments and channel sends are whole deep copies (`p_send_copy`,
+`compiler/lower.fd`): a `Vec`, `HashMap`, `str` or struct sent to another
+thread arrives with its own buffers, so sender and receiver cannot alias
+them. `Rc`/`Arc` counts and the share-box owner counts that back
+copy-on-write are **not atomic** — sending the same value from two threads
+at once, or mutating a value while a send copy walks it, is not checked.
+`Vec`, `HashMap` and `str` are not internally synchronized: a collection
+two threads can both reach (through a mutable global, or shared memory in
+`unsafe`) has no ordering of its own.
 
 `unsafe` code that shares raw memory without these is responsible for its own
 ordering.

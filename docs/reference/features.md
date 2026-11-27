@@ -10,15 +10,15 @@ reference.md is right. Counts: [selfhost.md → Numbers](selfhost.md#numbers).*
 
 ## Current State (Nov 19, 2026 — "1.0 release preparation" commit; counts and build rechecked Nov 21)
 
-- Compiler (counted Nov 21): `compiler/*.fd`, 80 modules, 360,657 lines; `src/*.rs` (frozen
-  bootstrap reference and test harness), 57 files, 114,184 lines; stdlib 403
-  modules, 259,299 lines (+ 4 in `stdlib/pe_runtime/`, 7 in
+- Compiler (counted Nov 27): `compiler/*.fd`, 65 modules, 361,317 lines (Nov 21: 80/360,657 — the retired PIR-era files were deleted since); `src/*.rs` (frozen
+  bootstrap reference and test harness), 57 files, 114,901 lines; stdlib 403
+  modules, 283,161 lines (+ 4 in `stdlib/pe_runtime/`, 7 in
   `stdlib/linux_runtime/` incl. `darwin.fd` and `wasi.fd`).
-- Tests: 1,753 `.fd` under `tests/bootstrap/` (1,682 top level, 456 of them
-  expected-fail `*_fail.fd`), 57 in `tests/selfhost/`, 1,596 in
-  `tests/conformance/`, 10 in `tests/leaks/`, 68 in `tests/nattools/`, 52 in
-  `tests/projects/`, 50 in `tests/verify/`, 14 + 126 check scripts in
-  `tests/tooling/`, 12 examples, 12 tools in `tools/`.
+- Tests: 2,131 `.fd` under `tests/bootstrap/` (2,056 top level, 631 of them
+  expected-fail `*_fail.fd`), 47 in `tests/selfhost/`, 1,617 in
+  `tests/conformance/`, 11 in `tests/leaks/`, 79 in `tests/nattools/`, 52 in
+  `tests/projects/`, 49 in `tests/verify/`, 15 + 146 check scripts in
+  `tests/tooling/`, 12 examples, 42 `.fd` tools in `tools/`.
 - Fixpoint: stage 2 C == stage 3 C, 49 MB (Nov 6; last verified before the
   ~2.3x Nov 10–19 growth — re-verification is part of the release prep).
   Self-compile ~74 s when the compiler was 159K lines (Nov 9); 57 s at -O2
@@ -191,7 +191,7 @@ reference.md is right. Counts: [selfhost.md → Numbers](selfhost.md#numbers).*
 | `struct` | ✅ | Struct definitions and instances |
 | `enum` (algebraic) | ✅ | Sum types with data |
 | Generic enums `enum Foo<T>` | ✅ | Type parameters on enum declarations |
-| Generic structs `struct Foo<T>` | ⚠️ | Parsed, but `fid` rejects using one ("field 'v' expected T", Nov 9); generic enums, functions and `impl<T>` work |
+| Generic structs `struct Foo<T>` | ✅ | Work through type inference: `val p: Pair<i64> = Pair { .. }`. The turbofish literal `Pair<i64> { .. }` does not parse |
 | Generics `<T>` | ✅ | Generic functions and types; bounds checked, inference, turbofish (`fid`) |
 | Type aliases `type` | ✅ | Type alias declarations |
 
@@ -233,7 +233,7 @@ reference.md is right. Counts: [selfhost.md → Numbers](selfhost.md#numbers).*
 | Closures | ✅ | Captures environment |
 | Generic functions `fn name<T>()` | ✅ | Type parameters |
 | Default arguments | ✅ | `fn add(a: i64, b: i64 = 10)`; trailing defaulted parameters may be left out |
-| Named arguments | ✅ | `add(b: 2, a: 1)`; put in parameter order by lowering. A named argument's type is not checked |
+| Named arguments | ✅ | `add(b: 2, a: 1)`; put in parameter order by lowering. `fid` checks names, duplicates, position and type (`TypeChecker_check_named_args`); named arguments to methods are not checked |
 | Variadic arguments | ❌ | `...name` is parsed and ignored |
 
 ### Data Structures
@@ -853,8 +853,8 @@ suite run is Nov 2 (interp 339/339, C 343/343, PE 345/345, expected-fail
 |---------|--------|-------|
 | Self-compilation | ✅ | `fides-c.exe` compiles `compiler/main.fd` → up to `fides-c5.exe` (5 generations; session-24 regression fixed in session 26) |
 | Bootstrap fixpoint | ✅ | stage 2 == stage 3 byte-identical (49 MB of C, Nov 6), checked by `RELEASE=1 scripts/bootstrap.sh` on every release build; stage 1 comes from `STAGE0=<exe>` or a pinned stage 0 when one exists (`PIN=1` pins one; none yet), otherwise from `fidesc`. Not re-verified since Nov 8; from `fidesc` the bootstrap cannot pass stage 2 on the current tree (known-bugs 2g.79) |
-| Self-host modules | ✅ | 80 `.fd` modules, 360,657 lines (Nov 21; was 68/159K Nov 9, 25/61K in session 15) |
-| Self-host tests | ✅ | 57 programs in `tests/selfhost/` (`verify-selfhost.sh`; saved baseline 36/47×3) |
+| Self-host modules | ✅ | 65 `.fd` modules, 361,317 lines (Nov 27; was 80/360,657 Nov 21 — PIR-era files deleted, 68/159K Nov 9, 25/61K in session 15) |
+| Self-host tests | ✅ | 47 programs in `tests/selfhost/` (`verify-selfhost.sh`; saved baseline 36/47×3) |
 | Self-compile time | ✅ | ~133 s (type check 59 s, borrow check 16 s, lowering 20 s, C generation 12 s; Nov 6); `fidesc` ~21 s. Nov 21: 57 s at -O2 for the 361K-line tree |
 | PE emitter (self-hosted) | ✅ | `fid emit` (`compiler/pe_ir*.fd`) makes native Windows executables with no C compiler and reaches a byte-identical fixpoint. The older `build --native` pipeline (compiler.fd `build_executable`, PIR → opt → codegen_x64 → elf64 → linker) was removed Nov 17 (MI18): `--native` is the machine layer (nat_ir); `emit --boot` goes through pe_ir (`PEIR_BARE_BOOT`), and compiler/pe.fd is reached by nothing |
 | LSP server (self-hosted) | ✅ | `compiler/lsp.fd` (4,576 lines, Nov 21) — JSON-RPC over stdio |

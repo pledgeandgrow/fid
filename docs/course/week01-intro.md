@@ -12,7 +12,7 @@ promises for a given mistake.
 ## 1. Why a course on Fid
 
 Fid is a small systems language whose compiler, Fides, is written in Fid
-itself (`compiler/*.fd`, 80 modules, about 361,000 lines on Nov 21, 2026;
+itself (`compiler/*.fd`, 65 modules, about 361,000 lines on Nov 27, 2026;
 the release compiler is the
 one that compiled its own source). It is a good teaching vehicle for four
 ideas this course follows through the term:

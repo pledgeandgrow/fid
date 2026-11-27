@@ -387,8 +387,9 @@ What changed, and why:
 - **`ranked[:3]` became `truncate(3)`.** There are no slices.
 - **`ranked` borrows the map** (`&HashMap<str, i64>`) rather than copying
   it; `main` still owns it.
-- **`f"{count:4}"` became `str_pad_left`.** f-strings have no format
-  specs.
+- **`f"{count:4}"` works.** f-strings take format specs
+  (`[fill][<|>|^][#][0][+][width][.precision][x|X|b|o]`); `str_pad_left`
+  does the same by hand.
 - **Nothing is freed by hand**, and `fid run topwords.fd --leaks` (which
   builds through C) reports `every block was freed`.
 

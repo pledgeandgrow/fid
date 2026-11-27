@@ -154,9 +154,8 @@ integer arithmetic is checked in every build (overflow panics):
 
 ```fides
 use core;
-use result;
 
-fn parse_port(s: str) -> Option {
+fn parse_port(s: str) -> Option<i64> {
     if str_len(s) == 0 { return Option::None; }
     var n: i64 = str_parse_int(s);
     if n <= 0 || n > 65535 { return Option::None; }
@@ -229,7 +228,7 @@ fn main() -> i64 {
 }
 ```
 
-For parallelism, `parallel { a | b }` runs branches on worker threads;
+For parallelism, `parallel { | a | b }` runs branches on worker threads;
 `use channel;`/`use sync;` provide channels and locks.
 
 ## Time and benchmarking

@@ -6,7 +6,7 @@ Some of it predates the self-hosted compiler: file names ending in `.rs`
 refer to the frozen Rust compiler in `src/`, and "Fides" is used for the
 language in places (the language is Fid; Fides is the compiler). For current
 counts see [selfhost.md, Numbers](selfhost.md#numbers); for the current
-pipeline see [compiler-internals.md](../compiler-internals.md).
+pipeline see [compiler-internals.md](compiler-internals.md).
 
 ---
 
@@ -435,13 +435,13 @@ struct Point {
 
 impl Point {
     fn new(x: f64, y: f64) -> Point {
-        Point { x: x, y: y }
+        return Point { x: x, y: y };
     }
 
-    fn distance(&self, other: &Point) -> f64 {
+    fn distance(self: &Point, other: &Point) -> f64 {
         val dx = self.x - other.x;
         val dy = self.y - other.y;
-        (dx * dx + dy * dy).sqrt()
+        return sqrt(dx * dx + dy * dy);
     }
 }
 
@@ -479,7 +479,7 @@ See `docs/reference/syntax.md` for the complete syntax specification.
 
 ```
 fid/
-├── compiler/               # 80 self-hosted Fides modules (~361K lines) — THE COMPILER
+├── compiler/               # 65 self-hosted Fides modules (~361K lines) — THE COMPILER
 │   ├── main.fd / compiler.fd / inc.fd / csplit.fd  # CLI, pipeline, build cache, split C
 │   ├── lexer.fd / parser.fd / ast.fd / token.fd / comptime_eval.fd  # Front end
 │   ├── typechecker.fd / escape.fd / secrecy.fd / borrowck.fd / mono.fd / cowcheck.fd  # Checks
@@ -507,7 +507,7 @@ fid/
 │   ├── rc.fd               # Rc<T> / Arc<T> reference counting
 │   └── ...                 # 399 more modules (math, banking, medical, tensor, games, protocols, ...)
 │                           #   kernel.fd + uefi.fd moved to the fides-os project
-├── tests/                  # bootstrap (1,753 .fd), conformance (1,596), selfhost (57), nattools, projects, verify, tooling, ... + harness
+├── tests/                  # bootstrap (2,131 .fd), conformance (1,617), selfhost (47), nattools, projects, verify, tooling, ... + harness
 ├── examples/               # 12 example programs
 ├── release/                # Self-hosted compiler binaries + generated C (gitignored)
 │   └── fid.exe             # Self-hosted compiler (RELEASE=1 scripts/bootstrap.sh: 3 stages,
@@ -615,4 +615,4 @@ Run all tests: `./target/release/fidesc test` (or `cargo test --test harness`)
 See `docs/roadmap/roadmap.md` for the full phase status and milestones.
 See `docs/roadmap/roadmap.md` § Self-Host Details for the self-hosting plan.
 
-**Self-hosting status:** Bootstrap fixpoint verified (stage 2 == stage 3 byte-for-byte, checked on every release build; last verified Nov 8, 2026, before the ~2.3x Nov 10–19 growth). 80 self-hosted modules (~361K lines) in `compiler/*.fd`. The self-hosted compiler is the release compiler (`fid.exe`) and defines the language; the Rust compiler (`fidesc.exe`) is frozen.
+**Self-hosting status:** Bootstrap fixpoint verified (stage 2 == stage 3 byte-for-byte, checked on every release build; last verified Nov 8, 2026, before the ~2.3x Nov 10–19 growth). 65 self-hosted modules (~361K lines) in `compiler/*.fd`. The self-hosted compiler is the release compiler (`fid.exe`) and defines the language; the Rust compiler (`fidesc.exe`) is frozen.

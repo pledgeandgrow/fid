@@ -17,7 +17,7 @@ and a few genuinely different ideas (effects, `cap`, annotations).
 | `Box<dyn T>` / `&dyn T` | `dyn T` — cast with `x as dyn T` |
 | `match x { Some(v) => .. }` | `match x { Option::Some(v: i64) => { .. } }` |
 | `x.unwrap_or(0)` | `x ?? 0` |
-| `println!("{}", v)` | `println(f"{v}")` or `println(int_to_str(v))` — format strings without specifiers |
+| `println!("{}", v)` | `println(f"{v}")` or `println(int_to_str(v))`; specifiers exist (`f"{x:.2}"`, `f"{n:5}"`, `f"{x:#x}"`) but not `{:?}` |
 | `Vec<T>` methods | `Vec::new()`, `v.push`, `v.get`, `v.len` — same idea |
 | `use crate::m` | `use m;` or `use compiler::m;` (path namespaced) |
 | `#[derive]` | none — write the impl |
@@ -40,8 +40,9 @@ and a few genuinely different ideas (effects, `cap`, annotations).
 - **No explicit lifetimes.** Because references can't escape, the
   borrow checker doesn't need `<'a>` annotations anywhere.
 - **No macros.** No `macro_rules!`, no proc macros. `println` is a
-  builtin, not a macro; `f"{x}"` builds a `str` but has no format
-  specifiers (no `{:?}`, `{x:#x}`).
+  builtin, not a macro; `f"{x}"` builds a `str` and takes format
+  specifiers — `f"{x:.2}"`, `f"{n:5}"`, `f"{x:#x}"` — but no `{:?}`-style
+  debug form.
 - **`panic`, not `Result`-everywhere.** Functions that can fail
   recoverably return `Option`/`Result`, and `e?` passes a `None` or `Err`
   up as Rust's `?` does, but the default error path is `panic(...)` with a

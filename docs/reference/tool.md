@@ -35,7 +35,7 @@ binaries. Dispatch is in compiler/main.fd (docs/file-analysis/main.md).
 | `lint <file>` | unused functions and imports, `unwrap()` outside tests | works (does not resolve `compiler::` imports) |
 | `fmt <file> [--check] [-w]` | formatter: prints the formatted source; `-w` rewrites the file, `--check` is a pass/fail (CRLF endings are not a difference) | corrupted files until Nov 15 (known-bugs 2g.6, fixed) |
 | `test [<file>] [--fail]` | a file's `test_*`/`bench_*` functions, or the suite / expected-fail list | works on Windows; without a file broken on POSIX |
-| `fuzz <file> [--seeds N]` | a test file's `fuzz_*(data: Vec<u8>)` targets on N deterministic inputs (1000; `test --fuzz`: 100), coverage-guided (the harness is built with `ccompile --fuzz-cov`); failing inputs are saved under `testdata/fuzz/<target>/` and replayed by every `fid test`: [docs/guides/fuzzing.md](../fuzzing.md) | new Nov 15 (TL1), checked by scripts/tl-check.sh |
+| `fuzz <file> [--seeds N]` | a test file's `fuzz_*(data: Vec<u8>)` targets on N deterministic inputs (1000; `test --fuzz`: 100), coverage-guided (the harness is built with `ccompile --fuzz-cov`); failing inputs are saved under `testdata/fuzz/<target>/` and replayed by every `fid test`: [docs/guides/fuzzing.md](../guides/fuzzing.md) | new Nov 15 (TL1), checked by scripts/tl-check.sh |
 | `fix <file> [--check]` | applies the suggested fixes (`val` -> `var`, a narrowing `as T`, a misspelled name, an unused import), each kept only when the program then has fewer errors (or as many, none on the fixed line); `--check` writes nothing | new Nov 15 (TL3) |
 | `test-rules [--smt <dir>]` | checks the rewrite rules on values; writes SMT obligations | works |
 | `qualify <file>` | safety evidence as JSON | works |

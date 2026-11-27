@@ -9,6 +9,11 @@ sessions; their docs say so). The open bugs that audit found are collected
 in `docs/reference/known-bugs.md` §2g. This table replaces the 2026-10-22/23
 one; that pass's record follows the template below.
 
+> **Nov 27 update:** `compiler/` has **65 modules, 361,317 lines** — the
+> retired PIR-era files were deleted since Nov 21 (see the Nov 21 note
+> below for which). 64 of the 65 have a page here (`lockcheck.fd` is the
+> one without); the pages for deleted modules were removed with them.
+>
 > **Nov 21 update:** `compiler/` has 80 modules (361,942 lines, `wc -l
 > compiler/*.fd`; 360,657 before debcee9 and 5fb5516, which grew 9 files
 > by +1,201 lines: compiler, comptime_eval, iropt, iropt_me, lower,

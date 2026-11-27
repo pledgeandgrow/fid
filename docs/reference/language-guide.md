@@ -40,7 +40,7 @@ commit (see [platforms](platforms.md)).
 | Capability security | Compile-time capability grants | None | None |
 | Dependency model | No LLVM; native Windows and Linux output needs no C compiler or linker (`fid emit`); other targets go through a C compiler | External (crates, LLVM) | External (libc) |
 | Codegen | Direct machine code (Windows x64; Linux x86-64, AArch64, RISC-V 64) or C99 | Via LLVM | Via gcc/clang |
-| Self-hosting | ✅ Achieved (80 modules, 360,657 lines, bootstrap fixpoint verified Nov 6 and Nov 8 — before the ~2.3x Nov 10–19 growth) | Yes | Yes |
+| Self-hosting | ✅ Achieved (65 modules, 361,317 lines, Nov 27; bootstrap fixpoint verified Nov 6 and Nov 8 — before the ~2.3x Nov 10–19 growth) | Yes | Yes |
 
 ### Design Philosophy
 
@@ -812,7 +812,7 @@ use http with { Net };
 Further safety rules: `@no-alloc` (sees `.push()`, `Vec::new()`, string `+`),
 `@no-recursion`, `@no-unbounded`, `@no-indirect` (no calls through function
 parameters), `@no-panic`, `@bounded-stack[(N)]`, `@firmware` (no OS runtime
-calls), `@tainted` (on parameters). There are 17 rules, each with a negative
+calls), `@tainted` (on parameters). There are 21 rules, each with a negative
 test: [safety-rules.md](safety-rules.md). `fid qualify <file.fd> [-o out.json]`
 writes JSON evidence (compiler and source hashes, check result, annotated
 functions, each rule with its requirement and tests). Its verdict is always
@@ -1467,8 +1467,8 @@ Fides has 403 stdlib modules (259,299 lines, Nov 19), plus 4 in
 ## 10. Self-Hosting
 
 **The Fides compiler is self-hosted.** The compiler has been rewritten from
-Rust (`src/*.rs`, 57 files, 114,184 lines) into Fides (`compiler/*.fd`, 80
-modules, 360,657 lines; Nov 21) and achieves a **bootstrap fixpoint**: the self-hosted
+Rust (`src/*.rs`, 57 files, 114,901 lines) into Fides (`compiler/*.fd`, 65
+modules, 361,317 lines; Nov 27) and achieves a **bootstrap fixpoint**: the self-hosted
 compiler reproduces byte-identical output across generations.
 
 ### Current State (Nov 6, 2026)

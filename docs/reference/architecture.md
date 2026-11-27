@@ -4,8 +4,8 @@
 **Targets (Nov 19):** working: IR interpreter (`fid run`), C codegen (`fid ccompile`, cross targets through `zig cc`), native Windows x64 PE (`fid emit`, compiler/pe_ir*.fd), native Linux AArch64 / RISC-V 64 / x86-64 static ELF (`fid emit --target aarch64-linux|riscv64-linux|x86_64-linux`, the machine layer compiler/nat_ir.fd + nat_enc.fd), Windows x64 on the machine layer (opt-in `fid emit --nat`), native WebAssembly (`fid wasm`, WASI preview 1; 316/344 suite tests), native macOS Mach-O and universal binaries (build, not run on a Mac), Cortex-M Thumb-2 (compiler/nat_thumb.fd), UEFI and multiboot images (`emit --uefi`/`--boot`). Experimental / incomplete: the retired PIR path, PIR-era ARM64/RISC-V assembly, bare-metal flat binary (`emit --bare`).
 
 > **Current state (Nov 21, 2026).** The release compiler is the self-hosted
-> `fid` (`compiler/*.fd`, 80 modules, 360,657 lines). The Rust compiler
-> `fidesc` (`src/*.rs`, 57 files, 114,184 lines) is frozen: it builds stage 1
+> `fid` (`compiler/*.fd`, 65 modules, 361,317 lines, Nov 27). The Rust compiler
+> `fidesc` (`src/*.rs`, 57 files, 114,901 lines) is frozen: it builds stage 1
 > of the bootstrap and runs the test harness. A fid built by fidesc runs out
 > of memory self-compiling the current tree (known-bugs 2g.79); on Nov 21
 > the tree was built in one step from a self-hosted stage 0 (the fid of
@@ -737,7 +737,7 @@ call merging and the library-facts file (`FID_LIBFACTS`,
 `FID_LIBFACTS_IN`) use; `FID_IROPT_ON=icf` folds functions with the same
 IR (WP19).
 
-**Not reached from `main.fd`** (Nov 21: 56 of the 80 modules are): the
+**Not reached from `main.fd`** (Nov 27: 58 of the 65 modules are; Nov 21 it was 56 of 80): the
 retired PIR path (pir, opt, regalloc, peephole, codegen_x64, codegen_arm64,
 codegen_riscv, pe, arm64_enc, riscv_enc, runtime_linux, runtime_arm64,
 runtime_riscv, coff, macho, codegen) and autograd, debugger, diag,

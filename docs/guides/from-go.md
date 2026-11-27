@@ -66,8 +66,9 @@ var v: i64 = task_result(t);
 
 ## What Go doesn't have that Fides does
 
-- Compile-time effect tracking: a function marked `pure`/`!read`/`!alloc`
-  is checked (and optimizers exploit it).
+- Compile-time effect tracking: a function declared `!{}` (pure),
+  `!{Read}`, `!{Alloc}` etc. has its inferred effects checked against the
+  declaration (and optimizers exploit it).
 - `@crashfree`/`@no-alloc` contracts on functions — closer to MISRA-style
   embedded discipline than anything in Go.
 - Borrow-checked mutation: two `&mut` aliases can't exist — data races

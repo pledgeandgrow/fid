@@ -304,7 +304,7 @@ FID=release/fid.exe JOBS=4 bash scripts/cross-test.sh aarch64-linux
 
 ```
 SELF-HOSTED COMPILER (primary source):
-  compiler/*.fd:  65 modules, 357,310 lines (Nov 27, be36317) — THE COMPILER. 58 are reached
+  compiler/*.fd:  65 modules, 361,317 lines (Nov 27 evening) — THE COMPILER. 58 are reached
                   from main.fd and all are called (export prefixes differ
                   from file names: irverify→ir_verify, iropt_me→ime_*,
                   csplit→cs_*, nat_ir→nat_*/ng_*, scribe→process_directory,
@@ -418,8 +418,8 @@ WINDOWS INSTALLER (fides.nsi's default VERSION is 0.8.0):
                  v0.8.5-unstable being prepared Nov 27 (be36317)
 
 TESTS:
-  tests/bootstrap/:  2,077 .fd (Nov 27, be36317) — 2,002 at top level (569
-                     with a `// expect-error` line; 613 named *_fail.fd),
+  tests/bootstrap/:  2,131 .fd (Nov 27 evening) — 2,056 at top level (586
+                     with a `// expect-error` line; 631 named *_fail.fd),
                      75 in subdirs: at_import, baseline, capability,
                      decl_lib, diag_dup, diagnostics, effects, golden,
                      nattools, race_lib, regions, safety, same_name_lib,

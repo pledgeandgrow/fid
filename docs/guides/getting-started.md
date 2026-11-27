@@ -10,12 +10,15 @@ or build from source:
 ```
 git clone https://github.com/pledgeandgrow/fid.git
 cd fid
-cargo build --release
+cargo build --release        # builds fidesc, the Rust bootstrap compiler
+RELEASE=1 ./scripts/bootstrap.sh   # 3-stage self-host build → release/fid(.exe)
 ```
 
 The `fid` compiler is a single executable with the standard library
 beside it. No runtime to install, no virtual machine, no toolchain
-configuration.
+configuration. (`fidesc` is the frozen Rust bootstrap — it can `run`,
+`check` and `ccompile` the same programs; `fid` adds the native emitters
+and the extra checks.)
 
 ## Hello World
 
@@ -143,9 +146,9 @@ fn safe_add(a: i64, b: i64) -> i64 {
     return a + b;
 }
 
-// This function can read and write files
-fn process(path: str) -> str !read !write {
-    return read_file(path);
+// This function can do I/O — the inferred effect must be declared
+fn process(path: str) -> str !{IO} {
+    return read_file(path).unwrap_or("");
 }
 ```
 
@@ -176,7 +179,7 @@ One compiler, every target:
 ```
 fid emit hello.fd --target aarch64-linux -o hello_arm
 fid emit hello.fd --target riscv64-linux -o hello_riscv
-fid emit hello.fd --target wasm32-wasi -o hello.wasm   # via ccompile
+fid ccompile hello.fd --target wasm32-wasi -o hello.wasm   # wasm reaches through C today
 ```
 
 No per-target toolchain. The compiler emits machine code directly.
@@ -184,6 +187,6 @@ No per-target toolchain. The compiler emits machine code directly.
 ## Next Steps
 
 - [Language reference](../reference/reference.md)
-- [Migration guides](#) for C, Rust, Go, Python developers
+- Migration guides for [C](from-c.md), [Rust](from-rust.md), [Go](from-go.md), [Python](from-python.md), [Zig](from-zig.md) developers
 - [Standard library](../stdlib/) — 403 modules
 - [Examples](../../examples/) — working programs

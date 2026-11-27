@@ -10,8 +10,8 @@
 > shipped as `fid.exe`) and defines the language:
 > [docs/reference/reference.md](docs/reference/reference.md).
 >
-> **Stats (Nov 27, be36317; exact figures in [selfhost.md → Numbers](docs/reference/selfhost.md#numbers)):** 65 self-hosted `.fd` compiler modules (~357K lines) · 57 `.rs` bootstrap files (~114K lines) ·
-> 414 stdlib modules (~313K lines) · 2,077 `.fd` tests in `tests/bootstrap/` (2,002 top level, 569 with an `// expect-error` line) + 47 in `tests/selfhost/` + 1,617 in `tests/conformance/` + hundreds more in `tests/{projects,verify,nattools,tooling,...}` · 12 examples · 42 `.fd` files in `tools/`.
+> **Stats (Nov 27 evening; exact figures in [selfhost.md → Numbers](docs/reference/selfhost.md#numbers)):** 65 self-hosted `.fd` compiler modules (~361K lines) · 57 `.rs` bootstrap files (~114K lines) ·
+> 414 stdlib modules (~313K lines) · 2,131 `.fd` tests in `tests/bootstrap/` (2,056 top level, 586 with an `// expect-error` line) + 47 in `tests/selfhost/` + 1,617 in `tests/conformance/` + hundreds more in `tests/{projects,verify,nattools,tooling,...}` · 12 examples · 42 `.fd` files in `tools/`.
 > Fixpoint: VERIFIED byte-for-byte (stage 2 == stage 3, checked by `RELEASE=1 scripts/bootstrap.sh`): Nov 8 (67 MB of C) and Nov 21 (123,338,942 bytes, from the pinned self-hosted stage 0). Since then builds are one stage from a self-hosted stage 0 (Nov 25, Nov 27); the Nov 25 fid passes the leak gate (11/11) and 1,897 of 1,983 suite tests on `run`. A 3-stage bootstrap that starts cold from `fidesc` stops at stage 2 (out of memory, known-bugs 2g.79).
 > v1.0.0 released Sep 9, 2026 with Windows installer (Fides-Setup-1.0.0.exe, 2.5 MB). v0.8.0-unstable prerelease Nov 10, 2026 (Fides-Setup-0.8.0.exe, 6.6 MB); v0.8.1- to v0.8.4-unstable Nov 21–23; v0.8.5-unstable being prepared Nov 27 (be36317), its `fid.exe` a one-stage build from a self-hosted stage 0, not a 3-stage fixpoint. `fid version` base is now `1.0.0` (`1.0.0+dev` on dev builds).
 
@@ -92,7 +92,6 @@ and `AGENTS.md` first when working on the compiler.
 | [roadmap/external-roadmap.md](docs/roadmap/external-roadmap.md) | Goals no code can finish: security audits and a bug bounty, certification, production use, community, teaching, a foundation. |
 | [roadmap/safety-critical.md](docs/roadmap/safety-critical.md) | Safety-critical roadmap (IEC 62304 / DO-178C class work). |
 | [roadmap/security-roadmap.md](docs/roadmap/security-roadmap.md) | Security hardening guide and exploit-class coverage. |
-| [roadmap/bug-audit-2026-10-22.md](docs/roadmap/bug-audit-2026-10-22.md) | Dated bug-audit snapshot. |
 
 ### Analysis, proposals, verification
 | File | Description |

@@ -6,8 +6,10 @@
 
 The sections below are history. What is true now:
 
-- `fid` (self-hosted, `compiler/*.fd`, 80 modules, 360,594 lines) is the
-  release compiler. `fidesc` (Rust, `src/*.rs`, 57 files) is frozen: it
+- `fid` (self-hosted, `compiler/*.fd`) is the
+  release compiler — 80 modules/360,594 lines on Nov 20, **65 modules,
+  361,317 lines on Nov 27** (the retired PIR-era files were deleted since).
+  `fidesc` (Rust, `src/*.rs`, 57 files) is frozen: it
   builds stage 1 and runs the test harness. **Nov 20: fidesc compiles the
   Nov 19 tree again** (7 fixes in `src/` — see the Nov 20 commits) after
   five days in which no binary could parse the current stdlib at all.
@@ -46,7 +48,7 @@ The sections below are history. What is true now:
   still completing when this was written.
 - Last full suite: Nov 2 (`fidesc test`): interpreter 339/339, C 343/343, PE
   345/345, expected-fail 89/89 — on a suite a third of today's size
-  (1,752 bootstrap + 1,596 conformance programs). The fidesc interpreter
+  (2,131 bootstrap + 1,617 conformance programs on Nov 27). The fidesc interpreter
   predates the counted-string stdlib: `str_len`/`str_slice`-family calls
   panic under `fidesc run` (a pre-existing gap, not a regression — nothing
   ran before the Nov 20 fixes); C and PE lanes are the signal until the

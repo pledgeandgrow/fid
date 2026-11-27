@@ -5,7 +5,7 @@
 
 > **Implementation Status:** This document describes the language design, with implementation status marked in places (✅ working / ⚠️ partial / ❌ parsed-only or planned). The language is what the self-hosted compiler `fid` accepts; [reference.md](reference.md) describes it rule by rule from the compiler source and is right where this document disagrees. See `features.md` for the feature matrix and `architecture.md` for the compiler pipeline.
 >
-> **Self-hosting status (Nov 21, 2026):** The Fides compiler is self-hosted: 80 modules (360,657 lines, Nov 21), bootstrap fixpoint (stage 2 C == stage 3 C, 49 MB on Nov 6, 67 MB on Nov 8) checked on every release build; not re-verified on the current tree (known-bugs 2g.79). (First reached in session 15 with 25 modules.) Counts: [selfhost.md → Numbers](selfhost.md#numbers).
+> **Self-hosting status (Nov 27, 2026):** The Fides compiler is self-hosted: 65 modules (361,317 lines, Nov 27; 80 modules/360,657 lines on Nov 21, before the retired PIR-era files were deleted), bootstrap fixpoint (stage 2 C == stage 3 C, 49 MB on Nov 6, 67 MB on Nov 8) checked on every release build; not re-verified on the current tree (known-bugs 2g.79). (First reached in session 15 with 25 modules.) Counts: [selfhost.md → Numbers](selfhost.md#numbers).
 >
 > **Tier 3 OS features (session 16):** inline asm clobber lists, bare-metal mode (`--bare`; there is no `--no-std` flag), cross-compilation target dispatch. `stdlib/uefi.fd` and `stdlib/kernel.fd` moved to the fides-os project; `fid emit --bare` writes Multiboot flat binaries that bare-metal.yml boots under QEMU (platforms.md).
 
@@ -1864,11 +1864,11 @@ impl Drawable for Circle {
 **New:**
 ```fides
 cap Drawable {
-    fn draw(&self);
+    fn draw(self: &Self);
 }
 
 impl Drawable for Circle {
-    fn draw(&self) {
+    fn draw(self: &Circle) {
         println("Drawing circle");
     }
 }
@@ -1931,7 +1931,7 @@ pf max<T>(a: T, b: T) -> T where T: Ord {
 
 **New:**
 ```fides
-fn max<T>(a: T, b: T) -> T where T: Ord {
+fn max<T: Ord>(a: T, b: T) -> T {
     if a > b { return a; } else { return b; }
 }
 ```
@@ -1948,9 +1948,9 @@ pf read_file(path: &str) -> Result<String, Error> {
 
 **New:**
 ```fides
-fn read_file(path: &str) -> Result<String, Error> {
-    val content = file_read(path)?;
-    return content;
+fn load(path: str) -> Option<str> {
+    val content = read_file(path)?;
+    return Option::Some(content);
 }
 ```
 
@@ -1988,10 +1988,10 @@ impl Point {
         return Point { x, y };
     }
 
-    fn distance(&self, other: &Point) -> f64 {
+    fn distance(self: &Point, other: &Point) -> f64 {
         val dx = self.x - other.x;
         val dy = self.y - other.y;
-        return (dx * dx + dy * dy).sqrt();
+        return sqrt(dx * dx + dy * dy);
     }
 }
 ```
@@ -2026,14 +2026,15 @@ pf main() -> i64 {
 
 **New:**
 ```fides
-async fn fetch_data(url: &str) -> String {
-    return http_get(url).await;
+async fn fetch_data(u: str) -> Future<HttpResponse> {
+    // an `async fn`'s declared result is `Future<T>`; its body returns `T`
+    return http_get_url(u);
 }
 
 fn main() -> i64 {
-    // a dropped handle is an error (CA6): detach the task by name, or keep
-    // the handle and await it
-    spawn detached fetch_data("https://example.com");
+    // `await e` is a prefix operator on `Future<T>` and gives `T`
+    val r: HttpResponse = await fetch_data("https://example.com");
+    println(r.status);
     return 0;
 }
 ```
@@ -2054,11 +2055,11 @@ handle !IO {
 
 **New:**
 ```fides
-handle !IO {
+handle {
     val data = read_input();
     process(data);
 } with {
-    !IO(e) => {
+    IO.read(e) => {
         println(f"IO error: {e}");
     }
 }
@@ -2076,10 +2077,9 @@ comptime {
 
 **New:**
 ```fides
-comptime {
-    val types = @reflect(Widget);
-    @generate(types);
-}
+// `comptime e` / `comptime { stmts }` are evaluated while compiling;
+// reflection is `comptime type_name(T)`, `is_struct(T)`, etc.
+val name: str = comptime type_name(Widget);
 ```
 
 ### 5.14 Region block
@@ -2095,7 +2095,7 @@ region {
 **New:**
 ```fides
 region {
-    val buf = Buffer::new();
+    val buf = Vec::new();
     process(&buf);
 }  // buf is freed here
 ```
@@ -2113,10 +2113,16 @@ pf write_file(path: &str) -> Result<(), Error> {
 
 **New:**
 ```fides
-fn write_file(path: &str) -> Result<(), Error> {
-    val f = file_open(path)?;
-    defer file_close(f);
-    return write_data(f);
+fn write_file(path: str) -> i64 {
+    match File::create(path) {
+        Option::Some(f) => {
+            var w: File = f;
+            defer { w.close(); }
+            w.write_line("data");
+            return 0;
+        }
+        Option::None => { return -1; }
+    }
 }
 ```
 
@@ -2284,11 +2290,11 @@ Binary output is identical.
 
 ```fides
 use core;
-use core::io;
+use io;
 
 cap Shape {
-    fn area(&self) -> f64;
-    fn name(&self) -> &str;
+    pf area(&self) -> f64;
+    pf name(&self) -> &str;
 }
 
 struct Circle {
@@ -2296,12 +2302,12 @@ struct Circle {
 }
 
 impl Shape for Circle {
-    fn area(&self) -> f64 {
-        return 3.14159 * self.radius * self.radius;
+    pf area(&self) -> f64 {
+        ret 3.14159 * self.radius * self.radius;
     }
 
-    fn name(&self) -> &str {
-        return "circle";
+    pf name(&self) -> &str {
+        ret "circle";
     }
 }
 
@@ -2311,27 +2317,27 @@ struct Rectangle {
 }
 
 impl Shape for Rectangle {
-    fn area(&self) -> f64 {
-        return self.width * self.height;
+    pf area(&self) -> f64 {
+        ret self.width * self.height;
     }
 
-    fn name(&self) -> &str {
-        return "rectangle";
+    pf name(&self) -> &str {
+        ret "rectangle";
     }
 }
 
-fn print_shape(shape: &dyn Shape) {
+pf print_shape(shape: &dyn Shape) {
     println(f"{shape.name()}: {shape.area()}");
 }
 
-fn main() -> i64 {
-    val circle = Circle { radius: 5.0 };
-    val rect = Rectangle { width: 3.0, height: 4.0 };
+pf main() -> i64 {
+    pv circle = Circle { radius: 5.0 };
+    pv rect = Rectangle { width: 3.0, height: 4.0 };
 
     print_shape(&circle);
     print_shape(&rect);
 
-    return 0;
+    ret 0;
 }
 ```
 
@@ -2339,11 +2345,11 @@ fn main() -> i64 {
 
 ```fides
 use core;
-use core::io;
+use io;
 
 cap Shape {
-    fn area(&self) -> f64;
-    fn name(&self) -> &str;
+    fn area(self: &Self) -> f64;
+    fn name(self: &Self) -> str;
 }
 
 struct Circle {
@@ -2351,11 +2357,11 @@ struct Circle {
 }
 
 impl Shape for Circle {
-    fn area(&self) -> f64 {
+    fn area(self: &Circle) -> f64 {
         return 3.14159 * self.radius * self.radius;
     }
 
-    fn name(&self) -> &str {
+    fn name(self: &Circle) -> str {
         return "circle";
     }
 }
@@ -2366,11 +2372,11 @@ struct Rectangle {
 }
 
 impl Shape for Rectangle {
-    fn area(&self) -> f64 {
+    fn area(self: &Rectangle) -> f64 {
         return self.width * self.height;
     }
 
-    fn name(&self) -> &str {
+    fn name(self: &Rectangle) -> str {
         return "rectangle";
     }
 }
@@ -2408,7 +2414,7 @@ programmer. Zero learning curve for the keywords.
 | Type alias        | `type`       | Rust/Go/Scala. Universal.                              |
 | Import            | `use`        | Kept. Short, Rust/Zig convention. Already familiar.    |
 | Uninit var        | `var x: T;`  | Zig/C/Carbon. No extra keyword. Definite assignment.   |
-| Semicolons        | Required     | Rust/C/Go. Explicit, unambiguous.                      |
+| Semicolons        | Optional     | Statement boundaries are inferred at newlines.          |
 | Closures          | `fn(x) { }`  | Rust-style. Consistent with function keyword.          |
 | Attributes        | `@...`       | Current Fides. Short, distinct from comments.          |
 | String interp     | `f"..."`     | Python f-string. AI-familiar, explicit.                |

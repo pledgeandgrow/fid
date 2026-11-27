@@ -3,7 +3,7 @@
 > **Status (Nov 27, 2026):** the self-hosted compiler `fid` (`compiler/*.fd`,
 > 65 modules, 357,310 lines at be36317; 58 reached from `main.fd`, Nov 24) is the release
 > compiler and defines the language ([reference.md](reference.md)); the Rust
-> compiler `fidesc` (`src/*.rs`, 57 files, 114,899 lines) is frozen and builds
+> compiler `fidesc` (`src/*.rs`, 57 files, 114,901 lines) is frozen and builds
 > stage 1 and runs the test harness. `RELEASE=1 CC="zig cc"
 > ./scripts/bootstrap.sh` builds `fid` in three stages, each stage's C split
 > into 8 units compiled at -O2 when the previous stage has `fid split-c`,
@@ -125,19 +125,19 @@ OP23's vblk search lowering are the known left items.
 
 | Component | Files | Lines |
 |-----------|-------|-------|
-| Self-hosted compiler (`compiler/*.fd`) | 65 (58 reached from `main.fd`, Nov 24) | 357,310 (348,330 on Nov 24) |
-| Rust compiler (`src/*.rs`, frozen) | 57 | 114,899 |
-| Stdlib (`stdlib/*.fd`) | 403 top level (396 with a `module` line); 414 with the runtimes | 283,248 top level; 312,667 with the runtimes (259,299 before the formatter repair was applied to the tree, a1bede6) |
+| Self-hosted compiler (`compiler/*.fd`) | 65 (58 reached from `main.fd`, Nov 24) | 361,317 (Nov 27; 348,330 on Nov 24) |
+| Rust compiler (`src/*.rs`, frozen) | 57 | 114,901 |
+| Stdlib (`stdlib/*.fd`) | 403 top level (396 with a `module` line); 414 with the runtimes | 283,161 top level; 313,456 with the runtimes (259,299 before the formatter repair was applied to the tree, a1bede6) |
 | Native runtimes (`stdlib/pe_runtime/`, `stdlib/linux_runtime/`) | 4 + 7 | 12,258 + 17,161 |
-| Tools (`tools/*.fd`) | 42 (12 on Nov 22; the AD4 ports of Nov 25 and 4 helper libraries) | 40,406 |
-| Tests (`tests/bootstrap/`) | 2,077 .fd (2,002 top level: 569 with an `// expect-error` line, 613 named `*_fail.fd`; 75 in subdirs) | — |
+| Tools (`tools/*.fd`) | 42 (12 on Nov 22; the AD4 ports of Nov 25 and 4 helper libraries) | 40,588 |
+| Tests (`tests/bootstrap/`) | 2,131 .fd (2,056 top level: 586 with an `// expect-error` line, 631 named `*_fail.fd`; 75 in subdirs) | — |
 | Tests (`tests/selfhost/`) | 47 .fd | — |
-| Tests (`tests/conformance/`) | 1,617 .fd (each checks a rule of reference.md §1–§13) | — |
+| Tests (`tests/conformance/`) | 1,617 .fd (each checks a rule of reference.md §1–§13; 4 helper modules live in `_modules/`) | — |
 | Tests (`tests/leaks/`) | 11 .fd + .expected (`scripts/leak-check.sh`) | — |
-| Tests (`tests/nattools/`) | 75 .fd + 98 .sh check scripts | — |
+| Tests (`tests/nattools/`) | 79 .fd + 102 .sh check scripts | — |
 | Tests (`tests/projects/`) | 52 .fd | — |
 | Tests (`tests/verify/`) | 49 .fd | — |
-| Tests (`tests/tooling/`) | 14 .fd + 143 scripts (135 `*-check.sh`) | — |
+| Tests (`tests/tooling/`) | 15 .fd + 146 scripts | — |
 | Examples (`examples/`) | 12 .fd | — |
 | Installer (`installer/`) | 5 tracked (built `*-Setup-*.exe` files are git-ignored) | — |
 | Compiler module docs (`docs/file-analysis/`) | 64 of 65 modules (lockcheck missing) | — |
@@ -145,7 +145,7 @@ OP23's vblk search lowering are the known left items.
 
 | Measurement | Value |
 |-------------|-------|
-| Last full suite (Rust harness, `fidesc` as the compiler) | Nov 2: interp 339/339, C 343/343, PE 345/345, expected-fail 89/89 — the suite has grown since (2,077 bootstrap files on Nov 27); a fresh full run is part of the 1.0 release prep |
+| Last full suite (Rust harness, `fidesc` as the compiler) | Nov 2: interp 339/339, C 343/343, PE 345/345, expected-fail 89/89 — the suite has grown since (2,131 bootstrap files on Nov 27); a fresh full run is part of the 1.0 release prep |
 | Full suite with `fid` as the compiler | Nov 25, `run` only, the fid built from the 905d756b tree: 1,897 of 1,983 pass; 82 of the 86 failures fail the same with the earlier compiler, the other 4 are timeouts (300 s limit) with correct output (noise_proto 262 s new vs 241 s old alone). C and native lanes: not finished (the Nov 27 run was still going when the gate stopped) |
 | Native Linux suite (`NATIVE=1 scripts/cross-test.sh`, Nov 9) | AArch64 273, RISC-V 271, x86-64 272 of 317 match the interpreter |
 | Windows x64 on the machine layer (`fid emit --nat`, Nov 9) | 301 of 338 |
@@ -2506,7 +2506,7 @@ fid/
 ├── docs/reference/       # This documentation (selfhost.md, known-bugs.md, ...)
 ├── release/              # Self-hosted build artifacts (gitignored)
 ├── src/                  # Rust reference compiler, frozen (57 .rs files, 114,423 lines)
-├── stdlib/               # Fides standard library (414 .fd modules, 312,544 lines)
+├── stdlib/               # Fides standard library (414 .fd modules, 313,456 lines)
 ├── tests/bootstrap/      # Language tests (2,037 .fd files)
 ├── tests/selfhost/       # Self-host module tests (46 .fd files)
 │   └── baseline/         # verify-selfhost baseline (test_results.txt)
@@ -2892,8 +2892,8 @@ defer {
 #### Syntax
 
 ```fides
-let x = maybe_fails()?;       // Try operator
-let y = try {                 // Try block
+val x = maybe_fails()?;       // Try operator
+val y = try {                 // Try block
     ...
 };
 ```

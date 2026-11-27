@@ -130,8 +130,15 @@ character (`read_char_lit`): `val c: i64 = 'A';` gives 65. Escapes: `\n` `\t`
   literally; the closing delimiter is `"` followed by the same number of `#`.
 - Format strings `f"…{expr}…"`: text outside braces takes the same escapes as a
   plain string. Each `{…}` (braces may nest) is lexed and parsed again as an
-  expression (`parser.fd:parse_fstring_parts`). The result has type `str`.
-  There is no escape for a literal brace. Each expression is type-checked; it
+  expression (`parser.fd:parse_fstring_parts`); a string, f-string, raw
+  string or char literal inside it is read whole, so a `}`, `{`, `"` or
+  `:` in it belongs to the literal (`f"{str_len("a}c")}"` is `3`,
+  `f"{c == ':'}"` compares with `':'`; `lexer.fd:lex_fstr_expr_end`), and
+  a lex error inside it is an error of the program. The result has type
+  `str`. A literal brace in the text is written as an escape: `\x7B` or
+  `\u{7b}` for `{`, `\x7D` or `\u{7d}` for `}` (`f"\x7Bx\x7D"` is the text
+  `{x}`). `{{` is not an escape: it opens a nested block, so `f"{{x}}"`
+  prints the value of `x`. Each expression is type-checked; it
   may be text, a number, a bool or a `Vec` — a struct (or a reference to one)
   is an error, since it has no text form
   (`TypeChecker_check_fstring_part`; `test_frontend_fstring.fd`,
@@ -1735,64 +1742,35 @@ and `effects/test_effect_ho_instantiation.fd` is accepted by both.
 
 ## 15. Docs that disagree with the compiler
 
-- `docs/reference/syntax.md:157`: the suffix literal `42i64` does not lex as
-  one literal; there are no literal suffixes (§1.5).
-- `docs/reference/syntax.md:164`: `b"bytes"` byte strings do not exist (§1.8).
-- `docs/reference/syntax.md:194-198`: `isize`, `usize` and `char` are not
-  types (§3.1).
-- `docs/reference/syntax.md:217`: `vec![…]` does not parse.
-- `docs/reference/syntax.md:237-244` (and `:823`): tuple structs, unit structs
-  and struct-like enum variants do not parse (§2.2, §2.3).
-- `docs/reference/syntax.md:426` (and `:990`, `:1152`): `where` clauses do not
-  parse (§7.1).
-- `docs/reference/syntax.md:433` (and `:1077`, `:1291`): `.await` is not a
-  postfix operator; `await e` is prefix (§4.1).
-- `docs/reference/syntax.md:504-506`: `val Point { x, y } = p` and
-  `val Some(v) = o` do not parse; only tuple destructuring does (§5.1).
-- `docs/reference/syntax.md:535` and `docs/reference/language-guide.md:390`: no
-  move check exists for `String`/`Vec`; only `@linear` types move (§8.1).
-- `docs/reference/syntax.md:634`: a statement `match` needs block arms;
-  `Red => 0xFF0000,` is a parse error there (§6).
-- `docs/reference/syntax.md:655`: struct-like patterns
-  `Shape::Circle { radius }` do not parse (§6).
-- `docs/reference/syntax.md:669`: exhaustiveness is checked only for enums and
-  `bool` (§6).
-- `docs/reference/syntax.md:681`: `for (i, x) in …` does not parse (§5.4).
-- `docs/reference/syntax.md:715`: `loop` is not an expression (§5.4).
-- `docs/reference/syntax.md:741`: `defer close(file);` does not parse; `defer`
-  takes a block (§5.5).
-- `docs/reference/language-guide.md:250`: `val x = 42;` is an `i64`, not an
-  `i32` (§3.4).
-- `docs/reference/language-guide.md:282` and `:291`: `&self` is not valid
-  parameter syntax (§2.1).
-- `docs/reference/language-guide.md:331`: `str` ↔ `i64` is allowed only in the
-  runtime layer and the compiler's own modules; in a program it is a type error
-  (§3.3).
-- `docs/reference/language-guide.md:433`: `push` during a `for` over the same
-  `Vec` is rejected by the borrow checker (`test_iter_invalidation_fail.fd`).
-- `docs/reference/language-guide.md:561`: `str` has no `to_string` method, and
-  a reference to a region-local value cannot be returned (§8.4, §13.4).
-- `docs/reference/language-guide.md:699`: `FileIO` is not an inferred effect; the
-  function would get `IO` and be rejected (§9.1).
-- `docs/reference/language-guide.md:712`: `Read` and `Write` are not
-  capabilities the compiler checks; the checked ones are `IO`, `FS`, `Net`,
-  `Spawn`, `Alloc` (§9.2).
-- `docs/reference/language-guide.md:718`: a `sandbox` denies all capabilities,
-  granted or not (§9.3).
-- `docs/reference/language-guide.md:720` and `docs/reference/features.md:222`:
-  capabilities are checked per call by name and do not propagate through the
-  call graph (§9.2).
-- `docs/reference/language-guide.md:731`: `@conserve` is money conservation
-  (effects, floats, `@conserve` callees, no minting), not "no leaks" (§11).
-- `docs/reference/language-guide.md:736`: `@sync` is recorded and not checked
-  (§11).
-- `docs/reference/features.md:171`: default arguments are implemented (and
-  named arguments) (§2.1).
-- `docs/reference/features.md:209-210`: `use m::{a}` and `use m::*` import the
-  whole module; the list does not select (§2.9).
-- `docs/reference/features.md:198` and `:262`: no region use-after-free check
-  exists. The type checker writes `freed_regions` and never reads it, and the
-  interpreter's region end only pops a stack of names. A region is a scope
-  (§8.6).
-- `docs/reference/features.md:247`: fixed Nov 4 — `fid` now instantiates
-  effects per call site (§9.1).
+The disagreements listed here on Nov 24 have all been corrected in the
+named documents (re-checked Nov 27): literal suffixes, byte strings,
+`isize`/`usize`/`char`, `vec![…]`, tuple/unit structs, struct-like enum
+variants and patterns, `where` clauses, postfix `.await`, named-struct
+destructuring, move checks on `str`/`Vec`, statement-`match` arm
+syntax, exhaustiveness scope, `for (i, x)`, `loop` as an expression and
+`defer expr;` in `syntax.md`; the `i32` default literal, `&self`,
+`str`↔`i64` casts, iterator invalidation, `to_string`, the `FileIO`
+effect, `Read`/`Write` capabilities, sandbox grants, capability
+non-propagation, `@conserve` and `@sync` in `language-guide.md`; and
+default arguments, selective `use` lists, the region use-after-free
+note and per-call-site effects in `features.md`. The stale "New"
+examples in `syntax.md`'s migration record were also fixed Nov 27:
+`where` clause, `.await`, `defer expr;`, `Result<String, Error>` +
+misplaced `?`, `&self` method receivers (§5.3, §5.9 and §9.2's
+before/after block, which had also lost its old-syntax "before"),
+invented `handle !IO`, `@reflect`/`@generate`, `Buffer::new`,
+`file_open`/`file_close`/`write_data`, `http_get`'s arity and
+non-Future return, `use core::io`, and "semicolons required".
+
+Docs that still disagree or describe planned behavior:
+
+- `docs/guides/from-rust.md` and `docs/guides/from-python.md` claimed
+  f-strings have no format specifiers; they do
+  (`[fill][<|>|^][#][0][+][width][.precision][x|X|b|o]`, §1.8) — fixed
+  Nov 27.
+- `docs/reference/features.md` rows track the frozen `fidesc` where a
+  `fid`/`fidesc` column split is not given; where it matters the row
+  says so (§14).
+- `docs/reference/memory-model.md` said spawn/channel sends share the
+  collection with the sender; sends are deep copies since CA5 — fixed
+  Nov 27.
