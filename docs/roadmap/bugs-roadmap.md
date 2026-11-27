@@ -7012,3 +7012,26 @@ Same rules as the first run:
       Confirmed Nov 27 (`fid check` clean, `fid run` crash, release
       fid.exe); TypeChecker_check_enum_pattern read in the current source
       and the `scrut == ""` path confirmed open. Confidence: high.
+- [ ] BG490. **A generic call whose argument is a method call takes the
+      type parameter from the method's receiver, not its result:
+      `assert_eq(0, q.len())` with `q: Vec<str>` is instantiated as
+      `assert_eq__Vec__str`.** compiler/mono.fd / compiler/typechecker.fd
+      (inference of a call's type arguments from an argument that is
+      itself a call): `fid explain k3.fd --stages main` lowers both
+      `assert_eq(q, q)` and `assert_eq(0, q.len())` to
+      `call assert_eq__Vec__str(...)`, and the second one hands the
+      literal `0` and the length to a body that compares two vectors.
+      It passes while both words happen to compare equal as vectors and
+      crashes otherwise: `val p = args_positionals(); assert_eq(0,
+      p.len()); println("ok");` (`use args;`) dies "Panic: Invalid
+      memory access (null or dangling pointer)" on run, emit and
+      ccompile with every build since the Nov 25 tree (release/fid-dev.exe
+      of Nov 25 21:50, the Nov 27 builds); the pinned Nov 21 stage 0
+      prints "ok". Found by the doc examples step of CI (`scripts/doctest.py
+      stdlib`: stdlib/args.fd example 16), which no hosted runner has
+      reached from Nov 23 to Nov 27 (the build step before it died).
+      `assert_eq(args_positionals_len(), 0)` (a plain call) is right: the
+      receiver's type is taken when the argument is a method call. Same
+      family as BG271 (the parameter taken from the wrong argument).
+      Confirmed Nov 27 on release/fid-night.exe and release/stage0/fid.exe;
+      the IR read with `fid explain --stages main`. Confidence: high.
