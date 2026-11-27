@@ -41,6 +41,10 @@ BG204, BG227), 35 open. BG242-BG246, found Nov 25, are open.
 Status Nov 27 (checkbox count at be36317, the v0.8.5-unstable commit):
 BG128-BG241: 80 done `[x]`, 3 partly done `[~]` (BG183, BG204, BG227), 31
 open; BG242-BG246 open. The whole file: 207 `[x]`, 3 `[~]`, 36 `[ ]`.
+Status Nov 27 (night run, 07:25): BG128-BG241: 93 done `[x]`, 3
+partly `[~]` (BG183, BG204, BG227), 18 open; BG242 done, BG243-BG246
+open; BG247 done; BG248-BG253 open. The whole file: 222 `[x]`, 3
+`[~]`, 28 `[ ]`.
 
 Status markers as in the other roadmaps: `[ ]` open, `[~]` partly done,
 `[x]` done.
@@ -1974,12 +1978,34 @@ names are the reference.
       `&` on doubles); `f <<= 2` panics "Arithmetic error (float, int)" under
       `run`. reference.md §4.2's wording covers these operators too and needs
       the same correction. Confirmed Nov 24. Confidence: high.
-- [ ] BG202. **`<` and `>` on two `str` values are accepted, and the backends
+      Nov 27 (night): the expression form is done and validated with the
+      build of 06:35 (tree 2e3a15e9): test_bg201_float_bitwise_fail is
+      rejected ("`&` takes integers, got f64"), test_bg201_int_bitwise and
+      tests/conformance/s4_2_bitwise_float_rejected pass on run, ccompile
+      and emit; reference §4.2 says so. The compound form is NOT validated:
+      its first check (f148a589) also rejected a plain `x = ...` on a
+      float, which the build of 07:10 showed on stdlib/core.fd:8662 and
+      30 places of the compiler's own source; 647b4368 makes it look at
+      the five compound operators only (stage-0 check clean; no build was
+      left in that run). Left, with the next build: test_bg201_float_shift_
+      assign_fail rejected, a program with plain float assignments passes
+      and `check compiler/main.fd` is clean (build/verify-nov27/
+      validate-batch3.sh, steps 1, 2, 6).
+- [x] BG202. **`<` and `>` on two `str` values are accepted, and the backends
       disagree.** The type checker accepts an ordering of two strings, which
       reference.md §4.2 does not define (only `==`). `fid run` panics
       "Arithmetic error (str, str)"; C compares the addresses (`"abc" < "abd"`
       true, `"b" > "abc"` false). Either reject it or define it as a byte
       comparison everywhere. Confirmed Nov 24. Confidence: high.
+      Fixed Nov 27 (night) (b03479b8): `< > <= >=` on two `str` are a
+      type error in a program ("cannot order two str values with `<`";
+      Fix: `str_compare(a, b)` gives -1, 0 or 1); reference §4.2.
+      test_bg202_str_order_fail rejected, test_bg202_str_compare and
+      tests/conformance/s4_2_str_order_rejected pass on run, ccompile and
+      emit with the build of 06:35; 164 of the 169 related programs
+      (conformance s4_2, s2_8, s7; *trait*, *generic*, *alias*) pass, the
+      5 others are helper files that fail the same with the compiler of
+      Nov 25.
 - [ ] BG203. **`Option::Some(x)` built from a `for x in v` loop variable leaks
       its payload.** lower.fd `Lowerer_lower_for` (Vec branch) /
       `Lowerer_lower_for_vec` record no AST type for the loop variable, so
@@ -2153,13 +2179,24 @@ names are the reference.
       triggers, ties both ways, a negative value, zero, add and mul with a
       negative scale): passes on run, ccompile and emit with the fid-dev of
       Nov 25; test_decimal and test_std_tariff unchanged.
-- [ ] BG218. **Two `impl Show for P` in one file are accepted; the later one
+- [x] BG218. **Two `impl Show for P` in one file are accepted; the later one
       wins.** The CL7 conflict check (compiler.fd) compares only modules.
       Confirmed Nov 24. Confidence: high.
-- [ ] BG219. **A generic function with a bound taken as a value skips the
+      Fixed Nov 27 (night) (9ec4af52, compiler.fd
+      `cc_find_trait_impl_conflicts`): a trait impl defined twice in the
+      user program, or twice in one imported module, is an error ("is
+      defined twice in this program"). test_bg218_duplicate_impl_fail is
+      rejected with the build of 06:35; the trait_conflict tests of the
+      related run are as before.
+- [x] BG219. **A generic function with a bound taken as a value skips the
       bound and fails at run time.** `val f = need; f(5)` with `fn need<T:
       A>(x: T)` is accepted and panics "CallPtr: null function value" (C exits
       127). Confirmed Nov 24. Confidence: high.
+      Fixed Nov 27 (night) (f0973224): a generic function taken as a
+      value is a type error ("the generic function 'need' cannot be taken
+      as a value"). test_bg219_generic_fn_value_fail rejected,
+      test_bg219_generic_fn_call passes on run, ccompile and emit with the
+      build of 06:35.
 - [x] BG220. **A generic struct whose fields are all `@send` is rejected by
       `spawn`.** typechecker.fd `TypeChecker_is_send_type`, Generic arm,
       allows only built-in types, so `spawn work(w)` with `w: Wrap<i64>` is
@@ -2327,6 +2364,12 @@ names are the reference.
       codegen_c.fd `p_read_stdin__raw` calls `malloc(n + 1)` = `malloc(0)`,
       skips the read loop and writes `buf[0] = 0`; other negative `n` are
       caught only through the NULL return. Read only. Confidence: medium.
+      Nov 27 (night): `p_read_stdin__raw` returns NULL for a negative
+      `n` (cb8f8b69, codegen_c.fd). NOT validated: the test
+      test_bg231_read_stdin_negative (`//@ backends: ccompile`; its
+      marker stood inside the expected block until 5c86e3dd) has not run
+      on ccompile with a built compiler. Left: validate-batch3.sh step 1
+      with the next build.
 - [ ] BG232. **disasm has no row for several instructions the encoders emit.**
       disasm.fd encoding table: x86 `blsmsk`/`blsi` (TG7; only `blsr` has a
       row); AArch64 pre/post-indexed `ldr`/`str` (TG8, e.g. `f8008528`), FP
@@ -2362,16 +2405,28 @@ names are the reference.
       called: `check` passes; the same code as a named or spawned function is
       rejected. A real deadlock only when the closure runs on another thread.
       Confirmed Nov 24. Confidence: high.
-- [ ] BG236. **mono: function-type mangling is ambiguous.** mono.fd
+- [x] BG236. **mono: function-type mangling is ambiguous.** mono.fd
       `mangle_type`, `Type::Func`: `"fn_" + params + "_" + ret` with no count,
       so `fn(fn(i64) -> f64, i64) -> i64` and `fn(fn(i64, f64) -> i64) -> i64`
       both become `id__fn_fn_i64_f64_i64_i64` (one instance for two `T`). No
       wrong output today (every function value is one word); BG85 gave tuples
       and arrays a count but not `Func`. Confirmed Nov 24 (dump-ir).
       Confidence: high.
-- [ ] BG237. **`fid fmt --check file.fd` (flag before the file) reads the flag
+      Fixed Nov 27 (night) (0fcd0261): each part of a function type
+      carries its length (`fn_2_16_fn_1_3_i64_3_f64_3_i64_3_i64` and
+      `fn_1_22_fn_2_3_i64_3_f64_3_i64_3_i64`). Checked directly on
+      `mangle_type`: tests/nattools/mangle_func_unit.fd, which passes
+      through `fid run` (it runs the tree's own mono.fd) with the
+      compilers of Nov 25 and Nov 27. tests/selfhost/test_mono.fd no
+      longer compiles for reasons of its own (BG253), so its mangle lines
+      moved there (ac4ae268). Through ccompile and emit: validate-batch3
+      step 1 with the next build.
+- [x] BG237. **`fid fmt --check file.fd` (flag before the file) reads the flag
       as the file name** ("could not read file: --check", exit 1); `fid fmt
       file.fd --check` works. Confirmed Nov 24. Confidence: high.
+      Fixed Nov 27 (night) (b03479b8): `cmd_fmt` takes the file wherever
+      it stands among the flags. tests/tooling/fmt-flag-order-check.sh:
+      6 of 6 with the build of 06:35.
 - [x] BG238. **`Money_print` writes negative amounts wrong.** stdlib/money.fd:
       `Money_new(-5)` prints `$0.0-5` and `-105` prints `$-1.0-5` (want
       `-$0.05`, `-$1.05`). Confirmed Nov 24. Confidence: high.
@@ -2393,9 +2448,17 @@ names are the reference.
       itself (8160 bytes, equal to a shorter expansion over their common
       length) was checked once through ccompile: not a suite test, 255 HMACs
       do not finish in the interpreter.
-- [ ] BG240. **A cycle of type aliases overflows the checker's stack.** `type
+- [x] BG240. **A cycle of type aliases overflows the checker's stack.** `type
       A = B; type B = A;` recurses in `TypeChecker_resolve_type` until a stack
       overflow instead of an error. Confirmed Nov 24. Confidence: high.
+      Fixed Nov 27 (night) (b03479b8): `TypeChecker_resolve_type` follows
+      aliases in a loop, and a cycle is an error where the aliases are
+      registered ("type alias 'A' resolves to itself through 1 alias(es):
+      a cycle of type aliases"); reference §2.8. test_bg240_alias_cycle_
+      fail and test_bg240_alias_cycle_three_fail rejected,
+      test_bg240_alias_chain and tests/conformance/s2_8_alias_cycle_
+      rejected pass on run, ccompile and emit with the build of 06:35. An
+      alias of a reference type is still rejected: BG252.
 - [ ] BG241. **`select` drops a received value equal to its "not ready"
       sentinel.** lower.fd `Lowerer_lower_select_stmt` uses the in-band value
       -9223372036854775807 for "nothing ready"; a received value equal to it
@@ -2406,11 +2469,17 @@ names are the reference.
 
 ## Found while fixing the Nov 25 batch (TL2/TL4/TL5, the six bugs)
 
-- [ ] BG242. **The type checker accepts a `str` for an `i64` parameter.**
+- [x] BG242. **The type checker accepts a `str` for an `i64` parameter.**
       Seen at a `str_find_char(s, "x")` call (the second parameter is the
       character as `i64`): `fid check` gives no error and the call passes the
       string's address. Found Nov 25 while adding TL2 hints. Confidence:
       medium (the exact rule that lets it through is not located yet).
+      Nov 27 (night): no longer reproduces. A `str` for an `i64`
+      parameter is an error ("function 'take' parameter 1 expects 'i64',
+      got 'str'"): test_bg242_str_for_int_param_fail, rejected with the
+      build of 06:35 and with the compiler of Nov 25. The entry's
+      `str_find_char` no longer exists in the library. Which change
+      closed it was not looked up.
 - [ ] BG243. **`tests/tooling/dbg_decl_lines_check` fails: an inlined
       function has no DWARF subprogram**, so its declaration line is missing
       from the debug info. Found Nov 25 (TL5). Same cause on pe_ir: `fid emit
@@ -2485,6 +2554,17 @@ names are the reference.
       `p_hlt` (test_kernel_hello): "not available in native Windows
       executables yet" or "undefined symbol". Found Nov 27 by the same
       comparison. Confidence: high.
+- [ ] BG252. **An alias of a reference type cannot be dereferenced.**
+      `struct A { x: i64 }` `type Ref = &A;` `fn f(r: Ref) -> i64 { return
+      *r.x; }` is rejected ("cannot dereference non-reference type Ref"),
+      with the compiler of Nov 25 as with that of Nov 27 (night). Found
+      Nov 27 (night) while writing BG240's test, which keeps to aliases of
+      value types. Confidence: high.
+- [ ] BG253. **tests/selfhost/test_mono.fd no longer compiles** ("no
+      method 'len' on struct 'GenericFuncMap'"), with the compiler of Nov
+      25 as with that of Nov 27 (night): the monomorphizer's own test
+      checks nothing. Found Nov 27 (night) through BG236. Confidence:
+      high.
 
 ## Found and fixed while reviewing (Nov 22)
 

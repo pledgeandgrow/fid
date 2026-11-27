@@ -135,7 +135,7 @@ the file), `deferred` (cannot be done on this machine), with the reason.
 | 12 | BG232 | disasm has no row for instructions the encoders emit | `compiler/disasm.fd` | the entry's list (x86 `blsmsk`/`blsi`, AArch64 pre/post-index and FP loads, RISC-V vector) decodes with the right length | todo |
 | 13 | BG212 | comptime does not evaluate float/int casts | `compiler/comptime_eval.fd` (`Expr::Cast`) | `comptime avg(3, 4)` and `comptime (-(7.9 as i64))` evaluate| done (Nov 27 05:47, 4445b05d: its two tests and 321 of 324 related programs; the three fail with the compiler of Nov 25 too) |
 | 14 | BG213 | C header parser evaluates unsigned macro arithmetic as signed | `compiler/cparser.fd` (`CpEval`/`CpExpr`) | `fid parse-header` on a header with `UDIV`, `UNEG`, `MASK`, `COND`, `CMP`, `0b1010`| deferred to a later batch: needs a typed macro evaluator (unsigned 32-bit arithmetic), about fifteen functions |
-| 15 | LG3 | reads are not checked against a live `&mut` | `compiler/borrowck.fd` | `val v = m` while `r = id_mut(&mut m)` is live and used after is a borrow error; `test_frontend_lifetime*.fd` and `tests/conformance/s8_*` still pass| the rule of 7b06ce65 passed its tests but rejected the compiler's own tree (three calls of the form `f(&mut g.e, read(g))`); refined in 21e16421 and not yet validated: needs the next build (the four LG3 tests, `check compiler/main.fd`, scripts/check-stdlib.sh) |
+| 15 | LG3 | reads are not checked against a live `&mut` | `compiler/borrowck.fd` | `val v = m` while `r = id_mut(&mut m)` is live and used after is a borrow error; `test_frontend_lifetime*.fd` and `tests/conformance/s8_*` still pass| the rule of 7b06ce65 passed its tests but rejected the compiler's own tree (three calls of the form `f(&mut g.e, read(g))`); refined in 21e16421; the build of 06:35 still rejected one place (nat_ir.fd ng_mir_finish: a released borrow was counted as a named one), fixed in 4d7dcd55 with test_lg3_read_after_released_mut; not yet validated by a built compiler: the first build of the next run, then validate-batch3.sh steps 1, 2, 6, 7, 8 |
 
 ### D. Verify only — the gate runs on this machine
 
@@ -168,15 +168,15 @@ Take in this order as soon as `git status --porcelain -- <file>` is empty.
 | # | Goal | Files |
 |---|---|---|
 | 26 | DWARF: `DW_AT_decl_file` is 0 for generated functions (the 15 `image-check.sh` failures) | `compiler/nat_ir.fd` (`ng_gen_function`: `g_nat_line_file_ix = 0` for a function without a source file), `compiler/nat_enc.fd` | Status: fixed by another session in e52b278d (Nov 27 02:07): only confirm with release/fid-night.exe through scripts/image-check.sh |
-| 27 | BG201, BG202, BG240, BG242, BG235 | `compiler/typechecker.fd` | Status: BG201, BG202 and BG240: code in b03479b8, to validate with the next build; BG242 does not reproduce with the compiler of Nov 25 (a str for an i64 parameter is rejected), its regression test test_bg242_str_for_int_param_fail is in 0fcd0261, to validate the same way; BG235 not started |
+| 27 | BG201, BG202, BG240, BG242, BG235 | `compiler/typechecker.fd` | Status: BG202, BG240 and BG242 done (Nov 27 night, the build of 06:35; marked in bugs-roadmap.md). BG201: the expression form is validated; the compound form (`f <<= 2`) is corrected in 647b4368 after f148a589 rejected plain float assignments, to validate with the next build (test_bg201_float_shift_assign_fail rejected, a float program with plain assignments passes). BG235 not started |
 | 28 | BG203, BG228, BG230, BG241 | `compiler/lower.fd` |
 | 29 | BG209, BG210, BG211 | `compiler/lexer.fd`, `compiler/parser.fd` |
-| 30 | BG205, BG231, BG244 | `compiler/codegen_c.fd` |
-| 31 | BG236 | `compiler/mono.fd` | Status: code in 0fcd0261 (each part of a function type carries its length), to validate with the next build through tests/selfhost/test_mono.fd |
+| 30 | BG205, BG231, BG244 | `compiler/codegen_c.fd` | Status: BG231: code in cb8f8b69, the test test_bg231_read_stdin_negative (marker fixed in 5c86e3dd), to validate on ccompile with the next build (validate-batch3.sh step 1); BG205 and BG244 not started |
+| 31 | BG236 | `compiler/mono.fd` | done (Nov 27 night: the unit test tests/nattools/mangle_func_unit.fd passes through `run`, which runs the tree's own mono.fd; test_mono.fd no longer compiles: BG253; through ccompile and emit: validate-batch3.sh step 1 with the next build) |
 | 32 | BG234, BG245 | `compiler/nat_enc.fd` |
-| 33 | BG218, BG219 | `compiler/compiler.fd` | Status: BG218: code in 9ec4af52 (compiler.fd, the conflict check); BG219: code in f0973224 (typechecker.fd); both to validate with the next build |
+| 33 | BG218, BG219 | `compiler/compiler.fd` | done (Nov 27 night, the build of 06:35: test_bg218_duplicate_impl_fail and test_bg219_generic_fn_value_fail rejected, test_bg219_generic_fn_call passes on run, ccompile and emit) |
 | 34 | BG225, BG229 | `compiler/interp.fd` |
-| 35 | BG237 | `compiler/main.fd` or `compiler/fmt.fd` | Status: code in b03479b8, to validate with the next build through tests/tooling/fmt-flag-order-check.sh |
+| 35 | BG237 | `compiler/main.fd` or `compiler/fmt.fd` | done (Nov 27 night, the build of 06:35: tests/tooling/fmt-flag-order-check.sh 6 of 6) |
 | 36 | BG246 | `compiler/pe_ir*.fd` (check whether it is clean) |
 | 37 | MI9, MI5, MI14, MI17, RA1, TG5, TG11, TG16, WP6, WP14, LF11, LF13, LF14, LF16, LF20, SP16, OP15, CS3, VF3, VF5, TL5 | `nat_ir.fd`, `iropt.fd`, `wasm.fd` and the like; each large, take only after B to D are closed |
 | 38 | BG248 (found by the comparison) | `compiler/nat_ir.fd` | todo: `--nat` Windows: a call through a function value made from a C function's address returns 0 (test_fix_fnval_c_ptr prints 7, 12, 5 through `emit`) |
@@ -281,3 +281,35 @@ are the commit times.)
   Build 1's check of the 324 related programs: 321 pass; three fail with
   the compiler of Nov 25 as well (test_frontend_comptime_if_assign,
   s4_11_comptime_if_generic, s8_2_null_deref_panics): not this batch's.
+- 07:30, the end of the 06:13 run (77 minutes), two builds. Build 2
+  (06:19-06:35, tree 2e3a15e9, 16 units at -O2) validated the formatter
+  (BG237, 6 of 6) and the rejections of BG201's expression form, BG202,
+  BG240, BG218, BG219 and BG242; `check compiler/main.fd` still failed at
+  nat_ir.fd ng_mir_finish (LG3). The cause, found by reducing the site: a
+  released borrow stays in the checker's table without a borrower, and the
+  helper of 21e16421 counted it as a named one (4d7dcd55, with
+  test_lg3_read_after_released_mut). BG201's compound form was written
+  (f148a589) and was WRONG: build 3 (06:55-07:10, 16 units at -O2)
+  rejects every plain `x = ...` on a float (stdlib/core.fd:8662 and 30
+  places in the compiler's own source), because `assign_op_binop` gives
+  BitAnd for `=` as for `&=`. Corrected in 647b4368 (the five compound
+  operators only); stage-0 check clean; no build was left in the run.
+  Also 5c86e3dd (two test fixes) and ac4ae268 (the mangle check as a unit
+  test). Marked done on build 2's evidence: BG202, BG218, BG219, BG236,
+  BG237, BG240, BG242 (bugs-roadmap.md; BG252 and BG253 filed there).
+  release/fid-night.exe is build 3: it rejects float assignments, so it
+  validates nothing.
+  NEXT, IN THIS ORDER: (1) build again (the command above) and copy the
+  result to release/fid-night.exe; (2) `STEPS="0 2 6" bash
+  build/verify-nov27/validate-batch3.sh`: 11 rejections (among them
+  test_bg201_float_shift_assign_fail) and `check compiler/main.fd` clean,
+  which is LG3's last open point; (3) side by side, `STEPS="1 3 4"`,
+  `STEPS=5`, `STEPS=7`, `STEPS=8` (step 8 is LG3's gate); (4) mark the LG3
+  read rule, BG201 and BG231 from those logs; (5) the WebAssembly list, 154
+  programs in build/verify-nov27/wasm-rerun-files.txt (`FID=release/fid-v27.exe
+  JOBS=2 OUT=build/wasm-rerun bash scripts/wasm-test.sh $(cat
+  build/verify-nov27/wasm-rerun-files.txt)`), classify, then PL4; (6)
+  scripts/image-check.sh (row 26) and scripts/disasm-check.sh.
+  Lesson of the run: the stage-0 check proves that the tree type-checks,
+  not that new code is right; a compiler change committed before its build
+  must say so in its commit, and the next build comes first.

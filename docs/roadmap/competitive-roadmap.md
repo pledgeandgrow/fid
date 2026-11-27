@@ -2508,6 +2508,30 @@ Reach what Rust, Go, Zig and C++ programmers expect on day one.
       another parameter than the trait's). Left: as above;
       test_frontend_lifetime_struct_store_fail gives 2 errors (the first
       matches); not run on the Linux targets.
+      Nov 27 (night): the read rule is in the tree, NOT yet validated by
+      a built compiler. `check_read` (borrowck.fd): a read of a variable
+      or of a field path of one while a mutable borrow of it, of a field
+      under it or of a path above it is active is a borrow error
+      (reference §8.4 rule 4); field-wise (`&mut s.y` does not stop a
+      read of `s.x`); a borrower ends at its last use. Three commits:
+      7b06ce65 (the rule; test_lg3_read_during_mut_borrow and the
+      conformance file s8_4), 21e16421 (a temporary of the call being
+      evaluated does not block a read of a later argument:
+      `f(&mut g.e, read(g))`, also once a nested call activated it),
+      4d7dcd55 (a released borrow stays in the table without a borrower
+      and was counted as a named one; it rejected the compiler's own
+      source at nat_ir.fd ng_mir_finish; test_lg3_read_after_released_
+      mut). The stage-0 check is clean. The build of 06:35 (before
+      4d7dcd55) rejects `check compiler/main.fd` at that one place; the
+      build of 07:10 could not be used (its BG201 check rejected every
+      plain float assignment; 647b4368 corrects it). To do with the next
+      build, in this order: `STEPS="0 2 6" bash build/verify-nov27/
+      validate-batch3.sh`, then steps 1, 3, 4, 5, 7 and 8 side by side
+      (step 8: the test_frontend_lifetime* files, tests/conformance/s8_*
+      and the LG3 tests). Then what is left of this entry: a struct's
+      lifetime parameters are matched by position, not by name; generic
+      structs with lifetimes are not instantiated by lifetime; the Linux
+      targets.
 - [~] LG4. Traits: bounds checked, associated types, default methods, trait objects
       Nov 22 audit: mostly done — bounds at calls (typechecker.fd:15699,
       :21798), associated types (:2440-2573, :2919-2962), default methods
