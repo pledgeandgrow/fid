@@ -2264,7 +2264,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       VERIFY failures. The rebuilt validation compiler runs the targeted
       check at 0 failures with default-on. Relational facts (`i <
       v.len()` of a parameter Vec) are still not carried.
-- [~] LF11. Check hoisting: one check before a loop instead of one per iteration,
+- [x] LF11. Check hoisting: one check before a loop instead of one per iteration,
       when the loop is versioned (ME25) (M).
       Nov 16: written with ME25, opt-in (`FID_IROPT_ON=version`): the copy's
       bounds checks become one `n <= v.len() && i >= 0` test before the loop
@@ -2288,6 +2288,15 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       tests/tooling/version-default-check.sh (stopped with the job of the
       long gates; 0 failed on Nov 21). The whole-suite leg is WP14's: the
       default run against the one with FID_IROPT_OFF=spec,version.
+      Nov 27 (day, evening): done. tests/tooling/version-default-check.sh
+      with the -O2 build of 16:19: 0 failed (4, 3, 2 and 2 loops versioned
+      by default in its four tests, none with FID_IROPT_OFF=version; the
+      outputs right on and off; explain sum_first: 1 bounds check removed
+      in the copy, 1 kept in the original, none removed with version off).
+      The gate had compared the code addresses a panic trace prints between
+      the on and the off build; it leaves those lines out now. And the
+      whole of tests/bootstrap on emit gives the same 2,018 pass and 38
+      fail with versioning off as with it on (WP14's note of this evening).
 - [x] LF12. Narrow types as ranges: a `u8` value needs no overflow check on a
       widening add (S). `peir_type_range` on narrow loads and `IntExtend`.
 - [~] LF13. Escape analysis: a `Vec`, `str` or struct that never leaves its function

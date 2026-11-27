@@ -91,7 +91,11 @@ for r in "${rounds[@]}"; do
     if [ "$(cat "$on.rc")" = BUILD ]; then no "$label $nm: does not build with version on"; continue; fi
     if [ "$(cat "$off.rc")" = BUILD ]; then no "$label $nm: does not build with version off"; continue; fi
     if grep -q "IR verifier" "$on.log"; then no "$label $nm: $(grep -m1 'IR verifier' "$on.log")"; continue; fi
-    if [ "$(cat "$off.rc")" != "$(cat "$on.rc")" ] || ! cmp -s <(tr -d '\r' < "$off.out" | grep -v -i 'panic\|stack\|called from\|line ') <(tr -d '\r' < "$on.out" | grep -v -i 'panic\|stack\|called from\|line '); then
+    # the program's own lines only: a panic trace names code addresses, and
+    # the versioned code sits elsewhere (bare 16-digit hex lines, since the
+    # traces come from the machine stack)
+    body() { tr -d '\r' < "$1" | grep -v -i 'panic\|stack\|called from\|line ' | grep -v -E '^[0-9a-f]{16}$'; }
+    if [ "$(cat "$off.rc")" != "$(cat "$on.rc")" ] || ! cmp -s <(body "$off.out") <(body "$on.out"); then
       no "$label $nm: on and off differ (rc $(cat "$off.rc") / $(cat "$on.rc"))"
       diff <(tr -d '\r' < "$off.out") <(tr -d '\r' < "$on.out") | head -6 | sed 's/^/      /'
       continue
@@ -100,7 +104,7 @@ for r in "${rounds[@]}"; do
       test_version_oob_fail|test_version_negstart_fail)
         want="1 2 3 4 5 "
         [ "$nm" = test_version_negstart_fail ] && want="12 "
-        got=$(tr -d '\r' < "$on.out" | grep -E '^-?[0-9]+$' | tr '\n' ' ')
+        got=$(body "$on.out" | grep -E '^-?[0-9]+$' | tr '\n' ' ')
         if [ "$(cat "$on.rc")" = 0 ] || grep -q unreachable "$on.out"; then
           no "$label $nm: no panic, or it went past it"
         elif [ "$got" != "$want" ]; then
