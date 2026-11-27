@@ -1,0 +1,267 @@
+[All modules](index.md)
+
+# pgo -- Fides Documentation
+
+## Contents
+
+- [trace_wanted](#trace_wanted) (function)
+- [trace_set](#trace_set) (function)
+- [pgo_note_call](#pgo_note_call) (function)
+- [pgo_count](#pgo_count) (function)
+- [pgo_active](#pgo_active) (function)
+- [pgo_has_blocks](#pgo_has_blocks) (function)
+- [pgo_block_entries](#pgo_block_entries) (function)
+- [pgo_block_cold](#pgo_block_cold) (function)
+- [pgo_block_weight](#pgo_block_weight) (function)
+- [pgo_site_calls](#pgo_site_calls) (function)
+- [pgo_instrument](#pgo_instrument) (function)
+- [pgo_write](#pgo_write) (function)
+- [pgo_apply](#pgo_apply) (function)
+
+## trace_wanted
+
+CT10: does `--trace` ask for the calls of `name` (an IR function name:
+a method `T::m` is `T_m`, as `--trace` also accepts it)?
+
+```fides
+pub fn trace_wanted(name: str) -> bool {
+```
+
+**Parameters:**
+
+- `name`: `str`
+
+**Returns:** `bool`
+
+*Defined at line 67*
+
+---
+
+## trace_set
+
+CT10: `--trace`'s list ("f,g" or "T::m") as g_trace_fns keeps it.
+
+```fides
+pub fn trace_set(list: str) {
+```
+
+**Parameters:**
+
+- `list`: `str`
+
+*Defined at line 75*
+
+---
+
+## pgo_note_call
+
+The interpreter calls this on entry to each function while recording.
+
+```fides
+pub fn pgo_note_call(name: str) {
+```
+
+**Parameters:**
+
+- `name`: `str`
+
+*Defined at line 93*
+
+---
+
+## pgo_count
+
+How many times the profiled run called `name` (0: never, or no profile).
+
+```fides
+pub fn pgo_count(name: str) -> i64 {
+```
+
+**Parameters:**
+
+- `name`: `str`
+
+**Returns:** `i64`
+
+*Defined at line 108*
+
+---
+
+## pgo_active
+
+CS6: is a profile in use (loaded for `--profile-use`, or being
+recorded)? iropt_native's memo of its per-function passes (ir_ser.fd
+imc_*) is off then: its keys do not hold the counts the passes read.
+
+```fides
+pub fn pgo_active() -> bool {
+```
+
+**Returns:** `bool`
+
+*Defined at line 121*
+
+---
+
+## pgo_has_blocks
+
+OP30: does the profile `--profile-use` names count blocks (a run made
+with the block probes, version 2)?
+
+```fides
+pub fn pgo_has_blocks() -> bool {
+```
+
+**Returns:** `bool`
+
+*Defined at line 130*
+
+---
+
+## pgo_block_entries
+
+OP30: how many times the profiled run entered block `block_id` (the
+BasicBlock's id, as lowering made it) of function `fname`; -1 when the
+profile does not say (no block counts, a function the run never called
+or of one block, a block an optimization made).
+
+```fides
+pub fn pgo_block_entries(fname: str, block_id: i64) -> i64 {
+```
+
+**Parameters:**
+
+- `fname`: `str`
+- `block_id`: `i64`
+
+**Returns:** `i64`
+
+*Defined at line 141*
+
+---
+
+## pgo_block_cold
+
+OP30: did the profiled run enter this block less than once per
+PGO_COLD_RATIO calls of its function (never, in particular)? false when
+the profile does not know the block.
+
+```fides
+pub fn pgo_block_cold(fname: str, block_id: i64) -> bool {
+```
+
+**Parameters:**
+
+- `fname`: `str`
+- `block_id`: `i64`
+
+**Returns:** `bool`
+
+*Defined at line 155*
+
+---
+
+## pgo_block_weight
+
+OP30: how often the block runs per call of its function, PGO_WEIGHT_ONE
+being once per call (a loop body of 100 trips: 100 * PGO_WEIGHT_ONE),
+at most 1 << 20; 0 for a cold block (pgo_block_cold); -1 when the
+profile does not know the block (a weight from loop depth then).
+
+```fides
+pub fn pgo_block_weight(fname: str, block_id: i64) -> i64 {
+```
+
+**Parameters:**
+
+- `fname`: `str`
+- `block_id`: `i64`
+
+**Returns:** `i64`
+
+*Defined at line 171*
+
+---
+
+## pgo_site_calls
+
+OP30: the count an inliner weighs the call to `callee` in block
+`site_block` of `caller` by: the times the profiled run entered that
+block when the profile counts it (a call the run never made there is
+cold even when `callee` is hot elsewhere), else the callee's calls.
+
+```fides
+pub fn pgo_site_calls(caller: str, site_block: i64, callee: str) -> i64 {
+```
+
+**Parameters:**
+
+- `caller`: `str`
+- `site_block`: `i64`
+- `callee`: `str`
+
+**Returns:** `i64`
+
+*Defined at line 204*
+
+---
+
+## pgo_instrument
+
+OP30: start each block of every function of `module` with more than one
+block with a call to an empty probe "<function>@<block id>", added to
+the module, so the interpreter's call counts (pgo_note_call) count the
+blocks. Lowering does this through pgo_apply while `--profile` records.
+The number of probes made.
+
+```fides
+pub fn pgo_instrument(module: &mut IrModule) -> i64 {
+```
+
+**Parameters:**
+
+- `module`: `&mut IrModule`
+
+**Returns:** `i64`
+
+*Defined at line 226*
+
+---
+
+## pgo_write
+
+Write the recorded counts to `path`; false when it cannot be written.
+
+```fides
+pub fn pgo_write(path: str) -> bool {
+```
+
+**Parameters:**
+
+- `path`: `str`
+
+**Returns:** `bool`
+
+*Defined at line 320*
+
+---
+
+## pgo_apply
+
+With a profile: the module's functions the run called, most called
+first, then the others in their order (the backends lay functions out in
+module order, so the hot ones end up together).
+
+```fides
+pub fn pgo_apply(module: &mut IrModule) {
+```
+
+**Parameters:**
+
+- `module`: `&mut IrModule`
+
+*Defined at line 414*
+
+---
+
+*Generated by [scribe](https://fides.dev) -- Fides documentation generator*

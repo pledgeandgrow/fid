@@ -1,0 +1,312 @@
+[All modules](index.md)
+
+# compiler::lsp -- Fides Documentation
+
+## Contents
+
+- [DocEntry](#DocEntry) (struct)
+- [DocEntry_new](#DocEntry_new) (function)
+- [lsp_run](#lsp_run) (function)
+- [OptI64Pair](#OptI64Pair) (enum)
+- [I64Triple](#I64Triple) (struct)
+- [I64Triple_new](#I64Triple_new) (function)
+- [SrcFix](#SrcFix) (struct)
+- [SrcFix_new](#SrcFix_new) (function)
+- [fix_edition_line](#fix_edition_line) (function)
+- [fix_set_edition](#fix_set_edition) (function)
+- [fix_restore_edition](#fix_restore_edition) (function)
+- [fix_suggestions](#fix_suggestions) (function)
+- [fix_apply](#fix_apply) (function)
+- [IhCtx](#IhCtx) (struct)
+- [IhCtx_new](#IhCtx_new) (function)
+
+## DocEntry
+
+```fides
+pub struct DocEntry {
+```
+
+**Fields:**
+
+| Name | Type |
+|------|------|
+| `uri` | `str` |
+| `text` | `str` |
+
+*Defined at line 38*
+
+---
+
+## DocEntry_new
+
+```fides
+pub fn DocEntry_new(uri: str, text: str) -> DocEntry {
+```
+
+**Parameters:**
+
+- `uri`: `str`
+- `text`: `str`
+
+**Returns:** `DocEntry`
+
+*Defined at line 43*
+
+---
+
+## lsp_run
+
+Run the LSP server over stdio. Returns exit code.
+
+```fides
+pub fn lsp_run() -> i64 {
+```
+
+**Returns:** `i64`
+
+*Defined at line 52*
+
+---
+
+## OptI64Pair
+
+Optional pair of i64 values (for find_definition result).
+
+```fides
+pub enum OptI64Pair {
+```
+
+**Variants:**
+
+- `Some`
+- `None`
+
+*Defined at line 1469*
+
+---
+
+## I64Triple
+
+Triple of i64 values (for find_all_occurrences).
+
+```fides
+pub struct I64Triple {
+```
+
+**Fields:**
+
+| Name | Type |
+|------|------|
+| `a` | `i64` |
+| `b` | `i64` |
+| `c` | `i64` |
+
+*Defined at line 1475*
+
+---
+
+## I64Triple_new
+
+```fides
+pub fn I64Triple_new(a: i64, b: i64, c: i64) -> I64Triple {
+```
+
+**Parameters:**
+
+- `a`: `i64`
+- `b`: `i64`
+- `c`: `i64`
+
+**Returns:** `I64Triple`
+
+*Defined at line 1481*
+
+---
+
+## SrcFix
+
+```fides
+pub struct SrcFix {
+```
+
+**Fields:**
+
+| Name | Type |
+|------|------|
+| `off` | `i64` |
+| `size` | `i64` |
+| `text` | `str` |
+| `title` | `str` |
+| `line` | `i64` |
+
+*Defined at line 1913*
+
+---
+
+## SrcFix_new
+
+```fides
+pub fn SrcFix_new(off: i64, size: i64, text: str, title: str, line: i64) -> SrcFix {
+```
+
+**Parameters:**
+
+- `off`: `i64`
+- `size`: `i64`
+- `text`: `str`
+- `title`: `str`
+- `line`: `i64`
+
+**Returns:** `SrcFix`
+
+*Defined at line 1921*
+
+---
+
+## fix_edition_line
+
+The 0-based index of the line of `lines` that states the edition
+(`#[edition(...)]` at the start of the line), or -1.
+
+```fides
+pub fn fix_edition_line(lines: Vec<str>) -> i64 {
+```
+
+**Parameters:**
+
+- `lines`: `Vec<str>`
+
+**Returns:** `i64`
+
+*Defined at line 2053*
+
+---
+
+## fix_set_edition
+
+`source` stating edition `e`: its `#[edition(...)]` changed to
+`#[edition(e)]`, or, when it states none, the line `#[edition(e)]`
+put before its first line of code (after the header comments and the
+`module` line).
+
+```fides
+pub fn fix_set_edition(source: str, e: i64) -> str {
+```
+
+**Parameters:**
+
+- `source`: `str`
+- `e`: `i64`
+
+**Returns:** `str`
+
+*Defined at line 2068*
+
+---
+
+## fix_restore_edition
+
+`fixed` (which fix_set_edition gave an edition line) with the edition
+line `orig` had put back, or taken out when `orig` stated none.
+
+```fides
+pub fn fix_restore_edition(orig: str, fixed: str) -> str {
+```
+
+**Parameters:**
+
+- `orig`: `str`
+- `fixed`: `str`
+
+**Returns:** `str`
+
+*Defined at line 2115*
+
+---
+
+## fix_suggestions
+
+The mechanical fixes of the diagnostics `errs` (as the checker or the
+linter gives them) of `source`, in the order of the diagnostics.
+
+```fides
+pub fn fix_suggestions(source: str, errs: Vec<str>) -> Vec<SrcFix> {
+```
+
+**Parameters:**
+
+- `source`: `str`
+- `errs`: `Vec<str>`
+
+**Returns:** `Vec<SrcFix>`
+
+*Defined at line 3198*
+
+---
+
+## fix_apply
+
+`source` with the fix `f` applied.
+
+```fides
+pub fn fix_apply(source: str, f: SrcFix) -> str {
+```
+
+**Parameters:**
+
+- `source`: `str`
+- `f`: `SrcFix`
+
+**Returns:** `str`
+
+*Defined at line 3211*
+
+---
+
+## IhCtx
+
+TL4: what a type hint can look up: the functions (`table`, `fn_ix`:
+name -> index + 1), the methods by "Type.m" (`mkey_ix` -> index + 1
+into `mfuncs`, -1 when two impls have one of that key) with their
+impl's type parameters (`mtps`, joined by ","), the enums and structs
+of the file.
+
+```fides
+pub struct IhCtx {
+```
+
+**Fields:**
+
+| Name | Type |
+|------|------|
+| `table` | `Vec<Func>` |
+| `fn_ix` | `i64` |
+| `enum_names` | `Vec<str>` |
+| `struct_names` | `Vec<str>` |
+| `mfuncs` | `Vec<Func>` |
+| `mtps` | `Vec<str>` |
+| `mkey_ix` | `i64` |
+
+*Defined at line 4279*
+
+---
+
+## IhCtx_new
+
+```fides
+pub fn IhCtx_new(table: Vec<Func>, fn_ix: i64, enum_names: Vec<str>) -> IhCtx {
+```
+
+**Parameters:**
+
+- `table`: `Vec<Func>`
+- `fn_ix`: `i64`
+- `enum_names`: `Vec<str>`
+
+**Returns:** `IhCtx`
+
+*Defined at line 4289*
+
+---
+
+*Generated by [scribe](https://fides.dev) -- Fides documentation generator*

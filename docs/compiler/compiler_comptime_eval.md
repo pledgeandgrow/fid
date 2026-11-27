@@ -1,0 +1,344 @@
+[All modules](index.md)
+
+# compiler::comptime_eval -- Fides Documentation
+
+## Contents
+
+- [ct_box_expr_unbox](#ct_box_expr_unbox) (function)
+- [ComptimeEnv](#ComptimeEnv) (struct)
+- [ComptimeEnv_new](#ComptimeEnv_new) (function)
+- [ComptimeEnv_get](#ComptimeEnv_get) (function)
+- [ComptimeEnv_set](#ComptimeEnv_set) (function)
+- [ComptimeEnv_declare](#ComptimeEnv_declare) (function)
+- [ComptimeEnv_clone](#ComptimeEnv_clone) (function)
+- [ct_vec_of](#ct_vec_of) (function)
+- [ct_vec_elems](#ct_vec_elems) (function)
+- [ct_materialize](#ct_materialize) (function)
+- [comptime_subst_errors](#comptime_subst_errors) (function)
+- [OptExpr](#OptExpr) (enum)
+- [ResultExpr](#ResultExpr) (enum)
+- [comptime_gen_errors](#comptime_gen_errors) (function)
+- [process_gen](#process_gen) (function)
+- [OptProgram](#OptProgram) (enum)
+- [substitute](#substitute) (function)
+- [evaluate](#evaluate) (function)
+- [comptime_expand_errors](#comptime_expand_errors) (function)
+- [expand_comptime](#expand_comptime) (function)
+
+## ct_box_expr_unbox
+
+```fides
+pub fn ct_box_expr_unbox(b: Box<Expr>) -> Expr {
+```
+
+**Parameters:**
+
+- `b`: `Box<Expr>`
+
+**Returns:** `Expr`
+
+*Defined at line 23*
+
+---
+
+## ComptimeEnv
+
+```fides
+pub struct ComptimeEnv {
+```
+
+**Fields:**
+
+| Name | Type |
+|------|------|
+| `names` | `Vec<str>` |
+| `values` | `Vec<Expr>` |
+
+*Defined at line 152*
+
+---
+
+## ComptimeEnv_new
+
+```fides
+pub fn ComptimeEnv_new() -> ComptimeEnv {
+```
+
+**Returns:** `ComptimeEnv`
+
+*Defined at line 157*
+
+---
+
+## ComptimeEnv_get
+
+```fides
+pub fn ComptimeEnv_get(env: &ComptimeEnv, name: str) -> OptExpr {
+```
+
+**Parameters:**
+
+- `env`: `&ComptimeEnv`
+- `name`: `str`
+
+**Returns:** `OptExpr`
+
+*Defined at line 166*
+
+---
+
+## ComptimeEnv_set
+
+```fides
+pub fn ComptimeEnv_set(env: &mut ComptimeEnv, name: str, v: Expr) {
+```
+
+**Parameters:**
+
+- `env`: `&mut ComptimeEnv`
+- `name`: `str`
+- `v`: `Expr`
+
+*Defined at line 177*
+
+---
+
+## ComptimeEnv_declare
+
+`val name = v` in a block whose own names start at index `from`: a new
+variable, even when an enclosing block has one of the same name (it was
+overwritten, and the block's end wrote the inner value back to it).
+
+```fides
+pub fn ComptimeEnv_declare(env: &mut ComptimeEnv, name: str, v: Expr, from: i64) {
+```
+
+**Parameters:**
+
+- `env`: `&mut ComptimeEnv`
+- `name`: `str`
+- `v`: `Expr`
+- `from`: `i64`
+
+*Defined at line 193*
+
+---
+
+## ComptimeEnv_clone
+
+```fides
+pub fn ComptimeEnv_clone(env: &ComptimeEnv) -> ComptimeEnv {
+```
+
+**Parameters:**
+
+- `env`: `&ComptimeEnv`
+
+**Returns:** `ComptimeEnv`
+
+*Defined at line 206*
+
+---
+
+## ct_vec_of
+
+```fides
+pub fn ct_vec_of(elem_ty: Type, elements: Vec<Expr>) -> Expr {
+```
+
+**Parameters:**
+
+- `elem_ty`: `Type`
+- `elements`: `Vec<Expr>`
+
+**Returns:** `Expr`
+
+*Defined at line 223*
+
+---
+
+## ct_vec_elems
+
+The elements of comptime Vec `e`, when it is one.
+
+```fides
+pub fn ct_vec_elems(e: Expr, out: &mut Vec<Expr>) -> bool {
+```
+
+**Parameters:**
+
+- `e`: `Expr`
+- `out`: `&mut Vec<Expr>`
+
+**Returns:** `bool`
+
+*Defined at line 230*
+
+---
+
+## ct_materialize
+
+Program code for comptime value `v`: itself, or for a comptime Vec
+`{ var __ctv: Vec<T> = Vec::new(); __ctv.push(e0); ...; __ctv }`.
+
+```fides
+pub fn ct_materialize(v: Expr) -> Expr {
+```
+
+**Parameters:**
+
+- `v`: `Expr`
+
+**Returns:** `Expr`
+
+*Defined at line 288*
+
+---
+
+## comptime_subst_errors
+
+```fides
+pub fn comptime_subst_errors() -> Vec<str> {
+```
+
+**Returns:** `Vec<str>`
+
+*Defined at line 334*
+
+---
+
+## OptExpr
+
+```fides
+pub enum OptExpr {
+```
+
+**Variants:**
+
+- `Some`
+- `None`
+
+*Defined at line 591*
+
+---
+
+## ResultExpr
+
+```fides
+pub enum ResultExpr {
+```
+
+**Variants:**
+
+- `Ok`
+- `Err`
+
+*Defined at line 596*
+
+---
+
+## comptime_gen_errors
+
+```fides
+pub fn comptime_gen_errors() -> Vec<str> {
+```
+
+**Returns:** `Vec<str>`
+
+*Defined at line 608*
+
+---
+
+## process_gen
+
+```fides
+pub fn process_gen(program: Program) -> Program {
+```
+
+**Parameters:**
+
+- `program`: `Program`
+
+**Returns:** `Program`
+
+*Defined at line 612*
+
+---
+
+## OptProgram
+
+```fides
+pub enum OptProgram {
+```
+
+**Variants:**
+
+- `Some`
+- `None`
+
+*Defined at line 1002*
+
+---
+
+## substitute
+
+```fides
+pub fn substitute(program: Program) -> Program {
+```
+
+**Parameters:**
+
+- `program`: `Program`
+
+**Returns:** `Program`
+
+*Defined at line 2073*
+
+---
+
+## evaluate
+
+```fides
+pub fn evaluate(expr: &Expr, original: &Program) -> ResultExpr {
+```
+
+**Parameters:**
+
+- `expr`: `&Expr`
+- `original`: `&Program`
+
+**Returns:** `ResultExpr`
+
+*Defined at line 4057*
+
+---
+
+## comptime_expand_errors
+
+```fides
+pub fn comptime_expand_errors() -> Vec<str> {
+```
+
+**Returns:** `Vec<str>`
+
+*Defined at line 6536*
+
+---
+
+## expand_comptime
+
+```fides
+pub fn expand_comptime(program: Program) -> Program {
+```
+
+**Parameters:**
+
+- `program`: `Program`
+
+**Returns:** `Program`
+
+*Defined at line 6540*
+
+---
+
+*Generated by [scribe](https://fides.dev) -- Fides documentation generator*

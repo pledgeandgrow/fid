@@ -1,0 +1,67 @@
+# Modules
+
+- [compiler::ark](compiler_ark.md) (5 items) -- ark.fd -- Package manager for the Fides programming language
+- [compiler::ast](compiler_ast.md) (165 items) -- ast.fd -- AST types for the Fides compiler
+- [ast_ser](ast_ser.md) (146 items) -- CS2: binary serialization for the front-end AST (Program). The checked
+- [compiler::autograd](compiler_autograd.md) (1 items) -- autograd.fd -- Reverse-mode automatic differentiation (no-op shim)
+- [compiler::borrowck](compiler_borrowck.md) (27 items) -- borrowck.fd -- Borrow checker for Fides, rewritten from src/borrowck.rs (1221 LOC)
+- [compiler::build_info](compiler_build_info.md) (6 items) -- build_info.fd -- what `fid version` names as the exact build (release N12).
+- [compiler::checks](compiler_checks.md) (41 items) -- checks.fd - which runtime checks a function does not need.
+- [compiler::codegen_c](compiler_codegen_c.md) (41 items) -- codegen_c.fd - C99 generator from Fides IR, rewritten from src/codegen_c.rs (4241 LOC)
+- [compiler::compiler](compiler_compiler.md) (175 items) -- compiler.fd -- Compiler pipeline driver (rewritten from src/compiler.rs)
+- [compiler::comptime_eval](compiler_comptime_eval.md) (20 items) -- comptime_eval.fd -- Compile-time evaluation engine, ported from src/comptime.rs
+- [cowcheck](cowcheck.md) (13 items) -- cowcheck.fd -- the copy-on-write migration check (proposal 0001, release M5).
+- [compiler::cparser](compiler_cparser.md) (10 items) -- cparser.fd -- C header parser: Fides FFI bindings from real headers
+- [csplit](csplit.md) (4 items) -- csplit.fd — split one generated C file into several translation units
+- [compiler::debugger](compiler_debugger.md) (37 items) -- debugger.fd -- Built-in interactive debugger for Fides
+- [compiler::diag](compiler_diag.md) (61 items) -- Fides compiler diagnostic system -- SH-6.2 rewrite of diag.rs
+- [compiler::disasm](compiler_disasm.md) (196 items) -- disasm.fd -- a disassembler for the machine layer's own output
+- [compiler::egraph](compiler_egraph.md) (6 items) -- compiler/egraph.fd — an e-graph mid-end (own-backend roadmap ME6–ME11)
+- [compiler::elf64](compiler_elf64.md) (79 items) -- elf64.fd -- ELF64 Object File Emitter for Linux x86-64
+- [compiler::embedded](compiler_embedded.md) (37 items) -- embedded.fd -- Embedded & IoT Support
+- [compiler::escape](compiler_escape.md) (21 items) -- escape.fd -- Reference escape check, rewritten from src/escape.rs
+- [compiler::flat_ast](compiler_flat_ast.md) (11 items) -- flat_ast.fd -- Flat AST serialization for self-host parser differential testing.
+- [compiler::fmt](compiler_fmt.md) (6 items) -- fmt.fd -- Fides code formatter (SH-6.4 rewrite of fmt.rs)
+- [compiler::gpu](compiler_gpu.md) (34 items) -- gpu.fd -- GPU Codegen (SPIR-V + PTX)
+- [compiler::green_thread](compiler_green_thread.md) (19 items) -- green_thread.fd -- Cooperative green threads (ported from src/green_thread.rs)
+- [compiler::hotreload](compiler_hotreload.md) (35 items) -- hotreload.fd -- Hot Reload System
+- [compiler::image_writer](compiler_image_writer.md) (80 items) -- image_writer.fd -- the one writer of executable and object files (own-
+- [compiler::inc](compiler_inc.md) (71 items) -- inc.fd -- Incremental compilation cache (ported from src/inc.rs)
+- [compiler::interp](compiler_interp.md) (261 items) -- interp.fd -- IR Interpreter (self-hosted)
+- [compiler::ir](compiler_ir.md) (213 items) -- ir.fd -- Fides IR types, rewritten from src/ir.rs (1761 LOC Rust)
+- [compiler::iropt](compiler_iropt.md) (51 items) -- compiler/iropt.fd — IR optimizations run before native code generation
+- [compiler::iropt_me](compiler_iropt_me.md) (34 items) -- compiler/iropt_me.fd — the mid-end passes of docs/roadmap/llvm-roadmap.md
+- [compiler::irverify](compiler_irverify.md) (1 items) -- compiler/irverify.fd — the IR verifier (own-backend roadmap ME4).
+- [ir_ser](ir_ser.md) (79 items) -- Binary codec for IrFunction — the per-function lowered-IR cache (CS4).
+- [compiler::json](compiler_json.md) (8 items) -- Fides JSON module -- SH-6.3 rewrite of json.rs
+- [compiler::lexer](compiler_lexer.md) (29 items) -- lexer.fd -- Fides lexer, SH-7.1 rewrite of src/lexer.rs (589 LOC Rust)
+- [compiler::linker](compiler_linker.md) (34 items) -- linker.fd -- Fides Integrated Linker (Phase 4D)
+- [compiler::lockcheck](compiler_lockcheck.md) (8 items) -- CA4 (complaint-roadmap): Lock-order analysis across the call graph.
+- [compiler::lower](compiler_lower.md) (238 items) -- lower.fd - AST - Fides IR lowering pass, rewritten from src/lower.rs (6198 LOC)
+- [compiler::lsp](compiler_lsp.md) (15 items) -- lsp.fd -- LSP (Language Server Protocol) server for Fides.
+- [compiler::main](compiler_main.md) (1 items) -- main.fd -- CLI entry point for the self-hosted Fides compiler.
+- [compiler::mir](compiler_mir.md) (122 items) -- mir.fd -- the machine IR (MIR) of the machine layer (roadmap MI1).
+- [compiler::mono](compiler_mono.md) (78 items) -- mono.fd -- Monomorphization for the Fides compiler
+- [compiler::native_debugger](compiler_native_debugger.md) (23 items) -- native_debugger.fd -- Native code debugger (ptrace-based, Linux only)
+- [compiler::nat_enc](compiler_nat_enc.md) (553 items) -- nat_enc.fd -- machine code for the native Linux AArch64 and RISC-V 64
+- [compiler::nat_ir](compiler_nat_ir.md) (61 items) -- nat_ir.fd -- IR -> native Linux executables for AArch64 and RISC-V 64
+- [compiler::nat_thumb](compiler_nat_thumb.md) (4 items) -- compiler/nat_thumb.fd — PL5: Cortex-M (ARMv7-M, Thumb-2) code generator.
+- [compiler::parser](compiler_parser.md) (90 items) -- parser.fd -- Fides parser, SH-7.3 rewrite of src/parser.rs (3433 LOC Rust)
+- [compiler::pdb](compiler_pdb.md) (18 items) -- pdb.fd — program databases (PDB, MSF 7.00) for Windows images: what
+- [compiler::pe_ir](compiler_pe_ir.md) (26 items) -- pe_ir.fd -- IR -> PE32+ executable backend: instruction-lowering half.
+- [compiler::pe_ir_enc](compiler_pe_ir_enc.md) (270 items) -- pe_ir_enc.fd -- x86-64 machine-code encoder and PE file-format writer for
+- [compiler::pe_ir_stubs](compiler_pe_ir_stubs.md) (137 items) -- pe_ir_stubs.fd -- PE runtime stubs + reachability for the IR -> .exe backend
+- [pgo](pgo.md) (13 items) -- pgo.fd — profiles from a real run, for profile-guided optimization
+- [reach](reach.md) (1 items) -- compiler/reach.fd — which functions `lower` needs (compile time, CS4)
+- [compiler::rules](compiler_rules.md) (6 items) -- compiler/rules.fd — rewrite rules as data, and pure calls merged
+- [compiler::runtime](compiler_runtime.md) (33 items) -- runtime.fd — Fides-authored runtime (native backends)
+- [compiler::scribe](compiler_scribe.md) (49 items) -- scribe.fd -- Documentation generator for the Fides programming language
+- [compiler::secrecy](compiler_secrecy.md) (7 items) -- secrecy.fd -- @secret/@sensitive information-flow check, rewritten from
+- [compiler::ssa](compiler_ssa.md) (8 items) -- compiler/ssa.fd — SSA form inside the mid-end (docs/roadmap/llvm-roadmap.md
+- [compiler::tensor](compiler_tensor.md) (44 items) -- tensor.fd -- TensorData type: n-dimensional arrays with stride info.
+- [compiler::token](compiler_token.md) (7 items) -- token.fd -- Token types for the Fides compiler
+- [compiler::tv](compiler_tv.md) (38 items) -- compiler/tv.fd — translation validation of the mid-end (own-backend roadmap
+- [compiler::typechecker](compiler_typechecker.md) (232 items) -- typechecker.fd -- Fides typechecker, rewritten from src/typechecker.rs (7424 LOC)
+- [compiler::veil](compiler_veil.md) (23 items)
+- [compiler::wasm](compiler_wasm.md) (5 items) -- wasm.fd -- IR -> a WebAssembly module that runs under WASI (release F9):
+- [compiler::x86](compiler_x86.md) (26 items) -- x86.fd -- x86_64 stack-machine backend, ported from src/x86.rs (1420 LOC)
