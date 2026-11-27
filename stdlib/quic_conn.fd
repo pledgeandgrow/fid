@@ -435,8 +435,8 @@ fn qcn_keep_next_secret(secret: Vec<i64>) -> Vec<i64> {
 }
 
 @declassify
-fn qcn_keep_updated(old: QuicKeys, next_secret: Vec<i64>) -> QuicKeys {
-    return quic_updated_keys(old, next_secret);
+fn qcn_keep_updated(old: QuicKeys, next_secret: Vec<i64>, aead: i64) -> QuicKeys {
+    return quic_updated_keys(old, next_secret, aead);
 }
 
 // ─── Configuration ──────────────────────────────────────────────────────
@@ -1872,7 +1872,7 @@ fn qcn_open_short(c: &mut QuicConn, sp: &QSpace, p: Vec<i64>) -> QuicOpened {
         return o;
     }
     val next_secret: Vec<i64> = qcn_keep_next_secret(c.ap_rx_secret);
-    val next: QuicKeys = qcn_keep_updated(sp.rx, next_secret);
+    val next: QuicKeys = qcn_keep_updated(sp.rx, next_secret, quic_tls_suite_aead(c.tls.suite));
     val o2: QuicOpened = quic_unprotect_short(next, p, c.scid.len(), sp.largest_rx);
     if o2.ok {
         val phase: bool = (o2.header.get(0) & 0x04) != 0;
@@ -1885,7 +1885,7 @@ fn qcn_open_short(c: &mut QuicConn, sp: &QSpace, p: Vec<i64>) -> QuicOpened {
         c.ap_rx_secret = next_secret;
         if phase != c.key_phase {
             val next_tx_secret: Vec<i64> = qcn_keep_next_secret(c.ap_tx_secret);
-            ap.tx = qcn_keep_updated(ap.tx, next_tx_secret);
+            ap.tx = qcn_keep_updated(ap.tx, next_tx_secret, quic_tls_suite_aead(c.tls.suite));
             c.ap_tx_secret = next_tx_secret;
             c.key_phase = phase;
             c.key_update_pn = ap.next_pn;
@@ -1908,7 +1908,7 @@ pub fn quic_conn_update_keys(c: &mut QuicConn) -> bool {
     }
     var ap: QSpace = c.spaces.get(QL_APP);
     val next_tx_secret: Vec<i64> = qcn_keep_next_secret(c.ap_tx_secret);
-    ap.tx = qcn_keep_updated(ap.tx, next_tx_secret);
+    ap.tx = qcn_keep_updated(ap.tx, next_tx_secret, quic_tls_suite_aead(c.tls.suite));
     c.ap_tx_secret = next_tx_secret;
     c.key_phase = !c.key_phase;
     c.key_update_pn = ap.next_pn;
