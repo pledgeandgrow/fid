@@ -727,7 +727,7 @@ pub fn mock_clock_fixed(t: i64) -> MockClock {
 
 **Returns:** `MockClock`
 
-*Defined at line 435*
+*Defined at line 437*
 
 ---
 
@@ -746,7 +746,7 @@ pub fn mock_clock_now(clock: &mut MockClock) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 443*
+*Defined at line 447*
 
 ---
 
@@ -764,7 +764,7 @@ pub fn mock_clock_reads(clock: &MockClock) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 456*
+*Defined at line 460*
 
 ---
 
@@ -786,7 +786,7 @@ pub struct MockFS {
 | `paths` | `Vec<str>` |
 | `contents` | `Vec<str>` |
 
-*Defined at line 465*
+*Defined at line 469*
 
 ---
 
@@ -800,7 +800,7 @@ pub fn mock_fs() -> MockFS {
 
 **Returns:** `MockFS`
 
-*Defined at line 471*
+*Defined at line 475*
 
 ---
 
@@ -818,7 +818,7 @@ pub fn mock_fs_add(fs: &mut MockFS, path: str, content: str) {
 - `path`: `str`
 - `content`: `str`
 
-*Defined at line 476*
+*Defined at line 482*
 
 ---
 
@@ -837,7 +837,7 @@ pub fn mock_fs_read(fs: &MockFS, path: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 490*
+*Defined at line 496*
 
 ---
 
@@ -856,7 +856,7 @@ pub fn mock_fs_has(fs: &MockFS, path: str) -> bool {
 
 **Returns:** `bool`
 
-*Defined at line 502*
+*Defined at line 508*
 
 ---
 
@@ -874,7 +874,7 @@ pub fn mock_fs_paths(fs: &MockFS) -> Vec<str> {
 
 **Returns:** `Vec<str>`
 
-*Defined at line 514*
+*Defined at line 520*
 
 ---
 
@@ -893,7 +893,7 @@ pub struct MockNet {
 | `urls` | `Vec<str>` |
 | `responses` | `Vec<str>` |
 
-*Defined at line 519*
+*Defined at line 525*
 
 ---
 
@@ -907,7 +907,7 @@ pub fn mock_net() -> MockNet {
 
 **Returns:** `MockNet`
 
-*Defined at line 525*
+*Defined at line 531*
 
 ---
 
@@ -925,7 +925,7 @@ pub fn mock_net_add(net: &mut MockNet, url: str, response: str) {
 - `url`: `str`
 - `response`: `str`
 
-*Defined at line 530*
+*Defined at line 538*
 
 ---
 
@@ -944,7 +944,7 @@ pub fn mock_net_get(net: &MockNet, url: str) -> str {
 
 **Returns:** `str`
 
-*Defined at line 544*
+*Defined at line 552*
 
 ---
 

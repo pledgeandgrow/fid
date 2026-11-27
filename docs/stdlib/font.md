@@ -257,7 +257,7 @@ val a = font_bitmap_char(65);
 assert_eq(a.width, BITMAP_FONT_WIDTH);
 assert_eq(a.height, 8);
 assert_eq(image_get_pixel(&a, 2, 0), 0xFFFFFFFF);   // 'A' row 0, x=2 is set
-assert_eq(image_get_pixel(&a, 0, 0), 0xFF000000);   // unset pixel is opaque black
+assert_eq(image_get_pixel(&a, 0, 0), 0xFF);         // unset pixel is opaque black (r, g, b = 0, a = 255)
 val t = font_bitmap_text("hi");
 assert_eq(t.width, 16);
 ```

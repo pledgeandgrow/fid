@@ -519,7 +519,8 @@ Number of positional arguments.
 *Example -- run as a test by `scripts/doctest.py`:*
 
 ```fides
-assert_eq(args_positionals_len(), args_positionals().len());
+val ps = args_positionals();
+assert(args_positionals_len() == ps.len());
 ```
 
 ```fides
@@ -528,7 +529,7 @@ pub fn args_positionals_len() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 398*
+*Defined at line 399*
 
 ---
 
@@ -546,7 +547,7 @@ pub fn args_flags_present(flags_spec: str) -> Vec<str> {
 
 **Returns:** `Vec<str>`
 
-*Defined at line 403*
+*Defined at line 404*
 
 ---
 
@@ -564,7 +565,7 @@ pub fn args_opts_present(opts_spec: str) -> Vec<str> {
 
 **Returns:** `Vec<str>`
 
-*Defined at line 408*
+*Defined at line 409*
 
 ---
 
@@ -583,7 +584,7 @@ pub fn args_positionals_exact(flags_spec: str, opts_spec: str) -> Vec<str> {
 
 **Returns:** `Vec<str>`
 
-*Defined at line 413*
+*Defined at line 414*
 
 ---
 
@@ -601,7 +602,7 @@ pub fn args_usage(spec: str) -> void {
 
 **Returns:** `void`
 
-*Defined at line 420*
+*Defined at line 421*
 
 ---
 
@@ -623,7 +624,7 @@ pub fn args_require(cond: bool, spec: str, msg: str, code: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 426*
+*Defined at line 427*
 
 ---
 
@@ -637,7 +638,7 @@ pub fn os_argc() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 438*
+*Defined at line 439*
 
 ---
 
@@ -655,7 +656,7 @@ pub fn os_argv(idx: i64) -> str {
 
 **Returns:** `str`
 
-*Defined at line 443*
+*Defined at line 444*
 
 ---
 

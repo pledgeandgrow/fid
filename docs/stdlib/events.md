@@ -25,9 +25,14 @@ index (for event_remove_at).
 *Example -- run as a test by `scripts/doctest.py`:*
 
 ```fides
-fn h(x: i64) -> i64 { return x; }
-event_on("e", h);
-assert_eq(event_count("e"), 1);
+fn h(x: i64) -> i64 {
+    return x;
+}
+fn main() -> i64 {
+    event_on("e", h);
+    assert_eq(event_count("e"), 1);
+    return 0;
+}
 ```
 
 ```fides
@@ -41,7 +46,7 @@ pub fn event_on(name: str, f: fn(i64) -> i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 48*
+*Defined at line 53*
 
 ---
 
@@ -59,7 +64,7 @@ pub fn event_off(name: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 55*
+*Defined at line 60*
 
 ---
 
@@ -78,7 +83,7 @@ pub fn event_remove_at(idx: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 72*
+*Defined at line 77*
 
 ---
 
@@ -96,7 +101,7 @@ pub fn event_count(name: str) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 81*
+*Defined at line 86*
 
 ---
 
@@ -123,7 +128,7 @@ pub fn event_emit(name: str, arg: i64) -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 98*
+*Defined at line 103*
 
 ---
 
@@ -142,7 +147,7 @@ pub fn events_dispatch(event_name: str) {
 
 - `event_name`: `str`
 
-*Defined at line 123*
+*Defined at line 128*
 
 ---
 
@@ -157,7 +162,7 @@ pub fn event_clear() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 129*
+*Defined at line 134*
 
 ---
 
@@ -176,7 +181,7 @@ pub fn event_queue(name: str, arg: i64) -> void {
 
 **Returns:** `void`
 
-*Defined at line 146*
+*Defined at line 151*
 
 ---
 
@@ -192,7 +197,7 @@ pub fn event_flush() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 154*
+*Defined at line 159*
 
 ---
 
@@ -206,7 +211,7 @@ pub fn event_queued() -> i64 {
 
 **Returns:** `i64`
 
-*Defined at line 168*
+*Defined at line 173*
 
 ---
 
