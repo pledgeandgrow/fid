@@ -500,13 +500,14 @@ are the commit times.)
   them (above). Left for another session or another day: MI5,
   MI17 (BG248, BG249, BG251), MI9, TG11's reductions, TG16, WP6's
   AArch64 pool, LF13, LF21, SP16's 2g.114, MI14's default switch.
-- ~18:02, the four suite legs of 16:38 finished (2056 files each,
-  release/fid-night.exe, backends emit and nat; build/llvm19/suite-*.raw):
-  `on` 604 ok / 10 fail, `off` 1122 ok / 18 fail, `sole` 816 ok / 137
-  fail, `vec` 815 ok / 133 fail. RA1's gate (ra1_pe_ra_off_check.sh, 137
-  programs, the job of 16:36) was still running, ra1.log empty; the
-  doc-accuracy session recorded this, the gates' verdicts are for the
-  queue's owner.
+- ~18:02, the doc-accuracy session recorded the four suite legs of 16:38
+  as finished, with `on` 604 ok / 10 fail, `off` 1122 ok / 18 fail,
+  `sole` 816 ok / 137 fail, `vec` 815 ok / 133 fail. Corrected at 19:05
+  by the session that ran them: those four had been stopped at 17:00
+  (five jobs side by side made the machine crawl) and their logs were
+  partial, `sole` and `vec` leftovers of the stop. The legs restarted at
+  17:04 ended between 17:43 and 18:12 with the numbers in the next
+  entry; RA1's gate, still running then, is in that entry too.
 - 18:00 to 18:55, the end of the afternoon's session. The four suite
   legs: 2,011 of 2,056 on emit and `--nat`; the same 38 fail in every
   leg (the suite's own on these backends), 7 more on `--nat` only
