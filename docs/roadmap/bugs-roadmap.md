@@ -2397,8 +2397,8 @@ names are the reference.
       30 (23 of them BG232; the build of 08:47 fails 21 of them);
       tests/nattools/enc_table_unit.fd, which now lists the encoders
       that had no row and the words nat_ir.fd writes itself: table ok,
-      a64 ok, rv64 ok, x64 ok on ccompile and emit, and with the tree's
-      source; scripts/disasm-check.sh: 18 ok, and test_machine_fast on
+      a64 ok, rv64 ok, x64 ok on run, ccompile and emit, and with the
+      tree's source; scripts/disasm-check.sh: 18 ok, and test_machine_fast on
       AArch64 has 0 words undecoded where LLVM decodes 2,957 (8
       before).
 - [x] BG233. **disasm one-byte forms ignore the 0x66 operand-size prefix and
