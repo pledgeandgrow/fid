@@ -260,11 +260,15 @@ Fid is young and moving fast.
     - 11–18x behind on pidigits, where its big integers are slow.
   - **Natively (`fid emit`):** slower than through C on every program. But the executables are the smallest in the table (40 KB for hello, against 123 KB for Rust), and they start as fast as Zig's.
   - [Benchmarks, losses included](docs/benchmarks.md).
-- **The package index is just starting.** `ark` installs from a path, a git repository or [the pacts index](https://github.com/pledgeandgrow/pacts) (`fid ark add textkit`, verified on Windows, Linux CI and macOS CI); few pacts are published yet.
+- **The package index is just starting.** `ark` installs from a path, a git repository or [the pacts index](https://github.com/pledgeandgrow/pacts) (`fid ark add textkit`); few pacts are published yet. The CI steps that install from the index on Linux, Windows and macOS have not passed yet.
 - **The fixpoint was last verified on Nov 21, 2026:** stage 2 and stage 3 were byte-identical on that day's ~361K-line tree. Builds since (Nov 25, Nov 27, v0.8.5/v0.8.6-unstable) are one stage from a self-hosted `fid`; the Nov 25 one passes the leak gate (11 of 11).
-- **The full test suite has a pass rate only on the interpreter.** Nov 25, with `fid` as the compiler: 1,897 of 1,983 pass on `run` (82 of the failures fail the same with the earlier compiler, 4 are timeouts).
-  - On Nov 27 the suite was run on `emit` and `--nat` for the first time, to compare optimizer settings. Its log records 604 programs passing and 10 failing with the default settings ([goal workflow](docs/roadmap/goal-workflow.md), L12).
-  - The C lane of the whole suite has not been rerun. Features are checked with their own tests on each backend.
+- **The whole test suite on each backend.**
+  - **Interpreter (Nov 25):** 1,897 of 1,983 pass on `run`, with `fid` as the compiler. 82 of the failures fail the same with the earlier compiler; 4 are timeouts.
+  - **Native, both backends (Nov 27, the first such run):** 2,011 of the 2,056 programs in `tests/bootstrap` pass on `emit` and on `--nat`.
+    - 38 fail on both: 13 don't compile, 8 hit PE generation errors, and the rest are bare-metal or boot programs and tests that need SDL2 or a C header.
+    - 7 fail on `--nat` only.
+    - Details in the [LLVM roadmap](docs/roadmap/llvm-roadmap.md), WP14.
+  - **C:** not rerun.
 - **CI is red.**
   - None of the runs GitHub still has for `ci.yml` (88), `tier1.yml` (89) or `macos-native.yml` (20), going back to Nov 21, has passed.
   - Most jobs stop while building `fid`, on the stage-0 binaries and the memory of GitHub's runners.
