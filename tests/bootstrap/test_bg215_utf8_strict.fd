@@ -1,0 +1,102 @@
+// BG215 (docs/roadmap/bugs-roadmap.md): the UTF-8 decoders give U+FFFD for
+// an overlong, surrogate or out-of-range sequence, one replacement per bad
+// byte, as their documentation promises. Before, E0 80 AF decoded to '/'
+// and uni_lower / uni_nfc turned ".. C0 AF x" into "../x".
+//
+// Expected output:
+// overlong E0 80 AF: 65533 65533 65533 65 | 65533 65533 65533 65
+// surrogate ED A0 80: 65533 65533 65533 65 | 65533 65533 65533 65
+// too far F4 90 80 80: 65533 65533 65533 65533 65 | 65533 65533 65533 65533 65
+// overlong C0 AF: 65533 65533 65 | 65533 65533 65
+// valid: 8364 128512 55295 57344 128 1114111 | 8364 128512 55295 57344 128 1114111
+// utf8_valid, the four bad ones: false false false false
+// lowest encodings are kept: true true
+// uni_lower, uni_nfc of ".. C0 AF x" are "../x": false false
+use encoding;
+use unicode;
+
+// `n` bytes, then "A" (65)
+fn seq(a: i64, b: i64, c: i64, d: i64, n: i64) -> str {
+    var v = Vec::new();
+    if n > 0 { v.push(a); }
+    if n > 1 { v.push(b); }
+    if n > 2 { v.push(c); }
+    if n > 3 { v.push(d); }
+    v.push(65);
+    return enc_bytes_to_str(v);
+}
+
+// both decoders, every codepoint
+fn both(s: str) -> str {
+    var a = utf8_decode(s);
+    var b = uni_to_codepoints(s);
+    var out = "";
+    var i = 0;
+    while i < a.len() {
+        if i > 0 {
+            out = out + " ";
+        }
+        out = out + f"{a.get(i)}";
+        i = i + 1;
+    }
+    out = out + " |";
+    i = 0;
+    while i < b.len() {
+        out = out + " ";
+        out = out + f"{b.get(i)}";
+        i = i + 1;
+    }
+    return out;
+}
+
+fn valid_one(s: str) -> bool {
+    return utf8_decode(s).get(0) != 65533;
+}
+
+fn main() -> i64 {
+    println(f"overlong E0 80 AF: {both(seq(0xE0, 0x80, 0xAF, 0, 3))}");
+    println(f"surrogate ED A0 80: {both(seq(0xED, 0xA0, 0x80, 0, 3))}");
+    println(f"too far F4 90 80 80: {both(seq(0xF4, 0x90, 0x80, 0x80, 4))}");
+    println(f"overlong C0 AF: {both(seq(0xC0, 0xAF, 0, 0, 2))}");
+
+    var good = Vec::new();
+    good.push(0xE2); good.push(0x82); good.push(0xAC);
+    good.push(0xF0); good.push(0x9F); good.push(0x98); good.push(0x80);
+    good.push(0xED); good.push(0x9F); good.push(0xBF);
+    good.push(0xEE); good.push(0x80); good.push(0x80);
+    good.push(0xC2); good.push(0x80);
+    good.push(0xF4); good.push(0x8F); good.push(0xBF); good.push(0xBF);
+    println(f"valid: {both(enc_bytes_to_str(good))}");
+
+    print("utf8_valid, the four bad ones: ");
+    print(utf8_valid(seq(0xE0, 0x80, 0xAF, 0, 3)));
+    print(" ");
+    print(utf8_valid(seq(0xED, 0xA0, 0x80, 0, 3)));
+    print(" ");
+    print(utf8_valid(seq(0xF4, 0x90, 0x80, 0x80, 4)));
+    print(" ");
+    print(utf8_valid(seq(0xC0, 0xAF, 0, 0, 2)));
+    print("\n");
+
+    // the lowest and highest encodings stay valid
+    var edge = Vec::new();
+    edge.push(0xC2); edge.push(0x80);
+    edge.push(0xE0); edge.push(0xA0); edge.push(0x80);
+    edge.push(0xF0); edge.push(0x90); edge.push(0x80); edge.push(0x80);
+    var edges = enc_bytes_to_str(edge);
+    println(f"lowest encodings are kept: {valid_one(edges)} {utf8_valid(edges)}");
+
+    var t = seq2();
+    print("uni_lower, uni_nfc of \".. C0 AF x\" are \"../x\": ");
+    print(uni_lower(t) == "../x");
+    print(" ");
+    print(uni_nfc(t) == "../x");
+    print("\n");
+    return 0;
+}
+
+fn seq2() -> str {
+    var v = Vec::new();
+    v.push(0x2E); v.push(0x2E); v.push(0xC0); v.push(0xAF); v.push(0x78);
+    return enc_bytes_to_str(v);
+}

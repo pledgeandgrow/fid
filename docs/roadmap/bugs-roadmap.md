@@ -2037,7 +2037,7 @@ names are the reference.
       Fixed Nov 24 (stdlib/http.fd `hc_take`, `hc_chunked`,
       `http_read_message`: a body cut off by end of input or a timeout leaves
       `method` ""); test_std_http_framing passes on C and emit (Nov 25).
-- [ ] BG215. **UTF-8 decoders accept overlong, surrogate and out-of-range
+- [x] BG215. **UTF-8 decoders accept overlong, surrogate and out-of-range
       sequences.** stdlib/encoding.fd `utf8_decode` skips the checks
       `utf8_valid_bytes` does (its doc promises U+FFFD), and stdlib/unicode.fd
       `uni_to_codepoints` accepts any `C0`–`DF` lead byte, so a byte-level
@@ -2046,6 +2046,15 @@ names are the reference.
       90 80 80` to 1114112; `uni_lower`/`uni_nfc` of `.. C0 AF x` return
       `../x` while `utf8_valid` says false. Confirmed Nov 24 (run).
       Confidence: high.
+      Fixed Nov 27: encoding.fd `utf8_seq_ok` (continuation bytes and the
+      first one's range) is now what both `utf8_valid_bytes` and
+      `utf8_decode` check, and an invalid sequence gives U+FFFD and consumes
+      one byte; unicode.fd `uni_to_codepoints` takes no lead byte below C2
+      and checks the second byte through `uni_lead_ok`. Test
+      test_bg215_utf8_strict (the four triggers, the lowest encodings, and
+      `uni_lower`/`uni_nfc` of `.. C0 AF x`): passes on run, ccompile and
+      emit with the fid-dev of Nov 25; test_encoding, test_lib_unicode,
+      test_std_jni and test_std_push unchanged.
 - [ ] BG216. **`tls_crypto::x25519` gets RFC 7748's second test vector
       wrong.** stdlib/tls_crypto.fd `x25519` does not mask bit 255 of u before
       `mod p` (RFC 7748 §5), and its swap is a secret-dependent `if`;
