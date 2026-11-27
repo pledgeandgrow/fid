@@ -7032,6 +7032,11 @@ Same rules as the first run:
       reached from Nov 23 to Nov 27 (the build step before it died).
       `assert_eq(args_positionals_len(), 0)` (a plain call) is right: the
       receiver's type is taken when the argument is a method call. Same
+      kind of trigger, `assert_eq(image_get_pixel(&a, 0, 0), 0xFF)`,
+      is lowered the same way (the reference's type) and passes only
+      while the two words compare equal under the wrong instance. The
+      args example was rewritten as `assert(n == ps.len())` so the doc
+      step does not wait for the fix; the bug stays.
       family as BG271 (the parameter taken from the wrong argument).
       Confirmed Nov 27 on release/fid-night.exe and release/stage0/fid.exe;
       the IR read with `fid explain --stages main`. Confidence: high.
