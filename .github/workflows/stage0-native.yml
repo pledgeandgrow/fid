@@ -86,7 +86,7 @@ jobs:
           sed 's/^int main(int argc, char\*\* argv)/int fides_main(int argc, char** argv)/' build/fid-raw.c > build/fid-wrapped.c
           grep -c "^int fides_main" build/fid-wrapped.c
           cat scripts/stackwrap.c >> build/fid-wrapped.c
-          # [3/4] split into 16 units, compile at -O2 (retry alone at -O0)
+          # [3/4] split into 16 units, compile at -O0 (LLVM -O2 kills the runner on the giant units, 2g.86 — no retry can fire when the runner itself dies; the seed is slower but exists)
           ./build/seed-x64 split-c build/fid-wrapped.c build/fidu 16
           case "${{ matrix.target }}" in
             aarch64-linux)  TRIP=aarch64-linux-musl;  LIBS="-lm -lpthread -ldl -lunwind" ;;
@@ -98,14 +98,13 @@ jobs:
           : > build/cc.log
           compile_one() {
             u="$1"
-            "$ZIG" cc -target "$TRIP" -O2 -fno-strict-aliasing -fwrapv -c "$u" -o "${u%.c}.o" 2>> build/cc.log \
-              || "$ZIG" cc -target "$TRIP" -O0 -fno-strict-aliasing -fwrapv -fno-sanitize=all -c "$u" -o "${u%.c}.o" 2>> build/cc.log
+            "$ZIG" cc -target "$TRIP" -O0 -fno-strict-aliasing -fwrapv -fno-sanitize=all -c "$u" -o "${u%.c}.o" 2>> build/cc.log \
           }
           export -f compile_one; export ZIG TRIP
           ls build/fidu_*.c | xargs -P 2 -I{} bash -c 'compile_one "$@"' _ {} || { echo "unit compile failed:"; tail -20 build/cc.log; exit 1; }
           ls build/fidu_*.o | wc -l
           # [4/4] link
-          "$ZIG" cc -target "$TRIP" -O2 -o release/fid-dev build/fidu_*.o $LIBS 2>> build/cc.log || { echo "link failed:"; tail -20 build/cc.log; exit 1; }
+          "$ZIG" cc -target "$TRIP" -O0 -o release/fid-dev build/fidu_*.o $LIBS 2>> build/cc.log || { echo "link failed:"; tail -20 build/cc.log; exit 1; }
           ls -la release/fid-dev
       - name: Smoke test (qemu - real execution)
         if: matrix.emu == 'qemu'
