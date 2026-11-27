@@ -111,7 +111,7 @@ the file), `deferred` (cannot be done on this machine), with the reason.
 | # | Goal | What is wrong | Files | Gate | Status |
 |---|---|---|---|---|---|
 | 1 | BG215 | UTF-8 decoders accept overlong, surrogate and out-of-range sequences | `stdlib/encoding.fd` (`utf8_decode`), `stdlib/unicode.fd` (`uni_to_codepoints`) | the entry's trigger bytes give U+FFFD; `uni_lower`/`uni_nfc` of `.. C0 AF x` keep the bytes | done (Nov 27 02:25) |
-| 2 | BG217 | decimal: a negative scale prints the wrong value | `stdlib/decimal.fd` (`dec_round`, `dec_div`, `dec_to_str`) | `dec_round(dec_parse("1234"), -2, DEC_HALF_UP)` is 1200; `dec_div(1000, 3, -1, DEC_HALF_UP)` is 330 | todo |
+| 2 | BG217 | decimal: a negative scale prints the wrong value | `stdlib/decimal.fd` (`dec_round`, `dec_div`, `dec_to_str`) | `dec_round(dec_parse("1234"), -2, DEC_HALF_UP)` is 1200; `dec_div(1000, 3, -1, DEC_HALF_UP)` is 330 | done (Nov 27 02:40) |
 | 3 | BG238 | `Money_print` writes negative amounts wrong | `stdlib/money.fd` | `Money_new(-5)` prints `-$0.05`, `-105` prints `-$1.05` | todo |
 | 4 | BG239 | `hkdf_expand` does not reject a length over 255 * 32 | `stdlib/tls_crypto.fd` | a length of 8161 is an error; RFC 5869 vectors still pass | todo |
 | 5 | BG223 | `url_resolve` builds broken or lossy URLs; path decoded too early | `stdlib/url.fd` | the entry's triggers (IPv6 host, userinfo, `%2F` in the path) | todo |
@@ -190,3 +190,6 @@ One line per run: time, what was done, what is next.
 - Nov 27 02:08 (the session that created the workflow): BG215 fixed in
   `stdlib/encoding.fd` and `stdlib/unicode.fd`; `test_bg215_utf8_strict`
   passes on run, ccompile and emit. Next: BG217.
+- Nov 27 02:40: BG217 fixed in `stdlib/decimal.fd` (`dec_to_str`,
+  `dec_from_units`); `test_bg217_decimal_negative_scale` passes on run,
+  ccompile and emit. Next: BG238.

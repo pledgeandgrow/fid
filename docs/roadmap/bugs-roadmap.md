@@ -2062,12 +2062,19 @@ names are the reference.
       the module tls13, tls_record and quic import. Trigger: §5.2 vector 2
       gives `d5f33573…` (want `95cbde94…`); vector 1 is right. Confirmed Nov
       24 (ccompile). Confidence: high.
-- [ ] BG217. **decimal: a negative scale prints the wrong value.**
+- [x] BG217. **decimal: a negative scale prints the wrong value.**
       stdlib/decimal.fd `dec_round` and `dec_div` accept and keep a negative
       scale, and `dec_to_str` prints the mantissa for any scale <= 0 without
       multiplying by 10^-scale. Triggers: `dec_round(dec_parse("1234"), -2,
       DEC_HALF_UP)` prints 12 (want 1200); `dec_div(1000, 3, -1, DEC_HALF_UP)`
       prints 33 (want 330). Confirmed Nov 24. Confidence: high.
+      Fixed Nov 27: `dec_to_str` writes the mantissa followed by `-scale`
+      zeros (zero stays `0`); `dec_from_units` with a negative scale now
+      multiplies instead of dropping the factor. The arithmetic was right
+      and is unchanged. Test test_bg217_decimal_negative_scale (the two
+      triggers, ties both ways, a negative value, zero, add and mul with a
+      negative scale): passes on run, ccompile and emit with the fid-dev of
+      Nov 25; test_decimal and test_std_tariff unchanged.
 - [ ] BG218. **Two `impl Show for P` in one file are accepted; the later one
       wins.** The CL7 conflict check (compiler.fd) compares only modules.
       Confirmed Nov 24. Confidence: high.

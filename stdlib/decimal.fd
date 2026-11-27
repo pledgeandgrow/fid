@@ -66,17 +66,20 @@ pub fn dec_from_i64(n: i64) -> Decimal {
     };
 }
 
-/// units / 10^scale: dec_from_units(1250, 2) is 12.50.
+/// units / 10^scale: dec_from_units(1250, 2) is 12.50. A negative scale
+/// multiplies: dec_from_units(12, -2) is 1200.
 ///
 /// Example:
 ///   assert_eq(dec_to_str(dec_from_units(1250, 2)), "12.50");
 pub fn dec_from_units(units: i64, scale: i64) -> Decimal {
+    var m: BigInt = bigint_from_i64(units);
     var s: i64 = scale;
     if s < 0 {
+        m = bigint_mul(m, dec_pow10(0 - s));
         s = 0;
     }
     return Decimal {
-        m: bigint_from_i64(units), scale: s
+        m: m, scale: s
     };
 }
 
@@ -155,6 +158,14 @@ pub fn dec_parse(text: str) -> Decimal {
 pub fn dec_to_str(d: Decimal) -> str {
     var neg: bool = bigint_lt(d.m, bigint_zero());
     var digits: str = bigint_to_str(bigint_abs(d.m));
+    if d.scale < 0 && !bigint_is_zero(d.m) {
+        // m / 10^scale with a negative scale: the mantissa, then zeros
+        var k: i64 = 0 - d.scale;
+        while k > 0 {
+            digits = digits + "0";
+            k = k - 1;
+        }
+    }
     if d.scale <= 0 {
         if neg {
             return "-" + digits;
