@@ -46,3 +46,8 @@ under `fid run`.
   the next line as a new statement). A line that ends in an operator or
   a next line that starts with one is still joined (`w = w` / `- 1`,
   `x == 1` / `&& z == 4`). Both files print `1both` and `4 4 5`.
+- `cast`: after `as` and `is` a `*` starts the type (`a as *mut u8`,
+  `(a + 1) as *const u8`), as it does in a declaration: it is no product
+  and keeps no space. The printer took it for a binary `*` and wrote
+  `as * mut u8`, which kept the 19 stdlib modules with such a cast from
+  passing `fid fmt --check`. Both files print `4096`, `4096`, `4097`, `6`.

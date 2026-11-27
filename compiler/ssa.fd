@@ -44,7 +44,14 @@
 // off. With --validate (compiler/tv.fd) the result is checked against the
 // function as it was before.
 
-module compiler::ssa; use core; use vec; use string; use compiler::ast; use compiler::ir; use compiler::checks;  /// Most phis placed in one function; with more, it is left as it is.
+module compiler::ssa;
+use core;
+use vec;
+use string;
+use compiler::ast;
+use compiler::ir;
+use compiler::checks;
+/// Most phis placed in one function; with more, it is left as it is.
 const SSA_MAX_PHIS: i64 = 20000;
 
 // --- Helpers ----------------------------------------------------------------
@@ -106,7 +113,7 @@ fn ssa_scalar(t: IrType) -> bool {
 
 /// The type of value `id`: a parameter's declared type (it has no
 /// instruction), else its recorded type; Void when neither is known.
-pub fn ssa_vty(f: & IrFunction, id: i64) -> IrType {
+pub fn ssa_vty(f: &IrFunction, id: i64) -> IrType {
     var pi: i64 = 0;
     while pi < f.params.len() {
         if f.params.get(pi).id == id {
@@ -124,7 +131,7 @@ pub fn ssa_vty(f: & IrFunction, id: i64) -> IrType {
     return IrType::Void;
 }
 
-fn ssa_alloca_ty(f: & IrFunction, a: i64) -> IrType {
+fn ssa_alloca_ty(f: &IrFunction, a: i64) -> IrType {
     match peir_inst_of(f, a) {
         Inst::Alloca(t, _) => {
             return t;
@@ -137,7 +144,7 @@ fn ssa_alloca_ty(f: & IrFunction, a: i64) -> IrType {
 
 /// Does a store of `sv` (declared type `ot`) put a value of exactly the
 /// local's type `t` in it?
-fn ssa_store_ok(f: & IrFunction, ot: OptIrType, sv: i64, t: IrType) -> bool {
+fn ssa_store_ok(f: &IrFunction, ot: OptIrType, sv: i64, t: IrType) -> bool {
     match ot {
         OptIrType::Some(st) => {
             if !ir_type_eq(st, t) {
@@ -166,7 +173,7 @@ fn ssa_is_jump(inst: Inst) -> bool {
 
 /// Does `f` hold an instruction whose value operands the renaming cannot
 /// follow (TryUnwrap names a destination, Asm its outputs)?
-fn ssa_has_unhandled(f: & IrFunction) -> bool {
+fn ssa_has_unhandled(f: &IrFunction) -> bool {
     var b: i64 = 0;
     while b < f.blocks.len() {
         var ids: Vec<i64> = f.blocks.get(b).instructions;
@@ -190,7 +197,7 @@ fn ssa_has_unhandled(f: & IrFunction) -> bool {
 }
 
 /// What `v0` names after the replacements in `repl` (id -> new id + 1).
-fn ssa_resolve(repl: & Vec<i64>, v0: i64) -> i64 {
+fn ssa_resolve(repl: &Vec<i64>, v0: i64) -> i64 {
     var v: i64 = v0;
     var hops: i64 = 0;
     while v >= 0 && v < repl.len() && repl.get(v) != 0 && hops < 1000000 {
@@ -200,16 +207,16 @@ fn ssa_resolve(repl: & Vec<i64>, v0: i64) -> i64 {
     return v;
 }
 
-fn ssa_top(stacks: & Vec<Vec<i64>>, c: i64) -> i64 {
+fn ssa_top(stacks: &Vec<Vec<i64>>, c: i64) -> i64 {
     var s: Vec<i64> = stacks.get(c);
     if s.len() == 0 {
-        return - 1;
+        return -1;
     }
     return s.get(s.len() - 1);
 }
 
 /// A new instruction in `f` that is in no block yet.
-fn ssa_detached(f: & mut IrFunction, inst: Inst) -> i64 {
+fn ssa_detached(f: &mut IrFunction, inst: Inst) -> i64 {
     var saved: i64 = f.current_block_idx;
     if saved < 0 || saved >= f.blocks.len() {
         f.current_block_idx = 0;
@@ -223,7 +230,7 @@ fn ssa_detached(f: & mut IrFunction, inst: Inst) -> i64 {
     return id;
 }
 
-fn ssa_is_const(f: & IrFunction, nv: i64, v: i64) -> bool {
+fn ssa_is_const(f: &IrFunction, nv: i64, v: i64) -> bool {
     if v < 0 || v >= nv {
         return false;
     }
@@ -237,7 +244,7 @@ fn ssa_is_const(f: & IrFunction, nv: i64, v: i64) -> bool {
     }
 }
 
-fn ssa_const_val(f: & IrFunction, v: i64) -> i64 {
+fn ssa_const_val(f: &IrFunction, v: i64) -> i64 {
     match peir_inst_of(f, v) {
         Inst::ConstInt(c, _) => {
             return c;
@@ -248,14 +255,14 @@ fn ssa_const_val(f: & IrFunction, v: i64) -> i64 {
     }
 }
 
-fn ssa_m(map: & Vec<i64>, id: i64) -> i64 {
+fn ssa_m(map: &Vec<i64>, id: i64) -> i64 {
     if id >= 0 && id < map.len() && map.get(id) != 0 {
         return map.get(id) - 1;
     }
     return id;
 }
 
-fn ssa_m_vec(map: & Vec<i64>, v: Vec<i64>) -> Vec<i64> {
+fn ssa_m_vec(map: &Vec<i64>, v: Vec<i64>) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     var i: i64 = 0;
     while i < v.len() {
@@ -267,7 +274,7 @@ fn ssa_m_vec(map: & Vec<i64>, v: Vec<i64>) -> Vec<i64> {
 
 /// `inst` with its value operands renamed through `map` (id -> new id + 1).
 /// TryUnwrap and Asm never reach here (ssa_has_unhandled).
-pub fn ssa_remap(inst: Inst, map: & Vec<i64>) -> Inst {
+pub fn ssa_remap(inst: Inst, map: &Vec<i64>) -> Inst {
     match inst {
         Inst::BinOp(op, a, b, t) => {
             return Inst::BinOp(op, ssa_m(map, a), ssa_m(map, b), t);
@@ -348,7 +355,7 @@ pub fn ssa_remap(inst: Inst, map: & Vec<i64>) -> Inst {
 }
 
 /// Rename the operands of every instruction of `f` through `map`.
-fn ssa_apply_map(f: & mut IrFunction, map: & Vec<i64>) {
+fn ssa_apply_map(f: &mut IrFunction, map: &Vec<i64>) {
     var i: i64 = 0;
     while i < f.insts.len() {
         var entry: ValueIdInst = f.insts.get(i);
@@ -394,7 +401,7 @@ pub struct SsaState {
 }
 
 /// The scalar allocas of `f` that can become values (step 1).
-fn ssa_candidates(f: & IrFunction, cfg: & IroCfg, blk_of: & Vec<i64>, pos_of: & Vec<i64>) -> Vec<i64> {
+fn ssa_candidates(f: &IrFunction, cfg: &IroCfg, blk_of: &Vec<i64>, pos_of: &Vec<i64>) -> Vec<i64> {
     var nv: i64 = blk_of.len();
     var ok: Vec<i64> = peir_zeros(nv);
     var b: i64 = 0;
@@ -455,7 +462,7 @@ fn ssa_candidates(f: & IrFunction, cfg: & IroCfg, blk_of: & Vec<i64>, pos_of: & 
                 var uid: i64 = ids2.get(k2);
                 var inst: Inst = peir_inst_of(f, uid);
                 var ops: Vec<i64> = Vec::new();
-                peir_inst_operands(inst, & mut ops);
+                peir_inst_operands(inst, &mut ops);
                 var o: i64 = 0;
                 while o < ops.len() {
                     var v: i64 = ops.get(o);
@@ -495,7 +502,7 @@ fn ssa_candidates(f: & IrFunction, cfg: & IroCfg, blk_of: & Vec<i64>, pos_of: & 
 }
 
 /// Dominance frontiers (Cooper, Harvey and Kennedy) of the reachable blocks.
-fn ssa_frontiers(cfg: & IroCfg) -> Vec<Vec<i64>> {
+fn ssa_frontiers(cfg: &IroCfg) -> Vec<Vec<i64>> {
     var n: i64 = cfg.n;
     var df: Vec<Vec<i64>> = Vec::new();
     var b: i64 = 0;
@@ -503,7 +510,7 @@ fn ssa_frontiers(cfg: & IroCfg) -> Vec<Vec<i64>> {
         df.push(Vec::new());
         b = b + 1;
     }
-    var mark: Vec<i64> = ssa_fill(n, - 1);
+    var mark: Vec<i64> = ssa_fill(n, -1);
     b = 0;
     while b < n {
         if cfg.rpo_num.get(b) >= 0 {
@@ -532,7 +539,7 @@ fn ssa_frontiers(cfg: & IroCfg) -> Vec<Vec<i64>> {
                             }
                             var up: i64 = cfg.idom.get(runner);
                             if up == runner {
-                                runner = - 1;
+                                runner = -1;
                             } else {
                                 runner = up;
                             }
@@ -549,7 +556,7 @@ fn ssa_frontiers(cfg: & IroCfg) -> Vec<Vec<i64>> {
 }
 
 /// The dominator tree as children lists.
-fn ssa_dom_kids(cfg: & IroCfg) -> Vec<Vec<i64>> {
+fn ssa_dom_kids(cfg: &IroCfg) -> Vec<Vec<i64>> {
     var kids: Vec<Vec<i64>> = Vec::new();
     var b: i64 = 0;
     while b < cfg.n {
@@ -571,12 +578,12 @@ fn ssa_dom_kids(cfg: & IroCfg) -> Vec<Vec<i64>> {
 
 /// Step 2: phis at the iterated dominance frontiers of each candidate's
 /// stores. False when there would be too many.
-fn ssa_place_phis(f: & IrFunction, cfg: & IroCfg, st: & mut SsaState) -> bool {
+fn ssa_place_phis(f: &IrFunction, cfg: &IroCfg, st: &mut SsaState) -> bool {
     var n: i64 = cfg.n;
     var nc: i64 = st.cands.len();
     // the blocks that store each candidate
     var defs: Vec<Vec<i64>> = Vec::new();
-    var lastb: Vec<i64> = ssa_fill(nc, - 1);
+    var lastb: Vec<i64> = ssa_fill(nc, -1);
     var c: i64 = 0;
     while c < nc {
         defs.push(Vec::new());
@@ -608,8 +615,8 @@ fn ssa_place_phis(f: & IrFunction, cfg: & IroCfg, st: & mut SsaState) -> bool {
         }
         b = b + 1;
     }
-    var has_phi: Vec<i64> = ssa_fill(n, - 1);
-    var queued: Vec<i64> = ssa_fill(n, - 1);
+    var has_phi: Vec<i64> = ssa_fill(n, -1);
+    var queued: Vec<i64> = ssa_fill(n, -1);
     c = 0;
     while c < nc {
         var work: Vec<i64> = Vec::new();
@@ -641,9 +648,9 @@ fn ssa_place_phis(f: & IrFunction, cfg: & IroCfg, st: & mut SsaState) -> bool {
                     var pj: i64 = 0;
                     while pj < ps.len() {
                         if cfg.rpo_num.get(ps.get(pj)) >= 0 {
-                            ins.push(- 1);
+                            ins.push(-1);
                         } else {
-                            ins.push(- 4);
+                            ins.push(-4);
                         }
                         pj = pj + 1;
                     }
@@ -669,7 +676,7 @@ fn ssa_place_phis(f: & IrFunction, cfg: & IroCfg, st: & mut SsaState) -> bool {
 }
 
 /// Push value `v` on candidate `c`'s stack and log the push.
-fn ssa_push(stacks: & mut Vec<Vec<i64>>, plog: & mut Vec<i64>, c: i64, v: i64) {
+fn ssa_push(stacks: &mut Vec<Vec<i64>>, plog: &mut Vec<i64>, c: i64, v: i64) {
     var s: Vec<i64> = stacks.get(c);
     s.push(v);
     stacks.set(c, s);
@@ -678,7 +685,7 @@ fn ssa_push(stacks: & mut Vec<Vec<i64>>, plog: & mut Vec<i64>, c: i64, v: i64) {
 
 /// Step 3 for one block: its phis and instructions, then the phi inputs of
 /// its successors.
-fn ssa_rename_block(f: & IrFunction, cfg: & IroCfg, st: & mut SsaState, stacks: & mut Vec<Vec<i64>>, plog: & mut Vec<i64>, b: i64) {
+fn ssa_rename_block(f: &IrFunction, cfg: &IroCfg, st: &mut SsaState, stacks: &mut Vec<Vec<i64>>, plog: &mut Vec<i64>, b: i64) {
     var lb: Vec<i64> = st.ph_at.get(b);
     var li: i64 = 0;
     while li < lb.len() {
@@ -706,9 +713,9 @@ fn ssa_rename_block(f: & IrFunction, cfg: & IroCfg, st: & mut SsaState, stacks: 
             Inst::Store(p, sv, _) => {
                 if p >= 0 && p < st.nv && st.cidx.get(p) >= 0 && id >= 0 && id < st.nv {
                     var c2: i64 = st.cidx.get(p);
-                    var rsv: i64 = ssa_resolve(& st.repl, sv);
+                    var rsv: i64 = ssa_resolve(&st.repl, sv);
                     ssa_push(stacks, plog, c2, rsv);
-                    if st.first_val.get(c2) == - 1 {
+                    if st.first_val.get(c2) == -1 {
                         st.first_val.set(c2, rsv);
                     }
                     st.kill.set(id, 1);
@@ -745,12 +752,12 @@ fn ssa_rename_block(f: & IrFunction, cfg: & IroCfg, st: & mut SsaState, stacks: 
 
 /// Step 3: rename over the dominator tree (an explicit stack: deep trees do
 /// not recurse).
-fn ssa_rename(f: & IrFunction, cfg: & IroCfg, st: & mut SsaState) {
+fn ssa_rename(f: &IrFunction, cfg: &IroCfg, st: &mut SsaState) {
     var stacks: Vec<Vec<i64>> = Vec::new();
     var c: i64 = 0;
     while c < st.cands.len() {
         var s0: Vec<i64> = Vec::new();
-        s0.push(- 1);
+        s0.push(-1);
         stacks.push(s0);
         c = c + 1;
     }
@@ -766,7 +773,7 @@ fn ssa_rename(f: & IrFunction, cfg: & IroCfg, st: & mut SsaState) {
             fb.push(pending);
             fk.push(0);
             fl.push(plog.len());
-            ssa_rename_block(f, cfg, st, & mut stacks, & mut plog, pending);
+            ssa_rename_block(f, cfg, st, &mut stacks, &mut plog, pending);
             entering = false;
         }
         if fb.len() == 0 {
@@ -798,7 +805,7 @@ fn ssa_rename(f: & IrFunction, cfg: & IroCfg, st: & mut SsaState) {
 
 /// Step 4a: a phi whose inputs (other than itself) are all one value is that
 /// value. An input no store reaches keeps the phi.
-fn ssa_trivial_phis(st: & mut SsaState) {
+fn ssa_trivial_phis(st: &mut SsaState) {
     var np: i64 = st.ph_block.len();
     var again: bool = true;
     var round: i64 = 0;
@@ -808,18 +815,18 @@ fn ssa_trivial_phis(st: & mut SsaState) {
         while k < np {
             if st.ph_gone.get(k) == 0 {
                 var me: i64 = st.nv + k;
-                var only: i64 = - 2;
+                var only: i64 = -2;
                 var ins: Vec<i64> = st.ph_in.get(k);
                 var j: i64 = 0;
                 while j < ins.len() {
                     var x: i64 = ins.get(j);
-                    if x != - 4 {
-                        var r: i64 = ssa_resolve(& st.repl, x);
+                    if x != -4 {
+                        var r: i64 = ssa_resolve(&st.repl, x);
                         if r != me {
-                            if only == - 2 {
+                            if only == -2 {
                                 only = r;
                             } else if only != r {
-                                only = - 3;
+                                only = -3;
                             }
                         }
                     }
@@ -838,18 +845,18 @@ fn ssa_trivial_phis(st: & mut SsaState) {
 }
 
 /// The phi value `v` names after the replacements (-1 when it names none).
-fn ssa_phi_of(st: & SsaState, v: i64) -> i64 {
-    var r: i64 = ssa_resolve(& st.repl, v);
+fn ssa_phi_of(st: &SsaState, v: i64) -> i64 {
+    var r: i64 = ssa_resolve(&st.repl, v);
     if r >= st.nv && r < st.nv + st.ph_block.len() {
         return r - st.nv;
     }
-    return - 1;
+    return -1;
 }
 
 /// Step 4b (ME15): the phis the program reads, directly or through other
 /// phis; then a read phi with an input no store reaches keeps its
 /// candidate in memory.
-fn ssa_live_phis(f: & IrFunction, cfg: & IroCfg, st: & mut SsaState) {
+fn ssa_live_phis(f: &IrFunction, cfg: &IroCfg, st: &mut SsaState) {
     var work: Vec<i64> = Vec::new();
     var b: i64 = 0;
     while b < f.blocks.len() {
@@ -860,7 +867,7 @@ fn ssa_live_phis(f: & IrFunction, cfg: & IroCfg, st: & mut SsaState) {
                 var id: i64 = ids.get(k);
                 if id < 0 || id >= st.nv || st.kill.get(id) == 0 {
                     var ops: Vec<i64> = Vec::new();
-                    peir_inst_operands(peir_inst_of(f, id), & mut ops);
+                    peir_inst_operands(peir_inst_of(f, id), &mut ops);
                     var o: i64 = 0;
                     while o < ops.len() {
                         var p: i64 = ssa_phi_of(st, ops.get(o));
@@ -882,7 +889,7 @@ fn ssa_live_phis(f: & IrFunction, cfg: & IroCfg, st: & mut SsaState) {
         var j: i64 = 0;
         while j < ins.len() {
             var x: i64 = ins.get(j);
-            if x != - 4 {
+            if x != -4 {
                 var p2: i64 = ssa_phi_of(st, x);
                 if p2 >= 0 && st.ph_live.get(p2) == 0 {
                     st.ph_live.set(p2, 1);
@@ -899,7 +906,7 @@ fn ssa_live_phis(f: & IrFunction, cfg: & IroCfg, st: & mut SsaState) {
             var j2: i64 = 0;
             while j2 < ins2.len() {
                 var x2: i64 = ins2.get(j2);
-                if x2 != - 4 && ssa_resolve(& st.repl, x2) < 0 {
+                if x2 != -4 && ssa_resolve(&st.repl, x2) < 0 {
                     st.bad.set(st.ph_cand.get(k2), 1);
                 }
                 j2 = j2 + 1;
@@ -910,10 +917,10 @@ fn ssa_live_phis(f: & IrFunction, cfg: & IroCfg, st: & mut SsaState) {
 }
 
 /// A fresh state for the candidates flagged in `ok` (per value).
-fn ssa_state(f: & IrFunction, cfg: & IroCfg, ok: & Vec<i64>, df: Vec<Vec<i64>>, kids: Vec<Vec<i64>>) -> SsaState {
+fn ssa_state(f: &IrFunction, cfg: &IroCfg, ok: &Vec<i64>, df: Vec<Vec<i64>>, kids: Vec<Vec<i64>>) -> SsaState {
     var nv: i64 = ok.len();
     var cands: Vec<i64> = Vec::new();
-    var cidx: Vec<i64> = ssa_fill(nv, - 1);
+    var cidx: Vec<i64> = ssa_fill(nv, -1);
     var v: i64 = 0;
     while v < nv {
         if ok.get(v) == 1 {
@@ -930,7 +937,7 @@ fn ssa_state(f: & IrFunction, cfg: & IroCfg, ok: & Vec<i64>, df: Vec<Vec<i64>>, 
     }
     var bad: Vec<i64> = peir_zeros(cands.len());
     return SsaState {
-        nv: nv, cands: cands, cidx: cidx, df: df, kids: kids, ph_block: Vec::new(), ph_cand: Vec::new(), ph_in: Vec::new(), ph_at: at, ph_gone: Vec::new(), ph_live: Vec::new(), repl: peir_zeros(nv), kill: peir_zeros(nv), bad: bad, first_val: ssa_fill(cands.len(), - 1)
+        nv: nv, cands: cands, cidx: cidx, df: df, kids: kids, ph_block: Vec::new(), ph_cand: Vec::new(), ph_in: Vec::new(), ph_at: at, ph_gone: Vec::new(), ph_live: Vec::new(), repl: peir_zeros(nv), kill: peir_zeros(nv), bad: bad, first_val: ssa_fill(cands.len(), -1)
     };
 }
 
@@ -965,7 +972,7 @@ pub fn ssa_exit_stats_line() -> str {
 
 /// Is resolved value `r` (a phi when >= st.nv) an i64 defined outside the
 /// loop `body` (a parameter, or in a block the loop does not hold)?
-fn ssa_outside_i64(f: & IrFunction, st: & SsaState, blk_of: & Vec<i64>, body: & Vec<i64>, r: i64) -> bool {
+fn ssa_outside_i64(f: &IrFunction, st: &SsaState, blk_of: &Vec<i64>, body: &Vec<i64>, r: i64) -> bool {
     if r < 0 {
         return false;
     }
@@ -1000,7 +1007,7 @@ fn ssa_outside_i64(f: & IrFunction, st: & SsaState, blk_of: & Vec<i64>, body: & 
 }
 
 /// Is resolved value `r` (a phi when >= st.nv) a signed 64-bit integer?
-fn ssa_r_i64(f: & IrFunction, st: & SsaState, r: i64) -> bool {
+fn ssa_r_i64(f: &IrFunction, st: &SsaState, r: i64) -> bool {
     if r < 0 {
         return false;
     }
@@ -1029,8 +1036,8 @@ struct SsaSide {
     v: i64,
 }
 
-fn ssa_side(f: & IrFunction, st: & SsaState, v: i64) -> SsaSide {
-    var r: i64 = ssa_resolve(& st.repl, v);
+fn ssa_side(f: &IrFunction, st: &SsaState, v: i64) -> SsaSide {
+    var r: i64 = ssa_resolve(&st.repl, v);
     if ssa_is_const(f, st.nv, r) {
         return SsaSide {
             is_k: true, k: ssa_const_val(f, r), v: r
@@ -1083,14 +1090,14 @@ fn ssa_fact_gives_le(x: SsaSide, y: SsaSide, strict: bool, lo: SsaSide, hi: SsaS
 /// Does the condition `c` (resolved), true when `pos` and false otherwise,
 /// prove `lo <= hi`? Signed i64 comparisons only; `&&` taken apart when
 /// true, `||` when false.
-fn ssa_cond_gives_le(f: & IrFunction, st: & SsaState, blk_of: & Vec<i64>, c: i64, pos: bool, lo: SsaSide, hi: SsaSide, depth: i64) -> bool {
+fn ssa_cond_gives_le(f: &IrFunction, st: &SsaState, blk_of: &Vec<i64>, c: i64, pos: bool, lo: SsaSide, hi: SsaSide, depth: i64) -> bool {
     if c < 0 || c >= st.nv || depth > 4 {
         return false;
     }
     match peir_inst_of(f, c) {
         Inst::BinOp(op, a, b, _) => {
             if (binop_eq(op, BinOp::And) && pos) || (binop_eq(op, BinOp::Or) && !pos) {
-                return ssa_cond_gives_le(f, st, blk_of, ssa_resolve(& st.repl, a), pos, lo, hi, depth + 1) || ssa_cond_gives_le(f, st, blk_of, ssa_resolve(& st.repl, b), pos, lo, hi, depth + 1);
+                return ssa_cond_gives_le(f, st, blk_of, ssa_resolve(&st.repl, a), pos, lo, hi, depth + 1) || ssa_cond_gives_le(f, st, blk_of, ssa_resolve(&st.repl, b), pos, lo, hi, depth + 1);
             }
             var isrel: bool = binop_eq(op, BinOp::Lt) || binop_eq(op, BinOp::LtEq) || binop_eq(op, BinOp::Gt) || binop_eq(op, BinOp::GtEq);
             if !isrel {
@@ -1144,7 +1151,7 @@ fn ssa_cond_gives_le(f: & IrFunction, st: & SsaState, blk_of: & Vec<i64>, c: i64
 /// blocks of one predecessor, each Branch whose edge leads down to the
 /// loop adds its condition (true on the true edge, false on the false
 /// one). SSA values cannot change between the guard and the loop.
-fn ssa_guard_le(f: & IrFunction, cfg: & IroCfg, st: & SsaState, blk_of: & Vec<i64>, body: & Vec<i64>, pre: i64, h: i64, lo: SsaSide, hi: SsaSide) -> bool {
+fn ssa_guard_le(f: &IrFunction, cfg: &IroCfg, st: &SsaState, blk_of: &Vec<i64>, body: &Vec<i64>, pre: i64, h: i64, lo: SsaSide, hi: SsaSide) -> bool {
     var cur: i64 = pre;
     var into: i64 = h;
     var steps: i64 = 0;
@@ -1156,15 +1163,15 @@ fn ssa_guard_le(f: & IrFunction, cfg: & IroCfg, st: & SsaState, blk_of: & Vec<i6
         if ids.len() > 0 {
             match peir_inst_of(f, ids.get(ids.len() - 1)) {
                 Inst::Branch(c, t, e) => {
-                    var ti: i64 = - 1;
-                    var ei: i64 = - 1;
+                    var ti: i64 = -1;
+                    var ei: i64 = -1;
                     if t >= 0 && t < cfg.index.len() {
                         ti = cfg.index.get(t);
                     }
                     if e >= 0 && e < cfg.index.len() {
                         ei = cfg.index.get(e);
                     }
-                    var rc: i64 = ssa_resolve(& st.repl, c);
+                    var rc: i64 = ssa_resolve(&st.repl, c);
                     if ti == into && ei != into {
                         if ssa_cond_gives_le(f, st, blk_of, rc, true, lo, hi, 0) {
                             return true;
@@ -1190,7 +1197,7 @@ fn ssa_guard_le(f: & IrFunction, cfg: & IroCfg, st: & SsaState, blk_of: & Vec<i6
 }
 
 /// Is `s` (a value after the replacements) `phi + 1`?
-fn ssa_is_step(f: & IrFunction, st: & SsaState, s: i64, me: i64) -> bool {
+fn ssa_is_step(f: &IrFunction, st: &SsaState, s: i64, me: i64) -> bool {
     if s < 0 || s >= st.nv {
         return false;
     }
@@ -1199,8 +1206,8 @@ fn ssa_is_step(f: & IrFunction, st: & SsaState, s: i64, me: i64) -> bool {
             if !binop_eq(op, BinOp::Add) {
                 return false;
             }
-            var ra: i64 = ssa_resolve(& st.repl, a);
-            var rc: i64 = ssa_resolve(& st.repl, c);
+            var ra: i64 = ssa_resolve(&st.repl, a);
+            var rc: i64 = ssa_resolve(&st.repl, c);
             if ra == me && ssa_is_const(f, st.nv, rc) && ssa_const_val(f, rc) == 1 {
                 return true;
             }
@@ -1222,7 +1229,7 @@ fn ssa_is_step(f: & IrFunction, st: & SsaState, s: i64, me: i64) -> bool {
 /// Nov 17: c0 and N may be values (N from before the loop): with `!=` i is
 /// N after the loop; with `<` / `<=` it is N / N + 1 when a guard on the
 /// loop's way in (ssa_guard_le) proves c0 <= N.
-fn ssa_exit_values(f: & IrFunction, cfg: & IroCfg, st: & SsaState, blk_of: & Vec<i64>) -> Vec<SsaExit> {
+fn ssa_exit_values(f: &IrFunction, cfg: &IroCfg, st: &SsaState, blk_of: &Vec<i64>) -> Vec<SsaExit> {
     var out: Vec<SsaExit> = Vec::new();
     if st.ph_block.len() == 0 {
         return out;
@@ -1241,8 +1248,8 @@ fn ssa_exit_values(f: & IrFunction, cfg: & IroCfg, st: & SsaState, blk_of: & Vec
         if ok {
             ok = ps.len() == 2;
         }
-        var pre_j: i64 = - 1;
-        var lat_j: i64 = - 1;
+        var pre_j: i64 = -1;
+        var lat_j: i64 = -1;
         if ok {
             var j: i64 = 0;
             while j < 2 {
@@ -1260,12 +1267,12 @@ fn ssa_exit_values(f: & IrFunction, cfg: & IroCfg, st: & SsaState, blk_of: & Vec
         // Nov 17: the value i enters with may be any value (c0s), not only
         // a constant; then a guard has to say how it compares with the bound
         var c0s: SsaSide = SsaSide {
-            is_k: false, k: 0, v: - 1
+            is_k: false, k: 0, v: -1
         };
         if ok {
             var ins: Vec<i64> = st.ph_in.get(k);
-            var r0: i64 = ssa_resolve(& st.repl, ins.get(pre_j));
-            ok = r0 >= 0 && ssa_is_step(f, st, ssa_resolve(& st.repl, ins.get(lat_j)), me);
+            var r0: i64 = ssa_resolve(&st.repl, ins.get(pre_j));
+            ok = r0 >= 0 && ssa_is_step(f, st, ssa_resolve(&st.repl, ins.get(lat_j)), me);
             if ok {
                 c0s = ssa_side(f, st, r0);
                 c0 = c0s.k;
@@ -1275,11 +1282,11 @@ fn ssa_exit_values(f: & IrFunction, cfg: & IroCfg, st: & SsaState, blk_of: & Vec
         // the header's branch: i < N (or <=, !=) into the loop, out otherwise
         var lim: i64 = 0;
         var lims: SsaSide = SsaSide {
-            is_k: false, k: 0, v: - 1
+            is_k: false, k: 0, v: -1
         };
         var kind: i64 = 0;
-        var ti: i64 = - 1;
-        var ei: i64 = - 1;
+        var ti: i64 = -1;
+        var ei: i64 = -1;
         if ok {
             ok = false;
             var hids: Vec<i64> = f.blocks.get(h).instructions;
@@ -1290,15 +1297,15 @@ fn ssa_exit_values(f: & IrFunction, cfg: & IroCfg, st: & SsaState, blk_of: & Vec
                             ti = cfg.index.get(t);
                             ei = cfg.index.get(e);
                         }
-                        var rc: i64 = ssa_resolve(& st.repl, cnd);
+                        var rc: i64 = ssa_resolve(&st.repl, cnd);
                         if rc >= 0 && rc < st.nv && ti >= 0 && ei >= 0 {
                             match peir_inst_of(f, rc) {
                                 Inst::BinOp(op, x, y, _) => {
-                                    var ry: i64 = ssa_resolve(& st.repl, y);
+                                    var ry: i64 = ssa_resolve(&st.repl, y);
                                     // Nov 17: the bound may be a value from
                                     // before the loop (checked below, once
                                     // the body is known)
-                                    if ssa_resolve(& st.repl, x) == me && ry >= 0 && ssa_r_i64(f, st, ry) {
+                                    if ssa_resolve(&st.repl, x) == me && ry >= 0 && ssa_r_i64(f, st, ry) {
                                         lims = ssa_side(f, st, ry);
                                         lim = lims.k;
                                         if binop_eq(op, BinOp::Lt) {
@@ -1323,7 +1330,7 @@ fn ssa_exit_values(f: & IrFunction, cfg: & IroCfg, st: & SsaState, blk_of: & Vec
         }
         var body: Vec<i64> = Vec::new();
         if ok {
-            body = iro_loop_body(& lt, h);
+            body = iro_loop_body(&lt, h);
             ok = body.get(ti) == 1 && body.get(ei) == 0 && cfg.preds.get(ei).len() == 1;
         }
         if ok {
@@ -1345,7 +1352,7 @@ fn ssa_exit_values(f: & IrFunction, cfg: & IroCfg, st: & SsaState, blk_of: & Vec
             }
         }
         var value: i64 = 0;
-        var vid: i64 = - 1;
+        var vid: i64 = -1;
         var plus1: bool = false;
         var both_k: bool = c0s.is_k && lims.is_k;
         if ok && !both_k {
@@ -1354,7 +1361,7 @@ fn ssa_exit_values(f: & IrFunction, cfg: & IroCfg, st: & SsaState, blk_of: & Vec
             // only with i == N; `i < N` / `i <= N` exit with N / N + 1 when
             // i started at most N, which a guard on the way in must say
             // (else the start itself would be the answer: no select here).
-            if !lims.is_k && !ssa_outside_i64(f, st, blk_of, & body, lims.v) {
+            if !lims.is_k && !ssa_outside_i64(f, st, blk_of, &body, lims.v) {
                 ok = false;
             }
             if ok && kind == 3 {
@@ -1366,7 +1373,7 @@ fn ssa_exit_values(f: & IrFunction, cfg: & IroCfg, st: & SsaState, blk_of: & Vec
             } else if ok {
                 if lims.is_k && kind == 2 && lim == 9223372036854775807 {
                     ok = false;
-                } else if ssa_guard_le(f, cfg, st, blk_of, & body, ps.get(pre_j), h, c0s, lims) {
+                } else if ssa_guard_le(f, cfg, st, blk_of, &body, ps.get(pre_j), h, c0s, lims) {
                     if lims.is_k {
                         value = lim;
                         if kind == 2 {
@@ -1424,15 +1431,15 @@ fn ssa_exit_values(f: & IrFunction, cfg: & IroCfg, st: & SsaState, blk_of: & Vec
 
 /// What value `v` names once the phis are slots: the load of a phi's slot,
 /// or the value itself (-1: none).
-fn ssa_final(st: & SsaState, vreal: & Vec<i64>, v: i64) -> i64 {
-    var r: i64 = ssa_resolve(& st.repl, v);
+fn ssa_final(st: &SsaState, vreal: &Vec<i64>, v: i64) -> i64 {
+    var r: i64 = ssa_resolve(&st.repl, v);
     if r >= st.nv && r < st.nv + st.ph_block.len() {
         return vreal.get(r - st.nv);
     }
     return r;
 }
 
-fn ssa_materialize(f: & mut IrFunction, cfg: & IroCfg, st: & SsaState, exits: & Vec<SsaExit>) {
+fn ssa_materialize(f: &mut IrFunction, cfg: &IroCfg, st: &SsaState, exits: &Vec<SsaExit>) {
     var np: i64 = st.ph_block.len();
     var nb: i64 = f.blocks.len();
     var heads: Vec<Vec<i64>> = Vec::new();
@@ -1445,8 +1452,8 @@ fn ssa_materialize(f: & mut IrFunction, cfg: & IroCfg, st: & SsaState, exits: & 
     }
     var entry_new: Vec<i64> = Vec::new();
     // a slot and a load for each phi the program reads
-    var vreal: Vec<i64> = ssa_fill(np, - 1);
-    var slot: Vec<i64> = ssa_fill(np, - 1);
+    var vreal: Vec<i64> = ssa_fill(np, -1);
+    var slot: Vec<i64> = ssa_fill(np, -1);
     var k: i64 = 0;
     while k < np {
         if st.ph_live.get(k) == 1 && st.ph_gone.get(k) == 0 {
@@ -1482,8 +1489,8 @@ fn ssa_materialize(f: & mut IrFunction, cfg: & IroCfg, st: & SsaState, exits: & 
             var ps: Vec<i64> = cfg.preds.get(st.ph_block.get(k));
             var j: i64 = 0;
             while j < ins.len() && j < ps.len() {
-                if ins.get(j) != - 4 {
-                    var v: i64 = ssa_final(st, & vreal, ins.get(j));
+                if ins.get(j) != -4 {
+                    var v: i64 = ssa_final(st, &vreal, ins.get(j));
                     if v >= 0 {
                         var sid: i64 = ssa_detached(f, Inst::Store(slot.get(k), v, OptIrType::Some(ty2)));
                         var pb: i64 = ps.get(j);
@@ -1505,7 +1512,7 @@ fn ssa_materialize(f: & mut IrFunction, cfg: & IroCfg, st: & SsaState, exits: & 
         if ex.vid >= 0 {
             // Nov 17: the bound itself (a value from before the loop, so it
             // reaches the exit block), plus one for `<=`
-            var nreal: i64 = ssa_final(st, & vreal, ex.vid);
+            var nreal: i64 = ssa_final(st, &vreal, ex.vid);
             if ex.plus1 && nreal >= 0 {
                 var one: i64 = ssa_detached(f, Inst::ConstInt(1, IrType::I64));
                 var add: i64 = ssa_detached(f, Inst::BinOp(BinOp::Add, nreal, one, IrType::I64));
@@ -1533,7 +1540,7 @@ fn ssa_materialize(f: & mut IrFunction, cfg: & IroCfg, st: & SsaState, exits: & 
         if st.kill.get(v2) == 1 {
             match peir_inst_of(f, v2) {
                 Inst::Load(_, _) => {
-                    var r: i64 = ssa_final(st, & vreal, v2);
+                    var r: i64 = ssa_final(st, &vreal, v2);
                     if r >= 0 && r != v2 {
                         map.set(v2, r + 1);
                     }
@@ -1565,7 +1572,7 @@ fn ssa_materialize(f: & mut IrFunction, cfg: & IroCfg, st: & SsaState, exits: & 
             nl.push(hl2.get(hi));
             hi = hi + 1;
         }
-        var term: i64 = - 1;
+        var term: i64 = -1;
         if ids.len() > 0 && ssa_is_jump(peir_inst_of(f, ids.get(ids.len() - 1))) {
             term = ids.get(ids.len() - 1);
         }
@@ -1594,7 +1601,7 @@ fn ssa_materialize(f: & mut IrFunction, cfg: & IroCfg, st: & SsaState, exits: & 
         f.blocks.set(b, blk);
         b = b + 1;
     }
-    ssa_apply_map(f, & map);
+    ssa_apply_map(f, &map);
     // ME23: outside its loop, the variable is its exit value
     e = 0;
     while e < exits.len() {
@@ -1610,7 +1617,7 @@ fn ssa_materialize(f: & mut IrFunction, cfg: & IroCfg, st: & SsaState, exits: & 
                     var q: i64 = 0;
                     while q < bids.len() {
                         var qid: i64 = bids.get(q);
-                        var qi: Inst = ssa_remap(peir_inst_of(f, qid), & m2);
+                        var qi: Inst = ssa_remap(peir_inst_of(f, qid), &m2);
                         IrFunction_set_inst(f, qid, qi);
                         q = q + 1;
                     }
@@ -1646,7 +1653,7 @@ fn ssa_materialize(f: & mut IrFunction, cfg: & IroCfg, st: & SsaState, exits: & 
             var w3: i64 = 0;
             while w3 < bids2.len() {
                 ops2.clear();
-                peir_inst_operands(peir_inst_of(f, bids2.get(w3)), & mut ops2);
+                peir_inst_operands(peir_inst_of(f, bids2.get(w3)), &mut ops2);
                 var o2: i64 = 0;
                 while o2 < ops2.len() {
                     var u2: i64 = ops2.get(o2);
@@ -1700,7 +1707,7 @@ fn ssa_materialize(f: & mut IrFunction, cfg: & IroCfg, st: & SsaState, exits: & 
                     tpos = out3.len();
                 }
                 ops4.clear();
-                peir_inst_operands(peir_inst_of(f, y3), & mut ops4);
+                peir_inst_operands(peir_inst_of(f, y3), &mut ops4);
                 var hit: i64 = 0 - 1;
                 var o3: i64 = 0;
                 while o3 < ops4.len() && hit < 0 {
@@ -1722,7 +1729,7 @@ fn ssa_materialize(f: & mut IrFunction, cfg: & IroCfg, st: & SsaState, exits: & 
                         out3.push(ld3);
                     }
                     out3.push(y3);
-                    IrFunction_set_inst(f, y3, ssa_remap(peir_inst_of(f, y3), & m3));
+                    IrFunction_set_inst(f, y3, ssa_remap(peir_inst_of(f, y3), &m3));
                     any3 = true;
                 } else {
                     out3.push(y3);
@@ -1761,12 +1768,12 @@ fn ssa_materialize(f: & mut IrFunction, cfg: & IroCfg, st: & SsaState, exits: & 
         var aid: i64 = ent.id;
         if aid >= 0 && aid < st.cidx.len() && st.cidx.get(aid) >= 0 {
             var cc: i64 = st.cidx.get(aid);
-            var nid: i64 = - 1;
+            var nid: i64 = -1;
             var multi: bool = HashMap_get(namecount, ent.name) > 1;
             if multi {
                 var fv: i64 = st.first_val.get(cc);
                 if fv >= 0 {
-                    nid = ssa_final(st, & vreal, fv);
+                    nid = ssa_final(st, &vreal, fv);
                 }
             }
             if nid < 0 {
@@ -1782,7 +1789,7 @@ fn ssa_materialize(f: & mut IrFunction, cfg: & IroCfg, st: & SsaState, exits: & 
             if nid < 0 && !multi {
                 var fv2: i64 = st.first_val.get(cc);
                 if fv2 >= 0 {
-                    nid = ssa_final(st, & vreal, fv2);
+                    nid = ssa_final(st, &vreal, fv2);
                 }
             }
             if nid >= 0 {
@@ -1796,7 +1803,7 @@ fn ssa_materialize(f: & mut IrFunction, cfg: & IroCfg, st: & SsaState, exits: & 
 
 // --- Cleanup: values nothing reads ---------------------------------------------
 
-fn ssa_quiet_binop(f: & IrFunction, op: BinOp, l: i64) -> bool {
+fn ssa_quiet_binop(f: &IrFunction, op: BinOp, l: i64) -> bool {
     var cmp: bool = binop_eq(op, BinOp::Eq) || binop_eq(op, BinOp::Neq) || binop_eq(op, BinOp::Lt) || binop_eq(op, BinOp::Gt) || binop_eq(op, BinOp::LtEq) || binop_eq(op, BinOp::GtEq);
     var bits: bool = binop_eq(op, BinOp::BitAnd) || binop_eq(op, BinOp::BitOr) || binop_eq(op, BinOp::BitXor) || binop_eq(op, BinOp::And) || binop_eq(op, BinOp::Or);
     if !cmp && !bits {
@@ -1809,7 +1816,7 @@ fn ssa_quiet_binop(f: & IrFunction, op: BinOp, l: i64) -> bool {
 
 /// Can `inst` go when nothing reads it: constants, addresses, comparisons
 /// and bit operations on integers, loads of locals.
-fn ssa_pure(f: & IrFunction, inst: Inst) -> bool {
+fn ssa_pure(f: &IrFunction, inst: Inst) -> bool {
     match inst {
         Inst::ConstInt(_, _) => {
             return true;
@@ -1859,7 +1866,7 @@ fn ssa_pure(f: & IrFunction, inst: Inst) -> bool {
 
 /// ME15: drop values nothing reads (the stored values of removed stores,
 /// the loads they read) until none is left, a few rounds at most.
-pub fn ssa_dce(f: & mut IrFunction) -> bool {
+pub fn ssa_dce(f: &mut IrFunction) -> bool {
     var any: bool = false;
     var round: i64 = 0;
     var removed: bool = true;
@@ -1872,7 +1879,7 @@ pub fn ssa_dce(f: & mut IrFunction) -> bool {
             var k: i64 = 0;
             while k < ids.len() {
                 var ops: Vec<i64> = Vec::new();
-                peir_inst_operands(peir_inst_of(f, ids.get(k)), & mut ops);
+                peir_inst_operands(peir_inst_of(f, ids.get(k)), &mut ops);
                 var o: i64 = 0;
                 while o < ops.len() {
                     var v: i64 = ops.get(o);
@@ -1920,7 +1927,7 @@ pub fn ssa_dce(f: & mut IrFunction) -> bool {
 /// entry block has predecessors. ME3: iropt's `promote` (iro_promote), which
 /// ssa subsumes, still runs on exactly these when ssa is on (iropt.fd
 /// iro_promote_here), so no function loses the load forwarding it had.
-pub fn ssa_takes(f: & IrFunction) -> bool {
+pub fn ssa_takes(f: &IrFunction) -> bool {
     if f.is_constant_time || f.blocks.len() == 0 {
         return false;
     }
@@ -1936,14 +1943,14 @@ pub fn ssa_takes(f: & IrFunction) -> bool {
 
 /// ME3 + ME15 (+ ME23 when `exit_values`): build SSA for `f`'s promotable
 /// locals, optimize it, convert it back to slots. True when `f` changed.
-pub fn ssa_round_trip(f: & mut IrFunction, exit_values: bool) -> bool {
+pub fn ssa_round_trip(f: &mut IrFunction, exit_values: bool) -> bool {
     if !ssa_takes(f) {
         return false;
     }
     var cfg: IroCfg = iro_cfg(f);
     var nv: i64 = f.next_value + 1;
-    var blk_of: Vec<i64> = ssa_fill(nv, - 1);
-    var pos_of: Vec<i64> = ssa_fill(nv, - 1);
+    var blk_of: Vec<i64> = ssa_fill(nv, -1);
+    var pos_of: Vec<i64> = ssa_fill(nv, -1);
     var b: i64 = 0;
     while b < f.blocks.len() {
         var ids: Vec<i64> = f.blocks.get(b).instructions;
@@ -1958,22 +1965,22 @@ pub fn ssa_round_trip(f: & mut IrFunction, exit_values: bool) -> bool {
         }
         b = b + 1;
     }
-    var ok: Vec<i64> = ssa_candidates(f, & cfg, & blk_of, & pos_of);
-    var df: Vec<Vec<i64>> = ssa_frontiers(& cfg);
-    var kids: Vec<Vec<i64>> = ssa_dom_kids(& cfg);
+    var ok: Vec<i64> = ssa_candidates(f, &cfg, &blk_of, &pos_of);
+    var df: Vec<Vec<i64>> = ssa_frontiers(&cfg);
+    var kids: Vec<Vec<i64>> = ssa_dom_kids(&cfg);
     // a candidate found to need memory is dropped and the rest rebuilt
     var round: i64 = 0;
     while round < 4 {
-        var st: SsaState = ssa_state(f, & cfg, & ok, df, kids);
+        var st: SsaState = ssa_state(f, &cfg, &ok, df, kids);
         if st.cands.len() == 0 {
             return false;
         }
-        if !ssa_place_phis(f, & cfg, & mut st) {
+        if !ssa_place_phis(f, &cfg, &mut st) {
             return false;
         }
-        ssa_rename(f, & cfg, & mut st);
-        ssa_trivial_phis(& mut st);
-        ssa_live_phis(f, & cfg, & mut st);
+        ssa_rename(f, &cfg, &mut st);
+        ssa_trivial_phis(&mut st);
+        ssa_live_phis(f, &cfg, &mut st);
         if p_getenv("FID_SSA_DUMP") == f.name {
             var dk: i64 = 0;
             while dk < st.ph_block.len() {
@@ -2011,9 +2018,9 @@ pub fn ssa_round_trip(f: & mut IrFunction, exit_values: bool) -> bool {
             }
             var exits: Vec<SsaExit> = Vec::new();
             if exit_values {
-                exits = ssa_exit_values(f, & cfg, & st, & blk_of);
+                exits = ssa_exit_values(f, &cfg, &st, &blk_of);
             }
-            ssa_materialize(f, & cfg, & st, & exits);
+            ssa_materialize(f, &cfg, &st, &exits);
             ssa_dce(f);
             return true;
         }
