@@ -500,8 +500,8 @@ are the commit times.)
   closed (cc293424). Two builds failed on the machine's commit limit
   (44 of 48 GB taken) and one bug of mine in the build script's success
   path (56492abb); the -O2 builds of 15:52 and 16:19 are installed as
-  release/fid-night.exe (fid-night-prev.exe is the one of 15:52). Still
-  running when this was written: the gates RA1, LF11, SP9 and the four
-  suite legs (above). Left for another session or another day: MI5,
+  release/fid-night.exe (fid-night-prev.exe is the one of 15:52). Still running when this was written (17:15): two suite jobs, the default
+  leg and the chain off, sole, vec; the gates RA1, LF11, SP9 wait for
+  them (above). Left for another session or another day: MI5,
   MI17 (BG248, BG249, BG251), MI9, TG11's reductions, TG16, WP6's
   AArch64 pool, LF13, LF21, SP16's 2g.114, MI14's default switch.

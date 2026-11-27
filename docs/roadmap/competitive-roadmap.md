@@ -2023,6 +2023,11 @@ This is the race we can win outright, since no rival's speed comes for free.
       the memo is not shown sound (it is already on by default for `emit
       -o` through CB3); a one-line edit still takes 700 ms (target 100).
       Nov 21 (c082ee6, 2g.93): the verify comparison hashes the post-pass bytes of a hit (imc_verify_post) — the mismatches were comparing unlike hashes, not wrong replays.
+      Nov 27 (day): llvm-roadmap's SP6 is done (its cache gate and the
+      tail-summary gate pass on the -O2 build of 16:19) and SP7 is done
+      (relink_check.sh 21 ok on x86-64, AArch64 and `--nat` Windows: an
+      edit puts every function back, the changed ones into their places).
+      The 100 ms of SP8 is not met (docs/perf/compile-time-2026-11-27.md).
 - [x] CS7. A fast debug mode with no optimizer, and a release mode (S).
       Done: `--debug` (C at -O0) and `--release` (-O2) on `ccompile` in both compilers.
 - [x] CS8. No linear scans in the self-hosted compiler: tables, not `Vec` searches

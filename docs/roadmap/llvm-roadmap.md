@@ -268,6 +268,11 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       `test_natabi_optmatch.fd` cover those paths. Left: general scalar
       replacement of small local structs that are not returned through the
       direct-call result-slot path. Keep partial.
+      Nov 27 (day): not touched. Left as written: general scalar
+      replacement of small local structs that are not returned through the
+      direct-call result-slot path (nat_ir.fd, a design piece of the
+      machine layer). Another session edits nat_ir.fd this afternoon (debug
+      info, call lowering).
 - [x] MI10. A MIR verifier: every use defined, every block terminated, operand
       classes match the operation; run after each MIR stage in debug builds (M).
       The allocation checker (RA15) runs over the MIR with `FID_VERIFY=1`; a
@@ -417,6 +422,10 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       (in flight), BG248, BG249 and the five gaps of BG251. Left: those,
       then retiring the lowerings (pe_ir is still the default). Still
       partly.
+      Nov 27 (day): not touched; the lowerings are retired once MI5's
+      comparison is clean, and that waits on BG248, BG249 and BG251
+      (another session's). mi5_nat_peir_check.sh was not run again on the
+      -O2 build of 16:19, release/fid-night.exe.
 - [x] MI18. Retire the old PIR path (`pir.fd`, `opt.fd`, `regalloc.fd`,
       `codegen_x64.fd`) and `build --native` with it (S).
       Nov 16: no build reaches PIR any more. `build --native` is the machine
@@ -612,6 +621,13 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       ra1_pe_ra_off_check on 117 programs gives 114 same, 0 differ (1
       out-of-memory build). Left: deleting pe_ir's allocator, which waits
       for MI17 and the Windows default.
+      Nov 27 (day): the gate was not run to its end. Two attempts were
+      stopped, one when the machine ran out of commit, one when five jobs
+      side by side made it crawl. tests/nattools/ra1_pe_ra_off_check.sh
+      takes the interpreter's output of each of its 137 programs as the
+      reference, and some of them run minutes there. Left: the gate on the
+      -O2 build of 16:19, release/fid-night.exe, then deleting pe_ir's
+      allocator (MI17, the Windows default).
 - [x] RA2. Liveness on MIR from use lists, live ranges as lists of segments with
       holes, not hulls (M).
       Done (Nov 17): liveness from use lists (`ng_use_liveness`;
@@ -1119,6 +1135,9 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       test_wasm_collections, 304 functions structured), the modules
       validate, both builds print the same, structured modules are about 9%
       smaller. Left: the target on MIR (wasm.fd still lowers from IR).
+      Nov 27 (day): not touched here. Another session is building the port
+      onto MIR (build/tg16-fid-v5: its fid-dev.exe runs the suite's
+      WebAssembly programs through `fid wasm` this afternoon).
 - [x] TG17. Peephole rules per target as data, after allocation: redundant moves,
       load after store, branch to next block (M).
       Already (verified Nov 15): branch to the next block, jump threading
@@ -1891,6 +1910,15 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       only values whose sites weigh >= IRO_SPEC_HOT (8), at most 2 per
       param (iropt.fd :8378–:8420, wired at :8645). That "Left: hotness"
       was stale. Left: the full suite only.
+      Nov 27 (day): specialization is on by default in the -O2 build of
+      16:19, release/fid-night.exe. The whole-suite leg that is left
+      started at 17:04: every program of tests/bootstrap (2,056) on emit
+      and `--nat`, against the same run with FID_IROPT_OFF=spec,version. A
+      sample of every 70th program (30 files) passed 29; the one failure is
+      test_bare_panic_handler.fd, which needs `--bare`. The leg was still
+      running when this was written (17:15); its verdicts are in
+      build/llvm19/suite-on.raw and suite-off.raw, and the comparison of
+      the two in the run log of docs/roadmap/goal-workflow.md.
 - [x] WP15. Dead function and dead global elimination after optimization, not only
       before (S).
       `iropt_native` calls `IrModule_dead_function_elimination` after the pass
@@ -2233,6 +2261,11 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       entry: a phi's load value read in another block now loads the slot
       again before the use) restored them; version-default-check reports
       3 and 2 loops for those tests again, 0 failed.
+      Nov 27 (day): versioning is on by default in the -O2 build of 16:19,
+      release/fid-night.exe. Not run today:
+      tests/tooling/version-default-check.sh (stopped with the job of the
+      long gates; 0 failed on Nov 21). The whole-suite leg is WP14's: the
+      default run against the one with FID_IROPT_OFF=spec,version.
 - [x] LF12. Narrow types as ranges: a `u8` value needs no overflow check on a
       widening add (S). `peir_type_range` on narrow loads and `IntExtend`.
 - [~] LF13. Escape analysis: a `Vec`, `str` or struct that never leaves its function
@@ -2304,6 +2337,10 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       buffers need a static push-count bound (counted-loop facts LF7/LF8
       feeding the escape pass) or a core Vec_init_stackbuf that promotes to
       heap on push overflow — that entry point does not exist today.
+      Nov 27 (day): not touched: lower.fd is another session's file this
+      afternoon (BG203, BG228, BG230, BG241). Left as written: the
+      data-dependent and unbounded producers, Vec::new()+push buffers, the
+      suite legs.
 - [~] LF14. Scalar replacement of a non-escaping `Vec` of known small length (M).
       Nov 16: built and tested (test_midend_vec_sroa.fd, `fid run` and
       `fid emit` with FID_IROPT_ON=vecsroa and without): iropt.fd `iro_vec_sroa` (run by
@@ -2340,10 +2377,10 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       sibling); the rejections the debug line shows are stdlib functions'.
       The line names its function and the failing terms now (iropt.fd).
       Right with the pass off and on, on pe_ir and `--nat`. Left: a suite
-      run with the pass on (
-      not run on Nov 27 (the suite legs waited for a machine with room for
-      them)
-      ).
+      run with the pass on: started at 17:04 (the whole of tests/bootstrap
+      on emit with FID_IROPT_ON=vecsroa, judged against the default run),
+      not finished when this was written (17:15);
+      build/llvm19/suite-vec.raw.
 - [x] LF15. Reference counts removed where ownership is known (proposal 0004): no
       `Vec_share` / drop pairs on values that are moved (M). Moves on last use
       (Nov 7), and in one block: Str and Box count/drop pairs, a Vec or map
@@ -2385,6 +2422,13 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       vec_own inside Vec_push/Vec_set stays (a call, not inlined). Test:
       tests/bootstrap/test_midend_sole_owner.fd. Left: a build and a suite
       run on and off.
+      Nov 27 (day): the sole-owner pass is opt-in as before
+      (FID_IROPT_ON=soleown; tests/bootstrap/test_midend_sole_owner.fd).
+      The suite leg with it on is queued behind the leg with specialization
+      and versioning off, both started at 17:04: the whole of
+      tests/bootstrap on emit, judged against the default run (a file it
+      fails that the default run passes is a bug of the pass). Not finished
+      when this was written (17:15); build/llvm19/suite-sole.raw.
 - [x] LF17. Drops of values known to be empty or static removed (S). String
       literals, and string variables only ever assigned literals
       (`LOWER_LITERAL_SLOTS`); an empty Vec still frees its header.
@@ -2475,6 +2519,11 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       accepted and written for the C backend (FID_REGION_ARENA=1; see
       competitive OP29). Left: the machine layer's runtime
       (stdlib/linux_runtime, `--nat`), where p_region_word is 0 today.
+      Nov 27 (day): not touched: stdlib/linux_runtime is another session's
+      this afternoon (BG249's task stacks). The leftover is the design
+      piece the entry names: the per-thread region arena of proposal 0005
+      in the Linux runtime, where pert_region_word answers that no region
+      is ever open.
 - [x] LF22. `comptime` results as constants the mid-end folds further (S).
       Nov 9: what `comptime` computes reaches the IR as constants already
       (the front end's comptime pass); fold, SCCP and branch facts fold
@@ -2833,6 +2882,12 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       (Nov 27 fid). Not run before the stop: parse_par_check.sh,
       imports_par_check.sh, the FID_PP_VERIFY row, parse_par_bench.sh. Left:
       those checks, then on by default; type check in parallel (step 3).
+      Nov 27 (day): the four checks (tests/par/parse_par_check.sh and
+      imports_par_check.sh, each with and without SELF=1) and the bench
+      were not run to their end: the attempt was stopped when the machine
+      ran out of commit. FID_PAR stays opt-in. Left: those checks on the
+      -O2 build of 16:19, release/fid-night.exe, the bench on a quiet
+      machine, then on by default; step 3 (the type check in parallel).
 - [x] SP10. No linear scans anywhere in the compiler: every lookup by name or id is
       a table (release CS8) (M).
       Competitive CS8: instructions, functions, strings, structs, methods,
