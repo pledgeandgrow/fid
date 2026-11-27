@@ -2129,6 +2129,10 @@ fn x64_field_text(code: i64, b: &Vec<i64>, imm: i64, m: DsmModrm, size: i64, rex
         if wide {
             return dsm_insn(0, x64r(r, 8, true));
         }
+        // 16-bit under the 0x66 prefix, else 32 (BG233)
+        if size == 2 {
+            return dsm_insn(0, x64r(r, 2, has_rex));
+        }
         return dsm_insn(0, x64r(r, 4, has_rex));
     }
     if code == EFF_IB {
@@ -2147,6 +2151,10 @@ fn x64_field_text(code: i64, b: &Vec<i64>, imm: i64, m: DsmModrm, size: i64, rex
         return dsm_insn(4, dsm_shex(dsm_sext(dsm_u(b, imm, 4), 32)));
     }
     if code == EFF_UZ {
+        // two bytes under the 0x66 prefix, four without it (BG233)
+        if size == 2 {
+            return dsm_insn(2, "0x" + dsm_hex(dsm_u(b, imm, 2) & 0xFFFF, 1));
+        }
         return dsm_insn(4, "0x" + dsm_hex(dsm_u(b, imm, 4) & 0xFFFFFFFF, 1));
     }
     if code == EFF_IQ {
@@ -2299,6 +2307,14 @@ pub fn dsm_x64(b: &Vec<i64>, at: i64, addr: i64) -> DsmInsn {
             vpre = 0xF2;
         }
         var vop: i64 = dsm_u8(b, q);
+        // VEX.0F 77 has no operand, so no ModRM byte follows it: read here,
+        // as the row lookup below would take the next byte for one (BG208)
+        if vmap == 1 && vop == 0x77 && vpre == 0 {
+            if vl {
+                return dsm_insn(q + 1 - at, "vzeroall");
+            }
+            return dsm_insn(q + 1 - at, "vzeroupper");
+        }
         var vm: DsmModrm = x64_modrm(b, q + 1, vrex);
         var vid: i64 = ef_match_x64(1, vmap, vop, vpre, vm.reg, vw);
         if vid >= 0 {
@@ -2312,6 +2328,13 @@ pub fn dsm_x64(b: &Vec<i64>, at: i64, addr: i64) -> DsmInsn {
         return dsm_insn(start_len, "ret");
     }
     if op == 0x90 {
+        // F3 90 is pause; with REX.B the register is r8, not rax (BG233)
+        if rep == 0xF3 {
+            return dsm_insn(start_len, "pause");
+        }
+        if (rex & 1) != 0 {
+            return dsm_insn(start_len, "xchg r8, rax");
+        }
         return dsm_insn(start_len, "nop");
     }
     if op == 0xCC {
@@ -2320,6 +2343,9 @@ pub fn dsm_x64(b: &Vec<i64>, at: i64, addr: i64) -> DsmInsn {
     if op == 0x99 {
         if wide {
             return dsm_insn(start_len, "cqo");
+        }
+        if size == 2 {
+            return dsm_insn(start_len, "cwd");
         }
         return dsm_insn(start_len, "cdq");
     }

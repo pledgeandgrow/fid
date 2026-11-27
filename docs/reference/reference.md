@@ -1165,6 +1165,11 @@ access read through references automatically.
 3. Changing `x` — assignment, field or index assignment, write through it, or a
    changing method — is an error while a borrow of `x` is active
    (`test_field_borrow_fail.fd`).
+4. Reading `x`, or a field path of it, is an error while a mutable borrow of
+   it, of a field under it or of a path above it is active
+   (`test_lg3_read_during_mut_borrow_fail.fd`,
+   `s8_4_read_while_mut_borrowed_rejected.fd`). A mutable borrow of `s.y`
+   does not stop a read of `s.x`, and a shared borrow does not stop a read.
 
 A borrow ends at the borrower's last use. `&s.x` and `&s.y` may coexist. Code in
 `unsafe` is not checked.

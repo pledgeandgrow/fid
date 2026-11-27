@@ -2687,6 +2687,17 @@ fn check_mutation(self: &mut BorrowChecker, var: str, line: i64) -> void {
     }
 }
 
+/// Rule 3b (LG3): reading a variable or a field path of one, `path`, while
+/// a mutable borrow of it or of a field under it is active, or of a path
+/// above it: the borrow may change it under the reader's eyes. Field-wise:
+/// a mutable borrow of `s.y` does not stop a read of `s.x`. Shared borrows
+/// may coexist with a read.
+fn check_read(self: &mut BorrowChecker, path: str, line: i64) -> void {
+    if HashMap_get(self.mb_pfx, path) > 0 || bc_borrow_on_prefix(self, path, true) {
+        violation(self, line, "cannot read " + path + ": a mutable borrow is active on it or its fields" + holder_note(self, path, 1));
+    }
+}
+
 // --- Violation reporting --------------------------------------------------
 
 /// Whether a `for` loop around this point iterates over `var` (or the
@@ -3150,6 +3161,12 @@ fn check_stmt(self: &mut BorrowChecker, stmt: Stmt) -> void {
 // --- Expression walker ----------------------------------------------------
 
 fn check_expr(self: &mut BorrowChecker, expr: Expr) -> void {
+    // LG3: a read of a variable or of a field path of one (checked once, on
+    // the whole path: FieldAccess below does not walk into a variable base)
+    var rp: str = bc_field_path(expr);
+    if str_len(rp) > 0 {
+        check_read(self, rp, self.stmt_line);
+    }
     match expr {
         Expr::IntLit(_) => {
         }
@@ -3196,7 +3213,10 @@ fn check_expr(self: &mut BorrowChecker, expr: Expr) -> void {
             release_temps_since(self, checkpoint);
         }
         Expr::FieldAccess(e, _) => {
-            check_expr(self, bc_box_expr_unbox(e));
+            // a variable's field path was checked as a whole above (LG3)
+            if str_len(rp) == 0 {
+                check_expr(self, bc_box_expr_unbox(e));
+            }
         }
         Expr::OptionalFieldAccess(e, _) => {
             check_expr(self, bc_box_expr_unbox(e));

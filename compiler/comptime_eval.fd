@@ -1585,6 +1585,21 @@ fn ct_signed_ty(t: Type) -> bool {
     return false;
 }
 
+/// Whether `t` is a float type (`x as f32` / `x as f64`).
+fn ct_float_ty(t: Type) -> bool {
+    match t {
+        Type::F32 => {
+            return true;
+        }
+        Type::F64 => {
+            return true;
+        }
+        _ => {
+        }
+    }
+    return false;
+}
+
 /// The bit width `t` stores in a comptime IntLit (wider types store their
 /// low 64).
 fn ct_int_width(t: Type) -> i64 {
@@ -5290,6 +5305,31 @@ fn evaluate_with_env(expr: &Expr, env: &ComptimeEnv, original: &Program) -> Resu
                         }
                     }
                     if !is_int {
+                        // A float value (BG212): to a float it is itself; to
+                        // an integer it is truncated toward zero, as at run
+                        // time, and must be in range
+                        match cv {
+                            Expr::FloatLit(fv) => {
+                                if ct_unsigned_ty(cty) || ct_signed_ty(cty) {
+                                    if fv != fv || fv >= 9223372036854775808.0 || fv < -9223372036854775808.0 {
+                                        return ResultExpr::Err("comptime cast: " + float_to_str(fv) + " does not fit in " + type_to_str(cty));
+                                    }
+                                    var fvi: i64 = fv as i64;
+                                    if ct_unsigned_ty(cty) {
+                                        if fvi < 0 {
+                                            return ResultExpr::Err("comptime cast: " + float_to_str(fv) + " does not fit in " + type_to_str(cty));
+                                        }
+                                        return ResultExpr::Ok(ct_tag(Expr::IntLit(fvi), cty));
+                                    }
+                                    return ResultExpr::Ok(Expr::IntLit(ct_sext(fvi, ct_int_width(cty))));
+                                }
+                                if ct_float_ty(cty) {
+                                    return ResultExpr::Ok(Expr::FloatLit(fv));
+                                }
+                            }
+                            _ => {
+                            }
+                        }
                         return ResultExpr::Ok(Expr::Cast(Box::new(cv), cty));
                     }
                     if ct_unsigned_ty(cty) {
@@ -5297,6 +5337,10 @@ fn evaluate_with_env(expr: &Expr, env: &ComptimeEnv, original: &Program) -> Resu
                     }
                     if ct_signed_ty(cty) {
                         return ResultExpr::Ok(Expr::IntLit(ct_sext(iv, ct_int_width(cty))));
+                    }
+                    // an integer to a float (BG212)
+                    if ct_float_ty(cty) {
+                        return ResultExpr::Ok(Expr::FloatLit(iv as f64));
                     }
                     return ResultExpr::Ok(Expr::Cast(Box::new(Expr::IntLit(iv)), cty));
                 }
