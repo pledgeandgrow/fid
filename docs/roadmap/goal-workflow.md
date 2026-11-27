@@ -57,6 +57,17 @@
   `cp build/selfhost-night/fid-dev.exe release/fid-night.exe` and validate
   with `release/fid-night.exe`. One build per batch of fixes, at most two per
   run.
+  Nov 28, 00:20: two things about that command on this tree and machine.
+  The pinned `release/stage0/fid.exe` (Nov 21) no longer checks the tree:
+  `dump-c` stops with "no method 'len' on struct 'LinearVarStack'"
+  (compiler/typechecker.fd 19790, another session's edit in progress) and
+  makes no C; `STAGE0=release/fid-night.exe` does (142.5 MB of C). And at
+  `-O2` with `JOBS=2` the six giant units fail two at a time and one alone
+  took 9.8 GB of the commit, down to 133 MB free: add
+  `SPLIT_OPT=-O1 JOBS=1` (section A says it below). Before the build, and
+  again when it reaches `[3/3]`, make sure no build of another session is
+  running: one started four minutes after its last one ended on Nov 28,
+  while this workflow's was compiling, and this workflow's was stopped.
 - **Three backends for every new or changed test:**
 
   ```
@@ -99,6 +110,11 @@ by hand in four stages (`build/llvm19/fix-nat2`, stage2.log, stage3.log,
 stage3b.log, stage4.log) and the result is in RL14: it needs 8 GB of
 commit free, and died once under 5 GB. While a whole-suite run or a build
 of this workflow runs, start no other.**
+
+**Nov 28, 00:35: nothing of this workflow runs.** Another session is
+building the compiler (its second build since 00:09 began at 00:24) and
+holds the machine's commit. RL14's stage 1 of the same source is half
+built and waits for a free machine (row L15).
 
 | Marker | Result | Roadmap entries |
 |---|---|---|
@@ -163,7 +179,7 @@ holds, with its gate green on a built compiler.
 | L12 | WP14, LF16 | whole-suite legs | done (Nov 27 evening, 748df914: the whole of tests/bootstrap on emit and `--nat`, 2,011 of 2,056; no verdict changes with any pass on or off; LF14 the same) |
 | L13 | MI5, MI17 | `compiler/pe_ir*.fd`, `nat_ir.fd` | waiting: BG248, BG249, BG251 (the other session's), then `tests/nattools/mi5_nat_peir_check.sh` again; the default switch is MI14's |
 | L14 | MI9, TG16, LF13, LF21 | MI9: SRA of local structs (`nat_ir.fd`); TG16: the port onto MIR (the other session builds tg16-fid-v5); LF13: the other producers, `Vec::new()`+push buffers (`lower.fd`); LF21: the region arena in the Linux runtime | deferred: multi-week design work in files another session edits (each entry says what is left); not a goal of an 80-minute run |
-| L15 | RL14 (not among the 19; its run is this run's) | `scripts/native-fixpoint.sh` | pe_ir: done (the 19:10 run: stage 2 == stage 3 byte for byte). `--nat` (the 23:10 run): stage 3 == stage 4 byte for byte, stage 2 != stage 3 (two compilers: stage 1 is the C build of 16:19), in the entry; it needs 8 GB of commit free (the cache writer's 1 GiB vector). Left: a stage 1 of the same source (a C build of the current tree, when its files are free) and the three Linux hosts (not on this machine) |
+| L15 | RL14 (not among the 19; its run is this run's) | `scripts/native-fixpoint.sh` | pe_ir: done (the 19:10 run: stage 2 == stage 3 byte for byte). `--nat` (Nov 27, 23:10): stage 3 == stage 4 byte for byte, stage 2 != stage 3 (two compilers: stage 1 is the C build of 16:19), in the entry; it needs 8 GB of commit free (the cache writer's 1 GiB vector). A stage 1 of the same source is half built (Nov 28, 00:20 to 00:32, stopped: another session's build took the machine): 10 of 16 units of the snapshot of 00:10 in `build/llvm19/fix-nat3`. Left: `bash build/llvm19/rl14-nat-resume.sh` on a free machine (it checks: no compile of another session, 8 GB of commit free; then the six giant units at -O1, the link, stages 2 and 3, the comparison; 35 to 50 minutes), and the three Linux hosts (not on this machine) |
 
 Gate scripts, once fixed, are in tests/nattools (a working WSL only: `wsl.exe -e sh -c 'echo wsl-ok'`; a path given to `fid serve` on stdin is a Windows path, `cygpath -m`). The driver of one run: `FID=<fid> bash build/llvm19/gates.sh [name ...]` (tg11 wp6 sp16 mi14 fregs lf20 sp6 sp20 sp7 ct ra1 lf11 sp9), its log `build/llvm19/progress.log`; the whole-suite legs: `bash build/llvm19/suite.sh <name> <list-or-dash> [VAR=value]` (tests/bootstrap on emit and `--nat`).
 
@@ -588,3 +604,17 @@ are the commit times.)
   self-compile needs 8 GB of commit free for the cache writer
   (compiler/ast_ser.fd AwBuf keeps a byte in a word; nat_ir.fd
   nc_finish).
+- Nov 28, 00:09 to 00:40, a scheduled run (the lock was free). No goal
+  could be worked: at 00:10 every file behind L5 and L7 to L13 was still
+  modified by another session. RL14 (L15): the experiment with a stage 1
+  of the same source was started and stopped. The snapshot of 00:10 is
+  in build/llvm19/fix-nat3. The pinned stage 0 can no longer check the
+  tree (compiler/typechecker.fd 19790, no method 'len' on struct
+  'LinearVarStack': another session's edit in progress), so the C was
+  made with release/fid-night.exe; at -O2 ten units built and the six
+  giant ones failed two at a time, one alone took 9.8 GB (133 MB of
+  commit left). Another session began a second build of the compiler at
+  00:24 while this one compiled: this workflow's was stopped at 00:32
+  and the other left alone. Left for a free machine: `bash
+  build/llvm19/rl14-nat-resume.sh` (35 to 50 minutes). Not filed: the
+  tree is not compilable by the pinned stage 0.
