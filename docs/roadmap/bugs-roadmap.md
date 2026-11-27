@@ -2402,7 +2402,7 @@ names are the reference.
 
 ## Found by the Nov 27 night run (docs/roadmap/goal-workflow.md)
 
-- [ ] BG247. **The default Windows backend's `float_to_str` loses the low
+- [x] BG247. **The default Windows backend's `float_to_str` loses the low
       digits of a large value.** `println(f"{1e25}")` prints
       `10000000000000001000000000` through `fid emit`; `fid run`,
       `ccompile`, `emit --nat` and the exact value of the double give
@@ -2413,6 +2413,19 @@ names are the reference.
       in stdlib/linux_runtime/base.fd, is right). Found Nov 27 while fixing
       BG180, whose test keeps to the values every backend prints right.
       Confidence: high (seen on run, ccompile, emit and emit --nat).
+      Cause: `pert_to_str_float` asked the C runtime's printf for the
+      digits, and msvcrt keeps 17 significant digits of a value this large.
+      Fixed Nov 27: from 2^53 the value is whole, and
+      `pe_big_integer_text` makes its digits here (the decimal digits of
+      the 53 significant bits, doubled as many times as the exponent says:
+      at most 971 doublings of 309 digits). Test
+      test_bg247_float_to_str_large (1e25 and -1e25, 2^53, 2^64, 1e25 at
+      two decimals, a fraction just under 2^53, 1e300, the largest double,
+      whose 309 digits are exact on all three backends): passes on run,
+      ccompile and emit with the fid-dev of Nov 25; the 51 other float and
+      f-string programs of tests/bootstrap pass (test_bg182_optional_float_field
+      fails as before: BG182, another session's); the leak gate and the
+      checked allocator pass.
 
 ## Found and fixed while reviewing (Nov 22)
 

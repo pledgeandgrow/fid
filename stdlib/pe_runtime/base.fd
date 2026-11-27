@@ -362,6 +362,11 @@ pub fn pert_to_str_float(val: f64) -> str {
     if a < 0.0 {
         a = 0.0 - a;
     }
+    // From 2^53 the value is whole, and its digits are made here, exact:
+    // the C runtime's printf keeps 17 significant digits of it (BG247)
+    if a >= 9007199254740992.0 {
+        return pe_big_integer_text(val < 0.0, a);
+    }
     var exp: i64 = 0;
     if a >= 1.0 {
         while a >= 10.0 {
@@ -396,6 +401,59 @@ pub fn pert_to_str_float(val: f64) -> str {
     }
     pe_c_fmt_prec(buf, 511, "%.*f", max_prec, val);
     return p_str_adopt(buf);
+}
+
+/// The exact digits of a whole value from 2^53: a double there is its 53
+/// significant bits times a power of two, so the digits of those bits are
+/// doubled that many times (at most 971 doublings of at most 309 digits).
+fn pe_big_integer_text(neg: bool, a: f64) -> str {
+    var bits: i64 = pe_f64_to_bits(a);
+    var m: i64 = (bits & 4503599627370495) + 4503599627370496;
+    var two: i64 = ((bits >> 52) & 2047) - 1075;
+    // the digits, least significant first
+    var buf: i64 = p_malloc(512);
+    var n: i64 = 0;
+    var x: i64 = m;
+    while x > 0 {
+        pe_set_byte(buf, n, 48 + (x % 10));
+        x = x / 10;
+        n = n + 1;
+    }
+    var k: i64 = 0;
+    while k < two {
+        var carry: i64 = 0;
+        var i: i64 = 0;
+        while i < n {
+            var dd: i64 = (pe_byte_at(buf, i) - 48) * 2 + carry;
+            pe_set_byte(buf, i, 48 + (dd % 10));
+            carry = dd / 10;
+            i = i + 1;
+        }
+        while carry > 0 {
+            pe_set_byte(buf, n, 48 + (carry % 10));
+            carry = carry / 10;
+            n = n + 1;
+        }
+        k = k + 1;
+    }
+    var size: i64 = n;
+    if neg {
+        size = n + 1;
+    }
+    var at: i64 = 0;
+    var out: i64 = p_str_buf(size);
+    if neg {
+        pe_set_byte(out, 0, 45);
+        at = 1;
+    }
+    var j: i64 = n - 1;
+    while j >= 0 {
+        pe_set_byte(out, at, pe_byte_at(buf, j));
+        at = at + 1;
+        j = j - 1;
+    }
+    p_free(buf);
+    return p_str_adopt(out);
 }
 
 pub fn pert_float_to_str(val: f64) -> str {

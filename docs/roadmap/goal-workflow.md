@@ -123,7 +123,7 @@ the file), `deferred` (cannot be done on this machine), with the reason.
 | 6 | BG216 | `tls_crypto::x25519` gets RFC 7748's second vector wrong | `stdlib/tls_crypto.fd` (`x25519`: mask bit 255 of `u`; a constant-time swap) | RFC 7748 section 5.2 vectors 1 and 2; slow in the interpreter, so through `ccompile` | done (Nov 27 02:57; it now calls x25519.fd's ladder) |
 | 7 | BG224 | `xml` and `toml` have no nesting limit | `stdlib/xml.fd`, `stdlib/toml.fd` | deep input gives an error, not a stack overflow | done (Nov 27 03:55; `XML_MAX_DEPTH`, `TOML_MAX_DEPTH`, both 128) |
 | 8 | BG180 | f-string float precision wrong for large values; fill ignored | `stdlib/core.fd` (`fstr_fmt_f64`, `__fstr_pad`, `__fstr_width0`) | the entry's triggers; check first whether it still reproduces | done (Nov 27 04:05) |
-| 9 | BG247 | the default Windows backend's `float_to_str` loses the low digits of a large value (found by BG180) | `stdlib/pe_runtime/base.fd` (`pert_float_to_str`; the machine layer's, in `stdlib/linux_runtime/base.fd`, is right) | `f"{1e25}"` prints `10000000000000000905969664` through `emit` | todo |
+| 9 | BG247 | the default Windows backend's `float_to_str` loses the low digits of a large value (found by BG180) | `stdlib/pe_runtime/base.fd` (`pert_float_to_str`; the machine layer's, in `stdlib/linux_runtime/base.fd`, is right) | `f"{1e25}"` prints `10000000000000000905969664` through `emit` | done (Nov 27 04:25) |
 | 9 | BG206 | Linux runtime `pert_str_to_float` is not correctly rounded | `stdlib/linux_runtime/base.fd` | 2000 printed doubles read back; runs here through `emit --nat` | todo (a correct-rounding conversion: the last of this group) |
 
 ### C. Bugs in compiler files no other session edits — one build per batch
@@ -222,3 +222,7 @@ are the commit times.)
   `__fstr_body`); `test_bg180_fstring_precision_fill` passes, and the 59
   other f-string programs with it. Found on the way and filed: BG247.
   Next: BG247, then queue C.
+- 04:25, BG247 (found by BG180): `stdlib/pe_runtime/base.fd`
+  (`pe_big_integer_text`); `test_bg247_float_to_str_large` passes on run,
+  ccompile and emit. Queue B is closed: next the whole-suite
+  comparison's result (queue A), then queue C.
