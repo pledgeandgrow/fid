@@ -128,6 +128,7 @@ the file), `deferred` (cannot be done on this machine), with the reason.
 | 42 | BG254 | `use transform3d;` is a parse error (transform3d, lidar, pointcloud) | `stdlib/transform3d.fd` 146 | the three modules build on their own (scripts/check-stdlib.sh) | done (Nov 27 08:05, 1ae02075; the parser's part is BG257, row 29) |
 | 43 | BG255 | `use quic;` is a `@secret` error in the library (quic, quic_conn, quic_frame, quic_tls, quic_udp, http3, http3_udp) | `stdlib/quic.fd` 359 | the seven modules build on their own; the QUIC and HTTP/3 tests unchanged | done (Nov 27 08:11, dbb3347c and aea3663b: the 7 modules; the 5 tests pass on ccompile and emit with both compilers) |
 | 44 | BG256 | `use parallel;` is a thread-safety error on its own | `stdlib/parallel.fd` 138 | the module builds on its own; tests/par/par_check.sh still passes | waiting on a design decision: a function value cannot reach a spawned task as an argument, as a used variable, or through a cast (the entry's note of Nov 27) |
+| 45 | BG253 | tests/selfhost/test_mono.fd no longer compiled (the maps became structs, SP10) | `tests/selfhost/test_mono.fd` | the test passes on run, ccompile and emit | done (Nov 27 10:12: "All tests passed!" on the three) |
 
 ### C. Bugs in compiler files no other session edits — one build per batch
 

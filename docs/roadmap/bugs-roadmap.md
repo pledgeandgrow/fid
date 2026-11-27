@@ -41,10 +41,10 @@ BG204, BG227), 35 open. BG242-BG246, found Nov 25, are open.
 Status Nov 27 (checkbox count at be36317, the v0.8.5-unstable commit):
 BG128-BG241: 80 done `[x]`, 3 partly done `[~]` (BG183, BG204, BG227), 31
 open; BG242-BG246 open. The whole file: 207 `[x]`, 3 `[~]`, 36 `[ ]`.
-Status Nov 27 (night run, 10:10): BG128-BG241: 97 done `[x]`, 3
+Status Nov 27 (night run, 10:15): BG128-BG241: 97 done `[x]`, 3
 partly `[~]` (BG183, BG204, BG227), 14 open; BG242 done, BG243-BG246
-open; BG247 done; BG248-BG257: BG254, BG255 and BG257 done, 7 open.
-The whole file: 229 `[x]`, 3 `[~]`, 25 `[ ]`.
+open; BG247 done; BG248-BG257: BG253, BG254, BG255 and BG257 done, 6
+open. The whole file: 230 `[x]`, 3 `[~]`, 24 `[ ]`.
 
 Status markers as in the other roadmaps: `[ ]` open, `[~]` partly done,
 `[x]` done.
@@ -2605,11 +2605,19 @@ names are the reference.
       with the compiler of Nov 25 as with that of Nov 27 (night). Found
       Nov 27 (night) while writing BG240's test, which keeps to aliases of
       value types. Confidence: high.
-- [ ] BG253. **tests/selfhost/test_mono.fd no longer compiles** ("no
+- [x] BG253. **tests/selfhost/test_mono.fd no longer compiles** ("no
       method 'len' on struct 'GenericFuncMap'"), with the compiler of Nov
       25 as with that of Nov 27 (night): the monomorphizer's own test
       checks nothing. Found Nov 27 (night) through BG236. Confidence:
       high.
+      Nov 27 (night), fixed: the two maps are structs with a name index
+      since SP10 (GenericFuncMap, GenericMethodMap: `entries` and
+      `index`, filled through `GenericFuncMap_push` and
+      `GenericMethodMap_push`); the test built them as plain Vecs and
+      asked them for `len`. With release/fid-v27.exe the test passes
+      on run (3 s), ccompile and emit: "All tests passed!". The
+      mangling checks it once had are in tests/nattools/
+      mangle_func_unit.fd (BG236).
 - [x] BG254. **`use transform3d;` does not compile: a parse error.**
       stdlib/transform3d.fd 146:12 (`m00: r.m00,` on the line after
       `return mat4 {`): "unexpected token 'Colon'". Through it
