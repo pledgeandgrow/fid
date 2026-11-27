@@ -2603,6 +2603,29 @@ names are the reference.
       overflow at the guard page. It needs a hook from
       `pe_task_stack_new` (conc.fd, shared with Linux) and the task
       tests on the native backend: goal-workflow.md row 46.
+      Nov 27 (night), tried for 25 minutes; not validated, nothing
+      kept. Written and run through `emit --nat`: the mapping reserved
+      with its top 20 KB committed (8 KB, a guard page, 8 KB under it,
+      for the exception to be delivered on), a flag win.fd's mmap knows
+      (asked for by `pe_task_stack_new` where win.fd sets a global),
+      and `pe_win_grow_stack` in the exception handler (64 KB more at
+      a time, guard page and band under it; the stack's end one step
+      above the guard region, reported as an overflow). What the system
+      does with it: it does not grow such a stack itself (its
+      STACK_OVERFLOW is raised for the guard page, whatever StackLimit
+      the TEB has), and while the TEB describes the task's stack a
+      guard page set by the handler is never raised again (a task
+      recursed on through it to reserved pages and died). With the
+      TEB's three stack words left 0 for such tasks the guard pages
+      raise plain exceptions: growth followed step by step (depth 2400
+      to 7000) in a build with trace prints in the handler, and failed
+      at the first or second step in builds without them (depth 300
+      and 1000 ran, 2400 and more did not), with caches off as well.
+      Not understood; the trace calls themselves take about 70 KB of
+      the stack they report on. The experiment is in build/tmp/bg249/
+      (conc.lazy.fd, win.lazy.fd, g2.template.fd). Next: a debugger
+      (cdb or WinDbg) or a note in memory instead of prints; then the
+      task tests on the native backend.
 - [ ] BG250. **pe_ir hangs on test_read_line_long.** The program runs
       itself with a file of long lines on its standard input (BG41): the
       pe_ir image printed one line and did not finish in 60 s, twice, and
