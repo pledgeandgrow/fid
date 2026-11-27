@@ -212,6 +212,10 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       (BG183, BG159). The gate (no differ, no machine-layer-only build
       failure) does not pass: 6 and 5, all real. pe_ir is still the
       Windows default. Still partly.
+      Nov 27 (day): no new comparison. Four of the six programs `--nat`
+      gets wrong were BG165, fixed in the Nov 27 batch; BG248, BG249 and
+      BG251 are the other session's. Re-run
+      tests/nattools/mi5_nat_peir_check.sh once they close.
 - [x] MI6. Panic paths as cold out-of-line blocks shared per function, each a
       call (so traces name the function), from the one lowering (M).
       Panics are calls to shared stubs on every Linux target, so traces name the
@@ -356,6 +360,17 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       targets, which it declines (cost 13780 -> 13780) while every
       output is right. Left: the default switch (the loop and the
       sieve), those three stale expectations, the suites with
+      winfregs/splitfloat. Still partly.
+      Nov 27 (day): the three stale expectations were the gate's, and are
+      fixed (f10eb6a1). With release/fid-night.exe (the build of 11:30):
+      machine_mi14_check.sh 33 ok, 0 fail; machine_fregs_check.sh 25 ok, 0
+      fail. `around` is no split candidate on any target since RA18's
+      callee-saved float registers; `between` is, and the gate checks it
+      now: 11 pieces kept on x86-64 and `--nat` (cost 2637 -> 1741), 10 on
+      AArch64 and RISC-V, 13 values spilled against 22 with
+      FID_NAT_OFF=splitfloat (7 against 17). The 7 WSL failures were
+      wsl.exe on PATH with no distribution. Left: the default switch (the
+      loop 2.34x and the sieve 3.56x slower on `--nat`), the suites with
       winfregs/splitfloat. Still partly.
 - [x] MI15. A Linux x86-64 target on MIR for free once x64 is ported: the ELF
       writer of `nat_enc.fd`, the Linux runtime, x64 selection (M).
@@ -973,6 +988,13 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       build of test_simd_i64 crashes in its wrap section, reductions (red6,
       redk) are not vectorized.
       Nov 21 (5fb5516): the test_simd_i64 crash the check hit (2g.96) was an itoa scratch buffer under saved r14 in pe_ir_stubs, not SIMD codegen — fixed; the sse/avx2/neon/rvv images were right.
+      Nov 27 (day): with release/fid-night.exe (the build of 11:30)
+      test_machine_simd builds clean under FID_VERIFY=1 on x86_64-linux,
+      `--nat` Windows and pe_ir (the allocation-check failure of Nov 21 is
+      gone, 2g.88), and the pe_ir image of test_simd_i64 prints its
+      expected lines (2g.96). Left: the reductions (red6, redk) are not
+      vectorized, and the vectorizer's loops as MIR vector operations.
+      Still partly.
 - [x] TG12. Object files (COFF, ELF, Mach-O) from the same writer as executables,
       for linking with C (release F4) (M).
       Nov 16, ELF: `fid emit <file> --obj --target <linux> -o x.o` (main.fd
@@ -1699,6 +1721,17 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       aarch64 fwd3 keeps 17 moves with or without the hints (the
       call's parameters are not passed in place there — a hint/coalesce
       gap, not a correctness bug). Left: that leg; the native suite.
+      Nov 27 (day): wp6_args_check.sh 23 ok, 1 fail with
+      release/fid-night.exe (the build of 11:30; its two "output differs"
+      on x86_64 were wsl.exe with no distribution, fixed in f10eb6a1):
+      AArch64 fwd3 keeps 17 moves with or without the hints. That is no
+      hint or coalesce gap: AArch64's allocatable registers are x8-x11 and
+      x19-x28 (nat_ir.fd, the target description) and none of the argument
+      registers x0-x7 is among them (they are the generator's scratch: li,
+      and, or), so a parameter live past its first instructions moves at
+      entry and again at the call, hints or not. Left: x0-x7 in the pool
+      where the generator does not need them (a change of the machine
+      layer's design, MI's grade); the native suite. Still partly.
 - [~] WP7. `__env` dropped from functions that never read it, at every call (S).
       `iro_env_trim` (`compiler/iropt.fd`): removes `params[0]` and the
       matching `args[0]` at every direct `Inst::Call`. Address-taken
@@ -2529,7 +2562,7 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       par_emit_check 88 ok, its 4 failures out-of-memory builds that give
       identical images when rebuilt; 1/4/8 threads identical on every
       target, the par mutant caught. Not run: the PAR_BIG self-build timing.
-- [~] SP6. A per-function code cache: key = hash of the function's IR, the target,
+- [x] SP6. A per-function code cache: key = hash of the function's IR, the target,
       the options and the clobber/effect facts of what it calls (M).
       Competitive CS6: `FID_FNCACHE=<file>` (opt-in, nat_ir.fd): key = the
       whole IrFunction plus a salt of layouts, globals, externs, the
@@ -2603,6 +2636,19 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       path, function-set checks per function, narrow give-up, loop functions on
       16). The leg's 'mk given up' line was stale (now a note). Left: MI28
       tail-call summaries are order-dependent; keys use absolute lines.
+      Nov 27 (day): both gates pass with release/fid-night.exe (the build
+      of 11:30, the first built after the Nov 27 changes).
+      machine_fncache_check.sh: all passed (the edit leg reuses 273, 273
+      and 274 of A's functions on x86_64, AArch64 and RISC-V and compiles
+      2; B on A's cache is B without the cache, byte for byte).
+      sp20_fncache_tail_check.sh: 21 ok (with tail calls, B's cache hit is
+      B without the cache on the three targets). The cache is on by default
+      for every machine-layer build. Done. Two refinements are not part of
+      it, they are SP8's: the key hashes each value's absolute line, so an
+      inserted line compiles the functions below it again (a line-relative
+      key needs the replay to rebase the line rows and the panic lines),
+      and the order of MI28's summary asks is not fixed (the tail check
+      shows no difference).
 - [~] SP7. Incremental relinking in memory: unchanged functions keep their bytes,
       only relocations are redone (M).
       On an FID_FNCACHE hit a function's bytes are replayed at the new
@@ -2898,6 +2944,20 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       a native-fixpoint stage-2 attempt OOM'd under parallel load, no
       clean run recorded.
       Nov 27: not re-checked (the gate was stopped before it).
+      Nov 27 (day): machine_sp16_check.sh 9 ok, 0 fail with
+      release/fid-night.exe (the build of 11:30), after three gate fixes
+      (f10eb6a1): the negative probe reached stdlib/net.fd's
+      pledge_net_socket, which has pert_c_pledge_net_socket since Nov 22
+      (the check passed the probe it had to reject; it declares an extern
+      nothing provides now); selfhost_builtins_check.py read all three @cfg
+      variants of interp_cpu_ms on every layer, so Windows-only
+      GetProcessTimes was "missing" on Linux and macOS (a definition under
+      a false @cfg is not reached now, and an extern the layer's runtime
+      imports itself resolves: win.fd's pe_wcpu_times); and the
+      x86_64-linux main-stack image was run through wsl.exe with no
+      distribution. What blocks the goal is unchanged: 2g.114 (the compiler
+      built by pe_ir panics), then the compiler built by `fid emit`. Still
+      partly.
 - [x] SP17. Memory of a build under 1 GB for the compiler itself (M).
       Measured Nov 15: `fid check compiler/main.fd` peaks at ~550 MB —
       under 1 GB. (`dump-c` peaks higher through the 76 MB C text but a
