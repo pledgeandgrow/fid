@@ -2242,10 +2242,19 @@ names are the reference.
       the smallest i64 does not overflow). Test test_bg238_money_negative
       (-5, -105, 0, 1234, 7, the smallest i64): passes on run, ccompile and
       emit with the fid-dev of Nov 25; the 13 other money tests unchanged.
-- [ ] BG239. **`hkdf_expand` does not reject a length over 255 * 32.**
+- [x] BG239. **`hkdf_expand` does not reject a length over 255 * 32.**
       stdlib/tls_crypto.fd `hkdf_expand`: the counter byte reaches 256 and the
       output stops following RFC 5869, where it should be an error. Read only.
       Confidence: high.
+      Fixed Nov 27: `hkdf_expand` panics on a length over 255 * 32 ("more
+      than 255 * 32 bytes asked for (RFC 5869)"). Test
+      test_bg239_hkdf_expand_limit_fail (RFC 5869 vector 1, then 8161
+      bytes): passes on run, ccompile and emit with the fid-dev of Nov 25;
+      test_crypto_tls_vectors, test_std_kdf, test_stdlib_secret_keys and
+      test_stdlib_tls13_schedule unchanged on ccompile and emit. The limit
+      itself (8160 bytes, equal to a shorter expansion over their common
+      length) was checked once through ccompile: not a suite test, 255 HMACs
+      do not finish in the interpreter.
 - [ ] BG240. **A cycle of type aliases overflows the checker's stack.** `type
       A = B; type B = A;` recurses in `TypeChecker_resolve_type` until a stack
       overflow instead of an error. Confirmed Nov 24. Confidence: high.

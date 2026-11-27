@@ -113,7 +113,7 @@ the file), `deferred` (cannot be done on this machine), with the reason.
 | 1 | BG215 | UTF-8 decoders accept overlong, surrogate and out-of-range sequences | `stdlib/encoding.fd` (`utf8_decode`), `stdlib/unicode.fd` (`uni_to_codepoints`) | the entry's trigger bytes give U+FFFD; `uni_lower`/`uni_nfc` of `.. C0 AF x` keep the bytes | done (Nov 27 02:25) |
 | 2 | BG217 | decimal: a negative scale prints the wrong value | `stdlib/decimal.fd` (`dec_round`, `dec_div`, `dec_to_str`) | `dec_round(dec_parse("1234"), -2, DEC_HALF_UP)` is 1200; `dec_div(1000, 3, -1, DEC_HALF_UP)` is 330 | done (Nov 27 02:40) |
 | 3 | BG238 | `Money_print` writes negative amounts wrong | `stdlib/money.fd` | `Money_new(-5)` prints `-$0.05`, `-105` prints `-$1.05` | done (Nov 27 02:48) |
-| 4 | BG239 | `hkdf_expand` does not reject a length over 255 * 32 | `stdlib/tls_crypto.fd` | a length of 8161 is an error; RFC 5869 vectors still pass | todo |
+| 4 | BG239 | `hkdf_expand` does not reject a length over 255 * 32 | `stdlib/tls_crypto.fd` | a length of 8161 is an error; RFC 5869 vectors still pass | done (Nov 27 03:00) |
 | 5 | BG223 | `url_resolve` builds broken or lossy URLs; path decoded too early | `stdlib/url.fd` | the entry's triggers (IPv6 host, userinfo, `%2F` in the path) | todo |
 | 6 | BG216 | `tls_crypto::x25519` gets RFC 7748's second vector wrong | `stdlib/tls_crypto.fd` (`x25519`: mask bit 255 of `u`; a constant-time swap) | RFC 7748 section 5.2 vectors 1 and 2; slow in the interpreter, so through `ccompile` | todo |
 | 7 | BG224 | `xml` and `toml` have no nesting limit | `stdlib/xml.fd`, `stdlib/toml.fd` | deep input gives an error, not a stack overflow | todo |
@@ -195,3 +195,6 @@ One line per run: time, what was done, what is next.
   ccompile and emit. Next: BG238.
 - Nov 27 02:48: BG238 fixed in `stdlib/money.fd` (`Money_print`);
   `test_bg238_money_negative` passes on run, ccompile and emit. Next: BG239.
+- Nov 27 03:00: BG239 fixed in `stdlib/tls_crypto.fd` (`hkdf_expand`);
+  `test_bg239_hkdf_expand_limit_fail` passes on run, ccompile and emit (the
+  8160-byte limit itself checked once through ccompile). Next: BG223.
