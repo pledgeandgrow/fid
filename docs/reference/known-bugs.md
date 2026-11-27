@@ -1278,6 +1278,16 @@ panic class appears in test_vec_sized_layout (pe_ir), test_stdlib_repaired
 (pe_ir diverges after the json_save file write), and in --nat runs of
 test_process_command / mem_profile.fd / mem_hog — likely one shared defect in
 how hand-written native file/string primitives produce str-valued memory.
+Fix design (Nov 26, verified against the working concat implementation at
+compiler/pe_ir_stubs.fd ~5744): a counted string is p_malloc(16 + len + 1),
+[block+0] = 0x4649444500000001 (magic plus one owner), [block+8] = len, the
+bytes at block+16 with a terminator, the str pointer is block+16.
+PeirGen_gen_file_read allocates raw and returns raw; it must allocate
+size+17, write the two header words, aim ReadFile at block+16, terminate,
+return block+16. The same treatment for any other pe_ir primitive returning
+str-valued memory (process output reads) — grep PeirGen_gen_* for p_malloc
+callers that return the raw block. The nat_ir runtime (linux_runtime) passes
+these tests, so its arrangement is the second reference.
 Status: open.
 
 ## 2g. Nov 9, 2026 — module audit: open bugs
