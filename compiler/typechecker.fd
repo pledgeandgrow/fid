@@ -2260,6 +2260,12 @@ pub fn TypeChecker_register_program(self: &mut TypeChecker, program: Program, mo
         TypeChecker_set_item_visibility(self, ta.name, ta.is_pub);
         tai = tai + 1;
     }
+    // BG240: no alias resolves to itself through other aliases
+    tai = 0;
+    while tai < program.type_aliases.len() {
+        TypeChecker_check_alias_cycle(self, program.type_aliases.get(tai).name);
+        tai = tai + 1;
+    }
 
     // Register functions
     var fi3: i64 = 0;
@@ -14021,14 +14027,36 @@ pub fn TypeChecker_resolve_type(self: &TypeChecker, ty: Type) -> Type {
     match ty {
         Type::Named(name) => {
             // OPTIMIZATION: use cached alias lookup instead of O(n) linear scan
-            match TypeChecker_lookup_alias_cache(self, name) {
-                OptType::Some(alias) => {
-                    return TypeChecker_resolve_type(self, alias);
-                }
-                OptType::None => {
-                    return ty;
+            // (BG240: followed here in a loop, not by recursion: a cycle of
+            // aliases, `type A = B; type B = A;`, recursed to a stack
+            // overflow; it is an error that names the alias)
+            var cur: str = name;
+            var hops: i64 = 0;
+            var cycling: bool = false;
+            while !cycling {
+                match TypeChecker_lookup_alias_cache(self, cur) {
+                    OptType::Some(alias) => {
+                        match alias {
+                            Type::Named(next) => {
+                                if next == name || hops >= 64 {
+                                    cycling = true;
+                                } else {
+                                    cur = next;
+                                    hops = hops + 1;
+                                }
+                            }
+                            _ => {
+                                return TypeChecker_resolve_type(self, alias);
+                            }
+                        }
+                    }
+                    OptType::None => {
+                        return Type::Named(cur);
+                    }
                 }
             }
+            // a cycle: an error reported where the aliases are registered
+            // (TypeChecker_check_alias_cycle); the name is left as it is
             return ty;
         }
         Type::Ref(inner, is_mut) => {
@@ -14066,6 +14094,41 @@ pub fn TypeChecker_resolve_type(self: &TypeChecker, ty: Type) -> Type {
         }
     }
     return ty;
+}
+
+/// BG240: alias `name` must not resolve to itself through other aliases
+/// (`type A = B; type B = A;`): TypeChecker_resolve_type follows aliases in
+/// a loop and leaves such a name as it is. Reported once per alias, when
+/// the aliases are registered.
+fn TypeChecker_check_alias_cycle(self: &mut TypeChecker, name: str) -> void {
+    var cur: str = name;
+    var hops: i64 = 0;
+    while hops < 64 {
+        var next: str = "";
+        match TypeChecker_lookup_alias_cache(self, cur) {
+            OptType::Some(alias) => {
+                match alias {
+                    Type::Named(n) => {
+                        next = n;
+                    }
+                    _ => {
+                        return;
+                    }
+                }
+            }
+            OptType::None => {
+                return;
+            }
+        }
+        if next == name {
+            if TypeChecker_first_report(self, name) {
+                self.errors.push("Type error: type alias '" + name + "' resolves to itself through " + int_to_str(hops + 1) + " alias(es): a cycle of type aliases.\n    Fix: an alias must end in a type that is not one of the aliases it goes through.");
+            }
+            return;
+        }
+        cur = next;
+        hops = hops + 1;
+    }
 }
 
 pub fn TypeChecker_subst_type_params(ty: Type, subst: Vec<StringType>) -> Type {
@@ -21507,6 +21570,13 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
                 self.errors.push("Type error (line " + int_to_str(self.current_line) + "): cannot compare a str with a number (" + type_to_str(lt_r) + " with " + type_to_str(rt_r) + ").\n    `==` on a str compares text, and a str is never null: a builtin that can fail gives an Option (read_file, env_var, arg_at, read_line). To compare with a number, convert one side with `as` or int_to_str.\n    Fix: compare two numbers (`s.len() == 0`, `parse_int(s) == n`) or two strings (`s == int_to_str(n)`).");
                 return Type::Bool;
             }
+            // BG202: the reference orders no strings (`==` and `!=` compare
+            // text); the backends disagreed: the interpreter panicked and C
+            // compared addresses
+            if is_cmp && !binop_eq(op, BinOp::Eq) && !binop_eq(op, BinOp::Neq) && type_eq(lt_r, Type::Str) && type_eq(rt_r, Type::Str) && !is_runtime_layer(self.current_module) && !str_starts_with(self.current_module, "compiler") {
+                self.errors.push("Type error (line " + int_to_str(self.current_line) + "): cannot order two str values with `" + tc_cmp_symbol(op) + "`: only `==` and `!=` are defined for text.\n    Fix: str_compare(a, b) is negative, zero or positive: write `str_compare(a, b) " + tc_cmp_symbol(op) + " 0`.");
+                return Type::Bool;
+            }
             // CL10: `<` `<=` `>` `>=` on a unit (@dimension) compare its f64
             // with another value of the same unit (lower.fd does the same).
             // TL2: before BG60's check below, whose "cannot compare Len with
@@ -21524,6 +21594,13 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
             // BG60: what else a comparison's operands must be (out of line)
             if is_cmp && TypeChecker_check_comparison(self, op, box_expr_unbox(left), box_expr_unbox(right), lt_r, rt_r) {
                 return Type::Bool;
+            }
+            // BG201: `& | ^ << >>` take integers. A float operand was given
+            // `f64`, and C then failed to compile, where the interpreter
+            // printed 0
+            if (binop_eq(op, BinOp::BitAnd) || binop_eq(op, BinOp::BitOr) || binop_eq(op, BinOp::BitXor) || binop_eq(op, BinOp::Shl) || binop_eq(op, BinOp::Shr)) && !TypeChecker_is_reported(self, lt_r) && !TypeChecker_is_reported(self, rt_r) && ((type_eq(lt_r, Type::F64) || type_eq(lt_r, Type::F32)) || (type_eq(rt_r, Type::F64) || type_eq(rt_r, Type::F32))) {
+                self.errors.push("Type error (line " + int_to_str(self.current_line) + "): `" + tc_cmp_symbol(op) + "` takes integers, got " + type_to_str(lt_r) + " and " + type_to_str(rt_r) + ".\n    Fix: convert with `as i64` first (`(f as i64) & 2`), or use the arithmetic you meant.");
+                return Type::I64;
             }
             match op {
                 BinOp::Add => {

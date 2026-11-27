@@ -391,6 +391,9 @@ alias = "type" Name "=" type [";"]
 ```
 
 An alias to a struct can be used in a struct literal (`parse_type_alias`).
+An alias resolves through other aliases to a type; a cycle of aliases
+(`type A = B; type B = A;`) is an error, not a stack overflow
+(`s2_8_alias_cycle_rejected.fd`, `test_bg240_alias_chain.fd`).
 
 ### 2.9 Modules and `use`
 
@@ -639,14 +642,19 @@ Consequences:
 
 ### 4.2 Operator typing
 
-- Arithmetic `+ - * / %` and bitwise `& | ^ << >>` on two integers give the
-  wider type; with a float operand they give `f64` (or `f32` when neither
-  operand is `f64`).
+- Arithmetic `+ - * / %` on two integers give the wider type; with a float
+  operand they give `f64` (or `f32` when neither operand is `f64`).
+- Bitwise `& | ^ << >>` (and their `=` forms) take integers: a float operand is
+  an error (`s4_2_bitwise_float_rejected.fd`,
+  `test_bg201_float_shift_assign_fail.fd`).
 - `+` on two `str` values concatenates. `+` on a typed string (`SQLString`,
   `ShellString`, `HTMLString`, `JSONString`, `PathString`) is an error.
-- `== != < > <= >=` give `bool`. `==` on two `str` values compares text. A `str`
-  compared with a number is an error (`safety/test_str_int_compare_fail.fd`);
-  to test a runtime `str` for null write `(s as i64) == 0`.
+- `== != < > <= >=` give `bool`. `==` and `!=` on two `str` values compare
+  text. A `str` compared with a number is an error
+  (`safety/test_str_int_compare_fail.fd`); to test a runtime `str` for null
+  write `(s as i64) == 0`. `< > <= >=` on two `str` values are an error in a
+  program too: text is ordered by `str_compare(a, b)`, negative, zero or
+  positive (`s4_2_str_order_rejected.fd`, `test_bg202_str_compare.fd`).
 - `&&` and `||` require `bool` operands and short-circuit.
 - `!` requires `bool`; `~` requires an integer; `-` requires a number.
 - `if` and `while` conditions must be `bool`, `i32` or `i64`. An integer literal
