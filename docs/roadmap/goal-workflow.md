@@ -68,6 +68,14 @@
   again when it reaches `[3/3]`, make sure no build of another session is
   running: one started four minutes after its last one ended on Nov 28,
   while this workflow's was compiling, and this workflow's was stopped.
+  Nov 28, 01:50, for a heavy job of this workflow (`build/llvm19/rl14-
+  nat-stage3.sh` has it; the resume script too): the guard is
+  `build/llvm19/foreign-builds.ps1`, by the parent chain (what descends
+  from the script's own shell is its own) and by the build's marker
+  `-DP_NO_ENV_LIMITS` (the C route of a test has `-fno-strict-aliasing`
+  too and is no build). Its stop is the native `taskkill` on the PIDs of
+  the last poll: PowerShell itself does not start at 1 GB of commit free,
+  so a stop that needs it fails exactly when it is needed (01:32).
 - **Three backends for every new or changed test:**
 
   ```
@@ -111,10 +119,11 @@ stage3b.log, stage4.log) and the result is in RL14: it needs 8 GB of
 commit free, and died once under 5 GB. While a whole-suite run or a build
 of this workflow runs, start no other.**
 
-**Nov 28, 00:35: nothing of this workflow runs.** Another session is
-building the compiler (its second build since 00:09 began at 00:24) and
-holds the machine's commit. RL14's stage 1 of the same source is half
-built and waits for a free machine (row L15).
+**Nov 28, 01:50: nothing of this workflow runs.** RL14's stage 1 of the
+same source and its stage 2 are made; its stage 3 waits for a free
+machine (row L15). What holds the machine's commit changes by the minute:
+another session's compiler builds (00:09, 00:24) and its Android
+emulators (01:06, 3.8 GB, and a second one that keeps coming back).
 
 | Marker | Result | Roadmap entries |
 |---|---|---|
@@ -179,7 +188,7 @@ holds, with its gate green on a built compiler.
 | L12 | WP14, LF16 | whole-suite legs | done (Nov 27 evening, 748df914: the whole of tests/bootstrap on emit and `--nat`, 2,011 of 2,056; no verdict changes with any pass on or off; LF14 the same) |
 | L13 | MI5, MI17 | `compiler/pe_ir*.fd`, `nat_ir.fd` | waiting: BG248, BG249, BG251 (the other session's), then `tests/nattools/mi5_nat_peir_check.sh` again; the default switch is MI14's |
 | L14 | MI9, TG16, LF13, LF21 | MI9: SRA of local structs (`nat_ir.fd`); TG16: the port onto MIR (the other session builds tg16-fid-v5); LF13: the other producers, `Vec::new()`+push buffers (`lower.fd`); LF21: the region arena in the Linux runtime | deferred: multi-week design work in files another session edits (each entry says what is left); not a goal of an 80-minute run |
-| L15 | RL14 (not among the 19; its run is this run's) | `scripts/native-fixpoint.sh` | pe_ir: done (the 19:10 run: stage 2 == stage 3 byte for byte). `--nat` (Nov 27, 23:10): stage 3 == stage 4 byte for byte, stage 2 != stage 3 (two compilers: stage 1 is the C build of 16:19), in the entry; it needs 8 GB of commit free (the cache writer's 1 GiB vector). A stage 1 of the same source is half built (Nov 28, 00:20 to 00:32, stopped: another session's build took the machine): 10 of 16 units of the snapshot of 00:10 in `build/llvm19/fix-nat3`. Left: `bash build/llvm19/rl14-nat-resume.sh` on a free machine (it checks: no compile of another session, 8 GB of commit free; then the six giant units at -O1, the link, stages 2 and 3, the comparison; 35 to 50 minutes), and the three Linux hosts (not on this machine) |
+| L15 | RL14 (not among the 19; its run is this run's) | `scripts/native-fixpoint.sh` | pe_ir: done (the 19:10 run: stage 2 == stage 3 byte for byte). `--nat` (Nov 27, 23:10): stage 3 == stage 4 byte for byte, stage 2 != stage 3 (two compilers: stage 1 is the C build of 16:19), in the entry; it needs 8 GB of commit free (the cache writer's 1 GiB vector). A stage 1 of the same source and stage 2 are made (Nov 28, the 00:39 run, from the snapshot of 00:10 in `build/llvm19/fix-nat3`): fidC.exe, 33,580,544 bytes, and fid2c.exe, 18,580,435 bytes, in the entry. Left: `bash build/llvm19/rl14-nat-stage3.sh` (stage 3 and the comparison: about 9 minutes with 9 GB of commit free and no build of another session; it waits for that and stops itself at 1.5 GB; three attempts of Nov 28 met the emulators of another session), and the three Linux hosts (not on this machine) |
 
 Gate scripts, once fixed, are in tests/nattools (a working WSL only: `wsl.exe -e sh -c 'echo wsl-ok'`; a path given to `fid serve` on stdin is a Windows path, `cygpath -m`). The driver of one run: `FID=<fid> bash build/llvm19/gates.sh [name ...]` (tg11 wp6 sp16 mi14 fregs lf20 sp6 sp20 sp7 ct ra1 lf11 sp9), its log `build/llvm19/progress.log`; the whole-suite legs: `bash build/llvm19/suite.sh <name> <list-or-dash> [VAR=value]` (tests/bootstrap on emit and `--nat`).
 
@@ -618,3 +627,20 @@ are the commit times.)
   and the other left alone. Left for a free machine: `bash
   build/llvm19/rl14-nat-resume.sh` (35 to 50 minutes). Not filed: the
   tree is not compilable by the pinned stage 0.
+- Nov 28, 00:39 to 01:55, a scheduled run (the lock was free). No other
+  goal could be touched: every file behind L5 and L7 to L13 was still
+  another session's. RL14 (L15): a stage 1 of the same source and its
+  stage 2 are made (fidC.exe 33,580,544 bytes, fid2c.exe 18,580,435
+  bytes); stage 3 is left. It needs 9 GB of commit free for 9 minutes,
+  and the machine had 6.7 to 8.4 GB while two Android emulators of
+  another session ran; one attempt died in the function cache writer at
+  01:33. The resume script's guard was wrong three ways, each found by a
+  test of its own and fixed: a closing parenthesis too many in its memory
+  query (its first start waited for nothing for ten minutes); it took the
+  test compiles of another session for builds (they carry
+  `-fno-strict-aliasing` too: a build is known by `-DP_NO_ENV_LIMITS`)
+  and its own compile for a foreign one (now by the parent chain); and its
+  stop could not stop a stage (PowerShell does not start at 1 GB of
+  commit: the stop is now the native taskkill). The tests:
+  build/llvm19/test-guard.sh, test-resume.sh, test-kill.sh. Left for a
+  free machine: `bash build/llvm19/rl14-nat-stage3.sh`.

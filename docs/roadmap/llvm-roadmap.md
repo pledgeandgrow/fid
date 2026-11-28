@@ -3536,6 +3536,26 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       needs a C build of the current tree. The 1 GiB buffer is a cost of
       the cache writer (compiler/ast_ser.fd AwBuf holds a byte in a
       word), not of this goal: worth a row of its own. Still partly.
+      Nov 28 (night, the 00:39 run): a stage 1 of the same source, and
+      stage 2. The snapshot of 00:10 (build/llvm19/fix-nat3/tree: 65
+      compiler modules, 403 stdlib modules). Stage 1: its C, made by
+      release/fid-night.exe (the pinned Nov 21 stage 0 no longer checks
+      the tree: typechecker.fd 19790), built as scripts/build-selfhost.sh
+      builds, in 16 units: ten at -O2, units 1 and 3 at -O1, units 4, 6,
+      7 and 9 at -O0 (at -O1 each ended in "Allocation failed" beside
+      another session's emulator): fidC.exe, 33,580,544 bytes, 01:17.
+      Stage 2: fidC.exe builds the snapshot with `emit --nat` in 4 min
+      27 s: fid2c.exe, 18,580,435 bytes, 01:24. Stage 3 (fid2c.exe
+      building the snapshot) is not made. One run of it reached the
+      function cache writer at 01:33 with the machine's commit at its
+      wall (two Android emulators of another session beside it, 3.8 GB
+      and 0.6 GB) and died "out of memory (268435456 bytes requested)";
+      then no window with 9 GB of commit free came before the run ended
+      at 01:48. The stage takes about 9 minutes with 9 GB of commit free:
+      `bash build/llvm19/rl14-nat-stage3.sh` makes it and compares (it
+      waits for the machine and stops itself at 1.5 GB). So the entry's
+      test on `--nat`, stage 2 == stage 3 with a stage 1 of the same
+      source, has not run to its end. Still partly.
 - [~] RL15. Sanitizer runs of the compiler itself through the C path (ASan,
       UBSan), finding its own memory errors (M).
       Done (Nov 15): `COMPILER=1 scripts/sanitize.sh` builds fid's C with
