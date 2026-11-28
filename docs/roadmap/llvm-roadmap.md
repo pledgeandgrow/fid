@@ -3556,6 +3556,20 @@ week), L (several weeks), XL (months). Each goal names where it lands.
       waits for the machine and stops itself at 1.5 GB). So the entry's
       test on `--nat`, stage 2 == stage 3 with a stage 1 of the same
       source, has not run to its end. Still partly.
+      Nov 28 (night, the 01:56 run): no stage made. With the cache on,
+      stage 3 found no moment in 50 minutes with 9 GB of commit free and
+      no build of another session: that session built (00:09, 00:24,
+      02:37, 03:05), tested with its new compiler (3.3 GB) and ran
+      Android emulators (3.8 GB), and the machine went from 1.2 GB to
+      12.8 GB free in between. A second way is written, both stages with
+      the function cache off (FID_FNCACHE=0: `bash build/llvm19/
+      rl14-nat-nocache.sh`; it also compares that stage 2 with the one
+      made with the cache on): stage 2 then held under 3 GB at 2 min 36 s
+      (2,953 MB) where it holds 6.8 GB with the cache. It was stopped
+      twice, by its own guard: once at the commit floor (1.2 GB free,
+      that session's test compiler beside it) and once to give way to its
+      build at 03:05. Left: about 14 minutes of the machine with no build
+      of another session in them. Still partly.
 - [~] RL15. Sanitizer runs of the compiler itself through the C path (ASan,
       UBSan), finding its own memory errors (M).
       Done (Nov 15): `COMPILER=1 scripts/sanitize.sh` builds fid's C with

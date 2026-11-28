@@ -119,11 +119,12 @@ stage3b.log, stage4.log) and the result is in RL14: it needs 8 GB of
 commit free, and died once under 5 GB. While a whole-suite run or a build
 of this workflow runs, start no other.**
 
-**Nov 28, 01:50: nothing of this workflow runs.** RL14's stage 1 of the
-same source and its stage 2 are made; its stage 3 waits for a free
-machine (row L15). What holds the machine's commit changes by the minute:
-another session's compiler builds (00:09, 00:24) and its Android
-emulators (01:06, 3.8 GB, and a second one that keeps coming back).
+**Nov 28, 03:10: nothing of this workflow runs.** RL14's stage 1 of the
+same source and its stage 2 are made; its stage 3 waits for about 14
+minutes of the machine with no build of another session in them (row
+L15). What holds the machine's commit changes by the minute: another
+session's compiler builds (00:09, 00:24, 02:37, 03:05), its tests with the
+compiler it just built (3.3 GB) and its Android emulators (3.8 GB).
 
 | Marker | Result | Roadmap entries |
 |---|---|---|
@@ -188,7 +189,7 @@ holds, with its gate green on a built compiler.
 | L12 | WP14, LF16 | whole-suite legs | done (Nov 27 evening, 748df914: the whole of tests/bootstrap on emit and `--nat`, 2,011 of 2,056; no verdict changes with any pass on or off; LF14 the same) |
 | L13 | MI5, MI17 | `compiler/pe_ir*.fd`, `nat_ir.fd` | waiting: BG248, BG249, BG251 (the other session's), then `tests/nattools/mi5_nat_peir_check.sh` again; the default switch is MI14's |
 | L14 | MI9, TG16, LF13, LF21 | MI9: SRA of local structs (`nat_ir.fd`); TG16: the port onto MIR (the other session builds tg16-fid-v5); LF13: the other producers, `Vec::new()`+push buffers (`lower.fd`); LF21: the region arena in the Linux runtime | deferred: multi-week design work in files another session edits (each entry says what is left); not a goal of an 80-minute run |
-| L15 | RL14 (not among the 19; its run is this run's) | `scripts/native-fixpoint.sh` | pe_ir: done (the 19:10 run: stage 2 == stage 3 byte for byte). `--nat` (Nov 27, 23:10): stage 3 == stage 4 byte for byte, stage 2 != stage 3 (two compilers: stage 1 is the C build of 16:19), in the entry; it needs 8 GB of commit free (the cache writer's 1 GiB vector). A stage 1 of the same source and stage 2 are made (Nov 28, the 00:39 run, from the snapshot of 00:10 in `build/llvm19/fix-nat3`): fidC.exe, 33,580,544 bytes, and fid2c.exe, 18,580,435 bytes, in the entry. Left: `bash build/llvm19/rl14-nat-stage3.sh` (stage 3 and the comparison: about 9 minutes with 9 GB of commit free and no build of another session; it waits for that and stops itself at 1.5 GB; three attempts of Nov 28 met the emulators of another session), and the three Linux hosts (not on this machine) |
+| L15 | RL14 (not among the 19; its run is this run's) | `scripts/native-fixpoint.sh` | pe_ir: done (the 19:10 run: stage 2 == stage 3 byte for byte). `--nat` (Nov 27, 23:10): stage 3 == stage 4 byte for byte, stage 2 != stage 3 (two compilers: stage 1 is the C build of 16:19), in the entry; it needs 8 GB of commit free (the cache writer's 1 GiB vector). A stage 1 of the same source and stage 2 are made (Nov 28, the 00:39 run, from the snapshot of 00:10 in `build/llvm19/fix-nat3`): fidC.exe, 33,580,544 bytes, and fid2c.exe, 18,580,435 bytes, in the entry. Left: about 14 minutes of the machine with no build of another session in them. `bash build/llvm19/rl14-nat-nocache.sh` (the 01:56 run: both stages with the function cache off, FID_FNCACHE=0; stage 2 holds under 3 GB where it holds 6.8 GB with the cache; it waits for the machine and stops itself; it also compares its stage 2 with the one made with the cache on) or `bash build/llvm19/rl14-nat-stage3.sh` (stage 3 with the cache on: 9 minutes with 9 GB of commit free). Both were stopped on Nov 28 by the builds and tests of another session. And the three Linux hosts (not on this machine) |
 
 Gate scripts, once fixed, are in tests/nattools (a working WSL only: `wsl.exe -e sh -c 'echo wsl-ok'`; a path given to `fid serve` on stdin is a Windows path, `cygpath -m`). The driver of one run: `FID=<fid> bash build/llvm19/gates.sh [name ...]` (tg11 wp6 sp16 mi14 fregs lf20 sp6 sp20 sp7 ct ra1 lf11 sp9), its log `build/llvm19/progress.log`; the whole-suite legs: `bash build/llvm19/suite.sh <name> <list-or-dash> [VAR=value]` (tests/bootstrap on emit and `--nat`).
 
@@ -644,3 +645,15 @@ are the commit times.)
   commit: the stop is now the native taskkill). The tests:
   build/llvm19/test-guard.sh, test-resume.sh, test-kill.sh. Left for a
   free machine: `bash build/llvm19/rl14-nat-stage3.sh`.
+- Nov 28, 01:56 to 03:12, a scheduled run (the lock was free). No goal
+  finished. The files behind L5 and L7 to L13 were still another
+  session's (13 of 15). RL14 (L15): stage 3 with the cache on waited 50
+  minutes and found no moment with 9 GB of commit free and no build of
+  another session. A lighter way was written and tried, both stages with
+  the function cache off (build/llvm19/rl14-nat-nocache.sh): stage 2
+  holds under 3 GB where it holds 6.8 GB with the cache; it was stopped
+  twice by its own guard, at the commit floor (another session's test
+  compiler, 3.3 GB, beside it) and to give way to that session's build at
+  03:05. The session builds about every half hour (00:09, 00:24, 02:37,
+  03:05) and tests in between: no 14 minutes of the machine were without
+  one of its jobs. Left: about 14 quiet minutes.
